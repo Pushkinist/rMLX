@@ -26,4 +26,4 @@ safetensors = { workspace = true }
 metal-capture = []
 
 [build-dependencies]
-bindgen = "0.71"
+bindgen = "0.72"
