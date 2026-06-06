@@ -286,6 +286,19 @@ fn fractional_group_size_zero_rejected() {
     );
 }
 
+// ── parse_max_prompt_tokens ──────────────────────────────────────
+
+#[test]
+fn parse_max_prompt_tokens_rejects_zero() {
+    let err = parse_max_prompt_tokens(0).unwrap_err();
+    assert!(err.to_string().contains(">= 1"), "{err}");
+}
+
+#[test]
+fn parse_max_prompt_tokens_accepts_one() {
+    assert_eq!(parse_max_prompt_tokens(1).unwrap(), 1);
+}
+
 // ── resolve_model_flags fractional dispatch ─────────────────────
 // Integer path via resolve_model_flags with f32 must match exactly.
 

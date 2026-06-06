@@ -105,9 +105,9 @@ use commands::parse::KvPresetArg;
 use commands::serve::{FusedQkMode, PlanarFlashDecodeMode, SparseAttnMode, TurboFlashMode};
 use commands::{
     acquire_claim_for_device, build_cache_type_spec, parse_device, parse_kv_bits_combo,
-    parse_kv_bits_fractional, parse_kv_preset, parse_kv_quant, parse_max_ctx, resolve_model_flags,
-    resolve_preset_arg, run_baseline, run_healthcheck, run_info, run_kv_calibrate, run_ppl,
-    run_serve,
+    parse_kv_bits_fractional, parse_kv_preset, parse_kv_quant, parse_max_ctx,
+    parse_max_prompt_tokens, resolve_model_flags, resolve_preset_arg, run_baseline,
+    run_healthcheck, run_info, run_kv_calibrate, run_ppl, run_serve,
 };
 
 /// Long-help body shared by `--cache-type-k` / `--cache-type-v` on every
@@ -911,6 +911,12 @@ enum Cmd {
         /// set.
         #[arg(long, visible_alias = "ctx-max")]
         max_ctx: Option<u32>,
+        /// Truncate the tokenized prompt to at most this many tokens (CPU forward
+        /// is O(N^2), so a cap guards against pathological bench times). Defaults
+        /// to the built-in cap; raise it to bench longer contexts (e.g. 128k).
+        /// Must be >= 1.
+        #[arg(long, value_name = "N", default_value_t = commands::baseline::MAX_PROMPT_TOKENS)]
+        max_prompt_tokens: usize,
         /// Free-form label stamped into the metrics record's `notes` column
         /// (used by the bench harness to group cells under a campaign name).
         #[arg(long)]
@@ -1700,9 +1706,11 @@ fn main() -> Result<()> {
             kv_bits,
             kv_group_size,
             max_ctx,
+            max_prompt_tokens,
             label: bench_label,
             record,
         } => {
+            let max_prompt_tokens = parse_max_prompt_tokens(max_prompt_tokens)?;
             // --kv-preset pre-resolution. resolve_preset_arg runs the
             // auto-selector for KvPresetArg::Auto.
             let (dev, kv_quant_resolved, max_ctx_override) = if let Some(preset_arg) = kv_preset {
@@ -1820,6 +1828,7 @@ fn main() -> Result<()> {
                 &label_str,
                 Some(kv_quant_resolved),
                 max_ctx_override,
+                max_prompt_tokens,
                 &sink,
                 record_args,
             )?;
