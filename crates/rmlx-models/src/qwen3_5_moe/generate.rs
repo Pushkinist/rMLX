@@ -649,31 +649,50 @@ pub fn generate_greedy(
         let kv_snap: Result<Vec<_>> = kv_caches.iter().map(|c| c.try_deep_clone()).collect();
         let lin_snap: Result<Vec<_>> = lin_caches.iter().map(|c| c.try_deep_clone()).collect();
         if let (Ok(kvs), Ok(lins)) = (kv_snap, lin_snap) {
-            PROMPT_CACHE.with_inner_mut(|guard| {
-                if let Some(cache) = guard.as_mut() {
-                    // salt chained walk with the active layout_key. When
-                    // tier is OFF, helper returns 0 ⇒ legacy un-salted digests.
-                    let lk = crate::qwen3_5_moe::prompt_cache::active_layout_key();
-                    cache.push(Qwen35MoeEntry {
-                        prompt_token_ids: prompt_ids.to_vec(),
-                        block_hashes: crate::prompt_cache::chained_block_hashes_seeded(
-                            prompt_ids,
-                            crate::prompt_cache::FNV_OFFSET ^ lk,
-                        ),
-                        kv_caches: kvs,
-                        lin_caches: lins,
-                        first_id: last_id,
-                        first_piece: piece.clone(),
-                        kv_quant: Some(kv_quant),
+            // Materialize GPU arrays on the current inference thread before
+            // storing in the prompt cache.  Each spawn_blocking request runs
+            // on its own tokio thread, which has its own Metal GPU stream
+            // (registered by ensure_gpu_default_stream() in arch::generate_greedy).
+            // If these lazy arrays are stored as-is and later evicted on a
+            // *different* inference thread (a subsequent request), that thread's
+            // eval_for_spill call will fail with "There is no Stream(gpu, N) in
+            // current thread" because stream N is only registered here.
+            // Pre-eval on this thread makes eval() a no-op from any future thread.
+            match kvs
+                .iter()
+                .try_for_each(|c| c.eval_for_spill())
+                .and_then(|()| lins.iter().try_for_each(|c| c.eval_for_spill()))
+            {
+                Ok(()) => {
+                    PROMPT_CACHE.with_inner_mut(|guard| {
+                        if let Some(cache) = guard.as_mut() {
+                            // salt chained walk with the active layout_key. When
+                            // tier is OFF, helper returns 0 ⇒ legacy un-salted digests.
+                            let lk = crate::qwen3_5_moe::prompt_cache::active_layout_key();
+                            cache.push(Qwen35MoeEntry {
+                                prompt_token_ids: prompt_ids.to_vec(),
+                                block_hashes: crate::prompt_cache::chained_block_hashes_seeded(
+                                    prompt_ids,
+                                    crate::prompt_cache::FNV_OFFSET ^ lk,
+                                ),
+                                kv_caches: kvs,
+                                lin_caches: lins,
+                                first_id: last_id,
+                                first_piece: piece.clone(),
+                                kv_quant: Some(kv_quant),
+                            });
+                            tracing::debug!(
+                                prompt_len = prompt_ids.len(),
+                                token_id = last_id,
+                                n_slots = cache.slots.len(),
+                                "qwen3_5moe generate_greedy: prompt cache MISS — saved snapshot"
+                            );
+                        }
                     });
-                    tracing::debug!(
-                        prompt_len = prompt_ids.len(),
-                        token_id = last_id,
-                        n_slots = cache.slots.len(),
-                        "qwen3_5moe generate_greedy: prompt cache MISS — saved snapshot"
-                    );
                 }
-            });
+                Err(e) => tracing::warn!(error = %e,
+                    "qwen3_5moe generate_greedy: pre-eval of KV/lin caches failed, skipping prompt cache store"),
+            }
         }
     }
 
