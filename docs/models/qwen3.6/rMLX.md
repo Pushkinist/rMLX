@@ -20,12 +20,15 @@ Step-by-step execution — one cell per run.
   codecs *lose* at long ctx (V-dequant overhead). At 8k all 8-bit-K codecs tie.
 - **The real deficit is prefill/TTFT**, ~40–50× slower than mlx-lm at short ctx —
   the #1 improvement-plan target.
-- **Speculative barely helps:** MTP +4.2% (only working drafter), DFlash −37%,
-  **Eagle3 crashes** (MoE KV bug). Spec-loop overhead eats the accept gain.
-- **SSD tier** decode-neutral (−0.5%) but **hydrate doesn't skip prefill** (bug).
+- **Speculative barely helps:** MTP +4.2% (best drafter), DFlash −37%, Eagle3
+  −39% (now works after the crash fix, but low accept ~0.27 → net loss). Spec-loop
+  overhead eats the accept gain.
+- **SSD tier** decode-neutral (−0.5% / −3.1%); spill now persists correctly; the
+  **hydrate-doesn't-skip-prefill** gap remains (#9, deferred).
 - **PARO 27B:** rMLX runs it (26.3 TPS) but −5.6% vs the paroquant reference.
-- Bugs found: Eagle3 KV crash, SSD hydrate-no-prefill-skip, SSD spill GPU-stream,
-  CBB→runs.db schema reject. See plan §10.
+- **Bugs filed + FIXED in 0.1.1:** Eagle3 MoE crash (#8), SSD spill GPU-stream
+  (#10), baseline prompt cap (#11). Still open: SSD hydrate-no-prefill-skip (#9,
+  enhancement). CBB→runs.db schema reject (harness). See plan §10.
 
 ---
 
@@ -125,17 +128,21 @@ Enabled via `--kv-ssd-cache-gb 8`. rotor3 @128k:
 | Config | decode TPS @128k | Δ | notes |
 |---|---|---|---|
 | rotor3, SSD off | 58.19 | — | |
-| rotor3, SSD on | 57.90 | **−0.5%** | spill async (no decode stall); hydrate 0.68s |
+| rotor3, SSD on | 57.90 / 56.41 | **−0.5% / −3.1%** | spill async (no decode stall) |
 
-**Finding:** SSD decode overhead is **negligible** (−0.5%) — the drain-thread spill
-doesn't stall decode. SSD's purpose is **capacity** (KV that outgrows RAM), not
-speed; at 128k single-stream (KV ~2.2 GB) it isn't needed. **Two bugs found:**
+**Finding:** SSD decode overhead is **negligible** (−0.5% original, −3.1% on
+re-test, both within noise) — the drain-thread spill doesn't stall decode. SSD's
+purpose is **capacity** (KV that outgrows RAM), not speed; at 128k single-stream
+(KV ~2.2 GB) it isn't needed. Two bugs were found; one is fixed:
 1. **SSD hydrate does not bypass prefill** — `prompt_cache_hits=0` even after a
    successful hydrate (510 blocks, prefix_len 130560); the full 342s prefill still
    ran. The cross-restart prefill-reuse benefit is **not materializing** (the
-   hydrated KV isn't matched to the active request's prefix). Improvement target.
-2. **Spill GPU-stream WARN** — `eval-for-spill failed: no Stream(gpu,2)` on the
-   drain thread → that run's KV isn't persisted. Non-fatal but a real bug.
+   hydrated KV isn't matched to the active request's prefix). **Open — #9,
+   deferred (feature-sized; ExactOnly policy vs block-aligned hydrate).**
+2. ~~Spill GPU-stream WARN~~ — **FIXED in 0.1.1 (#10).** Was
+   `eval-for-spill failed: no Stream(gpu,N)` → block not persisted. Re-tested
+   post-fix: WARN gone, `kv-spill: block written + indexed` confirmed (2.34 GB
+   blocks persisted), decode 56.41 TPS (−3.1%, within noise).
 
 ### 2d. Phase E — speculative (drafter × KV anchor)
 
@@ -145,23 +152,25 @@ Verifier = 35B-A3B-8bit, kv none, 4k, temp 0 (greedy accept). Baseline none@4k =
 |---|---|---|---|---|
 | MTP-5bit (block 3, k=4) | 101.77 | +4.2% (1.04×) | 66.4% | +20% |
 | DFlash (block 16, k=4) | 61.86 | **−37% (regression)** | 47.2% | −27% |
-| Eagle3 | **CRASH** | — (bug) | — | — |
+| Eagle3 (block 5) | 59.61 | **−39% (regression)** | 26.5% | −30% |
 
 _DFlash: the `z-lab__…-DFlash` snapshot loads as a heavy ~full-size MoE (72.6 GB
 dual-model peak) — draft cost ≈ verify cost, so spec backfires. Decode-only
 number; engine overall (incl. 6.5s prefill) was ~23 TPS. Dead end for this snapshot._
 
-_Eagle3: drafter loads (vocab 248320→32000, d2t hot-path, aux layers [2,18,34],
-block 5) but **crashes at token ~245** every run — MLX `slice_update` shape error
-`(1,2,N,256) vs (1,2,0,256)` (zero-length seq dim) in the Eagle3 draft-KV
-aux-layer management for MoE. **Bug — Eagle3 is broken on Qwen3.6-MoE.**_
+_Eagle3: **the crash is fixed** (PR #8 / 0.1.1 — the drafter KV cache was
+hardcoded to 4096; now sized to the verifier `max_seq`). Re-tested post-fix:
+256 tokens complete, coherent, no `slice_update` crash. But decode is **59.61 TPS
+(−39% vs none)** at a low **26.5% accept-rate** — the small accept can't offset the
+spec-loop overhead, so Eagle3 is a net decode loss for this model (same shape as
+DFlash). Functional now, but not worth using here without a higher-accept drafter._
 
-**Phase E verdict:** **MTP** is the only working drafter — but only **+4.2%**
-(round overhead eats the 66% accept). **DFlash** regresses (heavy drafter).
-**Eagle3** is broken (KV bug). Speculative is not a net win for rMLX on this model
-today; the gains live behind (a) reducing spec-loop overhead, (b) fixing Eagle3,
-(c) a true lightweight drafter. Block-size / KV-anchor tuning deferred to the
-improvement plan.
+**Phase E verdict (post-0.1.1):** all three drafters now RUN (Eagle3 crash fixed),
+but speculative is **not a net win** for Qwen3.6: MTP +4.2% (only positive),
+DFlash −37%, Eagle3 −39%. The accept-rates (MTP 66%, DFlash 47%, Eagle3 27%)
+don't clear the spec-loop overhead. Gains live behind (a) reducing per-round
+overhead, (b) a higher-accept / truly-lightweight drafter, (c) block-size / KV-
+anchor tuning — deferred to the improvement plan.
 
 **Finding (forming):** MTP spec gives only **+4.2%** despite a 66% accept rate —
 the speculative round overhead (draft-model forwards + multi-position verify)
@@ -204,13 +213,15 @@ Ranked by impact:
    (expert gather + dequant fusion) could extend the lead. `--fused-qk` is
    default-OFF — turning it on may also let quant codecs win on decode.
 3. **Speculative overhead.** MTP only +4.2% despite 66% accept — the spec-round
-   cost (draft forwards + multi-position verify) nearly cancels the savings. Reduce
-   per-round overhead; **fix the Eagle3 MoE KV crash** (`slice_update` zero-dim);
-   source a true lightweight DFlash head.
-4. **SSD prompt-cache not skipping prefill.** Hydrate restores KV but
+   cost (draft forwards + multi-position verify) nearly cancels the savings. The
+   Eagle3 MoE KV crash is **fixed (#8 / 0.1.1)** — Eagle3 now runs but at −39%
+   (27% accept). Remaining work: reduce per-round overhead; source a higher-accept
+   / truly-lightweight drafter (the DFlash snapshot is full-size).
+4. **SSD prompt-cache not skipping prefill (#9, open).** Hydrate restores KV but
    `prompt_cache_hits=0` → full prefill still runs. Wiring the hydrated prefix into
    the cache-hit path would turn SSD into a real cross-restart TTFT win (and helps
-   #1 for repeated long prefixes). Also fix the spill GPU-stream WARN.
+   #1 for repeated long prefixes). _(The spill GPU-stream bug is fixed — #10 /
+   0.1.1.)_
 5. **PARO decode** −5.6% vs the paroquant reference — rMLX's PARO path trails the
    native rotation kernels. Lower priority (non-comparable, niche format).
 
