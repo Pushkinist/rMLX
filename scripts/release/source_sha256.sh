@@ -22,13 +22,12 @@ VER=$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)
 URL="https://github.com/${OWNER_REPO}/archive/refs/tags/v${VER}.tar.gz"
 echo "==> fetching $URL" >&2
 
-# gh-authenticated fetch works for private repos; falls back to plain curl.
-if command -v gh >/dev/null 2>&1; then
-  SHA=$(gh api "repos/${OWNER_REPO}/tarball/v${VER}" 2>/dev/null | shasum -a 256 | awk '{print $1}')
-else
-  SHA=$(curl -fsSL "$URL" | shasum -a 256 | awk '{print $1}')
-fi
-[ -n "$SHA" ] || { echo "error: failed to compute sha256 (tag v${VER} reachable?)"; exit 1; }
+# MUST hash the exact `archive/refs/tags/...tar.gz` the formula `url` downloads.
+# NOTE: `gh api .../tarball/...` returns a DIFFERENT tarball (different prefix /
+# packing) with a different sha — do not use it here. The repo must be public
+# (Homebrew downloads anonymously), so a plain curl of the archive URL is right.
+SHA=$(curl -fsSL "$URL" | shasum -a 256 | awk '{print $1}')
+[ -n "$SHA" ] || { echo "error: failed to compute sha256 (tag v${VER} public + reachable?)"; exit 1; }
 
 echo "sha256: $SHA"
 
