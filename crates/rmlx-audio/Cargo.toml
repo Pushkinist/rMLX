@@ -1,0 +1,33 @@
+[package]
+name = "rmlx-audio"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "rMLX audio: Whisper STT, WAV I/O, mel-spectrogram, Silero VAD stub."
+
+[lints]
+workspace = true
+
+[dependencies]
+rmlx-core    = { workspace = true }
+rmlx-mlx     = { workspace = true }
+rmlx-loader  = { workspace = true }
+thiserror    = { workspace = true }
+tracing      = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+rustfft      = { workspace = true }
+symphonia    = { workspace = true }
+# tokenizers: BPE tokenizer for Whisper text decode. Already a workspace dep
+# (used by rmlx-models for LLM tokenization). No new transitive deps added.
+tokenizers   = { workspace = true }
+# miniz_oxide: inflate (DEFLATE decompress) for reading .npz (ZIP+deflate) archives.
+# Already a transitive dep via symphonia → flate2. Pinned to the workspace-resolved
+# version to avoid pulling a second copy. No new transitive deps added.
+miniz_oxide  = "0.8"
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,49 @@
+# rMLX CI — runs on GitHub-hosted macOS runners.
+#
+# `fmt` is link-free and always reliable. `build` needs the MLX / mlx-c
+# libraries (rMLX links the stable mlx-c C ABI; it does not vendor MLX), so it
+# installs them via Homebrew and points the build at the cellar prefix.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  build:
+    name: build + clippy
+    runs-on: macos-14 # Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install MLX (provides mlx-c)
+        run: brew install mlx-c
+      - name: Resolve MLX_C_PREFIX
+        run: echo "MLX_C_PREFIX=$(brew --prefix mlx-c)" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: build
+        run: cargo build --workspace --release
+      # The full test suite runs on Apple Silicon HARDWARE, not here: many tests
+      # need a real Metal GPU and normal machine specs, while GitHub-hosted macOS
+      # runners are VMs (~7 GB RAM, limited/again no usable Metal device). Run
+      # `make test` locally or wire a self-hosted Apple Silicon runner. Hosted CI
+      # validates formatting, lint, and a clean release build.

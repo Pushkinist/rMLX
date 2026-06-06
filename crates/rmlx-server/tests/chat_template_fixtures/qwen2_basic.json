@@ -1,0 +1,15 @@
+{
+  "snapshot": "mlx-community__jinaai-ReaderLM-v2",
+  "arch": "Qwen2ForCausalLM",
+  "messages": [
+    {
+      "role": "user",
+      "content": "What is the capital of France?"
+    }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "bos_token": "",
+  "eos_token": "<|im_end|>",
+  "expected": "<|im_start|>system\nYou are an AI assistant developed by Jina AI.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"
+}

@@ -1,0 +1,86 @@
+# Rust build artefacts
+target/
+**/*.rs.bk
+*.pdb
+
+# Release artifacts (built locally by scripts/release/package_binary.sh)
+dist/
+
+# Cargo lockfile policy: keep for binary crate (workspace root)
+# (intentionally not ignored — Cargo.lock IS committed)
+
+# Belt-and-braces against any cwd leaks: `cargo run` from a sub-crate or
+# stale tooling that resolves relative `logs`/`metrics` against the crate
+# directory will not pollute git. The canonical runtime root is `.rmlx/`
+# (resolved via `rmlx_core::paths`); anything dropped at repo root or
+# inside a crate folder is treated as orphan.
+/logs/
+/metrics/
+crates/*/logs/
+crates/*/metrics/
+
+# Editor / OS junk
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local env / secrets
+.env
+.env.local
+*.local.toml
+
+# Vendored deps (we use crates.io, no submodules at root)
+vendor/
+
+# Profiling output
+*.prof
+flamegraph.svg
+perf.data*
+
+# Pyroscope / instruments captures
+*.trace
+*.dSYM/
+
+# Local scratch
+scratch/
+tmp/
+
+# Local-only machine paths / env specifics referenced by CLAUDE.md. Never committed.
+LOCAL.md
+
+# Local cross-backend bench scratch; the canonical harness lives at ../Cross-Backend-Bench/.
+Cross-Backend-Bench/
+
+# Superpowers skill scratch (transient, never committed).
+docs/superpowers/
+
+# Findings log — local-only research notes, not committed.
+FINDINGS.md
+
+# TODO list
+TODO.md
+
+# autoresearch local logs (target-metric and serendipity tracking)
+results.tsv
+serendipity.tsv
+
+# Python bytecode cache (parity / helper scripts under scripts/)
+__pycache__/
+*.pyc
+
+# Claude Code runtime state (per-session locks, etc.)
+.claude/
+
+# rMLX runtime data root (logs / metrics / DB / cache / tmp). Resolved via
+# `$RMLX_HOME` or workspace-walk; the dev default is this in-tree directory.
+.rmlx/
+
+# Generated champions table (regenerate via `make metrics-export`; not tracked).
+/BENCHMARK_CHAMPIONS.md
+scripts/release_e2e/stage6_perf/last_run.json
+
+# Repo-local model-snapshot dir (RMLX_O_MODELS_ROOT fallback). Drop snapshots here.
+/models/

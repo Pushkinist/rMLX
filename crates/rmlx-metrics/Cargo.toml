@@ -1,0 +1,30 @@
+[package]
+name = "rmlx-metrics"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "rMLX metrics database — DB connection, schema migrations, metric/prompt registry, ingest/query/export APIs."
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+rmlx-core  = { workspace = true }
+
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2     = "0.10"
+time     = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+uuid     = { version = "1", features = ["v4"] }
+csv      = "1"
+toml     = "0.8"
+
+[dev-dependencies]
+tempfile    = "3"
+regex-lite  = "0.1"

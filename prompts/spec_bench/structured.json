@@ -1,0 +1,11 @@
+{
+  "name": "spec-bench-fibonacci-10",
+  "class": "structured",
+  "notes": "Short deterministic structured output. Moderate MTP accept rate (~0.68 on gemma-4-e2b-it-mxfp8). Output is ~22 tokens; absolute TPS not comparable to longer-output prompts.",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Output exactly the first 10 Fibonacci numbers, separated by commas, no other text."
+    }
+  ]
+}

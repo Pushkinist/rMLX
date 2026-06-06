@@ -1,0 +1,46 @@
+[package]
+name = "rmlx-models"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "rMLX models: per-architecture inference graphs (Gemma4 first)."
+
+[lints]
+workspace = true
+
+[dependencies]
+rmlx-core    = { workspace = true }
+rmlx-mlx     = { workspace = true }
+rmlx-quant   = { workspace = true }
+rmlx-kv-quant = { workspace = true }
+rmlx-kv-ssd  = { workspace = true }
+rmlx-loader  = { workspace = true }
+rmlx-runtime = { workspace = true }
+rmlx-metrics = { workspace = true }
+safetensors  = { workspace = true }
+thiserror    = { workspace = true }
+tracing      = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+tokenizers   = { workspace = true }
+rustc-hash   = { workspace = true }
+twox-hash    = { workspace = true }
+image        = { workspace = true }
+
+symphonia = { workspace = true }
+rustfft   = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# Criterion micro-benchmarks for prefix-index strategies. Pulled
+# from the workspace pin so rmlx-quant and rmlx-models stay aligned. Not
+# wired into `make ci` — run on demand via
+# `cargo bench -p rmlx-models --bench prefix_index_bench`.
+criterion = { workspace = true }
+
+[[bench]]
+name    = "prefix_index_bench"
+harness = false

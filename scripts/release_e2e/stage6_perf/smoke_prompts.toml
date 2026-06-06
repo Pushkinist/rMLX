@@ -1,0 +1,95 @@
+# KV-codec smoke prompts.
+#
+# Three short, deterministic, arch-independent prompts used by every row in
+# `kv_codec_matrix.toml`. Each prompt drives one `rmlx baseline` invocation
+# and the runner validates the model's continuation against `validate_regex`
+# (Python `re` / Rust regex compatible syntax — no lookaround, no Unicode
+# category escapes). A row FAILs if any single prompt fails validation.
+#
+# Rationale for the choices below:
+#
+#   * `coherence`     — open-ended generation, language fluency floor. A
+#                       broken KV cache typically collapses into repetition,
+#                       gibberish, or empty output well before fluency is
+#                       acceptable. Validator counts ASCII word chars and
+#                       requires >= 95% printable / non-control ratio across
+#                       the continuation.
+#   * `instruction`   — short instruction-following with a structural signal
+#                       (three numbered items). A broken codec can still
+#                       emit plausible English but typically loses the
+#                       numbered structure first, so the regex is the cheap
+#                       canary.
+#   * `multi_turn`    — three-turn OpenAI-style chat where the final user
+#                       turn references information introduced in the first
+#                       assistant turn. The runner converts this into a
+#                       single concatenated prompt (the smoke harness uses
+#                       `rmlx baseline --prompt <file>`, which is text-only;
+#                       a real chat-template apply would require `rmlx serve`
+#                       and is left for a follow-up). Validator checks
+#                       that the answer mentions the seed word "lighthouse"
+#                       carried from turn 1.
+#
+# Choice constraints honoured:
+#   - English-only prompts (no cross-lingual confound).
+#   - No model-family-specific tokens (system tags, tool calls).
+#   - Short generation budget (32 tokens) so a full matrix sweep stays
+#     under wall-clock budget on M-series hardware.
+#   - Greedy decoding (temperature=0 set by `rmlx baseline` default) for
+#     bit-exact reproducibility across runs.
+
+[prompts.coherence]
+prompt = "Describe a sunrise in three sentences."
+max_tokens = 64
+# Fluent-prose detector: at least five words separated by any whitespace or
+# ASCII punctuation. Updated 2026-06-02: the original separator class
+# `[ ,.';:!?-]` excluded `\n`, `\t`, and markdown symbols (`*`, `#`),
+# causing the gate to incorrectly reject thinking-model output (Bonsai /
+# Qwen3.6 emit <think> blocks with structured markdown before the actual
+# answer). Using `\s` in the separator class allows any whitespace including
+# newlines, matching word sequences across multiple lines in thinking content.
+# The min_printable_ratio guard (0.95) still catches pure-binary or
+# null-byte outputs. Incoherent repetition loops are caught by the multi-word
+# requirement: a model stuck emitting the same token cannot produce 5 distinct
+# `[a-z]+` sequences without at least 5 distinct tokens.
+validate_regex = "(?i)(?:[a-z]+[\\s,.';:!?*#-]+){4}[a-z]+"
+min_printable_ratio = 0.95
+
+[prompts.instruction]
+prompt = "List 3 benefits of regular exercise. Number them 1, 2, 3."
+max_tokens = 96
+# Require the digits 1, 2, 3 to appear in sequence anywhere in the output.
+# Updated 2026-06-02: the original regex `(?s).*1[.)].*2[.)].*3[.)]` required
+# the numerals as explicit list markers (`1.` or `1)`) in order, which thinking
+# models (Bonsai/Qwen3.6) fail in raw text-completion mode because they
+# continue the prompt format rather than producing a formatted list.
+# The `\b1\b` variant also fails: Rust Debug format escapes `\n` as `\\n`
+# (two chars: `\` + `n`), so extracted decoded text has `n` adjacent to
+# digits (`\\n1.`). `\b` requires a non-word char before `1`; `n` is `\w`
+# so `\b1` does not fire. Minimal correct form `(?s)1.*2.*3` matches digits
+# in sequence with any intervening content, including the prompt echo
+# `Number them 1, 2, 3.` and properly formatted `1.`/`2.`/`3.` lists.
+validate_regex = "(?s)1.*2.*3"
+min_printable_ratio = 0.95
+
+[prompts.multi_turn]
+# Short-context recall probe: the seed fact ("red and white") appears in
+# immediate context and the model must echo it back. This replaces the
+# original multi-turn `User:`/`Assistant:` format (2026-06-02 fix): Gemma4 in
+# raw text-completion mode does not use `User:`/`Assistant:` as turn
+# delimiters and answers "I don't have a specific color" without referencing
+# the colour from the prompt. The underlying KV-cache coherence property we
+# care about — "does the codec retain recently-seen tokens?" — is equally
+# well tested by a single-paragraph proximity-recall format that is
+# arch-independent (no chat-template markup, no role labels).
+# Gemma4 (Gemma4ForConditionalGeneration) requires
+# `<start_of_turn>model\n` for proper multi-turn, which is arch-specific.
+# Using a factual recall paragraph avoids the chat-template confound while
+# still catching KV codec failures: a broken codec collapses into gibberish
+# or echoes unrelated tokens, failing to reproduce "red", "white", or
+# "lighthouse".
+prompt = "The coastal lighthouse was painted red and white. Sailors could see it from miles away because of its distinctive red and white color. Question: What color was the lighthouse? Answer:"
+max_tokens = 32
+# The model must echo at least one of the seed colour words OR the seed noun,
+# demonstrating that the KV cache retained the immediately-preceding context.
+validate_regex = "(?i)(lighthouse|red|white)"
+min_printable_ratio = 0.95

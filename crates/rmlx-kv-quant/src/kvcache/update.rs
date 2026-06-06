@@ -1,0 +1,6207 @@
+//! Update paths: `update`, prefill, GPU state management, and storage-specific appenders.
+#![allow(
+    clippy::cognitive_complexity,
+    clippy::items_after_statements,
+    clippy::manual_let_else,
+    clippy::match_same_arms,
+    clippy::too_many_lines
+)]
+
+use std::sync::OnceLock;
+
+use rmlx_core::error::{Error, Result};
+use rmlx_mlx::{zeros, Array, Device, Dtype};
+
+use crate::storage::{
+    IsoBlocks, KvStorage, QuantIsoK3, QuantIsoK4, QuantIsoV3, QuantIsoV4, QuantK, QuantKTurbo3,
+    QuantKTurbo4, QuantPlanarK, QuantPlanarV, QuantRotorV3, QuantRotorV4, QuantV, RotorBlocks,
+    RotorKBlocks, ISO3_GROUP_SIZE, ISO4_GROUP_SIZE,
+};
+use crate::turbo_flash_msl::{turbo_flash_lock_enabled, turbo_flash_sdpa, turbo_flash_should_run};
+use crate::KvQuant;
+
+use super::helpers::{array_to_f32_vec, arrays_to_f32, f32_vec_to_array, storage_variant_name};
+use super::KvCache;
+
+/// Narrow `layer_idx` (`usize`) to `u32` for rotor-seed APIs.
+///
+/// Centralizes the cast so the `cast_possible_truncation` lint allow is
+/// scoped to a single spot rather than the whole module. `layer_idx` is a
+/// model-layer count (≤ thousands), well within `u32::MAX`. Taking the value
+/// by argument (not via `&self`) avoids partial-borrow conflicts at call
+/// sites that already hold a mutable borrow on `self.storage`.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "layer_idx is a model-layer count (≤ thousands), fits u32"
+)]
+#[inline]
+fn layer_idx_u32(layer_idx: usize) -> u32 {
+    layer_idx as u32
+}
+
+/// Encode a KV chunk (`new_kv`, shape `[B, kv_h, S, D]`) via the iso4
+/// MSL kernel and return the resulting CPU [`IsoBlocks`].
+///
+/// Mirrors the CPU codec ([`crate::isoquant::iso_encode_fast`] with
+/// `bits = 4`): the returned block's `n_tokens` equals `B * kv_h * S`, codes
+/// are bit-packed identically (8 vals/u32, dense), and the per-token L2 norm
+/// is preserved (deduplicated from the per-group GPU norm slot).
+///
+/// The kernel is axis-agnostic, so the same helper drives both the V-side
+/// ([`QuantIsoV4`]) and K-side ([`QuantIsoK4`]) appenders.
+///
+/// # Errors
+///
+/// Forwards Metal kernel / shape errors as `Error::Mlx` / `Error::Quant`.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "shape rank guarded to 4 immediately above each indexing site; new_shape[0..=3] are always in-bounds"
+)]
+fn iso4_gpu_encode_block(new_kv: &Array, new_shape: &[i32]) -> Result<IsoBlocks> {
+    if new_shape.len() != 4 {
+        return Err(Error::Mlx(format!(
+            "iso4_gpu_encode_block: expected 4D new_shape, got {new_shape:?}"
+        )));
+    }
+    let b = new_shape[0] as usize;
+    let kv_h = new_shape[1] as usize;
+    let s = new_shape[2] as usize;
+    let head_dim = new_shape[3] as usize;
+    let n_tokens_total = b * kv_h * s;
+    if !head_dim.is_multiple_of(ISO4_GROUP_SIZE) {
+        return Err(Error::Quant(format!(
+            "iso4_gpu_encode_block: head_dim={head_dim} must be a positive multiple of \
+             ISO4_GROUP_SIZE={ISO4_GROUP_SIZE}"
+        )));
+    }
+    let n_groups = head_dim / ISO4_GROUP_SIZE;
+
+    tracing::debug!(
+        target: "rmlx::kv_quant::iso4",
+        n_tokens = n_tokens_total,
+        n_groups,
+        head_dim,
+        "iso4 GPU encode block"
+    );
+
+    let (codes_arr, scales_arr, quats_arr, norms_arr) =
+        crate::isoquant_msl_v4::iso_quantize_v4_gpu(new_kv, head_dim, Device::Gpu)?;
+    let (codes, scales, quaternions, norms) = crate::isoquant_msl_v4::iso4_gpu_outputs_to_cpu(
+        &codes_arr,
+        &scales_arr,
+        &quats_arr,
+        &norms_arr,
+        n_tokens_total,
+        n_groups,
+    )?;
+
+    Ok(IsoBlocks {
+        codes,
+        scales,
+        quaternions,
+        norms,
+        n_tokens: n_tokens_total,
+    })
+}
+
+/// Push a pre-built [`IsoBlocks`] onto a [`QuantIsoV4`] buffer and update
+/// `vs.shape` the same way [`QuantIsoV4::append`] does.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "vs.shape rank-4 guard above each indexing site; new_shape rank validated by upstream encoder helper"
+)]
+fn push_iso4_v_block(vs: &mut QuantIsoV4, block: IsoBlocks, new_shape: &[i32]) {
+    vs.blocks.push(block);
+    if vs.shape.len() != 4 || vs.shape[0] == 0 {
+        vs.shape = new_shape.to_vec();
+    } else {
+        vs.shape[2] += new_shape[2];
+    }
+}
+
+/// Push a pre-built [`IsoBlocks`] onto a [`QuantIsoK4`] buffer and update
+/// `ks.shape` the same way [`QuantIsoK4::append`] does.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "ks.shape rank-4 guard above each indexing site; new_shape rank validated by upstream encoder helper"
+)]
+fn push_iso4_k_block(ks: &mut QuantIsoK4, block: IsoBlocks, new_shape: &[i32]) {
+    ks.blocks.push(block);
+    if ks.shape.len() != 4 || ks.shape[0] == 0 {
+        ks.shape = new_shape.to_vec();
+    } else {
+        ks.shape[2] += new_shape[2];
+    }
+}
+
+/// Convenience wrapper — encode `new_v` via GPU iso4 kernel and append
+/// the resulting block to `vs`. Shared by [`KvCache::update_iso4`] and
+/// [`KvCache::update_iso4_sym`].
+fn iso4_gpu_append_into_blocks(
+    vs: &mut QuantIsoV4,
+    new_v: &Array,
+    new_shape: &[i32],
+) -> Result<()> {
+    let block = iso4_gpu_encode_block(new_v, new_shape)?;
+    push_iso4_v_block(vs, block, new_shape);
+    Ok(())
+}
+
+/// Convenience wrapper for the K-side iso4 codec
+/// ([`KvCache::update_iso_k_only_4`] and the K-side of
+/// [`KvCache::update_iso4_sym`]).
+fn iso4_gpu_append_into_k_blocks(
+    ks: &mut QuantIsoK4,
+    new_k: &Array,
+    new_shape: &[i32],
+) -> Result<()> {
+    let block = iso4_gpu_encode_block(new_k, new_shape)?;
+    push_iso4_k_block(ks, block, new_shape);
+    Ok(())
+}
+
+// ── Iso3 MSL helpers (mirror of iso4) ────────────────────────────────────────
+
+/// Encode a KV chunk (`new_kv`, shape `[B, kv_h, S, D]`) via the iso3
+/// MSL kernel and return the resulting CPU [`IsoBlocks`].
+///
+/// Mirrors the CPU codec ([`crate::isoquant::iso_encode_fast`] with
+/// `bits = 3`): the returned block's `n_tokens` equals `B * kv_h * S`, codes
+/// are bit-packed identically (10 vals/u32, Planar3 pack convention), and the
+/// per-token L2 norm is preserved (deduplicated from the per-group GPU norm
+/// slot).
+///
+/// The kernel is axis-agnostic, so the same helper drives both the V-side
+/// ([`QuantIsoV3`]) and K-side ([`QuantIsoK3`]) appenders.
+///
+/// # Errors
+///
+/// Forwards Metal kernel / shape errors as `Error::Mlx` / `Error::Quant`.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "shape rank guarded to 4 immediately above each indexing site; new_shape[0..=3] are always in-bounds"
+)]
+fn iso3_gpu_encode_block(new_kv: &Array, new_shape: &[i32]) -> Result<IsoBlocks> {
+    if new_shape.len() != 4 {
+        return Err(Error::Mlx(format!(
+            "iso3_gpu_encode_block: expected 4D new_shape, got {new_shape:?}"
+        )));
+    }
+    let b = new_shape[0] as usize;
+    let kv_h = new_shape[1] as usize;
+    let s = new_shape[2] as usize;
+    let head_dim = new_shape[3] as usize;
+    let n_tokens_total = b * kv_h * s;
+    if !head_dim.is_multiple_of(ISO3_GROUP_SIZE) {
+        return Err(Error::Quant(format!(
+            "iso3_gpu_encode_block: head_dim={head_dim} must be a positive multiple of \
+             ISO3_GROUP_SIZE={ISO3_GROUP_SIZE}"
+        )));
+    }
+    let n_groups = head_dim / ISO3_GROUP_SIZE;
+
+    tracing::debug!(
+        target: "rmlx::kv_quant::iso3",
+        n_tokens = n_tokens_total,
+        n_groups,
+        head_dim,
+        "iso3 GPU encode block"
+    );
+
+    let (codes_arr, scales_arr, quats_arr, norms_arr) =
+        crate::isoquant_msl::iso_quantize_v3_gpu(new_kv, head_dim, Device::Gpu)?;
+    let (codes, scales, quaternions, norms) = crate::isoquant_msl::iso3_gpu_outputs_to_cpu(
+        &codes_arr,
+        &scales_arr,
+        &quats_arr,
+        &norms_arr,
+        n_tokens_total,
+        n_groups,
+    )?;
+
+    Ok(IsoBlocks {
+        codes,
+        scales,
+        quaternions,
+        norms,
+        n_tokens: n_tokens_total,
+    })
+}
+
+// `push_iso3_v_block` was removed along with the V-side helper —
+// `QuantIsoV3::append_gpu` now owns shape bookkeeping for the V path. The
+// K-side equivalent (`push_iso3_k_block`) is still in use below.
+
+/// Push a pre-built [`IsoBlocks`] onto a [`QuantIsoK3`] buffer and update
+/// `ks.shape` the same way [`QuantIsoK3::append`] does.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "ks.shape rank-4 guard above each indexing site; new_shape rank validated by upstream encoder helper"
+)]
+fn push_iso3_k_block(ks: &mut QuantIsoK3, block: IsoBlocks, new_shape: &[i32]) {
+    ks.blocks.push(block);
+    if ks.shape.len() != 4 || ks.shape[0] == 0 {
+        ks.shape = new_shape.to_vec();
+    } else {
+        ks.shape[2] += new_shape[2];
+    }
+}
+
+// The V-side iso3 helper
+// `iso3_gpu_append_into_blocks(vs, new_v, &new_shape)` was inlined into
+// `QuantIsoV3::append_gpu` (which also writes the GPU-resident mirror). The
+// K-side wrapper below remains in use.
+
+/// Convenience wrapper for the K-side iso3 codec
+/// ([`KvCache::update_iso_k_only_3`] and the K-side of
+/// [`KvCache::update_iso3_sym`]).
+fn iso3_gpu_append_into_k_blocks(
+    ks: &mut QuantIsoK3,
+    new_k: &Array,
+    new_shape: &[i32],
+) -> Result<()> {
+    let block = iso3_gpu_encode_block(new_k, new_shape)?;
+    push_iso3_k_block(ks, block, new_shape);
+    Ok(())
+}
+
+// ── Rotor3 / rotor4 MSL helpers ───────────────────────────────────────────────
+
+/// Encode a KV chunk (`new_kv`, shape `[B, kv_h, S, D]`) via the
+/// `bits`-bit rotor MSL kernel and return the resulting CPU
+/// [`RotorBlocks`].
+///
+/// The kernel is axis-agnostic: V-side and K-side (QJL off) callers feed
+/// identically-shaped slices and consume the same `(codes, scales, norms)`
+/// triple. The `rotors` slice is the static per-(layer, head) rotor table,
+/// flat `[n_groups * 4]` f32.
+///
+/// # Errors
+///
+/// Forwards Metal kernel / shape errors as `Error::Mlx` / `Error::Quant`.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "shape rank guarded to 4 immediately above each indexing site; new_shape[0..=3] are always in-bounds"
+)]
+fn rotor_gpu_encode_block(
+    new_kv: &Array,
+    new_shape: &[i32],
+    rotors: &[f32],
+    bits: u8,
+) -> Result<RotorBlocks> {
+    if new_shape.len() != 4 {
+        return Err(Error::Mlx(format!(
+            "rotor_gpu_encode_block: expected 4D new_shape, got {new_shape:?}"
+        )));
+    }
+    let b = new_shape[0] as usize;
+    let kv_h = new_shape[1] as usize;
+    let s = new_shape[2] as usize;
+    let head_dim = new_shape[3] as usize;
+    let n_tokens_total = b * kv_h * s;
+    let n_groups = head_dim.div_ceil(crate::rotorquant::ROTOR3_GROUP_SIZE);
+
+    let rotors_arr = crate::rotorquant_msl::rotor_table_to_array(rotors)?;
+
+    let (codes_arr, scales_arr, norms_arr) = if bits == crate::rotorquant::ROTOR3_BITS {
+        crate::rotorquant_msl::rotor_quantize_v3_gpu(new_kv, &rotors_arr, head_dim, Device::Gpu)?
+    } else {
+        crate::rotorquant_msl::rotor_quantize_v4_gpu(new_kv, &rotors_arr, head_dim, Device::Gpu)?
+    };
+    let (codes, scales, norms) = crate::rotorquant_msl::rotor_gpu_outputs_to_cpu(
+        &codes_arr,
+        &scales_arr,
+        &norms_arr,
+        n_tokens_total,
+        n_groups,
+    )?;
+
+    Ok(RotorBlocks {
+        codes,
+        scales,
+        norms,
+        n_tokens: n_tokens_total,
+    })
+}
+
+/// Ensure `vs.rotors` is initialised for `head_dim` (mirrors the lazy-init
+/// branch inside [`QuantRotorV3::append`] / [`QuantRotorV4::append`]).
+///
+/// The CPU `append` lazy-inits the rotor table on first call; the GPU path
+/// bypasses that, so the helpers below seed the table once before dispatch.
+fn ensure_v3_rotors(vs: &mut QuantRotorV3, head_dim: usize) {
+    if vs.rotors.is_empty() {
+        let n_groups = head_dim.div_ceil(crate::rotorquant::ROTOR3_GROUP_SIZE);
+        vs.rotors = crate::clifford::make_rotor_table(vs.layer_idx, vs.head_idx, n_groups);
+    }
+}
+
+fn ensure_v4_rotors(vs: &mut QuantRotorV4, head_dim: usize) {
+    if vs.rotors.is_empty() {
+        let n_groups = head_dim.div_ceil(crate::rotorquant::ROTOR3_GROUP_SIZE);
+        vs.rotors = crate::clifford::make_rotor_table(vs.layer_idx, vs.head_idx, n_groups);
+    }
+}
+
+/// The CPU `QuantRotorK3::append` couples rotor-table init with QJL
+/// projection-matrix init under a single `if self.rotors.is_empty()` guard.
+/// The GPU encode path bypasses that `append`, so seed both here too —
+/// otherwise a mid-run CPU fallback after a GPU first-chunk would find
+/// `rotors` non-empty, skip QJL init, and silently encode without QJL. We
+/// always seed when `rotor_qjl_enabled()` is true; the GPU encode itself
+/// ignores the JL projection, so this is harmless on the pure-GPU path.
+fn ensure_k3_rotors(ks: &mut crate::storage::QuantRotorK3, head_dim: usize) {
+    if ks.rotors.is_empty() {
+        let n_groups = head_dim.div_ceil(crate::rotorquant::ROTOR3_GROUP_SIZE);
+        ks.rotors = crate::clifford::make_rotor_table(ks.layer_idx, ks.head_idx, n_groups);
+        if crate::rotor_qjl::rotor_qjl_enabled() && ks.qjl_s_matrix.is_none() {
+            ks.qjl_s_matrix = Some(crate::rotorquant::make_qjl_projection(head_dim));
+        }
+    }
+}
+
+/// See [`ensure_k3_rotors`] for the QJL-init coupling rationale.
+fn ensure_k4_rotors(ks: &mut crate::storage::QuantRotorK4, head_dim: usize) {
+    if ks.rotors.is_empty() {
+        let n_groups = head_dim.div_ceil(crate::rotorquant::ROTOR3_GROUP_SIZE);
+        ks.rotors = crate::clifford::make_rotor_table(ks.layer_idx, ks.head_idx, n_groups);
+        if crate::rotor_qjl::rotor_qjl_enabled() && ks.qjl_s_matrix.is_none() {
+            ks.qjl_s_matrix = Some(crate::rotorquant::make_qjl_projection(head_dim));
+        }
+    }
+}
+
+/// Push a pre-built [`RotorBlocks`] onto a [`QuantRotorV3`] buffer and update
+/// `vs.shape` the same way [`QuantRotorV3::append`] does.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "vs.shape rank-4 guard above each indexing site; new_shape rank validated by upstream encoder helper"
+)]
+fn push_rotor3_v_block(vs: &mut QuantRotorV3, block: RotorBlocks, new_shape: &[i32]) {
+    vs.blocks.push(block);
+    if vs.shape.len() != 4 || vs.shape[0] == 0 {
+        vs.shape = new_shape.to_vec();
+    } else {
+        vs.shape[2] += new_shape[2];
+    }
+}
+
+#[allow(
+    clippy::indexing_slicing,
+    reason = "vs.shape rank-4 guard above each indexing site; new_shape rank validated by upstream encoder helper"
+)]
+fn push_rotor4_v_block(vs: &mut QuantRotorV4, block: RotorBlocks, new_shape: &[i32]) {
+    vs.blocks.push(block);
+    if vs.shape.len() != 4 || vs.shape[0] == 0 {
+        vs.shape = new_shape.to_vec();
+    } else {
+        vs.shape[2] += new_shape[2];
+    }
+}
+
+/// Push a pre-built [`RotorBlocks`] onto a [`QuantRotorK3`] buffer (QJL OFF
+/// path — caller has already verified [`crate::rotor_qjl::rotor_qjl_enabled`]
+/// is `false`).
+#[allow(
+    clippy::indexing_slicing,
+    reason = "ks.shape rank-4 guard above each indexing site; new_shape rank validated by upstream encoder helper"
+)]
+fn push_rotor3_k_block(
+    ks: &mut crate::storage::QuantRotorK3,
+    block: RotorBlocks,
+    new_shape: &[i32],
+) {
+    ks.blocks.push(RotorKBlocks {
+        codes: block.codes,
+        scales: block.scales,
+        norms: block.norms,
+        qjl_codes: Vec::new(),
+        qjl_norms: Vec::new(),
+        n_tokens: block.n_tokens,
+    });
+    if ks.shape.len() != 4 || ks.shape[0] == 0 {
+        ks.shape = new_shape.to_vec();
+    } else {
+        ks.shape[2] += new_shape[2];
+    }
+}
+
+#[allow(
+    clippy::indexing_slicing,
+    reason = "ks.shape rank-4 guard above each indexing site; new_shape rank validated by upstream encoder helper"
+)]
+fn push_rotor4_k_block(
+    ks: &mut crate::storage::QuantRotorK4,
+    block: RotorBlocks,
+    new_shape: &[i32],
+) {
+    ks.blocks.push(RotorKBlocks {
+        codes: block.codes,
+        scales: block.scales,
+        norms: block.norms,
+        qjl_codes: Vec::new(),
+        qjl_norms: Vec::new(),
+        n_tokens: block.n_tokens,
+    });
+    if ks.shape.len() != 4 || ks.shape[0] == 0 {
+        ks.shape = new_shape.to_vec();
+    } else {
+        ks.shape[2] += new_shape[2];
+    }
+}
+
+/// Recover `head_dim` from a 4-D new_shape without silently swallowing
+/// malformed shapes (previous `.get(3).unwrap_or(0)` pattern). Returns
+/// `Error::Mlx` on rank mismatch.
+fn head_dim_from_shape(new_shape: &[i32], ctx: &str) -> Result<usize> {
+    if new_shape.len() != 4 {
+        return Err(Error::Mlx(format!(
+            "{ctx}: expected 4D new_shape, got {new_shape:?}"
+        )));
+    }
+    // `.get(3)` rather than `[3]` to avoid the `clippy::indexing_slicing`
+    // allow; rank-4 guard above guarantees the value is present.
+    let d = new_shape.get(3).copied().ok_or_else(|| {
+        Error::Mlx(format!(
+            "{ctx}: shape len {} mismatched rank-4 guard (internal invariant)",
+            new_shape.len()
+        ))
+    })?;
+    Ok(d as usize)
+}
+
+/// V-side convenience wrapper: GPU-encode + push onto a [`QuantRotorV3`]
+/// buffer. Lazy-inits the rotor table on first call.
+fn rotor3_gpu_append_into_blocks(
+    vs: &mut QuantRotorV3,
+    new_v: &Array,
+    new_shape: &[i32],
+) -> Result<()> {
+    let head_dim = head_dim_from_shape(new_shape, "rotor3_gpu_append_into_blocks")?;
+    ensure_v3_rotors(vs, head_dim);
+    let block =
+        rotor_gpu_encode_block(new_v, new_shape, &vs.rotors, crate::rotorquant::ROTOR3_BITS)?;
+    push_rotor3_v_block(vs, block, new_shape);
+    Ok(())
+}
+
+fn rotor4_gpu_append_into_blocks(
+    vs: &mut QuantRotorV4,
+    new_v: &Array,
+    new_shape: &[i32],
+) -> Result<()> {
+    let head_dim = head_dim_from_shape(new_shape, "rotor4_gpu_append_into_blocks")?;
+    ensure_v4_rotors(vs, head_dim);
+    let block =
+        rotor_gpu_encode_block(new_v, new_shape, &vs.rotors, crate::rotorquant::ROTOR4_BITS)?;
+    push_rotor4_v_block(vs, block, new_shape);
+    Ok(())
+}
+
+/// K-side convenience wrapper, QJL off only. Caller MUST check
+/// [`crate::rotor_qjl::rotor_qjl_enabled`] returns `false` before invoking
+/// this; with QJL enabled, fall back to the CPU [`QuantRotorK3::append`] path
+/// (the K-side QJL residual is not implemented in MSL — see
+/// `rotorquant_msl.rs`).
+fn rotor3_gpu_append_into_k_blocks(
+    ks: &mut crate::storage::QuantRotorK3,
+    new_k: &Array,
+    new_shape: &[i32],
+) -> Result<()> {
+    let head_dim = head_dim_from_shape(new_shape, "rotor3_gpu_append_into_k_blocks")?;
+    ensure_k3_rotors(ks, head_dim);
+    // qjl_s_matrix is seeded inside `ensure_k3_rotors` when `rotor_qjl_enabled()`
+    // is true (mid-run CPU fallback after a GPU first-chunk needs it). The GPU
+    // encode itself ignores the JL projection — this path is QJL-off-only by
+    // dispatcher contract.
+    let block =
+        rotor_gpu_encode_block(new_k, new_shape, &ks.rotors, crate::rotorquant::ROTOR3_BITS)?;
+    push_rotor3_k_block(ks, block, new_shape);
+    Ok(())
+}
+
+fn rotor4_gpu_append_into_k_blocks(
+    ks: &mut crate::storage::QuantRotorK4,
+    new_k: &Array,
+    new_shape: &[i32],
+) -> Result<()> {
+    let head_dim = head_dim_from_shape(new_shape, "rotor4_gpu_append_into_k_blocks")?;
+    ensure_k4_rotors(ks, head_dim);
+    let block =
+        rotor_gpu_encode_block(new_k, new_shape, &ks.rotors, crate::rotorquant::ROTOR4_BITS)?;
+    push_rotor4_k_block(ks, block, new_shape);
+    Ok(())
+}
+
+impl KvCache {
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    /// Append one decode step's K/V tensors (or a prefill chunk) to the cache.
+    pub fn update(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        device: Device,
+    ) -> Result<(Array, Array)> {
+        // Rotating SWA path. The RotatingState owns its own offset
+        // (mirrors mlx-lm `RotatingKVCache.offset`), so we sync `self.offset`
+        // from it after the update. Skip the prefill_raw machinery (the
+        // rotating buffer has its own growth+rotate semantics that the
+        // pre-allocated prefill_raw buffer would conflict with).
+        if let Some(ref mut rot) = self.rotating {
+            let (k_full, v_full) = rot.update_and_fetch(new_k, new_v, device)?;
+            self.offset = rot.offset;
+            return Ok((k_full, v_full));
+        }
+
+        let new_seq = new_k.shape()[2];
+        self.offset += new_seq;
+
+        if self.in_prefill {
+            return self.update_prefill_raw(new_k, new_v, device);
+        }
+
+        // Dispatch on the actual storage variant, not self.quant.
+        //
+        // Using self.quant here was the bug: after SSD hydration, SWA
+        // layers are stored with tag "none" → KvStorage::None, but
+        // from_storage() sets self.quant to the model's global KvQuant (e.g.
+        // K8V8). The quant-based dispatch then routed to update_k8v8(), which
+        // pattern-matched self.storage expecting KvStorage::K8V8 and hit the
+        // unreachable!(). Dispatching on self.storage is the ground truth:
+        // it reflects what data is actually in the cache regardless of the
+        // declared KvQuant, and it already covers the Paged variant which was
+        // the only exception before this fix.
+        match &self.storage {
+            KvStorage::K8V4 { .. } => self.update_k8v4(new_k, new_v, device),
+            KvStorage::K8V8 { .. } => self.update_k8v8(new_k, new_v, device),
+            KvStorage::Planar { .. } => self.update_planar(new_k, new_v, device),
+            KvStorage::None { .. } => self.update_none(new_k, new_v, device),
+            KvStorage::Paged { .. } => self.update_paged(new_k, new_v, device),
+            KvStorage::Mixed { .. } | KvStorage::RotKTq4V { .. } => Err(Error::Mlx(
+                "Contract violation: KvCache::update called on a Mixed/RotKTq4V cache. \
+                     These caches MUST be driven through KvCache::update_and_sdpa (universal \
+                     wrapper). Direct update() bypasses the quantized SDPA and leaves the cache \
+                     in an inconsistent state."
+                    .into(),
+            )),
+            // K8VTurbo3 decode update — same structure as K8V4 but bits=3 on V.
+            KvStorage::K8VTurbo3 { .. } => self.update_k8vturbo3(new_k, new_v, device),
+            // TurboSym3 decode update — symmetric WHT-3 K + turbo3 V.
+            // K side uses the GPU turbo3 MSL kernel; V side forced CPU
+            // (same K8VTurbo3 precedent: GPU V-side dispatch regressed −2% TPS gate).
+            KvStorage::TurboSym3 { .. } => self.update_tsym3(new_k, new_v, device),
+            // TurboSym4 decode update — symmetric WHT-4 K + tq4 V.
+            KvStorage::TurboSym4 { .. } => self.update_tsym4(new_k, new_v, device),
+            // PlanarK decode update — K is PlanarQuant 4-bit, V bf16.
+            KvStorage::PlanarK { .. } => self.update_planar_k(new_k, new_v, device),
+            // K8VTurbo2 decode update — same structure as K8V4 but bits=2 on V.
+            KvStorage::K8VTurbo2 { .. } => self.update_k8vturbo2(new_k, new_v, device),
+            // IsoV3 decode update — K = affine q8_0, V = IsoQuant 3-bit (CPU).
+            KvStorage::IsoV3 { .. } => self.update_iso3(new_k, new_v, device),
+            // IsoV4 decode update — K = affine q8_0, V = IsoQuant 4-bit (CPU).
+            KvStorage::IsoV4 { .. } => self.update_iso4(new_k, new_v, device),
+            // RotorV3 decode update — K = affine q8_0, V = rotor3 (CPU).
+            KvStorage::RotorV3 { .. } => self.update_rotor3(new_k, new_v, device),
+            // RotorV4 decode update — K = affine q8_0, V = rotor4 (CPU).
+            KvStorage::RotorV4 { .. } => self.update_rotor4(new_k, new_v, device),
+            // K8VTurbo3Tcq decode update — same code path as
+            // K8VTurbo3 but with Viterbi trellis encode-side assignment.
+            KvStorage::K8VTurbo3Tcq { .. } => self.update_k8vturbo3_tcq(new_k, new_v, device),
+            // K8VTurbo2Tcq decode update — same code path as
+            // K8VTurbo2 but with Viterbi trellis encode-side assignment.
+            KvStorage::K8VTurbo2Tcq { .. } => self.update_k8vturbo2_tcq(new_k, new_v, device),
+            // Iso symmetric / K-only decode updates.
+            KvStorage::IsoSym3 { .. } => self.update_iso3_sym(new_k, new_v, device),
+            KvStorage::IsoSym4 { .. } => self.update_iso4_sym(new_k, new_v, device),
+            KvStorage::IsoKOnly3 { .. } => self.update_iso_k_only_3(new_k, new_v, device),
+            KvStorage::IsoKOnly4 { .. } => self.update_iso_k_only_4(new_k, new_v, device),
+            // Symmetric / K-only rotor variants.
+            KvStorage::RotorSym3 { .. } => self.update_rotor3_sym(new_k, new_v, device),
+            KvStorage::RotorSym4 { .. } => self.update_rotor4_sym(new_k, new_v, device),
+            KvStorage::RotorKOnly3 { .. } => self.update_rotor_k_only_3(new_k, new_v, device),
+            KvStorage::RotorKOnly4 { .. } => self.update_rotor_k_only_4(new_k, new_v, device),
+            // Asymmetric rotor K + affine V variants.
+            KvStorage::RotorKAsym3 { .. } => self.update_rotor_k_asym_3(new_k, new_v, device),
+            KvStorage::RotorKAsym4 { .. } => self.update_rotor_k_asym_4(new_k, new_v, device),
+        }
+    }
+
+    /// Decode-step update for the unquantised (`KvQuant::None`) cache.
+    ///
+    /// Reuses `update_decode_fp16` — the same pre-allocated bf16 buffer machinery
+    /// already used as the warm-TTFT fp16 decode seed for the quantised paths.
+    /// On the first call, `update_decode_fp16` allocates the
+    /// `[B, kv_h, max_seq, head_dim]` buffer; subsequent calls slice_update at
+    /// the current offset.
+    fn update_none(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        device: Device,
+    ) -> Result<(Array, Array)> {
+        let KvStorage::None { max_seq } = &self.storage else {
+            return Err(Error::KvStorageMismatch {
+                expected: "None",
+                got: storage_variant_name(&self.storage),
+            });
+        };
+        let max_seq = *max_seq;
+        self.update_decode_fp16(new_k, new_v, max_seq, device)
+    }
+
+    /// Enforce the optional `RMLX_KV_MAX_SEQ_HARD_CAP` and grow the
+    /// per-layer raw prefill buffer when the next chunk would overflow it.
+    ///
+    /// `needed_seq` is the post-append sequence length (`prev_offset + new_seq`).
+    /// When the existing `[B, kv_h, max_seq, head_dim]` buffer is too small,
+    /// a new buffer of the next power-of-two capacity is allocated and the
+    /// filled prefix `[..prev_offset]` is copied forward via `slice_update`.
+    /// The storage variant's `max_seq` is bumped to the new capacity so
+    /// downstream `exit_prefill` quantised buffers honour the same size.
+    ///
+    /// # Resumed-cache guard
+    ///
+    /// The "quantised payload not allocated yet" doc-claim only holds on the
+    /// **first** prefill of a layer. `KvCache::enter_prefill` only flips
+    /// `in_prefill=true` and clears `prefill_raw_k/v`; it does NOT reset
+    /// payload buffers or `MixedKvState.offset`. On any resumed-cache path
+    /// (chunked-prefill resume across calls, SSD-hydrate seed, branched
+    /// generation), the storage already carries on-axis buffers sized to the
+    /// old `max_seq`. Bumping the scalar would let it disagree with the
+    /// payload shape and produce a shape assert or silent truncation in
+    /// `exit_prefill`. The guard below detects payload presence and fails
+    /// loudly with a typed error instead.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "internal helper; carries the prefill shape derived from new_k/new_v in the caller"
+    )]
+    fn ensure_prefill_capacity(
+        &mut self,
+        needed_seq: i32,
+        prev_offset: i32,
+        b: i32,
+        kv_h: i32,
+        head_dim: i32,
+        k_dtype: Dtype,
+        v_dtype: Dtype,
+        device: Device,
+    ) -> Result<()> {
+        // Hard cap: opt-in via `RMLX_KV_MAX_SEQ_HARD_CAP`. Unset → no cap.
+        if let Some(cap) = kv_hard_cap() {
+            if needed_seq > cap {
+                tracing::warn!(
+                    requested = needed_seq,
+                    cap,
+                    "KV hard cap exceeded — rejecting prefill request"
+                );
+                return Err(Error::KvHardCapExceeded {
+                    requested: needed_seq,
+                    cap,
+                });
+            }
+        }
+
+        let current_max_seq = storage_max_seq(&self.storage);
+        if needed_seq <= current_max_seq {
+            return Ok(());
+        }
+
+        // A grow on a resumed cache (any payload currently materialised)
+        // would leave the storage `max_seq` scalar disagreeing with the
+        // on-axis payload buffer length sized to the old max_seq → shape
+        // assert or silent truncation downstream. Detect and fail loudly
+        // instead of corrupting the buffers. The grow path is only legal on
+        // a fresh layer / between `enter_prefill` and the very first
+        // `exit_prefill`, where no quantised payload exists yet.
+        //
+        // Invariant: callers (chunked-prefill resume, SSD-hydrate seed,
+        // branched generation) MUST size the cache to fit the full prompt
+        // at construction time. Hitting this branch in production means the
+        // caller mis-sized the cache. Documented as a non-fatal typed error
+        // so the runtime degrades cleanly; the test
+        // [`update_prefill_raw_rejects_grow_on_resumed_cache`]
+        // exercises this exact path.
+        if self.storage_has_materialised_payload() {
+            return Err(Error::Mlx(
+                "grow not legal after exit_prefill — current_max_seq exceeded on \
+                 resumed cache; raise --max-ctx or RMLX_KV_MAX_SEQ_HARD_CAP"
+                    .into(),
+            ));
+        }
+
+        // Grow to next power-of-two ≥ needed. Doubling avoids per-chunk
+        // churn during multi-chunk prefill while keeping the buffer within
+        // a single doubling of the request.
+        let new_max_seq = next_pow2_seq(needed_seq);
+
+        tracing::info!(
+            from = current_max_seq,
+            to = new_max_seq,
+            needed_seq,
+            "KV prefill buffer grow"
+        );
+
+        // Bump max_seq on the storage variant first so subsequent reads see
+        // the new capacity (single-source-of-truth for exit_prefill).
+        set_storage_max_seq(&mut self.storage, new_max_seq);
+
+        // If the raw prefill buffer was already allocated, copy the filled
+        // prefix `[..prev_offset]` into a fresh, larger buffer. If not
+        // allocated, the lazy path in `update_prefill_raw` will pick up the
+        // new max_seq below.
+        //
+        // `prev_offset` is computed upstream as `self.offset - new_seq` after
+        // `self.offset += new_seq`, so it is structurally non-negative at this
+        // call site. Pin the invariant with a `debug_assert!` instead of
+        // laundering it through `.max(0)`.
+        debug_assert!(
+            prev_offset >= 0,
+            "prev_offset invariant — offset accounting upstream"
+        );
+        let filled = prev_offset;
+        // K/V copy hoists the three slice descriptors above the K/V copy
+        // blocks. The descriptors are identical for both axes (same
+        // `[B, kv_h, filled, head_dim]` window), so sharing them
+        // is the correct deduplication and does not require a helper.
+        if let (Some(old_k), Some(old_v)) = (self.prefill_raw_k.take(), self.prefill_raw_v.take()) {
+            let new_shape = [b, kv_h, new_max_seq, head_dim];
+            let new_k_buf = zeros(&new_shape, k_dtype, device)?;
+            let new_v_buf = zeros(&new_shape, v_dtype, device)?;
+
+            let slice_start = vec![0i32; 4];
+            let slice_stop: Vec<i32> = [b, kv_h, filled, head_dim].into();
+            let strides = vec![1i32; 4];
+
+            let new_k_buf = if filled > 0 {
+                let prefix_k = old_k.slice(&slice_start, &slice_stop, &strides, device)?;
+                new_k_buf.slice_update(&prefix_k, &slice_start, &slice_stop, &strides, device)?
+            } else {
+                new_k_buf
+            };
+            let new_v_buf = if filled > 0 {
+                let prefix_v = old_v.slice(&slice_start, &slice_stop, &strides, device)?;
+                new_v_buf.slice_update(&prefix_v, &slice_start, &slice_stop, &strides, device)?
+            } else {
+                new_v_buf
+            };
+            let _ = new_k_buf.async_eval();
+            let _ = new_v_buf.async_eval();
+            self.prefill_raw_k = Some(new_k_buf);
+            self.prefill_raw_v = Some(new_v_buf);
+        }
+
+        Ok(())
+    }
+
+    /// Does the active `KvStorage` already carry quantised (or fp16-seeded)
+    /// payload buffers from a prior `exit_prefill`?
+    ///
+    /// Returns true if any K/V payload Option is `Some` on the active variant,
+    /// or — for variants that store K/V on `MixedKvState` rather than as
+    /// per-axis Options — when `state.offset > 0`. Also returns true when the
+    /// parent cache holds a decode fp16 seed (`KvStorage::None`, `PlanarK` V,
+    /// K-only variants, Paged seed), since those routes materialise their
+    /// "payload" outside the storage variant.
+    fn storage_has_materialised_payload(&self) -> bool {
+        if self.decode_fp16_k.is_some() || self.decode_fp16_v.is_some() {
+            return true;
+        }
+        match &self.storage {
+            KvStorage::K8V4 { k, v, .. } => k.is_some() || v.is_some(),
+            KvStorage::K8V8 { k, v, .. } => k.is_some() || v.is_some(),
+            KvStorage::Planar { k, v, .. } => k.is_some() || v.is_some(),
+            KvStorage::None { .. } => false,
+            KvStorage::Mixed { state, .. } => state.offset > 0,
+            KvStorage::Paged {
+                k, v_k8, v_planar, ..
+            } => k.is_some() || v_k8.is_some() || v_planar.is_some(),
+            KvStorage::RotKTq4V { k_state, v, .. } => k_state.offset > 0 || v.is_some(),
+            KvStorage::K8VTurbo3 { k, v, .. } => k.is_some() || v.is_some(),
+            KvStorage::TurboSym3 { k, v, .. } => k.is_some() || v.is_some(),
+            KvStorage::TurboSym4 { k, v, .. } => k.is_some() || v.is_some(),
+            KvStorage::PlanarK { k, .. } => k.is_some(),
+            KvStorage::K8VTurbo2 { k, v, .. } => k.is_some() || v.is_some(),
+            KvStorage::IsoV3 { k, v, .. } => k.is_some() || v.is_some(),
+            KvStorage::IsoV4 { k, v, .. } => k.is_some() || v.is_some(),
+            KvStorage::RotorV3 { k, v, .. } => k.is_some() || v.is_some(),
+            KvStorage::RotorV4 { k, v, .. } => k.is_some() || v.is_some(),
+            KvStorage::K8VTurbo3Tcq { k, v, .. } => k.is_some() || v.is_some(),
+            KvStorage::K8VTurbo2Tcq { k, v, .. } => k.is_some() || v.is_some(),
+            KvStorage::IsoSym3 { k, v, .. } => k.is_some() || v.is_some(),
+            KvStorage::IsoSym4 { k, v, .. } => k.is_some() || v.is_some(),
+            KvStorage::IsoKOnly3 { k, .. } => k.is_some(),
+            KvStorage::IsoKOnly4 { k, .. } => k.is_some(),
+            KvStorage::RotorSym3 { k, v, .. } => k.is_some() || v.is_some(),
+            KvStorage::RotorSym4 { k, v, .. } => k.is_some() || v.is_some(),
+            KvStorage::RotorKOnly3 { k, .. } => k.is_some(),
+            KvStorage::RotorKOnly4 { k, .. } => k.is_some(),
+            // RotorKAsym3 / RotorKAsym4 — either side materialised.
+            KvStorage::RotorKAsym3 { k, v, .. } => k.is_some() || v.is_some(),
+            KvStorage::RotorKAsym4 { k, v, .. } => k.is_some() || v.is_some(),
+        }
+    }
+
+    /// Append a prefill K/V chunk into the per-layer raw prefill buffer.
+    ///
+    /// # Buffer-grow contract
+    ///
+    /// The raw prefill buffer is allocated lazily on first call with shape
+    /// `[B, kv_h, max_seq, head_dim]`, where `max_seq` is the value recorded
+    /// on the active `KvStorage` variant. Before every write we check whether
+    /// `prev_offset + new_seq` fits in the current buffer; if not, we grow
+    /// the buffer to the next power-of-two ≥ needed (so subsequent chunks
+    /// also fit without churn) and copy the existing filled prefix forward.
+    /// The storage variant's `max_seq` field is bumped in lockstep so
+    /// `exit_prefill` allocates downstream quantised buffers with the same
+    /// new capacity.
+    ///
+    /// # Hard cap
+    ///
+    /// `RMLX_KV_MAX_SEQ_HARD_CAP` (env var) is an opt-in hard cap on the
+    /// total prefill length. When set and exceeded by `needed_seq`, the
+    /// call returns [`Error::KvHardCapExceeded`] **before** any allocation
+    /// happens. When the env var is unset there is no cap.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    pub(super) fn update_prefill_raw(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        device: Device,
+    ) -> Result<(Array, Array)> {
+        let shape = new_k.shape();
+        let b = shape[0];
+        let kv_h = shape[1];
+        let new_seq = shape[2];
+        let head_dim = shape[3];
+
+        let prev_offset = self.offset - new_seq;
+        let new_offset = self.offset;
+
+        // Enforce the optional hard cap before any allocation, then grow the
+        // per-layer raw prefill buffer if the new chunk would overflow it.
+        // The storage variant's `max_seq` is bumped in lockstep so the
+        // downstream `exit_prefill` quantised buffers see the new capacity.
+        self.ensure_prefill_capacity(
+            new_offset,
+            prev_offset,
+            b,
+            kv_h,
+            head_dim,
+            new_k.dtype(),
+            new_v.dtype(),
+            device,
+        )?;
+
+        let max_seq = storage_max_seq(&self.storage);
+
+        if self.prefill_raw_k.is_none() {
+            let buf_shape = [b, kv_h, max_seq, head_dim];
+            self.prefill_raw_k = Some(zeros(&buf_shape, new_k.dtype(), device)?);
+            self.prefill_raw_v = Some(zeros(&buf_shape, new_v.dtype(), device)?);
+        }
+
+        let k_buf = self.prefill_raw_k.as_mut().unwrap();
+        let v_buf = self.prefill_raw_v.as_mut().unwrap();
+
+        let ndim = 4usize;
+        let mut start = vec![0i32; ndim];
+        start[2] = prev_offset;
+        let mut stop: Vec<i32> = [b, kv_h, 0i32, head_dim].into();
+        stop[2] = new_offset;
+        let strides = vec![1i32; ndim];
+
+        let k_updated = k_buf.slice_update(new_k, &start, &stop, &strides, device)?;
+        let v_updated = v_buf.slice_update(new_v, &start, &stop, &strides, device)?;
+        *k_buf = k_updated;
+        *v_buf = v_updated;
+        let _ = k_buf.async_eval();
+        let _ = v_buf.async_eval();
+
+        let slice_start = vec![0i32; ndim];
+        let slice_stop: Vec<i32> = [b, kv_h, new_offset, head_dim].into();
+        let slice_strides = vec![1i32; ndim];
+        let k_full = k_buf.slice(&slice_start, &slice_stop, &slice_strides, device)?;
+        let v_full = v_buf.slice(&slice_start, &slice_stop, &slice_strides, device)?;
+
+        Ok((k_full, v_full))
+    }
+
+    /// Switch the cache into prefill mode (accumulates raw K/V before quantizing).
+    pub fn enter_prefill(&mut self) {
+        // Rotating cache handles prefill via update_concat directly.
+        // Skip the prefill_raw scaffolding so the ring buffer is the authority.
+        if self.rotating.is_some() {
+            return;
+        }
+        // Mixed cache also uses the fp16 prefill_raw scaffolding — store K/V
+        // as fp16 during prefill, bulk-quantize to Mixed (k8/v4/g64) in
+        // exit_prefill. This mirrors K8V4's pattern and avoids calling
+        // mx.quantize on every 256-token prefill chunk, which
+        // was the bottleneck causing 2077 ms cold TTFT vs 1353 ms champion.
+        self.in_prefill = true;
+        self.prefill_raw_k = None;
+        self.prefill_raw_v = None;
+    }
+
+    #[allow(
+        clippy::unreachable,
+        reason = "each arm is guarded by a prior `match self.quant` that guarantees storage \
+                  variant alignment; mismatch is a construction-time BUG, not a runtime condition"
+    )]
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "wildcard arm is the correct fallthrough for unsupported arch/quant variants; exhaustive expansion would require updating on every new variant"
+    )]
+    #[allow(
+        unused_qualifications,
+        reason = "pre-existing `crate::storage::QuantIsoK4::new` call sites are intentionally kept fully qualified to keep the dispatcher diff surgical; `QuantIsoK4` is imported for the new helper code only"
+    )]
+    /// Finalize prefill: quantize the accumulated raw K/V into the storage buffers.
+    pub fn exit_prefill(&mut self, device: Device) -> Result<()> {
+        if self.rotating.is_some() {
+            // No-op: rotating prefill writes go straight into the ring buffer.
+            return Ok(());
+        }
+
+        // Paged storage uses the decode_fp16 seed for prefill (same as
+        // `KvQuant::None` path) — the page allocator is populated lazily during
+        // decode steps via `update_paged`. Materialise the compact fp16 seed
+        // here and return early.
+        if matches!(self.storage, KvStorage::Paged { .. }) {
+            self.in_prefill = false;
+            if let (Some(raw_k), Some(raw_v)) =
+                (self.prefill_raw_k.take(), self.prefill_raw_v.take())
+            {
+                // Compact seed: clone filled slice only.
+                let shape = raw_k.shape();
+                let b = shape[0];
+                let kv_h = shape[1];
+                let head_dim = shape[3];
+                let total_seq = self.offset;
+                let sl_start = vec![0i32; 4];
+                let sl_stop: Vec<i32> = [b, kv_h, total_seq, head_dim].into();
+                let sl_strides = vec![1i32; 4];
+                let k_buf = raw_k.slice(&sl_start, &sl_stop, &sl_strides, device)?;
+                let v_buf = raw_v.slice(&sl_start, &sl_stop, &sl_strides, device)?;
+                k_buf.eval()?;
+                v_buf.eval()?;
+                self.decode_fp16_k = Some(k_buf);
+                self.decode_fp16_v = Some(v_buf);
+            }
+            return Ok(());
+        }
+
+        self.in_prefill = false;
+
+        let (raw_k, raw_v) = match (self.prefill_raw_k.take(), self.prefill_raw_v.take()) {
+            (Some(k), Some(v)) => (k, v),
+            _ => return Ok(()),
+        };
+
+        // Quant paths: slice out the filled portion for quantization, and keep
+        // a compact fp16 decode seed (compact seed, not full max_seq).
+        //
+        // Previously the full `max_seq`-sized raw buffer was cloned as the seed,
+        // wasting up to 64 MB/layer when max_seq >> total_seq. Now we store
+        // only the filled portion (`total_seq` tokens). `update_decode_fp16`
+        // already handles compact seeds via the `needs_expand` path, expanding
+        // to `max_seq` lazily on the first decode step.
+        let shape = raw_k.shape();
+        let b = shape[0];
+        let kv_h = shape[1];
+        let head_dim = shape[3];
+        let total_seq = self.offset;
+
+        let slice_start = vec![0i32; 4];
+        let slice_stop: Vec<i32> = [b, kv_h, total_seq, head_dim].into();
+        let slice_strides = vec![1i32; 4];
+        let k_full = raw_k.slice(&slice_start, &slice_stop, &slice_strides, device)?;
+        let v_full = raw_v.slice(&slice_start, &slice_stop, &slice_strides, device)?;
+
+        // Compact seed: clone just the filled slice (total_seq tokens), not the
+        // full max_seq-sized raw buffer. Saves up to (max_seq - total_seq) ×
+        // B × kv_h × head_dim × 2 bytes per layer during the prefill phase.
+        //
+        // The bf16 K seed is only materialised when a consumer actually reads
+        // it — either the `KvStorage::None` bf16 fallback below (always needs
+        // K) or a quant arm whose decode path honours the
+        // `decode_fp16_k.is_some()` shortcut (`feeds_bf16_k_at_decode()`).
+        // The K-only family reads neither, so its K clone+eval is skipped
+        // entirely. The V seed is always materialised — every quant arm reads
+        // it at decode.
+        let need_k_seed =
+            matches!(self.storage, KvStorage::None { .. }) || self.quant.feeds_bf16_k_at_decode();
+        let k_buf = if need_k_seed {
+            let k = k_full.try_clone()?;
+            k.eval()?;
+            Some(k)
+        } else {
+            None
+        };
+        let v_buf = v_full.try_clone()?;
+        v_buf.eval()?;
+        tracing::debug!(
+            total_seq,
+            max_seq = shape[2],
+            k_seeded = need_k_seed,
+            "exit_prefill: compact fp16 decode seed materialised (total_seq tokens)"
+        );
+        let decode_fp16_pair = Some((k_buf, v_buf));
+
+        // Guard: when the actual storage is KvStorage::None — which happens for
+        // SWA layers that were hydrated from the SSD tier (they are stored as
+        // tag "none" since the rotating bf16 ring cannot be serialised, but
+        // from_storage() sets self.quant to the model's global KvQuant) — take
+        // the bf16 path regardless of self.quant. The quantised dispatch arms
+        // all pattern-match self.storage expecting their specific variant and hit
+        // unreachable!() when they find KvStorage::None instead.
+        if matches!(self.storage, KvStorage::None { .. }) {
+            if let Some((k_seed, v_seed)) = decode_fp16_pair {
+                // `need_k_seed` is true on this path (KvStorage::None), so the
+                // K clone above was materialised.
+                self.decode_fp16_k = k_seed;
+                self.decode_fp16_v = Some(v_seed);
+            }
+            return Ok(());
+        }
+
+        match self.quant {
+            KvQuant::K8V8 => {
+                let max_seq = match &self.storage {
+                    KvStorage::K8V8 { max_seq, .. } => *max_seq,
+                    _ => {
+                        return Err(Error::KvStorageMismatch {
+                            expected: "K8V8",
+                            got: storage_variant_name(&self.storage),
+                        })
+                    }
+                };
+                let new_shape = k_full.shape();
+                let (k_f32, v_f32) = if device == Device::Gpu {
+                    (Vec::new(), Vec::new())
+                } else {
+                    arrays_to_f32(&k_full, &v_full, device)?
+                };
+
+                let KvStorage::K8V8 { k, v, .. } = &mut self.storage else {
+                    return Err(Error::KvStorageMismatch {
+                        expected: "K8V8",
+                        got: storage_variant_name(&self.storage),
+                    });
+                };
+                let mut init_shape = new_shape.clone();
+                init_shape[2] = 0;
+                let mut qk = QuantK {
+                    codes: Vec::new(),
+                    scales: Vec::new(),
+                    gpu_codes_buf: None,
+                    gpu_scales_buf: None,
+                    gpu_words_per_step: 0,
+                    gpu_scales_per_step: 0,
+                    gpu_capacity: 0,
+                    shape: init_shape.clone(),
+                    max_seq,
+                };
+                let mut qv = QuantK {
+                    codes: Vec::new(),
+                    scales: Vec::new(),
+                    gpu_codes_buf: None,
+                    gpu_scales_buf: None,
+                    gpu_words_per_step: 0,
+                    gpu_scales_per_step: 0,
+                    gpu_capacity: 0,
+                    shape: init_shape,
+                    max_seq,
+                };
+                qk.append(&k_f32, &new_shape, &k_full, device, max_seq)?;
+                qv.append(&v_f32, &new_shape, &v_full, device, max_seq)?;
+                *k = Some(qk);
+                *v = Some(qv);
+            }
+            KvQuant::K8V4 => {
+                let max_seq = match &self.storage {
+                    KvStorage::K8V4 { max_seq, .. } => *max_seq,
+                    _ => unreachable!(),
+                };
+                let new_shape = k_full.shape();
+                let (k_f32, v_f32) = if device == Device::Gpu {
+                    (Vec::new(), Vec::new())
+                } else {
+                    arrays_to_f32(&k_full, &v_full, device)?
+                };
+
+                let KvStorage::K8V4 { k, v, .. } = &mut self.storage else {
+                    unreachable!("KvQuant::K8V4 but storage is not K8V4");
+                };
+                let mut init_shape = new_shape.clone();
+                init_shape[2] = 0;
+                let mut qk = QuantK {
+                    codes: Vec::new(),
+                    scales: Vec::new(),
+                    gpu_codes_buf: None,
+                    gpu_scales_buf: None,
+                    gpu_words_per_step: 0,
+                    gpu_scales_per_step: 0,
+                    gpu_capacity: 0,
+                    shape: init_shape.clone(),
+                    max_seq,
+                };
+                let mut qv = QuantV {
+                    blocks: Vec::new(),
+                    gpu_codes_buf: None,
+                    gpu_scales_buf: None,
+                    gpu_words_per_step: 0,
+                    gpu_scales_per_step: 0,
+                    gpu_capacity: 0,
+                    shape: init_shape,
+                    bits: 4,
+                    max_seq,
+                    high_precision_indices: None,
+                    value_codebook: None,
+                    value_codebook_gpu: None,
+                    use_tcq: false,
+                };
+                qk.append(&k_f32, &new_shape, &k_full, device, max_seq)?;
+                qv.append(&v_f32, &new_shape, &v_full, device, max_seq)?;
+                *k = Some(qk);
+                *v = Some(qv);
+            }
+            KvQuant::None => {
+                // BF16 KV path. The `raw_k`/`raw_v` buffers — already
+                // sized to `[B, kv_h, max_seq, head_dim]` by `update_prefill_raw`
+                // — are exactly the decode buffers we need. Promote them
+                // directly into `decode_fp16_k`/`decode_fp16_v`; subsequent
+                // `update_none` calls hit `update_decode_fp16` and slice_update
+                // at the current offset. No quantize/dequantize work.
+                self.decode_fp16_k = Some(raw_k.try_clone()?);
+                self.decode_fp16_v = Some(raw_v.try_clone()?);
+                return Ok(());
+            }
+            KvQuant::Planar | KvQuant::Planar3 => {
+                let (max_seq, v_bits) = match &self.storage {
+                    KvStorage::Planar { max_seq, bits, .. } => (*max_seq, *bits),
+                    _ => unreachable!(),
+                };
+                let new_shape = k_full.shape();
+                let (k_f32, v_f32) = if device == Device::Gpu {
+                    (Vec::new(), Vec::new())
+                } else {
+                    arrays_to_f32(&k_full, &v_full, device)?
+                };
+
+                let KvStorage::Planar { k, v, .. } = &mut self.storage else {
+                    unreachable!("KvQuant::Planar/Planar3 but storage is not Planar");
+                };
+                let mut init_shape = new_shape.clone();
+                init_shape[2] = 0;
+                let mut qk = QuantK {
+                    codes: Vec::new(),
+                    scales: Vec::new(),
+                    gpu_codes_buf: None,
+                    gpu_scales_buf: None,
+                    gpu_words_per_step: 0,
+                    gpu_scales_per_step: 0,
+                    gpu_capacity: 0,
+                    shape: init_shape.clone(),
+                    max_seq,
+                };
+                let mut qpv = QuantPlanarV {
+                    blocks: Vec::new(),
+                    gpu_codes_buf: None,
+                    gpu_scales_buf: None,
+                    gpu_rotations_buf: None,
+                    gpu_codes_words_per_step: 0,
+                    gpu_scales_per_step: 0,
+                    gpu_rotations_words_per_step: 0,
+                    gpu_capacity: 0,
+                    shape: init_shape,
+                    max_seq,
+                    bits: v_bits,
+                };
+                qk.append(&k_f32, &new_shape, &k_full, device, max_seq)?;
+                qpv.append(&v_f32, &new_shape, &v_full, device, max_seq)?;
+                *k = Some(qk);
+                *v = Some(qpv);
+            }
+            // Mixed cache uses the fp16 prefill_raw scaffolding. Bulk-quantize
+            // the accumulated fp16 K/V (total_seq tokens) into the Mixed state
+            // directly (skips the zero-alloc + 6×slice_update round-trip that
+            // the per-token path pays on large prefill prefixes).
+            KvQuant::Mixed { .. } | KvQuant::RotK { .. } => {
+                tracing::debug!(
+                    total_seq,
+                    "exit_prefill Mixed/RotK: bulk-quantizing fp16 prefill K/V"
+                );
+                let state = match &mut self.storage {
+                    KvStorage::Mixed { state, .. } => state,
+                    _ => unreachable!("Mixed-path quant but storage is not Mixed"),
+                };
+                // Reset so bulk_init_from_fp16 starts clean. reset() preserves
+                // `k_rotation` so RotK keeps rotating K post-prefill.
+                state.reset();
+                // Directly quantize and store — no zero-buffer alloc, no
+                // write_at, no slice_seq_to. offset is set to total_seq.
+                state.bulk_init_from_fp16(&k_full, &v_full, device)?;
+                // The compact fp16 seed for warm-TTFT decode is the same buffer
+                // already materialised above (decode_fp16_pair).
+            }
+            // RotKTq4V — bulk-quantize K into the rotated MixedKvState,
+            // and V into TurboFlash QuantV, from the accumulated fp16 prefix.
+            KvQuant::RotKTq4V => {
+                tracing::debug!(
+                    total_seq,
+                    "exit_prefill RotKTq4V: bulk-quantizing rotated K + tq4 V"
+                );
+                let new_shape = k_full.shape();
+                // _k_f32 unused: bulk_init_k_from_fp16 takes the Array directly.
+                // v_f32 is for QuantV::append CPU path.
+                let (_k_f32, v_f32) = if device == Device::Gpu {
+                    (Vec::new(), Vec::new())
+                } else {
+                    arrays_to_f32(&k_full, &v_full, device)?
+                };
+                let KvStorage::RotKTq4V {
+                    k_state,
+                    v,
+                    max_seq,
+                } = &mut self.storage
+                else {
+                    // -review HIGH 2: typed error instead of unreachable!() panic.
+                    let variant = storage_variant_name(&self.storage);
+                    return Err(Error::Mlx(format!(
+                        "RotKTq4V dispatch: storage variant mismatch (quant=RotKTq4V, \
+                         storage={variant}); cache may have been hydrated from incompatible spill"
+                    )));
+                };
+                let max_seq = *max_seq;
+                // K-side: use MixedKvState bulk init (rotate + affine-quantize K).
+                k_state.reset();
+                // For bulk K init we only need the K side — call bulk_init_from_fp16
+                // with a dummy zero V (it quantizes V too but we replace V below).
+                // Instead, use rotate_k_and_quantize directly + store K.
+                let (k_codes, k_scales, k_biases) =
+                    k_state.bulk_init_k_from_fp16(&k_full, device)?;
+                k_state.keys = Some(crate::mixed_quant::MixedTuple {
+                    codes: k_codes,
+                    scales: k_scales,
+                    biases: k_biases,
+                });
+                k_state.offset = new_shape[2];
+
+                // V-side: quantize into TurboFlash QuantV.
+                let mut init_shape = new_shape.clone();
+                init_shape[2] = 0;
+                let mut qv = QuantV {
+                    blocks: Vec::new(),
+                    gpu_codes_buf: None,
+                    gpu_scales_buf: None,
+                    gpu_words_per_step: 0,
+                    gpu_scales_per_step: 0,
+                    gpu_capacity: 0,
+                    shape: init_shape,
+                    bits: 4,
+                    max_seq,
+                    high_precision_indices: None,
+                    value_codebook: None,
+                    value_codebook_gpu: None,
+                    use_tcq: false,
+                };
+                qv.append(&v_f32, &new_shape, &v_full, device, max_seq)?;
+                *v = Some(qv);
+            }
+            // K8VTurbo3 — bulk-quantize K (affine q8_0) + V (TurboQuant 3-bit).
+            // CPU dequant only: no GPU path for 3-bit V (no MSL kernel this pass).
+            KvQuant::K8VTurbo3 => {
+                tracing::debug!(
+                    total_seq,
+                    "exit_prefill K8VTurbo3: bulk-quantizing K (q8_0) + V (turbo3)"
+                );
+                let max_seq = match &self.storage {
+                    KvStorage::K8VTurbo3 { max_seq, .. } => *max_seq,
+                    _ => unreachable!("KvQuant::K8VTurbo3 but storage is not K8VTurbo3"),
+                };
+                let new_shape = k_full.shape();
+                let (k_f32, v_f32) = arrays_to_f32(&k_full, &v_full, device)?;
+
+                let KvStorage::K8VTurbo3 { k, v, .. } = &mut self.storage else {
+                    unreachable!("KvQuant::K8VTurbo3 but storage is not K8VTurbo3");
+                };
+                let mut init_shape = new_shape.clone();
+                init_shape[2] = 0;
+                let mut qk = QuantK {
+                    codes: Vec::new(),
+                    scales: Vec::new(),
+                    gpu_codes_buf: None,
+                    gpu_scales_buf: None,
+                    gpu_words_per_step: 0,
+                    gpu_scales_per_step: 0,
+                    gpu_capacity: 0,
+                    shape: init_shape.clone(),
+                    max_seq,
+                };
+                let mut qv = QuantV {
+                    blocks: Vec::new(),
+                    gpu_codes_buf: None,
+                    gpu_scales_buf: None,
+                    gpu_words_per_step: 0,
+                    gpu_scales_per_step: 0,
+                    gpu_capacity: 0,
+                    shape: init_shape,
+                    bits: 3,
+                    max_seq,
+                    high_precision_indices: None,
+                    value_codebook: None,
+                    value_codebook_gpu: None,
+                    use_tcq: false,
+                };
+                // K-side: GPU affine q8_0 (same path as K8V4/K8V8).
+                qk.append(&k_f32, &new_shape, &k_full, device, max_seq)?;
+                // V-side: CPU TurboQuant 3-bit (GPU path not yet available for bits=3).
+                qv.append(&v_f32, &new_shape, &v_full, Device::Cpu, max_seq)?;
+                *k = Some(qk);
+                *v = Some(qv);
+            }
+            // TurboSym3 — symmetric WHT-3 K + turbo3 V.
+            // K side uses the GPU turbo3 MSL kernel (Decision B); V side forced CPU
+            // (K8VTurbo3 precedent: GPU V-side dispatch regressed −2% TPS gate).
+            KvQuant::TurboSym3 => {
+                tracing::debug!(
+                    total_seq,
+                    "exit_prefill TurboSym3: bulk-quantizing K (turbo3/GPU) + V (turbo3/CPU)"
+                );
+                let max_seq = match &self.storage {
+                    KvStorage::TurboSym3 { max_seq, .. } => *max_seq,
+                    _ => unreachable!("KvQuant::TurboSym3 but storage is not TurboSym3"),
+                };
+                let new_shape = k_full.shape();
+                // K GPU-capable; V CPU-forced.
+                let k_f32 = if device == Device::Gpu {
+                    Vec::new()
+                } else {
+                    array_to_f32_vec(&k_full, device)?
+                };
+                let v_f32 = array_to_f32_vec(&v_full, Device::Cpu)?;
+
+                let KvStorage::TurboSym3 { k, v, .. } = &mut self.storage else {
+                    unreachable!("KvQuant::TurboSym3 but storage is not TurboSym3");
+                };
+                let mut init_shape = new_shape.clone();
+                init_shape[2] = 0;
+                let mut qk = QuantKTurbo3::new(init_shape.clone(), max_seq);
+                let mut qv = QuantV {
+                    blocks: Vec::new(),
+                    gpu_codes_buf: None,
+                    gpu_scales_buf: None,
+                    gpu_words_per_step: 0,
+                    gpu_scales_per_step: 0,
+                    gpu_capacity: 0,
+                    shape: init_shape,
+                    bits: 3,
+                    max_seq,
+                    high_precision_indices: None,
+                    value_codebook: None,
+                    value_codebook_gpu: None,
+                    use_tcq: false,
+                };
+                qk.append(&k_f32, &new_shape, &k_full, device, max_seq)?;
+                // V-side: force CPU path for 3-bit (GPU kernel wired but disabled;
+                // see update_k8vturbo3 doc-comment for the −2% gate fail).
+                qv.append(&v_f32, &new_shape, &v_full, Device::Cpu, max_seq)?;
+                *k = Some(qk);
+                *v = Some(qv);
+            }
+            // TurboSym4 — symmetric WHT-4 K + tq4 V. Both axes are
+            // bulk-quantized via the same MSL kernel (axis-agnostic).
+            KvQuant::TurboSym4 => {
+                tracing::debug!(
+                    total_seq,
+                    "exit_prefill TurboSym4: bulk-quantizing K (tq4) + V (tq4)"
+                );
+                let max_seq = match &self.storage {
+                    KvStorage::TurboSym4 { max_seq, .. } => *max_seq,
+                    _ => unreachable!("KvQuant::TurboSym4 but storage is not TurboSym4"),
+                };
+                let new_shape = k_full.shape();
+                let (k_f32, v_f32) = if device == Device::Gpu {
+                    (Vec::new(), Vec::new())
+                } else {
+                    arrays_to_f32(&k_full, &v_full, device)?
+                };
+
+                let KvStorage::TurboSym4 { k, v, .. } = &mut self.storage else {
+                    unreachable!("KvQuant::TurboSym4 but storage is not TurboSym4");
+                };
+                let mut init_shape = new_shape.clone();
+                init_shape[2] = 0;
+                let mut qk = QuantKTurbo4 {
+                    blocks: Vec::new(),
+                    gpu_codes_buf: None,
+                    gpu_scales_buf: None,
+                    gpu_words_per_step: 0,
+                    gpu_scales_per_step: 0,
+                    gpu_capacity: 0,
+                    shape: init_shape.clone(),
+                    bits: 4,
+                    max_seq,
+                };
+                let mut qv = QuantV {
+                    blocks: Vec::new(),
+                    gpu_codes_buf: None,
+                    gpu_scales_buf: None,
+                    gpu_words_per_step: 0,
+                    gpu_scales_per_step: 0,
+                    gpu_capacity: 0,
+                    shape: init_shape,
+                    bits: 4,
+                    max_seq,
+                    high_precision_indices: None,
+                    value_codebook: None,
+                    value_codebook_gpu: None,
+                    use_tcq: false,
+                };
+                qk.append(&k_f32, &new_shape, &k_full, device, max_seq)?;
+                qv.append(&v_f32, &new_shape, &v_full, device, max_seq)?;
+                *k = Some(qk);
+                *v = Some(qv);
+            }
+            // PlanarK — bulk-quantize K via QuantPlanarK; V stays
+            // bf16 (materialised by decode_fp16_pair below).
+            KvQuant::PlanarK => {
+                tracing::debug!(
+                    total_seq,
+                    "exit_prefill PlanarK: bulk-quantizing K (planar4); V stays bf16"
+                );
+                let max_seq = match &self.storage {
+                    KvStorage::PlanarK { max_seq, .. } => *max_seq,
+                    _ => {
+                        return Err(Error::KvStorageMismatch {
+                            expected: "PlanarK",
+                            got: storage_variant_name(&self.storage),
+                        })
+                    }
+                };
+                let new_shape = k_full.shape();
+                let k_f32 = if device == Device::Gpu {
+                    Vec::new()
+                } else {
+                    array_to_f32_vec(&k_full, device)?
+                };
+
+                let KvStorage::PlanarK { k, .. } = &mut self.storage else {
+                    return Err(Error::KvStorageMismatch {
+                        expected: "PlanarK",
+                        got: storage_variant_name(&self.storage),
+                    });
+                };
+                let mut init_shape = new_shape.clone();
+                init_shape[2] = 0;
+                let mut qpk = QuantPlanarK::new(init_shape, max_seq);
+                qpk.append(&k_f32, &new_shape, &k_full, device, max_seq)?;
+                *k = Some(qpk);
+                // V side: bf16 — materialized by decode_fp16_pair below.
+            }
+            // K8VTurbo2 — same shape as K8VTurbo3 with bits=2.
+            // CPU dequant only (the turbo2 MSL kernel is a future-reference
+            // hook, mirroring K8VTurbo3; see `turbo2_v_msl.rs`).
+            KvQuant::K8VTurbo2 => {
+                tracing::debug!(
+                    total_seq,
+                    "exit_prefill K8VTurbo2: bulk-quantizing K (q8_0) + V (turbo2)"
+                );
+                let max_seq = match &self.storage {
+                    KvStorage::K8VTurbo2 { max_seq, .. } => *max_seq,
+                    _ => return Err(Error::Mlx(
+                        "K8VTurbo2 exit_prefill: storage mismatch (KvQuant::K8VTurbo2 but storage is not K8VTurbo2)".into()
+                    )),
+                };
+                let new_shape = k_full.shape();
+                let (k_f32, v_f32) = arrays_to_f32(&k_full, &v_full, device)?;
+
+                let KvStorage::K8VTurbo2 { k, v, .. } = &mut self.storage else {
+                    return Err(Error::Mlx(
+                        "K8VTurbo2 exit_prefill: storage mismatch (KvQuant::K8VTurbo2 but storage is not K8VTurbo2)".into()
+                    ));
+                };
+                let mut init_shape = new_shape.clone();
+                init_shape[2] = 0;
+                let mut qk = QuantK {
+                    codes: Vec::new(),
+                    scales: Vec::new(),
+                    gpu_codes_buf: None,
+                    gpu_scales_buf: None,
+                    gpu_words_per_step: 0,
+                    gpu_scales_per_step: 0,
+                    gpu_capacity: 0,
+                    shape: init_shape.clone(),
+                    max_seq,
+                };
+                let mut qv = QuantV {
+                    blocks: Vec::new(),
+                    gpu_codes_buf: None,
+                    gpu_scales_buf: None,
+                    gpu_words_per_step: 0,
+                    gpu_scales_per_step: 0,
+                    gpu_capacity: 0,
+                    shape: init_shape,
+                    bits: 2,
+                    max_seq,
+                    high_precision_indices: None,
+                    value_codebook: None,
+                    value_codebook_gpu: None,
+                    use_tcq: false,
+                };
+                // K-side: GPU affine q8_0 (same path as K8V4/K8V8).
+                qk.append(&k_f32, &new_shape, &k_full, device, max_seq)?;
+                // V-side: CPU TurboQuant 2-bit (GPU path not wired on hot path).
+                qv.append(&v_f32, &new_shape, &v_full, Device::Cpu, max_seq)?;
+                *k = Some(qk);
+                *v = Some(qv);
+            }
+            // Iso4 — bulk-quantize K (affine q8_0) + V (IsoQuant 4-bit, CPU only).
+            KvQuant::Iso4 => {
+                tracing::debug!(
+                    total_seq,
+                    "exit_prefill Iso4: bulk-quantizing K (q8_0) + V (iso4 CPU)"
+                );
+                let max_seq = match &self.storage {
+                    KvStorage::IsoV4 { max_seq, .. } => *max_seq,
+                    _ => {
+                        return Err(Error::Mlx(
+                            "Iso4 exit_prefill: storage mismatch (KvQuant::Iso4 but storage is not IsoV4)".into()
+                        ))
+                    }
+                };
+                let new_shape = k_full.shape();
+                let (k_f32, v_f32) = arrays_to_f32(&k_full, &v_full, device)?;
+
+                let KvStorage::IsoV4 { k, v, .. } = &mut self.storage else {
+                    return Err(Error::Mlx("Iso4 exit_prefill: storage mismatch".into()));
+                };
+                let mut init_shape = new_shape.clone();
+                init_shape[2] = 0;
+                let mut qk = QuantK {
+                    codes: Vec::new(),
+                    scales: Vec::new(),
+                    gpu_codes_buf: None,
+                    gpu_scales_buf: None,
+                    gpu_words_per_step: 0,
+                    gpu_scales_per_step: 0,
+                    gpu_capacity: 0,
+                    shape: init_shape.clone(),
+                    max_seq,
+                };
+                let mut qv = QuantIsoV4::new(init_shape, max_seq);
+                qk.append(&k_f32, &new_shape, &k_full, device, max_seq)?;
+                qv.append(&v_f32, &new_shape)?;
+                *k = Some(qk);
+                *v = Some(qv);
+            }
+            // Iso3 — bulk-quantize K (affine q8_0) + V (IsoQuant 3-bit, CPU only).
+            KvQuant::Iso3 => {
+                tracing::debug!(
+                    total_seq,
+                    "exit_prefill Iso3: bulk-quantizing K (q8_0) + V (iso3 CPU)"
+                );
+                let max_seq = match &self.storage {
+                    KvStorage::IsoV3 { max_seq, .. } => *max_seq,
+                    _ => {
+                        return Err(Error::Mlx(
+                            "Iso3 exit_prefill: storage mismatch (KvQuant::Iso3 but storage is not IsoV3)".into()
+                        ))
+                    }
+                };
+                let new_shape = k_full.shape();
+                let (k_f32, v_f32) = arrays_to_f32(&k_full, &v_full, device)?;
+
+                let KvStorage::IsoV3 { k, v, .. } = &mut self.storage else {
+                    return Err(Error::Mlx("Iso3 exit_prefill: storage mismatch".into()));
+                };
+                let mut init_shape = new_shape.clone();
+                init_shape[2] = 0;
+                let mut qk = QuantK {
+                    codes: Vec::new(),
+                    scales: Vec::new(),
+                    gpu_codes_buf: None,
+                    gpu_scales_buf: None,
+                    gpu_words_per_step: 0,
+                    gpu_scales_per_step: 0,
+                    gpu_capacity: 0,
+                    shape: init_shape.clone(),
+                    max_seq,
+                };
+                let mut qv = QuantIsoV3::new(init_shape, max_seq);
+                // K-side: GPU affine q8_0 (same path as K8V4/K8V8).
+                qk.append(&k_f32, &new_shape, &k_full, device, max_seq)?;
+                // V-side: CPU IsoQuant 3-bit (no GPU path until T11d).
+                //
+                // Per-phase trace instrumentation for the iso3 V
+                // exit_prefill encode (where the V-side codec actually runs
+                // in the current build — decode hot-path is shadowed by the
+                // bf16 warm-TTFT seed, see docs/PERF_BASELINE.md).
+                let kv_h = new_shape[1];
+                let head_dim = new_shape[3];
+                let t_enc = std::time::Instant::now();
+                qv.append(&v_f32, &new_shape)?;
+                tracing::trace!(
+                    phase = "iso3_encode",
+                    ms = t_enc.elapsed().as_secs_f64() * 1e3,
+                    s_total = new_shape[2],
+                    kv_h,
+                    head_dim,
+                    site = "exit_prefill",
+                    "iso3 hot-path"
+                );
+                *k = Some(qk);
+                *v = Some(qv);
+            }
+            // Rotor3 — bulk-quantize K (affine q8_0) + V (rotor3, CPU only).
+            KvQuant::Rotor3 => {
+                tracing::debug!(
+                    total_seq,
+                    "exit_prefill Rotor3: bulk-quantizing K (q8_0) + V (rotor3 CPU)"
+                );
+                let max_seq = match &self.storage {
+                    KvStorage::RotorV3 { max_seq, .. } => *max_seq,
+                    _ => {
+                        return Err(Error::Mlx(
+                            "Rotor3 exit_prefill: storage mismatch (KvQuant::Rotor3 but storage is not RotorV3)".into()
+                        ))
+                    }
+                };
+                let new_shape = k_full.shape();
+                let (k_f32, v_f32) = arrays_to_f32(&k_full, &v_full, device)?;
+
+                let KvStorage::RotorV3 { k, v, .. } = &mut self.storage else {
+                    return Err(Error::Mlx("Rotor3 exit_prefill: storage mismatch".into()));
+                };
+                let mut init_shape = new_shape.clone();
+                init_shape[2] = 0;
+                let mut qk = QuantK {
+                    codes: Vec::new(),
+                    scales: Vec::new(),
+                    gpu_codes_buf: None,
+                    gpu_scales_buf: None,
+                    gpu_words_per_step: 0,
+                    gpu_scales_per_step: 0,
+                    gpu_capacity: 0,
+                    shape: init_shape.clone(),
+                    max_seq,
+                };
+                let mut qv = QuantRotorV3::new(init_shape, max_seq, layer_idx_u32(self.layer_idx));
+                qk.append(&k_f32, &new_shape, &k_full, device, max_seq)?;
+                qv.append(&v_f32, &new_shape)?;
+                *k = Some(qk);
+                *v = Some(qv);
+            }
+            // Rotor4 — bulk-quantize K (affine q8_0) + V (rotor4, CPU only).
+            KvQuant::Rotor4 => {
+                tracing::debug!(
+                    total_seq,
+                    "exit_prefill Rotor4: bulk-quantizing K (q8_0) + V (rotor4 CPU)"
+                );
+                let max_seq = match &self.storage {
+                    KvStorage::RotorV4 { max_seq, .. } => *max_seq,
+                    _ => {
+                        return Err(Error::Mlx(
+                            "Rotor4 exit_prefill: storage mismatch (KvQuant::Rotor4 but storage is not RotorV4)".into()
+                        ))
+                    }
+                };
+                let new_shape = k_full.shape();
+                let (k_f32, v_f32) = arrays_to_f32(&k_full, &v_full, device)?;
+
+                let KvStorage::RotorV4 { k, v, .. } = &mut self.storage else {
+                    return Err(Error::Mlx("Rotor4 exit_prefill: storage mismatch".into()));
+                };
+                let mut init_shape = new_shape.clone();
+                init_shape[2] = 0;
+                let mut qk = QuantK {
+                    codes: Vec::new(),
+                    scales: Vec::new(),
+                    gpu_codes_buf: None,
+                    gpu_scales_buf: None,
+                    gpu_words_per_step: 0,
+                    gpu_scales_per_step: 0,
+                    gpu_capacity: 0,
+                    shape: init_shape.clone(),
+                    max_seq,
+                };
+                let mut qv = QuantRotorV4::new(init_shape, max_seq, layer_idx_u32(self.layer_idx));
+                qk.append(&k_f32, &new_shape, &k_full, device, max_seq)?;
+                qv.append(&v_f32, &new_shape)?;
+                *k = Some(qk);
+                *v = Some(qv);
+            }
+            // K8VTurbo3Tcq — bulk-quantize K (affine q8_0) + V
+            // (TurboQuant 3-bit with Viterbi assignment). Mirrors the K8VTurbo3
+            // arm with `use_tcq = true` on the V slot so the encode dispatch in
+            // QuantV::append picks the Viterbi path.
+            KvQuant::K8VTurbo3Tcq => {
+                tracing::debug!(
+                    total_seq,
+                    "exit_prefill K8VTurbo3Tcq: bulk-quantizing K (q8_0) + V (turbo3 + Viterbi)"
+                );
+                let max_seq = match &self.storage {
+                    KvStorage::K8VTurbo3Tcq { max_seq, .. } => *max_seq,
+                    _ => unreachable!("KvQuant::K8VTurbo3Tcq but storage is not K8VTurbo3Tcq"),
+                };
+                let new_shape = k_full.shape();
+                let (k_f32, v_f32) = arrays_to_f32(&k_full, &v_full, device)?;
+
+                let KvStorage::K8VTurbo3Tcq { k, v, .. } = &mut self.storage else {
+                    unreachable!("KvQuant::K8VTurbo3Tcq but storage is not K8VTurbo3Tcq");
+                };
+                let mut init_shape = new_shape.clone();
+                init_shape[2] = 0;
+                let mut qk = QuantK {
+                    codes: Vec::new(),
+                    scales: Vec::new(),
+                    gpu_codes_buf: None,
+                    gpu_scales_buf: None,
+                    gpu_words_per_step: 0,
+                    gpu_scales_per_step: 0,
+                    gpu_capacity: 0,
+                    shape: init_shape.clone(),
+                    max_seq,
+                };
+                let mut qv = QuantV {
+                    blocks: Vec::new(),
+                    gpu_codes_buf: None,
+                    gpu_scales_buf: None,
+                    gpu_words_per_step: 0,
+                    gpu_scales_per_step: 0,
+                    gpu_capacity: 0,
+                    shape: init_shape,
+                    bits: 3,
+                    max_seq,
+                    high_precision_indices: None,
+                    value_codebook: None,
+                    value_codebook_gpu: None,
+                    use_tcq: true,
+                };
+                // K-side: GPU affine q8_0 (same path as K8V4/K8V8).
+                qk.append(&k_f32, &new_shape, &k_full, device, max_seq)?;
+                // V-side: CPU TurboQuant 3-bit with Viterbi assignment.
+                qv.append(&v_f32, &new_shape, &v_full, Device::Cpu, max_seq)?;
+                *k = Some(qk);
+                *v = Some(qv);
+            }
+            // K8VTurbo2Tcq — bulk-quantize K (affine q8_0) + V
+            // (TurboQuant 2-bit with Viterbi assignment). Mirrors K8VTurbo3Tcq
+            // with bits=2 and the `turbo2_tcq` max_compression preset.
+            KvQuant::K8VTurbo2Tcq => {
+                tracing::debug!(
+                    total_seq,
+                    "exit_prefill K8VTurbo2Tcq: bulk-quantizing K (q8_0) + V (turbo2 + Viterbi)"
+                );
+                let max_seq = match &self.storage {
+                    KvStorage::K8VTurbo2Tcq { max_seq, .. } => *max_seq,
+                    _ => unreachable!("KvQuant::K8VTurbo2Tcq but storage is not K8VTurbo2Tcq"),
+                };
+                let new_shape = k_full.shape();
+                let (k_f32, v_f32) = arrays_to_f32(&k_full, &v_full, device)?;
+
+                let KvStorage::K8VTurbo2Tcq { k, v, .. } = &mut self.storage else {
+                    unreachable!("KvQuant::K8VTurbo2Tcq but storage is not K8VTurbo2Tcq");
+                };
+                let mut init_shape = new_shape.clone();
+                init_shape[2] = 0;
+                let mut qk = QuantK {
+                    codes: Vec::new(),
+                    scales: Vec::new(),
+                    gpu_codes_buf: None,
+                    gpu_scales_buf: None,
+                    gpu_words_per_step: 0,
+                    gpu_scales_per_step: 0,
+                    gpu_capacity: 0,
+                    shape: init_shape.clone(),
+                    max_seq,
+                };
+                let mut qv = QuantV {
+                    blocks: Vec::new(),
+                    gpu_codes_buf: None,
+                    gpu_scales_buf: None,
+                    gpu_words_per_step: 0,
+                    gpu_scales_per_step: 0,
+                    gpu_capacity: 0,
+                    shape: init_shape,
+                    bits: 2,
+                    max_seq,
+                    high_precision_indices: None,
+                    value_codebook: None,
+                    value_codebook_gpu: None,
+                    use_tcq: true,
+                };
+                // K-side: GPU affine q8_0 (same path as K8V4/K8V8).
+                qk.append(&k_f32, &new_shape, &k_full, device, max_seq)?;
+                // V-side: CPU TurboQuant 2-bit with Viterbi assignment.
+                qv.append(&v_f32, &new_shape, &v_full, Device::Cpu, max_seq)?;
+                *k = Some(qk);
+                *v = Some(qv);
+            }
+            // Iso3Sym — bulk-quantize K (iso3, CPU) + V (iso3, CPU).
+            // The codec is axis-agnostic; only the role on the SDPA path differs.
+            KvQuant::Iso3Sym => {
+                tracing::debug!(
+                    total_seq,
+                    "exit_prefill Iso3Sym: bulk-quantizing K + V (both iso3 CPU)"
+                );
+                let max_seq = match &self.storage {
+                    KvStorage::IsoSym3 { max_seq, .. } => *max_seq,
+                    _ => {
+                        return Err(Error::Mlx(
+                            "Iso3Sym exit_prefill: storage mismatch (KvQuant::Iso3Sym but storage is not IsoSym3)".into()
+                        ))
+                    }
+                };
+                let new_shape = k_full.shape();
+                let (k_f32, v_f32) = arrays_to_f32(&k_full, &v_full, device)?;
+
+                let KvStorage::IsoSym3 { k, v, .. } = &mut self.storage else {
+                    return Err(Error::Mlx("Iso3Sym exit_prefill: storage mismatch".into()));
+                };
+                let mut init_shape = new_shape.clone();
+                init_shape[2] = 0;
+                let mut qk = crate::storage::QuantIsoK3::new(init_shape.clone(), max_seq);
+                let mut qv = QuantIsoV3::new(init_shape, max_seq);
+                qk.append(&k_f32, &new_shape)?;
+                qv.append(&v_f32, &new_shape)?;
+                *k = Some(qk);
+                *v = Some(qv);
+            }
+            // Iso4Sym — bulk-quantize K (iso4) + V (iso4).
+            KvQuant::Iso4Sym => {
+                tracing::debug!(
+                    total_seq,
+                    "exit_prefill Iso4Sym: bulk-quantizing K + V (both iso4 CPU)"
+                );
+                let max_seq = match &self.storage {
+                    KvStorage::IsoSym4 { max_seq, .. } => *max_seq,
+                    _ => {
+                        return Err(Error::Mlx(
+                            "Iso4Sym exit_prefill: storage mismatch (KvQuant::Iso4Sym but storage is not IsoSym4)".into()
+                        ))
+                    }
+                };
+                let new_shape = k_full.shape();
+                let (k_f32, v_f32) = arrays_to_f32(&k_full, &v_full, device)?;
+
+                let KvStorage::IsoSym4 { k, v, .. } = &mut self.storage else {
+                    return Err(Error::Mlx("Iso4Sym exit_prefill: storage mismatch".into()));
+                };
+                let mut init_shape = new_shape.clone();
+                init_shape[2] = 0;
+                let mut qk = crate::storage::QuantIsoK4::new(init_shape.clone(), max_seq);
+                let mut qv = QuantIsoV4::new(init_shape, max_seq);
+                qk.append(&k_f32, &new_shape)?;
+                qv.append(&v_f32, &new_shape)?;
+                *k = Some(qk);
+                *v = Some(qv);
+            }
+            // IsoKOnly3 — bulk-quantize K (iso3, CPU); V stays bf16
+            // (materialised by `decode_fp16_pair` below, same machinery as PlanarK).
+            KvQuant::IsoKOnly3 => {
+                tracing::debug!(
+                    total_seq,
+                    "exit_prefill IsoKOnly3: bulk-quantizing K (iso3 CPU); V stays bf16"
+                );
+                let max_seq = match &self.storage {
+                    KvStorage::IsoKOnly3 { max_seq, .. } => *max_seq,
+                    _ => {
+                        return Err(Error::Mlx(
+                            "IsoKOnly3 exit_prefill: storage mismatch (KvQuant::IsoKOnly3 but storage is not IsoKOnly3)".into()
+                        ))
+                    }
+                };
+                let new_shape = k_full.shape();
+                let k_f32 = array_to_f32_vec(&k_full, device)?;
+
+                let KvStorage::IsoKOnly3 { k, .. } = &mut self.storage else {
+                    return Err(Error::Mlx(
+                        "IsoKOnly3 exit_prefill: storage mismatch".into(),
+                    ));
+                };
+                let mut init_shape = new_shape.clone();
+                init_shape[2] = 0;
+                let mut qk = crate::storage::QuantIsoK3::new(init_shape, max_seq);
+                qk.append(&k_f32, &new_shape)?;
+                *k = Some(qk);
+                // V-side: bf16 — materialised by decode_fp16_pair below.
+            }
+            // IsoKOnly4 — bulk-quantize K (iso4 CPU); V stays bf16.
+            KvQuant::IsoKOnly4 => {
+                tracing::debug!(
+                    total_seq,
+                    "exit_prefill IsoKOnly4: bulk-quantizing K (iso4 CPU); V stays bf16"
+                );
+                let max_seq = match &self.storage {
+                    KvStorage::IsoKOnly4 { max_seq, .. } => *max_seq,
+                    _ => {
+                        return Err(Error::Mlx(
+                            "IsoKOnly4 exit_prefill: storage mismatch (KvQuant::IsoKOnly4 but storage is not IsoKOnly4)".into()
+                        ))
+                    }
+                };
+                let new_shape = k_full.shape();
+                let k_f32 = array_to_f32_vec(&k_full, device)?;
+
+                let KvStorage::IsoKOnly4 { k, .. } = &mut self.storage else {
+                    return Err(Error::Mlx(
+                        "IsoKOnly4 exit_prefill: storage mismatch".into(),
+                    ));
+                };
+                let mut init_shape = new_shape.clone();
+                init_shape[2] = 0;
+                let mut qk = crate::storage::QuantIsoK4::new(init_shape, max_seq);
+                qk.append(&k_f32, &new_shape)?;
+                *k = Some(qk);
+            }
+            // Rotor3Sym — bulk-quantize K (rotor3 CPU, optional QJL)
+            // + V (rotor3 CPU). Mirrors `KvQuant::Iso3Sym` with rotor3 codecs.
+            KvQuant::Rotor3Sym => {
+                tracing::debug!(
+                    total_seq,
+                    "exit_prefill Rotor3Sym: bulk-quantizing K + V (both rotor3 CPU)"
+                );
+                let max_seq = match &self.storage {
+                    KvStorage::RotorSym3 { max_seq, .. } => *max_seq,
+                    _ => {
+                        return Err(Error::Mlx(
+                            "Rotor3Sym exit_prefill: storage mismatch (KvQuant::Rotor3Sym but storage is not RotorSym3)".into()
+                        ))
+                    }
+                };
+                let new_shape = k_full.shape();
+                let (k_f32, v_f32) = arrays_to_f32(&k_full, &v_full, device)?;
+
+                let KvStorage::RotorSym3 { k, v, .. } = &mut self.storage else {
+                    return Err(Error::Mlx(
+                        "Rotor3Sym exit_prefill: storage mismatch".into(),
+                    ));
+                };
+                let mut init_shape = new_shape.clone();
+                init_shape[2] = 0;
+                let mut qk = crate::storage::QuantRotorK3::new(
+                    init_shape.clone(),
+                    max_seq,
+                    layer_idx_u32(self.layer_idx),
+                );
+                let mut qv = QuantRotorV3::new(init_shape, max_seq, layer_idx_u32(self.layer_idx));
+                qk.append(&k_f32, &new_shape)?;
+                qv.append(&v_f32, &new_shape)?;
+                *k = Some(qk);
+                *v = Some(qv);
+            }
+            // Rotor4Sym — bulk-quantize K (rotor4 CPU, optional QJL)
+            // + V (rotor4 CPU). Mirrors `KvQuant::Iso4Sym`.
+            KvQuant::Rotor4Sym => {
+                tracing::debug!(
+                    total_seq,
+                    "exit_prefill Rotor4Sym: bulk-quantizing K + V (both rotor4 CPU)"
+                );
+                let max_seq = match &self.storage {
+                    KvStorage::RotorSym4 { max_seq, .. } => *max_seq,
+                    _ => {
+                        return Err(Error::Mlx(
+                            "Rotor4Sym exit_prefill: storage mismatch (KvQuant::Rotor4Sym but storage is not RotorSym4)".into()
+                        ))
+                    }
+                };
+                let new_shape = k_full.shape();
+                let (k_f32, v_f32) = arrays_to_f32(&k_full, &v_full, device)?;
+
+                let KvStorage::RotorSym4 { k, v, .. } = &mut self.storage else {
+                    return Err(Error::Mlx(
+                        "Rotor4Sym exit_prefill: storage mismatch".into(),
+                    ));
+                };
+                let mut init_shape = new_shape.clone();
+                init_shape[2] = 0;
+                let mut qk = crate::storage::QuantRotorK4::new(
+                    init_shape.clone(),
+                    max_seq,
+                    layer_idx_u32(self.layer_idx),
+                );
+                let mut qv = QuantRotorV4::new(init_shape, max_seq, layer_idx_u32(self.layer_idx));
+                qk.append(&k_f32, &new_shape)?;
+                qv.append(&v_f32, &new_shape)?;
+                *k = Some(qk);
+                *v = Some(qv);
+            }
+            // RotorKOnly3 — bulk-quantize K (rotor3 CPU, optional QJL);
+            // V stays bf16 on `decode_fp16_v`.
+            KvQuant::RotorKOnly3 => {
+                tracing::debug!(
+                    total_seq,
+                    "exit_prefill RotorKOnly3: bulk-quantizing K (rotor3 CPU); V stays bf16"
+                );
+                let max_seq = match &self.storage {
+                    KvStorage::RotorKOnly3 { max_seq, .. } => *max_seq,
+                    _ => {
+                        return Err(Error::Mlx(
+                            "RotorKOnly3 exit_prefill: storage mismatch (KvQuant::RotorKOnly3 but storage is not RotorKOnly3)".into()
+                        ))
+                    }
+                };
+                let new_shape = k_full.shape();
+                let k_f32 = array_to_f32_vec(&k_full, device)?;
+
+                let KvStorage::RotorKOnly3 { k, .. } = &mut self.storage else {
+                    return Err(Error::Mlx(
+                        "RotorKOnly3 exit_prefill: storage mismatch".into(),
+                    ));
+                };
+                let mut init_shape = new_shape.clone();
+                init_shape[2] = 0;
+                let mut qk = crate::storage::QuantRotorK3::new(
+                    init_shape,
+                    max_seq,
+                    layer_idx_u32(self.layer_idx),
+                );
+                qk.append(&k_f32, &new_shape)?;
+                *k = Some(qk);
+            }
+            // RotorKOnly4 — bulk-quantize K (rotor4 CPU, optional QJL);
+            // V stays bf16.
+            KvQuant::RotorKOnly4 => {
+                tracing::debug!(
+                    total_seq,
+                    "exit_prefill RotorKOnly4: bulk-quantizing K (rotor4 CPU); V stays bf16"
+                );
+                let max_seq = match &self.storage {
+                    KvStorage::RotorKOnly4 { max_seq, .. } => *max_seq,
+                    _ => {
+                        return Err(Error::Mlx(
+                            "RotorKOnly4 exit_prefill: storage mismatch (KvQuant::RotorKOnly4 but storage is not RotorKOnly4)".into()
+                        ))
+                    }
+                };
+                let new_shape = k_full.shape();
+                let k_f32 = array_to_f32_vec(&k_full, device)?;
+
+                let KvStorage::RotorKOnly4 { k, .. } = &mut self.storage else {
+                    return Err(Error::Mlx(
+                        "RotorKOnly4 exit_prefill: storage mismatch".into(),
+                    ));
+                };
+                let mut init_shape = new_shape.clone();
+                init_shape[2] = 0;
+                let mut qk = crate::storage::QuantRotorK4::new(
+                    init_shape,
+                    max_seq,
+                    layer_idx_u32(self.layer_idx),
+                );
+                qk.append(&k_f32, &new_shape)?;
+                *k = Some(qk);
+            }
+            // RotorK3Asym — bulk-quantize K (rotor3 CPU, optional QJL)
+            // and V (affine `v_bits` / `v_group_size` via the existing QuantV
+            // path). Mirrors the RotorKOnly3 K side + the K8V4 V side.
+            KvQuant::RotorK3Asym { .. } => {
+                let (max_seq, v_bits, v_group_size) = match &self.storage {
+                    KvStorage::RotorKAsym3 {
+                        max_seq,
+                        v_bits,
+                        v_group_size,
+                        ..
+                    } => (*max_seq, *v_bits, *v_group_size),
+                    _ => {
+                        return Err(Error::Mlx(
+                            "RotorK3Asym exit_prefill: storage mismatch (KvQuant::RotorK3Asym but storage is not RotorKAsym3)".into()
+                        ))
+                    }
+                };
+                tracing::debug!(
+                    total_seq,
+                    v_bits,
+                    v_group_size,
+                    "exit_prefill RotorK3Asym: bulk-quantizing K (rotor3 CPU) + V (affine)"
+                );
+                let new_shape = k_full.shape();
+                let (k_f32, v_f32) = if device == Device::Gpu {
+                    (array_to_f32_vec(&k_full, device)?, Vec::new())
+                } else {
+                    arrays_to_f32(&k_full, &v_full, device)?
+                };
+
+                let KvStorage::RotorKAsym3 { k, v, .. } = &mut self.storage else {
+                    return Err(Error::KvStorageMismatch {
+                        expected: "RotorKAsym3",
+                        got: storage_variant_name(&self.storage),
+                    });
+                };
+                let mut init_shape = new_shape.clone();
+                init_shape[2] = 0;
+                let mut qk = crate::storage::QuantRotorK3::new(
+                    init_shape.clone(),
+                    max_seq,
+                    layer_idx_u32(self.layer_idx),
+                );
+                let mut qv = QuantV::new_affine_decode(init_shape, v_bits, max_seq);
+                qk.append(&k_f32, &new_shape)?;
+                qv.append(&v_f32, &new_shape, &v_full, device, max_seq)?;
+                *k = Some(qk);
+                *v = Some(qv);
+                let _ = v_group_size;
+            }
+            // RotorK4Asym — mirror of RotorK3Asym with rotor4 K.
+            KvQuant::RotorK4Asym { .. } => {
+                let (max_seq, v_bits, v_group_size) = match &self.storage {
+                    KvStorage::RotorKAsym4 {
+                        max_seq,
+                        v_bits,
+                        v_group_size,
+                        ..
+                    } => (*max_seq, *v_bits, *v_group_size),
+                    _ => {
+                        return Err(Error::Mlx(
+                            "RotorK4Asym exit_prefill: storage mismatch (KvQuant::RotorK4Asym but storage is not RotorKAsym4)".into()
+                        ))
+                    }
+                };
+                tracing::debug!(
+                    total_seq,
+                    v_bits,
+                    v_group_size,
+                    "exit_prefill RotorK4Asym: bulk-quantizing K (rotor4 CPU) + V (affine)"
+                );
+                let new_shape = k_full.shape();
+                let (k_f32, v_f32) = if device == Device::Gpu {
+                    (array_to_f32_vec(&k_full, device)?, Vec::new())
+                } else {
+                    arrays_to_f32(&k_full, &v_full, device)?
+                };
+
+                let KvStorage::RotorKAsym4 { k, v, .. } = &mut self.storage else {
+                    return Err(Error::KvStorageMismatch {
+                        expected: "RotorKAsym4",
+                        got: storage_variant_name(&self.storage),
+                    });
+                };
+                let mut init_shape = new_shape.clone();
+                init_shape[2] = 0;
+                let mut qk = crate::storage::QuantRotorK4::new(
+                    init_shape.clone(),
+                    max_seq,
+                    layer_idx_u32(self.layer_idx),
+                );
+                let mut qv = QuantV::new_affine_decode(init_shape, v_bits, max_seq);
+                qk.append(&k_f32, &new_shape)?;
+                qv.append(&v_f32, &new_shape, &v_full, device, max_seq)?;
+                *k = Some(qk);
+                *v = Some(qv);
+                let _ = v_group_size;
+            }
+        }
+
+        // Warm-TTFT seed: the shortcut quant arms get the bf16 K+V decode
+        // mirror that `update_decode_fp16` reads via the
+        // `decode_fp16_k.is_some()` shortcut. See docs/KV_CACHE.md §9.6.
+        //
+        // For the K-only family (IsoKOnly3/4, RotorKOnly3/4) the K codec runs
+        // every decode step and never reads `decode_fp16_k`, so populating the
+        // bf16 K seed was dead memory. The K seed is gated on
+        // `feeds_bf16_k_at_decode()` and dropped for those variants. The bf16
+        // **V** seed stays unconditional — the K-only decode path reads it
+        // via `update_decode_fp16_v_only`. Pure RAM reclaim; output unchanged.
+        if let Some((k_buf, v_buf)) = decode_fp16_pair {
+            // `k_buf` is `Some` iff `feeds_bf16_k_at_decode()` (the K-only
+            // family produced `None` above and so seeds no bf16 K mirror).
+            self.decode_fp16_k = k_buf;
+            self.decode_fp16_v = Some(v_buf);
+        }
+
+        Ok(())
+    }
+
+    /// Approximate RAM held by this cache slot, in bytes.
+    ///
+    /// Uses `self.offset` as the filled sequence length (not the pre-allocated
+    /// `max_seq`). Bits-per-element: 8 for K8V8/K8V4-K / Planar-K (q8_0),
+    /// 4 for K8V4-V / Planar-V / Mixed-V (4-bit codebook), 8 for Mixed-K,
+    /// 16 for None (bf16). Adds one factor-of-2 for the warm-TTFT fp16 seed
+    /// buffers (decode_fp16_k/v) when present.
+    ///
+    /// This is a best-effort estimate for the `/metrics/cache` endpoint —
+    /// not guaranteed to match Metal allocator accounting byte-for-byte.
+    ///
+    /// **Intentionally excludes paged-pool overhead**: paged KV storage
+    /// (`RMLX_PAGED_KV`) is default-OFF, so paged-pool overhead is always 0
+    /// on normal paths. If/when `paged_kv_enabled()` is flipped default-ON,
+    /// add a `paged_overhead_bytes()` method to `PagedKvArena` and sum it
+    /// alongside this estimate. See K15 in `docs/tasks/groups/group-K-backlog.md`.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    pub fn approx_bytes(&self) -> u64 {
+        let seq = self.offset as u64;
+        if seq == 0 {
+            return 0;
+        }
+        // Derive B * kv_h * head_dim from a decode_fp16 buffer shape when
+        // available (most reliable post-prefill source), or from the rotating
+        // ring buffer. Fall back to zero if shape is unknown (cache never used).
+        //
+        // The K-only family no longer populates `decode_fp16_k` (it was dead
+        // memory), so fall through to `decode_fp16_v`, which is the same
+        // B·kv_h·head_dim shape and is still populated for those
+        // variants. Without this the K-only `approx_bytes` would read 0.
+        let bhd: u64 = if let Some(k) = self.decode_fp16_k.as_ref().or(self.decode_fp16_v.as_ref())
+        {
+            let s = k.shape();
+            if s.len() == 4 {
+                s[0] as u64 * s[1] as u64 * s[3] as u64
+            } else {
+                0
+            }
+        } else if let Some(ref rot) = self.rotating {
+            if let Some(k) = &rot.keys {
+                let s = k.shape();
+                if s.len() == 4 {
+                    s[0] as u64 * s[1] as u64 * s[3] as u64
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        if bhd == 0 {
+            return 0;
+        }
+        // bits per element for K and V respectively.
+        let (k_bits, v_bits): (u64, u64) = match self.quant {
+            KvQuant::None => (16, 16),
+            KvQuant::K8V8 => (8, 8),
+            KvQuant::K8V4 => (8, 4),
+            KvQuant::Planar => (8, 4),
+            // Planar3 — K is affine q8_0; V is PlanarQuant 3-bit (3.25-bit effective).
+            KvQuant::Planar3 => (8, 3),
+            KvQuant::Mixed { k_bits, v_bits, .. } => (u64::from(k_bits), u64::from(v_bits)),
+            // RotK: K is 8-bit affine in the rotated basis; V is v_bits.
+            KvQuant::RotK { v_bits, .. } => (8, u64::from(v_bits)),
+            // RotKTq4V: K is 8-bit rotated affine; V is TurboQuant 4-bit.
+            KvQuant::RotKTq4V => (8, 4),
+            // K8VTurbo3: K is affine q8_0; V is TurboQuant 3-bit.
+            KvQuant::K8VTurbo3 => (8, 3),
+            // TurboSym3 — both K and V are TurboQuant 3-bit.
+            KvQuant::TurboSym3 => (3, 3),
+            // TurboSym4 — both K and V are TurboQuant 4-bit.
+            KvQuant::TurboSym4 => (4, 4),
+            // PlanarK — K is PlanarQuant 4-bit; V is bf16.
+            KvQuant::PlanarK => (4, 16),
+            // K8VTurbo2 — K is affine q8_0; V is TurboQuant 2-bit.
+            KvQuant::K8VTurbo2 => (8, 2),
+            // Iso3 — K is affine q8_0; V is IsoQuant 3-bit (~3.25
+            // bits effective with the per-group quaternion / scale overhead).
+            KvQuant::Iso3 => (8, 3),
+            // Iso4 — K is affine q8_0; V is IsoQuant 4-bit (~4.25
+            // bits effective with the per-group quaternion / scale overhead).
+            KvQuant::Iso4 => (8, 4),
+            // Rotor3 — K is affine q8_0; V is rotor3 (~3.25 bits
+            // effective with the per-group scale + per-token norm overhead;
+            // rotor table is static per layer so amortises across tokens).
+            KvQuant::Rotor3 => (8, 3),
+            // Rotor4 — K is affine q8_0; V is rotor4 (~4.25 bits
+            // effective; same amortised rotor table as rotor3).
+            KvQuant::Rotor4 => (8, 4),
+            // K8VTurbo3Tcq — K affine q8_0; V is TurboQuant 3-bit
+            // (Viterbi assignment, same pack as K8VTurbo3 — encode-side change only).
+            KvQuant::K8VTurbo3Tcq => (8, 3),
+            // K8VTurbo2Tcq — K affine q8_0; V is TurboQuant 2-bit
+            // (Viterbi assignment, same pack as K8VTurbo2 — encode-side change only).
+            KvQuant::K8VTurbo2Tcq => (8, 2),
+            // Iso3Sym — both K and V are iso 3-bit (~3.25 bits per
+            // axis effective with per-group quaternion + scale overhead).
+            KvQuant::Iso3Sym => (3, 3),
+            // Iso4Sym — both K and V are iso 4-bit.
+            KvQuant::Iso4Sym => (4, 4),
+            // IsoKOnly3 — K iso 3-bit; V stays bf16.
+            KvQuant::IsoKOnly3 => (3, 16),
+            // IsoKOnly4 — K iso 4-bit; V stays bf16.
+            KvQuant::IsoKOnly4 => (4, 16),
+            // Rotor3Sym — both K and V are rotor3 (~3.25 bits per axis effective;
+            // rotor table + optional QJL projection are layer-static so amortise
+            // across tokens, not counted in seq-scaled bytes).
+            KvQuant::Rotor3Sym => (3, 3),
+            // Rotor4Sym — both K and V are rotor4.
+            KvQuant::Rotor4Sym => (4, 4),
+            // RotorKOnly3 — K rotor3; V stays bf16.
+            KvQuant::RotorKOnly3 => (3, 16),
+            // RotorKOnly4 — K rotor4; V stays bf16.
+            KvQuant::RotorKOnly4 => (4, 16),
+            // RotorK3Asym — K rotor3 (3-bit effective); V affine
+            // at v_bits. Same as RotorKOnly3 K side, with affine V replacing bf16.
+            KvQuant::RotorK3Asym { v_bits, .. } => (3, u64::from(v_bits)),
+            // RotorK4Asym — K rotor4 (4-bit effective); V affine at v_bits.
+            KvQuant::RotorK4Asym { v_bits, .. } => (4, u64::from(v_bits)),
+        };
+        let kv_bytes = seq * bhd * (k_bits + v_bits) / 8;
+        // Add warm-TTFT fp16 seed buffers when they exist (present for
+        // quantised paths after exit_prefill; decode_fp16 uses max_seq not
+        // offset, but the memory impact is modest so we count offset).
+        //
+        // Count the K and V seeds independently (each = seq × bhd × 2 bytes /
+        // bf16). The K-only family drops the K seed but keeps the V seed, so
+        // `approx_bytes` reflects a single 2-byte mirror, not 4.
+        // `KvQuant::None` carries no quantised storage and is not a warm-TTFT
+        // seed path, so it is excluded from the seed bytes.
+        let seed_bytes: u64 = if matches!(self.quant, KvQuant::None) {
+            0
+        } else {
+            let k_seed = u64::from(self.decode_fp16_k.is_some());
+            let v_seed = u64::from(self.decode_fp16_v.is_some());
+            seq * bhd * 2 * (k_seed + v_seed)
+        };
+        kv_bytes + seed_bytes
+    }
+
+    /// Reset the cache to an empty state (offset → 0, buffers zeroed).
+    pub fn reset(&mut self) {
+        if let Some(ref mut rot) = self.rotating {
+            rot.reset();
+        }
+        self.storage.reset();
+        self.offset = 0;
+        self.in_prefill = false;
+        self.prefill_raw_k = None;
+        self.prefill_raw_v = None;
+        self.decode_fp16_k = None;
+        self.decode_fp16_v = None;
+        // Drop the head-major TurboFlash buffers. They will be
+        // re-seeded from the next request's prefill on first decode dispatch.
+        self.flash_k_codes = None;
+        self.flash_k_scales = None;
+        self.flash_v_codes = None;
+        self.flash_v_scales = None;
+        self.flash_max_seq = 0;
+        self.flash_filled = 0;
+        // Drop the head-major fused-QK shadow. Re-seeded from the
+        // next request's prefill on first fused-QK decode dispatch.
+        self.fused_qk_shadow = None;
+    }
+
+    /// Truncate the cache to `n` positions.
+    ///
+    /// Drops accumulated K/V state past position `n` so that the next
+    /// `update` call writes at offset `n`. Preserves the decode_fp16
+    /// buffers — they are pre-allocated to `max_seq` length and
+    /// positions `[0..n]` remain valid; positions `[n..]` are stale
+    /// but won't be sliced since SDPA reads `[0..offset]`.
+    ///
+    /// For `KvQuant::None` (bf16 KV path) the decode_fp16
+    /// buffers ARE the storage; dropping them would lose prefill data.
+    /// For quantised paths (K8V4/K8V8/Planar) the decode_fp16 buffers
+    /// are the warm-TTFT seed; the quantised storage's
+    /// `shape[2]` is also lowered to `n` via `storage.truncate_to`.
+    pub fn truncate_to(&mut self, n: i32) {
+        debug_assert!(
+            n <= self.offset,
+            "KvCache::truncate_to: n={n} > offset={}",
+            self.offset
+        );
+        // Roll the fused-QK shadow's filled count back on BOTH the rotating
+        // and non-rotating paths. Today `try_fused_qk_dispatch` gates
+        // rotating storage out via `storage_max_seq_for_fused_qk`, so the
+        // rotating branch should never have a shadow allocated — but the
+        // assertion below makes
+        // that explicit and the truncate call keeps the shadow filled
+        // count in sync if a future change ever wires rotating into the
+        // shadow path.
+        if let Some(ref mut shadow) = self.fused_qk_shadow {
+            debug_assert!(
+                self.rotating.is_none(),
+                "rotating cache should never have a fused-QK shadow allocated \
+                 (storage_max_seq_for_fused_qk returns None for rotating variants)"
+            );
+            shadow.truncate_to(n);
+        }
+        // Port mlx-lm `RotatingKVCache.trim` semantics (cache.py:542-549).
+        // mlx-lm's `trim_prompt_cache(cache, num)` decrements offset/idx
+        // losslessly when `is_trimmable` (offset < max_size); otherwise
+        // silently returns 0 (cache.py:109-111). Speculative decoding
+        // tolerates this — the Gemma 31b spec test in mlx-lm relies on it.
+        if let Some(ref mut rot) = self.rotating {
+            let delta = self.offset - n;
+            let _trimmed = rot.trim_lossless(delta);
+            // Mirror rot's offset back onto KvCache.offset. If `trimmed == 0`
+            // (post-rotation), `rot.offset` is unchanged and KvCache.offset
+            // must stay where it was — matches mlx-lm's no-op behaviour.
+            self.offset = rot.offset;
+            return;
+        }
+        self.storage.truncate_to(n);
+        self.offset = n;
+        self.in_prefill = false;
+        // Keep the GPU buffer allocation but mark only `n` tokens valid.
+        // Subsequent `update_and_sdpa_k8v4_flash` calls will overwrite
+        // positions `[n..]` head-major as new tokens stream in.
+        if self.flash_filled > n {
+            self.flash_filled = n;
+        }
+    }
+
+    /// Force evaluation of any pending MLX lazy operations in the KV buffers.
+    pub fn eval_gpu_state(&self) -> Result<()> {
+        // Rotating ring buffer holds K/V on its own arrays.
+        if let Some(ref rot) = self.rotating {
+            if let Some(k) = &rot.keys {
+                k.eval()?;
+            }
+            if let Some(v) = &rot.values {
+                v.eval()?;
+            }
+            return Ok(());
+        }
+        match &self.storage {
+            KvStorage::K8V4 { k, v, .. } => {
+                if let Some(qk) = k {
+                    if let Some(codes) = &qk.gpu_codes_buf {
+                        codes.eval()?;
+                    }
+                    if let Some(scales) = &qk.gpu_scales_buf {
+                        scales.eval()?;
+                    }
+                }
+                if let Some(qv) = v {
+                    if let Some(codes) = &qv.gpu_codes_buf {
+                        codes.eval()?;
+                    }
+                    if let Some(scales) = &qv.gpu_scales_buf {
+                        scales.eval()?;
+                    }
+                }
+            }
+            KvStorage::K8V8 { k, v, .. } => {
+                if let Some(qk) = k {
+                    if let Some(codes) = &qk.gpu_codes_buf {
+                        codes.eval()?;
+                    }
+                    if let Some(scales) = &qk.gpu_scales_buf {
+                        scales.eval()?;
+                    }
+                }
+                if let Some(qv) = v {
+                    if let Some(codes) = &qv.gpu_codes_buf {
+                        codes.eval()?;
+                    }
+                    if let Some(scales) = &qv.gpu_scales_buf {
+                        scales.eval()?;
+                    }
+                }
+            }
+            KvStorage::Planar { k, v, .. } => {
+                if let Some(qk) = k {
+                    if let Some(codes) = &qk.gpu_codes_buf {
+                        codes.eval()?;
+                    }
+                    if let Some(scales) = &qk.gpu_scales_buf {
+                        scales.eval()?;
+                    }
+                }
+                if let Some(qv) = v {
+                    if let Some(codes) = &qv.gpu_codes_buf {
+                        codes.eval()?;
+                    }
+                    if let Some(scales) = &qv.gpu_scales_buf {
+                        scales.eval()?;
+                    }
+                    if let Some(rotations) = &qv.gpu_rotations_buf {
+                        rotations.eval()?;
+                    }
+                }
+            }
+            KvStorage::None { .. } => {
+                // BF16 KV — buffers live on `decode_fp16_k`/`decode_fp16_v`
+                // and are eval'd by the trailing block below.
+            }
+            KvStorage::Mixed { state, .. } => {
+                state.eval_gpu_state()?;
+            }
+            // Paged storage — the active page arrays live inside PageSlab::pool.
+            // They are already async_eval'd by the slice_update chain inside write_page.
+            // No additional flush needed here beyond the decode_fp16 trailing block.
+            KvStorage::Paged { .. } => {}
+            // RotKTq4V — flush the MixedKvState (affine K) and the QuantV.
+            // -review MEDIUM 1: flush codes/scales independently so a mid-
+            // allocation window (one Some, one None) still flushes the available buf.
+            KvStorage::RotKTq4V { k_state, v, .. } => {
+                k_state.eval_gpu_state()?;
+                if let Some(qv) = v {
+                    if let Some(codes) = &qv.gpu_codes_buf {
+                        codes.eval()?;
+                    }
+                    if let Some(scales) = &qv.gpu_scales_buf {
+                        scales.eval()?;
+                    }
+                }
+            }
+            // K8VTurbo3 — flush K (QuantK) and V (QuantV, bits=3, CPU-dequant only).
+            KvStorage::K8VTurbo3 { k, v, .. } => {
+                if let Some(qk) = k {
+                    if let Some(codes) = &qk.gpu_codes_buf {
+                        codes.eval()?;
+                    }
+                    if let Some(scales) = &qk.gpu_scales_buf {
+                        scales.eval()?;
+                    }
+                }
+                if let Some(qv) = v {
+                    if let Some(codes) = &qv.gpu_codes_buf {
+                        codes.eval()?;
+                    }
+                    if let Some(scales) = &qv.gpu_scales_buf {
+                        scales.eval()?;
+                    }
+                }
+            }
+            // TurboSym4 — flush both TurboQuant K + V GPU buffers.
+            KvStorage::TurboSym4 { k, v, .. } => {
+                if let Some(qk) = k {
+                    if let Some(codes) = &qk.gpu_codes_buf {
+                        codes.eval()?;
+                    }
+                    if let Some(scales) = &qk.gpu_scales_buf {
+                        scales.eval()?;
+                    }
+                }
+                if let Some(qv) = v {
+                    if let Some(codes) = &qv.gpu_codes_buf {
+                        codes.eval()?;
+                    }
+                    if let Some(scales) = &qv.gpu_scales_buf {
+                        scales.eval()?;
+                    }
+                }
+            }
+            // PlanarK — flush K (codes/scales/rotations); V is bf16
+            // (decode_fp16_v) and is flushed by the trailing block below.
+            KvStorage::PlanarK { k, .. } => {
+                if let Some(qk) = k {
+                    if let Some(codes) = &qk.gpu_codes_buf {
+                        codes.eval()?;
+                    }
+                    if let Some(scales) = &qk.gpu_scales_buf {
+                        scales.eval()?;
+                    }
+                    if let Some(rotations) = &qk.gpu_rotations_buf {
+                        rotations.eval()?;
+                    }
+                }
+            }
+            // K8VTurbo2 — K is QuantK (codes/scales), V is QuantV (CPU-only).
+            KvStorage::K8VTurbo2 { k, v, .. } => {
+                if let Some(qk) = k {
+                    if let Some(codes) = &qk.gpu_codes_buf {
+                        codes.eval()?;
+                    }
+                    if let Some(scales) = &qk.gpu_scales_buf {
+                        scales.eval()?;
+                    }
+                }
+                if let Some(qv) = v {
+                    if let Some(codes) = &qv.gpu_codes_buf {
+                        codes.eval()?;
+                    }
+                    if let Some(scales) = &qv.gpu_scales_buf {
+                        scales.eval()?;
+                    }
+                }
+            }
+            // IsoV3 / IsoV4 / RotorV3 / RotorV4 — K is QuantK (GPU-capable
+            // q8_0); V is CPU-only payload.
+            KvStorage::IsoV3 { k, .. }
+            | KvStorage::IsoV4 { k, .. }
+            | KvStorage::RotorV3 { k, .. }
+            | KvStorage::RotorV4 { k, .. } => {
+                // K is GPU-capable q8_0 (`QuantK`); V is CPU-only so no GPU
+                // buffers to flush on the V side.
+                if let Some(qk) = k {
+                    if let Some(codes) = &qk.gpu_codes_buf {
+                        codes.eval()?;
+                    }
+                    if let Some(scales) = &qk.gpu_scales_buf {
+                        scales.eval()?;
+                    }
+                }
+            }
+            // K8VTurbo3Tcq — flush like K8VTurbo3 (K is GPU-capable q8_0,
+            // V is CPU-only QuantV with Viterbi encode; gpu_codes_buf
+            // may exist from a hydrated cache).
+            KvStorage::K8VTurbo3Tcq { k, v, .. } => {
+                if let Some(qk) = k {
+                    if let Some(codes) = &qk.gpu_codes_buf {
+                        codes.eval()?;
+                    }
+                    if let Some(scales) = &qk.gpu_scales_buf {
+                        scales.eval()?;
+                    }
+                }
+                if let Some(qv) = v {
+                    if let Some(codes) = &qv.gpu_codes_buf {
+                        codes.eval()?;
+                    }
+                    if let Some(scales) = &qv.gpu_scales_buf {
+                        scales.eval()?;
+                    }
+                }
+            }
+            // IsoSym3 / IsoSym4 / IsoKOnly3 / IsoKOnly4 — CPU-only
+            // codecs (no GPU buffers on either axis). V-side IsoKOnly* is bf16,
+            // flushed by the trailing decode_fp16 block below.
+            KvStorage::IsoSym3 { .. }
+            | KvStorage::IsoSym4 { .. }
+            | KvStorage::IsoKOnly3 { .. }
+            | KvStorage::IsoKOnly4 { .. } => {}
+            // Rotor symmetric / K-only — CPU-only codecs, no GPU buffers on
+            // either axis. V-side RotorKOnly* is bf16, flushed by the trailing
+            // decode_fp16 block below.
+            KvStorage::RotorSym3 { .. }
+            | KvStorage::RotorSym4 { .. }
+            | KvStorage::RotorKOnly3 { .. }
+            | KvStorage::RotorKOnly4 { .. } => {}
+            // RotorKAsym3 / RotorKAsym4 — K rotor is CPU-only; V is
+            // affine QuantV with optional GPU codes/scales buffers (flushed
+            // like the K8V4 V side).
+            KvStorage::RotorKAsym3 { v, .. } | KvStorage::RotorKAsym4 { v, .. } => {
+                if let Some(qv) = v {
+                    if let Some(codes) = &qv.gpu_codes_buf {
+                        codes.eval()?;
+                    }
+                    if let Some(scales) = &qv.gpu_scales_buf {
+                        scales.eval()?;
+                    }
+                }
+            }
+            // TurboSym3 — K is GPU-capable (QuantKTurbo3 shares the same flush
+            // pattern as TurboSym4 K side); V is CPU-only (no GPU buffers).
+            // NOTE: No explicit eval() needed here. MLX is lazy — QuantKTurbo3::append
+            // builds the compute graph; the Metal encoder is flushed when the K buffer
+            // is first read (e.g. dequantize_choice). Omitting eval() is correct and
+            // consistent with how IsoSym3/RotorSym3 K-side GPU buffers are handled.
+            KvStorage::TurboSym3 { .. } => {}
+            // K8VTurbo2Tcq — flush like K8VTurbo2 / K8VTurbo3Tcq.
+            KvStorage::K8VTurbo2Tcq { k, v, .. } => {
+                if let Some(qk) = k {
+                    if let Some(codes) = &qk.gpu_codes_buf {
+                        codes.eval()?;
+                    }
+                    if let Some(scales) = &qk.gpu_scales_buf {
+                        scales.eval()?;
+                    }
+                }
+                if let Some(qv) = v {
+                    if let Some(codes) = &qv.gpu_codes_buf {
+                        codes.eval()?;
+                    }
+                    if let Some(scales) = &qv.gpu_scales_buf {
+                        scales.eval()?;
+                    }
+                }
+            }
+        }
+        if let Some(buf) = &self.decode_fp16_k {
+            buf.eval()?;
+        }
+        if let Some(buf) = &self.decode_fp16_v {
+            buf.eval()?;
+        }
+        if let Some(buf) = &self.prefill_raw_k {
+            buf.eval()?;
+        }
+        if let Some(buf) = &self.prefill_raw_v {
+            buf.eval()?;
+        }
+        Ok(())
+    }
+
+    /// Force materialization of just the prefill raw buffers, the cheap subset
+    /// of `eval_gpu_state` used to flush the Metal command buffer between
+    /// prefill chunks. Skips the lm_head logits projection by not touching
+    /// the forward pass output.
+    pub fn eval_prefill_state(&self) -> Result<()> {
+        // Flush rotating ring buffer between prefill chunks.
+        if let Some(ref rot) = self.rotating {
+            if let Some(k) = &rot.keys {
+                k.eval()?;
+            }
+            if let Some(v) = &rot.values {
+                v.eval()?;
+            }
+            return Ok(());
+        }
+        // Flush mixed-quant 3-tuple buffers between prefill chunks.
+        if let KvStorage::Mixed { state, .. } = &self.storage {
+            state.eval_gpu_state()?;
+            return Ok(());
+        }
+        if let Some(buf) = &self.prefill_raw_k {
+            buf.eval()?;
+        }
+        if let Some(buf) = &self.prefill_raw_v {
+            buf.eval()?;
+        }
+        Ok(())
+    }
+
+    /// Warm-TTFT decode step (`0806148`). Serves K **and** V from the
+    /// pre-expanded bf16 mirror (`decode_fp16_k`/`decode_fp16_v`) via one
+    /// `slice_update` per step — no per-token quantize/dequant.
+    ///
+    /// This is the universal decode shortcut: every quantized `update_<codec>`
+    /// (K8V*, Mixed, Planar*, Turbo*, Iso*Sym, Rotor*Sym, RotorK*Asym, …)
+    /// early-returns here when `self.decode_fp16_k.is_some()` (always, post
+    /// `exit_prefill`). The per-codec quantizer runs once at `exit_prefill`
+    /// and is then quiescent for the whole decode window — decode-phase K/V
+    /// are bf16. The codec storage buffer is frozen at the prefill length and
+    /// is **not** consulted at decode-read time. See the architectural
+    /// contract + per-codec audit table in `docs/KV_CACHE.md` §9.6.
+    ///
+    /// Exceptions: the K-only family (`IsoKOnly*`, `RotorKOnly*`) does NOT
+    /// route here for K — it quantizes K every decode step and uses
+    /// [`Self::update_decode_fp16_v_only`] for V instead (calling this full
+    /// helper would re-arm the K shortcut and silently drop K to bf16).
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    pub(super) fn update_decode_fp16(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        max_seq: i32,
+        device: Device,
+    ) -> Result<(Array, Array)> {
+        let shape = new_k.shape();
+        let b = shape[0];
+        let kv_h = shape[1];
+        let new_seq = shape[2];
+        let head_dim = shape[3];
+        let dtype = new_k.dtype();
+
+        let mut prev_offset = self.offset - new_seq;
+        let mut new_offset = self.offset;
+
+        let buf_shape = [b, kv_h, max_seq, head_dim];
+        let needs_expand = match &self.decode_fp16_k {
+            None => true,
+            Some(k) => k.shape()[2] < max_seq,
+        };
+
+        // SWA hydration guard: KvStorage::None layers after SSD hydration carry
+        // the block's seq_len as self.offset (needed for RoPE base_offset on the
+        // model side) but hold no actual K/V data (the rotating ring buffer cannot
+        // be spilled). On the first decode step after hydration, decode_fp16_k is
+        // None AND prev_offset may exceed max_seq (e.g. prev_offset=1023 vs
+        // max_seq=512 for Gemma4-e2b SWA layers). Writing at position 1023 into a
+        // buffer of size 512 produces a broadcast-shape error in mlx slice_update.
+        //
+        // Fix: when there is no existing K data AND prev_offset would overflow the
+        // buffer, reset prev_offset/new_offset relative to 0. The SWA cache
+        // effectively starts fresh — the phantom prefix tokens were never spilled.
+        if needs_expand && self.decode_fp16_k.is_none() && prev_offset >= max_seq {
+            // H5: tracing event for SWA hydration offset reset (emit before mutation).
+            tracing::warn!(
+                layer_max_seq = max_seq,
+                old_offset = prev_offset,
+                new_offset = new_seq,
+                "SWA hydration: resetting out-of-range offset (phantom prefix discarded)"
+            );
+            // Also update self.offset so subsequent decode steps use correct positions.
+            self.offset = new_seq;
+            prev_offset = 0;
+            new_offset = new_seq;
+        }
+        if needs_expand {
+            // Task 12: kv_alloc event — fires on first allocation (first_step)
+            // and on lazy expansion from compact seed to full max_seq buffer
+            // (grow). Does NOT fire on normal decode steps — only when the
+            // buffer is newly allocated or expanded.
+            let cause = if self.decode_fp16_k.is_none() {
+                "first_step"
+            } else {
+                "grow"
+            };
+            // bf16 per element = 2 bytes; K + V = 2 arrays.
+            let kv_bytes_allocated =
+                b as u64 * kv_h as u64 * max_seq as u64 * head_dim as u64 * 2 * 2;
+            tracing::debug!(
+                kv_bytes_allocated,
+                cause,
+                offset = self.offset,
+                max_seq,
+                "kv_alloc"
+            );
+            let k_zeros = zeros(&buf_shape, dtype, device)?;
+            let v_zeros = zeros(&buf_shape, dtype, device)?;
+            let k_buf = if let Some(seed) = self.decode_fp16_k.take() {
+                let seed_seq = seed.shape()[2];
+                let mut seed_start = vec![0i32; 4];
+                seed_start[2] = 0;
+                let seed_stop: Vec<i32> = [b, kv_h, seed_seq, head_dim].into();
+                let seed_strides = vec![1i32; 4];
+                k_zeros.slice_update(&seed, &seed_start, &seed_stop, &seed_strides, device)?
+            } else {
+                k_zeros
+            };
+            let v_buf = if let Some(seed) = self.decode_fp16_v.take() {
+                let seed_seq = seed.shape()[2];
+                let mut seed_start = vec![0i32; 4];
+                seed_start[2] = 0;
+                let seed_stop: Vec<i32> = [b, kv_h, seed_seq, head_dim].into();
+                let seed_strides = vec![1i32; 4];
+                v_zeros.slice_update(&seed, &seed_start, &seed_stop, &seed_strides, device)?
+            } else {
+                v_zeros
+            };
+            self.decode_fp16_k = Some(k_buf);
+            self.decode_fp16_v = Some(v_buf);
+        }
+
+        let k_buf = self.decode_fp16_k.as_mut().unwrap();
+        let v_buf = self.decode_fp16_v.as_mut().unwrap();
+
+        let ndim = 4usize;
+        let mut start = vec![0i32; ndim];
+        start[2] = prev_offset;
+        let mut stop: Vec<i32> = [b, kv_h, 0i32, head_dim].into();
+        stop[2] = new_offset;
+        let strides = vec![1i32; ndim];
+
+        let k_updated = k_buf.slice_update(new_k, &start, &stop, &strides, device)?;
+        let v_updated = v_buf.slice_update(new_v, &start, &stop, &strides, device)?;
+        *k_buf = k_updated;
+        *v_buf = v_updated;
+        let _ = k_buf.async_eval();
+        let _ = v_buf.async_eval();
+
+        let slice_start = vec![0i32; ndim];
+        let slice_stop: Vec<i32> = [b, kv_h, new_offset, head_dim].into();
+        let slice_strides = vec![1i32; ndim];
+        let k_full = k_buf.slice(&slice_start, &slice_stop, &slice_strides, device)?;
+        let v_full = v_buf.slice(&slice_start, &slice_stop, &slice_strides, device)?;
+
+        Ok((k_full, v_full))
+    }
+
+    /// V-only bf16 update helper for IsoKOnly variants.
+    ///
+    /// Mirrors [`Self::update_decode_fp16`] but **only** manages the V side
+    /// (`decode_fp16_v`). It deliberately does NOT touch `self.decode_fp16_k`.
+    ///
+    /// This is the correct helper for `update_iso_k_only_3` /
+    /// `update_iso_k_only_4`: those codecs own K in the ISO quantized buffer
+    /// while V stays bf16. Calling the full `update_decode_fp16` would
+    /// populate `self.decode_fp16_k` as a side-effect, causing the
+    /// `decode_fp16_k.is_some()` early-return guard in `update_iso3_sym` /
+    /// `update_iso4_sym` to short-circuit the codec on the *next* decode step
+    /// (silent bf16-K regression guarded by regression test).
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "decode_fp16_v is Some by construction: the needs_expand branch above always sets it, and this path is only reached after that guard"
+    )]
+    pub(super) fn update_decode_fp16_v_only(
+        &mut self,
+        new_v: &Array,
+        max_seq: i32,
+        device: Device,
+    ) -> Result<Array> {
+        let shape = new_v.shape();
+        let b = shape[0];
+        let kv_h = shape[1];
+        let new_seq = shape[2];
+        let head_dim = shape[3];
+        let dtype = new_v.dtype();
+
+        let mut prev_offset = self.offset - new_seq;
+        let mut new_offset = self.offset;
+
+        let buf_shape = [b, kv_h, max_seq, head_dim];
+        let needs_expand = match &self.decode_fp16_v {
+            None => true,
+            Some(v) => v.shape()[2] < max_seq,
+        };
+
+        // Mirror the SWA hydration guard from update_decode_fp16: when there is
+        // no existing V data AND prev_offset overflows max_seq (e.g. SWA layer
+        // hydrated with phantom-prefix offset), reset to a fresh position.
+        if needs_expand && self.decode_fp16_v.is_none() && prev_offset >= max_seq {
+            self.offset = new_seq;
+            prev_offset = 0;
+            new_offset = new_seq;
+        }
+        if needs_expand {
+            let v_zeros = zeros(&buf_shape, dtype, device)?;
+            let v_buf = if let Some(seed) = self.decode_fp16_v.take() {
+                let seed_seq = seed.shape()[2];
+                let mut seed_start = vec![0i32; 4];
+                seed_start[2] = 0;
+                let seed_stop: Vec<i32> = [b, kv_h, seed_seq, head_dim].into();
+                let seed_strides = vec![1i32; 4];
+                v_zeros.slice_update(&seed, &seed_start, &seed_stop, &seed_strides, device)?
+            } else {
+                v_zeros
+            };
+            self.decode_fp16_v = Some(v_buf);
+        }
+
+        let v_buf = self.decode_fp16_v.as_mut().unwrap();
+
+        let ndim = 4usize;
+        let mut start = vec![0i32; ndim];
+        start[2] = prev_offset;
+        let mut stop: Vec<i32> = [b, kv_h, 0i32, head_dim].into();
+        stop[2] = new_offset;
+        let strides = vec![1i32; ndim];
+
+        let v_updated = v_buf.slice_update(new_v, &start, &stop, &strides, device)?;
+        *v_buf = v_updated;
+        let _ = v_buf.async_eval();
+
+        let slice_start = vec![0i32; ndim];
+        let slice_stop: Vec<i32> = [b, kv_h, new_offset, head_dim].into();
+        let slice_strides = vec![1i32; ndim];
+        let v_full = v_buf.slice(&slice_start, &slice_stop, &slice_strides, device)?;
+
+        Ok(v_full)
+    }
+
+    #[allow(
+        clippy::unreachable,
+        reason = "storage variant is guaranteed by the `match &self.storage` dispatch in \
+                  KvCache::update() (KvStorage::K8V4 arm); \
+                  mismatch is a construction-time BUG"
+    )]
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    fn update_k8v4(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        device: Device,
+    ) -> Result<(Array, Array)> {
+        let KvStorage::K8V4 { k, v, max_seq } = &mut self.storage else {
+            unreachable!("storage mismatch: expected K8V4");
+        };
+        let max_seq = *max_seq;
+
+        if self.decode_fp16_k.is_some() {
+            return self.update_decode_fp16(new_k, new_v, max_seq, device);
+        }
+
+        let new_shape = new_k.shape();
+
+        let (k_f32, v_f32) = if device == Device::Gpu {
+            (Vec::new(), Vec::new())
+        } else {
+            arrays_to_f32(new_k, new_v, device)?
+        };
+
+        if k.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *k = Some(QuantK {
+                codes: Vec::new(),
+                scales: Vec::new(),
+                gpu_codes_buf: None,
+                gpu_scales_buf: None,
+                gpu_words_per_step: 0,
+                gpu_scales_per_step: 0,
+                gpu_capacity: 0,
+                shape: init_shape,
+                max_seq,
+            });
+        }
+        let ks = k.as_mut().unwrap();
+        ks.append(&k_f32, &new_shape, new_k, device, max_seq)?;
+        let k_shape = ks.shape.clone();
+        let (k_recon_f32, k_arr_opt) = ks.dequantize_choice(device, new_k.dtype())?;
+        let k_full = match k_arr_opt {
+            Some(arr) => arr,
+            None => f32_vec_to_array(&k_recon_f32, &k_shape)?,
+        };
+
+        if v.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *v = Some(QuantV {
+                blocks: Vec::new(),
+                gpu_codes_buf: None,
+                gpu_scales_buf: None,
+                gpu_words_per_step: 0,
+                gpu_scales_per_step: 0,
+                gpu_capacity: 0,
+                shape: init_shape,
+                bits: 4,
+                max_seq,
+                high_precision_indices: None,
+                value_codebook: None,
+                value_codebook_gpu: None,
+                use_tcq: false,
+            });
+        }
+        let vs = v.as_mut().unwrap();
+        vs.append(&v_f32, &new_shape, new_v, device, max_seq)?;
+        let v_shape = vs.shape.clone();
+        let (v_recon_f32, v_arr_opt) = vs.dequantize_choice(device, new_v.dtype())?;
+        let v_full = match v_arr_opt {
+            Some(arr) => arr,
+            None => f32_vec_to_array(&v_recon_f32, &v_shape)?,
+        };
+
+        Ok((k_full, v_full))
+    }
+
+    /// K8VTurbo3 decode update — K = affine q8_0, V = TurboQuant 3-bit
+    /// Lloyd-Max (codebook from `turboquant::lloyd_gaussian_codebook(3)`).
+    ///
+    /// Mirrors `update_k8v4` but with `bits=3` on the V side. added a
+    /// Metal 3-bit kernel (`k8vturbo3_append_msl`) but bench showed it
+    /// regresses Gemma4-e4b by ~3.5% and Gemma4-26b by ~6.9% vs the
+    /// `Mixed{v_bits:3}` affine baseline — both fail the −2% TPS
+    /// gate. The GPU dispatch wiring was therefore reverted; the V side
+    /// stays on CPU here, exactly as in . The MSL kernel source is
+    /// retained in `k8vturbo3_append_msl.rs` as a future-reference hook
+    /// (still unit-tested for bit-equivalence) — see
+    /// `docs/research/turboquant_v3_vs_affine_v3.md` "Second pass" for the
+    /// bench numbers.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    fn update_k8vturbo3(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        device: Device,
+    ) -> Result<(Array, Array)> {
+        let KvStorage::K8VTurbo3 { k, v, max_seq } = &mut self.storage else {
+            return Err(Error::Mlx(format!(
+                "storage mismatch: expected K8VTurbo3, got {}",
+                storage_variant_name(&self.storage)
+            )));
+        };
+        let max_seq = *max_seq;
+
+        if self.decode_fp16_k.is_some() {
+            return self.update_decode_fp16(new_k, new_v, max_seq, device);
+        }
+
+        let new_shape = new_k.shape();
+
+        // K-side: GPU-capable affine q8_0 (same as K8V4).
+        // V-side: force CPU for 3-bit (: GPU dispatch failed the −2% gate;
+        // dispatch was reverted, kernel source kept as future-reference hook).
+        let k_f32 = if device == Device::Gpu {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_k, device)?
+        };
+        let v_f32 = array_to_f32_vec(new_v, Device::Cpu)?;
+
+        if k.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *k = Some(QuantK {
+                codes: Vec::new(),
+                scales: Vec::new(),
+                gpu_codes_buf: None,
+                gpu_scales_buf: None,
+                gpu_words_per_step: 0,
+                gpu_scales_per_step: 0,
+                gpu_capacity: 0,
+                shape: init_shape,
+                max_seq,
+            });
+        }
+        let ks = k.as_mut().unwrap();
+        ks.append(&k_f32, &new_shape, new_k, device, max_seq)?;
+        let k_shape = ks.shape.clone();
+        let (k_recon_f32, k_arr_opt) = ks.dequantize_choice(device, new_k.dtype())?;
+        let k_full = match k_arr_opt {
+            Some(arr) => arr,
+            None => f32_vec_to_array(&k_recon_f32, &k_shape)?,
+        };
+
+        if v.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *v = Some(QuantV {
+                blocks: Vec::new(),
+                gpu_codes_buf: None,
+                gpu_scales_buf: None,
+                gpu_words_per_step: 0,
+                gpu_scales_per_step: 0,
+                gpu_capacity: 0,
+                shape: init_shape,
+                bits: 3,
+                max_seq,
+                high_precision_indices: None,
+                value_codebook: None,
+                value_codebook_gpu: None,
+                use_tcq: false,
+            });
+        }
+        let vs = v.as_mut().unwrap();
+        // V-side: force CPU path for 3-bit (GPU kernel wired but disabled;
+        // see `update_k8vturbo3` doc-comment + research doc for the −2% gate fail).
+        vs.append(&v_f32, &new_shape, new_v, Device::Cpu, max_seq)?;
+        let v_shape = vs.shape.clone();
+        let (v_recon_f32, _) = vs.dequantize_choice(Device::Cpu, new_v.dtype())?;
+        let v_full = f32_vec_to_array(&v_recon_f32, &v_shape)?;
+
+        Ok((k_full, v_full))
+    }
+
+    /// TurboSym3 decode update — K = `QuantKTurbo3` (GPU-capable
+    /// turbo3 MSL kernel), V = `QuantV` (bits=3, **CPU-forced**; GPU V-side
+    /// dispatch failed the −2% TPS gate on K8VTurbo3, see `update_k8vturbo3`
+    /// doc-comment).
+    ///
+    /// Mirrors `update_tsym4` for the K side with `bits=3`; mirrors
+    /// `update_k8vturbo3` for the V side (forced `Device::Cpu`).
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    fn update_tsym3(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        device: Device,
+    ) -> Result<(Array, Array)> {
+        let KvStorage::TurboSym3 { k, v, max_seq } = &mut self.storage else {
+            return Err(Error::Mlx(format!(
+                "storage mismatch: expected TurboSym3, got {}",
+                storage_variant_name(&self.storage)
+            )));
+        };
+        let max_seq = *max_seq;
+
+        if self.decode_fp16_k.is_some() {
+            return self.update_decode_fp16(new_k, new_v, max_seq, device);
+        }
+
+        tracing::trace!(quant = "tsym3", "update_tsym3: decode step");
+
+        let new_shape = new_k.shape();
+
+        // K-side: GPU-capable turbo3 MSL kernel (Decision B: reuse existing
+        // k8vturbo3 MSL kernel, axis-agnostic). V-side: force CPU for 3-bit
+        // (GPU V-side dispatch regressed −2% TPS gate on K8VTurbo3).
+        let k_f32 = if device == Device::Gpu {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_k, device)?
+        };
+        let v_f32 = array_to_f32_vec(new_v, Device::Cpu)?;
+
+        if k.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *k = Some(QuantKTurbo3::new(init_shape, max_seq));
+        }
+        let Some(ks) = k.as_mut() else {
+            return Err(Error::Mlx("TurboSym3 K buffer absent after init".into()));
+        };
+        ks.append(&k_f32, &new_shape, new_k, device, max_seq)?;
+        let k_shape = ks.shape.clone();
+        let (k_recon_f32, k_arr_opt) = ks.dequantize_choice(device, new_k.dtype())?;
+        let k_full = match k_arr_opt {
+            Some(arr) => arr,
+            None => f32_vec_to_array(&k_recon_f32, &k_shape)?,
+        };
+
+        if v.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *v = Some(QuantV {
+                blocks: Vec::new(),
+                gpu_codes_buf: None,
+                gpu_scales_buf: None,
+                gpu_words_per_step: 0,
+                gpu_scales_per_step: 0,
+                gpu_capacity: 0,
+                shape: init_shape,
+                bits: 3,
+                max_seq,
+                high_precision_indices: None,
+                value_codebook: None,
+                value_codebook_gpu: None,
+                use_tcq: false,
+            });
+        }
+        let Some(vs) = v.as_mut() else {
+            return Err(Error::Mlx("TurboSym3 V buffer absent after init".into()));
+        };
+        // V-side: force CPU path for 3-bit (GPU kernel wired but disabled;
+        // see doc-comment + K8VTurbo3 precedent for the −2% gate fail).
+        vs.append(&v_f32, &new_shape, new_v, Device::Cpu, max_seq)?;
+        let v_shape = vs.shape.clone();
+        let (v_recon_f32, _) = vs.dequantize_choice(Device::Cpu, new_v.dtype())?;
+        let v_full = f32_vec_to_array(&v_recon_f32, &v_shape)?;
+
+        Ok((k_full, v_full))
+    }
+
+    /// K8VTurbo3Tcq decode update — K = affine q8_0,
+    /// V = TurboQuant 3-bit with Viterbi trellis (TCQ) assignment.
+    ///
+    /// Mirrors [`Self::update_k8vturbo3`] structurally — same K-side q8_0
+    /// dispatch, same CPU V-side path; only `QuantV::use_tcq` is set so that
+    /// `QuantV::append` calls the Viterbi encoder
+    /// ([`crate::tcq::tcq_quantize_v3`]) instead of nearest-centroid. The
+    /// decoder is shared with plain turbo3 (TCQ output layout is byte-for-byte
+    /// identical), so `dequantize_choice` is unchanged.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    fn update_k8vturbo3_tcq(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        device: Device,
+    ) -> Result<(Array, Array)> {
+        let KvStorage::K8VTurbo3Tcq { k, v, max_seq } = &mut self.storage else {
+            return Err(Error::Mlx(format!(
+                "storage mismatch: expected K8VTurbo3Tcq, got {}",
+                storage_variant_name(&self.storage)
+            )));
+        };
+        let max_seq = *max_seq;
+
+        if self.decode_fp16_k.is_some() {
+            return self.update_decode_fp16(new_k, new_v, max_seq, device);
+        }
+
+        let new_shape = new_k.shape();
+
+        // K-side: GPU-capable affine q8_0 (same as K8V4 / K8VTurbo3).
+        // V-side: force CPU — the TCQ MSL kernel ships as a future-ref hook
+        // (see `tcq_v_msl.rs` Dispatch status).
+        let k_f32 = if device == Device::Gpu {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_k, device)?
+        };
+        let v_f32 = array_to_f32_vec(new_v, Device::Cpu)?;
+
+        if k.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *k = Some(QuantK {
+                codes: Vec::new(),
+                scales: Vec::new(),
+                gpu_codes_buf: None,
+                gpu_scales_buf: None,
+                gpu_words_per_step: 0,
+                gpu_scales_per_step: 0,
+                gpu_capacity: 0,
+                shape: init_shape,
+                max_seq,
+            });
+        }
+        let ks = k.as_mut().unwrap();
+        ks.append(&k_f32, &new_shape, new_k, device, max_seq)?;
+        let k_shape = ks.shape.clone();
+        let (k_recon_f32, k_arr_opt) = ks.dequantize_choice(device, new_k.dtype())?;
+        let k_full = match k_arr_opt {
+            Some(arr) => arr,
+            None => f32_vec_to_array(&k_recon_f32, &k_shape)?,
+        };
+
+        if v.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *v = Some(QuantV {
+                blocks: Vec::new(),
+                gpu_codes_buf: None,
+                gpu_scales_buf: None,
+                gpu_words_per_step: 0,
+                gpu_scales_per_step: 0,
+                gpu_capacity: 0,
+                shape: init_shape,
+                bits: 3,
+                max_seq,
+                high_precision_indices: None,
+                value_codebook: None,
+                value_codebook_gpu: None,
+                use_tcq: true,
+            });
+        }
+        let vs = v.as_mut().unwrap();
+        // Force CPU on the TCQ encode path (Viterbi over the trellis).
+        vs.append(&v_f32, &new_shape, new_v, Device::Cpu, max_seq)?;
+        let v_shape = vs.shape.clone();
+        let (v_recon_f32, _) = vs.dequantize_choice(Device::Cpu, new_v.dtype())?;
+        let v_full = f32_vec_to_array(&v_recon_f32, &v_shape)?;
+
+        Ok((k_full, v_full))
+    }
+
+    /// K8VTurbo2Tcq decode update — K = affine q8_0,
+    /// V = TurboQuant **2-bit** with Viterbi trellis (TCQ) assignment.
+    ///
+    /// Structurally identical to [`Self::update_k8vturbo3_tcq`] — same K-side
+    /// GPU-capable affine q8_0 path (same as K8V4 / K8VTurbo3), same forced-CPU
+    /// V-side (Viterbi loop is sequential; the MSL kernel ships as a future-ref
+    /// hook in `tcq_v2_msl.rs`). Only the V-side `bits` changes from 3 to 2.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Option is Some by construction: if k/v.is_none() block above guarantees Some on both branches"
+    )]
+    fn update_k8vturbo2_tcq(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        device: Device,
+    ) -> Result<(Array, Array)> {
+        let KvStorage::K8VTurbo2Tcq { k, v, max_seq } = &mut self.storage else {
+            return Err(Error::Mlx(format!(
+                "storage mismatch: expected K8VTurbo2Tcq, got {}",
+                storage_variant_name(&self.storage)
+            )));
+        };
+        let max_seq = *max_seq;
+
+        if self.decode_fp16_k.is_some() {
+            return self.update_decode_fp16(new_k, new_v, max_seq, device);
+        }
+
+        let new_shape = new_k.shape();
+
+        // K-side: GPU-capable affine q8_0 (same as K8V4 / K8VTurbo3).
+        // V-side: force CPU — the TCQ MSL kernel ships as a future-ref hook.
+        let k_f32 = if device == Device::Gpu {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_k, device)?
+        };
+        let v_f32 = array_to_f32_vec(new_v, Device::Cpu)?;
+
+        if k.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *k = Some(QuantK {
+                codes: Vec::new(),
+                scales: Vec::new(),
+                gpu_codes_buf: None,
+                gpu_scales_buf: None,
+                gpu_words_per_step: 0,
+                gpu_scales_per_step: 0,
+                gpu_capacity: 0,
+                shape: init_shape,
+                max_seq,
+            });
+        }
+        let ks = k.as_mut().unwrap();
+        ks.append(&k_f32, &new_shape, new_k, device, max_seq)?;
+        let k_shape = ks.shape.clone();
+        let (k_recon_f32, k_arr_opt) = ks.dequantize_choice(device, new_k.dtype())?;
+        let k_full = match k_arr_opt {
+            Some(arr) => arr,
+            None => f32_vec_to_array(&k_recon_f32, &k_shape)?,
+        };
+
+        if v.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *v = Some(QuantV {
+                blocks: Vec::new(),
+                gpu_codes_buf: None,
+                gpu_scales_buf: None,
+                gpu_words_per_step: 0,
+                gpu_scales_per_step: 0,
+                gpu_capacity: 0,
+                shape: init_shape,
+                bits: 2,
+                max_seq,
+                high_precision_indices: None,
+                value_codebook: None,
+                value_codebook_gpu: None,
+                use_tcq: true,
+            });
+        }
+        let vs = v.as_mut().unwrap();
+        // Force CPU on the 2-bit TCQ encode path (Viterbi over the trellis).
+        vs.append(&v_f32, &new_shape, new_v, Device::Cpu, max_seq)?;
+        let v_shape = vs.shape.clone();
+        let (v_recon_f32, _) = vs.dequantize_choice(Device::Cpu, new_v.dtype())?;
+        let v_full = f32_vec_to_array(&v_recon_f32, &v_shape)?;
+
+        Ok((k_full, v_full))
+    }
+
+    /// TurboSym4 decode update — symmetric WHT-4 K + tq4 V.
+    ///
+    /// Mirrors `update_k8v4` but the K side uses [`QuantKTurbo4`] (TurboQuant
+    /// 4-bit) instead of `QuantK` (q8_0). Both K and V dispatch through the
+    /// axis-agnostic `turbo_quantize_v4_gpu` / `turbo_dequantize_v4_gpu` MSL
+    /// kernel — no kernel fork.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    fn update_tsym4(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        device: Device,
+    ) -> Result<(Array, Array)> {
+        let KvStorage::TurboSym4 { k, v, max_seq } = &mut self.storage else {
+            return Err(Error::Mlx(format!(
+                "storage mismatch: expected TurboSym4, got {}",
+                storage_variant_name(&self.storage)
+            )));
+        };
+        let max_seq = *max_seq;
+
+        if self.decode_fp16_k.is_some() {
+            return self.update_decode_fp16(new_k, new_v, max_seq, device);
+        }
+
+        tracing::trace!(quant = "tsym4", "update_tsym4: decode step");
+
+        let new_shape = new_k.shape();
+        let (k_f32, v_f32) = if device == Device::Gpu {
+            (Vec::new(), Vec::new())
+        } else {
+            arrays_to_f32(new_k, new_v, device)?
+        };
+
+        if k.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *k = Some(QuantKTurbo4 {
+                blocks: Vec::new(),
+                gpu_codes_buf: None,
+                gpu_scales_buf: None,
+                gpu_words_per_step: 0,
+                gpu_scales_per_step: 0,
+                gpu_capacity: 0,
+                shape: init_shape,
+                bits: 4,
+                max_seq,
+            });
+        }
+        let Some(ks) = k.as_mut() else {
+            return Err(Error::Mlx("TurboSym4 K buffer absent after init".into()));
+        };
+        ks.append(&k_f32, &new_shape, new_k, device, max_seq)?;
+        let k_shape = ks.shape.clone();
+        let (k_recon_f32, k_arr_opt) = ks.dequantize_choice(device, new_k.dtype())?;
+        let k_full = match k_arr_opt {
+            Some(arr) => arr,
+            None => f32_vec_to_array(&k_recon_f32, &k_shape)?,
+        };
+
+        if v.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *v = Some(QuantV {
+                blocks: Vec::new(),
+                gpu_codes_buf: None,
+                gpu_scales_buf: None,
+                gpu_words_per_step: 0,
+                gpu_scales_per_step: 0,
+                gpu_capacity: 0,
+                shape: init_shape,
+                bits: 4,
+                max_seq,
+                high_precision_indices: None,
+                value_codebook: None,
+                value_codebook_gpu: None,
+                use_tcq: false,
+            });
+        }
+        let Some(vs) = v.as_mut() else {
+            return Err(Error::Mlx("TurboSym4 V buffer absent after init".into()));
+        };
+        vs.append(&v_f32, &new_shape, new_v, device, max_seq)?;
+        let v_shape = vs.shape.clone();
+        let (v_recon_f32, v_arr_opt) = vs.dequantize_choice(device, new_v.dtype())?;
+        let v_full = match v_arr_opt {
+            Some(arr) => arr,
+            None => f32_vec_to_array(&v_recon_f32, &v_shape)?,
+        };
+
+        Ok((k_full, v_full))
+    }
+
+    /// K8VTurbo2 decode update — K = affine q8_0, V = TurboQuant
+    /// 2-bit Lloyd-Max (codebook from `turboquant::lloyd_gaussian_codebook(2)`).
+    ///
+    /// Mirrors [`update_k8vturbo3`](Self::update_k8vturbo3) byte-for-byte with
+    /// `bits=2` on the V side. CPU dequant only on the hot path: the MSL kernel
+    /// in `turbo2_v_msl.rs` is wired as a future-reference hook (unit-tested
+    /// for bit-exact CPU↔GPU parity) but never dispatched. The naïve Lloyd-Max
+    /// 2-bit codebook ships without outlier-mask; outlier-mask deferred pending
+    /// calibration loader. See `docs/KV_QUANT.md`
+    /// for the gap-vs-mtq quantification.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    fn update_k8vturbo2(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        device: Device,
+    ) -> Result<(Array, Array)> {
+        let KvStorage::K8VTurbo2 { k, v, max_seq } = &mut self.storage else {
+            return Err(Error::Mlx(format!(
+                "storage mismatch: expected K8VTurbo2, got {}",
+                storage_variant_name(&self.storage)
+            )));
+        };
+        let max_seq = *max_seq;
+
+        if self.decode_fp16_k.is_some() {
+            return self.update_decode_fp16(new_k, new_v, max_seq, device);
+        }
+
+        let new_shape = new_k.shape();
+
+        // K-side: GPU-capable affine q8_0 (same as K8V4 / K8VTurbo3).
+        // V-side: force CPU for 2-bit (no GPU dispatch on the hot path; the
+        // MSL kernel is a future-reference hook in `turbo2_v_msl.rs`).
+        let k_f32 = if device == Device::Gpu {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_k, device)?
+        };
+        let v_f32 = array_to_f32_vec(new_v, Device::Cpu)?;
+
+        if k.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *k = Some(QuantK {
+                codes: Vec::new(),
+                scales: Vec::new(),
+                gpu_codes_buf: None,
+                gpu_scales_buf: None,
+                gpu_words_per_step: 0,
+                gpu_scales_per_step: 0,
+                gpu_capacity: 0,
+                shape: init_shape,
+                max_seq,
+            });
+        }
+        // SAFETY: k is Some by construction — the `if k.is_none()` block above
+        // assigns Some on both branches (initial + pre-existing), so this unwrap
+        // cannot fail.
+        #[allow(
+            clippy::unwrap_used,
+            reason = "Option is Some by construction: if k.is_none() block above guarantees Some on both branches"
+        )]
+        let ks = k.as_mut().unwrap();
+        ks.append(&k_f32, &new_shape, new_k, device, max_seq)?;
+        let k_shape = ks.shape.clone();
+        let (k_recon_f32, k_arr_opt) = ks.dequantize_choice(device, new_k.dtype())?;
+        let k_full = match k_arr_opt {
+            Some(arr) => arr,
+            None => f32_vec_to_array(&k_recon_f32, &k_shape)?,
+        };
+
+        if v.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *v = Some(QuantV {
+                blocks: Vec::new(),
+                gpu_codes_buf: None,
+                gpu_scales_buf: None,
+                gpu_words_per_step: 0,
+                gpu_scales_per_step: 0,
+                gpu_capacity: 0,
+                shape: init_shape,
+                bits: 2,
+                max_seq,
+                high_precision_indices: None,
+                value_codebook: None,
+                value_codebook_gpu: None,
+                use_tcq: false,
+            });
+        }
+        // SAFETY: v is Some by construction — the `if v.is_none()` block above
+        // assigns Some on both branches (initial + pre-existing), so this unwrap
+        // cannot fail.
+        #[allow(
+            clippy::unwrap_used,
+            reason = "Option is Some by construction: if v.is_none() block above guarantees Some on both branches"
+        )]
+        let vs = v.as_mut().unwrap();
+        // V-side: force CPU path for 2-bit (no GPU dispatch on the hot path;
+        // see `update_k8vturbo2` doc-comment + `turbo2_v_msl.rs` "Dispatch status").
+        vs.append(&v_f32, &new_shape, new_v, Device::Cpu, max_seq)?;
+        let v_shape = vs.shape.clone();
+        let (v_recon_f32, _) = vs.dequantize_choice(Device::Cpu, new_v.dtype())?;
+        let v_full = f32_vec_to_array(&v_recon_f32, &v_shape)?;
+
+        Ok((k_full, v_full))
+    }
+
+    /// TurboFlash K8V4 path.
+    ///
+    /// Like `update_k8v4`, but when `turbo_flash_should_run()` is true AND the
+    /// GPU buffers are available, dispatches `turbo_flash_sdpa` directly on the
+    /// raw quantized K/V buffers — skipping the dequantize → SDPA → re-quantize
+    /// round-trip that the standard path pays.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(output))` — TurboFlash ran; `output` is `[B, n_q_heads, 1, D]`.
+    /// - `Ok(None)` — TurboFlash did not run (conditions not met or default-OFF);
+    ///   caller should fall through to the standard `update_k8v4` + SDPA path.
+    ///
+    /// # Fallback conditions
+    ///
+    /// - `RMLX_TURBO_FLASH != "1"` (default).
+    /// - Smoke-probe forced fallback (corruption detected).
+    /// - q_seq != 1 (prefill path — only decode is supported).
+    /// - kv_seq <= `TURBO_FLASH_MIN_KV_SEQ` (below split-K crossover).
+    /// - GPU buffers not yet populated (first call, before alloc).
+    /// - head_dim ∉ {128, 256} (kernel register-array sizing constraint).
+    ///
+    /// **CAVEAT**: TheTom's original TurboFlash is default-OFF on Apple10 (M5+)
+    /// due to corruption (commit `67f076f2e`, a default-flip — no upstream
+    /// kernel fix exists). Empirically reproduced the M5 Max failure on rMLX's
+    /// adaptation: a hard `SIGSEGV`/`KERN_INVALID_ADDRESS` (null
+    /// `Buffer::raw_ptr()` in the kernel-output `to_bytes`) at 32k ctx on
+    /// Qwen3.6-35B-A3B-8bit (head_dim=256) — worse than TheTom's
+    /// garbage-token corruption (it crashes the server). Stays default-OFF.
+    /// Setting `RMLX_TURBO_FLASH=1` will crash on that cell. See
+    /// `docs/reports/B1-turboflash-m5-validation.md`.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "wildcard arm is the correct fallthrough for unsupported arch/quant variants; exhaustive expansion would require updating on every new variant"
+    )]
+    pub fn update_and_sdpa_k8v4_flash(
+        &mut self,
+        queries: &Array,
+        new_k: &Array,
+        new_v: &Array,
+        scale: f32,
+        additive_mask: Option<&Array>,
+        device: Device,
+    ) -> Result<Option<Array>> {
+        self.update_and_sdpa_k8v4_flash_inner(
+            queries,
+            new_k,
+            new_v,
+            scale,
+            additive_mask,
+            false,
+            device,
+        )
+    }
+
+    /// TurboFlash entry point for cross-layer-KV consumers (Gemma4). Identical
+    /// behaviour to [`Self::update_and_sdpa_k8v4_flash`] except
+    /// `RMLX_TURBO_FLASH_LOCK=1` is ignored: the bf16 `decode_fp16_k/v`
+    /// mirror MUST stay current every decode step, because the caller
+    /// (`update_and_sdpa_returning_kv`) slices it to surface bf16 (K, V) for
+    /// shared-KV consumer layers. Lock-on would freeze the mirror at the
+    /// prefill prefix and silently drop decode tokens from the surfaced K/V.
+    pub(super) fn update_and_sdpa_k8v4_flash_no_lock(
+        &mut self,
+        queries: &Array,
+        new_k: &Array,
+        new_v: &Array,
+        scale: f32,
+        additive_mask: Option<&Array>,
+        device: Device,
+    ) -> Result<Option<Array>> {
+        self.update_and_sdpa_k8v4_flash_inner(
+            queries,
+            new_k,
+            new_v,
+            scale,
+            additive_mask,
+            true,
+            device,
+        )
+    }
+
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "wildcard arm is the correct fallthrough for unsupported arch/quant variants; exhaustive expansion would require updating on every new variant"
+    )]
+    #[allow(clippy::too_many_arguments)]
+    fn update_and_sdpa_k8v4_flash_inner(
+        &mut self,
+        queries: &Array,
+        new_k: &Array,
+        new_v: &Array,
+        scale: f32,
+        additive_mask: Option<&Array>,
+        force_lock_off: bool,
+        device: Device,
+    ) -> Result<Option<Array>> {
+        if !self.is_k8v4() {
+            return Ok(None);
+        }
+
+        let q_shape = queries.shape();
+        let q_seq = q_shape[2];
+        let head_dim = q_shape[3];
+        let new_seq = new_k.shape()[2];
+
+        // Gating (BEFORE any state update so the caller can drive `c.update()`
+        // cleanly on the fallback path).
+        //
+        // `kv_seq_after_update` is the offset the caller's `update()` would
+        // produce — used for the `kv_seq > TURBO_FLASH_MIN_KV_SEQ` gate.
+        let kv_seq_after_update = self.offset + new_seq;
+        if !turbo_flash_should_run(q_seq, kv_seq_after_update) {
+            return Ok(None);
+        }
+        if head_dim != 128 && head_dim != 256 {
+            tracing::debug!(
+                "TurboFlash: head_dim={head_dim} not in {{128, 256}}, falling back to standard SDPA"
+            );
+            return Ok(None);
+        }
+        if device != Device::Gpu {
+            return Ok(None);
+        }
+
+        // Keep state in lock-step with what `update()` would do:
+        // 1. Bump `self.offset += new_seq`.
+        // 2. Mirror the new K/V into `decode_fp16_k/v` (so a future fallback
+        // step sees this token in the bf16 fast-path buffer).
+        //
+        // The head-major persistent K8V4 buffer (P2.A.1) is updated below, AFTER
+        // we know the prefill seed has been materialised in `decode_fp16_k/v`.
+        //
+        // Cold-decode (no fp16 seed) is impossible in practice because the gate
+        // `kv_seq_after_update > 4096` implies a prior prefill of >4K tokens,
+        // and prefill's `exit_prefill` always populates `decode_fp16_k/v` for
+        // K8V4. Bail before any state mutation so the caller's `c.update()`
+        // fallback runs cleanly without double-counting.
+        if self.decode_fp16_k.is_none() {
+            return Ok(None);
+        }
+        let max_seq = match &self.storage {
+            KvStorage::K8V4 { max_seq, .. } => *max_seq,
+            _ => return Ok(None),
+        };
+        let prev_offset = self.offset;
+        self.offset += new_seq;
+
+        // ── Lock-on skip of `update_decode_fp16`
+        //
+        // When `RMLX_TURBO_FLASH_LOCK=1` AND the persistent flash buffers are
+        // already seeded (`flash_k_codes.is_some()`), the bf16 mirror is no
+        // longer read by anyone — the kernel reads `flash_*` directly and the
+        // request has opted out of standard-SDPA fallback. Skipping the bf16
+        // maintenance call eliminates the single largest dispatch on the hot
+        // path (one full `slice_update` over `[B, kv_h, max_seq, D]` bf16).
+        //
+        // First dispatch still pays the bf16 update because the seed for
+        // `flash_*` is quantised from `decode_fp16_k/v`. After that the
+        // mirror is frozen at the prefill prefix.
+        // Cross-layer-KV consumers (Gemma4) require the bf16 mirror to be
+        // updated every step so `update_and_sdpa_returning_kv` can slice it
+        // back to the consumer. `force_lock_off` short-circuits the lock-on
+        // optimisation in that case. Non-cross-layer-KV callers (the public
+        // entry point) keep the optimisation.
+        let lock_on = !force_lock_off && turbo_flash_lock_enabled() && self.flash_k_codes.is_some();
+        if !lock_on {
+            self.update_decode_fp16(new_k, new_v, max_seq, device)?;
+        }
+
+        let kv_seq = self.offset;
+
+        // ── Head-major persistent K8V4 storage ───────────────────────────────
+        //
+        // First TurboFlash dispatch on this cache: allocate the persistent
+        // 4-D buffer pair `[B, kv_h, max_seq, D/.]` and seed it by quantising
+        // the prefill prefix `[B, kv_h, prev_offset, D]` from `decode_fp16_k/v`
+        // in one shot. Subsequent dispatches: per-decode-token, quantise the
+        // single new token and `slice_update` head-major at the new row.
+        //
+        // This eliminates the prior O(prefix) re-quant per dispatch, which was
+        // the entire reason TurboFlash regressed vs OFF at 16K-128K (P1.A.1
+        // bench: -60% to -80% TPS). After this fix, per-decode write traffic
+        // is `B*kv_h*D` (a few KB per layer).
+        let (b, kv_h, _) = {
+            let s = new_k.shape();
+            (s[0], s[1], s[3])
+        };
+
+        if self.flash_k_codes.is_none() {
+            // First dispatch: allocate persistent buffers and seed from prefix.
+            self.alloc_flash_buffers(b, kv_h, head_dim, max_seq, device)?;
+            if prev_offset > 0 {
+                // Seed: quantise the prefill prefix [B, kv_h, prev_offset, D]
+                // from decode_fp16_k/v and slice_update head-major into the
+                // persistent buffers at [:, :, 0:prev_offset, :].
+                self.append_flash_buffers_from_fp16(0, prev_offset, device)?;
+            }
+            // First-dispatch new chunk still comes from decode_fp16_k/v
+            // (the mirror was just updated above so it contains the new token).
+            self.append_flash_buffers_from_fp16(prev_offset, new_seq, device)?;
+        } else if lock_on {
+            // Subsequent dispatch under lock-on: quantise `new_k`/`new_v`
+            // directly into the persistent flash buffers — no bf16 round-trip.
+            self.append_flash_buffers_from_new(new_k, new_v, prev_offset, new_seq, device)?;
+        } else {
+            // Subsequent dispatch, lock OFF: read the new chunk back through
+            // `decode_fp16_k/v` (which was just updated above). Preserves the
+            // original P2.A.1 behaviour bit-for-bit when lock is not requested.
+            self.append_flash_buffers_from_fp16(prev_offset, new_seq, device)?;
+        }
+
+        // Pull the persistent buffers as 1-D flat views for the kernel
+        // (contiguous reshape — zero copy on the MLX side).
+        let k_codes_buf = self.flash_k_codes.as_ref().unwrap();
+        let k_scales_buf = self.flash_k_scales.as_ref().unwrap();
+        let v_codes_buf = self.flash_v_codes.as_ref().unwrap();
+        let v_scales_buf = self.flash_v_scales.as_ref().unwrap();
+        let k_codes_total: i32 = k_codes_buf.shape().iter().product();
+        let k_scales_total: i32 = k_scales_buf.shape().iter().product();
+        let v_codes_total: i32 = v_codes_buf.shape().iter().product();
+        let v_scales_total: i32 = v_scales_buf.shape().iter().product();
+        let k_codes_flat = k_codes_buf.reshape(&[k_codes_total], device)?;
+        let k_scales_flat = k_scales_buf.reshape(&[k_scales_total], device)?;
+        let v_codes_flat = v_codes_buf.reshape(&[v_codes_total], device)?;
+        let v_scales_flat = v_scales_buf.reshape(&[v_scales_total], device)?;
+
+        let q_shape = queries.shape();
+        let b = q_shape[0];
+        let n_q_heads = q_shape[1];
+
+        // Scale the queries (turbo_flash_sdpa expects pre-scaled Q).
+        let q_scaled = {
+            use rmlx_mlx::{multiply, scalar_f32};
+            let sc = scalar_f32(scale);
+            let sc = if queries.dtype() == Dtype::F32 {
+                sc
+            } else {
+                sc.astype(queries.dtype(), device)?
+            };
+            multiply(queries, &sc, device)?
+        };
+
+        let t_stride = self.flash_max_seq;
+        let out = turbo_flash_sdpa(
+            &q_scaled,
+            &k_codes_flat,
+            &k_scales_flat,
+            &v_codes_flat,
+            &v_scales_flat,
+            additive_mask,
+            b,
+            n_q_heads,
+            kv_h,
+            kv_seq,
+            t_stride,
+            head_dim,
+            device,
+        );
+
+        match out {
+            Ok(arr) => Ok(Some(arr)),
+            Err(e) => {
+                tracing::warn!("TurboFlash: kernel error, falling back to standard SDPA: {e}");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Allocate the 4-D head-major persistent K8V4 buffers.
+    ///
+    /// Layout (per documented K/V format):
+    /// K codes: u32 `[B, kv_h, max_seq, head_dim/4]` — q8_0, 4 i8/u32
+    /// K scales: f32 `[B, kv_h, max_seq, head_dim/Q8_GROUP]` — q8_0 scales
+    /// V codes: u32 `[B, kv_h, max_seq, head_dim/8]` — turbo4, 8 nibbles/u32
+    /// V scales: f32 `[B, kv_h, max_seq, head_dim/TQ4_GROUP]` — turbo4 scales
+    ///
+    /// Buffers are zero-init via `zeros()`; slots `[kv_seq..max_seq)` are
+    /// never read by the kernel (it iterates `t < t_active`). Total RAM:
+    /// for Qwen35B max_seq=128K, B=1, kv_h=8, head_dim=128 ≈ 33 MB per layer
+    /// across both K and V — same order as the existing K8V4 storage which
+    /// would also size to max_seq when paged growth filled, so the residency
+    /// uplift is bounded.
+    fn alloc_flash_buffers(
+        &mut self,
+        b: i32,
+        kv_h: i32,
+        head_dim: i32,
+        max_seq: i32,
+        device: Device,
+    ) -> Result<()> {
+        use crate::q8_msl::Q8_GROUP_SIZE;
+        use crate::turboquant::GROUP_SIZE as TQ4_GROUP;
+
+        let k_codes_shape = [b, kv_h, max_seq, head_dim / 4];
+        let k_scales_shape = [b, kv_h, max_seq, head_dim / Q8_GROUP_SIZE as i32];
+        let v_codes_shape = [b, kv_h, max_seq, head_dim / 8];
+        let v_scales_shape = [b, kv_h, max_seq, head_dim / TQ4_GROUP as i32];
+
+        self.flash_k_codes = Some(zeros(&k_codes_shape, Dtype::U32, device)?);
+        self.flash_k_scales = Some(zeros(&k_scales_shape, Dtype::F32, device)?);
+        self.flash_v_codes = Some(zeros(&v_codes_shape, Dtype::U32, device)?);
+        self.flash_v_scales = Some(zeros(&v_scales_shape, Dtype::F32, device)?);
+        self.flash_max_seq = max_seq;
+        self.flash_filled = 0;
+        Ok(())
+    }
+
+    /// Quantise `[B, kv_h, n, D]` from `decode_fp16_k/v` starting
+    /// at token `start` and `slice_update` it head-major into the persistent
+    /// flash buffers at `[:, :, start:start+n, :]`.
+    ///
+    /// Both seed (prefill prefix, `n = prev_offset`) and per-decode-step
+    /// append (`n = 1`) flow through this single helper.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    fn append_flash_buffers_from_fp16(&mut self, start: i32, n: i32, device: Device) -> Result<()> {
+        if n <= 0 {
+            return Ok(());
+        }
+        let fp16_k = self
+            .decode_fp16_k
+            .as_ref()
+            .ok_or_else(|| Error::Mlx("flash append: decode_fp16_k missing".into()))?;
+        let fp16_v = self
+            .decode_fp16_v
+            .as_ref()
+            .ok_or_else(|| Error::Mlx("flash append: decode_fp16_v missing".into()))?;
+        let k_shape = fp16_k.shape();
+        let b = k_shape[0];
+        let kv_h = k_shape[1];
+        let d = k_shape[3];
+
+        // Slice [B, kv_h, n, D] from decode_fp16 starting at `start`.
+        let sl_start = [0i32, 0, start, 0];
+        let sl_stop = [b, kv_h, start + n, d];
+        let sl_strides = [1i32; 4];
+        let k_chunk = fp16_k.slice(&sl_start, &sl_stop, &sl_strides, device)?;
+        let v_chunk = fp16_v.slice(&sl_start, &sl_stop, &sl_strides, device)?;
+        // q8_quantize_gpu / turbo_quantize_v4_gpu expect f32 input.
+        let k_f32 = if k_chunk.dtype() == Dtype::F32 {
+            k_chunk
+        } else {
+            k_chunk.astype(Dtype::F32, device)?
+        };
+        let v_f32 = if v_chunk.dtype() == Dtype::F32 {
+            v_chunk
+        } else {
+            v_chunk.astype(Dtype::F32, device)?
+        };
+
+        let (k_codes, k_scales) = crate::q8_msl::q8_quantize_gpu(&k_f32, device)?;
+        let (v_codes, v_scales) = crate::turboquant_msl::turbo_quantize_v4_gpu(&v_f32, device)?;
+
+        // The quantize kernels return flat arrays whose underlying data is
+        // `[B, kv_h, n, D/.]` row-major (they preserve element order).
+        // Reshape to 4-D so the slice_update target stride matches.
+        use crate::q8_msl::Q8_GROUP_SIZE;
+        use crate::turboquant::GROUP_SIZE as TQ4_GROUP;
+        let k_codes_4d = k_codes.reshape(&[b, kv_h, n, d / 4], device)?;
+        let k_scales_4d = k_scales.reshape(&[b, kv_h, n, d / Q8_GROUP_SIZE as i32], device)?;
+        let v_codes_4d = v_codes.reshape(&[b, kv_h, n, d / 8], device)?;
+        let v_scales_4d = v_scales.reshape(&[b, kv_h, n, d / TQ4_GROUP as i32], device)?;
+
+        // 4-D slice_update at [:, :, start:start+n, :] into each persistent buffer.
+        let kc_buf = self.flash_k_codes.take().unwrap();
+        let ks_buf = self.flash_k_scales.take().unwrap();
+        let vc_buf = self.flash_v_codes.take().unwrap();
+        let vs_buf = self.flash_v_scales.take().unwrap();
+
+        let max_seq = self.flash_max_seq;
+        let kc_stop = [b, kv_h, start + n, d / 4];
+        let ks_stop = [b, kv_h, start + n, d / Q8_GROUP_SIZE as i32];
+        let vc_stop = [b, kv_h, start + n, d / 8];
+        let vs_stop = [b, kv_h, start + n, d / TQ4_GROUP as i32];
+        // Sanity: ensure we stay within the allocated max_seq.
+        debug_assert!(start + n <= max_seq, "flash append exceeds max_seq");
+
+        let kc_new = kc_buf.slice_update(&k_codes_4d, &sl_start, &kc_stop, &sl_strides, device)?;
+        let ks_new = ks_buf.slice_update(&k_scales_4d, &sl_start, &ks_stop, &sl_strides, device)?;
+        let vc_new = vc_buf.slice_update(&v_codes_4d, &sl_start, &vc_stop, &sl_strides, device)?;
+        let vs_new = vs_buf.slice_update(&v_scales_4d, &sl_start, &vs_stop, &sl_strides, device)?;
+
+        self.flash_k_codes = Some(kc_new);
+        self.flash_k_scales = Some(ks_new);
+        self.flash_v_codes = Some(vc_new);
+        self.flash_v_scales = Some(vs_new);
+        if start + n > self.flash_filled {
+            self.flash_filled = start + n;
+        }
+        Ok(())
+    }
+
+    /// Quantise `new_k`/`new_v` directly into the persistent flash buffers at
+    /// `[:, :, start:start+n, :]`, bypassing the bf16 `decode_fp16_k/v` mirror.
+    ///
+    /// Used by the `RMLX_TURBO_FLASH_LOCK=1` path after the initial seed has
+    /// populated `flash_*`. Algorithmically equivalent to
+    /// `append_flash_buffers_from_fp16` if the caller updated `decode_fp16_*`
+    /// with the same `new_k`/`new_v` first — but we skip that update so the
+    /// kernel can drop one slice_update dispatch per layer per decode step.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    fn append_flash_buffers_from_new(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        start: i32,
+        n: i32,
+        device: Device,
+    ) -> Result<()> {
+        if n <= 0 {
+            return Ok(());
+        }
+        let k_shape = new_k.shape();
+        let b = k_shape[0];
+        let kv_h = k_shape[1];
+        debug_assert_eq!(
+            k_shape[2], n,
+            "append_flash_buffers_from_new: new_k.shape[2] must equal n"
+        );
+        let d = k_shape[3];
+
+        // q8_quantize_gpu / turbo_quantize_v4_gpu expect f32 input.
+        let k_f32_owned;
+        let k_f32: &Array = if new_k.dtype() == Dtype::F32 {
+            new_k
+        } else {
+            k_f32_owned = new_k.astype(Dtype::F32, device)?;
+            &k_f32_owned
+        };
+        let v_f32_owned;
+        let v_f32: &Array = if new_v.dtype() == Dtype::F32 {
+            new_v
+        } else {
+            v_f32_owned = new_v.astype(Dtype::F32, device)?;
+            &v_f32_owned
+        };
+
+        let (k_codes, k_scales) = crate::q8_msl::q8_quantize_gpu(k_f32, device)?;
+        let (v_codes, v_scales) = crate::turboquant_msl::turbo_quantize_v4_gpu(v_f32, device)?;
+
+        use crate::q8_msl::Q8_GROUP_SIZE;
+        use crate::turboquant::GROUP_SIZE as TQ4_GROUP;
+        let k_codes_4d = k_codes.reshape(&[b, kv_h, n, d / 4], device)?;
+        let k_scales_4d = k_scales.reshape(&[b, kv_h, n, d / Q8_GROUP_SIZE as i32], device)?;
+        let v_codes_4d = v_codes.reshape(&[b, kv_h, n, d / 8], device)?;
+        let v_scales_4d = v_scales.reshape(&[b, kv_h, n, d / TQ4_GROUP as i32], device)?;
+
+        let sl_start = [0i32, 0, start, 0];
+        let sl_strides = [1i32; 4];
+        let kc_buf = self.flash_k_codes.take().unwrap();
+        let ks_buf = self.flash_k_scales.take().unwrap();
+        let vc_buf = self.flash_v_codes.take().unwrap();
+        let vs_buf = self.flash_v_scales.take().unwrap();
+
+        let max_seq = self.flash_max_seq;
+        let kc_stop = [b, kv_h, start + n, d / 4];
+        let ks_stop = [b, kv_h, start + n, d / Q8_GROUP_SIZE as i32];
+        let vc_stop = [b, kv_h, start + n, d / 8];
+        let vs_stop = [b, kv_h, start + n, d / TQ4_GROUP as i32];
+        debug_assert!(start + n <= max_seq, "flash append exceeds max_seq");
+
+        let kc_new = kc_buf.slice_update(&k_codes_4d, &sl_start, &kc_stop, &sl_strides, device)?;
+        let ks_new = ks_buf.slice_update(&k_scales_4d, &sl_start, &ks_stop, &sl_strides, device)?;
+        let vc_new = vc_buf.slice_update(&v_codes_4d, &sl_start, &vc_stop, &sl_strides, device)?;
+        let vs_new = vs_buf.slice_update(&v_scales_4d, &sl_start, &vs_stop, &sl_strides, device)?;
+
+        self.flash_k_codes = Some(kc_new);
+        self.flash_k_scales = Some(ks_new);
+        self.flash_v_codes = Some(vc_new);
+        self.flash_v_scales = Some(vs_new);
+        if start + n > self.flash_filled {
+            self.flash_filled = start + n;
+        }
+        Ok(())
+    }
+
+    /// Returns true when this cache holds K8V4 quantization (q8_0 K + turbo4 V).
+    pub fn is_k8v4(&self) -> bool {
+        matches!(self.quant, KvQuant::K8V4)
+    }
+
+    /// Single dispatch entry point for all K8V4 attention layers.
+    ///
+    /// Encapsulates the TurboFlash opt-in check so each arch attention layer
+    /// calls one function instead of repeating the env-var / seq-len logic.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(output))` — TurboFlash ran; output is `[B, n_q_heads, 1, D]`.
+    /// - `Ok(None)` — not K8V4, env-var OFF, seq too short, or prefill step;
+    ///   caller falls through to standard `cache.update()` + SDPA.
+    ///
+    /// # Dispatch rule
+    ///
+    /// ```text
+    /// if RMLX_TURBO_FLASH=1 AND is_k8v4() AND kv_seq_after_update > 4096 {
+    /// update_and_sdpa_k8v4_flash(...) // split-K FA, no dequant round-trip
+    /// } else {
+    /// None // caller does standard update() + scaled_dot_product_attention()
+    /// }
+    /// ```
+    ///
+    /// The `kv_seq > 4096` threshold is checked inside `update_and_sdpa_k8v4_flash`
+    /// via `turbo_flash_should_run`; this wrapper delegates entirely to that
+    /// function, keeping the check in one place.
+    ///
+    /// Callers that are NOT K8V4 pay only the `is_k8v4()` bool check and
+    /// immediately get `Ok(None)` — zero overhead for other quant modes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sdpa_dispatch(
+        &mut self,
+        queries: &Array,
+        new_k: &Array,
+        new_v: &Array,
+        scale: f32,
+        additive_mask: Option<&Array>,
+        device: Device,
+    ) -> Result<Option<Array>> {
+        if !self.is_k8v4() {
+            return Ok(None);
+        }
+        self.update_and_sdpa_k8v4_flash(queries, new_k, new_v, scale, additive_mask, device)
+    }
+
+    /// Sibling of [`Self::sdpa_dispatch`] used by
+    /// `update_and_sdpa_returning_kv` (cross-layer-KV producers). Forces the
+    /// TurboFlash lock-on optimisation OFF so the bf16 mirror stays current.
+    pub(super) fn sdpa_dispatch_no_lock(
+        &mut self,
+        queries: &Array,
+        new_k: &Array,
+        new_v: &Array,
+        scale: f32,
+        additive_mask: Option<&Array>,
+        device: Device,
+    ) -> Result<Option<Array>> {
+        if !self.is_k8v4() {
+            return Ok(None);
+        }
+        self.update_and_sdpa_k8v4_flash_no_lock(queries, new_k, new_v, scale, additive_mask, device)
+    }
+
+    #[allow(
+        clippy::unreachable,
+        reason = "storage variant is guaranteed by the `match &self.storage` dispatch in \
+                  KvCache::update() (KvStorage::K8V8 arm); \
+                  mismatch is a construction-time BUG"
+    )]
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    fn update_k8v8(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        device: Device,
+    ) -> Result<(Array, Array)> {
+        let KvStorage::K8V8 { k, v, max_seq } = &mut self.storage else {
+            unreachable!("storage mismatch: expected K8V8");
+        };
+        let max_seq = *max_seq;
+
+        if self.decode_fp16_k.is_some() {
+            return self.update_decode_fp16(new_k, new_v, max_seq, device);
+        }
+
+        let new_shape = new_k.shape();
+        let (k_f32, v_f32) = if device == Device::Gpu {
+            (Vec::new(), Vec::new())
+        } else {
+            arrays_to_f32(new_k, new_v, device)?
+        };
+
+        if k.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *k = Some(QuantK {
+                codes: Vec::new(),
+                scales: Vec::new(),
+                gpu_codes_buf: None,
+                gpu_scales_buf: None,
+                gpu_words_per_step: 0,
+                gpu_scales_per_step: 0,
+                gpu_capacity: 0,
+                shape: init_shape,
+                max_seq,
+            });
+        }
+        let ks = k.as_mut().unwrap();
+        ks.append(&k_f32, &new_shape, new_k, device, max_seq)?;
+        let k_shape = ks.shape.clone();
+        let (k_recon_f32, k_arr_opt) = ks.dequantize_choice(device, new_k.dtype())?;
+        let k_full = match k_arr_opt {
+            Some(arr) => arr,
+            None => f32_vec_to_array(&k_recon_f32, &k_shape)?,
+        };
+
+        if v.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *v = Some(QuantK {
+                codes: Vec::new(),
+                scales: Vec::new(),
+                gpu_codes_buf: None,
+                gpu_scales_buf: None,
+                gpu_words_per_step: 0,
+                gpu_scales_per_step: 0,
+                gpu_capacity: 0,
+                shape: init_shape,
+                max_seq,
+            });
+        }
+        let vs = v.as_mut().unwrap();
+        vs.append(&v_f32, &new_shape, new_v, device, max_seq)?;
+        let v_shape = vs.shape.clone();
+        let (v_recon_f32, v_arr_opt) = vs.dequantize_choice(device, new_v.dtype())?;
+        let v_full = match v_arr_opt {
+            Some(arr) => arr,
+            None => f32_vec_to_array(&v_recon_f32, &v_shape)?,
+        };
+
+        Ok((k_full, v_full))
+    }
+
+    #[allow(
+        clippy::unreachable,
+        reason = "storage variant is guaranteed by the `match &self.storage` dispatch in \
+                  KvCache::update() (KvStorage::Planar arm); \
+                  mismatch is a construction-time BUG"
+    )]
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    fn update_planar(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        device: Device,
+    ) -> Result<(Array, Array)> {
+        let KvStorage::Planar {
+            k,
+            v,
+            max_seq,
+            bits,
+        } = &mut self.storage
+        else {
+            unreachable!("storage mismatch: expected Planar");
+        };
+        let max_seq = *max_seq;
+        let v_bits = *bits;
+
+        if self.decode_fp16_k.is_some() {
+            return self.update_decode_fp16(new_k, new_v, max_seq, device);
+        }
+
+        let new_shape = new_k.shape();
+        let (k_f32, v_f32) = if device == Device::Gpu {
+            (Vec::new(), Vec::new())
+        } else {
+            arrays_to_f32(new_k, new_v, device)?
+        };
+
+        if k.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *k = Some(QuantK {
+                codes: Vec::new(),
+                scales: Vec::new(),
+                gpu_codes_buf: None,
+                gpu_scales_buf: None,
+                gpu_words_per_step: 0,
+                gpu_scales_per_step: 0,
+                gpu_capacity: 0,
+                shape: init_shape,
+                max_seq,
+            });
+        }
+        let ks = k.as_mut().unwrap();
+        ks.append(&k_f32, &new_shape, new_k, device, max_seq)?;
+        let k_shape = ks.shape.clone();
+        let (k_recon_f32, k_arr_opt) = ks.dequantize_choice(device, new_k.dtype())?;
+        let k_full = match k_arr_opt {
+            Some(arr) => arr,
+            None => f32_vec_to_array(&k_recon_f32, &k_shape)?,
+        };
+
+        if v.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *v = Some(QuantPlanarV {
+                blocks: Vec::new(),
+                gpu_codes_buf: None,
+                gpu_scales_buf: None,
+                gpu_rotations_buf: None,
+                gpu_codes_words_per_step: 0,
+                gpu_scales_per_step: 0,
+                gpu_rotations_words_per_step: 0,
+                gpu_capacity: 0,
+                shape: init_shape,
+                max_seq,
+                bits: v_bits,
+            });
+        }
+        let vs = v.as_mut().unwrap();
+        vs.append(&v_f32, &new_shape, new_v, device, max_seq)?;
+        let v_shape = vs.shape.clone();
+        let (v_recon_f32, v_arr_opt) = vs.dequantize_choice(device, new_v.dtype())?;
+        let v_full = match v_arr_opt {
+            Some(arr) => arr,
+            None => f32_vec_to_array(&v_recon_f32, &v_shape)?,
+        };
+
+        Ok((k_full, v_full))
+    }
+
+    /// PlanarK decode update. K is quantized through `QuantPlanarK`
+    /// (shared MSL kernel with `Planar` V-side — PlanarQuant is axis-agnostic).
+    /// V stays bf16 in `decode_fp16_v` (same machinery as `KvStorage::None`).
+    ///
+    /// Warm-TTFT shortcut: when `decode_fp16_k` is present (set by
+    /// `exit_prefill`), route through `update_decode_fp16` so the bf16 K seed
+    /// is used for the rest of the request. This matches every other
+    /// `update_<arch>` (K8V4/K8V8/Planar/Mixed/K8VTurbo*/Iso*/Rotor*/
+    /// TurboSym*). Before this fix, PlanarK was the **sole** codec that
+    /// re-encoded K through the lossy 4-bit Lloyd-Max + Givens kernel on every
+    /// decode step while every other variant silently stayed in bf16 K, and
+    /// that asymmetry surfaced as the Bonsai PlanarK NIAH retrieval failure.
+    ///
+    /// See `docs/reports/planar-chunked-prefill-fix.md` § "Followups"
+    /// for the open question of whether warm-TTFT-as-default is the intended
+    /// steady-state design for the entire quantised-KV surface.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    fn update_planar_k(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        device: Device,
+    ) -> Result<(Array, Array)> {
+        let KvStorage::PlanarK { k, max_seq } = &mut self.storage else {
+            return Err(Error::KvStorageMismatch {
+                expected: "PlanarK",
+                got: storage_variant_name(&self.storage),
+            });
+        };
+        let max_seq = *max_seq;
+
+        // Warm-TTFT bf16 K seed path. Same shortcut every other
+        // `update_<arch>` honours; before this fix PlanarK lacked it and was
+        // the only codec exercising the per-decode-step 4-bit K encode.
+        //
+        // See `docs/reports/planar-chunked-prefill-fix.md` § "Followups"
+        // for the open question of whether warm-TTFT-as-default is the intended
+        // steady-state design for the entire quantised-KV surface.
+        if self.decode_fp16_k.is_some() {
+            tracing::debug!(
+                target: "rmlx_kv_quant::warm_ttft",
+                path = "warm_ttft_bypass",
+                codec = "PlanarK",
+                offset = self.offset,
+                "PlanarK update routing through warm-TTFT bf16 K seed; \
+                 4-bit codec stays quiescent for this decode step"
+            );
+            return self.update_decode_fp16(new_k, new_v, max_seq, device);
+        }
+
+        let new_shape = new_k.shape();
+        let k_f32 = if device == Device::Gpu {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_k, device)?
+        };
+
+        // ── K side: QuantPlanarK encode + dequant for SDPA input ─────────────
+        if k.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *k = Some(QuantPlanarK::new(init_shape, max_seq));
+        }
+        let Some(ks) = k.as_mut() else {
+            return Err(Error::Mlx("PlanarK K buffer absent after init".into()));
+        };
+        ks.append(&k_f32, &new_shape, new_k, device, max_seq)?;
+        let k_shape = ks.shape.clone();
+        let (k_recon_f32, k_arr_opt) = ks.dequantize_choice(device, new_k.dtype())?;
+        let k_full = match k_arr_opt {
+            Some(arr) => arr,
+            None => f32_vec_to_array(&k_recon_f32, &k_shape)?,
+        };
+
+        // ── V side: bf16 via update_decode_fp16 (same as KvStorage::None V).
+        // We pass the original `new_k` shadow for the unused K side; the V
+        // returned is the one we keep. K from quant codec is what SDPA sees.
+        let (_k_shadow, v_full) = self.update_decode_fp16(new_k, new_v, max_seq, device)?;
+        Ok((k_full, v_full))
+    }
+
+    /// PagedAttention decode-step update (`RMLX_PAGED_KV=1`).
+    ///
+    /// Steps:
+    /// 1. Quantize `new_k` (q8_0) and `new_v` (TurboQuant V4 / q8_0 / Planar)
+    /// 2. Append into the block-table page allocator (creates/fills pages).
+    /// 3. Gather all filled pages into contiguous flat arrays.
+    /// 4. Dequantize and return the full accumulated `(K, V)`.
+    ///
+    /// Falls back to the warm-TTFT fp16 decode seed path if `decode_fp16_k` is
+    /// set (same as the non-paged quant paths).
+    #[allow(
+        clippy::unreachable,
+        reason = "all sites guard KvStorage::Paged invariant or impossible paged_quant arms; \
+                  each is reachable only via a construction-time BUG in cache allocation"
+    )]
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "wildcard arm is the correct fallthrough for unsupported arch/quant variants; exhaustive expansion would require updating on every new variant"
+    )]
+    fn update_paged(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        device: Device,
+    ) -> Result<(Array, Array)> {
+        use crate::paged::{
+            paged_kv_page_tokens, PagedKStorage, PagedPlanarVStorage, PagedVStorage,
+        };
+        use crate::planarquant_msl::{planar_dequantize_v4_gpu, planar_quantize_v4_gpu};
+        use crate::q8_msl::{q8_dequantize_gpu, q8_quantize_gpu};
+        use crate::turboquant_msl::{turbo_dequantize_v4_gpu, turbo_quantize_v4_gpu};
+
+        // Extract quant + max_seq without holding the storage borrow.
+        let (paged_quant, max_seq) = match &self.storage {
+            KvStorage::Paged { quant, max_seq, .. } => (*quant, *max_seq),
+            _ => unreachable!("update_paged called on non-Paged storage"),
+        };
+
+        // Warm-TTFT fp16 seed path (same as non-paged quant paths).
+        // decode_fp16_k is set after exit_prefill; first decode step uses it.
+        if self.decode_fp16_k.is_some() {
+            return self.update_decode_fp16(new_k, new_v, max_seq, device);
+        }
+
+        // GPU only: paged path only activates on GPU; CPU falls back to decode_fp16.
+        if device != Device::Gpu {
+            return self.update_decode_fp16(new_k, new_v, max_seq, device);
+        }
+
+        let new_shape = new_k.shape();
+        let page_tokens = paged_kv_page_tokens();
+        let n_pages = ((max_seq + page_tokens - 1) / page_tokens) as usize;
+
+        // --- K (always q8_0) ---
+        let (codes_k, scales_k) = q8_quantize_gpu(new_k, device)?;
+        let KvStorage::Paged { k, .. } = &mut self.storage else {
+            unreachable!()
+        };
+        if k.is_none() {
+            *k = Some(PagedKStorage::new(max_seq, page_tokens, n_pages));
+        }
+        let pk = k.as_mut().unwrap();
+        pk.append(&new_shape, codes_k, scales_k, device)?;
+        let k_shape = pk.shape.clone();
+        let total_k = pk.total_tokens;
+        let n_pages_k = pk.block_table.len();
+        let (gathered_codes_k, gathered_scales_k) = pk.gather(device)?;
+        let k_full = q8_dequantize_gpu(
+            &gathered_codes_k,
+            &gathered_scales_k,
+            &k_shape,
+            new_k.dtype(),
+            device,
+        )?;
+
+        // --- V (mode-dependent) ---
+        let v_full = match paged_quant {
+            KvQuant::K8V8 => {
+                let (codes_v, scales_v) = q8_quantize_gpu(new_v, device)?;
+                let KvStorage::Paged { v_k8, .. } = &mut self.storage else {
+                    unreachable!()
+                };
+                if v_k8.is_none() {
+                    *v_k8 = Some(Box::new(PagedVStorage::new(
+                        max_seq,
+                        page_tokens,
+                        n_pages,
+                        8,
+                    )));
+                }
+                let pv = v_k8.as_mut().unwrap();
+                pv.append(&new_shape, codes_v, scales_v, device)?;
+                let v_shape = pv.shape.clone();
+                let (gathered_codes_v, gathered_scales_v) = pv.gather(device)?;
+                q8_dequantize_gpu(
+                    &gathered_codes_v,
+                    &gathered_scales_v,
+                    &v_shape,
+                    new_v.dtype(),
+                    device,
+                )?
+            }
+            KvQuant::K8V4 => {
+                let (codes_v, scales_v) = turbo_quantize_v4_gpu(new_v, device)?;
+                let KvStorage::Paged { v_k8, .. } = &mut self.storage else {
+                    unreachable!()
+                };
+                if v_k8.is_none() {
+                    *v_k8 = Some(Box::new(PagedVStorage::new(
+                        max_seq,
+                        page_tokens,
+                        n_pages,
+                        4,
+                    )));
+                }
+                let pv = v_k8.as_mut().unwrap();
+                pv.append(&new_shape, codes_v, scales_v, device)?;
+                let v_shape = pv.shape.clone();
+                let (gathered_codes_v, gathered_scales_v) = pv.gather(device)?;
+                turbo_dequantize_v4_gpu(
+                    &gathered_codes_v,
+                    &gathered_scales_v,
+                    &v_shape,
+                    new_v.dtype(),
+                    device,
+                )?
+            }
+            KvQuant::Planar => {
+                let (codes_v, scales_v, rotations_v) = planar_quantize_v4_gpu(new_v, device)?;
+                let KvStorage::Paged { v_planar, .. } = &mut self.storage else {
+                    unreachable!()
+                };
+                if v_planar.is_none() {
+                    *v_planar = Some(Box::new(PagedPlanarVStorage::new(
+                        max_seq,
+                        page_tokens,
+                        n_pages,
+                    )));
+                }
+                let pv = v_planar.as_mut().unwrap();
+                pv.append(&new_shape, codes_v, scales_v, rotations_v, device)?;
+                let v_shape = pv.shape.clone();
+                let (gathered_codes_v, gathered_scales_v, gathered_rotations_v) =
+                    pv.gather(device)?;
+                let out = planar_dequantize_v4_gpu(
+                    &gathered_codes_v,
+                    &gathered_scales_v,
+                    &gathered_rotations_v,
+                    &v_shape,
+                    device,
+                )?;
+                if out.dtype() == new_v.dtype() {
+                    out
+                } else {
+                    out.astype(new_v.dtype(), device)?
+                }
+            }
+            _ => {
+                return Err(Error::Mlx(
+                    "update_paged: unexpected quant mode (None/Mixed not routed here)".into(),
+                ));
+            }
+        };
+
+        tracing::trace!(
+            seq = new_shape[2],
+            total = total_k,
+            pages = n_pages_k,
+            "paged KV append"
+        );
+
+        Ok((k_full, v_full))
+    }
+
+    /// Materialize all GPU `Array` buffers this cache holds to host-readable
+    /// memory, on the **calling** thread.
+    ///
+    /// Called on the inference thread by the spill sink right after the
+    /// refcount-clone, so that the background spill drain thread (which has no
+    /// access to the Metal stream that built these arrays) can serialize the
+    /// already-evaluated bytes without re-evaluating the lazy graph. Without
+    /// this, the drain thread's serialize fails with
+    /// `There is no Stream(gpu, N) in current thread`.
+    pub fn eval_for_spill(&self) -> Result<()> {
+        // Delegate to the complete GPU-state materializer (handles every storage
+        // variant + rotating ring + decode_fp16/prefill_raw scratch). Called on
+        // the inference thread by the spill sinks so the drain thread —
+        // which has no Metal stream — only copies already-evaluated host bytes.
+        self.eval_gpu_state()
+    }
+
+    /// Deep-clone this cache: creates new MLX arrays for every stored tensor.
+    pub fn try_deep_clone(&self) -> Result<Self> {
+        Ok(Self {
+            storage: self.storage.try_deep_clone()?,
+            offset: self.offset,
+            quant: self.quant,
+            layer_idx: self.layer_idx,
+            prefill_raw_k: match &self.prefill_raw_k {
+                Some(a) => Some(a.try_clone()?),
+                None => None,
+            },
+            prefill_raw_v: match &self.prefill_raw_v {
+                Some(a) => Some(a.try_clone()?),
+                None => None,
+            },
+            in_prefill: self.in_prefill,
+            decode_fp16_k: match &self.decode_fp16_k {
+                Some(a) => Some(a.try_clone()?),
+                None => None,
+            },
+            decode_fp16_v: match &self.decode_fp16_v {
+                Some(a) => Some(a.try_clone()?),
+                None => None,
+            },
+            rotating: match &self.rotating {
+                Some(r) => Some(r.try_deep_clone()?),
+                None => None,
+            },
+            flash_k_codes: match &self.flash_k_codes {
+                Some(a) => Some(a.try_clone()?),
+                None => None,
+            },
+            flash_k_scales: match &self.flash_k_scales {
+                Some(a) => Some(a.try_clone()?),
+                None => None,
+            },
+            flash_v_codes: match &self.flash_v_codes {
+                Some(a) => Some(a.try_clone()?),
+                None => None,
+            },
+            flash_v_scales: match &self.flash_v_scales {
+                Some(a) => Some(a.try_clone()?),
+                None => None,
+            },
+            flash_max_seq: self.flash_max_seq,
+            flash_filled: self.flash_filled,
+            // The fused-QK shadow holds purely transient decode-time state
+            // (re-seeded on every fresh decode). A deep clone for request
+            // branching simply drops it; the next decode dispatch on the
+            // cloned cache will reallocate from the bf16 prefix.
+            fused_qk_shadow: None,
+        })
+    }
+
+    /// Iso3 decode update — K = affine q8_0, V = IsoQuant 3-bit
+    /// (quaternion SO(4) rotation + Lloyd-Max codebook).
+    ///
+    /// Mirrors [`Self::update_k8vturbo3`] with the V side replaced by
+    /// [`QuantIsoV3`].
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Option is Some by construction immediately above this fn body's assignments"
+    )]
+    fn update_iso3(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        device: Device,
+    ) -> Result<(Array, Array)> {
+        let KvStorage::IsoV3 { k, v, max_seq } = &mut self.storage else {
+            return Err(Error::Mlx(format!(
+                "storage mismatch: expected IsoV3, got {}",
+                storage_variant_name(&self.storage)
+            )));
+        };
+        let max_seq = *max_seq;
+
+        if self.decode_fp16_k.is_some() {
+            return self.update_decode_fp16(new_k, new_v, max_seq, device);
+        }
+
+        let new_shape = new_k.shape();
+
+        // K-side: GPU-capable affine q8_0 (same as K8V4 / K8VTurbo3).
+        // V-side: routes encode through the iso3 MSL kernel when
+        // `device == Device::Gpu`; CPU encode remains the fallback. This
+        // hot path is shadowed by the warm-TTFT bf16 seed: the GPU encode
+        // fires once at exit_prefill (large `new_v` slice), not per decode
+        // step (the bf16 V buffer absorbs decode-step appends).
+        let k_f32 = if device == Device::Gpu {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_k, device)?
+        };
+        let v_f32 = if device == Device::Gpu {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_v, Device::Cpu)?
+        };
+
+        if k.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *k = Some(QuantK {
+                codes: Vec::new(),
+                scales: Vec::new(),
+                gpu_codes_buf: None,
+                gpu_scales_buf: None,
+                gpu_words_per_step: 0,
+                gpu_scales_per_step: 0,
+                gpu_capacity: 0,
+                shape: init_shape,
+                max_seq,
+            });
+        }
+        let ks = k.as_mut().unwrap();
+        ks.append(&k_f32, &new_shape, new_k, device, max_seq)?;
+        let k_shape = ks.shape.clone();
+        let (k_recon_f32, k_arr_opt) = ks.dequantize_choice(device, new_k.dtype())?;
+        let k_full = match k_arr_opt {
+            Some(arr) => arr,
+            None => f32_vec_to_array(&k_recon_f32, &k_shape)?,
+        };
+
+        if v.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *v = Some(QuantIsoV3::new(init_shape, max_seq));
+        }
+        let vs = v.as_mut().unwrap();
+        // Per-phase trace instrumentation for the iso3 V hot path.
+        // Each phase emits one structured `trace!` event. Off by default; opt
+        // in with `--log verbose` or `RUST_LOG=rmlx_kv_quant=trace`. Per
+        // CLAUDE.md §Debug mode: never enable trace at info level.
+        let kv_h = new_shape[1];
+        let head_dim = new_shape[3];
+        let t_enc = std::time::Instant::now();
+        if device == Device::Gpu {
+            // GPU-resident mirror update. `QuantIsoV3::append_gpu` retains
+            // the encode outputs in a pre-allocated per-struct buffer so
+            // `dequant_gpu` below can skip the CPU-staged `Array::from_bytes`
+            // upload on every step.
+            vs.append_gpu(new_v, &new_shape, device)?;
+        } else {
+            vs.append(&v_f32, &new_shape)?;
+        }
+        let s_total = vs.shape[2];
+        tracing::trace!(
+            phase = "iso3_encode",
+            ms = t_enc.elapsed().as_secs_f64() * 1e3,
+            s_total = s_total,
+            kv_h,
+            head_dim,
+            "iso3 hot-path"
+        );
+        // On GPU, skip the CPU dequant + vec_to_array round-trip and upload
+        // codes/scales/quaternions/norms directly via Array::from_bytes
+        // → dispatch iso_dequantize_v3_gpu. Single-pass GPU side, no
+        // intermediate Vec<f32> materialisation.
+        let v_shape = vs.shape.clone();
+        let v_full = if device == Device::Gpu {
+            let t_deq = std::time::Instant::now();
+            let arr = vs.dequant_gpu(device)?;
+            tracing::trace!(
+                phase = "iso3_dequant_gpu",
+                codec = "iso3_gpu",
+                ms = t_deq.elapsed().as_secs_f64() * 1e3,
+                s_total = s_total,
+                kv_h,
+                head_dim,
+                "iso3 hot-path"
+            );
+            arr
+        } else {
+            let t_deq = std::time::Instant::now();
+            let v_recon_f32 = vs.dequant()?;
+            tracing::trace!(
+                phase = "iso3_dequant_cpu",
+                ms = t_deq.elapsed().as_secs_f64() * 1e3,
+                s_total = s_total,
+                kv_h,
+                head_dim,
+                "iso3 hot-path"
+            );
+            let t_mat = std::time::Instant::now();
+            let arr = f32_vec_to_array(&v_recon_f32, &v_shape)?;
+            tracing::trace!(
+                phase = "iso3_vec_to_array",
+                ms = t_mat.elapsed().as_secs_f64() * 1e3,
+                s_total = s_total,
+                kv_h,
+                head_dim,
+                "iso3 hot-path"
+            );
+            arr
+        };
+
+        Ok((k_full, v_full))
+    }
+
+    /// Iso4 decode update — K = affine q8_0, V = IsoQuant 4-bit
+    /// (quaternion SO(4) rotation + 4-bit Lloyd-Max codebook).
+    ///
+    /// Structurally identical to [`Self::update_iso3`] with the V side bound
+    /// to `QuantIsoV4` instead of `QuantIsoV3`. The iso4 MSL kernel wires the
+    /// V-encode step when `device == Device::Gpu`; CPU dequant remains primary
+    /// for the returned Array (warm-TTFT bf16 shortcut is active at decode).
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Option is Some by construction immediately above this fn body's assignments"
+    )]
+    fn update_iso4(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        device: Device,
+    ) -> Result<(Array, Array)> {
+        let KvStorage::IsoV4 { k, v, max_seq } = &mut self.storage else {
+            return Err(Error::Mlx(format!(
+                "storage mismatch: expected IsoV4, got {}",
+                storage_variant_name(&self.storage)
+            )));
+        };
+        let max_seq = *max_seq;
+
+        if self.decode_fp16_k.is_some() {
+            return self.update_decode_fp16(new_k, new_v, max_seq, device);
+        }
+
+        let new_shape = new_k.shape();
+
+        // K-side: GPU-capable affine q8_0 (same as K8V4 / K8VTurbo3).
+        // V-side: routes encode through the iso4 MSL kernel when
+        // `device == Device::Gpu`; CPU encode remains the fallback. This
+        // hot path is shadowed by the warm-TTFT bf16 seed: the GPU encode
+        // fires once at exit_prefill (large `new_v` slice), not per decode
+        // step (the bf16 V buffer absorbs decode-step appends).
+        let k_f32 = if device == Device::Gpu {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_k, device)?
+        };
+        let v_f32 = if device == Device::Gpu {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_v, Device::Cpu)?
+        };
+
+        if k.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *k = Some(QuantK {
+                codes: Vec::new(),
+                scales: Vec::new(),
+                gpu_codes_buf: None,
+                gpu_scales_buf: None,
+                gpu_words_per_step: 0,
+                gpu_scales_per_step: 0,
+                gpu_capacity: 0,
+                shape: init_shape,
+                max_seq,
+            });
+        }
+        let ks = k.as_mut().unwrap();
+        ks.append(&k_f32, &new_shape, new_k, device, max_seq)?;
+        let k_shape = ks.shape.clone();
+        let (k_recon_f32, k_arr_opt) = ks.dequantize_choice(device, new_k.dtype())?;
+        let k_full = match k_arr_opt {
+            Some(arr) => arr,
+            None => f32_vec_to_array(&k_recon_f32, &k_shape)?,
+        };
+
+        if v.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *v = Some(QuantIsoV4::new(init_shape, max_seq));
+        }
+        let vs = v.as_mut().unwrap();
+        if device == Device::Gpu {
+            iso4_gpu_append_into_blocks(vs, new_v, &new_shape)?;
+        } else {
+            vs.append(&v_f32, &new_shape)?;
+        }
+        let v_shape = vs.shape.clone();
+        let v_recon_f32 = vs.dequant()?;
+        let v_full = f32_vec_to_array(&v_recon_f32, &v_shape)?;
+
+        Ok((k_full, v_full))
+    }
+
+    /// Iso3Sym decode update: K and V both quantize through
+    /// IsoQuant 3-bit (CPU-only). Structurally mirrors [`Self::update_iso3`]
+    /// with the K side bound to `QuantIsoK3` instead of `QuantK`.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction"
+    )]
+    fn update_iso3_sym(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        device: Device,
+    ) -> Result<(Array, Array)> {
+        let KvStorage::IsoSym3 { k, v, max_seq } = &mut self.storage else {
+            return Err(Error::Mlx(format!(
+                "storage mismatch: expected IsoSym3, got {}",
+                storage_variant_name(&self.storage)
+            )));
+        };
+        let max_seq = *max_seq;
+
+        if self.decode_fp16_k.is_some() {
+            return self.update_decode_fp16(new_k, new_v, max_seq, device);
+        }
+
+        let new_shape = new_k.shape();
+        // K and V encode through the iso3 MSL kernel when
+        // `device == Device::Gpu`. The kernel is axis-agnostic — K-side and
+        // V-side share the same dispatch. This hot path is warm-TTFT-shadowed:
+        // the GPU encode fires once at exit_prefill, not per decode step.
+        let k_f32 = if device == Device::Gpu {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_k, Device::Cpu)?
+        };
+        let v_f32 = if device == Device::Gpu {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_v, Device::Cpu)?
+        };
+
+        if k.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *k = Some(QuantIsoK3::new(init_shape, max_seq));
+        }
+        let Some(ks) = k.as_mut() else {
+            return Err(Error::Mlx("IsoSym3 K buffer absent after init".into()));
+        };
+        if device == Device::Gpu {
+            iso3_gpu_append_into_k_blocks(ks, new_k, &new_shape)?;
+        } else {
+            ks.append(&k_f32, &new_shape)?;
+        }
+        let k_shape = ks.shape.clone();
+        let k_full = if device == Device::Gpu {
+            ks.dequant_gpu(device)?
+        } else {
+            let k_recon_f32 = ks.dequant()?;
+            f32_vec_to_array(&k_recon_f32, &k_shape)?
+        };
+
+        if v.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *v = Some(QuantIsoV3::new(init_shape, max_seq));
+        }
+        let Some(vs) = v.as_mut() else {
+            return Err(Error::Mlx("IsoSym3 V buffer absent after init".into()));
+        };
+        // Per-phase trace instrumentation for iso3 V (sym path).
+        let kv_h = new_shape[1];
+        let head_dim = new_shape[3];
+        let t_enc = std::time::Instant::now();
+        if device == Device::Gpu {
+            // Same GPU-resident mirror pattern as `update_iso3`.
+            vs.append_gpu(new_v, &new_shape, device)?;
+        } else {
+            vs.append(&v_f32, &new_shape)?;
+        }
+        let s_total = vs.shape[2];
+        tracing::trace!(
+            phase = "iso3_encode",
+            ms = t_enc.elapsed().as_secs_f64() * 1e3,
+            s_total = s_total,
+            kv_h,
+            head_dim,
+            "iso3 hot-path (sym V)"
+        );
+        let v_shape = vs.shape.clone();
+        let v_full = if device == Device::Gpu {
+            let t_deq = std::time::Instant::now();
+            let arr = vs.dequant_gpu(device)?;
+            tracing::trace!(
+                phase = "iso3_dequant_gpu",
+                codec = "iso3_gpu",
+                ms = t_deq.elapsed().as_secs_f64() * 1e3,
+                s_total = s_total,
+                kv_h,
+                head_dim,
+                "iso3 hot-path (sym V)"
+            );
+            arr
+        } else {
+            let t_deq = std::time::Instant::now();
+            let v_recon_f32 = vs.dequant()?;
+            tracing::trace!(
+                phase = "iso3_dequant_cpu",
+                ms = t_deq.elapsed().as_secs_f64() * 1e3,
+                s_total = s_total,
+                kv_h,
+                head_dim,
+                "iso3 hot-path (sym V)"
+            );
+            let t_mat = std::time::Instant::now();
+            let arr = f32_vec_to_array(&v_recon_f32, &v_shape)?;
+            tracing::trace!(
+                phase = "iso3_vec_to_array",
+                ms = t_mat.elapsed().as_secs_f64() * 1e3,
+                s_total = s_total,
+                kv_h,
+                head_dim,
+                "iso3 hot-path (sym V)"
+            );
+            arr
+        };
+
+        Ok((k_full, v_full))
+    }
+
+    /// Iso4Sym decode update: K and V both quantize through
+    /// IsoQuant 4-bit (CPU-only). Mirrors [`Self::update_iso3_sym`] with bits=4.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction"
+    )]
+    fn update_iso4_sym(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        device: Device,
+    ) -> Result<(Array, Array)> {
+        let KvStorage::IsoSym4 { k, v, max_seq } = &mut self.storage else {
+            return Err(Error::Mlx(format!(
+                "storage mismatch: expected IsoSym4, got {}",
+                storage_variant_name(&self.storage)
+            )));
+        };
+        let max_seq = *max_seq;
+
+        if self.decode_fp16_k.is_some() {
+            return self.update_decode_fp16(new_k, new_v, max_seq, device);
+        }
+
+        let new_shape = new_k.shape();
+        // Both K and V encode through the iso4 MSL kernel when
+        // `device == Device::Gpu`. The kernel is axis-agnostic — K-side
+        // and V-side share the same dispatch. This path is warm-TTFT-shadowed:
+        // GPU encode fires once at exit_prefill, not per step.
+        let k_f32 = if device == Device::Gpu {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_k, Device::Cpu)?
+        };
+        let v_f32 = if device == Device::Gpu {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_v, Device::Cpu)?
+        };
+
+        if k.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *k = Some(QuantIsoK4::new(init_shape, max_seq));
+        }
+        let Some(ks) = k.as_mut() else {
+            return Err(Error::Mlx("IsoSym4 K buffer absent after init".into()));
+        };
+        if device == Device::Gpu {
+            iso4_gpu_append_into_k_blocks(ks, new_k, &new_shape)?;
+        } else {
+            ks.append(&k_f32, &new_shape)?;
+        }
+        let k_shape = ks.shape.clone();
+        let k_recon_f32 = ks.dequant()?;
+        let k_full = f32_vec_to_array(&k_recon_f32, &k_shape)?;
+
+        if v.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *v = Some(QuantIsoV4::new(init_shape, max_seq));
+        }
+        let Some(vs) = v.as_mut() else {
+            return Err(Error::Mlx("IsoSym4 V buffer absent after init".into()));
+        };
+        if device == Device::Gpu {
+            iso4_gpu_append_into_blocks(vs, new_v, &new_shape)?;
+        } else {
+            vs.append(&v_f32, &new_shape)?;
+        }
+        let v_shape = vs.shape.clone();
+        let v_recon_f32 = vs.dequant()?;
+        let v_full = f32_vec_to_array(&v_recon_f32, &v_shape)?;
+
+        Ok((k_full, v_full))
+    }
+
+    /// IsoKOnly3 decode update. K is IsoQuant 3-bit (CPU); V stays
+    /// bf16 on `decode_fp16_v` (same machinery as `KvStorage::None` /
+    /// `KvStorage::PlanarK`).
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction"
+    )]
+    fn update_iso_k_only_3(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        device: Device,
+    ) -> Result<(Array, Array)> {
+        let KvStorage::IsoKOnly3 { k, max_seq } = &mut self.storage else {
+            return Err(Error::KvStorageMismatch {
+                expected: "IsoKOnly3",
+                got: storage_variant_name(&self.storage),
+            });
+        };
+        let max_seq = *max_seq;
+
+        let new_shape = new_k.shape();
+        // K encode routes through the iso3 MSL kernel when
+        // `device == Device::Gpu`. Warm-TTFT-shadowed: GPU encode fires
+        // once at exit_prefill, not per decode step.
+        let k_f32 = if device == Device::Gpu {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_k, Device::Cpu)?
+        };
+
+        if k.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *k = Some(QuantIsoK3::new(init_shape, max_seq));
+        }
+        let Some(ks) = k.as_mut() else {
+            return Err(Error::Mlx("IsoKOnly3 K buffer absent after init".into()));
+        };
+        // Per-phase trace instrumentation for iso3 K (K-only path).
+        // V side is bf16, not iso3, so no phase events on V.
+        let kv_h = new_shape[1];
+        let head_dim = new_shape[3];
+        let t_enc = std::time::Instant::now();
+        if device == Device::Gpu {
+            iso3_gpu_append_into_k_blocks(ks, new_k, &new_shape)?;
+        } else {
+            ks.append(&k_f32, &new_shape)?;
+        }
+        let s_total = ks.shape[2];
+        tracing::trace!(
+            phase = "iso3_encode",
+            ms = t_enc.elapsed().as_secs_f64() * 1e3,
+            s_total = s_total,
+            kv_h,
+            head_dim,
+            "iso3 hot-path (K-only)"
+        );
+        let k_shape = ks.shape.clone();
+        let k_full = if device == Device::Gpu {
+            let t_deq = std::time::Instant::now();
+            let arr = ks.dequant_gpu(device)?;
+            tracing::trace!(
+                phase = "iso3_dequant_gpu",
+                codec = "iso3_gpu",
+                ms = t_deq.elapsed().as_secs_f64() * 1e3,
+                s_total = s_total,
+                kv_h,
+                head_dim,
+                "iso3 hot-path (K-only)"
+            );
+            arr
+        } else {
+            let t_deq = std::time::Instant::now();
+            let k_recon_f32 = ks.dequant()?;
+            tracing::trace!(
+                phase = "iso3_dequant_cpu",
+                ms = t_deq.elapsed().as_secs_f64() * 1e3,
+                s_total = s_total,
+                kv_h,
+                head_dim,
+                "iso3 hot-path (K-only)"
+            );
+            let t_mat = std::time::Instant::now();
+            let arr = f32_vec_to_array(&k_recon_f32, &k_shape)?;
+            tracing::trace!(
+                phase = "iso3_vec_to_array",
+                ms = t_mat.elapsed().as_secs_f64() * 1e3,
+                s_total = s_total,
+                kv_h,
+                head_dim,
+                "iso3 hot-path (K-only)"
+            );
+            arr
+        };
+
+        // V-side: bf16 via the V-only helper (must NOT touch decode_fp16_k).
+        // Calling the full update_decode_fp16 here would populate
+        // self.decode_fp16_k as a side-effect, causing the
+        // decode_fp16_k.is_some() early-return guard to short-circuit the
+        // ISO codec on the next decode step (silent bf16-K regression).
+        let v_full = self.update_decode_fp16_v_only(new_v, max_seq, device)?;
+        Ok((k_full, v_full))
+    }
+
+    /// IsoKOnly4 decode update. K is IsoQuant 4-bit (CPU); V bf16.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction"
+    )]
+    fn update_iso_k_only_4(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        device: Device,
+    ) -> Result<(Array, Array)> {
+        let KvStorage::IsoKOnly4 { k, max_seq } = &mut self.storage else {
+            return Err(Error::KvStorageMismatch {
+                expected: "IsoKOnly4",
+                got: storage_variant_name(&self.storage),
+            });
+        };
+        let max_seq = *max_seq;
+
+        let new_shape = new_k.shape();
+        // K encode routes through the iso4 MSL kernel when
+        // `device == Device::Gpu`. Warm-TTFT-shadowed: GPU encode fires
+        // once at exit_prefill, not per decode step.
+        let k_f32 = if device == Device::Gpu {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_k, Device::Cpu)?
+        };
+
+        if k.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *k = Some(QuantIsoK4::new(init_shape, max_seq));
+        }
+        let Some(ks) = k.as_mut() else {
+            return Err(Error::Mlx("IsoKOnly4 K buffer absent after init".into()));
+        };
+        if device == Device::Gpu {
+            iso4_gpu_append_into_k_blocks(ks, new_k, &new_shape)?;
+        } else {
+            ks.append(&k_f32, &new_shape)?;
+        }
+        let k_shape = ks.shape.clone();
+        let k_recon_f32 = ks.dequant()?;
+        let k_full = f32_vec_to_array(&k_recon_f32, &k_shape)?;
+
+        // V-side: bf16 via the V-only helper (must NOT touch decode_fp16_k).
+        let v_full = self.update_decode_fp16_v_only(new_v, max_seq, device)?;
+        Ok((k_full, v_full))
+    }
+
+    /// Rotor3 decode update — K = affine q8_0, V = rotor3
+    /// (Cl(3,0) Clifford rotor sandwich + 3-bit Lloyd-Max codebook).
+    ///
+    /// Structurally mirrors [`Self::update_iso4`] with the V side bound to
+    /// `QuantRotorV3` instead of `QuantIsoV4`. CPU dequant only — no MSL
+    /// kernel for rotor3 (deferred, see [`crate::rotorquant`] module docs).
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Option is Some by construction immediately above this fn body's assignments"
+    )]
+    fn update_rotor3(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        device: Device,
+    ) -> Result<(Array, Array)> {
+        let KvStorage::RotorV3 { k, v, max_seq } = &mut self.storage else {
+            return Err(Error::Mlx(format!(
+                "storage mismatch: expected RotorV3, got {}",
+                storage_variant_name(&self.storage)
+            )));
+        };
+        let max_seq = *max_seq;
+
+        if self.decode_fp16_k.is_some() {
+            return self.update_decode_fp16(new_k, new_v, max_seq, device);
+        }
+
+        let new_shape = new_k.shape();
+
+        // K-side: GPU-capable affine q8_0 (same as iso3 / iso4 / K8V4).
+        // V-side: routes encode through the rotor3 MSL kernel when
+        // `device == Device::Gpu`; CPU encode remains the fallback. This
+        // hot path is shadowed by the warm-TTFT bf16 seed: the GPU encode
+        // fires once at exit_prefill (large `new_v` slice), not per decode step.
+        let k_f32 = if device == Device::Gpu {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_k, device)?
+        };
+        let v_f32 = if device == Device::Gpu {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_v, Device::Cpu)?
+        };
+
+        if k.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *k = Some(QuantK {
+                codes: Vec::new(),
+                scales: Vec::new(),
+                gpu_codes_buf: None,
+                gpu_scales_buf: None,
+                gpu_words_per_step: 0,
+                gpu_scales_per_step: 0,
+                gpu_capacity: 0,
+                shape: init_shape,
+                max_seq,
+            });
+        }
+        let ks = k.as_mut().unwrap();
+        ks.append(&k_f32, &new_shape, new_k, device, max_seq)?;
+        let k_shape = ks.shape.clone();
+        let (k_recon_f32, k_arr_opt) = ks.dequantize_choice(device, new_k.dtype())?;
+        let k_full = match k_arr_opt {
+            Some(arr) => arr,
+            None => f32_vec_to_array(&k_recon_f32, &k_shape)?,
+        };
+
+        if v.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            // Thread the real model-layer index into the rotor3 seed
+            // so each layer gets a distinct rotor table. The rotor table is
+            // deterministic and persists via SSD round-trip.
+            *v = Some(QuantRotorV3::new(
+                init_shape,
+                max_seq,
+                layer_idx_u32(self.layer_idx),
+            ));
+        }
+        let vs = v.as_mut().unwrap();
+        if device == Device::Gpu {
+            rotor3_gpu_append_into_blocks(vs, new_v, &new_shape)?;
+        } else {
+            vs.append(&v_f32, &new_shape)?;
+        }
+        let v_shape = vs.shape.clone();
+        let v_recon_f32 = vs.dequant()?;
+        let v_full = f32_vec_to_array(&v_recon_f32, &v_shape)?;
+
+        Ok((k_full, v_full))
+    }
+
+    /// Rotor4 decode update — K = affine q8_0, V = rotor4
+    /// (Cl(3,0) Clifford rotor sandwich + 4-bit Lloyd-Max codebook).
+    ///
+    /// Structurally mirrors [`Self::update_rotor3`] with the V side bound to
+    /// `QuantRotorV4` instead of `QuantRotorV3`. CPU dequant only — no MSL
+    /// kernel for rotor4 (deferred, same rationale as rotor3).
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Option is Some by construction immediately above this fn body's assignments"
+    )]
+    fn update_rotor4(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        device: Device,
+    ) -> Result<(Array, Array)> {
+        let KvStorage::RotorV4 { k, v, max_seq } = &mut self.storage else {
+            return Err(Error::Mlx(format!(
+                "storage mismatch: expected RotorV4, got {}",
+                storage_variant_name(&self.storage)
+            )));
+        };
+        let max_seq = *max_seq;
+
+        if self.decode_fp16_k.is_some() {
+            return self.update_decode_fp16(new_k, new_v, max_seq, device);
+        }
+
+        let new_shape = new_k.shape();
+
+        // K-side: GPU-capable affine q8_0 (same as rotor3 / iso3 / iso4 / K8V4).
+        // V-side: routes encode through the rotor4 MSL kernel when
+        // `device == Device::Gpu`; CPU encode remains the fallback. This
+        // hot path is shadowed by the warm-TTFT bf16 seed: the GPU encode
+        // fires once at exit_prefill, not per decode step.
+        let k_f32 = if device == Device::Gpu {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_k, device)?
+        };
+        let v_f32 = if device == Device::Gpu {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_v, Device::Cpu)?
+        };
+
+        if k.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *k = Some(QuantK {
+                codes: Vec::new(),
+                scales: Vec::new(),
+                gpu_codes_buf: None,
+                gpu_scales_buf: None,
+                gpu_words_per_step: 0,
+                gpu_scales_per_step: 0,
+                gpu_capacity: 0,
+                shape: init_shape,
+                max_seq,
+            });
+        }
+        let ks = k.as_mut().unwrap();
+        ks.append(&k_f32, &new_shape, new_k, device, max_seq)?;
+        let k_shape = ks.shape.clone();
+        let (k_recon_f32, k_arr_opt) = ks.dequantize_choice(device, new_k.dtype())?;
+        let k_full = match k_arr_opt {
+            Some(arr) => arr,
+            None => f32_vec_to_array(&k_recon_f32, &k_shape)?,
+        };
+
+        if v.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            // Thread the real model-layer index into the rotor4 seed
+            // so each layer gets a distinct rotor table. The rotor table is
+            // deterministic and persists via SSD round-trip.
+            *v = Some(QuantRotorV4::new(
+                init_shape,
+                max_seq,
+                layer_idx_u32(self.layer_idx),
+            ));
+        }
+        let vs = v.as_mut().unwrap();
+        if device == Device::Gpu {
+            rotor4_gpu_append_into_blocks(vs, new_v, &new_shape)?;
+        } else {
+            vs.append(&v_f32, &new_shape)?;
+        }
+        let v_shape = vs.shape.clone();
+        let v_recon_f32 = vs.dequant()?;
+        let v_full = f32_vec_to_array(&v_recon_f32, &v_shape)?;
+
+        Ok((k_full, v_full))
+    }
+
+    /// Rotor3Sym decode update: K and V both quantize through the rotor3
+    /// (Cl(3,0) Clifford rotor) codec (CPU-only). K-side carries the optional
+    /// 1-bit QJL residual sideband when
+    /// [`crate::rotor_qjl::rotor_qjl_enabled`] is `true` at first append.
+    ///
+    /// Structurally mirrors [`Self::update_iso3_sym`] with the codec
+    /// bound to `QuantRotorK3` / `QuantRotorV3` instead of the iso K/V types.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction"
+    )]
+    fn update_rotor3_sym(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        device: Device,
+    ) -> Result<(Array, Array)> {
+        let KvStorage::RotorSym3 { k, v, max_seq } = &mut self.storage else {
+            return Err(Error::Mlx(format!(
+                "storage mismatch: expected RotorSym3, got {}",
+                storage_variant_name(&self.storage)
+            )));
+        };
+        let max_seq = *max_seq;
+
+        if self.decode_fp16_k.is_some() {
+            return self.update_decode_fp16(new_k, new_v, max_seq, device);
+        }
+
+        let new_shape = new_k.shape();
+        // GPU encode for both K and V when device == GPU and QJL is
+        // disabled. With QJL enabled the K-side falls back to CPU (the GPU
+        // kernel cannot replicate the QJL residual — see rotor_fused_qk_msl.rs).
+        let use_gpu = device == Device::Gpu;
+        let gpu_k_ok = use_gpu && !crate::rotor_qjl::rotor_qjl_enabled();
+        let k_f32 = if gpu_k_ok {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_k, Device::Cpu)?
+        };
+        let v_f32 = if use_gpu {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_v, Device::Cpu)?
+        };
+
+        if k.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *k = Some(crate::storage::QuantRotorK3::new(
+                init_shape,
+                max_seq,
+                layer_idx_u32(self.layer_idx),
+            ));
+        }
+        let Some(ks) = k.as_mut() else {
+            return Err(Error::Mlx("RotorSym3 K buffer absent after init".into()));
+        };
+        if gpu_k_ok {
+            rotor3_gpu_append_into_k_blocks(ks, new_k, &new_shape)?;
+        } else {
+            ks.append(&k_f32, &new_shape)?;
+        }
+        let k_shape = ks.shape.clone();
+        let k_recon_f32 = ks.dequant()?;
+        let k_full = f32_vec_to_array(&k_recon_f32, &k_shape)?;
+
+        if v.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *v = Some(QuantRotorV3::new(
+                init_shape,
+                max_seq,
+                layer_idx_u32(self.layer_idx),
+            ));
+        }
+        let Some(vs) = v.as_mut() else {
+            return Err(Error::Mlx("RotorSym3 V buffer absent after init".into()));
+        };
+        if use_gpu {
+            rotor3_gpu_append_into_blocks(vs, new_v, &new_shape)?;
+        } else {
+            vs.append(&v_f32, &new_shape)?;
+        }
+        let v_shape = vs.shape.clone();
+        let v_recon_f32 = vs.dequant()?;
+        let v_full = f32_vec_to_array(&v_recon_f32, &v_shape)?;
+
+        Ok((k_full, v_full))
+    }
+
+    /// Rotor4Sym decode update. Mirror of
+    /// [`Self::update_rotor3_sym`] with `bits=4`.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction"
+    )]
+    fn update_rotor4_sym(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        device: Device,
+    ) -> Result<(Array, Array)> {
+        let KvStorage::RotorSym4 { k, v, max_seq } = &mut self.storage else {
+            return Err(Error::Mlx(format!(
+                "storage mismatch: expected RotorSym4, got {}",
+                storage_variant_name(&self.storage)
+            )));
+        };
+        let max_seq = *max_seq;
+
+        if self.decode_fp16_k.is_some() {
+            return self.update_decode_fp16(new_k, new_v, max_seq, device);
+        }
+
+        let new_shape = new_k.shape();
+        // GPU encode when device == GPU. K-side opts out when QJL is
+        // enabled (see rotor3_sym mirror).
+        let use_gpu = device == Device::Gpu;
+        let gpu_k_ok = use_gpu && !crate::rotor_qjl::rotor_qjl_enabled();
+        let k_f32 = if gpu_k_ok {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_k, Device::Cpu)?
+        };
+        let v_f32 = if use_gpu {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_v, Device::Cpu)?
+        };
+
+        if k.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *k = Some(crate::storage::QuantRotorK4::new(
+                init_shape,
+                max_seq,
+                layer_idx_u32(self.layer_idx),
+            ));
+        }
+        let Some(ks) = k.as_mut() else {
+            return Err(Error::Mlx("RotorSym4 K buffer absent after init".into()));
+        };
+        if gpu_k_ok {
+            rotor4_gpu_append_into_k_blocks(ks, new_k, &new_shape)?;
+        } else {
+            ks.append(&k_f32, &new_shape)?;
+        }
+        let k_shape = ks.shape.clone();
+        let k_recon_f32 = ks.dequant()?;
+        let k_full = f32_vec_to_array(&k_recon_f32, &k_shape)?;
+
+        if v.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *v = Some(QuantRotorV4::new(
+                init_shape,
+                max_seq,
+                layer_idx_u32(self.layer_idx),
+            ));
+        }
+        let Some(vs) = v.as_mut() else {
+            return Err(Error::Mlx("RotorSym4 V buffer absent after init".into()));
+        };
+        if use_gpu {
+            rotor4_gpu_append_into_blocks(vs, new_v, &new_shape)?;
+        } else {
+            vs.append(&v_f32, &new_shape)?;
+        }
+        let v_shape = vs.shape.clone();
+        let v_recon_f32 = vs.dequant()?;
+        let v_full = f32_vec_to_array(&v_recon_f32, &v_shape)?;
+
+        Ok((k_full, v_full))
+    }
+
+    /// RotorKOnly3 decode update. K is rotor3 (CPU); V stays
+    /// bf16 on `decode_fp16_v`.
+    ///
+    /// **CRITICAL** (HIGH bug guard): uses
+    /// [`Self::update_decode_fp16_v_only`] for the V side, NOT
+    /// `update_decode_fp16`. The latter populates `self.decode_fp16_k` as a
+    /// side-effect, which causes the `decode_fp16_k.is_some()` early-return
+    /// guard to short-circuit the K codec on the *next* decode step (silent
+    /// bf16-K regression).
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction"
+    )]
+    fn update_rotor_k_only_3(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        device: Device,
+    ) -> Result<(Array, Array)> {
+        let KvStorage::RotorKOnly3 { k, max_seq } = &mut self.storage else {
+            return Err(Error::KvStorageMismatch {
+                expected: "RotorKOnly3",
+                got: storage_variant_name(&self.storage),
+            });
+        };
+        let max_seq = *max_seq;
+
+        let new_shape = new_k.shape();
+        // GPU encode for K when device == GPU AND QJL is disabled.
+        let gpu_k_ok = device == Device::Gpu && !crate::rotor_qjl::rotor_qjl_enabled();
+        let k_f32 = if gpu_k_ok {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_k, Device::Cpu)?
+        };
+
+        if k.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *k = Some(crate::storage::QuantRotorK3::new(
+                init_shape,
+                max_seq,
+                layer_idx_u32(self.layer_idx),
+            ));
+        }
+        let Some(ks) = k.as_mut() else {
+            return Err(Error::Mlx("RotorKOnly3 K buffer absent after init".into()));
+        };
+        if gpu_k_ok {
+            rotor3_gpu_append_into_k_blocks(ks, new_k, &new_shape)?;
+        } else {
+            ks.append(&k_f32, &new_shape)?;
+        }
+        let k_shape = ks.shape.clone();
+        let k_recon_f32 = ks.dequant()?;
+        let k_full = f32_vec_to_array(&k_recon_f32, &k_shape)?;
+
+        // V-side: bf16 via the V-only helper (must NOT touch decode_fp16_k).
+        let v_full = self.update_decode_fp16_v_only(new_v, max_seq, device)?;
+        Ok((k_full, v_full))
+    }
+
+    /// RotorKOnly4 decode update. Mirror of
+    /// [`Self::update_rotor_k_only_3`] with `bits=4`.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction"
+    )]
+    fn update_rotor_k_only_4(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        device: Device,
+    ) -> Result<(Array, Array)> {
+        let KvStorage::RotorKOnly4 { k, max_seq } = &mut self.storage else {
+            return Err(Error::KvStorageMismatch {
+                expected: "RotorKOnly4",
+                got: storage_variant_name(&self.storage),
+            });
+        };
+        let max_seq = *max_seq;
+
+        let new_shape = new_k.shape();
+        let gpu_k_ok = device == Device::Gpu && !crate::rotor_qjl::rotor_qjl_enabled();
+        let k_f32 = if gpu_k_ok {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_k, Device::Cpu)?
+        };
+
+        if k.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *k = Some(crate::storage::QuantRotorK4::new(
+                init_shape,
+                max_seq,
+                layer_idx_u32(self.layer_idx),
+            ));
+        }
+        let Some(ks) = k.as_mut() else {
+            return Err(Error::Mlx("RotorKOnly4 K buffer absent after init".into()));
+        };
+        if gpu_k_ok {
+            rotor4_gpu_append_into_k_blocks(ks, new_k, &new_shape)?;
+        } else {
+            ks.append(&k_f32, &new_shape)?;
+        }
+        let k_shape = ks.shape.clone();
+        let k_recon_f32 = ks.dequant()?;
+        let k_full = f32_vec_to_array(&k_recon_f32, &k_shape)?;
+
+        // V-side: bf16 via the V-only helper (must NOT touch decode_fp16_k).
+        let v_full = self.update_decode_fp16_v_only(new_v, max_seq, device)?;
+        Ok((k_full, v_full))
+    }
+
+    /// RotorK3Asym decode update. K is rotor3 (CPU); V is MLX
+    /// affine `v_bits` / `v_group_size` (reuses [`QuantV`]).
+    ///
+    /// Mirrors [`Self::update_rotor_k_only_3`] for K and [`Self::update_k8v4`]
+    /// for V (affine path) on the **seedless** path only.
+    ///
+    /// **Warm-TTFT.** Unlike `RotorKOnly3`, this asym variant DOES carry the
+    /// `decode_fp16_k.is_some()` shortcut (below): once the bf16 seed is live
+    /// (always, post-`exit_prefill` — see `exit_prefill`'s
+    /// generic seed tail), the entire decode step routes through
+    /// [`Self::update_decode_fp16`] and serves **both** K and V from bf16. The
+    /// rotor-K and affine-V codecs are quiescent for the whole decode window;
+    /// they re-encode only at `exit_prefill` or on a seedless cache. This is
+    /// the universal warm-TTFT decode contract documented in
+    /// `docs/KV_CACHE.md` §9.6.
+    ///
+    /// NB: `RotorKOnly3` (no asym V) is the opposite — it has **no** seed
+    /// shortcut in its body, so its rotor-K codec runs every decode step
+    /// (K-only family). Do not assume the two share K-side decode semantics.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction"
+    )]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Option is Some by construction immediately above this fn body's assignments"
+    )]
+    fn update_rotor_k_asym_3(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        device: Device,
+    ) -> Result<(Array, Array)> {
+        let KvStorage::RotorKAsym3 {
+            k,
+            v,
+            max_seq,
+            v_bits,
+            v_group_size,
+        } = &mut self.storage
+        else {
+            return Err(Error::KvStorageMismatch {
+                expected: "RotorKAsym3",
+                got: storage_variant_name(&self.storage),
+            });
+        };
+        let max_seq = *max_seq;
+        let v_bits = *v_bits;
+        let _ = v_group_size;
+
+        if self.decode_fp16_k.is_some() {
+            return self.update_decode_fp16(new_k, new_v, max_seq, device);
+        }
+
+        let new_shape = new_k.shape();
+        let gpu_k_ok = device == Device::Gpu && !crate::rotor_qjl::rotor_qjl_enabled();
+        let k_f32 = if gpu_k_ok {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_k, Device::Cpu)?
+        };
+        let v_f32 = if device == Device::Gpu {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_v, device)?
+        };
+
+        if k.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *k = Some(crate::storage::QuantRotorK3::new(
+                init_shape,
+                max_seq,
+                layer_idx_u32(self.layer_idx),
+            ));
+        }
+        let ks = k.as_mut().unwrap();
+        if gpu_k_ok {
+            rotor3_gpu_append_into_k_blocks(ks, new_k, &new_shape)?;
+        } else {
+            ks.append(&k_f32, &new_shape)?;
+        }
+        let k_shape = ks.shape.clone();
+        let k_recon_f32 = ks.dequant()?;
+        let k_full = f32_vec_to_array(&k_recon_f32, &k_shape)?;
+
+        if v.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *v = Some(QuantV::new_affine_decode(init_shape, v_bits, max_seq));
+        }
+        let vs = v.as_mut().unwrap();
+        vs.append(&v_f32, &new_shape, new_v, device, max_seq)?;
+        let v_shape = vs.shape.clone();
+        let (v_recon_f32, v_arr_opt) = vs.dequantize_choice(device, new_v.dtype())?;
+        let v_full = match v_arr_opt {
+            Some(arr) => arr,
+            None => f32_vec_to_array(&v_recon_f32, &v_shape)?,
+        };
+
+        Ok((k_full, v_full))
+    }
+
+    /// RotorK4Asym decode update. Mirror of
+    /// [`Self::update_rotor_k_asym_3`] with rotor4 K.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction"
+    )]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Option is Some by construction immediately above this fn body's assignments"
+    )]
+    fn update_rotor_k_asym_4(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        device: Device,
+    ) -> Result<(Array, Array)> {
+        let KvStorage::RotorKAsym4 {
+            k,
+            v,
+            max_seq,
+            v_bits,
+            v_group_size,
+        } = &mut self.storage
+        else {
+            return Err(Error::KvStorageMismatch {
+                expected: "RotorKAsym4",
+                got: storage_variant_name(&self.storage),
+            });
+        };
+        let max_seq = *max_seq;
+        let v_bits = *v_bits;
+        let _ = v_group_size;
+
+        if self.decode_fp16_k.is_some() {
+            return self.update_decode_fp16(new_k, new_v, max_seq, device);
+        }
+
+        let new_shape = new_k.shape();
+        let gpu_k_ok = device == Device::Gpu && !crate::rotor_qjl::rotor_qjl_enabled();
+        let k_f32 = if gpu_k_ok {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_k, Device::Cpu)?
+        };
+        let v_f32 = if device == Device::Gpu {
+            Vec::new()
+        } else {
+            array_to_f32_vec(new_v, device)?
+        };
+
+        if k.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *k = Some(crate::storage::QuantRotorK4::new(
+                init_shape,
+                max_seq,
+                layer_idx_u32(self.layer_idx),
+            ));
+        }
+        let ks = k.as_mut().unwrap();
+        if gpu_k_ok {
+            rotor4_gpu_append_into_k_blocks(ks, new_k, &new_shape)?;
+        } else {
+            ks.append(&k_f32, &new_shape)?;
+        }
+        let k_shape = ks.shape.clone();
+        let k_recon_f32 = ks.dequant()?;
+        let k_full = f32_vec_to_array(&k_recon_f32, &k_shape)?;
+
+        if v.is_none() {
+            let mut init_shape = new_shape.clone();
+            init_shape[2] = 0;
+            *v = Some(QuantV::new_affine_decode(init_shape, v_bits, max_seq));
+        }
+        let vs = v.as_mut().unwrap();
+        vs.append(&v_f32, &new_shape, new_v, device, max_seq)?;
+        let v_shape = vs.shape.clone();
+        let (v_recon_f32, v_arr_opt) = vs.dequantize_choice(device, new_v.dtype())?;
+        let v_full = match v_arr_opt {
+            Some(arr) => arr,
+            None => f32_vec_to_array(&v_recon_f32, &v_shape)?,
+        };
+
+        Ok((k_full, v_full))
+    }
+}
+
+// ── KV hard-cap helpers ──────────────────────────────────────────────────────
+
+/// Cached value of the `RMLX_KV_MAX_SEQ_HARD_CAP` env var. Resolved once
+/// per process. `None` = no cap; `Some(cap)` = reject prefill requests
+/// whose total length exceeds `cap`.
+static KV_HARD_CAP: OnceLock<Option<i32>> = OnceLock::new();
+
+/// Returns the configured hard cap on KV prefill length, if any.
+fn kv_hard_cap() -> Option<i32> {
+    *KV_HARD_CAP.get_or_init(|| {
+        let raw = std::env::var("RMLX_KV_MAX_SEQ_HARD_CAP").ok()?;
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        match raw.parse::<i32>() {
+            Ok(v) if v > 0 => {
+                // Downgrade to debug — the OnceLock is resolved lazily on
+                // first call (mid-decode), not at startup, so an info-level
+                // event would appear out-of-band in the run log. Parse-error
+                // branches stay at warn.
+                tracing::debug!(cap = v, "KV hard cap enabled via RMLX_KV_MAX_SEQ_HARD_CAP");
+                Some(v)
+            }
+            Ok(v) => {
+                tracing::warn!(
+                    value = v,
+                    "RMLX_KV_MAX_SEQ_HARD_CAP must be a positive i32; ignoring"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    value = raw,
+                    error = %e,
+                    "RMLX_KV_MAX_SEQ_HARD_CAP failed to parse as i32; ignoring"
+                );
+                None
+            }
+        }
+    })
+}
+
+/// Next power-of-two ≥ `needed`, clamped to the closest power-of-two
+/// representable as `i32`. `needed <= 0` is treated as 1.
+pub(super) fn next_pow2_seq(needed: i32) -> i32 {
+    if needed <= 1 {
+        return 1;
+    }
+    // Largest i32 power-of-two is 1 << 30 (2^30 = 1_073_741_824).
+    // 2^31 overflows i32. Saturate there.
+    let max_pow2: i32 = 1 << 30;
+    if needed >= max_pow2 {
+        return max_pow2;
+    }
+    let n = needed as u32;
+    // next_power_of_two on u32; safe because n <= max_pow2 < 2^31.
+    let p = n.next_power_of_two();
+    p as i32
+}
+
+/// Read the `max_seq` recorded on whichever `KvStorage` variant is active.
+fn storage_max_seq(storage: &KvStorage) -> i32 {
+    match storage {
+        KvStorage::K8V4 { max_seq, .. } => *max_seq,
+        KvStorage::K8V8 { max_seq, .. } => *max_seq,
+        KvStorage::Planar { max_seq, .. } => *max_seq,
+        KvStorage::None { max_seq } => *max_seq,
+        KvStorage::Mixed { max_seq, .. } => *max_seq,
+        KvStorage::Paged { max_seq, .. } => *max_seq,
+        KvStorage::RotKTq4V { max_seq, .. } => *max_seq,
+        KvStorage::K8VTurbo3 { max_seq, .. } => *max_seq,
+        KvStorage::TurboSym3 { max_seq, .. } => *max_seq,
+        KvStorage::TurboSym4 { max_seq, .. } => *max_seq,
+        KvStorage::PlanarK { max_seq, .. } => *max_seq,
+        KvStorage::K8VTurbo2 { max_seq, .. } => *max_seq,
+        KvStorage::IsoV3 { max_seq, .. } => *max_seq,
+        KvStorage::IsoV4 { max_seq, .. } => *max_seq,
+        KvStorage::RotorV3 { max_seq, .. } => *max_seq,
+        KvStorage::RotorV4 { max_seq, .. } => *max_seq,
+        KvStorage::K8VTurbo3Tcq { max_seq, .. } => *max_seq,
+        KvStorage::K8VTurbo2Tcq { max_seq, .. } => *max_seq,
+        KvStorage::IsoSym3 { max_seq, .. } => *max_seq,
+        KvStorage::IsoSym4 { max_seq, .. } => *max_seq,
+        KvStorage::IsoKOnly3 { max_seq, .. } => *max_seq,
+        KvStorage::IsoKOnly4 { max_seq, .. } => *max_seq,
+        KvStorage::RotorSym3 { max_seq, .. } => *max_seq,
+        KvStorage::RotorSym4 { max_seq, .. } => *max_seq,
+        KvStorage::RotorKOnly3 { max_seq, .. } => *max_seq,
+        KvStorage::RotorKOnly4 { max_seq, .. } => *max_seq,
+        KvStorage::RotorKAsym3 { max_seq, .. } => *max_seq,
+        KvStorage::RotorKAsym4 { max_seq, .. } => *max_seq,
+    }
+}
+
+/// Bump the `max_seq` recorded on the active storage variant. This is the
+/// single source of truth read by `update_prefill_raw`, `exit_prefill`, and
+/// the per-axis `QuantK::append` / `QuantV::append` capacity caps. Quant
+/// payload buffers (codes/scales) are not allocated yet at this point — the
+/// quantised storage is materialised in `exit_prefill` from the (now larger)
+/// raw prefill buffer, and `exit_prefill` reads `max_seq` from here — so
+/// already-quantised on-axis bytes do not exist to migrate.
+fn set_storage_max_seq(storage: &mut KvStorage, new_max_seq: i32) {
+    match storage {
+        KvStorage::K8V4 { max_seq, .. } => *max_seq = new_max_seq,
+        KvStorage::K8V8 { max_seq, .. } => *max_seq = new_max_seq,
+        KvStorage::Planar { max_seq, .. } => *max_seq = new_max_seq,
+        KvStorage::None { max_seq } => *max_seq = new_max_seq,
+        KvStorage::Mixed { max_seq, .. } => *max_seq = new_max_seq,
+        KvStorage::Paged { max_seq, .. } => *max_seq = new_max_seq,
+        KvStorage::RotKTq4V { max_seq, .. } => *max_seq = new_max_seq,
+        KvStorage::K8VTurbo3 { max_seq, .. } => *max_seq = new_max_seq,
+        KvStorage::TurboSym3 { max_seq, .. } => *max_seq = new_max_seq,
+        KvStorage::TurboSym4 { max_seq, .. } => *max_seq = new_max_seq,
+        KvStorage::PlanarK { max_seq, .. } => *max_seq = new_max_seq,
+        KvStorage::K8VTurbo2 { max_seq, .. } => *max_seq = new_max_seq,
+        KvStorage::IsoV3 { max_seq, .. } => *max_seq = new_max_seq,
+        KvStorage::IsoV4 { max_seq, .. } => *max_seq = new_max_seq,
+        KvStorage::RotorV3 { max_seq, .. } => *max_seq = new_max_seq,
+        KvStorage::RotorV4 { max_seq, .. } => *max_seq = new_max_seq,
+        KvStorage::K8VTurbo3Tcq { max_seq, .. } => *max_seq = new_max_seq,
+        KvStorage::K8VTurbo2Tcq { max_seq, .. } => *max_seq = new_max_seq,
+        KvStorage::IsoSym3 { max_seq, .. } => *max_seq = new_max_seq,
+        KvStorage::IsoSym4 { max_seq, .. } => *max_seq = new_max_seq,
+        KvStorage::IsoKOnly3 { max_seq, .. } => *max_seq = new_max_seq,
+        KvStorage::IsoKOnly4 { max_seq, .. } => *max_seq = new_max_seq,
+        KvStorage::RotorSym3 { max_seq, .. } => *max_seq = new_max_seq,
+        KvStorage::RotorSym4 { max_seq, .. } => *max_seq = new_max_seq,
+        KvStorage::RotorKOnly3 { max_seq, .. } => *max_seq = new_max_seq,
+        KvStorage::RotorKOnly4 { max_seq, .. } => *max_seq = new_max_seq,
+        KvStorage::RotorKAsym3 { max_seq, .. } => *max_seq = new_max_seq,
+        KvStorage::RotorKAsym4 { max_seq, .. } => *max_seq = new_max_seq,
+    }
+}

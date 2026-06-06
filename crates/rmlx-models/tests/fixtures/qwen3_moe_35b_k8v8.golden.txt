@@ -1,0 +1,35 @@
+# golden tokens — tag=qwen3_moe_35b_k8v8 kv_quant=k8v8
+# n_tokens=32
+# decoded: "\n\n<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - Statement 1: \"The capital of France is"
+271
+248068
+198
+8160
+579
+264
+7047
+1817
+25
+271
+16
+13
+220
+2972
+2014
+53983
+2570
+5396
+64700
+198
+256
+471
+21085
+220
+16
+25
+328
+760
+6511
+314
+9338
+369

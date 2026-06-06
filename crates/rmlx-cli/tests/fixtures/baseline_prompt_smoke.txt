@@ -1,0 +1,66 @@
+## Source: Short smoke prompt for rMLX baseline harness.
+## 50 lines of real prose; used instead of the full fixture during smoke runs
+## to avoid the multi-hour CPU wall-clock of the 840-line fixture.
+
+# A Short History of Mechanical Timekeeping
+
+The measurement of time is among the oldest scientific preoccupations of human
+civilization. Sundials, water clocks, and candle clocks served the ancient world;
+mechanical clocks emerged in medieval Europe; the spring-driven watch miniaturized
+timekeeping into a portable form; and the quartz oscillator and atomic clock brought
+accuracy that would have seemed miraculous to earlier generations.
+
+The earliest mechanical clocks appeared in Europe during the thirteenth and fourteenth
+centuries. These were large, heavy devices driven by falling weights and regulated by
+a mechanism called the verge escapement. The verge escapement was ingenious but
+imprecise: it allowed the clock to gain or lose many minutes per day. Mechanical clocks
+of this period were primarily used in churches and public towers, where they announced
+the hours by striking bells. The visual display of time on a clock face was a secondary
+feature that developed somewhat later.
+
+The invention of the coiled mainspring in the fifteenth century enabled the development
+of portable clocks and, eventually, watches. A spring stores energy as it is wound up
+and releases it gradually as it uncoils. The challenge was that a coiled spring exerts
+more force when fully wound than when nearly run down, causing the clock to run faster
+when freshly wound. Watchmakers developed mechanisms called fusees and stackfreeds to
+equalize the spring force over the power reserve, improving timekeeping consistency.
+
+Galileo observed the isochronism of pendulums around 1602, noting that a pendulum of
+a given length takes the same time to complete a swing regardless of how far it swings.
+This property made the pendulum an ideal regulator for mechanical clocks. Christiaan
+Huygens built the first practical pendulum clock in 1656, dramatically improving
+accuracy from minutes per day to seconds per day. The long-case clock, or grandfather
+clock, was developed partly to protect the pendulum from disturbances.
+
+The marine chronometer, developed in the eighteenth century, solved one of the central
+navigation problems of the age of sail: the determination of longitude at sea.
+Longitude requires knowing the exact time at a reference meridian; a clock accurate
+enough to maintain Greenwich Mean Time across weeks at sea was the key. John Harrison
+devoted decades to building such a clock, eventually succeeding with his H4 design
+in the 1750s. The marine chronometer made accurate ocean navigation possible and
+contributed directly to the expansion of global trade and empire.
+
+The wristwatch became standard equipment for soldiers during the First World War, when
+the pocket watch proved impractical under combat conditions. After the war, the wristwatch
+became fashionable for civilians as well. Throughout the twentieth century, mechanical
+watchmaking became a refined craft, with Swiss makers in particular competing to achieve
+extreme precision and reliability in small mechanical movements.
+
+The quartz watch, introduced commercially in the late 1960s, used the precise frequency
+of a quartz crystal oscillator to regulate timekeeping with an accuracy that no
+mechanical watch could match. Within a decade, inexpensive quartz watches had disrupted
+the mechanical watch industry. Many Swiss manufacturers went out of business or merged.
+The survivors repositioned mechanical watches as luxury objects, valued not for their
+accuracy but for their craftsmanship and aesthetic appeal.
+
+Atomic clocks, developed from the 1950s onward, measure time by counting the oscillations
+of atoms transitioning between energy states. The cesium atomic clock is the basis of
+the international definition of the second. Modern atomic clocks are accurate to within
+a second in many millions of years. They underpin GPS navigation, internet time
+synchronization, financial transaction timing, and a wide range of other applications
+that require precise, universal timekeeping.
+
+Time measurement is now so accurate and so embedded in digital infrastructure that
+its workings are largely invisible to ordinary users. Yet the history of mechanical
+timekeeping is a reminder of how hard-won this precision was, and how profoundly the
+ability to measure time accurately has shaped human commerce, navigation, and science.

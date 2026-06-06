@@ -1,0 +1,37 @@
+# Clippy thresholds — strict baseline.
+# Tuned for an inference engine (long compute fns, large config types).
+
+# Cognitive complexity per fn. Reference (rmcp-server-kit) uses 25; inference
+# forward / sdpa_dispatch / chunked-prefill paths legitimately exceed that.
+cognitive-complexity-threshold = 30
+
+# Type complexity — model graphs and KV-cache descriptors carry deep generics.
+type-complexity-threshold = 350
+
+# Positional args per fn. Inference forward(...) takes a lot of state.
+# Reference allows 7; rMLX needs 10.
+too-many-arguments-threshold = 10
+
+# Function body length (clippy::too_many_lines). Reference uses 100;
+# decoder loops + arch forward fns exceed that without being unclear.
+too-many-lines-threshold = 150
+
+# Bool params per fn (clippy::fn_params_excessive_bools).
+max-fn-params-bools = 3
+
+# enum-variant-size — flag large variants. Reference 200; KV-cache enums
+# carry Array handles which are small + pointer-sized.
+enum-variant-size-threshold = 256
+
+# Treat std-library paths in doc and string literals as case-sensitive.
+# (Prevents doc_markdown noise; lint itself is `allow`-ed anyway.)
+doc-valid-idents = ["MLX", "FWHT", "TurboQuant", "IsoQuant", "PlanarQuant", "ParoQuant", "KVBM", "MSL", "SDPA", "RoPE", "YARN", "Eagle3", "MoE", "OpenAI", "GitHub", "Apple", "Metal", "FFI", "SIMD", "PCM", "PPL"]
+
+# Hard-ban naked .unwrap() / .unwrap_err() at the method-call level,
+# complementing the workspace [workspace.lints.clippy] `unwrap_used = "deny"`
+# attribute-level gate.  Any surviving call must carry a per-site
+# #[allow(clippy::unwrap_used, reason = "...")] annotation.
+disallowed-methods = [
+    { path = "core::result::Result::unwrap",      reason = "use ? or expect with invariant comment" },
+    { path = "core::option::Option::unwrap",      reason = "use ? or expect with invariant comment" },
+]

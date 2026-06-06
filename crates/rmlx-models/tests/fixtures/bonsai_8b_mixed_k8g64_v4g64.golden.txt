@@ -1,0 +1,35 @@
+# golden tokens — tag=bonsai_8b_mixed_k8g64_v4g64 kv_quant=mixed_k8g64_v4g64
+# n_tokens=32
+# decoded: " The sky appears blue during the day because sunlight is scattered by the atmosphere, with shorter wavelengths like blue being scattered more than longer ones like red. \n\nThe capital"
+576
+12884
+7952
+6303
+2337
+279
+1899
+1576
+39020
+374
+36967
+553
+279
+16566
+11
+448
+23327
+92859
+1075
+6303
+1660
+36967
+803
+1091
+5021
+6174
+1075
+2518
+13
+4710
+785
+6722

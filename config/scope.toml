@@ -1,0 +1,131 @@
+# BENCHMARK_CHAMPIONS.md scope file.
+#
+# Lists the models that get rendered in the markdown export. Out-of-scope
+# models are still recorded in metrics/runs.db, they are just hidden from the
+# generated report.
+#
+# Editing this file does NOT touch the DB. Re-run:
+#   rmlx metrics export --markdown --scope metrics/scope.toml > BENCHMARK_CHAMPIONS.md
+#
+# Excluded by user direction 2026-05-09:
+#   - mlx-community/Laguna-XS.2-mxfp8     (out-of-tree custom arch)
+#   - mlx-community/DR-Venus-4B-RL-mlx-8Bit (redundant with Bonsai/medgemma)
+
+# ── Qwen3.5MoE family ─────────────────────────────────────────────────────────
+
+[[model]]
+namespace = "mlx-community"
+name = "Qwen3.6-35B-A3B-8bit"
+arch = "Qwen3.5MoE"
+weight_quant_display = "affine 8b"
+order = 1
+aliases = [
+  { namespace = "local",  name = "Qwen3.6-35B-A3B-8bit" },
+  { namespace = "ollama", name = "qwen3.6:35b-a3b-coding-mxfp8" },
+]
+unsupported = []
+
+[[model]]
+namespace = "z-lab"
+name = "Qwen3.6-27B-PARO"
+arch = "Qwen3.5MoE"
+weight_quant_display = "paroquant int4"
+order = 2
+aliases = [
+  { namespace = "hf", name = "z-lab/Qwen3.6-27B-PARO" },
+]
+unsupported = [
+  { backend = "omlx",   reason = "no paroquant support" },
+  { backend = "mlx_lm", reason = "no paroquant support" },
+  { backend = "ollama", reason = "no paroquant support" },
+]
+
+# ── Qwen3 dense (Bonsai) ──────────────────────────────────────────────────────
+
+[[model]]
+namespace = "prism-ml"
+name = "Ternary-Bonsai-8B-mlx-2bit"
+arch = "Qwen3 dense"
+weight_quant_display = "2-bit ternary"
+order = 3
+aliases = []
+unsupported = [
+  { backend = "ollama", reason = "no 2-bit ternary support" },
+]
+
+# ── Gemma3 ────────────────────────────────────────────────────────────────────
+
+[[model]]
+namespace = "mlx-community"
+name = "medgemma-1.5-4b-it-8bit"
+arch = "Gemma3"
+weight_quant_display = "affine 8b"
+order = 4
+aliases = []
+unsupported = [
+  { backend = "ollama", reason = "no MLX affine 8b support" },
+]
+
+# ── Gemma4 small ──────────────────────────────────────────────────────────────
+
+[[model]]
+namespace = "mlx-community"
+name = "gemma-4-e2b-it-mxfp8"
+arch = "Gemma4 small"
+weight_quant_display = "mxfp8 g32"
+order = 5
+aliases = []
+unsupported = [
+  { backend = "ollama", reason = "no mxfp8 support" },
+]
+
+[[model]]
+namespace = "mlx-community"
+name = "gemma-4-e4b-it-mxfp8"
+arch = "Gemma4 small"
+weight_quant_display = "mxfp8 g32"
+order = 6
+aliases = []
+unsupported = [
+  { backend = "ollama", reason = "no mxfp8 support" },
+]
+
+# ── Gemma4 MoE ────────────────────────────────────────────────────────────────
+
+[[model]]
+namespace = "mlx-community"
+name = "gemma-4-26b-a4b-it-mxfp8"
+arch = "Gemma4 MoE"
+weight_quant_display = "mxfp8 g32"
+order = 7
+aliases = []
+unsupported = [
+  { backend = "ollama", reason = "no mxfp8 support" },
+]
+
+# ── Gemma4 dense ──────────────────────────────────────────────────────────────
+
+[[model]]
+namespace = "mlx-community"
+name = "gemma-4-31b-it-mxfp8"
+arch = "Gemma4 dense"
+weight_quant_display = "mxfp8 g32"
+order = 8
+aliases = []
+unsupported = [
+  { backend = "ollama", reason = "no mxfp8 support" },
+]
+
+[[model]]
+namespace = "z-lab"
+name = "gemma-4-31B-it-PARO"
+arch = "Gemma4 dense"
+weight_quant_display = "paroquant int4"
+order = 9
+aliases = []
+unsupported = [
+  { backend = "omlx",       reason = "no paroquant support" },
+  { backend = "mlx_lm",     reason = "no paroquant support" },
+  { backend = "ollama",     reason = "no paroquant support" },
+  { backend = "paroquant",  reason = "Python 3.14 thread-local stream bug" },
+]

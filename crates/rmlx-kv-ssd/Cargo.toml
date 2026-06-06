@@ -1,0 +1,27 @@
+[package]
+name = "rmlx-kv-ssd"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "rMLX SSD-tier KV cache: index, spill, hydrate, block I/O, layout-key salt."
+
+[lints]
+workspace = true
+
+[dependencies]
+rmlx-core    = { workspace = true }
+rmlx-mlx     = { workspace = true }
+rmlx-kv-quant = { workspace = true }
+rmlx-metrics = { workspace = true }
+safetensors  = { workspace = true }
+thiserror    = { workspace = true }
+tracing      = { workspace = true }
+
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile   = { workspace = true }
+serde_json = { workspace = true }

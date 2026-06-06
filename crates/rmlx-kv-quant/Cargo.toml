@@ -1,0 +1,20 @@
+[package]
+name = "rmlx-kv-quant"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "rMLX KV-cache quantization codecs, storage, MSL kernels, and per-layer cache."
+
+[lints]
+workspace = true
+
+[dependencies]
+rmlx-core  = { workspace = true }
+rmlx-mlx   = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+
+[dev-dependencies]

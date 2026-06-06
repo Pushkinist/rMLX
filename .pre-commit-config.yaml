@@ -1,0 +1,56 @@
+# Pre-commit hooks. Install once: `pre-commit install`
+# Run all hooks manually: `pre-commit run --all-files`
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+        args: ["--maxkb=512"]   # weights / safetensors must never enter git
+        # Silero VAD safetensors (1.2 MB, MIT) is an intentionally vendored asset.
+        exclude: ^crates/rmlx-audio/assets/silero_vad_16k\.safetensors$
+      - id: check-merge-conflict
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+
+  # Local hooks call the host toolchain (rustfmt, clippy, deny, audit).
+  # Pre-installed via brew; no per-language env spinup.
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt --check
+        entry: cargo fmt --all -- --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy -D warnings
+        entry: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      # cargo-deny and cargo-audit are NOT run per-commit — they fetch the
+      # RustSec advisory DB over the network and hang on slow links. Run them
+      # via `make ci` (or `make audit` / `make deny`) before push, and the
+      # `manual` stage keeps `pre-commit run --hook-stage manual` working.
+      - id: cargo-deny
+        name: cargo deny check
+        entry: cargo deny --all-features check
+        language: system
+        files: ^(Cargo\.toml|Cargo\.lock|deny\.toml|crates/.*/Cargo\.toml)$
+        pass_filenames: false
+        stages: [manual]
+
+      - id: cargo-audit
+        name: cargo audit
+        entry: cargo audit --deny warnings --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
+        language: system
+        files: ^(Cargo\.toml|Cargo\.lock|crates/.*/Cargo\.toml)$
+        pass_filenames: false
+        stages: [manual]

@@ -1,0 +1,29 @@
+[package]
+name = "rmlx-mlx"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "rMLX MLX FFI: bindgen wrapper around brew-prebuilt mlx-c + safe Rust layer."
+
+[lints]
+workspace = true
+
+[dependencies]
+rmlx-core   = { workspace = true }
+rmlx-loader = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+safetensors = { workspace = true }
+
+[features]
+# Feature-gated GPU trace capture via MTLCaptureManager (debug only).
+# Enables `rmlx_mlx::metal_capture::CaptureScope` — a drop-guard RAII wrapper
+# around mlx_metal_start_capture / mlx_metal_stop_capture.
+# Do NOT enable in release builds; the feature tag keeps binaries clean.
+metal-capture = []
+
+[build-dependencies]
+bindgen = "0.71"

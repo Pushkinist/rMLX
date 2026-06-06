@@ -1,0 +1,1817 @@
+// unsafe_code: mlx-rs Array zero-copy view — slice::from_raw_parts byte-reinterpret in test helpers
+#![cfg_attr(test, allow(unsafe_code))]
+#![cfg_attr(test, allow(clippy::format_push_string))]
+#![allow(
+    clippy::cloned_instead_of_copied,
+    clippy::items_after_statements,
+    clippy::manual_let_else,
+    clippy::match_wildcard_for_single_variants,
+    clippy::stable_sort_primitive,
+    clippy::too_many_lines
+)]
+use super::*;
+
+// Pull in mlx primitives that were at module scope in the original flat file
+// and are needed by multiple test functions.
+use rmlx_mlx::{add, divide, softmax, sum_axis, Array, Device, Dtype};
+
+// pub(crate) items: loader helpers re-exported from mod.rs but not visible
+// via `use super::*` (glob only includes `pub` items).
+use super::{
+    convert_awq_qweight, convert_awq_qzeros_to_biases, f16_bits_to_f32, f32_to_f16_bits,
+    quantize_f16_affine_int4,
+};
+// pub(super) items accessed via explicit submodule paths.
+use super::decoder_layer::AttnBlock;
+use super::layers::{embed_lookup, Embedding};
+use super::prompt_cache::Qwen35MoeEntry;
+use crate::prompt_cache::{chained_block_hashes, PromptCache, BLOCK_TOKENS};
+
+fn paro_model_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("RMLX_TEST_MODEL_QWEN36_PARO").map(std::path::PathBuf::from)
+}
+
+fn qwen36_model_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("RMLX_TEST_MODEL_QWEN36").map(std::path::PathBuf::from)
+}
+
+/// Verify the softmax -> argsort top-K -> optional normalize routing math.
+///
+/// For a two-token batch with 4 experts and top_k=2:
+/// Token 0 logits = [2.0, 1.0, 0.5, 0.1] -> top experts: 0, 1
+/// Token 1 logits = [0.1, 0.5, 1.0, 2.0] -> top experts: 3, 2
+///
+/// After softmax and norm_topk_prob, each token's selected weights sum to 1.0.
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn qwen3_5_moe_routing_math() {
+    let n = 2usize;
+    let ne = 4usize;
+    let tk = 2usize;
+
+    // Logits: [2, 4]
+    let logits_data: Vec<f32> = vec![2.0, 1.0, 0.5, 0.1, 0.1, 0.5, 1.0, 2.0];
+    let bytes = unsafe {
+        std::slice::from_raw_parts(logits_data.as_ptr().cast::<u8>(), logits_data.len() * 4)
+    };
+    let logits = Array::from_bytes(bytes, &[2, 4], Dtype::F32).unwrap();
+
+    let device = Device::Cpu;
+
+    // Softmax along last axis.
+    let gates = softmax(&logits, -1, device).unwrap();
+
+    // Argsort ascending -> last tk = top-k.
+    let sorted_idx = rmlx_mlx::argsort(&gates, device).unwrap();
+    let expert_idx = sorted_idx
+        .slice(
+            &[0, (ne - tk) as i32],
+            &[n as i32, ne as i32],
+            &[1, 1],
+            device,
+        )
+        .unwrap();
+    let expert_idx_i32 = expert_idx.astype(Dtype::I32, device).unwrap();
+
+    // Gather scores.
+    let mut off_data = vec![0i32; n * tk];
+    for i in 0..n {
+        for j in 0..tk {
+            off_data[i * tk + j] = (i * ne) as i32;
+        }
+    }
+    let off_bytes =
+        unsafe { std::slice::from_raw_parts(off_data.as_ptr().cast::<u8>(), off_data.len() * 4) };
+    let offsets = Array::from_bytes(off_bytes, &[(n * tk) as i32], Dtype::I32).unwrap();
+    let idx_flat = expert_idx_i32.reshape(&[(n * tk) as i32], device).unwrap();
+    let flat_idx = add(&idx_flat, &offsets, device).unwrap();
+    let gates_flat = gates.reshape(&[(n * ne) as i32], device).unwrap();
+    let scores_flat = gates_flat.take(&flat_idx, 0, device).unwrap();
+    let scores = scores_flat.reshape(&[n as i32, tk as i32], device).unwrap();
+
+    // Normalize.
+    let s_sum = sum_axis(&scores, -1, device).unwrap();
+    let s_sum_2d = s_sum.reshape(&[n as i32, 1], device).unwrap();
+    let scores_norm = divide(&scores, &s_sum_2d, device).unwrap();
+
+    // Row sums must be ~1.0.
+    // Evaluate to CPU, extract bytes, reinterpret as f32.
+    let row_sums = sum_axis(&scores_norm, -1, device).unwrap();
+    row_sums.eval().unwrap();
+    let sum_bytes = row_sums.to_bytes().unwrap();
+    let sum_data: Vec<f32> = sum_bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    for (i, &s) in sum_data.iter().enumerate() {
+        assert!(
+            (s - 1.0).abs() < 1e-4,
+            "token {i} normalized weights sum = {s}, expected 1.0"
+        );
+    }
+
+    // Expert indices: token 0 should pick experts 0 and 1 (highest logits).
+    // Token 1 should pick experts 3 and 2.
+    expert_idx_i32.eval().unwrap();
+    let idx_bytes = expert_idx_i32.to_bytes().unwrap();
+    let idx_data: Vec<i32> = idx_bytes
+        .chunks_exact(4)
+        .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    let tok0: Vec<i32> = {
+        let mut v = vec![idx_data[0], idx_data[1]];
+        v.sort();
+        v
+    };
+    let tok1: Vec<i32> = {
+        let mut v = vec![idx_data[2], idx_data[3]];
+        v.sort();
+        v
+    };
+    assert_eq!(
+        tok0,
+        vec![0, 1],
+        "token 0 expected experts {{0,1}}, got {tok0:?}"
+    );
+    assert_eq!(
+        tok1,
+        vec![2, 3],
+        "token 1 expected experts {{2,3}}, got {tok1:?}"
+    );
+}
+
+// ── PromptCache unit tests (C1: block-level prefix sharing) ───────────────
+
+/// Build a Qwen35MoeEntry test fixture with computed chained block hashes
+/// and empty KV / linear caches.
+fn moe_entry(prompt_token_ids: Vec<u32>) -> Qwen35MoeEntry {
+    let block_hashes = chained_block_hashes(&prompt_token_ids);
+    Qwen35MoeEntry {
+        prompt_token_ids,
+        block_hashes,
+        kv_caches: vec![],
+        lin_caches: vec![],
+        first_id: 0,
+        first_piece: String::new(),
+        kv_quant: Some(rmlx_kv_quant::KvQuant::K8V8),
+    }
+}
+
+/// `find_best_prefix` returns None on an empty cache.
+#[test]
+fn prompt_cache_lookup_miss_empty() {
+    let mut cache: PromptCache<Qwen35MoeEntry> = PromptCache::new(4);
+    let ids = vec![1u32, 2, 3, 4];
+    assert!(
+        cache.find_best_prefix(&ids).is_none(),
+        "empty cache must return None"
+    );
+}
+
+/// `find_best_prefix` returns the slot index and matched block count on a hit.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn prompt_cache_lookup_hit_prefix() {
+    let mut cache = PromptCache::new(4);
+
+    // Push a 2-block (512-token) entry.
+    let base: Vec<u32> = (0..2 * BLOCK_TOKENS as u32).collect();
+    cache.push(moe_entry(base));
+
+    // New prompt: first full block identical, second block diverges.
+    let mut new_prompt: Vec<u32> = (0..BLOCK_TOKENS as u32).collect();
+    new_prompt.extend(10_000..10_000 + BLOCK_TOKENS as u32);
+
+    let result = cache.find_best_prefix(&new_prompt);
+    assert!(result.is_some(), "cache must return a prefix hit");
+    let (slot_idx, block_count) = result.unwrap();
+    assert_eq!(slot_idx, 0, "slot index must be 0");
+    assert_eq!(block_count, 1, "exactly one leading block matches");
+}
+
+/// `find_best_prefix` ignores a shared prefix shorter than one full block.
+#[test]
+fn prompt_cache_lookup_miss_below_threshold() {
+    let mut cache = PromptCache::new(4);
+
+    // Entry shares only 10 leading tokens with the query — no full block match.
+    let base: Vec<u32> = (1..=10).chain(500..700u32).collect();
+    cache.push(moe_entry(base));
+
+    let query: Vec<u32> = (1..=10).chain(800..1000u32).collect();
+    assert!(
+        cache.find_best_prefix(&query).is_none(),
+        "shared prefix < one 256-token block must return None"
+    );
+}
+
+/// LRU eviction: pushing beyond capacity evicts the oldest-accessed slot
+/// (LRU == FIFO when no hits).
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn prompt_cache_fifo_eviction() {
+    let mut cache = PromptCache::new(2); // capacity = 2
+
+    // Each prompt is 2 full blocks; interleave by 4 so no block is shared.
+    let make_ids =
+        |off: u32| -> Vec<u32> { (0..2 * BLOCK_TOKENS as u32).map(|x| x * 4 + off).collect() };
+
+    cache.push(moe_entry(make_ids(0))); // slot A
+    cache.push(moe_entry(make_ids(1))); // slot B
+    assert_eq!(cache.slots.len(), 2);
+
+    // Push slot C: slot A must be evicted (LRU — A pushed first, no hits).
+    cache.push(moe_entry(make_ids(2)));
+    assert_eq!(cache.slots.len(), 2, "capacity must be respected");
+
+    // Slot A is gone — its exact prompt no longer matches any block.
+    let query_a = make_ids(0);
+    let r = cache.find_best_prefix(&query_a);
+    assert!(
+        r.is_none(),
+        "evicted slot A must not produce a match; got {r:?}"
+    );
+
+    // Slot C must match its own 2-block prompt exactly.
+    let query_c = make_ids(2);
+    let rc = cache.find_best_prefix(&query_c);
+    assert!(rc.is_some(), "slot C must match its own prompt");
+    let (_, blocks) = rc.unwrap();
+    assert_eq!(blocks, 2, "slot C shares both blocks with its own prompt");
+}
+
+/// C1 regression (the gap 700 unit tests missed): an identical-prompt repeat
+/// must be detected as a true EXACT hit, NOT misrouted into the partial path.
+///
+/// C1 shipped with the callsite Exact test written as
+/// `block_count * BLOCK_TOKENS == prompt_ids.len()`. That is essentially never
+/// true (only when len % 256 == 0), so an identical re-request of a
+/// non-block-aligned prompt fell into the block-truncate + tail-reprefill
+/// Prefix path. For qwen3_5_moe that path leaves the recurrent GDN
+/// `lin_caches` untouched while truncating KV, corrupting state → the model
+/// emitted EOS after 9 tokens instead of the correct 258 (cold value).
+///
+/// The fixed callsite predicate is `entry.prompt_token_ids() == prompt_ids`
+/// (full token equality). This test asserts that predicate behaves correctly
+/// for a deliberately non-block-aligned prompt (len % 256 != 0), and that the
+/// old block-floored predicate would have FAILED to detect the same exact
+/// match — i.e. it pins the exact misrouting bug.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+fn prompt_cache_identical_prompt_is_exact_not_partial() {
+    use crate::prompt_cache::PromptCacheEntry;
+
+    let mut cache: PromptCache<Qwen35MoeEntry> = PromptCache::new(4);
+
+    // 3854 tokens — the real longctx_4k.json prompt length. NOT block-aligned:
+    // 3854 % 256 == 14, so block_count = 15 → 15*256 = 3840 != 3854.
+    let prompt: Vec<u32> = (0..3854u32).collect();
+    assert_ne!(
+        prompt.len() % BLOCK_TOKENS,
+        0,
+        "fixture must be non-aligned"
+    );
+
+    cache.push(moe_entry(prompt.clone()));
+
+    // Re-request the SAME prompt (regenerate / identical retry).
+    let (slot_idx, block_count) = cache
+        .find_best_prefix(&prompt)
+        .expect("identical prompt must hit");
+
+    // The fixed callsite predicate: full token-level equality => EXACT.
+    let is_exact = cache.slots[slot_idx].entry.prompt_token_ids() == prompt.as_slice();
+    assert!(
+        is_exact,
+        "identical prompt must be classified EXACT (full token equality)"
+    );
+
+    // The OLD (broken) block-floored predicate would have said "not exact"
+    // for this identical prompt, misrouting it into the unsafe partial path.
+    let old_broken_exact = block_count * BLOCK_TOKENS == prompt.len();
+    assert!(
+        !old_broken_exact,
+        "block-floored test must NOT detect this exact match \
+         (this is precisely the C1 regression being pinned)"
+    );
+}
+
+/// Validate AWQ → MLX weight conversion + quantized_matmul with a synthetic example.
+///
+/// Synthetic: in=128, out=8, bits=4, group_size=128, num_groups=1.
+/// Weight values after dequant: nibble[i, o] = (i + o) % 8, scale=1.0, zero=0.
+/// So dequant(x=ones): out[o] = sum_{i=0}^{127} (i + o) % 8.
+///
+/// MLX requires group_size ∈ {32, 64, 128} — smaller values have no kernel.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn paro_weight_conversion_roundtrip() {
+    use rmlx_mlx::{Array, Device, Dtype};
+
+    let in_f = 128usize;
+    let out_f = 8usize;
+    let bits = 4usize;
+    let gs = 128usize;
+    let num_groups = in_f / gs; // = 1
+
+    // Build expected nibble matrix [in, out]: nibble[i][o] = (i + o) % 8
+    // Each element fits in 4 bits (value 0..7 < 15).
+    let mut nibble_matrix = vec![[0u8; 8]; in_f];
+    for (i, row) in nibble_matrix.iter_mut().enumerate() {
+        for (o, cell) in row.iter_mut().enumerate() {
+            *cell = ((i + o) % 8) as u8;
+        }
+    }
+
+    // Pack in AWQ order: [in, out*bits/32] = [128, 1] I32 words.
+    // AWQ interleave: output elements [0,2,4,6,1,3,5,7] go to nibble positions [0..7].
+    let awq_order: [usize; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
+    let words_per_in = out_f * bits / 32; // = 1
+    let mut qweight_bytes = vec![0u8; in_f * words_per_in * 4];
+    for (i, row) in nibble_matrix.iter().enumerate() {
+        // One word per input row (8 nibbles = 8 outputs).
+        let mut word = 0u32;
+        for (pos, &o) in awq_order.iter().enumerate() {
+            word |= u32::from(row[o]) << (pos * 4);
+        }
+        let off = i * words_per_in * 4;
+        qweight_bytes[off..off + 4].copy_from_slice(&word.to_le_bytes());
+    }
+
+    // Convert AWQ qweight → MLX layout.
+    let mlx_weight_bytes =
+        convert_awq_qweight(&qweight_bytes, in_f, out_f, bits).expect("convert_awq_qweight");
+    // Expected shape: [out=8, in*bits/32=1] words.
+    assert_eq!(mlx_weight_bytes.len(), out_f * (in_f * bits / 32) * 4);
+
+    // Verify: unpack MLX weight and check nibbles match transpose [in, out] → [out, in].
+    let words_per_out = in_f * bits / 32; // = 128*4/32 = 16
+    #[allow(clippy::needless_range_loop)]
+    for o in 0..out_f {
+        for j in 0..words_per_out {
+            let off = (o * words_per_out + j) * 4;
+            let word = u32::from_le_bytes([
+                mlx_weight_bytes[off],
+                mlx_weight_bytes[off + 1],
+                mlx_weight_bytes[off + 2],
+                mlx_weight_bytes[off + 3],
+            ]);
+            // MLX sequential: nibble at position k = input element (j*8 + k).
+            for k in 0..8usize {
+                let in_idx = j * 8 + k;
+                if in_idx >= in_f {
+                    break;
+                }
+                let nibble = ((word >> (k * 4)) & 0xF) as u8;
+                let expected = nibble_matrix[in_idx][o];
+                assert_eq!(
+                    nibble, expected,
+                    "MLX weight nibble[out={o}, in={in_idx}]: expected {expected}, got {nibble}"
+                );
+            }
+        }
+    }
+
+    // Build scales (F16 = 1.0) and zeros (0) for num_groups=1, out_f=8.
+    // AWQ scales shape: [num_groups=1, out_f=8] F16.
+    // AWQ qzeros shape: [num_groups=1, out_f*bits/32=1] I32 (zeros packed as nibbles).
+    let scale_f16_bits: u16 = 0x3C00; // 1.0 in F16
+    let mut scales_bytes = vec![0u8; num_groups * out_f * 2]; // [1, 8] F16
+    for o in 0..out_f {
+        let off = o * 2;
+        scales_bytes[off..off + 2].copy_from_slice(&scale_f16_bits.to_le_bytes());
+    }
+    // qzeros: [num_groups=1, out*bits/32=1] all zeros → zero-points = 0.
+    let qzeros_bytes = vec![0u8; num_groups * words_per_in * 4];
+
+    let (scales_t_bytes, biases_t_bytes) =
+        convert_awq_qzeros_to_biases(&qzeros_bytes, &scales_bytes, num_groups, out_f, bits)
+            .expect("convert_awq_qzeros_to_biases");
+
+    // scales_t: [out=8, num_groups=1] F16 = all 1.0
+    // biases_t: [out=8, num_groups=1] F16 = -1.0 * 0 = 0.0
+    for o in 0..out_f {
+        let s_bits = u16::from_le_bytes([scales_t_bytes[o * 2], scales_t_bytes[o * 2 + 1]]);
+        assert_eq!(s_bits, scale_f16_bits, "scale[o={o}] must be 1.0 F16");
+        let b_bits = u16::from_le_bytes([biases_t_bytes[o * 2], biases_t_bytes[o * 2 + 1]]);
+        // -1.0 * 0 = -0.0 (F16 0x8000) or +0.0 (0x0000): both are zero.
+        assert!(
+            b_bits == 0u16 || b_bits == 0x8000u16,
+            "bias[o={o}] must be ±0.0 F16, got {b_bits:#06X}"
+        );
+    }
+
+    // Call quantized_matmul with x=ones: expect out[o] = sum(nibble[i][o]) for i=0..7.
+    // For our nibble matrix: out[o] = sum((i+o)%8, i=0..7) = 0+1+..+7 = 28 for all o.
+    let device = Device::Gpu;
+
+    let w = Array::from_bytes(
+        &mlx_weight_bytes,
+        &[out_f as i32, (in_f * bits / 32) as i32],
+        Dtype::U32,
+    )
+    .expect("w");
+    let s = Array::from_bytes(
+        &scales_t_bytes,
+        &[out_f as i32, num_groups as i32],
+        Dtype::F16,
+    )
+    .expect("s");
+    let b = Array::from_bytes(
+        &biases_t_bytes,
+        &[out_f as i32, num_groups as i32],
+        Dtype::F16,
+    )
+    .expect("b");
+
+    // x = ones [1, in_f] F16
+    let x_data = vec![1.0f32; in_f];
+    let x_bytes =
+        unsafe { std::slice::from_raw_parts(x_data.as_ptr().cast::<u8>(), x_data.len() * 4) };
+    let x_f32 = Array::from_bytes(x_bytes, &[1, in_f as i32], Dtype::F32).expect("x_f32");
+    let x = x_f32.astype(Dtype::F16, device).expect("x f16");
+
+    let out = rmlx_mlx::quantized_matmul(
+        &x,
+        &w,
+        &s,
+        Some(&b),
+        gs as i32,
+        bits as i32,
+        "affine",
+        true,
+        device,
+    )
+    .expect("quantized_matmul");
+
+    out.eval().expect("eval");
+    let out_f32 = out.astype(Dtype::F32, Device::Cpu).expect("astype f32");
+    out_f32.eval().expect("eval f32");
+    let out_bytes = out_f32.to_bytes().expect("to_bytes");
+    let out_vals: Vec<f32> = out_bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+
+    // Expected: sum_{i=0}^{127} (i+o)%8 = 16 * (0+1+2+3+4+5+6+7) = 16 * 28 = 448.
+    // (128/8 = 16 complete cycles; each cycle covers all values 0..7 regardless of offset o.)
+    let expected = 448.0f32;
+    // Tolerance: 0.5% relative for F16 accumulation errors over 128 elements.
+    let tol = expected.mul_add(0.005, 1.0);
+    assert_eq!(
+        out_vals.len(),
+        out_f,
+        "output must have out_f={out_f} elements"
+    );
+    for (o, &v) in out_vals.iter().enumerate() {
+        assert!(
+            (v - expected).abs() < tol,
+            "out[{o}]: expected {expected:.1}, got {v:.4} (diff={:.4})",
+            (v - expected).abs()
+        );
+    }
+}
+
+/// Verify that `quantize_f16_affine_int4` matches MLX `mx.quantize` output.
+///
+/// Uses a known row of embed_tokens (row 760, first 128 elements) and checks
+/// that our Rust quantization produces the same scale/bias as Python.
+///
+/// Python reference (from paro_embed_check.py):
+/// row760[:128] scale ≈ -0.01029, bias ≈ 0.12354
+/// dequant[:8] = [0.02061, 3.05e-5, 3.05e-5, 3.05e-5, 3.05e-5, 3.05e-5, 0.01032, -0.01026]
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn quantize_f16_affine_int4_matches_python() {
+    // Synthesize a known group: row with min≈-0.034, max≈0.124.
+    // These bounds are from the first 128 elements of embed_tokens.weight[760].
+    // We don't need the actual model file — we can test the formula directly.
+    let group_size = 128usize;
+    let n = group_size;
+
+    // Build a synthetic F16 row with known min=-0.08 and max=0.08.
+    // scale = -(0.08 - (-0.08)) / 15 = -0.16/15 ≈ -0.010667
+    // bias = max = 0.08
+    let min_val = -0.08_f32;
+    let max_val = 0.08_f32;
+    let mut row_f32: Vec<f32> = (0..n)
+        .map(|i| min_val + (max_val - min_val) * (i as f32) / ((n - 1) as f32))
+        .collect();
+
+    // Encode as F16 bytes.
+    let mut row_bytes = vec![0u8; n * 2];
+    for (i, &v) in row_f32.iter().enumerate() {
+        let bits = f32_to_f16_bits(v);
+        row_bytes[i * 2..i * 2 + 2].copy_from_slice(&bits.to_le_bytes());
+    }
+    // Re-read the actual F16 values (may differ slightly from f32 due to F16 precision).
+    for i in 0..n {
+        let bits = u16::from_le_bytes([row_bytes[i * 2], row_bytes[i * 2 + 1]]);
+        row_f32[i] = f16_bits_to_f32(bits);
+    }
+    let actual_min = row_f32.iter().cloned().fold(f32::INFINITY, f32::min);
+    let actual_max = row_f32.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+    let (wq_bytes, sc_bytes, bi_bytes) =
+        quantize_f16_affine_int4(&row_bytes, 1, n, group_size).expect("quantize");
+
+    let scale_bits = u16::from_le_bytes([sc_bytes[0], sc_bytes[1]]);
+    let bias_bits = u16::from_le_bytes([bi_bytes[0], bi_bytes[1]]);
+    let scale_f32 = f16_bits_to_f32(scale_bits);
+    let bias_f32 = f16_bits_to_f32(bias_bits);
+
+    let expected_scale = -(actual_max - actual_min) / 15.0;
+    let expected_bias = actual_max;
+    let tol = 0.001_f32;
+    assert!(
+        (scale_f32 - f16_bits_to_f32(f32_to_f16_bits(expected_scale))).abs() < tol,
+        "scale mismatch: got={scale_f32:.6}, expected≈{expected_scale:.6}"
+    );
+    assert!(
+        (bias_f32 - f16_bits_to_f32(f32_to_f16_bits(expected_bias))).abs() < tol,
+        "bias mismatch: got={bias_f32:.6}, expected≈{expected_bias:.6}"
+    );
+
+    // Dequant and check round-trip error is within 1 quantization step.
+    let step = (actual_max - actual_min) / 15.0;
+    for (i, &orig) in row_f32.iter().enumerate().take(n) {
+        let word_idx = i / 8;
+        let nibble_pos = i % 8;
+        let word = u32::from_le_bytes(wq_bytes[word_idx * 4..word_idx * 4 + 4].try_into().unwrap());
+        let nibble = (word >> (nibble_pos * 4)) & 0xF;
+        let dequant = (nibble as f32).mul_add(scale_f32, bias_f32);
+        let err = (dequant - orig).abs();
+        assert!(
+            err <= step + 0.001,
+            "dequant error at [{i}]: original={orig:.6}, dequant={dequant:.6}, err={err:.6}, step={step:.6}",
+        );
+    }
+}
+
+/// Validate quantize_f16_affine_int4 on the actual PARO embed_tokens row 760.
+///
+/// Python reference (from mlx-lm-turboquant env):
+/// embed_np[760, 0] = 0.02099609375
+/// group0 min=-0.033935546875, max=0.12353515625
+/// scale_f16 = -0.01029205322265625, bias_f16 = 0.12353515625
+/// dequant[760, :8] = [0.0206146, 3.05e-5, 3.05e-5, 3.05e-5, 3.05e-5, 3.05e-5, 0.010323, -0.010262]
+///
+/// Run: cargo test -- --ignored quantize_paro_embed_row760
+#[test]
+#[ignore]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn quantize_paro_embed_row760() {
+    use rmlx_loader::{load_shard_index, ShardSet};
+    let Some(model_dir_buf) = paro_model_dir() else {
+        println!("SKIP: RMLX_TEST_MODEL_QWEN36_PARO not set");
+        return;
+    };
+    let model_dir = model_dir_buf.as_path();
+    if !model_dir.exists() {
+        println!("SKIP: PARO model dir not found");
+        return;
+    }
+    let idx = load_shard_index(model_dir).expect("shard index");
+    let shards = ShardSet::open(model_dir, &idx).expect("shards");
+
+    #[allow(
+        clippy::expect_used,
+        reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+    )]
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    fn load_raw_t(shards: &ShardSet, name: &str) -> Option<(Vec<u8>, Vec<usize>)> {
+        for (_, h) in shards.iter() {
+            if let Ok(st) = h.safetensors() {
+                if let Ok(t) = st.tensor(name) {
+                    return Some((t.data().to_vec(), t.shape().to_vec()));
+                }
+            }
+        }
+        None
+    }
+
+    let (w_bytes, w_shape) =
+        load_raw_t(&shards, "model.language_model.embed_tokens.weight").expect("load embed");
+    let vocab = w_shape[0];
+    let hidden = w_shape[1];
+    let group_size = 128usize;
+
+    println!("embed shape: [{vocab}, {hidden}]");
+
+    // Get raw F16 values for row 760
+    let row = 760usize;
+    let row_start = row * hidden * 2;
+    let row760_bytes = &w_bytes[row_start..row_start + hidden * 2];
+
+    // Get group 0 (cols 0..128) min/max
+    let mut g0_min = f32::INFINITY;
+    let mut g0_max = f32::NEG_INFINITY;
+    for c in 0..128 {
+        let bits = u16::from_le_bytes([row760_bytes[c * 2], row760_bytes[c * 2 + 1]]);
+        let v = f16_bits_to_f32(bits);
+        if v < g0_min {
+            g0_min = v;
+        }
+        if v > g0_max {
+            g0_max = v;
+        }
+    }
+    println!("row760 group0: min={g0_min}, max={g0_max}");
+    println!(
+        "row760 elem0: {}",
+        f16_bits_to_f32(u16::from_le_bytes([row760_bytes[0], row760_bytes[1]]))
+    );
+
+    // Run quantize on row 760 only
+    let single_row_bytes = row760_bytes.to_vec();
+    let (wq, sc, bi) =
+        quantize_f16_affine_int4(&single_row_bytes, 1, hidden, group_size).expect("quantize");
+
+    let scale0 = f16_bits_to_f32(u16::from_le_bytes([sc[0], sc[1]]));
+    let bias0 = f16_bits_to_f32(u16::from_le_bytes([bi[0], bi[1]]));
+    println!("scale[0] = {scale0}, bias[0] = {bias0}");
+    println!("expected: scale=-0.01029205, bias=0.12353515625");
+
+    // Check nibble for col 0
+    let word0 = u32::from_le_bytes(wq[0..4].try_into().unwrap());
+    let nibble0 = word0 & 0xF;
+    let dq0 = scale0.mul_add(nibble0 as f32, bias0);
+    println!("nibble[0] = {nibble0}, dequant[0] = {dq0}");
+    println!("expected dequant[0] = 0.0206146");
+
+    // Dequant first 8
+    for i in 0..8 {
+        let word = u32::from_le_bytes(wq[(i / 8) * 4..(i / 8) * 4 + 4].try_into().unwrap());
+        let nibble = (word >> ((i % 8) * 4)) & 0xF;
+        let sg = i / group_size;
+        let s = f16_bits_to_f32(u16::from_le_bytes([sc[sg * 2], sc[sg * 2 + 1]]));
+        let b = f16_bits_to_f32(u16::from_le_bytes([bi[sg * 2], bi[sg * 2 + 1]]));
+        let dq = s.mul_add(nibble as f32, b);
+        print!("{dq:.7}, ");
+    }
+    println!();
+
+    assert!(
+        (scale0 - (-0.01029205_f32)).abs() < 1e-4,
+        "scale mismatch: got={scale0}"
+    );
+    assert!(
+        (bias0 - 0.12353516_f32).abs() < 1e-4,
+        "bias mismatch: got={bias0}"
+    );
+    assert!(
+        (dq0 - 0.0206146_f32).abs() < 1e-4,
+        "dq0 mismatch: got={dq0}"
+    );
+
+    // Now: build Embedding::Quantized and call embed_lookup for token 760.
+    // We use a SINGLE-row embedding (row 760 only, mapped to index 0).
+    let num_groups = hidden / group_size;
+    let wq_arr =
+        Array::from_bytes(&wq, &[1_i32, (hidden * 4 / 32) as i32], Dtype::U32).expect("wq arr");
+    let sc_arr = Array::from_bytes(&sc, &[1_i32, num_groups as i32], Dtype::F16).expect("sc arr");
+    let bi_arr = Array::from_bytes(&bi, &[1_i32, num_groups as i32], Dtype::F16).expect("bi arr");
+
+    let id_bytes: [u8; 4] = 0u32.to_le_bytes();
+    let ids_arr = Array::from_bytes(&id_bytes, &[1], Dtype::U32).expect("ids");
+
+    let result = embed_lookup(
+        &ids_arr,
+        &wq_arr,
+        &sc_arr,
+        Some(&bi_arr),
+        group_size as i32,
+        4,
+        "affine",
+        Device::Cpu,
+    )
+    .expect("embed_lookup");
+    result.eval().expect("eval");
+    let r_f32 = result.astype(Dtype::F32, Device::Cpu).expect("f32");
+    r_f32.eval().expect("eval f32");
+    let r_bytes = r_f32.to_bytes().expect("bytes");
+    let r_vals: Vec<f32> = r_bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    println!("embed_lookup[:8] = {:?}", &r_vals[..8]);
+    let expected = [
+        0.0206146_f32,
+        3.05e-5,
+        3.05e-5,
+        3.05e-5,
+        3.05e-5,
+        3.05e-5,
+        0.010323,
+        -0.010262,
+    ];
+    for (i, (&got, &exp)) in r_vals.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            (got - exp).abs() < 1e-4,
+            "embed_lookup[{i}]: expected={exp:.7}, got={got:.7}"
+        );
+    }
+    println!("PASS: embed_lookup matches Python");
+
+    // Extended: quantize TWO rows (row 0 and row 760) and test take+embed_lookup for index 1.
+    // Simulates load_from_path_paro but with only 2 rows.
+    let row0_bytes = w_bytes[0..hidden * 2].to_vec();
+    let row760_start = 760 * hidden * 2;
+    let row760_bytes2 = w_bytes[row760_start..row760_start + hidden * 2].to_vec();
+    let two_rows: Vec<u8> = row0_bytes
+        .iter()
+        .chain(row760_bytes2.iter())
+        .cloned()
+        .collect();
+
+    let (wq2, sc2, bi2) =
+        quantize_f16_affine_int4(&two_rows, 2, hidden, group_size).expect("quantize 2 rows");
+
+    let wq2_arr =
+        Array::from_bytes(&wq2, &[2_i32, (hidden * 4 / 32) as i32], Dtype::U32).expect("wq2 arr");
+    let sc2_arr =
+        Array::from_bytes(&sc2, &[2_i32, num_groups as i32], Dtype::F16).expect("sc2 arr");
+    let bi2_arr =
+        Array::from_bytes(&bi2, &[2_i32, num_groups as i32], Dtype::F16).expect("bi2 arr");
+
+    // Verify scale/bias for row 1 (the embedding for token 760)
+    let s2_bytes_vec = sc2_arr.to_bytes().expect("sc2 bytes");
+    let b2_bytes_vec = bi2_arr.to_bytes().expect("bi2 bytes");
+    let s2 = s2_bytes_vec.as_slice();
+    let b2 = b2_bytes_vec.as_slice();
+    let s1_0 = f16_bits_to_f32(u16::from_le_bytes([
+        s2[num_groups * 2],
+        s2[num_groups * 2 + 1],
+    ]));
+    let b1_0 = f16_bits_to_f32(u16::from_le_bytes([
+        b2[num_groups * 2],
+        b2[num_groups * 2 + 1],
+    ]));
+    println!("two-row: scales[1,0]={s1_0:.8} (expected -0.01029205)");
+    println!("two-row: biases[1,0]={b1_0:.8} (expected 0.12353516)");
+    assert!(
+        (s1_0 - (-0.01029205_f32)).abs() < 1e-4,
+        "scale[1,0] wrong: {s1_0}"
+    );
+    assert!(
+        (b1_0 - 0.12353516_f32).abs() < 1e-4,
+        "bias[1,0] wrong: {b1_0}"
+    );
+
+    // embed_lookup for index 1 (= row 760 in 2-row embedding)
+    let id1_bytes: [u8; 4] = 1u32.to_le_bytes();
+    let ids1_arr = Array::from_bytes(&id1_bytes, &[1], Dtype::U32).expect("ids1");
+    let result2 = embed_lookup(
+        &ids1_arr,
+        &wq2_arr,
+        &sc2_arr,
+        Some(&bi2_arr),
+        group_size as i32,
+        4,
+        "affine",
+        Device::Cpu,
+    )
+    .expect("embed_lookup2");
+    result2.eval().expect("eval2");
+    let r2_f32 = result2.astype(Dtype::F32, Device::Cpu).expect("f32 2");
+    r2_f32.eval().expect("eval r2");
+    let r2_bytes_vec = r2_f32.to_bytes().expect("bytes2");
+    let r2_vals: Vec<f32> = r2_bytes_vec
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    println!("two-row embed_lookup[1][:8] = {:?}", &r2_vals[..8]);
+    let expected2 = [
+        0.0206146_f32,
+        3.05e-5,
+        3.05e-5,
+        3.05e-5,
+        3.05e-5,
+        3.05e-5,
+        0.010323,
+        -0.010262,
+    ];
+    for (i, (&got, &exp)) in r2_vals.iter().zip(expected2.iter()).enumerate() {
+        assert!(
+            (got - exp).abs() < 1e-4,
+            "two-row embed_lookup[{i}]: expected={exp:.7}, got={got:.7}"
+        );
+    }
+    println!("PASS: two-row embed_lookup matches Python");
+
+    // Full-vocab check: quantize ALL vocab rows, then check row 760.
+    // This tests that the large buffer has correct layout.
+    println!("Quantizing all {vocab} rows (may take a few seconds in debug)...");
+    let (wq_full, sc_full, bi_full) =
+        quantize_f16_affine_int4(&w_bytes, vocab, hidden, group_size).expect("quantize full");
+    println!("Full quantize done. Checking row 760...");
+
+    // Extract scale/bias for row 760
+    let row = 760usize;
+    let sg_off = row * num_groups * 2;
+    let s760_0 = f16_bits_to_f32(u16::from_le_bytes([sc_full[sg_off], sc_full[sg_off + 1]]));
+    let b760_0 = f16_bits_to_f32(u16::from_le_bytes([bi_full[sg_off], bi_full[sg_off + 1]]));
+    println!("full: sc[760,0]={s760_0:.8} (expected -0.01029205)");
+    println!("full: bi[760,0]={b760_0:.8} (expected 0.12353516)");
+
+    // Dequant elem 0 of row 760
+    let w_off = row * (hidden / 8) * 4;
+    let word = u32::from_le_bytes(wq_full[w_off..w_off + 4].try_into().unwrap());
+    let n0 = word & 0xF;
+    let dq_full = s760_0.mul_add(n0 as f32, b760_0);
+    println!("full: nibble[760,0]={n0} → dequant={dq_full:.7} (expected 0.0206146)");
+
+    assert!(
+        (s760_0 - (-0.01029205_f32)).abs() < 1e-4,
+        "full scale wrong: {s760_0}"
+    );
+    assert!(
+        (b760_0 - 0.12353516_f32).abs() < 1e-4,
+        "full bias wrong: {b760_0}"
+    );
+    assert!(
+        (dq_full - 0.0206146_f32).abs() < 1e-4,
+        "full dq wrong: {dq_full}"
+    );
+    println!("PASS: full-vocab quantize row 760 correct");
+}
+
+/// Validate PARO Linear::forward against Python manual dequant reference.
+///
+/// Loads layer 0 in_proj_qkv from the PARO checkpoint, calls Linear::forward
+/// with x=ones[1,5120], and checks the first 4 output values match the
+/// Python reference (computed in paro_qmm_test.py):
+/// out[0:4] ≈ [-0.5281, -1.7090, 1.0711, 0.1899]
+///
+/// This isolates the PARO weight conversion + quantized_matmul path from
+/// the rotation kernel. The Linear::Paro path applies rotation first, so we
+/// test with rotation bypassed by constructing a Linear::Quantized directly.
+///
+/// Skipped in CI; run manually: cargo test -- --ignored paro_linear_fwd_layer0
+#[test]
+#[ignore]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn paro_linear_fwd_layer0() {
+    use rmlx_loader::{load_shard_index, ShardSet};
+    use rmlx_mlx::{Array, Device, Dtype};
+
+    let Some(model_dir_buf) = paro_model_dir() else {
+        println!("SKIP: RMLX_TEST_MODEL_QWEN36_PARO not set");
+        return;
+    };
+    let model_dir = model_dir_buf.as_path();
+    if !model_dir.exists() {
+        println!("SKIP: PARO model dir not found");
+        return;
+    }
+
+    let _shard_path = model_dir.join("model.safetensors");
+    let idx = load_shard_index(model_dir).expect("shard index");
+    let shards = ShardSet::open(model_dir, &idx).expect("shards");
+
+    #[allow(
+        clippy::expect_used,
+        reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+    )]
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    fn load_raw_any(shards: &ShardSet, name: &str) -> Option<(Vec<u8>, Vec<usize>)> {
+        for (_, h) in shards.iter() {
+            if let Ok(st) = h.safetensors() {
+                if let Ok(t) = st.tensor(name) {
+                    return Some((t.data().to_vec(), t.shape().to_vec()));
+                }
+            }
+        }
+        None
+    }
+
+    let base = "model.language_model.layers.0.linear_attn.in_proj_qkv";
+    let (qw_bytes, qw_shape) = load_raw_any(&shards, &format!("{base}.qweight")).expect("qweight");
+    let (sc_bytes, sc_shape) = load_raw_any(&shards, &format!("{base}.scales")).expect("scales");
+    let (qz_bytes, _) = load_raw_any(&shards, &format!("{base}.qzeros")).expect("qzeros");
+
+    println!("qweight shape: {qw_shape:?}");
+    println!("scales  shape: {sc_shape:?}");
+
+    let in_f = qw_shape[0];
+    let num_groups = sc_shape[0];
+    let out_f = sc_shape[1];
+    let bits = 4usize;
+    let group_size = 128usize;
+
+    println!("in={in_f} out={out_f} groups={num_groups} group_size={group_size}");
+
+    // Convert AWQ weight
+    let mlx_w_bytes = convert_awq_qweight(&qw_bytes, in_f, out_f, bits).expect("convert qweight");
+    let w = Array::from_bytes(
+        &mlx_w_bytes,
+        &[out_f as i32, (in_f * bits / 32) as i32],
+        Dtype::U32,
+    )
+    .expect("w array");
+
+    let (s_bytes, b_bytes) =
+        convert_awq_qzeros_to_biases(&qz_bytes, &sc_bytes, num_groups, out_f, bits)
+            .expect("convert qzeros");
+    let s = Array::from_bytes(&s_bytes, &[out_f as i32, num_groups as i32], Dtype::F16).expect("s");
+    let b = Array::from_bytes(&b_bytes, &[out_f as i32, num_groups as i32], Dtype::F16).expect("b");
+
+    let device = Device::Gpu;
+
+    // x = ones [1, in_f] F16
+    let x_data = vec![1.0f32; in_f];
+    let x_bytes =
+        unsafe { std::slice::from_raw_parts(x_data.as_ptr().cast::<u8>(), x_data.len() * 4) };
+    let x_f32 = Array::from_bytes(x_bytes, &[1, in_f as i32], Dtype::F32).expect("x");
+    let x = x_f32.astype(Dtype::F16, device).expect("x f16");
+
+    let out = rmlx_mlx::quantized_matmul(
+        &x,
+        &w,
+        &s,
+        Some(&b),
+        group_size as i32,
+        bits as i32,
+        "affine",
+        true,
+        device,
+    )
+    .expect("quantized_matmul");
+
+    out.eval().expect("eval");
+    let out_f32 = out.astype(Dtype::F32, Device::Cpu).expect("astype");
+    out_f32.eval().expect("eval f32");
+    let bytes = out_f32.to_bytes().expect("to_bytes");
+    let vals: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+
+    println!("Rust out[0:8]: {:?}", &vals[..8.min(vals.len())]);
+
+    // Debug: print scales and biases for out=0, group=0
+    // scales_t: [out, num_groups] F16 → scales_t[0, 0] = scales[0, 0]
+    // Python: scale[g=0, o=0] = 0x1E27 = 0.006008
+    {
+        let s_bits = u16::from_le_bytes([s_bytes[0], s_bytes[1]]);
+        let b_bits = u16::from_le_bytes([b_bytes[0], b_bytes[1]]);
+        let s_f32 = f16_bits_to_f32(s_bits);
+        let b_f32 = f16_bits_to_f32(b_bits);
+        println!("scale[o=0, g=0]: bits=0x{s_bits:04X} f32={s_f32:.8}");
+        println!("bias[o=0,  g=0]: bits=0x{b_bits:04X} f32={b_f32:.8}");
+        // Python reference: scale=0x1E27=0.006008, bias=0xAA27=-0.048065
+    }
+
+    // Debug: print first 8 weight nibbles for out=0 from the Rust-converted MLX weight.
+    // MLX weight shape: [out, in*bits/32], each row is packed input nibbles.
+    // For out=0: row 0 of mlx_w_bytes.
+    // words_per_out = in_f*4/32 = 16, row 0 spans bytes [0..64].
+    {
+        let words_per_out = in_f * bits / 32;
+        print!("First 8 Rust weight nibbles (out=0, in=0..7): ");
+        let mut nibbles = Vec::new();
+        for j in 0..words_per_out.min(1) {
+            let off = j * 4;
+            let word = u32::from_le_bytes(mlx_w_bytes[off..off + 4].try_into().unwrap());
+            for k in 0..8 {
+                nibbles.push((word >> (k * 4)) & 0xF);
+            }
+        }
+        println!("{:?}", &nibbles[..8]);
+        // Python: unpacked[0:8, 0] = nibble_matrix[0:8][0]
+        // from python: "First 8 weight nibbles (col=0, i=0..7)"
+    }
+
+    // Python reference (from paro_qmm_test.py): MLX qmm out[0:8] ≈
+    // [-0.5390625, -1.7080078, 1.0664062, 0.19702148,
+    // 0.21374512, -0.9897461, -0.30981445, -1.3105469]
+    let reference = [-0.5390625f32, -1.7080078, 1.0664062, 0.19702148];
+    let tol = 0.05;
+    for (i, (&r, &v)) in reference.iter().zip(vals.iter()).enumerate() {
+        assert!(
+            (v - r).abs() < tol,
+            "out[{i}]: reference={r:.4}, rust={v:.4}, diff={:.4}",
+            (v - r).abs()
+        );
+    }
+    println!("PASS: PARO Linear::Quantized forward matches Python reference");
+}
+
+/// Layer-0 trace test: loads the PARO model, runs single-token [760] forward,
+/// and checks intermediate values match the Python reference.
+///
+/// Python reference (single token 760, layer 0):
+/// embed[760][:8] = [0.02061, 3.05e-5, 3.05e-5, 3.05e-5, 3.05e-5, 3.05e-5, 0.01032, -0.01026]
+/// normed[:8] = [1.486, 0.00198, 0.00195, 0.00199, 0.00191, 0.00193, 0.750, -0.629]
+/// GDN out[:8] = [-0.03806, 0.002659, -0.01468, 0.000163, -0.04623, -0.000996, 0.004459, -0.01350]
+/// layer0_out[:8] = [-0.00491, 0.007183, -0.05164, -0.04550, -0.05255, -0.01894, 0.02736, -0.02786]
+///
+/// Run manually: cargo test -- --ignored paro_layer0_trace
+#[test]
+#[ignore]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn paro_layer0_trace() {
+    let Some(model_dir_buf) = paro_model_dir() else {
+        println!("SKIP: RMLX_TEST_MODEL_QWEN36_PARO not set");
+        return;
+    };
+    let model_dir = model_dir_buf.as_path();
+    if !model_dir.exists() {
+        println!("SKIP: PARO model dir not found");
+        return;
+    }
+
+    println!("Loading PARO model for layer0 trace...");
+    let model = load_from_path_paro(model_dir).expect("load PARO model");
+
+    // Diagnostic: inspect embed_tokens scales/biases for row 760 directly.
+    {
+        if let Embedding::Quantized {
+            weight,
+            scales,
+            biases,
+            group_size,
+            bits,
+            ..
+        } = &model.embed_tokens
+        {
+            println!(
+                "embed: weight shape={:?}, scales shape={:?}",
+                weight.shape(),
+                scales.shape()
+            );
+            // Extract scales[760, 0] and biases[760, 0]
+            let idx_bytes: [u8; 4] = 760u32.to_le_bytes();
+            let idx_arr = Array::from_bytes(&idx_bytes, &[1], Dtype::U32).expect("idx");
+            let s760 = scales.take(&idx_arr, 0, Device::Cpu).expect("scales take");
+            let b760 = biases
+                .as_ref()
+                .unwrap()
+                .take(&idx_arr, 0, Device::Cpu)
+                .expect("biases take");
+            s760.eval().expect("eval s760");
+            b760.eval().expect("eval b760");
+            let s_bytes = s760.to_bytes().expect("s bytes");
+            let b_bytes = b760.to_bytes().expect("b bytes");
+            let s0 = f16_bits_to_f32(u16::from_le_bytes([s_bytes[0], s_bytes[1]]));
+            let b0 = f16_bits_to_f32(u16::from_le_bytes([b_bytes[0], b_bytes[1]]));
+            println!("embed scales[760, 0] = {s0:.8} (expected -0.01029205)");
+            println!("embed biases[760, 0] = {b0:.8} (expected 0.12353516)");
+            // Check the packed weight nibbles for row 760, word 0
+            let w760 = weight.take(&idx_arr, 0, Device::Cpu).expect("weight take");
+            w760.eval().expect("eval w760");
+            let w_bytes = w760.to_bytes().expect("w bytes");
+            let word0 = u32::from_le_bytes(w_bytes[0..4].try_into().unwrap());
+            let n0 = word0 & 0xF;
+            let dq0 = s0 * n0 as f32 + b0;
+            println!("embed weight[760, word0=0x{word0:08X}] nibble[0]={n0} → dequant={dq0:.7} (expected 0.0206146)");
+            println!("group_size={group_size}, bits={bits}");
+        }
+    }
+
+    let device = Device::Gpu;
+
+    // Single token [760] ("The")
+    let ids: Vec<u32> = vec![760];
+    let ids_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(ids.as_ptr().cast::<u8>(), ids.len() * 4) };
+    let ids_arr = Array::from_bytes(ids_bytes, &[1], Dtype::U32).expect("ids");
+
+    // Embed
+    let h = model.embed_tokens.forward(&ids_arr, device).expect("embed");
+    h.eval().expect("eval embed");
+    let h = h
+        .reshape(&[1, 1, model.cfg.hidden_size as i32], device)
+        .expect("reshape");
+
+    let h_f32 = h.astype(Dtype::F32, Device::Cpu).expect("h f32");
+    h_f32.eval().expect("eval h_f32");
+    let h_vals: Vec<f32> = h_f32
+        .to_bytes()
+        .expect("bytes")
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    println!("embed[760][:8] = {:?}", &h_vals[..8]);
+
+    // Python reference (exact F16 values — precision is intentional)
+    #[allow(clippy::excessive_precision)]
+    let embed_ref: [f32; 8] = [
+        0.0206146240234375,
+        3.0517578125e-5,
+        3.0517578125e-5,
+        3.0517578125e-5,
+        3.0517578125e-5,
+        3.0517578125e-5,
+        0.01032257080078125,
+        -0.01026153564453125,
+    ];
+    let tol_embed = 0.0002_f32;
+    for (i, (&got, &exp)) in h_vals.iter().zip(embed_ref.iter()).enumerate() {
+        assert!(
+            (got - exp).abs() < tol_embed,
+            "embed[{i}]: expected={exp:.8}, got={got:.8}, diff={:.8}",
+            (got - exp).abs()
+        );
+    }
+    println!("PASS: embed matches Python");
+
+    // Debug: print embed[760] RMS and sample elements across all groups.
+    {
+        let rms_sq: f32 = h_vals.iter().map(|&v| v * v).sum::<f32>() / h_vals.len() as f32;
+        let rms = rms_sq.sqrt();
+        println!("embed[760] rms={rms:.6} (Python rms≈0.014645)");
+        println!("embed[760][128:136] = {:?}", &h_vals[128..136]);
+        println!("embed[760][256:264] = {:?}", &h_vals[256..264]);
+        // How many elements have abs > 1.0?
+        let large = h_vals.iter().filter(|&&v| v.abs() > 1.0).count();
+        println!("embed[760] elements with |v|>1.0: {large}");
+    }
+
+    // Layer 0
+    let layer0 = &model.layers[0];
+
+    // Pre-norm
+    let h_normed = layer0.input_layernorm.forward(&h, device).expect("norm");
+    h_normed.eval().expect("eval normed");
+    let hn_f32 = h_normed.astype(Dtype::F32, Device::Cpu).expect("f32");
+    hn_f32.eval().expect("eval hn f32");
+    let hn_vals: Vec<f32> = hn_f32
+        .to_bytes()
+        .expect("bytes")
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    println!("normed[:8] = {:?}", &hn_vals[..8]);
+
+    // Exact F16 reference values — precision intentional
+    #[allow(clippy::excessive_precision)]
+    let normed_ref: [f32; 8] = [
+        1.486328125,
+        0.0019779205322265625,
+        0.0019512176513671875,
+        0.001987457275390625,
+        0.0019083023071289062,
+        0.001926422119140625,
+        0.75048828125,
+        -0.62890625,
+    ];
+    let tol_norm = 0.01_f32;
+    for (i, (&got, &exp)) in hn_vals.iter().zip(normed_ref.iter()).enumerate() {
+        assert!(
+            (got - exp).abs() < tol_norm,
+            "normed[{i}]: expected={exp:.8}, got={got:.8}, diff={:.8}",
+            (got - exp).abs()
+        );
+    }
+    println!("PASS: normed matches Python");
+
+    // GDN forward (no cache)
+    let gdn = match &layer0.attn {
+        AttnBlock::Linear(gdn) => gdn,
+        _ => panic!("layer 0 should be GatedDeltaNet"),
+    };
+    let y_gdn = gdn.forward(&h_normed, None, device).expect("GDN forward");
+    y_gdn.eval().expect("eval y_gdn");
+    let y_f32 = y_gdn.astype(Dtype::F32, Device::Cpu).expect("f32");
+    y_f32.eval().expect("eval y_f32");
+    let y_vals: Vec<f32> = y_f32
+        .to_bytes()
+        .expect("bytes")
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    println!("GDN output[:8] = {:?}", &y_vals[..8]);
+
+    // Exact F16 reference values — precision intentional
+    #[allow(clippy::excessive_precision)]
+    let gdn_ref: [f32; 8] = [
+        -0.038055419921875,
+        0.002658843994140625,
+        -0.014678955078125,
+        0.00016319751739501953,
+        -0.046234130859375,
+        -0.000995635986328125,
+        0.004459381103515625,
+        -0.0135040283203125,
+    ];
+    let tol_gdn = 0.005_f32;
+    let mut gdn_ok = true;
+    for (i, (&got, &exp)) in y_vals.iter().zip(gdn_ref.iter()).enumerate() {
+        if (got - exp).abs() > tol_gdn {
+            println!(
+                "GDN MISMATCH [{i}]: expected={exp:.8}, got={got:.8}, diff={:.8}",
+                (got - exp).abs()
+            );
+            gdn_ok = false;
+        }
+    }
+    if gdn_ok {
+        println!("PASS: GDN output matches Python");
+    } else {
+        println!("FAIL: GDN output diverges from Python");
+    }
+
+    // Write full GDN output for inspection
+    let report = format!(
+        "paro_layer0_trace\nembed[:8]={embed_ref:?}\nnormed[:8]={normed_ref:?}\n\
+         GDN_ref[:8]={gdn_ref:?}\nGDN_rust[:8]={:?}\n",
+        &y_vals[..8]
+    );
+    std::fs::write("/tmp/paro_layer0_trace_result.txt", &report).ok();
+
+    assert!(
+        gdn_ok,
+        "GDN output diverges from Python reference. See /tmp/paro_layer0_trace_result.txt"
+    );
+}
+
+/// Integration test: PARO model forward pass with the real prompt token IDs.
+///
+/// Python reference (paroquant loader + mlx-lm, temp=0):
+/// prompt: "<|im_start|>user\nThe capital of France is<|im_end|>\n<|im_start|>assistant\n<think>\n"
+/// token IDs: [248045, 846, 198, 760, 6511, 314, 9338, 369, 248046, 198, 248045, 74455, 198, 248068, 198]
+/// first token output: "Paris" (token 24102 or similar)
+/// second token output: "."
+///
+/// Run manually: cargo test -- --ignored integration_paro_forward
+#[test]
+#[ignore]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn integration_paro_forward() {
+    let Some(model_dir_buf) = paro_model_dir() else {
+        println!("SKIP: RMLX_TEST_MODEL_QWEN36_PARO not set");
+        return;
+    };
+    let model_dir = model_dir_buf.as_path();
+    if !model_dir.exists() {
+        println!("SKIP: PARO model dir not found");
+        return;
+    }
+
+    println!("Loading PARO model...");
+    let model = load_from_path_paro(model_dir).expect("load PARO model");
+    println!("Model loaded. vocab_size={}", model.cfg.vocab_size);
+
+    // Token IDs matching Python reference:
+    // "<|im_start|>user\nThe capital of France is<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    let prompt_ids: Vec<u32> = vec![
+        248045, 846, 198, 760, 6511, 314, 9338, 369, 248046, 198, 248045, 74455, 198, 248068, 198,
+    ];
+
+    println!("Running forward pass with {} tokens...", prompt_ids.len());
+    let logits = model
+        .forward_seq(&prompt_ids, Device::Gpu)
+        .expect("forward_seq");
+    logits.eval().expect("eval");
+
+    let logits_f32 = logits.astype(Dtype::F32, Device::Cpu).expect("logits f32");
+    logits_f32.eval().expect("eval f32");
+    let bytes = logits_f32.to_bytes().expect("to_bytes");
+    let vals: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+
+    // Write results to a file since cargo test captures stdout.
+    let mut report = String::new();
+    report.push_str(&format!("Logits shape: {:?}\n", logits.shape()));
+    report.push_str(&format!("Logits[0..5]: {:?}\n", &vals[..5.min(vals.len())]));
+
+    // Find argmax.
+    let (argmax, max_val) =
+        vals.iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |acc, (i, &v)| {
+                if v > acc.1 {
+                    (i, v)
+                } else {
+                    acc
+                }
+            });
+    report.push_str(&format!("argmax token: {argmax} (logit={max_val:.4})\n"));
+
+    // Top-10 logits.
+    let mut indexed: Vec<(usize, f32)> = vals.iter().copied().enumerate().collect();
+    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    report.push_str(&format!(
+        "Top-10 tokens: {:?}\n",
+        &indexed[..10.min(indexed.len())]
+    ));
+
+    // Also run with raw "The capital of France is" tokens (5 tokens, same as Python reference)
+    let raw_prompt_ids: Vec<u32> = vec![760, 6511, 314, 9338, 369];
+    report.push_str(&format!(
+        "\n--- Raw prompt ({} tokens) ---\n",
+        raw_prompt_ids.len()
+    ));
+    let raw_logits = model
+        .forward_seq(&raw_prompt_ids, Device::Gpu)
+        .expect("raw forward_seq");
+    raw_logits.eval().expect("raw eval");
+    let raw_f32 = raw_logits.astype(Dtype::F32, Device::Cpu).expect("raw f32");
+    raw_f32.eval().expect("raw eval f32");
+    let raw_bytes = raw_f32.to_bytes().expect("raw to_bytes");
+    let raw_vals: Vec<f32> = raw_bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    let (raw_argmax, raw_max) =
+        raw_vals
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |acc, (i, &v)| {
+                if v > acc.1 {
+                    (i, v)
+                } else {
+                    acc
+                }
+            });
+    report.push_str(&format!(
+        "raw argmax token: {raw_argmax} (logit={raw_max:.4})\n"
+    ));
+    let mut raw_indexed: Vec<(usize, f32)> = raw_vals.iter().copied().enumerate().collect();
+    raw_indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    report.push_str(&format!(
+        "raw Top-10 tokens: {:?}\n",
+        &raw_indexed[..10.min(raw_indexed.len())]
+    ));
+
+    std::fs::write("/tmp/paro_integration_result.txt", &report).expect("write result");
+
+    // Python reference (verified 2026-05-08):
+    // chat template prompt → argmax=8160 ("Here"), logit≈22.28
+    // raw prompt → argmax=11751 (" Paris"), logit≈16.08
+    //
+    // Tolerance: ±1 token for chat (model is thinking, nondeterministic-ish);
+    // raw prompt must be exactly " Paris" (token 11751).
+    assert_eq!(
+        raw_argmax, 11751,
+        "raw prompt: expected argmax=11751 (' Paris') but got {raw_argmax}\nReport:\n{report}"
+    );
+    assert_eq!(
+        argmax, 8160,
+        "chat template: expected argmax=8160 ('Here') but got {argmax}\nReport:\n{report}"
+    );
+    assert!(
+        (raw_max - 16.08_f32).abs() < 0.5,
+        "raw prompt max logit={raw_max:.4}, expected≈16.08\nReport:\n{report}"
+    );
+    println!(
+        "PASS: integration_paro_forward — raw→'Paris' (token 11751), chat→'Here' (token 8160)"
+    );
+}
+
+/// Integration test: PARO model generate_greedy with chat-templated "hi" prompt.
+///
+/// Regression test for the generate_greedy fixedpoint bug (token 227854 "ĠSorr" repeating).
+///
+/// Verifies that generate_greedy produces token 8160 ("Here") as the first token,
+/// matching forward_seq which gives the same argmax without a KV cache.
+///
+/// Run manually: cargo test -- --ignored integration_paro_generate_greedy
+#[test]
+#[ignore]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+fn integration_paro_generate_greedy() {
+    let Some(model_dir_buf) = paro_model_dir() else {
+        println!("SKIP: RMLX_TEST_MODEL_QWEN36_PARO not set");
+        return;
+    };
+    let model_dir = model_dir_buf.as_path();
+    if !model_dir.exists() {
+        println!("SKIP: PARO model dir not found");
+        return;
+    }
+
+    println!("Loading PARO model...");
+    let model = load_from_path_paro(model_dir).expect("load PARO model");
+    let tokenizer =
+        tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json")).expect("load tokenizer");
+    println!("Model loaded. vocab_size={}", model.cfg.vocab_size);
+
+    // Chat-templated "hi" prompt — 11 tokens as the server sends.
+    // "<|im_start|>user\nĠhi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    // Token 15131 = "Ġhi" (space+hi via BPE).
+    let prompt_ids: Vec<u32> = vec![
+        248045, 846, 198, 15131, 248046, 198, 248045, 74455, 198, 248068, 198,
+    ];
+
+    println!(
+        "Running generate_greedy with {} tokens...",
+        prompt_ids.len()
+    );
+    let mut report = String::new();
+    let mut step_fn = |step: &crate::gemma4::ProbeStep| -> Option<u32> {
+        let line = format!(
+            "step {} token_id={}\n",
+            report.matches('\n').count(),
+            step.token_id
+        );
+        report.push_str(&line);
+        println!("{}", line.trim());
+        None
+    };
+    // A7.2: greedy (temperature 0.0) — untouched argmax path.
+    let test_sampler_cfg = crate::sampler::SamplerConfig {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        min_p: 0.0,
+        seed: None,
+        top_logprobs_k: 0,
+    };
+    let mut test_rng = crate::sampler::Pcg32::new(test_sampler_cfg.seed_or_default());
+    let mut test_token_history: Vec<u32> = Vec::new();
+    let test_penalty_cfg = crate::sampler::PenaltyConfig::default();
+    let steps = generate_greedy(
+        &model,
+        &tokenizer,
+        &prompt_ids,
+        8,
+        Device::Gpu,
+        rmlx_kv_quant::KvQuant::K8V8,
+        Some(4096),
+        1,
+        &[],
+        &mut step_fn,
+        None,
+        &test_sampler_cfg,
+        &mut test_rng,
+        &test_penalty_cfg,
+        &mut test_token_history,
+    )
+    .expect("generate_greedy");
+
+    std::fs::write("/tmp/paro_generate_greedy_result.txt", &report).ok();
+
+    let first_id = steps.first().map_or(0, |s| s.token_id);
+    assert_eq!(
+        first_id, 8160,
+        "generate_greedy step 0: expected token 8160 ('Here') but got {first_id}.\n\
+         This is the PARO generate_greedy fixedpoint bug.\nSteps: {steps:?}"
+    );
+
+    // Also verify it doesn't fixedpoint (first 4 tokens must not all be the same).
+    let ids: Vec<u32> = steps.iter().map(|s| s.token_id).collect();
+    let all_same = ids.windows(2).all(|w| w[0] == w[1]);
+    assert!(
+        !all_same,
+        "generate_greedy fixedpoint detected: all tokens are the same ({ids:?})"
+    );
+
+    println!("PASS: integration_paro_generate_greedy — first token={first_id}");
+}
+
+/// Verify paro_rotate_gpu output for embed_tokens[760] through layer 0 in_proj_qkv rotation.
+///
+/// Python reference (paroquant loader, token_id=760, layer=0, in_proj_qkv):
+/// input: embed_tokens.weight[760], shape [1, 5120] F16
+/// output: rotated[0, 0:16] = [0.01657, -0.00576, 0.000283, 0.02132,
+/// -0.001490, 0.009895, 0.010307, -0.001883,
+/// -0.002081, -0.001678, -0.008347, 0.002474,
+/// -0.01151, 0.003979, 0.003664, -0.002384]
+///
+/// Reference output saved as f32 in /tmp/paro_rotation_expected.npy (shape [1,5120]).
+///
+/// Run manually: cargo test -- --ignored paro_rotation_kernel_vs_python
+#[test]
+#[ignore]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn paro_rotation_kernel_vs_python() {
+    use rmlx_loader::{load_shard_index, ShardSet};
+    use rmlx_mlx::{Array, Device, Dtype};
+
+    let Some(model_dir_buf) = paro_model_dir() else {
+        println!("SKIP: RMLX_TEST_MODEL_QWEN36_PARO not set");
+        return;
+    };
+    let model_dir = model_dir_buf.as_path();
+    if !model_dir.exists() {
+        println!("SKIP: PARO model dir not found");
+        return;
+    }
+
+    let idx = load_shard_index(model_dir).expect("shard index");
+    let shards = ShardSet::open(model_dir, &idx).expect("shards");
+
+    #[allow(
+        clippy::expect_used,
+        reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+    )]
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    fn load_tensor(shards: &ShardSet, name: &str) -> (Vec<u8>, Vec<usize>) {
+        for (_, h) in shards.iter() {
+            if let Ok(st) = h.safetensors() {
+                if let Ok(t) = st.tensor(name) {
+                    return (t.data().to_vec(), t.shape().to_vec());
+                }
+            }
+        }
+        panic!("tensor not found: {name}");
+    }
+
+    // Load embed_tokens.weight [248320, 5120] F16 — row 760.
+    let (emb_bytes, emb_shape) = load_tensor(&shards, "model.language_model.embed_tokens.weight");
+    println!("embed_tokens shape: {emb_shape:?}");
+    let vocab = emb_shape[0];
+    let hidden = emb_shape[1];
+    assert_eq!(hidden, 5120, "expected hidden=5120");
+    // Row 760 byte range: [760 * 5120 * 2 .. 761 * 5120 * 2].
+    let row_start = 760 * hidden * 2;
+    let row_end = row_start + hidden * 2;
+    let row_bytes = emb_bytes[row_start..row_end].to_vec();
+    // Build [1, 5120] F16 array from the row bytes.
+    let x = Array::from_bytes(&row_bytes, &[1, hidden as i32], Dtype::F16).expect("embed row");
+    let x_gpu = x.astype(Dtype::F16, Device::Gpu).expect("x gpu");
+
+    // Load rotation params for layer 0 in_proj_qkv.
+    let base = "model.language_model.layers.0.linear_attn.in_proj_qkv";
+    let (theta_bytes, theta_shape) = load_tensor(&shards, &format!("{base}.theta"));
+    let (pairs_bytes, pairs_shape) = load_tensor(&shards, &format!("{base}.pairs"));
+    let (cs_bytes, cs_shape) = load_tensor(&shards, &format!("{base}.channel_scales"));
+    println!("theta shape: {theta_shape:?}");
+    println!("pairs shape: {pairs_shape:?}");
+    println!("channel_scales shape: {cs_shape:?}");
+
+    // theta: F16 [krot, hidden/2].
+    let krot = theta_shape[0];
+    let half_hidden = theta_shape[1];
+    assert_eq!(half_hidden * 2, hidden, "theta half_hidden mismatch");
+    let group_size = 128usize; // PARO Qwen3.6-27B always uses 128.
+
+    // Pre-compute cos/sin from F16 theta bytes (mirrors load_paro_linear).
+    let n_theta = krot * half_hidden;
+    let mut cos_bytes = vec![0u8; n_theta * 2];
+    let mut sin_bytes = vec![0u8; n_theta * 2];
+    for i in 0..n_theta {
+        let th_bits = u16::from_le_bytes([theta_bytes[i * 2], theta_bytes[i * 2 + 1]]);
+        let th_f32 = f16_bits_to_f32(th_bits);
+        let cos_f16 = f32_to_f16_bits(th_f32.cos());
+        let sin_f16 = f32_to_f16_bits(th_f32.sin());
+        cos_bytes[i * 2..i * 2 + 2].copy_from_slice(&cos_f16.to_le_bytes());
+        sin_bytes[i * 2..i * 2 + 2].copy_from_slice(&sin_f16.to_le_bytes());
+    }
+    let cos_theta = Array::from_bytes(&cos_bytes, &[krot as i32, half_hidden as i32], Dtype::F16)
+        .expect("cos_theta");
+    let sin_theta = Array::from_bytes(&sin_bytes, &[krot as i32, half_hidden as i32], Dtype::F16)
+        .expect("sin_theta");
+
+    // Pack I16 pairs [krot, hidden] → I32 [krot, hidden/2].
+    // pairs_bytes: I16 little-endian, shape [krot, hidden].
+    let packed = crate::paroquant_msl::pack_pairs_cpu(&pairs_bytes, krot, hidden, group_size)
+        .expect("pack_pairs_cpu");
+    let packed_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(packed.as_ptr().cast::<u8>(), packed.len() * 4) };
+    let packed_pairs =
+        Array::from_bytes(packed_bytes, &[krot as i32, half_hidden as i32], Dtype::I32)
+            .expect("packed_pairs");
+
+    // Channel scales: F16 [1, hidden] or [hidden].
+    let cs_flat_shape: &[i32] = if cs_shape.len() > 1 {
+        &[cs_shape[0] as i32, cs_shape[1] as i32]
+    } else {
+        &[cs_shape[0] as i32]
+    };
+    let channel_scales =
+        Array::from_bytes(&cs_bytes, cs_flat_shape, Dtype::F16).expect("channel_scales");
+
+    println!("krot={krot}, group_size={group_size}, hidden={hidden}");
+
+    // Run the rotation kernel.
+    let out = crate::paroquant_msl::paro_rotate_gpu(
+        &x_gpu,
+        &packed_pairs,
+        &cos_theta,
+        &sin_theta,
+        &channel_scales,
+        krot,
+        group_size,
+        Device::Gpu,
+    )
+    .expect("paro_rotate_gpu");
+
+    out.eval().expect("eval");
+    let out_f32 = out.astype(Dtype::F32, Device::Cpu).expect("astype f32");
+    out_f32.eval().expect("eval f32");
+    let out_bytes = out_f32.to_bytes().expect("to_bytes");
+    let out_vals: Vec<f32> = out_bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+
+    // Write full result for inspection.
+    {
+        let preview: Vec<f32> = out_vals[..16.min(out_vals.len())].to_vec();
+        let report = format!(
+            "paro_rotation_kernel_vs_python\n\
+             krot={krot} group_size={group_size} hidden={hidden}\n\
+             Rust out[0:16]: {preview:?}\n\
+             Python ref:     [0.01657, -0.00576, 0.000283, 0.02132, -0.001490, 0.009895, 0.010307, -0.001883, -0.002081, -0.001678, -0.008347, 0.002474, -0.01151, 0.003979, 0.003664, -0.002384]\n"
+        );
+        std::fs::write("/tmp/paro_rotation_kernel_result.txt", &report).ok();
+        println!("{report}");
+    }
+
+    // Python reference: first 16 elements of rotated output (exact F16 values).
+    // Source: /tmp/paro_rotation_expected.npy, computed by paroquant Python loader.
+    #[allow(clippy::excessive_precision)]
+    let reference: [f32; 16] = [
+        0.016571044921875,
+        -0.005756378173828125,
+        0.00028324127197265625,
+        0.0213165283203125,
+        -0.0014896392822265625,
+        0.00989532470703125,
+        0.01030731201171875,
+        -0.0018825531005859375,
+        -0.0020809173583984375,
+        -0.001678466796875,
+        -0.0083465576171875,
+        0.0024738311767578125,
+        -0.01151275634765625,
+        0.003978729248046875,
+        0.0036640167236328125,
+        -0.002384185791015625,
+    ];
+
+    // Tolerance: F16 arithmetic → allow 1 ULP at F16 resolution (~0.0002 for values ~0.01).
+    let tol = 0.001_f32;
+    let mut failures = 0usize;
+    for (i, (&got, &exp)) in out_vals.iter().zip(reference.iter()).enumerate() {
+        let diff = (got - exp).abs();
+        if diff > tol {
+            println!("MISMATCH out[{i}]: expected={exp:.8}, got={got:.8}, diff={diff:.8}");
+            failures += 1;
+        }
+    }
+    assert_eq!(
+        failures, 0,
+        "paro_rotate_gpu output diverges from Python reference (see /tmp/paro_rotation_kernel_result.txt)"
+    );
+    println!("PASS: paro_rotate_gpu matches Python reference within tolerance={tol}");
+    let _ = vocab;
+}
+
+/// Integration smoke probe — requires the actual model snapshot at the path.
+/// Skipped in CI; run manually with: cargo test -- --ignored integration_qwen3_5_moe_35b
+#[test]
+#[ignore]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+fn integration_qwen3_5_moe_35b() {
+    let Some(model_dir_buf) = qwen36_model_dir() else {
+        println!("SKIP: RMLX_TEST_MODEL_QWEN36 not set");
+        return;
+    };
+    let model_dir = model_dir_buf.as_path();
+    if !model_dir.exists() {
+        println!("SKIP: model dir not found");
+        return;
+    }
+    let model = load_from_path(model_dir).expect("load failed");
+    let ids = vec![1u32, 2, 3, 4, 5, 6, 7, 8];
+    let result = model.forward_seq(&ids, Device::Cpu);
+    match result {
+        Ok(arr) => {
+            let shape = arr.shape();
+            assert_eq!(shape.len(), 3);
+            assert_eq!(shape[0], 1);
+            assert_eq!(shape[1], 1);
+            assert_eq!(shape[2] as usize, model.cfg.vocab_size);
+            println!("forward_seq OK shape={shape:?}");
+        }
+        Err(e) => panic!("forward_seq failed: {e}"),
+    }
+}

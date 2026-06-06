@@ -1,0 +1,266 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rmlx-audio",
+    "crates/rmlx-cli",
+    "crates/rmlx-core",
+    "crates/rmlx-loader",
+    "crates/rmlx-metrics",
+    "crates/rmlx-kv-quant",
+    "crates/rmlx-kv-ssd",
+    "crates/rmlx-mlx",
+    "crates/rmlx-models",
+    "crates/rmlx-quant",
+    "crates/rmlx-runtime",
+    "crates/rmlx-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Pushkinist/rMLX"
+# Internal app workspace — no member crate is published to crates.io. Marking
+# them unpublished lets cargo-deny's `allow-wildcard-paths` exempt the
+# version-less internal path deps, keeping one version literal repo-wide.
+publish = false
+
+[workspace.dependencies]
+# Internal — path-only; cargo-deny's `allow-wildcard-paths = true` permits the
+# omitted version, so `[workspace.package].version` is the single source of truth.
+rmlx-audio  = { path = "crates/rmlx-audio" }
+rmlx-core   = { path = "crates/rmlx-core" }
+rmlx-mlx    = { path = "crates/rmlx-mlx" }
+rmlx-quant  = { path = "crates/rmlx-quant" }
+rmlx-kv-quant = { path = "crates/rmlx-kv-quant" }
+rmlx-kv-ssd  = { path = "crates/rmlx-kv-ssd" }
+rmlx-loader  = { path = "crates/rmlx-loader" }
+rmlx-metrics = { path = "crates/rmlx-metrics" }
+rmlx-models  = { path = "crates/rmlx-models" }
+rmlx-runtime = { path = "crates/rmlx-runtime" }
+rmlx-server = { path = "crates/rmlx-server" }
+
+# Errors
+thiserror = "2"
+anyhow    = "1"
+
+# Logging
+tracing             = "0.1"
+tracing-subscriber  = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+tracing-appender    = "0.2"
+
+# Serde
+serde      = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+toml       = "0.8"
+
+# I/O
+memmap2     = "0.9"
+safetensors = "0.4"
+
+# Image decode + resize for the jina-v4 Qwen2.5-VL image front-end
+# (user-approved 2026-05-19). Scoped to the only two
+# codecs the DoD needs (PNG + JPEG) — both pure-Rust, no system libs, so the
+# single-binary tenet holds. `imageops` resize is in the always-on core (not
+# feature-gated). default-features=false drops the AVIF/EXR/WebP/AV1/GIF
+# transitive tree the full default set would otherwise pull in.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Async runtime + HTTP server
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "io-util", "sync"] }
+# multipart: added for POST /v1/audio/transcriptions and /v1/audio/translations.
+# multer is already axum's implementation; no new transitive dep.
+axum  = { version = "0.8", features = ["json", "macros", "tokio", "multipart"] }
+futures = "0.3"
+# Pinned to the version axum 0.8 already pulls in; no new transitive deps.
+# Required for explicit use of Layer + Service traits in catch_unwind middleware.
+tower = { version = "0.5", default-features = false }
+
+# Templates / tokenizer
+minijinja  = { version = "2", features = ["json", "preserve_order"] }
+tokenizers = "0.20"
+
+# MLX bindings — disabled until tensor compute is needed (S1.4 Gemma4 graph).
+# See FINDINGS.md "MLX bindings" for the build-tooling situation.
+# mlx-rs = "0.25"
+
+# Time
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+
+# Minimal blocking HTTP client — image fetch for /v1/embeddings and chat image
+# path. native-tls uses the macOS Security framework (no openssl dep,
+# single-binary tenet). default-features=false keeps the dep tree lean.
+ureq = { version = "3", default-features = false, features = ["native-tls"] }
+
+# System (flock / POSIX) — used by rmlx-server Metal claim file
+libc = "0.2"
+
+# Allocator — jemalloc reduces fragmentation on macOS for long-running servers
+# with KV-cache churn. macOS-only (target_os = "macos") per CLAUDE.md §1.
+tikv-jemallocator = "0.6"
+
+# Fast non-cryptographic hasher for trusted keyspaces (compile caches, internal
+# dispatch tables). Do NOT use for attacker-controlled keys (HTTP request bodies,
+# JSON extras, model-id lookups from request). Those MUST stay stdlib SipHash.
+rustc-hash = "2"
+
+# xxh3_64 streaming hasher for the multimodal encoder-output cache.
+# Keyspace = trusted (post-preprocess pixel tensor bytes inside the engine,
+# never attacker-controlled HTTP body). Pure-Rust, MIT, default-features off
+# to drop xxh32 + alloc-only path we do not use. Tiny — single header build.
+twox-hash = { version = "2", default-features = false, features = ["xxhash3_64", "alloc"] }
+
+# Mutex/RwLock without poison semantics — eliminates the Cloudflare-class
+# .lock().unwrap() pattern in the HTTP request path.
+# Scoped to rmlx-server and rmlx-cli; internal compute crates use std::sync.
+parking_lot = "0.12"
+
+# Pure-Rust real-valued FFT — used by Gemma4 audio feature extractor.
+# Default features fine (SIMD acceleration on aarch64 is always-on in 6.x).
+rustfft = "6.4"
+
+# Pure-Rust audio decode for WAV + MP3.
+# wav  — RIFF/WAVE container format reader (symphonia-format-riff).
+# pcm  — PCM codec required to decode the audio inside WAV files
+#         (symphonia-codec-pcm; NOT included by wav alone).
+# mp3  — MPEG Layer 3 codec (symphonia-bundle-mp3/mp3).
+# default-features=false drops AIFF/OGG/FLAC/AAC/MKV/ADPCM from the default
+# registry so only the three features we need are compiled in.
+symphonia = { version = "0.5", default-features = false, features = ["wav", "pcm", "mp3"] }
+
+# Testing
+tempfile = "3"
+
+# Micro-benchmark harness — shared by rmlx-quant (`dequant`) and
+# rmlx-models (`prefix_index_bench`). Declared at the workspace level so
+# both crates pin the same major + features (`html_reports`). cargo does
+# not have a separate `[workspace.dev-dependencies]` table; consumers
+# reference this via `criterion.workspace = true` from their own
+# `[dev-dependencies]`.
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[workspace.lints.rust]
+# Memory / safety. unsafe_code = "deny" + scoped #[allow(unsafe_code)] at
+# module level in rmlx-mlx (mlx-c FFI), rmlx-core::mach_mem, and the MSL
+# kernel files. forbid would block legitimate FFI; deny forces an audit.
+unsafe_code                   = "deny"
+unsafe_op_in_unsafe_fn        = "deny"
+unreachable_pub               = "warn"
+missing_debug_implementations = "warn"
+missing_docs                  = "warn"
+trivial_casts                 = "warn"
+trivial_numeric_casts         = "warn"
+unused_extern_crates          = "warn"
+unused_import_braces          = "warn"
+unused_qualifications         = "warn"
+
+[workspace.lints.clippy]
+# Strict baseline — see refactor/clippy-strict for migration history.
+all          = { level = "deny", priority = -1 }
+correctness  = { level = "deny", priority = -1 }
+suspicious   = { level = "deny", priority = -1 }
+perf         = { level = "warn", priority = -1 }
+style        = { level = "warn", priority = -1 }
+pedantic     = { level = "warn", priority = -1 }
+
+# Hard bans — escape via #[allow] at the precise site, justified in code.
+unwrap_used              = "deny"
+expect_used              = "deny"
+panic                    = "deny"
+todo                     = "deny"
+unimplemented            = "deny"
+dbg_macro                = "deny"
+print_stdout             = "deny"
+print_stderr             = "deny"
+indexing_slicing         = "deny"
+clone_on_ref_ptr         = "deny"
+fallible_impl_from       = "deny"
+wildcard_enum_match_arm  = "deny"
+fn_params_excessive_bools = "deny"
+# `disallowed_methods` is configured in clippy.toml to document the banned paths
+# (Result::unwrap, Option::unwrap). The semantic gate is the `unwrap_used =
+# "deny"` entry above — it fires on the same sites and is the authoritative
+# deny. `disallowed_methods` is explicitly overridden to "allow" here to avoid
+# dual-annotation churn: adding it as "deny" would require every existing
+# `#[allow(clippy::unwrap_used)]` site to also add
+# `#[allow(clippy::disallowed_methods)]` (900+ sites across 91 files).
+# The clippy.toml config is retained as an audit record.
+disallowed_methods       = "allow"
+
+# Warn — fix in batches, not blocking.
+unreachable              = "warn"
+redundant_clone          = "warn"
+# clippy 1.96 (2026-05) promotes `suboptimal_flops` from a quiet warn to a
+# pre-commit blocker (the `-D warnings` gate turns warn→error). Its `mul_add`
+# suggestion is a FUSED multiply-add — it changes float rounding vs explicit
+# `a*b + c`, which the rotation-KV / MSL numerics kernels (rotorquant, mel,
+# fused-QK) keep bit-exact against their Python/MLX references on purpose.
+# Allow rather than alter reference parity; revisit per-site if ever a hotspot.
+suboptimal_flops         = "allow"
+needless_collect         = "warn"
+implicit_clone           = "warn"
+needless_pass_by_value   = "warn"
+large_enum_variant       = "warn"
+box_collection           = "warn"
+rc_buffer                = "warn"
+exhaustive_enums         = "warn"
+exhaustive_structs       = "warn"
+cognitive_complexity     = "warn"
+too_many_lines           = "warn"
+
+# Pedantic noise floor — actively disagree.
+needless_return          = "allow"
+module_name_repetitions  = "allow"
+must_use_candidate       = "allow"
+missing_errors_doc       = "allow"
+missing_panics_doc       = "allow"
+similar_names            = "allow"
+cast_precision_loss      = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss           = "allow"
+cast_possible_wrap       = "allow"
+doc_markdown             = "allow"
+unreadable_literal       = "allow"
+many_single_char_names   = "allow"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# line-tables-only: preserves filename/line info for samply/Instruments without
+# full DWARF bloat. strip="debuginfo" keeps the symbol table (readable
+# backtraces) while removing DWARF sections to limit binary size.
+# split-debuginfo="packed" bundles debug info in a .dSYM alongside the binary.
+# Replaces strip=true which removed ALL symbols and broke profiling entirely.
+debug = "line-tables-only"
+strip = "debuginfo"
+split-debuginfo = "packed"
+panic = "unwind"  # J7.3: unwind lets MetalClaim::Drop run on panic (claim file removed). Small binary-size + codegen cost vs "abort" but required for RAII cleanup.
+
+[profile.release-perf]
+inherits = "release"
+# Adds over release: debug-assertions off, overflow-checks off, fully stripped.
+# panic="unwind" is inherited (J7.3: MetalClaim::Drop must run on panic to remove
+# the claim file; "abort" would leave /tmp/rmlx.<port>.claim dangling).
+# codegen-units=1 and lto="fat" are inherited — do not re-add.
+debug-assertions = false
+overflow-checks = false
+strip = "symbols"
+
+[profile.release-debug]
+inherits = "release"
+# Full DWARF + no strip so samply reconstructs inlined frames under LTO.
+# opt-level=3 and lto="fat" are inherited — high optimization preserved.
+# line-tables-only (from release) is overridden to full debug info so that
+# inlined frame names survive the LTO+codegen-units=1 pass.
+debug = true
+strip = "none"
+
+[profile.dev]
+opt-level = 0
+debug = true
+overflow-checks = true

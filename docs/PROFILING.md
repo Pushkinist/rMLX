@@ -1,0 +1,263 @@
+# rMLX Profiling Runbook
+
+Reference: [Rust Perf Book, Chapter 5 — Profiling](https://nnethercote.github.io/perf-book/profiling.html)
+
+## Long-term perf trends
+
+Per-bench TPS / TTFT / RSS land in `metrics/runs.db` (see `docs/METRICS_DB.md`). Time-series queries:
+- `rmlx metrics history --backend rmlx --namespace mlx-community --model gemma-4-e2b-it-mxfp8 --weight-quant mxfp8 --kv-quant k8v8 --metric decode_tps_warm` — every observation for one cell.
+- `rmlx metrics deltas --since-sha <git-sha> --threshold-pct 5` — what regressed since a commit.
+- `rmlx metrics rank --metric decode_tps_warm --limit 20` — top-20 champions.
+
+## Prerequisites (already shipped)
+
+`Cargo.toml [profile.release]` has:
+- `debug = "line-tables-only"` — filename + line info for samply/Instruments, no full DWARF.
+- `strip = "debuginfo"` — keeps the symbol table (readable backtraces), removes DWARF.
+- `split-debuginfo = "packed"` — bundles debug info in `.dSYM` alongside the binary.
+
+`.cargo/config.toml` has:
+- `force-frame-pointers=yes` — keeps x29 non-clobbered for stack-walking (samply, Instruments).
+
+These together mean `cargo build --release` already produces samply-readable binaries.
+
+## Tool matrix (Apple Silicon / macOS aarch64)
+
+| Tool | macOS aarch64 | Notes |
+|------|--------------|-------|
+| **samply** | YES — recommended | Cross-platform sampling profiler. Outputs Firefox Profiler JSON. |
+| **Instruments / xctrace** | YES — recommended | Native Apple profiler. Time Profiler, Metal System Trace, Allocations. |
+| **cargo flamegraph** | YES (needs sudo for DTrace) | Uses DTrace under the hood on macOS. Lower ergonomics than samply. |
+| **dhat-rs** | YES — gated feature | Heap allocation profiling. Gate: `--features dhat-heap`. See below. |
+| **counts crate** | YES | Ad-hoc cardinality counting via `eprintln!`. No binary dep. |
+| **Intel VTune** | YES (x86 emulation only) | Not recommended on aarch64. |
+| **perf + Hotspot** | NO — Linux only | Use Instruments Time Profiler or samply instead. |
+| **Cachegrind / Callgrind** | NO — Valgrind ARM64-darwin broken | Use Instruments Counters template (PMU events). |
+| **heaptrack / bytehound** | NO — Linux only | Use dhat-rs or Instruments Allocations instead. |
+| **Coz (causal profiling)** | NO — macOS support poor | Skip. |
+| **AMD uProf** | NO — macOS not supported | Skip. |
+
+## 1. CPU sampling with samply (recommended)
+
+Install:
+```bash
+cargo install samply
+```
+
+Profile a single `rmlx baseline` run:
+```bash
+samply record --rate 4000 -- \
+  ./target/release/rmlx baseline \
+    --model $RMLX_O_MODELS_ROOT/mlx-community__gemma-4-e2b-it-mxfp8 \
+    --kv-quant k8v8
+```
+
+`samply` opens the Firefox Profiler in your browser automatically. Requires no `sudo`.
+
+`--rate 4000` = 4000 Hz sampling (default is 1000 Hz; higher = more resolution, more overhead).
+
+### Make target
+
+```bash
+make profile-samply MODEL=/path/to/snapshot
+```
+
+## 2. Instruments / xctrace (Apple native)
+
+Time Profiler (CPU sampling, integrates with tracing spans via os_signpost):
+```bash
+xcrun xctrace record \
+  --template 'Time Profiler' \
+  --launch -- ./target/release/rmlx baseline \
+    --model $RMLX_O_MODELS_ROOT/mlx-community__gemma-4-e2b-it-mxfp8 \
+    --kv-quant k8v8
+```
+
+Output: `.trace` package. Open with Instruments.app.
+
+Metal System Trace (GPU kernel timings — requires `RMLX_METAL_CAPTURE` path, see §5):
+```bash
+xcrun xctrace record \
+  --template 'Metal System Trace' \
+  --launch -- ./target/release/rmlx baseline \
+    --model /path/to/snapshot --kv-quant k8v8
+```
+
+### Make target
+
+```bash
+make profile-instruments MODEL=/path/to/snapshot
+```
+
+## 3. cargo-flamegraph (DTrace-based, needs sudo)
+
+Install:
+```bash
+cargo install flamegraph
+```
+
+Run:
+```bash
+sudo cargo flamegraph --bin rmlx -- baseline \
+  --model $RMLX_O_MODELS_ROOT/mlx-community__gemma-4-e2b-it-mxfp8 \
+  --kv-quant k8v8
+```
+
+Output: `flamegraph.svg` in the current directory.
+
+Note: DTrace on macOS requires SIP to be partially disabled for kernel stacks. User-space
+stacks work without SIP changes when frame pointers are preserved (already configured).
+
+## 4. Heap profiling with dhat-rs (gated feature)
+
+`rmlx-cli` has a `dhat-heap` feature that instruments the global allocator to collect
+DHAT-format heap profiles. It is OFF by default and must be explicitly enabled.
+
+Build and run:
+```bash
+cargo build --features rmlx-cli/dhat-heap --bin rmlx
+./target/debug/rmlx baseline \
+  --model $RMLX_O_MODELS_ROOT/mlx-community__gemma-4-e2b-it-mxfp8 \
+  --kv-quant k8v8
+```
+
+On exit, `dhat-heap.json` is written to the current directory.
+View it at: https://nnethercote.github.io/dh_view/dh_view.html
+
+Note: run in **debug** mode (or `opt-level=1`) — DHAT's overhead is significant at full opt.
+Note: the global allocator is replaced when this feature is active, so jemalloc is disabled.
+
+### What DHAT shows
+
+- Which call sites allocated the most heap bytes.
+- Which allocations are short-lived (high alloc + dealloc rate = pressure hot spots).
+- Useful for auditing `rmlx-loader` mmap vs full-read behaviour and KV-cache growth.
+
+## 5. Metal GPU capture (deferred — symbol confirmed in bindings)
+
+`mlx_metal_start_capture` / `mlx_metal_stop_capture` exist in the bound mlx-c library
+(confirmed in `target/debug/build/rmlx-mlx-*/out/bindings.rs` lines 2864-2868).
+
+Safe wrappers are not yet exposed in `rmlx-mlx::lib`. When needed (Stage 1.4+):
+
+1. Add `pub fn metal_start_capture(path: &Path) -> Result<()>` in `rmlx-mlx/src/lib.rs`
+   calling `sys::mlx_metal_start_capture(c_path_ptr)`.
+2. Gate on `RMLX_METAL_CAPTURE=/path/to.gputrace` env var checked at engine boot
+   (`engine.rs` or `baseline.rs`).
+3. Open `.gputrace` in Instruments → Metal System Trace.
+
+## 6. Ad-hoc cardinality counting with the `counts` crate
+
+The [counts crate](https://crates.io/crates/counts) is the perf-book's "ad-hoc profiling"
+recommendation: sprinkle `eprintln!` on a hot branch, run, pipe to `counts`, get a
+frequency table.
+
+No code change needed — add `counts` as a dev-dependency when needed:
+```toml
+[dev-dependencies]
+counts = "0.2"
+```
+
+Example use: counting how often mxfp8 vs bf16 dequant paths are taken in `rmlx-quant`:
+```rust
+eprintln!("dequant_path={}", if is_mxfp8 { "mxfp8" } else { "bf16" });
+```
+```bash
+./target/release/rmlx baseline ... 2>&1 | counts
+```
+
+## 7. RUST_LOG tuning for profiling sessions
+
+The default `RUST_LOG=debug,rmlx=trace` setting writes every span enter/exit for
+`rmlx_models` to the JSONL log. With `#[instrument]` on generate_greedy boundaries,
+this produces ~42 span events per decode step at trace level — tolerable for short runs.
+
+For long runs or when reducing log I/O is important:
+```bash
+RUST_LOG=debug,rmlx_models=debug ./target/release/rmlx baseline ...
+```
+
+To enable per-model trace for a specific module only:
+```bash
+RUST_LOG=debug,rmlx_models::gemma4=trace ./target/release/rmlx baseline ...
+```
+
+## 8. Symbol demangling
+
+If a profiler shows mangled `_ZN` or `_R` prefixed names:
+```bash
+cargo install rustfilt
+some-profiler-output | rustfilt
+```
+
+Or build with v0 mangling (more demangler-compatible):
+```bash
+RUSTFLAGS="-C symbol-mangling-version=v0" cargo build --release
+```
+(Not set by default — adds it only when needed for a specific profiling session.)
+
+## 9. Process-memory counters: RSS vs phys_footprint vs Metal peak_alloc (J4)
+
+`rmlx_core::mach_mem::read_proc_mem()` exposes six counters from two `task_info` calls.
+They are related but not equal; understanding the difference matters for OOM tuning:
+
+| Counter | Source | What it counts | When to use |
+|---------|--------|----------------|-------------|
+| `rss_bytes` | `MACH_TASK_BASIC_INFO.resident_size` | Pages physically in RAM right now — what `ps -o rss` shows. | Quick sanity check; matches operator intuition. |
+| `virtual_bytes` | `MACH_TASK_BASIC_INFO.virtual_size` | Total VM address space committed. | Rarely actionable on Apple Silicon (48-bit VA space). |
+| `phys_footprint_bytes` | `TASK_VM_INFO.phys_footprint` | **Apple's pressure metric** — anonymous + file-backed resident + compressed pages counted as "yours". What Activity Monitor shows; what the kernel OOM killer uses. | Use this for pressure decisions (J3 OOM guard). |
+| `internal_bytes` | `TASK_VM_INFO.internal` | Anonymous heap pages — jemalloc arenas, KV-cache buffers, Rust Vec allocations. | Track heap growth independently of weights. |
+| `compressed_bytes` | `TASK_VM_INFO.compressed` | Pages handed to the macOS memory compressor ("soft swap" — still counts against `phys_footprint`). | Non-zero means the system is already under pressure. |
+| `external_bytes` | `TASK_VM_INFO.external` | File-backed pages — in rMLX this is primarily mmap'd safetensors weight files. | `external_bytes ≈ loaded-weight footprint`; grows with model size, shrinks on unload. |
+
+**Metal `peak_alloc_mb` (F3, not yet built)** is a separate counter from the Metal Performance
+HUD / `MTLDevice.currentAllocatedSize`.  It counts GPU-private VRAM allocations (weight
+tensors, KV-cache MTLBuffers) and is disjoint from the `task_info` counters above — they
+measure CPU/UMA host memory, not GPU-private usage.  On Unified Memory Macs the boundaries
+blur (all memory is the same physical chips) but the accounting domains are distinct.
+
+**Typical relationship**: `rss_bytes ≤ phys_footprint_bytes ≤ rss_bytes + compressed_bytes`.
+`external_bytes` overlaps with `rss_bytes` (mmap'd weight pages that are currently resident).
+When weights are evicted by the compressor, `external_bytes` drops and `compressed_bytes` rises.
+
+## 10. Prefill-chunk size knob (J9)
+
+Cold prefill is chunked per-arch by `rmlx_models::prefill_chunk::prefill_chunk_for(arch)`
+(all 7 archs route through it). The chunk size trades per-chunk lazy-graph
+overhead against MLX scheduler pipelining and the GatedDeltaNet `ts<256`
+fast-path (Qwen3.5-MoE). Tuned per-arch from follow-up bench data —
+**do not change defaults without an executor-bench sweep** (CLAUDE.md
+§"Executor-bench discipline").
+
+Per-arch defaults: `qwen3=256`, `qwen3_5_moe=64`, `gemma3=256`,
+`gemma4=512`, `qwen2=256`, `laguna=256`.
+
+Override at runtime (resolution order: **per-arch env > global env >
+arch default > 64 fallback**):
+
+- `RMLX_PREFILL_CHUNK=<n>` — global, all archs.
+- `RMLX_PREFILL_CHUNK_<ARCH>=<n>` — per-arch, ARCH upper-cased, e.g.
+  `RMLX_PREFILL_CHUNK_QWEN3_5_MOE=256`.
+
+Notes:
+- `qwen3_5_moe=64` is deliberately low: a larger chunk pushes
+  GatedDeltaNet past the `ts<256` fused-kernel fast-path into the slow
+  MLX-graph recurrence. The 256 variant is reachable via
+  `RMLX_PREFILL_CHUNK_QWEN3_5_MOE=256` for users who want to A/B it.
+- `gemma4=512` is bench-justified (−30% cold TTFT at 8K vs 256).
+- The 64-is-best-for-qwen3_5_moe verdict was last measured 2026-05-12;
+  re-confirm in the next bench sweep that touches the MoE path (J9.5,
+  backlog).
+
+## Quick reference
+
+| Goal | Command |
+|------|---------|
+| CPU profile (recommended) | `make profile-samply MODEL=...` |
+| Native Apple profiler | `make profile-instruments MODEL=...` |
+| Flamegraph (needs sudo) | `sudo cargo flamegraph --bin rmlx -- baseline ...` |
+| Heap profile | `cargo build --features rmlx-cli/dhat-heap && ./target/debug/rmlx baseline ...` |
+| GPU capture | Deferred — see §5 above |
+| Ad-hoc branch counts | `eprintln!` + `counts` crate |
+| Process memory snapshot | `rmlx_core::mach_mem::read_proc_mem()` — see §9 |
+| Prefill-chunk override | `RMLX_PREFILL_CHUNK_<ARCH>=<n>` — see §10 |

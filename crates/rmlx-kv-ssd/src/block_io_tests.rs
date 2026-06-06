@@ -1,0 +1,2545 @@
+//! Rotor K-side tests use `..` wildcard in match arms deliberately
+//! (KvStorage exhaustive coverage is checked in the non-test `block_io.rs`).
+#![allow(clippy::wildcard_enum_match_arm)]
+
+use std::sync::Mutex;
+
+use super::*;
+use rmlx_mlx::Device;
+
+const MODEL_ID: &str = "Qwen3ForCausalLM/test-snapshot";
+
+/// Process-global lock for tests that mutate `RMLX_ROTOR_QJL` in the env.
+/// Held during the entire test body (set → build → write → read → assert → clear).
+/// Same pattern as `serve_tests.rs::ENV_LOCK`.
+static ROTOR_QJL_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+fn tmp_path(name: &str) -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!(
+        "rmlx_blockio_{name}_{}.safetensors",
+        std::process::id()
+    ));
+    p
+}
+
+// Deterministic LCG f32 data in [-1, 1].
+fn lcg(n: usize, seed: u64) -> Vec<f32> {
+    let mut s = seed;
+    (0..n)
+        .map(|_| {
+            s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((s >> 33) as f32 / u32::MAX as f32).mul_add(2.0, -1.0)
+        })
+        .collect()
+}
+
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn arr(data: &[f32], shape: &[i32]) -> Array {
+    // SAFETY: data is a &[f32] with known length; byte reinterpret valid for f32
+    // (alignment ≥ 1, size = 4); total byte count = data.len() * 4 fits in isize.
+    let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 4) };
+    Array::from_bytes(bytes, shape, Dtype::F32).unwrap()
+}
+
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn to_vec(a: &Array) -> Vec<f32> {
+    a.eval().unwrap();
+    bytes_to_f32(&a.to_bytes().unwrap())
+}
+
+// Build a single-layer storage of `quant` populated with `[1,kv_h,S,D]` K/V
+// by quantizing directly through the CPU quant primitives, then dequantize K
+// back to f32 for tolerance comparison.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "wildcard arm is the correct fallthrough for unsupported arch/quant variants; exhaustive expansion would require updating on every new variant"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "single match over the closed KvQuant enum used by the SSD round-trip suite; one arm per variant, each is small and self-contained"
+)]
+fn build_storage(
+    quant: KvQuant,
+    shape: &[i32],
+    seed: u64,
+    device: Device,
+) -> (KvStorage, Vec<f32>) {
+    use rmlx_kv_quant::planarquant::planar_quantize;
+    use rmlx_kv_quant::q8::q8_quantize;
+    use rmlx_kv_quant::turboquant::{turbo_quantize_v, GROUP_SIZE};
+
+    let n: usize = shape.iter().map(|&x| x as usize).product();
+    let k_data = lcg(n, seed);
+    let v_data = lcg(n, seed ^ 0xABCD);
+
+    let storage = match quant {
+        KvQuant::K8V4 => {
+            let (kc, ks) = q8_quantize(&k_data);
+            let vblk = turbo_quantize_v(&v_data, 4, shape).unwrap();
+            KvStorage::K8V4 {
+                k: Some(QuantK::from_cpu_parts(kc, ks, shape.to_vec())),
+                v: Some(QuantV::from_cpu_blocks(vec![vblk], shape.to_vec(), 4)),
+                max_seq: 4096,
+            }
+        }
+        KvQuant::K8V8 => {
+            let (kc, ks) = q8_quantize(&k_data);
+            let (vc, vs) = q8_quantize(&v_data);
+            KvStorage::K8V8 {
+                k: Some(QuantK::from_cpu_parts(kc, ks, shape.to_vec())),
+                v: Some(QuantK::from_cpu_parts(vc, vs, shape.to_vec())),
+                max_seq: 4096,
+            }
+        }
+        KvQuant::Planar => {
+            let (kc, ks) = q8_quantize(&k_data);
+            let vblk = planar_quantize(&v_data, GROUP_SIZE, 4, shape).unwrap();
+            KvStorage::Planar {
+                k: Some(QuantK::from_cpu_parts(kc, ks, shape.to_vec())),
+                v: Some(QuantPlanarV::from_cpu_blocks(vec![vblk], shape.to_vec(), 4)),
+                max_seq: 4096,
+                bits: 4,
+            }
+        }
+        // Planar3 — same layout as Planar but 3-bit V codebook.
+        KvQuant::Planar3 => {
+            let (kc, ks) = q8_quantize(&k_data);
+            let vblk = planar_quantize(&v_data, GROUP_SIZE, 3, shape).unwrap();
+            KvStorage::Planar {
+                k: Some(QuantK::from_cpu_parts(kc, ks, shape.to_vec())),
+                v: Some(QuantPlanarV::from_cpu_blocks(vec![vblk], shape.to_vec(), 3)),
+                max_seq: 4096,
+                bits: 3,
+            }
+        }
+        KvQuant::Mixed {
+            k_bits,
+            v_bits,
+            k_group_size,
+            v_group_size,
+        } => {
+            let mut state = MixedKvState::new(
+                i32::from(k_bits),
+                i32::from(v_bits),
+                i32::from(k_group_size),
+                i32::from(v_group_size),
+            );
+            let k = arr(&k_data, shape);
+            let v = arr(&v_data, shape);
+            state.bulk_init_from_fp16(&k, &v, device).unwrap();
+            KvStorage::Mixed {
+                state,
+                max_seq: 4096,
+            }
+        }
+        KvQuant::RotKTq4V => {
+            // K: build via MixedKvState K-only bulk init (rotate + affine-quantize).
+            // V: build via QuantV CPU path (TurboQuant scalar).
+            use rmlx_kv_quant::turboquant::turbo_quantize_v;
+            let mut k_state = MixedKvState::new_k_only_rotated();
+            let k_arr = arr(&k_data, shape);
+            let (k_codes, k_scales, k_biases) =
+                k_state.bulk_init_k_from_fp16(&k_arr, device).unwrap();
+            k_state.keys = Some(MixedTuple {
+                codes: k_codes,
+                scales: k_scales,
+                biases: k_biases,
+            });
+            k_state.offset = shape[2];
+
+            let vblk = turbo_quantize_v(&v_data, 4, shape).unwrap();
+            let qv = QuantV::from_cpu_blocks(vec![vblk], shape.to_vec(), 4);
+            KvStorage::RotKTq4V {
+                k_state,
+                v: Some(qv),
+                max_seq: 4096,
+            }
+        }
+        // TurboSym3 — symmetric WHT-3 K + turbo3 V (CPU-only build).
+        KvQuant::TurboSym3 => {
+            use rmlx_kv_quant::storage::QuantKTurbo3;
+            let kblk = turbo_quantize_v(&k_data, 3, shape).unwrap();
+            let vblk = turbo_quantize_v(&v_data, 3, shape).unwrap();
+            KvStorage::TurboSym3 {
+                k: Some(QuantKTurbo3::from_cpu_blocks(
+                    vec![kblk],
+                    shape.to_vec(),
+                    3,
+                    4096,
+                )),
+                v: Some(QuantV::from_cpu_blocks(vec![vblk], shape.to_vec(), 3)),
+                max_seq: 4096,
+            }
+        }
+        // TurboSym4 — symmetric WHT-4 K + tq4 V (CPU-only build).
+        KvQuant::TurboSym4 => {
+            use rmlx_kv_quant::turboquant::turbo_quantize_v;
+            let kblk = turbo_quantize_v(&k_data, 4, shape).unwrap();
+            let vblk = turbo_quantize_v(&v_data, 4, shape).unwrap();
+            KvStorage::TurboSym4 {
+                k: Some(QuantKTurbo4::from_cpu_blocks(vec![kblk], shape.to_vec(), 4)),
+                v: Some(QuantV::from_cpu_blocks(vec![vblk], shape.to_vec(), 4)),
+                max_seq: 4096,
+            }
+        }
+        // PlanarK — K-axis PlanarQuant 4-bit. V is bf16 off-storage.
+        KvQuant::PlanarK => {
+            use rmlx_kv_quant::storage::QuantPlanarK;
+            let kblk = planar_quantize(&k_data, GROUP_SIZE, 4, shape).unwrap();
+            KvStorage::PlanarK {
+                k: Some(QuantPlanarK::from_cpu_blocks(vec![kblk], shape.to_vec())),
+                max_seq: 4096,
+            }
+        }
+        // K8VTurbo2 — K is QuantK (q8_0), V is QuantV bits=2.
+        KvQuant::K8VTurbo2 => {
+            let (kc, ks) = q8_quantize(&k_data);
+            let vblk = turbo_quantize_v(&v_data, 2, shape).unwrap();
+            KvStorage::K8VTurbo2 {
+                k: Some(QuantK::from_cpu_parts(kc, ks, shape.to_vec())),
+                v: Some(QuantV::from_cpu_blocks(vec![vblk], shape.to_vec(), 2)),
+                max_seq: 4096,
+            }
+        }
+        // Iso3 — K is QuantK (q8_0); V is QuantIsoV3 (CPU path).
+        KvQuant::Iso3 => {
+            use rmlx_kv_quant::isoquant::iso_encode_fast;
+            use rmlx_kv_quant::storage::{IsoBlocks, QuantIsoV3};
+            let (kc, ks) = q8_quantize(&k_data);
+            let head_dim = shape[3] as usize;
+            let n_tokens_total = (shape[0] as usize) * (shape[1] as usize) * (shape[2] as usize);
+            let (codes_u32, scales, quaternions, norms) = iso_encode_fast(
+                &v_data,
+                head_dim,
+                rmlx_kv_quant::storage::ISO3_GROUP_SIZE,
+                rmlx_kv_quant::storage::ISO3_BITS,
+            )
+            .unwrap();
+            let blk = IsoBlocks {
+                codes: codes_u32,
+                scales,
+                quaternions,
+                norms,
+                n_tokens: n_tokens_total,
+            };
+            let mut qv = QuantIsoV3::from_cpu_blocks(vec![blk], shape.to_vec());
+            // max_seq should reflect the provisioned window, not just S.
+            qv.max_seq = 4096;
+            KvStorage::IsoV3 {
+                k: Some(QuantK::from_cpu_parts(kc, ks, shape.to_vec())),
+                v: Some(qv),
+                max_seq: 4096,
+            }
+        }
+        // Iso4 — K is QuantK (q8_0); V is QuantIsoV4 (CPU path,
+        // 4-bit codebook + dense 8-vals-per-u32 pack).
+        KvQuant::Iso4 => {
+            use rmlx_kv_quant::isoquant::iso_encode_fast;
+            use rmlx_kv_quant::storage::{IsoBlocks, QuantIsoV4};
+            let (kc, ks) = q8_quantize(&k_data);
+            let head_dim = shape[3] as usize;
+            let n_tokens_total = (shape[0] as usize) * (shape[1] as usize) * (shape[2] as usize);
+            let (codes_u32, scales, quaternions, norms) = iso_encode_fast(
+                &v_data,
+                head_dim,
+                rmlx_kv_quant::storage::ISO4_GROUP_SIZE,
+                rmlx_kv_quant::storage::ISO4_BITS,
+            )
+            .unwrap();
+            let blk = IsoBlocks {
+                codes: codes_u32,
+                scales,
+                quaternions,
+                norms,
+                n_tokens: n_tokens_total,
+            };
+            let mut qv = QuantIsoV4::from_cpu_blocks(vec![blk], shape.to_vec());
+            qv.max_seq = 4096;
+            KvStorage::IsoV4 {
+                k: Some(QuantK::from_cpu_parts(kc, ks, shape.to_vec())),
+                v: Some(qv),
+                max_seq: 4096,
+            }
+        }
+        // Rotor3 — K is QuantK (q8_0); V is QuantRotorV3 (CPU path).
+        KvQuant::Rotor3 => {
+            use rmlx_kv_quant::clifford::make_rotor_table;
+            use rmlx_kv_quant::rotorquant::{n_groups_for, rotor3_encode};
+            use rmlx_kv_quant::storage::{QuantRotorV3, RotorBlocks};
+            let (kc, ks) = q8_quantize(&k_data);
+            let head_dim = shape[3] as usize;
+            let n_tokens_total = (shape[0] as usize) * (shape[1] as usize) * (shape[2] as usize);
+            let n_groups = n_groups_for(head_dim);
+            // Use layer_idx=0 / head_idx=0 — the SSD writer persists the
+            // rotor table so cross-restart identity does not depend on the
+            // seed inputs at hydrate time.
+            let rotors = make_rotor_table(0, 0, n_groups);
+            let (codes, scales, norms) = rotor3_encode(&v_data, &rotors, head_dim).unwrap();
+            let blk = RotorBlocks {
+                codes,
+                scales,
+                norms,
+                n_tokens: n_tokens_total,
+            };
+            let mut qv = QuantRotorV3::from_cpu_blocks(rotors, vec![blk], shape.to_vec(), 0);
+            qv.max_seq = 4096;
+            KvStorage::RotorV3 {
+                k: Some(QuantK::from_cpu_parts(kc, ks, shape.to_vec())),
+                v: Some(qv),
+                max_seq: 4096,
+            }
+        }
+        // Rotor4 — K is QuantK (q8_0); V is QuantRotorV4 (CPU path).
+        KvQuant::Rotor4 => {
+            use rmlx_kv_quant::clifford::make_rotor_table;
+            use rmlx_kv_quant::rotorquant::{n_groups_for, rotor4_encode};
+            use rmlx_kv_quant::storage::{QuantRotorV4, RotorBlocks};
+            let (kc, ks) = q8_quantize(&k_data);
+            let head_dim = shape[3] as usize;
+            let n_tokens_total = (shape[0] as usize) * (shape[1] as usize) * (shape[2] as usize);
+            let n_groups = n_groups_for(head_dim);
+            // Use layer_idx=0 / head_idx=0 — the SSD writer persists the
+            // rotor table so cross-restart identity does not depend on the
+            // seed inputs at hydrate time.
+            let rotors = make_rotor_table(0, 0, n_groups);
+            let (codes, scales, norms) = rotor4_encode(&v_data, &rotors, head_dim).unwrap();
+            let blk = RotorBlocks {
+                codes,
+                scales,
+                norms,
+                n_tokens: n_tokens_total,
+            };
+            let mut qv = QuantRotorV4::from_cpu_blocks(rotors, vec![blk], shape.to_vec(), 0);
+            qv.max_seq = 4096;
+            KvStorage::RotorV4 {
+                k: Some(QuantK::from_cpu_parts(kc, ks, shape.to_vec())),
+                v: Some(qv),
+                max_seq: 4096,
+            }
+        }
+        // K8VTurbo3Tcq — K is QuantK (q8_0), V is QuantV bits=3. Build with
+        // the Viterbi encoder so the test round-trips the same codes the
+        // production path would write. `use_tcq=true` is set via
+        // `from_cpu_blocks_tcq` so any post-hydrate decode-step encode would
+        // continue using Viterbi.
+        KvQuant::K8VTurbo3Tcq => {
+            use rmlx_kv_quant::tcq::tcq_quantize_v3;
+            let (kc, ks) = q8_quantize(&k_data);
+            let vblk = tcq_quantize_v3(&v_data, shape).unwrap();
+            KvStorage::K8VTurbo3Tcq {
+                k: Some(QuantK::from_cpu_parts(kc, ks, shape.to_vec())),
+                v: Some(QuantV::from_cpu_blocks_tcq(vec![vblk], shape.to_vec(), 3)),
+                max_seq: 4096,
+            }
+        }
+        // K8VTurbo2Tcq — K is QuantK (q8_0), V is QuantV bits=2. Build with
+        // the Viterbi encoder so the test round-trips the same codes the
+        // production path would write. `use_tcq=true` is set via
+        // `from_cpu_blocks_tcq` so any post-hydrate decode-step encode would
+        // continue using Viterbi.
+        KvQuant::K8VTurbo2Tcq => {
+            use rmlx_kv_quant::tcq::tcq_quantize_v2;
+            let (kc, ks) = q8_quantize(&k_data);
+            let vblk = tcq_quantize_v2(&v_data, shape).unwrap();
+            KvStorage::K8VTurbo2Tcq {
+                k: Some(QuantK::from_cpu_parts(kc, ks, shape.to_vec())),
+                v: Some(QuantV::from_cpu_blocks_tcq(vec![vblk], shape.to_vec(), 2)),
+                max_seq: 4096,
+            }
+        }
+        // Iso3Sym / Iso4Sym / IsoKOnly3 / IsoKOnly4 — K-side iso codec built
+        // via the axis-agnostic isoquant CPU encoder.
+        KvQuant::Iso3Sym => {
+            use rmlx_kv_quant::isoquant::iso_encode_fast;
+            use rmlx_kv_quant::storage::{
+                IsoBlocks, QuantIsoK3, QuantIsoV3, ISO3_BITS, ISO3_GROUP_SIZE,
+            };
+            let head_dim = shape[3] as usize;
+            let n_tokens_total = (shape[0] as usize) * (shape[1] as usize) * (shape[2] as usize);
+            // K-side iso3 encode.
+            let (k_codes, k_scales, k_quats, k_norms) =
+                iso_encode_fast(&k_data, head_dim, ISO3_GROUP_SIZE, ISO3_BITS).unwrap();
+            let k_blk = IsoBlocks {
+                codes: k_codes,
+                scales: k_scales,
+                quaternions: k_quats,
+                norms: k_norms,
+                n_tokens: n_tokens_total,
+            };
+            let qk = QuantIsoK3::from_cpu_blocks(vec![k_blk], shape.to_vec(), 4096);
+            // V-side iso3 encode.
+            let (v_codes, v_scales, v_quats, v_norms) =
+                iso_encode_fast(&v_data, head_dim, ISO3_GROUP_SIZE, ISO3_BITS).unwrap();
+            let v_blk = IsoBlocks {
+                codes: v_codes,
+                scales: v_scales,
+                quaternions: v_quats,
+                norms: v_norms,
+                n_tokens: n_tokens_total,
+            };
+            let mut qv = QuantIsoV3::from_cpu_blocks(vec![v_blk], shape.to_vec());
+            qv.max_seq = 4096;
+            KvStorage::IsoSym3 {
+                k: Some(qk),
+                v: Some(qv),
+                max_seq: 4096,
+            }
+        }
+        KvQuant::Iso4Sym => {
+            use rmlx_kv_quant::isoquant::iso_encode_fast;
+            use rmlx_kv_quant::storage::{
+                IsoBlocks, QuantIsoK4, QuantIsoV4, ISO4_BITS, ISO4_GROUP_SIZE,
+            };
+            let head_dim = shape[3] as usize;
+            let n_tokens_total = (shape[0] as usize) * (shape[1] as usize) * (shape[2] as usize);
+            let (k_codes, k_scales, k_quats, k_norms) =
+                iso_encode_fast(&k_data, head_dim, ISO4_GROUP_SIZE, ISO4_BITS).unwrap();
+            let k_blk = IsoBlocks {
+                codes: k_codes,
+                scales: k_scales,
+                quaternions: k_quats,
+                norms: k_norms,
+                n_tokens: n_tokens_total,
+            };
+            let qk = QuantIsoK4::from_cpu_blocks(vec![k_blk], shape.to_vec(), 4096);
+            let (v_codes, v_scales, v_quats, v_norms) =
+                iso_encode_fast(&v_data, head_dim, ISO4_GROUP_SIZE, ISO4_BITS).unwrap();
+            let v_blk = IsoBlocks {
+                codes: v_codes,
+                scales: v_scales,
+                quaternions: v_quats,
+                norms: v_norms,
+                n_tokens: n_tokens_total,
+            };
+            let mut qv = QuantIsoV4::from_cpu_blocks(vec![v_blk], shape.to_vec());
+            qv.max_seq = 4096;
+            KvStorage::IsoSym4 {
+                k: Some(qk),
+                v: Some(qv),
+                max_seq: 4096,
+            }
+        }
+        KvQuant::IsoKOnly3 => {
+            use rmlx_kv_quant::isoquant::iso_encode_fast;
+            use rmlx_kv_quant::storage::{IsoBlocks, QuantIsoK3, ISO3_BITS, ISO3_GROUP_SIZE};
+            let head_dim = shape[3] as usize;
+            let n_tokens_total = (shape[0] as usize) * (shape[1] as usize) * (shape[2] as usize);
+            let (k_codes, k_scales, k_quats, k_norms) =
+                iso_encode_fast(&k_data, head_dim, ISO3_GROUP_SIZE, ISO3_BITS).unwrap();
+            let k_blk = IsoBlocks {
+                codes: k_codes,
+                scales: k_scales,
+                quaternions: k_quats,
+                norms: k_norms,
+                n_tokens: n_tokens_total,
+            };
+            let qk = QuantIsoK3::from_cpu_blocks(vec![k_blk], shape.to_vec(), 4096);
+            KvStorage::IsoKOnly3 {
+                k: Some(qk),
+                max_seq: 4096,
+            }
+        }
+        KvQuant::IsoKOnly4 => {
+            use rmlx_kv_quant::isoquant::iso_encode_fast;
+            use rmlx_kv_quant::storage::{IsoBlocks, QuantIsoK4, ISO4_BITS, ISO4_GROUP_SIZE};
+            let head_dim = shape[3] as usize;
+            let n_tokens_total = (shape[0] as usize) * (shape[1] as usize) * (shape[2] as usize);
+            let (k_codes, k_scales, k_quats, k_norms) =
+                iso_encode_fast(&k_data, head_dim, ISO4_GROUP_SIZE, ISO4_BITS).unwrap();
+            let k_blk = IsoBlocks {
+                codes: k_codes,
+                scales: k_scales,
+                quaternions: k_quats,
+                norms: k_norms,
+                n_tokens: n_tokens_total,
+            };
+            let qk = QuantIsoK4::from_cpu_blocks(vec![k_blk], shape.to_vec(), 4096);
+            KvStorage::IsoKOnly4 {
+                k: Some(qk),
+                max_seq: 4096,
+            }
+        }
+        // Rotor K-side variants. K-side uses QuantRotorK3/K4 via `append` so
+        // the QJL sideband (when active per env) is captured.
+        KvQuant::Rotor3Sym => {
+            use rmlx_kv_quant::storage::{QuantRotorK3, QuantRotorV3};
+            let mut qk = QuantRotorK3::new(vec![shape[0], shape[1], 0, shape[3]], 4096, 0);
+            qk.append(&k_data, shape).unwrap();
+            let mut qv = QuantRotorV3::new(vec![shape[0], shape[1], 0, shape[3]], 4096, 0);
+            qv.append(&v_data, shape).unwrap();
+            KvStorage::RotorSym3 {
+                k: Some(qk),
+                v: Some(qv),
+                max_seq: 4096,
+            }
+        }
+        KvQuant::Rotor4Sym => {
+            use rmlx_kv_quant::storage::{QuantRotorK4, QuantRotorV4};
+            let mut qk = QuantRotorK4::new(vec![shape[0], shape[1], 0, shape[3]], 4096, 0);
+            qk.append(&k_data, shape).unwrap();
+            let mut qv = QuantRotorV4::new(vec![shape[0], shape[1], 0, shape[3]], 4096, 0);
+            qv.append(&v_data, shape).unwrap();
+            KvStorage::RotorSym4 {
+                k: Some(qk),
+                v: Some(qv),
+                max_seq: 4096,
+            }
+        }
+        KvQuant::RotorKOnly3 => {
+            use rmlx_kv_quant::storage::QuantRotorK3;
+            let mut qk = QuantRotorK3::new(vec![shape[0], shape[1], 0, shape[3]], 4096, 0);
+            qk.append(&k_data, shape).unwrap();
+            KvStorage::RotorKOnly3 {
+                k: Some(qk),
+                max_seq: 4096,
+            }
+        }
+        KvQuant::RotorKOnly4 => {
+            use rmlx_kv_quant::storage::QuantRotorK4;
+            let mut qk = QuantRotorK4::new(vec![shape[0], shape[1], 0, shape[3]], 4096, 0);
+            qk.append(&k_data, shape).unwrap();
+            KvStorage::RotorKOnly4 {
+                k: Some(qk),
+                max_seq: 4096,
+            }
+        }
+        // RotorK3Asym — rotor3 K + affine V at (v_bits, v_group_size).
+        KvQuant::RotorK3Asym {
+            v_bits,
+            v_group_size,
+        } => {
+            use rmlx_kv_quant::storage::QuantRotorK3;
+            let mut qk = QuantRotorK3::new(vec![shape[0], shape[1], 0, shape[3]], 4096, 0);
+            qk.append(&k_data, shape).unwrap();
+            // V: affine via TurboQuant V kernel (bits=v_bits). The SSD path uses
+            // the QuantV codec — for tests we build with the same kernel the
+            // production exit_prefill uses.
+            let vblk = turbo_quantize_v(&v_data, v_bits, shape).unwrap();
+            KvStorage::RotorKAsym3 {
+                k: Some(qk),
+                v: Some(QuantV::from_cpu_blocks(vec![vblk], shape.to_vec(), v_bits)),
+                max_seq: 4096,
+                v_bits,
+                v_group_size,
+            }
+        }
+        // RotorK4Asym — mirror with rotor4 K.
+        KvQuant::RotorK4Asym {
+            v_bits,
+            v_group_size,
+        } => {
+            use rmlx_kv_quant::storage::QuantRotorK4;
+            let mut qk = QuantRotorK4::new(vec![shape[0], shape[1], 0, shape[3]], 4096, 0);
+            qk.append(&k_data, shape).unwrap();
+            let vblk = turbo_quantize_v(&v_data, v_bits, shape).unwrap();
+            KvStorage::RotorKAsym4 {
+                k: Some(qk),
+                v: Some(QuantV::from_cpu_blocks(vec![vblk], shape.to_vec(), v_bits)),
+                max_seq: 4096,
+                v_bits,
+                v_group_size,
+            }
+        }
+        other => panic!("build_storage: unsupported quant {other:?}"),
+    };
+
+    let k_recon = dequant_k(&storage, device);
+    (storage, k_recon)
+}
+
+/// Round-trip one storage variant: build → write → read → dequant K, assert
+/// the dequant matches the pre-serialization dequant byte-for-byte (codes
+/// are stored exactly, so reconstruction is lossless relative to the
+/// already-quantized state).
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn roundtrip_variant(name: &str, quant: KvQuant) {
+    let device = Device::Cpu;
+    let shape = &[1i32, 2, 4, 128];
+    let (storage, k_recon_before) = build_storage(quant, shape, 0x1234_5678, device);
+
+    let layers = vec![storage];
+    let path = tmp_path(name);
+    KvBlockWriter::new(MODEL_ID, quant, &layers, &[])
+        .write(&path, device)
+        .unwrap();
+
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (rebuilt, _lin) = reader.hydrate(MODEL_ID, quant, device).unwrap();
+    assert_eq!(rebuilt.len(), 1, "{name}: layer count");
+
+    // Dequant K from the rebuilt storage and compare to the pre-write dequant.
+    let k_recon_after = dequant_k(&rebuilt[0], device);
+    assert_eq!(
+        k_recon_before.len(),
+        k_recon_after.len(),
+        "{name}: K length mismatch"
+    );
+    let max_err = k_recon_before
+        .iter()
+        .zip(&k_recon_after)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    // Codes round-trip exactly → dequant is bit-identical. Allow a hair of
+    // slack for any bf16 cast on the GPU path (CPU path is exact f32).
+    assert!(
+        max_err < 1e-3,
+        "{name}: K dequant round-trip error {max_err} too large"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+// Dequant the K side of a storage to flat f32 (CPU paths only — tests run on CPU).
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn dequant_k(storage: &KvStorage, device: Device) -> Vec<f32> {
+    match storage {
+        KvStorage::K8V4 { k, .. } | KvStorage::K8V8 { k, .. } | KvStorage::Planar { k, .. } => {
+            let (flat, _) = k
+                .as_ref()
+                .unwrap()
+                .dequantize_choice(device, Dtype::F32)
+                .unwrap();
+            flat
+        }
+        KvStorage::Mixed { state, .. } => {
+            // Dequant the K tuple via mx.dequantize.
+            let t = state.keys.as_ref().unwrap();
+            let out = rmlx_mlx::dequantize(
+                &t.codes,
+                &t.scales,
+                Some(&t.biases),
+                state.k_group_size,
+                state.k_bits,
+                "affine",
+                device,
+            )
+            .unwrap();
+            to_vec(&out)
+        }
+        KvStorage::Paged { k, .. } => {
+            let pk = k.as_ref().unwrap();
+            let (codes, scales) = pk.gather(device).unwrap();
+            codes.eval().unwrap();
+            scales.eval().unwrap();
+            let codes_v = codes.to_bytes().unwrap();
+            let scales_v = bytes_to_f32(&scales.to_bytes().unwrap());
+            rmlx_kv_quant::q8::q8_dequantize(&codes_v, &scales_v)
+        }
+        KvStorage::None { .. } => Vec::new(),
+        // RotKTq4V — K is stored in the MixedKvState (same as Mixed/RotK).
+        KvStorage::RotKTq4V { k_state, .. } => {
+            let t = k_state.keys.as_ref().unwrap();
+            let out = rmlx_mlx::dequantize(
+                &t.codes,
+                &t.scales,
+                Some(&t.biases),
+                k_state.k_group_size,
+                k_state.k_bits,
+                "affine",
+                device,
+            )
+            .unwrap();
+            to_vec(&out)
+        }
+        // K8VTurbo3 — K is QuantK (same as K8V4).
+        KvStorage::K8VTurbo3 { k, .. } => {
+            let (flat, _) = k
+                .as_ref()
+                .unwrap()
+                .dequantize_choice(device, Dtype::F32)
+                .unwrap();
+            flat
+        }
+        // TurboSym3 — K is `QuantKTurbo3` (TurboQuant 3-bit).
+        KvStorage::TurboSym3 { k, .. } => k.as_ref().unwrap().dequant().unwrap(),
+        // TurboSym4 — K is `QuantKTurbo4` (TurboQuant 4-bit).
+        KvStorage::TurboSym4 { k, .. } => {
+            let (flat, _) = k
+                .as_ref()
+                .unwrap()
+                .dequantize_choice(device, Dtype::F32)
+                .unwrap();
+            flat
+        }
+        // PlanarK — K is `QuantPlanarK` (same dequant API as V row).
+        KvStorage::PlanarK { k, .. } => {
+            let (flat, _) = k
+                .as_ref()
+                .unwrap()
+                .dequantize_choice(device, Dtype::F32)
+                .unwrap();
+            flat
+        }
+        // K8VTurbo2 — K is QuantK (same as K8V4).
+        KvStorage::K8VTurbo2 { k, .. } => {
+            let (flat, _) = k
+                .as_ref()
+                .unwrap()
+                .dequantize_choice(device, Dtype::F32)
+                .unwrap();
+            flat
+        }
+        // IsoV3 — K is QuantK; the test helper dequants K so the exhaustive
+        // match stays happy.
+        // IsoV4 mirrors IsoV3 on K (q8_0 affine).
+        // RotorV3 — K is also QuantK (q8_0 affine).
+        // RotorV4 — K is also QuantK (q8_0 affine).
+        KvStorage::IsoV3 { k, .. }
+        | KvStorage::IsoV4 { k, .. }
+        | KvStorage::RotorV3 { k, .. }
+        | KvStorage::RotorV4 { k, .. } => {
+            let (flat, _) = k
+                .as_ref()
+                .unwrap()
+                .dequantize_choice(device, Dtype::F32)
+                .unwrap();
+            flat
+        }
+        // K8VTurbo3Tcq — K is QuantK (same as K8V4 / K8VTurbo3).
+        // K8VTurbo2Tcq — K is QuantK (same pattern; V-side bits=2).
+        KvStorage::K8VTurbo3Tcq { k, .. } | KvStorage::K8VTurbo2Tcq { k, .. } => {
+            let (flat, _) = k
+                .as_ref()
+                .unwrap()
+                .dequantize_choice(device, Dtype::F32)
+                .unwrap();
+            flat
+        }
+        // IsoSym3 / IsoKOnly3 — K is `QuantIsoK3` (CPU-only).
+        KvStorage::IsoSym3 { k, .. } | KvStorage::IsoKOnly3 { k, .. } => {
+            k.as_ref().unwrap().dequant().unwrap()
+        }
+        KvStorage::IsoSym4 { k, .. } | KvStorage::IsoKOnly4 { k, .. } => {
+            k.as_ref().unwrap().dequant().unwrap()
+        }
+        // RotorSym3 / RotorKOnly3 — K is `QuantRotorK3` (CPU-only).
+        KvStorage::RotorSym3 { k, .. } | KvStorage::RotorKOnly3 { k, .. } => {
+            k.as_ref().unwrap().dequant().unwrap()
+        }
+        // RotorSym4 / RotorKOnly4 — K is `QuantRotorK4` (CPU-only).
+        KvStorage::RotorSym4 { k, .. } | KvStorage::RotorKOnly4 { k, .. } => {
+            k.as_ref().unwrap().dequant().unwrap()
+        }
+        // RotorKAsym3 / RotorKAsym4 — K is QuantRotorK3 / QuantRotorK4
+        // (CPU-only); V is affine but only K is dequant-probed here.
+        KvStorage::RotorKAsym3 { k, .. } => k.as_ref().unwrap().dequant().unwrap(),
+        KvStorage::RotorKAsym4 { k, .. } => k.as_ref().unwrap().dequant().unwrap(),
+    }
+}
+
+#[test]
+fn roundtrip_k8v4() {
+    roundtrip_variant("k8v4", KvQuant::K8V4);
+}
+
+#[test]
+fn roundtrip_k8v8() {
+    roundtrip_variant("k8v8", KvQuant::K8V8);
+}
+
+#[test]
+fn roundtrip_planar() {
+    roundtrip_variant("planar", KvQuant::Planar);
+}
+
+/// TurboSym3 round-trip: build (CPU TurboQuant 3-bit K+V) → write → read →
+/// dequant K must match pre-write dequant exactly (codes round-trip
+/// bit-identically through the safetensors serialization).
+#[test]
+fn roundtrip_tsym3() {
+    roundtrip_variant("tsym3", KvQuant::TurboSym3);
+}
+
+/// TurboSym4 round-trip: build (CPU TurboQuant 4-bit K+V) → write → read →
+/// dequant K must match pre-write dequant exactly (codes round-trip
+/// bit-identically through the safetensors serialization).
+#[test]
+fn roundtrip_tsym4() {
+    roundtrip_variant("tsym4", KvQuant::TurboSym4);
+}
+
+/// Planar3 SSD round-trip: K codes/scales + V 3-bit codes survive the
+/// spill/hydrate cycle (codes stored exactly → dequant is bit-identical).
+/// Also verifies that `bits=3` is preserved in the reconstructed storage.
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "wildcard arm is the correct fallthrough for unsupported arch/quant variants; exhaustive expansion would require updating on every new variant"
+)]
+fn roundtrip_planar3() {
+    let device = Device::Cpu;
+    let shape = &[1i32, 2, 4, 128];
+    let (storage, k_recon_before) = build_storage(KvQuant::Planar3, shape, 0xA127_B310, device);
+
+    // Capture V codes and bits before serialization.
+    let (v_codes_before, v_bits_before) = match &storage {
+        KvStorage::Planar {
+            v: Some(qpv), bits, ..
+        } => {
+            assert_eq!(*bits, 3, "build_storage must produce bits=3 for Planar3");
+            (qpv.blocks[0].codes.clone(), *bits)
+        }
+        _ => panic!("expected KvStorage::Planar for Planar3"),
+    };
+    assert_eq!(v_bits_before, 3, "Planar3 storage must have bits=3");
+
+    let layers = vec![storage];
+    let path = tmp_path("planar3");
+    KvBlockWriter::new(MODEL_ID, KvQuant::Planar3, &layers, &[])
+        .write(&path, device)
+        .unwrap();
+
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (rebuilt, _lin) = reader.hydrate(MODEL_ID, KvQuant::Planar3, device).unwrap();
+    assert_eq!(rebuilt.len(), 1, "planar3: layer count");
+
+    // Assert bits=3 is preserved through the round-trip.
+    let (v_codes_after, v_bits_after) = match &rebuilt[0] {
+        KvStorage::Planar {
+            v: Some(qpv), bits, ..
+        } => (qpv.blocks[0].codes.clone(), *bits),
+        _ => panic!("expected KvStorage::Planar after Planar3 hydrate"),
+    };
+    assert_eq!(
+        v_bits_after, 3,
+        "Planar3: bits must remain 3 after SSD round-trip"
+    );
+    assert_eq!(
+        v_codes_before, v_codes_after,
+        "Planar3 V codes are not byte-identical after SSD round-trip"
+    );
+
+    // K dequant must match pre-write within tolerance (codes round-trip exactly).
+    let k_recon_after = dequant_k(&rebuilt[0], device);
+    assert_eq!(
+        k_recon_before.len(),
+        k_recon_after.len(),
+        "planar3: K length mismatch"
+    );
+    let max_err = k_recon_before
+        .iter()
+        .zip(&k_recon_after)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_err < 1e-3,
+        "planar3: K dequant round-trip error {max_err} too large"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// PlanarK SSD round-trip: K codes/scales/rotations survive the spill/hydrate
+/// cycle (codes stored exactly → dequant is bit-identical).
+#[test]
+fn roundtrip_planar_k() {
+    roundtrip_variant("planar_k", KvQuant::PlanarK);
+}
+
+/// K8VTurbo2 write → read → dequant K round-trip.
+/// Mirrors the K8V4 / K8V8 / Planar SSD round-trip pattern. V codes are
+/// stored exactly (bits=2 pack format is the same Vec<u8> layout as bits=4).
+#[test]
+fn roundtrip_k8vturbo2() {
+    roundtrip_variant("k8vturbo2", KvQuant::K8VTurbo2);
+}
+
+/// K8VTurbo3Tcq SSD round-trip — V-side codes must survive a write → read
+/// cycle byte-for-byte, and the hydrated `QuantV` must carry `use_tcq = true`
+/// so any subsequent decode-step encode would re-enter the Viterbi path (not
+/// silently fall back to nearest-centroid).
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "test scaffolding: shape established by build_storage"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test scaffolding: invariants enforced by build_storage / writer / reader"
+)]
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "test asserts the K8VTurbo3Tcq variant only; wildcard panics on shape drift"
+)]
+fn roundtrip_k8vturbo3_tcq() {
+    let device = Device::Cpu;
+    let shape = &[1i32, 2, 4, 128];
+    let (storage, _) = build_storage(KvQuant::K8VTurbo3Tcq, shape, 0x7A57_F00D, device);
+
+    let v_codes_before = match &storage {
+        KvStorage::K8VTurbo3Tcq { v: Some(qv), .. } => qv.blocks[0].codes.clone(),
+        _ => panic!("expected K8VTurbo3Tcq storage"),
+    };
+    let v_bits_before = match &storage {
+        KvStorage::K8VTurbo3Tcq { v: Some(qv), .. } => qv.blocks[0].bits,
+        _ => unreachable!(),
+    };
+    assert_eq!(v_bits_before, 3, "build_storage should produce bits=3 V");
+
+    let layers = vec![storage];
+    let path = tmp_path("k8vturbo3tcq");
+    KvBlockWriter::new(MODEL_ID, KvQuant::K8VTurbo3Tcq, &layers, &[])
+        .write(&path, device)
+        .unwrap();
+
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (rebuilt, _) = reader
+        .hydrate(MODEL_ID, KvQuant::K8VTurbo3Tcq, device)
+        .unwrap();
+    assert_eq!(rebuilt.len(), 1, "layer count");
+
+    let (v_codes_after, v_bits_after, use_tcq_after) = match &rebuilt[0] {
+        KvStorage::K8VTurbo3Tcq { v: Some(qv), .. } => {
+            (qv.blocks[0].codes.clone(), qv.blocks[0].bits, qv.use_tcq)
+        }
+        _ => panic!("expected K8VTurbo3Tcq after hydrate"),
+    };
+    assert_eq!(
+        v_bits_after, 3,
+        "K8VTurbo3Tcq V must reconstruct with bits=3"
+    );
+    assert!(
+        use_tcq_after,
+        "K8VTurbo3Tcq hydrated QuantV must carry use_tcq=true so post-hydrate \
+         decode-step encodes stay on the Viterbi path"
+    );
+    assert_eq!(
+        v_codes_before, v_codes_after,
+        "K8VTurbo3Tcq V codes are not byte-identical after SSD round-trip"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// K8VTurbo2 V-side round-trip — verify the QuantV bits=2 codes survive
+/// serialise → deserialise byte-for-byte. The K-side is covered by
+/// `roundtrip_k8vturbo2`; this asserts the 2-bit V layout decoder in
+/// `read_quant_v_bits(..., 2)` matches what `write_quant_v` writes.
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "test scaffolding: shape established by build_storage"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test scaffolding: invariants enforced by build_storage / writer / reader"
+)]
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "test asserts the K8VTurbo2 variant only; wildcard panics on shape drift"
+)]
+fn roundtrip_k8vturbo2_v_codes_byte_identical() {
+    let device = Device::Cpu;
+    let shape = &[1i32, 2, 4, 128];
+    let (storage, _) = build_storage(KvQuant::K8VTurbo2, shape, 0xCAFE_F00D, device);
+
+    let v_codes_before = match &storage {
+        KvStorage::K8VTurbo2 { v: Some(qv), .. } => qv.blocks[0].codes.clone(),
+        _ => panic!("expected K8VTurbo2 storage"),
+    };
+    let v_bits_before = match &storage {
+        KvStorage::K8VTurbo2 { v: Some(qv), .. } => qv.blocks[0].bits,
+        _ => unreachable!(),
+    };
+    assert_eq!(v_bits_before, 2, "build_storage should produce bits=2 V");
+
+    let layers = vec![storage];
+    let path = tmp_path("k8vturbo2_v_codes");
+    KvBlockWriter::new(MODEL_ID, KvQuant::K8VTurbo2, &layers, &[])
+        .write(&path, device)
+        .unwrap();
+
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (rebuilt, _) = reader
+        .hydrate(MODEL_ID, KvQuant::K8VTurbo2, device)
+        .unwrap();
+    assert_eq!(rebuilt.len(), 1, "layer count");
+
+    let (v_codes_after, v_bits_after) = match &rebuilt[0] {
+        KvStorage::K8VTurbo2 { v: Some(qv), .. } => (qv.blocks[0].codes.clone(), qv.blocks[0].bits),
+        _ => panic!("expected K8VTurbo2 after hydrate"),
+    };
+    assert_eq!(v_bits_after, 2, "K8VTurbo2 V must reconstruct with bits=2");
+    assert_eq!(
+        v_codes_before, v_codes_after,
+        "K8VTurbo2 V codes are not byte-identical after SSD round-trip"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn roundtrip_mixed() {
+    roundtrip_variant(
+        "mixed",
+        KvQuant::Mixed {
+            k_bits: 8,
+            v_bits: 4,
+            k_group_size: 64,
+            v_group_size: 64,
+        },
+    );
+}
+
+/// RotKTq4V write → read → dequant K must be bit-identical (codes stored
+/// exactly). Also verifies the V-side block count round-trips (the CPU QuantV
+/// has one TurboBlock after build).
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "wildcard arm is the correct fallthrough for unsupported arch/quant variants; exhaustive expansion would require updating on every new variant"
+)]
+fn roundtrip_rot_k_tq4v() {
+    let device = Device::Cpu;
+    let shape = &[1i32, 2, 4, 128];
+    let (storage, k_recon_before) = build_storage(KvQuant::RotKTq4V, shape, 0xDEAD_BEEF, device);
+
+    // Capture the V codes before serialization for comparison.
+    let v_codes_before = match &storage {
+        KvStorage::RotKTq4V { v: Some(qv), .. } => qv.blocks[0].codes.clone(),
+        _ => panic!("expected RotKTq4V storage"),
+    };
+
+    let layers = vec![storage];
+    let path = tmp_path("rot_k_tq4v");
+    KvBlockWriter::new(MODEL_ID, KvQuant::RotKTq4V, &layers, &[])
+        .write(&path, device)
+        .unwrap();
+
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (rebuilt, _lin) = reader.hydrate(MODEL_ID, KvQuant::RotKTq4V, device).unwrap();
+    assert_eq!(rebuilt.len(), 1, "layer count");
+
+    // K codes round-trip: dequant must be bit-identical.
+    let k_recon_after = dequant_k(&rebuilt[0], device);
+    assert_eq!(k_recon_before.len(), k_recon_after.len(), "K length");
+    let max_err = k_recon_before
+        .iter()
+        .zip(&k_recon_after)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_err < 1e-3,
+        "rot_k_tq4v: K dequant round-trip error {max_err}"
+    );
+
+    // V codes round-trip: CPU blocks must be byte-identical.
+    let v_codes_after = match &rebuilt[0] {
+        KvStorage::RotKTq4V { v: Some(qv), .. } => qv.blocks[0].codes.clone(),
+        _ => panic!("expected RotKTq4V after hydrate"),
+    };
+    assert_eq!(v_codes_before, v_codes_after, "V codes round-trip");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// IsoV3 SSD round-trip: all four V-side buffers (codes_packed, scales,
+/// quaternions, norms) survive the spill/hydrate cycle bit-identically.
+/// K dequant matches within tolerance (codes round-trip exactly).
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: shape set by build_storage"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test scaffolding: invariants enforced by build_storage / writer / reader"
+)]
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "test asserts the IsoV3 variant only; wildcard panics on shape drift"
+)]
+fn roundtrip_iso3() {
+    let device = Device::Cpu;
+    let shape = &[1i32, 2, 4, 128];
+    let (storage, k_recon_before) = build_storage(KvQuant::Iso3, shape, 0xA128_B11C, device);
+
+    // Capture the four V-side buffers before serialization.
+    let (v_codes_before, v_scales_before, v_quats_before, v_norms_before) = match &storage {
+        KvStorage::IsoV3 { v: Some(qv), .. } => {
+            let blk = &qv.blocks[0];
+            (
+                blk.codes.clone(),
+                blk.scales.clone(),
+                blk.quaternions.clone(),
+                blk.norms.clone(),
+            )
+        }
+        _ => panic!("expected KvStorage::IsoV3 for Iso3"),
+    };
+
+    let layers = vec![storage];
+    let path = tmp_path("iso3");
+    KvBlockWriter::new(MODEL_ID, KvQuant::Iso3, &layers, &[])
+        .write(&path, device)
+        .unwrap();
+
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (rebuilt, _lin) = reader.hydrate(MODEL_ID, KvQuant::Iso3, device).unwrap();
+    assert_eq!(rebuilt.len(), 1, "iso3: layer count");
+
+    // All four V-side buffers must be byte/value-identical after round-trip.
+    let (v_codes_after, v_scales_after, v_quats_after, v_norms_after) = match &rebuilt[0] {
+        KvStorage::IsoV3 { v: Some(qv), .. } => {
+            let blk = &qv.blocks[0];
+            (
+                blk.codes.clone(),
+                blk.scales.clone(),
+                blk.quaternions.clone(),
+                blk.norms.clone(),
+            )
+        }
+        _ => panic!("expected KvStorage::IsoV3 after iso3 hydrate"),
+    };
+
+    assert_eq!(
+        v_codes_before, v_codes_after,
+        "iso3 V codes_packed are not bit-identical after SSD round-trip"
+    );
+    // scales / quaternions / norms are f32 and stored via to_le_bytes — should
+    // be bit-identical. Allow a hair of tolerance to guard against any
+    // future platform-specific f32 serialisation difference.
+    let max_scale_err = v_scales_before
+        .iter()
+        .zip(&v_scales_after)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_scale_err < 1e-6,
+        "iso3 V scales round-trip err {max_scale_err}"
+    );
+
+    let max_quat_err = v_quats_before
+        .iter()
+        .zip(&v_quats_after)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_quat_err < 1e-6,
+        "iso3 V quaternions round-trip err {max_quat_err}"
+    );
+
+    let max_norm_err = v_norms_before
+        .iter()
+        .zip(&v_norms_after)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_norm_err < 1e-6,
+        "iso3 V norms round-trip err {max_norm_err}"
+    );
+
+    // K dequant must also match within tolerance.
+    let k_recon_after = dequant_k(&rebuilt[0], device);
+    assert_eq!(
+        k_recon_before.len(),
+        k_recon_after.len(),
+        "iso3: K length mismatch"
+    );
+    let max_k_err = k_recon_before
+        .iter()
+        .zip(&k_recon_after)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_k_err < 1e-3,
+        "iso3: K dequant round-trip error {max_k_err} too large"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Iso4 SSD round-trip: build → write → read → assert all four V-side buffers
+/// (codes_packed, scales, quaternions, norms) are bit/value-identical, and K
+/// dequant matches within tolerance.
+///
+/// Mirrors `roundtrip_iso3` exactly with `KvQuant::Iso4` / `KvStorage::IsoV4`.
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "test asserts the IsoV4 variant only; wildcard panics on shape drift"
+)]
+fn roundtrip_iso4() {
+    let device = Device::Cpu;
+    let shape = &[1i32, 2, 4, 128];
+    let (storage, k_recon_before) = build_storage(KvQuant::Iso4, shape, 0xA129_F12C, device);
+
+    let (v_codes_before, v_scales_before, v_quats_before, v_norms_before) = match &storage {
+        KvStorage::IsoV4 { v: Some(qv), .. } => {
+            let blk = &qv.blocks[0];
+            (
+                blk.codes.clone(),
+                blk.scales.clone(),
+                blk.quaternions.clone(),
+                blk.norms.clone(),
+            )
+        }
+        _ => panic!("expected KvStorage::IsoV4 for Iso4"),
+    };
+
+    let layers = vec![storage];
+    let path = tmp_path("iso4");
+    KvBlockWriter::new(MODEL_ID, KvQuant::Iso4, &layers, &[])
+        .write(&path, device)
+        .unwrap();
+
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (rebuilt, _lin) = reader.hydrate(MODEL_ID, KvQuant::Iso4, device).unwrap();
+    assert_eq!(rebuilt.len(), 1, "iso4: layer count");
+
+    let (v_codes_after, v_scales_after, v_quats_after, v_norms_after) = match &rebuilt[0] {
+        KvStorage::IsoV4 { v: Some(qv), .. } => {
+            let blk = &qv.blocks[0];
+            (
+                blk.codes.clone(),
+                blk.scales.clone(),
+                blk.quaternions.clone(),
+                blk.norms.clone(),
+            )
+        }
+        _ => panic!("expected KvStorage::IsoV4 after iso4 hydrate"),
+    };
+
+    assert_eq!(
+        v_codes_before, v_codes_after,
+        "iso4 V codes_packed are not bit-identical after SSD round-trip"
+    );
+
+    let max_scale_err = v_scales_before
+        .iter()
+        .zip(&v_scales_after)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_scale_err < 1e-6,
+        "iso4 V scales round-trip err {max_scale_err}"
+    );
+
+    let max_quat_err = v_quats_before
+        .iter()
+        .zip(&v_quats_after)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_quat_err < 1e-6,
+        "iso4 V quaternions round-trip err {max_quat_err}"
+    );
+
+    let max_norm_err = v_norms_before
+        .iter()
+        .zip(&v_norms_after)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_norm_err < 1e-6,
+        "iso4 V norms round-trip err {max_norm_err}"
+    );
+
+    let k_recon_after = dequant_k(&rebuilt[0], device);
+    assert_eq!(
+        k_recon_before.len(),
+        k_recon_after.len(),
+        "iso4: K length mismatch"
+    );
+    let max_k_err = k_recon_before
+        .iter()
+        .zip(&k_recon_after)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_k_err < 1e-3,
+        "iso4: K dequant round-trip error {max_k_err} too large"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Rotor3 SSD round-trip: build → write → read → assert all four V-side
+/// buffers (codes_packed, scales, norms, rotors) are bit/value-identical, and
+/// K dequant matches within tolerance.
+///
+/// Mirrors `roundtrip_iso4` with `KvQuant::Rotor3` / `KvStorage::RotorV3`.
+/// The fourth V buffer here is `rotors` (the static rotor table) rather than
+/// `quaternions` — same wire layout idea, different semantics.
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "test asserts the RotorV3 variant only; wildcard panics on shape drift"
+)]
+fn roundtrip_rotor3() {
+    let device = Device::Cpu;
+    let shape = &[1i32, 2, 4, 96];
+    let (storage, k_recon_before) = build_storage(KvQuant::Rotor3, shape, 0xA130_F13C, device);
+
+    let (v_codes_before, v_scales_before, v_norms_before, v_rotors_before) = match &storage {
+        KvStorage::RotorV3 { v: Some(qv), .. } => {
+            let blk = &qv.blocks[0];
+            (
+                blk.codes.clone(),
+                blk.scales.clone(),
+                blk.norms.clone(),
+                qv.rotors.clone(),
+            )
+        }
+        _ => panic!("expected KvStorage::RotorV3 for Rotor3"),
+    };
+
+    let layers = vec![storage];
+    let path = tmp_path("rotor3");
+    KvBlockWriter::new(MODEL_ID, KvQuant::Rotor3, &layers, &[])
+        .write(&path, device)
+        .unwrap();
+
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (rebuilt, _lin) = reader.hydrate(MODEL_ID, KvQuant::Rotor3, device).unwrap();
+    assert_eq!(rebuilt.len(), 1, "rotor3: layer count");
+
+    let (v_codes_after, v_scales_after, v_norms_after, v_rotors_after) = match &rebuilt[0] {
+        KvStorage::RotorV3 { v: Some(qv), .. } => {
+            let blk = &qv.blocks[0];
+            (
+                blk.codes.clone(),
+                blk.scales.clone(),
+                blk.norms.clone(),
+                qv.rotors.clone(),
+            )
+        }
+        _ => panic!("expected KvStorage::RotorV3 after rotor3 hydrate"),
+    };
+
+    assert_eq!(
+        v_codes_before, v_codes_after,
+        "rotor3 V codes_packed are not bit-identical after SSD round-trip"
+    );
+
+    let max_scale_err = v_scales_before
+        .iter()
+        .zip(&v_scales_after)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_scale_err < 1e-6,
+        "rotor3 V scales round-trip err {max_scale_err}"
+    );
+
+    let max_norm_err = v_norms_before
+        .iter()
+        .zip(&v_norms_after)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_norm_err < 1e-6,
+        "rotor3 V norms round-trip err {max_norm_err}"
+    );
+
+    let max_rotors_err = v_rotors_before
+        .iter()
+        .zip(&v_rotors_after)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_rotors_err < 1e-6,
+        "rotor3 V rotor table round-trip err {max_rotors_err}"
+    );
+
+    let k_recon_after = dequant_k(&rebuilt[0], device);
+    assert_eq!(
+        k_recon_before.len(),
+        k_recon_after.len(),
+        "rotor3: K length mismatch"
+    );
+    let max_k_err = k_recon_before
+        .iter()
+        .zip(&k_recon_after)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_k_err < 1e-3,
+        "rotor3: K dequant round-trip error {max_k_err} too large"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// RotorV4 round-trip: build → write → read → verify codes/scales/norms/rotors
+/// are bit-exact and K dequant is within q8_0 tolerance.
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "test asserts the RotorV4 variant only; wildcard panics on shape drift"
+)]
+fn roundtrip_rotor4() {
+    let device = Device::Cpu;
+    let shape = &[1i32, 2, 4, 96];
+    let (storage, k_recon_before) = build_storage(KvQuant::Rotor4, shape, 0xA131_F14C, device);
+
+    let (v_codes_before, v_scales_before, v_norms_before, v_rotors_before) = match &storage {
+        KvStorage::RotorV4 { v: Some(qv), .. } => {
+            let blk = &qv.blocks[0];
+            (
+                blk.codes.clone(),
+                blk.scales.clone(),
+                blk.norms.clone(),
+                qv.rotors.clone(),
+            )
+        }
+        _ => panic!("expected KvStorage::RotorV4 for Rotor4"),
+    };
+
+    let layers = vec![storage];
+    let path = tmp_path("rotor4");
+    KvBlockWriter::new(MODEL_ID, KvQuant::Rotor4, &layers, &[])
+        .write(&path, device)
+        .unwrap();
+
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (rebuilt, _lin) = reader.hydrate(MODEL_ID, KvQuant::Rotor4, device).unwrap();
+    assert_eq!(rebuilt.len(), 1, "rotor4: layer count");
+
+    let (v_codes_after, v_scales_after, v_norms_after, v_rotors_after) = match &rebuilt[0] {
+        KvStorage::RotorV4 { v: Some(qv), .. } => {
+            let blk = &qv.blocks[0];
+            (
+                blk.codes.clone(),
+                blk.scales.clone(),
+                blk.norms.clone(),
+                qv.rotors.clone(),
+            )
+        }
+        _ => panic!("expected KvStorage::RotorV4 after rotor4 hydrate"),
+    };
+
+    assert_eq!(
+        v_codes_before, v_codes_after,
+        "rotor4 V codes_packed are not bit-identical after SSD round-trip"
+    );
+
+    let max_scale_err = v_scales_before
+        .iter()
+        .zip(&v_scales_after)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_scale_err < 1e-6,
+        "rotor4 V scales round-trip err {max_scale_err}"
+    );
+
+    let max_norm_err = v_norms_before
+        .iter()
+        .zip(&v_norms_after)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_norm_err < 1e-6,
+        "rotor4 V norms round-trip err {max_norm_err}"
+    );
+
+    let max_rotors_err = v_rotors_before
+        .iter()
+        .zip(&v_rotors_after)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_rotors_err < 1e-6,
+        "rotor4 V rotor table round-trip err {max_rotors_err}"
+    );
+
+    let k_recon_after = dequant_k(&rebuilt[0], device);
+    assert_eq!(
+        k_recon_before.len(),
+        k_recon_after.len(),
+        "rotor4: K length mismatch"
+    );
+    let max_k_err = k_recon_before
+        .iter()
+        .zip(&k_recon_after)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_k_err < 1e-3,
+        "rotor4: K dequant round-trip error {max_k_err} too large"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `None` (bf16) keeps K/V on the parent KvCache, not in storage. Verify the
+/// geometry round-trips and the variant reconstructs as `None`.
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn roundtrip_none() {
+    let device = Device::Cpu;
+    let layers = vec![KvStorage::None { max_seq: 4096 }];
+    let path = tmp_path("none");
+    KvBlockWriter::new(MODEL_ID, KvQuant::None, &layers, &[])
+        .write(&path, device)
+        .unwrap();
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (rebuilt, _) = reader.hydrate(MODEL_ID, KvQuant::None, device).unwrap();
+    assert!(matches!(rebuilt[0], KvStorage::None { max_seq: 4096 }));
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Paged: build a paged K8V4 storage directly, write → read → dequant K.
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn roundtrip_paged() {
+    let device = Device::Cpu;
+    let shape = &[1i32, 2, 4, 128];
+    let n: usize = shape.iter().map(|&x| x as usize).product();
+    let k_data = lcg(n, 0xFEED);
+    let v_data = lcg(n, 0xBEEF);
+
+    // Build a Paged K8V4 storage by quantizing K (q8_0) and V (turbo4) and
+    // appending into the paged structures directly.
+    use rmlx_kv_quant::q8::q8_quantize;
+    use rmlx_kv_quant::turboquant::turbo_quantize_v;
+
+    let (k_codes, k_scales) = q8_quantize(&k_data);
+    let mut pk = PagedKStorage::new(4096, 32, 4);
+    // Build codes/scales arrays as the paged append expects (flat u32/f32).
+    let k_codes_arr = u8_codes_to_u32_array(&k_codes, device);
+    let k_scales_arr = arr(&k_scales, &[k_scales.len() as i32]);
+    pk.append(shape, k_codes_arr, k_scales_arr, device).unwrap();
+
+    let vblk = turbo_quantize_v(&v_data, 4, shape).unwrap();
+    let mut pv = PagedVStorage::new(4096, 32, 4, 4);
+    let v_codes_arr = u8_codes_to_u32_array(&vblk.codes, device);
+    let v_scales_arr = arr(&vblk.scales, &[vblk.scales.len() as i32]);
+    pv.append(shape, v_codes_arr, v_scales_arr, device).unwrap();
+
+    let storage = KvStorage::Paged {
+        quant: KvQuant::K8V4,
+        k: Some(pk),
+        v_k8: Some(Box::new(pv)),
+        v_planar: None,
+        max_seq: 4096,
+    };
+    let before = dequant_k(&storage, device);
+
+    let layers = vec![storage];
+    let path = tmp_path("paged");
+    KvBlockWriter::new(MODEL_ID, KvQuant::K8V4, &layers, &[])
+        .write(&path, device)
+        .unwrap();
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (rebuilt, _) = reader.hydrate(MODEL_ID, KvQuant::K8V4, device).unwrap();
+    let after = dequant_k(&rebuilt[0], device);
+    assert_eq!(before.len(), after.len(), "paged K length");
+    let max_err = before
+        .iter()
+        .zip(&after)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max_err < 1e-3, "paged K round-trip error {max_err}");
+    let _ = std::fs::remove_file(&path);
+}
+
+// Reinterpret a u8 q8/turbo codes blob as a u32 array (4 bytes/word, LE).
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn u8_codes_to_u32_array(codes: &[u8], _device: Device) -> Array {
+    assert_eq!(codes.len() % 4, 0, "codes len must be multiple of 4");
+    Array::from_bytes(codes, &[(codes.len() / 4) as i32], Dtype::U32).unwrap()
+}
+
+/// LinearAttn (GDN): full recurrent state round-trips whole, untruncated.
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn roundtrip_linear_attn() {
+    let device = Device::Cpu;
+    let conv = arr(&lcg(24, 1), &[1, 3, 8]);
+    let delta = arr(&lcg(48, 2), &[1, 2, 4, 6]);
+    let mut lac = LinearAttnCache::new();
+    lac.conv_state = Some(conv);
+    lac.delta_state = Some(delta);
+    let conv_before = to_vec(lac.conv_state.as_ref().unwrap());
+    let delta_before = to_vec(lac.delta_state.as_ref().unwrap());
+
+    let layers: Vec<KvStorage> = vec![KvStorage::None { max_seq: 4096 }];
+    let lin = vec![lac];
+    let path = tmp_path("gdn");
+    KvBlockWriter::new(MODEL_ID, KvQuant::None, &layers, &lin)
+        .write(&path, device)
+        .unwrap();
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (_layers, rebuilt_lin) = reader.hydrate(MODEL_ID, KvQuant::None, device).unwrap();
+    assert_eq!(rebuilt_lin.len(), 1, "linear cache count");
+    assert_eq!(
+        to_vec(rebuilt_lin[0].conv_state.as_ref().unwrap()),
+        conv_before
+    );
+    assert_eq!(
+        to_vec(rebuilt_lin[0].delta_state.as_ref().unwrap()),
+        delta_before
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Wrong model_id load returns Err.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn wrong_model_id_rejected() {
+    let device = Device::Cpu;
+    let layers = vec![KvStorage::None { max_seq: 4096 }];
+    let path = tmp_path("wrong_model");
+    KvBlockWriter::new(MODEL_ID, KvQuant::None, &layers, &[])
+        .write(&path, device)
+        .unwrap();
+    let reader = KvBlockReader::open(&path).unwrap();
+    let res = reader.hydrate("OtherArch/other-snapshot", KvQuant::None, device);
+    match res {
+        Err(Error::Mlx(m)) => {
+            assert!(m.contains("model_id mismatch"), "wrong error message: {m}");
+        }
+        Err(other) => panic!("expected model_id mismatch Err, got {other:?}"),
+        Ok(_) => panic!("expected Err on wrong model_id, got Ok"),
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+// ── C3 + C1 + C2: GPU hydrate round-trips (require Metal) ─────────────────
+
+/// C3 + C1: K8V4 write (GPU) → read → hydrate → one-step decode, no panic.
+///
+/// Without C3 fix: writer dumps full GPU paged capacity (≥512 words for
+/// 300-token sequence) → on-disk tensor too large → hydrate reader OOB on
+/// `slice_update`.
+///
+/// Without C1 fix: QuantV allocates zero GPU buffers on hydration → V is
+/// all-zeros across history → silent attention corruption.
+///
+/// Requires Metal / Apple-Silicon GPU.
+#[test]
+#[ignore = "GPU Metal context — run: cargo test kv_cache -- c3_k8v4_hydrate_round_trip_no_panic --ignored --test-threads=1"]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn c3_k8v4_hydrate_round_trip_no_panic() {
+    let device = Device::Gpu;
+    // 300 tokens — fills past the 256-token page boundary so paged GPU
+    // buffer capacity exceeds the filled prefix.
+    let shape = [1i32, 2, 300, 128];
+    let n: usize = shape.iter().map(|&x| x as usize).product();
+    let k = arr(&lcg(n, 0xC3_1234), &shape);
+    let v = arr(&lcg(n, 0xC3_1234 ^ 0xF00D), &shape);
+
+    let mut c = KvCache::with_quant_max_seq(KvQuant::K8V4, 4096);
+    c.enter_prefill();
+    c.update(&k, &v, device).unwrap();
+    c.exit_prefill(device).unwrap();
+
+    let path = tmp_path("c3_k8v4_round_trip");
+    write_caches(&path, device, MODEL_ID, KvQuant::K8V4, &[c], &[]).unwrap();
+
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (rebuilt, _) = reader.hydrate(MODEL_ID, KvQuant::K8V4, device).unwrap();
+    let storage = rebuilt.into_iter().next().unwrap();
+
+    let mut cache = KvCache::from_storage(storage, KvQuant::K8V4, 300, 0);
+    // One decode step — must not OOB-panic.
+    // n1 = B*kv_h*S*D = 1*2*1*128 = 256.
+    let n1 = 256usize;
+    let one_k = arr(&lcg(n1, 0xAABB), &[1, 2, 1, 128]);
+    let one_v = arr(&lcg(n1, 0xCCDD), &[1, 2, 1, 128]);
+    let (k_out, _) = cache.update(&one_k, &one_v, device).unwrap();
+    assert_eq!(k_out.shape()[2], 301, "C3/K8V4: seq should advance to 301");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// C2 + C3: Planar write (GPU) → read → hydrate → one-step decode, no panic.
+///
+/// Without C2 fix: QuantPlanarV init_cap = KV_PAGE_SIZE (256) < prev_seq
+/// (300) → grow path tries to copy 300 words from a 256-word buffer → OOB
+/// slice_update → broadcast error / panic.
+///
+/// Requires Metal / Apple-Silicon GPU.
+#[test]
+#[ignore = "GPU Metal context — run: cargo test kv_cache -- c2_planar_hydrate_round_trip_no_panic --ignored --test-threads=1"]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn c2_planar_hydrate_round_trip_no_panic() {
+    let device = Device::Gpu;
+    let shape = [1i32, 2, 300, 128];
+    let n: usize = shape.iter().map(|&x| x as usize).product();
+    let k = arr(&lcg(n, 0xC2_5678), &shape);
+    let v = arr(&lcg(n, 0xC2_5678 ^ 0xCAFE), &shape);
+
+    let mut c = KvCache::with_quant_max_seq(KvQuant::Planar, 4096);
+    c.enter_prefill();
+    c.update(&k, &v, device).unwrap();
+    c.exit_prefill(device).unwrap();
+
+    let path = tmp_path("c2_planar_round_trip");
+    write_caches(&path, device, MODEL_ID, KvQuant::Planar, &[c], &[]).unwrap();
+
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (rebuilt, _) = reader.hydrate(MODEL_ID, KvQuant::Planar, device).unwrap();
+    let storage = rebuilt.into_iter().next().unwrap();
+
+    let mut cache = KvCache::from_storage(storage, KvQuant::Planar, 300, 0);
+    // n1 = B*kv_h*S*D = 1*2*1*128 = 256.
+    let n1 = 256usize;
+    let one_k = arr(&lcg(n1, 0xEEFF), &[1, 2, 1, 128]);
+    let one_v = arr(&lcg(n1, 0x1122), &[1, 2, 1, 128]);
+    let (k_out, _) = cache.update(&one_k, &one_v, device).unwrap();
+    assert_eq!(
+        k_out.shape()[2],
+        301,
+        "C2/Planar: seq should advance to 301"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+// ── H4 + H5: SWA offset reset on hydration (CPU-runnable) ─────────────────
+
+/// H4 + H5: KvStorage::None (SWA) layer with offset > max_seq must reset
+/// gracefully on first decode step without OOB panic.
+///
+/// The reset path (H5) also emits a tracing::warn! event.
+/// This test runs on CPU (no GPU required).
+#[test]
+fn h4_swa_prev_offset_exceeds_max_seq_reset_no_panic() {
+    let device = Device::Cpu;
+    // Simulate a SWA layer hydrated with prev_offset=1023, max_seq=512.
+    // The SWA ring buffer was not spilled; offset > max_seq triggers reset.
+    let storage = KvStorage::None { max_seq: 512 };
+    let mut cache = KvCache::from_storage(storage, KvQuant::None, 1023, 0);
+
+    // n = B*kv_h*S*D = 1*2*1*128 = 256.
+    let n = 256usize;
+    let one_k = arr(&lcg(n, 0x1111), &[1, 2, 1, 128]);
+    let one_v = arr(&lcg(n, 0x2222), &[1, 2, 1, 128]);
+
+    // Must not panic; SWA offset is reset to [0..new_seq].
+    let result = cache.update(&one_k, &one_v, device);
+    assert!(
+        result.is_ok(),
+        "SWA hydrate with prev_offset > max_seq must not error: {:?}",
+        result.err()
+    );
+}
+
+/// K8VTurbo2Tcq SSD round-trip — V-side codes must survive a write → read
+/// cycle byte-for-byte, and the hydrated `QuantV` must carry `use_tcq = true`
+/// so any subsequent decode-step encode would re-enter the Viterbi path (not
+/// silently fall back to nearest-centroid).
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "test scaffolding: shape established by build_storage"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test scaffolding: invariants enforced by build_storage / writer / reader"
+)]
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "test asserts the K8VTurbo2Tcq variant only; wildcard panics on shape drift"
+)]
+fn roundtrip_k8vturbo2tcq() {
+    let device = Device::Cpu;
+    let shape = &[1i32, 2, 4, 128];
+    let (storage, _) = build_storage(KvQuant::K8VTurbo2Tcq, shape, 0x2B2B_F00D, device);
+
+    let v_codes_before = match &storage {
+        KvStorage::K8VTurbo2Tcq { v: Some(qv), .. } => qv.blocks[0].codes.clone(),
+        _ => panic!("expected K8VTurbo2Tcq storage"),
+    };
+    let v_bits_before = match &storage {
+        KvStorage::K8VTurbo2Tcq { v: Some(qv), .. } => qv.blocks[0].bits,
+        _ => unreachable!(),
+    };
+    assert_eq!(v_bits_before, 2, "build_storage should produce bits=2 V");
+
+    let layers = vec![storage];
+    let path = tmp_path("k8vturbo2tcq");
+    KvBlockWriter::new(MODEL_ID, KvQuant::K8VTurbo2Tcq, &layers, &[])
+        .write(&path, device)
+        .unwrap();
+
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (rebuilt, _) = reader
+        .hydrate(MODEL_ID, KvQuant::K8VTurbo2Tcq, device)
+        .unwrap();
+    assert_eq!(rebuilt.len(), 1, "layer count");
+
+    let (v_codes_after, v_bits_after, use_tcq_after) = match &rebuilt[0] {
+        KvStorage::K8VTurbo2Tcq { v: Some(qv), .. } => {
+            (qv.blocks[0].codes.clone(), qv.blocks[0].bits, qv.use_tcq)
+        }
+        _ => panic!("expected K8VTurbo2Tcq after hydrate"),
+    };
+    assert_eq!(
+        v_bits_after, 2,
+        "K8VTurbo2Tcq V must reconstruct with bits=2"
+    );
+    assert!(
+        use_tcq_after,
+        "K8VTurbo2Tcq hydrated QuantV must carry use_tcq=true so post-hydrate \
+         decode-step encodes stay on the Viterbi path"
+    );
+    assert_eq!(
+        v_codes_before, v_codes_after,
+        "K8VTurbo2Tcq V codes are not byte-identical after SSD round-trip"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Wrong kv_quant load returns Err.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn wrong_kv_quant_rejected() {
+    let device = Device::Cpu;
+    let layers = vec![KvStorage::None { max_seq: 4096 }];
+    let path = tmp_path("wrong_quant");
+    KvBlockWriter::new(MODEL_ID, KvQuant::None, &layers, &[])
+        .write(&path, device)
+        .unwrap();
+    let reader = KvBlockReader::open(&path).unwrap();
+    let res = reader.hydrate(MODEL_ID, KvQuant::K8V8, device);
+    match res {
+        Err(Error::Mlx(m)) => {
+            assert!(m.contains("kv_quant mismatch"), "wrong error message: {m}");
+        }
+        Err(other) => panic!("expected kv_quant mismatch Err, got {other:?}"),
+        Ok(_) => panic!("expected Err on wrong kv_quant, got Ok"),
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+// ── K-side IsoQuant SSD round-trips ──────────────────────────────────────────
+
+/// Iso3Sym (K iso3 + V iso3) SSD round-trip.
+/// All four K-side buffers and all four V-side buffers survive the spill/
+/// hydrate cycle bit-identically. K dequant matches within tolerance.
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "test scaffolding: shape established by build_storage"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test scaffolding: invariants enforced by build_storage / writer / reader"
+)]
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "test asserts the IsoSym3 variant only; wildcard panics on shape drift"
+)]
+fn roundtrip_iso_sym_3() {
+    let device = Device::Cpu;
+    let shape = &[1i32, 2, 4, 128];
+    let (storage, k_recon_before) = build_storage(KvQuant::Iso3Sym, shape, 0x5722_3A1F, device);
+
+    let (k_codes_before, v_codes_before) = match &storage {
+        KvStorage::IsoSym3 {
+            k: Some(qk),
+            v: Some(qv),
+            ..
+        } => (qk.blocks[0].codes.clone(), qv.blocks[0].codes.clone()),
+        _ => panic!("expected IsoSym3 storage"),
+    };
+
+    let layers = vec![storage];
+    let path = tmp_path("iso_sym_3");
+    KvBlockWriter::new(MODEL_ID, KvQuant::Iso3Sym, &layers, &[])
+        .write(&path, device)
+        .unwrap();
+
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (rebuilt, _) = reader.hydrate(MODEL_ID, KvQuant::Iso3Sym, device).unwrap();
+    assert_eq!(rebuilt.len(), 1, "iso_sym_3: layer count");
+
+    let (k_codes_after, v_codes_after) = match &rebuilt[0] {
+        KvStorage::IsoSym3 {
+            k: Some(qk),
+            v: Some(qv),
+            ..
+        } => (qk.blocks[0].codes.clone(), qv.blocks[0].codes.clone()),
+        _ => panic!("expected IsoSym3 after hydrate"),
+    };
+    assert_eq!(
+        k_codes_before, k_codes_after,
+        "iso_sym_3 K codes bit-identical"
+    );
+    assert_eq!(
+        v_codes_before, v_codes_after,
+        "iso_sym_3 V codes bit-identical"
+    );
+
+    let k_recon_after = dequant_k(&rebuilt[0], device);
+    assert_eq!(k_recon_before.len(), k_recon_after.len());
+    let max_k_err = k_recon_before
+        .iter()
+        .zip(&k_recon_after)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max_k_err < 1e-3, "iso_sym_3 K dequant err {max_k_err}");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Iso4Sym SSD round-trip (4-bit K + 4-bit V).
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "test scaffolding: shape established by build_storage"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test scaffolding: invariants enforced by build_storage / writer / reader"
+)]
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "test asserts the IsoSym4 variant only; wildcard panics on shape drift"
+)]
+fn roundtrip_iso_sym_4() {
+    let device = Device::Cpu;
+    let shape = &[1i32, 2, 4, 128];
+    let (storage, k_recon_before) = build_storage(KvQuant::Iso4Sym, shape, 0x5722_3A20, device);
+
+    let (k_codes_before, v_codes_before) = match &storage {
+        KvStorage::IsoSym4 {
+            k: Some(qk),
+            v: Some(qv),
+            ..
+        } => (qk.blocks[0].codes.clone(), qv.blocks[0].codes.clone()),
+        _ => panic!("expected IsoSym4 storage"),
+    };
+
+    let layers = vec![storage];
+    let path = tmp_path("iso_sym_4");
+    KvBlockWriter::new(MODEL_ID, KvQuant::Iso4Sym, &layers, &[])
+        .write(&path, device)
+        .unwrap();
+
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (rebuilt, _) = reader.hydrate(MODEL_ID, KvQuant::Iso4Sym, device).unwrap();
+    assert_eq!(rebuilt.len(), 1);
+
+    let (k_codes_after, v_codes_after) = match &rebuilt[0] {
+        KvStorage::IsoSym4 {
+            k: Some(qk),
+            v: Some(qv),
+            ..
+        } => (qk.blocks[0].codes.clone(), qv.blocks[0].codes.clone()),
+        _ => panic!("expected IsoSym4 after hydrate"),
+    };
+    assert_eq!(k_codes_before, k_codes_after);
+    assert_eq!(v_codes_before, v_codes_after);
+
+    let k_recon_after = dequant_k(&rebuilt[0], device);
+    let max_k_err = k_recon_before
+        .iter()
+        .zip(&k_recon_after)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max_k_err < 1e-3, "iso_sym_4 K dequant err {max_k_err}");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// IsoKOnly3 SSD round-trip (K iso3, V bf16 off-storage).
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "test scaffolding: shape established by build_storage"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test scaffolding: invariants enforced by build_storage / writer / reader"
+)]
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "test asserts the IsoKOnly3 variant only; wildcard panics on shape drift"
+)]
+fn roundtrip_iso_k_only_3() {
+    let device = Device::Cpu;
+    let shape = &[1i32, 2, 4, 128];
+    let (storage, k_recon_before) = build_storage(KvQuant::IsoKOnly3, shape, 0x5722_3A21, device);
+
+    let k_codes_before = match &storage {
+        KvStorage::IsoKOnly3 { k: Some(qk), .. } => qk.blocks[0].codes.clone(),
+        _ => panic!("expected IsoKOnly3 storage"),
+    };
+
+    let layers = vec![storage];
+    let path = tmp_path("iso_k_only_3");
+    KvBlockWriter::new(MODEL_ID, KvQuant::IsoKOnly3, &layers, &[])
+        .write(&path, device)
+        .unwrap();
+
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (rebuilt, _) = reader
+        .hydrate(MODEL_ID, KvQuant::IsoKOnly3, device)
+        .unwrap();
+    assert_eq!(rebuilt.len(), 1);
+
+    let k_codes_after = match &rebuilt[0] {
+        KvStorage::IsoKOnly3 { k: Some(qk), .. } => qk.blocks[0].codes.clone(),
+        _ => panic!("expected IsoKOnly3 after hydrate"),
+    };
+    assert_eq!(k_codes_before, k_codes_after);
+
+    let k_recon_after = dequant_k(&rebuilt[0], device);
+    let max_k_err = k_recon_before
+        .iter()
+        .zip(&k_recon_after)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max_k_err < 1e-3);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// IsoKOnly4 SSD round-trip.
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "test scaffolding: shape established by build_storage"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test scaffolding: invariants enforced by build_storage / writer / reader"
+)]
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "test asserts the IsoKOnly4 variant only; wildcard panics on shape drift"
+)]
+fn roundtrip_iso_k_only_4() {
+    let device = Device::Cpu;
+    let shape = &[1i32, 2, 4, 128];
+    let (storage, k_recon_before) = build_storage(KvQuant::IsoKOnly4, shape, 0x5722_3A22, device);
+
+    let k_codes_before = match &storage {
+        KvStorage::IsoKOnly4 { k: Some(qk), .. } => qk.blocks[0].codes.clone(),
+        _ => panic!("expected IsoKOnly4 storage"),
+    };
+
+    let layers = vec![storage];
+    let path = tmp_path("iso_k_only_4");
+    KvBlockWriter::new(MODEL_ID, KvQuant::IsoKOnly4, &layers, &[])
+        .write(&path, device)
+        .unwrap();
+
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (rebuilt, _) = reader
+        .hydrate(MODEL_ID, KvQuant::IsoKOnly4, device)
+        .unwrap();
+    assert_eq!(rebuilt.len(), 1);
+
+    let k_codes_after = match &rebuilt[0] {
+        KvStorage::IsoKOnly4 { k: Some(qk), .. } => qk.blocks[0].codes.clone(),
+        _ => panic!("expected IsoKOnly4 after hydrate"),
+    };
+    assert_eq!(k_codes_before, k_codes_after);
+
+    let k_recon_after = dequant_k(&rebuilt[0], device);
+    let max_k_err = k_recon_before
+        .iter()
+        .zip(&k_recon_after)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max_k_err < 1e-3);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+// ── Rotor K-side SSD round-trip tests ────────────────────────────────────────
+
+/// Rotor3Sym SSD round-trip with QJL OFF.
+#[test]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used)]
+fn roundtrip_rotor_sym_3_no_qjl() {
+    let _guard = ROTOR_QJL_ENV_LOCK.lock().unwrap();
+    unsafe { std::env::set_var("RMLX_ROTOR_QJL", "0") };
+    let device = Device::Cpu;
+    let shape = &[1i32, 2, 4, 128];
+    let (storage, k_recon_before) = build_storage(KvQuant::Rotor3Sym, shape, 0xA140_2301, device);
+    let k_codes_before = match &storage {
+        KvStorage::RotorSym3 { k: Some(qk), .. } => qk.blocks[0].codes.clone(),
+        _ => panic!("expected RotorSym3 storage"),
+    };
+    let layers = vec![storage];
+    let path = tmp_path("rotor_sym_3_no_qjl");
+    KvBlockWriter::new(MODEL_ID, KvQuant::Rotor3Sym, &layers, &[])
+        .write(&path, device)
+        .unwrap();
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (rebuilt, _) = reader
+        .hydrate(MODEL_ID, KvQuant::Rotor3Sym, device)
+        .unwrap();
+    let (k_codes_after, use_qjl_after) = match &rebuilt[0] {
+        KvStorage::RotorSym3 { k: Some(qk), .. } => (qk.blocks[0].codes.clone(), qk.use_qjl()),
+        _ => panic!("expected RotorSym3 after hydrate"),
+    };
+    assert_eq!(k_codes_before, k_codes_after);
+    assert!(!use_qjl_after, "QJL must hydrate as OFF");
+    let k_recon_after = dequant_k(&rebuilt[0], device);
+    let max_k_err = k_recon_before
+        .iter()
+        .zip(&k_recon_after)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max_k_err < 1e-3, "rotor_sym_3 K dequant err {max_k_err}");
+    let _ = std::fs::remove_file(&path);
+    unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
+}
+
+/// Rotor3Sym SSD round-trip with QJL ON (default).
+#[test]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used)]
+fn roundtrip_rotor_sym_3_qjl() {
+    let _guard = ROTOR_QJL_ENV_LOCK.lock().unwrap();
+    unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
+    let device = Device::Cpu;
+    let shape = &[1i32, 2, 4, 128];
+    let (storage, _) = build_storage(KvQuant::Rotor3Sym, shape, 0xA140_2302, device);
+    let (k_codes_before, qjl_codes_before) = match &storage {
+        KvStorage::RotorSym3 { k: Some(qk), .. } => {
+            (qk.blocks[0].codes.clone(), qk.blocks[0].qjl_codes.clone())
+        }
+        _ => panic!("expected RotorSym3 storage"),
+    };
+    assert!(
+        !qjl_codes_before.is_empty(),
+        "QJL must be ON by default at build time"
+    );
+    let layers = vec![storage];
+    let path = tmp_path("rotor_sym_3_qjl");
+    KvBlockWriter::new(MODEL_ID, KvQuant::Rotor3Sym, &layers, &[])
+        .write(&path, device)
+        .unwrap();
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (rebuilt, _) = reader
+        .hydrate(MODEL_ID, KvQuant::Rotor3Sym, device)
+        .unwrap();
+    let (k_codes_after, qjl_codes_after, use_qjl_after) = match &rebuilt[0] {
+        KvStorage::RotorSym3 { k: Some(qk), .. } => (
+            qk.blocks[0].codes.clone(),
+            qk.blocks[0].qjl_codes.clone(),
+            qk.use_qjl(),
+        ),
+        _ => panic!("expected RotorSym3 after hydrate"),
+    };
+    assert_eq!(k_codes_before, k_codes_after);
+    assert_eq!(
+        qjl_codes_before, qjl_codes_after,
+        "QJL signs must hydrate bit-identically"
+    );
+    assert!(use_qjl_after, "use_qjl must be ON after hydrate");
+}
+
+/// Rotor4Sym SSD round-trip with QJL ON.
+#[test]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used)]
+fn roundtrip_rotor_sym_4_qjl() {
+    let _guard = ROTOR_QJL_ENV_LOCK.lock().unwrap();
+    unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
+    let device = Device::Cpu;
+    let shape = &[1i32, 2, 4, 128];
+    let (storage, _) = build_storage(KvQuant::Rotor4Sym, shape, 0xA140_2303, device);
+    let k_codes_before = match &storage {
+        KvStorage::RotorSym4 { k: Some(qk), .. } => qk.blocks[0].codes.clone(),
+        _ => panic!("expected RotorSym4"),
+    };
+    let layers = vec![storage];
+    let path = tmp_path("rotor_sym_4_qjl");
+    KvBlockWriter::new(MODEL_ID, KvQuant::Rotor4Sym, &layers, &[])
+        .write(&path, device)
+        .unwrap();
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (rebuilt, _) = reader
+        .hydrate(MODEL_ID, KvQuant::Rotor4Sym, device)
+        .unwrap();
+    let (k_codes_after, use_qjl_after) = match &rebuilt[0] {
+        KvStorage::RotorSym4 { k: Some(qk), .. } => (qk.blocks[0].codes.clone(), qk.use_qjl()),
+        _ => panic!("expected RotorSym4 after hydrate"),
+    };
+    assert_eq!(k_codes_before, k_codes_after);
+    assert!(use_qjl_after);
+}
+
+/// Rotor4Sym SSD round-trip with QJL OFF.
+#[test]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used)]
+fn roundtrip_rotor_sym_4_no_qjl() {
+    let _guard = ROTOR_QJL_ENV_LOCK.lock().unwrap();
+    unsafe { std::env::set_var("RMLX_ROTOR_QJL", "0") };
+    let device = Device::Cpu;
+    let shape = &[1i32, 2, 4, 128];
+    let (storage, _) = build_storage(KvQuant::Rotor4Sym, shape, 0xA140_2304, device);
+    let layers = vec![storage];
+    let path = tmp_path("rotor_sym_4_no_qjl");
+    KvBlockWriter::new(MODEL_ID, KvQuant::Rotor4Sym, &layers, &[])
+        .write(&path, device)
+        .unwrap();
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (rebuilt, _) = reader
+        .hydrate(MODEL_ID, KvQuant::Rotor4Sym, device)
+        .unwrap();
+    let use_qjl_after = match &rebuilt[0] {
+        KvStorage::RotorSym4 { k: Some(qk), .. } => qk.use_qjl(),
+        _ => panic!("expected RotorSym4 after hydrate"),
+    };
+    assert!(!use_qjl_after);
+    let _ = std::fs::remove_file(&path);
+    unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
+}
+
+/// RotorK3Asym SSD round-trip at (v_bits=4, v_group_size=64). Verifies the
+/// layout tag carries the V-side (bits, group) suffix so the reader can
+/// dispatch the correct affine V codec on hydrate.
+#[test]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used)]
+fn roundtrip_rotor_k3_asym_v4_g64() {
+    let _guard = ROTOR_QJL_ENV_LOCK.lock().unwrap();
+    unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
+    let device = Device::Cpu;
+    let shape = &[1i32, 2, 4, 128];
+    let kq = KvQuant::RotorK3Asym {
+        v_bits: 4,
+        v_group_size: 64,
+    };
+    let (storage, k_recon_before) = build_storage(kq, shape, 0xA158_3104, device);
+    let layers = vec![storage];
+    let path = tmp_path("rotor_k3_asym_v4_g64");
+    KvBlockWriter::new(MODEL_ID, kq, &layers, &[])
+        .write(&path, device)
+        .unwrap();
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (rebuilt, _) = reader.hydrate(MODEL_ID, kq, device).unwrap();
+    assert_eq!(rebuilt.len(), 1);
+    let (vb_after, vg_after) = match &rebuilt[0] {
+        KvStorage::RotorKAsym3 {
+            v_bits,
+            v_group_size,
+            ..
+        } => (*v_bits, *v_group_size),
+        _ => panic!("expected RotorKAsym3 after hydrate"),
+    };
+    assert_eq!(vb_after, 4);
+    assert_eq!(vg_after, 64);
+    let k_recon_after = dequant_k(&rebuilt[0], device);
+    assert_eq!(k_recon_before.len(), k_recon_after.len());
+    let max_err = k_recon_before
+        .iter()
+        .zip(&k_recon_after)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_err < 1e-3,
+        "rotor_k3_asym K dequant round-trip error {max_err} too large"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// RotorK4Asym SSD round-trip at (v_bits=3, v_group_size=64).
+#[test]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used)]
+fn roundtrip_rotor_k4_asym_v3_g64() {
+    let _guard = ROTOR_QJL_ENV_LOCK.lock().unwrap();
+    unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
+    let device = Device::Cpu;
+    let shape = &[1i32, 2, 4, 128];
+    let kq = KvQuant::RotorK4Asym {
+        v_bits: 3,
+        v_group_size: 64,
+    };
+    let (storage, k_recon_before) = build_storage(kq, shape, 0xA158_3105, device);
+    let layers = vec![storage];
+    let path = tmp_path("rotor_k4_asym_v3_g64");
+    KvBlockWriter::new(MODEL_ID, kq, &layers, &[])
+        .write(&path, device)
+        .unwrap();
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (rebuilt, _) = reader.hydrate(MODEL_ID, kq, device).unwrap();
+    assert_eq!(rebuilt.len(), 1);
+    let (vb_after, vg_after) = match &rebuilt[0] {
+        KvStorage::RotorKAsym4 {
+            v_bits,
+            v_group_size,
+            ..
+        } => (*v_bits, *v_group_size),
+        _ => panic!("expected RotorKAsym4 after hydrate"),
+    };
+    assert_eq!(vb_after, 3);
+    assert_eq!(vg_after, 64);
+    let k_recon_after = dequant_k(&rebuilt[0], device);
+    assert_eq!(k_recon_before.len(), k_recon_after.len());
+    let max_err = k_recon_before
+        .iter()
+        .zip(&k_recon_after)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max_err < 1e-3);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// RotorKOnly3 SSD round-trip with QJL ON.
+#[test]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used)]
+fn roundtrip_rotor_k_only_3_qjl() {
+    let _guard = ROTOR_QJL_ENV_LOCK.lock().unwrap();
+    unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
+    let device = Device::Cpu;
+    let shape = &[1i32, 2, 4, 128];
+    let (storage, _) = build_storage(KvQuant::RotorKOnly3, shape, 0xA140_2305, device);
+    let layers = vec![storage];
+    let path = tmp_path("rotor_k_only_3_qjl");
+    KvBlockWriter::new(MODEL_ID, KvQuant::RotorKOnly3, &layers, &[])
+        .write(&path, device)
+        .unwrap();
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (rebuilt, _) = reader
+        .hydrate(MODEL_ID, KvQuant::RotorKOnly3, device)
+        .unwrap();
+    let use_qjl_after = match &rebuilt[0] {
+        KvStorage::RotorKOnly3 { k: Some(qk), .. } => qk.use_qjl(),
+        _ => panic!("expected RotorKOnly3 after hydrate"),
+    };
+    assert!(use_qjl_after);
+}
+
+/// RotorKOnly3 SSD round-trip with QJL OFF.
+#[test]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used)]
+fn roundtrip_rotor_k_only_3_no_qjl() {
+    let _guard = ROTOR_QJL_ENV_LOCK.lock().unwrap();
+    unsafe { std::env::set_var("RMLX_ROTOR_QJL", "0") };
+    let device = Device::Cpu;
+    let shape = &[1i32, 2, 4, 128];
+    let (storage, _) = build_storage(KvQuant::RotorKOnly3, shape, 0xA140_2306, device);
+    let layers = vec![storage];
+    let path = tmp_path("rotor_k_only_3_no_qjl");
+    KvBlockWriter::new(MODEL_ID, KvQuant::RotorKOnly3, &layers, &[])
+        .write(&path, device)
+        .unwrap();
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (rebuilt, _) = reader
+        .hydrate(MODEL_ID, KvQuant::RotorKOnly3, device)
+        .unwrap();
+    let use_qjl_after = match &rebuilt[0] {
+        KvStorage::RotorKOnly3 { k: Some(qk), .. } => qk.use_qjl(),
+        _ => panic!("expected RotorKOnly3 after hydrate"),
+    };
+    assert!(!use_qjl_after);
+    let _ = std::fs::remove_file(&path);
+    unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
+}
+
+/// RotorKOnly4 SSD round-trip with QJL ON.
+#[test]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used)]
+fn roundtrip_rotor_k_only_4_qjl() {
+    let _guard = ROTOR_QJL_ENV_LOCK.lock().unwrap();
+    unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
+    let device = Device::Cpu;
+    let shape = &[1i32, 2, 4, 128];
+    let (storage, _) = build_storage(KvQuant::RotorKOnly4, shape, 0xA140_2307, device);
+    let layers = vec![storage];
+    let path = tmp_path("rotor_k_only_4_qjl");
+    KvBlockWriter::new(MODEL_ID, KvQuant::RotorKOnly4, &layers, &[])
+        .write(&path, device)
+        .unwrap();
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (rebuilt, _) = reader
+        .hydrate(MODEL_ID, KvQuant::RotorKOnly4, device)
+        .unwrap();
+    let use_qjl_after = match &rebuilt[0] {
+        KvStorage::RotorKOnly4 { k: Some(qk), .. } => qk.use_qjl(),
+        _ => panic!("expected RotorKOnly4 after hydrate"),
+    };
+    assert!(use_qjl_after);
+}
+
+/// RotorKOnly4 SSD round-trip with QJL OFF.
+#[test]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used)]
+fn roundtrip_rotor_k_only_4_no_qjl() {
+    let _guard = ROTOR_QJL_ENV_LOCK.lock().unwrap();
+    unsafe { std::env::set_var("RMLX_ROTOR_QJL", "0") };
+    let device = Device::Cpu;
+    let shape = &[1i32, 2, 4, 128];
+    let (storage, _) = build_storage(KvQuant::RotorKOnly4, shape, 0xA140_2308, device);
+    let layers = vec![storage];
+    let path = tmp_path("rotor_k_only_4_no_qjl");
+    KvBlockWriter::new(MODEL_ID, KvQuant::RotorKOnly4, &layers, &[])
+        .write(&path, device)
+        .unwrap();
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (rebuilt, _) = reader
+        .hydrate(MODEL_ID, KvQuant::RotorKOnly4, device)
+        .unwrap();
+    let use_qjl_after = match &rebuilt[0] {
+        KvStorage::RotorKOnly4 { k: Some(qk), .. } => qk.use_qjl(),
+        _ => panic!("expected RotorKOnly4 after hydrate"),
+    };
+    assert!(!use_qjl_after);
+    let _ = std::fs::remove_file(&path);
+    unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
+}
+
+/// SSD round-trip preserves `layer_idx` positionally.
+///
+/// Builds N rotor3 caches with distinct `layer_idx` values via
+/// [`KvCache::from_storage`], spills via [`write_caches`], then hydrates via
+/// [`read_caches`] and asserts that every hydrated cache's `layer_idx` matches
+/// the original. This is the integration-level contract for `write_caches`:
+/// the on-disk `.kvb` format does not persist `layer_idx`, so the hydrate path
+/// reconstructs it positionally. Out-of-order spill would scramble rotor3
+/// seeds at hydrate — this test would catch that regression.
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: N small, fixed-size loop"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test-only: panic on unexpected error is the desired failure mode"
+)]
+fn ssd_roundtrip_preserves_layer_idx_positional() {
+    let device = Device::Cpu;
+    let shape = &[1i32, 2, 4, 96];
+    let n_layers = 4usize;
+
+    // Build n_layers rotor3 storages (distinct seeds), wrap each as a KvCache
+    // with `layer_idx = i`. The `offset` argument matches the recorded
+    // sequence dimension (shape[2]=4).
+    let mut caches: Vec<KvCache> = Vec::with_capacity(n_layers);
+    for i in 0..n_layers {
+        let (storage, _) = build_storage(KvQuant::Rotor3, shape, 0xA154_0000 ^ (i as u64), device);
+        caches.push(KvCache::from_storage(storage, KvQuant::Rotor3, 4, i));
+    }
+
+    // Sanity: pre-spill layer_idx matches.
+    for (i, c) in caches.iter().enumerate() {
+        assert_eq!(c.layer_idx(), i, "pre-spill: layer_idx mismatch at {i}");
+    }
+
+    // Spill (layer-ordered) → hydrate → verify positional layer_idx restoration.
+    let path = tmp_path("layer_idx_positional");
+    write_caches(&path, device, MODEL_ID, KvQuant::Rotor3, &caches, &[]).unwrap();
+    let (hydrated, _lin) = read_caches(&path, device, MODEL_ID, KvQuant::Rotor3).unwrap();
+
+    assert_eq!(
+        hydrated.len(),
+        n_layers,
+        "hydrated layer count must match spill"
+    );
+    for (i, c) in hydrated.iter().enumerate() {
+        assert_eq!(
+            c.layer_idx(),
+            i,
+            "hydrated layer_idx must match positional index (write_caches contract)"
+        );
+    }
+
+    let _ = std::fs::remove_file(&path);
+}

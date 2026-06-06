@@ -1,0 +1,458 @@
+//! Laguna greedy autoregressive generation loop.
+//!
+//! [`generate_greedy`] drives prefill and decode for the Laguna architecture,
+//! including chunked prefill, KV-cache management, and streaming token delivery.
+//!
+//! # Public API
+//!
+//! - [`generate_greedy`] — main generation entry point.
+
+#![allow(
+    clippy::cognitive_complexity,
+    clippy::collapsible_else_if,
+    clippy::too_many_lines
+)]
+use std::time::Instant;
+
+use rmlx_core::error::Result;
+use rmlx_mlx::{argmax, Array, Device, Dtype};
+
+use crate::constraint::ConstraintEngine;
+use crate::kv_cache::{kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N};
+use crate::sampler::apply_mask_argmax;
+use rmlx_kv_quant::{KvCache, KV_MAX_SEQ_DEFAULT};
+
+use super::model::LagunaText;
+
+// ---------------------------------------------------------------------------
+// Smoke probe -- generate_greedy
+// ---------------------------------------------------------------------------
+
+/// Count NaN values in a byte buffer of floats (F32 or Bf16).
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "wildcard arm is the correct fallthrough for unsupported arch/quant variants; exhaustive expansion would require updating on every new variant"
+)]
+fn count_nan_in_bytes(bytes: &[u8], dtype: Dtype) -> usize {
+    match dtype {
+        Dtype::F32 => bytes
+            .chunks_exact(4)
+            .filter(|c| f32::from_le_bytes((*c).try_into().unwrap()).is_nan())
+            .count(),
+        Dtype::Bf16 => bytes
+            .chunks_exact(2)
+            .filter(|c| {
+                let raw = u16::from_le_bytes((*c).try_into().unwrap());
+                f32::from_bits(u32::from(raw) << 16).is_nan()
+            })
+            .count(),
+        _ => 0,
+    }
+}
+
+/// Compute max(|logit|) from a byte buffer. Returns 0.0 on empty or unknown dtype.
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "wildcard arm is the correct fallthrough for unsupported arch/quant variants; exhaustive expansion would require updating on every new variant"
+)]
+fn max_abs_from_bytes(bytes: &[u8], dtype: Dtype) -> f32 {
+    match dtype {
+        Dtype::F32 => bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes((*c).try_into().unwrap()).abs())
+            .fold(0.0_f32, f32::max),
+        Dtype::Bf16 => bytes
+            .chunks_exact(2)
+            .map(|c| {
+                let raw = u16::from_le_bytes((*c).try_into().unwrap());
+                f32::from_bits(u32::from(raw) << 16).abs()
+            })
+            .fold(0.0_f32, f32::max),
+        _ => 0.0,
+    }
+}
+
+/// Greedy autoregressive generation using KV-cache prefill + decode.
+///
+/// Returns `Vec<ProbeStep>` -- same shape as `gemma4::generate_greedy`.
+#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+pub fn generate_greedy(
+    model: &LagunaText,
+    tokenizer: &tokenizers::Tokenizer,
+    prompt_ids: &[u32],
+    n_tokens: usize,
+    device: Device,
+    kv_quant: rmlx_kv_quant::KvQuant,
+    max_ctx_override: Option<i32>,
+    eos_ids: &[u32],
+    step_fn: &mut dyn FnMut(&crate::gemma4::ProbeStep) -> Option<u32>,
+    // A6.2: optional sampler constraint. See gemma4::generate_greedy.
+    mut constraint: Option<&mut dyn ConstraintEngine>,
+    // A7.2: sampling config + per-request RNG. See gemma3::generate_greedy.
+    sampler_cfg: &crate::sampler::SamplerConfig,
+    rng: &mut crate::sampler::Pcg32,
+    // A7.3: logit-penalty configuration + per-request token history.
+    penalty_cfg: &crate::sampler::PenaltyConfig,
+    token_history: &mut Vec<u32>,
+) -> Result<Vec<crate::gemma4::ProbeStep>> {
+    use crate::gemma4::ProbeStep;
+
+    tracing::info!(
+        arch = "LagunaForCausalLM",
+        ?kv_quant,
+        ?max_ctx_override,
+        "generate_greedy: selected KV cache quant"
+    );
+
+    if n_tokens == 0 {
+        return Ok(vec![]);
+    }
+
+    let vocab = model.cfg.vocab_size as i32;
+    let mut steps = Vec::with_capacity(n_tokens);
+
+    // Decode profile timers. See gemma4::generate_greedy for rationale.
+    let mut forward_total_ns: u128 = 0;
+    let mut eval_total_ns: u128 = 0;
+    let mut step_total_ns: u128 = 0;
+    let mut decode_steps: u32 = 0;
+    let prefill_t0 = Instant::now();
+
+    let max_seq = max_ctx_override.unwrap_or(KV_MAX_SEQ_DEFAULT);
+
+    // Allocate one KvCache per decoder layer using the selected quant mode.
+    // Force K8V8 for boundary layers (first head_n + last tail_n).
+    let n_layers = model.cfg.num_hidden_layers;
+    let mut caches: Vec<KvCache> = (0..n_layers)
+        .map(|i| {
+            let q = kv_quant_for_layer(
+                i,
+                n_layers,
+                kv_quant,
+                LAYER_ADAPTIVE_TAIL_N,
+                LAYER_ADAPTIVE_HEAD_N,
+            );
+            KvCache::with_quant_max_seq(q, max_seq).with_layer_idx(i)
+        })
+        .collect();
+
+    // Prefill: encode the prompt in fixed-size chunks. Per chunk we
+    // eval only the KV-cache prefill_raw buffers, not the logits, so MLX
+    // lazily skips the lm_head matmul on every non-final chunk. The Metal
+    // command buffer still flushes between chunks via the cache evals.
+    //
+    // enter_prefill() / exit_prefill() bracket the loop so K/V are stored
+    // as raw BF16 during chunked prefill instead of being
+    // quantize-dequantized on every chunk.
+    //
+    // Chunk size is per-arch; default 256 for laguna (preserves pre-tuning
+    // value, no laguna bench data yet), override via `RMLX_PREFILL_CHUNK`
+    // (global) or `RMLX_PREFILL_CHUNK_LAGUNA` (per-arch).
+    let prefill_chunk = crate::prefill_chunk::prefill_chunk_for("laguna");
+    for c in &mut caches {
+        c.enter_prefill();
+    }
+    let prefill_logits = {
+        let mut last_logits: Option<Array> = None;
+        let mut prefill_ok = true;
+        let n_chunks = prompt_ids.len().div_ceil(prefill_chunk);
+        'prefill: for (chunk_idx, chunk) in prompt_ids.chunks(prefill_chunk).enumerate() {
+            let is_last = chunk_idx + 1 == n_chunks;
+            match model.forward_seq_with_cache(chunk, Some(&mut caches), device) {
+                Ok(logits) => {
+                    if is_last {
+                        last_logits = Some(logits);
+                    } else {
+                        for c in &caches {
+                            if let Err(e) = c.eval_prefill_state() {
+                                tracing::warn!(
+                                    error = %e,
+                                    chunk_len = chunk.len(),
+                                    "laguna generate_greedy: prefill chunk cache eval failed"
+                                );
+                                prefill_ok = false;
+                                break 'prefill;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        prompt_len = prompt_ids.len(),
+                        "laguna generate_greedy: prefill chunk failed, returning empty"
+                    );
+                    prefill_ok = false;
+                    break 'prefill;
+                }
+            }
+        }
+        for c in &mut caches {
+            if let Err(e) = c.exit_prefill(device) {
+                tracing::warn!(error = %e, "laguna generate_greedy: exit_prefill quantization failed");
+                prefill_ok = false;
+                break;
+            }
+        }
+        if !prefill_ok || last_logits.is_none() {
+            return Ok(steps);
+        }
+        last_logits.unwrap()
+    };
+
+    let logits_flat = prefill_logits.reshape(&[1, vocab], device)?;
+    logits_flat.eval()?;
+
+    let logit_bytes = logits_flat.to_bytes()?;
+    let nan_count = count_nan_in_bytes(&logit_bytes, logits_flat.dtype());
+    let max_abs_logit = max_abs_from_bytes(&logit_bytes, logits_flat.dtype());
+
+    // A6.2 masked-argmax fork (first emit).
+    let mask_active = constraint.as_ref().is_some_and(|c| c.wants_mask());
+    // A7.2: temp<=0 keeps the exact greedy block below; temp>0 host-samples.
+    let sampling_active = sampler_cfg.sampling_active();
+    let penalties_active = penalty_cfg.penalties_active();
+    // A7.3: trailing-20 window (empty at prefill step 0).
+    let win_start = token_history.len().saturating_sub(20);
+    let recent = &token_history[win_start..];
+    let top = if sampling_active {
+        let mask_opt: Option<&[bool]> = if mask_active {
+            Some(constraint.as_mut().unwrap().step_mask(vocab as usize))
+        } else {
+            None
+        };
+        crate::sampler::sample_token_array(
+            &logits_flat,
+            sampler_cfg,
+            mask_opt,
+            penalty_cfg,
+            recent,
+            rng,
+            device,
+        )?
+    } else {
+        if penalties_active {
+            let mask_opt: Option<&[bool]> = if mask_active {
+                Some(constraint.as_mut().unwrap().step_mask(vocab as usize))
+            } else {
+                None
+            };
+            crate::sampler::argmax_with_penalties(
+                &logits_flat,
+                mask_opt,
+                penalty_cfg,
+                recent,
+                device,
+            )?
+        } else if mask_active {
+            let c = constraint.as_mut().unwrap();
+            let m = c.step_mask(vocab as usize);
+            apply_mask_argmax(&logits_flat, m, device)?
+        } else {
+            argmax(&logits_flat, -1, device)?
+        }
+    };
+    top.eval()?;
+    let top_bytes = top.to_bytes()?;
+    let mut last_id = i32::from_le_bytes(top_bytes[..4].try_into().unwrap()) as u32;
+    // A6.2: advance constraint with emitted id.
+    if let Some(c) = constraint.as_mut() {
+        c.advance(last_id);
+    }
+    // A7.3: push prefill token into history.
+    token_history.push(last_id);
+    let prefill_total_ns = prefill_t0.elapsed().as_nanos();
+
+    let piece = tokenizer
+        .id_to_token(last_id)
+        .unwrap_or_else(|| format!("<unk:{last_id}>"));
+
+    tracing::debug!(
+        step = 0,
+        token_id = last_id,
+        piece = %piece,
+        max_abs_logit,
+        nan_count,
+        prompt_len = prompt_ids.len(),
+        "laguna generate_greedy prefill"
+    );
+
+    steps.push(ProbeStep {
+        token_id: last_id,
+        piece: piece.into_boxed_str(),
+        max_abs_logit,
+        nan_count,
+        logprobs: None,
+    });
+    step_fn(steps.last().unwrap());
+
+    if nan_count > 0 {
+        return Ok(steps);
+    }
+
+    // EOS-stop. If prefill emitted an EOS already, no decode steps.
+    if eos_ids.contains(&last_id) {
+        return Ok(steps);
+    }
+
+    // Decode: one token at a time.
+    for step_idx in 1..n_tokens {
+        let step_t0 = Instant::now();
+        let fwd_t0 = Instant::now();
+        let decode_logits =
+            match model.forward_seq_with_cache(&[last_id], Some(&mut caches), device) {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::warn!(
+                        step = step_idx,
+                        error = %e,
+                        "laguna generate_greedy: decode step failed, stopping early"
+                    );
+                    break;
+                }
+            };
+        let fwd_dt = fwd_t0.elapsed().as_nanos();
+
+        let eval_t0 = Instant::now();
+        let logits_flat = decode_logits.reshape(&[1, vocab], device)?;
+        logits_flat.eval()?;
+
+        let logit_bytes = logits_flat.to_bytes()?;
+        let nan_count = count_nan_in_bytes(&logit_bytes, logits_flat.dtype());
+        let max_abs_logit = max_abs_from_bytes(&logit_bytes, logits_flat.dtype());
+
+        // A6.3: only apply mask when engine is engaged (wants_mask).
+        let mask_active = constraint.as_ref().is_some_and(|c| c.wants_mask());
+        // A7.2: temp<=0 keeps the exact greedy block below; temp>0 host-samples.
+        let sampling_active = sampler_cfg.sampling_active();
+        let penalties_active = penalty_cfg.penalties_active();
+        // A7.3: trailing-20 window for penalty context.
+        let win_start = token_history.len().saturating_sub(20);
+        let recent = &token_history[win_start..];
+        let top = if sampling_active {
+            let mask_opt: Option<&[bool]> = if mask_active {
+                Some(constraint.as_mut().unwrap().step_mask(vocab as usize))
+            } else {
+                None
+            };
+            crate::sampler::sample_token_array(
+                &logits_flat,
+                sampler_cfg,
+                mask_opt,
+                penalty_cfg,
+                recent,
+                rng,
+                device,
+            )?
+        } else {
+            if penalties_active {
+                let mask_opt: Option<&[bool]> = if mask_active {
+                    Some(constraint.as_mut().unwrap().step_mask(vocab as usize))
+                } else {
+                    None
+                };
+                crate::sampler::argmax_with_penalties(
+                    &logits_flat,
+                    mask_opt,
+                    penalty_cfg,
+                    recent,
+                    device,
+                )?
+            } else if mask_active {
+                let c = constraint.as_mut().unwrap();
+                let m = c.step_mask(vocab as usize);
+                apply_mask_argmax(&logits_flat, m, device)?
+            } else {
+                argmax(&logits_flat, -1, device)?
+            }
+        };
+        top.eval()?;
+        let top_bytes = top.to_bytes()?;
+        let next_id = i32::from_le_bytes(top_bytes[..4].try_into().unwrap()) as u32;
+        // A6.2: advance constraint with emitted id.
+        if let Some(c) = constraint.as_mut() {
+            c.advance(next_id);
+        }
+        // A7.3: accumulate emitted token into history.
+        token_history.push(next_id);
+        let eval_dt = eval_t0.elapsed().as_nanos();
+        forward_total_ns += fwd_dt;
+        eval_total_ns += eval_dt;
+        step_total_ns += step_t0.elapsed().as_nanos();
+        decode_steps += 1;
+
+        let piece = tokenizer
+            .id_to_token(next_id)
+            .unwrap_or_else(|| format!("<unk:{next_id}>"));
+
+        tracing::debug!(
+            step = step_idx,
+            token_id = next_id,
+            piece = %piece,
+            max_abs_logit,
+            nan_count,
+            "laguna generate_greedy decode step"
+        );
+
+        steps.push(ProbeStep {
+            token_id: next_id,
+            piece: piece.into_boxed_str(),
+            max_abs_logit,
+            nan_count,
+            logprobs: None,
+        });
+        step_fn(steps.last().unwrap());
+
+        if nan_count > 0 {
+            break;
+        }
+
+        // EOS-stop in the decode loop.
+        if eos_ids.contains(&next_id) {
+            tracing::debug!(
+                step = step_idx,
+                token_id = next_id,
+                "laguna generate_greedy: EOS emitted, stopping decode loop"
+            );
+            break;
+        }
+
+        last_id = next_id;
+    }
+
+    let prefill_ms = (prefill_total_ns as f64) / 1.0e6;
+    let forward_ms = (forward_total_ns as f64) / 1.0e6;
+    let eval_ms = (eval_total_ns as f64) / 1.0e6;
+    let step_ms = (step_total_ns as f64) / 1.0e6;
+    let n = f64::from(decode_steps.max(1));
+    tracing::info!(
+        target: "decode_profile",
+        arch = "LagunaForCausalLM",
+        n_steps = decode_steps,
+        prefill_ms,
+        forward_total_ms = forward_ms,
+        eval_total_ms = eval_ms,
+        step_total_ms = step_ms,
+        forward_per_step_ms = forward_ms / n,
+        eval_per_step_ms = eval_ms / n,
+        "decode_profile"
+    );
+
+    Ok(steps)
+}

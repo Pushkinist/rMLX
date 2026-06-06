@@ -1,0 +1,1280 @@
+# rMLX E2E feature-proof manifest — Phase 1 (Bonsai run-1).
+#
+# One [[case]] per feature × sub-feature. The runner
+# (`tests/e2e/runner.rs`) parses this, drives the real `rmlx` binary, and
+# asserts. See `docs/E2E_TEST_PLAN.md`.
+#
+# Fields:
+#   id          unique case id
+#   feature     grid row group
+#   subfeature  grid sub-row
+#   model       env-var KEY ("BONSAI") → snapshot path; omit for model-free CLI
+#   cli         [...] subcommand+flags ($MODEL substitutes the resolved path)
+#   serve_flags [...] extra `rmlx serve` flags (paired with `request`)
+#   request     named request fixture (see runner::request_fixture)
+#   kv_quant    --kv-quant preset for serve cases
+#   assert      { kind, expect, min_cosine }
+#   tags        ["run1","quant",...]; "phase2" rows are stubbed, never executed
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. CLI surface (no / low GPU)
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[case]]
+id = "cli_info_list_cache_types"
+feature = "cli_surface"
+subfeature = "info --list-cache-types"
+# The table lists per-side codec tags (q8_g128, q4_g64, bf16), not composite
+# KvQuant names; anchor on the stable bf16 row.
+cli = ["info", "--list-cache-types"]
+assert = { kind = "metric_present", expect = "q8_g128" }
+tags = ["run1", "cli"]
+
+[[case]]
+id = "cli_info_probe_smoke"
+feature = "cli_surface"
+subfeature = "info --probe-smoke"
+model = "BONSAI"
+cli = ["info", "--model", "$MODEL", "--probe-smoke"]
+assert = { kind = "exit_code", expect = "0" }
+tags = ["run1", "cli"]
+
+[[case]]
+id = "cli_baseline_record"
+feature = "cli_surface"
+subfeature = "baseline --record"
+model = "BONSAI"
+# Explicit absolute --prompt: the bundled default resolves CWD-relative and the
+# test CWD is the crate dir, not the workspace root.
+cli = ["baseline", "--model", "$MODEL", "--prompt", "$FIXTURES/baseline_prompt_smoke.txt", "--max-tokens", "16", "--record"]
+assert = { kind = "exit_code", expect = "0" }
+tags = ["run1", "cli"]
+
+[[case]]
+id = "cli_metrics_query"
+feature = "cli_surface"
+subfeature = "metrics query"
+cli = ["metrics", "query", "SELECT name FROM sqlite_master WHERE type='table'"]
+assert = { kind = "metric_present", expect = "observations" }
+tags = ["run1", "cli"]
+
+[[case]]
+id = "cli_healthcheck_full"
+feature = "cli_surface"
+subfeature = "healthcheck --full"
+model = "BONSAI"
+cli = ["healthcheck", "--model", "$MODEL", "--full"]
+assert = { kind = "exit_code", expect = "0" }
+tags = ["run1", "cli"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. Text core (temp=0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[case]]
+id = "text_chat_nonstream"
+feature = "text_core"
+subfeature = "chat non-stream"
+model = "BONSAI"
+serve_flags = []
+request = "chat_basic"
+assert = { kind = "golden", expect = "Paris" }
+tags = ["run1", "text"]
+
+[[case]]
+id = "text_chat_stream"
+feature = "text_core"
+subfeature = "chat stream"
+model = "BONSAI"
+serve_flags = []
+request = "chat_stream"
+# SSE stream exposes no per-token logprob bytes → substring+coherence, not a
+# byte-for-byte golden. Honest kind: contains_coherent.
+assert = { kind = "contains_coherent", expect = "Paris" }
+tags = ["run1", "text"]
+
+[[case]]
+id = "text_anthropic_messages"
+feature = "text_core"
+subfeature = "anthropic /v1/messages"
+model = "BONSAI"
+serve_flags = []
+request = "anthropic_basic"
+# /v1/messages exposes no per-token logprob bytes → substring+coherence, not a
+# byte-for-byte golden. Honest kind: contains_coherent.
+assert = { kind = "contains_coherent", expect = "Paris" }
+tags = ["run1", "text"]
+
+[[case]]
+id = "text_multi_turn"
+feature = "text_core"
+subfeature = "multi-turn"
+model = "BONSAI"
+serve_flags = []
+request = "multi_turn"
+assert = { kind = "coherent", expect = "teal" }
+tags = ["run1", "text"]
+
+[[case]]
+id = "text_stop"
+feature = "text_core"
+subfeature = "stop sequence"
+model = "BONSAI"
+serve_flags = []
+# stop_halts sends the same prompt with/without `stop` and asserts the stopped
+# completion is strictly shorter (generation halted at the stop boundary).
+#
+# Stop sequences now truncate the content at the first match (stop string
+# excluded) and set finish_reason="stop", for OpenAI + Anthropic, streaming +
+# non-streaming, including token-straddling stops.
+assert = { kind = "stop_halts" }
+tags = ["run1", "text"]
+
+[[case]]
+id = "text_seed_determinism"
+feature = "text_core"
+subfeature = "seed determinism"
+model = "BONSAI"
+serve_flags = []
+request = "chat_basic"
+assert = { kind = "golden", expect = "Paris" }
+tags = ["run1", "text"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. Quant matrix — every legal Bonsai (dense Qwen3) KV preset.
+#    Full codecs: coherent + NIAH@8k + cosine≥0.99.
+#    Each preset gets a coherence + NIAH + cosine triple of cases.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# --- k8v8 ---
+[[case]]
+id = "quant_k8v8_coherent"
+feature = "quant_matrix"
+subfeature = "k8v8 / coherent"
+model = "BONSAI"
+kv_quant = "k8v8"
+request = "chat_basic"
+assert = { kind = "coherent", expect = "Paris" }
+tags = ["run1", "quant"]
+
+[[case]]
+id = "quant_k8v8_niah"
+feature = "quant_matrix"
+subfeature = "k8v8 / niah@8k"
+model = "BONSAI"
+kv_quant = "k8v8"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run1", "quant"]
+
+[[case]]
+id = "quant_k8v8_cosine"
+feature = "quant_matrix"
+subfeature = "k8v8 / cosine"
+model = "BONSAI"
+kv_quant = "k8v8"
+request = "chat_logprobs"
+assert = { kind = "cosine_vs_bf16", min_cosine = 0.99 }
+tags = ["run1", "quant"]
+
+# --- k8v4 ---
+[[case]]
+id = "quant_k8v4_coherent"
+feature = "quant_matrix"
+subfeature = "k8v4 / coherent"
+model = "BONSAI"
+kv_quant = "k8v4"
+request = "chat_basic"
+assert = { kind = "coherent", expect = "Paris" }
+tags = ["run1", "quant"]
+
+[[case]]
+id = "quant_k8v4_niah"
+feature = "quant_matrix"
+subfeature = "k8v4 / niah@8k"
+model = "BONSAI"
+kv_quant = "k8v4"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run1", "quant"]
+
+[[case]]
+id = "quant_k8v4_cosine"
+feature = "quant_matrix"
+subfeature = "k8v4 / cosine"
+model = "BONSAI"
+kv_quant = "k8v4"
+request = "chat_logprobs"
+assert = { kind = "cosine_vs_bf16", min_cosine = 0.99 }
+tags = ["run1", "quant"]
+
+# --- k8vturbo3 ---
+[[case]]
+id = "quant_k8vturbo3_coherent"
+feature = "quant_matrix"
+subfeature = "k8vturbo3 / coherent"
+model = "BONSAI"
+kv_quant = "k8vturbo3"
+request = "chat_basic"
+assert = { kind = "coherent", expect = "Paris" }
+tags = ["run1", "quant"]
+
+[[case]]
+id = "quant_k8vturbo3_niah"
+feature = "quant_matrix"
+subfeature = "k8vturbo3 / niah@8k"
+model = "BONSAI"
+kv_quant = "k8vturbo3"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run1", "quant"]
+
+[[case]]
+id = "quant_k8vturbo3_cosine"
+feature = "quant_matrix"
+subfeature = "k8vturbo3 / cosine"
+model = "BONSAI"
+kv_quant = "k8vturbo3"
+request = "chat_logprobs"
+assert = { kind = "cosine_vs_bf16", min_cosine = 0.99 }
+tags = ["run1", "quant"]
+
+# --- k8vturbo2 ---
+[[case]]
+id = "quant_k8vturbo2_coherent"
+feature = "quant_matrix"
+subfeature = "k8vturbo2 / coherent"
+model = "BONSAI"
+kv_quant = "k8vturbo2"
+request = "chat_basic"
+assert = { kind = "coherent", expect = "Paris" }
+tags = ["run1", "quant"]
+
+[[case]]
+id = "quant_k8vturbo2_niah"
+feature = "quant_matrix"
+subfeature = "k8vturbo2 / niah@8k"
+model = "BONSAI"
+kv_quant = "k8vturbo2"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run1", "quant"]
+
+[[case]]
+id = "quant_k8vturbo2_cosine"
+feature = "quant_matrix"
+subfeature = "k8vturbo2 / cosine"
+model = "BONSAI"
+kv_quant = "k8vturbo2"
+request = "chat_logprobs"
+assert = { kind = "cosine_vs_bf16", min_cosine = 0.97 }
+tags = ["run1", "quant"]
+
+# --- k8vturbo3tcq ---
+[[case]]
+id = "quant_k8vturbo3tcq_coherent"
+feature = "quant_matrix"
+subfeature = "k8vturbo3tcq / coherent"
+model = "BONSAI"
+kv_quant = "k8vturbo3tcq"
+request = "chat_basic"
+assert = { kind = "coherent", expect = "Paris" }
+tags = ["run1", "quant"]
+
+[[case]]
+id = "quant_k8vturbo3tcq_niah"
+feature = "quant_matrix"
+subfeature = "k8vturbo3tcq / niah@8k"
+model = "BONSAI"
+kv_quant = "k8vturbo3tcq"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run1", "quant"]
+
+# --- k8vturbo2tcq ---
+[[case]]
+id = "quant_k8vturbo2tcq_coherent"
+feature = "quant_matrix"
+subfeature = "k8vturbo2tcq / coherent"
+model = "BONSAI"
+kv_quant = "k8vturbo2tcq"
+request = "chat_basic"
+assert = { kind = "coherent", expect = "Paris" }
+tags = ["run1", "quant"]
+
+[[case]]
+id = "quant_k8vturbo2tcq_niah"
+feature = "quant_matrix"
+subfeature = "k8vturbo2tcq / niah@8k"
+model = "BONSAI"
+kv_quant = "k8vturbo2tcq"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run1", "quant"]
+
+# --- planar ---
+[[case]]
+id = "quant_planar_coherent"
+feature = "quant_matrix"
+subfeature = "planar / coherent"
+model = "BONSAI"
+kv_quant = "planar"
+request = "chat_basic"
+assert = { kind = "coherent", expect = "Paris" }
+tags = ["run1", "quant"]
+
+[[case]]
+id = "quant_planar_niah"
+feature = "quant_matrix"
+subfeature = "planar / niah@8k"
+model = "BONSAI"
+kv_quant = "planar"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run1", "quant"]
+
+[[case]]
+id = "quant_planar_cosine"
+feature = "quant_matrix"
+subfeature = "planar / cosine"
+model = "BONSAI"
+kv_quant = "planar"
+request = "chat_logprobs"
+assert = { kind = "cosine_vs_bf16", min_cosine = 0.99 }
+tags = ["run1", "quant"]
+
+# --- planar3 ---
+[[case]]
+id = "quant_planar3_coherent"
+feature = "quant_matrix"
+subfeature = "planar3 / coherent"
+model = "BONSAI"
+kv_quant = "planar3"
+request = "chat_basic"
+assert = { kind = "coherent", expect = "Paris" }
+tags = ["run1", "quant"]
+
+[[case]]
+id = "quant_planar3_niah"
+feature = "quant_matrix"
+subfeature = "planar3 / niah@8k"
+model = "BONSAI"
+kv_quant = "planar3"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run1", "quant"]
+
+# --- iso3 ---
+[[case]]
+id = "quant_iso3_coherent"
+feature = "quant_matrix"
+subfeature = "iso3 / coherent"
+model = "BONSAI"
+kv_quant = "iso3"
+request = "chat_basic"
+assert = { kind = "coherent", expect = "Paris" }
+tags = ["run1", "quant"]
+
+[[case]]
+id = "quant_iso3_niah"
+feature = "quant_matrix"
+subfeature = "iso3 / niah@8k"
+model = "BONSAI"
+kv_quant = "iso3"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run1", "quant"]
+
+# --- iso4 ---
+[[case]]
+id = "quant_iso4_coherent"
+feature = "quant_matrix"
+subfeature = "iso4 / coherent"
+model = "BONSAI"
+kv_quant = "iso4"
+request = "chat_basic"
+assert = { kind = "coherent", expect = "Paris" }
+tags = ["run1", "quant"]
+
+[[case]]
+id = "quant_iso4_niah"
+feature = "quant_matrix"
+subfeature = "iso4 / niah@8k"
+model = "BONSAI"
+kv_quant = "iso4"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run1", "quant"]
+
+# --- rotor3 ---
+[[case]]
+id = "quant_rotor3_coherent"
+feature = "quant_matrix"
+subfeature = "rotor3 / coherent"
+model = "BONSAI"
+kv_quant = "rotor3"
+request = "chat_basic"
+assert = { kind = "coherent", expect = "Paris" }
+tags = ["run1", "quant"]
+
+[[case]]
+id = "quant_rotor3_niah"
+feature = "quant_matrix"
+subfeature = "rotor3 / niah@8k"
+model = "BONSAI"
+kv_quant = "rotor3"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run1", "quant"]
+
+# --- rotor4 ---
+[[case]]
+id = "quant_rotor4_coherent"
+feature = "quant_matrix"
+subfeature = "rotor4 / coherent"
+model = "BONSAI"
+kv_quant = "rotor4"
+request = "chat_basic"
+assert = { kind = "coherent", expect = "Paris" }
+tags = ["run1", "quant"]
+
+[[case]]
+id = "quant_rotor4_niah"
+feature = "quant_matrix"
+subfeature = "rotor4 / niah@8k"
+model = "BONSAI"
+kv_quant = "rotor4"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run1", "quant"]
+
+# --- mixed_k8g64_v4g64 ---
+[[case]]
+id = "quant_mixed_coherent"
+feature = "quant_matrix"
+subfeature = "mixed_k8g64_v4g64 / coherent"
+model = "BONSAI"
+kv_quant = "mixed_k8g64_v4g64"
+request = "chat_basic"
+assert = { kind = "coherent", expect = "Paris" }
+tags = ["run1", "quant"]
+
+[[case]]
+id = "quant_mixed_niah"
+feature = "quant_matrix"
+subfeature = "mixed_k8g64_v4g64 / niah@8k"
+model = "BONSAI"
+kv_quant = "mixed_k8g64_v4g64"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run1", "quant"]
+
+[[case]]
+id = "quant_mixed_cosine"
+feature = "quant_matrix"
+subfeature = "mixed_k8g64_v4g64 / cosine"
+model = "BONSAI"
+kv_quant = "mixed_k8g64_v4g64"
+request = "chat_logprobs"
+assert = { kind = "cosine_vs_bf16", min_cosine = 0.99 }
+tags = ["run1", "quant"]
+
+# --- rot_k (RotK, K rotated 8-bit + V affine 4/g64) ---
+# NOTE: the RotK Display form `rot_k_v4g64` does NOT round-trip through
+# `--kv-quant` FromStr (the valid list omits it). RotK is reachable only via the
+# compose form `--ctk rot_k --ctv q4_g64`. See E2E findings + docs/CLI.md.
+[[case]]
+id = "quant_rotk_coherent"
+feature = "quant_matrix"
+subfeature = "rot_k (--ctk rot_k --ctv q4_g64) / coherent"
+model = "BONSAI"
+ctk = "rot_k"
+ctv = "q4_g64"
+request = "chat_basic"
+assert = { kind = "coherent", expect = "Paris" }
+tags = ["run1", "quant"]
+
+[[case]]
+id = "quant_rotk_niah"
+feature = "quant_matrix"
+subfeature = "rot_k (--ctk rot_k --ctv q4_g64) / niah@8k"
+model = "BONSAI"
+ctk = "rot_k"
+ctv = "q4_g64"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run1", "quant"]
+
+# --- rot_k_tq4v ---
+# FINDING (E2E run-1): rot_k_tq4v is DEGRADED on Bonsai-2bit — at temp=0 it drops
+# the answer token ("The capital of France." with no "Paris") and produces
+# incoherent output at 8k NIAH. Treated like the K-only family: assert SHORT-ctx
+# coherence only, no NIAH. This is a real codec-quality signal, captured here.
+[[case]]
+id = "quant_rotktq4v_short"
+feature = "quant_matrix_konly"
+subfeature = "rot_k_tq4v / short-coherent (DEGRADED — see note)"
+model = "BONSAI"
+kv_quant = "rot_k_tq4v"
+request = "chat_basic"
+assert = { kind = "coherent" }
+tags = ["run1", "quant", "degraded"]
+
+# --- planar_k (K-axis planar 4-bit, V bf16) ---
+[[case]]
+id = "quant_planark_coherent"
+feature = "quant_matrix"
+subfeature = "planar_k / coherent"
+model = "BONSAI"
+kv_quant = "planar_k"
+request = "chat_basic"
+assert = { kind = "coherent", expect = "Paris" }
+tags = ["run1", "quant"]
+
+[[case]]
+id = "quant_planark_niah"
+feature = "quant_matrix"
+subfeature = "planar_k / niah@8k"
+model = "BONSAI"
+kv_quant = "planar_k"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run1", "quant"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3b. K-only / symmetric codecs — incoherent at long ctx on Bonsai-2bit.
+#     Assert SHORT-ctx coherence ONLY (no NIAH, no cosine).
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[case]]
+id = "quant_kiso3_short"
+feature = "quant_matrix_konly"
+subfeature = "k_iso3 / short-coherent"
+model = "BONSAI"
+kv_quant = "k_iso3"
+request = "chat_basic"
+assert = { kind = "coherent" }
+tags = ["run1", "quant", "konly"]
+
+[[case]]
+id = "quant_kiso4_short"
+feature = "quant_matrix_konly"
+subfeature = "k_iso4 / short-coherent"
+model = "BONSAI"
+kv_quant = "k_iso4"
+request = "chat_basic"
+assert = { kind = "coherent" }
+tags = ["run1", "quant", "konly"]
+
+[[case]]
+id = "quant_krotor3_short"
+feature = "quant_matrix_konly"
+subfeature = "k_rotor3 / short-coherent"
+model = "BONSAI"
+kv_quant = "k_rotor3"
+request = "chat_basic"
+assert = { kind = "coherent" }
+tags = ["run1", "quant", "konly"]
+
+[[case]]
+id = "quant_krotor4_short"
+feature = "quant_matrix_konly"
+subfeature = "k_rotor4 / short-coherent"
+model = "BONSAI"
+kv_quant = "k_rotor4"
+request = "chat_basic"
+assert = { kind = "coherent" }
+tags = ["run1", "quant", "konly"]
+
+[[case]]
+id = "quant_iso3sym_short"
+feature = "quant_matrix_konly"
+subfeature = "iso3_sym / short-coherent"
+model = "BONSAI"
+kv_quant = "iso3_sym"
+request = "chat_basic"
+assert = { kind = "coherent" }
+tags = ["run1", "quant", "konly"]
+
+[[case]]
+id = "quant_iso4sym_short"
+feature = "quant_matrix_konly"
+subfeature = "iso4_sym / short-coherent"
+model = "BONSAI"
+kv_quant = "iso4_sym"
+request = "chat_basic"
+assert = { kind = "coherent" }
+tags = ["run1", "quant", "konly"]
+
+[[case]]
+id = "quant_rotor3sym_short"
+feature = "quant_matrix_konly"
+subfeature = "rotor3_sym / short-coherent"
+model = "BONSAI"
+kv_quant = "rotor3_sym"
+request = "chat_basic"
+assert = { kind = "coherent" }
+tags = ["run1", "quant", "konly"]
+
+[[case]]
+id = "quant_rotor4sym_short"
+feature = "quant_matrix_konly"
+subfeature = "rotor4_sym / short-coherent"
+model = "BONSAI"
+kv_quant = "rotor4_sym"
+request = "chat_basic"
+assert = { kind = "coherent" }
+tags = ["run1", "quant", "konly"]
+
+[[case]]
+id = "quant_tsym3_short"
+feature = "quant_matrix_konly"
+subfeature = "tsym3 / short-coherent"
+model = "BONSAI"
+kv_quant = "tsym3"
+request = "chat_basic"
+assert = { kind = "coherent" }
+tags = ["run1", "quant", "konly"]
+
+[[case]]
+id = "quant_tsym4_short"
+feature = "quant_matrix_konly"
+subfeature = "tsym4 / short-coherent"
+model = "BONSAI"
+kv_quant = "tsym4"
+request = "chat_basic"
+assert = { kind = "coherent" }
+tags = ["run1", "quant", "konly"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. Thinking (Bonsai is a thinking model)
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[case]]
+id = "thinking_budget_enforced"
+feature = "thinking"
+subfeature = "enable_thinking + thinking_budget"
+model = "BONSAI"
+serve_flags = []
+request = "thinking"
+assert = { kind = "thinking" }
+tags = ["run1", "thinking"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Phase 2a — state features (SSD cross-restart + prompt-cache reuse), LIVE.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# SSD KV cross-restart: the runner owns two serve phases under single-MLX
+# discipline with a dedicated hermetic RMLX_HOME (serve --kv-ssd-cache-gb 1
+# --prompt-cache-slots 1 → spill → kill → restart same HOME → hydrate). PASS
+# requires the restarted completion to be BYTE-IDENTICAL to phase 1 AND
+# /metrics/cache ssd_hits >= 1 (the RAM miss was served from the .kvb spill,
+# not a silent cold re-prefill). serve_flags / kv_quant are injected by
+# assert_byte_identical_restart itself.
+[[case]]
+id = "ssd_byte_identical_restart"
+feature = "ssd_kv_tier"
+subfeature = "byte-identical restart (spill→restart→hydrate)"
+model = "BONSAI"
+serve_flags = []
+assert = { kind = "byte_identical_restart" }
+tags = ["run2a", "ssd"]
+
+# Prompt-cache exact-prefix reuse: single server, prompt cache ON. Issue a long
+# (≳600-token, multi-block) prompt twice. Bonsai/Qwen3 is ReusePolicy::ExactOnly
+# so the second identical request is an EXACT prefix hit. PASS requires the
+# second completion BYTE-IDENTICAL to the first (reuse must not change output)
+# AND /metrics/cache block_hits to increment between the two requests (B
+# genuinely took the cache path). Default --prompt-cache-slots (4) keeps the
+# cache on; no extra flags needed.
+[[case]]
+id = "prompt_cache_prefix_reuse"
+feature = "prompt_cache"
+subfeature = "exact-prefix reuse (ExactOnly) — hit + output equivalence"
+model = "BONSAI"
+serve_flags = []
+assert = { kind = "cache_hit_equivalence" }
+tags = ["run2a", "prompt_cache"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 2b/2c — stubbed rows (declarative only; runner records PENDING).
+# Broader models (Gemma4-e4b, Qwen3.6-MoE) + remaining state/modality features.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[case]]
+id = "p2_speculative_decode"
+feature = "speculative"
+subfeature = "MTP drafter accept-rate"
+model = "BONSAI"
+assert = { kind = "metric_present", expect = "accept_rate" }
+tags = ["phase2"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 2b — multi-model lifecycle + attention dispatch (LIVE).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Multi-model lifecycle: the runner owns a registry-mode serve (Bonsai + a 2nd
+# model resolved from GEMMA4_E2B) under single-MLX discipline. Proves:
+#   (a) load A → loaded; (c) cap=1 eager preload of [A,B] → B resident, A LRU-
+#   evicted (status flips); (d) explicit unload B → loaded:false, 2nd unload →
+#   404; (e) claim enforcement — a 2nd `rmlx serve` on the HELD port is rejected
+#   (exit 11, no competing Metal context). When GEMMA4_E2B is absent the runner
+#   runs the single-model subset (leg a + claim leg) and marks the 2-model legs
+#   SKIPPED in the detail. A wrong status transition, a 2nd-process that wrongly
+#   starts, or an unparseable status body all FAIL. serve flags injected by the
+#   assertion itself (registry JSON + --max-loaded-models).
+[[case]]
+id = "p2_multi_model_lifecycle"
+feature = "multi_model"
+subfeature = "load / LRU-evict / unload / claim-enforcement"
+model = "BONSAI"
+serve_flags = []
+assert = { kind = "model_lifecycle" }
+tags = ["run2b", "multi_model"]
+
+# Attention dispatch_fired (log scrape). HONEST signal: the only externally-
+# observable per-dispatch signal is the `path` field on the `update_and_sdpa`
+# trace span in the --log verbose run jsonl. On Bonsai/Qwen3 (head_dim=128) the
+# specialised kernels (TurboFlash flash / fused_qk / planar_k_fused) stay
+# DORMANT — warm-TTFT routes every decode step through the bf16-K seed
+# (every dispatch records path=legacy). Their dispatch counters are process-
+# internal atomics with no HTTP surface, covered by the in-crate counter tests
+# (sparse_attn_dispatch.rs, iso_fused_qk_msl_tests.rs) — see
+# docs/E2E_TEST_PLAN.md. This row proves the attention-dispatch instrumentation
+# FIRES (>=1 update_and_sdpa span with a resolved path) AND output is coherent.
+# FAILS if no dispatch span appears or output is incoherent.
+[[case]]
+id = "p2_attn_dispatch_fired"
+feature = "attention"
+subfeature = "update_and_sdpa dispatch fired (verbose-log scrape, k8v4)"
+model = "BONSAI"
+kv_quant = "k8v4"
+serve_flags = []
+assert = { kind = "dispatch_fired" }
+tags = ["run2b", "attention"]
+
+[[case]]
+id = "p2_image_input"
+feature = "modalities"
+subfeature = "image input (vision tower)"
+model = "GEMMA4_E4B"
+assert = { kind = "coherent" }
+tags = ["phase2"]
+
+[[case]]
+id = "p2_audio_input"
+feature = "modalities"
+subfeature = "audio input (whisper)"
+model = "GEMMA4_E4B"
+assert = { kind = "coherent" }
+tags = ["phase2"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 2c — broader-model text-core proof: Gemma4-e4b + Qwen3.6-35B-A3B-MoE.
+# LIVE rows (tag run2c). CORRECTNESS-first, REPRESENTATIVE legal-KV subset per
+# arch (not the full 18-preset matrix — that is extensible by adding rows). The
+# arch-guard refusals prove the per-arch KV invariant is a working feature.
+# Models resolve via GEMMA4_E4B / QWEN36 → SKIP (clear reason) when absent.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Gemma4-e4b (mxfp8, SWA, head_dim=256, NOT a thinking model) ───────────────
+
+[[case]]
+id = "p2c_gemma4_golden"
+feature = "broader_models"
+subfeature = "Gemma4-e4b / text-core golden (temp=0)"
+model = "GEMMA4_E4B"
+serve_flags = []
+request = "chat_basic"
+assert = { kind = "golden", expect = "Paris" }
+tags = ["run2c", "gemma4", "text"]
+
+[[case]]
+id = "p2c_gemma4_stream"
+feature = "broader_models"
+subfeature = "Gemma4-e4b / chat stream coherent"
+model = "GEMMA4_E4B"
+serve_flags = []
+request = "chat_stream"
+assert = { kind = "contains_coherent", expect = "Paris" }
+tags = ["run2c", "gemma4", "text"]
+
+[[case]]
+id = "p2c_gemma4_anthropic"
+feature = "broader_models"
+subfeature = "Gemma4-e4b / anthropic /v1/messages coherent"
+model = "GEMMA4_E4B"
+serve_flags = []
+request = "anthropic_basic"
+assert = { kind = "contains_coherent", expect = "Paris" }
+tags = ["run2c", "gemma4", "text"]
+
+# Representative legal Gemma4 KV cells. SWA layers always stay bf16 (§D6.7);
+# only full-attention layers are quantized. K8V4 at head_dim=256 needs the
+# TurboFlash kernel — force it ON explicitly (`--turbo-flash on`) so the cell
+# is deterministic across host families (auto resolves ON on Apple10+ but we
+# do not depend on the host family here). niah@8k + cosine≥0.99 per docs/KV_QUANT.md.
+
+# --- K8V8 ---
+[[case]]
+id = "p2c_gemma4_k8v8_niah"
+feature = "broader_models"
+subfeature = "Gemma4-e4b / k8v8 niah@8k"
+model = "GEMMA4_E4B"
+kv_quant = "k8v8"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run2c", "gemma4", "quant"]
+
+[[case]]
+id = "p2c_gemma4_k8v8_cosine"
+feature = "broader_models"
+subfeature = "Gemma4-e4b / k8v8 cosine"
+model = "GEMMA4_E4B"
+kv_quant = "k8v8"
+request = "chat_logprobs"
+assert = { kind = "cosine_vs_bf16", min_cosine = 0.99 }
+tags = ["run2c", "gemma4", "quant"]
+
+# --- K8V4 (turbo-flash ON for head_dim=256) ---
+[[case]]
+id = "p2c_gemma4_k8v4_niah"
+feature = "broader_models"
+subfeature = "Gemma4-e4b / k8v4 niah@8k (--turbo-flash on)"
+model = "GEMMA4_E4B"
+kv_quant = "k8v4"
+serve_flags = ["--turbo-flash", "on"]
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run2c", "gemma4", "quant"]
+
+[[case]]
+id = "p2c_gemma4_k8v4_cosine"
+feature = "broader_models"
+subfeature = "Gemma4-e4b / k8v4 cosine (--turbo-flash on)"
+model = "GEMMA4_E4B"
+kv_quant = "k8v4"
+serve_flags = ["--turbo-flash", "on"]
+request = "chat_logprobs"
+assert = { kind = "cosine_vs_bf16", min_cosine = 0.99 }
+tags = ["run2c", "gemma4", "quant"]
+
+# --- K8VTurbo3 ---
+[[case]]
+id = "p2c_gemma4_k8vturbo3_niah"
+feature = "broader_models"
+subfeature = "Gemma4-e4b / k8vturbo3 niah@8k"
+model = "GEMMA4_E4B"
+kv_quant = "k8vturbo3"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run2c", "gemma4", "quant"]
+
+[[case]]
+id = "p2c_gemma4_k8vturbo3_cosine"
+feature = "broader_models"
+subfeature = "Gemma4-e4b / k8vturbo3 cosine"
+model = "GEMMA4_E4B"
+kv_quant = "k8vturbo3"
+request = "chat_logprobs"
+assert = { kind = "cosine_vs_bf16", min_cosine = 0.99 }
+tags = ["run2c", "gemma4", "quant"]
+
+# --- Planar ---
+[[case]]
+id = "p2c_gemma4_planar_niah"
+feature = "broader_models"
+subfeature = "Gemma4-e4b / planar niah@8k"
+model = "GEMMA4_E4B"
+kv_quant = "planar"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run2c", "gemma4", "quant"]
+
+[[case]]
+id = "p2c_gemma4_planar_cosine"
+feature = "broader_models"
+subfeature = "Gemma4-e4b / planar cosine"
+model = "GEMMA4_E4B"
+kv_quant = "planar"
+request = "chat_logprobs"
+assert = { kind = "cosine_vs_bf16", min_cosine = 0.99 }
+tags = ["run2c", "gemma4", "quant"]
+
+# SWA-exercising case: the niah haystack (~8k tokens) crosses Gemma4's sliding
+# window many times. At the default K8V8 it proves the SWA ring snapshot/restore
+# (MEMORY: Gemma4 B1 ring fix) recovers the needle across the window boundary —
+# coherent + needle recovered. (The niah cells above already exercise long ctx;
+# this row anchors the SWA-correctness claim explicitly at the auto default.)
+[[case]]
+id = "p2c_gemma4_swa_niah"
+feature = "broader_models"
+subfeature = "Gemma4-e4b / SWA window-crossing niah@8k (auto KV)"
+model = "GEMMA4_E4B"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run2c", "gemma4", "swa"]
+
+# ── Qwen3.6-35B-A3B (8-bit affine, MoE, 7:1 GQA, head_dim=128; K must be ≥8) ──
+# Heavy model (35B). CORRECTNESS-first, representative cells only.
+
+[[case]]
+id = "p2c_qwen36_golden"
+feature = "broader_models"
+subfeature = "Qwen3.6-MoE / text-core golden (temp=0)"
+model = "QWEN36"
+serve_flags = []
+request = "chat_basic"
+assert = { kind = "golden", expect = "Paris" }
+tags = ["run2c", "qwen36", "text"]
+
+[[case]]
+id = "p2c_qwen36_stream"
+feature = "broader_models"
+subfeature = "Qwen3.6-MoE / chat stream coherent"
+model = "QWEN36"
+serve_flags = []
+request = "chat_stream"
+assert = { kind = "contains_coherent", expect = "Paris" }
+tags = ["run2c", "qwen36", "text"]
+
+# Representative legal Qwen3.6-MoE KV cells (K≥8 always). niah@8k + cosine.
+# --- K8V8 ---
+[[case]]
+id = "p2c_qwen36_k8v8_niah"
+feature = "broader_models"
+subfeature = "Qwen3.6-MoE / k8v8 niah@8k"
+model = "QWEN36"
+kv_quant = "k8v8"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run2c", "qwen36", "quant"]
+
+[[case]]
+id = "p2c_qwen36_k8v8_cosine"
+feature = "broader_models"
+subfeature = "Qwen3.6-MoE / k8v8 cosine"
+model = "QWEN36"
+kv_quant = "k8v8"
+request = "chat_logprobs"
+assert = { kind = "cosine_vs_bf16", min_cosine = 0.99 }
+tags = ["run2c", "qwen36", "quant"]
+
+# --- K8V4 ---
+[[case]]
+id = "p2c_qwen36_k8v4_niah"
+feature = "broader_models"
+subfeature = "Qwen3.6-MoE / k8v4 niah@8k"
+model = "QWEN36"
+kv_quant = "k8v4"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run2c", "qwen36", "quant"]
+
+[[case]]
+id = "p2c_qwen36_k8v4_cosine"
+feature = "broader_models"
+subfeature = "Qwen3.6-MoE / k8v4 cosine"
+model = "QWEN36"
+kv_quant = "k8v4"
+request = "chat_logprobs"
+assert = { kind = "cosine_vs_bf16", min_cosine = 0.99 }
+tags = ["run2c", "qwen36", "quant"]
+
+# --- Planar ---
+[[case]]
+id = "p2c_qwen36_planar_niah"
+feature = "broader_models"
+subfeature = "Qwen3.6-MoE / planar niah@8k"
+model = "QWEN36"
+kv_quant = "planar"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run2c", "qwen36", "quant"]
+
+[[case]]
+id = "p2c_qwen36_planar_cosine"
+feature = "broader_models"
+subfeature = "Qwen3.6-MoE / planar cosine"
+model = "QWEN36"
+kv_quant = "planar"
+request = "chat_logprobs"
+assert = { kind = "cosine_vs_bf16", min_cosine = 0.99 }
+tags = ["run2c", "qwen36", "quant"]
+
+# --- Iso3 (rotation KV; K stays 8-bit asymmetric) ---
+[[case]]
+id = "p2c_qwen36_iso3_niah"
+feature = "broader_models"
+subfeature = "Qwen3.6-MoE / iso3 niah@8k"
+model = "QWEN36"
+kv_quant = "iso3"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run2c", "qwen36", "quant"]
+
+[[case]]
+id = "p2c_qwen36_iso3_cosine"
+feature = "broader_models"
+subfeature = "Qwen3.6-MoE / iso3 cosine"
+model = "QWEN36"
+kv_quant = "iso3"
+request = "chat_logprobs"
+assert = { kind = "cosine_vs_bf16", min_cosine = 0.99 }
+tags = ["run2c", "qwen36", "quant"]
+
+# ── Qwen3.6-MoE arch-guard refusals (serve_refused, exit 78) ──────────────────
+# Proves the per-arch KV invariant is a WORKING feature: an illegal codec is
+# rejected at serve resolve time (before /health) with EX_CONFIG (78).
+
+# K<8 codec: --cache-type-k q4_g128 → Mixed{k_bits=4} → QwenMoeKBitsTooLow → 78.
+[[case]]
+id = "p2c_qwen36_guard_kbits"
+feature = "broader_models"
+subfeature = "Qwen3.6-MoE / arch-guard: K<8 (q4_g128) REJECTED exit 78"
+model = "QWEN36"
+ctk = "q4_g128"
+assert = { kind = "serve_refused", expect = "78" }
+tags = ["run2c", "qwen36", "guard"]
+
+# Symmetric-K codec: --kv-quant tsym3 → TurboSym3 → QwenMoeTurboKRejected → 78.
+[[case]]
+id = "p2c_qwen36_guard_symk"
+feature = "broader_models"
+subfeature = "Qwen3.6-MoE / arch-guard: symmetric-K (tsym3) REJECTED exit 78"
+model = "QWEN36"
+kv_quant = "tsym3"
+assert = { kind = "serve_refused", expect = "78" }
+tags = ["run2c", "qwen36", "guard"]
+
+# ── Qwen3.6 thinking model — one enable_thinking case ─────────────────────────
+[[case]]
+id = "p2c_qwen36_thinking"
+feature = "broader_models"
+subfeature = "Qwen3.6-MoE / enable_thinking (reasoning_content + answer)"
+model = "QWEN36"
+serve_flags = []
+request = "thinking"
+assert = { kind = "thinking" }
+tags = ["run2c", "qwen36", "thinking"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 2d — big-Gemma4 text-core proof: gemma-4-26b-a4b (MoE, 128 experts) +
+# gemma-4-31b (dense, 60 layers). Both Gemma4ForConditionalGeneration,
+# head_dim=256, SWA window=1024 → same KV legality as Gemma4-e4b (SWA layers
+# stay bf16, full-attn layers quantized, K8V4 needs TurboFlash). Heavy models:
+# CORRECTNESS-first representative cells only. The `model` field is the
+# snapshot SLUG directly (resolved under RMLX_O_MODELS_ROOT, default
+# ./models) — no resolver-code edit needed to add a model. Override at
+# runtime with RMLX_E2E_MODEL_<SLUG-upper, non-alnum→_>=/abs/path. SKIP (clear
+# reason) when the dir is absent.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── gemma-4-26b-a4b (MoE) ─────────────────────────────────────────────────────
+
+[[case]]
+id = "p2d_gemma4_26b_golden"
+feature = "broader_models"
+subfeature = "Gemma4-26b-a4b / text-core golden (temp=0)"
+model = "mlx-community__gemma-4-26b-a4b-it-mxfp8"
+serve_flags = []
+request = "chat_basic"
+assert = { kind = "golden", expect = "Paris" }
+tags = ["run2d", "gemma4", "text"]
+
+[[case]]
+id = "p2d_gemma4_26b_stream"
+feature = "broader_models"
+subfeature = "Gemma4-26b-a4b / chat stream coherent"
+model = "mlx-community__gemma-4-26b-a4b-it-mxfp8"
+serve_flags = []
+request = "chat_stream"
+assert = { kind = "contains_coherent", expect = "Paris" }
+tags = ["run2d", "gemma4", "text"]
+
+[[case]]
+id = "p2d_gemma4_26b_k8v8_niah"
+feature = "broader_models"
+subfeature = "Gemma4-26b-a4b / k8v8 niah@8k"
+model = "mlx-community__gemma-4-26b-a4b-it-mxfp8"
+kv_quant = "k8v8"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run2d", "gemma4", "quant"]
+
+[[case]]
+id = "p2d_gemma4_26b_k8v8_cosine"
+feature = "broader_models"
+subfeature = "Gemma4-26b-a4b / k8v8 cosine"
+model = "mlx-community__gemma-4-26b-a4b-it-mxfp8"
+kv_quant = "k8v8"
+request = "chat_logprobs"
+assert = { kind = "cosine_vs_bf16", min_cosine = 0.99 }
+tags = ["run2d", "gemma4", "quant"]
+
+[[case]]
+id = "p2d_gemma4_26b_k8v4_cosine"
+feature = "broader_models"
+subfeature = "Gemma4-26b-a4b / k8v4 cosine (--turbo-flash on)"
+model = "mlx-community__gemma-4-26b-a4b-it-mxfp8"
+kv_quant = "k8v4"
+serve_flags = ["--turbo-flash", "on"]
+request = "chat_logprobs"
+assert = { kind = "cosine_vs_bf16", min_cosine = 0.99 }
+tags = ["run2d", "gemma4", "quant"]
+
+[[case]]
+id = "p2d_gemma4_26b_planar_cosine"
+feature = "broader_models"
+subfeature = "Gemma4-26b-a4b / planar cosine"
+model = "mlx-community__gemma-4-26b-a4b-it-mxfp8"
+kv_quant = "planar"
+request = "chat_logprobs"
+assert = { kind = "cosine_vs_bf16", min_cosine = 0.99 }
+tags = ["run2d", "gemma4", "quant"]
+
+[[case]]
+id = "p2d_gemma4_26b_swa_niah"
+feature = "broader_models"
+subfeature = "Gemma4-26b-a4b / SWA window-crossing niah@8k (auto KV)"
+model = "mlx-community__gemma-4-26b-a4b-it-mxfp8"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run2d", "gemma4", "swa"]
+
+# ── gemma-4-31b (dense) ───────────────────────────────────────────────────────
+
+[[case]]
+id = "p2d_gemma4_31b_golden"
+feature = "broader_models"
+subfeature = "Gemma4-31b / text-core golden (temp=0)"
+model = "mlx-community__gemma-4-31b-it-mxfp8"
+serve_flags = []
+request = "chat_basic"
+assert = { kind = "golden", expect = "Paris" }
+tags = ["run2d", "gemma4", "text"]
+
+[[case]]
+id = "p2d_gemma4_31b_stream"
+feature = "broader_models"
+subfeature = "Gemma4-31b / chat stream coherent"
+model = "mlx-community__gemma-4-31b-it-mxfp8"
+serve_flags = []
+request = "chat_stream"
+assert = { kind = "contains_coherent", expect = "Paris" }
+tags = ["run2d", "gemma4", "text"]
+
+[[case]]
+id = "p2d_gemma4_31b_k8v8_niah"
+feature = "broader_models"
+subfeature = "Gemma4-31b / k8v8 niah@8k"
+model = "mlx-community__gemma-4-31b-it-mxfp8"
+kv_quant = "k8v8"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run2d", "gemma4", "quant"]
+
+[[case]]
+id = "p2d_gemma4_31b_k8v8_cosine"
+feature = "broader_models"
+subfeature = "Gemma4-31b / k8v8 cosine"
+model = "mlx-community__gemma-4-31b-it-mxfp8"
+kv_quant = "k8v8"
+request = "chat_logprobs"
+assert = { kind = "cosine_vs_bf16", min_cosine = 0.99 }
+tags = ["run2d", "gemma4", "quant"]
+
+[[case]]
+id = "p2d_gemma4_31b_k8v4_cosine"
+feature = "broader_models"
+subfeature = "Gemma4-31b / k8v4 cosine (--turbo-flash on)"
+model = "mlx-community__gemma-4-31b-it-mxfp8"
+kv_quant = "k8v4"
+serve_flags = ["--turbo-flash", "on"]
+request = "chat_logprobs"
+assert = { kind = "cosine_vs_bf16", min_cosine = 0.99 }
+tags = ["run2d", "gemma4", "quant"]
+
+[[case]]
+id = "p2d_gemma4_31b_planar_cosine"
+feature = "broader_models"
+subfeature = "Gemma4-31b / planar cosine"
+model = "mlx-community__gemma-4-31b-it-mxfp8"
+kv_quant = "planar"
+request = "chat_logprobs"
+assert = { kind = "cosine_vs_bf16", min_cosine = 0.99 }
+tags = ["run2d", "gemma4", "quant"]
+
+[[case]]
+id = "p2d_gemma4_31b_swa_niah"
+feature = "broader_models"
+subfeature = "Gemma4-31b / SWA window-crossing niah@8k (auto KV)"
+model = "mlx-community__gemma-4-31b-it-mxfp8"
+request = "niah"
+assert = { kind = "niah_retrieval" }
+tags = ["run2d", "gemma4", "swa"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 2e — speculative decoding (LIVE). Real drafter + verifier; the round-loop
+# must FIRE (accept_rate > 0 in the `<kind>_generate_greedy: done` jsonl summary)
+# AND the output must stay coherent. Verifier = Qwen3.6-35B-A3B-8bit (alias
+# QWEN36). Drafters carry their snapshot slug directly in `draft_model` (resolved
+# under RMLX_O_MODELS_ROOT). SKIP (clear reason) when a drafter snapshot absent.
+# Supersedes the declarative `p2_speculative_decode` phase2 stub.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[case]]
+id = "p2e_qwen36_dflash"
+feature = "speculative"
+subfeature = "Qwen3.6-MoE / DFlash drafter — round-loop fires + coherent"
+model = "QWEN36"
+draft_model = "z-lab__Qwen3.6-35B-A3B-DFlash"
+draft_kind = "dflash"
+assert = { kind = "spec_decode", expect = "Paris" }
+tags = ["run2e", "qwen36", "speculative"]
+
+[[case]]
+id = "p2e_qwen36_mtp"
+feature = "speculative"
+subfeature = "Qwen3.6-MoE / MTP sidecar drafter — round-loop fires + coherent"
+model = "QWEN36"
+draft_model = "mlx-community__Qwen3.6-35B-A3B-MTP-5bit"
+draft_kind = "mtp"
+assert = { kind = "spec_decode", expect = "Paris" }
+tags = ["run2e", "qwen36", "speculative"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 2f — modalities + agent surface (LIVE). Image input (vision tower) and
+# function/tool-calling, the two heavy-use agent paths. Real models, real
+# image, real tool emission. SKIP (clear reason) when a model is absent.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Image input: Gemma4-e4b vision tower (SigLIP) reads a solid-red image ──────
+[[case]]
+id = "p2f_gemma4_image"
+feature = "modalities"
+subfeature = "Gemma4-e4b / image input — reads dominant colour"
+model = "GEMMA4_E4B"
+request = "image_color"
+assert = { kind = "image", expect = "red" }
+tags = ["run2f", "gemma4", "image"]
+
+# ── Tool-calling: Qwen3.6-MoE (XML format) emits a get_weather call ────────────
+[[case]]
+id = "p2f_qwen36_tool_call"
+feature = "agent"
+subfeature = "Qwen3.6-MoE / tool-calling — emits get_weather"
+model = "QWEN36"
+request = "tool_weather"
+assert = { kind = "tool_call", expect = "get_weather" }
+tags = ["run2f", "qwen36", "tools"]
+
+# ── Tool-calling: Bonsai (Qwen3, Hermes-JSON format) emits a get_weather call ──
+[[case]]
+id = "p2f_bonsai_tool_call"
+feature = "agent"
+subfeature = "Bonsai / tool-calling — emits get_weather (Hermes JSON)"
+model = "BONSAI"
+request = "tool_weather"
+assert = { kind = "tool_call", expect = "get_weather" }
+tags = ["run2f", "bonsai", "tools"]

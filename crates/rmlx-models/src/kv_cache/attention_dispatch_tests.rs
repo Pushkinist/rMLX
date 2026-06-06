@@ -1,0 +1,251 @@
+use super::*;
+use rmlx_kv_quant::KvQuant;
+use rmlx_mlx::{Array, Device, Dtype};
+
+/// Build a small dummy `SparseAttnInputs` for the gate-OFF unit tests.
+///
+/// The gate check (`!sparse_attn_enabled()`) fires before any input
+/// validation or kernel dispatch — so these arrays only need to be
+/// constructible, not coherent.  We make them tiny f32 arrays sized for
+/// `b=1, kv_h=1, heads_per_kv=1, kv_seq=2, head_dim=64`.
+#[allow(
+    clippy::expect_used,
+    reason = "test fixture: panic on Array build is correct"
+)]
+fn make_dummy_inputs() -> (Array, Array, Array, Array, Array) {
+    let head_dim = 64usize;
+    let kv_seq = 2usize;
+    let q_bytes: Vec<u8> = vec![0u8; head_dim * 4];
+    let q = Array::from_bytes(&q_bytes, &[1, 1, 1, head_dim as i32], Dtype::F32).expect("dummy Q");
+    // PlanarQuant K codes: (head_dim / 32) * 4 = 8 u32 words per token, times 2 tokens = 16.
+    let codes_per_tok = (head_dim / 32) * 4;
+    let codes_total = kv_seq * codes_per_tok;
+    let codes_bytes: Vec<u8> = vec![0u8; codes_total * 4];
+    let k_codes =
+        Array::from_bytes(&codes_bytes, &[codes_total as i32], Dtype::U32).expect("dummy K codes");
+    let scales_total = kv_seq * head_dim / 2;
+    let scales_bytes: Vec<u8> = vec![0u8; scales_total * 4];
+    let k_scales = Array::from_bytes(&scales_bytes, &[scales_total as i32], Dtype::F32)
+        .expect("dummy K scales");
+    let rot_total = kv_seq * head_dim / 16;
+    let rot_bytes: Vec<u8> = vec![0u8; rot_total * 4];
+    let k_rot32 =
+        Array::from_bytes(&rot_bytes, &[rot_total as i32], Dtype::U32).expect("dummy K rot32");
+    let v_total = kv_seq * head_dim;
+    let v_bytes: Vec<u8> = vec![0u8; v_total * 4];
+    let v = Array::from_bytes(
+        &v_bytes,
+        &[1, 1, kv_seq as i32, head_dim as i32],
+        Dtype::F32,
+    )
+    .expect("dummy V");
+    (q, k_codes, k_scales, k_rot32, v)
+}
+
+fn make_dummy_sparse_inputs<'a>(
+    q: &'a Array,
+    k_codes: &'a Array,
+    k_scales: &'a Array,
+    k_rot32: &'a Array,
+    v: &'a Array,
+) -> SparseAttnInputs<'a> {
+    SparseAttnInputs {
+        query: q,
+        k_codes,
+        k_scales,
+        k_rot32,
+        v,
+        b: 1,
+        kv_h: 1,
+        kv_seq: 2,
+        head_dim: 64,
+        heads_per_kv: 1,
+        layer_idx: 0,
+        scale: 0.125,
+        device: Device::Cpu,
+    }
+}
+
+// ── Table completeness ────────────────────────────────────────────────────────
+
+/// The table must contain exactly 8 entries (7 KvQuant pairs + Rotor4Sym
+/// which brings the total to 8 for the two rotor variants).
+///
+/// Spec: 7 (codec, KvQuant) pairs total; Rotor3Sym and Rotor4Sym are listed
+/// separately making 8 entries in the table.
+#[test]
+fn fused_qk_table_has_eight_entries() {
+    assert_eq!(
+        FUSED_QK_TABLE.len(),
+        8,
+        "FUSED_QK_TABLE must have 8 entries (K8V4, K8V8, TurboSym3, TurboSym4, \
+         Iso3Sym, Iso4Sym, Rotor3Sym, Rotor4Sym)"
+    );
+}
+
+/// All 8 entries expose real fused-QK kernels.
+#[test]
+fn fused_qk_table_pending_kernels_match_executors() {
+    for entry in FUSED_QK_TABLE {
+        let landed = matches!(
+            entry.kv_quant,
+            KvQuant::K8V4
+                | KvQuant::K8V8
+                | KvQuant::TurboSym3
+                | KvQuant::TurboSym4
+                | KvQuant::Iso3Sym
+                | KvQuant::Iso4Sym
+                | KvQuant::Rotor3Sym
+                | KvQuant::Rotor4Sym
+        );
+        assert!(
+            landed && entry.kernel.is_some(),
+            "entry for {:?} must have kernel=Some",
+            entry.kv_quant
+        );
+    }
+}
+
+/// lookup_fused_qk returns Some for all 8 spec-mandated KvQuant targets.
+///
+/// The in-crate mirror in
+/// `rmlx_kv_quant::kvcache::fused_qk_dispatch::lookup_fused_qk_kernel` is a
+/// SUPERSET of this public table: it additionally maps the four `*KOnly*`
+/// variants (`IsoKOnly3`, `IsoKOnly4`, `RotorKOnly3`, `RotorKOnly4`) to the
+/// same kernels as their `*Sym` counterparts, because the K-side decode is
+/// identical (only V-side codec differs, and V-side is the SDPA caller's
+/// responsibility — see attention_dispatch.rs:186-188 for the rationale).
+/// The public table stays at the 8 `*Sym` entries because that is the
+/// canonical key the model-side dispatch consumes; this test asserts that
+/// the 8 entries are all populated and the `*KOnly*` variants are
+/// intentionally absent from the public surface.
+#[test]
+fn lookup_fused_qk_pending_kernels_match_executors() {
+    for kq in [
+        KvQuant::K8V4,
+        KvQuant::K8V8,
+        KvQuant::TurboSym3,
+        KvQuant::TurboSym4,
+        KvQuant::Iso3Sym,
+        KvQuant::Iso4Sym,
+        KvQuant::Rotor3Sym,
+        KvQuant::Rotor4Sym,
+    ] {
+        assert!(
+            lookup_fused_qk(kq).is_some(),
+            "lookup_fused_qk({kq:?}) must return Some"
+        );
+    }
+    // The `*KOnly*` variants are deliberately ABSENT from the public table
+    // (the codec-layer mirror covers them; this surface stays canonical
+    // on `*Sym`).
+    for kq in [
+        KvQuant::IsoKOnly3,
+        KvQuant::IsoKOnly4,
+        KvQuant::RotorKOnly3,
+        KvQuant::RotorKOnly4,
+    ] {
+        assert!(
+            lookup_fused_qk(kq).is_none(),
+            "lookup_fused_qk({kq:?}) must return None on the PUBLIC table \
+             (the in-crate codec mirror is a superset; the public surface stays canonical on *Sym)"
+        );
+    }
+}
+
+// ── sparse_attn_dispatch_if_enabled stub tests ────────────────────────────────
+//
+// All four cases return None in Exec A — the dispatch site is a placeholder
+// until Exec B wires in real phase-1 / phase-2 MSL kernels.
+//
+// OnceLock note: `sparse_attn_enabled()` latches its env read on first call.
+// In a fresh test process the env-var is unset → returns false → these
+// assertions are stable regardless of test ordering. The CLI env-setter
+// tests live in `rmlx-cli::commands::serve_tests` (no overlap).
+
+/// Build a `HeadBudgets` via JSON round-trip (the struct is
+/// `#[non_exhaustive]` so direct construction is banned outside
+/// `rmlx-loader`).
+#[allow(
+    clippy::expect_used,
+    reason = "test helper: JSON is a compile-time constant; panic on parse failure is the correct behavior"
+)]
+fn make_test_head_budgets() -> HeadBudgets {
+    let json = r#"{
+      "version": 1,
+      "model_name": "test",
+      "num_layers": 1,
+      "num_heads": 2,
+      "calibration": {
+        "method": "softmax_mass",
+        "prompt_set_sha256": "ab",
+        "num_prompts": 1,
+        "max_seq_len": 128,
+        "mass_threshold": 0.95
+      },
+      "per_layer_per_head_budget": [[16, 16]]
+    }"#;
+    serde_json::from_str(json).expect("parse test head_budgets fixture")
+}
+
+#[test]
+fn sparse_attn_dispatch_none_when_gate_off_and_budgets_absent() {
+    // Default state in a fresh test process: env-var unset, no budgets.
+    // The function must return None because the gate short-circuits before
+    // touching the inputs (Exec B: gate ON path runs the kernels).
+    let (q, kc, ks, kr, v) = make_dummy_inputs();
+    let inputs = make_dummy_sparse_inputs(&q, &kc, &ks, &kr, &v);
+    assert!(sparse_attn_dispatch_if_enabled(&inputs, None).is_none());
+}
+
+#[test]
+fn sparse_attn_dispatch_none_when_gate_off_with_budgets_present() {
+    // Even with budgets present, the gate is off (OnceLock latches OFF
+    // in this test process) → must return None.
+    let budgets = make_test_head_budgets();
+    let (q, kc, ks, kr, v) = make_dummy_inputs();
+    let inputs = make_dummy_sparse_inputs(&q, &kc, &ks, &kr, &v);
+    assert!(sparse_attn_dispatch_if_enabled(&inputs, Some(&budgets)).is_none());
+}
+
+#[test]
+fn sparse_attn_dispatch_short_circuits_on_missing_budgets() {
+    // Even if a future test in the same process latched the OnceLock to
+    // true, missing budgets must still produce None (correctness invariant).
+    let (q, kc, ks, kr, v) = make_dummy_inputs();
+    let inputs = make_dummy_sparse_inputs(&q, &kc, &ks, &kr, &v);
+    assert!(sparse_attn_dispatch_if_enabled(&inputs, None).is_none());
+}
+
+/// lookup_fused_qk returns None for non-table KvQuant variants.
+#[test]
+fn lookup_fused_qk_returns_none_for_non_table_variants() {
+    // These variants have no fused-QK table entry.
+    for kq in [KvQuant::K8VTurbo3, KvQuant::Planar, KvQuant::PlanarK] {
+        assert!(
+            lookup_fused_qk(kq).is_none(),
+            "lookup_fused_qk({kq:?}) must return None (not a fused-QK target)"
+        );
+    }
+}
+
+// ── Table entry correctness ───────────────────────────────────────────────────
+
+/// The table contains entries for all 7 spec-mandated KvQuant targets.
+#[test]
+fn fused_qk_table_contains_all_spec_entries() {
+    let required = [
+        KvQuant::K8V4,
+        KvQuant::K8V8,
+        KvQuant::TurboSym3,
+        KvQuant::TurboSym4,
+        KvQuant::Iso3Sym,
+        KvQuant::Iso4Sym,
+        KvQuant::Rotor3Sym,
+        KvQuant::Rotor4Sym,
+    ];
+    for kq in required {
+        let found = FUSED_QK_TABLE.iter().any(|e| e.kv_quant == kq);
+        assert!(found, "FUSED_QK_TABLE must contain an entry for {kq:?}");
+    }
+}

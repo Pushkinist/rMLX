@@ -1,0 +1,32 @@
+[package]
+name = "rmlx-quant"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "rMLX quant: weight + KV-cache decode kernels (affine, mxfp4/8, turbo, planar)."
+
+[lints]
+workspace = true
+
+[dependencies]
+rmlx-core = { workspace = true }
+# mlx-rs  = { workspace = true }   # see FINDINGS.md
+thiserror = { workspace = true }
+tracing   = { workspace = true }
+
+[dev-dependencies]
+# Micro-benchmark harness.  Not wired into `make ci` — run on-demand via
+# `cargo bench -p rmlx-quant --bench dequant` (perf-book ch 2: don't gate CI
+# on micro-bench noise). Pulled from the workspace pin so rmlx-models and
+# rmlx-quant stay aligned.
+criterion = { workspace = true }
+# The `dequant` bench measures turbo/planar quantizers that now
+# live in `rmlx-kv-quant`. Dev-only — keeps the runtime dep graph cycle-free.
+rmlx-kv-quant = { workspace = true }
+
+[[bench]]
+name    = "dequant"
+harness = false

@@ -1,0 +1,19 @@
+{
+  "snapshot": "mlx-community__Qwen3.6-35B-A3B-8bit",
+  "arch": "Qwen3_5MoeForConditionalGeneration",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a helpful assistant."
+    },
+    {
+      "role": "user",
+      "content": "Hi"
+    }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "bos_token": "",
+  "eos_token": "<|im_end|>",
+  "expected": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+}

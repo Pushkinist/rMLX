@@ -1,0 +1,14 @@
+[build]
+# Apple Silicon (M1–M5). `native` tunes codegen for the building machine's own
+# chip and runs wherever it was built — the right default for a from-source
+# project, and portable across the whole M-series (a pinned newer core would
+# SIGILL on older chips). rMLX's heavy math is GPU-side (Metal/mlx-c), so the
+# codegen target moves end-to-end perf only marginally; the win is per-machine
+# ISA use (NEON/dotprod everywhere, plus bf16/i8mm/LSE2 on M2+).
+#
+# Local max-perf override (e.g. force a newer core than `native` resolves to,
+# or add profiling frame pointers):
+#   RUSTFLAGS="-C target-cpu=apple-m5 -C force-frame-pointers=yes" cargo build --release
+#
+# -dead_strip drops unreachable symbols → smaller binary.
+rustflags = ["-C", "target-cpu=native", "-C", "link-arg=-dead_strip"]

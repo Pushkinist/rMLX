@@ -1,0 +1,29 @@
+[package]
+name = "rmlx-loader"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "rMLX loader: safetensors index + config.json parser, sibling-tensor resolver."
+
+[lints]
+workspace = true
+
+[dependencies]
+rmlx-core   = { workspace = true }
+rmlx-quant  = { workspace = true }
+safetensors = { workspace = true }
+memmap2     = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+# Parallel shard open (file open + mmap) for multi-shard models.
+# Direct dep — only rmlx-loader uses rayon; no workspace entry needed.
+# ThreadPoolBuilder::num_threads(4) caps parallelism below MLX's core needs.
+rayon       = "1"
+
+[dev-dependencies]
+tempfile    = { workspace = true }

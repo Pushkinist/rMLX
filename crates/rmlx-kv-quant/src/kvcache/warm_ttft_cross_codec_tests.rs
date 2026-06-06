@@ -1,0 +1,323 @@
+//! Warm-TTFT bf16-K cross-codec audit (diagnostic regression lock).
+//!
+//! The warm-TTFT contract was originally pinned for PlanarK only. This file
+//! extends the empirical proof across three behavioural classes, so the audit
+//! table in `docs/KV_CACHE.md` §9.6 is backed by executable assertions rather
+//! than code-reading:
+//!
+//! 1. **Shortcut codecs** (`decode_fp16_k.is_some()` early-return present):
+//!    K8V4, K8V8, Iso3Sym (asserted in this file). TurboSym3 is covered by
+//!    code-reading (same `update_decode_fp16` dispatch path); PlanarK is
+//!    asserted in the sibling `warm_ttft_tests.rs`. After `exit_prefill`
+//!    the bf16 K+V mirror is live; every decode `update()` routes through
+//!    `update_decode_fp16` and the quant codec stays **frozen** (its
+//!    `shape[2]` does not advance past the prefill length). Decode-phase K
+//!    AND V are bf16, not re-quantised.
+//!
+//! 2. **K-only codecs** (no `decode_fp16_k.is_some()` shortcut in the
+//!    `update_<arch>` body; V via the V-only helper): IsoKOnly3,
+//!    RotorKOnly3. These quantise K at **every** decode step — the K codec
+//!    `shape[2]` advances by 1 per step, and V rides the bf16
+//!    `decode_fp16_v` mirror.
+//!
+//! An earlier audit found that `exit_prefill` unconditionally populated
+//! `decode_fp16_k` for **every** quant arm, INCLUDING the K-only codecs
+//! whose `update_<arch>` never reads it. For IsoKOnly3 / RotorKOnly3 the bf16 K
+//! seed was allocated at exit_prefill and held, unused, for the whole decode
+//! window — dead memory.
+//!
+//! The fix gates the K-seed materialisation on
+//! `KvQuant::feeds_bf16_k_at_decode()`, which is `false` for the K-only family.
+//! So the K-only tests below assert `decode_fp16_k` is **absent** after
+//! exit_prefill+decode (the V seed is still present, and the K codec still
+//! advances every decode step — correctness is byte-unchanged, only the dead
+//! K buffer is reclaimed). The shortcut-codec assertions are unchanged.
+//!
+//! The asymmetry is the whole point of the audit: the "warm-TTFT" bf16
+//! decode shortcut fires for the *Sym / V-quant family (codec frozen at
+//! decode) but is structurally absent from the K-only family's decode body
+//! (codec runs at decode). See the audit table + per-codec rationale in
+//! `docs/KV_CACHE.md` §9.6.
+
+use super::core::KvCache;
+use crate::storage::KvStorage;
+use crate::KvQuant;
+use rmlx_mlx::{Array, Device, Dtype};
+
+const TEST_KV_H: i32 = 8;
+const TEST_HEAD_DIM: i32 = 128;
+const TEST_MAX_SEQ: i32 = 512;
+const TEST_PREFILL_SEQ: i32 = 256;
+
+fn f32_arr(data: &[f32], shape: &[i32]) -> Array {
+    // SAFETY: Apple-Silicon-only build (CLAUDE.md Hard rule 1); f32 is 4-byte
+    // LE on this target. `data` is borrowed read-only and copied into MLX
+    // before the borrow ends.
+    let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 4) };
+    Array::from_bytes(bytes, shape, Dtype::F32).expect("Array::from_bytes")
+}
+
+/// Outcome of driving a cache through prefill → exit_prefill → one decode step.
+struct DecodeOutcome {
+    /// Whether the bf16 K seed (`decode_fp16_k`) is live after the decode step.
+    k_seed_live: bool,
+    /// Whether the bf16 V seed (`decode_fp16_v`) is live after the decode step.
+    v_seed_live: bool,
+    /// Cache offset after one decode step.
+    offset: i32,
+    /// `approx_bytes()` residency estimate after one decode step.
+    approx_bytes: u64,
+}
+
+/// Drive a cache through prefill (one chunk) → exit_prefill → one decode step.
+fn drive_one_decode(cache: &mut KvCache, device: Device) -> DecodeOutcome {
+    cache.enter_prefill();
+
+    let prefill_shape = [1i32, TEST_KV_H, TEST_PREFILL_SEQ, TEST_HEAD_DIM];
+    let n_pref: usize = prefill_shape.iter().map(|&d| d as usize).product();
+    let k_pref = f32_arr(&vec![0.123f32; n_pref], &prefill_shape);
+    let v_pref = f32_arr(&vec![0.456f32; n_pref], &prefill_shape);
+    cache
+        .update(&k_pref, &v_pref, device)
+        .expect("prefill chunk");
+    cache.exit_prefill(device).expect("exit_prefill");
+
+    let step_shape = [1i32, TEST_KV_H, 1, TEST_HEAD_DIM];
+    let n_step: usize = step_shape.iter().map(|&d| d as usize).product();
+    let k_step = f32_arr(&vec![0.789f32; n_step], &step_shape);
+    let v_step = f32_arr(&vec![0.321f32; n_step], &step_shape);
+    cache
+        .update(&k_step, &v_step, device)
+        .expect("decode step 1");
+
+    DecodeOutcome {
+        k_seed_live: cache.decode_fp16_k_for_test().is_some(),
+        v_seed_live: cache.decode_fp16_v_for_test().is_some(),
+        offset: cache.offset(),
+        approx_bytes: cache.approx_bytes(),
+    }
+}
+
+/// Shortcut-codec contract: after one decode step the bf16 K mirror is live
+/// (proves `update_decode_fp16` ran) and the quant codec did NOT advance.
+fn assert_shortcut_codec(quant: KvQuant, codec_seq_after: impl Fn(&KvCache) -> i32) {
+    let device = Device::Cpu;
+    let mut cache = KvCache::with_quant_max_seq(quant, TEST_MAX_SEQ);
+    cache.enter_prefill();
+    let prefill_shape = [1i32, TEST_KV_H, TEST_PREFILL_SEQ, TEST_HEAD_DIM];
+    let n_pref: usize = prefill_shape.iter().map(|&d| d as usize).product();
+    let k_pref = f32_arr(&vec![0.123f32; n_pref], &prefill_shape);
+    let v_pref = f32_arr(&vec![0.456f32; n_pref], &prefill_shape);
+    cache
+        .update(&k_pref, &v_pref, device)
+        .expect("prefill chunk");
+    cache.exit_prefill(device).expect("exit_prefill");
+
+    let codec_seq_pre_decode = codec_seq_after(&cache);
+    assert_eq!(
+        codec_seq_pre_decode, TEST_PREFILL_SEQ,
+        "{quant:?}: exit_prefill should bulk-encode the prefill K to {TEST_PREFILL_SEQ}, \
+         got {codec_seq_pre_decode}"
+    );
+
+    let step_shape = [1i32, TEST_KV_H, 1, TEST_HEAD_DIM];
+    let n_step: usize = step_shape.iter().map(|&d| d as usize).product();
+    let k_step = f32_arr(&vec![0.789f32; n_step], &step_shape);
+    let v_step = f32_arr(&vec![0.321f32; n_step], &step_shape);
+    cache
+        .update(&k_step, &v_step, device)
+        .expect("decode step 1");
+
+    assert!(
+        cache.decode_fp16_k_for_test().is_some(),
+        "{quant:?}: warm-TTFT contract — decode_fp16_k MUST be live after exit_prefill + decode"
+    );
+    let codec_seq_post_decode = codec_seq_after(&cache);
+    assert_eq!(
+        codec_seq_post_decode, codec_seq_pre_decode,
+        "{quant:?}: warm-TTFT shortcut violation — quant K codec advanced from \
+         {codec_seq_pre_decode} to {codec_seq_post_decode} on a decode step while \
+         decode_fp16_k was live (the codec must stay frozen; decode reads bf16)"
+    );
+    assert_eq!(
+        cache.offset(),
+        TEST_PREFILL_SEQ + 1,
+        "{quant:?}: offset after one decode step"
+    );
+}
+
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "test asserts a construction-time invariant: storage matches the KvQuant the cache was built with; any other variant is a construction bug an explicit panic catches sooner."
+)]
+fn k8_codec_seq(cache: &KvCache) -> i32 {
+    match cache.storage() {
+        KvStorage::K8V4 { k, .. } | KvStorage::K8V8 { k, .. } => k
+            .as_ref()
+            .and_then(|q| q.shape.get(2).copied())
+            .unwrap_or(0),
+        _ => panic!("expected K8V4/K8V8 storage"),
+    }
+}
+
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "construction-time invariant — see k8_codec_seq."
+)]
+fn iso_sym3_k_codec_seq(cache: &KvCache) -> i32 {
+    match cache.storage() {
+        KvStorage::IsoSym3 { k, .. } => k
+            .as_ref()
+            .map_or(0, |q| q.shape.get(2).copied().unwrap_or(0)),
+        _ => panic!("expected IsoSym3 storage"),
+    }
+}
+
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "construction-time invariant — see k8_codec_seq."
+)]
+fn iso_k_only3_k_codec_seq(cache: &KvCache) -> i32 {
+    match cache.storage() {
+        KvStorage::IsoKOnly3 { k, .. } => k
+            .as_ref()
+            .map_or(0, |q| q.shape.get(2).copied().unwrap_or(0)),
+        _ => panic!("expected IsoKOnly3 storage"),
+    }
+}
+
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "construction-time invariant — see k8_codec_seq."
+)]
+fn rotor_k_only3_k_codec_seq(cache: &KvCache) -> i32 {
+    match cache.storage() {
+        KvStorage::RotorKOnly3 { k, .. } => k
+            .as_ref()
+            .map_or(0, |q| q.shape.get(2).copied().unwrap_or(0)),
+        _ => panic!("expected RotorKOnly3 storage"),
+    }
+}
+
+#[test]
+fn k8v4_warm_ttft_freezes_codec() {
+    assert_shortcut_codec(KvQuant::K8V4, k8_codec_seq);
+}
+
+#[test]
+fn k8v8_warm_ttft_freezes_codec() {
+    assert_shortcut_codec(KvQuant::K8V8, k8_codec_seq);
+}
+
+#[test]
+fn iso_sym3_warm_ttft_freezes_codec() {
+    assert_shortcut_codec(KvQuant::Iso3Sym, iso_sym3_k_codec_seq);
+}
+
+/// K-only contract: IsoKOnly3 quantises K at every decode step and
+/// never reads the bf16 K seed. The K-seed materialisation is gated on
+/// `KvQuant::feeds_bf16_k_at_decode()`, which is `false` for the K-only family:
+/// the K seed is ABSENT while the V seed stays live, the K codec still
+/// advances one position per decode step, and `approx_bytes` drops by the
+/// bf16 K-seed cost. Output is byte-unchanged.
+#[test]
+fn iso_k_only3_quant_at_decode() {
+    let device = Device::Cpu;
+    let mut cache = KvCache::with_quant_max_seq(KvQuant::IsoKOnly3, TEST_MAX_SEQ);
+    let out = drive_one_decode(&mut cache, device);
+
+    // The bf16 K seed is NOT allocated for the K-only family —
+    // the decode body never reads it, so exit_prefill skips it.
+    assert!(
+        !out.k_seed_live,
+        "IsoKOnly3: exit_prefill must NOT populate decode_fp16_k (K-only never reads it)"
+    );
+    // The bf16 V seed IS still live — K-only decode reads it via
+    // update_decode_fp16_v_only.
+    assert!(
+        out.v_seed_live,
+        "IsoKOnly3: decode_fp16_v MUST stay live (V seed feeds the K-only decode path)"
+    );
+    // The K-only codec still runs at decode — proof the warm-TTFT shortcut does
+    // NOT short-circuit this path (no decode_fp16_k.is_some() gate in the body).
+    assert_eq!(
+        iso_k_only3_k_codec_seq(&cache),
+        TEST_PREFILL_SEQ + 1,
+        "IsoKOnly3: K codec MUST advance by 1 per decode step (quant-at-decode), \
+         not freeze at the prefill length — the bf16 K seed is NOT consulted here"
+    );
+    assert_eq!(
+        out.offset,
+        TEST_PREFILL_SEQ + 1,
+        "IsoKOnly3 offset after one decode step"
+    );
+    // Residency: exact post-reclaim expectation.
+    //
+    // Formula: kv_bytes + seed_bytes
+    //   seq = TEST_PREFILL_SEQ + 1 = 257
+    //   bhd = 1 * TEST_KV_H * TEST_HEAD_DIM = 8 * 128 = 1024
+    //   k_bits = 3 (IsoKOnly3 K is IsoQuant 3-bit), v_bits = 16 (bf16 V)
+    //   kv_bytes = 257 * 1024 * (3 + 16) / 8 = 625_024
+    //   seed_bytes: k_seed absent, v_seed present →
+    //     257 * 1024 * 2 * 1 = 526_336
+    //   total = 625_024 + 526_336 = 1_151_360
+    //
+    // This assert FAILS if the K seed is still counted (pre-fix total was
+    // 1_151_360 + 526_336 = 1_677_696 — not equal to 1_151_360).
+    assert_eq!(
+        out.approx_bytes, 1_151_360,
+        "IsoKOnly3: approx_bytes must equal quantised-K (3-bit) + bf16-V-seed; \
+         got {}",
+        out.approx_bytes,
+    );
+}
+
+/// K-only contract for the rotor family — same as IsoKOnly3 but rotor3 K.
+/// Pins the truth that RotorKOnly3 does NOT consult `decode_fp16_k`. The
+/// dead K seed was dropped; the K rotor codec still runs every decode step.
+#[test]
+fn rotor_k_only3_quant_at_decode() {
+    let device = Device::Cpu;
+    let mut cache = KvCache::with_quant_max_seq(KvQuant::RotorKOnly3, TEST_MAX_SEQ);
+    let out = drive_one_decode(&mut cache, device);
+
+    assert!(
+        !out.k_seed_live,
+        "RotorKOnly3: exit_prefill must NOT populate decode_fp16_k (K-only never reads it)"
+    );
+    assert!(
+        out.v_seed_live,
+        "RotorKOnly3: decode_fp16_v MUST stay live (V seed feeds the K-only decode path)"
+    );
+    assert_eq!(
+        rotor_k_only3_k_codec_seq(&cache),
+        TEST_PREFILL_SEQ + 1,
+        "RotorKOnly3: K rotor codec MUST advance by 1 per decode step (quant-at-decode); \
+         the asym-variant rustdoc claim that RotorKOnly3 bypasses K once the seed is live \
+         is FALSE — the body has no seed gate"
+    );
+    assert_eq!(
+        out.offset,
+        TEST_PREFILL_SEQ + 1,
+        "RotorKOnly3 offset after one decode step"
+    );
+    // Residency: exact post-reclaim expectation.
+    //
+    // Formula: kv_bytes + seed_bytes
+    //   seq = TEST_PREFILL_SEQ + 1 = 257
+    //   bhd = 1 * TEST_KV_H * TEST_HEAD_DIM = 8 * 128 = 1024
+    //   k_bits = 3 (RotorKOnly3 K is rotor3, 3-bit effective), v_bits = 16 (bf16 V)
+    //   kv_bytes = 257 * 1024 * (3 + 16) / 8 = 625_024
+    //   seed_bytes: k_seed absent, v_seed present →
+    //     257 * 1024 * 2 * 1 = 526_336
+    //   total = 625_024 + 526_336 = 1_151_360
+    //
+    // This assert FAILS if the K seed is still counted (pre-fix total was
+    // 1_151_360 + 526_336 = 1_677_696 — not equal to 1_151_360).
+    assert_eq!(
+        out.approx_bytes, 1_151_360,
+        "RotorKOnly3: approx_bytes must equal quantised-K (3-bit) + bf16-V-seed; \
+         got {}",
+        out.approx_bytes,
+    );
+}

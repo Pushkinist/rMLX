@@ -1,0 +1,15 @@
+{
+  "snapshot": "mlx-community__medgemma-1.5-4b-it-8bit",
+  "arch": "Gemma3ForConditionalGeneration",
+  "messages": [
+    {
+      "role": "user",
+      "content": "What is the capital of France?"
+    }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "bos_token": "<bos>",
+  "eos_token": "<eos>",
+  "expected": "<bos><start_of_turn>user\nWhat is the capital of France?<end_of_turn>\n<start_of_turn>model\n"
+}

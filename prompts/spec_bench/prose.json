@@ -1,0 +1,11 @@
+{
+  "name": "spec-bench-rust-5-features",
+  "class": "prose",
+  "notes": "Free-prose listing. Low MTP accept rate (~0.23 on gemma-4-e2b-it-mxfp8). Used as the spec_bench.sh default.",
+  "messages": [
+    {
+      "role": "user",
+      "content": "List 5 important features of the Rust programming language."
+    }
+  ]
+}

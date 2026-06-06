@@ -1,0 +1,15 @@
+{
+  "snapshot": "mlx-community__gemma-4-e4b-it-mxfp8",
+  "arch": "Gemma4ForConditionalGeneration",
+  "messages": [
+    {
+      "role": "user",
+      "content": "What is 2+2?"
+    }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "bos_token": "<bos>",
+  "eos_token": "<eos>",
+  "expected": "<bos><|turn>user\nWhat is 2+2?<turn|>\n<|turn>model\n"
+}

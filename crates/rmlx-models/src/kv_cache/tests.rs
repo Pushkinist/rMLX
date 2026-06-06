@@ -1,0 +1,1708 @@
+// unsafe_code: mlx-rs Array zero-copy view — slice::from_raw_parts byte-reinterpret in test helpers
+#![cfg_attr(test, allow(unsafe_code))]
+
+#[cfg(test)]
+#[allow(clippy::module_inception)]
+mod tests {
+    use super::super::{
+        kv_quant_for_ctx, kv_quant_for_layer, lookup_layer_calibration, KvCacheBuilder,
+        LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
+    };
+    use rmlx_kv_quant::kvcache::KvCache;
+    use rmlx_kv_quant::storage::KvStorage;
+    use rmlx_kv_quant::{KvQuant, KV_MAX_SEQ_DEFAULT};
+    use rmlx_loader::KvCalibration;
+    use rmlx_mlx::{Array, Device, Dtype};
+
+    // Helper: make a [B, kv_h, S, D] F32 array with deterministic LCG data in [-1, 1].
+    #[allow(
+        clippy::expect_used,
+        reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+    )]
+    fn make_lcg_array(shape: &[i32], seed: u64) -> (Array, Vec<f32>) {
+        let n: usize = shape.iter().map(|&x| x as usize).product();
+        let mut state = seed;
+        let data: Vec<f32> = (0..n)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let frac = ((state >> 33) as f32) / (u32::MAX as f32);
+                frac * 2.0 - 1.0
+            })
+            .collect();
+        let bytes =
+            unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 4) };
+        let arr = Array::from_bytes(bytes, shape, Dtype::F32).expect("make_lcg_array failed");
+        (arr, data)
+    }
+
+    // Helper: extract f32 values from an Array (must be F32 dtype, already materialised).
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    fn array_to_vec(a: &Array) -> Vec<f32> {
+        a.eval().unwrap();
+        let bytes = a.to_bytes().unwrap();
+        bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    #[allow(
+        clippy::expect_used,
+        reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+    )]
+    fn kv_cache_quant_k8v4_roundtrip_within_tolerance() {
+        let device = Device::Cpu;
+        let shape: &[i32] = &[1, 2, 3, 128];
+
+        let (new_k, k_data) = make_lcg_array(shape, 0xCAFE_BABE_u64);
+        let (new_v, v_data) = make_lcg_array(shape, 0xDEAD_BEEF_u64);
+
+        let mut cache = KvCache::with_quant(KvQuant::K8V4);
+        let (k_full, v_full) = cache
+            .update(&new_k, &new_v, device)
+            .expect("K8V4 update failed");
+
+        assert_eq!(k_full.shape(), vec![1, 2, 3, 128], "K shape mismatch");
+        assert_eq!(v_full.shape(), vec![1, 2, 3, 128], "V shape mismatch");
+
+        let k_recon = array_to_vec(&k_full);
+        let v_recon = array_to_vec(&v_full);
+
+        let k_max_err = k_data
+            .iter()
+            .zip(&k_recon)
+            .map(|(&o, &r)| (o - r).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            k_max_err < 0.05,
+            "K max abs error {k_max_err:.6} exceeds tolerance 0.05 for q8_0"
+        );
+
+        let v_max_err = v_data
+            .iter()
+            .zip(&v_recon)
+            .map(|(&o, &r)| (o - r).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            v_max_err < 0.15,
+            "V max abs error {v_max_err:.6} exceeds tolerance 0.15 for TurboQuant V4"
+        );
+
+        assert!(
+            k_recon.iter().all(|v| v.is_finite()),
+            "K contains non-finite"
+        );
+        assert!(
+            v_recon.iter().all(|v| v.is_finite()),
+            "V contains non-finite"
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::expect_used,
+        reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+    )]
+    fn kv_cache_quant_planar_roundtrip_within_tolerance() {
+        let device = Device::Cpu;
+        let shape: &[i32] = &[1, 2, 3, 128];
+
+        let (new_k, k_data) = make_lcg_array(shape, 0xCAFE_BABE_u64);
+        let (new_v, v_data) = make_lcg_array(shape, 0xDEAD_BEEF_u64);
+
+        let mut cache = KvCache::with_quant(KvQuant::Planar);
+        let (k_full, v_full) = cache
+            .update(&new_k, &new_v, device)
+            .expect("Planar update failed");
+
+        assert_eq!(k_full.shape(), vec![1, 2, 3, 128], "K shape mismatch");
+        assert_eq!(v_full.shape(), vec![1, 2, 3, 128], "V shape mismatch");
+
+        let k_recon = array_to_vec(&k_full);
+        let v_recon = array_to_vec(&v_full);
+
+        let k_max_err = k_data
+            .iter()
+            .zip(&k_recon)
+            .map(|(&o, &r)| (o - r).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            k_max_err < 0.05,
+            "Planar K max abs error {k_max_err:.6} exceeds 0.05 for q8_0"
+        );
+
+        let v_max_err = v_data
+            .iter()
+            .zip(&v_recon)
+            .map(|(&o, &r)| (o - r).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            v_max_err < 0.10,
+            "Planar V max abs error {v_max_err:.6} exceeds 0.10 for PlanarQuant V4"
+        );
+
+        assert!(
+            k_recon.iter().all(|v| v.is_finite()),
+            "K contains non-finite"
+        );
+        assert!(
+            v_recon.iter().all(|v| v.is_finite()),
+            "V contains non-finite"
+        );
+    }
+
+    // ── Per-arch defaults ─────────────────────────────────────────────────
+    //
+    // Every architecture defaults to K8V8. The unquantised `KvQuant::None`
+    // path was removed because it pre-allocated a `[B, kv_h, max_seq, D]` bf16
+    // buffer (~64 GB at 128k ctx) and every shipping arch was already coherent
+    // at K8V8 per the 4k-bench.
+    //
+    // for_arch_default is deprecated; the tests below are retained to verify
+    // the deprecated function still returns K8V8 for all arches (it is a no-op).
+    // New callers must use resolve_default.
+    #[allow(
+        deprecated,
+        reason = "verifying deprecated for_arch_default still returns K8V8"
+    )]
+    #[test]
+    fn kv_quant_default_for_qwen3_5_moe_is_k8v8() {
+        assert_eq!(
+            KvCacheBuilder::for_arch_default("Qwen3_5MoeForConditionalGeneration"),
+            KvQuant::K8V8,
+            "Qwen3_5MoeForConditionalGeneration must default to K8V8"
+        );
+    }
+
+    #[allow(
+        deprecated,
+        reason = "verifying deprecated for_arch_default still returns K8V8"
+    )]
+    #[test]
+    fn kv_quant_default_for_qwen2_moe_is_k8v8() {
+        assert_eq!(
+            KvCacheBuilder::for_arch_default("Qwen2MoeForCausalLM"),
+            KvQuant::K8V8
+        );
+    }
+
+    #[allow(
+        deprecated,
+        reason = "verifying deprecated for_arch_default still returns K8V8"
+    )]
+    #[test]
+    fn kv_quant_default_for_qwen3_moe_is_k8v8() {
+        assert_eq!(
+            KvCacheBuilder::for_arch_default("Qwen3MoeForCausalLM"),
+            KvQuant::K8V8
+        );
+    }
+
+    #[allow(
+        deprecated,
+        reason = "verifying deprecated for_arch_default still returns K8V8"
+    )]
+    #[test]
+    fn kv_quant_default_for_gemma4_is_k8v8() {
+        assert_eq!(
+            KvCacheBuilder::for_arch_default("Gemma4ForConditionalGeneration"),
+            KvQuant::K8V8
+        );
+    }
+
+    #[allow(
+        deprecated,
+        reason = "verifying deprecated for_arch_default still returns K8V8"
+    )]
+    #[test]
+    fn kv_quant_default_for_qwen3_dense_is_k8v8() {
+        assert_eq!(
+            KvCacheBuilder::for_arch_default("Qwen3ForCausalLM"),
+            KvQuant::K8V8,
+            "Dense Qwen3 (no MoE) defaults to K8V8"
+        );
+    }
+
+    // ── resolve_default uses arch + config signals ────────────────────────
+    use super::super::ResolverSignals;
+
+    #[test]
+    fn resolve_default_qwen3_5_moe_affine() {
+        // Qwen3.6-35B-A3B-8bit — affine 8b, no paroquant.
+        // Mixed K8V8 routing on FA layers caused -11.9% decode regression
+        // on Qwen3.6-35B-A3B-8bit. Reverted to K8V8.
+        let s = ResolverSignals {
+            weight_bits: Some(8),
+            ..Default::default()
+        };
+        assert_eq!(
+            KvCacheBuilder::resolve_default("Qwen3_5MoeForConditionalGeneration", s),
+            KvQuant::K8V8
+        );
+    }
+
+    #[test]
+    fn resolve_default_qwen3_5_moe_paro() {
+        // z-lab/Qwen3.6-27B-PARO uses arch class Qwen3_5ForConditionalGeneration (dense).
+        // Mixed K8V4 routing caused -28% decode regression. Reverted.
+        let s = ResolverSignals {
+            is_paroquant: true,
+            weight_bits: Some(4),
+            ..Default::default()
+        };
+        assert_eq!(
+            KvCacheBuilder::resolve_default("Qwen3_5ForConditionalGeneration", s),
+            KvQuant::K8V4
+        );
+    }
+
+    #[test]
+    fn resolve_default_qwen3_dense_2bit() {
+        // prism-ml Ternary-Bonsai-8B — Qwen3 dense, bits=2.
+        // Bonsai (bits=2) routes to the mlx-lm-tq Mixed { K=8, V=4 } path
+        // (quantized 3-tuple stored, 2× quantized_matmul SDPA).
+        // Affine 8b Qwen3 dense continues on K8V8 below.
+        let s = ResolverSignals {
+            weight_bits: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(
+            KvCacheBuilder::resolve_default("Qwen3ForCausalLM", s),
+            KvQuant::Mixed {
+                k_bits: 8,
+                v_bits: 4,
+                k_group_size: 64,
+                v_group_size: 64,
+            }
+        );
+        // Affine 8b Qwen3 dense (e.g. mlx-community Qwen3-x.x-Bx-8bit) stays K8V8.
+        let s8 = ResolverSignals {
+            weight_bits: Some(8),
+            ..Default::default()
+        };
+        assert_eq!(
+            KvCacheBuilder::resolve_default("Qwen3ForCausalLM", s8),
+            KvQuant::K8V8
+        );
+    }
+
+    #[test]
+    fn resolve_default_gemma3() {
+        // medgemma-1.5-4b-it-8bit (Gemma3) — planar wins TPS.
+        let s = ResolverSignals {
+            hidden_size: Some(2560),
+            weight_bits: Some(8),
+            ..Default::default()
+        };
+        assert_eq!(
+            KvCacheBuilder::resolve_default("Gemma3ForConditionalGeneration", s),
+            KvQuant::Planar
+        );
+    }
+
+    #[test]
+    fn resolve_default_gemma4_small() {
+        // Composite-score audit: Gemma4 small (non-paroquant, non-MoE,
+        // hidden ≤ 2560) reverted to K8V8. Composite score (3-term degraded):
+        //   K8V8     = 0.942 (TPS 74.22, cosine ≥0.9990, mem 16 bits)
+        //   K8VTurbo3 = 0.887 (TPS 73.16, cosine ≥0.9807, mem 11 bits)
+        // +1.4% TPS and +0.0183 cosine — both exceed ±1% / ±0.002 conservatism gate.
+        // K8VTurbo3 remains available via --kv-quant k8vturbo3.
+        //
+        // gemma-4-e2b-mxfp8 — hidden=1536, no MoE.
+        let s = ResolverSignals {
+            hidden_size: Some(1536),
+            ..Default::default()
+        };
+        assert_eq!(
+            KvCacheBuilder::resolve_default("Gemma4ForConditionalGeneration", s),
+            KvQuant::K8V8,
+            "Gemma4 small (hidden=1536) must resolve to K8V8"
+        );
+        // gemma-4-e4b-mxfp8 — hidden=2560 (boundary, inclusive).
+        let s = ResolverSignals {
+            hidden_size: Some(2560),
+            ..Default::default()
+        };
+        assert_eq!(
+            KvCacheBuilder::resolve_default("Gemma4ForConditionalGeneration", s),
+            KvQuant::K8V8,
+            "Gemma4 small (hidden=2560 boundary) must resolve to K8V8"
+        );
+    }
+
+    #[test]
+    fn resolve_default_gemma4_small_boundary() {
+        // hidden=2561 — first value above the ≤2560 small ceiling; must fall through
+        // to the unknown-territory K8V8 default (no MoE, not ≥5376).
+        let s = ResolverSignals {
+            hidden_size: Some(2561),
+            ..Default::default()
+        };
+        assert_eq!(
+            KvCacheBuilder::resolve_default("Gemma4ForConditionalGeneration", s),
+            KvQuant::K8V8
+        );
+        // hidden=5375 — one below the ≥5376 dense gate; must also fall through to K8V8.
+        let s = ResolverSignals {
+            hidden_size: Some(5375),
+            ..Default::default()
+        };
+        assert_eq!(
+            KvCacheBuilder::resolve_default("Gemma4ForConditionalGeneration", s),
+            KvQuant::K8V8
+        );
+    }
+
+    #[test]
+    fn resolve_default_gemma4_dense() {
+        // gemma-4-31b-it-mxfp8 — hidden=5376, no MoE → planar.
+        let s = ResolverSignals {
+            hidden_size: Some(5376),
+            ..Default::default()
+        };
+        assert_eq!(
+            KvCacheBuilder::resolve_default("Gemma4ForConditionalGeneration", s),
+            KvQuant::Planar
+        );
+    }
+
+    #[test]
+    fn resolve_default_gemma4_paro_dense() {
+        // z-lab/gemma-4-31B-PARO — hidden=5376, paroquant → planar.
+        let s = ResolverSignals {
+            hidden_size: Some(5376),
+            is_paroquant: true,
+            weight_bits: Some(4),
+            ..Default::default()
+        };
+        assert_eq!(
+            KvCacheBuilder::resolve_default("Gemma4ForConditionalGeneration", s),
+            KvQuant::Planar
+        );
+    }
+
+    #[test]
+    fn resolve_default_gemma4_moe() {
+        // gemma-4-26b-a4b-it-mxfp8 — has_moe=true overrides hidden_size.
+        let s = ResolverSignals {
+            hidden_size: Some(2816),
+            has_moe: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            KvCacheBuilder::resolve_default("Gemma4ForConditionalGeneration", s),
+            KvQuant::K8V8
+        );
+    }
+
+    // ── per-arch default audit tests ──────────────────────────────────────────
+
+    /// Gemma4 small (non-MoE, hidden ≤ 2560, non-paroquant) must resolve to K8V8.
+    ///
+    /// Composite-score audit: K8V8 score=0.942 beats K8VTurbo3 score=0.887.
+    /// +1.4% TPS, +0.0183 cosine.
+    #[test]
+    fn resolve_default_gemma4_small_picks_k8v8() {
+        // e4b hidden=2560 (boundary).
+        let s = ResolverSignals {
+            hidden_size: Some(2560),
+            has_moe: false,
+            is_paroquant: false,
+            weight_bits: Some(8),
+        };
+        assert_eq!(
+            KvCacheBuilder::resolve_default("Gemma4ForConditionalGeneration", s),
+            KvQuant::K8V8,
+            "Gemma4 small (e4b, hidden=2560) must pick K8V8"
+        );
+        // e2b hidden=1536.
+        let s2 = ResolverSignals {
+            hidden_size: Some(1536),
+            has_moe: false,
+            is_paroquant: false,
+            weight_bits: Some(8),
+        };
+        assert_eq!(
+            KvCacheBuilder::resolve_default("Gemma4ForConditionalGeneration", s2),
+            KvQuant::K8V8,
+            "Gemma4 small (e2b, hidden=1536) must pick K8V8"
+        );
+    }
+
+    /// Qwen3.6-MoE (Qwen3_5MoeForConditionalGeneration) must stay K8V8.
+    ///
+    /// Composite audit: K8V8 composite score=0.937 vs turbo2_tcq=0.795.
+    /// No flip — default was already K8V8.
+    #[test]
+    fn resolve_default_qwen35_moe_stays_k8v8() {
+        let s = ResolverSignals {
+            weight_bits: Some(8),
+            ..Default::default()
+        };
+        assert_eq!(
+            KvCacheBuilder::resolve_default("Qwen3_5MoeForConditionalGeneration", s),
+            KvQuant::K8V8,
+            "Qwen3.6-MoE must stay K8V8 (composite score=0.937)"
+        );
+    }
+
+    /// Bonsai / Qwen3ForCausalLM 2-bit must stay Mixed{k8g64,v4g64}.
+    ///
+    /// Composite audit: Mixed score=0.946 vs turbo3_tcq=0.819, turbo2_tcq=0.714.
+    /// No flip — default was already Mixed.
+    #[test]
+    fn resolve_default_bonsai_stays_mixed() {
+        let s = ResolverSignals {
+            weight_bits: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(
+            KvCacheBuilder::resolve_default("Qwen3ForCausalLM", s),
+            KvQuant::Mixed {
+                k_bits: 8,
+                v_bits: 4,
+                k_group_size: 64,
+                v_group_size: 64,
+            },
+            "Bonsai (Qwen3 2-bit) must stay Mixed{{k8g64,v4g64}} (composite score=0.946)"
+        );
+    }
+
+    /// Qwen3ForCausalLM 8-bit (dense non-Bonsai) must stay K8V8.
+    ///
+    /// Composite audit: no cell data for Qwen3-dense-8bit. Safe default K8V8 retained.
+    #[test]
+    fn resolve_default_qwen3_dense_8bit_stays_k8v8() {
+        let s = ResolverSignals {
+            weight_bits: Some(8),
+            ..Default::default()
+        };
+        assert_eq!(
+            KvCacheBuilder::resolve_default("Qwen3ForCausalLM", s),
+            KvQuant::K8V8,
+            "Qwen3 dense 8-bit must stay K8V8 (no cell data)"
+        );
+    }
+
+    #[test]
+    fn resolve_default_unknown_falls_back_to_k8v8() {
+        let s = ResolverSignals::default();
+        assert_eq!(
+            KvCacheBuilder::resolve_default("FakeArchXyz", s),
+            KvQuant::K8V8
+        );
+        // Empty arch class also falls back.
+        assert_eq!(KvCacheBuilder::resolve_default("", s), KvQuant::K8V8);
+    }
+
+    #[test]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    fn kv_cache_k8v4_two_updates_shape() {
+        let device = Device::Cpu;
+
+        let (k1, _) = make_lcg_array(&[1, 2, 3, 128], 1);
+        let (v1, _) = make_lcg_array(&[1, 2, 3, 128], 2);
+
+        let mut cache = KvCache::with_quant(KvQuant::K8V4);
+        let (kf1, vf1) = cache.update(&k1, &v1, device).unwrap();
+        assert_eq!(kf1.shape(), vec![1, 2, 3, 128]);
+        assert_eq!(vf1.shape(), vec![1, 2, 3, 128]);
+        assert_eq!(cache.offset(), 3);
+
+        let (k2, _) = make_lcg_array(&[1, 2, 1, 128], 3);
+        let (v2, _) = make_lcg_array(&[1, 2, 1, 128], 4);
+        let (kf2, vf2) = cache.update(&k2, &v2, device).unwrap();
+        assert_eq!(kf2.shape(), vec![1, 2, 4, 128], "accumulated K shape wrong");
+        assert_eq!(vf2.shape(), vec![1, 2, 4, 128], "accumulated V shape wrong");
+        assert_eq!(cache.offset(), 4);
+    }
+
+    #[test]
+    fn linear_attn_cache_default_empty() {
+        use rmlx_kv_quant::LinearAttnCache;
+        let c = LinearAttnCache::new();
+        assert!(c.conv_state.is_none(), "fresh cache must have no conv tail");
+        assert!(
+            c.delta_state.is_none(),
+            "fresh cache must have no delta state"
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    fn linear_attn_cache_reset_clears_both_states() {
+        use rmlx_kv_quant::LinearAttnCache;
+        let mut c = LinearAttnCache::new();
+        let arr = Array::from_bytes(&[0u8; 16], &[1, 4], Dtype::F32).unwrap();
+        c.conv_state = Some(arr.try_clone().unwrap());
+        c.delta_state = Some(arr);
+        assert!(c.conv_state.is_some());
+        assert!(c.delta_state.is_some());
+
+        c.reset();
+        assert!(c.conv_state.is_none(), "reset must drop conv tail");
+        assert!(c.delta_state.is_none(), "reset must drop delta state");
+    }
+
+    #[test]
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "wildcard arm is the correct fallthrough for unsupported arch/quant variants; exhaustive expansion would require updating on every new variant"
+    )]
+    fn with_quant_max_seq_stores_correct_capacity() {
+        let c_default = KvCache::with_quant(KvQuant::K8V4);
+        let default_max = match &c_default.storage {
+            KvStorage::K8V4 { max_seq, .. } => *max_seq,
+            _ => panic!("expected K8V4 storage"),
+        };
+        assert_eq!(
+            default_max, KV_MAX_SEQ_DEFAULT,
+            "with_quant(K8V4) must cap at KV_MAX_SEQ_DEFAULT={KV_MAX_SEQ_DEFAULT}"
+        );
+
+        let c_long = KvCache::with_quant_max_seq(KvQuant::K8V4, 8192);
+        let long_max = match &c_long.storage {
+            KvStorage::K8V4 { max_seq, .. } => *max_seq,
+            _ => panic!("expected K8V4 storage"),
+        };
+        assert_eq!(
+            long_max, 8192,
+            "with_quant_max_seq(K8V4, 8192) must store max_seq=8192, not KV_MAX_SEQ_DEFAULT"
+        );
+    }
+
+    // ── N16: approx_bytes unit tests ──────────────────────────────────────────
+
+    /// Zero offset → zero bytes regardless of quant mode.
+    #[test]
+    fn approx_bytes_empty_cache_is_zero() {
+        for quant in [KvQuant::K8V8, KvQuant::K8V4, KvQuant::None, KvQuant::Planar] {
+            let cache = KvCache::with_quant(quant);
+            assert_eq!(
+                cache.approx_bytes(),
+                0,
+                "empty {quant:?} cache must be 0 bytes"
+            );
+        }
+    }
+
+    /// After a single update on `KvQuant::None` (bf16, 16-bit K + 16-bit V),
+    /// approx_bytes should equal: seq × B × kv_h × head_dim × (16+16)/8 bytes.
+    ///
+    /// Shape: B=1, kv_h=4, seq=256, head_dim=128.
+    /// Expected = 256 × 1 × 4 × 128 × 4 = 524_288 bytes (512 KiB).
+    #[test]
+    #[allow(
+        clippy::expect_used,
+        reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+    )]
+    fn approx_bytes_none_quant_matches_formula() {
+        let device = Device::Cpu;
+        // Use a large max_seq so the cache isn't truncated.
+        let mut cache = KvCache::with_quant_max_seq(KvQuant::None, 4096);
+        // enter_prefill + update + exit_prefill so decode_fp16 buffers are set.
+        cache.enter_prefill();
+        let k = make_lcg_array(&[1, 4, 256, 128], 0xABCD).0;
+        let v = make_lcg_array(&[1, 4, 256, 128], 0x1234).0;
+        cache.update(&k, &v, device).expect("update must not fail");
+        cache
+            .exit_prefill(device)
+            .expect("exit_prefill must not fail");
+
+        // seq=256, B=1, kv_h=4, head_dim=128, bf16 (2 bytes each for K and V)
+        // Formula: seq × kv_h × head_dim × (k_bits + v_bits) / 8
+        let expected: u64 = 256 * 4 * 128 * 4; // (16+16)/8 = 4 bytes per element pair
+        assert_eq!(
+            cache.approx_bytes(),
+            expected,
+            "None (bf16) cache: expected {expected} bytes, got {}",
+            cache.approx_bytes()
+        );
+    }
+
+    /// After a single update on `KvQuant::K8V8` (8-bit K + 8-bit V),
+    /// approx_bytes should equal:
+    /// seq × B × kv_h × head_dim × (8+8)/8 + warm-seed bytes
+    /// = 256 × 1 × 4 × 128 × 2 + 256 × 1 × 4 × 128 × 4
+    /// = 262_144 + 524_288 = 786_432 bytes.
+    ///
+    /// The warm-TTFT fp16 seed (decode_fp16_k/v) adds one 2-byte buffer per K
+    /// and V element at the filled sequence length.
+    #[test]
+    #[allow(
+        clippy::expect_used,
+        reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+    )]
+    fn approx_bytes_k8v8_matches_formula() {
+        let device = Device::Cpu;
+        let mut cache = KvCache::with_quant_max_seq(KvQuant::K8V8, 4096);
+        cache.enter_prefill();
+        let k = make_lcg_array(&[1, 4, 256, 128], 0xBEEF).0;
+        let v = make_lcg_array(&[1, 4, 256, 128], 0xCAFE).0;
+        cache.update(&k, &v, device).expect("update must not fail");
+        cache
+            .exit_prefill(device)
+            .expect("exit_prefill must not fail");
+
+        // quant: K8V8 → (8+8)/8 = 2 bytes per elem pair × seq × bhd
+        // seed: fp16 seed = 4 bytes per elem pair (K+V both fp16) × seq × bhd
+        let bhd: u64 = 4 * 128; // kv_h=4, head_dim=128 (B=1 implicit)
+        let seq: u64 = 256;
+        let quant_bytes = seq * bhd * 2; // (8+8)/8 = 2 bytes per (K,V) element
+        let seed_bytes = seq * bhd * 4; // decode_fp16 K+V combined (2+2 bytes)
+        let expected = quant_bytes + seed_bytes;
+        assert_eq!(
+            cache.approx_bytes(),
+            expected,
+            "K8V8 cache: expected {expected} bytes, got {}",
+            cache.approx_bytes()
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::expect_used,
+        reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+    )]
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "wildcard arm is the correct fallthrough for unsupported arch/quant variants; exhaustive expansion would require updating on every new variant"
+    )]
+    fn kv_cache_truncate_k8v8_path() {
+        let mut cache = KvCache::with_quant_max_seq(KvQuant::K8V8, 32);
+
+        let device = Device::Cpu;
+        let k = make_lcg_array(&[1, 1, 8, 128], 10).0;
+        let v = make_lcg_array(&[1, 1, 8, 128], 11).0;
+        cache.update(&k, &v, device).expect("update must not fail");
+        assert_eq!(cache.offset(), 8);
+
+        cache.truncate_to(3);
+        assert_eq!(cache.offset(), 3, "offset must equal truncation target");
+        match &cache.storage {
+            KvStorage::K8V8 { k, v, .. } => {
+                if let Some(qk) = k {
+                    assert_eq!(
+                        qk.shape[2], 3,
+                        "QuantK shape[2] must equal truncation target"
+                    );
+                }
+                if let Some(qv) = v {
+                    assert_eq!(
+                        qv.shape[2], 3,
+                        "QuantV shape[2] must equal truncation target"
+                    );
+                }
+            }
+            _ => panic!("expected K8V8 storage"),
+        }
+    }
+
+    // ── kv_quant_for_layer unit tests ────────────────────────────────────────
+
+    #[test]
+    fn kv_quant_for_layer_returns_base_for_middle_layers() {
+        // With tail_n=8, head_n=2, n_layers=40, layers 2..32 (exclusive)
+        // should return the base quant unchanged.
+        let n = 40;
+        let base = KvQuant::K8V4;
+        for i in 2..32 {
+            let q = kv_quant_for_layer(i, n, base, 8, 2);
+            assert_eq!(q, base, "middle layer {i} should return base quant");
+        }
+    }
+
+    #[test]
+    fn kv_quant_for_layer_overrides_tail_to_k8v8() {
+        // With tail_n=8 and n_layers=40, layers 32..40 should be K8V8.
+        let n = 40;
+        let base = KvQuant::K8V4;
+        for i in 32..40 {
+            let q = kv_quant_for_layer(i, n, base, 8, 0);
+            assert_eq!(q, KvQuant::K8V8, "tail layer {i} should be K8V8");
+        }
+    }
+
+    #[test]
+    fn kv_quant_for_layer_overrides_head_to_k8v8() {
+        // With head_n=2 and n_layers=40, layers 0..2 should be K8V8.
+        let n = 40;
+        let base = KvQuant::K8V4;
+        for i in 0..2 {
+            let q = kv_quant_for_layer(i, n, base, 0, 2);
+            assert_eq!(q, KvQuant::K8V8, "head layer {i} should be K8V8");
+        }
+        // Layer 2 is not a head layer.
+        assert_eq!(
+            kv_quant_for_layer(2, n, base, 0, 2),
+            base,
+            "layer 2 should not be overridden"
+        );
+    }
+
+    #[test]
+    fn kv_quant_for_layer_zero_tail_and_head_is_noop() {
+        // tail_n=0 and head_n=0 should never override — returns base for all.
+        let n = 10;
+        let base = KvQuant::Planar;
+        for i in 0..n {
+            let q = kv_quant_for_layer(i, n, base, 0, 0);
+            assert_eq!(q, base, "zero tail+head should not override layer {i}");
+        }
+    }
+
+    #[test]
+    fn kv_quant_for_layer_k8v8_base_is_noop() {
+        // If base is already K8V8, any override is the same — no regression.
+        let n = 10;
+        let base = KvQuant::K8V8;
+        for i in 0..n {
+            let q = kv_quant_for_layer(i, n, base, LAYER_ADAPTIVE_TAIL_N, LAYER_ADAPTIVE_HEAD_N);
+            assert_eq!(q, KvQuant::K8V8, "K8V8 base should stay K8V8 at layer {i}");
+        }
+    }
+
+    #[test]
+    fn kv_quant_for_layer_planar_tail_overridden() {
+        // Planar base: last 8 of 40 layers become K8V8; head 2 also become K8V8.
+        let n = 40;
+        let base = KvQuant::Planar;
+        // Head layers become K8V8.
+        assert_eq!(
+            kv_quant_for_layer(0, n, base, 8, 2),
+            KvQuant::K8V8,
+            "head layer 0"
+        );
+        assert_eq!(
+            kv_quant_for_layer(1, n, base, 8, 2),
+            KvQuant::K8V8,
+            "head layer 1"
+        );
+        // Middle layers stay Planar.
+        assert_eq!(
+            kv_quant_for_layer(2, n, base, 8, 2),
+            KvQuant::Planar,
+            "middle layer 2"
+        );
+        assert_eq!(
+            kv_quant_for_layer(31, n, base, 8, 2),
+            KvQuant::Planar,
+            "middle layer 31"
+        );
+        // Tail layers become K8V8.
+        assert_eq!(
+            kv_quant_for_layer(32, n, base, 8, 2),
+            KvQuant::K8V8,
+            "tail layer 32"
+        );
+        assert_eq!(
+            kv_quant_for_layer(39, n, base, 8, 2),
+            KvQuant::K8V8,
+            "tail layer 39"
+        );
+    }
+
+    // ── kv_quant_for_ctx ──────────────────────────────────────────────────────
+
+    #[test]
+    fn kv_quant_for_ctx_short_selects_k8v4() {
+        // ≤8192 tokens → K8V4
+        assert_eq!(kv_quant_for_ctx(1), KvQuant::K8V4);
+        assert_eq!(kv_quant_for_ctx(512), KvQuant::K8V4);
+        assert_eq!(kv_quant_for_ctx(8_192), KvQuant::K8V4);
+    }
+
+    #[test]
+    fn kv_quant_for_ctx_mid_selects_none() {
+        // 8193–16384 tokens → None (bf16)
+        assert_eq!(kv_quant_for_ctx(8_193), KvQuant::None);
+        assert_eq!(kv_quant_for_ctx(12_000), KvQuant::None);
+        assert_eq!(kv_quant_for_ctx(16_384), KvQuant::None);
+    }
+
+    #[test]
+    fn kv_quant_for_ctx_long_selects_k8v8() {
+        // 16385–32768 tokens → K8V8
+        assert_eq!(kv_quant_for_ctx(16_385), KvQuant::K8V8);
+        assert_eq!(kv_quant_for_ctx(24_000), KvQuant::K8V8);
+        assert_eq!(kv_quant_for_ctx(32_768), KvQuant::K8V8);
+    }
+
+    #[test]
+    fn kv_quant_for_ctx_very_long_selects_planar() {
+        // >32768 tokens → Planar (incl. ≥64K)
+        assert_eq!(kv_quant_for_ctx(32_769), KvQuant::Planar);
+        assert_eq!(kv_quant_for_ctx(64_000), KvQuant::Planar);
+        assert_eq!(kv_quant_for_ctx(131_072), KvQuant::Planar);
+    }
+
+    /// Parity test: the new universal `KvCache::update_and_sdpa` wrapper must
+    /// produce byte-equivalent output to the legacy `update + SDPA` pattern on
+    /// the K8V8 path (the most-used non-Mixed, non-K8V4-flash code path).
+    ///
+    /// Setup: two K8V8 caches seeded with an identical 16-token prefill, then
+    /// one decode step run through the legacy pattern (cache A) and the new
+    /// wrapper (cache B). `max(|out_a - out_b|)` must be below 1e-3.
+    #[test]
+    #[allow(
+        clippy::expect_used,
+        reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+    )]
+    fn update_and_sdpa_matches_legacy_k8v8_path() {
+        use rmlx_mlx::scaled_dot_product_attention;
+
+        let device = Device::Cpu;
+        let n_kv_heads: i32 = 4;
+        let head_dim: i32 = 128;
+        let prefill_seq: i32 = 16;
+        let scale: f32 = 1.0 / (head_dim as f32).sqrt();
+
+        // Identical prefill K/V for both caches.
+        let prefill_shape: &[i32] = &[1, n_kv_heads, prefill_seq, head_dim];
+        let (k_pref, _) = make_lcg_array(prefill_shape, 0xA1A1_A1A1_u64);
+        let (v_pref, _) = make_lcg_array(prefill_shape, 0xB2B2_B2B2_u64);
+
+        // Decode-step queries / new K / new V (seq=1).
+        let step_shape: &[i32] = &[1, n_kv_heads, 1, head_dim];
+        let (queries, _) = make_lcg_array(step_shape, 0xC3C3_C3C3_u64);
+        let (new_k, _) = make_lcg_array(step_shape, 0xD4D4_D4D4_u64);
+        let (new_v, _) = make_lcg_array(step_shape, 0xE5E5_E5E5_u64);
+
+        // Cache A — legacy `update` + `scaled_dot_product_attention`.
+        let mut cache_a = KvCache::with_quant(KvQuant::K8V8);
+        cache_a
+            .update(&k_pref, &v_pref, device)
+            .expect("K8V8 prefill failed on cache A");
+        let (k_full_a, v_full_a) = cache_a
+            .update(&new_k, &new_v, device)
+            .expect("K8V8 decode update failed on cache A");
+        let out_a =
+            scaled_dot_product_attention(&queries, &k_full_a, &v_full_a, scale, "", None, device)
+                .expect("legacy SDPA failed");
+
+        // Cache B — new universal wrapper.
+        let mut cache_b = KvCache::with_quant(KvQuant::K8V8);
+        cache_b
+            .update(&k_pref, &v_pref, device)
+            .expect("K8V8 prefill failed on cache B");
+        let out_b = cache_b
+            .update_and_sdpa(&queries, &new_k, &new_v, scale, "", None, device)
+            .expect("update_and_sdpa failed");
+
+        // max(|out_a - out_b|) < 1e-3
+        assert_eq!(out_a.shape(), out_b.shape(), "output shape mismatch");
+        let a = array_to_vec(&out_a);
+        let b = array_to_vec(&out_b);
+        let max_abs_diff = a
+            .iter()
+            .zip(&b)
+            .map(|(&x, &y)| (x - y).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_abs_diff < 1e-3,
+            "update_and_sdpa diverges from legacy path: max |Δ| = {max_abs_diff:.6}"
+        );
+    }
+
+    /// Smoke test for the cross-layer-KV-sharing sibling wrapper on the K8V8
+    /// path: build a cache, seed it with 16 tokens, run one decode step via
+    /// `update_and_sdpa_returning_kv`, assert the call returns three arrays
+    /// with the expected shapes.
+    #[test]
+    #[allow(
+        clippy::expect_used,
+        reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+    )]
+    fn update_and_sdpa_returning_kv_k8v8_smoke() {
+        let device = Device::Cpu;
+        let n_kv_heads: i32 = 4;
+        let head_dim: i32 = 128;
+        let prefill_seq: i32 = 16;
+        let scale: f32 = 1.0 / (head_dim as f32).sqrt();
+
+        let prefill_shape: &[i32] = &[1, n_kv_heads, prefill_seq, head_dim];
+        let (k_pref, _) = make_lcg_array(prefill_shape, 0xA1A1_A1A1_u64);
+        let (v_pref, _) = make_lcg_array(prefill_shape, 0xB2B2_B2B2_u64);
+
+        let step_shape: &[i32] = &[1, n_kv_heads, 1, head_dim];
+        let (queries, _) = make_lcg_array(step_shape, 0xC3C3_C3C3_u64);
+        let (new_k, _) = make_lcg_array(step_shape, 0xD4D4_D4D4_u64);
+        let (new_v, _) = make_lcg_array(step_shape, 0xE5E5_E5E5_u64);
+
+        let mut cache = KvCache::with_quant(KvQuant::K8V8);
+        cache
+            .update(&k_pref, &v_pref, device)
+            .expect("K8V8 prefill failed");
+        let (out, k_full, v_full) = cache
+            .update_and_sdpa_returning_kv(&queries, &new_k, &new_v, scale, "", None, device)
+            .expect("update_and_sdpa_returning_kv K8V8 failed");
+
+        // After one decode step on top of the 16-token prefill: total = 17.
+        let total_kv: i32 = prefill_seq + 1;
+        assert_eq!(
+            out.shape(),
+            vec![1, n_kv_heads, 1, head_dim],
+            "SDPA output shape"
+        );
+        assert_eq!(
+            k_full.shape(),
+            vec![1, n_kv_heads, total_kv, head_dim],
+            "accumulated K shape"
+        );
+        assert_eq!(
+            v_full.shape(),
+            vec![1, n_kv_heads, total_kv, head_dim],
+            "accumulated V shape"
+        );
+    }
+
+    /// K8V4 also exposes accumulated `(K, V)` via `update()` (the codec
+    /// dequantises on read), so the sibling wrapper must accept it. Only Mixed
+    /// — whose fused quantized SDPA hides K/V inside the storage — is rejected.
+    #[test]
+    #[allow(
+        clippy::expect_used,
+        reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+    )]
+    fn update_and_sdpa_returning_kv_k8v4_smoke() {
+        let device = Device::Cpu;
+        let n_kv_heads: i32 = 4;
+        let head_dim: i32 = 128;
+        let prefill_seq: i32 = 16;
+        let scale: f32 = 1.0 / (head_dim as f32).sqrt();
+
+        let prefill_shape: &[i32] = &[1, n_kv_heads, prefill_seq, head_dim];
+        let (k_pref, _) = make_lcg_array(prefill_shape, 0xA1A1_A1A1_u64);
+        let (v_pref, _) = make_lcg_array(prefill_shape, 0xB2B2_B2B2_u64);
+
+        let step_shape: &[i32] = &[1, n_kv_heads, 1, head_dim];
+        let (queries, _) = make_lcg_array(step_shape, 0xC3C3_C3C3_u64);
+        let (new_k, _) = make_lcg_array(step_shape, 0xD4D4_D4D4_u64);
+        let (new_v, _) = make_lcg_array(step_shape, 0xE5E5_E5E5_u64);
+
+        let mut cache = KvCache::with_quant(KvQuant::K8V4);
+        cache
+            .update(&k_pref, &v_pref, device)
+            .expect("K8V4 prefill failed");
+        let (out, k_full, v_full) = cache
+            .update_and_sdpa_returning_kv(&queries, &new_k, &new_v, scale, "", None, device)
+            .expect("update_and_sdpa_returning_kv K8V4 failed");
+
+        let total_kv: i32 = prefill_seq + 1;
+        assert_eq!(out.shape(), vec![1, n_kv_heads, 1, head_dim]);
+        assert_eq!(k_full.shape(), vec![1, n_kv_heads, total_kv, head_dim]);
+        assert_eq!(v_full.shape(), vec![1, n_kv_heads, total_kv, head_dim]);
+    }
+
+    /// `update_and_sdpa_returning_kv` now SUPPORTS Mixed caches via
+    /// dequant-before-share. The fused quantized SDPA stores K/V as quant
+    /// 3-tuples, but the wrapper surfaces the accumulated bf16 K/V (prefill-raw
+    /// during prefill, maintained `decode_fp16_k/v` during decode) so a
+    /// cross-layer-KV consumer (Gemma4) gets the full prefix every step.
+    ///
+    /// Mirrors the Gemma4 cache-holding full-attention layer flow: enter_prefill
+    /// → wrapper (multi-token chunk) → exit_prefill → wrapper (decode step). The
+    /// call must SUCCEED (no longer error) for a Mixed cache, return three arrays
+    /// with the expected shapes (prefill = prefill_seq tokens, decode extends by
+    /// exactly one), and produce finite K/V/output.
+    ///
+    /// NOTE: runs on `Device::Cpu`, where the MLX-C `mlx_slice_update` backend
+    /// drops non-leading kv heads on any axis-2 sub-slice write into a larger
+    /// pre-allocated buffer (a pre-existing primitive quirk, unrelated to —
+    /// it corrupts K8V8/K8V4/None `decode_fp16` and `prefill_raw` accumulators on
+    /// CPU identically, which is why the existing `approx_bytes_*` CPU tests only
+    /// assert byte counts, never values). Therefore this test asserts shape,
+    /// finiteness and offset progression on CPU; value-level coherence of the
+    /// dequant-before-share K/V is validated by the Gemma4 e4b/26b Mixed baseline
+    /// runs on GPU.
+    #[test]
+    #[allow(
+        clippy::expect_used,
+        reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+    )]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    fn update_and_sdpa_returning_kv_mixed_shared_kv() {
+        let device = Device::Cpu;
+        let n_kv_heads: i32 = 4;
+        let head_dim: i32 = 128;
+        let prefill_seq: i32 = 16;
+        let scale: f32 = 1.0 / (head_dim as f32).sqrt();
+
+        let prefill_shape: &[i32] = &[1, n_kv_heads, prefill_seq, head_dim];
+        let (k_pref, _) = make_lcg_array(prefill_shape, 0xA1A1_A1A1_u64);
+        let (v_pref, _) = make_lcg_array(prefill_shape, 0xB2B2_B2B2_u64);
+        let (q_pref, _) = make_lcg_array(prefill_shape, 0xF0F0_F0F0_u64);
+
+        let step_shape: &[i32] = &[1, n_kv_heads, 1, head_dim];
+        let (queries, _) = make_lcg_array(step_shape, 0xC3C3_C3C3_u64);
+        let (new_k, _) = make_lcg_array(step_shape, 0xD4D4_D4D4_u64);
+        let (new_v, _) = make_lcg_array(step_shape, 0xE5E5_E5E5_u64);
+
+        let mut cache = KvCache::with_quant(KvQuant::Mixed {
+            k_bits: 8,
+            v_bits: 4,
+            k_group_size: 64,
+            v_group_size: 64,
+        });
+
+        // Prefill through the shared-KV wrapper — must NOT error for Mixed.
+        cache.enter_prefill();
+        let (out_pref, k_pre_full, v_pre_full) = cache
+            .update_and_sdpa_returning_kv(&q_pref, &k_pref, &v_pref, scale, "causal", None, device)
+            .expect("Mixed prefill via returning_kv must succeed");
+        cache.exit_prefill(device).expect("exit_prefill failed");
+
+        assert_eq!(out_pref.shape(), vec![1, n_kv_heads, prefill_seq, head_dim]);
+        assert_eq!(
+            k_pre_full.shape(),
+            vec![1, n_kv_heads, prefill_seq, head_dim]
+        );
+        assert_eq!(
+            v_pre_full.shape(),
+            vec![1, n_kv_heads, prefill_seq, head_dim]
+        );
+        assert_eq!(cache.offset(), prefill_seq, "prefill must advance offset");
+        assert!(
+            array_to_vec(&out_pref.astype(Dtype::F32, device).unwrap())
+                .iter()
+                .all(|x| x.is_finite()),
+            "prefill SDPA output has non-finite values"
+        );
+
+        // One decode step: extend the prefix by exactly one token.
+        let (out, k_full, v_full) = cache
+            .update_and_sdpa_returning_kv(&queries, &new_k, &new_v, scale, "", None, device)
+            .expect("update_and_sdpa_returning_kv Mixed decode must succeed");
+
+        let total_kv: i32 = prefill_seq + 1;
+        assert_eq!(out.shape(), vec![1, n_kv_heads, 1, head_dim]);
+        assert_eq!(
+            k_full.shape(),
+            vec![1, n_kv_heads, total_kv, head_dim],
+            "accumulated K must extend by exactly one token per decode step"
+        );
+        assert_eq!(v_full.shape(), vec![1, n_kv_heads, total_kv, head_dim]);
+        assert_eq!(
+            cache.offset(),
+            total_kv,
+            "decode must advance offset by one"
+        );
+        assert!(
+            array_to_vec(&out.astype(Dtype::F32, device).unwrap())
+                .iter()
+                .all(|x| x.is_finite()),
+            "decode SDPA output has non-finite values"
+        );
+    }
+
+    // ── 2-bit V (asymmetric K=8 / V=2) round-trip ──────────────────────
+
+    /// 2-bit V quantization via the Mixed path (K=8-bit, V=2-bit affine, g=64).
+    /// 2-bit is the lossiest rung — assert the dequantized output is finite,
+    /// shape-correct, and bounded (no NaN/Inf), not bit-exact. The MLX affine
+    /// quantizer (`mx.quantize`) handles 2-bit packing (16 vals/u32) natively;
+    /// no rMLX kernel change was needed.
+    #[test]
+    #[allow(
+        clippy::expect_used,
+        reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+    )]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    fn kv_cache_mixed_v2_roundtrip_finite_and_bounded() {
+        let device = Device::Cpu;
+        let n_kv_heads: i32 = 4;
+        let head_dim: i32 = 128; // 128 % 16 == 0 (2-bit packing) and % 64 == 0.
+        let prefill_seq: i32 = 16;
+        let scale: f32 = 1.0 / (head_dim as f32).sqrt();
+
+        let prefill_shape: &[i32] = &[1, n_kv_heads, prefill_seq, head_dim];
+        let (k_pref, _) = make_lcg_array(prefill_shape, 0x2B2B_0001_u64);
+        let (v_pref, _) = make_lcg_array(prefill_shape, 0x2B2B_0002_u64);
+        let (q_pref, _) = make_lcg_array(prefill_shape, 0x2B2B_0003_u64);
+
+        let mut cache = KvCache::with_quant(KvQuant::Mixed {
+            k_bits: 8,
+            v_bits: 2,
+            k_group_size: 64,
+            v_group_size: 64,
+        });
+
+        cache.enter_prefill();
+        let (out_pref, _k_full, v_full) = cache
+            .update_and_sdpa_returning_kv(&q_pref, &k_pref, &v_pref, scale, "causal", None, device)
+            .expect("2-bit V Mixed prefill must succeed");
+        cache.exit_prefill(device).expect("exit_prefill failed");
+
+        assert_eq!(v_full.shape(), vec![1, n_kv_heads, prefill_seq, head_dim]);
+        assert_eq!(out_pref.shape(), vec![1, n_kv_heads, prefill_seq, head_dim]);
+
+        // 2-bit dequant must stay finite and bounded — the source data is in
+        // [-1, 1], so a sane affine reconstruction is well within [-2, 2].
+        let recon = array_to_vec(&v_full.astype(Dtype::F32, device).unwrap());
+        assert!(
+            recon.iter().all(|x| x.is_finite()),
+            "2-bit V dequant produced non-finite values"
+        );
+        assert!(
+            recon.iter().all(|&x| x.abs() < 2.0),
+            "2-bit V dequant out of expected bound (source in [-1,1])"
+        );
+        assert!(
+            array_to_vec(&out_pref.astype(Dtype::F32, device).unwrap())
+                .iter()
+                .all(|x| x.is_finite()),
+            "2-bit V SDPA output has non-finite values"
+        );
+    }
+
+    // ── KvQuant Display / FromStr ──────────────────────────────────────────────
+
+    #[test]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    fn kv_quant_display_round_trip_none() {
+        use std::str::FromStr;
+        assert_eq!(KvQuant::None.to_string(), "none");
+        assert_eq!(KvQuant::from_str("none").unwrap(), KvQuant::None);
+    }
+
+    #[test]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    fn kv_quant_from_str_accepts_bf16_alias() {
+        use std::str::FromStr;
+        assert_eq!(KvQuant::from_str("bf16").unwrap(), KvQuant::None);
+    }
+
+    #[test]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    fn kv_quant_from_str_accepts_f16_alias() {
+        use std::str::FromStr;
+        assert_eq!(KvQuant::from_str("f16").unwrap(), KvQuant::None);
+    }
+
+    #[test]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    fn kv_quant_display_round_trip_k8v4() {
+        use std::str::FromStr;
+        assert_eq!(KvQuant::K8V4.to_string(), "k8v4");
+        assert_eq!(KvQuant::from_str("k8v4").unwrap(), KvQuant::K8V4);
+    }
+
+    #[test]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    fn kv_quant_display_round_trip_k8v8() {
+        use std::str::FromStr;
+        assert_eq!(KvQuant::K8V8.to_string(), "k8v8");
+        assert_eq!(KvQuant::from_str("k8v8").unwrap(), KvQuant::K8V8);
+    }
+
+    #[test]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    fn kv_quant_display_round_trip_planar() {
+        use std::str::FromStr;
+        assert_eq!(KvQuant::Planar.to_string(), "planar");
+        assert_eq!(KvQuant::from_str("planar").unwrap(), KvQuant::Planar);
+    }
+
+    #[test]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    fn kv_quant_display_round_trip_mixed_8_4_128_64() {
+        use std::str::FromStr;
+        let m = KvQuant::Mixed {
+            k_bits: 8,
+            v_bits: 4,
+            k_group_size: 128,
+            v_group_size: 64,
+        };
+        assert_eq!(m.to_string(), "mixed_k8g128_v4g64");
+        assert_eq!(KvQuant::from_str("mixed_k8g128_v4g64").unwrap(), m);
+    }
+
+    #[test]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    fn kv_quant_display_round_trip_mixed_8_8_64_64() {
+        use std::str::FromStr;
+        let m = KvQuant::Mixed {
+            k_bits: 8,
+            v_bits: 8,
+            k_group_size: 64,
+            v_group_size: 64,
+        };
+        assert_eq!(m.to_string(), "mixed_k8g64_v8g64");
+        assert_eq!(KvQuant::from_str("mixed_k8g64_v8g64").unwrap(), m);
+    }
+
+    #[test]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    fn kv_quant_display_round_trip_mixed_4_4_32_32() {
+        use std::str::FromStr;
+        let m = KvQuant::Mixed {
+            k_bits: 4,
+            v_bits: 4,
+            k_group_size: 32,
+            v_group_size: 32,
+        };
+        assert_eq!(m.to_string(), "mixed_k4g32_v4g32");
+        assert_eq!(KvQuant::from_str("mixed_k4g32_v4g32").unwrap(), m);
+    }
+
+    #[test]
+    fn kv_quant_from_str_unknown_returns_err() {
+        use std::str::FromStr;
+        assert!(KvQuant::from_str("kx99").is_err());
+        assert!(KvQuant::from_str("").is_err());
+        assert!(KvQuant::from_str("mixed_garbage").is_err());
+        assert!(KvQuant::from_str("mixed_k8_v4").is_err());
+        assert!(KvQuant::from_str("mixed_x8g64_v4g64").is_err());
+    }
+
+    /// `k8vturbo2` display + FromStr round-trip.
+    #[test]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "test asserts the round-trip; .unwrap() failure is the test failure"
+    )]
+    fn kv_quant_display_round_trip_k8vturbo2() {
+        use std::str::FromStr;
+        assert_eq!(KvQuant::K8VTurbo2.to_string(), "k8vturbo2");
+        assert_eq!(KvQuant::from_str("k8vturbo2").unwrap(), KvQuant::K8VTurbo2);
+    }
+
+    /// `KvQuantParseError::Unknown` mentions `k8vturbo2` in its
+    /// `valid:` listing. Locks in the user-visible string surface.
+    #[test]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "test asserts the Err arm; .unwrap_err() failure on Ok is the test failure"
+    )]
+    fn kv_quant_parse_error_unknown_lists_k8vturbo2() {
+        use std::str::FromStr;
+        let err = KvQuant::from_str("definitely-not-a-codec").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("k8vturbo2"),
+            "Unknown KvQuant error must list k8vturbo2 as a valid value: {msg}"
+        );
+    }
+
+    // ── KV memory reduction regression table ───────────────────────────
+    //
+    // Tests that the reduction ratio (bf16_codes_bytes / quant_codes_bytes) for
+    // each KvQuant variant stays within documented tolerance bands.
+    //
+    // DESIGN: uses codes-only bytes (seq * bhd * (k_bits + v_bits) / 8),
+    // NOT approx_bytes(), because:
+    // 1. The warm-TTFT fp16 seed included in approx_bytes is a transient
+    // buffer, not steady-state KV compression — including it in a ratio
+    // produces values < 1.0 (quantized "uses more" than bf16), which is
+    // misleading and not what the reference table (mlx-vlm / docs §4) cites.
+    // 2. The (k_bits, v_bits) mapping in approx_bytes IS the regression target:
+    // if any variant's bits change, the codes formula changes → ratio changes
+    // → this test fails.
+    //
+    // FIXED SHAPE: B=1, kv_h=8, head_dim=128, seq=1024
+    // bhd = B * kv_h * head_dim = 1 * 8 * 128 = 1024
+    // bf16_codes = 1024 * 1024 * (16+16)/8 = 4_194_304 bytes
+    //
+    // CODEC TABLE (derived, then bands set ± epsilon):
+    //
+    // Codec k_bits v_bits codes_bytes ratio_vs_bf16 band
+    // bf16 (None) 16 16 4_194_304 1.000× —
+    // K8V8 8 8 2_097_152 2.000× [1.9, 2.1]
+    // K8V4 8 4 1_572_864 2.667× [2.5, 2.8]
+    // Planar 8 4 1_572_864 2.667× [2.5, 2.8]
+    // Mixed{k8,v4,g64} 8 4 1_572_864 2.667× [2.5, 2.8]
+    // Mixed{k8,v2,g64} 8 2 1_310_720 3.200× [3.0, 3.5]
+    // Mixed{k4,v4,g64} 4 4 1_048_576 4.000× [3.8, 4.2]
+    // Mixed{k3,v3,g64} 3 3 786_432 5.333× [5.0, 5.7]
+    // Mixed{k2,v2,g64} 2 2 524_288 8.000× [7.5, 8.5]
+    // RotK{v4,g64} 8 4 1_572_864 2.667× [2.5, 2.8]
+    // RotK{v2,g64} 8 2 1_310_720 3.200× [3.0, 3.5]
+    //
+    // NOTE on "q2 ≈ 8×" reference (mlx-vlm README, docs §4):
+    // The mlx-vlm "8×" figure assumes symmetric 2-bit K+V combined: (16+16)/(2+2) = 8×.
+    // rMLX's q2_g64 is V-side only (k=8-bit, v=2-bit): (16+16)/(8+2) = 3.2×.
+    // The V-only compression is 16/2 = 8× (codes) / ~6.4× effective (at g=64, scale overhead
+    // adds ~1 byte per 64 elements). Both figures are correct for their context; the test
+    // uses the K+V combined ratio (3.2×), which is what approx_bytes computes.
+    // See docs/KV_CACHE.md §4 (q2_g64 row) and §5.10 (pure-2-bit-K gated).
+
+    /// Pure-formula helper: codes-only KV bytes for a given shape and bit widths.
+    /// No GPU, no MLX operations. Mirrors the `kv_bytes` formula in `approx_bytes`.
+    fn codes_bytes(seq: u64, bhd: u64, k_bits: u64, v_bits: u64) -> u64 {
+        seq * bhd * (k_bits + v_bits) / 8
+    }
+
+    #[test]
+    fn kv_reduction_ratios_match_table() {
+        // Fixed shape — chosen so all divisibility constraints hold:
+        // seq=1024, B=1, kv_h=8, head_dim=128 → bhd = 1024
+        // head_dim=128 satisfies: 128 % 64 == 0 (group=64), 128 % (32/2) = 128 % 16 == 0 (2-bit packing).
+        let seq: u64 = 1024;
+        let bhd: u64 = 1024; // B=1, kv_h=8, head_dim=128
+
+        let bf16_bytes = codes_bytes(seq, bhd, 16, 16);
+        assert_eq!(bf16_bytes, 4_194_304, "bf16 baseline sanity check");
+
+        // Helper: assert the reduction ratio is within [lo, hi].
+        let check = |label: &str, k_bits: u64, v_bits: u64, lo: f64, hi: f64| {
+            let qbytes = codes_bytes(seq, bhd, k_bits, v_bits);
+            assert!(
+                qbytes > 0,
+                "{label}: quant codes_bytes must be > 0 (got {qbytes})"
+            );
+            let ratio = bf16_bytes as f64 / qbytes as f64;
+            assert!(
+                ratio >= lo && ratio <= hi,
+                "{label}: reduction ratio {ratio:.4}× out of expected band [{lo}, {hi}] \
+                 (bf16={bf16_bytes} bytes, quant={qbytes} bytes, k_bits={k_bits}, v_bits={v_bits})"
+            );
+        };
+
+        // ── Named presets ─────────────────────────────────────────────────────
+
+        // K8V8: k=8, v=8 → codes = 1024*1024*2 = 2_097_152 → ratio = 2.0×
+        // Band [1.9, 2.1] — tight around the exact integer ratio.
+        check("K8V8", 8, 8, 1.9, 2.1);
+
+        // K8V4 / Planar / Mixed{k8,v4}: k=8, v=4 → codes = 1_572_864 → ratio = 2.667×
+        // Band [2.5, 2.8] — covers both K8V4, Planar (same bits), and Mixed{k8,v4}.
+        check("K8V4 / Planar / Mixed{k8,v4}", 8, 4, 2.5, 2.8);
+
+        // ── Mixed asymmetric / q2 ───────────────────────────────────────
+
+        // Mixed{k=8,v=2}: rMLX q2_g64. K stays 8-bit (pure-2-bit K gated §5.10).
+        // codes = 1024*1024*(8+2)/8 = 1_310_720 → ratio = 32/10 = 3.2×
+        // Band [3.0, 3.5].
+        check("Mixed{k8,v2} (q2_g64)", 8, 2, 3.0, 3.5);
+
+        // Mixed{k=4,v=4}: symmetric 4-bit — matches mlx-vlm "4 ≈ 4×" rung.
+        // codes = 1024*1024*1 = 1_048_576 → ratio = 4.0×
+        // Band [3.8, 4.2].
+        check("Mixed{k4,v4} (q4 symmetric)", 4, 4, 3.8, 4.2);
+
+        // Mixed{k=3,v=3}: symmetric 3-bit — near mlx-vlm "3 ≈ 5×" rung.
+        // codes = 1024*1024*(3+3)/8 = 786_432 → ratio = 32/6 ≈ 5.333×
+        // Band [5.0, 5.7].
+        check("Mixed{k3,v3} (q3 symmetric)", 3, 3, 5.0, 5.7);
+
+        // Mixed{k=2,v=2}: symmetric 2-bit — mlx-vlm "2 ≈ 8×" rung.
+        // codes = 1024*1024*4/8 = 524_288 → ratio = 8.0×
+        // Band [7.5, 8.5].
+        // NOTE: pure-2-bit K is gated in rMLX (§5.10 / ); this row covers the
+        // formula for the symmetric case referenced in the mlx-vlm table.
+        check("Mixed{k2,v2} (q2 symmetric, mlx-vlm ref)", 2, 2, 7.5, 8.5);
+
+        // ── RotK variants ─────────────────────────────────────────────────────
+
+        // RotK{v_bits=4}: K=8-bit in rotated basis, V=4-bit → same bits as K8V4.
+        // ratio = 2.667× — band [2.5, 2.8].
+        check("RotK{v4}", 8, 4, 2.5, 2.8);
+
+        // RotK{v_bits=2}: K=8-bit rotated, V=2-bit → same bits as Mixed{k8,v2}.
+        // ratio = 3.2× — band [3.0, 3.5].
+        check("RotK{v2}", 8, 2, 3.0, 3.5);
+
+        // ── Baseline self-check ───────────────────────────────────────────────
+
+        // bf16 / bf16 = 1.0× exactly.
+        check("bf16 self", 16, 16, 0.99, 1.01);
+    }
+
+    /// regression: a Mixed-quant SWA (rotating) cache driven across a
+    /// window-crossing prefill chunk must NOT broadcast-fail.
+    ///
+    /// Before , `update_and_sdpa[_returning_kv]` short-circuited Mixed to
+    /// `update_prefill_raw` (full, uncapped K of length `offset + seq`) BEFORE
+    /// honoring the rotating ring. But the Gemma4 SWA attention mask is sized
+    /// to the ring's window-capped K (`offset.min(window-1) + seq`). On the
+    /// chunk that crosses the window the two disagreed:
+    /// `add: [broadcast_shapes] (…,seq,offset+seq) and (…,seq,window-1+seq)`.
+    /// The fix routes rotating caches through `update()` (ring first) for every
+    /// quant, so K matches the capped mask. This drives exactly that path with
+    /// a tiny window and asserts Ok + window-capped K shape.
+    #[test]
+    #[allow(
+        clippy::expect_used,
+        reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+    )]
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    )]
+    fn mixed_swa_window_crossing_chunk_no_broadcast() {
+        let device = Device::Cpu;
+        let n_kv_heads: i32 = 2;
+        let head_dim: i32 = 128;
+        let window: i32 = 8;
+        let scale: f32 = 1.0 / (head_dim as f32).sqrt();
+
+        // Mixed-quant SWA layer: rotating ring is created regardless of quant
+        // (mlx-lm RotatingKVCache stays bf16). max_seq is ignored on the ring.
+        let mut cache = KvCache::with_quant_max_seq_window(
+            KvQuant::Mixed {
+                k_bits: 8,
+                v_bits: 4,
+                k_group_size: 64,
+                v_group_size: 64,
+            },
+            4096,
+            Some(window),
+        );
+        assert!(cache.is_rotating(), "SWA layer must use the rotating ring");
+
+        // Chunk 1: fill exactly to the window (offset 0 -> window).
+        let c1: i32 = window;
+        let shape1: &[i32] = &[1, n_kv_heads, c1, head_dim];
+        let (q1, _) = make_lcg_array(shape1, 0x1111_1111_u64);
+        let (k1, _) = make_lcg_array(shape1, 0x2222_2222_u64);
+        let (v1, _) = make_lcg_array(shape1, 0x3333_3333_u64);
+        // First chunk: offset == 0 -> "causal", no explicit mask (matches
+        // Gemma4 SWA prefill at offset 0).
+        let (_o1, _k1f, _v1f) = cache
+            .update_and_sdpa_returning_kv(&q1, &k1, &v1, scale, "causal", None, device)
+            .expect("chunk 1 prefill must succeed");
+        assert_eq!(cache.offset(), c1);
+
+        // Chunk 2: crosses the window. Build the SWA mask the way Gemma4 does:
+        // effective (capped) offset = offset.min(window - 1).
+        let c2: i32 = window; // second chunk same size; total > window
+        let shape2: &[i32] = &[1, n_kv_heads, c2, head_dim];
+        let (q2, _) = make_lcg_array(shape2, 0x4444_4444_u64);
+        let (k2, _) = make_lcg_array(shape2, 0x5555_5555_u64);
+        let (v2, _) = make_lcg_array(shape2, 0x6666_6666_u64);
+        let eff_offset = cache.offset().min(window - 1);
+        let mask = crate::layers::build_swa_prefill_mask(eff_offset, c2, window as usize, device)
+            .expect("build swa prefill mask");
+
+        // Pre-fix: this errored with the (…,c2,c2+offset) vs (…,c2,eff+c2)
+        // broadcast mismatch. Post-fix: Ok, K capped at the window.
+        let (out, k_full, v_full) = cache
+            .update_and_sdpa_returning_kv(&q2, &k2, &v2, scale, "array", Some(&mask), device)
+            .expect("window-crossing Mixed SWA chunk must not broadcast-fail");
+
+        // The crux: the ring's K length must equal the mask's key dimension
+        // (`eff_offset + c2`), i.e. the window-capped length the mlx-lm
+        // `_update_concat` produces on the wrapping chunk (`window - 1 + seq`).
+        // This is exactly what would have mismatched pre-fix.
+        let kv_len = k_full.shape()[2];
+        let mask_keys = mask.shape()[3];
+        assert_eq!(
+            kv_len, mask_keys,
+            "ring K length must equal the SWA mask key dimension (no off-by-one)"
+        );
+        assert_eq!(
+            kv_len,
+            eff_offset + c2,
+            "wrapping concat caps K at window-1+seq"
+        );
+        assert_eq!(v_full.shape()[2], kv_len, "V len must match K len");
+        assert_eq!(out.shape(), vec![1, n_kv_heads, c2, head_dim]);
+        assert!(
+            array_to_vec(&out.astype(Dtype::F32, device).unwrap())
+                .iter()
+                .all(|x| x.is_finite()),
+            "SDPA output across the window boundary must be finite"
+        );
+    }
+
+    // ── KvCacheBuilder::with_calibration + lookup_layer_calibration ──────────
+
+    /// Build a `KvCalibration` via JSON round-trip to avoid `#[non_exhaustive]`
+    /// restriction (struct literal construction is banned outside the defining crate).
+    #[allow(
+        clippy::expect_used,
+        reason = "test helper: JSON is a compile-time constant; panic on parse failure is the correct behavior"
+    )]
+    fn make_t18_calib() -> KvCalibration {
+        let json = r#"{
+          "version": 1,
+          "recipe": "turboquant35",
+          "head_size": 128,
+          "model_name": "test",
+          "transform_version": "v1",
+          "codebook_version": "v1",
+          "layers": {
+            "model.layers.0.self_attn": {
+              "key_high_precision_indices": [[0, 1, 2]],
+              "value_high_precision_indices": [[3, 4, 5]]
+            }
+          },
+          "calibration": {
+            "method": "weight_norm",
+            "objective": "l2_norm",
+            "num_prompts": 0,
+            "max_seq_len": 0,
+            "batch_size": 0,
+            "num_observed_tokens": 0,
+            "dtype": "bfloat16",
+            "device": "cpu",
+            "prompts_sha256": ""
+          }
+        }"#;
+        serde_json::from_str(json).expect("make_t18_calib: valid JSON")
+    }
+
+    /// Default KvCacheBuilder has no calibration.
+    #[test]
+    fn kv_cache_builder_default_has_no_calibration() {
+        let b = KvCacheBuilder::default();
+        assert!(
+            b.calibration.is_none(),
+            "default KvCacheBuilder.calibration must be None"
+        );
+    }
+
+    /// with_calibration(Some(_)) stores calibration on the builder.
+    #[test]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "test: is_some() asserted on the line above; unwrap cannot fail"
+    )]
+    fn kv_cache_builder_with_calibration_stores_value() {
+        let calib = make_t18_calib();
+        let b = KvCacheBuilder::default().with_calibration(Some(calib));
+        assert!(
+            b.calibration.is_some(),
+            "calibration should be Some after with_calibration"
+        );
+        assert_eq!(b.calibration.as_ref().unwrap().head_size, 128);
+    }
+
+    /// with_calibration(None) leaves calibration as None.
+    #[test]
+    fn kv_cache_builder_with_calibration_none_leaves_none() {
+        let b = KvCacheBuilder::default().with_calibration(None);
+        assert!(
+            b.calibration.is_none(),
+            "with_calibration(None) should leave calibration as None"
+        );
+    }
+
+    /// Exact-match lookup succeeds.
+    #[test]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "test: is_some() asserted on the line above; unwrap cannot fail"
+    )]
+    fn lookup_layer_calibration_exact_match() {
+        let calib = make_t18_calib();
+        let entry = lookup_layer_calibration(&calib, "model.layers.0.self_attn");
+        assert!(entry.is_some(), "exact match should succeed");
+        assert_eq!(
+            entry.unwrap().key_high_precision_indices,
+            vec![vec![0u32, 1, 2]]
+        );
+    }
+
+    /// Case-insensitive 3-dotted-prefix match.
+    #[test]
+    fn lookup_layer_calibration_case_insensitive_fuzzy_match() {
+        let calib = make_t18_calib();
+        // Query uses uppercase — should still match model.layers.0.self_attn
+        let entry = lookup_layer_calibration(&calib, "MODEL.LAYERS.0.self_attn");
+        assert!(
+            entry.is_some(),
+            "case-insensitive 3-prefix match should succeed for MODEL.LAYERS.0"
+        );
+    }
+
+    /// Near-miss with extra component still matches via 3-prefix.
+    #[test]
+    fn lookup_layer_calibration_extra_component_matches_prefix() {
+        let calib = make_t18_calib();
+        // "model.layers.0.self_attn.k_proj" — 3-prefix is "model.layers.0" which matches
+        let entry = lookup_layer_calibration(&calib, "model.layers.0.self_attn.k_proj");
+        assert!(
+            entry.is_some(),
+            "query with extra trailing component should match via 3-prefix"
+        );
+    }
+
+    /// Missing layer key returns None.
+    #[test]
+    fn lookup_layer_calibration_no_match_returns_none() {
+        let calib = make_t18_calib();
+        let entry = lookup_layer_calibration(&calib, "model.layers.99.self_attn");
+        assert!(entry.is_none(), "non-existent layer key must return None");
+    }
+
+    /// Query with fewer than 3 dot-components returns None on fuzzy path.
+    #[test]
+    fn lookup_layer_calibration_short_query_returns_none() {
+        let calib = make_t18_calib();
+        let entry = lookup_layer_calibration(&calib, "model.layers");
+        assert!(
+            entry.is_none(),
+            "query with < 3 dot-components should return None"
+        );
+    }
+
+    /// "model.layers.0" has exactly 3 components — must match via fuzzy path.
+    ///
+    /// Regression test for the doc/code contradiction in lookup_layer_calibration:
+    /// the guard is `< 3` (strict), so a 3-component query passes and matches
+    /// "model.layers.0.self_attn" by shared 3-prefix.
+    #[test]
+    fn lookup_layer_calibration_three_component_query_matches() {
+        let calib = make_t18_calib();
+        let entry = lookup_layer_calibration(&calib, "model.layers.0");
+        assert!(
+            entry.is_some(),
+            "3-component query should match via 3-prefix (guard is < 3, not <= 3)"
+        );
+    }
+}

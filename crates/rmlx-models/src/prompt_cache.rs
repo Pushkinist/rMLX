@@ -1,0 +1,931 @@
+//! Arch-agnostic prompt-cache primitives.
+//!
+//! ## Design
+//!
+//! `PromptCache<E>` is a multi-slot cache generic over an entry type `E`
+//! that implements `PromptCacheEntry`. Each arch supplies its own concrete
+//! entry type holding whatever post-prefill state it needs:
+//!
+//! - `Gemma4Entry` — `Vec<KvCache>` only (pure-attention arch).
+//! - `Qwen35MoeEntry` — `Vec<KvCache>` + `Vec<LinearAttnCache>` (hybrid GDN).
+//!
+//! The cache is intentionally NOT a boxed-trait object or a single global.
+//! Each arch owns its own `Mutex<Option<PromptCache<E>>>` static — identical
+//! to the old Qwen-only pattern, just refactored so both archs share the
+//! lookup / push / stats logic.
+//!
+//! ## Trait contract
+//!
+//! `PromptCacheEntry` exposes:
+//! - `prompt_token_ids() -> &[u32]` — key for prefix matching.
+//! - `deep_clone() -> Result<Self>` — cheap refcount clone of MLX arrays.
+//! - `truncate_kv_to(prefix_len: usize)` — trim KV caches to prefix length.
+//! - `kv_bytes() -> u64` — RAM estimate for eviction budget.
+//!
+//! ## Stats
+//!
+//! `CacheStats` is a simple flat struct: `hits`, `misses`, `evictions`, `bytes`.
+//! It is updated on every `find_best_prefix` call (hit/miss) and every
+//! evicting `push`. Reset via `clear()`.
+//!
+//! ## LRU policy (M29)
+//!
+//! Each slot carries a `last_used_seq: u64` counter (monotonically increasing,
+//! no syscall). On every `find_best_prefix` hit the winning slot's counter is
+//! bumped to the current global sequence. On `push`:
+//!
+//!   1. RAM cap check: if `total_kv_bytes + new_entry_bytes > max_bytes`,
+//!      repeatedly evict the slot with the smallest `last_used_seq` (LRU)
+//!      until the budget fits or slots are empty.
+//!   2. Slot count cap: if `slots.len() == capacity`, evict the slot with the
+//!      smallest `last_used_seq`.
+//!
+//! The smaller of the two caps (RAM bytes, slot count) wins — either can
+//! trigger eviction first. Eviction never happens inside `find_best_prefix`
+//! (finish lookup first, then evict).
+//!
+//! RAM cap is configurable via `--prompt-cache-ram-gb` CLI flag, or
+//! the `RMLX_PROMPT_CACHE_MAX_BYTES` env var (silent fallback, undocumented).
+//! Default: 2 GiB.
+
+#![allow(clippy::struct_field_names)]
+use rmlx_core::error::Result;
+
+use crate::prefix_index::{
+    active_prefix_index_kind, build_active_index, PrefixIndex, PrefixIndexKind,
+};
+use rmlx_kv_quant::KvQuant;
+use rmlx_kv_ssd::{SsdHydrator, SsdSpiller};
+
+// The SSD-tier hashing primitives (`FNV_OFFSET`, `FNV_PRIME`,
+// `BLOCK_TOKENS`, `chained_block_hashes`, `chained_block_hashes_seeded`) and
+// the `SsdHydrate<E>` trait live in `rmlx-kv-ssd` so the SSD modules can use
+// them without a back-edge into `rmlx-models`. The re-exports below preserve
+// every in-crate `crate::prompt_cache::FNV_OFFSET` / `BLOCK_TOKENS` /
+// `chained_block_hashes_seeded` / `SsdHydrate` import path byte-identically.
+pub(crate) use rmlx_kv_ssd::{
+    chained_block_hashes, chained_block_hashes_seeded, SsdHydrate, BLOCK_TOKENS, FNV_OFFSET,
+    FNV_PRIME,
+};
+
+/// Default RAM cap for the prompt cache (2 GiB).
+pub(crate) const DEFAULT_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Resolve the RAM cap for the prompt cache from CLI flag + env fallback.
+///
+/// Precedence: CLI `--prompt-cache-ram-gb` > env `RMLX_PROMPT_CACHE_MAX_BYTES`
+/// (bytes, decimal — undocumented compat fallback) > default 2 GiB.
+///
+/// `cli_gib` is the parsed `--prompt-cache-ram-gb` value (`Option<f64>` in GiB).
+/// Negative / non-finite values are rejected as "invalid" and fall through to
+/// the env fallback. The env var is the byte-count form preserved from the
+/// pre-wire shape; CLI-supplied gibibytes are converted to bytes here.
+///
+/// Process-global resolution: stored in a `OnceLock` so every per-arch
+/// `PromptCache::new` call sees the same value regardless of construction
+/// order. The first call to [`install_ram_cap`] wins; later calls are
+/// no-ops with a `warn!` if they disagree, matching the SSD-tier OnceLock.
+pub fn resolve_ram_cap_bytes(cli_gib: Option<f64>, env_val: Option<&str>) -> u64 {
+    if let Some(g) = cli_gib {
+        if g.is_finite() && g >= 0.0 {
+            return (g * 1024.0 * 1024.0 * 1024.0) as u64;
+        }
+    }
+    if let Some(s) = env_val {
+        if let Ok(n) = s.parse::<u64>() {
+            return n;
+        }
+    }
+    DEFAULT_MAX_BYTES
+}
+
+static RAM_CAP_BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Install the process-global RAM cap for [`PromptCache::new`].
+///
+/// First call wins. Pass `cli_gib = None` to fall back to env / default. See
+/// [`resolve_ram_cap_bytes`] for precedence rules. Called once at serve
+/// startup before any model loads. Idempotent re-entry: a second call with a
+/// different value is dropped with a `warn!` (mirrors `ssd_tier::install_config`).
+pub fn install_ram_cap(cli_gib: Option<f64>) {
+    let env_val = std::env::var("RMLX_PROMPT_CACHE_MAX_BYTES").ok();
+    let bytes = resolve_ram_cap_bytes(cli_gib, env_val.as_deref());
+    if RAM_CAP_BYTES.set(bytes).is_err() {
+        let existing = RAM_CAP_BYTES.get().copied().unwrap_or(0);
+        if existing != bytes {
+            tracing::warn!(
+                existing,
+                requested = bytes,
+                "install_ram_cap called more than once; keeping the first value"
+            );
+        }
+        return;
+    }
+    let source = if cli_gib.is_some_and(|g| g.is_finite() && g >= 0.0) {
+        "cli"
+    } else if env_val.is_some() {
+        "env"
+    } else {
+        "default"
+    };
+    tracing::info!(
+        bytes,
+        gib = (bytes as f64) / (1024.0 * 1024.0 * 1024.0),
+        source,
+        "prompt-cache RAM cap installed"
+    );
+}
+
+/// Active RAM cap. Reads the [`install_ram_cap`] value; if it has not been
+/// installed yet (tests / unit paths), falls back to env + default.
+pub(crate) fn active_ram_cap_bytes() -> u64 {
+    if let Some(b) = RAM_CAP_BYTES.get().copied() {
+        return b;
+    }
+    let env_val = std::env::var("RMLX_PROMPT_CACHE_MAX_BYTES").ok();
+    resolve_ram_cap_bytes(None, env_val.as_deref())
+}
+
+// ---------------------------------------------------------------------------
+// CacheStats
+// ---------------------------------------------------------------------------
+
+/// Running hit/miss/eviction counters for a `PromptCache` instance.
+///
+/// Updated by `find_best_prefix` (hit/miss) and `push` (evictions).
+/// `bytes` is computed lazily on `PromptCache::stats()` — it is NOT
+/// kept incrementally because slots can be truncated/evicted at any time.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default)]
+pub struct CacheStats {
+    /// Number of times `find_best_prefix` returned a match (exact or prefix).
+    pub hits: u64,
+    /// Number of times `find_best_prefix` returned `None`.
+    pub misses: u64,
+    /// Number of slots evicted (LRU policy: slot-count cap or RAM-bytes cap).
+    pub evictions: u64,
+    /// Approximate total RAM held by all occupied slots, in bytes.
+    ///
+    /// Populated when `PromptCache::stats()` is called; zero otherwise.
+    pub bytes: u64,
+    /// Total 256-token blocks matched across all hit requests.
+    pub block_hits: u64,
+    /// Total 256-token blocks missed across all requests (hit + miss).
+    pub block_misses: u64,
+    /// Number of hit requests where at least one block was NOT matched
+    /// (i.e., partial prefix hit: best_blocks > 0 && best_blocks < want_blocks).
+    pub partial_hits: u64,
+    /// Number of RAM-cache misses that were served from the SSD tier.
+    ///
+    /// Incremented by [`PromptCache::hydrate_from_ssd`] each time a longest-
+    /// prefix block was read back from a `.kvb` file and promoted into RAM.
+    /// Zero when no SSD source is attached (the RAM-only default).
+    pub ssd_hits: u64,
+}
+
+// ---------------------------------------------------------------------------
+// PromptCacheEntry trait
+// ---------------------------------------------------------------------------
+
+/// Contract for a single cached post-prefill snapshot.
+///
+/// Each arch implements this on its own concrete entry struct. The trait is
+/// `pub(crate)` — not exported from the crate — because no external callers
+/// need it. `PromptCache<E>` is the only consumer.
+pub(crate) trait PromptCacheEntry: Sized {
+    /// The full prompt token IDs that produced this snapshot.
+    ///
+    /// Used at both arch callsites to confirm a true full-token-equality
+    /// Exact hit (identical-prompt repeat). C1's block-hash matching narrows
+    /// the candidate slot via `find_best_prefix`; this method then verifies
+    /// the FULL token sequence is byte-identical before the no-truncate,
+    /// no-reprefill Exact fast path is taken. Block-floored equality is
+    /// insufficient (it misroutes identical prompts into the unsafe partial
+    /// path). Also required by C2/C3 (SSD persistence rehydrate + re-verify).
+    fn prompt_token_ids(&self) -> &[u32];
+
+    /// Deep clone of all MLX arrays inside the entry.
+    ///
+    /// `Array::try_clone` is a refcount increment on the MLX-c side — no
+    /// tensor data is copied. The returned entry shares GPU buffers until
+    /// a write (prefill of a tail) triggers MLX copy-on-write.
+    fn deep_clone(&self) -> Result<Self>;
+
+    /// Chained 256-token block digests of this entry's prompt.
+    ///
+    /// One digest per full block (trailing partial block excluded), accumulated
+    /// at construction via `chained_block_hashes`. Used by
+    /// `find_best_prefix` for block-aligned longest-prefix matching.
+    fn block_hashes(&self) -> &[u64];
+
+    /// Truncate KV caches to `prefix_len` sequence positions in-place.
+    ///
+    /// Called on a cloned entry before re-prefilling the tail. Only KV
+    /// caches need truncation; linear-attention recurrent states are re-run
+    /// from scratch on the tail so they do not need truncation.
+    ///
+    /// the gemma4 impl of `truncate_kv_to_block` delegates here, so the
+    /// gemma4 partial-prefix path reaches this method. qwen3_5_moe's impl is
+    /// not invoked in production (MoE is full-hit-only). Kept on the trait
+    /// contract for C2/C3 (SSD persistence) and the per-arch policy docs.
+    #[allow(dead_code)]
+    fn truncate_kv_to(&mut self, prefix_len: usize);
+
+    /// Block-aligned truncation: trim KV caches to `block_count` full blocks.
+    ///
+    /// Equivalent to `truncate_kv_to(block_count * BLOCK_TOKENS)` but
+    /// implemented per-arch so arch-specific policies (e.g. Qwen GDN
+    /// `lin_caches` are deliberately NOT truncated) stay intact.
+    ///
+    /// live caller — the gemma4 partial-prefix `CacheLookup::Prefix`
+    /// path (`gemma4/generate.rs`) calls this after gating on
+    /// `Gemma4Entry::can_truncate_to_block` (every layer cache trimmable —
+    /// no wrapped-SWA desync). qwen3_5_moe never calls it: its recurrent GDN
+    /// `lin_caches` cannot be reconstructed from a block-truncated KV, so MoE
+    /// is gated to full-token-equality (Exact) reuse only.
+    fn truncate_kv_to_block(&mut self, block_count: usize);
+
+    /// Approximate RAM held by this entry's KV/recurrent state, in bytes.
+    ///
+    /// Used by `PromptCache::stats()` to populate `CacheStats::bytes` and
+    /// by the RAM-cap eviction policy in `push`.
+    /// Best-effort estimate — does not guarantee byte-exact Metal accounting.
+    fn kv_bytes(&self) -> u64;
+}
+
+// ---------------------------------------------------------------------------
+// SpillSink — optional SSD-spill hook
+// ---------------------------------------------------------------------------
+
+/// Sink that receives an entry as it is being evicted from RAM, so it can be
+/// persisted to the SSD tier (`KvBlockWriter` → `SsdKvIndex`) instead of
+/// silently dropped.
+///
+/// Generic over the entry type so `PromptCache<E>` stays arch-agnostic and the
+/// hook is mockable in tests (a test sink can capture the evicted entry's hash
+/// without touching disk). The real implementation (`kv_cache::spill::SsdSpiller`)
+/// is fire-and-forget: it does a cheap refcount-clone of the entry's caches and
+/// hands them to a background drain thread; on any failure it `warn!`s and drops
+/// the job — eviction never blocks on disk I/O and never panics.
+///
+/// `spill` is called with the entry **by reference, before it is dropped**, on
+/// both eviction paths (RAM-cap and slot-count). When the cache holds no sink
+/// (`None`), eviction is exactly the pre-pure drop.
+pub(crate) trait SpillSink<E>: Send {
+    /// Spill an entry that is about to be evicted. Must not block or panic.
+    fn spill(&self, entry: &E);
+}
+
+// ---------------------------------------------------------------------------
+// SsdHydrate — lives in `rmlx_kv_ssd::traits`. Re-exported above.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Slot wrapper (internal)
+// ---------------------------------------------------------------------------
+
+/// Internal slot: wraps an entry with its LRU sequence number.
+pub(crate) struct Slot<E> {
+    pub(crate) entry: E,
+    /// Monotonically increasing counter set when this slot is last accessed
+    /// (either on first `push` or on a `find_best_prefix` hit).
+    last_used_seq: u64,
+    /// stable monotonic id assigned at first `push`. Used as the
+    /// `slot_id` payload stored inside the per-cache [`PrefixIndex`]; the
+    /// index hands this back on `match_best`, and the cache scans
+    /// `self.slots` to convert it back to a current `usize` index (the
+    /// `Vec` index is unstable under `swap_remove`). Cost: O(slots) on a
+    /// hit, but `slots.len()` is small (default 4, max realistically 256).
+    slot_uid: u64,
+}
+
+// ---------------------------------------------------------------------------
+// PromptCache<E>
+// ---------------------------------------------------------------------------
+
+/// Multi-slot LRU prompt cache, generic over the arch-specific entry type.
+///
+/// See module-level docs for the slot semantics and eviction policy.
+pub(crate) struct PromptCache<E: PromptCacheEntry> {
+    pub(crate) slots: Vec<Slot<E>>,
+    pub(crate) capacity: usize,
+    /// RAM cap in bytes. Loaded once from `RMLX_PROMPT_CACHE_MAX_BYTES`
+    /// at construction. Default 2 GiB.
+    pub(crate) max_bytes: u64,
+    /// Global monotonic sequence counter. Incremented on every
+    /// `find_best_prefix` hit and `push`. Never resets (u64 overflow
+    /// would require >1.8 × 10^19 cache accesses — irrelevant in practice).
+    seq: u64,
+    pub(crate) stats: CacheStats,
+    /// Optional SSD-spill hook. `None` → evicted entries are dropped
+    /// exactly as before. `Some(_)` → each evicted entry is offered to the
+    /// sink (fire-and-forget) before being dropped.
+    spill: Option<Box<dyn SpillSink<E>>>,
+    /// Optional SSD-hydrate source. `None` → a RAM miss is just a miss
+    /// (today's behavior). `Some(_)` → on a RAM miss the source is queried for
+    /// the longest matching block-hash prefix and, on a hit, the reconstructed
+    /// entry is promoted into RAM via [`PromptCache::hydrate_from_ssd`].
+    ssd: Option<Box<dyn SsdHydrate<E>>>,
+    /// which `PrefixIndex` impl this cache uses for `find_best_prefix`.
+    /// Stored alongside the trait object so we can early-out on the Linear
+    /// path (preserve the pre-byte-identical scan with no index
+    /// upkeep) and only pay index-maintenance cost on the Radix path.
+    prefix_index_kind: PrefixIndexKind,
+    /// pluggable longest-prefix index. Mirrors `self.slots` —
+    /// every entry in `slots` has exactly one corresponding entry here
+    /// keyed by `(slot.entry.block_hashes(), layout_key=0)` with payload =
+    /// `slot.slot_uid`. Layout disambiguation is already baked into the
+    /// stored `block_hashes` by the per-arch push path
+    /// (`chained_block_hashes_seeded(ids, FNV_OFFSET ^ layout_key)`), so we
+    /// pass `0` to the trait and rely on hash inequality alone.
+    ///
+    /// On the Linear path this index is built + maintained for parity with
+    /// the Radix path (used by the differential test in the bench)
+    /// but `find_best_prefix` ignores it and walks `slots` directly. On the
+    /// Radix path the index is the query target; the slot scan is reduced
+    /// to a slot_uid → idx lookup (O(slots), `slots.len()` ≤ 256).
+    prefix_index: Box<dyn PrefixIndex>,
+    /// monotonic counter handed out as `Slot::slot_uid` on each push.
+    next_slot_uid: u64,
+}
+
+impl<E: PromptCacheEntry> PromptCache<E> {
+    /// Create a new cache with the given slot capacity (minimum 1).
+    ///
+    /// RAM cap is taken from the process-global resolver
+    /// ([`active_ram_cap_bytes`]): CLI `--prompt-cache-ram-gb` if installed,
+    /// else env `RMLX_PROMPT_CACHE_MAX_BYTES` (bytes, decimal — silent
+    /// compat fallback), else default 2 GiB.
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self::with_max_bytes(capacity, active_ram_cap_bytes())
+    }
+
+    /// Create a cache with an explicit RAM cap (used in tests).
+    pub(crate) fn with_max_bytes(capacity: usize, max_bytes: u64) -> Self {
+        let kind = active_prefix_index_kind();
+        Self {
+            slots: Vec::with_capacity(capacity.max(1)),
+            capacity: capacity.max(1),
+            max_bytes,
+            seq: 0,
+            stats: CacheStats::default(),
+            spill: None,
+            ssd: None,
+            prefix_index_kind: kind,
+            prefix_index: build_active_index(),
+            next_slot_uid: 0,
+        }
+    }
+
+    /// Attach an SSD-spill sink. Evicted entries are offered to `sink`
+    /// before being dropped. Idempotent-overwrite: replaces any prior sink.
+    ///
+    /// Off by default (`new`/`with_max_bytes` leave it `None`); a model-load
+    /// path opts in by calling this once. With no sink, eviction is the
+    /// unchanged pre-pure drop.
+    ///
+    /// wires the production caller: `ssd_tier::attach_at_load` →
+    /// per-arch `install_ssd_sinks` spawns a spiller and calls this.
+    pub(crate) fn set_spill_sink(&mut self, sink: Box<dyn SpillSink<E>>) {
+        self.spill = Some(sink);
+    }
+
+    /// Attach an SSD-hydrate source (, symmetric to [`set_spill_sink`]).
+    /// On a RAM miss the source is queried for the longest matching block-hash
+    /// prefix; a hit is reconstructed and promoted into RAM.
+    ///
+    /// Off by default (`None`) → RAM-only behavior, unchanged from pre-.
+    /// wires the production caller at model-load (`ssd_tier::attach_at_load`),
+    /// gated by `--kv-ssd-cache-gb`.
+    ///
+    /// [`set_spill_sink`]: PromptCache::set_spill_sink
+    pub(crate) fn set_ssd_source(&mut self, source: Box<dyn SsdHydrate<E>>) {
+        self.ssd = Some(source);
+    }
+
+    /// On a RAM-cache miss, try to serve the request from the SSD tier.
+    ///
+    /// Queries the attached [`SsdHydrate`] source for the longest matching
+    /// block-hash prefix of `prompt_ids`. On a hit, the reconstructed entry is
+    /// `push`ed into RAM (which may spill a different LRU entry via — the
+    /// symmetric path) and `stats.ssd_hits` is bumped; the new slot index is
+    /// returned. On a miss, or when no SSD source is attached, returns `None`
+    /// and the caller falls through to a full prefill.
+    ///
+    /// Call this only after [`find_best_prefix`] returns `None`. Corruption
+    /// (bad read / metadata mismatch / missing file) is handled inside the
+    /// source impl (delete file + index row, `warn!`) and surfaces as a miss
+    /// here — this method never panics.
+    ///
+    /// [`find_best_prefix`]: PromptCache::find_best_prefix
+    pub(crate) fn hydrate_from_ssd(&mut self, prompt_ids: &[u32]) -> Option<usize> {
+        // Take the source out so the `&self` borrow during `hydrate` does not
+        // conflict with the `&mut self` `push` below; put it back after.
+        let source = self.ssd.take()?;
+        let result = source.hydrate(prompt_ids);
+        self.ssd = Some(source);
+        match result {
+            Ok(Some(entry)) => {
+                self.push(entry);
+                self.stats.ssd_hits += 1;
+                // `push` appended at the end (after any eviction); the new
+                // entry is the last slot.
+                Some(self.slots.len() - 1)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                // The source contract maps corruption to Ok(None); a residual
+                // Err is logged and treated as a miss — never propagated.
+                tracing::warn!(error = %e, "ssd-hydrate: source error, treating as miss");
+                None
+            }
+        }
+    }
+
+    /// Return accumulated hit/miss/eviction counters plus current byte estimate.
+    ///
+    /// `bytes` is computed fresh on each call by summing `kv_bytes()` over all
+    /// occupied slots — no incremental bookkeeping, so this is always accurate
+    /// without worrying about eviction/truncation invalidating a running total.
+    pub(crate) fn stats(&self) -> CacheStats {
+        let bytes: u64 = self.slots.iter().map(|s| s.entry.kv_bytes()).sum();
+        CacheStats {
+            bytes,
+            ..self.stats.clone()
+        }
+    }
+
+    /// Clear all slots and reset stats.
+    /// Called when model is unloaded or capacity changes.
+    #[allow(dead_code)]
+    pub(crate) fn clear(&mut self) {
+        self.slots.clear();
+        self.stats = CacheStats::default();
+        self.seq = 0;
+        self.prefix_index.clear();
+        self.next_slot_uid = 0;
+    }
+
+    /// Find the slot with the longest block-aligned prefix match.
+    ///
+    /// Computes the incoming prompt's chained 256-token block hashes, then for
+    /// each slot counts the number of leading block digests that match.
+    /// Returns `Some((slot_index, matched_block_count))` for the best match
+    /// with `matched_block_count >= 1` (the 256-token worthwhile floor), or
+    /// `None` if no slot shares at least one full block.
+    ///
+    /// Because the digests are chained (block N folds in block N-1), a run of
+    /// `k` leading equal digests proves the entire `k * 256`-token prefix is
+    /// byte-identical — no token-level rescan needed.
+    ///
+    /// On a hit, bumps `last_used_seq` of the winning slot to mark it MRU.
+    /// Increments `stats.hits` on a match, `stats.misses` on `None`.
+    ///
+    /// Eviction is NOT performed here — call `push` afterwards if needed.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    pub(crate) fn find_best_prefix(&mut self, prompt_ids: &[u32]) -> Option<(usize, usize)> {
+        let want = chained_block_hashes(prompt_ids);
+
+        let (best_idx, best_blocks) = match self.prefix_index_kind {
+            // Linear path is byte-identical to the pre-scan;
+            // the parallel `prefix_index` is maintained (so the bench
+            // harness can swap it in) but unused on lookup.
+            PrefixIndexKind::Linear => {
+                let mut best_idx: Option<usize> = None;
+                let mut best_blocks = 0usize; // hit requires >= 1 block
+                for (i, slot) in self.slots.iter().enumerate() {
+                    let have = slot.entry.block_hashes();
+                    let matched = want
+                        .iter()
+                        .zip(have.iter())
+                        .take_while(|(a, b)| a == b)
+                        .count();
+                    if matched > best_blocks {
+                        best_blocks = matched;
+                        best_idx = Some(i);
+                    }
+                }
+                (best_idx, best_blocks)
+            }
+            // Radix path — query the tree, then convert the returned
+            // `slot_uid` payload back to a slot index via a linear scan
+            // (small N, dominated by the radix lookup's O(n_blocks) cost).
+            PrefixIndexKind::Radix => match self.prefix_index.match_best(&want, 0) {
+                Some((slot_uid, blocks)) => {
+                    let idx = self.slots.iter().position(|s| s.slot_uid == slot_uid);
+                    // Stale uid (defensive — index/slots desync should be
+                    // unreachable but we fall back to Linear scan instead
+                    // of panicking).
+                    if let Some(i) = idx {
+                        (Some(i), blocks)
+                    } else {
+                        tracing::warn!(
+                            slot_uid,
+                            "radix returned a stale slot_uid; falling back to linear scan"
+                        );
+                        let mut best_idx: Option<usize> = None;
+                        let mut best_blocks = 0usize;
+                        for (i, slot) in self.slots.iter().enumerate() {
+                            let matched = want
+                                .iter()
+                                .zip(slot.entry.block_hashes().iter())
+                                .take_while(|(a, b)| a == b)
+                                .count();
+                            if matched > best_blocks {
+                                best_blocks = matched;
+                                best_idx = Some(i);
+                            }
+                        }
+                        (best_idx, best_blocks)
+                    }
+                }
+                None => (None, 0),
+            },
+        };
+
+        let want_blocks = want.len();
+        if let Some(i) = best_idx {
+            // Bump MRU: advance seq and stamp the winning slot.
+            self.seq += 1;
+            self.slots[i].last_used_seq = self.seq;
+            self.stats.hits += 1;
+            self.stats.block_hits += best_blocks as u64;
+            self.stats.block_misses += (want_blocks - best_blocks) as u64;
+            if best_blocks > 0 && best_blocks < want_blocks {
+                self.stats.partial_hits += 1;
+            }
+        } else {
+            self.stats.misses += 1;
+            self.stats.block_misses += want_blocks as u64;
+        }
+
+        best_idx.map(|i| (i, best_blocks))
+    }
+
+    /// Push a new entry, evicting LRU slot(s) as needed.
+    ///
+    /// Eviction order:
+    /// 1. While `total_kv_bytes + new_entry_bytes > max_bytes` and slots
+    /// 2. If `slots.len() == capacity`: drop the slot with the smallest
+    ///
+    /// Either cap can trigger independently. Each eviction increments
+    /// `stats.evictions`.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    pub(crate) fn push(&mut self, entry: E) {
+        let new_bytes = entry.kv_bytes();
+
+        // --- RAM-cap eviction ---
+        let mut total: u64 = self.slots.iter().map(|s| s.entry.kv_bytes()).sum();
+        while !self.slots.is_empty() && total + new_bytes > self.max_bytes {
+            let lru_idx = self.lru_slot_index();
+            total -= self.slots[lru_idx].entry.kv_bytes();
+            let evicted = self.slots.swap_remove(lru_idx);
+            // drop the evicted entry from the prefix index BEFORE
+            // the entry is offered to the SSD spill sink — keeps the index
+            // ⇔ slots invariant intact even if `spill` later panics.
+            self.prefix_index.remove(evicted.entry.block_hashes(), 0);
+            self.spill_evicted(&evicted.entry);
+            self.stats.evictions += 1;
+        }
+
+        // --- Slot-count-cap eviction ---
+        if self.slots.len() == self.capacity {
+            let lru_idx = self.lru_slot_index();
+            let evicted = self.slots.swap_remove(lru_idx);
+            self.prefix_index.remove(evicted.entry.block_hashes(), 0);
+            self.spill_evicted(&evicted.entry);
+            self.stats.evictions += 1;
+        }
+
+        // Stamp the new slot with the next sequence number + stable uid.
+        self.seq += 1;
+        self.next_slot_uid += 1;
+        let slot_uid = self.next_slot_uid;
+        // index the new entry's block-hash chain before pushing.
+        self.prefix_index.insert(entry.block_hashes(), 0, slot_uid);
+        self.slots.push(Slot {
+            entry,
+            last_used_seq: self.seq,
+            slot_uid,
+        });
+    }
+
+    /// Evict the slot at `idx` and bump `stats.evictions`.
+    ///
+    /// Used by call-site lookup logic that detects an entry mismatch (e.g.
+    /// stored `KvQuant` differs from the runtime `KvQuant` — Plan §D8) and
+    /// needs to drop the unusable slot before falling back to a Miss. Uses
+    /// `swap_remove` so it is O(1); slot order is not meaningful for any
+    /// other cache invariant.
+    ///
+    /// Panics if `idx` is out of range.
+    pub(crate) fn evict_slot(&mut self, idx: usize) {
+        let removed = self.slots.swap_remove(idx);
+        // keep the prefix index in lockstep with the slot vec.
+        self.prefix_index.remove(removed.entry.block_hashes(), 0);
+        self.stats.evictions += 1;
+    }
+
+    /// Offer an about-to-be-dropped entry to the SSD-spill sink, if attached.
+    ///
+    /// No-op when no sink is configured (`None`) — the pre-pure-drop
+    /// behavior. The sink is contractually fire-and-forget (non-blocking,
+    /// never panics), so this stays on the hot path with no I/O.
+    fn spill_evicted(&self, entry: &E) {
+        if let Some(sink) = &self.spill {
+            sink.spill(entry);
+        }
+    }
+
+    /// Index of the slot with the smallest `last_used_seq` (LRU).
+    ///
+    /// Panics if `slots` is empty — callers must guard.
+    #[allow(
+        clippy::expect_used,
+        reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+    )]
+    fn lru_slot_index(&self) -> usize {
+        self.slots
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, s)| s.last_used_seq)
+            .map(|(i, _)| i)
+            .expect("lru_slot_index: slots must be non-empty")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ReusePolicy — per-arch hard runtime gate
+// ---------------------------------------------------------------------------
+
+/// Per-arch policy gating which kinds of cache reuse are allowed.
+///
+/// hard runtime gate (NOT a comment): every arch instantiates an
+/// [`ArchPromptCache`] with one of these variants. The policy is queried by
+/// the generate loop's lookup logic to decide whether a partial / strict-prefix
+/// hit may be taken or must degrade to a Miss.
+///
+/// - [`ReusePolicy::Partial`] — pure-attention arch with trimmable KV (Gemma4).
+///   Block-aligned partial-prefix reuse + B1 strict-prefix SWA snapshot/restore
+///   are both legal. The arch still has to gate per-slot via
+///   `Gemma4Entry::can_truncate_to_block` (SWA ring-buffer wrap).
+/// - [`ReusePolicy::ExactOnly`] — full-token-equality reuse only. Block-aligned
+///   partial hits MUST degrade to a Miss. Required for any arch that holds
+///   non-truncatable state alongside the attention KV — today the only
+///   production user is **Qwen3.5-MoE** (recurrent GatedDeltaNet `lin_caches`
+///   cannot be reconstructed from a block-truncated prefix). Qwen3-dense also
+///   uses this for simplicity (its Exact-hit warm-TTFT case is the dominant
+///   one and the bench winner; the partial path was never worth the complexity
+///   for an arch with no Prefix consumers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReusePolicy {
+    /// Block-aligned partial-prefix reuse allowed (Gemma4 — full-attn + SWA).
+    Partial,
+    /// Full-token-equality reuse only; partial hits must degrade to Miss
+    /// (Qwen3-MoE — GDN recurrent state cannot be block-truncated).
+    ExactOnly,
+}
+
+// ---------------------------------------------------------------------------
+// ArchPromptCache — per-arch shell over `PromptCache<E>`
+// ---------------------------------------------------------------------------
+
+/// per-arch SSD-attach parameters held outside the cache so they
+/// survive `ensure_prompt_cache`'s capacity-change re-creation.
+#[derive(Clone)]
+pub(crate) struct AttachParams {
+    pub(crate) namespace: String,
+    pub(crate) kv_quant: KvQuant,
+    pub(crate) layout_key: u64,
+    pub(crate) device: rmlx_mlx::Device,
+}
+
+/// unified per-arch wrapper around `PromptCache<E>`.
+///
+/// Collapses the duplicated static state that every arch's `prompt_cache.rs`
+/// used to keep (its `Mutex<Option<PromptCache<E>>>`, `Mutex<Option<Attach…>>`,
+/// `AtomicU64` last-bytes counter, plus the matching `ensure` / `attach` /
+/// `read_stats` boilerplate) into one generic type. Each arch keeps a single
+/// `static PROMPT_CACHE: ArchPromptCache<MyEntry> = ArchPromptCache::new(…)`.
+///
+/// The genuinely per-arch parts that stay outside this struct:
+/// - the `Entry` struct (Gemma4 = KV only, Qwen3 = KV only, Qwen3.5-MoE =
+///   KV + LinearAttn);
+/// - the `impl SpillSink<Entry> for SsdSpiller` /
+///   `impl SsdHydrate<Entry> for SsdHydrator` blocks (Entry-shape specific);
+/// - the in-`generate.rs` `CacheLookup` match (Exact / Prefix / Miss), which
+///   queries [`ArchPromptCache::policy`] to enforce [`ReusePolicy::ExactOnly`]
+///   as a hard runtime check.
+///
+/// Risk-mitigation contract:
+/// - The constructor takes a `ReusePolicy`. The `policy()` getter is the
+///   single source of truth — the gate is enforced at the call site
+///   (`generate.rs`), not as a comment.
+/// - Gemma4-SWA needs the snapshot/restore hook in the entry impl
+///   (`is_strict_prefix_of`, `can_truncate_to_block`). The compile-time bound
+///   on `attach_ssd_tier` (`SsdSpiller: SpillSink<E>`) keeps SSD attach only
+///   reachable for archs that implement the trait — never silently disabled.
+pub(crate) struct ArchPromptCache<E: PromptCacheEntry> {
+    /// Human-readable arch tag used in tracing events.
+    arch_name: &'static str,
+    /// Reuse policy: `Partial` (Gemma4) or `ExactOnly` (Qwen3, Qwen3.5-MoE).
+    policy: ReusePolicy,
+    /// The actual prompt cache. `None` until `ensure_prompt_cache` builds it.
+    inner: std::sync::Mutex<Option<PromptCache<E>>>,
+    /// SSD-tier attach parameters (set once by `attach_ssd_tier`); replayed on
+    /// every cache re-creation so a capacity bump never silently drops the
+    /// tier.
+    attach: std::sync::Mutex<Option<AttachParams>>,
+    /// Last-request KV-cache byte total, surfaced via `/metrics/cache`.
+    last_kv_bytes: std::sync::atomic::AtomicU64,
+}
+
+impl<E: PromptCacheEntry> ArchPromptCache<E> {
+    /// Construct an empty per-arch cache. `const fn` so each arch can declare
+    /// it as a `static`.
+    pub(crate) const fn new(arch_name: &'static str, policy: ReusePolicy) -> Self {
+        Self {
+            arch_name,
+            policy,
+            inner: std::sync::Mutex::new(None),
+            attach: std::sync::Mutex::new(None),
+            last_kv_bytes: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Human-readable arch tag used in tracing events.
+    #[allow(dead_code)]
+    pub(crate) const fn arch_name(&self) -> &'static str {
+        self.arch_name
+    }
+
+    /// The arch's reuse policy. Generate-loop call sites query this to enforce
+    /// `ExactOnly` as a hard runtime gate (see [`ReusePolicy`]).
+    pub(crate) const fn policy(&self) -> ReusePolicy {
+        self.policy
+    }
+
+    /// Lock the inner cache for the duration of the closure. Centralises the
+    /// poison-recovery pattern so call sites do not repeat
+    /// `lock().unwrap_or_else(|p| p.into_inner())`.
+    ///
+    /// On a previously poisoned `Mutex`, the inner state is silently recovered
+    /// (matches `PromptCache` policy elsewhere) — a panic inside `f` poisons the
+    /// lock for subsequent calls but never propagates.
+    pub(crate) fn with_inner_mut<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut Option<PromptCache<E>>) -> R,
+    {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&mut guard)
+    }
+
+    /// Ensure the cache is initialised with at least `capacity` slots. If the
+    /// existing cache already has the same capacity, this is a no-op. Otherwise
+    /// the cache is rebuilt (old snapshots discarded) and the SSD spiller /
+    /// hydrator are re-installed from the recorded `attach` params (no-op when
+    /// the tier is OFF).
+    ///
+    /// `SsdSpiller: SpillSink<E>` and `SsdHydrator: SsdHydrate<E>` bound the
+    /// call so only archs with both trait impls reach this method.
+    pub(crate) fn ensure(&self, capacity: usize)
+    where
+        SsdSpiller: SpillSink<E>,
+        SsdHydrator: SsdHydrate<E>,
+    {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match guard.as_ref() {
+            Some(c) if c.capacity == capacity => {}
+            _ => {
+                let mut cache = PromptCache::new(capacity);
+                let attach = self
+                    .attach
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                if let Some(p) = attach {
+                    install_ssd_sinks::<E>(&mut cache, &p);
+                }
+                *guard = Some(cache);
+            }
+        }
+    }
+
+    /// Wire the spiller + hydrator onto this arch's prompt cache
+    /// for `namespace` at `kv_quant` (/ ). Records the attach params
+    /// so they survive a later cache re-creation, then installs the sinks on
+    /// the live cache when one already exists.
+    pub(crate) fn attach_ssd_tier(
+        &self,
+        namespace: &str,
+        kv_quant: KvQuant,
+        layout_key: u64,
+        device: rmlx_mlx::Device,
+    ) where
+        SsdSpiller: SpillSink<E>,
+        SsdHydrator: SsdHydrate<E>,
+    {
+        let params = AttachParams {
+            namespace: namespace.to_string(),
+            kv_quant,
+            layout_key,
+            device,
+        };
+        *self
+            .attach
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(params.clone());
+        if let Some(cache) = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            install_ssd_sinks::<E>(cache, &params);
+        }
+        tracing::info!(
+            arch = self.arch_name,
+            namespace,
+            ?kv_quant,
+            layout_key = format!("{layout_key:016x}"),
+            "SSD tier attached to prompt cache"
+        );
+    }
+
+    /// active SSD-tier `layout_key`, or `0` when the tier is OFF.
+    /// `FNV_OFFSET ^ 0 == FNV_OFFSET` ⇒ legacy un-salted digests on RAM-only
+    /// runs, preserving byte-identical behaviour.
+    pub(crate) fn active_layout_key(&self) -> u64 {
+        self.attach
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map_or(0, |p| p.layout_key)
+    }
+
+    /// Read the current hit/miss/bytes stats, or `None` if the cache has not
+    /// been initialised yet (no request served for this arch since startup).
+    pub(crate) fn read_cache_stats(&self) -> Option<CacheStats> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(PromptCache::stats)
+    }
+
+    /// Read the KV-cache bytes from the last completed request (0 if none).
+    pub(crate) fn read_kv_cache_bytes(&self) -> u64 {
+        self.last_kv_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Store the KV-cache bytes for the just-finished request. Called by
+    /// `generate_greedy` at request boundary.
+    pub(crate) fn store_kv_cache_bytes(&self, n: u64) {
+        self.last_kv_bytes
+            .store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Shared SSD-sink install routine — replaces the three near-identical per-arch
+/// `install_ssd_sinks` helpers. Spiller is unconditional; hydrator-open failure
+/// logs a `warn!` and leaves the cache spill-only for the run.
+fn install_ssd_sinks<E: PromptCacheEntry>(cache: &mut PromptCache<E>, p: &AttachParams)
+where
+    SsdSpiller: SpillSink<E>,
+    SsdHydrator: SsdHydrate<E>,
+{
+    cache.set_spill_sink(Box::new(SsdSpiller::spawn(
+        &p.namespace,
+        p.layout_key,
+        p.device,
+    )));
+    match SsdHydrator::open(&p.namespace, p.kv_quant, p.layout_key, p.device) {
+        Ok(h) => cache.set_ssd_source(Box::new(h)),
+        Err(e) => tracing::warn!(
+            namespace = %p.namespace,
+            error = %e,
+            "SSD hydrator open failed; spill-only for this run"
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "prompt_cache_tests.rs"]
+mod prompt_cache_tests;

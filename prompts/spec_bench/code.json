@@ -1,0 +1,11 @@
+{
+  "name": "spec-bench-fizzbuzz-rust",
+  "class": "code",
+  "notes": "Rust code completion. High MTP accept rate (~0.89 on gemma-4-e2b-it-mxfp8) — current MTP sweet spot. +70.9% TPS vs normal on the reference run.",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Write a Rust function fizzbuzz(n: u32) that prints numbers from 1 to n, printing Fizz for multiples of 3, Buzz for multiples of 5, and FizzBuzz for multiples of both. Provide only the code, no explanation."
+    }
+  ]
+}

@@ -1,0 +1,78 @@
+# cargo-deny config. Run: `cargo deny check`.
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = false
+no-default-features = false
+targets = [
+    { triple = "aarch64-apple-darwin" },
+]
+
+[output]
+feature-depth = 1
+
+# ---- advisories ---------------------------------------------------------
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+# All ignores below are unmaintained-only advisories on transitive crates we
+# do not control. Revisit when `tokenizers` upgrades the chain.
+ignore = [
+    # `paste` archived. Transitive via `tokenizers`.
+    "RUSTSEC-2024-0436",
+    # `number_prefix` unmaintained. Transitive via `indicatif` -> `tokenizers`.
+    "RUSTSEC-2025-0119",
+]
+
+# ---- licenses -----------------------------------------------------------
+[licenses]
+# License set we accept without case-by-case review.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    # CDLA-Permissive-2.0: Linux Foundation Community Data License Agreement —
+    # Permissive 2.0. Permissive analogous to Apache-2.0. Added for
+    # webpki-root-certs (transitive via ureq → rmlx-server).
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.93
+exceptions = []
+
+# ---- bans ---------------------------------------------------------------
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Internal path deps omit a version so `[workspace.package].version` is the
+# single source of truth; this exempts them from the wildcard ban.
+allow-wildcard-paths = true
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+
+# Crates we deliberately do not want pulled in.
+deny = [
+    # `openssl` — pulls system OpenSSL; prefer rustls path.
+    { name = "openssl", reason = "use rustls; see Anthropic + axum tls path" },
+    # NB: do not ban `log` — many transitive deps still emit through it,
+    # and tracing-log bridges them. We just don't write `log::` ourselves.
+]
+
+skip = []
+skip-tree = []
+
+# ---- sources ------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git      = "deny"
+allow-registry   = ["https://github.com/rust-lang/crates.io-index"]
+allow-git        = []

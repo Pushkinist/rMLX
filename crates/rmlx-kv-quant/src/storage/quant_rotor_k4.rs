@@ -1,0 +1,294 @@
+// Rotor4 K-side storage (Cl(3,0) Clifford rotor sandwich,
+// 4-bit Lloyd-Max codebook, optional 1-bit QJL residual).
+//
+// Mirror of `quant_rotor_k3.rs` with `bits=4` and the dense 8-vals-per-u32
+// pack from `rotor4_k_encode` / `rotor4_k_decode`. Identical storage layout
+// modulo the codes bit-width — `RotorKBlocks` is shared from `quant_rotor_k3`.
+#![allow(
+    unreachable_pub,
+    clippy::exhaustive_structs,
+    clippy::doc_lazy_continuation
+)]
+//! Quantized K buffer: `QuantRotorK4` (rotor4 K codec).
+
+use rmlx_core::error::Result;
+
+use crate::clifford::make_rotor_table;
+use crate::rotorquant::{
+    make_qjl_projection, n_groups_for, rotor4_k_decode, rotor4_k_encode, RotorQuantError,
+    ROTOR4_BITS, ROTOR4_GROUP_SIZE,
+};
+use crate::storage::quant_rotor_k3::RotorKBlocks;
+
+/// Bit-width of the rotor4 K codec.
+pub const ROTOR4_K_BITS: u8 = ROTOR4_BITS;
+
+/// Multivector group size (identical to rotor3 / rotor4 V-side codecs).
+pub const ROTOR4_K_GROUP_SIZE: usize = ROTOR4_GROUP_SIZE;
+
+/// Accumulated rotor4 K cache. See [`QuantRotorK3`](super::QuantRotorK3) for the
+/// field semantics — same structure, 4-bit codes via the rotor4 codec.
+pub struct QuantRotorK4 {
+    /// Static rotor table for this layer/head.
+    pub rotors: Vec<f32>,
+    /// Static QJL projection matrix (None when QJL is disabled at first append).
+    pub qjl_s_matrix: Option<Vec<f32>>,
+    /// Accumulated per-token blocks.
+    pub blocks: Vec<RotorKBlocks>,
+    /// Accumulated shape `[B, kv_h, S_total, D]`.
+    pub shape: Vec<i32>,
+    /// Maximum sequence length the storage was provisioned for.
+    pub max_seq: i32,
+    /// Layer index used to seed the rotor table.
+    pub layer_idx: u32,
+    /// Head index (currently always 0).
+    pub head_idx: u32,
+    /// Bit-width tag (always [`ROTOR4_K_BITS`]).
+    pub bits: u8,
+}
+
+impl std::fmt::Debug for QuantRotorK4 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuantRotorK4")
+            .field("n_rotors", &(self.rotors.len() / 4))
+            .field("use_qjl", &self.qjl_s_matrix.is_some())
+            .field("n_blocks", &self.blocks.len())
+            .field("shape", &self.shape)
+            .field("max_seq", &self.max_seq)
+            .field("layer_idx", &self.layer_idx)
+            .field("head_idx", &self.head_idx)
+            .field("bits", &self.bits)
+            .finish()
+    }
+}
+
+impl QuantRotorK4 {
+    /// Construct an empty `QuantRotorK4`.
+    #[must_use]
+    pub fn new(init_shape: Vec<i32>, max_seq: i32, layer_idx: u32) -> Self {
+        Self {
+            rotors: Vec::new(),
+            qjl_s_matrix: None,
+            blocks: Vec::new(),
+            shape: init_shape,
+            max_seq,
+            layer_idx,
+            head_idx: 0,
+            bits: ROTOR4_K_BITS,
+        }
+    }
+
+    /// Build a `QuantRotorK4` from pre-computed CPU blocks (SSD hydrate path).
+    /// Takes `max_seq` explicitly — see [`QuantRotorK3::from_cpu_blocks`].
+    #[must_use]
+    pub fn from_cpu_blocks(
+        rotors: Vec<f32>,
+        qjl_s_matrix: Option<Vec<f32>>,
+        blocks: Vec<RotorKBlocks>,
+        shape: Vec<i32>,
+        max_seq: i32,
+        layer_idx: u32,
+    ) -> Self {
+        debug_assert!(
+            shape.len() == 4,
+            "QuantRotorK4::from_cpu_blocks expects a 4-element [B, kv_h, S, D] shape, got {shape:?}"
+        );
+        Self {
+            rotors,
+            qjl_s_matrix,
+            blocks,
+            shape,
+            max_seq,
+            layer_idx,
+            head_idx: 0,
+            bits: ROTOR4_K_BITS,
+        }
+    }
+
+    /// Append one K slice. See [`QuantRotorK3::append`] for the rotor-table /
+    /// QJL-projection lazy-init semantics.
+    ///
+    /// # Errors
+    /// Forwards any [`RotorQuantError`] from [`rotor4_k_encode`].
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "shape rank verified above (new_shape.len() != 4 guard) and by append caller contract [B, H, S, D]"
+    )]
+    pub fn append(&mut self, f32_data: &[f32], new_shape: &[i32]) -> Result<()> {
+        if new_shape.len() != 4 {
+            return Err(rmlx_core::error::Error::Mlx(format!(
+                "QuantRotorK4::append: expected 4D new_shape, got {new_shape:?}"
+            )));
+        }
+        let head_dim = new_shape[3] as usize;
+        let n_tokens_total =
+            (new_shape[0] as usize) * (new_shape[1] as usize) * (new_shape[2] as usize);
+
+        if self.rotors.is_empty() {
+            let n_groups = n_groups_for(head_dim);
+            self.rotors = make_rotor_table(self.layer_idx, self.head_idx, n_groups);
+            if crate::rotor_qjl::rotor_qjl_enabled() {
+                self.qjl_s_matrix = Some(make_qjl_projection(head_dim));
+            }
+        }
+
+        let (codes, scales, norms, qjl_codes, qjl_norms) = rotor4_k_encode(
+            f32_data,
+            &self.rotors,
+            head_dim,
+            self.qjl_s_matrix.as_deref(),
+        )
+        .map_err(|e: RotorQuantError| {
+            rmlx_core::error::Error::Mlx(format!("rotor4_k encode: {e}"))
+        })?;
+
+        self.blocks.push(RotorKBlocks {
+            codes,
+            scales,
+            norms,
+            qjl_codes,
+            qjl_norms,
+            n_tokens: n_tokens_total,
+        });
+
+        if self.shape.len() != 4 || self.shape[0] == 0 {
+            self.shape = new_shape.to_vec();
+        } else {
+            self.shape[2] += new_shape[2];
+        }
+        Ok(())
+    }
+
+    /// Reset the accumulated sequence to zero.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "shape.len() >= 4 checked immediately before indexing shape[2]"
+    )]
+    pub fn reset(&mut self) {
+        self.blocks.clear();
+        if self.shape.len() >= 4 {
+            self.shape[2] = 0;
+        }
+    }
+
+    /// Truncate the accumulated sequence to `n` tokens.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "shape.len() >= 4 checked immediately before indexing shape[2]"
+    )]
+    pub fn truncate_to(&mut self, n: i32) {
+        let n_usize = n.max(0) as usize;
+        let mut acc: usize = 0;
+        let mut keep = 0usize;
+        for (i, blk) in self.blocks.iter().enumerate() {
+            if acc + blk.n_tokens <= n_usize {
+                acc += blk.n_tokens;
+                keep = i + 1;
+            } else {
+                break;
+            }
+        }
+        self.blocks.truncate(keep);
+        if self.shape.len() >= 4 {
+            self.shape[2] = n;
+        }
+    }
+
+    /// Deep-clone.
+    ///
+    /// # Errors
+    /// Infallible on the CPU path; returns `Result` for parity.
+    pub fn try_deep_clone(&self) -> Result<Self> {
+        Ok(Self {
+            rotors: self.rotors.clone(),
+            qjl_s_matrix: self.qjl_s_matrix.clone(),
+            blocks: self.blocks.clone(),
+            shape: self.shape.clone(),
+            max_seq: self.max_seq,
+            layer_idx: self.layer_idx,
+            head_idx: self.head_idx,
+            bits: self.bits,
+        })
+    }
+
+    /// Approximate byte footprint.
+    #[must_use]
+    pub fn byte_size(&self) -> usize {
+        let mut total = self.rotors.len() * size_of::<f32>();
+        if let Some(s) = &self.qjl_s_matrix {
+            total += s.len() * size_of::<f32>();
+        }
+        for blk in &self.blocks {
+            total += blk.codes.len() * size_of::<u32>();
+            total += blk.scales.len() * size_of::<f32>();
+            total += blk.norms.len() * size_of::<f32>();
+            total += blk.qjl_codes.len();
+            total += blk.qjl_norms.len() * size_of::<f32>();
+        }
+        total
+    }
+
+    /// True when the QJL sideband is active.
+    #[must_use]
+    pub fn use_qjl(&self) -> bool {
+        self.qjl_s_matrix.is_some()
+    }
+
+    /// Dequantize all accumulated K slices.
+    ///
+    /// # Errors
+    /// Returns an `Error::Mlx` if [`rotor4_k_decode`] fails for any block.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "shape.len() != 4 early-return guard above ensures shape[3] is in-bounds"
+    )]
+    pub fn dequant(&self) -> Result<Vec<f32>> {
+        if self.shape.len() != 4 {
+            return Err(rmlx_core::error::Error::Mlx(format!(
+                "QuantRotorK4::dequant: malformed shape {:?}",
+                self.shape
+            )));
+        }
+        let head_dim = self.shape[3] as usize;
+        let total_elems: usize = self.shape.iter().map(|&d| d as usize).product();
+        let mut out: Vec<f32> = Vec::with_capacity(total_elems);
+
+        if self.blocks.is_empty() {
+            out.resize(total_elems, 0.0);
+            return Ok(out);
+        }
+
+        if self.rotors.is_empty() {
+            return Err(rmlx_core::error::Error::Mlx(
+                "QuantRotorK4::dequant: rotor table is empty but blocks were appended".into(),
+            ));
+        }
+
+        for blk in &self.blocks {
+            let dec = rotor4_k_decode(
+                &blk.codes,
+                &blk.scales,
+                &blk.norms,
+                &self.rotors,
+                head_dim,
+                &blk.qjl_codes,
+                &blk.qjl_norms,
+                self.qjl_s_matrix.as_deref(),
+            )
+            .map_err(|e: RotorQuantError| {
+                rmlx_core::error::Error::Mlx(format!("rotor4_k decode: {e}"))
+            })?;
+            out.extend_from_slice(&dec);
+        }
+        if out.len() < total_elems {
+            out.resize(total_elems, 0.0);
+        } else if out.len() > total_elems {
+            out.truncate(total_elems);
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+#[path = "quant_rotor_k4_tests.rs"]
+mod quant_rotor_k4_tests;
