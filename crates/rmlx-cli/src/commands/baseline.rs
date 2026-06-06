@@ -135,7 +135,8 @@ pub(crate) fn compute_phase_timing(
 /// Record a performance baseline for the given model snapshot.
 ///
 /// Steps:
-/// 1. Parse device, read prompt file, tokenize, truncate to MAX_PROMPT_TOKENS.
+/// 1. Parse device, read prompt file, tokenize, truncate to `max_prompt_tokens`
+///    (CLI-configurable; defaults to `MAX_PROMPT_TOKENS`).
 /// 2. `arch::load_model` -- capture `load_ms`.
 /// 3. `arch.generate_greedy` -- per-token `step_fn` callback captures wall-clock
 /// so prefill (TTFT) and steady-state decode are timed SEPARATELY.
@@ -157,6 +158,7 @@ pub(crate) fn run_baseline(
     prompt_label: &str,
     kv_quant_override: Option<rmlx_kv_quant::KvQuant>,
     max_ctx_override: Option<i32>,
+    max_prompt_tokens: usize,
     sink: &EventRecorder,
     record_args: Option<BaselineRecordArgs<'_>>,
 ) -> anyhow::Result<()> {
@@ -187,14 +189,14 @@ pub(crate) fn run_baseline(
 
     let mut prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
 
-    // Truncate to MAX_PROMPT_TOKENS (CPU forward time is O(N^2)).
-    if prompt_ids.len() > MAX_PROMPT_TOKENS {
+    // Truncate to `max_prompt_tokens` (CLI-configurable; CPU forward time is O(N^2)).
+    if prompt_ids.len() > max_prompt_tokens {
         warn!(
             original = prompt_ids.len(),
-            cap = MAX_PROMPT_TOKENS,
+            cap = max_prompt_tokens,
             "baseline: prompt truncated to cap"
         );
-        prompt_ids.truncate(MAX_PROMPT_TOKENS);
+        prompt_ids.truncate(max_prompt_tokens);
     }
     let prompt_token_count = prompt_ids.len();
 

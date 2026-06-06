@@ -402,6 +402,14 @@ pub(crate) fn resolve_kv_quant(
     final_kv_quant
 }
 
+/// Reject a zero `--max-prompt-tokens`; `truncate(0)` would empty the prompt.
+pub(crate) fn parse_max_prompt_tokens(v: usize) -> anyhow::Result<usize> {
+    if v == 0 {
+        return Err(anyhow::anyhow!("--max-prompt-tokens must be >= 1, got 0"));
+    }
+    Ok(v)
+}
+
 /// Parse the `--max-ctx` flag value into an optional `i32` override.
 ///
 /// `None` → no override (arch derives from `max_position_embeddings`, capped at 4096).
