@@ -327,8 +327,14 @@ impl Eagle3Drafter {
     }
 
     /// Reset the drafter's KV cache between generations.
-    pub fn reset(&mut self) {
-        self.cache = KvCache::with_quant(KvQuant::None);
+    ///
+    /// `max_seq` must cover the full generation horizon:
+    /// `prompt_len + max_new_tokens`. The drafter cache advances by
+    /// `accepted + 1` tokens per round; using `KV_MAX_SEQ_DEFAULT = 4096`
+    /// here would overflow on any prompt whose length + target exceeds 4096,
+    /// causing a silent MLX `slice_update` broadcast failure at the boundary.
+    pub fn reset(&mut self, max_seq: i32) {
+        self.cache = KvCache::with_quant_max_seq(KvQuant::None, max_seq);
     }
 
     /// Trained / configured block ceiling.
@@ -871,7 +877,13 @@ pub fn eagle3_generate_greedy(
         .map(|_| LinearAttnCache::new())
         .collect();
 
-    drafter.reset();
+    // Size the drafter KV cache to the verifier context limit
+    // (max_position_embeddings, capped to KV_MAX_SEQ_DEFAULT, or --max-ctx).
+    // This matches the verifier caches so the drafter cannot overflow before
+    // the verifier does — fixing the prior hardcoded 4096 that crashed once
+    // prompt + emitted tokens exceeded it (zero-length slice_update range in
+    // update_decode_fp16, broadcast-shape panic).
+    drafter.reset(max_seq);
 
     let mut total_draft = 0usize;
     let mut total_accept = 0usize;
