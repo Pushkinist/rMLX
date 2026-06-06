@@ -956,34 +956,49 @@ pub fn generate_greedy(
         let kv_snap: rmlx_core::error::Result<Vec<_>> =
             caches.iter().map(|c| c.try_deep_clone()).collect();
         if let Ok(kvs) = kv_snap {
-            PROMPT_CACHE.with_inner_mut(|guard| {
-                if let Some(cache) = guard.as_mut() {
-                    // salt the chained walk with the active layout_key so
-                    // an entry that later spills lands under the same `(hash,
-                    // layout_key)` row the hydrator will reconstruct. When
-                    // the SSD tier is OFF, `active_layout_key()` returns 0 and the
-                    // seed collapses to `FNV_OFFSET` — legacy un-salted digests.
-                    let lk = crate::gemma4::prompt_cache::active_layout_key();
-                    cache.push(Gemma4Entry {
-                        prompt_token_ids: prompt_ids.to_vec(),
-                        block_hashes: crate::prompt_cache::chained_block_hashes_seeded(
-                            prompt_ids,
-                            crate::prompt_cache::FNV_OFFSET ^ lk,
-                        ),
-                        kv_caches: kvs,
-                        first_id: last_id,
-                        first_piece: piece.clone(),
-                        kv_quant: Some(kv_quant),
+            // Materialize GPU arrays on the current inference thread before
+            // storing in the prompt cache.  Each spawn_blocking request runs
+            // on its own tokio thread with its own Metal GPU stream.  If these
+            // lazy arrays are evicted on a *different* inference thread later,
+            // that thread's eval_for_spill would fail with "There is no
+            // Stream(gpu, N) in current thread".  Pre-eval here makes eval()
+            // a no-op from any future thread.
+            // The drain thread's spill() refcount-clones these arrays (no new graph) and evals
+            // the clone, which shares the same buffers — so materializing here makes that eval a no-op.
+            match kvs.iter().try_for_each(|c| c.eval_for_spill()) {
+                Ok(()) => {
+                    PROMPT_CACHE.with_inner_mut(|guard| {
+                        if let Some(cache) = guard.as_mut() {
+                            // salt the chained walk with the active layout_key so
+                            // an entry that later spills lands under the same `(hash,
+                            // layout_key)` row the hydrator will reconstruct. When
+                            // the SSD tier is OFF, `active_layout_key()` returns 0 and the
+                            // seed collapses to `FNV_OFFSET` — legacy un-salted digests.
+                            let lk = crate::gemma4::prompt_cache::active_layout_key();
+                            cache.push(Gemma4Entry {
+                                prompt_token_ids: prompt_ids.to_vec(),
+                                block_hashes: crate::prompt_cache::chained_block_hashes_seeded(
+                                    prompt_ids,
+                                    crate::prompt_cache::FNV_OFFSET ^ lk,
+                                ),
+                                kv_caches: kvs,
+                                first_id: last_id,
+                                first_piece: piece.clone(),
+                                kv_quant: Some(kv_quant),
+                            });
+                            tracing::debug!(
+                                prompt_len = prompt_ids.len(),
+                                token_id = last_id,
+                                n_slots = cache.slots.len(),
+                                cache_path = if is_prefix { "prefix" } else { "miss" },
+                                "gemma4 generate_greedy: full-prompt snapshot saved"
+                            );
+                        }
                     });
-                    tracing::debug!(
-                        prompt_len = prompt_ids.len(),
-                        token_id = last_id,
-                        n_slots = cache.slots.len(),
-                        cache_path = if is_prefix { "prefix" } else { "miss" },
-                        "gemma4 generate_greedy: full-prompt snapshot saved"
-                    );
                 }
-            });
+                Err(e) => tracing::warn!(error = %e,
+                    "gemma4 generate_greedy: pre-eval of KV caches failed, skipping prompt cache store"),
+            }
         }
     }
 
