@@ -621,3 +621,91 @@ fn mismatch_only_at_bonus_full_pos_eq_n_draft() {
         "bonus mismatch must not influence full_pos (out of range)"
     );
 }
+
+// -----------------------------------------------------------------------
+// KV-cache sizing regression test.
+//
+// Guards the fix in `Eagle3Drafter::reset`: the drafter cache must be sized
+// to the verifier's context limit (max_seq), not a hardcoded 4096. Prior to
+// the fix, once prompt + emitted tokens exceeded 4096 the decode path hit a
+// zero-width `slice_update` range (prev_offset >= max_seq with a live
+// buffer), producing a broadcast-shape panic.
+// -----------------------------------------------------------------------
+
+/// Regression: a `KvCache` built via `KvCache::with_quant_max_seq(KvQuant::None, 8192)`
+/// must successfully process decode steps whose cumulative offset surpasses
+/// 4096 (the former hardcoded cap).
+///
+/// The test mirrors what `Eagle3Drafter::reset(max_seq)` does, then drives
+/// the same update path that crashed: prefill to 4090, then decode past 4096.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test tensors + KvCache are built by construction in this fn; the unwrapped Results are infallible by setup"
+)]
+fn eagle3_drafter_cache_sized_from_max_seq_decodes_past_4096() {
+    use rmlx_kv_quant::{KvCache, KvQuant};
+    use rmlx_mlx::{Array, Device, Dtype};
+
+    const B: i32 = 1;
+    const KV_H: i32 = 2;
+    const HEAD_DIM: i32 = 8;
+    // Prefill to just below 4096; decode steps will push offset above it.
+    const PREFILL_SEQ: i32 = 4090;
+    // Decode this many single-token steps — step 7 puts offset at 4097.
+    const DECODE_STEPS: i32 = 10;
+
+    let device = Device::Cpu;
+
+    // Build the cache the same way reset() does (KvQuant::None, max_seq=8192).
+    let mut cache = KvCache::with_quant_max_seq(KvQuant::None, 8192);
+
+    // Helper: allocate a tiny f32 array for K or V.
+    let make_arr = |seq: i32, fill: f32| -> Array {
+        let shape = [B, KV_H, seq, HEAD_DIM];
+        let n: usize = shape.iter().map(|&d| d as usize).product();
+        let data = vec![fill; n];
+        // SAFETY: f32 is 4-byte LE on Apple Silicon (CLAUDE.md hard rule 1).
+        let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), n * 4) };
+        Array::from_bytes(bytes, &shape, Dtype::F32).unwrap()
+    };
+
+    // Prefill phase: feed PREFILL_SEQ tokens.
+    cache.enter_prefill();
+    let k_pre = make_arr(PREFILL_SEQ, 0.1);
+    let v_pre = make_arr(PREFILL_SEQ, 0.2);
+    cache.update(&k_pre, &v_pre, device).unwrap();
+    cache.exit_prefill(device).unwrap();
+
+    assert_eq!(
+        cache.offset(),
+        PREFILL_SEQ,
+        "offset must equal PREFILL_SEQ after prefill"
+    );
+
+    // Decode phase: single-token steps. Each step increments offset by 1.
+    // Steps 1-6 stay at or below 4096; step 7 reaches 4097.
+    // With the old max_seq=4096 hardcode, step 7 panicked here.
+    for step in 1..=DECODE_STEPS {
+        let k_dec = make_arr(1, 0.01 * step as f32);
+        let v_dec = make_arr(1, 0.02 * step as f32);
+        cache.update(&k_dec, &v_dec, device).unwrap_or_else(|e| {
+            panic!(
+                "decode step {step} (offset {}) failed: {e}",
+                PREFILL_SEQ + step
+            )
+        });
+        assert_eq!(
+            cache.offset(),
+            PREFILL_SEQ + step,
+            "offset must advance by 1 each decode step"
+        );
+    }
+
+    // Final offset must be 4100 (4090 + 10), comfortably past 4096.
+    assert_eq!(
+        cache.offset(),
+        PREFILL_SEQ + DECODE_STEPS,
+        "cache must decode past 4096 without error"
+    );
+}
