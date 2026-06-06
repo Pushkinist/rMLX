@@ -1,0 +1,63 @@
+name: Bug report
+description: Something broke — wrong output, crash, load failure, perf regression.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. rMLX is Apple-Silicon-only — please confirm you're
+        on an M-series Mac. For security issues, **do not** file here; see
+        [SECURITY.md](../blob/main/SECURITY.md).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what you got.
+      placeholder: Loaded model X, sent request Y, got incoherent output / crash / …
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Exact command / request. Minimal is best.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model snapshot
+      description: e.g. mlx-community__gemma-4-e4b-it-mxfp8
+    validations:
+      required: true
+  - type: input
+    id: arch
+    attributes:
+      label: Architecture
+      description: From config.json, e.g. Gemma4ForConditionalGeneration
+  - type: input
+    id: quant
+    attributes:
+      label: Weight / KV quant
+      description: e.g. mxfp8 weights, K8V8 KV
+  - type: input
+    id: version
+    attributes:
+      label: rMLX version / commit
+      description: "`rmlx --version` or git SHA"
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version + chip
+      description: e.g. macOS 15.4, M3 Max, 64 GB
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: From .rmlx/logs/. Run with --log debug if useful.
+      render: shell

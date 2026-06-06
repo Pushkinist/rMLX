@@ -1,0 +1,28 @@
+name: Feature / model request
+description: A new model arch, quant format, API surface, or capability.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Keep scope in mind: rMLX is Apple-Silicon, no-Python, MLX-format only.
+        Not in scope: GGUF, training / fine-tune, non-Apple backends.
+  - type: textarea
+    id: request
+    attributes:
+      label: What would you like
+      description: The capability, model arch, or quant format.
+    validations:
+      required: true
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Why
+      description: Use case. What does it unblock?
+    validations:
+      required: true
+  - type: input
+    id: refs
+    attributes:
+      label: References
+      description: Model card, paper, upstream impl, mlx-lm reference, etc.
