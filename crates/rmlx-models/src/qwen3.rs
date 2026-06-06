@@ -2456,41 +2456,57 @@ pub fn generate_greedy(
         let cloned_caches: Result<Vec<KvCache>> =
             caches.iter().map(|c| c.try_deep_clone()).collect();
         if let Ok(kv_snapshot) = cloned_caches {
-            // salt chained walk with the active layout_key. When tier
-            // is OFF, `active_layout_key()` returns 0 ⇒ legacy un-salted.
-            let lk = qwen3_active_layout_key();
-            let block_hashes = chained_block_hashes_seeded(prompt_ids, FNV_OFFSET ^ lk);
-            // Capture the first-token logprobs at the OpenAI ceiling so
-            // a later exact-hit replays a true logprob (truncated to its own
-            // `top_logprobs_k`) regardless of whether THIS request asked for
-            // logprobs. `logits_flat` is already host-evaluated above; this is
-            // one extra host log-softmax + top-k per cache store (per unique
-            // prompt), not per token.
-            let first_logprobs = capture_logprobs(&logits_flat, &top, PROMPT_CACHE_LOGPROBS_K);
-            let entry = Qwen3Entry {
-                prompt_token_ids: prompt_ids.to_vec(),
-                block_hashes,
-                kv_caches: kv_snapshot,
-                first_id: last_id,
-                first_piece: tokenizer
-                    .id_to_token(last_id)
-                    .unwrap_or_else(|| format!("<unk:{last_id}>")),
-                first_logprobs,
-                kv_quant: Some(kv_quant),
-            };
-            QWEN3_PROMPT_CACHE.with_inner_mut(|guard| {
-                if let Some(cache) = guard.as_mut() {
-                    cache.push(entry);
-                    let stats = cache.stats();
-                    tracing::debug!(
-                        prompt_len = prompt_ids.len(),
-                        cache_hits = stats.hits,
-                        cache_misses = stats.misses,
-                        cache_bytes = stats.bytes,
-                        "qwen3 generate_greedy: pushed snapshot to prompt cache (miss path)"
-                    );
+            // Materialize GPU arrays on the current inference thread before
+            // storing in the prompt cache.  Each spawn_blocking request runs
+            // on its own tokio thread with its own Metal GPU stream.  If these
+            // lazy arrays are evicted on a *different* inference thread later,
+            // that thread's eval_for_spill would fail with "There is no
+            // Stream(gpu, N) in current thread".  Pre-eval here makes eval()
+            // a no-op from any future thread.
+            // The drain thread's spill() refcount-clones these arrays (no new graph) and evals
+            // the clone, which shares the same buffers — so materializing here makes that eval a no-op.
+            match kv_snapshot.iter().try_for_each(|c| c.eval_for_spill()) {
+                Ok(()) => {
+                    // salt chained walk with the active layout_key. When tier
+                    // is OFF, `active_layout_key()` returns 0 ⇒ legacy un-salted.
+                    let lk = qwen3_active_layout_key();
+                    let block_hashes = chained_block_hashes_seeded(prompt_ids, FNV_OFFSET ^ lk);
+                    // Capture the first-token logprobs at the OpenAI ceiling so
+                    // a later exact-hit replays a true logprob (truncated to its own
+                    // `top_logprobs_k`) regardless of whether THIS request asked for
+                    // logprobs. `logits_flat` is already host-evaluated above; this is
+                    // one extra host log-softmax + top-k per cache store (per unique
+                    // prompt), not per token.
+                    let first_logprobs =
+                        capture_logprobs(&logits_flat, &top, PROMPT_CACHE_LOGPROBS_K);
+                    let entry = Qwen3Entry {
+                        prompt_token_ids: prompt_ids.to_vec(),
+                        block_hashes,
+                        kv_caches: kv_snapshot,
+                        first_id: last_id,
+                        first_piece: tokenizer
+                            .id_to_token(last_id)
+                            .unwrap_or_else(|| format!("<unk:{last_id}>")),
+                        first_logprobs,
+                        kv_quant: Some(kv_quant),
+                    };
+                    QWEN3_PROMPT_CACHE.with_inner_mut(|guard| {
+                        if let Some(cache) = guard.as_mut() {
+                            cache.push(entry);
+                            let stats = cache.stats();
+                            tracing::debug!(
+                                prompt_len = prompt_ids.len(),
+                                cache_hits = stats.hits,
+                                cache_misses = stats.misses,
+                                cache_bytes = stats.bytes,
+                                "qwen3 generate_greedy: pushed snapshot to prompt cache (miss path)"
+                            );
+                        }
+                    });
                 }
-            });
+                Err(e) => tracing::warn!(error = %e,
+                    "qwen3 generate_greedy: pre-eval of KV caches failed, skipping prompt cache store"),
+            }
         }
     }
 
