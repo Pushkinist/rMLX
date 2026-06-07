@@ -216,8 +216,9 @@ The codec partitioning that #26 added to the **RAM** prompt cache
 (`KvQuant::cache_key_salt()` XOR'd into the block-hash seed) composes correctly
 with `layout_key`: on an SSD-active run the seed mixes both, so RAM slots are
 codec-partitioned even though the SSD tier itself remains single-codec for the
-resident lifetime. A live SSD reconfiguration is a well-scoped follow-up:
-per-namespace tier teardown/attach driven by a control-plane setter.
+resident lifetime. A live SSD reconfiguration is a well-scoped follow-up
+(tracked in issue #30): per-namespace tier teardown/attach driven by a
+control-plane drain+reattach setter.
 
 ---
 
