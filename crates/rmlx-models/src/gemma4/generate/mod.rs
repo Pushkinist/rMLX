@@ -167,19 +167,29 @@ pub fn generate_greedy(
     // image prompts bypass the prompt cache. The cached K/V is keyed by
     // token ids only; an image prompt's K/V depends on the scattered vision
     // features, so it must never be reused for (or saved under) a token-id key.
+    // Issue #26: codec-partitioned prompt-cache key. The query digest stream is
+    // salted by `FNV_OFFSET ^ layout_key ^ codec_salt(kv_quant)` — identical to
+    // the push seed below — so a slot stored under a different KV codec never
+    // matches this request (no cross-codec serve), and codecs coexist as
+    // distinct slots rather than thrash-evicting one another. On a single-codec
+    // RAM-only run (layout_key=0, constant codec) this is byte-identical to the
+    // legacy un-salted stream for this codec.
+    let cache_seed = crate::prompt_cache::FNV_OFFSET
+        ^ crate::gemma4::prompt_cache::active_layout_key()
+        ^ kv_quant.cache_key_salt();
     let lookup: CacheLookup = if image_prefill.is_some() {
         CacheLookup::Miss
     } else {
         PROMPT_CACHE.with_inner_mut(|guard| {
             let cache = guard.as_mut().unwrap();
-            let mut raw_match = cache.find_best_prefix(prompt_ids);
+            let mut raw_match = cache.find_best_prefix(prompt_ids, cache_seed);
             // on a RAM miss, try to serve the longest cached block-aligned
             // prefix from the SSD tier (no-op when no SSD source is attached —
             // tier OFF). A hydrate hit promotes the block into RAM; re-run
             // find_best_prefix so the promoted slot is matched (and quant-checked)
             // by the normal path below.
             if raw_match.is_none() && cache.hydrate_from_ssd(prompt_ids).is_some() {
-                raw_match = cache.find_best_prefix(prompt_ids);
+                raw_match = cache.find_best_prefix(prompt_ids, cache_seed);
             }
             // Plan §D8 / Task 11.5: the snapshot is only safe to reuse when the
             // stored `KvQuant` discriminant matches the runtime quant for this
@@ -974,12 +984,19 @@ pub fn generate_greedy(
                             // layout_key)` row the hydrator will reconstruct. When
                             // the SSD tier is OFF, `active_layout_key()` returns 0 and the
                             // seed collapses to `FNV_OFFSET` — legacy un-salted digests.
+                            // Issue #26: salt the stored digest stream by the
+                            // active KV codec too, so the push seed matches the
+                            // codec-partitioned query seed in `find_best_prefix`
+                            // above. Stacks with `layout_key` (XOR) exactly like
+                            // the SSD-tier salt.
                             let lk = crate::gemma4::prompt_cache::active_layout_key();
                             cache.push(Gemma4Entry {
                                 prompt_token_ids: prompt_ids.to_vec(),
                                 block_hashes: crate::prompt_cache::chained_block_hashes_seeded(
                                     prompt_ids,
-                                    crate::prompt_cache::FNV_OFFSET ^ lk,
+                                    crate::prompt_cache::FNV_OFFSET
+                                        ^ lk
+                                        ^ kv_quant.cache_key_salt(),
                                 ),
                                 kv_caches: kvs,
                                 first_id: last_id,

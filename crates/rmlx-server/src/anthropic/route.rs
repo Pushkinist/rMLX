@@ -538,6 +538,10 @@ pub(crate) async fn messages(
         thinking_end_token: None,
         // C5 Slice A: set below, after FIFO admission acquires the permit.
         gpu_admission: None,
+        // Issue #26: the Anthropic Messages surface does not expose per-request
+        // KV-config overrides (stricter wire spec); always launch default here.
+        kv_quant_override: None,
+        max_ctx_override: None,
         // Anthropic route has no multimodal content-part extraction yet.
         images: vec![],
         audio_b64: vec![],

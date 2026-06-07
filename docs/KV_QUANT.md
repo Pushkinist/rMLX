@@ -120,6 +120,20 @@ of the active `KvQuant`: they use `RotatingState` (a ring-buffer bf16 path
 ported from mlx-lm's `RotatingKVCache`). `mlx-lm.to_quantized` raises
 `NotImplementedError` for rotating caches; rMLX matches that behaviour.
 
+### Per-request hot-swap (issue #26)
+
+The `KvQuant` for a request is **not** tied to the model load. A running
+`rmlx serve` accepts a per-request `kv_quant` field (OpenAI route) that selects
+the codec for that one request — weights stay resident, only the KV cache is
+rebuilt. This means one resident model can serve `none`, `k8v4`, `k8v8`, … back
+to back with no reload. The override threads down to the same per-request cache
+builder the per-ctx `auto` policy already used; absent → launch `--kv-quant`.
+
+The prompt/prefix cache is **partitioned by codec** so a switch can never serve
+mismatched cached K/V — `KvQuant::cache_key_salt()` is XOR'd into the
+block-hash seed alongside the SSD `layout_key`. See `docs/PROMPT_CACHE.md`
+§ "Codec namespacing" and `docs/SERVER.md` § "Per-request KV-config hot-swap".
+
 ---
 
 ## Storage variants — summary table

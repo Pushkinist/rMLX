@@ -153,3 +153,72 @@ fn rotk_cli_form_parses() {
     // And the Display round-trip.
     assert_eq!(q.to_string(), "rot_k_v4g64");
 }
+
+/// Issue #26: `cache_key_salt` must be collision-free across distinct codecs so
+/// the codec-partitioned prompt-cache key never conflates two codecs. Two
+/// distinct `KvQuant` values (including payload-bearing variants that differ
+/// only by bit-width / group size) must produce distinct salts; the same value
+/// must produce the same salt (determinism).
+#[test]
+fn cache_key_salt_is_unique_and_deterministic() {
+    let cases: &[KvQuant] = &[
+        KvQuant::None,
+        KvQuant::K8V4,
+        KvQuant::K8V8,
+        KvQuant::Planar,
+        KvQuant::K8VTurbo3,
+        KvQuant::Mixed {
+            k_bits: 8,
+            v_bits: 4,
+            k_group_size: 64,
+            v_group_size: 64,
+        },
+        KvQuant::Mixed {
+            k_bits: 8,
+            v_bits: 8,
+            k_group_size: 128,
+            v_group_size: 128,
+        },
+        KvQuant::RotK {
+            v_bits: 4,
+            v_group_size: 64,
+        },
+        KvQuant::RotorK3Asym {
+            v_bits: 4,
+            v_group_size: 64,
+        },
+    ];
+    // Determinism: same value → same salt.
+    for &q in cases {
+        assert_eq!(
+            q.cache_key_salt(),
+            q.cache_key_salt(),
+            "{q:?} cache_key_salt must be deterministic"
+        );
+    }
+    // Uniqueness: every distinct pair must differ.
+    for (i, &a) in cases.iter().enumerate() {
+        for &b in &cases[i + 1..] {
+            assert_ne!(
+                a.cache_key_salt(),
+                b.cache_key_salt(),
+                "{a:?} and {b:?} must have distinct cache_key_salts (codec partitioning)"
+            );
+        }
+    }
+    // The two Mixed variants above differ only by bit-width/group size — their
+    // salts must still diverge (payload is part of the codec identity).
+    let m1 = KvQuant::Mixed {
+        k_bits: 8,
+        v_bits: 4,
+        k_group_size: 64,
+        v_group_size: 64,
+    };
+    let m2 = KvQuant::Mixed {
+        k_bits: 8,
+        v_bits: 8,
+        k_group_size: 128,
+        v_group_size: 128,
+    };
+    assert_ne!(m1.cache_key_salt(), m2.cache_key_salt());
+}

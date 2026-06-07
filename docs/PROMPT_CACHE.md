@@ -94,6 +94,38 @@ is retained for tests and for backward-compat verification.
 The SSD index also stores `(hash, layout_key)` as a composite primary key,
 providing defence-in-depth against hash collisions across layouts.
 
+### Codec namespacing (issue #26)
+
+A single resident model can serve requests under **different KV codecs**
+(per-request `kv_quant` hot-swap, no weight reload — see `docs/SERVER.md`).
+Because cached K/V bytes are codec-specific, a prefix cached under `none` (bf16)
+**must not** serve a `k8v4` request. The block-hash seed therefore folds in a
+per-codec salt as well:
+
+```
+seed = FNV_OFFSET ^ layout_key ^ kv_quant.cache_key_salt()
+```
+
+`KvQuant::cache_key_salt()` is a stable FNV-1a-64 hash over the codec's
+canonical `Display` string (`"none"`, `"k8v4"`, `"mixed_k8g64_v4g64"`, …), so it
+covers every variant including payload-bearing ones (`Mixed`, `RotK`,
+`RotorK*Asym`). Both the push side (storing a slot) and the
+[`find_best_prefix`](#find_best_prefix-lookup) query side salt with the same
+value, so two requests with identical tokens but different codecs produce
+**disjoint digest streams** and occupy **distinct cache slots**. A codec switch
+is a clean cross-codec miss — the other codec's slot survives and is reusable
+again under its own codec, rather than being thrash-evicted.
+
+On a single-codec RAM-only run (`layout_key = 0`, constant codec) the salt is a
+constant XOR for every request, so hit/miss behaviour is identical to the legacy
+stream for that codec — zero regression.
+
+> The SSD `layout_key` already mixes `kv_quant` into its hash, so on an
+> SSD-active run the codec is salted twice (`layout_key` *and*
+> `cache_key_salt`); the extra XOR is harmless (still a deterministic salt) and
+> keeps the RAM-only path correct, where `layout_key = 0` would otherwise leave
+> the codec un-partitioned.
+
 ---
 
 ## Per-arch caches
@@ -180,10 +212,16 @@ re-installed from the recorded `attach` params.
 ## `find_best_prefix` lookup
 
 ```
-find_best_prefix(prompt_ids) -> Option<(slot_index, matched_blocks)>
+find_best_prefix(prompt_ids, seed) -> Option<(slot_index, matched_blocks)>
 ```
 
-1. Compute chained block hashes for `prompt_ids`.
+The `seed` (issue #26) is the `FNV_OFFSET ^ layout_key ^ codec_salt` the caller
+also uses on the push side, so the query digest stream partitions by
+`(layout, codec)` — a slot stored under a different KV codec or SSD layout never
+matches. Pass the bare `FNV_OFFSET` for the legacy un-salted stream (RAM-only,
+single-codec, `layout_key = 0`).
+
+1. Compute chained block hashes for `prompt_ids` using `seed`.
 2. Scan all slots (Linear path) or query the radix tree (Radix path).
 3. For each slot count how many leading block digests match.
 4. Return `Some((best_slot_index, best_block_count))` where

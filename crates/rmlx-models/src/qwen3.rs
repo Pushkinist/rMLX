@@ -1936,14 +1936,19 @@ pub fn generate_greedy(
         "qwen3 ArchPromptCache must use ReusePolicy::ExactOnly",
     );
 
+    // Issue #26: codec-partitioned prompt-cache key — see gemma4/generate/mod.rs
+    // for the full rationale. The query digest stream is salted by
+    // `FNV_OFFSET ^ layout_key ^ codec_salt(kv_quant)` (matches the push seed),
+    // so a slot stored under a different KV codec never cross-serves.
+    let cache_seed = FNV_OFFSET ^ qwen3_active_layout_key() ^ kv_quant.cache_key_salt();
     let lookup: CacheLookup = QWEN3_PROMPT_CACHE.with_inner_mut(|guard| {
         let cache = guard.as_mut().unwrap();
-        let mut raw_match = cache.find_best_prefix(prompt_ids);
+        let mut raw_match = cache.find_best_prefix(prompt_ids, cache_seed);
         // on a RAM miss, try the SSD tier (no-op when no source attached
         // — tier OFF). A hit promotes the block into RAM; re-run find_best_prefix
         // so the promoted slot is matched + quant-checked by the path below.
         if raw_match.is_none() && cache.hydrate_from_ssd(prompt_ids).is_some() {
-            raw_match = cache.find_best_prefix(prompt_ids);
+            raw_match = cache.find_best_prefix(prompt_ids, cache_seed);
         }
         // Plan §D8 / Task 11.5: stored `KvQuant` must match runtime; on
         // mismatch evict + warn + degrade to Miss. See `gemma4/generate.rs`
@@ -2476,10 +2481,14 @@ pub fn generate_greedy(
             // the clone, which shares the same buffers — so materializing here makes that eval a no-op.
             match kv_snapshot.iter().try_for_each(|c| c.eval_for_spill()) {
                 Ok(()) => {
-                    // salt chained walk with the active layout_key. When tier
-                    // is OFF, `active_layout_key()` returns 0 ⇒ legacy un-salted.
+                    // salt chained walk with the active layout_key + KV codec
+                    // (issue #26). When tier is OFF and the codec is constant,
+                    // this is the legacy stream for that codec.
                     let lk = qwen3_active_layout_key();
-                    let block_hashes = chained_block_hashes_seeded(prompt_ids, FNV_OFFSET ^ lk);
+                    let block_hashes = chained_block_hashes_seeded(
+                        prompt_ids,
+                        FNV_OFFSET ^ lk ^ kv_quant.cache_key_salt(),
+                    );
                     // Capture the first-token logprobs at the OpenAI ceiling so
                     // a later exact-hit replays a true logprob (truncated to its own
                     // `top_logprobs_k`) regardless of whether THIS request asked for

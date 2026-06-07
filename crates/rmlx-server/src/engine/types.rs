@@ -407,6 +407,20 @@ pub struct GenerationRequest {
     /// unit-test / non-route paths that never went through admission.
     pub gpu_admission: Option<GpuAdmission>,
 
+    /// Issue #26: per-request KV-quant codec override. `Some(q)` switches the
+    /// per-request cache builder to codec `q` on the resident model (no weight
+    /// reload); `None` falls through to the generator's launch default
+    /// (`--kv-quant`, or the auto per-ctx policy). The prefix/prompt cache key
+    /// is namespaced by codec, so a `none`-codec cached prefix never serves a
+    /// quantized-KV request and vice-versa.
+    pub kv_quant_override: Option<rmlx_kv_quant::KvQuant>,
+
+    /// Issue #26: per-request max-context ceiling override. `Some(n)` re-sizes
+    /// the KV-ring virtual ceiling for this request only (the ring still grows
+    /// lazily, #25); `None` uses the generator's launch `--max-ctx`. No weight
+    /// touch — a ring realloc only.
+    pub max_ctx_override: Option<i32>,
+
     // multimodal content parts extracted from `user` message Parts.
     // will pass these into the vision/audio towers. The decode loop
     // currently ignores them — text-only requests stay byte-identical.

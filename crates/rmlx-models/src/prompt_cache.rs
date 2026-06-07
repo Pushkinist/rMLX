@@ -62,9 +62,12 @@ use rmlx_kv_ssd::{SsdHydrator, SsdSpiller};
 // every in-crate `crate::prompt_cache::FNV_OFFSET` / `BLOCK_TOKENS` /
 // `chained_block_hashes_seeded` / `SsdHydrate` import path byte-identically.
 pub(crate) use rmlx_kv_ssd::{
-    chained_block_hashes, chained_block_hashes_seeded, SsdHydrate, BLOCK_TOKENS, FNV_OFFSET,
-    FNV_PRIME,
+    chained_block_hashes_seeded, SsdHydrate, BLOCK_TOKENS, FNV_OFFSET, FNV_PRIME,
 };
+// `chained_block_hashes` (the un-seeded form) is no longer used by this module
+// directly — `find_best_prefix` now always salts with a caller-supplied seed
+// (issue #26). It is still consumed by sibling `#[path]` test modules and by
+// `gemma4::prompt_cache`, which import it directly from `rmlx_kv_ssd`.
 
 /// Default RAM cap for the prompt cache (2 GiB).
 pub(crate) const DEFAULT_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -471,8 +474,19 @@ impl<E: PromptCacheEntry> PromptCache<E> {
         clippy::indexing_slicing,
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
     )]
-    pub(crate) fn find_best_prefix(&mut self, prompt_ids: &[u32]) -> Option<(usize, usize)> {
-        let want = chained_block_hashes(prompt_ids);
+    pub(crate) fn find_best_prefix(
+        &mut self,
+        prompt_ids: &[u32],
+        seed: u64,
+    ) -> Option<(usize, usize)> {
+        // Issue #26: `seed` salts the query digest stream so it partitions by
+        // the same `(layout_key, codec)` the push side seeds with. Different
+        // KV codecs (or SSD layouts) for the same tokens produce disjoint
+        // digest streams and never match each other's slots — the codec
+        // namespacing that lets a resident model serve multiple KV codecs
+        // without cross-serving cached KV. Pass `FNV_OFFSET` for the legacy
+        // un-salted stream (RAM-only, single-codec, layout_key=0).
+        let want = chained_block_hashes_seeded(prompt_ids, seed);
 
         let (best_idx, best_blocks) = match self.prefix_index_kind {
             // Linear path is byte-identical to the pre-scan;

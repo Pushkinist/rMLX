@@ -196,6 +196,29 @@ under one KV layout cannot collide with the same block cached under another.
 `layout_key`) at `attach_at_load` before the index is opened, so operators can
 correlate log rows with the active layout during debugging.
 
+## Live reconfiguration (deferred — issue #26)
+
+Issue #26 makes the KV **codec** and **context ceiling** per-request hot-swappable
+on a resident model (see `docs/SERVER.md` § "Per-request KV-config hot-swap").
+The SSD tier is **deliberately excluded** from that per-request surface and stays
+launch-fixed (`--kv-ssd-cache-gb`, attached once at `attach_at_load`).
+
+**Why deferred.** The tier is wired into the prompt cache via a per-namespace
+spiller + hydrator keyed by `(namespace, layout_key)`, opened against an on-disk
+`ssd_index` and `.kvb` block files at load. A per-request SSD toggle would need
+to tear down and re-attach that per-namespace tier (close/reopen the index,
+respawn the spiller, re-key the hydrator) mid-flight — architecturally heavy and
+orthogonal to the read-only-weights insight that makes codec/ctx hot-swap cheap.
+The per-request codec/ctx override delivers the issue's core benefit (resident
+multi-KV sweeps, per-request KV policy) without it.
+
+The codec partitioning that #26 added to the **RAM** prompt cache
+(`KvQuant::cache_key_salt()` XOR'd into the block-hash seed) composes correctly
+with `layout_key`: on an SSD-active run the seed mixes both, so RAM slots are
+codec-partitioned even though the SSD tier itself remains single-codec for the
+resident lifetime. A live SSD reconfiguration is a well-scoped follow-up:
+per-namespace tier teardown/attach driven by a control-plane setter.
+
 ---
 
 ## Hydrate Path (RAM Miss → SSD Load → Promote)
