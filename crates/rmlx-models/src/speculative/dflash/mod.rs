@@ -944,18 +944,16 @@ pub fn dflash_generate_greedy(
         block_size = block_total,
         "dflash_generate_greedy: done"
     );
-    if std::env::var("RMLX_DFLASH_DEBUG").is_ok() {
-        tracing::debug!(
-            rounds,
-            emitted = emitted.len(),
-            total_draft,
-            total_accept,
-            accept_rate,
-            decode_tps,
-            elapsed_ms,
-            "[dflash] debug summary"
-        );
-    }
+    tracing::debug!(
+        rounds,
+        emitted = emitted.len(),
+        total_draft,
+        total_accept,
+        accept_rate,
+        decode_tps,
+        elapsed_ms,
+        "[dflash] debug summary"
+    );
     Ok(emitted)
 }
 

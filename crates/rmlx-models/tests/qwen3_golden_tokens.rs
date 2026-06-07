@@ -92,7 +92,8 @@ fn thinking_budget_exact_hit_qwen3_5_moe() {
     const N_TOKENS: usize = 16; // total decode budget; must be > N_THINKING + 1
 
     let device = Device::Gpu;
-    let model = arch::load_model(&model_path, device).expect("load model");
+    let model =
+        arch::load_model(&model_path, device, &arch::LoadOpts::default()).expect("load model");
 
     let tk_path = model_path.join("tokenizer.json");
     let tokenizer = tokenizers::Tokenizer::from_file(&tk_path).expect("load tokenizer");

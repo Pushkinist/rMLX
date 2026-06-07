@@ -552,10 +552,10 @@ pub struct AppState {
     /// Optional metrics sink. `None` in unit tests; `Some` in production runs.
     pub metrics: Option<Arc<EventRecorder>>,
     /// Server-startup keep-alive policy applied to every freshly
-    /// loaded model (overridable by `RMLX_KEEP_ALIVE` env at startup and by
-    /// the per-request `keep_alive` field on native routes). When this is
-    /// `KeepAlivePolicy::Pin` no timer is armed and the model stays
-    /// resident until the process exits or it is explicitly unloaded.
+    /// loaded model (overridable by the per-request `keep_alive` field on
+    /// native routes). When this is `KeepAlivePolicy::Pin` no timer is armed
+    /// and the model stays resident until the process exits or it is
+    /// explicitly unloaded.
     ///
     /// Default (when no CLI flag, env var, or request field is set): 15 min.
     /// CLI: `--idle-timeout-secs` (accepts `0` / `-1` / `30s` / `15m` / `2h`).

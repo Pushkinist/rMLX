@@ -75,7 +75,7 @@ xcrun xctrace record \
 
 Output: `.trace` package. Open with Instruments.app.
 
-Metal System Trace (GPU kernel timings — requires `RMLX_METAL_CAPTURE` path, see §5):
+Metal System Trace (GPU kernel timings, see §5):
 ```bash
 xcrun xctrace record \
   --template 'Metal System Trace' \
@@ -142,7 +142,7 @@ Safe wrappers are not yet exposed in `rmlx-mlx::lib`. When needed (Stage 1.4+):
 
 1. Add `pub fn metal_start_capture(path: &Path) -> Result<()>` in `rmlx-mlx/src/lib.rs`
    calling `sys::mlx_metal_start_capture(c_path_ptr)`.
-2. Gate on `RMLX_METAL_CAPTURE=/path/to.gputrace` env var checked at engine boot
+2. Gate on a CLI flag or dedicated env var checked at engine boot
    (`engine.rs` or `baseline.rs`).
 3. Open `.gputrace` in Instruments → Metal System Trace.
 

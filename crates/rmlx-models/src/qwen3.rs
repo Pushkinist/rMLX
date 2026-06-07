@@ -633,6 +633,33 @@ fn qwen_embedding_lookup(
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
+// YarnOverride
+// ---------------------------------------------------------------------------
+
+/// Runtime YARN RoPE override for Qwen3 models that lack `rope_scaling` in
+/// their `config.json` but need context extension.
+///
+/// Passed through `ModelLoadConfig` → `load_from_path` →
+/// `Qwen3Config::from_model_config`. When `Some`, it is tried as a fallback
+/// after the JSON-parsed `rope_scaling` path; the JSON path always wins when
+/// present.
+///
+/// Set via `--yarn-factor` / `--yarn-original-max` CLI flags
+/// (env: `RMLX_YARN_FACTOR` / `RMLX_YARN_ORIGINAL_MAX`).
+#[derive(Debug, Clone, Copy)]
+#[allow(
+    clippy::exhaustive_structs,
+    reason = "two fields are the complete YARN-override contract; adding a field requires updating all construction sites and the CLI binding"
+)]
+pub struct YarnOverride {
+    /// YARN scale factor (must be > 1.0 to activate).
+    pub factor: f32,
+    /// Original max position embeddings before YARN extension.
+    /// When 0.0, the model's `max_position_embeddings` is used as the fallback.
+    pub original_max: f32,
+}
+
+// ---------------------------------------------------------------------------
 
 /// Subset of config.json fields for the Qwen3 forward pass.
 ///
@@ -682,7 +709,14 @@ pub struct Qwen3Config {
 
 impl Qwen3Config {
     /// Parse from a [`rmlx_loader::ModelConfig`] loaded from `config.json`.
-    pub fn from_model_config(cfg: &rmlx_loader::ModelConfig) -> Result<Self> {
+    ///
+    /// `yarn_override` provides a runtime YARN config for models whose
+    /// `config.json` lacks `rope_scaling`. When `None`, only the JSON-parsed
+    /// path is active. JSON-parsed YARN always takes precedence over the override.
+    pub fn from_model_config(
+        cfg: &rmlx_loader::ModelConfig,
+        yarn_override: Option<&YarnOverride>,
+    ) -> Result<Self> {
         let e = &cfg.extras;
 
         let hidden_size = e
@@ -760,46 +794,20 @@ impl Qwen3Config {
         // `yarn = None` and use the plain `rope_theta`-only path
         // (byte-identical to develop tip).
         //
-        // Env-var override path: for Qwen3 models that lack
-        // `rope_scaling` in config.json but want context extension, set
-        //   RMLX_YARN_FACTOR=<f> RMLX_YARN_ORIGINAL_MAX=<u>
-        // before model load. Synthesises a YarnConfig with the paper defaults
-        // (`beta_fast=32, beta_slow=1`). Falls back to JSON-parsed YARN when
-        // both env vars are unset, preserving byte-identical develop behavior
-        // for every code path that does not opt in.
+        // Runtime override path: for Qwen3 models that lack `rope_scaling` in
+        // config.json but want context extension, pass a `YarnOverride` via
+        // `--yarn-factor` / `--yarn-original-max` CLI flags. JSON-parsed YARN
+        // always takes precedence over the runtime override.
         let yarn = e
             .get("rope_scaling")
             .and_then(crate::rope::YarnConfig::from_extras)
             .or_else(|| {
-                // Warn on parse failure so
-                // operator typos don't silently degrade to non-YARN at 32k.
-                let factor: f32 = match std::env::var("RMLX_YARN_FACTOR") {
-                    Err(_) => return None,
-                    Ok(raw) => match raw.parse() {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::warn!(
-                                raw = %raw,
-                                error = %e,
-                                "qwen3: RMLX_YARN_FACTOR parse failed; ignoring env override"
-                            );
-                            return None;
-                        }
-                    },
-                };
-                let original: f32 = match std::env::var("RMLX_YARN_ORIGINAL_MAX") {
-                    Err(_) => max_position_embeddings as f32,
-                    Ok(raw) => match raw.parse() {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::warn!(
-                                raw = %raw,
-                                error = %e,
-                                "qwen3: RMLX_YARN_ORIGINAL_MAX parse failed; ignoring env override"
-                            );
-                            return None;
-                        }
-                    },
+                let ov = yarn_override?;
+                let factor = ov.factor;
+                let original = if ov.original_max > 0.0 {
+                    ov.original_max
+                } else {
+                    max_position_embeddings as f32
                 };
                 if factor <= 1.0 || original <= 0.0 {
                     return None;
@@ -2802,9 +2810,12 @@ pub fn generate_greedy(
 // ---------------------------------------------------------------------------
 
 /// Load a Qwen3 model from a snapshot directory.
-pub fn load_from_path(model_dir: &Path) -> Result<Qwen3Text> {
+///
+/// `yarn_override` provides a runtime YARN config for models whose
+/// `config.json` lacks `rope_scaling`. See [`YarnOverride`].
+pub fn load_from_path(model_dir: &Path, yarn_override: Option<&YarnOverride>) -> Result<Qwen3Text> {
     let cfg_raw = load_config(model_dir)?;
-    let cfg = Qwen3Config::from_model_config(&cfg_raw)?;
+    let cfg = Qwen3Config::from_model_config(&cfg_raw, yarn_override)?;
 
     info!(
         num_hidden_layers = cfg.num_hidden_layers,

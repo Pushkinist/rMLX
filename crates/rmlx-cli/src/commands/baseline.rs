@@ -159,6 +159,7 @@ pub(crate) fn run_baseline(
     kv_quant_override: Option<rmlx_kv_quant::KvQuant>,
     max_ctx_override: Option<i32>,
     max_prompt_tokens: usize,
+    yarn_override: Option<rmlx_models::qwen3::YarnOverride>,
     sink: &EventRecorder,
     record_args: Option<BaselineRecordArgs<'_>>,
 ) -> anyhow::Result<()> {
@@ -210,8 +211,14 @@ pub(crate) fn run_baseline(
 
     // -- Load model, capture load_ms -------------------------------------------
     let ts_load_start = Instant::now();
-    let model = arch::load_model(model_path, device)
-        .map_err(|e| anyhow::anyhow!("arch::load_model: {e}"))?;
+    let model = arch::load_model(
+        model_path,
+        device,
+        &arch::LoadOpts {
+            yarn: yarn_override,
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("arch::load_model: {e}"))?;
     let load_ms = ts_load_start.elapsed().as_millis() as f64;
 
     info!(load_ms, "baseline: model loaded");

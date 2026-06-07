@@ -70,7 +70,7 @@ fn integration_qwen3_dr_venus() {
         return;
     }
 
-    let model = load_from_path(model_dir).expect("load_from_path failed");
+    let model = load_from_path(model_dir, None).expect("load_from_path failed");
 
     let logits = model
         .forward_seq(&[151643], Device::Gpu)
@@ -130,7 +130,7 @@ fn integration_qwen3_ternary_bonsai() {
         return;
     }
 
-    let model = load_from_path(model_dir).expect("load_from_path failed");
+    let model = load_from_path(model_dir, None).expect("load_from_path failed");
     assert_eq!(model.cfg.quant_bits, 2, "expected 2-bit quantization");
     assert_eq!(model.cfg.quant_group_size, 128, "expected group_size=128");
 

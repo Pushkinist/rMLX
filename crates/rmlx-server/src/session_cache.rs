@@ -26,7 +26,7 @@
 //! request will still get an N1 cache hit *if* the PromptCache slot has not been
 //! overwritten (best-effort).
 //!
-//! Default `max_sessions`: `RMLX_SESSION_CACHE_MAX_SESSIONS` env var, or 64.
+//! Default `max_sessions`: `--session-cache-max-sessions` CLI flag (env: `RMLX_SESSION_CACHE_MAX_SESSIONS`), default 64.
 //!
 //! ## Cross-session safety
 //!
@@ -108,16 +108,6 @@ impl SessionCache {
             entries: HashMap::new(),
             max_sessions: max_sessions.max(1),
         }
-    }
-
-    /// Create from env var `RMLX_SESSION_CACHE_MAX_SESSIONS` (default 64).
-    pub fn from_env() -> Self {
-        let max = std::env::var("RMLX_SESSION_CACHE_MAX_SESSIONS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(64);
-        tracing::debug!(max_sessions = max, "SessionCache: initialised");
-        Self::new(max)
     }
 
     /// Number of currently tracked sessions.

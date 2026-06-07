@@ -69,8 +69,7 @@ pub use engine::{
     NotReadyGenerator, SpeculativeGenerator,
 };
 pub use keep_alive::{
-    parse_duration_spec, parse_env_keep_alive, policy_from_request_field, DecodeLease,
-    DecodeLeaseGuard, KeepAlivePolicy,
+    parse_duration_spec, policy_from_request_field, DecodeLease, DecodeLeaseGuard, KeepAlivePolicy,
 };
 pub use metrics_drainer::{spawn_drainer, DrainerHandle, MetricEvent, MetricKind};
 pub use openai::{

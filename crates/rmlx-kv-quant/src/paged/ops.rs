@@ -26,7 +26,7 @@ use super::alloc::PageSlab;
 // ── PagedKStorage ─────────────────────────────────────────────────────────────
 
 /// Paged quantized K storage (q8_0). Replaces `QuantK` on the GPU path when
-/// `RMLX_PAGED_KV=1`.
+/// paged KV is enabled (`--paged-kv`).
 ///
 /// Uses two `PageSlab`s — one for u32 codes, one for f32 scales — and a
 /// `block_table` that maps logical page index to physical page ID.

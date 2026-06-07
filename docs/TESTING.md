@@ -26,6 +26,18 @@ The model directory must contain at minimum `config.json` and `tokenizer_config.
 | `RMLX_TEST_MODEL_READERLM_V2` | `mlx-community__jinaai-ReaderLM-v2` | `Qwen2ForCausalLM` |
 | `RMLX_TEST_MODEL_QWEN3_VL_30B` | `mlx-community__Qwen3-VL-30B-Instruct-*` | `Qwen3VLForConditionalGeneration` |
 
+## Specialised test-model variables
+
+Some integration tests use dedicated snapshot variables instead of the family
+variables above:
+
+| Variable | Used by | Purpose |
+|----------|---------|---------|
+| `RMLX_TEST_MODEL` | `rmlx-server/tests/ssd_cache_restart.rs` | Generic single-model override for the SSD-restart smoke test. |
+| `RMLX_KV_TEST_MODEL` | `gemma4_kv_cache_equivalence.rs`, `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs`, `projects_toml_e2e.rs`, `cli_flags_e2e.rs` | Model snapshot for KV-cache equivalence and drafter-alignment tests. Typically set to a Gemma4-e4b path. |
+| `RMLX_DRAFT_TEST_MODEL` | `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs` | Draft model snapshot path. Used alongside `RMLX_KV_TEST_MODEL` for speculative-decode alignment tests. |
+| `RMLX_VL_TEST_MODEL` | `qwen3_vl_moe_text_parity.rs` | Vision-language model snapshot for VL text-parity tests. |
+
 ## Directory root variable
 
 | Variable | Purpose | Default |
@@ -413,8 +425,7 @@ sweeps each codec against its bf16 baseline.
 `.github/workflows/codec-matrix.yml`:
 
 * Triggers only on `push` to `develop`.
-* Self-hosted Apple Silicon runner; required env: `RMLX_METAL_AVAILABLE=1`,
-  the three `RMLX_TEST_MODEL_*` snapshot paths.
+* Self-hosted Apple Silicon runner; required env: the three `RMLX_TEST_MODEL_*` snapshot paths.
 * Pull requests do not trigger the gate (manual / Exec B sweeps only).
 * `last_run.json` uploaded as artifact on every run.
 * On any row FAIL the workflow posts a one-line commit comment with the
@@ -423,3 +434,23 @@ sweeps each codec against its bf16 baseline.
 The gate honours the single-MLX-process discipline (CLAUDE.md hard
 rule 8) via the runner's `preflight` (pkill + claim-file cleanup) before
 each row's `rmlx baseline` and NIAH `cargo test` invocations.
+
+---
+
+## Test behaviour toggles
+
+These variables modify test execution without requiring a model snapshot.
+They are read only inside test code (`tests/` and `*_tests.rs` files).
+
+| Variable | Values | Description |
+|---|---|---|
+| `RMLX_SKIP_GPU` | `1` | Skip GPU/Metal parity tests even when `--include-ignored` is passed. |
+| `RMLX_REGEN_GOLDENS` | any | Regenerate golden-token fixtures instead of asserting them. |
+| `RMLX_E2E_REGEN_GOLDEN` | `1` | Regenerate E2E golden snapshots in the harness runner. |
+| `RMLX_E2E_ONLY` | comma-separated spec names | Run only the named E2E specs; skip all others. |
+| `RMLX_REGISTRY_TEST` | any | Enable multi-model registry smoke tests (require model snapshots). Unset → skip. |
+| `RMLX_NIAH_KV_QUANT` | KV quant name (e.g. `k8v4`) | Override the KV quant used in NIAH long-context harness tests. |
+| `RMLX_APPLE10_STRICT` | `1` | Fail (not warn) on Apple10 head-dim=256 cosine gate below floor. |
+| `RMLX_FUSED_QK_STRICT` | `1` | Fail (not warn) on fused-QK parity tests. |
+| `RMLX_RETURNING_KV_STRICT` | `1` | Fail (not warn) on returning-KV dispatch parity tests. |
+| `RMLX_SPARSE_ATTN_STRICT` | `1` | Fail (not warn) on sparse-attn dispatch parity tests. |

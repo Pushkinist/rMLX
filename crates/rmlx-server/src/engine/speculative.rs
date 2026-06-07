@@ -35,8 +35,8 @@ use super::types::{GenerationRequest, GenerationToken, ModelLoadConfig};
 /// bonus/correction token.
 ///
 /// Phase 2 invariants:
-/// - K is fixed at construction time (default 4; tunable via env
-///   `RMLX_SPEC_K`).
+/// - K is fixed at construction time (default 4; tunable via
+///   `--draft-block-size`).
 /// - Verifier and draft both re-prefill on every round (no KV
 ///   reconciliation — Phase 3).
 /// - Greedy only — no sampling. Temperature/seed in the request are
@@ -70,7 +70,7 @@ pub struct SpeculativeGenerator {
     /// /14/15 loaders branch on this to select the correct drafter.
     pub draft_kind: Option<rmlx_models::DraftKind>,
     /// draft block size (`--draft-block-size`).
-    /// `None` = use default (current: `k` field set from `RMLX_SPEC_K`).
+    /// `None` = use default (4).
     pub draft_block_size: Option<usize>,
     /// MTP sidecar drafter, `Some` only when `draft_kind == Mtp`.
     ///
@@ -330,11 +330,11 @@ impl SpeculativeGenerator {
             None => crate::detokenizer::TokenizerKind::Other,
         };
 
-        // K from env (RMLX_SPEC_K). Default 4.
-        let k: usize = std::env::var("RMLX_SPEC_K")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(4);
+        // Speculative lookahead K. Fixed at 4 (was the undocumented experimental
+        // RMLX_SPEC_K env, removed in the env-var cleanup; its only value was the
+        // default). The independent `--draft-block-size` flag still controls the
+        // round block size below (defaulting to k+1) — the two are decoupled.
+        let k: usize = 4;
 
         // A2: derive effective_max_ctx from the verifier's positional limit.
         // Same formula as Gemma4Generator above. Speculative inherits the

@@ -656,8 +656,8 @@ fn load_qwen3_for_calibration(model_dir: &Path) -> anyhow::Result<Qwen3Text> {
     let device = Device::Gpu;
     let _claim = crate::commands::parse::acquire_claim_for_device(device, 0)?;
 
-    let arch =
-        arch::load_model(model_dir, device).map_err(|e| anyhow::anyhow!("load_model: {e}"))?;
+    let arch = arch::load_model(model_dir, device, &arch::LoadOpts::default())
+        .map_err(|e| anyhow::anyhow!("load_model: {e}"))?;
     let arch_name = arch.arch_class();
     if let Architecture::Qwen3(m) = arch {
         Ok(m)

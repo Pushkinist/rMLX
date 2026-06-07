@@ -71,7 +71,7 @@ fn main() -> anyhow::Result<()> {
 
     // -- Load model --
     eprintln!("loading model...");
-    let model = arch::load_model(&model_path, Device::Gpu)
+    let model = arch::load_model(&model_path, Device::Gpu, &arch::LoadOpts::default())
         .map_err(|e| anyhow::anyhow!("load_model: {e}"))?;
     eprintln!("model loaded.");
 

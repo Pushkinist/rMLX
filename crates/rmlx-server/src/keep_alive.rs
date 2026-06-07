@@ -2,10 +2,9 @@
 //!
 //! This module owns the **per-model** keep-alive policy: parse Go-style
 //! duration strings (`30s`, `15m`, `2h`, `24h`), resolve the precedence
-//! chain (per-request, then env `RMLX_KEEP_ALIVE`, then CLI
-//! `--idle-timeout-secs`, then the default 15 min), and expose the
-//! active-decode lease that prevents an unload from racing a running
-//! generation.
+//! chain (per-request, then CLI `--idle-timeout-secs`, then the default 15 min),
+//! and expose the active-decode lease that prevents an unload from racing a
+//! running generation.
 //!
 //! The reaper is **per-model**, not a global poll loop: when a request
 //! resolves a [`LoadedModel`] in the registry slot, the previously armed
@@ -37,7 +36,7 @@ use std::time::Duration;
 /// Resolved keep-alive policy for one model slot.
 ///
 /// Constructed by [`KeepAlivePolicy::resolve`] from the precedence chain
-/// (per-request > env > flag > default) at request entry and at load time.
+/// (per-request > CLI flag > default) at request entry and at load time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(
     clippy::exhaustive_enums,
@@ -90,16 +89,14 @@ impl KeepAlivePolicy {
 
     /// Resolve the precedence chain.
     ///
-    /// Order: per-request > env > CLI flag > default.
+    /// Order: per-request > CLI flag > default.
     /// Each input is `Option<Self>`; the first `Some` wins.
     #[must_use]
     pub fn resolve(
         per_request: Option<KeepAlivePolicy>,
-        env: Option<KeepAlivePolicy>,
         flag: Option<KeepAlivePolicy>,
     ) -> KeepAlivePolicy {
         per_request
-            .or(env)
             .or(flag)
             .unwrap_or(KeepAlivePolicy::Idle(Duration::from_secs(
                 Self::DEFAULT_TTL_SECS,
@@ -182,22 +179,6 @@ pub fn parse_duration_spec(spec: &str) -> Result<KeepAlivePolicy, String> {
     };
 
     Ok(KeepAlivePolicy::Idle(Duration::from_secs(secs)))
-}
-
-/// Convenience: parse the `RMLX_KEEP_ALIVE` environment variable if set.
-///
-/// Returns `Ok(None)` if the env var is absent. Returns `Err` if the var
-/// is set but unparseable — caller decides whether to fail-loud or fall
-/// back to the next precedence level.
-///
-/// # Errors
-///
-/// Returns `Err` when the env var is set to an unparseable spec.
-pub fn parse_env_keep_alive() -> Result<Option<KeepAlivePolicy>, String> {
-    match std::env::var("RMLX_KEEP_ALIVE") {
-        Ok(s) => parse_duration_spec(&s).map(Some),
-        Err(_) => Ok(None),
-    }
 }
 
 /// Convenience: map an `Option<i64>` per-request `keep_alive` field to a policy.

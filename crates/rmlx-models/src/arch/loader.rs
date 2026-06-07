@@ -13,6 +13,27 @@ use super::phases::LAST_LOAD_PHASES;
 use super::registry::is_arch_supported;
 use super::{Architecture, LoadPhases};
 
+// ---------------------------------------------------------------------------
+// LoadOpts — optional per-load runtime overrides
+// ---------------------------------------------------------------------------
+
+/// Optional runtime overrides passed to [`load_model`].
+///
+/// All fields are `Option`; `None` means "use the model's own config.json
+/// value" (or no override). Default (`LoadOpts::default()`) activates no
+/// overrides — byte-identical to the pre-opts behaviour for all callers.
+#[derive(Debug, Clone, Default)]
+#[allow(
+    clippy::exhaustive_structs,
+    reason = "open extension point — callers construct via struct literal with named fields; adding a field requires updating all construction sites anyway"
+)]
+pub struct LoadOpts {
+    /// YARN RoPE override for Qwen3 models that lack `rope_scaling` in
+    /// `config.json`. Forwarded to `qwen3::load_from_path`. Has no effect on
+    /// non-Qwen3 architectures.
+    pub yarn: Option<crate::qwen3::YarnOverride>,
+}
+
 /// Load a model snapshot from `model_dir`.
 ///
 /// Reads `config.json`, dispatches on `architectures[0]`:
@@ -23,12 +44,16 @@ use super::{Architecture, LoadPhases};
 /// `first_kernel_ready_ms`, `total_load_ms`) into `LAST_LOAD_PHASES`.
 /// Read after load via `read_load_phases()`.
 ///
+/// `opts` carries optional runtime overrides (e.g. YARN RoPE for Qwen3).
+/// Pass `&LoadOpts::default()` (or `Default::default()`) when no overrides
+/// are needed — this is byte-identical to the no-opts behaviour.
+///
 /// # Errors
 /// Returns `Error::Config` if `config.json` cannot be read or parsed.
 /// Returns `Error::Model` if the architecture is not yet supported.
 /// Returns `Error::Loader` / `Error::Mlx` if weight loading fails.
 #[tracing::instrument(skip_all, fields(model_dir = %model_dir.display()))]
-pub fn load_model(model_dir: &Path, _device: Device) -> Result<Architecture> {
+pub fn load_model(model_dir: &Path, _device: Device, opts: &LoadOpts) -> Result<Architecture> {
     let t_total_start = Instant::now();
 
     let cfg = load_config(model_dir)?;
@@ -96,7 +121,7 @@ pub fn load_model(model_dir: &Path, _device: Device) -> Result<Architecture> {
             a
         }
         "Qwen3ForCausalLM" => {
-            let model = crate::qwen3::load_from_path(model_dir)?;
+            let model = crate::qwen3::load_from_path(model_dir, opts.yarn.as_ref())?;
             let a = Architecture::Qwen3(model);
             tracing::info!(summary = %a.config_summary(), "arch::load_model: loaded Qwen3");
             a
@@ -351,7 +376,7 @@ pub fn run_smoke_probe(
     kv_quant: Option<rmlx_kv_quant::KvQuant>,
     max_ctx_override: Option<i32>,
 ) -> Result<crate::gemma4::SmokeVerdict> {
-    let model = load_model(model_dir, device)?;
+    let model = load_model(model_dir, device, &LoadOpts::default())?;
 
     // Resolve BOS token id from tokenizer_config.json.
     let bos_id = resolve_bos_id(model_dir)?;

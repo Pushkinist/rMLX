@@ -43,7 +43,7 @@ use std::time::Instant;
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{argmax, Array, Device, Dtype};
 
-use crate::arch::{load_model, Architecture};
+use crate::arch::{load_model, Architecture, LoadOpts};
 use crate::gemma4::ProbeStep;
 use crate::kv_cache::KvCacheBuilder;
 pub use draft_kind::DraftKind;
@@ -99,12 +99,12 @@ impl SpeculativeDispatcher {
             draft = %draft_dir.display(),
             "speculative: load_speculative — loading verifier"
         );
-        let verifier = load_model(verifier_dir, device)?;
+        let verifier = load_model(verifier_dir, device, &LoadOpts::default())?;
         tracing::info!(
             verifier = %verifier_dir.display(),
             "speculative: load_speculative — loading draft"
         );
-        let draft = load_model(draft_dir, device)?;
+        let draft = load_model(draft_dir, device, &LoadOpts::default())?;
         tracing::info!(
             verifier_summary = %verifier.config_summary(),
             draft_summary = %draft.config_summary(),
