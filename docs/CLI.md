@@ -72,7 +72,7 @@ mutually exclusive.
 | `--kv-bits` | float | — | Bit-width alias (integer or fractional, e.g. `4`, `3.5`). Mutually exclusive with `--kv-quant` and `--cache-type-*`. See KV-bits mapping below. |
 | `--kv-group-size` | usize | 64 | Group size for `--kv-bits`. Requires `--kv-bits`. |
 | `--max-ctx` | u32 | (from model) | KV cache buffer token capacity. Derives from `max_position_embeddings` capped at 4096 when unset. Must be ≥ 256 when set. |
-| `--idle-timeout-secs` | string | `15m` | Idle time before the model is unloaded. Accepts an integer count of seconds (`30`, `900`) OR a Go-style duration (`30s`, `15m`, `2h`, `24h`). Negative (`-1`) pins the model forever; `0` unloads after each response. Env override: `RMLX_KEEP_ALIVE`. Per-request override on **native** routes only (`POST /v1/models/{id}/load` body field `keep_alive`); OpenAI/Anthropic compat routes do not parse the field but still reset the timer on use. **Interaction with the single-MLX claim file:** the timer never bypasses the claim — when TTL fires it unloads the slot in-process; the cross-process claim file (`/tmp/rmlx.<port>.claim`) remains held for the lifetime of the `rmlx serve` process. |
+| `--idle-timeout-secs` | string | `15m` | Idle time before the model is unloaded. Accepts an integer count of seconds (`30`, `900`) OR a Go-style duration (`30s`, `15m`, `2h`, `24h`). Negative (`-1`) pins the model forever; `0` unloads after each response. Per-request override on **native** routes only (`POST /v1/models/{id}/load` body field `keep_alive`); OpenAI/Anthropic compat routes do not parse the field but still reset the timer on use. **Interaction with the single-MLX claim file:** the timer never bypasses the claim — when TTL fires it unloads the slot in-process; the cross-process claim file (`/tmp/rmlx.<port>.claim`) remains held for the lifetime of the `rmlx serve` process. |
 | `--prompt-cache-slots` | usize | 4 | Number of prompt-cache slots for multi-slot prefix matching. Set to `1` for legacy single-slot exact-match behaviour. |
 | `--draft-model` | path | — | Path to a draft model for speculative decoding. Requires `--draft-kind`. |
 | `--draft-kind` | `mtp \| dflash \| eagle3` | — | Drafter architecture. Requires `--draft-model`. Env: `MLX_VLM_DRAFT_KIND`. |
@@ -99,9 +99,9 @@ mutually exclusive.
 | `--kv-ssd-cache-gb` | f64 | 0.0 | SSD prompt-cache tier budget in GiB per namespace. `0` = tier off (RAM-only). Blocks land in `<RMLX_HOME>/cache/kv/<namespace>/`. |
 | `--project` | string | (model id) | SSD prompt-cache namespace name. Requires `--kv-ssd-cache-gb > 0`. |
 | `--kv-ssd-global-gb` | f64 | 0.0 | Global SSD pool ceiling across all namespaces in GiB. `0` = no global cap. Effective per-namespace ceiling is `min(--kv-ssd-cache-gb, --kv-ssd-global-gb)` when global > 0. |
-| `--prompt-cache-ram-gb` | f64 | 2.0 | RAM cap for the in-process prompt cache in GiB. Env fallback: `RMLX_PROMPT_CACHE_MAX_BYTES` (bytes). |
-| `--paged-kv` | bool flag | off | Route K8V4/K8V8/Planar caches through the block-table paged storage path. Incompatible with `bf16`/`none` and `rot_k*` cache types. Env fallback: `RMLX_PAGED_KV=1`. |
-| `--paged-kv-page-tokens` | i32 | 32 | Tokens per paged-KV block. Requires `--paged-kv`. Env fallback: `RMLX_KV_PAGE_SIZE`. |
+| `--prompt-cache-ram-gb` | f64 | 2.0 | RAM cap for the in-process prompt cache in GiB. |
+| `--paged-kv` | bool flag | off | Route K8V4/K8V8/Planar caches through the block-table paged storage path. Incompatible with `bf16`/`none` and `rot_k*` cache types. |
+| `--paged-kv-page-tokens` | i32 | 32 | Tokens per paged-KV block. Requires `--paged-kv`. |
 | `--rotor-qjl` | `on \| off` | `on` | Toggle the K-side 1-bit QJL residual for the `rotor3_sym` / `rotor4_sym` / `k_rotor3` / `k_rotor4` / `rotor_k_{3,4}_asym_v*_g*` codecs. Default `on` (spec mandate). `--rotor-qjl off` disables the QJL sideband for ablation / bench. Env fallback: `RMLX_ROTOR_QJL=0`. No effect on non-rotor-K-side quant variants. |
 | `--planar-fused-qk` | `on \| off` | `on` | Route pre-softmax QK over PlanarQuant-packed K (`KvStorage::PlanarK`) through the `planar_fused_qk` MSL kernel instead of dequant+SDPA. Decode-step only (prefill chunks fall through to the legacy path). No effect on any non-PlanarK cache. **No env fallback — CLI-only**; tests do not need an env lock. See `docs/KV_QUANT.md` §"Fused-QK kernels". |
 | `--prefix-index` | `linear \| radix` | `linear` | Longest-prefix index strategy for the prompt cache. `linear` is O(slots × n\_blocks); `radix` is O(n\_blocks). |
@@ -130,9 +130,8 @@ Precedence (highest to lowest):
 
 1. Per-request `keep_alive` body field on **native** routes only —
    `POST /v1/models/{id}/load` accepts `{"keep_alive": <int>}`.
-2. `RMLX_KEEP_ALIVE` environment variable at server startup.
-3. `--idle-timeout-secs <DURATION>` CLI flag.
-4. Default: `15m` (900 s).
+2. `--idle-timeout-secs <DURATION>` CLI flag.
+3. Default: `15m` (900 s).
 
 Accepted duration syntax (CLI flag, env var, and request field):
 
@@ -752,22 +751,54 @@ The canonical prompt is hardcoded (20 tokens). The expected baseline is
 
 ## Environment variables
 
-| Variable | Description |
-|---|---|
-| `RMLX_HOME` | Root directory for all on-disk state (`logs/`, `metrics/`, `cache/`). Resolution order: (1) `$RMLX_HOME` (must be absolute), (2) `<workspace>/.rmlx/` (auto-detected by walking up for `Cargo.lock`), (3) `$HOME/.rmlx/`. |
-| `RMLX_LOG_CAP_MB` | Total log directory size cap in megabytes. Default `100`. Oldest `.jsonl` files are deleted at startup until the total is within cap. |
-| `RUST_LOG` | Explicit `tracing` filter directive. When set, overrides `--log`. Example: `RUST_LOG=debug,rmlx=trace`. |
-| `RMLX_METRICS_DB` | Override path to `runs.db`. Used by `rmlx metrics` subcommands and any subcommand that opens an `EventRecorder`. |
-| `RMLX_TURBO_FLASH` | Set to `1` to enable the TurboFlash MSL attention kernel. With `--turbo-flash=auto` (the default) the env var still acts as an explicit override on Apple ≥10 / unknown hosts where Auto otherwise resolves to OFF. `--turbo-flash on` force-sets this var; `--turbo-flash off` does NOT clear a pre-set var (back-compat). |
-| `RMLX_TURBO_FLASH_LOCK` | Set to `1` to enable the TurboFlash lock variant without passing `--turbo-flash-lock`. The CLI flag takes precedence when set. |
-| `RMLX_PLANAR_FLASH_DECODE` | Set to `1` to enable the planar_flash_decode MSL kernel. With `--planar-flash-decode=auto` (the default) the env still acts as an explicit override since Auto currently resolves OFF on every host (see CLI flag row). `--planar-flash-decode on` force-sets this var; `--planar-flash-decode off` **hard-removes** this var. Only applies to `KvStorage::PlanarK` caches (Bonsai is the sole reachable arch — Qwen3.6 MoE rejects PlanarK at validate_resolved; Gemma4 routes through `update_and_sdpa_returning_kv`). |
-| `RMLX_PAGED_KV` | Set to `1` to enable the paged-KV block-table path without passing `--paged-kv`. Honoured for one release cycle as a back-compat fallback. |
-| `RMLX_KV_PAGE_SIZE` | Page token count for the paged-KV path. Honoured when `--paged-kv-page-tokens` is absent. |
-| `RMLX_PROMPT_CACHE_MAX_BYTES` | RAM cap for the in-process prompt cache in bytes. Honoured when `--prompt-cache-ram-gb` is absent. |
-| `MLX_VLM_DRAFT_KIND` | Drafter architecture for speculative decoding. Honoured when `--draft-kind` is absent. Values: `mtp`, `dflash`, `eagle3`. |
-| `MLX_VLM_DRAFT_BLOCK_SIZE` | Draft block size (tokens per speculative round). Honoured when `--draft-block-size` is absent. |
-| `RMLX_YARN_FACTOR` | For Qwen3-family models that ship without `rope_scaling` in `config.json`, set this to a float `> 1.0` to synthesise a YARN config at model load. Default `beta_fast=32, beta_slow=1` (per the YARN paper). Models that already declare `rope_scaling.rope_type == "yarn"` (Bonsai) ignore this var — config wins. |
-| `RMLX_YARN_ORIGINAL_MAX` | Optional companion to `RMLX_YARN_FACTOR`: the training-time `original_max_position_embeddings`. Defaults to the model's `max_position_embeddings` when absent. |
+### User / operational
+
+These are the variables a typical operator sets. For each variable that has a
+matching CLI flag, **the flag wins** — the env var is a convenience for
+persistent shell configuration.
+
+| Variable | Flag (if any) | Default | Description |
+|---|---|---|---|
+| `RMLX_HOME` | — | `<workspace>/.rmlx/` or `$HOME/.rmlx/` | Root directory for all on-disk state (`logs/`, `metrics/`, `cache/`). Resolution order: (1) `$RMLX_HOME` (must be absolute), (2) `<workspace>/.rmlx/` (auto-detected by walking up for `Cargo.lock`), (3) `$HOME/.rmlx/`. |
+| `RMLX_LOG_CAP_MB` | `--log-cap-mb` | `100` | Total log directory size cap in megabytes. Oldest `.jsonl` files are deleted at startup until the total is within cap. Flag wins. |
+| `RUST_LOG` | `--log` | — | Explicit `tracing` filter directive. When set, overrides `--log`. Example: `RUST_LOG=debug,rmlx=trace`. |
+| `RMLX_METRICS_DB` | — | `<RMLX_HOME>/metrics/runs.db` | Override path to `runs.db`. Used by `rmlx metrics` subcommands and any subcommand that opens an `EventRecorder`. |
+| `RMLX_WHISPER_MODEL_PATH` | `--whisper-model-path` | — | Path to a Whisper snapshot directory. Required for `/v1/audio/transcriptions` and `/v1/audio/translations`. Flag wins. |
+| `RMLX_WHISPER_TOKENIZER_PATH` | `--whisper-tokenizer-path` | — | Path to a directory containing `tokenizer.json` for Whisper. Flag wins. |
+| `RMLX_TTS_MODEL_PATH` | `--tts-model-path` | — | Path to a Qwen3-TTS model snapshot directory. Required for `/v1/audio/speech`. Flag wins. |
+| `RMLX_TTS_TOKENIZER_PATH` | `--tts-tokenizer-path` | — | Path to the Qwen3-TTS speech tokenizer snapshot directory. Flag wins. |
+| `RMLX_MM_CACHE_BYTES` | `--mm-cache-bytes` | `536870912` (512 MiB) | Byte budget for the multimodal encoder-output cache. `0` disables. Flag wins. |
+| `RMLX_SESSION_CACHE_MAX_SESSIONS` | `--session-cache-max-sessions` | `8` | Maximum number of prompt-cache sessions held resident. Flag wins. |
+| `RMLX_YARN_FACTOR` | `--yarn-factor` | — | For Qwen3-family models that ship without `rope_scaling` in `config.json`, set this to a float `> 1.0` to synthesise a YARN config at model load. Default `beta_fast=32, beta_slow=1` (per the YARN paper). Models that already declare `rope_scaling.rope_type == "yarn"` (Bonsai) ignore this var — config wins. Flag wins. |
+| `RMLX_YARN_ORIGINAL_MAX` | `--yarn-original-max` | (model `max_position_embeddings`) | Optional companion to `RMLX_YARN_FACTOR`: the training-time `original_max_position_embeddings`. Flag wins. |
+| `RMLX_PROMPTS_DIR` | `--prompts-dir` | `<repo>/prompts/` | Directory containing prompt JSON files used by `rmlx baseline` and bench scripts. Flag wins. |
+| `MLX_VLM_DRAFT_KIND` | `--draft-kind` | — | Drafter architecture for speculative decoding. Values: `mtp`, `dflash`, `eagle3`. Flag wins. |
+| `MLX_VLM_DRAFT_BLOCK_SIZE` | `--draft-block-size` | `4` | Draft block size (tokens per speculative round). Flag wins. |
+
+### Internal / advanced (not needed for normal use)
+
+These variables are read once via `OnceLock` at first use. They exist as
+bridges for the corresponding CLI flags, or as dev / ablation toggles that
+have no user-facing flag. **Prefer the matching `--flag` where one exists** —
+the env var is only the internal bridge that the flag writes before the first
+inference call latches the lock.
+
+| Variable | Flag (if any) | Default | Description |
+|---|---|---|---|
+| `RMLX_TURBO_FLASH` | `--turbo-flash` | (hardware-gated) | Set to `1` to enable the TurboFlash MSL attention kernel. `--turbo-flash on` force-sets this var; `--turbo-flash off` hard-removes it so a stale `=1` cannot latch the OnceLock. Prefer `--turbo-flash`. |
+| `RMLX_TURBO_FLASH_LOCK` | `--turbo-flash-lock` | unset | Set to `1` to enable the TurboFlash lock variant. The CLI flag takes precedence. Prefer `--turbo-flash-lock`. |
+| `RMLX_TURBO_FLASH_MIN` | — | `1` | Minimum batch-sequence count below which TurboFlash is bypassed regardless of the `RMLX_TURBO_FLASH` gate. Dev tuning only. |
+| `RMLX_PLANAR_FLASH_DECODE` | `--planar-flash-decode` | unset (resolves OFF) | Set to `1` to enable the `planar_flash_decode` MSL kernel. `--planar-flash-decode on` force-sets; `--planar-flash-decode off` hard-removes. Only applies to `KvStorage::PlanarK` caches. Prefer `--planar-flash-decode`. |
+| `RMLX_FUSED_QK` | `--fused-qk` | unset (resolves OFF) | Set to `1` to enable the fused-QK MSL kernel for PlanarK caches. `--fused-qk on` force-sets; `--fused-qk off` hard-removes. Prefer `--fused-qk`. |
+| `RMLX_FUSED_QK_MIN` | — | `1` | Minimum sequence length threshold for fused-QK dispatch. Dev tuning only. |
+| `RMLX_SPARSE_ATTN` | `--sparse-attn` | unset (resolves OFF) | Set to `1` to enable the two-phase sparse-attention dispatcher. `--sparse-attn on` force-sets; `--sparse-attn off` hard-removes. Prefer `--sparse-attn`. |
+| `RMLX_ROTOR_QJL` | `--rotor-qjl` | unset (default ON for rotor codecs) | Set to `0` to disable the K-side 1-bit QJL residual for rotor-K codecs. Prefer `--rotor-qjl off`. |
+| `RMLX_ROT_K_FUSED` | — | unset (resolves OFF) | Set to `1` to route rot_k decode steps through the fused MSL path. No CLI flag — ablation / bench only. |
+| `RMLX_EAGLE3_NO_FCS` | — | unset | Set to any value to disable the FCS (final correction step) in Eagle3 speculative decoding. Ablation only. |
+| `RMLX_PREFILL_CHUNK` | — | (per-arch default) | Override the global prefill chunk size (tokens per forward pass). Also accepts per-arch form `RMLX_PREFILL_CHUNK_<ARCH>` (e.g. `RMLX_PREFILL_CHUNK_QWEN3_5_MOE=256`). Per-arch override takes precedence over the global. Dev tuning. |
+| `RMLX_KV_MAX_SEQ_HARD_CAP` | — | unset (no cap) | Opt-in hard cap on KV sequence length. When set, the KV cache rejects any extension beyond this token count. `--max-ctx` is the normal gate; this env is a last-resort safety guard. |
+| `RMLX_HARDWARE_TAG` | — | `m5_max_128gb` | Hardware tag embedded in `rmlx baseline` and `rmlx eval ppl` result rows. Set to match your machine (e.g. `m4_max_64gb`) when recording bench results for cross-machine comparison. |
+| `RMLX_REPO_ROOT` | — | (auto-detected) | Root directory of the rMLX workspace, used by `rmlx metrics export` when resolving the `BENCHMARK_CHAMPIONS.md` output path. Typically set automatically; override when running from a non-standard working directory. |
 
 ---
 

@@ -44,9 +44,7 @@
 //! trigger eviction first. Eviction never happens inside `find_best_prefix`
 //! (finish lookup first, then evict).
 //!
-//! RAM cap is configurable via `--prompt-cache-ram-gb` CLI flag, or
-//! the `RMLX_PROMPT_CACHE_MAX_BYTES` env var (silent fallback, undocumented).
-//! Default: 2 GiB.
+//! RAM cap is configurable via `--prompt-cache-ram-gb` CLI flag. Default: 2 GiB.
 
 #![allow(clippy::struct_field_names)]
 use rmlx_core::error::Result;
@@ -71,29 +69,22 @@ pub(crate) use rmlx_kv_ssd::{
 /// Default RAM cap for the prompt cache (2 GiB).
 pub(crate) const DEFAULT_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Resolve the RAM cap for the prompt cache from CLI flag + env fallback.
+/// Resolve the RAM cap for the prompt cache from the CLI flag.
 ///
-/// Precedence: CLI `--prompt-cache-ram-gb` > env `RMLX_PROMPT_CACHE_MAX_BYTES`
-/// (bytes, decimal — undocumented compat fallback) > default 2 GiB.
+/// Precedence: CLI `--prompt-cache-ram-gb` > default 2 GiB.
 ///
 /// `cli_gib` is the parsed `--prompt-cache-ram-gb` value (`Option<f64>` in GiB).
-/// Negative / non-finite values are rejected as "invalid" and fall through to
-/// the env fallback. The env var is the byte-count form preserved from the
-/// pre-wire shape; CLI-supplied gibibytes are converted to bytes here.
+/// Negative / non-finite values fall through to the default.
+/// CLI-supplied gibibytes are converted to bytes here.
 ///
 /// Process-global resolution: stored in a `OnceLock` so every per-arch
 /// `PromptCache::new` call sees the same value regardless of construction
 /// order. The first call to [`install_ram_cap`] wins; later calls are
 /// no-ops with a `warn!` if they disagree, matching the SSD-tier OnceLock.
-pub fn resolve_ram_cap_bytes(cli_gib: Option<f64>, env_val: Option<&str>) -> u64 {
+pub fn resolve_ram_cap_bytes(cli_gib: Option<f64>) -> u64 {
     if let Some(g) = cli_gib {
         if g.is_finite() && g >= 0.0 {
             return (g * 1024.0 * 1024.0 * 1024.0) as u64;
-        }
-    }
-    if let Some(s) = env_val {
-        if let Ok(n) = s.parse::<u64>() {
-            return n;
         }
     }
     DEFAULT_MAX_BYTES
@@ -103,13 +94,12 @@ static RAM_CAP_BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
 /// Install the process-global RAM cap for [`PromptCache::new`].
 ///
-/// First call wins. Pass `cli_gib = None` to fall back to env / default. See
+/// First call wins. Pass `cli_gib = None` to use the 2 GiB default. See
 /// [`resolve_ram_cap_bytes`] for precedence rules. Called once at serve
 /// startup before any model loads. Idempotent re-entry: a second call with a
 /// different value is dropped with a `warn!` (mirrors `ssd_tier::install_config`).
 pub fn install_ram_cap(cli_gib: Option<f64>) {
-    let env_val = std::env::var("RMLX_PROMPT_CACHE_MAX_BYTES").ok();
-    let bytes = resolve_ram_cap_bytes(cli_gib, env_val.as_deref());
+    let bytes = resolve_ram_cap_bytes(cli_gib);
     if RAM_CAP_BYTES.set(bytes).is_err() {
         let existing = RAM_CAP_BYTES.get().copied().unwrap_or(0);
         if existing != bytes {
@@ -123,8 +113,6 @@ pub fn install_ram_cap(cli_gib: Option<f64>) {
     }
     let source = if cli_gib.is_some_and(|g| g.is_finite() && g >= 0.0) {
         "cli"
-    } else if env_val.is_some() {
-        "env"
     } else {
         "default"
     };
@@ -137,13 +125,12 @@ pub fn install_ram_cap(cli_gib: Option<f64>) {
 }
 
 /// Active RAM cap. Reads the [`install_ram_cap`] value; if it has not been
-/// installed yet (tests / unit paths), falls back to env + default.
+/// installed yet (tests / unit paths), falls back to the 2 GiB default.
 pub(crate) fn active_ram_cap_bytes() -> u64 {
-    if let Some(b) = RAM_CAP_BYTES.get().copied() {
-        return b;
-    }
-    let env_val = std::env::var("RMLX_PROMPT_CACHE_MAX_BYTES").ok();
-    resolve_ram_cap_bytes(None, env_val.as_deref())
+    RAM_CAP_BYTES
+        .get()
+        .copied()
+        .unwrap_or_else(|| resolve_ram_cap_bytes(None))
 }
 
 // ---------------------------------------------------------------------------
@@ -309,8 +296,7 @@ pub(crate) struct Slot<E> {
 pub(crate) struct PromptCache<E: PromptCacheEntry> {
     pub(crate) slots: Vec<Slot<E>>,
     pub(crate) capacity: usize,
-    /// RAM cap in bytes. Loaded once from `RMLX_PROMPT_CACHE_MAX_BYTES`
-    /// at construction. Default 2 GiB.
+    /// RAM cap in bytes. Set at construction from the CLI flag. Default 2 GiB.
     pub(crate) max_bytes: u64,
     /// Global monotonic sequence counter. Incremented on every
     /// `find_best_prefix` hit and `push`. Never resets (u64 overflow
@@ -354,8 +340,7 @@ impl<E: PromptCacheEntry> PromptCache<E> {
     ///
     /// RAM cap is taken from the process-global resolver
     /// ([`active_ram_cap_bytes`]): CLI `--prompt-cache-ram-gb` if installed,
-    /// else env `RMLX_PROMPT_CACHE_MAX_BYTES` (bytes, decimal — silent
-    /// compat fallback), else default 2 GiB.
+    /// else default 2 GiB.
     pub(crate) fn new(capacity: usize) -> Self {
         Self::with_max_bytes(capacity, active_ram_cap_bytes())
     }

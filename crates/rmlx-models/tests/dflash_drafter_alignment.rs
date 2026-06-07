@@ -73,7 +73,8 @@ fn dflash_round0_first_token_aligns() {
         return;
     };
     let device = Device::Gpu;
-    let verifier = arch::load_model(&model_path, device).expect("load verifier");
+    let verifier =
+        arch::load_model(&model_path, device, &arch::LoadOpts::default()).expect("load verifier");
     assert!(
         verifier.needs_lin_caches(),
         "DFlash verifier must be the Qwen3.5/3.6-MoE hybrid"
@@ -188,7 +189,8 @@ fn dflash_live_loop_emits_coherent() {
         return;
     };
     let device = Device::Gpu;
-    let verifier = arch::load_model(&model_path, device).expect("load verifier");
+    let verifier =
+        arch::load_model(&model_path, device, &arch::LoadOpts::default()).expect("load verifier");
     let hidden = verifier.hidden_size();
     let mut drafter = DFlashDrafter::load(&draft_path, hidden, device).expect("load drafter");
 

@@ -12,10 +12,10 @@
 //!   substitute tag).
 //!
 //! **Env-gated** (require real snapshots — skip when env unset):
-//! - `tq4_on_k_side_rejected` — `RMLX_TEST_BONSAI`, exit 78.
-//! - `planar4_on_k_side_rejected` — `RMLX_TEST_BONSAI`, exit 78.
-//! - `qwen_moe_low_k_bits_rejected` — `RMLX_TEST_QWEN36`, exit 78.
-//! - `asymmetric_auto_with_tq4_rejected_on_bonsai` — `RMLX_TEST_BONSAI`, exit 78.
+//! - `tq4_on_k_side_rejected` — `RMLX_TEST_MODEL_BONSAI`, exit 78.
+//! - `planar4_on_k_side_rejected` — `RMLX_TEST_MODEL_BONSAI`, exit 78.
+//! - `qwen_moe_low_k_bits_rejected` — `RMLX_TEST_MODEL_QWEN36`, exit 78.
+//! - `asymmetric_auto_with_tq4_rejected_on_bonsai` — `RMLX_TEST_MODEL_BONSAI`, exit 78.
 //!   (Bonsai's auto K-side decomposes to `q8_g64`, which is not `q8_g128`;
 //!   the asymmetric coercion guard rejects rather than silently promoting.)
 
@@ -159,13 +159,13 @@ fn q8_0_returns_not_implemented_hint() {
 ///
 /// stderr: "K-side rotation codec 'tq4' not implemented"
 ///
-/// Requires: `RMLX_TEST_BONSAI=/path/to/prism-ml__Ternary-Bonsai-8B-mlx-2bit`
+/// Requires: `RMLX_TEST_MODEL_BONSAI=/path/to/prism-ml__Ternary-Bonsai-8B-mlx-2bit`
 #[test]
 fn tq4_on_k_side_rejected() {
-    let bonsai = if let Ok(p) = std::env::var("RMLX_TEST_BONSAI") {
+    let bonsai = if let Ok(p) = std::env::var("RMLX_TEST_MODEL_BONSAI") {
         p
     } else {
-        eprintln!("skipping tq4_on_k_side_rejected: RMLX_TEST_BONSAI not set");
+        eprintln!("skipping tq4_on_k_side_rejected: RMLX_TEST_MODEL_BONSAI not set");
         return;
     };
     let r = run(&["info", "--model", &bonsai, "--cache-type-k", "tq4"]);
@@ -187,13 +187,13 @@ fn tq4_on_k_side_rejected() {
 ///
 /// stderr: "K-side rotation codec 'planar4' not implemented"
 ///
-/// Requires: `RMLX_TEST_BONSAI=/path/to/prism-ml__Ternary-Bonsai-8B-mlx-2bit`
+/// Requires: `RMLX_TEST_MODEL_BONSAI=/path/to/prism-ml__Ternary-Bonsai-8B-mlx-2bit`
 #[test]
 fn planar4_on_k_side_rejected() {
-    let bonsai = if let Ok(p) = std::env::var("RMLX_TEST_BONSAI") {
+    let bonsai = if let Ok(p) = std::env::var("RMLX_TEST_MODEL_BONSAI") {
         p
     } else {
-        eprintln!("skipping planar4_on_k_side_rejected: RMLX_TEST_BONSAI not set");
+        eprintln!("skipping planar4_on_k_side_rejected: RMLX_TEST_MODEL_BONSAI not set");
         return;
     };
     let r = run(&["info", "--model", &bonsai, "--cache-type-k", "planar4"]);
@@ -215,13 +215,13 @@ fn planar4_on_k_side_rejected() {
 ///
 /// stderr: "Qwen MoE family requires K-side bits >= 8"
 ///
-/// Requires: `RMLX_TEST_QWEN36=/path/to/mlx-community__Qwen3.6-35B-A3B-8bit`
+/// Requires: `RMLX_TEST_MODEL_QWEN36=/path/to/mlx-community__Qwen3.6-35B-A3B-8bit`
 #[test]
 fn qwen_moe_low_k_bits_rejected() {
-    let qwen = if let Ok(p) = std::env::var("RMLX_TEST_QWEN36") {
+    let qwen = if let Ok(p) = std::env::var("RMLX_TEST_MODEL_QWEN36") {
         p
     } else {
-        eprintln!("skipping qwen_moe_low_k_bits_rejected: RMLX_TEST_QWEN36 not set");
+        eprintln!("skipping qwen_moe_low_k_bits_rejected: RMLX_TEST_MODEL_QWEN36 not set");
         return;
     };
     let r = run(&[
@@ -250,13 +250,15 @@ fn qwen_moe_low_k_bits_rejected() {
 /// ACCEPTED (the shared-KV path dequantises before share). `info` does no
 /// inference, so it must exit 0 with the Mixed combo resolved.
 ///
-/// Requires: `RMLX_TEST_GEMMA4_E4B=/path/to/mlx-community__gemma-4-e4b-it-mxfp8`
+/// Requires: `RMLX_TEST_MODEL_GEMMA4_E4B=/path/to/mlx-community__gemma-4-e4b-it-mxfp8`
 #[test]
 fn gemma4_mixed_cache_type_spec_accepted() {
-    let gemma4 = if let Ok(p) = std::env::var("RMLX_TEST_GEMMA4_E4B") {
+    let gemma4 = if let Ok(p) = std::env::var("RMLX_TEST_MODEL_GEMMA4_E4B") {
         p
     } else {
-        eprintln!("skipping gemma4_mixed_cache_type_spec_accepted: RMLX_TEST_GEMMA4_E4B not set");
+        eprintln!(
+            "skipping gemma4_mixed_cache_type_spec_accepted: RMLX_TEST_MODEL_GEMMA4_E4B not set"
+        );
         return;
     };
     let r = run(&[
@@ -278,13 +280,15 @@ fn gemma4_mixed_cache_type_spec_accepted() {
 /// `--kv-quant mixed_k8g128_v4g64` on Gemma4 is now accepted at startup
 /// (validate_resolved no longer rejects shared-KV + Mixed).
 ///
-/// Requires: `RMLX_TEST_GEMMA4_E4B=/path/to/mlx-community__gemma-4-e4b-it-mxfp8`
+/// Requires: `RMLX_TEST_MODEL_GEMMA4_E4B=/path/to/mlx-community__gemma-4-e4b-it-mxfp8`
 #[test]
 fn gemma4_mixed_kv_quant_preset_accepted() {
-    let gemma4 = if let Ok(p) = std::env::var("RMLX_TEST_GEMMA4_E4B") {
+    let gemma4 = if let Ok(p) = std::env::var("RMLX_TEST_MODEL_GEMMA4_E4B") {
         p
     } else {
-        eprintln!("skipping gemma4_mixed_kv_quant_preset_accepted: RMLX_TEST_GEMMA4_E4B not set");
+        eprintln!(
+            "skipping gemma4_mixed_kv_quant_preset_accepted: RMLX_TEST_MODEL_GEMMA4_E4B not set"
+        );
         return;
     };
     let r = run(&[
@@ -303,13 +307,13 @@ fn gemma4_mixed_kv_quant_preset_accepted() {
 
 /// `--kv-quant k8v8` on Gemma4 must succeed with exit 0.
 ///
-/// Requires: `RMLX_TEST_GEMMA4_E4B=/path/to/mlx-community__gemma-4-e4b-it-mxfp8`
+/// Requires: `RMLX_TEST_MODEL_GEMMA4_E4B=/path/to/mlx-community__gemma-4-e4b-it-mxfp8`
 #[test]
 fn gemma4_k8v8_accepted() {
-    let gemma4 = if let Ok(p) = std::env::var("RMLX_TEST_GEMMA4_E4B") {
+    let gemma4 = if let Ok(p) = std::env::var("RMLX_TEST_MODEL_GEMMA4_E4B") {
         p
     } else {
-        eprintln!("skipping gemma4_k8v8_accepted: RMLX_TEST_GEMMA4_E4B not set");
+        eprintln!("skipping gemma4_k8v8_accepted: RMLX_TEST_MODEL_GEMMA4_E4B not set");
         return;
     };
     let r = run(&["info", "--model", &gemma4, "--kv-quant", "k8v8"]);
@@ -322,13 +326,13 @@ fn gemma4_k8v8_accepted() {
 
 /// Mixed on Bonsai must NOT be rejected — Bonsai is not a shared-KV arch.
 ///
-/// Requires: `RMLX_TEST_BONSAI=/path/to/prism-ml__Ternary-Bonsai-8B-mlx-2bit`
+/// Requires: `RMLX_TEST_MODEL_BONSAI=/path/to/prism-ml__Ternary-Bonsai-8B-mlx-2bit`
 #[test]
 fn bonsai_mixed_not_rejected() {
-    let bonsai = if let Ok(p) = std::env::var("RMLX_TEST_BONSAI") {
+    let bonsai = if let Ok(p) = std::env::var("RMLX_TEST_MODEL_BONSAI") {
         p
     } else {
-        eprintln!("skipping bonsai_mixed_not_rejected: RMLX_TEST_BONSAI not set");
+        eprintln!("skipping bonsai_mixed_not_rejected: RMLX_TEST_MODEL_BONSAI not set");
         return;
     };
     let r = run(&[
@@ -357,13 +361,15 @@ fn bonsai_mixed_not_rejected() {
 ///
 /// stderr: contains both "q8_g64" and "tq4"
 ///
-/// Requires: `RMLX_TEST_BONSAI=/path/to/prism-ml__Ternary-Bonsai-8B-mlx-2bit`
+/// Requires: `RMLX_TEST_MODEL_BONSAI=/path/to/prism-ml__Ternary-Bonsai-8B-mlx-2bit`
 #[test]
 fn asymmetric_auto_with_tq4_rejected_on_bonsai() {
-    let bonsai = if let Ok(p) = std::env::var("RMLX_TEST_BONSAI") {
+    let bonsai = if let Ok(p) = std::env::var("RMLX_TEST_MODEL_BONSAI") {
         p
     } else {
-        eprintln!("skipping asymmetric_auto_with_tq4_rejected_on_bonsai: RMLX_TEST_BONSAI not set");
+        eprintln!(
+            "skipping asymmetric_auto_with_tq4_rejected_on_bonsai: RMLX_TEST_MODEL_BONSAI not set"
+        );
         return;
     };
     let r = run(&[

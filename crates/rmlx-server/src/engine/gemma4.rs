@@ -165,7 +165,13 @@ impl Gemma4Generator {
             "Gemma4Generator: parsed EOS token ids from config.json"
         );
 
-        let model = rmlx_models::arch::load_model(model_dir, device)?;
+        let model = rmlx_models::arch::load_model(
+            model_dir,
+            device,
+            &rmlx_models::arch::LoadOpts {
+                yarn: load_cfg.yarn,
+            },
+        )?;
 
         let tk_path = model_dir.join("tokenizer.json");
         let tokenizer = tokenizers::Tokenizer::from_file(&tk_path)

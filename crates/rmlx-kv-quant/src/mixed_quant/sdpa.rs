@@ -21,17 +21,11 @@ use super::state::MixedTuple;
 /// Threshold below which a softmax probability is treated as zero for V-row
 /// dequant (sparse-V cheap path).
 ///
-/// Default: 1e-6 (matching TheTom `experimental_decode_speed_tests` TURBO_SPARSE_V).
-/// Override at runtime via `RMLX_SPARSE_V_THRESHOLD=<f32>`.
-/// Set to `0.0` to disable (equivalent to unset / off).
+/// Hardcoded `1e-6` (`RMLX_SPARSE_V_THRESHOLD` env var removed in PASS 3).
+/// Matches TheTom `experimental_decode_speed_tests` `TURBO_SPARSE_V` default.
+#[inline]
 fn sparse_v_threshold() -> f32 {
-    static THRESHOLD: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *THRESHOLD.get_or_init(|| {
-        std::env::var("RMLX_SPARSE_V_THRESHOLD")
-            .ok()
-            .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(1e-6_f32)
-    })
+    1e-6_f32
 }
 
 /// Byte-for-byte port of `mixed_quantized_scaled_dot_product_attention`
@@ -179,7 +173,7 @@ pub fn mixed_quantized_sdpa(
         }
     };
 
-    // Fused sparse-V MSL kernel — opt-in via RMLX_SPARSE_V_KERNEL=1.
+    // Fused sparse-V MSL kernel — always ON (hardcoded default, PASS 3).
     let t_seq = q_values.codes.shape()[2]; // actual context length
     let use_t33 =
         sparse_v_kernel_enabled() && l == 1 && (v_bits == 4 || v_bits == 8) && t_seq >= 8192;

@@ -133,23 +133,39 @@ pub fn sparse_attn_enabled() -> bool {
 
 /// Returns `true` when the GPU-resident `QuantIsoV3` mirror is enabled.
 ///
-/// **Default OFF** (bench-driven decision). Set `RMLX_GPU_RESIDENT_ISO=1` to
-/// opt in. **The value is latched on first call** via `OnceLock`; toggling the
-/// environment variable after the first inference has no effect for the lifetime
-/// of the process. Phase-1 callers (`QuantIsoV3::append_gpu`) rely on this
-/// latching guarantee so that `prev_seq` capture is safe even when steady-state
-/// CPU bookkeeping runs ahead of the gate check.
-///
-/// Phase 1 bench: deltas within the run-to-run noise envelope on the
+/// **Hardcoded OFF** (bench-driven decision; `RMLX_GPU_RESIDENT_ISO` env var
+/// removed in PASS 3 cleanup). Phase-1 bench showed deltas within noise on the
 /// `update_iso3` hot path because the FusedQkShadow already absorbs the dequant.
 /// See [docs/PERF_BASELINE.md] for bench rationale. The remaining 7 codecs
 /// (iso3 K, iso4 V/K, rotor3/4 V/K) are **deferred** until a bench arm shows a
 /// clear win on a FusedQkShadow-incompatible path (PPL eval, prompt-cache hits
 /// that skip prefill, or any seedless workload).
-///
-/// The CLI flag is not yet wired; only the env var.
+#[cfg(not(test))]
+pub fn gpu_resident_iso_enabled() -> bool {
+    false
+}
+
+/// Test-only override for `gpu_resident_iso_enabled`. Latches the value for
+/// the lifetime of the test binary (OnceLock semantics preserved). Call before
+/// any `append_gpu` invocation. GPU mirror tests require `--test-threads=1`.
+#[cfg(test)]
 pub fn gpu_resident_iso_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| matches!(std::env::var("RMLX_GPU_RESIDENT_ISO").as_deref(), Ok("1")))
+    *ENABLED.get_or_init(|| GPU_RESIDENT_ISO_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Test-only setter for the GPU-resident ISO gate. Set to `true` before the
+/// first call to `gpu_resident_iso_enabled()` in the test binary. Requires
+/// `--test-threads=1` (OnceLock latches on first read).
+#[cfg(test)]
+pub(crate) static GPU_RESIDENT_ISO_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Enables the GPU-resident ISO mirror for the remainder of this test binary.
+/// Must be called before any `QuantIsoV3::append_gpu` (OnceLock latches on
+/// first read of `gpu_resident_iso_enabled`). Run tests with `--test-threads=1`.
+#[cfg(test)]
+pub(crate) fn set_gpu_resident_iso_for_test(enabled: bool) {
+    GPU_RESIDENT_ISO_FOR_TEST.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }

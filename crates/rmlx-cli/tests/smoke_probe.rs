@@ -75,8 +75,12 @@ fn smoke_probe_gemma4_mxfp8_is_clean() {
     eprintln!("[smoke_probe] bos='{bos_str}' id={bos_id}");
 
     // Load model via arch dispatch (not gemma4::load_from_path directly).
-    let model = rmlx_models::arch::load_model(model_path, rmlx_mlx::Device::Cpu)
-        .expect("arch::load_model should succeed for Gemma4ForConditionalGeneration");
+    let model = rmlx_models::arch::load_model(
+        model_path,
+        rmlx_mlx::Device::Cpu,
+        &rmlx_models::arch::LoadOpts::default(),
+    )
+    .expect("arch::load_model should succeed for Gemma4ForConditionalGeneration");
 
     // CPU: generate_greedy re-encodes the full prefix each step (O(N²), no KV cache).
     // kv_quant_override = None: use arch default (KvCacheBuilder::for_arch_default).

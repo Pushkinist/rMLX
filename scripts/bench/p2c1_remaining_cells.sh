@@ -178,9 +178,10 @@ run_cell() {
             --device gpu --kv-quant "${kv_quant}" --max-ctx "${max_ctx}" \
             > "${SERVE_LOG}" 2>&1 &
     else
-        RMLX_SPEC_K="${spec_k}" "${RMLX_BIN}" serve \
+        "${RMLX_BIN}" serve \
             --model "${VERIFIER_PATH}" \
             --draft-model "${DRAFT_PATH}" \
+            --draft-block-size "${spec_k}" \
             --port "${PORT}" --host 127.0.0.1 \
             --device gpu --kv-quant "${kv_quant}" --max-ctx "${max_ctx}" \
             > "${SERVE_LOG}" 2>&1 &

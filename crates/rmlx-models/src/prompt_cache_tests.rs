@@ -730,45 +730,22 @@ fn partial_hit_truncates_to_matched_block_boundary() {
 // ── resolve_ram_cap_bytes ────────────────────────────────────────
 
 #[test]
-fn ram_resolver_default_when_both_absent() {
-    assert_eq!(resolve_ram_cap_bytes(None, None), DEFAULT_MAX_BYTES);
-}
-
-#[test]
-fn ram_resolver_env_only() {
-    assert_eq!(resolve_ram_cap_bytes(None, Some("536870912")), 536_870_912);
-}
-
-#[test]
-fn ram_resolver_env_invalid_falls_through() {
-    assert_eq!(
-        resolve_ram_cap_bytes(None, Some("notanumber")),
-        DEFAULT_MAX_BYTES
-    );
+fn ram_resolver_default_when_absent() {
+    assert_eq!(resolve_ram_cap_bytes(None), DEFAULT_MAX_BYTES);
 }
 
 #[test]
 fn ram_resolver_cli_only() {
     // 1.5 GiB
-    let bytes = resolve_ram_cap_bytes(Some(1.5), None);
+    let bytes = resolve_ram_cap_bytes(Some(1.5));
     assert_eq!(bytes, (1.5 * 1024.0 * 1024.0 * 1024.0) as u64);
 }
 
 #[test]
-fn ram_resolver_cli_overrides_env() {
-    // CLI 1 GiB beats env 512 MiB.
-    let bytes = resolve_ram_cap_bytes(Some(1.0), Some("536870912"));
-    assert_eq!(bytes, 1024 * 1024 * 1024);
-}
-
-#[test]
-fn ram_resolver_cli_negative_falls_through() {
-    // Negative CLI is rejected → env wins.
-    let bytes = resolve_ram_cap_bytes(Some(-1.0), Some("123456"));
-    assert_eq!(bytes, 123_456);
-    // No env either → default.
-    let bytes2 = resolve_ram_cap_bytes(Some(-1.0), None);
-    assert_eq!(bytes2, DEFAULT_MAX_BYTES);
+fn ram_resolver_cli_negative_falls_through_to_default() {
+    // Negative CLI is rejected → default.
+    let bytes = resolve_ram_cap_bytes(Some(-1.0));
+    assert_eq!(bytes, DEFAULT_MAX_BYTES);
 }
 
 // ── unified ArchPromptCache ──────────────────────────────────────

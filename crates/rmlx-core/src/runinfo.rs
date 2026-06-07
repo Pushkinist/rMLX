@@ -23,7 +23,9 @@ fn chrono_now_compact() -> String {
     format!("{y:04}{m:02}{d:02}-{hh:02}{mm:02}{ss:02}")
 }
 
-fn git_short_sha() -> Option<String> {
+/// Return the short git SHA of the current HEAD, or `None` when the working
+/// directory has no git repo (e.g. an installed binary without a checkout).
+pub fn git_short_sha() -> Option<String> {
     let out = Command::new("git")
         .args(["rev-parse", "--short=7", "HEAD"])
         .output()

@@ -137,21 +137,19 @@ impl Gemma4AssistantDrafter {
         let kv_len_sliding = sliding_kv.0.shape()[2];
         let swa_mask = self.build_swa_mask(kv_offset, 1, kv_len_sliding)?;
 
-        // numeric-diff: dump round-0 only (per-step files would otherwise
-        // be overwritten by later rounds with a different conditioning hidden).
-        let dump = dump_dir().filter(|d| !d.join("dumped_inputs").exists());
-        if let Some(d) = dump.as_ref() {
-            {
-                dump_scalar_u32(d, "last_token", last_token);
-                dump_scalar_u32(d, "kv_offset", kv_offset as u32);
-                dump_array(d, "hidden_in", hidden, self.device);
-                dump_array(d, "sliding_k", sliding_kv.0, self.device);
-                dump_array(d, "sliding_v", sliding_kv.1, self.device);
-                dump_array(d, "full_k", full_kv.0, self.device);
-                dump_array(d, "full_v", full_kv.1, self.device);
-                std::fs::write(d.join("dumped_inputs"), "1").ok();
-            }
-        }
+        // numeric-diff: trace round-0 inputs so --log verbose / RUST_LOG=rmlx=trace
+        // surfaces them without requiring an fs dump directory.
+        tracing::trace!(
+            target: "rmlx::mtp",
+            last_token,
+            kv_offset,
+            hidden_shape = ?hidden.shape(),
+            sliding_k_shape = ?sliding_kv.0.shape(),
+            sliding_v_shape = ?sliding_kv.1.shape(),
+            full_k_shape = ?full_kv.0.shape(),
+            full_v_shape = ?full_kv.1.shape(),
+            "mtp_draft round-0 inputs"
+        );
 
         let mut tok = last_token;
         let mut h_prev = hidden.try_clone()?; // [1,1,backbone_hidden]
@@ -163,13 +161,6 @@ impl Gemma4AssistantDrafter {
             let cat = concatenate(&[&tok_embed, &h_prev], -1, self.device)?; // [1,1,2*backbone]
             let h = self.pre_projection.forward(&cat, self.device)?; // [1,1,draft_hidden]
 
-            if let Some(d) = dump.as_ref() {
-                if step < 4 {
-                    dump_array(d, &format!("s{step}_tok_embed"), &tok_embed, self.device);
-                    dump_array(d, &format!("s{step}_pre_proj"), &h, self.device);
-                }
-            }
-
             let mut h = h;
             for (li, layer) in self.layers.iter().enumerate() {
                 let (sk, sv, mask) = match layer.layer_type {
@@ -177,22 +168,24 @@ impl Gemma4AssistantDrafter {
                     LayerType::FullAttention => (full_kv.0, full_kv.1, None),
                 };
                 h = self.layer_forward(layer, &h, sk, sv, mask, kv_offset)?;
-                if let Some(d) = dump.as_ref() {
-                    if step < 4 {
-                        dump_array(d, &format!("s{step}_l{li}_out"), &h, self.device);
-                    }
-                }
+                tracing::trace!(
+                    target: "rmlx::mtp",
+                    step,
+                    li,
+                    out_shape = ?h.shape(),
+                    "mtp_draft layer out"
+                );
             }
             let h = self.norm.forward(&h, self.device)?; // [1,1,draft_hidden]
             h_prev = self.post_projection.forward(&h, self.device)?; // [1,1,backbone]
 
             let next = self.masked_argmax(&h)?;
-            if let Some(d) = dump.as_ref() {
-                if step < 4 {
-                    dump_array(d, &format!("s{step}_norm_h"), &h, self.device);
-                    dump_scalar_u32(d, &format!("s{step}_argmax"), next);
-                }
-            }
+            tracing::trace!(
+                target: "rmlx::mtp",
+                step,
+                argmax = next,
+                "mtp_draft step"
+            );
             tokens.push(next);
             tok = next;
         }
@@ -336,33 +329,6 @@ impl Gemma4AssistantDrafter {
         let arr = Array::from_bytes(bytes, &[1, 1, query_len, kv_len], Dtype::F32)?;
         Ok(Some(arr))
     }
-}
-
-/// Numeric-diff dump. Active only when `RMLX_MTP_DUMP=<dir>` is set;
-/// writes `<dir>/<name>.bin` (raw f32 LE) + `<dir>/<name>.shape` (CSV dims) so
-/// the mlx-vlm reference (`scripts/mtp_ref_diff.py`) can load the *exact* same
-/// inputs and compare the drafter forward position-by-position. Errors are
-/// swallowed (best-effort diagnostics, never abort generation).
-fn dump_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("RMLX_MTP_DUMP").map(std::path::PathBuf::from)
-}
-
-fn dump_array(dir: &Path, name: &str, a: &Array, device: Device) {
-    let _ = (|| -> Result<()> {
-        std::fs::create_dir_all(dir).ok();
-        let f = a.astype(Dtype::F32, device)?;
-        f.eval()?;
-        let bytes = f.to_bytes()?;
-        std::fs::write(dir.join(format!("{name}.bin")), &bytes).ok();
-        let shape: Vec<String> = a.shape().iter().map(ToString::to_string).collect();
-        std::fs::write(dir.join(format!("{name}.shape")), shape.join(",")).ok();
-        Ok(())
-    })();
-}
-
-fn dump_scalar_u32(dir: &Path, name: &str, v: u32) {
-    std::fs::create_dir_all(dir).ok();
-    std::fs::write(dir.join(format!("{name}.u32")), v.to_string()).ok();
 }
 
 fn i32_array(v: &[i32]) -> Result<Array> {

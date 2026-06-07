@@ -763,7 +763,7 @@ Multiple bench scripts running in parallel = same DB. SQLite WAL handles concurr
 - All recorder invocations are short-lived (single transaction, milliseconds).
 - `PRAGMA busy_timeout=5000` makes contending writers retry instead of failing.
 - The single-MLX-process rule (CLAUDE.md) means parallel bench scripts shouldn't exist anyway. Recorder contention = configuration bug.
-- For belt-and-braces: `metrics/runs.db.write.lock` PID file. Recorder takes flock, refuses to start if lock held by live PID. Released on exit/crash. Only enforced if user opts in (`RMLX_METRICS_LOCK=1`).
+- For belt-and-braces: `metrics/runs.db.write.lock` PID file. Recorder takes flock, refuses to start if lock held by live PID. Released on exit/crash.
 
 ### 8.3 Bench script integration (day-1 DB-only)
 
@@ -1085,7 +1085,7 @@ Runs in this order, exits non-zero on any failure:
 - `observations` INSERTs serialized by SQLite WAL (one writer at a time, readers parallel).
 - `busy_timeout=5000` makes contending writers retry rather than fail.
 - Bench scripts MUST NOT run in parallel against the same model anyway (single MLX process per Mac, CLAUDE.md hard rule).
-- Optional `RMLX_METRICS_LOCK=1` env var enables an external PID-flock on `metrics/runs.db.write.lock` to refuse concurrent recorder invocations.
+- External PID-flock on `metrics/runs.db.write.lock` to refuse concurrent recorder invocations.
 - Grafana datasource (§10.6) opens DB read-only — never blocks writers.
 
 ### 10.6 Grafana / dashboards (DB as a datasource)
@@ -1244,7 +1244,7 @@ For any future Claude session that touches metrics:
 18. **JSON buffer per run** (§8.4) — bench writes `metrics/buffer/pending/<ts>-<uuid>.json`, calls recorder, deletes on success or moves to `failed/` on rejection. Crash recovery via `--replay-pending`.
 19. **`inserted_by` audit field** — every row carries `<tool>@<semver>`. Never NULL. Triage rows by tool when anomalies appear.
 20. **`rmlx metrics doctor`** — run after migrations or before suspect-state operations. Validates schema version, FKs, whitelists, unit/direction sanity.
-21. **No parallel writers.** Single MLX process rule already prevents this. `RMLX_METRICS_LOCK=1` PID-flock available as belt-and-braces.
+21. **No parallel writers.** Single MLX process rule already prevents this. PID-flock available as belt-and-braces.
 22. **Atomicity per run** — one `record` invocation = one transaction = all observations from that run land or none do.
 23. **DB is also a Grafana datasource** — the `observations` table is a time-series. Schema choices privilege read-time derivation over write-time pruning specifically to keep history queryable. Never delete observations to "clean up" — that breaks the dashboards.
 24. **Doc propagation is mandatory** — see §14. New metric/backend/rule here without CLAUDE.md + crate-README updates = drift.

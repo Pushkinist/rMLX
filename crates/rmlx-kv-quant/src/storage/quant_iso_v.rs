@@ -481,10 +481,10 @@ impl QuantIsoV3 {
             self.shape[2] += new_shape[2];
         }
 
-        // SAFETY: OnceLock latches gpu_resident_iso_enabled() on first read;
-        // toggling RMLX_GPU_RESIDENT_ISO mid-process has no effect, so prev_seq
-        // capture above is safe even though step 3 runs unconditionally — the
-        // gate state cannot toggle between this call and the next.
+        // SAFETY: `gpu_resident_iso_enabled()` is hardcoded `false` in
+        // production (PASS 3); in test mode it uses OnceLock latching on first
+        // read. Either way the gate state cannot toggle between prev_seq capture
+        // (above) and this check, so prev_seq is safe to use unconditionally.
         // ── 4. GPU mirror write (gated). ───────────────────────────────────
         if !crate::gpu_resident_iso_enabled() {
             return Ok(());

@@ -35,9 +35,8 @@ use rmlx_loader::{discover_kv_calibration, load_config, load_head_budgets};
 use rmlx_metrics::events::EventRecorder;
 use rmlx_mlx::Device;
 use rmlx_server::{
-    parse_env_keep_alive, register_ssd_prom_hooks, spawn_drainer, AppState, Gemma4Generator,
-    KeepAlivePolicy, ModelLoadConfig, ModelLoader, ModelRegistry, RegistryConfig,
-    SpeculativeGenerator, TtftStore,
+    register_ssd_prom_hooks, spawn_drainer, AppState, Gemma4Generator, KeepAlivePolicy,
+    ModelLoadConfig, ModelLoader, ModelRegistry, RegistryConfig, SpeculativeGenerator, TtftStore,
 };
 use tracing::{info, warn};
 
@@ -632,6 +631,11 @@ pub(crate) fn run_serve(
     // Multimodal encoder-output cache byte budget. `0` disables.
     // Default 512 MiB (set by main.rs default_value_t).
     mm_cache_bytes: usize,
+    // Maximum number of sessions in the LRU session cache. Default 64.
+    session_cache_max_sessions: usize,
+    // Runtime YARN RoPE override for Qwen3 models that lack rope_scaling.
+    // None = no override (default).
+    yarn_override: Option<rmlx_models::qwen3::YarnOverride>,
     sink: &EventRecorder,
 ) -> anyhow::Result<()> {
     // A11: bridge CLI flags into env before any OnceLock consumers run.
@@ -864,6 +868,8 @@ pub(crate) fn run_serve(
         // Calibration is per-model-path and is discovered inside the loader
         // closure below where `path` is known. Default None here.
         calibration: None,
+        // YARN override — propagated from --yarn-factor / --yarn-original-max.
+        yarn: yarn_override,
     };
     let draft_path: Option<std::path::PathBuf> = draft_model.map(Path::to_path_buf);
     // capture draft_kind + draft_block_size for the loader closure.
@@ -1027,10 +1033,8 @@ pub(crate) fn run_serve(
     .map_err(|e| anyhow::anyhow!("metrics record: {e}"))?;
 
     // Resolve the effective keep-alive policy from the precedence chain:
-    //   env RMLX_KEEP_ALIVE > --idle-timeout-secs > default 15 min.
+    //   --idle-timeout-secs > default 15 min.
     // Per-request `keep_alive` field overrides further at request time.
-    let env_policy =
-        parse_env_keep_alive().map_err(|e| anyhow::anyhow!("RMLX_KEEP_ALIVE parse: {e}"))?;
     let flag_policy = match idle_timeout_spec.as_deref() {
         Some(s) => Some(
             rmlx_server::parse_duration_spec(s)
@@ -1038,7 +1042,7 @@ pub(crate) fn run_serve(
         ),
         None => None,
     };
-    let idle_policy = KeepAlivePolicy::resolve(None, env_policy, flag_policy);
+    let idle_policy = KeepAlivePolicy::resolve(None, flag_policy);
     info!(
         address = %addr_str,
         idle_policy = ?idle_policy,
@@ -1047,9 +1051,8 @@ pub(crate) fn run_serve(
     );
 
     // Gather git-sha and hardware-tag for the SPSC drainer record context.
-    // git_sha: read from RMLX_GIT_SHA env (set at build time by build.rs) or
-    // fall back to None — harmless if absent.
-    let drainer_git_sha: Option<String> = std::env::var("RMLX_GIT_SHA").ok();
+    // Falls back to None for installed binaries with no git checkout — harmless.
+    let drainer_git_sha: Option<String> = rmlx_core::runinfo::git_short_sha();
     let drainer_hw_tag = "m5_max_128gb".to_owned();
     let drainer_db_path = rmlx_core::paths::metrics_db_path();
 
@@ -1090,9 +1093,9 @@ pub(crate) fn run_serve(
             max_tokens_cap,
             // A8: per-request HTTP timeout cap (seconds). 0 = disabled.
             max_timeout_secs,
-            session_cache: Arc::new(parking_lot::Mutex::new(
-                rmlx_server::SessionCache::from_env(),
-            )),
+            session_cache: Arc::new(parking_lot::Mutex::new(rmlx_server::SessionCache::new(
+                session_cache_max_sessions,
+            ))),
             // L6: TTFT ring-buffer — empty at startup, populated on first request.
             ttft_store: TtftStore::default(),
             // M30: ITL ring-buffer — empty at startup, populated after first decode.

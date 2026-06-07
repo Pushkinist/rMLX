@@ -42,8 +42,7 @@ use crate::keep_alive::{policy_from_request_field, KeepAlivePolicy};
 pub(crate) struct LoadBody {
     /// Per-request keep-alive override. Negative = pin, `0` = unload-after,
     /// `N>0` = idle TTL in seconds. Absent = use the slot's current policy
-    /// (which is in turn `RMLX_KEEP_ALIVE` env > `--idle-timeout-secs` flag
-    /// > 15-min default).
+    /// (which is in turn `--idle-timeout-secs` flag > 15-min default).
     pub keep_alive: Option<i64>,
 }
 
