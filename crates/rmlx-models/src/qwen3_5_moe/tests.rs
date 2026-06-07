@@ -25,7 +25,8 @@ use super::{
 use super::decoder_layer::AttnBlock;
 use super::layers::{embed_lookup, Embedding};
 use super::prompt_cache::Qwen35MoeEntry;
-use crate::prompt_cache::{chained_block_hashes, PromptCache, BLOCK_TOKENS};
+use crate::prompt_cache::{PromptCache, BLOCK_TOKENS};
+use rmlx_kv_ssd::chained_block_hashes;
 
 fn paro_model_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("RMLX_TEST_MODEL_QWEN36_PARO").map(std::path::PathBuf::from)
@@ -171,7 +172,9 @@ fn prompt_cache_lookup_miss_empty() {
     let mut cache: PromptCache<Qwen35MoeEntry> = PromptCache::new(4);
     let ids = vec![1u32, 2, 3, 4];
     assert!(
-        cache.find_best_prefix(&ids).is_none(),
+        cache
+            .find_best_prefix(&ids, crate::prompt_cache::FNV_OFFSET)
+            .is_none(),
         "empty cache must return None"
     );
 }
@@ -193,7 +196,7 @@ fn prompt_cache_lookup_hit_prefix() {
     let mut new_prompt: Vec<u32> = (0..BLOCK_TOKENS as u32).collect();
     new_prompt.extend(10_000..10_000 + BLOCK_TOKENS as u32);
 
-    let result = cache.find_best_prefix(&new_prompt);
+    let result = cache.find_best_prefix(&new_prompt, crate::prompt_cache::FNV_OFFSET);
     assert!(result.is_some(), "cache must return a prefix hit");
     let (slot_idx, block_count) = result.unwrap();
     assert_eq!(slot_idx, 0, "slot index must be 0");
@@ -211,7 +214,9 @@ fn prompt_cache_lookup_miss_below_threshold() {
 
     let query: Vec<u32> = (1..=10).chain(800..1000u32).collect();
     assert!(
-        cache.find_best_prefix(&query).is_none(),
+        cache
+            .find_best_prefix(&query, crate::prompt_cache::FNV_OFFSET)
+            .is_none(),
         "shared prefix < one 256-token block must return None"
     );
 }
@@ -240,7 +245,7 @@ fn prompt_cache_fifo_eviction() {
 
     // Slot A is gone — its exact prompt no longer matches any block.
     let query_a = make_ids(0);
-    let r = cache.find_best_prefix(&query_a);
+    let r = cache.find_best_prefix(&query_a, crate::prompt_cache::FNV_OFFSET);
     assert!(
         r.is_none(),
         "evicted slot A must not produce a match; got {r:?}"
@@ -248,7 +253,7 @@ fn prompt_cache_fifo_eviction() {
 
     // Slot C must match its own 2-block prompt exactly.
     let query_c = make_ids(2);
-    let rc = cache.find_best_prefix(&query_c);
+    let rc = cache.find_best_prefix(&query_c, crate::prompt_cache::FNV_OFFSET);
     assert!(rc.is_some(), "slot C must match its own prompt");
     let (_, blocks) = rc.unwrap();
     assert_eq!(blocks, 2, "slot C shares both blocks with its own prompt");
@@ -297,7 +302,7 @@ fn prompt_cache_identical_prompt_is_exact_not_partial() {
 
     // Re-request the SAME prompt (regenerate / identical retry).
     let (slot_idx, block_count) = cache
-        .find_best_prefix(&prompt)
+        .find_best_prefix(&prompt, crate::prompt_cache::FNV_OFFSET)
         .expect("identical prompt must hit");
 
     // The fixed callsite predicate: full token-level equality => EXACT.

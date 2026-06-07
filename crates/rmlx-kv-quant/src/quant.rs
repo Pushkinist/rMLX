@@ -414,6 +414,42 @@ pub enum KvQuant {
 }
 
 impl KvQuant {
+    /// Issue #26: stable per-codec salt for namespacing the in-RAM
+    /// prompt/prefix cache key by KV codec.
+    ///
+    /// A single resident model can serve requests under different KV codecs
+    /// (hot-swap, no weight reload). The cached K/V bytes are codec-specific —
+    /// a prefix cached under `None` (bf16) must NOT serve a `K8V4` request. The
+    /// prompt-cache block-hash chain is salted with this value (XOR'd into the
+    /// FNV seed, the same mixing the SSD `layout_key` uses), so two requests
+    /// with the same tokens but different codecs produce disjoint digest
+    /// streams and occupy distinct cache slots — no cross-codec serve.
+    ///
+    /// The salt is a deterministic FNV-1a-64 hash over the codec's canonical
+    /// [`Display`](std::fmt::Display) string (`"none"`, `"k8v4"`,
+    /// `"mixed_k8g64_v4g64"`, …), so it is stable across runs and covers every
+    /// variant — including payload-bearing ones (`Mixed`, `RotK`, `RotorK*Asym`)
+    /// whose payload is part of the Display form. Two codecs render to the same
+    /// string iff they are byte-identical, so the salt is collision-free across
+    /// the enum.
+    #[must_use]
+    pub fn cache_key_salt(&self) -> u64 {
+        // FNV-1a-64 over the canonical Display bytes. Constants are the
+        // standard offset basis / prime — self-contained here because
+        // `rmlx-kv-quant` does not (and must not) depend on `rmlx-kv-ssd`,
+        // where the prompt-cache FNV constants live. The *values* match by
+        // construction (same standard FNV-1a-64 constants).
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        let label = self.to_string();
+        let mut h = FNV_OFFSET;
+        for byte in label.as_bytes() {
+            h ^= u64::from(*byte);
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        h
+    }
+
     /// True for the Mixed-machinery hot path (Mixed + RotK), which dispatches
     /// through `mx.quantize` 3-tuples + `mixed_quantized_sdpa`.
     pub fn uses_mixed_path(&self) -> bool {

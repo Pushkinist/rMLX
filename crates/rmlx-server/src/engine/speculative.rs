@@ -571,8 +571,16 @@ impl Generator for SpeculativeGenerator {
         let prompt_tokens = req.prompt_tokens.clone();
         let n_tokens = req.max_tokens as usize;
         let lock = Arc::clone(&self._lock);
+        // Issue #26: per-request `kv_quant` override wins over the launch
+        // default (explicit or per-ctx auto), scoped to this request only.
         // Same ctx-based auto selection as Gemma4Generator.
-        let kv_quant_override = if self.kv_quant_user_explicit {
+        let kv_quant_override = if let Some(rq) = req.kv_quant_override {
+            tracing::info!(
+                ?rq,
+                "speculative generate: per-request KV-quant override active (issue #26)"
+            );
+            Some(rq)
+        } else if self.kv_quant_user_explicit {
             self.kv_quant_override
         } else {
             let ctx_quant = rmlx_models::kv_cache::kv_quant_for_ctx(prompt_tokens.len());
@@ -583,7 +591,8 @@ impl Generator for SpeculativeGenerator {
             );
             Some(ctx_quant)
         };
-        let max_ctx_override = self.max_ctx_override;
+        // Issue #26: per-request max-ctx ceiling override (#25 lazy-grow path).
+        let max_ctx_override = req.max_ctx_override.or(self.max_ctx_override);
         // F2: capture effective_max_ctx for drainer MetricEvent.ctx_max field.
         let effective_max_ctx_val = self.effective_max_ctx as i64;
         // N2: use effective_prompt_cache_slots override if set by route handler.

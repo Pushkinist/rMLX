@@ -483,14 +483,27 @@ impl Generator for Gemma4Generator {
         let req_images = req.images.clone();
         let vision = self.vision.clone();
         let mm_cache = self.mm_cache.clone();
-        let kv_quant_user_explicit = self.kv_quant_user_explicit;
+        // Issue #26: a per-request `kv_quant` override hot-swaps the KV codec on
+        // the resident model. When present it takes precedence over the launch
+        // `--kv-quant` (explicit or auto) and over the per-ctx auto policy —
+        // exactly like a startup-explicit flag, but scoped to this one request.
+        // The prefix/prompt cache key is namespaced by codec downstream, so a
+        // codec switch never serves mismatched cached KV.
+        let req_kv_quant_override = req.kv_quant_override;
+        let kv_quant_user_explicit = self.kv_quant_user_explicit || req_kv_quant_override.is_some();
         let lock = Arc::clone(&self._lock);
         // Per-request ctx-based KV mode selection in auto mode.
         // When the user gave an explicit `--kv-quant <mode>` flag at startup,
         // honour it for every request. In auto mode, override the arch-resolved
         // default with `kv_quant_for_ctx(prompt_len)` so long-ctx requests
         // automatically use a quant mode suited to that context length.
-        let kv_quant_override = if self.kv_quant_user_explicit {
+        let kv_quant_override = if let Some(rq) = req_kv_quant_override {
+            tracing::info!(
+                ?rq,
+                "generate: per-request KV-quant override active (issue #26)"
+            );
+            Some(rq)
+        } else if self.kv_quant_user_explicit {
             self.kv_quant_override
         } else if matches!(
             self.model.as_ref(),
@@ -511,7 +524,16 @@ impl Generator for Gemma4Generator {
             );
             Some(ctx_quant)
         };
-        let max_ctx_override = self.max_ctx_override;
+        // Issue #26: a per-request `max_ctx` re-sizes the KV-ring virtual
+        // ceiling for this request only (#25 lazy-grow path); `None` keeps the
+        // launch `--max-ctx`. No weight touch — a ring realloc only.
+        let max_ctx_override = req.max_ctx_override.or(self.max_ctx_override);
+        if req.max_ctx_override.is_some() {
+            tracing::info!(
+                max_ctx = ?req.max_ctx_override,
+                "generate: per-request max-ctx override active (issue #26)"
+            );
+        }
         // F2: capture effective_max_ctx for drainer MetricEvent.ctx_max field.
         let effective_max_ctx_val = self.effective_max_ctx as i64;
         // N2: route handler sets effective_prompt_cache_slots = base + active_sessions

@@ -179,7 +179,10 @@ impl SsdHydrate<Qwen35MoeEntry> for SsdHydrator {
             kv_caches,
             lin_caches,
         } = block;
-        let block_hashes = chained_block_hashes_seeded(&prompt_ids, FNV_OFFSET ^ self.layout_key());
+        let block_hashes = chained_block_hashes_seeded(
+            &prompt_ids,
+            FNV_OFFSET ^ self.layout_key() ^ self.kv_quant().cache_key_salt(),
+        );
         Ok(Some(Qwen35MoeEntry {
             prompt_token_ids: prompt_ids,
             block_hashes,

@@ -49,7 +49,7 @@ pub use types::{
 
 // ── Crate-internal re-exports ─────────────────────────────────────────────────
 
-pub(crate) use helpers::record_ttft_and_prefill;
+pub(crate) use helpers::{parse_request_kv_quant, record_ttft_and_prefill};
 
 // ── Test-visible re-exports ───────────────────────────────────────────────────
 
