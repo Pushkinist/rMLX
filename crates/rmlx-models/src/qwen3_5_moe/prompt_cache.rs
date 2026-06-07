@@ -58,6 +58,17 @@ pub(crate) struct Qwen35MoeEntry {
     pub(crate) first_piece: String,
     /// Runtime `KvQuant` discriminant in effect when this snapshot was written.
     pub(crate) kv_quant: Option<KvQuant>,
+    /// True when this entry was reconstructed from the SSD tier and therefore
+    /// stores only the BLOCK-ALIGNED prefix (`prompt_token_ids.len()` is a
+    /// multiple of `BLOCK_TOKENS`). The tail tokens of the original request
+    /// were never prefilled into these caches. The generate loop detects this
+    /// flag to take the `HydratedTail` path: it re-prefills only the missing
+    /// tail on top of the restored KV/lin state, then decodes normally.
+    ///
+    /// MUST be set only in `SsdHydrate::hydrate`; never set by the normal
+    /// RAM-cache push path. Do NOT use the `first_id == 0` heuristic as a
+    /// substitute — `<bos>` token id is 0 for some models.
+    pub(crate) is_ssd_hydrated: bool,
 }
 
 impl PromptCacheEntry for Qwen35MoeEntry {
@@ -81,6 +92,7 @@ impl PromptCacheEntry for Qwen35MoeEntry {
             first_id: self.first_id,
             first_piece: self.first_piece.clone(),
             kv_quant: self.kv_quant,
+            is_ssd_hydrated: self.is_ssd_hydrated,
         })
     }
 
@@ -176,6 +188,10 @@ impl SsdHydrate<Qwen35MoeEntry> for SsdHydrator {
             first_id: 0,
             first_piece: String::new(),
             kv_quant: Some(self.kv_quant()),
+            // SSD-hydrated entries store only the block-aligned prefix.
+            // The generate loop uses this flag to re-prefill the tail tokens
+            // before decoding (HydratedTail path). See `Qwen35MoeEntry::is_ssd_hydrated`.
+            is_ssd_hydrated: true,
         }))
     }
 }
