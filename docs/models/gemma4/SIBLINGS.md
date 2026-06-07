@@ -1,7 +1,7 @@
 # Gemma4 — Sibling-Backend Champions (Phase A)
 
-> Companion: `rMLX.md` (Stage 2 — rMLX full matrix + standing-vs-champion).
-> **Pending. Not yet collected.** This file covers sibling backends only.
+> Companion: [`rMLX.md`](rMLX.md) — rMLX full matrix + standing-vs-champion
+> (Stage 2 **COMPLETE**). This file covers sibling backends only.
 > Plan: `docs/superpowers/plans/CHAMPION_MATRIX_BENCH.md` (`Models: Gemma4`).
 
 **Family:** `gemma4` / `Gemma4ForConditionalGeneration` (text core `gemma4_text`;
