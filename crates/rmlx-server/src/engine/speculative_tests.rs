@@ -14,10 +14,39 @@ fn qwen35_mtp_sidecar_routes_to_mtp_drafter() {
         classify_mtp_draft("qwen3_5_mtp", "qwen3_5_mtp"),
         MtpDraftFamily::Qwen35Mtp
     );
-    // model_type alone is sufficient (some exports leave architectures empty).
+    // model_type alone is sufficient — real Qwen3.6-35B-A3B-MTP-5bit has no
+    // `architectures` array; only `model_type=qwen3_5_mtp` is set.
     assert_eq!(
         classify_mtp_draft("", "qwen3_5_mtp"),
         MtpDraftFamily::Qwen35Mtp
+    );
+}
+
+#[test]
+fn qwen35_mtp_substring_match() {
+    // arch substring: tolerate minor variant suffixes in the arch string.
+    assert_eq!(
+        classify_mtp_draft("qwen3_5_mtp_head_v2", ""),
+        MtpDraftFamily::Qwen35Mtp,
+        "arch substring containing qwen3_5_mtp should route to Qwen35Mtp"
+    );
+    // model_type substring: same tolerance on model_type side.
+    assert_eq!(
+        classify_mtp_draft("", "qwen3_5_mtp_variant"),
+        MtpDraftFamily::Qwen35Mtp,
+        "model_type substring containing qwen3_5_mtp should route to Qwen35Mtp"
+    );
+}
+
+#[test]
+fn empty_config_falls_through_to_qwen35_mtp() {
+    // Both fields absent: legacy blank-config snapshot. The downstream
+    // MtpDrafter::load warns and proceeds by tensor names — this must NOT
+    // be rejected as Unsupported (regression from issue #23 fix scope).
+    assert_eq!(
+        classify_mtp_draft("", ""),
+        MtpDraftFamily::Qwen35Mtp,
+        "blank arch+model_type must fall through to Qwen35Mtp, not Unsupported"
     );
 }
 

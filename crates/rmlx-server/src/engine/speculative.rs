@@ -48,10 +48,26 @@ enum MtpDraftFamily {
 /// Classify an `--draft-kind mtp` draft by its `architectures[0]` and
 /// `model_type`. Both fields are checked because mlx-community snapshots set the
 /// family on one or the other depending on the export tool.
+///
+/// Empty-config fall-through: when BOTH `arch` AND `model_type` are absent/empty
+/// we treat the snapshot as a Qwen3.5 MTP sidecar. Real-world Qwen3.6 MTP
+/// sidecars (e.g. `mlx-community/Qwen3.6-35B-A3B-MTP-5bit`) carry
+/// `model_type=qwen3_5_mtp` but an absent `architectures` array — the downstream
+/// `MtpDrafter::load` (mtp.rs:~288) only warns on a mismatch and proceeds by
+/// tensor names. The issue #23 fix targets *populated* foreign families
+/// (e.g. `Gemma4ForConditionalGeneration`), not blanks.
 fn classify_mtp_draft(arch: &str, model_type: &str) -> MtpDraftFamily {
     if model_type == "gemma4_assistant" || arch.contains("Gemma4Assistant") {
         MtpDraftFamily::Gemma4Assistant
-    } else if model_type == "qwen3_5_mtp" || arch == "qwen3_5_mtp" {
+    } else if arch.contains("qwen3_5_mtp") || model_type.contains("qwen3_5_mtp") {
+        // `arch` checked via substring to tolerate minor variant suffixes; same
+        // token (`qwen3_5_mtp`) is what real Qwen3.6 MTP sidecars carry in
+        // `model_type` (arch field absent in those snapshots).
+        MtpDraftFamily::Qwen35Mtp
+    } else if arch.is_empty() && model_type.is_empty() {
+        // Both fields absent: legacy fall-through to Qwen3.5 MTP sidecar loader,
+        // which warns and proceeds by tensor names. A populated foreign family
+        // (e.g. plain Gemma4) is caught by the Unsupported arm below.
         MtpDraftFamily::Qwen35Mtp
     } else {
         MtpDraftFamily::Unsupported
