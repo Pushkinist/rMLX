@@ -485,7 +485,7 @@ fn serialize_block_refs_timed(
     // ── Phase 2: write to disk ────────────────────────────────────────────────
     let t_write = Instant::now();
     let refs: Vec<(String, &OwnedTensor)> = tensors.iter().map(|(n, t)| (n.clone(), t)).collect();
-    safetensors::serialize_to_file(refs, &Some(meta), path)
+    safetensors::serialize_to_file(refs, Some(meta), path)
         .map_err(|e| Error::Mlx(format!("KV block serialize: {e}")))?;
     let dur_write_us = t_write.elapsed().as_micros() as u64;
 
