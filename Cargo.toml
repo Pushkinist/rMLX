@@ -130,7 +130,7 @@ rustfft = "6.4"
 # mp3  — MPEG Layer 3 codec (symphonia-bundle-mp3/mp3).
 # default-features=false drops AIFF/OGG/FLAC/AAC/MKV/ADPCM from the default
 # registry so only the three features we need are compiled in.
-symphonia = { version = "0.5", default-features = false, features = ["wav", "pcm", "mp3"] }
+symphonia = { version = "0.6", default-features = false, features = ["wav", "pcm", "mp3"] }
 
 # Testing
 tempfile = "3"

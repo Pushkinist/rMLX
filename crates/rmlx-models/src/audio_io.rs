@@ -22,8 +22,11 @@
 use std::io::Cursor;
 
 use symphonia::core::{
-    audio::SampleBuffer, codecs::DecoderOptions, errors::Error as SymphoniaError,
-    formats::FormatOptions, io::MediaSourceStream, meta::MetadataOptions, probe::Hint,
+    codecs::audio::AudioDecoderOptions,
+    errors::Error as SymphoniaError,
+    formats::{probe::Hint, FormatOptions, TrackType},
+    io::MediaSourceStream,
+    meta::MetadataOptions,
 };
 use tracing::{debug, instrument, warn};
 
@@ -44,48 +47,58 @@ pub fn decode_audio_bytes(bytes: &[u8]) -> Result<(Vec<f32>, u32), String> {
     let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
 
     // Probe: let symphonia detect the container type.
-    let probed = symphonia::default::get_probe()
-        .format(
+    let mut reader = symphonia::default::get_probe()
+        .probe(
             &Hint::new(),
             mss,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
+            FormatOptions::default(),
+            MetadataOptions::default(),
         )
         .map_err(|e| format!("audio probe failed: {e}"))?;
 
-    let mut reader = probed.format;
-
     // Pick the first default/best audio track.
     let track = reader
-        .default_track()
+        .default_track(TrackType::Audio)
         .ok_or_else(|| "no audio track found".to_owned())?;
 
     let track_id = track.id;
-    let codec_params = track.codec_params.clone();
+    let audio_params = track
+        .codec_params
+        .as_ref()
+        .and_then(|cp| cp.audio())
+        .ok_or_else(|| "no audio codec parameters".to_owned())?
+        .clone();
 
-    let sample_rate = codec_params
+    let sample_rate = audio_params
         .sample_rate
         .ok_or_else(|| "codec params missing sample_rate".to_owned())?;
 
-    let n_channels = codec_params.channels.map_or(1, |c| c.count()).max(1);
+    let n_channels = audio_params
+        .channels
+        .as_ref()
+        .map_or(1, |c| c.count())
+        .max(1);
 
     debug!(
         sample_rate,
         n_channels, track_id, "audio track selected for decode"
     );
 
-    let mut decoder = symphonia::default::get_codecs()
-        .make(&codec_params, &DecoderOptions::default())
+    let reg_entry = symphonia::default::get_codecs()
+        .get_audio_decoder(audio_params.codec)
+        .ok_or_else(|| "no decoder registered for audio codec".to_owned())?;
+    let mut decoder = (reg_entry.factory)(&audio_params, &AudioDecoderOptions::default())
         .map_err(|e| format!("failed to create audio decoder: {e}"))?;
 
     // Accumulate interleaved f32 samples from all packets.
     let mut interleaved: Vec<f32> = Vec::new();
-    let mut sample_buf: Option<SampleBuffer<f32>> = None;
+    let mut frame_buf: Vec<f32> = Vec::new();
 
     loop {
         let packet = match reader.next_packet() {
-            Ok(p) => p,
+            Ok(Some(p)) => p,
             // End of stream is the normal termination signal.
+            Ok(None) => break,
             Err(SymphoniaError::IoError(ref e))
                 if e.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
@@ -97,7 +110,7 @@ pub fn decode_audio_bytes(bytes: &[u8]) -> Result<(Vec<f32>, u32), String> {
             }
         };
 
-        if packet.track_id() != track_id {
+        if packet.track_id != track_id {
             continue;
         }
 
@@ -110,14 +123,10 @@ pub fn decode_audio_bytes(bytes: &[u8]) -> Result<(Vec<f32>, u32), String> {
             Err(e) => return Err(format!("audio decode error: {e}")),
         };
 
-        // Lazily allocate the sample buffer on the first decoded frame so we
-        // know the exact capacity needed.
-        let spec = *decoded.spec();
-        let sb = sample_buf
-            .get_or_insert_with(|| SampleBuffer::<f32>::new(decoded.capacity() as u64, spec));
-
-        sb.copy_interleaved_ref(decoded);
-        interleaved.extend_from_slice(sb.samples());
+        // Copy decoded audio as interleaved f32, converting sample format as needed.
+        // copy_to_vec_interleaved resizes + overwrites frame_buf, so no clear() needed.
+        decoded.copy_to_vec_interleaved::<f32>(&mut frame_buf);
+        interleaved.extend_from_slice(&frame_buf);
     }
 
     if interleaved.is_empty() {

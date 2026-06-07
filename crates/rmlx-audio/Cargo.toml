@@ -25,8 +25,8 @@ symphonia    = { workspace = true }
 # (used by rmlx-models for LLM tokenization). No new transitive deps added.
 tokenizers   = { workspace = true }
 # miniz_oxide: inflate (DEFLATE decompress) for reading .npz (ZIP+deflate) archives.
-# Already a transitive dep via symphonia → flate2. Pinned to the workspace-resolved
-# version to avoid pulling a second copy. No new transitive deps added.
+# symphonia 0.5 brought this in transitively via flate2; symphonia 0.6 dropped
+# flate2, so miniz_oxide is now a direct dep here. Still no new transitive crates.
 miniz_oxide  = "0.8"
 
 [dev-dependencies]
