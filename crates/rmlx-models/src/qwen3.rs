@@ -64,13 +64,15 @@ use tracing::{debug, info};
 
 use crate::calibration_sink::CalibrationSink;
 use crate::constraint::ConstraintEngine;
-use crate::kv_cache::{kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N};
+use crate::kv_cache::{
+    kv_max_seq_and_ceiling, kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
+};
 use crate::prompt_cache::{
     chained_block_hashes_seeded, ArchPromptCache, PromptCacheEntry, ReusePolicy, SpillSink,
     SsdHydrate, BLOCK_TOKENS, FNV_OFFSET,
 };
 use crate::sampler::{apply_mask_argmax, TokenLogprobs};
-use rmlx_kv_quant::{KvCache, KvQuant, KV_MAX_SEQ_DEFAULT};
+use rmlx_kv_quant::{KvCache, KvQuant};
 use rmlx_kv_ssd::{HydratedBlock, SpillJob, SsdHydrator, SsdSpiller};
 
 /// capture top-`k` logprobs for an already-chosen token.
@@ -2267,15 +2269,12 @@ pub fn generate_greedy(
     // Path B (Miss): full re-prefill from scratch.
     let prefill_t0 = Instant::now();
 
-    // Derive max_seq: user override wins; otherwise derive from mpe, capped at KV_MAX_SEQ_DEFAULT.
-    let max_seq = max_ctx_override.unwrap_or_else(|| {
-        let mpe = model.cfg.max_position_embeddings as i32;
-        if mpe <= 0 || mpe > KV_MAX_SEQ_DEFAULT {
-            KV_MAX_SEQ_DEFAULT
-        } else {
-            mpe
-        }
-    });
+    // Derive initial ring size + virtual ceiling (issue #25): `--max-ctx` is a
+    // ceiling the ring grows lazily up to, not an eager allocation.
+    // `initial_max_seq` is the small lazy start; `max_seq_ceiling` caps growth
+    // and rejects over-long prompts.
+    let (initial_max_seq, max_seq_ceiling) =
+        kv_max_seq_and_ceiling(max_ctx_override, model.cfg.max_position_embeddings as i32);
 
     // Allocate one KvCache per decoder layer using the selected quant mode.
     // Force K8V8 for boundary layers (first head_n + last tail_n).
@@ -2289,7 +2288,9 @@ pub fn generate_greedy(
                 LAYER_ADAPTIVE_TAIL_N,
                 LAYER_ADAPTIVE_HEAD_N,
             );
-            KvCache::with_quant_max_seq(q, max_seq).with_layer_idx(i)
+            KvCache::with_quant_max_seq(q, initial_max_seq)
+                .with_max_seq_ceiling(max_seq_ceiling)
+                .with_layer_idx(i)
         })
         .collect();
 

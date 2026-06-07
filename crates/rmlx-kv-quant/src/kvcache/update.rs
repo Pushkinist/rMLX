@@ -704,6 +704,24 @@ impl KvCache {
             }
         }
 
+        // Virtual ceiling: the resolved `--max-ctx`. The ring grows lazily up
+        // to it; a prefill needing more is rejected before any allocation so a
+        // server started with a large ceiling pays no long-context tax on short
+        // requests. Checked after the env hard cap (both bound the same axis).
+        if let Some(ceiling) = self.max_seq_ceiling {
+            if needed_seq > ceiling {
+                tracing::warn!(
+                    requested = needed_seq,
+                    ceiling,
+                    "KV max-ctx ceiling exceeded — rejecting prefill request"
+                );
+                return Err(Error::KvCeilingExceeded {
+                    requested: needed_seq,
+                    ceiling,
+                });
+            }
+        }
+
         let current_max_seq = storage_max_seq(&self.storage);
         if needed_seq <= current_max_seq {
             return Ok(());
@@ -734,8 +752,14 @@ impl KvCache {
 
         // Grow to next power-of-two ≥ needed. Doubling avoids per-chunk
         // churn during multi-chunk prefill while keeping the buffer within
-        // a single doubling of the request.
-        let new_max_seq = next_pow2_seq(needed_seq);
+        // a single doubling of the request. When a virtual ceiling is set,
+        // clamp the doubled size to it (never allocate past `--max-ctx`):
+        // `needed_seq <= ceiling` is guaranteed by the reject check above, so
+        // the clamped capacity still fits the request.
+        let new_max_seq = match self.max_seq_ceiling {
+            Some(ceiling) => next_pow2_seq(needed_seq).min(ceiling),
+            None => next_pow2_seq(needed_seq),
+        };
 
         tracing::info!(
             from = current_max_seq,
@@ -4781,6 +4805,9 @@ impl KvCache {
             // branching simply drops it; the next decode dispatch on the
             // cloned cache will reallocate from the bf16 prefix.
             fused_qk_shadow: None,
+            // Preserve the virtual ceiling across a branch clone so the cloned
+            // cache enforces the same --max-ctx bound on further prefill.
+            max_seq_ceiling: self.max_seq_ceiling,
         })
     }
 
@@ -6133,7 +6160,7 @@ pub(super) fn next_pow2_seq(needed: i32) -> i32 {
 }
 
 /// Read the `max_seq` recorded on whichever `KvStorage` variant is active.
-fn storage_max_seq(storage: &KvStorage) -> i32 {
+pub(super) fn storage_max_seq(storage: &KvStorage) -> i32 {
     match storage {
         KvStorage::K8V4 { max_seq, .. } => *max_seq,
         KvStorage::K8V8 { max_seq, .. } => *max_seq,
