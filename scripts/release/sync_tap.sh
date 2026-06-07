@@ -26,14 +26,15 @@ else
 fi
 
 mkdir -p "$TAP_DIR/Formula"
-cp "$SRC" "$TAP_DIR/Formula/rmlx.rb"
+cp -f "$SRC" "$TAP_DIR/Formula/rmlx.rb"
 
 ( cd "$TAP_DIR"
   git add Formula/rmlx.rb
   if git diff --cached --quiet; then
     echo "==> tap already up to date"
   else
-    git commit -q -m "rmlx ${VER}"
+    # GitHub email-privacy push block — must commit as the noreply identity, not the operator's global git identity.
+    git -c user.name="Pushkinist" -c user.email="4850452+Pushkinist@users.noreply.github.com" commit -q -m "rmlx ${VER}"
     git push -q
     echo "==> pushed Formula/rmlx.rb (rmlx ${VER}) to $TAP_REPO"
   fi
