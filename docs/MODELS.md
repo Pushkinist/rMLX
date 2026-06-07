@@ -641,8 +641,12 @@ the embedding sequence similarly to image tokens.
 
 **Speculative decoding fully wired for Gemma4.** `forward_seq_last_k_with_cache`,
 `forward_hidden_states`, `forward_hidden_states_shared_kv`, `apply_final_norm`,
-`logits_from_hidden`, `embed_token_raw` all implemented. Supports the MTP head
-drafter and the Gemma4-assistant MTP path.
+`logits_from_hidden`, `embed_token_raw` all implemented. The Gemma4 spec path is
+the **assistant drafter** (`Gemma4AssistantDrafter`), selected with
+`--draft-kind mtp` and a dedicated `*-it-assistant-bf16` draft snapshot. A plain
+`Gemma4ForConditionalGeneration` model is **not** a valid `--draft-kind mtp`
+draft (no MTP sidecar head) and is rejected at load — see `docs/SPECULATIVE.md`
+§"`--draft-kind mtp` dispatch" and issue #23.
 
 ### Weight quantization
 

@@ -434,13 +434,35 @@ respectively.
 `--draft-kind none` is not a valid value; to disable speculative decoding omit
 `--draft-model` and `--draft-kind` entirely.
 
+### `--draft-kind mtp` dispatch (arch-family routing)
+
+`--draft-kind mtp` fronts **two structurally different drafter loaders**, and
+the serve layer (`engine::speculative::classify_mtp_draft`) routes by the draft
+model's **detected architecture family** (`architectures[0]` and `model_type`),
+never a substring guess:
+
+| Draft family (`model_type` / `architectures[0]`) | Drafter loaded | Notes |
+|---|---|---|
+| `qwen3_5_mtp` | `MtpDrafter` (Qwen3.5/3.6-MoE sidecar head) | The MTP head reuses the verifier's embedding, LM head, and one Qwen3.5-MoE decoder layer. |
+| `gemma4_assistant` / `Gemma4Assistant*` | `Gemma4AssistantDrafter` | The dedicated `*-it-assistant-bf16` snapshot — a small Gemma4 decoder stack that reads the verifier's own K/V cache. |
+| anything else (incl. plain `Gemma4ForConditionalGeneration`) | **rejected at load** | Typed `Error::SpeculativePairing`; for a plain Gemma4 draft the message points at the assistant snapshot. |
+
+A **plain Gemma4 model** (`Gemma4ForConditionalGeneration`, e.g.
+`gemma-4-e2b-it-mxfp8`) is **not** a valid `--draft-kind mtp` draft: it has no
+MTP sidecar head and is not the assistant drafter. Passing one is rejected at
+load with an actionable error rather than falling through to the Qwen3.5
+sidecar loader (which previously leaked a confusing `text_config missing
+num_experts` error — issue #23). Use the `*-it-assistant-bf16` assistant
+snapshot for Gemma4 speculative decoding.
+
 ### Example invocations
 
 ```text
-# Two-model Gemma4 speculative (31B verifier + E2B draft):
+# Gemma4 assistant speculative (verifier + dedicated assistant drafter):
+# the draft MUST be the *-assistant-bf16 snapshot, NOT a plain Gemma4 model.
 rmlx serve \
-  --model   /path/to/gemma-4-31b-mxfp8 \
-  --draft-model /path/to/gemma-4-e2b-mxfp8 \
+  --model   /path/to/gemma-4-e2b-it-mxfp8 \
+  --draft-model /path/to/gemma-4-E2B-it-assistant-bf16 \
   --draft-kind  mtp \
   --draft-block-size 6
 

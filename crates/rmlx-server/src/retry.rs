@@ -148,6 +148,10 @@ pub fn classify(err: &RmlxError) -> RetryClass {
         // The prompt exceeds the operator-declared context bound; replaying
         // would hit the same ceiling. Fatal (same class as the hard cap).
         RmlxError::KvCeilingExceeded { .. } => RetryClass::Fatal,
+        // Unsupported `--draft-model` + `--draft-kind` pairing. Structural
+        // misconfiguration detected at load; replaying would hit the same
+        // rejection. Fatal.
+        RmlxError::SpeculativePairing { .. } => RetryClass::Fatal,
         // Non-exhaustive catch-all: future variants default to Fatal.
         _ => RetryClass::Fatal,
     }
