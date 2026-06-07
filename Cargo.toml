@@ -57,7 +57,7 @@ toml       = "0.8"
 
 # I/O
 memmap2     = "0.9"
-safetensors = "0.4"
+safetensors = "0.7"
 
 # Image decode + resize for the jina-v4 Qwen2.5-VL image front-end
 # (user-approved 2026-05-19). Scoped to the only two
