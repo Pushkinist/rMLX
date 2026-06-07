@@ -99,38 +99,23 @@ fn parse_rejects_missing_number() {
 // ── KeepAlivePolicy::resolve ─────────────────────────────────────────────────
 
 #[test]
-fn resolve_request_wins_over_env_and_flag() {
+fn resolve_request_wins_over_flag() {
     let r = KeepAlivePolicy::resolve(
         Some(KeepAlivePolicy::Pin),
-        Some(KeepAlivePolicy::Idle(Duration::from_secs(60))),
         Some(KeepAlivePolicy::Idle(Duration::from_secs(120))),
     );
     assert_eq!(r, KeepAlivePolicy::Pin);
 }
 
 #[test]
-fn resolve_env_wins_over_flag() {
-    let r = KeepAlivePolicy::resolve(
-        None,
-        Some(KeepAlivePolicy::Idle(Duration::from_secs(60))),
-        Some(KeepAlivePolicy::Idle(Duration::from_secs(120))),
-    );
-    assert_eq!(r, KeepAlivePolicy::Idle(Duration::from_secs(60)));
-}
-
-#[test]
-fn resolve_flag_wins_when_no_request_or_env() {
-    let r = KeepAlivePolicy::resolve(
-        None,
-        None,
-        Some(KeepAlivePolicy::Idle(Duration::from_secs(120))),
-    );
+fn resolve_flag_wins_when_no_request() {
+    let r = KeepAlivePolicy::resolve(None, Some(KeepAlivePolicy::Idle(Duration::from_secs(120))));
     assert_eq!(r, KeepAlivePolicy::Idle(Duration::from_secs(120)));
 }
 
 #[test]
 fn resolve_default_15m_when_nothing_set() {
-    let r = KeepAlivePolicy::resolve(None, None, None);
+    let r = KeepAlivePolicy::resolve(None, None);
     assert_eq!(
         r,
         KeepAlivePolicy::Idle(Duration::from_secs(KeepAlivePolicy::DEFAULT_TTL_SECS))

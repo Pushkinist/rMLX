@@ -57,11 +57,12 @@
 //!
 //! # Activation
 //!
-//! Default: **ON**. Disable via `RMLX_SPARSE_V_KERNEL=0`. The kernel is only
-//! invoked for L=1 (single decode step); prefill always uses `quantized_matmul`.
+//! Always ON (hardcoded; `RMLX_SPARSE_V_KERNEL` env var removed in PASS 3).
+//! The kernel is only invoked for L=1 (single decode step); prefill always
+//! uses `quantized_matmul`.
 //!
-//! Default-ON after regression bench: VG.2 PASS
-//! (2/2 greedy identity), 0/20 cells regressed, 6/20 cells beaten.
+//! Default-ON rationale: VG.2 PASS (2/2 greedy identity), 0/20 cells regressed,
+//! 6/20 cells beaten.
 //!
 //! # Reference
 //!
@@ -81,35 +82,26 @@ use rmlx_core::error::{Error, Result};
 use rmlx_mlx::metal_kernel::{MetalKernel, MetalKernelInvoke};
 use rmlx_mlx::{Array, Device, Dtype};
 
-// ── Env-var guards ────────────────────────────────────────────────────────────
+// ── Kernel gates (hardcoded defaults, PASS 3 cleanup) ────────────────────────
 
-/// Returns true when the fused sparse-V MSL kernel is enabled.
+/// Returns `true` when the fused sparse-V MSL kernel is enabled.
 ///
-/// Default ON. Disable via `RMLX_SPARSE_V_KERNEL=0` to fall back to the
-/// the cheap-path only (zeros probs but still pays quantized_matmul bandwidth).
-///
-/// Default-ON: VG.2 PASS, 0/20 cells regressed,
+/// Hardcoded ON (`RMLX_SPARSE_V_KERNEL` env var removed in PASS 3).
+/// Default-ON rationale: VG.2 PASS, 0/20 cells regressed,
 /// 6/20 cells beaten (Gemma26B k8v8 +6-9%, Gemma26B planar +5-11%).
+#[inline]
 pub fn sparse_v_kernel_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        match std::env::var("RMLX_SPARSE_V_KERNEL").as_deref() {
-            Ok("0") => false,
-            _ => true, // default ON
-        }
-    })
+    true
 }
 
 /// Threshold below which a softmax probability is treated as negligible and
-/// its V-row dequant is skipped. Shared with `RMLX_SPARSE_V_THRESHOLD` from the cheap-path.
+/// its V-row dequant is skipped. Shared with the cheap-path in `mixed_quant::sdpa`.
+///
+/// Hardcoded `1e-6` (`RMLX_SPARSE_V_THRESHOLD` env var removed in PASS 3).
+/// Matches TheTom `experimental_decode_speed_tests` `TURBO_SPARSE_V` default.
+#[inline]
 fn kernel_eps() -> f32 {
-    static EPS: OnceLock<f32> = OnceLock::new();
-    *EPS.get_or_init(|| {
-        std::env::var("RMLX_SPARSE_V_THRESHOLD")
-            .ok()
-            .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(1e-6_f32)
-    })
+    1e-6_f32
 }
 
 // ── MSL kernel source ─────────────────────────────────────────────────────────

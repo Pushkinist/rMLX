@@ -51,11 +51,14 @@ impl LogLevel {
 /// Filter precedence: `RUST_LOG` (escape hatch) > `--log` flag preset.
 /// The default size-cap rotation sweep runs before the appender is opened
 /// so the newly-created file is never the one we delete.
-pub(crate) fn init_tracing(run_id: &str, level: LogLevel) -> Result<WorkerGuard> {
+///
+/// `log_cap_mb` is the resolved value of `--log-cap-mb` (default 100). The
+/// caller is responsible for supplying the final value; no env read happens here.
+pub(crate) fn init_tracing(run_id: &str, level: LogLevel, log_cap_mb: u64) -> Result<WorkerGuard> {
     use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
     let logs_dir = rmlx_core::paths::logs_dir();
-    rotate_logs(&logs_dir);
+    rotate_logs(&logs_dir, log_cap_mb);
 
     let file_appender = tracing_appender::rolling::never(&logs_dir, format!("{run_id}.jsonl"));
     let (nb_writer, guard) = tracing_appender::non_blocking(file_appender);
@@ -87,19 +90,14 @@ pub(crate) fn init_tracing(run_id: &str, level: LogLevel) -> Result<WorkerGuard>
 // rotate_logs
 // ---------------------------------------------------------------------------
 
-/// Total log-size cap in megabytes. Override via `RMLX_LOG_CAP_MB`.
-const DEFAULT_LOG_CAP_MB: u64 = 100;
-
 /// Delete oldest `*.jsonl` files in `dir` until total bytes ≤ cap.
 /// Best-effort: any FS error during scan or delete is logged at WARN and
 /// swallowed — log rotation must never bring down the server. Runs once at
 /// startup, before the new run's appender is opened (so the in-flight file
 /// is never a candidate for deletion).
-pub(crate) fn rotate_logs(dir: &std::path::Path) {
-    let cap_mb = std::env::var("RMLX_LOG_CAP_MB")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_LOG_CAP_MB);
+///
+/// `cap_mb` is the caller-resolved value (from `--log-cap-mb`, default 100).
+pub(crate) fn rotate_logs(dir: &std::path::Path, cap_mb: u64) {
     let cap_bytes = cap_mb.saturating_mul(1024 * 1024);
 
     let Ok(entries) = std::fs::read_dir(dir) else {

@@ -2240,7 +2240,7 @@ impl KvCache {
     /// not guaranteed to match Metal allocator accounting byte-for-byte.
     ///
     /// **Intentionally excludes paged-pool overhead**: paged KV storage
-    /// (`RMLX_PAGED_KV`) is default-OFF, so paged-pool overhead is always 0
+    /// (`--paged-kv`) is default-OFF, so paged-pool overhead is always 0
     /// on normal paths. If/when `paged_kv_enabled()` is flipped default-ON,
     /// add a `paged_overhead_bytes()` method to `PagedKvArena` and sum it
     /// alongside this estimate. See K15 in `docs/tasks/groups/group-K-backlog.md`.
@@ -4531,7 +4531,7 @@ impl KvCache {
         Ok((k_full, v_full))
     }
 
-    /// PagedAttention decode-step update (`RMLX_PAGED_KV=1`).
+    /// PagedAttention decode-step update (paged KV path, `--paged-kv`).
     ///
     /// Steps:
     /// 1. Quantize `new_k` (q8_0) and `new_v` (TurboQuant V4 / q8_0 / Planar)

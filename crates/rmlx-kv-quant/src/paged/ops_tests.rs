@@ -27,67 +27,29 @@ fn paged_kv_page_tokens_positive() {
 // ── resolve_paged_kv ──────────────────────────────────────────────
 
 #[test]
-fn paged_resolver_default_both_absent() {
-    assert!(!resolve_paged_kv(false, None));
+fn paged_resolver_default_absent() {
+    assert!(!resolve_paged_kv(false));
 }
 
 #[test]
-fn paged_resolver_cli_only_true() {
-    assert!(resolve_paged_kv(true, None));
-}
-
-#[test]
-fn paged_resolver_env_only_true() {
-    assert!(resolve_paged_kv(false, Some("1")));
-}
-
-#[test]
-fn paged_resolver_env_only_false() {
-    assert!(!resolve_paged_kv(false, Some("0")));
-    assert!(!resolve_paged_kv(false, Some("garbage")));
-}
-
-#[test]
-fn paged_resolver_cli_true_overrides_env_false() {
-    assert!(resolve_paged_kv(true, Some("0")));
-}
-
-#[test]
-fn paged_resolver_cli_false_lets_env_decide() {
-    // CLI default false; env "1" → enable.
-    assert!(resolve_paged_kv(false, Some("1")));
-    // CLI default false; env "0" → off.
-    assert!(!resolve_paged_kv(false, Some("0")));
+fn paged_resolver_cli_true() {
+    assert!(resolve_paged_kv(true));
 }
 
 #[test]
 fn paged_page_tokens_resolver_default() {
-    assert_eq!(
-        resolve_paged_kv_page_tokens(None, None),
-        DEFAULT_PAGE_TOKENS
-    );
+    assert_eq!(resolve_paged_kv_page_tokens(None), DEFAULT_PAGE_TOKENS);
 }
 
 #[test]
-fn paged_page_tokens_resolver_cli_wins() {
-    assert_eq!(resolve_paged_kv_page_tokens(Some(64), Some("128")), 64);
-}
-
-#[test]
-fn paged_page_tokens_resolver_env_fallback() {
-    assert_eq!(resolve_paged_kv_page_tokens(None, Some("128")), 128);
+fn paged_page_tokens_resolver_cli() {
+    assert_eq!(resolve_paged_kv_page_tokens(Some(64)), 64);
 }
 
 #[test]
 fn paged_page_tokens_resolver_invalid_falls_through() {
-    assert_eq!(
-        resolve_paged_kv_page_tokens(Some(0), Some("0")),
-        DEFAULT_PAGE_TOKENS
-    );
-    assert_eq!(
-        resolve_paged_kv_page_tokens(Some(-5), Some("notnum")),
-        DEFAULT_PAGE_TOKENS
-    );
+    assert_eq!(resolve_paged_kv_page_tokens(Some(0)), DEFAULT_PAGE_TOKENS);
+    assert_eq!(resolve_paged_kv_page_tokens(Some(-5)), DEFAULT_PAGE_TOKENS);
 }
 
 // Tests below require MLX runtime (zeros/slice_update/concatenate).

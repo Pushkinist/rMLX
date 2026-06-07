@@ -97,7 +97,7 @@ pub(crate) fn run_ppl(
 
     // -- Load model -------------------------------------------------------------
     let ts_load = Instant::now();
-    let model = arch::load_model(model_path, device)
+    let model = arch::load_model(model_path, device, &arch::LoadOpts::default())
         .map_err(|e| anyhow::anyhow!("arch::load_model: {e}"))?;
     let load_ms = ts_load.elapsed().as_millis() as f64;
     info!(load_ms, arch = model.arch_class(), "ppl: model loaded");

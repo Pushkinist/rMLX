@@ -646,6 +646,7 @@ async fn real_generation_openai_chat_completions() {
             prompt_cache_slots: 4,
             mm_cache: None,
             calibration: None,
+            yarn: None,
         },
         Arc::new(parking_lot::Mutex::new(())),
     )
@@ -700,6 +701,7 @@ async fn real_generation_anthropic_messages() {
             prompt_cache_slots: 4,
             mm_cache: None,
             calibration: None,
+            yarn: None,
         },
         Arc::new(parking_lot::Mutex::new(())),
     )
@@ -1281,6 +1283,7 @@ async fn h3_non_streaming_usage_triple_exact() {
             prompt_cache_slots: 4,
             mm_cache: None,
             calibration: None,
+            yarn: None,
         },
         Arc::new(parking_lot::Mutex::new(())),
     )
@@ -1358,6 +1361,7 @@ async fn h4_streaming_include_usage_true_emits_usage_chunk() {
             prompt_cache_slots: 4,
             mm_cache: None,
             calibration: None,
+            yarn: None,
         },
         Arc::new(parking_lot::Mutex::new(())),
     )
@@ -1444,6 +1448,7 @@ async fn h4_streaming_include_usage_false_no_usage_in_stream() {
             prompt_cache_slots: 4,
             mm_cache: None,
             calibration: None,
+            yarn: None,
         },
         Arc::new(parking_lot::Mutex::new(())),
     )

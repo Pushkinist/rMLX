@@ -8,7 +8,7 @@
 #   MODEL_FILTER=e4b ./scripts/bench/turboquant_v3_bench.sh
 #
 # Required env:
-#   RMLX_OMODELS_DIR  — path to your Open Models snapshots root (see .env.example)
+#   RMLX_O_MODELS_ROOT  — path to your Open Models snapshots root (see .env.example)
 #
 # Optional env (all have defaults):
 #   RMLX_BIN         — path to rmlx binary (default: <repo>/target/release-perf/rmlx)
@@ -28,7 +28,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 : "${LOG_DIR:=$REPO_ROOT/.rmlx/bench/turboquant_v3}"
 
 # Model paths — required, fail loudly if unset
-: "${RMLX_OMODELS_DIR:?set RMLX_OMODELS_DIR to your Open Models snapshots root (see .env.example)}"
+: "${RMLX_O_MODELS_ROOT:?set RMLX_O_MODELS_ROOT to your Open Models snapshots root (see .env.example)}"
 
 # Prompt file
 : "${PROMPT_FILE:=$REPO_ROOT/prompts/longctx_16k.json}"
@@ -42,7 +42,7 @@ MAX_TOKENS="${MAX_TOKENS:-100}"
 CTX="${CTX:-17500}"
 
 export RMLX_BIN MODEL_FILTER PORT WARMUP_RUNS MEASURE_RUNS MAX_TOKENS CTX PROMPT_FILE
-export LOG_DIR RMLX_OMODELS_DIR REPO_ROOT
+export LOG_DIR RMLX_O_MODELS_ROOT REPO_ROOT
 
 exec python3 - "$@" <<'PYEOF'
 import json
@@ -67,7 +67,7 @@ MAX_TOKENS       = int(os.environ["MAX_TOKENS"])
 CTX              = int(os.environ["CTX"])
 PROMPT_FILE      = os.environ["PROMPT_FILE"]
 LOG_BASE         = pathlib.Path(os.environ["LOG_DIR"])
-OMODELS_DIR      = os.environ["RMLX_OMODELS_DIR"]
+OMODELS_DIR      = os.environ["RMLX_O_MODELS_ROOT"]
 REPO_ROOT        = pathlib.Path(os.environ["REPO_ROOT"])
 
 GIT_SHA = subprocess.run(

@@ -97,7 +97,8 @@ fn thinking_budget_exact_hit_qwen3() {
     const N_TOKENS: usize = 16; // total decode budget; must be > N_THINKING + 1
 
     let device = Device::Gpu;
-    let model = arch::load_model(&model_path, device).expect("load model");
+    let model =
+        arch::load_model(&model_path, device, &arch::LoadOpts::default()).expect("load model");
 
     let tk_path = model_path.join("tokenizer.json");
     let tokenizer = tokenizers::Tokenizer::from_file(&tk_path).expect("load tokenizer");
@@ -234,7 +235,8 @@ fn thinking_budget_forced_token_no_logprobs() {
     const LP_K: u32 = 3; // request top-3 logprobs
 
     let device = Device::Gpu;
-    let model = arch::load_model(&model_path, device).expect("load model");
+    let model =
+        arch::load_model(&model_path, device, &arch::LoadOpts::default()).expect("load model");
 
     let tk_path = model_path.join("tokenizer.json");
     let tokenizer = tokenizers::Tokenizer::from_file(&tk_path).expect("load tokenizer");
@@ -376,7 +378,8 @@ fn cache_hit_first_token_logprob_parity() {
     const LP_K: u32 = 5;
 
     let device = Device::Gpu;
-    let model = arch::load_model(&model_path, device).expect("load model");
+    let model =
+        arch::load_model(&model_path, device, &arch::LoadOpts::default()).expect("load model");
 
     let tk_path = model_path.join("tokenizer.json");
     let tokenizer = tokenizers::Tokenizer::from_file(&tk_path).expect("load tokenizer");

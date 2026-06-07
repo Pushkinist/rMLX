@@ -14,7 +14,7 @@
 # Spec path does NOT use prompt cache, so every request pays full prefill.
 # Streaming is the only way to isolate decode TPS from prefill.
 #
-# K config: RMLX_SPEC_K env var (2 or 4), default 4.
+# K config: spec_k variable passed via --draft-block-size (2 or 4), default 4.
 #
 # Usage: ./scripts/bench/p2c1_spec_128k_bench.sh
 # Bash 3.2 compatible (no declare -A).
@@ -220,9 +220,10 @@ run_cell() {
             > "${SERVE_LOG}" 2>&1 &
     else
         log "Starting spec server (kv=${kv_quant}, max-ctx=${max_ctx}, K=${spec_k})..."
-        RMLX_SPEC_K="${spec_k}" "${RMLX_BIN}" serve \
+        "${RMLX_BIN}" serve \
             --model "${VERIFIER_PATH}" \
             --draft-model "${DRAFT_PATH}" \
+            --draft-block-size "${spec_k}" \
             --port "${PORT}" --host 127.0.0.1 \
             --device gpu --kv-quant "${kv_quant}" --max-ctx "${max_ctx}" \
             > "${SERVE_LOG}" 2>&1 &

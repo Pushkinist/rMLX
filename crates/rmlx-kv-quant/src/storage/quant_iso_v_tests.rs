@@ -163,30 +163,27 @@ fn quant_iso_v_truncate_to_keeps_first_n() {
 // All gated `#[ignore]` per Metal-context policy. Run explicitly via
 //   cargo test -p rmlx-kv-quant --lib -- --ignored quant_iso_v --test-threads=1
 //
-// The GPU mirror default is OFF (`RMLX_GPU_RESIDENT_ISO` unset). The mirror
-// tests need it ON, so each test sets the env var **before** any call into
-// `append_gpu` — `gpu_resident_iso_enabled()` latches the value on first
-// read via OnceLock, so the very first test to set it wins for the rest of
-// the test-binary lifetime. The `--test-threads=1` invocation is required
-// so there is no concurrent env reader/writer.
+// The GPU mirror default is OFF (hardcoded; `RMLX_GPU_RESIDENT_ISO` removed in
+// PASS 3). The mirror tests need it ON, so each test calls
+// `force_gpu_resident_iso_on()` before any call into `append_gpu` —
+// `gpu_resident_iso_enabled()` latches the value on first read via OnceLock,
+// so the very first test to set it wins for the rest of the test-binary
+// lifetime. The `--test-threads=1` invocation is required so there is no
+// concurrent reader/writer of the AtomicBool + OnceLock pair.
 
-/// Set `RMLX_GPU_RESIDENT_ISO=1` so the per-process OnceLock latches ON for
-/// the GPU mirror tests. No-op when the var is already `"1"`.
+/// Enable the GPU-resident ISO mirror for the rest of this test binary.
+///
+/// Calls `crate::set_gpu_resident_iso_for_test(true)` so the OnceLock in
+/// `gpu_resident_iso_enabled()` latches `true` on first read. No-op if already
+/// latched ON (OnceLock is write-once after first read). Requires
+/// `--test-threads=1` — concurrent readers of the OnceLock must not race with
+/// this store.
 ///
 /// Any future gate-OFF + GPU test must run in its own test binary
 /// (integration test in `tests/`) because the per-process OnceLock cannot
-/// be reset — once any test calls `gpu_resident_iso_enabled()` the value is
-/// latched for the lifetime of this test binary.
-#[allow(
-    unsafe_code,
-    reason = "GPU mirror tests run under --test-threads=1 (see module docs); \
-              setenv is single-threaded for the lifetime of this binary"
-)]
+/// be reset once latched.
 fn force_gpu_resident_iso_on() {
-    // SAFETY: tests are `--test-threads=1`; no concurrent env reader/writer.
-    unsafe {
-        std::env::set_var("RMLX_GPU_RESIDENT_ISO", "1");
-    }
+    crate::set_gpu_resident_iso_for_test(true);
 }
 
 /// Build a 4-D f32 `Array` from a row-major slice and shape `[B, kv_h, S, D]`.

@@ -70,7 +70,7 @@ fn load_model_rejects_unknown_architecture() {
     let dir = TempDir::new().expect("tempdir");
     let model_path = write_config(&dir, &["FakeArchXyz"]);
 
-    let result = load_model(&model_path, Device::Cpu);
+    let result = load_model(&model_path, Device::Cpu, &LoadOpts::default());
     match result {
         Err(Error::Model(msg)) => {
             assert!(
@@ -95,7 +95,7 @@ fn load_model_rejects_empty_architectures() {
     let dir = TempDir::new().expect("tempdir");
     let model_path = write_config(&dir, &[]);
 
-    let result = load_model(&model_path, Device::Cpu);
+    let result = load_model(&model_path, Device::Cpu, &LoadOpts::default());
     // Empty arch array -> arch_str = "(empty)" -> Model error.
     assert!(
         matches!(result, Err(Error::Model(_))),

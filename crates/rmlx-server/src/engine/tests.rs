@@ -249,6 +249,7 @@ async fn gemma4_generator_loads_and_model_id_matches_basename() {
             prompt_cache_slots: 4,
             mm_cache: None,
             calibration: None,
+            yarn: None,
         },
         Arc::new(Mutex::new(())),
     )

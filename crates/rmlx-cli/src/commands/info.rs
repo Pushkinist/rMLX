@@ -346,7 +346,7 @@ pub(crate) fn run_info(
     // -- forward probe ---------------------------------------------------------
     if probe_forward {
         info!(arch = %arch, ?device, "forward_probe: loading model via arch::load_model");
-        match arch::load_model(model_path, device) {
+        match arch::load_model(model_path, device, &arch::LoadOpts::default()) {
             Err(e) => {
                 warn!(error = %e, "forward_probe: arch not supported or load failed");
                 println!("forward_probe: skipped ({e})");
@@ -386,7 +386,7 @@ pub(crate) fn run_info(
         info!(arch = %arch, ?device, "smoke_probe: loading model via arch::load_model");
 
         // Load model via architecture dispatch -- returns Error::Model for unsupported arches.
-        let model = match arch::load_model(model_path, device) {
+        let model = match arch::load_model(model_path, device, &arch::LoadOpts::default()) {
             Ok(m) => m,
             Err(e) => {
                 warn!(error = %e, "smoke_probe: arch not supported or load failed");

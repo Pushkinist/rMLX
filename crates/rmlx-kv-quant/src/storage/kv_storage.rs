@@ -204,7 +204,7 @@ pub enum KvStorage {
         #[allow(dead_code)]
         max_seq: i32,
     },
-    /// PagedAttention block-table KV storage (`RMLX_PAGED_KV=1`).
+    /// PagedAttention block-table KV storage (paged KV path, `--paged-kv`).
     ///
     /// K is always q8_0 (PagedKStorage). V variant is chosen by quant mode:
     /// - K8V4 / K8V8 → PagedVStorage (TurboQuant V4 for K8V4, q8_0 for K8V8).
@@ -505,8 +505,8 @@ impl KvStorage {
     pub fn new(quant: KvQuant, max_seq: i32) -> Self {
         use crate::paged::paged_kv_enabled;
 
-        // When RMLX_PAGED_KV=1, route K8V4 / K8V8 / Planar to the block-table
-        // paged path. None and Mixed stay on their existing paths (bf16
+        // When paged KV is enabled (--paged-kv), route K8V4 / K8V8 / Planar to
+        // the block-table paged path. None and Mixed stay on their existing paths (bf16
         // buffers / mx.quantize 3-tuples) — paging does not apply to them.
         if paged_kv_enabled() {
             match quant {

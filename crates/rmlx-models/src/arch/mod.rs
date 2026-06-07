@@ -23,7 +23,7 @@ pub(crate) mod loader;
 pub(crate) mod phases;
 pub(crate) mod registry;
 
-pub use loader::{load_model, run_smoke_probe, smoke_prompt_ids, SMOKE_PROMPT};
+pub use loader::{load_model, run_smoke_probe, smoke_prompt_ids, LoadOpts, SMOKE_PROMPT};
 pub use phases::{read_load_phases, LoadPhases};
 pub use registry::{is_arch_supported, KNOWN_ARCHS};
 

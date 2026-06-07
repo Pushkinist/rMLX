@@ -132,6 +132,11 @@ pub struct ModelLoadConfig {
     /// behavior. No CLI flag is exposed; the field is populated by the loader
     /// closure in `run_serve` via `rmlx_loader::discover_kv_calibration`.
     pub calibration: Option<rmlx_loader::KvCalibration>,
+    /// Runtime YARN RoPE override for Qwen3 models that lack `rope_scaling`
+    /// in `config.json`. `None` = no override (default, byte-identical to
+    /// pre-flag behaviour). Set via `--yarn-factor` / `--yarn-original-max`
+    /// CLI flags on `rmlx serve` / `rmlx baseline`.
+    pub yarn: Option<rmlx_models::qwen3::YarnOverride>,
 }
 
 // ── A6.1: route-agnostic response-format normalisation ───────────────────────

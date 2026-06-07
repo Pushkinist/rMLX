@@ -192,6 +192,20 @@ struct Cli {
     /// when set. Default `info`.
     #[arg(long, value_enum, global = true, default_value_t = LogLevel::Info)]
     log: LogLevel,
+    /// Total size cap for `<RMLX_HOME>/logs/` in megabytes. When the directory
+    /// exceeds this limit at startup, the oldest `.jsonl` files are deleted
+    /// until the total is within the cap. `0` disables rotation (logs grow
+    /// unbounded). Default 100.
+    ///
+    /// Env: `RMLX_LOG_CAP_MB`.
+    #[arg(
+        long,
+        global = true,
+        env = "RMLX_LOG_CAP_MB",
+        default_value_t = 100u64,
+        value_name = "MB"
+    )]
+    log_cap_mb: u64,
     /// Toggle the K-side 1-bit QJL residual for the rotor3_sym /
     /// rotor4_sym / k_rotor3 / k_rotor4 codecs. Default `on` (spec mandate).
     /// `--rotor-qjl off` disables the QJL sideband for ablation / bench.
@@ -343,10 +357,9 @@ enum Cmd {
         /// duration string (`30s`, `15m`, `2h`, `24h`). Negative (`-1`)
         /// pins the model forever; `0` unloads immediately after each response.
         ///
-        /// Default: `15m` (900 s). Override at startup with `RMLX_KEEP_ALIVE`;
-        /// override per request with the `keep_alive` body field on native
-        /// rMLX routes (OpenAI/Anthropic-compat routes ignore the field but
-        /// still reset the timer on use).
+        /// Default: `15m` (900 s). Override per request with the `keep_alive`
+        /// body field on native rMLX routes (OpenAI/Anthropic-compat routes
+        /// ignore the field but still reset the timer on use).
         #[arg(long, value_name = "DURATION", allow_hyphen_values = true)]
         idle_timeout_secs: Option<String>,
         /// Number of prompt-cache slots for multi-slot prefix matching.
@@ -523,10 +536,8 @@ enum Cmd {
         kv_ssd_global_gb: f64,
         /// RAM cap for the in-process prompt cache, in GiB.
         ///
-        /// Precedence: CLI > env `RMLX_PROMPT_CACHE_MAX_BYTES` (bytes, decimal,
-        /// silent compat fallback) > default 2 GiB. The env var is honored as
-        /// a fallback only when this flag is unset; the CLI value wins when
-        /// passed. Applies to every per-arch prompt cache constructed during
+        /// Precedence: CLI > default 2 GiB. Applies to every per-arch prompt
+        /// cache constructed during
         /// this process — controls `PromptCache::new` via the
         /// `install_ram_cap` resolver.
         #[arg(long, value_name = "GIB")]
@@ -544,16 +555,13 @@ enum Cmd {
         /// - `--paged-kv` + `--cache-type-k rot_k*` is rejected (RotK / RotKTq4V
         ///   are not paged-compatible — they ride the Mixed quantized-SDPA path).
         ///
-        /// Env fallback `RMLX_PAGED_KV=1` is still honored when this flag is
-        /// absent (one release cycle of back-compat).
         #[arg(long, default_value_t = false)]
         paged_kv: bool,
         /// per-page token count for `--paged-kv` (positive integer).
         ///
         /// Requires `--paged-kv` (clap `requires`). Default 32 (TurboQuant /
         /// PlanarQuant group size — exactly one quantiser group per element
-        /// per page, no cross-page partial groups). Env fallback
-        /// `RMLX_KV_PAGE_SIZE` honored when this flag is absent.
+        /// per page, no cross-page partial groups).
         #[arg(long, value_name = "N", requires = "paged_kv")]
         paged_kv_page_tokens: Option<i32>,
         /// prompt-cache longest-prefix index strategy.
@@ -663,6 +671,39 @@ enum Cmd {
             default_value_t = 512 * 1024 * 1024
         )]
         mm_cache_bytes: usize,
+        /// Maximum number of active sessions held in the LRU session cache.
+        ///
+        /// Each active session reserves an extra prompt-cache slot so multi-turn
+        /// conversations are not evicted by concurrent single-turn requests. When
+        /// the limit is reached the least-recently-used session is dropped (its
+        /// KV tensors are not deleted — only the slot reservation is lost).
+        ///
+        /// Default 64. Env: `RMLX_SESSION_CACHE_MAX_SESSIONS`.
+        #[arg(
+            long,
+            env = "RMLX_SESSION_CACHE_MAX_SESSIONS",
+            value_name = "N",
+            default_value_t = 64usize
+        )]
+        session_cache_max_sessions: usize,
+        /// YARN RoPE scale factor for Qwen3 models whose `config.json` lacks
+        /// `rope_scaling`. When set, synthesises a YarnConfig with the paper
+        /// defaults (`beta_fast=32, beta_slow=1`), extending the effective
+        /// context window. Must be > 1.0 to take effect; values ≤ 1.0 are
+        /// ignored. Has no effect when `rope_scaling` is already present in
+        /// the model config (JSON path always wins).
+        ///
+        /// Env: `RMLX_YARN_FACTOR`.
+        #[arg(long, env = "RMLX_YARN_FACTOR", value_name = "FLOAT")]
+        yarn_factor: Option<f32>,
+        /// Original max position embeddings for YARN context extension
+        /// (`--yarn-factor`). Sets the pre-extension context size used to
+        /// compute the YARN interpolation parameters. When absent (0), the
+        /// model's `max_position_embeddings` is used as the fallback.
+        ///
+        /// Env: `RMLX_YARN_ORIGINAL_MAX`.
+        #[arg(long, env = "RMLX_YARN_ORIGINAL_MAX", value_name = "U32")]
+        yarn_original_max: Option<u32>,
     },
     /// One-off REPL chat for sanity-checking a model.
     Chat {
@@ -719,6 +760,14 @@ enum Cmd {
         /// Must be >= 256 when set.
         #[arg(long)]
         max_ctx: Option<u32>,
+        /// YARN RoPE scale factor for Qwen3 models whose `config.json` lacks
+        /// `rope_scaling`. Advanced / long-context use. Env: `RMLX_YARN_FACTOR`.
+        #[arg(long, env = "RMLX_YARN_FACTOR", value_name = "FLOAT")]
+        yarn_factor: Option<f32>,
+        /// Original max position embeddings for YARN context extension.
+        /// Env: `RMLX_YARN_ORIGINAL_MAX`.
+        #[arg(long, env = "RMLX_YARN_ORIGINAL_MAX", value_name = "U32")]
+        yarn_original_max: Option<u32>,
     },
     /// Print arch + quant info for a snapshot, no inference.
     Info {
@@ -927,6 +976,23 @@ enum Cmd {
         /// view immediately. Used by the bench harness.
         #[arg(long, default_value_t = false)]
         record: bool,
+        /// Root directory to search for canonical bench prompt files
+        /// (`longctx_<N>k.json`). When unset, the binary walks up from the
+        /// current working directory looking for a `prompts/` subdirectory that
+        /// contains `longctx_4k.json`, then falls back to `prompts/` relative to
+        /// cwd. This flag overrides both the cwd-walk and the fallback.
+        ///
+        /// Env: `RMLX_PROMPTS_DIR`.
+        #[arg(long, env = "RMLX_PROMPTS_DIR", value_name = "PATH")]
+        prompts_dir: Option<PathBuf>,
+        /// YARN RoPE scale factor for Qwen3 models whose `config.json` lacks
+        /// `rope_scaling`. Advanced / long-context use. Env: `RMLX_YARN_FACTOR`.
+        #[arg(long, env = "RMLX_YARN_FACTOR", value_name = "FLOAT")]
+        yarn_factor: Option<f32>,
+        /// Original max position embeddings for YARN context extension.
+        /// Env: `RMLX_YARN_ORIGINAL_MAX`.
+        #[arg(long, env = "RMLX_YARN_ORIGINAL_MAX", value_name = "U32")]
+        yarn_original_max: Option<u32>,
     },
     /// Manage named server profiles in `<RMLX_HOME>/profiles.toml`.
     Profile {
@@ -1100,7 +1166,7 @@ fn main() -> Result<()> {
             std::env::set_var("RUST_BACKTRACE", "full");
         }
     }
-    let _guard = init_tracing(&run_id, cli.log)?;
+    let _guard = init_tracing(&run_id, cli.log, cli.log_cap_mb)?;
 
     // Install the rotor-QJL toggle before any cache construction.
     // This is a process-wide one-shot OnceLock; safe to call once at startup.
@@ -1237,6 +1303,9 @@ fn main() -> Result<()> {
             tts_model_path,
             tts_tokenizer_path,
             mm_cache_bytes,
+            session_cache_max_sessions,
+            yarn_factor,
+            yarn_original_max,
         } => {
             // load + merge the named profile (if any). Precedence is
             // CLI > profile > hard-coded default. Each bindable flag is `Option`
@@ -1265,9 +1334,8 @@ fn main() -> Result<()> {
             let max_ctx = max_ctx.or_else(|| p.and_then(|x| x.max_ctx));
             // Idle keep-alive — CLI string > profile u64 (legacy) > unset.
             //
-            // When unset everywhere, `run_serve` falls back to the env var
-            // `RMLX_KEEP_ALIVE` and then the 15 min default. `Option::None`
-            // here signals "no CLI override" — the layered resolver wins.
+            // When unset everywhere, `run_serve` falls back to the 15 min default.
+            // `Option::None` here signals "no CLI override" — the layered resolver wins.
             let idle_timeout_spec: Option<String> = idle_timeout_secs
                 .or_else(|| p.and_then(|x| x.idle_timeout_secs.map(|n| n.to_string())));
             let prompt_cache_slots = prompt_cache_slots
@@ -1504,6 +1572,11 @@ fn main() -> Result<()> {
 
             // Acquire Metal claim for GPU runs; CPU-only skips.
             let _claim = acquire_claim_for_device(dev, port)?;
+            // Build YARN override from CLI flags. None when either flag is absent.
+            let yarn_override = yarn_factor.map(|factor| rmlx_models::qwen3::YarnOverride {
+                factor,
+                original_max: yarn_original_max.map_or(0.0, |v| v as f32),
+            });
             run_serve(
                 model.as_deref(),
                 registry.as_deref(),
@@ -1543,6 +1616,8 @@ fn main() -> Result<()> {
                 tts_model_path,
                 tts_tokenizer_path,
                 mm_cache_bytes,
+                session_cache_max_sessions,
+                yarn_override,
                 &sink,
             )?;
         }
@@ -1556,6 +1631,8 @@ fn main() -> Result<()> {
             kv_bits,
             kv_group_size,
             max_ctx,
+            yarn_factor: _yarn_factor,
+            yarn_original_max: _yarn_original_max,
         } => {
             // Load config + run the cache-type resolver before any model
             // load. Even though `chat` is a stub today, validating the flag
@@ -1709,6 +1786,9 @@ fn main() -> Result<()> {
             max_prompt_tokens,
             label: bench_label,
             record,
+            prompts_dir,
+            yarn_factor,
+            yarn_original_max,
         } => {
             let max_prompt_tokens = parse_max_prompt_tokens(max_prompt_tokens)?;
             // --kv-preset pre-resolution. resolve_preset_arg runs the
@@ -1739,10 +1819,8 @@ fn main() -> Result<()> {
 
             // Resolve --prompt-tokens → canonical longctx file when present.
             // The prompts/ dir lives at the workspace root; locate it via the
-            // RMLX_HOME workspace anchor (cwd or env-var override).
-            let prompts_root = std::env::var("RMLX_PROMPTS_DIR")
-                .map(PathBuf::from)
-                .ok()
+            // --prompts-dir flag (env: RMLX_PROMPTS_DIR) or a cwd-walk.
+            let prompts_root = prompts_dir
                 .or_else(|| {
                     // Walk up from cwd for `prompts/longctx_4k.json` (mirrors
                     // the workspace-root convention used by the bench harness).
@@ -1819,6 +1897,11 @@ fn main() -> Result<()> {
                 None
             };
 
+            // Build YARN override from CLI flags. None when yarn_factor is absent.
+            let yarn_override = yarn_factor.map(|factor| rmlx_models::qwen3::YarnOverride {
+                factor,
+                original_max: yarn_original_max.map_or(0.0, |v| v as f32),
+            });
             run_baseline(
                 &model,
                 &effective_prompt_path,
@@ -1829,6 +1912,7 @@ fn main() -> Result<()> {
                 Some(kv_quant_resolved),
                 max_ctx_override,
                 max_prompt_tokens,
+                yarn_override,
                 &sink,
                 record_args,
             )?;

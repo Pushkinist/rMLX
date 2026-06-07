@@ -67,7 +67,8 @@ fn embed_token_raw_applies_sqrt_hidden_scale() {
         return;
     };
     let device = Device::Gpu;
-    let model = arch::load_model(&model_path, device).expect("arch::load_model");
+    let model = arch::load_model(&model_path, device, &arch::LoadOpts::default())
+        .expect("arch::load_model");
 
     let scaled = model
         .embed_token_raw(818u32, device)
@@ -100,7 +101,8 @@ fn mtp_assistant_accept_rate_is_high() {
         return;
     };
     let device = Device::Gpu;
-    let verifier = arch::load_model(&model_path, device).expect("load verifier");
+    let verifier =
+        arch::load_model(&model_path, device, &arch::LoadOpts::default()).expect("load verifier");
     let backbone_hidden = verifier.hidden_size();
     let drafter =
         Gemma4AssistantDrafter::load(&draft_path, backbone_hidden, device).expect("load drafter");
