@@ -245,6 +245,17 @@ cache sized to the ceiling.
 SWA / rotating layers are unaffected: their bf16 ring is sized to the
 `sliding_window`, never to `max_seq`, so they carry no long-context tax.
 
+### Per-request `max_ctx` override (issue #26)
+
+Because the ceiling is resolved **per request** (`kv_max_seq_and_ceiling`), it
+can be overridden per request without reloading weights. The OpenAI route
+accepts an optional `max_ctx` field that supplies the override for that one
+request (else the launch `--max-ctx`); the server's `context_length_exceeded`
+prompt-length guard uses the per-request ceiling when present. This pairs with
+the per-request KV-codec hot-swap (also issue #26) so a resident model can sweep
+`(codec × ctx)` cells with no reload. See `docs/SERVER.md` § "Per-request
+KV-config hot-swap".
+
 ## 5. Hard invariants
 
 These are enforced by the resolver. Violation exits with code 78

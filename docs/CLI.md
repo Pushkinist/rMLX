@@ -106,6 +106,14 @@ mutually exclusive.
 | `--planar-fused-qk` | `on \| off` | `on` | Route pre-softmax QK over PlanarQuant-packed K (`KvStorage::PlanarK`) through the `planar_fused_qk` MSL kernel instead of dequant+SDPA. Decode-step only (prefill chunks fall through to the legacy path). No effect on any non-PlanarK cache. **No env fallback — CLI-only**; tests do not need an env lock. See `docs/KV_QUANT.md` §"Fused-QK kernels". |
 | `--prefix-index` | `linear \| radix` | `linear` | Longest-prefix index strategy for the prompt cache. `linear` is O(slots × n\_blocks); `radix` is O(n\_blocks). |
 
+> **Per-request override (issue #26).** `--kv-quant` and `--max-ctx` set the
+> **launch defaults**. On a running server, the OpenAI route accepts per-request
+> `kv_quant` / `max_ctx` fields that override them for one request without
+> reloading weights — one resident model can serve multiple KV codecs / context
+> ceilings. Requests that omit the fields use these launch defaults. See
+> `docs/SERVER.md` § "Per-request KV-config hot-swap". `--kv-ssd-cache-gb` stays
+> launch-fixed (SSD live reconfig deferred — `docs/SSD_TIER.md`).
+
 **KV-bits mapping** (`--kv-bits` + `--kv-group-size`):
 
 | `--kv-bits` | Result |

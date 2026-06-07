@@ -1,5 +1,6 @@
 use super::*;
 use rmlx_core::error::Result;
+use rmlx_kv_ssd::chained_block_hashes;
 
 // ── chained_block_hashes_seeded ────────────────────────────────────
 
@@ -40,6 +41,19 @@ struct TestEntry {
 impl TestEntry {
     fn new(ids: Vec<u32>) -> Self {
         let hashes = chained_block_hashes(&ids);
+        TestEntry {
+            ids,
+            hashes,
+            truncated_to: std::cell::Cell::new(None),
+        }
+    }
+
+    /// Issue #26: build an entry whose block-hash chain is salted with an
+    /// explicit `seed` (the `FNV_OFFSET ^ layout_key ^ codec_salt` the
+    /// production push uses). Lets the codec-partition test store a slot under
+    /// one codec seed and query under another.
+    fn new_seeded(ids: Vec<u32>, seed: u64) -> Self {
+        let hashes = chained_block_hashes_seeded(&ids, seed);
         TestEntry {
             ids,
             hashes,
@@ -105,13 +119,13 @@ fn hit_miss_counters_three_requests() {
     let mut cache: PromptCache<TestEntry> = PromptCache::new(4);
 
     // --- Request 1: cold miss (cache empty) ---
-    let r1 = cache.find_best_prefix(&prompt_a);
+    let r1 = cache.find_best_prefix(&prompt_a, FNV_OFFSET);
     assert!(r1.is_none(), "r1 should be a miss");
     // Populate cache so subsequent requests can hit.
     cache.push(TestEntry::new(prompt_a.clone()));
 
     // --- Request 2: full-prompt block hit (same prompt) ---
-    let r2 = cache.find_best_prefix(&prompt_a);
+    let r2 = cache.find_best_prefix(&prompt_a, FNV_OFFSET);
     assert!(r2.is_some(), "r2 should be a hit");
     let (_, blocks_2) = r2.unwrap();
     assert_eq!(blocks_2, 2, "full hit must cover all 2 blocks");
@@ -119,7 +133,7 @@ fn hit_miss_counters_three_requests() {
     // --- Request 3: partial prefix hit (one extra full block of new ids) ---
     let mut prompt_b = prompt_a.clone();
     prompt_b.extend(1000..1000 + BLOCK_TOKENS as u32);
-    let r3 = cache.find_best_prefix(&prompt_b);
+    let r3 = cache.find_best_prefix(&prompt_b, FNV_OFFSET);
     assert!(r3.is_some(), "r3 should be a partial prefix hit");
     let (_, blocks_3) = r3.unwrap();
     assert_eq!(
@@ -162,7 +176,7 @@ fn short_prefix_treated_as_miss() {
 
     // Query with the same short prompt — no full block stored, so there is
     // nothing to match: must be a miss.
-    let result = cache.find_best_prefix(&short_prompt);
+    let result = cache.find_best_prefix(&short_prompt, FNV_OFFSET);
     assert!(
         result.is_none(),
         "shared prefix < one 256-token block must be treated as a miss"
@@ -197,11 +211,11 @@ fn lru_bump_on_hit_determines_eviction_order() {
     assert_eq!(cache.slots.len(), 3);
 
     // Hit B — B becomes MRU.
-    let hit_b = cache.find_best_prefix(&ids_b);
+    let hit_b = cache.find_best_prefix(&ids_b, FNV_OFFSET);
     assert!(hit_b.is_some(), "B must hit");
 
     // Hit C — C becomes MRU.
-    let hit_c = cache.find_best_prefix(&ids_c);
+    let hit_c = cache.find_best_prefix(&ids_c, FNV_OFFSET);
     assert!(hit_c.is_some(), "C must hit");
 
     // Push D — slot count cap triggers, A must be evicted (smallest seq).
@@ -313,7 +327,7 @@ fn long_prompt_block_aligned_partial_hit() {
     prompt_b.extend(9000..9000 + BLOCK_TOKENS as u32);
     assert_eq!(prompt_b.len(), 16 * BLOCK_TOKENS);
 
-    let r = cache.find_best_prefix(&prompt_b);
+    let r = cache.find_best_prefix(&prompt_b, FNV_OFFSET);
     assert!(r.is_some(), "must hit on the shared 15-block prefix");
     let (slot_idx, block_count) = r.unwrap();
     assert_eq!(block_count, 15, "must match exactly 15 leading blocks");
@@ -365,7 +379,7 @@ fn block_level_counters_partial_and_full() {
     partial_prompt.extend(9000..9000 + BLOCK_TOKENS as u32);
     assert_eq!(partial_prompt.len(), 16 * BLOCK_TOKENS);
 
-    let r_a = cache.find_best_prefix(&partial_prompt);
+    let r_a = cache.find_best_prefix(&partial_prompt, FNV_OFFSET);
     assert!(r_a.is_some(), "(a) must be a hit");
     let (_, blocks_a) = r_a.unwrap();
     assert_eq!(blocks_a, 15, "(a) 15 blocks matched");
@@ -387,7 +401,7 @@ fn block_level_counters_partial_and_full() {
     // The want vector for this prompt has 17 hashes; cache has 16.
     // Matched = 16 (full match of stored entry), unmatched = 1.
     // Because best_blocks (16) < want_blocks (17) → still a partial_hit.
-    let r_b = cache.find_best_prefix(&full_prompt);
+    let r_b = cache.find_best_prefix(&full_prompt, FNV_OFFSET);
     assert!(r_b.is_some(), "(b) must be a hit");
     let (_, blocks_b) = r_b.unwrap();
     assert_eq!(blocks_b, 16, "(b) 16 blocks matched");
@@ -402,7 +416,7 @@ fn block_level_counters_partial_and_full() {
 
     // Build a truly full match (same 16-block prompt, no extension).
     // want_blocks == 16, best_blocks == 16 → NOT partial.
-    let r_b2 = cache.find_best_prefix(&base);
+    let r_b2 = cache.find_best_prefix(&base, FNV_OFFSET);
     assert!(r_b2.is_some(), "(b2) must be a hit");
     let (_, blocks_b2) = r_b2.unwrap();
     assert_eq!(blocks_b2, 16, "(b2) 16 blocks matched");
@@ -419,7 +433,7 @@ fn block_level_counters_partial_and_full() {
     // (c) Total miss: use an unrelated 4-block prompt with completely
     // different token ids (offset by 100000 to avoid any block collision).
     let miss_prompt: Vec<u32> = (100000..100000 + 4 * BLOCK_TOKENS as u32).collect();
-    let r_c = cache.find_best_prefix(&miss_prompt);
+    let r_c = cache.find_best_prefix(&miss_prompt, FNV_OFFSET);
     assert!(r_c.is_none(), "(c) must be a miss");
 
     let s = cache.stats();
@@ -460,7 +474,7 @@ fn exact_hit_clone_preserves_prompt_identity() {
     cache.push(TestEntry::new(prompt.clone()));
 
     let (idx, blocks) = cache
-        .find_best_prefix(&prompt)
+        .find_best_prefix(&prompt, FNV_OFFSET)
         .expect("identical prompt must hit");
     assert_eq!(blocks, 2, "full prompt covers both blocks");
     // Exact-hit gate at the call site: stored ids == request ids.
@@ -634,7 +648,10 @@ fn ssd_hydrate_populates_ram_and_bumps_counter() {
     }));
 
     // RAM miss (cache empty).
-    assert!(cache.find_best_prefix(&prompt).is_none(), "cold RAM miss");
+    assert!(
+        cache.find_best_prefix(&prompt, FNV_OFFSET).is_none(),
+        "cold RAM miss"
+    );
     assert_eq!(cache.stats().ssd_hits, 0);
 
     // Hydrate from SSD → promoted into RAM, counter bumped.
@@ -644,7 +661,7 @@ fn ssd_hydrate_populates_ram_and_bumps_counter() {
     assert_eq!(cache.slots.len(), 1, "one slot now populated");
 
     // The hydrated entry is now served by find_best_prefix.
-    let r = cache.find_best_prefix(&prompt);
+    let r = cache.find_best_prefix(&prompt, FNV_OFFSET);
     assert!(
         r.is_some(),
         "find_best_prefix must serve the hydrated entry"
@@ -659,7 +676,7 @@ fn ssd_hydrate_populates_ram_and_bumps_counter() {
 fn no_ssd_source_is_inert() {
     let prompt: Vec<u32> = make_ids(2 * BLOCK_TOKENS);
     let mut cache: PromptCache<TestEntry> = PromptCache::new(4);
-    assert!(cache.find_best_prefix(&prompt).is_none());
+    assert!(cache.find_best_prefix(&prompt, FNV_OFFSET).is_none());
     assert!(
         cache.hydrate_from_ssd(&prompt).is_none(),
         "no SSD source → always a miss"
@@ -715,7 +732,9 @@ fn partial_hit_truncates_to_matched_block_boundary() {
     // Request shares first 3 blocks, then diverges.
     let mut req = cached[..3 * BLOCK_TOKENS].to_vec();
     req.extend(50_000..50_000 + BLOCK_TOKENS as u32);
-    let (idx, blocks) = cache.find_best_prefix(&req).expect("3-block prefix hit");
+    let (idx, blocks) = cache
+        .find_best_prefix(&req, FNV_OFFSET)
+        .expect("3-block prefix hit");
     assert_eq!(blocks, 3, "exactly 3 leading blocks match");
 
     let mut cloned = cache.slots[idx].entry.deep_clone().unwrap();
@@ -821,7 +840,7 @@ fn arch_cache_with_inner_mut_round_trip() {
     // Second-call observability: the pushed entry is reachable.
     let hit_blocks = arch.with_inner_mut(|g| {
         let cache = g.as_mut().unwrap();
-        cache.find_best_prefix(&ids).map(|(_, b)| b)
+        cache.find_best_prefix(&ids, FNV_OFFSET).map(|(_, b)| b)
     });
     assert_eq!(hit_blocks, Some(2), "pushed entry must hit on full prompt");
     // Deep-clone semantics: clone the slot and verify tokens identical.
@@ -895,7 +914,7 @@ fn exact_only_policy_forces_partial_match_to_miss_semantics() {
     // the full-token-equality check fails, the lookup MUST be Miss.
     let outcome = arch.with_inner_mut(|g| {
         let cache = g.as_mut().unwrap();
-        let m = cache.find_best_prefix(&req);
+        let m = cache.find_best_prefix(&req, FNV_OFFSET);
         match m {
             Some((slot_idx, _b)) => {
                 let exact = cache.slots[slot_idx].entry.prompt_token_ids() == req.as_slice();
@@ -911,5 +930,200 @@ fn exact_only_policy_forces_partial_match_to_miss_semantics() {
     assert_eq!(
         outcome, "miss",
         "ExactOnly policy must force non-exact matches to Miss semantics"
+    );
+}
+
+/// Issue #26 — codec-partitioned prefix-cache key (the anti-cross-serve guard).
+///
+/// A prefix cached under one KV codec must NOT be served to a request running a
+/// different codec — the cached K/V bytes are codec-specific. The production
+/// push/query seed is `FNV_OFFSET ^ layout_key ^ codec_salt(kv_quant)`; here we
+/// store a slot under codec A's seed and assert that a query under codec A's
+/// seed HITS (same codec → reuse) while a query under codec B's seed MISSES
+/// (cross-codec → no serve), even though the token ids are byte-identical. This
+/// is the namespacing that lets a resident model serve multiple codecs without
+/// conflating their caches.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test-only: PromptCache slots populated by construction just above each lookup"
+)]
+fn codec_partitioned_key_blocks_cross_codec_serve() {
+    use rmlx_kv_quant::KvQuant;
+
+    // Two distinct codecs → two distinct salts → two distinct seeds.
+    let seed_a = FNV_OFFSET ^ KvQuant::None.cache_key_salt();
+    let seed_b = FNV_OFFSET ^ KvQuant::K8V4.cache_key_salt();
+    assert_ne!(seed_a, seed_b, "distinct codecs must yield distinct seeds");
+
+    // Identical 2-block prompt for both codecs.
+    let prompt: Vec<u32> = make_ids(2 * BLOCK_TOKENS);
+
+    let mut cache: PromptCache<TestEntry> = PromptCache::new(4);
+    // Store the slot under codec A's seed (mirrors the production push).
+    cache.push(TestEntry::new_seeded(prompt.clone(), seed_a));
+
+    // 1. Same-codec query (seed A) → HIT (full 2-block prefix).
+    let hit_a = cache.find_best_prefix(&prompt, seed_a);
+    assert!(
+        hit_a.is_some(),
+        "same-codec query must hit the codec-A slot"
+    );
+    assert_eq!(hit_a.unwrap().1, 2, "full 2-block prefix must match");
+
+    // 2. Cross-codec query (seed B) → MISS, even though the tokens are
+    //    identical. The codec-B digest stream is disjoint from codec-A's, so
+    //    the codec-A slot is never matched → no cross-serve of mismatched KV.
+    let miss_b = cache.find_best_prefix(&prompt, seed_b);
+    assert!(
+        miss_b.is_none(),
+        "cross-codec query must MISS the codec-A slot (anti-cross-serve guard)"
+    );
+
+    // 3. Coexistence: pushing the same prompt under codec B adds a *second*
+    //    slot rather than colliding, and each codec now hits its own slot.
+    cache.push(TestEntry::new_seeded(prompt.clone(), seed_b));
+    assert_eq!(
+        cache.slots.len(),
+        2,
+        "both codecs coexist as distinct slots"
+    );
+    assert!(
+        cache.find_best_prefix(&prompt, seed_a).is_some(),
+        "codec-A query still hits its own slot"
+    );
+    assert!(
+        cache.find_best_prefix(&prompt, seed_b).is_some(),
+        "codec-B query hits its own slot"
+    );
+}
+
+// ── SSD hydrate seed symmetry (issue #26 reviewer fix) ────────────────────
+//
+// Regression guard for the SSD hydrate path fixed in the review of #26:
+// `SsdHydrate<E>` impls must build the hydrated entry's `block_hashes` with
+// `FNV_OFFSET ^ layout_key ^ kv_quant.cache_key_salt()` — the same seed the
+// RAM push and `find_best_prefix` query use.  If the codec salt is omitted
+// from the hydrate seed, `find_best_prefix` can never match a hydrated entry
+// on SSD-active runs (non-zero `layout_key`) → guaranteed prefix MISS despite
+// a valid on-disk block.
+
+/// A mock `SsdHydrate<TestEntry>` whose returned entry uses the fully-salted
+/// seed (`FNV_OFFSET ^ layout_key ^ codec_salt`), mirroring the corrected
+/// production impls.
+struct MockHydrateSalted {
+    ids: Vec<u32>,
+    layout_key: u64,
+    codec_salt: u64,
+}
+
+impl SsdHydrate<TestEntry> for MockHydrateSalted {
+    fn hydrate(&self, _prompt_ids: &[u32]) -> rmlx_core::error::Result<Option<TestEntry>> {
+        let seed = FNV_OFFSET ^ self.layout_key ^ self.codec_salt;
+        let hashes = chained_block_hashes_seeded(&self.ids, seed);
+        Ok(Some(TestEntry {
+            ids: self.ids.clone(),
+            hashes,
+            truncated_to: std::cell::Cell::new(None),
+        }))
+    }
+}
+
+/// Same as above but uses only `FNV_OFFSET ^ layout_key` (codec salt
+/// omitted) — reproduces the pre-fix bug so we can confirm it misses.
+struct MockHydrateUnsalted {
+    ids: Vec<u32>,
+    layout_key: u64,
+}
+
+impl SsdHydrate<TestEntry> for MockHydrateUnsalted {
+    fn hydrate(&self, _prompt_ids: &[u32]) -> rmlx_core::error::Result<Option<TestEntry>> {
+        let seed = FNV_OFFSET ^ self.layout_key;
+        let hashes = chained_block_hashes_seeded(&self.ids, seed);
+        Ok(Some(TestEntry {
+            ids: self.ids.clone(),
+            hashes,
+            truncated_to: std::cell::Cell::new(None),
+        }))
+    }
+}
+
+/// Issue #26 review — SSD hydrate seed must include the codec salt.
+///
+/// With a non-zero `layout_key` and a non-trivial codec salt:
+/// 1. A hydrated entry built with the **full** seed (`FNV_OFFSET ^
+///    layout_key ^ codec_salt`) is found by a same-seed `find_best_prefix`
+///    query (corrected behavior — HIT).
+/// 2. A hydrated entry built with the **unsalted** seed (`FNV_OFFSET ^
+///    layout_key`, codec salt omitted) is NOT found by the same-codec
+///    query (pre-fix bug — MISS, here tested as the negative case to confirm
+///    the fix is load-bearing).
+/// 3. A correct hydrated entry is NOT found by a different-codec query
+///    (cross-codec isolation still holds).
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test-only: values established by construction"
+)]
+fn ssd_hydrate_seed_symmetry_with_nonzero_layout_key() {
+    use rmlx_kv_quant::KvQuant;
+
+    // Non-zero layout_key to exercise the SSD-active code path.
+    let layout_key: u64 = 0xdead_beef_0000_0001;
+    let codec_a = KvQuant::K8V4;
+    let codec_b = KvQuant::K8V8;
+    let codec_salt_a = codec_a.cache_key_salt();
+    let codec_salt_b = codec_b.cache_key_salt();
+    assert_ne!(
+        codec_salt_a, codec_salt_b,
+        "codecs must have distinct salts"
+    );
+
+    let full_seed_a = FNV_OFFSET ^ layout_key ^ codec_salt_a;
+
+    // 2-block prompt.
+    let prompt_ids: Vec<u32> = make_ids(2 * BLOCK_TOKENS);
+
+    // ── Case 1: corrected hydrate (salted) → same-codec query HITs ──────────
+    let mut cache_correct: PromptCache<TestEntry> = PromptCache::new(4);
+    cache_correct.set_ssd_source(Box::new(MockHydrateSalted {
+        ids: prompt_ids.clone(),
+        layout_key,
+        codec_salt: codec_salt_a,
+    }));
+    let before = cache_correct.find_best_prefix(&prompt_ids, full_seed_a);
+    assert!(before.is_none(), "RAM empty before hydrate");
+    let promoted = cache_correct.hydrate_from_ssd(&prompt_ids);
+    assert!(promoted.is_some(), "mock SSD source must hydrate");
+    let after = cache_correct.find_best_prefix(&prompt_ids, full_seed_a);
+    assert!(
+        after.is_some(),
+        "salted hydrated entry must be found by same-codec query (corrected behavior)"
+    );
+    assert_eq!(after.unwrap().1, 2, "full 2-block prefix must match");
+
+    // ── Case 2: pre-fix hydrate (unsalted seed) → same-codec query MISSes ───
+    // This is the negative case that would have silently re-prefilled before
+    // the fix.  The hydrated entry's hashes are built from
+    // `FNV_OFFSET ^ layout_key` but the query uses `full_seed_a`
+    // (`FNV_OFFSET ^ layout_key ^ codec_salt_a`) → disjoint streams → MISS.
+    let mut cache_broken: PromptCache<TestEntry> = PromptCache::new(4);
+    cache_broken.set_ssd_source(Box::new(MockHydrateUnsalted {
+        ids: prompt_ids.clone(),
+        layout_key,
+    }));
+    cache_broken.hydrate_from_ssd(&prompt_ids);
+    let after_broken = cache_broken.find_best_prefix(&prompt_ids, full_seed_a);
+    assert!(
+        after_broken.is_none(),
+        "pre-fix (unsalted) hydrated entry must NOT be found by salted query (negative case)"
+    );
+
+    // ── Case 3: corrected hydrate under codec A → different-codec query MISSes
+    let full_seed_b = FNV_OFFSET ^ layout_key ^ codec_salt_b;
+    let cross_codec = cache_correct.find_best_prefix(&prompt_ids, full_seed_b);
+    assert!(
+        cross_codec.is_none(),
+        "codec-A hydrated entry must not cross-serve a codec-B query"
     );
 }

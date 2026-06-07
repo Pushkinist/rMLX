@@ -186,6 +186,8 @@ Expired requests return HTTP 408 `timeout`.
 | `stream_options` | object | `{include_usage:true}` appends a usage chunk before `[DONE]`. |
 | `enable_thinking` | bool | `false` suppresses the open `<think>` block on Qwen3-family models. |
 | `thinking_budget` | u32 | Cap the reasoning channel at N tokens. |
+| `kv_quant` | string | **Issue #26 — per-request KV-codec hot-swap.** Override the KV-cache codec for this request on the resident model, no weight reload. Accepts the same grammar as the `--kv-quant` CLI flag (`"none"`/`"bf16"`, `"k8v4"`, `"k8v8"`, `"planar"`, `"mixed"`, `"mixed_k<kb>g<kg>_v<vb>g<vg>"`, …). `"auto"` selects the per-arch/per-ctx default. Omitted → the server's launch `--kv-quant`. A malformed codec string returns HTTP 400 `invalid_request_error`. |
+| `max_ctx` | i32 | **Issue #26 — per-request context-ceiling override.** Re-size the KV-ring virtual ceiling (lazy-grow, #25) for this request only; must be `> 0`. Omitted → the server's launch `--max-ctx`. No weight touch — a ring realloc only. |
 | `logit_bias` | object | Token-id (string key) → logit bias (float). |
 | `frequency_penalty` | f32 | |
 | `presence_penalty` | f32 | |
@@ -195,6 +197,36 @@ Expired requests return HTTP 408 `timeout`.
 
 Unknown fields are accepted, debug-logged, and discarded. Fields that indicate
 injection intent are explicitly rejected.
+
+### Per-request KV-config hot-swap (issue #26)
+
+`kv_quant` and `max_ctx` change the **KV cache** for one request without
+reloading the model weights. Weights are read-only during decode; the KV cache
+(codec, ring size) is built per request, so a config switch only rebuilds the
+cache — the resident weights stay put. This lets a single `rmlx serve` process
+sweep KV codecs / context ceilings, or pick a KV policy per request (aggressive
+quant for a 128k request, `none` for a short chat) with zero downtime.
+
+- **Precedence.** A per-request `kv_quant` wins over the launch `--kv-quant`
+  (explicit or `auto`) and over the per-ctx auto policy — exactly like a
+  startup-explicit flag, but scoped to the one request. `"auto"` defers to the
+  generator's per-arch/per-ctx default. Absent → launch default (byte-identical
+  to pre-#26 behavior; zero regression).
+- **Codec-partitioned prefix cache.** The prompt/prefix cache key is namespaced
+  by KV codec, so a prefix cached under one codec **never** serves a request
+  running a different codec (the cached K/V bytes are codec-specific). Two
+  codecs for the same tokens occupy **distinct** cache slots and coexist — a
+  codec switch is a clean cross-codec miss, not a thrash-eviction. See
+  `docs/PROMPT_CACHE.md` § "Codec namespacing".
+- **`max_ctx`** re-sizes the KV-ring virtual ceiling (#25 lazy-grow) for the
+  request; the engine clamps it by the model's `max_position_embeddings` during
+  cache build. The `context_length_exceeded` prompt-length guard uses the
+  per-request ceiling when the override is present.
+- **Single-MLX claim is unaffected** — one model stays resident throughout.
+- **Anthropic `/v1/messages`** does not expose these fields (stricter wire
+  spec); it always uses the launch default.
+- **Deferred:** live SSD-tier reconfiguration (per-request `kv_ssd` toggle) is
+  **not** implemented — see `docs/SSD_TIER.md` § "Live reconfiguration (deferred)".
 
 **Non-streaming response** (`stream:false`):
 

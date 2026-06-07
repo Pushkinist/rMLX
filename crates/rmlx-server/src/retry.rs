@@ -254,6 +254,10 @@ pub struct RequestPlan {
     pub images: Vec<String>,
     /// Base64-encoded audio payloads attached to this request.
     pub audio_b64: Vec<String>,
+    /// Issue #26: per-request KV-quant codec override (`None` = launch default).
+    pub kv_quant_override: Option<rmlx_kv_quant::KvQuant>,
+    /// Issue #26: per-request max-ctx ceiling override (`None` = launch default).
+    pub max_ctx_override: Option<i32>,
 }
 
 impl RequestPlan {
@@ -288,6 +292,8 @@ impl RequestPlan {
             thinking_end_token: req.thinking_end_token.clone(),
             images: req.images.clone(),
             audio_b64: req.audio_b64.clone(),
+            kv_quant_override: req.kv_quant_override,
+            max_ctx_override: req.max_ctx_override,
         }
     }
 
@@ -334,6 +340,8 @@ impl RequestPlan {
             gpu_admission: None,
             images: self.images.clone(),
             audio_b64: self.audio_b64.clone(),
+            kv_quant_override: self.kv_quant_override,
+            max_ctx_override: self.max_ctx_override,
         }
     }
 }

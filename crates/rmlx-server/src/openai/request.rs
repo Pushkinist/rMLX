@@ -501,6 +501,21 @@ pub struct ChatCompletionsRequest {
     #[serde(default)]
     pub thinking_end_token: Option<String>,
 
+    // Issue #26: per-request KV-cache config hot-swap on a resident model.
+    // These let a single `rmlx serve` process (weights loaded once) switch the
+    // KV codec and context ceiling per request — no weight reload. `None`
+    // (omitted) preserves the launch-default behavior exactly (zero regression).
+    /// Per-request KV-quant codec override (e.g. `"none"`, `"k8v4"`, `"k8v8"`,
+    /// `"planar"`, `"auto"`). `"auto"` selects the per-arch/per-ctx default.
+    /// `None` (omitted) uses the server's launch `--kv-quant`. Parsed with the
+    /// same grammar as the `--kv-quant` CLI flag.
+    #[serde(default)]
+    pub kv_quant: Option<String>,
+    /// Per-request max-context ceiling override (KV ring grows lazily up to this
+    /// ceiling, #25). `None` (omitted) uses the server's launch `--max-ctx`.
+    #[serde(default)]
+    pub max_ctx: Option<i32>,
+
     // Stage 2+ features — accepted & ignored with a debug log.
     // Explicitly reject only fields that indicate unsafe injection intent.
     /// Catch-all for unknown request fields; debug-logged and ignored.

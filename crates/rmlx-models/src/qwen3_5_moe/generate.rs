@@ -179,14 +179,20 @@ pub fn generate_greedy(
          partial-prefix reuse is unsafe for GDN lin_caches",
     );
 
+    // Issue #26: codec-partitioned prompt-cache key — see gemma4/generate/mod.rs
+    // for the full rationale. Query digest stream salted by
+    // `FNV_OFFSET ^ layout_key ^ codec_salt(kv_quant)` (matches the push seed).
+    let cache_seed = crate::prompt_cache::FNV_OFFSET
+        ^ crate::qwen3_5_moe::prompt_cache::active_layout_key()
+        ^ kv_quant.cache_key_salt();
     let lookup: CacheLookup = PROMPT_CACHE.with_inner_mut(|guard| {
         let cache = guard.as_mut().unwrap();
-        let mut raw_match = cache.find_best_prefix(prompt_ids);
+        let mut raw_match = cache.find_best_prefix(prompt_ids, cache_seed);
         // on a RAM miss, try the SSD tier (no-op when no source attached
         // — tier OFF). A hit promotes the block into RAM; re-run find_best_prefix
         // so the promoted slot is matched + quant-checked by the path below.
         if raw_match.is_none() && cache.hydrate_from_ssd(prompt_ids).is_some() {
-            raw_match = cache.find_best_prefix(prompt_ids);
+            raw_match = cache.find_best_prefix(prompt_ids, cache_seed);
         }
         // Plan §D8 / Task 11.5: stored `KvQuant` must match runtime; on
         // mismatch evict + warn + degrade to Miss. See `gemma4/generate.rs`
@@ -703,7 +709,9 @@ pub fn generate_greedy(
                                     prompt_token_ids: prompt_ids.to_vec(),
                                     block_hashes: crate::prompt_cache::chained_block_hashes_seeded(
                                         prompt_ids,
-                                        crate::prompt_cache::FNV_OFFSET ^ lk,
+                                        crate::prompt_cache::FNV_OFFSET
+                                            ^ lk
+                                            ^ kv_quant.cache_key_salt(),
                                     ),
                                     kv_caches: kvs,
                                     lin_caches: lins,
@@ -1126,7 +1134,9 @@ pub fn generate_greedy(
                                 prompt_token_ids: prompt_ids.to_vec(),
                                 block_hashes: crate::prompt_cache::chained_block_hashes_seeded(
                                     prompt_ids,
-                                    crate::prompt_cache::FNV_OFFSET ^ lk,
+                                    crate::prompt_cache::FNV_OFFSET
+                                        ^ lk
+                                        ^ kv_quant.cache_key_salt(),
                                 ),
                                 kv_caches: kvs,
                                 lin_caches: lins,

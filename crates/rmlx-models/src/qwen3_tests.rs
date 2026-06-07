@@ -1,5 +1,6 @@
 use super::*;
-use crate::prompt_cache::{chained_block_hashes, PromptCache};
+use crate::prompt_cache::PromptCache;
+use rmlx_kv_ssd::chained_block_hashes;
 
 /// Unit test: per-head q_norm shape is preserved.
 ///
@@ -299,7 +300,7 @@ fn qwen3_ssd_hydrate_promotes_entry_into_ram() {
     }));
 
     // Before hydrate: RAM miss.
-    let before = cache.find_best_prefix(&prompt_ids);
+    let before = cache.find_best_prefix(&prompt_ids, FNV_OFFSET);
     assert!(before.is_none(), "RAM must be empty before hydrate");
 
     // Hydrate from mock SSD.
@@ -316,7 +317,7 @@ fn qwen3_ssd_hydrate_promotes_entry_into_ram() {
     assert_eq!(cache.stats().ssd_hits, 1, "ssd_hits counter must be bumped");
 
     // After hydrate: RAM hit.
-    let after = cache.find_best_prefix(&prompt_ids);
+    let after = cache.find_best_prefix(&prompt_ids, FNV_OFFSET);
     assert!(
         after.is_some(),
         "promoted entry must be findable in RAM after hydrate"

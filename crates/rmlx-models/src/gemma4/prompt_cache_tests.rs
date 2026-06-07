@@ -3,7 +3,7 @@ use crate::prompt_cache::PromptCache;
 use rmlx_kv_quant::KvQuant;
 
 fn entry_with(kv_caches: Vec<KvCache>, ids: Vec<u32>) -> Gemma4Entry {
-    let block_hashes = crate::prompt_cache::chained_block_hashes(&ids);
+    let block_hashes = rmlx_kv_ssd::chained_block_hashes(&ids);
     Gemma4Entry {
         prompt_token_ids: ids,
         block_hashes,
@@ -19,7 +19,7 @@ fn entry_with_quant(
     ids: Vec<u32>,
     kv_quant: Option<KvQuant>,
 ) -> Gemma4Entry {
-    let block_hashes = crate::prompt_cache::chained_block_hashes(&ids);
+    let block_hashes = rmlx_kv_ssd::chained_block_hashes(&ids);
     Gemma4Entry {
         prompt_token_ids: ids,
         block_hashes,
@@ -85,14 +85,16 @@ fn kv_quant_mismatch_evicts_and_misses() {
     cache.push(entry);
 
     let runtime_quant = KvQuant::K8V4;
-    let (slot_idx, _) = cache.find_best_prefix(&prompt_ids).expect("block hit");
+    let (slot_idx, _) = cache
+        .find_best_prefix(&prompt_ids, FNV_OFFSET)
+        .expect("block hit");
     let entry_quant = cache.slots[slot_idx].entry.kv_quant;
     assert!(entry_quant != Some(runtime_quant));
     cache.evict_slot(slot_idx);
 
     assert_eq!(cache.slots.len(), 0);
     assert_eq!(cache.stats().evictions, 1);
-    assert!(cache.find_best_prefix(&prompt_ids).is_none());
+    assert!(cache.find_best_prefix(&prompt_ids, FNV_OFFSET).is_none());
 }
 
 /// BACKWARD-COMPAT path: stored `None` — treated as MISMATCH.
@@ -117,7 +119,9 @@ fn kv_quant_legacy_none_evicts_and_misses() {
     cache.push(entry);
 
     let runtime_quant = KvQuant::K8V8;
-    let (slot_idx, _) = cache.find_best_prefix(&prompt_ids).expect("block hit");
+    let (slot_idx, _) = cache
+        .find_best_prefix(&prompt_ids, FNV_OFFSET)
+        .expect("block hit");
     assert!(cache.slots[slot_idx].entry.kv_quant != Some(runtime_quant));
     cache.evict_slot(slot_idx);
     assert_eq!(cache.slots.len(), 0);
@@ -145,7 +149,9 @@ fn kv_quant_match_hits_no_eviction() {
     let mut cache: PromptCache<Gemma4Entry> = PromptCache::new(4);
     cache.push(entry);
 
-    let (slot_idx, _) = cache.find_best_prefix(&prompt_ids).expect("block hit");
+    let (slot_idx, _) = cache
+        .find_best_prefix(&prompt_ids, FNV_OFFSET)
+        .expect("block hit");
     assert_eq!(cache.slots[slot_idx].entry.kv_quant, Some(KvQuant::K8V8));
     assert_eq!(cache.slots.len(), 1);
     assert_eq!(cache.stats().evictions, 0);

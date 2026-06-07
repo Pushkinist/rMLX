@@ -213,6 +213,34 @@ pub(crate) async fn chat_completions(
             return bad_request("presence_penalty must be in [-2.0, 2.0]");
         }
     }
+    // Issue #26: per-request KV-cache config hot-swap. Parse `kv_quant` /
+    // `max_ctx` overrides up front so a malformed codec string rejects with a
+    // clean 400 before any tokenization or model-load work. `None` (omitted)
+    // → fall through to the generator's launch default (zero regression).
+    let req_kv_quant_override = match req.kv_quant.as_deref() {
+        Some(s) => match crate::engine::parse_request_kv_quant(s) {
+            Ok(v) => v,
+            Err(e) => {
+                state.error_counts.increment(ApiErrorCategory::BadRequest);
+                return bad_request(&format!("kv_quant: {e}"));
+            }
+        },
+        None => None,
+    };
+    if let Some(c) = req.max_ctx {
+        if c <= 0 {
+            state.error_counts.increment(ApiErrorCategory::BadRequest);
+            return bad_request("max_ctx must be > 0");
+        }
+    }
+    let req_max_ctx_override = req.max_ctx;
+    if req_kv_quant_override.is_some() || req_max_ctx_override.is_some() {
+        tracing::info!(
+            kv_quant = ?req_kv_quant_override,
+            max_ctx = ?req_max_ctx_override,
+            "chat_completions: per-request KV-config override (issue #26)"
+        );
+    }
     // logprobs / top_logprobs validation (OpenAI semantics).
     // - `top_logprobs` requires `logprobs:true` (else 400).
     // - `top_logprobs` must be in 0..=20.
@@ -937,6 +965,10 @@ pub(crate) async fn chat_completions(
         thinking_end_token,
         // C5 Slice A: set below, after FIFO admission acquires the permit.
         gpu_admission: None,
+        // Issue #26: per-request KV-config overrides threaded to the cache
+        // builder (None = launch default).
+        kv_quant_override: req_kv_quant_override,
+        max_ctx_override: req_max_ctx_override,
         // multimodal content-part extraction.
         images: req_images,
         audio_b64: req_audio_b64,
@@ -971,7 +1003,14 @@ pub(crate) async fn chat_completions(
     // Slot=None (cold-start race) or NotReadyGenerator default → usize::MAX,
     // letting the existing 503 path catch real runtime overflows there.
     {
-        let effective_max_ctx = state.effective_max_ctx_for(&req.model);
+        // Issue #26: when a per-request `max_ctx` override is present, the guard
+        // ceiling is the requested value (the engine sizes the KV-ring virtual
+        // ceiling to it, #25), not the load-time `--max-ctx`. The engine clamps
+        // by the model's max_position_embeddings during cache build, so an
+        // over-mpe request is bounded there; this guard only prevents a runaway
+        // prompt from bottoming out as a 503 / zero-token response.
+        let effective_max_ctx = req_max_ctx_override
+            .map_or_else(|| state.effective_max_ctx_for(&req.model), |n| n as usize);
         let prompt_len = gen_req.prompt_tokens.len();
         if prompt_len > effective_max_ctx {
             state

@@ -27,6 +27,8 @@ fn sample_req() -> GenerationRequest {
         thinking_start_token: None,
         thinking_end_token: None,
         gpu_admission: None,
+        kv_quant_override: None,
+        max_ctx_override: None,
         images: vec![],
         audio_b64: vec![],
     }
@@ -735,4 +737,62 @@ fn registry_exposes_new_ops() {
             "{op} direction"
         );
     }
+}
+
+// ── Issue #26: per-request KV-config override parsing ──────────────────────────
+
+/// `parse_request_kv_quant` mirrors the `--kv-quant` CLI grammar: `"auto"` →
+/// `None` (fall through to the generator's per-arch/per-ctx default), canonical
+/// codec strings → the matching `KvQuant`, `"mixed"` → the canonical short
+/// alias, and a malformed string → `Err` (the route maps this to HTTP 400).
+#[test]
+fn parse_request_kv_quant_maps_strings() {
+    use rmlx_kv_quant::KvQuant;
+
+    // "auto" → None (defer to launch/auto policy).
+    assert_eq!(parse_request_kv_quant("auto"), Ok(None));
+    // Case-insensitive + whitespace-tolerant.
+    assert_eq!(parse_request_kv_quant("  AUTO "), Ok(None));
+
+    // Canonical codec strings round-trip to the right variant.
+    assert_eq!(parse_request_kv_quant("none"), Ok(Some(KvQuant::None)));
+    assert_eq!(parse_request_kv_quant("bf16"), Ok(Some(KvQuant::None)));
+    assert_eq!(parse_request_kv_quant("k8v4"), Ok(Some(KvQuant::K8V4)));
+    assert_eq!(parse_request_kv_quant("k8v8"), Ok(Some(KvQuant::K8V8)));
+    assert_eq!(parse_request_kv_quant("planar"), Ok(Some(KvQuant::Planar)));
+
+    // "mixed" → the canonical Mixed{k8,v4,g64} short alias.
+    assert_eq!(
+        parse_request_kv_quant("mixed"),
+        Ok(Some(KvQuant::Mixed {
+            k_bits: 8,
+            v_bits: 4,
+            k_group_size: 64,
+            v_group_size: 64,
+        }))
+    );
+
+    // Garbage → Err (route layer returns HTTP 400).
+    assert!(parse_request_kv_quant("definitely-not-a-codec").is_err());
+}
+
+/// Default-when-absent: the override fields on a freshly built request are
+/// `None`, so the generator falls through to its launch default (zero
+/// regression for requests that omit `kv_quant` / `max_ctx`).
+#[test]
+fn generation_request_overrides_default_none() {
+    let req = sample_req();
+    assert_eq!(req.kv_quant_override, None);
+    assert_eq!(req.max_ctx_override, None);
+}
+
+/// A per-request override is carried verbatim on the `GenerationRequest` so the
+/// generator's `generate()` can prefer it over the launch default.
+#[test]
+fn generation_request_carries_overrides() {
+    let mut req = sample_req();
+    req.kv_quant_override = Some(rmlx_kv_quant::KvQuant::K8V4);
+    req.max_ctx_override = Some(8192);
+    assert_eq!(req.kv_quant_override, Some(rmlx_kv_quant::KvQuant::K8V4));
+    assert_eq!(req.max_ctx_override, Some(8192));
 }

@@ -129,6 +129,37 @@ pub(crate) fn resolve_kv_quant_for_load(
     }
 }
 
+/// Issue #26: parse a per-request `kv_quant` string into an optional override.
+///
+/// Mirrors the `--kv-quant` CLI grammar (`crate`-external
+/// `rmlx_cli::commands::parse::parse_kv_quant`) so a request field and the
+/// launch flag accept identical strings:
+/// - `"auto"` → `Ok(None)` — fall through to the generator's per-arch/per-ctx
+///   auto policy (NOT the launch explicit value).
+/// - `"mixed"` → the canonical `Mixed{k8,v4,g64}` short alias.
+/// - everything else → `<KvQuant as FromStr>::from_str` (`none`/`bf16`,
+///   `k8v4`, `k8v8`, `planar`, `mixed_k<kb>g<kg>_v<vb>g<vg>`, …).
+///
+/// Returns the parse error string (no `--kv-quant:` prefix) so the route layer
+/// can wrap it in a clean HTTP 400 `invalid_request_error`.
+pub(crate) fn parse_request_kv_quant(s: &str) -> Result<Option<rmlx_kv_quant::KvQuant>, String> {
+    use rmlx_kv_quant::KvQuant;
+    use std::str::FromStr;
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+    if s.eq_ignore_ascii_case("mixed") {
+        return Ok(Some(KvQuant::Mixed {
+            k_bits: 8,
+            v_bits: 4,
+            k_group_size: 64,
+            v_group_size: 64,
+        }));
+    }
+    KvQuant::from_str(s).map(Some).map_err(|e| e.to_string())
+}
+
 // ── tool-marker allowlist ────────────────────────────────────────────────────
 
 /// A5.6: whether a special-token surface form is one of the Gemma-4
