@@ -131,6 +131,21 @@ pub enum Error {
         /// The configured virtual ceiling (in tokens), from `--max-ctx`.
         ceiling: i32,
     },
+
+    /// A `--draft-model` + `--draft-kind` combination is structurally
+    /// unsupported. Raised at load (before first inference) when the draft
+    /// model's detected architecture family cannot back the requested draft
+    /// kind — e.g. a plain `Gemma4ForConditionalGeneration` snapshot passed
+    /// with `--draft-kind mtp`, which has no MTP sidecar head and is not the
+    /// dedicated Gemma4 assistant drafter. The message names the detected
+    /// family and the correct alternative so the operator can fix the flags
+    /// instead of seeing an unrelated loader error leak from the wrong path.
+    #[error("unsupported speculative pairing: {reason}")]
+    SpeculativePairing {
+        /// Human-readable explanation naming the detected draft arch and the
+        /// correct alternative (e.g. the required assistant snapshot).
+        reason: String,
+    },
 }
 
 /// The allocation phase in which an [`Error::Oom`] was raised.

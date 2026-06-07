@@ -91,6 +91,24 @@ fn classify_io_is_fatal() {
     assert_eq!(classify(&err), RetryClass::Fatal);
 }
 
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test-only string construction; no fallible ops"
+)]
+fn classify_speculative_pairing_is_fatal() {
+    // SpeculativePairing is emitted when --draft-kind mtp is given an
+    // incompatible draft snapshot (e.g. plain Gemma4 fed to the Qwen MTP
+    // loader). Retrying would hit the same rejection — must be Fatal, not
+    // Migratable.
+    let err = E::SpeculativePairing {
+        reason: "draft model architecture 'Gemma4ForConditionalGeneration' is not a supported \
+                 --draft-kind mtp family"
+            .to_owned(),
+    };
+    assert_eq!(classify(&err), RetryClass::Fatal);
+}
+
 // ── is_replayable() ──────────────────────────────────────────────────────
 
 fn req_with_temp(temperature: f32) -> GenerationRequest {
