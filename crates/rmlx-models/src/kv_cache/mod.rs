@@ -153,6 +153,9 @@ pub fn kv_quant_for_layer(
 ///   the server's `effective_max_ctx` uses, so the per-cache ceiling and the
 ///   per-request prompt-length guard agree. `mpe <= 0` means the arch does not
 ///   expose `max_position_embeddings`; treat it as "unknown" and ignore it.
+/// - `max_ctx_override = Some(n)` where `n <= 0` is treated as "unset" (falls
+///   through to the arch-default path) and emits a `warn!` event so the caller
+///   can diagnose unexpected zero/negative values from config parsing.
 ///
 /// Wire it in an arch `generate` as:
 /// ```ignore
@@ -170,7 +173,20 @@ pub fn kv_max_seq_and_ceiling(max_ctx_override: Option<i32>, mpe: i32) -> (i32, 
                 n
             }
         }
-        _ => {
+        Some(n) => {
+            // n <= 0: treat as unset; log so the caller can diagnose
+            // unexpected zero/negative values from CLI or config parsing.
+            tracing::warn!(
+                max_ctx_override = n,
+                "max_ctx_override <= 0 treated as unset; using arch default"
+            );
+            if mpe > 0 {
+                mpe.min(default)
+            } else {
+                default
+            }
+        }
+        None => {
             if mpe > 0 {
                 mpe.min(default)
             } else {

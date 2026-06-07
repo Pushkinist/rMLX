@@ -348,9 +348,8 @@ pub fn generate_greedy(
     // Derive the initial ring size and the virtual ceiling (issue #25):
     // `--max-ctx` is a ceiling the ring grows lazily up to, not an eager
     // allocation. `initial_max_seq` is the small lazy start; `max_seq_ceiling`
-    // caps growth and rejects over-long prompts. `max_seq` keeps its name as
-    // the value the cache is first built with.
-    let (max_seq, max_seq_ceiling) =
+    // caps growth and rejects over-long prompts.
+    let (initial_max_seq, max_seq_ceiling) =
         kv_max_seq_and_ceiling(max_ctx_override, model.cfg.max_position_embeddings as i32);
 
     // ------------------------------------------------------------------
@@ -740,7 +739,7 @@ pub fn generate_greedy(
                         LAYER_ADAPTIVE_TAIL_N,
                         LAYER_ADAPTIVE_HEAD_N,
                     );
-                    KvCache::with_quant_max_seq_window(q, max_seq, window)
+                    KvCache::with_quant_max_seq_window(q, initial_max_seq, window)
                         .with_max_seq_ceiling(max_seq_ceiling)
                         .with_layer_idx(i)
                 })

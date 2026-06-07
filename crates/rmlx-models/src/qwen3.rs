@@ -2270,10 +2270,10 @@ pub fn generate_greedy(
     let prefill_t0 = Instant::now();
 
     // Derive initial ring size + virtual ceiling (issue #25): `--max-ctx` is a
-    // ceiling the ring grows lazily up to, not an eager allocation. `max_seq`
-    // is the small lazy start; `max_seq_ceiling` caps growth + rejects over-long
-    // prompts.
-    let (max_seq, max_seq_ceiling) =
+    // ceiling the ring grows lazily up to, not an eager allocation.
+    // `initial_max_seq` is the small lazy start; `max_seq_ceiling` caps growth
+    // and rejects over-long prompts.
+    let (initial_max_seq, max_seq_ceiling) =
         kv_max_seq_and_ceiling(max_ctx_override, model.cfg.max_position_embeddings as i32);
 
     // Allocate one KvCache per decoder layer using the selected quant mode.
@@ -2288,7 +2288,7 @@ pub fn generate_greedy(
                 LAYER_ADAPTIVE_TAIL_N,
                 LAYER_ADAPTIVE_HEAD_N,
             );
-            KvCache::with_quant_max_seq(q, max_seq)
+            KvCache::with_quant_max_seq(q, initial_max_seq)
                 .with_max_seq_ceiling(max_seq_ceiling)
                 .with_layer_idx(i)
         })

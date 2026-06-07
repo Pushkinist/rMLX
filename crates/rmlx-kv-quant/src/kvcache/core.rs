@@ -198,6 +198,10 @@ impl KvCache {
             flash_max_seq: 0,
             flash_filled: 0,
             fused_qk_shadow: None,
+            // Intentional: hydrated/restored caches resume with `in_prefill: false`
+            // and never re-enter the prefill grow path, so the ceiling guard is
+            // not needed. Callers that want to re-attach a ceiling after hydration
+            // can chain `.with_max_seq_ceiling(n)` explicitly.
             max_seq_ceiling: None,
         }
     }
@@ -236,6 +240,14 @@ impl KvCache {
     /// what lets a server started with a large `--max-ctx` serve short requests
     /// at full speed: short requests pay only for what they fill, while the
     /// ceiling still bounds the maximum context.
+    ///
+    /// **Scope: non-rotating (global-attention / dense) layers only.**
+    /// Rotating SWA layers return early from `update()` via the `self.rotating`
+    /// branch before reaching `ensure_prefill_capacity`, so the ceiling is never
+    /// consulted for them. This is correct by construction: SWA layers are
+    /// window-bounded (e.g. 512 or 1024 tokens), so no ceiling guard is needed.
+    /// Per-arch correctness holds because every wired architecture has at least
+    /// one global-attention layer that does enforce the ceiling.
     ///
     /// `ceiling <= 0` is treated as "no ceiling" and clears it.
     #[must_use]
