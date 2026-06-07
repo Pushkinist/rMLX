@@ -333,7 +333,12 @@ Per draft step:
    verifier hidden width and `D` is the draft hidden width).
 4. Run the 4-layer decoder stack using the shared K/V from the verifier's most
    recent forward pass. Sliding layers receive an additive bidirectional-window
-   bias mask when the KV length exceeds the sliding window.
+   bias mask when the KV length exceeds the sliding window. That bias is passed
+   to SDPA via mlx-c's `"array"` mask mode (masked cells use a large finite
+   penalty `-1e30`, bias cast to the bf16 Q/K/V dtype) — the same convention as
+   the verifier SWA path (`gemma4::layers::build_attn_mask`). mlx-c does **not**
+   accept an `"additive"` mode string; using it aborts every decode step
+   (fixed, issue #24).
 5. Apply `norm` (final RMSNorm), then `post_projection` (`D -> B`) to produce
    the `last_hidden` for the next step.
 6. Pick the next token via the **centroid-routed sparse LM head**

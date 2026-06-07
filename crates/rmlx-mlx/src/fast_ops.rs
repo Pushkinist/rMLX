@@ -265,13 +265,16 @@ pub fn rope_with_freqs(
 /// `scale`: 1/sqrt(head_dim) or 1.0 (Gemma4 uses 1.0).
 /// `mask`: optional causal mask array (bf16 or f32 additive mask) or None.
 ///
-/// `mask_mode`: MLX's string hint for mask type.
+/// `mask_mode`: MLX's string hint for mask type. mlx-c accepts ONLY these
+/// values (the Metal kernel rejects anything else, incl. `"additive"`):
 /// - `"causal"`: use internal causal masking (fastest).
-/// - `"additive"`: caller supplies an additive mask in `mask_arr`.
+/// - `"array"`: caller supplies an explicit mask in `mask_arr` — an additive
+///   bias (0 = allowed, large-negative = masked) whose dtype promotes with
+///   Q/K/V. This is how additive / sliding-window masks are passed.
 /// - `""` (empty): no mask.
 ///
-/// When mask_mode is "causal", `mask_arr` is ignored. When "additive", `mask_arr`
-/// must be a valid array.
+/// When mask_mode is `"causal"` or `""`, `mask_arr` is ignored. When `"array"`,
+/// `mask_arr` must be a valid array.
 ///
 /// Wraps `mlx_fast_scaled_dot_product_attention`.
 pub fn scaled_dot_product_attention(
