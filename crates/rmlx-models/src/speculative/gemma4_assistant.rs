@@ -39,7 +39,9 @@
 //! Unbatched, B=1, greedy (temp=0). Stochastic temp>0 is deferred (the host
 //! sampler slots in at the round-loop level - ). Full-attention masks
 //! are `None` (B=1 no-padding); sliding-attention layers get an additive
-//! bidirectional-window bias when the verifier KV exceeds the window. The
+//! bidirectional-window bias (passed via mlx-c SDPA `"array"` mode, matching
+//! the verifier SWA path — there is no `"additive"` mode) when the verifier KV
+//! exceeds the window. The
 //! `position_ids` are held constant across draft steps (`query_offset =
 //! kv_offset`), mirroring `draft_block`'s single-position multi-token generator.
 
@@ -233,10 +235,12 @@ impl Gemma4AssistantDrafter {
             }
         };
 
-        let (mode, mask_arr) = match mask {
-            Some(m) => ("additive", Some(m)),
-            None => ("", None),
-        };
+        // mlx-c SDPA accepts only "causal" / "array" / "" for mask_mode; the
+        // additive window-bias mask is supplied via "array" with the bias as
+        // mask_arr (mirrors the verifier SWA path in gemma4::layers, NOT a
+        // distinct "additive" mode string — that value is rejected by the
+        // Metal kernel, see fast_ops::scaled_dot_product_attention docs).
+        let (mode, mask_arr) = swa_sdpa_mode(mask);
         let attn = scaled_dot_product_attention(&q, sk, sv, 1.0, mode, mask_arr, self.device)?;
         let attn = attn.transpose(&[0, 2, 1, 3], self.device)?;
         let attn = attn.reshape(&[1, 1, (self.n_heads * layer.head_dim) as i32], self.device)?;
@@ -314,20 +318,38 @@ impl Gemma4AssistantDrafter {
         if kv_len <= window && q_off < window && (kv_len - (q_off + query_len)) < window {
             return Ok(None);
         }
+        // Masked cells use -1e30 (not f32::NEG_INFINITY) to match the verifier
+        // SWA mask builders (crate::layers::build_swa_*): a fully-masked softmax
+        // row over -inf yields NaN, whereas a large finite penalty stays well-
+        // conditioned. The bias is converted to Bf16 below so its dtype promotes
+        // with the bf16 Q/K/V (mlx-c SDPA "array" mode requires this).
         let mut bias = vec![0.0f32; (query_len * kv_len) as usize];
         for qi in 0..query_len {
             let q = q_off + qi;
             for ki in 0..kv_len {
                 let dist = q - ki;
                 if !(dist > -window && dist < window) {
-                    bias[(qi * kv_len + ki) as usize] = f32::NEG_INFINITY;
+                    bias[(qi * kv_len + ki) as usize] = -1e30;
                 }
             }
         }
         let bytes =
             unsafe { std::slice::from_raw_parts(bias.as_ptr().cast::<u8>(), bias.len() * 4) };
         let arr = Array::from_bytes(bytes, &[1, 1, query_len, kv_len], Dtype::F32)?;
-        Ok(Some(arr))
+        Ok(Some(arr.astype(Dtype::Bf16, self.device)?))
+    }
+}
+
+/// Select the mlx-c SDPA `(mask_mode, mask_arr)` for a drafter attention layer.
+///
+/// The additive window-bias mask (when present) goes through the `"array"`
+/// mode — mlx-c rejects a bespoke `"additive"` mode string (valid values are
+/// `"causal"`, `"array"`, `""`). `None` (full-attention or window-covers-all)
+/// uses the empty mode. Verifier-faithful: see `gemma4::layers::build_attn_mask`.
+fn swa_sdpa_mode(mask: Option<&Array>) -> (&'static str, Option<&Array>) {
+    match mask {
+        Some(m) => ("array", Some(m)),
+        None => ("", None),
     }
 }
 
@@ -887,3 +909,7 @@ fn slice_kv_len(kv: &(Array, Array), keep: i32, device: Device) -> Result<(Array
     };
     Ok((do_slice(&kv.0)?, do_slice(&kv.1)?))
 }
+
+#[cfg(test)]
+#[path = "gemma4_assistant_tests.rs"]
+mod tests;
