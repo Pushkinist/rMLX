@@ -71,7 +71,7 @@ mutually exclusive.
 | `--cache-type-v` / `--ctv` | string | — | Per-side codec for the V (value) tensor. Mutually exclusive with `--kv-quant`. |
 | `--kv-bits` | float | — | Bit-width alias (integer or fractional, e.g. `4`, `3.5`). Mutually exclusive with `--kv-quant` and `--cache-type-*`. See KV-bits mapping below. |
 | `--kv-group-size` | usize | 64 | Group size for `--kv-bits`. Requires `--kv-bits`. |
-| `--max-ctx` | u32 | (from model) | KV cache buffer token capacity. Derives from `max_position_embeddings` capped at 4096 when unset. Must be ≥ 256 when set. |
+| `--max-ctx` | u32 | (from model) | **Virtual ceiling** on context length, in tokens — NOT an eager allocation. The KV ring starts small (`KV_MAX_SEQ_DEFAULT = 4096`) and grows lazily up to this ceiling as the prompt fills; prompts over the ceiling are rejected. Short requests on a large-`--max-ctx` server thus decode at full speed (no long-context working-set tax — see `docs/KV_CACHE.md` §4.6). Derives from `max_position_embeddings` capped at 4096 when unset. Must be ≥ 256 when set. |
 | `--idle-timeout-secs` | string | `15m` | Idle time before the model is unloaded. Accepts an integer count of seconds (`30`, `900`) OR a Go-style duration (`30s`, `15m`, `2h`, `24h`). Negative (`-1`) pins the model forever; `0` unloads after each response. Per-request override on **native** routes only (`POST /v1/models/{id}/load` body field `keep_alive`); OpenAI/Anthropic compat routes do not parse the field but still reset the timer on use. **Interaction with the single-MLX claim file:** the timer never bypasses the claim — when TTL fires it unloads the slot in-process; the cross-process claim file (`/tmp/rmlx.<port>.claim`) remains held for the lifetime of the `rmlx serve` process. |
 | `--prompt-cache-slots` | usize | 4 | Number of prompt-cache slots for multi-slot prefix matching. Set to `1` for legacy single-slot exact-match behaviour. |
 | `--draft-model` | path | — | Path to a draft model for speculative decoding. Requires `--draft-kind`. |
@@ -192,7 +192,7 @@ rmlx chat --model /path/to/snapshot --device cpu --kv-quant k8v4
 | `--cache-type-v` / `--ctv` | string | — | Per-side V codec. Mutually exclusive with `--kv-quant`. |
 | `--kv-bits` | float | — | Bit-width alias. Mutually exclusive with `--kv-quant` and `--cache-type-*`. |
 | `--kv-group-size` | usize | 64 | Group size for `--kv-bits`. Requires `--kv-bits`. |
-| `--max-ctx` | u32 | (from model) | KV cache buffer token capacity. Must be ≥ 256 when set. |
+| `--max-ctx` | u32 | (from model) | **Virtual ceiling** on context length, in tokens (not an eager allocation): the KV ring grows lazily up to it, prompts over it are rejected. See `docs/KV_CACHE.md` §4.6. Must be ≥ 256 when set. |
 
 ---
 
@@ -219,7 +219,7 @@ rmlx info --model /path/to/snapshot --probe-smoke
 | `--cache-type-v` / `--ctv` | string | — | Per-side V codec. Mutually exclusive with `--kv-quant`. |
 | `--kv-bits` | float | — | Bit-width alias. Mutually exclusive with `--kv-quant` and `--cache-type-*`. |
 | `--kv-group-size` | usize | 64 | Group size for `--kv-bits`. |
-| `--max-ctx` | u32 | (from model) | KV cache buffer token capacity. Must be ≥ 256 when set. |
+| `--max-ctx` | u32 | (from model) | **Virtual ceiling** on context length, in tokens (not an eager allocation): the KV ring grows lazily up to it, prompts over it are rejected. See `docs/KV_CACHE.md` §4.6. Must be ≥ 256 when set. |
 | `--list-cache-types` | bool flag | off | Print the full §D1 KV codec table and exit. No model load. |
 
 ---

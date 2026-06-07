@@ -154,6 +154,121 @@ fn update_prefill_raw_rejects_grow_on_resumed_cache() {
     );
 }
 
+/// Issue #25: a large `max_seq_ceiling` does NOT pre-allocate the ring.
+///
+/// The ring must start at its small initial `max_seq` and grow lazily up to
+/// the ceiling. Build a cache with a tiny initial `max_seq=128` and a large
+/// ceiling of 140_000 (the issue's oversized `--max-ctx`), then prefill 192
+/// tokens. The buffer must end up sized to the lazy power-of-two (256), NOT to
+/// the ceiling — proving the short request pays only for what it fills.
+#[test]
+fn ceiling_does_not_pre_allocate_ring() {
+    let device = Device::Cpu;
+    let mut cache = KvCache::with_quant_max_seq(KvQuant::None, TEST_INITIAL_MAX_SEQ)
+        .with_max_seq_ceiling(140_000);
+    cache.enter_prefill();
+
+    let chunk_shape = [1_i32, TEST_KV_H, TEST_CHUNK, TEST_HEAD_DIM];
+    let n_chunk: usize = chunk_shape.iter().map(|&d| d as usize).product();
+    for step in 0..3_u32 {
+        let k = f32_arr(&vec![0.1_f32 * (step as f32 + 1.0); n_chunk], &chunk_shape);
+        let v = f32_arr(&vec![0.2_f32 * (step as f32 + 1.0); n_chunk], &chunk_shape);
+        cache
+            .update(&k, &v, device)
+            .expect("lazy grow under ceiling");
+    }
+
+    assert_eq!(cache.offset(), 192, "offset tracks filled length");
+    // The ring grew only to the next pow2 ≥ 192 = 256 — NOT to 140_000.
+    assert_eq!(
+        cache.storage_max_seq_for_test(),
+        256,
+        "ring grows lazily to the doubling boundary, not the ceiling",
+    );
+
+    cache.exit_prefill(device).expect("exit_prefill");
+}
+
+/// Issue #25: lazy grow is clamped to the ceiling, never past it.
+///
+/// With initial `max_seq=128` and ceiling=200, a 192-token prefill would
+/// normally double to 256, but the ceiling clamps the allocation to exactly
+/// 200. The request still fits (192 <= 200) and completes.
+#[test]
+fn grow_clamps_to_ceiling() {
+    let device = Device::Cpu;
+    let mut cache =
+        KvCache::with_quant_max_seq(KvQuant::None, TEST_INITIAL_MAX_SEQ).with_max_seq_ceiling(200);
+    cache.enter_prefill();
+
+    let chunk_shape = [1_i32, TEST_KV_H, TEST_CHUNK, TEST_HEAD_DIM];
+    let n_chunk: usize = chunk_shape.iter().map(|&d| d as usize).product();
+    for _ in 0..3_u32 {
+        let k = f32_arr(&vec![0.1_f32; n_chunk], &chunk_shape);
+        let v = f32_arr(&vec![0.2_f32; n_chunk], &chunk_shape);
+        cache.update(&k, &v, device).expect("lazy grow to ceiling");
+    }
+
+    assert_eq!(cache.offset(), 192);
+    assert_eq!(
+        cache.storage_max_seq_for_test(),
+        200,
+        "doubled size (256) clamped down to the 200-token ceiling",
+    );
+
+    cache.exit_prefill(device).expect("exit_prefill");
+}
+
+/// Issue #25: a prefill that exceeds the ceiling is rejected with a typed
+/// error before any allocation past the ceiling.
+///
+/// Initial `max_seq=128`, ceiling=150. A single 200-token chunk needs more
+/// than the ceiling and must error with `KvCeilingExceeded` rather than grow.
+#[test]
+fn prefill_over_ceiling_is_rejected() {
+    let device = Device::Cpu;
+    let mut cache =
+        KvCache::with_quant_max_seq(KvQuant::None, TEST_INITIAL_MAX_SEQ).with_max_seq_ceiling(150);
+    cache.enter_prefill();
+
+    let chunk_shape = [1_i32, TEST_KV_H, 200, TEST_HEAD_DIM];
+    let n_chunk: usize = chunk_shape.iter().map(|&d| d as usize).product();
+    let k = f32_arr(&vec![0.5_f32; n_chunk], &chunk_shape);
+    let v = f32_arr(&vec![0.7_f32; n_chunk], &chunk_shape);
+
+    let err = cache
+        .update(&k, &v, device)
+        .expect_err("prefill over ceiling must error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("exceeds max-ctx ceiling"),
+        "unexpected error: {msg}",
+    );
+}
+
+/// A zero/negative ceiling is treated as "no ceiling" — unbounded lazy grow.
+#[test]
+fn non_positive_ceiling_means_unbounded() {
+    let device = Device::Cpu;
+    let mut cache =
+        KvCache::with_quant_max_seq(KvQuant::None, TEST_INITIAL_MAX_SEQ).with_max_seq_ceiling(0);
+    cache.enter_prefill();
+
+    // 300 > 128 initial cap; with no ceiling it grows to 512 as usual.
+    let chunk_shape = [1_i32, TEST_KV_H, 300, TEST_HEAD_DIM];
+    let n_chunk: usize = chunk_shape.iter().map(|&d| d as usize).product();
+    let k = f32_arr(&vec![0.5_f32; n_chunk], &chunk_shape);
+    let v = f32_arr(&vec![0.7_f32; n_chunk], &chunk_shape);
+    cache
+        .update(&k, &v, device)
+        .expect("unbounded grow with non-positive ceiling");
+
+    assert_eq!(cache.offset(), 300);
+    assert_eq!(cache.storage_max_seq_for_test(), 512);
+
+    cache.exit_prefill(device).expect("exit_prefill");
+}
+
 /// `next_pow2_seq` rounds correctly for a representative spread.
 ///
 /// Pins the local helper so future refactors don't silently regress to
