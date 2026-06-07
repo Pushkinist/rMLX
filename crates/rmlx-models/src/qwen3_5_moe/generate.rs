@@ -8,6 +8,13 @@
 //! # Public API
 //!
 //! - [`generate_greedy`] — main generation entry point.
+//
+// LOC-exempt: the engine deliberately holds three explicit, sequential serving
+// paths inline — Path A (Exact cache hit), Path B (SSD HydratedTail), Path C
+// (cold prefill) — each with its own prefill + decode loop. Per the project's
+// "straight-forward core backend: sequential, sync, explicit" rule, these are
+// kept unrolled rather than factored behind a shared decode helper; the small
+// duplication is intentional and easier to audit than a parameterised loop.
 
 #![allow(
     clippy::cognitive_complexity,
@@ -112,9 +119,11 @@ pub fn generate_greedy(
     let mut steps = Vec::with_capacity(n_tokens);
 
     // Decode profile timers. For Qwen3.5MoE we only instrument the
-    // cache-MISS path C (full prefill from scratch). The exact/prefix paths
-    // are not used by the 4k CBB bench harness (fresh prompts every run) and
-    // adding timers there would only clutter the log.
+    // cache-MISS path C (full prefill from scratch). Path A (Exact) and
+    // Path B (HydratedTail) are intentionally uninstrumented: Path A skips
+    // prefill entirely, and Path B's tail-prefill latency is dominated by
+    // model forward cost (not the cache machinery), so decode_profile events
+    // would only clutter the log for these paths.
     //
     // Note: Qwen3.5MoE pipelines argmax with `async_eval` (line ~485), so the
     // GPU sync materialises at the *next* step's `to_bytes()` on `pending`.
@@ -130,12 +139,27 @@ pub fn generate_greedy(
     // partial path is unsafe for the recurrent GDN `lin_caches` (see the
     // `find_best_prefix` match below). Genuine partial hits fall back to Miss
     // (full re-prefill). Only full-token-equality reuse (Exact) is optimized.
+    //
+    // `HydratedTail` is the exception: when a SSD-hydrated entry is a STRICT
+    // PREFIX of the incoming prompt (i.e. its token ids are a byte-identical
+    // leading subsequence of `prompt_ids`), the block-aligned KV + GDN
+    // lin_caches represent recurrent state at exactly t=prefix_len of THIS
+    // same prompt, so re-prefilling only `prompt_ids[prefix_len..]` on top
+    // is sequentially correct. This is safe because the strict-prefix check
+    // guarantees the tail is the continuation of the exact same prompt (not a
+    // divergent sequence), which is the unsafe case ExactOnly guards against.
     enum CacheLookup {
         Exact {
             kv_caches: Vec<KvCache>,
             lin_caches: Vec<LinearAttnCache>,
             last_id: u32,
             piece: String,
+        },
+        /// SSD-hydrated block-aligned prefix; caller must re-prefill the tail.
+        HydratedTail {
+            kv_caches: Vec<KvCache>,
+            lin_caches: Vec<LinearAttnCache>,
+            prefix_len: usize,
         },
         Miss,
     }
@@ -196,8 +220,17 @@ pub fn generate_greedy(
             // deliberately leaves `lin_caches` untouched), so it emitted
             // corrupted output (258 -> 9 tokens for an identical re-request).
             // True full-equality reuse sidesteps truncation entirely.
+            //
+            // BUG-1 guard: a SSD-hydrated entry whose block-aligned prefix
+            // length happens to equal `prompt_ids.len()` (prompt is an exact
+            // multiple of BLOCK_TOKENS → no tail → `prefix_len == len`) must
+            // NOT be served as Exact: `first_id` is the placeholder 0 set in
+            // `SsdHydrate::hydrate`, not a real decode token. Excluding it
+            // here causes the match to fall through to `Miss` → full re-prefill
+            // re-derives the real `first_id`. Correctness over the micro-opt.
             Some((slot_idx, _block_count))
-                if cache.slots[slot_idx].entry.prompt_token_ids() == prompt_ids =>
+                if !cache.slots[slot_idx].entry.is_ssd_hydrated
+                    && cache.slots[slot_idx].entry.prompt_token_ids() == prompt_ids =>
             {
                 let slot = &cache.slots[slot_idx].entry;
                 match slot.deep_clone() {
@@ -206,6 +239,41 @@ pub fn generate_greedy(
                         lin_caches: cloned.lin_caches,
                         last_id: cloned.first_id,
                         piece: cloned.first_piece,
+                    },
+                    Err(_) => CacheLookup::Miss,
+                }
+            }
+            // HydratedTail: SSD-hydrated block-aligned prefix that is a
+            // STRICT PREFIX of the incoming prompt. The hydrated KV + GDN
+            // lin_caches represent recurrent state at t=prefix_len of this
+            // exact prompt; re-prefilling only `prompt_ids[prefix_len..]`
+            // on top is sequentially correct (identical to pausing/resuming
+            // the original prefill at the block boundary).
+            //
+            // Guards (all must hold):
+            // 1. Entry was promoted from SSD (`is_ssd_hydrated == true`).
+            // 2. Stored ids are shorter than the incoming prompt (strict prefix,
+            //    not a full match — the Exact arm handles the equal-length case).
+            // 3. Stored ids are byte-identical to the matching leading subsequence
+            //    of `prompt_ids` (guarantees the tail is the same prompt's
+            //    continuation, not a divergent one).
+            //
+            // If deep_clone fails, fall through to Miss (full re-prefill).
+            Some((slot_idx, _block_count))
+                if {
+                    let e = &cache.slots[slot_idx].entry;
+                    let stored = e.prompt_token_ids();
+                    e.is_ssd_hydrated
+                        && stored.len() < prompt_ids.len()
+                        && prompt_ids.starts_with(stored)
+                } =>
+            {
+                let slot = &cache.slots[slot_idx].entry;
+                match slot.deep_clone() {
+                    Ok(cloned) => CacheLookup::HydratedTail {
+                        kv_caches: cloned.kv_caches,
+                        lin_caches: cloned.lin_caches,
+                        prefix_len: slot.prompt_token_ids().len(),
                     },
                     Err(_) => CacheLookup::Miss,
                 }
@@ -462,6 +530,390 @@ pub fn generate_greedy(
         return Ok(steps);
     }
 
+    // Path B: HydratedTail — SSD block-aligned prefix in RAM, tail needs forwarding.
+    //
+    // The hydrated caches are in POST-exit_prefill (decode) mode: the prefix
+    // K/V at positions 0..prefix_len are already stored in the quantised
+    // payload buffers with `offset == prefix_len`. Running
+    // `forward_seq_with_cache(tail, ...)` in this state (WITHOUT calling
+    // enter_prefill) correctly:
+    //
+    //   1. appends the tail K/V into the existing storage via the decode path
+    //      (`update_none` / `update_k8v8` etc.), advancing `offset` to
+    //      prefix_len + tail_len.
+    //   2. produces logits where each tail position attends causally over ALL
+    //      prefix + earlier-tail positions — identical to what a full cold
+    //      prefill would produce.
+    //
+    // This is exactly the mechanism that `forward_seq_last_k_with_cache`
+    // (tested in `tests/qwen3_5_moe_forward_seq_last_k.rs`) uses to split a
+    // prefill into two sequential calls and produce byte-identical logits.
+    //
+    // IMPORTANT: do NOT call enter_prefill() here. enter_prefill() resets the
+    // raw accumulation buffers (`prefill_raw_k/v = None`) but leaves the
+    // quantised payload intact. The subsequent tail forward would then attempt
+    // to grow the prefill_raw buffer from zero, ignoring the existing payload,
+    // which produces wrong attention and a guard error on resumed caches.
+    //
+    // Chunking (same prefill_chunk as Path C): keeps GDN ts < 256 per chunk
+    // to avoid Metal watchdog timeouts on long tails.
+    if let CacheLookup::HydratedTail {
+        mut kv_caches,
+        mut lin_caches,
+        prefix_len,
+    } = lookup
+    {
+        let tail_len = prompt_ids.len() - prefix_len;
+        tracing::info!(
+            arch = "Qwen3_5MoeForConditionalGeneration",
+            prefix_len,
+            tail_len,
+            "qwen3_5moe: hydrated-tail hit — forwarding tail from SSD-restored KV"
+        );
+
+        let prefill_chunk = crate::prefill_chunk::prefill_chunk_for("qwen3_5_moe");
+
+        let prefill_logits = {
+            let mut last_logits: Option<Array> = None;
+            let mut prefill_ok = true;
+            let tail = &prompt_ids[prefix_len..];
+            let n_chunks = tail.len().div_ceil(prefill_chunk);
+            for (chunk_idx, chunk) in tail.chunks(prefill_chunk).enumerate() {
+                let is_last = chunk_idx + 1 == n_chunks;
+                match model.forward_seq_with_cache(
+                    chunk,
+                    Some(&mut kv_caches),
+                    Some(&mut lin_caches),
+                    device,
+                ) {
+                    Ok(logits) => {
+                        if is_last {
+                            last_logits = Some(logits);
+                        } else {
+                            // Force-evaluate the KV cache state between chunks
+                            // (avoids lazy-graph explosion, mirrors Path C).
+                            for c in &kv_caches {
+                                if let Err(e) = c.eval_prefill_state() {
+                                    tracing::warn!(
+                                        error = %e,
+                                        chunk_len = chunk.len(),
+                                        "qwen3_5moe generate_greedy (hydrated-tail): tail chunk eval failed"
+                                    );
+                                    prefill_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            prefix_len,
+                            tail_len,
+                            "qwen3_5moe generate_greedy (hydrated-tail): tail chunk failed, returning empty"
+                        );
+                        prefill_ok = false;
+                        break;
+                    }
+                }
+                if !prefill_ok {
+                    break;
+                }
+            }
+
+            if !prefill_ok || last_logits.is_none() {
+                return Ok(steps);
+            }
+            last_logits.unwrap()
+        };
+
+        let logits_flat = prefill_logits.reshape(&[1, vocab], device)?;
+        let mask_active = constraint.as_ref().is_some_and(|c| c.wants_mask());
+        let sampling_active = sampler_cfg.sampling_active();
+        let penalties_active = penalty_cfg.penalties_active();
+        let lp_k = sampler_cfg.top_logprobs_k as usize;
+        let win_start = token_history.len().saturating_sub(20);
+        let recent = &token_history[win_start..];
+        let top = if sampling_active {
+            let mask_opt: Option<&[bool]> = if mask_active {
+                Some(constraint.as_mut().unwrap().step_mask(vocab as usize))
+            } else {
+                None
+            };
+            crate::sampler::sample_token_array(
+                &logits_flat,
+                sampler_cfg,
+                mask_opt,
+                penalty_cfg,
+                recent,
+                rng,
+                device,
+            )?
+        } else {
+            if penalties_active {
+                let mask_opt: Option<&[bool]> = if mask_active {
+                    Some(constraint.as_mut().unwrap().step_mask(vocab as usize))
+                } else {
+                    None
+                };
+                crate::sampler::argmax_with_penalties(
+                    &logits_flat,
+                    mask_opt,
+                    penalty_cfg,
+                    recent,
+                    device,
+                )?
+            } else if mask_active {
+                let c = constraint.as_mut().unwrap();
+                let m = c.step_mask(vocab as usize);
+                apply_mask_argmax(&logits_flat, m, device)?
+            } else {
+                argmax(&logits_flat, -1, device)?
+            }
+        };
+        top.eval()?;
+        let top_bytes = top.to_bytes()?;
+        let last_id = i32::from_le_bytes(top_bytes[..4].try_into().unwrap()) as u32;
+        if let Some(c) = constraint.as_mut() {
+            c.advance(last_id);
+        }
+
+        let piece = tokenizer
+            .id_to_token(last_id)
+            .unwrap_or_else(|| format!("<unk:{last_id}>"));
+
+        // Push the completed full-length snapshot (both prefix + tail) so
+        // future requests can serve this prompt as an Exact hit from RAM.
+        {
+            let kv_snap: Result<Vec<_>> = kv_caches.iter().map(|c| c.try_deep_clone()).collect();
+            let lin_snap: Result<Vec<_>> = lin_caches.iter().map(|c| c.try_deep_clone()).collect();
+            if let (Ok(kvs), Ok(lins)) = (kv_snap, lin_snap) {
+                match kvs
+                    .iter()
+                    .try_for_each(|c| c.eval_for_spill())
+                    .and_then(|()| lins.iter().try_for_each(|c| c.eval_for_spill()))
+                {
+                    Ok(()) => {
+                        PROMPT_CACHE.with_inner_mut(|guard| {
+                            if let Some(cache) = guard.as_mut() {
+                                let lk = crate::qwen3_5_moe::prompt_cache::active_layout_key();
+                                cache.push(Qwen35MoeEntry {
+                                    prompt_token_ids: prompt_ids.to_vec(),
+                                    block_hashes: crate::prompt_cache::chained_block_hashes_seeded(
+                                        prompt_ids,
+                                        crate::prompt_cache::FNV_OFFSET ^ lk,
+                                    ),
+                                    kv_caches: kvs,
+                                    lin_caches: lins,
+                                    first_id: last_id,
+                                    first_piece: piece.clone(),
+                                    kv_quant: Some(kv_quant),
+                                    is_ssd_hydrated: false,
+                                });
+                                tracing::debug!(
+                                    prompt_len = prompt_ids.len(),
+                                    token_id = last_id,
+                                    n_slots = cache.slots.len(),
+                                    "qwen3_5moe generate_greedy: hydrated-tail — saved full snapshot"
+                                );
+                            }
+                        });
+                    }
+                    Err(e) => tracing::warn!(error = %e,
+                        "qwen3_5moe generate_greedy (hydrated-tail): pre-eval failed, skipping prompt cache store"),
+                }
+            }
+        }
+
+        let prefill_logprobs = if lp_k > 0 {
+            capture_logprobs(&logits_flat, &top, lp_k)
+        } else {
+            None
+        };
+        steps.push(ProbeStep {
+            token_id: last_id,
+            piece: piece.into_boxed_str(),
+            max_abs_logit: 0.0,
+            nan_count: 0,
+            logprobs: prefill_logprobs,
+        });
+        step_fn(steps.last().unwrap());
+        token_history.push(last_id);
+
+        if eos_ids.contains(&last_id) {
+            return Ok(steps);
+        }
+
+        let mut next_id;
+        let _ = last_id;
+        let mut y: Array = {
+            let id_i32 = last_id as i32;
+            let bytes = id_i32.to_le_bytes();
+            Array::from_bytes(&bytes, &[1], Dtype::I32)?
+        };
+        y.eval()?;
+
+        let mut pending: Option<Array> = None;
+        let mut pending_logprobs: Option<TokenLogprobs> = None;
+        let mut early_stop = false;
+        let mut forced_next: Option<u32> = None;
+
+        for step_idx in 1..n_tokens {
+            let decode_logits =
+                match model.forward_arr(&y, 1, Some(&mut kv_caches), Some(&mut lin_caches), device)
+                {
+                    Ok(l) => l,
+                    Err(e) => {
+                        tracing::warn!(
+                            step = step_idx,
+                            error = %e,
+                            "qwen3_5moe generate_greedy (hydrated-tail): decode step failed"
+                        );
+                        break;
+                    }
+                };
+            let logits_flat = decode_logits.reshape(&[1, vocab], device)?;
+            let mask_active = constraint.as_ref().is_some_and(|c| c.wants_mask());
+            let sampling_active = sampler_cfg.sampling_active();
+            let penalties_active = penalty_cfg.penalties_active();
+            let lp_k = sampler_cfg.top_logprobs_k as usize;
+            let drain_now = mask_active || sampling_active || penalties_active || lp_k > 0;
+            if mask_active {
+                logits_flat.eval()?;
+            }
+            let pre_drain_eos = if drain_now {
+                if let Some(p) = pending.take() {
+                    let top_bytes = p.to_bytes()?;
+                    next_id = i32::from_le_bytes(top_bytes[..4].try_into().unwrap()) as u32;
+                    if let Some(c) = constraint.as_mut() {
+                        c.advance(next_id);
+                    }
+                    token_history.push(next_id);
+                    steps.push(ProbeStep {
+                        token_id: next_id,
+                        piece: String::new().into_boxed_str(),
+                        max_abs_logit: 0.0,
+                        nan_count: 0,
+                        logprobs: pending_logprobs.take(),
+                    });
+                    forced_next = forced_next.or(step_fn(steps.last().unwrap()));
+                    eos_ids.contains(&next_id)
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if pre_drain_eos {
+                early_stop = true;
+                break;
+            }
+            let win_start = token_history.len().saturating_sub(20);
+            let recent = &token_history[win_start..];
+            let next_y = if sampling_active {
+                let mask_opt: Option<&[bool]> = if mask_active {
+                    Some(constraint.as_mut().unwrap().step_mask(vocab as usize))
+                } else {
+                    None
+                };
+                crate::sampler::sample_token_array(
+                    &logits_flat,
+                    sampler_cfg,
+                    mask_opt,
+                    penalty_cfg,
+                    recent,
+                    rng,
+                    device,
+                )?
+            } else {
+                if penalties_active {
+                    let mask_opt: Option<&[bool]> = if mask_active {
+                        Some(constraint.as_mut().unwrap().step_mask(vocab as usize))
+                    } else {
+                        None
+                    };
+                    crate::sampler::argmax_with_penalties(
+                        &logits_flat,
+                        mask_opt,
+                        penalty_cfg,
+                        recent,
+                        device,
+                    )?
+                } else if mask_active {
+                    let c = constraint.as_mut().unwrap();
+                    let m = c.step_mask(vocab as usize);
+                    apply_mask_argmax(&logits_flat, m, device)?
+                } else {
+                    argmax(&logits_flat, -1, device)?
+                }
+            };
+            let _ = next_y.async_eval();
+            if lp_k > 0 {
+                pending_logprobs = capture_logprobs(&logits_flat, &next_y, lp_k);
+            }
+            let mut emitted_eos = false;
+            if !drain_now {
+                if let Some(p) = pending.take() {
+                    let top_bytes = p.to_bytes()?;
+                    next_id = i32::from_le_bytes(top_bytes[..4].try_into().unwrap()) as u32;
+                    if let Some(c) = constraint.as_mut() {
+                        c.advance(next_id);
+                    }
+                    token_history.push(next_id);
+                    steps.push(ProbeStep {
+                        token_id: next_id,
+                        piece: String::new().into_boxed_str(),
+                        max_abs_logit: 0.0,
+                        nan_count: 0,
+                        logprobs: None,
+                    });
+                    forced_next = forced_next.or(step_fn(steps.last().unwrap()));
+                    emitted_eos = eos_ids.contains(&next_id);
+                }
+            }
+            if emitted_eos {
+                early_stop = true;
+                break;
+            }
+            if let Some(forced_id) = forced_next.take() {
+                let bytes = (forced_id as i32).to_le_bytes();
+                let forced_arr = Array::from_bytes(&bytes, &[1], Dtype::I32)?;
+                let _ = forced_arr.async_eval();
+                y = forced_arr.try_clone()?;
+                pending = Some(forced_arr);
+                pending_logprobs = None;
+            } else {
+                y = next_y.try_clone()?;
+                pending = Some(next_y);
+            }
+        }
+
+        if !early_stop {
+            if let Some(p) = pending {
+                p.eval()?;
+                let top_bytes = p.to_bytes()?;
+                next_id = i32::from_le_bytes(top_bytes[..4].try_into().unwrap()) as u32;
+                if let Some(c) = constraint.as_mut() {
+                    c.advance(next_id);
+                }
+                token_history.push(next_id);
+                steps.push(ProbeStep {
+                    token_id: next_id,
+                    piece: String::new().into_boxed_str(),
+                    max_abs_logit: 0.0,
+                    nan_count: 0,
+                    logprobs: pending_logprobs.take(),
+                });
+                step_fn(steps.last().unwrap());
+            }
+        }
+
+        let kv_bytes: u64 = kv_caches.iter().map(|c| c.approx_bytes()).sum::<u64>()
+            + lin_caches.iter().map(|c| c.approx_bytes()).sum::<u64>();
+        store_kv_cache_bytes(kv_bytes);
+        return Ok(steps);
+    }
+
     let max_seq = max_ctx_override.unwrap_or_else(|| {
         let mpe = model.cfg.max_position_embeddings as i32;
         if mpe <= 0 || mpe > KV_MAX_SEQ_DEFAULT {
@@ -680,6 +1132,7 @@ pub fn generate_greedy(
                                 first_id: last_id,
                                 first_piece: piece.clone(),
                                 kv_quant: Some(kv_quant),
+                                is_ssd_hydrated: false,
                             });
                             tracing::debug!(
                                 prompt_len = prompt_ids.len(),
