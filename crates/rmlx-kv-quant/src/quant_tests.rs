@@ -161,6 +161,7 @@ fn rotk_cli_form_parses() {
 /// must produce the same salt (determinism).
 #[test]
 fn cache_key_salt_is_unique_and_deterministic() {
+    // when adding a KvQuant variant, add it here
     let cases: &[KvQuant] = &[
         KvQuant::None,
         KvQuant::K8V4,

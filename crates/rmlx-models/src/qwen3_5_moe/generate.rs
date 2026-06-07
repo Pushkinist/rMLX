@@ -709,7 +709,9 @@ pub fn generate_greedy(
                                     prompt_token_ids: prompt_ids.to_vec(),
                                     block_hashes: crate::prompt_cache::chained_block_hashes_seeded(
                                         prompt_ids,
-                                        crate::prompt_cache::FNV_OFFSET ^ lk,
+                                        crate::prompt_cache::FNV_OFFSET
+                                            ^ lk
+                                            ^ kv_quant.cache_key_salt(),
                                     ),
                                     kv_caches: kvs,
                                     lin_caches: lins,

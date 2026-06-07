@@ -997,3 +997,133 @@ fn codec_partitioned_key_blocks_cross_codec_serve() {
         "codec-B query hits its own slot"
     );
 }
+
+// ── SSD hydrate seed symmetry (issue #26 reviewer fix) ────────────────────
+//
+// Regression guard for the SSD hydrate path fixed in the review of #26:
+// `SsdHydrate<E>` impls must build the hydrated entry's `block_hashes` with
+// `FNV_OFFSET ^ layout_key ^ kv_quant.cache_key_salt()` — the same seed the
+// RAM push and `find_best_prefix` query use.  If the codec salt is omitted
+// from the hydrate seed, `find_best_prefix` can never match a hydrated entry
+// on SSD-active runs (non-zero `layout_key`) → guaranteed prefix MISS despite
+// a valid on-disk block.
+
+/// A mock `SsdHydrate<TestEntry>` whose returned entry uses the fully-salted
+/// seed (`FNV_OFFSET ^ layout_key ^ codec_salt`), mirroring the corrected
+/// production impls.
+struct MockHydrateSalted {
+    ids: Vec<u32>,
+    layout_key: u64,
+    codec_salt: u64,
+}
+
+impl SsdHydrate<TestEntry> for MockHydrateSalted {
+    fn hydrate(&self, _prompt_ids: &[u32]) -> rmlx_core::error::Result<Option<TestEntry>> {
+        let seed = FNV_OFFSET ^ self.layout_key ^ self.codec_salt;
+        let hashes = chained_block_hashes_seeded(&self.ids, seed);
+        Ok(Some(TestEntry {
+            ids: self.ids.clone(),
+            hashes,
+            truncated_to: std::cell::Cell::new(None),
+        }))
+    }
+}
+
+/// Same as above but uses only `FNV_OFFSET ^ layout_key` (codec salt
+/// omitted) — reproduces the pre-fix bug so we can confirm it misses.
+struct MockHydrateUnsalted {
+    ids: Vec<u32>,
+    layout_key: u64,
+}
+
+impl SsdHydrate<TestEntry> for MockHydrateUnsalted {
+    fn hydrate(&self, _prompt_ids: &[u32]) -> rmlx_core::error::Result<Option<TestEntry>> {
+        let seed = FNV_OFFSET ^ self.layout_key;
+        let hashes = chained_block_hashes_seeded(&self.ids, seed);
+        Ok(Some(TestEntry {
+            ids: self.ids.clone(),
+            hashes,
+            truncated_to: std::cell::Cell::new(None),
+        }))
+    }
+}
+
+/// Issue #26 review — SSD hydrate seed must include the codec salt.
+///
+/// With a non-zero `layout_key` and a non-trivial codec salt:
+/// 1. A hydrated entry built with the **full** seed (`FNV_OFFSET ^
+///    layout_key ^ codec_salt`) is found by a same-seed `find_best_prefix`
+///    query (corrected behavior — HIT).
+/// 2. A hydrated entry built with the **unsalted** seed (`FNV_OFFSET ^
+///    layout_key`, codec salt omitted) is NOT found by the same-codec
+///    query (pre-fix bug — MISS, here tested as the negative case to confirm
+///    the fix is load-bearing).
+/// 3. A correct hydrated entry is NOT found by a different-codec query
+///    (cross-codec isolation still holds).
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test-only: values established by construction"
+)]
+fn ssd_hydrate_seed_symmetry_with_nonzero_layout_key() {
+    use rmlx_kv_quant::KvQuant;
+
+    // Non-zero layout_key to exercise the SSD-active code path.
+    let layout_key: u64 = 0xdead_beef_0000_0001;
+    let codec_a = KvQuant::K8V4;
+    let codec_b = KvQuant::K8V8;
+    let codec_salt_a = codec_a.cache_key_salt();
+    let codec_salt_b = codec_b.cache_key_salt();
+    assert_ne!(
+        codec_salt_a, codec_salt_b,
+        "codecs must have distinct salts"
+    );
+
+    let full_seed_a = FNV_OFFSET ^ layout_key ^ codec_salt_a;
+
+    // 2-block prompt.
+    let prompt_ids: Vec<u32> = make_ids(2 * BLOCK_TOKENS);
+
+    // ── Case 1: corrected hydrate (salted) → same-codec query HITs ──────────
+    let mut cache_correct: PromptCache<TestEntry> = PromptCache::new(4);
+    cache_correct.set_ssd_source(Box::new(MockHydrateSalted {
+        ids: prompt_ids.clone(),
+        layout_key,
+        codec_salt: codec_salt_a,
+    }));
+    let before = cache_correct.find_best_prefix(&prompt_ids, full_seed_a);
+    assert!(before.is_none(), "RAM empty before hydrate");
+    let promoted = cache_correct.hydrate_from_ssd(&prompt_ids);
+    assert!(promoted.is_some(), "mock SSD source must hydrate");
+    let after = cache_correct.find_best_prefix(&prompt_ids, full_seed_a);
+    assert!(
+        after.is_some(),
+        "salted hydrated entry must be found by same-codec query (corrected behavior)"
+    );
+    assert_eq!(after.unwrap().1, 2, "full 2-block prefix must match");
+
+    // ── Case 2: pre-fix hydrate (unsalted seed) → same-codec query MISSes ───
+    // This is the negative case that would have silently re-prefilled before
+    // the fix.  The hydrated entry's hashes are built from
+    // `FNV_OFFSET ^ layout_key` but the query uses `full_seed_a`
+    // (`FNV_OFFSET ^ layout_key ^ codec_salt_a`) → disjoint streams → MISS.
+    let mut cache_broken: PromptCache<TestEntry> = PromptCache::new(4);
+    cache_broken.set_ssd_source(Box::new(MockHydrateUnsalted {
+        ids: prompt_ids.clone(),
+        layout_key,
+    }));
+    cache_broken.hydrate_from_ssd(&prompt_ids);
+    let after_broken = cache_broken.find_best_prefix(&prompt_ids, full_seed_a);
+    assert!(
+        after_broken.is_none(),
+        "pre-fix (unsalted) hydrated entry must NOT be found by salted query (negative case)"
+    );
+
+    // ── Case 3: corrected hydrate under codec A → different-codec query MISSes
+    let full_seed_b = FNV_OFFSET ^ layout_key ^ codec_salt_b;
+    let cross_codec = cache_correct.find_best_prefix(&prompt_ids, full_seed_b);
+    assert!(
+        cross_codec.is_none(),
+        "codec-A hydrated entry must not cross-serve a codec-B query"
+    );
+}

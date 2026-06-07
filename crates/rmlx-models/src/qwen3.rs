@@ -274,7 +274,10 @@ impl SsdHydrate<Qwen3Entry> for SsdHydrator {
             kv_caches,
             lin_caches: _, // pure-attention arch has no GDN state
         } = block;
-        let block_hashes = chained_block_hashes_seeded(&prompt_ids, FNV_OFFSET ^ self.layout_key());
+        let block_hashes = chained_block_hashes_seeded(
+            &prompt_ids,
+            FNV_OFFSET ^ self.layout_key() ^ self.kv_quant().cache_key_salt(),
+        );
         Ok(Some(Qwen3Entry {
             prompt_token_ids: prompt_ids,
             block_hashes,

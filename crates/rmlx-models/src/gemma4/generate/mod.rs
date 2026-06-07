@@ -171,9 +171,11 @@ pub fn generate_greedy(
     // salted by `FNV_OFFSET ^ layout_key ^ codec_salt(kv_quant)` — identical to
     // the push seed below — so a slot stored under a different KV codec never
     // matches this request (no cross-codec serve), and codecs coexist as
-    // distinct slots rather than thrash-evicting one another. On a single-codec
-    // RAM-only run (layout_key=0, constant codec) this is byte-identical to the
-    // legacy un-salted stream for this codec.
+    // distinct slots rather than thrash-evicting one another. On a RAM-only run
+    // (layout_key=0) the push and query seeds are equal (`FNV_OFFSET ^
+    // codec_salt`), so same-codec hits still land; digests differ from the
+    // pre-#26 stream by the constant codec salt, harmless because the cache is
+    // rebuilt per process.
     let cache_seed = crate::prompt_cache::FNV_OFFSET
         ^ crate::gemma4::prompt_cache::active_layout_key()
         ^ kv_quant.cache_key_salt();
