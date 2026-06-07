@@ -5,8 +5,8 @@
 #[allow(clippy::module_inception)]
 mod tests {
     use super::super::{
-        kv_quant_for_ctx, kv_quant_for_layer, lookup_layer_calibration, KvCacheBuilder,
-        LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
+        kv_max_seq_and_ceiling, kv_quant_for_ctx, kv_quant_for_layer, lookup_layer_calibration,
+        KvCacheBuilder, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
     };
     use rmlx_kv_quant::kvcache::KvCache;
     use rmlx_kv_quant::storage::KvStorage;
@@ -1704,5 +1704,61 @@ mod tests {
             entry.is_some(),
             "3-component query should match via 3-prefix (guard is < 3, not <= 3)"
         );
+    }
+
+    // ── Issue #25: kv_max_seq_and_ceiling policy ──────────────────────────────
+
+    /// A large `--max-ctx` becomes a ceiling, NOT the initial ring size.
+    ///
+    /// The ring must start at the lazy default while the ceiling carries the
+    /// operator's `--max-ctx` (clamped to mpe). This is the core fix: a 140k
+    /// override on a 262k-mpe model starts the ring at 4096, ceiling 140k.
+    #[test]
+    fn ceiling_large_override_starts_lazy() {
+        let (initial, ceiling) = kv_max_seq_and_ceiling(Some(140_000), 262_144);
+        assert_eq!(initial, KV_MAX_SEQ_DEFAULT, "ring starts at lazy default");
+        assert_eq!(ceiling, 140_000, "ceiling = override (under mpe)");
+    }
+
+    /// `--max-ctx` is clamped to the model's positional capacity.
+    #[test]
+    fn ceiling_override_clamped_to_mpe() {
+        let (initial, ceiling) = kv_max_seq_and_ceiling(Some(500_000), 131_072);
+        assert_eq!(initial, KV_MAX_SEQ_DEFAULT);
+        assert_eq!(ceiling, 131_072, "ceiling never exceeds mpe");
+    }
+
+    /// A sub-default ceiling must also cap the initial ring (don't pre-grow
+    /// past a small ceiling).
+    #[test]
+    fn ceiling_below_default_caps_initial() {
+        let (initial, ceiling) = kv_max_seq_and_ceiling(Some(2048), 131_072);
+        assert_eq!(initial, 2048, "initial capped at the sub-default ceiling");
+        assert_eq!(ceiling, 2048);
+    }
+
+    /// No override: ceiling falls back to `min(mpe, default)`, initial = that.
+    #[test]
+    fn ceiling_no_override_uses_mpe_default_chain() {
+        // mpe above default → clamp to default.
+        let (initial, ceiling) = kv_max_seq_and_ceiling(None, 131_072);
+        assert_eq!(initial, KV_MAX_SEQ_DEFAULT);
+        assert_eq!(ceiling, KV_MAX_SEQ_DEFAULT);
+        // mpe below default → use mpe.
+        let (initial, ceiling) = kv_max_seq_and_ceiling(None, 2048);
+        assert_eq!(initial, 2048);
+        assert_eq!(ceiling, 2048);
+    }
+
+    /// Unknown mpe (arch reports 0) is ignored; override stands alone.
+    #[test]
+    fn ceiling_unknown_mpe_ignored() {
+        let (initial, ceiling) = kv_max_seq_and_ceiling(Some(64_000), 0);
+        assert_eq!(initial, KV_MAX_SEQ_DEFAULT);
+        assert_eq!(ceiling, 64_000, "no mpe clamp when mpe unknown");
+        // No override + unknown mpe → bare default.
+        let (initial, ceiling) = kv_max_seq_and_ceiling(None, 0);
+        assert_eq!(initial, KV_MAX_SEQ_DEFAULT);
+        assert_eq!(ceiling, KV_MAX_SEQ_DEFAULT);
     }
 }

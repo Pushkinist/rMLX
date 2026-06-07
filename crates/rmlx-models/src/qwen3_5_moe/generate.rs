@@ -30,9 +30,11 @@ use rmlx_core::error::Result;
 use rmlx_mlx::{argmax, Array, Device, Dtype};
 
 use crate::constraint::ConstraintEngine;
-use crate::kv_cache::{kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N};
+use crate::kv_cache::{
+    kv_max_seq_and_ceiling, kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
+};
 use crate::sampler::{apply_mask_argmax, TokenLogprobs};
-use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache, KV_MAX_SEQ_DEFAULT};
+use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
 use super::model::Qwen3_5MoeText;
 use super::prompt_cache::{
@@ -914,14 +916,11 @@ pub fn generate_greedy(
         return Ok(steps);
     }
 
-    let max_seq = max_ctx_override.unwrap_or_else(|| {
-        let mpe = model.cfg.max_position_embeddings as i32;
-        if mpe <= 0 || mpe > KV_MAX_SEQ_DEFAULT {
-            KV_MAX_SEQ_DEFAULT
-        } else {
-            mpe
-        }
-    });
+    // Issue #25: `--max-ctx` is a virtual ceiling the KV ring grows lazily up
+    // to, not an eager allocation. `max_seq` is the lazy start; `max_seq_ceiling`
+    // caps growth and rejects over-long prompts.
+    let (max_seq, max_seq_ceiling) =
+        kv_max_seq_and_ceiling(max_ctx_override, model.cfg.max_position_embeddings as i32);
     // 64-token chunks keep GDN ts < 256 threshold → sequential MSL kernel, no lazy graph explosion.
     // 2048-token chunks (e0231a4) trigger gated_delta_prefill_ops at ts=2048 → ~1.47M lazy nodes
     // across 30 GDN layers → Metal GPU watchdog timeout.
@@ -960,7 +959,9 @@ pub fn generate_greedy(
                 LAYER_ADAPTIVE_TAIL_N,
                 LAYER_ADAPTIVE_HEAD_N,
             );
-            KvCache::with_quant_max_seq(q, max_seq).with_layer_idx(i)
+            KvCache::with_quant_max_seq(q, max_seq)
+                .with_max_seq_ceiling(max_seq_ceiling)
+                .with_layer_idx(i)
         })
         .collect();
     let mut lin_caches: Vec<LinearAttnCache> = (0..model.cfg.num_hidden_layers)

@@ -111,6 +111,15 @@ pub struct KvCache {
     // subsequent decode token. See
     // `docs/research/fused-qk-storage-design.md`.
     pub(super) fused_qk_shadow: Option<FusedQkShadow>,
+    /// Virtual ceiling on the lazily-grown prefill ring, in tokens.
+    ///
+    /// `None` = no ceiling (grow until `RMLX_KV_MAX_SEQ_HARD_CAP` or memory).
+    /// `Some(c)` = the resolved `--max-ctx`: the ring starts small and grows
+    /// lazily (power-of-two doubling) only up to `c`. A prefill that would need
+    /// more than `c` tokens is rejected with [`rmlx_core::Error::KvCeilingExceeded`]
+    /// before any allocation, instead of paying the long-context working-set
+    /// tax on every short request. Set via [`KvCache::with_max_seq_ceiling`].
+    pub(super) max_seq_ceiling: Option<i32>,
 }
 
 impl KvCache {
@@ -189,6 +198,7 @@ impl KvCache {
             flash_max_seq: 0,
             flash_filled: 0,
             fused_qk_shadow: None,
+            max_seq_ceiling: None,
         }
     }
 
@@ -212,7 +222,26 @@ impl KvCache {
             flash_max_seq: 0,
             flash_filled: 0,
             fused_qk_shadow: None,
+            max_seq_ceiling: None,
         }
+    }
+
+    /// Set the virtual ceiling on lazy prefill-ring growth (the resolved
+    /// `--max-ctx`), in tokens.
+    ///
+    /// The ring is allocated lazily at its starting `max_seq` and grows by
+    /// power-of-two doubling up to this ceiling (never past it). A prefill that
+    /// would need more than `ceiling` tokens is rejected with
+    /// [`rmlx_core::Error::KvCeilingExceeded`] before any allocation. This is
+    /// what lets a server started with a large `--max-ctx` serve short requests
+    /// at full speed: short requests pay only for what they fill, while the
+    /// ceiling still bounds the maximum context.
+    ///
+    /// `ceiling <= 0` is treated as "no ceiling" and clears it.
+    #[must_use]
+    pub fn with_max_seq_ceiling(mut self, ceiling: i32) -> Self {
+        self.max_seq_ceiling = if ceiling > 0 { Some(ceiling) } else { None };
+        self
     }
 
     /// Construct a KV cache, optionally as a rotating ring buffer for SWA layers.
@@ -311,6 +340,15 @@ impl KvCache {
     #[cfg(test)]
     pub fn decode_fp16_k_for_test(&self) -> Option<&Array> {
         self.decode_fp16_k.as_ref()
+    }
+
+    /// Test-only accessor: the `max_seq` currently recorded on the active
+    /// storage variant (the allocated ring capacity). Used by the issue-#25
+    /// lazy-grow / ceiling tests to assert the ring grew lazily rather than
+    /// pre-allocating to the ceiling.
+    #[cfg(test)]
+    pub fn storage_max_seq_for_test(&self) -> i32 {
+        super::update::storage_max_seq(&self.storage)
     }
 
     /// Test-only accessor: borrow the internal `decode_fp16_v` Option.

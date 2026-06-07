@@ -116,6 +116,21 @@ pub enum Error {
         /// The configured hard cap (in tokens), from `RMLX_KV_MAX_SEQ_HARD_CAP`.
         cap: i32,
     },
+
+    /// Prefill requested a sequence length above the per-cache virtual
+    /// ceiling. The ceiling is the resolved `--max-ctx` (a virtual cap, not an
+    /// eager allocation): the KV ring grows lazily up to it. Raised before any
+    /// allocation past the ceiling so an over-long prompt is rejected cleanly
+    /// instead of growing the ring beyond the operator-declared context bound.
+    #[error(
+        "kv prefill request exceeds max-ctx ceiling: requested={requested}, ceiling={ceiling}"
+    )]
+    KvCeilingExceeded {
+        /// The needed sequence length (in tokens) that triggered the guard.
+        requested: i32,
+        /// The configured virtual ceiling (in tokens), from `--max-ctx`.
+        ceiling: i32,
+    },
 }
 
 /// The allocation phase in which an [`Error::Oom`] was raised.

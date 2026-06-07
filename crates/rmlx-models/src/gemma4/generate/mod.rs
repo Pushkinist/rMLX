@@ -40,10 +40,12 @@ use rmlx_mlx::{argmax, Array, Device, Dtype};
 use tracing::info_span;
 
 use crate::constraint::ConstraintEngine;
-use crate::kv_cache::{kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N};
+use crate::kv_cache::{
+    kv_max_seq_and_ceiling, kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
+};
 use crate::prompt_cache::PromptCacheEntry as _;
 use crate::sampler::{apply_mask_argmax, TokenLogprobs};
-use rmlx_kv_quant::{KvCache, KvQuant, KV_MAX_SEQ_DEFAULT};
+use rmlx_kv_quant::{KvCache, KvQuant};
 
 use super::model::Gemma4Text;
 use super::prompt_cache::{ensure_prompt_cache, store_kv_cache_bytes, Gemma4Entry, PROMPT_CACHE};
@@ -343,16 +345,13 @@ pub fn generate_greedy(
         })
     };
 
-    // Derive max_seq (used for cache miss allocation and may be needed in
-    // prefix path for entering prefill).
-    let max_seq = max_ctx_override.unwrap_or_else(|| {
-        let mpe = model.cfg.max_position_embeddings as i32;
-        if mpe <= 0 || mpe > KV_MAX_SEQ_DEFAULT {
-            KV_MAX_SEQ_DEFAULT
-        } else {
-            mpe
-        }
-    });
+    // Derive the initial ring size and the virtual ceiling (issue #25):
+    // `--max-ctx` is a ceiling the ring grows lazily up to, not an eager
+    // allocation. `initial_max_seq` is the small lazy start; `max_seq_ceiling`
+    // caps growth and rejects over-long prompts. `max_seq` keeps its name as
+    // the value the cache is first built with.
+    let (max_seq, max_seq_ceiling) =
+        kv_max_seq_and_ceiling(max_ctx_override, model.cfg.max_position_embeddings as i32);
 
     // ------------------------------------------------------------------
     // Helper: decode loop — shared across exact-hit / prefix-hit / miss paths.
@@ -741,7 +740,9 @@ pub fn generate_greedy(
                         LAYER_ADAPTIVE_TAIL_N,
                         LAYER_ADAPTIVE_HEAD_N,
                     );
-                    KvCache::with_quant_max_seq_window(q, max_seq, window).with_layer_idx(i)
+                    KvCache::with_quant_max_seq_window(q, max_seq, window)
+                        .with_max_seq_ceiling(max_seq_ceiling)
+                        .with_layer_idx(i)
                 })
                 .collect();
             (fresh, prompt_ids, false)

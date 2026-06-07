@@ -155,9 +155,10 @@ rejected as `UnsupportedCombo`. `q2_g64` is V-side only and pure 2-bit K is
 
 Prefill chunks accumulate into a per-layer `[B, kv_h, max_seq, head_dim]`
 raw buffer (`KvCache::prefill_raw_k/v`) before quantisation in
-`exit_prefill`. The initial `max_seq` comes from the model's
-`max_position_embeddings` or, when absent, `KV_MAX_SEQ_DEFAULT = 4096`
-(see `crates/rmlx-kv-quant/src/quant.rs`).
+`exit_prefill`. The **initial** `max_seq` is always the small lazy default
+`KV_MAX_SEQ_DEFAULT = 4096` (capped at the ceiling — see §4.6), regardless of
+`--max-ctx`; the buffer grows from there to fit the prompt. The grow path
+(below) takes it up to the resolved `--max-ctx` ceiling.
 
 Before this fix the buffer was sized once at cache construction and never
 grew. If a prompt exceeded `max_seq`, the chunked-prefill loop wrote at
@@ -173,7 +174,9 @@ at the top of every call. When `needed_seq > storage.max_seq`:
 
 1. Allocate a fresh `[B, kv_h, new_max_seq, head_dim]` buffer where
    `new_max_seq = next_pow2_seq(needed_seq)` (power-of-two ≥ needed,
-   clamped to `2^30`).
+   clamped to `2^30`). When a virtual ceiling is set (§4.6), the doubled
+   size is additionally clamped down to the ceiling, so the ring never
+   allocates past `--max-ctx`.
 2. Copy the filled prefix `[..prev_offset]` from the old buffer into
    the new one with `slice_update`.
 3. Bump `max_seq` on the active `KvStorage` variant so the downstream
@@ -200,6 +203,47 @@ on the prefill sequence length. When set to a positive integer:
 
 The env var is resolved once at process start (`OnceLock`); changes
 during the process lifetime are ignored.
+
+## 4.6 `--max-ctx` is a virtual ceiling (lazy grow)
+
+`--max-ctx N` is a **virtual ceiling**, not an eager allocation. Both
+`rmlx serve` and `rmlx baseline` start the KV ring at the lazy default
+(`KV_MAX_SEQ_DEFAULT = 4096`, capped at the ceiling) and grow it by the
+power-of-two policy above **up to** the ceiling as the prompt fills. A short
+request on a server started with a large `--max-ctx` therefore pays only for
+what it fills — it does **not** carry a multi-GB-to-tens-of-GB resident KV
+cache sized to the ceiling.
+
+> **Why this matters (issue #25).** Decode speed tracks the *allocated* ring
+> capacity, not the *filled* length: an oversized resident KV sitting next to
+> the weights starves decode bandwidth/locality. Eagerly sizing the ring to
+> `--max-ctx` cost short requests ~20-25% decode TPS (e.g. gemma-4-e2b 4k:
+> ~95 TPS oversized vs ~117 TPS right-sized). Lazy grow removes the tax; the
+> only cost is an occasional realloc+copy when a request crosses a doubling
+> boundary (amortised O(1), rare).
+
+### Mechanism
+
+* The resolved ceiling is `min(--max-ctx, max_position_embeddings)` when an
+  override is given, else `min(max_position_embeddings, KV_MAX_SEQ_DEFAULT)`.
+  Computed once per request by `rmlx_models::kv_cache::kv_max_seq_and_ceiling`,
+  which returns `(initial_max_seq, ceiling)`. This is the same chain the
+  server's `effective_max_ctx` uses for the per-request prompt-length guard,
+  so cache ceiling and request guard agree.
+* The ceiling is recorded on each `KvCache` via
+  `KvCache::with_max_seq_ceiling(ceiling)` (field `max_seq_ceiling`). It is
+  preserved across branch clones (`try_deep_clone`).
+* `ensure_prefill_capacity` rejects a prefill that needs more than the
+  ceiling with `Error::KvCeilingExceeded { requested, ceiling }` **before**
+  any allocation, and clamps grown allocations to the ceiling. The server
+  route additionally rejects over-long prompts up front
+  (`effective_max_ctx_for`), so this engine-level guard is defense-in-depth
+  (and the sole guard for the CLI `baseline`/`chat` paths).
+* `ceiling <= 0` means "no ceiling" — unbounded lazy grow (bounded only by
+  `RMLX_KV_MAX_SEQ_HARD_CAP` / unified memory).
+
+SWA / rotating layers are unaffected: their bf16 ring is sized to the
+`sliding_window`, never to `max_seq`, so they carry no long-context tax.
 
 ## 5. Hard invariants
 

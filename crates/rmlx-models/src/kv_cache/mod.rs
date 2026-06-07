@@ -135,6 +135,55 @@ pub fn kv_quant_for_layer(
     }
 }
 
+/// Resolve `(initial_max_seq, ceiling)` for a request from `--max-ctx`.
+///
+/// This is the shared policy that makes `--max-ctx` a **virtual ceiling**
+/// rather than an eager allocation, fixing the short-prompt decode penalty
+/// (issue #25): a server started with a large `--max-ctx` must serve short
+/// requests at full speed by growing the KV ring lazily up to the ceiling,
+/// not by allocating the whole ceiling up front.
+///
+/// - `initial_max_seq` is what the per-layer `KvCache` is *first* sized to.
+///   It is always the small lazy default ([`rmlx_kv_quant::KV_MAX_SEQ_DEFAULT`]),
+///   capped by the ceiling so a sub-default ceiling is honoured. The codec's
+///   power-of-two grow path ([`KvCache::ensure_prefill_capacity`]) takes it
+///   from there up to the ceiling as the prompt fills.
+/// - `ceiling` is the resolved bound: `min(max_ctx_override, mpe)` when an
+///   override is given, else `min(mpe, KV_MAX_SEQ_DEFAULT)` — the same chain
+///   the server's `effective_max_ctx` uses, so the per-cache ceiling and the
+///   per-request prompt-length guard agree. `mpe <= 0` means the arch does not
+///   expose `max_position_embeddings`; treat it as "unknown" and ignore it.
+///
+/// Wire it in an arch `generate` as:
+/// ```ignore
+/// let (initial_max_seq, ceiling) = kv_max_seq_and_ceiling(max_ctx_override, mpe);
+/// KvCache::with_quant_max_seq(q, initial_max_seq).with_max_seq_ceiling(ceiling)
+/// ```
+#[must_use]
+pub fn kv_max_seq_and_ceiling(max_ctx_override: Option<i32>, mpe: i32) -> (i32, i32) {
+    let default = rmlx_kv_quant::KV_MAX_SEQ_DEFAULT;
+    let ceiling = match max_ctx_override {
+        Some(n) if n > 0 => {
+            if mpe > 0 {
+                n.min(mpe)
+            } else {
+                n
+            }
+        }
+        _ => {
+            if mpe > 0 {
+                mpe.min(default)
+            } else {
+                default
+            }
+        }
+    };
+    // Start the ring at the lazy default, but never above the ceiling (a
+    // sub-default ceiling must not be pre-grown past).
+    let initial_max_seq = default.min(ceiling);
+    (initial_max_seq, ceiling)
+}
+
 // ── KvCacheBuilder ────────────────────────────────────────────────────────────
 
 /// Returns the appropriate `KvQuant` default for a named architecture.

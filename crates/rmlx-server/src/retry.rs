@@ -144,6 +144,10 @@ pub fn classify(err: &RmlxError) -> RetryClass {
         // request is structurally too large for the current process limits;
         // replaying would hit the same cap. Fatal.
         RmlxError::KvHardCapExceeded { .. } => RetryClass::Fatal,
+        // KV prefill request above the resolved `--max-ctx` virtual ceiling.
+        // The prompt exceeds the operator-declared context bound; replaying
+        // would hit the same ceiling. Fatal (same class as the hard cap).
+        RmlxError::KvCeilingExceeded { .. } => RetryClass::Fatal,
         // Non-exhaustive catch-all: future variants default to Fatal.
         _ => RetryClass::Fatal,
     }
