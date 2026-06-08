@@ -173,6 +173,24 @@ impl Gemma4Generator {
             },
         )?;
 
+        // Issue #36: deterministically warm the resolved KV codec's MSL kernels
+        // during this load (preload) window so the first user request does not
+        // pay a shader cold-compile. General per-codec (keyed off
+        // `KvQuant::carries_msl`); a no-op for `none`/affine and for the
+        // CPU-hot-path iso/rotor families (nothing to warm). Best-effort: a warm
+        // failure logs and proceeds (the kernel compiles lazily on first use).
+        if let Some(kq) = kv_quant_resolved {
+            // head_dim drives the kernel template / group alignment; a single
+            // KV head is enough to force every pipeline to compile (the warm
+            // buffer is `[1, 1, tokens, head_dim]`).
+            let head_dim = cfg.head_dim().unwrap_or(0);
+            if let Err(e) =
+                rmlx_kv_quant::precompile::precompile_kv_codec_msl(kq, head_dim, 1, device)
+            {
+                tracing::warn!(error = %e, kv_quant = %kq, "Gemma4Generator: KV codec MSL precompile failed (non-fatal)");
+            }
+        }
+
         let tk_path = model_dir.join("tokenizer.json");
         let tokenizer = tokenizers::Tokenizer::from_file(&tk_path)
             .map_err(|e| Error::Other(format!("load tokenizer: {e}")))?;

@@ -1268,6 +1268,56 @@ fn validate_resolved_non_moe_iso_k_side_passes() {
     }
 }
 
+/// Issue #36 — Metal-vs-CPU classification in `validate_resolved`.
+///
+/// Single test (no second test mutates `RMLX_STRICT_METAL_KV`) so the
+/// process-global env toggle is not racy under parallel test threads:
+/// - non-strict default: CPU-hot-path iso / rotor V-only codecs resolve `Ok`
+///   (warn-only, not rejected); Metal codecs resolve `Ok`.
+/// - strict (`RMLX_STRICT_METAL_KV=1`): iso / rotor V-only codecs hard-reject
+///   with `CpuOnlyKvCodec` naming the variant; Metal codecs still pass.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test intentionally asserts both Ok (unwrap) and the reject (unwrap_err)"
+)]
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "test asserts the CpuOnlyKvCodec arm only; the catch-all panics on any other variant"
+)]
+fn validate_resolved_cpu_codec_classification() {
+    std::env::remove_var("RMLX_STRICT_METAL_KV");
+
+    // Non-strict: nothing is rejected.
+    for kq in [
+        KvQuant::Iso3,
+        KvQuant::Rotor3,
+        KvQuant::Iso4,
+        KvQuant::Rotor4,
+        KvQuant::K8V4,
+        KvQuant::Planar,
+        KvQuant::RotKTq4V,
+    ] {
+        validate_resolved("Gemma4ForConditionalGeneration", &kq)
+            .unwrap_or_else(|e| panic!("non-strict resolve must pass for {kq}: {e}"));
+    }
+
+    // Strict: CPU codecs reject; Metal codecs pass.
+    std::env::set_var("RMLX_STRICT_METAL_KV", "1");
+    for kq in [KvQuant::Iso3, KvQuant::Rotor3] {
+        let err = validate_resolved("Gemma4ForConditionalGeneration", &kq).unwrap_err();
+        match err {
+            ResolveError::CpuOnlyKvCodec { ref variant, .. } => {
+                assert_eq!(variant, &kq.to_string(), "must name the offending codec");
+            }
+            other => panic!("expected CpuOnlyKvCodec for {kq}, got {other:?}"),
+        }
+    }
+    validate_resolved("Gemma4ForConditionalGeneration", &KvQuant::K8V4).unwrap();
+    validate_resolved("Gemma4ForConditionalGeneration", &KvQuant::RotKTq4V).unwrap();
+    std::env::remove_var("RMLX_STRICT_METAL_KV");
+}
+
 /// Iso3Sym combo_to_kv_quant: (IsoK3, Iso3) maps to Iso3Sym.
 #[test]
 #[allow(

@@ -542,6 +542,122 @@ impl KvQuant {
         }
     }
 
+    /// Issue #36: true when this codec dispatches at least one custom Metal
+    /// (MSL) kernel on its production hot path, so its shaders pay a one-time
+    /// cold-compile on first dispatch.
+    ///
+    /// Used by [`crate::precompile::precompile_kv_codec_msl`] to decide whether
+    /// the load-time MSL warm should run (and to keep `none` off the warm path),
+    /// and by the resolve-time readiness logic to widen the first-serve window
+    /// only for shader-heavy codecs.
+    ///
+    /// **Important:** "carries MSL" is *not* the same as "runs entirely on
+    /// Metal". The iso / rotor families also return `true` here (their K-side is
+    /// q8_0 MSL and they ship V/K GPU encoders), yet their production V encode +
+    /// dequant run on **CPU** — see [`cpu_hot_path_reason`](Self::cpu_hot_path_reason).
+    /// The only codec with no MSL at all is `None` (raw bf16, `slice_update`).
+    ///
+    /// Exhaustive on purpose (no wildcard) so a new variant must be classified.
+    pub fn carries_msl(&self) -> bool {
+        match self {
+            // Raw bf16 KV: no quantization kernel, just slice_update on a bf16
+            // buffer. Nothing to cold-compile.
+            KvQuant::None => false,
+            // Everything else quantizes K with the q8_0 MSL kernel (or, for the
+            // Mixed/RotK family, MLX-native affine `mx.quantize`, itself a
+            // compiled Metal op) and therefore carries at least one shader.
+            KvQuant::K8V4
+            | KvQuant::K8V8
+            | KvQuant::Planar
+            | KvQuant::Planar3
+            | KvQuant::PlanarK
+            | KvQuant::Mixed { .. }
+            | KvQuant::RotK { .. }
+            | KvQuant::RotKTq4V
+            | KvQuant::K8VTurbo3
+            | KvQuant::K8VTurbo3Tcq
+            | KvQuant::K8VTurbo2
+            | KvQuant::K8VTurbo2Tcq
+            | KvQuant::TurboSym3
+            | KvQuant::TurboSym4
+            | KvQuant::Iso3
+            | KvQuant::Iso4
+            | KvQuant::Iso3Sym
+            | KvQuant::Iso4Sym
+            | KvQuant::IsoKOnly3
+            | KvQuant::IsoKOnly4
+            | KvQuant::Rotor3
+            | KvQuant::Rotor4
+            | KvQuant::Rotor3Sym
+            | KvQuant::Rotor4Sym
+            | KvQuant::RotorKOnly3
+            | KvQuant::RotorKOnly4
+            | KvQuant::RotorK3Asym { .. }
+            | KvQuant::RotorK4Asym { .. } => true,
+        }
+    }
+
+    /// Issue #36: `Some(reason)` when this codec runs its V (and, for the K-only
+    /// / symmetric variants, K) **encode + dequant on the CPU** on the default
+    /// production hot path — i.e. it falls through to the dequant-then-SDPA
+    /// legacy path with a host-side scalar codec rather than a Metal kernel.
+    ///
+    /// This is the honest Metal-vs-CPU verdict (CLAUDE.md hard rule 7). The
+    /// iso (quaternion SO(4)) and rotor (Clifford Cl(3,0)) families are CPU on
+    /// the default path: their `exit_prefill` encode calls the scalar
+    /// `QuantIso*/QuantRotor*::append` and decode dequantizes the growing prefix
+    /// on the host (`dequant() -> Vec<f32>`). A GPU fused-QK encoder exists for
+    /// the rotor family but is gated OFF by default (`RMLX_FUSED_QK`) and never
+    /// fires on the standard generate flow; the iso family has no wired GPU
+    /// encoder on the hot path at all. The consequence is the issue-#36
+    /// 30–60× first-forward slowdown and the monotonic decode decay as KV grows.
+    ///
+    /// Returns `None` for codecs whose hot path is genuinely Metal (q8_0 K +
+    /// tq4/planar/affine V, the Turbo/Mixed/RotK families).
+    ///
+    /// Exhaustive on purpose (no wildcard) so a new variant must be classified.
+    pub fn cpu_hot_path_reason(&self) -> Option<&'static str> {
+        match self {
+            KvQuant::Iso3
+            | KvQuant::Iso4
+            | KvQuant::Iso3Sym
+            | KvQuant::Iso4Sym
+            | KvQuant::IsoKOnly3
+            | KvQuant::IsoKOnly4 => Some(
+                "IsoQuant (quaternion SO(4)) V/K encode + dequant run on CPU on the \
+                 default hot path; no Metal kernel is wired into prefill/decode",
+            ),
+            KvQuant::Rotor3
+            | KvQuant::Rotor4
+            | KvQuant::Rotor3Sym
+            | KvQuant::Rotor4Sym
+            | KvQuant::RotorKOnly3
+            | KvQuant::RotorKOnly4
+            | KvQuant::RotorK3Asym { .. }
+            | KvQuant::RotorK4Asym { .. } => Some(
+                "RotorQuant (Clifford Cl(3,0)) V/K encode + dequant run on CPU on the \
+                 default hot path; the GPU fused-QK encoder is opt-in (RMLX_FUSED_QK) \
+                 and does not fire on the standard generate flow",
+            ),
+            // Genuinely Metal on the hot path (or no-op bf16): not a CPU codec.
+            KvQuant::None
+            | KvQuant::K8V4
+            | KvQuant::K8V8
+            | KvQuant::Planar
+            | KvQuant::Planar3
+            | KvQuant::PlanarK
+            | KvQuant::Mixed { .. }
+            | KvQuant::RotK { .. }
+            | KvQuant::RotKTq4V
+            | KvQuant::K8VTurbo3
+            | KvQuant::K8VTurbo3Tcq
+            | KvQuant::K8VTurbo2
+            | KvQuant::K8VTurbo2Tcq
+            | KvQuant::TurboSym3
+            | KvQuant::TurboSym4 => None,
+        }
+    }
+
     /// The `(k_bits, v_bits, k_group_size, v_group_size)` the Mixed state should
     /// be built with for this quant, or `None` for non-Mixed-path variants.
     ///

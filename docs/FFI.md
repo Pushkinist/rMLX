@@ -433,6 +433,17 @@ input/output `mlx_vector_array` handles, dispatches via
 `mlx_fast_metal_kernel_apply`, extracts output `Array` handles, and returns
 them.
 
+**Lazy compile (issue #36).** `MetalKernel::new` only *registers* the kernel
+with MLX; the MSL → Metal pipeline compiles on the **first `apply()`
+dispatch**, not at `new`. For KV codecs this means the shader cold-compile lands
+inside the first user request unless it is warmed earlier. The KV layer warms
+its shader-heavy codecs at model-load time via
+`rmlx_kv_quant::precompile::precompile_kv_codec_msl` (one representative dispatch
+per codec kernel during the eager-preload window); see `docs/KV_QUANT.md`
+§ "Metal-vs-CPU hot path + load-time MSL precompile". The `gdn_warmup` in
+`rmlx-models::arch::loader` is the analogous warm for the GatedDeltaNet compiled
+graph.
+
 ### MSL source conventions
 
 The `source` parameter is the **body** of the kernel function. MLX wraps it

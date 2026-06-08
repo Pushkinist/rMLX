@@ -212,6 +212,73 @@ block-hash seed alongside the SSD `layout_key`. See `docs/PROMPT_CACHE.md`
 | `Paged` | q8_0 per page | 128 | tq4 / q8_0 / planar per page | 32/128/32 | `PagedKStorage` + paged V | — |
 | `TurboSym3` | TurboQuant 3-bit | 32 | TurboQuant 3-bit | 32 | `QuantKTurbo3` + `QuantV{bits:3}` | 0.9807 (K empirical floor) |
 
+---
+
+## Metal-vs-CPU hot path + load-time MSL precompile (issue #36)
+
+Two orthogonal codec attributes drive startup behaviour. Both are exhaustive
+matches on `KvQuant` (`crates/rmlx-kv-quant/src/quant.rs`) — a new variant must
+be classified or the build fails.
+
+* **`KvQuant::carries_msl()`** — `true` when the codec dispatches at least one
+  custom Metal (MSL) kernel on its hot path (every codec except `none`, whose K
+  is q8_0 MSL or MLX-affine `mx.quantize`). MSL kernels in this crate compile
+  **lazily** — `MetalKernel::new` only registers; MLX compiles the pipeline on
+  the *first* `apply()` dispatch (see `docs/FFI.md` § `MetalKernel`). For a
+  shader-heavy codec that first dispatch lands inside the first user request, so
+  the first long-prompt forward pays a one-time shader cold-compile (a 1-token
+  `"hi"` warmup does not trigger it — the codec kernel only fires on a real
+  prefill encode).
+
+* **`KvQuant::cpu_hot_path_reason()`** — `Some(reason)` when the codec's KV
+  encode **and** dequant run on the **CPU** on the default hot path (the iso and
+  rotor families). These carry MSL on the K side (q8_0) yet route their V (and,
+  for the K-only / symmetric variants, K) encode through the scalar
+  `QuantIso*/QuantRotor*::append` at `exit_prefill` and dequantize the growing
+  prefix on the host (`dequant() -> Vec<f32>`) on every decode step. This is the
+  honest Metal-vs-CPU verdict (CLAUDE.md hard rule 7): it is the source of the
+  issue-#36 30–60× first-forward slowdown and the monotonic decode decay as KV
+  grows. The rotor family ships a GPU fused-QK encoder, but it is gated OFF by
+  default (`RMLX_FUSED_QK`) and never fires on the standard generate flow; the
+  iso family has no wired GPU encoder on the hot path at all.
+
+### Per-codec verdict
+
+| Codec family | Hot-path verdict | Notes |
+|---|---|---|
+| `none` | bf16, no kernel | nothing to compile |
+| `k8v4` / `k8v8` / `planar` / `planar3` / `planar_k` | **Metal** | q8_0 K + tq4 / planar V GPU kernels |
+| `mixed_*` / `rot_k_v*` / `rot_k_tq4v` | **Metal** | MLX-affine `mx.quantize` K + tq4/affine V (compiled Metal ops) |
+| `k8vturbo3` / `k8vturbo2` / `*tcq` / `tsym3` / `tsym4` | **Metal K**, CPU V (bounded) | K=q8_0 GPU; V CPU-forced by the −1 %/−2 % TPS gate, cost small |
+| `iso3` / `iso4` / `iso3_sym` / `iso4_sym` / `k_iso3` / `k_iso4` | **CPU** | quaternion SO(4) encode + dequant on host; no Metal hot path |
+| `rotor3` / `rotor4` / `rotor*_sym` / `k_rotor3` / `k_rotor4` / `rotor_k_*_asym_*` | **CPU** | Clifford Cl(3,0) encode + dequant on host; GPU encoder is `RMLX_FUSED_QK`-only |
+
+### Load-time precompile
+
+`rmlx_kv_quant::precompile::precompile_kv_codec_msl(kq, head_dim, kv_heads,
+device)` warms the kernels a codec carries with one representative GPU dispatch
+during model load (the eager-preload window), so the first user request is
+steady-state instead of paying a cold compile. It is **general per-codec**
+(keyed off `carries_msl()`, never an arch name): a no-op on CPU device, for
+`none`, and for the CPU-hot-path iso/rotor families (nothing to warm). It warms
+the shared q8_0 K-side kernels for every MSL codec, plus the tq4 / planar V
+kernel for `k8v4` / `rot_k_tq4v` / `planar`. Best-effort — a warm failure logs
+`warn!` and proceeds (the kernel then compiles lazily on first use, the
+pre-#36 behaviour). Wired into `Gemma4Generator::from_snapshot_with_id` (the
+single server-side generator factory all archs route through).
+
+### CPU-codec classification at resolve time
+
+`rmlx_models::kv_cache::validate_resolved` (alias `validate_resolved_kv_quant`)
+runs the arch-agnostic Metal-vs-CPU check after the Qwen-MoE guards. When the
+resolved codec is CPU-hot-path it emits a loud structured `warn!` naming the
+codec + reason so the cost is never silent. A hard reject (`ResolveError::
+CpuOnlyKvCodec`) fires **only** under the opt-in `RMLX_STRICT_METAL_KV=1` — these
+codecs still produce correct output, so the default is warn-and-proceed, not
+reject. Set `RMLX_STRICT_METAL_KV=1` for a Metal-only KV policy.
+
+---
+
 The `KvQuant::RotK { v_bits, v_group_size }` variant uses `KvStorage::Mixed`
 (same `MixedKvState` machinery) with the `rotate_k=true` flag set. It is
 listed under Mixed below.
