@@ -41,7 +41,8 @@ use tracing::info_span;
 
 use crate::constraint::ConstraintEngine;
 use crate::kv_cache::{
-    kv_max_seq_and_ceiling, kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
+    kv_max_seq_and_ceiling, kv_quant_for_layer, warn_if_kv_codec_net_negative, KvLayerShape,
+    LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
 };
 use crate::prompt_cache::PromptCacheEntry as _;
 use crate::sampler::{apply_mask_argmax, TokenLogprobs};
@@ -704,6 +705,34 @@ pub fn generate_greedy(
     use super::config::LayerType;
     let sliding_window_i32 = model.cfg.sliding_window as i32;
     let n_layers = model.cfg.num_hidden_layers;
+
+    // Issue #34: advise once if the resolved codec is estimated to increase
+    // resident KV vs bf16 on this windowed+global layer mix. Windowed (SWA)
+    // layers already run the bf16 rotating ring and are a no-op for the codec;
+    // the warn fires when the per-global-layer warm-TTFT bf16 seed + codec
+    // scales exceed the bytes the codec saves at the effective context. Keyed
+    // on geometry only (head_dim / kv_heads / window), no arch branch.
+    {
+        let window_u64 = model.cfg.sliding_window as u64;
+        let layer_shapes: Vec<KvLayerShape> = (0..n_layers)
+            .map(|i| match model.cfg.layer_types[i] {
+                LayerType::SlidingAttention => KvLayerShape {
+                    head_dim: model.cfg.head_dim as u64,
+                    kv_heads: model.cfg.num_key_value_heads as u64,
+                    window: Some(window_u64),
+                },
+                LayerType::FullAttention => KvLayerShape {
+                    head_dim: model.cfg.global_head_dim as u64,
+                    kv_heads: model.cfg.num_global_key_value_heads as u64,
+                    window: None,
+                },
+            })
+            .collect();
+        // Effective context the global layers will hold: the resolved ceiling
+        // (or the prompt length if longer — either gives the correct sign).
+        let eff_seq = (max_seq_ceiling.max(0) as u64).max(prompt_ids.len() as u64);
+        warn_if_kv_codec_net_negative(kv_quant, &layer_shapes, eff_seq);
+    }
 
     // `is_prefix` gates the enter_prefill/exit_prefill bracketing below: the
     // truncated clone is already post-prefill quantized, so the tail must
