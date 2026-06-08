@@ -5,8 +5,9 @@
 #[allow(clippy::module_inception)]
 mod tests {
     use super::super::{
-        kv_max_seq_and_ceiling, kv_quant_for_ctx, kv_quant_for_layer, lookup_layer_calibration,
-        KvCacheBuilder, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
+        kv_codec_net_saving_total, kv_max_seq_and_ceiling, kv_quant_for_ctx, kv_quant_for_layer,
+        lookup_layer_calibration, KvCacheBuilder, KvLayerShape, LAYER_ADAPTIVE_HEAD_N,
+        LAYER_ADAPTIVE_TAIL_N,
     };
     use rmlx_kv_quant::kvcache::KvCache;
     use rmlx_kv_quant::storage::KvStorage;
@@ -1760,5 +1761,97 @@ mod tests {
         let (initial, ceiling) = kv_max_seq_and_ceiling(None, 0);
         assert_eq!(initial, KV_MAX_SEQ_DEFAULT);
         assert_eq!(ceiling, KV_MAX_SEQ_DEFAULT);
+    }
+
+    // ── Issue #34: KV-codec net-benefit decision (policy layer) ───────────────
+
+    /// Build the Gemma4 e2b layer mix: 7 global (head_dim=256, 1 kv head) +
+    /// 28 windowed (window=512). Model-agnostic helper — keyed on geometry.
+    fn e2b_layer_mix() -> Vec<KvLayerShape> {
+        let mut v = Vec::with_capacity(35);
+        for i in 0..35 {
+            // e2b pattern: 1 full-attention per 6 (5 sliding + 1 full); here we
+            // only need the COUNT (7 global / 28 windowed) to exercise the sum.
+            if i % 6 == 5 || i == 34 {
+                v.push(KvLayerShape {
+                    head_dim: 256,
+                    kv_heads: 1,
+                    window: None,
+                });
+            } else {
+                v.push(KvLayerShape {
+                    head_dim: 256,
+                    kv_heads: 1,
+                    window: Some(512),
+                });
+            }
+        }
+        v
+    }
+
+    /// A scratch-heavy codec (K8V4) on the windowed+global mix is net-negative:
+    /// the global-layer bf16 seed + scales exceed the bytes saved. The warn
+    /// must fire (total saving < 0) and the windowed layers must contribute 0.
+    #[test]
+    fn net_negative_warn_fires_on_scratch_heavy_codec_swa_mix() {
+        let layers = e2b_layer_mix();
+        let n_windowed = layers.iter().filter(|l| l.window.is_some()).count();
+        let (saving, n_global, n_win) = kv_codec_net_saving_total(KvQuant::K8V4, &layers, 4096);
+        assert_eq!(n_win, n_windowed);
+        assert_eq!(n_global, 35 - n_windowed);
+        assert!(
+            saving < 0,
+            "K8V4 on the SWA+global mix at 4096 ctx must be net-negative (warn fires); got {saving}"
+        );
+    }
+
+    /// bf16 (`None`) never warns — saving is exactly 0 against its own baseline.
+    #[test]
+    fn net_negative_warn_silent_for_bf16() {
+        let layers = e2b_layer_mix();
+        let (saving, _, _) = kv_codec_net_saving_total(KvQuant::None, &layers, 4096);
+        assert_eq!(saving, 0, "bf16 must never be net-negative against itself");
+    }
+
+    /// A pure-global layer mix with a seed-free K-only codec at large context is
+    /// net-POSITIVE (no warn) — proving the decision is keyed on codec attrs,
+    /// not on the presence of windowed layers.
+    #[test]
+    fn net_positive_no_warn_for_seed_free_codec_global_only() {
+        // All-global mix (no windowed layers), large context.
+        let layers: Vec<KvLayerShape> = (0..16)
+            .map(|_| KvLayerShape {
+                head_dim: 128,
+                kv_heads: 8,
+                window: None,
+            })
+            .collect();
+        let (saving, n_global, n_win) =
+            kv_codec_net_saving_total(KvQuant::IsoKOnly4, &layers, 16_384);
+        assert_eq!(n_global, 16);
+        assert_eq!(n_win, 0);
+        assert!(
+            saving > 0,
+            "IsoKOnly4 (no bf16 K seed) on a large all-global mix should save; got {saving}"
+        );
+    }
+
+    /// An all-windowed mix can never be net-negative for any codec: every
+    /// windowed layer runs the bf16 ring, so the codec is a no-op (saving 0).
+    #[test]
+    fn all_windowed_mix_never_net_negative() {
+        let layers: Vec<KvLayerShape> = (0..24)
+            .map(|_| KvLayerShape {
+                head_dim: 256,
+                kv_heads: 1,
+                window: Some(512),
+            })
+            .collect();
+        for q in [KvQuant::K8V4, KvQuant::K8V8, KvQuant::Planar] {
+            let (saving, n_global, n_win) = kv_codec_net_saving_total(q, &layers, 4096);
+            assert_eq!(n_global, 0);
+            assert_eq!(n_win, 24);
+            assert_eq!(saving, 0, "{q:?} all-windowed mix must net to 0 (no warn)");
+        }
     }
 }

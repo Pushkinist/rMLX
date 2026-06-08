@@ -135,6 +135,108 @@ pub fn kv_quant_for_layer(
     }
 }
 
+/// Per-layer attributes for the resolve-time net-benefit check.
+///
+/// Model-agnostic: every field is a layer geometry attribute the arch parser
+/// already knows. No arch name is carried — the check keys off geometry +
+/// codec only, so any architecture interleaving windowed + global attention is
+/// covered identically.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy)]
+pub struct KvLayerShape {
+    /// Per-KV-head dimension (e.g. 256 for Gemma4, 128 for Bonsai/Qwen).
+    pub head_dim: u64,
+    /// Number of KV heads (GQA group count).
+    pub kv_heads: u64,
+    /// Sliding-window size in tokens for windowed layers, or `None` for a
+    /// global (full-attention) layer.
+    pub window: Option<u64>,
+}
+
+/// Emit one structured `warn!` when the resolved KV codec is estimated to
+/// **increase** resident KV versus plain bf16 on the active layer mix
+/// (issue #34).
+///
+/// Why this can happen, generally: a quantized codec keeps a warm-TTFT bf16
+/// decode seed (`decode_fp16_k/v`) alongside its packed codes + per-group
+/// scales on every **global** layer (see
+/// [`rmlx_kv_quant::KvQuant::feeds_bf16_k_at_decode`]). At small effective
+/// context the codes + scales are pure overhead on top of a buffer the same
+/// size as bf16, so the codec is net-negative. **Windowed layers always run
+/// the bf16 rotating ring regardless of the flag**
+/// (`RotatingKVCache.to_quantized` raises `NotImplementedError` in mlx-lm;
+/// rMLX matches it), so they are a no-op for the codec and contribute zero to
+/// the delta — the net-negative is a property of the global layers only.
+///
+/// This is advisory: the codec is **not** changed (keeping it is the operator's
+/// explicit choice, and forcing bf16 globally would change numerics). The warn
+/// gives the operator the byte math so they can pick `--kv-quant none` when the
+/// codec buys nothing at their context size.
+///
+/// Keyed entirely on `(KvLayerShape, KvQuant, eff_seq)` — no arch branch. Call
+/// once per request from the arch `generate` path after the codec is resolved
+/// and the layer mix is known.
+///
+/// `layers` is the per-layer shape vector (one entry per decoder layer);
+/// `eff_seq` is the effective prompt+generate length the global layers will
+/// hold (the resolved `--max-ctx` ceiling or the prompt length — either is a
+/// fine estimate for the sign of the saving).
+pub fn warn_if_kv_codec_net_negative(quant: KvQuant, layers: &[KvLayerShape], eff_seq: u64) {
+    let (total_saving, n_global, n_windowed) = kv_codec_net_saving_total(quant, layers, eff_seq);
+    if total_saving < 0 {
+        tracing::warn!(
+            kv_quant = %quant,
+            eff_seq,
+            n_global,
+            n_windowed,
+            est_extra_bytes = -total_saving,
+            "KV codec increases resident KV vs bf16 on this layer mix — the per-global-layer warm-TTFT bf16 seed plus codec scales exceed the bytes saved at this context; windowed layers already run bf16 and are unaffected. Consider --kv-quant none if memory is the goal."
+        );
+    }
+}
+
+/// Pure decision behind [`warn_if_kv_codec_net_negative`]: total estimated
+/// net byte saving across the layer mix (negative = codec costs more than
+/// bf16), plus the global / windowed layer counts.
+///
+/// Split out so the sign decision is unit-testable without a tracing
+/// subscriber. `KvQuant::None` (or an empty layer list) returns `(0, _, _)` —
+/// bf16 is never net-negative against itself.
+///
+/// Keyed entirely on `(KvLayerShape, KvQuant, eff_seq)`; model-agnostic.
+#[must_use]
+pub fn kv_codec_net_saving_total(
+    quant: KvQuant,
+    layers: &[KvLayerShape],
+    eff_seq: u64,
+) -> (i64, usize, usize) {
+    if matches!(quant, KvQuant::None) || layers.is_empty() {
+        return (0, 0, 0);
+    }
+    let mut total_saving: i64 = 0;
+    let mut n_global: usize = 0;
+    let mut n_windowed: usize = 0;
+    for l in layers {
+        let is_windowed = l.window.is_some();
+        if is_windowed {
+            n_windowed += 1;
+        } else {
+            n_global += 1;
+        }
+        let seq = match l.window {
+            Some(w) => eff_seq.min(w),
+            None => eff_seq,
+        };
+        total_saving = total_saving.saturating_add(quant.estimated_net_saving_per_layer(
+            seq,
+            l.head_dim,
+            l.kv_heads,
+            is_windowed,
+        ));
+    }
+    (total_saving, n_global, n_windowed)
+}
+
 /// Resolve `(initial_max_seq, ceiling)` for a request from `--max-ctx`.
 ///
 /// This is the shared policy that makes `--max-ctx` a **virtual ceiling**
