@@ -38,6 +38,10 @@ use super::config::LayerType;
 pub(super) mod kernels;
 pub(super) mod moe;
 
+#[cfg(test)]
+#[path = "mask_tests.rs"]
+mod mask_tests;
+
 // Re-exports used by decoder_layer.rs and model.rs (siblings of layers/).
 pub(super) use kernels::{geglu_fused, qk_norm_fused, softcap_fused};
 pub(super) use moe::{Gemma4Experts, Gemma4MoeBlock, Gemma4Router, PerLayerInput};
@@ -284,28 +288,41 @@ impl Attention {
             let v = v.transpose(&[0, 2, 1, 3], device)?;
 
             // Mask must be built before the cache update so the wrapper can run
-            // update + SDPA in one shot. `effective_offset` mirrors mlx-lm
-            // `RotatingKVCache.make_mask`: when the source cache is rotating,
-            // the post-update K shape is capped at `min(max_size-1, prev_offset) + seq`.
-            // For non-rotating caches, K shape is `prev_offset + seq` — i.e.
-            // `offset + seq`.
-            let effective_offset = if attn_is_rotating {
-                offset.min(self.sliding_window as i32 - 1)
-            } else {
-                offset
-            };
-            let total_kv_len_pre = effective_offset + seq;
-            let (mask_holder_pre, mask_mode_pre) = build_attn_mask(
-                self.layer_type,
-                seq,
-                effective_offset,
-                total_kv_len_pre,
-                attn_is_rotating,
-                self.sliding_window,
-                device,
-            )?;
-
+            // update + SDPA in one shot. The mask's key dim MUST equal the
+            // post-update K seq dim the SDPA actually attends, otherwise mlx-c
+            // `scaled_dot_product_attention` rejects the broadcast (issue #32:
+            // mask `(1,1,5,kv+1)` vs scores `(1,8,5,kv)`).
+            //
+            // The post-update K length is `producer_offset + seq` (non-rotating)
+            // or the ring-capped `min(max_size-1, producer_offset) + seq`
+            // (rotating). `producer_offset` is the **cache-holding layer's own**
+            // `offset()`, which can drift from the model-wide `offset`
+            // (`cache_base_offset`, picked from the first full-attention cache)
+            // by one position across a speculative verify-block rollback: the
+            // rotating sliding cache that drives the round's `v_target` rolls
+            // back with no-op semantics once it wraps, desyncing its reported
+            // offset from the non-rotating producer. RoPE still uses the
+            // model-wide `offset` (absolute position); only the mask's key dim
+            // is bound to the producer's own K length. See
+            // `update_and_sdpa_returning_kv` (rotating short-circuit) for the
+            // sibling Mixed-path fix this generalises.
             if let Some(c) = cache {
+                let producer_offset = c.offset();
+                let effective_offset = producer_effective_offset(
+                    producer_offset,
+                    attn_is_rotating,
+                    self.sliding_window,
+                );
+                let total_kv_len_pre = effective_offset + seq;
+                let (mask_holder_pre, mask_mode_pre) = build_attn_mask(
+                    self.layer_type,
+                    seq,
+                    effective_offset,
+                    total_kv_len_pre,
+                    attn_is_rotating,
+                    self.sliding_window,
+                    device,
+                )?;
                 // Cache-holding layer: route through the shared-KV variant of
                 // the universal wrapper. Returns (out, k_full, v_full) so the
                 // accumulated K/V can be handed to downstream consumer layers
@@ -321,6 +338,21 @@ impl Attention {
                     mask_holder_pre.as_ref(),
                     device,
                 )?;
+                // Guard (issue #32): the array-mode mask's key dim must equal
+                // the K seq dim the SDPA just attended. A mismatch is a sizing
+                // bug, not user input — fail loudly here rather than let a
+                // later layer hit the opaque mlx-c broadcast error.
+                if let Some(mask) = mask_holder_pre.as_ref() {
+                    let mask_kv = mask.shape()[3];
+                    let k_seq = k_full.shape()[2];
+                    if mask_kv != k_seq {
+                        return Err(Error::Model(format!(
+                            "Gemma4 attention mask key dim {mask_kv} != K seq dim {k_seq} \
+                             (layer_type={:?}, seq={seq}, producer_offset={producer_offset})",
+                            self.layer_type
+                        )));
+                    }
+                }
                 attn_out_holder = Some(attn_out);
                 (
                     q,
@@ -329,8 +361,24 @@ impl Attention {
                     Some((k_full, v_full)),
                 )
             } else {
-                // No-cache forward (e.g. eval path with `caches: None`). Run
-                // SDPA directly on the freshly-computed K/V.
+                // No-cache forward (e.g. eval path with `caches: None`). The
+                // freshly-computed K is exactly `offset + seq` long, so size the
+                // mask from the model-wide `offset` directly.
+                let effective_offset = if attn_is_rotating {
+                    offset.min(self.sliding_window as i32 - 1)
+                } else {
+                    offset
+                };
+                let total_kv_len_pre = effective_offset + seq;
+                let (mask_holder_pre, mask_mode_pre) = build_attn_mask(
+                    self.layer_type,
+                    seq,
+                    effective_offset,
+                    total_kv_len_pre,
+                    attn_is_rotating,
+                    self.sliding_window,
+                    device,
+                )?;
                 let k_new = k.try_clone()?;
                 let v_new = v.try_clone()?;
                 let attn_out = scaled_dot_product_attention(
@@ -374,12 +422,37 @@ impl Attention {
         let attn_out = if let Some(out) = attn_out_holder {
             out
         } else {
+            // Shared-KV consumer branch: K is fetched from the producer layer
+            // (`shared_kv`), not freshly projected here. Its seq dim
+            // (`k.shape()[2]`) is the ground truth for how many keys SDPA
+            // attends. Size the mask's key dim from that actual K length, NOT
+            // from the model-wide `offset` (#32 part 2): across a speculative
+            // partial-accept verify rollback the producer cache is rolled back
+            // while the model-wide `offset` (`cache_base_offset`, taken from the
+            // first full-attention cache that was NOT rolled back) is not, so
+            // `offset` can be one-or-more positions above the real K length.
+            // Sizing the band from `offset` then yields a mask one key too wide
+            // → the opaque mlx-c SDPA broadcast crash.
+            //
+            // `effective_offset = total_kv_len - seq` (K length minus the
+            // newly-projected query tokens) is the symmetric counterpart of the
+            // producer-branch `producer_effective_offset`. In the non-spec path
+            // (no rollback) `total_kv_len == offset + seq` exactly (rotating:
+            // `total_kv_len == offset.min(window-1) + seq`), so
+            // `total_kv_len - seq` reproduces the IDENTICAL effective offset the
+            // old `offset`-based sizing produced — including the rotating cap,
+            // which is already baked into the producer's K length. No regression
+            // on ordinary prefill/decode; the value only diverges (correctly)
+            // when a rollback desynced `offset` from the K it shares.
             let total_kv_len = k.shape()[2]; // [B, kv_heads, total_kv, D]
-            let effective_offset = if attn_is_rotating {
-                offset.min(self.sliding_window as i32 - 1)
-            } else {
-                offset
-            };
+            if total_kv_len < seq {
+                return Err(Error::Model(format!(
+                    "Gemma4 consumer/shared-KV K seq dim {total_kv_len} < query seq {seq} \
+                     (layer_type={:?}, offset={offset})",
+                    self.layer_type
+                )));
+            }
+            let effective_offset = consumer_effective_offset(total_kv_len, seq);
             let (mask_holder, mask_mode) = build_attn_mask(
                 self.layer_type,
                 seq,
@@ -389,6 +462,20 @@ impl Attention {
                 self.sliding_window,
                 device,
             )?;
+            // Guard (issue #32 part 2): the array-mode consumer mask's key dim
+            // must equal the K seq dim the SDPA is about to attend. Fail loudly
+            // on any future off-by-one rather than surfacing the opaque mlx-c
+            // broadcast error from a later frame.
+            if let Some(mask) = mask_holder.as_ref() {
+                let mask_kv = mask.shape()[3];
+                if mask_kv != total_kv_len {
+                    return Err(Error::Model(format!(
+                        "Gemma4 consumer/shared-KV mask key dim {mask_kv} != K seq dim \
+                         {total_kv_len} (layer_type={:?}, seq={seq}, offset={offset})",
+                        self.layer_type
+                    )));
+                }
+            }
             scaled_dot_product_attention(&q, &k, &v, 1.0, mask_mode, mask_holder.as_ref(), device)?
         };
         // [B, H, S, D] -> [B, S, H*D]
@@ -399,6 +486,49 @@ impl Attention {
         let out = self.o_proj.forward(&attn_out, device)?;
         Ok((out, new_kv))
     }
+}
+
+/// Compute the effective mask offset from a **producer cache's own offset**
+/// (not the model-wide `cache_base_offset`).
+///
+/// This is the single place that implements the #32 fix: at a speculative
+/// verify-block step the rotating sliding cache that drove the round's
+/// `v_target` can desync from the non-rotating full-attention producer by one
+/// position across a partial-accept rollback. Using the producer's `c.offset()`
+/// (not the model-wide `offset` argument) and capping it for rotating caches
+/// keeps the mask key dim equal to the post-update K seq dim.
+///
+/// Extracted as a named helper so the selection is covered by
+/// `mask_tests::guard_invariant_*` without requiring a full model forward pass.
+#[cfg_attr(test, allow(dead_code))]
+pub(super) fn producer_effective_offset(
+    producer_offset: i32,
+    attn_is_rotating: bool,
+    sliding_window: usize,
+) -> i32 {
+    if attn_is_rotating {
+        producer_offset.min(sliding_window as i32 - 1)
+    } else {
+        producer_offset
+    }
+}
+
+/// Compute the effective mask offset for a **consumer / shared-KV branch**.
+///
+/// The consumer branch does not own a cache; it attends a shared K tensor
+/// handed from the producer layer. The K seq dim (`total_kv_len = k.shape()[2]`)
+/// is the ground truth. `total_kv_len - seq` is the effective offset: how many
+/// keys precede the newly-projected query tokens. In the non-spec path
+/// (`total_kv_len == offset + seq`) this reproduces the same value as the
+/// old `offset`-based sizing; it only diverges — correctly — when a
+/// partial-accept rollback desynced `offset` from the actual K length.
+///
+/// Extracted as a named helper symmetric to `producer_effective_offset` so
+/// `mask_tests::guard_invariant_consumer_*` can call it directly and go RED
+/// if the call site in `Attention::forward` is reverted to `offset`-based sizing.
+#[cfg_attr(test, allow(dead_code))]
+pub(super) fn consumer_effective_offset(total_kv_len: i32, seq: i32) -> i32 {
+    total_kv_len - seq
 }
 
 /// Build the per-step additive mask + mask-mode for Gemma4 attention.

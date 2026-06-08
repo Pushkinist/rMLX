@@ -352,6 +352,27 @@ accepted position, obtained via `forward_hidden_states_shared_kv`. On partial
 accept, the verifier KV caches are truncated to the valid prefix length;
 the shared K/V is sliced accordingly before the next draft step.
 
+**Verify-step mask invariant (issue #32).** The verifier's multi-token verify
+forward (`forward_hidden_states_shared_kv` over `[b, draft…]`, `query_len > 1`)
+builds its SWA / chunked-prefill array mask in `gemma4::layers::Attention::
+forward`. The mask's key dim **must equal the post-update K seq dim** the SDPA
+attends, or mlx-c rejects the broadcast (`mask (1,1,5,kv+1)` vs scores
+`(1,8,5,kv)`). For a cache-holding producer layer the post-update K length is
+`producer_offset + seq` (non-rotating) or the ring-capped
+`min(window-1, producer_offset) + seq` (rotating), where `producer_offset` is
+the **cache-holding layer's own `KvCache::offset()`** — NOT the model-wide
+`cache_base_offset` (read from the first full-attention cache). Those two can
+desync by one position across a partial-accept verify-block rollback (the
+rotating sliding cache that drives `v_target` rolls back with no-op semantics
+once it wraps), so sizing the mask from `cache_base_offset` produced a mask one
+key too long only at non-trivial prompt lengths (window no longer covers the
+whole KV). RoPE still uses the model-wide absolute `offset`; only the mask's
+key dim is bound to the producer's own K. A guard in the producer branch fails
+loudly if `mask.shape()[3] != k_full.shape()[2]`. This is downstream of the
+issue-#24 `additive`→`array` mode fix, not a regression. The shared-KV consumer
+layers and the `draft_n` (`query_len == 1`) path already size their mask from
+the actual K (`k.shape()[2]`) and are unaffected.
+
 Weight layout (E2B sidecar, `model.*` prefix):
 
 | Tensor | Shape | Role |
