@@ -308,11 +308,11 @@ impl Attention {
             // sibling Mixed-path fix this generalises.
             if let Some(c) = cache {
                 let producer_offset = c.offset();
-                let effective_offset = if attn_is_rotating {
-                    producer_offset.min(self.sliding_window as i32 - 1)
-                } else {
-                    producer_offset
-                };
+                let effective_offset = producer_effective_offset(
+                    producer_offset,
+                    attn_is_rotating,
+                    self.sliding_window,
+                );
                 let total_kv_len_pre = effective_offset + seq;
                 let (mask_holder_pre, mask_mode_pre) = build_attn_mask(
                     self.layer_type,
@@ -446,6 +446,31 @@ impl Attention {
 
         let out = self.o_proj.forward(&attn_out, device)?;
         Ok((out, new_kv))
+    }
+}
+
+/// Compute the effective mask offset from a **producer cache's own offset**
+/// (not the model-wide `cache_base_offset`).
+///
+/// This is the single place that implements the #32 fix: at a speculative
+/// verify-block step the rotating sliding cache that drove the round's
+/// `v_target` can desync from the non-rotating full-attention producer by one
+/// position across a partial-accept rollback. Using the producer's `c.offset()`
+/// (not the model-wide `offset` argument) and capping it for rotating caches
+/// keeps the mask key dim equal to the post-update K seq dim.
+///
+/// Extracted as a named helper so the selection is covered by
+/// `mask_tests::guard_invariant_*` without requiring a full model forward pass.
+#[cfg_attr(test, allow(dead_code))]
+pub(super) fn producer_effective_offset(
+    producer_offset: i32,
+    attn_is_rotating: bool,
+    sliding_window: usize,
+) -> i32 {
+    if attn_is_rotating {
+        producer_offset.min(sliding_window as i32 - 1)
+    } else {
+        producer_offset
     }
 }
 
