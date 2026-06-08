@@ -25,7 +25,7 @@
 
 use rmlx_mlx::Device;
 
-use super::{build_attn_mask, producer_effective_offset, LayerType};
+use super::{build_attn_mask, consumer_effective_offset, producer_effective_offset, LayerType};
 
 /// FullAttention verify-block step at a long prompt (offset > 0, seq > 1) must
 /// take the `"array"` masked branch and size the mask key dim to
@@ -177,21 +177,23 @@ fn guard_invariant_producer_offset_matches_k_seq() {
 
 /// Consumer / shared-KV branch invariant (#32 part 2): the consumer mask must
 /// size its key dim from the ACTUAL shared K length (`k.shape()[2]`), NOT from
-/// the model-wide `offset`. In `Attention::forward` the consumer branch derives
-/// `effective_offset = total_kv_len - seq` where `total_kv_len = k.shape()[2]`.
+/// the model-wide `offset`. In `Attention::forward` the consumer branch calls
+/// `consumer_effective_offset(total_kv_len, seq)` where
+/// `total_kv_len = k.shape()[2]`.
 ///
 /// Here we simulate a desynced verify round: the producer cache was rolled back
 /// (delta = 4 accepted tokens), so the shared K it hands the consumer has
 /// length `k_seq = base_offset - delta + seq`, while the model-wide `offset`
 /// (`base_offset`, the un-rolled-back full-attention cache) is `delta` higher.
 /// Sizing the mask from `base_offset` would make it `delta` keys too wide and
-/// broadcast-fail against the shared K. Sizing from `k_seq - seq` keeps it
-/// exactly `k_seq`.
+/// broadcast-fail against the shared K. Sizing from `consumer_effective_offset`
+/// keeps it exactly `k_seq`.
 ///
 /// Goes RED if someone reverts the consumer branch to size from the model-wide
-/// `offset`: `effective_offset` would become `base_offset` (= `k_seq - seq +
-/// delta`), inflating the mask key dim to `k_seq + delta != k_seq` and tripping
-/// the consumer guard / the original mlx-c broadcast crash.
+/// `offset` rather than routing through `consumer_effective_offset(total_kv_len, seq)`:
+/// `effective_offset` would become `base_offset` (= `k_seq - seq + delta`),
+/// inflating the mask key dim to `k_seq + delta != k_seq` and tripping the
+/// consumer guard / the original mlx-c broadcast crash.
 #[test]
 #[allow(
     clippy::unwrap_used,
@@ -213,9 +215,11 @@ fn guard_invariant_consumer_mask_matches_shared_k_len() {
     let k_seq = (base_offset - delta) + seq;
 
     // This is exactly what the consumer branch computes (mod.rs ~L422-440 post-
-    // fix): effective_offset = total_kv_len - seq, total_kv_len = k.shape()[2].
+    // fix): consumer_effective_offset(total_kv_len, seq), total_kv_len = k.shape()[2].
+    // Routing through the named helper (not inlining the subtraction) means a
+    // revert of the call site to `offset`-based sizing turns this test RED.
     let total_kv_len = k_seq;
-    let effective_offset = total_kv_len - seq;
+    let effective_offset = consumer_effective_offset(total_kv_len, seq);
     assert_eq!(
         effective_offset,
         base_offset - delta,

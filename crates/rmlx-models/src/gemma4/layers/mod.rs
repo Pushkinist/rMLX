@@ -445,7 +445,14 @@ impl Attention {
             // on ordinary prefill/decode; the value only diverges (correctly)
             // when a rollback desynced `offset` from the K it shares.
             let total_kv_len = k.shape()[2]; // [B, kv_heads, total_kv, D]
-            let effective_offset = total_kv_len - seq;
+            if total_kv_len < seq {
+                return Err(Error::Model(format!(
+                    "Gemma4 consumer/shared-KV K seq dim {total_kv_len} < query seq {seq} \
+                     (layer_type={:?}, offset={offset})",
+                    self.layer_type
+                )));
+            }
+            let effective_offset = consumer_effective_offset(total_kv_len, seq);
             let (mask_holder, mask_mode) = build_attn_mask(
                 self.layer_type,
                 seq,
@@ -504,6 +511,24 @@ pub(super) fn producer_effective_offset(
     } else {
         producer_offset
     }
+}
+
+/// Compute the effective mask offset for a **consumer / shared-KV branch**.
+///
+/// The consumer branch does not own a cache; it attends a shared K tensor
+/// handed from the producer layer. The K seq dim (`total_kv_len = k.shape()[2]`)
+/// is the ground truth. `total_kv_len - seq` is the effective offset: how many
+/// keys precede the newly-projected query tokens. In the non-spec path
+/// (`total_kv_len == offset + seq`) this reproduces the same value as the
+/// old `offset`-based sizing; it only diverges — correctly — when a
+/// partial-accept rollback desynced `offset` from the actual K length.
+///
+/// Extracted as a named helper symmetric to `producer_effective_offset` so
+/// `mask_tests::guard_invariant_consumer_*` can call it directly and go RED
+/// if the call site in `Attention::forward` is reverted to `offset`-based sizing.
+#[cfg_attr(test, allow(dead_code))]
+pub(super) fn consumer_effective_offset(total_kv_len: i32, seq: i32) -> i32 {
+    total_kv_len - seq
 }
 
 /// Build the per-step additive mask + mask-mode for Gemma4 attention.
