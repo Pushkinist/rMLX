@@ -291,6 +291,10 @@ pub(crate) fn run_baseline(
         )
         .map_err(|e| anyhow::anyhow!("generate_greedy: {e}"))?;
     let generate_elapsed = ts_generate_start.elapsed();
+    // Read actual on-device KV-cache bytes from the arch-specific static that
+    // `generate_greedy` writes via `store_kv_cache_bytes`.  Returns 0 for
+    // architectures that do not yet maintain that static.
+    let kv_cache_bytes: u64 = model.kv_cache_bytes();
     // Drop the span guard explicitly so the span closes (and its elapsed_ms is
     // emitted to the JSONL log) right here — before the summary println below.
     drop(_decode_span_guard);
@@ -427,6 +431,22 @@ pub(crate) fn run_baseline(
         .map_err(|e| anyhow::anyhow!("metrics record {op}: {e}"))?;
     }
 
+    // Emit kv_cache_bytes only when non-zero (un-wired archs return 0; omitting
+    // them matches the `build_run_record` gate and prevents a spurious
+    // "measured 0-byte KV" row in the events table).
+    if kv_cache_bytes > 0 {
+        sink.record(&rmlx_metrics::events::Measurement {
+            model_path: &abs_path_str,
+            quant_mode: &quant_mode,
+            stage: "baseline",
+            op: "baseline_kv_cache_bytes",
+            value_unit: "bytes",
+            value: kv_cache_bytes as f64,
+            notes: &notes_truncated,
+        })
+        .map_err(|e| anyhow::anyhow!("metrics record baseline_kv_cache_bytes: {e}"))?;
+    }
+
     // -- Append to metrics/baseline.csv ---------------------------------------
     let ts_utc = chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
@@ -523,6 +543,7 @@ pub(crate) fn run_baseline(
             rss_mb,
             n_generated,
             &preview_64,
+            kv_cache_bytes,
         )?;
         let path = write_buffer_record(&record)?;
         info!(path = %path.display(), "baseline: wrote §8.5 ingest record");
@@ -654,6 +675,7 @@ fn build_run_record(
     rss_mb: f64,
     n_generated: usize,
     preview_first_64: &str,
+    kv_cache_bytes: u64,
 ) -> anyhow::Result<serde_json::Value> {
     // Identity: namespace + model name from the snapshot directory basename.
     let snapshot_str = model_path
@@ -711,15 +733,20 @@ fn build_run_record(
 
     // `decode_tps_warm` now carries the prefill-EXCLUDED steady-state number;
     // `overall_tps` keeps the combined prefill+decode value; `prefill_tps` is
-    // prompt throughput.
-    let metrics = serde_json::json!([
-        { "name": "decode_tps_warm", "value": decode_tps },
-        { "name": "overall_tps",     "value": overall_tps },
-        { "name": "prefill_tps",     "value": prefill_tps },
-        { "name": "ttft_warm_ms",    "value": ttft_ms },
-        { "name": "model_load_ms",   "value": load_ms },
-        { "name": "peak_rss_mb",     "value": rss_mb },
-    ]);
+    // prompt throughput.  `kv_cache_bytes` is omitted when 0 (arch not yet
+    // wired) so the RunRecord schema stays backward-compatible.
+    let mut metrics = vec![
+        serde_json::json!({ "name": "decode_tps_warm", "value": decode_tps }),
+        serde_json::json!({ "name": "overall_tps",     "value": overall_tps }),
+        serde_json::json!({ "name": "prefill_tps",     "value": prefill_tps }),
+        serde_json::json!({ "name": "ttft_warm_ms",    "value": ttft_ms }),
+        serde_json::json!({ "name": "model_load_ms",   "value": load_ms }),
+        serde_json::json!({ "name": "peak_rss_mb",     "value": rss_mb }),
+    ];
+    if kv_cache_bytes > 0 {
+        metrics.push(serde_json::json!({ "name": "kv_cache_bytes", "value": kv_cache_bytes }));
+    }
+    let metrics = serde_json::Value::Array(metrics);
 
     Ok(serde_json::json!({
         "backend": "rmlx",

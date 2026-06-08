@@ -27,8 +27,8 @@
 //!   [`KvCache::update_and_sdpa_k8v4_flash`], [`KvCache::update`].
 //! - Lifecycle: [`KvCache::enter_prefill`], [`KvCache::exit_prefill`],
 //!   [`KvCache::reset`], [`KvCache::truncate_to`].
-//! - Diagnostics: [`KvCache::approx_bytes`], [`KvCache::offset`],
-//!   [`KvCache::seq_len`].
+//! - Diagnostics: [`KvCache::approx_bytes`], [`KvCache::resident_bytes`],
+//!   [`KvCache::offset`], [`KvCache::seq_len`].
 //!
 //! # See also
 //!
@@ -76,6 +76,11 @@ mod prefill_grow_tests;
 #[cfg(test)]
 #[path = "rotor3_layer_idx_tests.rs"]
 mod rotor3_layer_idx_tests;
+
+// resident_bytes: actual on-device byte accounting.
+#[cfg(test)]
+#[path = "resident_bytes_tests.rs"]
+mod resident_bytes_tests;
 
 pub use core::KvCache;
 pub use fused_qk_dispatch::fused_qk_total_dispatch_count;

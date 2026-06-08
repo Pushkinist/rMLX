@@ -805,7 +805,9 @@ independently and so reflects the dropped buffer. Residency reclaimed for Bonsai
 (`num_kv_heads=8`, `head_dim=128`, 36 layers): 288 MiB @ 4k ctx, 576 MiB @ 8k,
 1152 MiB @ 16k (= `seq × kv_h × head_dim × 2 B × n_layers`). Pinned by
 `warm_ttft_cross_codec_tests::iso_k_only3_quant_at_decode` (asserts
-the seed is **absent** and `approx_bytes` drops).
+the seed is **absent** and `approx_bytes` drops). `resident_bytes` is the
+preferred diagnostic in metrics paths — it reads actual buffer sizes rather
+than re-deriving from shape fields.
 
 ### Decision: keep warm-TTFT universal
 

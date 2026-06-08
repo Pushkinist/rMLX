@@ -113,7 +113,7 @@ impl PromptCacheEntry for Qwen35MoeEntry {
     }
 
     fn kv_bytes(&self) -> u64 {
-        let kv: u64 = self.kv_caches.iter().map(|c| c.approx_bytes()).sum();
+        let kv: u64 = self.kv_caches.iter().map(|c| c.resident_bytes()).sum();
         let lin: u64 = self.lin_caches.iter().map(|c| c.approx_bytes()).sum();
         kv + lin
     }

@@ -137,7 +137,7 @@ impl PromptCacheEntry for Gemma4Entry {
     }
 
     fn kv_bytes(&self) -> u64 {
-        self.kv_caches.iter().map(KvCache::approx_bytes).sum()
+        self.kv_caches.iter().map(KvCache::resident_bytes).sum()
     }
 }
 

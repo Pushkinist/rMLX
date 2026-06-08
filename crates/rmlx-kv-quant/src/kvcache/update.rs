@@ -2397,6 +2397,91 @@ impl KvCache {
         kv_bytes + seed_bytes
     }
 
+    /// Actual on-device bytes held by this KV cache at the current call-site.
+    ///
+    /// Returns the sum of every buffer currently allocated on this cache:
+    ///
+    /// - **Quantized storage** (`KvStorage::resident_bytes`): packed codes,
+    ///   scales, rotation buffers, etc. for all codec variants. Returns 0 for
+    ///   `KvStorage::None` (bf16 buffers live in `decode_fp16_k/v` below).
+    /// - **fp16 decode seeds** (`decode_fp16_k`, `decode_fp16_v`): warm-TTFT
+    ///   bf16 mirrors present on quantized paths; also the sole storage for
+    ///   `KvStorage::None` (bf16).
+    /// - **Rotating SWA ring** (`rotating`): pre-allocated bf16 `[B, kv_h,
+    ///   window, D]` buffer used by SWA layers, sized to the sliding window.
+    /// - **TurboFlash head-major buffers** (`flash_k_codes/scales`,
+    ///   `flash_v_codes/scales`): lazy copy of the K/V cache in head-major
+    ///   layout for the TurboFlash MSL SDPA kernel.
+    /// - **Fused-QK shadow** (`fused_qk_shadow`): head-major K shadow used by
+    ///   fused-QK dispatch (q8, turbo3/4-sym, iso3/4-sym, rotor3/4-sym, …).
+    ///
+    /// Unlike [`approx_bytes`], this does **not** use a formula: it reads the
+    /// actual `Array` shape × dtype from every live buffer. For GPU-backed
+    /// codecs this reflects the paged allocation size, which is rounded up to
+    /// the nearest page; for CPU-backed codecs (IsoQuant, RotorQuant) it is
+    /// the exact heap bytes of the backing `Vec`s.
+    ///
+    /// Returns 0 when the cache has never been used (`offset == 0` and no
+    /// buffers are allocated). Safe to call at any point — no FFI eval, no
+    /// data read, no mutation.
+    pub fn resident_bytes(&self) -> u64 {
+        // Helper: bytes of a single Array without FFI eval.
+        #[inline]
+        fn ab(a: &Array) -> u64 {
+            let n: u64 = a.shape().iter().map(|&d| d as u64).product();
+            n * a.dtype().itemsize() as u64
+        }
+
+        // 1. Quantized storage (codec-specific buffers; None → 0).
+        let mut total = self.storage.resident_bytes();
+
+        // 2. fp16 decode seeds (KvQuant::None bf16 storage lives here too).
+        if let Some(ref k) = self.decode_fp16_k {
+            total += ab(k);
+        }
+        if let Some(ref v) = self.decode_fp16_v {
+            total += ab(v);
+        }
+
+        // 3. Rotating SWA ring buffer (bf16, sized to sliding window).
+        if let Some(ref rot) = self.rotating {
+            if let Some(ref k) = rot.keys {
+                total += ab(k);
+            }
+            if let Some(ref v) = rot.values {
+                total += ab(v);
+            }
+        }
+
+        // 4. TurboFlash head-major K/V buffers (lazy; only for K8V4 path).
+        if let Some(ref c) = self.flash_k_codes {
+            total += ab(c);
+        }
+        if let Some(ref s) = self.flash_k_scales {
+            total += ab(s);
+        }
+        if let Some(ref c) = self.flash_v_codes {
+            total += ab(c);
+        }
+        if let Some(ref s) = self.flash_v_scales {
+            total += ab(s);
+        }
+
+        // 5. Fused-QK shadow (head-major K shadow for fused-QK MSL kernels).
+        if let Some(ref shadow) = self.fused_qk_shadow {
+            total += ab(&shadow.k_codes);
+            total += ab(&shadow.k_scales);
+            if let Some(ref norms) = shadow.sideband_norms {
+                total += ab(norms);
+            }
+            if let Some(ref table) = shadow.sideband_rotor_table {
+                total += ab(table);
+            }
+        }
+
+        total
+    }
+
     /// Reset the cache to an empty state (offset → 0, buffers zeroed).
     pub fn reset(&mut self) {
         if let Some(ref mut rot) = self.rotating {
