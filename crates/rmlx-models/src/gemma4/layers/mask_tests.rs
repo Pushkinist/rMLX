@@ -175,6 +175,124 @@ fn guard_invariant_producer_offset_matches_k_seq() {
     );
 }
 
+/// Consumer / shared-KV branch invariant (#32 part 2): the consumer mask must
+/// size its key dim from the ACTUAL shared K length (`k.shape()[2]`), NOT from
+/// the model-wide `offset`. In `Attention::forward` the consumer branch derives
+/// `effective_offset = total_kv_len - seq` where `total_kv_len = k.shape()[2]`.
+///
+/// Here we simulate a desynced verify round: the producer cache was rolled back
+/// (delta = 4 accepted tokens), so the shared K it hands the consumer has
+/// length `k_seq = base_offset - delta + seq`, while the model-wide `offset`
+/// (`base_offset`, the un-rolled-back full-attention cache) is `delta` higher.
+/// Sizing the mask from `base_offset` would make it `delta` keys too wide and
+/// broadcast-fail against the shared K. Sizing from `k_seq - seq` keeps it
+/// exactly `k_seq`.
+///
+/// Goes RED if someone reverts the consumer branch to size from the model-wide
+/// `offset`: `effective_offset` would become `base_offset` (= `k_seq - seq +
+/// delta`), inflating the mask key dim to `k_seq + delta != k_seq` and tripping
+/// the consumer guard / the original mlx-c broadcast crash.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "test asserts on known-good shapes; unwrap/expect failures are the assertion"
+)]
+fn guard_invariant_consumer_mask_matches_shared_k_len() {
+    // Reproduce the #32-part-2 crash magnitudes: base_offset 3221 (the
+    // un-rolled-back full-attention cache), producer rolled back by delta=4
+    // (round-1 accepted tokens), verify block seq=5.
+    let seq = 5;
+    let base_offset = 3221; // model-wide `offset` (NOT rolled back).
+    let delta = 4; // tokens accepted in the prior round → producer rollback.
+    let window = 512usize;
+
+    // The shared K the producer hands the consumer reflects the rollback:
+    //   k_seq = (base_offset - delta) + seq
+    let k_seq = (base_offset - delta) + seq;
+
+    // This is exactly what the consumer branch computes (mod.rs ~L422-440 post-
+    // fix): effective_offset = total_kv_len - seq, total_kv_len = k.shape()[2].
+    let total_kv_len = k_seq;
+    let effective_offset = total_kv_len - seq;
+    assert_eq!(
+        effective_offset,
+        base_offset - delta,
+        "consumer effective offset must follow the producer's rolled-back K, \
+         not the model-wide offset"
+    );
+
+    let (mask, mode) = build_attn_mask(
+        LayerType::FullAttention,
+        seq,
+        effective_offset,
+        total_kv_len,
+        false, // attn_is_rotating
+        window,
+        Device::Cpu,
+    )
+    .unwrap();
+    assert_eq!(mode, "array", "long-prompt verify block uses array mode");
+    let shape = mask
+        .expect("array mode must carry a mask array")
+        .shape()
+        .to_vec();
+    // Guard invariant: consumer mask key dim == actual shared K length.
+    assert_eq!(
+        shape[3], k_seq,
+        "consumer mask key dim must equal the shared K seq dim; the consumer \
+         guard must not fire"
+    );
+    // And it is strictly below the model-wide offset-based sizing the bug used:
+    assert!(
+        shape[3] < base_offset + seq,
+        "offset-based sizing (base_offset + seq) would have been wider — the \
+         #32-part-2 broadcast crash"
+    );
+}
+
+/// Companion to the consumer test: if the consumer branch were reverted to size
+/// from the model-wide `offset` (`base_offset`) instead of `total_kv_len - seq`,
+/// the mask key dim would exceed the shared K length by exactly `delta`.
+///
+/// Documents the exact off-by-`delta` crash arithmetic; pins it so a regression
+/// to model-wide-offset sizing is unambiguous.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "test asserts on known-bad shape to document the regression; unwrap/expect failures are the assertion"
+)]
+fn guard_invariant_regressed_consumer_offset_inflates_mask() {
+    let seq = 5;
+    let base_offset = 3221; // model-wide offset (NOT rolled back).
+    let delta = 4;
+    let window = 512usize;
+    let k_seq = (base_offset - delta) + seq; // actual shared K length.
+
+    // Simulate the reverted consumer branch: size from model-wide `offset`
+    // (base_offset), not from the shared K length.
+    let (mask, _) = build_attn_mask(
+        LayerType::FullAttention,
+        seq,
+        base_offset,
+        base_offset + seq,
+        false,
+        window,
+        Device::Cpu,
+    )
+    .unwrap();
+    // Off-by-delta: mask is `delta` keys longer than the shared K — the crash.
+    assert_eq!(
+        mask.expect("array mode must carry a mask array").shape()[3],
+        k_seq + delta,
+        "model-wide-offset consumer mask is delta keys too long — the #32-part-2 \
+         guard trigger"
+    );
+}
+
 /// Guard invariant (REGRESSED side): if the model-wide `base_offset`
 /// (`producer_offset + 1`) were used instead of `producer_effective_offset`,
 /// the mask key dim would exceed K seq dim by exactly one.

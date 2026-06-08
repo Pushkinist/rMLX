@@ -422,12 +422,30 @@ impl Attention {
         let attn_out = if let Some(out) = attn_out_holder {
             out
         } else {
+            // Shared-KV consumer branch: K is fetched from the producer layer
+            // (`shared_kv`), not freshly projected here. Its seq dim
+            // (`k.shape()[2]`) is the ground truth for how many keys SDPA
+            // attends. Size the mask's key dim from that actual K length, NOT
+            // from the model-wide `offset` (#32 part 2): across a speculative
+            // partial-accept verify rollback the producer cache is rolled back
+            // while the model-wide `offset` (`cache_base_offset`, taken from the
+            // first full-attention cache that was NOT rolled back) is not, so
+            // `offset` can be one-or-more positions above the real K length.
+            // Sizing the band from `offset` then yields a mask one key too wide
+            // → the opaque mlx-c SDPA broadcast crash.
+            //
+            // `effective_offset = total_kv_len - seq` (K length minus the
+            // newly-projected query tokens) is the symmetric counterpart of the
+            // producer-branch `producer_effective_offset`. In the non-spec path
+            // (no rollback) `total_kv_len == offset + seq` exactly (rotating:
+            // `total_kv_len == offset.min(window-1) + seq`), so
+            // `total_kv_len - seq` reproduces the IDENTICAL effective offset the
+            // old `offset`-based sizing produced — including the rotating cap,
+            // which is already baked into the producer's K length. No regression
+            // on ordinary prefill/decode; the value only diverges (correctly)
+            // when a rollback desynced `offset` from the K it shares.
             let total_kv_len = k.shape()[2]; // [B, kv_heads, total_kv, D]
-            let effective_offset = if attn_is_rotating {
-                offset.min(self.sliding_window as i32 - 1)
-            } else {
-                offset
-            };
+            let effective_offset = total_kv_len - seq;
             let (mask_holder, mask_mode) = build_attn_mask(
                 self.layer_type,
                 seq,
@@ -437,6 +455,20 @@ impl Attention {
                 self.sliding_window,
                 device,
             )?;
+            // Guard (issue #32 part 2): the array-mode consumer mask's key dim
+            // must equal the K seq dim the SDPA is about to attend. Fail loudly
+            // on any future off-by-one rather than surfacing the opaque mlx-c
+            // broadcast error from a later frame.
+            if let Some(mask) = mask_holder.as_ref() {
+                let mask_kv = mask.shape()[3];
+                if mask_kv != total_kv_len {
+                    return Err(Error::Model(format!(
+                        "Gemma4 consumer/shared-KV mask key dim {mask_kv} != K seq dim \
+                         {total_kv_len} (layer_type={:?}, seq={seq}, offset={offset})",
+                        self.layer_type
+                    )));
+                }
+            }
             scaled_dot_product_attention(&q, &k, &v, 1.0, mask_mode, mask_holder.as_ref(), device)?
         };
         // [B, H, S, D] -> [B, S, H*D]
