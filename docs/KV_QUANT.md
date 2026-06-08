@@ -120,6 +120,57 @@ of the active `KvQuant`: they use `RotatingState` (a ring-buffer bf16 path
 ported from mlx-lm's `RotatingKVCache`). `mlx-lm.to_quantized` raises
 `NotImplementedError` for rotating caches; rMLX matches that behaviour.
 
+### Per-layer net-benefit decision + net-negative warn (issue #34)
+
+Because SWA layers already run the bf16 ring (above), the per-layer
+quantization decision is implicit: **windowed layers are bf16, global
+(full-attention) layers are quantized**. The codec is a no-op on windowed
+layers and can never make them larger — the issue #34 "skip quant on tiny
+windowed layers" gate is therefore already satisfied by the rotating-ring
+exemption, not by an extra gate.
+
+The residual net-negative is on the **global** layers. A quantized global
+layer keeps a warm-TTFT bf16 decode seed (`decode_fp16_k` / `decode_fp16_v`,
+gated by [`KvQuant::feeds_bf16_k_at_decode`]) *alongside* its packed codes and
+per-group scales. At small effective context the codes + scales are pure
+overhead on top of a buffer the same size as bf16, so the codec is strictly
+larger than `--kv-quant none`. Measured on Gemma4 e2b (7 global + 28 windowed
+layers, head_dim 256, 1 KV head) at a 4096-token prompt: `k8v4` ≈ 125.0 MB vs
+`none` ≈ 113.2 MB (`kv_cache_bytes`, both inflated ~2× by the prompt-cache
+snapshot which cancels in the delta) — `k8v4` is +11.7 MB on the global layers,
+zero delta on the windowed layers.
+
+rMLX emits one structured `warn!` at request build time when the resolved codec
+is estimated to increase resident KV vs bf16 on the active layer mix:
+
+```
+WARN KV codec increases resident KV vs bf16 on this layer mix — the
+per-global-layer warm-TTFT bf16 seed plus codec scales exceed the bytes saved
+at this context; windowed layers already run bf16 and are unaffected. Consider
+--kv-quant none if memory is the goal.
+  kv_quant=k8v4 eff_seq=8192 n_global=7 n_windowed=28 est_extra_bytes=51380224
+```
+
+The estimate is model-agnostic — keyed only on layer geometry (`head_dim`,
+`kv_heads`, `window`) and codec attributes (`KvQuant::approx_code_bits`,
+the per-group scale cadence, and whether the codec retains a bf16 seed). The
+decision lives in:
+
+- `rmlx_kv_quant::KvQuant::estimated_resident_bytes_per_layer` /
+  `estimated_net_saving_per_layer` (codec layer — the per-side byte model;
+  windowed layers return saving 0).
+- `rmlx_models::kv_cache::kv_codec_net_saving_total` /
+  `warn_if_kv_codec_net_negative` (policy layer — sums the layer mix and emits
+  the warn). Wired into the Gemma4 `generate` path; any arch interleaving
+  windowed + global attention can call it with its own `KvLayerShape` vector.
+
+The warn is **advisory only** — the codec is not changed. Keeping the resolved
+codec is the operator's explicit choice (and forcing bf16 globally would change
+numerics); the warn just surfaces the byte math so `--kv-quant none` is an
+informed option when memory is the goal. Seed-free codecs (the K-only
+re-quantize families, `feeds_bf16_k_at_decode == false`) cross over to
+net-positive at large context and do not warn.
+
 **Byte accounting.** Two methods report KV-cache size:
 
 - `KvCache::approx_bytes()` — formula-based estimate using stored shape fields.

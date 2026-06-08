@@ -571,6 +571,159 @@ impl KvQuant {
             _ => None,
         }
     }
+
+    /// Effective per-side `(k_bits, v_bits)` an estimator can use to model the
+    /// packed-code footprint of this codec, model-agnostically.
+    ///
+    /// These are the bit-widths of the **stored codes** per element, not a
+    /// quality claim. `None` (bf16) reports 16/16. K-only codecs report a bf16
+    /// (16-bit) V; V-only codecs (PlanarK) report a bf16 (16-bit) K. The
+    /// rotor/iso/turbo families report their nominal code width.
+    ///
+    /// Used by [`Self::estimated_resident_bytes_per_layer`] to size the packed
+    /// codes; the per-group scale / rotation / bias overhead is added there.
+    #[must_use]
+    #[allow(
+        clippy::match_same_arms,
+        reason = "explicit per-variant bit widths read clearer than collapsing arms"
+    )]
+    pub fn approx_code_bits(&self) -> (u32, u32) {
+        match self {
+            KvQuant::None => (16, 16),
+            KvQuant::K8V8 => (8, 8),
+            KvQuant::K8V4 => (8, 4),
+            KvQuant::Planar => (8, 4),
+            KvQuant::Planar3 => (8, 3),
+            KvQuant::PlanarK => (4, 16),
+            KvQuant::Mixed { k_bits, v_bits, .. } => (u32::from(*k_bits), u32::from(*v_bits)),
+            KvQuant::RotK { v_bits, .. } => (8, u32::from(*v_bits)),
+            KvQuant::RotKTq4V => (8, 4),
+            KvQuant::K8VTurbo3 | KvQuant::K8VTurbo3Tcq => (8, 3),
+            KvQuant::K8VTurbo2 | KvQuant::K8VTurbo2Tcq => (8, 2),
+            KvQuant::TurboSym3 => (3, 3),
+            KvQuant::TurboSym4 => (4, 4),
+            KvQuant::Iso3 => (8, 3),
+            KvQuant::Iso4 => (8, 4),
+            KvQuant::Iso3Sym => (3, 3),
+            KvQuant::Iso4Sym => (4, 4),
+            KvQuant::IsoKOnly3 => (3, 16),
+            KvQuant::IsoKOnly4 => (4, 16),
+            KvQuant::Rotor3 => (8, 3),
+            KvQuant::Rotor4 => (8, 4),
+            KvQuant::Rotor3Sym => (3, 3),
+            KvQuant::Rotor4Sym => (4, 4),
+            KvQuant::RotorKOnly3 => (3, 16),
+            KvQuant::RotorKOnly4 => (4, 16),
+            KvQuant::RotorK3Asym { v_bits, .. } => (3, u32::from(*v_bits)),
+            KvQuant::RotorK4Asym { v_bits, .. } => (4, u32::from(*v_bits)),
+        }
+    }
+
+    /// Estimate the resident KV bytes per layer this codec holds for a
+    /// **global (full-attention)** layer of `seq` tokens.
+    ///
+    /// Model-agnostic: the estimate is derived purely from layer attributes
+    /// (`seq`, `head_dim`, `kv_heads`) and codec attributes
+    /// ([`Self::approx_code_bits`], the per-group scale cadence, and whether
+    /// the codec retains a bf16 decode seed via
+    /// [`Self::feeds_bf16_k_at_decode`]) — never from an arch name.
+    ///
+    /// Components per side:
+    /// - **Packed codes**: `seq * head_dim * code_bits / 8`.
+    /// - **Per-group scales**: one f32 per quantization group. K groups are
+    ///   128 elements (q8_0) or the K-side group; V groups are 32 (TurboQuant)
+    ///   or the affine group. A conservative single cadence of one f32 per 32
+    ///   elements is used for quantized sides (it never under-counts the q8_0
+    ///   K-side at group 128, which is the cheaper case).
+    /// - **bf16 decode seed**: when [`Self::feeds_bf16_k_at_decode`] is true the
+    ///   codec keeps a full `seq * head_dim * 2` bf16 mirror of **V** (always)
+    ///   and **K** (unless it is a K-only re-quantize family). This is the
+    ///   warm-TTFT shortcut buffer and is the dominant term that can make a
+    ///   quantized global layer *larger* than bf16.
+    ///
+    /// `None` (bf16) returns just the two bf16 buffers and no seed.
+    ///
+    /// This is an estimate (page-rounding, GPU/CPU residual coexistence, and
+    /// rotation/bias buffers are not modelled) used only for the resolve-time
+    /// net-benefit `warn!` — the authoritative number is
+    /// [`crate::KvCache::resident_bytes`] read after the first measurement.
+    #[must_use]
+    pub fn estimated_resident_bytes_per_layer(
+        &self,
+        seq: u64,
+        head_dim: u64,
+        kv_heads: u64,
+    ) -> u64 {
+        let elems = seq.saturating_mul(head_dim).saturating_mul(kv_heads);
+        if matches!(self, KvQuant::None) {
+            // Two bf16 buffers (K + V), no codes, no seed.
+            return elems.saturating_mul(2).saturating_mul(2);
+        }
+        let (k_bits, v_bits) = self.approx_code_bits();
+        // Per-side bytes: helper sizes one side (K or V) given its code bits and
+        // whether a parallel bf16 decode seed is retained for it.
+        //
+        // - **16-bit side (bf16-stored)**: the side IS a single bf16 buffer.
+        //   No separate codes vs seed — the bf16 buffer is both. Count it once.
+        // - **quantized side**: packed codes (`bits/8` bytes/elem) + one f32
+        //   per 32-element group (conservative scale cadence) + a bf16 decode
+        //   seed mirror *iff* this codec retains one (`retains_seed`).
+        let side_bytes = |bits: u32, retains_seed: bool| -> u64 {
+            if bits >= 16 {
+                // bf16 side: single buffer, counted once.
+                return elems.saturating_mul(2);
+            }
+            let codes = elems.saturating_mul(u64::from(bits)) / 8;
+            let scales = (elems / 32).saturating_mul(4);
+            let seed = if retains_seed {
+                elems.saturating_mul(2)
+            } else {
+                0
+            };
+            codes.saturating_add(scales).saturating_add(seed)
+        };
+        // V seed is always retained by the warm-TTFT shortcut codecs (every
+        // quant arm reads `decode_fp16_v` at decode). K seed is retained unless
+        // this is a K-only re-quantize family (`feeds_bf16_k_at_decode == false`).
+        let k_bytes = side_bytes(k_bits, self.feeds_bf16_k_at_decode());
+        let v_bytes = side_bytes(v_bits, true);
+        k_bytes.saturating_add(v_bytes)
+    }
+
+    /// Estimated **net byte saving** of running this codec versus plain bf16 on
+    /// a single layer, given its attributes. Positive = the codec saves memory;
+    /// **negative = the codec costs more memory than bf16** (the issue #34
+    /// net-negative condition).
+    ///
+    /// `is_windowed` layers always run the bf16 rotating ring regardless of the
+    /// codec flag (mlx-lm `RotatingKVCache.to_quantized` raises
+    /// `NotImplementedError`; rMLX matches it), so the codec is a no-op there
+    /// and the net saving is exactly `0`. For global layers the saving is
+    /// `bf16_bytes(seq) - codec_bytes(seq)`.
+    ///
+    /// Callers pass the effective per-layer `seq` (for a windowed layer, clamp
+    /// it to the window before calling — a windowed layer never holds more than
+    /// `window` tokens, though the result is `0` for windowed regardless).
+    ///
+    /// Keyed entirely on layer + codec attributes; no arch name is consulted.
+    #[must_use]
+    pub fn estimated_net_saving_per_layer(
+        &self,
+        seq: u64,
+        head_dim: u64,
+        kv_heads: u64,
+        is_windowed: bool,
+    ) -> i64 {
+        if is_windowed {
+            // Windowed layer always runs the bf16 ring → codec is a no-op,
+            // identical bytes either way.
+            return 0;
+        }
+        let bf16 = KvQuant::None.estimated_resident_bytes_per_layer(seq, head_dim, kv_heads);
+        let codec = self.estimated_resident_bytes_per_layer(seq, head_dim, kv_heads);
+        // saving = bf16 - codec; negative when the codec is bigger.
+        i64::try_from(bf16).unwrap_or(i64::MAX) - i64::try_from(codec).unwrap_or(i64::MAX)
+    }
 }
 
 // ── KvQuant Display / FromStr ────────────────────────────────────────────────
