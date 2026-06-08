@@ -245,6 +245,49 @@ cache sized to the ceiling.
 SWA / rotating layers are unaffected: their bf16 ring is sized to the
 `sliding_window`, never to `max_seq`, so they carry no long-context tax.
 
+### Windowed-layer ring sizing (issue #35)
+
+Issue #35 alleged that windowed / sliding-window-attention (SWA) layers
+allocate KV to the full context length rather than the attention window. This
+is **not the case** — it was falsified by direct `resident_bytes()` measurement
+and is documented here so the question does not recur.
+
+SWA layers use the `rotating` ring (`rmlx-kv-quant::rotating`, a byte-for-byte
+port of mlx-lm `RotatingKVCache`). The ring's *physical* buffer is bounded to
+`sliding_window + prefill_chunk` rows **regardless of context** — never the
+filled context length. Mechanism: `RotatingState::update_in_place` only grows
+while `buf_len < max_size`, and `update_concat` trims to `max_size - 1` before
+concatenating the next prefill chunk, so the buffer peaks at
+`max_size - 1 + chunk` (the `+ chunk` is the in-flight prefill block). The
+logical `offset` field tracks total tokens seen (mirroring mlx-lm) but is **not**
+the physical fill. `KvCache::resident_bytes()` (issue #33) counts the ring
+buffers, so the measurement is exact.
+
+Measured windowed (rotating) vs global (full-attention) bf16 `resident_bytes`
+for a single Gemma4-shaped layer (`B=1, kv_h=1, head_dim=256, window=512,
+chunk=512`), chunked prefill at growing context:
+
+| ctx  | windowed (bytes) | global (bytes) | windowed scales with ctx? |
+|------|------------------|----------------|---------------------------|
+| 4k   | 1,047,552        | 4,194,304      | no                        |
+| 16k  | 1,047,552        | 16,777,216     | no                        |
+| 64k  | 1,047,552        | 67,108,864     | no (64× smaller)          |
+
+The windowed ring is **flat** across context; only the global-attention layers
+grow with `max_seq`. This is exactly what #35 asked for — already implemented by
+the rotating ring. Pinned by
+`crates/rmlx-kv-quant/src/kvcache/windowed_ring_sizing_tests.rs`
+(`windowed_ring_stays_bounded_while_global_grows` for the byte bound;
+`windowed_ring_retains_full_swa_window` for the correctness guard that the
+retained set always contains the full most-recent `window` — no still-attended
+key is ever evicted).
+
+Scope note: the rotating ring is the bf16 SWA path used by Gemma3/Gemma4 (the
+only archs with interleaved windowed + global attention). Quantized SWA codecs
+are not currently routed through the ring (mlx-lm's reference keeps SWA bf16
+too — `RotatingKVCache.to_quantized` raises), but the SWA layers are bf16 by
+default (§5.7), so the bound applies on every shipping SWA configuration.
+
 ### Per-request `max_ctx` override (issue #26)
 
 Because the ceiling is resolved **per request** (`kv_max_seq_and_ceiling`), it

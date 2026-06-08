@@ -82,6 +82,11 @@ mod rotor3_layer_idx_tests;
 #[path = "resident_bytes_tests.rs"]
 mod resident_bytes_tests;
 
+// Windowed (SWA) ring sizing diagnostic — issue #35 falsification.
+#[cfg(test)]
+#[path = "windowed_ring_sizing_tests.rs"]
+mod windowed_ring_sizing_tests;
+
 pub use core::KvCache;
 pub use fused_qk_dispatch::fused_qk_total_dispatch_count;
 // `FusedQkLayout` / `FusedQkShadow` are crate-internal
