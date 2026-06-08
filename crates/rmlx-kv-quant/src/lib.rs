@@ -55,6 +55,7 @@ pub mod planar_fused_qk;
 pub mod planar_fused_qk_msl;
 pub mod planarquant;
 pub mod planarquant_msl;
+pub mod precompile;
 pub mod q8;
 pub mod q8_fused_qk_msl;
 pub mod q8_msl;

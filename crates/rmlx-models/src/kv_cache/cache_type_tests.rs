@@ -52,8 +52,7 @@ fn kv_bitwidth_matrix_resolves() {
     // - 4-bit packs 8 vals/u32 → head_dim % 8 == 0 (128 OK).
     // - 3-bit packs 10 vals/u32 → head_dim % 10 == 0 → 128 is REJECTED;
     // needs a multiple of lcm(64,10)=320. This is a pre-existing rMLX
-    // guard (see `mlx_bit_packing_violation_q3_g64_on_unfriendly_head_dim`),
-    // not introduced by .
+    // guard (see `mlx_bit_packing_violation_q3_g64_on_unfriendly_head_dim`).
     // So 2/4 are asserted at head_dim=128 (Bonsai); 3 and the 3.5-bit
     // fractional endpoints (K3/V4) at head_dim=320.
     let arch = "Qwen3ForCausalLM";
@@ -1265,6 +1264,49 @@ fn validate_resolved_non_moe_iso_k_side_passes() {
     ] {
         validate_resolved("Gemma4ForConditionalGeneration", &kq).unwrap();
         validate_resolved("Qwen3ForCausalLM", &kq).unwrap();
+    }
+}
+
+/// Metal-vs-CPU classification in `validate_resolved` (warn-only).
+///
+/// CPU-hot-path iso / rotor V-only codecs resolve `Ok` — the classifier emits
+/// a warn but never rejects. Metal codecs also resolve `Ok`.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test asserts Ok for all paths — unwrap surfaces an unexpected reject"
+)]
+fn validate_resolved_cpu_codec_classification() {
+    // CPU-hot-path codecs (iso/rotor V-only families): warn-and-proceed,
+    // never rejected.
+    for kq in [
+        KvQuant::Iso3,
+        KvQuant::Rotor3,
+        KvQuant::Iso4,
+        KvQuant::Rotor4,
+    ] {
+        validate_resolved("Gemma4ForConditionalGeneration", &kq)
+            .unwrap_or_else(|e| panic!("CPU-hot-path codec must resolve Ok for {kq}: {e}"));
+    }
+
+    // Metal codecs resolve Ok.
+    for kq in [KvQuant::K8V4, KvQuant::Planar, KvQuant::RotKTq4V] {
+        validate_resolved("Gemma4ForConditionalGeneration", &kq)
+            .unwrap_or_else(|e| panic!("Metal codec must resolve Ok for {kq}: {e}"));
+    }
+
+    // K-only iso codecs dispatch the iso K MSL kernel every decode step — they
+    // are Metal (cpu_hot_path_reason returns None) and must resolve Ok.
+    for kq in [KvQuant::IsoKOnly3, KvQuant::IsoKOnly4] {
+        validate_resolved("Gemma4ForConditionalGeneration", &kq)
+            .unwrap_or_else(|e| panic!("K-only iso codec must resolve Ok for {kq}: {e}"));
+    }
+
+    // K-only rotor codec verdict is QJL-dependent; in either case
+    // validate_resolved must return Ok (no reject path).
+    for kq in [KvQuant::RotorKOnly3, KvQuant::RotorKOnly4] {
+        validate_resolved("Gemma4ForConditionalGeneration", &kq)
+            .unwrap_or_else(|e| panic!("K-only rotor codec must resolve Ok for {kq}: {e}"));
     }
 }
 
