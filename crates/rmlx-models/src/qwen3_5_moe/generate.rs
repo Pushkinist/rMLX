@@ -532,7 +532,7 @@ pub fn generate_greedy(
             }
         }
         // N16: store KV-cache bytes (KV + linear-attn state) for /metrics/cache.
-        let kv_bytes: u64 = kv_caches.iter().map(|c| c.approx_bytes()).sum::<u64>()
+        let kv_bytes: u64 = kv_caches.iter().map(|c| c.resident_bytes()).sum::<u64>()
             + lin_caches.iter().map(|c| c.approx_bytes()).sum::<u64>();
         store_kv_cache_bytes(kv_bytes);
         return Ok(steps);
@@ -918,7 +918,7 @@ pub fn generate_greedy(
             }
         }
 
-        let kv_bytes: u64 = kv_caches.iter().map(|c| c.approx_bytes()).sum::<u64>()
+        let kv_bytes: u64 = kv_caches.iter().map(|c| c.resident_bytes()).sum::<u64>()
             + lin_caches.iter().map(|c| c.approx_bytes()).sum::<u64>();
         store_kv_cache_bytes(kv_bytes);
         return Ok(steps);
@@ -1429,7 +1429,7 @@ pub fn generate_greedy(
     );
 
     // N16: store KV-cache bytes (KV + linear-attn state) for /metrics/cache.
-    let kv_bytes: u64 = kv_caches.iter().map(|c| c.approx_bytes()).sum::<u64>()
+    let kv_bytes: u64 = kv_caches.iter().map(|c| c.resident_bytes()).sum::<u64>()
         + lin_caches.iter().map(|c| c.approx_bytes()).sum::<u64>();
     store_kv_cache_bytes(kv_bytes);
 

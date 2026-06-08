@@ -120,6 +120,17 @@ of the active `KvQuant`: they use `RotatingState` (a ring-buffer bf16 path
 ported from mlx-lm's `RotatingKVCache`). `mlx-lm.to_quantized` raises
 `NotImplementedError` for rotating caches; rMLX matches that behaviour.
 
+**Byte accounting.** Two methods report KV-cache size:
+
+- `KvCache::approx_bytes()` — formula-based estimate using stored shape fields.
+  Used for SWA ring sizing and internal shape guards. Can return 0 when shape
+  fields are absent (e.g. before the first prefill).
+- `KvCache::resident_bytes()` — actual on-device allocation: reads the real
+  `Array` shape × `dtype.itemsize()` for every GPU buffer, and `Vec.len()`
+  for CPU codec blocks. Covers packed codes, scales, zero-points, and optional
+  rotation/residual buffers. This is the value recorded in `kv_cache_bytes`
+  metrics observations and returned by `rmlx baseline`.
+
 ### Per-request hot-swap (issue #26)
 
 The `KvQuant` for a request is **not** tied to the model load. A running

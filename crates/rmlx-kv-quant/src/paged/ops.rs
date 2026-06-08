@@ -193,6 +193,11 @@ impl PagedKStorage {
         self.scales.reset();
     }
 
+    /// Actual on-device bytes across all allocated pages (codes + scales slabs).
+    pub fn resident_bytes(&self) -> u64 {
+        self.codes.resident_bytes() + self.scales.resident_bytes()
+    }
+
     #[allow(
         clippy::indexing_slicing,
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
@@ -382,6 +387,11 @@ impl PagedVStorage {
         }
         self.codes.reset();
         self.scales.reset();
+    }
+
+    /// Actual on-device bytes across all allocated pages (codes + scales slabs).
+    pub fn resident_bytes(&self) -> u64 {
+        self.codes.resident_bytes() + self.scales.resident_bytes()
     }
 
     #[allow(
@@ -604,6 +614,11 @@ impl PagedPlanarVStorage {
         self.codes.reset();
         self.scales.reset();
         self.rotations.reset();
+    }
+
+    /// Actual on-device bytes across all allocated pages (codes + scales + rotations slabs).
+    pub fn resident_bytes(&self) -> u64 {
+        self.codes.resident_bytes() + self.scales.resident_bytes() + self.rotations.resident_bytes()
     }
 
     #[allow(

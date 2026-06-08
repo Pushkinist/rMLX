@@ -1196,6 +1196,27 @@ impl Architecture {
         }
     }
 
+    /// Actual on-device KV-cache bytes used by the most recent `generate_greedy`
+    /// call on this architecture.
+    ///
+    /// Reads the arch-specific prompt-cache static that `generate_greedy` writes
+    /// via `store_kv_cache_bytes` at the end of every generate call.  Returns 0
+    /// for architectures that do not yet maintain that static (Qwen2, BitNet,
+    /// Laguna, Qwen3VlMoe).
+    pub fn kv_cache_bytes(&self) -> u64 {
+        match self {
+            Architecture::Gemma4(_) | Architecture::Gemma3(_) => {
+                crate::gemma4::gemma4_kv_cache_bytes()
+            }
+            Architecture::Qwen3_5Moe(_) => crate::qwen3_5_moe::qwen3_5_moe_kv_cache_bytes(),
+            Architecture::Qwen3(_) => crate::qwen3::read_kv_cache_bytes(),
+            Architecture::Qwen2(_)
+            | Architecture::Laguna(_)
+            | Architecture::Qwen3VlMoe(_)
+            | Architecture::BitNet(_) => 0,
+        }
+    }
+
     /// Smoke probe verdict -- delegates to gemma4::classify_smoke for now.
     pub fn classify_smoke(steps: &[crate::gemma4::ProbeStep]) -> SmokeVerdict {
         crate::gemma4::classify_smoke(steps)

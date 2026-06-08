@@ -627,7 +627,7 @@ pub fn generate_greedy(
                 }
             }
  // N16: store KV-cache bytes at decode-loop end before returning.
-            let kv_bytes_macro: u64 = kv_caches.iter().map(|c| c.approx_bytes()).sum();
+            let kv_bytes_macro: u64 = kv_caches.iter().map(|c| c.resident_bytes()).sum();
             store_kv_cache_bytes(kv_bytes_macro);
         }};
     }
@@ -1315,7 +1315,7 @@ pub fn generate_greedy(
        );
 
     // N16: store KV-cache bytes for the /metrics/cache endpoint.
-    let kv_bytes: u64 = caches.iter().map(|c| c.approx_bytes()).sum();
+    let kv_bytes: u64 = caches.iter().map(|c| c.resident_bytes()).sum();
     store_kv_cache_bytes(kv_bytes);
 
     Ok(steps)

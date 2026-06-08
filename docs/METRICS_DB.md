@@ -341,7 +341,7 @@ Source of truth for `observations.metric`, `.unit`, `.direction`. Add to this ta
 | `model_load_ms`       | `ms`    | `lower_better`  | Wall time from `serve` start to "ready" log line.                       |
 | `peak_rss_mb`         | `mb`    | `lower_better`  | Peak resident set during the run.                                       |
 | `metal_peak_alloc_mb` | `mb`    | `lower_better`  | Peak Metal device allocation (from `mx.metal.get_peak_memory()`).       |
-| `kv_cache_bytes`      | `bytes` | `lower_better`  | KV cache footprint at end of generation.                                |
+| `kv_cache_bytes`      | `bytes` | `lower_better`  | Actual on-device KV-cache allocation at end of generation (packed codes + scales + rotation/residual buffers; reads real Array sizes via `KvCache::resident_bytes`). |
 | `tps_per_gb_ram`      | `ratio` | `higher_better` | `decode_tps_warm / peak_rss_gb` — runtime efficiency.                   |
 | `task_pass_at_1`      | `ratio` | `higher_better` | Quality probe pass rate (CBB-style). 0.0–1.0.                           |
 | `prompt_cache_block_hits`        | `count` | `higher_better` | Cumulative 256-tok blocks served from a cached prefix.   |
