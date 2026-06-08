@@ -55,6 +55,26 @@ impl PageSlab {
         self.page_tokens * self.elems_per_token
     }
 
+    /// Actual on-device bytes across all allocated pages in this slab.
+    ///
+    /// Counts only allocated (initialised) pages — `pool[i].is_some()` up to
+    /// `next_free`. Each page holds `page_tokens * elems_per_token` elements at
+    /// `dtype.itemsize()` bytes each. Pages that are allocated but not yet fully
+    /// written count their full allocation.
+    pub(super) fn resident_bytes(&self) -> u64 {
+        #[allow(
+            clippy::indexing_slicing,
+            reason = "next_free is monotonically bounded by pool.len() by construction"
+        )]
+        let allocated_pages = self.pool[..self.next_free]
+            .iter()
+            .filter(|p| p.is_some())
+            .count() as u64;
+        let elems_per_page = self.page_elems() as u64;
+        let item_bytes = self.dtype.itemsize() as u64;
+        allocated_pages * elems_per_page * item_bytes
+    }
+
     /// Allocate the next free physical page, initialize it to zeros on `device`.
     /// Returns the physical page ID.
     #[allow(

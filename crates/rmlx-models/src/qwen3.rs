@@ -187,7 +187,7 @@ impl PromptCacheEntry for Qwen3Entry {
     }
 
     fn kv_bytes(&self) -> u64 {
-        self.kv_caches.iter().map(|c| c.approx_bytes()).sum()
+        self.kv_caches.iter().map(|c| c.resident_bytes()).sum()
     }
 }
 
@@ -2268,7 +2268,7 @@ pub fn generate_greedy(
         // Store KV-cache bytes on exact-hit path (mirrors the Miss path store at
         // the prefill snapshot block below). Once per generate call, after decode.
         {
-            let kv_bytes: u64 = kv_caches.iter().map(|c| c.approx_bytes()).sum();
+            let kv_bytes: u64 = kv_caches.iter().map(|c| c.resident_bytes()).sum();
             QWEN3_PROMPT_CACHE.store_kv_cache_bytes(kv_bytes);
         }
         return Ok(steps);
@@ -2468,7 +2468,7 @@ pub fn generate_greedy(
     // We clone the post-prefill KV caches (refcount bump, no data copy) before
     // the decode loop starts writing new decode-step K/V into them.
     {
-        let kv_bytes: u64 = caches.iter().map(|c| c.approx_bytes()).sum();
+        let kv_bytes: u64 = caches.iter().map(|c| c.resident_bytes()).sum();
         QWEN3_PROMPT_CACHE.store_kv_cache_bytes(kv_bytes);
         let cloned_caches: Result<Vec<KvCache>> =
             caches.iter().map(|c| c.try_deep_clone()).collect();
