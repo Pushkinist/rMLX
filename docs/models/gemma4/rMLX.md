@@ -6,40 +6,51 @@
 > 31b 14.1/13.6/12.9/11.7/9.9/7.6 (4k/8k/16k/32k/64k[/128k]).
 
 **Family:** `gemma4` (`Gemma4ForConditionalGeneration`, text core `gemma4_text`)
-**Machine:** Apple M5 Max, 128 GB, macOS 26.4.1 · **Binary:** `release-perf`, rMLX
-0.1.1 (`c308b24`)
+**Machine:** Apple M5 Max, 128 GB, macOS 26.4.1 · **Binary:** `release-perf`,
+post-fix campaign (`bench/gemma4-siblings` on main `4da2000`; #32/#33/#34/#35/#36/#39 merged)
 **Protocol:** batch=1, temp=0, `max_tokens=256`; **n=3 measured** (4k/8k/16k/32k),
 **n=2 → n=1 measured** (64k/128k), 1 warmup `r0` discarded; decode-TPS median +
 95% CI (bootstrap). **Same harness as SIBLINGS** (CBB `run_one`, chat-templated
 serve), so rMLX cells compare directly. Bar (§0.1): WIN / TIE-on-CI-overlap / LOSS.
 
-> **Status: Stage 2 COMPLETE** (Phases B–E). rMLX serve cells use **per-prompt
-> right-sized `--max-ctx`** — see the §M measurement note; this is essential for a
-> fair number (rMLX pre-allocates the KV ring to `--max-ctx`).
+> **Status: Stage 2 COMPLETE + post-fix dual-axis re-bench (2026-06-08).** Post-#25
+> the KV ring grows lazily — serve once at a high ceiling, no per-prompt right-sizing
+> needed (§M/§V). This sweep adds the **`kv_cache_bytes`** axis (#33/#39).
 
 ## 0. TL;DR
 
-- **(Updated 2026-06-08, post-#25 load-once.)** rMLX **now WINS e2b @4k** (117.4 vs
-  116.4) and e4b short/mid-ctx losses narrowed (8k −3.4 %, 16k −5.3 %), but rMLX
-  **still LOSES at long ctx** (32k–64k: −12…−21 %), the gap widening with context.
-  Still the **opposite of Qwen3.6** (rMLX won +12–15 % there). See §2b/§3.
-- **KV quantization does NOT recover the gap** (Phase C). The **full 25-codec e2b/e4b
-  sweep** shows all 16 mainstream codecs within **±2 % of `none`** at every size —
-  KV quant neither helps nor hurts dense-Gemma4 decode; **only 31b gains** (k8vturbo2
-  **+4.1 %** @ 64k). So the deficit is **not KV-read-bandwidth** — it's the
-  SWA-attention decode path. _(The 9 rotation/K-only codecs could not be measured
-  cleanly — Metal shader cold-compile artifact; see §2b.)_
-- **rMLX carries a much larger KV footprint than mlx-lm under Gemma4 SWA**
-  (e2b @64k RSS **30.5 GB** vs mlx-lm **5.0 GB**; e4b @64k **40.8 GB** vs
-  **7.7 GB**) — yet quantizing it doesn't speed decode, so the footprint is an
-  allocation/capacity issue, not the decode bottleneck.
-- **Speculative decoding is BROKEN on Gemma4** (Phase E) — 2 bugs: the
-  `--draft-kind mtp` dispatch misroutes a plain-gemma4 draft to the Qwen3.5 MTP
-  path, and the dedicated assistant drafter (only pairs with the **e2b** verifier)
-  hits a Metal SDPA `Invalid mask_mode additive` crash → 0 decode. **File both.**
-  _(Filed + fixed: #23 dispatch, #24 mask. Post-fix (§V): both reachable,
-  additive crash gone, short-prompt spec works — accept 0.833 — but a residual
-  off-by-one SWA mask shape remains at longer prompts.)_
+- **(Updated 2026-06-08, post-fix dual-axis sweep — 6 fixes merged: #32/#33/#34/#35/#36/#39.)**
+  Decode standing is **unchanged within noise** — the fixes were KV-reporting,
+  speculative, and codec-classification work; they do **not** touch the decode
+  kernel. e2b **TIE @4k** (116.6 vs 116.4), losses **widen with ctx** to −21 % @64k;
+  e4b **−4…−12 %** (4k→64k). The **SWA-attention decode path remains the deficit** —
+  opposite of Qwen3.6 (MoE, no SWA — rMLX won +12–15 %). See §2b/§3.
+- **NEW — KV-cache-SIZE axis (now measurable: #33/#39 give accurate `kv_cache_bytes`).**
+  The headline: on Gemma4 SWA, **KV "quant" mostly _inflates_ resident KV, not
+  shrinks it.** A quantized layer keeps a bf16 warm-TTFT decode seed _alongside_ the
+  quantized blocks + scales, so vs `none` @64k: k8v4 **1.20×**, k8v8 1.25×,
+  planar/rotor ~1.46×, iso 1.86×, **iso_sym 2.47× (worst)**. **Only K-only rotor
+  compresses K (0.87×)** — but it is CPU-bound and decode-uncompetitive. So KV quant
+  buys **neither decode nor memory** on dense Gemma4; `none` is the right default.
+  The per-layer net-benefit `warn!` (#34) now flags these net-negative configs at
+  resolve time.
+- **KV-footprint claim CORRECTED.** The earlier "rMLX carries ~6× mlx-lm KV under
+  SWA (30.5 GB)" was an artifact: windowed SWA layers are **already window-bounded**
+  (flat ring, #35), and `kv_cache_bytes` was reading the **ceiling-sized** buffer
+  (#39, now filled-prefix). True live-inference KV @64k (`none`): **e2b 780 MB /
+  e4b 2088 MB**. _Note:_ the None-path global decode seed is **f32, not bf16** — a
+  real ~2× allocation-reduction candidate, tracked as **#44** (numerics-gated, not done).
+- **Rotation/K-only codecs now CLEANLY MEASURABLE** (#36 load-time MSL precompile —
+  the prior "shader cold-compile" contamination is **gone**: r0≈r1≈r2 for every
+  rotation codec, no LOADFAILs). Honest verdict: **iso/rotor V-only** fire a
+  CPU-hot-path `warn!` (prefill encode is CPU) but **decode ≈ `none`** (decode reads
+  the bf16 seed); **k_iso / k_rotor (K-only)** are **genuinely CPU-bound** — decode
+  craters (e2b k_iso3 52→3 TPS across 4k→64k) and is not competitive.
+- **Speculative decoding is FIXED on Gemma4** (#32, was broken). The verify-step SWA
+  mask off-by-one — in **both** the producer and consumer attention branches — is
+  resolved; e2b + assistant-bf16 `--draft-kind mtp` now runs a 4.6k-token prompt with
+  a partial-accept round, **no SDPA broadcast crash** (§V). #23/#24 earlier fixed the
+  dispatch + additive-mask crash; #32 closes the residual.
 - **SSD tier** initializes cleanly + is decode-neutral (−2 % @64k, within noise),
   but **no spill is triggered** at 256-token single-stream (capacity feature, not
   exercised at these sizes).
@@ -134,34 +145,35 @@ during multi-token verify at non-trivial prompt lengths. Follow-up to #24.
 decode TPS median [95% CI]; cold-`r0` prefill TTFT / tok·s; peak RSS.
 
 **e2b** (ceiling 64k — 128k fixture 137,920 tok > 131072 ctx).
-_decode = **2026-06-08 load-once** @ `--max-ctx 79872` (serve once, sweep all sizes
-against the resident lazy-grown ring, post-#25); `pre-#25` = the prior per-prompt
-right-sized serve. They agree within noise. cold-prefill is method-independent._
+_decode = **2026-06-08 post-fix load-once** @ `--max-ctx 79872` (serve once, sweep
+all sizes against the resident lazy-grown ring); `kv_cache_bytes` = live-inference
+KV (filled-prefix, #39-accurate), from `rmlx baseline`, in MB. cold-prefill is
+method-independent. Decode matches the pre-fix sweep within ±1 % (no regression)._
 
-| Prompt | decode TPS (load-once) | pre-#25 right-sized | cold prefill |
+| Prompt | decode TPS (`none`) | kv_cache_bytes (`none`) | cold prefill |
 |---|---|---|---|
-| 4k | **117.4** | 116.8 | 0.3 s / 14 847 |
-| 8k | **112.1** | 110.2 | 0.5 s / 15 005 |
-| 16k | **104.0** | 106.3 | 1.2 s / 13 955 |
-| 32k³ | **91.9** | 96.7 | 3.3 s / 10 019 |
-| 64k¹ | **76.2** | 76.4 | 11.6 s / 5 658 |
+| 4k | **116.6** | 64 MB | 0.3 s / 14 847 |
+| 8k | **110.9** | 115 MB | 0.5 s / 15 005 |
+| 16k | **104.4** | 229 MB | 1.2 s / 13 955 |
+| 32k | **92.1** | 440 MB | 3.3 s / 10 019 |
+| 64k¹ | **75.5** | 780 MB | 11.6 s / 5 658 |
 
-Peak RSS unchanged from prior (5.6 → 32.6 GB at 64k; serving at a 64k ceiling does
-**not** pre-allocate — the ring grows lazily, so RSS still tracks the filled length).
+`kv_cache_bytes` is the **live-inference** KV (12 windowed SWA layers flat at the
+window + 3 global full-attention layers growing with ctx); the global seed is f32
+(#44). Peak RSS @64k ≈ 32.6 GB (weights + activations + Metal, KV is a small part).
 
-**e4b** (ceiling 64k). Same load-once method; load-once matches right-sized at
-**every** size (incl. 32k: 52.5 vs 52.3) — confirming the e2b 32k³ dip is noise,
-not a method effect.
+**e4b** (ceiling 64k). Same load-once method; decode within ±1 % of the pre-fix sweep.
 
-| Prompt | decode TPS (load-once) | pre-#25 right-sized | cold prefill |
+| Prompt | decode TPS (`none`) | kv_cache_bytes (`none`) | cold prefill |
 |---|---|---|---|
-| 4k | **71.6** | 71.2 | 0.8 s / 5 335 |
-| 8k | **67.9** | 65.5 | 1.4 s / 5 672 |
-| 16k | **62.1** | 60.9 | 3.0 s / 5 475 |
-| 32k | **52.5** | 52.3 | 6.6 s / 4 935 |
-| 64k¹ | **39.7** | 39.6 | 18.3 s / 3 577 |
+| 4k | **70.7** | 178 MB | 0.8 s / 5 335 |
+| 8k | **68.2** | 314 MB | 1.4 s / 5 672 |
+| 16k | **61.8** | 618 MB | 3.0 s / 5 475 |
+| 32k | **52.5** | 1181 MB | 6.6 s / 4 935 |
+| 64k¹ | **39.9** | 2088 MB | 18.3 s / 3 577 |
 
-**26b-a4b MoE** (ceiling 128k):
+**26b-a4b MoE** (ceiling 128k) — **not re-run in the 2026-06-08 post-fix sweep**
+(e2b/e4b only); rows are the prior Stage-2 right-sized numbers, decode-only:
 
 | Prompt | decode TPS | cold prefill | peak RSS |
 |---|---|---|---|
@@ -189,87 +201,107 @@ thermal/warmup noise on the n=2 4k cell; the executor also flagged 31b kv-none 4
 as ~1 TPS below a historical `eed133c` reading (12.2) → a **possible minor 31b
 dense regression** worth a separate check. Treat 31b 4k as soft.
 
-³ **load-once method (e2b/e4b only, 2026-06-08).** Serve once at `--max-ctx 79872`
-and sweep 4k→64k ascending against the resident ring (valid post-#25). Matches the
-pre-#25 per-prompt right-sized numbers within noise on both models; the lone e2b
-32k −5 % dip does not reproduce on e4b, so treat it as run-to-run noise. 26b/31b
-were **not** re-run — their rows are the pre-#25 right-sized Stage-2 numbers.
+**Load-once method (e2b/e4b, 2026-06-08).** Serve once at `--max-ctx 79872` and
+sweep 4k→64k ascending against the resident lazy-grown ring (valid post-#25). Matches
+per-prompt right-sized within noise on both models. 26b/31b were **not** re-run —
+their rows are the prior right-sized Stage-2 numbers.
 
 All cells coherent (temp=0): e2b `"llama.cpp: Longest README content…"`, e4b
 `"llama.cpp: Contains extensive feature descriptions…"`, 26b `"llama.cpp: longest
 README provided…"`, 31b `"llama.cpp: 178 lines"`. The 2026-06-08 KV sweep (§2b) is
-coherent across all 16 mainstream codecs on both models — no repetition loops.
+coherent across **all 25 codecs** on both models — no repetition loops.
 
-### 2b. Phase C — full KV sweep (e2b + e4b, 2026-06-08, load-once)
+### 2b. Phase C — full dual-axis KV sweep (e2b + e4b, 2026-06-08 post-fix)
 
-All 25 `KvQuant::FromStr` codecs × {4k,8k,16k,32k,64k}, n=3 (n=2 @64k), served
-load-once per codec at the 64k ceiling. **16 mainstream codecs measured clean; the
-9 rotation / K-only codecs are contaminated by a Metal shader cold-compile artifact
-(caveat below) and are NOT ranked.** Best per cell bolded.
+All 25 `KvQuant::FromStr` codecs × {4k,8k,16k,32k,64k}, n=3 (n=2 @64k). **Two axes:**
+decode TPS (serve+`run_one`, load-once at the 64k ceiling) **and `kv_cache_bytes`**
+(`rmlx baseline`, filled-prefix, #39-accurate). **Rotation codecs are now cleanly
+measured** — #36's load-time MSL precompile killed the prior cold-compile
+contamination (r0≈r1≈r2 every codec, no LOADFAILs). Best mainstream per cell bolded.
 
-**e2b — decode TPS median (16 mainstream codecs):**
+**Decode — every mainstream codec is within ±2 % of `none` (decode no-op), both models.**
 
-| KV | 4k | 8k | 16k | 32k | 64k |
-|---|---|---|---|---|---|
-| **none** | **117.4** | **112.1** | 104.0 | 91.9 | 76.2 |
-| k8v4 | 115.6 | 111.0 | 103.5 | 91.2 | 76.8 |
-| k8v8 | 114.9 | 111.0 | 104.9 | 92.4 | 76.0 |
-| planar | 116.0 | 109.5 | 103.2 | 92.5 | 75.4 |
-| planar3 | 115.4 | 110.9 | 103.6 | **92.7** | 76.2 |
-| planar_k | 116.0 | 110.8 | 104.3 | 90.9 | 76.1 |
-| k8vturbo2 | 116.1 | 110.9 | 103.3 | 92.6 | 76.6 |
-| k8vturbo3 | 115.2 | 110.3 | **105.6** | 92.1 | 76.8 |
-| k8vturbo2tcq | 115.3 | 110.9 | 104.1 | 92.0 | **76.9** |
-| k8vturbo3tcq | 116.3 | 109.6 | 103.4 | 91.8 | 76.7 |
-| tsym3 | 115.7 | 110.3 | 103.3 | 91.7 | 76.4 |
-| tsym4 | 115.3 | 110.3 | 103.3 | 92.3 | 76.4 |
-| iso3 | 114.4 | 111.0 | 105.1 | 91.5 | 76.1 |
-| iso4 | 115.8 | 109.2 | 102.7 | 90.7 | 76.4 |
-| iso3_sym | 115.5 | 110.3 | 103.1 | 91.1 | 75.6 |
-| iso4_sym | 115.7 | 110.2 | 103.2 | 91.5 | 74.6 |
-
-**e4b — decode TPS median (16 mainstream codecs):**
+**e2b — decode TPS median (16 mainstream):**
 
 | KV | 4k | 8k | 16k | 32k | 64k |
 |---|---|---|---|---|---|
-| **none** | **71.6** | 67.9 | 62.1 | 52.5 | 39.7 |
-| k8v4 | 70.8 | 68.1 | 61.6 | 52.2 | 39.0 |
-| k8v8 | 71.1 | 68.2 | 61.0 | 51.5 | **40.4** |
-| planar | 70.6 | 67.6 | 62.1 | **52.6** | 40.3 |
-| planar3 | 70.9 | **68.9** | 62.3 | **52.6** | **40.4** |
-| planar_k | 70.5 | 68.2 | **62.6** | 52.0 | 39.9 |
-| k8vturbo2 | 70.5 | 68.3 | 60.8 | 52.3 | 39.9 |
-| k8vturbo3 | 71.3 | 68.4 | 61.6 | 52.0 | 40.1 |
-| k8vturbo2tcq | 71.2 | 68.3 | 61.8 | 52.3 | 40.1 |
-| k8vturbo3tcq | 70.9 | 67.8 | 62.0 | 52.2 | 39.5 |
-| tsym3 | 70.9 | 67.8 | 62.0 | 52.3 | —ᴸ |
-| tsym4 | 69.5 | 68.0 | 62.4 | 52.2 | 40.2 |
-| iso3 | 71.0 | 68.0 | 62.0 | 52.0 | ✗⁰ |
-| iso4 | 71.5 | 68.8 | 62.3 | 52.0 | 39.4 |
-| iso3_sym | 69.3 | 68.5 | 62.3 | 51.2 | 39.8 |
-| iso4_sym | 70.6 | 68.4 | 62.1 | 50.8 | 39.1 |
+| **none** | **116.6** | 110.9 | 104.4 | 92.1 | 75.5 |
+| k8v4 | 116.3 | 110.6 | **104.9** | 92.2 | 76.0 |
+| k8v8 | 115.2 | **111.1** | **104.9** | 90.9 | 76.4 |
+| planar | 116.0 | 109.5 | 103.9 | 92.3 | 75.1 |
+| planar3 | 115.4 | 110.7 | 104.4 | **92.6** | 76.3 |
+| planar_k | 115.7 | 111.0 | 103.6 | 91.2 | 76.3 |
+| k8vturbo2 | 116.0 | **111.1** | 104.2 | 92.5 | 76.1 |
+| k8vturbo3 | 115.0 | 110.2 | 104.8 | 92.0 | 76.5 |
+| k8vturbo2tcq | 115.3 | 110.9 | 104.0 | 92.2 | 76.5 |
+| k8vturbo3tcq | 116.3 | 110.4 | 103.6 | 91.5 | **76.6** |
+| tsym3 | 116.1 | 110.3 | 103.3 | 91.9 | **76.6** |
+| tsym4 | 114.6 | 111.0 | 103.8 | 92.4 | 76.5 |
+| iso3ᵂ | 114.9 | 110.2 | 104.4 | 91.2 | 75.9 |
+| iso4ᵂ | 115.4 | 109.2 | 103.7 | 90.7 | 75.5 |
+| iso3_symᵂ | 116.4 | 110.0 | 102.9 | 91.1 | 75.5 |
+| iso4_symᵂ | 115.7 | 110.1 | 103.2 | 90.5 | 74.9 |
 
-ᴸ `—` = serve LOADFAIL on a cold start (shader compile, see caveat); ⁰ `✗` =
-`success` but `decode_tps=0` (64k prefill consumed the token budget).
+**e4b — decode TPS median (16 mainstream):**
 
-**Finding (e2b/e4b): every mainstream KV codec is within ±2 % of `none`** at every
-size — KV quant neither helps nor hurts dense-Gemma4 decode. This confirms §0: the
-deficit is the **SWA-attention decode path, not KV-read-bandwidth**. `none` is the
-safe default; no codec earns its keep on e2b/e4b. (`rotor4` showed a noise-level edge
-on e2b — 118.6/113.1/107.5 — but was **slower** than `none` on e4b, so it is not a
-robust win, and its e2b numbers are shader-contamination-suspect anyway.)
+| KV | 4k | 8k | 16k | 32k | 64k |
+|---|---|---|---|---|---|
+| **none** | 70.7 | 68.2 | 61.8 | 52.5 | 39.9 |
+| k8v4 | 70.8 | 67.7 | 61.8 | 52.3 | 39.4 |
+| k8v8 | **71.3** | 68.2 | 62.4 | 52.5 | 40.1 |
+| planar | 70.6 | 67.6 | 62.1 | 52.4 | 40.3 |
+| planar3 | 71.0 | 68.6 | 62.4 | **52.7** | **40.4** |
+| planar_k | 70.1 | 68.2 | **62.6** | 52.4 | 40.0 |
+| k8vturbo2 | **71.3** | **68.7** | 61.4 | 52.2 | 40.0 |
+| k8vturbo3 | **71.4** | 68.4 | 61.6 | 52.1 | 40.2 |
+| k8vturbo2tcq | 71.2 | 68.6 | 61.6 | 52.5 | 40.1 |
+| k8vturbo3tcq | 71.1 | 68.0 | 62.1 | **52.7** | 39.9 |
+| tsym3 | 70.9 | 67.5 | 62.1 | 52.4 | 39.9 |
+| tsym4 | 69.7 | 68.0 | 62.4 | 52.2 | 40.3 |
+| iso3ᵂ | 71.0 | 68.0 | 62.4 | 52.0 | 38.8 |
+| iso4ᵂ | 70.7 | 68.6 | 62.3 | 52.2 | 39.2 |
+| iso3_symᵂ | 69.8 | 68.3 | 62.3 | 51.5 | 38.9 |
+| iso4_symᵂ | 70.8 | 68.4 | 62.2 | 51.4 | 38.6 |
 
-**⚠ Rotation / K-only codecs NOT cleanly measurable — Metal shader cold-compile.**
-`k_iso3/4`, `rotor3/4`, `rotor3/4_sym`, `k_rotor3/4`, `rot_k_tq4v` carry heavy MSL
-shaders that compile lazily during the **first forward pass** (30–60× slow), and the
-1-token serve warmup does not trigger compilation. Their first measured cells are
-therefore contaminated — e.g. e2b `k_iso4` 26→4 TPS but e4b `k_iso4` 71→52 ≈ `none`,
-a warmup artifact, not codec cost. 59 cold-start records were quarantined; the
-survivors are still unreliable and are excluded from ranking. Only `k_iso3` is
-consistently slow on both models (genuinely heavy at this ctx). **A clean
-rotation-codec bench needs a realistic-prompt warmup to force shader compilation
-before measuring** — a bench-harness gap, and a candidate engine UX bug (the first
-request after serving a rotation-KV model stalls 30–60×).
+ᵂ fires the per-layer CPU-hot-path `warn!` (#36) — the iso/rotor V-encode is on CPU
+at **prefill**, but **decode reads the bf16 seed**, so decode stays ≈ `none`. The
+warn is about memory/prefill, not decode TPS.
+
+**NEW — `kv_cache_bytes` (the KV-SIZE axis). KV "quant" _inflates_ resident KV.**
+Ratio vs `none` is ~codec-intrinsic (near-constant across ctx); shown @64k with the
+absolute MB. `none` absolute grows with ctx (e2b 64/115/229/440/**780** MB;
+e4b 178/314/618/1181/**2088** MB at 4k/8k/16k/32k/64k):
+
+| KV | e2b @64k | e4b @64k | ratio vs none | why |
+|---|---|---|---|---|
+| **k_rotor3 / k_rotor4** | **677** | **1818** | **0.87×** | only real K compression (K-only, no bf16 seed) — but CPU-bound (below) |
+| none | 780 | 2088 | 1.00× | bf16 K+V, baseline |
+| tsym3 | 876 | 2344 | 1.12× | |
+| k8v4 | 939 | 2512 | 1.20× | quant blocks **+ bf16 seed** |
+| k8v8 | 978 | 2616 | 1.25× | |
+| planar / rotor* | 1136–1143 | 3038–3056 | 1.46× | + planar/rotation scratch |
+| iso3 / iso4 | 1456 | 3890 | 1.86× | + quaternion buffers |
+| **iso3_sym / iso4_sym** | **1934** | **5164** | **2.47×** | worst — sym rotation tables |
+
+**Finding (the headline): on Gemma4 SWA, KV quant costs decode nothing AND grows
+memory.** A quantized layer keeps its bf16 warm-TTFT decode seed _alongside_ the
+packed blocks + scales (+ rotation/quaternion scratch), so every mainstream codec is
+**larger** than `none` — up to 2.47×. The only genuine K compression (k_rotor, 0.87×)
+is CPU-bound. So **`none` is the right default on dense Gemma4** — confirmed on both
+axes. (#34's net-benefit `warn!` now surfaces this at resolve time.)
+
+**Rotation / K-only — now honestly classified (#36), no cold-compile artifact.**
+- **iso/rotor V-only** (`iso*`, `rotor*`): decode ≈ `none` (above); the CPU cost is
+  prefill-side. Memory-negative (1.46–2.47×). Not worth it.
+- **K-only `k_iso* / k_rotor*` are genuinely CPU-bound** — K dequant runs on the host
+  every decode step (no bf16 seed to shadow it). Decode craters with ctx:
+  e2b `k_iso3` **52.4/30.9/20.5/12.3/3.4**, `k_iso4` 26.7/15.4/8.2/4.2/2.0;
+  e4b `k_iso3` 23.4/14.6/7.6/3.1/1.8. `k_rotor*` are ~1–4 TPS (32k/64k cells capped —
+  too slow to measure). They are the **only KV-shrinking** codecs (0.87×) but are
+  decode-uncompetitive; a Metal K-dequant kernel would be needed to make them viable.
+- **`rot_k_tq4v`** is Metal but its TQ-4 K-kernel cost **scales with hidden dim**:
+  ≈`none` on e2b (111.7/109.5/99.9/90.3/69.5) but **−15…−27 %** on e4b
+  (67.9/58.9/54.4/43.8/29.3) — a real K-side cost on the wider model, not an artifact.
 
 **Carry to 64k — 26b / 31b (prior right-sized Stage-2 data, NOT re-run 2026-06-08):**
 
@@ -299,9 +331,15 @@ is a **capacity** feature; at these sizes it isn't triggered. Not stress-tested
 here (would need a multi-turn / >RAM-KV scenario). _(The Qwen3.6 §9
 hydrate-doesn't-skip-prefill gap is untested on Gemma4 for the same reason.)_
 
-### 2d. Phase E — speculative (Gemma4 assistant MTP) — **BROKEN** (pre-fix; see §V)
+### 2d. Phase E — speculative (Gemma4 assistant MTP) — **FIXED** (#23/#24/#32; see §V)
 
-Every speculative cell failed. Three distinct failures (verifier @4k, kv none):
+> **Resolved 2026-06-08.** All three failures below are fixed: #23 (dispatch), #24
+> (additive→array mask), and **#32** (the verify-step SWA mask off-by-one in both the
+> producer and consumer attention branches). e2b + `assistant-bf16` `--draft-kind
+> mtp` now serves a 4.6k-token prompt with a partial-accept round, coherent output,
+> **no SDPA broadcast crash**. The pre-fix failure analysis is kept below for history.
+
+Pre-fix, every speculative cell failed. Three distinct failures (verifier @4k, kv none):
 
 | Pairing | result |
 |---|---|
@@ -319,34 +357,38 @@ Every speculative cell failed. Three distinct failures (verifier @4k, kv none):
    The only valid drafter pairing (e2b + assistant) therefore crashes on every
    decode step. (`speculative/gemma4_assistant.rs` SWA-mask construction.)
 
-**Phase E verdict:** Gemma4 speculative is **non-functional** in rMLX 0.1.1 — no
-accept-rate or speedup measurable. (Mirrors the Qwen3.6 Eagle3-crash situation pre-
-0.1.1; same "file + fix later" path.)
+**Phase E verdict (post-fix):** Gemma4 speculative is **functional** — e2b +
+assistant-bf16 MTP runs at real prompt lengths without crashing (#23/#24/#32 all
+merged). Accept-rate / net speedup is not yet swept here (correctness gate only —
+the 4.6k repro exercised a partial-accept round, no crash); a speed sweep is
+follow-up. (Mirrors the Qwen3.6 path: crash fixed first, speed characterized later.)
 
 ---
 
 ## 3. Standing vs champion (decode)
 
-rMLX best (mainstream KV, **2026-06-08 load-once**) vs the SIBLINGS mlx-lm champion.
-WIN / TIE-on-CI / LOSS (§0.1). e2b/e4b updated; 26b/31b are the prior Stage-2 rows.
+rMLX best **mainstream** KV (2026-06-08 post-fix sweep) vs the SIBLINGS mlx-lm
+champion. WIN / TIE-on-CI / LOSS (§0.1). Decode is **unchanged within noise** from
+the prior sweep — the 6 fixes don't touch the decode kernel. e2b/e4b refreshed;
+26b/31b are the prior Stage-2 rows (not re-run).
 
-### e2b — **now WINS @4k** (was TIE)
-| Prompt | rMLX best | champion (mlx-lm) | standing |
+### e2b — TIE @4k, losses widen with ctx
+| Prompt | rMLX best (mainstream) | champion (mlx-lm) | standing |
 |---|---|---|---|
-| 4k | 117.4 (none) | 116.4 | 🟢 **WIN +0.9%** |
-| 8k | 112.1 (none) | 114.7 | 🔴 LOSS −2.3% (was −4%) |
-| 16k | 105.6 (k8vturbo3) | 110.7 | 🔴 LOSS −4.6% |
-| 32k | 92.7 (planar3) | 106.1 | 🔴 LOSS −12.6% (32k³ soft) |
-| 64k | 76.9 (k8vturbo2tcq) | 97.4 | 🔴 LOSS −21% |
+| 4k | 116.6 (none) | 116.4 | 🟡 **TIE +0.2%** |
+| 8k | 111.1 (k8v8) | 114.7 | 🔴 LOSS −3.1% |
+| 16k | 104.9 (k8v4/k8v8) | 110.7 | 🔴 LOSS −5.2% |
+| 32k | 92.6 (planar3) | 106.1 | 🔴 LOSS −12.7% |
+| 64k | 76.6 (tsym3) | 97.4 | 🔴 LOSS −21.4% |
 
-### e4b — losses narrowed at short/mid ctx
-| Prompt | rMLX best | champion | standing |
+### e4b — LOSS −4…−12 %, widening
+| Prompt | rMLX best (mainstream) | champion | standing |
 |---|---|---|---|
-| 4k | 71.6 (none) | 74.6 | 🔴 LOSS −4.0% (was −5%) |
-| 8k | 68.9 (planar3) | 71.3 | 🔴 LOSS −3.4% (was −8%) |
-| 16k | 62.6 (planar_k) | 66.1 | 🔴 LOSS −5.3% (was −8%) |
-| 32k | 52.6 (planar/planar3) | 58.1 | 🔴 LOSS −9.5% |
-| 64k | 40.4 (k8v8/planar3) | 45.9 | 🔴 LOSS −12.0% (was −14%) |
+| 4k | 71.4 (k8vturbo3) | 74.6 | 🔴 LOSS −4.3% |
+| 8k | 68.7 (k8vturbo2) | 71.3 | 🔴 LOSS −3.6% |
+| 16k | 62.6 (planar_k) | 66.1 | 🔴 LOSS −5.3% |
+| 32k | 52.7 (planar3) | 58.1 | 🔴 LOSS −9.3% |
+| 64k | 40.4 (planar3) | 45.9 | 🔴 LOSS −12.0% |
 
 ### 26b-a4b
 | Prompt | rMLX best | champion | standing |
@@ -368,12 +410,13 @@ WIN / TIE-on-CI / LOSS (§0.1). e2b/e4b updated; 26b/31b are the prior Stage-2 r
 | 64k | 8.33 (k8vturbo2) | 9.9 | 🔴 LOSS −16% |
 | 128k | 5.6 | 7.6 | 🔴 LOSS −26% |
 
-> **Verdict (post-#25, 2026-06-08): rMLX now WINS e2b @4k (+0.9 %) and the e4b
-> losses narrowed** (8k −8→−3.4 %, 16k −8→−5.3 %), but still **trails at long ctx**,
-> the gap widening to −12…−21 % at 32k–64k. The champion comparison is **decode
-> only**; on prefill rMLX is also far behind (§2a TTFT). Unlike Qwen3.6 (MoE, no SWA
-> — rMLX won +12–15 %), Gemma4's interleaved SWA still exposes a weakness in rMLX's
-> sliding-window attention decode path at scale. KV quant does not move it (§2b).
+> **Verdict (post-fix, 2026-06-08): rMLX TIEs e2b @4k (+0.2 %) and trails at long
+> ctx**, the gap widening to −12…−21 % at 32k–64k (e4b −4…−12 %). Decode is unchanged
+> by the 6 fixes — they were KV-reporting, spec, and classification work. The champion
+> comparison is **decode only**; on prefill rMLX is also far behind (§2a TTFT). Unlike
+> Qwen3.6 (MoE, no SWA — rMLX won +12–15 %), Gemma4's interleaved SWA still exposes a
+> weakness in rMLX's sliding-window attention decode path at scale. KV quant moves
+> neither decode (±2 %) nor memory (it _inflates_ KV — §2b).
 
 ---
 
@@ -387,27 +430,31 @@ Ranked by impact:
    sliding-window attention compute (mask construction, ring snapshot/restore, or
    attention-over-window kernel). The widening-with-ctx slope is the signature.
    Profile the Gemma4 decode attention vs mlx-lm's SWA path. **Highest value.**
-2. **KV footprint under SWA.** rMLX resident KV is ~6× mlx-lm at 64k (e2b 30.5 vs
-   5.0 GB; e4b 40.8 vs 7.7 GB) — mlx-lm shrinks KV to the SWA window for
-   windowed layers; rMLX appears to allocate full-ctx KV per layer. It doesn't
-   gate decode speed directly (KV quant was a no-op) but it caps deployable context
-   and feeds (1). Worth shrinking KV allocation to the window for SWA layers.
-3. **Speculative is broken (Phase E, 2 bugs).** (a) spec dispatch misroutes a
-   plain-gemma4 draft to the Qwen3.5 MTP path; (b) the assistant drafter's
-   `additive` SWA mask crashes the Metal SDPA kernel. Fix both → the 31b verifier
-   (11 TPS) + e2b/assistant draft is exactly where spec should pay off. File as
-   bugs.
+2. **KV memory: quant inflates, and the global seed is f32.** Two corrected facts
+   replace the old "6× full-ctx KV" claim: windowed SWA layers are **already
+   window-bounded** (#35), and the prior 6× was a reporting artifact (#39). The real
+   levers now: (a) KV "quant" **grows** resident KV (bf16 seed alongside blocks,
+   1.2–2.47× — §2b), so it is net-negative on dense Gemma4; (b) the None-path **global
+   decode seed is f32** — storing it bf16 is a ~2× KV-residency reduction on the only
+   growing layers (**#44**, numerics-gated). Neither gates decode speed (KV quant is a
+   no-op there) but both cap deployable context.
+3. **Speculative — FIXED (#23/#24/#32).** Dispatch (#23), additive-mask crash (#24),
+   and the verify-step SWA mask off-by-one in both producer + consumer branches (#32)
+   are all resolved; e2b + assistant MTP runs at 4.6k without crashing. Remaining:
+   sweep accept-rate / net speedup (the 31b verifier + e2b/assistant draft is where
+   spec should pay off) — not yet measured.
 4. **Prefill/TTFT on the big models.** 31b @128k prefill > 600 s (times out);
    26b @128k ≈ 403 s; prefill tok/s sinks to ~300 at long ctx. Same prefill class
    the Qwen3.6 campaign flagged — separate from decode, large.
-5. **Possible 31b dense regression** — kv-none 4k 11.0 is below a historical 12.2
-   (`eed133c`); 31b 4k < 8k is non-physical. Confirm with a clean n≥3 4k re-run
-   and bisect if real.
+5. **K-only codecs are CPU-bound (#36).** `k_iso* / k_rotor*` are the only
+   KV-shrinking codecs (0.87×) but run K dequant on the host every decode step →
+   decode craters with ctx (§2b). A Metal K-dequant kernel would make the one genuine
+   compressor viable; until then they are decode-uncompetitive and warned at resolve.
 
-**The one bright spot:** **31b + k8vturbo2 (+4.1 % @64k)** — the only KV-quant win,
-the rotation/turbo-V codec rMLX uniquely ships paying off on the most
-KV-bandwidth-pressured model. Everything else trails. Coherence was solid across
-all KV variants and all baseline cells.
+**No KV-quant bright spot on e2b/e4b** — `none` wins both axes. The prior 31b
+k8vturbo2 +4.1 % @64k note (KV-bandwidth-pressured dense model) stands as the lone
+KV-quant win, but 31b was not re-run this sweep (decode-only; no KV-byte axis).
+Coherence was solid across all 25 codecs and all baseline cells.
 
 ---
 
@@ -416,8 +463,14 @@ all KV variants and all baseline cells.
 - **64k/128k are n=1 measured** (single post-warmup run) — point estimates.
 - **31b 4k is soft** (anomalous vs 8k; possible regression — §2a²).
 - **SSD not stress-tested** — no spill triggered at 256-token single-stream.
-- **Speculative unmeasured** — broken (Phase E); no accept-rate / speedup exists.
+- **Speculative fixed (#23/#24/#32), speed not swept** — runs without crashing;
+  accept-rate / net speedup not yet measured (correctness gate only).
+- **K-only codecs decode capped at 32k/64k** — `k_iso* / k_rotor*` too slow
+  (~1–4 TPS) to measure at long ctx; their KV-byte axis is captured at all sizes.
 - **e2b/e4b 128k absent** — fixture (137,920 gemma tok) exceeds 131072 ctx.
+- **`kv_cache_bytes` ingest whitelist** — `rmlx metrics record` only ingests
+  none/k8v4/k8v8/planar into `observations`; the other 21 codecs' bytes were read
+  from the `events` table (improvement-plan item: widen `canonicalize_kv_quant`).
 - rMLX cells recorded in CBB `metrics/runs/*.jsonl` (backend=rmlx); **not** in
   `runs.db` (CBB schema rejected by the rMLX buffer — known harness landmine).
 - Aggregator: `Cross-Backend-Bench/scripts/agg_gemma4_siblings.py`.
