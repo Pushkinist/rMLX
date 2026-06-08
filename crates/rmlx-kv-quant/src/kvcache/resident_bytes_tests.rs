@@ -142,6 +142,47 @@ fn resident_bytes_scales_with_seq() {
     );
 }
 
+/// When the bf16 decode buffer is over-allocated to a ceiling capacity larger
+/// than the filled length (the on-device case: the mirror is sized to
+/// max-context but only `offset` positions hold live K/V), `resident_bytes`
+/// must report only the *filled* prefix — not the whole ceiling allocation.
+///
+/// This is the live-inference-KV accounting fix: a ceiling-sized buffer must
+/// not inflate the reported KV (e.g. an 8192-capacity buffer holding 4096 live
+/// positions reports half the bytes a naive shape × dtype sum would).
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test — panics are the intended failure mode"
+)]
+fn ceiling_sized_decode_buffer_counts_filled_prefix_only() {
+    const B: i32 = 1;
+    const KV_H: i32 = 2;
+    const D: i32 = 64;
+    const CAPACITY: i32 = 8192; // allocated ceiling
+    const FILLED: i32 = 4096; // live positions
+
+    // Plant K/V buffers allocated to CAPACITY but only FILLED positions live.
+    let k = bf16_zeros(B, KV_H, CAPACITY, D);
+    let v = bf16_zeros(B, KV_H, CAPACITY, D);
+    let mut cache = KvCache::with_quant_max_seq(KvQuant::None, CAPACITY);
+    cache.inject_decode_fp16_for_test(k, v, FILLED);
+
+    // Expected: 2 buffers × B × kv_h × FILLED × D × 2 bytes — NOT CAPACITY.
+    let expected_filled = 2 * B as u64 * KV_H as u64 * FILLED as u64 * D as u64 * 2;
+    let naive_capacity = 2 * B as u64 * KV_H as u64 * CAPACITY as u64 * D as u64 * 2;
+    assert_eq!(
+        cache.resident_bytes(),
+        expected_filled,
+        "resident_bytes must count only the filled prefix, not the ceiling capacity"
+    );
+    assert!(
+        cache.resident_bytes() < naive_capacity,
+        "filled-prefix count must be strictly less than the ceiling-capacity sum \
+         (the inflation the live-KV accounting fix removes)"
+    );
+}
+
 /// Two separately populated `KvCache` instances (simulating two model
 /// layers) sum correctly.
 #[test]

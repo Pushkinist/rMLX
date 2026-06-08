@@ -288,6 +288,33 @@ are not currently routed through the ring (mlx-lm's reference keeps SWA bf16
 too — `RotatingKVCache.to_quantized` raises), but the SWA layers are bf16 by
 default (§5.7), so the bound applies on every shipping SWA configuration.
 
+### `resident_bytes` counts the live-inference KV (filled prefix, not ceiling)
+
+`KvCache::resident_bytes()` reports the bytes of the K/V that **actually serves
+decode** — the *filled* prefix of each buffer, not its pre-allocated capacity.
+This matters because the per-position decode mirrors (`decode_fp16_k/v`, and the
+sole bf16/f32 storage on the `KvQuant::None` path) are allocated to the
+`--max-ctx` ceiling and only compacted to the filled length *after*
+`exit_prefill` / decode-time reclaim. Naively summing the whole allocation made
+the same `(model, prompt, KV quant)` cell report different totals depending on
+when the metric was read (ceiling vs compacted), and made `kv_cache_bytes`
+depend on the chosen ceiling rather than the prompt — so a high `--max-ctx`
+inflated the reported KV even for a short prompt.
+
+To keep the figure consistent and comparable for bytes-per-KV-token /
+tokens-per-KV-GB, the seq-scaled buffers are counted by their filled length
+(`offset`, clamped to the buffer capacity) at each buffer's real per-position
+size (shape × dtype, so per-layer head_dim differences — e.g. the windowed
+layers' `head_dim` vs the full-attention layers' larger `head_dim` — and the
+real decode dtype are both picked up). Quantized storage is already compacted at
+`exit_prefill`, so it is counted as-is. The windowed ring is already bounded to
+the window (above), so clamping is a no-op once the ring has filled.
+
+The prompt-cache snapshot (a deep clone of every layer cache, held per slot in
+the arch prompt cache) is **never** part of this sum — the store sites iterate
+only the active decode caches. So `kv_cache_bytes` means live-inference KV on
+every arch, with or without a prompt-cache snapshot resident.
+
 ### Per-request `max_ctx` override (issue #26)
 
 Because the ceiling is resolved **per request** (`kv_max_seq_and_ceiling`), it

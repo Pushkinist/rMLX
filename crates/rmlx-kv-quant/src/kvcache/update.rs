@@ -2397,29 +2397,37 @@ impl KvCache {
         kv_bytes + seed_bytes
     }
 
-    /// Actual on-device bytes held by this KV cache at the current call-site.
+    /// Live-inference KV resident bytes held by this cache at the call-site.
     ///
-    /// Returns the sum of every buffer currently allocated on this cache:
+    /// Reports the bytes of the K/V that actually serves decode — the *filled*
+    /// prefix of each buffer, not its pre-allocated capacity. The bf16 decode
+    /// mirrors (`decode_fp16_k/v`) are sized to the max-context ceiling, so the
+    /// seq-scaled buffers are counted by their filled length (`offset`,
+    /// clamped to the buffer's capacity) rather than the whole allocation.
+    /// This keeps the figure consistent across contexts and configurations so
+    /// bytes-per-KV-token is comparable: a run with a large ceiling no longer
+    /// reports more KV than its active cache. Sums:
     ///
     /// - **Quantized storage** (`KvStorage::resident_bytes`): packed codes,
-    ///   scales, rotation buffers, etc. for all codec variants. Returns 0 for
+    ///   scales, rotation buffers, etc. for all codec variants. Already
+    ///   compacted to the filled length at `exit_prefill`. Returns 0 for
     ///   `KvStorage::None` (bf16 buffers live in `decode_fp16_k/v` below).
     /// - **fp16 decode seeds** (`decode_fp16_k`, `decode_fp16_v`): warm-TTFT
     ///   bf16 mirrors present on quantized paths; also the sole storage for
-    ///   `KvStorage::None` (bf16).
+    ///   `KvStorage::None` (bf16). Counted by filled length, not capacity.
     /// - **Rotating SWA ring** (`rotating`): pre-allocated bf16 `[B, kv_h,
-    ///   window, D]` buffer used by SWA layers, sized to the sliding window.
+    ///   window, D]` buffer used by SWA layers; counted by filled length
+    ///   (≤ the sliding window).
     /// - **TurboFlash head-major buffers** (`flash_k_codes/scales`,
     ///   `flash_v_codes/scales`): lazy copy of the K/V cache in head-major
     ///   layout for the TurboFlash MSL SDPA kernel.
     /// - **Fused-QK shadow** (`fused_qk_shadow`): head-major K shadow used by
     ///   fused-QK dispatch (q8, turbo3/4-sym, iso3/4-sym, rotor3/4-sym, …).
     ///
-    /// Unlike [`approx_bytes`], this does **not** use a formula: it reads the
-    /// actual `Array` shape × dtype from every live buffer. For GPU-backed
-    /// codecs this reflects the paged allocation size, which is rounded up to
-    /// the nearest page; for CPU-backed codecs (IsoQuant, RotorQuant) it is
-    /// the exact heap bytes of the backing `Vec`s.
+    /// Unlike [`approx_bytes`], the per-position size comes from the actual
+    /// `Array` shape × dtype of each live buffer (picking up per-layer head_dim
+    /// differences, e.g. windowed vs full-attention layers), scaled by the
+    /// filled length rather than a quant-bit formula.
     ///
     /// Returns 0 when the cache has never been used (`offset == 0` and no
     /// buffers are allocated). Safe to call at any point — no FFI eval, no
@@ -2432,24 +2440,57 @@ impl KvCache {
             n * a.dtype().itemsize() as u64
         }
 
-        // 1. Quantized storage (codec-specific buffers; None → 0).
+        // Helper: bytes of the *filled* prefix of a `[B, kv_h, seq, D]` decode
+        // buffer. These per-position mirrors are pre-allocated to the
+        // max-context ceiling (full `max_seq`) and compacted to the filled
+        // length only after `exit_prefill`/decode reclaim — so the same config
+        // reports different totals depending on when the metric is read. Only
+        // `offset` positions ever hold live K/V that decode reads. Counting the
+        // whole ceiling-sized buffer inflates the live-inference KV total and
+        // makes bytes-per-KV-token incomparable across contexts (a run with a
+        // high ceiling reports far more than its active cache). Scale by the
+        // filled length, using each buffer's real per-position size (shape ×
+        // dtype, so per-layer head_dim and dtype are picked up), so the figure
+        // is the KV that serves decode regardless of read timing.
+        #[inline]
+        #[allow(
+            clippy::indexing_slicing,
+            reason = "indices 0..=3 are bounds-checked by the `s.len() != 4` early return above"
+        )]
+        fn filled_seq_bytes(a: &Array, filled: u64) -> u64 {
+            let s = a.shape();
+            if s.len() != 4 {
+                return ab(a);
+            }
+            let per_pos = s[0] as u64 * s[1] as u64 * s[3] as u64 * a.dtype().itemsize() as u64;
+            let cap = s[2] as u64;
+            per_pos * filled.min(cap)
+        }
+
+        let offset = self.offset.max(0) as u64;
+
+        // 1. Quantized storage (codec-specific buffers; None → 0). Already
+        //    compacted to the filled length at `exit_prefill`.
         let mut total = self.storage.resident_bytes();
 
         // 2. fp16 decode seeds (KvQuant::None bf16 storage lives here too).
+        //    Count only the filled prefix, not the ceiling-sized allocation.
         if let Some(ref k) = self.decode_fp16_k {
-            total += ab(k);
+            total += filled_seq_bytes(k, offset);
         }
         if let Some(ref v) = self.decode_fp16_v {
-            total += ab(v);
+            total += filled_seq_bytes(v, offset);
         }
 
-        // 3. Rotating SWA ring buffer (bf16, sized to sliding window).
+        // 3. Rotating SWA ring buffer (bf16, sized to the sliding window). The
+        //    ring holds at most `window` live positions; early in a sequence
+        //    only `offset` are filled. Both are already ≤ the window allocation.
         if let Some(ref rot) = self.rotating {
             if let Some(ref k) = rot.keys {
-                total += ab(k);
+                total += filled_seq_bytes(k, offset);
             }
             if let Some(ref v) = rot.values {
-                total += ab(v);
+                total += filled_seq_bytes(v, offset);
             }
         }
 

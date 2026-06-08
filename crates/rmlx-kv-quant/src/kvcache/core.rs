@@ -363,6 +363,18 @@ impl KvCache {
         super::update::storage_max_seq(&self.storage)
     }
 
+    /// Test-only mutator: plant pre-allocated bf16 decode K/V buffers (sized to
+    /// a capacity that may exceed the filled length) and set the filled
+    /// `offset`. Lets `resident_bytes` tests reproduce the on-device case where
+    /// the bf16 decode mirror is allocated to the max-context ceiling but only
+    /// `offset` positions hold live K/V.
+    #[cfg(test)]
+    pub fn inject_decode_fp16_for_test(&mut self, k: Array, v: Array, offset: i32) {
+        self.decode_fp16_k = Some(k);
+        self.decode_fp16_v = Some(v);
+        self.offset = offset;
+    }
+
     /// Test-only accessor: borrow the internal `decode_fp16_v` Option.
     ///
     /// Used by tests to assert the bf16 V seed stays live even when the K seed
