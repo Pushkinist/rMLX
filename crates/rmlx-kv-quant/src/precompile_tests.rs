@@ -92,10 +92,10 @@ fn v_only_iso_rotor_families_are_cpu_fallback_with_reason() {
 #[test]
 fn k_only_iso_families_are_metal_on_gpu() {
     // `IsoKOnly3/4` have NO bf16 decode-seed early-return: `update_iso_k_only_*`
-    // dispatches the iso{3,4} MSL kernel every decode step on GPU. The verdict
-    // must be `None` (Metal) — they must NOT be hard-rejected under
-    // They are still skipped by the q8 precompile because
-    // their K kernel is iso MSL, not q8 (`is_k_only_iso_rotor`).
+    // dispatches the iso{3,4} MSL kernel every decode step on GPU, so the verdict
+    // must be `None` (Metal) — not classified CPU-hot-path. They are still skipped
+    // by the q8 precompile because their K kernel is iso MSL, not q8
+    // (`is_k_only_iso_rotor`).
     for kq in [KvQuant::IsoKOnly3, KvQuant::IsoKOnly4] {
         assert!(
             kq.cpu_hot_path_reason().is_none(),
