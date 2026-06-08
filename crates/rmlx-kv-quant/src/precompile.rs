@@ -1,4 +1,4 @@
-//! Issue #36: deterministic load-time MSL precompile for KV codecs.
+//! Deterministic load-time MSL precompile for KV codecs.
 //!
 //! Custom Metal kernels in this crate compile **lazily** — `MetalKernel::new`
 //! only registers the kernel; MLX compiles the MSL → Metal pipeline on the
@@ -50,7 +50,7 @@ use crate::KvQuant;
 ///
 /// Best-effort: a warm dispatch failure is logged at `warn!` and returns
 /// `Ok(())` — a failed precompile must not abort model load (the kernel will
-/// simply compile lazily on first use, the pre-#36 behaviour).
+/// simply compile lazily on first use, the previous lazy-compile behaviour).
 #[allow(
     clippy::cognitive_complexity,
     reason = "linear sequence of early-return guards (device / carries_msl / cpu_hot_path / shape-alignment) plus two best-effort warm calls; splitting the guards into helpers would add indirection without reducing local complexity"
@@ -88,7 +88,7 @@ pub fn precompile_kv_codec_msl(
     // `cpu_hot_path_reason()` is `None`), but their K side is the iso/rotor MSL
     // kernel, NOT the shared q8_0 K kernel that `warm_q8` below compiles. Warming
     // q8 for them would compile the wrong shader and miss the real one; their
-    // iso/rotor K kernel compiles lazily on first prefill (the pre-#36 behaviour).
+    // iso/rotor K kernel compiles lazily on first prefill (lazy-compile path).
     if kq.is_k_only_iso_rotor() {
         tracing::debug!(
             kv_quant = %kq,
@@ -194,7 +194,7 @@ fn gcd_usize(mut a: usize, mut b: usize) -> usize {
 ///
 /// The TurboQuant/PlanarQuant V kernels require `head_dim % 32 == 0`; when the
 /// warm buffer's last axis is not 32-aligned the V warm is skipped (the kernel
-/// will compile lazily on first real use, same as pre-#36).
+/// will compile lazily on first real use, same as the lazy-compile path).
 #[allow(
     clippy::wildcard_enum_match_arm,
     reason = "the wildcard arm is the contract: codecs whose V encode is q8 (K8V8), CPU-forced (turbo3/turbo2/tcq/planar3), or CPU-only (iso/rotor, skipped before this call) have no extra V shader to warm here. Exhaustive expansion would add a no-op arm per future variant for no semantic gain."

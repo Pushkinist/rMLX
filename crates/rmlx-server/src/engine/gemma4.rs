@@ -173,9 +173,9 @@ impl Gemma4Generator {
             },
         )?;
 
-        // Issue #36: deterministically warm the resolved KV codec's MSL kernels
-        // during this load (preload) window so the first user request does not
-        // pay a shader cold-compile. General per-codec (keyed off
+        // Deterministically warm the resolved KV codec's MSL kernels during
+        // this load (preload) window so the first user request does not pay a
+        // shader cold-compile. General per-codec (keyed off
         // `KvQuant::carries_msl`); a no-op for `none`/affine and for the
         // CPU-hot-path iso/rotor families (nothing to warm). Best-effort: a warm
         // failure logs and proceeds (the kernel compiles lazily on first use).

@@ -433,7 +433,7 @@ input/output `mlx_vector_array` handles, dispatches via
 `mlx_fast_metal_kernel_apply`, extracts output `Array` handles, and returns
 them.
 
-**Lazy compile (issue #36).** `MetalKernel::new` only *registers* the kernel
+**Lazy compile.** `MetalKernel::new` only *registers* the kernel
 with MLX; the MSL → Metal pipeline compiles on the **first `apply()`
 dispatch**, not at `new`. For KV codecs this means the shader cold-compile lands
 inside the first user request unless it is warmed earlier. The KV layer warms

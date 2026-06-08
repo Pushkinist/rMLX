@@ -542,7 +542,7 @@ impl KvQuant {
         }
     }
 
-    /// Issue #36: true when this codec dispatches at least one custom Metal
+    /// True when this codec dispatches at least one custom Metal
     /// (MSL) kernel on its production hot path, so its shaders pay a one-time
     /// cold-compile on first dispatch.
     ///
@@ -597,7 +597,7 @@ impl KvQuant {
         }
     }
 
-    /// Issue #36: `Some(reason)` when this codec runs its V (and, for the K-only
+    /// `Some(reason)` when this codec runs its V (and, for the K-only
     /// / symmetric variants, K) **encode + dequant on the CPU** on the default
     /// production hot path — i.e. it falls through to the dequant-then-SDPA
     /// legacy path with a host-side scalar codec rather than a Metal kernel.
@@ -620,10 +620,9 @@ impl KvQuant {
     ///   live [`crate::rotor_qjl::rotor_qjl_enabled`] gate so the verdict tracks
     ///   the dispatcher.
     ///
-    /// The `Some(reason)` cases are the issue-#36 30–60× first-forward slowdown
-    /// and the monotonic decode decay as KV grows. The reject under
-    /// `RMLX_STRICT_METAL_KV=1` keys off this verdict, so a `None` here MUST mean
-    /// a Metal kernel demonstrably dispatches on the hot path — never an
+    /// The `Some(reason)` cases are the source of the 30–60× first-forward
+    /// slowdown and the monotonic decode decay as KV grows. A `None` here MUST
+    /// mean a Metal kernel demonstrably dispatches on the hot path — never an
     /// assumption.
     ///
     /// Returns `None` for codecs whose hot path is genuinely Metal (q8_0 K +
@@ -633,7 +632,7 @@ impl KvQuant {
     /// Exhaustive on purpose (no wildcard) so a new variant must be classified.
     #[allow(
         clippy::match_same_arms,
-        reason = "the K-only iso arm returns None like the Metal arm but is kept separate on purpose: it is the load-bearing #36 honesty classification (a Metal kernel dispatches, distinct from the genuinely-Metal q8/turbo codecs and from the QJL-gated rotor arm). Merging it would erase the per-codec verdict this function exists to document."
+        reason = "the K-only iso arm returns None like the Metal arm but is kept separate to document the per-codec Metal-vs-CPU verdict this fn exists for: a Metal kernel dispatches for the K-only iso codec, distinct from the genuinely-Metal q8/turbo codecs and from the QJL-gated rotor arm. Merging the arms would erase that distinction."
     )]
     pub fn cpu_hot_path_reason(&self) -> Option<&'static str> {
         match self {
@@ -652,8 +651,7 @@ impl KvQuant {
             // dispatches the real iso{3,4} MSL encode kernel; IsoKOnly3 also runs
             // the iso3 MSL dequant kernel. This is a Metal hot path (a hybrid —
             // the dequant restages the growing prefix host-side each step — but a
-            // Metal kernel demonstrably dispatches, so it is NOT a CPU-only codec
-            // and must not be hard-rejected under RMLX_STRICT_METAL_KV).
+            // Metal kernel demonstrably dispatches, so it is NOT a CPU-only codec).
             KvQuant::IsoKOnly3 | KvQuant::IsoKOnly4 => None,
             // V-only rotor variants and the rotor-K-asym variants early-return to
             // the bf16 decode seed at decode (`decode_fp16_k.is_some()`), so the
@@ -873,8 +871,8 @@ impl KvQuant {
 
     /// Estimated **net byte saving** of running this codec versus plain bf16 on
     /// a single layer, given its attributes. Positive = the codec saves memory;
-    /// **negative = the codec costs more memory than bf16** (the issue #34
-    /// net-negative condition).
+    /// **negative = the codec costs more memory than bf16** (the net-negative
+    /// condition).
     ///
     /// `is_windowed` layers always run the bf16 rotating ring regardless of the
     /// codec flag (mlx-lm `RotatingKVCache.to_quantized` raises

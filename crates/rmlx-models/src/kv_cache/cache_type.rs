@@ -7,7 +7,7 @@
 //! Implemented: enum + parser + inline tests.
 //! Not yet: Resolver, ResolverContext, ResolveError.
 //!
-//! ## Codec-parameter audit (Task 1 findings — kept as ground truth)
+//! ## Codec-parameter audit (kept as ground truth)
 //!
 //! The claims below were verified by reading the source symbols listed in the
 //! "Symbol inspected" columns. No assumptions were carried forward from the
@@ -563,8 +563,8 @@ impl CacheType {
 /// Per-side KV cache type specification, holding one [`CacheType`] for K and
 /// one for V.
 ///
-/// Parsed from `--cache-type-k` / `--cache-type-v` (Task 12).
-/// Resolved to a concrete [`super::KvQuant`] by the resolver (Task 3).
+/// Parsed from `--cache-type-k` / `--cache-type-v`.
+/// Resolved to a concrete [`super::KvQuant`] by the resolver.
 #[allow(
     clippy::exhaustive_structs,
     reason = "internal closed struct — two codec fields (K, V); adding a side requires updating resolve() and all cache-type CLI parsing"
@@ -834,28 +834,6 @@ pub enum ResolveError {
     QwenMoeTurboKRejected {
         /// The KvQuant `Display` form that triggered the guard.
         variant: String,
-    },
-
-    /// Issue #36 — the resolved codec runs its KV encode + dequant on the CPU
-    /// on the default hot path (the iso / rotor families) and `RMLX_STRICT_METAL_KV=1`
-    /// is set, so the resolver refuses it rather than serving 30–60× slower than a
-    /// Metal codec. `reason` carries the per-family explanation
-    /// ([`KvQuant::cpu_hot_path_reason`]).
-    ///
-    /// Without the strict env-var these codecs are *not* rejected — they are
-    /// still functional and produce correct output — but `validate_resolved`
-    /// emits a loud structured `warn!` so the CPU cost is never silent.
-    #[error(
-        "KV codec '{variant}' has no Metal hot path on this build and \
-         RMLX_STRICT_METAL_KV=1 rejects CPU-only KV codecs: {reason}. \
-         Use a Metal codec (e.g. '--kv-quant k8v4', 'k8v8', 'planar', or \
-         'rot_k_tq4v'), or unset RMLX_STRICT_METAL_KV to run it on CPU."
-    )]
-    CpuOnlyKvCodec {
-        /// The KvQuant `Display` form that runs on CPU (e.g. `"rotor3"`, `"iso3"`).
-        variant: String,
-        /// The per-family reason from [`KvQuant::cpu_hot_path_reason`].
-        reason: &'static str,
     },
 
     // The former `SharedKvIncompatibleWithMixed` variant was removed.
@@ -1640,46 +1618,24 @@ pub fn validate_resolved(arch_class: &str, kq: &KvQuant) -> Result<(), ResolveEr
         }
     }
 
-    // Issue #36 — general (arch-agnostic) Metal-vs-CPU classification. Codecs
-    // whose KV encode + dequant run on the CPU on the default hot path (the
-    // iso / rotor families) are honestly surfaced here: a loud structured warn
-    // so the 30–60× cost is never silent, and a hard reject only under the
-    // opt-in `RMLX_STRICT_METAL_KV=1` (these codecs still produce correct
-    // output, so they are not rejected by default — only flagged).
+    // General (arch-agnostic) Metal-vs-CPU classification. Codecs whose KV
+    // encode + dequant run on the CPU on the default hot path (the iso / rotor
+    // families) are honestly surfaced here with a loud structured warn so the
+    // 30–60× cost is never silent. These codecs still produce correct output
+    // and are not rejected — only flagged.
     if let Some(reason) = kq.cpu_hot_path_reason() {
-        if strict_metal_kv() {
-            tracing::warn!(
-                arch = arch_class,
-                kv_quant = %kq,
-                reason,
-                "rejecting CPU-only KV codec — RMLX_STRICT_METAL_KV=1"
-            );
-            return Err(ResolveError::CpuOnlyKvCodec {
-                variant: format!("{kq}"),
-                reason,
-            });
-        }
         tracing::warn!(
             arch = arch_class,
             kv_quant = %kq,
             reason,
             "KV codec runs its encode + dequant on CPU on the default hot path — \
-             expect a slow first forward and decode that slows as KV grows. This is \
-             NOT a Metal kernel. Set RMLX_STRICT_METAL_KV=1 to reject CPU-only KV \
-             codecs, or pick a Metal codec (k8v4 / k8v8 / planar / rot_k_tq4v)."
+             expect a slow first forward and decode that slows as KV grows. \
+             This is NOT a Metal kernel. \
+             Pick a Metal codec (k8v4 / k8v8 / planar / rot_k_tq4v) to avoid this."
         );
     }
 
     Ok(())
-}
-
-/// Issue #36 — whether the resolver should hard-reject CPU-only KV codecs.
-///
-/// Opt-in via `RMLX_STRICT_METAL_KV=1`. Default OFF: CPU codecs are functional
-/// (correct output, just slow) so they are warned-about, not rejected, unless
-/// the operator explicitly opts into a Metal-only policy.
-fn strict_metal_kv() -> bool {
-    matches!(std::env::var("RMLX_STRICT_METAL_KV").as_deref(), Ok("1"))
 }
 
 // ── resolve ───────────────────────────────────────────────────────────────────
@@ -1687,7 +1643,7 @@ fn strict_metal_kv() -> bool {
 /// Resolve a user-supplied [`CacheTypeSpec`] against a [`ResolverContext`] and
 /// a base `auto` [`KvQuant`] (typically from `KvCacheBuilder::resolve_default`).
 ///
-/// Steps, in order (see plan Task 3 for the full spec):
+/// Steps, in order:
 /// 1. `head_dim` required (else `HeadDimUnknown`).
 /// 2. K-side rotation rejected (`KSideRotationCodec`).
 /// 3. Each non-`Auto` side checked for affine group-divisibility (§D6.1) and

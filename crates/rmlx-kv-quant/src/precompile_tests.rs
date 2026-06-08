@@ -1,10 +1,10 @@
-//! Tests for issue #36 load-time MSL precompile + codec classification.
+//! Tests for load-time MSL precompile + codec classification.
 //!
 //! These are CPU-only / classification tests — they assert the precompile
 //! entrypoint is a no-op for `none` and for CPU-hot-path codecs, and that the
 //! `carries_msl` / `cpu_hot_path_reason` classifiers are internally consistent.
-//! The actual Metal warm dispatch is exercised by the on-device proof in the
-//! issue-#36 report, not here (no Metal context in unit tests).
+//! The actual Metal warm dispatch is exercised by the on-device smoke test
+//! (no Metal context in unit tests).
 
 use super::*;
 use rmlx_mlx::Device;
@@ -94,7 +94,7 @@ fn k_only_iso_families_are_metal_on_gpu() {
     // `IsoKOnly3/4` have NO bf16 decode-seed early-return: `update_iso_k_only_*`
     // dispatches the iso{3,4} MSL kernel every decode step on GPU. The verdict
     // must be `None` (Metal) — they must NOT be hard-rejected under
-    // RMLX_STRICT_METAL_KV. They are still skipped by the q8 precompile because
+    // They are still skipped by the q8 precompile because
     // their K kernel is iso MSL, not q8 (`is_k_only_iso_rotor`).
     for kq in [KvQuant::IsoKOnly3, KvQuant::IsoKOnly4] {
         assert!(

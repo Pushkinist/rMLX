@@ -120,13 +120,13 @@ of the active `KvQuant`: they use `RotatingState` (a ring-buffer bf16 path
 ported from mlx-lm's `RotatingKVCache`). `mlx-lm.to_quantized` raises
 `NotImplementedError` for rotating caches; rMLX matches that behaviour.
 
-### Per-layer net-benefit decision + net-negative warn (issue #34)
+### Per-layer net-benefit decision + net-negative warn
 
 Because SWA layers already run the bf16 ring (above), the per-layer
 quantization decision is implicit: **windowed layers are bf16, global
 (full-attention) layers are quantized**. The codec is a no-op on windowed
-layers and can never make them larger — the issue #34 "skip quant on tiny
-windowed layers" gate is therefore already satisfied by the rotating-ring
+layers and can never make them larger — the "skip quant on tiny windowed
+layers" condition is therefore already satisfied by the rotating-ring
 exemption, not by an extra gate.
 
 The residual net-negative is on the **global** layers. A quantized global
@@ -182,7 +182,7 @@ net-positive at large context and do not warn.
   rotation/residual buffers. This is the value recorded in `kv_cache_bytes`
   metrics observations and returned by `rmlx baseline`.
 
-### Per-request hot-swap (issue #26)
+### Per-request hot-swap
 
 The `KvQuant` for a request is **not** tied to the model load. A running
 `rmlx serve` accepts a per-request `kv_quant` field (OpenAI route) that selects
@@ -214,7 +214,7 @@ block-hash seed alongside the SSD `layout_key`. See `docs/PROMPT_CACHE.md`
 
 ---
 
-## Metal-vs-CPU hot path + load-time MSL precompile (issue #36)
+## Metal-vs-CPU hot path + load-time MSL precompile
 
 Two orthogonal codec attributes drive startup behaviour. Both are exhaustive
 matches on `KvQuant` (`crates/rmlx-kv-quant/src/quant.rs`) — a new variant must
@@ -247,7 +247,7 @@ be classified or the build fails.
     kernel). Hybrid — the dequant restages the growing prefix host-side and
     re-uploads via `Array::from_bytes` each step (a real, growing CPU cost) — but
     a Metal kernel demonstrably dispatches, so it is **not** "no Metal kernel",
-    and must not be hard-rejected under `RMLX_STRICT_METAL_KV`.
+    and must not be hard-rejected by the CPU-path classifier.
   * **K-only rotor** (`k_rotor3` / `k_rotor4`) → **QJL-dependent**. No bf16
     early-return; `update_rotor_k_only_{3,4}` gates the GPU K encode on
     `device == Gpu && !rotor_qjl_enabled()`. QJL **on** (default) → CPU
@@ -255,8 +255,8 @@ be classified or the build fails.
     `rotor{3,4}_gpu_append_into_k_blocks` Metal MSL encode (`None`). The verdict
     reads the live `rotor_qjl_enabled()` gate so it tracks the dispatcher.
 
-  The `Some` cases are the source of the issue-#36 30–60× first-forward slowdown
-  and the monotonic decode decay as KV grows.
+  The `Some` cases are the source of the 30–60× first-forward slowdown and the
+  monotonic decode decay as KV grows.
 
 ### Per-codec verdict
 
@@ -287,7 +287,7 @@ lazily on first prefill. It warms the shared q8_0 K-side kernels for every q8-K
 MSL codec, plus the tq4 / planar V kernel for `k8v4` / `rot_k_tq4v` / `planar`.
 Best-effort — a warm failure logs
 `warn!` and proceeds (the kernel then compiles lazily on first use, the
-pre-#36 behaviour). Wired into `Gemma4Generator::from_snapshot_with_id` (the
+previous lazy-compile behaviour). Wired into `Gemma4Generator::from_snapshot_with_id` (the
 single server-side generator factory all archs route through).
 
 ### CPU-codec classification at resolve time
@@ -295,13 +295,11 @@ single server-side generator factory all archs route through).
 `rmlx_models::kv_cache::validate_resolved` (alias `validate_resolved_kv_quant`)
 runs the arch-agnostic Metal-vs-CPU check after the Qwen-MoE guards. When the
 resolved codec is CPU-hot-path (`cpu_hot_path_reason()` is `Some`) it emits a
-loud structured `warn!` naming the codec + reason so the cost is never silent. A
-hard reject (`ResolveError::CpuOnlyKvCodec`) fires **only** under the opt-in
-`RMLX_STRICT_METAL_KV=1` — these codecs still produce correct output, so the
-default is warn-and-proceed, not reject. Because the reject keys off the verdict,
-the K-only iso (`k_iso3/4`) and QJL-off rotor (`k_rotor3/4`) codecs — Metal on
-the hot path — are **accepted** under strict-metal; only genuine CPU-hot-path
-codecs are rejected. Set `RMLX_STRICT_METAL_KV=1` for a Metal-only KV policy.
+loud structured `warn!` naming the codec + reason so the cost is never silent.
+These codecs still produce correct output — the classifier is warn-and-proceed
+only. The K-only iso (`k_iso3/4`) and QJL-off rotor (`k_rotor3/4`) codecs have
+`cpu_hot_path_reason() == None` (Metal on the hot path) and are unaffected by the
+warn.
 
 ---
 

@@ -52,8 +52,7 @@ fn kv_bitwidth_matrix_resolves() {
     // - 4-bit packs 8 vals/u32 → head_dim % 8 == 0 (128 OK).
     // - 3-bit packs 10 vals/u32 → head_dim % 10 == 0 → 128 is REJECTED;
     // needs a multiple of lcm(64,10)=320. This is a pre-existing rMLX
-    // guard (see `mlx_bit_packing_violation_q3_g64_on_unfriendly_head_dim`),
-    // not introduced by .
+    // guard (see `mlx_bit_packing_violation_q3_g64_on_unfriendly_head_dim`).
     // So 2/4 are asserted at head_dim=128 (Bonsai); 3 and the 3.5-bit
     // fractional endpoints (K3/V4) at head_dim=320.
     let arch = "Qwen3ForCausalLM";
@@ -1268,84 +1267,47 @@ fn validate_resolved_non_moe_iso_k_side_passes() {
     }
 }
 
-/// Issue #36 — Metal-vs-CPU classification in `validate_resolved`.
+/// Metal-vs-CPU classification in `validate_resolved` (warn-only).
 ///
-/// Single test (no second test mutates `RMLX_STRICT_METAL_KV`) so the
-/// process-global env toggle is not racy under parallel test threads:
-/// - non-strict default: CPU-hot-path iso / rotor V-only codecs resolve `Ok`
-///   (warn-only, not rejected); Metal codecs resolve `Ok`.
-/// - strict (`RMLX_STRICT_METAL_KV=1`): iso / rotor V-only codecs hard-reject
-///   with `CpuOnlyKvCodec` naming the variant; Metal codecs still pass.
+/// CPU-hot-path iso / rotor V-only codecs resolve `Ok` — the classifier emits
+/// a warn but never rejects. Metal codecs also resolve `Ok`.
 #[test]
 #[allow(
     clippy::unwrap_used,
-    reason = "test intentionally asserts both Ok (unwrap) and the reject (unwrap_err)"
-)]
-#[allow(
-    clippy::wildcard_enum_match_arm,
-    reason = "test asserts the CpuOnlyKvCodec arm only; the catch-all panics on any other variant"
+    reason = "test asserts Ok for all paths — unwrap surfaces an unexpected reject"
 )]
 fn validate_resolved_cpu_codec_classification() {
-    std::env::remove_var("RMLX_STRICT_METAL_KV");
-
-    // Non-strict: nothing is rejected.
+    // CPU-hot-path codecs (iso/rotor V-only families): warn-and-proceed,
+    // never rejected.
     for kq in [
         KvQuant::Iso3,
         KvQuant::Rotor3,
         KvQuant::Iso4,
         KvQuant::Rotor4,
-        KvQuant::K8V4,
-        KvQuant::Planar,
-        KvQuant::RotKTq4V,
     ] {
         validate_resolved("Gemma4ForConditionalGeneration", &kq)
-            .unwrap_or_else(|e| panic!("non-strict resolve must pass for {kq}: {e}"));
+            .unwrap_or_else(|e| panic!("CPU-hot-path codec must resolve Ok for {kq}: {e}"));
     }
 
-    // Strict: V-only iso/rotor CPU codecs reject; Metal codecs pass.
-    std::env::set_var("RMLX_STRICT_METAL_KV", "1");
-    for kq in [KvQuant::Iso3, KvQuant::Rotor3] {
-        let err = validate_resolved("Gemma4ForConditionalGeneration", &kq).unwrap_err();
-        match err {
-            ResolveError::CpuOnlyKvCodec { ref variant, .. } => {
-                assert_eq!(variant, &kq.to_string(), "must name the offending codec");
-            }
-            other => panic!("expected CpuOnlyKvCodec for {kq}, got {other:?}"),
-        }
+    // Metal codecs resolve Ok.
+    for kq in [KvQuant::K8V4, KvQuant::Planar, KvQuant::RotKTq4V] {
+        validate_resolved("Gemma4ForConditionalGeneration", &kq)
+            .unwrap_or_else(|e| panic!("Metal codec must resolve Ok for {kq}: {e}"));
     }
-    validate_resolved("Gemma4ForConditionalGeneration", &KvQuant::K8V4).unwrap();
-    validate_resolved("Gemma4ForConditionalGeneration", &KvQuant::RotKTq4V).unwrap();
-    // #36 review: K-only iso codecs dispatch the iso K MSL kernel every decode
-    // step — they are Metal (cpu_hot_path_reason None), so strict-metal must NOT
-    // reject them.
+
+    // K-only iso codecs dispatch the iso K MSL kernel every decode step — they
+    // are Metal (cpu_hot_path_reason returns None) and must resolve Ok.
     for kq in [KvQuant::IsoKOnly3, KvQuant::IsoKOnly4] {
         validate_resolved("Gemma4ForConditionalGeneration", &kq)
-            .unwrap_or_else(|e| panic!("strict-metal must accept K-only iso codec {kq}: {e}"));
+            .unwrap_or_else(|e| panic!("K-only iso codec must resolve Ok for {kq}: {e}"));
     }
-    // #36 review: rotor K-only is QJL-aware. Under this test's default process
-    // env (QJL on by default unless a sibling test set RMLX_ROTOR_QJL/CLI), the
-    // verdict equals `cpu_hot_path_reason().is_some()`. Rather than toggle the
-    // rotor-QJL process-global from here (it lives in rmlx-kv-quant with its own
-    // lock; the QJL-state matrix is unit-tested there in precompile_tests), assert
-    // the rmlx-models reject path is a faithful pass-through of the codec verdict:
-    // strict-metal rejects iff `cpu_hot_path_reason()` is `Some`.
+
+    // K-only rotor codec verdict is QJL-dependent; in either case
+    // validate_resolved must return Ok (no reject path).
     for kq in [KvQuant::RotorKOnly3, KvQuant::RotorKOnly4] {
-        let verdict_is_cpu = kq.cpu_hot_path_reason().is_some();
-        let res = validate_resolved("Gemma4ForConditionalGeneration", &kq);
-        if verdict_is_cpu {
-            match res.unwrap_err() {
-                ResolveError::CpuOnlyKvCodec { ref variant, .. } => {
-                    assert_eq!(variant, &kq.to_string(), "must name the offending codec");
-                }
-                other => panic!("QJL-on {kq}: expected CpuOnlyKvCodec, got {other:?}"),
-            }
-        } else {
-            res.unwrap_or_else(|e| {
-                panic!("QJL-off {kq} is Metal (None) — strict-metal must accept: {e}")
-            });
-        }
+        validate_resolved("Gemma4ForConditionalGeneration", &kq)
+            .unwrap_or_else(|e| panic!("K-only rotor codec must resolve Ok for {kq}: {e}"));
     }
-    std::env::remove_var("RMLX_STRICT_METAL_KV");
 }
 
 /// Iso3Sym combo_to_kv_quant: (IsoK3, Iso3) maps to Iso3Sym.
