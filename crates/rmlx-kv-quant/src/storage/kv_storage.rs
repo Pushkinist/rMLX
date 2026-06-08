@@ -1686,13 +1686,21 @@ impl KvStorage {
 ///
 /// GPU path: `gpu_codes_buf` (u32) + `gpu_scales_buf` (f32) — sized to
 /// `gpu_capacity`, not just `offset`. CPU path: `codes` (u8) + `scales` (f32).
+///
+/// NOTE: After an SSD-hydrate init the GPU mirror is live (`gpu_codes_buf =
+/// Some`) *and* the pre-hydration CPU `codes`/`scales` are still resident in
+/// RAM (the hydrate upload path never clears them). Both allocations are
+/// counted.
 fn quant_k_bytes(qk: Option<&QuantK>) -> u64 {
     let Some(qk) = qk else {
         return 0;
     };
     if let Some(ref codes) = qk.gpu_codes_buf {
         let scales_bytes = qk.gpu_scales_buf.as_ref().map_or(0, array_nbytes);
-        array_nbytes(codes) + scales_bytes
+        // Add any coexisting CPU residual (pre-hydration data not cleared on
+        // GPU-mirror init; see `QuantK::append_inner` hydrated-init block).
+        let cpu_residual = qk.codes.len() as u64 + qk.scales.len() as u64 * 4;
+        array_nbytes(codes) + scales_bytes + cpu_residual
     } else {
         // CPU path: codes = Vec<u8>, scales = Vec<f32>
         qk.codes.len() as u64 + qk.scales.len() as u64 * 4
@@ -1704,13 +1712,23 @@ fn quant_k_bytes(qk: Option<&QuantK>) -> u64 {
 /// GPU path: `gpu_codes_buf` (u32) + `gpu_scales_buf` (f32). CPU path: sum of
 /// `TurboBlocks` — each block has `codes: Vec<u8>` (1 B/elem) and
 /// `scales: Vec<f32>` (4 B/elem).
+///
+/// NOTE: After an SSD-hydrate init the GPU mirror is live and the pre-hydration
+/// CPU `blocks` are still resident in RAM. Both are counted.
 fn quant_v_bytes(qv: Option<&QuantV>) -> u64 {
     let Some(qv) = qv else {
         return 0;
     };
     if let Some(ref codes) = qv.gpu_codes_buf {
         let scales_bytes = qv.gpu_scales_buf.as_ref().map_or(0, array_nbytes);
-        array_nbytes(codes) + scales_bytes
+        // Add any coexisting CPU residual (pre-hydration blocks not cleared on
+        // GPU-mirror init; see `QuantV::append_inner` hydrated-init block).
+        let cpu_residual: u64 = qv
+            .blocks
+            .iter()
+            .map(|b| b.codes.len() as u64 + b.scales.len() as u64 * 4)
+            .sum();
+        array_nbytes(codes) + scales_bytes + cpu_residual
     } else {
         // CPU path: TurboBlocks — codes: Vec<u8>, scales: Vec<f32>
         qv.blocks
@@ -1725,6 +1743,9 @@ fn quant_v_bytes(qv: Option<&QuantV>) -> u64 {
 /// GPU path: `gpu_codes_buf` (u32) + `gpu_scales_buf` (f32) +
 /// `gpu_rotations_buf` (u32). CPU path: sum of `PlanarBlocks` — each has
 /// `codes: Vec<u8>` (1 B), `scales: Vec<f32>` (4 B), `rotations: Vec<u8>` (1 B).
+///
+/// NOTE: After an SSD-hydrate init the GPU mirror is live and the pre-hydration
+/// CPU `blocks` are still resident in RAM. Both are counted.
 fn quant_planar_v_bytes(qv: Option<&QuantPlanarV>) -> u64 {
     let Some(qv) = qv else {
         return 0;
@@ -1732,7 +1753,14 @@ fn quant_planar_v_bytes(qv: Option<&QuantPlanarV>) -> u64 {
     if let Some(ref codes) = qv.gpu_codes_buf {
         let scales_bytes = qv.gpu_scales_buf.as_ref().map_or(0, array_nbytes);
         let rot_bytes = qv.gpu_rotations_buf.as_ref().map_or(0, array_nbytes);
-        array_nbytes(codes) + scales_bytes + rot_bytes
+        // Add any coexisting CPU residual (pre-hydration blocks not cleared on
+        // GPU-mirror init; see `QuantPlanarV::append` hydrated-init block).
+        let cpu_residual: u64 = qv
+            .blocks
+            .iter()
+            .map(|b| b.codes.len() as u64 + b.scales.len() as u64 * 4 + b.rotations.len() as u64)
+            .sum();
+        array_nbytes(codes) + scales_bytes + rot_bytes + cpu_residual
     } else {
         qv.blocks
             .iter()
@@ -1744,6 +1772,9 @@ fn quant_planar_v_bytes(qv: Option<&QuantPlanarV>) -> u64 {
 /// PlanarQuant K buffer (`QuantPlanarK`), used for `PlanarK` variant.
 ///
 /// Same buffer layout as `QuantPlanarV` — GPU or CPU with codes/scales/rotations.
+///
+/// NOTE: After an SSD-hydrate init the GPU mirror is live and the pre-hydration
+/// CPU `blocks` are still resident in RAM. Both are counted.
 fn quant_planar_k_bytes(qk: Option<&QuantPlanarK>) -> u64 {
     let Some(qk) = qk else {
         return 0;
@@ -1751,7 +1782,14 @@ fn quant_planar_k_bytes(qk: Option<&QuantPlanarK>) -> u64 {
     if let Some(ref codes) = qk.gpu_codes_buf {
         let scales_bytes = qk.gpu_scales_buf.as_ref().map_or(0, array_nbytes);
         let rot_bytes = qk.gpu_rotations_buf.as_ref().map_or(0, array_nbytes);
-        array_nbytes(codes) + scales_bytes + rot_bytes
+        // Add any coexisting CPU residual (pre-hydration blocks not cleared on
+        // GPU-mirror init; see `QuantPlanarK::append` hydrated-init block).
+        let cpu_residual: u64 = qk
+            .blocks
+            .iter()
+            .map(|b| b.codes.len() as u64 + b.scales.len() as u64 * 4 + b.rotations.len() as u64)
+            .sum();
+        array_nbytes(codes) + scales_bytes + rot_bytes + cpu_residual
     } else {
         qk.blocks
             .iter()
@@ -1779,13 +1817,23 @@ fn mixed_kv_state_bytes(state: &crate::mixed_quant::MixedKvState) -> u64 {
 ///
 /// GPU path: `gpu_codes_buf` (u32) + `gpu_scales_buf` (f32).
 /// CPU path: sum of `TurboBlocks`.
+///
+/// NOTE: After an SSD-hydrate init the GPU mirror is live and the pre-hydration
+/// CPU `blocks` are still resident in RAM. Both are counted.
 fn quant_k_turbo3_bytes(qk: Option<&QuantKTurbo3>) -> u64 {
     let Some(qk) = qk else {
         return 0;
     };
     if let Some(ref codes) = qk.gpu_codes_buf {
         let scales_bytes = qk.gpu_scales_buf.as_ref().map_or(0, array_nbytes);
-        array_nbytes(codes) + scales_bytes
+        // Add any coexisting CPU residual (pre-hydration blocks not cleared on
+        // GPU-mirror init; see `QuantKTurbo3::append` hydrated-init block).
+        let cpu_residual: u64 = qk
+            .blocks
+            .iter()
+            .map(|b| b.codes.len() as u64 + b.scales.len() as u64 * 4)
+            .sum();
+        array_nbytes(codes) + scales_bytes + cpu_residual
     } else {
         qk.blocks
             .iter()
@@ -1797,13 +1845,23 @@ fn quant_k_turbo3_bytes(qk: Option<&QuantKTurbo3>) -> u64 {
 /// TurboQuant 4-bit K buffer (`QuantKTurbo4`).
 ///
 /// Same buffer layout as `QuantKTurbo3` — GPU codes/scales or CPU TurboBlocks.
+///
+/// NOTE: After an SSD-hydrate init the GPU mirror is live and the pre-hydration
+/// CPU `blocks` are still resident in RAM. Both are counted.
 fn quant_k_turbo4_bytes(qk: Option<&QuantKTurbo4>) -> u64 {
     let Some(qk) = qk else {
         return 0;
     };
     if let Some(ref codes) = qk.gpu_codes_buf {
         let scales_bytes = qk.gpu_scales_buf.as_ref().map_or(0, array_nbytes);
-        array_nbytes(codes) + scales_bytes
+        // Add any coexisting CPU residual (pre-hydration blocks not cleared on
+        // GPU-mirror init; see `QuantKTurbo4::append` hydrated-init block).
+        let cpu_residual: u64 = qk
+            .blocks
+            .iter()
+            .map(|b| b.codes.len() as u64 + b.scales.len() as u64 * 4)
+            .sum();
+        array_nbytes(codes) + scales_bytes + cpu_residual
     } else {
         qk.blocks
             .iter()
@@ -1818,6 +1876,11 @@ fn quant_k_turbo4_bytes(qk: Option<&QuantKTurbo4>) -> u64 {
 /// `gpu_scales_buf` (f32) + `gpu_norms_buf` (f32). CPU path: sum of
 /// `IsoBlocks` — each has `codes: Vec<u32>` (4 B), `scales: Vec<f32>` (4 B),
 /// `quaternions: Vec<f32>` (4 B), `norms: Vec<f32>` (4 B).
+///
+/// NOTE: `QuantIsoV3::gpu_offset` advances independently from `blocks` when
+/// CPU-only blocks are also appended, e.g. after an SSD-hydrate fallback
+/// (see `quant_iso_v.rs` field doc on `gpu_offset`). Both GPU-mirror and any
+/// coexisting CPU `blocks` are resident simultaneously, so both are counted.
 fn quant_iso_v3_bytes(qv: Option<&QuantIsoV3>) -> u64 {
     let Some(qv) = qv else {
         return 0;
@@ -1826,7 +1889,20 @@ fn quant_iso_v3_bytes(qv: Option<&QuantIsoV3>) -> u64 {
     if let Some(ref codes) = qv.gpu_codes_buf {
         let scales_bytes = qv.gpu_scales_buf.as_ref().map_or(0, array_nbytes);
         let norms_bytes = qv.gpu_norms_buf.as_ref().map_or(0, array_nbytes);
-        return array_nbytes(codes) + scales_bytes + norms_bytes;
+        // Add any coexisting CPU residual (blocks can be non-empty under a live
+        // GPU mirror after an SSD-hydrate fallback — gpu_offset advances
+        // independently; CPU blocks remain resident).
+        let cpu_residual: u64 = qv
+            .blocks
+            .iter()
+            .map(|b| {
+                b.codes.len() as u64 * 4
+                    + b.scales.len() as u64 * 4
+                    + b.quaternions.len() as u64 * 4
+                    + b.norms.len() as u64 * 4
+            })
+            .sum();
+        return array_nbytes(codes) + scales_bytes + norms_bytes + cpu_residual;
     }
     // CPU path.
     qv.blocks

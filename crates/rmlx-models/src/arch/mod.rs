@@ -1205,9 +1205,12 @@ impl Architecture {
     /// Laguna, Qwen3VlMoe).
     pub fn kv_cache_bytes(&self) -> u64 {
         match self {
-            Architecture::Gemma4(_) | Architecture::Gemma3(_) => {
-                crate::gemma4::gemma4_kv_cache_bytes()
-            }
+            Architecture::Gemma4(_) => crate::gemma4::gemma4_kv_cache_bytes(),
+            // NOTE: Gemma3 has its own generate path (`crate::gemma3::generate_greedy`)
+            // that does NOT call `store_kv_cache_bytes`, so `gemma4_kv_cache_bytes()`
+            // always returns 0 (or the last Gemma4 value if both were loaded in the
+            // same process). Gemma3 KV byte reporting is not yet wired.
+            Architecture::Gemma3(_) => 0,
             Architecture::Qwen3_5Moe(_) => crate::qwen3_5_moe::qwen3_5_moe_kv_cache_bytes(),
             Architecture::Qwen3(_) => crate::qwen3::read_kv_cache_bytes(),
             Architecture::Qwen2(_)

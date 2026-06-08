@@ -416,7 +416,6 @@ pub(crate) fn run_baseline(
         ("baseline_prefill_tps", "tok/s", prefill_tps),
         ("baseline_prompt_tokens", "count", prompt_token_count as f64),
         ("baseline_peak_rss_mb", "MB", rss_mb),
-        ("baseline_kv_cache_bytes", "bytes", kv_cache_bytes as f64),
     ];
 
     for (op, unit, value) in metrics_data {
@@ -430,6 +429,22 @@ pub(crate) fn run_baseline(
             notes: &notes_truncated,
         })
         .map_err(|e| anyhow::anyhow!("metrics record {op}: {e}"))?;
+    }
+
+    // Emit kv_cache_bytes only when non-zero (un-wired archs return 0; omitting
+    // them matches the `build_run_record` gate and prevents a spurious
+    // "measured 0-byte KV" row in the events table).
+    if kv_cache_bytes > 0 {
+        sink.record(&rmlx_metrics::events::Measurement {
+            model_path: &abs_path_str,
+            quant_mode: &quant_mode,
+            stage: "baseline",
+            op: "baseline_kv_cache_bytes",
+            value_unit: "bytes",
+            value: kv_cache_bytes as f64,
+            notes: &notes_truncated,
+        })
+        .map_err(|e| anyhow::anyhow!("metrics record baseline_kv_cache_bytes: {e}"))?;
     }
 
     // -- Append to metrics/baseline.csv ---------------------------------------
