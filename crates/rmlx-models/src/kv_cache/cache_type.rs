@@ -7,7 +7,7 @@
 //! Implemented: enum + parser + inline tests.
 //! Not yet: Resolver, ResolverContext, ResolveError.
 //!
-//! ## Codec-parameter audit (Task 1 findings — kept as ground truth)
+//! ## Codec-parameter audit (kept as ground truth)
 //!
 //! The claims below were verified by reading the source symbols listed in the
 //! "Symbol inspected" columns. No assumptions were carried forward from the
@@ -563,8 +563,8 @@ impl CacheType {
 /// Per-side KV cache type specification, holding one [`CacheType`] for K and
 /// one for V.
 ///
-/// Parsed from `--cache-type-k` / `--cache-type-v` (Task 12).
-/// Resolved to a concrete [`super::KvQuant`] by the resolver (Task 3).
+/// Parsed from `--cache-type-k` / `--cache-type-v`.
+/// Resolved to a concrete [`super::KvQuant`] by the resolver.
 #[allow(
     clippy::exhaustive_structs,
     reason = "internal closed struct — two codec fields (K, V); adding a side requires updating resolve() and all cache-type CLI parsing"
@@ -1618,6 +1618,23 @@ pub fn validate_resolved(arch_class: &str, kq: &KvQuant) -> Result<(), ResolveEr
         }
     }
 
+    // General (arch-agnostic) Metal-vs-CPU classification. Codecs whose KV
+    // encode + dequant run on the CPU on the default hot path (the iso / rotor
+    // families) are honestly surfaced here with a loud structured warn so the
+    // 30–60× cost is never silent. These codecs still produce correct output
+    // and are not rejected — only flagged.
+    if let Some(reason) = kq.cpu_hot_path_reason() {
+        tracing::warn!(
+            arch = arch_class,
+            kv_quant = %kq,
+            reason,
+            "KV codec runs its encode + dequant on CPU on the default hot path — \
+             expect a slow first forward and decode that slows as KV grows. \
+             This is NOT a Metal kernel. \
+             Pick a Metal codec (k8v4 / k8v8 / planar / rot_k_tq4v) to avoid this."
+        );
+    }
+
     Ok(())
 }
 
@@ -1626,7 +1643,7 @@ pub fn validate_resolved(arch_class: &str, kq: &KvQuant) -> Result<(), ResolveEr
 /// Resolve a user-supplied [`CacheTypeSpec`] against a [`ResolverContext`] and
 /// a base `auto` [`KvQuant`] (typically from `KvCacheBuilder::resolve_default`).
 ///
-/// Steps, in order (see plan Task 3 for the full spec):
+/// Steps, in order:
 /// 1. `head_dim` required (else `HeadDimUnknown`).
 /// 2. K-side rotation rejected (`KSideRotationCodec`).
 /// 3. Each non-`Auto` side checked for affine group-divisibility (§D6.1) and

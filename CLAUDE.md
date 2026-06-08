@@ -196,12 +196,21 @@ Hard rules:
 - **Advisory: `make file-size-report`** prints files >1000 LOC. Non-failing.
   Also runs at the end of `make ci` (advisory, non-blocking).
 
+## Comments and identifiers (hard rule)
+
+Code comments, identifiers, log/error/reason strings must be **general** — never
+reference task/issue/PR/review numbers (`// #36 review:`, `// fix for #32`).
+Ticket traceability lives in git history, commit messages, and PR descriptions,
+not in source. A comment must still read correctly and be useful once the ticket
+is gone.
+
 ## Simplicity rules (hard)
 
 1. **Readability first.** Match existing style. Plain names. No clever macros, no trait towers, no premature generics.
 2. **No over-engineering.** Build what task needs. No speculative abstractions, no single-use traits, no "configurable" knobs that have one caller.
 3. **Straight-forward core backend.** Inference path is sequential, sync, explicit. Async only at HTTP/file-I/O boundaries (already in coding style above).
 4. **Inline beats premature factoring.** Extract to a function/module only when 2+ real callers exist. Three similar lines is better than a wrong abstraction.
+5. **No env-gated one-caller knobs.** Prefer a fixed default or a CLI flag with a real second caller. Env vars are invisible config — each is a support and repro burden. Keep the existing env surface minimal; new env vars need explicit justification (and are an "Ask before" item).
 
 ## Common commands (Makefile)
 
@@ -357,6 +366,7 @@ The build-by-failure rule is in §Hard rules rule 9 — do not duplicate it here
 - Removing a smoke-probe / safety check.
 - Bypassing the single-process claim file.
 - Deleting or truncating anything under `<RMLX_HOME>/metrics/` (the size-cap log rotation in `<RMLX_HOME>/logs/` is automatic and does not require asking).
+- Adding a new environment variable or runtime config knob.
 
 ## What "0.1.0 done" looks like
 
