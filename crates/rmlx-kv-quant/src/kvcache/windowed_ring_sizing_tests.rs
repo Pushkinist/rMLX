@@ -31,9 +31,9 @@ use super::core::KvCache;
 use crate::KvQuant;
 use rmlx_mlx::{Array, Device, Dtype};
 
-// SWA layer shape for Gemma4 e2b/e4b: kv_h=1 (kv-shared sliding layers vary by
-// variant, but the per-token byte arithmetic is linear in kv_h so the verdict
-// is shape-independent). head_dim=256 is the Gemma4 SWA head_dim.
+// SWA layer shape for Gemma4 e2b/e4b: kv_h=1 baseline; kv_h=2 tested by
+// `windowed_ring_flat_across_ctx_kv_h2` (confirms the "linear in kv_h" claim).
+// head_dim=256 is the Gemma4 SWA head_dim.
 const B: i32 = 1;
 const KV_H: i32 = 1;
 const D: i32 = 256;
@@ -90,39 +90,46 @@ fn bf16_ramp(seq: i32, base: i32) -> Array {
 /// shot (mlx-lm RotatingKVCache only trims on the SECOND+ `update_and_fetch`).
 const PREFILL_CHUNK: i32 = 512;
 
-/// Drive a cache through a chunked prefill of `ctx` tokens, mirroring the real
-/// generate loop (`prefill_ids.chunks(prefill_chunk)`), then exit prefill.
-#[allow(
-    clippy::unwrap_used,
-    reason = "test — panics are the intended failure mode"
-)]
-fn chunked_prefill(cache: &mut KvCache, ctx: i32, device: Device) {
-    cache.enter_prefill();
-    let mut pos = 0;
-    while pos < ctx {
-        let s = PREFILL_CHUNK.min(ctx - pos);
-        let k = bf16_zeros(s);
-        let v = bf16_zeros(s);
-        cache.update(&k, &v, device).unwrap();
-        pos += s;
-    }
-    cache.exit_prefill(device).unwrap();
-}
-
 /// Resident bytes of a WINDOWED (rotating) cache after prefilling `ctx` tokens.
 /// Mirrors the Gemma4 SWA-layer construction:
 /// `KvCache::with_quant_max_seq_window(quant, initial_max_seq, Some(window))`.
+///
+/// Uses the module-level `KV_H=1` shape.
 #[allow(
     clippy::unwrap_used,
     reason = "test — panics are the intended failure mode"
 )]
 fn windowed_bytes_after_prefill(ctx: i32) -> u64 {
+    windowed_bytes_after_prefill_kv_h(ctx, KV_H)
+}
+
+/// Parameterised variant of [`windowed_bytes_after_prefill`] that lets the
+/// caller vary `kv_h` independently of the module-level constant. Used to
+/// assert that the flat-across-ctx property holds for `kv_h > 1` (linearity
+/// by construction: `resident_bytes` counts the shape product `B×kv_h×rows×D`).
+#[allow(
+    clippy::unwrap_used,
+    reason = "test — panics are the intended failure mode"
+)]
+fn windowed_bytes_after_prefill_kv_h(ctx: i32, kv_h: i32) -> u64 {
     let device = Device::Cpu;
     // initial_max_seq is the lazy default; the rotating path ignores it and
     // sizes to `window`. quant is recorded but unused on the rotating path
     // (SWA stays bf16 regardless — mlx-lm RotatingKVCache.to_quantized raises).
     let mut cache = KvCache::with_quant_max_seq_window(KvQuant::K8V8, 4096, Some(WINDOW));
-    chunked_prefill(&mut cache, ctx, device);
+    // Drive chunked prefill using arrays shaped [B, kv_h, chunk, D].
+    cache.enter_prefill();
+    let mut pos = 0;
+    while pos < ctx {
+        let s = PREFILL_CHUNK.min(ctx - pos);
+        let n = (B * kv_h * s * D) as usize;
+        let bytes = vec![0u8; n * 2];
+        let k = Array::from_bytes(&bytes, &[B, kv_h, s, D], Dtype::Bf16).unwrap();
+        let v = Array::from_bytes(&bytes, &[B, kv_h, s, D], Dtype::Bf16).unwrap();
+        cache.update(&k, &v, device).unwrap();
+        pos += s;
+    }
+    cache.exit_prefill(device).unwrap();
     cache.resident_bytes()
 }
 
@@ -198,6 +205,63 @@ fn windowed_ring_stays_bounded_while_global_grows() {
         g64 >= w64 * 50,
         "at 64k the global cache ({g64}) must be >=50x the windowed ring ({w64}) — \
          confirms windowed KV does not scale with context"
+    );
+
+    // Flatness / equality pin (docs/KV_CACHE.md §4.6).
+    //
+    // docs/KV_CACHE.md documents the windowed ring as FLAT at exactly
+    // 1,047,552 bytes for kv_h=1, head_dim=256, window=512.  Pin the live
+    // measurement against that value so a silent bloat (still under
+    // `window_cap_bytes`) can't escape this test.
+    let w4 = windowed_bytes_after_prefill(4_096);
+    assert_eq!(
+        w4, 1_047_552,
+        "windowed ring at 4k must equal the documented flat bound \
+         1,047,552 B (docs/KV_CACHE.md §4.6)"
+    );
+    assert_eq!(
+        windowed_bytes_after_prefill(16_384),
+        w4,
+        "windowed ring must be flat (identical bytes) across ctx 4k→16k \
+         (docs/KV_CACHE.md §4.6)"
+    );
+    assert_eq!(
+        windowed_bytes_after_prefill(65_536),
+        w4,
+        "windowed ring must be flat (identical bytes) across ctx 4k→64k \
+         (docs/KV_CACHE.md §4.6)"
+    );
+}
+
+/// Verify the flat-across-ctx property holds for `kv_h=2` (the documented
+/// "linear in kv_h" claim, now a tested fact).
+///
+/// `resident_bytes` counts the full shape product `B×kv_h×rows×D×2`, so
+/// doubling `kv_h` must exactly double the flat bound, and the result must
+/// still be perfectly flat across 4k/16k/64k.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test — panics are the intended failure mode"
+)]
+fn windowed_ring_flat_across_ctx_kv_h2() {
+    let w4 = windowed_bytes_after_prefill_kv_h(4_096, 2);
+    // kv_h=2 doubles every element count → exactly 2× the kv_h=1 flat bound.
+    assert_eq!(
+        w4,
+        1_047_552 * 2,
+        "kv_h=2 windowed ring at 4k must equal 2× the kv_h=1 flat bound \
+         (linearity: resident_bytes ∝ kv_h)"
+    );
+    assert_eq!(
+        windowed_bytes_after_prefill_kv_h(16_384, 2),
+        w4,
+        "kv_h=2 windowed ring must be flat across ctx 4k→16k"
+    );
+    assert_eq!(
+        windowed_bytes_after_prefill_kv_h(65_536, 2),
+        w4,
+        "kv_h=2 windowed ring must be flat across ctx 4k→64k"
     );
 }
 
