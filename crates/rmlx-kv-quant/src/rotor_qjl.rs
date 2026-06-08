@@ -68,6 +68,14 @@ pub fn rotor_qjl_enabled() -> bool {
     }
 }
 
+/// `true` when the CLI override (`install_rotor_qjl`) has been installed in this
+/// process. Test-only helper: lets cross-module tests that toggle the env var
+/// detect the CLI shadow and skip the env-based assertions.
+#[cfg(test)]
+pub(crate) fn rotor_qjl_cli_is_set() -> bool {
+    ROTOR_QJL_CLI.get().is_some()
+}
+
 #[cfg(test)]
 #[path = "rotor_qjl_tests.rs"]
 mod rotor_qjl_tests;

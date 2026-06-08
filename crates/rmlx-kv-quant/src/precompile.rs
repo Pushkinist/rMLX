@@ -15,9 +15,13 @@
 //! the deterministic preload window rather than on the first request.
 //!
 //! The warm is **general per-codec**, keyed off [`KvQuant::carries_msl`] — never
-//! an arch name. It is a no-op for `none` and for the CPU-hot-path codecs
-//! (iso / rotor families, see [`KvQuant::cpu_hot_path_reason`]) whose production
-//! encode + dequant run on CPU and therefore have no shader to warm.
+//! an arch name. It is a no-op for `none` and for the CPU-hot-path codecs (the
+//! V-only iso / rotor families and QJL-on rotor-K, see
+//! [`KvQuant::cpu_hot_path_reason`]) whose production encode + dequant run on
+//! CPU and therefore have no q8 shader to warm here. The K-only iso / rotor
+//! codecs ARE Metal on the hot path but dispatch the iso/rotor MSL kernel for K
+//! (not the shared q8_0 K kernel this module warms), so they are also skipped
+//! ([`KvQuant::is_k_only_iso_rotor`]) and compile lazily on first prefill.
 
 use rmlx_core::error::Result;
 use rmlx_mlx::{Array, Device, Dtype};
@@ -34,9 +38,12 @@ use crate::KvQuant;
 /// Behaviour:
 /// - `device != Gpu` → no-op (CPU runs have no Metal pipeline to compile).
 /// - codec does not carry MSL (`none`) → no-op.
-/// - CPU-hot-path codec (iso / rotor) → no-op (its encode/dequant is CPU; the
-///   GPU encoder, when present, is opt-in via `RMLX_FUSED_QK` and not on the
-///   default path — warming it would not change the production first-forward).
+/// - CPU-hot-path codec (V-only iso / rotor, QJL-on rotor-K) → no-op (its
+///   encode/dequant is CPU; the GPU fused-QK encoder, when present, is opt-in
+///   via `RMLX_FUSED_QK` and not on the default path).
+/// - K-only iso / rotor codec (`is_k_only_iso_rotor`) → no-op here (Metal on the
+///   hot path, but its K kernel is the iso/rotor MSL kernel, not the shared q8_0
+///   K kernel this module warms; it compiles lazily on first prefill).
 /// - otherwise → warm the shared q8_0 K-side kernels (every MSL-carrying KV
 ///   codec quantizes K with q8_0) plus, where applicable, the codec's V-side
 ///   GPU kernel.
@@ -57,6 +64,14 @@ pub fn precompile_kv_codec_msl(
     if device != Device::Gpu {
         return Ok(());
     }
+    if head_dim == 0 {
+        // Degenerate config (arch did not report head_dim). The shape math
+        // below would build a 0-element warm array and dispatch q8 on an empty
+        // buffer — a silent, useless dispatch. Skip; the kernel compiles lazily
+        // on first real use.
+        tracing::debug!(kv_quant = %kq, "precompile_kv_codec_msl: skip — head_dim unknown (0)");
+        return Ok(());
+    }
     if !kq.carries_msl() {
         tracing::debug!(kv_quant = %kq, "precompile_kv_codec_msl: codec carries no MSL — skip");
         return Ok(());
@@ -66,6 +81,19 @@ pub fn precompile_kv_codec_msl(
             kv_quant = %kq,
             reason,
             "precompile_kv_codec_msl: CPU-hot-path codec — no shader to warm, skip"
+        );
+        return Ok(());
+    }
+    // K-only iso / rotor codecs are Metal on the hot path (so
+    // `cpu_hot_path_reason()` is `None`), but their K side is the iso/rotor MSL
+    // kernel, NOT the shared q8_0 K kernel that `warm_q8` below compiles. Warming
+    // q8 for them would compile the wrong shader and miss the real one; their
+    // iso/rotor K kernel compiles lazily on first prefill (the pre-#36 behaviour).
+    if kq.is_k_only_iso_rotor() {
+        tracing::debug!(
+            kv_quant = %kq,
+            "precompile_kv_codec_msl: K-only iso/rotor codec — K kernel is iso/rotor MSL, \
+             not q8; lazy-compile on first prefill, skip q8 warm"
         );
         return Ok(());
     }

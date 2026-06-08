@@ -1302,7 +1302,7 @@ fn validate_resolved_cpu_codec_classification() {
             .unwrap_or_else(|e| panic!("non-strict resolve must pass for {kq}: {e}"));
     }
 
-    // Strict: CPU codecs reject; Metal codecs pass.
+    // Strict: V-only iso/rotor CPU codecs reject; Metal codecs pass.
     std::env::set_var("RMLX_STRICT_METAL_KV", "1");
     for kq in [KvQuant::Iso3, KvQuant::Rotor3] {
         let err = validate_resolved("Gemma4ForConditionalGeneration", &kq).unwrap_err();
@@ -1315,6 +1315,36 @@ fn validate_resolved_cpu_codec_classification() {
     }
     validate_resolved("Gemma4ForConditionalGeneration", &KvQuant::K8V4).unwrap();
     validate_resolved("Gemma4ForConditionalGeneration", &KvQuant::RotKTq4V).unwrap();
+    // #36 review: K-only iso codecs dispatch the iso K MSL kernel every decode
+    // step — they are Metal (cpu_hot_path_reason None), so strict-metal must NOT
+    // reject them.
+    for kq in [KvQuant::IsoKOnly3, KvQuant::IsoKOnly4] {
+        validate_resolved("Gemma4ForConditionalGeneration", &kq)
+            .unwrap_or_else(|e| panic!("strict-metal must accept K-only iso codec {kq}: {e}"));
+    }
+    // #36 review: rotor K-only is QJL-aware. Under this test's default process
+    // env (QJL on by default unless a sibling test set RMLX_ROTOR_QJL/CLI), the
+    // verdict equals `cpu_hot_path_reason().is_some()`. Rather than toggle the
+    // rotor-QJL process-global from here (it lives in rmlx-kv-quant with its own
+    // lock; the QJL-state matrix is unit-tested there in precompile_tests), assert
+    // the rmlx-models reject path is a faithful pass-through of the codec verdict:
+    // strict-metal rejects iff `cpu_hot_path_reason()` is `Some`.
+    for kq in [KvQuant::RotorKOnly3, KvQuant::RotorKOnly4] {
+        let verdict_is_cpu = kq.cpu_hot_path_reason().is_some();
+        let res = validate_resolved("Gemma4ForConditionalGeneration", &kq);
+        if verdict_is_cpu {
+            match res.unwrap_err() {
+                ResolveError::CpuOnlyKvCodec { ref variant, .. } => {
+                    assert_eq!(variant, &kq.to_string(), "must name the offending codec");
+                }
+                other => panic!("QJL-on {kq}: expected CpuOnlyKvCodec, got {other:?}"),
+            }
+        } else {
+            res.unwrap_or_else(|e| {
+                panic!("QJL-off {kq} is Metal (None) — strict-metal must accept: {e}")
+            });
+        }
+    }
     std::env::remove_var("RMLX_STRICT_METAL_KV");
 }
 
