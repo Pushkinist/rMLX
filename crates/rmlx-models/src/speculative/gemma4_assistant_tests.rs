@@ -118,8 +118,6 @@ fn bias_all_allowed_when_window_covers_kv() {
 // Exercises the plain-head path (centroids None) for 26B/31B assistants.
 // ---------------------------------------------------------------------------
 
-use crate::layers::{Embedding, Linear, RmsNorm};
-
 #[allow(
     clippy::expect_used,
     reason = "test fixture: tiny constant-shape arrays, any failure is a test bug"
