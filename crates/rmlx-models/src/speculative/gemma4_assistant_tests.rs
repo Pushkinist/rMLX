@@ -112,3 +112,100 @@ fn bias_all_allowed_when_window_covers_kv() {
     let bias = window_bias(0, 1, 4, 64);
     assert!(bias.iter().all(|v| allowed(*v)));
 }
+
+// ---------------------------------------------------------------------------
+// Plain tied-head LM head — full-vocab argmax over h @ embed_tokens.T.
+// Exercises the plain-head path (centroids None) for 26B/31B assistants.
+// ---------------------------------------------------------------------------
+
+use crate::layers::{Embedding, Linear, RmsNorm};
+
+#[allow(
+    clippy::expect_used,
+    reason = "test fixture: tiny constant-shape arrays, any failure is a test bug"
+)]
+fn mk_f32(data: &[f32], shape: &[i32]) -> Array {
+    let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 4) };
+    Array::from_bytes(bytes, shape, Dtype::F32).expect("f32 array")
+}
+
+/// Build a minimal plain-head drafter: only `embed_tokens`, `draft_hidden`,
+/// `device`, and `centroids = None` are load-bearing for `plain_argmax`. The
+/// remaining fields are dummies never touched by the head.
+fn plain_head_drafter(embed_weight: Array, draft_hidden: usize) -> Gemma4AssistantDrafter {
+    let dummy_lin = || Linear::Plain {
+        weight: mk_f32(&[0.0], &[1, 1]),
+    };
+    let dummy_norm = RmsNorm {
+        weight: None,
+        eps: 1e-6,
+    };
+    Gemma4AssistantDrafter {
+        embed_tokens: Embedding::Plain {
+            weight: embed_weight,
+        },
+        pre_projection: dummy_lin(),
+        post_projection: dummy_lin(),
+        norm: dummy_norm,
+        layers: Vec::new(),
+        centroids: None,
+        token_ordering: None,
+        draft_hidden,
+        backbone_hidden: 1,
+        n_heads: 1,
+        sliding_window: 1,
+        rope_sliding_theta: 10000.0,
+        num_centroids: 1,
+        centroid_top_k: 1,
+        vocab_per_centroid: 1,
+        device: Device::Cpu,
+    }
+}
+
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test: .expect on tiny fixtures, failure is a test bug"
+)]
+fn plain_argmax_picks_max_dot_product_token() {
+    // embed_tokens: vocab=4, draft_hidden=3. Token 2's row aligns best with h.
+    let draft_hidden = 3usize;
+    let embed = mk_f32(
+        &[
+            1.0, 0.0, 0.0, // token 0
+            0.0, 1.0, 0.0, // token 1
+            5.0, 5.0, 5.0, // token 2 — largest dot with all-positive h
+            0.0, 0.0, 1.0, // token 3
+        ],
+        &[4, draft_hidden as i32],
+    );
+    let drafter = plain_head_drafter(embed, draft_hidden);
+
+    let h = mk_f32(&[1.0, 1.0, 1.0], &[1, 1, draft_hidden as i32]);
+    let tok = drafter.plain_argmax(&h).expect("plain_argmax");
+    assert_eq!(tok, 2, "max-dot-product token is 2");
+}
+
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test: .expect on tiny fixtures, failure is a test bug"
+)]
+fn plain_argmax_respects_hidden_direction() {
+    // Different h selects a different token (no centroid shortlist — full vocab).
+    let draft_hidden = 3usize;
+    let embed = mk_f32(
+        &[
+            1.0, 0.0, 0.0, // token 0
+            0.0, 1.0, 0.0, // token 1
+            0.0, 0.0, 1.0, // token 2
+        ],
+        &[3, draft_hidden as i32],
+    );
+    let drafter = plain_head_drafter(embed, draft_hidden);
+
+    // h points along the token-1 basis vector → argmax = 1.
+    let h = mk_f32(&[0.1, 9.0, 0.2], &[1, 1, draft_hidden as i32]);
+    let tok = drafter.plain_argmax(&h).expect("plain_argmax");
+    assert_eq!(tok, 1, "h aligned with token-1 basis");
+}
