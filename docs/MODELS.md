@@ -632,6 +632,16 @@ layers use `global_head_dim` (512 on 31B). Partial rotary factor applies to
 **AltUp residual.** `hidden_size_per_layer_input` enables an AltUp-style
 residual gate when non-zero.
 
+**Stream stays at the model dtype (bf16 on mxfp8).** The activation stream runs
+at the model dtype end-to-end. This matters for `--kv-quant none`: the global
+(full-attention) K/V are stored at the stream dtype, so on mxfp8 they are bf16,
+not f32 — about half the resident KV they would take if the stream widened. The
+constants that could promote the stream — the embed-scale, the per-layer-input
+scales, and the fused GeGLU / PLI-GeGLU activations (whose `gelu_tanh` constants
+are f32) — adopt / restore the operand dtype, mirroring mlx-lm's weak-typed
+Python floats. A unit-level dtype-lock test guards this against regression; see
+docs/KV_QUANT.md "Gemma4 global `--kv-quant none` KV is bf16".
+
 **Conformer audio encoder.** Present in e4b and above. The SSCP subsampling
 (two conv stages reducing the time dimension by 4×), Macaron-style FFW blocks
 with `residual_weight=0.5`, chunked local attention, and optional output

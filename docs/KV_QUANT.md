@@ -136,9 +136,11 @@ per-group scales. At small effective context the codes + scales are pure
 overhead on top of a buffer the same size as bf16, so the codec is strictly
 larger than `--kv-quant none`. Measured on Gemma4 e2b (7 global + 28 windowed
 layers, head_dim 256, 1 KV head) at a 4096-token prompt: `k8v4` ≈ 125.0 MB vs
-`none` ≈ 113.2 MB (`kv_cache_bytes`, both inflated ~2× by the prompt-cache
-snapshot which cancels in the delta) — `k8v4` is +11.7 MB on the global layers,
-zero delta on the windowed layers.
+`none` ≈ 113.2 MB (`kv_cache_bytes`) — `k8v4` is +11.7 MB on the global layers,
+zero delta on the windowed layers. (These figures predate the global-`none`
+bf16 fix below, where the global `none` K/V were resident as f32; the +11.7 MB
+codec-vs-`none` delta is the same conclusion — the codec adds scales + seed on
+top of the global buffer — and the warn math is unaffected.)
 
 rMLX emits one structured `warn!` at request build time when the resolved codec
 is estimated to increase resident KV vs bf16 on the active layer mix:
@@ -170,6 +172,36 @@ numerics); the warn just surfaces the byte math so `--kv-quant none` is an
 informed option when memory is the goal. Seed-free codecs (the K-only
 re-quantize families, `feeds_bf16_k_at_decode == false`) cross over to
 net-positive at large context and do not warn.
+
+### Gemma4 global `--kv-quant none` KV is bf16 (was f32)
+
+On the mxfp8 path Gemma4 previously ran its whole attention + FFN stream in
+f32, so the global (full-attention) `--kv-quant none` K **and** V were resident
+as f32 (4 B/elem) — roughly **2× the bf16 expectation**. Only the global layers
+grow KV with context (windowed layers are ring-bounded, already bf16), so this
+dominated KV residency on long prompts.
+
+Root cause was **model-dtype discipline**, not the codec, the RoPE freqs table,
+or RMSNorm: strong-F32 scalar constants meeting bf16 activations promoted the
+residual stream to f32, which then propagated through the Q/K/V projections,
+attention, and the global KV cache. Three sources, all matching mlx-lm's
+weak-typed Python floats now:
+
+- the embed-scale (`hidden_size**0.5`) constant,
+- the per-layer-input scales (embed / proj / inv-sqrt2),
+- the fused GeGLU / PLI-GeGLU activations, whose internal `gelu_tanh`
+  arithmetic constants are f32 and silently widen a bf16 gate.
+
+The scale constants now adopt the operand dtype, and the fused activation
+closures restore the gate dtype on their output (the cast folds into the
+compiled program, no extra launch). The stream is bf16 end-to-end, so **both**
+global K and V store as bf16.
+
+Measured (e4b mxfp8, `--kv-quant none`, ~18.5 k context): `kv_cache_bytes`
+≈ 325 MB, exactly half the prior f32 ≈ 649 MB. Decode TPS is unchanged-to-faster
+(no mixed-dtype SDPA). A unit-level dtype-lock regression test pins the fused
+activations and scale sites at bf16, so a future re-promotion of the Gemma4
+stream to f32 fails CI.
 
 **Byte accounting.** Two methods report KV-cache size:
 

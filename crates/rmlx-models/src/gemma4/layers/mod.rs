@@ -42,6 +42,10 @@ pub(super) mod moe;
 #[path = "mask_tests.rs"]
 mod mask_tests;
 
+#[cfg(test)]
+#[path = "kernels_tests.rs"]
+mod kernels_tests;
+
 // Re-exports used by decoder_layer.rs and model.rs (siblings of layers/).
 pub(super) use kernels::{geglu_fused, qk_norm_fused, softcap_fused};
 pub(super) use moe::{Gemma4Experts, Gemma4MoeBlock, Gemma4Router, PerLayerInput};
