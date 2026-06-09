@@ -191,9 +191,26 @@ pub fn quantize(
     bits: i32,
     device: Device,
 ) -> Result<(Array, Array, Array)> {
+    quantize_mode(x, group_size, bits, "affine", device)
+}
+
+/// Quantize with an explicit MLX codec mode (`"affine"`, `"mxfp8"`,
+/// `"mxfp4"`, `"nvfp4"`).
+///
+/// Same 3-tuple as [`quantize`]; the no-bias codecs (`mxfp*`/`nvfp4`) still
+/// return a `biases` array (MLX emits a placeholder) — callers that pass
+/// `None` biases to [`quantized_matmul`] / [`gather_qmm`] simply ignore it.
+/// [`quantize`] is the `"affine"` specialization.
+pub fn quantize_mode(
+    x: &Array,
+    group_size: i32,
+    bits: i32,
+    mode: &str,
+    device: Device,
+) -> Result<(Array, Array, Array)> {
     install_error_handler();
 
-    let mode_cstr = mode_to_cstr("affine", "quantize")?;
+    let mode_cstr = mode_to_cstr(mode, "quantize")?;
 
     let gs = sys::mlx_optional_int {
         value: group_size,
@@ -230,12 +247,14 @@ pub fn quantize(
     let extract_result = (|| -> Result<(Array, Array, Array)> {
         unsafe { check_status(status, "quantize") }?;
 
-        // Verify the vector has 3 entries (codes, scales, biases).
+        // Affine emits 3 entries (codes, scales, biases); the mxfp*/nvfp4
+        // codecs emit 2 (codes, scales) — biases is then left as the
+        // default-constructed empty array, which the caller discards.
         // SAFETY: vec_res is a valid mlx_vector_array on success.
         let len = unsafe { sys::mlx_vector_array_size(vec_res) };
-        if len != 3 {
+        if len != 2 && len != 3 {
             return Err(Error::Mlx(format!(
-                "quantize: expected 3-element vector_array, got {len}"
+                "quantize: expected 2- or 3-element vector_array, got {len}"
             )));
         }
 
@@ -253,10 +272,12 @@ pub fn quantize(
                 sys::mlx_vector_array_get(&raw mut scales, vec_res, 1),
                 "quantize: get scales",
             )?;
-            check_status(
-                sys::mlx_vector_array_get(&raw mut biases, vec_res, 2),
-                "quantize: get biases",
-            )?;
+            if len == 3 {
+                check_status(
+                    sys::mlx_vector_array_get(&raw mut biases, vec_res, 2),
+                    "quantize: get biases",
+                )?;
+            }
         }
         Ok((
             Array { inner: codes },

@@ -58,6 +58,20 @@ pub fn divide(a: &Array, b: &Array, device: Device) -> Result<Array> {
     Ok(Array { inner: res })
 }
 
+/// Element-wise floor division: `floor(a / b)`. Broadcasts. Integer-exact for
+/// integer inputs (unlike `divide`, which promotes to float).
+pub fn floor_divide(a: &Array, b: &Array, device: Device) -> Result<Array> {
+    install_error_handler();
+    let mut res = unsafe { sys::mlx_array_new() };
+    let status = unsafe {
+        with_stream(device, |s| {
+            sys::mlx_floor_divide(&raw mut res, a.inner, b.inner, s)
+        })
+    };
+    unsafe { check_status(status, "floor_divide") }?;
+    Ok(Array { inner: res })
+}
+
 /// Element-wise subtraction: `a - b`. Broadcasts.
 pub fn subtract(a: &Array, b: &Array, device: Device) -> Result<Array> {
     install_error_handler();
