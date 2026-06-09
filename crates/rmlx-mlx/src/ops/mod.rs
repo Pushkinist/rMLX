@@ -30,9 +30,9 @@ mod shape;
 pub use activation::{gelu, gelu_tanh, silu, softmax, softmax_precise, tanh};
 pub use arith::{
     add, argmax, argpartition, argsort, broadcast_to, clip, concatenate, divide, exp, expand_dims,
-    greater_equal, log, log1p, max_axis, multiply, negative, repeat_axis, scalar_f32, scatter_add,
-    sigmoid, softplus, sqrt, stack_axis, subtract, sum_axis, sum_axis_keepdims, take_along_axis,
-    topk, where_cond, zeros,
+    floor_divide, greater_equal, log, log1p, max_axis, multiply, negative, repeat_axis, scalar_f32,
+    scatter_add, sigmoid, softplus, sqrt, stack_axis, subtract, sum_axis, sum_axis_keepdims,
+    take_along_axis, topk, where_cond, zeros,
 };
 pub use matmul::{dequantize, gather_qmm, matmul, quantize, quantized_matmul};
 pub use shape::{arange, conv1d, conv2d, conv_transpose1d, cos, maximum, pad, sin, tril};

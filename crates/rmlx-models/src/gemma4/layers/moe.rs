@@ -5,13 +5,18 @@
 
 use rmlx_core::error::Result;
 use rmlx_mlx::{
-    argpartition, expand_dims, multiply, rms_norm, scalar_f32, softmax, sum_axis, take_along_axis,
-    Array, Device, Dtype,
+    argpartition, argsort, expand_dims, floor_divide, multiply, rms_norm, scalar_f32, softmax,
+    sum_axis, take_along_axis, Array, Device, Dtype,
 };
 
 use crate::layers::{Linear, RmsNorm};
 
 use super::kernels::{geglu_fused, pli_gelu_fused};
+
+/// Flattened `n_tokens * top_k` count at or above which the expert dispatch
+/// sorts indices for contiguous per-expert access (prefill). Below it (decode,
+/// single token) the simple broadcast path is cheaper. Matches mlx-lm SwitchGLU.
+const SORT_DISPATCH_THRESHOLD: i32 = 64;
 
 #[allow(missing_debug_implementations)]
 pub(crate) struct PerLayerInput {
@@ -195,13 +200,32 @@ impl Gemma4Experts {
         routing_weights: &Array,
         device: Device,
     ) -> Result<Array> {
+        let s = expert_indices.shape();
+        let n_tokens = s[0];
+        let tk = s[1];
+
+        // Multi-token (prefill) fast path: sort the flattened expert indices so
+        // each expert's rows are contiguous, then dispatch gather_qmm with
+        // sorted_indices=true and scatter the outputs back. Contiguous expert
+        // access lets the gathered-matmul kernel run each expert as one dense
+        // block instead of scattered per-token gathers. Mirrors mlx-lm
+        // SwitchGLU (threshold `indices.size >= 64`). Decode (n_tokens=1,
+        // tk*1 < 64) keeps the simple broadcast path below.
+        if n_tokens * tk >= SORT_DISPATCH_THRESHOLD {
+            return self.forward_sorted(x, expert_indices, routing_weights, device);
+        }
+
         // Expand x: [n, hidden] -> [n, 1, 1, hidden]
         let xe = expand_dims(x, -2, device)?; // [n, 1, hidden]
         let xe = expand_dims(&xe, -2, device)?; // [n, 1, 1, hidden]
 
         // gate: [n, tk, 1, inter]; up: same.
-        let gate_raw = self.gate_proj.gather_forward(&xe, expert_indices, device)?;
-        let up_raw = self.up_proj.gather_forward(&xe, expert_indices, device)?;
+        let gate_raw = self
+            .gate_proj
+            .gather_forward(&xe, expert_indices, false, device)?;
+        let up_raw = self
+            .up_proj
+            .gather_forward(&xe, expert_indices, false, device)?;
 
         let s = gate_raw.shape();
         let gate_3d = gate_raw.reshape(&[s[0], s[1], s[3]], device)?;
@@ -216,7 +240,9 @@ impl Gemma4Experts {
 
         // Re-expand for down_proj.
         let gd = expand_dims(&gated, -2, device)?; // [n, tk, 1, inter]
-        let out_raw = self.down_proj.gather_forward(&gd, expert_indices, device)?;
+        let out_raw = self
+            .down_proj
+            .gather_forward(&gd, expert_indices, false, device)?;
         let s = out_raw.shape();
         let out_3d = out_raw.reshape(&[s[0], s[1], s[3]], device)?; // [n, tk, hidden]
 
@@ -225,6 +251,78 @@ impl Gemma4Experts {
         let out_scaled = multiply(&out_3d, &rw, device)?;
 
         // Sum over top_k: [n, hidden].
+        sum_axis(&out_scaled, 1, device)
+    }
+
+    /// Sorted-dispatch expert forward for the multi-token (prefill) case.
+    ///
+    /// Sorts the flattened `[n*tk]` expert indices ascending, gathers the
+    /// matching x rows into expert-contiguous order, runs the three gathered
+    /// quantized matmuls with `sorted_indices=true`, then scatters the result
+    /// back to token order. Math is identical to the broadcast path; only the
+    /// memory-access order into the expert weights changes.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: index buffers sized from x/indices shapes"
+    )]
+    fn forward_sorted(
+        &self,
+        x: &Array,
+        expert_indices: &Array,
+        routing_weights: &Array,
+        device: Device,
+    ) -> Result<Array> {
+        let s = expert_indices.shape();
+        let n_tokens = s[0];
+        let tk = s[1];
+        let total = n_tokens * tk;
+        let hidden = x.shape()[1];
+
+        // order = argsort(flat_indices); inv_order = argsort(order).
+        let flat_idx = expert_indices.reshape(&[total], device)?;
+        let order = argsort(&flat_idx, device)?.astype(Dtype::I32, device)?;
+        let inv_order = argsort(&order, device)?.astype(Dtype::I32, device)?;
+
+        // Sorted expert ids: [total]. take(flat_idx, order).
+        let sorted_idx = flat_idx.take(&order, 0, device)?;
+
+        // Sorted token rows: token = order // tk; gather x rows -> [total, hidden].
+        let tk_arr = scalar_f32(tk as f32).astype(Dtype::I32, device)?;
+        let tok_of_order = floor_divide(&order, &tk_arr, device)?;
+        let x_sorted = x.take(&tok_of_order, 0, device)?; // [total, hidden]
+
+        // Shape for gather_qmm: x [total, 1, hidden] aligns its leading `total`
+        // dim with the 1-D `rhs_indices [total]` (element-wise expert per row).
+        let xe = expand_dims(&x_sorted, -2, device)?; // [total, 1, hidden]
+
+        let gate_raw = self
+            .gate_proj
+            .gather_forward(&xe, &sorted_idx, true, device)?; // [total, 1, inter]
+        let up_raw = self
+            .up_proj
+            .gather_forward(&xe, &sorted_idx, true, device)?;
+
+        let s = gate_raw.shape();
+        let gate_2d = gate_raw.reshape(&[s[0], s[2]], device)?; // [total, inter]
+        let s = up_raw.shape();
+        let up_2d = up_raw.reshape(&[s[0], s[2]], device)?;
+
+        let gated = geglu_fused(&gate_2d, &up_2d, device)?; // [total, inter]
+
+        let gd = expand_dims(&gated, -2, device)?; // [total, 1, inter]
+        let out_raw = self
+            .down_proj
+            .gather_forward(&gd, &sorted_idx, true, device)?; // [total, 1, hidden]
+        let s = out_raw.shape();
+        let out_2d = out_raw.reshape(&[s[0], s[2]], device)?; // [total, hidden]
+
+        // Scatter back to token order, then reshape to [n, tk, hidden].
+        let out_unsorted = out_2d.take(&inv_order, 0, device)?; // [total, hidden]
+        let out_3d = out_unsorted.reshape(&[n_tokens, tk, hidden], device)?;
+
+        // Scale by routing weights and sum over top_k: [n, hidden].
+        let rw = expand_dims(routing_weights, -1, device)?;
+        let out_scaled = multiply(&out_3d, &rw, device)?;
         sum_axis(&out_scaled, 1, device)
     }
 }
@@ -242,6 +340,7 @@ impl Linear {
         &self,
         x: &Array,
         rhs_indices: &Array,
+        sorted_indices: bool,
         device: Device,
     ) -> Result<Array> {
         match self {
@@ -290,7 +389,7 @@ impl Linear {
                 *group_size,
                 *bits,
                 mode.as_str(),
-                false,
+                sorted_indices,
                 device,
             ),
             // PARO layers do not appear as MoE expert projections in Gemma4 PARO (dense MoE path

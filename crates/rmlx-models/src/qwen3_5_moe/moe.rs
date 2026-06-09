@@ -10,11 +10,16 @@
 #![allow(clippy::struct_field_names)]
 use rmlx_core::error::Result;
 use rmlx_mlx::{
-    add, argpartition, divide, expand_dims, multiply, sigmoid, silu, softmax, sum_axis,
-    take_along_axis, Array, Device, Dtype,
+    add, argpartition, argsort, divide, expand_dims, floor_divide, multiply, scalar_f32, sigmoid,
+    silu, softmax, sum_axis, take_along_axis, Array, Device, Dtype,
 };
 
 use super::layers::Linear;
+
+/// Flattened `n_tokens * top_k` count at or above which the expert dispatch
+/// sorts indices for contiguous per-expert access (prefill). Below it (decode,
+/// single token) the simple broadcast path is cheaper. Matches mlx-lm SwitchGLU.
+const SORT_DISPATCH_THRESHOLD: i32 = 64;
 
 #[allow(missing_debug_implementations)]
 pub(super) struct SwitchMlp {
@@ -39,12 +44,28 @@ impl SwitchMlp {
         routing_weights: &Array,
         device: Device,
     ) -> Result<Array> {
+        let s = expert_indices.shape();
+        let n_tokens = s[0];
+        let tk = s[1];
+
+        // Multi-token (prefill) fast path: sort the flattened expert indices so
+        // each expert's rows are contiguous, then dispatch gather_qmm with
+        // sorted_indices=true and scatter the outputs back. Decode (single
+        // token) keeps the simple broadcast path below. Mirrors mlx-lm SwitchGLU.
+        if n_tokens * tk >= SORT_DISPATCH_THRESHOLD {
+            return self.forward_sorted(x, expert_indices, routing_weights, device);
+        }
+
         // Expand x: [n, hidden] -> [n, 1, 1, hidden].
         let xe = expand_dims(x, -2, device)?;
         let xe = expand_dims(&xe, -2, device)?;
 
-        let gate_raw = self.gate_proj.gather_forward(&xe, expert_indices, device)?;
-        let up_raw = self.up_proj.gather_forward(&xe, expert_indices, device)?;
+        let gate_raw = self
+            .gate_proj
+            .gather_forward(&xe, expert_indices, false, device)?;
+        let up_raw = self
+            .up_proj
+            .gather_forward(&xe, expert_indices, false, device)?;
 
         // Squeeze singleton: [n, tk, 1, inter] -> [n, tk, inter].
         let gs = gate_raw.shape();
@@ -56,7 +77,9 @@ impl SwitchMlp {
 
         // Re-expand for down_proj: [n, tk, inter] -> [n, tk, 1, inter].
         let gd = expand_dims(&gated, -2, device)?;
-        let out_raw = self.down_proj.gather_forward(&gd, expert_indices, device)?;
+        let out_raw = self
+            .down_proj
+            .gather_forward(&gd, expert_indices, false, device)?;
         let os = out_raw.shape();
         let out_3d = out_raw.reshape(&[os[0], os[1], os[3]], device)?;
 
@@ -64,6 +87,73 @@ impl SwitchMlp {
         let rw = expand_dims(routing_weights, -1, device)?;
         let out_scaled = multiply(&out_3d, &rw, device)?;
 
+        sum_axis(&out_scaled, 1, device)
+    }
+
+    /// Sorted-dispatch expert forward for the multi-token (prefill) case.
+    ///
+    /// Sorts the flattened `[n*tk]` expert indices ascending, gathers the
+    /// matching x rows into expert-contiguous order, runs the three gathered
+    /// quantized matmuls with `sorted_indices=true`, then scatters the result
+    /// back to token order. Math is identical to the broadcast path; only the
+    /// memory-access order into the expert weights changes.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: index buffers sized from x/indices shapes"
+    )]
+    fn forward_sorted(
+        &self,
+        x: &Array,
+        expert_indices: &Array,
+        routing_weights: &Array,
+        device: Device,
+    ) -> Result<Array> {
+        let s = expert_indices.shape();
+        let n_tokens = s[0];
+        let tk = s[1];
+        let total = n_tokens * tk;
+        let hidden = x.shape()[1];
+
+        let flat_idx = expert_indices.reshape(&[total], device)?;
+        let order = argsort(&flat_idx, device)?.astype(Dtype::I32, device)?;
+        let inv_order = argsort(&order, device)?.astype(Dtype::I32, device)?;
+        let sorted_idx = flat_idx.take(&order, 0, device)?;
+
+        // token = order // tk; gather x rows -> [total, hidden].
+        let tk_arr = scalar_f32(tk as f32).astype(Dtype::I32, device)?;
+        let tok_of_order = floor_divide(&order, &tk_arr, device)?;
+        let x_sorted = x.take(&tok_of_order, 0, device)?;
+
+        // x [total, 1, hidden] aligns its leading dim with rhs_indices [total].
+        let xe = expand_dims(&x_sorted, -2, device)?;
+
+        let gate_raw = self
+            .gate_proj
+            .gather_forward(&xe, &sorted_idx, true, device)?; // [total, 1, inter]
+        let up_raw = self
+            .up_proj
+            .gather_forward(&xe, &sorted_idx, true, device)?;
+
+        let gs = gate_raw.shape();
+        let gate_2d = gate_raw.reshape(&[gs[0], gs[2]], device)?; // [total, inter]
+        let us = up_raw.shape();
+        let up_2d = up_raw.reshape(&[us[0], us[2]], device)?;
+        let gate = silu(&gate_2d, device)?;
+        let gated = multiply(&gate, &up_2d, device)?;
+
+        let gd = expand_dims(&gated, -2, device)?; // [total, 1, inter]
+        let out_raw = self
+            .down_proj
+            .gather_forward(&gd, &sorted_idx, true, device)?; // [total, 1, hidden]
+        let os = out_raw.shape();
+        let out_2d = out_raw.reshape(&[os[0], os[2]], device)?; // [total, hidden]
+
+        // Scatter back to token order, then [n, tk, hidden].
+        let out_unsorted = out_2d.take(&inv_order, 0, device)?;
+        let out_3d = out_unsorted.reshape(&[n_tokens, tk, hidden], device)?;
+
+        let rw = expand_dims(routing_weights, -1, device)?;
+        let out_scaled = multiply(&out_3d, &rw, device)?;
         sum_axis(&out_scaled, 1, device)
     }
 }
