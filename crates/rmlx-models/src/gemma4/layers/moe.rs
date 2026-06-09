@@ -214,7 +214,23 @@ impl Gemma4Experts {
         if n_tokens * tk >= SORT_DISPATCH_THRESHOLD {
             return self.forward_sorted(x, expert_indices, routing_weights, device);
         }
+        self.forward_broadcast(x, expert_indices, routing_weights, device)
+    }
 
+    /// Broadcast (per-token gather) expert forward. Used for the decode /
+    /// single-token case; also the equivalence reference for `forward_sorted`
+    /// (the two produce mathematically identical output for any routing).
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: index buffers sized from x/indices shapes"
+    )]
+    fn forward_broadcast(
+        &self,
+        x: &Array,
+        expert_indices: &Array,
+        routing_weights: &Array,
+        device: Device,
+    ) -> Result<Array> {
         // Expand x: [n, hidden] -> [n, 1, 1, hidden]
         let xe = expand_dims(x, -2, device)?; // [n, 1, hidden]
         let xe = expand_dims(&xe, -2, device)?; // [n, 1, 1, hidden]
@@ -420,3 +436,7 @@ pub(crate) struct Gemma4MoeBlock {
     pub(crate) post_ffn_norm_2: RmsNorm,
     pub(crate) pre_ffn_norm_2: RmsNorm,
 }
+
+#[cfg(test)]
+#[path = "moe_tests.rs"]
+mod moe_tests;
