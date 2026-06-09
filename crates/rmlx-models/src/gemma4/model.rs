@@ -112,7 +112,15 @@ impl Gemma4Text {
 
         // Embed + scale. Mirrors forward_arr.
         let h_raw = self.embed_tokens.forward(&ids_arr, device)?;
-        let embed_scale = scalar_f32((self.cfg.hidden_size as f32).sqrt());
+        // Match mlx-lm dtype discipline: the embed-scale constant adopts the
+        // activation dtype (bf16 for mxfp8) instead of a strong-F32 scalar.
+        // A strong-F32 scalar would promote the whole residual stream to f32,
+        // which then propagates through Q/K/V projections, attention, and the
+        // global KV cache (doubling its residency on the None path). mlx-lm
+        // multiplies by a Python float (weak type) / a `mx.array(_, bf16)`,
+        // keeping the stream at the model dtype.
+        let embed_scale =
+            scalar_f32((self.cfg.hidden_size as f32).sqrt()).astype(h_raw.dtype(), device)?;
         let h = multiply(&h_raw, &embed_scale, device)?;
         let h = h.reshape(&[1, seq as i32, self.cfg.hidden_size as i32], device)?;
 
@@ -259,7 +267,15 @@ impl Gemma4Text {
     ) -> Result<Array> {
         // Embed tokens → [1, seq, hidden]; scale by hidden_size^0.5.
         let h_raw = self.embed_tokens.forward(ids_arr, device)?;
-        let embed_scale = scalar_f32((self.cfg.hidden_size as f32).sqrt());
+        // Match mlx-lm dtype discipline: the embed-scale constant adopts the
+        // activation dtype (bf16 for mxfp8) instead of a strong-F32 scalar.
+        // A strong-F32 scalar would promote the whole residual stream to f32,
+        // which then propagates through Q/K/V projections, attention, and the
+        // global KV cache (doubling its residency on the None path). mlx-lm
+        // multiplies by a Python float (weak type) / a `mx.array(_, bf16)`,
+        // keeping the stream at the model dtype.
+        let embed_scale =
+            scalar_f32((self.cfg.hidden_size as f32).sqrt()).astype(h_raw.dtype(), device)?;
         let h = multiply(&h_raw, &embed_scale, device)?;
         let h = h.reshape(&[1, seq, self.cfg.hidden_size as i32], device)?;
         self.forward_h(h, ids_arr, seq, caches, device)
@@ -436,7 +452,15 @@ impl Gemma4Text {
         let base_offset = cache_base_offset(caches.as_deref());
 
         let h_raw = self.embed_tokens.forward(ids_arr, device)?;
-        let embed_scale = scalar_f32((self.cfg.hidden_size as f32).sqrt());
+        // Match mlx-lm dtype discipline: the embed-scale constant adopts the
+        // activation dtype (bf16 for mxfp8) instead of a strong-F32 scalar.
+        // A strong-F32 scalar would promote the whole residual stream to f32,
+        // which then propagates through Q/K/V projections, attention, and the
+        // global KV cache (doubling its residency on the None path). mlx-lm
+        // multiplies by a Python float (weak type) / a `mx.array(_, bf16)`,
+        // keeping the stream at the model dtype.
+        let embed_scale =
+            scalar_f32((self.cfg.hidden_size as f32).sqrt()).astype(h_raw.dtype(), device)?;
         let h = multiply(&h_raw, &embed_scale, device)?;
         let h = h.reshape(&[1, seq, self.cfg.hidden_size as i32], device)?;
 
@@ -571,7 +595,15 @@ impl Gemma4Text {
         let base_offset = cache_base_offset(caches.as_deref());
 
         let h_raw = self.embed_tokens.forward(&ids_arr, device)?;
-        let embed_scale = scalar_f32((self.cfg.hidden_size as f32).sqrt());
+        // Match mlx-lm dtype discipline: the embed-scale constant adopts the
+        // activation dtype (bf16 for mxfp8) instead of a strong-F32 scalar.
+        // A strong-F32 scalar would promote the whole residual stream to f32,
+        // which then propagates through Q/K/V projections, attention, and the
+        // global KV cache (doubling its residency on the None path). mlx-lm
+        // multiplies by a Python float (weak type) / a `mx.array(_, bf16)`,
+        // keeping the stream at the model dtype.
+        let embed_scale =
+            scalar_f32((self.cfg.hidden_size as f32).sqrt()).astype(h_raw.dtype(), device)?;
         let h = multiply(&h_raw, &embed_scale, device)?;
         let h = h.reshape(&[1, seq, self.cfg.hidden_size as i32], device)?;
 
@@ -700,7 +732,15 @@ impl Gemma4Text {
         let base_offset = cache_base_offset(Some(caches));
 
         let h_raw = self.embed_tokens.forward(&ids_arr, device)?;
-        let embed_scale = scalar_f32((self.cfg.hidden_size as f32).sqrt());
+        // Match mlx-lm dtype discipline: the embed-scale constant adopts the
+        // activation dtype (bf16 for mxfp8) instead of a strong-F32 scalar.
+        // A strong-F32 scalar would promote the whole residual stream to f32,
+        // which then propagates through Q/K/V projections, attention, and the
+        // global KV cache (doubling its residency on the None path). mlx-lm
+        // multiplies by a Python float (weak type) / a `mx.array(_, bf16)`,
+        // keeping the stream at the model dtype.
+        let embed_scale =
+            scalar_f32((self.cfg.hidden_size as f32).sqrt()).astype(h_raw.dtype(), device)?;
         let h = multiply(&h_raw, &embed_scale, device)?;
         let h = h.reshape(&[1, seq, self.cfg.hidden_size as i32], device)?;
 
@@ -861,9 +901,16 @@ impl Gemma4Text {
         let d = self.cfg.hidden_size_per_layer_input;
         let seq = ids.shape()[0];
 
+        // Per-layer-input scale constants adopt the operand dtype (bf16 for
+        // mxfp8), mirroring mlx-lm where these scales are Python floats (weak
+        // types that do not promote the activation). A strong-F32 scalar here
+        // would promote the per-layer-input tensor to f32, which then promotes
+        // the residual stream through the per-layer-input gating `add` in the
+        // decoder layer — and from there into Q/K/V and the global KV cache.
+        //
         // Token embedding for per-layer: [seq, n * d] → reshape [1, seq, n, d].
         let raw = embed_per_layer.forward(ids, device)?;
-        let scale = scalar_f32((d as f32).sqrt());
+        let scale = scalar_f32((d as f32).sqrt()).astype(raw.dtype(), device)?;
         let raw = multiply(&raw, &scale, device)?;
         let raw = raw.reshape(&[1, seq, n as i32, d as i32], device)?;
 
@@ -872,14 +919,15 @@ impl Gemma4Text {
         // per_layer_projection = norm(proj * scale)
         // return (per_layer_projection + per_layer_inputs) * 2^-0.5
         let proj_out = proj.forward(h, device)?;
-        let proj_scale = scalar_f32((self.cfg.hidden_size as f32).powf(-0.5));
+        let proj_scale = scalar_f32((self.cfg.hidden_size as f32).powf(-0.5))
+            .astype(proj_out.dtype(), device)?;
         let proj_out = multiply(&proj_out, &proj_scale, device)?;
         let proj_out = proj_out.reshape(&[1, seq, n as i32, d as i32], device)?;
 
         let proj_normed = norm.forward(&proj_out, device)?;
 
         let combined = rmlx_mlx::add(&proj_normed, &raw, device)?;
-        let inv_sqrt2 = scalar_f32((-0.5f32).exp2());
+        let inv_sqrt2 = scalar_f32((-0.5f32).exp2()).astype(combined.dtype(), device)?;
         let combined = multiply(&combined, &inv_sqrt2, device)?;
 
         // Split into per-layer slices: each [1, seq, d].
