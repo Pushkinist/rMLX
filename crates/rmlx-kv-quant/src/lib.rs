@@ -80,7 +80,7 @@ pub mod turbo_k4_fused_qk_msl;
 pub mod turboquant;
 pub mod turboquant_msl;
 
-pub use kvcache::KvCache;
+pub use kvcache::{KvCache, SharedKvOut};
 pub use linear_attn::LinearAttnCache;
 pub use quant::{validate_rotor_k_asym_v, KvQuant, KvQuantParseError, KV_MAX_SEQ_DEFAULT};
 

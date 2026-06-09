@@ -5,7 +5,7 @@ use rmlx_mlx::{add, multiply, Array, Device};
 use tracing::debug_span;
 
 use crate::layers::{Mlp, RmsNorm};
-use rmlx_kv_quant::KvCache;
+use rmlx_kv_quant::{KvCache, SharedKvOut};
 
 use super::layers::{geglu_fused, Attention, Gemma4MoeBlock, PerLayerInput};
 
@@ -51,13 +51,13 @@ impl DecoderLayer {
     pub(super) fn forward(
         &self,
         x: &Array,
-        shared_kv: Option<(&Array, &Array)>,
+        shared_kv: Option<&SharedKvOut>,
         per_layer_input: Option<&Array>,
         offset: i32,
         cache: Option<&mut KvCache>,
         kv_is_rotating: bool,
         device: Device,
-    ) -> Result<(Array, Option<(Array, Array)>)> {
+    ) -> Result<(Array, Option<SharedKvOut>)> {
         // Attention sub-layer.
         let residual = x.try_clone()?;
         let h = self.input_norm.forward(x, device)?;

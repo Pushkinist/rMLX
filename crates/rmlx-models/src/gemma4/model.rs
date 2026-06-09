@@ -21,7 +21,7 @@ use rmlx_mlx::{multiply, scalar_f32, Array, Device, Dtype};
 use tracing::debug;
 
 use crate::layers::Embedding;
-use rmlx_kv_quant::KvCache;
+use rmlx_kv_quant::{KvCache, SharedKvOut};
 
 use super::config::Gemma4TextConfig;
 use super::decoder_layer::DecoderLayer;
@@ -128,7 +128,7 @@ impl Gemma4Text {
         let per_layer_inputs = self.compute_per_layer_inputs(&ids_arr, &h, device)?;
 
         // KV accumulation for shared-KV layers (same pattern as forward_arr/forward_h).
-        let mut stored_kvs: Vec<Option<(Array, Array)>> =
+        let mut stored_kvs: Vec<Option<SharedKvOut>> =
             (0..self.cfg.num_hidden_layers).map(|_| None).collect();
 
         let mut h = h;
@@ -138,9 +138,7 @@ impl Gemma4Text {
             let shared_kv = if prev_idx == layer_idx {
                 None
             } else {
-                stored_kvs[prev_idx]
-                    .as_ref()
-                    .map(|(k, v)| (k as &Array, v as &Array))
+                stored_kvs[prev_idx].as_ref()
             };
             let per_layer = per_layer_inputs.as_ref().map(|pli| &pli[layer_idx]);
             let (new_h, new_kv) = layer.forward(
@@ -327,7 +325,7 @@ impl Gemma4Text {
         let per_layer_inputs = self.compute_per_layer_inputs(ids_arr, &h, device)?;
 
         // KV storage: index = previous_kvs[layer_idx], value = (K, V) from that layer.
-        let mut stored_kvs: Vec<Option<(Array, Array)>> =
+        let mut stored_kvs: Vec<Option<SharedKvOut>> =
             (0..self.cfg.num_hidden_layers).map(|_| None).collect();
 
         let mut h = h;
@@ -351,9 +349,7 @@ impl Gemma4Text {
                     let shared_kv = if prev_idx == layer_idx {
                         None
                     } else {
-                        stored_kvs[prev_idx]
-                            .as_ref()
-                            .map(|(k, v)| (k as &Array, v as &Array))
+                        stored_kvs[prev_idx].as_ref()
                     };
                     let per_layer = per_layer_inputs.as_ref().map(|pli| &pli[layer_idx]);
                     let (new_h, new_kv) = layer.forward(
@@ -377,9 +373,7 @@ impl Gemma4Text {
                     let shared_kv = if prev_idx == layer_idx {
                         None
                     } else {
-                        stored_kvs[prev_idx]
-                            .as_ref()
-                            .map(|(k, v)| (k as &Array, v as &Array))
+                        stored_kvs[prev_idx].as_ref()
                     };
                     let per_layer = per_layer_inputs.as_ref().map(|pli| &pli[layer_idx]);
                     // Shared-KV layers don't have their own cache entry; pass None.
@@ -466,7 +460,7 @@ impl Gemma4Text {
 
         let per_layer_inputs = self.compute_per_layer_inputs(ids_arr, &h, device)?;
 
-        let mut stored_kvs: Vec<Option<(Array, Array)>> =
+        let mut stored_kvs: Vec<Option<SharedKvOut>> =
             (0..self.cfg.num_hidden_layers).map(|_| None).collect();
 
         let mut h = h;
@@ -487,9 +481,7 @@ impl Gemma4Text {
                     let shared_kv = if prev_idx == layer_idx {
                         None
                     } else {
-                        stored_kvs[prev_idx]
-                            .as_ref()
-                            .map(|(k, v)| (k as &Array, v as &Array))
+                        stored_kvs[prev_idx].as_ref()
                     };
                     let per_layer = per_layer_inputs.as_ref().map(|pli| &pli[layer_idx]);
                     let (new_h, new_kv) = layer.forward(
@@ -513,9 +505,7 @@ impl Gemma4Text {
                     let shared_kv = if prev_idx == layer_idx {
                         None
                     } else {
-                        stored_kvs[prev_idx]
-                            .as_ref()
-                            .map(|(k, v)| (k as &Array, v as &Array))
+                        stored_kvs[prev_idx].as_ref()
                     };
                     let per_layer = per_layer_inputs.as_ref().map(|pli| &pli[layer_idx]);
                     let cache = if prev_idx == layer_idx {
@@ -609,7 +599,7 @@ impl Gemma4Text {
 
         let per_layer_inputs = self.compute_per_layer_inputs(&ids_arr, &h, device)?;
 
-        let mut stored_kvs: Vec<Option<(Array, Array)>> =
+        let mut stored_kvs: Vec<Option<SharedKvOut>> =
             (0..self.cfg.num_hidden_layers).map(|_| None).collect();
 
         let mut h = h;
@@ -629,9 +619,7 @@ impl Gemma4Text {
                     let shared_kv = if prev_idx == layer_idx {
                         None
                     } else {
-                        stored_kvs[prev_idx]
-                            .as_ref()
-                            .map(|(k, v)| (k as &Array, v as &Array))
+                        stored_kvs[prev_idx].as_ref()
                     };
                     let per_layer = per_layer_inputs.as_ref().map(|pli| &pli[layer_idx]);
                     let (new_h, new_kv) = layer.forward(
@@ -655,9 +643,7 @@ impl Gemma4Text {
                     let shared_kv = if prev_idx == layer_idx {
                         None
                     } else {
-                        stored_kvs[prev_idx]
-                            .as_ref()
-                            .map(|(k, v)| (k as &Array, v as &Array))
+                        stored_kvs[prev_idx].as_ref()
                     };
                     let per_layer = per_layer_inputs.as_ref().map(|pli| &pli[layer_idx]);
                     let cache = if prev_idx == layer_idx {
@@ -746,7 +732,7 @@ impl Gemma4Text {
 
         let per_layer_inputs = self.compute_per_layer_inputs(&ids_arr, &h, device)?;
 
-        let mut stored_kvs: Vec<Option<(Array, Array)>> =
+        let mut stored_kvs: Vec<Option<SharedKvOut>> =
             (0..self.cfg.num_hidden_layers).map(|_| None).collect();
 
         let mut h = h;
@@ -762,9 +748,7 @@ impl Gemma4Text {
             let shared_kv = if prev_idx == layer_idx {
                 None
             } else {
-                stored_kvs[prev_idx]
-                    .as_ref()
-                    .map(|(k, v)| (k as &Array, v as &Array))
+                stored_kvs[prev_idx].as_ref()
             };
             let per_layer = per_layer_inputs.as_ref().map(|pli| &pli[layer_idx]);
             let cache = if prev_idx == layer_idx {
@@ -789,10 +773,17 @@ impl Gemma4Text {
 
         // Representative shared K/V: highest-index cache-holding layer of each
         // type (last-wins, matching the Python dict-overwrite semantics).
+        // This speculative-decode entry point returns bf16 (K, V) to the
+        // drafter machinery. The fused-quant shared-KV decode share surfaces
+        // quant 3-tuples instead of bf16 on the Mixed global path, which this
+        // bf16 contract cannot consume — so only `Bf16` payloads are picked.
+        // A `MixedQuant` payload falls through to the loud "no … K/V captured"
+        // error below rather than silently mis-feeding the drafter; fused-quant
+        // KV share + Gemma4 speculative decode is unsupported in this slice.
         let pick = |want: super::config::LayerType| -> Option<(Array, Array)> {
             for i in (0..self.cfg.num_hidden_layers).rev() {
                 if self.cfg.layer_types[i] == want {
-                    if let Some((kk, vv)) = &stored_kvs[i] {
+                    if let Some(SharedKvOut::Bf16(kk, vv)) = &stored_kvs[i] {
                         return Some((kk.try_clone().ok()?, vv.try_clone().ok()?));
                     }
                 }

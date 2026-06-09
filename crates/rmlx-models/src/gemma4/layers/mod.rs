@@ -31,7 +31,8 @@ use rmlx_mlx::{
 };
 
 use crate::layers::{Linear, RmsNorm};
-use rmlx_kv_quant::KvCache;
+use rmlx_kv_quant::mixed_quant::mixed_quantized_sdpa;
+use rmlx_kv_quant::{KvCache, SharedKvOut};
 
 use super::config::LayerType;
 
@@ -150,12 +151,12 @@ impl Attention {
     pub(super) fn forward(
         &self,
         x: &Array,
-        shared_kv: Option<(&Array, &Array)>,
+        shared_kv: Option<&SharedKvOut>,
         offset: i32,
         cache: Option<&mut KvCache>,
         kv_is_rotating: bool,
         device: Device,
-    ) -> Result<(Array, Option<(Array, Array)>)> {
+    ) -> Result<(Array, Option<SharedKvOut>)> {
         let shape = x.shape(); // [batch, seq, hidden]
         let batch = shape[0];
         let seq = shape[1];
@@ -196,7 +197,7 @@ impl Attention {
         // wrapper has already run (`attn_out_holder`) or we still need a
         // direct `scaled_dot_product_attention` on shared / cacheless K/V.
         let mut attn_out_holder: Option<Array> = None;
-        let (q, k, v, new_kv) = if let Some((sk, sv)) = shared_kv {
+        let (q, k, v, new_kv) = if let Some(shared) = shared_kv {
             // Shared KV: q_norm runs alone, then transpose + RoPE on Q.
             let q = self.q_norm.forward(&q, device)?;
             let q = q.transpose(&[0, 2, 1, 3], device)?; // [B, H, S, D]
@@ -217,7 +218,52 @@ impl Attention {
                     rope_with_freqs(&q, self.head_dim as i32, false, 1.0, offset, freqs, device)?
                 }
             };
-            (q, sk.try_clone()?, sv.try_clone()?, None)
+            match shared {
+                SharedKvOut::Bf16(sk, sv) => (q, sk.try_clone()?, sv.try_clone()?, None),
+                SharedKvOut::MixedQuant {
+                    k,
+                    v,
+                    k_rotation,
+                    k_bits,
+                    v_bits,
+                    k_group_size,
+                    v_group_size,
+                } => {
+                    // Fused-quant shared-KV consumer: attend the producer's
+                    // quant store directly via `mixed_quantized_sdpa` instead of
+                    // a dequantized bf16 SDPA. This path is only produced on the
+                    // GLOBAL (FullAttention) decode branch (seq == 1), where the
+                    // attention mask is empty ("") — so no additive mask is
+                    // needed and no causal/array mask rework applies. GQA head
+                    // broadcast is handled inside `mixed_quantized_sdpa`.
+                    if seq != 1 {
+                        return Err(Error::Model(format!(
+                            "Gemma4 fused-quant shared-KV consumer reached with seq={seq} \
+                             (expected decode seq==1; quant share is decode-only)"
+                        )));
+                    }
+                    let attn_out = mixed_quantized_sdpa(
+                        &q,
+                        k,
+                        v,
+                        1.0,
+                        None,
+                        *k_group_size,
+                        *k_bits,
+                        *v_group_size,
+                        *v_bits,
+                        k_rotation.as_ref(),
+                        device,
+                    )?;
+                    attn_out_holder = Some(attn_out);
+                    // The consumer's own SDPA already ran (`attn_out_holder` is
+                    // Some), so the k/v slots are unused; placeholder clones of q
+                    // keep the tuple well-typed without allocating fresh tensors.
+                    let k_unused = q.try_clone()?;
+                    let v_unused = q.try_clone()?;
+                    (q, k_unused, v_unused, None)
+                }
+            }
         } else {
             let k_proj = self.k_proj.as_ref().ok_or_else(|| {
                 Error::Model("Attention: has_kv=false but no shared_kv provided".to_owned())
@@ -328,12 +374,14 @@ impl Attention {
                     device,
                 )?;
                 // Cache-holding layer: route through the shared-KV variant of
-                // the universal wrapper. Returns (out, k_full, v_full) so the
+                // the universal wrapper. Returns (out, shared_kv) so the
                 // accumulated K/V can be handed to downstream consumer layers
-                // via `stored_kvs[layer_idx]` in `gemma4/model.rs`. : the
-                // wrapper now supports Mixed via dequant-before-share (returns
-                // the accumulated bf16 K/V), alongside None/K8V4/K8V8/Planar.
-                let (attn_out, k_full, v_full) = c.update_and_sdpa_returning_kv(
+                // via `stored_kvs[layer_idx]` in `gemma4/model.rs`. The wrapper
+                // surfaces bf16 K/V for None/K8V4/K8V8/Planar/SWA/prefill, and —
+                // on the Mixed GLOBAL decode path — the live quant 3-tuples so
+                // the consumer attends the quant store directly (no bf16
+                // re-inflation of the O(ctx) global KV).
+                let (attn_out, shared) = c.update_and_sdpa_returning_shared_kv(
                     &q,
                     &k,
                     &v,
@@ -345,8 +393,12 @@ impl Attention {
                 // Guard (issue #32): the array-mode mask's key dim must equal
                 // the K seq dim the SDPA just attended. A mismatch is a sizing
                 // bug, not user input — fail loudly here rather than let a
-                // later layer hit the opaque mlx-c broadcast error.
-                if let Some(mask) = mask_holder_pre.as_ref() {
+                // later layer hit the opaque mlx-c broadcast error. Only the
+                // bf16-surfacing path exposes a K seq dim to check; the quant
+                // path's mask was already validated inside the wrapper's SDPA.
+                if let (Some(mask), SharedKvOut::Bf16(k_full, _)) =
+                    (mask_holder_pre.as_ref(), &shared)
+                {
                     let mask_kv = mask.shape()[3];
                     let k_seq = k_full.shape()[2];
                     if mask_kv != k_seq {
@@ -358,12 +410,12 @@ impl Attention {
                     }
                 }
                 attn_out_holder = Some(attn_out);
-                (
-                    q,
-                    k_full.try_clone()?,
-                    v_full.try_clone()?,
-                    Some((k_full, v_full)),
-                )
+                // Producer's own SDPA already ran inside the wrapper
+                // (`attn_out_holder` is Some), so the `k`/`v` slots below are
+                // unused for this branch — placeholder clones of the freshly
+                // projected K/V keep the tuple well-typed. `new_kv` carries the
+                // shared payload downstream.
+                (q, k.try_clone()?, v.try_clone()?, Some(shared))
             } else {
                 // No-cache forward (e.g. eval path with `caches: None`). The
                 // freshly-computed K is exactly `offset + seq` long, so size the
@@ -395,7 +447,7 @@ impl Attention {
                     device,
                 )?;
                 attn_out_holder = Some(attn_out);
-                (q, k, v, Some((k_new, v_new)))
+                (q, k, v, Some(SharedKvOut::Bf16(k_new, v_new)))
             }
         };
 

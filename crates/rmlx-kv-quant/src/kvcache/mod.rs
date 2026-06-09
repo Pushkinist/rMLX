@@ -67,6 +67,11 @@ mod warm_ttft_cross_codec_tests;
 #[path = "returning_kv_tests.rs"]
 mod returning_kv_tests;
 
+// Fused-quant shared-KV decode share (Mixed global path).
+#[cfg(test)]
+#[path = "shared_kv_quant_tests.rs"]
+mod shared_kv_quant_tests;
+
 // Dynamic grow + hard cap for `update_prefill_raw`.
 #[cfg(test)]
 #[path = "prefill_grow_tests.rs"]
@@ -89,6 +94,7 @@ mod windowed_ring_sizing_tests;
 
 pub use core::KvCache;
 pub use fused_qk_dispatch::fused_qk_total_dispatch_count;
+pub use sdpa::SharedKvOut;
 // `FusedQkLayout` / `FusedQkShadow` are crate-internal
 // only; they carry mlx-rs `Array` in their storage and would leak the
 // upstream type if exposed. Downstream callers don't need them — the

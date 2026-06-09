@@ -12,7 +12,7 @@ use rmlx_mlx::{
     add, dequantize, matmul, scaled_dot_product_attention, softmax_precise, Array, Device, Dtype,
 };
 
-use crate::mixed_quant::{mixed_quantized_sdpa, rot_k_tq4v_sdpa};
+use crate::mixed_quant::{mixed_quantized_sdpa, rot_k_tq4v_sdpa, MixedTuple};
 use crate::planar_flash_decode_msl::{planar_flash_decode_enabled, planar_flash_decode_sdpa};
 use crate::planar_fused_qk::planar_fused_qk_enabled;
 use crate::planar_fused_qk_msl::planar_fused_qk;
@@ -20,6 +20,69 @@ use crate::storage::KvStorage;
 
 use super::helpers::storage_variant_name;
 use super::KvCache;
+
+/// Shared-KV payload surfaced by [`KvCache::update_and_sdpa_returning_shared_kv`]
+/// for cross-layer-KV architectures (Gemma4).
+///
+/// Most codecs (and every prefill step) surface dequantized **bf16** K/V — the
+/// historic contract a consumer layer attends with a plain SDPA. The `Mixed`
+/// codec on the GLOBAL / full-attention decode path instead surfaces the live
+/// quant 3-tuples so the consumer can run a fused quantized SDPA directly over
+/// the quant store — no full-length bf16 mirror is materialised, so the global
+/// KV stays at quant-store size instead of re-inflating to bf16.
+#[allow(
+    clippy::exhaustive_enums,
+    reason = "the Gemma4 arch wiring matches this exhaustively on purpose: \
+              adding a shared-KV payload variant should force every consumer \
+              dispatch to be updated rather than silently take a wildcard arm"
+)]
+pub enum SharedKvOut {
+    /// Dequantized bf16 K/V — `(k_full, v_full)`. The legacy shared-KV contract.
+    Bf16(Array, Array),
+    /// Fused-quant decode tuples for the consumer's `mixed_quantized_sdpa`.
+    MixedQuant {
+        /// Quantized K (codes/scales/biases), full accumulated length.
+        k: MixedTuple,
+        /// Quantized V (codes/scales/biases), full accumulated length.
+        v: MixedTuple,
+        /// Optional K-rotation the consumer must apply to Q (RotK; `None` for
+        /// plain Mixed).
+        k_rotation: Option<Array>,
+        /// K quantization bit-width.
+        k_bits: i32,
+        /// V quantization bit-width.
+        v_bits: i32,
+        /// K quantization group size.
+        k_group_size: i32,
+        /// V quantization group size.
+        v_group_size: i32,
+    },
+}
+
+impl std::fmt::Debug for SharedKvOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // mlx-rs `Array` carries no meaningful Debug; print only the variant
+        // and the scalar quant params so logs stay readable.
+        match self {
+            Self::Bf16(_, _) => f.write_str("SharedKvOut::Bf16"),
+            Self::MixedQuant {
+                k_bits,
+                v_bits,
+                k_group_size,
+                v_group_size,
+                k_rotation,
+                ..
+            } => f
+                .debug_struct("SharedKvOut::MixedQuant")
+                .field("k_bits", k_bits)
+                .field("v_bits", v_bits)
+                .field("k_group_size", k_group_size)
+                .field("v_group_size", v_group_size)
+                .field("k_rotation", &k_rotation.is_some())
+                .finish(),
+        }
+    }
+}
 
 impl KvCache {
     /// Mixed-precision one-shot append + quantized SDPA.
@@ -51,6 +114,7 @@ impl KvCache {
             new_v,
             scale,
             additive_mask,
+            false,
             false,
             device,
         )?;
@@ -89,8 +153,9 @@ impl KvCache {
         scale: f32,
         additive_mask: Option<&Array>,
         want_kv: bool,
+        surface_quant: bool,
         device: Device,
-    ) -> Result<(Array, Option<(Array, Array)>)> {
+    ) -> Result<(Array, Option<SharedKvOut>)> {
         let (k_bits, v_bits, k_group_size, v_group_size) =
             self.quant.mixed_params().ok_or_else(|| {
                 Error::Mlx("update_and_sdpa_mixed called on non-Mixed-path cache".into())
@@ -129,9 +194,13 @@ impl KvCache {
                 device,
             )?;
             // the prefill-raw bf16 buffers ARE the accumulator a shared-KV
-            // consumer needs — return them directly (no extra work).
+            // consumer needs — return them directly (no extra work). The quant
+            // store is not built until `exit_prefill`, so even on the
+            // `surface_quant` path the consumer attends bf16 during prefill;
+            // the fused-quant decode path only kicks in post-prefill (decode
+            // branch below), which is where the O(ctx) inflation lives.
             let kv = if want_kv {
-                Some((k_full, v_full))
+                Some(SharedKvOut::Bf16(k_full, v_full))
             } else {
                 None
             };
@@ -173,12 +242,33 @@ impl KvCache {
             device,
         )?;
 
-        // maintain the bf16 accumulator for cross-layer-KV consumers.
-        // Only on the want_kv path so the non-shared Mixed decode hot path
-        // (Bonsai / Qwen3) pays nothing. `self.offset` was already advanced to
-        // `prev_offset + new_seq` above, so `update_decode_fp16` slices the new
-        // token in at `[prev_offset:offset]` — identical bookkeeping to K8V4.
-        let kv = if want_kv {
+        // Surface KV for cross-layer-KV consumers (Gemma4). Two modes:
+        //
+        // * `surface_quant` — hand the consumer the live quant 3-tuples
+        //   (`k_tuple`/`v_tuple`, already the full accumulated length) so it can
+        //   run a fused quantized SDPA directly. NO bf16 mirror is built, so the
+        //   global KV stays at quant-store size (the whole point — drop the
+        //   O(ctx) bf16 re-inflation). The consumer applies `k_rotation` to Q
+        //   exactly as `mixed_quantized_sdpa` does here.
+        //
+        // * bf16 (legacy) — maintain the full-length bf16 accumulator via
+        //   `update_decode_fp16` and surface that. `self.offset` was already
+        //   advanced to `prev_offset + new_seq` above, so the new token is
+        //   sliced in at `[prev_offset:offset]` — identical bookkeeping to K8V4.
+        //
+        // The non-shared Mixed decode hot path (Bonsai / Qwen3, want_kv=false)
+        // takes neither branch and pays nothing.
+        let kv = if want_kv && surface_quant {
+            Some(SharedKvOut::MixedQuant {
+                k: k_tuple.try_clone()?,
+                v: v_tuple.try_clone()?,
+                k_rotation,
+                k_bits,
+                v_bits,
+                k_group_size,
+                v_group_size,
+            })
+        } else if want_kv {
             let max_seq = match &self.storage {
                 KvStorage::Mixed { max_seq, .. } => *max_seq,
                 _ => {
@@ -189,7 +279,7 @@ impl KvCache {
                 }
             };
             let (k_full, v_full) = self.update_decode_fp16(new_k, new_v, max_seq, device)?;
-            Some((k_full, v_full))
+            Some(SharedKvOut::Bf16(k_full, v_full))
         } else {
             None
         };
@@ -787,15 +877,19 @@ impl KvCache {
                 scale,
                 additive_mask,
                 true,
+                false,
                 device,
             )?;
-            let (k_full, v_full) = kv.ok_or_else(|| {
-                Error::Mlx(
-                    "update_and_sdpa_returning_kv: Mixed path returned no bf16 K/V \
-                     (want_kv=true must always surface the accumulator)"
-                        .into(),
-                )
-            })?;
+            let (k_full, v_full) = match kv {
+                Some(SharedKvOut::Bf16(k, v)) => (k, v),
+                _ => {
+                    return Err(Error::Mlx(
+                        "update_and_sdpa_returning_kv: Mixed path returned no bf16 K/V \
+                         (want_kv=true, surface_quant=false must surface the bf16 accumulator)"
+                            .into(),
+                    ))
+                }
+            };
             return Ok((out, k_full, v_full));
         }
 
@@ -841,6 +935,71 @@ impl KvCache {
             device,
         )?;
         Ok((out, k_full, v_full))
+    }
+
+    /// Cross-layer-KV producer SDPA that can surface the **quant store** for the
+    /// consumer instead of a bf16 mirror.
+    ///
+    /// This is the fused-quant-decode variant of
+    /// [`KvCache::update_and_sdpa_returning_kv`]. On the `Mixed` codec DECODE
+    /// path it surfaces [`SharedKvOut::MixedQuant`] — the live quant 3-tuples —
+    /// so the shared-KV consumer runs a fused quantized SDPA directly and NO
+    /// full-length bf16 mirror is materialised (the global KV stays at
+    /// quant-store size). Every other path (SWA rotating, prefill, non-Mixed
+    /// codecs, the dispatch chain, the legacy `update()` fallthrough) surfaces
+    /// [`SharedKvOut::Bf16`] — identical to `update_and_sdpa_returning_kv`.
+    ///
+    /// The legacy `update_and_sdpa_returning_kv` is left byte-for-byte
+    /// unchanged for callers that do not opt into the fused-quant-decode share.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_and_sdpa_returning_shared_kv(
+        &mut self,
+        queries: &Array,
+        new_k: &Array,
+        new_v: &Array,
+        scale: f32,
+        mask_mode: &str,
+        additive_mask: Option<&Array>,
+        device: Device,
+    ) -> Result<(Array, SharedKvOut)> {
+        // Mixed (and RotK) DECODE: surface the quant tuples. SWA rotating layers
+        // never reach here as Mixed (they are forced bf16 by the rotating
+        // short-circuit inside `update_and_sdpa_mixed_inner`'s prefill branch
+        // and by `with_quant_max_seq_window`); the `surface_quant` mode only
+        // takes effect on the decode (post-prefill) branch, so prefill still
+        // surfaces bf16.
+        if self.quant.uses_mixed_path() && self.rotating.is_none() {
+            let (out, kv) = self.update_and_sdpa_mixed_inner(
+                queries,
+                new_k,
+                new_v,
+                scale,
+                additive_mask,
+                true,
+                true,
+                device,
+            )?;
+            let kv = kv.ok_or_else(|| {
+                Error::Mlx(
+                    "update_and_sdpa_returning_shared_kv: Mixed path returned no shared KV \
+                     (want_kv=true must always surface a payload)"
+                        .into(),
+                )
+            })?;
+            return Ok((out, kv));
+        }
+
+        // Everything else: delegate to the bf16-surfacing legacy path and wrap.
+        let (out, k_full, v_full) = self.update_and_sdpa_returning_kv(
+            queries,
+            new_k,
+            new_v,
+            scale,
+            mask_mode,
+            additive_mask,
+            device,
+        )?;
+        Ok((out, SharedKvOut::Bf16(k_full, v_full)))
     }
 
     /// Run the TurboFlash / fused-QK dispatch chain in the cross-layer-KV
