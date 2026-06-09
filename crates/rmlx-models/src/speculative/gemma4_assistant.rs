@@ -30,9 +30,24 @@
 //! `[target_embed(tok), last_hidden]` (`2 * backbone_hidden`), projects down to
 //! the drafter width via `pre_projection`, runs the 4-layer stack against the
 //! shared K/V, applies `norm`, then `post_projection` back up to backbone width
-//! (the `last_hidden` carried into the next step). The greedy next token comes
-//! from the centroid-routed sparse LM head (`masked_embedding`) over the
-//! drafter's hidden (drafter `tie_word_embeddings=true`).
+//! (the `last_hidden` carried into the next step).
+//!
+//! # LM-head variants
+//!
+//! Two assistant sub-variants ship under `model_type=gemma4_assistant`, both
+//! with the drafter's `tie_word_embeddings=true`; they differ only in the LM
+//! head. We detect which by tensor presence (the `num_centroids` config key is
+//! vestigial in both and not a reliable signal):
+//!
+//! - **Sparse head** (smaller assistants): carries
+//!   `masked_embedding.centroids.weight` + `masked_embedding.token_ordering`.
+//!   The greedy next token comes from the centroid-routed sparse LM head
+//!   (`MaskedEmbedder`) — an approximate argmax over a centroid-selected token
+//!   shortlist. See [`Gemma4AssistantDrafter::masked_argmax`].
+//! - **Plain tied head** (larger assistants): ships no `masked_embedding.*`
+//!   tensors. The LM head is the tied `model.embed_tokens.weight`, and the
+//!   greedy next token is a standard full-vocab argmax over `h @ embedW.T`.
+//!   See [`Gemma4AssistantDrafter::plain_argmax`].
 //!
 //! # MVP scope (document-the-truth, CLAUDE.md hard rule 7)
 //!
@@ -92,9 +107,11 @@ pub struct Gemma4AssistantDrafter {
     norm: RmsNorm,
     layers: Vec<DraftLayer>,
     /// `masked_embedding.centroids`: `Linear(draft_hidden -> num_centroids)`.
-    centroids: Linear,
+    /// `None` for the plain-tied-head variant (no `masked_embedding.*`).
+    centroids: Option<Linear>,
     /// `masked_embedding.token_ordering`: `[vocab_size]` I32 (centroid->token).
-    token_ordering: Array,
+    /// `None` for the plain-tied-head variant.
+    token_ordering: Option<Array>,
     draft_hidden: usize,
     backbone_hidden: usize,
     n_heads: usize,
@@ -181,7 +198,11 @@ impl Gemma4AssistantDrafter {
             let h = self.norm.forward(&h, self.device)?; // [1,1,draft_hidden]
             h_prev = self.post_projection.forward(&h, self.device)?; // [1,1,backbone]
 
-            let next = self.masked_argmax(&h)?;
+            let next = if self.centroids.is_some() {
+                self.masked_argmax(&h)?
+            } else {
+                self.plain_argmax(&h)?
+            };
             tracing::trace!(
                 target: "rmlx::mtp",
                 step,
@@ -262,12 +283,25 @@ impl Gemma4AssistantDrafter {
     }
 
     /// Greedy token via the centroid-routed sparse LM head (`MaskedEmbedder`).
+    /// Only used on the sparse-head variant (`centroids.is_some()`).
     #[allow(
         clippy::indexing_slicing,
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
     )]
+    #[allow(
+        clippy::expect_used,
+        reason = "structural invariant: masked_argmax is dispatched only when centroids/token_ordering are Some (sparse-head variant); .expect() documents that"
+    )]
     fn masked_argmax(&self, h: &Array) -> Result<u32> {
-        let cscore = self.centroids.forward(h, self.device)?; // [1,1,num_centroids]
+        let centroids = self
+            .centroids
+            .as_ref()
+            .expect("masked_argmax on plain-head drafter (centroids None)");
+        let token_ordering = self
+            .token_ordering
+            .as_ref()
+            .expect("masked_argmax on plain-head drafter (token_ordering None)");
+        let cscore = centroids.forward(h, self.device)?; // [1,1,num_centroids]
         let nc = self.num_centroids as i32;
         let kth = nc - self.centroid_top_k as i32;
         let part = argpartition(&cscore, kth, -1, self.device)?;
@@ -276,7 +310,7 @@ impl Gemma4AssistantDrafter {
         let topk: Vec<i32> = bytes_to_i32(&topk_idx)?;
 
         let vpc = self.vocab_per_centroid as i32;
-        let ordering = self.token_ordering.reshape(&[nc, vpc], self.device)?;
+        let ordering = token_ordering.reshape(&[nc, vpc], self.device)?;
         let topk_arr = i32_array(&topk)?;
         let sel = ordering.take(&topk_arr, 0, self.device)?; // [top_k, vpc]
         sel.eval()?;
@@ -295,6 +329,26 @@ impl Gemma4AssistantDrafter {
         best.eval()?;
         let best_i = bytes_to_i32(&best)?[0] as usize;
         Ok(cand[best_i] as u32)
+    }
+
+    /// Greedy token via the plain tied LM head (`tie_word_embeddings=true`,
+    /// no `masked_embedding`). Full-vocab argmax over `h @ embed_tokens.T`.
+    /// Only used on the plain-head variant (`centroids.is_none()`).
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "best is a [1] argmax result; index 0 is in-bounds by construction"
+    )]
+    fn plain_argmax(&self, h: &Array) -> Result<u32> {
+        let emb_w = self.embed_tokens_weight()?; // [vocab, draft_hidden]
+        let h_flat = h.reshape(&[1, self.draft_hidden as i32], self.device)?;
+        let logits = matmul(
+            &h_flat,
+            &emb_w.transpose(&[1, 0], self.device)?,
+            self.device,
+        )?; // [1, vocab]
+        let best = argmax(&logits, -1, self.device)?;
+        best.eval()?;
+        Ok(bytes_to_i32(&best)?[0] as u32)
     }
 
     fn embed_tokens_weight(&self) -> Result<Array> {
@@ -501,11 +555,29 @@ fn load_assistant(
     let pre_projection = lin("pre_projection.weight")?;
     let post_projection = lin("post_projection.weight")?;
     let final_norm = norm("model.norm.weight")?;
-    let centroids = lin("masked_embedding.centroids.weight")?;
+
+    // LM-head variant detection by tensor presence (NOT config — `num_centroids`
+    // is vestigial in both variants). Sparse head ships
+    // `masked_embedding.centroids.weight` + `.token_ordering`; the plain
+    // tied-head variant ships neither and uses a full-vocab argmax over the
+    // tied `embed_tokens` weight instead.
+    let has_centroids = shards.iter().any(|(_, handle)| {
+        handle
+            .safetensors()
+            .ok()
+            .is_some_and(|st| st.tensor("masked_embedding.centroids.weight").is_ok())
+    });
+
+    let centroids = if has_centroids {
+        Some(lin("masked_embedding.centroids.weight")?)
+    } else {
+        None
+    };
     // `masked_embedding.token_ordering` is stored as int64 in the checkpoint;
     // MLX safetensors loading rejects I64, so read the raw little-endian i64
     // bytes and narrow to i32 on the host (token ids fit in i32 — vocab 262144).
-    let token_ordering = {
+    // Absent in the plain tied-head variant → `None`.
+    let token_ordering = if has_centroids {
         let mut found: Option<Array> = None;
         for (_, handle) in shards.iter() {
             let st = handle
@@ -525,11 +597,13 @@ fn load_assistant(
                 break;
             }
         }
-        found.ok_or_else(|| {
+        Some(found.ok_or_else(|| {
             Error::Model(
                 "Gemma4Assistant: tensor 'masked_embedding.token_ordering' not found".into(),
             )
-        })?
+        })?)
+    } else {
+        None
     };
 
     let rope_full_freqs = crate::gemma4::build_proportional_rope_freqs(
@@ -581,6 +655,7 @@ fn load_assistant(
         backbone_hidden,
         n_layers,
         num_centroids,
+        lm_head = if has_centroids { "sparse" } else { "plain-tied" },
         "Gemma4AssistantDrafter: loaded sidecar"
     );
 
