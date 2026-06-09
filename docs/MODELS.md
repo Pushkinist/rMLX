@@ -323,6 +323,11 @@ Text only. No vision or audio tower.
   prompts in windows to avoid GPU command-buffer timeout on Qwen3.6-MoE at
   n > ~1 000 tokens.
 - **Thinking mode and prompt cache.** Both active.
+- **Sorted-index expert gather at prefill.** Same optimization as Gemma4-26b:
+  when `n_tokens*top_k ≥ 64`, the routed expert indices are sorted for
+  contiguous per-expert access, the three `gather_qmm` calls run with
+  `sorted_indices=true`, and the outputs are scattered back. Decode keeps the
+  broadcast path. Mirrors mlx-lm `SwitchGLU`.
 
 ### Known limitations
 
@@ -691,7 +696,18 @@ Text, image, and audio input. rMLX implements all three towers:
 - **SWA + FullAttention alternation** with dual RoPE theta.
 - **Cross-layer KV sharing** (`num_kv_shared_layers`).
 - **K=V weight sharing** for full-attention layers on 26B/31B.
-- **Sparse MoE** on 26B (dense + sparse block per layer).
+- **Sparse MoE** on 26B (dense + sparse block per layer). The expert dispatch
+  uses **sorted-index gather** at prefill: when the flattened `n_tokens*top_k`
+  count is ≥ 64 (multi-token prefill), the routed expert indices are sorted so
+  each expert's rows are contiguous, the three gathered quantized matmuls run
+  with `sorted_indices=true`, and the outputs are scattered back to token order.
+  Contiguous per-expert access lets the gathered-matmul kernel run each expert
+  as one dense block instead of scattered per-token gathers — a ~4× prefill
+  speedup on 26B at 4k/16k/32k. Decode (single token, count < 64) keeps the
+  simple broadcast path. Mirrors mlx-lm `SwitchGLU`. The remaining ~1.6× gap to
+  mlx-lm prefill is inherent: Gemma4-26b runs a **dense MLP and the sparse
+  experts in parallel every layer** plus three extra MoE RMSNorms, so it does
+  strictly more per-layer work than a pure-MoE model.
 - **Conformer audio encoder** with SSCP subsampling.
 - **Gemma4-assistant MTP drafter.** The sidecar MTP head reads the verifier's
   pre-final-norm hidden state via `forward_hidden_states_shared_kv`, which also

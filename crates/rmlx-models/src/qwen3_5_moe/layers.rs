@@ -141,6 +141,7 @@ impl Linear {
         &self,
         x: &Array,
         rhs_indices: &Array,
+        sorted_indices: bool,
         device: Device,
     ) -> Result<Array> {
         match self {
@@ -201,7 +202,7 @@ impl Linear {
                 *group_size,
                 *bits,
                 mode,
-                false,
+                sorted_indices,
                 device,
             ),
         }
