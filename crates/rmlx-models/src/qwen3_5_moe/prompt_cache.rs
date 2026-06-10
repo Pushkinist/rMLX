@@ -9,9 +9,9 @@
 //! - `impl PromptCacheEntry for Qwen35MoeEntry`: deep_clone + KV/lin accessors.
 //!   The trait-default `truncate_kv_to` trims only the KV caches; `lin_caches`
 //!   are NOT truncated — they hold sequence-end recurrent state re-run on the
-//!   tail (the default body structurally cannot reach them).
-//! - `impl SpillSink<Qwen35MoeEntry> for SsdSpiller`: hybrid spill — both KV
-//!   and lin_caches.
+//!   tail (the default body structurally cannot reach them). The SSD spill path
+//!   is the blanket `SpillSink<E> for SsdSpiller` in `crate::prompt_cache`,
+//!   which spills both `kv_caches()` and `lin_caches()` (hybrid).
 //! - `impl SsdHydrate<Qwen35MoeEntry> for SsdHydrator`: hybrid hydrate.
 //!
 //! The per-arch shell (`PROMPT_CACHE`, attach/ensure/stats wrappers) is pure
@@ -32,10 +32,10 @@ use rmlx_core::error::Result;
 
 use crate::prompt_cache::{
     chained_block_hashes_seeded, ArchPromptCache, CacheStats, PromptCacheEntry, ReusePolicy,
-    SpillSink, SsdHydrate, FNV_OFFSET,
+    SsdHydrate, FNV_OFFSET,
 };
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
-use rmlx_kv_ssd::{HydratedBlock, SpillJob, SsdHydrator, SsdSpiller};
+use rmlx_kv_ssd::{HydratedBlock, SsdHydrator};
 
 // ---------------------------------------------------------------------------
 // Entry type
@@ -119,50 +119,11 @@ impl PromptCacheEntry for Qwen35MoeEntry {
 }
 
 // ---------------------------------------------------------------------------
-// SSD-spill sink — hybrid: spills both `kv_caches` and `lin_caches`.
+// SSD-spill sink — the blanket `impl SpillSink<E> for SsdSpiller` in
+// `crate::prompt_cache` covers Qwen3.5-MoE: `kv_caches()` + `lin_caches()`
+// both return the real per-layer slices, so the spill job carries both the
+// attention KV and the GDN recurrent state.
 // ---------------------------------------------------------------------------
-
-impl SpillSink<Qwen35MoeEntry> for SsdSpiller {
-    fn spill(&self, entry: &Qwen35MoeEntry) {
-        let Some(&hash) = entry.block_hashes.last() else {
-            return; // no full block → no stable spill key
-        };
-        let Some(kv_quant) = entry.kv_quant else {
-            return; // unknown quant → cannot tag the block
-        };
-        let layout_key = self.layout_key();
-        let kv_caches: Result<Vec<KvCache>> =
-            entry.kv_caches.iter().map(|c| c.try_deep_clone()).collect();
-        let lin_caches: Result<Vec<LinearAttnCache>> = entry
-            .lin_caches
-            .iter()
-            .map(|c| c.try_deep_clone())
-            .collect();
-        let (kv_caches, lin_caches) = match (kv_caches, lin_caches) {
-            (Ok(kv), Ok(lin)) => (kv, lin),
-            (Err(e), _) | (_, Err(e)) => {
-                tracing::warn!(error = %e, "kv-spill: qwen3.5-moe cache clone failed, skipping spill");
-                return;
-            }
-        };
-        let materialized = kv_caches
-            .iter()
-            .try_for_each(|c| c.eval_for_spill())
-            .and_then(|()| lin_caches.iter().try_for_each(|c| c.eval_for_spill()));
-        if let Err(e) = materialized {
-            tracing::warn!(error = %e, "kv-spill: qwen3.5-moe eval-for-spill failed, skipping spill");
-            return;
-        }
-        self.try_spill(SpillJob {
-            hash,
-            layout_key,
-            model_id: self.model_id().to_string(),
-            kv_quant,
-            kv_caches,
-            lin_caches,
-        });
-    }
-}
 
 // ---------------------------------------------------------------------------
 // SSD-hydrate source — hybrid: reconstructs both KV and lin caches.

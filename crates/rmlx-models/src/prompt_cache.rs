@@ -1,3 +1,7 @@
+// LOC-exempt: the PromptCacheEntry + SpillSink trait contracts, their blanket
+// impl over SsdSpiller, and the PromptCache<E> container form one cohesion unit;
+// splitting the blanket impl from the trait it serves would scatter the
+// prompt-cache eviction/spill policy across modules.
 //! Arch-agnostic prompt-cache primitives.
 //!
 //! ## Design
@@ -53,7 +57,7 @@ use crate::prefix_index::{
     active_prefix_index_kind, build_active_index, PrefixIndex, PrefixIndexKind,
 };
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
-use rmlx_kv_ssd::{SsdHydrator, SsdSpiller};
+use rmlx_kv_ssd::{SpillJob, SsdHydrator, SsdSpiller};
 
 // The SSD-tier hashing primitives (`FNV_OFFSET`, `FNV_PRIME`,
 // `BLOCK_TOKENS`, `chained_block_hashes`, `chained_block_hashes_seeded`) and
@@ -232,11 +236,9 @@ pub(crate) trait PromptCacheEntry: Sized {
     /// REQUIRED (not defaulted): a defaulted `None` would silently disable the
     /// SSD-spill key tagging in `SpillSink::spill`, dropping every block.
     ///
-    /// No in-crate caller yet — the per-arch `SpillSink::spill` impls read the
-    /// `kv_quant` field directly. Kept on the contract (not field access) so the
-    /// trait can drive a generic spill path without re-introducing per-arch
-    /// field reach-in.
-    #[allow(dead_code)]
+    /// Read by the blanket `SpillSink::spill` impl to tag each spilled block
+    /// with its codec. Kept on the contract (not field access) so the trait can
+    /// drive the generic spill path without per-arch field reach-in.
     fn kv_quant(&self) -> Option<KvQuant>;
 
     /// The entry's linear-attention recurrent caches (GDN layers).
@@ -324,6 +326,70 @@ pub(crate) trait PromptCacheEntry: Sized {
 pub(crate) trait SpillSink<E>: Send {
     /// Spill an entry that is about to be evicted. Must not block or panic.
     fn spill(&self, entry: &E);
+}
+
+/// Blanket spill impl over any `PromptCacheEntry`.
+///
+/// Replaces the per-arch `impl SpillSink<…Entry> for SsdSpiller` blocks: the
+/// entry shape is reached only through the trait accessors, so the same body
+/// serves pure-attention archs (`lin_caches()` returns `&[]`) and hybrid GDN
+/// archs (`lin_caches()` returns the real recurrent slice) identically. Local
+/// trait + foreign `SsdSpiller` is a coherent blanket impl; the per-arch
+/// blocks are deleted so no overlap is possible.
+///
+/// Fire-and-forget: entries without a full block or a known `kv_quant` are
+/// skipped; any clone/eval error is `warn!`-logged and the job dropped —
+/// eviction never blocks on disk I/O and never panics.
+impl<E: PromptCacheEntry> SpillSink<E> for SsdSpiller {
+    fn spill(&self, entry: &E) {
+        let Some(&hash) = entry.block_hashes().last() else {
+            return; // no full block → no stable spill key
+        };
+        let Some(kv_quant) = entry.kv_quant() else {
+            return; // unknown quant → cannot tag the block
+        };
+        let kv: Result<Vec<KvCache>> = entry
+            .kv_caches()
+            .iter()
+            .map(KvCache::try_deep_clone)
+            .collect();
+        let lin: Result<Vec<LinearAttnCache>> = entry
+            .lin_caches()
+            .iter()
+            .map(LinearAttnCache::try_deep_clone)
+            .collect();
+        let (kv_caches, lin_caches) = match (kv, lin) {
+            (Ok(k), Ok(l)) => (k, l),
+            (Err(e), _) | (_, Err(e)) => {
+                tracing::warn!(model_id = self.model_id(), error = %e,
+                    "kv-spill: cache clone failed, skipping spill");
+                return;
+            }
+        };
+        // Eval on the inference thread before handing buffers to the spill worker —
+        // lazy arrays must be materialized while the Metal context is ours.
+        if let Err(e) = kv_caches
+            .iter()
+            .try_for_each(KvCache::eval_for_spill)
+            .and_then(|()| {
+                lin_caches
+                    .iter()
+                    .try_for_each(LinearAttnCache::eval_for_spill)
+            })
+        {
+            tracing::warn!(model_id = self.model_id(), error = %e,
+                "kv-spill: eval failed, skipping spill");
+            return;
+        }
+        self.try_spill(SpillJob {
+            hash,
+            layout_key: self.layout_key(),
+            model_id: self.model_id().to_string(),
+            kv_quant,
+            kv_caches,
+            lin_caches,
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -776,8 +842,9 @@ pub(crate) struct AttachParams {
 /// The genuinely per-arch parts that stay outside this struct:
 /// - the `Entry` struct (Gemma4 = KV only, Qwen3 = KV only, Qwen3.5-MoE =
 ///   KV + LinearAttn);
-/// - the `impl SpillSink<Entry> for SsdSpiller` /
-///   `impl SsdHydrate<Entry> for SsdHydrator` blocks (Entry-shape specific);
+/// - the `impl SsdHydrate<Entry> for SsdHydrator` block (Entry-shape specific —
+///   reconstruction needs the concrete entry's extra fields). The spill side is
+///   the blanket `impl SpillSink<E> for SsdSpiller` above, shared by every arch.
 /// - the in-`generate.rs` `CacheLookup` match (Exact / Prefix / Miss), which
 ///   queries [`ArchPromptCache::policy`] to enforce [`ReusePolicy::ExactOnly`]
 ///   as a hard runtime check.
