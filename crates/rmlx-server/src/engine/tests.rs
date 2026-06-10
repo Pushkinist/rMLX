@@ -223,7 +223,7 @@ async fn not_ready_emits_exactly_one_error() {
     assert!(stream.next().await.is_none(), "stream should be exhausted");
 }
 
-/// `Gemma4Generator::from_snapshot` with the primary test snapshot.
+/// `ArchGenerator::from_snapshot` with the primary test snapshot.
 ///
 /// Skips with a `tracing::warn!` if the snapshot directory is absent
 /// (CI / machines without the model download).
@@ -242,7 +242,7 @@ async fn gemma4_generator_loads_and_model_id_matches_basename() {
         return;
     }
 
-    let gen = Gemma4Generator::from_snapshot(
+    let gen = ArchGenerator::from_snapshot(
         &snap,
         &ModelLoadConfig {
             device: rmlx_mlx::Device::Cpu,
@@ -264,9 +264,9 @@ async fn gemma4_generator_loads_and_model_id_matches_basename() {
     );
 }
 
-/// Empty prompt must yield an immediate error from `Gemma4Generator`.
+/// Empty prompt must yield an immediate error from `ArchGenerator`.
 ///
-/// This test uses `NotReadyGenerator` as a proxy since `Gemma4Generator`
+/// This test uses `NotReadyGenerator` as a proxy since `ArchGenerator`
 /// requires the snapshot. The empty-prompt path is tested separately
 /// via the mismatch guard (both precede the spawn_blocking call).
 #[tokio::test]

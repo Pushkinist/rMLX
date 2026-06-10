@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rmlx_server::{
-    timeout_mw, ApiErrorCounters, AppState, Gemma4Generator, Generator, ItlStore, LoadedModel,
+    timeout_mw, ApiErrorCounters, AppState, ArchGenerator, Generator, ItlStore, LoadedModel,
     ModelLoadConfig, ModelLoader, ModelRegistry, NotReadyGenerator, SessionCache, TtftStore,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -150,23 +150,23 @@ async fn start_server(registry: ModelRegistry) -> u16 {
     port
 }
 
-/// Start a server backed by a real `Gemma4Generator` loaded on demand.
+/// Start a server backed by a real `ArchGenerator` loaded on demand.
 ///
-/// The loader captures the `gen` inside an `Arc<Mutex<Option<Gemma4Generator>>>` so
+/// The loader captures the `gen` inside an `Arc<Mutex<Option<ArchGenerator>>>` so
 /// the first call yields the real generator and subsequent calls reuse it.
 /// (Tests using this helper call the model at most once, so this is safe.)
-async fn start_server_with_gemma4(gen: Gemma4Generator) -> u16 {
+async fn start_server_with_gemma4(gen: ArchGenerator) -> u16 {
     let snap = primary_snapshot_dir()
         .expect("RMLX_TEST_MODEL_GEMMA4_E4B must be set when calling start_server_with_gemma4");
     let reg = ModelRegistry::from_paths(std::slice::from_ref(&snap));
 
     // Wrap the pre-built generator in a once-cell pattern.
-    let gen_cell: Arc<std::sync::Mutex<Option<Gemma4Generator>>> =
+    let gen_cell: Arc<std::sync::Mutex<Option<ArchGenerator>>> =
         Arc::new(std::sync::Mutex::new(Some(gen)));
 
     let loader: ModelLoader = Arc::new(move |_path, _id| {
         let mut guard = gen_cell.lock().unwrap();
-        let g = guard.take().expect("Gemma4Generator already consumed");
+        let g = guard.take().expect("ArchGenerator already consumed");
         Ok(Box::new(g) as Box<dyn Generator>)
     });
 
@@ -611,7 +611,7 @@ async fn max_tokens_above_64_default_cap_passes() {
 
 // ── Real end-to-end generation tests ─────────────────────────────────────────
 //
-// These tests boot a server with the real Gemma4Generator (CPU) and verify
+// These tests boot a server with the real ArchGenerator (CPU) and verify
 // that both API surfaces produce non-empty text.
 //
 // CPU-only forward is ~1.3 s/token with no KV cache. With max_tokens=4 that
@@ -621,7 +621,7 @@ async fn max_tokens_above_64_default_cap_passes() {
 // Run manually:
 // cargo test -p rmlx-server -- --ignored real_generation --nocapture
 
-/// OpenAI `POST /v1/chat/completions` with the real Gemma4Generator.
+/// OpenAI `POST /v1/chat/completions` with the real ArchGenerator.
 #[ignore = "requires primary snapshot + ~30s wall-clock (CPU, no KV cache)"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_generation_openai_chat_completions() {
@@ -637,7 +637,7 @@ async fn real_generation_openai_chat_completions() {
         return;
     }
 
-    let gen = Gemma4Generator::from_snapshot(
+    let gen = ArchGenerator::from_snapshot(
         &snap,
         &ModelLoadConfig {
             device: rmlx_mlx::Device::Cpu,
@@ -650,7 +650,7 @@ async fn real_generation_openai_chat_completions() {
         },
         Arc::new(parking_lot::Mutex::new(())),
     )
-    .expect("Gemma4Generator::from_snapshot");
+    .expect("ArchGenerator::from_snapshot");
     let port = start_server_with_gemma4(gen).await;
 
     let payload = r#"{"model":"mlx-community__gemma-4-e4b-it-mxfp8","messages":[{"role":"user","content":"Hello"}],"max_tokens":4}"#;
@@ -676,7 +676,7 @@ async fn real_generation_openai_chat_completions() {
     tracing::info!(content, completion_tokens, "real_generation_openai: OK");
 }
 
-/// Anthropic `POST /v1/messages` with the real Gemma4Generator.
+/// Anthropic `POST /v1/messages` with the real ArchGenerator.
 #[ignore = "requires primary snapshot + ~30s wall-clock (CPU, no KV cache)"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_generation_anthropic_messages() {
@@ -692,7 +692,7 @@ async fn real_generation_anthropic_messages() {
         return;
     }
 
-    let gen = Gemma4Generator::from_snapshot(
+    let gen = ArchGenerator::from_snapshot(
         &snap,
         &ModelLoadConfig {
             device: rmlx_mlx::Device::Cpu,
@@ -705,7 +705,7 @@ async fn real_generation_anthropic_messages() {
         },
         Arc::new(parking_lot::Mutex::new(())),
     )
-    .expect("Gemma4Generator::from_snapshot");
+    .expect("ArchGenerator::from_snapshot");
     let port = start_server_with_gemma4(gen).await;
 
     let payload = r#"{"model":"mlx-community__gemma-4-e4b-it-mxfp8","messages":[{"role":"user","content":"Hello"}],"max_tokens":4}"#;
@@ -1274,7 +1274,7 @@ async fn h3_non_streaming_usage_triple_exact() {
         return;
     }
 
-    let gen = Gemma4Generator::from_snapshot(
+    let gen = ArchGenerator::from_snapshot(
         &snap,
         &ModelLoadConfig {
             device: rmlx_mlx::Device::Cpu,
@@ -1287,7 +1287,7 @@ async fn h3_non_streaming_usage_triple_exact() {
         },
         Arc::new(parking_lot::Mutex::new(())),
     )
-    .expect("Gemma4Generator::from_snapshot");
+    .expect("ArchGenerator::from_snapshot");
     let port = start_server_with_gemma4(gen).await;
 
     // max_tokens = 4.
@@ -1352,7 +1352,7 @@ async fn h4_streaming_include_usage_true_emits_usage_chunk() {
         return;
     }
 
-    let gen = Gemma4Generator::from_snapshot(
+    let gen = ArchGenerator::from_snapshot(
         &snap,
         &ModelLoadConfig {
             device: rmlx_mlx::Device::Cpu,
@@ -1365,7 +1365,7 @@ async fn h4_streaming_include_usage_true_emits_usage_chunk() {
         },
         Arc::new(parking_lot::Mutex::new(())),
     )
-    .expect("Gemma4Generator::from_snapshot");
+    .expect("ArchGenerator::from_snapshot");
     let port = start_server_with_gemma4(gen).await;
 
     let payload = r#"{"model":"mlx-community__gemma-4-e4b-it-mxfp8","messages":[{"role":"user","content":"Hello"}],"max_tokens":8,"stream":true,"stream_options":{"include_usage":true}}"#;
@@ -1439,7 +1439,7 @@ async fn h4_streaming_include_usage_false_no_usage_in_stream() {
         return;
     }
 
-    let gen = Gemma4Generator::from_snapshot(
+    let gen = ArchGenerator::from_snapshot(
         &snap,
         &ModelLoadConfig {
             device: rmlx_mlx::Device::Cpu,
@@ -1452,7 +1452,7 @@ async fn h4_streaming_include_usage_false_no_usage_in_stream() {
         },
         Arc::new(parking_lot::Mutex::new(())),
     )
-    .expect("Gemma4Generator::from_snapshot");
+    .expect("ArchGenerator::from_snapshot");
     let port = start_server_with_gemma4(gen).await;
 
     // Omit stream_options entirely — must behave identically to include_usage=false.

@@ -1,6 +1,6 @@
-//! `Gemma4Generator` — real inference engine backed by `rmlx_models::arch`.
+//! `ArchGenerator` — architecture-agnostic HTTP generation engine backed by `rmlx_models::arch`.
 //!
-//! EXEMPTION: This file exceeds 1000 LOC (≈1300). The Gemma4Generator::generate
+//! EXEMPTION: This file exceeds 1000 LOC (≈1300). The ArchGenerator::generate
 //! method is a single large decode loop (text + image, streaming + blocking,
 //! all arch variants) that cannot be split without introducing artificial
 //! indirection. All other engine submodules are within the 1000 LOC limit.
@@ -27,28 +27,24 @@ use super::image::{build_image_prompt, run_qwen3vl_image, VisionBundle};
 use super::think::ThinkSplitter;
 use super::types::{GenerationRequest, GenerationToken, ModelLoadConfig};
 
-// ── Gemma4Generator ───────────────────────────────────────────────────────────
+// ── ArchGenerator ─────────────────────────────────────────────────────────────
 
-/// Real generator backed by `rmlx_models::arch`.
-///
-/// One instance per loaded model. Holds the arch-dispatched model, tokenizer,
-/// and device choice. A `Mutex` enforces single-inflight generation: Apple
-/// Silicon Metal context is exclusive per process, and even the CPU path is not
-/// thread-safe due to MLX's per-stream thread allocation.
-///
-/// Stage 1 constraint: generation is O(n²) per token (no KV cache). The
-/// max_tokens cap in the route layer keeps wall-clock bounded.
+/// Architecture-agnostic HTTP generation engine. Loads any registry arch via
+/// `rmlx_models::arch::load_model` and dispatches through the `Architecture` enum.
 #[allow(
     clippy::exhaustive_structs,
     reason = "internal generator implementation — field set is coupled to the model-load lifecycle; adding a field requires updating from_snapshot and all constructors"
 )]
-pub struct Gemma4Generator {
+pub struct ArchGenerator {
     model: Arc<rmlx_models::arch::Architecture>,
     tokenizer: Arc<tokenizers::Tokenizer>,
     device: rmlx_mlx::Device,
     model_id: String,
     /// Serialises concurrent calls. A second request blocks until the first
     /// finishes. `tracing::warn!` fires so the operator can see contention.
+    /// Serialisation covers the CPU path too: the Metal context is exclusive
+    /// per process and MLX allocates compute threads per stream, so concurrent
+    /// generation is unsafe regardless of whether a request runs on GPU or CPU.
     /// Wrapped in `Arc` so a clone of the handle can be moved into `spawn_blocking`.
     _lock: Arc<Mutex<()>>,
     /// Server-startup-time KV quantization override. `None` = arch default.
@@ -86,16 +82,16 @@ pub struct Gemma4Generator {
     mm_cache: Option<Arc<rmlx_models::multimodal_cache::MultimodalCache>>,
 }
 
-impl std::fmt::Debug for Gemma4Generator {
+impl std::fmt::Debug for ArchGenerator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Gemma4Generator")
+        f.debug_struct("ArchGenerator")
             .field("model_id", &self.model_id)
             .field("device", &self.device)
             .finish()
     }
 }
 
-impl Gemma4Generator {
+impl ArchGenerator {
     /// Load weights, tokenizer, and derive `model_id` from the snapshot
     /// directory basename.
     ///
@@ -141,7 +137,7 @@ impl Gemma4Generator {
             ToOwned::to_owned,
         );
 
-        tracing::info!(model_id = %model_id, ?device, "Gemma4Generator: loading model via arch dispatch");
+        tracing::info!(model_id = %model_id, ?device, "ArchGenerator: loading model via arch dispatch");
 
         // Load config.json once for both kv-quant resolution and EOS-id
         // extraction.
@@ -162,7 +158,7 @@ impl Gemma4Generator {
         tracing::info!(
             model_id = %model_id,
             ?eos_ids,
-            "Gemma4Generator: parsed EOS token ids from config.json"
+            "ArchGenerator: parsed EOS token ids from config.json"
         );
 
         let model = rmlx_models::arch::load_model(
@@ -187,7 +183,7 @@ impl Gemma4Generator {
             if let Err(e) =
                 rmlx_kv_quant::precompile::precompile_kv_codec_msl(kq, head_dim, 1, device)
             {
-                tracing::warn!(error = %e, kv_quant = %kq, "Gemma4Generator: KV codec MSL precompile failed (non-fatal)");
+                tracing::warn!(error = %e, kv_quant = %kq, "ArchGenerator: KV codec MSL precompile failed (non-fatal)");
             }
         }
 
@@ -210,7 +206,7 @@ impl Gemma4Generator {
         tracing::debug!(
             model_id = %model_id,
             ?tokenizer_kind,
-            "Gemma4Generator: classified detokenizer family (A10)"
+            "ArchGenerator: classified detokenizer family (A10)"
         );
 
         // A2: derive effective_max_ctx for the per-request prompt-length guard.
@@ -364,7 +360,7 @@ impl Gemma4Generator {
             prompt_cache_slots,
             effective_max_ctx,
             has_vision = vision.is_some(),
-            "Gemma4Generator: ready"
+            "ArchGenerator: ready"
         );
 
         Ok(Self {
@@ -394,7 +390,7 @@ impl Gemma4Generator {
     }
 }
 
-impl Generator for Gemma4Generator {
+impl Generator for ArchGenerator {
     fn effective_max_ctx(&self) -> usize {
         self.effective_max_ctx
     }
@@ -710,7 +706,7 @@ impl Generator for Gemma4Generator {
                 } else {
                     tracing::warn!(
                         model_id = %model_id_for_log,
-                        "Gemma4Generator: concurrent generation — waiting for lock \
+                        "ArchGenerator: concurrent generation — waiting for lock \
                          (Stage 1 allows only one inflight generation at a time)"
                     );
                     lock.lock()

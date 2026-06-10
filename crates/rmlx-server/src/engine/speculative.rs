@@ -436,7 +436,7 @@ impl SpeculativeGenerator {
         let k: usize = 4;
 
         // A2: derive effective_max_ctx from the verifier's positional limit.
-        // Same formula as Gemma4Generator above. Speculative inherits the
+        // Same formula as ArchGenerator above. Speculative inherits the
         // verifier's KV-cache sizing, so its positional bound is what matters.
         let mpe_raw = dispatcher.verifier.max_position_embeddings();
         let mpe: usize = if mpe_raw <= 0 { 4096 } else { mpe_raw as usize };
@@ -461,7 +461,7 @@ impl SpeculativeGenerator {
             tokenizer: Arc::new(tokenizer),
             device,
             model_id,
-            // C4: shared process-wide GPU gate (see Gemma4Generator above).
+            // C4: shared process-wide GPU gate (see ArchGenerator above).
             _lock: gpu_gate,
             kv_quant_override: kv_quant_resolved,
             kv_quant_user_explicit,
@@ -573,7 +573,7 @@ impl Generator for SpeculativeGenerator {
         let lock = Arc::clone(&self._lock);
         // Issue #26: per-request `kv_quant` override wins over the launch
         // default (explicit or per-ctx auto), scoped to this request only.
-        // Same ctx-based auto selection as Gemma4Generator.
+        // Same ctx-based auto selection as ArchGenerator.
         let kv_quant_override = if let Some(rq) = req.kv_quant_override {
             tracing::info!(
                 ?rq,
@@ -610,7 +610,7 @@ impl Generator for SpeculativeGenerator {
         // layer off-runtime; only ITL/kv_cache_bytes are written here).
         let event_recorder = req.event_recorder;
         // C5 Slice A: hold the FIFO admission guard for the lifetime of the
-        // blocking decode (mirrors Gemma4Generator). Released on completion.
+        // blocking decode (mirrors ArchGenerator). Released on completion.
         let gpu_admission = req.gpu_admission;
         // A6.3 Option SK: speculative decode cannot honor a stateful
         // grammar — the K+1 verifier argmax has no per-token mask hook
@@ -665,7 +665,7 @@ impl Generator for SpeculativeGenerator {
                 "SpeculativeGenerator: stochastic acceptance active (Leviathan)"
             );
         }
-        // A3: think_splitter mirrors Gemma4Generator. Speculative wraps a
+        // A3: think_splitter mirrors ArchGenerator. Speculative wraps a
         // verifier `Architecture` so we can ask it directly. Today the
         // verifier is Gemma4 in all production paths (Qwen3 speculative
         // is unimplemented per L36 N48), so this is always `None`, but
@@ -689,11 +689,11 @@ impl Generator for SpeculativeGenerator {
             None
         };
         // A5.6: reconstruct suppressed tool-protocol markers (see
-        // Gemma4Generator site for rationale).
+        // ArchGenerator site for rationale).
         let emit_tool_markers = req.emit_tool_markers;
 
         // Use spawn_blocking instead of std::thread::spawn (same rationale
-        // as Gemma4Generator above).
+        // as ArchGenerator above).
         tokio::task::spawn_blocking(move || {
             let _guard = {
                 let try_result = lock.try_lock();
@@ -709,26 +709,26 @@ impl Generator for SpeculativeGenerator {
             };
 
             // C5 Slice A: hold the FIFO admission guard for the whole decode
-            // (mirrors Gemma4Generator). Released on closure exit.
+            // (mirrors ArchGenerator). Released on closure exit.
             let _gpu_admission = gpu_admission;
 
             tracing::debug!(model_id = %model_id_for_log, k, "spec generate: blocking thread started");
 
             // Full-prefix decode → byte-diff per token (mirrors
-            // Gemma4Generator). Speculative emits in bursts of accept+1
+            // ArchGenerator). Speculative emits in bursts of accept+1
             // tokens per round; the diff-emit pattern handles bursts
             // transparently — each ProbeStep call appends one id and
             // re-decodes the full prefix.
             //
             // A10: owned by `StreamingDetokenizer` (UTF-8 token-healing —
-            // see Gemma4Generator site). A multi-byte codepoint split by a
+            // see ArchGenerator site). A multi-byte codepoint split by a
             // speculative round boundary is held until the next ProbeStep
             // completes it.
             let mut detok = crate::detokenizer::StreamingDetokenizer::new(tokenizer_kind);
             // M30: pre-allocated per-step timestamps for ITL computation.
             let mut step_timestamps: Vec<Instant> = Vec::with_capacity(n_tokens);
             let mut cancelled = false;
-            // A3: same shape as Gemma4Generator — `None` for non-reasoning archs.
+            // A3: same shape as ArchGenerator — `None` for non-reasoning archs.
             let mut think_splitter = think_splitter;
             let tx_ref = &tx;
             let cancelled_ref = &mut cancelled;
@@ -760,7 +760,7 @@ impl Generator for SpeculativeGenerator {
                     }
                 };
                 // A5.6: reconstruct suppressed Gemma tool markers (see
-                // Gemma4Generator site for the full rationale).
+                // ArchGenerator site for the full rationale).
                 if emit_tool_markers && text.is_empty() {
                     if let Some(surface) = tokenizer_ref.id_to_token(s.token_id) {
                         if is_reconstructible_tool_marker(&surface) {
@@ -899,7 +899,7 @@ impl Generator for SpeculativeGenerator {
                 return;
             }
 
-            // M30: compute ITL stats from step timestamps and emit (same as Gemma4Generator).
+            // M30: compute ITL stats from step timestamps and emit (same as ArchGenerator).
             {
                 let itl_opt = compute_itl_stats(&step_timestamps);
                 if let Some((p50, p95, p99, mean, spikes)) = itl_opt {
@@ -1046,7 +1046,7 @@ impl Generator for SpeculativeGenerator {
                         }
                     }
                     // A10: flush any withheld multi-byte tail (see
-                    // Gemma4Generator site for rationale).
+                    // ArchGenerator site for rationale).
                     if !cancelled {
                         match detok.finalize(&tokenizer) {
                             Ok(tail) if !tail.is_empty() => {
@@ -1071,7 +1071,7 @@ impl Generator for SpeculativeGenerator {
                         piece: String::new(),
                         done: true,
                         finish_reason: Some(finish_reason),
-                        // A3: see Gemma4Generator done-token comment.
+                        // A3: see ArchGenerator done-token comment.
                         is_thinking: false,
                         logprobs: None,
                     };
