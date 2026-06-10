@@ -134,7 +134,11 @@ impl Gemma4Router {
         // mlx-lm: `mx.fast.rms_norm(x, self.scale * self._root_size, self.eps)`.
         // The `scale * root_size` could be baked at load-time (sub-1% gain);
         // keeping per-call to preserve weight tying with checkpoint.
-        let rs = scalar_f32(self.root_size);
+        // Cast the root-size scalar to the activation dtype first: a strong-f32
+        // scalar would promote `scaled_weight` (and thus the RMSNorm output, the
+        // expert scores, and the routing weights) to f32, leaking f32 into the
+        // MoE residual stream — keep the stream in the model dtype (bf16).
+        let rs = scalar_f32(self.root_size).astype(x.dtype(), device)?;
         let scaled_weight = multiply(&self.scale, &rs, device)?;
         let x_normed = rms_norm(x, Some(&scaled_weight), self.eps, device)?;
 
