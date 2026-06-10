@@ -1,0 +1,35 @@
+# golden tokens — tag=medgemma_4b_k8v8 kv_quant=k8v8
+# n_tokens=32
+# decoded: "\n\nThe sky appears blue during the day because of the way Earth's atmosphere scatters sunlight. Blue light waves are shorter than red light waves, and they"
+108
+818
+7217
+7412
+3730
+1913
+506
+1719
+1547
+529
+506
+1595
+10824
+236789
+236751
+11661
+141891
+1826
+26808
+236761
+9595
+2214
+11707
+659
+20532
+1082
+2604
+2214
+11707
+236764
+532
+901
