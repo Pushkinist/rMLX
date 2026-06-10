@@ -89,7 +89,7 @@ run_once() {
         --prompt-tokens "${PROMPT_TOKENS}" \
         --max-tokens "${MAX_TOKENS}" \
         --max-ctx "${MAX_CTX}" \
-        "${extra_args[@]}" \
+        ${extra_args[@]+"${extra_args[@]}"} \
         2>/dev/null \
         | grep -o 'decode_tps=[0-9.]*' \
         | cut -d= -f2
