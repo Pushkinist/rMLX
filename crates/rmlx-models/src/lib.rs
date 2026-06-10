@@ -41,6 +41,7 @@ pub mod jina_v4;
 pub mod kv_cache;
 pub mod laguna;
 pub mod layers;
+pub(crate) mod load_util;
 pub mod multimodal_cache;
 pub mod paroquant_msl;
 pub mod ppl;
