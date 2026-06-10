@@ -156,6 +156,23 @@ impl SsdHydrator {
         self.layout_key
     }
 
+    /// Index lookup + recompute of the RAM-side seeded block-hash chain for the
+    /// matched block-aligned prefix. The seed partitions prompt-cache keys by KV
+    /// layout and codec; the arch-side recompute after hydrate MUST use this exact
+    /// formula or hydrated entries are unfindable in the RAM cache. (The index
+    /// probe inside `lookup()` has its own seed — they must agree.)
+    pub fn lookup_seeded(
+        &self,
+        prompt_ids: &[u32],
+    ) -> rmlx_core::error::Result<Option<(HydratedBlock, Vec<u64>)>> {
+        let Some(block) = self.lookup(prompt_ids)? else {
+            return Ok(None);
+        };
+        let seed = FNV_OFFSET ^ self.layout_key ^ self.kv_quant.cache_key_salt();
+        let hashes = chained_block_hashes_seeded(&block.prompt_ids, seed);
+        Ok(Some((block, hashes)))
+    }
+
     /// Look up + reconstruct the longest cached block-aligned prefix of
     /// `prompt_ids`. Returns `Ok(Some(_))` on an SSD hit, `Ok(None)` on a true
     /// miss **or** on corruption (after deleting the bad file + row + `warn!`).

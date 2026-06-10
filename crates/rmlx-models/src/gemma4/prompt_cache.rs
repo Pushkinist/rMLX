@@ -29,8 +29,7 @@
 use rmlx_core::error::Result;
 
 use crate::prompt_cache::{
-    chained_block_hashes_seeded, ArchPromptCache, CacheStats, PromptCacheEntry, ReusePolicy,
-    SsdHydrate, BLOCK_TOKENS, FNV_OFFSET,
+    ArchPromptCache, CacheStats, PromptCacheEntry, ReusePolicy, SsdHydrate, BLOCK_TOKENS,
 };
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 use rmlx_kv_ssd::{HydratedBlock, SsdHydrator};
@@ -158,7 +157,7 @@ impl PromptCacheEntry for Gemma4Entry {
 
 impl SsdHydrate<Gemma4Entry> for SsdHydrator {
     fn hydrate(&self, prompt_ids: &[u32]) -> Result<Option<Gemma4Entry>> {
-        let Some(block) = self.lookup(prompt_ids)? else {
+        let Some((block, block_hashes)) = self.lookup_seeded(prompt_ids)? else {
             return Ok(None);
         };
         let HydratedBlock {
@@ -166,10 +165,6 @@ impl SsdHydrate<Gemma4Entry> for SsdHydrator {
             kv_caches,
             lin_caches: _,
         } = block;
-        let block_hashes = chained_block_hashes_seeded(
-            &prompt_ids,
-            FNV_OFFSET ^ self.layout_key() ^ self.kv_quant().cache_key_salt(),
-        );
         Ok(Some(Gemma4Entry {
             prompt_token_ids: prompt_ids,
             block_hashes,

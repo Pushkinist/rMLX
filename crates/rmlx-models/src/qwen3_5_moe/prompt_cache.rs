@@ -30,10 +30,7 @@
 #![allow(clippy::redundant_closure_for_method_calls)]
 use rmlx_core::error::Result;
 
-use crate::prompt_cache::{
-    chained_block_hashes_seeded, ArchPromptCache, CacheStats, PromptCacheEntry, ReusePolicy,
-    SsdHydrate, FNV_OFFSET,
-};
+use crate::prompt_cache::{ArchPromptCache, CacheStats, PromptCacheEntry, ReusePolicy, SsdHydrate};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 use rmlx_kv_ssd::{HydratedBlock, SsdHydrator};
 
@@ -131,7 +128,7 @@ impl PromptCacheEntry for Qwen35MoeEntry {
 
 impl SsdHydrate<Qwen35MoeEntry> for SsdHydrator {
     fn hydrate(&self, prompt_ids: &[u32]) -> Result<Option<Qwen35MoeEntry>> {
-        let Some(block) = self.lookup(prompt_ids)? else {
+        let Some((block, block_hashes)) = self.lookup_seeded(prompt_ids)? else {
             return Ok(None);
         };
         let HydratedBlock {
@@ -139,10 +136,6 @@ impl SsdHydrate<Qwen35MoeEntry> for SsdHydrator {
             kv_caches,
             lin_caches,
         } = block;
-        let block_hashes = chained_block_hashes_seeded(
-            &prompt_ids,
-            FNV_OFFSET ^ self.layout_key() ^ self.kv_quant().cache_key_salt(),
-        );
         Ok(Some(Qwen35MoeEntry {
             prompt_token_ids: prompt_ids,
             block_hashes,
