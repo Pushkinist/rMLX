@@ -190,6 +190,92 @@ fn salted_keyed_block_is_found_by_probe() {
     assert_eq!(block.kv_caches.len(), 1, "one reconstructed layer");
 }
 
+/// `lookup_seeded` returns a `Vec<u64>` equal to the canonical seed recompute:
+/// `chained_block_hashes_seeded(&block.prompt_ids, FNV_OFFSET ^ layout_key ^ QUANT.cache_key_salt())`.
+/// Non-zero layout key + real codec salt exercise both components of the seed.
+///
+/// The input is TWO full blocks but only the FIRST block is indexed/spilled, so
+/// the matched prefix (`block.prompt_ids`) is one block while the input is two.
+/// This pins that `lookup_seeded` recomputes over the MATCHED PREFIX, not the
+/// full input — a regression hashing the input would return two digests and
+/// fail `hashes.len() == 1`.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: the first chained digest exists (full first block), and input_ids has 2*BLOCK_TOKENS elements so the [..BLOCK_TOKENS] slice is in range"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture setup: tempdir / index-open / write_caches / fs-metadata / record / lookup on a hermetic temp path; any failure is a test failure"
+)]
+fn lookup_seeded_matches_arch_recompute() {
+    const LK: u64 = 0x1234_5678_9abc_def0;
+
+    let device = Device::Cpu;
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let db = dir.join("index.db");
+    let index = SsdKvIndex::open_at(&db).unwrap();
+
+    // TWO full blocks of input, but only the FIRST block is indexed below — so
+    // the matched prefix is one block while the input is two.
+    let input_ids: Vec<u32> = (0..(2 * BLOCK_TOKENS) as u32).collect();
+    let first_block_ids = &input_ids[..BLOCK_TOKENS];
+
+    // Key the index row with the FIRST block's canonical salted digest. The
+    // chained hash is prefix-dependent, so the first digest of the 2-block input
+    // equals the digest of the lone first block — the probe inside lookup finds
+    // it after the (unindexed) 2-block digest misses.
+    let salted =
+        chained_block_hashes_seeded(first_block_ids, FNV_OFFSET ^ LK ^ QUANT.cache_key_salt());
+    assert_eq!(salted.len(), 1);
+    let key = hash_to_hex_local(salted[0]);
+
+    // Build + spill a single-block, single-layer cache, record the row.
+    let cache = build_kvcache(BLOCK_TOKENS as i32, 0x9F3C);
+    let path = dir.join(format!("{key}.kvb"));
+    write_caches(&path, device, MODEL_ID, QUANT, &[cache], &[]).unwrap();
+    let size = std::fs::metadata(&path).unwrap().len();
+    index
+        .record(&key, LK, &path, MODEL_ID, &QUANT.to_string(), size)
+        .unwrap();
+
+    let hydrator = SsdHydrator::with_index(MODEL_ID, QUANT, LK, device, dir, index);
+    let (block, hashes) = hydrator
+        .lookup_seeded(&input_ids)
+        .unwrap()
+        .expect("lookup_seeded must find the first-block prefix of the 2-block input");
+
+    // Only the first block matched.
+    assert_eq!(
+        block.prompt_ids.len(),
+        BLOCK_TOKENS,
+        "matched prefix is the single indexed block, not the full input"
+    );
+    assert_eq!(
+        block.prompt_ids, first_block_ids,
+        "matched prefix == first block"
+    );
+    // Recompute is over the MATCHED PREFIX (one block → one digest), not the
+    // 2-block input (which would be two digests).
+    assert_eq!(
+        hashes.len(),
+        1,
+        "lookup_seeded recomputes over the matched prefix, not the full input"
+    );
+    let expected =
+        chained_block_hashes_seeded(&block.prompt_ids, FNV_OFFSET ^ LK ^ QUANT.cache_key_salt());
+    assert_eq!(
+        hashes, expected,
+        "lookup_seeded block_hashes must equal the canonical seed recompute"
+    );
+    assert_eq!(block.kv_caches.len(), 1, "one reconstructed layer");
+}
+
 /// (b): a corrupt `.kvb` (garbled bytes) → the file + index row are deleted
 /// and `lookup` returns `None` (fall back to prefill). No panic.
 #[test]

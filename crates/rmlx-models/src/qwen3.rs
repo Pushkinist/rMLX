@@ -228,7 +228,7 @@ fn qwen3_active_layout_key() -> u64 {
 /// `first_piece` are sentinels (the SSD block stores no first decode token).
 impl SsdHydrate<Qwen3Entry> for SsdHydrator {
     fn hydrate(&self, prompt_ids: &[u32]) -> Result<Option<Qwen3Entry>> {
-        let Some(block) = self.lookup(prompt_ids)? else {
+        let Some((block, block_hashes)) = self.lookup_seeded(prompt_ids)? else {
             return Ok(None);
         };
         let HydratedBlock {
@@ -236,10 +236,6 @@ impl SsdHydrate<Qwen3Entry> for SsdHydrator {
             kv_caches,
             lin_caches: _, // pure-attention arch has no GDN state
         } = block;
-        let block_hashes = chained_block_hashes_seeded(
-            &prompt_ids,
-            FNV_OFFSET ^ self.layout_key() ^ self.kv_quant().cache_key_salt(),
-        );
         Ok(Some(Qwen3Entry {
             prompt_token_ids: prompt_ids,
             block_hashes,

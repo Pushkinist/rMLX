@@ -1,5 +1,5 @@
 use super::*;
-use crate::prompt_cache::PromptCache;
+use crate::prompt_cache::{PromptCache, FNV_OFFSET};
 use rmlx_kv_quant::KvQuant;
 
 fn entry_with(kv_caches: Vec<KvCache>, ids: Vec<u32>) -> Gemma4Entry {
