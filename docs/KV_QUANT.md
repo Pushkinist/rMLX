@@ -319,7 +319,7 @@ lazily on first prefill. It warms the shared q8_0 K-side kernels for every q8-K
 MSL codec, plus the tq4 / planar V kernel for `k8v4` / `rot_k_tq4v` / `planar`.
 Best-effort — a warm failure logs
 `warn!` and proceeds (the kernel then compiles lazily on first use, the
-previous lazy-compile behaviour). Wired into `Gemma4Generator::from_snapshot_with_id` (the
+previous lazy-compile behaviour). Wired into `ArchGenerator::from_snapshot_with_id` (the
 single server-side generator factory all archs route through).
 
 ### CPU-codec classification at resolve time

@@ -2,17 +2,17 @@
 //!
 //! `Generator` is the single seam between the HTTP routes and the actual
 //! inference engine. `NotReadyGenerator` is the placeholder (returns 503).
-//! `Gemma4Generator` is the real engine backed by rmlx-models::gemma4.
+//! `ArchGenerator` is the real engine backed by rmlx-models::arch.
 //!
 //! Submodules:
-//! - `types`      — Phase, NormalizedTool, SamplingParams, GenerationRequest,
+//! - `types`         — Phase, NormalizedTool, SamplingParams, GenerationRequest,
 //!   GpuAdmission, Admission, admit_request, GenerationToken
-//! - `think`      — ThinkSplitter `<think>...</think>` state machine
-//! - `generator`  — Generator trait + NotReadyGenerator placeholder
-//! - `image`      — VisionBundle, build_image_prompt, run_qwen3vl_image
-//! - `gemma4`     — Gemma4Generator (real arch-dispatch engine)
-//! - `speculative` — SpeculativeGenerator (greedy speculative decoding)
-//! - `helpers`    — shared private helpers (ITL/TTFT writers, kv_quant_label, etc.)
+//! - `think`         — ThinkSplitter `<think>...</think>` state machine
+//! - `generator`     — Generator trait + NotReadyGenerator placeholder
+//! - `image`         — VisionBundle, build_image_prompt, run_qwen3vl_image
+//! - `arch_generator` — ArchGenerator (real arch-dispatch engine)
+//! - `speculative`   — SpeculativeGenerator (greedy speculative decoding)
+//! - `helpers`       — shared private helpers (ITL/TTFT writers, kv_quant_label, etc.)
 
 #![allow(
     clippy::cognitive_complexity,
@@ -25,7 +25,7 @@
     trivial_casts
 )]
 
-pub(crate) mod gemma4;
+pub(crate) mod arch_generator;
 pub(crate) mod generator;
 pub(crate) mod helpers;
 pub(crate) mod image;
@@ -38,7 +38,7 @@ mod tests;
 
 // ── Public API surface (frozen — matches lib.rs pub use) ─────────────────────
 
-pub use gemma4::Gemma4Generator;
+pub use arch_generator::ArchGenerator;
 pub use generator::{Generator, NotReadyGenerator};
 pub use speculative::SpeculativeGenerator;
 pub use types::{

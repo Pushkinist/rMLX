@@ -12,7 +12,7 @@
 //! ## How slot reservation works
 //!
 //! `SessionCache` tracks active sessions and reports `active_count()`. The
-//! caller (`Gemma4Generator::generate`) passes
+//! caller (`ArchGenerator::generate`) passes
 //! `base_slots + session_cache.active_count()` as `prompt_cache_slots` to
 //! `generate_greedy`. This increases the per-arch PromptCache capacity so
 //! there is always headroom for every active session, preventing FIFO eviction
@@ -84,7 +84,7 @@ pub struct SessionKey {
 /// LRU registry of active sessions.
 ///
 /// `Mutex<SessionCache>` is held in `AppState` and accessed from
-/// `Gemma4Generator::generate` (inside `spawn_blocking`).
+/// `ArchGenerator::generate` (inside `spawn_blocking`).
 pub struct SessionCache {
     entries: HashMap<SessionKey, SessionEntry>,
     max_sessions: usize,
