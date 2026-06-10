@@ -590,6 +590,7 @@ pub fn generate_greedy<'a>(
         prompt_ids,
         prefill_chunk,
         device,
+        "Qwen3_5MoeForConditionalGeneration",
         |chunk, kv| model.forward_seq_with_cache(chunk, Some(kv), Some(&mut lin_caches), device),
     )?
     else {
