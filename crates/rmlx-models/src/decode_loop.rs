@@ -453,6 +453,7 @@ pub(crate) fn chunked_prefill(
     ids: &[u32],
     chunk_size: usize,
     device: Device,
+    arch: &'static str,
     mut forward_chunk: impl FnMut(&[u32], &mut Vec<KvCache>) -> Result<Array>,
 ) -> Result<Option<Array>> {
     for c in caches.iter_mut() {
@@ -473,6 +474,7 @@ pub(crate) fn chunked_prefill(
                     for c in caches.iter() {
                         if let Err(e) = c.eval_prefill_state() {
                             tracing::warn!(
+                                arch,
                                 error = %e,
                                 chunk_len = chunk.len(),
                                 "prefill chunk cache eval failed"
@@ -485,6 +487,7 @@ pub(crate) fn chunked_prefill(
             }
             Err(e) => {
                 tracing::warn!(
+                    arch,
                     error = %e,
                     prompt_len = ids.len(),
                     "prefill chunk failed, returning empty"
@@ -496,7 +499,7 @@ pub(crate) fn chunked_prefill(
     }
     for c in caches.iter_mut() {
         if let Err(e) = c.exit_prefill(device) {
-            tracing::warn!(error = %e, "prefill: exit_prefill quantization failed");
+            tracing::warn!(arch, error = %e, "prefill: exit_prefill quantization failed");
             prefill_ok = false;
             break;
         }
