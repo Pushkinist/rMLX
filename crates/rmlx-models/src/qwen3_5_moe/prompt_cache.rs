@@ -14,8 +14,9 @@
 //!   which spills both `kv_caches()` and `lin_caches()` (hybrid).
 //! - `impl SsdHydrate<Qwen35MoeEntry> for SsdHydrator`: hybrid hydrate.
 //!
-//! The per-arch shell (`PROMPT_CACHE`, attach/ensure/stats wrappers) is pure
-//! delegation to `ArchPromptCache`.
+//! The per-arch shell (`PROMPT_CACHE`, ensure/stats wrappers) is pure
+//! delegation to `ArchPromptCache`; SSD attach is invoked directly on the
+//! static from `ssd_tier.rs`.
 //!
 //! ## Reuse policy — Exact-only (hard runtime gate, )
 //!
@@ -163,16 +164,6 @@ impl SsdHydrate<Qwen35MoeEntry> for SsdHydrator {
 /// any `Some(_)` non-Exact match to `CacheLookup::Miss`.
 pub(crate) static PROMPT_CACHE: ArchPromptCache<Qwen35MoeEntry> =
     ArchPromptCache::new("Qwen3_5MoeForConditionalGeneration", ReusePolicy::ExactOnly);
-
-/// Wire the spiller + hydrator onto the Qwen3.5-MoE prompt cache.
-pub(crate) fn attach_ssd_tier(
-    namespace: &str,
-    kv_quant: KvQuant,
-    layout_key: u64,
-    device: rmlx_mlx::Device,
-) {
-    PROMPT_CACHE.attach_ssd_tier(namespace, kv_quant, layout_key, device);
-}
 
 /// active SSD-tier `layout_key`, or `0` when tier OFF.
 pub(crate) fn active_layout_key() -> u64 {
