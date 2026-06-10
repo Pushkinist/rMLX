@@ -1,6 +1,6 @@
 //! Smoke-probe types: [`ProbeStep`], [`SmokeVerdict`], byte-level logit helpers.
 
-use rmlx_mlx::{Array, Dtype};
+use rmlx_mlx::Dtype;
 
 use crate::sampler::TokenLogprobs;
 
@@ -69,35 +69,6 @@ pub enum SmokeVerdict {
         /// Human-readable explanation of why the verdict is inconclusive.
         reason: String,
     },
-}
-
-/// capture top-`k` logprobs for an already-chosen token.
-///
-/// Called ONLY behind a `k > 0` guard at every decode-loop call site, so the
-/// default decode path (no logprobs requested) never touches log-softmax /
-/// top-k and stays byte-identical. `chosen` is the sampled/argmax token Array
-/// (`[1] I32`); it is materialised here so we can pin the chosen token's own
-/// logprob to the same logits the rest of `top` is computed from. Errors are
-/// downgraded to `None` — logprob capture must never abort generation.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-)]
-#[allow(
-    clippy::unwrap_used,
-    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
-)]
-pub(super) fn capture_logprobs(
-    logits_flat: &Array,
-    chosen: &Array,
-    k: usize,
-) -> Option<TokenLogprobs> {
-    let top_bytes = match chosen.to_bytes() {
-        Ok(b) if b.len() >= 4 => b,
-        _ => return None,
-    };
-    let chosen_id = i32::from_le_bytes(top_bytes[..4].try_into().unwrap()) as u32;
-    crate::sampler::compute_top_logprobs(logits_flat, chosen_id, k).ok()
 }
 
 // ---------------------------------------------------------------------------

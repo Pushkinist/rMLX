@@ -33,19 +33,21 @@ mod tests;
 pub(super) mod types;
 
 pub use classify::classify_smoke;
-use types::{capture_logprobs, count_nan_in_bytes, max_abs_from_bytes};
+use types::{count_nan_in_bytes, max_abs_from_bytes};
 pub use types::{ProbeStep, SmokeVerdict};
 
-use rmlx_mlx::{argmax, Array, Device, Dtype};
+use rmlx_mlx::{Array, Device};
 use tracing::info_span;
 
 use crate::constraint::ConstraintEngine;
+use crate::decode_loop::{
+    capture_logprobs, choose_token, chunked_prefill, pipelined_decode, DecodeCtx,
+};
 use crate::kv_cache::{
     kv_max_seq_and_ceiling, kv_quant_for_layer, warn_if_kv_codec_net_negative, KvLayerShape,
     LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
 };
 use crate::prompt_cache::PromptCacheEntry as _;
-use crate::sampler::{apply_mask_argmax, TokenLogprobs};
 use rmlx_kv_quant::{KvCache, KvQuant};
 
 use super::model::Gemma4Text;
@@ -76,30 +78,33 @@ use super::prompt_cache::{ensure_prompt_cache, store_kv_cache_bytes, Gemma4Entry
     clippy::unwrap_used,
     reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
 )]
-pub fn generate_greedy(
+pub fn generate_greedy<'a>(
     model: &Gemma4Text,
-    tokenizer: &tokenizers::Tokenizer,
+    tokenizer: &'a tokenizers::Tokenizer,
     prompt_ids: &[u32],
     n_tokens: usize,
     device: Device,
     kv_quant: KvQuant,
     max_ctx_override: Option<i32>,
     prompt_cache_slots: usize,
-    eos_ids: &[u32],
-    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    eos_ids: &'a [u32],
+    // The shared `DecodeCtx` bundles every per-request borrow under one
+    // lifetime, so these references share `'a` (a `&mut dyn` trait-object
+    // reborrow is invariant and cannot be re-unified once split).
+    step_fn: &'a mut dyn FnMut(&ProbeStep) -> Option<u32>,
     // A6.2: optional sampler constraint. `None` = unmasked argmax (the hot
     // path; identical to pre-A6.2 behaviour). `Some(_)` enables the masked
     // branch at every argmax call site below.
-    mut constraint: Option<&mut dyn ConstraintEngine>,
+    mut constraint: Option<&'a mut dyn ConstraintEngine>,
     // A7.2: sampling config + per-request RNG. `temperature <= 0.0` keeps the
     // untouched greedy argmax path (`sampler_cfg.sampling_active() == false`).
-    sampler_cfg: &crate::sampler::SamplerConfig,
-    rng: &mut crate::sampler::Pcg32,
+    sampler_cfg: &'a crate::sampler::SamplerConfig,
+    rng: &'a mut crate::sampler::Pcg32,
     // A7.3: logit-penalty configuration + per-request token history.
     // `penalty_cfg.penalties_active() == false` AND `!sampler_cfg.sampling_active()`
     // keeps the temp=0 pure-GPU argmax path byte-for-byte untouched.
-    penalty_cfg: &crate::sampler::PenaltyConfig,
-    token_history: &mut Vec<u32>,
+    penalty_cfg: &'a crate::sampler::PenaltyConfig,
+    token_history: &'a mut Vec<u32>,
     // optional precomputed multimodal prefill. `Some((embeds,
     // masked_ids))` carries the scatter-merged `inputs_embeds` `[1, seq,
     // hidden]` (text + vision features at image-token positions) and the
@@ -129,14 +134,6 @@ pub fn generate_greedy(
 
     let vocab = model.cfg.vocab_size as i32;
     let mut steps = Vec::with_capacity(n_tokens);
-
-    // ------------------------------------------------------------------
-    // Decode profile timers. Coarse boundaries only.
-    // ------------------------------------------------------------------
-    let mut forward_total_ns: u128 = 0;
-    let mut eval_total_ns: u128 = 0;
-    let mut step_total_ns: u128 = 0;
-    let mut decode_steps: u32 = 0;
 
     ensure_prompt_cache(prompt_cache_slots);
 
@@ -366,303 +363,64 @@ pub fn generate_greedy(
         kv_max_seq_and_ceiling(max_ctx_override, model.cfg.max_position_embeddings as i32);
 
     // ------------------------------------------------------------------
-    // Helper: decode loop — shared across exact-hit / prefix-hit / miss paths.
-    // Takes ownership of kv_caches and the initial last_id.
-    //
-    // A6.2: the macro accesses `constraint` from outer scope. The `None`
-    // branch resolves at runtime to a single discriminant check on
-    // `Option::as_mut()` and the same `argmax(...)` call as before; LLVM
-    // optimises the unmasked path to be identical to the pre-A6.2 code.
-    // The `Some(_)` branch builds a vocab-sized mask buffer and uses
-    // `apply_mask_argmax` — pays an extra GPU sync per step. Acceptable:
-    // only `response_format ∈ {json_object, json_schema}` requests enter
-    // the masked branch, and A6.2 wires only `NoOpConstraint` for them
-    // (output is unchanged at temp=0).
-    //
-    // A7.3: `penalty_cfg` and `token_history` are also accessed from outer
-    // scope. `penalties_active()` is folded into `drain_now` so the temp=0
-    // no-penalty path stays the untouched GPU argmax path byte-for-byte.
-    // ------------------------------------------------------------------
-    macro_rules! run_decode {
-        ($kv_caches:expr, $last_id:expr) => {{
-            let mut kv_caches = $kv_caches;
-            let last_id: u32 = $last_id;
-
-            if eos_ids.contains(&last_id) {
-                return Ok(steps);
-            }
-
-            let mut y: Array = {
-                let id_i32 = last_id as i32;
-                let bytes = id_i32.to_le_bytes();
-                Array::from_bytes(&bytes, &[1], Dtype::I32)?
-            };
-            y.eval()?;
-            let mut pending: Option<Array> = None;
- // logprobs captured at sample time travel with `pending` (the
- // token they belong to is emitted one iteration later). `None` on
- // the disabled path (`lp_k == 0`) — never allocated, never read.
-            let mut pending_logprobs: Option<TokenLogprobs> = None;
-            let mut early_stop = false;
-
-            let _decode_span = info_span!("decode", n_tokens).entered();
-
-            for step_idx in 1..n_tokens {
-                let step_t0 = Instant::now();
-                let fwd_t0 = Instant::now();
-                let decode_logits =
-                    match model.forward_arr(&y, 1, Some(&mut kv_caches), device) {
-                        Ok(l) => l,
-                        Err(e) => {
-                            tracing::warn!(
-                                step = step_idx,
-                                error = %e,
-                                "gemma4 generate_greedy: decode step failed, stopping early"
-                            );
-                            break;
-                        }
-                    };
-
-                let logits_flat = decode_logits.reshape(&[1, vocab], device)?;
- // A6.3: when the engine is engaged (`wants_mask`), the mask
- // for step N must reflect the state AFTER step N-1's token
- // was advance()'d into the grammar — so we pre-drain the
- // prev pending token, accept the per-step GPU sync, and
- // build the mask off fresh state. During warm-up (constraint
- // present but inert) and when constraint=None, we keep the
- // pipelined no-mask path so argmax dtype + scheduling are
- // bit-identical to the unconstrained baseline.
-                let mask_active =
-                    constraint.as_ref().map(|c| c.wants_mask()).unwrap_or(false);
- // A7.2: temp>0 reads logits to host every step (no async
- // pipelining benefit), so it shares the masked branch's
- // pre-drain path. temp<=0 keeps the exact `mask_active`-gated
- // pipelined behaviour byte-for-byte.
-                let sampling_active = sampler_cfg.sampling_active();
- // A7.3: penalties also require logits on host → fold into
- // drain_now. temp=0 AND !penalties_active AND !mask_active
- // keeps the pure-GPU argmax path byte-for-byte untouched.
-                let penalties_active = penalty_cfg.penalties_active();
- // logprob capture needs host logits per step → also drains.
-                let lp_k = sampler_cfg.top_logprobs_k as usize;
-                let drain_now = mask_active || sampling_active || penalties_active || lp_k > 0;
- // Force eager eval of logits when the constraint mask is active.
- // Lazy logits_flat combined with an unresolved `y` alias can
- // cause the argmax to read stale GPU data on the masked path.
-                if mask_active {
-                    logits_flat.eval()?;
-                }
-                let pre_drain_eos = if drain_now {
-                    if let Some(p) = pending.take() {
-                        let top_bytes = p.to_bytes()?;
-                        let next_id =
-                            i32::from_le_bytes(top_bytes[..4].try_into().unwrap()) as u32;
-                        if let Some(c) = constraint.as_mut() {
-                            c.advance(next_id);
-                        }
- // A7.3: accumulate emitted token into history.
-                        token_history.push(next_id);
-                        let piece = tokenizer
-                            .id_to_token(next_id)
-                            .unwrap_or_else(|| format!("<unk:{next_id}>"));
-                        steps.push(ProbeStep {
-                            token_id: next_id,
-                            piece: piece.into_boxed_str(),
-                            max_abs_logit: 0.0,
-                            nan_count: 0,
- // logprobs computed when this token was sampled.
-                            logprobs: pending_logprobs.take(),
-                        });
-                        step_fn(steps.last().unwrap());
-                        eos_ids.contains(&next_id)
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-                if pre_drain_eos {
-                    early_stop = true;
-                    tracing::debug!(
-                        step = step_idx - 1,
-                        "gemma4 generate_greedy: EOS emitted (pre-drain, masked), stopping"
-                    );
-                    break;
-                }
- // A7.3: build trailing-20 window for penalty application.
-                let win_start = token_history.len().saturating_sub(20);
-                let recent = &token_history[win_start..];
-                let next_y = if !sampling_active {
-                    if penalties_active {
- // temp=0 + penalties: GPU→host, apply penalties, host argmax.
-                        let mask_opt: Option<&[bool]> = if mask_active {
-                            Some(constraint.as_mut().unwrap().step_mask(vocab as usize))
-                        } else {
-                            None
-                        };
-                        crate::sampler::argmax_with_penalties(
-                            &logits_flat,
-                            mask_opt,
-                            penalty_cfg,
-                            recent,
-                            device,
-                        )?
-                    } else if mask_active {
-                        let c = constraint.as_mut().unwrap();
-                        let m = c.step_mask(vocab as usize);
-                        apply_mask_argmax(&logits_flat, m, device)?
-                    } else {
- // Untouched pure-GPU argmax (the common fast path).
-                        argmax(&logits_flat, -1, device)?
-                    }
-                } else {
-                    let mask_opt: Option<&[bool]> = if mask_active {
-                        Some(constraint.as_mut().unwrap().step_mask(vocab as usize))
-                    } else {
-                        None
-                    };
-                    crate::sampler::sample_token_array(
-                        &logits_flat,
-                        sampler_cfg,
-                        mask_opt,
-                        penalty_cfg,
-                        recent,
-                        rng,
-                        device,
-                    )?
-                };
-                let _ = next_y.async_eval();
- // capture this step's logprobs from `logits_flat` + the
- // chosen token. Stashed in `pending_logprobs`; emitted with the
- // matching ProbeStep next iteration (pipelined token identity).
-                if lp_k > 0 {
-                    pending_logprobs = capture_logprobs(&logits_flat, &next_y, lp_k);
-                }
-                let fwd_dt = fwd_t0.elapsed().as_nanos();
-
-                let eval_t0 = Instant::now();
-                let mut emitted_eos = false;
- // Unconstrained branch + warm-up: drain prev pending here
- // (original pipelined behaviour). Masked / sampling / penalty
- // branch already drained above.
-                if !drain_now {
-                    if let Some(p) = pending.take() {
-                    let top_bytes = p.to_bytes()?;
-                    let next_id =
-                        i32::from_le_bytes(top_bytes[..4].try_into().unwrap()) as u32;
- // A6.3: keep the engine in sync during warm-up so it
- // can detect the engagement byte.
-                    if let Some(c) = constraint.as_mut() {
-                        c.advance(next_id);
-                    }
- // A7.3: accumulate pipelined token into history.
-                    token_history.push(next_id);
-                    let piece = tokenizer
-                        .id_to_token(next_id)
-                        .unwrap_or_else(|| format!("<unk:{next_id}>"));
-                    tracing::debug!(
-                        step = step_idx - 1,
-                        token_id = next_id,
-                        piece = %piece,
-                        "gemma4 generate_greedy decode step (pipelined emit)"
-                    );
-                    steps.push(ProbeStep {
-                        token_id: next_id,
-                        piece: piece.into_boxed_str(),
-                        max_abs_logit: 0.0,
-                        nan_count: 0,
-                        logprobs: None,
-                    });
-                    step_fn(steps.last().unwrap());
-                    emitted_eos = eos_ids.contains(&next_id);
-                    }
-                }
-                let eval_dt = eval_t0.elapsed().as_nanos();
-
-                forward_total_ns += fwd_dt;
-                eval_total_ns += eval_dt;
-                step_total_ns += step_t0.elapsed().as_nanos();
-                decode_steps += 1;
-
-                if emitted_eos {
-                    early_stop = true;
-                    tracing::debug!(
-                        step = step_idx - 1,
-                        "gemma4 generate_greedy: EOS emitted, stopping decode loop"
-                    );
-                    break;
-                }
-
-                y = next_y.try_clone()?;
-                pending = Some(next_y);
-            }
-
-            if !early_stop {
-                if let Some(p) = pending {
-                    let drain_t0 = Instant::now();
-                    p.eval()?;
-                    let top_bytes = p.to_bytes()?;
-                    eval_total_ns += drain_t0.elapsed().as_nanos();
-                    let next_id =
-                        i32::from_le_bytes(top_bytes[..4].try_into().unwrap()) as u32;
- // A6.3: advance constraint on final drain. On both
- // branches `pending` carries the last emitted token of
- // the decode loop.
-                    if let Some(c) = constraint.as_mut() {
-                        c.advance(next_id);
-                    }
- // A7.3: final drain token into history.
-                    token_history.push(next_id);
-                    let piece = tokenizer
-                        .id_to_token(next_id)
-                        .unwrap_or_else(|| format!("<unk:{next_id}>"));
-                    steps.push(ProbeStep {
-                        token_id: next_id,
-                        piece: piece.into_boxed_str(),
-                        max_abs_logit: 0.0,
-                        nan_count: 0,
- // final pending token carries its sample-time logprobs.
-                        logprobs: pending_logprobs.take(),
-                    });
-                    step_fn(steps.last().unwrap());
-                }
-            }
- // N16: store KV-cache bytes at decode-loop end before returning.
-            let kv_bytes_macro: u64 = kv_caches.iter().map(|c| c.resident_bytes()).sum();
-            store_kv_cache_bytes(kv_bytes_macro);
-        }};
-    }
-
-    // ------------------------------------------------------------------
-    // Path A: exact cache hit — skip prefill entirely.
+    // Path A: exact cache hit — skip prefill entirely. The exact-hit funnel
+    // is just "caches + last_id → decode"; `pipelined_decode` is the call
+    // site. GDN linear state does not exist for gemma4 (pure KV), so the
+    // closure threads only `kv_caches`.
     // ------------------------------------------------------------------
     if let CacheLookup::Exact {
-        kv_caches,
+        mut kv_caches,
         last_id,
         piece,
     } = lookup
     {
-        steps.push(ProbeStep {
+        step_fn(steps.push_mut(ProbeStep {
             token_id: last_id,
             piece: piece.into_boxed_str(),
             max_abs_logit: 0.0,
             nan_count: 0,
             logprobs: None,
-        });
-        step_fn(steps.last().unwrap());
-        // A7.3: exact-hit token into history.
+        }));
+        // exact-hit token into history.
         token_history.push(last_id);
-        run_decode!(kv_caches, last_id);
+
+        // EOS-stop. If the cached first token is an EOS, no decode steps —
+        // return before the loop, with no kv-bytes store and no decode_profile
+        // emission (the cached snapshot already accounts for its own bytes).
+        if eos_ids.contains(&last_id) {
+            return Ok(steps);
+        }
+
+        let stats = {
+            let mut ctx = DecodeCtx {
+                tokenizer,
+                vocab,
+                n_tokens,
+                device,
+                eos_ids,
+                step_fn,
+                constraint: constraint.take(),
+                sampler_cfg,
+                rng,
+                penalty_cfg,
+                token_history,
+                arch: "Gemma4ForConditionalGeneration",
+                resolve_pieces: true,
+            };
+            pipelined_decode(&mut ctx, last_id, &mut steps, |y| {
+                model.forward_arr(y, 1, Some(&mut kv_caches), device)
+            })?
+        };
 
         let prefill_ms = 0.0_f64;
-        let forward_ms = (forward_total_ns as f64) / 1.0e6;
-        let eval_ms = (eval_total_ns as f64) / 1.0e6;
-        let step_ms = (step_total_ns as f64) / 1.0e6;
-        let n = f64::from(decode_steps.max(1));
+        let forward_ms = (stats.forward_total_ns as f64) / 1.0e6;
+        let eval_ms = (stats.eval_total_ns as f64) / 1.0e6;
+        let step_ms = (stats.step_total_ns as f64) / 1.0e6;
+        let n = f64::from(stats.decode_steps.max(1));
         tracing::info!(
             target: "decode_profile",
             arch = "Gemma4ForConditionalGeneration",
-            n_steps = decode_steps,
+            n_steps = stats.decode_steps,
             prefill_ms,
             forward_total_ms = forward_ms,
             eval_total_ms = eval_ms,
@@ -672,6 +430,8 @@ pub fn generate_greedy(
             cache_path = "exact",
             "decode_profile"
         );
+        // store KV-cache bytes for the /metrics/cache endpoint.
+        store_kv_cache_bytes(kv_caches.iter().map(|c| c.resident_bytes()).sum());
         return Ok(steps);
     }
 
@@ -815,20 +575,22 @@ pub fn generate_greedy(
     // Phase span: prefill. Entered once per generate_greedy call, not per token.
     // Visible in samply/Instruments as a single region covering the full prefill.
     let _prefill_span = info_span!("prefill", prompt_len = prompt_ids.len()).entered();
-    // Prefix path: the truncated clone is already post-prefill quantized;
-    // the tail appends via decode-mode `update`, so do NOT enter the
-    // raw-BF16 prefill scaffolding (it would route the tail into the empty
-    // prefill_raw buffer and exit_prefill would re-quantize only the tail).
-    if !is_prefix {
+    // Three prefill flush protocols, kept per-arch:
+    //   - image  : one forward over the scatter-merged embeds (pre-hook),
+    //              fresh caches enter_prefill → forward → exit_prefill.
+    //   - prefix : B1 SWA snapshot/restore — the truncated clone is already
+    //              post-prefill quantized, so the tail appends via decode-mode
+    //              `update` with NO enter/exit brackets, flushing the
+    //              quantized/decode_fp16 buffers via `eval_gpu_state`.
+    //   - miss   : Fresh full re-prefill via the shared `chunked_prefill`
+    //              (enter_prefill → per-chunk `eval_prefill_state` → exit).
+    let prefill_logits = if let Some((embeds, masked_ids)) = image_prefill {
+        // image_prefill is only ever Some on the Miss path (lookup forced to
+        // Miss above), so `caches` is fresh. No chunking: an image prompt is
+        // short (soft tokens + text) and fits one forward comfortably.
         for c in &mut caches {
             c.enter_prefill();
         }
-    }
-    // image prefill — one forward over the scatter-merged embeds.
-    // image_prefill is only ever Some on the Miss path (lookup forced to Miss
-    // above), so `caches` is fresh + enter_prefill'd. No chunking: an image
-    // prompt is short (soft tokens + text) and fits one forward comfortably.
-    let prefill_logits = if let Some((embeds, masked_ids)) = image_prefill {
         let seq_i32 = prompt_ids.len() as i32;
         let logits =
             match model.forward_arr_embeds(embeds, &masked_ids, seq_i32, Some(&mut caches), device)
@@ -846,7 +608,14 @@ pub fn generate_greedy(
             }
         }
         logits
-    } else {
+    } else if is_prefix {
+        // Prefix (B1): per-arch tail re-prefill. The cloned snapshot is already
+        // post-prefill quantized (offset == prefix_len), so the tail appends
+        // via decode-mode `update` — do NOT enter the raw-BF16 prefill
+        // scaffolding (it would route the tail into the empty prefill_raw
+        // buffer and exit_prefill would re-quantize only the tail). Non-final
+        // chunks flush the quantized/decode_fp16 buffers via `eval_gpu_state`
+        // (NOT `eval_prefill_state`); there is nothing to quantize on exit.
         let mut last_logits: Option<Array> = None;
         let mut prefill_ok = true;
         let n_chunks = prefill_ids.len().div_ceil(prefill_chunk);
@@ -860,21 +629,13 @@ pub fn generate_greedy(
                         last_logits = Some(logits);
                     } else {
                         // Non-final chunk: discard logits (lazy graph drops
-                        // lm_head matmul) and flush only the cache state.
-                        // Prefix path is in decode-mode (no prefill_raw), so
-                        // flush the quantized/decode_fp16 buffers via
-                        // eval_gpu_state instead of eval_prefill_state.
+                        // lm_head matmul) and flush only the decode-mode state.
                         for c in &caches {
-                            let flush = if is_prefix {
-                                c.eval_gpu_state()
-                            } else {
-                                c.eval_prefill_state()
-                            };
-                            if let Err(e) = flush {
+                            if let Err(e) = c.eval_gpu_state() {
                                 tracing::warn!(
                                     error = %e,
                                     chunk_len = chunk.len(),
-                                    "generate_greedy: prefill chunk cache eval failed"
+                                    "generate_greedy: prefix tail chunk cache eval failed"
                                 );
                                 prefill_ok = false;
                                 break 'prefill;
@@ -886,21 +647,8 @@ pub fn generate_greedy(
                     tracing::warn!(
                         error = %e,
                         prompt_len = prompt_ids.len(),
-                        "generate_greedy: prefill chunk failed, returning empty"
+                        "generate_greedy: prefix tail chunk failed, returning empty"
                     );
-                    prefill_ok = false;
-                    break;
-                }
-            }
-        }
-        // Prefix path never entered prefill (tail used decode-mode update),
-        // so there is nothing to quantize on exit — the prefix is already
-        // quantized in the cloned storage and the tail was appended via the
-        // decode path. Skip exit_prefill to keep it cold-equal.
-        if !is_prefix {
-            for c in &mut caches {
-                if let Err(e) = c.exit_prefill(device) {
-                    tracing::warn!(error = %e, "generate_greedy: exit_prefill quantization failed");
                     prefill_ok = false;
                     break;
                 }
@@ -910,6 +658,21 @@ pub fn generate_greedy(
             return Ok(steps);
         }
         last_logits.unwrap()
+    } else {
+        // Miss: Fresh full re-prefill via the shared chunked_prefill helper. It
+        // brackets the loop with enter_prefill() / exit_prefill(), evals only
+        // the cache state on non-final chunks, and returns None on rejection.
+        let Some(logits) = chunked_prefill(
+            &mut caches,
+            prompt_ids,
+            prefill_chunk,
+            device,
+            |chunk, caches| model.forward_seq_with_cache(chunk, Some(caches), device),
+        )?
+        else {
+            return Ok(steps);
+        };
+        logits
     };
 
     let logits_flat = prefill_logits.reshape(&[1, vocab], device)?;
@@ -919,62 +682,45 @@ pub fn generate_greedy(
     let nan_count = count_nan_in_bytes(&logit_bytes, logits_flat.dtype());
     let max_abs_logit = max_abs_from_bytes(&logit_bytes, logits_flat.dtype());
 
-    // A6.3: only apply mask when engine is engaged (wants_mask).
-    let mask_active = constraint.as_ref().is_some_and(|c| c.wants_mask());
-    // A7.2: temp<=0 keeps the exact greedy block below; temp>0 host-samples.
-    let sampling_active = sampler_cfg.sampling_active();
-    let penalties_active = penalty_cfg.penalties_active();
     // top-k logprob capture (0 = disabled, hot-loop zero-overhead).
     let lp_k = sampler_cfg.top_logprobs_k as usize;
-    // A7.3: trailing-20 window (empty at prefill step 0).
-    let win_start = token_history.len().saturating_sub(20);
-    let recent = &token_history[win_start..];
-    let top = if sampling_active {
-        let mask_opt: Option<&[bool]> = if mask_active {
-            Some(constraint.as_mut().unwrap().step_mask(vocab as usize))
-        } else {
-            None
-        };
-        crate::sampler::sample_token_array(
-            &logits_flat,
-            sampler_cfg,
-            mask_opt,
-            penalty_cfg,
-            recent,
-            rng,
-            device,
-        )?
-    } else {
-        if penalties_active {
-            let mask_opt: Option<&[bool]> = if mask_active {
-                Some(constraint.as_mut().unwrap().step_mask(vocab as usize))
-            } else {
-                None
-            };
-            crate::sampler::argmax_with_penalties(
-                &logits_flat,
-                mask_opt,
-                penalty_cfg,
-                recent,
-                device,
-            )?
-        } else if mask_active {
-            let c = constraint.as_mut().unwrap();
-            let m = c.step_mask(vocab as usize);
-            apply_mask_argmax(&logits_flat, m, device)?
-        } else {
-            argmax(&logits_flat, -1, device)?
-        }
+
+    // Build the shared decode context ONCE for the prefill-tail selection AND
+    // the decode loop (Prefix + Miss + image all reach here), so the
+    // per-request state is borrowed a single time (a `&mut dyn` trait-object
+    // reborrow is invariant in its lifetime — two separate `DecodeCtx` over the
+    // same params would not compile). Intervening prefill-tail ops route
+    // through `ctx.constraint` / `ctx.token_history` / `ctx.step_fn`.
+    let mut ctx = DecodeCtx {
+        tokenizer,
+        vocab,
+        n_tokens,
+        device,
+        eos_ids,
+        step_fn,
+        constraint: constraint.take(),
+        sampler_cfg,
+        rng,
+        penalty_cfg,
+        token_history,
+        arch: "Gemma4ForConditionalGeneration",
+        resolve_pieces: true,
     };
+
+    // Prefill-tail token selection via the shared sampling fork. Gate the mask
+    // ONCE here, before the post-selection `advance()` below — matching the old
+    // prefill-tail timing (wants_mask can flip on engagement).
+    let mask_active = ctx.constraint.as_ref().is_some_and(|c| c.wants_mask());
+    let top = choose_token(&mut ctx, &logits_flat, mask_active)?;
     top.eval()?;
     let top_bytes = top.to_bytes()?;
     let last_id = i32::from_le_bytes(top_bytes[..4].try_into().unwrap()) as u32;
     // A6.3: advance constraint regardless of mask state (warm-up scans).
-    if let Some(c) = constraint.as_mut() {
+    if let Some(c) = ctx.constraint.as_mut() {
         c.advance(last_id);
     }
     // A7.3: push prefill token into history.
-    token_history.push(last_id);
+    ctx.token_history.push(last_id);
     let prefill_total_ns = prefill_t0.elapsed().as_nanos();
 
     let piece = tokenizer
@@ -1057,16 +803,15 @@ pub fn generate_greedy(
     } else {
         None
     };
-    steps.push(ProbeStep {
+    (ctx.step_fn)(steps.push_mut(ProbeStep {
         token_id: last_id,
         piece: piece.into_boxed_str(),
         max_abs_logit,
         nan_count,
         logprobs: prefill_logprobs,
-    });
-    step_fn(steps.last().unwrap());
+    }));
     // A7.3: prefill first token into history.
-    token_history.push(last_id);
+    ctx.token_history.push(last_id);
 
     if nan_count > 0 {
         return Ok(steps);
@@ -1077,257 +822,25 @@ pub fn generate_greedy(
         return Ok(steps);
     }
 
-    // Phase span: decode. One span covering the entire autoregressive loop.
-    // Not per-step — intentional. Visible in samply/Instruments as one region
-    // alongside the sibling prefill span.
-    let _decode_span = info_span!("decode", n_tokens).entered();
-
-    // ------------------------------------------------------------------
-    // Decode: pipelined async pattern. Each iteration dispatches
-    // step i+1's forward while step i's argmax materialises in the
-    // background. GPU sync only happens on the *previous* step's `pending`
-    // via `to_bytes()`. Mirrors the qwen3 and gemma3 decode loops.
-    //
-    // The `last_id` u32 is only used for the very first decode step; from
-    // step 2 onward the next-token Array (`y`) is fed to the forward without
-    // a CPU readback. Per-step NaN/max-abs diagnostics are dropped from the
-    // hot path — the prefill check above still catches catastrophic-quant
-    // failures.
-    //
-    // EOS-stop is checked right after the pending drain (which is
-    // where we know the integer token id). On EOS we set `early_stop=true`
-    // and break; the post-loop pending drain is skipped so we don't emit
-    // one extra token after EOS. The `next_y` we already dispatched on
-    // this iteration is wasted (one forward), which is negligible.
-    // ------------------------------------------------------------------
-    let mut y: Array = {
-        let id_i32 = last_id as i32;
-        let bytes = id_i32.to_le_bytes();
-        Array::from_bytes(&bytes, &[1], Dtype::I32)?
-    };
-    y.eval()?;
-    let mut pending: Option<Array> = None;
-    // logprobs captured at sample time travel with `pending` (the token
-    // they belong to is emitted one iteration later). `None` on the disabled
-    // path (`lp_k == 0`) — never allocated, never read.
-    let mut pending_logprobs: Option<TokenLogprobs> = None;
-    let mut early_stop = false;
-
-    for step_idx in 1..n_tokens {
-        let step_t0 = Instant::now();
-        let fwd_t0 = Instant::now();
-        let decode_logits = match model.forward_arr(&y, 1, Some(&mut caches), device) {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::warn!(
-                    step = step_idx,
-                    error = %e,
-                    "generate_greedy: decode step failed (resource limit?), stopping early"
-                );
-                break;
-            }
-        };
-
-        let logits_flat = decode_logits.reshape(&[1, vocab], device)?;
-        // A6.3: see the run_decode macro for the wants_mask gating rationale.
-        let mask_active = constraint.as_ref().is_some_and(|c| c.wants_mask());
-        // A7.2: temp>0 reads logits to host each step (no async pipelining
-        // benefit), so it shares the masked branch's pre-drain. temp<=0
-        // keeps the exact `mask_active`-gated pipelined path byte-for-byte.
-        let sampling_active = sampler_cfg.sampling_active();
-        // A7.3: penalties also require logits on host → fold into drain_now.
-        let penalties_active = penalty_cfg.penalties_active();
-        // logprob capture needs host logits per step → also drains here.
-        let lp_k = sampler_cfg.top_logprobs_k as usize;
-        let drain_now = mask_active || sampling_active || penalties_active || lp_k > 0;
-        // Force eager eval of logits when the constraint mask is active.
-        // The pipelined path uses async_eval + lazy graph for pure-decode steps,
-        // but when apply_mask_argmax needs the logits values, a lazy logits_flat
-        // combined with an unresolved `y` alias can cause the argmax to read
-        // stale GPU data. eval() here ensures the KV-cache forward is complete
-        // before we build the mask and run argmax.
-        if mask_active {
-            logits_flat.eval()?;
-        }
-        let pre_drain_eos = if drain_now {
-            if let Some(p) = pending.take() {
-                let top_bytes = p.to_bytes()?;
-                let next_id = i32::from_le_bytes(top_bytes[..4].try_into().unwrap()) as u32;
-                if let Some(c) = constraint.as_mut() {
-                    c.advance(next_id);
-                }
-                // A7.3: accumulate emitted token into history.
-                token_history.push(next_id);
-                let piece = tokenizer
-                    .id_to_token(next_id)
-                    .unwrap_or_else(|| format!("<unk:{next_id}>"));
-                steps.push(ProbeStep {
-                    token_id: next_id,
-                    piece: piece.into_boxed_str(),
-                    max_abs_logit: 0.0,
-                    nan_count: 0,
-                    // logprobs computed when this token was sampled.
-                    logprobs: pending_logprobs.take(),
-                });
-                step_fn(steps.last().unwrap());
-                eos_ids.contains(&next_id)
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        if pre_drain_eos {
-            early_stop = true;
-            tracing::debug!(
-                step = step_idx - 1,
-                "generate_greedy: EOS emitted (pre-drain, masked), stopping"
-            );
-            break;
-        }
-        // A7.3: trailing-20 window for penalty context.
-        let win_start = token_history.len().saturating_sub(20);
-        let recent = &token_history[win_start..];
-        let next_y = if sampling_active {
-            let mask_opt: Option<&[bool]> = if mask_active {
-                Some(constraint.as_mut().unwrap().step_mask(vocab as usize))
-            } else {
-                None
-            };
-            crate::sampler::sample_token_array(
-                &logits_flat,
-                sampler_cfg,
-                mask_opt,
-                penalty_cfg,
-                recent,
-                rng,
-                device,
-            )?
-        } else {
-            if penalties_active {
-                let mask_opt: Option<&[bool]> = if mask_active {
-                    Some(constraint.as_mut().unwrap().step_mask(vocab as usize))
-                } else {
-                    None
-                };
-                crate::sampler::argmax_with_penalties(
-                    &logits_flat,
-                    mask_opt,
-                    penalty_cfg,
-                    recent,
-                    device,
-                )?
-            } else if mask_active {
-                let c = constraint.as_mut().unwrap();
-                let m = c.step_mask(vocab as usize);
-                apply_mask_argmax(&logits_flat, m, device)?
-            } else {
-                argmax(&logits_flat, -1, device)?
-            }
-        };
-        let _ = next_y.async_eval();
-        // capture this step's logprobs from `logits_flat` + the chosen
-        // token. Stashed in `pending_logprobs`; emitted with the matching
-        // ProbeStep next iteration (pipelined token identity). Gated on lp_k>0.
-        if lp_k > 0 {
-            pending_logprobs = capture_logprobs(&logits_flat, &next_y, lp_k);
-        }
-        let fwd_dt = fwd_t0.elapsed().as_nanos();
-
-        // Consume the previous step's pending argmax (unconstrained + warm-up).
-        let eval_t0 = Instant::now();
-        let mut emitted_eos = false;
-        if !drain_now {
-            if let Some(p) = pending.take() {
-                let top_bytes = p.to_bytes()?;
-                let next_id = i32::from_le_bytes(top_bytes[..4].try_into().unwrap()) as u32;
-                if let Some(c) = constraint.as_mut() {
-                    c.advance(next_id);
-                }
-                // A7.3: accumulate pipelined token into history.
-                token_history.push(next_id);
-                let piece = tokenizer
-                    .id_to_token(next_id)
-                    .unwrap_or_else(|| format!("<unk:{next_id}>"));
-                tracing::debug!(
-                    step = step_idx - 1,
-                    token_id = next_id,
-                    piece = %piece,
-                    "generate_greedy decode step (pipelined emit)"
-                );
-                steps.push(ProbeStep {
-                    token_id: next_id,
-                    piece: piece.into_boxed_str(),
-                    max_abs_logit: 0.0,
-                    nan_count: 0,
-                    logprobs: None,
-                });
-                step_fn(steps.last().unwrap());
-                emitted_eos = eos_ids.contains(&next_id);
-            }
-        }
-        let eval_dt = eval_t0.elapsed().as_nanos();
-
-        forward_total_ns += fwd_dt;
-        eval_total_ns += eval_dt;
-        step_total_ns += step_t0.elapsed().as_nanos();
-        decode_steps += 1;
-
-        if emitted_eos {
-            early_stop = true;
-            tracing::debug!(
-                step = step_idx - 1,
-                "generate_greedy: EOS emitted, stopping decode loop"
-            );
-            break;
-        }
-
-        // Feed next step's forward with the (still pending) argmax Array.
-        // try_clone shares the underlying data; pending keeps ownership of
-        // the GPU buffer until the next iteration consumes it.
-        y = next_y.try_clone()?;
-        pending = Some(next_y);
-    }
-
-    // Drain any final pending token that has not yet been emitted.
-    // Skip drain on early_stop so we don't emit a token after EOS.
-    if !early_stop {
-        if let Some(p) = pending {
-            let drain_t0 = Instant::now();
-            p.eval()?;
-            let top_bytes = p.to_bytes()?;
-            eval_total_ns += drain_t0.elapsed().as_nanos();
-            let next_id = i32::from_le_bytes(top_bytes[..4].try_into().unwrap()) as u32;
-            // A6.2: advance constraint on final drain.
-            if let Some(c) = constraint.as_mut() {
-                c.advance(next_id);
-            }
-            // A7.3: final drain token into history.
-            token_history.push(next_id);
-            let piece = tokenizer
-                .id_to_token(next_id)
-                .unwrap_or_else(|| format!("<unk:{next_id}>"));
-            steps.push(ProbeStep {
-                token_id: next_id,
-                piece: piece.into_boxed_str(),
-                max_abs_logit: 0.0,
-                nan_count: 0,
-                // final pending token carries its sample-time logprobs.
-                logprobs: pending_logprobs.take(),
-            });
-            step_fn(steps.last().unwrap());
-        }
-    }
+    // Decode: shared pipelined async loop, reusing the prefill-tail `ctx`.
+    // Prefix + Miss + image all funnel here as "caches + last_id → decode";
+    // the loop is the call site. The pipeline ordering (choose_token →
+    // async_eval → drain previous pending → feed) overlaps host sampling with
+    // the in-flight GPU forward; see decode_loop.rs. gemma4 is pure-KV, so the
+    // closure threads only `caches`.
+    let stats = pipelined_decode(&mut ctx, last_id, &mut steps, |y| {
+        model.forward_arr(y, 1, Some(&mut caches), device)
+    })?;
 
     let prefill_ms = (prefill_total_ns as f64) / 1.0e6;
-    let forward_ms = (forward_total_ns as f64) / 1.0e6;
-    let eval_ms = (eval_total_ns as f64) / 1.0e6;
-    let step_ms = (step_total_ns as f64) / 1.0e6;
-    let n = f64::from(decode_steps.max(1));
+    let forward_ms = (stats.forward_total_ns as f64) / 1.0e6;
+    let eval_ms = (stats.eval_total_ns as f64) / 1.0e6;
+    let step_ms = (stats.step_total_ns as f64) / 1.0e6;
+    let n = f64::from(stats.decode_steps.max(1));
     tracing::info!(
            target: "decode_profile",
            arch = "Gemma4ForConditionalGeneration",
-           n_steps = decode_steps,
+           n_steps = stats.decode_steps,
            prefill_ms,
            forward_total_ms = forward_ms,
            eval_total_ms = eval_ms,
