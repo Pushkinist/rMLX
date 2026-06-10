@@ -7,19 +7,21 @@
 
 **Family:** `gemma4` (`Gemma4ForConditionalGeneration`, text core `gemma4_text`)
 **Machine:** Apple M5 Max, 128 GB, macOS 26.4.1 · **Binary:** `release-perf`,
-`bench/gemma4-siblings` rebased on main (`#44` bf16-stream + `#46` sorted-MoE merged,
-atop #32/#33/#34/#35/#36/#39)
+`bench/gemma4-siblings` rebased on main (`#44` bf16-stream + `#46` sorted-MoE + `#51`
+bf16-MoE-router merged, atop #32/#33/#34/#35/#36/#39/#49)
 **Protocol:** batch=1, temp=0, `max_tokens=256`; **n=3 measured** (4k/8k/16k/32k),
 **n=2 → n=1 measured** (64k/128k), 1 warmup `r0` discarded; decode-TPS median +
 95% CI (bootstrap). **Same harness as SIBLINGS** (CBB `run_one`, chat-templated
 serve), so rMLX cells compare directly. Bar (§0.1): WIN / TIE-on-CI-overlap / LOSS.
 
 > **Status: FULL RE-RUN of all four models (2026-06-09/10) — #44 + #46 + #49
-> merged.** Every model below carries the post-fix dual-axis sweep (baseline 25
-> codecs) plus an 8-codec MTP grid. **#44** (Gemma4 bf16 activation stream) is the
-> decode mover; **#46** (sorted-MoE gather) fixed the 26b MoE prefill; **#49**
-> (plain-tied-head drafter) made 26b/31b spec drafters loadable. The §2 grids are
-> the live data; §2a/§2b are superseded by `## 2. rMLX full matrix`.
+> merged; 26b re-run again 2026-06-10 post-#51.** Every model below carries the
+> post-fix dual-axis sweep (baseline 25 codecs) plus an 8-codec MTP grid. **#44**
+> (Gemma4 bf16 activation stream) flipped e2b/e4b; **#46** (sorted-MoE gather) fixed
+> the 26b MoE prefill; **#49** (plain-tied-head drafter) made 26b/31b spec drafters
+> loadable; **#51** (bf16 MoE router/expert stream) closed the 26b MoE decode gap and
+> halved its KV (the §2.3 grids are the post-#51 re-run). The §2 grids are the live
+> data; §2a/§2b are superseded by `## 2. rMLX full matrix`.
 
 ## 0. TL;DR
 
@@ -27,12 +29,13 @@ serve), so rMLX cells compare directly. Bar (§0.1): WIN / TIE-on-CI-overlap / L
   with ctx (the whole attention+FFN stream was f32, now bf16 — less activation+KV
   bandwidth per step). KV `none` is exactly halved (global decode K/V now bf16) and
   is the **smallest KV of every codec on every model**.
-- **Standing FLIPS the small dense models.** #44 flipped **e2b** (was TIE@4k →
-  −21 % @64k) to **🟢 WIN @4k (+3 %), 🟡 TIE 8k/16k, 🔴 −3 %/−5 % @32k/64k**, and
-  flipped **e4b** (was −4…−12 %) to a **🟢 WIN at every size (+1…+3 %)**. The big
-  models still trail on decode: **26b MoE −10…−28 %**, **31b dense −2…−12 %**
-  (dense-bandwidth physics). Headline: **#44 flipped the small dense models to beat
-  mlx-lm; 26b MoE and 31b dense still trail on decode but prefill improved (#46).**
+- **Standing FLIPS e2b/e4b (#44); #51 CLOSES 26b MoE.** #44 flipped **e2b** to
+  **🟢 WIN @4k**, near-parity 32k/64k (the prior −3…−5 % re-measured ≈ parity, n=2
+  noise), and flipped **e4b** (was −4…−12 %) to a **🟢 WIN at every size (+1…+3 %)**.
+  **#51 (bf16 MoE router/expert stream) closed the 26b MoE decode gap from −10…−28 %
+  to −4…+1 % (🟢 WIN @16k) and halved its KV.** Only **31b dense still trails
+  −2…−12 %** (dense-bandwidth physics, near the ceiling). Headline: **#44 + #51 made
+  e2b/e4b/26b competitive with mlx-lm decode; only 31b dense trails.**
 - **KV codec is a decode no-op on every model** (all mainstream codecs ≈ `none`)
   **AND memory-inflating** (1.2–4× resident KV) — **EXCEPT 31b dense**, the lone
   model where KV quant pays a small decode win (k8vturbo2/tsym +3–4 % @32k–64k,
@@ -276,58 +279,68 @@ but craters at 4k (51 vs 77, accept 0.08) and loses at 32k/64k (accept 0.17/0.23
 
 ### 2.3 26b-a4b MoE
 
-**Baseline** (ceiling 128k; 128k KV `*` = ≈64k, 65536-tok baseline cap):
+**Baseline** (ceiling 128k; 128k KV `*` = ≈64k, 65536-tok baseline cap).
+**Post-fix #51** (bf16 MoE router/expert stream): decode + TTFT + KV-MB all re-run
+n=3(4k-32k)/n=2(64k-128k); decode via serve+run_one, KV-MB via `baseline --record`:
 
 | KV | 4k | 8k | 16k | 32k | 64k | 128k |
 |---|---|---|---|---|---|---|
-| none | 65.9·2.0s·583 | 65.2·4.2s·771 | 61.4·9.1s·1190 | 51.8·21.1s·1966 | 38.7·54.4s·3216 | 25.5·161.6s·3216 |
-| k8v4 | 63.7·2.2s·605 | 62.1·4.6s·814 | 61.1·10.4s·1281 | 52.0·22.9s·2144 | 39.5·56.4s·3534 | 25.8·166.8s·3534 |
-| k8v8 | 66.5·2.2s·611 | 62.3·4.7s·825 | 61.3·10.5s·1303 | 52.1·23.1s·2187 | 38.9·56.6s·3612 | 26.4·163.9s·3612 |
-| planar | 64.8·2.3s·634 | 63.4·4.6s·870 | 61.1·10.1s·1397 | 52.8·22.5s·2371 | 39.9·55.4s·3942 | 26.2·161.6s·3942 |
-| planar3 | 67.5·2.0s·634 | 65.1·4.2s·870 | 62.0·9.2s·1397 | 51.9·21.2s·2371 | 39.3·54.0s·3942 | 26.3·162.2s·3942* |
-| planar_k | 64.6·2.3s·620 | 62.7·4.9s·843 | 61.6·10.3s·1340 | 52.5·22.7s·2261 | 39.9·55.5s·3744 | 26.5·160.5s·3744* |
-| k8vturbo2 | 66.4·2.2s·602 | 64.0·4.9s·808 | 61.9·10.4s·1267 | 52.5·22.8s·2117 | 40.4·55.7s·3486 | 28.1·161.7s·3486* |
-| k8vturbo3 | 64.9·2.2s·603 | 63.9·4.8s·811 | 61.8·10.2s·1273 | 53.2·22.5s·2130 | 40.0·54.4s·3510 | 28.1·156.5s·3510* |
-| k8vturbo2tcq | 66.6·2.4s·602 | 64.1·4.9s·808 | 62.0·11.4s·1267 | 52.8·23.2s·2117 | 40.0·56.9s·3486 | 26.9·165.4s·3486* |
-| k8vturbo3tcq | 66.1·2.5s·603 | 64.7·5.2s·811 | 61.6·10.9s·1273 | 52.6·24.1s·2130 | 40.0·59.5s·3510 | 25.3·177.5s·3510* |
-| tsym3 | 65.5·2.3s·596 | 64.1·4.9s·797 | 61.3·10.5s·1244 | 52.2·23.3s·2073 | 40.1·57.1s·3408 | 27.8·169.1s·3408* |
-| tsym4 | 64.2·2.2s·600 | 63.8·4.9s·804 | 61.3·10.3s·1258 | 52.6·22.6s·2100 | 38.6·55.2s·3456 | 25.9·161.1s·3456* |
-| iso3 | 65.7·2.4s·675 | 64.7·5.0s·952 | 61.3·10.8s·1572 | 52.2·23.7s·2719 | 39.4·57.9s·4568 | 27.3·165.9s·4568* |
-| iso4 | 67.5·2.4s·675 | 65.1·5.1s·952 | 60.9·10.7s·1572 | 52.8·23.4s·2719 | 39.7·57.1s·4568 | 27.3·161.0s·4568* |
-| iso3_sym | 67.0·2.4s·738 | 65.1·4.9s·1080 | 60.9·10.6s·1841 | 51.7·23.9s·3251 | 38.6·57.3s·5523 | 24.4·166.5s·5523* |
-| iso4_sym | 65.4·2.7s·738 | 62.7·5.6s·1080 | 60.7·12.2s·1841 | 52.0·26.4s·3251 | 39.2·63.3s·5523 | 24.6·171.5s·5523* |
-| rotor3 | 66.2·2.2s·632 | 64.7·4.5s·867 | 60.9·9.9s·1392 | 52.9·22.3s·2363 | 39.3·54.1s·3929 | 27.5·157.7s·3929* |
-| rotor4 | 65.8·2.3s·632 | 65.2·5.0s·867 | 61.0·10.6s·1392 | 53.1·23.4s·2363 | 39.7·57.5s·3929 | 26.8·165.5s·3929* |
-| rotor3_sym | 66.6·6.2s·657 | 64.8·12.3s·915 | 61.2·25.4s·1490 | 52.5·51.8s·2556 | 39.5·111.8s·4274 | 27.5·272.7s·4274* |
-| rotor4_sym | 65.7·6.1s·657 | 63.8·12.4s·915 | 61.2·25.7s·1490 | 52.4·54.3s·2556 | 39.3·117.1s·4274 | 27.2·281.6s·4274* |
-| rot_k_tq4v | 65.3·2.0s·610 | 63.2·4.2s·820 | 57.8·9.0s·1289 | 45.7·21.0s·2157 | 30.2·53.5s·3556 | 19.2·156.8s·3556* |
-| k_iso3 | 24.6·2.4s·609 | 16.1·4.7s·822 | 8.9·10.1s·1299 | 4.0·23.6s·2181 | 2.5·56.7s·3761 | 1.0·156.8s·3761* |
-| k_iso4 | 13.7·2.4s·609 | 7.5·4.8s·822 | 3.8·11.0s·1299 | 2.0·24.3s·2181 | 1.1·55.8s·3761 | 0.5·160.4s·3761* |
-| k_rotor3 | 1.9·6.1s·571 | 1.0·12.1s·743 | 0.5·24.3s·1129 | 0.2·51.8s·1842 | 0.1·111.2s·3151 | —(TIMEOUT) |
-| k_rotor4 | 1.9·5.9s·571 | 1.0·12.1s·743 | 0.5·24.6s·1129 | 0.2·52.8s·1842 | 0.1·121.9s·3151 | —(TIMEOUT) |
+| none | 71.2·1.6s·305 | 69.8·3.3s·407 | 67.7·7.2s·637 | 58.5·16.1s·1061 | 47.2·41.0s·1744 | 34.6·117.1s·1744* |
+| k8v4 | 70.1·1.6s·327 | 68.5·3.6s·451 | 66.6·7.6s·727 | 59.4·16.6s·1238 | 46.7·41.2s·2062 | 33.5·123.3s·2062* |
+| k8v8 | 71.2·1.6s·333 | 68.6·3.7s·462 | 66.7·7.7s·750 | 59.4·17.0s·1282 | 46.6·41.5s·2140 | 32.6·124.1s·2140* |
+| planar | 70.0·1.8s·356 | 68.1·3.8s·507 | 65.9·7.8s·844 | 58.8·17.3s·1466 | 46.6·42.5s·2470 | 33.6·125.2s·2470* |
+| planar3 | 70.1·1.8s·356 | 67.9·3.8s·507 | 65.9·8.0s·844 | 58.6·17.6s·1466 | 46.4·42.9s·2470 | 33.2·128.0s·2470* |
+| planar_k | 69.8·1.7s·342 | 68.6·3.8s·480 | 66.5·7.8s·787 | 60.0·17.1s·1356 | 43.6·43.7s·2272 | 30.7·133.8s·2272* |
+| k8vturbo2 | 65.9·2.0s·324 | 64.2·4.0s·444 | 62.4·8.7s·713 | 54.6·19.0s·1211 | 44.0·46.5s·2014 | 32.3·134.6s·2014* |
+| k8vturbo3 | 67.3·2.0s·325 | 64.4·4.1s·447 | 62.9·8.7s·720 | 55.4·19.2s·1225 | 44.0·46.6s·2038 | 32.4·134.9s·2038* |
+| k8vturbo2tcq | 71.4·2.2s·324 | 70.0·3.9s·444 | 67.2·8.3s·713 | 59.3·18.1s·1211 | 47.9·44.0s·2014 | 34.8·123.2s·2014* |
+| k8vturbo3tcq | 72.4·1.9s·325 | 70.4·4.1s·447 | 66.7·8.3s·720 | 59.7·18.1s·1225 | 48.1·45.4s·2038 | 35.3·122.1s·2038* |
+| tsym3 | 70.6·1.6s·318 | 70.7·3.4s·433 | 67.5·7.2s·691 | 59.4·16.0s·1168 | 47.8·39.1s·1936 | 35.2·110.7s·1936* |
+| tsym4 | 72.9·1.5s·322 | 70.8·3.3s·440 | 66.4·7.1s·705 | 59.6·15.7s·1195 | 47.9·38.0s·1984 | 35.2·109.8s·1984* |
+| iso3 | 72.5·1.7s·396 | 69.0·3.6s·589 | 67.2·7.7s·1019 | 59.5·16.8s·1814 | 47.2·40.5s·3096 | 34.6·119.3s·3096* |
+| iso4 | 70.0·1.9s·396 | 68.5·3.8s·589 | 67.2·8.2s·1019 | 59.2·17.8s·1814 | 47.0·42.9s·3096 | 34.4·124.0s·3096* |
+| iso3_sym | 70.3·1.8s·460 | 67.8·3.9s·716 | 67.0·7.9s·1288 | 59.3·17.5s·2346 | 45.7·44.3s·4051 | 32.3·134.9s·4051* |
+| iso4_sym | 71.2·2.1s·460 | 68.2·4.4s·716 | 67.4·9.1s·1288 | 59.1·20.7s·2346 | 46.5·49.3s·4051 | 32.5·133.4s·4051* |
+| rotor3 | 70.7·1.7s·353 | 67.8·3.5s·503 | 67.2·7.5s·838 | 59.4·16.5s·1458 | 47.7·40.3s·2457 | 35.1·116.6s·2457* |
+| rotor4 | 72.5·1.7s·353 | 68.2·3.7s·503 | 67.4·7.7s·838 | 59.9·17.1s·1458 | 47.4·40.7s·2457 | 35.3·115.8s·2457* |
+| rotor3_sym | 72.3·5.6s·379 | 69.3·12.1s·552 | 66.9·23.6s·937 | 59.2·47.5s·1651 | 47.8·102.8s·2802 | 33.5·237.5s·2802* |
+| rotor4_sym | 71.3·5.4s·379 | 67.9·12.1s·552 | 66.2·24.2s·937 | 58.0·49.5s·1651 | 46.5·119.0s·2802 | 33.0·271.3s·2802* |
+| rot_k_tq4v | 66.5·1.6s·331 | 65.3·3.3s·455 | 61.2·7.1s·732 | 52.7·16.1s·1245 | 38.5·40.8s·2072 | 25.6·119.2s·2072* |
+| k_iso3 | 24.9·1.7s·408 | 15.6·3.5s·613 | 8.2·7.5s·1071 | 4.5·16.9s·1917 | 1.8·42.0s·2593 | 1.1·118.2s·2593* |
+| k_iso4 | 13.6·1.8s·408 | 7.7·3.8s·613 | 3.8·8.0s·1071 | 2.1·17.6s·1917 | 1.1·42.2s·2593 | 0.5·121.0s·2593* |
+| k_rotor3 | 1.9·5.1s·370 | 1.0·11.7s·534 | 0.5·22.7s·900 | 0.3·46.2s·1579 | 0.1·97.9s·1983 | —(TIMEOUT) |
+| k_rotor4 | 1.9·5.2s·370 | 1.0·11.9s·534 | 0.5·23.6s·900 | 0.2·47.8s·1579 | 0.1·102.4s·1983 | —(TIMEOUT) |
 
 **MTP** (8 codecs, plain-tied-head drafter #49, capped 4k-32k):
 
 | KV+MTP | 4k | 8k | 16k | 32k |
 |---|---|---|---|---|
-| none+mtp | 27·0.19·2.0s | 36·0.32·4.2s | 35·0.42·9.5s | 32·0.39·22.1s |
-| k8v4+mtp | 26·0.19·2.2s | 34·0.32·4.9s | 34·0.42·10.4s | 32·0.39·23.1s |
-| k8v8+mtp | 26·0.19·2.2s | 34·0.32·4.7s | 34·0.42·10.1s | 32·0.39·22.4s |
-| k8vturbo3tcq+mtp | 27·0.19·2.4s | 36·0.32·5.3s | 36·0.42·11.2s | 34·0.39·27.5s |
-| tsym3+mtp | 27·0.19·2.2s | 35·0.32·4.9s | 36·0.42·10.3s | 34·0.39·22.8s |
-| rotor3+mtp | 27·0.19·2.3s | 36·0.32·5.1s | 36·0.42·10.6s | 34·0.39·23.7s |
-| iso3+mtp | 27·0.19·2.4s | 36·0.32·5.2s | 36·0.42·10.7s | 34·0.39·23.6s |
-| rotor3_sym+mtp | 28·0.19·8.8s | 36·0.32·17.7s | 36·0.42·35.2s | 34·0.39·73.4s |
+| none+mtp | 32·0.29·1.6s | 31·0.25·3.2s | 47·0.57·7.1s | 49·0.79·16.1s |
+| k8v4+mtp | 32·0.29·1.5s | 31·0.25·3.2s | 47·0.57·7.0s | 50·0.79·15.8s |
+| k8v8+mtp | 32·0.29·1.6s | 31·0.25·3.4s | 47·0.57·7.2s | 50·0.79·16.1s |
+| k8vturbo3tcq+mtp | 32·0.29·2.2s | 31·0.25·4.5s | 47·0.57·9.3s | 50·0.79·21.0s |
+| tsym3+mtp | 31·0.29·1.7s | 31·0.25·3.5s | 47·0.57·7.6s | 50·0.79·16.7s |
+| rotor3+mtp | 32·0.29·1.8s | 31·0.25·3.8s | 47·0.57·8.1s | 49·0.79·18.1s |
+| iso3+mtp | 32·0.29·1.8s | 31·0.25·3.9s | 47·0.57·8.3s | 50·0.79·18.4s |
+| rotor3_sym+mtp | 32·0.29·7.8s | 31·0.25·19.5s | 46·0.57·36.0s | 49·0.79·72.7s |
 
-**Analysis (26b MoE).** Decode `none` **66/65/61/52/39/26** (4k→128k) still trails
-champ 74/72/67/60/49/36 by **−10…−28 %** at every size — the remaining MoE-kernel
-decode gap. But **#46 fixed prefill**: `none` 128k cold TTFT **161.6 s** (was ~403 s,
-~2.5×) and 64k **54.4 s** (was ~182 s). KV is a decode no-op (mainstream all ≈ `none`)
-and memory-inflating (iso_sym 5523 vs none 3216 @128k). MoE does **not** arch-guard —
-all 25 codecs ran (correct any stale "K<8bit rejected" claim; that gate is
-Qwen-MoE-only). MTP **loses at all sizes** (none-MTP 27/36/35/32 vs baseline
-66/65/61/52) — the verifier block-forward is too expensive on the MoE to break even
-at accept 0.19-0.42. _(128k KV `*` = ≈64k baseline cap; k_rotor 128k = TIMEOUT.)_
+**Analysis (26b MoE) — #51 closed the decode gap.** Decode `none`
+**71/70/68/59/47/35** (4k→128k) now sits at champ 74/72/67/60/49/36 within
+**−4/−3/+1/−2/−4/−4 %** — a 🟢 **WIN @16k**, parity-noise elsewhere (was −10…−28 %).
+**#51** (bf16 MoE router/expert stream) was the mover: the router scaled its RMSNorm
+weight by a strong-f32 root-size scalar, promoting `x_normed → expert_scores →
+routing_weights` to f32 and leaking f32 through the whole MoE residual into the
+downstream KV. The one-line `.astype(x.dtype())` (the #44 embed-scale idiom) keeps the
+stream bf16 → **`none` KV halved** (64k 3216→**1744 MB**, 4k 583→**305**), so both
+decode and KV-bandwidth win, **growing with ctx** (same #44 signature: f32-KV →
+2× bandwidth, worst at long ctx). Prefill also dropped (bf16 stream; #46 had already
+cut 128k cold TTFT to ~117 s). KV axis unchanged in character — `none` is the smallest,
+codecs inflate (iso_sym 4051 vs none 1744 @64k) but **every codec's KV halved** vs
+pre-fix; decode no-op holds (all mainstream ≈ `none`). MoE does **not** arch-guard —
+all 25 codecs ran. **MTP still loses at all sizes**: spec rose to 32/31/47/49 and
+accept climbed (0.79 @32k), but the now-fast baseline (59 @32k) rose more — the
+verifier block-forward can't break even on the MoE. _(128k KV `*` = ≈64k baseline cap;
+k_rotor 128k decode = TIMEOUT.)_
 
 ### 2.4 31b dense
 
@@ -460,15 +473,15 @@ per-codec spread is noise (§2), so no cherry-picked "best codec" is used.
 | 32k | **59** | 58 | 🟢 **WIN +2%** | LOSS −9.3% |
 | 64k | **47** | 46 | 🟢 **WIN +2%** | LOSS −12.0% |
 
-### 26b-a4b MoE — 🔴 LOSS at every size (decode still trails; prefill fixed by #46)
-| Prompt | rMLX `none` | champion | standing |
-|---|---|---|---|
-| 4k | 66 | 74 | 🔴 LOSS −11% |
-| 8k | 65 | 72 | 🔴 LOSS −10% |
-| 16k | 62 | 67 | 🔴 LOSS −7% |
-| 32k | 52 | 60 | 🔴 LOSS −13% |
-| 64k | 39 | 49 | 🔴 LOSS −20% |
-| 128k | 26 | 36 | 🔴 LOSS −28% |
+### 26b-a4b MoE — 🟢 WIN @16k, near-parity elsewhere (decode gap CLOSED by #51)
+| Prompt | rMLX `none` | champion | standing | was (pre-#51) |
+|---|---|---|---|---|
+| 4k | 71 | 74 | 🔴 LOSS −4% | LOSS −11% |
+| 8k | 70 | 72 | 🟡 TIE −3% | LOSS −10% |
+| 16k | 68 | 67 | 🟢 **WIN +1%** | LOSS −7% |
+| 32k | 59 | 60 | 🟡 TIE −2% | LOSS −13% |
+| 64k | 47 | 49 | 🔴 LOSS −4% | LOSS −20% |
+| 128k | 35 | 36 | 🔴 LOSS −4% | LOSS −28% |
 
 ### 31b dense — 🔴 LOSS −2…−12% (dense-bandwidth physics)
 | Prompt | rMLX `none` | champion | standing |
@@ -480,15 +493,16 @@ per-codec spread is noise (§2), so no cherry-picked "best codec" is used.
 | 64k | 9.3 | 9.9 | 🔴 LOSS −6% |
 | 128k | 7.0 | 7.6 | 🔴 LOSS −8% |
 
-> **Verdict: #44 flipped the small dense models (e2b/e4b) to beat mlx-lm** — e2b
-> WINs @4k (+3 %), TIEs 8k/16k, trails only −3…−5 % at 32k/64k (was −21 % @64k);
-> e4b WINs at **every** size (+1…+3 %, flipped from a −4…−12 % loss). **The big
-> models still trail on decode** — 26b MoE −10…−28 % (the MoE-kernel decode gap) and
-> 31b dense −2…−12 % (bandwidth physics) — **but prefill improved**: #46 cut 26b
-> 128k cold TTFT ~2.5× (403 s → 161.6 s); 31b dense `none` 128k is still a 477 s
-> prefill (the remaining big-model lever). The champion comparison is **decode
-> only**. KV quant moves neither decode (≈ noise) nor memory (it _inflates_ KV;
-> `none` is the smallest) — except 31b, where k8vturbo2/tsym pays +3–4 % @32k–64k.
+> **Verdict: #44 flipped e2b/e4b; #51 closed 26b MoE; only 31b dense still trails.**
+> e2b WINs @4k, near-parity 32k/64k (the prior −3…−5 % was n=2 noise, re-measured
+> ≈parity); e4b WINs at **every** size (+1…+3 %). **26b MoE — #51 (bf16 MoE
+> router/expert stream) closed the −10…−28 % decode gap to −4…+1 % (🟢 WIN @16k) and
+> halved its KV** (none 64k 3216→1744 MB). **31b dense still trails −2…−12 %**
+> (bandwidth physics — near the ceiling). Prefill: #46 cut 26b 128k cold TTFT ~2.5×;
+> 31b dense `none` 128k is still a 477 s prefill (the remaining big-model lever). The
+> champion comparison is **decode only**. KV quant moves neither decode (≈ noise) nor
+> memory (it _inflates_ KV; `none` is the smallest) — except 31b, where k8vturbo2/tsym
+> pays +3–4 % @32k–64k.
 
 ---
 
@@ -501,22 +515,28 @@ Ranked by impact:
    kernel per se**. #44 (bf16 activation stream) flipped **e2b** to a +3 % WIN @4k /
    TIE mid / −3…−5 % long-ctx (was −21 % @64k) and **e4b** to a 🟢 **WIN at every
    size** (+1…+3 %, flipped from −4…−12 %). The SWA decode deficit is closed on small
-   dense; only a small long-ctx e2b residual remains.
-2. **Big-model decode still trails — the remaining decode gap.** **26b MoE −10…−28 %**
-   at every size (the MoE-kernel decode gap, untouched by #44) and **31b dense
-   −2…−12 %** (dense-bandwidth physics — close to the ceiling, hard to move). These
-   are the two models where decode is still behind mlx-lm post-fix.
+   dense; the prior small long-ctx e2b residual re-measured ≈ parity (32k 106.9, 64k
+   103.2 — it was n=2 noise, e2b is dense and untouched by #51).
+2. **Big-model decode — 26b MoE CLOSED by #51; only 31b dense remains.** **#51**
+   (bf16 MoE router/expert stream) closed the 26b MoE gap from −10…−28 % to **−4…+1 %**
+   (🟢 WIN @16k) and halved its KV — the same f32-stream class #44 fixed for the dense
+   path, which the MoE **router** was missed by (a strong-f32 root-size scalar leaked
+   f32 through `routing_weights` into the whole MoE residual → downstream KV). **31b
+   dense −2…−12 %** (dense-bandwidth physics — close to the ceiling, hard to move) is
+   now the **only** model trailing mlx-lm on decode.
 3. **Prefill improved on 26b (#46) but still large on 31b dense.** #46 sorted-MoE
    gather cut 26b 128k cold TTFT ~2.5× (403 s → **161.6 s**) and 64k ~3× (~182 s →
    **54.4 s**). 31b dense `none` 128k is still a **477 s** prefill (64k 171 s) — the
    highest-value remaining big-model lever, same prefill class the Qwen3.6 campaign
    flagged.
 4. **KV memory: `none` is the smallest of every codec on every model.** Windowed SWA
-   layers are window-bounded (#35), the old 6× was a reporting artifact (#39), and
-   #44 stores the global decode K/V bf16 — `none` KV is exactly halved and smaller
-   than every quant codec (which keep their bf16 seed *alongside* the packed blocks,
-   1.2–4× larger). **KV quant only pays on 31b dense** (k8vturbo2/tsym +3–4 %
-   @32k–64k, bandwidth-bound) — it is net-negative on the other three.
+   layers are window-bounded (#35), the old 6× was a reporting artifact (#39), #44
+   stores the global decode K/V bf16, and **#51 extends the same bf16-stream fix to the
+   26b MoE residual → 26b `none` KV also halved** (64k 3216→**1744 MB**; every 26b
+   codec's KV dropped proportionally). `none` KV is smaller than every quant codec
+   (which keep their bf16 seed *alongside* the packed blocks, 1.2–4× larger). **KV
+   quant only pays on 31b dense** (k8vturbo2/tsym +3–4 % @32k–64k, bandwidth-bound) —
+   it is net-negative on the other three.
 5. **MTP accept-rate is the lever — drafter quality, not the engine.** Spec is purely
    accept-gated, and accept is **prompt-dependent (0.08–0.90), not codec-dependent**
    (the MTP grids are flat across codecs). Wins where accept high (31b 4k +74 % @0.90,
