@@ -1,5 +1,5 @@
 use super::*;
-use crate::prompt_cache::{PromptCache, BLOCK_TOKENS};
+use crate::prompt_cache::{PromptCache, SpillSink, BLOCK_TOKENS};
 use rmlx_kv_ssd::chained_block_hashes;
 
 /// Unit test: per-head q_norm shape is preserved.

@@ -68,12 +68,12 @@ use crate::kv_cache::{
     kv_max_seq_and_ceiling, kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
 };
 use crate::prompt_cache::{
-    chained_block_hashes_seeded, ArchPromptCache, PromptCacheEntry, ReusePolicy, SpillSink,
-    SsdHydrate, FNV_OFFSET,
+    chained_block_hashes_seeded, ArchPromptCache, PromptCacheEntry, ReusePolicy, SsdHydrate,
+    FNV_OFFSET,
 };
 use crate::sampler::{apply_mask_argmax, TokenLogprobs};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
-use rmlx_kv_ssd::{HydratedBlock, SpillJob, SsdHydrator, SsdSpiller};
+use rmlx_kv_ssd::{HydratedBlock, SsdHydrator};
 
 /// capture top-`k` logprobs for an already-chosen token.
 ///
@@ -210,50 +210,10 @@ fn qwen3_active_layout_key() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// SSD-spill sink
+// SSD-spill sink — the blanket `impl SpillSink<E> for SsdSpiller` in
+// `crate::prompt_cache` covers Qwen3 dense (pure-attention: `lin_caches()` is
+// `&[]`, so the spill job carries `kv_caches` only).
 // ---------------------------------------------------------------------------
-
-/// Spill a RAM-evicted `Qwen3Entry` to the SSD tier.
-///
-/// Pure-attention arch: only `kv_caches` are spilled (no GDN linear state).
-/// Entries with no full block or an unknown `kv_quant` are skipped; a clone
-/// error is `warn!`-skipped — eviction still drops the entry from RAM.
-impl SpillSink<Qwen3Entry> for SsdSpiller {
-    fn spill(&self, entry: &Qwen3Entry) {
-        let Some(&hash) = entry.block_hashes.last() else {
-            return; // no full block → no stable spill key
-        };
-        let Some(kv_quant) = entry.kv_quant else {
-            return; // unknown quant → cannot tag the block
-        };
-        let layout_key = self.layout_key();
-        let kv_caches: Result<Vec<KvCache>> =
-            entry.kv_caches.iter().map(|c| c.try_deep_clone()).collect();
-        let kv_caches = match kv_caches {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(error = %e, "kv-spill: qwen3 cache clone failed, skipping spill");
-                return;
-            }
-        };
-        // Materialize GPU buffers on THIS (inference) thread; the drain thread
-        // cannot evaluate the lazy graph (no Metal stream). See KvCache::eval_for_spill.
-        for c in &kv_caches {
-            if let Err(e) = c.eval_for_spill() {
-                tracing::warn!(error = %e, "kv-spill: qwen3 eval-for-spill failed, skipping spill");
-                return;
-            }
-        }
-        self.try_spill(SpillJob {
-            hash,
-            layout_key,
-            model_id: self.model_id().to_string(),
-            kv_quant,
-            kv_caches,
-            lin_caches: Vec::new(),
-        });
-    }
-}
 
 // ---------------------------------------------------------------------------
 // SSD-hydrate source
