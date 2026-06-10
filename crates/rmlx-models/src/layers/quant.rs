@@ -97,31 +97,81 @@ impl QuantParams {
     }
 }
 
-/// Resolve quantization parameters for a given tensor base name.
+/// Resolve quantization parameters for a given tensor base name, owning the
+/// `.biases`-sibling / affine rule shared by every quantized architecture.
 ///
-/// Checks `overrides` for an entry whose key is a suffix of `tensor_name`
-/// (e.g. override key `"model.layers.5.mlp.gate.proj"` matches tensor name
-/// `"model.layers.5.mlp.gate.proj"`). If found, that entry's group_size/bits
-/// override the defaults; mode falls back to the global default.
+/// Override lookup is an **exact-key** match: `overrides.get(tensor_name)`.
+/// The key must equal the tensor base path exactly (e.g.
+/// `"language_model.model.layers.5.router.proj"`); there is no suffix or
+/// prefix matching. When an override is present its `group_size`/`bits` win,
+/// and its `mode` wins when non-empty (else the global default `mode` is
+/// inherited).
 ///
-/// Returns the resolved `(group_size, bits, mode)` tuple.
+/// After resolving `(group_size, bits, mode)`, the `.biases` sibling governs
+/// the final mode. Only a mode that an override sets **explicitly** can clash;
+/// a non-affine *global default* mode inherited by a biased tensor is treated
+/// as the common affine-int-checkpoint case (gemma4-26b's ~120 biased tensors
+/// inherit the global `mxfp8` default yet are affine) and is forced to affine,
+/// matching the pre-unification per-arch resolvers:
+/// - `has_biases`, no override-set mode → force `"affine"` (per-group
+///   zero-point `.biases` ⇒ integer-affine regardless of the global mode).
+/// - `has_biases` + override mode already `"affine"` → keep `"affine"`.
+/// - `has_biases` + override sets an explicit **non-affine** mode (`mxfp8`,
+///   `nvfp4`, …) → hard error: an affine `.biases` sibling cannot decode under
+///   a microscaling/fp4 mode, so the config is internally contradictory.
+/// - `!has_biases` → the resolved mode is used as-is.
+///
+/// The hard-error branch is the one behavior new to the unified resolver: it
+/// replaces gemma4's honor-the-explicit-override and laguna/qwen3.5-moe's silent
+/// force-affine for the contradictory case. No on-disk snapshot in the registry
+/// hits it; reaching it means the `config.json` quant block is malformed.
 pub fn resolve_quant(
     tensor_name: &str,
+    has_biases: bool,
     defaults: &QuantParams,
     overrides: &std::collections::HashMap<String, QuantParams>,
-) -> QuantParams {
-    if let Some(ov) = overrides.get(tensor_name) {
-        QuantParams {
-            group_size: ov.group_size,
-            bits: ov.bits,
-            // Override mode if specified, else inherit global.
-            mode: if ov.mode.is_empty() {
-                defaults.mode.clone()
-            } else {
-                ov.mode.clone()
-            },
-        }
+) -> rmlx_core::error::Result<QuantParams> {
+    // Track whether a non-empty mode was set by the override itself; only an
+    // override-set mode can contradict the biases sibling. A non-affine *global
+    // default* inherited by a biased tensor is the normal affine-checkpoint case.
+    let override_entry = overrides.get(tensor_name);
+    let mode_set_by_override = override_entry.is_some_and(|ov| !ov.mode.is_empty());
+
+    let (group_size, bits, mode) = if let Some(ov) = override_entry {
+        let mode = if ov.mode.is_empty() {
+            defaults.mode.clone()
+        } else {
+            ov.mode.clone()
+        };
+        (ov.group_size, ov.bits, mode)
     } else {
-        defaults.clone()
+        (defaults.group_size, defaults.bits, defaults.mode.clone())
+    };
+
+    if has_biases {
+        if mode_set_by_override && QuantMode::from(mode.as_str()) != QuantMode::Affine {
+            // An explicit override mode that is not affine alongside an affine
+            // `.biases` sibling is a contradiction MLX cannot decode. Parse the
+            // mode first so an unrecognized-but-affine string (which
+            // `QuantMode::from` maps to Affine) is not refused — only a genuine
+            // microscaling/fp4 mode (`mxfp8`, `nvfp4`, …) errors.
+            return Err(rmlx_core::error::Error::Loader(format!(
+                "config quant mode '{mode}' for '{tensor_name}' contradicts the \
+                 .biases sibling: affine biases cannot decode under {mode}"
+            )));
+        }
+        // Affine-int checkpoint: a per-group zero-point `.biases` tensor is
+        // present, so the mode is "affine" regardless of the global mode.
+        return Ok(QuantParams {
+            group_size,
+            bits,
+            mode: "affine".to_owned(),
+        });
     }
+
+    Ok(QuantParams {
+        group_size,
+        bits,
+        mode,
+    })
 }
