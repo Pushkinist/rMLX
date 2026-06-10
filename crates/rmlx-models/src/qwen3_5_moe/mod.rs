@@ -20,7 +20,7 @@ pub(super) mod loader;
 pub(super) mod model;
 pub(super) mod moe;
 pub(crate) mod mtp_layer;
-pub(super) mod prompt_cache;
+pub(crate) mod prompt_cache;
 
 // ---------------------------------------------------------------------------
 // Public re-exports (preserve crate::qwen3_5_moe::* paths)
@@ -31,7 +31,6 @@ pub use generate::generate_greedy;
 pub use loader::{load_from_path, load_from_path_paro};
 pub use model::Qwen3_5MoeText;
 pub(crate) use mtp_layer::{MtpLayer, MtpLayerDims};
-pub(crate) use prompt_cache::attach_ssd_tier;
 pub use prompt_cache::read_cache_stats as qwen3_5_moe_cache_stats;
 pub use prompt_cache::read_kv_cache_bytes as qwen3_5_moe_kv_cache_bytes;
 

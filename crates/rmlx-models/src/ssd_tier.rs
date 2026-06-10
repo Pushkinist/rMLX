@@ -4,10 +4,8 @@
 //! pre-release v1 wipe, layout-key compute, spill / hydrate / block-I/O /
 //! index modules + the 5 Prometheus hook globals) lives in `rmlx-kv-ssd`.
 //! `rmlx-kv-ssd` cannot reach back into `rmlx-models`, so the arch-specific
-//! dispatch — `Gemma4ForConditionalGeneration` → `gemma4::attach_ssd_tier`,
-//! `Qwen3_5MoeForConditionalGeneration` → `qwen3_5_moe::attach_ssd_tier`,
-//! `Qwen3ForCausalLM` → `qwen3::attach_ssd_tier` — lives here and calls
-//! [`rmlx_kv_ssd::prepare_attach`] for everything else.
+//! dispatch — calling each arch's `PROMPT_CACHE` static's `attach_ssd_tier`
+//! method directly — lives here alongside [`rmlx_kv_ssd::prepare_attach`].
 //!
 //! The `pub use rmlx_kv_ssd::ssd_tier::*` shim was dropped — callers in
 //! `rmlx-cli` / `rmlx-server` import `SsdTierConfig`, `install_config`,
@@ -45,7 +43,7 @@ pub fn attach_at_load(
 
     match arch {
         "Gemma4ForConditionalGeneration" => {
-            crate::gemma4::attach_ssd_tier(
+            crate::gemma4::prompt_cache::PROMPT_CACHE.attach_ssd_tier(
                 &info.namespace,
                 info.kv_quant,
                 info.layout_key,
@@ -53,7 +51,7 @@ pub fn attach_at_load(
             );
         }
         "Qwen3_5MoeForConditionalGeneration" => {
-            crate::qwen3_5_moe::attach_ssd_tier(
+            crate::qwen3_5_moe::prompt_cache::PROMPT_CACHE.attach_ssd_tier(
                 &info.namespace,
                 info.kv_quant,
                 info.layout_key,
@@ -61,7 +59,7 @@ pub fn attach_at_load(
             );
         }
         "Qwen3ForCausalLM" => {
-            crate::qwen3::attach_ssd_tier(
+            crate::qwen3::QWEN3_PROMPT_CACHE.attach_ssd_tier(
                 &info.namespace,
                 info.kv_quant,
                 info.layout_key,

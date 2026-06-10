@@ -14,8 +14,9 @@
 //! - SWA helpers `can_truncate_to_block` / `is_strict_prefix_of` consumed by
 //!   `gemma4/generate.rs`'s `CacheLookup` match (/ B1 snapshot/restore).
 //!
-//! The per-arch shell (`PROMPT_CACHE` static, attach/ensure/stats wrappers) is
-//! pure delegation to `ArchPromptCache`.
+//! The per-arch shell (`PROMPT_CACHE` static, ensure/stats wrappers) is
+//! pure delegation to `ArchPromptCache`; SSD attach is invoked directly on the
+//! static from `ssd_tier.rs`.
 //!
 //! ## SWA / RotatingKvCache note
 //! Gemma4 has sliding-window attention (SWA) layers backed by a
@@ -187,16 +188,6 @@ impl SsdHydrate<Gemma4Entry> for SsdHydrator {
 /// path (`is_strict_prefix_of`) is also taken via the generate-loop match.
 pub(crate) static PROMPT_CACHE: ArchPromptCache<Gemma4Entry> =
     ArchPromptCache::new("Gemma4ForConditionalGeneration", ReusePolicy::Partial);
-
-/// Wire the spiller + hydrator onto the gemma4 prompt cache.
-pub(crate) fn attach_ssd_tier(
-    namespace: &str,
-    kv_quant: KvQuant,
-    layout_key: u64,
-    device: rmlx_mlx::Device,
-) {
-    PROMPT_CACHE.attach_ssd_tier(namespace, kv_quant, layout_key, device);
-}
 
 /// the active `layout_key` for SSD tier seeding, or `0` when the tier
 /// is OFF. See [`ArchPromptCache::active_layout_key`].
