@@ -26,7 +26,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
-use tracing::debug;
+use tracing::{debug, warn};
 
 use rmlx_core::{Error, Result};
 
@@ -421,6 +421,39 @@ impl std::fmt::Debug for TensorView<'_> {
     }
 }
 
+// ── TensorLookup ───────────────────────────────────────────────────────────────
+
+/// Outcome of a discriminated index-driven tensor lookup ([`view_discriminated`]).
+///
+/// The three `Ok` outcomes split what was historically one opaque
+/// `Error::Loader(String)` "not found" string into cases a caller can act on:
+///
+/// - [`Found`](TensorLookup::Found) — the tensor was located and read.
+/// - [`NotInIndex`](TensorLookup::NotInIndex) — the index has no entry for this
+///   name. **Safe to fall back** to scanning every open shard header.
+/// - [`WrongShard`](TensorLookup::WrongShard) — the index names a shard for this
+///   tensor but that shard's header does not contain it (the "index lies" class:
+///   entries point at the wrong shard, or the named shard is not open). **Safe to
+///   fall back** to a header scan; callers should log a warning.
+///
+/// A failure to *parse* a shard's safetensors header is NOT one of these — a
+/// corrupt/truncated header is a real error, returned as `Err(...)` so a caller
+/// can never mistake corruption for "not here, look elsewhere".
+#[allow(
+    clippy::exhaustive_enums,
+    reason = "closed lookup-outcome enum — the three variants are the complete discrimination contract (Found / index-miss / index-lies); adding a variant requires updating view_discriminated and every fallback caller"
+)]
+#[derive(Debug)]
+pub enum TensorLookup<'a> {
+    /// Tensor located and read; the view borrows the owning shard's mmap.
+    Found(TensorView<'a>),
+    /// No `weight_map` entry for this name. Safe to fall back to a header scan.
+    NotInIndex,
+    /// The index points at a shard that does not actually hold the tensor (or is
+    /// not open). The "medgemma index lies" class — safe to fall back, log warn.
+    WrongShard,
+}
+
 // ── try_exact_then_suffix ────────────────────────────────────────────────────
 
 /// Resolve a tensor name in `idx.weight_map` using a two-phase strategy.
@@ -523,49 +556,103 @@ pub fn try_exact_then_suffix<'a>(
     None
 }
 
-/// Look up tensor `name` across all shards and return a zero-copy view.
+/// Look up tensor `name` via the shard index and return a discriminated outcome.
 ///
-/// Locates the owning shard via `idx.weight_map`, then parses the shard's
+/// Locates the owning shard via `idx.weight_map`, then parses that shard's
 /// safetensors header (O(KB)) and returns the tensor's byte slice — no full
 /// shard data is loaded into user memory beyond the page-faulted mmap region
 /// actually touched.
 ///
-/// `bytes` has lifetime `'a` (borrowed from the shard mmap).
-/// `shape` is a small owned copy (Vec<usize>) from the parsed header.
-pub fn view<'a>(shards: &'a ShardSet, idx: &ShardIndex, name: &'a str) -> Result<TensorView<'a>> {
-    let shard_filename = idx
-        .weight_map
-        .get(name)
-        .ok_or_else(|| Error::Loader(format!("tensor '{name}' not found in shard index")))?;
+/// The outcome separates "not here, look elsewhere" from "something is broken"
+/// so a caller's fallback-to-header-scan path can never silently swallow a
+/// corrupt shard (see [`TensorLookup`]):
+///
+/// - `Ok(Found(tv))` — tensor located; `tv.bytes` borrows the shard mmap (`'a`).
+/// - `Ok(NotInIndex)` — `name` is absent from `weight_map`; safe to fall back.
+/// - `Ok(WrongShard)` — the index names a shard for `name` but that shard is not
+///   open, or its header does not contain `name`; safe to fall back, log a warn.
+/// - `Err(...)` — the named shard's header failed to parse (corrupt/truncated),
+///   or another I/O failure. The caller MUST propagate — never fall back.
+///
+/// `shape` is a small owned copy (`Vec<usize>`) from the parsed header.
+pub fn view_discriminated<'a>(
+    shards: &'a ShardSet,
+    idx: &ShardIndex,
+    name: &'a str,
+) -> Result<TensorLookup<'a>> {
+    // Index miss: the tensor is not mapped to any shard. Safe to fall back.
+    let Some(shard_filename) = idx.weight_map.get(name) else {
+        return Ok(TensorLookup::NotInIndex);
+    };
 
-    let handle: &'a ShardHandle = shards.get(shard_filename).ok_or_else(|| {
-        Error::Loader(format!(
-            "shard '{shard_filename}' not open (referenced by tensor '{name}')"
-        ))
-    })?;
+    // Index inconsistency: the named shard is not among the open handles. The
+    // tensor may live in another open shard, so this is a fall-back case, not an
+    // error. Log a warning — a well-formed snapshot never hits this.
+    let Some(handle) = shards.get(shard_filename) else {
+        warn!(
+            tensor = name,
+            shard = shard_filename.as_str(),
+            "shard index references a shard that is not open — discriminated as WrongShard (caller may fall back to a header scan)"
+        );
+        return Ok(TensorLookup::WrongShard);
+    };
 
     // Parse safetensors header — O(header size), not O(shard size).
-    // The deserialize-from-bytes lifetime threads through cleanly: bytes are
-    // `&'a [u8]` (borrowed from the mmap), so SafeTensors<'a>, TensorView<'a>,
-    // and `t.data() -> &'a [u8]` all carry the same lifetime.
+    // A parse failure here is a CORRUPT/truncated shard header: a real error
+    // that must NEVER be reported as "not found", or a fallback caller would
+    // silently mask shard corruption. The deserialize-from-bytes lifetime
+    // threads through cleanly: bytes are `&'a [u8]` (borrowed from the mmap), so
+    // SafeTensors<'a>, TensorView<'a>, and `t.data() -> &'a [u8]` all carry `'a`.
     let st = safetensors::SafeTensors::deserialize(handle.as_bytes()).map_err(|e| {
         Error::Loader(format!(
             "cannot parse safetensors header in {shard_filename}: {e}"
         ))
     })?;
 
-    let t = st.tensor(name).map_err(|e| {
-        Error::Loader(format!(
-            "tensor '{name}' not found in shard '{shard_filename}': {e}"
-        ))
-    })?;
+    // Index points at this shard but its header does not list the tensor: the
+    // "index lies" class (entries point at the wrong shard). Safe to fall back.
+    let Ok(t) = st.tensor(name) else {
+        warn!(
+            tensor = name,
+            shard = shard_filename.as_str(),
+            "shard index points at a shard whose header omits the tensor — discriminated as WrongShard (caller may fall back to a header scan)"
+        );
+        return Ok(TensorLookup::WrongShard);
+    };
 
-    Ok(TensorView {
+    Ok(TensorLookup::Found(TensorView {
         name,
         dtype: t.dtype(),
         shape: t.shape().to_vec(),
         bytes: t.data(),
-    })
+    }))
+}
+
+/// Look up tensor `name` across all shards and return a zero-copy view, or a
+/// hard error.
+///
+/// Convenience wrapper over [`view_discriminated`] for callers that genuinely
+/// want "found, or fail" semantics and do not implement a header-scan fallback.
+/// Both index-miss ([`TensorLookup::NotInIndex`]) and index-lies
+/// ([`TensorLookup::WrongShard`]) collapse back into an `Error::Loader`, and a
+/// corrupt-header parse failure propagates as before — so existing
+/// `view(...)?`-style callers keep their current behavior.
+///
+/// `bytes` has lifetime `'a` (borrowed from the shard mmap).
+/// `shape` is a small owned copy (Vec<usize>) from the parsed header.
+pub fn view<'a>(shards: &'a ShardSet, idx: &ShardIndex, name: &'a str) -> Result<TensorView<'a>> {
+    match view_discriminated(shards, idx, name)? {
+        TensorLookup::Found(tv) => Ok(tv),
+        TensorLookup::NotInIndex => Err(Error::Loader(format!(
+            "tensor '{name}' not found in shard index"
+        ))),
+        TensorLookup::WrongShard => {
+            let shard = idx.weight_map.get(name).map_or("?", |s| s.as_str());
+            Err(Error::Loader(format!(
+                "tensor '{name}' not found in the shard '{shard}' its index entry names"
+            )))
+        }
+    }
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
