@@ -835,35 +835,40 @@ impl Architecture {
     /// Returns `Vec<ProbeStep>` -- one entry per generated token.
     #[tracing::instrument(skip_all, fields(n_tokens, prompt_len = prompt_ids.len()))]
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_greedy(
+    pub fn generate_greedy<'a>(
         &self,
-        tokenizer: &tokenizers::Tokenizer,
+        tokenizer: &'a tokenizers::Tokenizer,
         prompt_ids: &[u32],
         n_tokens: usize,
         device: Device,
         kv_quant_override: Option<rmlx_kv_quant::KvQuant>,
         max_ctx_override: Option<i32>,
         prompt_cache_slots: usize,
-        eos_ids: &[u32],
-        step_fn: &mut dyn FnMut(&crate::gemma4::ProbeStep) -> Option<u32>,
+        eos_ids: &'a [u32],
+        step_fn: &'a mut dyn FnMut(&crate::gemma4::ProbeStep) -> Option<u32>,
         // A6.2: optional sampler constraint. `None` = unmasked argmax (the
         // hot path; identical to pre-A6.2 behaviour). `Some(_)` enables the
         // masked branch in each arch's `argmax` call sites; in A6.2 the only
         // impl is `NoOpConstraint` (all-allow), so it is plumbing-only and
         // produces byte-identical output at temp=0.
-        constraint: Option<&mut dyn crate::ConstraintEngine>,
+        //
+        // The per-request borrows share `'a`: the shared decode loop stores them
+        // together in one `DecodeCtx<'a>` for the duration of the call. `'a`
+        // appears only in parameter position, so callers are not over-constrained
+        // — they pass all of these from a single request frame.
+        constraint: Option<&'a mut dyn crate::ConstraintEngine>,
         // A7.2: sampling config + per-request RNG. `sampler_cfg.temperature
         // <= 0.0` keeps the untouched greedy GPU argmax path byte-for-byte;
         // `> 0.0` routes to the host categorical sampler. The route handler
         // constructs both from `GenerationRequest.sampling`.
-        sampler_cfg: &crate::sampler::SamplerConfig,
-        rng: &mut crate::sampler::Pcg32,
+        sampler_cfg: &'a crate::sampler::SamplerConfig,
+        rng: &'a mut crate::sampler::Pcg32,
         // A7.3: logit-penalty configuration. `penalty_cfg.penalties_active() ==
         // false` keeps the temp=0 pure-GPU argmax path byte-for-byte untouched.
         // `token_history` accumulates every emitted token id; the arch trims it
         // to the trailing-20 window before each `apply_penalties` call.
-        penalty_cfg: &crate::sampler::PenaltyConfig,
-        token_history: &mut Vec<u32>,
+        penalty_cfg: &'a crate::sampler::PenaltyConfig,
+        token_history: &'a mut Vec<u32>,
     ) -> Result<Vec<crate::gemma4::ProbeStep>> {
         use crate::kv_cache::KvCacheBuilder;
         use rmlx_kv_quant::KvQuant;
