@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-10
+
+Gemma 4 decode is now competitive with mlx-lm across the whole family, Gemma 4
+speculative decoding (MTP) works end to end, the KV ring grows lazily with
+per-request KV / context hot-swap, KV-cache metrics report live sizes, and the
+env-var surface is cleaned up — **breaking** for shell configs that set removed
+vars directly (see Removed).
+
+### Added
+
+- **Per-request KV-quant + `--max-ctx` hot-swap** on a resident model — switch
+  the KV codec or context ceiling per request without reloading the model. (#26)
+- **Per-layer KV net-benefit estimator** — warns when a KV codec costs more
+  resident bytes than it saves on a given layer mix (general across arches). (#34)
+- Five env-var-only knobs promoted to proper `--flag` / `env=` pairs (the flag
+  always takes precedence): `--log-cap-mb`, `--yarn-factor`,
+  `--yarn-original-max`, `--session-cache-max-sessions`, `--prompts-dir`.
+
+### Fixed
+
+- **Gemma 4 speculative (MTP) functional end to end.** Dispatch routes
+  `--draft-kind mtp` by draft arch family and rejects a plain-`gemma4` draft
+  cleanly (#23); the assistant SWA mask uses array mode instead of the rejected
+  additive mode (#24); a verify-step SWA mask off-by-one in both the producer
+  and consumer branches is fixed (#32); and the loader supports both assistant
+  LM-head variants — sparse centroid-routed (e2b/e4b) and plain tied-head
+  (26b/31b) (#49). All four Gemma 4 sizes load and run coherent under MTP.
+- **Gemma 4 decode kept bf16 end to end.** `gelu_tanh` f32 constants plus the
+  embed / per-layer scales no longer promote the dense activation stream to f32
+  (#44), and the MoE router's strong-f32 root-size scalar no longer leaks f32
+  into the routing weights and the downstream KV (#51). Net: e2b/e4b beat mlx-lm
+  decode, 26b-a4b MoE closed from −10…−28 % to −4…+1 %, and global `--kv-quant
+  none` KV is halved (bf16) on every model.
+- **`--max-ctx` is a virtual ceiling** — the KV ring grows on demand, so a high
+  ceiling no longer penalizes small-prompt decode. (#25)
+- **Rotation / K-only KV codecs** precompile their MSL kernels at load and are
+  truthfully classified Metal vs CPU (no silent host-CPU fallback). (#36)
+- **Qwen3.6-MoE SSD-hydrated prefix skips prefill** via a hydrated-tail path — a
+  cache hit no longer re-runs the full prefill. (#9)
+- **Live KV-cache metrics** — `kv_cache_bytes` reports the real resident size
+  (was always 0) and counts the filled prefix, not the `--max-ctx` ceiling.
+  (#33, #39)
+
+### Performance
+
+- **MoE prefill ~4× faster** on gemma4-26b and Qwen3.5-MoE via sorted-index
+  expert gather (contiguous per-expert access in `gather_qmm`) — 26b 128k cold
+  TTFT ~403 s → ~117 s. (#46)
+
+### Tested
+
+- Falsified the 6× SWA-KV claim: windowed SWA KV is window-bounded, not
+  full-context (#35, #40).
+- Full Gemma 4 and Qwen 3.6 KV × context bench matrices (per-model decode /
+  TTFT / KV-size across all codecs) recorded under `docs/models/`.
+
 ### Changed
 
 - **Env-var surface cleanup** (`chore/env-var-cleanup`). Five previously
@@ -27,6 +83,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   vars (`RMLX_HOME`, `RMLX_METRICS_DB`), all five newly-promoted flag-envs,
   audio path vars, `RMLX_MM_CACHE_BYTES`, `RMLX_SESSION_CACHE_MAX_SESSIONS`,
   draft compat keys, and prefill chunk tuning.
+- Dependency bumps: `safetensors` 0.4 → 0.7, `symphonia` 0.5 → 0.6.
 
 ### Removed
 
@@ -120,6 +177,7 @@ inference + conversion backend for Apple Silicon — no Python at runtime.
 - Speculative drafters validated against their verifiers: Qwen 3.6 MTP sidecar
   and the Gemma 4 assistant drafter.
 
-[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.0
 [0.1.1]: https://github.com/Pushkinist/rMLX/releases/tag/v0.1.1
 [0.1.0]: https://github.com/Pushkinist/rMLX/releases/tag/v0.1.0
