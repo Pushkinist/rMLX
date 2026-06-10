@@ -144,6 +144,58 @@ fn parses_weight_map() {
     assert_eq!(counts["model-00002-of-00002.safetensors"], 1);
 }
 
+/// Write a one-tensor `.safetensors` shard into `dir`. The tensor is a tiny
+/// F32 scalar — only the header matters for shard discovery.
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: temp-file I/O and serialization failures should abort the test loudly"
+)]
+fn write_shard(dir: &Path, filename: &str, tensor_name: &str) {
+    let data: [u8; 4] = 1.0f32.to_le_bytes();
+    let tv = safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![1], &data).unwrap();
+    let bytes = safetensors::serialize([(tensor_name.to_owned(), tv)], None).unwrap();
+    std::fs::write(dir.join(filename), bytes).unwrap();
+}
+
+/// `open_dir` discovers every `*.safetensors` shard by glob, ignoring any index
+/// and any non-`.safetensors` file in the directory.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: tempdir / open_dir failures should abort the test loudly"
+)]
+fn open_dir_discovers_all_safetensors() {
+    let dir = tempfile::tempdir().unwrap();
+    write_shard(dir.path(), "a.safetensors", "tensor.a");
+    write_shard(dir.path(), "b.safetensors", "tensor.b");
+    // Decoy non-shard files that must be ignored.
+    std::fs::write(dir.path().join("config.json"), b"{}").unwrap();
+    std::fs::write(dir.path().join("notes.txt"), b"hi").unwrap();
+
+    let shards = ShardSet::open_dir(dir.path()).unwrap();
+    assert_eq!(shards.len(), 2, "exactly the two .safetensors shards");
+    assert!(shards.get("a.safetensors").is_some());
+    assert!(shards.get("b.safetensors").is_some());
+    assert!(
+        shards.get("config.json").is_none(),
+        "non-shard files must not be opened"
+    );
+}
+
+/// `open_dir` on a directory with no `*.safetensors` shard is an error, not an
+/// empty set — an index-less load against an empty dir must fail loudly.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: tempdir creation failure should abort the test loudly"
+)]
+fn open_dir_empty_is_err() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.json"), b"{}").unwrap();
+    let result = ShardSet::open_dir(dir.path());
+    assert!(result.is_err(), "no shards present must yield Err");
+}
+
 #[test]
 fn count_tensors_per_shard_basic() {
     let mut weight_map = BTreeMap::new();
