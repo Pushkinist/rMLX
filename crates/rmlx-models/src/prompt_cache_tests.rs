@@ -1,6 +1,8 @@
 use super::*;
 use rmlx_core::error::Result;
+use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 use rmlx_kv_ssd::chained_block_hashes;
+use rmlx_mlx::{Array, Device};
 
 // ── chained_block_hashes_seeded ────────────────────────────────────
 
@@ -79,6 +81,27 @@ impl PromptCacheEntry for TestEntry {
         })
     }
 
+    // TestEntry holds no real caches — these satisfy the required accessors so
+    // the trait's default bodies compile, but TestEntry keeps its own
+    // `truncate_kv_to`/`kv_bytes` overrides below to exercise the OVERRIDE path
+    // (recording the truncation length, faking byte counts). The default bodies
+    // are covered by `RealEntry` further down.
+    fn kv_caches(&self) -> &[KvCache] {
+        &[]
+    }
+
+    fn kv_caches_mut(&mut self) -> &mut [KvCache] {
+        &mut []
+    }
+
+    fn kv_quant(&self) -> Option<KvQuant> {
+        None
+    }
+
+    fn lin_caches(&self) -> &[LinearAttnCache] {
+        &[]
+    }
+
     fn truncate_kv_to(&mut self, prefix_len: usize) {
         self.truncated_to.set(Some(prefix_len));
     }
@@ -99,6 +122,227 @@ fn make_ids(n: usize) -> Vec<u32> {
 
 fn entry(n: usize) -> TestEntry {
     TestEntry::new(make_ids(n))
+}
+
+// ── RealEntry — exercises the trait's DEFAULT method bodies ──────────────────
+//
+// `TestEntry` mocks `truncate_kv_to` / `kv_bytes`, so it cannot cover the
+// default bodies introduced when those moved onto the trait. `RealEntry` holds
+// genuine `KvCache` + `LinearAttnCache` instances and supplies ONLY the four
+// required accessors, inheriting `truncate_kv_to` / `truncate_kv_to_block` /
+// `kv_bytes` from the default impl.
+
+const REAL_QUANT: KvQuant = KvQuant::K8V8;
+
+/// Deterministic LCG f32 data in [-1, 1] (same generator as the kv-ssd hydrate
+/// tests, so the byte shapes match the production spill path).
+fn lcg(n: usize, seed: u64) -> Vec<f32> {
+    let mut s = seed;
+    (0..n)
+        .map(|_| {
+            s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((s >> 33) as f32 / u32::MAX as f32).mul_add(2.0, -1.0)
+        })
+        .collect()
+}
+
+#[allow(
+    clippy::unwrap_used,
+    reason = "test-only: Array::from_f32_slice cannot fail on a correctly-sized F32 buffer"
+)]
+fn arr(data: &[f32], shape: &[i32]) -> Array {
+    Array::from_f32_slice(data, shape).unwrap()
+}
+
+/// Build a single-layer K8V8 `KvCache` populated with `seq` tokens via the
+/// public prefill path on CPU (mirrors `kv-ssd::hydrate_tests::build_kvcache`).
+#[allow(
+    clippy::unwrap_used,
+    reason = "test-only: CPU prefill of a correctly-shaped K8V8 cache is infallible here; any error is a structural bug in the fixture"
+)]
+fn build_kvcache(seq: i32, seed: u64) -> KvCache {
+    let device = Device::Cpu;
+    let mut c = KvCache::with_quant_max_seq(REAL_QUANT, 4096);
+    // shape [B=1, kv_h=2, seq, D=128]
+    let shape = [1i32, 2, seq, 128];
+    let n: usize = shape.iter().map(|&x| x as usize).product();
+    let k = arr(&lcg(n, seed), &shape);
+    let v = arr(&lcg(n, seed ^ 0xABCD), &shape);
+    c.enter_prefill();
+    c.update(&k, &v, device).unwrap();
+    c.exit_prefill(device).unwrap();
+    c
+}
+
+/// Entry built on real caches, supplying ONLY the required accessors so the
+/// trait's default `truncate_kv_to` / `truncate_kv_to_block` / `kv_bytes`
+/// bodies are exercised. No mock overrides.
+struct RealEntry {
+    ids: Vec<u32>,
+    hashes: Vec<u64>,
+    kv_caches: Vec<KvCache>,
+    lin_caches: Vec<LinearAttnCache>,
+    kv_quant: Option<KvQuant>,
+}
+
+impl RealEntry {
+    /// `n_kv` real K8V8 caches of `seq` tokens each, plus `n_lin` empty linear
+    /// caches. With `seq == 0` the caches have `offset() == 0` (never filled),
+    /// which the default `truncate_kv_to` guard must skip without panic.
+    fn new(ids: Vec<u32>, seq: i32, n_kv: usize, n_lin: usize) -> Self {
+        let hashes = chained_block_hashes(&ids);
+        let kv_caches = (0..n_kv)
+            .map(|i| {
+                if seq > 0 {
+                    build_kvcache(seq, 0x51D1 ^ i as u64)
+                } else {
+                    // Never-prefilled cache → offset() == 0 → truncate guard skips.
+                    KvCache::with_quant_max_seq(REAL_QUANT, 4096)
+                }
+            })
+            .collect();
+        let lin_caches = (0..n_lin).map(|_| LinearAttnCache::new()).collect();
+        RealEntry {
+            ids,
+            hashes,
+            kv_caches,
+            lin_caches,
+            kv_quant: Some(REAL_QUANT),
+        }
+    }
+}
+
+impl PromptCacheEntry for RealEntry {
+    fn prompt_token_ids(&self) -> &[u32] {
+        &self.ids
+    }
+
+    fn block_hashes(&self) -> &[u64] {
+        &self.hashes
+    }
+
+    #[allow(
+        clippy::unwrap_used,
+        reason = "test-only: refcount deep-clone of CPU caches is infallible in this fixture"
+    )]
+    fn deep_clone(&self) -> Result<Self> {
+        Ok(RealEntry {
+            ids: self.ids.clone(),
+            hashes: self.hashes.clone(),
+            kv_caches: self
+                .kv_caches
+                .iter()
+                .map(|c| c.try_deep_clone().unwrap())
+                .collect(),
+            lin_caches: self
+                .lin_caches
+                .iter()
+                .map(|c| c.try_deep_clone().unwrap())
+                .collect(),
+            kv_quant: self.kv_quant,
+        })
+    }
+
+    fn kv_caches(&self) -> &[KvCache] {
+        &self.kv_caches
+    }
+
+    fn kv_caches_mut(&mut self) -> &mut [KvCache] {
+        &mut self.kv_caches
+    }
+
+    fn kv_quant(&self) -> Option<KvQuant> {
+        self.kv_quant
+    }
+
+    fn lin_caches(&self) -> &[LinearAttnCache] {
+        &self.lin_caches
+    }
+    // truncate_kv_to / truncate_kv_to_block / kv_bytes: inherited from trait.
+}
+
+/// Default trait bodies over REAL `KvCache` instances:
+///  - a 2-cache entry (offset > 0) reports `kv_bytes() > 0` and `truncate_kv_to`
+///    actually shrinks the resident KV;
+///  - a 2-cache entry whose caches were never prefilled (offset == 0) must NOT
+///    panic on `truncate_kv_to` — the `offset() > 0` guard in the default body
+///    skips them.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test-only: fixture caches are constructed just above; deep_clone/eval are infallible on this CPU K8V8 fixture"
+)]
+fn default_truncate_and_kv_bytes_over_real_caches() {
+    // 4 full blocks of tokens, caches each holding 4*BLOCK_TOKENS positions.
+    let seq = (4 * BLOCK_TOKENS) as i32;
+    let ids = make_ids(4 * BLOCK_TOKENS);
+    let mut e = RealEntry::new(ids, seq, 2, 0);
+
+    let before = e.kv_bytes();
+    assert!(before > 0, "filled real caches must report non-zero bytes");
+
+    // Truncate to 1 block (256 positions) via the DEFAULT body.
+    e.truncate_kv_to(BLOCK_TOKENS);
+    for kv in e.kv_caches() {
+        assert_eq!(
+            kv.offset(),
+            BLOCK_TOKENS as i32,
+            "default truncate_kv_to must shrink each filled cache to the prefix length"
+        );
+    }
+    let after = e.kv_bytes();
+    assert!(
+        after < before,
+        "truncation must shrink resident KV ({after} < {before})"
+    );
+
+    // offset == 0 path: never-prefilled caches → default body's guard skips,
+    // no panic, bytes are zero.
+    let mut empty = RealEntry::new(make_ids(4 * BLOCK_TOKENS), 0, 2, 0);
+    assert_eq!(empty.kv_bytes(), 0, "never-filled caches hold no bytes");
+    empty.truncate_kv_to(BLOCK_TOKENS); // must not panic (offset == 0 guard)
+    for kv in empty.kv_caches() {
+        assert_eq!(kv.offset(), 0, "guard skipped the never-filled cache");
+    }
+}
+
+/// Default `kv_bytes` sums BOTH KV `resident_bytes` and linear-attn
+/// `approx_bytes`. Before this refactor only the qwen3.5-moe override summed
+/// the lin half; the default body now makes that structural for every arch
+/// that returns a non-empty `lin_caches()`.
+#[test]
+fn default_kv_bytes_sums_lin_caches() {
+    let seq = (2 * BLOCK_TOKENS) as i32;
+    let ids = make_ids(2 * BLOCK_TOKENS);
+    // 1 real KvCache + 1 LinearAttnCache. Populate the lin state with real
+    // arrays so `approx_bytes() > 0` — an empty lin cache reports 0, which would
+    // make this test vacuous (it would pass even if the default body dropped the
+    // `+ lin_caches()` term).
+    let mut e = RealEntry::new(ids, seq, 1, 1);
+    if let Some(lin) = e.lin_caches.first_mut() {
+        // conv_state [B, kernel-1, conv_dim] bf16; delta_state [B, Hv, Dv, Dk] f32.
+        lin.conv_state = Some(arr(&lcg(2 * 3 * 4, 0xC0), &[2, 3, 4]));
+        lin.delta_state = Some(arr(&lcg(2 * 2 * 4 * 4, 0xD0), &[2, 2, 4, 4]));
+    }
+
+    let kv_only: u64 = e.kv_caches().iter().map(KvCache::resident_bytes).sum();
+    let lin_only: u64 = e
+        .lin_caches()
+        .iter()
+        .map(LinearAttnCache::approx_bytes)
+        .sum();
+    assert!(kv_only > 0, "the real KV cache contributes bytes");
+    assert!(
+        lin_only > 0,
+        "the populated lin cache must contribute bytes"
+    );
+    assert_eq!(
+        e.kv_bytes(),
+        kv_only + lin_only,
+        "default kv_bytes must equal KV resident_bytes + lin approx_bytes"
+    );
 }
 
 /// 3 requests: 1st is a cold miss (cache empty), 2nd is a full-prompt
