@@ -113,18 +113,26 @@ impl ShardSet {
     /// and safe to overlap. Thread count is capped at `min(4, n_shards)`
     /// to leave cores available for MLX during model-load.
     pub fn open(model_dir: &Path, idx: &ShardIndex) -> Result<Self> {
-        let filenames: Vec<&String> = {
+        let filenames: Vec<String> = {
             let set: std::collections::BTreeSet<&String> = idx.weight_map.values().collect();
-            set.into_iter().collect()
+            set.into_iter().cloned().collect()
         };
+        Self::open_filenames(model_dir, filenames)
+    }
+
+    /// Open the named shards from `model_dir`, deduplicating nothing (callers
+    /// pass an already-distinct list) and parallelizing with a capped rayon pool
+    /// for multi-shard sets. Shared open body behind [`open`](ShardSet::open) and
+    /// [`open_dir`](ShardSet::open_dir).
+    fn open_filenames(model_dir: &Path, filenames: Vec<String>) -> Result<Self> {
         let n_shards = filenames.len();
 
         if n_shards <= 1 {
             // Fast path: avoid rayon overhead for single-shard models.
             let mut handles = BTreeMap::new();
             for filename in filenames {
-                let handle = ShardHandle::open(model_dir, filename)?;
-                handles.insert(filename.clone(), handle);
+                let handle = ShardHandle::open(model_dir, &filename)?;
+                handles.insert(filename, handle);
             }
             return Ok(ShardSet { handles });
         }
@@ -141,8 +149,8 @@ impl ShardSet {
             filenames
                 .into_par_iter()
                 .map(|filename| {
-                    let handle = ShardHandle::open(&model_dir_owned, filename)?;
-                    Ok((filename.clone(), handle))
+                    let handle = ShardHandle::open(&model_dir_owned, &filename)?;
+                    Ok((filename, handle))
                 })
                 .collect()
         });
@@ -154,6 +162,63 @@ impl ShardSet {
         }
 
         Ok(ShardSet { handles })
+    }
+
+    /// Open every `*.safetensors` shard in `model_dir` without consulting an index.
+    ///
+    /// For snapshots whose `model.safetensors.index.json` is absent or
+    /// untrustworthy (the gemma3 / medgemma class — the index omits sibling
+    /// tensors or mis-assigns shards) and for index-less layouts (qwen3_vl_moe,
+    /// whose shipped index references a pre-sanitize shard layout). Files are
+    /// discovered by directory glob and opened with the same mmap/handle path as
+    /// [`open`](ShardSet::open).
+    ///
+    /// Shards are opened in parallel using rayon when there are multiple shards
+    /// (single-shard discovery skips rayon entirely), capped at `min(4, n)` to
+    /// leave cores for MLX during model-load — identical to [`open`](ShardSet::open).
+    pub fn open_dir(model_dir: &Path) -> Result<Self> {
+        // Propagate `read_dir` enumeration errors instead of silently shrinking
+        // the shard set — a dropped shard surfaces later as "tensor not found",
+        // the exact masking this resolver exists to avoid.
+        let mut filenames: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(model_dir)
+            .map_err(|e| Error::Loader(format!("cannot read dir {}: {e}", model_dir.display())))?
+        {
+            let entry = entry.map_err(|e| {
+                Error::Loader(format!("read_dir entry in {}: {e}", model_dir.display()))
+            })?;
+            match entry.file_name().into_string() {
+                Ok(n) if n.ends_with(".safetensors") => filenames.push(n),
+                Ok(_) => {}
+                Err(os) => {
+                    tracing::warn!(name = ?os, "skipping non-UTF8 filename during shard discovery");
+                }
+            }
+        }
+        filenames.sort();
+
+        if filenames.is_empty() {
+            return Err(Error::Loader(format!(
+                "no *.safetensors shards found in {}",
+                model_dir.display()
+            )));
+        }
+
+        if filenames.len() > MAX_SHARDS {
+            error!(
+                got = filenames.len(),
+                max = MAX_SHARDS,
+                dir = %model_dir.display(),
+                "shard count exceeds MAX_SHARDS bound — possible malformed snapshot directory"
+            );
+            return Err(Error::Loader(format!(
+                "{} holds {} *.safetensors shards (max {MAX_SHARDS})",
+                model_dir.display(),
+                filenames.len()
+            )));
+        }
+
+        Self::open_filenames(model_dir, filenames)
     }
 
     /// Look up a shard handle by filename.
