@@ -1,4 +1,4 @@
-//! Image-prompt construction helpers shared by Gemma4Generator.
+//! Image-prompt construction helpers shared by ArchGenerator.
 //!
 //! - `VisionBundle` — arch-specific multimodal components (loaded once)
 //! - `build_image_prompt` — Gemma4/Gemma3 image embedding + token splice

@@ -1,4 +1,4 @@
-//! Shared helper functions used by both Gemma4Generator and SpeculativeGenerator.
+//! Shared helper functions used by both ArchGenerator and SpeculativeGenerator.
 //!
 //! - ITL / TTFT events-table write helpers
 //! - `resolve_kv_quant_for_load` — auto-kv-quant resolution
@@ -15,7 +15,7 @@ use rmlx_metrics::events::{EventRecorder, Measurement};
 
 /// Write p50/p95/p99 ITL measurements to the events table.
 ///
-/// Called from both Gemma4Generator and SpeculativeGenerator after decode
+/// Called from both ArchGenerator and SpeculativeGenerator after decode
 /// completes. A single helper avoids six near-identical `rec.record` blocks.
 ///
 /// Also writes the equivalent `tpot_*_ms` rows. In v1 the values are

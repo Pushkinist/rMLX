@@ -94,7 +94,7 @@ pub fn normalized_to_jinja_tool(t: &NormalizedTool) -> serde_json::Value {
 
 /// Shared startup configuration handed to every generator constructor.
 ///
-/// Bundles the model-load args that `Gemma4Generator` and
+/// Bundles the model-load args that `ArchGenerator` and
 /// `SpeculativeGenerator` carried identically (`device`, `kv_quant`,
 /// `max_ctx`, `prompt_cache_slots`). Built once in `run_serve` from the
 /// CLI-resolved flags and passed by reference into each constructor.

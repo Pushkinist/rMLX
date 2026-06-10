@@ -65,7 +65,7 @@ pub use admission::{
     StepMetrics,
 };
 pub use engine::{
-    Gemma4Generator, GenerationRequest, GenerationToken, Generator, ModelLoadConfig,
+    ArchGenerator, GenerationRequest, GenerationToken, Generator, ModelLoadConfig,
     NotReadyGenerator, SpeculativeGenerator,
 };
 pub use keep_alive::{

@@ -228,7 +228,7 @@ impl SpeculativeDispatcher {
             return Err(Error::Model(
                 "spec_generate_greedy: A6.2 — sampler constraint engine not \
                  supported on the speculative-decoding path. Use the \
-                 single-arch path (Gemma4Generator) for response_format \
+                 single-arch path (ArchGenerator) for response_format \
                  requests, or wait for A6.3."
                     .into(),
             ));

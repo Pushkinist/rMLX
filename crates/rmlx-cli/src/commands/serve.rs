@@ -35,7 +35,7 @@ use rmlx_loader::{discover_kv_calibration, load_config, load_head_budgets};
 use rmlx_metrics::events::EventRecorder;
 use rmlx_mlx::Device;
 use rmlx_server::{
-    register_ssd_prom_hooks, spawn_drainer, AppState, Gemma4Generator, KeepAlivePolicy,
+    register_ssd_prom_hooks, spawn_drainer, AppState, ArchGenerator, KeepAlivePolicy,
     ModelLoadConfig, ModelLoader, ModelRegistry, RegistryConfig, SpeculativeGenerator, TtftStore,
 };
 use tracing::{info, warn};
@@ -715,7 +715,7 @@ pub(crate) fn run_serve(
     // before any model loads. Per-namespace budget 0 AND global budget 0 →
     // tier OFF (no spiller/hydrator installed, decode byte-identical to the
     // RAM-only path). The model-load path
-    // (`Gemma4Generator::from_snapshot_with_id` → `ssd_tier::attach_at_load`)
+    // (`ArchGenerator::from_snapshot_with_id` → `ssd_tier::attach_at_load`)
     // reads this config to attach the spiller + hydrator.
     //
     // per_project_budgets populated from projects.toml sections.
@@ -843,7 +843,7 @@ pub(crate) fn run_serve(
 
     // The loader closure — called by AppState::ensure_loaded on demand.
     // When `--draft-model` is set, build a
-    // SpeculativeGenerator instead of the single-model Gemma4Generator.
+    // SpeculativeGenerator instead of the single-model ArchGenerator.
     // bundle the shared model-load args into one config built from the
     // CLI-resolved flags. `gpu_gate` stays a separate handle (shared resource,
     // cloned per construction — not a load-config value).
@@ -986,9 +986,9 @@ pub(crate) fn run_serve(
                 max_ctx = ?effective_cfg.max_ctx,
                 cache_slots = effective_cfg.prompt_cache_slots,
                 has_calibration = effective_cfg.calibration.is_some(),
-                "loader: Gemma4Generator::from_snapshot"
+                "loader: ArchGenerator::from_snapshot"
             );
-            let gen = Gemma4Generator::from_snapshot_with_id(
+            let gen = ArchGenerator::from_snapshot_with_id(
                 path,
                 Some(id),
                 &effective_cfg,

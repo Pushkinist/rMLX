@@ -45,7 +45,7 @@ type TtsCache = PLRwLock<
 
 /// Factory that loads a model from disk given its snapshot path and logical id.
 ///
-/// Injected at startup so tests can replace `Gemma4Generator::from_snapshot`
+/// Injected at startup so tests can replace `ArchGenerator::from_snapshot`
 /// with a lightweight stub (`NotReadyGenerator`).
 pub type ModelLoader =
     Arc<dyn Fn(&std::path::Path, &str) -> rmlx_core::Result<Box<dyn Generator>> + Send + Sync>;
@@ -547,7 +547,7 @@ pub struct AppState {
     /// Factory for loading a model by snapshot path.
     ///
     /// Signature: `(path, id) -> Result<Box<dyn Generator>>`.
-    /// Production uses `Gemma4Generator::from_snapshot`; tests inject a stub.
+    /// Production uses `ArchGenerator::from_snapshot`; tests inject a stub.
     pub loader: ModelLoader,
     /// Optional metrics sink. `None` in unit tests; `Some` in production runs.
     pub metrics: Option<Arc<EventRecorder>>,
