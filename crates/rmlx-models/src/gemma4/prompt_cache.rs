@@ -6,7 +6,8 @@
 //! Gemma4-specific bits:
 //!
 //! - `Gemma4Entry`: `Vec<KvCache>` only (pure-attention arch — no GDN state).
-//! - `impl PromptCacheEntry for Gemma4Entry`: deep_clone, truncate, kv_bytes.
+//! - `impl PromptCacheEntry for Gemma4Entry`: deep_clone + KV accessors;
+//!   truncate / kv_bytes come from the trait defaults (pure-attention, no GDN).
 //! - `impl SpillSink<Gemma4Entry> for SsdSpiller`: pure-attention spill (no
 //!   `lin_caches`).
 //! - `impl SsdHydrate<Gemma4Entry> for SsdHydrator`: pure-attention hydrate.
@@ -31,7 +32,7 @@ use crate::prompt_cache::{
     chained_block_hashes_seeded, ArchPromptCache, CacheStats, PromptCacheEntry, ReusePolicy,
     SpillSink, SsdHydrate, BLOCK_TOKENS, FNV_OFFSET,
 };
-use rmlx_kv_quant::{KvCache, KvQuant};
+use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 use rmlx_kv_ssd::{HydratedBlock, SpillJob, SsdHydrator, SsdSpiller};
 
 // ---------------------------------------------------------------------------
@@ -124,21 +125,25 @@ impl PromptCacheEntry for Gemma4Entry {
         })
     }
 
-    fn truncate_kv_to(&mut self, prefix_len: usize) {
-        for kv in &mut self.kv_caches {
-            if kv.offset() > 0 {
-                kv.truncate_to(prefix_len as i32);
-            }
-        }
+    fn kv_caches(&self) -> &[KvCache] {
+        &self.kv_caches
     }
 
-    fn truncate_kv_to_block(&mut self, block_count: usize) {
-        self.truncate_kv_to(block_count * BLOCK_TOKENS);
+    fn kv_caches_mut(&mut self) -> &mut [KvCache] {
+        &mut self.kv_caches
     }
 
-    fn kv_bytes(&self) -> u64 {
-        self.kv_caches.iter().map(KvCache::resident_bytes).sum()
+    fn kv_quant(&self) -> Option<KvQuant> {
+        self.kv_quant
     }
+
+    // Pure-attention arch: no GDN linear state.
+    fn lin_caches(&self) -> &[LinearAttnCache] {
+        &[]
+    }
+    // truncate_kv_to / truncate_kv_to_block / kv_bytes: trait defaults.
+    // SWA correctness is gated upstream by `can_truncate_to_block` /
+    // `is_strict_prefix_of`; the trim itself is the byte-identical default.
 }
 
 // ---------------------------------------------------------------------------
