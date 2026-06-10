@@ -1,14 +1,15 @@
 use super::*;
 use crate::block_io::write_caches;
-use crate::hashing::chained_block_hashes;
 use rmlx_mlx::{Array, Device, Dtype};
 use tempfile::TempDir;
 
 const MODEL_ID: &str = "Qwen3ForCausalLM/test-snap";
 const QUANT: KvQuant = KvQuant::K8V8;
-/// a `layout_key` of zero collapses the seeded digest stream to the
-/// un-salted `chained_block_hashes` output (`FNV_OFFSET ^ 0 == FNV_OFFSET`),
-/// so the pre-hydrate fixtures still work byte-for-byte.
+/// a `layout_key` of zero drops the layout component of the seed, so the seed
+/// reduces to `FNV_OFFSET ^ kv_quant.cache_key_salt()` — the per-codec
+/// partition. Fixtures here key their index rows with that same salted seed
+/// (matching the production probe + spill side); the layout salt is exercised
+/// separately by `salted_keyed_block_is_found_by_probe`.
 const TEST_LAYOUT_KEY: u64 = 0;
 
 // Deterministic LCG f32 data in [-1, 1] (same generator as block_io tests).
@@ -79,9 +80,13 @@ fn ssd_hit_reconstructs_block_within_tolerance() {
     let db = dir.join("index.db");
     let index = SsdKvIndex::open_at(&db).unwrap();
 
-    // One full block (256 tokens) of prompt ids → one chained digest.
+    // One full block (256 tokens) of prompt ids → one chained digest, keyed
+    // with the production-truth salted seed (matches the probe in `lookup`).
     let prompt_ids: Vec<u32> = (0..BLOCK_TOKENS as u32).collect();
-    let chained = chained_block_hashes(&prompt_ids);
+    let chained = chained_block_hashes_seeded(
+        &prompt_ids,
+        FNV_OFFSET ^ TEST_LAYOUT_KEY ^ QUANT.cache_key_salt(),
+    );
     assert_eq!(chained.len(), 1);
     let key = hash_to_hex_local(chained[0]);
 
@@ -126,6 +131,65 @@ fn ssd_hit_reconstructs_block_within_tolerance() {
     assert!(max_err < 1e-3, "K dequant round-trip error {max_err}");
 }
 
+/// Production-truth probe match: the spill side keys every index row with the
+/// **salted** digest seed (`FNV_OFFSET ^ layout_key ^ kv_quant.cache_key_salt()`).
+/// A block recorded under that salted key, with a non-zero layout key, must be
+/// found by `lookup` — i.e. the probe seeds the digest stream identically to the
+/// spill side. (The other hydrate tests use `layout_key == 0`, so they pin the
+/// codec-salt component but cannot catch a layout-key mismatch; this test pins
+/// both.)
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: single full block yields exactly one chained digest, asserted before index"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn salted_keyed_block_is_found_by_probe() {
+    // Non-zero layout key + the real codec salt, exactly as the spill side does.
+    const LK: u64 = 0x1234_5678_9abc_def0;
+
+    let device = Device::Cpu;
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let db = dir.join("index.db");
+    let index = SsdKvIndex::open_at(&db).unwrap();
+
+    // One full block of prompt ids.
+    let prompt_ids: Vec<u32> = (0..BLOCK_TOKENS as u32).collect();
+
+    // Production-truth seed: FNV_OFFSET ^ layout_key ^ codec salt.
+    let salted = chained_block_hashes_seeded(&prompt_ids, FNV_OFFSET ^ LK ^ QUANT.cache_key_salt());
+    assert_eq!(salted.len(), 1);
+    let key = hash_to_hex_local(salted[0]);
+
+    // Build + spill a single-layer cache to <dir>/<key>.kvb, record the row
+    // under the SALTED key + the non-zero layout key.
+    let cache = build_kvcache(BLOCK_TOKENS as i32, 0x5A17);
+    let path = dir.join(format!("{key}.kvb"));
+    write_caches(&path, device, MODEL_ID, QUANT, &[cache], &[]).unwrap();
+    let size = std::fs::metadata(&path).unwrap().len();
+    index
+        .record(&key, LK, &path, MODEL_ID, &QUANT.to_string(), size)
+        .unwrap();
+
+    // Hydrate with the same non-zero layout key → probe must produce the salted
+    // digest and match the recorded row.
+    let hydrator = SsdHydrator::with_index(MODEL_ID, QUANT, LK, device, dir, index);
+    let block = hydrator
+        .lookup(&prompt_ids)
+        .unwrap()
+        .expect("salted-keyed SSD block must be found by the probe");
+    assert_eq!(block.prompt_ids, prompt_ids, "matched prefix ids");
+    assert_eq!(block.kv_caches.len(), 1, "one reconstructed layer");
+}
+
 /// (b): a corrupt `.kvb` (garbled bytes) → the file + index row are deleted
 /// and `lookup` returns `None` (fall back to prefill). No panic.
 #[test]
@@ -144,8 +208,12 @@ fn corrupt_block_deletes_file_and_row_returns_miss() {
     let db = dir.join("index.db");
     let index = SsdKvIndex::open_at(&db).unwrap();
 
+    // Key the row with the production-truth salted seed so the probe matches it.
     let prompt_ids: Vec<u32> = (0..BLOCK_TOKENS as u32).collect();
-    let chained = chained_block_hashes(&prompt_ids);
+    let chained = chained_block_hashes_seeded(
+        &prompt_ids,
+        FNV_OFFSET ^ TEST_LAYOUT_KEY ^ QUANT.cache_key_salt(),
+    );
     let key = hash_to_hex_local(chained[0]);
     let path = dir.join(format!("{key}.kvb"));
     // Garbage that is not a valid safetensors file.
@@ -192,8 +260,15 @@ fn metadata_mismatch_treated_as_corrupt() {
     let db = dir.join("index.db");
     let index = SsdKvIndex::open_at(&db).unwrap();
 
+    // The hydrator probes with K8V4, so key the row with K8V4's salt so the
+    // probe finds it — the header (K8V8) mismatch then triggers deletion.
     let prompt_ids: Vec<u32> = (0..BLOCK_TOKENS as u32).collect();
-    let key = hash_to_hex_local(chained_block_hashes(&prompt_ids)[0]);
+    let key = hash_to_hex_local(
+        chained_block_hashes_seeded(
+            &prompt_ids,
+            FNV_OFFSET ^ TEST_LAYOUT_KEY ^ KvQuant::K8V4.cache_key_salt(),
+        )[0],
+    );
     // Write a valid block at K8V8 ...
     let cache = build_kvcache(BLOCK_TOKENS as i32, 0xBEEF);
     let path = dir.join(format!("{key}.kvb"));
@@ -293,8 +368,12 @@ fn ssd_hit_lookup_emits_hydrate_event() {
     let index = SsdKvIndex::open_at(&db).unwrap();
     let events_db_path = dir.join("events.db");
 
+    // Key the row with the production-truth salted seed so the probe matches it.
     let prompt_ids: Vec<u32> = (0..BLOCK_TOKENS as u32).collect();
-    let chained = chained_block_hashes(&prompt_ids);
+    let chained = chained_block_hashes_seeded(
+        &prompt_ids,
+        FNV_OFFSET ^ TEST_LAYOUT_KEY ^ QUANT.cache_key_salt(),
+    );
     let key = hash_to_hex_local(chained[0]);
     let path = dir.join(format!("{key}.kvb"));
 
