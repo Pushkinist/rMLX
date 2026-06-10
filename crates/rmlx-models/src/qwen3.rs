@@ -199,7 +199,7 @@ impl PromptCacheEntry for Qwen3Entry {
 /// keeping a single `Some(_) => Miss` arm is simpler than the SWA-style
 /// partial path. The hard runtime gate enforces "no partial reuse" without a
 /// comment.
-static QWEN3_PROMPT_CACHE: ArchPromptCache<Qwen3Entry> =
+pub(crate) static QWEN3_PROMPT_CACHE: ArchPromptCache<Qwen3Entry> =
     ArchPromptCache::new("Qwen3ForCausalLM", ReusePolicy::ExactOnly);
 
 /// active SSD-tier `layout_key` for the qwen3 dense cache, or `0` when
@@ -247,16 +247,6 @@ impl SsdHydrate<Qwen3Entry> for SsdHydrator {
             kv_quant: Some(self.kv_quant()),
         }))
     }
-}
-
-// ---------------------------------------------------------------------------
-// SSD-tier attach
-// ---------------------------------------------------------------------------
-
-/// Wire the spiller + hydrator onto the Qwen3 dense prompt cache
-/// for `namespace` at `kv_quant`. Delegates to `ArchPromptCache`.
-pub(crate) fn attach_ssd_tier(namespace: &str, kv_quant: KvQuant, layout_key: u64, device: Device) {
-    QWEN3_PROMPT_CACHE.attach_ssd_tier(namespace, kv_quant, layout_key, device);
 }
 
 fn ensure_qwen3_prompt_cache(capacity: usize) {

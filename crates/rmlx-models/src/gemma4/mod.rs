@@ -32,7 +32,7 @@ mod layers;
 mod loader;
 mod model;
 pub mod preprocessor;
-pub(super) mod prompt_cache;
+pub(crate) mod prompt_cache;
 #[cfg(test)]
 mod tests;
 mod vision;
@@ -50,7 +50,6 @@ pub use preprocessor::{
     aspect_ratio_preserving_resize, Gemma4ImageProcessor, Gemma4ImageProcessorConfig,
     Gemma4PixelValues,
 };
-pub(crate) use prompt_cache::attach_ssd_tier;
 pub use prompt_cache::read_cache_stats as gemma4_cache_stats;
 pub use prompt_cache::read_kv_cache_bytes as gemma4_kv_cache_bytes;
 pub use vision::{
