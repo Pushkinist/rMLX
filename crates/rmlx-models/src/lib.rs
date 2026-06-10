@@ -33,6 +33,7 @@ pub mod bitnet;
 pub mod block_manager;
 pub mod calibration_sink;
 pub mod constraint;
+pub(crate) mod decode_loop;
 pub mod gated_delta_msl;
 pub mod gemma3;
 pub mod gemma4;
