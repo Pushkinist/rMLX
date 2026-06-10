@@ -29,49 +29,145 @@ fn quant_mode_is_one_byte() {
 }
 
 #[test]
-fn resolve_quant_uses_override() {
+#[allow(
+    clippy::unwrap_used,
+    reason = "non-biased override path is infallible; unwrap asserts the Ok branch"
+)]
+fn resolve_quant_override_wins() {
     let defaults = QuantParams::global(32, 8, "mxfp8");
     let mut overrides = HashMap::new();
     overrides.insert(
         "model.layers.5.mlp.gate.proj".to_owned(),
         QuantParams {
             group_size: 64,
-            bits: 8,
-            mode: String::new(), // empty => inherit global mode
+            bits: 4,
+            mode: "mxfp4".to_owned(),
         },
     );
-    let resolved = resolve_quant("model.layers.5.mlp.gate.proj", &defaults, &overrides);
+    // Override group_size/bits/mode all applied (no biases → mode kept as-is).
+    let resolved =
+        resolve_quant("model.layers.5.mlp.gate.proj", false, &defaults, &overrides).unwrap();
     assert_eq!(resolved.group_size, 64, "override group_size");
-    assert_eq!(resolved.bits, 8, "override bits");
-    assert_eq!(resolved.mode, "mxfp8", "mode inherited from global");
+    assert_eq!(resolved.bits, 4, "override bits");
+    assert_eq!(resolved.mode, "mxfp4", "override mode");
+
+    // Empty override mode inherits the global default mode.
+    let mut overrides_empty_mode = HashMap::new();
+    overrides_empty_mode.insert(
+        "model.layers.5.mlp.gate.proj".to_owned(),
+        QuantParams {
+            group_size: 64,
+            bits: 8,
+            mode: String::new(),
+        },
+    );
+    let inherited = resolve_quant(
+        "model.layers.5.mlp.gate.proj",
+        false,
+        &defaults,
+        &overrides_empty_mode,
+    )
+    .unwrap();
+    assert_eq!(inherited.group_size, 64);
+    assert_eq!(
+        inherited.mode, "mxfp8",
+        "empty override mode inherits global"
+    );
 }
 
 #[test]
-fn resolve_quant_falls_back_to_defaults() {
+#[allow(
+    clippy::unwrap_used,
+    reason = "non-biased defaults path is infallible; unwrap asserts the Ok branch"
+)]
+fn resolve_quant_defaults_apply() {
     let defaults = QuantParams::global(32, 8, "mxfp8");
     let overrides = HashMap::new();
-    let resolved = resolve_quant("model.layers.0.mlp.gate_proj", &defaults, &overrides);
+    let resolved =
+        resolve_quant("model.layers.0.mlp.gate_proj", false, &defaults, &overrides).unwrap();
     assert_eq!(resolved.group_size, 32);
     assert_eq!(resolved.bits, 8);
     assert_eq!(resolved.mode, "mxfp8");
 }
 
 #[test]
-fn resolve_quant_explicit_mode_override() {
+#[allow(
+    clippy::unwrap_used,
+    reason = "biased mode-absent path forces affine and returns Ok; unwrap asserts it"
+)]
+fn resolve_quant_biases_force_affine_when_mode_absent() {
+    let defaults = QuantParams::global(32, 8, "mxfp8");
+    let mut overrides = HashMap::new();
+    // Override present but mode absent (empty) + a .biases sibling → affine.
+    overrides.insert(
+        "model.layers.0.router.proj".to_owned(),
+        QuantParams {
+            group_size: 32,
+            bits: 4,
+            mode: String::new(),
+        },
+    );
+    let resolved =
+        resolve_quant("model.layers.0.router.proj", true, &defaults, &overrides).unwrap();
+    assert_eq!(
+        resolved.mode, "affine",
+        "biases + absent mode forces affine"
+    );
+    assert_eq!(resolved.group_size, 32);
+    assert_eq!(resolved.bits, 4);
+
+    // No override at all, default mode mxfp8, but biases present → affine.
+    let empty = HashMap::new();
+    let no_ov = resolve_quant("model.layers.0.q_proj", true, &defaults, &empty).unwrap();
+    assert_eq!(no_ov.mode, "affine", "biases + no override forces affine");
+}
+
+#[test]
+fn resolve_quant_biases_with_explicit_nonaffine_is_err() {
+    let defaults = QuantParams::global(32, 8, "mxfp8");
+    let mut overrides = HashMap::new();
+    // Explicit non-affine override mode (`mxfp8` parses to a real microscaling
+    // mode, not the affine fallback) alongside a .biases sibling → hard error.
+    overrides.insert(
+        "model.layers.0.q_proj".to_owned(),
+        QuantParams {
+            group_size: 32,
+            bits: 4,
+            mode: "mxfp8".to_owned(),
+        },
+    );
+    let err = resolve_quant("model.layers.0.q_proj", true, &defaults, &overrides);
+    assert!(
+        err.is_err(),
+        "explicit non-affine mode + biases must hard-error"
+    );
+}
+
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "unrecognized-but-affine override + biases returns Ok(affine); unwrap asserts it"
+)]
+fn resolve_quant_biases_with_unrecognized_override_mode_is_affine() {
+    // An override-set mode string that `QuantMode::from` maps to Affine (its
+    // documented fallback for unrecognized strings) must NOT hard-error when a
+    // .biases sibling is present — both pre-unification resolvers decoded such a
+    // string as affine. Only a genuine microscaling/fp4 mode contradicts biases.
     let defaults = QuantParams::global(32, 8, "mxfp8");
     let mut overrides = HashMap::new();
     overrides.insert(
-        "model.layers.0.mlp.gate_proj".to_owned(),
+        "model.layers.0.q_proj".to_owned(),
         QuantParams {
-            group_size: 64,
+            group_size: 32,
             bits: 4,
-            mode: "affine".to_owned(),
+            mode: "int4".to_owned(), // unrecognized → QuantMode::from → Affine
         },
     );
-    let resolved = resolve_quant("model.layers.0.mlp.gate_proj", &defaults, &overrides);
-    assert_eq!(resolved.group_size, 64);
-    assert_eq!(resolved.bits, 4);
-    assert_eq!(resolved.mode, "affine");
+    let resolved = resolve_quant("model.layers.0.q_proj", true, &defaults, &overrides).unwrap();
+    assert_eq!(
+        resolved.mode, "affine",
+        "an unrecognized-but-affine override mode + biases stays affine"
+    );
 }
 
 fn f32_as_bytes(s: &[f32]) -> &[u8] {

@@ -18,6 +18,8 @@ use std::collections::HashMap;
 
 use rmlx_core::error::{Error, Result};
 
+use crate::layers::QuantParams;
+
 /// Subset of `text_config` needed for the text forward pass.
 #[allow(
     clippy::exhaustive_structs,
@@ -67,7 +69,7 @@ pub struct Gemma4TextConfig {
     /// Quantization mode string (e.g. `"mxfp8"`, `"affine"`).
     pub quant_mode: String,
     /// Per-tensor quant overrides (keyed by tensor base path, e.g. "language_model.model.layers.0.router.proj").
-    pub quant_overrides: HashMap<String, (i32, i32, String)>,
+    pub quant_overrides: HashMap<String, QuantParams>,
     // RoPE
     /// RoPE theta for sliding-attention layers.
     pub rope_sliding_theta: f32,
@@ -489,7 +491,7 @@ impl Gemma4TextConfig {
 
         // Parse per-tensor quant overrides from the raw quantization dict.
         // Keys like "language_model.model.layers.N.router.proj" carry {group_size, bits} overrides.
-        let mut quant_overrides: HashMap<String, (i32, i32, String)> = HashMap::new();
+        let mut quant_overrides: HashMap<String, QuantParams> = HashMap::new();
         if let Some(quant_obj) = raw_quant.and_then(|v| v.as_object()) {
             for (key, val) in quant_obj {
                 if matches!(
@@ -512,7 +514,14 @@ impl Gemma4TextConfig {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_owned();
-                    quant_overrides.insert(key.clone(), (ov_gs, ov_bits, ov_mode));
+                    quant_overrides.insert(
+                        key.clone(),
+                        QuantParams {
+                            group_size: ov_gs,
+                            bits: ov_bits,
+                            mode: ov_mode,
+                        },
+                    );
                 }
             }
         }

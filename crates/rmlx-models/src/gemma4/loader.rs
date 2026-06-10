@@ -27,7 +27,10 @@ use rmlx_loader::{load_config, load_shard_index, view, ShardSet};
 use rmlx_mlx::{argmax, max_axis, Array, Device, Dtype};
 use tracing::{debug, info, warn};
 
-use crate::layers::{Activation, Embedding, Linear, Mlp, ParoRotation, QuantMode, RmsNorm};
+use crate::layers::{
+    resolve_quant, Activation, Embedding, Linear, Mlp, ParoRotation, QuantMode, QuantParams,
+    RmsNorm,
+};
 
 use super::config::{Gemma4TextConfig, LayerType};
 use super::decoder_layer::DecoderLayer;
@@ -121,27 +124,11 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma4Text> {
         Array::from_safetensor_view(&tv).map_err(classify_load_oom)
     };
 
-    // Resolve quant params for a tensor: check per-tensor overrides, fall back to global.
-    // When biases are present the tensor is affine regardless of global mode.
+    // Resolve quant params for a tensor via the shared resolver: check
+    // per-tensor overrides, fall back to global, and let the `.biases` sibling
+    // govern the affine rule (hard-erroring on an affine-vs-non-affine clash).
     let global_mode = QuantMode::from(cfg.quant_mode.as_str());
-    let resolve_qp = |base: &str, has_biases: bool| -> (i32, i32, QuantMode) {
-        if let Some((gs, bits, mode_str)) = cfg.quant_overrides.get(base) {
-            let resolved_mode = if mode_str.is_empty() {
-                if has_biases {
-                    QuantMode::Affine
-                } else {
-                    global_mode
-                }
-            } else {
-                QuantMode::from(mode_str.as_str())
-            };
-            (*gs, *bits, resolved_mode)
-        } else if has_biases {
-            (cfg.quant_group_size, cfg.quant_bits, QuantMode::Affine)
-        } else {
-            (cfg.quant_group_size, cfg.quant_bits, global_mode)
-        }
-    };
+    let defaults = QuantParams::global(cfg.quant_group_size, cfg.quant_bits, &cfg.quant_mode);
 
     let load_quant = |base: &str| -> Result<Linear> {
         let w_name = format!("{base}.weight");
@@ -161,14 +148,14 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma4Text> {
         } else {
             None
         };
-        let (gs, bits, mode) = resolve_qp(base, has_biases);
+        let qp = resolve_quant(base, has_biases, &defaults, &cfg.quant_overrides)?;
         Ok(Linear::Quantized {
             weight: w,
             scales: s,
             biases,
-            group_size: gs,
-            bits,
-            mode,
+            group_size: qp.group_size,
+            bits: qp.bits,
+            mode: QuantMode::from(qp.mode.as_str()),
         })
     };
 
