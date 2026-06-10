@@ -121,19 +121,15 @@ impl MtpLayer {
                 } else {
                     None
                 };
-                let qp = resolve_quant(base, &defaults, &overrides);
-                let mode = if biases.is_some() && qp.mode != "affine" {
-                    "affine".to_owned()
-                } else {
-                    qp.mode.clone()
-                };
+                // The shared resolver owns the `.biases`-sibling affine rule.
+                let qp = resolve_quant(base, biases.is_some(), &defaults, &overrides)?;
                 Ok(Linear::Quantized {
                     weight: w,
                     scales: s,
                     biases,
                     group_size: qp.group_size,
                     bits: qp.bits,
-                    mode,
+                    mode: qp.mode,
                 })
             } else {
                 Ok(Linear::Plain { weight: w })

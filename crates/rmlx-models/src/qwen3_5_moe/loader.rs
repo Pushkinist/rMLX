@@ -653,19 +653,15 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
             } else {
                 None
             };
-            let qp = resolve_quant(base, &defaults, &cfg.quant_overrides);
-            let mode = if biases.is_some() && qp.mode != "affine" {
-                "affine".to_owned()
-            } else {
-                qp.mode.clone()
-            };
+            // The shared resolver owns the `.biases`-sibling affine rule.
+            let qp = resolve_quant(base, biases.is_some(), &defaults, &cfg.quant_overrides)?;
             Ok(Linear::Quantized {
                 weight: w,
                 scales: s,
                 biases,
                 group_size: qp.group_size,
                 bits: qp.bits,
-                mode,
+                mode: qp.mode,
             })
         } else {
             Ok(Linear::Plain { weight: w })
@@ -691,7 +687,7 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
             } else {
                 None
             };
-            let qp = resolve_quant(&base, &defaults, &cfg.quant_overrides);
+            let qp = resolve_quant(&base, biases.is_some(), &defaults, &cfg.quant_overrides)?;
             Embedding::Quantized {
                 weight: w,
                 scales: s,
