@@ -12,7 +12,9 @@
 //!
 //! ## Flow (per RAM miss)
 //!
-//! 1. Compute the prompt's chained block hashes (`chained_block_hashes`).
+//! 1. Compute the prompt's chained block hashes (`chained_block_hashes_seeded`,
+//!    seeded with `FNV_OFFSET ^ layout_key ^ kv_quant.cache_key_salt()` — the
+//!    spill-side key).
 //! 2. `SsdKvIndex::lookup_longest_prefix` — the longest cached block-aligned
 //!    prefix (longest-first scan of the candidate prefix digests).
 //! 3. On a hit: `block_io::read_caches` reads the `.kvb`, verifying the
@@ -198,10 +200,18 @@ impl SsdHydrator {
         prompt_ids: &[u32],
         test_recorder: Option<&EventRecorder>,
     ) -> rmlx_core::error::Result<Option<HydratedBlock>> {
-        // seed the chained walk with `FNV_OFFSET ^ layout_key` so the
-        // digest stream salts on the active layout. `layout_key == FNV_OFFSET`
-        // is the un-salted legacy case (DoD identity).
-        let chained = chained_block_hashes_seeded(prompt_ids, FNV_OFFSET ^ self.layout_key);
+        // seed the chained walk with `FNV_OFFSET ^ layout_key ^
+        // kv_quant.cache_key_salt()` so the probe digest stream is byte-identical
+        // to the spill side's key (the spill/RAM-push/post-hydrate-recompute
+        // paths all seed with this same salted value). Without the codec salt the
+        // probe could never match a row the spill side wrote, so the SSD tier
+        // would silently 0-hit. A zero `layout_key` with the codec salt is the
+        // per-codec partition (same tokens under different codecs occupy disjoint
+        // digest streams).
+        let chained = chained_block_hashes_seeded(
+            prompt_ids,
+            FNV_OFFSET ^ self.layout_key ^ self.kv_quant.cache_key_salt(),
+        );
         if chained.is_empty() {
             return Ok(None); // < one full block → nothing indexable
         }
