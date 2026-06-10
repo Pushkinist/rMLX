@@ -8,8 +8,8 @@
 //! - `Gemma4Entry`: `Vec<KvCache>` only (pure-attention arch — no GDN state).
 //! - `impl PromptCacheEntry for Gemma4Entry`: deep_clone + KV accessors;
 //!   truncate / kv_bytes come from the trait defaults (pure-attention, no GDN).
-//! - `impl SpillSink<Gemma4Entry> for SsdSpiller`: pure-attention spill (no
-//!   `lin_caches`).
+//!   The SSD spill path is the blanket `SpillSink<E> for SsdSpiller` in
+//!   `crate::prompt_cache` (pure-attention: `lin_caches()` is `&[]`).
 //! - `impl SsdHydrate<Gemma4Entry> for SsdHydrator`: pure-attention hydrate.
 //! - SWA helpers `can_truncate_to_block` / `is_strict_prefix_of` consumed by
 //!   `gemma4/generate.rs`'s `CacheLookup` match (/ B1 snapshot/restore).
@@ -30,10 +30,10 @@ use rmlx_core::error::Result;
 
 use crate::prompt_cache::{
     chained_block_hashes_seeded, ArchPromptCache, CacheStats, PromptCacheEntry, ReusePolicy,
-    SpillSink, SsdHydrate, BLOCK_TOKENS, FNV_OFFSET,
+    SsdHydrate, BLOCK_TOKENS, FNV_OFFSET,
 };
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
-use rmlx_kv_ssd::{HydratedBlock, SpillJob, SsdHydrator, SsdSpiller};
+use rmlx_kv_ssd::{HydratedBlock, SsdHydrator};
 
 // ---------------------------------------------------------------------------
 // Entry type
@@ -147,46 +147,10 @@ impl PromptCacheEntry for Gemma4Entry {
 }
 
 // ---------------------------------------------------------------------------
-// SSD-spill sink — pure-attention: no `lin_caches` in the spill job.
+// SSD-spill sink — the blanket `impl SpillSink<E> for SsdSpiller` in
+// `crate::prompt_cache` covers Gemma4 (pure-attention: `lin_caches()` is `&[]`,
+// so the spill job carries no recurrent state).
 // ---------------------------------------------------------------------------
-
-impl SpillSink<Gemma4Entry> for SsdSpiller {
-    fn spill(&self, entry: &Gemma4Entry) {
-        let Some(&hash) = entry.block_hashes.last() else {
-            return; // no full block → no stable spill key
-        };
-        let Some(kv_quant) = entry.kv_quant else {
-            return; // unknown quant → cannot tag the block
-        };
-        let layout_key = self.layout_key();
-        let kv_caches: Result<Vec<KvCache>> = entry
-            .kv_caches
-            .iter()
-            .map(KvCache::try_deep_clone)
-            .collect();
-        let kv_caches = match kv_caches {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(error = %e, "kv-spill: gemma4 cache clone failed, skipping spill");
-                return;
-            }
-        };
-        for c in &kv_caches {
-            if let Err(e) = c.eval_for_spill() {
-                tracing::warn!(error = %e, "kv-spill: gemma4 eval-for-spill failed, skipping spill");
-                return;
-            }
-        }
-        self.try_spill(SpillJob {
-            hash,
-            layout_key,
-            model_id: self.model_id().to_string(),
-            kv_quant,
-            kv_caches,
-            lin_caches: Vec::new(),
-        });
-    }
-}
 
 // ---------------------------------------------------------------------------
 // SSD-hydrate source — pure-attention: lin_caches from block discarded.
