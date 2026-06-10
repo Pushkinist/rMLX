@@ -1066,9 +1066,9 @@ impl Architecture {
         clippy::wildcard_enum_match_arm,
         reason = "wildcard arm is the correct fallthrough for unsupported arch/quant variants; exhaustive expansion would require updating on every new variant"
     )]
-    pub fn generate_image(
+    pub fn generate_image<'a>(
         &self,
-        tokenizer: &tokenizers::Tokenizer,
+        tokenizer: &'a tokenizers::Tokenizer,
         prompt_ids: &[u32],
         embeds: Array,
         masked_ids: Array,
@@ -1077,13 +1077,15 @@ impl Architecture {
         kv_quant_override: Option<rmlx_kv_quant::KvQuant>,
         max_ctx_override: Option<i32>,
         prompt_cache_slots: usize,
-        eos_ids: &[u32],
-        step_fn: &mut dyn FnMut(&crate::gemma4::ProbeStep) -> Option<u32>,
-        constraint: Option<&mut dyn crate::ConstraintEngine>,
-        sampler_cfg: &crate::sampler::SamplerConfig,
-        rng: &mut crate::sampler::Pcg32,
-        penalty_cfg: &crate::sampler::PenaltyConfig,
-        token_history: &mut Vec<u32>,
+        eos_ids: &'a [u32],
+        // The per-request borrows share `'a`: the shared decode loop stores
+        // them together in one `DecodeCtx<'a>` for the duration of the call.
+        step_fn: &'a mut dyn FnMut(&crate::gemma4::ProbeStep) -> Option<u32>,
+        constraint: Option<&'a mut dyn crate::ConstraintEngine>,
+        sampler_cfg: &'a crate::sampler::SamplerConfig,
+        rng: &'a mut crate::sampler::Pcg32,
+        penalty_cfg: &'a crate::sampler::PenaltyConfig,
+        token_history: &'a mut Vec<u32>,
     ) -> Result<Vec<crate::gemma4::ProbeStep>> {
         use crate::kv_cache::KvCacheBuilder;
         use rmlx_kv_quant::KvQuant;
