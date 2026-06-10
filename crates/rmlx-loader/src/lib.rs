@@ -44,6 +44,6 @@ pub use head_budgets::{load_head_budgets, write_head_budgets, HeadBudgetCalibrat
 pub use model_size::estimate_params_billions;
 pub use shards::{count_tensors_per_shard, load_shard_index, ShardHandle, ShardIndex, ShardSet};
 pub use tensors::{
-    resolve, resolve_paro, try_exact_then_suffix, view, ParoQuantParams, ParoQuantState,
-    ResolvedTensor, TensorKind, TensorView,
+    resolve, resolve_paro, try_exact_then_suffix, view, view_discriminated, ParoQuantParams,
+    ParoQuantState, ResolvedTensor, TensorKind, TensorLookup, TensorView,
 };

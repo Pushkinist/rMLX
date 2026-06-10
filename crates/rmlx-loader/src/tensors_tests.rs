@@ -309,3 +309,180 @@ fn resolve_paro_empty_paro_bases_returns_empty_state() {
     let state = resolve_paro(&idx, std::path::Path::new("/nonexistent"), Some(8)).unwrap();
     assert_eq!(state.layer_count(), 0, "no .pairs → empty state");
 }
+
+// ----- view / view_discriminated tests -----------------------------------
+//
+// These exercise the discriminated tensor lookup against real on-disk shards.
+// A valid shard is written with `safetensors::serialize`; a corrupt shard is a
+// truncated/garbage header. The discrimination contract is:
+//   Ok(Found)       — tensor located
+//   Ok(NotInIndex)  — name absent from weight_map           → safe to fall back
+//   Ok(WrongShard)  — index points at a shard lacking it    → safe to fall back
+//   Err(...)        — shard header failed to parse (CORRUPT) → MUST propagate
+
+/// Write a one-tensor `.safetensors` shard into `dir` and return its filename.
+/// The tensor is a tiny F32 scalar — content is irrelevant, only the header.
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: temp-file I/O and serialization failures should abort the test loudly"
+)]
+fn write_valid_shard(dir: &std::path::Path, filename: &str, tensor_name: &str) {
+    let data: [u8; 4] = 1.0f32.to_le_bytes();
+    let tv = safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![1], &data).unwrap();
+    let bytes = safetensors::serialize([(tensor_name.to_owned(), tv)], None).unwrap();
+    std::fs::write(dir.join(filename), bytes).unwrap();
+}
+
+/// Write a corrupt `.safetensors` shard (bogus header) into `dir`.
+/// The 8-byte little-endian length prefix claims a 16-byte header, but the
+/// "header" bytes are not valid JSON — `SafeTensors::deserialize` must fail.
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: temp-file I/O failures should abort the test loudly"
+)]
+fn write_corrupt_shard(dir: &std::path::Path, filename: &str) {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&16u64.to_le_bytes()); // header_len = 16
+    bytes.extend_from_slice(b"not valid json!!"); // 16 bytes of garbage
+    std::fs::write(dir.join(filename), bytes).unwrap();
+}
+
+/// Contract test: a corrupt shard header must propagate as `Err`, NOT be
+/// reported as a not-found/fall-back signal. This is the discrimination the
+/// split exists to prevent: a fallback caller that treats every lookup miss as
+/// "scan elsewhere" would silently mask shard corruption.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: tempdir / ShardSet open failures should abort the test loudly"
+)]
+fn corrupt_header_propagates_as_err_not_notfound() {
+    let dir = tempfile::tempdir().unwrap();
+    write_corrupt_shard(dir.path(), "corrupt.safetensors");
+    // Index claims the tensor lives in the corrupt shard.
+    let idx = make_idx(&[("model.norm.weight", "corrupt.safetensors")]);
+    let shards = ShardSet::open(dir.path(), &idx).unwrap();
+
+    // view_discriminated: the corrupt header must surface as Err, never as
+    // Ok(NotInIndex) / Ok(WrongShard).
+    let disc = view_discriminated(&shards, &idx, "model.norm.weight");
+    assert!(
+        disc.is_err(),
+        "corrupt header must be Err, got {:?} (would silently mask corruption on fall-back)",
+        disc.as_ref().map(|_| "Ok")
+    );
+    let msg = disc.unwrap_err().to_string();
+    assert!(
+        msg.contains("parse") || msg.contains("header"),
+        "error should name a header-parse failure: {msg}"
+    );
+
+    // view() convenience wrapper must likewise hard-error, not swallow.
+    assert!(
+        view(&shards, &idx, "model.norm.weight").is_err(),
+        "view() must propagate the corrupt-header error"
+    );
+}
+
+/// A name absent from `weight_map` discriminates as `NotInIndex` (safe to fall
+/// back). The shard on disk is valid; the index simply has no entry.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: tempdir / ShardSet open failures should abort the test loudly"
+)]
+fn not_in_index_discriminated() {
+    let dir = tempfile::tempdir().unwrap();
+    write_valid_shard(dir.path(), "s.safetensors", "present.weight");
+    let idx = make_idx(&[("present.weight", "s.safetensors")]);
+    let shards = ShardSet::open(dir.path(), &idx).unwrap();
+
+    match view_discriminated(&shards, &idx, "absent.weight").unwrap() {
+        TensorLookup::NotInIndex => {}
+        other @ (TensorLookup::Found(_) | TensorLookup::WrongShard) => {
+            panic!("expected NotInIndex for an unmapped name, got {other:?}")
+        }
+    }
+    // The convenience wrapper collapses NotInIndex into an Err.
+    assert!(view(&shards, &idx, "absent.weight").is_err());
+}
+
+/// A name whose `weight_map` shard does not actually contain it discriminates
+/// as `WrongShard` (the "index lies" / medgemma class — safe to fall back).
+/// Two valid shards exist; the index points the tensor at the wrong one.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: tempdir / ShardSet open failures should abort the test loudly"
+)]
+fn wrong_shard_discriminated() {
+    let dir = tempfile::tempdir().unwrap();
+    // The tensor physically lives in s2, but the index claims it is in s1.
+    write_valid_shard(dir.path(), "s1.safetensors", "decoy.weight");
+    write_valid_shard(dir.path(), "s2.safetensors", "model.norm.weight");
+    let idx = make_idx(&[
+        ("decoy.weight", "s1.safetensors"),
+        ("model.norm.weight", "s1.safetensors"), // lies: it is really in s2
+    ]);
+    let shards = ShardSet::open(dir.path(), &idx).unwrap();
+
+    match view_discriminated(&shards, &idx, "model.norm.weight").unwrap() {
+        TensorLookup::WrongShard => {}
+        other @ (TensorLookup::Found(_) | TensorLookup::NotInIndex) => {
+            panic!("expected WrongShard for an index-lies entry, got {other:?}")
+        }
+    }
+    assert!(view(&shards, &idx, "model.norm.weight").is_err());
+}
+
+/// A correctly-indexed tensor discriminates as `Found` with intact shape/dtype.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: tempdir / ShardSet open failures should abort the test loudly"
+)]
+fn found_discriminated() {
+    let dir = tempfile::tempdir().unwrap();
+    write_valid_shard(dir.path(), "s.safetensors", "model.norm.weight");
+    let idx = make_idx(&[("model.norm.weight", "s.safetensors")]);
+    let shards = ShardSet::open(dir.path(), &idx).unwrap();
+
+    match view_discriminated(&shards, &idx, "model.norm.weight").unwrap() {
+        TensorLookup::Found(tv) => {
+            assert_eq!(tv.name, "model.norm.weight");
+            assert_eq!(tv.dtype, safetensors::Dtype::F32);
+            assert_eq!(tv.shape, vec![1]);
+            assert_eq!(tv.bytes.len(), 4);
+        }
+        other @ (TensorLookup::NotInIndex | TensorLookup::WrongShard) => {
+            panic!("expected Found, got {other:?}")
+        }
+    }
+    // The convenience wrapper returns the same view.
+    let tv = view(&shards, &idx, "model.norm.weight").unwrap();
+    assert_eq!(tv.shape, vec![1]);
+}
+
+/// An index entry that names a shard which is not open also discriminates as
+/// `WrongShard` (the named handle is absent from the open set).
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: tempdir / ShardSet open failures should abort the test loudly"
+)]
+fn unopened_shard_discriminated_as_wrong_shard() {
+    let dir = tempfile::tempdir().unwrap();
+    write_valid_shard(dir.path(), "s.safetensors", "present.weight");
+    // Open the ShardSet over only the real shard...
+    let open_idx = make_idx(&[("present.weight", "s.safetensors")]);
+    let shards = ShardSet::open(dir.path(), &open_idx).unwrap();
+    // ...but query against an index that points at a never-opened shard.
+    let lying_idx = make_idx(&[("ghost.weight", "missing.safetensors")]);
+
+    match view_discriminated(&shards, &lying_idx, "ghost.weight").unwrap() {
+        TensorLookup::WrongShard => {}
+        other @ (TensorLookup::Found(_) | TensorLookup::NotInIndex) => {
+            panic!("expected WrongShard for an unopened-shard entry, got {other:?}")
+        }
+    }
+}
