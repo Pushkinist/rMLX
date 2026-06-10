@@ -29,6 +29,50 @@ pub struct Gemma3Text {
 }
 
 impl Gemma3Text {
+    /// Count the affine `.scales` / `.biases` sibling tensors that the loader
+    /// actually materialised into this model (embed_tokens + every decoder
+    /// projection + optional lm_head). Each `Quantized` variant contributes one
+    /// `.scales` always, plus one `.biases` when present.
+    ///
+    /// Test-only introspection for the loader sibling-parity invariant: the
+    /// snapshot's `model.safetensors.index.json` omits all `.scales` / `.biases`
+    /// entries, so this count must equal the header-truth sibling count to prove
+    /// the scan-only loader did not silently drop any index-omitted sibling.
+    ///
+    /// `#[doc(hidden)]` + `pub`: reachable from the `tests/` integration target
+    /// (`#[cfg(test)]` would not be, since that target links the crate as an
+    /// external dependency). Pure read-only counting — no behavioral effect.
+    #[doc(hidden)]
+    pub fn loaded_sibling_count(&self) -> usize {
+        fn linear_siblings(l: &Linear) -> usize {
+            match l {
+                Linear::Plain { .. } => 0,
+                Linear::Quantized { biases, .. } => 1 + usize::from(biases.is_some()),
+            }
+        }
+        fn embedding_siblings(e: &Embedding) -> usize {
+            match e {
+                Embedding::Plain { .. } => 0,
+                Embedding::Quantized { biases, .. } => 1 + usize::from(biases.is_some()),
+            }
+        }
+
+        let mut n = embedding_siblings(&self.embed_tokens);
+        if let Some(lm) = &self.lm_head {
+            n += linear_siblings(lm);
+        }
+        for layer in &self.layers {
+            n += linear_siblings(&layer.attn.q_proj);
+            n += linear_siblings(&layer.attn.k_proj);
+            n += linear_siblings(&layer.attn.v_proj);
+            n += linear_siblings(&layer.attn.o_proj);
+            n += linear_siblings(&layer.mlp.gate_proj);
+            n += linear_siblings(&layer.mlp.up_proj);
+            n += linear_siblings(&layer.mlp.down_proj);
+        }
+        n
+    }
+
     /// Run a full-sequence forward pass (no KV cache).
     ///
     /// `ids`: all token ids in the sequence.
