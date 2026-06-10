@@ -40,6 +40,31 @@ served via `/v1/chat/completions` and `/v1/completions`. `JinaEmbeddingsV4Model`
 is an encoder-only model served via `/v1/embeddings`; it never enters the
 `Architecture` enum.
 
+### Shared decode loop
+
+The per-token decode loop is **shared**, not re-copied per architecture. The
+pipelined loop (`choose_token` → `async_eval(next)` → drain the previous pending
+token → feed), the sampling fork, and Fresh chunked prefill live in
+`rmlx_models::decode_loop` (`pipelined_decode`, `choose_token`,
+`chunked_prefill`). The pipelined family — `Qwen3`, `Qwen3_5Moe`, `Gemma3`,
+`Gemma4` — funnels every cache-lookup outcome (Miss / Exact / Prefix / image /
+HydratedTail) into `pipelined_decode`.
+
+A converting or new architecture supplies only:
+
+- a **`forward_step` closure** `impl FnMut(&Array) -> Result<Array>` — the one
+  per-token hole, monomorphized with no `dyn` dispatch;
+- its **prefill / prompt-cache policy** — Fresh prefill via `chunked_prefill`,
+  plus any genuinely different per-arch flush (Gemma SWA prefix-append,
+  Qwen3.5-MoE HydratedTail append) which stays arch-side;
+- arch-side **`decode_profile` / KV-byte accounting** after the loop returns,
+  fed by the returned `DecodeStats`.
+
+`resolve_pieces` toggles per-token piece resolution (`id_to_token` + per-step
+`debug!`) on (Gemma, Qwen3) or off (Qwen3.5-MoE, which pushes empty pieces).
+`Qwen2` is not yet on the shared loop; the deliberately-sync-loop archs
+(`Laguna`, `Qwen3VlMoe`, `BitNet`) keep their own loops.
+
 ---
 
 ## Architecture support table

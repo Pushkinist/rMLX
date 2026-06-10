@@ -630,6 +630,6 @@ fn chunked_prefill_rejects_over_ceiling() {
             "simulated over-ceiling prefill rejection".to_owned(),
         ))
     };
-    let out = chunked_prefill(&mut caches, &ids, 4, Device::Cpu, forward_chunk).unwrap();
+    let out = chunked_prefill(&mut caches, &ids, 4, Device::Cpu, "test", forward_chunk).unwrap();
     assert!(out.is_none(), "rejected prefill returns Ok(None)");
 }
