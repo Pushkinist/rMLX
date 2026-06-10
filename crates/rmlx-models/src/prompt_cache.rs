@@ -52,7 +52,7 @@ use rmlx_core::error::Result;
 use crate::prefix_index::{
     active_prefix_index_kind, build_active_index, PrefixIndex, PrefixIndexKind,
 };
-use rmlx_kv_quant::KvQuant;
+use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 use rmlx_kv_ssd::{SsdHydrator, SsdSpiller};
 
 // The SSD-tier hashing primitives (`FNV_OFFSET`, `FNV_PRIME`,
@@ -208,39 +208,99 @@ pub(crate) trait PromptCacheEntry: Sized {
     /// `find_best_prefix` for block-aligned longest-prefix matching.
     fn block_hashes(&self) -> &[u64];
 
+    /// The entry's full-attention KV caches (one per decoder layer).
+    ///
+    /// Drives the default [`kv_bytes`] body (the mutable counterpart
+    /// [`kv_caches_mut`] drives [`truncate_kv_to`]). Pure-attention archs return
+    /// their only cache vector; hybrid archs return just the KV half (the
+    /// recurrent half is exposed via [`lin_caches`]).
+    ///
+    /// [`kv_caches_mut`]: PromptCacheEntry::kv_caches_mut
+    /// [`truncate_kv_to`]: PromptCacheEntry::truncate_kv_to
+    /// [`kv_bytes`]: PromptCacheEntry::kv_bytes
+    /// [`lin_caches`]: PromptCacheEntry::lin_caches
+    fn kv_caches(&self) -> &[KvCache];
+
+    /// Mutable view of the KV caches, for the default [`truncate_kv_to`] body.
+    ///
+    /// [`truncate_kv_to`]: PromptCacheEntry::truncate_kv_to
+    fn kv_caches_mut(&mut self) -> &mut [KvCache];
+
+    /// The runtime `KvQuant` discriminant in effect when this snapshot was
+    /// written, or `None` for the legacy sentinel.
+    ///
+    /// REQUIRED (not defaulted): a defaulted `None` would silently disable the
+    /// SSD-spill key tagging in `SpillSink::spill`, dropping every block.
+    ///
+    /// No in-crate caller yet — the per-arch `SpillSink::spill` impls read the
+    /// `kv_quant` field directly. Kept on the contract (not field access) so the
+    /// trait can drive a generic spill path without re-introducing per-arch
+    /// field reach-in.
+    #[allow(dead_code)]
+    fn kv_quant(&self) -> Option<KvQuant>;
+
+    /// The entry's linear-attention recurrent caches (GDN layers).
+    ///
+    /// Pure-attention archs return `&[]`; hybrid archs (Qwen3.5-MoE) return
+    /// the real per-layer slice. Drives the default [`kv_bytes`] body.
+    ///
+    /// REQUIRED (not defaulted): a defaulted `&[]` would let a future hybrid
+    /// arch silently account/spill KV-only and lose its recurrent state.
+    ///
+    /// [`kv_bytes`]: PromptCacheEntry::kv_bytes
+    fn lin_caches(&self) -> &[LinearAttnCache];
+
     /// Truncate KV caches to `prefix_len` sequence positions in-place.
     ///
-    /// Called on a cloned entry before re-prefilling the tail. Only KV
-    /// caches need truncation; linear-attention recurrent states are re-run
-    /// from scratch on the tail so they do not need truncation.
+    /// Called on a cloned entry before re-prefilling the tail. The default
+    /// body trims only the KV caches (`offset() > 0` guard skips never-filled
+    /// layers). The recurrent GDN [`lin_caches`] are deliberately NOT reachable
+    /// from this default — that "never truncate linear state" invariant is now
+    /// structural: linear state is re-run on the tail, never sliced. Override
+    /// only for a mock or a genuinely different per-arch policy.
     ///
-    /// the gemma4 impl of `truncate_kv_to_block` delegates here, so the
-    /// gemma4 partial-prefix path reaches this method. qwen3_5_moe's impl is
-    /// not invoked in production (MoE is full-hit-only). Kept on the trait
-    /// contract for C2/C3 (SSD persistence) and the per-arch policy docs.
-    #[allow(dead_code)]
-    fn truncate_kv_to(&mut self, prefix_len: usize);
+    /// [`lin_caches`]: PromptCacheEntry::lin_caches
+    fn truncate_kv_to(&mut self, prefix_len: usize) {
+        for kv in self.kv_caches_mut() {
+            if kv.offset() > 0 {
+                kv.truncate_to(prefix_len as i32);
+            }
+        }
+        // lin caches deliberately untouched: recurrent GDN state is re-run on
+        // the tail, never truncated. Structural now — the default body cannot
+        // reach them.
+    }
 
     /// Block-aligned truncation: trim KV caches to `block_count` full blocks.
     ///
-    /// Equivalent to `truncate_kv_to(block_count * BLOCK_TOKENS)` but
-    /// implemented per-arch so arch-specific policies (e.g. Qwen GDN
-    /// `lin_caches` are deliberately NOT truncated) stay intact.
-    ///
-    /// live caller — the gemma4 partial-prefix `CacheLookup::Prefix`
-    /// path (`gemma4/generate.rs`) calls this after gating on
-    /// `Gemma4Entry::can_truncate_to_block` (every layer cache trimmable —
-    /// no wrapped-SWA desync). qwen3_5_moe never calls it: its recurrent GDN
-    /// `lin_caches` cannot be reconstructed from a block-truncated KV, so MoE
-    /// is gated to full-token-equality (Exact) reuse only.
-    fn truncate_kv_to_block(&mut self, block_count: usize);
+    /// Default delegation to `truncate_kv_to(block_count * BLOCK_TOKENS)`.
+    /// The live caller is the gemma4 partial-prefix `CacheLookup::Prefix` path
+    /// (`gemma4/generate.rs`), gated on `Gemma4Entry::can_truncate_to_block`
+    /// (every layer cache trimmable — no wrapped-SWA desync). Qwen3.5-MoE never
+    /// calls it: its recurrent GDN `lin_caches` cannot be reconstructed from a
+    /// block-truncated KV, so MoE is gated to full-token-equality (Exact) reuse.
+    fn truncate_kv_to_block(&mut self, block_count: usize) {
+        self.truncate_kv_to(block_count * BLOCK_TOKENS);
+    }
 
     /// Approximate RAM held by this entry's KV/recurrent state, in bytes.
     ///
-    /// Used by `PromptCache::stats()` to populate `CacheStats::bytes` and
-    /// by the RAM-cap eviction policy in `push`.
-    /// Best-effort estimate — does not guarantee byte-exact Metal accounting.
-    fn kv_bytes(&self) -> u64;
+    /// Default body sums KV `resident_bytes` plus linear-attn `approx_bytes`
+    /// (the latter is empty for pure-attention archs). Used by
+    /// `PromptCache::stats()` to populate `CacheStats::bytes` and by the
+    /// RAM-cap eviction policy in `push`. Best-effort estimate — does not
+    /// guarantee byte-exact Metal accounting.
+    fn kv_bytes(&self) -> u64 {
+        self.kv_caches()
+            .iter()
+            .map(KvCache::resident_bytes)
+            .sum::<u64>()
+            + self
+                .lin_caches()
+                .iter()
+                .map(LinearAttnCache::approx_bytes)
+                .sum::<u64>()
+    }
 }
 
 // ---------------------------------------------------------------------------

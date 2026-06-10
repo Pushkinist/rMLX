@@ -69,10 +69,10 @@ use crate::kv_cache::{
 };
 use crate::prompt_cache::{
     chained_block_hashes_seeded, ArchPromptCache, PromptCacheEntry, ReusePolicy, SpillSink,
-    SsdHydrate, BLOCK_TOKENS, FNV_OFFSET,
+    SsdHydrate, FNV_OFFSET,
 };
 use crate::sampler::{apply_mask_argmax, TokenLogprobs};
-use rmlx_kv_quant::{KvCache, KvQuant};
+use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 use rmlx_kv_ssd::{HydratedBlock, SpillJob, SsdHydrator, SsdSpiller};
 
 /// capture top-`k` logprobs for an already-chosen token.
@@ -174,21 +174,23 @@ impl PromptCacheEntry for Qwen3Entry {
         })
     }
 
-    fn truncate_kv_to(&mut self, prefix_len: usize) {
-        for kv in &mut self.kv_caches {
-            if kv.offset() > 0 {
-                kv.truncate_to(prefix_len as i32);
-            }
-        }
+    fn kv_caches(&self) -> &[KvCache] {
+        &self.kv_caches
     }
 
-    fn truncate_kv_to_block(&mut self, block_count: usize) {
-        self.truncate_kv_to(block_count * BLOCK_TOKENS);
+    fn kv_caches_mut(&mut self) -> &mut [KvCache] {
+        &mut self.kv_caches
     }
 
-    fn kv_bytes(&self) -> u64 {
-        self.kv_caches.iter().map(|c| c.resident_bytes()).sum()
+    fn kv_quant(&self) -> Option<KvQuant> {
+        self.kv_quant
     }
+
+    // Pure-attention dense arch: no GDN linear state.
+    fn lin_caches(&self) -> &[LinearAttnCache] {
+        &[]
+    }
+    // truncate_kv_to / truncate_kv_to_block / kv_bytes: trait defaults.
 }
 
 /// per-arch shell, `ExactOnly` policy. Qwen3 dense (Bonsai) has no

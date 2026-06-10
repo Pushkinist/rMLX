@@ -6,9 +6,10 @@
 //! Qwen3.5-MoE-specific bits:
 //!
 //! - `Qwen35MoeEntry`: `Vec<KvCache>` + `Vec<LinearAttnCache>` (hybrid GDN).
-//! - `impl PromptCacheEntry for Qwen35MoeEntry`: deep_clone trims only KV
-//!   caches; `lin_caches` are NOT truncated — they hold sequence-end recurrent
-//!   state and are re-run on the tail.
+//! - `impl PromptCacheEntry for Qwen35MoeEntry`: deep_clone + KV/lin accessors.
+//!   The trait-default `truncate_kv_to` trims only the KV caches; `lin_caches`
+//!   are NOT truncated — they hold sequence-end recurrent state re-run on the
+//!   tail (the default body structurally cannot reach them).
 //! - `impl SpillSink<Qwen35MoeEntry> for SsdSpiller`: hybrid spill — both KV
 //!   and lin_caches.
 //! - `impl SsdHydrate<Qwen35MoeEntry> for SsdHydrator`: hybrid hydrate.
@@ -31,7 +32,7 @@ use rmlx_core::error::Result;
 
 use crate::prompt_cache::{
     chained_block_hashes_seeded, ArchPromptCache, CacheStats, PromptCacheEntry, ReusePolicy,
-    SpillSink, SsdHydrate, BLOCK_TOKENS, FNV_OFFSET,
+    SpillSink, SsdHydrate, FNV_OFFSET,
 };
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 use rmlx_kv_ssd::{HydratedBlock, SpillJob, SsdHydrator, SsdSpiller};
@@ -96,27 +97,25 @@ impl PromptCacheEntry for Qwen35MoeEntry {
         })
     }
 
-    fn truncate_kv_to(&mut self, prefix_len: usize) {
-        for kv in &mut self.kv_caches {
-            if kv.offset() > 0 {
-                kv.truncate_to(prefix_len as i32);
-            }
-        }
-        // lin_caches are NOT truncated — they are re-run on the tail.
+    fn kv_caches(&self) -> &[KvCache] {
+        &self.kv_caches
     }
 
-    fn truncate_kv_to_block(&mut self, block_count: usize) {
-        // Delegates to truncate_kv_to. ReusePolicy::ExactOnly means the
-        // generate-loop never actually calls this (partial hits degrade to
-        // Miss); the impl is retained for the trait contract + SSD code paths.
-        self.truncate_kv_to(block_count * BLOCK_TOKENS);
+    fn kv_caches_mut(&mut self) -> &mut [KvCache] {
+        &mut self.kv_caches
     }
 
-    fn kv_bytes(&self) -> u64 {
-        let kv: u64 = self.kv_caches.iter().map(|c| c.resident_bytes()).sum();
-        let lin: u64 = self.lin_caches.iter().map(|c| c.approx_bytes()).sum();
-        kv + lin
+    fn kv_quant(&self) -> Option<KvQuant> {
+        self.kv_quant
     }
+
+    // Hybrid GDN arch: real recurrent caches. The default `truncate_kv_to`
+    // deliberately cannot reach these (recurrent state is re-run on the tail,
+    // never sliced), and the default `kv_bytes` sums their `approx_bytes`.
+    fn lin_caches(&self) -> &[LinearAttnCache] {
+        &self.lin_caches
+    }
+    // truncate_kv_to / truncate_kv_to_block / kv_bytes: trait defaults.
 }
 
 // ---------------------------------------------------------------------------
