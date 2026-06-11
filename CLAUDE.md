@@ -170,7 +170,8 @@ Hard rules:
   lives in `rmlx_models::ssd_tier` and calls `rmlx_kv_ssd::prepare_attach`
   for the per-namespace SSD work.
 * `rmlx-quant` and `rmlx-kv-quant` are **sibling** crates: weight-quant
-  codecs (`affine`, `bf16`, `fp4`, `fp8`, `mxfp`) stay in `rmlx-quant`;
+  codecs (`affine`, `awq`, `bf16`, `fp4`, `fp8`, `mxfp`) stay in `rmlx-quant`
+  (`awq` is pure byte-math — AWQ→MLX pack/unpack with no `mlx`/`Array` dep);
   KV-side codecs (`turboquant`, `planarquant`, MSL wrappers, storage,
   `KvCache`, paged, mixed/rot-K) live in `rmlx-kv-quant`. New code MUST
   add KV codecs to `rmlx-kv-quant` and weight codecs to `rmlx-quant`,

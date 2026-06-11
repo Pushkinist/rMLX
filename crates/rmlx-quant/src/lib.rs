@@ -27,6 +27,7 @@
 )]
 
 pub mod affine;
+pub mod awq;
 pub mod bf16;
 pub mod fp4;
 pub mod fp8;

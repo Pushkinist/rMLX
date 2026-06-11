@@ -7,8 +7,9 @@
 //! - [`load_from_path`] — load MoE snapshot
 //! - [`load_from_path_paro`] — load PARO (dense) snapshot
 //!
-//! `pub(crate)` helpers re-exported for `gemma4.rs`:
-//! AWQ/F16 conversion functions from `loader`.
+//! The AWQ/F16 byte-math conversion functions now live in
+//! [`rmlx_quant::awq`]; the PARO/embedding `Array`-side assembly lives in
+//! [`crate::load_util`].
 
 pub(super) mod attention;
 pub(super) mod config;
@@ -33,12 +34,6 @@ pub use model::Qwen3_5MoeText;
 pub(crate) use mtp_layer::{MtpLayer, MtpLayerDims};
 pub use prompt_cache::read_cache_stats as qwen3_5_moe_cache_stats;
 pub use prompt_cache::read_kv_cache_bytes as qwen3_5_moe_kv_cache_bytes;
-
-// pub(crate) re-exports — used by gemma4.rs and crate tests.
-pub(crate) use loader::{
-    convert_awq_qweight, convert_awq_qzeros_to_biases, f16_bits_to_f32, f32_to_f16_bits,
-    quantize_f16_affine_int4,
-};
 
 // ---------------------------------------------------------------------------
 // Tests
