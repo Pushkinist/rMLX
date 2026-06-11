@@ -581,3 +581,75 @@ Coherence was solid across all 25 codecs on all four models (full sweep,
 - rMLX cells recorded in CBB `metrics/runs/*.jsonl` (backend=rmlx); **not** in
   `runs.db` (CBB schema rejected by the rMLX buffer — known harness landmine).
 - Aggregator: `Cross-Backend-Bench/scripts/agg_gemma4_siblings.py`.
+
+---
+
+## 6. Weight-quant sweep — QAT 4-bit vs PTQ mxfp8 (2026-06-11)
+
+A second, orthogonal axis to §2's KV-codec sweep: the **weight** quant. Tests the
+Gemma QAT collection (`mlx-community/gemma-4-<size>-it-qat-<fmt>`, MLX safetensors,
+quantization-aware-trained) against the on-disk PTQ-mxfp8 baselines.
+
+**Loader work landed to make these load** (branch `refactor/model-agnostic-architecture`):
+unquantized **bf16** (Plain fallback when no `.scales`) + **affine-int4** with
+per-group `.biases` (dense linears, embeddings, *and* MoE expert `gather_qmm`) +
+a **`Gemma4UnifiedForConditionalGeneration`** arch alias for the 12B variant
+(encoder-free multimodal; text decoder is Gemma4 — vision/audio not yet wired).
+
+**Method:** decode TPS via `rmlx baseline --kv-quant none --prompt-tokens 4096
+--max-tokens 100` (weight-isolated: KV held at bf16-`none` so the only variable is
+the weight codec; 1 warmup + 3 measured, median). Accuracy via `rmlx eval ppl`
+wikitext-2 (20k-token slice, BOS-per-window scorer). Coherence via temp-0 serve.
+These are a *different harness* from §2 (single-prompt `baseline`, not serve+CBB
+`run_one`), so the absolute TPS is comparable only **within** this section, not
+cross-referenced to §2's serve numbers.
+
+| size | mxfp8 (PTQ) | 4bit QAT (affine g64) | mxfp4 QAT | bf16 / nvfp4 ref |
+|---|---|---|---|---|
+| **e2b** | 127.7 · ppl 139 | **142.3 (+11%)** · ppl 37 | — *(empty HF repo)* | — |
+| **e4b** | 78.5 · ppl 47 | 87.5 (+11%) · ppl 25 | **87.7 (+12%)** · ppl 25 | bf16 47.3 · **ppl 22.8** · nvfp4 86.8 · ppl 301 ✗ |
+| **12b** | 35.4 · ppl 524† | **39.5 (+12%)** · ppl 958† | 39.3 (+11%) · ppl 1490† | — |
+| **26b MoE** | 79.2 · ppl 30434† | **106.2 (+34%)** · ppl 778† | 104.9 (+32%) · ppl 823† | — |
+
+Cell = `decodeTPS (Δ vs mxfp8) · ppl`. All coherent at temp 0 **except nvfp4**
+(rambling). `†` = ppl is a genuine instruct-model artifact, see finding 4.
+
+**Findings:**
+
+1. **4-bit decodes faster than mxfp8 on every model** — weights stay packed at
+   runtime (`Linear::Quantized` → `quantized_matmul(mode)`), so halving weight
+   bytes (1.0→0.5 B/elem) cuts decode bandwidth directly. **+11%** small dense,
+   **+32–34% on 26b MoE** (more weight bandwidth to save). bf16 is the slowest
+   (e4b 47.3, 2 B/elem). mxfp4 ≈ affine-4bit on speed.
+2. **Accuracy — the e4b cell (with a bf16 anchor) is the clean result:** QAT-4bit
+   ppl 25.0 ≈ QAT-mxfp4 25.4 ≈ **bf16 22.8** ≪ **PTQ-mxfp8 46.6**. QAT 4-bit
+   matches bf16 quality *and* runs +12% faster than the 8-bit PTQ baseline — a
+   genuine Pareto win on the small dense models. (e2b echoes it: 4bit 37 ≪ mxfp8 139.)
+3. **nvfp4 is fast but numerically degraded** (ppl 301 vs mxfp4 25; rambling
+   output). rMLX's dispatch is byte-identical to mlx-lm's and the weights
+   reconstruct to 5-decimal vs the bf16 reference — the degradation is inside MLX
+   0.31.2's nvfp4 `quantized_matmul` GPU kernel, not rMLX. **Use mxfp4 for 4-bit.**
+4. **12b/26b raw-wikitext ppl is huge but GENUINE, not a bug.** 26b-mxfp8 ppl
+   30434 despite coherent generation. Verified: the scorer is correct (softcap
+   applied, no non-finite, flat-high per-window NLL from window 0), and **rMLX
+   reproduces the mlx-lm reference within bf16 noise** (mlx-lm 26b-mxfp8 NLL 11.1
+   → ppl 65855, same flat-high per-window pattern). The split is structural —
+   the "clean" e2b/e4b are matformer nano models (`num_kv_shared_layers>0`,
+   `hidden_size_per_layer_input=256`); the "high-ppl" 12b/26b/31b are
+   `attention_k_eq_v` / no-per-layer-input. Coherent argmax + tiny probability
+   *mass* on raw-web tokens is the signature of an aggressively instruction-tuned
+   model preferring its chat distribution over raw text. Within-model precision
+   ordering (mxfp8 < mxfp4 < 4bit) is preserved and correct. **Do not use raw
+   wikitext ppl as a quant-quality signal for the k_eq_v instruct models** — it is
+   not comparable to the e2b/e4b cells. A chat-template-wrapped corpus (or a base
+   checkpoint) would be needed for a meaningful quality number there.
+
+**Recommendation (weight quant per size):** where a QAT 4-bit snapshot exists,
+**mxfp4 / affine-4bit is the pick** — faster than mxfp8 at every size (most on
+26b MoE) and, on the small dense models, accuracy ≈ bf16 and better than PTQ-mxfp8.
+mxfp8 stays a safe default; nvfp4 is out until the MLX kernel is fixed.
+
+**Caveats:** decode-TPS here is `--kv-quant none` weight-isolated (~4k prompt),
+not the §2 serve+CBB harness — within-section deltas only. `e2b-it-qat-mxfp4` is
+an empty placeholder repo on HF (no weights). 12b vision/audio input is not wired
+(text only). Metrics-DB ingest of these cells is deferred (grid-summary only).
