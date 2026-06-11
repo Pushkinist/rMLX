@@ -31,6 +31,7 @@ use crate::layers::{
     resolve_quant, Activation, Embedding, Linear, Mlp, ParoRotation, QuantMode, QuantParams,
     RmsNorm,
 };
+use crate::load_util::{load_paro_parts, quantize_embedding_int4, Weights};
 
 use super::config::{Gemma4TextConfig, LayerType};
 use super::decoder_layer::DecoderLayer;
@@ -595,6 +596,10 @@ pub fn load_from_path_paro(model_dir: &Path) -> Result<Gemma4Text> {
 
     let idx = load_shard_index(model_dir)?;
     let shards = ShardSet::open(model_dir, &idx)?;
+    // Shared PARO + embedding-quant assembly fetches via `Weights`; the rest of
+    // this loader still uses the local `g4_load_raw` closure (full migration to
+    // `Weights` is a later task).
+    let w = Weights::new(&shards, &idx);
 
     // ── Low-level tensor loader ──────────────────────────────────────────────
 
@@ -637,99 +642,19 @@ pub fn load_from_path_paro(model_dir: &Path) -> Result<Gemma4Text> {
 
     // Load a PARO linear layer (returns crate::layers::Linear::Paro).
     let load_paro = |base: &str| -> Result<Linear> {
-        let (qw_bytes, qw_shape) = g4_load_raw(&shards, &format!("{base}.qweight"))?;
-        let (sc_bytes, sc_shape) = g4_load_raw(&shards, &format!("{base}.scales"))?;
-        let (qz_bytes, _) = g4_load_raw(&shards, &format!("{base}.qzeros"))?;
-        let (th_bytes, th_shape) = g4_load_raw(&shards, &format!("{base}.theta"))?;
-        let (pa_bytes, _) = g4_load_raw(&shards, &format!("{base}.pairs"))?;
-        let (cs_bytes, _) = g4_load_raw(&shards, &format!("{base}.channel_scales"))?;
-
-        if sc_shape.len() != 2 || qw_shape.len() != 2 {
-            return Err(Error::Loader(format!(
-                "g4_load_paro '{base}': unexpected tensor rank"
-            )));
-        }
-
-        let num_groups = sc_shape[0]; // = in_features / group_size
-        let out_features = sc_shape[1];
-        let in_features = qw_shape[0];
-
-        // 1. Convert qweight AWQ [in, out*bits/32] → MLX [out, in*bits/32].
-        let mlx_weight_bytes =
-            crate::qwen3_5_moe::convert_awq_qweight(&qw_bytes, in_features, out_features, 4)?;
-        let weight = Array::from_bytes(
-            &mlx_weight_bytes,
-            &[out_features as i32, (in_features * 4 / 32) as i32],
-            Dtype::U32,
-        )?;
-
-        // 2. Convert qzeros + scales → transposed scales/biases for MLX.
-        let (scales_bytes_t, biases_bytes_t) = crate::qwen3_5_moe::convert_awq_qzeros_to_biases(
-            &qz_bytes,
-            &sc_bytes,
-            num_groups,
-            out_features,
-            4,
-        )?;
-        let scales = Array::from_bytes(
-            &scales_bytes_t,
-            &[out_features as i32, num_groups as i32],
-            Dtype::F16,
-        )?;
-        let biases = Array::from_bytes(
-            &biases_bytes_t,
-            &[out_features as i32, num_groups as i32],
-            Dtype::F16,
-        )?;
-
-        // 3. Rotation: pre-compute cos/sin from F16 theta [krot, hidden/2].
-        if th_shape.len() != 2 {
-            return Err(Error::Loader(format!(
-                "g4_load_paro '{base}': theta shape unexpected: {th_shape:?}"
-            )));
-        }
-        let krot = th_shape[0];
-        let half_hidden = th_shape[1];
-        let hidden = half_hidden * 2;
-        let n_theta = krot * half_hidden;
-        let mut cos_bytes = vec![0u8; n_theta * 2];
-        let mut sin_bytes = vec![0u8; n_theta * 2];
-        for i in 0..n_theta {
-            let th_bits = u16::from_le_bytes([th_bytes[i * 2], th_bytes[i * 2 + 1]]);
-            let th_f32 = crate::qwen3_5_moe::f16_bits_to_f32(th_bits);
-            let cos_f16 = crate::qwen3_5_moe::f32_to_f16_bits(th_f32.cos());
-            let sin_f16 = crate::qwen3_5_moe::f32_to_f16_bits(th_f32.sin());
-            cos_bytes[i * 2..i * 2 + 2].copy_from_slice(&cos_f16.to_le_bytes());
-            sin_bytes[i * 2..i * 2 + 2].copy_from_slice(&sin_f16.to_le_bytes());
-        }
-        let cos_theta =
-            Array::from_bytes(&cos_bytes, &[krot as i32, half_hidden as i32], Dtype::F16)?;
-        let sin_theta =
-            Array::from_bytes(&sin_bytes, &[krot as i32, half_hidden as i32], Dtype::F16)?;
-
-        // 4. Pack I16 pairs [krot, hidden] → I32 packed_pairs [krot, hidden/2].
-        let packed =
-            crate::paroquant_msl::pack_pairs_cpu(&pa_bytes, krot, hidden, paro_group_size)?;
-        let packed_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(packed.as_ptr().cast::<u8>(), packed.len() * 4) };
-        let packed_pairs =
-            Array::from_bytes(packed_bytes, &[krot as i32, half_hidden as i32], Dtype::I32)?;
-
-        // 5. Channel scales: F16 [1, hidden].
-        let cs = Array::from_bytes(&cs_bytes, &[1i32, hidden as i32], Dtype::F16)?;
-
+        let p = load_paro_parts(&w, base, paro_group_size)?;
         Ok(Linear::Paro {
             rotation: ParoRotation {
-                packed_pairs,
-                cos_theta,
-                sin_theta,
-                channel_scales: cs,
-                krot,
-                group_size: paro_group_size,
+                packed_pairs: p.packed_pairs,
+                cos_theta: p.cos_theta,
+                sin_theta: p.sin_theta,
+                channel_scales: p.channel_scales,
+                krot: p.krot,
+                group_size: p.group_size,
             },
-            weight,
-            scales,
-            biases,
+            weight: p.weight,
+            scales: p.scales,
+            biases: p.biases,
         })
     };
 
@@ -740,28 +665,12 @@ pub fn load_from_path_paro(model_dir: &Path) -> Result<Gemma4Text> {
     // Python loader calls mlx_nn.quantize(embed_tokens, group_size, bits=4, mode="affine")
     // — required for correct logits (raw F16 produces flat output).
     let embed_tokens = {
-        let (w_bytes, w_shape) = g4_load_raw(&shards, &format!("{pfx}.embed_tokens.weight"))?;
-        if w_shape.len() != 2 {
-            return Err(Error::Loader(format!(
-                "embed_tokens.weight: expected 2-D, got shape {w_shape:?}"
-            )));
-        }
-        let vocab = w_shape[0];
-        let hidden = w_shape[1];
-        let num_groups = hidden / paro_group_size;
-        let (wq_bytes, sc_bytes, bi_bytes) =
-            crate::qwen3_5_moe::quantize_f16_affine_int4(&w_bytes, vocab, hidden, paro_group_size)?;
-        let w = Array::from_bytes(
-            &wq_bytes,
-            &[vocab as i32, (hidden * paro_bits / 32) as i32],
-            Dtype::U32,
-        )?;
-        let s = Array::from_bytes(&sc_bytes, &[vocab as i32, num_groups as i32], Dtype::F16)?;
-        let b = Array::from_bytes(&bi_bytes, &[vocab as i32, num_groups as i32], Dtype::F16)?;
+        let (weight, scales, biases) =
+            quantize_embedding_int4(&w, &format!("{pfx}.embed_tokens"), paro_group_size)?;
         Embedding::Quantized {
-            weight: w,
-            scales: s,
-            biases: Some(b),
+            weight,
+            scales,
+            biases: Some(biases),
             group_size: paro_group_size as i32,
             bits: paro_bits as i32,
             mode: QuantMode::Affine,

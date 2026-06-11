@@ -18,13 +18,21 @@
 //!
 //! This helper wires into nothing yet — per-arch loaders adopt it incrementally.
 
+// unsafe_code: mlx-rs Array zero-copy view — slice::from_raw_parts byte-reinterpret
+// of the i32 packed-pair buffer for Array::from_bytes (PARO assembly).
+#![allow(unsafe_code)]
+
 use std::cell::OnceCell;
 
 use rmlx_core::error::{Error, Result};
 use rmlx_loader::{
     view_discriminated, ShardHandle, ShardIndex, ShardSet, TensorLookup, TensorView,
 };
-use rmlx_mlx::Array;
+use rmlx_mlx::{Array, Dtype};
+use rmlx_quant::awq::{
+    convert_awq_qweight, convert_awq_qzeros_to_biases, f16_bits_to_f32, f32_to_f16_bits,
+    quantize_f16_affine_int4,
+};
 use safetensors::SafeTensors;
 use tracing::debug;
 
@@ -256,6 +264,188 @@ impl<'a> Weights<'a> {
         }
         Ok(None)
     }
+}
+
+// ---------------------------------------------------------------------------
+// PARO + embedding-quant assembly (Array-side; stays in rmlx-models because it
+// needs `crate::paroquant_msl::pack_pairs_cpu`).
+// ---------------------------------------------------------------------------
+
+/// Reconstructed parts for one PARO INT4 linear layer.
+///
+/// Holds the raw MLX arrays a caller needs to build its own per-arch
+/// `Linear::Paro` (the gemma4 and qwen3_5_moe `Linear` enums differ, so this
+/// shared helper returns the arrays + scalars rather than a constructed layer).
+#[allow(
+    dead_code,
+    reason = "shared loader helper — per-arch PARO loaders adopt it incrementally; unwired until the loader migration lands"
+)]
+pub(crate) struct ParoParts {
+    /// Packed INT4 codes `[out, in*4/32]` U32.
+    pub weight: Array,
+    /// Per-group scales `[out, num_groups]` F16.
+    pub scales: Array,
+    /// Per-group biases (zero-points) `[out, num_groups]` F16.
+    pub biases: Array,
+    /// I32 packed pair indices `[krot, hidden/2]`.
+    pub packed_pairs: Array,
+    /// F16 cosine values `[krot, hidden/2]`.
+    pub cos_theta: Array,
+    /// F16 sine values `[krot, hidden/2]`.
+    pub sin_theta: Array,
+    /// F16 per-channel scales `[1, hidden]`.
+    pub channel_scales: Array,
+    /// Actual krot for this layer.
+    pub krot: usize,
+    /// Group size used by both the rotation kernel and the INT4 matmul.
+    pub group_size: usize,
+}
+
+/// Reconstruct one PARO INT4 linear layer from its six raw checkpoint tensors.
+///
+/// Fetches `<base>.{qweight,scales,qzeros,theta,pairs,channel_scales}` via
+/// [`Weights::raw`], converts AWQ packing to MLX layout, pre-computes cos/sin
+/// from theta, and packs the rotation pairs via
+/// [`crate::paroquant_msl::pack_pairs_cpu`]. Returns the assembled [`ParoParts`];
+/// the caller wraps them in its arch-specific `Linear::Paro`.
+#[allow(
+    dead_code,
+    reason = "shared loader helper — per-arch PARO loaders adopt it incrementally; unwired until the loader migration lands"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+pub(crate) fn load_paro_parts(w: &Weights<'_>, base: &str, group_size: usize) -> Result<ParoParts> {
+    let (qweight_bytes, qweight_shape, _) = w.raw(&format!("{base}.qweight"))?;
+    let (scales_bytes, scales_shape, _) = w.raw(&format!("{base}.scales"))?;
+    let (qzeros_bytes, _, _) = w.raw(&format!("{base}.qzeros"))?;
+    let (theta_bytes, theta_shape, _) = w.raw(&format!("{base}.theta"))?;
+    let (pairs_bytes, _, _) = w.raw(&format!("{base}.pairs"))?;
+    let (channel_scales_bytes, _, _) = w.raw(&format!("{base}.channel_scales"))?;
+
+    if scales_shape.len() != 2 || qweight_shape.len() != 2 {
+        return Err(Error::Loader(format!(
+            "load_paro_parts '{base}': unexpected tensor rank"
+        )));
+    }
+
+    let num_groups = scales_shape[0];
+    let out_features = scales_shape[1];
+    let in_features = qweight_shape[0];
+
+    let mlx_weight_bytes = convert_awq_qweight(&qweight_bytes, in_features, out_features, 4)?;
+    let weight = Array::from_bytes(
+        &mlx_weight_bytes,
+        &[out_features as i32, (in_features * 4 / 32) as i32],
+        Dtype::U32,
+    )?;
+
+    let (scales_bytes_t, biases_bytes_t) =
+        convert_awq_qzeros_to_biases(&qzeros_bytes, &scales_bytes, num_groups, out_features, 4)?;
+    let scales = Array::from_bytes(
+        &scales_bytes_t,
+        &[out_features as i32, num_groups as i32],
+        Dtype::F16,
+    )?;
+    let biases = Array::from_bytes(
+        &biases_bytes_t,
+        &[out_features as i32, num_groups as i32],
+        Dtype::F16,
+    )?;
+
+    if theta_shape.len() != 2 {
+        return Err(Error::Loader(format!(
+            "load_paro_parts '{base}': theta shape unexpected: {theta_shape:?}"
+        )));
+    }
+    let krot = theta_shape[0];
+    let half_hidden = theta_shape[1];
+    let hidden = half_hidden * 2;
+
+    let n_theta = krot * half_hidden;
+    if theta_bytes.len() != n_theta * 2 {
+        return Err(Error::Loader(format!(
+            "load_paro_parts '{base}': theta bytes length {} != expected {}",
+            theta_bytes.len(),
+            n_theta * 2
+        )));
+    }
+    let mut cos_bytes = vec![0u8; n_theta * 2];
+    let mut sin_bytes = vec![0u8; n_theta * 2];
+    for i in 0..n_theta {
+        let th_bits = u16::from_le_bytes([theta_bytes[i * 2], theta_bytes[i * 2 + 1]]);
+        let th_f32 = f16_bits_to_f32(th_bits);
+        let cos_f16 = f32_to_f16_bits(th_f32.cos());
+        let sin_f16 = f32_to_f16_bits(th_f32.sin());
+        cos_bytes[i * 2..i * 2 + 2].copy_from_slice(&cos_f16.to_le_bytes());
+        sin_bytes[i * 2..i * 2 + 2].copy_from_slice(&sin_f16.to_le_bytes());
+    }
+    let cos_theta = Array::from_bytes(&cos_bytes, &[krot as i32, half_hidden as i32], Dtype::F16)?;
+    let sin_theta = Array::from_bytes(&sin_bytes, &[krot as i32, half_hidden as i32], Dtype::F16)?;
+
+    let packed = crate::paroquant_msl::pack_pairs_cpu(&pairs_bytes, krot, hidden, group_size)?;
+    // SAFETY: reinterpret the i32 packed-pair buffer as bytes for Array::from_bytes;
+    // the slice is consumed immediately and never aliased mutably.
+    let packed_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(packed.as_ptr().cast::<u8>(), packed.len() * 4) };
+    let packed_pairs =
+        Array::from_bytes(packed_bytes, &[krot as i32, half_hidden as i32], Dtype::I32)?;
+
+    let channel_scales =
+        Array::from_bytes(&channel_scales_bytes, &[1i32, hidden as i32], Dtype::F16)?;
+
+    Ok(ParoParts {
+        weight,
+        scales,
+        biases,
+        packed_pairs,
+        cos_theta,
+        sin_theta,
+        channel_scales,
+        krot,
+        group_size,
+    })
+}
+
+/// Quantize a stored-F16 embedding/lm_head weight `<name>.weight` to MLX affine
+/// INT4 at load time (PARO checkpoints store these as F16).
+///
+/// Returns `(weight U32 [vocab, hidden*4/32], scales F16 [vocab, num_groups],
+/// biases F16 [vocab, num_groups])` — the caller wraps them in its arch-specific
+/// `Embedding::Quantized` / `Linear::Quantized`.
+#[allow(
+    dead_code,
+    reason = "shared loader helper — per-arch PARO loaders adopt it incrementally; unwired until the loader migration lands"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+pub(crate) fn quantize_embedding_int4(
+    w: &Weights<'_>,
+    name: &str,
+    group_size: usize,
+) -> Result<(Array, Array, Array)> {
+    let (w_bytes, w_shape, _) = w.raw(&format!("{name}.weight"))?;
+    if w_shape.len() != 2 {
+        return Err(Error::Loader(format!(
+            "{name}.weight: expected 2-D, got shape {w_shape:?}"
+        )));
+    }
+    let vocab = w_shape[0];
+    let hidden = w_shape[1];
+    let num_groups = hidden / group_size;
+    let (wq_bytes, sc_bytes, bi_bytes) =
+        quantize_f16_affine_int4(&w_bytes, vocab, hidden, group_size)?;
+    let weight = Array::from_bytes(
+        &wq_bytes,
+        &[vocab as i32, (hidden * 4 / 32) as i32],
+        Dtype::U32,
+    )?;
+    let scales = Array::from_bytes(&sc_bytes, &[vocab as i32, num_groups as i32], Dtype::F16)?;
+    let biases = Array::from_bytes(&bi_bytes, &[vocab as i32, num_groups as i32], Dtype::F16)?;
+    Ok((weight, scales, biases))
 }
 
 #[cfg(test)]
