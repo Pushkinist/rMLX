@@ -7,9 +7,8 @@
 )]
 use std::path::Path;
 
-use rmlx_core::error::Result;
+use rmlx_core::error::{Error, Result};
 use rmlx_loader::{load_config, load_shard_index, ShardSet};
-use rmlx_mlx::Array;
 use tracing::{debug, info};
 
 use crate::layers::{resolve_quant, QuantParams};
@@ -63,72 +62,68 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma3Text> {
     let defaults = QuantParams::global(cfg.quant_group_size, cfg.quant_bits, &cfg.quant_mode);
     let overrides = std::collections::HashMap::new();
 
-    let load_plain = |name: &str| -> Result<Array> { w.array(name) };
-
-    // Load affine-quantized or plain linear layer.
-    // Handles `.scales` + `.biases` siblings absent from the index.
-    let load_quant = |base: &str| -> Result<Linear> {
-        let w_name = format!("{base}.weight");
-        let s_name = format!("{base}.scales");
-        let b_name = format!("{base}.biases");
-
-        let weight = w.array(&w_name)?;
-
-        if w.has(&s_name)? {
-            let s = w.array(&s_name)?;
-            let biases = if w.has(&b_name)? {
-                Some(w.array(&b_name)?)
-            } else {
-                None
-            };
-            let qp = resolve_quant(base, biases.is_some(), &defaults, &overrides)?;
-            Ok(Linear::Quantized {
+    // Thin adapter: calls the shared seam, then converts the shared
+    // `crate::layers::Linear` (mode: QuantMode) to the arch-local
+    // `super::layers::Linear` (mode: String). OOM classification is inside
+    // `w.linear` — no `.map_err` needed here. `Paro` is unreachable from
+    // `w.linear` (it only builds Plain/Quantized) but the match is exhaustive.
+    let lin = |base: &str| -> Result<Linear> {
+        use crate::layers::Linear as SharedLinear;
+        match w.linear(base, |hb| resolve_quant(base, hb, &defaults, &overrides))? {
+            SharedLinear::Plain { weight } => Ok(Linear::Plain { weight }),
+            SharedLinear::Quantized {
                 weight,
-                scales: s,
+                scales,
                 biases,
-                group_size: qp.group_size,
-                bits: qp.bits,
-                mode: qp.mode,
-            })
-        } else {
-            Ok(Linear::Plain { weight })
+                group_size,
+                bits,
+                mode,
+            } => Ok(Linear::Quantized {
+                weight,
+                scales,
+                biases,
+                group_size,
+                bits,
+                mode: mode.as_str().to_owned(),
+            }),
+            SharedLinear::Paro { .. } => Err(Error::Loader(format!(
+                "{base}: unexpected Paro variant from w.linear"
+            ))),
+        }
+    };
+
+    // Thin adapter for embedding: same pattern as `lin`.
+    let emb = |base: &str| -> Result<Embedding> {
+        use crate::layers::Embedding as SharedEmbedding;
+        match w.embedding(base, |hb| resolve_quant(base, hb, &defaults, &overrides))? {
+            SharedEmbedding::Plain { weight } => Ok(Embedding::Plain { weight }),
+            SharedEmbedding::Quantized {
+                weight,
+                scales,
+                biases,
+                group_size,
+                bits,
+                mode,
+            } => Ok(Embedding::Quantized {
+                weight,
+                scales,
+                biases,
+                group_size,
+                bits,
+                mode: mode.as_str().to_owned(),
+            }),
         }
     };
 
     let load_rms_shifted = |name: &str| -> Result<RmsNormShifted> {
-        let w = load_plain(&format!("{name}.weight"))?;
-        RmsNormShifted::from_weight(&w, cfg.rms_norm_eps)
+        let weight = w.array(&format!("{name}.weight"))?;
+        RmsNormShifted::from_weight(&weight, cfg.rms_norm_eps)
     };
 
     let pfx = "language_model.model";
 
     // Embedding table (affine quantized in medgemma).
-    let embed_tokens = {
-        let base = format!("{pfx}.embed_tokens");
-        let s_name = format!("{base}.scales");
-        if w.has(&s_name)? {
-            let weight = w.array(&format!("{base}.weight"))?;
-            let s = w.array(&s_name)?;
-            let b_name = format!("{base}.biases");
-            let biases = if w.has(&b_name)? {
-                Some(w.array(&b_name)?)
-            } else {
-                None
-            };
-            let qp = resolve_quant(&base, biases.is_some(), &defaults, &overrides)?;
-            Embedding::Quantized {
-                weight,
-                scales: s,
-                biases,
-                group_size: qp.group_size,
-                bits: qp.bits,
-                mode: qp.mode,
-            }
-        } else {
-            let weight = load_plain(&format!("{base}.weight"))?;
-            Embedding::Plain { weight }
-        }
-    };
+    let embed_tokens = emb(&format!("{pfx}.embed_tokens"))?;
 
     // Final norm (shifted-gamma -- single BF16 weight, no quant).
     let final_norm = load_rms_shifted(&format!("{pfx}.norm"))?;
@@ -138,13 +133,8 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma3Text> {
         info!("Gemma3: tie_word_embeddings=true, using embed_tokens as lm_head");
         None
     } else {
-        let lm_base = "language_model.lm_head";
-        let lm = if w.has(&format!("{lm_base}.scales"))? {
-            load_quant(lm_base)?
-        } else {
-            let weight = load_plain(&format!("{lm_base}.weight"))?;
-            Linear::Plain { weight }
-        };
+        // `lin` falls through to `Linear::Plain` when no `.scales` sibling is present.
+        let lm = lin("language_model.lm_head")?;
         info!("Gemma3: loaded separate lm_head");
         Some(lm)
     };
@@ -167,14 +157,14 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma3Text> {
             LayerType::FullAttention => cfg.rope_global_theta,
         };
 
-        let q_norm_w = load_plain(&format!("{base}.self_attn.q_norm.weight"))?;
-        let k_norm_w = load_plain(&format!("{base}.self_attn.k_norm.weight"))?;
+        let q_norm_w = w.array(&format!("{base}.self_attn.q_norm.weight"))?;
+        let k_norm_w = w.array(&format!("{base}.self_attn.k_norm.weight"))?;
 
         let attn = Attention {
-            q_proj: load_quant(&format!("{base}.self_attn.q_proj"))?,
-            k_proj: load_quant(&format!("{base}.self_attn.k_proj"))?,
-            v_proj: load_quant(&format!("{base}.self_attn.v_proj"))?,
-            o_proj: load_quant(&format!("{base}.self_attn.o_proj"))?,
+            q_proj: lin(&format!("{base}.self_attn.q_proj"))?,
+            k_proj: lin(&format!("{base}.self_attn.k_proj"))?,
+            v_proj: lin(&format!("{base}.self_attn.v_proj"))?,
+            o_proj: lin(&format!("{base}.self_attn.o_proj"))?,
             q_norm: RmsNormShifted::from_weight(&q_norm_w, cfg.rms_norm_eps)?,
             k_norm: RmsNormShifted::from_weight(&k_norm_w, cfg.rms_norm_eps)?,
             n_heads: cfg.num_attention_heads,
@@ -187,9 +177,9 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma3Text> {
         };
 
         let mlp = Mlp {
-            gate_proj: load_quant(&format!("{base}.mlp.gate_proj"))?,
-            up_proj: load_quant(&format!("{base}.mlp.up_proj"))?,
-            down_proj: load_quant(&format!("{base}.mlp.down_proj"))?,
+            gate_proj: lin(&format!("{base}.mlp.gate_proj"))?,
+            up_proj: lin(&format!("{base}.mlp.up_proj"))?,
+            down_proj: lin(&format!("{base}.mlp.down_proj"))?,
         };
 
         layers.push(DecoderLayer {
