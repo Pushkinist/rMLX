@@ -76,28 +76,35 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
 
     let defaults = QuantParams::global(cfg.quant_group_size, cfg.quant_bits, &cfg.quant_mode);
 
-    let load_linear = |base: &str| -> Result<Linear> {
-        let weight = w.array(&format!("{base}.weight"))?;
-        let s_name = format!("{base}.scales");
-        if w.has(&s_name)? {
-            let s = w.array(&s_name)?;
-            let biases = if w.has(&format!("{base}.biases"))? {
-                Some(w.array(&format!("{base}.biases"))?)
-            } else {
-                None
-            };
-            // The shared resolver owns the `.biases`-sibling affine rule.
-            let qp = resolve_quant(base, biases.is_some(), &defaults, &cfg.quant_overrides)?;
-            Ok(Linear::Quantized {
+    // Thin adapter: calls the shared seam, then converts the shared
+    // `crate::layers::Linear` (mode: QuantMode) to the arch-local
+    // `Linear` (mode: String). OOM classification is inside `w.linear`
+    // — no `.map_err` needed here. `Paro` is unreachable from `w.linear`
+    // (it only builds Plain/Quantized) but the match is exhaustive.
+    let lin = |base: &str| -> Result<Linear> {
+        use crate::layers::Linear as SharedLinear;
+        match w.linear(base, |hb| {
+            resolve_quant(base, hb, &defaults, &cfg.quant_overrides)
+        })? {
+            SharedLinear::Plain { weight } => Ok(Linear::Plain { weight }),
+            SharedLinear::Quantized {
                 weight,
-                scales: s,
+                scales,
                 biases,
-                group_size: qp.group_size,
-                bits: qp.bits,
-                mode: qp.mode,
-            })
-        } else {
-            Ok(Linear::Plain { weight })
+                group_size,
+                bits,
+                mode,
+            } => Ok(Linear::Quantized {
+                weight,
+                scales,
+                biases,
+                group_size,
+                bits,
+                mode: mode.as_str().to_owned(),
+            }),
+            SharedLinear::Paro { .. } => Err(Error::Loader(format!(
+                "{base}: unexpected Paro variant from w.linear"
+            ))),
         }
     };
 
@@ -110,29 +117,30 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
 
     let pfx = "language_model.model";
 
+    // Embedding adapter mirrors `lin`: converts shared Embedding
+    // (mode: QuantMode) to the arch-local Embedding (mode: String).
     let embed_tokens = {
+        use crate::layers::Embedding as SharedEmbedding;
         let base = format!("{pfx}.embed_tokens");
-        if w.has(&format!("{base}.scales"))? {
-            let weight = w.array(&format!("{base}.weight"))?;
-            let s = w.array(&format!("{base}.scales"))?;
-            let biases = if w.has(&format!("{base}.biases"))? {
-                Some(w.array(&format!("{base}.biases"))?)
-            } else {
-                None
-            };
-            let qp = resolve_quant(&base, biases.is_some(), &defaults, &cfg.quant_overrides)?;
-            Embedding::Quantized {
+        match w.embedding(&base, |hb| {
+            resolve_quant(&base, hb, &defaults, &cfg.quant_overrides)
+        })? {
+            SharedEmbedding::Plain { weight } => Embedding::Plain { weight },
+            SharedEmbedding::Quantized {
                 weight,
-                scales: s,
+                scales,
                 biases,
-                group_size: qp.group_size,
-                bits: qp.bits,
-                mode: qp.mode,
-            }
-        } else {
-            Embedding::Plain {
-                weight: w.array(&format!("{base}.weight"))?,
-            }
+                group_size,
+                bits,
+                mode,
+            } => Embedding::Quantized {
+                weight,
+                scales,
+                biases,
+                group_size,
+                bits,
+                mode: mode.as_str().to_owned(),
+            },
         }
     };
 
@@ -155,7 +163,7 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
             }
         }
         info!(%base, "Qwen3_5Moe: loading lm_head");
-        Some(load_linear(base)?)
+        Some(lin(base)?)
     };
 
     let attn_scale = (cfg.head_dim as f32).powf(-0.5);
@@ -190,17 +198,17 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
             inv_scale_arr.eval()?;
 
             AttnBlock::Linear(GatedDeltaNet {
-                in_proj_qkv: load_linear(&format!("{la}.in_proj_qkv"))?,
-                in_proj_z: load_linear(&format!("{la}.in_proj_z"))?,
-                in_proj_b: load_linear(&format!("{la}.in_proj_b"))?,
-                in_proj_a: load_linear(&format!("{la}.in_proj_a"))?,
+                in_proj_qkv: lin(&format!("{la}.in_proj_qkv"))?,
+                in_proj_z: lin(&format!("{la}.in_proj_z"))?,
+                in_proj_b: lin(&format!("{la}.in_proj_b"))?,
+                in_proj_a: lin(&format!("{la}.in_proj_a"))?,
                 conv1d_weight: w.array(&format!("{la}.conv1d.weight"))?,
                 norm_weight: w.array(&format!("{la}.norm.weight"))?,
                 exp_a_log_f32,
                 dt_bias_3d,
                 inv_scale_sq_arr,
                 inv_scale_arr,
-                out_proj: load_linear(&format!("{la}.out_proj"))?,
+                out_proj: lin(&format!("{la}.out_proj"))?,
                 num_k_heads: cfg.linear_num_key_heads,
                 num_v_heads: cfg.linear_num_value_heads,
                 head_k_dim: cfg.linear_key_head_dim,
@@ -212,10 +220,10 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
         } else {
             let sa = format!("{base}.self_attn");
             AttnBlock::Full(FullAttention {
-                q_proj: load_linear(&format!("{sa}.q_proj"))?,
-                k_proj: load_linear(&format!("{sa}.k_proj"))?,
-                v_proj: load_linear(&format!("{sa}.v_proj"))?,
-                o_proj: load_linear(&format!("{sa}.o_proj"))?,
+                q_proj: lin(&format!("{sa}.q_proj"))?,
+                k_proj: lin(&format!("{sa}.k_proj"))?,
+                v_proj: lin(&format!("{sa}.v_proj"))?,
+                o_proj: lin(&format!("{sa}.o_proj"))?,
                 q_norm: load_rms(&format!("{sa}.q_norm"))?,
                 k_norm: load_rms(&format!("{sa}.k_norm"))?,
                 n_heads: cfg.num_attention_heads,
@@ -229,18 +237,18 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
 
         let m = format!("{base}.mlp");
         let mlp = MlpBlock::Moe(Box::new(SparseMoeBlock {
-            gate: load_linear(&format!("{m}.gate"))?,
+            gate: lin(&format!("{m}.gate"))?,
             switch_mlp: SwitchMlp {
-                gate_proj: load_linear(&format!("{m}.switch_mlp.gate_proj"))?,
-                up_proj: load_linear(&format!("{m}.switch_mlp.up_proj"))?,
-                down_proj: load_linear(&format!("{m}.switch_mlp.down_proj"))?,
+                gate_proj: lin(&format!("{m}.switch_mlp.gate_proj"))?,
+                up_proj: lin(&format!("{m}.switch_mlp.up_proj"))?,
+                down_proj: lin(&format!("{m}.switch_mlp.down_proj"))?,
             },
             shared_expert: SharedExpert {
-                gate_proj: load_linear(&format!("{m}.shared_expert.gate_proj"))?,
-                up_proj: load_linear(&format!("{m}.shared_expert.up_proj"))?,
-                down_proj: load_linear(&format!("{m}.shared_expert.down_proj"))?,
+                gate_proj: lin(&format!("{m}.shared_expert.gate_proj"))?,
+                up_proj: lin(&format!("{m}.shared_expert.up_proj"))?,
+                down_proj: lin(&format!("{m}.shared_expert.down_proj"))?,
             },
-            shared_expert_gate: load_linear(&format!("{m}.shared_expert_gate"))?,
+            shared_expert_gate: lin(&format!("{m}.shared_expert_gate"))?,
             num_experts: cfg.num_experts,
             top_k: cfg.num_experts_per_tok,
             norm_topk_prob: cfg.norm_topk_prob,
