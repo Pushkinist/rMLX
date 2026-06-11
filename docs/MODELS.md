@@ -695,9 +695,15 @@ draft (no MTP sidecar head) and is rejected at load — see `docs/SPECULATIVE.md
 
 ### Weight quantization
 
-mxfp8 (group=32) is the primary format for public snapshots. Affine (any
-group/bits) is also supported. Per-tensor quant overrides for router weights
-are read from the inline `quantization` dict.
+mxfp8 (group=32) is the primary format for public snapshots. Also supported:
+unquantized bf16 (plain weights, no `.scales`); affine at any group/bits —
+including affine-int4 with per-group `.biases` zero-points (Google QAT
+snapshots); and the microscaling formats mxfp4 / nvfp4. On this bandwidth-bound
+arch, 4-bit packed weights decode faster than mxfp8 (runtime `quantized_matmul`,
+weights stay packed). mxfp4 is the recommended 4-bit format: nvfp4 loads and runs
+but the MLX nvfp4 kernel currently yields degraded output on these snapshots.
+Per-tensor quant overrides (router weights, QAT MLP blocks) are read from the
+inline `quantization` dict.
 
 ### KV quantization
 
