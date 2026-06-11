@@ -244,21 +244,33 @@ fn compute_ppl_qwen3(
     })
 }
 
-/// sliding-window PPL scorer for the Gemma4 family.
+/// Sliding-window PPL scorer for the Gemma4 family.
 ///
-/// Mirrors `compute_ppl_qwen3` with one Gemma4-specific addition: a BOS token
-/// (id = 2) is prepended to the corpus when not already present. Gemma4 is
-/// trained with BOS as a start-of-document signal; without it the model
-/// produces degenerate logit distributions at position 0 and inflated NLL
-/// throughout the sequence. Prepending BOS before the first window matches
-/// the convention used by HF `evaluate.load("perplexity")` and
-/// lm-evaluation-harness for BOS-bearing models.
+/// Gemma4 is trained with a BOS token (id=2) as a start-of-document signal.
+/// Without BOS at the start of a forward pass, the model produces degenerate
+/// logit distributions — high NLL that worsens progressively across windows as
+/// no window after the first would have a BOS start-signal.
+///
+/// **BOS is prepended to every sliding window**, not just the first. For each
+/// window at corpus position `start`, the forward input is
+/// `[BOS, tokens[start], ..., tokens[start + ctx_window - 2]]` (length
+/// `ctx_window`). This ensures the model always starts from a known
+/// start-of-document state. The warmup positions (first `ctx_window - stride`
+/// positions in each non-first window) are skipped in scoring as usual — only
+/// the second half of each window is scored — so BOS context is always present
+/// for scored positions.
+///
+/// The scored positions in window i (BOS-prefixed view, 0-indexed):
+/// - window 0: positions `[0..ctx_window-2]` (predicts `tokens[0..ctx_window-1]`)
+/// - window i>0: positions `[warmup..ctx_window-2]` where `warmup = ctx_window - stride`
+///
+/// Each scored position `t` predicts `bos_window[t+1] = tokens[start + t]` —
+/// the corpus token immediately following position `t`.
 ///
 /// Uses `Gemma4Text::forward_seq_logits_all` to produce the full
 /// `[1, seq, vocab]` logit tensor in one Metal dispatch — no cache state,
 /// fresh window each call. Final-logit softcapping is applied inside
-/// `forward_seq_logits_all` via `apply_softcap`; the NLL computation here
-/// is unaffected.
+/// `forward_seq_logits_all` via `apply_softcap`.
 #[instrument(skip(model, tokens), fields(n_tokens = tokens.len(), ctx_window, stride))]
 #[allow(
     clippy::indexing_slicing,
@@ -287,29 +299,14 @@ fn compute_ppl_gemma4(
         });
     }
 
-    // Gemma4 is trained with a BOS token (id=2). When evaluating raw
-    // text without a chat template the model has no start-of-document signal and
-    // produces degenerate logit distributions at position 0 (and, to a lesser
-    // degree, throughout the sequence). Standard LM perplexity evaluation for
-    // BOS-trained models prepends the BOS token so the model knows it is at the
-    // beginning of a document. We do that here, mirroring the convention used
-    // by HF `evaluate.load("perplexity")` and lm-evaluation-harness for models
-    // with a BOS token.
-    //
-    // Gemma4 config.json: "bos_token_id": 2 (field lives on the outer
-    // GenerationConfig / text_config, not on Gemma4TextConfig as exposed by
-    // rMLX; no struct field to read from so the literal is hard-coded here).
-    // We only prepend if the caller didn't already supply BOS at position 0.
+    // Gemma4 config.json: "bos_token_id": 2.  The field lives on the outer
+    // GenerationConfig / text_config; no struct field in Gemma4TextConfig,
+    // so the literal is hard-coded here.
     const GEMMA4_BOS: u32 = 2;
-    let bos_prepended: Vec<u32>;
-    let tokens: &[u32] = if tokens.first().copied() == Some(GEMMA4_BOS) {
-        tokens
-    } else {
-        bos_prepended = std::iter::once(GEMMA4_BOS)
-            .chain(tokens.iter().copied())
-            .collect();
-        &bos_prepended
-    };
+
+    // Reusable BOS-prefixed window buffer.  Allocated once and reused across
+    // windows to avoid per-window heap allocation for a ctx_window-sized Vec.
+    let mut bos_window: Vec<u32> = Vec::with_capacity(ctx_window);
 
     let vocab = model.cfg.vocab_size;
     let mut sum_nll: f64 = 0.0;
@@ -319,29 +316,44 @@ fn compute_ppl_gemma4(
     let mut start: usize = 0;
     let mut first = true;
     while start < tokens.len() {
-        let end = (start + ctx_window).min(tokens.len());
-        let window = &tokens[start..end];
-        if window.len() < 2 {
-            break;
+        // Build a BOS-prefixed window of length min(ctx_window, available+1).
+        // Layout: [BOS, tokens[start], tokens[start+1], ..., tokens[start+ctx_window-2]]
+        // The window always starts with BOS so the model has a start-of-document
+        // signal regardless of where in the corpus this window begins.
+        let available = tokens.len() - start;
+        let content_len = available.min(ctx_window - 1); // corpus tokens after BOS
+        if content_len == 0 {
+            break; // no corpus tokens left to score
         }
+        bos_window.clear();
+        bos_window.push(GEMMA4_BOS);
+        bos_window.extend_from_slice(&tokens[start..start + content_len]);
+        let win_len = bos_window.len(); // 1 + content_len
 
-        // Forward this window -> [1, S, vocab] logits.
-        let logits = model.forward_seq_logits_all(window, device)?;
-        let host = logits_3d_to_host_f32(&logits, window.len(), vocab)?;
+        // BOS guarantees win_len = 1 + content_len >= 2 (content_len >= 1).
 
-        // warmup = number of leading positions whose NLL was already counted
-        // in the previous window. First window: 0. Subsequent windows: the
-        // overlap = ctx_window - stride.
+        // Forward this window -> [1, win_len, vocab] logits.
+        let logits = model.forward_seq_logits_all(&bos_window, device)?;
+        let host = logits_3d_to_host_f32(&logits, win_len, vocab)?;
+
+        // warmup = leading positions to skip (already scored in the previous window).
+        // First window: 0. Subsequent windows: the overlap region is
+        // ctx_window - stride positions, but the prepended BOS shifts every
+        // corpus target one slot earlier in the window, so the overlap to skip
+        // is one smaller: (ctx_window - stride - 1).
         let warmup = if first {
             0
         } else {
-            ctx_window.saturating_sub(stride).min(window.len() - 1)
+            ctx_window
+                .saturating_sub(stride)
+                .saturating_sub(1)
+                .min(win_len - 1)
         };
 
-        // Score positions [warmup .. window.len() - 1) -- predicting token at
-        // window[t+1] from logits[t].
-        for t in warmup..(window.len() - 1) {
-            let next_id = window[t + 1] as usize;
+        // Score positions [warmup .. win_len-1) predicting bos_window[t+1].
+        // bos_window[t+1] = tokens[start + t]  (for t >= 0, since bos_window[1..] = tokens[start..]).
+        for t in warmup..(win_len - 1) {
+            let next_id = bos_window[t + 1] as usize;
             if next_id >= vocab {
                 warn!(
                     token_id = next_id,
@@ -368,8 +380,9 @@ fn compute_ppl_gemma4(
         debug!(
             window_idx = windows - 1,
             start,
-            end,
+            end = start + content_len,
             warmup,
+            win_len,
             scored_so_far = count,
             mean_nll_running = if count > 0 {
                 sum_nll / count as f64
@@ -379,8 +392,8 @@ fn compute_ppl_gemma4(
             "ppl: window scored"
         );
 
-        // Advance. If the window already reached the corpus end, stop.
-        if end == tokens.len() {
+        // Advance. If we consumed the last available corpus tokens, stop.
+        if content_len < ctx_window - 1 {
             break;
         }
         start += stride;
@@ -408,6 +421,56 @@ fn compute_ppl_gemma4(
         scored_tokens: count,
         windows,
     })
+}
+
+/// Returns the set of corpus-target indices scored by `compute_ppl_gemma4` for a
+/// corpus of `n_tokens` tokens with the given window parameters.
+///
+/// Each entry is a corpus position `c` such that the scorer evaluated the NLL
+/// of `tokens[c]` (predicted by logits at the previous BOS-window slot).
+///
+/// This is pure index arithmetic — no model, no GPU, no `Array`.  It mirrors
+/// the `start` / `content_len` / `win_len` / `warmup` logic in
+/// `compute_ppl_gemma4` exactly and serves as the single source of truth for
+/// the windowing-coverage unit test.
+#[cfg(test)]
+pub(crate) fn gemma4_scored_indices(
+    n_tokens: usize,
+    ctx_window: usize,
+    stride: usize,
+) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut start: usize = 0;
+    let mut first = true;
+    while start < n_tokens {
+        let available = n_tokens - start;
+        let content_len = available.min(ctx_window - 1);
+        if content_len == 0 {
+            break;
+        }
+        let win_len = 1 + content_len; // BOS + content_len corpus tokens
+
+        let warmup = if first {
+            0
+        } else {
+            ctx_window
+                .saturating_sub(stride)
+                .saturating_sub(1)
+                .min(win_len - 1)
+        };
+
+        // Scored positions t in [warmup .. win_len-1): corpus index = start + t.
+        for t in warmup..(win_len - 1) {
+            out.push(start + t);
+        }
+
+        if content_len < ctx_window - 1 {
+            break; // last (partial) window
+        }
+        start += stride;
+        first = false;
+    }
+    out
 }
 
 /// Numerically-stable `-log_softmax(row)[idx]` over a vocab row.
