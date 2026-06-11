@@ -5,10 +5,11 @@ use std::path::Path;
 
 use rmlx_core::error::{Error, Result};
 use rmlx_loader::{load_config, load_shard_index, ShardSet};
-use rmlx_mlx::{zeros, Array, Device, Dtype};
+use rmlx_mlx::{zeros, Device, Dtype};
 use tracing::{debug, info, warn};
 
 use crate::layers::{resolve_quant, QuantParams};
+use crate::load_util::Weights;
 
 use super::attention::Attention;
 use super::config::{LagunaConfig, MlpKind};
@@ -53,41 +54,21 @@ pub fn load_from_path(model_dir: &Path) -> Result<LagunaText> {
     );
 
     let idx = load_shard_index(model_dir)?;
+    // Laguna ships an honest mxfp8 index → index-first fetch with header-scan
+    // fallback via the shared `Weights` helper. (`ShardSet::open`, not
+    // `open_dir`, since the index is trustworthy.)
     let shards = ShardSet::open(model_dir, &idx)?;
-
-    let load_array = |name: &str| -> Result<Array> {
-        for (_, handle) in shards.iter() {
-            let st = handle.safetensors()?;
-            if let Ok(t) = st.tensor(name) {
-                let tv = rmlx_loader::TensorView {
-                    name,
-                    dtype: t.dtype(),
-                    shape: t.shape().to_vec(),
-                    bytes: t.data(),
-                };
-                return Array::from_safetensor_view(&tv);
-            }
-        }
-        Err(Error::Loader(format!(
-            "tensor '{name}' not found in any shard"
-        )))
-    };
-
-    let has_tensor = |name: &str| -> bool {
-        shards
-            .iter()
-            .any(|(_, h)| h.safetensors().is_ok_and(|st| st.tensor(name).is_ok()))
-    };
+    let w = Weights::new(&shards, &idx);
 
     let defaults = QuantParams::global(cfg.quant_group_size, cfg.quant_bits, &cfg.quant_mode);
 
     let load_linear = |base: &str| -> Result<Linear> {
-        let w = load_array(&format!("{base}.weight"))?;
+        let weight = w.array(&format!("{base}.weight"))?;
         let s_name = format!("{base}.scales");
-        if has_tensor(&s_name) {
-            let s = load_array(&s_name)?;
-            let biases = if has_tensor(&format!("{base}.biases")) {
-                Some(load_array(&format!("{base}.biases"))?)
+        if w.has(&s_name)? {
+            let scales = w.array(&s_name)?;
+            let biases = if w.has(&format!("{base}.biases"))? {
+                Some(w.array(&format!("{base}.biases"))?)
             } else {
                 None
             };
@@ -96,21 +77,21 @@ pub fn load_from_path(model_dir: &Path) -> Result<LagunaText> {
             // global mode (MLX rejects "default"; affine biases require "affine").
             let qp = resolve_quant(base, biases.is_some(), &defaults, &cfg.quant_overrides)?;
             Ok(Linear::Quantized {
-                weight: w,
-                scales: s,
+                weight,
+                scales,
                 biases,
                 group_size: qp.group_size,
                 bits: qp.bits,
                 mode: qp.mode,
             })
         } else {
-            Ok(Linear::Plain { weight: w })
+            Ok(Linear::Plain { weight })
         }
     };
 
     let load_rms = |name: &str| -> Result<RmsNorm> {
         Ok(RmsNorm {
-            weight: load_array(&format!("{name}.weight"))?,
+            weight: w.array(&format!("{name}.weight"))?,
             eps: cfg.rms_norm_eps,
         })
     };
@@ -120,18 +101,18 @@ pub fn load_from_path(model_dir: &Path) -> Result<LagunaText> {
     // Embedding.
     let embed_tokens = {
         let base = format!("{pfx}.embed_tokens");
-        if has_tensor(&format!("{base}.scales")) {
-            let w = load_array(&format!("{base}.weight"))?;
-            let s = load_array(&format!("{base}.scales"))?;
-            let biases = if has_tensor(&format!("{base}.biases")) {
-                Some(load_array(&format!("{base}.biases"))?)
+        if w.has(&format!("{base}.scales"))? {
+            let weight = w.array(&format!("{base}.weight"))?;
+            let scales = w.array(&format!("{base}.scales"))?;
+            let biases = if w.has(&format!("{base}.biases"))? {
+                Some(w.array(&format!("{base}.biases"))?)
             } else {
                 None
             };
             let qp = resolve_quant(&base, biases.is_some(), &defaults, &cfg.quant_overrides)?;
             Embedding::Quantized {
-                weight: w,
-                scales: s,
+                weight,
+                scales,
                 biases,
                 group_size: qp.group_size,
                 bits: qp.bits,
@@ -139,7 +120,7 @@ pub fn load_from_path(model_dir: &Path) -> Result<LagunaText> {
             }
         } else {
             Embedding::Plain {
-                weight: load_array(&format!("{base}.weight"))?,
+                weight: w.array(&format!("{base}.weight"))?,
             }
         }
     };
@@ -150,7 +131,7 @@ pub fn load_from_path(model_dir: &Path) -> Result<LagunaText> {
         info!("Laguna: tie_word_embeddings=true, using embed_tokens as lm_head");
         None
     } else {
-        let base = if has_tensor("lm_head.weight") {
+        let base = if w.has("lm_head.weight")? {
             "lm_head"
         } else {
             "model.lm_head"
@@ -205,8 +186,8 @@ pub fn load_from_path(model_dir: &Path) -> Result<LagunaText> {
                 let router_proj = load_linear(&gate_base)?;
 
                 let bias_name = format!("{m}.gate.e_score_correction_bias");
-                let e_score_bias = if has_tensor(&bias_name) {
-                    load_array(&bias_name)?
+                let e_score_bias = if w.has(&bias_name)? {
+                    w.array(&bias_name)?
                 } else {
                     warn!(
                         layer = i,
