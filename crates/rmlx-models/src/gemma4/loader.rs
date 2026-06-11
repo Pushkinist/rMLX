@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use rmlx_core::error::{Error, Result};
-use rmlx_loader::{load_config, load_shard_index, view, ShardSet};
+use rmlx_loader::{load_config, load_shard_index, ShardSet};
 use rmlx_mlx::{argmax, max_axis, Array, Device, Dtype};
 use tracing::{debug, info, warn};
 
@@ -117,13 +117,15 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma4Text> {
 
     let idx = load_shard_index(model_dir)?;
     let shards = ShardSet::open(model_dir, &idx)?;
+    // gemma4 ships an honest index → index-first `array`/`has` hit `Found`
+    // and `has` header-truth, with no header-scan degradation on this snapshot.
+    let w = Weights::new(&shards, &idx);
 
-    // Helper closures to load tensors.
-    let load_plain = |name: &str| -> Result<Array> {
-        let tv =
-            view(&shards, &idx, name).map_err(|e| Error::Loader(format!("load {name}: {e}")))?;
-        Array::from_safetensor_view(&tv).map_err(classify_load_oom)
-    };
+    // Helper closures to load tensors. `classify_load_oom` is preserved on
+    // every fetch that carried it before: `w.array` returns the unwrapped
+    // `Array::from_safetensor_view` Result, so `.map_err(classify_load_oom)`
+    // re-classifies the identical load-phase OOM the old `view` path did.
+    let load_plain = |name: &str| -> Result<Array> { w.array(name).map_err(classify_load_oom) };
 
     // Resolve quant params for a tensor via the shared resolver: check
     // per-tensor overrides, fall back to global, and let the `.biases` sibling
@@ -135,24 +137,18 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma4Text> {
         let w_name = format!("{base}.weight");
         let s_name = format!("{base}.scales");
         let b_name = format!("{base}.biases");
-        let wv = view(&shards, &idx, &w_name)
-            .map_err(|e| Error::Loader(format!("load {w_name}: {e}")))?;
-        let sv = view(&shards, &idx, &s_name)
-            .map_err(|e| Error::Loader(format!("load {s_name}: {e}")))?;
-        let w = Array::from_safetensor_view(&wv).map_err(classify_load_oom)?;
-        let s = Array::from_safetensor_view(&sv).map_err(classify_load_oom)?;
-        let has_biases = idx.weight_map.contains_key(&b_name);
+        let weight = w.array(&w_name).map_err(classify_load_oom)?;
+        let scales = w.array(&s_name).map_err(classify_load_oom)?;
+        let has_biases = w.has(&b_name)?;
         let biases = if has_biases {
-            let bv = view(&shards, &idx, &b_name)
-                .map_err(|e| Error::Loader(format!("load {b_name}: {e}")))?;
-            Some(Array::from_safetensor_view(&bv).map_err(classify_load_oom)?)
+            Some(w.array(&b_name).map_err(classify_load_oom)?)
         } else {
             None
         };
         let qp = resolve_quant(base, has_biases, &defaults, &cfg.quant_overrides)?;
         Ok(Linear::Quantized {
-            weight: w,
-            scales: s,
+            weight,
+            scales,
             biases,
             group_size: qp.group_size,
             bits: qp.bits,
@@ -184,24 +180,20 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma4Text> {
         let w_name = format!("{pfx}.embed_tokens.weight");
         let s_name = format!("{pfx}.embed_tokens.scales");
         // Try quantized first (mxfp8 snapshot has .scales).
-        if idx.weight_map.contains_key(&s_name) {
-            let wv = view(&shards, &idx, &w_name)
-                .map_err(|e| Error::Loader(format!("load {w_name}: {e}")))?;
-            let sv = view(&shards, &idx, &s_name)
-                .map_err(|e| Error::Loader(format!("load {s_name}: {e}")))?;
-            let w = Array::from_safetensor_view(&wv)?;
-            let s = Array::from_safetensor_view(&sv)?;
+        if w.has(&s_name)? {
+            let weight = w.array(&w_name)?;
+            let scales = w.array(&s_name)?;
             Embedding::Quantized {
-                weight: w,
-                scales: s,
+                weight,
+                scales,
                 biases: None,
                 group_size: cfg.quant_group_size,
                 bits: cfg.quant_bits,
                 mode: global_mode,
             }
         } else {
-            let w = load_plain(&w_name)?;
-            Embedding::Plain { weight: w }
+            let weight = load_plain(&w_name)?;
+            Embedding::Plain { weight }
         }
     };
 
@@ -209,24 +201,20 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma4Text> {
     let embed_tokens_per_layer = if cfg.hidden_size_per_layer_input > 0 {
         let w_name = format!("{pfx}.embed_tokens_per_layer.weight");
         let s_name = format!("{pfx}.embed_tokens_per_layer.scales");
-        if idx.weight_map.contains_key(&s_name) {
-            let wv = view(&shards, &idx, &w_name)
-                .map_err(|e| Error::Loader(format!("load {w_name}: {e}")))?;
-            let sv = view(&shards, &idx, &s_name)
-                .map_err(|e| Error::Loader(format!("load {s_name}: {e}")))?;
-            let w = Array::from_safetensor_view(&wv)?;
-            let s = Array::from_safetensor_view(&sv)?;
+        if w.has(&s_name)? {
+            let weight = w.array(&w_name)?;
+            let scales = w.array(&s_name)?;
             Some(Embedding::Quantized {
-                weight: w,
-                scales: s,
+                weight,
+                scales,
                 biases: None,
                 group_size: cfg.quant_group_size,
                 bits: cfg.quant_bits,
                 mode: global_mode,
             })
         } else {
-            let w = load_plain(&w_name)?;
-            Some(Embedding::Plain { weight: w })
+            let weight = load_plain(&w_name)?;
+            Some(Embedding::Plain { weight })
         }
     } else {
         None
@@ -237,11 +225,11 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma4Text> {
         let base = format!("{pfx}.per_layer_model_projection");
         // This tensor may be plain BF16 (no .scales in this snapshot).
         let w_name = format!("{base}.weight");
-        if idx.weight_map.contains_key(&format!("{base}.scales")) {
+        if w.has(&format!("{base}.scales"))? {
             Some(load_quant(&base)?)
         } else {
-            let w = load_plain(&w_name)?;
-            Some(Linear::Plain { weight: w })
+            let weight = load_plain(&w_name)?;
+            Some(Linear::Plain { weight })
         }
     } else {
         None
@@ -308,7 +296,7 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma4Text> {
         let use_k_eq_v = cfg.attention_k_eq_v && lt == LayerType::FullAttention;
         let v_proj = if has_kv {
             let v_key = format!("{base}.self_attn.v_proj");
-            if use_k_eq_v && !idx.weight_map.contains_key(&format!("{v_key}.weight")) {
+            if use_k_eq_v && !w.has(&format!("{v_key}.weight"))? {
                 // v_proj is absent — reuse k_proj (mlx-c arrays are ref-counted, cheap clone).
                 debug!(
                     layer = i,
@@ -380,7 +368,7 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma4Text> {
 
         // layer_scalar: shape [1], dtype BF16 or F32.
         let layer_scalar_name = format!("{base}.layer_scalar");
-        let layer_scalar = if idx.weight_map.contains_key(&layer_scalar_name) {
+        let layer_scalar = if w.has(&layer_scalar_name)? {
             Some(load_plain(&layer_scalar_name)?)
         } else {
             None
