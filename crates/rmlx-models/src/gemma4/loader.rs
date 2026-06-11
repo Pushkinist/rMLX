@@ -130,7 +130,6 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma4Text> {
     // Resolve quant params for a tensor via the shared resolver: check
     // per-tensor overrides, fall back to global, and let the `.biases` sibling
     // govern the affine rule (hard-erroring on an affine-vs-non-affine clash).
-    let global_mode = QuantMode::from(cfg.quant_mode.as_str());
     let defaults = QuantParams::global(cfg.quant_group_size, cfg.quant_bits, &cfg.quant_mode);
 
     let load_quant = |base: &str| -> Result<Linear> {
@@ -138,6 +137,10 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma4Text> {
         let s_name = format!("{base}.scales");
         let b_name = format!("{base}.biases");
         let weight = w.array(&w_name).map_err(classify_load_oom)?;
+        // bf16 snapshots have no .scales — fall back to Plain.
+        if !w.has(&s_name)? {
+            return Ok(Linear::Plain { weight });
+        }
         let scales = w.array(&s_name).map_err(classify_load_oom)?;
         let has_biases = w.has(&b_name)?;
         let biases = if has_biases {
@@ -179,17 +182,30 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma4Text> {
     let embed_tokens = {
         let w_name = format!("{pfx}.embed_tokens.weight");
         let s_name = format!("{pfx}.embed_tokens.scales");
-        // Try quantized first (mxfp8 snapshot has .scales).
+        let b_name = format!("{pfx}.embed_tokens.biases");
+        // Try quantized first (mxfp8 snapshot has .scales; affine-4bit has .scales + .biases).
         if w.has(&s_name)? {
-            let weight = w.array(&w_name)?;
-            let scales = w.array(&s_name)?;
+            let weight = w.array(&w_name).map_err(classify_load_oom)?;
+            let scales = w.array(&s_name).map_err(classify_load_oom)?;
+            let has_biases = w.has(&b_name)?;
+            let biases = if has_biases {
+                Some(w.array(&b_name).map_err(classify_load_oom)?)
+            } else {
+                None
+            };
+            let qp = resolve_quant(
+                &format!("{pfx}.embed_tokens"),
+                has_biases,
+                &defaults,
+                &cfg.quant_overrides,
+            )?;
             Embedding::Quantized {
                 weight,
                 scales,
-                biases: None,
-                group_size: cfg.quant_group_size,
-                bits: cfg.quant_bits,
-                mode: global_mode,
+                biases,
+                group_size: qp.group_size,
+                bits: qp.bits,
+                mode: QuantMode::from(qp.mode.as_str()),
             }
         } else {
             let weight = load_plain(&w_name)?;
@@ -201,16 +217,29 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma4Text> {
     let embed_tokens_per_layer = if cfg.hidden_size_per_layer_input > 0 {
         let w_name = format!("{pfx}.embed_tokens_per_layer.weight");
         let s_name = format!("{pfx}.embed_tokens_per_layer.scales");
+        let b_name = format!("{pfx}.embed_tokens_per_layer.biases");
         if w.has(&s_name)? {
-            let weight = w.array(&w_name)?;
-            let scales = w.array(&s_name)?;
+            let weight = w.array(&w_name).map_err(classify_load_oom)?;
+            let scales = w.array(&s_name).map_err(classify_load_oom)?;
+            let has_biases = w.has(&b_name)?;
+            let biases = if has_biases {
+                Some(w.array(&b_name).map_err(classify_load_oom)?)
+            } else {
+                None
+            };
+            let qp = resolve_quant(
+                &format!("{pfx}.embed_tokens_per_layer"),
+                has_biases,
+                &defaults,
+                &cfg.quant_overrides,
+            )?;
             Some(Embedding::Quantized {
                 weight,
                 scales,
-                biases: None,
-                group_size: cfg.quant_group_size,
-                bits: cfg.quant_bits,
-                mode: global_mode,
+                biases,
+                group_size: qp.group_size,
+                bits: qp.bits,
+                mode: QuantMode::from(qp.mode.as_str()),
             })
         } else {
             let weight = load_plain(&w_name)?;
