@@ -590,7 +590,9 @@ impl KvCacheBuilder {
             // Gemma3 (medgemma) — planar wins on TPS, sim divergence is chat-template not kernel.
             "Gemma3ForConditionalGeneration" => KvQuant::Planar,
             // Gemma4 family: dispatch by MoE flag + hidden_size + paroquant.
-            "Gemma4ForConditionalGeneration" => {
+            // Gemma4UnifiedForConditionalGeneration (12B) uses the same text-decoder
+            // path; hidden_size=3840 falls in the (2560, 5376) range → K8V8 fallback.
+            "Gemma4ForConditionalGeneration" | "Gemma4UnifiedForConditionalGeneration" => {
                 if signals.has_moe {
                     // Gemma4 MoE (26B): k8v8 ties planar on TPS, prefer the universally-validated path.
                     KvQuant::K8V8
