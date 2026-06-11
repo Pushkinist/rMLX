@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashSet;
 
 /// DoD #4 -- five-token toy prompt + hand-rolled logits against an
 /// analytic log-softmax. The full PPL helper is integration-tested in
@@ -51,6 +52,106 @@ fn single_element_row_yields_zero_nll() {
     // log_softmax([x])[0] == 0 -> NLL == 0.
     let nll = neg_log_softmax_at(&[1.0f32], 0);
     assert!(nll.abs() < 1e-6, "nll={nll}");
+}
+
+/// Windowing-coverage: for representative `(n_tokens, ctx_window, stride)`
+/// triples, verify the index arithmetic of `compute_ppl_gemma4` via
+/// `gemma4_scored_indices`.
+///
+/// Two guarantees are tested:
+///
+/// **Overlap cases (`stride < ctx_window`):** every corpus position `0 ..
+/// n_tokens` is scored EXACTLY ONCE.  In the BOS-prefixed scheme, position
+/// `t` in a window predicts `bos_window[t+1] = tokens[start + t]`.  With any
+/// overlap, the `warmup` skip removes the already-scored prefix, so the union
+/// of scored indices across windows covers `{0, …, n_tokens-1}` without
+/// duplicates.  This is the class of configs the MEDIUM warmup fix targets:
+/// without the `saturating_sub(1)`, stride=1 windows after the first score
+/// zero tokens (catastrophic under-coverage).
+///
+/// **Non-overlap case (`stride = ctx_window`):** there are structural gaps
+/// — the last content slot of each full window (`start + ctx_window - 2`) is
+/// followed by a jump, leaving `start + ctx_window - 1` un-covered.  Only
+/// no-duplicate is asserted here.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test assertions: panicking on unexpected values is intentional"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: freq is sized to n_tokens, idx is asserted < n_tokens before indexing"
+)]
+fn gemma4_windowing_coverage() {
+    // --- overlap cases: stride < ctx_window; expect full coverage ---
+    let overlap_cases: &[(usize, usize, usize)] = &[
+        // stride = 1: most overlap-heavy, exercises the fixed warmup path
+        (10, 4, 1),
+        (20, 8, 1),
+        // stride = ctx_window / 2
+        (20, 8, 4),
+        (100, 16, 8),
+        // n_tokens not a multiple of stride
+        (25, 8, 5),
+        (17, 6, 4),
+        // minimal sizes
+        (2, 2, 1),
+        (3, 2, 1),
+    ];
+
+    for &(n_tokens, ctx_window, stride) in overlap_cases {
+        let scored = gemma4_scored_indices(n_tokens, ctx_window, stride);
+
+        let mut freq = vec![0usize; n_tokens];
+        for &idx in &scored {
+            assert!(
+                idx < n_tokens,
+                "n={n_tokens} w={ctx_window} s={stride}: scored index {idx} out of range"
+            );
+            freq[idx] += 1;
+        }
+
+        for (pos, &f) in freq.iter().enumerate() {
+            assert_eq!(
+                f, 1,
+                "n={n_tokens} w={ctx_window} s={stride}: corpus pos {pos} scored {f} times (expected 1)"
+            );
+        }
+
+        // Duplicate cross-check.
+        let unique: HashSet<usize> = scored.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            scored.len(),
+            "n={n_tokens} w={ctx_window} s={stride}: scored list contains duplicates"
+        );
+    }
+
+    // --- non-overlap cases: stride = ctx_window; expect no duplicates only ---
+    // Structural gap: the last content slot of each full window is not predicted
+    // (it would need position ctx_window-1 in the window but the loop stops at
+    // win_len-2 = ctx_window-2).
+    let nonoverlap_cases: &[(usize, usize, usize)] = &[(20, 8, 8), (100, 16, 16)];
+
+    for &(n_tokens, ctx_window, stride) in nonoverlap_cases {
+        let scored = gemma4_scored_indices(n_tokens, ctx_window, stride);
+
+        // All returned indices must be in-range.
+        for &idx in &scored {
+            assert!(
+                idx < n_tokens,
+                "n={n_tokens} w={ctx_window} s={stride}: scored index {idx} out of range"
+            );
+        }
+
+        // No duplicates.
+        let unique: HashSet<usize> = scored.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            scored.len(),
+            "n={n_tokens} w={ctx_window} s={stride}: scored list contains duplicates"
+        );
+    }
 }
 
 /// DoD #3 — verify the `PplError::ArchUnsupported` message text.
