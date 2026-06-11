@@ -83,6 +83,7 @@ A converting or new architecture supplies only:
 | `Qwen3VLMoeForConditionalGeneration` | `Architecture::Qwen3VlMoe` | text + image | `bf16` | config | green |
 | `Gemma3ForConditionalGeneration` | `Architecture::Gemma3` | text + image | `Planar` | `KV_MAX_SEQ_DEFAULT` | green |
 | `Gemma4ForConditionalGeneration` | `Architecture::Gemma4` | text + image + audio | `K8V8` / `Planar` / `K8V4` | config | green |
+| `Gemma4UnifiedForConditionalGeneration` | `Architecture::Gemma4` (alias) | text (12B; vision/audio not yet) | `K8V8` | config | green |
 | `LagunaForCausalLM` | `Architecture::Laguna` | text | `K8V8` | `KV_MAX_SEQ_DEFAULT` | green |
 | `BitNetForCausalLM` | `Architecture::BitNet` | text | `K8V8` | 4 096 | green |
 | `JinaEmbeddingsV4Model` | (encoder — no enum variant) | text + image | n/a | 128 000 | green |
@@ -639,6 +640,14 @@ audio fields under `audio_config`.
 | `gemma-4-e4b-it-mxfp8` | 2560 | 42 | no | yes (18 layers) | yes |
 | `gemma-4-26b-a4b-it-mxfp8` | ~5376 | large | yes | yes | yes |
 | `gemma-4-31b-it-mxfp8` | ~5376 | large | no | yes | yes |
+| `gemma-4-12B-it-*` (Unified) | 3840 | 48 | no | yes (`k_eq_v`) | yes |
+
+The 12B snapshots declare `architectures[0] = "Gemma4UnifiedForConditionalGeneration"`
+— an encoder-free multimodal variant whose **text** decoder is identical to
+Gemma4 (dense, `attention_k_eq_v`, no per-layer-input, no MoE). rMLX aliases the
+arch string to the Gemma4 text loader; the multimodal-embedder tensors
+(`embed_vision`/`embed_audio`/`vision_embedder.*`) are not read, so image/audio
+input is not yet wired for 12B (text serves end-to-end).
 
 ### Key structural properties
 

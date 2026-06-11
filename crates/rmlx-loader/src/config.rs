@@ -163,6 +163,7 @@ impl ModelConfig {
                 | "Gemma3ForConditionalGeneration"
                 | "Gemma4ForCausalLM"
                 | "Gemma4ForConditionalGeneration"
+                | "Gemma4UnifiedForConditionalGeneration"
         );
 
         // 1. Gemma3/Gemma4: global_head_dim (FA) — lives in text_config.extras.

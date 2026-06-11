@@ -10,6 +10,10 @@
 /// for that early check.
 pub const KNOWN_ARCHS: &[&str] = &[
     "Gemma4ForConditionalGeneration",
+    // 12B unified variant — text decoder is identical to Gemma4ForConditionalGeneration;
+    // extra multimodal-embedder tensors (embed_vision, embed_audio, vision_embedder.*)
+    // are not read by the text loader and are inert. Text only; vision/audio out of scope.
+    "Gemma4UnifiedForConditionalGeneration",
     "Gemma3ForConditionalGeneration",
     "Qwen2ForCausalLM",
     "Qwen3ForCausalLM",
