@@ -20,41 +20,18 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use rmlx_core::error::{Error, Result};
-use rmlx_loader::{load_config, ShardHandle};
+use rmlx_loader::{load_config, ShardSet};
 use rmlx_mlx::Array;
 use tracing::info;
 
 use crate::layers::RmsNorm;
+use crate::load_util::Weights;
 
 use super::attention::Attention;
 use super::config::Qwen3VlMoeConfig;
 use super::layers::{Embedding, Linear};
 use super::model::{DecoderLayer, MlpBlock, Qwen3VlMoeText};
 use super::moe::{SparseMoeBlock, SwitchMlp};
-
-/// Open every `model*.safetensors` file in `model_dir` (ignores the stale
-/// index). Returns the handles; tensor lookup scans them in order.
-fn open_shards(model_dir: &Path) -> Result<Vec<ShardHandle>> {
-    let mut files: Vec<String> = std::fs::read_dir(model_dir)
-        .map_err(|e| Error::Loader(format!("cannot read dir {}: {e}", model_dir.display())))?
-        .filter_map(std::result::Result::ok)
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|n| n.starts_with("model") && n.ends_with(".safetensors"))
-        .collect();
-    files.sort();
-    if files.is_empty() {
-        return Err(Error::Loader(format!(
-            "qwen3_vl_moe: no model*.safetensors found in {}",
-            model_dir.display()
-        )));
-    }
-    let mut handles = Vec::with_capacity(files.len());
-    for f in &files {
-        handles.push(ShardHandle::open(model_dir, f)?);
-    }
-    info!(shards = handles.len(), "qwen3_vl_moe: opened weight shards");
-    Ok(handles)
-}
 
 /// Load the full `Qwen3VlMoeConfig` from `config.json`.
 pub fn load_config_qwen3_vl(model_dir: &Path) -> Result<Qwen3VlMoeConfig> {
@@ -132,48 +109,28 @@ pub fn load_text_from_path(model_dir: &Path) -> Result<Qwen3VlMoeText> {
         "qwen3_vl_moe: loading text decoder"
     );
 
-    let shards = open_shards(model_dir)?;
-
-    let load_array = |name: &str| -> Result<Array> {
-        for h in &shards {
-            let st = h.safetensors()?;
-            if let Ok(t) = st.tensor(name) {
-                let tv = rmlx_loader::TensorView {
-                    name,
-                    dtype: t.dtype(),
-                    shape: t.shape().to_vec(),
-                    bytes: t.data(),
-                };
-                return Array::from_safetensor_view(&tv);
-            }
-        }
-        Err(Error::Loader(format!(
-            "qwen3_vl_moe: tensor '{name}' not found in any shard"
-        )))
-    };
-
-    let has_tensor = |name: &str| -> bool {
-        shards
-            .iter()
-            .any(|h| h.safetensors().is_ok_and(|st| st.tensor(name).is_ok()))
-    };
+    // Open every `*.safetensors` shard by directory glob (ignoring the stale
+    // index) and fetch tensors via a pure header scan — exactly matching the
+    // prior `open_shards` + per-shard lookup behaviour.
+    let shards = ShardSet::open_dir(model_dir)?;
+    let w = Weights::scan_only(&shards);
 
     // Per-layer quant params. Default = global (4-bit). `mlp.gate` routers are
     // 8-bit (upstream quant_predicate). We read group_size/bits from the actual
     // scales shape rather than hard-coding, so any cell stays correct.
     let load_linear = |base: &str| -> Result<Linear> {
-        let w = load_array(&format!("{base}.weight"))?;
+        let weight = w.array(&format!("{base}.weight"))?;
         let s_name = format!("{base}.scales");
-        if has_tensor(&s_name) {
-            let s = load_array(&s_name)?;
-            let biases = if has_tensor(&format!("{base}.biases")) {
-                Some(load_array(&format!("{base}.biases"))?)
+        if w.has(&s_name)? {
+            let s = w.array(&s_name)?;
+            let biases = if w.has(&format!("{base}.biases"))? {
+                Some(w.array(&format!("{base}.biases"))?)
             } else {
                 None
             };
-            let (group_size, bits) = infer_quant(&w, &s)?;
+            let (group_size, bits) = infer_quant(&weight, &s)?;
             Ok(Linear::Quantized {
-                weight: w,
+                weight,
                 scales: s,
                 biases,
                 group_size,
@@ -181,13 +138,13 @@ pub fn load_text_from_path(model_dir: &Path) -> Result<Qwen3VlMoeText> {
                 mode: tc.quant_mode.clone(),
             })
         } else {
-            Ok(Linear::Plain { weight: w })
+            Ok(Linear::Plain { weight })
         }
     };
 
     let load_rms = |name: &str| -> Result<RmsNorm> {
         Ok(RmsNorm {
-            weight: Some(load_array(&format!("{name}.weight"))?),
+            weight: Some(w.array(&format!("{name}.weight"))?),
             eps: tc.rms_norm_eps,
         })
     };
@@ -196,17 +153,17 @@ pub fn load_text_from_path(model_dir: &Path) -> Result<Qwen3VlMoeText> {
 
     let embed_tokens = {
         let base = format!("{pfx}.embed_tokens");
-        if has_tensor(&format!("{base}.scales")) {
-            let w = load_array(&format!("{base}.weight"))?;
-            let s = load_array(&format!("{base}.scales"))?;
-            let biases = if has_tensor(&format!("{base}.biases")) {
-                Some(load_array(&format!("{base}.biases"))?)
+        if w.has(&format!("{base}.scales"))? {
+            let weight = w.array(&format!("{base}.weight"))?;
+            let s = w.array(&format!("{base}.scales"))?;
+            let biases = if w.has(&format!("{base}.biases"))? {
+                Some(w.array(&format!("{base}.biases"))?)
             } else {
                 None
             };
-            let (group_size, bits) = infer_quant(&w, &s)?;
+            let (group_size, bits) = infer_quant(&weight, &s)?;
             Embedding::Quantized {
-                weight: w,
+                weight,
                 scales: s,
                 biases,
                 group_size,
@@ -215,7 +172,7 @@ pub fn load_text_from_path(model_dir: &Path) -> Result<Qwen3VlMoeText> {
             }
         } else {
             Embedding::Plain {
-                weight: load_array(&format!("{base}.weight"))?,
+                weight: w.array(&format!("{base}.weight"))?,
             }
         }
     };
@@ -227,11 +184,13 @@ pub fn load_text_from_path(model_dir: &Path) -> Result<Qwen3VlMoeText> {
         None
     } else {
         let candidates = ["language_model.lm_head", "lm_head"];
-        let base = candidates
-            .iter()
-            .find(|b| has_tensor(&format!("{b}.weight")))
-            .copied()
-            .unwrap_or("language_model.lm_head");
+        let mut base = "language_model.lm_head";
+        for b in candidates {
+            if w.has(&format!("{b}.weight"))? {
+                base = b;
+                break;
+            }
+        }
         info!(%base, "qwen3_vl_moe: loading lm_head");
         Some(load_linear(base)?)
     };
