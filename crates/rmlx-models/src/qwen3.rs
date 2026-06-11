@@ -2281,28 +2281,33 @@ pub fn load_from_path(model_dir: &Path, yarn_override: Option<&YarnOverride>) ->
     let defaults = QuantParams::global(cfg.quant_group_size, cfg.quant_bits, &cfg.quant_mode);
     let overrides = std::collections::HashMap::new();
 
-    let load_quant = |base: &str| -> Result<Linear> {
-        let weight = w.array(&format!("{base}.weight"))?;
-        let s_name = format!("{base}.scales");
-        if w.has(&s_name)? {
-            let scales = w.array(&s_name)?;
-            let biases = if w.has(&format!("{base}.biases"))? {
-                Some(w.array(&format!("{base}.biases"))?)
-            } else {
-                None
-            };
-            // The shared resolver owns the `.biases`-sibling affine rule.
-            let qp = resolve_quant(base, biases.is_some(), &defaults, &overrides)?;
-            Ok(Linear::Quantized {
+    // Thin adapter: calls the shared seam, then converts the shared
+    // `crate::layers::Linear` (mode: QuantMode) to the arch-local
+    // `Linear` (mode: String). OOM classification is inside `w.linear`
+    // — no `.map_err` needed here. `Paro` is unreachable from `w.linear`
+    // (it only builds Plain/Quantized) but the match is exhaustive.
+    let lin = |base: &str| -> Result<Linear> {
+        use crate::layers::Linear as SharedLinear;
+        match w.linear(base, |hb| resolve_quant(base, hb, &defaults, &overrides))? {
+            SharedLinear::Plain { weight } => Ok(Linear::Plain { weight }),
+            SharedLinear::Quantized {
                 weight,
                 scales,
                 biases,
-                group_size: qp.group_size,
-                bits: qp.bits,
-                mode: qp.mode,
-            })
-        } else {
-            Ok(Linear::Plain { weight })
+                group_size,
+                bits,
+                mode,
+            } => Ok(Linear::Quantized {
+                weight,
+                scales,
+                biases,
+                group_size,
+                bits,
+                mode: mode.as_str().to_owned(),
+            }),
+            SharedLinear::Paro { .. } => Err(Error::Loader(format!(
+                "{base}: unexpected Paro variant from w.linear"
+            ))),
         }
     };
 
@@ -2315,30 +2320,28 @@ pub fn load_from_path(model_dir: &Path, yarn_override: Option<&YarnOverride>) ->
 
     let pfx = "model";
 
-    // Embedding table.
+    // Embedding table. Thin adapter mirrors `lin`: converts shared Embedding
+    // (mode: QuantMode) to the arch-local Embedding (mode: String).
     let embed_tokens = {
+        use crate::layers::Embedding as SharedEmbedding;
         let base = format!("{pfx}.embed_tokens");
-        if w.has(&format!("{base}.scales"))? {
-            let weight = w.array(&format!("{base}.weight"))?;
-            let scales = w.array(&format!("{base}.scales"))?;
-            let biases = if w.has(&format!("{base}.biases"))? {
-                Some(w.array(&format!("{base}.biases"))?)
-            } else {
-                None
-            };
-            let qp = resolve_quant(&base, biases.is_some(), &defaults, &overrides)?;
-            Embedding::Quantized {
+        match w.embedding(&base, |hb| resolve_quant(&base, hb, &defaults, &overrides))? {
+            SharedEmbedding::Plain { weight } => Embedding::Plain { weight },
+            SharedEmbedding::Quantized {
                 weight,
                 scales,
                 biases,
-                group_size: qp.group_size,
-                bits: qp.bits,
-                mode: qp.mode,
-            }
-        } else {
-            Embedding::Plain {
-                weight: w.array(&format!("{base}.weight"))?,
-            }
+                group_size,
+                bits,
+                mode,
+            } => Embedding::Quantized {
+                weight,
+                scales,
+                biases,
+                group_size,
+                bits,
+                mode: mode.as_str().to_owned(),
+            },
         }
     };
 
@@ -2356,28 +2359,8 @@ pub fn load_from_path(model_dir: &Path, yarn_override: Option<&YarnOverride>) ->
             "model.lm_head"
         };
         info!(%base, "Qwen3: loading separate lm_head");
-        if w.has(&format!("{base}.scales"))? {
-            let weight = w.array(&format!("{base}.weight"))?;
-            let scales = w.array(&format!("{base}.scales"))?;
-            let biases = if w.has(&format!("{base}.biases"))? {
-                Some(w.array(&format!("{base}.biases"))?)
-            } else {
-                None
-            };
-            let qp = resolve_quant(base, biases.is_some(), &defaults, &overrides)?;
-            Some(Linear::Quantized {
-                weight,
-                scales,
-                biases,
-                group_size: qp.group_size,
-                bits: qp.bits,
-                mode: qp.mode,
-            })
-        } else {
-            Some(Linear::Plain {
-                weight: w.array(&format!("{base}.weight"))?,
-            })
-        }
+        // `lin` falls through to `Linear::Plain` when no `.scales` sibling is present.
+        Some(lin(base)?)
     };
 
     // Decoder layers.
@@ -2410,9 +2393,9 @@ pub fn load_from_path(model_dir: &Path, yarn_override: Option<&YarnOverride>) ->
         let q_norm = load_rms(&format!("{a}.q_norm"))?;
         let k_norm = load_rms(&format!("{a}.k_norm"))?;
 
-        let q_proj = load_quant(&format!("{a}.q_proj"))?;
-        let k_proj = load_quant(&format!("{a}.k_proj"))?;
-        let v_proj = load_quant(&format!("{a}.v_proj"))?;
+        let q_proj = lin(&format!("{a}.q_proj"))?;
+        let k_proj = lin(&format!("{a}.k_proj"))?;
+        let v_proj = lin(&format!("{a}.v_proj"))?;
 
         // L33: attempt to fuse Q+K+V into a single stacked weight at load time.
         // FusedQkvProjection::try_from_separate returns None for plain weights;
@@ -2433,7 +2416,7 @@ pub fn load_from_path(model_dir: &Path, yarn_override: Option<&YarnOverride>) ->
             q_proj,
             k_proj,
             v_proj,
-            o_proj: load_quant(&format!("{a}.o_proj"))?,
+            o_proj: lin(&format!("{a}.o_proj"))?,
             qkv_proj,
             q_norm,
             k_norm,
@@ -2454,9 +2437,9 @@ pub fn load_from_path(model_dir: &Path, yarn_override: Option<&YarnOverride>) ->
         };
 
         let mlp = Mlp {
-            gate_proj: load_quant(&format!("{base}.mlp.gate_proj"))?,
-            up_proj: load_quant(&format!("{base}.mlp.up_proj"))?,
-            down_proj: load_quant(&format!("{base}.mlp.down_proj"))?,
+            gate_proj: lin(&format!("{base}.mlp.gate_proj"))?,
+            up_proj: lin(&format!("{base}.mlp.up_proj"))?,
+            down_proj: lin(&format!("{base}.mlp.down_proj"))?,
         };
 
         layers.push(DecoderLayer {
