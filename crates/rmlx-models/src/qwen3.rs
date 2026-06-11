@@ -73,6 +73,8 @@ use crate::decode_loop::{
 use crate::kv_cache::{
     kv_max_seq_and_ceiling, kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
 };
+use crate::layers::{resolve_quant, QuantParams};
+use crate::load_util::Weights;
 use crate::prompt_cache::{
     chained_block_hashes_seeded, ArchPromptCache, PromptCacheEntry, ReusePolicy, SsdHydrate,
     FNV_OFFSET,
@@ -2267,58 +2269,46 @@ pub fn load_from_path(model_dir: &Path, yarn_override: Option<&YarnOverride>) ->
     );
 
     let idx = load_shard_index(model_dir)?;
+    // qwen3/bonsai ships an honest index → index-first fetch with header-scan
+    // fallback via the shared `Weights` helper. (`ShardSet::open`, not
+    // `open_dir`, since the index is trustworthy.)
     let shards = ShardSet::open(model_dir, &idx)?;
+    let w = Weights::new(&shards, &idx);
 
-    fn load_array(shards: &ShardSet, name: &str) -> Result<Array> {
-        for (_, handle) in shards.iter() {
-            let st = handle.safetensors()?;
-            if let Ok(t) = st.tensor(name) {
-                let tv = rmlx_loader::TensorView {
-                    name,
-                    dtype: t.dtype(),
-                    shape: t.shape().to_vec(),
-                    bytes: t.data(),
-                };
-                return Array::from_safetensor_view(&tv);
-            }
-        }
-        Err(Error::Loader(format!(
-            "tensor '{name}' not found in any shard"
-        )))
-    }
-
-    fn has_tensor(shards: &ShardSet, name: &str) -> bool {
-        shards
-            .iter()
-            .any(|(_, h)| h.safetensors().is_ok_and(|st| st.tensor(name).is_ok()))
-    }
+    // Global quant params; qwen3 has no per-tensor `config.json` overrides, so
+    // the resolver's `.biases`-sibling affine rule is the only thing that can
+    // change the mode (for affine checkpoints like Bonsai it is a no-op).
+    let defaults = QuantParams::global(cfg.quant_group_size, cfg.quant_bits, &cfg.quant_mode);
+    let overrides = std::collections::HashMap::new();
 
     let load_quant = |base: &str| -> Result<Linear> {
-        let w = load_array(&shards, &format!("{base}.weight"))?;
+        let weight = w.array(&format!("{base}.weight"))?;
         let s_name = format!("{base}.scales");
-        if has_tensor(&shards, &s_name) {
-            let s = load_array(&shards, &s_name)?;
-            let biases = if has_tensor(&shards, &format!("{base}.biases")) {
-                Some(load_array(&shards, &format!("{base}.biases"))?)
+        if w.has(&s_name)? {
+            let scales = w.array(&s_name)?;
+            let biases = if w.has(&format!("{base}.biases"))? {
+                Some(w.array(&format!("{base}.biases"))?)
             } else {
                 None
             };
+            // The shared resolver owns the `.biases`-sibling affine rule.
+            let qp = resolve_quant(base, biases.is_some(), &defaults, &overrides)?;
             Ok(Linear::Quantized {
-                weight: w,
-                scales: s,
+                weight,
+                scales,
                 biases,
-                group_size: cfg.quant_group_size,
-                bits: cfg.quant_bits,
-                mode: cfg.quant_mode.clone(),
+                group_size: qp.group_size,
+                bits: qp.bits,
+                mode: qp.mode,
             })
         } else {
-            Ok(Linear::Plain { weight: w })
+            Ok(Linear::Plain { weight })
         }
     };
 
     let load_rms = |name: &str| -> Result<RmsNorm> {
         Ok(RmsNorm {
-            weight: load_array(&shards, &format!("{name}.weight"))?,
+            weight: w.array(&format!("{name}.weight"))?,
             eps: cfg.rms_norm_eps,
         })
     };
@@ -2328,25 +2318,26 @@ pub fn load_from_path(model_dir: &Path, yarn_override: Option<&YarnOverride>) ->
     // Embedding table.
     let embed_tokens = {
         let base = format!("{pfx}.embed_tokens");
-        if has_tensor(&shards, &format!("{base}.scales")) {
-            let w = load_array(&shards, &format!("{base}.weight"))?;
-            let s = load_array(&shards, &format!("{base}.scales"))?;
-            let biases = if has_tensor(&shards, &format!("{base}.biases")) {
-                Some(load_array(&shards, &format!("{base}.biases"))?)
+        if w.has(&format!("{base}.scales"))? {
+            let weight = w.array(&format!("{base}.weight"))?;
+            let scales = w.array(&format!("{base}.scales"))?;
+            let biases = if w.has(&format!("{base}.biases"))? {
+                Some(w.array(&format!("{base}.biases"))?)
             } else {
                 None
             };
+            let qp = resolve_quant(&base, biases.is_some(), &defaults, &overrides)?;
             Embedding::Quantized {
-                weight: w,
-                scales: s,
+                weight,
+                scales,
                 biases,
-                group_size: cfg.quant_group_size,
-                bits: cfg.quant_bits,
-                mode: cfg.quant_mode.clone(),
+                group_size: qp.group_size,
+                bits: qp.bits,
+                mode: qp.mode,
             }
         } else {
             Embedding::Plain {
-                weight: load_array(&shards, &format!("{base}.weight"))?,
+                weight: w.array(&format!("{base}.weight"))?,
             }
         }
     };
@@ -2359,31 +2350,32 @@ pub fn load_from_path(model_dir: &Path, yarn_override: Option<&YarnOverride>) ->
         info!("Qwen3: tie_word_embeddings=true, using embed_tokens as lm_head");
         None
     } else {
-        let base = if has_tensor(&shards, "lm_head.weight") {
+        let base = if w.has("lm_head.weight")? {
             "lm_head"
         } else {
             "model.lm_head"
         };
         info!(%base, "Qwen3: loading separate lm_head");
-        if has_tensor(&shards, &format!("{base}.scales")) {
-            let w = load_array(&shards, &format!("{base}.weight"))?;
-            let s = load_array(&shards, &format!("{base}.scales"))?;
-            let biases = if has_tensor(&shards, &format!("{base}.biases")) {
-                Some(load_array(&shards, &format!("{base}.biases"))?)
+        if w.has(&format!("{base}.scales"))? {
+            let weight = w.array(&format!("{base}.weight"))?;
+            let scales = w.array(&format!("{base}.scales"))?;
+            let biases = if w.has(&format!("{base}.biases"))? {
+                Some(w.array(&format!("{base}.biases"))?)
             } else {
                 None
             };
+            let qp = resolve_quant(base, biases.is_some(), &defaults, &overrides)?;
             Some(Linear::Quantized {
-                weight: w,
-                scales: s,
+                weight,
+                scales,
                 biases,
-                group_size: cfg.quant_group_size,
-                bits: cfg.quant_bits,
-                mode: cfg.quant_mode.clone(),
+                group_size: qp.group_size,
+                bits: qp.bits,
+                mode: qp.mode,
             })
         } else {
             Some(Linear::Plain {
-                weight: load_array(&shards, &format!("{base}.weight"))?,
+                weight: w.array(&format!("{base}.weight"))?,
             })
         }
     };
