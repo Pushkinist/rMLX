@@ -95,7 +95,10 @@ pub fn load_model(model_dir: &Path, _device: Device, opts: &LoadOpts) -> Result<
     let t_dequant_start = Instant::now();
 
     let arch = match arch_str {
-        "Gemma4ForConditionalGeneration" => {
+        // Gemma4UnifiedForConditionalGeneration (12B) shares the same text-decoder
+        // structure as Gemma4ForConditionalGeneration; extra multimodal-embedder
+        // weights are not read by the text loader and are inert.
+        "Gemma4ForConditionalGeneration" | "Gemma4UnifiedForConditionalGeneration" => {
             let model = if cfg.is_paroquant() {
                 tracing::info!(
                     "arch::load_model: Gemma4 PARO checkpoint detected, using PARO loader"

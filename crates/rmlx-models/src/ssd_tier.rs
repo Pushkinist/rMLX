@@ -42,7 +42,7 @@ pub fn attach_at_load(
     };
 
     match arch {
-        "Gemma4ForConditionalGeneration" => {
+        "Gemma4ForConditionalGeneration" | "Gemma4UnifiedForConditionalGeneration" => {
             crate::gemma4::prompt_cache::PROMPT_CACHE.attach_ssd_tier(
                 &info.namespace,
                 info.kv_quant,
