@@ -72,47 +72,24 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
 
     let idx = load_shard_index(model_dir)?;
     let shards = ShardSet::open(model_dir, &idx)?;
-
-    let load_array = |name: &str| -> Result<Array> {
-        for (_, handle) in shards.iter() {
-            let st = handle.safetensors()?;
-            if let Ok(t) = st.tensor(name) {
-                let tv = rmlx_loader::TensorView {
-                    name,
-                    dtype: t.dtype(),
-                    shape: t.shape().to_vec(),
-                    bytes: t.data(),
-                };
-                return Array::from_safetensor_view(&tv);
-            }
-        }
-        Err(Error::Loader(format!(
-            "tensor '{name}' not found in any shard"
-        )))
-    };
-
-    let has_tensor = |name: &str| -> bool {
-        shards
-            .iter()
-            .any(|(_, h)| h.safetensors().is_ok_and(|st| st.tensor(name).is_ok()))
-    };
+    let w = Weights::new(&shards, &idx);
 
     let defaults = QuantParams::global(cfg.quant_group_size, cfg.quant_bits, &cfg.quant_mode);
 
     let load_linear = |base: &str| -> Result<Linear> {
-        let w = load_array(&format!("{base}.weight"))?;
+        let weight = w.array(&format!("{base}.weight"))?;
         let s_name = format!("{base}.scales");
-        if has_tensor(&s_name) {
-            let s = load_array(&s_name)?;
-            let biases = if has_tensor(&format!("{base}.biases")) {
-                Some(load_array(&format!("{base}.biases"))?)
+        if w.has(&s_name)? {
+            let s = w.array(&s_name)?;
+            let biases = if w.has(&format!("{base}.biases"))? {
+                Some(w.array(&format!("{base}.biases"))?)
             } else {
                 None
             };
             // The shared resolver owns the `.biases`-sibling affine rule.
             let qp = resolve_quant(base, biases.is_some(), &defaults, &cfg.quant_overrides)?;
             Ok(Linear::Quantized {
-                weight: w,
+                weight,
                 scales: s,
                 biases,
                 group_size: qp.group_size,
@@ -120,13 +97,13 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
                 mode: qp.mode,
             })
         } else {
-            Ok(Linear::Plain { weight: w })
+            Ok(Linear::Plain { weight })
         }
     };
 
     let load_rms = |name: &str| -> Result<RmsNorm> {
         Ok(RmsNorm {
-            weight: load_array(&format!("{name}.weight"))?,
+            weight: w.array(&format!("{name}.weight"))?,
             eps: cfg.rms_norm_eps,
         })
     };
@@ -135,17 +112,17 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
 
     let embed_tokens = {
         let base = format!("{pfx}.embed_tokens");
-        if has_tensor(&format!("{base}.scales")) {
-            let w = load_array(&format!("{base}.weight"))?;
-            let s = load_array(&format!("{base}.scales"))?;
-            let biases = if has_tensor(&format!("{base}.biases")) {
-                Some(load_array(&format!("{base}.biases"))?)
+        if w.has(&format!("{base}.scales"))? {
+            let weight = w.array(&format!("{base}.weight"))?;
+            let s = w.array(&format!("{base}.scales"))?;
+            let biases = if w.has(&format!("{base}.biases"))? {
+                Some(w.array(&format!("{base}.biases"))?)
             } else {
                 None
             };
             let qp = resolve_quant(&base, biases.is_some(), &defaults, &cfg.quant_overrides)?;
             Embedding::Quantized {
-                weight: w,
+                weight,
                 scales: s,
                 biases,
                 group_size: qp.group_size,
@@ -154,7 +131,7 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
             }
         } else {
             Embedding::Plain {
-                weight: load_array(&format!("{base}.weight"))?,
+                weight: w.array(&format!("{base}.weight"))?,
             }
         }
     };
@@ -170,11 +147,13 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
             "lm_head",
             &format!("{pfx}.lm_head"),
         ];
-        let base = candidates
-            .iter()
-            .find(|b| has_tensor(&format!("{b}.weight")))
-            .copied()
-            .unwrap_or("language_model.lm_head");
+        let mut base = "language_model.lm_head";
+        for cand in candidates {
+            if w.has(&format!("{cand}.weight"))? {
+                base = cand;
+                break;
+            }
+        }
         info!(%base, "Qwen3_5Moe: loading lm_head");
         Some(load_linear(base)?)
     };
@@ -191,14 +170,14 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
             let key_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim;
             let value_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim;
 
-            let a_log_raw = load_array(&format!("{la}.A_log"))?;
+            let a_log_raw = w.array(&format!("{la}.A_log"))?;
             let hv = cfg.linear_num_value_heads as i32;
             let a_log_3d = a_log_raw.reshape(&[1, 1, hv], rmlx_mlx::Device::Cpu)?;
             let a_log_f32 = a_log_3d.astype(rmlx_mlx::Dtype::F32, rmlx_mlx::Device::Cpu)?;
             let exp_a_log_f32 = rmlx_mlx::exp(&a_log_f32, rmlx_mlx::Device::Cpu)?;
             exp_a_log_f32.eval()?;
 
-            let dt_bias_raw = load_array(&format!("{la}.dt_bias"))?;
+            let dt_bias_raw = w.array(&format!("{la}.dt_bias"))?;
             let dt_bias_3d = dt_bias_raw.reshape(&[1, 1, hv], rmlx_mlx::Device::Cpu)?;
             dt_bias_3d.eval()?;
 
@@ -215,8 +194,8 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
                 in_proj_z: load_linear(&format!("{la}.in_proj_z"))?,
                 in_proj_b: load_linear(&format!("{la}.in_proj_b"))?,
                 in_proj_a: load_linear(&format!("{la}.in_proj_a"))?,
-                conv1d_weight: load_array(&format!("{la}.conv1d.weight"))?,
-                norm_weight: load_array(&format!("{la}.norm.weight"))?,
+                conv1d_weight: w.array(&format!("{la}.conv1d.weight"))?,
+                norm_weight: w.array(&format!("{la}.norm.weight"))?,
                 exp_a_log_f32,
                 dt_bias_3d,
                 inv_scale_sq_arr,
@@ -363,42 +342,13 @@ pub fn load_from_path_paro(model_dir: &Path) -> Result<Qwen3_5MoeText> {
 
     let idx = load_shard_index(model_dir)?;
     let shards = ShardSet::open(model_dir, &idx)?;
-    // Shared PARO + embedding-quant assembly fetches via `Weights`; the rest of
-    // this loader still uses the local `load_raw`/`load_array` closures (full
-    // migration to `Weights` is a later task).
+    // All tensor fetches go through the shared `Weights` handle. The PARO-specific
+    // `load_array` / `load_rms` closures keep their manual byte-math bodies (raw
+    // dtype match + f16 `+1.0` RMS shift) but source their bytes from `w.raw`.
     let w = Weights::new(&shards, &idx);
 
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-    )]
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "wildcard arm is the correct fallthrough for unsupported arch/quant variants; exhaustive expansion would require updating on every new variant"
-    )]
-    fn load_raw(
-        shards: &ShardSet,
-        name: &str,
-    ) -> Result<(Vec<u8>, Vec<usize>, safetensors::Dtype)> {
-        for (_, handle) in shards.iter() {
-            let st = handle.safetensors()?;
-            if let Ok(t) = st.tensor(name) {
-                return Ok((t.data().to_vec(), t.shape().to_vec(), t.dtype()));
-            }
-        }
-        Err(Error::Loader(format!(
-            "tensor '{name}' not found in any shard"
-        )))
-    }
-
-    let has_tensor = |name: &str| -> bool {
-        shards
-            .iter()
-            .any(|(_, h)| h.safetensors().is_ok_and(|st| st.tensor(name).is_ok()))
-    };
-
     let load_array = |name: &str| -> Result<Array> {
-        let (bytes, shape, dtype) = load_raw(&shards, name)?;
+        let (bytes, shape, dtype) = w.raw(name)?;
         let shape_i32: Vec<i32> = shape.iter().map(|&d| d as i32).collect();
         let mlx_dtype = match dtype {
             safetensors::Dtype::F16 => rmlx_mlx::Dtype::F16,
@@ -417,7 +367,7 @@ pub fn load_from_path_paro(model_dir: &Path) -> Result<Qwen3_5MoeText> {
 
     let load_rms = |name: &str| -> Result<RmsNorm> {
         let wname = format!("{name}.weight");
-        let (w_bytes, w_shape, _) = load_raw(&shards, &wname)?;
+        let (w_bytes, w_shape, _) = w.raw(&wname)?;
         let n = w_shape.iter().product::<usize>();
         let mut shifted = vec![0u8; n * 2];
         for i in 0..n {
@@ -427,19 +377,19 @@ pub fn load_from_path_paro(model_dir: &Path) -> Result<Qwen3_5MoeText> {
             shifted[i * 2..i * 2 + 2].copy_from_slice(&out_bits.to_le_bytes());
         }
         let shape_i32: Vec<i32> = w_shape.iter().map(|&d| d as i32).collect();
-        let w = Array::from_bytes(&shifted, &shape_i32, rmlx_mlx::Dtype::F16)?;
+        let weight = Array::from_bytes(&shifted, &shape_i32, rmlx_mlx::Dtype::F16)?;
         Ok(RmsNorm {
-            weight: w,
+            weight,
             eps: cfg.rms_norm_eps,
         })
     };
 
     let load_plain_linear = |base: &str| -> Result<Linear> {
         let w_name = format!("{base}.weight");
-        let (w_bytes, w_shape, _) = load_raw(&shards, &w_name)?;
+        let (w_bytes, w_shape, _) = w.raw(&w_name)?;
         let w_shape_i32: Vec<i32> = w_shape.iter().map(|&d| d as i32).collect();
-        let w = Array::from_bytes(&w_bytes, &w_shape_i32, rmlx_mlx::Dtype::F16)?;
-        Ok(Linear::Plain { weight: w })
+        let weight = Array::from_bytes(&w_bytes, &w_shape_i32, rmlx_mlx::Dtype::F16)?;
+        Ok(Linear::Plain { weight })
     };
 
     let load_paro = |base: &str| -> Result<Linear> {
@@ -460,7 +410,7 @@ pub fn load_from_path_paro(model_dir: &Path) -> Result<Qwen3_5MoeText> {
     };
 
     let load_auto_linear = |base: &str| -> Result<Linear> {
-        if has_tensor(&format!("{base}.pairs")) {
+        if w.has(&format!("{base}.pairs"))? {
             load_paro(base)
         } else {
             load_plain_linear(base)
@@ -489,11 +439,13 @@ pub fn load_from_path_paro(model_dir: &Path) -> Result<Qwen3_5MoeText> {
         None
     } else {
         let candidates = ["lm_head", &format!("{pfx}.lm_head")];
-        let base = candidates
-            .iter()
-            .find(|b| has_tensor(&format!("{b}.weight")))
-            .copied()
-            .unwrap_or("lm_head");
+        let mut base = "lm_head";
+        for cand in candidates {
+            if w.has(&format!("{cand}.weight"))? {
+                base = cand;
+                break;
+            }
+        }
         info!(%base, "Qwen3_5 PARO: loading lm_head (INT4 quantized to match Python loader)");
         let (lm_w, lm_s, lm_b) = quantize_embedding_int4(&w, base, paro_group_size)?;
         Some(Linear::Quantized {
