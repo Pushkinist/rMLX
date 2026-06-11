@@ -389,3 +389,130 @@ fn linear_propagates_qp_error() {
     let res = w.linear("q", qp_err);
     assert!(res.is_err(), "qp hard-error must propagate out of linear()");
 }
+
+/// `classify_load_oom` promotes an allocation-failure MLX error to `Error::Oom`
+/// and leaves non-alloc errors untouched.
+#[test]
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "wildcard arm is the correct fallthrough for unsupported arch/quant variants; exhaustive expansion would require updating on every new variant"
+)]
+fn classify_load_oom_alloc_string_becomes_oom() {
+    use rmlx_core::{Error, OomPhase};
+    // The exact shape MLX throws on a Metal allocation failure.
+    let e = Error::Mlx("Array::eval: [malloc_or_wait] Unable to allocate 9000000000 bytes".into());
+    match super::classify_load_oom(e) {
+        Error::Oom { phase, .. } => assert_eq!(phase, OomPhase::LoadWeights),
+        other => panic!("expected Error::Oom, got {other:?}"),
+    }
+}
+
+#[test]
+fn classify_load_oom_shape_error_stays_mlx() {
+    use rmlx_core::Error;
+    // A non-OOM MLX failure must NOT be misclassified as OOM.
+    let e = Error::Mlx("reshape: total size mismatch 12 vs 16".into());
+    assert!(
+        matches!(super::classify_load_oom(e), Error::Mlx(_)),
+        "shape error must stay Error::Mlx"
+    );
+}
+
+#[test]
+fn classify_load_oom_non_mlx_untouched() {
+    use rmlx_core::Error;
+    let e = Error::Loader("missing config.json".into());
+    assert!(matches!(super::classify_load_oom(e), Error::Loader(_)));
+}
+
+/// `embedding()` maps onto `Embedding`: a `.scales`-less base is `Plain`; a base
+/// with `.scales` + `.biases` is `Quantized { biases: Some }` (affine); `.scales`
+/// without `.biases` is `Quantized { biases: None }` (mxfp8-style). Sibling
+/// detection is header-based — index lists only `.weight` keys.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: tempdir / ShardSet open failures should abort the test loudly"
+)]
+fn embedding_maps_to_shared_embedding() {
+    use crate::layers::{Embedding, QuantParams};
+
+    let dir = tempfile::tempdir().unwrap();
+    write_shard(
+        dir.path(),
+        "s.safetensors",
+        &[
+            // Plain: weight only.
+            ("plain.weight", 4),
+            // Affine: weight + scales + biases.
+            ("affine.weight", 8),
+            ("affine.scales", 1),
+            ("affine.biases", 1),
+            // Mxfp8-style: weight + scales, no biases.
+            ("mxfp.weight", 8),
+            ("mxfp.scales", 1),
+        ],
+    );
+    // Index lists only the `.weight` keys; siblings resolve via header scan.
+    let idx = make_idx(&[
+        ("plain.weight", "s.safetensors"),
+        ("affine.weight", "s.safetensors"),
+        ("mxfp.weight", "s.safetensors"),
+    ]);
+    let shards = ShardSet::open(dir.path(), &idx).unwrap();
+    let w = Weights::new(&shards, &idx);
+
+    let qp = |_has_biases: bool| Ok(QuantParams::global(32, 8, "affine"));
+
+    // Plain fallback: no .scales sibling.
+    match w.embedding("plain", qp).unwrap() {
+        Embedding::Plain { weight } => assert_eq!(weight.shape(), vec![4]),
+        Embedding::Quantized { .. } => panic!("expected Plain for scales-less base"),
+    }
+
+    // Affine: .scales + .biases present → biases: Some.
+    match w.embedding("affine", qp).unwrap() {
+        Embedding::Quantized { biases, bits, .. } => {
+            assert!(biases.is_some(), "affine base has a .biases sibling");
+            assert_eq!(bits, 8);
+        }
+        Embedding::Plain { .. } => panic!("expected Quantized for affine base"),
+    }
+
+    // Mxfp8-style: .scales present, .biases absent → biases: None.
+    match w.embedding("mxfp", qp).unwrap() {
+        Embedding::Quantized { biases, .. } => {
+            assert!(biases.is_none(), "mxfp base has no .biases sibling");
+        }
+        Embedding::Plain { .. } => panic!("expected Quantized for mxfp base"),
+    }
+}
+
+/// The `qp` closure may hard-error; `embedding` propagates the error rather
+/// than building an `Embedding`.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: tempdir / ShardSet open failures should abort the test loudly"
+)]
+fn embedding_propagates_qp_error() {
+    use rmlx_core::error::Error;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_shard(
+        dir.path(),
+        "s.safetensors",
+        &[("emb.weight", 8), ("emb.scales", 1), ("emb.biases", 1)],
+    );
+    let idx = make_idx(&[("emb.weight", "s.safetensors")]);
+    let shards = ShardSet::open(dir.path(), &idx).unwrap();
+    let w = Weights::new(&shards, &idx);
+
+    let qp_err =
+        |_has_biases: bool| Err(Error::Loader("config contradicts tensor data".to_owned()));
+    let res = w.embedding("emb", qp_err);
+    assert!(
+        res.is_err(),
+        "qp hard-error must propagate out of embedding()"
+    );
+}

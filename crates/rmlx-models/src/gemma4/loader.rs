@@ -41,45 +41,6 @@ use super::layers::{
 };
 use super::model::Gemma4Text;
 
-/// J3: reclassify an MLX error raised *during the weights-load phase* as
-/// [`Error::Oom`] when its message carries an unambiguous allocation-failure
-/// signature.
-///
-/// SCOPE / HONESTY: mlx-c surfaces every failure through one opaque string
-/// channel (see `crates/rmlx-mlx/src/lib.rs::check_status`), so OOM is NOT
-/// reliably distinguishable from a shape / kernel-compile error at the
-/// status-code level. This classifier is therefore deliberately bounded to
-/// the weights-load phase only — where a "[malloc_or_wait] Unable to
-/// allocate" / "out of memory" string is overwhelmingly allocation, never a
-/// shape mismatch (tensors come straight from a validated safetensors index).
-/// It is intentionally NOT applied on the decode / forward path, where the
-/// same substrings could plausibly come from a non-OOM failure and a false
-/// `Error::Oom` (wrong 507 + wrong "evict & retry" advice) would be worse
-/// than an honest 503. Many real Metal OOMs never reach here at all — they
-/// kernel-panic the machine first (IOGPUMemory). Detection is partial by
-/// nature; see the group-K backlog note.
-fn classify_load_oom(e: Error) -> Error {
-    let Error::Mlx(ref msg) = e else {
-        return e;
-    };
-    let lower = msg.to_ascii_lowercase();
-    let is_alloc_failure = lower.contains("out of memory")
-        || lower.contains("failed to allocate")
-        || lower.contains("unable to allocate")
-        || lower.contains("insufficient memory");
-    if is_alloc_failure {
-        Error::Oom {
-            phase: rmlx_core::OomPhase::LoadWeights,
-            requested_bytes: None,
-            // TODO: metal_peak_alloc_mb — telemetry not yet built.
-            peak_alloc_mb: None,
-            msg: msg.clone(),
-        }
-    } else {
-        e
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Model loader (mxfp8)
 // ---------------------------------------------------------------------------
@@ -121,49 +82,24 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma4Text> {
     // and `has` header-truth, with no header-scan degradation on this snapshot.
     let w = Weights::new(&shards, &idx);
 
-    // Helper closures to load tensors. `classify_load_oom` is preserved on
-    // every fetch that carried it before: `w.array` returns the unwrapped
-    // `Array::from_safetensor_view` Result, so `.map_err(classify_load_oom)`
-    // re-classifies the identical load-phase OOM the old `view` path did.
-    let load_plain = |name: &str| -> Result<Array> { w.array(name).map_err(classify_load_oom) };
-
     // Resolve quant params for a tensor via the shared resolver: check
     // per-tensor overrides, fall back to global, and let the `.biases` sibling
     // govern the affine rule (hard-erroring on an affine-vs-non-affine clash).
     let defaults = QuantParams::global(cfg.quant_group_size, cfg.quant_bits, &cfg.quant_mode);
 
-    let load_quant = |base: &str| -> Result<Linear> {
-        let w_name = format!("{base}.weight");
-        let s_name = format!("{base}.scales");
-        let b_name = format!("{base}.biases");
-        let weight = w.array(&w_name).map_err(classify_load_oom)?;
-        // bf16 snapshots have no .scales — fall back to Plain.
-        if !w.has(&s_name)? {
-            return Ok(Linear::Plain { weight });
-        }
-        let scales = w.array(&s_name).map_err(classify_load_oom)?;
-        let has_biases = w.has(&b_name)?;
-        let biases = if has_biases {
-            Some(w.array(&b_name).map_err(classify_load_oom)?)
-        } else {
-            None
-        };
-        let qp = resolve_quant(base, has_biases, &defaults, &cfg.quant_overrides)?;
-        Ok(Linear::Quantized {
-            weight,
-            scales,
-            biases,
-            group_size: qp.group_size,
-            bits: qp.bits,
-            mode: QuantMode::from(qp.mode.as_str()),
+    // Thin adapter: delegates to the shared seam (OOM classification is inside
+    // `w.linear` now — no `.map_err(classify_load_oom)` needed here).
+    let lin = |base: &str| -> Result<Linear> {
+        w.linear(base, |hb| {
+            resolve_quant(base, hb, &defaults, &cfg.quant_overrides)
         })
     };
 
     let load_rms = |name: &str| -> Result<RmsNorm> {
         let w_name = format!("{name}.weight");
-        let w = load_plain(&w_name)?;
+        let weight = w.array(&w_name)?;
         Ok(RmsNorm {
-            weight: Some(w),
+            weight: Some(weight),
             eps: cfg.rms_norm_eps,
         })
     };
@@ -180,86 +116,27 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma4Text> {
 
     // Embedding tables.
     let embed_tokens = {
-        let w_name = format!("{pfx}.embed_tokens.weight");
-        let s_name = format!("{pfx}.embed_tokens.scales");
-        let b_name = format!("{pfx}.embed_tokens.biases");
-        // Try quantized first (mxfp8 snapshot has .scales; affine-4bit has .scales + .biases).
-        if w.has(&s_name)? {
-            let weight = w.array(&w_name).map_err(classify_load_oom)?;
-            let scales = w.array(&s_name).map_err(classify_load_oom)?;
-            let has_biases = w.has(&b_name)?;
-            let biases = if has_biases {
-                Some(w.array(&b_name).map_err(classify_load_oom)?)
-            } else {
-                None
-            };
-            let qp = resolve_quant(
-                &format!("{pfx}.embed_tokens"),
-                has_biases,
-                &defaults,
-                &cfg.quant_overrides,
-            )?;
-            Embedding::Quantized {
-                weight,
-                scales,
-                biases,
-                group_size: qp.group_size,
-                bits: qp.bits,
-                mode: QuantMode::from(qp.mode.as_str()),
-            }
-        } else {
-            let weight = load_plain(&w_name)?;
-            Embedding::Plain { weight }
-        }
+        let base = format!("{pfx}.embed_tokens");
+        w.embedding(&base, |hb| {
+            resolve_quant(&base, hb, &defaults, &cfg.quant_overrides)
+        })?
     };
 
     // Per-layer embedding (optional).
     let embed_tokens_per_layer = if cfg.hidden_size_per_layer_input > 0 {
-        let w_name = format!("{pfx}.embed_tokens_per_layer.weight");
-        let s_name = format!("{pfx}.embed_tokens_per_layer.scales");
-        let b_name = format!("{pfx}.embed_tokens_per_layer.biases");
-        if w.has(&s_name)? {
-            let weight = w.array(&w_name).map_err(classify_load_oom)?;
-            let scales = w.array(&s_name).map_err(classify_load_oom)?;
-            let has_biases = w.has(&b_name)?;
-            let biases = if has_biases {
-                Some(w.array(&b_name).map_err(classify_load_oom)?)
-            } else {
-                None
-            };
-            let qp = resolve_quant(
-                &format!("{pfx}.embed_tokens_per_layer"),
-                has_biases,
-                &defaults,
-                &cfg.quant_overrides,
-            )?;
-            Some(Embedding::Quantized {
-                weight,
-                scales,
-                biases,
-                group_size: qp.group_size,
-                bits: qp.bits,
-                mode: QuantMode::from(qp.mode.as_str()),
-            })
-        } else {
-            let weight = load_plain(&w_name)?;
-            Some(Embedding::Plain { weight })
-        }
+        let base = format!("{pfx}.embed_tokens_per_layer");
+        Some(w.embedding(&base, |hb| {
+            resolve_quant(&base, hb, &defaults, &cfg.quant_overrides)
+        })?)
     } else {
         None
     };
 
     // Per-layer model projection.
     let per_layer_model_proj = if cfg.hidden_size_per_layer_input > 0 {
-        let base = format!("{pfx}.per_layer_model_projection");
-        // This tensor may be plain BF16 (no .scales in this snapshot).
-        let w_name = format!("{base}.weight");
-        if w.has(&format!("{base}.scales"))? {
-            Some(load_quant(&base)?)
-        } else {
-            let weight = load_plain(&w_name)?;
-            Some(Linear::Plain { weight })
-        }
+        // This tensor may be plain BF16 (no .scales in this snapshot); `lin` falls
+        // through to `Linear::Plain` when no `.scales` sibling is present.
+        Some(lin(&format!("{pfx}.per_layer_model_projection"))?)
     } else {
         None
     };
@@ -311,9 +188,9 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma4Text> {
             }
         };
 
-        let q_proj = load_quant(&format!("{base}.self_attn.q_proj"))?;
+        let q_proj = lin(&format!("{base}.self_attn.q_proj"))?;
         let k_proj = if has_kv {
-            Some(load_quant(&format!("{base}.self_attn.k_proj"))?)
+            Some(lin(&format!("{base}.self_attn.k_proj"))?)
         } else {
             None
         };
@@ -333,12 +210,12 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma4Text> {
                 );
                 k_proj.as_ref().map(Linear::try_clone).transpose()?
             } else {
-                Some(load_quant(&v_key)?)
+                Some(lin(&v_key)?)
             }
         } else {
             None
         };
-        let o_proj = load_quant(&format!("{base}.self_attn.o_proj"))?;
+        let o_proj = lin(&format!("{base}.self_attn.o_proj"))?;
 
         let q_norm = load_rms(&format!("{base}.self_attn.q_norm"))?;
         let k_norm = if has_kv {
@@ -376,15 +253,15 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma4Text> {
         };
 
         let mlp = Mlp {
-            gate_proj: load_quant(&format!("{base}.mlp.gate_proj"))?,
-            up_proj: load_quant(&format!("{base}.mlp.up_proj"))?,
-            down_proj: load_quant(&format!("{base}.mlp.down_proj"))?,
+            gate_proj: lin(&format!("{base}.mlp.gate_proj"))?,
+            up_proj: lin(&format!("{base}.mlp.up_proj"))?,
+            down_proj: lin(&format!("{base}.mlp.down_proj"))?,
             activation: Activation::GeluTanh, // Gemma4 uses GeGLU (GELU with tanh approx).
         };
 
         let per_layer = if cfg.hidden_size_per_layer_input > 0 {
-            let gate = load_quant(&format!("{base}.per_layer_input_gate"))?;
-            let proj = load_quant(&format!("{base}.per_layer_projection"))?;
+            let gate = lin(&format!("{base}.per_layer_input_gate"))?;
+            let proj = lin(&format!("{base}.per_layer_projection"))?;
             let post_norm = load_rms(&format!("{base}.post_per_layer_input_norm"))?;
             Some(PerLayerInput {
                 gate,
@@ -398,7 +275,7 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma4Text> {
         // layer_scalar: shape [1], dtype BF16 or F32.
         let layer_scalar_name = format!("{base}.layer_scalar");
         let layer_scalar = if w.has(&layer_scalar_name)? {
-            Some(load_plain(&layer_scalar_name)?)
+            Some(w.array(&layer_scalar_name)?)
         } else {
             None
         };
@@ -413,9 +290,9 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma4Text> {
             let rot_base = format!("{base}.router");
 
             // Router proj: per-tensor override at g64 b8.
-            let router_proj = load_quant(&format!("{rot_base}.proj"))?;
-            let router_scale = load_plain(&format!("{rot_base}.scale"))?;
-            let per_expert_scale = load_plain(&format!("{rot_base}.per_expert_scale"))?;
+            let router_proj = lin(&format!("{rot_base}.proj"))?;
+            let router_scale = w.array(&format!("{rot_base}.scale"))?;
+            let per_expert_scale = w.array(&format!("{rot_base}.per_expert_scale"))?;
             let root_size = (cfg.hidden_size as f32).powf(-0.5);
 
             let router = Gemma4Router {
@@ -429,9 +306,9 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma4Text> {
             };
 
             let experts = Gemma4Experts {
-                gate_proj: load_quant(&format!("{exp_base}.gate_proj"))?,
-                up_proj: load_quant(&format!("{exp_base}.up_proj"))?,
-                down_proj: load_quant(&format!("{exp_base}.down_proj"))?,
+                gate_proj: lin(&format!("{exp_base}.gate_proj"))?,
+                up_proj: lin(&format!("{exp_base}.up_proj"))?,
+                down_proj: lin(&format!("{exp_base}.down_proj"))?,
             };
 
             Some(Gemma4MoeBlock {
