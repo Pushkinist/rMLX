@@ -395,7 +395,7 @@ impl Linear {
             Linear::Quantized {
                 weight,
                 scales,
-                biases: _,
+                biases,
                 group_size,
                 bits,
                 mode,
@@ -403,7 +403,7 @@ impl Linear {
                 x,
                 weight,
                 scales,
-                None, // expert tensors are mxfp8, no biases
+                biases.as_ref(),
                 None,
                 rhs_indices,
                 *group_size,
