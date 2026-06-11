@@ -16,8 +16,6 @@
 //! A corrupt/truncated shard header is never confused with "not here": it
 //! propagates as `Err`, never masked by the header-scan fallback.
 //!
-//! This helper wires into nothing yet — per-arch loaders adopt it incrementally.
-
 // unsafe_code: mlx-rs Array zero-copy view — slice::from_raw_parts byte-reinterpret
 // of the i32 packed-pair buffer for Array::from_bytes (PARO assembly).
 #![allow(unsafe_code)]
@@ -50,14 +48,7 @@ use crate::layers::{Linear, QuantMode, QuantParams};
 /// the whole load; a first-touch parse failure propagates and is NEVER cached
 /// as "absent". Construction stays allocation-light — the `OnceCell`s are empty
 /// until first touch.
-///
-/// Per-arch loaders adopt this incrementally; until then the only constructors
-/// are the unit tests, hence the crate-local `dead_code` allow.
 #[derive(Debug)]
-#[allow(
-    dead_code,
-    reason = "shared loader helper — per-arch loaders adopt it incrementally; unwired until the loader migration lands"
-)]
 pub(crate) struct Weights<'a> {
     shards: &'a ShardSet,
     idx: Option<&'a ShardIndex>,
@@ -66,10 +57,6 @@ pub(crate) struct Weights<'a> {
     headers: Box<[OnceCell<SafeTensors<'a>>]>,
 }
 
-#[allow(
-    dead_code,
-    reason = "shared loader helper — per-arch loaders adopt it incrementally; unwired until the loader migration lands"
-)]
 impl<'a> Weights<'a> {
     /// Index-first fetch: the index locates each tensor's shard, with a
     /// header-scan fallback when the index misses or lies.
@@ -205,6 +192,10 @@ impl<'a> Weights<'a> {
     /// on a config/data contradiction. With no `.scales` sibling the layer is
     /// [`Linear::Plain`]; otherwise [`Linear::Quantized`] with `biases: Some(_)`
     /// iff a `.biases` sibling exists.
+    #[allow(
+        dead_code,
+        reason = "no arch loader calls this yet — each assembles Linear directly; exercised by unit tests only"
+    )]
     pub(crate) fn linear(
         &self,
         base: &str,
@@ -276,10 +267,6 @@ impl<'a> Weights<'a> {
 /// Holds the raw MLX arrays a caller needs to build its own per-arch
 /// `Linear::Paro` (the gemma4 and qwen3_5_moe `Linear` enums differ, so this
 /// shared helper returns the arrays + scalars rather than a constructed layer).
-#[allow(
-    dead_code,
-    reason = "shared loader helper — per-arch PARO loaders adopt it incrementally; unwired until the loader migration lands"
-)]
 pub(crate) struct ParoParts {
     /// Packed INT4 codes `[out, in*4/32]` U32.
     pub weight: Array,
@@ -308,10 +295,6 @@ pub(crate) struct ParoParts {
 /// from theta, and packs the rotation pairs via
 /// [`crate::paroquant_msl::pack_pairs_cpu`]. Returns the assembled [`ParoParts`];
 /// the caller wraps them in its arch-specific `Linear::Paro`.
-#[allow(
-    dead_code,
-    reason = "shared loader helper — per-arch PARO loaders adopt it incrementally; unwired until the loader migration lands"
-)]
 #[allow(
     clippy::indexing_slicing,
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
@@ -414,10 +397,6 @@ pub(crate) fn load_paro_parts(w: &Weights<'_>, base: &str, group_size: usize) ->
 /// Returns `(weight U32 [vocab, hidden*4/32], scales F16 [vocab, num_groups],
 /// biases F16 [vocab, num_groups])` — the caller wraps them in its arch-specific
 /// `Embedding::Quantized` / `Linear::Quantized`.
-#[allow(
-    dead_code,
-    reason = "shared loader helper — per-arch PARO loaders adopt it incrementally; unwired until the loader migration lands"
-)]
 #[allow(
     clippy::indexing_slicing,
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
