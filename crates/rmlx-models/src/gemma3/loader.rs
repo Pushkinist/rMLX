@@ -7,10 +7,13 @@
 )]
 use std::path::Path;
 
-use rmlx_core::error::{Error, Result};
+use rmlx_core::error::Result;
 use rmlx_loader::{load_config, load_shard_index, ShardSet};
 use rmlx_mlx::Array;
 use tracing::{debug, info};
+
+use crate::layers::{resolve_quant, QuantParams};
+use crate::load_util::Weights;
 
 use super::attention::Attention;
 use super::config::{Gemma3TextConfig, LayerType};
@@ -39,51 +42,28 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma3Text> {
         "Gemma3: loading model"
     );
 
-    let idx = load_shard_index(model_dir)?;
-    let shards = ShardSet::open(model_dir, &idx)?;
-
-    // Load a tensor by scanning all open shard headers.
-    //
-    // The medgemma `model.safetensors.index.json` has two known issues:
+    // KEEP the index: `Weights::new` consumes it for index-first speed on the
+    // correctly-pointed majority of tensors. But open EVERY `.safetensors` in
+    // the dir via `open_dir` rather than the index-driven `open`: the medgemma
+    // index lies in two ways the header-scan fallback must be able to repair —
     // 1. Sibling tensors (`.scales`, `.biases`) are not listed at all.
     // 2. Some plain tensors (e.g. `model.norm.weight`) are assigned to the
-    // wrong shard in the index.
-    //
-    // Using `view()` (index-only) is unreliable for both cases. Scanning every
-    // open shard header is always correct and still fast (header is KB-sized,
-    // data is mmap'd -- we only fault in pages we actually read).
-    //
-    // Free function (not a closure) to avoid TensorView<'_> lifetime issues.
-    fn load_array(shards: &ShardSet, _idx: &rmlx_loader::ShardIndex, name: &str) -> Result<Array> {
-        for (_filename, handle) in shards.iter() {
-            let st = handle.safetensors()?;
-            if let Ok(t) = st.tensor(name) {
-                let tv = rmlx_loader::TensorView {
-                    name,
-                    dtype: t.dtype(),
-                    shape: t.shape().to_vec(),
-                    bytes: t.data(),
-                };
-                return Array::from_safetensor_view(&tv);
-            }
-        }
-        Err(Error::Loader(format!(
-            "tensor '{name}' not found in any shard"
-        )))
-    }
+    //    wrong shard.
+    // An index-driven `open` might not open the shard holding an index-omitted
+    // tensor; `open_dir` guarantees every shard is open so the fallback reaches
+    // it. Tensor names are unique across shards, so the first header-scan match
+    // is the same tensor regardless of where the index pointed.
+    let idx = load_shard_index(model_dir)?;
+    let shards = ShardSet::open_dir(model_dir)?;
+    let w = Weights::new(&shards, &idx);
 
-    // Check whether a tensor exists in any open shard header.
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-    )]
-    fn has_tensor(shards: &ShardSet, _idx: &rmlx_loader::ShardIndex, name: &str) -> bool {
-        shards
-            .iter()
-            .any(|(_, h)| h.safetensors().is_ok_and(|st| st.tensor(name).is_ok()))
-    }
+    // Global quant defaults. medgemma's quant mode is "affine" with `.biases`
+    // siblings, so `resolve_quant`'s has_biases→force-affine rule is a no-op
+    // (mode/group_size/bits unchanged). gemma3 carries no per-tensor overrides.
+    let defaults = QuantParams::global(cfg.quant_group_size, cfg.quant_bits, &cfg.quant_mode);
+    let overrides = std::collections::HashMap::new();
 
-    let load_plain = |name: &str| -> Result<Array> { load_array(&shards, &idx, name) };
+    let load_plain = |name: &str| -> Result<Array> { w.array(name) };
 
     // Load affine-quantized or plain linear layer.
     // Handles `.scales` + `.biases` siblings absent from the index.
@@ -92,25 +72,26 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma3Text> {
         let s_name = format!("{base}.scales");
         let b_name = format!("{base}.biases");
 
-        let w = load_array(&shards, &idx, &w_name)?;
+        let weight = w.array(&w_name)?;
 
-        if has_tensor(&shards, &idx, &s_name) {
-            let s = load_array(&shards, &idx, &s_name)?;
-            let biases = if has_tensor(&shards, &idx, &b_name) {
-                Some(load_array(&shards, &idx, &b_name)?)
+        if w.has(&s_name)? {
+            let s = w.array(&s_name)?;
+            let biases = if w.has(&b_name)? {
+                Some(w.array(&b_name)?)
             } else {
                 None
             };
+            let qp = resolve_quant(base, biases.is_some(), &defaults, &overrides)?;
             Ok(Linear::Quantized {
-                weight: w,
+                weight,
                 scales: s,
                 biases,
-                group_size: cfg.quant_group_size,
-                bits: cfg.quant_bits,
-                mode: cfg.quant_mode.clone(),
+                group_size: qp.group_size,
+                bits: qp.bits,
+                mode: qp.mode,
             })
         } else {
-            Ok(Linear::Plain { weight: w })
+            Ok(Linear::Plain { weight })
         }
     };
 
@@ -125,26 +106,27 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma3Text> {
     let embed_tokens = {
         let base = format!("{pfx}.embed_tokens");
         let s_name = format!("{base}.scales");
-        if has_tensor(&shards, &idx, &s_name) {
-            let w = load_array(&shards, &idx, &format!("{base}.weight"))?;
-            let s = load_array(&shards, &idx, &s_name)?;
+        if w.has(&s_name)? {
+            let weight = w.array(&format!("{base}.weight"))?;
+            let s = w.array(&s_name)?;
             let b_name = format!("{base}.biases");
-            let biases = if has_tensor(&shards, &idx, &b_name) {
-                Some(load_array(&shards, &idx, &b_name)?)
+            let biases = if w.has(&b_name)? {
+                Some(w.array(&b_name)?)
             } else {
                 None
             };
+            let qp = resolve_quant(&base, biases.is_some(), &defaults, &overrides)?;
             Embedding::Quantized {
-                weight: w,
+                weight,
                 scales: s,
                 biases,
-                group_size: cfg.quant_group_size,
-                bits: cfg.quant_bits,
-                mode: cfg.quant_mode.clone(),
+                group_size: qp.group_size,
+                bits: qp.bits,
+                mode: qp.mode,
             }
         } else {
-            let w = load_plain(&format!("{base}.weight"))?;
-            Embedding::Plain { weight: w }
+            let weight = load_plain(&format!("{base}.weight"))?;
+            Embedding::Plain { weight }
         }
     };
 
@@ -157,11 +139,11 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma3Text> {
         None
     } else {
         let lm_base = "language_model.lm_head";
-        let lm = if has_tensor(&shards, &idx, &format!("{lm_base}.scales")) {
+        let lm = if w.has(&format!("{lm_base}.scales"))? {
             load_quant(lm_base)?
         } else {
-            let w = load_plain(&format!("{lm_base}.weight"))?;
-            Linear::Plain { weight: w }
+            let weight = load_plain(&format!("{lm_base}.weight"))?;
+            Linear::Plain { weight }
         };
         info!("Gemma3: loaded separate lm_head");
         Some(lm)
