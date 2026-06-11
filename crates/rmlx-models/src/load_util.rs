@@ -34,7 +34,7 @@ use rmlx_quant::awq::{
 use safetensors::SafeTensors;
 use tracing::debug;
 
-use crate::layers::{Linear, QuantMode, QuantParams};
+use crate::layers::{Embedding, Linear, QuantMode, QuantParams};
 
 /// Unified tensor fetch over a snapshot's shards.
 ///
@@ -55,6 +55,40 @@ pub(crate) struct Weights<'a> {
     /// Lazily-parsed safetensors header per shard, indexed parallel to
     /// `shards.iter()`. Empty until first touched by `header`.
     headers: Box<[OnceCell<SafeTensors<'a>>]>,
+}
+
+/// Reclassify an MLX error raised during the weights-load phase as
+/// [`Error::Oom`] when its message carries an unambiguous allocation-failure
+/// signature.
+///
+/// SCOPE / HONESTY: mlx-c surfaces every failure through one opaque string
+/// channel, so OOM is NOT reliably distinguishable from a shape / kernel-compile
+/// error at the status-code level. This classifier is therefore deliberately
+/// bounded to the weights-load phase only — where a "[malloc_or_wait] Unable to
+/// allocate" / "out of memory" string is overwhelmingly allocation, never a
+/// shape mismatch (tensors come straight from a validated safetensors index).
+/// It is intentionally NOT applied on the decode / forward path, where the same
+/// substrings could plausibly come from a non-OOM failure and a false
+/// `Error::Oom` would be worse than an honest 503.
+fn classify_load_oom(e: Error) -> Error {
+    let Error::Mlx(ref msg) = e else {
+        return e;
+    };
+    let lower = msg.to_ascii_lowercase();
+    let is_alloc_failure = lower.contains("out of memory")
+        || lower.contains("failed to allocate")
+        || lower.contains("unable to allocate")
+        || lower.contains("insufficient memory");
+    if is_alloc_failure {
+        Error::Oom {
+            phase: rmlx_core::OomPhase::LoadWeights,
+            requested_bytes: None,
+            peak_alloc_mb: None,
+            msg: msg.clone(),
+        }
+    } else {
+        e
+    }
 }
 
 impl<'a> Weights<'a> {
@@ -123,7 +157,9 @@ impl<'a> Weights<'a> {
     pub(crate) fn array(&self, name: &str) -> Result<Array> {
         if let Some(idx) = self.idx {
             match view_discriminated(self.shards, idx, name)? {
-                TensorLookup::Found(tv) => return Array::from_safetensor_view(&tv),
+                TensorLookup::Found(tv) => {
+                    return Array::from_safetensor_view(&tv).map_err(classify_load_oom);
+                }
                 // Index miss or index lies — safe to fall back to a header scan.
                 TensorLookup::NotInIndex | TensorLookup::WrongShard => {}
             }
@@ -141,7 +177,7 @@ impl<'a> Weights<'a> {
             shape,
             bytes,
         };
-        Array::from_safetensor_view(&tv)
+        Array::from_safetensor_view(&tv).map_err(classify_load_oom)
     }
 
     /// Header-based existence check — NEVER consults the index.
@@ -170,6 +206,11 @@ impl<'a> Weights<'a> {
         if let Some(idx) = self.idx {
             match view_discriminated(self.shards, idx, name)? {
                 TensorLookup::Found(tv) => {
+                    // Owned host byte copy for the PARO byte-math path. No OOM
+                    // classification here: this is a `Vec<u8>` copy, not an MLX
+                    // `Array` allocation, so `classify_load_oom` (which maps
+                    // device-alloc error strings) does not apply — PARO's
+                    // `from_bytes` call sites surface any device-alloc failure.
                     return Ok((tv.bytes.to_vec(), tv.shape, tv.dtype));
                 }
                 TensorLookup::NotInIndex | TensorLookup::WrongShard => {}
@@ -192,10 +233,6 @@ impl<'a> Weights<'a> {
     /// on a config/data contradiction. With no `.scales` sibling the layer is
     /// [`Linear::Plain`]; otherwise [`Linear::Quantized`] with `biases: Some(_)`
     /// iff a `.biases` sibling exists.
-    #[allow(
-        dead_code,
-        reason = "no arch loader calls this yet — each assembles Linear directly; exercised by unit tests only"
-    )]
     pub(crate) fn linear(
         &self,
         base: &str,
@@ -220,6 +257,51 @@ impl<'a> Weights<'a> {
         };
 
         Ok(Linear::Quantized {
+            weight,
+            scales,
+            biases,
+            group_size: params.group_size,
+            bits: params.bits,
+            mode: QuantMode::from(params.mode.as_str()),
+        })
+    }
+
+    /// Assemble an [`Embedding`] for `<base>` from its `.weight` and (optional)
+    /// `.scales` / `.biases` siblings.
+    ///
+    /// Mirrors the structure and contract of [`linear`](Weights::linear): sibling
+    /// presence is detected via [`has`](Weights::has) (header-based, not the
+    /// index). `qp` receives `has_biases` and resolves the quant params for this
+    /// tensor; it may hard-error on a config/data contradiction. With no `.scales`
+    /// sibling the result is [`Embedding::Plain`]; otherwise [`Embedding::Quantized`]
+    /// with `biases: Some(_)` iff a `.biases` sibling exists.
+    ///
+    /// All fetches go through [`array`](Weights::array), so load-phase OOM errors
+    /// are classified uniformly.
+    pub(crate) fn embedding(
+        &self,
+        base: &str,
+        qp: impl FnOnce(bool) -> Result<QuantParams>,
+    ) -> Result<Embedding> {
+        let scales_name = format!("{base}.scales");
+        if !self.has(&scales_name)? {
+            // No scales sibling → plain bf16 weight.
+            let weight = self.array(&format!("{base}.weight"))?;
+            return Ok(Embedding::Plain { weight });
+        }
+
+        let has_biases = self.has(&format!("{base}.biases"))?;
+        let params = qp(has_biases)?;
+
+        let weight = self.array(&format!("{base}.weight"))?;
+        let scales = self.array(&scales_name)?;
+        let biases = if has_biases {
+            Some(self.array(&format!("{base}.biases"))?)
+        } else {
+            None
+        };
+
+        Ok(Embedding::Quantized {
             weight,
             scales,
             biases,
