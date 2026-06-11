@@ -62,30 +62,35 @@ pub fn load_from_path(model_dir: &Path) -> Result<LagunaText> {
 
     let defaults = QuantParams::global(cfg.quant_group_size, cfg.quant_bits, &cfg.quant_mode);
 
-    let load_linear = |base: &str| -> Result<Linear> {
-        let weight = w.array(&format!("{base}.weight"))?;
-        let s_name = format!("{base}.scales");
-        if w.has(&s_name)? {
-            let scales = w.array(&s_name)?;
-            let biases = if w.has(&format!("{base}.biases"))? {
-                Some(w.array(&format!("{base}.biases"))?)
-            } else {
-                None
-            };
-            // The shared resolver owns the `.biases`-sibling affine rule: when
-            // biases are present the tensor is integer-affine regardless of the
-            // global mode (MLX rejects "default"; affine biases require "affine").
-            let qp = resolve_quant(base, biases.is_some(), &defaults, &cfg.quant_overrides)?;
-            Ok(Linear::Quantized {
+    // Thin adapter: calls the shared seam, then converts the shared
+    // `crate::layers::Linear` (mode: QuantMode) to the arch-local
+    // `super::layers::Linear` (mode: String). OOM classification is inside
+    // `w.linear` — no `.map_err` needed here. `Paro` is unreachable from
+    // `w.linear` (it only builds Plain/Quantized) but the match is exhaustive.
+    let lin = |base: &str| -> Result<Linear> {
+        use crate::layers::Linear as SharedLinear;
+        match w.linear(base, |hb| {
+            resolve_quant(base, hb, &defaults, &cfg.quant_overrides)
+        })? {
+            SharedLinear::Plain { weight } => Ok(Linear::Plain { weight }),
+            SharedLinear::Quantized {
                 weight,
                 scales,
                 biases,
-                group_size: qp.group_size,
-                bits: qp.bits,
-                mode: qp.mode,
-            })
-        } else {
-            Ok(Linear::Plain { weight })
+                group_size,
+                bits,
+                mode,
+            } => Ok(Linear::Quantized {
+                weight,
+                scales,
+                biases,
+                group_size,
+                bits,
+                mode: mode.as_str().to_owned(),
+            }),
+            SharedLinear::Paro { .. } => Err(Error::Loader(format!(
+                "{base}: unexpected Paro variant from w.linear"
+            ))),
         }
     };
 
@@ -98,30 +103,30 @@ pub fn load_from_path(model_dir: &Path) -> Result<LagunaText> {
 
     let pfx = "model";
 
-    // Embedding.
+    // Embedding table. Thin adapter mirrors `lin`: converts shared Embedding
+    // (mode: QuantMode) to the arch-local Embedding (mode: String).
     let embed_tokens = {
+        use crate::layers::Embedding as SharedEmbedding;
         let base = format!("{pfx}.embed_tokens");
-        if w.has(&format!("{base}.scales"))? {
-            let weight = w.array(&format!("{base}.weight"))?;
-            let scales = w.array(&format!("{base}.scales"))?;
-            let biases = if w.has(&format!("{base}.biases"))? {
-                Some(w.array(&format!("{base}.biases"))?)
-            } else {
-                None
-            };
-            let qp = resolve_quant(&base, biases.is_some(), &defaults, &cfg.quant_overrides)?;
-            Embedding::Quantized {
+        match w.embedding(&base, |hb| {
+            resolve_quant(&base, hb, &defaults, &cfg.quant_overrides)
+        })? {
+            SharedEmbedding::Plain { weight } => Embedding::Plain { weight },
+            SharedEmbedding::Quantized {
                 weight,
                 scales,
                 biases,
-                group_size: qp.group_size,
-                bits: qp.bits,
-                mode: qp.mode,
-            }
-        } else {
-            Embedding::Plain {
-                weight: w.array(&format!("{base}.weight"))?,
-            }
+                group_size,
+                bits,
+                mode,
+            } => Embedding::Quantized {
+                weight,
+                scales,
+                biases,
+                group_size,
+                bits,
+                mode: mode.as_str().to_owned(),
+            },
         }
     };
 
@@ -137,7 +142,7 @@ pub fn load_from_path(model_dir: &Path) -> Result<LagunaText> {
             "model.lm_head"
         };
         info!(%base, "Laguna: loading separate lm_head");
-        Some(load_linear(base)?)
+        Some(lin(base)?)
     };
 
     // Decoder layers.
@@ -152,11 +157,11 @@ pub fn load_from_path(model_dir: &Path) -> Result<LagunaText> {
         let layer_kind = cfg.layer_attn_kinds[i];
 
         let attn = Attention {
-            q_proj: load_linear(&format!("{a}.q_proj"))?,
-            k_proj: load_linear(&format!("{a}.k_proj"))?,
-            v_proj: load_linear(&format!("{a}.v_proj"))?,
-            o_proj: load_linear(&format!("{a}.o_proj"))?,
-            g_proj: load_linear(&format!("{a}.g_proj"))?,
+            q_proj: lin(&format!("{a}.q_proj"))?,
+            k_proj: lin(&format!("{a}.k_proj"))?,
+            v_proj: lin(&format!("{a}.v_proj"))?,
+            o_proj: lin(&format!("{a}.o_proj"))?,
+            g_proj: lin(&format!("{a}.g_proj"))?,
             q_norm: load_rms(&format!("{a}.q_norm"))?,
             k_norm: load_rms(&format!("{a}.k_norm"))?,
             n_heads,
@@ -174,16 +179,16 @@ pub fn load_from_path(model_dir: &Path) -> Result<LagunaText> {
             MlpKind::Dense => {
                 let m = format!("{base}.mlp");
                 Mlp::Dense(DenseMlp {
-                    gate_proj: load_linear(&format!("{m}.gate_proj"))?,
-                    up_proj: load_linear(&format!("{m}.up_proj"))?,
-                    down_proj: load_linear(&format!("{m}.down_proj"))?,
+                    gate_proj: lin(&format!("{m}.gate_proj"))?,
+                    up_proj: lin(&format!("{m}.up_proj"))?,
+                    down_proj: lin(&format!("{m}.down_proj"))?,
                 })
             }
             MlpKind::Sparse => {
                 let m = format!("{base}.mlp");
 
                 let gate_base = format!("{m}.gate.proj");
-                let router_proj = load_linear(&gate_base)?;
+                let router_proj = lin(&gate_base)?;
 
                 let bias_name = format!("{m}.gate.e_score_correction_bias");
                 let e_score_bias = if w.has(&bias_name)? {
@@ -198,16 +203,16 @@ pub fn load_from_path(model_dir: &Path) -> Result<LagunaText> {
 
                 let sw = format!("{m}.switch_mlp");
                 let experts = SwitchExperts {
-                    gate_proj: load_linear(&format!("{sw}.gate_proj"))?,
-                    up_proj: load_linear(&format!("{sw}.up_proj"))?,
-                    down_proj: load_linear(&format!("{sw}.down_proj"))?,
+                    gate_proj: lin(&format!("{sw}.gate_proj"))?,
+                    up_proj: lin(&format!("{sw}.up_proj"))?,
+                    down_proj: lin(&format!("{sw}.down_proj"))?,
                 };
 
                 let se = format!("{m}.shared_expert");
                 let shared_expert = DenseMlp {
-                    gate_proj: load_linear(&format!("{se}.gate_proj"))?,
-                    up_proj: load_linear(&format!("{se}.up_proj"))?,
-                    down_proj: load_linear(&format!("{se}.down_proj"))?,
+                    gate_proj: lin(&format!("{se}.gate_proj"))?,
+                    up_proj: lin(&format!("{se}.up_proj"))?,
+                    down_proj: lin(&format!("{se}.down_proj"))?,
                 };
 
                 Mlp::Sparse(Box::new(SparseMoeBlock {
