@@ -4,6 +4,11 @@ Per-architecture support matrix for rMLX. Documents the config schema, weight
 and KV quantization support, modalities, context limits, special features, and
 known limitations for every architecture the server can load.
 
+> **Adding a model?** This page is the per-arch *reference*. For the
+> integration surface — the shared seams a new text architecture wires into,
+> the per-arch points it must still write, and the verification ritual — see
+> [`docs/ADDING_A_MODEL.md`](ADDING_A_MODEL.md).
+
 ## Contents
 
 - [Overview](#overview)
