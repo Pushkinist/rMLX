@@ -462,14 +462,16 @@ impl KvQuant {
         matches!(self, KvQuant::RotKTq4V)
     }
 
-    /// True for KV codecs that put K below 8-bit, which is catastrophic on
-    /// Qwen MoE (PPL 218 → 8641 per CLAUDE.md). Used by `validate_resolved` to
-    /// hard-reject explicit `--kv-quant tsym4` on a Qwen MoE arch. `K8V4` /
-    /// `K8V8` / `Planar` / `K8VTurbo3` keep K at 8-bit and are NOT included.
+    /// True for KV codecs that store K below 8 bits. Sub-8-bit K is
+    /// catastrophic on high-GQA architectures (measured: Qwen MoE PPL
+    /// 218 → 8641). `validate_resolved` in `rmlx-models` decides which
+    /// archs reject these codecs — this predicate only names the codec
+    /// property. `K8V4` / `K8V8` / `Planar` / `K8VTurbo3` keep K at
+    /// 8-bit and are NOT included.
     ///
-    /// `PlanarK` is guarded separately via a dedicated `QwenMoePlanarKRejected`
-    /// error (Contract A.y) before this check runs.
-    pub fn refuses_qwen_moe(&self) -> bool {
+    /// `PlanarK` is guarded separately (dedicated resolve error) before
+    /// this check runs.
+    pub fn k_below_8bit(&self) -> bool {
         matches!(
             self,
             KvQuant::TurboSym3

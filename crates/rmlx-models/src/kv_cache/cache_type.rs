@@ -1556,7 +1556,7 @@ pub fn validate_resolved(arch_class: &str, kq: &KvQuant) -> Result<(), ResolveEr
         }
         // Contract A.y — IsoQuant K-side codecs are surfaced via a
         // dedicated error so the diagnostic names the variant. Runs BEFORE the
-        // generic `refuses_qwen_moe → QwenMoeKBitsTooLow(4)` fallthrough.
+        // generic `k_below_8bit → QwenMoeKBitsTooLow(4)` fallthrough.
         if matches!(
             kq,
             KvQuant::Iso3Sym | KvQuant::Iso4Sym | KvQuant::IsoKOnly3 | KvQuant::IsoKOnly4
@@ -1593,7 +1593,7 @@ pub fn validate_resolved(arch_class: &str, kq: &KvQuant) -> Result<(), ResolveEr
         }
         // Contract A.y — TurboSym3 (symmetric WHT-3 K+V) is K-side
         // 3-bit on Qwen MoE — rejected with a dedicated error so the diagnostic
-        // names the variant. Runs after rotor guard and before `refuses_qwen_moe`.
+        // names the variant. Runs after rotor guard and before `k_below_8bit`.
         if matches!(kq, KvQuant::TurboSym3) {
             tracing::warn!(
                 arch = arch_class,
@@ -1608,7 +1608,7 @@ pub fn validate_resolved(arch_class: &str, kq: &KvQuant) -> Result<(), ResolveEr
         // the PPL-218→8641 disaster path on Qwen MoE (CLAUDE.md hard rule 6).
         // Surface as `QwenMoeKBitsTooLow(4)` so the error class is uniform with
         // the existing Mixed K<8 rejection — same exit code, same hint text.
-        if kq.refuses_qwen_moe() {
+        if kq.k_below_8bit() {
             tracing::warn!(
                 arch = arch_class,
                 kv_quant = ?kq,
