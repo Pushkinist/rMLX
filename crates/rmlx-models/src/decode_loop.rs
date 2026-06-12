@@ -501,7 +501,11 @@ pub(crate) fn chunked_prefill(
         if let Err(e) = c.exit_prefill(device) {
             tracing::warn!(arch, error = %e, "prefill: exit_prefill quantization failed");
             prefill_ok = false;
-            break;
+            // No break: every cache entered prefill above and must run
+            // exit_prefill, even after a failure — skipping it leaves the
+            // remaining caches with un-finalized prefill state (no decode
+            // seed / un-quantized storage) that corrupts any later reuse of
+            // this Vec.
         }
     }
     if !prefill_ok || last_logits.is_none() {
