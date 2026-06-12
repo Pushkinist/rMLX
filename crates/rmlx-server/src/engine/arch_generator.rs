@@ -489,16 +489,9 @@ impl Generator for ArchGenerator {
             Some(rq)
         } else if self.kv_quant_user_explicit {
             self.kv_quant_override
-        } else if matches!(
-            self.model.as_ref(),
-            rmlx_models::arch::Architecture::Qwen3VlMoe(_)
-        ) {
-            // Qwen3-VL-MoE degrades under quantized KV (K8V4/K8V8) — both
-            // text and image decode go incoherent on this 4-bit checkpoint.
-            // Pin its auto default to the arch-resolved bf16 (None) rather than
-            // the ctx-based quant policy.
-            tracing::info!("generate: Qwen3-VL-MoE auto-KV pinned to bf16 (None)");
-            Some(rmlx_kv_quant::KvQuant::None)
+        } else if let Some(pin) = self.model.preferred_auto_kv() {
+            tracing::info!(?pin, "generate: arch pinned auto-KV default");
+            Some(pin)
         } else {
             let ctx_quant = rmlx_models::kv_cache::kv_quant_for_ctx(prompt_tokens.len());
             tracing::info!(
