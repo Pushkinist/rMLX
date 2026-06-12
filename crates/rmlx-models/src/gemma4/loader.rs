@@ -56,13 +56,7 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma4Text> {
     let cfg_raw = load_config(model_dir)?;
 
     // Re-read config.json as raw JSON to capture per-tensor quant overrides.
-    let raw_json: serde_json::Value = {
-        let path = model_dir.join("config.json");
-        let data = std::fs::read(&path)
-            .map_err(|e| Error::Loader(format!("cannot read {}: {e}", path.display())))?;
-        serde_json::from_slice(&data)
-            .map_err(|e| Error::Loader(format!("malformed config.json: {e}")))?
-    };
+    let raw_json = crate::load_util::read_raw_config(model_dir)?;
     let raw_quant = raw_json.get("quantization");
 
     let cfg = Gemma4TextConfig::from_model_config(&cfg_raw, raw_quant)?;

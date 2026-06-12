@@ -36,6 +36,16 @@ use tracing::debug;
 
 use crate::layers::{Embedding, Linear, QuantMode, QuantParams};
 
+/// Read `config.json` under `model_dir` as raw JSON, preserving all keys —
+/// including nested blocks (e.g. per-tensor `quantization` overrides) that
+/// typed config structs drop.
+pub(crate) fn read_raw_config(model_dir: &std::path::Path) -> Result<serde_json::Value> {
+    let path = model_dir.join("config.json");
+    let data = std::fs::read(&path)
+        .map_err(|e| Error::Loader(format!("cannot read {}: {e}", path.display())))?;
+    serde_json::from_slice(&data).map_err(|e| Error::Loader(format!("malformed config.json: {e}")))
+}
+
 /// Unified tensor fetch over a snapshot's shards.
 ///
 /// Index-first when an index is available (fast path); header-scan fallback for
