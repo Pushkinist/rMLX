@@ -224,8 +224,11 @@ pub fn f16_bits_to_f32(bits: u16) -> f32 {
         if mantissa == 0 {
             return f32::from_bits(sign);
         }
-        // Subnormal: scale by 2^(1-15-10) = 2^(-24).
-        return f32::from_bits(sign) * (mantissa as f32) * (1.0 / 16777216.0);
+        // Subnormal: scale by 2^(1-15-10) = 2^(-24). The sign must be applied
+        // as a factor of ±1.0 — multiplying by f32::from_bits(sign) (±0.0)
+        // collapses every subnormal to a signed zero.
+        let sign_f = if bits >> 15 != 0 { -1.0_f32 } else { 1.0_f32 };
+        return sign_f * (mantissa as f32) * (1.0 / 16777216.0);
     } else if exp == 31 {
         // Inf or NaN.
         return f32::from_bits(sign | 0x7F800000 | (mantissa << 13));
