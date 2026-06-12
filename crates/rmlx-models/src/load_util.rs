@@ -16,10 +16,6 @@
 //! A corrupt/truncated shard header is never confused with "not here": it
 //! propagates as `Err`, never masked by the header-scan fallback.
 //!
-// unsafe_code: mlx-rs Array zero-copy view — slice::from_raw_parts byte-reinterpret
-// of the i32 packed-pair buffer for Array::from_bytes (PARO assembly).
-#![allow(unsafe_code)]
-
 use std::cell::OnceCell;
 
 use rmlx_core::error::{Error, Result};
@@ -460,12 +456,7 @@ pub(crate) fn load_paro_parts(w: &Weights<'_>, base: &str, group_size: usize) ->
     let sin_theta = Array::from_bytes(&sin_bytes, &[krot as i32, half_hidden as i32], Dtype::F16)?;
 
     let packed = crate::paroquant_msl::pack_pairs_cpu(&pairs_bytes, krot, hidden, group_size)?;
-    // SAFETY: reinterpret the i32 packed-pair buffer as bytes for Array::from_bytes;
-    // the slice is consumed immediately and never aliased mutably.
-    let packed_bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(packed.as_ptr().cast::<u8>(), packed.len() * 4) };
-    let packed_pairs =
-        Array::from_bytes(packed_bytes, &[krot as i32, half_hidden as i32], Dtype::I32)?;
+    let packed_pairs = Array::from_i32_slice(&packed, &[krot as i32, half_hidden as i32])?;
 
     let channel_scales =
         Array::from_bytes(&channel_scales_bytes, &[1i32, hidden as i32], Dtype::F16)?;

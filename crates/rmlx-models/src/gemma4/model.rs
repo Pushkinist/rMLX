@@ -10,14 +10,12 @@
 //!
 //! - [`Gemma4Text`] — model struct, constructed by [`super::loader::load_from_path`].
 
-// unsafe_code: mlx-rs Array zero-copy view — slice::from_raw_parts byte-reinterpret for Array::from_bytes
-#![allow(unsafe_code)]
 #![allow(clippy::manual_let_else, clippy::redundant_closure_for_method_calls)]
 // trivial_casts: `k as &Array` coercions are required to coerce from owned reference to trait-object
 // slice in heterogeneous iterator contexts; rustc does not accept a plain reference without the cast.
 #![allow(trivial_casts)]
 use rmlx_core::error::Result;
-use rmlx_mlx::{multiply, scalar_f32, Array, Device, Dtype};
+use rmlx_mlx::{multiply, scalar_f32, Array, Device};
 use tracing::debug;
 
 use crate::layers::Embedding;
@@ -103,12 +101,7 @@ impl Gemma4Text {
             ));
         }
         let ids_i32: Vec<i32> = ids.iter().map(|&x| x as i32).collect();
-        // SAFETY: `ids_i32` is a Vec<i32> of length `seq`; reinterpreting as &[u8] of
-        // length `seq * 4` is sound (i32 has stricter alignment than u8, no padding,
-        // and the slice does not outlive `ids_i32`).
-        let ids_bytes =
-            unsafe { std::slice::from_raw_parts(ids_i32.as_ptr().cast::<u8>(), seq * 4) };
-        let ids_arr = Array::from_bytes(ids_bytes, &[seq as i32], Dtype::I32)?;
+        let ids_arr = Array::from_i32_slice(&ids_i32, &[seq as i32])?;
 
         // Embed + scale. Mirrors forward_arr.
         let h_raw = self.embed_tokens.forward(&ids_arr, device)?;
@@ -196,9 +189,7 @@ impl Gemma4Text {
     ) -> Result<Array> {
         let seq = ids.len();
         let ids_i32: Vec<i32> = ids.iter().map(|&x| x as i32).collect();
-        let ids_bytes =
-            unsafe { std::slice::from_raw_parts(ids_i32.as_ptr().cast::<u8>(), seq * 4) };
-        let ids_arr = Array::from_bytes(ids_bytes, &[seq as i32], Dtype::I32)?;
+        let ids_arr = Array::from_i32_slice(&ids_i32, &[seq as i32])?;
         self.forward_arr(&ids_arr, seq as i32, caches, device)
     }
 
@@ -218,9 +209,7 @@ impl Gemma4Text {
             )));
         }
         let ids_i32: Vec<i32> = ids.iter().map(|&x| x as i32).collect();
-        let ids_bytes =
-            unsafe { std::slice::from_raw_parts(ids_i32.as_ptr().cast::<u8>(), seq * 4) };
-        let ids_arr = Array::from_bytes(ids_bytes, &[seq as i32], Dtype::I32)?;
+        let ids_arr = Array::from_i32_slice(&ids_i32, &[seq as i32])?;
         self.forward_arr_last_k(&ids_arr, seq as i32, k as i32, None, device)
     }
 
@@ -246,9 +235,7 @@ impl Gemma4Text {
             )));
         }
         let ids_i32: Vec<i32> = ids.iter().map(|&x| x as i32).collect();
-        let ids_bytes =
-            unsafe { std::slice::from_raw_parts(ids_i32.as_ptr().cast::<u8>(), seq * 4) };
-        let ids_arr = Array::from_bytes(ids_bytes, &[seq as i32], Dtype::I32)?;
+        let ids_arr = Array::from_i32_slice(&ids_i32, &[seq as i32])?;
         self.forward_arr_last_k(&ids_arr, seq as i32, k as i32, Some(caches), device)
     }
 
@@ -586,9 +573,7 @@ impl Gemma4Text {
             )));
         }
         let ids_i32: Vec<i32> = ids.iter().map(|&x| x as i32).collect();
-        let ids_bytes =
-            unsafe { std::slice::from_raw_parts(ids_i32.as_ptr().cast::<u8>(), seq * 4) };
-        let ids_arr = Array::from_bytes(ids_bytes, &[seq as i32], Dtype::I32)?;
+        let ids_arr = Array::from_i32_slice(&ids_i32, &[seq as i32])?;
 
         let seq = seq as i32;
         let k = k as i32;
@@ -723,9 +708,7 @@ impl Gemma4Text {
             )));
         }
         let ids_i32: Vec<i32> = ids.iter().map(|&x| x as i32).collect();
-        let ids_bytes =
-            unsafe { std::slice::from_raw_parts(ids_i32.as_ptr().cast::<u8>(), seq * 4) };
-        let ids_arr = Array::from_bytes(ids_bytes, &[seq as i32], Dtype::I32)?;
+        let ids_arr = Array::from_i32_slice(&ids_i32, &[seq as i32])?;
 
         let seq = seq as i32;
         let k = k as i32;
@@ -841,8 +824,7 @@ impl Gemma4Text {
     /// verifier prediction → accept).
     pub fn embed_token_raw(&self, tok: u32, device: Device) -> Result<Array> {
         let ids = [tok as i32];
-        let ids_bytes = unsafe { std::slice::from_raw_parts(ids.as_ptr().cast::<u8>(), 4) };
-        let ids_arr = Array::from_bytes(ids_bytes, &[1], Dtype::I32)?;
+        let ids_arr = Array::from_i32_slice(&ids, &[1])?;
         let e = self.embed_tokens.forward(&ids_arr, device)?;
         let e = e.reshape(&[1, 1, self.cfg.hidden_size as i32], device)?;
         let scale = scalar_f32((self.cfg.hidden_size as f32).sqrt());
