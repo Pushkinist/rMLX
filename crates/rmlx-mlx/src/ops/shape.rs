@@ -49,14 +49,10 @@ pub fn conv2d(
 
 /// Pad `a` along the given `axes` with per-axis `(low, high)` zero padding
 /// (constant mode, pad value 0). `low`/`high` line up with `axes` by index.
-#[allow(
-    clippy::expect_used,
-    reason = "CString::new on a hardcoded ASCII literal — interior NUL is impossible"
-)]
 pub fn pad(a: &Array, axes: &[i32], low: &[i32], high: &[i32], device: Device) -> Result<Array> {
     install_error_handler();
     let zero = scalar_f32(0.0);
-    let mode = std::ffi::CString::new("constant").expect("constant cstr");
+    let mode = crate::mode_to_cstr("constant", "pad")?;
     let mut res = unsafe { sys::mlx_array_new() };
     let status = unsafe {
         with_stream(device, |s| {
