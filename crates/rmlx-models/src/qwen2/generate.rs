@@ -101,7 +101,7 @@ pub fn generate_greedy(
     kv_quant: rmlx_kv_quant::KvQuant,
     max_ctx_override: Option<i32>,
     eos_ids: &[u32],
-    step_fn: &mut dyn FnMut(&crate::gemma4::ProbeStep) -> Option<u32>,
+    step_fn: &mut dyn FnMut(&crate::decode_loop::ProbeStep) -> Option<u32>,
     // A6.2: optional sampler constraint. See gemma4::generate_greedy.
     mut constraint: Option<&mut dyn ConstraintEngine>,
     // A7.2: sampling config + per-request RNG. See gemma3::generate_greedy.
@@ -110,8 +110,8 @@ pub fn generate_greedy(
     // A7.3: logit-penalty configuration + per-request token history.
     penalty_cfg: &crate::sampler::PenaltyConfig,
     token_history: &mut Vec<u32>,
-) -> Result<Vec<crate::gemma4::ProbeStep>> {
-    use crate::gemma4::ProbeStep;
+) -> Result<Vec<crate::decode_loop::ProbeStep>> {
+    use crate::decode_loop::ProbeStep;
 
     tracing::info!(
         arch = "Qwen2ForCausalLM",

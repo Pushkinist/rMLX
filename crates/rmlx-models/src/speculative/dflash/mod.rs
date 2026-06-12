@@ -612,7 +612,7 @@ pub fn walk_block_greedy(
     (accepted, new_tokens)
 }
 
-use crate::gemma4::ProbeStep;
+use crate::decode_loop::ProbeStep;
 
 /// Emit a single token through `step_fn` + the running `emitted` buffer.
 fn emit_step(

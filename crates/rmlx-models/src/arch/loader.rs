@@ -378,7 +378,7 @@ pub fn run_smoke_probe(
     device: Device,
     kv_quant: Option<rmlx_kv_quant::KvQuant>,
     max_ctx_override: Option<i32>,
-) -> Result<crate::gemma4::SmokeVerdict> {
+) -> Result<crate::decode_loop::SmokeVerdict> {
     let model = load_model(model_dir, device, &LoadOpts::default())?;
 
     // Resolve BOS token id from tokenizer_config.json.

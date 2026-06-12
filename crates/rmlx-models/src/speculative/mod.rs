@@ -44,7 +44,7 @@ use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{argmax, Array, Device, Dtype};
 
 use crate::arch::{load_model, Architecture, LoadOpts};
-use crate::gemma4::ProbeStep;
+use crate::decode_loop::ProbeStep;
 use crate::kv_cache::KvCacheBuilder;
 pub use draft_kind::DraftKind;
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache, KV_MAX_SEQ_DEFAULT};

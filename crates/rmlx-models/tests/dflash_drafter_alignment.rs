@@ -202,7 +202,7 @@ fn dflash_live_loop_emits_coherent() {
     let prompt_ids: Vec<u32> = enc.get_ids().to_vec();
 
     let mut emitted_ids: Vec<u32> = Vec::new();
-    let mut step_fn = |s: &rmlx_models::gemma4::ProbeStep| {
+    let mut step_fn = |s: &rmlx_models::ProbeStep| {
         emitted_ids.push(s.token_id);
         None
     };
