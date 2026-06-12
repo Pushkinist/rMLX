@@ -60,6 +60,16 @@ fn metal_kernel_add_one_gpu() {
     }
 }
 
+/// A NUL byte in an output name must return Err (not panic) — a regression
+/// guard for the leak-free error paths in `new` and `strings_to_vec_string`
+/// (this asserts the `Err` contract those frees depend on; it cannot itself
+/// observe a leak).
+#[test]
+fn new_rejects_nul_in_output_name() {
+    let r = MetalKernel::new("k", "", "kernel void k() {}", &["inp"], &["out\0bad"]);
+    assert!(r.is_err());
+}
+
 /// Kernel registration with bad source should not panic.
 ///
 /// MLX may defer compilation to first dispatch, so the error may surface
