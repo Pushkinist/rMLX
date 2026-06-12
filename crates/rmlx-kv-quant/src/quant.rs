@@ -807,13 +807,23 @@ impl KvQuant {
     /// the codec retains a bf16 decode seed via
     /// [`Self::feeds_bf16_k_at_decode`]) — never from an arch name.
     ///
-    /// Components per side:
-    /// - **Packed codes**: `seq * head_dim * code_bits / 8`.
-    /// - **Per-group scales**: one f32 per quantization group. K groups are
-    ///   128 elements (q8_0) or the K-side group; V groups are 32 (TurboQuant)
-    ///   or the affine group. A conservative single cadence of one f32 per 32
-    ///   elements is used for quantized sides (it never under-counts the q8_0
-    ///   K-side at group 128, which is the cheaper case).
+    /// Components per side, by layout family:
+    /// - **Generic (affine / turbo / planar)**: packed codes
+    ///   (`seq * head_dim * code_bits / 8`) + one f32 per 32-element group. A
+    ///   conservative single scale cadence of one f32 per 32 elements is used
+    ///   (it never under-counts the q8_0 K-side at group 128, the cheaper case).
+    /// - **iso (group 4)**: per 4-element group one code u32 + one f32 scale +
+    ///   four f32 quaternion, plus one f32 norm per token. The quaternion
+    ///   sideband dominates and makes an iso side *larger* than bf16 at
+    ///   `head_dim <= 256` — the generic cadence above underestimates it ~12×.
+    /// - **rotor (group 3)**: per 3-element group one code u32 + one f32 scale,
+    ///   plus one f32 norm per token. The static per-(layer, head) rotor table
+    ///   is not per-token and is omitted (estimate, not census).
+    ///
+    /// Only the side that actually carries the family codec uses its formula:
+    /// the V-only variants (`Iso3`/`Iso4`/`Rotor3`/`Rotor4`) keep an 8-bit
+    /// affine K, so their K side takes the generic path.
+    ///
     /// - **bf16 decode seed**: when [`Self::feeds_bf16_k_at_decode`] is true the
     ///   codec keeps a full `seq * head_dim * 2` bf16 mirror of **V** (always)
     ///   and **K** (unless it is a K-only re-quantize family). This is the
@@ -839,33 +849,96 @@ impl KvQuant {
             return elems.saturating_mul(2).saturating_mul(2);
         }
         let (k_bits, v_bits) = self.approx_code_bits();
-        // Per-side bytes: helper sizes one side (K or V) given its code bits and
-        // whether a parallel bf16 decode seed is retained for it.
-        //
-        // - **16-bit side (bf16-stored)**: the side IS a single bf16 buffer.
-        //   No separate codes vs seed — the bf16 buffer is both. Count it once.
-        // - **quantized side**: packed codes (`bits/8` bytes/elem) + one f32
-        //   per 32-element group (conservative scale cadence) + a bf16 decode
-        //   seed mirror *iff* this codec retains one (`retains_seed`).
-        let side_bytes = |bits: u32, retains_seed: bool| -> u64 {
+        let n_tokens = seq.saturating_mul(kv_heads);
+
+        // Per-side bytes for one quantized-or-bf16 side. Three layout families:
+        // - bf16 side (bits >= 16): one bf16 buffer, counted once.
+        // - iso (group 4): per 4-elem group 1 code u32 + 1 f32 scale + 4 f32
+        //   quaternion; plus 1 f32 norm per token. The quaternion sideband
+        //   dominates and makes iso larger than bf16 at head_dim <= 256.
+        // - rotor (group 3): per 3-elem group 1 code u32 + 1 f32 scale; plus
+        //   1 f32 norm per token. (Static per-(layer,head) rotor table is not
+        //   per-token and is omitted, consistent with estimate-not-census.)
+        // - everything else: dense pack bits/8 bytes/elem + one f32 scale per
+        //   32-elem group (the pre-existing conservative cadence).
+        let is_iso = matches!(
+            self,
+            KvQuant::Iso3
+                | KvQuant::Iso4
+                | KvQuant::Iso3Sym
+                | KvQuant::Iso4Sym
+                | KvQuant::IsoKOnly3
+                | KvQuant::IsoKOnly4
+        );
+        let is_rotor = matches!(
+            self,
+            KvQuant::Rotor3
+                | KvQuant::Rotor4
+                | KvQuant::Rotor3Sym
+                | KvQuant::Rotor4Sym
+                | KvQuant::RotorKOnly3
+                | KvQuant::RotorKOnly4
+                | KvQuant::RotorK3Asym { .. }
+                | KvQuant::RotorK4Asym { .. }
+        );
+        let side_bytes = |bits: u32, retains_seed: bool, side_uses_family: bool| -> u64 {
             if bits >= 16 {
-                // bf16 side: single buffer, counted once.
                 return elems.saturating_mul(2);
             }
-            let codes = elems.saturating_mul(u64::from(bits)) / 8;
-            let scales = (elems / 32).saturating_mul(4);
+            let stored = if side_uses_family && is_iso {
+                let groups = elems / 4;
+                groups
+                    .saturating_mul(4 + 4 + 16)
+                    .saturating_add(n_tokens.saturating_mul(4))
+            } else if side_uses_family && is_rotor {
+                // group size 3: per-token head_dim.div_ceil(3), NOT elems/3.
+                let groups = head_dim.div_ceil(3).saturating_mul(n_tokens);
+                groups
+                    .saturating_mul(4 + 4)
+                    .saturating_add(n_tokens.saturating_mul(4))
+            } else {
+                let codes = elems.saturating_mul(u64::from(bits)) / 8;
+                let scales = (elems / 32).saturating_mul(4);
+                codes.saturating_add(scales)
+            };
             let seed = if retains_seed {
                 elems.saturating_mul(2)
             } else {
                 0
             };
-            codes.saturating_add(scales).saturating_add(seed)
+            stored.saturating_add(seed)
         };
+        // Which side actually carries the iso/rotor encoding. V-only variants
+        // (Iso3/Iso4/Rotor3/Rotor4) keep an 8-bit AFFINE K -> generic path.
+        let k_uses_family = matches!(
+            self,
+            KvQuant::Iso3Sym
+                | KvQuant::Iso4Sym
+                | KvQuant::IsoKOnly3
+                | KvQuant::IsoKOnly4
+                | KvQuant::Rotor3Sym
+                | KvQuant::Rotor4Sym
+                | KvQuant::RotorKOnly3
+                | KvQuant::RotorKOnly4
+                | KvQuant::RotorK3Asym { .. }
+                | KvQuant::RotorK4Asym { .. }
+        );
+        let v_uses_family = matches!(
+            self,
+            KvQuant::Iso3
+                | KvQuant::Iso4
+                | KvQuant::Iso3Sym
+                | KvQuant::Iso4Sym
+                | KvQuant::Rotor3
+                | KvQuant::Rotor4
+                | KvQuant::Rotor3Sym
+                | KvQuant::Rotor4Sym
+        );
         // V seed is always retained by the warm-TTFT shortcut codecs (every
         // quant arm reads `decode_fp16_v` at decode). K seed is retained unless
         // this is a K-only re-quantize family (`feeds_bf16_k_at_decode == false`).
-        let k_bytes = side_bytes(k_bits, self.feeds_bf16_k_at_decode());
-        let v_bytes = side_bytes(v_bits, true);
+        let k_bytes = side_bytes(k_bits, self.feeds_bf16_k_at_decode(), k_uses_family);
+        let v_bytes = side_bytes(v_bits, true, v_uses_family);
         k_bytes.saturating_add(v_bytes)
     }
 

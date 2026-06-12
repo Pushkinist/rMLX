@@ -1813,11 +1813,13 @@ mod tests {
         assert_eq!(saving, 0, "bf16 must never be net-negative against itself");
     }
 
-    /// A pure-global layer mix with a seed-free K-only codec at large context is
-    /// net-POSITIVE (no warn) — proving the decision is keyed on codec attrs,
-    /// not on the presence of windowed layers.
+    /// A pure-global layer mix with the seed-free iso K-only codec at large
+    /// context is net-NEGATIVE (warn fires) — the iso quaternion sideband on K
+    /// exceeds the bf16 K it replaces, so the codec costs memory even with no
+    /// windowed layers. Proves the decision is keyed on codec attrs (the K
+    /// sideband), not on the presence of windowed layers.
     #[test]
-    fn net_positive_no_warn_for_seed_free_codec_global_only() {
+    fn net_negative_warn_for_iso_k_only_codec_global_only() {
         // All-global mix (no windowed layers), large context.
         let layers: Vec<KvLayerShape> = (0..16)
             .map(|_| KvLayerShape {
@@ -1831,8 +1833,8 @@ mod tests {
         assert_eq!(n_global, 16);
         assert_eq!(n_win, 0);
         assert!(
-            saving > 0,
-            "IsoKOnly4 (no bf16 K seed) on a large all-global mix should save; got {saving}"
+            saving < 0,
+            "IsoKOnly4 K carries the iso quaternion sideband (larger than bf16 K) → net-negative even all-global; got {saving}"
         );
     }
 

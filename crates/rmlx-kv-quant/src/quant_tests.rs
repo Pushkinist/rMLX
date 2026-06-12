@@ -271,15 +271,16 @@ fn global_layer_scratch_heavy_codec_is_net_negative_at_small_ctx() {
     );
 }
 
-/// A K-only re-quantize codec (no bf16 K seed) on a global layer at large
-/// context can be net-POSITIVE — proving the estimator distinguishes the
-/// seed-retaining families from the seed-free ones, generally.
+/// A seed-free K-only codec that carries a sideband-heavy family codec on K
+/// (iso quaternions) is net-NEGATIVE on memory: the per 4-element-group code +
+/// scale + 4×f32 quaternion, plus one f32 norm per token, exceeds the bf16 K it
+/// replaces — even though K's nominal code width is only 4 bits. This is the
+/// operator truth the resolve-time net-negative warn relies on; a naive
+/// bits-only model wrongly predicts a saving here. The only seed-free K-only
+/// codecs in the matrix (`IsoKOnly*`/`RotorKOnly*`) all carry such a sideband,
+/// so none of them actually save on a global layer.
 #[test]
-fn k_only_codec_can_be_net_positive_on_global_layer() {
-    // IsoKOnly4: feeds_bf16_k_at_decode() == false → no K seed retained.
-    // K stored 4-bit, V stored bf16 (no V codec). At large ctx the 4-bit K
-    // packed codes are smaller than the bf16 K it replaces, and there is no
-    // duplicate K seed, so the codec saves on the K side.
+fn k_only_iso_codec_is_net_negative_from_sidebands() {
     let saving = KvQuant::IsoKOnly4.estimated_net_saving_per_layer(
         16_384, // seq (large)
         128,    // head_dim
@@ -287,8 +288,8 @@ fn k_only_codec_can_be_net_positive_on_global_layer() {
         false,  // global
     );
     assert!(
-        saving > 0,
-        "IsoKOnly4 (no bf16 K seed) on a large global layer should save vs bf16; got {saving}"
+        saving < 0,
+        "IsoKOnly4 K carries the iso quaternion sideband (larger than bf16 K) → net-negative; got {saving}"
     );
 }
 
@@ -311,20 +312,21 @@ fn both_seed_codec_gets_more_negative_with_context() {
     );
 }
 
-/// A seed-free K-only codec crosses over: net-negative at tiny context (scales
-/// overhead dominates), net-positive once the 4-bit K codes save more than the
-/// scales cost. Proves the estimator captures a real per-codec crossover.
+/// The iso K-only codec's net cost scales with context: more tokens → more
+/// quaternion/norm sideband, so the saving grows MORE negative. There is no
+/// crossover — the sideband is a per-token overhead, not a fixed one, so it can
+/// never amortize away.
 #[test]
-fn seed_free_codec_improves_with_context_on_global_layer() {
+fn iso_k_only_codec_gets_more_negative_with_context() {
     let small = KvQuant::IsoKOnly4.estimated_net_saving_per_layer(64, 128, 8, false);
     let large = KvQuant::IsoKOnly4.estimated_net_saving_per_layer(16_384, 128, 8, false);
     assert!(
-        large > small,
-        "seed-free codec saving must improve with context: small={small} large={large}"
+        small < 0 && large < 0,
+        "iso K-only is net-negative at both contexts: small={small} large={large}"
     );
     assert!(
-        large > 0,
-        "seed-free K-only codec must be net-positive at large ctx; got {large}"
+        large < small,
+        "iso quaternion sideband is a per-token overhead → more negative with context: small={small} large={large}"
     );
 }
 
@@ -336,4 +338,69 @@ fn none_codec_zero_saving_vs_itself() {
     assert_eq!(bytes, 2 * 1024 * 128 * 8 * 2);
     let saving = KvQuant::None.estimated_net_saving_per_layer(1024, 128, 8, false);
     assert_eq!(saving, 0, "None vs bf16 baseline must net to 0");
+}
+
+/// The resident-bytes estimator must track the codec's ACTUAL stored bytes
+/// (codes + scales + sidebands), not just nominal code bits — otherwise the
+/// net-negative warn lies for sideband-heavy families (iso quaternions,
+/// rotor group-3 scale cadence).
+#[test]
+fn estimator_matches_actual_iso_rotor_encode_bytes() {
+    let head_dim = 128usize;
+    let seq = 64u64;
+    let kv_heads = 4u64;
+    let n_tokens = (seq * kv_heads) as usize;
+    let v: Vec<f32> = (0..n_tokens * head_dim)
+        .map(|i| ((i % 251) as f32) / 251.0 - 0.5)
+        .collect();
+
+    // iso3: actual stored bytes per side (codes + scales + quaternions + norms).
+    let (codes, scales, quats, norms) =
+        crate::isoquant::iso_encode_fast(&v, head_dim, 4, 3).unwrap();
+    let iso_side_actual = 4 * (codes.len() + scales.len() + quats.len() + norms.len()) as u64;
+
+    // Iso3Sym quantizes BOTH sides with the iso codec and retains bf16 seeds
+    // for both (warm-TTFT): estimate = 2*(side + seed).
+    let elems = seq * head_dim as u64 * kv_heads;
+    let seed = elems * 2;
+    let est = KvQuant::Iso3Sym.estimated_resident_bytes_per_layer(seq, head_dim as u64, kv_heads);
+    let expected = 2 * (iso_side_actual + seed);
+    let tol = expected / 10; // ±10%
+    assert!(
+        est.abs_diff(expected) <= tol,
+        "Iso3Sym estimate {est} not within 10% of actual {expected}"
+    );
+
+    // rotor3: per-token = n_groups*(code u32 + scale f32) + norm f32.
+    let n_groups = head_dim.div_ceil(crate::rotorquant::ROTOR3_GROUP_SIZE);
+    let rotors = vec![0.5f32; n_groups * 4];
+    let (r_codes, r_scales, r_norms) =
+        crate::rotorquant::rotor3_encode(&v, &rotors, head_dim).unwrap();
+    let rotor_side_actual = 4 * (r_codes.len() + r_scales.len() + r_norms.len()) as u64;
+    let est_r =
+        KvQuant::Rotor3Sym.estimated_resident_bytes_per_layer(seq, head_dim as u64, kv_heads);
+    let expected_r = 2 * (rotor_side_actual + seed);
+    let tol_r = expected_r / 10;
+    assert!(
+        est_r.abs_diff(expected_r) <= tol_r,
+        "Rotor3Sym estimate {est_r} not within 10% of actual {expected_r}"
+    );
+
+    // Net-saving must now be NEGATIVE for iso at head_dim=128.
+    let saving =
+        KvQuant::Iso3Sym.estimated_net_saving_per_layer(seq, head_dim as u64, kv_heads, false);
+    assert!(
+        saving < 0,
+        "iso3 must report net-negative at head_dim=128, got {saving}"
+    );
+
+    // V-only variants keep an 8-bit AFFINE K — their K side must take the
+    // generic codes+scales path, not the quaternion formula. Sym estimate
+    // (iso K) must be strictly larger than the V-only estimate (affine K).
+    let est_v_only =
+        KvQuant::Iso3.estimated_resident_bytes_per_layer(seq, head_dim as u64, kv_heads);
+    assert!(
+        est_v_only < est,
+        "Iso3 (affine K) estimate {est_v_only} must be below Iso3Sym (iso K) {est}"
+    );
 }
