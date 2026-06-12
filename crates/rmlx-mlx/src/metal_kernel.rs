@@ -97,7 +97,12 @@ impl MetalKernel {
 
         // Build mlx_vector_string for input_names and output_names.
         let in_vec = strings_to_vec_string(input_names)?;
-        let out_vec = strings_to_vec_string(output_names)?;
+        let out_vec = strings_to_vec_string(output_names).inspect_err(|_e| {
+            // SAFETY: in_vec was created just above, is not aliased, and is not
+            // used after this free — release it so the output-name failure path
+            // does not leak the input handle.
+            unsafe { sys::mlx_vector_string_free(in_vec) };
+        })?;
 
         // SAFETY: all CStrings are valid NUL-terminated strings; vectors were
         // created above and are valid for the duration of this call.
@@ -367,6 +372,10 @@ fn strings_to_vec_string(names: &[&str]) -> Result<sys::mlx_vector_string> {
     let vec = unsafe { sys::mlx_vector_string_new() };
     for &s in names {
         let cs = CString::new(s).map_err(|_| {
+            // SAFETY: vec was created above and is not aliased; free it before
+            // returning so the NUL-byte path does not leak the handle (mirrors
+            // the append_value-failure free below).
+            unsafe { sys::mlx_vector_string_free(vec) };
             Error::Mlx(format!(
                 "strings_to_vec_string: string '{s}' contains a NUL byte"
             ))
