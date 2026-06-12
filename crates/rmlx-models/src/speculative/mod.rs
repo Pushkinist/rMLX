@@ -1,6 +1,3 @@
-// unsafe_code: mlx-rs Array zero-copy view — slice::from_raw_parts byte-reinterpret for Array::from_bytes
-#![allow(unsafe_code)]
-
 //! Speculative decoding.
 //!
 //! Wraps a (verifier, draft) pair of `Architecture` instances.
@@ -1496,9 +1493,7 @@ fn draft_decode_n(
 
     // Step 0: feed all seed tokens at once (typical seed.len() = 1 or 2).
     let seed_i32: Vec<i32> = seed.iter().map(|&x| x as i32).collect();
-    let seed_bytes =
-        unsafe { std::slice::from_raw_parts(seed_i32.as_ptr().cast::<u8>(), seed.len() * 4) };
-    let mut y_arr = Array::from_bytes(seed_bytes, &[seed.len() as i32], Dtype::I32)?;
+    let mut y_arr = Array::from_i32_slice(&seed_i32, &[seed.len() as i32])?;
 
     let mut emitted_arrays: Vec<Array> = Vec::with_capacity(n);
     for _step_idx in 0..n {
@@ -1574,9 +1569,7 @@ fn draft_decode_n_stochastic(
     }
 
     let seed_i32: Vec<i32> = seed.iter().map(|&x| x as i32).collect();
-    let seed_bytes =
-        unsafe { std::slice::from_raw_parts(seed_i32.as_ptr().cast::<u8>(), seed.len() * 4) };
-    let mut y_arr = Array::from_bytes(seed_bytes, &[seed.len() as i32], Dtype::I32)?;
+    let mut y_arr = Array::from_i32_slice(&seed_i32, &[seed.len() as i32])?;
 
     let mut tokens: Vec<u32> = Vec::with_capacity(n);
     let mut q_dists: Vec<Vec<f32>> = Vec::with_capacity(n);
