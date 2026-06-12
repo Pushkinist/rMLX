@@ -1204,6 +1204,26 @@ impl Architecture {
         }
     }
 
+    /// Prompt-cache stats for the arch's shared PromptCache, when it has one.
+    ///
+    /// Reads the arch-specific global static that `generate_greedy` writes after
+    /// each generation call.  Returns `None` for architectures that do not yet
+    /// maintain a shared PromptCache (Qwen2, BitNet, Laguna, Qwen3VlMoe).
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "archs without a shared PromptCache fall through to None"
+    )]
+    pub fn cache_stats(&self) -> Option<crate::CacheStats> {
+        match self {
+            Architecture::Gemma4(_) | Architecture::Gemma3(_) => {
+                crate::gemma4::gemma4_cache_stats()
+            }
+            Architecture::Qwen3_5Moe(_) => crate::qwen3_5_moe::qwen3_5_moe_cache_stats(),
+            Architecture::Qwen3(_) => crate::qwen3::read_cache_stats(),
+            _ => None,
+        }
+    }
+
     /// Actual on-device KV-cache bytes used by the most recent `generate_greedy`
     /// call on this architecture.
     ///
