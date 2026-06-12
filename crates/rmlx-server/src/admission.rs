@@ -329,6 +329,10 @@ pub struct ControllerConfig {
     /// Initial (and minimum) queue depth. Equals the static `--max-queue-depth`
     /// passed at startup. The controller never goes below `MIN_QUEUE_DEPTH` (1).
     pub initial_queue_depth: usize,
+    /// Module-style arch key of the loaded model (`"gemma4"`, `"qwen3_5_moe"`, …),
+    /// used to resolve the arch's prefill-chunk default when no runtime override
+    /// is active. Empty string → conservative FALLBACK chunk.
+    pub arch: String,
     /// When `true`, the controller also adjusts the process-wide prefill
     /// chunk size via `rmlx_models::prefill_chunk::set_prefill_chunk`.
     ///
@@ -341,11 +345,19 @@ pub struct ControllerConfig {
 
 impl ControllerConfig {
     /// Construct a new `ControllerConfig` with `adaptive_prefill_chunk = false`.
-    pub fn new(step_target_ms: u64, itl_target_ms: u64, initial_queue_depth: usize) -> Self {
+    ///
+    /// `arch` is the module-style key of the loaded model (see [`ControllerConfig::arch`]).
+    pub fn new(
+        step_target_ms: u64,
+        itl_target_ms: u64,
+        initial_queue_depth: usize,
+        arch: String,
+    ) -> Self {
         Self {
             step_target_ms,
             itl_target_ms,
             initial_queue_depth,
+            arch,
             adaptive_prefill_chunk: false,
         }
     }
@@ -595,7 +607,7 @@ impl ControllerHandle {
     fn tick_prefill_chunk(&self, est_itl: f64, itl_target: f64) {
         let mut g = self.inner.lock();
         let current = rmlx_models::prefill_chunk::runtime_override()
-            .unwrap_or_else(|| rmlx_models::prefill_chunk::prefill_chunk_for("gemma4"));
+            .unwrap_or_else(|| rmlx_models::prefill_chunk::prefill_chunk_for(&g.config.arch));
 
         let reason = if est_itl > itl_target {
             g.prefill_chunk_overload_ticks += 1;
