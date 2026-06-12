@@ -562,7 +562,14 @@ because per-pair rotation+scale compresses correlated pairs extremely well even 
 
 **CLI**: `--kv-quant planar3`; or `--ctk q8_g128 --ctv planar_3`; or `--kv-preset planar3`.
 
-**Smoke-probe status**: CPU codec verified; GPU MSL kernels implemented (GPU tests `#[ignore]` until Metal context available).
+**Smoke-probe status**: CPU codec verified; the V3 **quantize** kernel
+(`planar_quantize_v3_gpu`) is **precompiled at load** via
+`precompile::warm_v_side`, so a first `--kv-quant planar3` request pays no
+Metal cold-compile stall on the prefill V-encode path (the separate
+`planar_dequantize_v3_gpu` kernel still cold-compiles lazily on first cache
+read). The GPU round-trip test `planar_v3_msl_roundtrip_within_tolerance`
+exists and passes but is `#[ignore]`-gated (needs a local Metal context — run
+with `cargo test -p rmlx-kv-quant --release -- --ignored`).
 
 ---
 
@@ -881,7 +888,7 @@ disaster path on Qwen MoE. `--kv-quant tsym4` on a
 `Qwen3_5MoeForConditionalGeneration` checkpoint is rejected at resolve-time
 by `validate_resolved` with `ResolveError::QwenMoeKBitsTooLow(4)` (exit 78,
 same surface as the existing Mixed K<8 rejection). The helper
-`KvQuant::refuses_qwen_moe()` returns `true` for this variant — extend the
+`KvQuant::k_below_8bit()` returns `true` for this variant — extend the
 helper when adding any future sub-8-bit-K codec.
 
 `KvCacheBuilder::resolve_default` never returns `TurboSym4` for any arch.
@@ -977,7 +984,7 @@ K-head error through softmax). `--kv-quant planar_k` and
 `Qwen3VLMoeForConditionalGeneration` are rejected at resolve-time by
 `validate_resolved` with the dedicated `ResolveError::QwenMoePlanarKRejected`
 (distinct from `QwenMoeKBitsTooLow` so the K-side disaster surface is
-preserved in the diagnostic). The helper `KvQuant::refuses_qwen_moe()`
+preserved in the diagnostic). The helper `KvQuant::k_below_8bit()`
 returns `true` for this variant — extend the helper when adding any future
 sub-8-bit-K codec.
 
@@ -1385,6 +1392,14 @@ where `*` is the **Hamilton product** and `v ∈ ℝ⁴` is treated as a quatern
 
 **Dequantize:** unpack → centroid lookup → rescale → inverse rotate → renorm.
 
+**Memory truth.** iso stores, per 4-element group, a packed code word, an
+f32 scale, and a 4×f32 quaternion, plus one f32 norm per token — ≈772 B per
+token per kv_head at head_dim=128 versus 256 B for bf16. **iso3/iso4 are
+net-NEGATIVE on memory at head_dim ≤ 256**; they are research codecs for
+quality experiments, not size wins. The resolve-time net-negative warn
+(`estimated_resident_bytes_per_layer` models the quaternion + norm sidebands
+exactly) accounts for these sidebands.
+
 **`head_dim % 4 == 0` constraint.** iso3 operates in groups of 4. Any
 `head_dim` not divisible by 4 is rejected at encode/decode time with
 `IsoQuantError::HeadDimNotMultipleOf4`.
@@ -1746,7 +1761,7 @@ the SDPA path and the SSD writer/reader tensor names (`l{idx}.k.*` vs
 
 **A.y Qwen MoE arch guard (mandatory).** K-side ≤4-bit on Qwen MoE is the
 PPL-disaster zone (218 → 8641 on Q4_K_M baseline; 7:1 GQA amplifies K-head
-error through softmax). All four variants extend `KvQuant::refuses_qwen_moe()`
+error through softmax). All four variants are flagged by `KvQuant::k_below_8bit()`
 and `cache_type::validate_resolved` routes them through the dedicated
 `ResolveError::QwenMoeIsoKRejected { variant }` error, which quotes the
 offending variant by name. `KvCacheBuilder::resolve_default` never returns
@@ -1767,6 +1782,17 @@ bf16 buffer on first decode step.
 **Status.** CPU-only on the hot path. The iso3 MSL kernel could in principle
 be reused on the K axis (it is axis-agnostic), but on-disk and SDPA paths use
 the CPU dequant fallback; an MSL re-wiring is a deferred follow-up.
+
+**Decode-cost caveat.** `QuantIsoK3`/`QuantIsoK4` have no GPU-resident code
+mirror on the live decode path: the CPU `dequant()` re-materializes every
+accumulated block each step and the reconstructed K prefix is re-uploaded to
+the GPU via `Array::from_bytes` — an O(kv_seq) per-step cost that grows
+monotonically with context. (A `dequant_gpu` mirror exists but is gated behind
+`gpu_resident_iso_enabled()`, hardcoded `false` in `rmlx-kv-quant/src/lib.rs`,
+so it does not run.) The short-prompt anchors elsewhere in this doc (warm-TTFT
+masks the cost after step 1) do not show it; long-prompt decode does (k_iso3
+Bonsai ~59 TPS vs iso3_sym ~142). The GPU mirror is deferred until a bench arm
+shows a win on a FusedQkShadow-incompatible path.
 
 **Cosine empirical floors.** Measured on the LCG fixture at
 `head_dim=128, n_rows=16, TEST_SEED` (see `quant_iso_k{,4}_tests.rs`):
@@ -1834,6 +1860,15 @@ siblings (K-side ≤4-bit on Qwen MoE is the PPL-disaster path). The error's
 **SDPA**: the K rotor codec dequants to bf16 (existing `RotorKOnly{3,4}` K
 path); the affine V codec dequants to bf16 (existing `K8V4` V path); then
 `scaled_dot_product_attention` runs.
+
+**Decode-cost caveat.** Like the iso K-side codecs, the rotor K-side codecs
+have no GPU-resident code mirror: with the default `--rotor-qjl on`, each
+decode step re-decodes the full K prefix on the CPU (and re-encodes the newly
+appended token), applies an O(head_dim²)-per-cached-token QJL score
+correction, then re-uploads the K prefix — an O(kv_seq) per-step cost that the
+short-prompt anchors mask but long-prompt decode exposes. The fused-QK fast path (which would avoid the
+per-step marshaling) is reachable only with `--rotor-qjl off` and is
+default-OFF; see the Fused-QK status below.
 
 **Fused-QK status:** the 6 rotor variants (`Rotor3Sym`, `Rotor4Sym`,
 `RotorKOnly3`, `RotorKOnly4`, `RotorK3Asym`, `RotorK4Asym`) are wired into
@@ -1919,7 +1954,7 @@ is validated; the QJL wiring did not change the storage shape.
 
 **A.y Qwen MoE arch guard (mandatory).** K-side ≤4-bit on Qwen MoE is the
 PPL-disaster zone (218 → 8641 on Q4_K_M baseline; 7:1 GQA amplifies K-head
-error through softmax). All four variants extend `KvQuant::refuses_qwen_moe()`
+error through softmax). All four variants are flagged by `KvQuant::k_below_8bit()`
 and `cache_type::validate_resolved` routes them through
 `ResolveError::QwenMoeRotorKRejected { variant }`, which quotes the offending
 variant by name. Error message verbatim:

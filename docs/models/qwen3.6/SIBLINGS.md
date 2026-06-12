@@ -172,7 +172,7 @@ rMLX full matrix (Stage 2):
 ```
 
 **Arch-guard pre-skips for MoE (Qwen3.5-MoE):** the following KV variants are hard-rejected
-by `refuses_qwen_moe()` in `rmlx-kv-quant/src/quant.rs` and will be logged as skip(arch-guard)
+by `k_below_8bit()` in `rmlx-kv-quant/src/quant.rs` and will be logged as skip(arch-guard)
 without a probe: `tsym3, tsym4, iso3_sym, iso4_sym, k_iso3, k_iso4, rotor3_sym, rotor4_sym,
 k_rotor3, k_rotor4, rotor_k_3_asym_*, rotor_k_4_asym_*` (~13 variants), plus `planar_k`.
 

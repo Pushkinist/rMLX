@@ -160,6 +160,19 @@ Recorded per `(codec, model)` cell. A.y-excluded combos (e.g. K8VTurbo3 K-side �
 
 `—` = cell not measured yet. SKIP marks A.y-rejected combos.
 
+**Why `k_iso*` / `k_rotor*` trail their `*_sym` siblings.** Counter-intuitively
+the K-only variants (bf16 V) decode *slower* than the fully-symmetric ones on
+Bonsai (e.g. k_iso3 59 vs iso3_sym 142, k_rotor3 45 vs rotor3_sym 145). The
+K-side iso/rotor codecs have no GPU-resident code mirror on the live decode
+path: the CPU `dequant()` re-materializes the full K prefix each step and the
+result is re-uploaded via `Array::from_bytes` (rotor additionally applies an
+O(head_dim²)-per-token QJL score correction under the default `--rotor-qjl
+on`), an O(kv_seq) per-step cost the `*_sym` path amortizes through its
+warm-TTFT bf16 seed. (The `dequant_gpu` mirror is gated off by
+`gpu_resident_iso_enabled()`.) These anchors are
+short-prompt; the gap widens with context. See `docs/KV_QUANT.md` "iso/rotor
+K-side variants" and `gpu_resident_iso_enabled` in `rmlx-kv-quant/src/lib.rs`.
+
 Each new codec: invoke `scripts/bench_codec_cell.sh --kv-quant <codec> --model <model>` per cell (3 cells per codec, A.y-excluded skipped), then append to this table.
 
 **Champions regen**: regenerate `BENCHMARK_CHAMPIONS.md` via `rmlx metrics export --markdown` after each cell lands. If that command is unavailable, manual fallback: hand-edit `BENCHMARK_CHAMPIONS.md` with cell + recorded TPS, cite source CSV row.
