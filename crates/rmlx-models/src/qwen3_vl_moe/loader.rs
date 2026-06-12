@@ -35,13 +35,7 @@ use super::moe::{SparseMoeBlock, SwitchMlp};
 
 /// Load the full `Qwen3VlMoeConfig` from `config.json`.
 pub fn load_config_qwen3_vl(model_dir: &Path) -> Result<Qwen3VlMoeConfig> {
-    let raw_json: serde_json::Value = {
-        let path = model_dir.join("config.json");
-        let data = std::fs::read(&path)
-            .map_err(|e| Error::Loader(format!("cannot read {}: {e}", path.display())))?;
-        serde_json::from_slice(&data)
-            .map_err(|e| Error::Loader(format!("malformed config.json: {e}")))?
-    };
+    let raw_json = crate::load_util::read_raw_config(model_dir)?;
     let raw = raw_json
         .as_object()
         .ok_or_else(|| Error::Config("qwen3_vl_moe: config.json is not an object".into()))?;
