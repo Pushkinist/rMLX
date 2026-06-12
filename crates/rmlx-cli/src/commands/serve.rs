@@ -1173,11 +1173,25 @@ pub(crate) fn run_serve(
         // Must happen after AppState is built but before accepting connections.
         // Mutates state.admission_controller and spawns the background tick task.
         if adaptive_admission {
+            // Resolve the primary model's prefill-chunk arch key from the registry
+            // (the per-model config class name, mapped to a module-style key). The
+            // controller's prefill-chunk fallback is process-wide; with a single
+            // --model there is exactly one entry. Empty string → conservative
+            // FALLBACK chunk, never the oversized gemma4 default.
+            let prefill_arch = state
+                .registry
+                .list()
+                .first()
+                .map_or("", |e| {
+                    rmlx_models::prefill_chunk::module_key_for_class(&e.arch)
+                })
+                .to_owned();
             let ctrl = rmlx_server::ControllerHandle::new(
                 rmlx_server::ControllerConfig::new(
                     ttft_target_ms, // M2: flag --ttft-target-ms maps to step_target_ms
                     itl_target_ms,
                     max_queue_depth.max(1),
+                    prefill_arch,
                 )
                 .with_adaptive_prefill_chunk(adaptive_prefill_chunk),
                 state.metrics.clone(),
