@@ -107,7 +107,7 @@ Bonsai facts that drive legality:
 - `head_dim = 128` → divisible by 4 (Iso quaternion) and 32 (Planar) — all
   rotation codecs are shape-legal.
 - dense `Qwen3ForCausalLM` (not `Qwen3_5MoeForConditionalGeneration`) →
-  `refuses_qwen_moe()` codecs (`*Sym`, `IsoKOnly*`, `RotorKOnly*`,
+  `k_below_8bit()` codecs (`*Sym`, `IsoKOnly*`, `RotorKOnly*`,
   `RotorK*Asym`, `PlanarK`) are all LEGAL here.
 - `max_position_embeddings = 65536` via YARN → 8k NIAH is well within band.
 
@@ -354,7 +354,7 @@ extend: add more `[[case]]` rows with `model = "GEMMA4_E4B"` / `"GEMMA4_26B"` /
 `k8vturbo2`, `planar3`, `iso3/4`, `rotor3/4`, …; Qwen3.6: `iso4`, `rotor3/4`,
 `mixed_k8g64_v4g64`, …, all K≥8).
 Each new golden auto-records on first run (`RMLX_E2E_REGEN_GOLDEN=1` to refresh).
-The Qwen-MoE illegal-codec surface (every `refuses_qwen_moe()` variant) can be
+The Qwen-MoE illegal-codec surface (every `k_below_8bit()` variant) can be
 swept with additional `serve_refused` rows.
 
 ## Files
