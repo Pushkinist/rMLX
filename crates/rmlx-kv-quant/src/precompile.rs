@@ -197,7 +197,7 @@ fn gcd_usize(mut a: usize, mut b: usize) -> usize {
 /// will compile lazily on first real use, same as the lazy-compile path).
 #[allow(
     clippy::wildcard_enum_match_arm,
-    reason = "the wildcard arm is the contract: codecs whose V encode is q8 (K8V8), CPU-forced (turbo3/turbo2/tcq/planar3), or CPU-only (iso/rotor, skipped before this call) have no extra V shader to warm here. Exhaustive expansion would add a no-op arm per future variant for no semantic gain."
+    reason = "the wildcard arm is the contract: codecs whose V encode is q8 (K8V8), CPU-forced (turbo3/turbo2/tcq), or CPU-only (iso/rotor, skipped before this call) have no extra V shader to warm here. Exhaustive expansion would add a no-op arm per future variant for no semantic gain."
 )]
 fn warm_v_side(kq: KvQuant, warm: &Array, device: Device) -> Result<()> {
     let head_dim = warm.shape().last().copied().unwrap_or(0);
@@ -220,9 +220,19 @@ fn warm_v_side(kq: KvQuant, warm: &Array, device: Device) -> Result<()> {
             scales.eval()?;
             rotations.eval()?;
         }
+        // PlanarQuant-3 V — same Givens-rotation kernel family at 3-bit.
+        // (quant_planar_v.rs dispatches planar_quantize_v3_gpu on the GPU
+        // append path when bits == 3.)
+        KvQuant::Planar3 => {
+            let (codes, scales, rotations) =
+                crate::planarquant_msl::planar_quantize_v3_gpu(warm, device)?;
+            codes.eval()?;
+            scales.eval()?;
+            rotations.eval()?;
+        }
         // K8V8 V side reuses the q8 kernel already warmed above; all other
-        // MSL-carrying codecs run their V encode on CPU (turbo3/turbo2/tcq,
-        // planar3) so there is no extra V shader to warm here.
+        // MSL-carrying codecs run their V encode on CPU (turbo3/turbo2/tcq)
+        // so there is no extra V shader to warm here.
         _ => {}
     }
     Ok(())
