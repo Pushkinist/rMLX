@@ -54,10 +54,6 @@
 //! * [`crate::turboquant_msl`] — bit-exact 4-bit unpack idiom (same byte/
 //!   nibble window arithmetic, reframed per thread instead of per-word).
 
-// unsafe_code: dims buffer byte cast — slice::from_raw_parts over a fixed
-// u32 array for MSL kernel input. SAFETY justified at each use site.
-#![allow(unsafe_code)]
-
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
@@ -262,37 +258,25 @@ pub fn turbo_k4_fused_qk_sdpa(
     scale: f32,
     device: Device,
 ) -> Result<Array> {
-    if head_dim != 128 && head_dim != 256 {
-        return Err(Error::Quant(format!(
-            "turbo_k4_fused_qk_sdpa: head_dim={head_dim} not supported \
-             (only 128 and 256 are wired; legacy dequant+SDPA path handles other dims)"
-        )));
-    }
+    let setup = crate::fused_qk_common::build_fused_qk_setup(
+        "turbo_k4_fused_qk_sdpa",
+        query,
+        additive_mask,
+        b,
+        kv_h,
+        kv_seq,
+        head_dim,
+        heads_per_kv,
+        scale,
+        device,
+    )?;
+
     if !(head_dim as usize).is_multiple_of(GROUP_SIZE) {
         return Err(Error::Quant(format!(
             "turbo_k4_fused_qk_sdpa: invariant: head_dim={head_dim} must be a multiple of \
              GROUP_SIZE={GROUP_SIZE}"
         )));
     }
-    if heads_per_kv <= 0 {
-        return Err(Error::Quant(format!(
-            "turbo_k4_fused_qk_sdpa: heads_per_kv must be > 0, got {heads_per_kv}"
-        )));
-    }
-    if b <= 0 || kv_seq <= 0 || kv_h <= 0 {
-        return Err(Error::Quant(format!(
-            "turbo_k4_fused_qk_sdpa: b={b}, kv_h={kv_h}, kv_seq={kv_seq} must all be > 0"
-        )));
-    }
-    let n_q_heads = kv_h * heads_per_kv;
-
-    let q_total: i64 = i64::from(b) * i64::from(n_q_heads) * i64::from(head_dim);
-    let q_flat = query.reshape(&[q_total as i32], device)?;
-    let q_f32 = if q_flat.dtype() == Dtype::F32 {
-        q_flat
-    } else {
-        q_flat.astype(Dtype::F32, device)?
-    };
 
     let tok_count: i64 = i64::from(b) * i64::from(kv_h) * i64::from(kv_seq);
     // turbo4: 4 u32 words per 32-element group => D/8 words per token.
@@ -300,82 +284,31 @@ pub fn turbo_k4_fused_qk_sdpa(
     let scales_total: i64 = tok_count * i64::from(head_dim) / (GROUP_SIZE as i64);
     let codes_flat = k_codes.reshape(&[codes_total as i32], device)?;
     let scales_flat = k_scales.reshape(&[scales_total as i32], device)?;
-
-    let (mask_flat, has_mask) = if let Some(m) = additive_mask {
-        let mask_total: i64 = i64::from(b) * i64::from(n_q_heads) * i64::from(kv_seq);
-        let m_f = if m.dtype() == Dtype::F32 {
-            m.reshape(&[mask_total as i32], device)?
-        } else {
-            m.astype(Dtype::F32, device)?
-                .reshape(&[mask_total as i32], device)?
-        };
-        (m_f, 1u32)
-    } else {
-        let zero_bytes = [0u8; 4];
-        let dummy = Array::from_bytes(&zero_bytes, &[1], Dtype::F32)
-            .map_err(|e| Error::Mlx(format!("turbo_k4_fused_qk dummy mask: {e}")))?;
-        (dummy, 0u32)
-    };
-
-    let scale_arr = {
-        let bytes = scale.to_le_bytes();
-        Array::from_bytes(&bytes, &[1], Dtype::F32)?
-    };
-    let dims_vals: [u32; 5] = [
-        head_dim as u32,
-        kv_seq as u32,
-        kv_h as u32,
-        heads_per_kv as u32,
-        has_mask,
-    ];
-    let dims_arr = {
-        // SAFETY: `dims_vals` is a stack array of 5 `u32`; reinterpreting the
-        // pointer as `&[u8]` of length 20 is safe — `u32` has no alignment
-        // requirement stricter than `u8`, every bit pattern is valid for
-        // `u8`, and `Array::from_bytes` copies the bytes before this scope
-        // ends, so no escaping pointer.
-        let bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(dims_vals.as_ptr().cast::<u8>(), 5 * 4) };
-        Array::from_bytes(bytes, &[5], Dtype::U32)?
-    };
-
-    q_f32.eval()?;
     codes_flat.eval()?;
     scales_flat.eval()?;
-    mask_flat.eval()?;
-    scale_arr.eval()?;
-    dims_arr.eval()?;
 
     let kernel = qk_kernel()?;
     let mut invoke = MetalKernelInvoke::new();
-    invoke.add_input(&q_f32)?;
+    invoke.add_input(&setup.q_f32)?;
     invoke.add_input(&codes_flat)?;
     invoke.add_input(&scales_flat)?;
-    invoke.add_input(&mask_flat)?;
-    invoke.add_input(&scale_arr)?;
-    invoke.add_input(&dims_arr)?;
+    invoke.add_input(&setup.mask_flat)?;
+    invoke.add_input(&setup.scale_arr)?;
+    invoke.add_input(&setup.dims_arr)?;
 
-    let out_total: i64 = i64::from(b) * i64::from(n_q_heads) * i64::from(kv_seq);
-    invoke.add_output_shape(&[out_total as i32], Dtype::F32)?;
+    invoke.add_output_shape(&[setup.out_total as i32], Dtype::F32)?;
 
-    let grid_x: i64 = i64::from(kv_seq) * i64::from(head_dim);
-    let grid_y: i64 = i64::from(b) * i64::from(n_q_heads);
-    if grid_x > i64::from(i32::MAX) || grid_y > i64::from(i32::MAX) {
-        return Err(Error::Quant(format!(
-            "turbo_k4_fused_qk_sdpa: grid dimensions exceed i32::MAX (x={grid_x}, y={grid_y})"
-        )));
-    }
-    invoke.set_grid(grid_x as i32, grid_y as i32, 1)?;
+    invoke.set_grid(setup.grid_x, setup.grid_y, 1)?;
     invoke.set_thread_group(head_dim, 1, 1)?;
 
     TURBO_K4_FUSED_QK_DISPATCHES.fetch_add(1, Ordering::Relaxed);
     tracing::trace!(
         b,
-        n_q_heads,
+        n_q_heads = setup.n_q_heads,
         kv_h,
         kv_seq,
         head_dim,
-        has_mask,
+        has_mask = setup.has_mask,
         "turbo_k4_fused_qk_sdpa: dispatch"
     );
 
@@ -387,7 +320,7 @@ pub fn turbo_k4_fused_qk_sdpa(
     }
     let out_flat = outputs.remove(0);
 
-    out_flat.reshape(&[b, n_q_heads, 1, kv_seq], device)
+    out_flat.reshape(&[b, setup.n_q_heads, 1, kv_seq], device)
 }
 
 #[cfg(test)]
