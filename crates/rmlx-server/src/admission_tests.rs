@@ -111,7 +111,8 @@ fn decision_reason_as_str_stable() {
 
 fn make_controller(ttft_ms: u64, itl_ms: u64, init_depth: usize) -> ControllerHandle {
     ControllerHandle::new(
-        ControllerConfig::new(ttft_ms, itl_ms, init_depth),
+        // Timing-logic tests assume the historical gemma4 prefill-chunk default.
+        ControllerConfig::new(ttft_ms, itl_ms, init_depth, "gemma4".to_owned()),
         None, // no DB in unit tests
     )
 }
@@ -297,7 +298,8 @@ fn prefill_chunk_global_state_serial() {
         rmlx_models::prefill_chunk::set_prefill_chunk(initial_chunk);
 
         let ctrl = ControllerHandle::new(
-            ControllerConfig::new(500, 50, 4).with_adaptive_prefill_chunk(true),
+            ControllerConfig::new(500, 50, 4, "gemma4".to_owned())
+                .with_adaptive_prefill_chunk(true),
             None,
         );
 
@@ -332,7 +334,8 @@ fn prefill_chunk_global_state_serial() {
         rmlx_models::prefill_chunk::set_prefill_chunk(initial_chunk);
 
         let ctrl = ControllerHandle::new(
-            ControllerConfig::new(500, 10, 8).with_adaptive_prefill_chunk(true),
+            ControllerConfig::new(500, 10, 8, "gemma4".to_owned())
+                .with_adaptive_prefill_chunk(true),
             None,
         );
 
@@ -384,6 +387,53 @@ fn prefill_chunk_global_state_serial() {
             rmlx_models::prefill_chunk::runtime_override(),
             Some(sentinel),
             "C: runtime override must not change when adaptive_prefill_chunk is off"
+        );
+        rmlx_models::prefill_chunk::set_prefill_chunk(0);
+    }
+
+    // Scenario D: the prefill-chunk fallback honors the loaded model's arch, not
+    // the hardcoded gemma4 default. With `arch = "qwen3_5_moe"` the controller's
+    // `current` starts from that arch's default (64), so the first overload lower
+    // sets an override <= 64. Under the old hardcoded-"gemma4" bug `current` would
+    // have started at 512, so the first lower would land at 256 > 64 — the bound
+    // below discriminates the two. Note: `arch_default` MUST be captured BEFORE
+    // driving the controller, while the override is cleared — `prefill_chunk_for`
+    // returns the runtime override (highest precedence) once one is set, so reading
+    // it after the lower would self-corrupt the bound.
+    {
+        // No runtime override → tick_prefill_chunk reads the arch default.
+        rmlx_models::prefill_chunk::set_prefill_chunk(0);
+        // Capture the true arch default (=64) before any lower pollutes the global.
+        let arch_default = rmlx_models::prefill_chunk::prefill_chunk_for("qwen3_5_moe");
+
+        let ctrl = ControllerHandle::new(
+            ControllerConfig::new(500, 10, 8, "qwen3_5_moe".to_owned())
+                .with_adaptive_prefill_chunk(true),
+            None,
+        );
+
+        // Drive overload (step_ms >> itl_target) to trigger a lower after HOLD_TICKS.
+        for tokens in [10u64, 20, 30, 40, 50, 60, 70, 80] {
+            ctrl.record_step(&StepMetrics {
+                prompt_tokens: tokens,
+                decode_kv_bytes: 0,
+                queue_depth: 1,
+                queue_wait_ms: 0,
+                step_ms: 50, // >> 10 ms target
+            });
+        }
+        for _ in 0..HOLD_TICKS {
+            ctrl.tick_force();
+        }
+
+        // The lower must have set an override; it must start from the qwen3_5_moe
+        // default (64), not gemma4's 512.
+        let resolved = rmlx_models::prefill_chunk::runtime_override()
+            .expect("D: overload must lower the chunk and set a runtime override");
+        assert!(
+            resolved <= arch_default,
+            "D: first lower must start from qwen3_5_moe default ({arch_default}=64), \
+             not gemma4's 512; got {resolved}"
         );
         rmlx_models::prefill_chunk::set_prefill_chunk(0);
     }

@@ -99,6 +99,26 @@ pub fn prefill_chunk_for(arch: &str) -> usize {
     arch_default(arch).unwrap_or(FALLBACK)
 }
 
+/// Map a config `architectures[0]` class name (e.g. `"Qwen3ForCausalLM"`) to
+/// the module-style key understood by [`prefill_chunk_for`]. Unknown classes
+/// return `""`, which `prefill_chunk_for` resolves to the conservative
+/// `FALLBACK` chunk — never the oversized gemma4 default.
+pub fn module_key_for_class(arch_class: &str) -> &'static str {
+    match arch_class {
+        "Gemma4ForConditionalGeneration" | "Gemma4UnifiedForConditionalGeneration" => "gemma4",
+        "Gemma3ForConditionalGeneration" => "gemma3",
+        "Qwen2ForCausalLM" => "qwen2",
+        "Qwen3ForCausalLM" => "qwen3",
+        "LagunaForCausalLM" => "laguna",
+        "Qwen3_5MoeForConditionalGeneration" | "Qwen3_5ForConditionalGeneration" => "qwen3_5_moe",
+        "BitNetForCausalLM" => "bitnet",
+        // Qwen3VLMoe (single-shot prefill, no `prefill_chunk_for` call) and any
+        // unsupported class: no dedicated prefill-chunk row, fall through to
+        // FALLBACK (safe, conservative).
+        _ => "",
+    }
+}
+
 fn arch_default(arch: &str) -> Option<usize> {
     match arch {
         "qwen3" => Some(256),
