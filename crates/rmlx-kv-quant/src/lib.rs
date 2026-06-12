@@ -41,6 +41,7 @@
 pub(crate) mod test_utils;
 
 pub mod clifford;
+pub(crate) mod fused_qk_common;
 pub mod iso_fused_qk_msl;
 pub mod isoquant;
 pub mod isoquant_msl;
