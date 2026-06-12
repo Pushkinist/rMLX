@@ -236,6 +236,7 @@ static CSTR_MXFP4: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock:
 static CSTR_NVFP4: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
 static CSTR_ARRAY: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
 static CSTR_CAUSAL: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+static CSTR_CONSTANT: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
 static CSTR_EMPTY: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
 
 /// Return a `&'static CStr` for a known mode string, or a heap-allocated `CString`.
@@ -284,6 +285,11 @@ pub(crate) fn mode_to_cstr(
         "causal" => Ok(Cow::Borrowed(
             CSTR_CAUSAL
                 .get_or_init(|| CString::new("causal").expect("causal cstr"))
+                .as_c_str(),
+        )),
+        "constant" => Ok(Cow::Borrowed(
+            CSTR_CONSTANT
+                .get_or_init(|| CString::new("constant").expect("constant cstr"))
                 .as_c_str(),
         )),
         "" => Ok(Cow::Borrowed(
