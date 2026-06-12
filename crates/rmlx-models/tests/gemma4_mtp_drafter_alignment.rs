@@ -125,7 +125,7 @@ fn mtp_assistant_accept_rate_is_high() {
     // covers n_tokens in far fewer rounds. We assert the loop returns the full
     // budget AND the output is coherent prose.
     let mut emitted: Vec<u32> = Vec::new();
-    let mut step_fn = |s: &rmlx_models::gemma4::ProbeStep| {
+    let mut step_fn = |s: &rmlx_models::ProbeStep| {
         emitted.push(s.token_id);
         None
     };

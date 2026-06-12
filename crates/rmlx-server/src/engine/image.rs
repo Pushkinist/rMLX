@@ -229,14 +229,14 @@ pub(crate) fn run_qwen3vl_image(
     kv_quant_override: Option<rmlx_kv_quant::KvQuant>,
     eos_ids: &[u32],
     tokenizer: &tokenizers::Tokenizer,
-    step_fn: &mut dyn FnMut(&rmlx_models::gemma4::ProbeStep) -> Option<u32>,
+    step_fn: &mut dyn FnMut(&rmlx_models::ProbeStep) -> Option<u32>,
     constraint: Option<&mut dyn rmlx_models::ConstraintEngine>,
     sampler_cfg: &rmlx_models::SamplerConfig,
     rng: &mut rmlx_models::Pcg32,
     penalty_cfg: &rmlx_models::PenaltyConfig,
     token_history: &mut Vec<u32>,
     mm_cache: Option<&rmlx_models::multimodal_cache::MultimodalCache>,
-) -> rmlx_core::Result<Vec<rmlx_models::gemma4::ProbeStep>> {
+) -> rmlx_core::Result<Vec<rmlx_models::ProbeStep>> {
     let (vision, processor) = match vb {
         VisionBundle::Qwen3VlMoe { vision, processor } => (vision, processor),
         _ => {

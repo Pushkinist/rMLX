@@ -683,7 +683,7 @@ fn load_assistant(
 // Round-loop (greedy MTP, port of _mtp_rounds + _mtp_acceptance_walk)
 // ---------------------------------------------------------------------------
 
-use crate::gemma4::ProbeStep;
+use crate::decode_loop::ProbeStep;
 use crate::kv_cache::{KvCacheBuilder, ResolverSignals};
 use rmlx_kv_quant::{KvCache, KvQuant, KV_MAX_SEQ_DEFAULT};
 use std::time::Instant;

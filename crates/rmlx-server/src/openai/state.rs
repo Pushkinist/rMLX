@@ -862,7 +862,7 @@ impl AppState {
             )
             .map_err(|e| format!("smoke probe error for '{model_id}': {e}"))?;
 
-            use rmlx_models::gemma4::SmokeVerdict;
+            use rmlx_models::SmokeVerdict;
             match &verdict {
                 SmokeVerdict::Ok | SmokeVerdict::Inconclusive { .. } => {
                     tracing::info!(model_id, ?verdict, "B5: smoke probe passed");

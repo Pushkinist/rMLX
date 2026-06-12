@@ -118,7 +118,7 @@ use rmlx_mlx::{add, argmax, concatenate, rope, Array, Device};
 
 use super::dflash::DFlashRoundState;
 use crate::arch::Architecture;
-use crate::gemma4::ProbeStep;
+use crate::decode_loop::ProbeStep;
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache, KV_MAX_SEQ_DEFAULT};
 

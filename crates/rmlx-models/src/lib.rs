@@ -65,6 +65,7 @@ pub mod ssd_tier;
 
 pub use arch::{is_arch_supported, read_load_phases, LoadPhases};
 pub use constraint::{ConstraintEngine, NoOpConstraint};
+pub use decode_loop::{ProbeStep, SmokeVerdict};
 // The flat `rmlx_models::{KvCache, KvQuant, LinearAttnCache,
 // write_caches, set_ssd_*}` re-exports were dropped. Codec types live at
 // `rmlx_kv_quant::*`, SSD-tier hooks + `write_caches` at `rmlx_kv_ssd::*`.

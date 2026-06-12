@@ -786,7 +786,7 @@ impl Generator for ArchGenerator {
             // the budget-unset path always returns `None` after a single
             // `Option`-discriminant + bool check, so the hot loop is
             // unchanged when no budget is set.
-            let mut step_fn = |s: &rmlx_models::gemma4::ProbeStep| -> Option<u32> {
+            let mut step_fn = |s: &rmlx_models::ProbeStep| -> Option<u32> {
                 // M30: record step arrival time for ITL computation.
                 // Instant::now() on macOS is a single rdtsc-equivalent syscall,
                 // ~3 ns; negligible vs the 8–15 ms decode step.
