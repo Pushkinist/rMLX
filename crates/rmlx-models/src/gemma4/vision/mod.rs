@@ -861,11 +861,7 @@ fn load_raw(shards: &ShardSet, name: &str) -> Result<Array> {
 /// Read top-level `quantization` (`group_size`, `bits`, `mode`) for the
 /// `embed_vision.embedding_projection` quantized Linear.
 fn read_quant_params(model_dir: &Path) -> Result<(i32, i32, crate::layers::QuantMode)> {
-    let path = model_dir.join("config.json");
-    let data = std::fs::read(&path)
-        .map_err(|e| Error::Loader(format!("cannot read {}: {e}", path.display())))?;
-    let v: serde_json::Value = serde_json::from_slice(&data)
-        .map_err(|e| Error::Loader(format!("malformed config.json: {e}")))?;
+    let v = crate::load_util::read_raw_config(model_dir)?;
     let q = v.get("quantization");
     let gs = q
         .and_then(|q| q.get("group_size"))

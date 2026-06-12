@@ -47,13 +47,7 @@ use super::moe::{DenseMlp, SharedExpert, SparseMoeBlock, SwitchMlp};
 pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
     let cfg_raw = load_config(model_dir)?;
 
-    let raw_json: serde_json::Value = {
-        let path = model_dir.join("config.json");
-        let data = std::fs::read(&path)
-            .map_err(|e| Error::Loader(format!("cannot read {}: {e}", path.display())))?;
-        serde_json::from_slice(&data)
-            .map_err(|e| Error::Loader(format!("malformed config.json: {e}")))?
-    };
+    let raw_json = crate::load_util::read_raw_config(model_dir)?;
 
     let raw_quant = raw_json.get("quantization");
     let raw_text_config = raw_json.get("text_config");
@@ -291,13 +285,7 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
 pub fn load_from_path_paro(model_dir: &Path) -> Result<Qwen3_5MoeText> {
     let cfg_raw = load_config(model_dir)?;
 
-    let raw_json: serde_json::Value = {
-        let path = model_dir.join("config.json");
-        let data = std::fs::read(&path)
-            .map_err(|e| Error::Loader(format!("cannot read {}: {e}", path.display())))?;
-        serde_json::from_slice(&data)
-            .map_err(|e| Error::Loader(format!("malformed config.json: {e}")))?
-    };
+    let raw_json = crate::load_util::read_raw_config(model_dir)?;
 
     let raw_text_config = raw_json.get("text_config");
     let raw_quant = None;

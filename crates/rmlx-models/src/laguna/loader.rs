@@ -32,13 +32,7 @@ pub fn load_from_path(model_dir: &Path) -> Result<LagunaText> {
 
     // Re-read config.json as raw JSON to extract inline quant overrides before
     // Serde struct-parsing drops unknown keys inside the quantization dict.
-    let raw_json: serde_json::Value = {
-        let path = model_dir.join("config.json");
-        let data = std::fs::read(&path)
-            .map_err(|e| Error::Loader(format!("cannot read {}: {e}", path.display())))?;
-        serde_json::from_slice(&data)
-            .map_err(|e| Error::Loader(format!("malformed config.json: {e}")))?
-    };
+    let raw_json = crate::load_util::read_raw_config(model_dir)?;
     let raw_quant = raw_json.get("quantization");
 
     let cfg = LagunaConfig::from_model_config(&cfg_raw, raw_quant)?;
