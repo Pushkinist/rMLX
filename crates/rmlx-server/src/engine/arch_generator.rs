@@ -399,22 +399,8 @@ impl Generator for ArchGenerator {
         self.model.cache_stats()
     }
 
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "wildcard arm is the correct fallthrough for unsupported arch/quant/error variants"
-    )]
     fn kv_cache_bytes(&self) -> u64 {
-        match self.model.as_ref() {
-            rmlx_models::arch::Architecture::Gemma4(_)
-            | rmlx_models::arch::Architecture::Gemma3(_) => {
-                rmlx_models::gemma4::gemma4_kv_cache_bytes()
-            }
-            rmlx_models::arch::Architecture::Qwen3_5Moe(_) => {
-                rmlx_models::qwen3_5_moe::qwen3_5_moe_kv_cache_bytes()
-            }
-            rmlx_models::arch::Architecture::Qwen3(_) => rmlx_models::qwen3::read_kv_cache_bytes(),
-            _ => 0,
-        }
+        self.model.kv_cache_bytes()
     }
 
     fn load_phases(&self) -> Option<rmlx_models::LoadPhases> {
@@ -1106,17 +1092,7 @@ impl Generator for ArchGenerator {
             // boundary — no lock contention with inference at this point.
             // F6/L18: also emit via SPSC drainer for SQLite persistence.
             {
-                use rmlx_models::arch::Architecture;
-                let kv_bytes = match model.as_ref() {
-                    Architecture::Gemma4(_) | Architecture::Gemma3(_) => {
-                        rmlx_models::gemma4::gemma4_kv_cache_bytes()
-                    }
-                    Architecture::Qwen3_5Moe(_) => {
-                        rmlx_models::qwen3_5_moe::qwen3_5_moe_kv_cache_bytes()
-                    }
-                    Architecture::Qwen3(_) => rmlx_models::qwen3::read_kv_cache_bytes(),
-                    _ => 0,
-                };
+                let kv_bytes = model.kv_cache_bytes();
                 // Reuse `kv_quant_label` so payload-bearing
                 // variants (RotorK*Asym, Mixed, RotK) render with their full
                 // tag (e.g. `rotor_k_3_asym_v8_g128`). Previously this match
