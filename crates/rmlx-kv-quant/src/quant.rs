@@ -66,9 +66,9 @@ pub enum KvQuant {
     /// Eliminates the per-step full dequantize that dominates the rMLX k8v4
     /// hot path (decode-step audit).
     ///
-    /// Currently wired for `Qwen3ForCausalLM` only (Bonsai-2bit) via
-    /// `KvCacheBuilder::resolve_default`; other archs continue to use their
-    /// existing per-arch defaults.
+    /// The codec is arch-agnostic; the auto policy currently selects it only
+    /// for `Qwen3ForCausalLM` (Bonsai-2bit) via `KvCacheBuilder::resolve_default`
+    /// as an example consumer — other archs keep their existing per-arch defaults.
     Mixed {
         /// K quantization bit-width.
         k_bits: u8,

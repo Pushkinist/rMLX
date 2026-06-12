@@ -9,7 +9,7 @@
 //! attention reads at most `max_size` tokens — no per-step trimming, no per-step
 //! window mask.
 //!
-//! Used by Gemma3/Gemma4 SWA layers in **bf16-KV mode only**.
+//! Used by SWA layers (e.g. Gemma3/Gemma4) in **bf16-KV mode only**.
 //! Quantized SWA layers stay on the existing full-size [`KvStorage`] codec
 //! paths; mlx-lm's reference also keeps RotatingKVCache as bf16
 //! (`to_quantized` raises `NotImplementedError`).
