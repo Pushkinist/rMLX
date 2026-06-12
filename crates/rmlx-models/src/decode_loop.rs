@@ -28,11 +28,77 @@ use tracing::info_span;
 use rmlx_core::error::Result;
 
 use crate::constraint::ConstraintEngine;
-use crate::gemma4::ProbeStep;
 use crate::sampler::{
     apply_mask_argmax, compute_top_logprobs, Pcg32, PenaltyConfig, SamplerConfig, TokenLogprobs,
 };
 use rmlx_kv_quant::KvCache;
+
+// ---------------------------------------------------------------------------
+// Smoke probe types
+// ---------------------------------------------------------------------------
+
+/// One record per autoregressive step produced by `generate_greedy`.
+#[allow(
+    clippy::exhaustive_structs,
+    reason = "internal closed per-step probe record — five fields are the complete decode-step observability contract; adding a field requires updating all generate_greedy call sites"
+)]
+#[derive(Debug, Clone)]
+pub struct ProbeStep {
+    /// Token id selected by greedy argmax.
+    pub token_id: u32,
+    /// Single-piece string from `tokenizer.id_to_token(token_id)` — used for
+    /// display and the broken-punct-loop heuristic.
+    ///
+    /// `Box<str>` saves 8 B per step vs `String`: 2 words (ptr + len) vs 3 words
+    /// (ptr + len + capacity). For 4096-token sequences: ~32 KB saved + 4096 fewer
+    /// allocator capacity slots. Construction: `piece.into_boxed_str()`.
+    pub piece: Box<str>,
+    /// `max(|logits|)` at this step. Finite normally; NaN/Inf signals a hazard.
+    pub max_abs_logit: f32,
+    /// Number of NaN cells in the logit vector at this step.
+    pub nan_count: usize,
+    /// per-token top-k logprobs. `None` unless the request set
+    /// `top_logprobs_k > 0` (the zero-overhead default leaves this `None` and
+    /// never runs the log-softmax / top-k path).
+    pub logprobs: Option<TokenLogprobs>,
+}
+
+/// Verdict returned by `classify_smoke`.
+///
+/// Heuristic: after the seeded 8-token probe, the snapshot is flagged broken on
+/// a degenerate repeat — see `classify_smoke` for the exact (B5b-widened) rule.
+/// Mirrors the Qwen3.6-35B-A3B-mxfp8 pattern in CLAUDE.md "mxfp8 broken-snapshot
+/// hazard" and the gemma-4-26b-a4b single-CJK-token loop (B5b audit).
+#[allow(
+    clippy::exhaustive_enums,
+    reason = "closed dispatch enum — four smoke outcomes (Ok/BrokenPunctLoop/BrokenNan/Inconclusive); adding an outcome requires updating classify_smoke and all SmokeVerdict match arms in the serve path"
+)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Smoke-probe outcome for a Gemma4 forward pass.
+pub enum SmokeVerdict {
+    /// Generation succeeded and output looks coherent.
+    Ok,
+    /// A degenerate repeat loop: ≤ 2 distinct ids + single-char punct piece, OR
+    /// ≥ `LOOP_K` consecutive identical ids, OR a single-char piece (any
+    /// category) dominating ≥ `LOOP_K` of the window. Name kept (not just
+    /// punct) to keep exit-code / HTTP-503 / test mapping stable.
+    BrokenPunctLoop {
+        /// The punctuation piece that dominated the output.
+        dominant_piece: String,
+        /// Number of distinct token ids in the sample window.
+        distinct_ids: usize,
+    },
+    /// A NaN appeared in the logit vector.
+    BrokenNan {
+        /// Decode step at which the NaN was detected.
+        at_step: usize,
+    },
+    /// Generation stopped early but neither hazard fired (e.g. EOS at step 1).
+    Inconclusive {
+        /// Human-readable explanation of why the verdict is inconclusive.
+        reason: String,
+    },
+}
 
 /// Per-request borrow bundle for the shared decode loop. Decode-only — prefill
 /// has its own free function ([`chunked_prefill`]) and does NOT take this struct.
