@@ -31,8 +31,9 @@ use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device};
 
 use crate::bitnet::BitNetText;
+use crate::decode_loop::SmokeVerdict;
 use crate::gemma3::Gemma3Text;
-use crate::gemma4::{Gemma4Text, SmokeVerdict};
+use crate::gemma4::Gemma4Text;
 use crate::laguna::LagunaText;
 use crate::qwen2::Qwen2Text;
 use crate::qwen3::Qwen3Text;
@@ -845,7 +846,7 @@ impl Architecture {
         max_ctx_override: Option<i32>,
         prompt_cache_slots: usize,
         eos_ids: &'a [u32],
-        step_fn: &'a mut dyn FnMut(&crate::gemma4::ProbeStep) -> Option<u32>,
+        step_fn: &'a mut dyn FnMut(&crate::decode_loop::ProbeStep) -> Option<u32>,
         // A6.2: optional sampler constraint. `None` = unmasked argmax (the
         // hot path; identical to pre-A6.2 behaviour). `Some(_)` enables the
         // masked branch in each arch's `argmax` call sites; in A6.2 the only
@@ -869,7 +870,7 @@ impl Architecture {
         // to the trailing-20 window before each `apply_penalties` call.
         penalty_cfg: &'a crate::sampler::PenaltyConfig,
         token_history: &'a mut Vec<u32>,
-    ) -> Result<Vec<crate::gemma4::ProbeStep>> {
+    ) -> Result<Vec<crate::decode_loop::ProbeStep>> {
         use crate::kv_cache::KvCacheBuilder;
         use rmlx_kv_quant::KvQuant;
         // Resolve the effective quant: explicit override wins; otherwise ask the builder.
@@ -1080,13 +1081,13 @@ impl Architecture {
         eos_ids: &'a [u32],
         // The per-request borrows share `'a`: the shared decode loop stores
         // them together in one `DecodeCtx<'a>` for the duration of the call.
-        step_fn: &'a mut dyn FnMut(&crate::gemma4::ProbeStep) -> Option<u32>,
+        step_fn: &'a mut dyn FnMut(&crate::decode_loop::ProbeStep) -> Option<u32>,
         constraint: Option<&'a mut dyn crate::ConstraintEngine>,
         sampler_cfg: &'a crate::sampler::SamplerConfig,
         rng: &'a mut crate::sampler::Pcg32,
         penalty_cfg: &'a crate::sampler::PenaltyConfig,
         token_history: &'a mut Vec<u32>,
-    ) -> Result<Vec<crate::gemma4::ProbeStep>> {
+    ) -> Result<Vec<crate::decode_loop::ProbeStep>> {
         use crate::kv_cache::KvCacheBuilder;
         use rmlx_kv_quant::KvQuant;
         match self {
@@ -1228,7 +1229,7 @@ impl Architecture {
     }
 
     /// Smoke probe verdict -- delegates to gemma4::classify_smoke for now.
-    pub fn classify_smoke(steps: &[crate::gemma4::ProbeStep]) -> SmokeVerdict {
+    pub fn classify_smoke(steps: &[crate::decode_loop::ProbeStep]) -> SmokeVerdict {
         crate::gemma4::classify_smoke(steps)
     }
 }

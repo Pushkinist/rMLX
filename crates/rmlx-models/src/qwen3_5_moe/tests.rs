@@ -1387,7 +1387,7 @@ fn integration_paro_generate_greedy() {
         prompt_ids.len()
     );
     let mut report = String::new();
-    let mut step_fn = |step: &crate::gemma4::ProbeStep| -> Option<u32> {
+    let mut step_fn = |step: &crate::decode_loop::ProbeStep| -> Option<u32> {
         let line = format!(
             "step {} token_id={}\n",
             report.matches('\n').count(),
@@ -1810,7 +1810,7 @@ fn hydrated_tail_produces_identical_output() {
     let cold_tokens: Vec<u32> = {
         let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
         let mut token_history: Vec<u32> = Vec::new();
-        let mut step_fn = |_: &crate::gemma4::ProbeStep| -> Option<u32> { None };
+        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
         let steps = generate_greedy(
             &model,
             // Tokenizer is only needed for piece strings in ProbeStep; we can
@@ -1935,7 +1935,7 @@ fn hydrated_tail_produces_identical_output() {
     let warm_tokens: Vec<u32> = {
         let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
         let mut token_history: Vec<u32> = Vec::new();
-        let mut step_fn = |_: &crate::gemma4::ProbeStep| -> Option<u32> { None };
+        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
         let steps = generate_greedy(
             &model,
             &tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
@@ -2014,7 +2014,7 @@ fn hydrated_tail_produces_identical_output() {
     let divergent_tokens: Vec<u32> = {
         let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
         let mut token_history: Vec<u32> = Vec::new();
-        let mut step_fn = |_: &crate::gemma4::ProbeStep| -> Option<u32> { None };
+        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
         let steps = generate_greedy(
             &model,
             &tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
@@ -2188,7 +2188,7 @@ fn hydrated_exact_block_no_tail_not_placeholder() {
     let cold_tokens: Vec<u32> = {
         let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
         let mut token_history: Vec<u32> = Vec::new();
-        let mut step_fn = |_: &crate::gemma4::ProbeStep| -> Option<u32> { None };
+        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
         let steps = generate_greedy(
             &model,
             &tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
@@ -2311,7 +2311,7 @@ fn hydrated_exact_block_no_tail_not_placeholder() {
     let warm_tokens: Vec<u32> = {
         let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
         let mut token_history: Vec<u32> = Vec::new();
-        let mut step_fn = |_: &crate::gemma4::ProbeStep| -> Option<u32> { None };
+        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
         let steps = generate_greedy(
             &model,
             &tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
@@ -2465,7 +2465,7 @@ fn hydrated_tail_k8v8_equivalence() {
     let cold_tokens: Vec<u32> = {
         let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
         let mut token_history: Vec<u32> = Vec::new();
-        let mut step_fn = |_: &crate::gemma4::ProbeStep| -> Option<u32> { None };
+        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
         let steps = generate_greedy(
             &model,
             &tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
@@ -2576,7 +2576,7 @@ fn hydrated_tail_k8v8_equivalence() {
     let warm_tokens: Vec<u32> = {
         let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
         let mut token_history: Vec<u32> = Vec::new();
-        let mut step_fn = |_: &crate::gemma4::ProbeStep| -> Option<u32> { None };
+        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
         let steps = generate_greedy(
             &model,
             &tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))

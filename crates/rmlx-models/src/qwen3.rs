@@ -1809,7 +1809,7 @@ pub fn generate_greedy<'a>(
     max_ctx_override: Option<i32>,
     prompt_cache_slots: usize,
     eos_ids: &'a [u32],
-    step_fn: &'a mut dyn FnMut(&crate::gemma4::ProbeStep) -> Option<u32>,
+    step_fn: &'a mut dyn FnMut(&crate::decode_loop::ProbeStep) -> Option<u32>,
     // A6.2: optional sampler constraint. See gemma4::generate_greedy.
     // The shared `DecodeCtx` bundles every per-request borrow under one
     // lifetime, so these references share `'a` (a `&mut dyn` trait-object
@@ -1821,8 +1821,8 @@ pub fn generate_greedy<'a>(
     // A7.3: logit-penalty configuration + per-request token history.
     penalty_cfg: &'a crate::sampler::PenaltyConfig,
     token_history: &'a mut Vec<u32>,
-) -> Result<Vec<crate::gemma4::ProbeStep>> {
-    use crate::gemma4::ProbeStep;
+) -> Result<Vec<crate::decode_loop::ProbeStep>> {
+    use crate::decode_loop::ProbeStep;
 
     tracing::info!(
         arch = "Qwen3ForCausalLM",

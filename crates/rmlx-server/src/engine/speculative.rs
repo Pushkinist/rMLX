@@ -742,7 +742,7 @@ impl Generator for SpeculativeGenerator {
             // so `think_splitter` is `None` here and this always returns
             // `None`, but the wiring is symmetric for a future thinking
             // verifier (L36).
-            let mut step_fn = |s: &rmlx_models::gemma4::ProbeStep| -> Option<u32> {
+            let mut step_fn = |s: &rmlx_models::ProbeStep| -> Option<u32> {
                 // M30: record step arrival time for ITL computation.
                 timestamps_ref.push(Instant::now());
                 if *cancelled_ref {

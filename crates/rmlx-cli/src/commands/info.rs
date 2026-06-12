@@ -452,10 +452,10 @@ pub(crate) fn run_info(
 
         // -- stdout output -------------------------------------------------------
         let verdict_str = match &verdict {
-            rmlx_models::gemma4::SmokeVerdict::Ok => "ok",
-            rmlx_models::gemma4::SmokeVerdict::BrokenPunctLoop { .. } => "broken_punct_loop",
-            rmlx_models::gemma4::SmokeVerdict::BrokenNan { .. } => "broken_nan",
-            rmlx_models::gemma4::SmokeVerdict::Inconclusive { .. } => "inconclusive",
+            rmlx_models::SmokeVerdict::Ok => "ok",
+            rmlx_models::SmokeVerdict::BrokenPunctLoop { .. } => "broken_punct_loop",
+            rmlx_models::SmokeVerdict::BrokenNan { .. } => "broken_nan",
+            rmlx_models::SmokeVerdict::Inconclusive { .. } => "inconclusive",
         };
 
         println!("smoke_probe: {verdict_str}");
@@ -480,10 +480,10 @@ pub(crate) fn run_info(
             .map(|s| s.max_abs_logit)
             .fold(0.0_f32, f32::max);
         let verdict_code: f64 = match &verdict {
-            rmlx_models::gemma4::SmokeVerdict::Ok => 0.0,
-            rmlx_models::gemma4::SmokeVerdict::BrokenPunctLoop { .. } => 1.0,
-            rmlx_models::gemma4::SmokeVerdict::BrokenNan { .. } => 2.0,
-            rmlx_models::gemma4::SmokeVerdict::Inconclusive { .. } => 3.0,
+            rmlx_models::SmokeVerdict::Ok => 0.0,
+            rmlx_models::SmokeVerdict::BrokenPunctLoop { .. } => 1.0,
+            rmlx_models::SmokeVerdict::BrokenNan { .. } => 2.0,
+            rmlx_models::SmokeVerdict::Inconclusive { .. } => 3.0,
         };
 
         sink.record(&Measurement {
@@ -524,8 +524,8 @@ pub(crate) fn run_info(
         // Exit 1 on broken snapshot.
         let is_broken = matches!(
             verdict,
-            rmlx_models::gemma4::SmokeVerdict::BrokenPunctLoop { .. }
-                | rmlx_models::gemma4::SmokeVerdict::BrokenNan { .. }
+            rmlx_models::SmokeVerdict::BrokenPunctLoop { .. }
+                | rmlx_models::SmokeVerdict::BrokenNan { .. }
         );
         return Ok(is_broken);
     }

@@ -67,7 +67,7 @@ pub fn generate_greedy<'a>(
     // The shared `DecodeCtx` bundles every per-request borrow under one
     // lifetime, so these references share `'a` (a `&mut dyn` trait-object
     // reborrow is invariant and cannot be re-unified once split).
-    step_fn: &'a mut dyn FnMut(&crate::gemma4::ProbeStep) -> Option<u32>,
+    step_fn: &'a mut dyn FnMut(&crate::decode_loop::ProbeStep) -> Option<u32>,
     mut constraint: Option<&'a mut dyn ConstraintEngine>,
     // A7.2: sampling config + per-request RNG. See gemma3::generate_greedy.
     sampler_cfg: &'a crate::sampler::SamplerConfig,
@@ -75,8 +75,8 @@ pub fn generate_greedy<'a>(
     // A7.3: logit-penalty configuration + per-request token history.
     penalty_cfg: &'a crate::sampler::PenaltyConfig,
     token_history: &'a mut Vec<u32>,
-) -> Result<Vec<crate::gemma4::ProbeStep>> {
-    use crate::gemma4::ProbeStep;
+) -> Result<Vec<crate::decode_loop::ProbeStep>> {
+    use crate::decode_loop::ProbeStep;
 
     tracing::info!(
         arch = "Qwen3_5MoeForConditionalGeneration",

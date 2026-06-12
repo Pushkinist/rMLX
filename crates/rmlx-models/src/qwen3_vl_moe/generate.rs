@@ -20,7 +20,7 @@ use rmlx_core::error::Result;
 use rmlx_mlx::{Array, Device, Dtype};
 
 use crate::constraint::ConstraintEngine;
-use crate::gemma4::ProbeStep;
+use crate::decode_loop::ProbeStep;
 use crate::sampler::{apply_mask_argmax, sample_token_array, Pcg32, PenaltyConfig, SamplerConfig};
 use rmlx_kv_quant::{KvCache, KvQuant};
 

@@ -118,7 +118,7 @@ pub fn generate_greedy<'a>(
     // The shared `DecodeCtx` bundles every per-request borrow under one
     // lifetime, so these references share `'a` (a `&mut dyn` trait-object
     // reborrow is invariant and cannot be re-unified once split).
-    step_fn: &'a mut dyn FnMut(&crate::gemma4::ProbeStep) -> Option<u32>,
+    step_fn: &'a mut dyn FnMut(&crate::decode_loop::ProbeStep) -> Option<u32>,
     // A6.2: optional sampler constraint. See gemma4::generate_greedy.
     mut constraint: Option<&'a mut dyn ConstraintEngine>,
     // A7.2: sampling config + per-request RNG. `temperature <= 0.0` keeps the
@@ -134,8 +134,8 @@ pub fn generate_greedy<'a>(
     // (image prompts are one-shot) and prefill runs from the embeds in one
     // forward instead of chunked token-id forwards.
     image_prefill: Option<Array>,
-) -> Result<Vec<crate::gemma4::ProbeStep>> {
-    use crate::gemma4::ProbeStep;
+) -> Result<Vec<crate::decode_loop::ProbeStep>> {
+    use crate::decode_loop::ProbeStep;
 
     tracing::info!(
         arch = "Gemma3ForConditionalGeneration",

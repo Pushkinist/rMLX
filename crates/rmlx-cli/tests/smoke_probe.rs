@@ -132,8 +132,7 @@ fn smoke_probe_gemma4_mxfp8_is_clean() {
     assert!(
         matches!(
             verdict,
-            rmlx_models::gemma4::SmokeVerdict::Ok
-                | rmlx_models::gemma4::SmokeVerdict::Inconclusive { .. }
+            rmlx_models::SmokeVerdict::Ok | rmlx_models::SmokeVerdict::Inconclusive { .. }
         ),
         "expected Ok or Inconclusive verdict for known-clean snapshot, got {verdict:?}"
     );

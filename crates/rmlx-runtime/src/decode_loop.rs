@@ -7,16 +7,16 @@
 //! refactor (chunked prefill + decode + decode-profile timers) is deferred
 //! until at least three archs have migrated to the runtime helpers
 //! provided here. Reason: the existing per-arch `generate_greedy` functions
-//! all return `crate::gemma4::ProbeStep` today, so introducing a
-//! `runtime::ProbeStep` and rewriting one arch's `generate_greedy` would
-//! force a cross-arch type rename that the task explicitly forbids
-//! ("no changes to non-migrated arches").
+//! all return `rmlx_models::ProbeStep` (defined in `rmlx_models::decode_loop`
+//! and re-exported at the crate root). Introducing a `runtime::ProbeStep`
+//! and rewriting one arch's `generate_greedy` would force a cross-arch type
+//! rename that the task explicitly forbids ("no changes to non-migrated arches").
 //!
 //! What is provided here right now:
 //! - [`ProbeStep`], [`SmokeVerdict`], [`DecodeProfile`] — runtime-native
 //!   types that future arches and the unified `generate_greedy` will use.
-//!   Structurally identical to `crate::gemma4::ProbeStep` /
-//!   `crate::gemma4::SmokeVerdict`. They co-exist for now and the gemma4
+//!   Structurally identical to `rmlx_models::ProbeStep` /
+//!   `rmlx_models::SmokeVerdict`. They co-exist for now and the models-crate
 //!   versions will be migrated to type aliases in a follow-up.
 //! - [`PREFILL_CHUNK`] — the standard 64-token prefill chunk size (Metal
 //!   watchdog safety margin).
@@ -38,8 +38,8 @@ pub const PREFILL_CHUNK: usize = 64;
 
 /// One record per autoregressive step.
 ///
-/// Mirrors [`rmlx_models::gemma4::ProbeStep`] field-for-field. Once all six
-/// arch graphs migrate to the runtime crate, the gemma4 version becomes a
+/// Mirrors [`rmlx_models::ProbeStep`] field-for-field. Once all six
+/// arch graphs migrate to the runtime crate, the models-crate version becomes a
 /// type alias.
 #[allow(
     clippy::exhaustive_structs,
@@ -58,7 +58,7 @@ pub struct ProbeStep {
 }
 
 /// Verdict returned by `classify_smoke`. Mirrors
-/// [`rmlx_models::gemma4::SmokeVerdict`] variant-for-variant.
+/// [`rmlx_models::SmokeVerdict`] variant-for-variant.
 #[allow(
     clippy::exhaustive_enums,
     reason = "closed dispatch enum — four smoke outcomes; adding an outcome requires updating classify_smoke and all verdict consumers"
