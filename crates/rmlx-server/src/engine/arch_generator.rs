@@ -395,24 +395,8 @@ impl Generator for ArchGenerator {
         self.effective_max_ctx
     }
 
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "wildcard arm is the correct fallthrough for unsupported arch/quant/error variants"
-    )]
     fn cache_stats(&self) -> Option<rmlx_models::CacheStats> {
-        // Dispatch to the arch-specific global static based on the loaded arch.
-        match self.model.as_ref() {
-            rmlx_models::arch::Architecture::Gemma4(_)
-            | rmlx_models::arch::Architecture::Gemma3(_) => {
-                rmlx_models::gemma4::gemma4_cache_stats()
-            }
-            rmlx_models::arch::Architecture::Qwen3_5Moe(_) => {
-                rmlx_models::qwen3_5_moe::qwen3_5_moe_cache_stats()
-            }
-            rmlx_models::arch::Architecture::Qwen3(_) => rmlx_models::qwen3::read_cache_stats(),
-            // Other archs don't use the shared PromptCache (yet).
-            _ => None,
-        }
+        self.model.cache_stats()
     }
 
     #[allow(
@@ -1023,17 +1007,7 @@ impl Generator for ArchGenerator {
             // since we are outside generate_greedy at this point).
             // F6/L18: also emit via SPSC drainer for SQLite persistence.
             {
-                use rmlx_models::arch::Architecture;
-                let cs_opt = match model.as_ref() {
-                    Architecture::Gemma4(_) | Architecture::Gemma3(_) => {
-                        rmlx_models::gemma4::gemma4_cache_stats()
-                    }
-                    Architecture::Qwen3_5Moe(_) => {
-                        rmlx_models::qwen3_5_moe::qwen3_5_moe_cache_stats()
-                    }
-                    Architecture::Qwen3(_) => rmlx_models::qwen3::read_cache_stats(),
-                    _ => None,
-                };
+                let cs_opt = model.cache_stats();
                 if let Some(cs) = cs_opt {
                     let total = cs.hits + cs.misses;
                     let hit_rate = if total == 0 {
