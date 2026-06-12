@@ -1248,6 +1248,23 @@ impl Architecture {
         }
     }
 
+    /// Arch-pinned auto-KV default, when the arch must not take the
+    /// ctx-based quant policy. `None` = use the normal auto policy.
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "only archs with a measured quantized-KV degradation pin a default"
+    )]
+    pub fn preferred_auto_kv(&self) -> Option<rmlx_kv_quant::KvQuant> {
+        match self {
+            // Qwen3-VL-MoE degrades under quantized KV (K8V4/K8V8) — both
+            // text and image decode go incoherent on this 4-bit checkpoint.
+            // Pin its auto default to bf16 (None) rather than the ctx-based
+            // quant policy.
+            Architecture::Qwen3VlMoe(_) => Some(rmlx_kv_quant::KvQuant::None),
+            _ => None,
+        }
+    }
+
     /// Smoke probe verdict -- delegates to gemma4::classify_smoke for now.
     pub fn classify_smoke(steps: &[crate::decode_loop::ProbeStep]) -> SmokeVerdict {
         crate::gemma4::classify_smoke(steps)
