@@ -21,14 +21,11 @@ fn qwen3_per_head_qnorm_shape() {
     let n = (batch * seq * n_heads * head_dim) as usize;
 
     let data: Vec<f32> = (0..n).map(|i| (i as f32) * 0.1).collect();
-    let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), n * 4) };
-    let x = Array::from_bytes(bytes, &[batch, seq, n_heads, head_dim], Dtype::F32)
-        .expect("build input tensor");
+    let x =
+        Array::from_f32_slice(&data, &[batch, seq, n_heads, head_dim]).expect("build input tensor");
 
     let w_data: Vec<f32> = vec![1.0_f32; head_dim as usize];
-    let w_bytes =
-        unsafe { std::slice::from_raw_parts(w_data.as_ptr().cast::<u8>(), w_data.len() * 4) };
-    let w = Array::from_bytes(w_bytes, &[head_dim], Dtype::F32).expect("build weight");
+    let w = Array::from_f32_slice(&w_data, &[head_dim]).expect("build weight");
 
     let norm = RmsNorm {
         weight: w,
