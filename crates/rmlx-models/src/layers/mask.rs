@@ -1,8 +1,5 @@
 //! Attention mask builders for causal, chunked-prefill, and SWA forward passes.
 
-// unsafe_code: Array::from_bytes uses slice::from_raw_parts for byte reinterpretation.
-#![allow(unsafe_code)]
-
 use rmlx_core::error::Result;
 use rmlx_mlx::{Array, Device, Dtype};
 
@@ -59,9 +56,7 @@ pub fn build_chunked_prefill_mask(offset: i32, new_seq: i32, device: Device) -> 
         }
     }
 
-    let bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 4) };
-    let mask_f32 = Array::from_bytes(bytes, &[1, 1, rows as i32, cols as i32], Dtype::F32)?;
+    let mask_f32 = Array::from_f32_slice(&data, &[1, 1, rows as i32, cols as i32])?;
     // Convert to BF16 to match Q/K/V dtype (MLX requires mask dtype to promote to output).
     mask_f32.astype(Dtype::Bf16, device)
 }
@@ -112,9 +107,7 @@ pub fn build_swa_prefill_mask(
         }
     }
 
-    let bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 4) };
-    let mask_f32 = Array::from_bytes(bytes, &[1, 1, rows as i32, cols as i32], Dtype::F32)?;
+    let mask_f32 = Array::from_f32_slice(&data, &[1, 1, rows as i32, cols as i32])?;
     mask_f32.astype(Dtype::Bf16, device)
 }
 
@@ -148,9 +141,7 @@ pub fn build_swa_decode_mask(
         *cell = 0.0;
     }
 
-    let bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 4) };
-    let mask_f32 = Array::from_bytes(bytes, &[1, 1, 1, cols as i32], Dtype::F32)?;
+    let mask_f32 = Array::from_f32_slice(&data, &[1, 1, 1, cols as i32])?;
     let mask_bf16 = mask_f32.astype(Dtype::Bf16, device)?;
     Ok(Some(mask_bf16))
 }
