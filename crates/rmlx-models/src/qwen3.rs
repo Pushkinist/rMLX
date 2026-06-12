@@ -1,8 +1,6 @@
 // LOC-exempt: full Qwen3 forward + loader + prompt-cache + decode driver in one
 // arch module; shrinks across the model-agnostic refactor phases (decode loop
 // already extracted) and lands under the soft cap as later phases continue.
-// unsafe_code: mlx-rs Array zero-copy view — slice::from_raw_parts byte-reinterpret for Array::from_bytes
-#![allow(unsafe_code)]
 
 //! Qwen3 text-only forward pass.
 //!
@@ -1575,9 +1573,7 @@ impl Qwen3Text {
     ) -> Result<Array> {
         let seq = ids.len();
         let ids_i32: Vec<i32> = ids.iter().map(|&x| x as i32).collect();
-        let ids_bytes =
-            unsafe { std::slice::from_raw_parts(ids_i32.as_ptr().cast::<u8>(), seq * 4) };
-        let ids_arr = Array::from_bytes(ids_bytes, &[seq as i32], Dtype::I32)?;
+        let ids_arr = Array::from_i32_slice(&ids_i32, &[seq as i32])?;
         self.forward_arr(&ids_arr, seq as i32, caches, device)
     }
 
@@ -1594,9 +1590,7 @@ impl Qwen3Text {
     ) -> Result<Array> {
         let seq = ids.len();
         let ids_i32: Vec<i32> = ids.iter().map(|&x| x as i32).collect();
-        let ids_bytes =
-            unsafe { std::slice::from_raw_parts(ids_i32.as_ptr().cast::<u8>(), seq * 4) };
-        let ids_arr = Array::from_bytes(ids_bytes, &[seq as i32], Dtype::I32)?;
+        let ids_arr = Array::from_i32_slice(&ids_i32, &[seq as i32])?;
         self.forward_arr_with_sink(&ids_arr, seq as i32, caches, Some(sink), device)
     }
 
@@ -1709,9 +1703,7 @@ impl Qwen3Text {
             ));
         }
         let ids_i32: Vec<i32> = ids.iter().map(|&x| x as i32).collect();
-        let ids_bytes =
-            unsafe { std::slice::from_raw_parts(ids_i32.as_ptr().cast::<u8>(), seq * 4) };
-        let ids_arr = Array::from_bytes(ids_bytes, &[seq as i32], Dtype::I32)?;
+        let ids_arr = Array::from_i32_slice(&ids_i32, &[seq as i32])?;
         let h = self.embed_tokens.forward(&ids_arr, device)?;
         let mut h = h.reshape(&[1, seq as i32, self.cfg.hidden_size as i32], device)?;
         for (i, layer) in self.layers.iter().enumerate() {
