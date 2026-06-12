@@ -198,3 +198,18 @@ fn quantize_f16_affine_int4_matches_python() {
         );
     }
 }
+
+#[test]
+fn f16_subnormal_negative_decodes_nonzero() {
+    // 0x8001 = sign=1, exp=0, mantissa=1 → -1 * 2^-24
+    let neg = f16_bits_to_f32(0x8001);
+    assert_eq!(neg, -(1.0 / 16777216.0));
+    // 0x83FF = largest negative subnormal: -1023 * 2^-24
+    let neg_max = f16_bits_to_f32(0x83FF);
+    assert_eq!(neg_max, -1023.0 / 16777216.0);
+    // Positive subnormal unchanged.
+    assert_eq!(f16_bits_to_f32(0x0001), 1.0 / 16777216.0);
+    // Signed zeros preserved.
+    assert_eq!(f16_bits_to_f32(0x0000).to_bits(), 0.0_f32.to_bits());
+    assert_eq!(f16_bits_to_f32(0x8000).to_bits(), (-0.0_f32).to_bits());
+}
