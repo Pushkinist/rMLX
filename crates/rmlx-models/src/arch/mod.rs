@@ -1215,11 +1215,7 @@ impl Architecture {
     ///
     /// Reads the arch-specific global static that `generate_greedy` writes after
     /// each generation call.  Returns `None` for architectures that do not yet
-    /// maintain a shared PromptCache (Laguna, Qwen3VlMoe).
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "archs without a shared PromptCache fall through to None"
-    )]
+    /// maintain a shared PromptCache (Laguna).
     pub fn cache_stats(&self) -> Option<crate::CacheStats> {
         match self {
             Architecture::Gemma4(_) => crate::gemma4::gemma4_cache_stats(),
@@ -1228,7 +1224,8 @@ impl Architecture {
             Architecture::Qwen3(_) => crate::qwen3::read_cache_stats(),
             Architecture::Qwen2(_) => crate::qwen2::qwen2_cache_stats(),
             Architecture::BitNet(_) => crate::bitnet::bitnet_cache_stats(),
-            _ => None,
+            Architecture::Qwen3VlMoe(_) => crate::qwen3_vl_moe::qwen3_vl_moe_cache_stats(),
+            Architecture::Laguna(_) => None,
         }
     }
 
@@ -1237,8 +1234,7 @@ impl Architecture {
     ///
     /// Reads the arch-specific prompt-cache static that `generate_greedy` writes
     /// via `store_kv_cache_bytes` at the end of every generate call.  Returns 0
-    /// for architectures that do not yet maintain that static (Laguna,
-    /// Qwen3VlMoe).
+    /// for architectures that do not yet maintain that static (Laguna).
     pub fn kv_cache_bytes(&self) -> u64 {
         match self {
             Architecture::Gemma4(_) => crate::gemma4::gemma4_kv_cache_bytes(),
@@ -1247,7 +1243,8 @@ impl Architecture {
             Architecture::Qwen3(_) => crate::qwen3::read_kv_cache_bytes(),
             Architecture::Qwen2(_) => crate::qwen2::qwen2_kv_cache_bytes(),
             Architecture::BitNet(_) => crate::bitnet::bitnet_kv_cache_bytes(),
-            Architecture::Laguna(_) | Architecture::Qwen3VlMoe(_) => 0,
+            Architecture::Qwen3VlMoe(_) => crate::qwen3_vl_moe::qwen3_vl_moe_kv_cache_bytes(),
+            Architecture::Laguna(_) => 0,
         }
     }
 

@@ -52,6 +52,7 @@ pub mod loader;
 pub mod model;
 pub(super) mod moe;
 pub(crate) mod mrope;
+pub(crate) mod prompt_cache;
 pub mod vision;
 
 pub use config::{Qwen3VlMoeConfig, Qwen3VlMoeTextConfig, Qwen3VlMoeVisionConfig};
@@ -60,4 +61,6 @@ pub use image_preprocess::{preprocess, Qwen3VlImageConfig, Qwen3VlPixelValues};
 pub use loader::{load_config_qwen3_vl, load_from_path, load_text_from_path};
 pub use model::Qwen3VlMoe;
 pub use model::Qwen3VlMoeText;
+pub use prompt_cache::read_cache_stats as qwen3_vl_moe_cache_stats;
+pub use prompt_cache::read_kv_cache_bytes as qwen3_vl_moe_kv_cache_bytes;
 pub use vision::{load_vision_tower, Qwen3VlMoeVision, VisionOutput};
