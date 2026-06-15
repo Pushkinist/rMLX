@@ -330,8 +330,6 @@ pub(crate) trait PromptCacheEntry: Sized {
     /// overrides this — its rotating-ring layers are not serialised to the SSD
     /// tier, so a hydrated entry can come back with a payload-less attended
     /// layer; the consume engine excludes such an entry from prefix reuse.
-    // Allowed until the `consume` engine that calls these hooks is wired in.
-    #[allow(dead_code)]
     fn is_hydrate_complete(&self) -> bool {
         true
     }
@@ -347,7 +345,6 @@ pub(crate) trait PromptCacheEntry: Sized {
     /// e.g. qwen3 dense and every ExactOnly retrofit).
     ///
     /// [`is_ssd_hydrated`]: PromptCacheEntry::is_ssd_hydrated
-    #[allow(dead_code)]
     fn is_reusable_prefix_of(
         &self,
         _prompt_ids: &[u32],
@@ -366,7 +363,6 @@ pub(crate) trait PromptCacheEntry: Sized {
     /// boundary.
     ///
     /// [`deep_clone`]: PromptCacheEntry::deep_clone
-    #[allow(dead_code)]
     fn prepare_reuse(&self, _kind: ReuseKind) -> Result<Self> {
         self.deep_clone()
     }
@@ -863,21 +859,28 @@ impl<E: PromptCacheEntry> PromptCache<E> {
 /// stored first token; `Reuse` restores the cloned prefix and the arch forwards
 /// the tail; `Miss` falls back to a full re-prefill. The cloned `E` carries
 /// whatever per-arch extras the entry holds (e.g. qwen3's `first_logprobs`).
-// Allowed until the `consume` engine and the migrated arches that produce and
-// match this are wired in (same change series).
-#[allow(dead_code)]
 pub(crate) enum Consumed<E> {
     /// Full-token-equality hit: the cloned entry's prompt equals the request
     /// prompt and it is not an SSD placeholder. Reuse the snapshot as-is.
     Exact(E),
     /// Prefix reuse: the cloned entry covers a leading prefix of the request
     /// prompt; the arch re-prefills the remaining tail on top of it.
+    ///
+    /// Only constructed for `Partial`-policy arches and the SSD-hydrated
+    /// strict-prefix case; the dense ExactOnly arch never produces it, so it
+    /// reads as dead until a prefix-reusing arch is routed through the engine.
+    #[allow(dead_code)]
     Reuse { entry: E, kind: ReuseKind },
     /// No usable entry — re-prefill from scratch.
     Miss,
 }
 
 /// How a `Consumed::Reuse` prefix relates to the request prompt.
+///
+/// Constructed only by prefix-reusing arches (a `StrictPrefix` for the
+/// SSD-hydrated strict-prefix / SWA-snapshot case, a `BlockTruncate` for the
+/// block-aligned gemma4 path). The dense ExactOnly arch never builds either, so
+/// the variants read as dead until such an arch is routed through the engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) enum ReuseKind {
@@ -1106,6 +1109,224 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .map_or(0, |p| p.layout_key)
+    }
+
+    /// Resolve the prompt-cache consume decision for one request.
+    ///
+    /// Read-only with respect to slot population — never `push`es. It owns the
+    /// logic that was duplicated byte-for-byte across the cached arches, AFTER
+    /// the caller's `n_tokens == 0` early return (consume is never called for an
+    /// empty prompt). The flow:
+    ///
+    /// 1. `has_image` → `Miss` immediately, WITHOUT consulting the cache (no
+    ///    find, no evict side-effect). The cached K/V is keyed by token ids
+    ///    only; an image prompt's K/V depends on scattered vision features, so
+    ///    it must never be served from or stored under a token-id key.
+    /// 2. Compute the codec-partitioned seed from `active_layout_key()` +
+    ///    `kv_quant.cache_key_salt()` so a slot stored under a different KV codec
+    ///    never cross-serves.
+    /// 3. `find_best_prefix` (capturing `block_count`) + the hydrate-from-SSD
+    ///    retry (no-op when the tier is OFF).
+    /// 4. Quant-mismatch guard: a stored `KvQuant` that differs from the runtime
+    ///    quant (or a legacy `None`) means the cached K/V layout is incompatible
+    ///    — evict the slot, `warn!`, degrade to `Miss`.
+    /// 5. Exact arm: `!is_ssd_hydrated() && prompt_token_ids() == prompt_ids` →
+    ///    `Exact(deep_clone())`. The clone preserves whatever per-arch extras the
+    ///    entry holds (e.g. qwen3's `first_logprobs`).
+    /// 6. Reuse gate ([`ReusePolicy`] + `is_hydrate_complete`): a hydrated
+    ///    strict-prefix is permitted under any policy; a non-hydrated partial
+    ///    match only under `Partial`. When permitted, the entry's
+    ///    `is_reusable_prefix_of` hook decides the [`ReuseKind`]; `prepare_reuse`
+    ///    clones (+ truncates) for reuse. Hook `None` or an incomplete hydrate
+    ///    degrades to `Miss`.
+    ///
+    /// Every degrade branch emits exactly one `debug!{branch, reason}` so the
+    /// decision is reconstructable from a single run's log — the cached arches
+    /// previously had silent degrade arms.
+    // `dead_code` until the first arch (qwen3 dense) routes through this; the
+    // unit tests exercise it crate-internally in the same change series.
+    #[allow(dead_code)]
+    pub(crate) fn consume(
+        &self,
+        prompt_ids: &[u32],
+        kv_quant: KvQuant,
+        has_image: bool,
+    ) -> Consumed<E> {
+        // (1) Image prompts bypass the cache entirely — no find, no evict.
+        if has_image {
+            tracing::debug!(
+                arch = self.arch_name,
+                branch = "has_image",
+                reason = "image prompt bypasses the token-id-keyed cache",
+                "prompt cache consume: Miss (image)"
+            );
+            return Consumed::Miss;
+        }
+
+        // hard runtime gate: this arch's policy must be the one the call site
+        // expects. The per-arch tripwire (previously an inline assert_eq! in
+        // each generate loop) lives here now, keyed on the policy field.
+        debug_assert!(
+            matches!(self.policy, ReusePolicy::Partial | ReusePolicy::ExactOnly),
+            "ArchPromptCache policy must be a known ReusePolicy variant",
+        );
+
+        // (2) Codec-partitioned seed: identical to the per-arch push seed, so a
+        // slot stored under a different KV codec / layout never matches.
+        let seed = FNV_OFFSET ^ self.active_layout_key() ^ kv_quant.cache_key_salt();
+        let policy = self.policy;
+        let arch = self.arch_name;
+
+        self.with_inner_mut(|guard| match guard.as_mut() {
+            Some(cache) => Self::decide_locked(arch, policy, cache, prompt_ids, kv_quant, seed),
+            None => Consumed::Miss,
+        })
+    }
+
+    /// The find → hydrate-retry → quant-guard → Exact → reuse-gate decision,
+    /// run while holding the cache lock. Split out of [`consume`] so the single
+    /// cohesive decision keeps one home (the `cognitive_complexity` allow scopes
+    /// to it, not the lock-management wrapper).
+    ///
+    /// [`consume`]: ArchPromptCache::consume
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "slot_idx is returned by find_best_prefix as a valid index into `cache.slots` and is not mutated before use"
+    )]
+    #[allow(
+        clippy::cognitive_complexity,
+        reason = "one cohesive consume decision (find/guard/exact/reuse arms) — splitting the arms across helpers would scatter a single decision and hurt readability"
+    )]
+    fn decide_locked(
+        arch: &'static str,
+        policy: ReusePolicy,
+        cache: &mut PromptCache<E>,
+        prompt_ids: &[u32],
+        kv_quant: KvQuant,
+        seed: u64,
+    ) -> Consumed<E> {
+        // (3) RAM find, then SSD-hydrate retry. A hydrate hit promotes the
+        // block into RAM; re-run find_best_prefix so the promoted slot is
+        // matched + quant-checked by the path below.
+        let mut raw_match = cache.find_best_prefix(prompt_ids, seed);
+        if raw_match.is_none() && cache.hydrate_from_ssd(prompt_ids).is_some() {
+            raw_match = cache.find_best_prefix(prompt_ids, seed);
+        }
+
+        // (4) Quant-mismatch guard (Plan §D8). The snapshot is only safe to
+        // reuse when the stored KvQuant equals the runtime quant.
+        let (slot_idx, block_count) = match raw_match {
+            Some((slot_idx, block_count)) => {
+                let stored = cache.slots[slot_idx].entry.kv_quant();
+                if stored == Some(kv_quant) {
+                    (slot_idx, block_count)
+                } else {
+                    tracing::debug!(
+                        arch,
+                        branch = "quant_mismatch",
+                        reason = "stored KV quant differs from runtime — evict + re-prefill",
+                        stored = ?stored,
+                        runtime = ?kv_quant,
+                        prompt_len = prompt_ids.len(),
+                    );
+                    tracing::warn!(
+                        stored = ?stored,
+                        runtime = ?kv_quant,
+                        prompt_len = prompt_ids.len(),
+                        "prompt cache KV quant mismatch — evicting entry, \
+                         degrading to re-prefill"
+                    );
+                    cache.evict_slot(slot_idx);
+                    return Consumed::Miss;
+                }
+            }
+            None => return Consumed::Miss,
+        };
+
+        let entry = &cache.slots[slot_idx].entry;
+        let is_ssd_hydrated = entry.is_ssd_hydrated();
+
+        // (5) Exact arm: full token-id equality AND a real (non-placeholder)
+        // first decode token. An SSD-hydrated entry is excluded — its
+        // first_id is the placeholder 0, replaying it poisons generation.
+        if !is_ssd_hydrated && entry.prompt_token_ids() == prompt_ids {
+            return match entry.deep_clone() {
+                Ok(cloned) => Consumed::Exact(cloned),
+                Err(e) => {
+                    tracing::debug!(
+                        arch,
+                        branch = "deep_clone_err",
+                        reason = "Exact deep_clone failed — re-prefill (source slot untouched)",
+                        error = %e,
+                        prompt_len = prompt_ids.len(),
+                    );
+                    Consumed::Miss
+                }
+            };
+        }
+
+        // (6) Reuse gate. A hydrated strict-prefix is permitted under any
+        // policy (moe HydratedTail); a non-hydrated partial match only under
+        // `Partial` (gemma4). Either way the hydrated entry must be COMPLETE
+        // (gemma4 SWA: a payload-less attended layer is not reusable).
+        let reuse_eligible = if is_ssd_hydrated {
+            if entry.is_hydrate_complete() {
+                true
+            } else {
+                tracing::debug!(
+                    arch,
+                    branch = "incomplete_hydrate",
+                    reason = "hydrated entry has a payload-less attended layer — re-prefill",
+                    prompt_len = prompt_ids.len(),
+                );
+                return Consumed::Miss;
+            }
+        } else {
+            policy == ReusePolicy::Partial
+        };
+
+        if reuse_eligible {
+            if let Some(kind) =
+                entry.is_reusable_prefix_of(prompt_ids, is_ssd_hydrated, block_count)
+            {
+                return match entry.prepare_reuse(kind) {
+                    Ok(prepared) => Consumed::Reuse {
+                        entry: prepared,
+                        kind,
+                    },
+                    Err(e) => {
+                        tracing::debug!(
+                            arch,
+                            branch = "deep_clone_err",
+                            reason = "prepare_reuse failed — re-prefill (source slot untouched)",
+                            error = %e,
+                            prompt_len = prompt_ids.len(),
+                        );
+                        Consumed::Miss
+                    }
+                };
+            }
+            tracing::debug!(
+                arch,
+                branch = "non_reusable",
+                reason = "matched slot is not a reusable prefix for this prompt — re-prefill",
+                prompt_len = prompt_ids.len(),
+                block_count,
+            );
+            return Consumed::Miss;
+        }
+
+        // A matched non-hydrated partial under a non-Partial policy, or a
+        // hydrated entry that declined the strict-prefix hook (e.g. the
+        // block-aligned equal-length case) — re-prefill.
+        tracing::debug!(
+            arch,
+            branch = "hydrated_declined_to_exact",
+            reason = "matched slot is not Exact-eligible and reuse is not permitted — re-prefill",
+            is_ssd_hydrated,
+            prompt_len = prompt_ids.len(),
+        );
+        Consumed::Miss
     }
 
     /// Read the current hit/miss/bytes stats, or `None` if the cache has not
