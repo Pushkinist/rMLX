@@ -459,10 +459,9 @@ pub(crate) fn apply_fused_qk_flags(mode: FusedQkMode) {
 /// same posture as `PlanarFlashDecodeMode::Auto`.
 ///
 /// Mirrors [`FusedQkMode`] exactly — same env-var / `OnceLock` pattern.
-/// See `docs/reports/sparse-attn-production.md` for the dispatch
-/// counter aggregator, dormancy invariant tests, and the seedless
-/// dispatch test that proves the kernels still fire when the warm-TTFT
-/// gate is bypassed.
+/// The dispatch counter aggregator (`sparse_attn_total_dispatch_count`),
+/// dormancy invariant tests, and the seedless dispatch test are in
+/// `crates/rmlx-kv-quant/src/sparse_attn*.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub(crate) enum SparseAttnMode {
     /// Force the two-phase sparse-attention dispatch on. Sets
@@ -476,8 +475,7 @@ pub(crate) enum SparseAttnMode {
     /// design (Path C): the production `update_and_sdpa` path always
     /// shortcuts through the bf16-K seed, so the two-phase kernels are
     /// reserved for seedless workloads. Same posture as
-    /// `PlanarFlashDecodeMode::Auto`. See
-    /// `docs/reports/sparse-attn-production.md`.
+    /// `PlanarFlashDecodeMode::Auto`.
     #[default]
     Auto,
 }
@@ -530,8 +528,7 @@ pub(crate) fn apply_sparse_attn_flags(mode: SparseAttnMode) {
                     tracing::info!(
                         family,
                         "--sparse-attn=auto on Apple{family} — resolved OFF \
-                         (warm-TTFT dormant by design; see \
-                         docs/reports/sparse-attn-production.md). \
+                         (warm-TTFT dormant by design). \
                          Use --sparse-attn on for seedless workloads."
                     );
                 }
