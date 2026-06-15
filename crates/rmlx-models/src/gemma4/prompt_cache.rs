@@ -56,6 +56,16 @@ pub(crate) struct Gemma4Entry {
     /// (Plan §D8 / Task 11.5). See the original commit comments for the
     /// `Option<None>` legacy-sentinel rationale.
     pub(crate) kv_quant: Option<KvQuant>,
+    /// True when this entry was reconstructed from the SSD tier and therefore
+    /// stores only the block-aligned prefix KV — `first_id` / `first_piece` are
+    /// placeholders, not a real decode token. The generate loop excludes such
+    /// an entry from the Exact fast path so it falls through to a re-prefill
+    /// that recomputes the real first token.
+    ///
+    /// MUST be set only in `SsdHydrate::hydrate`; never by the RAM-cache push
+    /// path. Do NOT use the `first_id == 0` heuristic as a substitute —
+    /// `<bos>` token id is 0 for some models.
+    pub(crate) is_ssd_hydrated: bool,
 }
 
 impl Gemma4Entry {
@@ -122,6 +132,7 @@ impl PromptCacheEntry for Gemma4Entry {
             first_id: self.first_id,
             first_piece: self.first_piece.clone(),
             kv_quant: self.kv_quant,
+            is_ssd_hydrated: self.is_ssd_hydrated,
         })
     }
 
@@ -135,6 +146,10 @@ impl PromptCacheEntry for Gemma4Entry {
 
     fn kv_quant(&self) -> Option<KvQuant> {
         self.kv_quant
+    }
+
+    fn is_ssd_hydrated(&self) -> bool {
+        self.is_ssd_hydrated
     }
 
     // Pure-attention arch: no GDN linear state.
@@ -173,6 +188,9 @@ impl SsdHydrate<Gemma4Entry> for SsdHydrator {
             first_id: 0,
             first_piece: String::new(),
             kv_quant: Some(self.kv_quant()),
+            // Block-aligned prefix only; the placeholder first_id must not be
+            // replayed — the generate loop re-prefills to recompute it.
+            is_ssd_hydrated: true,
         }))
     }
 }

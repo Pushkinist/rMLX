@@ -221,6 +221,7 @@ fn qwen3_spill_sink_skips_entry_with_no_full_block() {
         first_piece: String::new(),
         first_logprobs: None,
         kv_quant: Some(KvQuant::K8V8),
+        is_ssd_hydrated: false,
     });
 
     // Entry B: also short, triggers slot eviction of A.
@@ -233,6 +234,7 @@ fn qwen3_spill_sink_skips_entry_with_no_full_block() {
         first_piece: String::new(),
         first_logprobs: None,
         kv_quant: Some(KvQuant::K8V8),
+        is_ssd_hydrated: false,
     });
 
     // A was evicted but its block_hashes was empty → sink captured nothing.
@@ -283,6 +285,8 @@ fn qwen3_ssd_hydrate_promotes_entry_into_ram() {
                 first_piece: String::new(),
                 first_logprobs: None,
                 kv_quant: Some(KvQuant::K8V8),
+                // Mirrors SsdHydrate::hydrate — hydrated entries are flagged.
+                is_ssd_hydrated: true,
             }))
         }
     }
@@ -354,4 +358,256 @@ fn qwen3_kv_bytes_store_read_roundtrip() {
 #[test]
 fn qwen3_arch_policy_is_exact_only() {
     assert_eq!(QWEN3_PROMPT_CACHE.policy(), ReusePolicy::ExactOnly);
+}
+
+/// Regression: an SSD-hydrated full-prompt entry (block-aligned, no tail) must
+/// NOT be served via the Exact fast path. Its `first_id` / `first_piece` are
+/// placeholders (id 0) — replaying them emits a sentinel first token and seeds
+/// decode with garbage. The `!is_ssd_hydrated` Exact-arm guard forces a
+/// fall-through to a full re-prefill that re-derives the real first token.
+///
+/// Test structure (mirrors the qwen3_5_moe `hydrated_exact_block_no_tail`
+/// regression):
+///
+/// 1. COLD: `generate_greedy` from an empty cache with a block-aligned prompt
+///    (exact multiple of BLOCK_TOKENS, no tail) → record N_DECODE token ids.
+/// 2. WARM: inject a real KV snapshot of the SAME full prompt, marked
+///    `is_ssd_hydrated=true` with `first_id=0, first_piece=""` (exactly what
+///    `SsdHydrate::hydrate` produces). Before the fix this is served as Exact →
+///    `warm[0] == 0`. After the fix it falls to Miss → `warm == cold`.
+///
+/// Run:
+/// ```sh
+/// RMLX_TEST_MODEL_BONSAI=/path/to/Ternary-Bonsai-8B-mlx-2bit \
+/// cargo test -p rmlx-models qwen3_hydrated_exact_no_tail_not_placeholder \
+///     -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free; remaining unwrap is on values constructed in this fn"
+)]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: indices bounded by slice length validated before call"
+)]
+fn qwen3_hydrated_exact_no_tail_not_placeholder() {
+    let Some(model_dir_buf) =
+        std::env::var_os("RMLX_TEST_MODEL_BONSAI").map(std::path::PathBuf::from)
+    else {
+        println!("SKIP: RMLX_TEST_MODEL_BONSAI not set");
+        return;
+    };
+    let model_dir = model_dir_buf.as_path();
+    if !model_dir.exists() {
+        println!("SKIP: model dir not found at {}", model_dir.display());
+        return;
+    }
+
+    let arch_str = {
+        let cfg_path = model_dir.join("config.json");
+        let data = std::fs::read(&cfg_path).expect("read config.json");
+        let v: serde_json::Value = serde_json::from_slice(&data).expect("parse config.json");
+        v.get("architectures")
+            .and_then(|a| a.get(0))
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_owned()
+    };
+    if arch_str != "Qwen3ForCausalLM" {
+        println!("SKIP: arch \"{arch_str}\" is not Qwen3ForCausalLM");
+        return;
+    }
+
+    println!("Loading model from {}", model_dir.display());
+    let model = load_from_path(model_dir, None).expect("load model");
+    let n_layers = model.cfg.num_hidden_layers;
+    let device = Device::Gpu;
+
+    // Unquantized KV: COLD and WARM must produce token-identical output (the
+    // merged none-payload spill fix restores KV exactly, so only the sentinel
+    // would differ pre-fix).
+    let kv_quant = KvQuant::None;
+    let max_seq = 4096i32;
+
+    // Prompt: exactly BLOCK_TOKENS = 256 tokens — NO tail (the SSD exact-hit
+    // shape: the spilled block equals the full prompt).
+    let prompt_len = BLOCK_TOKENS; // 256
+    assert_eq!(
+        prompt_len % BLOCK_TOKENS,
+        0,
+        "fixture must be block-aligned (no tail)"
+    );
+    let prompt_ids: Vec<u32> = (1u32..=prompt_len as u32)
+        .map(|i| (i % 9999).max(1))
+        .collect();
+
+    let sampler_cfg = crate::sampler::SamplerConfig {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        min_p: 0.0,
+        seed: Some(0),
+        top_logprobs_k: 0,
+    };
+    let penalty_cfg = crate::sampler::PenaltyConfig::default();
+    let n_decode = 4usize;
+    let tokenizer =
+        tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json")).expect("load tokenizer");
+
+    // ── Step 1: COLD full prefill ─────────────────────────────────────────────
+    ensure_qwen3_prompt_cache(4);
+    QWEN3_PROMPT_CACHE.with_inner_mut(|guard| {
+        if let Some(cache) = guard.as_mut() {
+            cache.clear();
+        }
+    });
+
+    let cold_tokens: Vec<u32> = {
+        let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
+        let mut token_history: Vec<u32> = Vec::new();
+        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
+        let steps = generate_greedy(
+            &model,
+            &tokenizer,
+            &prompt_ids,
+            n_decode,
+            device,
+            kv_quant,
+            Some(max_seq),
+            4,
+            &[],
+            &mut step_fn,
+            None,
+            &sampler_cfg,
+            &mut rng,
+            &penalty_cfg,
+            &mut token_history,
+        )
+        .expect("cold generate_greedy");
+        steps.into_iter().map(|s| s.token_id).collect()
+    };
+    println!("COLD tokens: {cold_tokens:?}");
+    assert_eq!(cold_tokens.len(), n_decode);
+    assert_ne!(
+        cold_tokens[0], 0,
+        "cold first token is 0 — model anomaly; the regression check would be vacuous"
+    );
+
+    // ── Step 2: Build a real KV snapshot for the full block-aligned prompt ──
+    let full_kv_caches = {
+        use crate::kv_cache::{kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N};
+        let mut kv_caches: Vec<KvCache> = (0..n_layers)
+            .map(|i| {
+                let q = kv_quant_for_layer(
+                    i,
+                    n_layers,
+                    kv_quant,
+                    LAYER_ADAPTIVE_TAIL_N,
+                    LAYER_ADAPTIVE_HEAD_N,
+                );
+                KvCache::with_quant_max_seq(q, max_seq).with_layer_idx(i)
+            })
+            .collect();
+        for c in &mut kv_caches {
+            c.enter_prefill();
+        }
+        let prefill_chunk = crate::prefill_chunk::prefill_chunk_for("qwen3");
+        let n_chunks = prompt_len.div_ceil(prefill_chunk);
+        for (chunk_idx, chunk) in prompt_ids.chunks(prefill_chunk).enumerate() {
+            let is_last = chunk_idx + 1 == n_chunks;
+            let logits = model
+                .forward_seq_with_cache(chunk, Some(&mut kv_caches), device)
+                .expect("prefill chunk");
+            if is_last {
+                logits.eval().expect("eval last-chunk logits");
+            } else {
+                for c in &kv_caches {
+                    c.eval_prefill_state().expect("eval_prefill_state");
+                }
+            }
+        }
+        for c in &mut kv_caches {
+            c.exit_prefill(device).expect("exit_prefill");
+        }
+        for c in &kv_caches {
+            c.eval_for_spill().expect("eval_for_spill kv");
+        }
+        kv_caches
+    };
+
+    // ── Step 3: WARM — inject SSD-hydrated FULL-PROMPT snapshot ──────────────
+    // first_id=0, first_piece="" — the placeholder a real SsdHydrate::hydrate
+    // sets. Before the fix this entry is served as Exact → warm[0] == 0.
+    QWEN3_PROMPT_CACHE.with_inner_mut(|guard| {
+        if let Some(cache) = guard.as_mut() {
+            cache.clear();
+            let block_hashes =
+                chained_block_hashes_seeded(&prompt_ids, FNV_OFFSET ^ kv_quant.cache_key_salt());
+            let kv_snap: Result<Vec<_>> =
+                full_kv_caches.iter().map(KvCache::try_deep_clone).collect();
+            let kv_snap = kv_snap.expect("kv clone");
+            cache.push(Qwen3Entry {
+                prompt_token_ids: prompt_ids.clone(),
+                block_hashes,
+                kv_caches: kv_snap,
+                first_id: 0,
+                first_piece: String::new(),
+                first_logprobs: None,
+                kv_quant: Some(kv_quant),
+                // KEY: full-length entry marked hydrated (no tail). Before the
+                // fix the Exact arm fires → emits first_id=0. After the fix the
+                // Exact arm skips → Miss → re-prefill.
+                is_ssd_hydrated: true,
+            });
+        }
+    });
+
+    let warm_tokens: Vec<u32> = {
+        let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
+        let mut token_history: Vec<u32> = Vec::new();
+        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
+        let steps = generate_greedy(
+            &model,
+            &tokenizer,
+            &prompt_ids,
+            n_decode,
+            device,
+            kv_quant,
+            Some(max_seq),
+            4,
+            &[],
+            &mut step_fn,
+            None,
+            &sampler_cfg,
+            &mut rng,
+            &penalty_cfg,
+            &mut token_history,
+        )
+        .expect("warm generate_greedy");
+        steps.into_iter().map(|s| s.token_id).collect()
+    };
+    println!("WARM tokens: {warm_tokens:?}");
+
+    assert_ne!(
+        warm_tokens.first().copied(),
+        Some(0u32),
+        "REGRESSION: warm first token is placeholder 0. \
+         The Exact arm must be guarded by !is_ssd_hydrated."
+    );
+    assert_eq!(
+        warm_tokens, cold_tokens,
+        "regression: WARM must equal COLD after fix.\n\
+         COLD: {cold_tokens:?}\n\
+         WARM: {warm_tokens:?}"
+    );
+    println!(
+        "PASS: SSD exact-hit sentinel guard works — warm[0]={} (not 0), warm==cold",
+        warm_tokens[0]
+    );
 }

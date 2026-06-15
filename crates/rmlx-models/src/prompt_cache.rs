@@ -241,6 +241,24 @@ pub(crate) trait PromptCacheEntry: Sized {
     /// drive the generic spill path without per-arch field reach-in.
     fn kv_quant(&self) -> Option<KvQuant>;
 
+    /// True when this entry was reconstructed from the SSD tier rather than
+    /// produced by a live prefill.
+    ///
+    /// An SSD-hydrated entry restores only the block-aligned prefix KV — the
+    /// first decode token was never serialized, so `first_id` / `first_piece`
+    /// are placeholders (id 0). The exact-hit fast path MUST exclude such an
+    /// entry (`!entry.is_ssd_hydrated()`) so it falls through to a full
+    /// re-prefill that recomputes the real first token; replaying the
+    /// placeholder poisons generation (a sentinel "!" first token).
+    ///
+    /// Defaults to `false` (a normal RAM-cached entry). Arch entries that can
+    /// be hydrated from SSD override this to surface their stored flag. Do NOT
+    /// use a `first_id == 0` heuristic as a substitute — `<bos>` is id 0 for
+    /// some models.
+    fn is_ssd_hydrated(&self) -> bool {
+        false
+    }
+
     /// The entry's linear-attention recurrent caches (GDN layers).
     ///
     /// Pure-attention archs return `&[]`; hybrid archs (Qwen3.5-MoE) return
