@@ -166,6 +166,11 @@ pub fn generate_greedy(
             arch = "BitNetForCausalLM",
             total_tokens = steps.len(),
             decode_steps = decode_steps_count,
+            avg_decode_ns = if decode_steps_count > 0 {
+                forward_total_ns / u128::from(decode_steps_count)
+            } else {
+                0
+            },
             "generate_greedy: complete (exact hit)"
         );
         return Ok(steps);
