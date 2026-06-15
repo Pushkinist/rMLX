@@ -47,7 +47,7 @@ use crate::kv_cache::{
     kv_max_seq_and_ceiling, kv_quant_for_layer, warn_if_kv_codec_net_negative, KvLayerShape,
     LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
 };
-use crate::prompt_cache::PromptCacheEntry as _;
+use crate::prompt_cache::{Consumed, ReuseKind, ReusePolicy, BLOCK_TOKENS};
 use rmlx_kv_quant::{KvCache, KvQuant};
 
 use super::model::Gemma4Text;
@@ -138,17 +138,29 @@ pub fn generate_greedy<'a>(
     ensure_prompt_cache(prompt_cache_slots);
 
     // ------------------------------------------------------------------
-    // Prompt cache lookup
+    // Prompt cache lookup via the shared consume() engine.
     // ------------------------------------------------------------------
-    // C1: three outcomes. `Exact` = cached prompt token-for-token equal to
-    // this prompt (full reuse, no truncate, no re-prefill). `Prefix` = cached
-    // prompt shares >= 1 full 256-token block then diverges AND every layer
-    // cache is losslessly trimmable (mlx-lm `can_trim_prompt_cache`) — the KV
-    // is block-truncated and only the tail `[prefix_len..prompt_len)` is
-    // re-prefilled, at correct absolute positions. `Miss` = no usable prefix
-    // OR an SWA layer wrapped (ring buffer not trimmable, see
-    // `Gemma4Entry::can_truncate_to_block`) so a partial reuse cannot be made
-    // cold-equal — fall back to a full re-prefill.
+    // gemma4 is pure-attention (no GDN recurrent state) and uses
+    // `ReusePolicy::Partial`, so all three outcomes are reachable:
+    //   - `Exact`  = cached prompt token-for-token equal to this prompt (full
+    //                reuse, no truncate, no re-prefill).
+    //   - `Reuse{StrictPrefix}` = B1 SWA snapshot/restore: the cached prompt is
+    //                a token-for-token prefix the request extends; restore the
+    //                snapshot as-is (NO truncation, so a wrapped SWA ring is not
+    //                desynced) and forward only the tail.
+    //   - `Reuse{BlockTruncate}` = block-aligned partial hit: the KV is trimmed
+    //                to `effective_blocks * BLOCK_TOKENS` and only the tail is
+    //                re-prefilled. Gated per-slot by `can_truncate_to_block`
+    //                (an SWA ring that has wrapped is not trimmable → Miss).
+    //   - `Miss`   = no usable prefix, an incomplete SSD-hydrate (payload-less
+    //                SWA layer), or a quant mismatch — full re-prefill.
+    // The engine owns find → SSD-hydrate retry → quant-mismatch guard →
+    // SSD-hydrated Exact exclusion → reuse-gate, and traces every degrade
+    // branch; the per-arch policy tripwire lives here at the call site.
+    //
+    // The local `CacheLookup` enum is the bridge from the engine outcome to the
+    // existing decode paths below (Path A exact-hit, Path B prefix tail, Path C
+    // miss) — those paths are kept verbatim.
     enum CacheLookup {
         Exact {
             kv_caches: Vec<KvCache>,
@@ -162,238 +174,73 @@ pub fn generate_greedy<'a>(
         Miss,
     }
 
-    // image prompts bypass the prompt cache. The cached K/V is keyed by
-    // token ids only; an image prompt's K/V depends on the scattered vision
-    // features, so it must never be reused for (or saved under) a token-id key.
-    // Issue #26: codec-partitioned prompt-cache key. The query digest stream is
-    // salted by `FNV_OFFSET ^ layout_key ^ codec_salt(kv_quant)` — identical to
-    // the push seed below — so a slot stored under a different KV codec never
-    // matches this request (no cross-codec serve), and codecs coexist as
-    // distinct slots rather than thrash-evicting one another. On a RAM-only run
-    // (layout_key=0) the push and query seeds are equal (`FNV_OFFSET ^
-    // codec_salt`), so same-codec hits still land; digests differ from the
-    // pre-#26 stream by the constant codec salt, harmless because the cache is
-    // rebuilt per process.
-    let cache_seed = crate::prompt_cache::FNV_OFFSET
-        ^ crate::gemma4::prompt_cache::active_layout_key()
-        ^ kv_quant.cache_key_salt();
-    let lookup: CacheLookup = if image_prefill.is_some() {
-        CacheLookup::Miss
-    } else {
-        PROMPT_CACHE.with_inner_mut(|guard| {
-            let cache = guard.as_mut().unwrap();
-            let mut raw_match = cache.find_best_prefix(prompt_ids, cache_seed);
-            // on a RAM miss, try to serve the longest cached block-aligned
-            // prefix from the SSD tier (no-op when no SSD source is attached —
-            // tier OFF). A hydrate hit promotes the block into RAM; re-run
-            // find_best_prefix so the promoted slot is matched (and quant-checked)
-            // by the normal path below.
-            if raw_match.is_none() && cache.hydrate_from_ssd(prompt_ids).is_some() {
-                raw_match = cache.find_best_prefix(prompt_ids, cache_seed);
+    // hard runtime gate: gemma4 must use ReusePolicy::Partial so the engine's
+    // reuse arm is reachable for the B1 strict-prefix + block-truncate paths.
+    // A real (not debug_) assert so the tripwire fires under release-perf.
+    assert_eq!(
+        PROMPT_CACHE.policy(),
+        ReusePolicy::Partial,
+        "gemma4 prompt cache must be Partial — pure-attention KV is block-truncatable and the \
+         SWA snapshot/restore prefix reuse depends on the engine's reuse arm being reachable",
+    );
+
+    // image prompts bypass the prompt cache (`has_image` → engine returns Miss
+    // without touching the cache; mirrored by the `!has_image` store gate
+    // below). The token-id-keyed K/V is unsafe for image spans (the K/V depends
+    // on scattered vision features, not just the token ids).
+    let lookup: CacheLookup = match PROMPT_CACHE.consume(prompt_ids, kv_quant, has_image) {
+        Consumed::Exact(cloned) => {
+            tracing::debug!(
+                prompt_len = prompt_ids.len(),
+                token_id = cloned.first_id,
+                "gemma4 generate_greedy: prompt cache EXACT HIT"
+            );
+            CacheLookup::Exact {
+                kv_caches: cloned.kv_caches,
+                last_id: cloned.first_id,
+                piece: cloned.first_piece,
             }
-            // Plan §D8 / Task 11.5: the snapshot is only safe to reuse when the
-            // stored `KvQuant` discriminant matches the runtime quant for this
-            // request. A mismatch (or a legacy `None`) means the cached
-            // K/V layout / dtype / packing is incompatible with the model wired
-            // up for this request — evict the slot, log a warn, and fall through
-            // to a Miss (full re-prefill is always safe).
-            let safe_match = match raw_match {
-                Some((slot_idx, block_count)) => {
-                    let stored = cache.slots[slot_idx].entry.kv_quant;
-                    if stored == Some(kv_quant) {
-                        Some((slot_idx, block_count))
-                    } else {
-                        tracing::warn!(
-                            stored = ?stored,
-                            runtime = ?kv_quant,
-                            prompt_len = prompt_ids.len(),
-                            "prompt cache KV quant mismatch — evicting entry, \
-                             degrading to re-prefill"
-                        );
-                        cache.evict_slot(slot_idx);
-                        None
-                    }
-                }
-                None => None,
-            };
-            match safe_match {
-                // Exact match: the cached entry's FULL token id list equals the
-                // incoming prompt. Verified at token granularity, NOT by
-                // `block_count * BLOCK_TOKENS == len` — the block-floored test is
-                // essentially never true (only when len % 256 == 0) and was
-                // misrouting identical-prompt repeats into the block-truncate +
-                // tail-reprefill Prefix path, which produced wrong output here too
-                // (22 -> 0 tokens for an identical re-request). Full-equality
-                // reuse sidesteps truncation entirely (pre-C1 behaviour).
-                //
-                // A SSD-hydrated entry whose block-aligned prefix length equals
-                // `prompt_ids.len()` (prompt is an exact multiple of
-                // BLOCK_TOKENS → no tail) must NOT be served here: its
-                // `first_id` is the placeholder 0 set in `SsdHydrate::hydrate`,
-                // not a real decode token. The `!is_ssd_hydrated` guard drops it
-                // through to the block-partial / Miss arms, which re-prefill and
-                // recompute the real first token. Correctness over the micro-opt
-                // (mirrors the qwen3 / qwen3_5_moe Exact arm guards).
-                Some((slot_idx, _block_count))
-                    if !cache.slots[slot_idx].entry.is_ssd_hydrated()
-                        && cache.slots[slot_idx].entry.prompt_token_ids() == prompt_ids =>
-                {
-                    let slot = &cache.slots[slot_idx].entry;
-                    match slot.deep_clone() {
-                        Ok(cloned) => {
-                            tracing::debug!(
-                                prompt_len = prompt_ids.len(),
-                                token_id = cloned.first_id,
-                                "gemma4 generate_greedy: prompt cache EXACT HIT"
-                            );
-                            CacheLookup::Exact {
-                                kv_caches: cloned.kv_caches,
-                                last_id: cloned.first_id,
-                                piece: cloned.first_piece,
-                            }
-                        }
-                        Err(_) => CacheLookup::Miss,
-                    }
-                }
-                // B1: strict-prefix multi-turn extension. The cached entry's FULL
-                // token sequence is a token-for-token prefix of this prompt and
-                // the new prompt extends it by >= 1 token. The post-prefill
-                // snapshot is EXACTLY the state the new prompt needs at absolute
-                // position `cached_len` for every layer type — including SWA
-                // layers whose RotatingKvCache has WRAPPED. The deep-cloned ring
-                // already holds the last `sliding_window` K/V of the cached
-                // prefix (mlx-lm `state`/`meta_state` reuse contract), which is
-                // precisely and sufficiently what the tail attends to under SWA.
-                // We restore the snapshot as-is (NO truncation — `prefix_len ==
-                // cached_len`, both full-attn `KVCache.offset` and SWA
-                // `RotatingKVCache.offset` are `cached_len` post-prefill) and
-                // forward only `prompt_ids[cached_len..]` at positions
-                // `[cached_len, new_len)`. Because nothing is trimmed, the wrapped
-                // SWA `22 -> 0` desync cannot arise. This supersedes the
-                // block-aligned + `can_truncate_to_block` path for the multi-turn
-                // case (which forced a full re-prefill Miss on every wrapped-SWA
-                // turn — bug B1: prefill_ms grew with conversation length).
-                // Hydrate-completeness guard: a SSD-hydrated entry whose SWA
-                // layers came back as payload-less `KvStorage::None` (the
-                // rotating ring is not serialised to the SSD tier — see
-                // `Gemma4Entry::is_hydrate_complete`) MUST NOT be reused via a
-                // prefix arm. Reusing it would re-prefill only the tail on top
-                // of an empty SWA prefix and corrupt the output. Such an entry
-                // falls through to a full re-prefill (Miss). The guard is a
-                // no-op for RAM-resident snapshots (every layer holds payload).
-                Some((slot_idx, _block_count))
-                    if cache.slots[slot_idx].entry.is_strict_prefix_of(prompt_ids)
-                        && cache.slots[slot_idx].entry.is_hydrate_complete() =>
-                {
-                    let slot = &cache.slots[slot_idx].entry;
-                    let prefix_len = slot.prompt_token_ids().len();
-                    match slot.deep_clone() {
-                        Ok(cloned) => {
-                            tracing::debug!(
-                                prompt_len = prompt_ids.len(),
-                                prefix_len,
-                                tail_len = prompt_ids.len() - prefix_len,
-                                "gemma4 generate_greedy: prompt cache PREFIX-EXACT HIT \
-                             (B1 SWA snapshot/restore — restore + tail-only re-prefill)"
-                            );
-                            CacheLookup::Prefix {
-                                kv_caches: cloned.kv_caches,
-                                prefix_len,
-                            }
-                        }
-                        Err(_) => CacheLookup::Miss,
-                    }
-                }
-                // Genuine partial block-prefix hit: cached prompt shares the
-                // first `block_count` full 256-token blocks then diverges.
-                // gemma4 is pure-KV (no recurrent state), so block-truncating
-                // the KV to `block_count*256` and re-prefilling the tail at
-                // absolute positions `[prefix_len..prompt_len)` is cold-equal —
-                // BUT only when every layer cache is losslessly trimmable
-                // (mlx-lm `can_trim_prompt_cache`: `all(c.is_trimmable())`).
-                // gemma4 SWA layers use a RotatingKvCache; once the cached
-                // prompt exceeds `sliding_window` that ring buffer wraps and
-                // `truncate_kv_to_block` would silently no-op on the SWA layers
-                // while truncating the full-attention layers — desyncing the
-                // caches and corrupting the tail (the original broken path:
-                // longctx 22 -> 0 tokens). When `can_truncate_to_block` is
-                // false we fall back to a full re-prefill (Miss); correctness
-                // over speed for the wrapped-SWA case.
-                // Block-truncate partial-prefix reuse — same hydrate-
-                // completeness guard as the B1 arm above. A SSD-hydrated entry
-                // with a payload-less SWA `None` layer cannot be block-truncated
-                // and tail-re-prefilled correctly (the empty SWA prefix would
-                // give wrong attention), so it is excluded here and falls
-                // through to a full re-prefill (Miss).
-                Some((slot_idx, block_count))
-                    if block_count >= 1 && cache.slots[slot_idx].entry.is_hydrate_complete() =>
-                {
-                    // The tail `[prefix_len..prompt_len)` must be non-empty: the
-                    // re-prefilled tail's final position is where we read the
-                    // next-token logits from. If the matched blocks cover the
-                    // whole (block-aligned) prompt, drop the last matched block
-                    // back into the re-prefill tail (oMLX `prefix_cache.py`
-                    // 421-437 keeps a re-prefill remainder past the last block
-                    // boundary). If that leaves zero blocks, it is a Miss.
-                    let prompt_blocks = prompt_ids.len() / crate::prompt_cache::BLOCK_TOKENS;
-                    let effective_blocks =
-                        if block_count * crate::prompt_cache::BLOCK_TOKENS >= prompt_ids.len() {
-                            block_count.min(prompt_blocks).saturating_sub(1)
-                        } else {
-                            block_count
-                        };
-                    let slot = &cache.slots[slot_idx].entry;
-                    if effective_blocks >= 1 && slot.can_truncate_to_block(effective_blocks) {
-                        match slot.deep_clone() {
-                            Ok(mut cloned) => {
-                                cloned.truncate_kv_to_block(effective_blocks);
-                                let prefix_len =
-                                    effective_blocks * crate::prompt_cache::BLOCK_TOKENS;
-                                tracing::debug!(
-                                    prompt_len = prompt_ids.len(),
-                                    block_count,
-                                    effective_blocks,
-                                    prefix_len,
-                                    "gemma4 generate_greedy: prompt cache PREFIX HIT \
-                                 (block-truncate + tail re-prefill)"
-                                );
-                                CacheLookup::Prefix {
-                                    kv_caches: cloned.kv_caches,
-                                    prefix_len,
-                                }
-                            }
-                            Err(_) => CacheLookup::Miss,
-                        }
-                    } else {
-                        tracing::debug!(
-                            prompt_len = prompt_ids.len(),
-                            block_count,
-                            effective_blocks,
-                            "gemma4 generate_greedy: partial prefix hit not usable \
-                         (no tail blocks left, or an SWA layer wrapped / not \
-                         trimmable) — falling back to Miss"
-                        );
-                        CacheLookup::Miss
-                    }
-                }
-                // Incomplete SSD-hydrated entry: the prefix arms above were
-                // skipped by the `is_hydrate_complete` guard because at least
-                // one attended layer (a gemma4 SWA ring) came back payload-less
-                // after hydrate. Degrade to a full re-prefill (Miss) and record
-                // the decision so the empty-SWA reuse path is traceable.
-                Some((slot_idx, _)) if !cache.slots[slot_idx].entry.is_hydrate_complete() => {
-                    tracing::debug!(
-                        prompt_len = prompt_ids.len(),
-                        "gemma4 generate_greedy: SSD-hydrated entry has a payload-less \
-                         SWA layer (rotating ring not spilled) — degrading prefix reuse \
-                         to full re-prefill (Miss)"
-                    );
-                    CacheLookup::Miss
-                }
-                Some(_) => CacheLookup::Miss,
-                None => CacheLookup::Miss,
+        }
+        // B1 SWA snapshot/restore: restore the cloned snapshot verbatim at
+        // absolute position `prefix_len == cached_len` and tail-forward only
+        // `prompt_ids[prefix_len..]`. No truncation → no wrapped-SWA desync.
+        Consumed::Reuse {
+            entry: cloned,
+            kind: ReuseKind::StrictPrefix { prefix_len },
+        } => {
+            tracing::debug!(
+                prompt_len = prompt_ids.len(),
+                prefix_len,
+                tail_len = prompt_ids.len() - prefix_len,
+                "gemma4 generate_greedy: prompt cache PREFIX-EXACT HIT \
+                 (B1 SWA snapshot/restore — restore + tail-only re-prefill)"
+            );
+            CacheLookup::Prefix {
+                kv_caches: cloned.kv_caches,
+                prefix_len,
             }
-        })
+        }
+        // Block-aligned partial hit: `prepare_reuse` already trimmed the cloned
+        // KV to the block boundary; the tail re-prefills from
+        // `prefix_len = effective_blocks * BLOCK_TOKENS`.
+        Consumed::Reuse {
+            entry: cloned,
+            kind: ReuseKind::BlockTruncate { effective_blocks },
+        } => {
+            let prefix_len = effective_blocks * BLOCK_TOKENS;
+            tracing::debug!(
+                prompt_len = prompt_ids.len(),
+                effective_blocks,
+                prefix_len,
+                "gemma4 generate_greedy: prompt cache PREFIX HIT \
+                 (block-truncate + tail re-prefill)"
+            );
+            CacheLookup::Prefix {
+                kv_caches: cloned.kv_caches,
+                prefix_len,
+            }
+        }
+        Consumed::Miss => CacheLookup::Miss,
     };
 
     // Derive the initial ring size and the virtual ceiling (issue #25):
