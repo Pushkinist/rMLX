@@ -35,11 +35,14 @@ mod config;
 mod generate;
 mod loader;
 mod model;
+pub(crate) mod prompt_cache;
 
 pub use config::BitNetConfig;
 pub use generate::generate_greedy;
 pub use loader::load_from_path;
 pub use model::BitNetText;
+pub use prompt_cache::read_cache_stats as bitnet_cache_stats;
+pub use prompt_cache::read_kv_cache_bytes as bitnet_kv_cache_bytes;
 
 #[cfg(test)]
 #[path = "tests.rs"]

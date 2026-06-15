@@ -940,6 +940,7 @@ impl Architecture {
                 device,
                 kv_quant,
                 max_ctx_override,
+                prompt_cache_slots,
                 eos_ids,
                 step_fn,
                 constraint,
@@ -958,6 +959,7 @@ impl Architecture {
                 device,
                 kv_quant,
                 max_ctx_override,
+                prompt_cache_slots,
                 eos_ids,
                 step_fn,
                 constraint,
@@ -991,6 +993,7 @@ impl Architecture {
                 device,
                 kv_quant,
                 max_ctx_override,
+                prompt_cache_slots,
                 eos_ids,
                 step_fn,
                 constraint,
@@ -1041,6 +1044,7 @@ impl Architecture {
                 device,
                 kv_quant,
                 max_ctx_override,
+                prompt_cache_slots,
                 eos_ids,
                 step_fn,
                 constraint,
@@ -1129,10 +1133,13 @@ impl Architecture {
                     KvCacheBuilder::for_arch_default("Gemma3ForConditionalGeneration")
                 });
                 // Gemma3 has no per-layer-input gating, so `masked_ids` is
-                // unused (the scatter-merged embeds carry everything). Gemma3's
-                // generate_greedy also takes no prompt_cache_slots (image
-                // prompts are one-shot -- the cache is bypassed internally).
-                let _ = (masked_ids, prompt_cache_slots);
+                // unused (the scatter-merged embeds carry everything). The
+                // prompt cache is bypassed internally for an image prompt
+                // (`has_image` → consume returns Miss without touching the
+                // cache, and the snapshot store-back is `!has_image`-gated), but
+                // `prompt_cache_slots` is still threaded so the cache shell is
+                // sized consistently with the text path.
+                let _ = masked_ids;
                 crate::gemma3::generate_greedy(
                     m,
                     tokenizer,
@@ -1141,6 +1148,7 @@ impl Architecture {
                     device,
                     kv_quant,
                     max_ctx_override,
+                    prompt_cache_slots,
                     eos_ids,
                     step_fn,
                     constraint,
@@ -1207,20 +1215,17 @@ impl Architecture {
     /// Prompt-cache stats for the arch's shared PromptCache, when it has one.
     ///
     /// Reads the arch-specific global static that `generate_greedy` writes after
-    /// each generation call.  Returns `None` for architectures that do not yet
-    /// maintain a shared PromptCache (Qwen2, BitNet, Laguna, Qwen3VlMoe).
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "archs without a shared PromptCache fall through to None"
-    )]
+    /// each generation call.
     pub fn cache_stats(&self) -> Option<crate::CacheStats> {
         match self {
-            Architecture::Gemma4(_) | Architecture::Gemma3(_) => {
-                crate::gemma4::gemma4_cache_stats()
-            }
+            Architecture::Gemma4(_) => crate::gemma4::gemma4_cache_stats(),
+            Architecture::Gemma3(_) => crate::gemma3::gemma3_cache_stats(),
             Architecture::Qwen3_5Moe(_) => crate::qwen3_5_moe::qwen3_5_moe_cache_stats(),
             Architecture::Qwen3(_) => crate::qwen3::read_cache_stats(),
-            _ => None,
+            Architecture::Qwen2(_) => crate::qwen2::qwen2_cache_stats(),
+            Architecture::BitNet(_) => crate::bitnet::bitnet_cache_stats(),
+            Architecture::Qwen3VlMoe(_) => crate::qwen3_vl_moe::qwen3_vl_moe_cache_stats(),
+            Architecture::Laguna(_) => crate::laguna::laguna_cache_stats(),
         }
     }
 
@@ -1228,23 +1233,17 @@ impl Architecture {
     /// call on this architecture.
     ///
     /// Reads the arch-specific prompt-cache static that `generate_greedy` writes
-    /// via `store_kv_cache_bytes` at the end of every generate call.  Returns 0
-    /// for architectures that do not yet maintain that static (Qwen2, BitNet,
-    /// Laguna, Qwen3VlMoe).
+    /// via `store_kv_cache_bytes` at the end of every generate call.
     pub fn kv_cache_bytes(&self) -> u64 {
         match self {
             Architecture::Gemma4(_) => crate::gemma4::gemma4_kv_cache_bytes(),
-            // NOTE: Gemma3 has its own generate path (`crate::gemma3::generate_greedy`)
-            // that does NOT call `store_kv_cache_bytes`, so `gemma4_kv_cache_bytes()`
-            // always returns 0 (or the last Gemma4 value if both were loaded in the
-            // same process). Gemma3 KV byte reporting is not yet wired.
-            Architecture::Gemma3(_) => 0,
+            Architecture::Gemma3(_) => crate::gemma3::gemma3_kv_cache_bytes(),
             Architecture::Qwen3_5Moe(_) => crate::qwen3_5_moe::qwen3_5_moe_kv_cache_bytes(),
             Architecture::Qwen3(_) => crate::qwen3::read_kv_cache_bytes(),
-            Architecture::Qwen2(_)
-            | Architecture::Laguna(_)
-            | Architecture::Qwen3VlMoe(_)
-            | Architecture::BitNet(_) => 0,
+            Architecture::Qwen2(_) => crate::qwen2::qwen2_kv_cache_bytes(),
+            Architecture::BitNet(_) => crate::bitnet::bitnet_kv_cache_bytes(),
+            Architecture::Qwen3VlMoe(_) => crate::qwen3_vl_moe::qwen3_vl_moe_kv_cache_bytes(),
+            Architecture::Laguna(_) => crate::laguna::laguna_kv_cache_bytes(),
         }
     }
 

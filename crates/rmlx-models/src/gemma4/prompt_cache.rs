@@ -12,7 +12,7 @@
 //!   `crate::prompt_cache` (pure-attention: `lin_caches()` is `&[]`).
 //! - `impl SsdHydrate<Gemma4Entry> for SsdHydrator`: pure-attention hydrate.
 //! - SWA helpers `can_truncate_to_block` / `is_strict_prefix_of` consumed by
-//!   `gemma4/generate.rs`'s `CacheLookup` match (/ B1 snapshot/restore).
+//!   `gemma4/generate.rs`'s `consume()` dispatch (/ B1 snapshot/restore).
 //!
 //! The per-arch shell (`PROMPT_CACHE` static, ensure/stats wrappers) is
 //! pure delegation to `ArchPromptCache`; SSD attach is invoked directly on the
@@ -30,7 +30,7 @@
 use rmlx_core::error::Result;
 
 use crate::prompt_cache::{
-    ArchPromptCache, CacheStats, PromptCacheEntry, ReusePolicy, SsdHydrate, BLOCK_TOKENS,
+    ArchPromptCache, CacheStats, PromptCacheEntry, ReuseKind, ReusePolicy, SsdHydrate, BLOCK_TOKENS,
 };
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 use rmlx_kv_ssd::{HydratedBlock, SsdHydrator};
@@ -185,6 +185,103 @@ impl PromptCacheEntry for Gemma4Entry {
     // truncate_kv_to / truncate_kv_to_block / kv_bytes: trait defaults.
     // SWA correctness is gated upstream by `can_truncate_to_block` /
     // `is_strict_prefix_of`; the trim itself is the byte-identical default.
+
+    /// Delegates to the inherent [`Gemma4Entry::is_hydrate_complete`]: an
+    /// SSD-hydrated entry whose SWA rotating ring came back as a payload-less
+    /// `KvStorage::None` (the ring is not serialised to the SSD tier) is
+    /// incomplete, so the consume engine excludes it from prefix reuse and
+    /// degrades it to a full re-prefill.
+    fn is_hydrate_complete(&self) -> bool {
+        Gemma4Entry::is_hydrate_complete(self)
+    }
+
+    /// B1 (strict-prefix SWA snapshot/restore) is checked FIRST; only when it
+    /// declines does the block-truncate path run. This precedence preserves the
+    /// live arm order: the strict-prefix snapshot supersedes block-truncate for
+    /// the wrapped-SWA multi-turn case (where truncation would desync the SWA
+    /// ring).
+    ///
+    /// - Strict prefix: the cached prompt is a token-for-token prefix that the
+    ///   request extends by `>= 1` token (`is_strict_prefix_of`, with the
+    ///   `cached_len >= BLOCK_TOKENS` worthwhile floor). Reuse the snapshot
+    ///   verbatim at `prefix_len == cached_len` (no truncation → no SWA-wrap
+    ///   desync). Works whether the entry is RAM-resident or SSD-hydrated.
+    /// - Block truncate: otherwise, derive `effective_blocks` by dropping the
+    ///   trailing block when the matched blocks would cover the whole
+    ///   block-aligned prompt (the re-prefilled tail must be non-empty). When
+    ///   `effective_blocks >= 1` and every layer cache is losslessly trimmable
+    ///   (`can_truncate_to_block` — false once an SWA ring has wrapped), reuse
+    ///   the first `effective_blocks` blocks; otherwise decline.
+    fn is_reusable_prefix_of(
+        &self,
+        prompt_ids: &[u32],
+        _is_ssd_hydrated: bool,
+        matched_blocks: usize,
+    ) -> Option<ReuseKind> {
+        // B1 precedence — strict prefix supersedes block-truncate.
+        if self.is_strict_prefix_of(prompt_ids) {
+            return Some(ReuseKind::StrictPrefix {
+                prefix_len: self.prompt_token_ids.len(),
+            });
+        }
+        // Block-truncate path. The tail `[prefix_len..prompt_len)` must be
+        // non-empty (its final position is where the next-token logits are
+        // read). When the matched blocks already cover the whole block-aligned
+        // prompt, drop the last matched block back into the re-prefill tail; a
+        // genuine partial divergence (`matched * BLOCK < len`) reuses ALL
+        // matched blocks since the tail past the last block boundary is already
+        // non-empty.
+        let prompt_blocks = prompt_ids.len() / BLOCK_TOKENS;
+        let effective_blocks = if matched_blocks * BLOCK_TOKENS >= prompt_ids.len() {
+            matched_blocks.min(prompt_blocks).saturating_sub(1)
+        } else {
+            matched_blocks
+        };
+        if effective_blocks >= 1 && self.can_truncate_to_block(effective_blocks) {
+            Some(ReuseKind::BlockTruncate { effective_blocks })
+        } else {
+            None
+        }
+    }
+
+    /// `StrictPrefix` reuses the whole cached prefix verbatim → plain
+    /// `deep_clone` (trait default semantics). `BlockTruncate` deep-clones then
+    /// trims the KV to the block boundary, asserting the post-trim
+    /// `offset == effective_blocks * BLOCK_TOKENS` invariant the
+    /// generate-loop tail-forward relies on.
+    fn prepare_reuse(&self, kind: ReuseKind) -> Result<Self> {
+        match kind {
+            ReuseKind::StrictPrefix { .. } => self.deep_clone(),
+            ReuseKind::BlockTruncate { effective_blocks } => {
+                // The caller (generate-loop tail-forward) uses
+                // `prefix_len = effective_blocks * BLOCK_TOKENS` as the absolute
+                // position the tail re-prefills from. The block-truncate path is
+                // only constructed when `can_truncate_to_block(effective_blocks)`
+                // held (every layer cache losslessly trimmable — no wrapped-SWA
+                // ring), so re-asserting the precondition here is redundant.
+                // Assert the spec POSTcondition instead: after the trim, every
+                // KV cache that holds data lands exactly on the block boundary
+                // `effective_blocks * BLOCK_TOKENS`. Never-filled layers
+                // (`offset() == 0`) are skipped by `truncate_kv_to`, so they are
+                // excluded from the check.
+                let mut cloned = self.deep_clone()?;
+                cloned.truncate_kv_to_block(effective_blocks);
+                debug_assert!(
+                    {
+                        let expected = (effective_blocks * BLOCK_TOKENS) as i32;
+                        cloned
+                            .kv_caches
+                            .iter()
+                            .filter(|c| c.offset() > 0)
+                            .all(|c| c.offset() == expected)
+                    },
+                    "block-truncate postcondition: every filled KV cache offset \
+                     must equal effective_blocks * BLOCK_TOKENS after the trim"
+                );
+                Ok(cloned)
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
