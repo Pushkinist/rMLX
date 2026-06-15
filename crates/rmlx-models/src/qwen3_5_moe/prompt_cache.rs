@@ -31,7 +31,9 @@
 #![allow(clippy::redundant_closure_for_method_calls)]
 use rmlx_core::error::Result;
 
-use crate::prompt_cache::{ArchPromptCache, CacheStats, PromptCacheEntry, ReusePolicy, SsdHydrate};
+use crate::prompt_cache::{
+    ArchPromptCache, CacheStats, PromptCacheEntry, ReuseKind, ReusePolicy, SsdHydrate,
+};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 use rmlx_kv_ssd::{HydratedBlock, SsdHydrator};
 
@@ -107,6 +109,10 @@ impl PromptCacheEntry for Qwen35MoeEntry {
         self.kv_quant
     }
 
+    fn is_ssd_hydrated(&self) -> bool {
+        self.is_ssd_hydrated
+    }
+
     // Hybrid GDN arch: real recurrent caches. The default `truncate_kv_to`
     // deliberately cannot reach these (recurrent state is re-run on the tail,
     // never sliced), and the default `kv_bytes` sums their `approx_bytes`.
@@ -114,6 +120,47 @@ impl PromptCacheEntry for Qwen35MoeEntry {
         &self.lin_caches
     }
     // truncate_kv_to / truncate_kv_to_block / kv_bytes: trait defaults.
+
+    /// HydratedTail seam: an SSD-hydrated entry whose stored block-aligned
+    /// prefix is a STRICT prefix of the incoming prompt may be reused — the
+    /// hydrated KV + GDN `lin_caches` are the recurrent state at exactly
+    /// `t = prefix_len` of THIS same prompt, so re-prefilling only
+    /// `prompt_ids[prefix_len..]` on top is sequentially correct (identical to
+    /// pausing/resuming the original prefill at the block boundary).
+    ///
+    /// All three guards must hold:
+    /// 1. The entry was promoted from the SSD tier (`is_ssd_hydrated`).
+    /// 2. Stored ids are STRICTLY shorter than the incoming prompt. The strict
+    ///    less-than is load-bearing: it excludes the block-aligned EQUAL-length
+    ///    hydrated entry (no tail), which must fall through to Miss so its
+    ///    placeholder first token is recomputed rather than replayed.
+    /// 3. Stored ids are byte-identical to the matching leading subsequence of
+    ///    `prompt_ids` (guarantees the tail is the same prompt's continuation,
+    ///    not a divergent one).
+    ///
+    /// A non-hydrated partial match never reaches this hook (the ExactOnly
+    /// policy gates it out in the engine). Unlike gemma4, there is no
+    /// `>= BLOCK_TOKENS` floor: a hydrated entry is block-aligned by
+    /// construction, so the strict less-than alone is the correct gate.
+    fn is_reusable_prefix_of(
+        &self,
+        prompt_ids: &[u32],
+        is_ssd_hydrated: bool,
+        _matched_blocks: usize,
+    ) -> Option<ReuseKind> {
+        let stored = self.prompt_token_ids();
+        if is_ssd_hydrated && stored.len() < prompt_ids.len() && prompt_ids.starts_with(stored) {
+            Some(ReuseKind::StrictPrefix {
+                prefix_len: stored.len(),
+            })
+        } else {
+            None
+        }
+    }
+    // is_hydrate_complete / prepare_reuse: trait defaults. The GDN `lin_caches`
+    // recurrent state is carried by `deep_clone` (the default `prepare_reuse`)
+    // and is NEVER block-truncated — moe only ever yields `StrictPrefix`, and
+    // the default `truncate_kv_to` structurally cannot reach `lin_caches`.
 }
 
 // ---------------------------------------------------------------------------
