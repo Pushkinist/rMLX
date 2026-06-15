@@ -137,6 +137,20 @@ impl KvCache {
         &self.storage
     }
 
+    /// Borrow the live bf16 decode K/V buffers, if both are present.
+    ///
+    /// For a [`KvStorage::None`] cache these are the *only* place the live K/V
+    /// resides (the storage buffer is geometry-only), so the SSD spill path
+    /// reads them here to persist the bf16 prefix. Returns `None` when either
+    /// buffer is unset (a never-filled cache, or a hydrated SWA layer whose
+    /// rotating ring was never serialised) — those layers spill geometry-only.
+    pub fn decode_fp16_kv(&self) -> Option<(&Array, &Array)> {
+        match (&self.decode_fp16_k, &self.decode_fp16_v) {
+            (Some(k), Some(v)) => Some((k, v)),
+            _ => None,
+        }
+    }
+
     /// Set the model-side layer index on this cache.
     ///
     /// Call this in the arch builder loop immediately after `with_quant_max_seq`
@@ -161,6 +175,26 @@ impl KvCache {
     /// test in `rmlx-kv-ssd` to verify the `write_caches` positional contract.
     pub fn layer_idx(&self) -> usize {
         self.layer_idx
+    }
+
+    /// Seed the bf16 decode K/V buffers on a hydrated [`KvStorage::None`] cache.
+    ///
+    /// `KvStorage::None` (the unquantised bf16 path) keeps its live K/V in
+    /// [`Self::decode_fp16_k`] / [`Self::decode_fp16_v`] off the storage buffer,
+    /// so [`Self::from_storage`] alone reconstructs an *empty* cache for that
+    /// variant. The SSD hydrate path persists the bf16 prefix alongside the
+    /// geometry and restores it here so an exact-hit replay reads the real K/V
+    /// instead of zeros. bf16 round-trips exactly, so the seeded buffers match
+    /// the pre-spill values bit-for-bit.
+    ///
+    /// `k` / `v` are head-major `[B, kv_h, seq, head_dim]`, matching the layout
+    /// `exit_prefill` materialises. The `offset` set by [`Self::from_storage`]
+    /// already reflects `seq`, so no further bookkeeping is needed.
+    #[must_use]
+    pub fn with_decode_fp16_seed(mut self, k: Array, v: Array) -> Self {
+        self.decode_fp16_k = Some(k);
+        self.decode_fp16_v = Some(v);
+        self
     }
 
     /// Rebuild a `KvCache` from a reconstructed [`KvStorage`] (SSD
