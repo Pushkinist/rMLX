@@ -571,7 +571,7 @@ the corresponding negative-skip test at that time.
 **Codecs routed through Paged**: `K8V4`, `K8V8`, `Planar`, `Planar3`.
 
 **Codecs NOT routed through Paged** (auto-fall-through to their contiguous
-storage variants regardless of `RMLX_PAGED_KV`):
+storage variants regardless of `--paged-kv`):
 
 - `K8VTurbo3`, `K8VTurbo2`, `TurboSym4`, `PlanarK`, `RotKTq4V` — each owns a
   CPU- or hybrid-path V codec that does not fit either `PagedVStorage`

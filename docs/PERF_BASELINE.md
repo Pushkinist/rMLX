@@ -1923,7 +1923,7 @@ the 108 ms ON/OFF gap is comparable). This puts us in the
 - Decode TPS is **slightly worse** under GPU mirror ON (within ±1% reverse-
   noise envelope but consistent with TTFT pattern).
 
-→ **Gate is default-OFF**, opt-in via `RMLX_GPU_RESIDENT_ISO=1`.
+→ **Gate is hardcoded OFF** (`gpu_resident_iso_enabled()` returns `false` unconditionally in production; no env-var opt-in).
 
 The mirror architecture is landed and verified (5 ignored GPU tests pass;
 SSD round-trip preserves dequant output bit-identical). The gate-OFF path
@@ -1944,8 +1944,9 @@ the mirror is built but rarely read. The upload-cost saving the mirror buys
 ## GPU-resident mirror extension: dormant-by-design (2026-06-03)
 
 **Decision: won't extend.** The 7-codec GPU-resident mirror extension (iso3 K,
-iso4 V/K, rotor3/4 V/K) was evaluated and declined. The `RMLX_GPU_RESIDENT_ISO`
-gate is dormant on the normal decode path under the warm-TTFT bf16 seed contract
+iso4 V/K, rotor3/4 V/K) was evaluated and declined. The GPU-resident mirror
+gate (`gpu_resident_iso_enabled()`) is hardcoded `false` in production and
+dormant on the normal decode path under the warm-TTFT bf16 seed contract
 (`docs/KV_CACHE.md` §9.6, `decode_fp16_k`). Extending the mirror to the 7
 remaining codecs delivers no per-decode-step benefit because those codecs share
 the same early-return guard: every `update_iso3` / `update_iso4` /
@@ -1977,7 +1978,7 @@ interleaved. **Hardware:** M5 Max.
 
 | Arm | decode_tps runs | median | stdev | TTFT runs (ms) | median | stdev |
 |-----|----------------|--------|-------|---------------|--------|-------|
-| A — `RMLX_GPU_RESIDENT_ISO=1` (ON) | 61.755 / 60.570 / 61.302 | **61.302** | 0.598 | 6634 / 6639 / 6703 | **6639** | 38.5 |
+| A — GPU mirror ON (bench arm) | 61.755 / 60.570 / 61.302 | **61.302** | 0.598 | 6634 / 6639 / 6703 | **6639** | 38.5 |
 | B — unset (OFF, baseline) | 61.827 / 61.753 / 60.361 | **61.753** | 0.826 | 6636 / 6670 / 6758 | **6670** | 63.0 |
 | **Δ (A − B)** | | **−0.451 TPS** | | | **−31 ms** | |
 | **Δ %** | | **−0.73%** | | | **−0.46%** | |
@@ -1990,11 +1991,11 @@ condition for reversing this decision is not met.
 
 **Confirms null:** yes. The prior null result (TTFT delta 1.61%, decode TPS
 delta −1.30%, both inside noise) is reproduced with a fresh 3-run protocol.
-The `RMLX_GPU_RESIDENT_ISO` gate is a no-op on the normal decode path.
+The GPU-resident mirror gate is a no-op on the normal decode path.
 
 ### Dormant-by-design gate (permanent)
 
-The `RMLX_GPU_RESIDENT_ISO` opt-in gate remains in the codebase as a
+The `gpu_resident_iso_enabled()` gate is hardcoded `false` in production as a
 forward-compatibility knob for any **future** seedless workload — a decode path
 that leaves `decode_fp16_k`/`decode_fp16_v` absent (e.g. a PPL-eval harness that
 reads quantized KV instead of teacher-forced bf16, or a prompt-cache hydrate

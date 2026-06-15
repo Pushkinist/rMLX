@@ -135,13 +135,12 @@ pub fn sparse_attn_enabled() -> bool {
 
 /// Returns `true` when the GPU-resident `QuantIsoV3` mirror is enabled.
 ///
-/// **Hardcoded OFF** (bench-driven decision; `RMLX_GPU_RESIDENT_ISO` env var
-/// removed in PASS 3 cleanup). Phase-1 bench showed deltas within noise on the
-/// `update_iso3` hot path because the FusedQkShadow already absorbs the dequant.
-/// See [docs/PERF_BASELINE.md] for bench rationale. The remaining 7 codecs
-/// (iso3 K, iso4 V/K, rotor3/4 V/K) are **deferred** until a bench arm shows a
-/// clear win on a FusedQkShadow-incompatible path (PPL eval, prompt-cache hits
-/// that skip prefill, or any seedless workload).
+/// **Hardcoded OFF** (bench-driven decision; no env-var opt-in). A/B bench
+/// showed deltas within noise on the `update_iso3` hot path because the
+/// warm-TTFT bf16 seed absorbs the dequant cost before the mirror is reached.
+/// See `docs/PERF_BASELINE.md` for bench numbers. The gate exists as a
+/// forward-compatibility hook for future seedless decode paths where
+/// `decode_fp16_k.is_none()` during steady-state decode.
 #[cfg(not(test))]
 pub fn gpu_resident_iso_enabled() -> bool {
     false
