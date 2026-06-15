@@ -344,3 +344,309 @@ fn is_reusable_prefix_of_block_truncate_arithmetic() {
         "all-blocks-consumed (effective_blocks == 0) must decline → None → Miss"
     );
 }
+
+/// Phase B consume-engine migration golden (gemma4, e2b — model-gated).
+///
+/// Pins that routing gemma4 through the shared `consume()` engine is
+/// behavior-identical to the pre-migration inline `CacheLookup` across all
+/// three reachable gemma4 paths. At temp 0, every reuse path must decode
+/// token-identically to a cold (Miss) baseline of the SAME prompt:
+///   (a) SWA degrade-to-reprefill: a 336-token (non-block-aligned) prompt whose
+///       1 shared block is served from an SSD-hydrated entry with a payload-less
+///       SWA layer (`is_hydrate_complete == false`) → the engine degrades it to
+///       Miss → full re-prefill → WARM == COLD (the SWA-empty correctness fix).
+///   (b) RAM multi-turn prefix reuse, BOTH arms:
+///         - strict-prefix arm: a 512-token cached prompt that the request
+///           extends to 768 tokens → `Reuse{StrictPrefix}` → restore + tail →
+///           WARM == COLD(768);
+///         - block-truncate arm: a 512-token cached prompt and a same-length
+///           request that diverges in the second block (1 shared block) →
+///           `Reuse{BlockTruncate}` → trim + tail → WARM == COLD(request).
+///   (c) #87 exact-hit: a block-aligned (256-token) SSD-hydrated entry whose
+///       prefix length equals the full prompt (placeholder first_id 0) → the
+///       `!is_ssd_hydrated` Exact exclusion drops it to Miss → recompute →
+///       WARM == COLD, never the placeholder 0.
+///
+/// Run:
+/// ```sh
+/// RMLX_TEST_MODEL_GEMMA4_E2B=/path/to/mlx-community__gemma-4-e2b-it-mxfp8 \
+/// cargo test -p rmlx-models gemma4_consume_engine_migration_golden \
+///     -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test-only: Mutex critical section is panic-free; remaining unwrap is on values constructed in this fn"
+)]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: indices bounded by slice length validated before call"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "test-only: a single golden covering the three reachable gemma4 reuse paths (SWA-degrade / RAM strict-prefix + block-truncate / #87 exact-hit) reads clearest as one sequential fixture"
+)]
+fn gemma4_consume_engine_migration_golden() {
+    use crate::gemma4::{generate_greedy, load_from_path};
+    use rmlx_mlx::Device;
+
+    let Some(model_dir_buf) =
+        std::env::var_os("RMLX_TEST_MODEL_GEMMA4_E2B").map(std::path::PathBuf::from)
+    else {
+        println!("SKIP: RMLX_TEST_MODEL_GEMMA4_E2B not set");
+        return;
+    };
+    let model_dir = model_dir_buf.as_path();
+    if !model_dir.exists() {
+        println!("SKIP: model dir not found at {}", model_dir.display());
+        return;
+    }
+    let arch_str = {
+        let cfg_path = model_dir.join("config.json");
+        let data = std::fs::read(&cfg_path).expect("read config.json");
+        let v: serde_json::Value = serde_json::from_slice(&data).expect("parse config.json");
+        v.get("architectures")
+            .and_then(|a| a.get(0))
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_owned()
+    };
+    if arch_str != "Gemma4ForConditionalGeneration" {
+        println!("SKIP: arch \"{arch_str}\" is not Gemma4ForConditionalGeneration");
+        return;
+    }
+
+    let model = load_from_path(model_dir).expect("load model");
+    let device = Device::Gpu;
+    let kv_quant = KvQuant::None;
+    let max_seq = 4096i32;
+    let n_decode = 6usize;
+    let tokenizer =
+        tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json")).expect("load tokenizer");
+
+    // Deterministic synthetic token ids (kept in a safe mid-vocab band).
+    let make_ids = |len: usize, salt: u32| -> Vec<u32> {
+        (1u32..=len as u32)
+            .map(|i| ((i.wrapping_mul(7).wrapping_add(salt)) % 9999).max(1))
+            .collect()
+    };
+
+    let sampler = crate::sampler::SamplerConfig {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        min_p: 0.0,
+        seed: Some(0),
+        top_logprobs_k: 0,
+    };
+    let penalty_cfg = crate::sampler::PenaltyConfig::default();
+
+    // Run generate_greedy at temp 0, return the decoded token_id sequence.
+    let run = |ids: &[u32]| -> Vec<u32> {
+        let mut rng = crate::sampler::Pcg32::new(sampler.seed_or_default());
+        let mut token_history: Vec<u32> = Vec::new();
+        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
+        generate_greedy(
+            &model,
+            &tokenizer,
+            ids,
+            n_decode,
+            device,
+            kv_quant,
+            Some(max_seq),
+            4,
+            &[],
+            &mut step_fn,
+            None,
+            &sampler,
+            &mut rng,
+            &penalty_cfg,
+            &mut token_history,
+            None,
+        )
+        .expect("generate_greedy")
+        .into_iter()
+        .map(|s| s.token_id)
+        .collect()
+    };
+
+    let clear_cache = || {
+        ensure_prompt_cache(4);
+        PROMPT_CACHE.with_inner_mut(|guard| {
+            if let Some(cache) = guard.as_mut() {
+                cache.clear();
+            }
+        });
+    };
+
+    // Read back the RAM snapshot store-back left by the most recent cold run of
+    // `ids`, deep-cloning its KV caches (the cache keeps ownership).
+    let read_back_kv = |ids: &[u32]| -> Vec<KvCache> {
+        let seed = FNV_OFFSET ^ active_layout_key() ^ kv_quant.cache_key_salt();
+        PROMPT_CACHE.with_inner_mut(|guard| {
+            let cache = guard.as_mut().expect("cache present");
+            let (slot_idx, _) = cache
+                .find_best_prefix(ids, seed)
+                .expect("cold store-back must be resident");
+            cache.slots[slot_idx]
+                .entry
+                .kv_caches
+                .iter()
+                .map(|c| c.try_deep_clone().expect("kv clone"))
+                .collect()
+        })
+    };
+
+    // Push an SSD-hydrated entry (placeholder first_id 0, is_ssd_hydrated=true)
+    // keyed on `key_ids`, carrying `kv_caches`, into a freshly cleared cache.
+    let push_hydrated = |key_ids: &[u32], kv_caches: Vec<KvCache>| {
+        clear_cache();
+        PROMPT_CACHE.with_inner_mut(|guard| {
+            let cache = guard.as_mut().expect("cache present");
+            let block_hashes = crate::prompt_cache::chained_block_hashes_seeded(
+                key_ids,
+                FNV_OFFSET ^ active_layout_key() ^ kv_quant.cache_key_salt(),
+            );
+            cache.push(Gemma4Entry {
+                prompt_token_ids: key_ids.to_vec(),
+                block_hashes,
+                kv_caches,
+                first_id: 0,
+                first_piece: String::new(),
+                kv_quant: Some(kv_quant),
+                is_ssd_hydrated: true,
+            });
+        });
+    };
+
+    // ── (a) SWA degrade-to-reprefill — 336-token (non-block-aligned) prompt ──
+    // COLD baseline of the full 336-token prompt.
+    let p336 = make_ids(336, 0);
+    clear_cache();
+    let cold_336 = run(&p336);
+    assert_eq!(cold_336.len(), n_decode);
+    assert_ne!(
+        cold_336[0], 0,
+        "cold first token is placeholder 0 — anomaly"
+    );
+
+    // Build a real snapshot of the first 256-token (1-block) prefix via a cold
+    // run, then read its KV back and rebuild the SWA layers as payload-less
+    // `KvStorage::None` — exactly what `block_io` reconstructs on hydrate (the
+    // rotating ring is not serialised to the SSD tier).
+    let prefix256: Vec<u32> = p336[..BLOCK_TOKENS].to_vec();
+    clear_cache();
+    let _ = run(&prefix256); // store-back leaves a RAM snapshot of the prefix
+    let mut hydrated_kv = read_back_kv(&prefix256);
+    for (i, c) in hydrated_kv.iter_mut().enumerate() {
+        if matches!(
+            model.cfg.layer_types[i],
+            crate::gemma4::LayerType::SlidingAttention
+        ) {
+            // Drop the SWA ring to a payload-less None with no bf16 seed — the
+            // incomplete-hydrate shape the engine must degrade.
+            *c = KvCache::from_storage(
+                KvStorage::None {
+                    max_seq: model.cfg.sliding_window as i32,
+                },
+                kv_quant,
+                BLOCK_TOKENS as i32,
+                i,
+            );
+            assert!(
+                !c.has_persistent_cache() && c.decode_fp16_kv().is_none(),
+                "rebuilt SWA layer must be payload-less None"
+            );
+        }
+    }
+    push_hydrated(&prefix256, hydrated_kv);
+    let warm_swa = run(&p336);
+    println!("(a) SWA degrade: cold={cold_336:?} warm={warm_swa:?}");
+    assert_ne!(
+        warm_swa.first().copied(),
+        Some(0u32),
+        "SWA-incomplete hydrate must degrade to re-prefill, never replay placeholder 0"
+    );
+    assert_eq!(
+        warm_swa, cold_336,
+        "(a) SWA degrade-to-reprefill must equal the cold baseline"
+    );
+
+    // ── (b) RAM multi-turn prefix reuse — BOTH arms ─────────────────────────
+    // Strict-prefix arm: cache a 512-token prompt, then extend to 768 tokens.
+    let p512 = make_ids(512, 0);
+    let p768: Vec<u32> = {
+        let mut v = p512.clone();
+        v.extend(make_ids(256, 5)); // 256-token tail with a distinct salt
+        v
+    };
+    clear_cache();
+    let cold_768 = run(&p768);
+    clear_cache();
+    let _ = run(&p512); // store-back caches the 512-token prompt (RAM)
+    let warm_strict = run(&p768); // strict-prefix extension → Reuse{StrictPrefix}
+    println!("(b) strict-prefix: cold={cold_768:?} warm={warm_strict:?}");
+    assert_eq!(
+        warm_strict, cold_768,
+        "(b) RAM strict-prefix reuse must equal the cold baseline for the extended prompt"
+    );
+
+    // Block-truncate arm: a same-length 512-token request that shares the first
+    // block then diverges in the second block. find_best_prefix matches 1 block;
+    // `is_strict_prefix_of` is false (divergent, equal length) so the
+    // block-truncate arm fires (effective_blocks = 1).
+    let p512_div: Vec<u32> = {
+        let mut v = p512.clone();
+        for t in v.iter_mut().skip(BLOCK_TOKENS) {
+            *t = ((*t).wrapping_add(101) % 9999).max(1);
+        }
+        v
+    };
+    clear_cache();
+    let cold_div = run(&p512_div);
+    clear_cache();
+    let _ = run(&p512); // cache the 512-token prompt sharing the first block
+    let warm_trunc = run(&p512_div); // 1 shared block, diverges → Reuse{BlockTruncate}
+    println!("(b) block-truncate: cold={cold_div:?} warm={warm_trunc:?}");
+    assert_eq!(
+        warm_trunc, cold_div,
+        "(b) RAM block-truncate reuse must equal the cold baseline for the divergent prompt"
+    );
+
+    // ── (c) #87 exact-hit: block-aligned hydrated entry == full prompt ──────
+    // A 256-token block-aligned prompt; the hydrated entry's prefix length
+    // equals the full prompt (no tail, placeholder first_id 0). The Exact arm's
+    // `!is_ssd_hydrated` guard drops it to Miss → recompute → WARM == COLD.
+    let p256 = make_ids(BLOCK_TOKENS, 13);
+    clear_cache();
+    let cold_256 = run(&p256);
+    assert_ne!(
+        cold_256[0], 0,
+        "cold 256 first token is placeholder 0 — anomaly"
+    );
+    clear_cache();
+    let _ = run(&p256); // build a real RAM snapshot of the full block-aligned prompt
+    let full_kv = read_back_kv(&p256);
+    push_hydrated(&p256, full_kv); // re-key as a hydrated full-length entry
+    let warm_exact = run(&p256);
+    println!("(c) #87 exact-hit: cold={cold_256:?} warm={warm_exact:?}");
+    assert_ne!(
+        warm_exact.first().copied(),
+        Some(0u32),
+        "(c) block-aligned hydrated exact-length must NOT replay placeholder 0"
+    );
+    assert_eq!(
+        warm_exact, cold_256,
+        "(c) #87 hydrated exact-length recompute must equal the cold baseline"
+    );
+
+    println!(
+        "PASS: gemma4 consume-engine migration golden — SWA-degrade / strict-prefix / \
+         block-truncate / #87 exact-hit all match their cold baselines"
+    );
+}
