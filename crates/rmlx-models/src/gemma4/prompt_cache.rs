@@ -111,6 +111,32 @@ impl Gemma4Entry {
             && cached_len < prompt_ids.len()
             && self.prompt_token_ids[..] == prompt_ids[..cached_len]
     }
+
+    /// True iff every layer this architecture attends to carries real K/V
+    /// payload — i.e. the snapshot is safe to reuse as a prefix (B1
+    /// strict-prefix snapshot/restore or block-truncate) without re-prefilling
+    /// the prefix.
+    ///
+    /// Gemma4's sliding-window (SWA) layers run a bf16 `RotatingKvCache` ring
+    /// that is NOT serialised to the SSD tier; on hydrate they are
+    /// reconstructed as a payload-less `KvStorage::None` (the spill writer
+    /// records them geometry-only, see `block_io::write_layer`). Reusing such a
+    /// hydrated entry via a prefix arm would re-prefill only the tail on top of
+    /// an empty SWA prefix, giving the SWA layers the wrong attention context
+    /// and corrupting the output. `KvCache::is_trimmable()` returns `true` for a
+    /// `None` layer, so it is the wrong predicate to detect this.
+    ///
+    /// A layer is payload-less when its storage is `None` AND it carries no
+    /// off-storage bf16 seed. This distinguishes a dropped SWA ring (no seed →
+    /// incomplete) from a `KvQuant::None` global layer whose bf16 K/V was
+    /// spilled and restored via `KvCache::with_decode_fp16_seed` (seed present →
+    /// complete). A fully RAM-resident snapshot always passes (no layer is
+    /// `None`-without-seed), so only hydrated SWA entries are degraded.
+    pub(crate) fn is_hydrate_complete(&self) -> bool {
+        self.kv_caches
+            .iter()
+            .all(|c| c.has_persistent_cache() || c.decode_fp16_kv().is_some())
+    }
 }
 
 impl PromptCacheEntry for Gemma4Entry {

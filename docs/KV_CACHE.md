@@ -447,6 +447,14 @@ unconditionally — the rotating buffer codec is bf16. Quantization flags
 apply to full-attention layers only. A one-shot `info!` log discloses this
 at startup when a quantized type is requested on a SWA model.
 
+The bf16 rotating ring is **not** serialised to the SSD KV tier (the ring
+layout is not expressed in the `.kvb` format), so SWA layers hydrate as empty
+`KvStorage::None`. A hydrated prompt-cache entry whose length is not
+block-aligned therefore cannot be reused as a prefix (the empty SWA prefix
+would corrupt attention) — the consume path detects the payload-less SWA layer
+and degrades the entry to a full re-prefill. See `docs/SSD_TIER.md` §"SWA layers
+are not spilled". Serialising the SWA ring is a future enhancement.
+
 ### 5.8 TurboQuant requires Flash Attention
 
 The `tq4` V-side path is only valid through the Flash Attention dispatch.

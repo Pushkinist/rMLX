@@ -1,5 +1,6 @@
 use super::*;
 use crate::prompt_cache::{PromptCache, FNV_OFFSET};
+use rmlx_kv_quant::storage::KvStorage;
 use rmlx_kv_quant::KvQuant;
 
 fn entry_with(kv_caches: Vec<KvCache>, ids: Vec<u32>) -> Gemma4Entry {
@@ -165,6 +166,56 @@ fn kv_quant_match_hits_no_eviction() {
 #[test]
 fn arch_policy_is_partial() {
     assert_eq!(PROMPT_CACHE.policy(), ReusePolicy::Partial);
+}
+
+/// A fully RAM-resident snapshot (every layer holds persistent K/V) is
+/// hydrate-complete — the guard never degrades a normal RAM-cache hit.
+#[test]
+fn hydrate_complete_for_resident_snapshot() {
+    let kv = vec![
+        KvCache::with_quant_max_seq_window(KvQuant::K8V8, 8192, None), // full-attn
+        KvCache::with_quant_max_seq_window(KvQuant::K8V8, 8192, Some(512)), // SWA
+        KvCache::with_quant_max_seq_window(KvQuant::K8V8, 8192, Some(512)), // SWA
+    ];
+    let e = entry_with(kv, (0..(2 * BLOCK_TOKENS) as u32).collect());
+    assert!(
+        e.is_hydrate_complete(),
+        "a RAM-resident snapshot must be hydrate-complete (no payload-less None layer)"
+    );
+}
+
+/// An SSD-hydrated entry whose SWA layer came back as a payload-less
+/// `KvStorage::None` (the rotating ring is not spilled) MUST be detected as
+/// hydrate-INCOMPLETE so the generate loop degrades the prefix reuse to a full
+/// re-prefill (Miss). The full-attention layer is reconstructed with real
+/// quantized payload; the SWA layer is empty `None`.
+#[test]
+fn hydrate_incomplete_when_swa_layer_empty() {
+    // Full-attention layer: real K8V8 storage with a recorded offset (the
+    // hydrate path reconstructs these with payload).
+    let full = KvCache::from_storage(KvStorage::new(KvQuant::K8V8, 8192), KvQuant::K8V8, 256, 0);
+    assert!(
+        full.has_persistent_cache(),
+        "K8V8 full-attn layer must report persistent cache"
+    );
+    // SWA layer: payload-less None (rotating ring dropped on spill), no bf16
+    // seed restored — exactly what `block_io` reconstructs for a gemma4 SWA
+    // layer on hydrate.
+    let swa = KvCache::from_storage(KvStorage::None { max_seq: 512 }, KvQuant::K8V8, 256, 1);
+    assert!(
+        !swa.has_persistent_cache() && swa.decode_fp16_kv().is_none(),
+        "dropped-SWA layer must be payload-less None with no bf16 seed"
+    );
+
+    let mut e = entry_with(vec![full, swa], (0..(2 * BLOCK_TOKENS) as u32).collect());
+    // Scene-setting: model a hydrated entry. `is_hydrate_complete` inspects the
+    // per-layer caches, not this flag, but a real degrade also requires it.
+    e.is_ssd_hydrated = true;
+    assert!(
+        !e.is_hydrate_complete(),
+        "a hydrated entry with an empty SWA None layer must be hydrate-INCOMPLETE \
+         (excluded from the prefix reuse arms → Miss)"
+    );
 }
 
 /// / B1: `is_strict_prefix_of` is the SWA snapshot/restore "hook"
