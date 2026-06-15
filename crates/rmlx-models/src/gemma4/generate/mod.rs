@@ -273,8 +273,17 @@ pub fn generate_greedy<'a>(
                 // block-aligned + `can_truncate_to_block` path for the multi-turn
                 // case (which forced a full re-prefill Miss on every wrapped-SWA
                 // turn — bug B1: prefill_ms grew with conversation length).
+                // Hydrate-completeness guard: a SSD-hydrated entry whose SWA
+                // layers came back as payload-less `KvStorage::None` (the
+                // rotating ring is not serialised to the SSD tier — see
+                // `Gemma4Entry::is_hydrate_complete`) MUST NOT be reused via a
+                // prefix arm. Reusing it would re-prefill only the tail on top
+                // of an empty SWA prefix and corrupt the output. Such an entry
+                // falls through to a full re-prefill (Miss). The guard is a
+                // no-op for RAM-resident snapshots (every layer holds payload).
                 Some((slot_idx, _block_count))
-                    if cache.slots[slot_idx].entry.is_strict_prefix_of(prompt_ids) =>
+                    if cache.slots[slot_idx].entry.is_strict_prefix_of(prompt_ids)
+                        && cache.slots[slot_idx].entry.is_hydrate_complete() =>
                 {
                     let slot = &cache.slots[slot_idx].entry;
                     let prefix_len = slot.prompt_token_ids().len();
@@ -310,7 +319,15 @@ pub fn generate_greedy<'a>(
                 // longctx 22 -> 0 tokens). When `can_truncate_to_block` is
                 // false we fall back to a full re-prefill (Miss); correctness
                 // over speed for the wrapped-SWA case.
-                Some((slot_idx, block_count)) if block_count >= 1 => {
+                // Block-truncate partial-prefix reuse — same hydrate-
+                // completeness guard as the B1 arm above. A SSD-hydrated entry
+                // with a payload-less SWA `None` layer cannot be block-truncated
+                // and tail-re-prefilled correctly (the empty SWA prefix would
+                // give wrong attention), so it is excluded here and falls
+                // through to a full re-prefill (Miss).
+                Some((slot_idx, block_count))
+                    if block_count >= 1 && cache.slots[slot_idx].entry.is_hydrate_complete() =>
+                {
                     // The tail `[prefix_len..prompt_len)` must be non-empty: the
                     // re-prefilled tail's final position is where we read the
                     // next-token logits from. If the matched blocks cover the
@@ -358,6 +375,20 @@ pub fn generate_greedy<'a>(
                         );
                         CacheLookup::Miss
                     }
+                }
+                // Incomplete SSD-hydrated entry: the prefix arms above were
+                // skipped by the `is_hydrate_complete` guard because at least
+                // one attended layer (a gemma4 SWA ring) came back payload-less
+                // after hydrate. Degrade to a full re-prefill (Miss) and record
+                // the decision so the empty-SWA reuse path is traceable.
+                Some((slot_idx, _)) if !cache.slots[slot_idx].entry.is_hydrate_complete() => {
+                    tracing::debug!(
+                        prompt_len = prompt_ids.len(),
+                        "gemma4 generate_greedy: SSD-hydrated entry has a payload-less \
+                         SWA layer (rotating ring not spilled) — degrading prefix reuse \
+                         to full re-prefill (Miss)"
+                    );
+                    CacheLookup::Miss
                 }
                 Some(_) => CacheLookup::Miss,
                 None => CacheLookup::Miss,
