@@ -1,14 +1,25 @@
 // unsafe_code: mlx-rs Array zero-copy view — slice::from_raw_parts byte-reinterpret for Array::from_bytes
 #![allow(unsafe_code)]
+#![allow(clippy::redundant_closure_for_method_calls)]
 
 //! Greedy autoregressive generation for Qwen3-VL-MoE — text + image branches.
 //!
-//! Self-contained, deliberately simpler than the qwen3_5_moe generator: no
-//! prompt-cache reuse, no GatedDeltaNet, no MTP. The Qwen3-VL text decoder is a
-//! plain GQA stack with 3D interleaved M-RoPE, so a fresh per-layer
-//! [`KvCache`] + sequential prefill/decode is correct and fast enough for the
-//! single-image serve path. Sampling / penalty / constraint hooks mirror the
-//! other arch generators so the server's decode-loop call site is uniform.
+//! The Qwen3-VL text decoder is a plain GQA stack with 3D interleaved M-RoPE
+//! (the MoE lives in the FFN and never touches the KV cache), so a per-layer
+//! [`KvCache`] one-shot prefill + sequential decode is correct and fast enough
+//! for the single-image serve path. Sampling / penalty / constraint hooks mirror
+//! the other arch generators so the server's decode-loop call site is uniform.
+//!
+//! ## Prompt cache (text path only)
+//!
+//! The text [`generate_greedy`] routes through the shared
+//! [`crate::prompt_cache::ArchPromptCache::consume`] engine under
+//! [`crate::prompt_cache::ReusePolicy::ExactOnly`]: an identical-prompt repeat
+//! skips re-prefill (Exact), and every other request re-prefills and snapshots
+//! the post-prefill KV (Miss → store). Image turns route to [`generate_image`]
+//! (the text path never sees image ids), and both the consume bypass and the
+//! store-back are additionally `has_image`-gated as belt-and-suspenders — the
+//! token-id cache key is unsafe across image spans.
 //!
 //! The 3D position bookkeeping is the only Qwen3-VL-specific wrinkle:
 //! - text-only: positions are sequential in all three (t,h,w) dims;
@@ -21,12 +32,16 @@ use rmlx_mlx::{Array, Device, Dtype};
 
 use crate::constraint::ConstraintEngine;
 use crate::decode_loop::ProbeStep;
+use crate::prompt_cache::{chained_block_hashes_seeded, Consumed, ReusePolicy, FNV_OFFSET};
 use crate::sampler::{apply_mask_argmax, sample_token_array, Pcg32, PenaltyConfig, SamplerConfig};
 use rmlx_kv_quant::{KvCache, KvQuant};
 
 use super::image::{scatter_vision_features, visual_token_positions};
 use super::model::Qwen3VlMoeText;
 use super::mrope::{get_rope_index, RopeIndex3D};
+use super::prompt_cache::{
+    active_layout_key, ensure_prompt_cache, store_kv_cache_bytes, Qwen3VlMoeEntry, PROMPT_CACHE,
+};
 use super::vision::VisionOutput;
 
 /// Trailing-window size for repetition penalties (matches the other archs).
@@ -84,17 +99,23 @@ fn pick_token(
     Ok(i32::from_le_bytes(b[..4].try_into().unwrap()) as u32)
 }
 
+/// Decode one token id to its display piece (SentencePiece `▁` → space). Shared
+/// by `make_step` and the Miss-path snapshot store-back so a later Exact-hit
+/// replays a byte-identical piece without re-decoding.
+fn piece_for(token_id: u32, tokenizer: &tokenizers::Tokenizer) -> String {
+    tokenizer
+        .id_to_token(token_id)
+        .unwrap_or_default()
+        .replace('\u{2581}', " ")
+}
+
 /// Emit one decode step (token id + piece). Logit stats are left at defaults —
 /// the smoke classifier only needs ids + pieces, and the hot loop avoids the
 /// extra GPU→host transfer of the full logit row.
 fn make_step(token_id: u32, tokenizer: &tokenizers::Tokenizer) -> ProbeStep {
     ProbeStep {
         token_id,
-        piece: tokenizer
-            .id_to_token(token_id)
-            .unwrap_or_default()
-            .replace('\u{2581}', " ")
-            .into_boxed_str(),
+        piece: piece_for(token_id, tokenizer).into_boxed_str(),
         max_abs_logit: 0.0,
         nan_count: 0,
         logprobs: None,
@@ -102,6 +123,14 @@ fn make_step(token_id: u32, tokenizer: &tokenizers::Tokenizer) -> ProbeStep {
 }
 
 /// Greedy generation from plain text token ids.
+///
+/// `prompt_cache_slots` — number of post-prefill KV snapshots kept across
+/// requests. Pass 1 for single-slot; pass N for multi-slot prefix matching.
+/// Recommended: 4. Only the Exact-hit path is active under
+/// [`ReusePolicy::ExactOnly`] (identical-prompt repeat skips re-prefill
+/// entirely, same contract as Qwen2 / Qwen3 dense). `max_ctx_override` is unused
+/// here: the text decoder prefills the whole prompt in one shot and grows its KV
+/// ring lazily, so there is no pre-sized ceiling to clamp.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_greedy(
     model: &Qwen3VlMoeText,
@@ -111,7 +140,7 @@ pub fn generate_greedy(
     device: Device,
     kv_quant: KvQuant,
     _max_ctx_override: Option<i32>,
-    _prompt_cache_slots: usize,
+    prompt_cache_slots: usize,
     eos_ids: &[u32],
     step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
     mut constraint: Option<&mut dyn ConstraintEngine>,
@@ -132,12 +161,80 @@ pub fn generate_greedy(
     }
     let vocab = model.cfg.vocab_size;
     let n_layers = model.cfg.num_hidden_layers;
+    let mut steps = Vec::with_capacity(n_tokens);
+
+    ensure_prompt_cache(prompt_cache_slots);
+
+    // ------------------------------------------------------------------
+    // Prompt cache lookup via the shared consume() engine. The Qwen3-VL text
+    // decoder is plain GQA with no recurrent state and uses
+    // ReusePolicy::ExactOnly (it overrides none of the reuse hooks), so the only
+    // reachable outcomes are Exact (identical-prompt repeat skips re-prefill) and
+    // Miss (full re-prefill). The engine owns the find → SSD-hydrate retry →
+    // quant-mismatch guard → SSD-hydrated exclusion → Exact decision and traces
+    // every degrade branch. The ExactOnly policy tripwire lives here at the call
+    // site — not in the generic engine — because the engine is policy-agnostic
+    // and shared across architectures that may use different policies.
+    // ------------------------------------------------------------------
+    assert_eq!(
+        PROMPT_CACHE.policy(),
+        ReusePolicy::ExactOnly,
+        "Qwen3-VL-MoE prompt cache must be ExactOnly — pure-attention text decoder \
+         with no recurrent state and an Exact-hit-dominated workload; partial-prefix \
+         reuse is not wired",
+    );
+    // The text path never carries image ids (images route to generate_image), so
+    // has_image is always false here; the engine's bypass is belt-and-suspenders.
+    let has_image = false;
+    let consumed = PROMPT_CACHE.consume(prompt_ids, kv_quant, has_image);
+
+    // Path A: exact cache hit — skip re-prefill, replay the stored first token,
+    // then run the shared decode loop on the cloned caches.
+    if let Consumed::Exact(cloned) = consumed {
+        let Qwen3VlMoeEntry {
+            kv_caches: mut kv,
+            first_id: first,
+            first_piece,
+            ..
+        } = cloned;
+        tracing::debug!(
+            prompt_len = prompt_ids.len(),
+            token_id = first,
+            "qwen3_vl_moe generate_greedy: prompt cache EXACT HIT"
+        );
+        // The cached first_id is the same token the prefill argmax produced, and
+        // first_piece is its piece_for(...) string (stored at Miss-path push), so
+        // replaying it on the cloned caches yields the same decoded sequence as a
+        // cold run. Subsequent steps re-derive their piece via make_step.
+        decode_from(
+            model,
+            tokenizer,
+            &mut kv,
+            first,
+            Some(first_piece),
+            n_tokens,
+            vocab,
+            device,
+            eos_ids,
+            &mut steps,
+            step_fn,
+            &mut constraint,
+            sampler_cfg,
+            rng,
+            penalty_cfg,
+            token_history,
+        )?;
+        let kv_bytes: u64 = kv.iter().map(|c| c.resident_bytes()).sum();
+        store_kv_cache_bytes(kv_bytes);
+        return Ok(steps);
+    }
+
+    // Path B (Miss): one-shot prefill from scratch.
     let mut kv: Vec<KvCache> = (0..n_layers)
         .enumerate()
         .map(|(i, _)| KvCache::with_quant(kv_quant).with_layer_idx(i))
         .collect();
 
-    let mut steps = Vec::with_capacity(n_tokens);
     let logits = model.forward_seq_with_cache(prompt_ids, Some(&mut kv), device)?;
     let first = pick_token(
         &logits,
@@ -150,10 +247,125 @@ pub fn generate_greedy(
         device,
     )?;
 
+    // Push this prefill snapshot to the prompt cache (Miss → store), gated on
+    // !has_image so an image turn can never pollute the text cache. Clone the
+    // post-prefill KV caches (refcount bump, no data copy) before the decode loop
+    // starts writing new decode-step K/V into them. Materialize the GPU arrays on
+    // the current inference thread first so a later eviction on a different
+    // tokio/Metal thread can re-eval them as a no-op (see qwen3.rs).
+    if !has_image {
+        let kv_bytes: u64 = kv.iter().map(|c| c.resident_bytes()).sum();
+        store_kv_cache_bytes(kv_bytes);
+        let cloned_caches: Result<Vec<KvCache>> = kv.iter().map(|c| c.try_deep_clone()).collect();
+        if let Ok(kv_snapshot) = cloned_caches {
+            match kv_snapshot.iter().try_for_each(|c| c.eval_for_spill()) {
+                Ok(()) => {
+                    // Salt the chained block-hash walk with the active layout_key
+                    // + KV codec so a slot stored under a different codec / layout
+                    // never cross-serves. Identical to the consume() seed, so
+                    // find_best_prefix matches what is stored here.
+                    let lk = active_layout_key();
+                    let block_hashes = chained_block_hashes_seeded(
+                        prompt_ids,
+                        FNV_OFFSET ^ lk ^ kv_quant.cache_key_salt(),
+                    );
+                    let first_piece = piece_for(first, tokenizer);
+                    let entry = Qwen3VlMoeEntry {
+                        prompt_token_ids: prompt_ids.to_vec(),
+                        block_hashes,
+                        kv_caches: kv_snapshot,
+                        first_id: first,
+                        first_piece,
+                        kv_quant: Some(kv_quant),
+                        is_ssd_hydrated: false,
+                    };
+                    PROMPT_CACHE.with_inner_mut(|guard| {
+                        if let Some(cache) = guard.as_mut() {
+                            cache.push(entry);
+                            let stats = cache.stats();
+                            tracing::debug!(
+                                prompt_len = prompt_ids.len(),
+                                cache_hits = stats.hits,
+                                cache_misses = stats.misses,
+                                cache_bytes = stats.bytes,
+                                "qwen3_vl_moe generate_greedy: pushed snapshot to prompt cache (miss path)"
+                            );
+                        }
+                    });
+                }
+                Err(e) => tracing::warn!(error = %e,
+                    "qwen3_vl_moe generate_greedy: pre-eval of KV caches failed, skipping prompt cache store"),
+            }
+        }
+    }
+
+    decode_from(
+        model,
+        tokenizer,
+        &mut kv,
+        first,
+        None,
+        n_tokens,
+        vocab,
+        device,
+        eos_ids,
+        &mut steps,
+        step_fn,
+        &mut constraint,
+        sampler_cfg,
+        rng,
+        penalty_cfg,
+        token_history,
+    )?;
+    Ok(steps)
+}
+
+/// Shared sequential decode loop for both the Exact-hit and Miss text paths.
+///
+/// `first` is the step-0 token (prefill argmax or replayed cache first token);
+/// the loop emits it, then drives the remaining steps with the per-token
+/// `forward_seq_with_cache(&[feed], …)` continuation. `first_piece` is the
+/// stored display piece for `first` on the Exact path (set by `piece_for` at the
+/// Miss-path push, so it is byte-identical to what `make_step` produces); `None`
+/// re-derives it via `make_step`, matching the Miss path exactly.
+///
+/// The per-step decode math (token push, `step_fn` forced-feed, EOS break,
+/// constraint advance, `pick_token`) is byte-identical to the original inline
+/// loop; only the function boundary + the step-0 piece source differ (and that
+/// source produces the same string on both paths via `piece_for`).
+#[allow(clippy::too_many_arguments)]
+fn decode_from(
+    model: &Qwen3VlMoeText,
+    tokenizer: &tokenizers::Tokenizer,
+    kv: &mut [KvCache],
+    first: u32,
+    first_piece: Option<String>,
+    n_tokens: usize,
+    vocab: usize,
+    device: Device,
+    eos_ids: &[u32],
+    steps: &mut Vec<ProbeStep>,
+    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    constraint: &mut Option<&mut dyn ConstraintEngine>,
+    sampler_cfg: &SamplerConfig,
+    rng: &mut Pcg32,
+    penalty_cfg: &PenaltyConfig,
+    token_history: &mut Vec<u32>,
+) -> Result<()> {
     let mut next = first;
+    let mut first_piece = first_piece;
     for _ in 0..n_tokens {
         token_history.push(next);
-        let step = make_step(next, tokenizer);
+        let step = match first_piece.take() {
+            Some(piece) => ProbeStep {
+                token_id: next,
+                piece: piece.into_boxed_str(),
+                max_abs_logit: 0.0,
+                nan_count: 0,
+                logprobs: None,
+            },
+            None => make_step(next, tokenizer),
+        };
         let forced = step_fn(&step);
         steps.push(step);
         if eos_ids.contains(&next) {
@@ -163,19 +375,19 @@ pub fn generate_greedy(
             c.advance(next);
         }
         let feed = forced.unwrap_or(next);
-        let logits = model.forward_seq_with_cache(&[feed], Some(&mut kv), device)?;
+        let logits = model.forward_seq_with_cache(&[feed], Some(&mut *kv), device)?;
         next = pick_token(
             &logits,
             vocab,
             sampler_cfg,
             penalty_cfg,
-            &mut constraint,
+            constraint,
             token_history,
             rng,
             device,
         )?;
     }
-    Ok(steps)
+    Ok(())
 }
 
 /// Image-branch generation: ViT features already produced by the caller and

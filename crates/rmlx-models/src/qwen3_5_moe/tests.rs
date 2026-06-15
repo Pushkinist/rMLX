@@ -1710,8 +1710,9 @@ fn integration_qwen3_5_moe_35b() {
 /// 3. DIVERGENT: inject the same prefix snapshot but pass a prompt whose tail
 ///    diverges WITHIN the prefix range (not a strict prefix of the stored ids) →
 ///    `find_best_prefix` returns the slot but the strict-prefix gate rejects it →
-///    falls to `CacheLookup::Miss` (confirmed by checking the decode output
-///    differs from a crafted different-tail cold run, NOT from the warm run).
+///    the consume engine yields `Consumed::Miss` (confirmed by checking the
+///    decode output differs from a crafted different-tail cold run, NOT from the
+///    warm run).
 ///
 /// Run:
 /// ```sh
@@ -2629,5 +2630,317 @@ fn hydrated_tail_k8v8_equivalence() {
     println!(
         "hydrated_tail_k8v8_equivalence PASS: \
          prefix_len={prefix_len} tail_len={tail_len} kv_quant=K8V8 n_decode={n_decode}"
+    );
+}
+
+/// Phase C consume-engine migration golden (qwen3.5-moe, Qwen3.6 — model-gated).
+///
+/// Pins that routing qwen3.5-moe through the shared `consume()` engine is
+/// behavior-identical to the pre-migration inline dispatch across all three
+/// outcomes reachable for this hybrid GDN arch under `ReusePolicy::ExactOnly`.
+/// At temp 0, every reuse/degrade path must decode token-identically to a cold
+/// (Miss) baseline of the SAME prompt:
+///   (a) ExactOnly forbids a RAM (non-hydrated) PARTIAL match: a 512-token RAM
+///       snapshot whose first block is shared with a divergent 512-token request
+///       (1 shared full block, then diverges) → the ExactOnly policy gate
+///       degrades it to Miss → full re-prefill → WARM == COLD(divergent). The
+///       GDN `lin_caches` are never block-truncated.
+///   (b) hydrated strict-prefix HydratedTail resume: an SSD-hydrated 512-token
+///       block-aligned prefix that the request extends to 520 tokens →
+///       `Reuse{StrictPrefix}` → restore + tail-only re-prefill → WARM ==
+///       COLD(520).
+///   (c) hydrated block-aligned EQUAL-length exclusion (the strict-`<` guard): an
+///       SSD-hydrated 512-token entry whose prefix length equals the full
+///       512-token prompt (no tail, placeholder first_id 0) → both the Exact
+///       arm's `!is_ssd_hydrated` guard and the strict-less-than HydratedTail
+///       gate decline → Miss → recompute → WARM == COLD, never the placeholder 0.
+///
+/// Run:
+/// ```sh
+/// RMLX_TEST_MODEL_QWEN36=/path/to/mlx-community__Qwen3.6-35B-A3B-8bit \
+/// cargo test -p rmlx-models qwen3_5_moe_consume_engine_migration_golden \
+///     -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test-only: Mutex critical section is panic-free; remaining unwrap is on values constructed in this fn"
+)]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: indices bounded by slice length validated before call"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "test-only: a single golden covering the three reachable moe consume outcomes (RAM-partial degrade / hydrated strict-prefix HydratedTail / hydrated equal-length exclusion) reads clearest as one sequential fixture"
+)]
+fn qwen3_5_moe_consume_engine_migration_golden() {
+    let Some(model_dir_buf) = qwen36_model_dir() else {
+        println!("SKIP: RMLX_TEST_MODEL_QWEN36 not set");
+        return;
+    };
+    let model_dir = model_dir_buf.as_path();
+    if !model_dir.exists() {
+        println!("SKIP: model dir not found at {}", model_dir.display());
+        return;
+    }
+    let arch_str = {
+        let cfg_path = model_dir.join("config.json");
+        let data = std::fs::read(&cfg_path).expect("read config.json");
+        let v: serde_json::Value = serde_json::from_slice(&data).expect("parse config.json");
+        v.get("architectures")
+            .and_then(|a| a.get(0))
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_owned()
+    };
+    let expected_archs = [
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+    ];
+    if !expected_archs.contains(&arch_str.as_str()) {
+        println!("SKIP: arch \"{arch_str}\" is not a Qwen3.5-MoE arch");
+        return;
+    }
+
+    println!("Loading model from {}", model_dir.display());
+    let model = load_from_path(model_dir).expect("load model");
+    let n_layers = model.cfg.num_hidden_layers;
+    let device = Device::Gpu;
+
+    // Unquantized KV so the comparison is noise-free: warm == cold must hold
+    // token-for-token.
+    let kv_quant = rmlx_kv_quant::KvQuant::None;
+    let max_seq = 4096i32;
+    let n_decode = 6usize; // short — Qwen3.6 is a 35B model
+
+    let sampler_cfg = crate::sampler::SamplerConfig {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        min_p: 0.0,
+        seed: Some(0),
+        top_logprobs_k: 0,
+    };
+    let penalty_cfg = crate::sampler::PenaltyConfig::default();
+
+    // Run generate_greedy at temp 0, return the decoded token_id sequence.
+    let run = |ids: &[u32]| -> Vec<u32> {
+        let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
+        let mut token_history: Vec<u32> = Vec::new();
+        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
+        generate_greedy(
+            &model,
+            &tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
+                .expect("load tokenizer"),
+            ids,
+            n_decode,
+            device,
+            kv_quant,
+            Some(max_seq),
+            4,
+            &[],
+            &mut step_fn,
+            None,
+            &sampler_cfg,
+            &mut rng,
+            &penalty_cfg,
+            &mut token_history,
+        )
+        .expect("generate_greedy")
+        .into_iter()
+        .map(|s| s.token_id)
+        .collect()
+    };
+
+    let clear_cache = || {
+        prompt_cache::ensure_prompt_cache(4);
+        prompt_cache::PROMPT_CACHE.with_inner_mut(|guard| {
+            if let Some(cache) = guard.as_mut() {
+                cache.clear();
+            }
+        });
+    };
+
+    // Build a real (physically correct) KV/lin snapshot for `ids` via the same
+    // KV stack + enter/exit_prefill bracketing as generate_greedy's Miss path.
+    let make_snapshot = |ids: &[u32]| -> (
+        Vec<rmlx_kv_quant::KvCache>,
+        Vec<rmlx_kv_quant::LinearAttnCache>,
+    ) {
+        let mut kv_caches: Vec<rmlx_kv_quant::KvCache> = (0..n_layers)
+            .map(|i| {
+                use crate::kv_cache::{
+                    kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
+                };
+                let q = kv_quant_for_layer(
+                    i,
+                    n_layers,
+                    kv_quant,
+                    LAYER_ADAPTIVE_TAIL_N,
+                    LAYER_ADAPTIVE_HEAD_N,
+                );
+                rmlx_kv_quant::KvCache::with_quant_max_seq(q, max_seq).with_layer_idx(i)
+            })
+            .collect();
+        let mut lin_caches: Vec<rmlx_kv_quant::LinearAttnCache> = (0..n_layers)
+            .map(|_| rmlx_kv_quant::LinearAttnCache::new())
+            .collect();
+        for c in &mut kv_caches {
+            c.enter_prefill();
+        }
+        let prefill_chunk = crate::prefill_chunk::prefill_chunk_for("qwen3_5_moe");
+        let n_chunks = ids.len().div_ceil(prefill_chunk);
+        for (chunk_idx, chunk) in ids.chunks(prefill_chunk).enumerate() {
+            let is_last = chunk_idx + 1 == n_chunks;
+            let logits = model
+                .forward_seq_with_cache(chunk, Some(&mut kv_caches), Some(&mut lin_caches), device)
+                .expect("prefill chunk");
+            if is_last {
+                logits.eval().expect("eval last-chunk logits");
+            } else {
+                for c in &kv_caches {
+                    c.eval_prefill_state().expect("eval_prefill_state");
+                }
+            }
+        }
+        for c in &mut kv_caches {
+            c.exit_prefill(device).expect("exit_prefill");
+        }
+        for c in &kv_caches {
+            c.eval_for_spill().expect("eval_for_spill kv");
+        }
+        for c in &lin_caches {
+            c.eval_for_spill().expect("eval_for_spill lin");
+        }
+        (kv_caches, lin_caches)
+    };
+
+    // Push an entry keyed on `key_ids` carrying `(kv, lin)`, into a freshly
+    // cleared cache. `hydrated` sets is_ssd_hydrated + placeholder first token
+    // (id 0); a non-hydrated RAM entry carries a real first token.
+    let push_entry = |key_ids: &[u32],
+                      kv: Vec<rmlx_kv_quant::KvCache>,
+                      lin: Vec<rmlx_kv_quant::LinearAttnCache>,
+                      hydrated: bool,
+                      first_id: u32| {
+        clear_cache();
+        prompt_cache::PROMPT_CACHE.with_inner_mut(|guard| {
+            if let Some(cache) = guard.as_mut() {
+                let block_hashes = crate::prompt_cache::chained_block_hashes_seeded(
+                    key_ids,
+                    crate::prompt_cache::FNV_OFFSET
+                        ^ prompt_cache::active_layout_key()
+                        ^ kv_quant.cache_key_salt(),
+                );
+                cache.push(Qwen35MoeEntry {
+                    prompt_token_ids: key_ids.to_vec(),
+                    block_hashes,
+                    kv_caches: kv,
+                    lin_caches: lin,
+                    first_id,
+                    first_piece: String::new(),
+                    kv_quant: Some(kv_quant),
+                    is_ssd_hydrated: hydrated,
+                });
+            }
+        });
+    };
+
+    // Deterministic synthetic ids (1..=len, wrapping at 9999, never 0).
+    let make_ids = |len: usize, salt: u32| -> Vec<u32> {
+        (1u32..=len as u32)
+            .map(|i| ((i.wrapping_mul(7).wrapping_add(salt)) % 9999).max(1))
+            .collect()
+    };
+
+    // ── (a) ExactOnly forbids a RAM (non-hydrated) PARTIAL match → Miss ──────
+    // Cache a 512-token RAM snapshot; request a divergent 512-token prompt that
+    // shares only the first full block. find_best_prefix matches 1 block, but
+    // the ExactOnly policy gate forbids the non-hydrated partial → Miss → full
+    // re-prefill of the divergent prompt → WARM == COLD(divergent).
+    let p512 = make_ids(2 * BLOCK_TOKENS, 0);
+    let p512_div: Vec<u32> = {
+        let mut v = p512.clone();
+        for t in v.iter_mut().skip(BLOCK_TOKENS) {
+            *t = ((*t).wrapping_add(101) % 9999).max(1);
+        }
+        v
+    };
+    clear_cache();
+    let cold_div = run(&p512_div);
+    assert_eq!(cold_div.len(), n_decode);
+    assert_ne!(cold_div[0], 0, "cold divergent first token is 0 — anomaly");
+    let (kv512, lin512) = make_snapshot(&p512);
+    // A real RAM entry carries a real first token; use a sentinel non-zero id so
+    // a (forbidden) partial reuse would be detectable, but the test asserts the
+    // tokens equal the cold re-prefill regardless.
+    push_entry(&p512, kv512, lin512, false, 7u32);
+    let warm_partial = run(&p512_div);
+    println!("(a) RAM-partial degrade: cold={cold_div:?} warm={warm_partial:?}");
+    assert_eq!(
+        warm_partial, cold_div,
+        "(a) ExactOnly must forbid a non-hydrated partial match → Miss → full re-prefill \
+         equal to the cold baseline for the divergent prompt"
+    );
+
+    // ── (b) hydrated strict-prefix HydratedTail resume → warm == cold ────────
+    // SSD-hydrated 512-token block-aligned prefix; request extends it to 520
+    // tokens. The strict-`<` HydratedTail gate fires → restore + tail-only
+    // re-prefill → WARM == COLD(520).
+    let p520: Vec<u32> = {
+        let mut v = p512.clone();
+        v.extend(make_ids(8, 5)); // 8-token tail with a distinct salt
+        v
+    };
+    clear_cache();
+    let cold_520 = run(&p520);
+    let (kv_pref, lin_pref) = make_snapshot(&p512);
+    push_entry(&p512, kv_pref, lin_pref, true, 0u32);
+    let warm_tail = run(&p520);
+    println!("(b) HydratedTail: cold={cold_520:?} warm={warm_tail:?}");
+    assert_ne!(
+        warm_tail.first().copied(),
+        Some(0u32),
+        "(b) HydratedTail resume must decode a real first token, never the placeholder 0"
+    );
+    assert_eq!(
+        warm_tail, cold_520,
+        "(b) hydrated strict-prefix HydratedTail resume must equal the cold baseline for the \
+         extended 520-token prompt"
+    );
+
+    // ── (c) hydrated block-aligned EQUAL-length exclusion (strict-`<` guard) ──
+    // SSD-hydrated 512-token entry whose prefix length equals the full 512-token
+    // prompt (no tail, placeholder first_id 0). Neither the Exact arm
+    // (`!is_ssd_hydrated`) nor the strict-less-than HydratedTail gate accepts it
+    // → Miss → recompute → WARM == COLD, never the placeholder 0.
+    clear_cache();
+    let cold_512 = run(&p512);
+    assert_ne!(cold_512[0], 0, "cold 512 first token is 0 — anomaly");
+    let (kv_full, lin_full) = make_snapshot(&p512);
+    push_entry(&p512, kv_full, lin_full, true, 0u32);
+    let warm_equal = run(&p512);
+    println!("(c) hydrated equal-length exclusion: cold={cold_512:?} warm={warm_equal:?}");
+    assert_ne!(
+        warm_equal.first().copied(),
+        Some(0u32),
+        "(c) block-aligned hydrated equal-length must NOT replay placeholder 0 — \
+         the strict-< guard forces a re-prefill that recomputes the real first token"
+    );
+    assert_eq!(
+        warm_equal, cold_512,
+        "(c) block-aligned hydrated equal-length recompute must equal the cold baseline"
+    );
+
+    println!(
+        "PASS: qwen3_5_moe consume-engine migration golden — RAM-partial degrade / \
+         hydrated strict-prefix HydratedTail / hydrated equal-length exclusion all match \
+         their cold baselines"
     );
 }

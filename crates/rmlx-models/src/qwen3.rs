@@ -74,8 +74,8 @@ use crate::kv_cache::{
 use crate::layers::{resolve_quant, QuantParams};
 use crate::load_util::Weights;
 use crate::prompt_cache::{
-    chained_block_hashes_seeded, ArchPromptCache, PromptCacheEntry, ReusePolicy, SsdHydrate,
-    FNV_OFFSET,
+    chained_block_hashes_seeded, ArchPromptCache, Consumed, PromptCacheEntry, ReusePolicy,
+    SsdHydrate, FNV_OFFSET,
 };
 use crate::sampler::TokenLogprobs;
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
@@ -1854,114 +1854,38 @@ pub fn generate_greedy<'a>(
     ensure_qwen3_prompt_cache(prompt_cache_slots);
 
     // ------------------------------------------------------------------
-    // Prompt cache lookup — Exact hit path only (Qwen3 pure-attention,
-    // no GDN recurrent state). Identical-prompt repeat skips re-prefill.
+    // Prompt cache lookup via the shared consume() engine. Qwen3 dense is
+    // pure-attention with no GDN recurrent state and uses ReusePolicy::ExactOnly
+    // (it overrides none of the reuse hooks), so the only reachable outcomes are
+    // Exact (identical-prompt repeat skips re-prefill) and Miss (full
+    // re-prefill). The engine owns the find → SSD-hydrate retry → quant-mismatch
+    // guard → SSD-hydrated exclusion → Exact decision and traces every degrade
+    // branch. The ExactOnly policy tripwire lives here at the call site — not in
+    // the generic engine — because the engine is policy-agnostic and shared across
+    // architectures that may use different policies.
     // ------------------------------------------------------------------
-    enum CacheLookup {
-        Exact {
-            kv_caches: Vec<KvCache>,
-            last_id: u32,
-            piece: String,
-            // Stored prefill-token logprobs (top-k @ OpenAI ceiling),
-            // replayed truncated to the current request's lp_k on the hit path.
-            first_logprobs: Option<TokenLogprobs>,
-        },
-        Miss,
-    }
-
-    // hard runtime gate: qwen3 dense must be ExactOnly. The match arm
-    // below already routes any non-Exact `Some(_)` to Miss, but this assert
-    // catches a misconfigured arch table before any cache lookup happens.
-    // Promoted from debug_assert_eq! so the tripwire fires in release-perf too.
     assert_eq!(
         QWEN3_PROMPT_CACHE.policy(),
         ReusePolicy::ExactOnly,
-        "qwen3 ArchPromptCache must use ReusePolicy::ExactOnly",
+        "Qwen3 prompt cache must be ExactOnly — pure-attention with no GDN recurrent state \
+         cannot safely reuse a partial prefix whose residual state is not stored",
     );
-
-    // Issue #26: codec-partitioned prompt-cache key — see gemma4/generate/mod.rs
-    // for the full rationale. The query digest stream is salted by
-    // `FNV_OFFSET ^ layout_key ^ codec_salt(kv_quant)` (matches the push seed),
-    // so a slot stored under a different KV codec never cross-serves.
-    let cache_seed = FNV_OFFSET ^ qwen3_active_layout_key() ^ kv_quant.cache_key_salt();
-    let lookup: CacheLookup = QWEN3_PROMPT_CACHE.with_inner_mut(|guard| {
-        let cache = guard.as_mut().unwrap();
-        let mut raw_match = cache.find_best_prefix(prompt_ids, cache_seed);
-        // on a RAM miss, try the SSD tier (no-op when no source attached
-        // — tier OFF). A hit promotes the block into RAM; re-run find_best_prefix
-        // so the promoted slot is matched + quant-checked by the path below.
-        if raw_match.is_none() && cache.hydrate_from_ssd(prompt_ids).is_some() {
-            raw_match = cache.find_best_prefix(prompt_ids, cache_seed);
-        }
-        // Plan §D8 / Task 11.5: stored `KvQuant` must match runtime; on
-        // mismatch evict + warn + degrade to Miss. See `gemma4/generate.rs`
-        // for the full rationale.
-        let safe_match = match raw_match {
-            Some((slot_idx, block_count)) => {
-                let stored = cache.slots[slot_idx].entry.kv_quant;
-                if stored == Some(kv_quant) {
-                    Some((slot_idx, block_count))
-                } else {
-                    tracing::warn!(
-                        stored = ?stored,
-                        runtime = ?kv_quant,
-                        prompt_len = prompt_ids.len(),
-                        "prompt cache KV quant mismatch — evicting entry, \
-                         degrading to re-prefill"
-                    );
-                    cache.evict_slot(slot_idx);
-                    None
-                }
-            }
-            None => None,
-        };
-        match safe_match {
-            // Exact match: full token-id equality AND a real first decode token.
-            //
-            // A SSD-hydrated entry whose block-aligned prefix length happens to
-            // equal `prompt_ids.len()` (prompt is an exact multiple of
-            // BLOCK_TOKENS → no tail → restored prefix == full prompt) must NOT
-            // be served here: its `first_id` is the placeholder 0 set in
-            // `SsdHydrate::hydrate`, not a real decode token. Replaying it emits
-            // a sentinel first token and seeds decode with garbage. The
-            // `!is_ssd_hydrated` guard drops it through to `Miss` → a full
-            // re-prefill re-derives the real first token. Correctness over the
-            // micro-opt (mirrors the qwen3_5_moe Exact arm guard).
-            Some((slot_idx, _block_count))
-                if !cache.slots[slot_idx].entry.is_ssd_hydrated()
-                    && cache.slots[slot_idx].entry.prompt_token_ids() == prompt_ids =>
-            {
-                let slot = &cache.slots[slot_idx].entry;
-                match slot.deep_clone() {
-                    Ok(cloned) => {
-                        tracing::debug!(
-                            prompt_len = prompt_ids.len(),
-                            token_id = cloned.first_id,
-                            "qwen3 generate_greedy: prompt cache EXACT HIT"
-                        );
-                        CacheLookup::Exact {
-                            kv_caches: cloned.kv_caches,
-                            last_id: cloned.first_id,
-                            piece: cloned.first_piece,
-                            first_logprobs: cloned.first_logprobs,
-                        }
-                    }
-                    Err(_) => CacheLookup::Miss,
-                }
-            }
-            // Partial or no match — fall back to full re-prefill.
-            Some(_) | None => CacheLookup::Miss,
-        }
-    });
+    let consumed = QWEN3_PROMPT_CACHE.consume(prompt_ids, kv_quant, false);
 
     // Path A: exact cache hit — skip re-prefill, jump straight to decode.
-    if let CacheLookup::Exact {
-        mut kv_caches,
-        last_id,
-        piece,
-        first_logprobs,
-    } = lookup
-    {
+    if let Consumed::Exact(cloned) = consumed {
+        let Qwen3Entry {
+            mut kv_caches,
+            first_id: last_id,
+            first_piece: piece,
+            first_logprobs,
+            ..
+        } = cloned;
+        tracing::debug!(
+            prompt_len = prompt_ids.len(),
+            token_id = last_id,
+            "qwen3 generate_greedy: prompt cache EXACT HIT"
+        );
         // The cached first token was produced by a prior request's
         // prefill, but its raw-logit top-k logprobs were captured and stored
         // alongside `first_id` at store time. Replay the same true logprob the

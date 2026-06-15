@@ -50,6 +50,14 @@ pub fn attach_at_load(
                 info.device,
             );
         }
+        "Gemma3ForConditionalGeneration" => {
+            crate::gemma3::prompt_cache::PROMPT_CACHE.attach_ssd_tier(
+                &info.namespace,
+                info.kv_quant,
+                info.layout_key,
+                info.device,
+            );
+        }
         "Qwen3_5MoeForConditionalGeneration" => {
             crate::qwen3_5_moe::prompt_cache::PROMPT_CACHE.attach_ssd_tier(
                 &info.namespace,
@@ -60,6 +68,38 @@ pub fn attach_at_load(
         }
         "Qwen3ForCausalLM" => {
             crate::qwen3::QWEN3_PROMPT_CACHE.attach_ssd_tier(
+                &info.namespace,
+                info.kv_quant,
+                info.layout_key,
+                info.device,
+            );
+        }
+        "Qwen2ForCausalLM" => {
+            crate::qwen2::prompt_cache::PROMPT_CACHE.attach_ssd_tier(
+                &info.namespace,
+                info.kv_quant,
+                info.layout_key,
+                info.device,
+            );
+        }
+        "BitNetForCausalLM" => {
+            crate::bitnet::prompt_cache::PROMPT_CACHE.attach_ssd_tier(
+                &info.namespace,
+                info.kv_quant,
+                info.layout_key,
+                info.device,
+            );
+        }
+        "Qwen3VLMoeForConditionalGeneration" => {
+            crate::qwen3_vl_moe::prompt_cache::PROMPT_CACHE.attach_ssd_tier(
+                &info.namespace,
+                info.kv_quant,
+                info.layout_key,
+                info.device,
+            );
+        }
+        "LagunaForCausalLM" => {
+            crate::laguna::prompt_cache::PROMPT_CACHE.attach_ssd_tier(
                 &info.namespace,
                 info.kv_quant,
                 info.layout_key,

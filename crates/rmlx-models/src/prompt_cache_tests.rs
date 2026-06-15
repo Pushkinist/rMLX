@@ -34,11 +34,20 @@ fn chained_seeded_with_non_default_seed_diverges() {
 
 /// Minimal entry for testing: token ID list + chained block hashes,
 /// no KV tensors. `truncated_to` records the last block-truncation call.
+///
+/// The consume-engine tests drive the three trait hooks through configurable
+/// fields: `kv_quant` (so the engine's quant-guard can match a runtime quant),
+/// `hydrate_complete` (gemma4-style incomplete-hydrate degrade), and
+/// `reuse_kind` (the canned `is_reusable_prefix_of` result the engine consults
+/// once its policy gate permits).
 struct TestEntry {
     ids: Vec<u32>,
     hashes: Vec<u64>,
     truncated_to: std::cell::Cell<Option<usize>>,
     is_ssd_hydrated: bool,
+    kv_quant: Option<KvQuant>,
+    hydrate_complete: bool,
+    reuse_kind: Option<ReuseKind>,
 }
 
 impl TestEntry {
@@ -49,6 +58,9 @@ impl TestEntry {
             hashes,
             truncated_to: std::cell::Cell::new(None),
             is_ssd_hydrated: false,
+            kv_quant: None,
+            hydrate_complete: true,
+            reuse_kind: None,
         }
     }
 
@@ -63,6 +75,9 @@ impl TestEntry {
             hashes,
             truncated_to: std::cell::Cell::new(None),
             is_ssd_hydrated: false,
+            kv_quant: None,
+            hydrate_complete: true,
+            reuse_kind: None,
         }
     }
 
@@ -70,6 +85,41 @@ impl TestEntry {
     /// `first_id`). The Exact fast path must exclude it.
     fn ssd_hydrated(mut self) -> Self {
         self.is_ssd_hydrated = true;
+        self
+    }
+
+    /// Build an entry whose block hashes are salted to match the engine's
+    /// consume seed for `kv_quant` on a RAM-only run (`layout_key == 0`), and
+    /// tag the entry with that same `kv_quant` so the quant-guard accepts it.
+    fn for_quant(ids: Vec<u32>, kv_quant: KvQuant) -> Self {
+        let seed = FNV_OFFSET ^ kv_quant.cache_key_salt();
+        let hashes = chained_block_hashes_seeded(&ids, seed);
+        TestEntry {
+            ids,
+            hashes,
+            truncated_to: std::cell::Cell::new(None),
+            is_ssd_hydrated: false,
+            kv_quant: Some(kv_quant),
+            hydrate_complete: true,
+            reuse_kind: None,
+        }
+    }
+
+    fn with_ssd_hydrated(mut self, v: bool) -> Self {
+        self.is_ssd_hydrated = v;
+        self
+    }
+
+    fn with_hydrate_complete(mut self, v: bool) -> Self {
+        self.hydrate_complete = v;
+        self
+    }
+
+    /// Set the canned `is_reusable_prefix_of` result. The engine only consults
+    /// this once its policy gate permits (hydrated strict-prefix under any
+    /// policy; non-hydrated partial under `Partial`).
+    fn with_reuse_kind(mut self, kind: ReuseKind) -> Self {
+        self.reuse_kind = Some(kind);
         self
     }
 }
@@ -89,6 +139,9 @@ impl PromptCacheEntry for TestEntry {
             hashes: self.hashes.clone(),
             truncated_to: std::cell::Cell::new(self.truncated_to.get()),
             is_ssd_hydrated: self.is_ssd_hydrated,
+            kv_quant: self.kv_quant,
+            hydrate_complete: self.hydrate_complete,
+            reuse_kind: self.reuse_kind,
         })
     }
 
@@ -106,7 +159,7 @@ impl PromptCacheEntry for TestEntry {
     }
 
     fn kv_quant(&self) -> Option<KvQuant> {
-        None
+        self.kv_quant
     }
 
     fn is_ssd_hydrated(&self) -> bool {
@@ -128,6 +181,53 @@ impl PromptCacheEntry for TestEntry {
     fn kv_bytes(&self) -> u64 {
         // Fake: 8 bytes per token id so we can assert non-zero bytes.
         self.ids.len() as u64 * 8
+    }
+
+    fn is_hydrate_complete(&self) -> bool {
+        self.hydrate_complete
+    }
+
+    fn is_reusable_prefix_of(
+        &self,
+        prompt_ids: &[u32],
+        _is_ssd_hydrated: bool,
+        matched_blocks: usize,
+    ) -> Option<ReuseKind> {
+        // Mirror the real arch hooks' predicates so the matrix tests are honest;
+        // the policy gate that decides WHEN to call this lives in the engine.
+        match self.reuse_kind? {
+            // moe HydratedTail / gemma4 B1: a STRICT token-level prefix only
+            // (stored.len() < prompt.len() && starts_with). The strict-less is
+            // the load-bearing guard for the hydrated-equal-length case — such
+            // an entry returns `None` and falls to Miss even with a canned
+            // reuse_kind, so its placeholder first_id is never replayed.
+            kind @ ReuseKind::StrictPrefix { .. } => {
+                if self.ids.len() < prompt_ids.len() && prompt_ids.starts_with(&self.ids) {
+                    Some(kind)
+                } else {
+                    None
+                }
+            }
+            // gemma4 block-truncate: a divergent partial that shares >= 1 leading
+            // block (the engine passes find_best_prefix's block_count).
+            kind @ ReuseKind::BlockTruncate { .. } => {
+                if matched_blocks >= 1 {
+                    Some(kind)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn prepare_reuse(&self, kind: ReuseKind) -> Result<Self> {
+        let cloned = self.deep_clone()?;
+        if let ReuseKind::BlockTruncate { effective_blocks } = kind {
+            cloned
+                .truncated_to
+                .set(Some(effective_blocks * BLOCK_TOKENS));
+        }
+        Ok(cloned)
     }
 }
 
@@ -1355,6 +1455,9 @@ impl SsdHydrate<TestEntry> for MockHydrateSalted {
             hashes,
             truncated_to: std::cell::Cell::new(None),
             is_ssd_hydrated: true,
+            kv_quant: None,
+            hydrate_complete: true,
+            reuse_kind: None,
         }))
     }
 }
@@ -1375,6 +1478,9 @@ impl SsdHydrate<TestEntry> for MockHydrateUnsalted {
             hashes,
             truncated_to: std::cell::Cell::new(None),
             is_ssd_hydrated: true,
+            kv_quant: None,
+            hydrate_complete: true,
+            reuse_kind: None,
         }))
     }
 }
@@ -1456,5 +1562,482 @@ fn ssd_hydrate_seed_symmetry_with_nonzero_layout_key() {
     assert!(
         cross_codec.is_none(),
         "codec-A hydrated entry must not cross-serve a codec-B query"
+    );
+}
+
+// ── consume() engine — golden discriminant, policy×entry matrix, edges ───────
+//
+// These exercise the shared `ArchPromptCache::consume` decision over the
+// `TestEntry` mock. The cache is installed via `with_inner_mut` (TestEntry
+// lacks the SsdSpiller/SsdHydrator bounds `ensure` needs). On a RAM-only run
+// `active_layout_key() == 0`, so the engine's seed is `FNV_OFFSET ^
+// kv_quant.cache_key_salt()` — `TestEntry::for_quant` salts its block hashes to
+// match, and tags the entry with that same quant so the quant-guard accepts it.
+
+/// The runtime KV quant used for every consume test (entries are salted +
+/// tagged to match via `TestEntry::for_quant`).
+const TEST_QUANT: KvQuant = KvQuant::K8V8;
+
+/// Compact discriminant of a `Consumed` for golden-pair assertions.
+#[derive(Debug, PartialEq, Eq)]
+enum ConsumedTag {
+    Exact,
+    Reuse(ReuseKind),
+    Miss,
+}
+
+fn tag<E>(c: &Consumed<E>) -> ConsumedTag {
+    match c {
+        Consumed::Exact(_) => ConsumedTag::Exact,
+        Consumed::Reuse { kind, .. } => ConsumedTag::Reuse(*kind),
+        Consumed::Miss => ConsumedTag::Miss,
+    }
+}
+
+/// Install a single pushed entry into a fresh `ArchPromptCache` and run consume.
+#[allow(
+    clippy::unwrap_used,
+    reason = "test-only: the cache is installed inside the same closure just above each use"
+)]
+fn consume_one(
+    policy: ReusePolicy,
+    pushed: TestEntry,
+    prompt_ids: &[u32],
+    has_image: bool,
+) -> (ArchPromptCache<TestEntry>, Consumed<TestEntry>) {
+    let arch: ArchPromptCache<TestEntry> = ArchPromptCache::new("test", policy);
+    arch.with_inner_mut(|g| {
+        *g = Some(PromptCache::new(4));
+        g.as_mut().unwrap().push(pushed);
+    });
+    let out = arch.consume(prompt_ids, TEST_QUANT, has_image);
+    (arch, out)
+}
+
+/// RAM exact hit: stored ids == request ids, not hydrated → `Exact`.
+#[test]
+fn consume_exact_ram_entry() {
+    let prompt = make_ids(2 * BLOCK_TOKENS);
+    let (_arch, out) = consume_one(
+        ReusePolicy::ExactOnly,
+        TestEntry::for_quant(prompt.clone(), TEST_QUANT),
+        &prompt,
+        false,
+    );
+    assert_eq!(tag(&out), ConsumedTag::Exact);
+}
+
+/// Hydrated entry whose ids exactly equal the request (block-aligned, no tail)
+/// must be `Miss` — the Exact arm excludes hydrated entries (placeholder
+/// first_id) and the reuse hook's strict-less guard excludes equal-length.
+#[test]
+fn consume_hydrated_equal_length_is_miss() {
+    let prompt = make_ids(2 * BLOCK_TOKENS);
+    // Moe-style hook would only return StrictPrefix when stored.len() <
+    // prompt.len(); equal-length yields None here regardless. Configure a
+    // StrictPrefix reuse_kind to prove even a permissive hook can't rescue the
+    // equal-length hydrated entry (the engine never reaches reuse for it).
+    let entry = TestEntry::for_quant(prompt.clone(), TEST_QUANT)
+        .with_ssd_hydrated(true)
+        .with_reuse_kind(ReuseKind::StrictPrefix {
+            prefix_len: prompt.len(),
+        });
+    let (_arch, out) = consume_one(ReusePolicy::ExactOnly, entry, &prompt, false);
+    assert_eq!(tag(&out), ConsumedTag::Miss);
+}
+
+/// ExactOnly forbids a fresh (non-hydrated) partial match → `Miss`, even if the
+/// hook would otherwise offer a StrictPrefix (the gate never calls it).
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "test-only: slice bound is a literal block multiple <= the just-built prompt length"
+)]
+fn consume_exactonly_fresh_partial_is_miss() {
+    let cached = make_ids(4 * BLOCK_TOKENS);
+    // Request shares the first 3 blocks then diverges.
+    let mut req = cached[..3 * BLOCK_TOKENS].to_vec();
+    req.extend(50_000..50_000 + BLOCK_TOKENS as u32);
+    let entry = TestEntry::for_quant(cached, TEST_QUANT).with_reuse_kind(ReuseKind::StrictPrefix {
+        prefix_len: 3 * BLOCK_TOKENS,
+    });
+    let (_arch, out) = consume_one(ReusePolicy::ExactOnly, entry, &req, false);
+    assert_eq!(tag(&out), ConsumedTag::Miss);
+}
+
+/// ExactOnly STILL permits a hydrated strict-prefix (the moe HydratedTail) →
+/// `Reuse{StrictPrefix}`.
+#[test]
+fn consume_exactonly_hydrated_strict_prefix_is_reuse() {
+    let stored = make_ids(2 * BLOCK_TOKENS);
+    let mut req = stored.clone();
+    req.extend(70_000..70_000 + BLOCK_TOKENS as u32);
+    let entry = TestEntry::for_quant(stored.clone(), TEST_QUANT)
+        .with_ssd_hydrated(true)
+        .with_reuse_kind(ReuseKind::StrictPrefix {
+            prefix_len: stored.len(),
+        });
+    let (_arch, out) = consume_one(ReusePolicy::ExactOnly, entry, &req, false);
+    assert_eq!(
+        tag(&out),
+        ConsumedTag::Reuse(ReuseKind::StrictPrefix {
+            prefix_len: 2 * BLOCK_TOKENS,
+        })
+    );
+    // The Reuse carries the cloned entry (its prefix tokens), which the arch
+    // forwards a tail on top of. Assert the clone preserved the stored prefix.
+    if let Consumed::Reuse { entry, .. } = out {
+        assert_eq!(
+            entry.prompt_token_ids(),
+            stored.as_slice(),
+            "the reused clone must carry the stored prefix tokens"
+        );
+    } else {
+        panic!("asserted Reuse above");
+    }
+}
+
+/// Partial policy permits a fresh (non-hydrated) prefix reuse via the hook.
+/// Here the hook returns BlockTruncate → `Reuse{BlockTruncate}`.
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "test-only: slice bound is a literal block multiple <= the just-built prompt length"
+)]
+fn consume_partial_fresh_prefix_is_reuse() {
+    let cached = make_ids(4 * BLOCK_TOKENS);
+    let mut req = cached[..3 * BLOCK_TOKENS].to_vec();
+    req.extend(80_000..80_000 + BLOCK_TOKENS as u32);
+    let entry =
+        TestEntry::for_quant(cached, TEST_QUANT).with_reuse_kind(ReuseKind::BlockTruncate {
+            effective_blocks: 3,
+        });
+    let (_arch, out) = consume_one(ReusePolicy::Partial, entry, &req, false);
+    assert_eq!(
+        tag(&out),
+        ConsumedTag::Reuse(ReuseKind::BlockTruncate {
+            effective_blocks: 3
+        })
+    );
+}
+
+/// Partial policy with an incomplete hydrated entry (gemma4 SWA payload-less
+/// layer) → `Miss` via `is_hydrate_complete == false`, even though the hook
+/// would offer a StrictPrefix.
+#[test]
+fn consume_incomplete_hydrate_partial_is_miss() {
+    let stored = make_ids(2 * BLOCK_TOKENS);
+    let mut req = stored.clone();
+    req.extend(90_000..90_000 + BLOCK_TOKENS as u32);
+    let entry = TestEntry::for_quant(stored.clone(), TEST_QUANT)
+        .with_ssd_hydrated(true)
+        .with_hydrate_complete(false)
+        .with_reuse_kind(ReuseKind::StrictPrefix {
+            prefix_len: stored.len(),
+        });
+    let (_arch, out) = consume_one(ReusePolicy::Partial, entry, &req, false);
+    assert_eq!(tag(&out), ConsumedTag::Miss);
+}
+
+/// `has_image == true` → `Miss` WITHOUT touching the cache: a pre-existing exact
+/// entry must survive (not evicted), so a later text request still hits it.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test-only: cache installed in the same closure just above"
+)]
+fn consume_has_image_is_miss_no_cache_touch() {
+    let prompt = make_ids(2 * BLOCK_TOKENS);
+    let arch: ArchPromptCache<TestEntry> = ArchPromptCache::new("test", ReusePolicy::ExactOnly);
+    arch.with_inner_mut(|g| {
+        *g = Some(PromptCache::new(4));
+        g.as_mut()
+            .unwrap()
+            .push(TestEntry::for_quant(prompt.clone(), TEST_QUANT));
+    });
+
+    // Image request: Miss, and the cache is not consulted/evicted.
+    let img = arch.consume(&prompt, TEST_QUANT, true);
+    assert_eq!(tag(&img), ConsumedTag::Miss);
+    let slots = arch.with_inner_mut(|g| g.as_ref().unwrap().slots.len());
+    assert_eq!(slots, 1, "image request must not evict the existing entry");
+
+    // The surviving entry is still served as Exact to a text request.
+    let txt = arch.consume(&prompt, TEST_QUANT, false);
+    assert_eq!(tag(&txt), ConsumedTag::Exact);
+}
+
+/// Sub-one-block prompt → always `Miss` (find_best_prefix needs ≥1 full block).
+#[test]
+fn consume_short_prompt_under_one_block_is_miss() {
+    let short = make_ids(BLOCK_TOKENS - 1);
+    let (_arch, out) = consume_one(
+        ReusePolicy::ExactOnly,
+        TestEntry::for_quant(short.clone(), TEST_QUANT),
+        &short,
+        false,
+    );
+    assert_eq!(tag(&out), ConsumedTag::Miss);
+}
+
+/// Guard contract: consume is never called for an empty prompt (the arch
+/// early-returns on `n_tokens == 0` before `ensure_prompt_cache`). We still pin
+/// that an empty prompt yields `Miss` if it ever reaches the engine, so the
+/// guard is the only place that decides "no generation."
+#[test]
+fn consume_empty_after_guard() {
+    let empty: Vec<u32> = Vec::new();
+    let (_arch, out) = consume_one(
+        ReusePolicy::ExactOnly,
+        TestEntry::for_quant(make_ids(2 * BLOCK_TOKENS), TEST_QUANT),
+        &empty,
+        false,
+    );
+    assert_eq!(tag(&out), ConsumedTag::Miss);
+}
+
+/// Quant-mismatch degrade: the stored entry's quant differs from the runtime
+/// quant → evict + `Miss`. The entry is salted for `K8V4` but queried at the
+/// `TEST_QUANT` (`K8V8`) seed, so it would already miss the block-hash match;
+/// to isolate the quant-guard we salt with the RUNTIME seed but tag a different
+/// stored quant so the match fires and the guard rejects it.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test-only: cache installed in the same closure just above"
+)]
+fn consume_quant_mismatch_evicts_and_misses() {
+    let prompt = make_ids(2 * BLOCK_TOKENS);
+    // Salt with the runtime seed so find_best_prefix matches, but tag a DIFFERENT
+    // stored quant so the quant-guard rejects it.
+    let runtime_seed = FNV_OFFSET ^ TEST_QUANT.cache_key_salt();
+    let mut entry = TestEntry::new_seeded(prompt.clone(), runtime_seed);
+    entry.kv_quant = Some(KvQuant::K8V4); // != TEST_QUANT (K8V8)
+
+    let arch: ArchPromptCache<TestEntry> = ArchPromptCache::new("test", ReusePolicy::ExactOnly);
+    arch.with_inner_mut(|g| {
+        *g = Some(PromptCache::new(4));
+        g.as_mut().unwrap().push(entry);
+    });
+    let out = arch.consume(&prompt, TEST_QUANT, false);
+    assert_eq!(tag(&out), ConsumedTag::Miss);
+    let slots = arch.with_inner_mut(|g| g.as_ref().unwrap().slots.len());
+    assert_eq!(slots, 0, "quant-mismatch must evict the unusable slot");
+}
+
+// ── degrade-trace coverage ───────────────────────────────────────────────────
+//
+// Every consume degrade branch must emit exactly one `debug!{branch=...}` so a
+// silent-drop regression (the qwen3/moe arms were silent before unification)
+// fails this test rather than passing every other one.
+//
+// Capturing tracing events reliably from a test that shares one binary with
+// many other tracing-emitting tests is subtle: the per-callsite Interest cache
+// is GLOBAL and is populated by whatever dispatcher was current the FIRST time a
+// callsite fired. A thread-local `with_default` subscriber cannot retroactively
+// un-disable a callsite that a sibling test already cached as `never` under the
+// no-op default. The fix is a process-global "tee" subscriber installed once:
+// its `register_callsite` returns `always` (so callsites are never cached
+// disabled) and its `event` forwards the `branch` field to a THREAD-LOCAL sink
+// that is only armed inside `capture_branches`. Outside a capture it is inert.
+
+thread_local! {
+    static BRANCH_SINK: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct BranchVisitor<'a> {
+    out: &'a mut Vec<String>,
+}
+
+impl tracing::field::Visit for BranchVisitor<'_> {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "branch" {
+            self.out.push(value.to_owned());
+        }
+    }
+    fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+}
+
+/// Process-global tee subscriber. Always-interest so no callsite is cached as
+/// disabled; forwards `branch` fields to the thread-local sink when armed.
+struct TeeBranchSubscriber;
+
+impl tracing::Subscriber for TeeBranchSubscriber {
+    fn register_callsite(
+        &self,
+        _meta: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::always()
+    }
+    fn enabled(&self, _md: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::TRACE)
+    }
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        BRANCH_SINK.with(|sink| {
+            if let Some(out) = sink.borrow_mut().as_mut() {
+                let mut v = BranchVisitor { out };
+                event.record(&mut v);
+            }
+        });
+    }
+    fn enter(&self, _span: &tracing::span::Id) {}
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// Run `f` with the thread-local branch sink armed; return captured branches.
+///
+/// Installs the process-global tee subscriber on first use. Because the tee's
+/// `register_callsite` is `always`, the consume callsites dispatch to it on
+/// every thread regardless of which test fired them first — only the armed
+/// thread records, so the capture is deterministic across the shared binary.
+///
+/// test-ordering note: `set_global_default` is called exactly once (via
+/// `Once`) and is never uninstalled. No other test in this binary may rely on
+/// the global tracing dispatcher's span-filter or subscriber-specific
+/// semantics — the permanent install here will shadow any later attempt to set
+/// a different global default. Tests that need custom tracing must use a
+/// per-thread or scoped subscriber rather than the global dispatcher.
+fn capture_branches(f: impl FnOnce()) -> Vec<String> {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        // Ignore an error: another test having set a global default would only
+        // mean our tee is not installed; the assertions below would then catch
+        // a silent-drop, which is the desired failure mode.
+        let _ = tracing::subscriber::set_global_default(TeeBranchSubscriber);
+    });
+    BRANCH_SINK.with(|sink| *sink.borrow_mut() = Some(Vec::new()));
+    f();
+    BRANCH_SINK.with(|sink| sink.borrow_mut().take().unwrap_or_default())
+}
+
+/// Each degrade path emits exactly one `debug!{branch=...}` with the expected
+/// branch name. All six scenarios run inside ONE capture scope (one subscriber
+/// install + interest rebuild) so the collected `branch` sequence is
+/// deterministic — the per-call capture variant raced the global tracing
+/// interest cache against other tests sharing the binary.
+///
+/// Covers: has_image, quant_mismatch, incomplete_hydrate, non_reusable (fresh
+/// partial under Partial), hydrated_declined_to_exact (fresh partial under
+/// ExactOnly), and the hydrated equal-length case (declines via non_reusable).
+/// Exactly one `branch` per consume call.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test-only: caches installed in the same closures just above each consume"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "test-only: slice bound is a literal block multiple <= the just-built prompt length"
+)]
+fn consume_degrade_branches_each_emit_one_debug() {
+    let prompt = make_ids(2 * BLOCK_TOKENS);
+
+    let branches = capture_branches(|| {
+        // 1. has_image → "has_image" (no cache touch).
+        {
+            let arch: ArchPromptCache<TestEntry> =
+                ArchPromptCache::new("test", ReusePolicy::ExactOnly);
+            arch.with_inner_mut(|g| *g = Some(PromptCache::new(4)));
+            let _ = arch.consume(&prompt, TEST_QUANT, true);
+        }
+        // 2. quant_mismatch → "quant_mismatch".
+        {
+            let runtime_seed = FNV_OFFSET ^ TEST_QUANT.cache_key_salt();
+            let mut entry = TestEntry::new_seeded(prompt.clone(), runtime_seed);
+            entry.kv_quant = Some(KvQuant::K8V4);
+            let arch: ArchPromptCache<TestEntry> =
+                ArchPromptCache::new("test", ReusePolicy::ExactOnly);
+            arch.with_inner_mut(|g| {
+                *g = Some(PromptCache::new(4));
+                g.as_mut().unwrap().push(entry);
+            });
+            let _ = arch.consume(&prompt, TEST_QUANT, false);
+        }
+        // 3. incomplete_hydrate (Partial, hydrated, incomplete) → "incomplete_hydrate".
+        {
+            let mut req = prompt.clone();
+            req.extend(11_000..11_000 + BLOCK_TOKENS as u32);
+            let entry = TestEntry::for_quant(prompt.clone(), TEST_QUANT)
+                .with_ssd_hydrated(true)
+                .with_hydrate_complete(false)
+                .with_reuse_kind(ReuseKind::StrictPrefix {
+                    prefix_len: prompt.len(),
+                });
+            let arch: ArchPromptCache<TestEntry> =
+                ArchPromptCache::new("test", ReusePolicy::Partial);
+            arch.with_inner_mut(|g| {
+                *g = Some(PromptCache::new(4));
+                g.as_mut().unwrap().push(entry);
+            });
+            let _ = arch.consume(&req, TEST_QUANT, false);
+        }
+        // 4. non_reusable (Partial, fresh partial, hook returns None) → "non_reusable".
+        {
+            let cached = make_ids(4 * BLOCK_TOKENS);
+            let mut req = cached[..3 * BLOCK_TOKENS].to_vec();
+            req.extend(60_000..60_000 + BLOCK_TOKENS as u32);
+            let entry = TestEntry::for_quant(cached, TEST_QUANT);
+            let arch: ArchPromptCache<TestEntry> =
+                ArchPromptCache::new("test", ReusePolicy::Partial);
+            arch.with_inner_mut(|g| {
+                *g = Some(PromptCache::new(4));
+                g.as_mut().unwrap().push(entry);
+            });
+            let _ = arch.consume(&req, TEST_QUANT, false);
+        }
+        // 5. hydrated_declined_to_exact (ExactOnly, fresh partial, not token-equal,
+        //    reuse not permitted) → "hydrated_declined_to_exact".
+        {
+            let cached = make_ids(4 * BLOCK_TOKENS);
+            let mut req = cached[..3 * BLOCK_TOKENS].to_vec();
+            req.extend(61_000..61_000 + BLOCK_TOKENS as u32);
+            let entry = TestEntry::for_quant(cached, TEST_QUANT);
+            let arch: ArchPromptCache<TestEntry> =
+                ArchPromptCache::new("test", ReusePolicy::ExactOnly);
+            arch.with_inner_mut(|g| {
+                *g = Some(PromptCache::new(4));
+                g.as_mut().unwrap().push(entry);
+            });
+            let _ = arch.consume(&req, TEST_QUANT, false);
+        }
+        // 6. hydrated equal-length: reuse-eligible (complete) but the hook
+        //    declines (strict-less) → "non_reusable".
+        {
+            let entry = TestEntry::for_quant(prompt.clone(), TEST_QUANT)
+                .with_ssd_hydrated(true)
+                .with_reuse_kind(ReuseKind::StrictPrefix {
+                    prefix_len: prompt.len(),
+                });
+            let arch: ArchPromptCache<TestEntry> =
+                ArchPromptCache::new("test", ReusePolicy::ExactOnly);
+            arch.with_inner_mut(|g| {
+                *g = Some(PromptCache::new(4));
+                g.as_mut().unwrap().push(entry);
+            });
+            let _ = arch.consume(&prompt, TEST_QUANT, false);
+        }
+    });
+
+    // Exactly one branch per consume call, in order.
+    assert_eq!(
+        branches,
+        vec![
+            "has_image".to_owned(),
+            "quant_mismatch".to_owned(),
+            "incomplete_hydrate".to_owned(),
+            "non_reusable".to_owned(),
+            "hydrated_declined_to_exact".to_owned(),
+            "non_reusable".to_owned(),
+        ],
+        "each consume degrade branch must emit exactly one debug!{{branch=...}}"
     );
 }

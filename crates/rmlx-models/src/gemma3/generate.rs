@@ -29,10 +29,14 @@ use crate::decode_loop::{
     capture_logprobs, choose_token, chunked_prefill, pipelined_decode, DecodeCtx,
 };
 use crate::kv_cache::{kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N};
+use crate::prompt_cache::{chained_block_hashes_seeded, Consumed, ReusePolicy, FNV_OFFSET};
 use rmlx_kv_quant::{KvCache, KV_MAX_SEQ_DEFAULT};
 
 use super::loader::load_from_path;
 use super::model::Gemma3Text;
+use super::prompt_cache::{
+    active_layout_key, ensure_prompt_cache, store_kv_cache_bytes, Gemma3Entry, PROMPT_CACHE,
+};
 
 // ---------------------------------------------------------------------------
 // probe_forward -- CLI entry point
@@ -114,6 +118,11 @@ pub fn generate_greedy<'a>(
     device: Device,
     kv_quant: rmlx_kv_quant::KvQuant,
     max_ctx_override: Option<i32>,
+    // number of post-prefill KV snapshots kept across requests. Pass 1 for
+    // single-slot; pass N for multi-slot exact-match. Recommended: 4. Only the
+    // Exact-hit path is active for gemma3 (ReusePolicy::ExactOnly); an
+    // identical-prompt repeat skips re-prefill entirely.
+    prompt_cache_slots: usize,
     eos_ids: &'a [u32],
     // The shared `DecodeCtx` bundles every per-request borrow under one
     // lifetime, so these references share `'a` (a `&mut dyn` trait-object
@@ -141,6 +150,8 @@ pub fn generate_greedy<'a>(
         arch = "Gemma3ForConditionalGeneration",
         ?kv_quant,
         ?max_ctx_override,
+        prompt_cache_slots,
+        has_image = image_prefill.is_some(),
         "generate_greedy: selected KV cache quant"
     );
 
@@ -148,8 +159,63 @@ pub fn generate_greedy<'a>(
         return Ok(vec![]);
     }
 
+    // capture before `image_prefill` is moved into the prefill branch.
+    // Image prompts must not be served from or saved to the token-id-keyed
+    // prompt cache (the K/V depends on scattered vision features, not just the
+    // token ids).
+    let has_image = image_prefill.is_some();
+
     let vocab = model.cfg.vocab_size as i32;
     let mut steps = Vec::with_capacity(n_tokens);
+
+    ensure_prompt_cache(prompt_cache_slots);
+
+    // ------------------------------------------------------------------
+    // Prompt cache lookup via the shared consume() engine. Gemma3 is a
+    // pure-attention arch (no recurrent state) with sliding-window-attention
+    // layers, and uses ReusePolicy::ExactOnly: it overrides none of the
+    // prefix-reuse hooks, so the only reachable consume outcomes are Exact
+    // (identical-prompt repeat skips re-prefill — a full in-memory deep_clone of
+    // every layer cache including the SWA ring, so it is safe) and Miss (full
+    // re-prefill). Gemma3's ring / SWA-mask differs from gemma4, so the
+    // gemma4-style partial / strict-prefix snapshot-restore path is NOT enabled
+    // here yet (promotion to Partial is a separate follow-up). The engine owns
+    // the find → SSD-hydrate retry → quant-mismatch guard → SSD-hydrated
+    // exclusion → Exact decision and traces every degrade branch. The ExactOnly
+    // tripwire lives here at the call site — not in the generic engine — because
+    // the engine is policy-agnostic and shared across architectures.
+    // ------------------------------------------------------------------
+    assert_eq!(
+        PROMPT_CACHE.policy(),
+        ReusePolicy::ExactOnly,
+        "Gemma3 prompt cache must be ExactOnly — SWA-first: gemma3's sliding-window ring \
+         and mask differ from gemma4, so only a full-token-equality Exact hit (RAM deep_clone, \
+         SWA ring included) is reused; partial / strict-prefix reuse is a separate follow-up",
+    );
+
+    // image prompts bypass the prompt cache: pass `has_image` so the engine
+    // returns Miss without touching the cache (mirrored by the `!has_image`
+    // store gate below).
+    if !has_image {
+        if let Consumed::Exact(cloned) = PROMPT_CACHE.consume(prompt_ids, kv_quant, false) {
+            return exact_hit_decode(
+                model,
+                tokenizer,
+                cloned,
+                prompt_ids,
+                n_tokens,
+                vocab,
+                device,
+                eos_ids,
+                step_fn,
+                constraint,
+                sampler_cfg,
+                rng,
+                penalty_cfg,
+                token_history,
+            );
+        }
+    }
 
     // Prefill timer; decode timers come from `pipelined_decode`'s `DecodeStats`.
     let prefill_t0 = Instant::now();
@@ -296,6 +362,56 @@ pub fn generate_greedy<'a>(
         "gemma3 generate_greedy prefill"
     );
 
+    // Push this prefill snapshot to the prompt cache (Miss → store), gated
+    // `!has_image`: an image prompt's K/V is not reconstructible from the
+    // token-id cache key, so it must neither be served from nor stored into the
+    // cache. Clone the post-prefill KV caches (refcount bump, no data copy)
+    // before the decode loop starts writing new decode-step K/V into them.
+    // Materialize the GPU arrays on the current inference thread first so a
+    // later eviction on a different tokio/Metal thread can re-eval them as a
+    // no-op (see gemma4/generate/mod.rs).
+    if !has_image {
+        let kv_snap: Result<Vec<KvCache>> = caches.iter().map(KvCache::try_deep_clone).collect();
+        if let Ok(kvs) = kv_snap {
+            match kvs.iter().try_for_each(KvCache::eval_for_spill) {
+                Ok(()) => {
+                    // Salt the chained block-hash walk with the active layout_key
+                    // + KV codec so a slot stored under a different codec / layout
+                    // never cross-serves. Identical to the consume() seed.
+                    let lk = active_layout_key();
+                    let block_hashes = chained_block_hashes_seeded(
+                        prompt_ids,
+                        FNV_OFFSET ^ lk ^ kv_quant.cache_key_salt(),
+                    );
+                    let entry = Gemma3Entry {
+                        prompt_token_ids: prompt_ids.to_vec(),
+                        block_hashes,
+                        kv_caches: kvs,
+                        first_id: last_id,
+                        first_piece: piece.clone(),
+                        kv_quant: Some(kv_quant),
+                        is_ssd_hydrated: false,
+                    };
+                    PROMPT_CACHE.with_inner_mut(|guard| {
+                        if let Some(cache) = guard.as_mut() {
+                            cache.push(entry);
+                            let stats = cache.stats();
+                            tracing::debug!(
+                                prompt_len = prompt_ids.len(),
+                                cache_hits = stats.hits,
+                                cache_misses = stats.misses,
+                                cache_bytes = stats.bytes,
+                                "gemma3 generate_greedy: pushed snapshot to prompt cache (miss path)"
+                            );
+                        }
+                    });
+                }
+                Err(e) => tracing::warn!(error = %e,
+                    "gemma3 generate_greedy: pre-eval of KV caches failed, skipping prompt cache store"),
+            }
+        }
+    }
+
     // prefill is non-pipelined (last_id already materialised), so the prefill
     // token's logprobs come straight from this step's logits.
     let prefill_logprobs = if lp_k > 0 {
@@ -343,8 +459,109 @@ pub fn generate_greedy<'a>(
         step_total_ms = step_ms,
         forward_per_step_ms = forward_ms / n,
         eval_per_step_ms = eval_ms / n,
+        cache_path = "miss",
         "decode_profile"
     );
+
+    // store KV-cache bytes for the /metrics/cache endpoint.
+    store_kv_cache_bytes(caches.iter().map(KvCache::resident_bytes).sum());
+
+    Ok(steps)
+}
+
+/// Exact prompt-cache hit: skip re-prefill, replay the stored first token, then
+/// run the shared pipelined decode loop on the cloned caches (SWA ring
+/// included). `cloned` is the deep-cloned `Gemma3Entry` the consume engine
+/// returned; its `kv_caches` are post-prefill state for `prompt_ids`.
+#[allow(clippy::too_many_arguments)]
+fn exact_hit_decode<'a>(
+    model: &Gemma3Text,
+    tokenizer: &'a tokenizers::Tokenizer,
+    cloned: Gemma3Entry,
+    prompt_ids: &[u32],
+    n_tokens: usize,
+    vocab: i32,
+    device: Device,
+    eos_ids: &'a [u32],
+    step_fn: &'a mut dyn FnMut(&crate::decode_loop::ProbeStep) -> Option<u32>,
+    mut constraint: Option<&'a mut dyn ConstraintEngine>,
+    sampler_cfg: &'a crate::sampler::SamplerConfig,
+    rng: &'a mut crate::sampler::Pcg32,
+    penalty_cfg: &'a crate::sampler::PenaltyConfig,
+    token_history: &'a mut Vec<u32>,
+) -> Result<Vec<crate::decode_loop::ProbeStep>> {
+    use crate::decode_loop::ProbeStep;
+
+    let Gemma3Entry {
+        kv_caches: mut caches,
+        first_id: last_id,
+        first_piece: piece,
+        ..
+    } = cloned;
+    let mut steps = Vec::with_capacity(n_tokens);
+
+    tracing::debug!(
+        prompt_len = prompt_ids.len(),
+        token_id = last_id,
+        "gemma3 generate_greedy: prompt cache EXACT HIT"
+    );
+
+    step_fn(steps.push_mut(ProbeStep {
+        token_id: last_id,
+        piece: piece.into_boxed_str(),
+        max_abs_logit: 0.0,
+        nan_count: 0,
+        logprobs: None,
+    }));
+    // exact-hit token into history.
+    token_history.push(last_id);
+
+    // EOS-stop. If the cached first token is an EOS, no decode steps.
+    if eos_ids.contains(&last_id) {
+        return Ok(steps);
+    }
+
+    let stats = {
+        let mut ctx = DecodeCtx {
+            tokenizer,
+            vocab,
+            n_tokens,
+            device,
+            eos_ids,
+            step_fn,
+            constraint: constraint.take(),
+            sampler_cfg,
+            rng,
+            penalty_cfg,
+            token_history,
+            arch: "Gemma3ForConditionalGeneration",
+            resolve_pieces: true,
+        };
+        pipelined_decode(&mut ctx, last_id, &mut steps, |y| {
+            model.forward_arr(y, 1, Some(&mut caches), device)
+        })?
+    };
+
+    let forward_ms = (stats.forward_total_ns as f64) / 1.0e6;
+    let eval_ms = (stats.eval_total_ns as f64) / 1.0e6;
+    let step_ms = (stats.step_total_ns as f64) / 1.0e6;
+    let n = f64::from(stats.decode_steps.max(1));
+    tracing::info!(
+        target: "decode_profile",
+        arch = "Gemma3ForConditionalGeneration",
+        n_steps = stats.decode_steps,
+        prefill_ms = 0.0_f64,
+        forward_total_ms = forward_ms,
+        eval_total_ms = eval_ms,
+        step_total_ms = step_ms,
+        forward_per_step_ms = forward_ms / n,
+        eval_per_step_ms = eval_ms / n,
+        cache_path = "exact",
+        "decode_profile"
+    );
+
+    // store KV-cache bytes for the /metrics/cache endpoint.
+    store_kv_cache_bytes(caches.iter().map(KvCache::resident_bytes).sum());
 
     Ok(steps)
 }
