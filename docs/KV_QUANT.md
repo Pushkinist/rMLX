@@ -503,7 +503,7 @@ PlanarQuant stores three parallel buffers per V side:
 
 - `gpu_codes_buf` (u32): four u32 words per group of 32 elements.
 - `gpu_scales_buf` (f32): one f32 scale per pair of elements — 16 per group
-  (2× more fine-grained than TurboQuant's one-per-group).
+  (16× more fine-grained than TurboQuant's one scale per group of 32).
 - `gpu_rotations_buf` (u32): two u32 words per group, encoding eight 4-bit
   Givens rotation indices per word.
 
@@ -526,9 +526,11 @@ Storage struct: `QuantPlanarV`. CPU path uses scalar `planar_quantize` /
 
 **Perf characterization**: wins TPS outright vs K8V8 at long context (≥32K)
 on dense full-attention archs. Verified at 64K context on Qwen3.6-35B-A3B
-(71.53 TPS Planar vs 65.2 TPS K8V8). The extra rotation buffers add ~0.5×
-memory versus tq4 V but improve quality sufficiently that it is the default
-for Gemma dense and Gemma3.
+(71.53 TPS Planar vs 65.2 TPS K8V8). The per-pair scale buffers give PlanarQuant
+V ≈4.4× the resident memory of tq4 V at head\_dim=128 (≈352 B vs ≈80 B per
+token per kv\_head: codes 64 B + 16 scales/group × 4 B × 4 groups = 256 B +
+rotations 32 B). The quality gain from finer scales and per-pair rotation
+justifies this for dense full-attention archs at long context.
 
 **Arch defaults**: `Gemma3ForConditionalGeneration`;
 `Gemma4ForConditionalGeneration` (dense, hidden_size ≥ 5376); auto-by-ctx at
@@ -748,8 +750,9 @@ is retained as a future-reference hook.
 
 ### `KvStorage::K8VTurbo3Tcq` — q8_0 K, TurboQuant 3-bit V with Viterbi trellis
 
-**Status**: opt-in via `--kv-quant k8vturbo3tcq`. Never an auto baseline. The
-highest-quality 3-bit V codec in the multi-turboquant lineage.
+**Status**: opt-in via `--kv-quant k8vturbo3tcq`. Never an auto baseline.
+Turbo3-equivalent quality (same Lloyd-Max codebook, degenerate trellis — see
+note below).
 
 **K codec**: rMLX MSL q8_0, `group_size=128` (same K-side as K8VTurbo3).
 **V codec**: TurboQuant 3-bit Lloyd-Max N(0,1) codebook, `group_size=32`. The
@@ -772,9 +775,19 @@ nearest-centroid indices on the next decode append).
 
 **Cosine target**: ≥ 0.9807 on the canonical LCG fixture (mtq `turbo3_tcq`
 row 0.9817 − 0.001 empirical floor). The load-bearing quality test in
-`tcq_tests.rs` further asserts TCQ ≥ plain turbo3 cosine on a non-Gaussian
-(sinusoidal) fixture — proving the Viterbi assignment exploits inter-element
-structure the codebook does not encode.
+`tcq_tests.rs` asserts TCQ ≥ plain turbo3 cosine on a non-Gaussian
+(sinusoidal) fixture — a non-regression gate satisfied trivially by equality,
+not a demonstration of a strict quality win.
+
+**Trellis degeneracy note.** The per-step Viterbi cost is
+`dist(value, codebook[level])`, which depends only on the chosen level, not
+on the trellis state. Because every level is reachable from every state and
+the codebook is state-independent, the minimum-cost Viterbi path equals the
+greedy nearest-centroid assignment. TCQ output is therefore bit-identical to
+plain turbo3 on unstructured data with the same codebook. A state-dependent
+(grade-aware) codebook would be required to obtain a shaping gain; that
+follow-up is deferred. The `>=` quality gate in `tcq_tests.rs` is satisfied
+by equality and does not demonstrate a strict improvement over plain turbo3.
 
 **Bench** (canary shape 4096 prompt, 100 decode tokens, release-perf binary, 3-run mean):
 
@@ -814,8 +827,9 @@ with canonical tag `k8v_turbo_3_tcq`, alias `turbo3_tcq` in
 
 ### `KvStorage::K8VTurbo2Tcq` — q8_0 K, TurboQuant 2-bit V with Viterbi trellis
 
-**Status**: opt-in via `--kv-quant k8vturbo2tcq`. Never an auto baseline. The
-highest-quality 2-bit V codec in the multi-turboquant lineage.
+**Status**: opt-in via `--kv-quant k8vturbo2tcq`. Never an auto baseline.
+Turbo2-equivalent quality (same Lloyd-Max codebook, degenerate trellis — same
+caveat as K8VTurbo3Tcq above).
 
 **K codec**: rMLX MSL q8_0, `group_size=128` (same K-side as K8VTurbo2).
 **V codec**: TurboQuant 2-bit Lloyd-Max N(0,1) codebook (`CODEBOOK_2BIT`,
@@ -1490,7 +1504,8 @@ differences are the codebook (16 centroids vs 8) and the pack density
 
 | Property | iso3 | iso4 |
 |---|---|---|
-| Effective bits / element | 3.25 | 4.25 |
+| Code bits / element | 3 | 4 |
+| Effective bits / element (incl. quaternion + norm sidebands) | ≈48.25 (≈772 B/token at head\_dim=128 — see Memory truth in iso3 section) | ≈52.25 (≈836 B/token at head\_dim=128: same quaternion + norm overhead, 4-bit codes) |
 | Codebook | `lloyd_gaussian_codebook(3)` (8 centroids) | `lloyd_gaussian_codebook(4)` (16 centroids) |
 | Pack density (per u32) | 10 vals (30 bits used, 2 wasted) | 8 vals (32 bits used, 0 wasted) |
 | Rotation | Golden-ratio fixed quaternion (`FIXED_QUAT`) | Same |

@@ -122,9 +122,8 @@ pub fn fused_qk_enabled() -> bool {
 /// by `exit_prefill`. Setting this gate to true does NOT make sparse-attn fire
 /// on the normal generate flow; the kernels are reserved for **seedless**
 /// workloads (synthetic PlanarK caches, PPL eval, future prompt-cache hits that
-/// skip prefill). See `docs/reports/sparse-attn-production.md` and
-/// [`sparse_attn::sparse_attn_total_dispatch_count`] for the dispatch counter
-/// aggregator.
+/// skip prefill). See [`sparse_attn::sparse_attn_total_dispatch_count`] for
+/// the dispatch counter aggregator.
 pub fn sparse_attn_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
