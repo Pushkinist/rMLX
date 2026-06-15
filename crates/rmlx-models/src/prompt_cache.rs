@@ -1160,14 +1160,6 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
             return Consumed::Miss;
         }
 
-        // hard runtime gate: this arch's policy must be the one the call site
-        // expects. The per-arch tripwire (previously an inline assert_eq! in
-        // each generate loop) lives here now, keyed on the policy field.
-        debug_assert!(
-            matches!(self.policy, ReusePolicy::Partial | ReusePolicy::ExactOnly),
-            "ArchPromptCache policy must be a known ReusePolicy variant",
-        );
-
         // (2) Codec-partitioned seed: identical to the per-arch push seed, so a
         // slot stored under a different KV codec / layout never matches.
         let seed = FNV_OFFSET ^ self.active_layout_key() ^ kv_quant.cache_key_salt();
@@ -1210,7 +1202,7 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
             raw_match = cache.find_best_prefix(prompt_ids, seed);
         }
 
-        // (4) Quant-mismatch guard (Plan §D8). The snapshot is only safe to
+        // (4) Quant-mismatch guard. The snapshot is only safe to
         // reuse when the stored KvQuant equals the runtime quant.
         let (slot_idx, block_count) = match raw_match {
             Some((slot_idx, block_count)) => {

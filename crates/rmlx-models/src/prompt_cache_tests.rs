@@ -1899,6 +1899,13 @@ impl tracing::Subscriber for TeeBranchSubscriber {
 /// `register_callsite` is `always`, the consume callsites dispatch to it on
 /// every thread regardless of which test fired them first — only the armed
 /// thread records, so the capture is deterministic across the shared binary.
+///
+/// test-ordering note: `set_global_default` is called exactly once (via
+/// `Once`) and is never uninstalled. No other test in this binary may rely on
+/// the global tracing dispatcher's span-filter or subscriber-specific
+/// semantics — the permanent install here will shadow any later attempt to set
+/// a different global default. Tests that need custom tracing must use a
+/// per-thread or scoped subscriber rather than the global dispatcher.
 fn capture_branches(f: impl FnOnce()) -> Vec<String> {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {

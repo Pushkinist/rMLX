@@ -1860,8 +1860,16 @@ pub fn generate_greedy<'a>(
     // Exact (identical-prompt repeat skips re-prefill) and Miss (full
     // re-prefill). The engine owns the find → SSD-hydrate retry → quant-mismatch
     // guard → SSD-hydrated exclusion → Exact decision and traces every degrade
-    // branch; the policy tripwire moved into the engine, keyed on policy().
+    // branch. The ExactOnly policy tripwire lives here at the call site — not in
+    // the generic engine — because the engine is policy-agnostic and shared across
+    // architectures that may use different policies.
     // ------------------------------------------------------------------
+    assert_eq!(
+        QWEN3_PROMPT_CACHE.policy(),
+        ReusePolicy::ExactOnly,
+        "Qwen3 prompt cache must be ExactOnly — pure-attention with no GDN recurrent state \
+         cannot safely reuse a partial prefix whose residual state is not stored",
+    );
     let consumed = QWEN3_PROMPT_CACHE.consume(prompt_ids, kv_quant, false);
 
     // Path A: exact cache hit — skip re-prefill, jump straight to decode.
