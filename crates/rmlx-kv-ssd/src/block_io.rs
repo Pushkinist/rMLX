@@ -699,6 +699,13 @@ fn write_layer(
             // a hydrated SWA layer whose rotating ring was never serialised) this
             // falls back to geometry-only "none" — those layers hold no payload.
             if let Some((k, v)) = none_bf16 {
+                // `seq` is taken as the buffer's filled length. The spill
+                // contract requires the None-path `decode_fp16_k` to be
+                // compacted to `offset` (the state `exit_prefill` leaves it in:
+                // sliced to `[B, kv_h, offset, D]`). A decode-expanded buffer
+                // grown to the `max_seq` ceiling with a zeroed tail must never
+                // reach here, or that tail would be persisted as live KV and the
+                // reconstructed offset would be wrong.
                 let seq = k.shape().get(2).copied().unwrap_or(0);
                 out.push((format!("l{idx}.k.bf16"), OwnedTensor::from_array(k)?));
                 out.push((format!("l{idx}.v.bf16"), OwnedTensor::from_array(v)?));
