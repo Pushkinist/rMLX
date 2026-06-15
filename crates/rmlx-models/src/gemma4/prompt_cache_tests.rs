@@ -187,8 +187,8 @@ fn hydrate_complete_for_resident_snapshot() {
 /// An SSD-hydrated entry whose SWA layer came back as a payload-less
 /// `KvStorage::None` (the rotating ring is not spilled) MUST be detected as
 /// hydrate-INCOMPLETE so the generate loop degrades the prefix reuse to a full
-/// re-prefill (Miss) — this is the issue-82 guard. The full-attention layer is
-/// reconstructed with real quantized payload; the SWA layer is empty `None`.
+/// re-prefill (Miss). The full-attention layer is reconstructed with real
+/// quantized payload; the SWA layer is empty `None`.
 #[test]
 fn hydrate_incomplete_when_swa_layer_empty() {
     // Full-attention layer: real K8V8 storage with a recorded offset (the
@@ -208,6 +208,8 @@ fn hydrate_incomplete_when_swa_layer_empty() {
     );
 
     let mut e = entry_with(vec![full, swa], (0..(2 * BLOCK_TOKENS) as u32).collect());
+    // Scene-setting: model a hydrated entry. `is_hydrate_complete` inspects the
+    // per-layer caches, not this flag, but a real degrade also requires it.
     e.is_ssd_hydrated = true;
     assert!(
         !e.is_hydrate_complete(),
