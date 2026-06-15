@@ -34,7 +34,7 @@ use super::model::Qwen3_5MoeText;
 use super::prompt_cache::{
     ensure_prompt_cache, store_kv_cache_bytes, Qwen35MoeEntry, PROMPT_CACHE,
 };
-use crate::prompt_cache::PromptCacheEntry as _;
+use crate::prompt_cache::{Consumed, ReuseKind, ReusePolicy};
 
 /// Greedy autoregressive generation using KV-cache prefill + decode.
 ///
@@ -94,177 +94,88 @@ pub fn generate_greedy<'a>(
 
     ensure_prompt_cache(prompt_cache_slots);
 
-    // No `Prefix` variant for qwen3_5_moe: the block-truncate + tail-reprefill
-    // partial path is unsafe for the recurrent GDN `lin_caches` (see the
-    // `find_best_prefix` match below). Genuine partial hits fall back to Miss
-    // (full re-prefill). Only full-token-equality reuse (Exact) is optimized.
-    //
-    // `HydratedTail` is the exception: when a SSD-hydrated entry is a STRICT
-    // PREFIX of the incoming prompt (i.e. its token ids are a byte-identical
-    // leading subsequence of `prompt_ids`), the block-aligned KV + GDN
-    // lin_caches represent recurrent state at exactly t=prefix_len of THIS
-    // same prompt, so re-prefilling only `prompt_ids[prefix_len..]` on top
-    // is sequentially correct. This is safe because the strict-prefix check
-    // guarantees the tail is the continuation of the exact same prompt (not a
-    // divergent sequence), which is the unsafe case ExactOnly guards against.
-    enum CacheLookup {
-        Exact {
-            kv_caches: Vec<KvCache>,
-            lin_caches: Vec<LinearAttnCache>,
-            last_id: u32,
-            piece: String,
-        },
-        /// SSD-hydrated block-aligned prefix; caller must re-prefill the tail.
-        HydratedTail {
-            kv_caches: Vec<KvCache>,
-            lin_caches: Vec<LinearAttnCache>,
-            prefix_len: usize,
-        },
-        Miss,
-    }
+    // ------------------------------------------------------------------
+    // Prompt cache lookup via the shared consume() engine. Qwen3.5-MoE is a
+    // hybrid GDN arch and uses `ReusePolicy::ExactOnly`. The reachable outcomes:
+    //   - `Exact`  = cached prompt token-for-token equal to this prompt (full
+    //                reuse, no re-prefill).
+    //   - `Reuse{StrictPrefix}` = HydratedTail: an SSD-hydrated entry that is a
+    //                STRICT PREFIX of the incoming prompt. Its block-aligned KV +
+    //                GDN `lin_caches` are the recurrent state at t=prefix_len of
+    //                THIS same prompt, so re-prefilling only the tail on top is
+    //                sequentially correct (the engine's policy gate permits a
+    //                hydrated strict-prefix even under ExactOnly).
+    //   - `Miss`   = no usable entry — a non-hydrated partial match (forbidden by
+    //                ExactOnly for the GDN `lin_caches`), the block-aligned
+    //                equal-length hydrated case (placeholder first token — must
+    //                recompute), an incomplete hydrate, or a quant mismatch.
+    // `BlockTruncate` is never produced by moe (the GDN `lin_caches` cannot be
+    // reconstructed from a block-truncated KV), so that arm is unreachable here.
+    // The engine owns find → SSD-hydrate retry → quant-mismatch guard →
+    // SSD-hydrated Exact exclusion → reuse-gate, and traces every degrade branch.
+    // ------------------------------------------------------------------
 
-    // hard runtime gate: Qwen3.5-MoE must be on the ExactOnly policy.
-    // A wrong policy here would expose the unsafe partial-prefix path on GDN
+    // hard runtime gate: Qwen3.5-MoE must be on the ExactOnly policy. A wrong
+    // policy here would expose the unsafe partial-prefix path on the GDN
     // `lin_caches` (see Qwen35MoeEntry docs). Compile-time would also fail at
     // SsdHydrate impl resolution, but this catches a misconfigured arch table
-    // before any cache lookup happens.
-    // Promoted from debug_assert_eq! so the tripwire fires in release-perf too.
+    // before any cache lookup happens. A real (not debug_) assert so the
+    // tripwire fires under release-perf too.
     assert_eq!(
         PROMPT_CACHE.policy(),
-        crate::prompt_cache::ReusePolicy::ExactOnly,
+        ReusePolicy::ExactOnly,
         "qwen3_5_moe ArchPromptCache must use ReusePolicy::ExactOnly — \
          partial-prefix reuse is unsafe for GDN lin_caches",
     );
 
-    // Issue #26: codec-partitioned prompt-cache key — see gemma4/generate/mod.rs
-    // for the full rationale. Query digest stream salted by
-    // `FNV_OFFSET ^ layout_key ^ codec_salt(kv_quant)` (matches the push seed).
-    let cache_seed = crate::prompt_cache::FNV_OFFSET
-        ^ crate::qwen3_5_moe::prompt_cache::active_layout_key()
-        ^ kv_quant.cache_key_salt();
-    let lookup: CacheLookup = PROMPT_CACHE.with_inner_mut(|guard| {
-        let cache = guard.as_mut().unwrap();
-        let mut raw_match = cache.find_best_prefix(prompt_ids, cache_seed);
-        // on a RAM miss, try the SSD tier (no-op when no source attached
-        // — tier OFF). A hit promotes the block into RAM; re-run find_best_prefix
-        // so the promoted slot is matched + quant-checked by the path below.
-        if raw_match.is_none() && cache.hydrate_from_ssd(prompt_ids).is_some() {
-            raw_match = cache.find_best_prefix(prompt_ids, cache_seed);
+    // image prompts never reach this arch (text path only), so `has_image` is
+    // always false here; the engine bypass is belt-and-suspenders.
+    let consumed = PROMPT_CACHE.consume(prompt_ids, kv_quant, false);
+
+    // `exact_hit` carries the Path-A locals; `hydrated_tail` carries the Path-B
+    // tail-re-prefill locals. `Consumed::Miss` leaves both `None` and falls
+    // through to Path C (full re-prefill).
+    let mut exact_hit: Option<(Vec<KvCache>, Vec<LinearAttnCache>, u32, String)> = None;
+    let mut hydrated_tail: Option<(Vec<KvCache>, Vec<LinearAttnCache>, usize)> = None;
+    match consumed {
+        Consumed::Exact(cloned) => {
+            exact_hit = Some((
+                cloned.kv_caches,
+                cloned.lin_caches,
+                cloned.first_id,
+                cloned.first_piece,
+            ));
         }
-        // Plan §D8 / Task 11.5: stored `KvQuant` must match runtime; on
-        // mismatch evict + warn + degrade to Miss. See `gemma4/generate.rs`
-        // for the full rationale.
-        let safe_match = match raw_match {
-            Some((slot_idx, block_count)) => {
-                let stored = cache.slots[slot_idx].entry.kv_quant;
-                if stored == Some(kv_quant) {
-                    Some((slot_idx, block_count))
-                } else {
-                    tracing::warn!(
-                        stored = ?stored,
-                        runtime = ?kv_quant,
-                        prompt_len = prompt_ids.len(),
-                        "prompt cache KV quant mismatch — evicting entry, \
-                         degrading to re-prefill"
-                    );
-                    cache.evict_slot(slot_idx);
-                    None
-                }
-            }
-            None => None,
-        };
-        match safe_match {
-            // Exact match: the cached entry's FULL token id list equals the
-            // incoming prompt. This is verified at token granularity, NOT by
-            // `block_count * BLOCK_TOKENS == len` — the block-floored test is
-            // essentially never true (only when len % 256 == 0) and was
-            // misrouting identical-prompt repeats into the Prefix path. For
-            // qwen3_5_moe that path is unsafe: the GDN `lin_caches` recurrent
-            // state cannot be reconstructed by truncating KV to a block
-            // boundary and re-prefilling a short tail (`truncate_kv_to_block`
-            // deliberately leaves `lin_caches` untouched), so it emitted
-            // corrupted output (258 -> 9 tokens for an identical re-request).
-            // True full-equality reuse sidesteps truncation entirely.
-            //
-            // BUG-1 guard: a SSD-hydrated entry whose block-aligned prefix
-            // length happens to equal `prompt_ids.len()` (prompt is an exact
-            // multiple of BLOCK_TOKENS → no tail → `prefix_len == len`) must
-            // NOT be served as Exact: `first_id` is the placeholder 0 set in
-            // `SsdHydrate::hydrate`, not a real decode token. Excluding it
-            // here causes the match to fall through to `Miss` → full re-prefill
-            // re-derives the real `first_id`. Correctness over the micro-opt.
-            Some((slot_idx, _block_count))
-                if !cache.slots[slot_idx].entry.is_ssd_hydrated
-                    && cache.slots[slot_idx].entry.prompt_token_ids() == prompt_ids =>
-            {
-                let slot = &cache.slots[slot_idx].entry;
-                match slot.deep_clone() {
-                    Ok(cloned) => CacheLookup::Exact {
-                        kv_caches: cloned.kv_caches,
-                        lin_caches: cloned.lin_caches,
-                        last_id: cloned.first_id,
-                        piece: cloned.first_piece,
-                    },
-                    Err(_) => CacheLookup::Miss,
-                }
-            }
-            // HydratedTail: SSD-hydrated block-aligned prefix that is a
-            // STRICT PREFIX of the incoming prompt. The hydrated KV + GDN
-            // lin_caches represent recurrent state at t=prefix_len of this
-            // exact prompt; re-prefilling only `prompt_ids[prefix_len..]`
-            // on top is sequentially correct (identical to pausing/resuming
-            // the original prefill at the block boundary).
-            //
-            // Guards (all must hold):
-            // 1. Entry was promoted from SSD (`is_ssd_hydrated == true`).
-            // 2. Stored ids are shorter than the incoming prompt (strict prefix,
-            //    not a full match — the Exact arm handles the equal-length case).
-            // 3. Stored ids are byte-identical to the matching leading subsequence
-            //    of `prompt_ids` (guarantees the tail is the same prompt's
-            //    continuation, not a divergent one).
-            //
-            // If deep_clone fails, fall through to Miss (full re-prefill).
-            Some((slot_idx, _block_count))
-                if {
-                    let e = &cache.slots[slot_idx].entry;
-                    let stored = e.prompt_token_ids();
-                    e.is_ssd_hydrated
-                        && stored.len() < prompt_ids.len()
-                        && prompt_ids.starts_with(stored)
-                } =>
-            {
-                let slot = &cache.slots[slot_idx].entry;
-                match slot.deep_clone() {
-                    Ok(cloned) => CacheLookup::HydratedTail {
-                        kv_caches: cloned.kv_caches,
-                        lin_caches: cloned.lin_caches,
-                        prefix_len: slot.prompt_token_ids().len(),
-                    },
-                    Err(_) => CacheLookup::Miss,
-                }
-            }
-            // Genuine partial block-prefix hit (shares leading blocks then
-            // diverges). The block-truncate + tail-reprefill Prefix path is
-            // NOT correct for qwen3_5_moe: `truncate_kv_to_block` truncates
-            // only `kv_caches`; the recurrent GDN `lin_caches` would still
-            // hold the full original-prompt state, which is wrong for the new
-            // (diverged) tail. Reconstructing recurrent linear-attn state for
-            // a block-truncated prefix is not straightforward, so fall back to
-            // a full re-prefill (Miss). Correctness over speed — the partial
-            // optimization is forfeited for this hybrid arch on purpose.
-            Some(_) => CacheLookup::Miss,
-            None => CacheLookup::Miss,
+        // HydratedTail: SSD-hydrated block-aligned prefix that is a strict
+        // prefix of the incoming prompt; tail re-prefills on top of the
+        // restored KV + GDN lin state (no truncation — recurrent state is
+        // resumed at the block boundary).
+        Consumed::Reuse {
+            entry: cloned,
+            kind: ReuseKind::StrictPrefix { prefix_len },
+        } => {
+            hydrated_tail = Some((cloned.kv_caches, cloned.lin_caches, prefix_len));
         }
-    });
+        // Unreachable for moe: the ExactOnly policy never permits a non-hydrated
+        // partial match, and the hydrated-prefix hook only ever yields
+        // `StrictPrefix` (block-truncating a GDN `lin_caches` is unsafe and
+        // structurally forbidden). Treat defensively as a Miss (full re-prefill)
+        // rather than panicking, since a Miss is always correctness-safe.
+        Consumed::Reuse {
+            kind: ReuseKind::BlockTruncate { .. },
+            ..
+        } => {
+            tracing::warn!(
+                prompt_len = prompt_ids.len(),
+                "qwen3_5moe generate_greedy: unexpected BlockTruncate reuse for a GDN arch — \
+                 degrading to full re-prefill"
+            );
+        }
+        Consumed::Miss => {}
+    }
 
     // Path A: exact match
-    if let CacheLookup::Exact {
-        mut kv_caches,
-        mut lin_caches,
-        last_id,
-        piece,
-    } = lookup
-    {
+    if let Some((mut kv_caches, mut lin_caches, last_id, piece)) = exact_hit {
         tracing::debug!(
             prompt_len = prompt_ids.len(),
             token_id = last_id,
@@ -344,12 +255,7 @@ pub fn generate_greedy<'a>(
     //
     // Chunking (same prefill_chunk as Path C): keeps GDN ts < 256 per chunk
     // to avoid Metal watchdog timeouts on long tails.
-    if let CacheLookup::HydratedTail {
-        mut kv_caches,
-        mut lin_caches,
-        prefix_len,
-    } = lookup
-    {
+    if let Some((mut kv_caches, mut lin_caches, prefix_len)) = hydrated_tail {
         let tail_len = prompt_ids.len() - prefix_len;
         tracing::info!(
             arch = "Qwen3_5MoeForConditionalGeneration",

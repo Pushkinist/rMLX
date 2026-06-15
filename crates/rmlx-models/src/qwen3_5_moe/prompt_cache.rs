@@ -206,9 +206,11 @@ impl SsdHydrate<Qwen35MoeEntry> for SsdHydrator {
 
 /// per-arch shell with hard-gated `ReusePolicy::ExactOnly`. Partial /
 /// block-aligned reuse is unsafe for the hybrid GDN arch (the recurrent
-/// `lin_caches` cannot be reconstructed from a block-truncated KV) — the
-/// generate-loop's `CacheLookup` match enforces this at runtime by routing
-/// any `Some(_)` non-Exact match to `CacheLookup::Miss`.
+/// `lin_caches` cannot be reconstructed from a block-truncated KV) — the shared
+/// consume engine enforces this at runtime: under `ExactOnly` a non-hydrated
+/// partial match is forbidden, and the only permitted reuse is a hydrated
+/// strict-prefix (HydratedTail) via `is_reusable_prefix_of`; everything else
+/// degrades to a full re-prefill (Miss).
 pub(crate) static PROMPT_CACHE: ArchPromptCache<Qwen35MoeEntry> =
     ArchPromptCache::new("Qwen3_5MoeForConditionalGeneration", ReusePolicy::ExactOnly);
 

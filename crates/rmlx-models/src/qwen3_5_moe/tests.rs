@@ -1710,8 +1710,9 @@ fn integration_qwen3_5_moe_35b() {
 /// 3. DIVERGENT: inject the same prefix snapshot but pass a prompt whose tail
 ///    diverges WITHIN the prefix range (not a strict prefix of the stored ids) →
 ///    `find_best_prefix` returns the slot but the strict-prefix gate rejects it →
-///    falls to `CacheLookup::Miss` (confirmed by checking the decode output
-///    differs from a crafted different-tail cold run, NOT from the warm run).
+///    the consume engine yields `Consumed::Miss` (confirmed by checking the
+///    decode output differs from a crafted different-tail cold run, NOT from the
+///    warm run).
 ///
 /// Run:
 /// ```sh
