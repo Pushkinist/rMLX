@@ -1143,9 +1143,6 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
     /// Every degrade branch emits exactly one `debug!{branch, reason}` so the
     /// decision is reconstructable from a single run's log — the cached arches
     /// previously had silent degrade arms.
-    // `dead_code` until the first arch (qwen3 dense) routes through this; the
-    // unit tests exercise it crate-internally in the same change series.
-    #[allow(dead_code)]
     pub(crate) fn consume(
         &self,
         prompt_ids: &[u32],

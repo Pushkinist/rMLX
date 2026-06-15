@@ -35,9 +35,6 @@ rustfft   = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-# Already pinned at the workspace root; used only by prompt-cache degrade-trace
-# tests to capture `debug!{branch=...}` events without a hand-rolled subscriber.
-tracing-subscriber = { workspace = true }
 # Criterion micro-benchmarks for prefix-index strategies. Pulled
 # from the workspace pin so rmlx-quant and rmlx-models stay aligned. Not
 # wired into `make ci` — run on demand via

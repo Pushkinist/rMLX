@@ -611,3 +611,281 @@ fn qwen3_hydrated_exact_no_tail_not_placeholder() {
         warm_tokens[0]
     );
 }
+
+/// Phase A consume-engine migration golden (qwen3 dense, Bonsai).
+///
+/// Pins that routing qwen3 through the shared `consume()` engine is
+/// behavior-identical to the pre-migration inline `CacheLookup`. Captures the
+/// decoded `token_id` sequence at temp 0 for the four reachable cases and
+/// asserts each against the cold baseline:
+///   (i)   SSD exact-hit recompute: a hydrated FULL-prompt entry (no tail,
+///         placeholder first_id) must fall to Miss → WARM == COLD (engine drops
+///         it via the `!is_ssd_hydrated` Exact exclusion → re-prefill).
+///   (ii)  RAM exact-hit: a real RAM snapshot of the same prompt replays the
+///         stored first token → WARM == COLD.
+///   (iii) first_logprobs replay: a RAM exact-hit with `top_logprobs_k = 3`
+///         emits exactly one logprobs entry for the replayed first token,
+///         truncated to 3 alternatives — the Miss path's capture survives the
+///         Exact(E) clone.
+///   (iv)  Miss: a distinct prompt re-prefills → coherent, non-placeholder
+///         first token, distinct from the baseline.
+///
+/// Run:
+/// ```sh
+/// RMLX_TEST_MODEL_BONSAI=/path/to/Ternary-Bonsai-8B-mlx-2bit \
+/// cargo test -p rmlx-models qwen3_consume_engine_migration_golden \
+///     -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test-only: Mutex critical section is panic-free; remaining unwrap is on values constructed in this fn"
+)]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: indices bounded by slice length validated before call"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "test-only: a single golden covering the four reachable consume cases (cold/RAM/SSD/Miss) reads clearest as one sequential fixture"
+)]
+fn qwen3_consume_engine_migration_golden() {
+    let Some(model_dir_buf) =
+        std::env::var_os("RMLX_TEST_MODEL_BONSAI").map(std::path::PathBuf::from)
+    else {
+        println!("SKIP: RMLX_TEST_MODEL_BONSAI not set");
+        return;
+    };
+    let model_dir = model_dir_buf.as_path();
+    if !model_dir.exists() {
+        println!("SKIP: model dir not found at {}", model_dir.display());
+        return;
+    }
+    let arch_str = {
+        let cfg_path = model_dir.join("config.json");
+        let data = std::fs::read(&cfg_path).expect("read config.json");
+        let v: serde_json::Value = serde_json::from_slice(&data).expect("parse config.json");
+        v.get("architectures")
+            .and_then(|a| a.get(0))
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_owned()
+    };
+    if arch_str != "Qwen3ForCausalLM" {
+        println!("SKIP: arch \"{arch_str}\" is not Qwen3ForCausalLM");
+        return;
+    }
+
+    let model = load_from_path(model_dir, None).expect("load model");
+    let n_layers = model.cfg.num_hidden_layers;
+    let device = Device::Gpu;
+    let kv_quant = KvQuant::None;
+    let max_seq = 4096i32;
+    let n_decode = 6usize;
+    let tokenizer =
+        tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json")).expect("load tokenizer");
+
+    // Block-aligned prompt (no tail) — the SSD exact-hit shape (the spilled
+    // block equals the full prompt).
+    let prompt_len = BLOCK_TOKENS;
+    let prompt_ids: Vec<u32> = (1u32..=prompt_len as u32)
+        .map(|i| (i % 9999).max(1))
+        .collect();
+
+    // A distinct block-aligned prompt for the Miss case.
+    let other_ids: Vec<u32> = (1u32..=prompt_len as u32)
+        .map(|i| ((i * 7 + 3) % 9999).max(1))
+        .collect();
+
+    let base_sampler = crate::sampler::SamplerConfig {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        min_p: 0.0,
+        seed: Some(0),
+        top_logprobs_k: 0,
+    };
+    let penalty_cfg = crate::sampler::PenaltyConfig::default();
+
+    // Helper: run generate_greedy at temp 0 and return the decoded steps.
+    let run = |ids: &[u32],
+               sampler: &crate::sampler::SamplerConfig|
+     -> Vec<crate::decode_loop::ProbeStep> {
+        let mut rng = crate::sampler::Pcg32::new(sampler.seed_or_default());
+        let mut token_history: Vec<u32> = Vec::new();
+        let mut step_fn = |_: &crate::decode_loop::ProbeStep| -> Option<u32> { None };
+        generate_greedy(
+            &model,
+            &tokenizer,
+            ids,
+            n_decode,
+            device,
+            kv_quant,
+            Some(max_seq),
+            4,
+            &[],
+            &mut step_fn,
+            None,
+            sampler,
+            &mut rng,
+            &penalty_cfg,
+            &mut token_history,
+        )
+        .expect("generate_greedy")
+    };
+
+    let clear_cache = || {
+        ensure_qwen3_prompt_cache(4);
+        QWEN3_PROMPT_CACHE.with_inner_mut(|guard| {
+            if let Some(cache) = guard.as_mut() {
+                cache.clear();
+            }
+        });
+    };
+
+    // ── (a) COLD baseline (Miss path: full prefill + store-back) ─────────────
+    clear_cache();
+    let cold: Vec<u32> = run(&prompt_ids, &base_sampler)
+        .into_iter()
+        .map(|s| s.token_id)
+        .collect();
+    println!("COLD tokens: {cold:?}");
+    assert_eq!(cold.len(), n_decode);
+    assert_ne!(
+        cold[0], 0,
+        "cold first token is the placeholder 0 — fixture anomaly"
+    );
+
+    // ── (ii) RAM exact-hit: the store-back from (a) is now resident. Re-running
+    // the same prompt must be an Exact hit → token-identical to COLD. ─────────
+    let warm_ram: Vec<u32> = run(&prompt_ids, &base_sampler)
+        .into_iter()
+        .map(|s| s.token_id)
+        .collect();
+    println!("WARM (RAM exact-hit) tokens: {warm_ram:?}");
+    assert_eq!(
+        warm_ram, cold,
+        "RAM exact-hit must be token-identical to the cold baseline"
+    );
+
+    // ── (iii) first_logprobs truncated replay: a RAM exact-hit with
+    // top_logprobs_k = 3 must emit exactly one logprobs entry for the replayed
+    // first token (captured at store time, truncated to 3). ──────────────────
+    let lp_sampler = crate::sampler::SamplerConfig {
+        top_logprobs_k: 3,
+        ..base_sampler
+    };
+    let lp_steps = run(&prompt_ids, &lp_sampler);
+    let first = &lp_steps[0];
+    let lp = first
+        .logprobs
+        .as_ref()
+        .expect("exact-hit first token must carry replayed logprobs when lp_k > 0");
+    assert_eq!(
+        lp.token_id, cold[0],
+        "replayed logprobs must describe the replayed first token"
+    );
+    assert!(
+        lp.top.len() <= 3,
+        "first_logprobs must be truncated to the request's top_logprobs_k (3), got {}",
+        lp.top.len()
+    );
+
+    // ── (i) SSD exact-hit recompute: inject a hydrated FULL-prompt
+    // snapshot (placeholder first_id=0, is_ssd_hydrated=true). The consume
+    // engine's `!is_ssd_hydrated` Exact exclusion + the reuse hook declining the
+    // equal-length case must drop it to Miss → WARM == COLD (never replay 0). ──
+    let full_kv_caches = {
+        use crate::kv_cache::{kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N};
+        let mut kv_caches: Vec<KvCache> = (0..n_layers)
+            .map(|i| {
+                let q = kv_quant_for_layer(
+                    i,
+                    n_layers,
+                    kv_quant,
+                    LAYER_ADAPTIVE_TAIL_N,
+                    LAYER_ADAPTIVE_HEAD_N,
+                );
+                KvCache::with_quant_max_seq(q, max_seq).with_layer_idx(i)
+            })
+            .collect();
+        for c in &mut kv_caches {
+            c.enter_prefill();
+        }
+        let prefill_chunk = crate::prefill_chunk::prefill_chunk_for("qwen3");
+        let n_chunks = prompt_len.div_ceil(prefill_chunk);
+        for (chunk_idx, chunk) in prompt_ids.chunks(prefill_chunk).enumerate() {
+            let is_last = chunk_idx + 1 == n_chunks;
+            let logits = model
+                .forward_seq_with_cache(chunk, Some(&mut kv_caches), device)
+                .expect("prefill chunk");
+            if is_last {
+                logits.eval().expect("eval last-chunk logits");
+            } else {
+                for c in &kv_caches {
+                    c.eval_prefill_state().expect("eval_prefill_state");
+                }
+            }
+        }
+        for c in &mut kv_caches {
+            c.exit_prefill(device).expect("exit_prefill");
+        }
+        for c in &kv_caches {
+            c.eval_for_spill().expect("eval_for_spill kv");
+        }
+        kv_caches
+    };
+
+    clear_cache();
+    QWEN3_PROMPT_CACHE.with_inner_mut(|guard| {
+        if let Some(cache) = guard.as_mut() {
+            let block_hashes =
+                chained_block_hashes_seeded(&prompt_ids, FNV_OFFSET ^ kv_quant.cache_key_salt());
+            let kv_snap: Result<Vec<_>> =
+                full_kv_caches.iter().map(KvCache::try_deep_clone).collect();
+            cache.push(Qwen3Entry {
+                prompt_token_ids: prompt_ids.clone(),
+                block_hashes,
+                kv_caches: kv_snap.expect("kv clone"),
+                first_id: 0,
+                first_piece: String::new(),
+                first_logprobs: None,
+                kv_quant: Some(kv_quant),
+                is_ssd_hydrated: true,
+            });
+        }
+    });
+    let warm_ssd: Vec<u32> = run(&prompt_ids, &base_sampler)
+        .into_iter()
+        .map(|s| s.token_id)
+        .collect();
+    println!("WARM (SSD exact-hit recompute) tokens: {warm_ssd:?}");
+    assert_ne!(
+        warm_ssd.first().copied(),
+        Some(0u32),
+        "SSD exact-hit must NOT replay the placeholder first_id 0"
+    );
+    assert_eq!(
+        warm_ssd, cold,
+        "SSD exact-hit recompute must equal the cold baseline"
+    );
+
+    // ── (iv) Miss: a distinct prompt re-prefills → coherent, distinct. ───────
+    clear_cache();
+    let miss: Vec<u32> = run(&other_ids, &base_sampler)
+        .into_iter()
+        .map(|s| s.token_id)
+        .collect();
+    println!("MISS (distinct prompt) tokens: {miss:?}");
+    assert_eq!(miss.len(), n_decode);
+    assert_ne!(miss[0], 0, "Miss first token must be a real decode token");
+
+    println!(
+        "PASS: consume-engine migration golden — RAM/SSD/logprobs/Miss all match the baseline"
+    );
+}
