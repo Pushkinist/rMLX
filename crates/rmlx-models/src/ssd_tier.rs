@@ -66,6 +66,14 @@ pub fn attach_at_load(
                 info.device,
             );
         }
+        "Qwen2ForCausalLM" => {
+            crate::qwen2::prompt_cache::PROMPT_CACHE.attach_ssd_tier(
+                &info.namespace,
+                info.kv_quant,
+                info.layout_key,
+                info.device,
+            );
+        }
         other => {
             tracing::info!(
                 arch = other,

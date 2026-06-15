@@ -19,10 +19,14 @@ use rmlx_mlx::{argmax, Array, Device, Dtype};
 
 use crate::constraint::ConstraintEngine;
 use crate::kv_cache::{kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N};
+use crate::prompt_cache::{chained_block_hashes_seeded, Consumed, ReusePolicy, FNV_OFFSET};
 use crate::sampler::apply_mask_argmax;
 use rmlx_kv_quant::{KvCache, KV_MAX_SEQ_DEFAULT};
 
 use super::model::Qwen2Text;
+use super::prompt_cache::{
+    active_layout_key, ensure_prompt_cache, store_kv_cache_bytes, Qwen2Entry, PROMPT_CACHE,
+};
 
 // ---------------------------------------------------------------------------
 // Smoke probe — generate_greedy
@@ -83,6 +87,12 @@ fn max_abs_from_bytes(bytes: &[u8], dtype: Dtype) -> f32 {
 /// Greedy autoregressive generation using KV-cache prefill + decode.
 ///
 /// Returns `Vec<ProbeStep>` — same shape as `gemma4::generate_greedy`.
+///
+/// `prompt_cache_slots` — number of post-prefill KV snapshots kept across
+/// requests. Pass 1 for single-slot; pass N for multi-slot prefix matching.
+/// Recommended: 4. Only the Exact hit path is active (identical-prompt repeat
+/// skips re-prefill entirely, same `ReusePolicy::ExactOnly` contract as Qwen3
+/// dense).
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::indexing_slicing,
@@ -100,6 +110,7 @@ pub fn generate_greedy(
     device: Device,
     kv_quant: rmlx_kv_quant::KvQuant,
     max_ctx_override: Option<i32>,
+    prompt_cache_slots: usize,
     eos_ids: &[u32],
     step_fn: &mut dyn FnMut(&crate::decode_loop::ProbeStep) -> Option<u32>,
     // A6.2: optional sampler constraint. See gemma4::generate_greedy.
@@ -127,11 +138,100 @@ pub fn generate_greedy(
     let vocab = model.cfg.vocab_size as i32;
     let mut steps = Vec::with_capacity(n_tokens);
 
+    ensure_prompt_cache(prompt_cache_slots);
+
     // Decode profile timers. See gemma4::generate_greedy for rationale.
     let mut forward_total_ns: u128 = 0;
     let mut eval_total_ns: u128 = 0;
     let mut step_total_ns: u128 = 0;
     let mut decode_steps: u32 = 0;
+
+    // ------------------------------------------------------------------
+    // Prompt cache lookup via the shared consume() engine. Qwen2 is a dense
+    // pure-attention arch with no recurrent state and uses
+    // ReusePolicy::ExactOnly (it overrides none of the reuse hooks), so the only
+    // reachable outcomes are Exact (identical-prompt repeat skips re-prefill) and
+    // Miss (full re-prefill). The engine owns the find → SSD-hydrate retry →
+    // quant-mismatch guard → SSD-hydrated exclusion → Exact decision and traces
+    // every degrade branch. The ExactOnly policy tripwire lives here at the call
+    // site — not in the generic engine — because the engine is policy-agnostic
+    // and shared across architectures that may use different policies.
+    // ------------------------------------------------------------------
+    assert_eq!(
+        PROMPT_CACHE.policy(),
+        ReusePolicy::ExactOnly,
+        "Qwen2 prompt cache must be ExactOnly — pure-attention with no recurrent \
+         state and an Exact-hit-dominated workload; partial-prefix reuse is not wired",
+    );
+    // Qwen2 is text-only (no vision tower), so there is never an image prompt;
+    // the engine's has_image bypass is belt-and-suspenders.
+    let consumed = PROMPT_CACHE.consume(prompt_ids, kv_quant, false);
+
+    // Path A: exact cache hit — skip re-prefill, replay the stored first token,
+    // then run the shared decode loop on the cloned caches.
+    if let Consumed::Exact(cloned) = consumed {
+        let Qwen2Entry {
+            kv_caches: mut caches,
+            first_id: last_id,
+            first_piece: piece,
+            ..
+        } = cloned;
+        tracing::debug!(
+            prompt_len = prompt_ids.len(),
+            token_id = last_id,
+            "qwen2 generate_greedy: prompt cache EXACT HIT"
+        );
+        steps.push(ProbeStep {
+            token_id: last_id,
+            piece: piece.into_boxed_str(),
+            max_abs_logit: 0.0,
+            nan_count: 0,
+            logprobs: None,
+        });
+        step_fn(steps.last().unwrap());
+        token_history.push(last_id);
+
+        if eos_ids.contains(&last_id) {
+            return Ok(steps);
+        }
+
+        decode_loop(
+            model,
+            tokenizer,
+            &mut caches,
+            last_id,
+            n_tokens,
+            vocab,
+            device,
+            eos_ids,
+            &mut steps,
+            step_fn,
+            &mut constraint,
+            sampler_cfg,
+            rng,
+            penalty_cfg,
+            token_history,
+            &mut forward_total_ns,
+            &mut eval_total_ns,
+            &mut step_total_ns,
+            &mut decode_steps,
+        )?;
+
+        {
+            let kv_bytes: u64 = caches.iter().map(|c| c.resident_bytes()).sum();
+            store_kv_cache_bytes(kv_bytes);
+        }
+        log_decode_profile(
+            0.0,
+            forward_total_ns,
+            eval_total_ns,
+            step_total_ns,
+            decode_steps,
+        );
+        return Ok(steps);
+    }
+
+    // Path B (Miss): full re-prefill from scratch.
     let prefill_t0 = Instant::now();
 
     let max_seq = max_ctx_override.unwrap_or(KV_MAX_SEQ_DEFAULT);
@@ -291,7 +391,7 @@ pub fn generate_greedy(
 
     steps.push(ProbeStep {
         token_id: last_id,
-        piece: piece.into_boxed_str(),
+        piece: piece.clone().into_boxed_str(),
         max_abs_logit,
         nan_count,
         logprobs: None,
@@ -302,18 +402,140 @@ pub fn generate_greedy(
         return Ok(steps);
     }
 
+    // Push this prefill snapshot to the prompt cache (Miss → store). Clone the
+    // post-prefill KV caches (refcount bump, no data copy) before the decode
+    // loop starts writing new decode-step K/V into them. Materialize the GPU
+    // arrays on the current inference thread first so a later eviction on a
+    // different tokio/Metal thread can re-eval them as a no-op (see qwen3.rs).
+    {
+        let kv_bytes: u64 = caches.iter().map(|c| c.resident_bytes()).sum();
+        store_kv_cache_bytes(kv_bytes);
+        let cloned_caches: Result<Vec<KvCache>> =
+            caches.iter().map(|c| c.try_deep_clone()).collect();
+        if let Ok(kv_snapshot) = cloned_caches {
+            match kv_snapshot.iter().try_for_each(|c| c.eval_for_spill()) {
+                Ok(()) => {
+                    // Salt the chained block-hash walk with the active layout_key
+                    // + KV codec so a slot stored under a different codec / layout
+                    // never cross-serves. Identical to the consume() seed.
+                    let lk = active_layout_key();
+                    let block_hashes = chained_block_hashes_seeded(
+                        prompt_ids,
+                        FNV_OFFSET ^ lk ^ kv_quant.cache_key_salt(),
+                    );
+                    let entry = Qwen2Entry {
+                        prompt_token_ids: prompt_ids.to_vec(),
+                        block_hashes,
+                        kv_caches: kv_snapshot,
+                        first_id: last_id,
+                        // Last use of `piece` — move it (the prefill ProbeStep
+                        // above already consumed its own clone via into_boxed_str).
+                        first_piece: piece,
+                        kv_quant: Some(kv_quant),
+                        is_ssd_hydrated: false,
+                    };
+                    PROMPT_CACHE.with_inner_mut(|guard| {
+                        if let Some(cache) = guard.as_mut() {
+                            cache.push(entry);
+                            let stats = cache.stats();
+                            tracing::debug!(
+                                prompt_len = prompt_ids.len(),
+                                cache_hits = stats.hits,
+                                cache_misses = stats.misses,
+                                cache_bytes = stats.bytes,
+                                "qwen2 generate_greedy: pushed snapshot to prompt cache (miss path)"
+                            );
+                        }
+                    });
+                }
+                Err(e) => tracing::warn!(error = %e,
+                    "qwen2 generate_greedy: pre-eval of KV caches failed, skipping prompt cache store"),
+            }
+        }
+    }
+
     // EOS-stop. If prefill emitted an EOS already, no decode steps.
     if eos_ids.contains(&last_id) {
         return Ok(steps);
     }
 
-    // Decode: async_eval + single-slot pending pipeline (mirrors qwen3.rs).
-    // Each iteration dispatches step i+1's forward while step i's argmax
-    // materialises in the background. GPU sync only happens on the *previous*
-    // step's `pending` via `to_bytes()`. The `last_id` u32 is only used to
-    // build the initial Array for the very first decode step.
-    //
-    // EOS-stop after pending drain (see gemma4::generate_greedy).
+    decode_loop(
+        model,
+        tokenizer,
+        &mut caches,
+        last_id,
+        n_tokens,
+        vocab,
+        device,
+        eos_ids,
+        &mut steps,
+        step_fn,
+        &mut constraint,
+        sampler_cfg,
+        rng,
+        penalty_cfg,
+        token_history,
+        &mut forward_total_ns,
+        &mut eval_total_ns,
+        &mut step_total_ns,
+        &mut decode_steps,
+    )?;
+
+    log_decode_profile(
+        (prefill_total_ns as f64) / 1.0e6,
+        forward_total_ns,
+        eval_total_ns,
+        step_total_ns,
+        decode_steps,
+    );
+
+    Ok(steps)
+}
+
+/// Shared pipelined decode loop for both the Exact-hit and Miss paths.
+///
+/// `last_id` is the already-emitted step-0 token (prefill argmax or replayed
+/// cache first token); `steps` already holds its `ProbeStep`. This drives steps
+/// `1..n_tokens` with the single-slot async_eval pipeline and the final drain,
+/// accumulating decode timers into the caller's counters.
+///
+/// async_eval + single-slot pending pipeline (mirrors qwen3.rs). Each iteration
+/// dispatches step i+1's forward while step i's argmax materialises in the
+/// background; GPU sync only happens on the *previous* step's `pending` via
+/// `to_bytes()`. The `last_id` u32 is only used to build the initial Array for
+/// the very first decode step.
+#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: argmax byte slices are sized 4 by the I32 dtype; loop indices bounded by slice length"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Option/Result unwrap is on values established by construction earlier in this fn (pending pipeline / try_into on a 4-byte slice)"
+)]
+fn decode_loop(
+    model: &Qwen2Text,
+    tokenizer: &tokenizers::Tokenizer,
+    caches: &mut [KvCache],
+    last_id: u32,
+    n_tokens: usize,
+    vocab: i32,
+    device: Device,
+    eos_ids: &[u32],
+    steps: &mut Vec<crate::decode_loop::ProbeStep>,
+    step_fn: &mut dyn FnMut(&crate::decode_loop::ProbeStep) -> Option<u32>,
+    constraint: &mut Option<&mut dyn ConstraintEngine>,
+    sampler_cfg: &crate::sampler::SamplerConfig,
+    rng: &mut crate::sampler::Pcg32,
+    penalty_cfg: &crate::sampler::PenaltyConfig,
+    token_history: &mut Vec<u32>,
+    forward_total_ns: &mut u128,
+    eval_total_ns: &mut u128,
+    step_total_ns: &mut u128,
+    decode_steps: &mut u32,
+) -> Result<()> {
+    use crate::decode_loop::ProbeStep;
+
     let mut y: Array = {
         let id_i32 = last_id as i32;
         let bytes = id_i32.to_le_bytes();
@@ -326,7 +548,7 @@ pub fn generate_greedy(
     for step_idx in 1..n_tokens {
         let step_t0 = Instant::now();
         let fwd_t0 = Instant::now();
-        let decode_logits = match model.forward_arr(&y, 1, Some(&mut caches), device) {
+        let decode_logits = match model.forward_arr(&y, 1, Some(&mut *caches), device) {
             Ok(l) => l,
             Err(e) => {
                 tracing::warn!(
@@ -345,7 +567,7 @@ pub fn generate_greedy(
         // argmax dtype + pipelining are bit-identical to the no-constraint
         // path. `advance()` is still called from the post-drain branch so
         // warm-up engagement detection works.
-        let mask_active = constraint.as_ref().is_some_and(|c| c.wants_mask());
+        let mask_active = constraint.as_deref().is_some_and(|c| c.wants_mask());
         // A7.2: temp>0 reads logits to host each step (no async pipelining
         // benefit), so it shares the masked branch's pre-drain. temp<=0
         // keeps the exact `mask_active`-gated pipelined path byte-for-byte.
@@ -364,7 +586,7 @@ pub fn generate_greedy(
             if let Some(p) = pending.take() {
                 let top_bytes = p.to_bytes()?;
                 let next_id = i32::from_le_bytes(top_bytes[..4].try_into().unwrap()) as u32;
-                if let Some(c) = constraint.as_mut() {
+                if let Some(c) = constraint.as_deref_mut() {
                     c.advance(next_id);
                 }
                 // A7.3: accumulate emitted token into history.
@@ -406,7 +628,7 @@ pub fn generate_greedy(
         let recent = &token_history[win_start..];
         let next_y = if sampling_active {
             let mask_opt: Option<&[bool]> = if mask_active {
-                Some(constraint.as_mut().unwrap().step_mask(vocab as usize))
+                Some(constraint.as_deref_mut().unwrap().step_mask(vocab as usize))
             } else {
                 None
             };
@@ -422,7 +644,7 @@ pub fn generate_greedy(
         } else {
             if penalties_active {
                 let mask_opt: Option<&[bool]> = if mask_active {
-                    Some(constraint.as_mut().unwrap().step_mask(vocab as usize))
+                    Some(constraint.as_deref_mut().unwrap().step_mask(vocab as usize))
                 } else {
                     None
                 };
@@ -434,7 +656,7 @@ pub fn generate_greedy(
                     device,
                 )?
             } else if mask_active {
-                let c = constraint.as_mut().unwrap();
+                let c = constraint.as_deref_mut().unwrap();
                 let m = c.step_mask(vocab as usize);
                 apply_mask_argmax(&logits_flat, m, device)?
             } else {
@@ -452,7 +674,7 @@ pub fn generate_greedy(
             if let Some(p) = pending.take() {
                 let top_bytes = p.to_bytes()?;
                 let next_id = i32::from_le_bytes(top_bytes[..4].try_into().unwrap()) as u32;
-                if let Some(c) = constraint.as_mut() {
+                if let Some(c) = constraint.as_deref_mut() {
                     c.advance(next_id);
                 }
                 // A7.3: accumulate pipelined token into history.
@@ -479,10 +701,10 @@ pub fn generate_greedy(
         }
         let eval_dt = eval_t0.elapsed().as_nanos();
 
-        forward_total_ns += fwd_dt_total;
-        eval_total_ns += eval_dt;
-        step_total_ns += step_t0.elapsed().as_nanos();
-        decode_steps += 1;
+        *forward_total_ns += fwd_dt_total;
+        *eval_total_ns += eval_dt;
+        *step_total_ns += step_t0.elapsed().as_nanos();
+        *decode_steps += 1;
 
         if emitted_eos {
             early_stop = true;
@@ -507,7 +729,7 @@ pub fn generate_greedy(
             let drain_t0 = Instant::now();
             p.eval()?;
             let top_bytes = p.to_bytes()?;
-            eval_total_ns += drain_t0.elapsed().as_nanos();
+            *eval_total_ns += drain_t0.elapsed().as_nanos();
             let next_id = i32::from_le_bytes(top_bytes[..4].try_into().unwrap()) as u32;
             if let Some(c) = constraint.as_mut() {
                 c.advance(next_id);
@@ -528,7 +750,19 @@ pub fn generate_greedy(
         }
     }
 
-    let prefill_ms = (prefill_total_ns as f64) / 1.0e6;
+    Ok(())
+}
+
+/// Emit the `decode_profile` info event for one generate call.
+///
+/// `prefill_ms` is `0.0` on the Exact-hit path (no prefill ran).
+fn log_decode_profile(
+    prefill_ms: f64,
+    forward_total_ns: u128,
+    eval_total_ns: u128,
+    step_total_ns: u128,
+    decode_steps: u32,
+) {
     let forward_ms = (forward_total_ns as f64) / 1.0e6;
     let eval_ms = (eval_total_ns as f64) / 1.0e6;
     let step_ms = (step_total_ns as f64) / 1.0e6;
@@ -545,6 +779,4 @@ pub fn generate_greedy(
         eval_per_step_ms = eval_ms / n,
         "decode_profile"
     );
-
-    Ok(steps)
 }

@@ -21,6 +21,7 @@ pub(crate) mod config;
 pub(crate) mod generate;
 pub(crate) mod loader;
 pub(crate) mod model;
+pub(crate) mod prompt_cache;
 
 #[cfg(test)]
 mod tests;
@@ -29,3 +30,5 @@ pub use config::Qwen2Config;
 pub use generate::generate_greedy;
 pub use loader::load_from_path;
 pub use model::Qwen2Text;
+pub use prompt_cache::read_cache_stats as qwen2_cache_stats;
+pub use prompt_cache::read_kv_cache_bytes as qwen2_kv_cache_bytes;

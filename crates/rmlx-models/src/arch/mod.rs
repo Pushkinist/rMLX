@@ -958,6 +958,7 @@ impl Architecture {
                 device,
                 kv_quant,
                 max_ctx_override,
+                prompt_cache_slots,
                 eos_ids,
                 step_fn,
                 constraint,
@@ -1208,7 +1209,7 @@ impl Architecture {
     ///
     /// Reads the arch-specific global static that `generate_greedy` writes after
     /// each generation call.  Returns `None` for architectures that do not yet
-    /// maintain a shared PromptCache (Qwen2, BitNet, Laguna, Qwen3VlMoe).
+    /// maintain a shared PromptCache (BitNet, Laguna, Qwen3VlMoe).
     #[allow(
         clippy::wildcard_enum_match_arm,
         reason = "archs without a shared PromptCache fall through to None"
@@ -1220,6 +1221,7 @@ impl Architecture {
             }
             Architecture::Qwen3_5Moe(_) => crate::qwen3_5_moe::qwen3_5_moe_cache_stats(),
             Architecture::Qwen3(_) => crate::qwen3::read_cache_stats(),
+            Architecture::Qwen2(_) => crate::qwen2::qwen2_cache_stats(),
             _ => None,
         }
     }
@@ -1229,8 +1231,8 @@ impl Architecture {
     ///
     /// Reads the arch-specific prompt-cache static that `generate_greedy` writes
     /// via `store_kv_cache_bytes` at the end of every generate call.  Returns 0
-    /// for architectures that do not yet maintain that static (Qwen2, BitNet,
-    /// Laguna, Qwen3VlMoe).
+    /// for architectures that do not yet maintain that static (BitNet, Laguna,
+    /// Qwen3VlMoe).
     pub fn kv_cache_bytes(&self) -> u64 {
         match self {
             Architecture::Gemma4(_) => crate::gemma4::gemma4_kv_cache_bytes(),
@@ -1241,10 +1243,8 @@ impl Architecture {
             Architecture::Gemma3(_) => 0,
             Architecture::Qwen3_5Moe(_) => crate::qwen3_5_moe::qwen3_5_moe_kv_cache_bytes(),
             Architecture::Qwen3(_) => crate::qwen3::read_kv_cache_bytes(),
-            Architecture::Qwen2(_)
-            | Architecture::Laguna(_)
-            | Architecture::Qwen3VlMoe(_)
-            | Architecture::BitNet(_) => 0,
+            Architecture::Qwen2(_) => crate::qwen2::qwen2_kv_cache_bytes(),
+            Architecture::Laguna(_) | Architecture::Qwen3VlMoe(_) | Architecture::BitNet(_) => 0,
         }
     }
 
