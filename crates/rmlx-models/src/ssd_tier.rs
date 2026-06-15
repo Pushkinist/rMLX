@@ -50,6 +50,14 @@ pub fn attach_at_load(
                 info.device,
             );
         }
+        "Gemma3ForConditionalGeneration" => {
+            crate::gemma3::prompt_cache::PROMPT_CACHE.attach_ssd_tier(
+                &info.namespace,
+                info.kv_quant,
+                info.layout_key,
+                info.device,
+            );
+        }
         "Qwen3_5MoeForConditionalGeneration" => {
             crate::qwen3_5_moe::prompt_cache::PROMPT_CACHE.attach_ssd_tier(
                 &info.namespace,
