@@ -393,6 +393,30 @@ layer whose rotating ring was never serialised) falls back to the geometry-only
 This is the distinguishing signal: presence of `decode_fp16_{k,v}` means real KV
 exists and must travel; absence means there is nothing to persist.
 
+#### SWA layers are not spilled — hydrated entries degrade to re-prefill
+
+Gemma4's sliding-window-attention (SWA) layers run a bf16 `RotatingKvCache`
+ring that is **not** serialised to the SSD tier (the rotating ring layout is not
+expressed in the `.kvb` format). On hydrate those layers are reconstructed as
+payload-less `KvStorage::None` — empty, carrying neither quantized storage nor a
+restored bf16 seed.
+
+Reusing such a hydrated entry as a **prefix** (re-prefilling only the tail on top
+of the hydrated block) would leave every SWA layer's prefix empty, giving them
+the wrong attention context and corrupting the output for a non-block-aligned
+prompt. `KvCache::is_trimmable()` returns `true` for a `None` layer, so it is the
+wrong predicate to detect this.
+
+The consume path therefore evaluates a per-entry **hydrate-completeness** guard
+(`Gemma4Entry::is_hydrate_complete`) before the strict-prefix / block-truncate
+reuse arms: an entry is complete only if every attended layer holds payload
+(persistent storage, or a restored `decode_fp16_{k,v}` bf16 seed). A hydrated
+entry with an empty SWA `None` layer fails the check and is **degraded to a full
+re-prefill** (Miss), which recomputes the SWA prefix correctly. The guard is a
+no-op for RAM-resident snapshots (every layer holds payload), so non-SSD prefix
+reuse is unaffected. Serialising the SWA ring so hydrated entries could be reused
+as prefixes is a future enhancement.
+
 ---
 
 ## CLI Flags
