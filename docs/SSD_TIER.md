@@ -367,13 +367,31 @@ or `BlockIoError::KvQuantMismatch` — never a silently-wrong cache.
 | `K8V4` | `l{i}.k.codes` `l{i}.k.scales` `l{i}.v.codes` `l{i}.v.scales` |
 | `K8V8` | same as K8V4 (V is also q8_0) |
 | `Planar` | K8V4 tensors plus `l{i}.v.rotations` |
-| `None` | geometry only — bf16 K/V live on the parent KvCache, not storage |
+| `None` (filled bf16) | `l{i}.k.bf16` `l{i}.v.bf16` — the off-storage bf16 prefix; geom tag `none_bf16` |
+| `None` (no payload) | geometry only, geom tag `none` — see note below |
 | `Mixed` | `l{i}.k.codes` `l{i}.k.scales` `l{i}.k.biases` + V equivalents |
 | `Paged` | gathered contiguous codes/scales/rotations + page geometry metadata |
 | `LinearAttn` | `l{i}.conv_state` + `l{i}.delta_state` (recurrent state, whole, never truncated) |
 
 The round trip is byte-exact on codes. GDN state has no sequence axis and is
 serialized in full.
+
+#### `None` payload spill (bf16)
+
+`KvStorage::None` (the `--kv-quant none` path) does **not** hold its live K/V in
+the storage buffer — the bf16 K/V live on the parent `KvCache`
+(`decode_fp16_{k,v}`, the same buffers `exit_prefill` seeds). The spill bridge
+(`write_caches`) reads those buffers and, when present, persists them under
+`l{i}.k.bf16` / `l{i}.v.bf16` with the geometry tag `none_bf16`. On hydrate the
+reader restores the pair and re-seeds the reconstructed cache via
+`KvCache::with_decode_fp16_seed`, so an exact-hit SSD replay reads the real K/V.
+bf16 round-trips bit-for-bit, so the restored prefix equals the pre-spill value.
+
+A `None` layer with **no** bf16 pair (a never-filled cache, or a hydrated SWA
+layer whose rotating ring was never serialised) falls back to the geometry-only
+`none` tag and re-prefills its prefix on reuse — it carries no spillable payload.
+This is the distinguishing signal: presence of `decode_fp16_{k,v}` means real KV
+exists and must travel; absence means there is nothing to persist.
 
 ---
 
