@@ -163,8 +163,8 @@ fn quant_iso_v_truncate_to_keeps_first_n() {
 // All gated `#[ignore]` per Metal-context policy. Run explicitly via
 //   cargo test -p rmlx-kv-quant --lib -- --ignored quant_iso_v --test-threads=1
 //
-// The GPU mirror default is OFF (hardcoded; `RMLX_GPU_RESIDENT_ISO` removed in
-// PASS 3). The mirror tests need it ON, so each test calls
+// The GPU mirror default is OFF (hardcoded; no env-var opt-in). The mirror
+// tests need it ON, so each test calls
 // `force_gpu_resident_iso_on()` before any call into `append_gpu` —
 // `gpu_resident_iso_enabled()` latches the value on first read via OnceLock,
 // so the very first test to set it wins for the rest of the test-binary
