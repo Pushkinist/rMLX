@@ -804,6 +804,46 @@ impl<E: PromptCacheEntry> PromptCache<E> {
 }
 
 // ---------------------------------------------------------------------------
+// Consumed / ReuseKind — outcome of the shared consume engine
+// ---------------------------------------------------------------------------
+
+/// Outcome of a prompt-cache consume decision.
+///
+/// Read-only — the engine that produces this never `push`es. The arch maps each
+/// variant onto its own decode path: `Exact` skips prefill and replays the
+/// stored first token; `Reuse` restores the cloned prefix and the arch forwards
+/// the tail; `Miss` falls back to a full re-prefill. The cloned `E` carries
+/// whatever per-arch extras the entry holds (e.g. qwen3's `first_logprobs`).
+// Allowed until the `consume` engine and the migrated arches that produce and
+// match this are wired in (same change series).
+#[allow(dead_code)]
+pub(crate) enum Consumed<E> {
+    /// Full-token-equality hit: the cloned entry's prompt equals the request
+    /// prompt and it is not an SSD placeholder. Reuse the snapshot as-is.
+    Exact(E),
+    /// Prefix reuse: the cloned entry covers a leading prefix of the request
+    /// prompt; the arch re-prefills the remaining tail on top of it.
+    Reuse { entry: E, kind: ReuseKind },
+    /// No usable entry — re-prefill from scratch.
+    Miss,
+}
+
+/// How a `Consumed::Reuse` prefix relates to the request prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum ReuseKind {
+    /// Reuse the entry's full cached prefix verbatim. `prefix_len` is the
+    /// cached token length (NOT necessarily block-aligned). The arch forwards
+    /// `prompt_ids[prefix_len..]`. gemma4 B1 (SWA snapshot/restore), qwen3.5-moe
+    /// HydratedTail.
+    StrictPrefix { prefix_len: usize },
+    /// Block-aligned truncate then tail re-prefill (gemma4 only). The reuse
+    /// prefix is `effective_blocks * BLOCK_TOKENS` tokens; `prepare_reuse`
+    /// truncates the cloned KV to that boundary and asserts the invariant.
+    BlockTruncate { effective_blocks: usize },
+}
+
+// ---------------------------------------------------------------------------
 // ReusePolicy — per-arch hard runtime gate
 // ---------------------------------------------------------------------------
 
