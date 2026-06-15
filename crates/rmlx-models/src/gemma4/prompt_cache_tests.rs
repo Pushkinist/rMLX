@@ -1,5 +1,5 @@
 use super::*;
-use crate::prompt_cache::{PromptCache, FNV_OFFSET};
+use crate::prompt_cache::{PromptCache, ReuseKind, FNV_OFFSET};
 use rmlx_kv_quant::storage::KvStorage;
 use rmlx_kv_quant::KvQuant;
 
@@ -279,5 +279,68 @@ fn is_strict_prefix_of_swa_snapshot_hook() {
     assert!(
         !e.is_strict_prefix_of(&diverged),
         "divergent prompt is not a strict prefix"
+    );
+}
+
+/// `is_reusable_prefix_of` block-truncate arithmetic (no model). When the
+/// strict-prefix arm declines, the hook drops the trailing block so the
+/// re-prefilled tail is non-empty:
+///   - A 3-block-aligned prompt matching all 3 blocks → `effective_blocks == 2`
+///     (block_count - 1), since `block_count * 256 >= len`.
+///   - A single-block prompt matching its one block → `effective_blocks == 0`
+///     → `None` (no tail blocks left).
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+fn is_reusable_prefix_of_block_truncate_arithmetic() {
+    // Block-aligned 3-block prompt. A fresh (offset 0) flat cache is trimmable,
+    // so `can_truncate_to_block` permits the block-truncate path. The cached
+    // entry and the request are the SAME block-aligned prompt, so
+    // `is_strict_prefix_of` is false (equal length, not a strict extension) and
+    // the block-truncate arm runs.
+    let block_count = 3usize;
+    let ids: Vec<u32> = (0..(block_count * BLOCK_TOKENS) as u32).collect();
+    let kv = vec![KvCache::with_quant_max_seq_window(
+        KvQuant::K8V8,
+        8192,
+        None,
+    )];
+    let e = entry_with(kv, ids.clone());
+    assert!(
+        !e.is_strict_prefix_of(&ids),
+        "equal-length prompt must not take the strict-prefix arm — exercise block-truncate"
+    );
+
+    // matched_blocks == block_count == prompt_blocks; effective_blocks drops the
+    // trailing block (block_count * 256 >= len) → block_count - 1.
+    match e.is_reusable_prefix_of(&ids, false, block_count) {
+        Some(ReuseKind::BlockTruncate { effective_blocks }) => {
+            assert_eq!(
+                effective_blocks,
+                block_count - 1,
+                "block-aligned full match must drop one trailing block"
+            );
+        }
+        other => panic!("expected BlockTruncate, got {other:?}"),
+    }
+
+    // Single-block prompt matching its one block: effective_blocks saturates to
+    // 0 → None (no tail blocks left → Miss).
+    let single: Vec<u32> = (0..BLOCK_TOKENS as u32).collect();
+    let kv1 = vec![KvCache::with_quant_max_seq_window(
+        KvQuant::K8V8,
+        8192,
+        None,
+    )];
+    let e1 = entry_with(kv1, single.clone());
+    assert!(
+        !e1.is_strict_prefix_of(&single),
+        "equal-length single-block prompt must not take the strict-prefix arm"
+    );
+    assert!(
+        e1.is_reusable_prefix_of(&single, false, 1).is_none(),
+        "all-blocks-consumed (effective_blocks == 0) must decline → None → Miss"
     );
 }
