@@ -321,6 +321,55 @@ pub(crate) trait PromptCacheEntry: Sized {
                 .map(LinearAttnCache::approx_bytes)
                 .sum::<u64>()
     }
+
+    /// True unless a hydrated entry is missing K/V payload for a layer this
+    /// architecture attends to.
+    ///
+    /// Default `true`: a fully RAM-resident snapshot (or a pure-attention arch
+    /// whose SSD blocks restore every layer) is always complete. gemma4 SWA
+    /// overrides this — its rotating-ring layers are not serialised to the SSD
+    /// tier, so a hydrated entry can come back with a payload-less attended
+    /// layer; the consume engine excludes such an entry from prefix reuse.
+    // Allowed until the `consume` engine that calls these hooks is wired in.
+    #[allow(dead_code)]
+    fn is_hydrate_complete(&self) -> bool {
+        true
+    }
+
+    /// The reusable-prefix policy seam: decide whether (and how) the entry's
+    /// cached prefix may be reused for `prompt_ids`.
+    ///
+    /// `matched_blocks` is `find_best_prefix`'s block_count for this entry.
+    /// `is_ssd_hydrated` mirrors [`is_ssd_hydrated`]. Each arch keeps its own
+    /// predicate (they differ deliberately); the engine does not impose one.
+    ///
+    /// Default `None`: no partial reuse (full-token-equality Exact-only archs,
+    /// e.g. qwen3 dense and every ExactOnly retrofit).
+    ///
+    /// [`is_ssd_hydrated`]: PromptCacheEntry::is_ssd_hydrated
+    #[allow(dead_code)]
+    fn is_reusable_prefix_of(
+        &self,
+        _prompt_ids: &[u32],
+        _is_ssd_hydrated: bool,
+        _matched_blocks: usize,
+    ) -> Option<ReuseKind> {
+        None
+    }
+
+    /// Clone the entry for reuse, applying any truncation the `kind` requires.
+    ///
+    /// Atomic: on `Err` the engine yields `Miss` and the source slot is left
+    /// untouched. Default body is a plain [`deep_clone`] (correct for
+    /// `StrictPrefix`, where the whole cached prefix is reused verbatim). gemma4
+    /// overrides `BlockTruncate` to deep-clone then trim the KV to the block
+    /// boundary.
+    ///
+    /// [`deep_clone`]: PromptCacheEntry::deep_clone
+    #[allow(dead_code)]
+    fn prepare_reuse(&self, _kind: ReuseKind) -> Result<Self> {
+        self.deep_clone()
+    }
 }
 
 // ---------------------------------------------------------------------------
