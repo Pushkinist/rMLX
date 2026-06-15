@@ -482,8 +482,8 @@ impl QuantIsoV3 {
         }
 
         // SAFETY: `gpu_resident_iso_enabled()` is hardcoded `false` in
-        // production (PASS 3); in test mode it uses OnceLock latching on first
-        // read. Either way the gate state cannot toggle between prev_seq capture
+        // production; in test mode it uses OnceLock latching on first read.
+        // Either way the gate state cannot toggle between prev_seq capture
         // (above) and this check, so prev_seq is safe to use unconditionally.
         // ── 4. GPU mirror write (gated). ───────────────────────────────────
         if !crate::gpu_resident_iso_enabled() {

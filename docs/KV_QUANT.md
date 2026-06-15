@@ -896,7 +896,7 @@ helper when adding any future sub-8-bit-K codec.
 **Paged routing**: `PagedKStorage` is q8-only; adding a TurboQuant-K paged
 variant requires a separate page allocator and gather kernel.
 `KvStorage::new(KvQuant::TurboSym4, max_seq)` therefore returns the
-**non-paged** `TurboSym4` storage even when `RMLX_PAGED_KV=1`.
+**non-paged** `TurboSym4` storage even when `--paged-kv` is set.
 
 **Tail/head adaptive fallback** — `kv_quant_for_layer` falls back to `K8V8`
 (8-bit K) on the head / tail layers. `TurboSym4` is **not** added to the
@@ -941,7 +941,7 @@ are rejected at resolve-time by `validate_resolved` with the dedicated
 `ResolveError::QwenMoeTurboKRejected { variant: "tsym3" }`.
 
 **Paged routing**: `KvStorage::new(KvQuant::TurboSym3, max_seq)` returns
-non-paged `TurboSym3` storage even when `RMLX_PAGED_KV=1`.
+non-paged `TurboSym3` storage even when `--paged-kv` is set.
 
 **Tail/head adaptive fallback** — `kv_quant_for_layer` falls back to `K8V8`
 on head/tail layers. `TurboSym3` is not added to the tail/head candidate set.
@@ -992,7 +992,7 @@ sub-8-bit-K codec.
 
 **Paged routing**: there is no `PagedPlanarKStorage`.
 `KvStorage::new(KvQuant::PlanarK, max_seq)` returns the non-paged `PlanarK`
-storage even when `RMLX_PAGED_KV=1`.
+storage even when `--paged-kv` is set.
 
 **Tail/head adaptive fallback** — `kv_quant_for_layer` falls back to `K8V8`
 on the head / tail layers. `PlanarK` is **not** added to the tail/head
@@ -1052,7 +1052,7 @@ for standard affine + rotation codecs.
 
 ### `KvStorage::Paged` — vLLM-style block-table KV
 
-PagedAttention allocation (opt-in via `RMLX_PAGED_KV=1`; default OFF).
+PagedAttention allocation (opt-in via `--paged-kv` flag; default OFF).
 
 Instead of a single contiguous buffer grown in `KV_PAGE_SIZE=256` token
 increments (contiguous-growth path), `Paged` maintains:
@@ -1438,7 +1438,7 @@ a different measurement condition; rMLX LCG fixture measures mean ≈ 0.994
 | SSD tier integration | Done |
 | MSL kernel hook (`isoquant_msl.rs`) | Done |
 | **MSL encode dispatch + on-demand `Array::from_bytes` dequant** | **Done — `update_iso3` / `update_iso3_sym` / `update_iso_k_only_3` route encode and dequant through `iso_quantize_v3_gpu` + `iso_dequantize_v3_gpu` when `device == Device::Gpu`; `QuantIsoV3::dequant_gpu` / `QuantIsoK3::dequant_gpu` rebuild GPU Arrays directly from CPU blocks via `Array::from_bytes` (no intermediate `Vec<f32>`)** |
-| **GPU-resident `QuantIsoV3` mirror** | **Landed; default OFF behind `RMLX_GPU_RESIDENT_ISO=1` opt-in. `QuantIsoV3::append_gpu` retains the iso3 encode outputs in a per-struct pre-allocated buffer (codes / scales / per-group norms) via `slice_update`; `dequant_gpu` consumes the mirror directly when populated. CPU blocks are still populated for SSD spill (`.kvb` on-disk format unchanged). SSD hydrate leaves the mirror missing; the next `dequant_gpu` falls back to the `Array::from_bytes` path. See `docs/PERF_BASELINE.md` for the bench rationale.** |
+| **GPU-resident `QuantIsoV3` mirror** | **Landed; hardcoded OFF (bench decision — bench showed no measurable benefit on the warm-TTFT path where the bf16 seed absorbs the dequant). `QuantIsoV3::append_gpu` retains the mirror infrastructure for future seedless workloads but the gate `gpu_resident_iso_enabled()` returns `false` unconditionally in production. CPU blocks are still populated for SSD spill (`.kvb` on-disk format unchanged). See `docs/PERF_BASELINE.md` for the bench rationale.** |
 | `--kv-quant iso3` CLI flag | Done |
 
 The MSL kernel ships as a future-reference hook. The GPU dispatch is on:
@@ -2643,17 +2643,17 @@ Invariant tests:
   — seedless PlanarQuant-packed buffer through `sparse_attn_dispatch` increments the counter by exactly 2 and cosine ≥ 0.99 vs dense `planar_flash_decode_sdpa`.
 
 **GPU-resident iso/rotor V mirror — dormant by design:** the GPU-resident
-iso/rotor V mirror (`RMLX_GPU_RESIDENT_ISO`) is dormant on the normal decode
-path for the same structural reason: every iso and rotor update path
-short-circuits at `decode_fp16_k.is_some()` (warm-TTFT bf16 seed) before
-reaching the GPU-resident mirror branch. The 7-codec phase-2 extension (iso3
-K, iso4 V/K,
+iso/rotor V mirror is hardcoded OFF on the normal decode path for the same
+structural reason: every iso and rotor update path short-circuits at
+`decode_fp16_k.is_some()` (warm-TTFT bf16 seed) before reaching the
+GPU-resident mirror branch. The 7-codec phase-2 extension (iso3 K, iso4 V/K,
 rotor3/4 V/K) was evaluated and declined. A/B bench on Bonsai 8B
 (8k prompt, `--ctk q8_g128 --ctv iso_v_3`, 3 runs per arm) showed Δ decode-TPS
-= −0.73% and Δ TTFT = −0.46% (both inside ±2σ noise). The gate remains
-opt-in (`RMLX_GPU_RESIDENT_ISO=1`) for seedless workloads only. Re-open
-condition: a production path where `decode_fp16_k.is_none()` during steady-state
-decode. Full numbers: `docs/PERF_BASELINE.md`.
+= −0.73% and Δ TTFT = −0.46% (both inside ±2σ noise). The gate
+(`gpu_resident_iso_enabled()`) is hardcoded `false` in production; it is only
+controllable in tests. Re-open condition: a production path where
+`decode_fp16_k.is_none()` during steady-state decode. Full numbers:
+`docs/PERF_BASELINE.md`.
 
 ---
 
