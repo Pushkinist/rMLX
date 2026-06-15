@@ -993,6 +993,7 @@ impl Architecture {
                 device,
                 kv_quant,
                 max_ctx_override,
+                prompt_cache_slots,
                 eos_ids,
                 step_fn,
                 constraint,
@@ -1214,8 +1215,7 @@ impl Architecture {
     /// Prompt-cache stats for the arch's shared PromptCache, when it has one.
     ///
     /// Reads the arch-specific global static that `generate_greedy` writes after
-    /// each generation call.  Returns `None` for architectures that do not yet
-    /// maintain a shared PromptCache (Laguna).
+    /// each generation call.
     pub fn cache_stats(&self) -> Option<crate::CacheStats> {
         match self {
             Architecture::Gemma4(_) => crate::gemma4::gemma4_cache_stats(),
@@ -1225,7 +1225,7 @@ impl Architecture {
             Architecture::Qwen2(_) => crate::qwen2::qwen2_cache_stats(),
             Architecture::BitNet(_) => crate::bitnet::bitnet_cache_stats(),
             Architecture::Qwen3VlMoe(_) => crate::qwen3_vl_moe::qwen3_vl_moe_cache_stats(),
-            Architecture::Laguna(_) => None,
+            Architecture::Laguna(_) => crate::laguna::laguna_cache_stats(),
         }
     }
 
@@ -1233,8 +1233,7 @@ impl Architecture {
     /// call on this architecture.
     ///
     /// Reads the arch-specific prompt-cache static that `generate_greedy` writes
-    /// via `store_kv_cache_bytes` at the end of every generate call.  Returns 0
-    /// for architectures that do not yet maintain that static (Laguna).
+    /// via `store_kv_cache_bytes` at the end of every generate call.
     pub fn kv_cache_bytes(&self) -> u64 {
         match self {
             Architecture::Gemma4(_) => crate::gemma4::gemma4_kv_cache_bytes(),
@@ -1244,7 +1243,7 @@ impl Architecture {
             Architecture::Qwen2(_) => crate::qwen2::qwen2_kv_cache_bytes(),
             Architecture::BitNet(_) => crate::bitnet::bitnet_kv_cache_bytes(),
             Architecture::Qwen3VlMoe(_) => crate::qwen3_vl_moe::qwen3_vl_moe_kv_cache_bytes(),
-            Architecture::Laguna(_) => 0,
+            Architecture::Laguna(_) => crate::laguna::laguna_kv_cache_bytes(),
         }
     }
 

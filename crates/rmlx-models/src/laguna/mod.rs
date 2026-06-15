@@ -25,6 +25,7 @@ mod layers;
 pub mod loader;
 mod model;
 mod moe;
+pub(crate) mod prompt_cache;
 #[cfg(test)]
 mod tests;
 
@@ -32,3 +33,5 @@ pub use config::{LagunaConfig, LayerKind, MlpKind};
 pub use generate::generate_greedy;
 pub use loader::load_from_path;
 pub use model::LagunaText;
+pub use prompt_cache::read_cache_stats as laguna_cache_stats;
+pub use prompt_cache::read_kv_cache_bytes as laguna_kv_cache_bytes;
