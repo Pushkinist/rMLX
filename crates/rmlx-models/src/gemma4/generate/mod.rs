@@ -157,22 +157,9 @@ pub fn generate_greedy<'a>(
     // The engine owns find → SSD-hydrate retry → quant-mismatch guard →
     // SSD-hydrated Exact exclusion → reuse-gate, and traces every degrade
     // branch; the per-arch policy tripwire lives here at the call site.
-    //
-    // The local `CacheLookup` enum is the bridge from the engine outcome to the
-    // existing decode paths below (Path A exact-hit, Path B prefix tail, Path C
-    // miss) — those paths are kept verbatim.
-    enum CacheLookup {
-        Exact {
-            kv_caches: Vec<KvCache>,
-            last_id: u32,
-            piece: String,
-        },
-        Prefix {
-            kv_caches: Vec<KvCache>,
-            prefix_len: usize,
-        },
-        Miss,
-    }
+    // The `Consumed` outcome is matched directly into the existing decode
+    // dispatch below (Path A exact-hit early-return, Path B prefix tail, Path C
+    // miss) — those decode bodies are kept verbatim.
 
     // hard runtime gate: gemma4 must use ReusePolicy::Partial so the engine's
     // reuse arm is reachable for the B1 strict-prefix + block-truncate paths.
@@ -188,18 +175,19 @@ pub fn generate_greedy<'a>(
     // without touching the cache; mirrored by the `!has_image` store gate
     // below). The token-id-keyed K/V is unsafe for image spans (the K/V depends
     // on scattered vision features, not just the token ids).
-    let lookup: CacheLookup = match PROMPT_CACHE.consume(prompt_ids, kv_quant, has_image) {
+    // `exact_hit` carries the Path-A early-return locals; `prefix_hit` carries
+    // the Path-B tail-re-prefill locals. `Consumed::Miss` leaves both `None` and
+    // falls through to Path C (full re-prefill).
+    let mut exact_hit: Option<(Vec<KvCache>, u32, String)> = None;
+    let mut prefix_hit: Option<(Vec<KvCache>, usize)> = None;
+    match PROMPT_CACHE.consume(prompt_ids, kv_quant, has_image) {
         Consumed::Exact(cloned) => {
             tracing::debug!(
                 prompt_len = prompt_ids.len(),
                 token_id = cloned.first_id,
                 "gemma4 generate_greedy: prompt cache EXACT HIT"
             );
-            CacheLookup::Exact {
-                kv_caches: cloned.kv_caches,
-                last_id: cloned.first_id,
-                piece: cloned.first_piece,
-            }
+            exact_hit = Some((cloned.kv_caches, cloned.first_id, cloned.first_piece));
         }
         // B1 SWA snapshot/restore: restore the cloned snapshot verbatim at
         // absolute position `prefix_len == cached_len` and tail-forward only
@@ -215,10 +203,7 @@ pub fn generate_greedy<'a>(
                 "gemma4 generate_greedy: prompt cache PREFIX-EXACT HIT \
                  (B1 SWA snapshot/restore — restore + tail-only re-prefill)"
             );
-            CacheLookup::Prefix {
-                kv_caches: cloned.kv_caches,
-                prefix_len,
-            }
+            prefix_hit = Some((cloned.kv_caches, prefix_len));
         }
         // Block-aligned partial hit: `prepare_reuse` already trimmed the cloned
         // KV to the block boundary; the tail re-prefills from
@@ -235,13 +220,10 @@ pub fn generate_greedy<'a>(
                 "gemma4 generate_greedy: prompt cache PREFIX HIT \
                  (block-truncate + tail re-prefill)"
             );
-            CacheLookup::Prefix {
-                kv_caches: cloned.kv_caches,
-                prefix_len,
-            }
+            prefix_hit = Some((cloned.kv_caches, prefix_len));
         }
-        Consumed::Miss => CacheLookup::Miss,
-    };
+        Consumed::Miss => {}
+    }
 
     // Derive the initial ring size and the virtual ceiling (issue #25):
     // `--max-ctx` is a ceiling the ring grows lazily up to, not an eager
@@ -256,12 +238,7 @@ pub fn generate_greedy<'a>(
     // site. GDN linear state does not exist for gemma4 (pure KV), so the
     // closure threads only `kv_caches`.
     // ------------------------------------------------------------------
-    if let CacheLookup::Exact {
-        mut kv_caches,
-        last_id,
-        piece,
-    } = lookup
-    {
+    if let Some((mut kv_caches, last_id, piece)) = exact_hit {
         step_fn(steps.push_mut(ProbeStep {
             token_id: last_id,
             piece: piece.into_boxed_str(),
@@ -386,11 +363,7 @@ pub fn generate_greedy<'a>(
     // truncated clone is already post-prefill quantized, so the tail must
     // append via decode-mode `update`, exactly like the Exact-hit decode.
     let (mut caches, prefill_ids, is_prefix): (Vec<KvCache>, &[u32], bool) =
-        if let CacheLookup::Prefix {
-            kv_caches,
-            prefix_len,
-        } = lookup
-        {
+        if let Some((kv_caches, prefix_len)) = prefix_hit {
             tracing::debug!(
                 prompt_len = prompt_ids.len(),
                 prefix_len,
@@ -399,7 +372,7 @@ pub fn generate_greedy<'a>(
             );
             (kv_caches, &prompt_ids[prefix_len..], true)
         } else {
-            // CacheLookup::Exact is handled by Path A above and returns early;
+            // The exact hit is handled by Path A above and returns early;
             // Miss falls through to a full fresh-cache prefill.
             // Allocate one KvCache per decoder layer using the selected
             // quant mode.

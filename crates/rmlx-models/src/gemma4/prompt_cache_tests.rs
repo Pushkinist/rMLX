@@ -34,7 +34,7 @@ fn entry_with_quant(
 }
 
 /// A freshly built snapshot — every cache at offset 0 — is trimmable, so
-/// `can_truncate_to_block` permits the production `CacheLookup::Prefix`
+/// `can_truncate_to_block` permits the production block-truncate prefix
 /// path. This is the cold-equal regime (cached prompt within
 /// `sliding_window`, SWA ring not wrapped).
 #[test]
@@ -282,13 +282,21 @@ fn is_strict_prefix_of_swa_snapshot_hook() {
     );
 }
 
-/// `is_reusable_prefix_of` block-truncate arithmetic (no model). When the
-/// strict-prefix arm declines, the hook drops the trailing block so the
-/// re-prefilled tail is non-empty:
-///   - A 3-block-aligned prompt matching all 3 blocks → `effective_blocks == 2`
-///     (block_count - 1), since `block_count * 256 >= len`.
-///   - A single-block prompt matching its one block → `effective_blocks == 0`
-///     → `None` (no tail blocks left).
+/// `is_reusable_prefix_of` block-truncate arithmetic (no model). The hook is
+/// CONDITIONAL on whether the matched blocks cover the whole block-aligned
+/// prompt:
+///   - Block-aligned full match (`matched * 256 >= len`): drop the trailing
+///     block so the re-prefilled tail is non-empty.
+///       * A 3-block-aligned prompt matching all 3 blocks → `effective_blocks
+///         == 2` (matched_blocks - 1).
+///       * A single-block prompt matching its one block → `effective_blocks
+///         == 0` → `None` (no tail blocks left).
+///   - Genuine partial divergence (`matched * 256 < len`): reuse ALL matched
+///     blocks; the tail past the last block boundary is already non-empty.
+///       * A 512-token prompt diverging inside block 2 with `matched_blocks ==
+///         1` → `BlockTruncate { effective_blocks: 1 }` (NOT `None`). The
+///         pre-restoration unconditional `matched.min(prompt_blocks) - 1` would
+///         have dropped this to `effective_blocks == 0` → `None` (a lost hit).
 #[test]
 #[allow(
     clippy::indexing_slicing,
@@ -343,12 +351,44 @@ fn is_reusable_prefix_of_block_truncate_arithmetic() {
         e1.is_reusable_prefix_of(&single, false, 1).is_none(),
         "all-blocks-consumed (effective_blocks == 0) must decline → None → Miss"
     );
+
+    // Partial-divergence branch: a 512-token (2-block) request that shares only
+    // its first FULL block with the cached entry (`matched_blocks == 1`) and
+    // diverges inside block 2. `matched_blocks * 256 = 256 < 512`, so ALL
+    // matched blocks are reused → `effective_blocks == 1`. The cached entry is a
+    // distinct 512-token prompt (equal length, differing content) so the
+    // strict-prefix arm declines and the block-truncate arm runs. A fresh
+    // (offset 0) flat cache is trimmable, so `can_truncate_to_block(1)` holds.
+    let request: Vec<u32> = (0..(2 * BLOCK_TOKENS) as u32).collect();
+    let cached_ids: Vec<u32> = (1000..1000 + (2 * BLOCK_TOKENS) as u32).collect();
+    let kv2 = vec![KvCache::with_quant_max_seq_window(
+        KvQuant::K8V8,
+        8192,
+        None,
+    )];
+    let e2 = entry_with(kv2, cached_ids);
+    assert!(
+        !e2.is_strict_prefix_of(&request),
+        "differing same-length cached prompt must not take the strict-prefix arm"
+    );
+    match e2.is_reusable_prefix_of(&request, false, 1) {
+        Some(ReuseKind::BlockTruncate { effective_blocks }) => {
+            assert_eq!(
+                effective_blocks, 1,
+                "partial divergence (matched * 256 < len) must reuse ALL matched blocks"
+            );
+        }
+        other => panic!(
+            "partial divergence with 1 shared block must be BlockTruncate{{1}}, \
+             not a Miss; got {other:?}"
+        ),
+    }
 }
 
 /// Phase B consume-engine migration golden (gemma4, e2b — model-gated).
 ///
 /// Pins that routing gemma4 through the shared `consume()` engine is
-/// behavior-identical to the pre-migration inline `CacheLookup` across all
+/// behavior-identical to the pre-migration inline dispatch across all
 /// three reachable gemma4 paths. At temp 0, every reuse path must decode
 /// token-identically to a cold (Miss) baseline of the SAME prompt:
 ///   (a) SWA degrade-to-reprefill: a 336-token (non-block-aligned) prompt whose
@@ -360,9 +400,10 @@ fn is_reusable_prefix_of_block_truncate_arithmetic() {
 ///           extends to 768 tokens → `Reuse{StrictPrefix}` → restore + tail →
 ///           WARM == COLD(768);
 ///         - block-truncate arm: a 512-token cached prompt and a same-length
-///           request that diverges in the second block (1 shared block) →
-///           `Reuse{BlockTruncate}` → trim + tail → WARM == COLD(request).
-///   (c) #87 exact-hit: a block-aligned (256-token) SSD-hydrated entry whose
+///           request that diverges in the second block (1 shared full block,
+///           `matched * 256 < len`) → `Reuse{BlockTruncate{1}}` → trim + tail →
+///           WARM == COLD(request).
+///   (c) hydrated-exact-length exclusion: a block-aligned (256-token) SSD-hydrated entry whose
 ///       prefix length equals the full prompt (placeholder first_id 0) → the
 ///       `!is_ssd_hydrated` Exact exclusion drops it to Miss → recompute →
 ///       WARM == COLD, never the placeholder 0.
@@ -389,7 +430,7 @@ fn is_reusable_prefix_of_block_truncate_arithmetic() {
 )]
 #[allow(
     clippy::too_many_lines,
-    reason = "test-only: a single golden covering the three reachable gemma4 reuse paths (SWA-degrade / RAM strict-prefix + block-truncate / #87 exact-hit) reads clearest as one sequential fixture"
+    reason = "test-only: a single golden covering the three reachable gemma4 reuse paths (SWA-degrade / RAM strict-prefix + block-truncate / hydrated-exact-length exclusion) reads clearest as one sequential fixture"
 )]
 fn gemma4_consume_engine_migration_golden() {
     use crate::gemma4::{generate_greedy, load_from_path};
@@ -618,7 +659,7 @@ fn gemma4_consume_engine_migration_golden() {
         "(b) RAM block-truncate reuse must equal the cold baseline for the divergent prompt"
     );
 
-    // ── (c) #87 exact-hit: block-aligned hydrated entry == full prompt ──────
+    // ── (c) hydrated-exact-length exclusion: block-aligned hydrated entry == full prompt ──
     // A 256-token block-aligned prompt; the hydrated entry's prefix length
     // equals the full prompt (no tail, placeholder first_id 0). The Exact arm's
     // `!is_ssd_hydrated` guard drops it to Miss → recompute → WARM == COLD.
@@ -634,7 +675,7 @@ fn gemma4_consume_engine_migration_golden() {
     let full_kv = read_back_kv(&p256);
     push_hydrated(&p256, full_kv); // re-key as a hydrated full-length entry
     let warm_exact = run(&p256);
-    println!("(c) #87 exact-hit: cold={cold_256:?} warm={warm_exact:?}");
+    println!("(c) hydrated-exact-length exclusion: cold={cold_256:?} warm={warm_exact:?}");
     assert_ne!(
         warm_exact.first().copied(),
         Some(0u32),
@@ -642,11 +683,11 @@ fn gemma4_consume_engine_migration_golden() {
     );
     assert_eq!(
         warm_exact, cold_256,
-        "(c) #87 hydrated exact-length recompute must equal the cold baseline"
+        "(c) block-aligned hydrated exact-length recompute must equal the cold baseline"
     );
 
     println!(
         "PASS: gemma4 consume-engine migration golden — SWA-degrade / strict-prefix / \
-         block-truncate / #87 exact-hit all match their cold baselines"
+         block-truncate / hydrated-exact-length exclusion all match their cold baselines"
     );
 }
