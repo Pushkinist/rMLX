@@ -131,6 +131,16 @@ pub(crate) struct Qwen3Entry {
     /// Runtime `KvQuant` discriminant in effect when this snapshot was
     /// written (Plan §D8 / Task 11.5). See `Gemma4Entry::kv_quant`.
     pub(crate) kv_quant: Option<KvQuant>,
+    /// True when this entry was reconstructed from the SSD tier and therefore
+    /// stores only the block-aligned prefix KV — `first_id` / `first_piece` are
+    /// placeholders, not a real decode token. The generate loop excludes such
+    /// an entry from the Exact fast path so it falls through to a full
+    /// re-prefill that recomputes the real first token.
+    ///
+    /// MUST be set only in `SsdHydrate::hydrate`; never by the RAM-cache push
+    /// path. Do NOT use the `first_id == 0` heuristic as a substitute —
+    /// `<bos>` token id is 0 for some models.
+    pub(crate) is_ssd_hydrated: bool,
 }
 
 impl PromptCacheEntry for Qwen3Entry {
@@ -152,6 +162,7 @@ impl PromptCacheEntry for Qwen3Entry {
             first_piece: self.first_piece.clone(),
             first_logprobs: self.first_logprobs.clone(),
             kv_quant: self.kv_quant,
+            is_ssd_hydrated: self.is_ssd_hydrated,
         })
     }
 
@@ -165,6 +176,10 @@ impl PromptCacheEntry for Qwen3Entry {
 
     fn kv_quant(&self) -> Option<KvQuant> {
         self.kv_quant
+    }
+
+    fn is_ssd_hydrated(&self) -> bool {
+        self.is_ssd_hydrated
     }
 
     // Pure-attention dense arch: no GDN linear state.
@@ -206,7 +221,9 @@ fn qwen3_active_layout_key() -> u64 {
 /// GDN linear state — `lin_caches` from the block is discarded). The matched
 /// block-aligned prefix token IDs become the entry's `prompt_token_ids`; block
 /// hashes are recomputed and the runtime `kv_quant` recorded. `first_id` /
-/// `first_piece` are sentinels (the SSD block stores no first decode token).
+/// `first_piece` are sentinels (the SSD block stores no first decode token), so
+/// the entry is flagged `is_ssd_hydrated = true`; the generate loop excludes it
+/// from the Exact fast path and recomputes the real first token via re-prefill.
 impl SsdHydrate<Qwen3Entry> for SsdHydrator {
     fn hydrate(&self, prompt_ids: &[u32]) -> Result<Option<Qwen3Entry>> {
         let Some((block, block_hashes)) = self.lookup_seeded(prompt_ids)? else {
@@ -226,6 +243,9 @@ impl SsdHydrate<Qwen3Entry> for SsdHydrator {
             // SSD block stores no first decode token, so no logprob to replay.
             first_logprobs: None,
             kv_quant: Some(self.kv_quant()),
+            // Block-aligned prefix only; the placeholder first_id must not be
+            // replayed — the generate loop re-prefills to recompute it.
+            is_ssd_hydrated: true,
         }))
     }
 }
@@ -1896,8 +1916,20 @@ pub fn generate_greedy<'a>(
             None => None,
         };
         match safe_match {
+            // Exact match: full token-id equality AND a real first decode token.
+            //
+            // A SSD-hydrated entry whose block-aligned prefix length happens to
+            // equal `prompt_ids.len()` (prompt is an exact multiple of
+            // BLOCK_TOKENS → no tail → restored prefix == full prompt) must NOT
+            // be served here: its `first_id` is the placeholder 0 set in
+            // `SsdHydrate::hydrate`, not a real decode token. Replaying it emits
+            // a sentinel first token and seeds decode with garbage. The
+            // `!is_ssd_hydrated` guard drops it through to `Miss` → a full
+            // re-prefill re-derives the real first token. Correctness over the
+            // micro-opt (mirrors the qwen3_5_moe Exact arm guard).
             Some((slot_idx, _block_count))
-                if cache.slots[slot_idx].entry.prompt_token_ids() == prompt_ids =>
+                if !cache.slots[slot_idx].entry.is_ssd_hydrated()
+                    && cache.slots[slot_idx].entry.prompt_token_ids() == prompt_ids =>
             {
                 let slot = &cache.slots[slot_idx].entry;
                 match slot.deep_clone() {
@@ -2182,6 +2214,7 @@ pub fn generate_greedy<'a>(
                             .unwrap_or_else(|| format!("<unk:{last_id}>")),
                         first_logprobs,
                         kv_quant: Some(kv_quant),
+                        is_ssd_hydrated: false,
                     };
                     QWEN3_PROMPT_CACHE.with_inner_mut(|guard| {
                         if let Some(cache) = guard.as_mut() {

@@ -225,8 +225,18 @@ pub fn generate_greedy<'a>(
                 // tail-reprefill Prefix path, which produced wrong output here too
                 // (22 -> 0 tokens for an identical re-request). Full-equality
                 // reuse sidesteps truncation entirely (pre-C1 behaviour).
+                //
+                // A SSD-hydrated entry whose block-aligned prefix length equals
+                // `prompt_ids.len()` (prompt is an exact multiple of
+                // BLOCK_TOKENS → no tail) must NOT be served here: its
+                // `first_id` is the placeholder 0 set in `SsdHydrate::hydrate`,
+                // not a real decode token. The `!is_ssd_hydrated` guard drops it
+                // through to the block-partial / Miss arms, which re-prefill and
+                // recompute the real first token. Correctness over the micro-opt
+                // (mirrors the qwen3 / qwen3_5_moe Exact arm guards).
                 Some((slot_idx, _block_count))
-                    if cache.slots[slot_idx].entry.prompt_token_ids() == prompt_ids =>
+                    if !cache.slots[slot_idx].entry.is_ssd_hydrated()
+                        && cache.slots[slot_idx].entry.prompt_token_ids() == prompt_ids =>
                 {
                     let slot = &cache.slots[slot_idx].entry;
                     match slot.deep_clone() {
@@ -780,6 +790,7 @@ pub fn generate_greedy<'a>(
                                 first_id: last_id,
                                 first_piece: piece.clone(),
                                 kv_quant: Some(kv_quant),
+                                is_ssd_hydrated: false,
                             });
                             tracing::debug!(
                                 prompt_len = prompt_ids.len(),

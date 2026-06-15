@@ -11,6 +11,7 @@ fn entry_with(kv_caches: Vec<KvCache>, ids: Vec<u32>) -> Gemma4Entry {
         first_id: 0,
         first_piece: String::new(),
         kv_quant: Some(KvQuant::K8V8),
+        is_ssd_hydrated: false,
     }
 }
 
@@ -27,6 +28,7 @@ fn entry_with_quant(
         first_id: 0,
         first_piece: String::new(),
         kv_quant,
+        is_ssd_hydrated: false,
     }
 }
 

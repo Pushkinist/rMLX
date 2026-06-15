@@ -38,6 +38,7 @@ struct TestEntry {
     ids: Vec<u32>,
     hashes: Vec<u64>,
     truncated_to: std::cell::Cell<Option<usize>>,
+    is_ssd_hydrated: bool,
 }
 
 impl TestEntry {
@@ -47,6 +48,7 @@ impl TestEntry {
             ids,
             hashes,
             truncated_to: std::cell::Cell::new(None),
+            is_ssd_hydrated: false,
         }
     }
 
@@ -60,7 +62,15 @@ impl TestEntry {
             ids,
             hashes,
             truncated_to: std::cell::Cell::new(None),
+            is_ssd_hydrated: false,
         }
+    }
+
+    /// Mark this entry as reconstructed from the SSD tier (placeholder
+    /// `first_id`). The Exact fast path must exclude it.
+    fn ssd_hydrated(mut self) -> Self {
+        self.is_ssd_hydrated = true;
+        self
     }
 }
 
@@ -78,6 +88,7 @@ impl PromptCacheEntry for TestEntry {
             ids: self.ids.clone(),
             hashes: self.hashes.clone(),
             truncated_to: std::cell::Cell::new(self.truncated_to.get()),
+            is_ssd_hydrated: self.is_ssd_hydrated,
         })
     }
 
@@ -96,6 +107,10 @@ impl PromptCacheEntry for TestEntry {
 
     fn kv_quant(&self) -> Option<KvQuant> {
         None
+    }
+
+    fn is_ssd_hydrated(&self) -> bool {
+        self.is_ssd_hydrated
     }
 
     fn lin_caches(&self) -> &[LinearAttnCache] {
@@ -408,6 +423,76 @@ fn hit_miss_counters_three_requests() {
     assert_eq!(
         stats.bytes, expected_bytes,
         "bytes should match kv_bytes() of the single slot"
+    );
+}
+
+/// `is_ssd_hydrated()` defaults to `false` for a normal RAM-cached entry and
+/// flips to `true` once an entry is marked hydrated.
+#[test]
+fn is_ssd_hydrated_defaults_false() {
+    let ram = TestEntry::new(make_ids(BLOCK_TOKENS));
+    assert!(
+        !ram.is_ssd_hydrated(),
+        "a normal RAM-cached entry must report is_ssd_hydrated() == false"
+    );
+    let hydrated = TestEntry::new(make_ids(BLOCK_TOKENS)).ssd_hydrated();
+    assert!(
+        hydrated.is_ssd_hydrated(),
+        "an SSD-hydrated entry must report is_ssd_hydrated() == true"
+    );
+}
+
+/// Pins the exact-hit selection predicate the per-arch generate loops evaluate:
+/// an Exact serve requires `!entry.is_ssd_hydrated() && entry.prompt_token_ids()
+/// == prompt`. A normal RAM entry whose ids equal the prompt is served (replay
+/// the stored real first token); an SSD-hydrated entry with the SAME block-
+/// aligned ids must NOT be served as Exact — its `first_id` is the placeholder 0
+/// and replaying it poisons generation. Excluding it forces a fall-through to a
+/// full re-prefill that recomputes the real first token.
+///
+/// This is the codec-agnostic core of the SSD exact-hit sentinel fix; it runs in
+/// the default gate (no model) by checking the predicate against `find_best_prefix`
+/// hits for both a RAM-cached and a hydrated full-prompt entry.
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "find_best_prefix returns Some by construction (a block-aligned full-prompt entry was just pushed); the returned slot index is a valid `slots` index"
+)]
+fn ssd_hydrated_entry_excluded_from_exact_serve() {
+    // Block-aligned full prompt (no tail) — the SSD exact-hit reproduction shape
+    // where the restored prefix equals the whole prompt.
+    let prompt: Vec<u32> = make_ids(2 * BLOCK_TOKENS);
+
+    // The decision the generate loop makes on a matched slot.
+    let served_as_exact = |cache: &mut PromptCache<TestEntry>, prompt: &[u32]| -> bool {
+        let Some((slot_idx, _)) = cache.find_best_prefix(prompt, FNV_OFFSET) else {
+            return false;
+        };
+        let entry = &cache.slots[slot_idx].entry;
+        !entry.is_ssd_hydrated() && entry.prompt_token_ids() == prompt
+    };
+
+    // RAM-cached entry with the same ids → SERVED as Exact (real first token).
+    let mut ram_cache: PromptCache<TestEntry> = PromptCache::new(4);
+    ram_cache.push(TestEntry::new(prompt.clone()));
+    assert!(
+        served_as_exact(&mut ram_cache, &prompt),
+        "a normal RAM-cached full-prompt entry must be served as Exact"
+    );
+
+    // SSD-hydrated entry with the same ids → NOT served as Exact (falls through
+    // to re-prefill so the placeholder first_id is never replayed).
+    let mut ssd_cache: PromptCache<TestEntry> = PromptCache::new(4);
+    ssd_cache.push(TestEntry::new(prompt.clone()).ssd_hydrated());
+    // Sanity: the block-hash match still fires (only the exact-serve gate differs).
+    assert!(
+        ssd_cache.find_best_prefix(&prompt, FNV_OFFSET).is_some(),
+        "a hydrated full-prompt entry must still produce a block-hash match"
+    );
+    assert!(
+        !served_as_exact(&mut ssd_cache, &prompt),
+        "an SSD-hydrated full-prompt entry must NOT be served as Exact — \
+         replaying its placeholder first_id poisons generation"
     );
 }
 
@@ -1269,6 +1354,7 @@ impl SsdHydrate<TestEntry> for MockHydrateSalted {
             ids: self.ids.clone(),
             hashes,
             truncated_to: std::cell::Cell::new(None),
+            is_ssd_hydrated: true,
         }))
     }
 }
@@ -1288,6 +1374,7 @@ impl SsdHydrate<TestEntry> for MockHydrateUnsalted {
             ids: self.ids.clone(),
             hashes,
             truncated_to: std::cell::Cell::new(None),
+            is_ssd_hydrated: true,
         }))
     }
 }
