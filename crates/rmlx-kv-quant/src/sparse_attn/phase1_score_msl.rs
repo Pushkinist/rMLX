@@ -207,7 +207,10 @@ fn build_kernel_source() -> String {
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint t = tile_start; t < tile_end; t++) {{
-        uint kv_tok          = (b * kv_h + kv_h_idx) * kv_seq + t;
+        // K packing is SEQUENCE-major (`[B, S, kv_h, D]`): per token all heads
+        // are contiguous, matching QuantPlanarK's chunk-append layout. A
+        // head-major base would scramble heads↔seq after a multi-token append.
+        uint kv_tok          = (b * kv_seq + t) * kv_h + kv_h_idx;
         uint codes_tok_off   = kv_tok * codes_words_per_tok;
         uint scales_tok_off  = kv_tok * scales_pairs_per_tok;
         uint rot_tok_off     = kv_tok * rot_words_per_tok;

@@ -24,6 +24,7 @@ use crate::planarquant_msl::{planar_dequantize_v4_gpu, planar_quantize_v4_gpu};
 use crate::planarquant::{planar_dequantize, planar_quantize, PlanarBlocks};
 use crate::turboquant::GROUP_SIZE;
 
+use super::seq_layout::{transpose_heads_seq, transpose_seq_heads};
 use super::KV_PAGE_SIZE;
 
 // ── PlanarQuant K storage ─────────────────────────────────────────────────────
@@ -261,8 +262,31 @@ impl QuantPlanarK {
             let sp = self.gpu_scales_per_step;
             let rw = self.gpu_rotations_words_per_step;
 
-            // Shared kernel (axis-agnostic — see Step 0 decision).
-            let (new_codes, new_scales, new_rotations) = planar_quantize_v4_gpu(k_arr, device)?;
+            // Reorder the chunk to sequence-major `[B, new_seq, kv_h, D]` before
+            // quantizing. The flat GPU buffer accumulates chunks back-to-back at
+            // `prev_seq * words_per_seq`, where `words_per_seq` counts ONE token
+            // across all heads, so the active prefix is sequence-major
+            // (`[B, S, kv_h, D]`): for each token, all heads are contiguous.
+            // The incoming chunk is head-major (`[B, kv_h, new_seq, D]`);
+            // transposing heads↔seq makes the stored layout self-consistent
+            // across any number of appends and any `kv_h`. For a single token
+            // (`new_seq == 1`) the transpose is the identity, so the decode hot
+            // path is byte-unchanged; for a single chunk (`prev_seq == 0`) the
+            // dequant transpose is its inverse, so the cold-prefill round-trip
+            // is exact. PlanarQuant is layout-agnostic (it processes the flat
+            // element stream group-by-group and `D % GROUP_SIZE == 0`, so no
+            // group spans a (head, token) boundary), so the per-group scales are
+            // identical to the head-major grouping — the reorder is bit-exact,
+            // not just within-noise.
+            //
+            // `transpose` yields a strided view; the PlanarQuant MSL kernel reads
+            // its input by raw linear offset (it ignores MLX lazy-transpose
+            // strides), so materialize the heads↔seq permutation into a row-major
+            // buffer here — otherwise the kernel would read the original
+            // head-major bytes and scramble the stored codes.
+            let k_seq_major = k_arr.transpose(&[0, 2, 1, 3], device)?.contiguous(device)?;
+            let (new_codes, new_scales, new_rotations) =
+                planar_quantize_v4_gpu(&k_seq_major, device)?;
 
             let codes_buf = self.gpu_codes_buf.take().unwrap();
             let scales_buf = self.gpu_scales_buf.take().unwrap();
@@ -290,8 +314,20 @@ impl QuantPlanarK {
                 device,
             )?);
         } else {
-            // CPU path: scalar Rust PlanarQuant (axis-agnostic — same function).
-            let block = planar_quantize(f32_data, GROUP_SIZE, 4, new_shape)?;
+            // CPU mirror of the GPU path: store the chunk sequence-major so the
+            // accumulated blocks share one layout with the GPU buffer (the
+            // spill/hydrate round-trip moves codes between the two). `f32_data`
+            // arrives head-major (`[B, kv_h, new_seq, D]`); reorder it to
+            // `[B, new_seq, kv_h, D]` before quantizing, then record the chunk
+            // shape as `[B, new_seq, kv_h, D]` so `planar_quantize`'s flat
+            // grouping matches the reordered stream.
+            let b = new_shape[0] as usize;
+            let kv_h = new_shape[1] as usize;
+            let new_seq = new_shape[2] as usize;
+            let d = new_shape[3] as usize;
+            let seq_major = transpose_heads_seq(f32_data, b, kv_h, new_seq, d);
+            let seq_major_shape = [new_shape[0], new_shape[2], new_shape[1], new_shape[3]];
+            let block = planar_quantize(&seq_major, GROUP_SIZE, 4, &seq_major_shape)?;
             self.blocks.push(block);
         }
         Ok(())
@@ -326,8 +362,25 @@ impl QuantPlanarK {
                     &[1],
                     device,
                 )?;
-                let out =
-                    planar_dequantize_v4_gpu(&codes, &scales, &rotations, &self.shape, device)?;
+                // The flat buffer is sequence-major (see `append`): the active
+                // prefix lays out as `[B, S, kv_h, D]`. Dequant into that shape,
+                // then transpose heads↔seq back to the logical `[B, kv_h, S, D]`
+                // callers expect. For a single-chunk cache this transpose is the
+                // inverse of the append-side transpose, so the round-trip is
+                // exact. `transpose` alone yields a strided view; the raw
+                // byte-readers (SSD spill / hydrate) need a row-major
+                // `[B, kv_h, S, D]` buffer, so force contiguity. This is the
+                // post-hydrate dequant path, off the steady-state decode hot
+                // path, so the copy is acceptable.
+                let seq_major_shape = [self.shape[0], s, self.shape[1], self.shape[3]];
+                let out = planar_dequantize_v4_gpu(
+                    &codes,
+                    &scales,
+                    &rotations,
+                    &seq_major_shape,
+                    device,
+                )?;
+                let out = out.transpose(&[0, 2, 1, 3], device)?.contiguous(device)?;
                 let out = if out_dtype == Dtype::F32 {
                     out
                 } else {
@@ -337,19 +390,32 @@ impl QuantPlanarK {
             }
             return Ok((Vec::new(), None));
         }
-        // CPU path.
+        // CPU path: blocks are sequence-major (`[B, S, kv_h, D]`, see `append`).
+        // The caller reshapes the returned flat vector to the logical
+        // `[B, kv_h, S, D]`, so reorder heads↔seq back to head-major first.
         let total: usize = self.shape.iter().map(|&d| d as usize).product();
         let mut out = Vec::with_capacity(total);
         for block in &self.blocks {
             let slice = planar_dequantize(block)?;
             out.extend_from_slice(&slice);
         }
-        Ok((out, None))
+        let b = self.shape[0] as usize;
+        let kv_h = self.shape[1] as usize;
+        let s = self.shape[2] as usize;
+        let d = self.shape[3] as usize;
+        Ok((transpose_seq_heads(&out, b, s, kv_h, d), None))
     }
 
     /// Return the GPU-resident packed K buffers sliced to the accumulated
     /// `S` tokens, **without dequantizing**.  This is the input contract for
-    /// the fused-QK MSL kernel.
+    /// the fused-QK / flash-decode MSL kernels.
+    ///
+    /// The packed prefix is **sequence-major** (`[B, S, kv_h, D]` element
+    /// order — see `append`): per token, all heads are contiguous. The fused-QK
+    /// / flash-decode / sparse-attn phase-1 kernels index it with the
+    /// sequence-major token base `((b * S + s) * kv_h + h)`, NOT the head-major
+    /// `((b * kv_h + h) * S + s)` base. Any new consumer must honour the same
+    /// layout.
     ///
     /// Returns `Ok(None)` when GPU buffers are not present (CPU-only path or
     /// uninitialised cache).

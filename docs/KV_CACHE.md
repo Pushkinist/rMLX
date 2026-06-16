@@ -517,16 +517,43 @@ transpose because the custom quant / dequant MSL kernels read their buffers by
 raw linear index and ignore MLX lazy-transpose strides — a CPU-only test cannot
 catch that; the layout fixes are GPU round-trip verified.
 
-**Not yet covered (same class, deferred):** the PlanarQuant K/V structs
-(`QuantPlanarK` / `QuantPlanarV`) carry the same multi-append head scramble
-(reproduced on GPU: chunked decode vs one-shot diverges by ~4 abs at the Bonsai
-shape), but `QuantPlanarK` additionally exposes its packed codes buffer to the
-`planar_fused_qk` / `planar_flash_decode` MSL kernels via `gpu_packed_view`
-(the post-hydrate decode path, gated on `decode_fp16_k.is_none()`). Those
-kernels read the packed buffer with a head-major `(b, kv_h, kv_seq, head_dim)`
-indexing, so a sequence-major storage relayout would also have to relayout the
-fused-QK / flash kernels — a coordinated MSL-kernel change beyond the
-storage-local fix.
+**Now covered (PlanarQuant K/V — closes the class):** the PlanarQuant structs
+(`QuantPlanarK` / `QuantPlanarV`) carried the same multi-append head scramble
+(reproduced on CPU and GPU: a two-chunk GQA append with `kv_h > 1` and a
+multi-token second chunk drove per-row cosine far negative against the
+head-major reference). `QuantPlanarK` was the hard case because it also exposes
+its packed codes buffer to the `planar_fused_qk` / `planar_flash_decode` MSL
+kernels (and the sparse-attn phase-1/2 kernels) via `gpu_packed_view` on the
+post-hydrate decode path (gated on `decode_fp16_k.is_none()`). Those kernels
+read the packed K buffer **per token**, so the fix is a coordinated change:
+
+- **Storage goes sequence-major** like the rest of the family. `append` reorders
+  the incoming head-major chunk heads↔seq before quantizing (GPU: `transpose`
+  then `Array::contiguous`, because the raw-linear-index MSL kernel ignores
+  lazy-transpose strides; CPU: `transpose_heads_seq` on the flat data with the
+  reordered chunk shape), and `dequantize_choice` reshapes the prefix
+  `[B, S, kv_h, D]` and transposes back to the logical `[B, kv_h, S, D]`.
+- **The packed-K kernels switch to a sequence-major token base.** `planar_fused_qk`,
+  `planar_flash_decode` (P1), and the sparse-attn phase-1/2 score kernels now
+  index K as `kv_tok = (b * kv_seq + s) * kv_h + kv_h_idx` instead of the old
+  head-major `(b * kv_h + kv_h_idx) * kv_seq + s`. The V offset stays head-major
+  in the flash / sparse kernels because V is the separate bf16 decode mirror
+  (`decode_fp16_v`), not the planar-packed buffer.
+
+For a single decode token (`new_seq == 1`) the heads↔seq transpose is the
+identity, so the decode hot path is byte-unchanged; for a single cold-prefill
+chunk (`prev_seq == 0`) the append and dequant transposes cancel. PlanarQuant is
+layout-agnostic (it processes the flat element stream group-by-group and
+`head_dim % GROUP_SIZE == 0`, so no group spans a (head, token) boundary), so
+the reorder is bit-exact, not just within-noise — planar3 and planar4 packing
+are untouched. The `.kvb` SSD format is byte-stable (only the token-row order
+within the buffer changes; spill and dequant agree on sequence-major). With this
+change **the entire multi-append head-scramble class is closed** — every
+flat-buffer quantized KV storage (`QuantK`, `QuantV`, `QuantKTurbo3/4`, paged,
+all eight Iso/Rotor codecs, and now `QuantPlanarK` / `QuantPlanarV`) is
+canonically sequence-major. CPU + GPU round-trip verified (two-append GQA vs
+single-shot, plus the fused-QK / flash-decode / sparse-attn parity suites all
+green on real Metal).
 
 ### 5.7.3 The Iso / Rotor `Vec<Blocks>` codecs use the same sequence-major rule
 

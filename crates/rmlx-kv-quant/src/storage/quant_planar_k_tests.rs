@@ -185,20 +185,44 @@ fn quant_planar_k_oneshot_vs_chunked_append_parity() {
     let recon_a = array_to_f32(&recon_a_opt.expect("A None"));
 
     // ── Path B: prefill chunk then per-token decode appends ──────────────
+    // `data` is head-major `[1, kv_h, total_seq, head_dim]`. Both the prefill
+    // chunk and each per-token decode step must be sliced head-major so they
+    // carry the SAME logical (head, token) values Path A's one-shot append
+    // sees — otherwise the comparison drifts because the chunk schedule feeds
+    // a different tensor, not because the storage diverges. (The old slicing
+    // assumed a token-contiguous layout, which only matched the pre-fix
+    // token-major-write bug.)
     let mut init_shape_b = full_shape.to_vec();
     init_shape_b[2] = 0;
     let mut qpk_b = QuantPlanarK::new(init_shape_b, max_seq);
+    let kv_h_u = kv_h as usize;
+    let total_u = total_seq as usize;
+    let d_u = head_dim as usize;
+    let prefill_u = prefill_seq as usize;
+
+    let mut prefill_data = vec![0.0f32; kv_h_u * prefill_u * d_u];
+    for h in 0..kv_h_u {
+        for s in 0..prefill_u {
+            let src = (h * total_u + s) * d_u;
+            let dst = (h * prefill_u + s) * d_u;
+            prefill_data[dst..dst + d_u].copy_from_slice(&data[src..src + d_u]);
+        }
+    }
     let prefill_shape = [1i32, kv_h, prefill_seq, head_dim];
-    let prefill_elems: usize = prefill_shape.iter().map(|&d| d as usize).product();
-    let prefill_arr = make_f32_array(&data[..prefill_elems], &prefill_shape);
+    let prefill_arr = make_f32_array(&prefill_data, &prefill_shape);
     qpk_b
         .append(&[], &prefill_shape, &prefill_arr, Device::Gpu, max_seq)
         .expect("prefill append B");
-    let per_step_elems = (kv_h * head_dim) as usize;
     let step_shape = [1i32, kv_h, 1, head_dim];
     for step in 0..decode_seq as usize {
-        let off = prefill_elems + step * per_step_elems;
-        let step_arr = make_f32_array(&data[off..off + per_step_elems], &step_shape);
+        let s = prefill_u + step;
+        let mut step_data = vec![0.0f32; kv_h_u * d_u];
+        for h in 0..kv_h_u {
+            let src = (h * total_u + s) * d_u;
+            let dst = h * d_u;
+            step_data[dst..dst + d_u].copy_from_slice(&data[src..src + d_u]);
+        }
+        let step_arr = make_f32_array(&step_data, &step_shape);
         qpk_b
             .append(&[], &step_shape, &step_arr, Device::Gpu, max_seq)
             .expect("decode append B");
@@ -236,6 +260,167 @@ fn quant_planar_k_oneshot_vs_chunked_append_parity() {
         stats_b.mean >= 0.99,
         "chunked mean cosine {:.6} < 0.99",
         stats_b.mean
+    );
+}
+
+// ── Multi-append GQA head/seq-layout regression (multi-token-after-prefill scramble) ──
+//
+// The chunked-vs-oneshot parity test above never triggers the head-scramble:
+// its chunked schedule is a multi-token prefill at `prev_seq == 0` followed by
+// SINGLE-token decode appends. A single-token chunk is byte-identical in
+// head-major and sequence-major order, so the token-major write offset
+// (`prev_seq * words_per_seq`) is always correct for it. The scramble needs a
+// MULTI-token append at `prev_seq > 0` — exactly the SSD-hydrate-then-reprefill
+// path: an append whose chunk spans several tokens lands at a token-major
+// offset, but the dequant view reshapes the prefix head-major (`[B, kv_h, S, D]`),
+// transposing one head's new tokens onto another head's prefix.
+//
+// These fixtures build per-(head, token, dim) DISTINCT data so a head/seq swap
+// is visible far above 4-bit planar quant noise: head `h` carries a sinusoid
+// whose frequency scales with `h`, so a head that lands in the wrong slot has a
+// near-zero cosine against the head-major reference.
+
+/// Build `[1, kv_h, seq, d]` head-major f32 data where head `h`'s row at token
+/// `s` is `sin((h+1) * base_freq * (d + s))`. Distinct per head (frequency) and
+/// per token (phase); survives 4-bit planar quant per row at cosine ≈ 1.
+fn head_distinct_data(kv_h: i32, seq: i32, d: i32) -> Vec<f32> {
+    let kv_h = kv_h as usize;
+    let seq = seq as usize;
+    let d = d as usize;
+    let mut out = vec![0.0f32; kv_h * seq * d];
+    let base_freq = 0.05f32;
+    for h in 0..kv_h {
+        for s in 0..seq {
+            for di in 0..d {
+                let phase = (h as f32 + 1.0) * base_freq * ((di + s) as f32);
+                out[(h * seq + s) * d + di] = phase.sin();
+            }
+        }
+    }
+    out
+}
+
+/// CPU diagnostic: a two-chunk append where the SECOND chunk is multi-token and
+/// lands at `prev_seq > 0`. The dequant view must reproduce the head-major
+/// reference for EVERY (head, token) row. Pre-fix this fails on `kv_h > 1`
+/// because the token-major write scrambles heads↔seq.
+#[test]
+fn quant_planar_k_cpu_multi_append_gqa_head_layout() {
+    let kv_h = 4i32;
+    let head_dim = 64i32; // multiple of GROUP_SIZE (32), spans 2 groups per head
+    let chunk0 = 5i32; // prefill chunk
+    let chunk1 = 3i32; // multi-token decode/reprefill chunk at prev_seq > 0
+    let total = chunk0 + chunk1;
+
+    let full = head_distinct_data(kv_h, total, head_dim);
+    let d = head_dim as usize;
+    let total_u = total as usize;
+    let kv_h_u = kv_h as usize;
+
+    // Slice the head-major full tensor into two head-major chunks.
+    let mut chunk0_data = vec![0.0f32; kv_h_u * chunk0 as usize * d];
+    let mut chunk1_data = vec![0.0f32; kv_h_u * chunk1 as usize * d];
+    for h in 0..kv_h_u {
+        for s in 0..chunk0 as usize {
+            let src = (h * total_u + s) * d;
+            let dst = (h * chunk0 as usize + s) * d;
+            chunk0_data[dst..dst + d].copy_from_slice(&full[src..src + d]);
+        }
+        for s in 0..chunk1 as usize {
+            let src = (h * total_u + (chunk0 as usize + s)) * d;
+            let dst = (h * chunk1 as usize + s) * d;
+            chunk1_data[dst..dst + d].copy_from_slice(&full[src..src + d]);
+        }
+    }
+
+    let max_seq = total + 16;
+    let mut qpk = QuantPlanarK::new(vec![1i32, kv_h, 0, head_dim], max_seq);
+    let c0_shape = [1i32, kv_h, chunk0, head_dim];
+    let c1_shape = [1i32, kv_h, chunk1, head_dim];
+    // CPU path ignores the `Array` arg (it uses `f32_data`); a 0-len dummy is fine.
+    let dummy = Array::from_bytes(&[], &[0], Dtype::F32).expect("dummy array");
+    qpk.append(&chunk0_data, &c0_shape, &dummy, Device::Cpu, max_seq)
+        .expect("append chunk0");
+    qpk.append(&chunk1_data, &c1_shape, &dummy, Device::Cpu, max_seq)
+        .expect("append chunk1");
+
+    let (recon, _) = qpk
+        .dequantize_choice(Device::Cpu, Dtype::F32)
+        .expect("dequantize_choice CPU");
+    assert_eq!(recon.len(), full.len(), "recon length mismatch");
+
+    // Per-row cosine against the head-major reference. A head/seq swap pushes
+    // the swapped rows' cosine toward 0; a correct head-major buffer stays ≈ 1.
+    let stats = cosine_similarity_per_row(&full, &recon, d);
+    assert!(
+        stats.min >= 0.97,
+        "CPU multi-append GQA min per-row cosine {:.4} < 0.97 — head/seq scramble \
+         on the multi-token-after-prefill append (kv_h={kv_h})",
+        stats.min,
+    );
+}
+
+/// GPU diagnostic: the same multi-append GQA head-layout contract on the Metal
+/// path. This proves the packed buffer round-trips to head-major after a
+/// multi-token append; the kernel-index agreement (fused-QK / flash-decode /
+/// sparse read via `gpu_packed_view`) is covered separately by the fused-QK /
+/// flash / sparse parity tests at `kv_h > 1`.
+#[test]
+#[ignore = "GPU Metal context — cargo test quant_planar_k_gpu_multi_append_gqa -- --ignored --test-threads=1"]
+fn quant_planar_k_gpu_multi_append_gqa_head_layout() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    let kv_h = 4i32;
+    let head_dim = 64i32;
+    let chunk0 = 5i32;
+    let chunk1 = 3i32;
+    let total = chunk0 + chunk1;
+    let d = head_dim as usize;
+    let total_u = total as usize;
+    let kv_h_u = kv_h as usize;
+
+    let full = head_distinct_data(kv_h, total, head_dim);
+
+    let mut chunk0_data = vec![0.0f32; kv_h_u * chunk0 as usize * d];
+    let mut chunk1_data = vec![0.0f32; kv_h_u * chunk1 as usize * d];
+    for h in 0..kv_h_u {
+        for s in 0..chunk0 as usize {
+            let src = (h * total_u + s) * d;
+            let dst = (h * chunk0 as usize + s) * d;
+            chunk0_data[dst..dst + d].copy_from_slice(&full[src..src + d]);
+        }
+        for s in 0..chunk1 as usize {
+            let src = (h * total_u + (chunk0 as usize + s)) * d;
+            let dst = (h * chunk1 as usize + s) * d;
+            chunk1_data[dst..dst + d].copy_from_slice(&full[src..src + d]);
+        }
+    }
+
+    let init_shape = vec![1i32, kv_h, 0, head_dim];
+    let max_seq = total + 256;
+    let mut qpk = QuantPlanarK::new(init_shape, max_seq);
+    let c0_shape = [1i32, kv_h, chunk0, head_dim];
+    let c1_shape = [1i32, kv_h, chunk1, head_dim];
+    let c0_arr = make_f32_array(&chunk0_data, &c0_shape);
+    let c1_arr = make_f32_array(&chunk1_data, &c1_shape);
+    qpk.append(&[], &c0_shape, &c0_arr, Device::Gpu, max_seq)
+        .expect("append chunk0 GPU");
+    qpk.append(&[], &c1_shape, &c1_arr, Device::Gpu, max_seq)
+        .expect("append chunk1 GPU");
+
+    let (_, recon_opt) = qpk
+        .dequantize_choice(Device::Gpu, Dtype::F32)
+        .expect("dequantize_choice GPU");
+    let recon = array_to_f32(&recon_opt.expect("GPU dequant returned None"));
+    assert_eq!(recon.len(), full.len(), "GPU recon length mismatch");
+
+    let stats = cosine_similarity_per_row(&full, &recon, d);
+    assert!(
+        stats.min >= 0.97,
+        "GPU multi-append GQA min per-row cosine {:.4} < 0.97 — head/seq scramble \
+         on the multi-token-after-prefill append (kv_h={kv_h})",
+        stats.min,
     );
 }
 

@@ -168,9 +168,17 @@ fn run_parity(
     let v_data = lcg_data(v_n, v_seed);
     let v_arr = make_f32_array(&v_data, &v_shape);
 
-    // ── PlanarQuant pack K ───────────────────────────────────────────────
+    // ── PlanarQuant pack K (sequence-major) ──────────────────────────────
+    // The fused-QK / flash-decode / sparse phase-1/2 kernels index K
+    // sequence-major (`[B, S, kv_h, D]`); transpose the head-major `k_arr`
+    // heads↔seq and materialize before packing so the packed buffer matches.
+    let k_seq = k_arr
+        .transpose(&[0, 2, 1, 3], Device::Gpu)
+        .expect("transpose k seq-major")
+        .contiguous(Device::Gpu)
+        .expect("contiguous k seq-major");
     let (k_codes, k_scales, k_rot32) =
-        planar_quantize_v4_gpu(&k_arr, Device::Gpu).expect("planar_quantize_v4_gpu");
+        planar_quantize_v4_gpu(&k_seq, Device::Gpu).expect("planar_quantize_v4_gpu");
 
     // ── Dense reference (planar flash decode) ────────────────────────────
     let dense = planar_flash_decode_sdpa(

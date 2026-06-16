@@ -159,11 +159,11 @@ fn build_qk_header(bits: u8) -> Result<String> {
 //   dims[2] = kv_h           (number of K/V heads)
 //   dims[3] = heads_per_kv   (n_q_heads / kv_h)
 //
-// Inputs:
+// Inputs (K buffers are SEQUENCE-major: `[B, S_kv, kv_h, D]` element order):
 //   query  : float[B * n_q_heads * D]  (Q for the new token)
-//   codes  : uint [B * kv_h * S_kv * (D/8)]   — packed 4-bit codes
-//   scales : float[B * kv_h * S_kv * (D/2)]   — per-pair scale (f32)
-//   rot32  : uint [B * kv_h * S_kv * (D/16)]  — 4-bit rotation index per pair
+//   codes  : uint [B * S_kv * kv_h * (D/8)]   — packed 4-bit codes
+//   scales : float[B * S_kv * kv_h * (D/2)]   — per-pair scale (f32)
+//   rot32  : uint [B * S_kv * kv_h * (D/16)]  — 4-bit rotation index per pair
 //   scale_arr : float[1]   — softmax pre-scale (1/sqrt(d))
 //
 // Output:
@@ -222,7 +222,11 @@ fn build_qk_kernel_source(bits: u8) -> String {
     uint kv_h_idx  = hq / heads_per_kv;
 
     // Token-base offsets into K's per-(b, kv_h_idx, s_kv) record.
-    uint kv_tok          = (b * kv_h + kv_h_idx) * kv_seq + s_kv;
+    // K packing is SEQUENCE-major (`[B, S, kv_h, D]` element order): per token
+    // all heads are contiguous. This matches QuantPlanarK's storage, whose
+    // chunk appends land at a per-token (all-heads) offset; a head-major base
+    // would scramble heads↔seq after a multi-token append at prev_seq > 0.
+    uint kv_tok          = (b * kv_seq + s_kv) * kv_h + kv_h_idx;
     // Codes layout (axis-agnostic across 3-bit / 4-bit): every group of 32
     // elements occupies exactly 4 u32 words (4-bit packs 8 vals/word;
     // 3-bit packs 10 vals/word with 2 wasted bits — but still 4 words/group).
