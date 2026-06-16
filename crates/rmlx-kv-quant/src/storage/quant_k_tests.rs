@@ -52,8 +52,7 @@ fn build_buffer(appends: &[usize], kv_h: usize, d: usize, head_major_chunk: bool
         let start = prev * elems_per_seq;
         let mut i = start;
         if head_major_chunk {
-            for b in 0..B {
-                let _ = b;
+            for _b in 0..B {
                 for h in 0..kv_h {
                     for sl in 0..new_seq {
                         for dd in 0..d {
@@ -64,8 +63,7 @@ fn build_buffer(appends: &[usize], kv_h: usize, d: usize, head_major_chunk: bool
                 }
             }
         } else {
-            for b in 0..B {
-                let _ = b;
+            for _b in 0..B {
                 for sl in 0..new_seq {
                     for h in 0..kv_h {
                         for dd in 0..d {
@@ -207,8 +205,13 @@ fn head_major_chunk(kv_h: i32, seq: i32, d: i32, base_s: i32) -> Vec<f32> {
 )]
 fn cpu_two_append_multi_head_roundtrip_is_exact() {
     // Drive the real `QuantK::append` + `dequantize_choice` on the CPU device.
-    // q8 group size is 128, so head_dim must be a multiple of 128 for the chunk
-    // to quantize without crossing a (head, token) boundary.
+    // The reorder is flat-position-symmetric on store and read, so the
+    // round-trip is correct regardless of whether a q8 group crosses a
+    // (head, token) boundary (see `cpu_gemma4_shape_cross_head_group_roundtrip`
+    // for the d=64 boundary-crossing case). `d=128` here only because
+    // `q8_quantize` asserts the chunk length is a multiple of the group size
+    // (128) — with `d=128` and any `kv_h`, every chunk length `kv_h*d` divides
+    // evenly.
     let (kv_h, d, max_seq) = (3, 128, 512);
     let mut qk = new_quant_k(kv_h, d);
 
@@ -233,6 +236,44 @@ fn cpu_two_append_multi_head_roundtrip_is_exact() {
     assert!(
         m < 0.02,
         "CPU kv_h=3 two-append max abs error {m} — expected quant noise, not head scramble"
+    );
+}
+
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test: array/append construction from in-bounds fixed buffers cannot fail"
+)]
+fn cpu_gemma4_shape_cross_head_group_roundtrip() {
+    // The production Gemma4 KV shape: head_dim=64, kv_h=2. A single-token decode
+    // step produces a chunk of length kv_h*d = 2*64 = 128 — exactly one q8 group,
+    // which therefore spans TWO heads. This is the configuration the sequence-
+    // major reorder most needs to prove: if the per-(head,token) reorder were
+    // wrong when a group crosses a head boundary, this test fails with an error
+    // far above q8 noise (a whole head's values swapped in, ≥ ~0.1).
+    let (kv_h, d, max_seq) = (2, 64, 512);
+    let mut qk = new_quant_k(kv_h, d);
+
+    // Two appends so the second chunk lands at a sequence offset (prev_seq=1),
+    // exercising the multi-append reorder that the head-major store corrupted.
+    let c0 = head_major_chunk(kv_h, 1, d, 0);
+    let c1 = head_major_chunk(kv_h, 1, d, 1);
+    let dummy0 = zeros(&[1, kv_h, 1, d], Dtype::F32, Device::Cpu).expect("dummy0");
+    let dummy1 = zeros(&[1, kv_h, 1, d], Dtype::F32, Device::Cpu).expect("dummy1");
+    qk.append(&c0, &[1, kv_h, 1, d], &dummy0, Device::Cpu, max_seq)
+        .expect("append0");
+    qk.append(&c1, &[1, kv_h, 1, d], &dummy1, Device::Cpu, max_seq)
+        .expect("append1");
+
+    let (flat, arr) = qk
+        .dequantize_choice(Device::Cpu, Dtype::F32)
+        .expect("dequant");
+    assert!(arr.is_none(), "CPU dequant returns a flat vec");
+    let s_total = 2;
+    let m = check_roundtrip(&flat, kv_h, s_total, d);
+    assert!(
+        m < 0.02,
+        "Gemma4 d=64/kv_h=2 cross-head-group max abs error {m} — expected q8 noise, not head scramble"
     );
 }
 
