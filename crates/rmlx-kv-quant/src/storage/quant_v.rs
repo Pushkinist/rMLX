@@ -459,12 +459,29 @@ impl QuantV {
                 "value_codebook ↔ value_codebook_gpu cache desync — \
                  caller mutated pub value_codebook after first GPU upload"
             );
+            // Reorder the chunk to sequence-major `[B, new_seq, kv_h, D]` before
+            // quantizing. The flat GPU buffer accumulates chunks back-to-back at
+            // `prev_seq * words_per_seq`, so the active prefix is sequence-major;
+            // `dequantize_choice` reads it back with the matching reshape +
+            // transpose. The incoming chunk is head-major
+            // (`[B, kv_h, new_seq, D]`); transposing heads↔seq makes the stored
+            // layout self-consistent across any number of appends and any
+            // `kv_h`. With a single chunk (`prev_seq == 0`) this is the identity
+            // for the dequant view, so the cold-prefill path stays logically
+            // correct (byte-identical when `D % GROUP_SIZE == 0`, which the
+            // init-block debug_assert enforces). `transpose` yields a strided
+            // view; the TurboQuant MSL kernel reads its input by raw linear
+            // offset (ignores MLX strides), so materialize the permutation into
+            // a row-major buffer with `contiguous` first.
+            let v_seq_major = v_arr.transpose(&[0, 2, 1, 3], device)?.contiguous(device)?;
             let (new_codes, new_scales) = match (
                 self.value_codebook.is_some(),
                 self.value_codebook_gpu.as_ref(),
             ) {
-                (true, Some(cb_gpu)) => turbo_quantize_v4_codebook_buf_gpu(v_arr, cb_gpu, device)?,
-                (false, None) => turbo_quantize_v4_gpu(v_arr, device)?,
+                (true, Some(cb_gpu)) => {
+                    turbo_quantize_v4_codebook_buf_gpu(&v_seq_major, cb_gpu, device)?
+                }
+                (false, None) => turbo_quantize_v4_gpu(&v_seq_major, device)?,
                 (true, None) => {
                     return Err(rmlx_core::error::Error::Quant(
                         "value_codebook set but GPU upload missing — internal \
@@ -506,26 +523,42 @@ impl QuantV {
         } else {
             // CPU path: scalar Rust quantization.
             //
+            // CPU mirror of the GPU path: store the chunk sequence-major so the
+            // accumulated `self.blocks` share one layout with the GPU buffer
+            // (the spill/hydrate round-trip moves codes between the two, and the
+            // hydrated GPU init uploads CPU blocks at offset 0). `f32_data`
+            // arrives head-major (`[B, kv_h, new_seq, D]`); reorder it to
+            // `[B, new_seq, kv_h, D]` and pass the matching shape before
+            // quantizing. The codecs group positionally over the last axis `D`,
+            // so the seq-major shape is valid and `dequantize_choice` reorders
+            // back to the logical `[B, kv_h, S, D]`.
+            //
             // When `use_tcq` is set, dispatch to the Viterbi trellis encoder at
             // the matching bit-width. bits==3: 3-bit TCQ; bits==2: 2-bit TCQ.
             // Codebook override is supported for 3-bit only; 2-bit TCQ always
             // uses the built-in Lloyd-Max 2-bit codebook.
             // If no TCQ and a per-layer codebook override is set, use it;
             // otherwise fall back to the built-in Lloyd-Max codebook.
+            let b = new_shape[0] as usize;
+            let kv_h = new_shape[1] as usize;
+            let new_seq = new_shape[2] as usize;
+            let d = new_shape[3] as usize;
+            let seq_major = super::seq_layout::transpose_heads_seq(f32_data, b, kv_h, new_seq, d);
+            let seq_shape = [new_shape[0], new_shape[2], new_shape[1], new_shape[3]];
             let block = if self.use_tcq && self.bits == 3 {
                 match self.value_codebook.as_deref() {
-                    Some(cb) => tcq_quantize_v3_with_codebook(f32_data, new_shape, cb)?,
-                    None => tcq_quantize_v3(f32_data, new_shape)?,
+                    Some(cb) => tcq_quantize_v3_with_codebook(&seq_major, &seq_shape, cb)?,
+                    None => tcq_quantize_v3(&seq_major, &seq_shape)?,
                 }
             } else if self.use_tcq && self.bits == 2 {
                 // 2-bit TCQ. Codebook override not wired for 2-bit — TCQ reuses
                 // the standard Lloyd-Max 2-bit codebook.
-                tcq_quantize_v2(f32_data, new_shape)?
+                tcq_quantize_v2(&seq_major, &seq_shape)?
             } else {
                 turbo_quantize_v_with_codebook(
-                    f32_data,
+                    &seq_major,
                     self.bits,
-                    new_shape,
+                    &seq_shape,
                     self.value_codebook.as_deref(),
                 )?
             };
@@ -577,6 +610,16 @@ impl QuantV {
                     "value_codebook ↔ value_codebook_gpu cache desync — \
                      caller mutated pub value_codebook after first GPU upload"
                 );
+                // The flat buffer is sequence-major (see `append`): the active
+                // prefix lays out as `[B, S, kv_h, D]`. Dequant into that shape,
+                // then reorder heads↔seq back to the logical `[B, kv_h, S, D]`
+                // callers expect. For a single-chunk cache the transpose inverts
+                // the append-side reorder, so the round-trip is exact within
+                // quant noise. The dequant kernel reads its inputs by raw linear
+                // offset; the seq-major reshape on the OUTPUT then needs a final
+                // `contiguous` because raw byte-readers (SSD spill / hydrate)
+                // would otherwise see the un-permuted sequence-major bytes.
+                let seq_major_shape = [self.shape[0], self.shape[2], self.shape[1], self.shape[3]];
                 let out = match (
                     self.value_codebook.is_some(),
                     self.value_codebook_gpu.as_ref(),
@@ -585,13 +628,17 @@ impl QuantV {
                         &codes,
                         &scales,
                         cb_gpu,
-                        &self.shape,
+                        &seq_major_shape,
                         out_dtype,
                         device,
                     )?,
-                    (false, None) => {
-                        turbo_dequantize_v4_gpu(&codes, &scales, &self.shape, out_dtype, device)?
-                    }
+                    (false, None) => turbo_dequantize_v4_gpu(
+                        &codes,
+                        &scales,
+                        &seq_major_shape,
+                        out_dtype,
+                        device,
+                    )?,
                     (true, None) => {
                         return Err(rmlx_core::error::Error::Quant(
                             "value_codebook set but GPU upload missing — internal \
@@ -607,11 +654,14 @@ impl QuantV {
                         ));
                     }
                 };
+                let out = out.transpose(&[0, 2, 1, 3], device)?.contiguous(device)?;
                 return Ok((Vec::new(), Some(out)));
             }
             return Ok((Vec::new(), None));
         }
-        // CPU path.
+        // CPU path. Blocks are stored sequence-major (see `append`): the
+        // concatenated decode lays out as `[B, S, kv_h, D]`. Reorder heads↔seq
+        // back to the logical `[B, kv_h, S, D]` the caller reshapes to.
         let total: usize = self.shape.iter().map(|&d| d as usize).product();
         let mut out = Vec::with_capacity(total);
         let cb_override = self.value_codebook.as_deref();
@@ -623,6 +673,15 @@ impl QuantV {
             };
             out.extend_from_slice(&slice);
         }
+        // The reorder requires the full `[B, S, kv_h, D]` buffer; pad/truncate
+        // to the declared element count first (blocks always sum to `shape[2]`
+        // in normal operation, so this is a defensive backstop).
+        out.resize(total, 0.0);
+        let b = self.shape[0] as usize;
+        let kv_h = self.shape[1] as usize;
+        let s = self.shape[2] as usize;
+        let d = self.shape[3] as usize;
+        let out = super::seq_layout::transpose_seq_heads(&out, b, s, kv_h, d);
         Ok((out, None))
     }
 
