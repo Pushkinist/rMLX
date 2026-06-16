@@ -278,7 +278,12 @@ impl QuantK {
             // multiple of 128 (e.g. head_dim=64) a group spans a (head,token)
             // boundary, so per-group `abs_max` scales differ from the head-major
             // grouping — logically correct and within q8 noise, but not bit-exact.
-            let k_seq_major = k_arr.transpose(&[0, 2, 1, 3], device)?;
+            // `transpose` yields a strided view. `q8_quantize_gpu` reads its
+            // input by raw linear offset (the MSL kernel ignores MLX strides),
+            // so materialize the heads↔seq permutation into a row-major buffer
+            // here — otherwise the kernel would read the original head-major
+            // bytes and scramble the stored codes.
+            let k_seq_major = k_arr.transpose(&[0, 2, 1, 3], device)?.contiguous(device)?;
             let (new_codes, new_scales) = q8_quantize_gpu(&k_seq_major, device)?;
 
             // Compute offsets in the 1D buffer.
@@ -363,6 +368,9 @@ impl QuantK {
                 // bytes and scrambles heads↔seq. Forcing contiguity makes the
                 // physical layout match the logical `[B, kv_h, S, D]` shape for
                 // every consumer.
+                // Required for the raw byte-readers (SSD spill / hydrate
+                // round-trip) — this is the post-hydrate dequant path, off the
+                // steady-state decode hot path, so the copy is acceptable.
                 let out = out.transpose(&[0, 2, 1, 3], device)?.contiguous(device)?;
                 return Ok((Vec::new(), Some(out)));
             }

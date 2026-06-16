@@ -153,10 +153,13 @@ fn dequant_kernel() -> Result<&'static MetalKernel> {
 /// - `codes` u32 `[total_elems / 4]` — 4 i8 per uint32 (LE byte order).
 /// - `scales` f32 `[total_elems / 128]`.
 ///
-/// The input is forced row-major contiguous before the kernel reads it: the
-/// custom MSL quant kernel indexes the buffer by raw linear offset and ignores
-/// MLX strides, so a lazily-transposed input must be materialized first or the
-/// stored codes follow the original (wrong) physical order. See `Array::contiguous`.
+/// REQUIRES row-major contiguous input. The custom MSL quant kernel indexes the
+/// buffer by raw linear offset and ignores MLX strides, so a caller holding a
+/// transposed / sliced view must `.contiguous()` it first — otherwise the
+/// stored codes follow the original (wrong) physical order. Per-decode-step
+/// callers already pass row-contiguous head-major `[B, kv_h, n, D]` chunks; the
+/// transposed-view materialization lives at the one site that needs it
+/// (`QuantK::append`).
 pub fn q8_quantize_gpu(x: &Array, device: Device) -> Result<(Array, Array)> {
     let total_elems: usize = x.shape().iter().map(|&d| d as usize).product();
     if !total_elems.is_multiple_of(Q8_GROUP_SIZE) {
@@ -167,19 +170,10 @@ pub fn q8_quantize_gpu(x: &Array, device: Device) -> Result<(Array, Array)> {
     let n_groups = total_elems / Q8_GROUP_SIZE;
     let n_words = total_elems / 4;
 
-    // Materialize a row-major contiguous copy before the custom MSL kernel
-    // reads it. The kernel indexes `inp[base + i]` by raw linear offset and
-    // does NOT honor MLX strides, so a lazily-transposed (or otherwise
-    // non-contiguous) input would be read in its physical, un-permuted order —
-    // scrambling the codes. A bare `reshape` to `[total_elems]` is not enough:
-    // a flattened strided view can still carry the original byte order. Forcing
-    // contiguity here keeps the kernel's linear-index contract valid for every
-    // caller (e.g. `QuantK::append`, which hands us a `transpose([0,2,1,3])`).
-    let x_contig = x.contiguous(device)?;
-    let x_flat = if x_contig.ndim() == 1 {
-        x_contig
+    let x_flat = if x.ndim() == 1 {
+        x.try_clone()?
     } else {
-        x_contig.reshape(&[total_elems as i32], device)?
+        x.reshape(&[total_elems as i32], device)?
     };
     let x_f32 = if x_flat.dtype() == Dtype::F32 {
         x_flat
