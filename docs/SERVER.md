@@ -786,13 +786,19 @@ On call:
 If the file already exists:
 
 - The holder's PID is read from the file body.
-- A non-blocking `flock` is attempted. If it succeeds, the previous owner
-  exited without cleanup (stale file); the lock is stolen.
-- If the lock is held, `ClaimError::AlreadyHeld { port, holder_pid }` is
-  returned.
+- The PID is probed with `kill(pid, 0)`. If the holder is **alive**,
+  `ClaimError::AlreadyHeld { port, holder_pid }` is returned — a live claim is
+  never stolen (the single-MLX invariant).
+- If the holder is **dead** (ESRCH), the claim is stale: it was left by a
+  process that died without running `Drop` (SIGKILL, crash, power loss). A
+  non-blocking `flock` confirms no live fd still holds the lock, the file is
+  reclaimed (truncated, rewritten with our PID), and a `warn` is logged.
 
 `MetalClaim` is a RAII guard. Dropping it removes the claim file and releases
-the lock (the `flock` is released automatically when the fd closes).
+the lock (the `flock` is released automatically when the fd closes). The HTTP
+server installs a SIGINT/SIGTERM graceful-shutdown handler so a signalled
+`rmlx serve` runs `Drop` and removes the claim proactively; SIGKILL/crash are
+covered by the dead-PID reclaim above.
 
 Non-server GPU CLI operations (`rmlx info`, `rmlx chat`, `rmlx baseline`) use
 the sentinel port `0xCAFE` (51966) to represent "a single-shot GPU op in
