@@ -414,12 +414,14 @@ and transposes heads↔seq back to the logical `[B, kv_h, S, D]`. For a
 single-chunk cold prefill (`prev_seq == 0`) the two transposes cancel at the
 logical-mapping level, so the common path stays correct. The cold output is
 **byte-identical** to the pre-fix head-major grouping only when
-`head_dim % 128 == 0` (every q8 group of 128 stays inside one head — e.g.
-Qwen3.5-MoE linear `head_dim=128`, Gemma3 `head_dim=256`); for `head_dim` not a
-multiple of 128 (e.g. Gemma4 `head_dim=64`) a group spans a (head,token)
-boundary and its per-group `abs_max` scale differs from the old grouping, so the
-cold path is logically correct and within q8 noise but not bit-identical to the
-base commit. Without this transpose, a head-major chunk written at a
+`head_dim % 128 == 0` (every q8 group of 128 stays inside one head) — which
+holds for every current QuantK-routed target arch (Qwen3.5-MoE linear
+`head_dim=128`, Gemma3 and Gemma4 text KV `head_dim=256`), so the cold path is
+byte-identical in practice. When `head_dim` is not a multiple of 128 (no current
+target arch, but exercised directly by the `d=64` cross-head round-trip test) a
+q8 group of 128 spans a (head,token) boundary and its per-group `abs_max` scale
+differs from the old grouping, so the cold path is logically correct and within
+q8 noise but not bit-identical to the base commit. Without this transpose, a head-major chunk written at a
 sequence offset and read with a `[B, kv_h, S, D]` reshape transposed one head's
 new-token slot onto another head's prefix whenever `kv_h > 1` and the cache was
 appended in more than one chunk (the multi-append-after-SSD-hydrate decode

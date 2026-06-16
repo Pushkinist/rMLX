@@ -470,11 +470,14 @@ transposes back to the logical `[B, kv_h, S, D]`. A single-chunk cold prefill is
 the identity *at the logical-mapping level* (the transposes cancel), so the
 common path stays correct. It is **byte-identical** to the pre-fix head-major
 grouping only when `head_dim % 128 == 0` — then every q8 group of 128 stays
-inside one head (e.g. Qwen3.5-MoE linear `head_dim=128`, Gemma3 `head_dim=256`).
-For `head_dim` not a multiple of 128 (e.g. Gemma4 `head_dim=64`) a q8 group
-spans a (head,token) boundary, so its per-group `abs_max` scale differs from the
-old head-major grouping: the cold path is logically correct and within q8 noise
-but **not** bit-identical to the base commit's decode output.
+inside one head. That holds for every current QuantK-routed target arch
+(Qwen3.5-MoE linear `head_dim=128`, Gemma3 and Gemma4 text KV `head_dim=256`),
+so the cold path is byte-identical in practice. When `head_dim` is not a
+multiple of 128 (no current target arch, but exercised by the `d=64` cross-head
+round-trip test) a q8 group spans a (head,token) boundary, so its per-group
+`abs_max` scale differs from the old head-major grouping: the cold path is
+logically correct and within q8 noise but **not** bit-identical to the base
+commit's decode output.
 
 This matters for the **post-SSD-hydrate decode path**. After a hydrate, the bf16
 decode mirror (`decode_fp16_k`) is absent, so K is read from the quantized
