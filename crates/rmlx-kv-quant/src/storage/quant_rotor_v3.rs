@@ -170,17 +170,28 @@ impl QuantRotorV3 {
                 "QuantRotorV3::append: expected 4D new_shape, got {new_shape:?}"
             )));
         }
+        let b = new_shape[0] as usize;
+        let kv_h = new_shape[1] as usize;
+        let new_seq = new_shape[2] as usize;
         let head_dim = new_shape[3] as usize;
-        let n_tokens_total =
-            (new_shape[0] as usize) * (new_shape[1] as usize) * (new_shape[2] as usize);
+        let n_tokens_total = b * kv_h * new_seq;
 
         if self.rotors.is_empty() {
             let n_groups = n_groups_for(head_dim);
             self.rotors = make_rotor_table(self.layer_idx, self.head_idx, n_groups);
         }
 
+        // Store each chunk sequence-major (`[B, new_seq, kv_h, D]`) so the
+        // per-append blocks share one layout; a head-major store transposes
+        // heads across multi-append GQA caches (kv_h>1) when `dequant` reshapes
+        // head-major over the full sequence. The static rotor table is indexed
+        // by group position within `head_dim` (not by token), so the reorder
+        // leaves it correctly associated. See [`super::QuantIsoV3::append`].
+        let seq_major =
+            super::seq_layout::transpose_heads_seq(f32_data, b, kv_h, new_seq, head_dim);
+
         let (codes, scales, norms) =
-            rotor3_encode(f32_data, &self.rotors, head_dim).map_err(|e: RotorQuantError| {
+            rotor3_encode(&seq_major, &self.rotors, head_dim).map_err(|e: RotorQuantError| {
                 rmlx_core::error::Error::Mlx(format!("rotor3 encode: {e}"))
             })?;
 
@@ -305,6 +316,12 @@ impl QuantRotorV3 {
         } else if out.len() > total_elems {
             out.truncate(total_elems);
         }
+        // Blocks are sequence-major (see `append`); reorder back to head-major
+        // `[B, kv_h, S, D]`.
+        let b = self.shape[0] as usize;
+        let kv_h = self.shape[1] as usize;
+        let s = self.shape[2] as usize;
+        let out = super::seq_layout::transpose_seq_heads(&out, b, s, kv_h, head_dim);
         Ok(out)
     }
 }
