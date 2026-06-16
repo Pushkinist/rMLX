@@ -816,19 +816,37 @@ Apple Silicon exposes a single Metal GPU context per process. rMLX enforces
 a single-process invariant via a POSIX lock file at `/tmp/rmlx.<port>.claim`.
 
 - On `rmlx serve --port <N>`: the claim file for port `N` is written and held
-  for the server lifetime. Shutdown releases the file.
+  for the server lifetime. Shutdown releases the file. The server installs a
+  SIGINT/SIGTERM graceful-shutdown handler, so `Ctrl-C`, `kill`, and `pkill`
+  trigger normal teardown and remove the claim proactively.
 - On `rmlx chat`, `rmlx baseline`, `rmlx eval ppl`, and
   `rmlx info --probe-{forward,smoke}`: the sentinel port `0xCAFE` (51966) is
   used as the claim port, indicating a CLI-side (non-HTTP) GPU holder.
 - `rmlx healthcheck --port <N>` checks for the claim file without holding it.
 
-If another rMLX process already holds the claim, the new process logs an
-error and exits with code `11`. The conflicting PID is included in the error
-message. To recover manually:
+### Stale-claim auto-reclaim
+
+A claim left behind by a process that died without running its cleanup —
+SIGKILL, a crash, or power loss, none of which a signal handler can intercept —
+is reclaimed automatically on the next acquisition. When the claim file already
+exists, rMLX reads the holder PID and probes it with `kill(pid, 0)`:
+
+- Holder PID **dead** → the claim is reclaimed (a `warn` is logged) and startup
+  proceeds. No manual `rm` is needed.
+- Holder PID **alive** → the claim is respected; the new process logs an error
+  and exits with code `11`. A live claim is **never** stolen — that would put
+  two MLX processes on the single Metal context.
+
+If another rMLX process holds the claim (live holder), the conflicting PID is
+included in the error message. To stop it and recover manually:
 
 ```bash
 pkill -f 'rmlx serve' && rm -f /tmp/rmlx.<port>.claim
 ```
+
+(The trailing `rm` is only needed if you kill the holder with `SIGKILL`/`-9`;
+a plain `kill`/`pkill` lets graceful shutdown remove the file, and the next
+serve reclaims any stale file regardless.)
 
 CPU-mode runs (`--device cpu`) skip claim acquisition entirely.
 

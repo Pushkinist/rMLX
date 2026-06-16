@@ -21,7 +21,7 @@
 //! Those are handled by the unload/stop hints printed on `ClaimError`.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write as _;
+use std::io::{Seek as _, SeekFrom, Write as _};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 
@@ -78,15 +78,37 @@ impl Drop for MetalClaim {
 /// Returns `Ok(MetalClaim)` on success. The lock is held until the returned
 /// guard is dropped (i.e. until the subcommand exits).
 ///
-/// Returns `ClaimError::AlreadyHeld` if the file already exists *and* is
-/// flock-locked by another process. The holder's PID is read from the file.
+/// Returns `ClaimError::AlreadyHeld` if the file already exists *and* its
+/// holder PID is still alive. The holder's PID is read from the file.
+///
+/// ## Safety model: flock primary, PID probe secondary
+/// The load-bearing safety gate is the **flock**, not the PID probe. A live
+/// rMLX process keeps the claim file's fd open for its whole lifetime, so it
+/// holds the exclusive `flock`. Any second process therefore fails
+/// `flock(LOCK_EX | LOCK_NB)` on that file and refuses — a live MLX claim can
+/// never be stolen, regardless of what the PID body says. That is the
+/// single-MLX-process invariant the GPU depends on.
+///
+/// The PID probe is a **secondary stale-file detector**: it lets us recognise
+/// a claim file abandoned by a process that died without running `Drop`
+/// (SIGTERM/SIGKILL/crash/power-loss) so the next start can reuse it instead of
+/// failing forever. A provably **dead** holder PID (`kill(pid, 0)` → ESRCH)
+/// makes the file a reclaim candidate; we then still take the flock to confirm
+/// no live fd holds the file before reusing it.
+///
+/// The only residual race is narrow and fail-safe: a dead holder's PID could be
+/// recycled to an unrelated process between the first read and reclaim. We
+/// guard it by re-reading and re-probing the PID *after* taking the lock (see
+/// below) and by the flock itself. If anything is uncertain we **refuse**
+/// (`AlreadyHeld`) — the error direction is harmless (a transient false
+/// refusal), never the dangerous one (two MLX processes on one Metal context).
 pub fn try_claim(port: u16) -> Result<MetalClaim, ClaimError> {
     let path = PathBuf::from(format!("/tmp/rmlx.{port}.claim"));
 
     // --- attempt O_CREAT|O_EXCL -------------------------------------------
     // We try exclusive creation first. If that fails because the file already
-    // exists, we fall through to the flock path which will tell us whether the
-    // owner is still alive.
+    // exists, we fall through to the stale-reclaim path: a dead holder PID lets
+    // us take the file over, a live holder PID is respected.
 
     let file = match OpenOptions::new()
         .write(true)
@@ -95,18 +117,47 @@ pub fn try_claim(port: u16) -> Result<MetalClaim, ClaimError> {
     {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // File exists — try to open it and read the PID.
+            // File exists — read the holder PID first.
             let holder_pid = read_holder_pid(&path, port)?;
-            // Try to take the flock now; if it succeeds the old owner exited
-            // without cleanup — we can steal the file.
+
+            // Secondary stale detector: a provably-dead holder PID marks the
+            // file as a reclaim candidate. A live holder is respected here, but
+            // the real guarantee is the flock below — a live rMLX still holds
+            // its fd, so flock_ex_nb would fail even if this probe misfired.
+            if pid_is_alive(holder_pid) {
+                return Err(ClaimError::AlreadyHeld { port, holder_pid });
+            }
+
+            // Holder is (was) provably dead — its `Drop` never ran (SIGTERM/
+            // SIGKILL/crash). Take the flock: this is the load-bearing gate. If
+            // any live fd still holds the file the lock fails and we refuse.
             let candidate = OpenOptions::new()
                 .write(true)
                 .open(&path)
                 .map_err(|src| ClaimError::Io { port, source: src })?;
             if flock_ex_nb(candidate.as_raw_fd()) {
-                // Stale file, old process gone — we got the lock.
+                // Lock held. Close the narrow PID-reuse window: between the
+                // first read and now the dead holder's PID could have been
+                // recycled to an unrelated process that grabbed (and released)
+                // the file. Re-read the body and re-probe under the lock; if the
+                // PID changed or is now alive, refuse rather than reclaim. This
+                // is the fail-safe direction — a transient false refusal, never
+                // two MLX processes on the GPU.
+                let confirm_pid = read_holder_pid(&path, port).unwrap_or(0);
+                if confirm_pid != holder_pid || pid_is_alive(confirm_pid) {
+                    return Err(ClaimError::AlreadyHeld { port, holder_pid });
+                }
+                tracing::warn!(
+                    port,
+                    stale_pid = holder_pid,
+                    path = %path.display(),
+                    "reclaiming stale Metal claim left by a dead process (no Drop on SIGTERM/SIGKILL/crash)"
+                );
                 candidate
             } else {
+                // PID reads dead but the flock is still held — a live fd exists
+                // (e.g. PID reused, or read race). Refuse rather than risk a
+                // second MLX process on the GPU.
                 return Err(ClaimError::AlreadyHeld { port, holder_pid });
             }
         }
@@ -116,7 +167,9 @@ pub fn try_claim(port: u16) -> Result<MetalClaim, ClaimError> {
     // --- acquire exclusive non-blocking flock --------------------------------
     if !flock_ex_nb(file.as_raw_fd()) {
         // We just created the file but couldn't lock it — race with another
-        // starter. Read PID and report.
+        // starter. Read PID and report. holder_pid is often 0 here: neither our
+        // own create nor the racing winner may have written a PID body yet at
+        // this point, so the file is still empty.
         let holder_pid = read_holder_pid(&path, port).unwrap_or(0);
         // Remove the file we just created so we don't leave a stale entry.
         let _ = std::fs::remove_file(&path);
@@ -124,8 +177,15 @@ pub fn try_claim(port: u16) -> Result<MetalClaim, ClaimError> {
     }
 
     // --- write our PID -------------------------------------------------------
+    // Truncate first: when reclaiming a stale file the old PID body may be
+    // longer than ours, so an unconditional write would leave trailing digits
+    // and corrupt the PID a later reader parses.
     let pid = std::process::id();
     let mut f = file;
+    f.set_len(0)
+        .map_err(|src| ClaimError::Io { port, source: src })?;
+    f.seek(SeekFrom::Start(0))
+        .map_err(|src| ClaimError::Io { port, source: src })?;
     write!(f, "{pid}").map_err(|src| ClaimError::Io { port, source: src })?;
     f.flush()
         .map_err(|src| ClaimError::Io { port, source: src })?;
@@ -156,6 +216,31 @@ fn read_holder_pid(path: &PathBuf, port: u16) -> Result<u32, ClaimError> {
     let contents =
         std::fs::read_to_string(path).map_err(|src| ClaimError::Io { port, source: src })?;
     Ok(contents.trim().parse::<u32>().unwrap_or(0))
+}
+
+/// Liveness probe: is the process `pid` currently running?
+///
+/// Uses `kill(pid, 0)` — signal 0 performs the permission/existence check
+/// without sending a signal. `0` (or `EPERM`, meaning the process exists but is
+/// owned by another user) → alive; `ESRCH` → no such process.
+///
+/// A `pid` of `0` (unparsable / empty body) is treated as **alive** so an
+/// unreadable claim is never stolen — the conservative choice for the
+/// single-MLX invariant.
+fn pid_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return true;
+    }
+    // SAFETY: kill(2) with signal 0 is safe for any pid; it sends no signal and
+    // only reports existence/permission. errno EPERM also implies the process
+    // exists, so treat a non-ESRCH failure as alive.
+    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if ret == 0 {
+        return true;
+    }
+    // ret == -1: distinguish ESRCH (dead) from EPERM (alive, other user).
+    let errno = std::io::Error::last_os_error().raw_os_error();
+    errno != Some(libc::ESRCH)
 }
 
 // ---------------------------------------------------------------------------

@@ -58,7 +58,7 @@ use axum::routing::{get, post};
 use axum::serve::ListenerExt;
 use axum::Router;
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
 pub use admission::{
     spawn_controller_task, AdmissionHandle, ControllerConfig, ControllerHandle, DecisionReason,
@@ -180,9 +180,44 @@ pub async fn serve(state: AppState, host: &str, port: u16) -> anyhow::Result<()>
 
     info!(address = %addr, "rmlx-server listening");
 
+    // Graceful shutdown on SIGTERM/SIGINT so the future returns normally and the
+    // caller's `MetalClaim` guard `Drop` runs — proactively removing the claim
+    // file instead of leaving it for the next start's stale-reclaim path. This
+    // only covers signals tokio can intercept; SIGKILL/crash/power-loss still
+    // rely on acquisition-side stale-reclaim (see `claim::try_claim`).
     axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|e| anyhow::anyhow!("serve: {e}"))
+}
+
+/// Resolve when the process receives SIGINT (Ctrl-C) or SIGTERM (`kill` /
+/// `pkill`). Used as the axum graceful-shutdown trigger so normal teardown —
+/// including the `MetalClaim` `Drop` — runs on signalled exit.
+// cancel-safe: only awaits signal-notification futures; no partial state on drop.
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            // If we cannot install the SIGTERM handler, fall back to Ctrl-C
+            // only; the default disposition (immediate exit) still applies to
+            // SIGTERM and the next start reclaims the stale claim.
+            warn!(error = %e, "failed to install SIGTERM handler; graceful shutdown limited to SIGINT");
+            tokio::signal::ctrl_c().await.ok();
+            return;
+        }
+    };
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            info!("received SIGINT — shutting down gracefully");
+        }
+        _ = sigterm.recv() => {
+            info!("received SIGTERM — shutting down gracefully");
+        }
+    }
 }
 
 // ── Health handler ────────────────────────────────────────────────────────────
