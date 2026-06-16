@@ -30,6 +30,52 @@ fn array_to_f32(a: &Array) -> Vec<f32> {
         .collect()
 }
 
+/// Pack a head-major `[B, kv_h, S, D]` K array into the SEQUENCE-major packed
+/// buffers the fused-QK / flash-decode kernels now expect (`[B, S, kv_h, D]`
+/// element order). Returns the dequantized **head-major** K (for the CPU
+/// reference) alongside the packed buffers.
+#[allow(clippy::expect_used, reason = "test helper: invariants documented")]
+fn pack_v4_seq_major(k_arr: &Array, k_shape: &[i32]) -> (Array, Array, Array, Vec<f32>) {
+    let seq_shape = [k_shape[0], k_shape[2], k_shape[1], k_shape[3]];
+    let k_seq = k_arr
+        .transpose(&[0, 2, 1, 3], Device::Gpu)
+        .expect("transpose")
+        .contiguous(Device::Gpu)
+        .expect("contiguous");
+    let (codes, scales, rot32) =
+        planar_quantize_v4_gpu(&k_seq, Device::Gpu).expect("v4 quantize seq-major");
+    // Dequant in seq-major shape, transpose back to head-major for the ref.
+    let dq_seq = planar_dequantize_v4_gpu(&codes, &scales, &rot32, &seq_shape, Device::Gpu)
+        .expect("v4 dequant seq-major");
+    let dq_hm = dq_seq
+        .transpose(&[0, 2, 1, 3], Device::Gpu)
+        .expect("transpose back")
+        .contiguous(Device::Gpu)
+        .expect("contiguous back");
+    (codes, scales, rot32, array_to_f32(&dq_hm))
+}
+
+/// 3-bit sibling of [`pack_v4_seq_major`].
+#[allow(clippy::expect_used, reason = "test helper: invariants documented")]
+fn pack_v3_seq_major(k_arr: &Array, k_shape: &[i32]) -> (Array, Array, Array, Vec<f32>) {
+    let seq_shape = [k_shape[0], k_shape[2], k_shape[1], k_shape[3]];
+    let k_seq = k_arr
+        .transpose(&[0, 2, 1, 3], Device::Gpu)
+        .expect("transpose")
+        .contiguous(Device::Gpu)
+        .expect("contiguous");
+    let (codes, scales, rot32) =
+        planar_quantize_v3_gpu(&k_seq, Device::Gpu).expect("v3 quantize seq-major");
+    let dq_seq = planar_dequantize_v3_gpu(&codes, &scales, &rot32, &seq_shape, Device::Gpu)
+        .expect("v3 dequant seq-major");
+    let dq_hm = dq_seq
+        .transpose(&[0, 2, 1, 3], Device::Gpu)
+        .expect("transpose back")
+        .contiguous(Device::Gpu)
+        .expect("contiguous back");
+    (codes, scales, rot32, array_to_f32(&dq_hm))
+}
+
 fn ref_qk_scores(
     q: &[f32],
     k: &[f32],
@@ -84,7 +130,7 @@ fn planar_fused_qk_v4_matches_reference() {
     let q_data = lcg_data(q_n, 0xBEEF_5678_u64);
     let q_arr = make_f32_array(&q_data, &q_shape);
 
-    let (codes, scales, rot32) = planar_quantize_v4_gpu(&k_arr, Device::Gpu).expect("v4 quantize");
+    let (codes, scales, rot32, k_dequant_vec) = pack_v4_seq_major(&k_arr, &k_shape);
     let fused = planar_fused_qk(
         &q_arr,
         &codes,
@@ -101,9 +147,6 @@ fn planar_fused_qk_v4_matches_reference() {
     )
     .expect("fused QK kernel");
 
-    let k_dequant = planar_dequantize_v4_gpu(&codes, &scales, &rot32, &k_shape, Device::Gpu)
-        .expect("v4 dequant");
-    let k_dequant_vec = array_to_f32(&k_dequant);
     let ref_scores = ref_qk_scores(
         &q_data,
         &k_dequant_vec,
@@ -153,7 +196,7 @@ fn planar_fused_qk_v3_matches_reference() {
     let q_data = lcg_data(q_n, 0xFACE_8765_u64);
     let q_arr = make_f32_array(&q_data, &q_shape);
 
-    let (codes, scales, rot32) = planar_quantize_v3_gpu(&k_arr, Device::Gpu).expect("v3 quantize");
+    let (codes, scales, rot32, k_dequant_vec) = pack_v3_seq_major(&k_arr, &k_shape);
     let fused = planar_fused_qk(
         &q_arr,
         &codes,
@@ -170,9 +213,6 @@ fn planar_fused_qk_v3_matches_reference() {
     )
     .expect("fused QK kernel");
 
-    let k_dequant = planar_dequantize_v3_gpu(&codes, &scales, &rot32, &k_shape, Device::Gpu)
-        .expect("v3 dequant");
-    let k_dequant_vec = array_to_f32(&k_dequant);
     let ref_scores = ref_qk_scores(
         &q_data,
         &k_dequant_vec,
@@ -221,7 +261,7 @@ fn planar_fused_qk_mha_heads_per_kv_one() {
     let q_data = lcg_data(q_n, 0xCCCC_DDDD_u64);
     let q_arr = make_f32_array(&q_data, &q_shape);
 
-    let (codes, scales, rot32) = planar_quantize_v4_gpu(&k_arr, Device::Gpu).expect("v4 quantize");
+    let (codes, scales, rot32, k_dequant_vec) = pack_v4_seq_major(&k_arr, &k_shape);
     let fused = planar_fused_qk(
         &q_arr,
         &codes,
@@ -238,9 +278,6 @@ fn planar_fused_qk_mha_heads_per_kv_one() {
     )
     .expect("fused QK kernel");
 
-    let k_dequant = planar_dequantize_v4_gpu(&codes, &scales, &rot32, &k_shape, Device::Gpu)
-        .expect("v4 dequant");
-    let k_dequant_vec = array_to_f32(&k_dequant);
     let ref_scores = ref_qk_scores(
         &q_data,
         &k_dequant_vec,
@@ -290,7 +327,7 @@ fn planar_fused_qk_v4_head_dim_256() {
     let q_data = lcg_data(q_n, 0x2560_0002_u64);
     let q_arr = make_f32_array(&q_data, &q_shape);
 
-    let (codes, scales, rot32) = planar_quantize_v4_gpu(&k_arr, Device::Gpu).expect("v4 quantize");
+    let (codes, scales, rot32, k_dequant_vec) = pack_v4_seq_major(&k_arr, &k_shape);
     let fused = planar_fused_qk(
         &q_arr,
         &codes,
@@ -307,9 +344,6 @@ fn planar_fused_qk_v4_head_dim_256() {
     )
     .expect("fused QK kernel");
 
-    let k_dequant = planar_dequantize_v4_gpu(&codes, &scales, &rot32, &k_shape, Device::Gpu)
-        .expect("v4 dequant");
-    let k_dequant_vec = array_to_f32(&k_dequant);
     let ref_scores = ref_qk_scores(
         &q_data,
         &k_dequant_vec,

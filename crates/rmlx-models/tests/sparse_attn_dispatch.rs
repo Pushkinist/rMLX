@@ -295,8 +295,16 @@ fn sparse_attn_dispatches_on_seedless_planar_k() {
     let v_data = lcg_data(v_n, 0x166B_0003);
     let v_arr = make_f32_array(&v_data, &v_shape);
 
+    // K packing is sequence-major (`[B, S, kv_h, D]`) — the layout the
+    // fused-QK / flash-decode / sparse phase-1/2 kernels index. Transpose the
+    // head-major `k_arr` heads↔seq and materialize before packing.
+    let k_seq = k_arr
+        .transpose(&[0, 2, 1, 3], device)
+        .expect("transpose k seq-major")
+        .contiguous(device)
+        .expect("contiguous k seq-major");
     let (k_codes, k_scales, k_rot32) =
-        planar_quantize_v4_gpu(&k_arr, device).expect("planar_quantize_v4_gpu");
+        planar_quantize_v4_gpu(&k_seq, device).expect("planar_quantize_v4_gpu");
 
     let dense = planar_flash_decode_sdpa(
         &q_arr,
@@ -438,8 +446,16 @@ fn sparse_attn_seedless_planar_k_v2_budgets_wire_through() {
     let v_data = lcg_data(v_n, 0x167C_0003);
     let v_arr = make_f32_array(&v_data, &v_shape);
 
+    // K packing is sequence-major (`[B, S, kv_h, D]`) — the layout the
+    // fused-QK / flash-decode / sparse phase-1/2 kernels index. Transpose the
+    // head-major `k_arr` heads↔seq and materialize before packing.
+    let k_seq = k_arr
+        .transpose(&[0, 2, 1, 3], device)
+        .expect("transpose k seq-major")
+        .contiguous(device)
+        .expect("contiguous k seq-major");
     let (k_codes, k_scales, k_rot32) =
-        planar_quantize_v4_gpu(&k_arr, device).expect("planar_quantize_v4_gpu");
+        planar_quantize_v4_gpu(&k_seq, device).expect("planar_quantize_v4_gpu");
     let dense = planar_flash_decode_sdpa(
         &q_arr,
         &k_codes,
@@ -620,8 +636,16 @@ fn sparse_attn_seedless_planar_k_competing_keys_v2_vs_v1() {
     let v_data = lcg_data(v_n, 0x167C_0013);
     let v_arr = make_f32_array(&v_data, &v_shape);
 
+    // K packing is sequence-major (`[B, S, kv_h, D]`) — the layout the
+    // fused-QK / flash-decode / sparse phase-1/2 kernels index. Transpose the
+    // head-major `k_arr` heads↔seq and materialize before packing.
+    let k_seq = k_arr
+        .transpose(&[0, 2, 1, 3], device)
+        .expect("transpose k seq-major")
+        .contiguous(device)
+        .expect("contiguous k seq-major");
     let (k_codes, k_scales, k_rot32) =
-        planar_quantize_v4_gpu(&k_arr, device).expect("planar_quantize_v4_gpu");
+        planar_quantize_v4_gpu(&k_seq, device).expect("planar_quantize_v4_gpu");
     let dense = planar_flash_decode_sdpa(
         &q_arr,
         &k_codes,
