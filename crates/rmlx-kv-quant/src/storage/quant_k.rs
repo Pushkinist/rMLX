@@ -64,47 +64,7 @@ pub struct QuantK {
     pub max_seq: i32,
 }
 
-/// Reorder a flat head-major `[B, kv_h, S, D]` buffer to sequence-major
-/// `[B, S, kv_h, D]`. Used by the CPU `append` path to mirror the GPU buffer's
-/// sequence-major layout.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "src/out are sized b*kv_h*s*d; every (bi,h,si) base + d stays in bounds by construction"
-)]
-fn transpose_heads_seq(src: &[f32], b: usize, kv_h: usize, s: usize, d: usize) -> Vec<f32> {
-    let mut out = vec![0.0_f32; b * kv_h * s * d];
-    for bi in 0..b {
-        for h in 0..kv_h {
-            for si in 0..s {
-                let src_base = ((bi * kv_h + h) * s + si) * d;
-                let dst_base = ((bi * s + si) * kv_h + h) * d;
-                out[dst_base..dst_base + d].copy_from_slice(&src[src_base..src_base + d]);
-            }
-        }
-    }
-    out
-}
-
-/// Inverse of [`transpose_heads_seq`]: reorder a flat sequence-major
-/// `[B, S, kv_h, D]` buffer back to head-major `[B, kv_h, S, D]`. Used by the
-/// CPU `dequantize_choice` path so callers see the logical `[B, kv_h, S, D]`.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "src/out are sized b*s*kv_h*d; every (bi,si,h) base + d stays in bounds by construction"
-)]
-fn transpose_seq_heads(src: &[f32], b: usize, s: usize, kv_h: usize, d: usize) -> Vec<f32> {
-    let mut out = vec![0.0_f32; b * s * kv_h * d];
-    for bi in 0..b {
-        for si in 0..s {
-            for h in 0..kv_h {
-                let src_base = ((bi * s + si) * kv_h + h) * d;
-                let dst_base = ((bi * kv_h + h) * s + si) * d;
-                out[dst_base..dst_base + d].copy_from_slice(&src[src_base..src_base + d]);
-            }
-        }
-    }
-    out
-}
+use super::seq_layout::{transpose_heads_seq, transpose_seq_heads};
 
 impl QuantK {
     /// Append a new K slice. Picks CPU or GPU path from `device`.
