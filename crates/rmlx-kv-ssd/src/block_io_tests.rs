@@ -1896,6 +1896,118 @@ fn c2_planar_hydrate_round_trip_no_panic() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Decisive Planar3 V-codec cross-path proof: GPU-quantize → SSD-serialize →
+/// CPU-hydrate must reconstruct V within 3-bit PlanarQuant quant-noise.
+///
+/// This is the real-hardware analogue of the `planarquant.rs` byte-math parity
+/// tests. It exercises the actual boundary the codec fix targets:
+///
+/// 1. A GPU-backed `QuantPlanarV` (bits=3) is built by the real Metal kernel
+///    `planar_quantize_v3_gpu`, which packs codes in the shared 10-vals/u32 word
+///    convention (4 u32 words / 16 bytes per group).
+/// 2. The GPU code/scale/rotation buffers are serialized to a `.kvb` via the
+///    live spill writer (`write_caches` → `write_quant_planar_v` GPU branch).
+/// 3. The block is hydrated on `Device::Cpu`: `read_quant_planar_v` reinterprets
+///    the raw GPU-word bytes as a CPU `PlanarBlocks` and the CPU
+///    `planar_dequantize` decodes them.
+///
+/// Reference is the GPU's own dequant of the same codes (the GPU codec is
+/// path-fixed — it was correct before and after the fix). The CPU-hydrated V is
+/// compared against it.
+///
+/// FAIL on the pre-fix CPU codec: it unpacked the GPU-word byte stream with the
+/// old dense `bit_offset = elem * 3` layout, scrambling indices — cross-decode
+/// error ≈ 1.x. PASS now: both sides share the word convention, so the crossing
+/// is quant-noise small.
+///
+/// Requires Metal / Apple-Silicon GPU.
+#[test]
+#[ignore = "GPU Metal context — run: cargo test -p rmlx-kv-ssd planar3 -- --ignored --test-threads=1"]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "test asserts the Planar variant only; wildcard panics on shape drift"
+)]
+fn planar3_v_gpu_spill_cpu_hydrate_cross_path() {
+    let device = Device::Gpu;
+    // Multi-head GQA-shaped, head_dim 128 (divisible by GROUP_SIZE=32), seq 128.
+    let shape = [1i32, 2, 128, 128];
+    let n: usize = shape.iter().map(|&x| x as usize).product();
+    let k = arr(&lcg(n, 0xF131_AC03), &shape);
+    let v = arr(&lcg(n, 0xF131_AC03 ^ 0x5EED), &shape);
+
+    // ── GPU encode via the real Metal planar3 kernel ──────────────────────────
+    let mut c = KvCache::with_quant_max_seq(KvQuant::Planar3, 4096);
+    c.enter_prefill();
+    c.update(&k, &v, device).unwrap();
+    c.exit_prefill(device).unwrap();
+
+    // GPU reference V reconstruction (codec is identical pre/post fix on GPU).
+    let gpu_ref_v = match c.storage() {
+        KvStorage::Planar {
+            v: Some(qv), bits, ..
+        } => {
+            assert_eq!(*bits, 3, "expected Planar3 (3-bit) V storage");
+            let (_flat, arr_opt) = qv.dequantize_choice(device, Dtype::F32).unwrap();
+            // GPU path always returns Some(Array); None only on the CPU branch.
+            to_vec(&arr_opt.unwrap())
+        }
+        _ => panic!("expected KvStorage::Planar for Planar3"),
+    };
+
+    // ── Spill GPU codes to a .kvb (write_quant_planar_v GPU branch) ───────────
+    let path = tmp_path("planar3_cross_path");
+    write_caches(&path, device, MODEL_ID, KvQuant::Planar3, &[c], &[]).unwrap();
+
+    // ── Hydrate on CPU: GPU-word bytes → PlanarBlocks → CPU planar_dequantize ─
+    let reader = KvBlockReader::open(&path).unwrap();
+    let (rebuilt, _bf16, _) = reader
+        .hydrate(MODEL_ID, KvQuant::Planar3, Device::Cpu)
+        .unwrap();
+    let storage = rebuilt.into_iter().next().unwrap();
+
+    let cpu_hydrated_v = match &storage {
+        KvStorage::Planar {
+            v: Some(qv), bits, ..
+        } => {
+            assert_eq!(*bits, 3, "hydrated Planar3 storage must stay 3-bit");
+            let (flat, _) = qv.dequantize_choice(Device::Cpu, Dtype::F32).unwrap();
+            flat
+        }
+        _ => panic!("expected hydrated KvStorage::Planar"),
+    };
+
+    assert_eq!(
+        gpu_ref_v.len(),
+        cpu_hydrated_v.len(),
+        "GPU reference and CPU-hydrated V length mismatch"
+    );
+
+    // GPU-encode vs CPU-decode of the SAME codes. With a shared word convention
+    // this is f32-rounding noise between the two dequant implementations, not the
+    // ~1.x scrambled-index error the dense pre-fix CPU codec produced.
+    let max_err = gpu_ref_v
+        .iter()
+        .zip(&cpu_hydrated_v)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+
+    assert!(
+        max_err < 5e-3,
+        "planar3 GPU-spill → CPU-hydrate cross-path max abs error {max_err:.6} exceeds 5e-3 — \
+         the CPU codec is not reading the GPU 10-vals/u32 word stream; an SSD hydrate corrupts V"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
 // ── H4 + H5: SWA offset reset on hydration (CPU-runnable) ─────────────────
 
 /// H4 + H5: KvStorage::None (SWA) layer with offset > max_seq must reset

@@ -142,14 +142,18 @@ impl QuantPlanarV {
                     Dtype::U32,
                     device,
                 )?;
-                // C2 + C1 fix: upload CPU PlanarBlocks when initialising a
-                // hydrated layer (prev_seq > 0 and self.blocks non-empty).
+                // Upload CPU PlanarBlocks when initialising a hydrated layer
+                // (prev_seq > 0 and self.blocks non-empty).
                 //
-                // PlanarBlocks CPU layout: `codes: Vec<u8>` (4-bit packed, same
-                // LSB-first bit packing as GPU), `scales: Vec<f32>`, `rotations:
-                // Vec<u8>` (4-bit per pair, 2 pairs per byte — same packing).
-                // Flatten all blocks, reinterpret as bytes, upload via
-                // `Array::from_bytes` + `slice_update`.
+                // PlanarBlocks CPU layout: `codes: Vec<u8>` — 4 little-endian
+                // u32 words (16 bytes) per group of 32 in the shared word
+                // convention (`32 / bits` vals/u32), byte-identical to what the
+                // GPU dequant kernel reads. This holds for BOTH 3-bit (10
+                // vals/u32) and 4-bit (8 vals/u32); a dense 3-bit layout would
+                // not round-trip here. `scales: Vec<f32>`, `rotations: Vec<u8>`
+                // (4-bit rotation index per pair, 2 pairs per byte — also shared
+                // with the GPU). Flatten all blocks, reinterpret as bytes,
+                // upload via `Array::from_bytes` + `slice_update`.
                 let (codes_buf, scales_buf, rot_buf) = if !self.blocks.is_empty() && prev_seq > 0 {
                     let mut flat_codes: Vec<u8> = Vec::new();
                     let mut flat_scales: Vec<f32> = Vec::new();
