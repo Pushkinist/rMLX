@@ -469,6 +469,24 @@ The V side uses `QuantV { bits: 4 }`. Layout:
   `words_per_step = B * kv_h * D * 4 / GROUP_SIZE` (four u32 words per group
   of 32 at 4 bits = 128 bits = 4 u32). Paged growth as in K8V8.
 
+**Buffer layout (sequence-major).** Like `QuantK`, the `QuantV` buffer stores
+the filled prefix **sequence-major** (`[B, S, kv_h, D]`) on both backends:
+`append` reorders the head-major chunk heads↔seq before quantizing (GPU
+`transpose` + `contiguous` so the raw-linear-index TurboQuant MSL kernel sees
+the permuted bytes; CPU reorders `f32_data` and passes the seq-major shape to
+the positional `turbo_quantize_v` / TCQ codec), and `dequantize_choice`
+reshapes the prefix seq-major then transposes back to the logical
+`[B, kv_h, S, D]` (GPU output `contiguous` for raw byte-readers / SSD spill).
+Single-chunk cold prefill is the identity; byte-identical at `head_dim % 32 ==
+0` (every TurboQuant group of 32 stays inside one head). Without this reorder,
+a head-major store read with a `[B, kv_h, S, D]` reshape transposed heads
+whenever `kv_h > 1` and the cache was appended in more than one chunk (the
+post-SSD-hydrate decode-append path) — silent V corruption. The same
+sequence-major ordering applies to the K-side `QuantKTurbo3` / `QuantKTurbo4`
+structs (`TurboSym3` / `TurboSym4`) and to the paged K/V handoff in
+`update_paged` (which reorders `new_k`/`new_v` to seq-major before quantizing,
+since the page slabs are physically token-major).
+
 `update_and_sdpa` path (without TurboFlash):
 1. Append K via `QuantK::append`.
 2. Append V via `QuantV::append` (calls `turbo_quantize_v4_gpu` on GPU).

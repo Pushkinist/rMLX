@@ -46,6 +46,7 @@ mod quant_rotor_k4;
 mod quant_rotor_v3;
 mod quant_rotor_v4;
 mod quant_v;
+mod seq_layout;
 
 pub use kv_storage::{
     KvStorage, ISOV3_LAYOUT_TAG, ISOV4_LAYOUT_TAG, ISO_K_ONLY_3_LAYOUT_TAG,

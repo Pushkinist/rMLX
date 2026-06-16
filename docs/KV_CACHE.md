@@ -490,6 +490,48 @@ affected. The spill / hydrate / paged-grow paths copy the contiguous active
 prefix `[0 .. filled]` and are layout-agnostic, so the on-disk `.kvb` payload is
 unchanged.
 
+### 5.7.2 The same sequence-major rule covers `QuantV`, `QuantKTurbo3/4`, and the paged handoff
+
+The `prev_seq * words_per_seq` write vs head-major reshape is a buffer-shape
+property, not a K-vs-V one, so the sibling flat-buffer storage structs carry the
+**same** latent head-transposition and use the **same** sequence-major fix:
+
+- **`QuantV`** (TurboQuant V — K8V4 / Planar V side, bits=4 GPU + CPU
+  `Vec<TurboBlocks>`): `append` reorders the chunk heads↔seq before quantizing
+  on both backends; `dequantize_choice` reorders back. Byte-identical cold
+  prefill at `head_dim % 32 == 0` (TurboQuant group of 32). The CPU
+  `Vec<TurboBlocks>` path concatenates per-append blocks, so it carries the same
+  cross-block scramble and the same fix.
+- **`QuantKTurbo3` / `QuantKTurbo4`** (symmetric K side of `TurboSym3` /
+  `TurboSym4`): identical TurboQuant codec reuse; the "axis-agnostic" header
+  rationale was the root cause (a *positional* codec means physical buffer order
+  decides correctness across appends).
+- **Paged KV** (`update_paged` → `PagedKStorage` / `PagedVStorage` /
+  `PagedPlanarVStorage`): the page slabs are physically token-major
+  (`words_per_token` per token slot), so `update_paged` reorders the head-major
+  `new_k` / `new_v` to sequence-major **before** quantizing and transposes the
+  dequant output back. `--paged-kv` is default-off.
+
+In every case the GPU side adds `Array::contiguous` after the heads↔seq
+transpose because the custom quant / dequant MSL kernels read their buffers by
+raw linear index and ignore MLX lazy-transpose strides — a CPU-only test cannot
+catch that; the layout fixes are GPU round-trip verified.
+
+**Not yet covered (same class, deferred):** the PlanarQuant K/V structs
+(`QuantPlanarK` / `QuantPlanarV`) carry the same multi-append head scramble
+(reproduced on GPU: chunked decode vs one-shot diverges by ~4 abs at the Bonsai
+shape), but `QuantPlanarK` additionally exposes its packed codes buffer to the
+`planar_fused_qk` / `planar_flash_decode` MSL kernels via `gpu_packed_view`
+(the post-hydrate decode path, gated on `decode_fp16_k.is_none()`). Those
+kernels read the packed buffer with a head-major `(b, kv_h, kv_seq, head_dim)`
+indexing, so a sequence-major storage relayout would also have to relayout the
+fused-QK / flash kernels — a coordinated MSL-kernel change beyond the
+storage-local fix. The Iso / Rotor `Vec<Blocks>` codecs (`QuantIsoV3/V4`,
+`QuantIsoK3/K4`, `QuantRotorV3/V4`, `QuantRotorK3/K4`) share the CPU-blocks
+cross-block reshape and are affected on the same post-hydrate multi-append path;
+their rotation/quaternion sidebands need the reorder applied per codec with its
+own GPU proof.
+
 ### 5.8 TurboQuant requires Flash Attention
 
 The `tq4` V-side path is only valid through the Flash Attention dispatch.
