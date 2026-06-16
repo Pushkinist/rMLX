@@ -340,3 +340,164 @@ fn planar_v3_cpu_parity_deterministic() {
         "planar_v3_cpu_parity",
     );
 }
+
+// ── Cross-path packing parity (CPU bytes ↔ GPU word convention) ───────────────
+//
+// The GPU MSL kernels (`planarquant_msl.rs`) read the `codes` buffer as a flat
+// `[n_groups * 4]` array of u32 words, extracting element `e` of a group via the
+// shared "Planar3 pack convention":
+//
+//   bits=4: word = group*4 + e/8,  shift = (e%8)*4,  mask = 0xF  (8 vals/u32)
+//   bits=3: word = group*4 + e/10, shift = (e%10)*3, mask = 0x7  (10 vals/u32)
+//
+// `QuantPlanarV` (storage/quant_planar_v.rs) hydrates a CPU-encoded layer onto
+// the GPU by reinterpreting the CPU `PlanarBlocks::codes` byte vector as those
+// u32 words. For that round-trip to be lossless the CPU encoder must emit codes
+// in the SAME word convention the GPU reads. These tests prove byte-stream
+// path-independence at the index level.
+
+/// Re-extract one element's index from CPU-encoded `codes` bytes using the GPU
+/// MSL word convention (`vals_per_word = 32 / bits`, group = 4 u32 words).
+fn gpu_word_extract_index(codes: &[u8], group: usize, elem: usize, bits: u8) -> u8 {
+    // CPU writes `code_bytes_per_block` bytes per group; GPU reads 4 u32/group.
+    // Reinterpret the group's bytes as little-endian u32 words (the same view
+    // `Array::from_bytes(.., Dtype::U32)` yields on Apple Silicon).
+    // Intentionally hand-rolled, independent of `unpack_index`, so the parity
+    // check in callers is non-circular (calling `unpack_index` here would make
+    // the test vacuous).
+    let vals_per_word = 32 / bits as usize;
+    let word_in_group = elem / vals_per_word;
+    let shift = (elem % vals_per_word) * bits as usize;
+    let mask = (1u32 << bits) - 1;
+    // 4 u32 words per group regardless of bits (3-bit and 4-bit both 4 words).
+    let byte_base = group * 16 + word_in_group * 4;
+    let mut word = 0u32;
+    for (i, b) in codes.iter().skip(byte_base).take(4).copied().enumerate() {
+        word |= u32::from(b) << (i * 8);
+    }
+    ((word >> shift) & mask) as u8
+}
+
+/// Read one element index out of CPU-encoded `codes` via the codec's own
+/// `unpack_index` — the encoder's exact inverse.
+fn cpu_extract_index(codes: &[u8], group: usize, elem: usize, bits: u8) -> u8 {
+    // 4 u32 words = 16 bytes per block, for both 3-bit and 4-bit.
+    let block = &codes[group * 16..(group + 1) * 16];
+    unpack_index(block, elem, bits)
+}
+
+/// planar4 control: CPU dense byte packing and the GPU 8-vals/u32 word
+/// convention extract identical indices for every element. 4-bit must stay
+/// byte-identical across the CPU/GPU boundary — this guards the fix from
+/// regressing the (already-correct) 4-bit path.
+#[test]
+fn planar4_cpu_bytes_match_gpu_word_convention() {
+    let shape = [1i32, 1, 1, 32]; // exactly one group
+    let data = lcg_data(GROUP_SIZE, 0x0102_0304_u64);
+    let blocks = planar_quantize(&data, GROUP_SIZE, 4, &shape).expect("planar4 encode");
+    assert_eq!(
+        blocks.codes.len(),
+        16,
+        "4-bit: 32 elems × 4 bits = 16 bytes"
+    );
+
+    for elem in 0..GROUP_SIZE {
+        let cpu = cpu_extract_index(&blocks.codes, 0, elem, 4);
+        let gpu = gpu_word_extract_index(&blocks.codes, 0, elem, 4);
+        assert_eq!(
+            cpu, gpu,
+            "planar4 elem {elem}: CPU index {cpu} != GPU word-convention index {gpu} — \
+             4-bit packing must be path-independent"
+        );
+    }
+}
+
+/// planar3 cross-path parity: CPU-encoded `codes` bytes must yield the SAME
+/// element indices whether read with the CPU dense unpacker or the GPU
+/// 10-vals/u32 word convention. Without a unified packing scheme an SSD
+/// spill (CPU encode) → hydrate (GPU read) silently corrupts the V cache.
+///
+/// FAILS on dense CPU packing (12 bytes/group, `bit_offset = elem * 3`);
+/// PASSES once the CPU encoder emits the 10-vals/u32 word convention.
+#[test]
+fn planar3_cpu_bytes_match_gpu_word_convention() {
+    let shape = [1i32, 1, 1, 32]; // exactly one group
+    let data = lcg_data(GROUP_SIZE, 0x0a0b_0c0d_u64);
+    let blocks = planar_quantize(&data, GROUP_SIZE, 3, &shape).expect("planar3 encode");
+
+    let mut mismatches = 0usize;
+    for elem in 0..GROUP_SIZE {
+        let cpu = cpu_extract_index(&blocks.codes, 0, elem, 3);
+        let gpu = gpu_word_extract_index(&blocks.codes, 0, elem, 3);
+        if cpu != gpu {
+            mismatches += 1;
+        }
+    }
+    assert_eq!(
+        mismatches, 0,
+        "planar3: {mismatches}/{GROUP_SIZE} element indices differ between the CPU unpacker \
+         and the GPU 10-vals/u32 word convention — the CPU/GPU byte streams are not \
+         path-independent, so an SSD spill/hydrate across the boundary corrupts V codes"
+    );
+}
+
+/// planar3 full byte-stream round-trip across the CPU/GPU boundary.
+///
+/// Encode on CPU → reinterpret the code bytes via the GPU word convention →
+/// dequantize in rotated space with the same scales/rotations the CPU stored.
+/// The reconstruction error must be quantization-noise small, not the ~1.x
+/// cross-decode error seen when the two packings disagree.
+#[test]
+fn planar3_cross_path_decode_is_quant_noise() {
+    let shape = [1i32, 4, 32, 64];
+    let n: usize = shape.iter().map(|&d| d as usize).product();
+    let data = lcg_data(n, 0xBADD_F00D_u64);
+
+    let blocks = planar_quantize(&data, GROUP_SIZE, 3, &shape).expect("planar3 encode");
+
+    // Reference: the codec's own CPU decode (the correctness anchor).
+    let cpu_recon = planar_dequantize(&blocks).expect("planar3 cpu decode");
+
+    // Cross-path: decode the SAME stored codes/scales/rotations but pull each
+    // code index via the GPU 10-vals/u32 word convention instead of the CPU
+    // dense unpacker. If the packings agree, this matches cpu_recon exactly.
+    let rot_cb = planar_rotation_codebook();
+    let codebook = lloyd_gaussian_codebook(3).expect("3-bit codebook");
+    let n_blocks = n / GROUP_SIZE;
+    let pairs_per_block = GROUP_SIZE / 2;
+    let rot_bytes_per_block = pairs_per_block / 2;
+    let mut cross_recon = vec![0.0_f32; n];
+
+    for block in 0..n_blocks {
+        for pair in 0..pairs_per_block {
+            let scale = blocks.scales[block * pairs_per_block + pair];
+            let rot_byte = blocks.rotations[block * rot_bytes_per_block + pair / 2];
+            let rot_idx = ((rot_byte >> ((pair % 2) * 4)) & 0xF) as usize;
+            let entry = &rot_cb[rot_idx];
+
+            let elem_a = pair * 2;
+            let elem_b = pair * 2 + 1;
+            let idx_a = gpu_word_extract_index(&blocks.codes, block, elem_a, 3) as usize;
+            let idx_b = gpu_word_extract_index(&blocks.codes, block, elem_b, 3) as usize;
+            let ya = codebook[idx_a] * scale;
+            let yb = codebook[idx_b] * scale;
+            // R^T = [[c, s], [-s, c]] (entry = [c, -s, s, c]).
+            let a = entry[0] * ya + entry[2] * yb;
+            let b = entry[1] * ya + entry[3] * yb;
+            cross_recon[block * GROUP_SIZE + elem_a] = a;
+            cross_recon[block * GROUP_SIZE + elem_b] = b;
+        }
+    }
+
+    let cross_err = cpu_recon
+        .iter()
+        .zip(cross_recon.iter())
+        .map(|(&c, &x)| (c - x).abs())
+        .fold(0.0_f32, f32::max);
+
+    assert!(
+        cross_err < 1e-6,
+        "planar3 cross-path (CPU encode → GPU-convention decode) max abs error {cross_err:.6} \
+         vs CPU decode — packing is not path-independent; an SSD hydrate would corrupt V"
+    );
+}

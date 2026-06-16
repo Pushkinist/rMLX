@@ -554,6 +554,16 @@ justifies this for dense full-attention archs at long context.
 - **Decision boundaries**: 7 midpoints (vs 15 for 4-bit).
 - **Mask**: `0x7u` (3 bits, vs `0xFu` for 4-bit).
 
+**Path-independent byte stream.** Both the CPU codec and the MSL kernels pack
+codes in this same word convention (`word = elem / (32/bits)`,
+`shift = (elem % (32/bits)) * bits`, little-endian u32 words), so the code bytes
+round-trip across the CPU/GPU boundary unchanged — required for SSD spill (CPU
+encode) → hydrate (GPU read). For `bits=4` (8 vals/u32) the word convention is
+byte-identical to a dense LSB-first stream; for `bits=3` (10 vals/u32) it is
+**not** dense. A dense 3-bit layout (12 bytes/group) would be misread by the GPU
+as 4 u32 words (16 bytes/group) and silently corrupt the V cache. iso3 and
+rotor3 share this convention; PlanarQuant 3-bit now does too.
+
 The GPU kernels are `planar_quantize_v3_gpu` / `planar_dequantize_v3_gpu` in `planarquant_msl.rs`;
 CPU path uses `planar_quantize(bits=3)` / `planar_dequantize` from `planarquant.rs`.
 
