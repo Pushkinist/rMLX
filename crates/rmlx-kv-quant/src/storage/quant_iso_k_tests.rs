@@ -7,7 +7,8 @@
 
 use crate::isoquant::{iso_decode_fast, iso_encode_fast};
 use crate::storage::quant_iso_k::{QuantIsoK3, ISO_K3_BITS, ISO_K3_GROUP_SIZE};
-use crate::test_utils::{cosine_similarity_per_row, lcg_data, TEST_SEED};
+use crate::test_utils::{cosine_similarity_per_row, lcg_data, skip_if_no_gpu_env, TEST_SEED};
+use rmlx_mlx::Device;
 
 #[test]
 fn quant_iso_k3_new_shapes_correct() {
@@ -166,4 +167,83 @@ fn quant_iso_k3_multi_append_matches_single_shot_gqa() {
         "iso_k3 multi-append vs single-shot max_abs_err = {max_abs:.6} (>= 1.0) — head↔seq scramble"
     );
     let _ = (ISO_K3_BITS, ISO_K3_GROUP_SIZE);
+}
+
+/// GPU multi-append with `kv_h > 1` must match a single-shot CPU-append +
+/// `dequant_gpu` of the concatenated head-major buffer. `dequant_gpu` uploads
+/// CPU blocks via `Array::from_bytes` and drives the iso3 MSL kernel; the
+/// subsequent reshape+transpose reorders sequence-major blocks back to
+/// head-major `[B, kv_h, S, D]`. A head transposition produces errors ~100;
+/// quant noise on this fixture is well under 1.0.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test -p rmlx-kv-quant --release iso_k3_gpu_multi_append -- --ignored --test-threads=1"]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test: panic on failure is the desired test failure mode"
+)]
+fn iso_k3_gpu_multi_append_matches_single_shot_gqa() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    let kv_h = 3_i32;
+    let head_dim = 8_i32; // must be multiple of ISO_K3_GROUP_SIZE (4)
+    let chunk_a = 2_i32;
+    let chunk_b = 3_i32;
+    let s_total = chunk_a + chunk_b;
+
+    let val = |h: i32, s: i32, d: i32| -> f32 {
+        (h as f32) * 100.0 + (s as f32) * 10.0 + (d as f32) * 0.5 + 1.0
+    };
+    let build = |s_lo: i32, s_hi: i32| -> Vec<f32> {
+        let s = s_hi - s_lo;
+        let mut out = vec![0.0_f32; (kv_h * s * head_dim) as usize];
+        for h in 0..kv_h {
+            for si in 0..s {
+                for d in 0..head_dim {
+                    let idx = ((h * s + si) * head_dim + d) as usize;
+                    out[idx] = val(h, s_lo + si, d);
+                }
+            }
+        }
+        out
+    };
+
+    // Reference: single CPU append, then dequant_gpu.
+    let mut qref = QuantIsoK3::new(vec![1, kv_h, 0, head_dim], 64);
+    qref.append(&build(0, s_total), &[1, kv_h, s_total, head_dim])
+        .unwrap();
+    let ref_arr = qref.dequant_gpu(Device::Gpu).unwrap();
+    ref_arr.eval().unwrap();
+    let reference: Vec<f32> = ref_arr
+        .to_bytes()
+        .unwrap()
+        .chunks_exact(4)
+        .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
+        .collect();
+
+    // Two CPU appends, then dequant_gpu.
+    let mut qv = QuantIsoK3::new(vec![1, kv_h, 0, head_dim], 64);
+    qv.append(&build(0, chunk_a), &[1, kv_h, chunk_a, head_dim])
+        .unwrap();
+    qv.append(&build(chunk_a, s_total), &[1, kv_h, chunk_b, head_dim])
+        .unwrap();
+    let multi_arr = qv.dequant_gpu(Device::Gpu).unwrap();
+    multi_arr.eval().unwrap();
+    let multi: Vec<f32> = multi_arr
+        .to_bytes()
+        .unwrap()
+        .chunks_exact(4)
+        .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
+        .collect();
+
+    assert_eq!(multi.len(), reference.len(), "length parity");
+    let max_abs = multi
+        .iter()
+        .zip(reference.iter())
+        .fold(0.0_f32, |m, (a, b)| m.max((a - b).abs()));
+    assert!(
+        max_abs < 1.0,
+        "GPU multi-append vs single-shot max_abs_err = {max_abs:.6} (>= 1.0) — \
+         head↔seq layout scramble"
+    );
 }

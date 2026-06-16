@@ -1,8 +1,8 @@
 //! Unit tests for [`QuantRotorK3`].
-#![allow(unsafe_code)]
 //!
 //! Mirror of `quant_iso_k_tests.rs` adapted to the rotor3 K codec. The
 //! `_with_qjl` / `_no_qjl` variants exercise both QJL branches.
+#![allow(unsafe_code)]
 
 use crate::clifford::make_rotor_table;
 use crate::rotorquant::{n_groups_for, rotor3_decode, rotor3_encode};
