@@ -37,7 +37,15 @@
 //! # Block layout
 //!
 //! Groups of `GROUP_SIZE = 32` elements per block (16 pairs per block):
-//! - `codes`: `GROUP_SIZE * bits / 8` bytes per block (bit-packed LSB-first).
+//! - `codes`: 4 u32 words (16 bytes) per block. Codes use the shared **word
+//!   convention** (`vals_per_word = 32 / bits`): element `e` of a block lives at
+//!   `word = e / vals_per_word`, `shift = (e % vals_per_word) * bits`, within a
+//!   little-endian u32 word. This is the same convention iso3 / rotor3 and the
+//!   PlanarQuant MSL kernels use, so the byte stream is path-independent (CPU
+//!   and GPU produce/consume identical bytes). For `bits=4` (8 vals/u32) this
+//!   is byte-identical to a dense LSB-first stream; for `bits=3` (10 vals/u32,
+//!   30 bits used, 2 wasted per word) it is **not** dense — a dense layout would
+//!   corrupt on any CPU↔GPU round-trip (e.g. SSD spill/hydrate).
 //! - `scales`: `GROUP_SIZE / 2` f32 values per block — **one scale per pair**.
 //! - `rotations`: `GROUP_SIZE / 4` bytes per block — 4-bit rotation index per pair,
 //!   2 indices per byte, packed LSB-first. `GROUP_SIZE/2 = 16` pairs per block,
@@ -115,7 +123,8 @@ fn rotate_t(ya: f32, yb: f32, entry: &[f32; 4]) -> (f32, f32) {
 /// Blocks are `GROUP_SIZE = 32` element groups (16 pairs per block).
 /// Each block has:
 /// - `GROUP_SIZE / 2` f32 scales (one per pair — key difference from TurboQuant)
-/// - `GROUP_SIZE * bits / 8` code bytes (bit-packed LSB-first)
+/// - 4 u32 code words = 16 code bytes (word convention `32 / bits` vals/u32,
+///   path-independent CPU↔GPU; dense only for `bits=4`)
 /// - `GROUP_SIZE / 4` rotation bytes (4 bits per pair, 2 per byte, 8 bytes/block)
 ///
 /// `original_shape` stores the original `[B, kv_h, S, D]` dimensions.
@@ -126,7 +135,9 @@ fn rotate_t(ya: f32, yb: f32, entry: &[f32; 4]) -> (f32, f32) {
 )]
 #[derive(Debug, Clone)]
 pub struct PlanarBlocks {
-    /// Bit-packed quantized indices (LSB-first, `bits` per element).
+    /// Quantized indices packed in the shared word convention
+    /// (`vals_per_word = 32 / bits`, little-endian u32 words, 4 words/block).
+    /// Byte-identical to a dense LSB-first stream only for `bits=4`.
     pub codes: Vec<u8>,
     /// Per-pair scale factors (one per 2 elements, not per 32).
     /// Length = `total_elems / 2`.
@@ -149,6 +160,26 @@ const PAIRS_PER_BLOCK: usize = GROUP_SIZE / 2;
 
 /// Rotation bytes per block: 4-bit per pair, 2 pairs per byte.
 const ROT_BYTES_PER_BLOCK: usize = PAIRS_PER_BLOCK / 2;
+
+/// u32 code words per block under the shared word convention.
+///
+/// `vals_per_word = 32 / bits`. For both supported widths the word count is the
+/// same: `bits=4` → 8 vals/u32 → `ceil(32/8) = 4`; `bits=3` → 10 vals/u32 →
+/// `ceil(32/10) = 4`. Matching the PlanarQuant MSL kernels and iso3/rotor3 so
+/// the byte stream round-trips across the CPU/GPU boundary unchanged.
+const CODE_WORDS_PER_BLOCK: usize = 4;
+
+/// Code bytes per block: 4 u32 words.
+const CODE_BYTES_PER_BLOCK: usize = CODE_WORDS_PER_BLOCK * 4;
+
+/// Values packed per u32 word for `bits`: `32 / bits`.
+///
+/// `bits=3` → 10 (30 bits used, 2 wasted); `bits=4` → 8 (dense). Only 3 and 4
+/// are valid PlanarQuant widths; the codebook lookup rejects others upstream.
+#[inline]
+const fn vals_per_word(bits: u8) -> usize {
+    (32 / bits) as usize
+}
 
 // ── Quantize ──────────────────────────────────────────────────────────────────
 
@@ -285,7 +316,7 @@ pub fn planar_quantize(
 
     let rot_cb = planar_rotation_codebook();
     let n_blocks = total_elems / GROUP_SIZE;
-    let code_bytes_per_block = (GROUP_SIZE * bits as usize).div_ceil(8);
+    let code_bytes_per_block = CODE_BYTES_PER_BLOCK;
     let n_pairs = total_elems / 2;
 
     let mut codes = vec![0u8; n_blocks * code_bytes_per_block];
@@ -433,7 +464,7 @@ pub fn planar_dequantize(blocks: &PlanarBlocks) -> Result<Vec<f32>> {
     let total_elems: usize = blocks.original_shape.iter().map(|&d| d as usize).product();
     let n_blocks = total_elems / GROUP_SIZE;
     let n_pairs = total_elems / 2;
-    let code_bytes_per_block = (GROUP_SIZE * blocks.bits as usize).div_ceil(8);
+    let code_bytes_per_block = CODE_BYTES_PER_BLOCK;
 
     if blocks.scales.len() != n_pairs {
         return Err(err_scales_count(blocks.scales.len(), n_pairs));
@@ -547,61 +578,65 @@ fn nearest_centroid(normalized: f32, codebook: &[f32]) -> usize {
     idx
 }
 
-/// Pack `bits`-wide `index` into `block_bytes` at element position `elem`.
-/// Indices are packed LSB-first.
+/// Pack a `bits`-wide `index` into `block_bytes` at element position `elem`,
+/// using the shared word convention (`vals_per_word = 32 / bits`).
+///
+/// `block_bytes` is one block's code buffer: `CODE_WORDS_PER_BLOCK` little-endian
+/// u32 words (`CODE_BYTES_PER_BLOCK` bytes). Element `elem` maps to
+/// `word = elem / vals_per_word`, `shift = (elem % vals_per_word) * bits` within
+/// that word. A code never straddles a word boundary, so this packs into one
+/// word. This is the same layout the PlanarQuant MSL kernels and iso3/rotor3 use.
 #[inline]
 fn pack_index(block_bytes: &mut [u8], elem: usize, index: u8, bits: u8) {
-    let bit_offset = elem * bits as usize;
-    let mut remaining = bits as usize;
-    let mut shift = bit_offset % 8;
-    let mut byte_idx = bit_offset / 8;
-    let mut val = u32::from(index);
-
-    while remaining > 0 {
-        let take = remaining.min(8 - shift);
-        let mask = ((1u32 << take) - 1) as u8;
-        // byte_idx advances through the byte range occupied by elem; caller passes
-        // block_bytes whose length == code_bytes_per_block, which covers all elems
-        // in the block (GROUP_SIZE * bits / 8 bytes rounded up).
-        #[allow(
-            clippy::indexing_slicing,
-            reason = "byte_idx < block_bytes.len(): block_bytes covers all bits for GROUP_SIZE elements; byte_idx is bounded by the bit-packing arithmetic over valid elem/bits"
-        )]
-        let byte_slot = &mut block_bytes[byte_idx];
-        *byte_slot |= ((val as u8) & mask) << shift;
-        val >>= take;
-        remaining -= take;
-        shift = 0;
-        byte_idx += 1;
-    }
+    let vpw = vals_per_word(bits);
+    let word = elem / vpw;
+    let shift = (elem % vpw) * bits as usize;
+    let mask = (1u32 << bits) - 1;
+    let byte_base = word * 4;
+    // Read-modify-write the target little-endian u32 word in place.
+    // byte_base + 4 <= block_bytes.len(): block_bytes covers CODE_WORDS_PER_BLOCK
+    // words; word = elem/vpw < CODE_WORDS_PER_BLOCK for elem < GROUP_SIZE.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "byte_base+4 <= block_bytes.len(): block_bytes covers CODE_WORDS_PER_BLOCK u32 words; word=elem/vpw < CODE_WORDS_PER_BLOCK for elem < GROUP_SIZE"
+    )]
+    let word_bytes = &mut block_bytes[byte_base..byte_base + 4];
+    let mut w = u32::from_le_bytes(read_word(word_bytes));
+    w |= (u32::from(index) & mask) << shift;
+    word_bytes.copy_from_slice(&w.to_le_bytes());
 }
 
-/// Unpack a `bits`-wide index from `block_bytes` at element position `elem`.
+/// Unpack a `bits`-wide index from `block_bytes` at element position `elem`,
+/// using the shared word convention (`vals_per_word = 32 / bits`).
 #[inline]
 fn unpack_index(block_bytes: &[u8], elem: usize, bits: u8) -> u8 {
-    let bit_offset = elem * bits as usize;
-    let byte_start = bit_offset / 8;
-    let bit_shift = bit_offset % 8;
+    let vpw = vals_per_word(bits);
+    let word = elem / vpw;
+    let shift = (elem % vpw) * bits as usize;
     let mask = (1u32 << bits) - 1;
+    let byte_base = word * 4;
+    // byte_base + 4 <= block_bytes.len(): same invariant as pack_index.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "byte_base+4 <= block_bytes.len(): block_bytes covers CODE_WORDS_PER_BLOCK u32 words; word=elem/vpw < CODE_WORDS_PER_BLOCK for elem < GROUP_SIZE"
+    )]
+    let word_bytes = &block_bytes[byte_base..byte_base + 4];
+    let w = u32::from_le_bytes(read_word(word_bytes));
+    ((w >> shift) & mask) as u8
+}
 
-    // byte_start = (elem * bits) / 8 < block_bytes.len(): block_bytes covers all
-    // bits for GROUP_SIZE elements; elem < GROUP_SIZE is upheld by callers.
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "byte_start < block_bytes.len(): block_bytes covers GROUP_SIZE*bits/8 bytes; elem < GROUP_SIZE ensures byte_start is in bounds"
-    )]
-    let b0 = u32::from(block_bytes[byte_start]);
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "byte_start+1 < block_bytes.len() is checked by the surrounding if condition"
-    )]
-    let b1 = if byte_start + 1 < block_bytes.len() {
-        u32::from(block_bytes[byte_start + 1])
-    } else {
-        0
-    };
-    let window = b0 | (b1 << 8);
-    ((window >> bit_shift) & mask) as u8
+/// Copy a 4-byte slice into a fixed `[u8; 4]` for `u32::from_le_bytes`.
+///
+/// `word` is always a 4-byte sub-slice (`byte_base..byte_base + 4`); the loop
+/// copies exactly the available bytes, leaving the array zero-padded if shorter
+/// (never happens for valid callers, but keeps the helper index-panic-free).
+#[inline]
+fn read_word(word: &[u8]) -> [u8; 4] {
+    let mut buf = [0u8; 4];
+    for (dst, &src) in buf.iter_mut().zip(word.iter()) {
+        *dst = src;
+    }
+    buf
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
