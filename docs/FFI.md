@@ -99,6 +99,31 @@ which return a reference-counted handle to the already-running default
 stream. Freeing the handle decrements the ref-count; the stream and its
 thread are never torn down.
 
+### Per-thread GPU stream context — `ensure_gpu_default_stream`
+
+`with_stream` borrows the process-global default stream, but MLX's
+`eval` materialises arrays through a **thread-local** map of
+`{stream_index → CommandEncoder}`. The encoder entry for a given stream is
+created when `mlx::core::new_stream` runs on that thread. tokio
+blocking-pool worker threads never call `new_stream`, so an `Array::eval()`
+on such a thread can fail with `There is no Stream(gpu, 0) in current
+thread`.
+
+`rmlx_mlx::ensure_gpu_default_stream()` fixes this: it creates a GPU stream
+(registering a fresh `CommandEncoder` for the calling thread), sets it as the
+thread's default, and stores the handle in a thread-local for the thread's
+lifetime. It is idempotent and a no-op when the GPU is unavailable, with zero
+ML-semantic effect.
+
+**Contract:** every blocking-thread inference entry point must call it once
+before any GPU materialisation. Covered entries: the text generate dispatch
+(`arch::generate_greedy`), the image generate dispatch
+(`arch::generate_image` and the server's `run_qwen3vl_image`), the
+speculative-decode blocking closure, the audio-transcription blocking closure
+(`audio.rs` Whisper decode), and the embeddings compute closure
+(`embeddings.rs` `compute_embeddings`). New blocking-pool entry points that
+materialise GPU arrays must follow the same pattern.
+
 ### Null sentinel for optional arguments
 
 Several mlx-c functions accept optional `mlx_array` arguments. When the

@@ -712,6 +712,19 @@ impl Generator for SpeculativeGenerator {
             // (mirrors ArchGenerator). Released on closure exit.
             let _gpu_admission = gpu_admission;
 
+            // Ensure the GPU default stream is registered for the calling
+            // thread. tokio blocking-pool threads start with no GPU stream
+            // context; MLX's array materialisation then fails with "There is
+            // no Stream(gpu, 0) in current thread". The single-arch text path
+            // establishes this in `arch::generate_greedy`, but the speculative
+            // drafter round-loops dispatch into the verifier directly without
+            // going through that entry, so register it here once per thread
+            // entry — covers every drafter variant below with no ML-semantic
+            // effect.
+            if dispatcher.device() == rmlx_mlx::Device::Gpu {
+                rmlx_mlx::ensure_gpu_default_stream();
+            }
+
             tracing::debug!(model_id = %model_id_for_log, k, "spec generate: blocking thread started");
 
             // Full-prefix decode → byte-diff per token (mirrors
