@@ -55,6 +55,45 @@ fn add_two_f32_arrays_gpu() {
     assert_eq!(out, vec![2.0f32, 4.0, 6.0, 8.0]);
 }
 
+/// Smoke test for the blocking-thread GPU stream guard.
+///
+/// The generate entry points call `ensure_gpu_default_stream()` once at the
+/// top of each tokio blocking-pool worker so MLX's per-thread CommandEncoder
+/// map has an entry for `Stream(gpu, 0)` before any `Array::eval()`. This test
+/// runs that exact sequence on a freshly-spawned OS thread (the analog of a
+/// blocking-pool worker that never called `mlx::core::new_stream`): establish
+/// the stream, then materialise a GPU array.
+///
+/// Note: this asserts the guard is safe + idempotent off a worker thread and
+/// that GPU eval succeeds there. It is NOT a strict negative regression — the
+/// "no Stream(gpu, 0)" eval failure is MLX-version- and timing-dependent
+/// (recent mlx-c may lazily register the encoder for the global default stream
+/// on first access), so a bare fresh-thread eval does not reliably fault. The
+/// real cross-path proof is a live serve exercising the speculative / image
+/// generate paths.
+#[test]
+#[ignore = "requires Metal GPU; run with `-- --ignored` in a GPU-capable environment"]
+fn gpu_default_stream_guard_idempotent_on_worker_thread() {
+    let handle = std::thread::spawn(|| {
+        // Establish the GPU default stream for THIS thread, exactly as the
+        // blocking-thread generate entry points do before any materialisation.
+        ensure_gpu_default_stream();
+        // Idempotent: a second call from the same thread is a no-op.
+        ensure_gpu_default_stream();
+
+        let input: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+        let bytes = f32_as_bytes(&input);
+        let shape = [2i32, 2];
+        let a = Array::from_bytes(bytes, &shape, Dtype::F32).unwrap();
+        let b = Array::from_bytes(bytes, &shape, Dtype::F32).unwrap();
+        let c = add(&a, &b, Device::Gpu).unwrap();
+        c.eval().unwrap();
+        bytes_to_f32(&c.to_bytes().unwrap())
+    });
+    let out = handle.join().expect("worker thread panicked");
+    assert_eq!(out, vec![2.0f32, 4.0, 6.0, 8.0]);
+}
+
 #[test]
 fn from_bytes_wrong_size_is_err() {
     let result = Array::from_bytes(&[0u8; 3], &[2, 2], Dtype::F32);
