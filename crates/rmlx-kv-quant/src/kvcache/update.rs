@@ -4742,8 +4742,22 @@ impl KvCache {
         let page_tokens = paged_kv_page_tokens();
         let n_pages = ((max_seq + page_tokens - 1) / page_tokens) as usize;
 
+        // The page slabs store `words_per_token` (all heads) per token slot, so
+        // the physical layout is sequence-major: per token, all heads are
+        // contiguous. `new_k`/`new_v` arrive head-major (`[B, kv_h, S, D]`);
+        // quantizing them directly emits head-major codes that the per-token
+        // page write then mis-indexes (the `prev_seq * words_per_seq` class of
+        // the QuantK / QuantV layout fix). Reorder to sequence-major
+        // `[B, S, kv_h, D]` and materialize (`contiguous`) — the q8 / TurboQuant
+        // / PlanarQuant MSL kernels read their input by raw linear offset and
+        // ignore MLX strides. `gather` then yields a sequence-major prefix;
+        // dequant reshapes sequence-major and transposes back to the logical
+        // `[B, kv_h, S, D]`.
+        let new_k_sm = new_k.transpose(&[0, 2, 1, 3], device)?.contiguous(device)?;
+        let new_v_sm = new_v.transpose(&[0, 2, 1, 3], device)?.contiguous(device)?;
+
         // --- K (always q8_0) ---
-        let (codes_k, scales_k) = q8_quantize_gpu(new_k, device)?;
+        let (codes_k, scales_k) = q8_quantize_gpu(&new_k_sm, device)?;
         let KvStorage::Paged { k, .. } = &mut self.storage else {
             unreachable!()
         };
@@ -4756,18 +4770,24 @@ impl KvCache {
         let total_k = pk.total_tokens;
         let n_pages_k = pk.block_table.len();
         let (gathered_codes_k, gathered_scales_k) = pk.gather(device)?;
+        // `pk.shape` is the accumulated head-major `[B, kv_h, S, D]`; the page
+        // buffer is sequence-major, so dequant into `[B, S, kv_h, D]` then
+        // transpose heads↔seq back to the logical head-major shape.
+        let k_sm_shape = [k_shape[0], k_shape[2], k_shape[1], k_shape[3]];
         let k_full = q8_dequantize_gpu(
             &gathered_codes_k,
             &gathered_scales_k,
-            &k_shape,
+            &k_sm_shape,
             new_k.dtype(),
             device,
-        )?;
+        )?
+        .transpose(&[0, 2, 1, 3], device)?
+        .contiguous(device)?;
 
         // --- V (mode-dependent) ---
         let v_full = match paged_quant {
             KvQuant::K8V8 => {
-                let (codes_v, scales_v) = q8_quantize_gpu(new_v, device)?;
+                let (codes_v, scales_v) = q8_quantize_gpu(&new_v_sm, device)?;
                 let KvStorage::Paged { v_k8, .. } = &mut self.storage else {
                     unreachable!()
                 };
@@ -4782,17 +4802,20 @@ impl KvCache {
                 let pv = v_k8.as_mut().unwrap();
                 pv.append(&new_shape, codes_v, scales_v, device)?;
                 let v_shape = pv.shape.clone();
+                let v_sm_shape = [v_shape[0], v_shape[2], v_shape[1], v_shape[3]];
                 let (gathered_codes_v, gathered_scales_v) = pv.gather(device)?;
                 q8_dequantize_gpu(
                     &gathered_codes_v,
                     &gathered_scales_v,
-                    &v_shape,
+                    &v_sm_shape,
                     new_v.dtype(),
                     device,
                 )?
+                .transpose(&[0, 2, 1, 3], device)?
+                .contiguous(device)?
             }
             KvQuant::K8V4 => {
-                let (codes_v, scales_v) = turbo_quantize_v4_gpu(new_v, device)?;
+                let (codes_v, scales_v) = turbo_quantize_v4_gpu(&new_v_sm, device)?;
                 let KvStorage::Paged { v_k8, .. } = &mut self.storage else {
                     unreachable!()
                 };
@@ -4807,17 +4830,20 @@ impl KvCache {
                 let pv = v_k8.as_mut().unwrap();
                 pv.append(&new_shape, codes_v, scales_v, device)?;
                 let v_shape = pv.shape.clone();
+                let v_sm_shape = [v_shape[0], v_shape[2], v_shape[1], v_shape[3]];
                 let (gathered_codes_v, gathered_scales_v) = pv.gather(device)?;
                 turbo_dequantize_v4_gpu(
                     &gathered_codes_v,
                     &gathered_scales_v,
-                    &v_shape,
+                    &v_sm_shape,
                     new_v.dtype(),
                     device,
                 )?
+                .transpose(&[0, 2, 1, 3], device)?
+                .contiguous(device)?
             }
             KvQuant::Planar => {
-                let (codes_v, scales_v, rotations_v) = planar_quantize_v4_gpu(new_v, device)?;
+                let (codes_v, scales_v, rotations_v) = planar_quantize_v4_gpu(&new_v_sm, device)?;
                 let KvStorage::Paged { v_planar, .. } = &mut self.storage else {
                     unreachable!()
                 };
@@ -4831,15 +4857,18 @@ impl KvCache {
                 let pv = v_planar.as_mut().unwrap();
                 pv.append(&new_shape, codes_v, scales_v, rotations_v, device)?;
                 let v_shape = pv.shape.clone();
+                let v_sm_shape = [v_shape[0], v_shape[2], v_shape[1], v_shape[3]];
                 let (gathered_codes_v, gathered_scales_v, gathered_rotations_v) =
                     pv.gather(device)?;
                 let out = planar_dequantize_v4_gpu(
                     &gathered_codes_v,
                     &gathered_scales_v,
                     &gathered_rotations_v,
-                    &v_shape,
+                    &v_sm_shape,
                     device,
-                )?;
+                )?
+                .transpose(&[0, 2, 1, 3], device)?
+                .contiguous(device)?;
                 if out.dtype() == new_v.dtype() {
                     out
                 } else {
