@@ -214,6 +214,119 @@ fn quant_k_turbo3_from_cpu_blocks_max_seq_explicit() {
     assert_eq!(decoded.len(), data.len(), "decoded length must match input");
 }
 
+// ── Multi-append GQA layout round-trip ───────────────────────────────────────
+
+/// Distinct, small per-(head,token,dim) value so a head transposition (which
+/// swaps in a value differing by ≥ ~0.1) is obvious against q3 noise.
+fn rt_expected(h: i32, s: i32, d: i32) -> f32 {
+    (h * 100 + s * 5 + d % 7) as f32 * 0.001
+}
+
+/// Head-major flat `[1, kv_h, seq, d]` chunk — the layout `append` receives.
+fn rt_head_major_chunk(kv_h: i32, seq: i32, d: i32, base_s: i32) -> Vec<f32> {
+    let mut v = Vec::with_capacity((kv_h * seq * d) as usize);
+    for h in 0..kv_h {
+        for s in 0..seq {
+            for dd in 0..d {
+                v.push(rt_expected(h, base_s + s, dd));
+            }
+        }
+    }
+    v
+}
+
+fn rt_check(out: &[f32], kv_h: i32, s_total: i32, d: i32) -> f32 {
+    let mut m = 0.0_f32;
+    let mut i = 0usize;
+    for h in 0..kv_h {
+        for s in 0..s_total {
+            for dd in 0..d {
+                m = m.max((out[i] - rt_expected(h, s, dd)).abs());
+                i += 1;
+            }
+        }
+    }
+    m
+}
+
+#[allow(unsafe_code)]
+#[allow(
+    clippy::expect_used,
+    reason = "test: array construction from a fixed in-bounds buffer cannot fail"
+)]
+fn rt_f32_array(vals: &[f32], shape: &[i32]) -> Array {
+    // SAFETY: f32 is 4-byte LE; from_bytes copies immediately.
+    let bytes = unsafe { std::slice::from_raw_parts(vals.as_ptr().cast::<u8>(), vals.len() * 4) };
+    Array::from_bytes(bytes, shape, Dtype::F32).expect("rt_f32_array")
+}
+
+/// Two head-major appends, kv_h=3: the pre-fix head-major store + head-major
+/// reshape scrambled heads across the two blocks. The seq-major reorder fixes
+/// it; max-err must be q3 noise, not a head swap.
+#[test]
+fn quant_k_turbo3_two_append_multi_head_roundtrip() {
+    let (kv_h, d) = (3, 32);
+    let mut qk = QuantKTurbo3::new(vec![1, kv_h, 0, d], 512);
+    let c0 = rt_head_major_chunk(kv_h, 2, d, 0);
+    let c1 = rt_head_major_chunk(kv_h, 1, d, 2);
+    cpu_append(&mut qk, &c0, &[1, kv_h, 2, d]);
+    cpu_append(&mut qk, &c1, &[1, kv_h, 1, d]);
+    let out = qk.dequant().expect("dequant");
+    let m = rt_check(&out, kv_h, 3, d);
+    assert!(
+        m < 0.05,
+        "turbo3 kv_h=3 two-append max abs error {m} — expected q3 noise, not head scramble"
+    );
+}
+
+/// GPU two-append multi-head round-trip — the path the layout bug lived on.
+#[test]
+#[ignore = "GPU Metal context — run explicitly: -- --ignored --test-threads=1"]
+#[allow(
+    clippy::expect_used,
+    reason = "test: structural invariant established by construction; .expect() documents it"
+)]
+fn quant_k_turbo3_gpu_two_append_multi_head_roundtrip() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    let (kv_h, d) = (2, 32);
+    let mut qk = QuantKTurbo3::new(vec![1, kv_h, 0, d], 512);
+    let c0 = rt_head_major_chunk(kv_h, 2, d, 0);
+    let c1 = rt_head_major_chunk(kv_h, 1, d, 2);
+    qk.append(
+        &[],
+        &[1, kv_h, 2, d],
+        &rt_f32_array(&c0, &[1, kv_h, 2, d]),
+        Device::Gpu,
+        512,
+    )
+    .expect("append0");
+    qk.append(
+        &[],
+        &[1, kv_h, 1, d],
+        &rt_f32_array(&c1, &[1, kv_h, 1, d]),
+        Device::Gpu,
+        512,
+    )
+    .expect("append1");
+    let (_, gpu) = qk
+        .dequantize_choice(Device::Gpu, Dtype::F32)
+        .expect("dequant");
+    let gpu = gpu.expect("gpu array");
+    gpu.eval().expect("eval");
+    let bytes = gpu.to_bytes().expect("to_bytes");
+    let out: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().expect("chunk")))
+        .collect();
+    let m = rt_check(&out, kv_h, 3, d);
+    assert!(
+        m < 0.05,
+        "turbo3 GPU kv_h=2 two-append max abs error {m} — expected q3 noise, not head scramble"
+    );
+}
+
 // ── Parity: CPU == MSL (ignored, requires Metal) ─────────────────────────────
 
 /// Parity test: CPU path vs MSL kernel — both must decode to within 1e-5.
