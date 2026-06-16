@@ -1094,6 +1094,17 @@ impl Architecture {
     ) -> Result<Vec<crate::decode_loop::ProbeStep>> {
         use crate::kv_cache::KvCacheBuilder;
         use rmlx_kv_quant::KvQuant;
+
+        // Ensure the GPU default stream is registered for the calling thread.
+        // tokio blocking-pool threads start with no GPU stream context; MLX's
+        // array materialisation then fails with "There is no Stream(gpu, 0) in
+        // current thread". Registering the process-global GPU stream once per
+        // thread entry point avoids this without changing any ML semantics.
+        // Mirrors the text `generate_greedy` entry.
+        if device == Device::Gpu {
+            rmlx_mlx::ensure_gpu_default_stream();
+        }
+
         match self {
             Architecture::Gemma4(m) => {
                 // `for_arch_default` deprecated; no ModelConfig at this call site → keep K8V8.
