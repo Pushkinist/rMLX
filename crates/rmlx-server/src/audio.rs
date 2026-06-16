@@ -251,6 +251,14 @@ async fn handle_audio(state: AppState, mut multipart: Multipart, task: WhisperTa
 
         let device = Device::Gpu;
 
+        // Registering a thread-local GPU stream + CommandEncoder once per thread entry point.
+        // tokio blocking-pool threads start with no GPU stream context; MLX's array
+        // materialisation then fails with "There is no Stream(gpu, 0) in current thread".
+        // Mirrors the pattern used at the text and image generate entry points.
+        if device == Device::Gpu {
+            rmlx_mlx::ensure_gpu_default_stream();
+        }
+
         // Resolve model + tokenizer from cache, loading on first call.
         //
         // Read path (fast): no allocation, just Arc::clone while holding the
