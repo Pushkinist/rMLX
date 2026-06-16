@@ -208,10 +208,14 @@ methods trigger execution:
 
 ### Data readback
 
-`Array::to_bytes()` calls `mlx_array_data_uint8` to obtain a raw pointer to
-the materialized buffer, then copies into a `Vec<u8>`. The pointer is valid
-only for the lifetime of the `Array` object and only after the graph has been
-materialized; the method returns `Err` if the pointer is null.
+`Array::to_bytes()` forces evaluation (`eval()`) before reading, then calls
+`mlx_array_data_uint8` to obtain a raw pointer to the materialized buffer and
+copies into a `Vec<u8>`. Because it materializes internally, callers do not
+need a preceding `eval()` / `async_eval()` for correctness — an upstream
+`async_eval()` stays a pipelining hint, not a correctness prerequisite (the
+data pointer is not guaranteed valid until evaluation has actually run). The
+pointer is valid only for the lifetime of the `Array` object; the method
+returns `Err` if the pointer is null.
 
 ```rust
 // SAFETY: ptr is non-null and points to `nbytes` contiguous bytes owned
