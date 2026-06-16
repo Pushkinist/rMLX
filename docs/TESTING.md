@@ -454,3 +454,22 @@ They are read only inside test code (`tests/` and `*_tests.rs` files).
 | `RMLX_FUSED_QK_STRICT` | `1` | Fail (not warn) on fused-QK parity tests. |
 | `RMLX_RETURNING_KV_STRICT` | `1` | Fail (not warn) on returning-KV dispatch parity tests. |
 | `RMLX_SPARSE_ATTN_STRICT` | `1` | Fail (not warn) on sparse-attn dispatch parity tests. |
+
+---
+
+## In-process tests must not rely on the `paths::home()` `OnceLock`
+
+`rmlx_core::paths::home()` caches its resolved root in a `OnceLock` — fixed
+for the lifetime of the process. In-process unit tests share one process, so a
+test that does `std::env::set_var("RMLX_HOME", tmp)` and then reads a
+`paths::*` path **races every other test in the same binary**: whichever test
+resolves `home()` first pins the root, and a later `set_var` is silently
+ignored. The path then points at the workspace `.rmlx/` instead of the temp
+dir, which both flakes the test and leaks artifacts into the checkout.
+
+For in-process tests, **inject the root explicitly** — pass a temp path to the
+routine under test (open SQLite via `SsdKvIndex::open_at(&db_path)`, write
+fixture files under the temp dir) rather than going through `paths::home()`.
+Setting `RMLX_HOME` is only hermetic for **subprocess** tests
+(`Command::new(...).env("RMLX_HOME", tmp)`), where the child gets a fresh
+`OnceLock`.
