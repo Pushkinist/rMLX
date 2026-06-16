@@ -59,7 +59,10 @@ fn head_major(kv_h: i32, seq: i32, d: i32, base_t: i32) -> Vec<f32> {
     v
 }
 
-/// Mirror of `update_paged`'s K handoff with the sequence-major fix.
+/// Mirror of `update_paged`'s K handoff with the sequence-major fix. This guards
+/// the handoff *pattern* (transpose+contiguous before quantize, transpose back on
+/// dequant), not the `update_paged` call site itself — keep in sync with
+/// `KvCache::update_paged` if that reorder changes.
 fn append_chunk(pk: &mut PagedKStorage, kv_h: i32, seq: i32, d: i32, base_t: i32) {
     let shape = [1, kv_h, seq, d];
     let k_hm = arr(&head_major(kv_h, seq, d, base_t), &shape);
