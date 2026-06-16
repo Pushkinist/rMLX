@@ -356,7 +356,14 @@ impl QuantK {
                 // kernel writes bf16/f16/f32 — no follow-up astype.
                 let seq_major_shape = [self.shape[0], s, self.shape[1], self.shape[3]];
                 let out = q8_dequantize_gpu(&codes, &scales, &seq_major_shape, out_dtype, device)?;
-                let out = out.transpose(&[0, 2, 1, 3], device)?;
+                // Materialize the heads↔seq transpose into a row-major buffer.
+                // `transpose` alone yields a strided view: stride-honoring MLX ops
+                // (SDPA) read it correctly, but a raw byte read (`to_bytes`, SSD
+                // spill, a custom kernel) sees the un-permuted sequence-major
+                // bytes and scrambles heads↔seq. Forcing contiguity makes the
+                // physical layout match the logical `[B, kv_h, S, D]` shape for
+                // every consumer.
+                let out = out.transpose(&[0, 2, 1, 3], device)?.contiguous(device)?;
                 return Ok((Vec::new(), Some(out)));
             }
             return Ok((Vec::new(), None));
