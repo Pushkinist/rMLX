@@ -178,8 +178,12 @@ fn wipe_is_noop_on_v2_namespace() {
 
 /// Startup maintenance: an over-budget namespace index is evicted until the
 /// on-disk footprint is within budget, and the evicted `.kvb` files are
-/// deleted from disk. Also exercises `prune_missing`. Hermetic via an
-/// `RMLX_HOME` tempdir.
+/// deleted from disk. Also exercises `prune_missing`.
+///
+/// Hermetic via an explicit temp dir injected into `SsdKvIndex::open_at` and
+/// `startup_maintenance` — the routine takes its opened index by reference, so
+/// the test never resolves the process-global `paths::home()` `OnceLock` and is
+/// immune to its set-once-per-process ordering hazard under parallel runs.
 #[test]
 #[allow(
     clippy::unwrap_used,
@@ -187,23 +191,14 @@ fn wipe_is_noop_on_v2_namespace() {
 )]
 fn startup_maintenance_prunes_and_evicts_to_budget() {
     let tmp = tempfile::TempDir::new().unwrap();
-    // SAFETY: edition 2021; single-threaded test, set before paths::home()
-    // is first resolved in this process for this namespace.
-    std::env::set_var("RMLX_HOME", tmp.path());
-
     let ns = "test-ns";
-    let dir = rmlx_core::paths::kv_cache_dir(ns);
-    // `rmlx_core::paths::home()` is a OnceLock — if a prior test in
-    // this process resolved it before the `RMLX_HOME` set above, the dir
-    // path resolves into the workspace `.rmlx/` and may carry a stale v1
-    // schema DB. Wipe the namespace dir first so the fixture below starts
-    // from a clean v2-schema state every time.
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::create_dir_all(&dir);
+    let dir = tmp.path().join(ns);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("index.db");
     let lk: u64 = 0xa1b2_c3d4_e5f6_a7b8;
 
     {
-        let idx = SsdKvIndex::open(ns).unwrap();
+        let idx = SsdKvIndex::open_at(&db_path).unwrap();
         // Three 1000-byte real files + one ghost row (file never written).
         for name in ["aaa", "bbb", "ccc"] {
             let p = dir.join(format!("{name}.kvb"));
@@ -215,18 +210,16 @@ fn startup_maintenance_prunes_and_evicts_to_budget() {
         assert_eq!(idx.total_bytes().unwrap(), 3000 + 9999);
     }
 
-    startup_maintenance(ns, 1500);
+    let idx = SsdKvIndex::open_at(&db_path).unwrap();
+    startup_maintenance(&idx, ns, 1500);
 
-    let idx2 = SsdKvIndex::open(ns).unwrap();
-    assert!(idx2.lookup("ghost", lk).unwrap().is_none());
-    assert!(idx2.total_bytes().unwrap() <= 1500);
+    assert!(idx.lookup("ghost", lk).unwrap().is_none());
+    assert!(idx.total_bytes().unwrap() <= 1500);
     let surviving_files = ["aaa", "bbb", "ccc"]
         .iter()
         .filter(|n| dir.join(format!("{n}.kvb")).exists())
         .count();
     assert!(surviving_files <= 1);
-
-    std::env::remove_var("RMLX_HOME");
 }
 
 /// unit test: double `install_config` returns `Err(SsdTierAlreadyInstalled)`.
