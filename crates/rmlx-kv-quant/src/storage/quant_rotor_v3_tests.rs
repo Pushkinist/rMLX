@@ -116,3 +116,64 @@ fn quant_rotor_v3_deep_clone() {
     assert_eq!(cloned.blocks[0].codes, qv.blocks[0].codes);
     assert_eq!(cloned.layer_idx, qv.layer_idx);
 }
+
+/// Multi-append with `kv_h > 1` must match a single-shot append of the
+/// concatenated head-major buffer (head↔seq layout invariant). The static
+/// rotor table is group-position-keyed (not token), so the seq-major reorder
+/// leaves it correctly associated. Per-(head, token, dim) distinct values
+/// surface any head transposition as a large error.
+#[test]
+fn quant_rotor_v3_multi_append_matches_single_shot_gqa() {
+    let kv_h = 3_usize;
+    let head_dim = 96_usize;
+    let chunk_a = 2_usize;
+    let chunk_b = 3_usize;
+    let s_total = chunk_a + chunk_b;
+    let val = |h: usize, s: usize, d: usize| {
+        (h as f32) * 100.0 + (s as f32) * 10.0 + (d as f32) * 0.5 + 1.0
+    };
+    let build = |s_lo: usize, s_hi: usize| -> Vec<f32> {
+        let s = s_hi - s_lo;
+        let mut out = vec![0.0_f32; kv_h * s * head_dim];
+        for h in 0..kv_h {
+            for si in 0..s {
+                for d in 0..head_dim {
+                    out[(h * s + si) * head_dim + d] = val(h, s_lo + si, d);
+                }
+            }
+        }
+        out
+    };
+    // Same layer_idx so both caches share the same static rotor table.
+    let mut qref = QuantRotorV3::new(vec![1, kv_h as i32, 0, head_dim as i32], 64, 7);
+    qref.append(
+        &build(0, s_total),
+        &[1, kv_h as i32, s_total as i32, head_dim as i32],
+    )
+    .unwrap();
+    let reference = qref.dequant().unwrap();
+
+    let mut qv = QuantRotorV3::new(vec![1, kv_h as i32, 0, head_dim as i32], 64, 7);
+    qv.append(
+        &build(0, chunk_a),
+        &[1, kv_h as i32, chunk_a as i32, head_dim as i32],
+    )
+    .unwrap();
+    qv.append(
+        &build(chunk_a, s_total),
+        &[1, kv_h as i32, chunk_b as i32, head_dim as i32],
+    )
+    .unwrap();
+    let multi = qv.dequant().unwrap();
+
+    assert_eq!(multi.len(), reference.len());
+    let max_abs = multi
+        .iter()
+        .zip(reference.iter())
+        .fold(0.0_f32, |m, (a, b)| m.max((a - b).abs()));
+    assert!(
+        max_abs < 1.0,
+        "rotor3 multi-append vs single-shot max_abs_err = {max_abs:.6} (>= 1.0) — head↔seq scramble"
+    );
+    let _ = ROTOR3_V_BITS;
+}

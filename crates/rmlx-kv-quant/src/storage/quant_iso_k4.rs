@@ -70,12 +70,20 @@ impl QuantIsoK4 {
                 "QuantIsoK4::append: expected 4D new_shape, got {new_shape:?}"
             )));
         }
+        let b = new_shape[0] as usize;
+        let kv_h = new_shape[1] as usize;
+        let new_seq = new_shape[2] as usize;
         let head_dim = new_shape[3] as usize;
-        let n_tokens_total =
-            (new_shape[0] as usize) * (new_shape[1] as usize) * (new_shape[2] as usize);
+        let n_tokens_total = b * kv_h * new_seq;
+
+        // Store each chunk sequence-major so the per-append blocks share one
+        // layout; a head-major store transposes heads across multi-append GQA
+        // caches (kv_h>1). See [`super::QuantIsoV3::append`].
+        let seq_major =
+            super::seq_layout::transpose_heads_seq(f32_data, b, kv_h, new_seq, head_dim);
 
         let (codes, scales, quaternions, norms) =
-            iso_encode_fast(f32_data, head_dim, ISO_K4_GROUP_SIZE, ISO_K4_BITS).map_err(
+            iso_encode_fast(&seq_major, head_dim, ISO_K4_GROUP_SIZE, ISO_K4_BITS).map_err(
                 |e: IsoQuantError| rmlx_core::error::Error::Mlx(format!("iso_k4 encode: {e}")),
             )?;
 
@@ -203,6 +211,12 @@ impl QuantIsoK4 {
         } else if out.len() > total_elems {
             out.truncate(total_elems);
         }
+        // Blocks are sequence-major (see `append`); reorder back to head-major
+        // `[B, kv_h, S, D]`.
+        let b = self.shape[0] as usize;
+        let kv_h = self.shape[1] as usize;
+        let s = self.shape[2] as usize;
+        let out = super::seq_layout::transpose_seq_heads(&out, b, s, kv_h, head_dim);
         Ok(out)
     }
 }

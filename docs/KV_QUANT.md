@@ -1550,6 +1550,26 @@ No NaN/Inf, no infinite loops, 8-token generations complete. Decode TPS
 reflects CPU-heavy V dequant on the initial version; GPU encode path reduces
 overhead.
 
+**Sequence-major buffer layout (whole Iso / Rotor family).** Every `Vec<Blocks>`
+rotation-KV codec — `QuantIsoV3` / `QuantIsoV4`, `QuantIsoK3` / `QuantIsoK4`,
+`QuantRotorV3` / `QuantRotorV4`, `QuantRotorK3` / `QuantRotorK4` — accumulates
+one `*Blocks` entry per `append` and concatenates them on `dequant`. Because
+the caller reshapes the concatenation head-major `[B, kv_h, S, D]`, a head-major
+per-block store transposes per-head values across a multi-append GQA cache
+(`kv_h > 1`, e.g. the post-SSD-hydrate decode-append path) — the same head
+scramble fixed for `QuantK` / `QuantV`. Each `append` now reorders the
+head-major chunk heads↔seq (`[B, new_seq, kv_h, D]`) before encoding and
+`dequant` reorders back; single-chunk cold prefill is the identity. The codec is
+per-token-row positional, so the sidebands stay correctly associated: Iso
+per-(token, group) scale/norm and the constant `FIXED_QUAT` quaternion permute
+with the rows; the Rotor static rotor table and QJL projection are
+group/projection-keyed (untouched) while the per-token QJL `qjl_codes` /
+`qjl_norms` permute with the rows. `QuantIsoV3` is the only GPU-resident member
+and adds `Array::contiguous` after the heads↔seq transpose before its
+raw-linear-index MSL encode kernel. The `.kvb` SSD format is byte-stable (only
+the token-row order within a block changes). GPU round-trip verified on
+`QuantIsoV3` (two-append GQA vs single-shot). See `docs/KV_CACHE.md` §5.7.3.
+
 ---
 
 ### iso4 codec
