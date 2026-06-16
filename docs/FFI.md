@@ -118,8 +118,10 @@ ML-semantic effect.
 **Contract:** every blocking-thread inference entry point must call it once
 before any GPU materialisation. Covered entries: the text generate dispatch
 (`arch::generate_greedy`), the image generate dispatch
-(`arch::generate_image` and the server's `run_qwen3vl_image`), and the
-speculative-decode blocking closure. New blocking-pool entry points that
+(`arch::generate_image` and the server's `run_qwen3vl_image`), the
+speculative-decode blocking closure, the audio-transcription blocking closure
+(`audio.rs` Whisper decode), and the embeddings compute closure
+(`embeddings.rs` `compute_embeddings`). New blocking-pool entry points that
 materialise GPU arrays must follow the same pattern.
 
 ### Null sentinel for optional arguments

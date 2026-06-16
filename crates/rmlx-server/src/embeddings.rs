@@ -598,6 +598,14 @@ fn compute_embeddings(
 
     let device = rmlx_mlx::Device::Gpu;
 
+    // Registering a thread-local GPU stream + CommandEncoder once per thread entry point.
+    // tokio blocking-pool threads start with no GPU stream context; MLX's array
+    // materialisation then fails with "There is no Stream(gpu, 0) in current thread".
+    // Mirrors the pattern used at the text and image generate entry points.
+    if device == rmlx_mlx::Device::Gpu {
+        rmlx_mlx::ensure_gpu_default_stream();
+    }
+
     // Build (single_vec | multi_vec) per item with a uniform serializer so
     // the response shape is identical for text and image.
     let mut data = Vec::new();
