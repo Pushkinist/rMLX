@@ -263,7 +263,7 @@ fn quant_planar_k_oneshot_vs_chunked_append_parity() {
     );
 }
 
-// ── Multi-append GQA head/seq-layout regression (the #105-class bug) ──────────
+// ── Multi-append GQA head/seq-layout regression (multi-token-after-prefill scramble) ──
 //
 // The chunked-vs-oneshot parity test above never triggers the head-scramble:
 // its chunked schedule is a multi-token prefill at `prev_seq == 0` followed by
@@ -361,10 +361,10 @@ fn quant_planar_k_cpu_multi_append_gqa_head_layout() {
 }
 
 /// GPU diagnostic: the same multi-append GQA head-layout contract on the Metal
-/// path. This is the path the fused-QK / flash-decode kernels read via
-/// `gpu_packed_view`; the dequant head-major view shares the SAME packed buffer
-/// and index contract, so a head-major dequant pass-here proves the packed
-/// buffer the kernels index is head-major-correct after a multi-token append.
+/// path. This proves the packed buffer round-trips to head-major after a
+/// multi-token append; the kernel-index agreement (fused-QK / flash-decode /
+/// sparse read via `gpu_packed_view`) is covered separately by the fused-QK /
+/// flash / sparse parity tests at `kv_h > 1`.
 #[test]
 #[ignore = "GPU Metal context — cargo test quant_planar_k_gpu_multi_append_gqa -- --ignored --test-threads=1"]
 fn quant_planar_k_gpu_multi_append_gqa_head_layout() {
