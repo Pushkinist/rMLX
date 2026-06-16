@@ -272,7 +272,12 @@ impl QuantK {
             // the stored layout self-consistent across any number of appends and
             // any `kv_h`. With a single chunk (`prev_seq == 0`, `new_seq == S`)
             // this is the identity for the dequant view, so the cold-prefill
-            // path is unchanged.
+            // path stays logically correct. It is byte-identical to the pre-fix
+            // head-major grouping ONLY when `D % 128 == 0` (each q8 group of 128
+            // stays inside one head — e.g. linear head_dim=128); for `D` not a
+            // multiple of 128 (e.g. head_dim=64) a group spans a (head,token)
+            // boundary, so per-group `abs_max` scales differ from the head-major
+            // grouping — logically correct and within q8 noise, but not bit-exact.
             let k_seq_major = k_arr.transpose(&[0, 2, 1, 3], device)?;
             let (new_codes, new_scales) = q8_quantize_gpu(&k_seq_major, device)?;
 
@@ -342,9 +347,13 @@ impl QuantK {
                 // prefix lays out as `[B, S, kv_h, D]`. Dequant into that shape,
                 // then transpose heads↔seq back to the logical `[B, kv_h, S, D]`
                 // that callers expect. For a single-chunk cache this transpose is
-                // the inverse of the append-side transpose, so the round-trip is
-                // exact. Pass out_dtype directly: kernel writes bf16/f16/f32 — no
-                // follow-up astype.
+                // the inverse of the append-side transpose, so the logical
+                // round-trip is exact (within q8 noise). It reproduces the pre-fix
+                // head-major output bit-for-bit ONLY when `D % 128 == 0`; for `D`
+                // not a multiple of 128 the q8 grouping differs (see `append`), so
+                // a debugger comparing decode logits against the base commit will
+                // see q8-noise-level deltas, not zero. Pass out_dtype directly:
+                // kernel writes bf16/f16/f32 — no follow-up astype.
                 let seq_major_shape = [self.shape[0], s, self.shape[1], self.shape[3]];
                 let out = q8_dequantize_gpu(&codes, &scales, &seq_major_shape, out_dtype, device)?;
                 let out = out.transpose(&[0, 2, 1, 3], device)?;
