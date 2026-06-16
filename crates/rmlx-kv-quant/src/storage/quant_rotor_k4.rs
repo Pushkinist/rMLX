@@ -120,9 +120,11 @@ impl QuantRotorK4 {
                 "QuantRotorK4::append: expected 4D new_shape, got {new_shape:?}"
             )));
         }
+        let b = new_shape[0] as usize;
+        let kv_h = new_shape[1] as usize;
+        let new_seq = new_shape[2] as usize;
         let head_dim = new_shape[3] as usize;
-        let n_tokens_total =
-            (new_shape[0] as usize) * (new_shape[1] as usize) * (new_shape[2] as usize);
+        let n_tokens_total = b * kv_h * new_seq;
 
         if self.rotors.is_empty() {
             let n_groups = n_groups_for(head_dim);
@@ -132,8 +134,15 @@ impl QuantRotorK4 {
             }
         }
 
+        // Store each chunk sequence-major so the per-append blocks share one
+        // layout; static rotor/QJL projection are group/projection-keyed and
+        // the per-token QJL sideband reorders with the token rows. See
+        // [`super::QuantIsoV3::append`].
+        let seq_major =
+            super::seq_layout::transpose_heads_seq(f32_data, b, kv_h, new_seq, head_dim);
+
         let (codes, scales, norms, qjl_codes, qjl_norms) = rotor4_k_encode(
-            f32_data,
+            &seq_major,
             &self.rotors,
             head_dim,
             self.qjl_s_matrix.as_deref(),
@@ -285,6 +294,12 @@ impl QuantRotorK4 {
         } else if out.len() > total_elems {
             out.truncate(total_elems);
         }
+        // Blocks are sequence-major (see `append`); reorder back to head-major
+        // `[B, kv_h, S, D]`.
+        let b = self.shape[0] as usize;
+        let kv_h = self.shape[1] as usize;
+        let s = self.shape[2] as usize;
+        let out = super::seq_layout::transpose_seq_heads(&out, b, s, kv_h, head_dim);
         Ok(out)
     }
 }

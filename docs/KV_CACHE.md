@@ -526,11 +526,42 @@ shape), but `QuantPlanarK` additionally exposes its packed codes buffer to the
 kernels read the packed buffer with a head-major `(b, kv_h, kv_seq, head_dim)`
 indexing, so a sequence-major storage relayout would also have to relayout the
 fused-QK / flash kernels — a coordinated MSL-kernel change beyond the
-storage-local fix. The Iso / Rotor `Vec<Blocks>` codecs (`QuantIsoV3/V4`,
-`QuantIsoK3/K4`, `QuantRotorV3/V4`, `QuantRotorK3/K4`) share the CPU-blocks
-cross-block reshape and are affected on the same post-hydrate multi-append path;
-their rotation/quaternion sidebands need the reorder applied per codec with its
-own GPU proof.
+storage-local fix.
+
+### 5.7.3 The Iso / Rotor `Vec<Blocks>` codecs use the same sequence-major rule
+
+The rotation-KV `Vec<Blocks>` codecs — `QuantIsoV3` / `QuantIsoV4`,
+`QuantIsoK3` / `QuantIsoK4`, `QuantRotorV3` / `QuantRotorV4`,
+`QuantRotorK3` / `QuantRotorK4` — accumulate one `*Blocks` entry per `append`
+and concatenate them on `dequant`, with the caller reshaping head-major
+`[B, kv_h, S, D]`. That is the **same** cross-block head transposition as
+`QuantV` (a multi-append GQA cache with `kv_h > 1` scrambles per-head values).
+Each `append` now reorders the head-major chunk heads↔seq before encoding and
+`dequant` reorders back to the logical `[B, kv_h, S, D]`; for a single chunk
+(cold prefill) the two reorders cancel.
+
+These codecs are **per-token-row positional** (the codec sees `n_tokens` rows
+of `head_dim`; it does not interpret the B / kv_h / S axes), so the sideband
+parameters stay correctly associated after the value reorder:
+
+- **Quaternions / per-(token, group) scale + norm** (Iso): keyed by row
+  position, so they permute together with the value rows. The iso fast-mode
+  quaternion is the constant `FIXED_QUAT` for every group regardless.
+- **Static rotor table / QJL projection matrix** (Rotor): keyed by
+  group-position-within-`head_dim` (rotor) or by the JL projection (QJL), not
+  by token — the reorder leaves them untouched. The **per-token** QJL sideband
+  (`qjl_codes` / `qjl_norms`) permutes with the value rows.
+
+`QuantIsoV3` is the one GPU-resident member: its `append_gpu` adds
+`Array::contiguous` after the heads↔seq transpose before the iso3 encode kernel
+(raw-linear-index MSL kernel; lazy-transpose strides are ignored), and both
+`dequant_gpu` paths (mirror fast-path and CPU-staged `from_bytes`) reshape the
+flat decode to `[B, S, kv_h, D]` then transpose back. The remaining seven are
+CPU-only (`QuantIsoK3` also drives the shared iso3 dequant kernel via the
+CPU-staged path; iso4 / rotor have no MSL kernel). The `.kvb` SSD format is
+byte-stable — only the token-row order **within** a block changes, and spill
+and dequant agree on sequence-major. GPU round-trip verified on `QuantIsoV3`
+(two-append GQA vs single-shot, `kv_h=1` control).
 
 ### 5.8 TurboQuant requires Flash Attention
 

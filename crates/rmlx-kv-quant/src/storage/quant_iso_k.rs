@@ -82,12 +82,22 @@ impl QuantIsoK3 {
                 "QuantIsoK3::append: expected 4D new_shape, got {new_shape:?}"
             )));
         }
+        let b = new_shape[0] as usize;
+        let kv_h = new_shape[1] as usize;
+        let new_seq = new_shape[2] as usize;
         let head_dim = new_shape[3] as usize;
-        let n_tokens_total =
-            (new_shape[0] as usize) * (new_shape[1] as usize) * (new_shape[2] as usize);
+        let n_tokens_total = b * kv_h * new_seq;
+
+        // Store each chunk sequence-major (`[B, new_seq, kv_h, D]`) so the
+        // per-append blocks share one layout; a head-major store transposes
+        // heads across multi-append GQA caches (kv_h>1) when `dequant`
+        // reshapes head-major over the full sequence. See
+        // [`super::QuantIsoV3::append`].
+        let seq_major =
+            super::seq_layout::transpose_heads_seq(f32_data, b, kv_h, new_seq, head_dim);
 
         let (codes, scales, quaternions, norms) =
-            iso_encode_fast(f32_data, head_dim, ISO_K3_GROUP_SIZE, ISO_K3_BITS).map_err(
+            iso_encode_fast(&seq_major, head_dim, ISO_K3_GROUP_SIZE, ISO_K3_BITS).map_err(
                 |e: IsoQuantError| rmlx_core::error::Error::Mlx(format!("iso_k3 encode: {e}")),
             )?;
 
@@ -216,6 +226,12 @@ impl QuantIsoK3 {
         } else if out.len() > total_elems {
             out.truncate(total_elems);
         }
+        // Blocks are sequence-major (see `append`); reorder back to the logical
+        // head-major `[B, kv_h, S, D]`.
+        let b = self.shape[0] as usize;
+        let kv_h = self.shape[1] as usize;
+        let s = self.shape[2] as usize;
+        let out = super::seq_layout::transpose_seq_heads(&out, b, s, kv_h, head_dim);
         Ok(out)
     }
 
@@ -314,7 +330,11 @@ impl QuantIsoK3 {
             device,
         )?;
 
-        flat.reshape(&self.shape, device)
+        // CPU blocks are sequence-major (see `append`): reshape to
+        // `[B, S, kv_h, D]`, then reorder heads↔seq back to `[B, kv_h, S, D]`.
+        let seq_major_shape = [self.shape[0], self.shape[2], self.shape[1], self.shape[3]];
+        let out = flat.reshape(&seq_major_shape, device)?;
+        out.transpose(&[0, 2, 1, 3], device)?.contiguous(device)
     }
 }
 

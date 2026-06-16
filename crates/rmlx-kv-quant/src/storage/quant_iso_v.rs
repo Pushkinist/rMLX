@@ -170,12 +170,24 @@ impl QuantIsoV3 {
                 "QuantIsoV3::append: expected 4D new_shape, got {new_shape:?}"
             )));
         }
+        let b = new_shape[0] as usize;
+        let kv_h = new_shape[1] as usize;
+        let new_seq = new_shape[2] as usize;
         let head_dim = new_shape[3] as usize;
-        let n_tokens_total =
-            (new_shape[0] as usize) * (new_shape[1] as usize) * (new_shape[2] as usize);
+        let n_tokens_total = b * kv_h * new_seq;
+
+        // The codec is per-token-row positional (one row of length `head_dim`
+        // per token). Blocks accumulate one chunk per append; `dequant`
+        // concatenates them and the caller reshapes head-major `[B, kv_h, S, D]`.
+        // A head-major store transposes heads across a multi-append GQA cache
+        // (kv_h>1), so store each chunk sequence-major (`[B, new_seq, kv_h, D]`)
+        // — reorder the head-major input heads↔seq before quantizing and
+        // `dequant` reorders back to the logical `[B, kv_h, S, D]`.
+        let seq_major =
+            super::seq_layout::transpose_heads_seq(f32_data, b, kv_h, new_seq, head_dim);
 
         let (codes, scales, quaternions, norms) =
-            iso_encode_fast(f32_data, head_dim, ISO3_GROUP_SIZE, ISO3_BITS).map_err(
+            iso_encode_fast(&seq_major, head_dim, ISO3_GROUP_SIZE, ISO3_BITS).map_err(
                 |e: IsoQuantError| rmlx_core::error::Error::Mlx(format!("iso3 encode: {e}")),
             )?;
 
@@ -386,6 +398,12 @@ impl QuantIsoV3 {
         } else if out.len() > total_elems {
             out.truncate(total_elems);
         }
+        // Blocks are sequence-major (see `append`); reorder the concatenated
+        // decode back to the logical head-major `[B, kv_h, S, D]`.
+        let b = self.shape[0] as usize;
+        let kv_h = self.shape[1] as usize;
+        let s = self.shape[2] as usize;
+        let out = super::seq_layout::transpose_seq_heads(&out, b, s, kv_h, head_dim);
         Ok(out)
     }
 
@@ -442,11 +460,19 @@ impl QuantIsoV3 {
             })?;
 
         // ── 1. Dispatch the MSL encode kernel. ─────────────────────────────
+        // The codec is per-token-row positional; the GPU mirror accumulates
+        // each chunk's encode at `prev_seq * words_per_step`, so a head-major
+        // store + head-major reshape on `dequant_gpu` transposes heads across
+        // multi-append GQA caches (kv_h>1). Reorder the chunk to sequence-major
+        // `[B, new_seq, kv_h, D]` before quantizing — `transpose` yields a
+        // strided view, and the iso3 MSL kernel reads its input by raw linear
+        // offset (ignores MLX strides), so materialize with `contiguous` first.
         // `quats_gpu` is a constant FIXED_QUAT-filled placeholder that the
         // dequant kernel never reads (see `iso_dequantize_v3_gpu`); we forward
         // it to `iso3_gpu_outputs_to_cpu` for ABI parity and then drop it.
+        let v_seq_major = v_arr.transpose(&[0, 2, 1, 3], device)?.contiguous(device)?;
         let (codes_gpu, scales_gpu, quats_gpu, norms_gpu) =
-            crate::isoquant_msl::iso_quantize_v3_gpu(v_arr, head_dim, device)?;
+            crate::isoquant_msl::iso_quantize_v3_gpu(&v_seq_major, head_dim, device)?;
 
         // ── 2. Read back into CPU blocks (SSD spill compatibility). ────────
         // Reuse the shared helper so this path stays bit-identical with the
@@ -857,7 +883,13 @@ impl QuantIsoV3 {
                 Dtype::F32,
                 device,
             )?;
-            return flat.reshape(&self.shape, device);
+            // Mirror/blocks are sequence-major (see `append_gpu`): reshape the
+            // flat decode to `[B, S, kv_h, D]`, then reorder heads↔seq back to
+            // the logical `[B, kv_h, S, D]`. `contiguous` after the transpose so
+            // raw byte-readers (SSD spill) see the permuted bytes.
+            let seq_major_shape = [self.shape[0], self.shape[2], self.shape[1], self.shape[3]];
+            let out = flat.reshape(&seq_major_shape, device)?;
+            return out.transpose(&[0, 2, 1, 3], device)?.contiguous(device);
         }
 
         // Concatenate all block buffers. CPU codes/scales/quats are already in
@@ -947,7 +979,11 @@ impl QuantIsoV3 {
             device,
         )?;
 
-        flat.reshape(&self.shape, device)
+        // CPU blocks are sequence-major (see `append` / `append_gpu`): reshape
+        // to `[B, S, kv_h, D]`, then reorder heads↔seq back to `[B, kv_h, S, D]`.
+        let seq_major_shape = [self.shape[0], self.shape[2], self.shape[1], self.shape[3]];
+        let out = flat.reshape(&seq_major_shape, device)?;
+        out.transpose(&[0, 2, 1, 3], device)?.contiguous(device)
     }
 }
 
