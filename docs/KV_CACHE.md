@@ -455,6 +455,31 @@ would corrupt attention) — the consume path detects the payload-less SWA layer
 and degrades the entry to a full re-prefill. See `docs/SSD_TIER.md` §"SWA layers
 are not spilled". Serialising the SWA ring is a future enhancement.
 
+### 5.7.1 `QuantK` GPU buffer is sequence-major
+
+The `QuantK` storage (q8_0 K — the K side of K8V8 / K8V4 / Planar, the V side
+of K8V8, and the K side of the V-only Iso / Rotor codecs) lays its flat
+codes / scales buffer out **sequence-major**: the logical `[B, kv_h, S, D]`
+cache is stored as `[B, S, kv_h, D]`, so per token all heads are contiguous and
+chunk `n` occupies a single contiguous run at `prev_seq * words_per_seq`.
+
+This is the only ordering that lets the active prefix be read back as one
+contiguous `slice` after **any** number of appends. `QuantK::append` transposes
+the incoming head-major chunk before quantizing; `QuantK::dequantize_choice`
+transposes back to the logical `[B, kv_h, S, D]`. A single-chunk cold prefill is
+the identity (the transposes cancel), so the common path is unchanged.
+
+This matters for the **post-SSD-hydrate decode path**. After a hydrate, the bf16
+decode mirror (`decode_fp16_k`) is absent, so K is read from the quantized
+buffer; the first decode step appends a second chunk. Under the old head-major
+chunk store + `[B, kv_h, S, D]` reshape read, that second chunk landed after all
+heads' prefixes while the reshape mapped one head's new-token slot onto another
+head's prefix — a head transposition that silently corrupted K for every GQA
+model (`kv_heads > 1`). Steady-state decode (bf16 mirror live) was never
+affected. The spill / hydrate / paged-grow paths copy the contiguous active
+prefix `[0 .. filled]` and are layout-agnostic, so the on-disk `.kvb` payload is
+unchanged.
+
 ### 5.8 TurboQuant requires Flash Attention
 
 The `tq4` V-side path is only valid through the Flash Attention dispatch.
