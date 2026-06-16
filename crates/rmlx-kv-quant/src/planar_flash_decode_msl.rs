@@ -190,10 +190,11 @@ fn build_flash_header(bits: u8) -> Result<String> {
 // and accumulates the softmax-weighted contribution in a per-thread register.
 //
 // Buffer layout (must match `add_input` order in `planar_flash_decode_sdpa`):
+// K buffers are SEQUENCE-major (`[B, kv_seq, kv_h, ...]`); V stays head-major.
 // 0. query     : f32  [B * n_q_heads * head_dim]
-// 1. k_codes   : u32  [B * kv_h * kv_seq * (head_dim / 32) * 4]
-// 2. k_scales  : f32  [B * kv_h * kv_seq * (head_dim / 2)]
-// 3. k_rot32   : u32  [B * kv_h * kv_seq * (head_dim / 16)]
+// 1. k_codes   : u32  [B * kv_seq * kv_h * (head_dim / 32) * 4]
+// 2. k_scales  : f32  [B * kv_seq * kv_h * (head_dim / 2)]
+// 3. k_rot32   : u32  [B * kv_seq * kv_h * (head_dim / 16)]
 // 4. v_flat    : bf16 / f16 / f32 [B * kv_h * kv_seq * head_dim] (native dtype)
 // 5. mask_flat : f32  [B * n_q_heads * kv_seq] or [1] dummy when no mask
 // 6. scale_arr : f32  [1]
@@ -295,7 +296,11 @@ fn build_p1_kernel_source() -> String {
 
     for (uint t = tile_start; t < tile_end; t++) {{
         // ── Decode K[tid] for this (b, kv_h_idx, t) ──────────────────────
-        uint kv_tok          = (b * kv_h + kv_h_idx) * kv_seq + t;
+        // K packing is SEQUENCE-major (`[B, S, kv_h, D]`): per token all heads
+        // are contiguous, matching QuantPlanarK's chunk-append layout. (V below
+        // stays head-major — it is the separate bf16 decode mirror, not the
+        // planar-packed buffer.)
+        uint kv_tok          = (b * kv_seq + t) * kv_h + kv_h_idx;
         uint codes_tok_off   = kv_tok * codes_words_per_tok;
         uint scales_tok_off  = kv_tok * scales_pairs_per_tok;
         uint rot_tok_off     = kv_tok * rot_words_per_tok;

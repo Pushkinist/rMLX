@@ -24,6 +24,7 @@ use crate::planarquant_msl::{
 use crate::planarquant::{planar_dequantize, planar_quantize, PlanarBlocks};
 use crate::turboquant::GROUP_SIZE;
 
+use super::seq_layout::{transpose_heads_seq, transpose_seq_heads};
 use super::KV_PAGE_SIZE;
 
 // ── PlanarQuant V storage ─────────────────────────────────────────────────────
@@ -292,10 +293,20 @@ impl QuantPlanarV {
             // Since we never re-write the same offset within a sequence, atomic OR over the same
             // bits stays correct.
 
+            // Reorder the chunk to sequence-major `[B, new_seq, kv_h, D]` before
+            // quantizing — the flat buffer accumulates chunks at a per-token
+            // (all-heads) offset (`prev_seq * words_per_seq`), so the prefix is
+            // sequence-major. `dequantize_choice` reads it back with the matching
+            // reshape + transpose. For a single token the transpose is identity
+            // (decode hot path byte-unchanged); for a single chunk it cancels
+            // with the dequant transpose (cold-prefill round-trip exact). The
+            // MSL kernel reads by raw linear offset, so materialize the strided
+            // transpose into a row-major buffer before dispatch.
+            let v_seq_major = v_arr.transpose(&[0, 2, 1, 3], device)?.contiguous(device)?;
             let (new_codes, new_scales, new_rotations) = if self.bits == 3 {
-                planar_quantize_v3_gpu(v_arr, device)?
+                planar_quantize_v3_gpu(&v_seq_major, device)?
             } else {
-                planar_quantize_v4_gpu(v_arr, device)?
+                planar_quantize_v4_gpu(&v_seq_major, device)?
             };
 
             let codes_buf = self.gpu_codes_buf.take().unwrap();
@@ -324,8 +335,19 @@ impl QuantPlanarV {
                 device,
             )?);
         } else {
-            // CPU path: scalar Rust PlanarQuant (bits from self.bits — 3 or 4).
-            let block = planar_quantize(f32_data, GROUP_SIZE, self.bits, new_shape)?;
+            // CPU mirror of the GPU path: store sequence-major so the blocks
+            // share one layout with the GPU buffer (spill/hydrate moves codes
+            // between the two). `f32_data` arrives head-major
+            // (`[B, kv_h, new_seq, D]`); reorder to `[B, new_seq, kv_h, D]` and
+            // record that chunk shape so `planar_quantize`'s flat grouping
+            // matches the reordered stream.
+            let b = new_shape[0] as usize;
+            let kv_h = new_shape[1] as usize;
+            let new_seq = new_shape[2] as usize;
+            let d = new_shape[3] as usize;
+            let seq_major = transpose_heads_seq(f32_data, b, kv_h, new_seq, d);
+            let seq_major_shape = [new_shape[0], new_shape[2], new_shape[1], new_shape[3]];
+            let block = planar_quantize(&seq_major, GROUP_SIZE, self.bits, &seq_major_shape)?;
             self.blocks.push(block);
         }
         Ok(())
@@ -360,11 +382,19 @@ impl QuantPlanarV {
                     &[1],
                     device,
                 )?;
+                // Flat buffer is sequence-major (see `append`): dequant into
+                // `[B, S, kv_h, D]` then transpose heads↔seq back to the logical
+                // `[B, kv_h, S, D]`. `contiguous` makes the physical layout match
+                // for raw byte-readers (SSD spill / hydrate); this is the
+                // post-hydrate / chunked-prefill dequant path, off the decode hot
+                // path, so the copy is acceptable.
+                let seq_major_shape = [self.shape[0], s, self.shape[1], self.shape[3]];
                 let out = if self.bits == 3 {
-                    planar_dequantize_v3_gpu(&codes, &scales, &rotations, &self.shape, device)?
+                    planar_dequantize_v3_gpu(&codes, &scales, &rotations, &seq_major_shape, device)?
                 } else {
-                    planar_dequantize_v4_gpu(&codes, &scales, &rotations, &self.shape, device)?
+                    planar_dequantize_v4_gpu(&codes, &scales, &rotations, &seq_major_shape, device)?
                 };
+                let out = out.transpose(&[0, 2, 1, 3], device)?.contiguous(device)?;
                 let out = if out_dtype == Dtype::F32 {
                     out
                 } else {
@@ -374,14 +404,20 @@ impl QuantPlanarV {
             }
             return Ok((Vec::new(), None));
         }
-        // CPU path.
+        // CPU path: blocks are sequence-major (`[B, S, kv_h, D]`, see `append`).
+        // The caller reshapes the returned flat vector to the logical
+        // `[B, kv_h, S, D]`, so reorder heads↔seq back to head-major first.
         let total: usize = self.shape.iter().map(|&d| d as usize).product();
         let mut out = Vec::with_capacity(total);
         for block in &self.blocks {
             let slice = planar_dequantize(block)?;
             out.extend_from_slice(&slice);
         }
-        Ok((out, None))
+        let b = self.shape[0] as usize;
+        let kv_h = self.shape[1] as usize;
+        let s = self.shape[2] as usize;
+        let d = self.shape[3] as usize;
+        Ok((transpose_seq_heads(&out, b, s, kv_h, d), None))
     }
 
     /// Reconstruct a CPU-path `QuantPlanarV` from serialized PlanarQuant blocks.

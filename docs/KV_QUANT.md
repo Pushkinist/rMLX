@@ -1041,6 +1041,29 @@ axis-agnostic at the kernel input level (flat `[B, kv_h, S, D]` with
 **V codec**: unquantised bf16 (lives on `KvCache::decode_fp16_v`, same
 machinery as `KvStorage::None` for the V buffer).
 
+**Buffer layout (sequence-major).** Like every other flat-buffer quantized KV
+storage, the `QuantPlanarK` (and `QuantPlanarV`) buffer stores the filled
+prefix **sequence-major** (`[B, S, kv_h, D]` element order): per token, all
+heads are contiguous. `append` reorders the incoming head-major chunk heads↔seq
+before quantizing (GPU: `transpose` then `Array::contiguous`, since the
+raw-linear-index MSL kernel ignores lazy-transpose strides; CPU: the
+`transpose_heads_seq` mirror), and `dequantize_choice` reshapes the prefix
+`[B, S, kv_h, D]` and transposes back to the logical `[B, kv_h, S, D]`. For a
+single decode token the transpose is the identity (hot path byte-unchanged);
+for a single cold-prefill chunk the two transposes cancel. PlanarQuant is
+layout-agnostic (group-by-group over the flat stream, `head_dim % 32 == 0`, so
+no group spans a (head, token) boundary), so the reorder is **bit-exact** —
+planar3 / planar4 packing untouched. This closes the multi-append head-scramble
+class (the SSD-hydrate-then-reprefill path) for the whole codec family.
+
+Because `QuantPlanarK` also feeds its packed codes to the GPU kernels via
+`gpu_packed_view`, those kernels index K **sequence-major** to match:
+`planar_fused_qk`, `planar_flash_decode` (P1), and the sparse-attn phase-1/2
+score kernels compute the K token base as
+`kv_tok = (b * kv_seq + s) * kv_h + kv_h_idx`. The V offset in the flash /
+sparse kernels stays head-major — V is the separate bf16 decode mirror, not the
+planar-packed buffer.
+
 The K buffer is kept as an independent type (`QuantPlanarK`, layout-identical
 to `QuantPlanarV` but distinct so K and V append paths stay decoupled)
 inside `KvStorage::PlanarK { k, max_seq }`. Layout tag (single source of

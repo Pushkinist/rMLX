@@ -176,8 +176,16 @@ fn run_parity_with_v_dtype(
         }
     };
 
+    // K packing is sequence-major (`[B, S, kv_h, D]`) — the layout the
+    // fused-QK / flash-decode kernels index. Transpose the head-major `k_arr`
+    // heads↔seq and materialize before packing so the packed buffer matches.
+    let k_seq = k_arr
+        .transpose(&[0, 2, 1, 3], Device::Gpu)
+        .expect("transpose k seq-major")
+        .contiguous(Device::Gpu)
+        .expect("contiguous k seq-major");
     let (codes, scales, rot32) =
-        planar_quantize_v4_gpu(&k_arr, Device::Gpu).expect("planar_quantize_v4_gpu");
+        planar_quantize_v4_gpu(&k_seq, Device::Gpu).expect("planar_quantize_v4_gpu");
 
     // ── Flash output ─────────────────────────────────────────────────────
     let flash = planar_flash_decode_sdpa(
