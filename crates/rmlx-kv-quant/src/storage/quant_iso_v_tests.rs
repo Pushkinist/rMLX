@@ -81,6 +81,90 @@ fn quant_iso_v_roundtrip_dequant() {
     );
 }
 
+/// Multi-append with `kv_h > 1` must produce the same dequant output as a
+/// single-shot append of the concatenated head-major buffer. This is the
+/// head↔sequence layout invariant: the CPU blocks accumulate one chunk per
+/// append, and a head-major-per-block layout transposes heads across appends
+/// when the dequant reshapes head-major over the full sequence.
+///
+/// Fixture: per-(head, token) distinct values so any head transposition shows
+/// up as a large error (>> quant noise).
+#[test]
+fn quant_iso_v_multi_append_matches_single_shot_gqa() {
+    let b = 1_usize;
+    let kv_h = 3_usize;
+    let head_dim = 8_usize;
+    let chunk_a = 2_usize;
+    let chunk_b = 3_usize;
+    let s_total = chunk_a + chunk_b;
+
+    // Distinct, recognisable per-(head, token, dim) values. Encode the full
+    // head-major `[B, kv_h, S, D]` buffer once as the reference.
+    let val = |h: usize, s: usize, d: usize| -> f32 {
+        (h as f32) * 100.0 + (s as f32) * 10.0 + (d as f32) * 0.5 + 1.0
+    };
+    let mut full = vec![0.0_f32; b * kv_h * s_total * head_dim];
+    for h in 0..kv_h {
+        for s in 0..s_total {
+            for d in 0..head_dim {
+                full[(h * s_total + s) * head_dim + d] = val(h, s, d);
+            }
+        }
+    }
+
+    // Reference: one append of the whole sequence.
+    let mut qref = QuantIsoV3::new(vec![b as i32, kv_h as i32, 0, head_dim as i32], 64);
+    qref.append(
+        &full,
+        &[b as i32, kv_h as i32, s_total as i32, head_dim as i32],
+    )
+    .expect("single-shot append");
+    let reference = qref.dequant().expect("single-shot dequant");
+
+    // Two appends: chunk A then chunk B, each a head-major `[B, kv_h, s, D]`.
+    let extract = |s_lo: usize, s_hi: usize| -> Vec<f32> {
+        let s = s_hi - s_lo;
+        let mut out = vec![0.0_f32; b * kv_h * s * head_dim];
+        for h in 0..kv_h {
+            for si in 0..s {
+                for d in 0..head_dim {
+                    out[(h * s + si) * head_dim + d] = val(h, s_lo + si, d);
+                }
+            }
+        }
+        out
+    };
+    let mut qv = QuantIsoV3::new(vec![b as i32, kv_h as i32, 0, head_dim as i32], 64);
+    qv.append(
+        &extract(0, chunk_a),
+        &[b as i32, kv_h as i32, chunk_a as i32, head_dim as i32],
+    )
+    .expect("append chunk A");
+    qv.append(
+        &extract(chunk_a, s_total),
+        &[b as i32, kv_h as i32, chunk_b as i32, head_dim as i32],
+    )
+    .expect("append chunk B");
+    let multi = qv.dequant().expect("multi-append dequant");
+
+    assert_eq!(multi.len(), reference.len(), "length parity");
+    let mut max_abs = 0.0_f32;
+    for (a, b) in multi.iter().zip(reference.iter()) {
+        let d = (a - b).abs();
+        if d > max_abs {
+            max_abs = d;
+        }
+    }
+    // A head transposition produces errors on the order of the value spread
+    // (~100s). Quant noise on this fixture is well under 1.0. Use 1.0 as the
+    // discriminating threshold.
+    assert!(
+        max_abs < 1.0,
+        "multi-append vs single-shot max_abs_err = {max_abs:.6} (>= 1.0) — \
+         head↔seq layout scramble"
+    );
+}
+
 /// After `append` then `reset`, the storage reports seq = 0 and dequant returns
 /// the zero-element prefix only.
 #[test]
@@ -380,6 +464,133 @@ fn iso_v3_reset_clears_gpu_mirror() {
     assert_eq!(qv.gpu_offset, 0, "reset must zero gpu_offset");
     assert_eq!(qv.gpu_capacity, 0, "reset must zero gpu_capacity");
     assert!(qv.blocks.is_empty(), "reset must clear CPU blocks");
+}
+
+/// GPU multi-append with `kv_h > 1` must match a single-shot GPU append of the
+/// concatenated head-major buffer. Exercises the GPU-mirror layout invariant:
+/// `append_gpu` reorders each chunk seq-major before the encode kernel, and
+/// `dequant_gpu` reorders back — a head-major store + head-major reshape would
+/// transpose heads across the two chunks. CPU tests cannot catch the MSL
+/// raw-linear-index stride footgun, so this runs on the real GPU.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test -p rmlx-kv-quant -- --ignored quant_iso_v --test-threads=1"]
+fn iso_v3_gpu_multi_append_matches_single_shot_gqa() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    force_gpu_resident_iso_on();
+    let b = 1_i32;
+    let kv_h = 3_i32;
+    let head_dim = 8_i32;
+    let chunk_a = 2_i32;
+    let chunk_b = 3_i32;
+    let s_total = chunk_a + chunk_b;
+
+    let val = |h: i32, s: i32, d: i32| -> f32 {
+        (h as f32) * 100.0 + (s as f32) * 10.0 + (d as f32) * 0.5 + 1.0
+    };
+    let build = |s_lo: i32, s_hi: i32| -> Vec<f32> {
+        let s = s_hi - s_lo;
+        let mut out = vec![0.0_f32; (b * kv_h * s * head_dim) as usize];
+        for h in 0..kv_h {
+            for si in 0..s {
+                for d in 0..head_dim {
+                    let idx = (((h * s) + si) * head_dim + d) as usize;
+                    out[idx] = val(h, s_lo + si, d);
+                }
+            }
+        }
+        out
+    };
+
+    // Reference: one GPU append of the full sequence.
+    let full = build(0, s_total);
+    let full_arr = make_f32_array_4d(&full, &[b, kv_h, s_total, head_dim]);
+    let mut qref = QuantIsoV3::new(vec![b, kv_h, 0, head_dim], 64);
+    qref.append_gpu(&full_arr, &[b, kv_h, s_total, head_dim], Device::Gpu)
+        .expect("single-shot append_gpu");
+    let ref_arr = qref
+        .dequant_gpu(Device::Gpu)
+        .expect("single-shot dequant_gpu");
+    ref_arr.eval().expect("eval");
+    let reference: Vec<f32> = ref_arr
+        .to_bytes()
+        .expect("to_bytes")
+        .chunks_exact(4)
+        .map(|x| f32::from_le_bytes(x.try_into().expect("chunk len 4")))
+        .collect();
+
+    // Two GPU appends.
+    let arr_a = make_f32_array_4d(&build(0, chunk_a), &[b, kv_h, chunk_a, head_dim]);
+    let arr_b = make_f32_array_4d(&build(chunk_a, s_total), &[b, kv_h, chunk_b, head_dim]);
+    let mut qv = QuantIsoV3::new(vec![b, kv_h, 0, head_dim], 64);
+    qv.append_gpu(&arr_a, &[b, kv_h, chunk_a, head_dim], Device::Gpu)
+        .expect("append_gpu A");
+    qv.append_gpu(&arr_b, &[b, kv_h, chunk_b, head_dim], Device::Gpu)
+        .expect("append_gpu B");
+    let multi_arr = qv.dequant_gpu(Device::Gpu).expect("multi dequant_gpu");
+    multi_arr.eval().expect("eval");
+    let multi: Vec<f32> = multi_arr
+        .to_bytes()
+        .expect("to_bytes")
+        .chunks_exact(4)
+        .map(|x| f32::from_le_bytes(x.try_into().expect("chunk len 4")))
+        .collect();
+
+    assert_eq!(multi.len(), reference.len(), "length parity");
+    let mut max_abs = 0.0_f32;
+    for (a, b) in multi.iter().zip(reference.iter()) {
+        let d = (a - b).abs();
+        if d > max_abs {
+            max_abs = d;
+        }
+    }
+    // A head transposition produces errors ~100s; quant noise on this fixture
+    // is well under 1.0.
+    assert!(
+        max_abs < 1.0,
+        "GPU multi-append vs single-shot max_abs_err = {max_abs:.6} (>= 1.0) — \
+         head↔seq layout scramble"
+    );
+
+    // kv_h=1 control: layout reorder is a no-op, multi-append still matches.
+    let head_dim1 = 8_i32;
+    let c1 = build_single_head(b, head_dim1, 0, chunk_a, &val);
+    let c2 = build_single_head(b, head_dim1, chunk_a, s_total, &val);
+    let arr_c1 = make_f32_array_4d(&c1, &[b, 1, chunk_a, head_dim1]);
+    let arr_c2 = make_f32_array_4d(&c2, &[b, 1, chunk_b, head_dim1]);
+    let mut qctrl = QuantIsoV3::new(vec![b, 1, 0, head_dim1], 64);
+    qctrl
+        .append_gpu(&arr_c1, &[b, 1, chunk_a, head_dim1], Device::Gpu)
+        .expect("ctrl append A");
+    qctrl
+        .append_gpu(&arr_c2, &[b, 1, chunk_b, head_dim1], Device::Gpu)
+        .expect("ctrl append B");
+    let ctrl_arr = qctrl.dequant_gpu(Device::Gpu).expect("ctrl dequant");
+    ctrl_arr.eval().expect("eval");
+    assert_eq!(
+        ctrl_arr.shape(),
+        vec![b, 1, s_total, head_dim1],
+        "kv_h=1 control shape"
+    );
+}
+
+/// Helper for the kv_h=1 control case: build a `[B, 1, s, D]` head-major chunk.
+fn build_single_head(
+    b: i32,
+    head_dim: i32,
+    s_lo: i32,
+    s_hi: i32,
+    val: &dyn Fn(i32, i32, i32) -> f32,
+) -> Vec<f32> {
+    let s = s_hi - s_lo;
+    let mut out = vec![0.0_f32; (b * s * head_dim) as usize];
+    for si in 0..s {
+        for d in 0..head_dim {
+            out[(si * head_dim + d) as usize] = val(0, s_lo + si, d);
+        }
+    }
+    out
 }
 
 /// SSD spill→hydrate round-trip preserves the CPU blocks layout.
