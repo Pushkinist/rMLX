@@ -895,11 +895,10 @@ impl Architecture {
         let kv_quant: KvQuant =
             kv_quant_override.unwrap_or_else(|| KvCacheBuilder::for_arch_default(arch_name));
 
-        // Ensure the GPU default stream is registered for the calling thread.
-        // tokio blocking-pool threads start with no GPU stream context; MLX's
-        // array materialisation then fails with "There is no Stream(gpu, 0) in
-        // current thread". Registering the process-global GPU stream once per
-        // thread entry point avoids this without changing any ML semantics.
+        // Registering a thread-local GPU stream + CommandEncoder once per thread entry point.
+        // tokio blocking-pool threads start with no GPU stream context; MLX's array
+        // materialisation then fails with "There is no Stream(gpu, 0) in current thread".
+        // This is a no-op if already registered; zero ML-semantic effect.
         if device == Device::Gpu {
             rmlx_mlx::ensure_gpu_default_stream();
         }
@@ -1095,12 +1094,10 @@ impl Architecture {
         use crate::kv_cache::KvCacheBuilder;
         use rmlx_kv_quant::KvQuant;
 
-        // Ensure the GPU default stream is registered for the calling thread.
-        // tokio blocking-pool threads start with no GPU stream context; MLX's
-        // array materialisation then fails with "There is no Stream(gpu, 0) in
-        // current thread". Registering the process-global GPU stream once per
-        // thread entry point avoids this without changing any ML semantics.
-        // Mirrors the text `generate_greedy` entry.
+        // Registering a thread-local GPU stream + CommandEncoder once per thread entry point.
+        // tokio blocking-pool threads start with no GPU stream context; MLX's array
+        // materialisation then fails with "There is no Stream(gpu, 0) in current thread".
+        // Mirrors the text `generate_greedy` entry; zero ML-semantic effect.
         if device == Device::Gpu {
             rmlx_mlx::ensure_gpu_default_stream();
         }

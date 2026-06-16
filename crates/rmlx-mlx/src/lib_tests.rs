@@ -59,7 +59,7 @@ fn add_two_f32_arrays_gpu() {
 ///
 /// The generate entry points call `ensure_gpu_default_stream()` once at the
 /// top of each tokio blocking-pool worker so MLX's per-thread CommandEncoder
-/// map has an entry for `Stream(gpu, 0)` before any `Array::eval()`. This test
+/// map has a registered encoder before any `Array::eval()`. This test
 /// runs that exact sequence on a freshly-spawned OS thread (the analog of a
 /// blocking-pool worker that never called `mlx::core::new_stream`): establish
 /// the stream, then materialise a GPU array.
