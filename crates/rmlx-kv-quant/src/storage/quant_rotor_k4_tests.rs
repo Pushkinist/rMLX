@@ -1,6 +1,6 @@
 //! Unit tests for [`QuantRotorK4`]. Mirror of `quant_rotor_k3_tests.rs`
-#![allow(unsafe_code)]
 //! with `bits=4`.
+#![allow(unsafe_code)]
 
 use crate::clifford::make_rotor_table;
 use crate::rotorquant::{n_groups_for, rotor4_decode, rotor4_encode};
