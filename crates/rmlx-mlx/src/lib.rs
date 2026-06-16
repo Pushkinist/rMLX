@@ -728,6 +728,31 @@ impl Array {
         Ok(Array { inner: res })
     }
 
+    /// Materialize a row-major contiguous copy of this array.
+    ///
+    /// MLX ops like `transpose` produce a logical view with permuted strides —
+    /// the data is *not* re-laid-out until something forces it. Built-in MLX
+    /// ops honor those strides, so a transpose is usually free. Custom MSL
+    /// kernels (`MetalKernel`) do **not**: they read the input buffer by raw
+    /// linear index, so they see the un-permuted physical order and silently
+    /// produce scrambled results. Call this before feeding a transposed (or
+    /// otherwise non-contiguous) array to such a kernel so the physical layout
+    /// matches the logical shape. `mlx_reshape` to the same element count does
+    /// not guarantee this — a flattened strided view can still report as
+    /// "contiguous" while its bytes follow the original strides.
+    pub fn contiguous(&self, device: Device) -> Result<Array> {
+        install_error_handler();
+        let mut res = unsafe { sys::mlx_array_new() };
+        let status = unsafe {
+            with_stream(device, |s| {
+                // allow_col_major = false → force row-major layout.
+                sys::mlx_contiguous(&raw mut res, self.inner, false, s)
+            })
+        };
+        unsafe { check_status(status, "contiguous") }?;
+        Ok(Array { inner: res })
+    }
+
     /// Slice `a[start:stop:strides]` along all axes simultaneously.
     ///
     /// `start`, `stop`, `strides` must all have length == `self.ndim()`.

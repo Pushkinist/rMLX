@@ -398,6 +398,37 @@ paths:
   then a `slice_update` into the buffer at the current offset. This avoids
   the `O(n²)` lazy-concat tree that `concatenate` would produce.
 
+**Buffer layout (sequence-major).** The flat `QuantK` buffer (both the GPU
+`Array` pair and the CPU `Vec`s) stores the filled prefix **sequence-major**:
+the logical `[B, kv_h, S, D]` cache is laid out as `[B, S, kv_h, D]`, so for a
+given token all heads are contiguous, and chunk `n` occupies
+`[prev_seq * words_per_seq .. (prev_seq + new_seq) * words_per_seq]` with
+`words_per_seq = B * kv_h * D / 4`. The per-step write places one chunk at a
+sequence offset, so this is the only ordering under which appending in *any*
+number of chunks keeps the active prefix readable as one contiguous slice.
+
+`QuantK::append` therefore transposes the incoming head-major chunk
+(`[B, kv_h, new_seq, D]`) to `[B, new_seq, kv_h, D]` before quantizing, and
+`QuantK::dequantize_choice` reshapes the flat active prefix to `[B, S, kv_h, D]`
+and transposes heads↔seq back to the logical `[B, kv_h, S, D]`. For a
+single-chunk cold prefill (`prev_seq == 0`) the two transposes cancel at the
+logical-mapping level, so the common path stays correct. The cold output is
+**byte-identical** to the pre-fix head-major grouping only when
+`head_dim % 128 == 0` (every q8 group of 128 stays inside one head) — which
+holds for every current QuantK-routed target arch (Qwen3.5-MoE linear
+`head_dim=128`, Gemma3 and Gemma4 text KV `head_dim=256`), so the cold path is
+byte-identical in practice. When `head_dim` is not a multiple of 128 (no current
+target arch, but exercised directly by the `d=64` cross-head round-trip test) a
+q8 group of 128 spans a (head,token) boundary and its per-group `abs_max` scale
+differs from the old grouping, so the cold path is logically correct and within
+q8 noise but not bit-identical to the base commit. Without this transpose, a head-major chunk written at a
+sequence offset and read with a `[B, kv_h, S, D]` reshape transposed one head's
+new-token slot onto another head's prefix whenever `kv_h > 1` and the cache was
+appended in more than one chunk (the multi-append-after-SSD-hydrate decode
+path) — silent K corruption. The spill / hydrate / paged-grow paths copy the
+contiguous active prefix `[0 .. filled]` and are layout-agnostic, so they
+remain correct and the on-disk `.kvb` payload is unchanged by this ordering.
+
 `update_and_sdpa` path:
 1. `QuantK::append` — quantize new K, write into GPU buffer.
 2. `QuantK::append` — same for V.

@@ -152,6 +152,14 @@ fn dequant_kernel() -> Result<&'static MetalKernel> {
 /// `(codes, scales)`:
 /// - `codes` u32 `[total_elems / 4]` — 4 i8 per uint32 (LE byte order).
 /// - `scales` f32 `[total_elems / 128]`.
+///
+/// REQUIRES row-major contiguous input. The custom MSL quant kernel indexes the
+/// buffer by raw linear offset and ignores MLX strides, so a caller holding a
+/// transposed / sliced view must `.contiguous()` it first — otherwise the
+/// stored codes follow the original (wrong) physical order. Per-decode-step
+/// callers already pass row-contiguous head-major `[B, kv_h, n, D]` chunks; the
+/// transposed-view materialization lives at the one site that needs it
+/// (`QuantK::append`).
 pub fn q8_quantize_gpu(x: &Array, device: Device) -> Result<(Array, Array)> {
     let total_elems: usize = x.shape().iter().map(|&d| d as usize).product();
     if !total_elems.is_multiple_of(Q8_GROUP_SIZE) {

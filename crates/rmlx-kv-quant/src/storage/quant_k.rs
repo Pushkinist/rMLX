@@ -64,6 +64,48 @@ pub struct QuantK {
     pub max_seq: i32,
 }
 
+/// Reorder a flat head-major `[B, kv_h, S, D]` buffer to sequence-major
+/// `[B, S, kv_h, D]`. Used by the CPU `append` path to mirror the GPU buffer's
+/// sequence-major layout.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "src/out are sized b*kv_h*s*d; every (bi,h,si) base + d stays in bounds by construction"
+)]
+fn transpose_heads_seq(src: &[f32], b: usize, kv_h: usize, s: usize, d: usize) -> Vec<f32> {
+    let mut out = vec![0.0_f32; b * kv_h * s * d];
+    for bi in 0..b {
+        for h in 0..kv_h {
+            for si in 0..s {
+                let src_base = ((bi * kv_h + h) * s + si) * d;
+                let dst_base = ((bi * s + si) * kv_h + h) * d;
+                out[dst_base..dst_base + d].copy_from_slice(&src[src_base..src_base + d]);
+            }
+        }
+    }
+    out
+}
+
+/// Inverse of [`transpose_heads_seq`]: reorder a flat sequence-major
+/// `[B, S, kv_h, D]` buffer back to head-major `[B, kv_h, S, D]`. Used by the
+/// CPU `dequantize_choice` path so callers see the logical `[B, kv_h, S, D]`.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "src/out are sized b*s*kv_h*d; every (bi,si,h) base + d stays in bounds by construction"
+)]
+fn transpose_seq_heads(src: &[f32], b: usize, s: usize, kv_h: usize, d: usize) -> Vec<f32> {
+    let mut out = vec![0.0_f32; b * s * kv_h * d];
+    for bi in 0..b {
+        for si in 0..s {
+            for h in 0..kv_h {
+                let src_base = ((bi * s + si) * kv_h + h) * d;
+                let dst_base = ((bi * kv_h + h) * s + si) * d;
+                out[dst_base..dst_base + d].copy_from_slice(&src[src_base..src_base + d]);
+            }
+        }
+    }
+    out
+}
+
 impl QuantK {
     /// Append a new K slice. Picks CPU or GPU path from `device`.
     #[allow(
@@ -220,8 +262,29 @@ impl QuantK {
             let scales_per_seq = self.gpu_scales_per_step;
             let new_seq = new_shape[2];
 
-            // Quantize the new chunk on GPU.
-            let (new_codes, new_scales) = q8_quantize_gpu(k_arr, device)?;
+            // Reorder the chunk to sequence-major `[B, new_seq, kv_h, D]` before
+            // quantizing. The flat GPU buffer accumulates chunks back-to-back at
+            // `prev_seq * words_per_seq`, so the active prefix is sequence-major
+            // (`[B, S, kv_h, D]` ordering): for each token, all heads are
+            // contiguous. `dequantize_choice` reads it back with the matching
+            // `[B, S, kv_h, D]` reshape + transpose. The incoming chunk is
+            // head-major (`[B, kv_h, new_seq, D]`); transposing heads↔seq makes
+            // the stored layout self-consistent across any number of appends and
+            // any `kv_h`. With a single chunk (`prev_seq == 0`, `new_seq == S`)
+            // this is the identity for the dequant view, so the cold-prefill
+            // path stays logically correct. It is byte-identical to the pre-fix
+            // head-major grouping ONLY when `D % 128 == 0` (each q8 group of 128
+            // stays inside one head — e.g. linear head_dim=128); for `D` not a
+            // multiple of 128 (e.g. head_dim=64) a group spans a (head,token)
+            // boundary, so per-group `abs_max` scales differ from the head-major
+            // grouping — logically correct and within q8 noise, but not bit-exact.
+            // `transpose` yields a strided view. `q8_quantize_gpu` reads its
+            // input by raw linear offset (the MSL kernel ignores MLX strides),
+            // so materialize the heads↔seq permutation into a row-major buffer
+            // here — otherwise the kernel would read the original head-major
+            // bytes and scramble the stored codes.
+            let k_seq_major = k_arr.transpose(&[0, 2, 1, 3], device)?.contiguous(device)?;
+            let (new_codes, new_scales) = q8_quantize_gpu(&k_seq_major, device)?;
 
             // Compute offsets in the 1D buffer.
             let codes_start = prev_seq * words_per_seq;
@@ -245,7 +308,17 @@ impl QuantK {
             self.gpu_codes_buf = Some(codes_updated);
             self.gpu_scales_buf = Some(scales_updated);
         } else {
-            let (new_codes, new_scales) = q8_quantize(f32_data);
+            // CPU mirror of the GPU path: store the chunk sequence-major so the
+            // accumulated `self.codes` share one layout with the GPU buffer (the
+            // spill/hydrate round-trip moves codes between the two). `f32_data`
+            // arrives head-major (`[B, kv_h, new_seq, D]`); reorder it to
+            // `[B, new_seq, kv_h, D]` before quantizing.
+            let b = new_shape[0] as usize;
+            let kv_h = new_shape[1] as usize;
+            let new_seq = new_shape[2] as usize;
+            let d = new_shape[3] as usize;
+            let seq_major = transpose_heads_seq(f32_data, b, kv_h, new_seq, d);
+            let (new_codes, new_scales) = q8_quantize(&seq_major);
             self.codes.extend_from_slice(&new_codes);
             self.scales.extend_from_slice(&new_scales);
         }
@@ -275,14 +348,43 @@ impl QuantK {
                 let codes = codes_buf.slice(&[0], &[s * self.gpu_words_per_step], &[1], device)?;
                 let scales =
                     scales_buf.slice(&[0], &[s * self.gpu_scales_per_step], &[1], device)?;
-                // Pass out_dtype directly: kernel writes bf16/f16/f32 — no
-                // follow-up astype.
-                let out = q8_dequantize_gpu(&codes, &scales, &self.shape, out_dtype, device)?;
+                // The flat buffer is sequence-major (see `append`): the active
+                // prefix lays out as `[B, S, kv_h, D]`. Dequant into that shape,
+                // then transpose heads↔seq back to the logical `[B, kv_h, S, D]`
+                // that callers expect. For a single-chunk cache this transpose is
+                // the inverse of the append-side transpose, so the logical
+                // round-trip is exact (within q8 noise). It reproduces the pre-fix
+                // head-major output bit-for-bit ONLY when `D % 128 == 0`; for `D`
+                // not a multiple of 128 the q8 grouping differs (see `append`), so
+                // a debugger comparing decode logits against the base commit will
+                // see q8-noise-level deltas, not zero. Pass out_dtype directly:
+                // kernel writes bf16/f16/f32 — no follow-up astype.
+                let seq_major_shape = [self.shape[0], s, self.shape[1], self.shape[3]];
+                let out = q8_dequantize_gpu(&codes, &scales, &seq_major_shape, out_dtype, device)?;
+                // Materialize the heads↔seq transpose into a row-major buffer.
+                // `transpose` alone yields a strided view: stride-honoring MLX ops
+                // (SDPA) read it correctly, but a raw byte read (`to_bytes`, SSD
+                // spill, a custom kernel) sees the un-permuted sequence-major
+                // bytes and scrambles heads↔seq. Forcing contiguity makes the
+                // physical layout match the logical `[B, kv_h, S, D]` shape for
+                // every consumer.
+                // Required for the raw byte-readers (SSD spill / hydrate
+                // round-trip) — this is the post-hydrate dequant path, off the
+                // steady-state decode hot path, so the copy is acceptable.
+                let out = out.transpose(&[0, 2, 1, 3], device)?.contiguous(device)?;
                 return Ok((Vec::new(), Some(out)));
             }
             return Ok((Vec::new(), None));
         }
-        Ok((q8_dequantize(&self.codes, &self.scales), None))
+        // CPU codes are sequence-major (`[B, S, kv_h, D]`, see `append`). The
+        // caller reshapes the returned flat vector to the logical
+        // `[B, kv_h, S, D]`, so reorder heads↔seq back to head-major first.
+        let flat = q8_dequantize(&self.codes, &self.scales);
+        let b = self.shape[0] as usize;
+        let kv_h = self.shape[1] as usize;
+        let s = self.shape[2] as usize;
+        let d = self.shape[3] as usize;
+        Ok((transpose_seq_heads(&flat, b, s, kv_h, d), None))
     }
 
     /// Reconstruct a CPU-path `QuantK` from serialized codes / scales and the
@@ -322,3 +424,7 @@ impl QuantK {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "quant_k_tests.rs"]
+mod quant_k_tests;
