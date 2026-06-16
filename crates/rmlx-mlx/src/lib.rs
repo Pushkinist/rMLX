@@ -635,12 +635,19 @@ impl Array {
         unsafe { check_status(status, "Array::async_eval") }
     }
 
-    /// Copy evaluated array contents into a fresh `Vec<u8>`.
+    /// Copy array contents into a fresh `Vec<u8>`.
     ///
-    /// The array must have been evaluated first — returns an error if the
-    /// data pointer is null (unevaluated or empty array).
+    /// Forces evaluation first so the read is always of materialized data.
+    /// MLX is lazy and `async_eval` only *schedules* compute; the data pointer
+    /// returned by `mlx_array_data_uint8` is not guaranteed to hold the result
+    /// until the graph has actually run. Calling `eval()` here blocks until it
+    /// has — idempotent and near-free on an already-evaluated array. Without
+    /// it, reading the pointer can race the asynchronous evaluation and return
+    /// stale/recycled buffer bytes (another array's data) rather than this
+    /// array's value.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         install_error_handler();
+        self.eval()?;
         let nbytes = unsafe { sys::mlx_array_nbytes(self.inner) };
         if nbytes == 0 {
             return Ok(Vec::new());
