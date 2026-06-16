@@ -283,7 +283,20 @@ pub fn prepare_attach(
     } else {
         cfg.per_namespace_budget_bytes
     };
-    startup_maintenance(namespace.as_ref(), effective_per_ns);
+    // Open the namespace index here — this is the single `paths::home()`
+    // resolution on the attach path — then hand the opened handle to the
+    // maintenance routine. Keeping the open at the boundary means the
+    // maintenance logic itself takes its root explicitly (the index already
+    // carries it) and never re-resolves the process-global home, which is
+    // what makes it testable against an injected temp dir.
+    match SsdKvIndex::open(namespace.as_ref()) {
+        Ok(index) => startup_maintenance(&index, namespace.as_ref(), effective_per_ns),
+        Err(e) => tracing::warn!(
+            namespace = %namespace,
+            error = %e,
+            "ssd-tier startup index open failed; skipping maintenance"
+        ),
+    }
 
     Some(AttachInfo {
         namespace: namespace.into_owned(),
@@ -293,15 +306,20 @@ pub fn prepare_attach(
     })
 }
 
-/// Open the namespace index, prune missing blocks, then evict LRU until the
-/// persisted footprint is within `budget_bytes`. Best-effort: any error is
-/// `warn!`ed and maintenance is skipped (the spiller opens its own index on
-/// its drain thread regardless).
+/// Prune missing blocks from an already-opened namespace index, then evict LRU
+/// until the persisted footprint is within `budget_bytes`. Best-effort: any
+/// error is `warn!`ed and the remaining steps proceed (the spiller opens its
+/// own index on its drain thread regardless).
+///
+/// Takes the opened `index` explicitly rather than resolving it from the
+/// process-global home — the caller owns the one `paths::home()` resolution on
+/// the attach path. This keeps the routine root-injectable (tests open against
+/// a temp dir) and free of the `OnceLock` ordering hazard.
 #[allow(
     clippy::cognitive_complexity,
-    reason = "index open → prune → evict → prometheus hooks: four sequential \
-              best-effort operations each with their own error arms; splitting would \
-              obscure the linear maintenance sequence"
+    reason = "prune → evict → prometheus hooks: sequential best-effort operations \
+              each with their own error arms; splitting would obscure the linear \
+              maintenance sequence"
 )]
 #[allow(
     clippy::semicolon_if_nothing_returned,
@@ -309,14 +327,7 @@ pub fn prepare_attach(
               tracing::info! / tracing::warn! in match arms are the last expression, \
               and the surrounding match itself is a statement"
 )]
-fn startup_maintenance(namespace: &str, budget_bytes: u64) {
-    let index = match SsdKvIndex::open(namespace) {
-        Ok(idx) => idx,
-        Err(e) => {
-            tracing::warn!(namespace, error = %e, "ssd-tier startup index open failed; skipping maintenance");
-            return;
-        }
-    };
+fn startup_maintenance(index: &SsdKvIndex, namespace: &str, budget_bytes: u64) {
     match index.prune_missing() {
         Ok(n) if n > 0 => {
             tracing::info!(
