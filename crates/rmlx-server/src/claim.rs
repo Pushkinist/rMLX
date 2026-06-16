@@ -81,13 +81,27 @@ impl Drop for MetalClaim {
 /// Returns `ClaimError::AlreadyHeld` if the file already exists *and* its
 /// holder PID is still alive. The holder's PID is read from the file.
 ///
-/// ## Stale-claim auto-reclaim
-/// A claim left behind by a process that died without running `Drop` (SIGTERM,
-/// SIGKILL, crash, power loss) is auto-reclaimed: if the holder PID is provably
-/// **dead** (`kill(pid, 0)` reports no such process) the file is taken over and
-/// a `warn!` is logged. A claim whose holder PID is **alive** is never stolen —
-/// that is the single-MLX-process invariant; two MLX processes on one Metal
-/// context is exactly what the claim prevents.
+/// ## Safety model: flock primary, PID probe secondary
+/// The load-bearing safety gate is the **flock**, not the PID probe. A live
+/// rMLX process keeps the claim file's fd open for its whole lifetime, so it
+/// holds the exclusive `flock`. Any second process therefore fails
+/// `flock(LOCK_EX | LOCK_NB)` on that file and refuses — a live MLX claim can
+/// never be stolen, regardless of what the PID body says. That is the
+/// single-MLX-process invariant the GPU depends on.
+///
+/// The PID probe is a **secondary stale-file detector**: it lets us recognise
+/// a claim file abandoned by a process that died without running `Drop`
+/// (SIGTERM/SIGKILL/crash/power-loss) so the next start can reuse it instead of
+/// failing forever. A provably **dead** holder PID (`kill(pid, 0)` → ESRCH)
+/// makes the file a reclaim candidate; we then still take the flock to confirm
+/// no live fd holds the file before reusing it.
+///
+/// The only residual race is narrow and fail-safe: a dead holder's PID could be
+/// recycled to an unrelated process between the first read and reclaim. We
+/// guard it by re-reading and re-probing the PID *after* taking the lock (see
+/// below) and by the flock itself. If anything is uncertain we **refuse**
+/// (`AlreadyHeld`) — the error direction is harmless (a transient false
+/// refusal), never the dangerous one (two MLX processes on one Metal context).
 pub fn try_claim(port: u16) -> Result<MetalClaim, ClaimError> {
     let path = PathBuf::from(format!("/tmp/rmlx.{port}.claim"));
 
@@ -106,21 +120,33 @@ pub fn try_claim(port: u16) -> Result<MetalClaim, ClaimError> {
             // File exists — read the holder PID first.
             let holder_pid = read_holder_pid(&path, port)?;
 
-            // SAFETY INVARIANT: never steal a claim whose holder is alive.
-            // A live holder means an MLX process is (or may be) on the GPU.
+            // Secondary stale detector: a provably-dead holder PID marks the
+            // file as a reclaim candidate. A live holder is respected here, but
+            // the real guarantee is the flock below — a live rMLX still holds
+            // its fd, so flock_ex_nb would fail even if this probe misfired.
             if pid_is_alive(holder_pid) {
                 return Err(ClaimError::AlreadyHeld { port, holder_pid });
             }
 
-            // Holder is provably dead — its `Drop` never ran (SIGTERM/SIGKILL/
-            // crash). Take the flock to confirm no live fd still holds the lock,
-            // then reclaim. The flock check is belt-and-suspenders on top of the
-            // liveness check: both must agree before we reuse the file.
+            // Holder is (was) provably dead — its `Drop` never ran (SIGTERM/
+            // SIGKILL/crash). Take the flock: this is the load-bearing gate. If
+            // any live fd still holds the file the lock fails and we refuse.
             let candidate = OpenOptions::new()
                 .write(true)
                 .open(&path)
                 .map_err(|src| ClaimError::Io { port, source: src })?;
             if flock_ex_nb(candidate.as_raw_fd()) {
+                // Lock held. Close the narrow PID-reuse window: between the
+                // first read and now the dead holder's PID could have been
+                // recycled to an unrelated process that grabbed (and released)
+                // the file. Re-read the body and re-probe under the lock; if the
+                // PID changed or is now alive, refuse rather than reclaim. This
+                // is the fail-safe direction — a transient false refusal, never
+                // two MLX processes on the GPU.
+                let confirm_pid = read_holder_pid(&path, port).unwrap_or(0);
+                if confirm_pid != holder_pid || pid_is_alive(confirm_pid) {
+                    return Err(ClaimError::AlreadyHeld { port, holder_pid });
+                }
                 tracing::warn!(
                     port,
                     stale_pid = holder_pid,
@@ -141,7 +167,9 @@ pub fn try_claim(port: u16) -> Result<MetalClaim, ClaimError> {
     // --- acquire exclusive non-blocking flock --------------------------------
     if !flock_ex_nb(file.as_raw_fd()) {
         // We just created the file but couldn't lock it — race with another
-        // starter. Read PID and report.
+        // starter. Read PID and report. holder_pid is often 0 here: neither our
+        // own create nor the racing winner may have written a PID body yet at
+        // this point, so the file is still empty.
         let holder_pid = read_holder_pid(&path, port).unwrap_or(0);
         // Remove the file we just created so we don't leave a stale entry.
         let _ = std::fs::remove_file(&path);

@@ -194,6 +194,7 @@ pub async fn serve(state: AppState, host: &str, port: u16) -> anyhow::Result<()>
 /// Resolve when the process receives SIGINT (Ctrl-C) or SIGTERM (`kill` /
 /// `pkill`). Used as the axum graceful-shutdown trigger so normal teardown —
 /// including the `MetalClaim` `Drop` — runs on signalled exit.
+// cancel-safe: only awaits signal-notification futures; no partial state on drop.
 async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
 

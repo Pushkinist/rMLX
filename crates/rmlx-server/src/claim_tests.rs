@@ -100,6 +100,56 @@ fn live_pid_claim_is_refused() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A claim file whose body holds a DEAD PID but which still has a live
+/// `flock(LOCK_EX)` held on a second fd must NOT be reclaimed: the flock is the
+/// load-bearing gate, so `try_claim` refuses with `AlreadyHeld` even though the
+/// PID probe reports the body PID as dead. This covers the "PID dead but flock
+/// still held" safety branch that `write_stale_claim` cannot exercise (it
+/// closes its fd, releasing the lock).
+#[test]
+fn flock_held_dead_pid_is_refused() {
+    use std::os::unix::io::AsRawFd as _;
+
+    let port: u16 = 59882;
+    let path = PathBuf::from(format!("/tmp/rmlx.{port}.claim"));
+    let _ = std::fs::remove_file(&path);
+
+    // Write a dead PID into the body, but keep a fd open and an exclusive flock
+    // held on it — mimics a live fd whose recorded PID no longer resolves.
+    assert!(
+        !pid_is_alive(999_999),
+        "test precondition: PID 999999 must be dead"
+    );
+    let holder = {
+        use std::io::Write as _;
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("create flock-held claim file");
+        write!(f, "999999").expect("write dead pid");
+        f.flush().expect("flush dead pid");
+        f
+    };
+    // SAFETY: holder.as_raw_fd() is a valid open fd for the lifetime of `holder`.
+    let locked = unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(
+        locked, 0,
+        "test setup: must acquire flock on the claim file"
+    );
+
+    let res = try_claim(port);
+    assert!(
+        matches!(res, Err(ClaimError::AlreadyHeld { .. })),
+        "flock-held claim must be refused even with a dead PID body, got: {res:?}"
+    );
+    // File must be left intact — not stolen, not removed.
+    assert!(path.exists(), "flock-held claim file must be left in place");
+
+    drop(holder); // release the flock + close fd
+    let _ = std::fs::remove_file(&path);
+}
+
 /// `pid_is_alive(0)` is conservatively treated as alive so an unreadable /
 /// empty claim body is never stolen.
 #[test]
