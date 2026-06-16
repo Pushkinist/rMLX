@@ -13,7 +13,14 @@
 //! reconstructs the true head-major K within q8 noise across a multi-page,
 //! multi-append, multi-head schedule. `#[ignore]` — Metal context; run with
 //! `--ignored --test-threads=1`.
-#![allow(clippy::all, clippy::pedantic, unsafe_code)]
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    unsafe_code,
+    missing_docs
+)]
 
 use rmlx_kv_quant::paged::PagedKStorage;
 use rmlx_kv_quant::q8_msl::{q8_dequantize_gpu, q8_quantize_gpu};
