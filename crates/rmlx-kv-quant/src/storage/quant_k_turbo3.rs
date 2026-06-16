@@ -1,18 +1,17 @@
 // K-side TurboQuant 3-bit storage, mirror of `QuantKTurbo4`.
 //
-// Decision A (CPU K-side handling): transpose-before-call for the CPU path.
-// The V-side codec `turbo_quantize_v` is axis-agnostic — it treats its input
-// as a flat buffer shaped [B, kv_h, S, D] and operates over the last axis.
-// For K we simply pass the K array as-is (axis labels are semantics; the
-// byte layout is identical). No transposition needed: the K array arriving
-// at `append` is already shaped [B, kv_h, S, D] just like V.
-//
-// Decision B (MSL kernel): extended in place via the existing
-// `k8vturbo3_append_msl.rs` GPU path (`turbo_quantize_v3_gpu` /
-// `turbo_dequantize_v3_gpu`). The 3-bit kernel is axis-agnostic (same as
-// the 4-bit kernel that is reused). No fork needed: the Turbo3 K side just
-// calls the same GPU functions as the V side (precedent: `QuantKTurbo4`
-// calls `turbo_quantize_v4_gpu` and `turbo_dequantize_v4_gpu`).
+// CPU + MSL codec reuse: the V-side codec `turbo_quantize_v` and the
+// `k8vturbo3_append_msl.rs` GPU kernels (`turbo_quantize_v3_gpu` /
+// `turbo_dequantize_v3_gpu`) are positional — they group a flat buffer over
+// the last axis and do not interpret the head/seq axes. The Turbo3 K side
+// reuses them directly (no kernel fork; precedent: `QuantKTurbo4` reuses the
+// 4-bit kernels). Because the codec is positional, the *physical buffer order*
+// is what determines correctness across appends: `append` stores every chunk
+// sequence-major (`[B, S, kv_h, D]`) — reordering the head-major input
+// heads↔seq before quantizing — and `dequantize_choice` reorders back to the
+// logical `[B, kv_h, S, D]`. A flat head-major store would transpose heads
+// across a multi-append GQA cache (the dequant reshapes head-major over the
+// full sequence), so the reorder is load-bearing, not cosmetic.
 #![allow(
     missing_docs,
     unreachable_pub,
@@ -316,7 +315,15 @@ impl QuantKTurbo3 {
             let words_per_seq = self.gpu_words_per_step;
             let scales_per_seq = self.gpu_scales_per_step;
 
-            let (new_codes, new_scales) = turbo_quantize_v3_gpu(k_arr, device)?;
+            // Reorder the chunk to sequence-major `[B, new_seq, kv_h, D]` before
+            // quantizing: the flat buffer accumulates chunks at
+            // `prev_seq * words_per_seq`, so a head-major store + head-major
+            // reshape on dequant transposes heads across appends when kv_h>1.
+            // `transpose` yields a strided view; the TurboQuant MSL kernel reads
+            // its input by raw linear offset (ignores MLX strides), so
+            // materialize the permutation with `contiguous` first.
+            let k_seq_major = k_arr.transpose(&[0, 2, 1, 3], device)?.contiguous(device)?;
+            let (new_codes, new_scales) = turbo_quantize_v3_gpu(&k_seq_major, device)?;
 
             let codes_start = prev_seq * words_per_seq;
             let codes_stop = (prev_seq + new_seq) * words_per_seq;
@@ -347,7 +354,17 @@ impl QuantKTurbo3 {
         } else {
             // CPU path: scalar Rust quantization (axis-agnostic — same codec as
             // V-side turbo3; the codebook is N(0,1) Lloyd-Max regardless of axis).
-            let block = turbo_quantize_v(f32_data, self.bits, new_shape)?;
+            // Store the chunk sequence-major so the CPU blocks share one layout
+            // with the GPU buffer (spill/hydrate moves codes between them);
+            // `f32_data` is head-major, reorder to `[B, new_seq, kv_h, D]` and
+            // pass the matching shape.
+            let b = new_shape[0] as usize;
+            let kv_h = new_shape[1] as usize;
+            let new_seq = new_shape[2] as usize;
+            let d = new_shape[3] as usize;
+            let seq_major = super::seq_layout::transpose_heads_seq(f32_data, b, kv_h, new_seq, d);
+            let seq_shape = [new_shape[0], new_shape[2], new_shape[1], new_shape[3]];
+            let block = turbo_quantize_v(&seq_major, self.bits, &seq_shape)?;
             self.blocks.push(block);
         }
         Ok(())
@@ -373,18 +390,32 @@ impl QuantKTurbo3 {
                 let codes = codes_buf.slice(&[0], &[s * self.gpu_words_per_step], &[1], device)?;
                 let scales =
                     scales_buf.slice(&[0], &[s * self.gpu_scales_per_step], &[1], device)?;
-                let out = turbo_dequantize_v3_gpu(&codes, &scales, &self.shape, out_dtype, device)?;
+                // Flat buffer is sequence-major (see `append`): dequant into
+                // `[B, S, kv_h, D]`, then reorder heads↔seq back to the logical
+                // `[B, kv_h, S, D]`. `contiguous` after the output transpose so
+                // raw byte-readers (SSD spill) see the permuted bytes.
+                let seq_major_shape = [self.shape[0], self.shape[2], self.shape[1], self.shape[3]];
+                let out =
+                    turbo_dequantize_v3_gpu(&codes, &scales, &seq_major_shape, out_dtype, device)?;
+                let out = out.transpose(&[0, 2, 1, 3], device)?.contiguous(device)?;
                 return Ok((Vec::new(), Some(out)));
             }
             return Ok((Vec::new(), None));
         }
-        // CPU path.
+        // CPU path. Blocks are sequence-major (see `append`); reorder the
+        // concatenated decode back to the logical `[B, kv_h, S, D]`.
         let total: usize = self.shape.iter().map(|&d| d as usize).product();
         let mut out = Vec::with_capacity(total);
         for block in &self.blocks {
             let slice = turbo_dequantize(block)?;
             out.extend_from_slice(&slice);
         }
+        out.resize(total, 0.0);
+        let b = self.shape[0] as usize;
+        let kv_h = self.shape[1] as usize;
+        let s = self.shape[2] as usize;
+        let d = self.shape[3] as usize;
+        let out = super::seq_layout::transpose_seq_heads(&out, b, s, kv_h, d);
         Ok((out, None))
     }
 
