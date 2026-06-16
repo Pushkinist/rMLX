@@ -120,10 +120,11 @@ fn build_header() -> Result<String> {
 // ── Kernel source ────────────────────────────────────────────────────────────
 //
 // Buffer layout (must match `add_input` order in `phase2_sparse_attend`):
+// K buffers are SEQUENCE-major (`[B, kv_seq, kv_h, ...]`); V stays head-major.
 //   0. query           : f32  [n_bh * head_dim]
-//   1. k_codes         : u32  [B * kv_h * kv_seq * (head_dim/32) * 4]
-//   2. k_scales        : f32  [B * kv_h * kv_seq * head_dim/2]
-//   3. k_rot32         : u32  [B * kv_h * kv_seq * head_dim/16]
+//   1. k_codes         : u32  [B * kv_seq * kv_h * (head_dim/32) * 4]
+//   2. k_scales        : f32  [B * kv_seq * kv_h * head_dim/2]
+//   3. k_rot32         : u32  [B * kv_seq * kv_h * head_dim/16]
 //   4. v_flat          : bf16/f16/f32 [B * kv_h * kv_seq * head_dim]
 //   5. all_scores      : f32  [n_bh * kv_seq]  (from Phase 1)
 //   6. head_threshold  : f32  [n_bh]
@@ -234,7 +235,10 @@ fn build_kernel_source() -> String {
         }}
 
         // ── Decode K[tid] for this (b, kv_h_idx, t) ──────────────────────
-        uint kv_tok          = (b * kv_h + kv_h_idx) * kv_seq + t;
+        // K packing is SEQUENCE-major (`[B, S, kv_h, D]`): per token all heads
+        // are contiguous, matching QuantPlanarK's chunk-append layout. (V below
+        // stays head-major — it is the bf16 mirror, not the planar-packed buffer.)
+        uint kv_tok          = (b * kv_seq + t) * kv_h + kv_h_idx;
         uint codes_tok_off   = kv_tok * codes_words_per_tok;
         uint scales_tok_off  = kv_tok * scales_pairs_per_tok;
         uint rot_tok_off     = kv_tok * rot_words_per_tok;
