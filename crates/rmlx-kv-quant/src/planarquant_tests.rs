@@ -362,6 +362,9 @@ fn gpu_word_extract_index(codes: &[u8], group: usize, elem: usize, bits: u8) -> 
     // CPU writes `code_bytes_per_block` bytes per group; GPU reads 4 u32/group.
     // Reinterpret the group's bytes as little-endian u32 words (the same view
     // `Array::from_bytes(.., Dtype::U32)` yields on Apple Silicon).
+    // Intentionally hand-rolled, independent of `unpack_index`, so the parity
+    // check in callers is non-circular (calling `unpack_index` here would make
+    // the test vacuous).
     let vals_per_word = 32 / bits as usize;
     let word_in_group = elem / vals_per_word;
     let shift = (elem % vals_per_word) * bits as usize;

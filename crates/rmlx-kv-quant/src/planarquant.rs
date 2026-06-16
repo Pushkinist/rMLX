@@ -601,7 +601,7 @@ fn pack_index(block_bytes: &mut [u8], elem: usize, index: u8, bits: u8) {
         reason = "byte_base+4 <= block_bytes.len(): block_bytes covers CODE_WORDS_PER_BLOCK u32 words; word=elem/vpw < CODE_WORDS_PER_BLOCK for elem < GROUP_SIZE"
     )]
     let word_bytes = &mut block_bytes[byte_base..byte_base + 4];
-    let mut w = u32::from_le_bytes(read_word(word_bytes));
+    let mut w = u32::from_le_bytes(word_bytes.try_into().unwrap_or([0u8; 4]));
     w |= (u32::from(index) & mask) << shift;
     word_bytes.copy_from_slice(&w.to_le_bytes());
 }
@@ -621,22 +621,8 @@ fn unpack_index(block_bytes: &[u8], elem: usize, bits: u8) -> u8 {
         reason = "byte_base+4 <= block_bytes.len(): block_bytes covers CODE_WORDS_PER_BLOCK u32 words; word=elem/vpw < CODE_WORDS_PER_BLOCK for elem < GROUP_SIZE"
     )]
     let word_bytes = &block_bytes[byte_base..byte_base + 4];
-    let w = u32::from_le_bytes(read_word(word_bytes));
+    let w = u32::from_le_bytes(word_bytes.try_into().unwrap_or([0u8; 4]));
     ((w >> shift) & mask) as u8
-}
-
-/// Copy a 4-byte slice into a fixed `[u8; 4]` for `u32::from_le_bytes`.
-///
-/// `word` is always a 4-byte sub-slice (`byte_base..byte_base + 4`); the loop
-/// copies exactly the available bytes, leaving the array zero-padded if shorter
-/// (never happens for valid callers, but keeps the helper index-panic-free).
-#[inline]
-fn read_word(word: &[u8]) -> [u8; 4] {
-    let mut buf = [0u8; 4];
-    for (dst, &src) in buf.iter_mut().zip(word.iter()) {
-        *dst = src;
-    }
-    buf
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
