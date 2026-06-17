@@ -37,7 +37,9 @@
     clippy::disallowed_methods,
 )]
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use rmlx_kv_quant::{
     planarquant::{planar_dequantize, planar_quantize},
     turboquant::{turbo_dequantize, turbo_quantize_v},
