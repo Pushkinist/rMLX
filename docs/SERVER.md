@@ -228,6 +228,39 @@ quant for a 128k request, `none` for a short chat) with zero downtime.
 - **Deferred:** live SSD-tier reconfiguration (per-request `kv_ssd` toggle) is
   **not** implemented — see `docs/SSD_TIER.md` § "Live reconfiguration (deferred)".
 
+### Multimodal content parts — image + native audio input
+
+A user message's `content` may be a string (text) or an array of content parts.
+Image and native-audio parts are extracted from the last user message and routed
+through the model's multimodal towers. The tower output (soft tokens) is
+scattered into the prompt at the corresponding placeholder positions, then decode
+runs from the fused `inputs_embeds` (mirroring mlx-vlm `get_input_embeddings`).
+
+| Part `type` | Shape | Tower | Supported arch |
+|---|---|---|---|
+| `text` | `{type:"text", text:"…"}` | — | all |
+| `image_url` | `{type:"image_url", image_url:{url:"<url\|data-URL>"}}` | SigLIP vision | Gemma4, Gemma3, Qwen3-VL-MoE |
+| `input_image` | `{type:"input_image", image_url:"<url>"}` (mlx-vlm shape) | SigLIP vision | same |
+| `input_audio` | `{type:"input_audio", input_audio:{data:"<base64>", format:"wav"}}` | Conformer audio (USM) | **Gemma4** (e4b/26b) |
+
+**Native audio (`input_audio`) — Gemma4.** The base64 payload is decoded
+(`rmlx-audio` symphonia decoder — WAV/MP3/M4A/etc.), downmixed to mono and
+resampled to 16 kHz, run through the Gemma4 USM log-mel front-end, then the
+Conformer `audio_tower` produces `T_sub` audio soft tokens. The prompt is
+spliced with `<|audio>` + `T_sub`×`<|audio|>` + `<audio|>` after the leading
+token, and the soft tokens are scattered at the `<|audio|>` positions. `T_sub`
+is derived from the encoder's SSCP downsample (`≈ mel_frames / 4`), so the
+placeholder count always matches the encoder output (scatter aligns by
+construction). One clip per request; >1 is rejected with a clear error.
+
+**Not-supported path.** Submitting `input_audio` to a model without an audio
+tower (text-only, or a vision-only checkpoint) returns **HTTP 503**
+`"this model does not accept audio input (no audio tower)"` — never a silent
+drop. This mirrors the vision path's `503 no vision tower` rejection.
+
+**Bounds.** Each `input_audio` part is capped at 16 MiB decoded
+(`bounds::MAX_INPUT_AUDIO_BYTES`); larger clips return HTTP 400.
+
 **Non-streaming response** (`stream:false`):
 
 ```json
