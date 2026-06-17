@@ -649,6 +649,16 @@ arch string to the Gemma4 text loader; the multimodal-embedder tensors
 (`embed_vision`/`embed_audio`/`vision_embedder.*`) are not read, so image/audio
 input is not yet wired for 12B (text serves end-to-end).
 
+Text serves correctly at **all weight quants**, including the mixed 4/8-bit QAT
+snapshots (`gemma-4-12B-it-qat-4bit` affine, `gemma-4-12B-it-qat-mxfp4`): their
+`quantization` block keeps the MLP `gate/up/down` projections at 8-bit while the
+rest is 4-bit, which the per-tensor override resolver handles unchanged. These
+snapshots emit a degenerate filler token (`'1'`) on a *bare* instruction prompt
+with no turn markers — `mlx-lm` reproduces this identically, and the mxfp8 build
+degenerates the same way to `.`/`_`. The `--probe-smoke` heuristic therefore
+templates its seed (see `docs/CLI.md` `info`) so the verdict matches the served
+behaviour rather than the bare-prompt artifact.
+
 ### Key structural properties
 
 **SWA + FullAttention alternation.** Per-layer `layer_types` array determines

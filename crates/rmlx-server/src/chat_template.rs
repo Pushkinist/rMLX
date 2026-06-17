@@ -157,7 +157,7 @@ pub struct RenderOpts<'a> {
 /// Construct once per model; `render` may be called many times.
 #[allow(
     clippy::exhaustive_structs,
-    reason = "internal closed template struct — private minijinja environment field; public API is from_template_string() and render(); adding a field requires updating ChatTemplate::from_template_string"
+    reason = "internal closed template struct — private minijinja environment field; public API is ChatTemplate::new() and render(); adding a field requires updating ChatTemplate::new"
 )]
 pub struct ChatTemplate {
     env: Environment<'static>,
@@ -216,6 +216,91 @@ pub fn load_template_source(model_dir: &Path) -> Result<String> {
     let path = model_dir.join("chat_template.jinja");
     std::fs::read_to_string(&path)
         .map_err(|e| Error::Other(format!("cannot read {}: {e}", path.display())))
+}
+
+// ── Smoke-probe prompt ─────────────────────────────────────────────────────────
+
+/// Build the smoke-probe input token ids for a model snapshot by rendering the
+/// canonical seed through the model's real `chat_template.jinja`, so the probe
+/// exercises the same prompt shape the model is served with in production.
+///
+/// Instruction-tuned models are trained to continue *turn-structured* input
+/// (`<start_of_turn>user … <start_of_turn>model`). Fed a bare instruction with
+/// no turn scaffolding, a healthy model can still degenerate into a repeated
+/// filler token — a behaviour the reference loader reproduces identically. That
+/// made the bare-seed probe raise false `Broken*` verdicts for snapshots that
+/// generate correctly through `serve`. Rendering the canonical seed through
+/// `chat_template.jinja` removes that false positive generally, for any arch
+/// whose bare-prompt continuation is degenerate.
+///
+/// Returns `None` when the snapshot has no usable `chat_template.jinja` (or the
+/// render/encode fails) — base / non-chat snapshots. The caller then passes
+/// `None` to `run_smoke_probe`, which builds the shared bare seed itself with
+/// its own canonical BOS resolution. Keeping the bare-seed construction out of
+/// this function means the BOS fallback chain lives in exactly one place per
+/// entry point and no token id is hard-coded here.
+///
+/// The template emits its own `<bos>`, so the rendered text is tokenized with
+/// `add_special_tokens = false` (mirrors the production request path).
+pub fn smoke_prompt_ids(model_dir: &Path, tokenizer: &tokenizers::Tokenizer) -> Option<Vec<u32>> {
+    match render_templated_seed(model_dir, tokenizer) {
+        Ok(ids) => Some(ids),
+        Err(reason) => {
+            // Expected for base / non-chat snapshots. Recorded at debug level so
+            // a run's `.jsonl` shows whether the probe ran templated or fell back
+            // to the bare seed, and why — without warning on the normal case.
+            tracing::debug!(
+                reason,
+                "smoke_prompt_ids: no usable chat template — using bare seed"
+            );
+            None
+        }
+    }
+}
+
+/// Render `arch::SMOKE_PROMPT` as a single user turn through the model's chat
+/// template and tokenize the result. Returns the encoded ids on success, or a
+/// human-readable reason string on any miss (no template, compile/render/encode
+/// failure, or empty output) so the caller can log it once at the fallback
+/// boundary.
+fn render_templated_seed(
+    model_dir: &Path,
+    tokenizer: &tokenizers::Tokenizer,
+) -> std::result::Result<Vec<u32>, String> {
+    let src = load_template_source(model_dir).map_err(|e| format!("load template: {e}"))?;
+    let tpl = ChatTemplate::new(src).map_err(|e| format!("compile template: {e}"))?;
+
+    let cfg = crate::tokenizer_io::load_tokenizer_config(model_dir)
+        .map_err(|e| format!("load tokenizer_config: {e}"))?;
+    let bos_token = cfg.bos_token.as_deref().unwrap_or("");
+    let eos_token = cfg.eos_token.as_deref().unwrap_or("");
+
+    let messages = [ChatMessageTpl {
+        role: "user",
+        content: rmlx_models::arch::SMOKE_PROMPT,
+        ..ChatMessageTpl::default()
+    }];
+    let opts = RenderOpts {
+        bos_token,
+        eos_token,
+        add_generation_prompt: true,
+        tools: &[],
+        enable_thinking: None,
+    };
+    let rendered = tpl
+        .render(&messages, &opts)
+        .map_err(|e| format!("render template: {e}"))?;
+
+    // The template already emits the BOS marker, so encode without re-adding
+    // special tokens (mirrors the production request path).
+    let enc = tokenizer
+        .encode(rendered.text.as_str(), false)
+        .map_err(|e| format!("encode rendered prompt: {e}"))?;
+    let ids = enc.get_ids().to_vec();
+    if ids.is_empty() {
+        return Err("rendered prompt encoded to zero tokens".to_owned());
+    }
+    Ok(ids)
 }
 
 // ── ChatTemplate ──────────────────────────────────────────────────────────────
