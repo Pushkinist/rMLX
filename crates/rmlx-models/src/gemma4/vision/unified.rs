@@ -296,63 +296,7 @@ impl UnifiedVisionEmbedder {
         reason = "bounds established by construction: all indices derived from the host-computed patch grid"
     )]
     fn patchify_and_merge(&self, pv: &Gemma4PixelValues) -> Result<(Vec<f32>, Vec<i32>, Vec<i32>)> {
-        let p = self.cfg.patch_size; // 16
-        let k = self.cfg.pooling_kernel_size; // 3
-        let h = pv.height;
-        let w = pv.width;
-        if !h.is_multiple_of(p * k) || !w.is_multiple_of(p * k) {
-            return Err(Error::Model(format!(
-                "gemma4_unified vision: image {h}x{w} not divisible by model_patch_size {}",
-                p * k
-            )));
-        }
-        let p_h = h / p; // teacher rows
-        let p_w = w / p; // teacher cols
-        let m_h = p_h / k; // model rows
-        let m_w = p_w / k; // model cols
-        let n_model = m_h * m_w;
-        let model_patch = p * k; // 48
-        let patch_dim = model_patch * model_patch * 3; // 6912
-        let n_pixels = h * w;
-
-        // Build merged patches directly in the reference target layout. The
-        // upstream `patches_merge` reshapes the k×k kernel group to
-        // `(length, k, k, p, p, 3)` then permutes to `(length, k, p, k, p, 3)`
-        // and flattens — i.e. the 6912-vector interior is ordered
-        // **`[ky, ry, kx, rx, ch]`**. That makes the model patch a *contiguous*
-        // (k*p)×(k*p) image: full row = `ky*p + ry`, full col = `kx*p + rx`.
-        // (Ordering `[ky, kx, ry, rx, ch]` would tile 3×3 blocks instead and
-        // scramble fine detail — OCR fails, color survives.)
-        let mut merged = vec![0.0_f32; n_model * patch_dim];
-        let mut x_idx = vec![0i32; n_model];
-        let mut y_idx = vec![0i32; n_model];
-        for my in 0..m_h {
-            for mx in 0..m_w {
-                let model_i = my * m_w + mx;
-                // model-patch position = (min teacher_x // k, min teacher_y // k)
-                // = (mx, my) since teacher cols/rows in a kernel are contiguous.
-                x_idx[model_i] = mx as i32;
-                y_idx[model_i] = my as i32;
-                let dst = model_i * patch_dim;
-                for ky in 0..k {
-                    for ry in 0..p {
-                        for kx in 0..k {
-                            for rx in 0..p {
-                                let y = (my * k + ky) * p + ry; // my*48 + ky*16 + ry
-                                let x = (mx * k + kx) * p + rx; // mx*48 + kx*16 + rx
-                                for ch in 0..3 {
-                                    let src = ch * n_pixels + y * w + x;
-                                    // interior index: [ky, ry, kx, rx, ch] over dims [k, p, k, p, 3]
-                                    let off = ((((ky * p + ry) * k + kx) * p + rx) * 3) + ch;
-                                    merged[dst + off] = pv.pixel_values[src];
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok((merged, x_idx, y_idx))
+        patchify_and_merge_impl(&self.cfg, pv)
     }
 
     /// Gather `pos_embedding[x, 0, :] + pos_embedding[y, 1, :]` per model patch.
@@ -379,6 +323,80 @@ impl UnifiedVisionEmbedder {
         let pe_y = table_y.take(&y_arr, 0, device)?;
         add(&pe_x, &pe_y, device)
     }
+}
+
+/// Host patchify (16px teacher patches) + `patches_merge` (k×k -> model patch)
+/// core, factored out of [`UnifiedVisionEmbedder::patchify_and_merge`] so the
+/// channel/value layout is covered by a model-free numerical test.
+///
+/// Faithful to `convert_image_to_patches` (teacher-patch interior `[ry, rx, ch]`)
+/// and `patches_merge` (model-patch interior `[ky, ry, kx, rx, ch]` over dims
+/// `[k, p, k, p, 3]`; position = top-left teacher position // k). Returns the
+/// flat `[n_model * patch_dim]` f32 plus per-model-patch `(x, y)` positions.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: all indices derived from the host-computed patch grid"
+)]
+fn patchify_and_merge_impl(
+    cfg: &UnifiedVisionConfig,
+    pv: &Gemma4PixelValues,
+) -> Result<(Vec<f32>, Vec<i32>, Vec<i32>)> {
+    let p = cfg.patch_size; // 16
+    let k = cfg.pooling_kernel_size; // 3
+    let h = pv.height;
+    let w = pv.width;
+    if !h.is_multiple_of(p * k) || !w.is_multiple_of(p * k) {
+        return Err(Error::Model(format!(
+            "gemma4_unified vision: image {h}x{w} not divisible by model_patch_size {}",
+            p * k
+        )));
+    }
+    let p_h = h / p; // teacher rows
+    let p_w = w / p; // teacher cols
+    let m_h = p_h / k; // model rows
+    let m_w = p_w / k; // model cols
+    let n_model = m_h * m_w;
+    let model_patch = p * k; // 48
+    let patch_dim = model_patch * model_patch * 3; // 6912
+    let n_pixels = h * w;
+
+    // Build merged patches directly in the reference target layout. The upstream
+    // `patches_merge` reshapes the k×k kernel group to `(length, k, k, p, p, 3)`
+    // then permutes to `(length, k, p, k, p, 3)` and flattens — i.e. the
+    // 6912-vector interior is ordered **`[ky, ry, kx, rx, ch]`**, making the
+    // model patch a *contiguous* (k*p)×(k*p) image: full row = `ky*p + ry`, full
+    // col = `kx*p + rx`. (Ordering `[ky, kx, ry, rx, ch]` would tile 3×3 blocks
+    // instead and scramble fine detail — OCR fails, colour survives.)
+    let mut merged = vec![0.0_f32; n_model * patch_dim];
+    let mut x_idx = vec![0i32; n_model];
+    let mut y_idx = vec![0i32; n_model];
+    for my in 0..m_h {
+        for mx in 0..m_w {
+            let model_i = my * m_w + mx;
+            // model-patch position = (min teacher_x // k, min teacher_y // k)
+            // = (mx, my) since teacher cols/rows in a kernel are contiguous.
+            x_idx[model_i] = mx as i32;
+            y_idx[model_i] = my as i32;
+            let dst = model_i * patch_dim;
+            for ky in 0..k {
+                for ry in 0..p {
+                    for kx in 0..k {
+                        for rx in 0..p {
+                            let y = (my * k + ky) * p + ry; // my*48 + ky*16 + ry
+                            let x = (mx * k + kx) * p + rx; // mx*48 + kx*16 + rx
+                            for ch in 0..3 {
+                                let src = ch * n_pixels + y * w + x;
+                                // interior index: [ky, ry, kx, rx, ch] over dims [k, p, k, p, 3]
+                                let off = ((((ky * p + ry) * k + kx) * p + rx) * 3) + ch;
+                                merged[dst + off] = pv.pixel_values[src];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok((merged, x_idx, y_idx))
 }
 
 // ---------------------------------------------------------------------------
@@ -419,11 +437,14 @@ pub fn load_unified_vision_embedder(
             .any(|(_, h)| h.safetensors().is_ok_and(|st| st.tensor(name).is_ok()))
     };
 
+    // patch_ln1 / patch_ln2 / pos_norm are PyTorch `nn.LayerNorm` constructed
+    // with the default eps (1e-5) in the reference embedder — NOT the model's
+    // `rms_norm_eps` (1e-6, which only governs the `embed_vision` RMSNorm).
     let layer_norm = |prefix: &str| -> Result<LayerNorm> {
         Ok(LayerNorm {
             weight: load_f32(&shards, &format!("{prefix}.weight"))?,
             bias: load_f32(&shards, &format!("{prefix}.bias"))?,
-            eps: cfg.rms_norm_eps,
+            eps: 1e-5,
         })
     };
 

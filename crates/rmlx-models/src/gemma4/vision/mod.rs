@@ -777,6 +777,14 @@ pub fn load_multimodal_embedder(
 /// must equal the vision tower's `num_soft_tokens` for the scatter to align.
 pub const IMAGE_TOKEN_ID: u32 = 258880;
 
+/// Gemma4 `<start_of_image>` (begin-of-image) marker token id. Wraps each
+/// image's soft-token run on the left.
+pub const BOI_TOKEN_ID: u32 = 255_999;
+
+/// Gemma4 `<end_of_image>` marker token id. Wraps each image's soft-token run
+/// on the right.
+pub const EOI_TOKEN_ID: u32 = 258_882;
+
 /// Build the merged `inputs_embeds` for a Gemma4 image prompt.
 ///
 /// Faithful host port of mlx-vlm `gemma4.py::Model.get_input_embeddings`:
