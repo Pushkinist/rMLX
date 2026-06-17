@@ -82,7 +82,7 @@ tower = { version = "0.5", default-features = false }
 
 # Templates / tokenizer
 minijinja  = { version = "2", features = ["json", "preserve_order"] }
-tokenizers = "0.20"
+tokenizers = "0.23"
 
 # MLX bindings — disabled until tensor compute is needed (S1.4 Gemma4 graph).
 # See FINDINGS.md "MLX bindings" for the build-tooling situation.

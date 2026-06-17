@@ -1,12 +1,12 @@
 use super::*;
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::str::FromStr as _;
 use std::sync::{Mutex, MutexGuard};
 
 use rmlx_core::error::Error;
 use rmlx_kv_quant::KvQuant;
-use tokenizers::models::wordlevel::WordLevel;
 use tokenizers::Tokenizer;
 
 /// Serializes the MLX-touching tests *in this module* against each other. MLX
@@ -55,18 +55,25 @@ fn id_of(a: &Array) -> u32 {
 }
 
 /// A minimal `WordLevel` tokenizer over ids `0..n` mapped to `t<id>`.
+///
+/// Built from a HuggingFace tokenizer JSON string rather than the
+/// `WordLevelBuilder::vocab` API: tokenizers 0.21+ switched the builder's
+/// vocab map to `ahash::AHashMap`, which is not a direct dependency of this
+/// crate. The JSON path is behaviour-identical and dependency-free.
 #[allow(clippy::expect_used)]
 fn tiny_tokenizer(n: u32) -> Tokenizer {
-    let mut vocab: HashMap<String, u32> = HashMap::new();
+    let mut vocab = String::from("{");
     for i in 0..n {
-        vocab.insert(format!("t{i}"), i);
+        if i > 0 {
+            vocab.push(',');
+        }
+        let _ = write!(vocab, "\"t{i}\":{i}");
     }
-    let wl = WordLevel::builder()
-        .vocab(vocab)
-        .unk_token("<unk>".to_string())
-        .build()
-        .expect("build wordlevel");
-    Tokenizer::new(wl)
+    vocab.push('}');
+    let json = format!(
+        r#"{{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{{"type":"WordLevel","vocab":{vocab},"unk_token":"<unk>"}}}}"#
+    );
+    Tokenizer::from_str(&json).expect("build wordlevel tokenizer")
 }
 
 fn greedy_cfg() -> SamplerConfig {
