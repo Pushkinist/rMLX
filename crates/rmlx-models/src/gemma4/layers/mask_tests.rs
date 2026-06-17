@@ -53,6 +53,7 @@ fn full_attn_verify_block_mask_matches_producer_k_len() {
         producer_offset + seq,
         false, // attn_is_rotating
         window,
+        None, // bidi_overlay: tests cover causal/SWA mask sizing, not the image overlay
         Device::Cpu,
     )
     .unwrap();
@@ -100,6 +101,7 @@ fn sliding_attn_verify_block_mask_matches_capped_k_len() {
         effective_offset + seq,
         true, // attn_is_rotating
         window,
+        None, // bidi_overlay: tests cover causal/SWA mask sizing, not the image overlay
         Device::Cpu,
     )
     .unwrap();
@@ -162,6 +164,7 @@ fn guard_invariant_producer_offset_matches_k_seq() {
         effective_offset + seq,
         false,
         window,
+        None, // bidi_overlay: tests cover causal/SWA mask sizing, not the image overlay
         Device::Cpu,
     )
     .unwrap();
@@ -234,6 +237,7 @@ fn guard_invariant_consumer_mask_matches_shared_k_len() {
         total_kv_len,
         false, // attn_is_rotating
         window,
+        None, // bidi_overlay: tests cover causal/SWA mask sizing, not the image overlay
         Device::Cpu,
     )
     .unwrap();
@@ -285,6 +289,7 @@ fn guard_invariant_regressed_consumer_offset_inflates_mask() {
         base_offset + seq,
         false,
         window,
+        None, // bidi_overlay: tests cover causal/SWA mask sizing, not the image overlay
         Device::Cpu,
     )
     .unwrap();
@@ -332,6 +337,7 @@ fn guard_invariant_regressed_base_offset_inflates_mask() {
         base_offset_desynced + seq,
         false,
         window,
+        None, // bidi_overlay: tests cover causal/SWA mask sizing, not the image overlay
         Device::Cpu,
     )
     .unwrap();

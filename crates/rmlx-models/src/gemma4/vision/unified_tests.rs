@@ -96,3 +96,139 @@ fn is_unified_arch_false_for_missing_dir() {
     let p = Path::new("/nonexistent/gemma4-unified-test-dir");
     assert!(!is_unified_arch(p));
 }
+
+/// Build a solid-colour CHW `[1, 3, H, W]` pixel buffer (the shared
+/// preprocessor output: rescaled `[0,1]`, channels-first, RGB).
+#[allow(
+    clippy::indexing_slicing,
+    reason = "buffer sized 3*n at allocation; c*n+i bounded by c<3, i<n"
+)]
+fn solid_chw(h: usize, w: usize, rgb: [f32; 3]) -> Gemma4PixelValues {
+    let n = h * w;
+    let mut pixel_values = vec![0.0_f32; 3 * n];
+    for (c, &v) in rgb.iter().enumerate() {
+        for i in 0..n {
+            pixel_values[c * n + i] = v;
+        }
+    }
+    Gemma4PixelValues {
+        pixel_values,
+        height: h,
+        width: w,
+        num_soft_tokens: 0,
+    }
+}
+
+/// Model-free numerical guard for the unified patchify front-end — the test that
+/// would have caught a channel-order / value-scaling defect (#127's first
+/// suspect). For a solid RGB input every merged-patch slot must equal the source
+/// channel value exactly, and the three channels must remain in RGB order
+/// (interior index `% 3` selects R/G/B). A pure-green input must therefore yield
+/// nonzero values only in the green-derived (`off % 3 == 1`) slots.
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::float_cmp,
+    clippy::expect_used,
+    reason = "fixed-size solid-colour buffer indexed by construction; rescaled pixel values are exact 0.0/1.0"
+)]
+fn patchify_preserves_channel_values_and_order() {
+    let cfg = cfg_12b();
+    // One 48x48 model patch (k*p = 48): smallest valid image.
+    let (h, w) = (48usize, 48usize);
+
+    for (name, rgb) in [
+        ("red", [1.0, 0.0, 0.0]),
+        ("green", [0.0, 1.0, 0.0]),
+        ("blue", [0.0, 0.0, 1.0]),
+        ("white", [1.0, 1.0, 1.0]),
+        ("yellow", [1.0, 1.0, 0.0]),
+    ] {
+        let pv = solid_chw(h, w, rgb);
+        let (merged, x_idx, y_idx) =
+            patchify_and_merge_impl(&cfg, &pv).expect("patchify must succeed");
+        assert_eq!(x_idx, vec![0]);
+        assert_eq!(y_idx, vec![0]);
+        let patch_dim = cfg.patch_dim();
+        assert_eq!(merged.len(), patch_dim);
+
+        // Every interior slot equals the source channel value (no scaling,
+        // inversion, or channel swap); channel = interior index % 3.
+        for (off, &val) in merged.iter().enumerate() {
+            let ch = off % 3;
+            assert!(
+                (val - rgb[ch]).abs() < 1e-6,
+                "{name}: slot {off} (ch {ch}) = {val}, expected {}",
+                rgb[ch]
+            );
+        }
+        // Channel-order sanity: a channel that is 0 in the source must be 0 in
+        // every derived slot (e.g. pure green leaves R- and B-slots at 0).
+        for (ch, &src_val) in rgb.iter().enumerate() {
+            if src_val == 0.0 {
+                let any_nonzero = merged.iter().skip(ch).step_by(3).any(|&v| v != 0.0);
+                assert!(
+                    !any_nonzero,
+                    "{name}: channel {ch} is 0 in source but nonzero after patchify"
+                );
+            }
+        }
+    }
+}
+
+/// Channel routing within a single 48x48 patch must be spatially faithful: a
+/// half-red / half-blue image (left columns red, right columns blue) lands red
+/// in the left half of the contiguous model-patch image and blue in the right
+/// half — proving the `[ky, ry, kx, rx, ch]` interior layout reconstructs the
+/// original pixel grid (not a scrambled 3×3 tiling).
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::float_cmp,
+    clippy::expect_used,
+    reason = "fixed-size half-red/half-blue buffer indexed by construction; pixel values are exact 0.0/1.0"
+)]
+fn patchify_interior_layout_is_contiguous_image() {
+    let cfg = cfg_12b();
+    let (h, w) = (48usize, 48usize);
+    let n = h * w;
+    let mut pixel_values = vec![0.0_f32; 3 * n];
+    // CHW: R channel = 1 on left half, B channel = 1 on right half.
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            if x < w / 2 {
+                pixel_values[i] = 1.0; // R
+            } else {
+                pixel_values[2 * n + i] = 1.0; // B
+            }
+        }
+    }
+    let pv = Gemma4PixelValues {
+        pixel_values,
+        height: h,
+        width: w,
+        num_soft_tokens: 0,
+    };
+    let (merged, _, _) = patchify_and_merge_impl(&cfg, &pv).expect("patchify must succeed");
+
+    // The merged 6912-vector is a contiguous 48x48x3 image: index
+    // (row*48 + col)*3 + ch. Left columns must be red, right columns blue.
+    let side = cfg.model_patch_size; // 48
+    for row in 0..side {
+        for col in 0..side {
+            let base = (row * side + col) * 3;
+            let (r, g, b) = (merged[base], merged[base + 1], merged[base + 2]);
+            assert_eq!(g, 0.0, "no green expected at ({row},{col})");
+            if col < side / 2 {
+                assert_eq!((r, b), (1.0, 0.0), "left half must be red at ({row},{col})");
+            } else {
+                assert_eq!(
+                    (r, b),
+                    (0.0, 1.0),
+                    "right half must be blue at ({row},{col})"
+                );
+            }
+        }
+    }
+}

@@ -147,6 +147,7 @@ impl Attention {
         clippy::indexing_slicing,
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
     )]
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn forward(
         &self,
         x: &Array,
@@ -154,6 +155,7 @@ impl Attention {
         offset: i32,
         cache: Option<&mut KvCache>,
         kv_is_rotating: bool,
+        bidi_overlay: Option<&Array>,
         device: Device,
     ) -> Result<(Array, Option<(Array, Array)>)> {
         let shape = x.shape(); // [batch, seq, hidden]
@@ -325,6 +327,7 @@ impl Attention {
                     total_kv_len_pre,
                     attn_is_rotating,
                     self.sliding_window,
+                    bidi_overlay,
                     device,
                 )?;
                 // Cache-holding layer: route through the shared-KV variant of
@@ -381,6 +384,7 @@ impl Attention {
                     total_kv_len_pre,
                     attn_is_rotating,
                     self.sliding_window,
+                    bidi_overlay,
                     device,
                 )?;
                 let k_new = k.try_clone()?;
@@ -464,6 +468,7 @@ impl Attention {
                 total_kv_len,
                 attn_is_rotating,
                 self.sliding_window,
+                bidi_overlay,
                 device,
             )?;
             // Guard (issue #32 part 2): the array-mode consumer mask's key dim
@@ -552,6 +557,7 @@ fn build_attn_mask(
     total_kv_len: i32,
     attn_is_rotating: bool,
     sliding_window: usize,
+    bidi_overlay: Option<&Array>,
     device: Device,
 ) -> Result<(Option<Array>, &'static str)> {
     match layer_type {
@@ -572,16 +578,26 @@ fn build_attn_mask(
             } else {
                 // SWA prefill — banded-causal mask sized by the
                 // capped effective offset.
-                let mask = Some(crate::layers::build_swa_prefill_mask(
+                let mask = crate::layers::build_swa_prefill_mask(
                     effective_offset,
                     seq,
                     sliding_window,
                     device,
-                )?);
-                Ok((mask, "array"))
+                )?;
+                let mask = combine_bidi_overlay(mask, bidi_overlay, device)?;
+                Ok((Some(mask), "array"))
             }
         }
         LayerType::FullAttention => {
+            // Bidirectional vision blocks require an explicit array mask even at
+            // offset==0 (where the default would be the cheap "causal" mode), so
+            // the intra-image-block openings can be merged in.
+            if bidi_overlay.is_some() && seq > 1 {
+                let causal =
+                    crate::layers::build_chunked_prefill_mask(effective_offset, seq, device)?;
+                let mask = combine_bidi_overlay(causal, bidi_overlay, device)?;
+                return Ok((Some(mask), "array"));
+            }
             let mode = crate::layers::pick_attn_mask_mode(effective_offset, seq);
             let mask = if mode == "array" {
                 Some(crate::layers::build_chunked_prefill_mask(
@@ -593,6 +609,35 @@ fn build_attn_mask(
                 None
             };
             Ok((mask, mode))
+        }
+    }
+}
+
+/// Merge a bidirectional-attention overlay into a prefill mask.
+///
+/// Both masks use additive convention: `0.0` = attend allowed, large-negative =
+/// blocked. A key/query pair is allowed if **either** the causal/SWA rule allows
+/// it **or** both positions lie in the same vision (image) block — so the merge
+/// is element-wise `maximum`. The overlay is `[1, 1, seq, seq]` and must match
+/// the prefill mask's `[1, 1, seq, offset+seq]` only when `offset == 0` (the
+/// single-shot image prefill path); the caller guarantees that.
+fn combine_bidi_overlay(
+    causal: Array,
+    bidi_overlay: Option<&Array>,
+    device: Device,
+) -> Result<Array> {
+    match bidi_overlay {
+        None => Ok(causal),
+        Some(overlay) => {
+            // Shapes agree only on the offset==0 single-shot image prefill, which
+            // is the only path that supplies an overlay. If the key dim differs
+            // (chunked prefill with a prior offset), skip the merge defensively
+            // and keep the causal mask.
+            if causal.shape() == overlay.shape() {
+                rmlx_mlx::maximum(&causal, overlay, device)
+            } else {
+                Ok(causal)
+            }
         }
     }
 }
