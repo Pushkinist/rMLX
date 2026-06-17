@@ -66,7 +66,11 @@ fn gemma4_audio_prompt_build_real_weights() {
     let bundle = load_gemma4_audio_bundle(&dir)
         .expect("load audio bundle")
         .expect("snapshot has an audio_config");
-    let AudioBundle::Gemma4 { audio_token_id, .. } = &bundle;
+    // e4b ships the Conformer audio tower (not the encoder-free unified arch).
+    let AudioBundle::Gemma4 { audio_token_id, .. } = &bundle else {
+        eprintln!("SKIP: e4b loaded a non-Conformer audio bundle (unexpected)");
+        return;
+    };
     let audio_token_id = *audio_token_id;
 
     // Load the text model so build_audio_prompt can embed + scatter.

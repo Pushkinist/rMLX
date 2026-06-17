@@ -1057,5 +1057,11 @@ fn build_attention(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Unified (encoder-free) audio embedder — `Gemma4UnifiedForConditionalGeneration`.
+// ---------------------------------------------------------------------------
+
+pub mod unified;
+
 #[cfg(test)]
 mod tests;

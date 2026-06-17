@@ -255,6 +255,36 @@ impl ArchGenerator {
         // `None` here and the image-input path is rejected at request time.
         // Only the Gemma4 architecture has a vision tower today.
         let vision: Option<Arc<VisionBundle>> = match &model {
+            // Gemma4 **unified** (12B): encoder-free vision embedder, no SigLIP
+            // tower. Distinguished from the tower family by `architectures[0]`.
+            rmlx_models::arch::Architecture::Gemma4(_)
+                if rmlx_models::gemma4::is_unified_arch(model_dir) =>
+            {
+                match rmlx_models::gemma4::UnifiedVisionConfig::from_model_dir(model_dir) {
+                    Ok(Some(vcfg)) => {
+                        match rmlx_models::gemma4::load_unified_vision_embedder(model_dir, &vcfg) {
+                            Ok(embedder) => {
+                                let pc = rmlx_models::gemma4::unified_image_processor_config(&vcfg);
+                                let processor = rmlx_models::gemma4::Gemma4ImageProcessor::new(pc);
+                                tracing::info!(model_id = %model_id, "Gemma4-unified vision embedder loaded (encoder-free, multimodal)");
+                                Some(Arc::new(VisionBundle::Gemma4Unified {
+                                    embedder,
+                                    processor,
+                                }))
+                            }
+                            Err(e) => {
+                                tracing::warn!(model_id = %model_id, error = %e, "unified vision embedder load failed — image input disabled");
+                                None
+                            }
+                        }
+                    }
+                    Ok(None) => None,
+                    Err(e) => {
+                        tracing::warn!(model_id = %model_id, error = %e, "unified vision_config parse failed — image input disabled");
+                        None
+                    }
+                }
+            }
             rmlx_models::arch::Architecture::Gemma4(_) => {
                 match rmlx_models::gemma4::Gemma4VisionConfig::from_model_dir(model_dir) {
                     Ok(Some(vcfg)) => {

@@ -241,17 +241,29 @@ runs from the fused `inputs_embeds` (mirroring mlx-vlm `get_input_embeddings`).
 | `text` | `{type:"text", text:"…"}` | — | all |
 | `image_url` | `{type:"image_url", image_url:{url:"<url\|data-URL>"}}` | SigLIP vision | Gemma4, Gemma3, Qwen3-VL-MoE |
 | `input_image` | `{type:"input_image", image_url:"<url>"}` (mlx-vlm shape) | SigLIP vision | same |
-| `input_audio` | `{type:"input_audio", input_audio:{data:"<base64>", format:"wav"}}` | Conformer audio (USM) | **Gemma4** (e4b/26b) |
+| `input_audio` | `{type:"input_audio", input_audio:{data:"<base64>", format:"wav"}}` | Conformer audio (USM) / unified encoder-free | **Gemma4** (e4b/26b Conformer; 12B unified) |
 
 **Native audio (`input_audio`) — Gemma4.** The base64 payload is decoded
 (`rmlx-audio` symphonia decoder — WAV/MP3/M4A/etc.), downmixed to mono and
-resampled to 16 kHz, run through the Gemma4 USM log-mel front-end, then the
-Conformer `audio_tower` produces `T_sub` audio soft tokens. The prompt is
-spliced with `<|audio>` + `T_sub`×`<|audio|>` + `<audio|>` after the leading
-token, and the soft tokens are scattered at the `<|audio|>` positions. `T_sub`
-is derived from the encoder's SSCP downsample (`≈ mel_frames / 4`), so the
-placeholder count always matches the encoder output (scatter aligns by
-construction). One clip per request; >1 is rejected with a clear error.
+resampled to 16 kHz. The downstream front-end then forks by architecture:
+
+- **Conformer (e4b/26b).** The waveform runs through the Gemma4 USM log-mel
+  front-end, then the Conformer `audio_tower` produces `T_sub` audio soft
+  tokens. `T_sub` is derived from the encoder's SSCP downsample
+  (`≈ mel_frames / 4`).
+- **Unified encoder-free (12B `Gemma4UnifiedForConditionalGeneration`).** No mel
+  front-end, no Conformer: the raw 16 kHz waveform is chunked into fixed-length
+  640-sample frames (`extract_waveform_frames`) and each frame is projected by
+  `embed_audio` (`RMSNorm → Linear`, 640→hidden). `num_soft_tokens =
+  ceil(num_samples / 640)` (one soft token per 40 ms frame). See *Unified
+  (encoder-free) audio* in `docs/MODELS.md`.
+
+In both cases the prompt is spliced with `<|audio>` + `N`×`<|audio|>` +
+`<audio|>` after the leading token, and the soft tokens are scattered at the
+`<|audio|>` positions; the placeholder count always matches the front-end output
+(scatter aligns by construction). One clip per request; >1 is rejected with a
+clear error. Combined image+audio in one request is also rejected with a clear
+error (on both the Conformer and unified arches), never a silent drop.
 
 **Not-supported path.** Submitting `input_audio` to a model without an audio
 tower (text-only, or a vision-only checkpoint) returns **HTTP 503**

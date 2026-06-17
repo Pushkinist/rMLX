@@ -307,6 +307,31 @@ impl MultimodalEmbedder {
         let normed = rms_norm(inputs_embeds, None, self.norm_eps, device)?;
         self.projection.forward(&normed, device)
     }
+
+    /// Input feature dim of `embedding_projection` — the unpacked `in_features`
+    /// the projection consumes (e.g. `mm_embed_dim` 3840 for vision,
+    /// `audio_embed_dim` 640 for unified audio). Used to validate the parsed
+    /// `output_proj_dims` config against the actual checkpoint weight so a
+    /// mismatched config is rejected at load instead of producing a silent
+    /// shape error deep in the forward pass.
+    ///
+    /// For a quantized projection the unpacked input dim is
+    /// `scales.shape()[1] * group_size`; for a plain projection it is the
+    /// weight's second axis (`[out, in]`). Returns `None` if the shapes are
+    /// degenerate (treated as "cannot validate" by the caller).
+    pub fn projection_input_dim(&self) -> Option<usize> {
+        match &self.projection {
+            crate::layers::Linear::Plain { weight } => weight.shape().get(1).map(|&d| d as usize),
+            crate::layers::Linear::Quantized {
+                scales, group_size, ..
+            } => scales
+                .shape()
+                .get(1)
+                .map(|&groups| groups as usize * *group_size as usize),
+            // PARO projections never appear on the multimodal embedder path.
+            crate::layers::Linear::Paro { .. } => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -532,13 +557,13 @@ fn zero_mask(seq: usize) -> Result<Array> {
 }
 
 #[inline]
-fn f32_bytes(v: &[f32]) -> &[u8] {
+pub(super) fn f32_bytes(v: &[f32]) -> &[u8] {
     // SAFETY: f32 is 4 bytes; from_bytes copies immediately.
     unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), size_of_val(v)) }
 }
 
 #[inline]
-fn i32_bytes(v: &[i32]) -> &[u8] {
+pub(super) fn i32_bytes(v: &[i32]) -> &[u8] {
     // SAFETY: i32 is 4 bytes; from_bytes copies immediately.
     unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), size_of_val(v)) }
 }
@@ -884,7 +909,7 @@ pub fn build_inputs_embeds(
 }
 
 /// Load a packed quantized weight without dtype conversion (keep U32/U8/F16).
-fn load_raw(shards: &ShardSet, name: &str) -> Result<Array> {
+pub(super) fn load_raw(shards: &ShardSet, name: &str) -> Result<Array> {
     for (_, handle) in shards.iter() {
         let st = handle.safetensors()?;
         if let Ok(t) = st.tensor(name) {
@@ -904,7 +929,7 @@ fn load_raw(shards: &ShardSet, name: &str) -> Result<Array> {
 
 /// Read top-level `quantization` (`group_size`, `bits`, `mode`) for the
 /// `embed_vision.embedding_projection` quantized Linear.
-fn read_quant_params(model_dir: &Path) -> Result<(i32, i32, crate::layers::QuantMode)> {
+pub(super) fn read_quant_params(model_dir: &Path) -> Result<(i32, i32, crate::layers::QuantMode)> {
     let v = crate::load_util::read_raw_config(model_dir)?;
     let q = v.get("quantization");
     let gs = q
@@ -921,6 +946,12 @@ fn read_quant_params(model_dir: &Path) -> Result<(i32, i32, crate::layers::Quant
         .unwrap_or("mxfp8");
     Ok((gs, bits, crate::layers::QuantMode::from(mode_str)))
 }
+
+// ---------------------------------------------------------------------------
+// Unified (encoder-free) vision embedder — `Gemma4UnifiedForConditionalGeneration`.
+// ---------------------------------------------------------------------------
+
+pub(crate) mod unified;
 
 // ---------------------------------------------------------------------------
 
