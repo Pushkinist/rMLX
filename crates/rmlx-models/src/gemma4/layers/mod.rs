@@ -636,6 +636,15 @@ fn combine_bidi_overlay(
             if causal.shape() == overlay.shape() {
                 rmlx_mlx::maximum(&causal, overlay, device)
             } else {
+                // Unreachable under the single-shot prefill invariant. If it
+                // ever fires the image block silently reverts to causal
+                // attention (the unified-vision colour-corruption failure mode),
+                // so make the violation loud instead of degrading silently.
+                tracing::warn!(
+                    causal = ?causal.shape(),
+                    overlay = ?overlay.shape(),
+                    "gemma4 bidi overlay shape mismatch — image block fell back to causal"
+                );
                 Ok(causal)
             }
         }

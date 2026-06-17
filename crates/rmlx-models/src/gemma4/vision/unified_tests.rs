@@ -120,8 +120,9 @@ fn solid_chw(h: usize, w: usize, rgb: [f32; 3]) -> Gemma4PixelValues {
 }
 
 /// Model-free numerical guard for the unified patchify front-end — the test that
-/// would have caught a channel-order / value-scaling defect (#127's first
-/// suspect). For a solid RGB input every merged-patch slot must equal the source
+/// would have caught a channel-order / value-scaling defect (the first suspected
+/// cause of the unified-vision colour corruption). For a solid RGB input every
+/// merged-patch slot must equal the source
 /// channel value exactly, and the three channels must remain in RGB order
 /// (interior index `% 3` selects R/G/B). A pure-green input must therefore yield
 /// nonzero values only in the green-derived (`off % 3 == 1`) slots.

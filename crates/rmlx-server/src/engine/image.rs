@@ -9,10 +9,11 @@ use rmlx_core::Error;
 
 // ── image-prompt construction ─────────────────────────────────────────
 
-/// Gemma4 `<|image>` begin-of-image marker token id.
-pub(crate) const GEMMA4_BOI_TOKEN_ID: u32 = 255_999;
-/// Gemma4 `<image|>` end-of-image marker token id.
-pub(crate) const GEMMA4_EOI_TOKEN_ID: u32 = 258_882;
+/// Gemma4 begin-/end-of-image marker token ids. Re-exported from the single
+/// source of truth in `rmlx_models::gemma4` so the server and the model agree
+/// on these correctness-critical ids.
+pub(crate) use rmlx_models::gemma4::BOI_TOKEN_ID as GEMMA4_BOI_TOKEN_ID;
+pub(crate) use rmlx_models::gemma4::EOI_TOKEN_ID as GEMMA4_EOI_TOKEN_ID;
 
 /// bundle of the multimodal components needed to turn image bytes
 /// into scattered `inputs_embeds`. Loaded once per model. One variant per

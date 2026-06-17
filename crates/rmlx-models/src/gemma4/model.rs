@@ -54,10 +54,11 @@ fn cache_base_offset(caches: Option<&[KvCache]>) -> i32 {
         .map_or(0, |c| c.offset())
 }
 
-/// `<start_of_image>` (begin-of-image) marker token id.
-const BOI_TOKEN_ID: i32 = 255_999;
-/// `<end_of_image>` (end-of-image) marker token id.
-const EOI_TOKEN_ID: i32 = 258_882;
+/// `<start_of_image>` / `<end_of_image>` marker token ids, as `i32` for the
+/// id-scan loop below. The canonical source of truth is `super::vision`
+/// (`u32`); cast here at the i32 boundary so there is one definition.
+const BOI_TOKEN_ID: i32 = super::vision::BOI_TOKEN_ID as i32;
+const EOI_TOKEN_ID: i32 = super::vision::EOI_TOKEN_ID as i32;
 
 /// Build the bidirectional-attention overlay for vision (image) soft-token
 /// blocks during a single-shot prefill.
@@ -341,7 +342,10 @@ impl Gemma4Text {
             scalar_f32((self.cfg.hidden_size as f32).sqrt()).astype(h_raw.dtype(), device)?;
         let h = multiply(&h_raw, &embed_scale, device)?;
         let h = h.reshape(&[1, seq, self.cfg.hidden_size as i32], device)?;
-        self.forward_h(h, ids_arr, seq, caches, device)
+        // Pure-text path: no image markers, so the vision bidi overlay is never
+        // needed. Passing `has_image = false` skips the device→host id sync that
+        // `build_vision_bidi_overlay` would otherwise force on every prefill.
+        self.forward_h(h, ids_arr, seq, caches, false, device)
     }
 
     /// forward pass from precomputed, already-scaled `inputs_embeds`.
@@ -362,7 +366,10 @@ impl Gemma4Text {
         caches: Option<&mut [KvCache]>,
         device: Device,
     ) -> Result<Array> {
-        self.forward_h(embeds, ids_arr, seq, caches, device)
+        // Image path: the embeds carry scattered vision features, so the bidi
+        // overlay over image soft-token blocks is relevant. `has_image = true`
+        // gates the (single-shot prefill only) overlay build.
+        self.forward_h(embeds, ids_arr, seq, caches, true, device)
     }
 
     /// Shared decoder trunk + LM head over a precomputed scaled hidden state.
@@ -380,6 +387,7 @@ impl Gemma4Text {
         ids_arr: &Array,
         seq: i32,
         caches: Option<&mut [KvCache]>,
+        has_image: bool,
         device: Device,
     ) -> Result<Array> {
         // Current sequence offset (0 when no cache).
@@ -388,8 +396,10 @@ impl Gemma4Text {
         // Bidirectional attention overlay for image soft-token blocks. Only the
         // single-shot prefill (base_offset == 0, full sequence in this call) can
         // open the intra-image block; for chunked prefill / decode the overlay
-        // is None and attention stays causal.
-        let bidi_overlay = if base_offset == 0 {
+        // is None and attention stays causal. `has_image` is false on the
+        // pure-text path, so text prefill never forces a device→host id sync
+        // (`build_vision_bidi_overlay` reads the ids back to scan for markers).
+        let bidi_overlay = if has_image && base_offset == 0 {
             build_vision_bidi_overlay(ids_arr, seq, device)
         } else {
             None

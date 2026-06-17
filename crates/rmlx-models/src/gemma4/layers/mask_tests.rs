@@ -23,7 +23,7 @@
 //! the mask key dim from `k_seq` to `k_seq + 1` and making
 //! `guard_invariant_producer_offset_matches_k_seq` RED.
 
-use rmlx_mlx::Device;
+use rmlx_mlx::{Array, Device, Dtype};
 
 use super::{build_attn_mask, consumer_effective_offset, producer_effective_offset, LayerType};
 
@@ -347,5 +347,75 @@ fn guard_invariant_regressed_base_offset_inflates_mask() {
         mask.expect("array mode must carry a mask array").shape()[3],
         k_seq + 1,
         "base_offset-desynced mask is one key too long — the #32 guard trigger"
+    );
+}
+
+/// Inside a sliding-window layer, a vision (image) bidi overlay must override the
+/// window: an intra-image-block pair that the sliding window would block (the two
+/// positions are farther apart than `window`) ends up allowed (`0.0`) in the
+/// combined mask. Pins "image-bidi overrides the sliding window inside the block"
+/// against a regression that would re-apply the window cap to image soft tokens.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::float_cmp,
+    reason = "test asserts on a known-good mask cell; unwrap/expect failures are the assertion; mask cells are exact 0.0 / -1e30"
+)]
+fn swa_prefill_image_bidi_overrides_window() {
+    // Single-shot prefill (offset == 0), seq == 4, the whole sequence one image
+    // block. Window = 2, so the SWA mask alone blocks query 3 / key 0 (distance
+    // 3 >= window). The bidi overlay opens every (i, j) in the block to 0.0, so
+    // the element-wise `maximum` combine must leave (3, 0) allowed.
+    let seq = 4i32;
+    let window = 2usize;
+    let n = seq as usize;
+
+    // Overlay: 0.0 everywhere (one image block spanning the full sequence),
+    // matching the additive convention build_vision_bidi_overlay emits.
+    let overlay = Array::from_f32_slice(&vec![0.0_f32; n * n], &[1, 1, seq, seq])
+        .unwrap()
+        .astype(Dtype::Bf16, Device::Cpu)
+        .unwrap();
+
+    let (mask, mode) = build_attn_mask(
+        LayerType::SlidingAttention,
+        seq,
+        0, // effective_offset == 0 (single-shot prefill)
+        seq,
+        false, // attn_is_rotating
+        window,
+        Some(&overlay),
+        Device::Cpu,
+    )
+    .unwrap();
+
+    assert_eq!(mode, "array", "SWA prefill uses array mode");
+    let mask = mask.expect("array mode must carry a mask array");
+    let shape = mask.shape();
+    assert_eq!(shape, &[1, 1, seq, seq], "combined mask is [1,1,seq,seq]");
+
+    let grid: Vec<f32> = mask
+        .astype(Dtype::F32, Device::Cpu)
+        .unwrap()
+        .to_bytes()
+        .unwrap()
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    // Out-of-window intra-block cell (query 3, key 0): distance 3 >= window 2, so
+    // the SWA mask alone would block it (-1e30). The overlay opens it to 0.0.
+    assert_eq!(
+        grid[3 * n],
+        0.0,
+        "image-bidi overlay must override the sliding window inside the block"
+    );
+    // Future-direction intra-block cell (query 0, key 3) is also opened by the
+    // bidi overlay even though the causal/SWA mask blocks the future.
+    assert_eq!(
+        grid[3], 0.0,
+        "bidi overlay opens the in-future intra-block pair too"
     );
 }
