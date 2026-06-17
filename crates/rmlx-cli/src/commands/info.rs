@@ -396,8 +396,7 @@ pub(crate) fn run_info(
         };
         print_load_phases_json();
 
-        // Load tokenizer. Inline BOS extraction -- avoids adding rmlx-server as a dep
-        // of the probe path (dep-DAG constraint). ~10 lines mirrors tokenizer_io logic.
+        // Load tokenizer.
         let bos_id = load_bos_id(model_path)?;
         info!(bos_id, "smoke_probe: resolved BOS token id");
 
@@ -405,10 +404,16 @@ pub(crate) fn run_info(
         let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow::anyhow!("smoke_probe: load tokenizer: {e}"))?;
 
-        // B5b: seed with the fixed deterministic prompt (shared single source
-        // of truth in arch::smoke_prompt_ids — do NOT fork the seed logic).
-        let prompt_ids = arch::smoke_prompt_ids(&tokenizer, bos_id)
-            .map_err(|e| anyhow::anyhow!("smoke_probe: build seed prompt: {e}"))?;
+        // Build the smoke prompt through the model's real chat template when one
+        // exists (production-shaped, turn-structured input), falling back to the
+        // shared bare seed otherwise. This keeps the probe verdict consistent
+        // with how the model is actually served — a bare instruction can make a
+        // healthy instruction-tuned snapshot degenerate into a filler loop (the
+        // reference loader does the same), which previously raised false
+        // Broken* verdicts. Single source of truth lives in chat_template.
+        let prompt_ids =
+            rmlx_server::chat_template::smoke_prompt_ids(model_path, &tokenizer, bos_id)
+                .map_err(|e| anyhow::anyhow!("smoke_probe: build seed prompt: {e}"))?;
 
         info!(
             ?kv_quant_override,

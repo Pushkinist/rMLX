@@ -854,11 +854,24 @@ impl AppState {
         // zero-overhead path unchanged.
         if self.require_smoke_probe {
             tracing::info!(model_id, path = %entry.abs_path.display(), "B5: running smoke probe before first load");
+
+            // Render the smoke seed through the model's real chat template so the
+            // probe exercises production-shaped, turn-structured input. Falls back
+            // to the bare seed inside run_smoke_probe when no template / encode
+            // succeeds (handled by passing None).
+            let templated_prompt = crate::tokenizer_io::load_tokenizer(&entry.abs_path)
+                .ok()
+                .and_then(|tk| {
+                    let bos_id = tk.token_to_id("<bos>").unwrap_or(2);
+                    crate::chat_template::smoke_prompt_ids(&entry.abs_path, &tk, bos_id).ok()
+                });
+
             let verdict = rmlx_models::arch::run_smoke_probe(
                 &entry.abs_path,
                 rmlx_mlx::Device::Gpu,
                 None, // use arch default KV quant
                 None, // use model default max_ctx
+                templated_prompt,
             )
             .map_err(|e| format!("smoke probe error for '{model_id}': {e}"))?;
 

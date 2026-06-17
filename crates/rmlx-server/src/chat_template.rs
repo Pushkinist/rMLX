@@ -218,6 +218,76 @@ pub fn load_template_source(model_dir: &Path) -> Result<String> {
         .map_err(|e| Error::Other(format!("cannot read {}: {e}", path.display())))
 }
 
+// ── Smoke-probe prompt ─────────────────────────────────────────────────────────
+
+/// Build the smoke-probe input token ids for a model snapshot, preferring the
+/// model's real chat template so the probe exercises the same prompt shape the
+/// model is served with in production.
+///
+/// Instruction-tuned models are trained to continue *turn-structured* input
+/// (`<start_of_turn>user … <start_of_turn>model`). Fed a bare instruction with
+/// no turn scaffolding, a healthy model can still degenerate into a repeated
+/// filler token — a behaviour the reference loader reproduces identically. That
+/// made the bare-seed probe (`arch::smoke_prompt_ids`) raise false `Broken*`
+/// verdicts for snapshots that generate correctly through `serve`. Rendering
+/// the canonical seed through `chat_template.jinja` removes that false positive
+/// generally, for any arch whose bare-prompt continuation is degenerate.
+///
+/// Falls back to the bare-seed `arch::smoke_prompt_ids` when the snapshot has no
+/// `chat_template.jinja` or the render/encode fails — preserving probe coverage
+/// for base (non-chat) snapshots. The template emits its own `<bos>`, so the
+/// rendered text is tokenized with `add_special_tokens = false`.
+pub fn smoke_prompt_ids(
+    model_dir: &Path,
+    tokenizer: &tokenizers::Tokenizer,
+    bos_id: u32,
+) -> Result<Vec<u32>> {
+    if let Some(ids) = templated_smoke_prompt_ids(model_dir, tokenizer) {
+        return Ok(ids);
+    }
+    // No usable chat template — fall back to the shared bare seed.
+    rmlx_models::arch::smoke_prompt_ids(tokenizer, bos_id)
+        .map_err(|e| Error::Other(format!("smoke_prompt_ids: bare-seed build failed: {e}")))
+}
+
+/// Render `arch::SMOKE_PROMPT` as a single user turn through the model's chat
+/// template and tokenize the result. Returns `None` (so the caller falls back
+/// to the bare seed) when no template exists or rendering/encoding fails.
+fn templated_smoke_prompt_ids(
+    model_dir: &Path,
+    tokenizer: &tokenizers::Tokenizer,
+) -> Option<Vec<u32>> {
+    let src = load_template_source(model_dir).ok()?;
+    let tpl = ChatTemplate::new(src).ok()?;
+
+    let cfg = crate::tokenizer_io::load_tokenizer_config(model_dir).ok()?;
+    let bos_token = cfg.bos_token.as_deref().unwrap_or("");
+    let eos_token = cfg.eos_token.as_deref().unwrap_or("");
+
+    let messages = [ChatMessageTpl {
+        role: "user",
+        content: rmlx_models::arch::SMOKE_PROMPT,
+        ..ChatMessageTpl::default()
+    }];
+    let opts = RenderOpts {
+        bos_token,
+        eos_token,
+        add_generation_prompt: true,
+        tools: &[],
+        enable_thinking: None,
+    };
+    let rendered = tpl.render(&messages, &opts).ok()?;
+
+    // The template already emits the BOS marker, so encode without re-adding
+    // special tokens (mirrors the production request path).
+    let enc = tokenizer.encode(rendered.text.as_str(), false).ok()?;
+    let ids = enc.get_ids().to_vec();
+    if ids.is_empty() {
+        return None;
+    }
+    Some(ids)
+}
+
 // ── ChatTemplate ──────────────────────────────────────────────────────────────
 
 impl ChatTemplate {

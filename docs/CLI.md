@@ -265,6 +265,15 @@ rmlx info --model /path/to/snapshot --probe-smoke
 | `--max-ctx` | u32 | (from model) | **Virtual ceiling** on context length, in tokens (not an eager allocation): the KV ring grows lazily up to it, prompts over it are rejected. See `docs/KV_CACHE.md` §4.6. Must be ≥ 256 when set. |
 | `--list-cache-types` | bool flag | off | Print the full §D1 KV codec table and exit. No model load. |
 
+The smoke probe renders its fixed seed prompt through the snapshot's
+`chat_template.jinja` when present, so an instruction-tuned model is exercised
+on the same turn-structured input it is served with. A *bare* instruction (no
+turn markers) makes some healthy instruction-tuned models loop a filler token —
+the reference loader (`mlx-lm`) reproduces this identically — which previously
+raised false `BrokenPunctLoop` verdicts (e.g. the QAT-4bit `gemma-4-12B`
+unified snapshots, which serve coherently via the chat template). Snapshots
+with no chat template fall back to the bare-instruction seed.
+
 ---
 
 ### `baseline`
