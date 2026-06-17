@@ -5,7 +5,7 @@
 //!
 //! Faithful port of `mlx_vlm/models/gemma4/audio.py`. Pipeline (batch=1):
 //!
-//! log-mel `[B, T, 128]` (from )
+//! log-mel `[B, T, 128]` (from `Gemma4AudioFeatureExtractor`)
 //! -> SSCP: 2× (Conv2d stride-2 + LayerNorm(channels) + ReLU) -> flatten(F·C)
 //! -> `input_proj_linear` -> `[B, T_sub, hidden=1024]`
 //! -> 12 Conformer blocks: FFW1(macaron 0.5) -> Attention -> LightConv1d
@@ -635,7 +635,8 @@ impl ConformerBlock {
 
 /// Gemma4 Conformer audio tower (`audio_tower.*`). Forward consumes log-mel
 /// features `[B, T, 128]` and produces `[B, T_sub, output_proj_dims]` audio
-/// embeddings (fed to `embed_audio` / `MultimodalEmbedder` by ).
+/// embeddings (fed to `embed_audio` / `MultimodalEmbedder` by
+/// [`build_audio_inputs_embeds`]).
 #[allow(missing_debug_implementations)]
 pub struct AudioEncoder {
     cfg: Gemma4AudioConfig,

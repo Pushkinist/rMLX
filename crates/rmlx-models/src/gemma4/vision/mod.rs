@@ -757,8 +757,11 @@ pub const IMAGE_TOKEN_ID: u32 = 258880;
 /// Faithful host port of mlx-vlm `gemma4.py::Model.get_input_embeddings`:
 /// 1. `inputs_embeds = embed_tokens(input_ids) * embed_scale` (scaled text).
 /// 2. For each image: `embed_vision(vision_tower(pixels))` → `[1, n_soft,
-/// hidden]` f32 → astype bf16 → scatter into `inputs_embeds` at that
+///    hidden]` f32 → astype bf16 → scatter into `inputs_embeds` at that
+///    image's contiguous run of `IMAGE_TOKEN_ID` positions.
 /// 3. The per-layer-input ids mask the image positions to `0` (mlx-vlm
+///    zeroes the soft-token ids so per-layer gating sees text-only ids at
+///    the image positions).
 ///
 /// Returns `(inputs_embeds [1, seq, hidden], masked_ids [seq])`. Both feed
 /// [`super::model::Gemma4Text::forward_arr_embeds`].

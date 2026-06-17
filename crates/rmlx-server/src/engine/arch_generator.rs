@@ -28,6 +28,25 @@ use super::image::{build_image_prompt, run_qwen3vl_image, VisionBundle};
 use super::think::ThinkSplitter;
 use super::types::{GenerationRequest, GenerationToken, ModelLoadConfig};
 
+/// Reject the unsupported image + audio combination in a single request.
+///
+/// The fused `generate_image` embeds entry carries a single `(aug_ids, embeds,
+/// masked_ids)` triple, so only one modality block can be scattered per
+/// request. Returns a CLEAR request-level error when BOTH an image and an audio
+/// clip are present (never a silent drop of the audio), and `None` otherwise so
+/// the audio-only / image-only / text-only paths route unchanged.
+fn reject_combined_image_audio(has_image: bool, has_audio: bool) -> Option<Error> {
+    if has_image && has_audio {
+        Some(Error::Other(
+            "combined image + audio input in one request is not supported; \
+             send them in separate turns"
+                .to_owned(),
+        ))
+    } else {
+        None
+    }
+}
+
 // ── ArchGenerator ─────────────────────────────────────────────────────────────
 
 /// Architecture-agnostic HTTP generation engine. Loads any registry arch via
@@ -933,6 +952,22 @@ impl Generator for ArchGenerator {
                     None
                 };
 
+            // Combined image + audio in one request is not supported. Reject
+            // with a CLEAR request-level error rather than silently dropping the
+            // audio (the exact class of bug this audio wiring exists to
+            // eliminate) — surfaced as a proper HTTP error through the same
+            // channel as the other request-rejection paths in this function.
+            if let Some(err) =
+                reject_combined_image_audio(!req_images.is_empty(), !req_audio.is_empty())
+            {
+                tracing::warn!(
+                    model_id = %model_id_for_log,
+                    "rejecting combined image + audio input in one request"
+                );
+                let _ = tx.blocking_send(Err(err));
+                return;
+            }
+
             // audio path — decode the `input_audio` clip, expand the prompt with
             // the audio soft-token block (`<|audio>` + T_sub×`<|audio|>` +
             // `<audio|>`), run the Conformer tower, build the scatter-merged
@@ -941,7 +976,8 @@ impl Generator for ArchGenerator {
             // `(aug_ids, embeds, masked_ids)` triple). Submitting `input_audio`
             // to a model without an audio tower returns a CLEAR error here
             // (mirroring vision's no-tower rejection) — never a silent drop.
-            // Skipped entirely when images are present (image takes precedence).
+            // Image + audio in one request was already rejected above, so here
+            // `image_inputs` is `None` whenever `req_audio` is non-empty.
             let audio_inputs: Option<(Vec<u32>, rmlx_mlx::Array, rmlx_mlx::Array)> = if !req_audio
                 .is_empty()
                 && image_inputs.is_none()
@@ -967,7 +1003,8 @@ impl Generator for ArchGenerator {
                 None
             };
 
-            // Image takes precedence over audio when both are present.
+            // Image and audio are mutually exclusive per request (combined input
+            // rejected above), so at most one of these is `Some`.
             let multimodal_inputs = image_inputs.or(audio_inputs);
 
             let steps_result = if qvl_image {
@@ -1384,3 +1421,7 @@ impl Generator for ArchGenerator {
         Box::pin(token_stream)
     }
 }
+
+#[cfg(test)]
+#[path = "arch_generator_tests.rs"]
+mod arch_generator_tests;
