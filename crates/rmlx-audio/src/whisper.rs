@@ -51,14 +51,16 @@
 use std::path::Path;
 
 use rmlx_mlx::{
-    add, argmax, concatenate, conv1d, divide, gelu, matmul, multiply, scalar_f32, softmax,
-    softmax_precise, sqrt, subtract, sum_axis_keepdims, Array, Device,
+    add, argmax, concatenate, conv1d, divide, gelu, matmul, multiply, scalar_f32, softmax_precise,
+    sqrt, subtract, sum_axis_keepdims, Array, Device,
 };
 use thiserror::Error;
 use tracing::{debug, info, instrument, warn};
 
 use crate::npz::WeightMap;
-use crate::tokenizer::{TOK_EOT, TOK_NOSPEECH, TOK_TIMESTAMP_BEGIN};
+use crate::tokenizer::{
+    TOK_EN, TOK_EOT, TOK_LANG_LAST, TOK_NOSPEECH, TOK_NO_TIMESTAMPS, TOK_TIMESTAMP_BEGIN,
+};
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
@@ -705,8 +707,9 @@ impl WhisperModel {
 
     /// Detect the spoken language from encoder output.
     ///
-    /// Runs a single SOT decoder step and returns the argmax over the 99
-    /// language tokens (50259–50357). Falls back to English (50259) on error.
+    /// Runs a single SOT decoder step and returns the argmax over the 100
+    /// language tokens (`<|en|>`=50259 … `<|yue|>`=50358). Falls back to English
+    /// (50259) on error.
     ///
     /// Call after `encode_mel`. The returned token id can be passed directly to
     /// `WhisperTokenizer::sot_sequence_from_lang_tok`.
@@ -723,8 +726,8 @@ impl WhisperModel {
             .decoder
             .forward(&sot_arr, encoder_out, 0, &[], &[], device)?;
         // logits: [1, 1, vocab] → slice language range → argmax
-        let lang_start: i32 = 50_259;
-        let lang_end: i32 = 50_358; // exclusive — 99 language tokens
+        let lang_start: i32 = TOK_EN as i32;
+        let lang_end: i32 = TOK_LANG_LAST as i32 + 1; // exclusive — 100 language tokens
         let lang_logits =
             logits.slice(&[0, 0, lang_start], &[1, 1, lang_end], &[1, 1, 1], device)?;
         let best = argmax(
@@ -775,6 +778,11 @@ impl WhisperModel {
     /// `sot_sequence`: initial tokens (SOT + lang + task + no_timestamps).
     /// `max_tokens`: cap on generated tokens.
     /// `temperature`: 0 = greedy argmax; > 0 = temperature-scaled softmax + argmax.
+    /// `filters`: per-step logit suppression set (`DecodeFilters`).
+    ///
+    /// Returns the full token sequence **including** any timestamp tokens — the
+    /// caller (long-form chunker) needs them for segmentation. Special / non-speech
+    /// content tokens are masked out by `filters`, never emitted.
     #[allow(
         clippy::explicit_counter_loop,
         reason = "offset tracks KV-cache position starting from sot_len; not a pure iteration counter"
@@ -789,11 +797,14 @@ impl WhisperModel {
         sot_sequence: &[u32],
         max_tokens: usize,
         temperature: f32,
+        filters: &DecodeFilters,
         device: Device,
     ) -> Result<Vec<u32>, WhisperError> {
         let mut self_kvs: Vec<(Array, Array)> = Vec::new();
         let mut cross_kvs: Vec<(Array, Array)> = Vec::new();
-        let mut output_tokens: Vec<u32> = Vec::new();
+        // Sampled tokens (the suffix after the SOT prefix) — these are what the
+        // timestamp rules and the caller operate on.
+        let mut sampled: Vec<u32> = Vec::new();
 
         // Prefill the SOT sequence.
         let sot_i32: Vec<i32> = sot_sequence.iter().map(|&t| t as i32).collect();
@@ -816,40 +827,29 @@ impl WhisperModel {
         )?;
         let mut offset = sot_len;
 
-        // SuppressBlank: at the very first text-generation position (right after the
-        // SOT sequence), suppress EOT and the blank-space token. This matches Python's
-        // SuppressBlank logit filter in mlx_whisper/openai-whisper and prevents the
-        // model from immediately halting on short audio where EOT has the highest raw
-        // logit (often the case for 2–3 s clips with no leading silence).
-        let suppressed_logits = suppress_eot_at_prefill(&last_logits, self.cfg.n_vocab, device)?;
-        let next_tok = sample_next(&suppressed_logits, temperature, device)?;
+        // First sampled position: apply SuppressBlank (in addition to the standing
+        // suppression set + timestamp rules).
+        let mut logit_vec = logits_to_f32(&last_logits, self.cfg.n_vocab, device)?;
+        filters.apply(&mut logit_vec, &sampled, true);
+        let mut next_tok = argmax_f32(&logit_vec, temperature);
         debug!(
             next_tok,
             tok_eot = TOK_EOT,
             tok_nospeech = TOK_NOSPEECH,
             tok_ts_begin = TOK_TIMESTAMP_BEGIN,
-            "prefill first token (after suppress-blank)"
+            "prefill first token (after filters)"
         );
         if next_tok == TOK_NOSPEECH {
             return Err(WhisperError::Silence);
         }
-        // Mirror the in-loop guard: don't push timestamp tokens from prefill.
-        if next_tok >= TOK_TIMESTAMP_BEGIN {
-            debug!(
-                next_tok,
-                "prefill produced timestamp after suppress-blank; returning empty transcription"
-            );
-            return Ok(output_tokens); // empty
-        }
-        output_tokens.push(next_tok);
+        sampled.push(next_tok);
 
-        for _ in 1..max_tokens {
-            let last = *output_tokens.last().unwrap_or(&TOK_EOT);
-            if last == TOK_EOT || last >= TOK_TIMESTAMP_BEGIN {
+        while sampled.len() < max_tokens {
+            if next_tok == TOK_EOT {
                 break;
             }
 
-            let tok_i32 = [last as i32];
+            let tok_i32 = [next_tok as i32];
             let tok_arr = Array::from_i32_slice(&tok_i32, &[1, 1])
                 .map_err(|e| WhisperError::Mlx(e.to_string()))?;
 
@@ -865,108 +865,217 @@ impl WhisperModel {
             cross_kvs = new_cross;
             offset += 1;
 
-            let tok = sample_next(&step_logits, temperature, device)?;
-            output_tokens.push(tok);
+            let mut lv = logits_to_f32(&step_logits, self.cfg.n_vocab, device)?;
+            filters.apply(&mut lv, &sampled, false);
+            next_tok = argmax_f32(&lv, temperature);
+            sampled.push(next_tok);
         }
 
-        while output_tokens.last() == Some(&TOK_EOT) {
-            output_tokens.pop();
+        // Drop trailing EOT — it is a stop marker, not content.
+        while sampled.last() == Some(&TOK_EOT) {
+            sampled.pop();
         }
-        debug!(n_tokens = output_tokens.len(), "greedy decode done");
-        Ok(output_tokens)
+        debug!(n_tokens = sampled.len(), "greedy decode done");
+        Ok(sampled)
     }
 }
 
-/// Argmax (or temperature-scaled softmax + argmax) on the last token's logits.
-fn sample_next(logits: &Array, temperature: f32, device: Device) -> Result<u32, WhisperError> {
-    let flat = if temperature > 0.0 {
-        let scaled = divide(logits, &scalar_f32(temperature), device)?;
-        softmax(&scaled.reshape(&[-1], device)?, -1, device)?
-    } else {
-        logits.reshape(&[-1], device)?
-    };
-    let idx = argmax(&flat, 0, device)?;
-    // Materialise the scalar array to extract the value.
-    // Use eval() (synchronous) — async_eval does not guarantee the data pointer
-    // is ready when to_bytes() accesses it immediately after scheduling.
-    idx.eval().map_err(WhisperError::from)?;
-    let bytes = idx.to_bytes().map_err(WhisperError::from)?;
-    if bytes.len() < 4 {
-        return Err(WhisperError::Mlx("argmax returned empty bytes".to_owned()));
-    }
-    // MLX argmax returns uint32; decode as i32 (matching existing project pattern)
-    // then widen to u32.
-    #[allow(clippy::indexing_slicing, reason = "bounds checked: bytes.len() >= 4")]
-    Ok(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u32)
+/// Per-step logit suppression for Whisper decode.
+///
+/// Holds the standing suppression set (non-speech / special tokens derived from
+/// the tokenizer) plus a `timestamps` mode flag. Applied to a host-side f32 logit
+/// vector at **every** decode step — this is the openai-whisper / `mlx_whisper`
+/// `LogitFilter` chain (`SuppressBlank` + `SuppressTokens` + timestamp handling),
+/// the absence of which made rMLX decode halt or emit garbage.
+#[derive(Debug, Clone)]
+pub struct DecodeFilters {
+    /// Standing suppression set (always masked).
+    suppress: Vec<u32>,
+    /// `true` => timestamp mode (emit timestamp tokens, apply pairing rules).
+    /// `false` => `no_timestamps` mode (suppress all timestamp tokens).
+    timestamps: bool,
+    /// First sampled token of the SOT prefix that begins generation (always 0
+    /// here because `sampled` is the post-prefix suffix).
+    blank_suppress: Vec<u32>,
 }
 
-/// Suppress EOT (and blank-space) at the first text-generation step.
-///
-/// Matches Python's `SuppressBlank` logit filter: when sampling the very first
-/// output token after the SOT sequence, EOT (`<|endoftext|>`) and the blank-space
-/// token would be spuriously predicted on short audio. Set their logit to
-/// `-1e9` so argmax picks a real text token instead.
-///
-/// The logits tensor has shape `[1, 1, n_vocab]` (F16 or F32). We materialise,
-/// patch the EOT byte offset, and reconstruct — done once per decode sequence.
-#[allow(
-    clippy::too_many_lines,
-    reason = "suppress_eot_at_prefill is a single linear operation; splitting adds no clarity"
-)]
-fn suppress_eot_at_prefill(
-    logits: &Array,
-    n_vocab: usize,
-    device: Device,
-) -> Result<Array, WhisperError> {
+impl DecodeFilters {
+    /// Build the filter chain.
+    ///
+    /// `suppress` is the tokenizer-derived non-speech/special set
+    /// (`WhisperTokenizer::suppress_tokens`). `blank_ids` are the SuppressBlank
+    /// ids (EOT + the blank-space token, `tokenizer.encode(" ")`). `timestamps`
+    /// selects timestamp vs `no_timestamps` mode.
+    #[must_use]
+    pub fn new(suppress: Vec<u32>, blank_ids: Vec<u32>, timestamps: bool) -> Self {
+        Self {
+            suppress,
+            timestamps,
+            blank_suppress: blank_ids,
+        }
+    }
+
+    /// Apply the filter chain in-place to a host f32 logit vector of length
+    /// `n_vocab`.
+    ///
+    /// - `sampled`: tokens sampled so far (post-SOT-prefix).
+    /// - `first_step`: `true` only for the very first sampled position
+    ///   (enables SuppressBlank).
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "all token ids are bounds-checked against logits.len() before indexing"
+    )]
+    pub fn apply(&self, logits: &mut [f32], sampled: &[u32], first_step: bool) {
+        let n = logits.len();
+        let mask = |logits: &mut [f32], tok: u32| {
+            let t = tok as usize;
+            if t < n {
+                logits[t] = f32::NEG_INFINITY;
+            }
+        };
+
+        // SuppressBlank — first sampled position only.
+        if first_step {
+            for &t in &self.blank_suppress {
+                mask(logits, t);
+            }
+        }
+
+        // SuppressTokens — non-speech / special set, every step.
+        for &t in &self.suppress {
+            mask(logits, t);
+        }
+
+        let ts_begin = TOK_TIMESTAMP_BEGIN as usize;
+        if !self.timestamps {
+            // no_timestamps mode: suppress every timestamp token.
+            for l in logits.iter_mut().skip(ts_begin) {
+                *l = f32::NEG_INFINITY;
+            }
+            return;
+        }
+
+        // Timestamp mode: faithful port of openai-whisper `ApplyTimestampRules`.
+        // <|notimestamps|> can never be sampled here.
+        mask(logits, TOK_NO_TIMESTAMPS);
+
+        let len = sampled.len();
+        let last_was_ts = sampled.last().is_some_and(|&t| t as usize >= ts_begin);
+        // NOTE: `penultimate_was_timestamp` is TRUE when fewer than 2 tokens have
+        // been sampled (`len(seq) < 2`) — this is the reference semantics. Getting
+        // this wrong (treating len<2 as false) strands the decoder into EOT right
+        // after the opening `<|0.00|>` and yields empty transcripts.
+        let penult_was_ts = len < 2
+            || sampled
+                .get(len.wrapping_sub(2))
+                .is_some_and(|&t| t as usize >= ts_begin);
+
+        if last_was_ts {
+            if penult_was_ts {
+                // Timestamps must pair → the next token has to be NON-timestamp.
+                for l in logits.iter_mut().skip(ts_begin) {
+                    *l = f32::NEG_INFINITY;
+                }
+            } else {
+                // A single open timestamp → the next token cannot be normal text
+                // (only a closing timestamp or EOT). Mask everything below EOT.
+                let eot = TOK_EOT as usize;
+                for l in logits.iter_mut().take(eot.min(n)) {
+                    *l = f32::NEG_INFINITY;
+                }
+            }
+        }
+
+        // Monotonic timestamps: forbid timestamps smaller than the last one, and
+        // force nonzero segment length.
+        if let Some(&last_ts) = sampled.iter().rev().find(|&&t| t as usize >= ts_begin) {
+            let last_ts = last_ts as usize;
+            let upper = if last_was_ts && !penult_was_ts {
+                last_ts // allow re-emitting the same close timestamp
+            } else {
+                last_ts + 1
+            };
+            let upper = upper.min(n);
+            for (t, l) in logits.iter_mut().enumerate().take(upper) {
+                if t >= ts_begin {
+                    *l = f32::NEG_INFINITY;
+                }
+            }
+        }
+
+        // Beginning-of-sequence: the first sampled token must be a timestamp.
+        if sampled.is_empty() {
+            for l in logits.iter_mut().take(ts_begin.min(n)) {
+                *l = f32::NEG_INFINITY;
+            }
+        }
+
+        // Tie-break: if the cumulative probability mass over all timestamp tokens
+        // exceeds the best single text-token probability, suppress text entirely
+        // (force a timestamp). Mirrors the `log_softmax` comparison in the
+        // reference; computed on the post-mask logits.
+        let ts_logsumexp = logsumexp(&logits[ts_begin.min(n)..]);
+        let max_text = logits
+            .iter()
+            .take(ts_begin.min(n))
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        if ts_logsumexp > max_text {
+            for l in logits.iter_mut().take(ts_begin.min(n)) {
+                *l = f32::NEG_INFINITY;
+            }
+        }
+    }
+}
+
+/// Numerically-stable log-sum-exp over a slice (ignores `-inf` entries).
+fn logsumexp(xs: &[f32]) -> f32 {
+    let max = xs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+        return f32::NEG_INFINITY;
+    }
+    let sum: f32 = xs.iter().map(|&x| (x - max).exp()).sum();
+    max + sum.ln()
+}
+
+/// Materialise a `[1, 1, n_vocab]` (or `[1, n_vocab]`) logit tensor (F16/F32/Bf16)
+/// into a host-side f32 vector of length `n_vocab`.
+fn logits_to_f32(logits: &Array, n_vocab: usize, device: Device) -> Result<Vec<f32>, WhisperError> {
     use rmlx_mlx::Dtype;
-
-    let flat = logits.reshape(&[-1], device)?;
+    let flat = logits.reshape(&[-1], device)?.astype(Dtype::F32, device)?;
     flat.eval().map_err(WhisperError::from)?;
+    let bytes = flat.to_bytes().map_err(WhisperError::from)?;
+    let mut out = Vec::with_capacity(n_vocab);
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "chunks_exact(4) yields exactly 4 bytes; take(n_vocab) bounds the count"
+    )]
+    for chunk in bytes.chunks_exact(4).take(n_vocab) {
+        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    if out.len() < n_vocab {
+        out.resize(n_vocab, f32::NEG_INFINITY);
+    }
+    Ok(out)
+}
 
-    let dtype = flat.dtype();
-    let mut bytes = flat.to_bytes().map_err(WhisperError::from)?;
-
-    // Suppress EOT. Blank-space token for Whisper is typically token id 220
-    // (" " as a standalone piece in the BPE vocabulary); suppress it too, matching
-    // Python's SuppressBlank which sets `mask[tokenizer.encode(" ") + [tokenizer.eot]] = -inf`.
-    let suppress: &[u32] = &[TOK_EOT, 220];
-
-    for &tok in suppress {
-        if tok as usize >= n_vocab {
-            continue;
-        }
-        match dtype {
-            Dtype::F32 => {
-                let byte_off = tok as usize * 4;
-                if byte_off + 4 <= bytes.len() {
-                    let val: f32 = -1e9;
-                    #[allow(
-                        clippy::indexing_slicing,
-                        reason = "byte_off + 4 <= bytes.len() checked above"
-                    )]
-                    bytes[byte_off..byte_off + 4].copy_from_slice(&val.to_le_bytes());
-                }
-            }
-            Dtype::F16 => {
-                let byte_off = tok as usize * 2;
-                if byte_off + 2 <= bytes.len() {
-                    // -inf in float16 = 0xFC00 (sign=1, exp=11111, mantissa=0).
-                    let neg_inf_f16: u16 = 0xFC00_u16;
-                    #[allow(
-                        clippy::indexing_slicing,
-                        reason = "byte_off + 2 <= bytes.len() checked above"
-                    )]
-                    bytes[byte_off..byte_off + 2].copy_from_slice(&neg_inf_f16.to_le_bytes());
-                }
-            }
-            // Whisper weights are F16; F32 is used in tests. Bfloat16 / integer types
-            // do not appear in the Whisper logit tensor; skip them silently.
-            Dtype::Bf16 | Dtype::U8 | Dtype::U32 | Dtype::I32 => {}
+/// Greedy argmax over a host f32 logit vector.
+///
+/// `temperature` is accepted for parity with the API; at temp == 0 (the only
+/// deterministic mode rMLX serves) this is a plain argmax. Temperature scaling
+/// changes the softmax distribution but not the argmax, so for greedy decode the
+/// result is identical — we keep the param to avoid an API break and document
+/// that sampling (temp > 0) is not yet a stochastic path.
+fn argmax_f32(logits: &[f32], _temperature: f32) -> u32 {
+    let mut best_idx = 0usize;
+    let mut best_val = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best_val {
+            best_val = v;
+            best_idx = i;
         }
     }
-
-    Array::from_bytes(&bytes, &[n_vocab as i32], dtype)
-        .map_err(|e| WhisperError::Mlx(e.to_string()))
+    best_idx as u32
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

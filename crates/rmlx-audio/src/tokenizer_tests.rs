@@ -15,8 +15,8 @@ use super::{
 /// `WhisperTokenizerFast.from_pretrained` and calling `tokenizer.encode(f"<|{code}|>")`.
 /// Full table coverage is constrained to languages that are both (a) in the Whisper
 /// vocabulary and (b) listed in the `language_token` compile-time match.
-/// When `RMLX_TEST_MODEL_WHISPER` is set, integration tests in `crates/rmlx-audio/tests/`
-/// can verify against a live tokenizer.json.
+/// Integration tests in `crates/rmlx-audio/tests/transcribe.rs` verify against a
+/// live `tokenizer.json` when the snapshot is present under `RMLX_O_MODELS_ROOT`.
 #[test]
 fn language_token_ids() {
     // Verified against WhisperTokenizerFast.from_pretrained output.
@@ -37,14 +37,18 @@ fn language_token_ids() {
 }
 
 /// Special token constant sanity check.
+///
+/// large-v3 has 100 language slots (`<|en|>`=50259 … `<|yue|>`=50358), so every
+/// special after the language block is shifted up by one vs the v1/v2 layout.
+/// Verified against the shipped `tokenizer.json` `added_tokens` table.
 #[test]
 fn special_token_constants() {
     assert_eq!(TOK_EOT, 50_257);
     assert_eq!(TOK_SOT, 50_258);
     assert_eq!(TOK_EN, 50_259);
-    assert_eq!(TOK_TRANSLATE, 50_358);
-    assert_eq!(TOK_TRANSCRIBE, 50_359);
-    assert_eq!(TOK_NO_TIMESTAMPS, 50_363);
+    assert_eq!(TOK_TRANSLATE, 50_359);
+    assert_eq!(TOK_TRANSCRIBE, 50_360);
+    assert_eq!(TOK_NO_TIMESTAMPS, 50_364);
 }
 
 /// SOT sequence structure.

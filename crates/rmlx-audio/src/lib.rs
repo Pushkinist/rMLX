@@ -53,10 +53,14 @@
 pub mod mel;
 pub mod npz;
 pub mod tokenizer;
+pub mod transcribe;
 pub mod tts;
 pub mod vad;
 pub mod wav;
 pub mod whisper;
 
+pub use transcribe::{
+    render, resample_to_16k, OutputFormat, Segment, TranscribeOptions, Transcriber, Transcription,
+};
 pub use vad::{voiced_segments, SileroVad, VadState};
 pub use wav::{WavDecoder, WavEncoder};

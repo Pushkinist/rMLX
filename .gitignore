@@ -84,3 +84,9 @@ scripts/release_e2e/stage6_perf/last_run.json
 
 # Repo-local model-snapshot dir (RMLX_O_MODELS_ROOT fallback). Drop snapshots here.
 /models/
+
+# Local audio test fixtures (real recordings + reference transcripts). The
+# long-form regression test (crates/rmlx-audio/tests/transcribe.rs) scans this
+# dir for `*.{m4a,wav,mp3,…}` paired with a sibling `*.transcript.vtt`. Drop
+# your own audio + VTT here; nothing in it is tracked.
+/crates/rmlx-audio/tests/fixtures/

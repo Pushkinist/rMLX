@@ -20,6 +20,7 @@ name = "fused_qk_realmodel_probe"
 path = "examples/fused_qk_realmodel_probe.rs"
 
 [dependencies]
+rmlx-audio   = { workspace = true }
 rmlx-core    = { workspace = true }
 rmlx-kv-quant = { workspace = true }
 rmlx-kv-ssd  = { workspace = true }
