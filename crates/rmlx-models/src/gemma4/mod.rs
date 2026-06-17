@@ -63,5 +63,5 @@ pub use vision::unified::{
 };
 pub use vision::{
     build_inputs_embeds, load_multimodal_embedder, load_vision_tower, MultimodalEmbedder,
-    VisionModel, IMAGE_TOKEN_ID,
+    VisionModel, BOI_TOKEN_ID, EOI_TOKEN_ID, IMAGE_TOKEN_ID,
 };

@@ -54,6 +54,82 @@ fn cache_base_offset(caches: Option<&[KvCache]>) -> i32 {
         .map_or(0, |c| c.offset())
 }
 
+/// `<start_of_image>` / `<end_of_image>` marker token ids, as `i32` for the
+/// id-scan loop below. The canonical source of truth is `super::vision`
+/// (`u32`); cast here at the i32 boundary so there is one definition.
+const BOI_TOKEN_ID: i32 = super::vision::BOI_TOKEN_ID as i32;
+const EOI_TOKEN_ID: i32 = super::vision::EOI_TOKEN_ID as i32;
+
+/// Build the bidirectional-attention overlay for vision (image) soft-token
+/// blocks during a single-shot prefill.
+///
+/// Gemma 4 conditions image soft tokens with **bidirectional** attention within
+/// each image block: every soft token of an image attends to every other soft
+/// token of the same image, not just the causal prefix. (Text tokens stay
+/// causal.) This is essential for the encoder-free unified embedder, whose raw
+/// projected patches carry no pre-integrated spatial/colour context — read
+/// causally they are misinterpreted (e.g. solid colours misnamed). The SigLIP
+/// tower path already integrates the image in its ViT, so the overlay is a
+/// faithful no-harm addition there.
+///
+/// The overlay is `[1, 1, seq, seq]` additive (`0.0` = allowed, large-negative =
+/// blocked): cell `(i, j)` is `0.0` when positions `i` and `j` lie strictly
+/// between the same matching `<start_of_image>` / `<end_of_image>` pair, else
+/// large-negative. The mask builder merges it (element-wise `maximum`) with each
+/// layer's causal/SWA prefill mask, so an intra-block pair is allowed even when
+/// it is "in the future" of the causal mask.
+///
+/// Returns `None` when `seq == 1` (decode), when reading the ids fails, or when
+/// the sequence contains no complete image block.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "chunks_exact(4) guarantees 4-byte slabs; data index i*n+j bounded by the n×n allocation"
+)]
+fn build_vision_bidi_overlay(ids_arr: &Array, seq: i32, device: Device) -> Option<Array> {
+    if seq <= 1 {
+        return None;
+    }
+    let raw = ids_arr.to_bytes().ok()?;
+    let ids: Vec<i32> = raw
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    if ids.len() != seq as usize {
+        return None;
+    }
+
+    // Collect (start, end) exclusive ranges of soft tokens inside each
+    // <start_of_image> .. <end_of_image> pair.
+    let mut blocks: Vec<(usize, usize)> = Vec::new();
+    let mut open: Option<usize> = None;
+    for (i, &t) in ids.iter().enumerate() {
+        if t == BOI_TOKEN_ID {
+            open = Some(i + 1);
+        } else if t == EOI_TOKEN_ID {
+            if let Some(start) = open.take() {
+                if i > start {
+                    blocks.push((start, i));
+                }
+            }
+        }
+    }
+    if blocks.is_empty() {
+        return None;
+    }
+
+    let n = seq as usize;
+    let mut data = vec![-1e30_f32; n * n];
+    for (start, end) in blocks {
+        for i in start..end {
+            for j in start..end {
+                data[i * n + j] = 0.0;
+            }
+        }
+    }
+    let m = Array::from_f32_slice(&data, &[1, 1, seq, seq]).ok()?;
+    m.astype(rmlx_mlx::Dtype::Bf16, device).ok()
+}
+
 // ---------------------------------------------------------------------------
 // Full model
 // ---------------------------------------------------------------------------
@@ -139,6 +215,7 @@ impl Gemma4Text {
             let (new_h, new_kv) = layer.forward(
                 &h, shared_kv, per_layer, 0, // base_offset = 0 (fresh forward, no cache)
                 None, false, // no cache → no rotating cache
+                None,  // text/speculative path: causal only (no image bidi overlay)
                 device,
             )?;
             h = new_h;
@@ -265,7 +342,10 @@ impl Gemma4Text {
             scalar_f32((self.cfg.hidden_size as f32).sqrt()).astype(h_raw.dtype(), device)?;
         let h = multiply(&h_raw, &embed_scale, device)?;
         let h = h.reshape(&[1, seq, self.cfg.hidden_size as i32], device)?;
-        self.forward_h(h, ids_arr, seq, caches, device)
+        // Pure-text path: no image markers, so the vision bidi overlay is never
+        // needed. Passing `has_image = false` skips the device→host id sync that
+        // `build_vision_bidi_overlay` would otherwise force on every prefill.
+        self.forward_h(h, ids_arr, seq, caches, false, device)
     }
 
     /// forward pass from precomputed, already-scaled `inputs_embeds`.
@@ -286,7 +366,10 @@ impl Gemma4Text {
         caches: Option<&mut [KvCache]>,
         device: Device,
     ) -> Result<Array> {
-        self.forward_h(embeds, ids_arr, seq, caches, device)
+        // Image path: the embeds carry scattered vision features, so the bidi
+        // overlay over image soft-token blocks is relevant. `has_image = true`
+        // gates the (single-shot prefill only) overlay build.
+        self.forward_h(embeds, ids_arr, seq, caches, true, device)
     }
 
     /// Shared decoder trunk + LM head over a precomputed scaled hidden state.
@@ -304,10 +387,24 @@ impl Gemma4Text {
         ids_arr: &Array,
         seq: i32,
         caches: Option<&mut [KvCache]>,
+        has_image: bool,
         device: Device,
     ) -> Result<Array> {
         // Current sequence offset (0 when no cache).
         let base_offset = cache_base_offset(caches.as_deref());
+
+        // Bidirectional attention overlay for image soft-token blocks. Only the
+        // single-shot prefill (base_offset == 0, full sequence in this call) can
+        // open the intra-image block; for chunked prefill / decode the overlay
+        // is None and attention stays causal. `has_image` is false on the
+        // pure-text path, so text prefill never forces a device→host id sync
+        // (`build_vision_bidi_overlay` reads the ids back to scan for markers).
+        let bidi_overlay = if has_image && base_offset == 0 {
+            build_vision_bidi_overlay(ids_arr, seq, device)
+        } else {
+            None
+        };
+        let bidi_overlay = bidi_overlay.as_ref();
 
         // Per-position per-layer inputs.
         // ids_arr is [seq], h is [1, seq, hidden] — both span the full call.
@@ -350,6 +447,7 @@ impl Gemma4Text {
                         base_offset,
                         None,
                         kv_is_rotating[layer_idx],
+                        bidi_overlay,
                         device,
                     )?;
                     h = new_h;
@@ -382,6 +480,7 @@ impl Gemma4Text {
                         base_offset,
                         cache,
                         kv_is_rotating[layer_idx],
+                        bidi_overlay,
                         device,
                     )?;
                     h = new_h;
@@ -486,6 +585,7 @@ impl Gemma4Text {
                         base_offset,
                         None,
                         kv_is_rotating[layer_idx],
+                        None,
                         device,
                     )?;
                     h = new_h;
@@ -517,6 +617,7 @@ impl Gemma4Text {
                         base_offset,
                         cache,
                         kv_is_rotating[layer_idx],
+                        None,
                         device,
                     )?;
                     h = new_h;
@@ -626,6 +727,7 @@ impl Gemma4Text {
                         base_offset,
                         None,
                         kv_is_rotating[layer_idx],
+                        None,
                         device,
                     )?;
                     h = new_h;
@@ -657,6 +759,7 @@ impl Gemma4Text {
                         base_offset,
                         cache,
                         kv_is_rotating[layer_idx],
+                        None,
                         device,
                     )?;
                     h = new_h;
@@ -762,6 +865,7 @@ impl Gemma4Text {
                 base_offset,
                 cache,
                 kv_is_rotating[layer_idx],
+                None,
                 device,
             )?;
             h = new_h;
@@ -937,3 +1041,19 @@ impl Gemma4Text {
 pub(super) fn apply_softcap(logits: &Array, cap: f32, device: Device) -> Result<Array> {
     softcap_fused(logits, cap, device)
 }
+
+/// Test-only re-export of [`build_vision_bidi_overlay`] so the sibling
+/// `model_tests` module can assert the overlay allow/block pattern without a
+/// full model forward pass.
+#[cfg(test)]
+pub(super) fn build_vision_bidi_overlay_for_test(
+    ids_arr: &Array,
+    seq: i32,
+    device: Device,
+) -> Option<Array> {
+    build_vision_bidi_overlay(ids_arr, seq, device)
+}
+
+#[cfg(test)]
+#[path = "model_tests.rs"]
+mod model_tests;

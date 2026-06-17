@@ -56,14 +56,21 @@ impl DecoderLayer {
         offset: i32,
         cache: Option<&mut KvCache>,
         kv_is_rotating: bool,
+        bidi_overlay: Option<&Array>,
         device: Device,
     ) -> Result<(Array, Option<(Array, Array)>)> {
         // Attention sub-layer.
         let residual = x.try_clone()?;
         let h = self.input_norm.forward(x, device)?;
-        let (h, new_kv) =
-            self.attn
-                .forward(&h, shared_kv, offset, cache, kv_is_rotating, device)?;
+        let (h, new_kv) = self.attn.forward(
+            &h,
+            shared_kv,
+            offset,
+            cache,
+            kv_is_rotating,
+            bidi_overlay,
+            device,
+        )?;
         let h = self.post_attn_norm.forward(&h, device)?;
         let h = add(&residual, &h, device)?;
 

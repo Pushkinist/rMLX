@@ -785,10 +785,29 @@ Per-image pipeline (faithful port of HF `gemma4_unified`
 
 `patch_ln1/ln2/pos_norm` are true **LayerNorm** (mean-subtraction, weight+bias),
 not RMSNorm — verified against the snapshot's `.weight`+`.bias` tensors and the
-upstream class. Color, spatial layout (4-quadrant, left/right/top/bottom), and
-object counting are exact on the real 12B; fine-grained OCR is weaker than the
-e4b SigLIP tower — an architectural property of the encoder-free 35M projection
-(it lacks the semantic richness of a full vision encoder), not a port defect.
+upstream class. They use the PyTorch `nn.LayerNorm` default `eps = 1e-5` (not the
+model's `rms_norm_eps = 1e-6`, which governs only the `embed_vision` RMSNorm).
+
+**Bidirectional vision attention (required).** Gemma 4 conditions each image's
+soft tokens with **bidirectional** attention: every soft token of an image
+attends to every other soft token of the *same* image, not just the causal
+prefix (text stays causal). The text decoder builds a per-prefill overlay
+(`build_vision_bidi_overlay`, keyed off the `<start_of_image>`/`<end_of_image>`
+markers) that opens the intra-image block and merges it (element-wise `maximum`)
+with each layer's causal/SWA mask. This is **load-bearing** for the encoder-free
+path: the raw projected patches carry no pre-integrated context, so reading them
+causally mis-conditions the decoder (chromatic colours misnamed, spatial layout
+hallucinated). The SigLIP tower path (e4b/26b/31b) already integrates the image
+in its ViT, so the overlay is a no-harm addition there (e4b vision unchanged).
+
+With bidirectional attention, chromatic colour, spatial layout (4-quadrant,
+left/right/top/bottom, borders), and object counting are correct on the real 12B.
+Two inherent limits of the encoder-free projection remain (faithful to HF, not a
+port defect): fine-grained OCR is weaker than the e4b SigLIP tower; and
+**achromatic** inputs (pure white / gray / black) are indistinguishable — for any
+`(c, c, c)` pixel, `patch_ln1` normalises away the absolute level, so white, gray
+and black map to one embedding (the model reads them as dark/black). Brightness
+discrimination needs the SigLIP tower.
 
 ### Unified (encoder-free) audio — `Gemma4UnifiedForConditionalGeneration` (12B)
 
