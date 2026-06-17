@@ -7,6 +7,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-06-17
+
+Correctness + maintenance release. Closes a systemic KV-cache head-scramble
+class that affected **every** flat quantized KV codec, hardens the SSD KV tier
+and prompt cache, makes the single-MLX Metal claim self-heal after a crashed
+holder, and unifies the per-architecture model code onto shared seams (decode
+loop, loader, `Architecture` dispatch). Plus a round of dependency bumps. No
+breaking changes.
+
+### Fixed
+
+- **Systemic KV head-scramble class.** Every flat quantized KV codec wrote its
+  buffer sequence-major but reshaped it head-major on dequant — agreeing only
+  when `batch × kv_heads == 1`, and scrambling per-head K/V on any multi-append
+  (decode after a multi-token prefill, or after an SSD hydrate) when
+  `kv_heads > 1` (grouped-query attention). Fixed family-wide with a canonical
+  sequence-major layout (transpose on append + on dequant) and an explicit
+  `Array::contiguous` before each custom MSL kernel, which reads its input by
+  raw linear index and so cannot honor a lazy transpose. Covers `QuantK`
+  (#103), `QuantV` / TurboSym-K / paged-K handoff (#108), the Iso/Rotor
+  rotation codecs (#109), and PlanarQuant K/V plus its packed-K decode kernels
+  (#110).
+- **SSD KV tier.** Spill + restore now carry the bf16 K/V payload for
+  `KvQuant::None` layers (#88); SSD-hydrated entries are excluded from the
+  exact-hit fast path so a hydrate cannot be mistaken for an exact prompt-cache
+  hit (#87); a Gemma 4 entry hydrated with an empty SWA layer degrades to a
+  full re-prefill instead of decoding from a hole (#90).
+- **Prompt cache unified across architectures.** A single model-agnostic
+  `consume` engine replaces the per-arch hydrate/reuse glue and is retrofitted
+  onto five architectures, so the SSD-hydrate / prefix-reuse correctness fixes
+  above hold identically on every model (#98).
+- **GPU default stream on every inference entry.** The image, speculative,
+  audio, and embeddings blocking-thread entries now establish the thread-local
+  GPU stream the text path already had, fixing intermittent
+  `no Stream(gpu, N)` failures off the text path (#104). The adaptive
+  prefill-chunk fallback resolves the loaded architecture instead of assuming
+  Gemma 4 (#68).
+- **Metal claim self-heals.** A stale claim left by a crashed holder is
+  auto-reclaimed once the holder PID is proven dead (re-probed under the file
+  lock); `SIGTERM`/`SIGINT` now shut the server down gracefully and release the
+  claim (#112).
+- **`Array::to_bytes` evaluates before reading the data pointer**, closing a
+  lazy-eval race in the only reader of the raw MLX array buffer (#101).
+- `MetalKernel::new` frees its input vector when output-name conversion fails
+  (#60); the Planar3 V codec uses one packing path on CPU and GPU (#102) and
+  warms its MSL kernels at precompile (#59); the resident-bytes estimator
+  models Iso/Rotor sidebands exactly (#58); `chunked_prefill` exits prefill on
+  every cache after a failure (#57); f16 negative subnormals no longer decode
+  to `-0.0` (#56); the tensor-view loader distinguishes not-found from I/O /
+  parse failures (#4b5ea54 → see history).
+- **Gemma 4 loading:** unquantized bf16 and affine-int4 (QAT) snapshots load;
+  affine biases pass through the MoE expert `gather_qmm`; the perplexity scorer
+  prepends BOS to every sliding window.
+
+### Changed
+
+- **Shared decode loop.** Qwen 3, Qwen 3.5-MoE, Gemma 4, and Gemma 3 now run on
+  one decode loop (per-arch copies removed); `ProbeStep` / `SmokeVerdict` live
+  in the shared loop.
+- **Shared loader seam.** All architecture loaders (Gemma 4 / 3, Qwen 3 /
+  3.5-MoE / 3-VL-MoE, Laguna) adopt `load_util::Weights` — an index-first,
+  header-truth tensor fetch; AWQ byte-math moved to `rmlx-quant`; a single
+  `read_raw_config` helper replaces six per-loader clones.
+- **`Architecture` dispatch.** Auto-KV default, KV-byte reporting, and
+  prompt-cache stats now dispatch through the `Architecture` trait rather than
+  arch-specific branches.
+- Shared fused-QK setup scaffold (q8 / turbo-K3 / turbo-K4 / iso dispatchers
+  ported onto it); arch modules construct arrays via
+  `Array::from_{i32,f32}_slice` per `docs/FFI.md`; `refuses_qwen_moe` renamed to
+  `k_below_8bit` (it is a codec property, not an arch rule).
+
+### Dependencies
+
+- `tokenizers` 0.20 → 0.23 (encode/decode add-special / skip-special semantics
+  preserved; verified on Gemma 4, Qwen 3.6, and Bonsai tokenizers) (#97).
+- `toml` 0.8 → 1.1 (#94), `tikv-jemallocator` 0.6 → 0.7 (#96),
+  `criterion` 0.5 → 0.8 (dev / benches) (#95), `uuid` 1.23.2 → 1.23.3 and
+  `time` 0.3.47 → 0.3.49 (#93).
+
+### Tested
+
+- Full KV-codec regression re-sweep after the head-scramble fixes: every codec
+  class (QuantK/V, Iso/Rotor, Planar including its live fused-QK kernel) is
+  within ±5 % of its recorded best decode cell on Bonsai, Gemma 4-e4b, and
+  Qwen 3.6 — no decode regression. GPU round-trip tests assert each layout flip
+  reconstructs true head-major K/V at quant noise (with pre-fix scramble
+  controls).
+- Tokenizer correctness re-proven on three tokenizer families (SentencePiece +
+  BPE) at temp 0.
+
 ## [0.2.0] - 2026-06-10
 
 Gemma 4 decode is now competitive with mlx-lm across the whole family, Gemma 4
@@ -177,7 +267,8 @@ inference + conversion backend for Apple Silicon — no Python at runtime.
 - Speculative drafters validated against their verifiers: Qwen 3.6 MTP sidecar
   and the Gemma 4 assistant drafter.
 
-[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.1
 [0.2.0]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.0
 [0.1.1]: https://github.com/Pushkinist/rMLX/releases/tag/v0.1.1
 [0.1.0]: https://github.com/Pushkinist/rMLX/releases/tag/v0.1.0
