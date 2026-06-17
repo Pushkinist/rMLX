@@ -38,7 +38,19 @@ crates are `publish = false`). There is no separate `VERSION` file.
      dist/rmlx-v<version>-aarch64-apple-darwin.tar.gz \
      dist/rmlx-v<version>-aarch64-apple-darwin.tar.gz.sha256
    ```
-7. **Formula url + sha256:** bump the `url` line in
+7. **Sign the artifact (keyless cosign):** `make release-sign` →
+   `dist/rmlx-v<version>-aarch64-apple-darwin.tar.gz.cosign.bundle` (needs
+   `brew install cosign`; opens a browser OIDC prompt). Upload it:
+   ```sh
+   gh release upload v<version> \
+     dist/rmlx-v<version>-aarch64-apple-darwin.tar.gz.cosign.bundle
+   ```
+   The release binary is built locally (hosted CI has no Metal), so the
+   `.sha256` alone is self-attested. The cosign bundle binds the tarball to
+   your authenticated identity + the public Rekor log — real provenance for
+   the prebuilt binary. Consumer-side verification is in "Verify both install
+   paths".
+8. **Formula url + sha256:** bump the `url` line in
    `packaging/homebrew/rmlx.rb` to the new `v<version>` tag tarball, **then**
    `make release-sha` (or `bash scripts/release/source_sha256.sh --write`) for
    the sha256.
@@ -47,7 +59,7 @@ crates are `publish = false`). There is no separate `VERSION` file.
    > sha against the old tag's url and `brew install` fails with a sha
    > mismatch. Always edit the `url` line yourself.
    Commit the formula bump via a PR (`main` is ruleset-protected; see below).
-8. **Publish the tap:** `make tap-sync` (copies the formula into
+9. **Publish the tap:** `make tap-sync` (copies the formula into
    `Pushkinist/homebrew-rmlx` as `Formula/rmlx.rb` and pushes).
 
 ## Dependency-bump PRs (Dependabot)
@@ -82,6 +94,17 @@ gh release download v<version> -p '*aarch64-apple-darwin.tar.gz*'
 shasum -a 256 -c rmlx-v<version>-aarch64-apple-darwin.tar.gz.sha256
 tar xzf rmlx-v<version>-aarch64-apple-darwin.tar.gz
 ./rmlx-v<version>-aarch64-apple-darwin/rmlx --version
+```
+
+**Provenance (cosign bundle, if the release ships one):**
+```sh
+gh release download v<version> -p '*.cosign.bundle'
+cosign verify-blob \
+  --bundle rmlx-v<version>-aarch64-apple-darwin.tar.gz.cosign.bundle \
+  --certificate-identity <maintainer-oidc-email> \
+  --certificate-oidc-issuer <issuer-url> \
+  rmlx-v<version>-aarch64-apple-darwin.tar.gz
+# issuer: GitHub https://github.com/login/oauth · Google https://accounts.google.com
 ```
 
 **Homebrew (build from source):**

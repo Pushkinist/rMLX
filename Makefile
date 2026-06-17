@@ -43,7 +43,7 @@ PROF_GEN    ?= 500
 AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
 
 .PHONY: help build check test fmt fmt-check lint audit deny precommit hooks \
-        ci ci-metrics tag release-package release-sha tap-sync \
+        ci ci-metrics tag release-package release-sha release-sign tap-sync \
         clean serve chat info logs-tail metrics-summary \
         metrics-init metrics-doctor metrics-doctor-fix metrics-export \
         metrics-backup metrics-replay-pending metrics-prompts-sync \
@@ -177,6 +177,9 @@ release-package: ## build + bundle dist/rmlx-v<ver>-aarch64-apple-darwin.tar.gz 
 
 release-sha:     ## print sha256 of the v<ver> GitHub source tarball (append --write to patch the formula)
 	bash scripts/release/source_sha256.sh
+
+release-sign:    ## keyless cosign-sign dist/rmlx-v<ver>-...tar.gz -> .cosign.bundle (needs cosign + browser OIDC)
+	bash scripts/release/sign_artifact.sh
 
 tap-sync:        ## copy packaging/homebrew/rmlx.rb into the homebrew-rmlx tap and push
 	bash scripts/release/sync_tap.sh
