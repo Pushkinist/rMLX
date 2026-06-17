@@ -32,7 +32,13 @@ SHA=$(curl -fsSL "$URL" | shasum -a 256 | awk '{print $1}')
 echo "sha256: $SHA"
 
 if [ "${1:-}" = "--write" ]; then
+  # Bump BOTH the url tag version AND the sha256. Patching only the sha leaves
+  # the formula pointing at the previous tag's tarball with the new tag's sha,
+  # so `brew install` fails on a sha mismatch. The url substitution is anchored
+  # to the `  url "...archive/refs/tags/` line so the instructional comment
+  # above (which mentions an older tag) is left untouched.
+  sed -i '' -E "s|^(  url \"https://github.com/${OWNER_REPO}/archive/refs/tags/)v[^\"]*\.tar\.gz\"|\1v${VER}.tar.gz\"|" "$FORMULA"
   sed -i '' -E "s|^(  sha256 )\"[^\"]*\"|\1\"$SHA\"|" "$FORMULA"
-  echo "==> patched $FORMULA"
-  grep -n "sha256" "$FORMULA"
+  echo "==> patched $FORMULA (url -> v${VER}, sha256)"
+  grep -nE 'archive/refs/tags|sha256 ' "$FORMULA"
 fi
