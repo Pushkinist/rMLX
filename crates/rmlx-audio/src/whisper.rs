@@ -708,8 +708,8 @@ impl WhisperModel {
     /// Detect the spoken language from encoder output.
     ///
     /// Runs a single SOT decoder step and returns the argmax over the 100
-    /// language tokens (`<|en|>`=50259 … `<|yue|>`=50358). Falls back to English
-    /// (50259) on error.
+    /// language tokens (`<|en|>` … `<|yue|>`, ids `TOK_EN ..= TOK_LANG_LAST`).
+    /// Falls back to English (`TOK_EN`) on error.
     ///
     /// Call after `encode_mel`. The returned token id can be passed directly to
     /// `WhisperTokenizer::sot_sequence_from_lang_tok`.
@@ -741,7 +741,7 @@ impl WhisperModel {
             .to_bytes()
             .map_err(|e| WhisperError::Mlx(e.to_string()))?;
         let Some(b4) = bytes.get(..4) else {
-            return Ok(50_259_u32); // fallback to English
+            return Ok(TOK_EN); // fallback to English
         };
         let idx = i32::from_le_bytes(b4.try_into().unwrap_or([0u8; 4]));
         Ok((lang_start + idx) as u32)
@@ -846,6 +846,20 @@ impl WhisperModel {
 
         while sampled.len() < max_tokens {
             if next_tok == TOK_EOT {
+                break;
+            }
+            // Belt-and-suspenders: never request a positional-embedding row
+            // `>= n_text_ctx`. The next decode step would slice the positional
+            // table at `[offset, offset+1)`; once `offset == n_text_ctx` that row
+            // is off the `[n_text_ctx, n_state]` table and `forward` would abort
+            // the whole transcription. The caller already bounds `max_tokens`, but
+            // this guard makes the decode loop self-contained regardless of caller.
+            if offset >= self.cfg.n_text_ctx {
+                debug!(
+                    offset,
+                    n_text_ctx = self.cfg.n_text_ctx,
+                    "stopping decode: positional-embedding ceiling reached"
+                );
                 break;
             }
 

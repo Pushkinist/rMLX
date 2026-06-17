@@ -33,8 +33,32 @@ use crate::whisper::{DecodeFilters, WhisperError, WhisperModel};
 
 /// Seconds of audio represented by one timestamp-token step (Whisper uses 0.02 s).
 const TIME_PRECISION: f32 = 0.02;
-/// Maximum decoder tokens generated per 30 s window.
-const MAX_TOKENS_PER_WINDOW: usize = 224;
+
+/// Max length of the previous-text prompt fed back as `<|startofprev|>` context,
+/// derived from the decoder context length at runtime (no fixed literal).
+///
+/// Mirrors openai-whisper's `prompt[-(n_text_ctx // 2 - 1):]`: half the context
+/// minus one, so the prompt leaves room for the SOT_PREV marker, the SOT prefix,
+/// and the per-window generation budget without overrunning `n_text_ctx`.
+#[must_use]
+fn previous_text_cap(n_text_ctx: usize) -> usize {
+    (n_text_ctx / 2).saturating_sub(1)
+}
+
+/// Per-window decoder generation budget, derived from `n_text_ctx` at runtime.
+///
+/// openai-whisper uses `sample_len = n_text_ctx // 2`, but the hard ceiling is
+/// that the decoder position must stay `< n_text_ctx`: the positional-embedding
+/// slice `[offset, offset+seq)` would otherwise run off the `[n_text_ctx, n_state]`
+/// table and abort the transcription. `offset` starts at `prefix_len` and grows by
+/// one per generated token, so the largest row requested is
+/// `prefix_len + generated - 1`. Bounding `generated <= n_text_ctx - prefix_len`
+/// keeps that `< n_text_ctx`. Returns 0 when the prefix already fills the context.
+#[must_use]
+fn window_token_budget(n_text_ctx: usize, prefix_len: usize) -> usize {
+    let headroom = n_text_ctx.saturating_sub(prefix_len);
+    (n_text_ctx / 2).min(headroom)
+}
 
 /// One transcribed segment with real wall-clock times (seconds from start).
 #[derive(Debug, Clone)]
@@ -88,7 +112,6 @@ impl Default for TranscribeOptions {
 }
 
 /// Long-form Whisper transcriber. Construct once, reuse across requests.
-#[allow(missing_debug_implementations)]
 pub struct Transcriber {
     model: Arc<WhisperModel>,
     tokenizer: Arc<WhisperTokenizer>,
@@ -97,6 +120,20 @@ pub struct Transcriber {
     suppress: Vec<u32>,
     /// SuppressBlank ids (EOT + blank-space token).
     blank_ids: Vec<u32>,
+}
+
+impl std::fmt::Debug for Transcriber {
+    /// Print config dims + suppression-set sizes; the model/tokenizer/extractor
+    /// are opaque (large MLX buffers), so they are summarised, not dumped.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Transcriber")
+            .field("n_vocab", &self.model.cfg.n_vocab)
+            .field("n_text_ctx", &self.model.cfg.n_text_ctx)
+            .field("n_mels", &self.model.cfg.n_mels)
+            .field("suppress_len", &self.suppress.len())
+            .field("blank_ids_len", &self.blank_ids.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Transcriber {
@@ -180,9 +217,9 @@ impl Transcriber {
                 debug!(lang_tok, "language resolved");
                 resolved_lang = Some((lang_tok, lang_str));
             }
-            let (lang_tok, _) = resolved_lang
-                .clone()
-                .unwrap_or((crate::tokenizer::TOK_EN, "en".to_owned()));
+            let lang_tok = resolved_lang
+                .as_ref()
+                .map_or(crate::tokenizer::TOK_EN, |(t, _)| *t);
 
             // Build the SOT sequence (timestamp mode → no <|notimestamps|>), with
             // optional previous-text prompt.
@@ -196,10 +233,16 @@ impl Transcriber {
             }
             full_prefix.extend(sot.iter().copied());
 
+            // Per-window generation budget, derived from `n_text_ctx` at runtime
+            // (no fixed literal); bounded so the decoder position stays `< n_text_ctx`.
+            // greedy_decode additionally refuses any positional row `>= n_text_ctx`
+            // as a belt-and-suspenders guard.
+            let max_tokens = window_token_budget(self.model.cfg.n_text_ctx, full_prefix.len());
+
             let tokens = match self.model.greedy_decode(
                 &encoder_out,
                 &full_prefix,
-                MAX_TOKENS_PER_WINDOW,
+                max_tokens,
                 opts.temperature,
                 &filters,
                 device,
@@ -255,8 +298,10 @@ impl Transcriber {
                         .tokenizer
                         .encode(window_text.trim())
                         .unwrap_or_default();
-                    // Cap the prompt so the prefix never overruns n_text_ctx.
-                    let cap = self.model.cfg.n_text_ctx / 2;
+                    // Cap the previous-text prompt the way openai-whisper does:
+                    // the prefix never overruns n_text_ctx once the SOT_PREV marker
+                    // + SOT prefix + generation budget are added.
+                    let cap = previous_text_cap(self.model.cfg.n_text_ctx);
                     if prompt_tokens.len() > cap {
                         let start = prompt_tokens.len() - cap;
                         prompt_tokens = prompt_tokens.split_off(start);
