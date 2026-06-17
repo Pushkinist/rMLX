@@ -555,8 +555,6 @@ pub fn load_vision_tower(
     model_dir: &Path,
     cfg: &Gemma4VisionConfig,
 ) -> Result<(VisionModel, MultimodalEmbedder)> {
-    use crate::layers::Linear as CoreLinear;
-
     let idx = load_shard_index(model_dir)?;
     let shards = ShardSet::open(model_dir, &idx)?;
 
@@ -667,7 +665,55 @@ pub fn load_vision_tower(
     };
 
     // MultimodalEmbedder: embed_vision.embedding_projection (quantized if .scales).
-    let proj_base = "embed_vision.embedding_projection";
+    let embedder = load_multimodal_embedder(model_dir, "embed_vision", cfg.rms_norm_eps)?;
+
+    info!(
+        layers = cfg.num_hidden_layers,
+        "gemma4: vision tower + multimodal embedder loaded"
+    );
+    Ok((vision, embedder))
+}
+
+/// Load a Gemma4 [`MultimodalEmbedder`] (`<base>.embedding_projection.*`) from a
+/// snapshot directory. Shared by the vision (`embed_vision`) and audio
+/// (`embed_audio`) towers — both are the identical `RMSNormNoScale -> Linear`
+/// projection into the language-model hidden space, differing only in the
+/// `embedding_dim` of the (possibly quantized) projection weight.
+pub fn load_multimodal_embedder(
+    model_dir: &Path,
+    base: &str,
+    norm_eps: f32,
+) -> Result<MultimodalEmbedder> {
+    use crate::layers::Linear as CoreLinear;
+
+    let idx = load_shard_index(model_dir)?;
+    let shards = ShardSet::open(model_dir, &idx)?;
+
+    fn load_f32(shards: &ShardSet, name: &str) -> Result<Array> {
+        for (_, handle) in shards.iter() {
+            let st = handle.safetensors()?;
+            if let Ok(t) = st.tensor(name) {
+                let tv = rmlx_loader::TensorView {
+                    name,
+                    dtype: t.dtype(),
+                    shape: t.shape().to_vec(),
+                    bytes: t.data(),
+                };
+                let a = Array::from_safetensor_view(&tv)?;
+                return a.astype(Dtype::F32, Device::Cpu);
+            }
+        }
+        Err(Error::Loader(format!(
+            "gemma4 embedder: tensor '{name}' not found in any shard"
+        )))
+    }
+    let has = |name: &str| -> bool {
+        shards
+            .iter()
+            .any(|(_, h)| h.safetensors().is_ok_and(|st| st.tensor(name).is_ok()))
+    };
+
+    let proj_base = format!("{base}.embedding_projection");
     let projection = if has(&format!("{proj_base}.scales")) {
         let weight = load_raw(&shards, &format!("{proj_base}.weight"))?;
         let scales = load_raw(&shards, &format!("{proj_base}.scales"))?;
@@ -691,15 +737,10 @@ pub fn load_vision_tower(
         }
     };
 
-    info!(
-        layers = cfg.num_hidden_layers,
-        "gemma4: vision tower + multimodal embedder loaded"
-    );
-    let embedder = MultimodalEmbedder {
+    Ok(MultimodalEmbedder {
         projection,
-        norm_eps: cfg.rms_norm_eps,
-    };
-    Ok((vision, embedder))
+        norm_eps,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -716,8 +757,11 @@ pub const IMAGE_TOKEN_ID: u32 = 258880;
 /// Faithful host port of mlx-vlm `gemma4.py::Model.get_input_embeddings`:
 /// 1. `inputs_embeds = embed_tokens(input_ids) * embed_scale` (scaled text).
 /// 2. For each image: `embed_vision(vision_tower(pixels))` → `[1, n_soft,
-/// hidden]` f32 → astype bf16 → scatter into `inputs_embeds` at that
+///    hidden]` f32 → astype bf16 → scatter into `inputs_embeds` at that
+///    image's contiguous run of `IMAGE_TOKEN_ID` positions.
 /// 3. The per-layer-input ids mask the image positions to `0` (mlx-vlm
+///    zeroes the soft-token ids so per-layer gating sees text-only ids at
+///    the image positions).
 ///
 /// Returns `(inputs_embeds [1, seq, hidden], masked_ids [seq])`. Both feed
 /// [`super::model::Gemma4Text::forward_arr_embeds`].

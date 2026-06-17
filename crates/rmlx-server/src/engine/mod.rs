@@ -26,6 +26,7 @@
 )]
 
 pub(crate) mod arch_generator;
+pub(crate) mod audio;
 pub(crate) mod generator;
 pub(crate) mod helpers;
 pub(crate) mod image;

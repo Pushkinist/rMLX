@@ -219,6 +219,54 @@ fn gemma4_audio_encoder_forward_shape() {
     );
 }
 
+/// `num_output_frames` must exactly predict the `forward` output length
+/// (`T_sub`) so the server can splice the right number of `<|audio|>`
+/// placeholders before the tower runs. Without this the audio scatter in
+/// `build_audio_inputs_embeds` would misalign and the build would error.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init or validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free; remaining unwrap is on values established by construction"
+)]
+fn gemma4_audio_num_output_frames_matches_forward() {
+    let device = Device::Cpu;
+    let cfg = small_cfg();
+    let enc = synth_tower(&cfg);
+
+    for &t_frames in &[5i32, 17, 64, 100, 257, 513] {
+        let n = (t_frames as usize) * SSCP_INPUT_FEAT_SIZE;
+        let v = vec![0.0f32; n];
+        let mel = Array::from_bytes(
+            f32_bytes(&v),
+            &[1, t_frames, SSCP_INPUT_FEAT_SIZE as i32],
+            Dtype::F32,
+        )
+        .unwrap();
+        let mask = zeros(&[1, t_frames]);
+        let out = enc.forward(&mel, &mask, device).expect("audio forward");
+        out.eval().expect("eval");
+        let actual = out.shape()[1] as usize;
+        let predicted = enc.num_output_frames(t_frames as usize);
+        assert_eq!(
+            predicted, actual,
+            "num_output_frames({t_frames}) = {predicted} != forward T_sub {actual}"
+        );
+    }
+    assert_eq!(
+        enc.num_output_frames(0),
+        0,
+        "zero frames → zero soft tokens"
+    );
+}
+
 /// Real-weights forward (gated on the e4b snapshot, `--ignored`).
 #[test]
 #[ignore = "requires e4b snapshot; run with --ignored"]

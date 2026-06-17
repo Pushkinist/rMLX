@@ -696,12 +696,23 @@ are f32) — adopt / restore the operand dtype, mirroring mlx-lm's weak-typed
 Python floats. A unit-level dtype-lock test guards this against regression; see
 docs/KV_QUANT.md "Gemma4 global `--kv-quant none` KV is bf16".
 
-**Conformer audio encoder.** Present in e4b and above. The SSCP subsampling
-(two conv stages reducing the time dimension by 4×), Macaron-style FFW blocks
-with `residual_weight=0.5`, chunked local attention, and optional output
-projection implement the Conformer-S architecture from the Gemma4 multimodal
-paper. Audio tokens are marked with `audio_token_id` and scatter-merged into
-the embedding sequence similarly to image tokens.
+**Conformer audio encoder + native audio input.** Present in e4b and above. The
+SSCP subsampling (two conv stages reducing the time dimension by 4×),
+Macaron-style FFW blocks with `residual_weight=0.5`, chunked local attention, and
+optional output projection implement the Conformer-S architecture from the Gemma4
+multimodal paper. Audio tokens are marked with `audio_token_id` (258881 on e4b)
+and scatter-merged into the embedding sequence similarly to image tokens.
+
+The serve path is wired end-to-end: `/v1/chat/completions` `input_audio` content
+parts (base64 WAV/etc.) are decoded → 16 kHz mono → USM log-mel front-end →
+Conformer `audio_tower` → `embed_audio` projection → scattered at the `<|audio|>`
+positions. The server loads the audio tower once at startup (alongside the vision
+tower) when the snapshot ships an `audio_config` + `audio_tower.*` weights;
+text-only / vision-only models reject `input_audio` with a clear `503 no audio
+tower` (never a silent drop). The number of audio soft tokens spliced into the
+prompt (`<|audio>` + `T_sub`×`<|audio|>` + `<audio|>`) is derived from the
+encoder's SSCP downsample so the scatter aligns by construction. See
+`docs/SERVER.md` § "Multimodal content parts".
 
 **Speculative decoding fully wired for Gemma4.** `forward_seq_last_k_with_cache`,
 `forward_hidden_states`, `forward_hidden_states_shared_kv`, `apply_final_norm`,
