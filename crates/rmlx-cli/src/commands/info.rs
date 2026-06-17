@@ -410,10 +410,15 @@ pub(crate) fn run_info(
         // with how the model is actually served — a bare instruction can make a
         // healthy instruction-tuned snapshot degenerate into a filler loop (the
         // reference loader does the same), which previously raised false
-        // Broken* verdicts. Single source of truth lives in chat_template.
-        let prompt_ids =
-            rmlx_server::chat_template::smoke_prompt_ids(model_path, &tokenizer, bos_id)
-                .map_err(|e| anyhow::anyhow!("smoke_probe: build seed prompt: {e}"))?;
+        // Broken* verdicts. `smoke_prompt_ids` returns None for base snapshots
+        // with no usable template; the bare seed then uses the canonical
+        // `load_bos_id` resolution already performed above.
+        let prompt_ids = match rmlx_server::chat_template::smoke_prompt_ids(model_path, &tokenizer)
+        {
+            Some(ids) => ids,
+            None => arch::smoke_prompt_ids(&tokenizer, bos_id)
+                .map_err(|e| anyhow::anyhow!("smoke_probe: build seed prompt: {e}"))?,
+        };
 
         info!(
             ?kv_quant_override,

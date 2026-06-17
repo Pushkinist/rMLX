@@ -686,7 +686,7 @@ fn smoke_prompt_uses_chat_template_when_present() {
     write_smoke_fixture(tmp.path(), true);
     let tk = tokenizers::Tokenizer::from_file(tmp.path().join("tokenizer.json")).expect("load tok");
 
-    let ids = smoke_prompt_ids(tmp.path(), &tk, 0).expect("templated smoke prompt");
+    let ids = smoke_prompt_ids(tmp.path(), &tk).expect("templated smoke prompt");
 
     // Must be turn-structured: starts with BOS(0) + <start_of_turn>(10) user(12),
     // contains the prompt tokens, and ends on the model-turn opener (10, 13).
@@ -710,15 +710,28 @@ fn smoke_prompt_uses_chat_template_when_present() {
     }
 }
 
+/// Without a chat template, `smoke_prompt_ids` must return `None` so the caller
+/// (`run_smoke_probe` / the CLI probe) builds the bare seed itself with its own
+/// canonical BOS resolution. The function must NOT invent a token id — earlier
+/// the server probe hard-coded a magic id when no `<bos>` resolved, seeding the
+/// probe wrong; returning `None` keeps the BOS fallback chain in one place.
 #[test]
 fn smoke_prompt_falls_back_to_bare_seed_without_template() {
     let tmp = tempfile::tempdir().expect("tempdir");
     write_smoke_fixture(tmp.path(), false); // no chat_template.jinja
     let tk = tokenizers::Tokenizer::from_file(tmp.path().join("tokenizer.json")).expect("load tok");
 
-    let ids = smoke_prompt_ids(tmp.path(), &tk, 0).expect("bare-seed smoke prompt");
+    // No template ⇒ None (the templated path is the only thing this fn owns).
+    assert!(
+        smoke_prompt_ids(tmp.path(), &tk).is_none(),
+        "no chat template must yield None so the caller resolves BOS itself"
+    );
 
-    // Bare seed = [bos] + SMOKE_PROMPT tokens, no turn markers (10/13 absent).
+    // The bare-seed builder the caller falls back to is the shared
+    // `arch::smoke_prompt_ids`, which takes the canonically-resolved BOS id and
+    // never substitutes a magic literal. Seeded with a real BOS (0 here) it
+    // produces [bos] + SMOKE_PROMPT, no turn markers.
+    let ids = rmlx_models::arch::smoke_prompt_ids(&tk, 0).expect("bare-seed smoke prompt");
     assert_eq!(ids.first(), Some(&0), "bare seed must begin with BOS");
     assert!(
         !ids.contains(&10) && !ids.contains(&13),
