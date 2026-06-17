@@ -101,7 +101,7 @@ libc = "0.2"
 
 # Allocator — jemalloc reduces fragmentation on macOS for long-running servers
 # with KV-cache churn. macOS-only (target_os = "macos") per CLAUDE.md §1.
-tikv-jemallocator = "0.6"
+tikv-jemallocator = "0.7"
 
 # Fast non-cryptographic hasher for trusted keyspaces (compile caches, internal
 # dispatch tables). Do NOT use for attacker-controlled keys (HTTP request bodies,
