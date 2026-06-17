@@ -83,7 +83,7 @@ A converting or new architecture supplies only:
 | `Qwen3VLMoeForConditionalGeneration` | `Architecture::Qwen3VlMoe` | text + image | `bf16` | config | green |
 | `Gemma3ForConditionalGeneration` | `Architecture::Gemma3` | text + image | `Planar` | `KV_MAX_SEQ_DEFAULT` | green |
 | `Gemma4ForConditionalGeneration` | `Architecture::Gemma4` | text + image + audio | `K8V8` / `Planar` / `K8V4` | config | green |
-| `Gemma4UnifiedForConditionalGeneration` | `Architecture::Gemma4` (alias) | text + image (12B; audio not yet) | `K8V8` | config | green |
+| `Gemma4UnifiedForConditionalGeneration` | `Architecture::Gemma4` (alias) | text + image + audio (12B) | `K8V8` | config | green |
 | `LagunaForCausalLM` | `Architecture::Laguna` | text | `K8V8` | `KV_MAX_SEQ_DEFAULT` | green |
 | `BitNetForCausalLM` | `Architecture::BitNet` | text | `K8V8` | 4 096 | green |
 | `JinaEmbeddingsV4Model` | (encoder — no enum variant) | text + image | n/a | 128 000 | green |
@@ -645,12 +645,10 @@ audio fields under `audio_config`.
 The 12B snapshots declare `architectures[0] = "Gemma4UnifiedForConditionalGeneration"`
 — an encoder-free multimodal variant whose **text** decoder is identical to
 Gemma4 (dense, `attention_k_eq_v`, no per-layer-input, no MoE). rMLX aliases the
-arch string to the Gemma4 text loader for the decoder, and routes **vision**
-through a dedicated encoder-free embedder (no SigLIP tower; see *Unified
-(encoder-free) vision* below). **Audio** is not yet wired for 12B — the unified
-audio front-end (`embed_audio` early-fusion) is a follow-up; the existing
-`audio_tower.*` Conformer loader does not match the unified `embed_audio.*`
-weights, so audio input is disabled on 12B (text + image serve end-to-end).
+arch string to the Gemma4 text loader for the decoder, and routes **both vision
+and audio** through dedicated encoder-free embedders (no SigLIP tower, no
+Conformer; see *Unified (encoder-free) vision* and *Unified (encoder-free)
+audio* below). Text, image, and audio all serve end-to-end on the 12B.
 
 Text serves correctly at **all weight quants**, including the mixed 4/8-bit QAT
 snapshots (`gemma-4-12B-it-qat-4bit` affine, `gemma-4-12B-it-qat-mxfp4`): their
@@ -791,6 +789,41 @@ upstream class. Color, spatial layout (4-quadrant, left/right/top/bottom), and
 object counting are exact on the real 12B; fine-grained OCR is weaker than the
 e4b SigLIP tower — an architectural property of the encoder-free 35M projection
 (it lacks the semantic richness of a full vision encoder), not a port defect.
+
+### Unified (encoder-free) audio — `Gemma4UnifiedForConditionalGeneration` (12B)
+
+The unified 12B has **no Conformer `audio_tower`** either. Audio is early-fusion:
+the raw 16 kHz mono waveform is chunked into fixed-length frames and projected
+straight into the shared LM hidden space. rMLX dispatches on `architectures[0]`
+(`is_unified_arch`) *before* the Conformer loader and loads
+`crates/rmlx-models/src/gemma4/audio/unified.rs`; the snapshot ships only
+`embed_audio.embedding_projection.{weight,scales}` (a quantized
+640→3840 Linear) — there is no `audio_tower.*`.
+
+Per-clip pipeline (faithful port of HF `gemma4_unified`
+`Gemma4UnifiedAudioFeatureExtractor` + the shared multimodal embedder):
+
+1. base64 → wav decode → resample to 16 kHz mono (shared `rmlx-audio` path).
+2. Host feature front-end (`extract_waveform_frames`): zero-pad the tail to a
+   multiple of `audio_samples_per_token` (640), then reshape into
+   `[num_tokens, 640]` frames. **No** mel spectrogram, windowing, or per-sample
+   normalization — raw float samples. Since there is no downsampling,
+   `num_soft_tokens = ceil(num_samples / 640)` (one soft token per 40 ms frame).
+3. `embed_audio`: `RMSNormNoScale → embedding_projection` (640 → text hidden) —
+   the same [`MultimodalEmbedder`] the Conformer path and `embed_vision` reuse.
+4. Scatter the soft tokens at the `<|audio|>` run in `inputs_embeds`
+   (`build_unified_audio_inputs_embeds`), then run the shared text decoder from
+   embeds.
+
+`audio_embed_dim == audio_samples_per_token == output_proj_dims == 640` on the
+snapshot; the loader asserts the parsed `output_proj_dims` against the actual
+`embed_audio.embedding_projection` input dim and rejects a mismatch. The
+combined image+audio rejection guard still applies on the unified arch (a request
+with both returns a clear error, never a silent drop). Like the encoder-free
+vision path, audio grounding is real but coarse — the model reliably picks up the
+spoken content (e.g. "Tuesday at noon", named colors/objects) without a full
+audio encoder. Submitting audio to a model without the unified audio embedder
+returns a clear "no audio tower" error.
 
 ### Maximum context
 

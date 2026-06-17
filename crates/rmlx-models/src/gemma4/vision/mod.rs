@@ -307,6 +307,31 @@ impl MultimodalEmbedder {
         let normed = rms_norm(inputs_embeds, None, self.norm_eps, device)?;
         self.projection.forward(&normed, device)
     }
+
+    /// Input feature dim of `embedding_projection` — the unpacked `in_features`
+    /// the projection consumes (e.g. `mm_embed_dim` 3840 for vision,
+    /// `audio_embed_dim` 640 for unified audio). Used to validate the parsed
+    /// `output_proj_dims` config against the actual checkpoint weight so a
+    /// mismatched config is rejected at load instead of producing a silent
+    /// shape error deep in the forward pass.
+    ///
+    /// For a quantized projection the unpacked input dim is
+    /// `scales.shape()[1] * group_size`; for a plain projection it is the
+    /// weight's second axis (`[out, in]`). Returns `None` if the shapes are
+    /// degenerate (treated as "cannot validate" by the caller).
+    pub fn projection_input_dim(&self) -> Option<usize> {
+        match &self.projection {
+            crate::layers::Linear::Plain { weight } => weight.shape().get(1).map(|&d| d as usize),
+            crate::layers::Linear::Quantized {
+                scales, group_size, ..
+            } => scales
+                .shape()
+                .get(1)
+                .map(|&groups| groups as usize * *group_size as usize),
+            // PARO projections never appear on the multimodal embedder path.
+            crate::layers::Linear::Paro { .. } => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

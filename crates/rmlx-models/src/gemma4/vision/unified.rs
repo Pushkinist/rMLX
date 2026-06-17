@@ -189,8 +189,15 @@ impl LayerNorm {
     /// `x`: `[..., dim]`. Returns same shape.
     fn forward(&self, x: &Array, device: Device) -> Result<Array> {
         let x = x.astype(Dtype::F32, device)?;
-        let axis = (x.shape().len() as i32) - 1;
-        let dim = *x.shape().last().unwrap_or(&1) as f32;
+        let shape = x.shape();
+        if shape.is_empty() {
+            return Err(Error::Model(
+                "gemma4_unified LayerNorm: rank-0 input has no last axis to normalize".to_owned(),
+            ));
+        }
+        let axis = (shape.len() as i32) - 1;
+        // SAFETY: shape non-empty (checked above) → last() is Some.
+        let dim = *shape.last().unwrap_or(&1) as f32;
         // mean over last axis (keepdims for broadcast).
         let sum = sum_axis_keepdims(&x, axis, device)?;
         let mean = multiply(&sum, &scalar_f32(1.0 / dim), device)?;
@@ -451,6 +458,21 @@ pub fn load_unified_vision_embedder(
     // embed_vision: RMSNormNoScale -> embedding_projection (reused loader).
     let embed_vision =
         super::load_multimodal_embedder(model_dir, "embed_vision", cfg.rms_norm_eps)?;
+
+    // Validate the parsed `output_proj_dims` against the loaded projection's
+    // actual input feature dim. This makes the config field load-bearing: a
+    // checkpoint whose `embed_vision.embedding_projection` does not consume
+    // `output_proj_dims` features is rejected here instead of failing with an
+    // opaque shape error inside the forward pass.
+    if let Some(proj_in) = embed_vision.projection_input_dim() {
+        if proj_in != cfg.output_proj_dims {
+            return Err(Error::Loader(format!(
+                "gemma4_unified vision: output_proj_dims ({}) != embed_vision.embedding_projection \
+                 input dim ({proj_in}) — config/checkpoint mismatch",
+                cfg.output_proj_dims
+            )));
+        }
+    }
 
     info!(
         mm_embed_dim = cfg.mm_embed_dim,

@@ -37,6 +37,10 @@ pub(crate) mod prompt_cache;
 mod tests;
 mod vision;
 
+pub use audio::unified::{
+    build_unified_audio_inputs_embeds, extract_waveform_frames, load_unified_audio_embedder,
+    unified_num_audio_soft_tokens, UnifiedAudioConfig, UnifiedAudioEmbedder,
+};
 pub use audio::{build_audio_inputs_embeds, load_audio_tower, AudioEncoder};
 pub use audio_feature_extractor::{
     AudioFeatError, AudioFeatureExtractorConfig, Gemma4AudioFeatureExtractor,

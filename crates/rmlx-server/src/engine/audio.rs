@@ -26,12 +26,23 @@ const GEMMA4_AUDIO_SAMPLE_RATE: u32 = 16_000;
 /// `audio_config` + `audio_tower.*` weights. One variant per audio-capable
 /// architecture (only Gemma4's Conformer tower today).
 #[allow(missing_debug_implementations)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "loaded once per model and held behind an Arc; the Conformer variant carries the full audio tower while the unified variant is a thin projection — boxing would add an indirection on every multimodal forward for a single long-lived value"
+)]
 pub(crate) enum AudioBundle {
     /// Gemma4 Conformer audio tower + multimodal embedder + feature extractor.
     Gemma4 {
         encoder: rmlx_models::gemma4::AudioEncoder,
         embedder: rmlx_models::gemma4::MultimodalEmbedder,
         feature_extractor: rmlx_models::gemma4::Gemma4AudioFeatureExtractor,
+        audio_token_id: u32,
+    },
+    /// Gemma4 **unified** (`Gemma4UnifiedForConditionalGeneration`, 12B):
+    /// encoder-free audio embedder (no Conformer tower). Raw 16 kHz waveform is
+    /// chunked into fixed-length frames and projected by `embed_audio`.
+    Gemma4Unified {
+        embedder: rmlx_models::gemma4::UnifiedAudioEmbedder,
         audio_token_id: u32,
     },
 }
@@ -43,6 +54,21 @@ pub(crate) enum AudioBundle {
 /// vision-only). Errors propagate to the caller, which logs + disables the
 /// audio path (audio input then returns a clear "no audio tower" error).
 pub(crate) fn load_gemma4_audio_bundle(model_dir: &Path) -> rmlx_core::Result<Option<AudioBundle>> {
+    // Unified 12B: encoder-free audio (`model_type: gemma4_unified_audio`, no
+    // `audio_tower.*`). Route to the waveform-frame embedder before the
+    // Conformer loader, which would fail trying to read the absent tower
+    // tensors.
+    if rmlx_models::gemma4::is_unified_arch(model_dir) {
+        let Some(ucfg) = rmlx_models::gemma4::UnifiedAudioConfig::from_model_dir(model_dir)? else {
+            return Ok(None);
+        };
+        let embedder = rmlx_models::gemma4::load_unified_audio_embedder(model_dir, &ucfg)?;
+        return Ok(Some(AudioBundle::Gemma4Unified {
+            audio_token_id: ucfg.audio_token_id,
+            embedder,
+        }));
+    }
+
     let Some(acfg) = rmlx_models::gemma4::Gemma4AudioConfig::from_model_dir(model_dir)? else {
         return Ok(None);
     };
@@ -115,16 +141,40 @@ pub(crate) fn build_audio_prompt(
         )));
     }
 
+    let model = arch
+        .as_gemma4()
+        .ok_or_else(|| Error::Other("audio input requires the Gemma4 architecture".to_owned()))?;
+
+    // Unified 12B: encoder-free waveform-frame path. Decode + resample (shared
+    // with the Conformer path below), then chunk into fixed-length frames and
+    // project — no mel front-end, no tower.
+    if let AudioBundle::Gemma4Unified {
+        embedder,
+        audio_token_id,
+    } = ab
+    {
+        return build_unified_audio_prompt(
+            model,
+            embedder,
+            *audio_token_id,
+            &audio_b64[0],
+            prompt_tokens,
+            device,
+        );
+    }
+
     let AudioBundle::Gemma4 {
         encoder,
         embedder,
         feature_extractor,
         audio_token_id,
-    } = ab;
-
-    let model = arch
-        .as_gemma4()
-        .ok_or_else(|| Error::Other("audio input requires the Gemma4 architecture".to_owned()))?;
+    } = ab
+    else {
+        // Only the Conformer variant remains after the unified early return.
+        return Err(Error::Other(
+            "internal: unexpected audio bundle variant in Conformer path".to_owned(),
+        ));
+    };
 
     // 1. base64 → bytes → mono f32 @ 16 kHz.
     let raw = audio_b64[0].as_str();
@@ -205,6 +255,93 @@ pub(crate) fn build_audio_prompt(
         &mel_arr,
         &mask_arr,
         *audio_token_id,
+        &aug_ids,
+        device,
+    )?;
+    Ok((aug_ids, embeds, masked_ids))
+}
+
+/// Build the unified-arch (12B) audio prompt: decode the clip, chunk the raw
+/// 16 kHz waveform into fixed-length frames, project via the encoder-free
+/// `embed_audio`, and scatter at the `<|audio|>` positions.
+///
+/// Pipeline (mirrors HF `Gemma4UnifiedProcessor` + the unified vision splice):
+/// 1. base64 → bytes → `WavDecoder` (mono f32, native rate) → resample 16 kHz.
+/// 2. `extract_waveform_frames` → `[num_tokens, audio_embed_dim]` raw frames,
+///    `num_tokens = ceil(num_samples / audio_samples_per_token)`.
+/// 3. splice the audio block `<|audio>` + `num_tokens` × `<|audio|>` + `<audio|>`
+///    after the leading token.
+/// 4. `build_unified_audio_inputs_embeds` projects the frames and scatters them.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "insert_at is 0 or 1, bounded by prompt_tokens.len() (0 → empty, 1 → non-empty); both prompt_tokens slices are in range"
+)]
+fn build_unified_audio_prompt(
+    model: &rmlx_models::gemma4::Gemma4Text,
+    embedder: &rmlx_models::gemma4::UnifiedAudioEmbedder,
+    audio_token_id: u32,
+    audio_b64: &str,
+    prompt_tokens: &[u32],
+    device: rmlx_mlx::Device,
+) -> rmlx_core::Result<(Vec<u32>, rmlx_mlx::Array, rmlx_mlx::Array)> {
+    // 1. base64 → bytes → mono f32 @ 16 kHz (shared decode/resample helpers).
+    let b64 = audio_b64
+        .rsplit_once(',')
+        .map_or(audio_b64, |(_, tail)| tail);
+    let bytes = crate::image_io::base64_decode(b64)
+        .map_err(|e| Error::Other(format!("input_audio base64 decode failed: {e}")))?;
+    let (samples, sample_rate) = rmlx_audio::wav::WavDecoder::decode(&bytes)
+        .map_err(|e| Error::Other(format!("input_audio decode failed: {e}")))?;
+    let samples = rmlx_audio::transcribe::resample_to_16k(&samples, sample_rate);
+    let dur_secs = samples.len() as f64 / f64::from(GEMMA4_AUDIO_SAMPLE_RATE);
+
+    // 2. chunk raw waveform into fixed-length frames (encoder-free front-end).
+    let cfg = embedder.config();
+    let (frames, num_tokens) =
+        rmlx_models::gemma4::extract_waveform_frames(&samples, cfg.audio_samples_per_token);
+    if num_tokens == 0 {
+        return Err(Error::Other(
+            "input_audio produced zero audio soft tokens (clip empty)".to_owned(),
+        ));
+    }
+
+    tracing::info!(
+        sample_rate,
+        samples = samples.len(),
+        duration_secs = dur_secs,
+        audio_embed_dim = cfg.audio_embed_dim,
+        audio_samples_per_token = cfg.audio_samples_per_token,
+        audio_soft_tokens = num_tokens,
+        "Gemma4-unified audio preprocessed (encoder-free)"
+    );
+
+    // 3. splice the audio block after the prompt's leading token.
+    let mut block = Vec::with_capacity(num_tokens + 2);
+    block.push(GEMMA4_BOA_TOKEN_ID);
+    block.extend(std::iter::repeat_n(audio_token_id, num_tokens));
+    block.push(GEMMA4_EOA_TOKEN_ID);
+
+    let insert_at = usize::from(!prompt_tokens.is_empty());
+    let mut aug_ids = Vec::with_capacity(prompt_tokens.len() + block.len());
+    aug_ids.extend_from_slice(&prompt_tokens[..insert_at]);
+    aug_ids.extend_from_slice(&block);
+    aug_ids.extend_from_slice(&prompt_tokens[insert_at..]);
+
+    let in_prompt = aug_ids.iter().filter(|&&t| t == audio_token_id).count();
+    tracing::info!(
+        audio_soft_tokens = num_tokens,
+        audio_tokens_in_prompt = in_prompt,
+        aug_len = aug_ids.len(),
+        "built Gemma4-unified audio prompt"
+    );
+
+    // 4. project frames + scatter.
+    let (embeds, masked_ids) = rmlx_models::gemma4::build_unified_audio_inputs_embeds(
+        model,
+        embedder,
+        &frames,
+        num_tokens,
+        audio_token_id,
         &aug_ids,
         device,
     )?;
