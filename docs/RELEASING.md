@@ -38,11 +38,40 @@ crates are `publish = false`). There is no separate `VERSION` file.
      dist/rmlx-v<version>-aarch64-apple-darwin.tar.gz \
      dist/rmlx-v<version>-aarch64-apple-darwin.tar.gz.sha256
    ```
-7. **Formula sha256:** `make release-sha` then patch
-   `packaging/homebrew/rmlx.rb` (or `bash scripts/release/source_sha256.sh
-   --write`). Commit the formula bump.
+7. **Formula url + sha256:** bump the `url` line in
+   `packaging/homebrew/rmlx.rb` to the new `v<version>` tag tarball, **then**
+   `make release-sha` (or `bash scripts/release/source_sha256.sh --write`) for
+   the sha256.
+   > ⚠️ `source_sha256.sh --write` patches **only the sha256, not the `url`
+   > version**. If you skip the manual url bump, the formula carries the new
+   > sha against the old tag's url and `brew install` fails with a sha
+   > mismatch. Always edit the `url` line yourself.
+   Commit the formula bump via a PR (`main` is ruleset-protected; see below).
 8. **Publish the tap:** `make tap-sync` (copies the formula into
    `Pushkinist/homebrew-rmlx` as `Formula/rmlx.rb` and pushes).
+
+## Dependency-bump PRs (Dependabot)
+
+Hosted CI runs only fmt + clippy + a best-effort build (no Metal, no tests), so
+a green Dependabot check does **not** prove the bump builds with Metal or passes
+the suite. **Gate every bump locally with `make ci`** (and a real-model smoke for
+runtime-affecting deps — allocator, tokenizer) before merging.
+
+A **major** bump that needs source migration is the trap: Dependabot only edits
+the manifest, so its branch stays RED until the migration commit is **pushed to
+the remote PR branch**:
+
+```sh
+gh pr checkout <PR>            # work on the dependabot branch
+# … migrate source, `make ci`, prove …
+git push origin HEAD:dependabot/cargo/<branch>   # REQUIRED — push the fix
+```
+
+`main`'s ruleset requires the `rustfmt` and `build + clippy` checks with **no
+bypass** (not even admin), so the PR cannot merge until the *remote* branch is
+green. A migration that lives only in your local checkout will not unblock the
+merge. Do **not** `git branch -D` the local branch before the remote has the
+fix (the migration commit is otherwise only reachable via reflog).
 
 ## Verify both install paths
 
