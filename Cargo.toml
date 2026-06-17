@@ -141,7 +141,7 @@ tempfile = "3"
 # not have a separate `[workspace.dev-dependencies]` table; consumers
 # reference this via `criterion.workspace = true` from their own
 # `[dev-dependencies]`.
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 [workspace.lints.rust]
 # Memory / safety. unsafe_code = "deny" + scoped #[allow(unsafe_code)] at

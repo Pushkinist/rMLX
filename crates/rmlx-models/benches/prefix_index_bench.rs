@@ -40,7 +40,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use rmlx_models::prefix_index::{LinearScan, PrefixIndex, RadixTree};
 
