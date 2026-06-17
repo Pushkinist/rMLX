@@ -25,6 +25,12 @@ pub(crate) enum VisionBundle {
         embedder: rmlx_models::gemma4::MultimodalEmbedder,
         processor: rmlx_models::gemma4::Gemma4ImageProcessor,
     },
+    /// Gemma4 **unified** (`Gemma4UnifiedForConditionalGeneration`, 12B):
+    /// encoder-free vision embedder (no SigLIP tower) + processor.
+    Gemma4Unified {
+        embedder: rmlx_models::gemma4::UnifiedVisionEmbedder,
+        processor: rmlx_models::gemma4::Gemma4ImageProcessor,
+    },
     /// Gemma3 standard SigLIP tower + multimodal projector + processor.
     Gemma3 {
         vision: rmlx_models::gemma3::VisionModel,
@@ -132,6 +138,67 @@ pub(crate) fn build_image_prompt(
 
             let (embeds, masked_ids) = rmlx_models::gemma4::build_inputs_embeds(
                 model, vision, embedder, &pixels, &aug_ids, device, mm_cache,
+            )?;
+            Ok((aug_ids, embeds, masked_ids))
+        }
+        VisionBundle::Gemma4Unified {
+            embedder,
+            processor,
+        } => {
+            // The unified 12B loads through the Gemma4 text architecture; the
+            // encoder-free embedder replaces the SigLIP tower.
+            let model = arch.as_gemma4().ok_or_else(|| {
+                Error::Other("image input requires the Gemma4 architecture".to_owned())
+            })?;
+            let image_token_id = rmlx_models::gemma4::IMAGE_TOKEN_ID;
+
+            let mut pixels = Vec::with_capacity(sources.len());
+            for (i, src) in sources.iter().enumerate() {
+                let bytes = rmlx_server_load_image(src)?;
+                let pv = processor
+                    .preprocess(&bytes)
+                    .map_err(|e| Error::Other(format!("image {i} preprocess failed: {e}")))?;
+                let n_soft = rmlx_models::gemma4::unified_num_soft_tokens(
+                    pv.height,
+                    pv.width,
+                    embedder.config(),
+                );
+                tracing::info!(
+                    image_idx = i,
+                    width = pv.width,
+                    height = pv.height,
+                    num_soft_tokens = n_soft,
+                    "Gemma4-unified image preprocessed"
+                );
+                pixels.push((pv, n_soft));
+            }
+
+            let blocks: Vec<Vec<u32>> = pixels
+                .iter()
+                .map(|(_, n_soft)| {
+                    let mut b = Vec::with_capacity(n_soft + 2);
+                    b.push(GEMMA4_BOI_TOKEN_ID);
+                    b.extend(std::iter::repeat_n(image_token_id, *n_soft));
+                    b.push(GEMMA4_EOI_TOKEN_ID);
+                    b
+                })
+                .collect();
+            let aug_ids = splice(prompt_tokens, &blocks);
+
+            let total_soft: usize = pixels.iter().map(|(_, n)| *n).sum();
+            let in_prompt = aug_ids.iter().filter(|&&t| t == image_token_id).count();
+            tracing::info!(
+                images = pixels.len(),
+                soft_tokens = total_soft,
+                image_tokens_in_prompt = in_prompt,
+                aug_len = aug_ids.len(),
+                "built Gemma4-unified image prompt"
+            );
+
+            let pv_only: Vec<rmlx_models::gemma4::Gemma4PixelValues> =
+                pixels.into_iter().map(|(pv, _)| pv).collect();
+            let (embeds, masked_ids) = rmlx_models::gemma4::build_unified_inputs_embeds(
+                model, embedder, &pv_only, &aug_ids, device, mm_cache,
             )?;
             Ok((aug_ids, embeds, masked_ids))
         }
