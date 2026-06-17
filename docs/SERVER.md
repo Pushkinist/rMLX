@@ -944,7 +944,7 @@ TTS returns HTTP 503 when started without `--tts-model-path`.
 
 | Field | Required | Default | Description |
 |---|---|---|---|
-| `file` | yes | — | Audio bytes. Any Symphonia-supported container (WAV, MP3, FLAC, OGG, …) at 16 kHz mono. |
+| `file` | yes | — | Audio bytes. Any Symphonia-supported container (WAV, MP3, FLAC, OGG, AAC/`.m4a`, …). Stereo is downmixed to mono and any sample rate is resampled to 16 kHz internally. |
 | `model` | no | `whisper-large-v3` | Model identifier (logged; routing is fixed to the configured snapshot). |
 | `language` | no | `auto` | BCP-47 language code, or `auto` (default) to detect language automatically via a single SOT decoder step. Unknown explicit codes return 422. |
 | `response_format` | no | `json` | `json` \| `text` \| `verbose_json` \| `srt` \| `vtt`. Unknown values return 422. |
@@ -953,20 +953,24 @@ TTS returns HTTP 503 when started without `--tts-model-path`.
 
 ### Response formats
 
+Transcription is **long-form**: the engine walks the audio in 30 s windows and
+emits real per-segment timestamps (not a single hardcoded block).
+
 | `response_format` | Body |
 |---|---|
 | `json` (default) | `{"text": "..."}` |
 | `text` | Plain text string. |
-| `verbose_json` | `{"task":"transcribe","language":"en","duration":0.0,"text":"..."}` |
-| `srt` | SRT subtitle (one segment, no word-level timing at v1). |
-| `vtt` | WebVTT (one segment, no word-level timing at v1). |
+| `verbose_json` | `{"task":"transcribe","language":"en","duration":<seconds>,"text":"...","segments":[{"id","start","end","text"},…]}` |
+| `srt` | SRT subtitle, one cue per segment with real `HH:MM:SS,mmm` times. |
+| `vtt` | WebVTT, one cue per segment with real `HH:MM:SS.mmm` times. |
 
-### Constraints (v1)
+### Constraints
 
-- Audio must be at 16 kHz sample rate; other rates return 422.
+- Any sample rate / channel count is accepted — the server downmixes to mono and
+  resamples to 16 kHz (linear) before mel extraction.
 - Maximum audio file size: 25 MiB. Transport body limit is 26 MiB (25 MiB + 1 MiB multipart framing).
 - No streaming (SSE timestamps) — deferred to v2.
-- No word-level timestamps in `srt` / `vtt` — deferred to v2.
+- No word-level timestamps — segment-level timing only (real per-segment times).
 
 ### Model caching
 
@@ -992,21 +996,26 @@ every audio request returns:
 
 with HTTP 503.
 
-### VAD — long-audio chunking
+### Long-form transcription
 
-For audio longer than 30 seconds (480 000 samples at 16 kHz), the Whisper handler
-uses Silero VAD v4 to split the audio into voiced segments before transcription:
+Audio of any length is transcribed by the shared long-form engine
+(`rmlx_audio::transcribe::Transcriber`, also used by `rmlx transcribe` — one core,
+not two). The engine:
 
-1. VAD runs over the entire clip and emits per-frame speech probabilities.
-2. Voiced segments are merged into Whisper-window-sized chunks (≤ 30 s) with
-   1 s overlap at boundaries to avoid cut words.
-3. If VAD produces no segments (all silence), the handler falls back to a
-   sliding-window chunking strategy.
-4. Each chunk is transcribed independently; transcripts are joined with spaces.
+1. Walks the audio in 30 s windows. Each window runs the Whisper decoder in
+   **timestamp mode** with the full openai-whisper logit-filter chain
+   (`SuppressBlank` + `SuppressTokens` + `ApplyTimestampRules`).
+2. Parses the emitted timestamp tokens into segments with real cumulative times,
+   advances the window seek by the last consumed timestamp, and feeds the previous
+   window's text back as a `<|startofprev|>` prompt (previous-text conditioning).
+3. Drops filler hallucinated in the 30 s zero-pad tail of the final short window.
 
-Silero VAD weights are vendored at
-`crates/rmlx-audio/assets/silero_vad_16k.safetensors` (MIT, converted from
-ONNX via `scripts/convert_silero_vad.py`). No ONNX dependency at runtime.
+Decoding is greedy at temperature 0 — output is deterministic across runs.
+
+Silero VAD weights remain vendored at
+`crates/rmlx-audio/assets/silero_vad_16k.safetensors` (MIT) for future
+voice-activity gating; the current long-form path uses fixed 30 s windows with
+timestamp-driven seek rather than VAD pre-segmentation.
 
 ### `POST /v1/audio/speech` — Qwen3-TTS
 
@@ -1029,8 +1038,9 @@ Returns HTTP 503 when `--tts-model-path` is absent. Unknown voice names return 4
 
 When `language` is absent or `"auto"` in `/v1/audio/transcriptions`, the handler
 runs `WhisperModel::detect_language()` — a single SOT decoder step followed by
-argmax over the 99 language tokens (50259–50357) — and uses the detected token to
-build the SOT sequence. Falls back to English (50259) on error.
+argmax over the 100 large-v3 language tokens (`<|en|>`=50259 … `<|yue|>`=50358) —
+and uses the detected token to build the SOT sequence. Falls back to English
+(50259) on error.
 
 ---
 

@@ -38,6 +38,14 @@ variables above:
 | `RMLX_DRAFT_TEST_MODEL` | `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs` | Draft model snapshot path. Used alongside `RMLX_KV_TEST_MODEL` for speculative-decode alignment tests. |
 | `RMLX_VL_TEST_MODEL` | `qwen3_vl_moe_text_parity.rs` | Vision-language model snapshot for VL text-parity tests. |
 
+The Whisper audio integration tests (`crates/rmlx-audio/tests/transcribe.rs`)
+deliberately use **no** dedicated env var — they resolve the
+`mlx-community__whisper-large-v3-mlx` + `openai__whisper-large-v3-tokenizer`
+snapshots directly under `RMLX_O_MODELS_ROOT` (auto-discovery, skip-if-absent) and
+scan the gitignored `crates/rmlx-audio/tests/fixtures/` dir for a
+`*.{m4a,wav,…}` + sibling `*.transcript.vtt` long-form regression pair. The
+former `RMLX_TEST_MODEL_WHISPER` knob was removed.
+
 ## Directory root variable
 
 | Variable | Purpose | Default |

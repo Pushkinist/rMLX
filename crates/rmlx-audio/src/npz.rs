@@ -604,9 +604,11 @@ pub fn parse_npy_array(name: &str, data: &[u8]) -> Result<Array, NpzError> {
     let raw = &data[header_end..];
     let n_elems: usize = shape.iter().product();
     let elem_bytes = match dtype {
+        Dtype::U8 => 1,
         Dtype::F16 => 2,
-        Dtype::F32 => 4,
-        _ => {
+        Dtype::F32 | Dtype::U32 | Dtype::I32 => 4,
+        Dtype::Bf16 => {
+            // extract_npy_dtype never yields Bf16, but the match must be total.
             return Err(npy_err(&format!("unsupported dtype {dtype:?}")));
         }
     };
@@ -625,6 +627,12 @@ pub fn parse_npy_array(name: &str, data: &[u8]) -> Result<Array, NpzError> {
 // ── NPY header field extractors (pub for tests) ───────────────────────────────
 
 /// Extract the numpy dtype descriptor from a `.npy` header string.
+///
+/// Whisper `weights.npz` carries float weights (`f2`/`f4`) plus a small
+/// `alignment_heads` mask. That mask is stored as a NumPy boolean (`b1`) or
+/// small-int array; older parsers hard-errored on it with
+/// "cannot parse dtype". We map booleans / 1-byte ints to `U8` and 4-byte ints
+/// to `U32`/`I32` so the mask loads instead of aborting the whole archive.
 pub fn extract_npy_dtype(header: &str) -> Option<Dtype> {
     let start = header.find("'descr'")?;
     let rest = &header[start + 7..];
@@ -635,6 +643,10 @@ pub fn extract_npy_dtype(header: &str) -> Option<Dtype> {
     match s {
         "f2" => Some(Dtype::F16),
         "f4" => Some(Dtype::F32),
+        // boolean + 1-byte ints → U8 (alignment_heads mask).
+        "b1" | "u1" | "i1" => Some(Dtype::U8),
+        "u4" => Some(Dtype::U32),
+        "i4" => Some(Dtype::I32),
         _ => None,
     }
 }

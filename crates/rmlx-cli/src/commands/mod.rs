@@ -11,6 +11,7 @@ pub(crate) mod parse;
 pub(crate) mod preset_table;
 pub(crate) mod profile;
 pub(crate) mod serve;
+pub(crate) mod transcribe;
 
 pub(crate) use baseline::run_baseline;
 pub(crate) use eval::run_ppl;
