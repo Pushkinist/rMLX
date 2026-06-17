@@ -633,3 +633,112 @@ fn qwen3_plain_render_byte_identical_after_tool_support() {
         "plain render diverged after tool-support change (A5.2 invariant)"
     );
 }
+
+// ── Smoke-probe prompt: template-shaped vs bare-seed fallback ───────────────
+//
+// Regression guard for the gemma4-unified 4-bit false-positive: the smoke probe
+// must feed turn-structured input when the snapshot ships a chat template, so a
+// healthy instruction-tuned model is exercised the same way it is served. A bare
+// instruction prompt can make even a healthy model loop a filler token; rendering
+// through the template removes that false Broken* verdict. These two tests assert
+// the template path is taken when present and the bare-seed fallback otherwise —
+// no model snapshot required.
+
+/// A minimal WordLevel `tokenizer.json` whose vocab covers the turn markers, the
+/// `user`/`model` role words, and every whitespace-split token of `SMOKE_PROMPT`.
+/// Token ids are arbitrary but distinct so the encoded id sequence is checkable.
+fn write_smoke_fixture(dir: &Path, with_template: bool) {
+    // Whitespace pre-tokenizer splits on spaces and punctuation, so `France?`
+    // becomes `France` + `?`; the vocab lists both pieces. The `?` id is 26.
+    let vocab = r#"{
+        "<bos>":0,"<eos>":1,"<unk>":2,
+        "<start_of_turn>":10,"<end_of_turn>":11,"user":12,"model":13,
+        "What":20,"is":21,"the":22,"capital":23,"of":24,"France":25,"?":26
+    }"#;
+    // The angle-bracket markers must tokenize atomically (the Whitespace
+    // pre-tokenizer would otherwise split `<bos>` into `< bos >`), so they are
+    // registered as added/special tokens — mirroring real HF tokenizers.
+    let added = r#"[
+        {"id":0,"content":"<bos>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},
+        {"id":10,"content":"<start_of_turn>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},
+        {"id":11,"content":"<end_of_turn>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}
+    ]"#;
+    let tok_json = format!(
+        r#"{{"version":"1.0","truncation":null,"padding":null,"added_tokens":{added},"normalizer":null,"pre_tokenizer":{{"type":"Whitespace"}},"post_processor":null,"decoder":null,"model":{{"type":"WordLevel","vocab":{vocab},"unk_token":"<unk>"}}}}"#
+    );
+    std::fs::write(dir.join("tokenizer.json"), tok_json).expect("write tokenizer.json");
+    std::fs::write(
+        dir.join("tokenizer_config.json"),
+        r#"{"bos_token":"<bos>","eos_token":"<eos>"}"#,
+    )
+    .expect("write tokenizer_config.json");
+    if with_template {
+        // Gemma-style turn markers. The template emits its own BOS. Tokens are
+        // space-separated so the Whitespace pre-tokenizer yields exact vocab ids.
+        let tpl = "{{ bos_token }} {% for m in messages %}<start_of_turn> {{ m.role }} {{ m.content }} <end_of_turn> {% endfor %}{% if add_generation_prompt %}<start_of_turn> model{% endif %}";
+        std::fs::write(dir.join("chat_template.jinja"), tpl).expect("write chat_template.jinja");
+    }
+}
+
+#[test]
+fn smoke_prompt_uses_chat_template_when_present() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_smoke_fixture(tmp.path(), true);
+    let tk = tokenizers::Tokenizer::from_file(tmp.path().join("tokenizer.json")).expect("load tok");
+
+    let ids = smoke_prompt_ids(tmp.path(), &tk).expect("templated smoke prompt");
+
+    // Must be turn-structured: starts with BOS(0) + <start_of_turn>(10) user(12),
+    // contains the prompt tokens, and ends on the model-turn opener (10, 13).
+    assert_eq!(
+        ids.first(),
+        Some(&0),
+        "templated prompt must begin with BOS"
+    );
+    assert!(
+        ids.windows(2).any(|w| w == [10, 12]),
+        "expected a <start_of_turn> user span: {ids:?}"
+    );
+    assert_eq!(
+        &ids[ids.len() - 2..],
+        &[10, 13],
+        "templated prompt must end on the <start_of_turn> model opener: {ids:?}"
+    );
+    // The prompt body tokens are present (What=20, capital=23, France=25).
+    for t in [20u32, 23, 25] {
+        assert!(ids.contains(&t), "missing prompt token {t} in {ids:?}");
+    }
+}
+
+/// Without a chat template, `smoke_prompt_ids` must return `None` so the caller
+/// (`run_smoke_probe` / the CLI probe) builds the bare seed itself with its own
+/// canonical BOS resolution. The function must NOT invent a token id — earlier
+/// the server probe hard-coded a magic id when no `<bos>` resolved, seeding the
+/// probe wrong; returning `None` keeps the BOS fallback chain in one place.
+#[test]
+fn smoke_prompt_falls_back_to_bare_seed_without_template() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_smoke_fixture(tmp.path(), false); // no chat_template.jinja
+    let tk = tokenizers::Tokenizer::from_file(tmp.path().join("tokenizer.json")).expect("load tok");
+
+    // No template ⇒ None (the templated path is the only thing this fn owns).
+    assert!(
+        smoke_prompt_ids(tmp.path(), &tk).is_none(),
+        "no chat template must yield None so the caller resolves BOS itself"
+    );
+
+    // The bare-seed builder the caller falls back to is the shared
+    // `arch::smoke_prompt_ids`, which takes the canonically-resolved BOS id and
+    // never substitutes a magic literal. Seeded with a real BOS (0 here) it
+    // produces [bos] + SMOKE_PROMPT, no turn markers.
+    let ids = rmlx_models::arch::smoke_prompt_ids(&tk, 0).expect("bare-seed smoke prompt");
+    assert_eq!(ids.first(), Some(&0), "bare seed must begin with BOS");
+    assert!(
+        !ids.contains(&10) && !ids.contains(&13),
+        "bare-seed fallback must not contain turn markers: {ids:?}"
+    );
+    assert!(
+        ids.contains(&20) && ids.contains(&25),
+        "missing prompt body: {ids:?}"
+    );
+}

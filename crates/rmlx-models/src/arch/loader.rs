@@ -371,6 +371,14 @@ pub fn smoke_prompt_ids(tokenizer: &tokenizers::Tokenizer, bos_id: u32) -> Resul
 /// `tokenizer_config.json`, runs greedy generation for 8 steps, and returns
 /// a `SmokeVerdict`. Used by the server's `--require-smoke-probe` gate (B5).
 ///
+/// `prompt_ids_override` lets a caller that owns the chat-template engine
+/// (e.g. `rmlx-server`) feed a production-shaped, turn-structured prompt so the
+/// probe matches how the model is actually served. When `None`, the probe falls
+/// back to the shared bare-instruction seed (`smoke_prompt_ids`). Instruction
+/// models can degenerate into repeated filler on a bare prompt even when
+/// healthy — the reference loader reproduces this identically — so the templated
+/// path is preferred when available to avoid false `Broken*` verdicts.
+///
 /// Returns `Err` only for hard load/tokenizer failures. `Ok(verdict)` where
 /// `verdict != SmokeVerdict::Ok` means the snapshot is broken but loadable.
 pub fn run_smoke_probe(
@@ -378,6 +386,7 @@ pub fn run_smoke_probe(
     device: Device,
     kv_quant: Option<rmlx_kv_quant::KvQuant>,
     max_ctx_override: Option<i32>,
+    prompt_ids_override: Option<Vec<u32>>,
 ) -> Result<crate::decode_loop::SmokeVerdict> {
     let model = load_model(model_dir, device, &LoadOpts::default())?;
 
@@ -389,11 +398,15 @@ pub fn run_smoke_probe(
     let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| Error::Model(format!("run_smoke_probe: load tokenizer: {e}")))?;
 
-    // B5b: seed with a fixed deterministic prompt instead of bare BOS so
-    // healthy instruction-tuned snapshots generate real text.
-    let prompt_ids = smoke_prompt_ids(&tokenizer, bos_id)?;
+    // Prefer a caller-provided, chat-templated prompt; otherwise seed with the
+    // shared bare instruction so healthy snapshots generate real text.
+    let (prompt_ids, templated) = match prompt_ids_override {
+        Some(ids) if !ids.is_empty() => (ids, true),
+        _ => (smoke_prompt_ids(&tokenizer, bos_id)?, false),
+    };
     tracing::info!(
         prompt_len = prompt_ids.len(),
+        templated,
         seed = SMOKE_PROMPT,
         "run_smoke_probe: seeded smoke prompt"
     );
