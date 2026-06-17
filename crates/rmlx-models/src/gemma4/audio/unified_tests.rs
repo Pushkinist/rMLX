@@ -125,14 +125,10 @@ fn frame_count_matches_soft_token_count() {
 // shape. Skips gracefully when the snapshot is not available.
 // ---------------------------------------------------------------------------
 
-/// Resolve the unified 12B snapshot dir from a dedicated env var, falling back
-/// to `<RMLX_O_MODELS_ROOT>/mlx-community__gemma-4-12B-it-mxfp8`. Returns `None`
-/// when neither is set / the dir is absent (test skips).
+/// Resolve the unified 12B snapshot dir via
+/// `<RMLX_O_MODELS_ROOT>/mlx-community__gemma-4-12B-it-mxfp8`.
+/// Returns `None` when the root is unset or the directory is absent (test skips).
 fn unified_12b_dir() -> Option<std::path::PathBuf> {
-    if let Some(p) = std::env::var_os("RMLX_TEST_MODEL_GEMMA4_12B") {
-        let p = std::path::PathBuf::from(p);
-        return p.exists().then_some(p);
-    }
     let root = std::env::var_os("RMLX_O_MODELS_ROOT")?;
     let p = std::path::PathBuf::from(root).join("mlx-community__gemma-4-12B-it-mxfp8");
     p.exists().then_some(p)
@@ -145,7 +141,7 @@ fn unified_12b_dir() -> Option<std::path::PathBuf> {
 )]
 fn unified_audio_embedder_forward_real_weights() {
     let Some(dir) = unified_12b_dir() else {
-        eprintln!("SKIP: gemma-4-12B snapshot not available (set RMLX_TEST_MODEL_GEMMA4_12B or RMLX_O_MODELS_ROOT)");
+        eprintln!("SKIP: gemma-4-12B snapshot not available (set RMLX_O_MODELS_ROOT to the model root dir)");
         return;
     };
     let cfg = match UnifiedAudioConfig::from_model_dir(&dir) {
