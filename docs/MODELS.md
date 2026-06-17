@@ -83,7 +83,7 @@ A converting or new architecture supplies only:
 | `Qwen3VLMoeForConditionalGeneration` | `Architecture::Qwen3VlMoe` | text + image | `bf16` | config | green |
 | `Gemma3ForConditionalGeneration` | `Architecture::Gemma3` | text + image | `Planar` | `KV_MAX_SEQ_DEFAULT` | green |
 | `Gemma4ForConditionalGeneration` | `Architecture::Gemma4` | text + image + audio | `K8V8` / `Planar` / `K8V4` | config | green |
-| `Gemma4UnifiedForConditionalGeneration` | `Architecture::Gemma4` (alias) | text (12B; vision/audio not yet) | `K8V8` | config | green |
+| `Gemma4UnifiedForConditionalGeneration` | `Architecture::Gemma4` (alias) | text + image (12B; audio not yet) | `K8V8` | config | green |
 | `LagunaForCausalLM` | `Architecture::Laguna` | text | `K8V8` | `KV_MAX_SEQ_DEFAULT` | green |
 | `BitNetForCausalLM` | `Architecture::BitNet` | text | `K8V8` | 4 096 | green |
 | `JinaEmbeddingsV4Model` | (encoder — no enum variant) | text + image | n/a | 128 000 | green |
@@ -645,9 +645,12 @@ audio fields under `audio_config`.
 The 12B snapshots declare `architectures[0] = "Gemma4UnifiedForConditionalGeneration"`
 — an encoder-free multimodal variant whose **text** decoder is identical to
 Gemma4 (dense, `attention_k_eq_v`, no per-layer-input, no MoE). rMLX aliases the
-arch string to the Gemma4 text loader; the multimodal-embedder tensors
-(`embed_vision`/`embed_audio`/`vision_embedder.*`) are not read, so image/audio
-input is not yet wired for 12B (text serves end-to-end).
+arch string to the Gemma4 text loader for the decoder, and routes **vision**
+through a dedicated encoder-free embedder (no SigLIP tower; see *Unified
+(encoder-free) vision* below). **Audio** is not yet wired for 12B — the unified
+audio front-end (`embed_audio` early-fusion) is a follow-up; the existing
+`audio_tower.*` Conformer loader does not match the unified `embed_audio.*`
+weights, so audio input is disabled on 12B (text + image serve end-to-end).
 
 Text serves correctly at **all weight quants**, including the mixed 4/8-bit QAT
 snapshots (`gemma-4-12B-it-qat-4bit` affine, `gemma-4-12B-it-qat-mxfp4`): their
@@ -752,6 +755,42 @@ shared KV to consumer layers, so `Mixed` mode also works.
 Text, image, and audio input. rMLX implements all three towers:
 - Vision: SigLIP-style ViT + VisionPooler + soft-token scatter.
 - Audio: Conformer encoder + output projection + scatter.
+
+### Unified (encoder-free) vision — `Gemma4UnifiedForConditionalGeneration` (12B)
+
+The unified 12B has **no SigLIP `vision_tower`**. Vision is early-fusion: raw
+pixel patches are projected straight into the shared 48-layer LM hidden space
+(`mm_embed_dim = 3840`) as `num_soft_tokens` soft tokens. rMLX dispatches on
+`architectures[0]` (`is_unified_arch`) and loads
+`crates/rmlx-models/src/gemma4/vision/unified.rs` instead of the tower loader;
+the Gemma4 text decoder is reused unchanged.
+
+Per-image pipeline (faithful port of HF `gemma4_unified`
+`Gemma4UnifiedVisionEmbedder` + `Gemma4UnifiedImageProcessor`):
+
+1. Shared Gemma4 preprocess: aspect-ratio resize (mult of `model_patch_size=48`)
+   + rescale to `[0,1]` (`do_normalize=false`).
+2. Host patchify into 16px teacher patches (`[ry, rx, ch]`), then
+   `patches_merge`: each `3×3` (`pooling_kernel_size`) group becomes one 48×48
+   model patch (`patch_dim = 48²·3 = 6912`), interior laid out `[ky, ry, kx, rx,
+   ch]` so the model patch is a *contiguous* sub-image; model-patch position =
+   `(min teacher_x // k, min teacher_y // k)`.
+3. On-device: `patch_ln1` (LayerNorm 6912) → `patch_dense` (quantized Linear
+   6912→3840, +bias) → `patch_ln2` (LayerNorm 3840).
+4. Factorized 2D positional embedding: `pos_embedding[x, 0, :] +
+   pos_embedding[y, 1, :]` (table `[mm_posemb_size=1120, 2, 3840]`), added then
+   `pos_norm` (LayerNorm 3840).
+5. `embed_vision`: `RMSNormNoScale → embedding_projection` (3840 → text hidden) —
+   the same [`MultimodalEmbedder`] the tower path reuses.
+6. Scatter the soft tokens at the image-token run in `inputs_embeds`
+   (`build_unified_inputs_embeds`), then run the shared text decoder from embeds.
+
+`patch_ln1/ln2/pos_norm` are true **LayerNorm** (mean-subtraction, weight+bias),
+not RMSNorm — verified against the snapshot's `.weight`+`.bias` tensors and the
+upstream class. Color, spatial layout (4-quadrant, left/right/top/bottom), and
+object counting are exact on the real 12B; fine-grained OCR is weaker than the
+e4b SigLIP tower — an architectural property of the encoder-free 35M projection
+(it lacks the semantic richness of a full vision encoder), not a port defect.
 
 ### Maximum context
 
