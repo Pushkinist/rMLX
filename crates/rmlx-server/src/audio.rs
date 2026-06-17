@@ -61,8 +61,8 @@ use axum::extract::{Multipart, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use rmlx_audio::mel::MelExtractor;
 use rmlx_audio::tokenizer::{WhisperTask, WhisperTokenizer};
+use rmlx_audio::transcribe::{TranscribeOptions, Transcriber};
 use rmlx_audio::wav::WavDecoder;
 use rmlx_audio::whisper::WhisperModel;
 use rmlx_mlx::Device;
@@ -132,6 +132,15 @@ struct TranscriptionResponse {
     text: String,
 }
 
+/// One segment in a `verbose_json` response.
+#[derive(Debug, Serialize)]
+struct SegmentJson {
+    id: usize,
+    start: f32,
+    end: f32,
+    text: String,
+}
+
 /// `verbose_json` response with metadata.
 #[derive(Debug, Serialize)]
 struct VerboseTranscriptionResponse {
@@ -139,6 +148,7 @@ struct VerboseTranscriptionResponse {
     language: String,
     duration: f32,
     text: String,
+    segments: Vec<SegmentJson>,
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -239,10 +249,11 @@ async fn handle_audio(state: AppState, mut multipart: Multipart, task: WhisperTa
     let metrics_arc = state.metrics.clone();
     let model_path_str = model_path.to_string_lossy().into_owned();
 
-    // Clone the shared multimodal cache for the blocking task. The
-    // Whisper encoder output is cached keyed on the post-decode PCM bytes
-    // + sample rate so an identical waveform skips both mel + encoder.
-    let mm_cache = Arc::clone(&state.mm_cache);
+    // NOTE: the per-request multimodal encoder cache (`state.mm_cache`) is not
+    // used by the long-form path — the transcription engine re-encodes per 30 s
+    // window internally, so a single full-file encoder-output cache entry no
+    // longer applies. Per-window caching can be reintroduced inside the engine
+    // if profiling shows it pays off.
 
     let result = tokio::task::spawn_blocking(move || {
         // Hold the GPU admission guard for the duration of Whisper decode.
@@ -292,134 +303,49 @@ async fn handle_audio(state: AppState, mut multipart: Multipart, task: WhisperTa
             }
         };
 
-        // Decode audio.
-        let (samples, sample_rate) =
+        // Decode audio → mono f32 at native rate, then resample to 16 kHz if needed.
+        let (raw_samples, sample_rate) =
             WavDecoder::decode(&audio_bytes).map_err(|e| format!("audio decode: {e}"))?;
-
-        if sample_rate != rmlx_audio::mel::SAMPLE_RATE {
-            return Err(format!(
-                "audio must be 16 kHz (got {sample_rate} Hz); resample before submitting"
-            ));
-        }
+        let samples = rmlx_audio::transcribe::resample_to_16k(&raw_samples, sample_rate);
 
         // Audio duration in seconds (for RTF calculation).
-        let audio_dur_secs = samples.len() as f64 / f64::from(sample_rate);
+        let audio_dur_secs = samples.len() as f64 / f64::from(rmlx_audio::mel::SAMPLE_RATE);
 
-        // Precompute the cache key from the PCM bytes + sample rate.
-        // Mel + encode are skipped on a hit; the cached entry is
-        // `[1, n_audio_ctx, n_state]` — the Whisper encoder output that the
-        // decoder consumes verbatim.
-        let mm_key = if mm_cache.is_disabled() {
-            None
-        } else {
-            let key_bytes = rmlx_models::multimodal_cache::pcm_f32_bytes(&samples);
-            Some(rmlx_models::multimodal_cache::MmCacheKey::audio_key(
-                key_bytes,
-                sample_rate,
-                rmlx_models::multimodal_cache::MmDtype::F32,
-                1,
-            ))
-        };
+        // Build the long-form transcriber (shared engine with `rmlx transcribe`).
+        let transcriber = Transcriber::new(Arc::clone(&model), Arc::clone(&tokenizer))
+            .map_err(|e| format!("transcriber init: {e}"))?;
 
-        // Encode + decode timing (for RTF and first-chunk latency).
-        let t_encode_start = std::time::Instant::now();
-
-        let (encoder_out, encode_ms) = if let Some(key) = &mm_key {
-            if let Some(cached) = mm_cache.get(key) {
-                let elapsed_ms = t_encode_start.elapsed().as_secs_f64() * 1_000.0;
-                tracing::info!(
-                    key_hex = %key.short_hex(),
-                    "whisper encoder cache hit; skipped mel + encode"
-                );
-                (cached, elapsed_ms)
-            } else {
-                // Cache miss: run mel + encode, then insert.
-                let extractor =
-                    MelExtractor::new(128).map_err(|e| format!("mel extractor: {e}"))?;
-                let mel_frames = extractor
-                    .extract(&samples)
-                    .map_err(|e| format!("mel extraction: {e}"))?;
-                let computed = model
-                    .encode_mel(&mel_frames, device)
-                    .map_err(|e| format!("encode: {e}"))?;
-                let elapsed_ms = t_encode_start.elapsed().as_secs_f64() * 1_000.0;
-                match rmlx_models::multimodal_cache::array_byte_size(&computed) {
-                    Ok(sz) => {
-                        if let Ok(clone) = computed.try_clone() {
-                            mm_cache.put(*key, clone, sz);
-                        }
-                    }
-                    Err(e) => tracing::warn!(error = %e, "mm_cache: whisper encoder byte_size failed; not caching"),
-                }
-                (computed, elapsed_ms)
-            }
-        } else {
-            // Cache disabled — original path.
-            let extractor = MelExtractor::new(128).map_err(|e| format!("mel extractor: {e}"))?;
-            let mel_frames = extractor
-                .extract(&samples)
-                .map_err(|e| format!("mel extraction: {e}"))?;
-            let computed = model
-                .encode_mel(&mel_frames, device)
-                .map_err(|e| format!("encode: {e}"))?;
-            let elapsed_ms = t_encode_start.elapsed().as_secs_f64() * 1_000.0;
-            (computed, elapsed_ms)
-        };
-        // "first chunk" latency = mel + encode (prefill), before any decode step.
-        let first_chunk_ms = encode_ms;
-
-        // Language auto-detection: if caller did not specify a language (or passed
-        // "auto"), run a single SOT decoder step and pick the highest-probability
-        // language token (50259–50357). Falls back to English if detection fails.
-        let (sot, resolved_lang) = if language == "auto" {
-            let lang_tok = model
-                .detect_language(&encoder_out, device)
-                .unwrap_or(50_259_u32); // fallback to English
-            debug!(lang_tok, "auto-detected language token");
-            (
-                tokenizer.sot_sequence_from_tok(lang_tok, task, false),
-                format!("lang_tok={lang_tok}"),
-            )
-        } else {
-            (
-                tokenizer.sot_sequence(&language, task, false),
-                language.clone(),
-            )
+        let opts = TranscribeOptions {
+            language: language.clone(),
+            task,
+            temperature,
+            condition_on_previous_text: true,
         };
 
         let t_decode_start = std::time::Instant::now();
-
-        // Decode.
-        let tokens = model
-            .greedy_decode(&encoder_out, &sot, 224, temperature, device)
-            .map_err(|e| format!("decode: {e}"))?;
-
+        let transcription = transcriber
+            .transcribe(&samples, &opts, device)
+            .map_err(|e| format!("transcribe: {e}"))?;
         let decode_ms = t_decode_start.elapsed().as_secs_f64() * 1_000.0;
-        let total_inference_ms = encode_ms + decode_ms;
+
         let rtf = if audio_dur_secs > 0.0 {
-            total_inference_ms / 1_000.0 / audio_dur_secs
+            decode_ms / 1_000.0 / audio_dur_secs
         } else {
             0.0
         };
 
         info!(
-            encode_ms = encode_ms as u64,
             decode_ms = decode_ms as u64,
             audio_dur_secs,
             rtf,
+            n_segments = transcription.segments.len(),
             "audio inference timing"
         );
-
-        // Convert tokens to text.
-        let text = tokenizer
-            .decode(&tokens)
-            .map_err(|e| format!("token decode: {e}"))?;
 
         // Emit metrics to the events DB.
         if let Some(sink) = &metrics_arc {
             let notes = format!("task={task:?}");
             let metrics_to_record: &[(&str, &str, f64)] = &[
-                ("audio_first_chunk_ms", "ms", first_chunk_ms),
                 ("audio_decode_ms", "ms", decode_ms),
                 ("audio_rtf", "ratio", rtf),
             ];
@@ -452,15 +378,18 @@ async fn handle_audio(state: AppState, mut multipart: Multipart, task: WhisperTa
             }
         }
 
-        Ok::<(String, String), String>((text, resolved_lang))
+        Ok::<rmlx_audio::transcribe::Transcription, String>(transcription)
     })
     .await;
 
     match result {
-        Ok(Ok((text, resolved_lang))) => {
-            let text = text.trim().to_owned();
-            info!(chars = text.len(), "transcription complete");
-            build_response(&text, &resolved_lang, task, response_format)
+        Ok(Ok(transcription)) => {
+            info!(
+                chars = transcription.text.len(),
+                segments = transcription.segments.len(),
+                "transcription complete"
+            );
+            build_response(&transcription, task, response_format)
         }
         Ok(Err(msg)) => {
             warn!(error = msg, "transcription failed");
@@ -573,11 +502,12 @@ async fn parse_multipart(multipart: &mut Multipart) -> Result<AudioFormFields, S
 // ── Response builder ──────────────────────────────────────────────────────────
 
 fn build_response(
-    text: &str,
-    language: &str,
+    transcription: &rmlx_audio::transcribe::Transcription,
     task: WhisperTask,
     format: ResponseFormat,
 ) -> Response {
+    use rmlx_audio::transcribe::{render, OutputFormat};
+    let text = transcription.text.trim();
     match format {
         ResponseFormat::Text => (StatusCode::OK, text.to_owned()).into_response(),
         ResponseFormat::VerboseJson => {
@@ -586,21 +516,28 @@ fn build_response(
                     WhisperTask::Transcribe => "transcribe".to_owned(),
                     WhisperTask::Translate => "translate".to_owned(),
                 },
-                language: language.to_owned(),
-                // Duration is unknown without timestamps; 0.0 is a valid placeholder.
-                duration: 0.0,
+                language: transcription.language.clone(),
+                duration: transcription.duration,
                 text: text.to_owned(),
+                segments: transcription
+                    .segments
+                    .iter()
+                    .enumerate()
+                    .map(|(id, s)| SegmentJson {
+                        id,
+                        start: s.start,
+                        end: s.end,
+                        text: s.text.clone(),
+                    })
+                    .collect(),
             };
             Json(body).into_response()
         }
         ResponseFormat::Srt => {
-            // Minimal SRT with no timestamps (v1 has no word-level timing).
-            let srt = format!("1\n00:00:00,000 --> 00:00:30,000\n{text}\n\n");
-            (StatusCode::OK, srt).into_response()
+            (StatusCode::OK, render(transcription, OutputFormat::Srt)).into_response()
         }
         ResponseFormat::Vtt => {
-            let vtt = format!("WEBVTT\n\n00:00.000 --> 00:30.000\n{text}\n\n");
-            (StatusCode::OK, vtt).into_response()
+            (StatusCode::OK, render(transcription, OutputFormat::Vtt)).into_response()
         }
         ResponseFormat::Json => Json(TranscriptionResponse {
             text: text.to_owned(),

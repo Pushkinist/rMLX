@@ -14,20 +14,29 @@
 //!
 //! ## Special token IDs (locked to `openai/whisper-large-v3`)
 //!
-//! All values verified against `WhisperTokenizerFast.from_pretrained` output:
+//! All values verified against the shipped `tokenizer.json` `added_tokens`
+//! table. **large-v3 has 100 language slots** (`<|en|>`=50259 … `<|yue|>`=50358),
+//! one more than v1/v2 — this shifts every special after the language block up
+//! by one vs the v2 layout. Getting these wrong made the decoder emit the wrong
+//! task token and treat `<|notimestamps|>` as the timestamp-begin sentinel,
+//! producing empty / garbage transcripts.
 //!
 //! | Token | ID |
 //! |---|---|
 //! | `<|endoftext|>` (eot) | 50 257 |
 //! | `<|startoftranscript|>` (sot) | 50 258 |
 //! | `<|en|>` | 50 259 |
-//! | `<|translate|>` | 50 358 |
-//! | `<|transcribe|>` | 50 359 |
-//! | `<|nospeech|>` | 50 362 |
-//! | `<|notimestamps|>` | 50 363 |
-//! | `<|0.00|>` (timestamp_begin) | 50 364 |
+//! | `<|yue|>` (last language) | 50 358 |
+//! | `<|translate|>` | 50 359 |
+//! | `<|transcribe|>` | 50 360 |
+//! | `<|startoflm|>` | 50 361 |
+//! | `<|startofprev|>` | 50 362 |
+//! | `<|nospeech|>` | 50 363 |
+//! | `<|notimestamps|>` | 50 364 |
+//! | `<|0.00|>` (timestamp_begin) | 50 365 |
 //!
-//! Total vocabulary: 51 866 tokens (50 257 base GPT-2 + 1 609 added).
+//! Total vocabulary: 51 866 tokens (50 257 base GPT-2 + 1 609 added; the last
+//! timestamp `<|30.00|>` is 51 865).
 //!
 //! ## Tokenizer loading
 //!
@@ -49,16 +58,22 @@ pub const TOK_EOT: u32 = 50_257;
 pub const TOK_SOT: u32 = 50_258;
 /// English language token (`<|en|>`).
 pub const TOK_EN: u32 = 50_259;
+/// Last language token (`<|yue|>`). large-v3 has 100 languages (50259..=50358).
+pub const TOK_LANG_LAST: u32 = 50_358;
 /// Translate task token (`<|translate|>`).
-pub const TOK_TRANSLATE: u32 = 50_358;
+pub const TOK_TRANSLATE: u32 = 50_359;
 /// Transcribe task token (`<|transcribe|>`).
-pub const TOK_TRANSCRIBE: u32 = 50_359;
+pub const TOK_TRANSCRIBE: u32 = 50_360;
+/// Start-of-LM token (`<|startoflm|>`).
+pub const TOK_SOT_LM: u32 = 50_361;
+/// Start-of-previous-context token (`<|startofprev|>`), for prompt conditioning.
+pub const TOK_SOT_PREV: u32 = 50_362;
 /// No-speech token (`<|nospeech|>`).
-pub const TOK_NOSPEECH: u32 = 50_362;
+pub const TOK_NOSPEECH: u32 = 50_363;
 /// No-timestamps token (`<|notimestamps|>`).
-pub const TOK_NO_TIMESTAMPS: u32 = 50_363;
-/// First timestamp token `<|0.00|>`.
-pub const TOK_TIMESTAMP_BEGIN: u32 = 50_364;
+pub const TOK_NO_TIMESTAMPS: u32 = 50_364;
+/// First timestamp token `<|0.00|>`. Timestamps run 50365..=51865 in 0.02 s steps.
+pub const TOK_TIMESTAMP_BEGIN: u32 = 50_365;
 
 /// Language token IDs for the 99 supported languages.
 ///
@@ -226,6 +241,70 @@ impl WhisperTokenizer {
             .encode(text, false)
             .map_err(|e| TokenizerError::Encode(e.to_string()))?;
         Ok(enc.get_ids().to_vec())
+    }
+
+    /// Derive the Whisper non-speech / special suppression token set from the
+    /// loaded tokenizer.
+    ///
+    /// This is a faithful port of openai-whisper's `Tokenizer.non_speech_tokens`
+    /// plus `_get_suppress_tokens`: the non-speech set is computed by BPE-encoding
+    /// a fixed list of punctuation / symbol strings and keeping the ids that
+    /// encode to a single token (general — no hardcoded magic id list). On top of
+    /// that we always suppress the structural specials (`SOT`, `TRANSCRIBE`,
+    /// `TRANSLATE`, `NOSPEECH`) so they can never be emitted as content.
+    ///
+    /// The returned set is sorted+deduplicated and intended to be applied as a
+    /// logit mask at every decode step.
+    pub fn suppress_tokens(&self) -> Vec<u32> {
+        // openai-whisper symbol list (`whisper/tokenizer.py::non_speech_tokens`).
+        // Each char of the first group is a standalone symbol; the second group
+        // is space-separated multi-char symbols.
+        const SYMBOL_CHARS: &str = "\"#()*+/:;<=>@[\\]^_`{|}~「」『』";
+        const SYMBOL_WORDS: &str =
+            "<< >> <<< >>> -- --- -( -[ (' (\" (( )) ((( ))) [[ ]] {{ }} ♪♪ ♪♪♪";
+        // "Miscellaneous" musical symbols: each is forced in even when it
+        // BPE-splits into multiple tokens (matches the reference).
+        const MISC: &str = "♩♪♫♬♭♮♯";
+
+        let mut set: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+
+        // Reference seeds the set with the first token of " -" and " '".
+        for seed in [" -", " '"] {
+            if let Ok(ids) = self.encode(seed) {
+                if let Some(&first) = ids.first() {
+                    set.insert(first);
+                }
+            }
+        }
+
+        let misc: std::collections::BTreeSet<char> = MISC.chars().collect();
+        let symbols: Vec<String> = SYMBOL_CHARS
+            .chars()
+            .map(|c| c.to_string())
+            .chain(SYMBOL_WORDS.split(' ').map(str::to_owned))
+            .chain(MISC.chars().map(|c| c.to_string()))
+            .collect();
+
+        for symbol in &symbols {
+            let is_misc = symbol.chars().count() == 1
+                && symbol.chars().next().is_some_and(|c| misc.contains(&c));
+            for variant in [symbol.clone(), format!(" {symbol}")] {
+                if let Ok(ids) = self.encode(&variant) {
+                    if (ids.len() == 1 || is_misc) && !ids.is_empty() {
+                        if let Some(&first) = ids.first() {
+                            set.insert(first);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Structural specials that must never appear in content.
+        for t in [TOK_SOT, TOK_TRANSCRIBE, TOK_TRANSLATE, TOK_NOSPEECH] {
+            set.insert(t);
+        }
+
+        set.into_iter().collect()
     }
 
     /// Decode token IDs back to text, skipping tokens ≥ `TOK_EOT` (specials).

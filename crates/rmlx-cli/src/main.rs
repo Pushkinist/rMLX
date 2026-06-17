@@ -769,6 +769,42 @@ enum Cmd {
         #[arg(long, env = "RMLX_YARN_ORIGINAL_MAX", value_name = "U32")]
         yarn_original_max: Option<u32>,
     },
+    /// Transcribe an audio file to text / subtitles (speech-to-text).
+    ///
+    /// Arch-dispatched on the snapshot's `config.json` (Whisper today; the
+    /// dispatch is a seam for future ASR architectures). The input container is
+    /// decoded and resampled to 16 kHz mono internally, so any
+    /// `.m4a`/`.wav`/`.mp3`/`.flac`/… works directly. Output goes to stdout, or
+    /// to `--output` when given.
+    Transcribe {
+        /// Input audio file (any Symphonia-supported container).
+        #[arg(value_name = "AUDIO")]
+        audio: PathBuf,
+        /// Model snapshot directory (Whisper). Env: `RMLX_WHISPER_MODEL_PATH`.
+        #[arg(long, env = "RMLX_WHISPER_MODEL_PATH", value_name = "PATH")]
+        model: PathBuf,
+        /// Companion tokenizer directory. Whisper snapshots ship no
+        /// `tokenizer.json`; point this at the `openai/whisper-large-v3`
+        /// tokenizer dir. Env: `RMLX_WHISPER_TOKENIZER_PATH`. Falls back to the
+        /// model dir when absent.
+        #[arg(long, env = "RMLX_WHISPER_TOKENIZER_PATH", value_name = "PATH")]
+        tokenizer: Option<PathBuf>,
+        /// Output format: txt | json | srt | vtt.
+        #[arg(long, default_value = "txt")]
+        format: String,
+        /// Language code (`en`, `fr`, …) or `auto` for detection.
+        #[arg(long, default_value = "auto")]
+        language: String,
+        /// Translate to English instead of transcribing in the source language.
+        #[arg(long, default_value_t = false)]
+        translate: bool,
+        /// Write output to this file instead of stdout.
+        #[arg(long, value_name = "PATH")]
+        output: Option<PathBuf>,
+        /// Device: "cpu" or "gpu" (default "gpu").
+        #[arg(long, default_value = "gpu")]
+        device: String,
+    },
     /// Print arch + quant info for a snapshot, no inference.
     Info {
         /// Path to the model snapshot directory.
@@ -1664,6 +1700,38 @@ fn main() -> Result<()> {
             };
             let _claim = acquire_claim_for_device(dev, SENTINEL_PORT)?;
             println!("rmlx chat   model={}  device={device}", model.display());
+        }
+        Cmd::Transcribe {
+            audio,
+            model,
+            tokenizer,
+            format,
+            language,
+            translate,
+            output,
+            device,
+        } => {
+            let dev = parse_device(&device)?;
+            // ASR holds Metal; acquire the single-MLX claim like the other
+            // model-loading subcommands.
+            let _claim = acquire_claim_for_device(dev, SENTINEL_PORT)?;
+            let args = commands::transcribe::TranscribeArgs {
+                audio: &audio,
+                model: &model,
+                tokenizer: tokenizer.as_deref(),
+                format: &format,
+                language: &language,
+                translate,
+            };
+            let rendered = commands::transcribe::run_transcribe(&args, dev)?;
+            match output {
+                Some(path) => {
+                    std::fs::write(&path, rendered.as_bytes())
+                        .map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
+                    println!("wrote {}", path.display());
+                }
+                None => println!("{rendered}"),
+            }
         }
         Cmd::Info {
             model,

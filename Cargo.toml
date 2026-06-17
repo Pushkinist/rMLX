@@ -123,14 +123,17 @@ parking_lot = "0.12"
 # Default features fine (SIMD acceleration on aarch64 is always-on in 6.x).
 rustfft = "6.4"
 
-# Pure-Rust audio decode for WAV + MP3.
-# wav  — RIFF/WAVE container format reader (symphonia-format-riff).
-# pcm  — PCM codec required to decode the audio inside WAV files
-#         (symphonia-codec-pcm; NOT included by wav alone).
-# mp3  — MPEG Layer 3 codec (symphonia-bundle-mp3/mp3).
-# default-features=false drops AIFF/OGG/FLAC/AAC/MKV/ADPCM from the default
-# registry so only the three features we need are compiled in.
-symphonia = { version = "0.6", default-features = false, features = ["wav", "pcm", "mp3"] }
+# Pure-Rust audio decode for WAV + MP3 + AAC/MP4 (`.m4a`).
+# wav    — RIFF/WAVE container format reader (symphonia-format-riff).
+# pcm    — PCM codec required to decode the audio inside WAV files
+#           (symphonia-codec-pcm; NOT included by wav alone).
+# mp3    — MPEG Layer 3 codec (symphonia-bundle-mp3/mp3).
+# isomp4 — ISO-BMFF / MP4 container reader (needed for `.m4a`, `.mp4`).
+# aac    — AAC codec (the audio inside most `.m4a` recordings).
+# These are all features of the existing `symphonia` dep — no new crate. They
+# let `rmlx transcribe` / the audio endpoint ingest real meeting recordings
+# (`.m4a`) directly. default-features=false still drops AIFF/OGG/FLAC/MKV/ADPCM.
+symphonia = { version = "0.6", default-features = false, features = ["wav", "pcm", "mp3", "isomp4", "aac"] }
 
 # Testing
 tempfile = "3"

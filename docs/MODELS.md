@@ -1211,12 +1211,23 @@ architectures above, Whisper is served via dedicated audio endpoints, not
 
 | Snapshot path (relative to `$RMLX_O_MODELS_ROOT`) | Format | Smoke status |
 |---|---|---|
-| `mlx-community__whisper-large-v3-mlx` | `.npz` weights + `config.json` | pending (requires real audio) |
+| `mlx-community__whisper-large-v3-mlx` | `.npz` weights + `config.json` | green (full 48-min real-audio regression, normalized WER ≈ 0.08) |
 
 The mlx-community snapshot ships **without** a tokenizer. Use the companion
 `openai/whisper-large-v3` HuggingFace tokenizer directory (contains
-`tokenizer.json`) and set `--whisper-tokenizer-path` or
-`RMLX_WHISPER_TOKENIZER_PATH`.
+`tokenizer.json`) and set `--whisper-tokenizer-path` /
+`RMLX_WHISPER_TOKENIZER_PATH`, or pass `--tokenizer` to `rmlx transcribe`.
+
+#### Special-token layout (large-v3)
+
+large-v3 has **100** language slots (`<|en|>`=50259 … `<|yue|>`=50358), one more
+than v1/v2. This shifts every special after the language block up by one:
+`<|translate|>`=50359, `<|transcribe|>`=50360, `<|startoflm|>`=50361,
+`<|startofprev|>`=50362, `<|nospeech|>`=50363, `<|notimestamps|>`=50364, and
+timestamp tokens `<|0.00|>`=50365 … `<|30.00|>`=51865. Getting these off by one
+(the v2 layout) makes the decoder emit the wrong task token and treat
+`<|notimestamps|>` as the timestamp sentinel — the root cause of the empty /
+garbage transcripts fixed in this release.
 
 ### Config schema
 
@@ -1244,22 +1255,38 @@ output projection.
 
 ### Inference
 
-The server calls `WhisperModel::load` on the first audio request and caches
-the loaded model for the process lifetime. The inference path is:
+Both the audio endpoint and `rmlx transcribe` run through one shared long-form
+engine (`rmlx_audio::transcribe::Transcriber`). The path is:
 
-1. Audio decode via Symphonia → mono f32 at 16 kHz.
-2. Log-mel spectrogram (`MelExtractor`, 128 bins, 25 ms frame, 10 ms hop).
-3. Encoder forward (`encode_mel`) → encoder output `[1, T/2, 1280]`.
-4. Decoder prefill with SOT sequence: `[SOT, lang_token, task_token, no_timestamps]`.
-5. Greedy decode until EOT or `max_tokens` (default 224).
-6. BPE decode via `WhisperTokenizer` (from `tokenizer.json`).
+1. Audio decode via Symphonia → mono f32 (any container, incl. AAC/`.m4a`);
+   downmix stereo and resample to 16 kHz internally.
+2. Walk the audio in 30 s windows. Per window: log-mel (`MelExtractor`, 128 bins),
+   encoder forward (`encode_mel`), then greedy decode in **timestamp mode**.
+3. Each decode step applies the openai-whisper logit-filter chain —
+   `SuppressBlank` (first step) + `SuppressTokens` (tokenizer-derived non-speech /
+   special set) + `ApplyTimestampRules` (pairing, monotonic, BOS, timestamp/text
+   tie-break). The suppress set is derived from the loaded tokenizer, not a
+   hardcoded id list.
+4. Parse timestamp tokens into segments with real cumulative times; advance the
+   window seek by the last timestamp; condition the next window on the previous
+   window's text (`<|startofprev|>` prompt).
+5. BPE decode via `WhisperTokenizer`; emit `txt` / `json` / `srt` / `vtt`.
 
-Temperature > 0 applies temperature-scaled softmax before argmax.
+Decoding is greedy at temperature 0 — deterministic across runs.
 
-### Smoke probe
+### Smoke probe / regression
 
-Full smoke requires a WAV file and the model + tokenizer on disk. Gate with
-`RMLX_TEST_MODEL_WHISPER=/path/to/snapshot RMLX_WHISPER_TOKENIZER_PATH=/path/to/tok cargo test -p rmlx-audio`.
+Integration tests live in `crates/rmlx-audio/tests/transcribe.rs` and resolve the
+Whisper snapshot + tokenizer from **`RMLX_O_MODELS_ROOT` auto-discovery** (the same
+convention as `make model-check-full`) — no bespoke env var. They **skip
+gracefully** when the model or fixtures are absent:
+
+- `say_clip_deterministic` — synthesises a known sentence with macOS `say`+`ffmpeg`,
+  asserts low WER + byte-identical output across runs.
+- `long_form_regression` — scans the gitignored
+  `crates/rmlx-audio/tests/fixtures/` dir for any `*.{m4a,wav,mp3,…}` with a
+  sibling `*.transcript.vtt`, transcribes the FULL file, and asserts normalized
+  WER ≤ 0.30. Drop your own audio + reference VTT into that dir to enable it.
 
 ---
 

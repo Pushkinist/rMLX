@@ -204,6 +204,41 @@ rmlx chat --model /path/to/snapshot --device cpu --kv-quant k8v4
 
 ---
 
+### `transcribe`
+
+Speech-to-text. Transcribes an audio file to text or subtitles using the shared
+long-form transcription engine (the same core that backs
+`POST /v1/audio/transcriptions`). The backend is **arch-dispatched on the
+snapshot's `config.json`** — Whisper today (`model_type: "whisper"`), with a clean
+seam for future ASR architectures. The input container is decoded and resampled to
+16 kHz mono internally, so any `.m4a` / `.wav` / `.mp3` / `.flac` / … works
+directly (no manual ffmpeg pre-step needed). Decoding is greedy at temperature 0 —
+output is deterministic.
+
+```bash
+# Plain text to stdout
+rmlx transcribe meeting.m4a \
+  --model    $RMLX_O_MODELS_ROOT/mlx-community__whisper-large-v3-mlx \
+  --tokenizer $RMLX_O_MODELS_ROOT/openai__whisper-large-v3-tokenizer
+
+# WebVTT subtitles with real per-segment timestamps, written to a file
+rmlx transcribe meeting.m4a --model <whisper-snapshot> --tokenizer <tok-dir> \
+  --format vtt --output meeting.vtt
+```
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `<AUDIO>` | path | required | Input audio file (any Symphonia-supported container). |
+| `--model` | path | required | Model snapshot directory (Whisper). Env: `RMLX_WHISPER_MODEL_PATH`. |
+| `--tokenizer` | path | (model dir) | Companion tokenizer directory containing `tokenizer.json` (Whisper snapshots ship none; point at the `openai/whisper-large-v3` tokenizer). Env: `RMLX_WHISPER_TOKENIZER_PATH`. |
+| `--format` | `txt \| json \| srt \| vtt` | `txt` | Output format. `json` includes per-segment times; `srt`/`vtt` are multi-cue with real timestamps. |
+| `--language` | string | `auto` | BCP-47 language code (`en`, `fr`, …) or `auto` for detection. |
+| `--translate` | bool flag | off | Translate to English instead of transcribing in the source language. |
+| `--output` | path | (stdout) | Write the rendered output to this file instead of stdout. |
+| `--device` | `cpu \| gpu` | `gpu` | Inference device. Holds the single-MLX claim while running. |
+
+---
+
 ### `info`
 
 Prints architecture and quantization metadata for a model snapshot without

@@ -18,6 +18,19 @@ fn npy_dtype_f4() {
 }
 
 #[test]
+fn npy_dtype_bool_and_ints() {
+    // alignment_heads ships as a boolean (`b1`) mask — must parse, not error.
+    let hdr_bool = "{'descr': '|b1', 'fortran_order': False, 'shape': (20, 32), }";
+    assert_eq!(extract_npy_dtype(hdr_bool), Some(Dtype::U8));
+    let hdr_u1 = "{'descr': '|u1', 'fortran_order': False, 'shape': (10,), }";
+    assert_eq!(extract_npy_dtype(hdr_u1), Some(Dtype::U8));
+    let hdr_i4 = "{'descr': '<i4', 'fortran_order': False, 'shape': (4,), }";
+    assert_eq!(extract_npy_dtype(hdr_i4), Some(Dtype::I32));
+    let hdr_u4 = "{'descr': '<u4', 'fortran_order': False, 'shape': (4,), }";
+    assert_eq!(extract_npy_dtype(hdr_u4), Some(Dtype::U32));
+}
+
+#[test]
 fn npy_shape_1d() {
     let hdr = "{'descr': '<f2', 'fortran_order': False, 'shape': (1280,), }";
     assert_eq!(extract_npy_shape(hdr).unwrap(), vec![1280]);
