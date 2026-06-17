@@ -18,6 +18,7 @@ use rmlx_metrics::events::Measurement;
 
 use crate::openai::ItlSample;
 
+use super::audio::{build_audio_prompt, AudioBundle};
 use super::generator::Generator;
 use super::helpers::{
     compute_itl_stats, is_reconstructible_tool_marker, kv_quant_label, record_itl_percentiles,
@@ -76,6 +77,12 @@ pub struct ArchGenerator {
     /// `None` for text-only checkpoints (the image path is then rejected with
     /// a clear error). Wrapped in `Arc` so a clone moves into `spawn_blocking`.
     vision: Option<Arc<VisionBundle>>,
+    /// Gemma4 Conformer audio tower + multimodal embedder + USM feature
+    /// extractor, loaded once at startup when the snapshot ships an
+    /// `audio_config` + `audio_tower.*` weights. `None` for checkpoints without
+    /// an audio path (the `input_audio` path is then rejected with a clear
+    /// error). Wrapped in `Arc` so a clone moves into `spawn_blocking`.
+    audio: Option<Arc<AudioBundle>>,
     /// Shared multimodal encoder-output cache. `None` disables
     /// caching for this generator (e.g. unit-test stubs); production passes
     /// the `AppState.mm_cache` clone via `ModelLoadConfig`.
@@ -330,6 +337,28 @@ impl ArchGenerator {
             _ => None,
         };
 
+        // load the Gemma4 audio tower once when the snapshot ships an
+        // `audio_config` (+ `audio_tower.*` weights). Text-only / vision-only
+        // models return `None` here and the `input_audio` path is rejected at
+        // request time with a clear error. Only the Gemma4 architecture has a
+        // native audio tower today.
+        let audio: Option<Arc<AudioBundle>> = match &model {
+            rmlx_models::arch::Architecture::Gemma4(_) => {
+                match super::audio::load_gemma4_audio_bundle(model_dir) {
+                    Ok(Some(bundle)) => {
+                        tracing::info!(model_id = %model_id, "Gemma4 audio tower loaded (multimodal)");
+                        Some(Arc::new(bundle))
+                    }
+                    Ok(None) => None,
+                    Err(e) => {
+                        tracing::warn!(model_id = %model_id, error = %e, "audio tower load failed — audio input disabled");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
         // turn the SSD prompt-cache tier ON for this model if configured
         // (`--kv-ssd-cache-gb > 0`). No-op when the tier is OFF (the default):
         // the spiller / hydrator are never installed and decode is
@@ -380,6 +409,7 @@ impl ArchGenerator {
             effective_max_ctx,
             tokenizer_kind,
             vision,
+            audio,
             mm_cache: load_cfg.mm_cache.clone(),
         })
     }
@@ -466,6 +496,10 @@ impl Generator for ArchGenerator {
         // `req_images` is empty for text-only requests (zero extra work).
         let req_images = req.images.clone();
         let vision = self.vision.clone();
+        // base64 `input_audio` clips + the loaded audio bundle (clone of the Arc).
+        // `req_audio` is empty for non-audio requests (zero extra work).
+        let req_audio = req.audio_b64.clone();
+        let audio = self.audio.clone();
         let mm_cache = self.mm_cache.clone();
         // Issue #26: a per-request `kv_quant` override hot-swaps the KV codec on
         // the resident model. When present it takes precedence over the launch
@@ -899,6 +933,43 @@ impl Generator for ArchGenerator {
                     None
                 };
 
+            // audio path — decode the `input_audio` clip, expand the prompt with
+            // the audio soft-token block (`<|audio>` + T_sub×`<|audio|>` +
+            // `<audio|>`), run the Conformer tower, build the scatter-merged
+            // `inputs_embeds`, and decode from embeds. Routed through the same
+            // `generate_image` fused-embeds entry as vision (both carry the
+            // `(aug_ids, embeds, masked_ids)` triple). Submitting `input_audio`
+            // to a model without an audio tower returns a CLEAR error here
+            // (mirroring vision's no-tower rejection) — never a silent drop.
+            // Skipped entirely when images are present (image takes precedence).
+            let audio_inputs: Option<(Vec<u32>, rmlx_mlx::Array, rmlx_mlx::Array)> = if !req_audio
+                .is_empty()
+                && image_inputs.is_none()
+                && !qvl_image
+            {
+                if let Some(ab) = audio.as_ref() {
+                    match build_audio_prompt(model.as_ref(), ab, &req_audio, &prompt_tokens, device)
+                    {
+                        Ok(triple) => Some(triple),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "audio preprocessing failed");
+                            let _ = tx.blocking_send(Err(e));
+                            return;
+                        }
+                    }
+                } else {
+                    let _ = tx.blocking_send(Err(Error::Other(
+                        "this model does not accept audio input (no audio tower)".to_owned(),
+                    )));
+                    return;
+                }
+            } else {
+                None
+            };
+
+            // Image takes precedence over audio when both are present.
+            let multimodal_inputs = image_inputs.or(audio_inputs);
+
             let steps_result = if qvl_image {
                 // SAFETY: qvl_image is true only when vision.as_deref() matched
                 // Some(VisionBundle::Qwen3VlMoe{..}) two lines above, so this
@@ -938,7 +1009,7 @@ impl Generator for ArchGenerator {
                     mm_cache.as_deref(),
                 )
             } else {
-                match image_inputs {
+                match multimodal_inputs {
                     Some((aug_ids, embeds, masked_ids)) => model.generate_image(
                         &tokenizer,
                         &aug_ids,

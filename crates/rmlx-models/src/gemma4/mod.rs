@@ -37,7 +37,7 @@ pub(crate) mod prompt_cache;
 mod tests;
 mod vision;
 
-pub use audio::{load_audio_tower, AudioEncoder};
+pub use audio::{build_audio_inputs_embeds, load_audio_tower, AudioEncoder};
 pub use audio_feature_extractor::{
     AudioFeatError, AudioFeatureExtractorConfig, Gemma4AudioFeatureExtractor,
 };
@@ -53,5 +53,6 @@ pub use preprocessor::{
 pub use prompt_cache::read_cache_stats as gemma4_cache_stats;
 pub use prompt_cache::read_kv_cache_bytes as gemma4_kv_cache_bytes;
 pub use vision::{
-    build_inputs_embeds, load_vision_tower, MultimodalEmbedder, VisionModel, IMAGE_TOKEN_ID,
+    build_inputs_embeds, load_multimodal_embedder, load_vision_tower, MultimodalEmbedder,
+    VisionModel, IMAGE_TOKEN_ID,
 };

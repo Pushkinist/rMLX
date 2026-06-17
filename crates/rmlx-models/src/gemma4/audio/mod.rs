@@ -652,6 +652,25 @@ impl AudioEncoder {
         &self.cfg
     }
 
+    /// Number of audio soft tokens (`T_sub`) this tower emits for `n_mel_frames`
+    /// input log-mel frames.
+    ///
+    /// The two SSCP conv blocks each apply symmetric (1,1) time padding then a
+    /// stride-2, kernel-3 Conv2d, so each block maps `T -> floor((T - 1)/2) + 1`.
+    /// The server uses this to splice exactly `T_sub` `<|audio|>` placeholders
+    /// into the prompt so the scatter in [`build_audio_inputs_embeds`] aligns by
+    /// construction (mirrors the vision tower's known `num_soft_tokens`).
+    pub fn num_output_frames(&self, n_mel_frames: usize) -> usize {
+        fn conv_stride2(t: usize) -> usize {
+            // floor((t + 2*pad - kernel)/stride) + 1 with pad=1, kernel=3, stride=2.
+            if t == 0 {
+                return 0;
+            }
+            (t - 1) / 2 + 1
+        }
+        conv_stride2(conv_stride2(n_mel_frames))
+    }
+
     /// Build the `[chunk_size, context_size]` local causal+validity mask
     /// (1.0 = valid). Matches `_build_causal_valid_mask`.
     fn build_causal_valid_mask(&self, device: Device) -> Result<Array> {
@@ -868,6 +887,124 @@ pub fn load_audio_tower(model_dir: &Path, cfg: &Gemma4AudioConfig) -> Result<Aud
         layers,
         output_proj,
     })
+}
+
+// ---------------------------------------------------------------------------
+// build multimodal `inputs_embeds` (text + scattered audio features)
+// ---------------------------------------------------------------------------
+
+/// Build the merged `inputs_embeds` for a Gemma4 audio prompt.
+///
+/// Faithful host port of the audio branch of mlx-vlm
+/// `gemma4.py::Model.get_input_embeddings`:
+/// 1. `inputs_embeds = embed_tokens(input_ids) * embed_scale` (scaled text).
+/// 2. Run the Conformer audio tower over the log-mel features →
+///    `[1, T_sub, output_dim]`, then `embed_audio` → `[1, T_sub, hidden]` f32 →
+///    astype to the embedding dtype → scatter into `inputs_embeds` at the
+///    `audio_token_id` positions (the contiguous `<|audio|>` run in the prompt).
+/// 3. The per-layer-input ids mask the audio positions to `0` (mlx-vlm zeroes
+///    multimodal token ids before `get_per_layer_inputs`).
+///
+/// `audio_mel`: `[1, T, feature_size]` log-mel features.
+/// `audio_mel_mask`: `[1, T]` (1.0 = padding/invalid), the inverse of the
+/// feature-extractor attention mask (matching `~input_features_mask` upstream).
+///
+/// Returns `(inputs_embeds [1, seq, hidden], masked_ids [seq])`. Both feed
+/// [`super::model::Gemma4Text::forward_arr_embeds`] via `generate_image`.
+///
+/// Errors if the `audio_token_id` placeholder count in `input_ids` does not
+/// equal the audio tower's `T_sub` output frame count — a misalignment would
+/// scatter audio rows into the wrong positions and produce garbage output. The
+/// server side builds the prompt with exactly `T_sub` placeholders (computed by
+/// [`AudioEncoder::num_output_frames`]) so this is an invariant guard.
+#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+pub fn build_audio_inputs_embeds(
+    model: &super::model::Gemma4Text,
+    encoder: &AudioEncoder,
+    embedder: &super::vision::MultimodalEmbedder,
+    audio_mel: &Array,
+    audio_mel_mask: &Array,
+    audio_token_id: u32,
+    input_ids: &[u32],
+    device: Device,
+) -> Result<(Array, Array)> {
+    let hidden = model.cfg.hidden_size as i32;
+    let seq = input_ids.len();
+
+    // Locate the audio-token positions (one contiguous run per clip, in order).
+    let audio_positions: Vec<usize> = input_ids
+        .iter()
+        .enumerate()
+        .filter(|(_, &t)| t == audio_token_id)
+        .map(|(i, _)| i)
+        .collect();
+
+    // Encode: Conformer tower -> [1, T_sub, output_dim] -> embed_audio ->
+    // [1, T_sub, hidden] f32.
+    let enc = encoder.forward(audio_mel, audio_mel_mask, device)?;
+    let feats = embedder.forward(&enc, device)?;
+    let fs = feats.shape();
+    let t_sub = fs.get(1).copied().unwrap_or(0);
+    if fs.first().copied() != Some(1) || fs.get(2).copied() != Some(hidden) {
+        return Err(Error::Model(format!(
+            "gemma4 audio: audio feature shape {fs:?} != [1, T_sub, {hidden}]"
+        )));
+    }
+    if audio_positions.len() != t_sub as usize {
+        return Err(Error::Model(format!(
+            "gemma4 audio: {} audio-token ({audio_token_id}) positions in prompt != \
+             {t_sub} audio soft tokens (encoder output) — scatter would misalign",
+            audio_positions.len()
+        )));
+    }
+    // The audio run must be contiguous (the processor emits one `<|audio|>` run).
+    let first = audio_positions.first().copied().unwrap_or(0);
+    let contiguous = audio_positions
+        .iter()
+        .enumerate()
+        .all(|(k, &p)| p == first + k);
+    if !contiguous {
+        return Err(Error::Model(format!(
+            "gemma4 audio: audio-token positions are not contiguous (got {audio_positions:?})"
+        )));
+    }
+    info!(
+        audio_tokens = audio_positions.len(),
+        t_sub, seq, "gemma4 audio: building inputs_embeds (token count == soft tokens)"
+    );
+
+    // ---- scaled text embeddings: embed_tokens(ids) * sqrt(hidden) ----------
+    let ids_i32: Vec<i32> = input_ids.iter().map(|&x| x as i32).collect();
+    let ids_arr = Array::from_bytes(i32_bytes(&ids_i32), &[seq as i32], Dtype::I32)?;
+    let h_raw = model.embed_tokens.forward(&ids_arr, device)?;
+    let embed_scale = scalar_f32((model.cfg.hidden_size as f32).sqrt());
+    let mut embeds = multiply(&h_raw, &embed_scale, device)?;
+    embeds = embeds.reshape(&[1, seq as i32, hidden], device)?;
+    let embeds_dtype = embeds.dtype();
+
+    // astype to the embedding dtype (bf16) before scatter, then splice the
+    // contiguous audio run in one slice_update.
+    let feats = feats.astype(embeds_dtype, device)?;
+    embeds = embeds.slice_update(
+        &feats,
+        &[0, first as i32, 0],
+        &[1, (first + t_sub as usize) as i32, hidden],
+        &[1, 1, 1],
+        device,
+    )?;
+
+    // ---- masked ids for per-layer-input gating -----------------------------
+    let mut masked: Vec<i32> = ids_i32;
+    for &p in &audio_positions {
+        masked[p] = 0;
+    }
+    let masked_arr = Array::from_bytes(i32_bytes(&masked), &[seq as i32], Dtype::I32)?;
+
+    Ok((embeds, masked_arr))
 }
 
 /// Construct an [`AudioAttention`], precomputing scalar scales + inv-timescales.
