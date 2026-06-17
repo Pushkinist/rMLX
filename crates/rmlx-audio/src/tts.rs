@@ -1928,7 +1928,13 @@ impl TtsTokenizer {
                                 })
                                 .collect();
                             if !special_tokens.is_empty() {
-                                inner.add_special_tokens(&special_tokens);
+                                // tokenizers 0.21+ takes the tokens by value
+                                // (`impl IntoIterator<Item = AddedToken>`) and
+                                // returns the added count as a `Result`; the
+                                // local Vec is not used afterwards.
+                                inner
+                                    .add_special_tokens(special_tokens)
+                                    .map_err(|e| TtsError::Tokenizer(e.to_string()))?;
                             }
                         }
                     }
