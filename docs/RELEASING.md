@@ -50,14 +50,15 @@ crates are `publish = false`). There is no separate `VERSION` file.
    your authenticated identity + the public Rekor log — real provenance for
    the prebuilt binary. Consumer-side verification is in "Verify both install
    paths".
-8. **Formula url + sha256:** bump the `url` line in
-   `packaging/homebrew/rmlx.rb` to the new `v<version>` tag tarball, **then**
-   `make release-sha` (or `bash scripts/release/source_sha256.sh --write`) for
-   the sha256.
-   > ⚠️ `source_sha256.sh --write` patches **only the sha256, not the `url`
-   > version**. If you skip the manual url bump, the formula carries the new
-   > sha against the old tag's url and `brew install` fails with a sha
-   > mismatch. Always edit the `url` line yourself.
+8. **Formula url + sha256:** run `make release-sha` (or
+   `bash scripts/release/source_sha256.sh --write`) — it patches **both** the
+   `url` line in `packaging/homebrew/rmlx.rb` to the new `v<version>` tag
+   tarball **and** the `sha256`.
+   > GitHub generates the source archive on first access, so its sha256 can
+   > shift on the very first fetch right after a tag push. The
+   > `source_sha256.sh`-written value is usually the correct stable one — but
+   > re-fetch the archive 2-3× (`curl -fsSL .../archive/refs/tags/v<version>.tar.gz
+   > | shasum -a 256`) and confirm the digest is stable before trusting it.
    Commit the formula bump via a PR (`main` is ruleset-protected; see below).
 9. **Publish the tap:** `make tap-sync` (copies the formula into
    `Pushkinist/homebrew-rmlx` as `Formula/rmlx.rb` and pushes).
