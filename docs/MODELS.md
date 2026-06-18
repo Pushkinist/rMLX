@@ -456,6 +456,26 @@ size, video token id) but not yet exercised in rMLX.
 
 `max_position_embeddings` from `text_config`.
 
+Native Qwen3-VL image tiling produces thousands of image soft tokens (a
+2560×2560 image → ~6400 soft tokens at `patch_size=16`, `merge_size=2`), so the
+augmented image prompt routinely exceeds the lazy `KV_MAX_SEQ_DEFAULT = 4096`
+ring start. Both the image and text generate paths size the KV ring from the
+effective `--max-ctx` (via `kv_max_seq_and_ceiling`, same as the other arches):
+the ring grows lazily up to that ceiling so a prompt up to `--max-ctx` fits, and
+a prompt over the ceiling is rejected with a clean `context_overflow` rather
+than a `slice_update` broadcast error. Serve a long prompt with `--max-ctx N` ≥
+(soft tokens + text length).
+
+Both prefill paths are **chunked** (per-arch `prefill_chunk` = 512, plain GQA
+MoE — no GDN, so it tolerates the same chunk as Gemma4) and the vision tower
+evaluates per ViT block, so a long prompt does not run a single multi-thousand-
+token forward in one Metal command buffer. Note: the ViT runs **full attention
+over every image patch** for a single image (reference-faithful — mlx-vlm splits
+attention per image, which is one full block for one image). A very large image
+(tens of thousands of patches → an O(num_patches²) attention) can still overrun
+the ~10s Metal GPU watchdog on memory-constrained Apple Silicon; this is a
+vision-tower scaling limit, independent of the KV-cache sizing above.
+
 ### Special features
 
 - **3D M-RoPE** for spatial + temporal + text position encoding.

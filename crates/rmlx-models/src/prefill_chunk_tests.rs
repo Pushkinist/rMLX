@@ -11,6 +11,7 @@ fn defaults_match_recommendations() {
     }
     assert_eq!(arch_default("qwen3"), Some(256));
     assert_eq!(arch_default("qwen3_5_moe"), Some(64));
+    assert_eq!(arch_default("qwen3_vl_moe"), Some(512));
     assert_eq!(arch_default("gemma3"), Some(256));
     assert_eq!(arch_default("gemma4"), Some(512));
     assert_eq!(arch_default("qwen2"), Some(256));
@@ -47,13 +48,14 @@ fn module_key_for_class_maps_supported_classes() {
         "qwen3_5_moe"
     );
     assert_eq!(module_key_for_class("BitNetForCausalLM"), "bitnet");
-
-    // Unknown / single-shot-prefill classes → "" → FALLBACK chunk, never the
-    // oversized gemma4 default.
+    // Qwen3-VL-MoE chunks its image prefill (native tiling → thousands of soft
+    // tokens would trip the Metal watchdog in one forward).
     assert_eq!(
         module_key_for_class("Qwen3VLMoeForConditionalGeneration"),
-        ""
+        "qwen3_vl_moe"
     );
+
+    // Unknown classes → "" → FALLBACK chunk, never the oversized gemma4 default.
     assert_eq!(module_key_for_class("JinaEmbeddingsV4Model"), "");
     assert_eq!(module_key_for_class("TotallyUnknownArch"), "");
 }
