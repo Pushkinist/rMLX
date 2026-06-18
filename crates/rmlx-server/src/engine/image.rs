@@ -39,7 +39,11 @@ pub(crate) const GEMMA4_USER_TURN_OPENER: [u32; 3] = [105, 2364, 107];
 /// inserting after the prompt's leading BOS token.
 #[allow(
     clippy::indexing_slicing,
-    reason = "insert_at is bounded by prompt_tokens.len(): it is either 0/1 (after-BOS) or a window position plus the matched opener length, all within bounds"
+    reason = "insert_at is bounded by prompt_tokens.len(): it is either 0/1 (after-BOS) \
+              or a window position plus the matched opener length, all within bounds. \
+              The early-return to after_bos when turn_opener.is_empty() prevents windows(0) \
+              (which would panic); the turn_opener.len() > prompt_tokens.len() guard prevents \
+              the oversized-opener case where windows() would yield no results."
 )]
 pub(crate) fn splice_image_block(
     prompt_tokens: &[u32],
@@ -308,6 +312,11 @@ pub(crate) const QWEN3VL_VISION_END_ID: u32 = 151_653;
 /// Qwen3-VL-MoE `<|image_pad|>` token id (the scatter target).
 pub(crate) const QWEN3VL_IMAGE_PAD_ID: u32 = 151_655;
 
+/// Qwen3-VL-MoE user-turn opener `<|im_start|>user\n` (token ids 151644, 872, 198).
+/// The vision block splices in right after this, matching the mlx-vlm prompt format
+/// `<|im_start|>user\n<|vision_start|>...<|vision_end|><text><|im_end|>`.
+pub(crate) const QWEN3VL_USER_TURN_OPENER: [u32; 3] = [151_644, 872, 198];
+
 /// full Qwen3-VL-MoE image request: preprocess images, run the ViT,
 /// splice the per-image vision block (`<|vision_start|>` + N×`<|image_pad|>` +
 /// `<|vision_end|>`) after the prompt's leading token, then decode via the
@@ -485,11 +494,11 @@ pub(crate) fn run_qwen3vl_image(
 
     // Splice the vision block `<|vision_start|>` + N×`<|image_pad|>` +
     // `<|vision_end|>` immediately after the user-turn opener `<|im_start|>user\n`
-    // (token ids 151644, 872, 198) and before the user text — matching the
-    // mlx-vlm Qwen3-VL prompt format
-    // `<|im_start|>user\n<|vision_start|>...<|vision_end|><text><|im_end|>`. If
-    // that opener is not found (non-standard template), fall back to inserting
-    // after the leading token.
+    // — matching the mlx-vlm Qwen3-VL prompt format
+    // `<|im_start|>user\n<|vision_start|>...<|vision_end|><text><|im_end|>`. The
+    // last opener match is used so a multi-turn prompt splices into the final user
+    // turn. If the opener is not found (non-standard template), falls back to
+    // inserting after the leading token.
     let mut block = Vec::with_capacity(pv.num_soft_tokens + 2);
     block.push(QWEN3VL_VISION_START_ID);
     block.extend(std::iter::repeat_n(
@@ -498,17 +507,7 @@ pub(crate) fn run_qwen3vl_image(
     ));
     block.push(QWEN3VL_VISION_END_ID);
 
-    const IM_START: u32 = 151_644;
-    const USER: u32 = 872;
-    const NL: u32 = 198;
-    let insert_at = prompt_tokens
-        .windows(3)
-        .position(|w| w == [IM_START, USER, NL])
-        .map_or(usize::from(!prompt_tokens.is_empty()), |p| p + 3);
-    let mut aug_ids = Vec::with_capacity(prompt_tokens.len() + block.len());
-    aug_ids.extend_from_slice(&prompt_tokens[..insert_at]);
-    aug_ids.extend_from_slice(&block);
-    aug_ids.extend_from_slice(&prompt_tokens[insert_at..]);
+    let aug_ids = splice_image_block(prompt_tokens, &[block], &QWEN3VL_USER_TURN_OPENER);
 
     let in_prompt = aug_ids
         .iter()

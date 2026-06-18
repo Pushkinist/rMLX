@@ -10,7 +10,7 @@
     reason = "test fixtures: index/slice bounds are fixed by the literal prompt arrays constructed in each test"
 )]
 
-use super::{splice_image_block, GEMMA4_USER_TURN_OPENER};
+use super::{splice_image_block, GEMMA4_USER_TURN_OPENER, QWEN3VL_USER_TURN_OPENER};
 
 /// A minimal image block placeholder (real blocks are `<boi> + N×img + <eoi>`;
 /// the placement logic is independent of the block contents).
@@ -114,4 +114,61 @@ fn empty_prompt_inserts_block_at_front() {
     let blk = block(258_880, 1);
     let aug = splice_image_block(&[], std::slice::from_ref(&blk), &GEMMA4_USER_TURN_OPENER);
     assert_eq!(aug, blk, "empty prompt → block is the whole sequence");
+}
+
+#[test]
+fn multi_image_blocks_appear_in_order_and_contiguous() {
+    // Two blocks passed together must land in-order and contiguous at the splice
+    // point — no interleaving, no reversal.
+    let bos = 2u32;
+    let o = GEMMA4_USER_TURN_OPENER;
+    let prompt = [bos, o[0], o[1], o[2], 555, 106, 107];
+    let blk1 = block(111, 2); // first image block
+    let blk2 = block(222, 3); // second image block
+    let aug = splice_image_block(&prompt, &[blk1.clone(), blk2.clone()], &o);
+
+    let opener_end = 4usize; // bos + 3 opener tokens
+                             // Both blocks appear right after the opener, blk1 first, blk2 immediately after.
+    assert_eq!(
+        &aug[opener_end..opener_end + blk1.len()],
+        blk1.as_slice(),
+        "first block lands first"
+    );
+    assert_eq!(
+        &aug[opener_end + blk1.len()..opener_end + blk1.len() + blk2.len()],
+        blk2.as_slice(),
+        "second block immediately follows first"
+    );
+    // User text token 555 follows both blocks without any prompt tokens in between.
+    assert_eq!(
+        aug[opener_end + blk1.len() + blk2.len()],
+        555,
+        "user text follows both blocks"
+    );
+    // Total length is consistent.
+    assert_eq!(
+        aug.len(),
+        prompt.len() + blk1.len() + blk2.len(),
+        "length adds up"
+    );
+}
+
+#[test]
+fn qwen3vl_single_turn_splice_matches_last_opener() {
+    // Verify that routing Qwen3-VL through splice_image_block (last-match)
+    // produces the same insert position as the former first-match code for a
+    // single-turn prompt (first == last when there is only one opener).
+    let bos = 1u32;
+    let o = QWEN3VL_USER_TURN_OPENER; // [151644, 872, 198]
+    let prompt = [bos, o[0], o[1], o[2], 999, 151_645];
+    let blk = block(151_655, 4);
+    let aug = splice_image_block(&prompt, std::slice::from_ref(&blk), &o);
+
+    let opener_end = 4usize; // bos + 3 opener tokens
+    assert_eq!(
+        &aug[opener_end..opener_end + blk.len()],
+        blk.as_slice(),
+        "vision block lands right after the user-turn opener"
+    );
+    assert_eq!(aug[opener_end + blk.len()], 999, "user text follows");
 }
