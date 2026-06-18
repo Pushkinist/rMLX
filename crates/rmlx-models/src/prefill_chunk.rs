@@ -112,8 +112,8 @@ pub fn module_key_for_class(arch_class: &str) -> &'static str {
         "LagunaForCausalLM" => "laguna",
         "Qwen3_5MoeForConditionalGeneration" | "Qwen3_5ForConditionalGeneration" => "qwen3_5_moe",
         "BitNetForCausalLM" => "bitnet",
-        // Qwen3VLMoe (single-shot prefill, no `prefill_chunk_for` call) and any
-        // unsupported class: no dedicated prefill-chunk row, fall through to
+        "Qwen3VLMoeForConditionalGeneration" => "qwen3_vl_moe",
+        // Any unsupported class: no dedicated prefill-chunk row, fall through to
         // FALLBACK (safe, conservative).
         _ => "",
     }
@@ -131,6 +131,11 @@ fn arch_default(arch: &str) -> Option<usize> {
         // available via `RMLX_PREFILL_CHUNK_QWEN3_5_MOE=256` for users who
         // want to test it.
         "qwen3_5_moe" => Some(64),
+        // qwen3_vl_moe: plain GQA MoE (no GDN linear attention), so it tolerates
+        // the same large chunk as gemma4. Native image tiling produces thousands
+        // of soft tokens; a single-shot forward over the full prompt trips the
+        // Metal ~10s GPU watchdog, so the image prefill is chunked at 512.
+        "qwen3_vl_moe" => Some(512),
         "gemma3" => Some(256),
         // gemma4 default 512: p0b-ttft bench measured -30% cold TTFT at 8K
         // and -12% at 32K vs chunk=64 with no Metal watchdog at max-ctx 64K.

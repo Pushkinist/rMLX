@@ -1072,6 +1072,11 @@ impl Generator for ArchGenerator {
                     } else {
                         None
                     },
+                    // Effective `--max-ctx` (launch flag or per-request override)
+                    // so the image-path KV ring is sized to fit a large
+                    // multi-thousand-soft-token prompt and an over-cap prompt is
+                    // rejected cleanly rather than overflowing the 4096 default.
+                    max_ctx_override,
                     &eos_ids,
                     &tokenizer,
                     &mut step_fn,

@@ -422,6 +422,14 @@ impl Qwen3VlMoeVision {
         let mut deepstack_embeds = Vec::with_capacity(self.cfg.deepstack_visual_indexes.len());
         for (layer_num, blk) in self.blocks.iter().enumerate() {
             h = blk.forward(&h, &cos, &sin, mask.as_ref(), device)?;
+            // Flush each block's command buffer. The ViT runs full attention over
+            // every patch (native tiling → tens of thousands of patches for a
+            // large image, an O(num_patches^2) score matrix per block); letting
+            // all 27 blocks accumulate into a single lazy graph overruns the ~10s
+            // Metal GPU watchdog. Evaluating per block keeps each command buffer
+            // small. No effect on small images (the eval is cheap once the block
+            // is already computed).
+            h.eval()?;
             if let Some(ds_idx) = self
                 .cfg
                 .deepstack_visual_indexes
@@ -429,11 +437,21 @@ impl Qwen3VlMoeVision {
                 .position(|&x| x == layer_num)
             {
                 let de = self.deepstack_mergers[ds_idx].forward(&h, device)?;
+                // Materialize each deepstack merger output now so it is not
+                // re-derived (pulling the full ViT graph) when injected into the
+                // first text-prefill chunk.
+                de.eval()?;
                 deepstack_embeds.push(de);
             }
         }
 
         let image_embeds = self.merger.forward(&h, device)?;
+        // Materialize the merged image embeds before returning so the downstream
+        // scatter into the text sequence is its own command buffer, decoupled
+        // from the prefill — and so the whole ViT (a tens-of-thousands-of-patches
+        // full-attention graph) never folds into a single prefill buffer that
+        // overruns the Metal watchdog.
+        image_embeds.eval()?;
         Ok(VisionOutput {
             image_embeds,
             deepstack_embeds,
