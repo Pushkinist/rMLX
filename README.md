@@ -96,6 +96,7 @@ less install.sh && bash install.sh
 
 ```sh
 brew tap Pushkinist/rmlx
+brew trust Pushkinist/rmlx   # one-time: Homebrew now requires explicitly trusting third-party taps
 brew install rmlx
 ```
 
