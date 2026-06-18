@@ -32,6 +32,7 @@ use rmlx_mlx::{Array, Device, Dtype};
 
 use crate::constraint::ConstraintEngine;
 use crate::decode_loop::ProbeStep;
+use crate::kv_cache::kv_max_seq_and_ceiling;
 use crate::prompt_cache::{chained_block_hashes_seeded, Consumed, ReusePolicy, FNV_OFFSET};
 use crate::sampler::{apply_mask_argmax, sample_token_array, Pcg32, PenaltyConfig, SamplerConfig};
 use rmlx_kv_quant::{KvCache, KvQuant};
@@ -128,9 +129,9 @@ fn make_step(token_id: u32, tokenizer: &tokenizers::Tokenizer) -> ProbeStep {
 /// requests. Pass 1 for single-slot; pass N for multi-slot prefix matching.
 /// Recommended: 4. Only the Exact-hit path is active under
 /// [`ReusePolicy::ExactOnly`] (identical-prompt repeat skips re-prefill
-/// entirely, same contract as Qwen2 / Qwen3 dense). `max_ctx_override` is unused
-/// here: the text decoder prefills the whole prompt in one shot and grows its KV
-/// ring lazily, so there is no pre-sized ceiling to clamp.
+/// entirely, same contract as Qwen2 / Qwen3 dense). `max_ctx_override` sizes the
+/// KV ring ceiling so a long prompt (up to the effective `--max-ctx`) grows to
+/// fit and an over-cap prompt is rejected cleanly; see [`generate_image`].
 #[allow(clippy::too_many_arguments)]
 pub fn generate_greedy(
     model: &Qwen3VlMoeText,
@@ -139,7 +140,7 @@ pub fn generate_greedy(
     n_tokens: usize,
     device: Device,
     kv_quant: KvQuant,
-    _max_ctx_override: Option<i32>,
+    max_ctx_override: Option<i32>,
     prompt_cache_slots: usize,
     eos_ids: &[u32],
     step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
@@ -229,13 +230,37 @@ pub fn generate_greedy(
         return Ok(steps);
     }
 
-    // Path B (Miss): one-shot prefill from scratch.
+    // Path B (Miss): chunked prefill from scratch. Size the KV ring from the
+    // effective `--max-ctx` (lazy start + growth ceiling) so a prompt longer
+    // than the lazy KV_MAX_SEQ_DEFAULT=4096 start grows to fit instead of
+    // overflowing the fixed decode buffer; an over-cap prompt is rejected
+    // cleanly with KvCeilingExceeded (→ context_overflow). The shared
+    // chunked_prefill helper brackets enter_prefill()/exit_prefill() and flushes
+    // each chunk's command buffer under the ~10s Metal GPU watchdog — a
+    // single-shot forward over a multi-thousand-token prompt trips it. Mirrors
+    // the other arch text paths (qwen3_5_moe / gemma4).
+    let (initial_max_seq, max_seq_ceiling) =
+        kv_max_seq_and_ceiling(max_ctx_override, model.cfg.max_position_embeddings as i32);
     let mut kv: Vec<KvCache> = (0..n_layers)
-        .enumerate()
-        .map(|(i, _)| KvCache::with_quant(kv_quant).with_layer_idx(i))
+        .map(|i| {
+            KvCache::with_quant_max_seq(kv_quant, initial_max_seq)
+                .with_max_seq_ceiling(max_seq_ceiling)
+                .with_layer_idx(i)
+        })
         .collect();
 
-    let logits = model.forward_seq_with_cache(prompt_ids, Some(&mut kv), device)?;
+    let prefill_chunk = crate::prefill_chunk::prefill_chunk_for("qwen3_vl_moe");
+    let Some(logits) = crate::decode_loop::chunked_prefill(
+        &mut kv,
+        prompt_ids,
+        prefill_chunk,
+        device,
+        "Qwen3VLMoeForConditionalGeneration",
+        |chunk, kv| model.forward_seq_with_cache(chunk, Some(kv), device),
+    )?
+    else {
+        return Ok(steps);
+    };
     let first = pick_token(
         &logits,
         vocab,
@@ -410,6 +435,7 @@ pub fn generate_image(
     n_tokens: usize,
     device: Device,
     kv_quant: KvQuant,
+    max_ctx_override: Option<i32>,
     eos_ids: &[u32],
     step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
     mut constraint: Option<&mut dyn ConstraintEngine>,
@@ -441,26 +467,56 @@ pub fn generate_image(
         &visual_positions,
         device,
     )?;
+    // Materialize the scatter-merged embeds before the chunked prefill so the
+    // full-sequence scatter is its own command buffer, not folded into the first
+    // prefill chunk.
+    Array::eval(&inputs_embeds)?;
 
     // 2. 3D M-RoPE positions for the augmented sequence.
     let pos = get_rope_index(&ids_i64, image_grids, image_token_id, spatial_merge_size)?;
 
     // 3. prefill (deepstack injected after layers 0..len(deepstack)).
+    //
+    // The augmented image prompt is long (thousands of image soft tokens for
+    // native Qwen3-VL tiling — e.g. a 2560×2560 image → ~6400 soft tokens),
+    // far above the lazy KV_MAX_SEQ_DEFAULT=4096 start. Size the KV ring from
+    // the effective `--max-ctx`: `initial_max_seq` is the lazy start and
+    // `max_seq_ceiling` caps lazy growth and rejects an over-cap prompt with a
+    // clean `KvCeilingExceeded` (→ context_overflow) instead of a cryptic
+    // `slice_update` broadcast. Bracketing the chunked forward with
+    // enter_prefill()/exit_prefill() routes the prefill through the lazy-grow
+    // raw buffer (mirrors the Gemma4 image path) so it grows to fit.
+    let (initial_max_seq, max_seq_ceiling) =
+        kv_max_seq_and_ceiling(max_ctx_override, model.cfg.max_position_embeddings as i32);
     let n_layers = model.cfg.num_hidden_layers;
     let mut kv: Vec<KvCache> = (0..n_layers)
-        .enumerate()
-        .map(|(i, _)| KvCache::with_quant(kv_quant).with_layer_idx(i))
+        .map(|i| {
+            KvCache::with_quant_max_seq(kv_quant, initial_max_seq)
+                .with_max_seq_ceiling(max_seq_ceiling)
+                .with_layer_idx(i)
+        })
         .collect();
-    let logits = model.forward_embeds(
+    for c in &mut kv {
+        c.enter_prefill();
+    }
+    // Chunk the image prefill so a long augmented prompt (thousands of image
+    // soft tokens) does not run a single multi-thousand-token forward in one
+    // Metal command buffer (the ~10s GPU watchdog). The chunk size comes from
+    // the per-arch prefill-chunk table (512 for this plain-GQA MoE arch).
+    let prefill_chunk = crate::prefill_chunk::prefill_chunk_for("qwen3_vl_moe");
+    let logits = model.forward_embeds_chunked(
         &inputs_embeds,
         seq,
         &pos,
-        0,
         &vision.deepstack_embeds,
         &visual_positions,
-        Some(&mut kv),
+        prefill_chunk,
+        &mut kv,
         device,
     )?;
+    for c in &mut kv {
+        c.exit_prefill(device)?;
+    }
 
     let mut steps = Vec::with_capacity(n_tokens);
     let first = pick_token(
@@ -524,3 +580,7 @@ pub fn generate_image(
     }
     Ok(steps)
 }
+
+#[cfg(test)]
+#[path = "generate_tests.rs"]
+mod generate_tests;
