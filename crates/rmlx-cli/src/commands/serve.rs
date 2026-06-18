@@ -1132,15 +1132,28 @@ pub(crate) fn run_serve(
             tts_model: Arc::new(parking_lot::RwLock::new(None)),
         };
 
-        // Eager model preload — load every registry entry before
-        // serving requests so cold TTFT does not include model-load overhead.
+        // Eager model preload — warm the resident set before serving requests
+        // so cold TTFT does not include model-load overhead. Bounded to AT MOST
+        // `max_loaded_models` entries (the first `cap` in registry order):
+        // anything beyond the resident cap would be evicted by the next
+        // `ensure_loaded` (see `AppState::ensure_loaded` LRU swap), so preloading
+        // it is pure load-cost + transient memory pressure with nothing kept.
+        // The rest stay lazy — the documented load-on-demand / idle-unload path
+        // handles them on first request.
         // `ensure_loaded` is synchronous (CPU-bound disk + dequant); run it in
         // the blocking-thread pool so we do not stall the async runtime.
         // Best-effort: a load failure logs a warning but does not abort startup
         // (the first real request will attempt the load again via the normal
         // on-demand path and surface a 503 if it still fails).
         {
-            let ids: Vec<String> = state.registry.list().iter().map(|e| e.id.clone()).collect();
+            let cap = max_loaded_models.max(1);
+            let ids: Vec<String> = state
+                .registry
+                .list()
+                .iter()
+                .take(cap)
+                .map(|e| e.id.clone())
+                .collect();
             let state_ref = state.clone();
             tokio::task::spawn_blocking(move || {
                 for id in &ids {

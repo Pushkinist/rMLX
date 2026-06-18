@@ -58,7 +58,7 @@ mutually exclusive.
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `--model` | path | — | Path to a model snapshot directory. Mutually exclusive with `--registry`. |
-| `--registry` | path | — | Path to a JSON registry file. Format: `{"models":[{"id":"name","path":"/abs/path"},…]}`. Mutually exclusive with `--model`. |
+| `--registry` | path | — | Path to a JSON registry file. Format: `{"models":[{"id":"name","path":"/abs/path"},…]}`. Mutually exclusive with `--model`. At startup the server eagerly warms **at most `--max-loaded-models`** entries (the first `cap` in registry order); the rest stay lazy and load on first request (load-on-demand + idle-unload). A large registry therefore does not pull every model through GPU memory at boot. |
 | `--profile` | string | — | Named launch profile from `<RMLX_HOME>/profiles.toml`. CLI flags override profile values. See `rmlx profile list`. |
 | `--port` | u16 | 8080 | TCP port to listen on. |
 | `--host` | string | `127.0.0.1` | Host or IP to bind. |
@@ -83,7 +83,7 @@ mutually exclusive.
 | `--turbo-flash-lock` | bool flag | off | Enable TurboFlash lock variant. Has no effect unless `--turbo-flash` or `RMLX_TURBO_FLASH=1` is also active. |
 | `--planar-flash-decode` | `on` \| `off` \| `auto` | `auto` | PlanarK single-pass flash-decode MSL kernel. `auto` (default): resolves OFF on every host — validation confirmed the kernel is bit-for-bit identical to the fused chain (`update_and_sdpa_planar_k_fused` dispatch_delta>0 with output matching OFF byte-for-byte on Bonsai) but did not deliver a measurable decode-TPS gain (-0.19% mean at 4k canary; well below the ≥10% Auto-flip gate). A pre-existing PlanarK-on-Bonsai long-prompt chunked-prefill bug (`docs/KV_QUANT.md` §"Correctness gap") also prevented the NIAH correctness anchor from passing on the only reachable arch. `on` forces `RMLX_PLANAR_FLASH_DECODE=1` (opt-in ablation). `off` **hard-overrides** — removes any pre-existing `RMLX_PLANAR_FLASH_DECODE` from the env so a stale `=1` cannot latch the OnceLock. |
 | `--require-smoke-probe` | bool flag | off | Run 8-token smoke probe on every model load; reject `BrokenPunctLoop` / `BrokenNan` results with HTTP 503. |
-| `--max-loaded-models` | usize | 1 | Maximum models held resident in GPU memory. LRU eviction when exceeded. |
+| `--max-loaded-models` | usize | 1 | Maximum models held resident in GPU memory. LRU eviction when exceeded. Also bounds registry eager-preload: only the first `min(cap, N)` registry entries are warmed at boot (anything beyond the cap would be evicted by the next load, so preloading it is pure waste). |
 | `--max-queue-depth` | usize | 64 | FIFO admission queue depth. Requests beyond this limit receive HTTP 429. `0` = unlimited. |
 | `--adaptive-admission` | bool flag | off | Enable the in-process adaptive admission controller. When set, the controller adjusts `max_queue_depth` dynamically based on SLA telemetry and rejects requests with HTTP 503 + `Retry-After: 5` when the end-to-end step estimate exceeds `2 × step-target-ms`. When absent, the static `--max-queue-depth` is used unchanged. |
 | `--step-target-ms` | u64 | 500 | End-to-end step SLA target in milliseconds for the adaptive controller. Anticipatory 503 fires when `est_step > 2 × this`. Requires `--adaptive-admission`. `--ttft-target-ms` is accepted as a hidden alias for backward compatibility. |
