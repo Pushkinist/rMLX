@@ -743,6 +743,12 @@ impl Generator for ArchGenerator {
         // kv_quant_override and max_ctx_override are set at server-startup time via
         // from_snapshot and passed here; None means use arch default.
         let model_id_for_log = self.model_id.clone();
+        // Per-loaded-model signature folded into every multimodal-cache key so
+        // a shared (multi-model `--registry`) encoder-output cache never serves
+        // one model's vision/audio features to another for the same input. The
+        // model id is the stable identity; same id ⇒ same sig ⇒ cache still
+        // hits for repeat same-model requests.
+        let model_sig = rmlx_models::multimodal_cache::model_sig(&self.model_id);
         tokio::task::spawn_blocking(move || {
             // Acquire the serialisation lock.
             let _guard = {
@@ -964,6 +970,7 @@ impl Generator for ArchGenerator {
                             &prompt_tokens,
                             device,
                             mm_cache.as_deref(),
+                            model_sig,
                         ) {
                             Ok(triple) => Some(triple),
                             Err(e) => {
@@ -1074,6 +1081,7 @@ impl Generator for ArchGenerator {
                     &penalty_cfg,
                     &mut token_history,
                     mm_cache.as_deref(),
+                    model_sig,
                 )
             } else {
                 match multimodal_inputs {
