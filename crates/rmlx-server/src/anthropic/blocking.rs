@@ -56,6 +56,9 @@ pub(super) async fn generate_blocking(
         u64, // queue_depth at admission
         u64, // queue_wait_ms
     )>,
+    // Rolling ring-buffer for TTFT samples shared with AppState.
+    // Written here so non-streaming requests populate the same ring as streaming.
+    ttft_store: &crate::openai::state::TtftStore,
 ) -> Response {
     let input_token_count = req.prompt_tokens.len() as u32;
     // Capture stop sequences before `req` is moved into the generator.
@@ -103,6 +106,20 @@ pub(super) async fn generate_blocking(
                 if output_tokens == 0 {
                     let ttft_ms = request_start.elapsed().as_millis() as u64;
                     ttft_ms_blocking = Some(ttft_ms);
+                    tracing::info!(model_id, ttft_ms, "generate_blocking (anthropic): TTFT");
+                    // Append to the rolling ring-buffer so non-streaming requests
+                    // populate the same ring as streaming requests.
+                    {
+                        use crate::openai::{TtftSample, TTFT_RING_CAPACITY};
+                        let mut ring = ttft_store.lock();
+                        if ring.len() >= TTFT_RING_CAPACITY {
+                            ring.pop_front();
+                        }
+                        ring.push_back(TtftSample {
+                            model_id: model_id.to_owned(),
+                            ttft_ms,
+                        });
+                    }
                     tracing::debug!(
                         model_id,
                         phase = ?crate::engine::Phase::Decode,

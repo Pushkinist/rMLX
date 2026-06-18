@@ -5,6 +5,10 @@
 //! - `extract_top_level_json_value` — strip markdown fences from json_object output.
 //! - `try_extract_at` — attempt to extract a single JSON value at a given offset.
 
+#[cfg(test)]
+#[path = "generate_tests.rs"]
+mod generate_tests;
+
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -26,7 +30,7 @@ use super::response::{
     select_finish_reason, to_response_tool_call, ChatCompletionChunk, ChatCompletionsResponse,
     ChatLogprobContent, ChatLogprobs, Choice, DeltaContent, ResponseMessage, StreamChoice, Usage,
 };
-use super::state::{ApiErrorCounters, AppState, TtftSample, TTFT_RING_CAPACITY};
+use super::state::{ApiErrorCounters, AppState, TtftSample, TtftStore, TTFT_RING_CAPACITY};
 use super::streaming::{handle_streaming_token, StreamState};
 
 // ── JSON extraction helpers ───────────────────────────────────────────────────
@@ -275,6 +279,9 @@ pub(super) async fn generate_blocking(
         u64, // queue_depth at admission
         u64, // queue_wait_ms
     )>,
+    // Rolling ring-buffer for TTFT samples shared with AppState.
+    // Written here so non-streaming requests populate the same ring as streaming.
+    ttft_store: &TtftStore,
 ) -> Response {
     let prompt_token_count = req.prompt_tokens.len() as u32;
     // Capture the stop sequences before `req` is moved into the
@@ -330,6 +337,19 @@ pub(super) async fn generate_blocking(
                 if completion_tokens == 0 {
                     let ttft_ms = request_start.elapsed().as_millis() as u64;
                     ttft_ms_blocking = Some(ttft_ms);
+                    tracing::info!(model_id, ttft_ms, "generate_blocking: TTFT");
+                    // Append to the rolling ring-buffer so non-streaming requests
+                    // populate the same ring as streaming requests.
+                    {
+                        let mut ring = ttft_store.lock();
+                        if ring.len() >= TTFT_RING_CAPACITY {
+                            ring.pop_front();
+                        }
+                        ring.push_back(TtftSample {
+                            model_id: model_id.to_owned(),
+                            ttft_ms,
+                        });
+                    }
                     // phase transition Prefill -> Decode at the natural
                     // TTFT boundary (first OK token). Same timestamp as the
                     // existing TTFT capture — no second `Instant::now()`.
