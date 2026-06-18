@@ -653,12 +653,16 @@ fn compute_embeddings(
             prompt_ids,
             pixel_values,
         } => {
+            // Scope every mm-cache entry to this loaded model so a shared
+            // (multi-model) cache never serves another model's vision output
+            // for the same image.
+            let model_sig = rmlx_models::multimodal_cache::model_sig(model_id);
             data.reserve(pixel_values.len());
             for (index, pv) in pixel_values.iter().enumerate() {
                 if return_multivector {
                     let mv = holder
                         .model
-                        .embed_image_multi(&prompt_ids, pv, device, mm_cache)
+                        .embed_image_multi(&prompt_ids, pv, device, mm_cache, model_sig)
                         .map_err(|e| {
                             EmbedError::Compute(format!("embed_image_multi failed: {e}"))
                         })?;
@@ -666,7 +670,14 @@ fn compute_embeddings(
                 } else {
                     let v = holder
                         .model
-                        .embed_image_single(&prompt_ids, pv, device, truncate_dim, mm_cache)
+                        .embed_image_single(
+                            &prompt_ids,
+                            pv,
+                            device,
+                            truncate_dim,
+                            mm_cache,
+                            model_sig,
+                        )
                         .map_err(classify_single_err)?;
                     push_single(&mut data, index, v);
                 }

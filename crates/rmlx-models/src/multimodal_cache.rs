@@ -15,14 +15,22 @@
 //!   modality. Wrap in `Arc<MultimodalCache>` for cheap clone.
 //! - **Hash recipe** (lifted from
 //!   `dynamo/components/.../vllm/multimodal_utils/hash_utils.py:32-95`):
-//!   fixed 12-byte header `[version:u8=1, mode:u8 (0=image | 1=audio),
+//!   fixed 20-byte header `[version:u8=2, mode:u8 (0=image | 1=audio),
 //!   dtype:u8 (0=bf16 | 1=f32), channels:u8, dim1:u16 LE, dim2:u16 LE,
-//!   reserved:u32 LE]` + the canonical preprocessed pixel/PCM bytes.
-//!   The fixed header prevents `(H,W)` collision when the same pixel byte
-//!   stream is reshaped to a different geometry. For audio, `dim1`/`dim2` are
-//!   `0` and the `reserved` field carries the sample rate; `channels` lands
-//!   in `header[3]` so mono vs stereo PCM byte runs cannot alias; `n_samples`
-//!   is implied by the trailing byte length.
+//!   reserved:u32 LE, model_sig:u64 LE]` + the canonical preprocessed
+//!   pixel/PCM bytes. The fixed header prevents `(H,W)` collision when the
+//!   same pixel byte stream is reshaped to a different geometry. For audio,
+//!   `dim1`/`dim2` are `0` and the `reserved` field carries the sample rate;
+//!   `channels` lands in `header[3]` so mono vs stereo PCM byte runs cannot
+//!   alias; `n_samples` is implied by the trailing byte length.
+//! - **`model_sig`** is a stable per-loaded-model identity (a u64 hash of the
+//!   model's registry id / canonical snapshot path). It scopes every cached
+//!   encoder output to the model that produced it, so a multi-model
+//!   `--registry` server never serves model A's vision-tower output (projected
+//!   to A's hidden size) to model B for the same image. Without it, two models
+//!   sharing one cache and the same image collide on the content hash → a soft
+//!   token embedded at the wrong hidden dim → shape-mismatch failure. Same
+//!   model + same input ⇒ same `model_sig` ⇒ the cache still hits.
 //! - **Hasher**: `twox-hash` xxh3_64 (MIT, tiny, no transitive cost). Stored
 //!   as 8 bytes (the raw digest). If the digest is ever widened, bump the
 //!   `version` byte in the header along with the key array size — this type
@@ -119,7 +127,10 @@ impl MmCacheKey {
 
     /// Build an image key. `pixel_bytes` is the **post-preprocess** flat
     /// pixel buffer (e.g. the same `&[f32]` the vision tower reads). The
-    /// 12-byte header prevents `(H,W)` reshape collisions.
+    /// 20-byte header prevents `(H,W)` reshape collisions. `model_sig` is the
+    /// stable per-loaded-model identity (see [`model_sig`]) — it scopes the
+    /// key to the producing model so encoder outputs are never shared across
+    /// models in a multi-model registry.
     #[must_use]
     pub fn image_key(
         pixel_bytes: &[u8],
@@ -127,18 +138,28 @@ impl MmCacheKey {
         width: u16,
         channels: u8,
         dtype: MmDtype,
+        model_sig: u64,
     ) -> Self {
-        let header = build_header(MmMode::Image, dtype, channels, height, width, 0);
+        let header = build_header(MmMode::Image, dtype, channels, height, width, 0, model_sig);
         Self(digest(&header, pixel_bytes))
     }
 
     /// Build an audio key. `pcm_bytes` is the **post-preprocess** PCM byte
     /// stream (typically f32 mono). `sample_rate` lands in the `reserved`
     /// field so two identical PCM byte runs at different sample rates do not
-    /// alias. `dim1`/`dim2` are unused for audio (set to 0).
+    /// alias. `dim1`/`dim2` are unused for audio (set to 0). `model_sig` is the
+    /// stable per-loaded-model identity (see [`model_sig`]) — it scopes the
+    /// key to the producing model so encoder outputs are never shared across
+    /// models in a multi-model registry.
     #[must_use]
-    pub fn audio_key(pcm_bytes: &[u8], sample_rate: u32, dtype: MmDtype, channels: u8) -> Self {
-        let header = build_header(MmMode::Audio, dtype, channels, 0, 0, sample_rate);
+    pub fn audio_key(
+        pcm_bytes: &[u8],
+        sample_rate: u32,
+        dtype: MmDtype,
+        channels: u8,
+        model_sig: u64,
+    ) -> Self {
+        let header = build_header(MmMode::Audio, dtype, channels, 0, 0, sample_rate, model_sig);
         Self(digest(&header, pcm_bytes))
     }
 
@@ -156,19 +177,21 @@ fn build_header(
     dim1: u16,
     dim2: u16,
     reserved: u32,
-) -> [u8; 12] {
-    let mut header = [0u8; 12];
-    header[0] = 1; // version
+    model_sig: u64,
+) -> [u8; 20] {
+    let mut header = [0u8; 20];
+    header[0] = 2; // version — bumped from 1 when `model_sig` was folded in
     header[1] = mode as u8;
     header[2] = dtype as u8;
     header[3] = channels;
     header[4..6].copy_from_slice(&dim1.to_le_bytes());
     header[6..8].copy_from_slice(&dim2.to_le_bytes());
     header[8..12].copy_from_slice(&reserved.to_le_bytes());
+    header[12..20].copy_from_slice(&model_sig.to_le_bytes());
     header
 }
 
-fn digest(header: &[u8; 12], payload: &[u8]) -> [u8; 8] {
+fn digest(header: &[u8; 20], payload: &[u8]) -> [u8; 8] {
     // Streaming xxh3_64 over (header || payload). Avoids the ~9.6 MiB temp
     // allocation a one-shot path would need for a 896×896×3 f32 image.
     // `alloc` feature on `twox-hash` is enabled at the workspace level for
@@ -646,6 +669,23 @@ pub fn pixel_f32_bytes(pixels: &[f32]) -> &[u8] {
 #[must_use]
 pub fn pcm_f32_bytes(pcm: &[f32]) -> &[u8] {
     pixel_f32_bytes(pcm)
+}
+
+/// Derive the stable per-loaded-model signature folded into every
+/// [`MmCacheKey`]. `id` should be a stable identity for the loaded model —
+/// its registry id or canonical snapshot path. The same id always yields the
+/// same `u64`, so repeat same-model requests still hit the cache; two distinct
+/// models (different ids) yield different signatures, so their encoder outputs
+/// never collide on a shared cache.
+///
+/// `hidden_size` alone is deliberately NOT used: two different models can share
+/// a hidden size yet produce different features. The id/path is the
+/// collision-safe identity.
+#[must_use]
+pub fn model_sig(id: &str) -> u64 {
+    let mut h = XxHash3_64Hasher::new();
+    h.write(id.as_bytes());
+    h.finish()
 }
 
 #[cfg(test)]

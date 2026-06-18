@@ -567,6 +567,7 @@ pub fn build_inputs_embeds(
     input_ids: &[u32],
     device: Device,
     mm_cache: Option<&crate::multimodal_cache::MultimodalCache>,
+    model_sig: u64,
 ) -> Result<(Array, Array)> {
     let hidden = model.cfg.hidden_size as i32;
     let seq = input_ids.len();
@@ -627,6 +628,7 @@ pub fn build_inputs_embeds(
             u16::try_from(pv.width).unwrap_or(u16::MAX),
             3,
             crate::multimodal_cache::MmDtype::F32,
+            model_sig,
         );
         let feats = crate::multimodal_cache::get_or_compute(mm_cache, key, || {
             projector.forward(&vision.forward(pv, device)?, device)

@@ -657,7 +657,7 @@ fn build_inputs_embeds_aligns_and_shapes() {
     );
 
     let (embeds, masked) =
-        build_inputs_embeds(&model, &vision, &embedder, &[pv], &ids, device, None)
+        build_inputs_embeds(&model, &vision, &embedder, &[pv], &ids, device, None, 0)
             .expect("build embeds");
     embeds.eval().expect("eval embeds");
 
