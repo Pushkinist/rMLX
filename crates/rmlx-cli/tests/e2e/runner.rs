@@ -1957,10 +1957,11 @@ fn assert_cache_hit_equivalence(
 /// registry path (multiple model entries) instead of a single `--model`, and
 /// leaves `RUST_LOG=warn` (the lifecycle proof reads the HTTP API, not logs).
 ///
-/// Registry mode eagerly pre-loads AT MOST `cap` entries at startup (the first
-/// `cap` in registry order; see serve.rs "Eager model preload") — so on a green
-/// `/health` the first `min(cap, N)` registry entries are already resident and
-/// the rest stay lazy until their first request.
+/// Registry mode eagerly pre-loads AT MOST `cap` entries at startup (the
+/// alphabetically-first `min(cap, N)` model ids, since registry entries are
+/// BTreeMap-sorted by id; see serve.rs "Eager model preload") — so on a green
+/// `/health` those ids are already resident and the rest stay lazy until their
+/// first request.
 fn spawn_serve_registry(
     registry_json: &std::path::Path,
     port: u16,
@@ -2132,11 +2133,11 @@ fn assert_model_lifecycle(
     }
 
     // ── Legs (a)+(c)+(d): cap=1 registry with A (+B when present). ───────────
-    // With cap=1, eager preload warms only the FIRST registry entry (bounded to
-    // `min(cap, N)`). Order [A, B] → A resident, B lazy. Leg (c) then forces the
-    // LRU swap by explicitly loading B (see the defensive load below): the
-    // resident set flips to B, A evicted — proving the cap=1 LRU eviction. With
-    // only A, A is resident (leg a).
+    // With cap=1, eager preload warms whichever id sorts alphabetically first
+    // (registry entries are BTreeMap-sorted by id, not by JSON order). The
+    // defensive load-B below forces the LRU swap regardless of which was
+    // preloaded: the resident set ends up B-resident, A-evicted — proving
+    // cap=1 LRU eviction (leg c). With only A, A is resident (leg a).
     let entries_1: Vec<(&str, &std::path::Path)> = match (&model_b, &id_b) {
         (Some(pb), Some(idb)) => vec![(id_a, model_a), (idb.as_str(), pb.as_path())],
         _ => vec![(id_a, model_a)],
@@ -2161,8 +2162,9 @@ fn assert_model_lifecycle(
     // Two-model legs (a)/(c)/(d) when B is present; single-model leg (a) only
     // otherwise.
     if let Some(idb) = id_b.clone() {
-        // Eager preload of [A,B] at cap=1 warms only A (first entry); B stays
-        // lazy. The defensive load-B below forces the LRU swap: leg (c).
+        // Eager preload at cap=1 warms the alphabetically-first id (one entry);
+        // the other stays lazy. The defensive load-B below forces the LRU
+        // swap regardless of which was preloaded: leg (c).
         let a_loaded = match model_loaded(port, id_a) {
             Ok(v) => v,
             Err(e) => return fail_lc(&cap1_guard, &lc_home, mk, format!("status A (cap1): {e}")),

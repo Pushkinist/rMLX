@@ -715,8 +715,8 @@ tags = ["phase2"]
 
 # Multi-model lifecycle: the runner owns a registry-mode serve (Bonsai + a 2nd
 # model resolved from GEMMA4_E2B) under single-MLX discipline. Proves:
-#   (a) load A → loaded; (c) cap=1 eager preload of [A,B] warms only A (bounded
-#   to cap), then explicit load B forces the LRU swap → B resident, A evicted
+#   (a) load A → loaded; (c) cap=1 warms the alphabetically-first id (one entry,
+#   bounded to cap); explicit load B forces the LRU swap → B resident, A evicted
 #   (status flips); (d) explicit unload B → loaded:false, 2nd unload →
 #   404; (e) claim enforcement — a 2nd `rmlx serve` on the HELD port is rejected
 #   (exit 11, no competing Metal context). When GEMMA4_E2B is absent the runner

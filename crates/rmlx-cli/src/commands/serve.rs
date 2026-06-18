@@ -1134,7 +1134,8 @@ pub(crate) fn run_serve(
 
         // Eager model preload — warm the resident set before serving requests
         // so cold TTFT does not include model-load overhead. Bounded to AT MOST
-        // `max_loaded_models` entries (the first `cap` in registry order):
+        // `max_loaded_models` entries (the `cap` alphabetically-first ids, since
+        // `registry.list()` iterates a BTreeMap sorted by id — not JSON order):
         // anything beyond the resident cap would be evicted by the next
         // `ensure_loaded` (see `AppState::ensure_loaded` LRU swap), so preloading
         // it is pure load-cost + transient memory pressure with nothing kept.
