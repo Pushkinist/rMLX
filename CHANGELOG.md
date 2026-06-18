@@ -7,6 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-06-18
+
+Multimodal release. Whisper transcription works end to end (decode correctness
++ long-form) behind a new model-agnostic `rmlx transcribe` CLI; the dense
+Gemma 4 12B `gemma4_unified` any-to-any architecture is now supported for image
+and audio input; the standard Gemma 4 family gains native audio input through
+the serve path; and the unified vision color-fidelity bug is fixed. Plus
+release-signing and CI-hardening housekeeping. No breaking changes.
+
+### Added
+
+- **`rmlx transcribe <audio> --model <snapshot> [--format vtt|srt|json|txt]`** —
+  model-agnostic audio transcription CLI, arch-dispatched on `config.json`
+  (Whisper today, a clean seam for future ASR). Decodes any container to 16 kHz
+  mono internally (enabled `symphonia` isomp4+aac, so `.m4a` works). The HTTP
+  endpoint and the CLI share one long-form engine. (#119)
+- **Gemma 4 12B unified (`gemma4_unified`) image + audio input.** The dense
+  any-to-any 12B has no SigLIP/Conformer tower — vision and audio are
+  early-fusion via soft tokens projected straight into the shared 48-layer LM.
+  Faithful encoder-free ports of `Gemma4UnifiedVisionEmbedder` (host patchify +
+  3×3 merge → `patch_ln1` → quantized `patch_dense` → factorized 2D pos-emb →
+  `embed_vision`) and `Gemma4UnifiedAudioFeatureExtractor` (raw 16 kHz waveform
+  → fixed 640-sample frames → `embed_audio`). Dispatched off `is_unified_arch`;
+  the standard e4b/26b/31b SigLIP path is unchanged. (#120)
+- **Gemma 4 native audio input through the serve path.** The Conformer
+  `audio_tower` + `embed_audio` projector + USM feature extractor now load at
+  startup alongside the vision tower, and `input_audio` parts are decoded → mel
+  → `AudioEncoder` → soft tokens scattered at `<|audio|>`, mirroring the vision
+  flow. Submitting audio to a model without an audio tower (or combining image +
+  audio) returns a clear 503 — no silent drop. (#122)
+
+### Fixed
+
+- **Whisper transcription was empty / garbage.** large-v3 has 100 language
+  slots, shifting every special token +1 vs the v1/v2 layout the constants
+  assumed — so `TOK_TRANSCRIBE` pointed at `<|translate|>` and the
+  timestamp-begin hard-stop fired on `<|notimestamps|>`. Corrected the
+  special-token layout and added the missing in-loop logit filters
+  (`SuppressBlank`, `SuppressTokens` derived generally from the tokenizer, and a
+  faithful `ApplyTimestampRules`). Long-form decode bounds are derived from
+  `n_text_ctx` at runtime so the positional table can't overflow. Full 48-min
+  real recording at temp 0 → normalized WER ≈ 0.079, deterministic. (#119)
+- **Gemma 4 12B unified vision color corruption.** The encoder-free path read
+  image soft tokens *causally*, but `gemma4_unified` conditions each image's
+  soft tokens with **bidirectional** attention (the SigLIP path hides this by
+  pre-integrating the image in its ViT). A per-prefill bidirectional overlay,
+  keyed off the `<start_of_image>`/`<end_of_image>` markers and merged
+  element-wise into each layer's causal/SWA mask, fixes color naming and layout;
+  gated on `has_image` so text prefill is untouched. (LayerNorm eps also
+  corrected to the PyTorch `nn.LayerNorm` default 1e-5.) A 100%-uniform
+  achromatic fill still reads as one level — an inherent property of the
+  encoder-free projection (`patch_ln1` normalizes the absolute level away),
+  documented in `docs/MODELS.md`. (#127)
+- **`--probe-smoke` false `BrokenPunctLoop` on instruction-tuned snapshots.**
+  The probe fed a bare (no-chat-template) instruction; chat models degenerate on
+  such out-of-distribution input (the mlx-lm reference reproduces it
+  identically) — a probe artifact, not a 4-bit dequant bug. The smoke seed is
+  now rendered through the snapshot's `chat_template.jinja` when present, falling
+  back to the bare seed for base models; each entry point keeps its own canonical
+  BOS resolver (no hardcoded id). (#121)
+
+### Security
+
+- Pin CI actions (`actions/checkout`, `dtolnay/rust-toolchain`,
+  `Swatinem/rust-cache`) to commit SHAs, add keyless **cosign** release signing
+  (`make release-sign`), and drop a stale RustSec advisory ignore. (#116)
+
+### Changed
+
+- `scripts/release/source_sha256.sh --write` now also bumps the formula `url`
+  version, not just the sha256 (previously left the formula pointing at the old
+  tag's tarball). (#118)
+- `docs/RELEASING.md` documents the formula url-bump and Dependabot
+  migration-push gotchas. (#115)
+
 ## [0.2.1] - 2026-06-17
 
 Correctness + maintenance release. Closes a systemic KV-cache head-scramble
@@ -267,7 +342,8 @@ inference + conversion backend for Apple Silicon — no Python at runtime.
 - Speculative drafters validated against their verifiers: Qwen 3.6 MTP sidecar
   and the Gemma 4 assistant drafter.
 
-[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.2
 [0.2.1]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.1
 [0.2.0]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.0
 [0.1.1]: https://github.com/Pushkinist/rMLX/releases/tag/v0.1.1
