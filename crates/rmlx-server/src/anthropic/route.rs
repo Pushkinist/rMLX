@@ -750,6 +750,7 @@ pub(crate) async fn messages(
                 .admission_controller
                 .as_ref()
                 .map(|ctrl| (ctrl.clone(), admitted_depth, admitted_wait_ms)),
+            &state.ttft_store,
         )
         .instrument(req_span)
         .await

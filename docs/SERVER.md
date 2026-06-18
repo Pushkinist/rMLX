@@ -940,20 +940,95 @@ unloaded, all session-cache entries for that model are removed.
 
 ### `GET /metrics/cache` (JSON)
 
-Returns a JSON object with:
+Returns a JSON object. Example response after two requests (one hit, one miss):
 
-- `prompt_cache` — hit count, miss count, total bytes across all prompt-cache
-  namespaces.
-- `ttft` — rolling ring-buffer (last 20 samples) of per-model TTFT values in
-  milliseconds.
-- `last_itl` — last ITL aggregate per model (p50, p95, mean, step count).
-- `error_counts` — process-lifetime per-category counts (`bad_request`,
-  `context_overflow`, `not_found`, `oom_load`, `oom_kv_cache`,
+```json
+{
+  "models": [
+    {
+      "model_id": "gemma4-26b",
+      "hits": 1,
+      "misses": 1,
+      "evictions": 0,
+      "bytes": 1048576,
+      "hit_rate": 0.5,
+      "block_hits": 72,
+      "block_misses": 72,
+      "partial_hits": 0,
+      "partial_hit_rate": 0.0,
+      "ssd_hits": 0,
+      "kv_cache_bytes": 134217728,
+      "metal_peak_alloc_bytes": 4294967296,
+      "load_phases": {
+        "mmap_ms": 120,
+        "dequant_ms": 340,
+        "gpu_residency_ms": 80,
+        "first_kernel_ready_ms": 25,
+        "total_load_ms": 565
+      }
+    }
+  ],
+  "ttft": [
+    { "model_id": "gemma4-26b", "ttft_ms": 312 },
+    { "model_id": "gemma4-26b", "ttft_ms": 298 }
+  ],
+  "itl": [
+    {
+      "model_id": "gemma4-26b",
+      "p50_ms": 15.19,
+      "p95_ms": 23.2,
+      "step_mean_ms": 15.8,
+      "step_count": 163
+    }
+  ],
+  "tokens_in": 37238,
+  "tokens_out": 500,
+  "error_counts": {
+    "bad_request": 0,
+    "context_overflow": 0,
+    "not_found": 0,
+    "oom_load": 0,
+    "oom_kv_cache": 0,
+    "oom_mid_stream": 0,
+    "timeout": 0,
+    "upstream": 0,
+    "internal": 0,
+    "rate_limit": 0,
+    "admission_sla_503": 0
+  }
+}
+```
+
+Top-level fields:
+
+- `models` — array, one entry per currently loaded model. Each entry includes:
+  - `model_id` — logical model identifier.
+  - `hits` / `misses` / `evictions` / `bytes` — prompt-cache lifetime counts
+    and current byte size. Absent when the model has not been used yet.
+  - `hit_rate` — `hits / (hits + misses)`, range `[0.0, 1.0]`.
+  - `block_hits` / `block_misses` — block-level prompt-cache counts.
+  - `partial_hits` / `partial_hit_rate` — partial-prefix reuse counts.
+  - `ssd_hits` — RAM-miss requests served from the SSD KV tier.
+  - `kv_cache_bytes` — KV-cache allocation size from the last request (bytes).
+  - `metal_peak_alloc_bytes` — Metal allocator peak at the time of snapshot.
+  - `load_phases` — model-load timing breakdown (present when the generator
+    tracks it): `mmap_ms`, `dequant_ms`, `gpu_residency_ms`,
+    `first_kernel_ready_ms`, `total_load_ms` (all in milliseconds).
+- `ttft` — rolling ring-buffer of the last 20 TTFT samples across all models,
+  oldest first. Each entry: `{ "model_id": "…", "ttft_ms": <integer> }`.
+  Populated by both streaming and non-streaming completions. Empty until
+  at least one request has produced its first token.
+- `itl` — rolling ring-buffer of per-request ITL aggregates, oldest first.
+  Each entry: `{ "model_id": "…", "p50_ms": <f64>, "p95_ms": <f64>,
+  "step_mean_ms": <f64>, "step_count": <integer> }`.
+- `tokens_in` / `tokens_out` — process-lifetime cumulative prompt and
+  completion token counts.
+- `error_counts` — process-lifetime per-category API error counts. Keys:
+  `bad_request`, `context_overflow`, `not_found`, `oom_load`, `oom_kv_cache`,
   `oom_mid_stream`, `timeout`, `upstream`, `internal`, `rate_limit`,
-  `admission_sla_503`). The `admission_sla_503` counter is incremented
-  specifically by adaptive-admission anticipatory SLA rejections, distinct from the
-  `upstream` catch-all.
-- `tokens_in` / `tokens_out` — process-lifetime cumulative token counts.
+  `admission_sla_503`. The `admission_sla_503` counter is incremented
+  specifically by adaptive-admission anticipatory SLA rejections, distinct
+  from the `upstream` catch-all.
 
 ### `GET /metrics` (Prometheus)
 
