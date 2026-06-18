@@ -43,7 +43,7 @@ PROF_GEN    ?= 500
 AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
 
 .PHONY: help build check test fmt fmt-check lint audit deny precommit hooks \
-        ci ci-metrics tag release-package release-sha release-sign tap-sync \
+        ci ci-metrics tag release-package release-sha release-sign bottle tap-sync \
         clean serve chat info logs-tail metrics-summary \
         metrics-init metrics-doctor metrics-doctor-fix metrics-export \
         metrics-backup metrics-replay-pending metrics-prompts-sync \
@@ -180,6 +180,9 @@ release-sha:     ## print sha256 of the v<ver> GitHub source tarball (append --w
 
 release-sign:    ## keyless cosign-sign dist/rmlx-v<ver>-...tar.gz -> .cosign.bundle (needs cosign + browser OIDC)
 	bash scripts/release/sign_artifact.sh
+
+bottle:          ## build a Homebrew bottle from the installed rmlx keg (run after brew install --build-bottle)
+	bash scripts/release/build_bottle.sh
 
 tap-sync:        ## copy packaging/homebrew/rmlx.rb into the homebrew-rmlx tap and push
 	bash scripts/release/sync_tap.sh
