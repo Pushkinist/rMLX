@@ -68,6 +68,7 @@ pub(crate) fn build_image_prompt(
     prompt_tokens: &[u32],
     device: rmlx_mlx::Device,
     mm_cache: Option<&rmlx_models::multimodal_cache::MultimodalCache>,
+    model_sig: u64,
 ) -> rmlx_core::Result<(Vec<u32>, rmlx_mlx::Array, rmlx_mlx::Array)> {
     // Splice per-image token blocks (`<boi>` + N×image-token + `<eoi>`) in after
     // the prompt's leading BOS token so the image conditions the whole turn
@@ -138,7 +139,7 @@ pub(crate) fn build_image_prompt(
             );
 
             let (embeds, masked_ids) = rmlx_models::gemma4::build_inputs_embeds(
-                model, vision, embedder, &pixels, &aug_ids, device, mm_cache,
+                model, vision, embedder, &pixels, &aug_ids, device, mm_cache, model_sig,
             )?;
             Ok((aug_ids, embeds, masked_ids))
         }
@@ -199,7 +200,7 @@ pub(crate) fn build_image_prompt(
             let pv_only: Vec<rmlx_models::gemma4::Gemma4PixelValues> =
                 pixels.into_iter().map(|(pv, _)| pv).collect();
             let (embeds, masked_ids) = rmlx_models::gemma4::build_unified_inputs_embeds(
-                model, embedder, &pv_only, &aug_ids, device, mm_cache,
+                model, embedder, &pv_only, &aug_ids, device, mm_cache, model_sig,
             )?;
             Ok((aug_ids, embeds, masked_ids))
         }
@@ -252,7 +253,7 @@ pub(crate) fn build_image_prompt(
             );
 
             let (embeds, ids) = rmlx_models::gemma3::build_inputs_embeds(
-                model, vision, projector, &pixels, &aug_ids, device, mm_cache,
+                model, vision, projector, &pixels, &aug_ids, device, mm_cache, model_sig,
             )?;
             // Gemma3 has no masked-ids concept; pass the plain ids array through
             // the same (Vec, Array, Array) shape so the caller is arch-agnostic.
@@ -304,6 +305,7 @@ pub(crate) fn run_qwen3vl_image(
     penalty_cfg: &rmlx_models::PenaltyConfig,
     token_history: &mut Vec<u32>,
     mm_cache: Option<&rmlx_models::multimodal_cache::MultimodalCache>,
+    model_sig: u64,
 ) -> rmlx_core::Result<Vec<rmlx_models::ProbeStep>> {
     // Registering a thread-local GPU stream + CommandEncoder once per thread entry point.
     // tokio blocking-pool threads start with no GPU stream context; MLX's array
@@ -370,6 +372,7 @@ pub(crate) fn run_qwen3vl_image(
             u16::try_from(gw).unwrap_or(u16::MAX),
             3,
             rmlx_models::multimodal_cache::MmDtype::F32,
+            model_sig,
         );
         if let Some(mut arrays) = cache.get_many(&key) {
             // First array is the merged image_embeds, the rest are deepstack.

@@ -7,8 +7,10 @@ KV-quantization matrix any MLX server ships, including rotation-based KV familie
 (TurboQuant, IsoQuant, PlanarQuant, RotorQuant, ParoQuant) that no other MLX
 server offers.
 
-> Status: **0.1.0** — first feature-complete native MLX backend. Apple Silicon
-> only (Metal). See [What works](#what-works).
+> Status: **0.2.2** — feature-complete native MLX backend: OpenAI- and
+> Anthropic-compatible text, tool/function calling, streaming, image + audio
+> input, embeddings, and a multi-model registry. Apple Silicon only (Metal).
+> See [What works](#what-works).
 
 ## Why
 
@@ -21,22 +23,30 @@ server offers.
 ## What works
 
 - **Text generation** — OpenAI-compatible `/v1/chat/completions` and
-  `/v1/completions`, plus an Anthropic-compatible surface. Temperature, top-k/p,
-  penalties, thinking-budget, constrained / schema-guided decoding.
-- **Image input** — vision-capable models (Gemma 4 SigLIP tower, Qwen3-VL-MoE
-  deepstack) accept images via `image_url` content parts (data-URI, http, file
-  path, or base64).
-- **Audio input** — audio transcription / translation endpoints for
-  audio-capable models.
+  `/v1/completions`, plus an Anthropic-compatible surface. Streaming (SSE),
+  temperature, top-k/p, penalties, thinking-budget, constrained / schema-guided
+  decoding.
+- **Image input** — vision-capable models accept images via `image_url` content
+  parts (data-URI, http, file path, or base64): Gemma 4 SigLIP tower (e4b /
+  26b), the encoder-free Gemma 4 12B `gemma4_unified` any-to-any architecture,
+  jina-v4, and Qwen3-VL-MoE deepstack.
+- **Audio input** — audio-capable models accept audio (Gemma 4 unified Conformer
+  tower) plus Whisper speech-to-text via the model-agnostic `rmlx transcribe`
+  CLI (txt / vtt / srt / json, long-form chunking).
 - **Embeddings** — `/v1/embeddings`, including multimodal (text + image) jina-v4.
 - **Tool / function calling** — OpenAI `tool_calls` and Anthropic `tool_use`,
   multi-turn, multiple emit formats (Qwen XML, Hermes-JSON, Gemma).
+- **Multi-model registry** — serve many models from one process with
+  load-on-demand / unload-on-idle, a bounded resident-model cap, and a shared
+  multimodal encoder-output cache (scoped per model).
 - **Quantization** — affine 2–8 bit, mxfp4 / mxfp8, nvfp4, ParoQuant weights;
   KV-cache quant incl. fp8, TurboQuant, RotorQuant, PlanarQuant, IsoQuant,
   paged-KV, mixed / asymmetric K/V, and an SSD KV tier.
 - **Speculative decoding** — MTP, DFlash, and Eagle3 drafters.
 - **Prompt caching** — automatic prefix caching with block hashing.
-- **Conversion** — `rmlx convert` re-quantizes / repacks MLX → MLX.
+
+Conversion (`rmlx convert`, MLX → MLX re-quantize / layout repack) is a roadmap
+target and not yet shipped.
 
 Continuously smoke-tested end-to-end. The first four families carry committed
 golden-token decode gates (temp=0, exact token-id match); embeddings and the

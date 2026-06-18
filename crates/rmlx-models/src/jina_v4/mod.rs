@@ -191,6 +191,7 @@ impl JinaV4 {
         pixel_values: &PixelValues,
         device: rmlx_mlx::Device,
         mm_cache: Option<&crate::multimodal_cache::MultimodalCache>,
+        model_sig: u64,
     ) -> Result<(rmlx_mlx::Array, Vec<i64>)> {
         let image_token_id = i64::from(self.config.image_token_id);
         let merge = self.config.vision_config.spatial_merge_size;
@@ -212,6 +213,7 @@ impl JinaV4 {
             u16::try_from(g.w).unwrap_or(u16::MAX),
             3,
             crate::multimodal_cache::MmDtype::F32,
+            model_sig,
         );
         let vision_feats = crate::multimodal_cache::get_or_compute(mm_cache, key, || {
             self.vision.forward(pixel_values, device)
@@ -251,8 +253,10 @@ impl JinaV4 {
         device: rmlx_mlx::Device,
         truncate_dim: Option<usize>,
         mm_cache: Option<&crate::multimodal_cache::MultimodalCache>,
+        model_sig: u64,
     ) -> Result<Vec<f32>> {
-        let (hidden, input_ids) = self.image_hidden(prompt_ids, pixel_values, device, mm_cache)?;
+        let (hidden, input_ids) =
+            self.image_hidden(prompt_ids, pixel_values, device, mm_cache, model_sig)?;
         let (start, end) = image::vision_span(
             &input_ids,
             i64::from(self.config.vision_start_token_id),
@@ -279,8 +283,10 @@ impl JinaV4 {
         pixel_values: &PixelValues,
         device: rmlx_mlx::Device,
         mm_cache: Option<&crate::multimodal_cache::MultimodalCache>,
+        model_sig: u64,
     ) -> Result<Vec<Vec<f32>>> {
-        let (hidden, _input_ids) = self.image_hidden(prompt_ids, pixel_values, device, mm_cache)?;
+        let (hidden, _input_ids) =
+            self.image_hidden(prompt_ids, pixel_values, device, mm_cache, model_sig)?;
         let projected = self.projector.forward(&hidden, device)?;
         pooling::multi_vector(&projected, device)
     }
