@@ -110,10 +110,14 @@ cosign verify-blob \
 **Homebrew (build from source):**
 ```sh
 brew tap Pushkinist/rmlx
+brew trust Pushkinist/rmlx   # one-time: Homebrew refuses to load formulae from untrusted third-party taps
 brew install rmlx
 brew test rmlx
 rmlx --version
 ```
+> Recent Homebrew versions block third-party taps until trusted — a fresh
+> `brew install rmlx` fails with `Refusing to load formula … from untrusted tap`
+> until `brew trust Pushkinist/rmlx` is run once.
 
 Local formula check before publishing:
 ```sh
