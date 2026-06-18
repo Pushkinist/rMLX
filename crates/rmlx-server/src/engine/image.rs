@@ -15,6 +15,57 @@ use rmlx_core::Error;
 pub(crate) use rmlx_models::gemma4::BOI_TOKEN_ID as GEMMA4_BOI_TOKEN_ID;
 pub(crate) use rmlx_models::gemma4::EOI_TOKEN_ID as GEMMA4_EOI_TOKEN_ID;
 
+/// Gemma4 user-turn opener `<|turn>user\n` (token ids `<|turn>`=105, `user`=2364,
+/// `\n`=107). The image block splices in right after this so the image lands
+/// *inside* the user turn it belongs to — matching the HF/mlx-vlm processor,
+/// which substitutes the `<|image|>` placeholder in place within the user
+/// message rather than before the turn.
+pub(crate) const GEMMA4_USER_TURN_OPENER: [u32; 3] = [105, 2364, 107];
+
+/// Splice per-image token blocks (`<boi>` + N×image-token + `<eoi>`) into the
+/// prompt so the image conditions the turn it belongs to.
+///
+/// The image content item is part of the user message, so the block must land
+/// *inside* the user turn — right after `turn_opener` (the per-arch user-turn
+/// opener token sequence, e.g. [`GEMMA4_USER_TURN_OPENER`]). This mirrors the
+/// HF / mlx-vlm processor, which substitutes the `<|image|>` placeholder in
+/// place. Inserting the block *before* the user turn (after BOS) leaves the
+/// image outside the question and makes the model frequently fail to ground on
+/// it — image-independent, repetitive output.
+///
+/// The **last** opener match is used so a multi-turn prompt splices into the
+/// final user turn (the one the image accompanies), not an earlier one. When
+/// `turn_opener` is empty or not found (non-standard template), fall back to
+/// inserting after the prompt's leading BOS token.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "insert_at is bounded by prompt_tokens.len(): it is either 0/1 (after-BOS) or a window position plus the matched opener length, all within bounds"
+)]
+pub(crate) fn splice_image_block(
+    prompt_tokens: &[u32],
+    blocks: &[Vec<u32>],
+    turn_opener: &[u32],
+) -> Vec<u32> {
+    let total: usize = blocks.iter().map(Vec::len).sum();
+    let after_bos = usize::from(!prompt_tokens.is_empty());
+    let insert_at = if turn_opener.is_empty() || turn_opener.len() > prompt_tokens.len() {
+        after_bos
+    } else {
+        prompt_tokens
+            .windows(turn_opener.len())
+            .enumerate()
+            .rfind(|(_, w)| *w == turn_opener)
+            .map_or(after_bos, |(pos, _)| pos + turn_opener.len())
+    };
+    let mut aug = Vec::with_capacity(prompt_tokens.len() + total);
+    aug.extend_from_slice(&prompt_tokens[..insert_at]);
+    for b in blocks {
+        aug.extend_from_slice(b);
+    }
+    aug.extend_from_slice(&prompt_tokens[insert_at..]);
+    aug
+}
+
 /// bundle of the multimodal components needed to turn image bytes
 /// into scattered `inputs_embeds`. Loaded once per model. One variant per
 /// vision-capable architecture (Gemma4's custom SigLIP, Gemma3's standard SigLIP).
@@ -70,25 +121,6 @@ pub(crate) fn build_image_prompt(
     mm_cache: Option<&rmlx_models::multimodal_cache::MultimodalCache>,
     model_sig: u64,
 ) -> rmlx_core::Result<(Vec<u32>, rmlx_mlx::Array, rmlx_mlx::Array)> {
-    // Splice per-image token blocks (`<boi>` + N×image-token + `<eoi>`) in after
-    // the prompt's leading BOS token so the image conditions the whole turn
-    // causally. Shared between archs; only the token ids + soft counts differ.
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or validated before call"
-    )]
-    fn splice(prompt_tokens: &[u32], blocks: &[Vec<u32>]) -> Vec<u32> {
-        let total: usize = blocks.iter().map(Vec::len).sum();
-        let insert_at = usize::from(!prompt_tokens.is_empty());
-        let mut aug = Vec::with_capacity(prompt_tokens.len() + total);
-        aug.extend_from_slice(&prompt_tokens[..insert_at]);
-        for b in blocks {
-            aug.extend_from_slice(b);
-        }
-        aug.extend_from_slice(&prompt_tokens[insert_at..]);
-        aug
-    }
-
     match vb {
         VisionBundle::Gemma4 {
             vision,
@@ -126,7 +158,7 @@ pub(crate) fn build_image_prompt(
                     b
                 })
                 .collect();
-            let aug_ids = splice(prompt_tokens, &blocks);
+            let aug_ids = splice_image_block(prompt_tokens, &blocks, &GEMMA4_USER_TURN_OPENER);
 
             let total_soft: usize = pixels.iter().map(|p| p.num_soft_tokens).sum();
             let in_prompt = aug_ids.iter().filter(|&&t| t == image_token_id).count();
@@ -185,7 +217,7 @@ pub(crate) fn build_image_prompt(
                     b
                 })
                 .collect();
-            let aug_ids = splice(prompt_tokens, &blocks);
+            let aug_ids = splice_image_block(prompt_tokens, &blocks, &GEMMA4_USER_TURN_OPENER);
 
             let total_soft: usize = pixels.iter().map(|(_, n)| *n).sum();
             let in_prompt = aug_ids.iter().filter(|&&t| t == image_token_id).count();
@@ -240,7 +272,9 @@ pub(crate) fn build_image_prompt(
                     b
                 })
                 .collect();
-            let aug_ids = splice(prompt_tokens, &blocks);
+            // Gemma3's user-turn opener ids are not verified against a snapshot
+            // here, so keep the after-BOS fallback (empty opener) for it.
+            let aug_ids = splice_image_block(prompt_tokens, &blocks, &[]);
 
             let total_soft: usize = pixels.iter().map(|p| p.num_soft_tokens).sum();
             let in_prompt = aug_ids.iter().filter(|&&t| t == image_token_id).count();
@@ -514,3 +548,7 @@ pub(crate) fn rmlx_server_load_image(source: &str) -> rmlx_core::Result<Vec<u8>>
     crate::image_io::load_image(source, std::time::Duration::from_secs(20))
         .map_err(|e| Error::Other(format!("image load failed: {e}")))
 }
+
+#[cfg(test)]
+#[path = "image_tests.rs"]
+mod image_tests;

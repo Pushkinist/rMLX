@@ -697,6 +697,18 @@ are f32) — adopt / restore the operand dtype, mirroring mlx-lm's weak-typed
 Python floats. A unit-level dtype-lock test guards this against regression; see
 docs/KV_QUANT.md "Gemma4 global `--kv-quant none` KV is bf16".
 
+**Image-prompt placement (inside the user turn).** The per-image block
+(`<boi>` + N × `<image_soft_token>` + `<eoi>`) is spliced **inside** the user
+turn — immediately after the user-turn opener `<|turn>user\n` (token ids
+`[105, 2364, 107]`) — matching the HF/mlx-vlm processor, which substitutes the
+`<|image|>` placeholder in place within the user message. Placing the block
+before the turn (after BOS) leaves the image outside the question and makes the
+model frequently fail to ground on it (image-independent, repetitive output —
+e.g. "you have not provided an image"); the effect is prompt-phrasing-dependent
+and hits low-precision QAT-fp4 vision snapshots hardest. The last user-turn
+opener is used so multi-turn prompts splice into the final user turn. When the
+opener is absent (non-standard template) the splice falls back to after-BOS.
+
 **Conformer audio encoder + native audio input.** Present in e4b and above. The
 SSCP subsampling (two conv stages reducing the time dimension by 4×),
 Macaron-style FFW blocks with `residual_weight=0.5`, chunked local attention, and
