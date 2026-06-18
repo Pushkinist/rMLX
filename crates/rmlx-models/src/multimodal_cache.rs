@@ -76,7 +76,7 @@ use rmlx_mlx::Array;
 use tracing::Level;
 use twox_hash::xxhash3_64::Hasher as XxHash3_64Hasher;
 
-/// Mode discriminator embedded in the 12-byte header.
+/// Mode discriminator embedded in the 20-byte header.
 #[allow(
     clippy::exhaustive_enums,
     reason = "fixed wire-format byte: adding a variant is a breaking change to the digest layout and requires bumping `version` in the header"
@@ -89,7 +89,7 @@ pub enum MmMode {
     Audio = 1,
 }
 
-/// Dtype discriminator embedded in the 12-byte header. Kept independent of
+/// Dtype discriminator embedded in the 20-byte header. Kept independent of
 /// the MLX `Dtype` enum so the on-the-wire byte never breaks when MLX adds a
 /// new element type.
 #[allow(
@@ -107,7 +107,7 @@ pub enum MmDtype {
 /// Content-hash key for the cache. 8 bytes (xxh3_64 digest).
 ///
 /// If the digest is ever widened (e.g. blake3 256-bit), bump the `version`
-/// byte in the 12-byte header and grow this array — the on-the-wire layout
+/// byte in the 20-byte header and grow this array — the on-the-wire layout
 /// is internal-only, no external ABI depends on the size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MmCacheKey([u8; 8]);
