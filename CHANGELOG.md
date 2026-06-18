@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-06-18
+
+Multi-model registry hardening. Two `--registry` serving bugs fixed: the
+multimodal encoder-output cache no longer leaks vision/audio features across
+models, and eager model preload now respects `--max-loaded-models`. No breaking
+changes.
+
+### Fixed
+
+- **Multimodal encoder-output cache cross-model leak.** In `--registry`
+  multi-model mode the vision/audio encoder cache was keyed on the
+  post-preprocess content hash only, so a cached image encoding produced for one
+  model (projected to its `hidden_size`) was returned to a different model for
+  the same image — a vision-feature shape mismatch (HTTP 503) when the hidden
+  sizes differed. The cache key now folds in a stable per-model signature, so
+  entries are never shared across models; same-model repeats still hit. (#132)
+- **Registry eager-preload ignored `--max-loaded-models`.** `rmlx serve
+  --registry` preloaded every model at startup even with a smaller resident cap,
+  paying the full load cost for models that were immediately evicted (a
+  ~5-minute boot for a 13-model registry). Preload is now bounded to at most
+  `--max-loaded-models` entries (the alphabetically-first ids, since the
+  registry is id-sorted); the rest load on demand. (#133)
+
+### Changed
+
+- `README.md` refreshed to 0.2.3 with an accurate "What works" summary, and
+  `docs/CLI.md` documents that the multimodal cache key now includes model
+  identity (no cross-model sharing) and that registry preload is bounded to the
+  resident cap.
+
 ## [0.2.2] - 2026-06-18
 
 Multimodal release. Whisper transcription works end to end (decode correctness
@@ -342,7 +372,8 @@ inference + conversion backend for Apple Silicon — no Python at runtime.
 - Speculative drafters validated against their verifiers: Qwen 3.6 MTP sidecar
   and the Gemma 4 assistant drafter.
 
-[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.3
 [0.2.2]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.2
 [0.2.1]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.1
 [0.2.0]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.0
