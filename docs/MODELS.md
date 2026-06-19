@@ -779,10 +779,14 @@ unquantized bf16 (plain weights, no `.scales`); affine at any group/bits —
 including affine-int4 with per-group `.biases` zero-points (Google QAT
 snapshots); and the microscaling formats mxfp4 / nvfp4. On this bandwidth-bound
 arch, 4-bit packed weights decode faster than mxfp8 (runtime `quantized_matmul`,
-weights stay packed). mxfp4 is the recommended 4-bit format: nvfp4 loads and runs
-but the MLX nvfp4 kernel currently yields degraded output on these snapshots.
-Per-tensor quant overrides (router weights, QAT MLP blocks) are read from the
-inline `quantization` dict.
+weights stay packed). mxfp4 is the recommended 4-bit format. Per-tensor quant
+overrides (router weights, QAT MLP blocks) are read from the inline
+`quantization` dict.
+
+The Google QAT e4b 4-bit snapshots (`qat-mxfp4`, `qat-nvfp4`, `qat-4bit`) are
+text-strong but degrade on high-detail images — a checkpoint property, not a
+codec bug, reproduced identically by the `mlx_vlm` reference. See
+[Modalities → e4b QAT checkpoints](#e4b-qat-checkpoints--complex-image-vision-quality).
 
 ### KV quantization
 
@@ -801,6 +805,25 @@ shared KV to consumer layers, so `Mixed` mode also works.
 Text, image, and audio input. rMLX implements all three towers:
 - Vision: SigLIP-style ViT + VisionPooler + soft-token scatter.
 - Audio: Conformer encoder + output projection + scatter.
+
+#### e4b QAT checkpoints — complex-image vision quality
+
+The Google QAT e4b snapshots (`*-qat-bf16`, `*-qat-mxfp4`, `*-qat-nvfp4`,
+`*-qat-4bit`) share one byte-identical SigLIP `vision_tower` and one
+byte-identical set of clipped-linear bounds with the non-QAT `e4b-it-mxfp8`
+snapshot — only the QAT-trained language-model weights and the multimodal
+projection differ. On **simple, low-detail** images all QAT variants transcribe
+correctly. On **high-detail / high-patch-count** images (e.g. a full-resolution
+screenshot preprocessing to ~272 soft tokens) every QAT variant — including the
+unquantized `qat-bf16` — produces hallucinated or repetitive output, while
+`e4b-it-mxfp8` reads the same image correctly.
+
+This is an intrinsic quality limitation of the e4b QAT *checkpoint* on dense
+images, not a quantization-codec defect: `qat-bf16` (no fp4 dequant at all)
+fails the same way as `qat-mxfp4` / `qat-nvfp4`, and the `mlx_vlm` Python
+reference reproduces the identical failure on the same QAT snapshots. rMLX
+output is reference-faithful. For reliable complex-image OCR use
+`e4b-it-mxfp8`; treat e4b QAT as text-strong but unreliable on dense images.
 
 ### Unified (encoder-free) vision — `Gemma4UnifiedForConditionalGeneration` (12B)
 
