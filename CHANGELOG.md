@@ -7,6 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-06-19
+
+Vision, KV, and embedding-lookup bug-fix batch for Qwen3-VL and Gemma 4, plus a
+`/metrics/cache` recording/docs fix and a Homebrew bottle build+publish flow.
+Highlights: Qwen3-VL large images now work end to end (KV sized from `--max-ctx`;
+the O(seq²) embedding lookup that tripped the Metal GPU watchdog is gone), and
+Gemma 4 image grounding is fixed by placing image tokens inside the user turn. No
+breaking changes.
+
+### Added
+
+- **Homebrew bottle build+publish flow.** `scripts/release/build_bottle.sh` +
+  `make bottle` drive `brew bottle` against an installed keg, rename the local
+  bottle to the GitHub-Release asset name, and emit the ready-to-paste
+  `bottle do` block; documented as a release-time step in `docs/RELEASING.md`.
+  The committed formula stays source-build until a real bottle is uploaded, so
+  existing tap installs are unaffected. (#143, #139)
+
+### Fixed
+
+- **`/metrics/cache` TTFT empty for non-streaming completions.** Both
+  non-streaming paths (`generate_blocking`, OpenAI + Anthropic) measured TTFT
+  but never pushed it into the in-memory `ttft_store` ring — only the streaming
+  path did, so `ttft` stayed `[]` for non-streaming traffic. The ring is now
+  written on both paths. `docs/SERVER.md` is realigned to the endpoint's actual
+  shape (`models[]`, `itl`, `tokens_in/out`), dropping the never-emitted
+  `prompt_cache` / `last_itl` keys. (#142, #141)
+- **Gemma 4 image grounding (degenerate / image-independent output).** The
+  per-image token block was spliced after BOS but *before* the user-turn opener,
+  leaving the image outside the user message; the model then ignored it. Image
+  blocks are now spliced inside the (final) user turn via a shared
+  `splice_image_block`, matching the HF/mlx-vlm placeholder substitution. Fixes
+  the reported e4b QAT-fp4 degeneration (the soft tokens were correct all along)
+  and a latent flakiness that affected all Gemma 4 image requests; Qwen3-VL is
+  unified onto the same path. (#144, #140)
+- **Qwen3-VL ignored `--max-ctx`; large images failed with a `slice_update`
+  broadcast.** The image and text generate paths built KV with the bare 4096
+  default and never bracketed prefill, so any prompt over 4096 tokens (a large
+  image tiles to thousands of soft tokens) overran the fixed buffer. Both paths
+  now size the KV ring from the effective `--max-ctx` and chunk the prefill;
+  an over-cap prompt returns a clean `context_overflow` instead of the broadcast
+  panic. (#145, #138)
+- **Qwen3-VL large images hit the Metal GPU watchdog.** The quantized embedding
+  lookup used an O(seq²) `eye(seq) @ w` identity-matmul on CPU (plus a GPU↔CPU
+  round-trip); embedding the whole augmented prompt for a large image produced a
+  single command buffer that overran the ~10 s watchdog. Replaced with on-device
+  `take + dequantize` (O(seq)); added query-tiled ViT attention as a faithful
+  defense for very large single images. (#147, #146)
+- **Qwen3.6 (`qwen3_5_moe`) embedding lookup** carried the same O(seq²)
+  `eye(seq) @ w`-on-CPU trick (plus an `unsafe` block); ported to the same
+  on-device `take + dequantize`. Numerically faithful, removes a per-step CPU
+  round-trip. (#149, #148)
+
+### Performance
+
+- Qwen3-VL: large images (e.g. 2560×2560 → 6400 soft tokens) now complete
+  end-to-end instead of aborting the process at the Metal GPU watchdog. (#145, #147)
+
+### Tested
+
+- New CI-gated tests: image-token placement (in-turn, last-turn, multi-image,
+  after-BOS fallback), ViT attention tiling equals a single SDPA, and
+  `qwen3_5_moe` embed_lookup numeric equivalence across both dtype arms (the
+  prior coverage was `#[ignore]` + env-gated). Real-model proofs across Qwen3-VL
+  (KV + large-image), Gemma 4 e4b QAT-fp4 vision, and Qwen3.6 (decode-TPS
+  same-session A/B: no regression).
+
 ## [0.2.3] - 2026-06-18
 
 Multi-model registry hardening. Two `--registry` serving bugs fixed: the
@@ -372,7 +439,8 @@ inference + conversion backend for Apple Silicon — no Python at runtime.
 - Speculative drafters validated against their verifiers: Qwen 3.6 MTP sidecar
   and the Gemma 4 assistant drafter.
 
-[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.2.4...HEAD
+[0.2.4]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.4
 [0.2.3]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.3
 [0.2.2]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.2
 [0.2.1]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.1
