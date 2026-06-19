@@ -131,3 +131,98 @@ fn qwen3_vl_moe_vision_tower_shape() {
         .collect();
     assert_eq!(vals.iter().filter(|v| !v.is_finite()).count(), 0);
 }
+
+/// Query-tiled ViT attention must equal one SDPA over all queries: each query
+/// attends to every key in both, so tiling the query dim only changes the
+/// command-buffer boundaries, not the math. Drive the tiling path with a small
+/// `budget` so `seq` stays tiny, then compare against a single SDPA.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: all unwraps are on values constructed locally in this fn"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "test fixture: indices bounded by locally-constructed shapes"
+)]
+fn qwen3_vl_moe_vision_attn_tiling_matches_single_sdpa() {
+    let device = Device::Cpu;
+    let (h, seq, d) = (2i32, 9i32, 4i32);
+    let scale = (d as f32).powf(-0.5);
+
+    // Deterministic q/k/v in [1, H, seq, D].
+    let n = (h * seq * d) as usize;
+    let fill = |off: usize| -> Array {
+        let data: Vec<f32> = (0..n)
+            .map(|i| (((i + off) % 13) as f32 - 6.0) * 0.05)
+            .collect();
+        f32_arr(&data, &[1, h, seq, d]).unwrap()
+    };
+    let q = fill(0);
+    let k = fill(3);
+    let v = fill(7);
+
+    // qkv/proj are unused by attend_tiled (it takes q/k/v directly); 1x1 dummies.
+    let dummy_w = f32_arr(&[0.0f32], &[1, 1]).unwrap();
+    let attn = Attention {
+        qkv: Linear {
+            weight: dummy_w.try_clone().unwrap(),
+            bias: None,
+        },
+        proj: Linear {
+            weight: dummy_w,
+            bias: None,
+        },
+        num_heads: h as usize,
+        head_dim: d as usize,
+        scale,
+    };
+
+    // Reference: one SDPA over all queries.
+    let reference = scaled_dot_product_attention(&q, &k, &v, scale, "", None, device).unwrap();
+    Array::eval(&reference).unwrap();
+
+    // Tiled: budget below seq*seq (=81) forces tiling (tile = budget/seq rows).
+    // budget=12, seq=9 -> tile=1, so every query is its own command buffer.
+    let tiled = attn
+        .attend_tiled(&q, &k, &v, seq, h, d, 12, device)
+        .unwrap();
+    Array::eval(&tiled).unwrap();
+
+    assert_eq!(tiled.shape(), reference.shape());
+    let rv: Vec<f32> = reference
+        .to_bytes()
+        .unwrap()
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let tv: Vec<f32> = tiled
+        .to_bytes()
+        .unwrap()
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(rv.len(), tv.len());
+    for (a, b) in rv.iter().zip(tv.iter()) {
+        assert!(
+            (a - b).abs() <= 1e-5,
+            "tiled attention diverged from single SDPA: {a} vs {b}"
+        );
+    }
+
+    // Budget above seq*seq must collapse to the single-SDPA path (bit-identical
+    // small-image behavior).
+    let untiled = attn
+        .attend_tiled(&q, &k, &v, seq, h, d, 10_000, device)
+        .unwrap();
+    Array::eval(&untiled).unwrap();
+    let uv: Vec<f32> = untiled
+        .to_bytes()
+        .unwrap()
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (a, b) in rv.iter().zip(uv.iter()) {
+        assert!((a - b).abs() <= 1e-6, "untiled path must match reference");
+    }
+}
