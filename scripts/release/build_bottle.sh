@@ -95,11 +95,17 @@ JSON_FILE=$(find . -maxdepth 1 -name 'rmlx--*.bottle.json'   -print 2>/dev/null 
 [ -n "$LOCAL_TAR" ] || { echo "error: brew bottle did not produce a .bottle.tar.gz file" >&2; exit 1; }
 [ -n "$JSON_FILE" ] || { echo "error: brew bottle did not produce a .bottle.json file" >&2; exit 1; }
 
+# The brew bottle --json top-level key is the formula's full name — bare "rmlx"
+# for a file/core install, but the fully-qualified "<user>/<tap>/rmlx" when the
+# keg was installed from a tap. Derive it instead of hard-coding, or every
+# lookup below silently returns null.
+FKEY=$(jq -r 'keys[0]' "$JSON_FILE")
+
 # ── rename local → remote filename (double-dash → single-dash) ─────────────────
 # The JSON tab contains both fields:
-#   local_filename  →  rmlx--0.2.3.arm64_tahoe.bottle.tar.gz
-#   filename        →  rmlx-0.2.3.arm64_tahoe.bottle.tar.gz
-REMOTE_TAR=$(jq -r '.rmlx.bottle.tags | to_entries[0].value.filename' "$JSON_FILE" 2>/dev/null || echo "")
+#   local_filename  →  rmlx--<ver>.arm64_tahoe.bottle.tar.gz
+#   filename        →  rmlx-<ver>.arm64_tahoe.bottle.tar.gz
+REMOTE_TAR=$(jq -r --arg k "$FKEY" '.[$k].bottle.tags | to_entries[0].value.filename' "$JSON_FILE" 2>/dev/null || echo "")
 if [ -z "$REMOTE_TAR" ]; then
   # Fallback: replace first occurrence of '--' with '-'
   REMOTE_TAR="${LOCAL_TAR/--/-}"
@@ -112,9 +118,15 @@ echo "==> bottle:  dist/${REMOTE_TAR}"
 echo "==> json:    dist/${JSON_FILE}"
 
 # ── print bottle do block ──────────────────────────────────────────────────────
-OS_TAG=$(jq -r '.rmlx.bottle.tags | keys[0]' "dist/${JSON_FILE}" 2>/dev/null || echo "arm64_tahoe")
-SHA256=$(jq -r ".rmlx.bottle.tags[\"${OS_TAG}\"].sha256" "dist/${JSON_FILE}" 2>/dev/null || echo "")
-CELLAR=$(jq -r ".rmlx.bottle.tags[\"${OS_TAG}\"].cellar" "dist/${JSON_FILE}" 2>/dev/null || echo ":any_skip_relocation")
+OS_TAG=$(jq -r --arg k "$FKEY" '.[$k].bottle.tags | keys[0]' "dist/${JSON_FILE}" 2>/dev/null || echo "arm64_tahoe")
+SHA256=$(jq -r --arg k "$FKEY" --arg t "$OS_TAG" '.[$k].bottle.tags[$t].sha256' "dist/${JSON_FILE}" 2>/dev/null || echo "")
+# cellar lives at .bottle.cellar (not per-tag); it is a symbol (:any /
+# :any_skip_relocation) unless it is an absolute Cellar path, which must be quoted.
+CELLAR_RAW=$(jq -r --arg k "$FKEY" '.[$k].bottle.cellar' "dist/${JSON_FILE}" 2>/dev/null || echo "any")
+case "$CELLAR_RAW" in
+  /*) CELLAR="\"${CELLAR_RAW}\"" ;;
+  *)  CELLAR=":${CELLAR_RAW}" ;;
+esac
 
 echo ""
 echo "==> paste this bottle do block into packaging/homebrew/rmlx.rb"
