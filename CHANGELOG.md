@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- **Gemma 4 e4b QAT complex-image vision is a checkpoint limitation, not a bug.**
+  Investigated degenerate / hallucinated output from the `e4b-it-qat-mxfp4` and
+  `-qat-nvfp4` snapshots on high-detail screenshots (#153). The e4b QAT
+  snapshots share a byte-identical SigLIP `vision_tower` and clipped-linear
+  bounds with `e4b-it-mxfp8`; the unquantized `qat-bf16` checkpoint degrades on
+  dense images identically to the fp4 variants, and the `mlx_vlm` Python
+  reference reproduces the same failure on the same snapshots. So this is an
+  intrinsic quality limit of the e4b QAT checkpoint on complex images, not an
+  fp4-dequant defect — rMLX output is reference-faithful. No code change;
+  `docs/MODELS.md` now documents the behavior and recommends `e4b-it-mxfp8` for
+  complex-image OCR. (#153)
+
 ## [0.2.4] - 2026-06-19
 
 Vision, KV, and embedding-lookup bug-fix batch for Qwen3-VL and Gemma 4, plus a
