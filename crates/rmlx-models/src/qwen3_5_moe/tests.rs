@@ -468,6 +468,235 @@ fn paro_weight_conversion_matmul() {
     }
 }
 
+/// Verify `embed_lookup` on-device take+dequantize path — F16 scales arm.
+///
+/// Synthetic 3-row × 128-col, 4-bit affine embedding. All nibbles in row `r`
+/// are fixed to `r` (0, 1, 2). Scale = 1.0 F16, bias = 0.0 F16 for every
+/// group, so `dequant(row r)` = r (all 128 values equal `r` as f32).
+///
+/// Checks that `embed_lookup` with F16 scales:
+/// - selects the CORRECT row (ids=[1] → all output values ≈ 1.0, not 0.0/2.0),
+/// - returns dtype BF16 (the `astype Bf16` else-arm fires because dequantize
+///   returns the scales dtype = F16 ≠ BF16).
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "values established by construction; .expect() message documents the invariant"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "byte slices constructed in this fn; try_into() on known-size windows is infallible"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: vec sized at init, loop indices bounded by rows/num_groups"
+)]
+fn embed_lookup_f16_scales_selects_correct_row_and_casts_to_bf16() {
+    let rows = 3usize;
+    let cols = 128usize;
+    let group_size = 128i32;
+    let bits = 4i32;
+    let num_groups = (cols as i32) / group_size; // 1
+    let words_per_row = (cols * bits as usize) / 32; // 16
+
+    // Build packed 4-bit weight: row r → all nibbles = r.
+    // Each U32 word holds 8 nibbles: value r repeated 8 times.
+    let mut weight_bytes = vec![0u8; rows * words_per_row * 4];
+    for r in 0..rows {
+        let nibble = r as u32; // 0, 1, or 2
+                               // Pack 8 nibbles of the same value into one U32.
+        let mut word = 0u32;
+        for pos in 0..8 {
+            word |= nibble << (pos * 4);
+        }
+        let word_bytes = word.to_le_bytes();
+        for w in 0..words_per_row {
+            let off = (r * words_per_row + w) * 4;
+            weight_bytes[off..off + 4].copy_from_slice(&word_bytes);
+        }
+    }
+
+    // Build F16 scales (all 1.0) and biases (all 0.0): [rows, num_groups] F16.
+    let f16_one: u16 = 0x3C00; // 1.0 in IEEE-754 F16
+    let mut scales_bytes = vec![0u8; rows * num_groups as usize * 2];
+    for i in 0..rows * num_groups as usize {
+        scales_bytes[i * 2..i * 2 + 2].copy_from_slice(&f16_one.to_le_bytes());
+    }
+    let biases_bytes = vec![0u8; rows * num_groups as usize * 2]; // all 0.0
+
+    let device = Device::Gpu;
+
+    let w_arr = Array::from_bytes(
+        &weight_bytes,
+        &[rows as i32, words_per_row as i32],
+        Dtype::U32,
+    )
+    .expect("weight array");
+    let s_arr = Array::from_bytes(&scales_bytes, &[rows as i32, num_groups], Dtype::F16)
+        .expect("scales array");
+    let b_arr = Array::from_bytes(&biases_bytes, &[rows as i32, num_groups], Dtype::F16)
+        .expect("biases array");
+
+    // Look up row 1 — expected dequant output: all 128 values ≈ 1.0.
+    let id_bytes = 1u32.to_le_bytes();
+    let ids = Array::from_bytes(&id_bytes, &[1], Dtype::U32).expect("ids");
+
+    let out = embed_lookup(
+        &ids,
+        &w_arr,
+        &s_arr,
+        Some(&b_arr),
+        group_size,
+        bits,
+        "affine",
+        device,
+    )
+    .expect("embed_lookup F16 arm");
+    out.eval().expect("eval");
+
+    // dtype must be BF16 — the F16 scales branch forces astype(BF16).
+    assert_eq!(
+        out.dtype(),
+        Dtype::Bf16,
+        "embed_lookup must return BF16 when scales are F16 (astype branch)"
+    );
+
+    // Shape must be [1, 128].
+    assert_eq!(out.shape(), &[1, cols as i32], "embed_lookup output shape");
+
+    // Convert to F32 for value assertions.
+    let out_f32 = out.astype(Dtype::F32, Device::Cpu).expect("astype f32");
+    out_f32.eval().expect("eval f32");
+    let out_bytes = out_f32.to_bytes().expect("to_bytes");
+    let out_vals: Vec<f32> = out_bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+
+    assert_eq!(out_vals.len(), cols, "output must have {cols} values");
+    // With scale=1.0 and bias=0.0, dequant(nibble=1) = 1.0. Row 0 gives 0.0,
+    // row 2 gives 2.0 — any wrong row selection fails this assertion.
+    for (i, &v) in out_vals.iter().enumerate() {
+        assert!(
+            (v - 1.0_f32).abs() < 5e-3,
+            "embed_lookup F16 arm: out[{i}] expected ≈1.0, got {v:.6}"
+        );
+    }
+}
+
+/// Verify `embed_lookup` on-device take+dequantize path — BF16 scales arm.
+///
+/// Same synthetic 3-row × 128-col, 4-bit affine embedding as above, but with
+/// BF16 scales and biases. `dequantize` returns BF16 (matching the scales
+/// dtype), so `embed_lookup` hits the `Ok(dq)` passthrough without `astype`.
+///
+/// Checks that:
+/// - ids=[2] selects the CORRECT row (all output values ≈ 2.0),
+/// - output dtype is BF16 (the direct `Ok(dq)` passthrough arm fires).
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "values established by construction; .expect() message documents the invariant"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "byte slices constructed in this fn; try_into() on known-size windows is infallible"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: vec sized at init, loop indices bounded by rows/num_groups"
+)]
+fn embed_lookup_bf16_scales_passthrough_arm() {
+    let rows = 3usize;
+    let cols = 128usize;
+    let group_size = 128i32;
+    let bits = 4i32;
+    let num_groups = (cols as i32) / group_size; // 1
+    let words_per_row = (cols * bits as usize) / 32; // 16
+
+    // Packed weight: same nibble-per-row construction as the F16 test.
+    let mut weight_bytes = vec![0u8; rows * words_per_row * 4];
+    for r in 0..rows {
+        let nibble = r as u32;
+        let mut word = 0u32;
+        for pos in 0..8 {
+            word |= nibble << (pos * 4);
+        }
+        let word_bytes = word.to_le_bytes();
+        for w in 0..words_per_row {
+            let off = (r * words_per_row + w) * 4;
+            weight_bytes[off..off + 4].copy_from_slice(&word_bytes);
+        }
+    }
+
+    // Build BF16 scales (all 1.0) and biases (all 0.0): [rows, num_groups] BF16.
+    // BF16 1.0 = upper 2 bytes of F32 1.0 (0x3F80_0000) → [0x80, 0x3F] LE.
+    let bf16_one: [u8; 2] = [0x80, 0x3F];
+    let mut scales_bytes = vec![0u8; rows * num_groups as usize * 2];
+    for i in 0..rows * num_groups as usize {
+        scales_bytes[i * 2..i * 2 + 2].copy_from_slice(&bf16_one);
+    }
+    let biases_bytes = vec![0u8; rows * num_groups as usize * 2]; // BF16 0.0
+
+    let device = Device::Gpu;
+
+    let w_arr = Array::from_bytes(
+        &weight_bytes,
+        &[rows as i32, words_per_row as i32],
+        Dtype::U32,
+    )
+    .expect("weight array");
+    let s_arr = Array::from_bytes(&scales_bytes, &[rows as i32, num_groups], Dtype::Bf16)
+        .expect("scales array");
+    let b_arr = Array::from_bytes(&biases_bytes, &[rows as i32, num_groups], Dtype::Bf16)
+        .expect("biases array");
+
+    // Look up row 2 — expected dequant output: all 128 values ≈ 2.0.
+    let id_bytes = 2u32.to_le_bytes();
+    let ids = Array::from_bytes(&id_bytes, &[1], Dtype::U32).expect("ids");
+
+    let out = embed_lookup(
+        &ids,
+        &w_arr,
+        &s_arr,
+        Some(&b_arr),
+        group_size,
+        bits,
+        "affine",
+        device,
+    )
+    .expect("embed_lookup BF16 arm");
+    out.eval().expect("eval");
+
+    // dtype must be BF16 — the BF16 scales produce BF16 dequant, hitting Ok(dq).
+    assert_eq!(
+        out.dtype(),
+        Dtype::Bf16,
+        "embed_lookup must return BF16 when scales are already BF16 (passthrough arm)"
+    );
+
+    // Shape must be [1, 128].
+    assert_eq!(out.shape(), &[1, cols as i32], "embed_lookup output shape");
+
+    // Convert to F32 for value assertions.
+    let out_f32 = out.astype(Dtype::F32, Device::Cpu).expect("astype f32");
+    out_f32.eval().expect("eval f32");
+    let out_bytes = out_f32.to_bytes().expect("to_bytes");
+    let out_vals: Vec<f32> = out_bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+
+    assert_eq!(out_vals.len(), cols, "output must have {cols} values");
+    // scale=1.0, bias=0.0: dequant(nibble=2) = 2.0. Row 0→0.0, row 1→1.0 differ.
+    for (i, &v) in out_vals.iter().enumerate() {
+        assert!(
+            (v - 2.0_f32).abs() < 5e-3,
+            "embed_lookup BF16 arm: out[{i}] expected ≈2.0, got {v:.6}"
+        );
+    }
+}
+
 /// Validate quantize_f16_affine_int4 on the actual PARO embed_tokens row 760.
 ///
 /// Python reference (from mlx-lm-turboquant env):
