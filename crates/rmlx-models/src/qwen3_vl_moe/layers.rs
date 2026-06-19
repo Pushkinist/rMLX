@@ -162,13 +162,20 @@ impl Embedding {
     }
 }
 
-/// Quantized embedding lookup: dequantize the selected rows via an identity
-/// `quantized_matmul` on CPU, then move to `device`. Mirrors
-/// [`crate::qwen3_5_moe::layers::embed_lookup`].
-#[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-)]
+/// Quantized embedding lookup: gather the selected rows on-device and
+/// `dequantize` them. Mirrors mlx-lm's `QuantizedEmbedding.__call__`
+/// (`dequantize(weight[ids], scales[ids], biases[ids], …)`).
+///
+/// Earlier versions ran this through `Device::Cpu` with an `eye(seq) @ w`
+/// quantized-matmul trick. That is `O(seq²)` in the identity matrix and forces
+/// a GPU↔CPU round-trip: for a short text prompt it is merely wasteful, but the
+/// image path embeds the *whole* augmented prompt in one call — thousands of
+/// image-pad tokens (a 1152² image → ~1300 ids, a 2560² image → ~6400). The
+/// `seq²` CPU matmul + device copy then produces a single command buffer that
+/// overruns the Metal GPU watchdog before text prefill even starts. The
+/// on-device `take + dequantize` path is `O(seq)` and keeps everything on
+/// `device`, letting MLX fuse the lookup with the following layers (identical to
+/// [`crate::qwen3::qwen_embedding_lookup`]).
 fn embed_lookup(
     ids: &Array,
     weight: &Array,
@@ -179,35 +186,25 @@ fn embed_lookup(
     mode: &str,
     device: Device,
 ) -> Result<Array> {
-    let cpu = Device::Cpu;
-    let w_rows = weight.take(ids, 0, cpu)?;
-    let s_rows = scales.take(ids, 0, cpu)?;
-    let b_rows = biases.map(|b| b.take(ids, 0, cpu)).transpose()?;
-
-    let seq = ids.dim(0)? as usize;
-    let mut eye_data = vec![0.0_f32; seq * seq];
-    for i in 0..seq {
-        eye_data[i * seq + i] = 1.0;
-    }
-    let eye_bytes =
-        unsafe { std::slice::from_raw_parts(eye_data.as_ptr().cast::<u8>(), eye_data.len() * 4) };
-    let eye = Array::from_bytes(eye_bytes, &[seq as i32, seq as i32], Dtype::F32)?;
-    let eye_bf16 = eye.astype(Dtype::Bf16, cpu)?;
-
-    let result = rmlx_mlx::quantized_matmul(
-        &eye_bf16,
-        &w_rows,
-        &s_rows,
-        b_rows.as_ref(),
+    let weight_rows = weight.take(ids, 0, device)?;
+    let scales_rows = scales.take(ids, 0, device)?;
+    let biases_rows = biases.map(|b| b.take(ids, 0, device)).transpose()?;
+    let dq = rmlx_mlx::dequantize(
+        &weight_rows,
+        &scales_rows,
+        biases_rows.as_ref(),
         group_size,
         bits,
         mode,
-        false,
-        cpu,
+        device,
     )?;
-    if device == cpu {
-        Ok(result)
+    // Downstream layers (M-RoPE, attention masks, RmsNorm) expect BF16
+    // activations — the chunked prefill mask is hard-coded BF16
+    // (`build_chunked_prefill_mask`). `dequantize` returns the scales' dtype;
+    // force BF16 so SDPA's mask promotion stays consistent.
+    if dq.dtype() == Dtype::Bf16 {
+        Ok(dq)
     } else {
-        result.astype(result.dtype(), device)
+        dq.astype(Dtype::Bf16, device)
     }
 }
