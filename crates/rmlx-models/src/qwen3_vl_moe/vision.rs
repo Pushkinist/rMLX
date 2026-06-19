@@ -146,6 +146,21 @@ impl Mlp {
 // 2D vision RoPE.
 // ---------------------------------------------------------------------------
 
+/// Per-command-buffer score-matrix budget for the ViT full-attention pass, in
+/// `query_rows * key_rows` elements (per head). The Qwen3-VL ViT attends over
+/// every patch of one image (reference-faithful full attention — see the module
+/// docstring), so the score matrix is `seq * seq` per head. A large image
+/// (tens of thousands of patches) produces an O(seq²) score matrix whose single
+/// `scaled_dot_product_attention` command buffer overruns the ~10 s Metal GPU
+/// watchdog. We keep the math identical (each query still attends to all keys)
+/// but split the query dimension into tiles so each tile's command buffer
+/// covers `tile_rows * seq ≤ budget` score elements. The tile rows are derived
+/// as `max(1, budget / seq)`, so the per-buffer work stays bounded regardless of
+/// image size. The budget is chosen well below the size that timed out (a
+/// ~5184-patch single buffer, `26.9M` elems/head) and well above one that
+/// completes comfortably (a 784-patch buffer, `0.6M` elems/head).
+const VIT_ATTN_SCORE_BUDGET: usize = 2_097_152;
+
 #[allow(missing_debug_implementations)]
 struct Attention {
     qkv: Linear,
@@ -238,16 +253,74 @@ impl Attention {
         let v = to_bhsd(&v)?;
 
         let out = match mask {
+            // Multi-image / per-frame masked path (not built by the single-image
+            // serve path today): run as a single SDPA. A query tile would need
+            // the mask sliced per tile; not wired because no caller produces a
+            // mask here.
             Some(m) => {
                 scaled_dot_product_attention(&q, &k, &v, self.scale, "array", Some(m), device)?
             }
-            None => scaled_dot_product_attention(&q, &k, &v, self.scale, "", None, device)?,
+            // Single-image full attention. Tile the query dimension so each
+            // command buffer's score matrix (`tile_rows * seq`) stays under the
+            // Metal GPU watchdog budget; mathematically identical to one SDPA
+            // over all queries (each query attends to all keys). For a small
+            // image (`seq * seq <= budget`) this collapses to the original
+            // single SDPA, so small-image numerics are bit-identical.
+            None => self.attend_tiled(&q, &k, &v, seq, h, d, VIT_ATTN_SCORE_BUDGET, device)?,
         };
         let out = out
             .reshape(&[h, seq, d], device)?
             .transpose(&[1, 0, 2], device)?
             .reshape(&[seq, h * d], device)?;
         self.proj.forward(&out, device)
+    }
+
+    /// Full attention with the query dimension tiled to bound the per-command-
+    /// buffer score-matrix work. `q`/`k`/`v` are `[1, H, seq, D]`; returns
+    /// `[1, H, seq, D]` (same as a single SDPA over all queries — each query
+    /// attends to every key). Tiles only when `seq * seq` exceeds `budget`;
+    /// otherwise a single SDPA (bit-identical to the pre-tiling path). `budget`
+    /// is a parameter so a test can drive the tiling path at a small `seq`.
+    #[allow(clippy::too_many_arguments)]
+    fn attend_tiled(
+        &self,
+        q: &Array,
+        k: &Array,
+        v: &Array,
+        seq: i32,
+        h: i32,
+        d: i32,
+        budget: usize,
+        device: Device,
+    ) -> Result<Array> {
+        let seq_u = seq as usize;
+        // One SDPA when the full score matrix fits the budget — preserves the
+        // exact pre-tiling command buffer (and numerics) for small images.
+        if seq_u.saturating_mul(seq_u) <= budget {
+            return scaled_dot_product_attention(q, k, v, self.scale, "", None, device);
+        }
+        // Query rows per tile so `tile * seq <= budget`; at least 1.
+        let tile = (budget / seq_u).max(1) as i32;
+        debug!(
+            seq,
+            tile, "qwen3_vl_moe vision: tiling ViT attention query dim under watchdog budget"
+        );
+        let mut tiles: Vec<Array> = Vec::with_capacity((seq_u.div_ceil(tile as usize)).max(1));
+        let mut qs = 0_i32;
+        while qs < seq {
+            let qe = (qs + tile).min(seq);
+            // q[:, :, qs:qe, :] against full k/v — full attention for this tile.
+            let q_tile = q.slice(&[0, 0, qs, 0], &[1, h, qe, d], &[1, 1, 1, 1], device)?;
+            let o_tile = scaled_dot_product_attention(&q_tile, k, v, self.scale, "", None, device)?;
+            // Flush this tile's command buffer so the watchdog never sees the
+            // whole O(seq²) attention in one buffer.
+            o_tile.eval()?;
+            tiles.push(o_tile);
+            qs = qe;
+        }
+        // Concatenate tile outputs back along the query (seq) axis -> [1,H,seq,D].
+        let refs: Vec<&Array> = tiles.iter().collect();
+        concatenate(&refs, 2, device)
     }
 }
 
@@ -424,11 +497,12 @@ impl Qwen3VlMoeVision {
             h = blk.forward(&h, &cos, &sin, mask.as_ref(), device)?;
             // Flush each block's command buffer. The ViT runs full attention over
             // every patch (native tiling → tens of thousands of patches for a
-            // large image, an O(num_patches^2) score matrix per block); letting
-            // all 27 blocks accumulate into a single lazy graph overruns the ~10s
-            // Metal GPU watchdog. Evaluating per block keeps each command buffer
-            // small. No effect on small images (the eval is cheap once the block
-            // is already computed).
+            // large image); the in-block attention tiles its O(num_patches^2)
+            // score matrix (see `attend_tiled`), and this per-block eval keeps the
+            // surrounding qkv/proj/MLP matmuls from accumulating across all 27
+            // blocks into one lazy graph that would overrun the Metal GPU
+            // watchdog. No effect on small images (the eval is cheap once the
+            // block is already computed).
             h.eval()?;
             if let Some(ds_idx) = self
                 .cfg

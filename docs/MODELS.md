@@ -467,14 +467,30 @@ than a `slice_update` broadcast error. Serve a long prompt with `--max-ctx N` �
 (soft tokens + text length).
 
 Both prefill paths are **chunked** (per-arch `prefill_chunk` = 512, plain GQA
-MoE — no GDN, so it tolerates the same chunk as Gemma4) and the vision tower
-evaluates per ViT block, so a long prompt does not run a single multi-thousand-
-token forward in one Metal command buffer. Note: the ViT runs **full attention
-over every image patch** for a single image (reference-faithful — mlx-vlm splits
-attention per image, which is one full block for one image). A very large image
-(tens of thousands of patches → an O(num_patches²) attention) can still overrun
-the ~10s Metal GPU watchdog on memory-constrained Apple Silicon; this is a
-vision-tower scaling limit, independent of the KV-cache sizing above.
+MoE — no GDN, so it tolerates the same chunk as Gemma4) so a long prompt does
+not run a single multi-thousand-token forward in one Metal command buffer.
+
+Large images that produce thousands of soft tokens are made watchdog-safe by
+three bounded passes, none of which add an env var or change numerics:
+
+- **Quantized embedding lookup** is an on-device `take + dequantize` (mlx-lm's
+  `QuantizedEmbedding`), `O(seq)` in the prompt length. The image branch embeds
+  the *whole* augmented prompt (image-pad tokens included) in one call, so the
+  earlier `eye(seq) @ w` lookup was `O(seq²)` and produced a single command
+  buffer that overran the GPU watchdog before text prefill even started — the
+  dominant large-image failure (e.g. a 1152² image, ~1300 soft tokens).
+- **Vision tower** runs **full attention over every image patch** for a single
+  image (reference-faithful — mlx-vlm splits attention per image, one full block
+  per image), but the per-block attention **tiles the query dimension** so each
+  command buffer's score matrix stays under the watchdog budget. The result is
+  bit-identical to one SDPA over all queries (each query still attends to all
+  keys); small images below the budget take the original single-SDPA path
+  unchanged.
+- **Image prefill** is chunked at 512 tokens.
+
+With all three, large images complete end-to-end (validated to 6400 soft tokens
+/ a 2560² image, and progressing cleanly past 12 000 soft tokens). The remaining
+limit is wall-clock latency and `--max-ctx`, not the GPU watchdog.
 
 ### Special features
 
