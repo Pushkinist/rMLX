@@ -253,8 +253,9 @@ pub fn generate_greedy<'a>(
     // to grow the prefill_raw buffer from zero, ignoring the existing payload,
     // which produces wrong attention and a guard error on resumed caches.
     //
-    // Chunking (same prefill_chunk as Path C): keeps GDN ts < 256 per chunk
-    // to avoid Metal watchdog timeouts on long tails.
+    // Chunking (same prefill_chunk as Path C): bounds the per-chunk forward
+    // (KV write + GDN kernel) so long tails stay under the Metal
+    // command-buffer budget.
     if let Some((mut kv_caches, mut lin_caches, prefix_len)) = hydrated_tail {
         let tail_len = prompt_ids.len() - prefix_len;
         tracing::info!(
@@ -440,28 +441,16 @@ pub fn generate_greedy<'a>(
     // `max_seq_ceiling` caps growth and rejects over-long prompts.
     let (initial_max_seq, max_seq_ceiling) =
         kv_max_seq_and_ceiling(max_ctx_override, model.cfg.max_position_embeddings as i32);
-    // 64-token chunks keep GDN ts < 256 threshold → sequential MSL kernel, no lazy graph explosion.
-    // 2048-token chunks (e0231a4) trigger gated_delta_prefill_ops at ts=2048 → ~1.47M lazy nodes
-    // across 30 GDN layers → Metal GPU watchdog timeout.
-    //
-    // Compile cache is in place (gated_delta_msl.rs). Raising
-    // chunk size to 256 routes chunks to gated_delta_prefill_ops, which on the FIRST
-    // call traces T=256 (~184K lazy nodes) — acceptable for the watchdog, but the trace
-    // cost (~6s) lands on the critical path of the first request without warmup.
-    // The GDN pre-warm (`arch::load_model`) now traces gated_delta_prefill_ops at
-    // model load time, so the first chunk's compile cost is paid at startup.
-    //
-    // p0b-ttft bench: even with pre-warm, chunk=256
-    // REGRESSED cold TTFT by +15% at 8K and +80% at 32K vs chunk=64. Per-chunk
-    // gated_delta_prefill_ops at T=256 is genuinely slower (much heavier lazy
-    // graph per call) than per-chunk at T=64. Default stays at 64; the env
-    // override remains available for users who want to experiment.
-    //
-    // Override via `RMLX_PREFILL_CHUNK` (global) or
-    // `RMLX_PREFILL_CHUNK_QWEN3_5_MOE` (per-arch). Note: the pre-warm uses
-    // the chunk size resolved at load time
-    // (`gdn_warmup_t = prefill_chunk_for("qwen3_5_moe")` in arch.rs); set
-    // the env BEFORE `rmlx serve` for the warmup to match.
+    // Prefill chunk for qwen3_5_moe defaults to 2048 (see prefill_chunk.rs for
+    // the sweep behind that number). The GDN recurrence runs the
+    // `gated_delta_step_gpu` kernel at any T, so a large chunk does NOT route to
+    // the ops-graph path that used to explode the lazy graph — it just means
+    // fewer, bigger forward passes and far fewer per-chunk KV-state evals, which
+    // is where the prefill/TTFT win comes from. Override via
+    // `RMLX_PREFILL_CHUNK` (global) or `RMLX_PREFILL_CHUNK_QWEN3_5_MOE`
+    // (per-arch); the GDN kernel pre-warm in `arch::load_model` reads the same
+    // resolved chunk, so set the env BEFORE `rmlx serve` for the warmup shape to
+    // match.
     let prefill_chunk = crate::prefill_chunk::prefill_chunk_for("qwen3_5_moe");
 
     // Path C: cache miss — full prefill from scratch

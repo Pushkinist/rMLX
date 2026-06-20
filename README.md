@@ -124,9 +124,11 @@ temp=0; per-family grids under [`docs/models/`](docs/models)):
   decode there is weight-bandwidth-bound, so KV quant buys little. (31b dense
   trails slightly — bandwidth physics.)
 
-The current weak spot is **prefill / time-to-first-token**: roughly 40–50×
-slower than `mlx-lm` at short context. It is an active optimization target, not
-a decode problem — steady-state throughput is unaffected.
+**Prefill / time-to-first-token** is at parity with `mlx-lm`: a direct
+`mlx-lm` run on the same 35B-A3B snapshot measures ≈ 2.7k–3.6k prompt tok/s,
+versus rMLX's ≈ 3.0k — both bandwidth-bound at roughly the same level. (An
+earlier draft cited a ~40–50× prefill deficit; that came from a non-physical
+baseline and has been retracted after a direct measurement.)
 
 ## Requirements
 

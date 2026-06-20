@@ -18,8 +18,18 @@ Step-by-step execution — one cell per run.
   +12–15% (kv-none), confirmed path-equivalent to the sibling harness (−0.2%).
 - **Best KV: rotor3 / iso3** (rotation codecs) — +1.9% over none at 128k. Turbo
   codecs *lose* at long ctx (V-dequant overhead). At 8k all 8-bit-K codecs tie.
-- **The real deficit is prefill/TTFT**, ~40–50× slower than mlx-lm at short ctx —
-  the #1 improvement-plan target.
+- **Prefill/TTFT — FIXED, now at parity with mlx-lm.** The GatedDeltaNet
+  recurrence flipped from the `gated_delta_step_gpu` kernel to a lazy ops-graph at
+  T≥256, which pinned the prefill chunk at 64 and made rMLX ~7× slower than its
+  own potential. Fix: GDN always uses the kernel → chunk rises 64→2048 (mlx-lm's
+  `prefill_step_size`). A kv-none warm-TTFT sweep measured **4.0–4.2× lower TTFT**
+  (4k 4240→1065ms, 8k 9008→2136ms) with no decode change, no Metal watchdog
+  through 64k. **The earlier "~40–50× slower than mlx-lm / 4k TTFT 144ms" claim
+  was a measurement error** — a direct mlx-lm 0.31.3 run on this exact snapshot +
+  prompts measures **2711–3606 prompt tok/s** (4k/8k), i.e. ~1.1–1.2× of rMLX's
+  ~3050 tok/s; the cited 28000 tok/s exceeds the M5 Max bandwidth ceiling and is
+  non-physical. Prefill is bandwidth-bound; both backends sit at ~the same level.
+  The §2a grid below is the pre-fix `rmlx baseline` record. See §4 ①.
 - **Speculative barely helps:** MTP +4.2% (best drafter), DFlash −37%, Eagle3
   −39% (now works after the crash fix, but low accept ~0.27 → net loss). Spec-loop
   overhead eats the accept gain.
@@ -195,7 +205,8 @@ the overhead.
 
 > **Phase B verdict: rMLX baseline (kv none) WINS decode at every prompt size**
 > (+12–15%) vs the champion mlx-lm-turboquant. KV-quant variants (Phase C) may
-> push further. The deficit is prefill/TTFT, not decode (§4).
+> push further. Prefill/TTFT (once the apparent deficit) is now at mlx-lm parity
+> after the chunk fix — see §4 ①.
 
 ---
 
@@ -203,11 +214,28 @@ the overhead.
 
 Ranked by impact:
 
-1. **Prefill / TTFT — the dominant deficit.** rMLX prefill is ~40–50× slower than
-   mlx-lm at short ctx (4k TTFT 6.9s vs ~144ms) and degrades with length (prefill
-   596→419 tok/s as 4k→128k; TTFT 6.9s→132s→5m12s). Decode is fine; **prefill is
-   where rMLX loses wall-clock.** Profile the MoE first-prefill path (chunked
-   prefill, expert gather, graph compile). Highest-value fix.
+1. **Prefill / TTFT — RESOLVED; rMLX is at mlx-lm parity.** rMLX prefill was ~7×
+   slower than its own potential (NOT the "40–50× vs mlx-lm" originally claimed —
+   see below), degrading with length. Root cause: the GatedDeltaNet recurrence
+   flipped from the `gated_delta_step_gpu` Metal kernel to a lazy ops-graph at
+   T≥256 (~184K nodes at T=256, ~1.47M at T=2048 across 30 GDN layers), which
+   pinned the prefill chunk at 64 — so a 4k prompt ran ~64 forward passes + 63
+   KV-state evals where mlx-lm runs ~2. Fix: the GDN now always uses the kernel
+   (one dispatch, T-loop in registers; chaining across chunks is f32-state-exact
+   and matches mlx-lm's `use_kernel=True` default), unblocking a chunk rise to
+   2048 (mlx-lm's `prefill_step_size`). A kv-none warm-TTFT sweep measured TTFT 4k
+   4240→1065ms (4.0×), 8k 9008→2136ms (4.2×), 16k 19489→4712ms (4.1×); 32k/64k
+   complete with no Metal watchdog; the 3-family decode canary is unchanged.
+   **Baseline correction:** the original "~40–50× slower / 4k TTFT 144ms" was a
+   measurement error. A direct mlx-lm 0.31.3 run on this exact snapshot + prompts
+   measures **2711/3301 tok/s @4k (cold/warm), 3606 @8k** — vs rMLX's ~3050 tok/s,
+   i.e. mlx-lm is only **1.08–1.18×** faster, not 48×. The cited 28000 tok/s is
+   non-physical (exceeds M5-Max bandwidth ~5×). Prefill is bandwidth-bound and
+   both backends sit at ~the same level; the residual ~10–18% is ordinary
+   cross-impl kernel variance (host-side mask build is one small contributor),
+   not a structural deficit. **Investigated + dropped:** moving the post-prefill
+   prompt-cache store off the TTFT path — measured at 2.9ms (0.17% of TTFT), no
+   measurable win, reverted.
 2. **Decode kernel headroom.** rMLX wins the tier but sits ~half of M5-Max roofline
    (≈340 GB/s of ~600). llama.cpp/ollama saturate more. Tighter MoE decode kernels
    (expert gather + dequant fusion) could extend the lead. `--fused-qk` is
