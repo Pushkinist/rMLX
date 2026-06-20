@@ -16,8 +16,14 @@
 #   5. Prints the exact `gh release upload` command to attach the bottle.
 #
 # Prerequisites:
-#   - rmlx installed via `brew install --build-bottle packaging/homebrew/rmlx.rb`
-#     on the same macOS major version you want to bottle.
+#   - rmlx installed from the TAP via `brew install --build-bottle` on the same
+#     macOS major version you want to bottle. Homebrew >=6 rejects installing a
+#     loose `.rb` path ("formulae must be in a tap"), so the keg must be built
+#     from the tap formula (which must already carry the new version's url+sha):
+#       cp packaging/homebrew/rmlx.rb \
+#         "$(brew --repository)/Library/Taps/pushkinist/homebrew-rmlx/Formula/rmlx.rb"
+#       HOMEBREW_NO_INSTALL_FROM_API=1 brew install --build-bottle pushkinist/rmlx/rmlx
+#     See docs/RELEASING.md for the full ordered flow.
 #   - A published GitHub Release for the current version tag must already
 #     exist (step 6 in docs/RELEASING.md) so the root_url is valid at
 #     install time.
@@ -62,10 +68,13 @@ brew list rmlx >/dev/null 2>&1 || {
   echo "" >&2
   echo "error: rmlx is not installed in Homebrew." >&2
   echo "" >&2
-  echo "Install it first with:" >&2
-  echo "  brew install --build-bottle packaging/homebrew/rmlx.rb" >&2
+  echo "Install it from the tap first (Homebrew >=6 rejects loose .rb paths)," >&2
+  echo "after the tap formula carries this version's url+sha:" >&2
+  echo "  cp packaging/homebrew/rmlx.rb \\" >&2
+  echo "    \"\$(brew --repository)/Library/Taps/pushkinist/homebrew-rmlx/Formula/rmlx.rb\"" >&2
+  echo "  HOMEBREW_NO_INSTALL_FROM_API=1 brew install --build-bottle pushkinist/rmlx/rmlx" >&2
   echo "" >&2
-  echo "Then re-run this script." >&2
+  echo "Then re-run this script. See docs/RELEASING.md." >&2
   exit 1
 }
 
