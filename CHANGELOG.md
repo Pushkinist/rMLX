@@ -7,8 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-06-20
+
+Prefill / time-to-first-token fix for the MoE families, plus a baseline
+correction. Headline: Qwen 3.6 prefill is ~4× faster at short context and now at
+mlx-lm parity. No breaking changes.
+
+### Performance
+
+- **Qwen 3.6 (Qwen3.5-MoE) prefill is ~4× faster at short context.** The
+  GatedDeltaNet recurrence flipped from the `gated_delta_step_gpu` Metal kernel
+  to a lazy ops-graph at `T≥256`, which pinned the prefill chunk at 64 — a 4k
+  prompt ran ~64 forward passes where mlx-lm runs ~2. Making the GDN always use
+  the kernel (a byte-for-byte port of mlx-lm's `gated_delta_kernel`; chaining
+  across chunks is f32-state-exact) unblocked raising the prefill chunk to 2048
+  (mlx-lm's `prefill_step_size`). Warm-TTFT on `Qwen3.6-35B-A3B-8bit` (kv-none):
+  4k 4240→1065 ms (4.0×), 8k 9008→2136 ms (4.2×), 16k 19489→4712 ms (4.1×);
+  decode unchanged, no Metal watchdog through 64k. `gated_delta_prefill_ops` is
+  retained as the test-only kernel-equivalence oracle. (#155)
+- **Gemma 4 prefill chunk raised 512 → 1024.** A real-model sweep found 1024 the
+  shared TTFT sweet spot: e4b 4k +6% / 8k +4.5%, 26b-a4b +17%; decode flat, no
+  watchdog. `chunk=2048` regresses the e4b dense path (a sliding-window /
+  exec-unit cliff above 1024 = 2×window), so the shared `gemma4` default
+  stays 1024. (#155)
+
 ### Documentation
 
+- **Prefill/TTFT is at mlx-lm parity, not "40–50× slower".** The earlier
+  "~40–50× slower than mlx-lm / 4k TTFT 144 ms / 28000 tok/s" framing was a
+  non-physical baseline (the cited prompt-throughput exceeds the M5-Max
+  bandwidth ceiling). A direct mlx-lm 0.31.3 run on the same `Qwen3.6-35B-A3B-8bit`
+  snapshot + prompts measures 2711–3606 prompt tok/s vs rMLX's ~3050 — mlx-lm is
+  only ~1.1–1.2× faster. README, `docs/models/qwen3.6/rMLX.md`, and
+  `docs/models/qwen3.6/SIBLINGS.md` retract the claim. (#155)
 - **Gemma 4 e4b QAT complex-image vision is a checkpoint limitation, not a bug.**
   Investigated degenerate / hallucinated output from the `e4b-it-qat-mxfp4` and
   `-qat-nvfp4` snapshots on high-detail screenshots (#153). The e4b QAT
@@ -453,7 +484,8 @@ inference + conversion backend for Apple Silicon — no Python at runtime.
 - Speculative drafters validated against their verifiers: Qwen 3.6 MTP sidecar
   and the Gemma 4 assistant drafter.
 
-[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.2.4...HEAD
+[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.2.5...HEAD
+[0.2.5]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.5
 [0.2.4]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.4
 [0.2.3]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.3
 [0.2.2]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.2
