@@ -138,14 +138,22 @@ fn arch_default(arch: &str) -> Option<usize> {
         // `RMLX_PREFILL_CHUNK_QWEN3_5_MOE`.
         "qwen3_5_moe" => Some(2048),
         // qwen3_vl_moe: plain GQA MoE (no GDN linear attention), so it tolerates
-        // the same large chunk as gemma4. Native image tiling produces thousands
-        // of soft tokens; a single-shot forward over the full prompt trips the
-        // Metal ~10s GPU watchdog, so the image prefill is chunked at 512.
+        // a large text chunk. Kept at 512 for the image path: native image
+        // tiling produces thousands of soft tokens, and a single-shot forward
+        // over the full prompt trips the Metal ~10s GPU watchdog, so the image
+        // prefill is chunked at 512.
         "qwen3_vl_moe" => Some(512),
         "gemma3" => Some(256),
-        // gemma4 default 512: p0b-ttft bench measured -30% cold TTFT at 8K
-        // and -12% at 32K vs chunk=64 with no Metal watchdog at max-ctx 64K.
-        "gemma4" => Some(512),
+        // gemma4 default 1024. A real-model kv-none sweep (e4b dense + 26b-a4b
+        // MoE) found 1024 the shared TTFT sweet spot: e4b 4k 602→565ms / 8k
+        // 1234→1179ms (~+6%/+4.5% vs 512), 26b 4k 1578→1302ms / 8k 3285→2743ms
+        // (~+17% vs 512), decode unchanged, no Metal watchdog, coherent at
+        // 4k/8k/16k. chunk=2048 REGRESSES the e4b dense path (722ms @4k — a
+        // sliding-window/exec-unit cliff above 1024 = 2×window), so it is NOT
+        // the shared default; the 26b MoE gains a further ~5% at 2048 but the
+        // shared key keeps 1024 to protect e4b. Override via
+        // `RMLX_PREFILL_CHUNK_GEMMA4`.
+        "gemma4" => Some(1024),
         "qwen2" => Some(256),
         // laguna currently lacks tuning data; preserve its pre-tuning value
         // of 256 (was hardcoded as `PREFILL_CHUNK = 256` before this module

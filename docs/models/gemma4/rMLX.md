@@ -55,6 +55,13 @@ serve), so rMLX cells compare directly. Bar (§0.1): WIN / TIE-on-CI-overlap / L
   not a dependable Gemma4 win — drafter accept-rate is the whole story.
 - **Prefill/TTFT is still brutal on the big models** — 31b dense `none` 128k cold
   prefill **477 s**; the lever there is prefill, not decode.
+- **Prefill chunk raised 512 → 1024** (one shared `arch_default("gemma4")`). A
+  warm-TTFT kv-none sweep put 1024 at the sweet spot: e4b 4k 602→565 ms / 8k
+  1234→1179 ms (~+6 %/+4.5 %), 26b-a4b 4k 1578→1302 ms / 8k 3285→2743 ms (~+17 %),
+  decode flat, no watchdog. `chunk=2048` *regresses* the e4b dense path (window=512
+  exec-unit cliff) so it is not the shared default; the 26b would gain a further
+  ~5 % at 2048 but the shared key stays 1024 to protect e4b. The cold long-ctx
+  numbers above predate this and are unrefreshed.
 
 ---
 

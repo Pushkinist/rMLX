@@ -320,9 +320,10 @@ pub fn generate_greedy<'a>(
     // with the enter_prefill/exit_prefill bracketing (raw-BF16 →
     // one-shot quantize).
     //
-    // Chunk size is per-arch; default 512 for gemma4 (large vocab + dense
-    // SWA layers benefit from amortized FFI/flush overhead). Override via
-    // `RMLX_PREFILL_CHUNK` (global) or `RMLX_PREFILL_CHUNK_GEMMA4`
+    // Chunk size is per-arch; default 1024 for gemma4 (large vocab + dense
+    // SWA layers benefit from amortized FFI/flush overhead; a real-model sweep
+    // put the TTFT sweet spot at 1024 — 2048 regresses the e4b dense path).
+    // Override via `RMLX_PREFILL_CHUNK` (global) or `RMLX_PREFILL_CHUNK_GEMMA4`
     // (per-arch).
     let prefill_chunk = crate::prefill_chunk::prefill_chunk_for("gemma4");
     let prefill_t0 = Instant::now();
@@ -411,7 +412,7 @@ pub fn generate_greedy<'a>(
 
     // ------------------------------------------------------------------
     // Prefill: encode the prompt in `prefill_chunk` token chunks (default
-    // 512 for gemma4; see binding at top of path-B section). Per chunk we
+    // 1024 for gemma4; see binding at top of path-B section). Per chunk we
     // eval the KV-cache prefill_raw buffers (not the logits) to flush the
     // Metal command buffer under the ~10s watchdog while letting MLX skip
     // the wasted lm_head matmul for non-final chunks via lazy graph

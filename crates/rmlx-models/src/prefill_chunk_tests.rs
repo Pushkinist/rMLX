@@ -13,7 +13,7 @@ fn defaults_match_recommendations() {
     assert_eq!(arch_default("qwen3_5_moe"), Some(2048));
     assert_eq!(arch_default("qwen3_vl_moe"), Some(512));
     assert_eq!(arch_default("gemma3"), Some(256));
-    assert_eq!(arch_default("gemma4"), Some(512));
+    assert_eq!(arch_default("gemma4"), Some(1024));
     assert_eq!(arch_default("qwen2"), Some(256));
     assert_eq!(arch_default("laguna"), Some(256));
     assert_eq!(arch_default("bitnet"), Some(64));
@@ -68,14 +68,14 @@ fn module_key_resolves_to_arch_default_chunk() {
         return;
     }
     // qwen3_5_moe resolves to its own 2048 default (GDN kernel handles any T),
-    // distinct from gemma4's 512.
+    // distinct from gemma4's 1024.
     let key = module_key_for_class("Qwen3_5MoeForConditionalGeneration");
     assert_eq!(prefill_chunk_for(key), 2048);
     assert_eq!(
         prefill_chunk_for(module_key_for_class("Gemma4ForConditionalGeneration")),
-        512
+        1024
     );
-    // Unknown class resolves through "" to FALLBACK, not gemma4's 512.
+    // Unknown class resolves through "" to FALLBACK, not gemma4's default.
     assert_eq!(
         prefill_chunk_for(module_key_for_class("TotallyUnknownArch")),
         FALLBACK

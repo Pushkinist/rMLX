@@ -395,9 +395,9 @@ fn prefill_chunk_global_state_serial() {
     // the hardcoded gemma4 default. With `arch = "qwen3_5_moe"` the controller's
     // `current` starts from that arch's default (2048), so the first overload
     // lower halves it to 1024. Under the old hardcoded-"gemma4" bug `current`
-    // would have started at 512 and the first lower would land at 256 — so an
-    // exact `resolved == arch_default / 2` assertion discriminates the two
-    // (1024 vs 256). Note: `arch_default` MUST be captured BEFORE driving the
+    // would have started at gemma4's default (1024) and the first lower would
+    // land at 512 — so an exact `resolved == arch_default / 2` assertion
+    // discriminates the two (1024 vs 512). Note: `arch_default` MUST be captured BEFORE driving the
     // controller, while the override is cleared — `prefill_chunk_for` returns the
     // runtime override (highest precedence) once one is set, so reading it after
     // the lower would self-corrupt the bound.
@@ -428,15 +428,15 @@ fn prefill_chunk_global_state_serial() {
         }
 
         // The lower must have set an override; the first overload lower halves
-        // the qwen3_5_moe arch default (2048 → 1024). Under the old gemma4-512
-        // bug it would be 256, so the exact-equality check discriminates.
+        // the qwen3_5_moe arch default (2048 → 1024). Under the old gemma4-default
+        // bug it would be 512, so the exact-equality check discriminates.
         let resolved = rmlx_models::prefill_chunk::runtime_override()
             .expect("D: overload must lower the chunk and set a runtime override");
         assert_eq!(
             resolved,
             arch_default / 2,
             "D: first lower must halve the qwen3_5_moe default ({arch_default} → {}), \
-             not start from gemma4's 512; got {resolved}",
+             not start from gemma4's default; got {resolved}",
             arch_default / 2
         );
         rmlx_models::prefill_chunk::set_prefill_chunk(0);
