@@ -225,62 +225,56 @@ impl GatedDeltaNet {
         };
 
         // ── Recurrence dispatch ───────────────────────────────────────────
-        // Two paths:
-        // T < 256 (decode + small prefill chunks): sequential MSL kernel —
-        // compact single dispatch, state lives in GPU registers.
-        // T >= 256 (prefill): ops-based graph — Rust loop builds a lazy MLX
-        // graph over T steps; MLX schedules all T ops in one GPU pass.
-        // `gated_delta_prefill_ops` handles the GQA repeat internally and
-        // works entirely in f32 (state precision), so q/k/v/beta dtype
-        // normalisation for the Metal kernel is not needed here.
+        // Always the sequential MSL kernel `gated_delta_step_gpu`, for both
+        // decode (T=1) and prefill (T=chunk). It is a byte-for-byte port of
+        // mlx-lm 0.31's `gated_delta_kernel`, which mlx-lm itself uses for the
+        // whole prompt (`use_kernel=True` default): the `for t in 0..T` loop
+        // runs inside one Metal dispatch with the recurrent state in registers
+        // while the `B*Hv*Dv*32` threads supply the parallelism. The
+        // per-timestep loop is sequential WITHIN a thread, but the GPU hides
+        // that latency across heads/dims — so a single dispatch over a large T
+        // beats both small chunks (more dispatches) and the ops-graph path
+        // (`gated_delta_prefill_ops`), whose Rust per-step graph build explodes
+        // to ~184K–1.47M lazy nodes at T=256..2048.
+        //
+        // Chaining the kernel across prefill chunks is numerically exact: the
+        // f32 `state_in`→`state_out` carries between calls, so chunked prefill
+        // equals a single full-prompt call, and the prefill→decode handoff now
+        // shares one reduction order (decode already used this kernel).
         let g_f32 = if g_full.dtype() == Dtype::F32 {
             g_full
         } else {
             g_full.astype(Dtype::F32, device)?
         };
 
-        let (y_bf16, state_out) = if ts >= 256 {
-            // Prefill ops path: no dtype unification needed (ops path casts internally).
-            crate::gated_delta_msl::gated_delta_prefill_ops(
-                &q4_scaled_full,
-                &k4_scaled_full,
-                &v4,
-                &g_f32,
-                &beta_full,
-                &state_in,
-                device,
-            )?
+        // Unify q/k/v/beta to a single dtype before the kernel — MLX affine
+        // INT4 matmul returns the input dtype but scalar Bf16 multiplications
+        // can silently promote to F32. Use v4's dtype as ground truth.
+        let target_dtype = v4.dtype();
+        let q4_scaled_full = if q4_scaled_full.dtype() == target_dtype {
+            q4_scaled_full
         } else {
-            // Sequential MSL kernel path (decode / small chunk prefill).
-            // Unify q/k/v/beta to a single dtype before the kernel — MLX affine
-            // INT4 matmul returns the input dtype but scalar Bf16 multiplications
-            // can silently promote to F32. Use v4's dtype as ground truth.
-            let target_dtype = v4.dtype();
-            let q4_scaled_full = if q4_scaled_full.dtype() == target_dtype {
-                q4_scaled_full
-            } else {
-                q4_scaled_full.astype(target_dtype, device)?
-            };
-            let k4_scaled_full = if k4_scaled_full.dtype() == target_dtype {
-                k4_scaled_full
-            } else {
-                k4_scaled_full.astype(target_dtype, device)?
-            };
-            let beta_full = if beta_full.dtype() == target_dtype {
-                beta_full
-            } else {
-                beta_full.astype(target_dtype, device)?
-            };
-            crate::gated_delta_msl::gated_delta_step_gpu(
-                &q4_scaled_full,
-                &k4_scaled_full,
-                &v4,
-                &g_f32,
-                &beta_full,
-                &state_in,
-                device,
-            )?
+            q4_scaled_full.astype(target_dtype, device)?
         };
+        let k4_scaled_full = if k4_scaled_full.dtype() == target_dtype {
+            k4_scaled_full
+        } else {
+            k4_scaled_full.astype(target_dtype, device)?
+        };
+        let beta_full = if beta_full.dtype() == target_dtype {
+            beta_full
+        } else {
+            beta_full.astype(target_dtype, device)?
+        };
+        let (y_bf16, state_out) = crate::gated_delta_msl::gated_delta_step_gpu(
+            &q4_scaled_full,
+            &k4_scaled_full,
+            &v4,
+            &g_f32,
+            &beta_full,
+            &state_in,
+            device,
+        )?;
 
         // ── Persist recurrent state + conv tail into the cache ────────────
         // mlx-lm reference: `cache[1] = state` and

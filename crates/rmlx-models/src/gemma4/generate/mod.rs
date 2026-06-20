@@ -320,9 +320,10 @@ pub fn generate_greedy<'a>(
     // with the enter_prefill/exit_prefill bracketing (raw-BF16 →
     // one-shot quantize).
     //
-    // Chunk size is per-arch; default 512 for gemma4 (large vocab + dense
-    // SWA layers benefit from amortized FFI/flush overhead). Override via
-    // `RMLX_PREFILL_CHUNK` (global) or `RMLX_PREFILL_CHUNK_GEMMA4`
+    // Chunk size is per-arch; default 1024 for gemma4 (large vocab + dense
+    // SWA layers benefit from amortized FFI/flush overhead; a real-model sweep
+    // put the TTFT sweet spot at 1024 — 2048 regresses the e4b dense path).
+    // Override via `RMLX_PREFILL_CHUNK` (global) or `RMLX_PREFILL_CHUNK_GEMMA4`
     // (per-arch).
     let prefill_chunk = crate::prefill_chunk::prefill_chunk_for("gemma4");
     let prefill_t0 = Instant::now();
@@ -411,7 +412,7 @@ pub fn generate_greedy<'a>(
 
     // ------------------------------------------------------------------
     // Prefill: encode the prompt in `prefill_chunk` token chunks (default
-    // 512 for gemma4; see binding at top of path-B section). Per chunk we
+    // 1024 for gemma4; see binding at top of path-B section). Per chunk we
     // eval the KV-cache prefill_raw buffers (not the logits) to flush the
     // Metal command buffer under the ~10s watchdog while letting MLX skip
     // the wasted lm_head matmul for non-final chunks via lazy graph
@@ -430,8 +431,8 @@ pub fn generate_greedy<'a>(
     // quantize-dequantized on every chunk. exit_prefill() quantizes the
     // whole sequence in one shot when the loop completes.
     //
-    // Non-MoE arch — chunk well below the gated_delta ts>=256 threshold
-    // that only Qwen3.5MoE worries about (see `gated_delta_prefill_ops`).
+    // Non-MoE arch with no GatedDeltaNet layers — the prefill chunk only
+    // trades off per-chunk full-attention/KV cost vs dispatch count.
     // ------------------------------------------------------------------
     // Phase span: prefill. Entered once per generate_greedy call, not per token.
     // Visible in samply/Instruments as a single region covering the full prefill.
