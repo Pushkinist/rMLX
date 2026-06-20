@@ -2,12 +2,21 @@
 
 **Rust-native, single-binary [MLX](https://github.com/ml-explore/mlx) inference + conversion backend for Apple Silicon.**
 
-No Python at runtime. One `cargo build --release` artifact. The widest weight ×
-KV-quantization matrix any MLX server ships, including rotation-based KV families
-(TurboQuant, IsoQuant, PlanarQuant, RotorQuant, ParoQuant) that no other MLX
-server offers.
+[![Release](https://img.shields.io/github/v/release/Pushkinist/rMLX?sort=semver&color=blue)](https://github.com/Pushkinist/rMLX/releases)
+[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](#license)
+[![Platform](https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple)](#requirements)
+[![Rust](https://img.shields.io/badge/rust-1.95%2B-orange?logo=rust)](#requirements)
 
-> Status: **0.2.2** — feature-complete native MLX backend: OpenAI- and
+A native, no-Python **local LLM server** for Apple Silicon — a drop-in
+OpenAI- and Anthropic-compatible alternative to `mlx_lm.server`, and a
+Metal-native counterpart to `llama.cpp` that runs MLX-format models directly.
+One `cargo build --release` artifact — no Python runtime, no GGUF translation layer — and the widest
+weight × KV-quantization matrix any MLX server ships, including rotation-based
+KV families (TurboQuant, IsoQuant, PlanarQuant, RotorQuant, ParoQuant) that no
+other MLX server offers. Works as a local backend for any OpenAI/Anthropic-compatible
+coding agent (Claude Code, Cursor, Aider, OpenCode).
+
+> Status: **0.2.4** — feature-complete native MLX backend: OpenAI- and
 > Anthropic-compatible text, tool/function calling, streaming, image + audio
 > input, embeddings, and a multi-model registry. Apple Silicon only (Metal).
 > See [What works](#what-works).
@@ -19,11 +28,12 @@ server offers.
 | `mlx_lm.server` — Python venv juggling, slow startup, no KV rotation | Rust + lifted Metal kernels, instant warm-start, zero Python at runtime |
 | Multi-model Python servers — heavy deps, always-on | Single binary, load-on-demand / unload-on-idle lifecycle |
 | Experimental quant forks (TurboQuant / PlanarQuant / ParoQuant) live in separate llama.cpp or Python trees | All first-class on one MLX path |
+| `llama.cpp` on Mac — GGUF conversion + a translation layer, no MLX-native KV quant | Runs MLX-format weights directly on Metal; MLX → MLX re-quant, no GGUF round-trip |
 
 ## What works
 
-- **Text generation** — OpenAI-compatible `/v1/chat/completions` and
-  `/v1/completions`, plus an Anthropic-compatible surface. Streaming (SSE),
+- **Text generation** — OpenAI-compatible `/v1/chat/completions`, plus an
+  Anthropic-compatible `/v1/messages` surface. Streaming (SSE),
   temperature, top-k/p, penalties, thinking-budget, constrained / schema-guided
   decoding.
 - **Image input** — vision-capable models accept images via `image_url` content
@@ -60,10 +70,63 @@ speculative drafters are validated end-to-end via their serving endpoints.
 | BitNet | `bitnet-b1.58-2B-4T` | `BitNetForCausalLM` |
 | Embeddings | `jina-embeddings-v4` (text + image) | `JinaEmbeddingsV4Model` |
 
+Google's Gemma 4 **QAT** low-bit checkpoints (`*-qat-4bit` / `-mxfp4` / `-nvfp4`
+/ `-bf16`) load and serve text correctly on the same `Gemma4` arch — they need
+QAT-specific weight handling (per-group zero-point `.biases`, router/MLP
+overrides). One known limit: **e4b QAT complex-image vision is unreliable** — an
+intrinsic limitation of the QAT *checkpoint* (the unquantized `qat-bf16` fails
+the same way and the `mlx_vlm` reference reproduces it), not an rMLX codec
+defect; use `e4b-it-mxfp8` for dense-image OCR. Details:
+[`docs/MODELS.md`](docs/MODELS.md#e4b-qat-checkpoints--complex-image-vision-quality).
+
 Speculative-decoding drafters are validated against their verifiers via
 `--draft-kind mtp`: the Qwen 3.6 MTP sidecar (`Qwen3.6-35B-A3B-MTP-5bit`,
 verifier `Qwen3.6-35B-A3B-8bit`) and the Gemma 4 assistant drafter
 (`gemma-4-E2B-it-assistant-bf16`, verifier `gemma-4-e2b-it-mxfp8`).
+
+## How rMLX compares
+
+Other MLX servers are Python (`mlx-lm`, oMLX) or cover a narrower surface;
+`llama.cpp` is native but reads GGUF, not MLX. rMLX is the one that is native
+Rust **and** native MLX, with both API dialects and the full input-modality +
+quantization surface in a single process.
+
+| Capability | rMLX | `mlx-lm` | oMLX | mlxcel | `llama.cpp` |
+|---|---|---|---|---|---|
+| Language | Rust | Python | Python | Rust | C/C++ |
+| Single binary, no Python runtime | ✅ | — | — | ✅ | ✅ |
+| Native model format | MLX | MLX | MLX | MLX | GGUF |
+| OpenAI API (`/v1/chat/completions`) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Anthropic API (`/v1/messages`) | ✅ | — | ✅ | — | — |
+| Image input (in-server) | ✅ | —¹ | ✅ | ✅ | ✅ |
+| Audio input (in-server) | ✅ | — | — | — | ◐² |
+| Embeddings (`/v1/embeddings`) | ✅ | — | ✅ | — | ✅ |
+| KV-cache quantization | widest³ | 2 schemes | tiered, not quant⁴ | 1 (TurboQuant) | block types only⁵ |
+
+<sub>¹ `mlx-lm` itself is text; vision lives in the separate `mlx-vlm` package.
+² `llama.cpp` audio is in the `mtmd` CLI, not the HTTP server.
+³ affine 2–8 bit, fp8, mxfp/nvfp4, **plus** five rotation-KV families
+(TurboQuant, IsoQuant, PlanarQuant, RotorQuant, ParoQuant) no other MLX server
+ships. ⁴ oMLX has a tiered RAM+SSD KV cache, not KV-bit quantization.
+⁵ `llama.cpp` offers per-tensor block KV types (`q8_0`…`q5_1`) but no
+rotation-KV families. Competitor cells verified against each project's README /
+server docs (2026-06); capabilities evolve — corrections welcome.</sub>
+
+## Performance
+
+Decode throughput is competitive with `mlx-lm` across both lead families,
+measured on an independent cross-backend harness (Apple M5 Max, batch=1,
+temp=0; per-family grids under [`docs/models/`](docs/models)):
+
+- **Qwen 3.6 35B-A3B** — rMLX leads decode at **every context (4k→128k)**,
+  ≈ +12–15 % over `mlx-lm-turboquant` in our runs.
+- **Gemma 4 (e2b / e4b / 26b)** — matches `mlx-lm` within run-to-run noise;
+  decode there is weight-bandwidth-bound, so KV quant buys little. (31b dense
+  trails slightly — bandwidth physics.)
+
+The current weak spot is **prefill / time-to-first-token**: roughly 40–50×
+slower than `mlx-lm` at short context. It is an active optimization target, not
+a decode problem — steady-state throughput is unaffected.
 
 ## Requirements
 
@@ -212,3 +275,33 @@ Dual-licensed under either of
 - MIT license ([LICENSE-MIT](LICENSE-MIT))
 
 at your option.
+
+## Sibling projects
+
+rMLX stands on a lot of other people's work — the MLX ecosystem, the rotation-KV
+quantization research it ports, and the servers it learned its API shape from.
+Many thanks to:
+
+**MLX foundation**
+
+- [`ml-explore/mlx`](https://github.com/ml-explore/mlx) — the MLX array framework.
+- [`ml-explore/mlx-c`](https://github.com/ml-explore/mlx-c) — the stable C ABI rMLX links against.
+- [`ml-explore/mlx-lm`](https://github.com/ml-explore/mlx-lm) — reference loader + numerics.
+- [`oxideai/mlx-rs`](https://github.com/oxideai/mlx-rs) — community Rust binding over `mlx-c`.
+- [`huggingface/safetensors`](https://github.com/huggingface/safetensors) — the weight format + Rust crate.
+
+**KV / weight quantization research**
+
+- [`aivrar/multi-turboquant`](https://github.com/aivrar/multi-turboquant) — TurboQuant KV toolkit.
+- [`scrya-com/rotorquant`](https://github.com/scrya-com/rotorquant) — RotorQuant.
+- [`ParaMind2025/isoquant`](https://github.com/ParaMind2025/isoquant) — IsoQuant / PlanarQuant.
+- [`z-lab/paroquant`](https://github.com/z-lab/paroquant) — ParoQuant weight rotation.
+- [`TheTom/llama-cpp-turboquant`](https://github.com/TheTom/llama-cpp-turboquant) — TurboQuant KV Metal kernels (llama.cpp).
+- [`TheTom/turboquant_plus`](https://github.com/TheTom/turboquant_plus) — TurboQuant+ KV cache + multi-axis fidelity scoring.
+
+**Servers & multimodal**
+
+- [`Blaizzy/mlx-vlm`](https://github.com/Blaizzy/mlx-vlm) — vision-language reference.
+- [`jundot/omlx`](https://github.com/jundot/omlx) — multi-model MLX server (API-shape reference).
+- [`EricLBuehler/mistral.rs`](https://github.com/EricLBuehler/mistral.rs) — fast, flexible Rust LLM inference engine.
+- [`ai-dynamo/dynamo`](https://github.com/ai-dynamo/dynamo) — NVIDIA datacenter-scale distributed inference framework.
