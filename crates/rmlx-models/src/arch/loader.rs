@@ -226,10 +226,11 @@ pub fn load_model(model_dir: &Path, _device: Device, opts: &LoadOpts) -> Result<
         "arch::load_model: warmup phase complete"
     );
 
-    // -- Phase 5: GDN compile-cache pre-warm ----------------------------------
-    // For Qwen3_5Moe models: pre-trace `gated_delta_prefill_ops` at the
-    // qwen3_5_moe prefill chunk size so the compile-cache is hot before the
-    // first real request.
+    // -- Phase 5: GDN kernel pre-warm -----------------------------------------
+    // For Qwen3_5Moe models: pre-dispatch the `gated_delta_step_gpu` Metal
+    // kernel at the qwen3_5_moe prefill chunk size so its Metal program is
+    // compiled before the first real request (the kernel now serves both
+    // prefill and decode — see qwen3_5_moe::gated_delta_net).
     if _device == Device::Gpu {
         if let Architecture::Qwen3_5Moe(ref m) = arch {
             let t_gdn_warm = Instant::now();
@@ -246,7 +247,7 @@ pub fn load_model(model_dir: &Path, _device: Device, opts: &LoadOpts) -> Result<
                 hv,
                 dk,
                 dv,
-                "arch::load_model: pre-warm gated_delta_prefill_ops"
+                "arch::load_model: pre-warm gated_delta_step_gpu kernel"
             );
             let warmup_result = gdn_warmup(b, gdn_warmup_t, hk, hv, dk, dv);
             match warmup_result {
@@ -290,8 +291,9 @@ pub fn load_model(model_dir: &Path, _device: Device, opts: &LoadOpts) -> Result<
     Ok(arch)
 }
 
-/// Pre-warm the GDN compile-cache by running one traced call of
-/// `gated_delta_prefill_ops` at the production chunk shape.
+/// Pre-warm the GDN Metal kernel by dispatching one `gated_delta_step_gpu`
+/// call at the production chunk shape, compiling its Metal program at load
+/// time so the first real request pays no kernel-compile cost.
 ///
 /// Extracted from `load_model` to keep that function below 200 LOC.
 fn gdn_warmup(b: i32, t: i32, hk: i32, hv: i32, dk: i32, dv: i32) -> Result<()> {
@@ -311,7 +313,7 @@ fn gdn_warmup(b: i32, t: i32, hk: i32, hv: i32, dk: i32, dv: i32) -> Result<()> 
     let g = zeros_f32(&[b, t, hv])?;
     let beta = zeros_bf16(&[b, t, hv])?;
     let state_in = zeros_f32(&[b, hv, dv, dk])?;
-    let (y_out, s_out) = crate::gated_delta_msl::gated_delta_prefill_ops(
+    let (y_out, s_out) = crate::gated_delta_msl::gated_delta_step_gpu(
         &q,
         &k,
         &v,

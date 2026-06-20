@@ -430,8 +430,8 @@ pub fn generate_greedy<'a>(
     // quantize-dequantized on every chunk. exit_prefill() quantizes the
     // whole sequence in one shot when the loop completes.
     //
-    // Non-MoE arch — chunk well below the gated_delta ts>=256 threshold
-    // that only Qwen3.5MoE worries about (see `gated_delta_prefill_ops`).
+    // Non-MoE arch with no GatedDeltaNet layers — the prefill chunk only
+    // trades off per-chunk full-attention/KV cost vs dispatch count.
     // ------------------------------------------------------------------
     // Phase span: prefill. Entered once per generate_greedy call, not per token.
     // Visible in samply/Instruments as a single region covering the full prefill.

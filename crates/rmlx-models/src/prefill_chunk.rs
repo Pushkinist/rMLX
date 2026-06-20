@@ -7,8 +7,11 @@
 //!   command-buffer flush overhead, lowering the time-to-first-token on
 //!   long prompts.
 //! - **Metal GPU watchdog** — chunks too large blow past the ~10 s
-//!   command-buffer budget. Qwen3.5MoE's `gated_delta_prefill_ops` is
-//!   particularly sensitive (Qwen3.5MoE `gated_delta_prefill_ops`).
+//!   command-buffer budget per forward pass. The cost is the per-chunk
+//!   full-attention + KV work; Qwen3.5MoE's GatedDeltaNet runs the
+//!   `gated_delta_step_gpu` kernel (T-loop in registers, grid independent of
+//!   T) so it scales gracefully with chunk size rather than exploding a lazy
+//!   graph.
 //! - **First-call compile cost** — `compile_shapeless` traces a fresh
 //!   Metal program per unique input shape; bigger chunks mean a heavier
 //!   first-call trace before warmup populates the cache.
@@ -122,15 +125,18 @@ pub fn module_key_for_class(arch_class: &str) -> &'static str {
 fn arch_default(arch: &str) -> Option<usize> {
     match arch {
         "qwen3" => Some(256),
-        // qwen3_5_moe stays at 64. Spec proposed 256 with pre-warm;
-        // p0b-ttft bench measured chunk=256 cold TTFT REGRESSED
-        // by +15% at 8K and +80% at 32K vs chunk=64 — gated_delta_prefill_ops
-        // at T=256 has a substantially heavier lazy graph (~184K nodes/chunk)
-        // than at T=64, dwarfing the per-chunk FFI savings. Pre-warm
-        // mitigates only the first-chunk compile cost. Larger chunks still
-        // available via `RMLX_PREFILL_CHUNK_QWEN3_5_MOE=256` for users who
-        // want to test it.
-        "qwen3_5_moe" => Some(64),
+        // qwen3_5_moe: 2048, matching mlx-lm's prefill_step_size. The GDN
+        // recurrence now always runs the `gated_delta_step_gpu` Metal kernel
+        // (one dispatch, T-loop in registers) instead of flipping to the
+        // ops-graph path at T>=256 — so a large chunk no longer explodes the
+        // lazy graph; it just means fewer, bigger forward passes and far fewer
+        // per-chunk KV-state evals. A real-model sweep on Qwen3.6-35B-A3B-8bit
+        // (kv-none) measured TTFT improving monotonically 64→2048 with no Metal
+        // watchdog trip: 4k 4240→1065ms (4.0x), 8k 9008→2136ms (4.2x), 16k
+        // 19489→4712ms (4.1x); decode TPS unchanged (the decode kernel is the
+        // same at every chunk size). Override via
+        // `RMLX_PREFILL_CHUNK_QWEN3_5_MOE`.
+        "qwen3_5_moe" => Some(2048),
         // qwen3_vl_moe: plain GQA MoE (no GDN linear attention), so it tolerates
         // the same large chunk as gemma4. Native image tiling produces thousands
         // of soft tokens; a single-shot forward over the full prompt trips the

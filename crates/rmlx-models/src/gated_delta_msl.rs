@@ -345,23 +345,17 @@ pub fn gated_delta_step_gpu(
     Ok((y, state_out))
 }
 
-// ── Ops-based prefill (parallel graph build) ──────────────────────────────────
+// ── Ops-based prefill (reference / equivalence oracle) ────────────────────────
 //
-// For prefill (T ≥ 256) the sequential MSL kernel's `for t in 0..T` loop
-// serialises all T timesteps inside a single Metal dispatch. Because the
-// loop-carried state dependency prevents Metal from exploiting any ILP, the
-// GPU stalls while one timestep finishes before the next starts.
-//
-// This function builds the same computation as a lazy MLX ops graph — one
-// element-wise op node per step — and lets MLX's scheduler emit back-to-back
-// device kernels with optimal memory reuse. The complete graph is evaluated
-// in one shot by the caller (`mx_eval` is implicitly triggered when the output
-// array is consumed).
-//
-// Performance characteristic (matches mlx-lm's `gated_delta_ops` with
-// `@mx.compile`): MLX fuses independent per-head computations and schedules
-// memory traffic optimally. At T=256+ this is substantially faster than the
-// sequential MSL path. At T=1 (decode) use `gated_delta_step_gpu` instead.
+// NOT on the production path. Production prefill and decode both run
+// `gated_delta_step_gpu` (the MSL kernel) at every T — see
+// `qwen3_5_moe::gated_delta_net`. This function builds the same recurrence as a
+// lazy MLX ops graph (one element-wise node per timestep) and mirrors mlx-lm's
+// `gated_delta_ops` (the `use_kernel=False` fallback). It is retained as the
+// equivalence oracle that `gated_delta_msl_tests` checks `gated_delta_step_gpu`
+// against. It is NOT a faster prefill path: the per-step graph build explodes to
+// ~184K nodes at T=256 and ~1.47M at T=2048 across the 30 GDN layers, which is
+// exactly why the kernel — one dispatch with the T-loop in registers — wins.
 //
 // # Algorithm
 //
@@ -394,8 +388,10 @@ pub fn gated_delta_step_gpu(
 
 /// Ops-based GatedDeltaNet prefill: builds a lazy MLX graph over T timesteps.
 ///
-/// Use when `T ≥ 256`. For decode (T = 1) prefer [`gated_delta_step_gpu`]
-/// which dispatches a single compact Metal kernel per step.
+/// Reference / test-only equivalence oracle — production no longer dispatches
+/// this. Both prefill and decode run [`gated_delta_step_gpu`] (the MSL kernel)
+/// at every T; this exists so `gated_delta_msl_tests` can assert the kernel
+/// matches the ops-graph numerics within fp16 tolerance.
 ///
 /// # Inputs
 ///

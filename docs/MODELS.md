@@ -343,6 +343,14 @@ Text only. No vision or audio tower.
 - **GDN recurrent layers.** Unique to this architecture family. The recurrent
   state enables efficient autoregressive decoding without growing KV caches for
   those layers.
+- **GDN prefill = decode kernel.** Both prefill and decode run the
+  `gated_delta_step_gpu` Metal kernel (port of mlx-lm's `gated_delta_kernel`):
+  the per-timestep recurrence loops inside one dispatch with the state in
+  registers, parallelised across heads/dims. Chaining it across prefill chunks
+  is f32-state-exact, so a large `prefill_chunk` (2048, matching mlx-lm's
+  `prefill_step_size`) is the fast path — it does NOT route to the lazy ops-graph
+  reference (`gated_delta_prefill_ops`, now test-only). This is the prefill/TTFT
+  lever; small chunks multiply forward passes and per-chunk KV-state evals.
 - **Speculative decoding fully wired.** `forward_seq_last_k_with_cache`,
   `forward_verify_capture`, `forward_verify_capture_hot`,
   `forward_verify_capture_chunked`, `logits_from_hidden`, `embed_tokens_raw`
