@@ -149,7 +149,7 @@ rmlx-kv-ssd  → rmlx-core, rmlx-mlx, rmlx-kv-quant, rmlx-metrics
 rmlx-runtime → rmlx-core, rmlx-mlx, rmlx-loader, rmlx-metrics
 rmlx-models  → rmlx-core, rmlx-mlx, rmlx-quant, rmlx-kv-quant, rmlx-kv-ssd, rmlx-loader, rmlx-runtime, rmlx-metrics
 rmlx-audio   → rmlx-core, rmlx-loader
-rmlx-server  → rmlx-core, rmlx-mlx, rmlx-kv-quant, rmlx-kv-ssd, rmlx-loader, rmlx-runtime, rmlx-metrics, rmlx-models, rmlx-audio
+rmlx-server  → rmlx-core, rmlx-mlx, rmlx-kv-quant, rmlx-kv-ssd, rmlx-loader, rmlx-metrics, rmlx-models, rmlx-audio
 rmlx-cli     → all of the above
 ```
 
