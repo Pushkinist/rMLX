@@ -125,12 +125,15 @@ bandwidth utilization (kernel efficiency), NOT quant — recoverable in rMLX on 
 same weights. The literal "2×" is mostly an artifact of uncontrolled generation
 + caching.**
 
-**Bigger real gap found (decode is fine; prefill is not):** rMLX `baseline` @ 4k
-shows **TTFT ≈ 6.9 s, prefill ≈ 580 tok/s** vs mlx-lm TTFT ≈ 144 ms. rMLX
-prefill at short context is ~40–50× slower than mlx-lm — the genuine
-optimization target, far more impactful than the contaminated decode "2×". Needs
-its own investigation (chunked-prefill path / first-prefill graph cost on the
-MoE) in the improvement plan.
+**Prefill gap — investigated and RESOLVED (was a chunk-size bug + a flawed
+baseline):** rMLX `baseline` @ 4k once showed **TTFT ≈ 6.9 s, prefill ≈ 580
+tok/s**, attributed at the time to a "~40–50× vs mlx-lm (144 ms)" deficit. Both
+numbers were wrong. The 6.9 s was a GatedDeltaNet chunk-size bug (prefill pinned
+at chunk=64); fixing it (GDN kernel-always → chunk 2048) brought 4k TTFT to
+≈ 1.06 s (~3050 tok/s). The "mlx-lm 144 ms / 28000 tok/s" baseline is
+non-physical — a direct mlx-lm 0.31.3 run on this snapshot measures ≈ 2.7k–3.6k
+prompt tok/s, i.e. mlx-lm is only ~1.1–1.2× faster. Prefill is bandwidth-bound;
+rMLX is at mlx-lm parity. No structural prefill deficit remains.
 
 **To settle ollama honestly (later):** re-measure with `num_predict=256`, prompt
 caching disabled, and confirm full-context attention — then its decode TPS is
