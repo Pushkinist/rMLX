@@ -53,14 +53,31 @@ crates are `publish = false`). There is no separate `VERSION` file.
 8. **Build + publish the Homebrew bottle** (binary install channel — no Rust
    toolchain required for users):
 
-   a. **Install the keg from source** on the release machine (the same
-      Apple-Silicon Mac used for the binary artifact above):
+   a. **Build the keg from source** on the release machine (the same
+      Apple-Silicon Mac used for the binary artifact above).
+
+      > **Do step 9 (formula `url` + `sha256`) FIRST.** The bottle is a build of
+      > the *formula's* source `url`, so the formula must already point at the
+      > new `v<version>` tag tarball before you build the keg — otherwise you
+      > bottle the previous release. (The 0.2.x releases shipped the formula-url
+      > bump and the bottle as two separate PRs for this reason.)
+
+      > **Homebrew ≥6 refuses a loose `.rb` path** (`Error: Homebrew requires
+      > formulae to be in a tap`). The documented `brew install --build-bottle
+      > packaging/homebrew/rmlx.rb` no longer works — build from the tap formula
+      > instead. Mirror the url+sha-bumped formula into the tap checkout, then
+      > install from the tap reference:
       ```sh
-      brew install --build-bottle packaging/homebrew/rmlx.rb
+      cp packaging/homebrew/rmlx.rb \
+        "$(brew --repository)/Library/Taps/pushkinist/homebrew-rmlx/Formula/rmlx.rb"
+      HOMEBREW_NO_INSTALL_FROM_API=1 brew install --build-bottle pushkinist/rmlx/rmlx
       ```
-      This is a full source build. It may take a few minutes. `brew install
-      --build-bottle` is required because a normal `brew install` may silently
-      reuse a cached bottle from a previous release, producing a wrong keg.
+      This is a full source build (a few minutes). `--build-bottle` forces a
+      source build (a plain `brew install` may reuse a cached bottle). The
+      temporary tap-checkout copy is overwritten by `make tap-sync` (step 10).
+      If the tap is not yet tapped locally:
+      `brew tap pushkinist/rmlx && brew trust pushkinist/rmlx`. Note your `cp`
+      may be aliased to `cp -i` — use `/bin/cp -f` if it prompts.
 
    b. **Build the bottle and upload it:**
       ```sh
@@ -95,12 +112,15 @@ crates are `publish = false`). There is no separate `VERSION` file.
       the binary directly; if the bottle is unavailable for the user's macOS
       version Homebrew falls back to the source build automatically.
 
-   d. **Commit the formula update** via a PR (main is ruleset-protected):
+   d. **Commit the formula update** via a PR (main is ruleset-protected). By now
+      the formula carries the new `url` + source `sha256` (step 9 — done first,
+      see the ordering note in 8a) **and** the `bottle do` block (8c). Commit
+      them together as one formula PR:
       ```sh
       git add packaging/homebrew/rmlx.rb
-      git commit -m "chore(release): add bottle for v<version>"
+      git commit -m "chore(release): bump Homebrew formula to v<version>"
       ```
-      Open the PR and merge it; then continue to step 9 (formula url+sha256).
+      Open the PR, let CI pass, merge it, then run `make tap-sync` (step 10).
 
    > **Clean-machine verification (optional but recommended):**
    > On a machine without a local rmlx keg:
@@ -109,17 +129,41 @@ crates are `publish = false`). There is no separate `VERSION` file.
    >   `brew install --verbose rmlx` — the word "Bottled" appears in output).
    > - `brew uninstall mlx-c && brew install rmlx` — should fail cleanly with a
    >   dependency error before attempting any download or compile.
+   >
+   > **Verifying the pour ON the release machine is misleading.** The release
+   > machine's keg was built with `--build-bottle` (source), and `brew reinstall
+   > rmlx` *repeats the install options* — so it rebuilds from source even when
+   > the bottle is valid. To confirm the bottle pours here, either
+   > `brew uninstall rmlx && brew install rmlx` (a fresh install pours) or
+   > `brew reinstall --force-bottle rmlx` (pours or fails loudly with the real
+   > reason). Check `INSTALL_RECEIPT.json` → `poured_from_bottle: true`, or
+   > `brew info rmlx` → `(bottled)`.
+   >
+   > **The uploaded bottle asset has the same CDN-transient sha as the source
+   > archive** (see step 9): right after `gh release upload`, GitHub may serve
+   > stale bytes for ~1 min, so a verify run in that window sha-mismatches the
+   > bottle and silently falls back to source. Re-fetch the bottle URL
+   > (`curl -fsSL .../v<ver>/rmlx-<ver>.<tag>.bottle.tar.gz | shasum -a 256`)
+   > until it equals the formula's bottle `sha256` before trusting a non-pour.
+   > Do **not** re-upload with `--clobber` to "fix" it — that just restarts the
+   > propagation window.
 
-9. **Formula url + sha256:** run `make release-sha` (or
-   `bash scripts/release/source_sha256.sh --write`) — it patches **both** the
-   `url` line in `packaging/homebrew/rmlx.rb` to the new `v<version>` tag
-   tarball **and** the `sha256`.
+9. **Formula url + sha256** — do this **before** building the bottle (step 8):
+   the bottle is a build of the formula's source `url`, so the formula must
+   point at the new tag first. Note `make release-sha` only **prints** the
+   sha of the `v<version>` GitHub source tarball; to patch the `url` +
+   `sha256` in `packaging/homebrew/rmlx.rb` in place, run the script with
+   `--write`:
+   ```sh
+   bash scripts/release/source_sha256.sh --write
+   ```
    > GitHub generates the source archive on first access, so its sha256 can
    > shift on the very first fetch right after a tag push. The
    > `source_sha256.sh`-written value is usually the correct stable one — but
    > re-fetch the archive 2-3× (`curl -fsSL .../archive/refs/tags/v<version>.tar.gz
    > | shasum -a 256`) and confirm the digest is stable before trusting it.
-   Commit the formula bump via a PR (`main` is ruleset-protected; see below).
+   The url+sha change is committed **together with the bottle block** as one
+   formula PR (see 8d); `main` is ruleset-protected.
 10. **Publish the tap:** `make tap-sync` (copies the formula into
     `Pushkinist/homebrew-rmlx` as `Formula/rmlx.rb` and pushes).
 
