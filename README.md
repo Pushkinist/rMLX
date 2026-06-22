@@ -16,10 +16,10 @@ KV families (TurboQuant, IsoQuant, PlanarQuant, RotorQuant, ParoQuant) that no
 other MLX server offers. Works as a local backend for any OpenAI/Anthropic-compatible
 coding agent (Claude Code, Cursor, Aider, OpenCode).
 
-> Status: **0.2.4** — feature-complete native MLX backend: OpenAI- and
+> Status: **feature-complete native MLX backend** — OpenAI- and
 > Anthropic-compatible text, tool/function calling, streaming, image + audio
 > input, embeddings, and a multi-model registry. Apple Silicon only (Metal).
-> See [What works](#what-works).
+> Latest release version: see the badge above. See [What works](#what-works).
 
 ## Why
 
@@ -268,6 +268,12 @@ internal path deps omit a version (`deny.toml` sets `allow-wildcard-paths`).
 3. `make tag` — derives `v<version>` from `Cargo.toml`, creates the annotated
    tag.
 4. `git push origin v<version>`, then cut the GitHub release from the tag.
+
+This README is **not** version-bumped per release: the badge above tracks
+GitHub releases automatically, and the Status line carries no version number.
+Edit `README.md` only when capabilities materially change (a new modality,
+architecture family, or endpoint). The full release flow — changelog, signing,
+Homebrew bottle, tap — lives in [`docs/RELEASING.md`](docs/RELEASING.md).
 
 ## License
 
