@@ -132,6 +132,42 @@ used only at the HTTP boundary (axum handlers, SSE channel receive) and for
 file I/O. The GPU gate mutex inside each generator ensures at most one blocking
 thread executes a forward pass at any instant.
 
+### Concurrency model — single-stream by design
+
+rMLX serves requests **serially, one generation at a time**. This is a
+deliberate design choice, not a missing feature, and it shapes the latency
+profile under load.
+
+**What happens with concurrent requests.** The 1-permit `gpu_queue` semaphore
+admits requests in strict FIFO order; the permit is held for the *entire*
+decode and released only on completion. There is **no continuous batching** and
+**no cross-sequence interleave**: the decode loop processes a single sequence,
+and a request's chunked prefill runs to completion before that request's own
+decode begins. Concretely, request B does not make progress while request A is
+running — B waits behind A's whole generation (prefill **and** decode), then
+runs in full. Per-arch prefill chunking (`prefill_chunk_for`) is a
+per-request memory/watchdog bound, not a scheduler that interleaves A's prefill
+chunks with B's decode steps.
+
+**Why this is the right fit.** Apple Silicon gives one exclusive Metal context
+per process, and rMLX enforces a single MLX process per machine (claim file).
+The target workload is **single-user / agent-driving**, where exactly one
+generation is in flight at a time — the regime where a native Rust decode loop
+is at its strongest (no interpreter or async-scheduler overhead between tokens).
+A serial engine wins single-stream latency precisely because it does not pay for
+batching machinery it would not use.
+
+**Implication under load.** Because requests serialize, aggregate throughput
+stays roughly flat as concurrency rises (no batching speedup), and a request's
+end-to-end latency grows roughly linearly with the number of requests queued
+ahead of it. `max_queue_depth` (HTTP 429) bounds memory under burst, and the
+optional adaptive-admission controller sheds load under SLA pressure — but
+neither adds parallelism. **High-concurrency multi-tenant serving is explicitly
+out of scope**: there is no in-process continuous batching or vLLM-style
+chunked-prefill-interleaved scheduler. To serve many simultaneous users, run a
+pool of rMLX processes behind a load balancer (one Metal context each), rather
+than expecting a single process to scale up internally.
+
 ---
 
 ## Routes

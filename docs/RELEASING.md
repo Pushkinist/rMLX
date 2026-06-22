@@ -24,6 +24,13 @@ crates are `publish = false`). There is no separate `VERSION` file.
    (Keep a Changelog format) and the matching `[<version>]:` link at the
    bottom. This is the durable, in-repo record and the source of the Release
    body.
+
+   > **Do not version-bump `README.md`.** The README is intentionally decoupled
+   > from the release steps: its version badge (`shields.io/github/v/release`)
+   > tracks GitHub Releases automatically, and the Status line carries no version
+   > number. `CHANGELOG.md` is the per-release doc edit; the README changes only
+   > when capabilities materially change (a new modality, architecture family, or
+   > endpoint) — never for a routine version bump.
 3. **Gate:** `make ci` green (fmt + clippy + test + deny + audit).
 4. **Tag:** `make tag` → creates annotated `v<version>` from `Cargo.toml`.
    Push it: `git push origin v<version>`.
