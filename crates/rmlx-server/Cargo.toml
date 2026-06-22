@@ -33,7 +33,7 @@ thiserror    = { workspace = true }
 tracing      = { workspace = true }
 libc         = { workspace = true }
 parking_lot  = { workspace = true }
-rusqlite     = { version = "0.32", features = ["bundled"] }
+rusqlite     = { version = "0.40", features = ["bundled"] }
 chrono       = { workspace = true }
 uuid         = { version = "1", features = ["v4"] }
 ureq         = { workspace = true }
@@ -41,4 +41,4 @@ ureq         = { workspace = true }
 [dev-dependencies]
 tempfile  = { workspace = true }
 rmlx-mlx  = { workspace = true }
-rusqlite  = { version = "0.32", features = ["bundled"] }
+rusqlite  = { version = "0.40", features = ["bundled"] }
