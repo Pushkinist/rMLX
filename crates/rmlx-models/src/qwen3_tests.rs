@@ -889,3 +889,103 @@ fn qwen3_consume_engine_migration_golden() {
         "PASS: consume-engine migration golden — RAM/SSD/logprobs/Miss all match the baseline"
     );
 }
+
+/// Dtype-lock for the YARN mscale multiply site.
+///
+/// When YARN is active (Bonsai runs factor ×4), q/k are scaled by the
+/// precomputed `mscale` scalar before RoPE. The scalar is stored strong-f32
+/// (the operand dtype is not known at construction). If it is multiplied into a
+/// bf16 q/k as-is, MLX type-promotion widens q, k — and the K/V that reach the
+/// cache — to f32, doubling KV residency on the `--kv-quant none` path. The fix
+/// adopts the operand dtype before multiplying.
+///
+/// This test pins the invariant: a bf16 operand × dtype-adopted mscale stays
+/// bf16, while a bf16 operand × raw strong-f32 mscale promotes to f32 (the bug
+/// shape). A regression to the strong-f32 multiply makes this RED.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test asserts on dtype; an op error is the test failing"
+)]
+fn yarn_mscale_dtype_adopted_keeps_bf16() {
+    // A bf16 q/k operand, as seen at the YARN multiply site.
+    let operand = Array::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 4])
+        .unwrap()
+        .astype(Dtype::Bf16, Device::Cpu)
+        .unwrap();
+
+    // mscale is built strong-f32 at load (`scalar_f32(yarn_mscale)`).
+    let mscale = scalar_f32(1.3);
+
+    // Bug shape: multiplying the raw strong-f32 scalar promotes bf16 → f32.
+    let promoted = multiply(&operand, &mscale, Device::Cpu).unwrap();
+    promoted.eval().unwrap();
+    assert_eq!(
+        promoted.dtype(),
+        Dtype::F32,
+        "sanity: a raw strong-f32 mscale promotes a bf16 q/k to f32 (this is \
+         the f32-KV-leak bug the multiply-site fix avoids)"
+    );
+
+    // Fix shape: the scalar adopts the operand dtype before multiplying.
+    let adopted = mscale.astype(operand.dtype(), Device::Cpu).unwrap();
+    let kept = multiply(&operand, &adopted, Device::Cpu).unwrap();
+    kept.eval().unwrap();
+    assert_eq!(
+        kept.dtype(),
+        Dtype::Bf16,
+        "a dtype-adopted mscale must keep bf16 q/k at bf16 so the None-path KV \
+         cache stores bf16, not f32"
+    );
+}
+
+/// Dtype-lock for the RMSNorm weight.
+///
+/// The residual stream is bf16 (the embedding dequant is forced to bf16). Some
+/// snapshots (e.g. Bonsai) ship norm weights at fp16. MLX's `rms_norm` promotes
+/// a bf16 activation against an fp16 weight to f32 — and that f32 then
+/// propagates through Q/K/V projections, attention, and the `--kv-quant none`
+/// KV cache, doubling its residency. The load-time fix casts the norm weight to
+/// bf16 so the norm output stays bf16.
+///
+/// This test pins the invariant directly on the `rms_norm` op: a bf16 input
+/// normalized against an fp16 weight promotes to f32 (the bug shape), while a
+/// bf16 weight keeps the output bf16 (the fix). A regression to loading the raw
+/// fp16 weight makes this RED.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test asserts on dtype; an op error is the test failing"
+)]
+fn rms_norm_bf16_weight_keeps_output_bf16() {
+    // A bf16 residual-stream row, as the embedding produces it.
+    let x = Array::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 4])
+        .unwrap()
+        .astype(Dtype::Bf16, Device::Cpu)
+        .unwrap();
+
+    // Bug shape: an fp16 norm weight (as shipped) promotes the output to f32.
+    let w_f16 = Array::from_f32_slice(&[1.0, 1.0, 1.0, 1.0], &[4])
+        .unwrap()
+        .astype(Dtype::F16, Device::Cpu)
+        .unwrap();
+    let promoted = rms_norm(&x, Some(&w_f16), 1e-6, Device::Cpu).unwrap();
+    promoted.eval().unwrap();
+    assert_eq!(
+        promoted.dtype(),
+        Dtype::F32,
+        "sanity: rms_norm(bf16 x, fp16 weight) promotes to f32 (this is the \
+         f32-residual-stream leak the load-time bf16 cast avoids)"
+    );
+
+    // Fix shape: the norm weight is cast to bf16 at load.
+    let w_bf16 = w_f16.astype(Dtype::Bf16, Device::Cpu).unwrap();
+    let kept = rms_norm(&x, Some(&w_bf16), 1e-6, Device::Cpu).unwrap();
+    kept.eval().unwrap();
+    assert_eq!(
+        kept.dtype(),
+        Dtype::Bf16,
+        "a bf16 norm weight must keep the bf16 residual stream at bf16, so the \
+         None-path KV cache stores bf16, not f32"
+    );
+}

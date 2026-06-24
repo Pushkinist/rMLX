@@ -203,6 +203,32 @@ Measured (e4b mxfp8, `--kv-quant none`, ~18.5 k context): `kv_cache_bytes`
 activations and scale sites at bf16, so a future re-promotion of the Gemma4
 stream to f32 fails CI.
 
+### Qwen3 dense `--kv-quant none` KV is bf16 (was f32)
+
+The same class hit the dense Qwen3 arch (`Qwen3ForCausalLM`). Some snapshots
+ship norm weights and quant scales/biases at **fp16** (e.g. Bonsai-8B-2bit).
+rMLX runs the residual stream in **bf16** (the embedding dequant is forced to
+bf16). When `rms_norm` mixes a bf16 activation with an fp16 norm weight — and
+when `quantized_matmul` mixes a bf16 activation with fp16 scales/biases — MLX
+promotes the result to **f32**. That f32 carried through the Q/K/V projections,
+attention, and the global `--kv-quant none` KV cache, which then stored K and V
+at f32 (4 B/elem) — roughly **2× the bf16 expectation**. (The YARN mscale scalar
+is *not* the cause: q/k/v arrive at the YARN branch already f32 from the
+projection.)
+
+Fix, matching mlx-lm's "uniform model dtype" discipline (`w.astype(model_dtype)`
+at load): every float model parameter adopts the bf16 activation dtype at load —
+norm weights and quant scales/biases are cast to bf16 in the Qwen3 loader. The
+projection output then stays bf16, so K and V store as bf16. The YARN mscale
+multiply additionally adopts the operand dtype so a strong-f32 scalar cannot
+re-promote the now-bf16 q/k. Two unit-level dtype-lock regression tests pin the
+`rms_norm` and mscale sites at bf16.
+
+Measured (Bonsai-8B-2bit, `--kv-quant none`): decode-time K/V resident dtype
+flips f32→bf16 (4→2 B/elem), halving KV residency. Decode TPS gains widen with
+context as KV bandwidth dominates: ~+34 % at 4 k, ~+73 % at 16 k, ~+100 % at
+64 k — recovering the prior loss vs the mlx-lm champion on this model.
+
 **Byte accounting.** Two methods report KV-cache size:
 
 - `KvCache::approx_bytes()` — formula-based estimate using stored shape fields.
