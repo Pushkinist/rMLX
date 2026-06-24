@@ -931,7 +931,7 @@ impl Gemma4Text {
         let ids_arr = Array::from_i32_slice(&ids, &[1])?;
         let e = self.embed_tokens.forward(&ids_arr, device)?;
         let e = e.reshape(&[1, 1, self.cfg.hidden_size as i32], device)?;
-        let scale = scalar_f32((self.cfg.hidden_size as f32).sqrt());
+        let scale = scalar_f32((self.cfg.hidden_size as f32).sqrt()).astype(e.dtype(), device)?;
         multiply(&e, &scale, device)
     }
 

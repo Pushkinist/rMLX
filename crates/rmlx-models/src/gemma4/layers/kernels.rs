@@ -331,6 +331,12 @@ pub(crate) fn softcap_fused(x: &Array, cap: f32, device: Device) -> Result<Array
         device_tag: softcap_device_tag(device),
     };
     let compiled = softcap_get_or_compile(key, device)?;
+    // f32-ok: cap is a Python float (weak type) in mlx-lm's logit_softcap — it runs at the
+    // activation dtype there. Here cap_arr is a strong F32 scalar, which diverges from the
+    // reference in dtype. This is safe because softcap_fused is applied to TERMINAL pre-sampling
+    // logits only: the output is never written to the KV cache or the residual stream, so the
+    // F32 promotion does not propagate. Changing to astype(x.dtype()) would be numerically
+    // equivalent for BF16 logits but is intentionally left as F32 to match the compile key.
     let cap_arr = scalar_f32(cap);
     let mut outs = compiled.apply(&[&cap_arr, x])?;
     outs.pop()
