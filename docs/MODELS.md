@@ -242,6 +242,13 @@ defaults `beta_fast=32, beta_slow=1`.
   via `--prompt-cache-slots`.
 - **SSD spill.** KV blocks spill to SSD when RAM pressure is high and are
   hydrated back before they enter SDPA.
+- **Stream stays at the model dtype (bf16).** Float model parameters — norm
+  weights and quant scales/biases — are cast to bf16 at load (mlx-lm's uniform
+  model-dtype discipline). Some snapshots ship these at fp16 (e.g. Bonsai); a
+  bf16 activation mixed with an fp16 param promotes to f32 and propagates through
+  Q/K/V, attention, and the `--kv-quant none` KV cache (doubling its residency).
+  Casting at load keeps K/V bf16. See `docs/KV_QUANT.md` "Qwen3 dense
+  `--kv-quant none` KV is bf16".
 
 ### Known limitations
 

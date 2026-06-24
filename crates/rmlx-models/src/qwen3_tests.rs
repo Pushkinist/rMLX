@@ -889,3 +889,135 @@ fn qwen3_consume_engine_migration_golden() {
         "PASS: consume-engine migration golden — RAM/SSD/logprobs/Miss all match the baseline"
     );
 }
+
+/// Pins MLX type-promotion semantics at the YARN mscale multiply site.
+///
+/// The `yarn_mscale_arr` scalar is stored bf16 at load (cast via
+/// `scalar_f32(...).astype(Bf16, …)`). This test documents WHY: a raw
+/// strong-f32 scalar multiplied into a bf16 q/k would widen the result to
+/// f32 (defense-in-depth). The actual observed f32-KV leak was caused by
+/// fp16 norm weights and fp16 quant scales/biases promoting the projection
+/// output to f32 before this site — not the mscale itself.
+///
+/// This test pins MLX op-promotion semantics. It does NOT gate the loader
+/// directly; see `bf16_param_casts_fp16_to_bf16` for that.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test asserts on dtype; an op error is the test failing"
+)]
+fn yarn_mscale_dtype_adopted_keeps_bf16() {
+    // A bf16 q/k operand, as seen at the YARN multiply site.
+    let operand = Array::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 4])
+        .unwrap()
+        .astype(Dtype::Bf16, Device::Cpu)
+        .unwrap();
+
+    // A strong-f32 scalar (what `scalar_f32` builds before the load-time cast).
+    let mscale_f32 = scalar_f32(1.3);
+
+    // Bug shape: a raw strong-f32 scalar promotes bf16 → f32.
+    let promoted = multiply(&operand, &mscale_f32, Device::Cpu).unwrap();
+    promoted.eval().unwrap();
+    assert_eq!(
+        promoted.dtype(),
+        Dtype::F32,
+        "sanity: a raw strong-f32 mscale promotes a bf16 q/k to f32 \
+         (defense-in-depth motivation for the bf16 load-time cast)"
+    );
+
+    // Fix shape: scalar cast to bf16 at load keeps the multiply bf16.
+    let mscale_bf16 = mscale_f32.astype(Dtype::Bf16, Device::Cpu).unwrap();
+    let kept = multiply(&operand, &mscale_bf16, Device::Cpu).unwrap();
+    kept.eval().unwrap();
+    assert_eq!(
+        kept.dtype(),
+        Dtype::Bf16,
+        "a bf16-cast mscale must keep bf16 q/k at bf16"
+    );
+}
+
+/// Pins MLX type-promotion semantics at the `rms_norm` site.
+///
+/// The `load_rms` closure casts the norm weight to bf16 via `bf16_param`.
+/// On snapshots that ship weights at fp16 (e.g. Bonsai), skipping the cast
+/// would promote `rms_norm(bf16 x, fp16 w)` to f32 — propagating f32
+/// through Q/K/V and the `--kv-quant none` KV cache.
+///
+/// This test pins MLX promotion semantics. It does NOT gate the loader
+/// directly; see `bf16_param_casts_fp16_to_bf16` for that.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test asserts on dtype; an op error is the test failing"
+)]
+fn rms_norm_bf16_weight_keeps_output_bf16() {
+    // A bf16 residual-stream row, as the embedding produces it.
+    let x = Array::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 4])
+        .unwrap()
+        .astype(Dtype::Bf16, Device::Cpu)
+        .unwrap();
+
+    // Bug shape: an fp16 norm weight (as shipped on Bonsai) promotes to f32.
+    let w_f16 = Array::from_f32_slice(&[1.0, 1.0, 1.0, 1.0], &[4])
+        .unwrap()
+        .astype(Dtype::F16, Device::Cpu)
+        .unwrap();
+    let promoted = rms_norm(&x, Some(&w_f16), 1e-6, Device::Cpu).unwrap();
+    promoted.eval().unwrap();
+    assert_eq!(
+        promoted.dtype(),
+        Dtype::F32,
+        "sanity: rms_norm(bf16 x, fp16 w) promotes to f32 \
+         (motivation for the bf16 load-time cast in load_rms)"
+    );
+
+    // Fix shape: norm weight cast to bf16 at load keeps the output bf16.
+    let w_bf16 = w_f16.astype(Dtype::Bf16, Device::Cpu).unwrap();
+    let kept = rms_norm(&x, Some(&w_bf16), 1e-6, Device::Cpu).unwrap();
+    kept.eval().unwrap();
+    assert_eq!(
+        kept.dtype(),
+        Dtype::Bf16,
+        "a bf16 norm weight must keep the bf16 residual stream at bf16"
+    );
+}
+
+/// Direct regression gate for the `bf16_param` loader helper.
+///
+/// Removing or bypassing the `bf16_param` call at any load site (norm weight,
+/// quant scales/biases, embedding scales/biases) would let fp16 parameters
+/// reach fp16 → f32 promotion paths. This test calls `bf16_param` directly
+/// and asserts the two contract cases: fp16 → bf16 conversion, and bf16
+/// already-OK early return. A regression that removes the cast makes this RED.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test asserts on dtype; an op error is the test failing"
+)]
+fn bf16_param_casts_fp16_to_bf16() {
+    // fp16 input → must be cast to bf16.
+    let fp16 = Array::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[4])
+        .unwrap()
+        .astype(Dtype::F16, Device::Cpu)
+        .unwrap();
+    assert_eq!(fp16.dtype(), Dtype::F16, "precondition: input is fp16");
+    let out = bf16_param(fp16).unwrap();
+    assert_eq!(
+        out.dtype(),
+        Dtype::Bf16,
+        "bf16_param must cast fp16 → bf16 (removes the fp16→f32 promotion path)"
+    );
+
+    // bf16 input → no-op early return (no unnecessary copy).
+    let bf16 = Array::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[4])
+        .unwrap()
+        .astype(Dtype::Bf16, Device::Cpu)
+        .unwrap();
+    let out2 = bf16_param(bf16).unwrap();
+    assert_eq!(
+        out2.dtype(),
+        Dtype::Bf16,
+        "bf16_param must pass through an already-bf16 array unchanged"
+    );
+}
