@@ -106,7 +106,7 @@ impl LayerNorm {
     fn forward(&self, x: &Array, device: Device) -> Result<Array> {
         let mut keep = x.shape();
         let d = *keep.last().expect("layer_norm: empty shape");
-        let inv_d = scalar_f32(1.0 / d as f32);
+        let inv_d = scalar_f32(1.0 / d as f32); // f32-ok: SigLIP tower runs entirely in f32
 
         // keepdims shape: replace last dim with 1.
         *keep.last_mut().unwrap() = 1;
@@ -122,7 +122,7 @@ impl LayerNorm {
             &inv_d,
             device,
         )?;
-        let denom = sqrt(&add(&var, &scalar_f32(self.eps), device)?, device)?;
+        let denom = sqrt(&add(&var, &scalar_f32(self.eps), device)?, device)?; // f32-ok: SigLIP tower runs entirely in f32
         let normed = divide(&xc, &denom, device)?;
         let scaled = multiply(&normed, &self.weight, device)?;
         add(&scaled, &self.bias, device)
@@ -274,7 +274,7 @@ impl MultiModalProjector {
         // reshape into [b, vh, tps, k, tps, k] then mean over the two k axes.
         // (Non-overlapping pool == block average == reshape + reduce.)
         let blocked = g.reshape(&[b, vh, tps, k, tps, k], device)?;
-        let inv_k = scalar_f32(1.0 / k as f32);
+        let inv_k = scalar_f32(1.0 / k as f32); // f32-ok: SigLIP tower runs entirely in f32
         let m1 = multiply(&sum_axis(&blocked, 5, device)?, &inv_k, device)?; // [b,vh,tps,k,tps]
         let pooled = multiply(&sum_axis(&m1, 3, device)?, &inv_k, device)?; // [b,vh,tps,tps]
 
@@ -598,7 +598,8 @@ pub fn build_inputs_embeds(
     let ids_i32: Vec<i32> = input_ids.iter().map(|&x| x as i32).collect();
     let ids_arr = Array::from_bytes(i32_bytes(&ids_i32), &[seq as i32], Dtype::I32)?;
     let h_raw = model.embed_tokens.forward(&ids_arr, device)?;
-    let embed_scale = scalar_f32((model.cfg.hidden_size as f32).sqrt());
+    let embed_scale =
+        scalar_f32((model.cfg.hidden_size as f32).sqrt()).astype(h_raw.dtype(), device)?;
     let mut embeds = multiply(&h_raw, &embed_scale, device)?;
     embeds = embeds.reshape(&[1, seq as i32, hidden], device)?;
     let embeds_dtype = embeds.dtype();
@@ -771,7 +772,7 @@ pub fn load_vision_tower(
     // `RMSNorm` from language.py: `rms_norm(x, 1.0 + weight, eps)`). rMLX's
     // `rms_norm` uses the weight as-is, so pre-shift `weight + 1.0` at load.
     let soft_emb_norm_w_raw = load_f32(&shards, "multi_modal_projector.mm_soft_emb_norm.weight")?;
-    let soft_emb_norm_w = add(&soft_emb_norm_w_raw, &scalar_f32(1.0), Device::Cpu)?;
+    let soft_emb_norm_w = add(&soft_emb_norm_w_raw, &scalar_f32(1.0), Device::Cpu)?; // f32-ok: both operands are f32 weights loaded via load_f32
     let projector = MultiModalProjector {
         soft_emb_norm_w,
         input_projection_w: load_f32(&shards, "multi_modal_projector.mm_input_projection_weight")?,

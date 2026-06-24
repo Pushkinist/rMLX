@@ -97,6 +97,33 @@ Run these in order before declaring a new arch done.
    ```
    Never hand-edit `BENCHMARK_CHAMPIONS.md`. Ingest path, schema, and operating
    rules: `docs/METRICS_DB.md`.
+5. **Pass the f32-leak gate.** The CI gate `make check-no-scalar-f32-leak` scans
+   every file under `crates/rmlx-models/src/` for unguarded `scalar_f32(` calls.
+   A `scalar_f32(x)` combined with a BF16 activation silently upcasts the
+   residual stream, Q/K/V tensors, and the KV cache to F32 — this class of bug
+   has shipped multiple times and is invisible at review.
+
+   **Canonical form for scalars that enter the activation stream:**
+   ```rust
+   scalar_f32(x).astype(operand.dtype(), device)?
+   ```
+   The `.astype(` call may appear on the same line as `scalar_f32(` or anywhere
+   in the immediately following continuation lines of the same method chain
+   (lines that do not yet end the statement). Note: `.astype(Dtype::F32, …)` is
+   NOT a guard — it preserves the F32 scalar and the gate will still flag it.
+
+   **Allowlisting a genuine f32-only scalar** (e.g. inside a vision tower or
+   audio encoder that runs entirely in f32, or a scalar passed to an f32-only
+   API): add `// f32-ok: <reason>` on the same line or in the comment block
+   directly above the `scalar_f32(` call:
+   ```rust
+   // f32-ok: SigLIP tower runs entirely in f32 (weights upcast at load)
+   let inv_k = scalar_f32(1.0 / k as f32);
+   ```
+   The reason must be specific enough to explain why the f32 promotion is safe
+   (e.g. "tower is f32", "output is Vec<f32>", "terminal pre-sampling logits").
+
+   Run `make check-no-scalar-f32-leak` before pushing any new arch or new layer.
 
 ---
 

@@ -219,6 +219,15 @@ Date: 2026-05-21. Hardware: M5 Max.
 | mlx-community__Qwen3.6-35B-A3B-8bit | 848d4785 | k8v8 | 96.64 | 2.00 | release-perf | 2026-05-21 |
 | mlx-community__bitnet-b1.58-2B-4T | fa2ec73 | k8v8 | 31.61 | 0.17 | release | 2026-05-28 |
 
+**Qwen3-dense bf16-stream fix (2026-06-24).** Casting Qwen3 norm weights and
+quant scales/biases to bf16 at load (they ship fp16 on Bonsai) stops the
+residual stream — and the `--kv-quant none` KV cache — from widening to f32. The
+fix also lifts the Bonsai canary default (`mixed_k8g64_v4g64`) from ~110 to ~129
+decode_tps (the bf16 q/k/v compute is cheaper than the prior f32 path); Gemma4
+and Qwen3.6 (separate arch files) are unchanged. On the `none` path the gain
+widens with context as KV bandwidth dominates: Bonsai `none` decode_tps
+~101→~135 at 4 k, ~48→~83 at 16 k, ~19→~38 at 64 k.
+
 ## K8VTurbo3 promotion bench (2026-05-30)
 
 **Binary**: `target/release-perf/rmlx`
