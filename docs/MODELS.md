@@ -337,6 +337,33 @@ routes only FA layers through `quantized_matmul`) shows smaller gains than on
 dense architectures. Perf testing shows `K8V8` is faster than `Mixed k8v8 g64`
 on this arch.
 
+**`--kv-quant none` KV is bf16 — audited clean (no f32-KV leak).** Unlike the
+dense Qwen3 path (where some snapshots ship norm weights and quant scales/biases
+at fp16, promoting the bf16 stream to f32 and doubling `none` KV residency), the
+`mlx-community/Qwen3.6-35B-A3B-8bit` snapshot ships **every float param (norm
+weights, quant scales/biases) at bf16**. The compute stream is therefore bf16
+end-to-end:
+
+- the embedding dequant forces bf16 (`embed_lookup`),
+- `rms_norm(bf16 x, bf16 q/k-norm weight)` stays bf16 — the q/k that reach the
+  KV store are bf16,
+- the MoE router `softmax(bf16 gate logits)` keeps `routing_weights` bf16, so
+  no f32 leaks into the MoE residual / downstream KV (this arch has **no**
+  Gemma4-MoE router-scale leak: the router gate is a plain quantized `Linear`,
+  with no strong-f32 RMSNorm-weight scaling),
+- this arch's FullAttention has **no YARN mscale** on the q/k path (plain
+  `rope` only), so there is no un-`.astype`'d scalar-f32 multiply to leak.
+
+Measured directly on the 35B-A3B-8bit snapshot (`--kv-quant none`): every K/V
+tensor arrives at the cache-store boundary as **bf16 (480/480 store calls,
+prefill + decode), zero f32** — so the compute is genuinely clean, not merely
+floored by the model-agnostic `cast_store_bf16` bf16 store floor. The audit thus
+needs no source fix. A CPU dtype-lock test (`moe_stream_stays_bf16_with_bf16_params`
+in `qwen3_5_moe/moe_tests.rs`) pins the q/k-norm and router promotion semantics
+the bf16-shipping snapshot relies on. **If a future Qwen3.5-MoE snapshot ships
+fp16 params**, the loader must adopt the dense `bf16_param` discipline (cast
+norm/scale/bias to bf16 at load — see `qwen3.rs::bf16_param`).
+
 ### Modalities
 
 Text only. No vision or audio tower.

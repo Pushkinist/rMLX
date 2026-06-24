@@ -14,7 +14,7 @@
 //! `cargo test -p rmlx-models --lib qwen3_5_moe::moe -- --ignored`.
 
 use super::{Linear, SwitchMlp};
-use rmlx_mlx::{quantize, Array, Device, Dtype};
+use rmlx_mlx::{quantize, rms_norm, scalar_f32, softmax, Array, Device, Dtype};
 
 const DEV: Device = Device::Gpu;
 const GROUP_SIZE: i32 = 64;
@@ -164,6 +164,88 @@ fn assert_paths_match(n: i32, tk: i32, ne: i32, hidden: i32, inter: i32, mode: u
     assert!(
         worst <= 0.0,
         "sorted vs broadcast diverge beyond atol+rtol*|b| by {worst} (n={n} tk={tk} ne={ne} mode={mode})"
+    );
+}
+
+/// Dtype-lock: the Qwen3.5-MoE attention + router stream stays bf16 when the
+/// snapshot ships bf16 params, so the `--kv-quant none` KV cache stores bf16
+/// (≈2 B/elem), not f32.
+///
+/// This is the MoE counterpart to the dense Qwen3 `rms_norm_bf16_weight_keeps_output_bf16`
+/// / router-promotion lock. The audited `mlx-community__Qwen3.6-35B-A3B-8bit`
+/// snapshot ships every float param (norm weights, quant scales/biases) at bf16,
+/// so:
+///   - `rms_norm(bf16 q/k, bf16 q_norm/k_norm weight)` stays bf16 (q/k reach the
+///     KV store as bf16),
+///   - the router `softmax(bf16 gate logits)` stays bf16, so `routing_weights`
+///     and the downstream MoE residual stay bf16 (no f32 leak into the next
+///     layer's KV — the same MoE-router leak class that was fixed for Gemma4).
+///
+/// The two "bug shape" asserts pin the MLX promotion semantics that make this
+/// safe: a *strong-f32* norm weight or router logit promotes the stream to f32.
+/// If a future Qwen3.5-MoE snapshot ships fp16 params (e.g. an fp16 repack), the
+/// loader must adopt the dense `bf16_param` discipline (cast norm/scale/bias to
+/// bf16 at load) — this test documents the contract a bf16-shipping snapshot
+/// relies on. Runs on CPU; no Metal device, no model needed.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test asserts on dtype; an op error is the test failing"
+)]
+fn moe_stream_stays_bf16_with_bf16_params() {
+    let dev = Device::Cpu;
+
+    // --- q/k-norm site (FullAttention::forward via qk_norm_fused) ---
+    // A bf16 q/k row, as the bf16 projection produces it.
+    let qk = f32_arr(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 4])
+        .astype(Dtype::Bf16, dev)
+        .unwrap();
+
+    // Bug shape: an fp16 norm weight would promote rms_norm to f32.
+    let w_f16 = f32_arr(&[1.0, 1.0, 1.0, 1.0], &[4])
+        .astype(Dtype::F16, dev)
+        .unwrap();
+    let promoted = rms_norm(&qk, Some(&w_f16), 1e-6, dev).unwrap();
+    promoted.eval().unwrap();
+    assert_eq!(
+        promoted.dtype(),
+        Dtype::F32,
+        "sanity: rms_norm(bf16 q/k, fp16 norm weight) promotes to f32 — \
+         a future fp16-shipping snapshot would need the bf16_param load discipline"
+    );
+
+    // Clean shape: the audited snapshot ships bf16 norm weights → output bf16.
+    let w_bf16 = w_f16.astype(Dtype::Bf16, dev).unwrap();
+    let kept = rms_norm(&qk, Some(&w_bf16), 1e-6, dev).unwrap();
+    kept.eval().unwrap();
+    assert_eq!(
+        kept.dtype(),
+        Dtype::Bf16,
+        "bf16 q/k-norm weight keeps q/k bf16 into the KV store"
+    );
+
+    // --- router site (SparseMoeBlock::forward) ---
+    // Bug shape: strong-f32 gate logits would carry f32 through softmax into
+    // routing_weights and the MoE residual (the MoE-router leak class fixed for
+    // Gemma4).
+    let logits_f32 = scalar_f32(0.0).reshape(&[1, 1], dev).unwrap();
+    let gates_f32 = softmax(&logits_f32, -1, dev).unwrap();
+    gates_f32.eval().unwrap();
+    assert_eq!(
+        gates_f32.dtype(),
+        Dtype::F32,
+        "sanity: softmax of f32 gate logits yields f32 routing_weights"
+    );
+
+    // Clean shape: bf16 gate logits (bf16 quantized_matmul output on the audited
+    // snapshot) keep routing_weights bf16.
+    let logits_bf16 = logits_f32.astype(Dtype::Bf16, dev).unwrap();
+    let gates_bf16 = softmax(&logits_bf16, -1, dev).unwrap();
+    gates_bf16.eval().unwrap();
+    assert_eq!(
+        gates_bf16.dtype(),
+        Dtype::Bf16,
+        "bf16 gate logits keep routing_weights bf16 — no f32 leak into the MoE residual / KV"
     );
 }
 
