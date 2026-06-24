@@ -590,6 +590,27 @@ byte-stable — only the token-row order **within** a block changes, and spill
 and dequant agree on sequence-major. GPU round-trip verified on `QuantIsoV3`
 (two-append GQA vs single-shot, `kv_h=1` control).
 
+### 5.7.4 The unquantised store boundary floors K/V to bf16
+
+The `KvQuant::None` / warm-TTFT decode mirror (`decode_fp16_k/v`) is bf16 by
+contract — the dtype every sibling MLX backend stores for unquantised KV. But the
+incoming K/V inherit whatever dtype the model's attention stream happened to
+produce, so a single f32 scalar leaking upstream (Gemma4 mxfp8 stream, Qwen3
+fp16 norm/scale params — both fixed per-arch) silently promoted the cache to f32
+and doubled resident KV, found months later in a bench.
+
+The store boundary therefore **casts incoming K/V to bf16 independent of the
+inbound dtype**, at the single model-agnostic choke point every arch funnels
+through (`update_prefill_raw` for the seed, `update_decode_fp16` for the decode
+append, both in `rmlx-kv-quant`). The cast is idempotent (a `dtype == Bf16`
+check, no `astype` on the already-bf16 hot path) so it is pure insurance. It is
+**defense-in-depth, not a substitute for the per-arch source fix**: it caps the
+*memory* damage but leaves any upstream f32 *compute* (RoPE / SDPA) still f32.
+The bytes-per-element detector (an f32 input must store as 2 B/elem) lives in
+`resident_bytes_tests.rs` and runs under `make model-check` (now `-p
+rmlx-kv-quant`), so a future arch leak trips CI. Full reference:
+`docs/KV_QUANT.md` §`KvStorage::None`.
+
 ### 5.8 TurboQuant requires Flash Attention
 
 The `tq4` V-side path is only valid through the Flash Attention dispatch.

@@ -83,11 +83,17 @@ ci-perf:         ## pre-push gate under release-perf (separate from make ci; run
 	$(MAKE) test-perf
 	@echo "ci-perf ok"
 
-# model-check: run only the model-logic crates (rmlx-models, rmlx-runtime, rmlx-quant).
-# Excludes server, CLI, and metrics churn. The #[ignore] integration tests stay
-# skipped here — this target completes <30 s without any model present.
-model-check:     ## cargo test -p rmlx-{models,runtime,quant} only (no server/cli/metrics; <30s, no model needed)
-	cargo test -p rmlx-models -p rmlx-runtime -p rmlx-quant
+# model-check: run only the model-logic crates (rmlx-models, rmlx-runtime,
+# rmlx-quant) plus the KV-codec crate (rmlx-kv-quant). Excludes server, CLI, and
+# metrics churn. The #[ignore] integration tests stay skipped here — this target
+# runs without any model present.
+#
+# rmlx-kv-quant is included so the cache-level bf16 store-boundary floor (the
+# model-agnostic f32-KV guard) is checked at every integration run: its
+# bytes-per-element invariant tests (resident_bytes_tests) trip CI the moment a
+# future arch leaks f32 into the unquantised KV store.
+model-check:     ## cargo test -p rmlx-{models,runtime,quant,kv-quant} (no server/cli/metrics; no model needed)
+	cargo test -p rmlx-models -p rmlx-runtime -p rmlx-quant -p rmlx-kv-quant
 
 # model-check-full: run the model-logic unit tests (same as model-check) PLUS the
 # per-arch golden-token integration tests gated by RMLX_KV_TEST_MODEL.
