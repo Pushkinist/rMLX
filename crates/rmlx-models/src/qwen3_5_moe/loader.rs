@@ -26,7 +26,7 @@ use rmlx_quant::awq::{f16_bits_to_f32, f32_to_f16_bits};
 use tracing::info;
 
 use crate::layers::{resolve_quant, QuantParams};
-use crate::load_util::{load_paro_parts, quantize_embedding_int4, Weights};
+use crate::load_util::{bf16_param, load_paro_parts, quantize_embedding_int4, Weights};
 
 use super::attention::FullAttention;
 use super::config::Qwen3_5MoeConfig;
@@ -90,8 +90,8 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
                 mode,
             } => Ok(Linear::Quantized {
                 weight,
-                scales,
-                biases,
+                scales: bf16_param(scales)?,
+                biases: biases.map(bf16_param).transpose()?,
                 group_size,
                 bits,
                 mode: mode.as_str().to_owned(),
@@ -104,7 +104,7 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
 
     let load_rms = |name: &str| -> Result<RmsNorm> {
         Ok(RmsNorm {
-            weight: w.array(&format!("{name}.weight"))?,
+            weight: bf16_param(w.array(&format!("{name}.weight"))?)?,
             eps: cfg.rms_norm_eps,
         })
     };
@@ -129,8 +129,8 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
                 mode,
             } => Embedding::Quantized {
                 weight,
-                scales,
-                biases,
+                scales: bf16_param(scales)?,
+                biases: biases.map(bf16_param).transpose()?,
                 group_size,
                 bits,
                 mode: mode.as_str().to_owned(),
@@ -196,8 +196,15 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
                 in_proj_z: lin(&format!("{la}.in_proj_z"))?,
                 in_proj_b: lin(&format!("{la}.in_proj_b"))?,
                 in_proj_a: lin(&format!("{la}.in_proj_a"))?,
-                conv1d_weight: w.array(&format!("{la}.conv1d.weight"))?,
-                norm_weight: w.array(&format!("{la}.norm.weight"))?,
+                // Both conv1d_weight and norm_weight are plain float tensors that
+                // participate in bf16 compute. An fp16 conv1d_weight promotes the
+                // depthwise conv1d output (and thus v4, q4, k4) to f32 via MLX
+                // dtype promotion; an fp16 norm_weight promotes rms_norm(&y_bf16,
+                // norm_weight) to f32 at the final RMSNormGated site. Cast both
+                // to bf16 at load so any future fp16-shipping snapshot stays
+                // bf16-clean through the full GDN forward path.
+                conv1d_weight: bf16_param(w.array(&format!("{la}.conv1d.weight"))?)?,
+                norm_weight: bf16_param(w.array(&format!("{la}.norm.weight"))?)?,
                 exp_a_log_f32,
                 dt_bias_3d,
                 inv_scale_sq_arr,
