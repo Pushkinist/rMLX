@@ -1,7 +1,7 @@
 # Bonsai-8B (2-bit) — Sibling-Backend Champions (Phase A)
 
-> Companion: `rMLX.md` — rMLX full matrix + standing-vs-champion (**Stage 2,
-> pending**, not in this file). This file covers sibling backends only.
+> Companion: `rMLX.md` — rMLX full matrix + standing-vs-champion (**complete**).
+> This file covers sibling backends only.
 > Mirrors [`../gemma4/SIBLINGS.md`](../gemma4/SIBLINGS.md) in protocol and shape.
 
 **Model:** `prism-ml__Ternary-Bonsai-8B-mlx-2bit` —
@@ -171,7 +171,7 @@ column either).
 | **mlx-vlm** | Bonsai is a text-only model; mlx-vlm is a VLM reference. No applicable text-decode path. |
 | **mistral.rs / llama.cpp / dynamo / 1bit-eval-scratch / experiments-kv-cache-compression / *-turboquant kernel variants** | No CBB runner and/or no OpenAI-compatible serving path and/or GGUF-only. Building runners is out of scope for a data-collection run. |
 | **128k cell** | `max_position_embeddings = 65536` → 64k is the hard ceiling. No 128k fixture is run. |
-| **rMLX (all cells)** | Phase A is siblings only; the rMLX full KV-quant matrix is Stage 2 (`rMLX.md`, pending). |
+| **rMLX (all cells)** | Phase A is siblings only; the rMLX full KV-quant matrix lives in `rMLX.md`. |
 
 **Note on the 64k fixture (not a skip — a correction).** The standard
 `prompts/longctx_64k.json` was flagged as a possible overflow risk because the
@@ -212,7 +212,7 @@ top-context measurement comparable to the other docs.
   **Not** in rMLX `runs.db` — the CBB record schema (`model` vs `model_id`) is
   rejected by the rMLX metrics buffer (known landmine; rejected copies land in
   `metrics/buffer/failed/` and are ignored). Sibling numbers live in CBB only;
-  rMLX cells (Stage 2) will use `runs.db`.
+  rMLX cells use `runs.db` (see `rMLX.md`).
 
 ### Coherence gate
 Every benched cell passed temp=0 greedy coherence (real on-task text, no
@@ -240,11 +240,11 @@ counts ≈ 3.7k / 7.7k / 15.6k / 31.5k / 63.3k. The prefill tok/s in §2b uses t
 recorded (qwen3.6) count, so it is a slight over-estimate (~3 %) of the true
 Bonsai prompt-token rate.
 
-### Caveats carried into Stage 2 / synthesis
+### Caveats carried into the rMLX matrix / synthesis
 - 64k is **n=1 measured** — bump to n≥2 if a close call decides a champion.
 - oMLX 32k/64k rows are **paging-policy artifacts**, not compute — do not crown
   or compare them.
-- The **mlx-lm decode champion is the number rMLX must beat** in Stage 2:
-  ~110 / 94 / 73 / 49 / 28 TPS at 4k / 8k / 16k / 32k / 64k. (rMLX's perf_canary
-  anchor for Bonsai is ~110 TPS at 4k — at parity with this mlx-lm reference;
-  Stage 2 confirms per-cell across the rMLX KV-quant matrix.)
+- The **mlx-lm decode champion** (~110 / 94 / 73 / 49 / 28 TPS at 4k / 8k / 16k /
+  32k / 64k) is the number rMLX is measured against. The rMLX matrix (`rMLX.md`)
+  beats it at every context — `none` decode **133 / 115 / 90 / 61 / 36 TPS
+  (+21…+27 %)**.
