@@ -404,6 +404,14 @@ store sites that funnel into `decode_fp16_k/v` apply the floor:
 - `update_decode_fp16` (the per-step decode append; the cast also sizes the
   resident `zeros(...)` allocation in bf16).
 
+The K-only / V-only decode helper `update_decode_fp16_v_only` (used by the
+IsoKOnly and RotorKOnly asymmetric codecs to write their bf16 V mirror without
+disturbing the quantized K store) writes V in whatever dtype the codec provides,
+which is bf16 by codec contract — it is **not** floored here because it is a
+quantized-codec path, not the `KvQuant::None` / warm-TTFT path, and touching it
+would violate the hard rule that the floor must not reach into quantized codec
+internals.
+
 The cast is **idempotent** — a cheap `dtype == Bf16` check returns the input
 untouched (no `astype` launch) in the steady state that the per-arch source
 fixes already produce, so it is pure insurance with negligible hot-path cost.

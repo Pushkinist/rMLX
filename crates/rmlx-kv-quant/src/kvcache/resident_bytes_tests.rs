@@ -348,6 +348,20 @@ fn f32_decode_store_is_stored_bf16() {
         Dtype::Bf16,
         "f32 V must be floored to bf16 at the decode store boundary"
     );
+
+    // Bytes-per-element invariant on the resident buffer: SEQ+1 positions
+    // filled (SEQ-token prefill + 1 decode step), 2 buffers (K and V), each
+    // element bf16 = 2 bytes.  If the decode store silently kept f32 the
+    // resident_bytes() would be 2× larger and this assertion would catch it
+    // independently of any slice_update dtype-coercion behaviour.
+    let filled = (SEQ + 1) as u64; // prefill offset + one decode step
+    let elems_per_buf = (B * KV_H) as u64 * filled * D as u64;
+    let expected_bytes = 2 * elems_per_buf * 2; // 2 buffers × 2 B/elem (bf16)
+    assert_eq!(
+        cache.resident_bytes(),
+        expected_bytes,
+        "resident KV must be 2 B/elem (bf16) after decode step; f32 storage would produce 4 B/elem"
+    );
 }
 
 /// Control: a bf16 input stays bf16 (the floor is idempotent — the steady state
