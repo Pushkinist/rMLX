@@ -107,8 +107,10 @@ Run these in order before declaring a new arch done.
    ```rust
    scalar_f32(x).astype(operand.dtype(), device)?
    ```
-   This must appear either on the same line as `scalar_f32(` or on the
-   immediately following line (for multi-line method chains).
+   The `.astype(` call may appear on the same line as `scalar_f32(` or anywhere
+   in the immediately following continuation lines of the same method chain
+   (lines that do not yet end the statement). Note: `.astype(Dtype::F32, …)` is
+   NOT a guard — it preserves the F32 scalar and the gate will still flag it.
 
    **Allowlisting a genuine f32-only scalar** (e.g. inside a vision tower or
    audio encoder that runs entirely in f32, or a scalar passed to an f32-only
@@ -119,7 +121,7 @@ Run these in order before declaring a new arch done.
    let inv_k = scalar_f32(1.0 / k as f32);
    ```
    The reason must be specific enough to explain why the f32 promotion is safe
-   (e.g. "tower is f32", "output is Vec<f32>", "passed to compile_shapeless").
+   (e.g. "tower is f32", "output is Vec<f32>", "terminal pre-sampling logits").
 
    Run `make check-no-scalar-f32-leak` before pushing any new arch or new layer.
 

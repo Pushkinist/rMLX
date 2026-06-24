@@ -11,27 +11,45 @@
 #
 # WHAT THIS GATE CHECKS
 # ---------------------
-# Every non-test .rs file under crates/rmlx-models/src/ is scanned for lines
-# that:
+# Every non-test .rs file under crates/rmlx-models/src/ is scanned (excluding
+# out-of-scope arch directories: laguna/, dr_venus/) for lines that:
 #   (a) contain scalar_f32( (as actual code, not a pure line comment), AND
-#   (b) are NOT followed by .astype( on the SAME LINE, AND
-#   (c) are NOT followed by .astype( on the NEXT NON-BLANK LINE
-#       (handles multi-line method chains where .astype is wrapped to the
-#       next line — but only when the scalar_f32 line does not end the
-#       statement, i.e. does not end with ';' or '{' after stripping
-#       trailing whitespace), AND
-#   (d) do NOT have an  // f32-ok: <reason>  marker on the SAME LINE, OR on
+#   (b) are NOT followed by a non-F32 .astype( on the SAME LINE, AND
+#   (c) are NOT followed by a non-F32 .astype( within the immediately following
+#       continuation lines of the same multi-line chain expression (lines that
+#       do not terminate the statement — i.e. no trailing ';' or '}' after
+#       stripping whitespace), AND
+#   (d) do NOT have a  // f32-ok: <reason>  marker on the SAME LINE, OR on
 #       ANY preceding comment line that is part of the contiguous comment block
 #       immediately above the scalar_f32( line.
 #
+# WHAT COUNTS AS A GUARD
+# ----------------------
+# A guarding .astype( call MUST NOT target Dtype::F32 (which preserves the
+# scalar f32 rather than casting to the activation dtype). The following forms
+# are rejected as guards (false guards — they keep the f32):
+#   .astype(Dtype::F32,        → rejected (explicit F32 target)
+#   .astype(F32,               → rejected
+#   .astype(rmlx_mlx::Dtype::F32,  → rejected
+# Any other .astype( target (e.g. Dtype::Bf16, operand.dtype(), x.dtype(),
+# Dtype::I32, …) is accepted as a legitimate guard.
+#
+# SCOPE EXCLUSIONS
+# ----------------
+# Out-of-scope arch directories are excluded from the scan:
+#   laguna/      — excluded (not bench-provable, out of scope per project rules)
+#   dr_venus/    — excluded (same reason, defensive)
+#
 # ALLOWLISTING
 # ------------
-# To allow a genuine f32-only scalar (e.g. one consumed by a raw-f32 param or
-# inside a module where every tensor is already f32):
+# To allow a genuine f32-only scalar (e.g. inside a vision tower or audio
+# encoder that runs entirely in f32, or a scalar passed to an f32-only API):
 #   - Same-line:   scalar_f32(x) // f32-ok: <reason>
 #   - Preceding:   // f32-ok: <reason>
 #                  let s = scalar_f32(x);
-#     (the marker may appear in a multi-line comment block directly above)
+#   The marker may appear in a multi-line comment block directly above the
+#   scalar_f32( line. The reason must be specific (e.g. "tower is f32",
+#   "output is Vec<f32>", "passed to compile_shapeless", "terminal logits").
 #
 # THE CANONICAL FIX
 # -----------------
@@ -44,7 +62,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Arch-layer scope: all .rs files under crates/rmlx-models/src/.
-# Excludes test files (*_tests.rs, files under tests/ directories).
+# Excludes test files, and out-of-scope arch directories.
 SCAN_DIR="${REPO_ROOT}/crates/rmlx-models/src"
 
 violations=()
@@ -55,33 +73,50 @@ while IFS= read -r -d '' f; do
     # State machine:
     #   in_comment_block  — currently inside a contiguous run of // comment lines
     #   block_has_f32ok   — the current/recent comment block contained // f32-ok:
-    #   pending           — scalar_f32( seen; awaiting next non-blank line for
+    #   prev_f32ok        — the preceding comment block had f32-ok (set when the
+    #                       first code line after the block is reached)
+    #   pending           — scalar_f32( seen; awaiting continuation lines for a
     #                       multi-line chain check
     #   pending_line/text — saved location of the pending scalar_f32( line
     #   found             — 1 if any violation detected (drives exit code)
     #
-    # Transition logic:
-    #   On a pure comment line (^[[:space:]]*//) :
-    #     - Still in (or entering) a comment block.
-    #     - If it contains "// f32-ok:", set block_has_f32ok = 1.
+    # Key invariant: a guarding .astype( MUST NOT target F32.
+    # is_f32_astype(line): returns 1 when the line contains .astype( targeting F32.
+    # has_good_astype(line): .astype( present AND is NOT an F32 target.
     #
-    #   On a blank line:
-    #     - Ends the comment block (reset in_comment_block and block_has_f32ok).
-    #     - If pending, skip blank lines.
-    #
-    #   On any other (code) line:
-    #     - The comment block ended with the preceding comments; capture
-    #       block_has_f32ok as prev_f32ok, then reset in_comment_block.
-    #     - Check pending from previous iteration.
-    #     - If line contains scalar_f32( (not in a pure comment):
-    #         * same-line // f32-ok:   → OK
-    #         * prev_f32ok             → OK
-    #         * same-line .astype(     → OK
-    #         * terminated statement (ends with ; or {) → violation
-    #         * else                   → set pending
-    #     - Reset prev_f32ok / block state for next line.
+    # Pending (multi-line chain) logic:
+    #   Once pending is set, keep scanning continuation lines (lines that do not
+    #   terminate the statement, i.e. do not end with ';' or '}').  Accept if any
+    #   continuation carries a non-F32 .astype(.  Emit a violation only when a
+    #   terminating line is reached without having seen a non-F32 .astype(.
 
     awk -v file="$f" '
+        function is_f32_astype(line,    p) {
+            # Returns 1 if the line contains .astype( targeting F32 — not a guard.
+            p = index(line, ".astype(Dtype::F32")
+            if (p > 0) return 1
+            p = index(line, ".astype(F32")
+            if (p > 0) return 1
+            p = index(line, ".astype(rmlx_mlx::Dtype::F32")
+            if (p > 0) return 1
+            return 0
+        }
+
+        function has_good_astype(line) {
+            # Returns 1 if .astype( is present AND it is NOT an F32 target.
+            if (index(line, ".astype(") == 0) return 0
+            return !is_f32_astype(line)
+        }
+
+        function is_terminated(line,    s) {
+            # Returns 1 if the line ends a statement (trailing ; or }).
+            s = line
+            gsub(/^[[:space:]]+/, "", s)
+            gsub(/[[:space:]]+$/, "", s)
+            c = substr(s, length(s), 1)
+            return (c == ";" || c == "}")
+        }
+
         BEGIN {
             in_comment_block = 0
             block_has_f32ok  = 0
@@ -95,7 +130,6 @@ while IFS= read -r -d '' f; do
         # ---- blank line -------------------------------------------------------
         /^[[:space:]]*$/ {
             if (!pending) {
-                # Blank line ends any comment block.
                 in_comment_block = 0
                 block_has_f32ok  = 0
                 prev_f32ok       = 0
@@ -110,33 +144,28 @@ while IFS= read -r -d '' f; do
             next
         }
 
-        # ---- code line (anything that is not blank and not a pure comment) ----
+        # ---- code line --------------------------------------------------------
         {
-            # Capture whether the preceding comment block had f32-ok.
-            # (In the previous iteration a code line already cleared these, so
-            # prev_f32ok here reflects the most recent comment block directly
-            # above this code line.)
+            # Capture preceding comment block f32-ok status on first code line.
             if (in_comment_block) {
-                # We were in a comment block; its f32-ok status is now available.
                 prev_f32ok = block_has_f32ok
             }
-            # Reset the comment-block state now that we have a code line.
             in_comment_block = 0
             block_has_f32ok  = 0
 
-            # Handle any pending check from the previous code line.
+            # Handle pending multi-line chain from a previous scalar_f32( line.
             if (pending) {
-                if (index($0, ".astype(") > 0) {
-                    # Multi-line chain resolved — OK.
+                if (has_good_astype($0)) {
+                    # Chain resolved with a non-F32 .astype( — OK.
                     pending = 0
-                } else {
-                    # Next code line has no .astype( → violation.
+                } else if (is_terminated($0)) {
+                    # Statement terminated without a non-F32 .astype( → violation.
                     print file ":" pending_line ": unguarded scalar_f32(  →  " pending_text
                     found = 1
                     pending = 0
                 }
-                # After resolving pending, continue to check this line for
-                # its own scalar_f32( (fall through).
+                # else: non-terminated continuation — keep pending open, scan next line.
+                # Fall through to check this line for its own scalar_f32(.
             }
 
             # Check this code line for scalar_f32(.
@@ -145,21 +174,20 @@ while IFS= read -r -d '' f; do
                 if (index($0, "// f32-ok:") > 0) { prev_f32ok = 0; next }
                 # (b) Preceding comment block had f32-ok.
                 if (prev_f32ok) { prev_f32ok = 0; next }
-                # (c) Same-line .astype( chain.
-                if (index($0, ".astype(") > 0) { prev_f32ok = 0; next }
-                # (d) Is the statement terminated on this line?
-                stripped = $0
-                gsub(/^[[:space:]]+/, "", stripped)
-                gsub(/[[:space:]]+$/, "", stripped)
-                last_ch = substr(stripped, length(stripped), 1)
-                if (last_ch == ";" || last_ch == "{") {
-                    # Statement ends here — violation.
+                # (c) Same-line non-F32 .astype( chain.
+                if (has_good_astype($0)) { prev_f32ok = 0; next }
+                # (d) Same-line .astype( that targets F32 — counts as NO guard.
+                # (falls through to the termination check below)
+
+                # (e) Is the statement terminated on this line?
+                if (is_terminated($0)) {
+                    # Terminated with no guard → violation.
                     print file ":" NR ": unguarded scalar_f32(  →  " $0
                     found = 1
                     prev_f32ok = 0
                     next
                 }
-                # Non-terminated: defer to next non-blank code line.
+                # Non-terminated: enter pending state to scan continuation lines.
                 pending      = 1
                 pending_line = NR
                 pending_text = $0
@@ -167,12 +195,11 @@ while IFS= read -r -d '' f; do
                 next
             }
 
-            # Not a scalar_f32( line — just update prev_f32ok for next line.
+            # Not a scalar_f32( line.
             prev_f32ok = (index($0, "// f32-ok:") > 0)
         }
 
         END {
-            # Unresolved pending at EOF.
             if (pending) {
                 print file ":" pending_line ": unguarded scalar_f32(  →  " pending_text
                 found = 1
@@ -185,12 +212,15 @@ done < <(
         -not -path "*/target/*" \
         -not -path "*/tests/*" \
         -not -name "*_tests.rs" \
+        -not -path "*/laguna/*" \
+        -not -path "*/dr_venus/*" \
         -print0
 )
 
 if [ ${#violations[@]} -gt 0 ]; then
     echo "" >&2
     echo "CANONICAL FIX: scalar_f32(x).astype(operand.dtype(), device)?" >&2
+    echo "  NOTE: .astype(Dtype::F32, ...) does NOT count as a guard." >&2
     echo "" >&2
     echo "To allowlist a genuine f32-only scalar, add an inline marker:" >&2
     echo "  // f32-ok: <reason why f32 is safe here>" >&2

@@ -681,10 +681,12 @@ impl AudioEncoder {
         let upper_diag = max_past + max_future;
         let ctx = chunk + max_past + max_future;
 
-        let ones_cc = rmlx_mlx::broadcast_to(&scalar_f32(1.0), &[ctx, chunk], device)?; // f32-ok: causal mask is f32; audio tower f32
-                                                                                        // lower_causal = tril(ones(context, chunk)).T -> [chunk, context].
+        // f32-ok: causal validity mask is a float 0/1 array; audio tower runs entirely in f32
+        let ones_cc = rmlx_mlx::broadcast_to(&scalar_f32(1.0), &[ctx, chunk], device)?;
+        // lower_causal = tril(ones(context, chunk)).T -> [chunk, context].
         let lower_causal = tril(&ones_cc, 0, device)?.transpose(&[1, 0], device)?;
-        let ones_cc2 = rmlx_mlx::broadcast_to(&scalar_f32(1.0), &[chunk, ctx], device)?; // f32-ok: audio tower f32
+        // f32-ok: audio tower f32
+        let ones_cc2 = rmlx_mlx::broadcast_to(&scalar_f32(1.0), &[chunk, ctx], device)?;
         let upper_causal = tril(&ones_cc2, upper_diag, device)?; // [chunk, context]
                                                                  // mask = lower * upper (float 0/1; downstream uses >=0.5 as valid).
         multiply(&lower_causal, &upper_causal, device)
