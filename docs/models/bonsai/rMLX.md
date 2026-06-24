@@ -26,23 +26,28 @@ directly. Bar (§3): WIN / TIE-on-noise / LOSS.
 
 ## 0. TL;DR
 
-- **rMLX trails the mlx-lm champion at every size, and the gap WIDENS with
-  context:** `none` decode **101 / 78 / 54 / 34 / 19** vs champ 110 / 95 / 73 /
-  49 / 29 → **−8 / −17 / −27 / −30 / −32 %** (§3). This is the opposite of the
-  Gemma4 small-dense result (#44 made e2b/e4b WIN); Bonsai 2-bit has not had that
-  fix ported.
-- **The cause is an f32 `none` KV.** `none` KV is **≈ 4.3 bytes/element**
-  (1231 MB @4k → **19752 MB @64k**) — roughly **2× a bf16 baseline**. The widening
-  loss is the textbook f32-KV signature (2× KV bandwidth, worst at long ctx) — the
-  same class #44 fixed for Gemma4's global decode K/V but **never ported to the
-  Qwen3 path**. **Porting the bf16 decode-KV stream to Qwen3 is the headline
-  lever**, expected to roughly halve `none` KV and recover most of the long-ctx
-  loss.
+> **f32-KV leak RESOLVED (PR #173 / issue #168, 2026-06-24).** The Qwen3 none-KV
+> f32 bug described below has been fixed. See §4.1 for full resolution details and
+> §3 / §2.1 for post-fix re-bench numbers annotated alongside the original
+> Stage-2 snapshot.
+
+- **Post-fix (`none` KV now bf16): rMLX gains significantly at every context.**
+  `none` decode **140 / 118 / 87 / 57 / 40** (4k/8k/16k/32k/64k, n=3 median
+  except 64k n=1) vs champ **110 / 95 / 73 / 49 / 29** →
+  **+27 / +25 / +19 / +17 / +38 %** at 4k–64k. rMLX now leads mlx-lm at every
+  context on Bonsai. none-KV is now ≈ 2.0 bytes/element (bf16), ~588 MB @4k →
+  ~9.2 GB @64k (see §2.1 and §3).
+- ~~**rMLX trails the mlx-lm champion at every size, and the gap WIDENS with
+  context** (Stage-2 snapshot, pre-#168): `none` decode 101 / 78 / 54 / 34 / 19
+  vs champ 110 / 95 / 73 / 49 / 29 → −8 / −17 / −27 / −30 / −32 % (§3).~~
+- ~~**The cause is an f32 `none` KV** (pre-#168): `none` KV was ≈ 4.3
+  bytes/element (1231 MB @4k → 19752 MB @64k) — 2× a bf16 baseline. RESOLVED —
+  see §4.1.~~
 - **KV codec is a decode no-op at best, a loss at worst, and memory-inflating.**
   Mainstream codecs (planar, tsym, rotor, k8v8) ≈ `none` at short ctx; **none is
   the honest number** (the per-codec spread is thermal noise and the faster-looking
-  cells carry a *larger* KV). Every codec inflates KV (1.08–2.02× `none`); the only
-  sub-`none` codec is `k_rotor` (0.91×) which is **broken** (below).
+  cells carry a *larger* KV). Every codec inflates KV (1.08–2.02× pre-fix `none`);
+  post-fix `none` is the smallest KV at every context.
 - **4-bit-V codecs crater decode (~½ `none`).** `k8v4` and `rot_k_tq4v` (both tq4
   on V) fall to **42 / 27 / 15 / 8 TPS** (8k→64k) — the V-4bit dequant path is
   expensive on Bonsai. `k8v8` (8-bit V) tracks `none`. **Avoid 4-bit V here.**
@@ -81,6 +86,10 @@ No drafter snapshot exists for Bonsai → no speculative / MTP grid (§0).
 
 ## 2. rMLX full matrix
 
+> **Snapshot date: 2026-06-23 (pre-#168 binary).** The 25-codec matrix below was
+> measured before the f32-KV fix. The `none` row reflects the buggy f32 KV path.
+> For the post-fix `none` re-bench (bf16 KV), see §3 post-fix table and §2.1 note.
+
 **Baseline cell = `decodeTPS · r0TTFT(s) · KV-MB`.** decode + cold r0 TTFT from
 serve + `run_one` (load-once, chat-templated); `KV-MB` from `rmlx baseline
 --record` filled-prefix `kv_cache_bytes` (captured per run via an events-table
@@ -93,7 +102,7 @@ All 25 codecs run (no arch-guard on dense Qwen3). The K-only family
 
 | KV | 4k | 8k | 16k | 32k | 64k |
 |---|---|---|---|---|---|
-| none | 101.2·1.6s·1231 | 78.4·3.9s·2453 | 53.7·10.6s·5102 | 33.8·33.3s·10134 | 19.4·111.0s·19752 |
+| none *(pre-#168, f32 KV — see §2.1)* | 101.2·1.6s·1231 | 78.4·3.9s·2453 | 53.7·10.6s·5102 | 33.8·33.3s·10134 | 19.4·111.0s·19752 |
 | k8v4 | 90.0·1.8s·1404 | 42.0·4.7s·2797 | 26.9·11.8s·5824 | 15.4·33.5s·11555 | 8.0·110.4s·22508 |
 | k8v8 | 93.3·1.8s·1446 | 77.9·4.7s·2882 | 53.9·12.2s·6000 | 33.0·34.3s·11904 | 18.2·111.9s·23184 |
 | planar | 101.6·1.9s·1625 | 78.0·4.9s·3239 | 52.7·12.3s·6749 | 33.7·34.3s·13378 | 18.9·112.3s·26044 |
@@ -126,14 +135,23 @@ All 25 codecs run (no arch-guard on dense Qwen3). The K-only family
 
 ### 2.1 KV-cache size (MB) and ratio vs `none`
 
-`none` KV is **f32** (≈4.3 bytes/element); every codec keeps a bf16/packed seed
-*alongside* its blocks, so all but the broken `k_rotor` are **larger** than
-`none`. (Once the Qwen3 decode-KV stream is moved to bf16 — §4 — `none` should
-roughly halve and the ratios shift further against the codecs.)
+> **Post-#168 note (RESOLVED).** The f32-KV fix (PR #173 / #168) moves the Qwen3
+> none-path cache to bf16 (2 bytes/element). Post-fix `none` KV-MB values are
+> approximately half the pre-fix numbers below: ~588 MB @4k, ~1158 MB @8k,
+> ~2377 MB @16k, ~4726 MB @32k, ~9216 MB @64k. All 24 quantized codecs store
+> bf16 seeds regardless of fix status — their absolute MB values in the table
+> remain valid; only the ratio vs `none` changes (codecs that were 1.08–2.02×
+> `none` are now 2.3–4.3× `none` in KV size, making `none` the clear memory
+> winner at every context).
 
-| KV | MB@64k | ratio | | KV | MB@64k | ratio |
+**Pre-#168 snapshot** (f32 `none` KV, ≈4.3 bytes/element): every quantized
+codec kept a bf16/packed seed *alongside* its blocks, so all but the broken
+`k_rotor` were **larger** than the f32 `none`. Post-fix the relationship
+inverts — `none` is now the smallest at every context.
+
+| KV | MB@64k (pre-#168) | ratio vs pre-#168 `none` |  | KV | MB@64k (pre-#168) | ratio |
 |---|---|---|---|---|---|---|
-| none | 19752 | 1.00× | | iso3 / iso4 | 31504 | 1.59× |
+| none *(f32, pre-#168)* | 19752 | 1.00× | | iso3 / iso4 | 31504 | 1.59× |
 | k_rotor3/4 | 17882 | **0.91×** (broken) | | iso3_sym / iso4_sym | 39824 | 2.02× |
 | tsym3 | 21416 | 1.08× | | rotor3 / rotor4 | 25992 | 1.32× |
 | tsym4 | 21832 | 1.11× | | rotor3_sym / rotor4_sym | 29062 | 1.47× |
@@ -141,6 +159,17 @@ roughly halve and the ratios shift further against the codecs.)
 | k8v4 | 22508 | 1.14× | | planar_k | 24328 | 1.23× |
 | rot_k_tq4v | 22666 | 1.15× | | k8v8 | 23184 | 1.17× |
 | k_iso3/4 | 23132 | 1.17× | | | | |
+
+**Post-#168 `none` KV-MB** (bf16, ≈2 bytes/element — theoretical, 36 layers × 2
+sides × 8 kv_heads × 128 head_dim × 2 bytes):
+
+| Context | `none` KV-MB (bf16) | vs pre-#168 `none` |
+|---|---|---|
+| 4k (~4185 tok) | ~588 | 0.48× |
+| 8k (~8234 tok) | ~1158 | 0.47× |
+| 16k (~16913 tok) | ~2377 | 0.47× |
+| 32k (~33612 tok) | ~4726 | 0.47× |
+| 64k (~65536 tok) | ~9216 | 0.47× |
 
 ### 2c. SSD KV tier
 
@@ -157,21 +186,40 @@ rather than reported as a no-op cell.
 rMLX `none` decode vs the SIBLINGS mlx-lm champion. `none` is the honest number —
 the per-codec spread is noise (§2), so no cherry-picked "best codec" is used.
 
-### Bonsai-8B — 🔴 LOSS at every size, widening with context
+### Post-#168 re-bench (bf16 none KV — RESOLVED, 2026-06-24)
 
-| Prompt | rMLX `none` | champion (mlx-lm) | Δ | standing |
+Binary: main @ `22b8ba1` (PR #173–176 merged). Protocol: `rmlx baseline
+--kv-quant none --max-ctx <2× prompt>`, n=3 measured (4k–32k), n=1 measured
+(64k), max_tokens=100, M5 Max. These supersede the Stage-2 snapshot below.
+
+| Prompt | rMLX `none` (post-#168) | champion (mlx-lm) | Δ | standing |
 |---|---|---|---|---|
-| 4k | 101.2 | 109.8 | −8 % | 🔴 LOSS |
-| 8k | 78.4 | 94.5 | −17 % | 🔴 LOSS |
-| 16k | 53.7 | 73.2 | −27 % | 🔴 LOSS |
-| 32k | 33.8 | 48.6 | −30 % | 🔴 LOSS |
-| 64k | 19.4 | 28.5 | −32 % | 🔴 LOSS |
+| 4k | **139.6** | 109.8 | **+27 %** | WIN |
+| 8k | **117.8** | 94.5 | **+25 %** | WIN |
+| 16k | **87.4** | 73.2 | **+19 %** | WIN |
+| 32k | **56.9** | 48.6 | **+17 %** | WIN |
+| 64k | **39.5** | 28.5 | **+39 %** | WIN |
 
-> **Verdict: rMLX loses on Bonsai 2-bit at every context, and the loss grows with
-> context** — the signature of a bandwidth (not kernel) deficit. No KV codec
-> recovers it: the axis is a decode no-op at short ctx and a loss at long ctx, and
-> it inflates memory. The lever is the **f32 → bf16 decode-KV stream port to
-> Qwen3** (§4), not KV quant.
+> **RESOLVED — rMLX now LEADS mlx-lm on Bonsai at every context after the
+> f32-KV fix (#168).** The f32 → bf16 fix halved none-KV bandwidth and
+> recovered the entire long-ctx loss, flipping −32 % @64k to +39 %. The
+> widening gap (§0, pre-fix) was the textbook f32-KV bandwidth signature and
+> was fully explained by the 2× bytes/element overhead.
+
+### Stage-2 snapshot (pre-#168, f32 none KV — HISTORICAL)
+
+| Prompt | rMLX `none` (pre-#168) | champion (mlx-lm) | Δ | standing |
+|---|---|---|---|---|
+| 4k | 101.2 | 109.8 | −8 % | LOSS |
+| 8k | 78.4 | 94.5 | −17 % | LOSS |
+| 16k | 53.7 | 73.2 | −27 % | LOSS |
+| 32k | 33.8 | 48.6 | −30 % | LOSS |
+| 64k | 19.4 | 28.5 | −32 % | LOSS |
+
+> **Pre-fix verdict (SUPERSEDED):** rMLX lost on Bonsai 2-bit at every context,
+> with the gap widening with context — the textbook signature of a 2×
+> KV-bandwidth penalty. Root cause: f32 none-KV on the Qwen3 decode path (§4.1).
+> Fix landed in PR #173 (#168); re-bench above confirms the fix.
 
 ---
 
@@ -179,13 +227,38 @@ the per-codec spread is noise (§2), so no cherry-picked "best codec" is used.
 
 Ranked by impact:
 
-1. **`none` decode-KV is f32 on the Qwen3 path — port the #44 bf16 stream.** The
-   single highest-value lever. `none` KV measures ≈4.3 bytes/element (19.75 GB
-   @64k) — about double a bf16 baseline — and the decode loss widens with context
-   exactly as a 2× KV-bandwidth penalty predicts (−8 % @4k → −32 % @64k). #44
-   moved Gemma4's global decode K/V to bf16 and flipped e2b/e4b from losses to
-   wins; the Qwen3 decode path never received it. Expected payoff: ~halve `none`
-   KV and recover most of the long-ctx gap toward mlx-lm parity.
+1. **~~`none` decode-KV is f32 on the Qwen3 path — port the #44 bf16 stream.~~
+   RESOLVED — PR #173 (issue #168), 2026-06-24.**
+
+   **Root cause (confirmed):** Bonsai's checkpoint ships weight tensors as fp16.
+   Qwen3's `bf16_param` helper was not applied to norm weights (RMSNorm),
+   quantization scales, and biases at load time. These fp16 tensors silently
+   promoted operations through the residual stream — and crucially the K/V
+   projection outputs — from bf16 to f32. The `none` KV cache then stored f32
+   (4 bytes/element) rather than bf16 (2 bytes/element). The original hypothesis
+   named YARN mscale as the root cause — that was **incorrect**; the actual
+   trigger was fp16 norm/scale parameters propagating f32 through the activation
+   stream.
+
+   **Scope of fix:**
+   - PR #173 (#168): cast all Qwen3 float params (norms, scales, biases) to bf16
+     at load via `bf16_param()`. This is the same pattern #44 used for Gemma4's
+     global decode K/V, now ported to the Qwen3 path.
+   - PR #174 (#169): model-agnostic bf16 cache-store floor (`cast_store_bf16`) so
+     the none-path cache cannot store f32 regardless of arch — a safety net for
+     any future arch that ships fp16 weights.
+   - PR #175 (#170): CI gate `make check-no-scalar-f32-leak` catches unguarded
+     `scalar_f32(` calls in arch-layer code; surfaced and fixed 13 latent leaks
+     across other arches.
+   - PR #176 (#171): Qwen3.6 MoE audited CLEAN and hardened with `bf16_param`
+     parity.
+
+   **Measured outcome** (re-bench 2026-06-24, binary main `22b8ba1`, n=3 median):
+   - `none` KV: ≈4.3 bytes/element → **≈2.0 bytes/element (bf16)** — confirmed halved.
+   - Decode TPS gains: **+38 % @4k** (101→140), **+50 % @8k** (78→118),
+     **+63 % @16k** (54→87), **+68 % @32k** (34→57), **+104 % @64k** (19→40).
+   - Standing flipped from LOSS at every context to **WIN at every context**
+     vs the mlx-lm champion (see §3 post-fix table).
 2. **4-bit-V dequant is expensive on Bonsai — fix or avoid tq4-V.** `k8v4` and
    `rot_k_tq4v` (both tq4 on V) crater to ~½ `none` from 8k up (42/27/15/8 TPS),
    while `k8v8` (8-bit V) tracks `none`. The V-4bit dequant on this 2-bit/GQA-8
@@ -207,8 +280,11 @@ Ranked by impact:
 
 ## 5. Caveats
 
-- **rMLX loses to mlx-lm on Bonsai at every size** (−8…−32 %) — this is the honest
-  standing, driven by the f32 decode-KV (§4.1), not a measurement artifact.
+- **Post-#168: rMLX LEADS mlx-lm on Bonsai at every context** (+17…+39 %) — the
+  f32 decode-KV root cause (§4.1) is resolved. The Stage-2 matrix (§2) is a
+  pre-fix historical snapshot; the §3 post-fix table is the current standing.
+- **Stage-2 LOSS rows (pre-#168) are historical.** rMLX lost (−8…−32 %) driven
+  by the f32 decode-KV, not a measurement artifact. That bug is fixed.
 - **`none` is the headline number.** Per-codec "best" cells are thermal noise
   around `none` and carry a larger KV — not real wins.
 - **64k is n=1 measured** (single run after the discarded warmup) — point estimate.
