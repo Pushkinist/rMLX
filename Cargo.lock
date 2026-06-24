@@ -1352,9 +1352,9 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "memmap2"
-version = "0.9.10"
+version = "0.9.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
+checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
 dependencies = [
  "libc",
 ]
@@ -1924,7 +1924,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "rmlx-audio"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "miniz_oxide 0.9.1",
  "rmlx-core",
@@ -1942,7 +1942,7 @@ dependencies = [
 
 [[package]]
 name = "rmlx-cli"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1977,7 +1977,7 @@ dependencies = [
 
 [[package]]
 name = "rmlx-core"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "chrono",
  "libc",
@@ -1991,7 +1991,7 @@ dependencies = [
 
 [[package]]
 name = "rmlx-kv-quant"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "rmlx-core",
  "rmlx-mlx",
@@ -2001,7 +2001,7 @@ dependencies = [
 
 [[package]]
 name = "rmlx-kv-ssd"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "rmlx-core",
  "rmlx-kv-quant",
@@ -2017,7 +2017,7 @@ dependencies = [
 
 [[package]]
 name = "rmlx-loader"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "memmap2",
  "rayon",
@@ -2033,7 +2033,7 @@ dependencies = [
 
 [[package]]
 name = "rmlx-metrics"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "csv",
  "regex-lite",
@@ -2052,7 +2052,7 @@ dependencies = [
 
 [[package]]
 name = "rmlx-mlx"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "bindgen",
  "rmlx-core",
@@ -2064,7 +2064,7 @@ dependencies = [
 
 [[package]]
 name = "rmlx-models"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "criterion",
  "image",
@@ -2091,7 +2091,7 @@ dependencies = [
 
 [[package]]
 name = "rmlx-quant"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "criterion",
  "rmlx-core",
@@ -2102,7 +2102,7 @@ dependencies = [
 
 [[package]]
 name = "rmlx-runtime"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "rmlx-core",
  "rmlx-mlx",
@@ -2112,7 +2112,7 @@ dependencies = [
 
 [[package]]
 name = "rmlx-server"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "axum",
