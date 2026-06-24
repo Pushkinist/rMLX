@@ -203,6 +203,58 @@ Measured (e4b mxfp8, `--kv-quant none`, ~18.5 k context): `kv_cache_bytes`
 activations and scale sites at bf16, so a future re-promotion of the Gemma4
 stream to f32 fails CI.
 
+### Qwen3 dense `--kv-quant none` KV is bf16 (was f32)
+
+The same class hit the dense Qwen3 arch (`Qwen3ForCausalLM`). Some snapshots
+ship norm weights and quant scales/biases at **fp16** (e.g. Bonsai-8B-2bit).
+rMLX runs the residual stream in **bf16** (the embedding dequant is forced to
+bf16). When `rms_norm` mixes a bf16 activation with an fp16 norm weight — and
+when `quantized_matmul` mixes a bf16 activation with fp16 scales/biases — MLX
+promotes the result to **f32**. That f32 carried through the Q/K/V projections,
+attention, and the global `--kv-quant none` KV cache, which then stored K and V
+at f32 (4 B/elem) — roughly **2× the bf16 expectation**. (The YARN mscale scalar
+is *not* the cause: q/k/v arrive at the YARN branch already f32 from the
+projection.)
+
+Fix, matching mlx-lm's "uniform model dtype" discipline (`w.astype(model_dtype)`
+at load): every float model parameter — norm weights, quant scales/biases, and
+embedding scales/biases — adopts the bf16 activation dtype at load. The
+projection and norm outputs then stay bf16, so K and V store as bf16. The YARN
+mscale scalar is also stored as bf16 at load (defense-in-depth; the scalar was
+never the root cause, but prebuilding it as bf16 is cheaper than a per-step
+cast and keeps the multiply unambiguous. Two unit-level dtype-lock tests pin
+the `rms_norm` and `bf16_param` call paths.
+
+Measured (Bonsai-8B-2bit, `--kv-quant none`): decode-time K/V resident dtype
+flips f32→bf16 (4→2 B/elem), halving KV residency. Decode TPS gains widen with
+context as KV bandwidth dominates: ~+34 % at 4 k, ~+73 % at 16 k, ~+100 % at
+64 k — recovering the prior loss vs the mlx-lm champion on this model.
+
+### Qwen3.6 MoE `--kv-quant none` KV is bf16 — audited clean AND hardened
+
+The Qwen3.5-MoE arch (`Qwen3_5MoeForConditionalGeneration`) was audited for the
+same f32-KV leak class. **Verdict: clean AND structurally hardened.** The
+`qwen3_5_moe` loader casts every float param to bf16 at load via
+`load_util::bf16_param`, covering FullAttention (q/k-norm weights, quant
+scales/biases, embedding scales/biases) and GDN recurrent layers (`conv1d_weight`
+and `norm_weight`). This is identical to the dense Qwen3 loader — so **any future
+Qwen3.6 snapshot, including an fp16 repack, stays bf16-clean in compute**. The
+compute stream is bf16 end-to-end: `rms_norm` and `quantized_matmul` stay bf16
+(no fp16→f32 promotion), the MoE router `softmax(bf16 logits)` keeps
+`routing_weights` bf16 (no Gemma4-MoE-class router leak — the router gate is a
+plain quantized `Linear`, not a strong-f32-scaled RMSNorm), GDN
+`conv1d(bf16 qkv, bf16 conv1d_weight)` stays bf16 through `v4`/`y_bf16`, and
+`rms_norm(&y_bf16, bf16 norm_weight)` stays bf16 at the GDN RMSNormGated site.
+This arch's attention has no YARN mscale on the q/k path.
+
+Decisive measurement: at `--kv-quant none`, every K/V tensor arrives at the
+cache-store boundary as **bf16 (400+/400+ prefill+decode store calls, zero f32)**
+— so the compute is genuinely clean, not merely capped by the model-agnostic
+`cast_store_bf16` floor. Two CPU dtype-lock tests pin this:
+`moe_stream_stays_bf16_with_bf16_params` (q/k-norm + router promotion semantics)
+and `bf16_param_casts_fp16_to_bf16` (helper-contract gate — RED if `bf16_param`
+stops casting fp16→bf16; loader call sites verified by real-model load proof).
+
 **Byte accounting.** Two methods report KV-cache size:
 
 - `KvCache::approx_bytes()` — formula-based estimate using stored shape fields.
@@ -366,6 +418,42 @@ records only `max_seq`; the actual arrays are owned by `KvCache` directly.
 `update()` calls `update_decode_fp16`, which issues a `slice_update` at the
 current token offset into the pre-allocated buffer. SDPA uses
 `scaled_dot_product_attention` on the raw bf16 arrays.
+
+**Cache-boundary bf16 floor (model-agnostic f32-KV guard).** The store boundary
+casts incoming K/V to bf16 **independent of the inbound dtype**, so the resident
+buffer is bf16 regardless of what the model's attention stream produced. Both
+store sites that funnel into `decode_fp16_k/v` apply the floor:
+
+- `update_prefill_raw` (the warm-TTFT seed buffer that `exit_prefill` slices
+  into the decode mirror), and
+- `update_decode_fp16` (the per-step decode append; the cast also sizes the
+  resident `zeros(...)` allocation in bf16).
+
+The K-only / V-only decode helper `update_decode_fp16_v_only` (used by the
+IsoKOnly and RotorKOnly asymmetric codecs to write their bf16 V mirror without
+disturbing the quantized K store) writes V in whatever dtype the codec provides,
+which is bf16 by codec contract — it is **not** floored here because it is a
+quantized-codec path, not the `KvQuant::None` / warm-TTFT path, and touching it
+would violate the hard rule that the floor must not reach into quantized codec
+internals.
+
+The cast is **idempotent** — a cheap `dtype == Bf16` check returns the input
+untouched (no `astype` launch) in the steady state that the per-arch source
+fixes already produce, so it is pure insurance with negligible hot-path cost.
+This is **defense-in-depth, not a substitute for the per-arch fix**: it caps the
+*memory* damage of an upstream f32 leak (it cannot store f32) but does not fix
+the *compute* slowdown — any upstream f32 arithmetic (RoPE / SDPA) stays f32.
+The per-arch source fixes (Gemma4 §"Gemma4 global `--kv-quant none` KV is bf16",
+Qwen3 §"Qwen3 dense `--kv-quant none` KV is bf16") remain the real fix; this
+floor is the structural guard that makes the leak class impossible to re-create
+silently.
+
+The detector is a bytes-per-element invariant in
+`crates/rmlx-kv-quant/src/kvcache/resident_bytes_tests.rs`: an f32 K/V fed
+through the prefill-seed and decode-store paths must land as bf16 (2 B/elem). It
+is wired into `make model-check` (which now runs `-p rmlx-kv-quant`), so a future
+arch that leaks f32 into the unquantised KV store trips CI at integration instead
+of being found months later in a bench.
 
 **Memory cost**: `2 · B · kv_h · max_seq · head_dim · 2 bytes` per layer.
 At 128K context on a 35B-A3B model this is tens of gigabytes. Reserve for

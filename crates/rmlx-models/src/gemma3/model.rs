@@ -112,10 +112,12 @@ impl Gemma3Text {
     ) -> Result<Array> {
         // Embed tokens → [1, seq, hidden].
         let h = self.embed_tokens.forward(ids_arr, device)?;
-        // Embedding scale: sqrt(hidden_size).
+        // Embedding scale: sqrt(hidden_size). Adopt activation dtype so a
+        // strong-f32 scalar does not upcast the embedding stream.
         // Reference: gemma3_text.py Gemma3Model.__call__ line 190:
         // `h *= mx.array(self.args.hidden_size**0.5, mx.bfloat16).astype(h.dtype)`
-        let embed_scale = scalar_f32((self.cfg.hidden_size as f32).sqrt());
+        let embed_scale =
+            scalar_f32((self.cfg.hidden_size as f32).sqrt()).astype(h.dtype(), device)?;
         let h = multiply(&h, &embed_scale, device)?;
         let h = h.reshape(&[1, seq, self.cfg.hidden_size as i32], device)?;
         self.forward_h(h, seq, caches, device)
@@ -192,9 +194,10 @@ impl Gemma3Text {
             None => self.embed_tokens.as_linear(&h_last, device)?,
         };
 
-        // Final logit softcapping (optional — null in medgemma).
+        // Final logit softcapping (optional — null in medgemma). Adopt the
+        // logit dtype so a strong-f32 cap scalar does not upcast the stream.
         let logits = if let Some(cap) = self.cfg.final_logit_softcapping {
-            let cap_arr = scalar_f32(cap);
+            let cap_arr = scalar_f32(cap).astype(logits.dtype(), device)?;
             let scaled = divide(&logits, &cap_arr, device)?;
             let t = tanh(&scaled, device)?;
             multiply(&t, &cap_arr, device)?

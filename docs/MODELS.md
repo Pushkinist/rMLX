@@ -242,6 +242,13 @@ defaults `beta_fast=32, beta_slow=1`.
   via `--prompt-cache-slots`.
 - **SSD spill.** KV blocks spill to SSD when RAM pressure is high and are
   hydrated back before they enter SDPA.
+- **Stream stays at the model dtype (bf16).** Float model parameters — norm
+  weights and quant scales/biases — are cast to bf16 at load (mlx-lm's uniform
+  model-dtype discipline). Some snapshots ship these at fp16 (e.g. Bonsai); a
+  bf16 activation mixed with an fp16 param promotes to f32 and propagates through
+  Q/K/V, attention, and the `--kv-quant none` KV cache (doubling its residency).
+  Casting at load keeps K/V bf16. See `docs/KV_QUANT.md` "Qwen3 dense
+  `--kv-quant none` KV is bf16".
 
 ### Known limitations
 
@@ -329,6 +336,37 @@ The 25% FullAttention layer density means the Mixed MLX affine path (which
 routes only FA layers through `quantized_matmul`) shows smaller gains than on
 dense architectures. Perf testing shows `K8V8` is faster than `Mixed k8v8 g64`
 on this arch.
+
+**`--kv-quant none` KV is bf16 — audited clean AND hardened (no f32-KV leak).**
+The `qwen3_5_moe` loader casts every float parameter to bf16 at load via
+`load_util::bf16_param`, covering both FullAttention layers (q/k-norm weights,
+quant scales/biases, embedding scales/biases) and GDN recurrent layers
+(`conv1d_weight` and `norm_weight`). This matches the dense Qwen3 loader
+discipline and means **any future Qwen3.6 snapshot — including an fp16 repack —
+stays bf16-clean in compute**, not merely floored in memory by the
+model-agnostic `cast_store_bf16` store floor. The compute stream is bf16
+end-to-end:
+
+- the embedding dequant forces bf16 (`embed_lookup`),
+- `rms_norm(bf16 x, bf16 q/k-norm weight)` stays bf16 — the q/k that reach the
+  KV store are bf16,
+- the MoE router `softmax(bf16 gate logits)` keeps `routing_weights` bf16, so
+  no f32 leaks into the MoE residual / downstream KV (this arch has **no**
+  Gemma4-MoE router-scale leak: the router gate is a plain quantized `Linear`,
+  with no strong-f32 RMSNorm-weight scaling),
+- GDN `conv1d(bf16 qkv, bf16 conv1d_weight)` stays bf16 through `v4`/`y_bf16`,
+  and `rms_norm(&y_bf16, bf16 norm_weight)` stays bf16 at the RMSNormGated site,
+- this arch's FullAttention has **no YARN mscale** on the q/k path (plain
+  `rope` only), so there is no un-`.astype`'d scalar-f32 multiply to leak.
+
+Measured directly on the 35B-A3B-8bit snapshot (`--kv-quant none`): every K/V
+tensor arrives at the cache-store boundary as **bf16 (400+/400+ store calls,
+prefill + decode), zero f32** — so the compute is genuinely clean, not merely
+floored. Two CPU dtype-lock tests in `qwen3_5_moe/moe_tests.rs` pin this:
+`moe_stream_stays_bf16_with_bf16_params` (q/k-norm and router promotion
+semantics) and `bf16_param_casts_fp16_to_bf16` (helper-contract gate — RED if
+`bf16_param` stops casting fp16→bf16; loader call sites verified by real-model
+load proof).
 
 ### Modalities
 

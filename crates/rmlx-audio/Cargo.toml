@@ -27,7 +27,7 @@ tokenizers   = { workspace = true }
 # miniz_oxide: inflate (DEFLATE decompress) for reading .npz (ZIP+deflate) archives.
 # symphonia 0.5 brought this in transitively via flate2; symphonia 0.6 dropped
 # flate2, so miniz_oxide is now a direct dep here. Still no new transitive crates.
-miniz_oxide  = "0.8"
+miniz_oxide  = "0.9"
 
 [dev-dependencies]
 tempfile = { workspace = true }

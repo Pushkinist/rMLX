@@ -39,6 +39,31 @@ fn layer_idx_u32(layer_idx: usize) -> u32 {
     layer_idx as u32
 }
 
+/// Model-agnostic bf16 floor for the unquantised (`KvQuant::None`) / warm-TTFT
+/// cache store boundary.
+///
+/// The `decode_fp16_k/v` mirror is bf16 by contract (that is what every sibling
+/// MLX backend stores for unquantised KV, and the only sensible value), but the
+/// incoming K/V inherit whatever dtype the model's attention stream happened to
+/// produce. A single f32 scalar leaking into that stream upstream silently
+/// promotes K/V to f32 and doubles resident KV. Casting here at the store
+/// boundary caps the memory damage regardless of arch — defence-in-depth on top
+/// of the per-arch source fixes, not a replacement for them (upstream f32
+/// compute stays f32; this only floors what the cache *stores*).
+///
+/// Idempotent: when the input is already bf16 (the steady state after the
+/// per-arch fixes) this returns `None` after a cheap dtype check — no `astype`
+/// launch on the decode hot path. Only a non-bf16 input materialises the cast.
+/// Callers fold the result with `result.as_ref().unwrap_or(new_k)`.
+#[inline]
+fn cast_store_bf16(arr: &Array, device: Device) -> Result<Option<Array>> {
+    if arr.dtype() == Dtype::Bf16 {
+        Ok(None)
+    } else {
+        Ok(Some(arr.astype(Dtype::Bf16, device)?))
+    }
+}
+
 /// Encode a KV chunk (`new_kv`, shape `[B, kv_h, S, D]`) via the iso4
 /// MSL kernel and return the resulting CPU [`IsoBlocks`].
 ///
@@ -902,6 +927,16 @@ impl KvCache {
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
+        // bf16 floor: the raw prefill buffer becomes the warm-TTFT decode seed
+        // (the unquantised K/V the cache stores). Cast at the store boundary so
+        // an upstream f32 leak cannot double resident KV — the capacity grow,
+        // the buffer alloc, and the slice_update below all then see bf16.
+        // Idempotent: a no-op when already bf16.
+        let k_cast = cast_store_bf16(new_k, device)?;
+        let v_cast = cast_store_bf16(new_v, device)?;
+        let new_k = k_cast.as_ref().unwrap_or(new_k);
+        let new_v = v_cast.as_ref().unwrap_or(new_v);
+
         let shape = new_k.shape();
         let b = shape[0];
         let kv_h = shape[1];
@@ -2943,6 +2978,15 @@ impl KvCache {
         max_seq: i32,
         device: Device,
     ) -> Result<(Array, Array)> {
+        // bf16 floor: the unquantised / warm-TTFT decode mirror is bf16 by
+        // contract. Cast at the store boundary so an upstream f32 leak can never
+        // double resident KV (idempotent — a no-op when already bf16). The
+        // resulting `dtype` below then sizes the resident buffer in bf16 too.
+        let k_cast = cast_store_bf16(new_k, device)?;
+        let v_cast = cast_store_bf16(new_v, device)?;
+        let new_k = k_cast.as_ref().unwrap_or(new_k);
+        let new_v = v_cast.as_ref().unwrap_or(new_v);
+
         let shape = new_k.shape();
         let b = shape[0];
         let kv_h = shape[1];
