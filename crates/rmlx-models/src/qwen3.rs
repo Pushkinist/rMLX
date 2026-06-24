@@ -859,10 +859,11 @@ struct Attention {
     /// allocs per layer per decode step (72 allocs/step on Bonsai-36-layer).
     /// `None` when YARN is not active or mscale is exactly 1.0 (no scaling).
     ///
-    /// Stored strong-f32 (the operand dtype is not known at construction); the
-    /// q/k multiply site adopts the operand dtype before scaling so a strong-f32
-    /// scalar does not silently widen bf16 q/k — and the K side of the KV cache
-    /// they feed — to f32 on the None path.
+    /// Stored at bf16 (cast at load because the activation stream is fixed bf16).
+    /// A strong-f32 scalar here would be defense-in-depth against future dtype
+    /// changes, not the observed f32-KV leak; the actual cause was fp16 norm
+    /// weights and fp16 quant scales/biases promoting the projection output to f32
+    /// before this site. Precomputing as bf16 avoids a per-layer per-step cast.
     yarn_mscale_arr: Option<Array>,
 }
 
@@ -973,21 +974,21 @@ impl Attention {
                 // YARN path: hoist both transposes before mscale scaling.
                 let q = q.transpose(&[0, 2, 1, 3], device)?; // [B, H, S, D]
                 let k = k.transpose(&[0, 2, 1, 3], device)?;
-                // Reuse the precomputed scalar Array rather than allocating a
-                // fresh one per layer per step. The scalar is built strong-f32
-                // at load time (operand dtype is not known there); adopt the
-                // operand dtype before multiplying so a strong-f32 scalar does
-                // not promote a bf16 q/k to f32. A strong-f32 mscale would widen
-                // q and k through RoPE/SDPA and the K side of the KV cache.
-                // The cast is a single-element scalar reshape — negligible vs.
-                // the projection it scales.
+                // Reuse the precomputed scalar Array (already bf16 at load)
+                // rather than allocating a fresh one per layer per step.
+                // The scalar was cast to bf16 at load because the activation
+                // stream is fixed bf16; a residual strong-f32 mscale here
+                // would be defense-in-depth against future dtype changes, not
+                // the observed leak (q/k arrive already promoted to f32 by
+                // fp16 model params before this site, when uncast). No runtime
+                // astype needed.
                 let q_scaled = if let Some(m) = &self.yarn_mscale_arr {
-                    multiply(&q, &m.astype(q.dtype(), device)?, device)?
+                    multiply(&q, m, device)?
                 } else {
                     q.try_clone()?
                 };
                 let k_scaled = if let Some(m) = &self.yarn_mscale_arr {
-                    multiply(&k, &m.astype(k.dtype(), device)?, device)?
+                    multiply(&k, m, device)?
                 } else {
                     k.try_clone()?
                 };
@@ -2219,11 +2220,11 @@ pub fn generate_greedy<'a>(
 /// `--kv-quant none` KV cache. Casting every float parameter to BF16 at load —
 /// mlx-lm's "uniform model dtype" discipline — keeps the stream at BF16.
 /// Already-BF16 parameters are a no-op.
-fn bf16_param(a: Array, device: Device) -> Result<Array> {
+fn bf16_param(a: Array) -> Result<Array> {
     if a.dtype() == Dtype::Bf16 {
         Ok(a)
     } else {
-        a.astype(Dtype::Bf16, device)
+        a.astype(Dtype::Bf16, Device::Cpu)
     }
 }
 
@@ -2283,8 +2284,8 @@ pub fn load_from_path(model_dir: &Path, yarn_override: Option<&YarnOverride>) ->
                 // none` KV cache — doubling residency. mlx-lm casts every float
                 // weight to a single model dtype at load; force the scale/bias to
                 // BF16 here to match, so the projection output stays BF16.
-                scales: bf16_param(scales, Device::Cpu)?,
-                biases: biases.map(|b| bf16_param(b, Device::Cpu)).transpose()?,
+                scales: bf16_param(scales)?,
+                biases: biases.map(bf16_param).transpose()?,
                 group_size,
                 bits,
                 mode: mode.as_str().to_owned(),
@@ -2300,7 +2301,7 @@ pub fn load_from_path(model_dir: &Path, yarn_override: Option<&YarnOverride>) ->
     // the KV cache.
     let load_rms = |name: &str| -> Result<RmsNorm> {
         Ok(RmsNorm {
-            weight: bf16_param(w.array(&format!("{name}.weight"))?, Device::Cpu)?,
+            weight: bf16_param(w.array(&format!("{name}.weight"))?)?,
             eps: cfg.rms_norm_eps,
         })
     };
@@ -2323,8 +2324,14 @@ pub fn load_from_path(model_dir: &Path, yarn_override: Option<&YarnOverride>) ->
                 mode,
             } => Embedding::Quantized {
                 weight,
-                scales,
-                biases,
+                // The tied-lm_head path (`as_linear`) calls `quantized_matmul`
+                // with these scales/biases against a bf16 hidden state. On
+                // snapshots that ship embedding scales at fp16 (e.g. Bonsai),
+                // that produces f32 logits; cast to bf16 at load to keep the
+                // output bf16 — consistent with `lin`'s treatment and
+                // mlx-lm's uniform model-dtype discipline.
+                scales: bf16_param(scales)?,
+                biases: biases.map(bf16_param).transpose()?,
                 group_size,
                 bits,
                 mode: mode.as_str().to_owned(),
@@ -2416,8 +2423,11 @@ pub fn load_from_path(model_dir: &Path, yarn_override: Option<&YarnOverride>) ->
             // Precompute once; all layers share the same mscale value, and
             // scalar arrays carry no layer-specific state, so no try_clone
             // is needed.
+            // Cast to bf16 at load; the activation stream is fixed bf16, so the
+            // scalar dtype is known here. The per-step multiply then stays bf16
+            // without any runtime astype call.
             yarn_mscale_arr: if (yarn_mscale - 1.0).abs() > 1e-6 {
-                Some(scalar_f32(yarn_mscale))
+                Some(scalar_f32(yarn_mscale).astype(Dtype::Bf16, Device::Cpu)?)
             } else {
                 None
             },

@@ -217,12 +217,13 @@ is *not* the cause: q/k/v arrive at the YARN branch already f32 from the
 projection.)
 
 Fix, matching mlx-lm's "uniform model dtype" discipline (`w.astype(model_dtype)`
-at load): every float model parameter adopts the bf16 activation dtype at load —
-norm weights and quant scales/biases are cast to bf16 in the Qwen3 loader. The
-projection output then stays bf16, so K and V store as bf16. The YARN mscale
-multiply additionally adopts the operand dtype so a strong-f32 scalar cannot
-re-promote the now-bf16 q/k. Two unit-level dtype-lock regression tests pin the
-`rms_norm` and mscale sites at bf16.
+at load): every float model parameter — norm weights, quant scales/biases, and
+embedding scales/biases — adopts the bf16 activation dtype at load. The
+projection and norm outputs then stay bf16, so K and V store as bf16. The YARN
+mscale scalar is also stored as bf16 at load (defense-in-depth; the scalar was
+never the root cause, but prebuilding it as bf16 is cheaper than a per-step
+cast and keeps the multiply unambiguous. Two unit-level dtype-lock tests pin
+the `rms_norm` and `bf16_param` call paths.
 
 Measured (Bonsai-8B-2bit, `--kv-quant none`): decode-time K/V resident dtype
 flips f32→bf16 (4→2 B/elem), halving KV residency. Decode TPS gains widen with
