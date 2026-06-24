@@ -182,7 +182,8 @@ impl SparseMoeBlock {
             self.experts
                 .forward(&x_flat, &routing_weights, &expert_indices, device)?;
 
-        let scale_arr = rmlx_mlx::scalar_f32(self.routed_scaling_factor);
+        let scale_arr =
+            rmlx_mlx::scalar_f32(self.routed_scaling_factor).astype(routed_out.dtype(), device)?;
         let routed_scaled = multiply(&routed_out, &scale_arr, device)?;
         let combined = add(&routed_scaled, &shared_out, device)?;
 

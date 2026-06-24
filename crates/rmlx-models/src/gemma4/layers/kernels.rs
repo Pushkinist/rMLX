@@ -331,6 +331,9 @@ pub(crate) fn softcap_fused(x: &Array, cap: f32, device: Device) -> Result<Array
         device_tag: softcap_device_tag(device),
     };
     let compiled = softcap_get_or_compile(key, device)?;
+    // f32-ok: cap is a Python float in the reference (mlx-lm logit_softcap); passing it as a
+    // 0-D F32 scalar to compile_shapeless matches the reference exactly. The compiled closure
+    // is keyed on x.dtype() and MLX traces the mixed-precision graph at compile time.
     let cap_arr = scalar_f32(cap);
     let mut outs = compiled.apply(&[&cap_arr, x])?;
     outs.pop()

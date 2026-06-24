@@ -69,7 +69,7 @@ fn i32_bytes(v: &[i32]) -> &[u8] {
 
 /// `relu(x)` via `maximum(x, 0)`.
 fn relu(x: &Array, device: Device) -> Result<Array> {
-    let zero = scalar_f32(0.0);
+    let zero = scalar_f32(0.0); // f32-ok: audio tower runs entirely in f32 (weights upcast at load)
     maximum(x, &zero, device)
 }
 
@@ -105,12 +105,12 @@ impl ChannelLayerNorm {
     fn forward(&self, x: &Array, device: Device) -> Result<Array> {
         let last = (x.ndim() - 1) as i32;
         let dim = x.shape()[x.ndim() - 1] as f32;
-        let inv_n = scalar_f32(1.0 / dim);
+        let inv_n = scalar_f32(1.0 / dim); // f32-ok: audio tower runs entirely in f32 (weights upcast at load)
         let mean = multiply(&sum_axis_keepdims(x, last, device)?, &inv_n, device)?;
-        let centered = add(x, &multiply(&mean, &scalar_f32(-1.0), device)?, device)?;
+        let centered = add(x, &multiply(&mean, &scalar_f32(-1.0), device)?, device)?; // f32-ok: audio tower f32
         let sq = multiply(&centered, &centered, device)?;
         let var = multiply(&sum_axis_keepdims(&sq, last, device)?, &inv_n, device)?;
-        let denom = rmlx_mlx::sqrt(&add(&var, &scalar_f32(self.eps), device)?, device)?;
+        let denom = rmlx_mlx::sqrt(&add(&var, &scalar_f32(self.eps), device)?, device)?; // f32-ok: audio tower f32
         let normed = rmlx_mlx::divide(&centered, &denom, device)?;
         multiply(&normed, &self.weight, device)
     }
@@ -141,7 +141,7 @@ impl SscpConvBlock {
         // Zero out invalid positions: x = where(mask[:, :, None, None], 0, x).
         let mask_b = mask.reshape(&[b, t, 1, 1], device)?;
         let zeros = rmlx_mlx::zeros(&[b, t, f, c], Dtype::F32, device)?;
-        let mask_bool = rmlx_mlx::greater_equal(&mask_b, &scalar_f32(0.5), device)?;
+        let mask_bool = rmlx_mlx::greater_equal(&mask_b, &scalar_f32(0.5), device)?; // f32-ok: mask_b is f32 (audio tower f32)
         let mask_bcast = rmlx_mlx::broadcast_to(&mask_bool, &[b, t, f, c], device)?;
         let x = where_cond(&mask_bcast, &zeros, x, device)?;
 
@@ -213,8 +213,8 @@ struct ConformerFeedForward {
 impl ConformerFeedForward {
     fn forward(&self, x: &Array, device: Device) -> Result<Array> {
         let residual = x;
-        let lo = scalar_f32(-self.gradient_clipping);
-        let hi = scalar_f32(self.gradient_clipping);
+        let lo = scalar_f32(-self.gradient_clipping); // f32-ok: audio tower f32
+        let hi = scalar_f32(self.gradient_clipping); // f32-ok: audio tower f32
         let h = clip(x, &lo, &hi, device)?;
         let h = self.pre_layer_norm.forward(&h, device)?;
         let h = self.ffw_layer_1.forward(&h, device)?;
@@ -222,7 +222,7 @@ impl ConformerFeedForward {
         let h = self.ffw_layer_2.forward(&h, device)?;
         let h = clip(&h, &lo, &hi, device)?;
         let h = self.post_layer_norm.forward(&h, device)?;
-        let scaled = multiply(&h, &scalar_f32(self.residual_weight), device)?;
+        let scaled = multiply(&h, &scalar_f32(self.residual_weight), device)?; // f32-ok: audio tower f32
         add(residual, &scaled, device)
     }
 }
@@ -437,10 +437,10 @@ impl AudioAttention {
         let scale = softplus(&self.per_dim_scale, device)?;
         let q = multiply(
             &q,
-            &multiply(&scale, &scalar_f32(self.q_scale), device)?,
+            &multiply(&scale, &scalar_f32(self.q_scale), device)?, // f32-ok: audio tower f32
             device,
         )?;
-        let k = multiply(&k, &scalar_f32(self.k_scale), device)?;
+        let k = multiply(&k, &scalar_f32(self.k_scale), device)?; // f32-ok: audio tower f32
 
         let query_blocks = self.convert_to_block(&q, device)?; // [B, U, W, N, H]
         let key_blocks = self.extract_block_context(&k, device)?; // [B, U, C, N, H]
@@ -450,8 +450,8 @@ impl AudioAttention {
         // Block validity: valid = 1 - mask, extracted to [B, U, C].
         let mask_f = mask.astype(Dtype::F32, device)?;
         let valid = add(
-            &scalar_f32(1.0),
-            &multiply(&mask_f, &scalar_f32(-1.0), device)?,
+            &scalar_f32(1.0), // f32-ok: mask_f is cast to F32 above; audio tower f32
+            &multiply(&mask_f, &scalar_f32(-1.0), device)?, // f32-ok: audio tower f32
             device,
         )?;
         let extracted_valid = self.extract_block_context(&valid, device)?; // [B, U, C]
@@ -469,16 +469,16 @@ impl AudioAttention {
 
         // logits = rel_pos; softcap; mask invalid.
         let logits = self.rel_pos_logits(&query_blocks, &key_blocks, device)?;
-        let cap = scalar_f32(self.softcap);
-        let inv_cap = scalar_f32(1.0 / self.softcap);
+        let cap = scalar_f32(self.softcap); // f32-ok: audio tower f32
+        let inv_cap = scalar_f32(1.0 / self.softcap); // f32-ok: audio tower f32
         let logits = multiply(
             &tanh(&multiply(&logits, &inv_cap, device)?, device)?,
             &cap,
             device,
         )?;
-        let cond_bool = rmlx_mlx::greater_equal(&cond, &scalar_f32(0.5), device)?;
+        let cond_bool = rmlx_mlx::greater_equal(&cond, &scalar_f32(0.5), device)?; // f32-ok: cond is f32; audio tower f32
         let invalid = rmlx_mlx::broadcast_to(
-            &scalar_f32(self.invalid_logits_value),
+            &scalar_f32(self.invalid_logits_value), // f32-ok: audio tower f32
             &logits.shape(),
             device,
         )?;
@@ -556,8 +556,8 @@ impl ConformerLightConv1d {
             device,
         )?;
 
-        let lo = scalar_f32(-self.gradient_clipping);
-        let hi = scalar_f32(self.gradient_clipping);
+        let lo = scalar_f32(-self.gradient_clipping); // f32-ok: audio tower f32
+        let hi = scalar_f32(self.gradient_clipping); // f32-ok: audio tower f32
         let h = clip(&h, &lo, &hi, device)?;
         let h = self.conv_norm.forward(&h, device)?;
         let h = rmlx_mlx::silu(&h, device)?;
@@ -594,8 +594,8 @@ impl ConformerBlock {
         causal_valid_mask: &Array,
         device: Device,
     ) -> Result<Array> {
-        let lo = scalar_f32(-self.gradient_clipping);
-        let hi = scalar_f32(self.gradient_clipping);
+        let lo = scalar_f32(-self.gradient_clipping); // f32-ok: audio tower f32
+        let hi = scalar_f32(self.gradient_clipping); // f32-ok: audio tower f32
 
         let x = self.feed_forward1.forward(x, device)?;
 
@@ -615,8 +615,8 @@ impl ConformerBlock {
         let (b, t) = (s[0], s[1]);
         let mask_f = mask.astype(Dtype::F32, device)?;
         let validity = add(
-            &scalar_f32(1.0),
-            &multiply(&mask_f, &scalar_f32(-1.0), device)?,
+            &scalar_f32(1.0), // f32-ok: mask_f is cast to F32 above; audio tower f32
+            &multiply(&mask_f, &scalar_f32(-1.0), device)?, // f32-ok: audio tower f32
             device,
         )?
         .reshape(&[b, t, 1], device)?;
@@ -681,10 +681,10 @@ impl AudioEncoder {
         let upper_diag = max_past + max_future;
         let ctx = chunk + max_past + max_future;
 
-        let ones_cc = rmlx_mlx::broadcast_to(&scalar_f32(1.0), &[ctx, chunk], device)?;
-        // lower_causal = tril(ones(context, chunk)).T -> [chunk, context].
+        let ones_cc = rmlx_mlx::broadcast_to(&scalar_f32(1.0), &[ctx, chunk], device)?; // f32-ok: causal mask is f32; audio tower f32
+                                                                                        // lower_causal = tril(ones(context, chunk)).T -> [chunk, context].
         let lower_causal = tril(&ones_cc, 0, device)?.transpose(&[1, 0], device)?;
-        let ones_cc2 = rmlx_mlx::broadcast_to(&scalar_f32(1.0), &[chunk, ctx], device)?;
+        let ones_cc2 = rmlx_mlx::broadcast_to(&scalar_f32(1.0), &[chunk, ctx], device)?; // f32-ok: audio tower f32
         let upper_causal = tril(&ones_cc2, upper_diag, device)?; // [chunk, context]
                                                                  // mask = lower * upper (float 0/1; downstream uses >=0.5 as valid).
         multiply(&lower_causal, &upper_causal, device)
@@ -726,7 +726,7 @@ impl AudioEncoder {
             mask = mask.slice(&[0, 0], &[b, keep], &[1, 1], device)?;
         }
         let mask_b = mask.reshape(&[b, keep, 1], device)?;
-        let mask_bool = rmlx_mlx::greater_equal(&mask_b, &scalar_f32(0.5), device)?;
+        let mask_bool = rmlx_mlx::greater_equal(&mask_b, &scalar_f32(0.5), device)?; // f32-ok: mask_b derives from mask which is f32; audio tower f32
         let mask_bool = if keep == t {
             rmlx_mlx::broadcast_to(&mask_bool, &[b, t, hidden], device)?
         } else {
@@ -982,7 +982,8 @@ pub fn build_audio_inputs_embeds(
     let ids_i32: Vec<i32> = input_ids.iter().map(|&x| x as i32).collect();
     let ids_arr = Array::from_bytes(i32_bytes(&ids_i32), &[seq as i32], Dtype::I32)?;
     let h_raw = model.embed_tokens.forward(&ids_arr, device)?;
-    let embed_scale = scalar_f32((model.cfg.hidden_size as f32).sqrt());
+    let embed_scale =
+        scalar_f32((model.cfg.hidden_size as f32).sqrt()).astype(h_raw.dtype(), device)?;
     let mut embeds = multiply(&h_raw, &embed_scale, device)?;
     embeds = embeds.reshape(&[1, seq as i32, hidden], device)?;
     let embeds_dtype = embeds.dtype();

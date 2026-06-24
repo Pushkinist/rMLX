@@ -401,7 +401,11 @@ impl DFlashDrafter {
         match &self.rope_freqs {
             Some(freqs) => {
                 let scaled = if (self.rope_mscale - 1.0).abs() > 1e-6 {
-                    multiply(x, &scalar_f32(self.rope_mscale), device)?
+                    multiply(
+                        x,
+                        &scalar_f32(self.rope_mscale).astype(x.dtype(), device)?,
+                        device,
+                    )?
                 } else {
                     x.try_clone()?
                 };
@@ -514,7 +518,7 @@ impl DFlashDrafter {
             )?;
             let mut logits = verifier.logits_from_hidden(&row, device)?;
             if let Some(cap) = self.cfg.final_logit_softcapping {
-                let cap_arr = scalar_f32(cap);
+                let cap_arr = scalar_f32(cap).astype(logits.dtype(), device)?;
                 let scaled = divide(&logits, &cap_arr, device)?;
                 let t = tanh(&scaled, device)?;
                 logits = multiply(&t, &cap_arr, device)?;
