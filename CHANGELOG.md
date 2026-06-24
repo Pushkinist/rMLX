@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-06-24
+
+f32-KV-leak class hardening. The `--kv-quant none` KV cache no longer widens to
+f32 on the Qwen3 path, and the leak is now structurally closed for every
+architecture. Headline: Qwen3-dense (Bonsai-8B-2bit) `none` decode is ~+32…+87 %
+across 4k–64k and now beats the mlx-lm reference at every context, with KV
+residency halved. No breaking changes.
+
+### Fixed
+
+- **Qwen3 dense (`Qwen3ForCausalLM`) `--kv-quant none` KV stored f32, not bf16.**
+  Bonsai ships RMSNorm weights and quant scales/biases as fp16; bf16 activations
+  × fp16 params promoted the residual — and the K/V projection outputs — to f32,
+  so the cache stored f32 (4 B/element). Casting all Qwen3 float params to bf16
+  at load (`bf16_param`) keeps the stream and the cache bf16. On Bonsai-8B-2bit:
+  none-KV halved (≈0.53× the f32 MB), decode +32 / +47 / +68 / +82 / +87 % at
+  4k / 8k / 16k / 32k / 64k, and prefill ~0.55×. (#168)
+- **Qwen3.6 MoE (`Qwen3_5MoeForConditionalGeneration`) hardened to bf16-param
+  parity**, including the GatedDeltaNet norm + conv1d weights; audited clean for
+  the same f32-KV leak. (#171)
+
+### Added
+
+- **Model-agnostic bf16 floor at the KV-cache store boundary.** The
+  `--kv-quant none` cache casts K/V to bf16 at the single store choke point, so
+  no architecture can store f32 there regardless of upstream dtype — a durable
+  backstop for the per-arch fixes. Bytes-per-element invariant test wired into
+  `make model-check`. (#169)
+- **CI gate `make check-no-scalar-f32-leak`** flags unguarded `scalar_f32(` in
+  arch-layer code (the f32-leak idiom). Surfaced and fixed 13 latent leaks across
+  gemma3, gemma4 vision/audio, jina, bitnet, and dflash. (#170)
+
+### Dependencies
+
+- safetensors 0.7→0.8, rusqlite 0.32→0.40, miniz_oxide 0.8→0.9, plus the
+  cargo-minor-patch group; CI `actions/checkout` 6→7 and `Swatinem/rust-cache`.
+  (#162–167)
+
+### Security
+
+- memmap2 0.9.10 → 0.9.11, clearing **RUSTSEC-2026-0186** (unsound out-of-bounds
+  `offset`/`len` in `advise_range` / `flush_range`). rMLX maps safetensors
+  read-only and does not call the affected functions, so it was not reachable —
+  bumped to keep the advisory gate clean.
+
+### Docs
+
+- Bonsai-8B (2-bit) full rMLX KV-quant matrix + sibling-backend champions. (#177)
+
 ## [0.2.5] - 2026-06-20
 
 Prefill / time-to-first-token fix for the MoE families, plus a baseline
@@ -484,7 +533,8 @@ inference + conversion backend for Apple Silicon — no Python at runtime.
 - Speculative drafters validated against their verifiers: Qwen 3.6 MTP sidecar
   and the Gemma 4 assistant drafter.
 
-[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.2.5...HEAD
+[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.2.6...HEAD
+[0.2.6]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.6
 [0.2.5]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.5
 [0.2.4]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.4
 [0.2.3]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.3
