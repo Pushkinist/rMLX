@@ -14,6 +14,7 @@
 //! `cargo test -p rmlx-models --lib qwen3_5_moe::moe -- --ignored`.
 
 use super::{Linear, SwitchMlp};
+use crate::load_util::bf16_param;
 use rmlx_mlx::{quantize, rms_norm, scalar_f32, softmax, Array, Device, Dtype};
 
 const DEV: Device = Device::Gpu;
@@ -246,6 +247,45 @@ fn moe_stream_stays_bf16_with_bf16_params() {
         gates_bf16.dtype(),
         Dtype::Bf16,
         "bf16 gate logits keep routing_weights bf16 — no f32 leak into the MoE residual / KV"
+    );
+}
+
+/// Loader-level dtype gate: `bf16_param` casts fp16 → bf16 and is a no-op on
+/// already-bf16 tensors.
+///
+/// This is the RED-if-removed regression gate for the `load_rms` / `lin` /
+/// `embed_tokens` casts added to the MoE loader. If any of those call sites
+/// are removed, the dtype-lock cast is gone, and a future fp16-shipping
+/// Qwen3.6 snapshot would silently leak f32 into the activation stream and
+/// the `--kv-quant none` KV cache. Runs on CPU; no Metal device, no model needed.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test asserts on dtype; an op error is the test failing"
+)]
+fn bf16_param_casts_fp16_to_bf16() {
+    let dev = Device::Cpu;
+
+    // fp16 input must be cast to bf16.
+    let fp16 = f32_arr(&[1.0, 2.0, 3.0, 4.0], &[4])
+        .astype(Dtype::F16, dev)
+        .unwrap();
+    assert_eq!(fp16.dtype(), Dtype::F16);
+    let out = bf16_param(fp16).unwrap();
+    out.eval().unwrap();
+    assert_eq!(out.dtype(), Dtype::Bf16, "bf16_param must cast fp16 → bf16");
+
+    // bf16 input must be returned unchanged (no copy, same dtype).
+    let bf16 = f32_arr(&[1.0, 2.0, 3.0, 4.0], &[4])
+        .astype(Dtype::Bf16, dev)
+        .unwrap();
+    assert_eq!(bf16.dtype(), Dtype::Bf16);
+    let out2 = bf16_param(bf16).unwrap();
+    out2.eval().unwrap();
+    assert_eq!(
+        out2.dtype(),
+        Dtype::Bf16,
+        "bf16_param must be a no-op for already-bf16 tensors"
     );
 }
 

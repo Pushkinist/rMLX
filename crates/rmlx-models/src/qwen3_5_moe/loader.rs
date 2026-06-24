@@ -26,7 +26,7 @@ use rmlx_quant::awq::{f16_bits_to_f32, f32_to_f16_bits};
 use tracing::info;
 
 use crate::layers::{resolve_quant, QuantParams};
-use crate::load_util::{load_paro_parts, quantize_embedding_int4, Weights};
+use crate::load_util::{bf16_param, load_paro_parts, quantize_embedding_int4, Weights};
 
 use super::attention::FullAttention;
 use super::config::Qwen3_5MoeConfig;
@@ -90,8 +90,8 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
                 mode,
             } => Ok(Linear::Quantized {
                 weight,
-                scales,
-                biases,
+                scales: bf16_param(scales)?,
+                biases: biases.map(bf16_param).transpose()?,
                 group_size,
                 bits,
                 mode: mode.as_str().to_owned(),
@@ -104,7 +104,7 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
 
     let load_rms = |name: &str| -> Result<RmsNorm> {
         Ok(RmsNorm {
-            weight: w.array(&format!("{name}.weight"))?,
+            weight: bf16_param(w.array(&format!("{name}.weight"))?)?,
             eps: cfg.rms_norm_eps,
         })
     };
@@ -129,8 +129,8 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
                 mode,
             } => Embedding::Quantized {
                 weight,
-                scales,
-                biases,
+                scales: bf16_param(scales)?,
+                biases: biases.map(bf16_param).transpose()?,
                 group_size,
                 bits,
                 mode: mode.as_str().to_owned(),

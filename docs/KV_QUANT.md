@@ -230,13 +230,15 @@ flips f32→bf16 (4→2 B/elem), halving KV residency. Decode TPS gains widen wi
 context as KV bandwidth dominates: ~+34 % at 4 k, ~+73 % at 16 k, ~+100 % at
 64 k — recovering the prior loss vs the mlx-lm champion on this model.
 
-### Qwen3.6 MoE `--kv-quant none` KV is bf16 — audited clean
+### Qwen3.6 MoE `--kv-quant none` KV is bf16 — audited clean AND hardened
 
 The Qwen3.5-MoE arch (`Qwen3_5MoeForConditionalGeneration`) was audited for the
-same f32-KV leak class. **Verdict: clean — no fix needed.** The primary snapshot
-`mlx-community/Qwen3.6-35B-A3B-8bit` ships every float param (norm weights, quant
-scales/biases) at bf16, so the compute stream is bf16 end-to-end: `rms_norm` and
-`quantized_matmul` stay bf16 (no fp16→f32 promotion), the MoE router
+same f32-KV leak class. **Verdict: clean AND structurally hardened.** The
+`qwen3_5_moe` loader now casts every float param (norm weights, quant
+scales/biases) to bf16 at load via `load_util::bf16_param` — identical to the
+dense Qwen3 loader — so **any future Qwen3.6 snapshot, including an fp16 repack,
+stays bf16-clean in compute**. The compute stream is bf16 end-to-end: `rms_norm`
+and `quantized_matmul` stay bf16 (no fp16→f32 promotion), the MoE router
 `softmax(bf16 logits)` keeps `routing_weights` bf16 (no Gemma4-MoE-class router
 leak — the router gate is a plain quantized `Linear`, not a strong-f32-scaled
 RMSNorm), and this arch's attention has no YARN mscale on the q/k path.
@@ -245,10 +247,10 @@ Decisive measurement: at `--kv-quant none`, every K/V tensor arrives at the
 cache-store boundary as **bf16 (480/480 prefill+decode store calls, zero f32)** —
 so the compute is genuinely clean, not merely capped by the model-agnostic
 `cast_store_bf16` floor (which would mask a compute leak in resident bytes while
-the f32 bandwidth cost persisted). A CPU dtype-lock test
-(`moe_stream_stays_bf16_with_bf16_params`) pins the q/k-norm + router promotion
-semantics. A future fp16-shipping Qwen3.5-MoE snapshot would need the dense
-`bf16_param` load discipline (`qwen3.rs`).
+the f32 bandwidth cost persisted). Two CPU dtype-lock tests pin this:
+`moe_stream_stays_bf16_with_bf16_params` (q/k-norm + router promotion semantics)
+and `bf16_param_casts_fp16_to_bf16` (direct gate on the loader cast helper —
+RED if any `bf16_param` call is removed from the MoE loader).
 
 **Byte accounting.** Two methods report KV-cache size:
 

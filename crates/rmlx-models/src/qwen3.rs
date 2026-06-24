@@ -72,7 +72,7 @@ use crate::kv_cache::{
     kv_max_seq_and_ceiling, kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
 };
 use crate::layers::{resolve_quant, QuantParams};
-use crate::load_util::Weights;
+use crate::load_util::{bf16_param, Weights};
 use crate::prompt_cache::{
     chained_block_hashes_seeded, ArchPromptCache, Consumed, PromptCacheEntry, ReusePolicy,
     SsdHydrate, FNV_OFFSET,
@@ -2210,23 +2210,6 @@ pub fn generate_greedy<'a>(
 // ---------------------------------------------------------------------------
 // Loader
 // ---------------------------------------------------------------------------
-
-/// Cast a float model parameter to BF16 (the activation dtype) at load time.
-///
-/// rMLX runs the residual stream in BF16 (the embedding dequant is forced to
-/// BF16). Some snapshots ship norm weights and quant scales/biases at FP16; when
-/// an op mixes a BF16 activation with an FP16 parameter, MLX promotes the result
-/// to F32, which then carries F32 through the whole stream and into the
-/// `--kv-quant none` KV cache. Casting every float parameter to BF16 at load —
-/// mlx-lm's "uniform model dtype" discipline — keeps the stream at BF16.
-/// Already-BF16 parameters are a no-op.
-fn bf16_param(a: Array) -> Result<Array> {
-    if a.dtype() == Dtype::Bf16 {
-        Ok(a)
-    } else {
-        a.astype(Dtype::Bf16, Device::Cpu)
-    }
-}
 
 /// Load a Qwen3 model from a snapshot directory.
 ///
