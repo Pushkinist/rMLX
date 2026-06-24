@@ -544,7 +544,7 @@ impl VisionModel {
         let h2 = h.reshape(&[seq as i32, hidden], device)?;
         let pooled = matmul(&w_arr, &h2, device)?;
         let root = (self.cfg.hidden_size as f32).sqrt();
-        let root_arr = rmlx_mlx::scalar_f32(root);
+        let root_arr = rmlx_mlx::scalar_f32(root); // f32-ok: SigLIP vision tower runs entirely in f32 (pooled is f32)
         let pooled = multiply(&pooled, &root_arr, device)?;
         pooled.reshape(&[1, num_soft as i32, hidden], device)
     }
@@ -849,7 +849,8 @@ pub fn build_inputs_embeds(
     let ids_i32: Vec<i32> = input_ids.iter().map(|&x| x as i32).collect();
     let ids_arr = Array::from_bytes(i32_bytes(&ids_i32), &[seq as i32], Dtype::I32)?;
     let h_raw = model.embed_tokens.forward(&ids_arr, device)?;
-    let embed_scale = rmlx_mlx::scalar_f32((model.cfg.hidden_size as f32).sqrt());
+    let embed_scale = rmlx_mlx::scalar_f32((model.cfg.hidden_size as f32).sqrt())
+        .astype(h_raw.dtype(), device)?;
     let mut embeds = multiply(&h_raw, &embed_scale, device)?;
     embeds = embeds.reshape(&[1, seq as i32, hidden], device)?;
     let embeds_dtype = embeds.dtype();

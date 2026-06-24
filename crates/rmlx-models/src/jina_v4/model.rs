@@ -94,7 +94,11 @@ impl LoraDelta {
     fn apply(&self, base: &Array, x: &Array, device: Device) -> Result<Array> {
         let xa = rmlx_mlx::matmul(x, &self.a.transpose(&[1, 0], device)?, device)?;
         let xab = rmlx_mlx::matmul(&xa, &self.b.transpose(&[1, 0], device)?, device)?;
-        let scaled = multiply(&xab, &scalar_f32(self.scaling), device)?;
+        let scaled = multiply(
+            &xab,
+            &scalar_f32(self.scaling).astype(xab.dtype(), device)?,
+            device,
+        )?;
         add(base, &scaled, device)
     }
 }
