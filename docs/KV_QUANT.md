@@ -394,6 +394,34 @@ records only `max_seq`; the actual arrays are owned by `KvCache` directly.
 current token offset into the pre-allocated buffer. SDPA uses
 `scaled_dot_product_attention` on the raw bf16 arrays.
 
+**Cache-boundary bf16 floor (model-agnostic f32-KV guard).** The store boundary
+casts incoming K/V to bf16 **independent of the inbound dtype**, so the resident
+buffer is bf16 regardless of what the model's attention stream produced. Both
+store sites that funnel into `decode_fp16_k/v` apply the floor:
+
+- `update_prefill_raw` (the warm-TTFT seed buffer that `exit_prefill` slices
+  into the decode mirror), and
+- `update_decode_fp16` (the per-step decode append; the cast also sizes the
+  resident `zeros(...)` allocation in bf16).
+
+The cast is **idempotent** — a cheap `dtype == Bf16` check returns the input
+untouched (no `astype` launch) in the steady state that the per-arch source
+fixes already produce, so it is pure insurance with negligible hot-path cost.
+This is **defense-in-depth, not a substitute for the per-arch fix**: it caps the
+*memory* damage of an upstream f32 leak (it cannot store f32) but does not fix
+the *compute* slowdown — any upstream f32 arithmetic (RoPE / SDPA) stays f32.
+The per-arch source fixes (Gemma4 §"Gemma4 global `--kv-quant none` KV is bf16",
+Qwen3 §"Qwen3 dense `--kv-quant none` KV is bf16") remain the real fix; this
+floor is the structural guard that makes the leak class impossible to re-create
+silently.
+
+The detector is a bytes-per-element invariant in
+`crates/rmlx-kv-quant/src/kvcache/resident_bytes_tests.rs`: an f32 K/V fed
+through the prefill-seed and decode-store paths must land as bf16 (2 B/elem). It
+is wired into `make model-check` (which now runs `-p rmlx-kv-quant`), so a future
+arch that leaks f32 into the unquantised KV store trips CI at integration instead
+of being found months later in a bench.
+
 **Memory cost**: `2 · B · kv_h · max_seq · head_dim · 2 bytes` per layer.
 At 128K context on a 35B-A3B model this is tens of gigabytes. Reserve for
 short-context parity benches only.

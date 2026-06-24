@@ -14,6 +14,11 @@
 //! 3. Two independently populated layers sum correctly.
 //! 4. `KvStorage::None` contributes 0; only `KvCache::decode_fp16_k/v` are
 //!    counted.
+//!
+//! Also pins the **bf16 store-boundary floor** (the model-agnostic f32-KV
+//! guard): an f32 K/V fed through the prefill-seed and decode-store paths must
+//! land in the cache as bf16 (2 B/elem), so a future upstream f32 leak fails
+//! fast on the bytes-per-element invariant instead of silently doubling KV.
 
 use super::core::KvCache;
 use crate::KvQuant;
@@ -31,6 +36,20 @@ fn bf16_zeros(b: i32, kv_h: i32, seq: i32, d: i32) -> Array {
     // bf16 = 2 bytes per element; zero-fill.
     let bytes = vec![0u8; n * 2];
     Array::from_bytes(&bytes, &[b, kv_h, seq, d], Dtype::Bf16).unwrap()
+}
+
+/// Build a `[B, kv_h, seq, D]` **f32** Array with small non-zero values on CPU.
+///
+/// Models the f32-KV leak: an upstream f32 scalar promoted the attention stream
+/// to f32, so the cache receives f32 (4 B/elem) K/V at the store boundary.
+#[allow(
+    clippy::unwrap_used,
+    reason = "test helper — panic on failure is the desired outcome"
+)]
+fn f32_ramp(b: i32, kv_h: i32, seq: i32, d: i32) -> Array {
+    let n = (b * kv_h * seq * d) as usize;
+    let data: Vec<f32> = (0..n).map(|i| (i % 13) as f32 * 0.01).collect();
+    Array::from_f32_slice(&data, &[b, kv_h, seq, d]).unwrap()
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
@@ -221,4 +240,138 @@ fn layer_sum_is_additive() {
         per_layer * 2,
         "sum across two identical layers must equal 2 × per-layer"
     );
+}
+
+// ── bf16 store-boundary floor (model-agnostic f32-KV guard) ──────────────────
+//
+// These pin the cache-level bf16 floor: the unquantised (`KvQuant::None`) /
+// warm-TTFT store boundary casts incoming K/V to bf16 regardless of the
+// inbound dtype, so a future upstream f32 leak can never silently double
+// resident KV. The detector is the stored-buffer dtype (2 B/elem) — if the
+// cast is removed, an f32 input stores at 4 B/elem and these go RED.
+
+/// f32 K/V fed through the **prefill seed** path (`update_prefill_raw` →
+/// `exit_prefill`) is stored as bf16 — the seed dtype is floored independent of
+/// the inbound f32 stream.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test — panics are the intended failure mode"
+)]
+fn f32_prefill_seed_is_stored_bf16() {
+    const B: i32 = 1;
+    const KV_H: i32 = 2;
+    const SEQ: i32 = 16;
+    const D: i32 = 64;
+    let device = Device::Cpu;
+
+    let mut cache = KvCache::with_quant_max_seq(KvQuant::None, 256);
+    let k = f32_ramp(B, KV_H, SEQ, D);
+    let v = f32_ramp(B, KV_H, SEQ, D);
+    assert_eq!(k.dtype(), Dtype::F32, "input K is f32 (the leak case)");
+
+    cache.enter_prefill();
+    cache.update(&k, &v, device).unwrap();
+    cache.exit_prefill(device).unwrap();
+
+    let (sk, sv) = cache
+        .decode_fp16_kv()
+        .expect("None-path prefill seed must populate decode_fp16_k/v");
+    assert_eq!(
+        sk.dtype(),
+        Dtype::Bf16,
+        "f32 K must be floored to bf16 at the prefill store boundary"
+    );
+    assert_eq!(
+        sv.dtype(),
+        Dtype::Bf16,
+        "f32 V must be floored to bf16 at the prefill store boundary"
+    );
+
+    // Bytes-per-element invariant: 2 buffers × B × kv_h × SEQ × D × 2 (bf16).
+    let elems_per_buf = (B * KV_H * SEQ * D) as u64;
+    let expected = 2 * elems_per_buf * 2;
+    assert_eq!(
+        cache.resident_bytes(),
+        expected,
+        "resident KV must be 2 B/elem (bf16), not 4 B/elem (f32 leak)"
+    );
+    // Explicit bytes/elem == 2 derivation, independent of the formula above.
+    let bytes_per_elem = cache.resident_bytes() / (2 * elems_per_buf);
+    assert_eq!(bytes_per_elem, 2, "stored KV must be 2 bytes per element");
+}
+
+/// f32 K/V fed through the **decode store** path (`update_decode_fp16`, the
+/// post-`exit_prefill` per-step append) is stored as bf16 — the decode mirror
+/// stays floored, not just the prefill seed.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test — panics are the intended failure mode"
+)]
+fn f32_decode_store_is_stored_bf16() {
+    const B: i32 = 1;
+    const KV_H: i32 = 2;
+    const SEQ: i32 = 8;
+    const D: i32 = 64;
+    let device = Device::Cpu;
+
+    let mut cache = KvCache::with_quant_max_seq(KvQuant::None, 256);
+    // Prefill with bf16 so the decode-store path (not the prefill path) is the
+    // one under test on the following f32 step.
+    let pk = bf16_zeros(B, KV_H, SEQ, D);
+    let pv = bf16_zeros(B, KV_H, SEQ, D);
+    cache.enter_prefill();
+    cache.update(&pk, &pv, device).unwrap();
+    cache.exit_prefill(device).unwrap();
+
+    // One decode step with an f32 K/V (the per-token leak case).
+    let dk = f32_ramp(B, KV_H, 1, D);
+    let dv = f32_ramp(B, KV_H, 1, D);
+    assert_eq!(
+        dk.dtype(),
+        Dtype::F32,
+        "decode-step K is f32 (the leak case)"
+    );
+    cache.update(&dk, &dv, device).unwrap();
+
+    let (sk, sv) = cache
+        .decode_fp16_kv()
+        .expect("decode mirror must be populated after a decode step");
+    assert_eq!(
+        sk.dtype(),
+        Dtype::Bf16,
+        "f32 K must be floored to bf16 at the decode store boundary"
+    );
+    assert_eq!(
+        sv.dtype(),
+        Dtype::Bf16,
+        "f32 V must be floored to bf16 at the decode store boundary"
+    );
+}
+
+/// Control: a bf16 input stays bf16 (the floor is idempotent — the steady state
+/// after the per-arch source fixes is a pure no-op).
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test — panics are the intended failure mode"
+)]
+fn bf16_input_stays_bf16_no_op() {
+    const B: i32 = 1;
+    const KV_H: i32 = 2;
+    const SEQ: i32 = 16;
+    const D: i32 = 64;
+    let device = Device::Cpu;
+
+    let mut cache = KvCache::with_quant_max_seq(KvQuant::None, 256);
+    let k = bf16_zeros(B, KV_H, SEQ, D);
+    let v = bf16_zeros(B, KV_H, SEQ, D);
+    cache.enter_prefill();
+    cache.update(&k, &v, device).unwrap();
+    cache.exit_prefill(device).unwrap();
+
+    let (sk, sv) = cache.decode_fp16_kv().expect("seed must be populated");
+    assert_eq!(sk.dtype(), Dtype::Bf16, "bf16 K stays bf16");
+    assert_eq!(sv.dtype(), Dtype::Bf16, "bf16 V stays bf16");
 }
