@@ -44,7 +44,7 @@ fn l2_normalize_last(x: &Array, device: Device) -> Result<Array> {
     let s = sum_axis(&sq, last, device)?;
     let s = expand_dims(&s, last, device)?;
     // ‖x‖₂ = sqrt(sum(x²) + 1e-12); 1e-12 matches F.normalize's eps clamp.
-    let s = add(&s, &scalar_f32(1e-12), device)?;
+    let s = add(&s, &scalar_f32(1e-12), device)?; // f32-ok: pooling output is converted to Vec<f32>; f32 precision is intentional here
     let norm = sqrt(&s, device)?;
     divide(x, &norm, device)
 }
@@ -98,7 +98,7 @@ pub(super) fn single_vector(
     let shape = hidden.shape(); // [1, seq, hidden]
     let seq = shape[1];
     let summed = sum_axis(hidden, 1, device)?; // -> [1, hidden]
-    let pooled = divide(&summed, &scalar_f32(seq as f32), device)?;
+    let pooled = divide(&summed, &scalar_f32(seq as f32), device)?; // f32-ok: output is Vec<f32> via to_f32_vec; f32 precision intentional
     let normed = l2_normalize_last(&pooled, device)?; // [1, hidden]
 
     match truncate_dim {
@@ -159,7 +159,7 @@ pub(super) fn single_vector_image_span(
         device,
     )?;
     let summed = sum_axis(&slice, 1, device)?; // -> [1, hidden]
-    let pooled = divide(&summed, &scalar_f32(span as f32), device)?;
+    let pooled = divide(&summed, &scalar_f32(span as f32), device)?; // f32-ok: output is Vec<f32> via to_f32_vec; f32 precision intentional
     let normed = l2_normalize_last(&pooled, device)?; // [1, hidden]
 
     match truncate_dim {
