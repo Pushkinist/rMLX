@@ -55,7 +55,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         bench-codec-cell \
         smoke-codec-matrix \
         e2e \
-        file-size-report check-no-inline-tests
+        file-size-report check-no-inline-tests check-no-scalar-f32-leak
 
 help:
 	@awk 'BEGIN{FS=":.*##"} /^[a-zA-Z_-]+:.*##/ {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -162,9 +162,13 @@ file-size-report: ## advisory: print source files >1000 LOC (non-failing)
 check-no-inline-tests: ## CI gate: fail if any non-test.rs file has inline #[cfg(test)] mod tests { ... }
 	@bash scripts/check_no_inline_tests.sh
 
+check-no-scalar-f32-leak: ## CI gate: fail if arch-layer code has unguarded scalar_f32( not followed by .astype(
+	@bash scripts/check_no_scalar_f32_leak.sh
+
 # ---- one-shot CI gate -------------------------------------------------
 ci: fmt-check lint test deny audit ci-metrics ## full pre-merge gate: fmt + clippy + test + deny + audit + metrics-sanity + inline-test gate
 	@bash scripts/check_no_inline_tests.sh
+	@bash scripts/check_no_scalar_f32_leak.sh
 	@bash scripts/file_size_report.sh || true
 	@echo "ci ok"
 
