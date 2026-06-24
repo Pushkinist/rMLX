@@ -250,14 +250,15 @@ fn moe_stream_stays_bf16_with_bf16_params() {
     );
 }
 
-/// Loader-level dtype gate: `bf16_param` casts fp16 → bf16 and is a no-op on
-/// already-bf16 tensors.
+/// Direct gate on the `bf16_param` helper contract: fp16 → bf16 cast and
+/// already-bf16 no-op.
 ///
-/// This is the RED-if-removed regression gate for the `load_rms` / `lin` /
-/// `embed_tokens` casts added to the MoE loader. If any of those call sites
-/// are removed, the dtype-lock cast is gone, and a future fp16-shipping
-/// Qwen3.6 snapshot would silently leak f32 into the activation stream and
-/// the `--kv-quant none` KV cache. Runs on CPU; no Metal device, no model needed.
+/// This test gates the HELPER itself, not the loader call sites. It goes RED
+/// if `bf16_param` stops casting fp16 to bf16 or regresses the no-op fast
+/// path. The loader call sites (norm weights, quant scales/biases, GDN
+/// conv1d and norm weights) are exercised by the real-model load proof —
+/// this is a helper-contract gate, not a call-site regression gate. Runs on
+/// CPU; no Metal device, no model needed.
 #[test]
 #[allow(
     clippy::unwrap_used,

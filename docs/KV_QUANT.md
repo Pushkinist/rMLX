@@ -234,23 +234,26 @@ context as KV bandwidth dominates: ~+34 % at 4 k, ~+73 % at 16 k, ~+100 % at
 
 The Qwen3.5-MoE arch (`Qwen3_5MoeForConditionalGeneration`) was audited for the
 same f32-KV leak class. **Verdict: clean AND structurally hardened.** The
-`qwen3_5_moe` loader now casts every float param (norm weights, quant
-scales/biases) to bf16 at load via `load_util::bf16_param` — identical to the
-dense Qwen3 loader — so **any future Qwen3.6 snapshot, including an fp16 repack,
-stays bf16-clean in compute**. The compute stream is bf16 end-to-end: `rms_norm`
-and `quantized_matmul` stay bf16 (no fp16→f32 promotion), the MoE router
-`softmax(bf16 logits)` keeps `routing_weights` bf16 (no Gemma4-MoE-class router
-leak — the router gate is a plain quantized `Linear`, not a strong-f32-scaled
-RMSNorm), and this arch's attention has no YARN mscale on the q/k path.
+`qwen3_5_moe` loader casts every float param to bf16 at load via
+`load_util::bf16_param`, covering FullAttention (q/k-norm weights, quant
+scales/biases, embedding scales/biases) and GDN recurrent layers (`conv1d_weight`
+and `norm_weight`). This is identical to the dense Qwen3 loader — so **any future
+Qwen3.6 snapshot, including an fp16 repack, stays bf16-clean in compute**. The
+compute stream is bf16 end-to-end: `rms_norm` and `quantized_matmul` stay bf16
+(no fp16→f32 promotion), the MoE router `softmax(bf16 logits)` keeps
+`routing_weights` bf16 (no Gemma4-MoE-class router leak — the router gate is a
+plain quantized `Linear`, not a strong-f32-scaled RMSNorm), GDN
+`conv1d(bf16 qkv, bf16 conv1d_weight)` stays bf16 through `v4`/`y_bf16`, and
+`rms_norm(&y_bf16, bf16 norm_weight)` stays bf16 at the GDN RMSNormGated site.
+This arch's attention has no YARN mscale on the q/k path.
 
 Decisive measurement: at `--kv-quant none`, every K/V tensor arrives at the
-cache-store boundary as **bf16 (480/480 prefill+decode store calls, zero f32)** —
-so the compute is genuinely clean, not merely capped by the model-agnostic
-`cast_store_bf16` floor (which would mask a compute leak in resident bytes while
-the f32 bandwidth cost persisted). Two CPU dtype-lock tests pin this:
+cache-store boundary as **bf16 (400+/400+ prefill+decode store calls, zero f32)**
+— so the compute is genuinely clean, not merely capped by the model-agnostic
+`cast_store_bf16` floor. Two CPU dtype-lock tests pin this:
 `moe_stream_stays_bf16_with_bf16_params` (q/k-norm + router promotion semantics)
-and `bf16_param_casts_fp16_to_bf16` (direct gate on the loader cast helper —
-RED if any `bf16_param` call is removed from the MoE loader).
+and `bf16_param_casts_fp16_to_bf16` (helper-contract gate — RED if `bf16_param`
+stops casting fp16→bf16; loader call sites verified by real-model load proof).
 
 **Byte accounting.** Two methods report KV-cache size:
 

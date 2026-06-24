@@ -196,8 +196,15 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
                 in_proj_z: lin(&format!("{la}.in_proj_z"))?,
                 in_proj_b: lin(&format!("{la}.in_proj_b"))?,
                 in_proj_a: lin(&format!("{la}.in_proj_a"))?,
-                conv1d_weight: w.array(&format!("{la}.conv1d.weight"))?,
-                norm_weight: w.array(&format!("{la}.norm.weight"))?,
+                // Both conv1d_weight and norm_weight are plain float tensors that
+                // participate in bf16 compute. An fp16 conv1d_weight promotes the
+                // depthwise conv1d output (and thus v4, q4, k4) to f32 via MLX
+                // dtype promotion; an fp16 norm_weight promotes rms_norm(&y_bf16,
+                // norm_weight) to f32 at the final RMSNormGated site. Cast both
+                // to bf16 at load so any future fp16-shipping snapshot stays
+                // bf16-clean through the full GDN forward path.
+                conv1d_weight: bf16_param(w.array(&format!("{la}.conv1d.weight"))?)?,
+                norm_weight: bf16_param(w.array(&format!("{la}.norm.weight"))?)?,
                 exp_a_log_f32,
                 dt_bias_3d,
                 inv_scale_sq_arr,
