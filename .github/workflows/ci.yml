@@ -19,7 +19,7 @@ jobs:
     name: rustfmt
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: rustfmt
@@ -29,7 +29,7 @@ jobs:
     name: build + clippy
     runs-on: macos-14 # Apple Silicon
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy
@@ -37,7 +37,7 @@ jobs:
         run: brew install mlx-c
       - name: Resolve MLX_C_PREFIX
         run: echo "MLX_C_PREFIX=$(brew --prefix mlx-c)" >> "$GITHUB_ENV"
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: build

@@ -102,7 +102,7 @@ impl LayerNorm {
     fn forward(&self, x: &Array, device: Device) -> Result<Array> {
         let mut keep = x.shape();
         let d = *keep.last().expect("layer_norm: empty shape");
-        let inv_d = rmlx_mlx::scalar_f32(1.0 / d as f32);
+        let inv_d = rmlx_mlx::scalar_f32(1.0 / d as f32); // f32-ok: Qwen3-VL-MoE vision tower runs entirely in f32
         *keep.last_mut().unwrap() = 1;
 
         let mean = multiply(
@@ -116,7 +116,7 @@ impl LayerNorm {
             &inv_d,
             device,
         )?;
-        let denom = sqrt(&add(&var, &rmlx_mlx::scalar_f32(self.eps), device)?, device)?;
+        let denom = sqrt(&add(&var, &rmlx_mlx::scalar_f32(self.eps), device)?, device)?; // f32-ok: Qwen3-VL-MoE vision tower f32
         let normed = divide(&xc, &denom, device)?;
         let scaled = multiply(&normed, &self.weight, device)?;
         add(&scaled, &self.bias, device)

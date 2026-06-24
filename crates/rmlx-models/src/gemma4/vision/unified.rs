@@ -200,13 +200,13 @@ impl LayerNorm {
         let dim = *shape.last().unwrap_or(&1) as f32;
         // mean over last axis (keepdims for broadcast).
         let sum = sum_axis_keepdims(&x, axis, device)?;
-        let mean = multiply(&sum, &scalar_f32(1.0 / dim), device)?;
+        let mean = multiply(&sum, &scalar_f32(1.0 / dim), device)?; // f32-ok: x is cast to f32 on entry (line above)
         let centered = subtract(&x, &mean, device)?;
         // var = mean(centered^2)
         let sq = multiply(&centered, &centered, device)?;
         let sq_sum = sum_axis_keepdims(&sq, axis, device)?;
-        let var = multiply(&sq_sum, &scalar_f32(1.0 / dim), device)?;
-        let denom = rmlx_mlx::sqrt(&add(&var, &scalar_f32(self.eps), device)?, device)?;
+        let var = multiply(&sq_sum, &scalar_f32(1.0 / dim), device)?; // f32-ok: x is cast to f32 on entry
+        let denom = rmlx_mlx::sqrt(&add(&var, &scalar_f32(self.eps), device)?, device)?; // f32-ok: x is cast to f32 on entry
         let normed = rmlx_mlx::divide(&centered, &denom, device)?;
         let scaled = multiply(&normed, &self.weight, device)?;
         add(&scaled, &self.bias, device)
@@ -606,7 +606,8 @@ pub fn build_unified_inputs_embeds(
     let ids_i32: Vec<i32> = input_ids.iter().map(|&x| x as i32).collect();
     let ids_arr = Array::from_bytes(i32_bytes(&ids_i32), &[seq as i32], Dtype::I32)?;
     let h_raw = model.embed_tokens.forward(&ids_arr, device)?;
-    let embed_scale = scalar_f32((model.cfg.hidden_size as f32).sqrt());
+    let embed_scale =
+        scalar_f32((model.cfg.hidden_size as f32).sqrt()).astype(h_raw.dtype(), device)?;
     let mut embeds = multiply(&h_raw, &embed_scale, device)?;
     embeds = embeds.reshape(&[1, seq as i32, hidden], device)?;
     let embeds_dtype = embeds.dtype();

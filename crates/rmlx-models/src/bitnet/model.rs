@@ -76,9 +76,9 @@ impl BitNetMlp {
         let up = self.up_proj.forward(x, device)?;
 
         let gate_act = {
-            // relu2: max(x,0)^2
+            // relu2: max(x,0)^2 — zero adopts gate dtype to avoid f32 promotion.
             use rmlx_mlx::{maximum, scalar_f32};
-            let zero = scalar_f32(0.0);
+            let zero = scalar_f32(0.0).astype(gate.dtype(), device)?;
             let pos = maximum(&gate, &zero, device)?;
             multiply(&pos, &pos, device)?
         };

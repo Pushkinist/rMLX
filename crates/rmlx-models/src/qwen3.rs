@@ -72,7 +72,7 @@ use crate::kv_cache::{
     kv_max_seq_and_ceiling, kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
 };
 use crate::layers::{resolve_quant, QuantParams};
-use crate::load_util::Weights;
+use crate::load_util::{bf16_param, Weights};
 use crate::prompt_cache::{
     chained_block_hashes_seeded, ArchPromptCache, Consumed, PromptCacheEntry, ReusePolicy,
     SsdHydrate, FNV_OFFSET,
@@ -858,6 +858,12 @@ struct Attention {
     /// precomputed at load time when mscale != 1.0. Avoids 2 × `scalar_f32`
     /// allocs per layer per decode step (72 allocs/step on Bonsai-36-layer).
     /// `None` when YARN is not active or mscale is exactly 1.0 (no scaling).
+    ///
+    /// Stored at bf16 (cast at load because the activation stream is fixed bf16).
+    /// A strong-f32 scalar here would be defense-in-depth against future dtype
+    /// changes, not the observed f32-KV leak; the actual cause was fp16 norm
+    /// weights and fp16 quant scales/biases promoting the projection output to f32
+    /// before this site. Precomputing as bf16 avoids a per-layer per-step cast.
     yarn_mscale_arr: Option<Array>,
 }
 
@@ -968,8 +974,14 @@ impl Attention {
                 // YARN path: hoist both transposes before mscale scaling.
                 let q = q.transpose(&[0, 2, 1, 3], device)?; // [B, H, S, D]
                 let k = k.transpose(&[0, 2, 1, 3], device)?;
-                // Reuse the precomputed scalar Array
+                // Reuse the precomputed scalar Array (already bf16 at load)
                 // rather than allocating a fresh one per layer per step.
+                // The scalar was cast to bf16 at load because the activation
+                // stream is fixed bf16; a residual strong-f32 mscale here
+                // would be defense-in-depth against future dtype changes, not
+                // the observed leak (q/k arrive already promoted to f32 by
+                // fp16 model params before this site, when uncast). No runtime
+                // astype needed.
                 let q_scaled = if let Some(m) = &self.yarn_mscale_arr {
                     multiply(&q, m, device)?
                 } else {
@@ -2248,8 +2260,15 @@ pub fn load_from_path(model_dir: &Path, yarn_override: Option<&YarnOverride>) ->
                 mode,
             } => Ok(Linear::Quantized {
                 weight,
-                scales,
-                biases,
+                // Quant scales/biases are loaded at their on-disk dtype, FP16 for
+                // some snapshots (e.g. Bonsai). `quantized_matmul` promotes its
+                // BF16 activation against an FP16 scale to an F32 result, which
+                // then carries F32 through Q/K/V, attention, and the `--kv-quant
+                // none` KV cache — doubling residency. mlx-lm casts every float
+                // weight to a single model dtype at load; force the scale/bias to
+                // BF16 here to match, so the projection output stays BF16.
+                scales: bf16_param(scales)?,
+                biases: biases.map(bf16_param).transpose()?,
                 group_size,
                 bits,
                 mode: mode.as_str().to_owned(),
@@ -2260,9 +2279,12 @@ pub fn load_from_path(model_dir: &Path, yarn_override: Option<&YarnOverride>) ->
         }
     };
 
+    // Norm weight adopts the BF16 activation dtype (see `bf16_param`): `rms_norm`
+    // of a BF16 activation against an FP16 weight promotes to F32 and leaks into
+    // the KV cache.
     let load_rms = |name: &str| -> Result<RmsNorm> {
         Ok(RmsNorm {
-            weight: w.array(&format!("{name}.weight"))?,
+            weight: bf16_param(w.array(&format!("{name}.weight"))?)?,
             eps: cfg.rms_norm_eps,
         })
     };
@@ -2285,8 +2307,14 @@ pub fn load_from_path(model_dir: &Path, yarn_override: Option<&YarnOverride>) ->
                 mode,
             } => Embedding::Quantized {
                 weight,
-                scales,
-                biases,
+                // The tied-lm_head path (`as_linear`) calls `quantized_matmul`
+                // with these scales/biases against a bf16 hidden state. On
+                // snapshots that ship embedding scales at fp16 (e.g. Bonsai),
+                // that produces f32 logits; cast to bf16 at load to keep the
+                // output bf16 — consistent with `lin`'s treatment and
+                // mlx-lm's uniform model-dtype discipline.
+                scales: bf16_param(scales)?,
+                biases: biases.map(bf16_param).transpose()?,
                 group_size,
                 bits,
                 mode: mode.as_str().to_owned(),
@@ -2378,8 +2406,11 @@ pub fn load_from_path(model_dir: &Path, yarn_override: Option<&YarnOverride>) ->
             // Precompute once; all layers share the same mscale value, and
             // scalar arrays carry no layer-specific state, so no try_clone
             // is needed.
+            // Cast to bf16 at load; the activation stream is fixed bf16, so the
+            // scalar dtype is known here. The per-step multiply then stays bf16
+            // without any runtime astype call.
             yarn_mscale_arr: if (yarn_mscale - 1.0).abs() > 1e-6 {
-                Some(scalar_f32(yarn_mscale))
+                Some(scalar_f32(yarn_mscale).astype(Dtype::Bf16, Device::Cpu)?)
             } else {
                 None
             },

@@ -97,6 +97,22 @@ fn classify_load_oom(e: Error) -> Error {
     }
 }
 
+/// Cast a float model parameter to BF16 at load time.
+///
+/// Follows mlx-lm's "uniform model dtype" discipline: if the snapshot ships
+/// an fp16 (or other float) tensor where bf16 is expected, the narrower dtype
+/// forces MLX's promotion rules to lift the entire compute stream to f32,
+/// polluting downstream activations and the `--kv-quant none` KV cache.
+/// Casting at load is zero per-token cost and keeps every activation bf16.
+/// Already-BF16 tensors are returned unchanged (early-return, no copy).
+pub(crate) fn bf16_param(a: Array) -> Result<Array> {
+    if a.dtype() == Dtype::Bf16 {
+        Ok(a)
+    } else {
+        a.astype(Dtype::Bf16, rmlx_mlx::Device::Cpu)
+    }
+}
+
 impl<'a> Weights<'a> {
     /// Index-first fetch: the index locates each tensor's shard, with a
     /// header-scan fallback when the index misses or lies.
