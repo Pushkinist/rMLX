@@ -1508,6 +1508,13 @@ fn main() -> Result<()> {
                     "--paged-kv requested"
                 );
             }
+            // Validate --image-max-tokens: zero is rejected (matches the HTTP
+            // 400 the request path returns for image_max_tokens == 0). High
+            // values are silently clamped downstream, consistent with the
+            // request path which only errors on zero.
+            if image_max_tokens == Some(0) {
+                return Err(anyhow::anyhow!("--image-max-tokens must be > 0"));
+            }
             // projects.toml loading + cap resolution wired in run_serve.
             // log draft flags at startup.
             if let (Some(dp), Some(dk)) = (draft_model.as_deref(), draft_kind) {

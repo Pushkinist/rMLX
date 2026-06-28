@@ -516,15 +516,13 @@ pub struct ChatCompletionsRequest {
     #[serde(default)]
     pub max_ctx: Option<i32>,
 
-    // Per-request image-token budget for Gemma4-unified vision. `Some(n)`
-    // raises the soft-token budget for dense images (e.g. tables), preserving
-    // more vision resolution; the preprocessor clamps it to the model's safe
-    // upper bound. `None` (omitted) uses the server's launch
-    // `--image-max-tokens` or the snapshot's `processor_config.json` default.
-    // Resolution order: request > CLI flag > config default. A no-op for
-    // text-only requests and non-Gemma4-unified vision archs.
-    /// Per-request image-token budget override for Gemma4-unified vision;
-    /// `None` uses the server default.
+    /// Per-request image-token budget for Gemma4-unified vision. `Some(n)`
+    /// raises the soft-token budget for dense images (e.g. tables), preserving
+    /// more vision resolution; the preprocessor clamps it to the model's safe
+    /// upper bound. `None` (omitted) uses the server's launch
+    /// `--image-max-tokens` or the snapshot's `processor_config.json` default.
+    /// Resolution order: request > CLI flag > config default. A no-op for
+    /// text-only requests and non-Gemma4-unified vision archs.
     #[serde(default)]
     pub image_max_tokens: Option<u32>,
 

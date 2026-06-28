@@ -555,6 +555,10 @@ impl Generator for ArchGenerator {
         // image-token budget override: request value wins over the
         // server-startup `--image-max-tokens` default. `None` falls through to
         // the snapshot's `processor_config.json` budget inside build_image_prompt.
+        // This is the sole resolution point for the Anthropic path. For OpenAI
+        // the request value was already folded into `req.image_max_tokens` in
+        // chat.rs — the `.or(self.image_max_tokens)` here is a harmless safety
+        // net that keeps both paths correct if call sites diverge in future.
         let image_max_tokens = req.image_max_tokens.or(self.image_max_tokens);
         // base64 `input_audio` clips + the loaded audio bundle (clone of the Arc).
         // `req_audio` is empty for non-audio requests (zero extra work).
