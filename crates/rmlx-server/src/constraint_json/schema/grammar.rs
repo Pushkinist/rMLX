@@ -10,13 +10,13 @@
 //!
 //! ## LOC exemption
 //!
-//! This file is ~1185 LOC, exceeding the 1000 LOC split target. The
+//! This file is ~1400 LOC, exceeding the 1000 LOC split target. The
 //! `SchemaGrammar` state machine integrates object-key trie tracking,
 //! array bounds enforcement, literal-branch selection, free-key parsing,
-//! and epilogue handling into a single monolithic `impl` block. Splitting
-//! the state machine across files would require threading mutable `self`
-//! through function arguments or boxing frame state, adding indirection
-//! for no correctness gain.
+//! epilogue handling, and the buffer-reusing per-token `reset_from` into a
+//! single cohesive unit. Splitting the state machine across files would
+//! require threading mutable `self` through function arguments or boxing
+//! frame state, adding indirection for no correctness gain.
 
 #![allow(
     clippy::cognitive_complexity,
@@ -27,6 +27,8 @@
     clippy::unused_self,
     unreachable_pub
 )]
+
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -101,9 +103,14 @@ pub(super) fn union_literals(branches: &[SchemaNode]) -> Option<Vec<Vec<u8>>> {
 /// Position inside a set of literal alternatives. Tracks how many bytes of
 /// the chosen literal(s) have been emitted; the still-viable set is the
 /// literals whose prefix matches what has been emitted so far.
+///
+/// `lits` is the immutable alternative set, held behind `Arc` so cloning the
+/// trie (per candidate token in the mask probe) shares it instead of copying
+/// every literal. `pos`/`viable` are the mutable match progress and clone by
+/// value.
 #[derive(Debug, Clone)]
 pub(super) struct LiteralTrie {
-    pub(super) lits: Vec<Vec<u8>>,
+    pub(super) lits: Arc<[Vec<u8>]>,
     /// byte offset matched so far (same for all viable lits — they share
     /// the matched prefix).
     pub(super) pos: usize,
@@ -115,10 +122,18 @@ impl LiteralTrie {
     pub(super) fn new(lits: Vec<Vec<u8>>) -> Self {
         let viable = (0..lits.len()).collect();
         Self {
-            lits,
+            lits: Arc::from(lits),
             pos: 0,
             viable,
         }
+    }
+
+    /// Refill from `src` reusing the `viable` buffer (the per-token reset on
+    /// the mask sweep). `lits` is `Arc`-shared (refcount bump).
+    fn reset_from(&mut self, src: &Self) {
+        self.lits.clone_from(&src.lits);
+        self.pos = src.pos;
+        self.viable.clone_from(&src.viable);
     }
 
     #[allow(
@@ -220,21 +235,97 @@ fn free_key_step(byte: u8, escape: bool, unicode: u8) -> Result<FreeKeyNext, ()>
 enum Frame {
     /// Inside `{ … }`. `idx` = next property index to emit; `emitted` =
     /// keys already written; phase tracks the `"key":value,` micro-cycle.
+    ///
+    /// `node_props` / `required` are the immutable schema (shared via `Arc`);
+    /// `emitted` / `phase` are the mutable progress.
     Object {
-        node_props: Vec<(String, SchemaNode)>,
-        required: Vec<String>,
+        node_props: Arc<[(String, SchemaNode)]>,
+        required: Arc<[String]>,
         additional: bool,
         emitted: Vec<String>,
         phase: ObjPhase,
     },
     /// Inside `[ … ]`. `count` = elements committed so far.
+    ///
+    /// `items` is the immutable element schema (shared via `Arc`); `count` /
+    /// `phase` are the mutable progress.
     Array {
-        items: SchemaNode,
+        items: Arc<SchemaNode>,
         min: Option<usize>,
         max: Option<usize>,
         count: usize,
         phase: ArrPhase,
     },
+}
+
+impl Frame {
+    /// Refill from `src` reusing this frame's heap buffers when the variant is
+    /// unchanged: the `Object` `emitted` vector and the in-key trie's `viable`
+    /// vector are refilled in place via `clone_from`. On a variant mismatch we
+    /// fall back to a plain clone.
+    fn reset_from(&mut self, src: &Self) {
+        match (self, src) {
+            (
+                Frame::Object {
+                    node_props,
+                    required,
+                    additional,
+                    emitted,
+                    phase,
+                },
+                Frame::Object {
+                    node_props: s_props,
+                    required: s_req,
+                    additional: s_add,
+                    emitted: s_emitted,
+                    phase: s_phase,
+                },
+            ) => {
+                node_props.clone_from(s_props);
+                required.clone_from(s_req);
+                *additional = *s_add;
+                emitted.clone_from(s_emitted);
+                phase.reset_from(s_phase);
+            }
+            (
+                Frame::Array {
+                    items,
+                    min,
+                    max,
+                    count,
+                    phase,
+                },
+                Frame::Array {
+                    items: s_items,
+                    min: s_min,
+                    max: s_max,
+                    count: s_count,
+                    phase: s_phase,
+                },
+            ) => {
+                items.clone_from(s_items);
+                *min = *s_min;
+                *max = *s_max;
+                *count = *s_count;
+                *phase = s_phase.clone();
+            }
+            (dst, src) => *dst = src.clone(),
+        }
+    }
+}
+
+impl ObjPhase {
+    /// Refill from `src`, reusing the in-key trie's `viable` buffer when both
+    /// sides are mid-key; otherwise a plain clone (the other variants are
+    /// `Copy`-sized and allocate nothing).
+    fn reset_from(&mut self, src: &Self) {
+        match (self, src) {
+            (ObjPhase::InKey { trie }, ObjPhase::InKey { trie: s_trie }) => {
+                trie.reset_from(s_trie);
+            }
+            (dst, src) => *dst = src.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -265,8 +356,8 @@ enum ArrPhase {
 /// Active scalar/leaf sub-state when emitting a non-container value.
 #[derive(Debug, Clone)]
 enum Leaf {
-    /// Awaiting the first byte of a value governed by `node`.
-    Start(SchemaNode),
+    /// Awaiting the first byte of a value governed by `node` (shared via `Arc`).
+    Start(Arc<SchemaNode>),
     /// Inside a JSON string (free-form, e.g. `type:string` w/o enum).
     InStr {
         escape: bool,
@@ -284,6 +375,26 @@ enum Leaf {
         seen_digit: bool,
         done_to: AfterTarget,
     },
+}
+
+impl Leaf {
+    /// Refill from `src`, reusing the `InLit` trie's `viable` buffer when both
+    /// sides are inside a literal trie; otherwise a plain clone.
+    fn reset_from(&mut self, src: &Self) {
+        match (self, src) {
+            (
+                Leaf::InLit { trie, done_to },
+                Leaf::InLit {
+                    trie: s_trie,
+                    done_to: s_done_to,
+                },
+            ) => {
+                trie.reset_from(s_trie);
+                *done_to = *s_done_to;
+            }
+            (dst, src) => *dst = src.clone(),
+        }
+    }
 }
 
 /// Where control returns after a leaf/value completes.
@@ -307,12 +418,28 @@ pub struct SchemaGrammar {
 
 impl super::super::ProbeGrammar for SchemaGrammar {
     fn reset_from(&mut self, src: &Self) {
-        // `Frame` / `Leaf` own schema subtrees (heavy `Clone`), so refilling the
-        // stack element-by-element would deep-clone each frame anyway — no
-        // cheaper than a full clone. `clone_from` at least reuses the outer
-        // buffers; making the probe allocation-free here would need the schema
-        // held behind `Arc`, which is tracked separately.
-        self.clone_from(src);
+        // The immutable schema inside each `Frame` / `Leaf` is held behind
+        // `Arc` (property list, element schema, literal alternatives), so a
+        // frame reset is a few refcount bumps plus a copy of the tiny mutable
+        // progress (`emitted` keys, trie `viable` indices, `phase`). No schema
+        // subtree is ever deep-copied.
+        //
+        // Beyond that, this reset reuses the scratch's existing per-frame
+        // buffers: on the O(vocab) mask sweep the scratch is reset once per
+        // candidate token, and where its stack shape still matches the
+        // reference (same variant at the same depth) the `emitted` / `viable`
+        // vectors are refilled in place via `clone_from` rather than
+        // reallocated. The derived `clone_from` would instead reassign each
+        // frame wholesale, dropping and re-growing those vectors every token.
+        self.done = src.done;
+        reset_stack(&mut self.stack, &src.stack);
+        // Reuse a literal-trie's `viable` buffer when both leaves are the same
+        // trie-bearing variant; otherwise fall back to a plain clone.
+        match (self.leaf.as_mut(), src.leaf.as_ref()) {
+            (Some(d), Some(s)) => d.reset_from(s),
+            (_, Some(s)) => self.leaf = Some(s.clone()),
+            (_, None) => self.leaf = None,
+        }
     }
 
     fn feed(&mut self, byte: u8) -> Result<(), ()> {
@@ -320,12 +447,25 @@ impl super::super::ProbeGrammar for SchemaGrammar {
     }
 }
 
+/// Refill `dst` from `src`, reusing each frame's heap buffers in place where
+/// the variant at that depth is unchanged (the common case across consecutive
+/// probe tokens). Frames whose variant differs, and any tail beyond `src`'s
+/// length, fall back to a plain clone / truncate.
+fn reset_stack(dst: &mut Vec<Frame>, src: &[Frame]) {
+    let common = dst.len().min(src.len());
+    for (d, s) in dst.iter_mut().zip(src.iter()) {
+        d.reset_from(s);
+    }
+    dst.truncate(common);
+    dst.extend(src.iter().skip(common).cloned());
+}
+
 impl SchemaGrammar {
     /// Create a new grammar that will enforce the given `root` schema node.
     pub fn new(root: SchemaNode) -> Self {
         Self {
             stack: Vec::new(),
-            leaf: Some(Leaf::Start(root)),
+            leaf: Some(Leaf::Start(Arc::new(root))),
             done: false,
         }
     }
@@ -385,7 +525,14 @@ impl SchemaGrammar {
                 additional,
                 emitted,
                 phase,
-            }) => self.object_allowed(node_props, required, *additional, emitted, phase, &mut out),
+            }) => self.object_allowed(
+                node_props.as_ref(),
+                required.as_ref(),
+                *additional,
+                emitted,
+                phase,
+                &mut out,
+            ),
             Some(Frame::Array {
                 min,
                 max,
@@ -409,7 +556,7 @@ impl SchemaGrammar {
     )]
     fn leaf_allowed(&self, leaf: &Leaf, out: &mut [bool; 256]) {
         match leaf {
-            Leaf::Start(node) => self.value_starters(node, out),
+            Leaf::Start(node) => self.value_starters(node.as_ref(), out),
             Leaf::InStr {
                 escape, unicode, ..
             } => {
@@ -608,7 +755,7 @@ impl SchemaGrammar {
                 if !at_max {
                     // delegate to the items node's starters
                     if let Some(Frame::Array { items, .. }) = self.stack.last() {
-                        self.value_starters(items, out);
+                        self.value_starters(items.as_ref(), out);
                     }
                 }
                 if !just_after_comma && at_min {
@@ -802,22 +949,26 @@ impl SchemaGrammar {
     }
 
     /// Begin a value governed by `node` starting at `byte`.
+    ///
+    /// `node` is the shared schema sub-tree (`Arc`); container arms clone the
+    /// already-`Arc`-wrapped property list / element schema (a refcount bump,
+    /// not a deep copy) into the pushed frame.
     #[allow(
         clippy::indexing_slicing,
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or validated before call"
     )]
-    fn enter_value(&mut self, node: SchemaNode, byte: u8) -> Result<(), ()> {
+    fn enter_value(&mut self, node: Arc<SchemaNode>, byte: u8) -> Result<(), ()> {
         let done_to = if self.stack.is_empty() {
             AfterTarget::Top
         } else {
             AfterTarget::Container
         };
-        match node {
+        match node.as_ref() {
             SchemaNode::Union(branches) => {
                 // Discriminated union: every branch is a `const` or a
                 // string-`enum` literal → merge into one literal trie and
                 // prune as bytes commit (true discriminated-union support).
-                if let Some(lits) = union_literals(&branches) {
+                if let Some(lits) = union_literals(branches) {
                     let mut trie = LiteralTrie::new(lits);
                     trie.step(byte)?;
                     self.finish_or_keep_lit(trie, done_to);
@@ -826,7 +977,7 @@ impl SchemaGrammar {
                 // Structural union: pick the first branch whose starter set
                 // accepts `byte` (v1 limitation: no full backtracking).
                 let mut chosen: Option<SchemaNode> = None;
-                for br in &branches {
+                for br in branches {
                     let mut s = [false; 256];
                     self.value_starters(br, &mut s);
                     if s[byte as usize] {
@@ -836,14 +987,14 @@ impl SchemaGrammar {
                 }
                 match chosen {
                     Some(n) => {
-                        self.leaf = Some(Leaf::Start(n));
+                        self.leaf = Some(Leaf::Start(Arc::new(n)));
                         self.step(byte)
                     }
                     None => Err(()),
                 }
             }
             SchemaNode::Const(v) => {
-                let mut trie = LiteralTrie::new(vec![literal_bytes(&v)]);
+                let mut trie = LiteralTrie::new(vec![literal_bytes(v)]);
                 trie.step(byte)?;
                 if trie.complete() && trie.lits[0].len() == trie.pos {
                     self.value_complete(done_to);
@@ -882,7 +1033,7 @@ impl SchemaGrammar {
                     return Err(());
                 }
                 self.leaf = Some(Leaf::InNum {
-                    integer,
+                    integer: *integer,
                     seen_digit: byte.is_ascii_digit(),
                     done_to,
                 });
@@ -910,9 +1061,9 @@ impl SchemaGrammar {
                     return Err(());
                 }
                 self.stack.push(Frame::Object {
-                    node_props: props,
-                    required,
-                    additional,
+                    node_props: Arc::clone(props),
+                    required: Arc::clone(required),
+                    additional: *additional,
                     emitted: Vec::new(),
                     phase: ObjPhase::ExpectKeyOrEnd {
                         just_after_comma: false,
@@ -925,9 +1076,9 @@ impl SchemaGrammar {
                     return Err(());
                 }
                 self.stack.push(Frame::Array {
-                    items: *items,
-                    min,
-                    max,
+                    items: Arc::clone(items),
+                    min: *min,
+                    max: *max,
                     count: 0,
                     phase: ArrPhase::ExpectValueOrEnd {
                         just_after_comma: false,
@@ -962,8 +1113,8 @@ impl SchemaGrammar {
         match byte {
             b'{' => {
                 self.stack.push(Frame::Object {
-                    node_props: Vec::new(),
-                    required: Vec::new(),
+                    node_props: Arc::from([]),
+                    required: Arc::from([]),
                     additional: true,
                     emitted: Vec::new(),
                     phase: ObjPhase::ExpectKeyOrEnd {
@@ -974,7 +1125,7 @@ impl SchemaGrammar {
             }
             b'[' => {
                 self.stack.push(Frame::Array {
-                    items: SchemaNode::Any,
+                    items: Arc::new(SchemaNode::Any),
                     min: None,
                     max: None,
                     count: 0,
@@ -1051,7 +1202,10 @@ impl SchemaGrammar {
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or validated before call"
     )]
     fn step_object(&mut self, byte: u8) -> Result<(), ()> {
-        // Clone the small bits we need; mutate the frame in place after.
+        // Snapshot the bits we need so we can mutate the frame in place after.
+        // `node_props`/`required` are `Arc`-shared schema → these clones are
+        // refcount bumps, not deep copies; only `emitted`/`phase` are real
+        // (tiny) copies.
         let (props, required, additional, emitted, phase) = match self.stack.last() {
             Some(Frame::Object {
                 node_props,
@@ -1060,8 +1214,8 @@ impl SchemaGrammar {
                 emitted,
                 phase,
             }) => (
-                node_props.clone(),
-                required.clone(),
+                Arc::clone(node_props),
+                Arc::clone(required),
                 *additional,
                 emitted.clone(),
                 phase.clone(),
@@ -1152,7 +1306,7 @@ impl SchemaGrammar {
                 let value_node = which
                     .and_then(|i| props.get(i).map(|(_, n)| n.clone()))
                     .unwrap_or(SchemaNode::Any);
-                self.leaf = Some(Leaf::Start(value_node));
+                self.leaf = Some(Leaf::Start(Arc::new(value_node)));
                 if let Some(Frame::Object { phase, .. }) = self.stack.last_mut() {
                     *phase = ObjPhase::AfterValue;
                 }
@@ -1204,7 +1358,7 @@ impl SchemaGrammar {
                 max,
                 count,
                 phase,
-            }) => (items.clone(), *min, *max, *count, phase.clone()),
+            }) => (Arc::clone(items), *min, *max, *count, phase.clone()),
             _ => return Err(()),
         };
         let at_min = min.is_none_or(|m| count >= m);

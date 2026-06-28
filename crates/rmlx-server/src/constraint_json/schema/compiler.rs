@@ -12,6 +12,8 @@
     clippy::unused_self
 )]
 
+use std::sync::Arc;
+
 use serde_json::Value;
 
 use super::types::{SchemaError, SchemaNode};
@@ -305,8 +307,8 @@ impl SchemaNode {
         };
 
         Ok(SchemaNode::Object {
-            props,
-            required,
+            props: Arc::from(props),
+            required: Arc::from(required),
             additional,
         })
     }
@@ -319,10 +321,10 @@ impl SchemaNode {
     ) -> Result<SchemaNode, SchemaError> {
         let items = match obj.get("items") {
             Some(v) if v.is_object() => {
-                Box::new(SchemaNode::parse_node(v, strict, defs, depth + 1)?)
+                Arc::new(SchemaNode::parse_node(v, strict, defs, depth + 1)?)
             }
             // tuple-items / missing items → Any element
-            _ => Box::new(SchemaNode::Any),
+            _ => Arc::new(SchemaNode::Any),
         };
         let min = obj
             .get("minItems")

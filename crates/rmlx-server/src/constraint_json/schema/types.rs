@@ -4,6 +4,8 @@
 
 #![allow(unreachable_pub)]
 
+use std::sync::Arc;
+
 use serde_json::Value;
 
 /// Error returned when the supplied `response_format.json_schema.schema`
@@ -77,6 +79,14 @@ pub enum EngagePolicy {
 ///
 /// Adapted from llama.cpp `SchemaConverter::visit` keyword dispatch order:
 /// `$ref` → `oneOf`/`anyOf` → `const` → `enum` → object → array → scalar.
+///
+/// The immutable sub-schema fields (`props`, `required`, array `items`) are
+/// held behind `Arc` so the schema tree is *shared*, not deep-copied. The
+/// per-token allow-mask probe resets a scratch grammar once per candidate
+/// token (~152K per decode step); with the schema behind `Arc` each reset is
+/// a handful of refcount bumps rather than a recursive clone of the property
+/// list / element schema. `Arc` (not `Rc`) because the constraint engine is
+/// driven from a `Send` decode loop.
 #[allow(
     clippy::exhaustive_enums,
     reason = "closed schema-AST enum — variants are the complete supported JSON-Schema keyword subset; adding a variant requires updating the compiler, SchemaGrammar, and all SchemaNode match arms"
@@ -88,16 +98,16 @@ pub enum SchemaNode {
     /// extra free-form keys when `true`.
     Object {
         /// Ordered list of `(name, schema)` pairs for declared properties.
-        props: Vec<(String, SchemaNode)>,
+        props: Arc<[(String, SchemaNode)]>,
         /// Names of properties that must appear in the output object.
-        required: Vec<String>,
+        required: Arc<[String]>,
         /// When `true`, additional properties beyond `props` are permitted.
         additional: bool,
     },
     /// `type:array` with homogeneous `items`.
     Array {
         /// Schema applied to every element of the array.
-        items: Box<SchemaNode>,
+        items: Arc<SchemaNode>,
         /// Minimum number of array elements (`minItems`); `None` = unconstrained.
         min: Option<usize>,
         /// Maximum number of array elements (`maxItems`); `None` = unconstrained.

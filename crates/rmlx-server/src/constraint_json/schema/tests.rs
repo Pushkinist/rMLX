@@ -30,7 +30,7 @@ fn schema_parse_shapes() {
             additional,
         } => {
             assert_eq!(props.len(), 1);
-            assert_eq!(required, vec!["a".to_string()]);
+            assert_eq!(required.as_ref(), ["a".to_string()].as_slice());
             assert!(
                 additional,
                 "non-strict, no additionalProperties → permissive"
@@ -759,20 +759,20 @@ fn is_scalar_root_classification() {
     assert!(!SchemaNode::Union(vec![
         SchemaNode::Const(json!("a")),
         SchemaNode::Object {
-            props: vec![],
-            required: vec![],
+            props: Arc::from([]),
+            required: Arc::from([]),
             additional: false
         },
     ])
     .is_scalar_root());
     assert!(!SchemaNode::Object {
-        props: vec![],
-        required: vec![],
+        props: Arc::from([]),
+        required: Arc::from([]),
         additional: false
     }
     .is_scalar_root());
     assert!(!SchemaNode::Array {
-        items: Box::new(SchemaNode::Num { integer: false }),
+        items: Arc::new(SchemaNode::Num { integer: false }),
         min: None,
         max: None
     }
@@ -881,14 +881,77 @@ fn object_root_none_override_keeps_value_starter() {
     );
 }
 
+/// `reset_from` (the buffer-reusing per-token reset) must restore a scratch
+/// grammar to a state byte-identical to a fresh `clone()` of the reference,
+/// regardless of how the scratch was dirtied first. This guards the buffer
+/// reuse in `reset_from` / `Frame::reset_from` / `LiteralTrie::reset_from`
+/// against leaving stale mutable progress behind.
+#[test]
+fn reset_from_matches_fresh_clone() {
+    use super::super::ProbeGrammar;
+
+    // A schema rich enough to exercise object frames (with `emitted`), an
+    // enum literal trie, and array frames.
+    let root = node(
+        &json!({
+            "type":"object",
+            "properties":{
+                "name":{"type":"string"},
+                "size":{"type":"string","enum":["small","medium","large"]},
+                "tags":{"type":"array","items":{"type":"string"}}
+            },
+            "required":["name","size","tags"],
+            "additionalProperties":false
+        }),
+        true,
+    );
+
+    // Reference states at several distinct grammar positions.
+    let prefixes = [
+        "{",
+        "{\"name\":\"",
+        "{\"name\":\"x\",\"size\":\"",
+        "{\"name\":\"x\",\"size\":\"small\",\"tags\":[\"",
+    ];
+    // Bytes that drive the scratch into a different shape before each reset.
+    let dirtiers = [b'x', b'{', b'"', b'}', b'[', b' ', b',', b':', b']'];
+
+    for prefix in prefixes {
+        let mut base = SchemaGrammar::new(root.clone());
+        feed(&mut base, prefix).expect("prefix valid");
+        let expect = format!("{base:?}");
+        let expect_allowed = base.allowed_bytes();
+
+        let mut scratch = base.clone();
+        for &d in &dirtiers {
+            let _ = scratch.step(d); // diverge (may Err / no-op; that's fine)
+            scratch.reset_from(&base);
+            assert_eq!(
+                format!("{scratch:?}"),
+                expect,
+                "reset_from must restore base after stepping {:?} at prefix {prefix:?}",
+                d as char
+            );
+            assert_eq!(
+                scratch.allowed_bytes(),
+                expect_allowed,
+                "reset_from allowed_bytes mismatch at prefix {prefix:?}"
+            );
+        }
+    }
+}
+
 // ───────────────────────────────────────────────────────────────────────────
-// Perf probe: SchemaGrammar step_mask cost + the deep-clone fraction.
+// Perf probe: SchemaGrammar step_mask cost, across three columns.
 //
-// SchemaGrammar frames own the schema subtree (heavy Clone), so the shared
-// fill_allow_mask probe clone_from's the whole grammar per token. This measures
-// total step_mask cost vs clone-only (the deep-copy tax an Arc-wrap of the
-// immutable schema would mostly remove) on a synthetic ~152K vocab, across
-// container states. Compare to the json_object probe (~1-3 ms/step).
+// The immutable schema inside each frame is `Arc`-shared, so a grammar clone
+// no longer deep-copies the property list / element schema / literal set —
+// only the tiny mutable progress. This measures, on a synthetic ~152K vocab:
+//   total_ms      — full per-token sweep (reset + step), the user-visible cost
+//   cloneOnly_ms  — a raw `clone()` per token (no stepping)
+//   reset_ms      — the production path: one buffer-reusing `reset_from` per
+//                   token (what `fill_allow_mask` actually does)
+// Compare to the json_object probe (~1-3 ms/step).
 //
 // Run: cargo test -p rmlx-server constraint_json::schema::tests::probe_schema \
 //        --profile release-perf -- --ignored --nocapture
@@ -1002,10 +1065,10 @@ fn probe_schema_step_mask_cost() {
 
     println!("\nvocab={n}  reps={reps}  (per decode step = total/reps)\n");
     println!(
-        "{:<32} {:>10} {:>12} {:>9}",
-        "grammar state", "total_ms", "cloneOnly_ms", "clone%"
+        "{:<32} {:>10} {:>12} {:>9} {:>11}",
+        "grammar state", "total_ms", "cloneOnly_ms", "clone%", "reset_ms"
     );
-    println!("{}", "-".repeat(66));
+    println!("{}", "-".repeat(78));
 
     for (label, prefix) in scenes {
         let mut base = SchemaGrammar::new(root.clone());
@@ -1049,8 +1112,27 @@ fn probe_schema_step_mask_cost() {
         }
         let clone_ms = t1.elapsed().as_secs_f64() * 1e3 / f64::from(reps);
 
+        // C) reset_from — the production hot path. `fill_allow_mask` resets a
+        // single scratch grammar per candidate token instead of cloning, so
+        // this is the figure that actually governs constrained-decode cost.
+        // Step one byte before each reset so the scratch shape diverges and the
+        // reset must restore it (worst case for buffer reuse).
+        let mut scratch = base.clone();
+        let t2 = std::time::Instant::now();
+        for _ in 0..reps {
+            for id in 0..n {
+                if bm.token_bytes(id).is_empty() {
+                    continue;
+                }
+                let _ = scratch.step(b'x');
+                <SchemaGrammar as super::super::ProbeGrammar>::reset_from(&mut scratch, &base);
+                std::hint::black_box(&scratch);
+            }
+        }
+        let reset_ms = t2.elapsed().as_secs_f64() * 1e3 / f64::from(reps);
+
         let pct = clone_ms / total_ms.max(1e-9) * 100.0;
-        println!("{label:<32} {total_ms:>10.3} {clone_ms:>12.3} {pct:>8.1}%");
+        println!("{label:<32} {total_ms:>10.3} {clone_ms:>12.3} {pct:>8.1}% {reset_ms:>11.3}");
     }
     println!();
 }
