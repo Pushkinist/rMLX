@@ -144,6 +144,7 @@ fn req_with_temp(temperature: f32) -> GenerationRequest {
         max_ctx_override: None,
         images: vec![],
         audio_b64: vec![],
+        image_max_tokens: None,
     }
 }
 
@@ -267,6 +268,7 @@ fn make_initial_req(prompt: Vec<u32>, max_tokens: u32) -> GenerationRequest {
         max_ctx_override: None,
         images: vec![],
         audio_b64: vec![],
+        image_max_tokens: None,
     }
 }
 

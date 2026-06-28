@@ -614,6 +614,14 @@ pub struct AppState {
     ///
     /// Precedence: request `enable_thinking` > this > absent (= enabled).
     pub default_enable_thinking: Option<bool>,
+    /// Server-startup default image-token budget for Gemma4-unified vision.
+    /// `Some(n)` raises the soft-token budget for dense images (clamped to the
+    /// model's safe upper bound by the preprocessor). `None` = absent (use the
+    /// snapshot's `processor_config.json` `max_soft_tokens`). Configurable via
+    /// `--image-max-tokens`.
+    ///
+    /// Precedence: request `image_max_tokens` > this > snapshot config default.
+    pub default_image_max_tokens: Option<usize>,
     /// F14: process-lifetime cumulative prompt (input) token counter.
     ///
     /// Incremented at the same request-completion site that emits

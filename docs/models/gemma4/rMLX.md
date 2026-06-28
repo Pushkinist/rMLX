@@ -601,7 +601,8 @@ quantization-aware-trained) against the on-disk PTQ-mxfp8 baselines.
 unquantized **bf16** (Plain fallback when no `.scales`) + **affine-int4** with
 per-group `.biases` (dense linears, embeddings, *and* MoE expert `gather_qmm`) +
 a **`Gemma4UnifiedForConditionalGeneration`** arch alias for the 12B variant
-(encoder-free multimodal; text decoder is Gemma4 — vision/audio not yet wired).
+(encoder-free multimodal; text decoder is Gemma4, with the encoder-free vision
+and audio front-ends fully wired — see §"12B unified" below).
 
 **Method:** decode TPS via `rmlx baseline --kv-quant none --prompt-tokens 4096
 --max-tokens 100` (weight-isolated: KV held at bf16-`none` so the only variable is
@@ -658,5 +659,7 @@ mxfp8 stays a safe default; nvfp4 is out until the MLX kernel is fixed.
 
 **Caveats:** decode-TPS here is `--kv-quant none` weight-isolated (~4k prompt),
 not the §2 serve+CBB harness — within-section deltas only. `e2b-it-qat-mxfp4` is
-an empty placeholder repo on HF (no weights). 12b vision/audio input is not wired
-(text only). Metrics-DB ingest of these cells is deferred (grid-summary only).
+an empty placeholder repo on HF (no weights). The 12b unified arch's vision and
+audio input are fully wired (encoder-free embedder); these QAT cells are
+text-decode benchmarks only. Metrics-DB ingest of these cells is deferred
+(grid-summary only).

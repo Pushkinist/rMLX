@@ -545,6 +545,10 @@ pub(crate) async fn messages(
         // Anthropic route has no multimodal content-part extraction yet.
         images: vec![],
         audio_b64: vec![],
+        // The Anthropic surface has no image input yet, but carry the
+        // server-startup `--image-max-tokens` default so a future image path
+        // honours it; a no-op while `images` is empty.
+        image_max_tokens: state.default_image_max_tokens,
     };
 
     // Ensure the requested model is loaded (auto-swap if needed).

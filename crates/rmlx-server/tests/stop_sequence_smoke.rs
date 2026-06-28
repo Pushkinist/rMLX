@@ -131,6 +131,7 @@ fn scripted_state(pieces: &'static [&'static str]) -> (AppState, tempfile::TempD
         require_smoke_probe: false,
         default_temperature: None,
         default_enable_thinking: None,
+        default_image_max_tokens: None,
         tokens_in: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         tokens_out: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         error_counts: ApiErrorCounters::new(),

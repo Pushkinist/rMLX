@@ -10,7 +10,9 @@
     reason = "test fixtures: index/slice bounds are fixed by the literal prompt arrays constructed in each test"
 )]
 
-use super::{splice_image_block, GEMMA4_USER_TURN_OPENER, QWEN3VL_USER_TURN_OPENER};
+use super::{
+    resolve_gemma4_processor, splice_image_block, GEMMA4_USER_TURN_OPENER, QWEN3VL_USER_TURN_OPENER,
+};
 
 /// A minimal image block placeholder (real blocks are `<boi> + N×img + <eoi>`;
 /// the placement logic is independent of the block contents).
@@ -151,6 +153,36 @@ fn multi_image_blocks_appear_in_order_and_contiguous() {
         prompt.len() + blk1.len() + blk2.len(),
         "length adds up"
     );
+}
+
+// ---- image-token budget override resolution ---------------------------
+
+#[test]
+fn resolve_processor_none_borrows_shared() {
+    let proc = rmlx_models::gemma4::Gemma4ImageProcessor::with_defaults();
+    let resolved = resolve_gemma4_processor(&proc, None);
+    // No override → borrow (zero alloc), budget unchanged.
+    assert!(matches!(resolved, std::borrow::Cow::Borrowed(_)));
+    assert_eq!(resolved.config().max_soft_tokens, 280);
+}
+
+#[test]
+fn resolve_processor_override_owns_with_clamped_budget() {
+    let proc = rmlx_models::gemma4::Gemma4ImageProcessor::with_defaults();
+
+    let raised = resolve_gemma4_processor(&proc, Some(560));
+    assert!(matches!(raised, std::borrow::Cow::Owned(_)));
+    assert_eq!(raised.config().max_soft_tokens, 560);
+
+    // Above the safe ceiling → clamped to the model bound.
+    let clamped = resolve_gemma4_processor(&proc, Some(999_999));
+    assert_eq!(
+        clamped.config().max_soft_tokens,
+        rmlx_models::gemma4::MAX_SUPPORTED_SOFT_TOKENS
+    );
+
+    // Shared processor is never mutated.
+    assert_eq!(proc.config().max_soft_tokens, 280);
 }
 
 #[test]
