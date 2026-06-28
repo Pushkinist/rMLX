@@ -413,3 +413,231 @@ fn diagnose_gemma_token_bytes() {
     // non-printable; the engagement logic must handle them gracefully.
     eprintln!("[diagnose_gemma] done");
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// Empirical probe: clone-per-token vs scratch-reuse cost in step_mask.
+//
+// Reproduces the production step_mask inner loop (mod.rs) three ways and times
+// each across grammar states of increasing nesting depth, on a synthetic
+// ~152K-token vocab with a BPE-like byte-length distribution. Answers:
+//   (b) ~ms per decode step on the constrained path,
+//   (c) what fraction is per-token clone allocation vs irreducible step work,
+//   (d) whether eliminating the alloc (scratch reuse) is worth it, or whether
+//       the cost is algorithmic (vocab-wide probe → DFA/trie index).
+//
+// Run: cargo test -p rmlx-server constraint_json::tests::probe_step_mask \
+//        --profile release-perf -- --ignored --nocapture
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Deterministic LCG — no PRNG dep, reproducible vocab.
+struct Lcg(u64);
+impl Lcg {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next_u64() % n
+    }
+}
+
+/// Build a realistic ~`n`-token vocab: structural JSON tokens up front, then
+/// BPE-like text tokens (mean ~4-5 bytes, some space/quote prefixed).
+#[allow(
+    clippy::indexing_slicing,
+    reason = "letter index is bounded by rng.below(letters.len())"
+)]
+fn realistic_vocab(n: usize) -> Arc<TokenBytesMap> {
+    let structural: &[&[u8]] = &[
+        b"{",
+        b"}",
+        b"[",
+        b"]",
+        b"\"",
+        b":",
+        b",",
+        b" ",
+        b"\n",
+        b"\t",
+        b"0",
+        b"1",
+        b"2",
+        b"3",
+        b"4",
+        b"5",
+        b"6",
+        b"7",
+        b"8",
+        b"9",
+        b"-",
+        b".",
+        b"true",
+        b"false",
+        b"null",
+        b"\"a\"",
+        b"\"name\"",
+        b"\"id\"",
+        b" \"x",
+        b"\"value\"",
+    ];
+    let mut owned: Vec<Vec<u8>> = Vec::with_capacity(n);
+    for s in structural {
+        owned.push(s.to_vec());
+    }
+    let mut rng = Lcg(0x1234_5678_9abc_def0);
+    let letters = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    while owned.len() < n {
+        // length weighted 1..12, mean ~4-5
+        let len = match rng.below(100) {
+            0..=14 => 1,
+            15..=39 => 2,
+            40..=64 => 4,
+            65..=84 => 6,
+            85..=94 => 9,
+            _ => 12,
+        };
+        let mut t: Vec<u8> = Vec::with_capacity(len + 1);
+        match rng.below(100) {
+            0..=19 => t.push(b' '),  // Ġ-style space prefix
+            20..=24 => t.push(b'"'), // quote-prefixed
+            _ => {}
+        }
+        for _ in 0..len {
+            let idx = rng.below(letters.len() as u64) as usize;
+            t.push(letters[idx]);
+        }
+        owned.push(t);
+    }
+    owned.truncate(n);
+    let refs: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+    synthetic_bytes_map(&refs)
+}
+
+/// Drive the grammar to the state reached after consuming `prefix`.
+#[allow(
+    clippy::expect_used,
+    reason = "prefixes are static valid-JSON fragments authored in this test"
+)]
+fn grammar_at(prefix: &str) -> JsonGrammar {
+    let mut g = JsonGrammar::new();
+    for &b in prefix.as_bytes() {
+        g.step(b).expect("prefix must be valid JSON-so-far");
+    }
+    g
+}
+
+#[test]
+#[ignore = "perf probe — run manually with --ignored --nocapture"]
+fn probe_step_mask_clone_vs_scratch() {
+    let vocab_n = 152_064usize;
+    let bm = realistic_vocab(vocab_n);
+    let n = bm.vocab_size();
+    let reps = 30u32;
+
+    // (label, json-prefix). Depth = open-frame count after the prefix.
+    let scenes: &[(&str, &str)] = &[
+        ("Start top-value (depth0)", ""),
+        ("ObjectExpectKey (depth1)", "{"),
+        ("ExpectValue (depth1)", "{\"a\":"),
+        ("Nested ExpectValue (depth3)", "{\"a\":{\"b\":{\"c\":"),
+        (
+            "Nested ExpectValue (depth8)",
+            "{\"a\":[{\"b\":[{\"c\":[{\"d\":[",
+        ),
+        ("InString value (depth1)", "{\"a\":\""),
+    ];
+
+    println!("\nvocab={n}  reps={reps}  (figures are per-decode-step = total/reps)\n");
+    println!(
+        "{:<30} {:>10} {:>10} {:>7} {:>11} {:>9}",
+        "grammar state", "clone_ms", "scrch_ms", "speedup", "allocOnly", "legal"
+    );
+    println!("{}", "-".repeat(82));
+
+    for (label, prefix) in scenes {
+        let g = grammar_at(prefix);
+        let mut mask = vec![false; n];
+
+        // A) clone-per-token — current production logic (mod.rs:796).
+        let t0 = std::time::Instant::now();
+        let mut legal = 0usize;
+        for _ in 0..reps {
+            mask.fill(false);
+            for (id, m) in mask.iter_mut().enumerate() {
+                let bytes = bm.token_bytes(id);
+                if bytes.is_empty() {
+                    continue;
+                }
+                let mut gg = g.clone();
+                let mut ok = true;
+                for &b in bytes {
+                    if gg.step(b).is_err() {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    *m = true;
+                }
+            }
+            legal = mask.iter().filter(|&&m| m).count();
+        }
+        let clone_ms = t0.elapsed().as_secs_f64() * 1e3 / f64::from(reps);
+        let mask_a = mask.clone();
+
+        // B) scratch-reuse — one grammar, refilled via clear()+extend (no alloc
+        //    after warm-up). state is Copy; stack reuses its heap buffer.
+        let t1 = std::time::Instant::now();
+        let mut scratch = JsonGrammar::new();
+        for _ in 0..reps {
+            mask.fill(false);
+            for (id, m) in mask.iter_mut().enumerate() {
+                let bytes = bm.token_bytes(id);
+                if bytes.is_empty() {
+                    continue;
+                }
+                scratch.state = g.state;
+                scratch.stack.clear();
+                scratch.stack.extend_from_slice(&g.stack);
+                let mut ok = true;
+                for &b in bytes {
+                    if scratch.step(b).is_err() {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    *m = true;
+                }
+            }
+        }
+        let scratch_ms = t1.elapsed().as_secs_f64() * 1e3 / f64::from(reps);
+        // Correctness: scratch-reuse must produce a byte-identical allow-mask.
+        assert_eq!(
+            mask, mask_a,
+            "scratch mask diverges from clone mask at {label}"
+        );
+
+        // C) alloc-only — isolate the clone() heap cost (no stepping).
+        let t2 = std::time::Instant::now();
+        for _ in 0..reps {
+            for id in 0..n {
+                if bm.token_bytes(id).is_empty() {
+                    continue;
+                }
+                let gg = g.clone();
+                std::hint::black_box(&gg);
+            }
+        }
+        let alloc_ms = t2.elapsed().as_secs_f64() * 1e3 / f64::from(reps);
+
+        let speedup = clone_ms / scratch_ms.max(1e-9);
+        println!(
+            "{label:<30} {clone_ms:>10.3} {scratch_ms:>10.3} {speedup:>7.2} {alloc_ms:>11.3} {legal:>9}"
+        );
+    }
+    println!();
+}
