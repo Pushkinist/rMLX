@@ -636,9 +636,28 @@ impl SchemaGrammar {
             return Err(());
         }
 
-        // Whitespace handling: a no-op except it can close an open number.
-        let in_str = matches!(self.leaf, Some(Leaf::InStr { .. }));
-        if !in_str && WS.contains(&byte) {
+        // Whitespace handling. JSON allows insignificant whitespace only
+        // *between* tokens — never inside a string, literal, enum, or before
+        // the root value. Treating it as an unconditional no-op let a greedy
+        // (temp=0) decoder loop on JSON-legal whitespace forever instead of
+        // emitting the value, so we no-op it only where the spec actually
+        // permits it:
+        let ws_noop = match &self.leaf {
+            // Inside a string, literal, or enum trie: whitespace is never an
+            // insignificant separator. String whitespace is content (handled by
+            // `step_instr`); a literal/enum can't contain mid-token whitespace.
+            // Reject it (don't skip) so the trie advances and a greedy decoder
+            // can't loop.
+            Some(Leaf::InStr { .. } | Leaf::InLit { .. }) => false,
+            // Value-start: leading whitespace before an *interior* value is
+            // valid JSON (`: <ws> value`), but before the *root* value it is a
+            // pointless no-op a greedy decoder loops on, so reject it there.
+            Some(Leaf::Start(_)) => !self.stack.is_empty(),
+            // Inside a number, trailing whitespace closes it (below); structural
+            // whitespace between tokens inside a container is insignificant.
+            Some(Leaf::InNum { .. }) | None => true,
+        };
+        if ws_noop && WS.contains(&byte) {
             if let Some(Leaf::InNum { seen_digit, .. }) = &self.leaf {
                 if *seen_digit {
                     self.close_leaf();
@@ -765,7 +784,11 @@ impl SchemaGrammar {
                     });
                     Ok(())
                 }
-                0 => Err(()),
+                // Raw C0 control bytes (incl. tab / newline / CR) are illegal
+                // inside a JSON string — they must be escaped. Rejecting them
+                // also stops a greedy decoder from looping on raw whitespace
+                // inside a free-form string value.
+                0..=0x1f => Err(()),
                 _ => {
                     self.leaf = Some(Leaf::InStr {
                         escape: false,

@@ -539,6 +539,102 @@ fn scalar_root_enum_immediate_engage() {
     assert!(m2[2], "EOS must be allowed when grammar is done/clamped");
 }
 
+/// Regression: leading whitespace before the root value must NOT be allowed.
+/// JSON permits it, but treating WS as a no-op let a greedy (temp=0) decoder
+/// loop on JSON-legal whitespace forever instead of emitting the value —
+/// scalar/enum roots were the worst case. The mask must allow `"` but reject
+/// whitespace-only tokens.
+#[test]
+fn scalar_root_rejects_leading_whitespace() {
+    // Vocab: 0=`"` 1=space 2=newline 3=`  ` 4=`"small"` 5=EOS(empty)
+    let bm = synthetic_bm(&[b"\"", b" ", b"\n", b"  ", b"\"small\"", b""]);
+    let n = node(&json!({"type":"string","enum":["small","large"]}), false);
+    let mut c = SchemaConstraint::from_parts(bm, vec![5], n, None);
+    let (quote, space, newline, dbl_space, quoted_val) = {
+        let m = c.step_mask(6);
+        (m[0], m[1], m[2], m[3], m[4])
+    };
+    assert!(c.engaged, "Immediate policy engages at first step_mask");
+    assert!(quote, "`\"` must be allowed at root value-start");
+    assert!(
+        quoted_val,
+        "`\"small\"` must be allowed at root value-start"
+    );
+    assert!(!space, "single space must NOT be allowed (would loop)");
+    assert!(!newline, "newline must NOT be allowed");
+    assert!(!dbl_space, "double-space must NOT be allowed");
+}
+
+/// The root-whitespace rejection must NOT affect interior whitespace: a
+/// pretty-printed object must still validate end-to-end.
+#[test]
+fn object_root_allows_interior_whitespace() {
+    let n = node(
+        &json!({"type":"object","properties":{"k":{"type":"string"}},"required":["k"],"additionalProperties":false}),
+        true,
+    );
+    let mut g = SchemaGrammar::new(n);
+    feed(&mut g, "{\n  \"k\": \"v\"\n}").expect("pretty-printed object must validate");
+    assert!(g.is_done(), "object must complete");
+}
+
+/// Step a clone of `g` by one byte. A failed `step` leaves the real grammar's
+/// `leaf` taken, so probing several candidate bytes from one state needs a
+/// fresh clone each time.
+fn probe_byte(g: &SchemaGrammar, b: u8) -> Result<(), ()> {
+    let mut c = g.clone();
+    c.step(b)
+}
+
+/// Regression: whitespace *inside* an enum/literal must be rejected, not
+/// skipped. After the opening `"` the grammar is mid-literal; treating a
+/// newline there as a no-op let a greedy decoder loop on `"\n\n…` forever.
+#[test]
+fn enum_literal_rejects_interior_whitespace() {
+    let n = node(&json!({"type":"string","enum":["small","large"]}), false);
+    let mut base = SchemaGrammar::new(n);
+    base.step(b'"')
+        .expect("opening quote starts the enum literal");
+    assert!(
+        probe_byte(&base, b'\n').is_err(),
+        "newline mid-literal rejected"
+    );
+    assert!(
+        probe_byte(&base, b' ').is_err(),
+        "space mid-literal rejected"
+    );
+    assert!(
+        probe_byte(&base, b's').is_ok(),
+        "`s` advances toward \"small\""
+    );
+}
+
+/// Regression: a raw (unescaped) control char inside a string is illegal JSON
+/// and must be rejected — this also stops the whitespace loop for free-form
+/// `type:string` values. Printable bytes (incl. space) stay valid content.
+#[test]
+fn free_string_rejects_raw_control_chars() {
+    let n = node(&json!({"type":"string"}), false);
+    let mut base = SchemaGrammar::new(n);
+    base.step(b'"').expect("opening quote starts the string");
+    assert!(
+        probe_byte(&base, b'\n').is_err(),
+        "raw newline rejected in string"
+    );
+    assert!(
+        probe_byte(&base, b'\t').is_err(),
+        "raw tab rejected in string"
+    );
+    assert!(
+        probe_byte(&base, b'a').is_ok(),
+        "ordinary char is valid content"
+    );
+    assert!(
+        probe_byte(&base, b' ').is_ok(),
+        "space (0x20) is valid content"
+    );
+}
+
 /// scalar-root integer: the constraint must engage immediately and the
 /// grammar must reject `.` (integer forbids decimal point).
 #[test]
