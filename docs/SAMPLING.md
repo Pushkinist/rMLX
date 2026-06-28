@@ -377,11 +377,23 @@ and applied before softmax.
 decode loop skips `step_mask()` and uses the unconstrained fast path for
 that step.
 
-**JSON engine.** `constraint_json::JsonObjectConstraint` /
-`JsonSchemaConstraint` implement `ConstraintEngine`. Construction decodes
-every token in the vocabulary once (approximately 600 ms for a 152K-token
-vocabulary — one-time cost, hidden behind TTFT). Per-step mask build is
-O(vocab) byte-set membership, approximately 1 ms on Qwen3.6.
+**JSON engine.** `constraint_json::JsonObjectConstraint` (free-form
+`json_object`) and `constraint_json::SchemaConstraint` (`json_schema`)
+implement `ConstraintEngine`. Construction decodes every token in the
+vocabulary once (approximately 600 ms for a 152K-token vocabulary — one-time
+cost, hidden behind TTFT). Per-step mask build is an O(vocab) byte-set
+membership sweep: for each candidate token a shared scratch grammar is reset
+to the current state and the token's bytes are fed through it. The reset is
+the per-token cost driver, so both engines keep their grammar's *immutable*
+part cheap to copy — `JsonObjectConstraint` uses `Copy` frames, and
+`SchemaConstraint` holds the parsed schema (property lists, element schemas,
+literal-alternative sets) behind `Arc` and refills only the tiny mutable
+progress (`emitted` keys, trie `viable`/`pos`, phase) in place. A reset is
+therefore a handful of refcount bumps plus small buffer refills rather than a
+deep copy of the schema subtree. The free-form engine is ~1 ms/step on
+Qwen3.6; schema masking is heavier (the residual is the O(vocab) sweep and
+the literal-trie step-work, not the grammar copy) but no longer pays a
+per-token schema deep-clone.
 
 EOS tokens are naturally masked out mid-JSON (special tokens decode to empty
 or zero first byte; the state machine never allows byte value 0). At

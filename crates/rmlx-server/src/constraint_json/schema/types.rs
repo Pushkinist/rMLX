@@ -4,6 +4,8 @@
 
 #![allow(unreachable_pub)]
 
+use std::sync::Arc;
+
 use serde_json::Value;
 
 /// Error returned when the supplied `response_format.json_schema.schema`
@@ -77,6 +79,16 @@ pub enum EngagePolicy {
 ///
 /// Adapted from llama.cpp `SchemaConverter::visit` keyword dispatch order:
 /// `$ref` → `oneOf`/`anyOf` → `const` → `enum` → object → array → scalar.
+///
+/// The immutable sub-schema fields (`props` and each property value-schema,
+/// `required`, array `items`, union branches) are held behind `Arc` so the
+/// schema tree is *shared*, not deep-copied. The per-token allow-mask probe
+/// resets a scratch grammar once per candidate token (~152K per decode step)
+/// and, on a value-start byte, enters a property/branch sub-schema; with each
+/// sub-schema behind `Arc` both the reset and the value-entry are refcount
+/// bumps rather than a recursive clone of the property list / element schema /
+/// branch. `Arc` (not `Rc`) because the constraint engine is driven from a
+/// `Send` decode loop.
 #[allow(
     clippy::exhaustive_enums,
     reason = "closed schema-AST enum — variants are the complete supported JSON-Schema keyword subset; adding a variant requires updating the compiler, SchemaGrammar, and all SchemaNode match arms"
@@ -88,16 +100,18 @@ pub enum SchemaNode {
     /// extra free-form keys when `true`.
     Object {
         /// Ordered list of `(name, schema)` pairs for declared properties.
-        props: Vec<(String, SchemaNode)>,
+        /// Each value-schema is pre-wrapped in `Arc` so entering a property
+        /// value (in `step_object`) is a refcount bump, not a deep clone.
+        props: Arc<[(String, Arc<SchemaNode>)]>,
         /// Names of properties that must appear in the output object.
-        required: Vec<String>,
+        required: Arc<[String]>,
         /// When `true`, additional properties beyond `props` are permitted.
         additional: bool,
     },
     /// `type:array` with homogeneous `items`.
     Array {
         /// Schema applied to every element of the array.
-        items: Box<SchemaNode>,
+        items: Arc<SchemaNode>,
         /// Minimum number of array elements (`minItems`); `None` = unconstrained.
         min: Option<usize>,
         /// Maximum number of array elements (`maxItems`); `None` = unconstrained.
@@ -119,8 +133,10 @@ pub enum SchemaNode {
     Null,
     /// `const` (or a non-string `enum` member): an exact JSON literal.
     Const(Value),
-    /// `oneOf`/`anyOf` union of branches.
-    Union(Vec<SchemaNode>),
+    /// `oneOf`/`anyOf` union of branches. Each branch is pre-wrapped in
+    /// `Arc` so entering a structural branch value is a refcount bump, not a
+    /// deep clone.
+    Union(Arc<[Arc<SchemaNode>]>),
     /// Unsupported keyword fallback: any JSON value of any type.
     Any,
 }
