@@ -78,10 +78,10 @@ pub(super) fn literal_bytes(v: &Value) -> Vec<u8> {
     clippy::wildcard_enum_match_arm,
     reason = "wildcard arm is the correct fallthrough for unsupported arch/quant/error variants"
 )]
-pub(super) fn union_literals(branches: &[SchemaNode]) -> Option<Vec<Vec<u8>>> {
+pub(super) fn union_literals(branches: &[Arc<SchemaNode>]) -> Option<Vec<Vec<u8>>> {
     let mut out = Vec::new();
     for b in branches {
-        match b {
+        match b.as_ref() {
             SchemaNode::Const(v) => out.push(literal_bytes(v)),
             SchemaNode::Str {
                 enum_: Some(lits), ..
@@ -239,7 +239,7 @@ enum Frame {
     /// `node_props` / `required` are the immutable schema (shared via `Arc`);
     /// `emitted` / `phase` are the mutable progress.
     Object {
-        node_props: Arc<[(String, SchemaNode)]>,
+        node_props: Arc<[(String, Arc<SchemaNode>)]>,
         required: Arc<[String]>,
         additional: bool,
         emitted: Vec<String>,
@@ -634,8 +634,8 @@ impl SchemaGrammar {
                 }
             }
             SchemaNode::Union(branches) => {
-                for br in branches {
-                    self.value_starters(br, out);
+                for br in branches.iter() {
+                    self.value_starters(br.as_ref(), out);
                 }
             }
             SchemaNode::Any => {
@@ -678,7 +678,7 @@ impl SchemaGrammar {
     )]
     fn object_allowed(
         &self,
-        node_props: &[(String, SchemaNode)],
+        node_props: &[(String, Arc<SchemaNode>)],
         required: &[String],
         additional: bool,
         emitted: &[String],
@@ -975,19 +975,21 @@ impl SchemaGrammar {
                     return Ok(());
                 }
                 // Structural union: pick the first branch whose starter set
-                // accepts `byte` (v1 limitation: no full backtracking).
-                let mut chosen: Option<SchemaNode> = None;
-                for br in branches {
+                // accepts `byte` (v1 limitation: no full backtracking). The
+                // branch sub-schema is already `Arc`-wrapped, so entering it
+                // is a refcount bump, not a deep clone.
+                let mut chosen: Option<Arc<SchemaNode>> = None;
+                for br in branches.iter() {
                     let mut s = [false; 256];
-                    self.value_starters(br, &mut s);
+                    self.value_starters(br.as_ref(), &mut s);
                     if s[byte as usize] {
-                        chosen = Some(br.clone());
+                        chosen = Some(Arc::clone(br));
                         break;
                     }
                 }
                 match chosen {
                     Some(n) => {
-                        self.leaf = Some(Leaf::Start(Arc::new(n)));
+                        self.leaf = Some(Leaf::Start(n));
                         self.step(byte)
                     }
                     None => Err(()),
@@ -1303,10 +1305,13 @@ impl SchemaGrammar {
                 if byte != b':' {
                     return Err(());
                 }
+                // A schema'd property's value-schema is already `Arc`-wrapped,
+                // so entering it is a refcount bump. A free additional key
+                // (`which == None`) falls back to `Any`.
                 let value_node = which
-                    .and_then(|i| props.get(i).map(|(_, n)| n.clone()))
-                    .unwrap_or(SchemaNode::Any);
-                self.leaf = Some(Leaf::Start(Arc::new(value_node)));
+                    .and_then(|i| props.get(i).map(|(_, n)| Arc::clone(n)))
+                    .unwrap_or_else(|| Arc::new(SchemaNode::Any));
+                self.leaf = Some(Leaf::Start(value_node));
                 if let Some(Frame::Object { phase, .. }) = self.stack.last_mut() {
                     *phase = ObjPhase::AfterValue;
                 }

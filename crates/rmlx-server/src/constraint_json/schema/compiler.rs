@@ -47,7 +47,7 @@ impl SchemaNode {
             // A union is scalar when every branch is scalar (e.g. all-const
             // or all-string-enum). If any branch is a container, treat as
             // non-scalar (ValueStarter is safe for containers).
-            SchemaNode::Union(branches) => branches.iter().all(SchemaNode::is_scalar_root),
+            SchemaNode::Union(branches) => branches.iter().all(|b| b.is_scalar_root()),
             SchemaNode::Object { .. } | SchemaNode::Array { .. } | SchemaNode::Any => false,
         }
     }
@@ -162,11 +162,11 @@ impl SchemaNode {
             if arr.is_empty() {
                 return Err(SchemaError::EmptyUnion);
             }
-            let mut branches = Vec::with_capacity(arr.len());
+            let mut branches: Vec<Arc<SchemaNode>> = Vec::with_capacity(arr.len());
             for a in arr {
-                branches.push(Self::parse_node(a, strict, defs, depth + 1)?);
+                branches.push(Arc::new(Self::parse_node(a, strict, defs, depth + 1)?));
             }
-            return Ok(SchemaNode::Union(branches));
+            return Ok(SchemaNode::Union(Arc::from(branches)));
         }
 
         // `const`.
@@ -188,9 +188,11 @@ impl SchemaNode {
                     .collect();
                 return Ok(SchemaNode::Str { enum_: Some(lits) });
             }
-            return Ok(SchemaNode::Union(
-                arr.iter().map(|v| SchemaNode::Const(v.clone())).collect(),
-            ));
+            return Ok(SchemaNode::Union(Arc::from(
+                arr.iter()
+                    .map(|v| Arc::new(SchemaNode::Const(v.clone())))
+                    .collect::<Vec<_>>(),
+            )));
         }
 
         // unsupported scalar-narrowing keywords. In strict mode these are a
@@ -261,7 +263,7 @@ impl SchemaNode {
         defs: &serde_json::Map<String, Value>,
         depth: usize,
     ) -> Result<SchemaNode, SchemaError> {
-        let mut props: Vec<(String, SchemaNode)> = Vec::new();
+        let mut props: Vec<(String, Arc<SchemaNode>)> = Vec::new();
         if let Some(p) = obj.get("properties") {
             let pmap = p
                 .as_object()
@@ -269,7 +271,7 @@ impl SchemaNode {
             for (k, v) in pmap {
                 props.push((
                     k.clone(),
-                    SchemaNode::parse_node(v, strict, defs, depth + 1)?,
+                    Arc::new(SchemaNode::parse_node(v, strict, defs, depth + 1)?),
                 ));
             }
         }

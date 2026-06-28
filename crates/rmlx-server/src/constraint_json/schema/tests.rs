@@ -750,20 +750,20 @@ fn is_scalar_root_classification() {
     assert!(SchemaNode::Null.is_scalar_root());
     assert!(SchemaNode::Const(json!("hello")).is_scalar_root());
     // Union of scalars → scalar
-    assert!(SchemaNode::Union(vec![
-        SchemaNode::Const(json!("a")),
-        SchemaNode::Const(json!("b")),
-    ])
+    assert!(SchemaNode::Union(Arc::from([
+        Arc::new(SchemaNode::Const(json!("a"))),
+        Arc::new(SchemaNode::Const(json!("b"))),
+    ]))
     .is_scalar_root());
     // Union with container → not scalar
-    assert!(!SchemaNode::Union(vec![
-        SchemaNode::Const(json!("a")),
-        SchemaNode::Object {
+    assert!(!SchemaNode::Union(Arc::from([
+        Arc::new(SchemaNode::Const(json!("a"))),
+        Arc::new(SchemaNode::Object {
             props: Arc::from([]),
             required: Arc::from([]),
             additional: false
-        },
-    ])
+        }),
+    ]))
     .is_scalar_root());
     assert!(!SchemaNode::Object {
         props: Arc::from([]),
@@ -938,6 +938,83 @@ fn reset_from_matches_fresh_clone() {
                 "reset_from allowed_bytes mismatch at prefix {prefix:?}"
             );
         }
+    }
+}
+
+/// `reset_from` must also restore the scratch when its dirtied state has a
+/// **deeper** stack than `src` (exercising `reset_stack`'s truncate path) or a
+/// **differently-shaped frame at the same depth** (exercising the
+/// `Frame::reset_from` `*dst = src.clone()` variant-mismatch fallback). The
+/// single-byte dirtying in `reset_from_matches_fresh_clone` does not reliably
+/// reach those branches, so drive the scratch with a multi-byte prefix into a
+/// nested / different-variant container before resetting.
+#[test]
+fn reset_from_cross_shape_paths() {
+    use super::super::ProbeGrammar;
+
+    // Schema with both an object-valued and an array-valued property so the
+    // depth-1 container frame can be `Object` *or* `Array` depending on which
+    // property the decoder entered.
+    let root = node(
+        &json!({
+            "type":"object",
+            "properties":{
+                "obj":{
+                    "type":"object",
+                    "properties":{"x":{"type":"string"}},
+                    "required":["x"],
+                    "additionalProperties":false
+                },
+                "arr":{"type":"array","items":{"type":"string"}}
+            },
+            "required":["obj","arr"],
+            "additionalProperties":false
+        }),
+        true,
+    );
+
+    // (base prefix, scratch prefix). The scratch prefix drives a DEEPER or
+    // DIFFERENTLY-SHAPED state than the base before the reset.
+    let cases: &[(&str, &str)] = &[
+        // (a) truncate path: base at depth 1 (`{`), scratch pushed to depth 2
+        //     by opening the nested array, plus a string leaf inside it.
+        ("{", "{\"arr\":[\""),
+        // (a) truncate path, the other container shape: scratch enters the
+        //     nested object (depth 2) and starts a key.
+        ("{", "{\"obj\":{\""),
+        // (b) variant mismatch at depth 1: base entered the array property
+        //     (depth-1 frame = Array), scratch entered the object property
+        //     (depth-1 frame = Object). reset_from must replace the Object
+        //     frame with the Array frame via the clone() fallback.
+        ("{\"arr\":[", "{\"obj\":{"),
+        // (b) the reverse variant mismatch: base = Object frame at depth 1,
+        //     scratch = Array frame at depth 1.
+        ("{\"obj\":{", "{\"arr\":["),
+    ];
+
+    for (base_prefix, scratch_prefix) in cases {
+        let mut base = SchemaGrammar::new(root.clone());
+        feed(&mut base, base_prefix).expect("base prefix valid");
+        let fresh = base.clone();
+        let expect = format!("{fresh:?}");
+        let expect_allowed = fresh.allowed_bytes();
+
+        // Drive the scratch into the divergent (deeper / different-variant)
+        // shape, then reset it back toward `base`.
+        let mut scratch = SchemaGrammar::new(root.clone());
+        feed(&mut scratch, scratch_prefix).expect("scratch prefix valid");
+        scratch.reset_from(&base);
+
+        assert_eq!(
+            format!("{scratch:?}"),
+            expect,
+            "reset_from must restore base (base={base_prefix:?}, scratch was {scratch_prefix:?})"
+        );
+        assert_eq!(
+            scratch.allowed_bytes(),
+            expect_allowed,
+            "reset_from allowed_bytes mismatch (base={base_prefix:?}, scratch was {scratch_prefix:?})"
+        );
     }
 }
 
