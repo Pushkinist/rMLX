@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-06-28
+
+Constrained-decode hot-path and Gemma4-unified vision tuning. The `json_schema`
+and `json_object` per-token allow-mask probes no longer deep-clone their grammar
+across the ~152K-token vocab on every decode step, and a whitespace stall in
+schema-constrained decode is fixed. Gemma4-unified gains a per-request image-token
+budget. No breaking changes.
+
+### Added
+
+- **Per-request + CLI image-token budget for Gemma4-unified vision.** A
+  `image_max_tokens` request field (and matching CLI flag) caps soft image
+  tokens per request; default 280, ceiling 1120. Lets callers trade vision
+  fidelity for prefill cost on the unified any-to-any path. (#181, closes #180)
+
+### Fixed
+
+- **Schema-constrained decode whitespace loop.** Under `response_format:
+  json_schema`, enum / scalar leaves accepted insignificant whitespace in
+  states where it must be rejected (inside a literal, inside a string, at the
+  root scalar start), letting temp=0 decode loop on `\n`. The allow-mask now
+  matches whitespace per-leaf-state and rejects raw control chars (`0x00..=0x1f`)
+  inside strings. (#183)
+
+### Performance
+
+- **`json_schema` constrained decode no longer deep-clones the schema per
+  vocab token.** The allow-mask probe reset a scratch `SchemaGrammar` ~152K
+  times per decode step, deep-copying the immutable parsed schema each reset.
+  The schema is now held behind `Arc` (`Object.props`, `Union`, `Array.items`),
+  so entering a container/property/union branch is a refcount bump and the
+  per-token reset reuses buffers in place. Per-step cost on the production path
+  drops ~8–25× (was 20–40× heavier than the `json_object` engine; now
+  comparable). Tool / function-calling agents pay this directly. (#184,
+  closes #182)
+- **`json_object` constrained decode allow-mask reset is scratch-reused.** The
+  `JsonGrammar` reset became a state copy + `Vec` clear/extend (the stack frame
+  is `Copy`) instead of a fresh clone per vocab token — ~2× on the per-step
+  probe. The two engines now share one `fill_allow_mask` kernel over a
+  `ProbeGrammar` trait. (#183)
+
 ## [0.2.6] - 2026-06-24
 
 f32-KV-leak class hardening. The `--kv-quant none` KV cache no longer widens to
@@ -533,7 +574,8 @@ inference + conversion backend for Apple Silicon — no Python at runtime.
 - Speculative drafters validated against their verifiers: Qwen 3.6 MTP sidecar
   and the Gemma 4 assistant drafter.
 
-[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.2.6...HEAD
+[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.2.7...HEAD
+[0.2.7]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.7
 [0.2.6]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.6
 [0.2.5]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.5
 [0.2.4]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.4
