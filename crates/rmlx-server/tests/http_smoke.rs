@@ -67,6 +67,7 @@ fn not_ready_state(registry: ModelRegistry) -> AppState {
         require_smoke_probe: false,
         default_temperature: None,
         default_enable_thinking: None,
+        default_image_max_tokens: None,
         tokens_in: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         tokens_out: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         error_counts: ApiErrorCounters::new(),
@@ -192,6 +193,7 @@ async fn start_server_with_gemma4(gen: ArchGenerator) -> u16 {
         require_smoke_probe: false,
         default_temperature: None,
         default_enable_thinking: None,
+        default_image_max_tokens: None,
         tokens_in: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         tokens_out: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         error_counts: ApiErrorCounters::new(),
@@ -647,6 +649,7 @@ async fn real_generation_openai_chat_completions() {
             mm_cache: None,
             calibration: None,
             yarn: None,
+            image_max_tokens: None,
         },
         Arc::new(parking_lot::Mutex::new(())),
     )
@@ -702,6 +705,7 @@ async fn real_generation_anthropic_messages() {
             mm_cache: None,
             calibration: None,
             yarn: None,
+            image_max_tokens: None,
         },
         Arc::new(parking_lot::Mutex::new(())),
     )
@@ -1028,6 +1032,7 @@ async fn start_timeout_test_server(max_timeout_secs: u64) -> u16 {
         require_smoke_probe: false,
         default_temperature: None,
         default_enable_thinking: None,
+        default_image_max_tokens: None,
         tokens_in: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         tokens_out: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         error_counts: ApiErrorCounters::new(),
@@ -1284,6 +1289,7 @@ async fn h3_non_streaming_usage_triple_exact() {
             mm_cache: None,
             calibration: None,
             yarn: None,
+            image_max_tokens: None,
         },
         Arc::new(parking_lot::Mutex::new(())),
     )
@@ -1362,6 +1368,7 @@ async fn h4_streaming_include_usage_true_emits_usage_chunk() {
             mm_cache: None,
             calibration: None,
             yarn: None,
+            image_max_tokens: None,
         },
         Arc::new(parking_lot::Mutex::new(())),
     )
@@ -1449,6 +1456,7 @@ async fn h4_streaming_include_usage_false_no_usage_in_stream() {
             mm_cache: None,
             calibration: None,
             yarn: None,
+            image_max_tokens: None,
         },
         Arc::new(parking_lot::Mutex::new(())),
     )

@@ -633,6 +633,10 @@ pub(crate) fn run_serve(
     // Runtime YARN RoPE override for Qwen3 models that lack rope_scaling.
     // None = no override (default).
     yarn_override: Option<rmlx_models::qwen3::YarnOverride>,
+    // Server-startup default image-token budget for Gemma4-unified vision
+    // (--image-max-tokens). None = use the snapshot's processor_config.json
+    // max_soft_tokens. A per-request image_max_tokens field overrides this.
+    image_max_tokens: Option<usize>,
     sink: &EventRecorder,
 ) -> anyhow::Result<()> {
     // A11: bridge CLI flags into env before any OnceLock consumers run.
@@ -867,6 +871,8 @@ pub(crate) fn run_serve(
         calibration: None,
         // YARN override — propagated from --yarn-factor / --yarn-original-max.
         yarn: yarn_override,
+        // Server-startup image-token budget default (--image-max-tokens).
+        image_max_tokens,
     };
     let draft_path: Option<std::path::PathBuf> = draft_model.map(Path::to_path_buf);
     // capture draft_kind + draft_block_size for the loader closure.
@@ -1105,6 +1111,8 @@ pub(crate) fn run_serve(
             default_temperature,
             // --enable-thinking (None = absent = thinking enabled by template default).
             default_enable_thinking: enable_thinking,
+            // --image-max-tokens (None = absent = use snapshot processor_config default).
+            default_image_max_tokens: image_max_tokens,
             // Process-lifetime cumulative token counters (prompt + completion).
             tokens_in: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             tokens_out: Arc::new(std::sync::atomic::AtomicU64::new(0)),

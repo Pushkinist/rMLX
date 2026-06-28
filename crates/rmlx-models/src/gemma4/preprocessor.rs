@@ -57,6 +57,31 @@ use std::path::Path;
 
 use rmlx_core::error::{Error, Result};
 
+/// Largest image-token budget the Gemma4 processor will honour for an
+/// override. Mirrors the upstream `_SUPPORTED_SOFT_TOKENS = (70, 140, 280,
+/// 560, 1120)` ceiling in `transformers`/`mlx_vlm` `processing_gemma4`: the
+/// reference processor only accepts a `max_soft_tokens` from that set, with
+/// `1120` the maximum. A caller-supplied budget override is clamped to this
+/// value so a request can never size the resize target beyond what the
+/// reference vision front-end was validated for. The lower bound is `1`
+/// (a zero budget would degenerate the resize).
+pub const MAX_SUPPORTED_SOFT_TOKENS: usize = 1120;
+
+/// Resolve the effective image-token budget for one preprocess call.
+///
+/// Precedence is `override > config default`: when `override_tokens` is
+/// `Some(n)` the budget is `n` clamped to `[1, MAX_SUPPORTED_SOFT_TOKENS]`;
+/// when `None` the model's configured `config_default` (the snapshot's
+/// `processor_config.json` `max_soft_tokens`, typically 280) is used
+/// unchanged. The result is itself clamped to the safe upper bound so a
+/// stale config default can never exceed the validated ceiling either.
+#[inline]
+pub fn resolve_max_soft_tokens(override_tokens: Option<usize>, config_default: usize) -> usize {
+    override_tokens
+        .unwrap_or(config_default)
+        .clamp(1, MAX_SUPPORTED_SOFT_TOKENS)
+}
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -363,6 +388,22 @@ impl Gemma4ImageProcessor {
     /// Borrow the config (for callers that need patch_size / soft-token info).
     pub fn config(&self) -> &Gemma4ImageProcessorConfig {
         &self.cfg
+    }
+
+    /// Clone this processor with `max_soft_tokens` replaced by `n` (clamped to
+    /// the safe upper bound via [`resolve_max_soft_tokens`]).
+    ///
+    /// Used to apply a per-request image-token budget override without
+    /// mutating the shared, load-time processor. A larger budget raises
+    /// `max_patches`, so the aspect-ratio resize keeps more pixels and the
+    /// resulting [`Gemma4PixelValues::num_soft_tokens`] grows for the same
+    /// image. The resize math already caps the per-side length, so no extra
+    /// guard is needed beyond the budget clamp.
+    #[must_use]
+    pub fn with_max_soft_tokens(&self, n: usize) -> Self {
+        let mut cfg = self.cfg.clone();
+        cfg.max_soft_tokens = resolve_max_soft_tokens(Some(n), self.cfg.max_soft_tokens);
+        Self::new(cfg)
     }
 }
 

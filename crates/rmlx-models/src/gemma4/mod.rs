@@ -51,8 +51,8 @@ pub(crate) use layers::build_proportional_rope_freqs;
 pub use loader::{load_from_path, load_from_path_paro, probe_forward};
 pub use model::Gemma4Text;
 pub use preprocessor::{
-    aspect_ratio_preserving_resize, Gemma4ImageProcessor, Gemma4ImageProcessorConfig,
-    Gemma4PixelValues,
+    aspect_ratio_preserving_resize, resolve_max_soft_tokens, Gemma4ImageProcessor,
+    Gemma4ImageProcessorConfig, Gemma4PixelValues, MAX_SUPPORTED_SOFT_TOKENS,
 };
 pub use prompt_cache::read_cache_stats as gemma4_cache_stats;
 pub use prompt_cache::read_kv_cache_bytes as gemma4_kv_cache_bytes;

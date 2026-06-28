@@ -241,6 +241,20 @@ pub(crate) async fn chat_completions(
             "chat_completions: per-request KV-config override (issue #26)"
         );
     }
+    // per-request image-token budget. Reject a zero budget with a clean 400;
+    // the preprocessor clamps the upper bound. Resolution order (request >
+    // `--image-max-tokens` server default > snapshot config) is completed in
+    // the generator. `None` here keeps the server default.
+    if let Some(n) = req.image_max_tokens {
+        if n == 0 {
+            state.error_counts.increment(ApiErrorCategory::BadRequest);
+            return bad_request("image_max_tokens must be > 0");
+        }
+    }
+    let req_image_max_tokens: Option<usize> = req
+        .image_max_tokens
+        .map(|n| n as usize)
+        .or(state.default_image_max_tokens);
     // logprobs / top_logprobs validation (OpenAI semantics).
     // - `top_logprobs` requires `logprobs:true` (else 400).
     // - `top_logprobs` must be in 0..=20.
@@ -972,6 +986,8 @@ pub(crate) async fn chat_completions(
         // multimodal content-part extraction.
         images: req_images,
         audio_b64: req_audio_b64,
+        // per-request image-token budget (request > server default).
+        image_max_tokens: req_image_max_tokens,
     };
 
     // Ensure the requested model is loaded (auto-swap if needed).

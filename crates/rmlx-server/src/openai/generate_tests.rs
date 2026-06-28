@@ -103,6 +103,7 @@ fn minimal_request(model_id: &str) -> GenerationRequest {
         max_ctx_override: None,
         images: vec![],
         audio_b64: vec![],
+        image_max_tokens: None,
     }
 }
 

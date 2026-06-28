@@ -210,6 +210,81 @@ fn gemma4_preprocessor_solid_color_rescale() {
     }
 }
 
+// ---- image-token budget override --------------------------------------
+
+/// `resolve_max_soft_tokens`: precedence + clamp.
+#[test]
+fn resolve_budget_precedence_and_clamp() {
+    // None → config default, unchanged (when default within bounds).
+    assert_eq!(resolve_max_soft_tokens(None, 280), 280);
+    // Some(n) within bounds → n (override wins over config default).
+    assert_eq!(resolve_max_soft_tokens(Some(560), 280), 560);
+    // Override above the safe upper bound is clamped.
+    assert_eq!(
+        resolve_max_soft_tokens(Some(100_000), 280),
+        MAX_SUPPORTED_SOFT_TOKENS
+    );
+    assert_eq!(resolve_max_soft_tokens(Some(1120), 280), 1120);
+    // Zero override is clamped up to 1 (never degenerate the resize).
+    assert_eq!(resolve_max_soft_tokens(Some(0), 280), 1);
+    // A stale config default above the ceiling is also clamped when used.
+    assert_eq!(
+        resolve_max_soft_tokens(None, 100_000),
+        MAX_SUPPORTED_SOFT_TOKENS
+    );
+}
+
+/// `with_max_soft_tokens`: produces a processor whose config carries the
+/// clamped override; the shared processor is left untouched.
+#[test]
+fn with_max_soft_tokens_replaces_budget() {
+    let proc = Gemma4ImageProcessor::with_defaults();
+    assert_eq!(proc.config().max_soft_tokens, 280);
+
+    let raised = proc.with_max_soft_tokens(560);
+    assert_eq!(raised.config().max_soft_tokens, 560);
+    // Source processor unchanged.
+    assert_eq!(proc.config().max_soft_tokens, 280);
+
+    // Above-ceiling override clamps.
+    let clamped = proc.with_max_soft_tokens(5000);
+    assert_eq!(clamped.config().max_soft_tokens, MAX_SUPPORTED_SOFT_TOKENS);
+}
+
+/// A raised budget must yield MORE soft tokens for the same image — the core
+/// budget-override invariant. The resize keeps more pixels under a larger
+/// `max_patches`, so `num_soft_tokens` strictly increases (the image here is
+/// large enough that the default budget is the binding constraint).
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn raised_budget_increases_soft_tokens() {
+    // 2000×1500 source: comfortably above the 280-token budget's resize target.
+    let (h, w) = (1500usize, 2000usize);
+
+    let soft_for = |max_soft: usize| -> usize {
+        let cfg = Gemma4ImageProcessorConfig {
+            max_soft_tokens: max_soft,
+            ..Gemma4ImageProcessorConfig::default()
+        };
+        let (th, tw) = aspect_ratio_preserving_resize(h, w, &cfg).unwrap();
+        (th / cfg.patch_size) * (tw / cfg.patch_size)
+            / (cfg.pooling_kernel_size * cfg.pooling_kernel_size)
+    };
+
+    let soft_default = soft_for(280);
+    let soft_raised = soft_for(1120);
+    assert!(
+        soft_raised > soft_default,
+        "raised budget must yield more soft tokens: default={soft_default} raised={soft_raised}"
+    );
+    // Each stays within its own budget (resize never exceeds max_soft_tokens).
+    assert!(soft_default <= 280, "default soft={soft_default} > 280");
+    assert!(soft_raised <= 1120, "raised soft={soft_raised} > 1120");
+}
+
 /// Verify config parsing from a JSON object matching the e4b snapshot layout.
 #[test]
 fn config_parses_image_processor_block() {

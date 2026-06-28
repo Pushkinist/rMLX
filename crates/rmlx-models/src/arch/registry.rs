@@ -10,9 +10,11 @@
 /// for that early check.
 pub const KNOWN_ARCHS: &[&str] = &[
     "Gemma4ForConditionalGeneration",
-    // 12B unified variant — text decoder is identical to Gemma4ForConditionalGeneration;
-    // extra multimodal-embedder tensors (embed_vision, embed_audio, vision_embedder.*)
-    // are not read by the text loader and are inert. Text only; vision/audio out of scope.
+    // 12B unified variant — text decoder is identical to Gemma4ForConditionalGeneration.
+    // The multimodal-embedder tensors (embed_vision, embed_audio, vision_embedder.*)
+    // drive the encoder-free vision and audio front-ends wired in the gemma4::vision
+    // and gemma4::audio unified paths (is_unified_arch, VisionBundle::Gemma4Unified,
+    // build_unified_inputs_embeds). Vision + audio input are fully supported.
     "Gemma4UnifiedForConditionalGeneration",
     "Gemma3ForConditionalGeneration",
     "Qwen2ForCausalLM",
