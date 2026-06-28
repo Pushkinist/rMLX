@@ -235,37 +235,37 @@ impl ConstraintEngine for SchemaConstraint {
             return &self.mask;
         }
 
-        let n = self.bytes_map.vocab_size().min(vocab_size);
-        let mut allowed_count = 0usize;
-        let mut byte60_allowed_ids: Vec<usize> = Vec::new();
-        for id in 0..n {
-            let bytes = self.bytes_map.token_bytes(id);
-            if bytes.is_empty() {
-                continue;
-            }
-            let mut g = self.grammar.clone();
-            let mut ok = true;
-            for &b in bytes {
-                if g.step(b).is_err() {
-                    ok = false;
-                    break;
-                }
-            }
-            if ok {
-                self.mask[id] = true;
-                allowed_count += 1;
-                if bytes.first() == Some(&60) {
-                    byte60_allowed_ids.push(id);
-                }
-            }
-        }
-        tracing::debug!(
-            allowed_count,
-            byte60_allowed = byte60_allowed_ids.len(),
-            byte60_examples = ?&byte60_allowed_ids[..byte60_allowed_ids.len().min(5)],
-            grammar_done = self.grammar.done,
-            "SchemaConstraint::step_mask result"
+        // O(vocab) probe shared with the json_object engine via
+        // `fill_allow_mask`; `scratch` is a throwaway grammar reused across
+        // tokens. For `SchemaGrammar` each reset is a deep clone (heavy frames),
+        // so this engine does not yet gain the json_object engine's
+        // allocation-free fast path — see `SchemaGrammar::reset_from`.
+        let mut scratch = self.grammar.clone();
+        super::super::fill_allow_mask(
+            &self.grammar,
+            &mut scratch,
+            &self.bytes_map,
+            vocab_size,
+            &mut self.mask,
         );
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let allowed_count = self.mask.iter().filter(|&&b| b).count();
+            let n = self.bytes_map.vocab_size().min(vocab_size);
+            let byte60_allowed_ids: Vec<usize> = (0..n)
+                .filter(|&id| {
+                    self.mask.get(id) == Some(&true)
+                        && self.bytes_map.token_bytes(id).first() == Some(&60)
+                })
+                .take(5)
+                .collect();
+            tracing::debug!(
+                allowed_count,
+                byte60_allowed = byte60_allowed_ids.len(),
+                byte60_examples = ?byte60_allowed_ids,
+                grammar_done = self.grammar.done,
+                "SchemaConstraint::step_mask result"
+            );
+        }
         &self.mask
     }
 

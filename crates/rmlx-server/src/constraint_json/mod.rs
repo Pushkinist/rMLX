@@ -609,6 +609,76 @@ impl TokenBytesMap {
     }
 }
 
+// ────────────────── shared allow-mask probe ──────────────────────────────────
+
+/// A grammar the shared allow-mask probe can drive: cheaply reset to a
+/// reference state, then fed one byte at a time. Implemented by both the
+/// free-form [`JsonGrammar`] and the schema-driven `SchemaGrammar` so the
+/// O(vocab) mask sweep — the hot loop of every constrained decode step — lives
+/// in one place instead of being duplicated per engine.
+pub(crate) trait ProbeGrammar {
+    /// Overwrite `self` with `src`'s state, reusing `self`'s own buffers where
+    /// the frame type allows (no per-call allocation for a `Copy` frame stack).
+    fn reset_from(&mut self, src: &Self);
+
+    /// Advance one byte. `Err(())` means the byte is illegal at the current
+    /// position; the caller stops feeding that candidate token.
+    fn feed(&mut self, byte: u8) -> Result<(), ()>;
+}
+
+impl ProbeGrammar for JsonGrammar {
+    fn reset_from(&mut self, src: &Self) {
+        // `state` is `Copy`; `Frame` is `Copy`, so refilling the stack is a
+        // memcpy into the reused buffer — no per-token allocation.
+        self.state = src.state;
+        self.stack.clear();
+        self.stack.extend_from_slice(&src.stack);
+    }
+
+    fn feed(&mut self, byte: u8) -> Result<(), ()> {
+        self.step(byte)
+    }
+}
+
+/// Fill `mask` (length `vocab_size`) with the per-token allow bits by feeding
+/// each token's decoded bytes through `grammar`'s current state. `scratch` is a
+/// throwaway grammar reused across tokens so the probe allocates at most once
+/// per decode step (when the frame type is `Copy`) instead of once per token.
+///
+/// Cost on a ~152K vocab is ~1–3 ms per decode step on the constrained path:
+/// most tokens are rejected on their first byte, so the average probe is far
+/// shorter than a full token and the once-assumed "~1M ops" never materializes.
+/// The dominant remaining term is the O(vocab) sweep itself, which only a
+/// per-state feasible-token index would remove.
+pub(crate) fn fill_allow_mask<G: ProbeGrammar>(
+    grammar: &G,
+    scratch: &mut G,
+    bytes_map: &TokenBytesMap,
+    vocab_size: usize,
+    mask: &mut [bool],
+) {
+    let n = bytes_map.vocab_size().min(vocab_size);
+    for id in 0..n {
+        let bytes = bytes_map.token_bytes(id);
+        if bytes.is_empty() {
+            continue; // specials decode to "" → never allowed mid-grammar
+        }
+        scratch.reset_from(grammar);
+        let mut ok = true;
+        for &b in bytes {
+            if scratch.feed(b).is_err() {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            if let Some(m) = mask.get_mut(id) {
+                *m = true;
+            }
+        }
+    }
+}
+
 // ────────────────── ConstraintEngine impl ────────────────────────────────────
 
 /// `ConstraintEngine` for `response_format: json_object`. Holds the
@@ -787,29 +857,19 @@ impl ConstraintEngine for JsonObjectConstraint {
             }
             return &self.mask;
         }
-        // Per-step correctness: a candidate token is allowed only if ALL
-        // its bytes pass through a clone of the current grammar. This is
-        // the cost of stateful grammars; ~248K * avg_token_len ~ 1M
-        // simple ops per decode step on Qwen3.6 → ~5–20 ms per step,
-        // entirely on the constrained path.
-        let n = self.bytes_map.vocab_size.min(vocab_size);
-        for id in 0..n {
-            let bytes = self.bytes_map.token_bytes(id);
-            if bytes.is_empty() {
-                continue; // specials decode to "" → never allowed mid-grammar
-            }
-            let mut g = self.grammar.clone();
-            let mut ok = true;
-            for &b in bytes {
-                if g.step(b).is_err() {
-                    ok = false;
-                    break;
-                }
-            }
-            if ok {
-                self.mask[id] = true;
-            }
-        }
+        // Per-step correctness: a candidate token is allowed only if ALL its
+        // bytes feed cleanly through the current grammar. The O(vocab) probe is
+        // shared with the schema engine via `fill_allow_mask`; `scratch` is a
+        // throwaway grammar reused across tokens so the sweep allocates at most
+        // once per decode step (see the helper for the cost model).
+        let mut scratch = self.grammar.clone();
+        fill_allow_mask(
+            &self.grammar,
+            &mut scratch,
+            &self.bytes_map,
+            vocab_size,
+            &mut self.mask,
+        );
         &self.mask
     }
 

@@ -305,6 +305,21 @@ pub struct SchemaGrammar {
     pub(super) done: bool,
 }
 
+impl super::super::ProbeGrammar for SchemaGrammar {
+    fn reset_from(&mut self, src: &Self) {
+        // `Frame` / `Leaf` own schema subtrees (heavy `Clone`), so refilling the
+        // stack element-by-element would deep-clone each frame anyway — no
+        // cheaper than a full clone. `clone_from` at least reuses the outer
+        // buffers; making the probe allocation-free here would need the schema
+        // held behind `Arc`, which is tracked separately.
+        self.clone_from(src);
+    }
+
+    fn feed(&mut self, byte: u8) -> Result<(), ()> {
+        self.step(byte)
+    }
+}
+
 impl SchemaGrammar {
     /// Create a new grammar that will enforce the given `root` schema node.
     pub fn new(root: SchemaNode) -> Self {
