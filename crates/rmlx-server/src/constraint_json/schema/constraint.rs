@@ -237,9 +237,10 @@ impl ConstraintEngine for SchemaConstraint {
 
         // O(vocab) probe shared with the json_object engine via
         // `fill_allow_mask`; `scratch` is a throwaway grammar reused across
-        // tokens. For `SchemaGrammar` each reset is a deep clone (heavy frames),
-        // so this engine does not yet gain the json_object engine's
-        // allocation-free fast path — see `SchemaGrammar::reset_from`.
+        // tokens. The parsed schema inside `SchemaGrammar` is `Arc`-shared, so
+        // the per-token reset is a few refcount bumps plus a buffer-reusing
+        // refill of the small mutable progress — not a schema deep-copy. See
+        // `SchemaGrammar::reset_from`.
         let mut scratch = self.grammar.clone();
         super::super::fill_allow_mask(
             &self.grammar,
