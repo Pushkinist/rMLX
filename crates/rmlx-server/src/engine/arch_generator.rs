@@ -106,6 +106,12 @@ pub struct ArchGenerator {
     /// caching for this generator (e.g. unit-test stubs); production passes
     /// the `AppState.mm_cache` clone via `ModelLoadConfig`.
     mm_cache: Option<Arc<rmlx_models::multimodal_cache::MultimodalCache>>,
+    /// Server-startup default image-token budget for Gemma4-unified vision
+    /// (`--image-max-tokens`). `None` = use the snapshot's
+    /// `processor_config.json` `max_soft_tokens`. A per-request
+    /// `image_max_tokens` field takes precedence over this. A no-op for
+    /// text-only / non-Gemma4 generators.
+    image_max_tokens: Option<usize>,
 }
 
 impl std::fmt::Debug for ArchGenerator {
@@ -460,6 +466,7 @@ impl ArchGenerator {
             vision,
             audio,
             mm_cache: load_cfg.mm_cache.clone(),
+            image_max_tokens: load_cfg.image_max_tokens,
         })
     }
 
@@ -545,6 +552,10 @@ impl Generator for ArchGenerator {
         // `req_images` is empty for text-only requests (zero extra work).
         let req_images = req.images.clone();
         let vision = self.vision.clone();
+        // image-token budget override: request value wins over the
+        // server-startup `--image-max-tokens` default. `None` falls through to
+        // the snapshot's `processor_config.json` budget inside build_image_prompt.
+        let image_max_tokens = req.image_max_tokens.or(self.image_max_tokens);
         // base64 `input_audio` clips + the loaded audio bundle (clone of the Arc).
         // `req_audio` is empty for non-audio requests (zero extra work).
         let req_audio = req.audio_b64.clone();
@@ -971,6 +982,7 @@ impl Generator for ArchGenerator {
                             device,
                             mm_cache.as_deref(),
                             model_sig,
+                            image_max_tokens,
                         ) {
                             Ok(triple) => Some(triple),
                             Err(e) => {

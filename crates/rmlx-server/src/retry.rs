@@ -258,6 +258,8 @@ pub struct RequestPlan {
     pub kv_quant_override: Option<rmlx_kv_quant::KvQuant>,
     /// Issue #26: per-request max-ctx ceiling override (`None` = launch default).
     pub max_ctx_override: Option<i32>,
+    /// Per-request image-token budget override (`None` = launch default).
+    pub image_max_tokens: Option<usize>,
 }
 
 impl RequestPlan {
@@ -294,6 +296,7 @@ impl RequestPlan {
             audio_b64: req.audio_b64.clone(),
             kv_quant_override: req.kv_quant_override,
             max_ctx_override: req.max_ctx_override,
+            image_max_tokens: req.image_max_tokens,
         }
     }
 
@@ -342,6 +345,7 @@ impl RequestPlan {
             audio_b64: self.audio_b64.clone(),
             kv_quant_override: self.kv_quant_override,
             max_ctx_override: self.max_ctx_override,
+            image_max_tokens: self.image_max_tokens,
         }
     }
 }

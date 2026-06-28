@@ -137,6 +137,11 @@ pub struct ModelLoadConfig {
     /// pre-flag behaviour). Set via `--yarn-factor` / `--yarn-original-max`
     /// CLI flags on `rmlx serve` / `rmlx baseline`.
     pub yarn: Option<rmlx_models::qwen3::YarnOverride>,
+    /// Server-startup default image-token budget for Gemma4-unified vision
+    /// (`--image-max-tokens`). `None` = use the snapshot's
+    /// `processor_config.json` `max_soft_tokens` (typically 280). A per-request
+    /// `image_max_tokens` field overrides this. A no-op for non-vision models.
+    pub image_max_tokens: Option<usize>,
 }
 
 // ── A6.1: route-agnostic response-format normalisation ───────────────────────
@@ -430,6 +435,15 @@ pub struct GenerationRequest {
     /// Base64-encoded audio from `input_audio` content parts.
     /// Empty for text-only requests.
     pub audio_b64: Vec<String>,
+
+    /// Per-request image-token budget override for Gemma4-unified vision.
+    /// `Some(n)` raises the soft-token budget for dense images (e.g. tables)
+    /// so more vision resolution is preserved; clamped to the model's safe
+    /// upper bound by the preprocessor. Resolved request > `--image-max-tokens`
+    /// CLI flag; `None` falls through to the generator's launch default (CLI
+    /// flag or the snapshot's `processor_config.json` `max_soft_tokens`). A
+    /// no-op for non-vision requests and non-Gemma4 archs.
+    pub image_max_tokens: Option<usize>,
 }
 
 /// C5 Slice A: RAII admission guard moved into [`GenerationRequest`].

@@ -70,6 +70,34 @@ pub(crate) fn splice_image_block(
     aug
 }
 
+/// Resolve the Gemma4 image processor for one request, applying an optional
+/// per-request image-token budget override.
+///
+/// When `image_max_tokens` is `Some(n)`, returns an owned processor clone with
+/// `max_soft_tokens` set to `n` (clamped to the model's safe upper bound by
+/// [`rmlx_models::gemma4::Gemma4ImageProcessor::with_max_soft_tokens`]). When
+/// `None`, borrows the shared load-time processor unchanged — no allocation,
+/// byte-identical to the pre-override behaviour. Used by both Gemma4 families
+/// (tower + unified), which share the same preprocessor.
+fn resolve_gemma4_processor(
+    processor: &rmlx_models::gemma4::Gemma4ImageProcessor,
+    image_max_tokens: Option<usize>,
+) -> std::borrow::Cow<'_, rmlx_models::gemma4::Gemma4ImageProcessor> {
+    match image_max_tokens {
+        Some(n) => {
+            let p = processor.with_max_soft_tokens(n);
+            tracing::info!(
+                requested_max_tokens = n,
+                effective_max_soft_tokens = p.config().max_soft_tokens,
+                config_default = processor.config().max_soft_tokens,
+                "image_max_tokens override active (clamped to model safe bound)"
+            );
+            std::borrow::Cow::Owned(p)
+        }
+        None => std::borrow::Cow::Borrowed(processor),
+    }
+}
+
 /// bundle of the multimodal components needed to turn image bytes
 /// into scattered `inputs_embeds`. Loaded once per model. One variant per
 /// vision-capable architecture (Gemma4's custom SigLIP, Gemma3's standard SigLIP).
@@ -124,6 +152,7 @@ pub(crate) fn build_image_prompt(
     device: rmlx_mlx::Device,
     mm_cache: Option<&rmlx_models::multimodal_cache::MultimodalCache>,
     model_sig: u64,
+    image_max_tokens: Option<usize>,
 ) -> rmlx_core::Result<(Vec<u32>, rmlx_mlx::Array, rmlx_mlx::Array)> {
     match vb {
         VisionBundle::Gemma4 {
@@ -135,6 +164,11 @@ pub(crate) fn build_image_prompt(
                 Error::Other("image input requires the Gemma4 architecture".to_owned())
             })?;
             let image_token_id = rmlx_models::gemma4::IMAGE_TOKEN_ID;
+
+            // Apply the per-request image-token budget override when present;
+            // otherwise reuse the shared load-time processor (zero alloc).
+            let processor = resolve_gemma4_processor(processor, image_max_tokens);
+            let processor = processor.as_ref();
 
             let mut pixels = Vec::with_capacity(sources.len());
             for (i, src) in sources.iter().enumerate() {
@@ -189,6 +223,11 @@ pub(crate) fn build_image_prompt(
                 Error::Other("image input requires the Gemma4 architecture".to_owned())
             })?;
             let image_token_id = rmlx_models::gemma4::IMAGE_TOKEN_ID;
+
+            // Apply the per-request image-token budget override when present;
+            // otherwise reuse the shared load-time processor (zero alloc).
+            let processor = resolve_gemma4_processor(processor, image_max_tokens);
+            let processor = processor.as_ref();
 
             let mut pixels = Vec::with_capacity(sources.len());
             for (i, src) in sources.iter().enumerate() {

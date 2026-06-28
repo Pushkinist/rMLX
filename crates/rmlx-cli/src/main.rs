@@ -493,6 +493,18 @@ enum Cmd {
         /// an open `<think>` block byte-identical to HF `apply_chat_template`.
         #[arg(long, value_name = "BOOL")]
         enable_thinking: Option<bool>,
+        /// Server-startup default image-token budget for Gemma4-unified vision.
+        ///
+        /// Raises the soft-token budget the vision preprocessor allocates per
+        /// image, preserving more resolution for dense inputs (e.g. tables).
+        /// Clamped to the model's safe upper bound (1120). When absent
+        /// (default), the snapshot's `processor_config.json` `max_soft_tokens`
+        /// (typically 280) is used — behaviour unchanged.
+        ///
+        /// Precedence: per-request `image_max_tokens` > this > config default.
+        /// A no-op for text-only requests and non-Gemma4-unified vision archs.
+        #[arg(long, value_name = "N")]
+        image_max_tokens: Option<usize>,
         /// SSD prompt-cache tier budget, in GiB. GLOBAL ceiling over the
         /// active cache namespace's on-disk KV blocks.
         ///
@@ -1323,6 +1335,7 @@ fn main() -> Result<()> {
             max_queue_depth,
             default_temperature,
             enable_thinking,
+            image_max_tokens,
             kv_ssd_cache_gb,
             project,
             kv_ssd_global_gb,
@@ -1654,6 +1667,7 @@ fn main() -> Result<()> {
                 mm_cache_bytes,
                 session_cache_max_sessions,
                 yarn_override,
+                image_max_tokens,
                 &sink,
             )?;
         }

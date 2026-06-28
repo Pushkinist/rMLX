@@ -31,6 +31,7 @@ fn sample_req() -> GenerationRequest {
         max_ctx_override: None,
         images: vec![],
         audio_b64: vec![],
+        image_max_tokens: None,
     }
 }
 
@@ -252,6 +253,7 @@ async fn gemma4_generator_loads_and_model_id_matches_basename() {
             mm_cache: None,
             calibration: None,
             yarn: None,
+            image_max_tokens: None,
         },
         Arc::new(Mutex::new(())),
     )
