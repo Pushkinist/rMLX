@@ -880,3 +880,177 @@ fn object_root_none_override_keeps_value_starter() {
         "ValueStarter: must NOT engage on non-structural token"
     );
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// Perf probe: SchemaGrammar step_mask cost + the deep-clone fraction.
+//
+// SchemaGrammar frames own the schema subtree (heavy Clone), so the shared
+// fill_allow_mask probe clone_from's the whole grammar per token. This measures
+// total step_mask cost vs clone-only (the deep-copy tax an Arc-wrap of the
+// immutable schema would mostly remove) on a synthetic ~152K vocab, across
+// container states. Compare to the json_object probe (~1-3 ms/step).
+//
+// Run: cargo test -p rmlx-server constraint_json::schema::tests::probe_schema \
+//        --profile release-perf -- --ignored --nocapture
+// ───────────────────────────────────────────────────────────────────────────
+
+struct LcgS(u64);
+impl LcgS {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next_u64() % n
+    }
+}
+
+#[allow(
+    clippy::indexing_slicing,
+    reason = "letter index bounded by rng.below(letters.len())"
+)]
+fn realistic_vocab(n: usize) -> Arc<TokenBytesMap> {
+    let structural: &[&[u8]] = &[
+        b"{",
+        b"}",
+        b"[",
+        b"]",
+        b"\"",
+        b":",
+        b",",
+        b" ",
+        b"\n",
+        b"\t",
+        b"0",
+        b"1",
+        b"2",
+        b"-",
+        b"true",
+        b"false",
+        b"null",
+        b"\"name\"",
+        b"\"color\"",
+        b"\"size\"",
+        b"small",
+        b"medium",
+    ];
+    let mut owned: Vec<Vec<u8>> = structural.iter().map(|s| s.to_vec()).collect();
+    let mut rng = LcgS(0x1234_5678_9abc_def0);
+    let letters = b"abcdefghijklmnopqrstuvwxyz";
+    while owned.len() < n {
+        let len = match rng.below(100) {
+            0..=14 => 1,
+            15..=39 => 2,
+            40..=64 => 4,
+            65..=84 => 6,
+            _ => 9,
+        };
+        let mut t: Vec<u8> = Vec::with_capacity(len + 1);
+        match rng.below(100) {
+            0..=19 => t.push(b' '),
+            20..=24 => t.push(b'"'),
+            _ => {}
+        }
+        for _ in 0..len {
+            let idx = rng.below(letters.len() as u64) as usize;
+            t.push(letters[idx]);
+        }
+        owned.push(t);
+    }
+    owned.truncate(n);
+    let refs: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+    synthetic_bm(&refs)
+}
+
+#[test]
+#[ignore = "perf probe — run manually with --ignored --nocapture"]
+fn probe_schema_step_mask_cost() {
+    let vocab_n = 152_064usize;
+    let bm = realistic_vocab(vocab_n);
+    let n = bm.vocab_size();
+    let reps = 30u32;
+
+    // A realistic strict object: 6 properties incl. an enum. Frames on the
+    // stack carry these property schemas → the deep-clone tax.
+    let root = node(
+        &json!({
+            "type":"object",
+            "properties":{
+                "name":{"type":"string"},"color":{"type":"string"},
+                "size":{"type":"string","enum":["small","medium","large"]},
+                "count":{"type":"integer"},"ripe":{"type":"boolean"},
+                "origin":{"type":"string"}
+            },
+            "required":["name","color","size","count","ripe","origin"],
+            "additionalProperties":false
+        }),
+        true,
+    );
+
+    // (label, valid JSON prefix → reaches the probed grammar state)
+    let scenes: &[(&str, &str)] = &[
+        ("obj ExpectKey (6 props)", "{"),
+        ("in string value", "{\"name\":\""),
+        (
+            "enum value-start (InLit)",
+            "{\"name\":\"a\",\"color\":\"b\",\"size\":\"",
+        ),
+    ];
+
+    println!("\nvocab={n}  reps={reps}  (per decode step = total/reps)\n");
+    println!(
+        "{:<32} {:>10} {:>12} {:>9}",
+        "grammar state", "total_ms", "cloneOnly_ms", "clone%"
+    );
+    println!("{}", "-".repeat(66));
+
+    for (label, prefix) in scenes {
+        let mut base = SchemaGrammar::new(root.clone());
+        feed(&mut base, prefix).expect("prefix must be valid for the schema");
+        let mut mask = vec![false; n];
+
+        // A) clone-per-token + step (current fill_allow_mask behaviour).
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            mask.fill(false);
+            for (id, m) in mask.iter_mut().enumerate() {
+                let bytes = bm.token_bytes(id);
+                if bytes.is_empty() {
+                    continue;
+                }
+                let mut g = base.clone();
+                let mut ok = true;
+                for &b in bytes {
+                    if g.step(b).is_err() {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    *m = true;
+                }
+            }
+        }
+        let total_ms = t0.elapsed().as_secs_f64() * 1e3 / f64::from(reps);
+
+        // B) clone-only — the deep-copy tax (no stepping).
+        let t1 = std::time::Instant::now();
+        for _ in 0..reps {
+            for id in 0..n {
+                if bm.token_bytes(id).is_empty() {
+                    continue;
+                }
+                let g = base.clone();
+                std::hint::black_box(&g);
+            }
+        }
+        let clone_ms = t1.elapsed().as_secs_f64() * 1e3 / f64::from(reps);
+
+        let pct = clone_ms / total_ms.max(1e-9) * 100.0;
+        println!("{label:<32} {total_ms:>10.3} {clone_ms:>12.3} {pct:>8.1}%");
+    }
+    println!();
+}
