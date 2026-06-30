@@ -37,7 +37,7 @@ pub struct Qwen3_5MoeConfig {
     pub tie_word_embeddings: bool,
     /// Period at which a full-attention layer replaces a GatedDeltaNet layer.
     pub full_attention_interval: usize,
-    /// Total number of MoE experts per layer.
+    /// Total number of MoE experts per layer. 0 marks a dense checkpoint.
     pub num_experts: usize,
     /// Number of experts selected per token.
     pub num_experts_per_tok: usize,
@@ -127,10 +127,22 @@ impl Qwen3_5MoeConfig {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         let full_attention_interval = opt_u64!("full_attention_interval", 4);
-        let num_experts = req_u64!("num_experts");
-        let num_experts_per_tok = req_u64!("num_experts_per_tok");
-        let moe_intermediate_size = req_u64!("moe_intermediate_size");
-        let shared_expert_intermediate_size = req_u64!("shared_expert_intermediate_size");
+        // MoE-specific fields are optional: dense Qwen3.5 checkpoints
+        // (`Qwen3_5ForConditionalGeneration` with a plain SwiGLU MLP) omit them.
+        // `num_experts == 0` is the canonical "dense, no experts" marker the
+        // loader keys its per-layer MLP detection on. The dense FFN width
+        // (`intermediate_size`) is the fallback for the MoE widths so a dense
+        // config still yields a sane value.
+        let num_experts = opt_u64!("num_experts", 0);
+        let num_experts_per_tok = opt_u64!("num_experts_per_tok", 1);
+        let moe_intermediate_size = opt_u64!(
+            "moe_intermediate_size",
+            opt_u64!("intermediate_size", 0) as u64
+        );
+        let shared_expert_intermediate_size = opt_u64!(
+            "shared_expert_intermediate_size",
+            opt_u64!("intermediate_size", 0) as u64
+        );
         let norm_topk_prob = e
             .get("norm_topk_prob")
             .and_then(serde_json::Value::as_bool)
@@ -246,3 +258,7 @@ pub(super) fn extract_quant(
     }
     (gs, bits, mode, overrides)
 }
+
+#[cfg(test)]
+#[path = "config_tests.rs"]
+mod config_tests;
