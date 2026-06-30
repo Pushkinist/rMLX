@@ -377,8 +377,13 @@ fn scan_only_works_without_index() {
 /// Dense-vs-MoE MLP detection is the per-layer tensor fact the Qwen3.5 loader
 /// keys on: a sparse MoE layer carries `mlp.switch_mlp.gate_proj.weight`; a
 /// dense SwiGLU layer carries `mlp.{gate,up,down}_proj.weight` directly with no
-/// `switch_mlp` router. This mirrors the loader's `has(...switch_mlp...)` probe
-/// so a regression in the witness name fails here, host-side, with no Metal.
+/// `switch_mlp` router.
+///
+/// This asserts on `Weights::has` only — it MIRRORS the witness names the
+/// loader probes, it does not EXERCISE `build_mlp` itself. The real branch is
+/// driven end-to-end in `qwen3_5_moe/loader_tests.rs`, which calls `build_mlp`
+/// and asserts the returned `MlpBlock` variant. This case stays as a focused
+/// `Weights` regression guard at the load_util layer.
 #[test]
 #[allow(
     clippy::unwrap_used,

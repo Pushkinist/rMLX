@@ -128,6 +128,15 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
     // MLX-community layouts use `language_model.model.<...>`, other exporters use
     // `model.language_model.<...>`. The embedding table is the witness leaf every
     // layout carries.
+    //
+    // Assumption: the witness (`embed_tokens.weight`) is reachable in a shard
+    // opened by the index-driven `ShardSet::open` above. `resolve_prefix` →
+    // `has` header-scans only the opened shards. A future checkpoint that omits
+    // the witness from `model.safetensors.index.json` yet ships it in an
+    // unopened shard header would hard-error here despite the tensor existing —
+    // the index/header divergence `ShardSet::open_dir` defends against. Latent:
+    // embeddings are always indexed today (the existing `lm_head` probe below
+    // shares this assumption). Pair with `open_dir` if that ever changes.
     let pfx = w.resolve_prefix(
         &["language_model.model", "model.language_model"],
         "embed_tokens.weight",
@@ -327,6 +336,10 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
     })
 }
 
+#[cfg(test)]
+#[path = "loader_tests.rs"]
+mod loader_tests;
+
 // ---------------------------------------------------------------------------
 // load_from_path_paro — PARO dense checkpoint
 // ---------------------------------------------------------------------------
@@ -475,6 +488,25 @@ pub fn load_from_path_paro(model_dir: &Path) -> Result<Qwen3_5MoeText> {
     };
 
     let pfx = "model.language_model";
+
+    // Defense-in-depth: the PARO loader forces `num_experts = 0` and builds
+    // dense MLPs only. A PARO checkpoint that nonetheless ships MoE expert
+    // tensors would silently mis-load as dense, dropping every expert. No such
+    // checkpoint is known, but probe for the MoE witnesses (the sparse router's
+    // `switch_mlp` expert and the always-on `shared_expert`) and hard-error if
+    // present, rather than load wrong. Tensor-presence based, not arch-name
+    // based, so it survives any future PARO MoE layout.
+    for moe_witness in [
+        &format!("{pfx}.layers.0.mlp.switch_mlp.gate_proj.weight"),
+        &format!("{pfx}.layers.0.mlp.shared_expert.gate_proj.weight"),
+    ] {
+        if w.has(moe_witness)? {
+            return Err(Error::Loader(format!(
+                "PARO loader: checkpoint carries MoE expert tensor '{moe_witness}' but the \
+                 PARO path builds dense MLPs only — a PARO MoE checkpoint is not supported"
+            )));
+        }
+    }
 
     let embed_tokens = {
         let (weight, scales, biases) =

@@ -24,7 +24,7 @@ fn parse(json: &str) -> Qwen3_5MoeConfig {
 }
 
 /// Dense Qwen3.5 mxfp8 (ornith-style): no MoE fields. `num_experts == 0`,
-/// `intermediate_size` carried, `moe_intermediate_size` falls back to it.
+/// `moe_intermediate_size` falls back to the dense `intermediate_size`.
 #[test]
 fn dense_config_parses_with_zero_experts() {
     let json = r#"{
@@ -54,7 +54,6 @@ fn dense_config_parses_with_zero_experts() {
         cfg.num_experts, 0,
         "dense checkpoint reports zero experts — the loader's dense marker"
     );
-    assert_eq!(cfg.intermediate_size, 1024);
     assert_eq!(
         cfg.moe_intermediate_size, 1024,
         "moe_intermediate_size falls back to dense intermediate_size when absent"

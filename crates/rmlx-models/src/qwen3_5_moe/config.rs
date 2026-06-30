@@ -37,9 +37,6 @@ pub struct Qwen3_5MoeConfig {
     pub tie_word_embeddings: bool,
     /// Period at which a full-attention layer replaces a GatedDeltaNet layer.
     pub full_attention_interval: usize,
-    /// Dense SwiGLU FFN intermediate dimension. Used by the dense MLP variant
-    /// (`Qwen3_5ForConditionalGeneration`); 0 for pure-MoE checkpoints.
-    pub intermediate_size: usize,
     /// Total number of MoE experts per layer. 0 marks a dense checkpoint.
     pub num_experts: usize,
     /// Number of experts selected per token.
@@ -133,15 +130,19 @@ impl Qwen3_5MoeConfig {
         // MoE-specific fields are optional: dense Qwen3.5 checkpoints
         // (`Qwen3_5ForConditionalGeneration` with a plain SwiGLU MLP) omit them.
         // `num_experts == 0` is the canonical "dense, no experts" marker the
-        // loader keys its per-layer MLP detection on. `intermediate_size` is the
-        // dense FFN width; `moe_intermediate_size` falls back to it so a dense
+        // loader keys its per-layer MLP detection on. The dense FFN width
+        // (`intermediate_size`) is the fallback for the MoE widths so a dense
         // config still yields a sane value.
         let num_experts = opt_u64!("num_experts", 0);
         let num_experts_per_tok = opt_u64!("num_experts_per_tok", 1);
-        let intermediate_size = opt_u64!("intermediate_size", 0);
-        let moe_intermediate_size = opt_u64!("moe_intermediate_size", intermediate_size as u64);
-        let shared_expert_intermediate_size =
-            opt_u64!("shared_expert_intermediate_size", intermediate_size as u64);
+        let moe_intermediate_size = opt_u64!(
+            "moe_intermediate_size",
+            opt_u64!("intermediate_size", 0) as u64
+        );
+        let shared_expert_intermediate_size = opt_u64!(
+            "shared_expert_intermediate_size",
+            opt_u64!("intermediate_size", 0) as u64
+        );
         let norm_topk_prob = e
             .get("norm_topk_prob")
             .and_then(serde_json::Value::as_bool)
@@ -186,7 +187,6 @@ impl Qwen3_5MoeConfig {
             rms_norm_eps,
             tie_word_embeddings,
             full_attention_interval,
-            intermediate_size,
             num_experts,
             num_experts_per_tok,
             moe_intermediate_size,
