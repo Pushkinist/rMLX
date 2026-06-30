@@ -26,7 +26,9 @@ use rmlx_quant::awq::{f16_bits_to_f32, f32_to_f16_bits};
 use tracing::info;
 
 use crate::layers::{resolve_quant, QuantParams};
-use crate::load_util::{bf16_param, load_paro_parts, quantize_embedding_int4, Weights};
+use crate::load_util::{
+    bf16_param, bf16_scales, load_paro_parts, quantize_embedding_int4, Weights,
+};
 
 use super::attention::FullAttention;
 use super::config::Qwen3_5MoeConfig;
@@ -90,7 +92,11 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
                 mode,
             } => Ok(Linear::Quantized {
                 weight,
-                scales: bf16_param(scales)?,
+                // mxfp8/mxfp4 ship uint8 E8M0 scales the dequant kernel
+                // requires verbatim; only float (affine) scales get the
+                // bf16 uniformity cast. `biases` is always float (affine) or
+                // None (mxfp8), so the plain `bf16_param` is correct there.
+                scales: bf16_scales(scales)?,
                 biases: biases.map(bf16_param).transpose()?,
                 group_size,
                 bits,
@@ -129,7 +135,10 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
                 mode,
             } => Embedding::Quantized {
                 weight,
-                scales: bf16_param(scales)?,
+                // Same per-tensor scale-dtype gate as `lin`: uint8 E8M0
+                // (mxfp8/mxfp4) scales pass through, float (affine) scales
+                // get the bf16 uniformity cast.
+                scales: bf16_scales(scales)?,
                 biases: biases.map(bf16_param).transpose()?,
                 group_size,
                 bits,

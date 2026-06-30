@@ -94,6 +94,14 @@ No Infinity in OCP E4M3 FN profile.
 Dequant: w = e4m3_decode(element_byte) × e8m0_decode(scale_byte)
 ```
 
+**Loader scale-dtype contract.** The E8M0 scale byte is an exponent, not a
+float — MLX `dequantize`/`quantized_matmul` reject any scale dtype other than
+`uint8` for the `mxfp8`/`mxfp4` modes. Loaders must keep mxfp8/mxfp4 `.scales`
+at their on-disk `uint8` dtype; the float-uniformity cast that lifts fp16 affine
+scales to bf16 (`load_util::bf16_scales`) is gated on `scales.dtype()` and skips
+non-float scales. Casting an E8M0 scale to bf16 corrupts the exponent and crashes
+the dequant kernel at first prefill (`Scale type must be uint8`).
+
 Primary test target: `mlx-community__gemma-4-e4b-it-mxfp8`.
 
 Source: `crates/rmlx-quant/src/mxfp.rs`, `crates/rmlx-quant/src/fp8.rs`

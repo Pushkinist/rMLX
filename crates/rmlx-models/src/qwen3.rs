@@ -72,7 +72,7 @@ use crate::kv_cache::{
     kv_max_seq_and_ceiling, kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
 };
 use crate::layers::{resolve_quant, QuantParams};
-use crate::load_util::{bf16_param, Weights};
+use crate::load_util::{bf16_param, bf16_scales, Weights};
 use crate::prompt_cache::{
     chained_block_hashes_seeded, ArchPromptCache, Consumed, PromptCacheEntry, ReusePolicy,
     SsdHydrate, FNV_OFFSET,
@@ -2266,8 +2266,10 @@ pub fn load_from_path(model_dir: &Path, yarn_override: Option<&YarnOverride>) ->
                 // then carries F32 through Q/K/V, attention, and the `--kv-quant
                 // none` KV cache — doubling residency. mlx-lm casts every float
                 // weight to a single model dtype at load; force the scale/bias to
-                // BF16 here to match, so the projection output stays BF16.
-                scales: bf16_param(scales)?,
+                // BF16 here to match, so the projection output stays BF16. Only
+                // float scales are cast: mxfp8/mxfp4 ship uint8 E8M0 scales the
+                // dequant kernel requires verbatim (`bf16_scales` gates on dtype).
+                scales: bf16_scales(scales)?,
                 biases: biases.map(bf16_param).transpose()?,
                 group_size,
                 bits,
@@ -2312,8 +2314,9 @@ pub fn load_from_path(model_dir: &Path, yarn_override: Option<&YarnOverride>) ->
                 // snapshots that ship embedding scales at fp16 (e.g. Bonsai),
                 // that produces f32 logits; cast to bf16 at load to keep the
                 // output bf16 — consistent with `lin`'s treatment and
-                // mlx-lm's uniform model-dtype discipline.
-                scales: bf16_param(scales)?,
+                // mlx-lm's uniform model-dtype discipline. uint8 E8M0
+                // (mxfp8/mxfp4) scales pass through (`bf16_scales`).
+                scales: bf16_scales(scales)?,
                 biases: biases.map(bf16_param).transpose()?,
                 group_size,
                 bits,
