@@ -1924,7 +1924,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "rmlx-audio"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "miniz_oxide 0.9.1",
  "rmlx-core",
@@ -1942,7 +1942,7 @@ dependencies = [
 
 [[package]]
 name = "rmlx-cli"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1977,7 +1977,7 @@ dependencies = [
 
 [[package]]
 name = "rmlx-core"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "chrono",
  "libc",
@@ -1991,7 +1991,7 @@ dependencies = [
 
 [[package]]
 name = "rmlx-kv-quant"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "rmlx-core",
  "rmlx-mlx",
@@ -2001,7 +2001,7 @@ dependencies = [
 
 [[package]]
 name = "rmlx-kv-ssd"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "rmlx-core",
  "rmlx-kv-quant",
@@ -2017,7 +2017,7 @@ dependencies = [
 
 [[package]]
 name = "rmlx-loader"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "memmap2",
  "rayon",
@@ -2033,7 +2033,7 @@ dependencies = [
 
 [[package]]
 name = "rmlx-metrics"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "csv",
  "regex-lite",
@@ -2052,7 +2052,7 @@ dependencies = [
 
 [[package]]
 name = "rmlx-mlx"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "bindgen",
  "rmlx-core",
@@ -2064,7 +2064,7 @@ dependencies = [
 
 [[package]]
 name = "rmlx-models"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "criterion",
  "image",
@@ -2091,7 +2091,7 @@ dependencies = [
 
 [[package]]
 name = "rmlx-quant"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "criterion",
  "rmlx-core",
@@ -2102,7 +2102,7 @@ dependencies = [
 
 [[package]]
 name = "rmlx-runtime"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "rmlx-core",
  "rmlx-mlx",
@@ -2112,7 +2112,7 @@ dependencies = [
 
 [[package]]
 name = "rmlx-server"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "axum",
