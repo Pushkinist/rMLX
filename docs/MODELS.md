@@ -262,10 +262,26 @@ at temp=0.
 
 ---
 
-## Qwen3.5 MoE (`Qwen3_5MoeForConditionalGeneration`)
+## Qwen3.5 (`Qwen3_5MoeForConditionalGeneration` / `Qwen3_5ForConditionalGeneration`)
 
-Also handles `Qwen3_5ForConditionalGeneration` (PARO dense variant). Both route
-to `Architecture::Qwen3_5Moe`.
+One backbone, three checkpoint shapes — all route to `Architecture::Qwen3_5Moe`:
+
+- **Dense mxfp8 / affine** (`Qwen3_5ForConditionalGeneration`, e.g.
+  `ornith-1.0-9b-mxfp8`) — a plain SwiGLU MLP per layer.
+- **Sparse MoE mxfp8 / affine** (`Qwen3_5MoeForConditionalGeneration`, e.g.
+  `ornith-1.0-35b-mxfp8`, `Qwen3.6-35B-A3B`) — `switch_mlp` + `shared_expert` + router.
+- **PARO INT4 dense** (`Qwen3_5ForConditionalGeneration` with a
+  `quantization_config.quant_method == "paroquant"`).
+
+**Fact-driven dispatch.** The arch string alone does NOT determine the loader:
+PARO and plain dense checkpoints share `Qwen3_5ForConditionalGeneration`. The
+arch dispatch keys on the checkpoint itself — `is_paroquant()` selects the PARO
+loader, everything else the standard loader. The standard loader then resolves
+the tensor prefix (`language_model.model` vs `model.language_model`) by probing
+shard headers for the embedding witness, and selects each layer's MLP block
+(dense SwiGLU vs sparse MoE) by which tensors are present
+(`mlp.switch_mlp.*` → MoE; `mlp.{gate,up,down}_proj` → dense). `num_experts`
+defaults to 0 for dense configs that omit the MoE fields.
 
 ### Config schema
 
@@ -280,10 +296,11 @@ Config fields live under `text_config` in `config.json`.
 | `head_dim` | int | optional; derived from `hidden_size / num_attention_heads` if absent |
 | `vocab_size` | int | — |
 | `full_attention_interval` | int | FullAttention every N layers; GDN fills the rest (default 4) |
-| `num_experts` | int | total expert count |
-| `num_experts_per_tok` | int | experts activated per token |
-| `moe_intermediate_size` | int | per-expert FFN width |
-| `shared_expert_intermediate_size` | int | shared dense expert width |
+| `intermediate_size` | int | dense SwiGLU FFN width (dense checkpoints; optional, 0 on pure-MoE) |
+| `num_experts` | int | total expert count; optional, **0 marks a dense checkpoint** |
+| `num_experts_per_tok` | int | experts activated per token (optional, default 1) |
+| `moe_intermediate_size` | int | per-expert FFN width (optional; falls back to `intermediate_size`) |
+| `shared_expert_intermediate_size` | int | shared dense expert width (optional; falls back to `intermediate_size`) |
 | `norm_topk_prob` | bool | normalise top-k router probabilities |
 | `linear_num_value_heads` | int | GDN value head count |
 | `linear_num_key_heads` | int | GDN key head count |
@@ -299,8 +316,10 @@ Config fields live under `text_config` in `config.json`.
 
 **Hybrid FullAttention + GatedDeltaNet (GDN) stack.** The decoder is not a
 uniform transformer. Every `full_attention_interval`-th layer (default every 4th)
-is a standard FullAttention + MoE layer; the remaining layers are GatedDeltaNet
-(linear-attention recurrent) + MoE layers. This means:
+is a standard FullAttention layer; the remaining layers are GatedDeltaNet
+(linear-attention recurrent) layers. The MLP after each attention block is the
+same in both layer kinds — sparse MoE on MoE checkpoints, dense SwiGLU on dense
+checkpoints. This means:
 
 - `needs_lin_caches()` returns `true`. The server allocates a parallel
   `Vec<LinearAttnCache>` alongside the standard `Vec<KvCache>`. The GDN
@@ -309,8 +328,9 @@ is a standard FullAttention + MoE layer; the remaining layers are GatedDeltaNet
   snapshot/restore of this state followed by re-replay of the retained prefix.
 - GDN layers carry separate weight tensors (`linear_attn.*`) not present in
   Qwen2/Qwen3.
-- The model is sparse-MoE throughout; every layer dispatches through
-  `num_experts_per_tok` of `num_experts` experts.
+- MoE checkpoints dispatch every layer through `num_experts_per_tok` of
+  `num_experts` experts; dense checkpoints run a plain SwiGLU FFN
+  (`down(silu(gate(x)) * up(x))`) with no routing.
 
 **Thinking mode.** `supports_thinking()` returns `true` (same behaviour as
 Qwen3 dense).

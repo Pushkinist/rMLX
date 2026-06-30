@@ -236,6 +236,79 @@ fn corrupt_propagates_on_header_scan() {
     );
 }
 
+/// `resolve_prefix` picks the candidate whose `<prefix>.<witness>` tensor is
+/// present, in the candidate order given. Covers both real-world Qwen3.5
+/// layouts: MLX-community `language_model.model.*` and ParoQuant
+/// `model.language_model.*`. The witness is the embedding table.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: tempdir / ShardSet open failures should abort the test loudly"
+)]
+fn resolve_prefix_matches_present_layout() {
+    let candidates = ["language_model.model", "model.language_model"];
+    let witness = "embed_tokens.weight";
+
+    // Layout A: MLX-community ordering (ornith dense / MoE mxfp8).
+    {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(
+            dir.path(),
+            "s.safetensors",
+            &[("language_model.model.embed_tokens.weight", 4)],
+        );
+        let shards = ShardSet::open_dir(dir.path()).unwrap();
+        let w = Weights::scan_only(&shards);
+        assert_eq!(
+            w.resolve_prefix(&candidates, witness).unwrap(),
+            "language_model.model"
+        );
+    }
+
+    // Layout B: ParoQuant ordering — the SECOND candidate wins, proving the
+    // helper does not just return the first entry.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(
+            dir.path(),
+            "s.safetensors",
+            &[("model.language_model.embed_tokens.weight", 4)],
+        );
+        let shards = ShardSet::open_dir(dir.path()).unwrap();
+        let w = Weights::scan_only(&shards);
+        assert_eq!(
+            w.resolve_prefix(&candidates, witness).unwrap(),
+            "model.language_model"
+        );
+    }
+}
+
+/// `resolve_prefix` errors when no candidate carries the witness tensor — a
+/// clear signal of an unexpected layout, never a silent wrong-prefix that
+/// surfaces later as a confusing "tensor not found".
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: tempdir / ShardSet open failures should abort the test loudly"
+)]
+fn resolve_prefix_errors_when_no_candidate_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    write_shard(dir.path(), "s.safetensors", &[("some.other.tensor", 4)]);
+    let shards = ShardSet::open_dir(dir.path()).unwrap();
+    let w = Weights::scan_only(&shards);
+
+    let res = w.resolve_prefix(
+        &["language_model.model", "model.language_model"],
+        "embed_tokens.weight",
+    );
+    assert!(res.is_err(), "no matching prefix must be a hard error");
+    let msg = res.unwrap_err().to_string();
+    assert!(
+        msg.contains("resolve_prefix") && msg.contains("embed_tokens.weight"),
+        "error should name the helper and witness: {msg}"
+    );
+}
+
 /// `has()` is header-based and finds `.scales`/`.biases` siblings the index
 /// omits (the medgemma rule). The index lists only `.weight`; the shard header
 /// carries the siblings.
@@ -299,6 +372,71 @@ fn scan_only_works_without_index() {
     assert!(!w.has("attn.v_proj.weight").unwrap());
     // A truly-absent tensor is a hard error (not a silent miss).
     assert!(w.array("attn.v_proj.weight").is_err());
+}
+
+/// Dense-vs-MoE MLP detection is the per-layer tensor fact the Qwen3.5 loader
+/// keys on: a sparse MoE layer carries `mlp.switch_mlp.gate_proj.weight`; a
+/// dense SwiGLU layer carries `mlp.{gate,up,down}_proj.weight` directly with no
+/// `switch_mlp` router.
+///
+/// This asserts on `Weights::has` only — it MIRRORS the witness names the
+/// loader probes, it does not EXERCISE `build_mlp` itself. The real branch is
+/// driven end-to-end in `qwen3_5_moe/loader_tests.rs`, which calls `build_mlp`
+/// and asserts the returned `MlpBlock` variant. This case stays as a focused
+/// `Weights` regression guard at the load_util layer.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: tempdir / ShardSet open failures should abort the test loudly"
+)]
+fn dense_vs_moe_mlp_detection_by_tensors() {
+    let moe_witness = "mlp.switch_mlp.gate_proj.weight";
+
+    // MoE layout (ornith-35b / Qwen3.6-A3B): switch_mlp + shared_expert + router.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(
+            dir.path(),
+            "s.safetensors",
+            &[
+                ("mlp.gate.weight", 4),
+                ("mlp.switch_mlp.gate_proj.weight", 8),
+                ("mlp.switch_mlp.up_proj.weight", 8),
+                ("mlp.switch_mlp.down_proj.weight", 8),
+                ("mlp.shared_expert.gate_proj.weight", 8),
+            ],
+        );
+        let shards = ShardSet::open_dir(dir.path()).unwrap();
+        let w = Weights::scan_only(&shards);
+        assert!(
+            w.has(moe_witness).unwrap(),
+            "MoE layout must be detected as MoE (switch_mlp present)"
+        );
+    }
+
+    // Dense layout (ornith-9b mxfp8): plain gate/up/down, no switch_mlp router.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(
+            dir.path(),
+            "s.safetensors",
+            &[
+                ("mlp.gate_proj.weight", 8),
+                ("mlp.up_proj.weight", 8),
+                ("mlp.down_proj.weight", 8),
+            ],
+        );
+        let shards = ShardSet::open_dir(dir.path()).unwrap();
+        let w = Weights::scan_only(&shards);
+        assert!(
+            !w.has(moe_witness).unwrap(),
+            "dense layout must NOT be detected as MoE (no switch_mlp)"
+        );
+        // The dense block's own witnesses are present.
+        assert!(w.has("mlp.gate_proj.weight").unwrap());
+        assert!(w.has("mlp.up_proj.weight").unwrap());
+        assert!(w.has("mlp.down_proj.weight").unwrap());
+    }
 }
 
 /// `linear()` maps onto the shared `layers::Linear`: a `.scales`-less base is
