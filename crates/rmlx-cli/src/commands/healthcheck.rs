@@ -432,19 +432,34 @@ fn check_smoke(path: &Path) -> CheckLine {
         None, // max_ctx_override = auto
         &sink,
     ) {
-        Ok(broken) => {
-            if broken {
-                CheckLine::new(
-                    format!("smoke:{id}"),
-                    Status::Red,
-                    "smoke probe verdict: broken (BrokenPunctLoop or BrokenNan)".to_owned(),
-                )
-            } else {
-                CheckLine::new(
+        Ok(exit_code) => {
+            use crate::commands::info::SmokeExitCode;
+            match exit_code {
+                SmokeExitCode::Ok => CheckLine::new(
                     format!("smoke:{id}"),
                     Status::Green,
                     "smoke probe verdict: ok".to_owned(),
-                )
+                ),
+                SmokeExitCode::Broken => CheckLine::new(
+                    format!("smoke:{id}"),
+                    Status::Red,
+                    "smoke probe verdict: broken (BrokenPunctLoop or BrokenNan)".to_owned(),
+                ),
+                SmokeExitCode::LoadFail => CheckLine::new(
+                    format!("smoke:{id}"),
+                    Status::Red,
+                    "smoke probe verdict: load-fail (supported arch failed to load)".to_owned(),
+                ),
+                SmokeExitCode::Inconclusive => CheckLine::new(
+                    format!("smoke:{id}"),
+                    Status::Red,
+                    "smoke probe verdict: inconclusive (too few steps to confirm)".to_owned(),
+                ),
+                SmokeExitCode::Unsupported => CheckLine::new(
+                    format!("smoke:{id}"),
+                    Status::Red,
+                    "smoke probe verdict: unsupported architecture".to_owned(),
+                ),
             }
         }
         Err(e) => CheckLine::new(

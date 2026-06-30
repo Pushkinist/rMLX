@@ -37,10 +37,41 @@ use tracing::{info, warn};
 /// `device` is used for forward and smoke probes when enabled.
 /// `kv_quant_override` is forwarded to `generate_greedy` when `probe_smoke` is true.
 /// `None` = auto (arch default from `KvCacheBuilder`); `Some(q)` = explicit override.
+/// Exit-code outcome for `--probe-smoke`.
+///
+/// The variant maps 1:1 to the process exit code the caller passes to
+/// `std::process::exit`. Values 0 and 1 are kept identical to the
+/// pre-existing behaviour; 3/4/5 are newly distinct outcomes that
+/// previously collapsed into the exit-0 path.
+///
+/// `2` is deliberately absent — clap reserves it for argument-parse errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SmokeExitCode {
+    /// Coherent output; snapshot is healthy.
+    Ok = 0,
+    /// Incoherent output (`BrokenPunctLoop` or `BrokenNan`).
+    Broken = 1,
+    /// Supported architecture failed to load (I/O, missing weight, shape
+    /// mismatch, MLX error, or config error).
+    LoadFail = 3,
+    /// Verdict is `Inconclusive` — too few steps to confirm health.
+    Inconclusive = 4,
+    /// Architecture is not handled by this build (unsupported).
+    Unsupported = 5,
+}
+
+impl SmokeExitCode {
+    /// Convert to the integer exit code passed to `std::process::exit`.
+    pub(crate) fn as_i32(self) -> i32 {
+        self as i32
+    }
+}
+
 /// `max_ctx_override` is forwarded to `generate_greedy` when `probe_smoke` is true.
 /// `None` = derive from mpe (capped at 4096); `Some(n)` = use `n` directly.
 ///
-/// Returns `true` when the smoke probe detects a broken snapshot (caller exits 1).
+/// Returns the [`SmokeExitCode`] that represents the probe outcome.
+/// When `probe_smoke` is `false` the return value is always [`SmokeExitCode::Ok`].
 #[allow(
     clippy::unwrap_used,
     reason = "Mutex::lock() cannot poison; Option/Result unwrap on values established by construction in this fn"
@@ -53,7 +84,7 @@ pub(crate) fn run_info(
     kv_quant_override: Option<rmlx_kv_quant::KvQuant>,
     max_ctx_override: Option<i32>,
     sink: &EventRecorder,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<SmokeExitCode> {
     let cfg = load_config(model_path).map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
     let idx = load_shard_index(model_path).map_err(|e| anyhow::anyhow!("load_shard_index: {e}"))?;
 
@@ -385,13 +416,20 @@ pub(crate) fn run_info(
     if probe_smoke {
         info!(arch = %arch, ?device, "smoke_probe: loading model via arch::load_model");
 
-        // Load model via architecture dispatch -- returns Error::Model for unsupported arches.
+        // Load model via architecture dispatch.
+        // Error::Model → architecture not handled by this build (exit 5).
+        // Any other error → supported arch failed to load (exit 3).
         let model = match arch::load_model(model_path, device, &arch::LoadOpts::default()) {
             Ok(m) => m,
+            Err(rmlx_core::error::Error::Model(ref msg)) => {
+                warn!(error = %msg, "smoke_probe: architecture not supported");
+                println!("smoke_probe: skipped (unsupported arch: {msg})");
+                return Ok(SmokeExitCode::Unsupported);
+            }
             Err(e) => {
-                warn!(error = %e, "smoke_probe: arch not supported or load failed");
-                println!("smoke_probe: skipped ({e})");
-                return Ok(false);
+                warn!(error = %e, "smoke_probe: supported arch failed to load");
+                println!("smoke_probe: load-fail ({e})");
+                return Ok(SmokeExitCode::LoadFail);
             }
         };
         print_load_phases_json();
@@ -531,16 +569,16 @@ pub(crate) fn run_info(
 
         info!(verdict = %verdict_str, n_steps, max_abs_overall, "smoke_probe complete");
 
-        // Exit 1 on broken snapshot.
-        let is_broken = matches!(
-            verdict,
+        let exit_code = match verdict {
+            rmlx_models::SmokeVerdict::Ok => SmokeExitCode::Ok,
             rmlx_models::SmokeVerdict::BrokenPunctLoop { .. }
-                | rmlx_models::SmokeVerdict::BrokenNan { .. }
-        );
-        return Ok(is_broken);
+            | rmlx_models::SmokeVerdict::BrokenNan { .. } => SmokeExitCode::Broken,
+            rmlx_models::SmokeVerdict::Inconclusive { .. } => SmokeExitCode::Inconclusive,
+        };
+        return Ok(exit_code);
     }
 
-    Ok(false)
+    Ok(SmokeExitCode::Ok)
 }
 
 /// Run a single-token forward pass and return `(top_token_id, max_logit)`.
@@ -775,6 +813,10 @@ pub(crate) fn opt_u32(v: Option<u32>) -> String {
         None => "—".to_owned(),
     }
 }
+
+#[cfg(test)]
+#[path = "info_tests.rs"]
+mod info_tests;
 
 /// Print a JSON load-phase timing line if `read_load_phases()` returns `Some`.
 ///
