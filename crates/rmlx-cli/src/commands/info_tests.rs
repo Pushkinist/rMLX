@@ -1,6 +1,6 @@
 //! Unit tests for the smoke-probe exit-code mapping in `info.rs`.
 
-use super::SmokeExitCode;
+use super::{classify_load_error, classify_verdict, SmokeExitCode};
 use rmlx_models::SmokeVerdict;
 
 // ---------------------------------------------------------------------------
@@ -53,18 +53,8 @@ fn smoke_exit_code_unsupported_is_five() {
 }
 
 // ---------------------------------------------------------------------------
-// SmokeVerdict → SmokeExitCode mapping — inline helper mirrors run_info logic
+// classify_verdict — all SmokeVerdict variants
 // ---------------------------------------------------------------------------
-
-fn verdict_to_exit_code(v: &SmokeVerdict) -> SmokeExitCode {
-    match v {
-        SmokeVerdict::Ok => SmokeExitCode::Ok,
-        SmokeVerdict::BrokenPunctLoop { .. } | SmokeVerdict::BrokenNan { .. } => {
-            SmokeExitCode::Broken
-        }
-        SmokeVerdict::Inconclusive { .. } => SmokeExitCode::Inconclusive,
-    }
-}
 
 #[test]
 #[allow(
@@ -72,7 +62,7 @@ fn verdict_to_exit_code(v: &SmokeVerdict) -> SmokeExitCode {
     reason = "test assertions; panic is the desired failure mode"
 )]
 fn verdict_ok_maps_to_exit_0() {
-    assert_eq!(verdict_to_exit_code(&SmokeVerdict::Ok).as_i32(), 0);
+    assert_eq!(classify_verdict(&SmokeVerdict::Ok).as_i32(), 0);
 }
 
 #[test]
@@ -85,7 +75,7 @@ fn verdict_broken_punct_loop_maps_to_exit_1() {
         dominant_piece: ".".to_owned(),
         distinct_ids: 1,
     };
-    assert_eq!(verdict_to_exit_code(&v).as_i32(), 1);
+    assert_eq!(classify_verdict(&v).as_i32(), 1);
 }
 
 #[test]
@@ -95,7 +85,7 @@ fn verdict_broken_punct_loop_maps_to_exit_1() {
 )]
 fn verdict_broken_nan_maps_to_exit_1() {
     let v = SmokeVerdict::BrokenNan { at_step: 0 };
-    assert_eq!(verdict_to_exit_code(&v).as_i32(), 1);
+    assert_eq!(classify_verdict(&v).as_i32(), 1);
 }
 
 #[test]
@@ -107,25 +97,13 @@ fn verdict_inconclusive_maps_to_exit_4() {
     let v = SmokeVerdict::Inconclusive {
         reason: "eos at step 1".to_owned(),
     };
-    assert_eq!(verdict_to_exit_code(&v).as_i32(), 4);
+    assert_eq!(classify_verdict(&v).as_i32(), 4);
 }
 
 // ---------------------------------------------------------------------------
-// Load-error variants — exit 3 vs exit 5
+// classify_load_error — Error::Model and Error::ArchUnsupported → exit 5;
+// all other variants → exit 3.
 // ---------------------------------------------------------------------------
-
-// Error is #[non_exhaustive]; a wildcard arm is required even after listing all
-// known variants. Allow it here — the important branch is Model vs everything else.
-#[allow(
-    clippy::wildcard_enum_match_arm,
-    reason = "Error is #[non_exhaustive]; catch-all is required for forward compatibility"
-)]
-fn load_err_to_exit_code(e: &rmlx_core::error::Error) -> SmokeExitCode {
-    match e {
-        rmlx_core::error::Error::Model(_) => SmokeExitCode::Unsupported,
-        _ => SmokeExitCode::LoadFail,
-    }
-}
 
 #[test]
 #[allow(
@@ -134,7 +112,19 @@ fn load_err_to_exit_code(e: &rmlx_core::error::Error) -> SmokeExitCode {
 )]
 fn load_error_model_maps_to_exit_5() {
     let e = rmlx_core::error::Error::Model("arch not supported".to_owned());
-    assert_eq!(load_err_to_exit_code(&e).as_i32(), 5);
+    assert_eq!(classify_load_error(&e).as_i32(), 5);
+}
+
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test assertions; panic is the desired failure mode"
+)]
+fn load_error_arch_unsupported_maps_to_exit_5() {
+    let e = rmlx_core::error::Error::ArchUnsupported {
+        arch: "SomeNewArchForGeneration".to_owned(),
+    };
+    assert_eq!(classify_load_error(&e).as_i32(), 5);
 }
 
 #[test]
@@ -144,7 +134,7 @@ fn load_error_model_maps_to_exit_5() {
 )]
 fn load_error_loader_maps_to_exit_3() {
     let e = rmlx_core::error::Error::Loader("missing shard".to_owned());
-    assert_eq!(load_err_to_exit_code(&e).as_i32(), 3);
+    assert_eq!(classify_load_error(&e).as_i32(), 3);
 }
 
 #[test]
@@ -154,7 +144,7 @@ fn load_error_loader_maps_to_exit_3() {
 )]
 fn load_error_config_maps_to_exit_3() {
     let e = rmlx_core::error::Error::Config("malformed config".to_owned());
-    assert_eq!(load_err_to_exit_code(&e).as_i32(), 3);
+    assert_eq!(classify_load_error(&e).as_i32(), 3);
 }
 
 #[test]
@@ -164,5 +154,5 @@ fn load_error_config_maps_to_exit_3() {
 )]
 fn load_error_mlx_maps_to_exit_3() {
     let e = rmlx_core::error::Error::Mlx("metal error".to_owned());
-    assert_eq!(load_err_to_exit_code(&e).as_i32(), 3);
+    assert_eq!(classify_load_error(&e).as_i32(), 3);
 }

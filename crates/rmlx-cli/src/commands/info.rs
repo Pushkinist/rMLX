@@ -40,9 +40,14 @@ use tracing::{info, warn};
 /// Exit-code outcome for `--probe-smoke`.
 ///
 /// The variant maps 1:1 to the process exit code the caller passes to
-/// `std::process::exit`. Values 0 and 1 are kept identical to the
-/// pre-existing behaviour; 3/4/5 are newly distinct outcomes that
-/// previously collapsed into the exit-0 path.
+/// `std::process::exit`:
+///
+/// - `0` = coherent output; snapshot is healthy.
+/// - `1` = incoherent output (`BrokenPunctLoop` or `BrokenNan`).
+/// - `3` = supported architecture failed to load (I/O, missing weight, shape
+///   mismatch, MLX error, or config error).
+/// - `4` = verdict is `Inconclusive` — too few steps to confirm health.
+/// - `5` = architecture is not handled by this build (unsupported).
 ///
 /// `2` is deliberately absent — clap reserves it for argument-parse errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,8 +67,39 @@ pub(crate) enum SmokeExitCode {
 
 impl SmokeExitCode {
     /// Convert to the integer exit code passed to `std::process::exit`.
+    #[must_use]
     pub(crate) fn as_i32(self) -> i32 {
         self as i32
+    }
+}
+
+/// Classify a model-load error into a [`SmokeExitCode`].
+///
+/// `Error::Model` and `Error::ArchUnsupported` both indicate that the
+/// architecture is not handled by this build → exit 5 (`Unsupported`).
+/// Every other error indicates a supported architecture that failed to load
+/// (I/O, missing shard, MLX error, …) → exit 3 (`LoadFail`).
+// Error is #[non_exhaustive]; a wildcard arm is required.
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "Error is #[non_exhaustive]; catch-all is required for forward compatibility"
+)]
+pub(crate) fn classify_load_error(e: &rmlx_core::error::Error) -> SmokeExitCode {
+    match e {
+        rmlx_core::error::Error::Model(_) | rmlx_core::error::Error::ArchUnsupported { .. } => {
+            SmokeExitCode::Unsupported
+        }
+        _ => SmokeExitCode::LoadFail,
+    }
+}
+
+/// Classify a [`rmlx_models::SmokeVerdict`] into a [`SmokeExitCode`].
+pub(crate) fn classify_verdict(v: &rmlx_models::SmokeVerdict) -> SmokeExitCode {
+    match v {
+        rmlx_models::SmokeVerdict::Ok => SmokeExitCode::Ok,
+        rmlx_models::SmokeVerdict::BrokenPunctLoop { .. }
+        | rmlx_models::SmokeVerdict::BrokenNan { .. } => SmokeExitCode::Broken,
+        rmlx_models::SmokeVerdict::Inconclusive { .. } => SmokeExitCode::Inconclusive,
     }
 }
 
@@ -417,19 +453,20 @@ pub(crate) fn run_info(
         info!(arch = %arch, ?device, "smoke_probe: loading model via arch::load_model");
 
         // Load model via architecture dispatch.
-        // Error::Model → architecture not handled by this build (exit 5).
+        // Error::Model / Error::ArchUnsupported → arch not handled (exit 5).
         // Any other error → supported arch failed to load (exit 3).
         let model = match arch::load_model(model_path, device, &arch::LoadOpts::default()) {
             Ok(m) => m,
-            Err(rmlx_core::error::Error::Model(ref msg)) => {
-                warn!(error = %msg, "smoke_probe: architecture not supported");
-                println!("smoke_probe: skipped (unsupported arch: {msg})");
-                return Ok(SmokeExitCode::Unsupported);
-            }
             Err(e) => {
-                warn!(error = %e, "smoke_probe: supported arch failed to load");
-                println!("smoke_probe: load-fail ({e})");
-                return Ok(SmokeExitCode::LoadFail);
+                let code = classify_load_error(&e);
+                if code == SmokeExitCode::Unsupported {
+                    warn!(error = %e, "smoke_probe: architecture not supported");
+                    println!("smoke_probe: skipped (unsupported arch: {e})");
+                } else {
+                    warn!(error = %e, "smoke_probe: supported arch failed to load");
+                    println!("smoke_probe: load-fail ({e})");
+                }
+                return Ok(code);
             }
         };
         print_load_phases_json();
@@ -569,13 +606,7 @@ pub(crate) fn run_info(
 
         info!(verdict = %verdict_str, n_steps, max_abs_overall, "smoke_probe complete");
 
-        let exit_code = match verdict {
-            rmlx_models::SmokeVerdict::Ok => SmokeExitCode::Ok,
-            rmlx_models::SmokeVerdict::BrokenPunctLoop { .. }
-            | rmlx_models::SmokeVerdict::BrokenNan { .. } => SmokeExitCode::Broken,
-            rmlx_models::SmokeVerdict::Inconclusive { .. } => SmokeExitCode::Inconclusive,
-        };
-        return Ok(exit_code);
+        return Ok(classify_verdict(&verdict));
     }
 
     Ok(SmokeExitCode::Ok)

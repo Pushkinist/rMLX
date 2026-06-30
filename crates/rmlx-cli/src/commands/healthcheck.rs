@@ -455,10 +455,12 @@ fn check_smoke(path: &Path) -> CheckLine {
                     Status::Red,
                     "smoke probe verdict: inconclusive (too few steps to confirm)".to_owned(),
                 ),
+                // An unsupported architecture is not a deploy failure — this
+                // registry entry is simply skipped by this build.
                 SmokeExitCode::Unsupported => CheckLine::new(
                     format!("smoke:{id}"),
-                    Status::Red,
-                    "smoke probe verdict: unsupported architecture".to_owned(),
+                    Status::Info,
+                    "smoke probe: skipped (architecture not supported by this build)".to_owned(),
                 ),
             }
         }
