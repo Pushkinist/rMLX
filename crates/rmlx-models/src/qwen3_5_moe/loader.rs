@@ -38,14 +38,68 @@ use super::layers::{Embedding, Linear, ParoRotation, RmsNorm};
 use super::model::Qwen3_5MoeText;
 use super::moe::{DenseMlp, SharedExpert, SparseMoeBlock, SwitchMlp};
 
+/// Build one decoder layer's MLP block, selecting dense vs MoE by tensor facts.
+///
+/// Dense vs MoE is a per-layer checkpoint fact, not an arch-string or
+/// config-flag assumption: a sparse MoE layer carries `mlp.switch_mlp.*` (plus
+/// the `mlp.gate` router and `mlp.shared_expert.*`); a dense SwiGLU layer
+/// carries `mlp.{gate,up,down}_proj` directly with no router. Probing the MoE
+/// witness keeps both standard mxfp8 and affine checkpoints — and any future
+/// mixed layout — on the right path.
+///
+/// `m` is the MLP base (`<prefix>.layers.<i>.mlp`). `lin` is the layer's
+/// shared linear builder (the `load_from_path` adapter that maps the shared
+/// `Linear` onto the arch-local one).
+fn build_mlp(
+    w: &Weights<'_>,
+    m: &str,
+    cfg: &Qwen3_5MoeConfig,
+    lin: &impl Fn(&str) -> Result<Linear>,
+) -> Result<MlpBlock> {
+    if w.has(&format!("{m}.switch_mlp.gate_proj.weight"))? {
+        Ok(MlpBlock::Moe(Box::new(SparseMoeBlock {
+            gate: lin(&format!("{m}.gate"))?,
+            switch_mlp: SwitchMlp {
+                gate_proj: lin(&format!("{m}.switch_mlp.gate_proj"))?,
+                up_proj: lin(&format!("{m}.switch_mlp.up_proj"))?,
+                down_proj: lin(&format!("{m}.switch_mlp.down_proj"))?,
+            },
+            shared_expert: SharedExpert {
+                gate_proj: lin(&format!("{m}.shared_expert.gate_proj"))?,
+                up_proj: lin(&format!("{m}.shared_expert.up_proj"))?,
+                down_proj: lin(&format!("{m}.shared_expert.down_proj"))?,
+            },
+            shared_expert_gate: lin(&format!("{m}.shared_expert_gate"))?,
+            num_experts: cfg.num_experts,
+            top_k: cfg.num_experts_per_tok,
+            norm_topk_prob: cfg.norm_topk_prob,
+        })))
+    } else {
+        Ok(MlpBlock::Dense(Box::new(DenseMlp {
+            gate_proj: lin(&format!("{m}.gate_proj"))?,
+            up_proj: lin(&format!("{m}.up_proj"))?,
+            down_proj: lin(&format!("{m}.down_proj"))?,
+        })))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // load_from_path — standard MoE checkpoint
 // ---------------------------------------------------------------------------
 
-/// Load a Qwen3_5Moe model from a snapshot directory.
+/// Load a standard (non-PARO) Qwen3.5 model from a snapshot directory.
 ///
-/// Expects `config.architectures[0] == "Qwen3_5MoeForConditionalGeneration"`.
-/// Tensor prefix: `language_model.model`.
+/// Serves both arch strings — `Qwen3_5MoeForConditionalGeneration` (sparse MoE)
+/// and `Qwen3_5ForConditionalGeneration` (dense SwiGLU) — and both tensor-prefix
+/// layouts (`language_model.model` / `model.language_model`). The prefix is
+/// resolved from shard headers and each layer's MLP (dense vs MoE) is selected
+/// by which tensors are present, so a single loader covers the mxfp8 and affine
+/// checkpoints regardless of arch string. PARO checkpoints go through
+/// [`load_from_path_paro`] instead (selected upstream by `is_paroquant()`).
+#[allow(
+    clippy::cognitive_complexity,
+    reason = "single cohesive load sequence: prefix resolve + embedding/head + per-layer attn/MLP build. Splitting further would scatter the shared `lin`/`load_rms` closures across helpers for no readability gain — matches the laguna/gemma3 loader convention."
+)]
 pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
     let cfg_raw = load_config(model_dir)?;
 
@@ -69,6 +123,16 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
     let idx = load_shard_index(model_dir)?;
     let shards = ShardSet::open(model_dir, &idx)?;
     let w = Weights::new(&shards, &idx);
+
+    // Resolve the tensor prefix from the checkpoint rather than hardcoding it:
+    // MLX-community layouts use `language_model.model.<...>`, other exporters use
+    // `model.language_model.<...>`. The embedding table is the witness leaf every
+    // layout carries.
+    let pfx = w.resolve_prefix(
+        &["language_model.model", "model.language_model"],
+        "embed_tokens.weight",
+    )?;
+    info!(prefix = %pfx, "Qwen3_5: resolved tensor prefix");
 
     let defaults = QuantParams::global(cfg.quant_group_size, cfg.quant_bits, &cfg.quant_mode);
 
@@ -114,8 +178,6 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
             eps: cfg.rms_norm_eps,
         })
     };
-
-    let pfx = "language_model.model";
 
     // Embedding adapter mirrors `lin`: converts shared Embedding
     // (mode: QuantMode) to the arch-local Embedding (mode: String).
@@ -245,24 +307,7 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
             })
         };
 
-        let m = format!("{base}.mlp");
-        let mlp = MlpBlock::Moe(Box::new(SparseMoeBlock {
-            gate: lin(&format!("{m}.gate"))?,
-            switch_mlp: SwitchMlp {
-                gate_proj: lin(&format!("{m}.switch_mlp.gate_proj"))?,
-                up_proj: lin(&format!("{m}.switch_mlp.up_proj"))?,
-                down_proj: lin(&format!("{m}.switch_mlp.down_proj"))?,
-            },
-            shared_expert: SharedExpert {
-                gate_proj: lin(&format!("{m}.shared_expert.gate_proj"))?,
-                up_proj: lin(&format!("{m}.shared_expert.up_proj"))?,
-                down_proj: lin(&format!("{m}.shared_expert.down_proj"))?,
-            },
-            shared_expert_gate: lin(&format!("{m}.shared_expert_gate"))?,
-            num_experts: cfg.num_experts,
-            top_k: cfg.num_experts_per_tok,
-            norm_topk_prob: cfg.norm_topk_prob,
-        }));
+        let mlp = build_mlp(&w, &format!("{base}.mlp"), &cfg, &lin)?;
 
         layers.push(DecoderLayer {
             input_layernorm: load_rms(&format!("{base}.input_layernorm"))?,

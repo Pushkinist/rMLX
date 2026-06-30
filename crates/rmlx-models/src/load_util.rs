@@ -242,6 +242,31 @@ impl<'a> Weights<'a> {
         Ok(false)
     }
 
+    /// Resolve the tensor-name prefix a checkpoint uses, by probing shard
+    /// headers for a witness tensor under each candidate.
+    ///
+    /// Different exporters of the same architecture disagree on prefix order:
+    /// MLX-community layouts use `language_model.model.<...>` while ParoQuant
+    /// checkpoints use `model.language_model.<...>`. Rather than hardcode one
+    /// per loader, callers pass the candidate prefixes (most-likely first) and a
+    /// `witness` leaf that every layout carries (e.g. `embed_tokens.weight`);
+    /// the first candidate whose `<prefix>.<witness>` exists wins.
+    ///
+    /// Returns the matching prefix as a `String`. Errors (`Error::Loader`) only
+    /// when no candidate matches — a clear signal the checkpoint layout is
+    /// neither expected form, far better than a downstream "tensor not found".
+    pub(crate) fn resolve_prefix(&self, candidates: &[&str], witness: &str) -> Result<String> {
+        for cand in candidates {
+            if self.has(&format!("{cand}.{witness}"))? {
+                debug!(prefix = cand, witness, "resolve_prefix: matched");
+                return Ok((*cand).to_owned());
+            }
+        }
+        Err(Error::Loader(format!(
+            "resolve_prefix: none of {candidates:?} carry witness tensor '{witness}'"
+        )))
+    }
+
     /// Raw bytes + shape + dtype for `name`, using the same index-first /
     /// header-scan-fallback resolution as [`array`](Weights::array).
     ///

@@ -26,7 +26,7 @@ Shared seams live at the crate root (`crates/rmlx-models/src/`) and under
 | 4 | Generate | `<arch>/generate.rs` (or a `<arch>/generate/` dir) | Prompt-cache policy + cache construction + a `forward_step` closure handed to the shared `decode_loop` (`pipelined_decode` / `chunked_prefill` / `choose_token`). No decode-loop copy. |
 | 5 | Prompt cache (optional) | `<arch>/prompt_cache.rs` | `Entry` struct + accessor one-liners impl'ing `PromptCacheEntry`; `kv_bytes` / `truncate_kv_to` and the SSD spill path are inherited. Hydrate = `SsdHydrator::lookup_seeded` + a struct literal. |
 | 6 | Enum variant | `arch/mod.rs` | One `Architecture` variant + the match arms (`forward_seq`, `Debug`, config summary, …). |
-| 7 | Registry string | `arch/registry.rs`, `arch/loader.rs` | ~2 lines: add `architectures[0]` to `KNOWN_ARCHS` and a `load_model` match arm. |
+| 7 | Registry string | `arch/registry.rs`, `arch/loader.rs` | ~2 lines: add `architectures[0]` to `KNOWN_ARCHS` and a `load_model` match arm. When one arch string covers several checkpoint shapes (quant codec, dense vs MoE), branch the match arm on **checkpoint facts** — e.g. `cfg.is_paroquant()`, tensor presence — not on the arch string alone. The Qwen3.5 arm routes PARO vs standard this way. |
 | 8 | SSD attach (optional) | `ssd_tier.rs` | 1 match arm wiring the arch's `PROMPT_CACHE` into `attach_at_load`. |
 | 9 | Prefill chunk default | `prefill_chunk.rs` | 1 row in `arch_default` (omit to take the 64-token fallback). |
 | 10 | Tool / think / vision flags (optional) | `rmlx-server`: `tool_parser.rs`, `engine/think.rs`, `engine/arch_generator.rs` | Only if supported. Tool-call extraction, thinking-tag splitting, image-prompt assembly. |
@@ -44,6 +44,7 @@ list.
 - `load_util.rs` (`crates/rmlx-models/src/load_util.rs`):
   - `Weights::new(shards, idx)` / `Weights::scan_only(shards)` — tensor-fetch handle.
   - `.array(name)`, `.has(name)`, `.raw(name)`, `.linear(...)` — fetch / probe / dequant helpers (replaces hand-rolled `load_array` / `embed` / `linear`).
+  - `.resolve_prefix(candidates, witness) -> Result<String>` — pick the tensor-name prefix the checkpoint actually uses (e.g. `language_model.model` vs `model.language_model`) by probing shard headers for `<prefix>.<witness>`. Use this instead of hardcoding a prefix per loader when an arch ships under more than one layout.
 - `layers/quant.rs` (`crates/rmlx-models/src/layers/quant.rs`):
   - `resolve_quant(tensor_name, has_biases, defaults, overrides) -> Result<QuantParams>` — the shared `.biases`-sibling / affine rule. `QuantParams`, `QuantMode` live here too.
 - `lookup_seeded` lives in **`rmlx-kv-ssd`** (`crates/rmlx-kv-ssd/src/hydrate.rs`, `SsdHydrator::lookup_seeded`) — single-sources the FNV seed so no arch re-types the seed formula.

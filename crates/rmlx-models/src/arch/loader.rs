@@ -135,24 +135,28 @@ pub fn load_model(model_dir: &Path, _device: Device, opts: &LoadOpts) -> Result<
             tracing::info!(summary = %a.config_summary(), "arch::load_model: loaded Laguna");
             a
         }
-        "Qwen3_5MoeForConditionalGeneration" => {
-            let model = crate::qwen3_5_moe::load_from_path(model_dir)?;
+        // Both Qwen3.5 arch strings share one GatedDeltaNet + FullAttention
+        // hybrid backbone. They differ only in the MLP (dense SwiGLU vs sparse
+        // MoE) and the quant codec (mxfp8 / affine vs ParoQuant INT4). Neither
+        // axis is reliably implied by the arch string: ParoQuant ships
+        // `Qwen3_5ForConditionalGeneration` and so do plain dense mxfp8
+        // checkpoints. Dispatch on checkpoint facts — `is_paroquant()` (i.e.
+        // `quantization_config.quant_method == "paroquant"`) selects the PARO
+        // loader; everything else goes through the standard loader, which then
+        // resolves dense-vs-MoE per layer by which MLP tensors are present.
+        "Qwen3_5MoeForConditionalGeneration" | "Qwen3_5ForConditionalGeneration" => {
+            let model = if cfg.is_paroquant() {
+                tracing::info!(
+                    "arch::load_model: Qwen3.5 PARO checkpoint detected, using PARO loader"
+                );
+                crate::qwen3_5_moe::load_from_path_paro(model_dir)?
+            } else {
+                crate::qwen3_5_moe::load_from_path(model_dir)?
+            };
             let a = Architecture::Qwen3_5Moe(model);
             tracing::info!(
                 summary = %a.config_summary(),
-                "arch::load_model: loaded Qwen3_5Moe"
-            );
-            a
-        }
-        // Dense Qwen3.5 variant (ParoQuant INT4 checkpoints from z-lab).
-        // Shares the same GatedDeltaNet + FullAttention hybrid backbone as the MoE
-        // variant but uses a dense SwiGLU MLP instead of the sparse MoE block.
-        "Qwen3_5ForConditionalGeneration" => {
-            let model = crate::qwen3_5_moe::load_from_path_paro(model_dir)?;
-            let a = Architecture::Qwen3_5Moe(model);
-            tracing::info!(
-                summary = %a.config_summary(),
-                "arch::load_model: loaded Qwen3_5 (PARO dense)"
+                "arch::load_model: loaded Qwen3_5"
             );
             a
         }
