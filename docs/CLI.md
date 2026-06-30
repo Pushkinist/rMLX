@@ -256,7 +256,7 @@ rmlx info --model /path/to/snapshot --probe-smoke
 | `--model` | path | — | Path to the model snapshot directory. Required unless `--list-cache-types` is set. |
 | `--device` | `cpu \| gpu` | `gpu` | Device for probe passes (`--probe-forward`, `--probe-smoke`). |
 | `--probe-forward` | bool flag | off | Run a single-token forward pass and print the top-1 token + max logit. |
-| `--probe-smoke` | bool flag | off | Run the 8-token smoke probe and classify the snapshot. Exit 1 on `BrokenPunctLoop` or `BrokenNan`. |
+| `--probe-smoke` | bool flag | off | Run the 8-token smoke probe and classify the snapshot. Exit codes: `0` = ok, `1` = broken (`BrokenPunctLoop`/`BrokenNan`), `3` = load-fail (supported arch failed to load), `4` = inconclusive (too few steps), `5` = unsupported arch. `2` is reserved by clap for argument errors. |
 | `--kv-quant` | string | `auto` | KV cache quantization preset. |
 | `--kv-preset` | string | — | Named KV-cache preset. Mutually exclusive with `--kv-quant`, `--cache-type-k`, `--cache-type-v`, `--kv-bits`. Values: `auto` (hardware-aware selector), `fp16`, `q8`, `speed`, `quality`, `planar`, `k_only_planar`. |
 | `--cache-type-k` / `--ctk` | string | — | Per-side K codec. Mutually exclusive with `--kv-quant`. |
@@ -929,7 +929,7 @@ rmlx info --model /path/to/snapshot
 # List all supported KV cache codecs
 rmlx info --list-cache-types
 
-# Offline smoke probe — exits 1 on BrokenPunctLoop / BrokenNan
+# Offline smoke probe — exit 0=ok, 1=broken, 3=load-fail, 4=inconclusive, 5=unsupported
 rmlx info --model /path/to/snapshot --probe-smoke
 ```
 
