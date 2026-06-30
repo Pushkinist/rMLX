@@ -834,8 +834,11 @@ enum Cmd {
         /// Token 2 (BOS) is used. Requires the model to be Gemma4ForConditionalGeneration.
         #[arg(long, default_value_t = false)]
         probe_forward: bool,
-        /// Run the 8-token smoke probe and classify the snapshot for the broken-punct-loop
-        /// hazard described in CLAUDE.md. Exits 1 if BrokenPunctLoop or BrokenNan.
+        /// Run the 8-token smoke probe and classify the snapshot.
+        ///
+        /// Exit codes: 0 = ok (coherent), 1 = broken (BrokenPunctLoop or BrokenNan),
+        /// 3 = load-fail (supported arch failed to load), 4 = inconclusive (too few steps),
+        /// 5 = unsupported (architecture not handled). Exit 2 is reserved by clap.
         #[arg(long, default_value_t = false)]
         probe_smoke: bool,
         /// KV cache quantization: "auto" (arch default), "bf16" (unquantised cache; alias "none"), "k8v4", "k8v8", or "planar".
@@ -1816,7 +1819,7 @@ fn main() -> Result<()> {
             } else {
                 None
             };
-            let broken = run_info(
+            let exit_code = run_info(
                 &model,
                 probe_forward,
                 probe_smoke,
@@ -1825,8 +1828,9 @@ fn main() -> Result<()> {
                 max_ctx_override,
                 &sink,
             )?;
-            if broken {
-                std::process::exit(1);
+            let code = exit_code.as_i32();
+            if code != 0 {
+                std::process::exit(code);
             }
         }
         Cmd::Healthcheck {
