@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-06-30
+
+Qwen3.5-family model-loading correctness and a CI-gateable smoke probe. The
+weight-quant loaders no longer corrupt mxfp8/mxfp4 scales, dense Qwen3.5 mxfp8
+checkpoints now load via fact-driven dispatch (no longer hardwired to the PARO
+path), and `rmlx info --probe-smoke` returns distinct exit codes so a load
+failure can no longer masquerade as success. No breaking changes.
+
+### Added
+
+- **Dense Qwen3.5 mxfp8 loader + fact-driven dispatch.** Both
+  `Qwen3_5ForConditionalGeneration` and `Qwen3_5MoeForConditionalGeneration`
+  now route by checkpoint facts, not the arch string: `is_paroquant()` selects
+  the PARO vs the standard loader (the two share an arch string and differ only
+  by `quantization_config.quant_method`), a shared `resolve_prefix` probes shard
+  headers for the tensor prefix, and the MLP block is chosen per layer by tensor
+  presence (dense SwiGLU vs sparse MoE). A defensive guard hard-errors if a PARO
+  checkpoint ships MoE expert tensors. Dense Qwen3.5 mxfp8 snapshots now serve
+  end-to-end. (#191, closes #189)
+
+### Fixed
+
+- **mxfp8/mxfp4 uint8 E8M0 scales corrupted at load → MoE prefill crash.** The
+  Qwen3.5-MoE and Qwen3 loaders blanket-cast every quantized `.scales` tensor to
+  bf16, which is correct for affine (float) scales but corrupts mxfp's uint8 E8M0
+  scales, crashing the first prefill with `dequantize: Scale type must be uint8`.
+  A new per-tensor `bf16_scales` gate casts only float scales and passes uint8
+  scales through verbatim. (#190, closes #188)
+
+### Changed
+
+- **`rmlx info --probe-smoke` now returns distinct exit codes for CI gating.**
+  Previously every non-`Broken*` outcome — including a supported-arch load
+  failure and an inconclusive zero-token run — exited 0, so a loader regression
+  read as a pass. Exit codes are now `0` ok, `1` broken, `3` load-fail, `4`
+  inconclusive, `5` unsupported (`2` is reserved for clap arg-parse errors).
+  `healthcheck` marks load-fail / inconclusive / broken as Red and unsupported
+  as a non-fatal skip. (#193, closes #192)
+- Bumped `anyhow` 1.0.102 → 1.0.103 (fixes a Stacked-Borrows UB in
+  `Error::downcast_mut`) and `uuid` 1.23.3 → 1.23.4. (#187)
+
 ## [0.2.7] - 2026-06-28
 
 Constrained-decode hot-path and Gemma4-unified vision tuning. The `json_schema`
@@ -574,7 +615,8 @@ inference + conversion backend for Apple Silicon — no Python at runtime.
 - Speculative drafters validated against their verifiers: Qwen 3.6 MTP sidecar
   and the Gemma 4 assistant drafter.
 
-[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.2.7...HEAD
+[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.2.8...HEAD
+[0.2.8]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.8
 [0.2.7]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.7
 [0.2.6]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.6
 [0.2.5]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.5
