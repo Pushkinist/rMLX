@@ -488,6 +488,50 @@ fn embedding_maps_to_shared_embedding() {
     }
 }
 
+/// `bf16_scales` must leave a uint8 E8M0 scale tensor (mxfp8 / mxfp4) untouched:
+/// MLX's `dequantize` rejects any scale dtype other than uint8 for those modes,
+/// so casting the shared per-block exponent to bf16 corrupts it and crashes the
+/// kernel at first prefill. The dtype gate is the general rule — it follows the
+/// per-tensor checkpoint fact, not the arch string.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: Array construction failures should abort the test loudly"
+)]
+fn bf16_scales_keeps_uint8_e8m0_intact() {
+    use rmlx_mlx::{Array, Dtype};
+
+    // A uint8 E8M0 scale block as mxfp8 ships it: one shared exponent per group.
+    let u8_scales = Array::from_bytes(&[127u8, 128, 129, 130], &[4], Dtype::U8).unwrap();
+    let out = super::bf16_scales(u8_scales).unwrap();
+    assert_eq!(
+        out.dtype(),
+        Dtype::U8,
+        "mxfp8/mxfp4 uint8 E8M0 scales must survive the loader as uint8"
+    );
+}
+
+/// `bf16_scales` must still apply the float-uniformity cast for affine float
+/// scales: an fp16/f32 scale would otherwise promote `quantized_matmul` output
+/// to f32 and leak into the KV cache. Only non-float scales are exempt.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: Array construction failures should abort the test loudly"
+)]
+fn bf16_scales_casts_float_scales_to_bf16() {
+    use rmlx_mlx::{Array, Dtype};
+
+    // An f32 affine scale tensor: must be lifted to bf16 (uniformity discipline).
+    let f32_scales = Array::from_f32_slice(&[0.5, 0.25, 0.125, 1.0], &[4]).unwrap();
+    let out = super::bf16_scales(f32_scales).unwrap();
+    assert_eq!(
+        out.dtype(),
+        Dtype::Bf16,
+        "affine float scales keep the bf16 uniformity cast"
+    );
+}
+
 /// The `qp` closure may hard-error; `embedding` propagates the error rather
 /// than building an `Embedding`.
 #[test]

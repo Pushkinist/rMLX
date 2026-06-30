@@ -319,9 +319,14 @@ Qwen3 dense).
 
 ### Weight quantization
 
-Same coverage as Qwen3. Known snapshots include 8-bit affine and mxfp8. The PARO
-variant (`Qwen3_5ForConditionalGeneration`) uses a paroquant layout detected by
-the `is_paroquant` signal in `KvCacheBuilder::resolve_default`.
+Same coverage as Qwen3. Known snapshots include 8-bit affine, mxfp8, and mixed
+checkpoints (global mxfp8 with per-tensor affine overrides on the router gates,
+e.g. `ornith-1.0-35b-mxfp8`). mxfp8 / mxfp4 ship **uint8 E8M0** scales (a shared
+per-block exponent); the loader keeps those verbatim and only applies the bf16
+uniformity cast to float (affine) scales — gated on `scales.dtype()`, not on the
+arch or global quant mode, so a mixed checkpoint loads both codecs correctly. The
+PARO variant (`Qwen3_5ForConditionalGeneration`) uses a paroquant layout detected
+by the `is_paroquant` signal in `KvCacheBuilder::resolve_default`.
 
 ### KV quantization
 
