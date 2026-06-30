@@ -113,6 +113,29 @@ pub(crate) fn bf16_param(a: Array) -> Result<Array> {
     }
 }
 
+/// Cast a quantized layer's `.scales` to BF16 only when they are float.
+///
+/// Affine quant ships float scales; the [`bf16_param`] uniformity cast applies
+/// to keep the dequant output bf16 and avoid an fp16 → f32 promotion leak. But
+/// microscaling codecs (mxfp8 / mxfp4) ship **uint8 E8M0** scales — a shared
+/// per-block exponent, not a float — and MLX's `dequantize` rejects any scale
+/// dtype other than uint8 for those modes. Casting them to bf16 corrupts the
+/// exponents and crashes the kernel.
+///
+/// Gating on `scales.dtype()` (not the arch string or quant-mode string) is the
+/// general rule: the cast follows the per-tensor checkpoint fact and survives
+/// future uint8-scaled codecs without a special case. Float scales (the affine
+/// path) keep the existing uniformity cast; any non-float scale dtype passes
+/// through untouched.
+pub(crate) fn bf16_scales(a: Array) -> Result<Array> {
+    match a.dtype() {
+        Dtype::Bf16 | Dtype::F16 | Dtype::F32 => bf16_param(a),
+        // uint8 E8M0 (mxfp8/mxfp4) and any other non-float scale dtype: leave
+        // the on-disk dtype intact so the dequant kernel's contract holds.
+        Dtype::U8 | Dtype::U32 | Dtype::I32 => Ok(a),
+    }
+}
+
 impl<'a> Weights<'a> {
     /// Index-first fetch: the index locates each tensor's shard, with a
     /// header-scan fallback when the index misses or lies.
