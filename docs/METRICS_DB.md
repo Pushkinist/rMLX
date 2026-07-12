@@ -133,7 +133,7 @@ CREATE TABLE observations (
     -- run context (the run that produced THIS observation)
     run_id           TEXT    NOT NULL,             -- minted at DB write: '<YYYYMMDDHHMMSS>-<6hex>'
     ts_utc           TEXT    NOT NULL,             -- when measurement was taken (ISO-8601 UTC)
-    git_sha          TEXT,                         -- short sha at run time, '-dirty' suffix if uncommitted
+    git_sha          TEXT,                         -- caller-supplied provenance, see §8.5.1; NULL unless a caller set it
     build_profile    TEXT,                         -- 'release', 'release+pgo', 'debug'
     backend_version  TEXT,                         -- semver only, e.g. '0.0.1'
     hardware_tag     TEXT    NOT NULL,             -- 'm5_max_128gb' — context, no special invalidation logic
@@ -221,7 +221,7 @@ Run context (snapshot):
 |-------------------|-----------------------------------------------------------------------------------------------|
 | `run_id`          | Minted at DB write time. Format `<YYYYMMDDHHMMSS>-<6hex>`. Not a FK, just a tracking string.  |
 | `ts_utc`          | When the measurement was taken (ISO-8601 UTC). Distinct from `inserted_utc`.                  |
-| `git_sha`         | Short SHA of the commit this binary was compiled from (baked in at compile time). `-dirty` suffix if the source tree at that same path had uncommitted changes (staged or not) when *this process* started — resolved once at runtime, not baked in at build time. See §8.5.1 for the exact semantics. Absent for a binary with no source tree (e.g. `599fb89-dirty` vs plain `599fb89`). |
+| `git_sha`         | Caller-supplied provenance, not derived by the binary — a bench script's own `git rev-parse`, or `--git-sha` on `rmlx baseline` / `rmlx eval ppl`. `NULL` unless a caller set it (e.g. every drainer/server-produced row). Some historical rows predating this contract carry a `-dirty` suffix that `deltas --since-sha` still matches; the binary never mints that suffix now. See §8.5.1. |
 | `build_profile`   | Cargo profile + flags hint. `release`, `release+pgo`, `release+lto`, `debug`.                 |
 | `backend_version` | Semver only, e.g. `0.0.1`, `0.21.0`. The backend name lives in `backend`.                     |
 | `hardware_tag`    | Hardware identifier, e.g. `m5_max_128gb`. Treated as a regular context column — different value = different cell, no special "invalidation" semantics. Mint a new tag when migrating to new hardware (`m5_ultra_256gb`). |
@@ -304,11 +304,13 @@ WAL absorbs concurrent writers.
 `value` (REAL), `notes` (TEXT), plus the run-identity columns added by 003:
 `backend_version` (TEXT NULL), `git_sha` (TEXT NULL), `build_profile` (TEXT NULL).
 
-**Identity.** `events` and `observations` are stamped from the *same*
-`RunIdentity` source (§8.5.1). Before migration 003 `events` carried no identity
-at all and the version was recoverable only from the short SHA embedded in
-`run_id` — never as a semver. Rows written before 003 keep NULL; the table is
-append-only and is not backfilled.
+**Identity.** `backend_version` and `build_profile` are stamped from the same
+`RunIdentity` source `observations` uses (§8.5.1). `git_sha` is always `NULL`
+on `events` rows — the drainer has no caller-supplied git-sha input (there is
+no `--git-sha` flag on `rmlx serve`), and the column is provenance, not
+something `EventRecorder` derives. Before migration 003 `events` carried no
+identity at all. Rows written before 003 keep NULL; the table is append-only
+and is not backfilled.
 
 **`stage` / `op` vocabulary:**
 
@@ -913,26 +915,59 @@ Single JSON object per run. The recorder fans out into N `observations` rows (on
 
 ### 8.5.1 Run identity (hard rule)
 
-The five identity fields — `backend`, `backend_version`, `git_sha`, `build_profile`, `hardware_tag` — say **which binary produced the number**. Without them a metrics row cannot be compared across versions, and a wrong value is worse than no value.
+The four identity fields — `backend`, `backend_version`, `build_profile`, `hardware_tag` — say **which binary produced the number**. Without them a metrics row cannot be compared across versions, and a wrong value is worse than no value.
 
 They are produced in exactly **one place per language surface**. No emitter hand-rolls them, ever.
 
 | Surface | Source | Notes |
 |---|---|---|
-| Rust (borrow) | `rmlx_metrics::identity::RunIdentity::get()` | `&'static RunIdentity`, resolved once per process, no allocation after the first call. Prefer this. |
+| Rust (borrow) | `rmlx_metrics::identity::RunIdentity::get()` | `&'static RunIdentity`, resolved once per process, no allocation after the first call — a few `env!()` reads, no I/O, no subprocess. Prefer this. |
 | Rust (owned) | `rmlx_metrics::identity::RunIdentity::rmlx()` | `get().clone()`. Only for the one call site that must move the fields into an owned `RunRecord` (`RunRecordBuilder::rmlx`). |
 | Rust records | `rmlx_metrics::ingest::RunRecordBuilder::rmlx(...)` | Fills identity **and** `model_namespace` / `model` / `weight_quant` / `kv_quant` / `ts_utc` / `schema_version`. Caller supplies the measurement only. |
-| Shell / Python | `rmlx metrics identity --json` | `scripts/lib/identity.sh` exports it as `RMLX_IDENTITY_JSON`; `scripts/lib/rmlx_record.py` merges it. |
+| Shell / Python | `rmlx metrics identity --json` | `scripts/lib/identity.sh` exports it as `RMLX_IDENTITY_JSON`; merged into each record's JSON. |
 
-`RunRecord` is `#[non_exhaustive]` **and** its five identity fields
+**`git_sha` is not an identity field.** The binary cannot honestly know the
+commit it was built from or the tree it runs against: the working directory a
+process is launched from is not necessarily its own source checkout (`rmlx
+serve` is normally started from a user's project, not this repo), and
+compile-time approaches fare no better — every attempt to bake a commit SHA in
+at build time, then detect whether the source tree had since gone "dirty"
+relative to it, required a workspace-root-discovery + rerun-if-changed +
+runtime-probe apparatus that produced new defects across several review
+rounds (wrong-repo detection, stale-commit detection, untracked-file false
+positives) for a value nothing downstream actually needed the binary to
+guess. **The binary does no git of any kind, at build time or runtime, in any
+mode.**
+
+`git_sha` is instead ordinary **caller-supplied provenance**, exactly like
+`hardware_tag` already was before this section existed — the recording
+surface accepts it; it does not invent it. Two ways a caller supplies it:
+
+- A bench script that already runs its own `git -C <repo> rev-parse --short
+  HEAD` stamps `"git_sha": "<sha>"` directly into the §8.5 JSON it emits,
+  after the identity spread so the explicit value wins.
+- `rmlx baseline --git-sha <sha>` / `rmlx eval ppl --git-sha <sha>` — optional
+  CLI flags on the two record-producing bench commands. Absent by default;
+  `git_sha` is then `NULL`, never guessed or derived.
+
+The server drainer (`EventRecorder`, and any `RunRecordBuilder::rmlx(...)`
+caller) has no `--git-sha` input at all, so `git_sha` is always `NULL` on
+those rows. That is honest, not a regression — see §8.1 for what the drainer
+records.
+
+`RunRecord` is `#[non_exhaustive]` **and** its five `pub(crate)` fields
 (`backend`, `backend_version`, `git_sha`, `build_profile`, `hardware_tag`) are
-`pub(crate)`, read via getters (`RunRecord::backend()`, `.backend_version()`,
+read via getters (`RunRecord::backend()`, `.backend_version()`, `.git_sha()`,
 …). Two separate holes, two separate closures: `#[non_exhaustive]` blocks a
 struct *literal* from outside `rmlx-metrics`; field privacy blocks mutating an
 *already-built* record (`let mut r = builder.build()?; r.backend_version =
 Some("0.0.1".into());` compiled and bypassed the validator before this). Rust
 emitters must go through `RunRecordBuilder`; nothing outside this crate can
-construct or mutate a `RunRecord`'s identity at all.
+construct or mutate a `RunRecord`'s identity fields at all. `git_sha` stays
+`pub(crate)` too even though it is caller-supplied, not binary-derived — the
+same mutation-hole closure applies to it, and `RunRecordBuilder` has no
+`.git_sha(...)` setter today (no Rust caller needs one yet; the two CLI flags
+above set the field directly on the assembled JSON, not through the builder).
 
 This is a mutation-hole closure, not a provenance guarantee. `RunRecord::validate()`
 checks that `backend_version` is semver-*shaped*; it does not — cannot — verify
@@ -947,21 +982,15 @@ buffer file is JSON text, not a `RunRecord` value, and goes through
 
 - `backend == "rmlx"` **must** carry a semver-*shaped* `backend_version` (`MAJOR.MINOR.PATCH`, optional `-pre` / `+build` suffix — see previous paragraph on what "shaped" does and doesn't guarantee). Missing, empty, or non-semver ⇒ ingest **fails loudly**, exit 1, buffer file preserved for triage.
 - Every other backend keeps `backend_version` free-form and optional — llama.cpp has no semver, it emits a `build_commit`. Cross-backend ingest is unaffected.
+- `git_sha` is never required and never validated beyond being an optional string — it is provenance, not identity.
 
 Why rMLX only: it is our own binary, so it always knows its own version. A NULL there is a bug, not a limitation.
 
 **Identity is stamped at emit time, into the buffer file — never at ingest time.** A buffer replayed later by a newer binary keeps the identity of the build that produced it. `inserted_by` (`<tool>@<semver>`) separately records which tool did the insert. Build it with `RunIdentity::inserted_by(tool)`, not a literal.
 
-**`build_profile` is the real Cargo profile name** — `release`, `release-perf`, `release-debug`, `debug` — stamped by `crates/rmlx-core/build.rs` from `OUT_DIR` (the path component immediately before the LAST `build` component, so a `CARGO_TARGET_DIR` that itself contains an earlier `build/` component does not misfire). Do **not** use `cfg!(debug_assertions)`: it is off for all three release profiles and collapses them to one `"release"` label, which silently turns a cross-profile comparison into what looks like a same-profile one.
+**`build_profile` is the real Cargo profile name** — `release`, `release-perf`, `release-debug`, `debug` — stamped by `crates/rmlx-core/build.rs` from `OUT_DIR` (the path component immediately before the LAST `build` component, so a `CARGO_TARGET_DIR` that itself contains an earlier `build/` component does not misfire). Do **not** use `cfg!(debug_assertions)`: it is off for all three release profiles and collapses them to one `"release"` label, which silently turns a cross-profile comparison into what looks like a same-profile one. This is the *only* thing `build.rs` stamps — no git of any kind runs at build time.
 
-**`git_sha` is two facts from two different times, deliberately split — read this before touching either half:**
-
-- **The commit** is baked in at **compile time** by `crates/rmlx-core/build.rs`, anchored to the workspace root — never a runtime `git rev-parse` in the process's working directory. An installed `rmlx` is normally launched from someone else's project (`rmlx serve` from inside a user's repo); a runtime lookup would stamp *that* repo's SHA into every row this process produces. Empty (⇒ `None` at runtime) when there is no git checkout at build time, or the nearest repo found by walking up from the crate is not this workspace (an unrelated enclosing checkout — the exact "someone else's repo" bug, relocated to build time, that `build.rs` also refuses to trust).
-- **The `-dirty` suffix** is resolved **once per process** (memoized, `RunIdentity::get()` is the first caller — forced at startup right after `--metrics` mode is resolved, so the cost lands at a known point instead of wherever the first telemetry write happens to occur) via `git diff --quiet HEAD` against that *same compile-time-stamped path* — never the cwd, and never `git status --porcelain` (which also flags untracked files; an untracked stray file was never compiled into the binary and must not flip it dirty). **Not gated on `--metrics off`** — `git_sha` is a value `rmlx metrics identity --json` must report truthfully in every mode, not a telemetry write; gating it would make that command disagree with itself depending on `--metrics`. Two self-consistency guards, checked before trusting the tree at all: the tree's own `git rev-parse --show-toplevel` must equal the compile-time-stamped path exactly (never an enclosing repo git found by walking up after the checkout was deleted and the directory recreated inside one), and the tree's current `HEAD` must still equal the baked commit (if the tree has since moved to a different commit, "dirty relative to a commit it's no longer on" is unanswerable, so no claim is made). Always absent (never `-dirty`) when the compile-time path is empty, no longer exists, is no longer its own git repo, or has moved to a different commit — an installed binary has no source tree on the machine it runs on, so there is nothing that could be dirty.
-
-Baking `-dirty` in at compile time (an earlier version of this fix did exactly that) is wrong: emitting `rerun-if-changed` disables cargo's default whole-package rebuild-watch, so editing an ordinary source file that isn't on the (necessarily narrow) watch list leaves the build script un-rerun — the binary keeps reporting whatever dirty-state existed at the *last* rebuild, silently mislabelling every WIP build after the first as clean. Exact semantics, stated plainly (CLAUDE.md hard rule 7): **`<sha>` is the commit this binary was compiled from. `-dirty` means the source tree at that path had uncommitted changes when *this process* started — not at build time. An installed binary with no source tree carries no suffix, ever.**
-
-**Pre-existing rows.** The DB still holds rows that predate this rule (NULL versions, `'0.0.1'` literals, git SHAs in the semver column). `<RMLX_HOME>/metrics/` is append-only — they are **not** backfilled or rewritten. They carry a real `git_sha`, so a sha→tag map could reconstruct the truth later if ever wanted.
+**Pre-existing rows.** The DB still holds rows that predate this rule (NULL versions, `'0.0.1'` literals, git SHAs in the semver column) and rows written while the binary still minted `git_sha` itself, some carrying a `-dirty` suffix. `<RMLX_HOME>/metrics/` is append-only — they are **not** backfilled or rewritten. `rmlx metrics deltas --since-sha` still matches the `-dirty` suffix on historical rows (`crates/rmlx-metrics/src/query/read.rs`) even though the binary will never mint it again.
 
 **One-time pending-buffer quarantine.** Buffer files written by an `rmlx` binary from before this contract landed (`backend: "rmlx"`, no `backend_version` key at all) are now **rejected** by `rmlx metrics record --replay-pending` instead of being silently ingested as another NULL row. Expect, on the first `--replay-pending` after upgrading past this point:
 

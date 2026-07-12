@@ -26,7 +26,6 @@ pub(super) fn cmd_identity(json: bool) -> anyhow::Result<()> {
 
     println!("backend         {}", ident.backend());
     println!("backend_version {}", ident.backend_version());
-    println!("git_sha         {}", ident.git_sha().unwrap_or("-"));
     println!("build_profile   {}", ident.build_profile());
     println!("hardware_tag    {}", ident.hardware_tag());
     Ok(())

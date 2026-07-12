@@ -52,6 +52,7 @@ pub(crate) fn run_ppl(
     device_str: &str,
     max_tokens: usize,
     run_id: &str,
+    git_sha: Option<&str>,
 ) -> Result<()> {
     let device = match device_str {
         "cpu" => Device::Cpu,
@@ -172,6 +173,7 @@ pub(crate) fn run_ppl(
             load_ms,
             score_ms,
             &weight_quant,
+            git_sha,
         )?;
 
         let buf_path = write_buffer_record(&record)?;
@@ -219,6 +221,7 @@ pub(crate) fn run_ppl(
 ///
 /// Op family is `ppl`; the single metric is `ppl_<corpus>` (operator-friendly).
 /// Other audit fields go into `mean_nll`, `scored_tokens`, `windows`.
+#[allow(clippy::too_many_arguments)]
 fn build_ppl_run_record(
     run_id: &str,
     model_path: &Path,
@@ -230,6 +233,7 @@ fn build_ppl_run_record(
     load_ms: f64,
     score_ms: f64,
     weight_quant: &str,
+    git_sha: Option<&str>,
 ) -> Result<serde_json::Value> {
     let snapshot = model_path
         .canonicalize()
@@ -283,9 +287,16 @@ fn build_ppl_run_record(
     });
 
     // Identity comes from the single Rust source — eval does not assemble it.
+    // `stamp_json` deliberately does not touch `git_sha`: that field is
+    // caller-supplied provenance (see `RunIdentity`'s doc), not something
+    // this binary derives. `--git-sha` is the only source for it here.
     RunIdentity::get()
         .stamp_json(&mut record)
         .map_err(|e| anyhow::anyhow!("stamp run identity: {e}"))?;
+    record
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("record is not a JSON object"))?
+        .insert("git_sha".to_string(), serde_json::Value::from(git_sha));
 
     Ok(record)
 }

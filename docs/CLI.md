@@ -306,6 +306,7 @@ rmlx baseline --model /path/to/snapshot --prompt-tokens 4096 --label "8k-bench"
 | `--max-ctx` / `--ctx-max` | u32 | (from model) | KV cache buffer token capacity. Must be ≥ 256 when set. |
 | `--label` | string | — | Free-form campaign label stamped into the metrics record's `notes` column. |
 | `--record` | bool flag | off | Emit a §8.5 `RunRecord` to the metrics buffer and ingest into `runs.db` in-process. |
+| `--git-sha` | string | — | Commit SHA to stamp on the emitted record's `git_sha` column (only meaningful with `--record`). Provenance the caller supplies — the binary does not and cannot determine the commit it was built from. Absent by default (`git_sha` is `NULL`). |
 
 ---
 
@@ -572,16 +573,19 @@ of `--inline`, `--file`, `--stdin`, or `--replay-pending` must be provided.
 #### `metrics identity`
 
 Print the §8.5 run-identity block of *this* binary: `backend`, `backend_version`,
-`git_sha`, `build_profile`, `hardware_tag`.
+`build_profile`, `hardware_tag`. Deliberately does not include `git_sha` — the
+binary cannot honestly know the commit it was built from, so `git_sha` is not
+part of run identity at all; it is caller-supplied provenance (see
+`docs/METRICS_DB.md` §8.5.1) set via a script's own `git rev-parse`, or via
+`--git-sha` on `rmlx baseline` / `rmlx eval ppl`.
 
 This is how a non-Rust emitter learns who the measured binary is. Bench scripts
 merge the JSON block into their §8.5 record instead of hard-coding a version or
-guessing a build profile — see `scripts/lib/identity.sh` and
-`scripts/lib/rmlx_record.py`.
+guessing a build profile — see `scripts/lib/identity.sh`.
 
 ```bash
 rmlx metrics identity --json
-# {"backend":"rmlx","backend_version":"0.2.8","git_sha":"aaac659","build_profile":"release","hardware_tag":"m5_max_128gb"}
+# {"backend":"rmlx","backend_version":"0.2.8","build_profile":"release","hardware_tag":"m5_max_128gb"}
 
 rmlx metrics identity          # human-readable
 ```
@@ -793,6 +797,7 @@ rmlx eval ppl --model /path/to/snapshot --text-file wiki.txt \
 | `--corpus` | string | `""` | Corpus identifier. Non-empty triggers metrics ingestion. |
 | `--device` | `cpu \| gpu` | `gpu` | Inference device. |
 | `--max-tokens` | usize | 0 | Cap on tokens fed to the scorer. `0` = use the whole corpus. |
+| `--git-sha` | string | — | Commit SHA to stamp on the emitted record's `git_sha` column (only meaningful with a non-empty `--corpus`). Provenance the caller supplies — the binary does not and cannot determine the commit it was built from. Absent by default (`git_sha` is `NULL`). |
 
 ---
 

@@ -451,6 +451,7 @@ metric_entries = [
 
 obj = {
     **json.loads(os.environ['RMLX_IDENTITY_JSON']),
+    "git_sha": git_sha,
     "model_namespace": model_namespace,
     "model": model_basename,
     "weight_quant": weight_quant,

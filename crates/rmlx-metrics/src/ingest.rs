@@ -65,8 +65,9 @@ fn default_schema_version() -> u32 {
 /// from the §8.5 JSON (scripts, other backends). A struct literal outside
 /// `rmlx-metrics` is a compile error, by design.
 ///
-/// The five run-identity fields (`backend`, `backend_version`, `git_sha`,
-/// `build_profile`, `hardware_tag`) are `pub(crate)`, not `pub`: `#[non_exhaustive]`
+/// The five identity/provenance fields (`backend`, `backend_version`,
+/// `git_sha`, `build_profile`, `hardware_tag`) are `pub(crate)`, not `pub`:
+/// `#[non_exhaustive]`
 /// blocks a struct *literal* from outside this crate, but every field was
 /// still individually mutable — `let mut r = builder.build()?; r.backend_version
 /// = Some("0.0.1".into());` compiled fine and bypassed the validator entirely,
@@ -105,7 +106,10 @@ pub struct RunRecord {
     pub prompt: PromptRef,
     /// ISO-8601 UTC timestamp, validated as parseable.
     pub ts_utc: String,
-    /// Git commit SHA of the backend binary, if known. Read via [`RunRecord::git_sha`].
+    /// Commit SHA the caller attributes this run to, if supplied. The binary
+    /// never derives this itself (see `rmlx_metrics::identity::RunIdentity`'s
+    /// doc); it is ordinary caller-supplied provenance, exactly like
+    /// `hardware_tag`. Read via [`RunRecord::git_sha`].
     #[serde(default)]
     pub(crate) git_sha: Option<String>,
     /// Cargo build profile (e.g. `"release"`, `"release-perf"`). Read via [`RunRecord::build_profile`].
@@ -155,7 +159,7 @@ impl RunRecord {
         self.backend_version.as_deref()
     }
 
-    /// Git commit SHA of the backend binary, if known.
+    /// Commit SHA the caller attributes this run to, if supplied.
     pub fn git_sha(&self) -> Option<&str> {
         self.git_sha.as_deref()
     }
@@ -408,7 +412,10 @@ impl RunRecord {
 /// [`RunRecordBuilder::rmlx`] fills everything the caller has no business
 /// choosing:
 ///
-/// * the whole identity block, from [`RunIdentity::rmlx`];
+/// * the whole identity block, from [`RunIdentity::rmlx`] (`backend`,
+///   `backend_version`, `build_profile`, `hardware_tag` — NOT `git_sha`,
+///   which the binary cannot honestly derive; it stays `None` unless a
+///   future caller adds a `.git_sha(...)` builder method for it);
 /// * `model_namespace` / `model` / `weight_quant`, parsed and inferred from the
 ///   model id ([`identity::split_model_id`], [`identity::infer_weight_quant`]);
 /// * `kv_quant`, canonicalized ([`identity::canonicalize_kv_quant`]);
@@ -450,7 +457,13 @@ impl RunRecordBuilder {
                 ctx_max,
                 prompt,
                 ts_utc: now_iso8601()?,
-                git_sha: ident.git_sha,
+                // Caller-supplied provenance, not something the binary
+                // derives (see `RunIdentity`'s doc). No caller of this
+                // builder has a git-sha input today (the server drainer has
+                // no `--git-sha` flag), so this is always `None` — a future
+                // caller that gains one should add a `.git_sha(...)` builder
+                // method rather than reach into `rec` directly.
+                git_sha: None,
                 build_profile: Some(ident.build_profile),
                 hardware_tag: ident.hardware_tag,
                 prompt_tokens: None,

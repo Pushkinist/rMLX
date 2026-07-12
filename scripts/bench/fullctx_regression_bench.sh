@@ -220,6 +220,7 @@ with open('${prompt_file}') as f:
 first_64 = '${first_text}'[:64] if '${first_text}' else ''
 rec = {
     **json.loads(os.environ['RMLX_IDENTITY_JSON']),
+    'git_sha':         '${GIT_SHA}',
     'model_namespace': '${ns}',
     'model':           '${mdl}',
     'weight_quant':    'q8_0',

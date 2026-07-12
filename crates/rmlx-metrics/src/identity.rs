@@ -7,8 +7,9 @@
 //!
 //! # Public API
 //!
-//! - [`RunIdentity`] — who produced a metrics row: backend, version, git sha,
-//!   build profile, hardware tag. The ONE source for those fields in Rust.
+//! - [`RunIdentity`] — who produced a metrics row: backend, version, build
+//!   profile, hardware tag. The ONE source for those fields in Rust.
+//!   Deliberately does NOT include `git_sha` — see the struct doc for why.
 //! - [`canonicalize_kv_quant`] — normalise a KV-quant string to its canonical
 //!   lower-kebab form (e.g. `"K8V4"` → `"k8v4"`).
 //! - [`canonicalize`] — general field canonicalization against a whitelist.
@@ -30,12 +31,26 @@ const DEFAULT_HARDWARE_TAG: &str = "m5_max_128gb";
 /// The identity of the binary that produced a metrics row.
 ///
 /// Rust emitters (the server drainer, `rmlx baseline`, `rmlx eval`) build one
-/// of these instead of hand-rolling the five fields; shell emitters get the
+/// of these instead of hand-rolling the four fields; shell emitters get the
 /// same block as JSON from `rmlx metrics identity --json`. Both surfaces
 /// therefore agree by construction, and the §8.5 ingest validator rejects any
 /// `rmlx` record whose `backend_version` did not come from here.
 ///
-/// All five fields are `pub(crate)`, read via the getters below. A `pub`
+/// **Deliberately has no `git_sha` field.** Four review rounds concluded the
+/// binary cannot honestly know the commit it runs from — not at runtime (its
+/// working directory is not necessarily its own source checkout), and not at
+/// build time either (a compile-time SHA plus a runtime "is the tree dirty"
+/// probe against a discovered workspace root kept producing new defects:
+/// wrong-repo detection, stale-commit detection, untracked-file false
+/// positives — for a value nothing downstream needed the binary to guess).
+/// `git_sha` is caller-supplied provenance instead, exactly like
+/// `hardware_tag` already is via `RMLX_HARDWARE_TAG`: a bench script that
+/// runs `git rev-parse` in its own repo, or `rmlx baseline --git-sha` /
+/// `rmlx eval ppl --git-sha`, supplies it directly on the record.
+/// `RunRecord.git_sha` and `observations.git_sha` / `events.git_sha` stay as
+/// ordinary nullable columns — see `docs/METRICS_DB.md` §8.5.1.
+///
+/// All four fields are `pub(crate)`, read via the getters below. A `pub`
 /// field here would be the exact mutation hole closed on [`crate::ingest::RunRecord`]
 /// relocated one type upstream: `RunIdentity::stamp_json` takes `&self` and
 /// writes whatever fields it is given verbatim, with no validation of its
@@ -57,11 +72,6 @@ pub struct RunIdentity {
     pub(crate) backend: String,
     /// Semver of this binary (`[workspace.package].version`).
     pub(crate) backend_version: String,
-    /// Short git SHA of the checkout, `-dirty` suffixed when the tree had
-    /// uncommitted changes when this process started (not at build time —
-    /// see `rmlx_core::runinfo::source_tree_is_dirty`). `None` for an
-    /// installed binary with no checkout to interrogate.
-    pub(crate) git_sha: Option<String>,
     /// Real Cargo profile name: `release`, `release-perf`, `release-debug`, `debug`.
     pub(crate) build_profile: String,
     /// Hardware the run happened on. `RMLX_HARDWARE_TAG` overrides the default.
@@ -79,11 +89,6 @@ impl RunIdentity {
         &self.backend_version
     }
 
-    /// Short git SHA of the checkout, `-dirty` suffixed if applicable.
-    pub fn git_sha(&self) -> Option<&str> {
-        self.git_sha.as_deref()
-    }
-
     /// Real Cargo profile name.
     pub fn build_profile(&self) -> &str {
         &self.build_profile
@@ -95,13 +100,11 @@ impl RunIdentity {
     }
 }
 
-/// Computed once per process, cached in a `OnceLock`. None of the five fields
-/// can change while the process runs. `backend_version` / `build_profile` /
-/// the base `git_sha` are read from `build.rs`-stamped compile-time constants
-/// (no I/O). `hardware_tag` touches the environment via one `std::env::var`.
-/// The `-dirty` suffix on `git_sha` costs one `git status --porcelain`
-/// subprocess call, made at most once here — see
-/// [`rmlx_core::runinfo::source_tree_is_dirty`].
+/// Computed once per process, cached in a `OnceLock`. None of the four fields
+/// can change while the process runs. `backend_version` / `build_profile` are
+/// read from `build.rs`-stamped compile-time constants; `hardware_tag`
+/// touches the environment via one `std::env::var`. No I/O, no subprocess
+/// spawn, ever — the binary does no git of any kind at runtime.
 static IDENTITY: OnceLock<RunIdentity> = OnceLock::new();
 
 impl RunIdentity {
@@ -113,7 +116,6 @@ impl RunIdentity {
         IDENTITY.get_or_init(|| Self {
             backend: "rmlx".to_string(),
             backend_version: rmlx_core::runinfo::backend_version().to_string(),
-            git_sha: git_sha_with_dirty_check(),
             build_profile: rmlx_core::runinfo::build_profile().to_string(),
             hardware_tag: std::env::var("RMLX_HARDWARE_TAG")
                 .unwrap_or_else(|_| DEFAULT_HARDWARE_TAG.to_string()),
@@ -139,8 +141,14 @@ impl RunIdentity {
     /// Merge this identity into a §8.5 record that is still a `serde_json` object.
     ///
     /// For emitters that assemble the record with `serde_json::json!` rather
-    /// than a `RunRecord` struct literal. Overwrites any identity key already
-    /// present — the point is that the caller does not get to supply its own.
+    /// than a `RunRecord` struct literal. Overwrites `backend` /
+    /// `backend_version` / `build_profile` / `hardware_tag` unconditionally —
+    /// the caller does not get to supply its own for those. Deliberately
+    /// leaves `git_sha` untouched: that field is caller-supplied provenance
+    /// (see the struct doc), not something this binary derives, so a caller
+    /// that already set it (a script's own `"git_sha": "<sha>"` key from its
+    /// own `git rev-parse`) keeps its value, and a caller that did not set it
+    /// gets the §8.5 default (absent ⇒ `None` on ingest).
     pub fn stamp_json(&self, record: &mut serde_json::Value) -> Result<()> {
         let obj = record
             .as_object_mut()
@@ -154,41 +162,11 @@ impl RunIdentity {
             self.backend_version.clone().into(),
         );
         obj.insert(
-            "git_sha".to_string(),
-            self.git_sha
-                .clone()
-                .map_or(serde_json::Value::Null, Into::into),
-        );
-        obj.insert(
             "build_profile".to_string(),
             self.build_profile.clone().into(),
         );
         obj.insert("hardware_tag".to_string(), self.hardware_tag.clone().into());
         Ok(())
-    }
-}
-
-/// The compile-time git SHA, `-dirty` suffixed if the source tree that built
-/// this binary has uncommitted changes right now.
-///
-/// Deliberately NOT gated on `--metrics off` — `git_sha` is a *value*, not a
-/// telemetry write, and `rmlx metrics identity --json` (the documented
-/// identity source for every shell/Python emitter, `docs/METRICS_DB.md` §8.5)
-/// is a read/print command that must report the true answer regardless of
-/// `--metrics` mode. Gating it here would make `rmlx metrics identity --json`
-/// and `rmlx --metrics off metrics identity --json` disagree on the same
-/// binary and the same tree — exactly the kind of inconsistent identity this
-/// whole contract exists to prevent. It would also buy nothing: on every
-/// telemetry-writing path, `EventRecorder::open_at` / `baseline` / `eval`
-/// already return before this function is ever reached under `off`, so the
-/// `OnceLock` in [`RunIdentity::get`] is what avoids the cost there, not a
-/// mode check here.
-fn git_sha_with_dirty_check() -> Option<String> {
-    let sha = rmlx_core::runinfo::git_short_sha()?;
-    if rmlx_core::runinfo::source_tree_is_dirty() {
-        Some(format!("{sha}-dirty"))
-    } else {
-        Some(sha)
     }
 }
 

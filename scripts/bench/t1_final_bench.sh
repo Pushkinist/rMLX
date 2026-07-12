@@ -248,6 +248,7 @@ rec = {
     'max_ctx': int('${max_ctx}'),
     'decode_tps_mean': float('${tps_mean}'),
     'decode_tps_stddev': float('${tps_stddev}'),
+    'git_sha': '${GIT_SHA}',
     'notes': 'T1-final-bench',
 }
 print(json.dumps(rec))
@@ -288,6 +289,7 @@ words = ${first_32_words}
 output_first_64 = ' '.join(words)[:64]
 rec = {
     **json.loads(os.environ['RMLX_IDENTITY_JSON']),
+    'git_sha':         '${GIT_SHA}',
     'model_namespace': '${ns}',
     'model':           '${mdl}',
     'weight_quant':    '${weight_quant}',

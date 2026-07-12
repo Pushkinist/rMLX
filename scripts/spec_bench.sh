@@ -421,6 +421,7 @@ else:
 
 obj = {
     **json.loads(os.environ['RMLX_IDENTITY_JSON']),
+    "git_sha": git_sha,
     "model_namespace": "mlx-community",
     "model": "gemma-4-e2b-it-mxfp8",
     "weight_quant": "mxfp8",

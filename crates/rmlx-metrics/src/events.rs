@@ -240,7 +240,11 @@ impl EventRecorder {
                 m.value,
                 m.notes,
                 &identity.backend_version,
-                &identity.git_sha,
+                // `events.git_sha` is a caller-supplied provenance column
+                // (see `RunIdentity`'s doc); the drainer has no caller-supplied
+                // git-sha input, so every event row this recorder writes gets
+                // an honest NULL here rather than a guessed value.
+                Option::<String>::None,
                 &identity.build_profile,
             ],
         )?;

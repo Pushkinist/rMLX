@@ -408,6 +408,7 @@ with open('${PROMPT_FILE}') as f:
 prompt_body = pf.get('messages', pf.get('body', str(pf)))
 rec = {
     **json.loads(os.environ['RMLX_IDENTITY_JSON']),
+    'git_sha':         '${GIT_SHA}',
     'model_namespace': '${ns}',
     'model':           '${mdl}',
     'weight_quant':    '${weight_quant}',
@@ -462,6 +463,7 @@ rec = {
     'decode_tps_stddev': float('${decode_stddev}'),
     'prefill_tps': float('${prefill_mean}'),
     'ttft_ms': float('${ttft_ms}'),
+    'git_sha': '${GIT_SHA}',
     'notes': 'final-matrix',
 }
 print(json.dumps(rec))

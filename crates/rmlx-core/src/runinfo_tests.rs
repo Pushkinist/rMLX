@@ -3,9 +3,13 @@ use super::*;
 #[test]
 fn run_id_shape() {
     let id = make_run_id();
-    // YYYYMMDD-HHMMSS-... length >= 16
+    // YYYYMMDD-HHMMSS-<version>
     assert!(id.len() >= 16, "got: {id}");
     assert_eq!(&id[8..9], "-");
+    assert!(
+        id.ends_with(backend_version()),
+        "run-id must end with the version discriminator, got: {id}"
+    );
 }
 
 #[test]

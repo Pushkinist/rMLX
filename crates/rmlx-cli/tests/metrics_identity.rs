@@ -108,7 +108,10 @@ fn identity_json_carries_semver_and_real_build_profile() {
         "got {profile:?}"
     );
 
-    assert!(v.get("git_sha").is_some());
+    // `git_sha` is deliberately NOT part of run identity: the binary cannot
+    // honestly know the commit it was built from, so it is caller-supplied
+    // provenance (`--git-sha` on `baseline`/`eval ppl`), never printed here.
+    assert!(v.get("git_sha").is_none());
     assert!(v["hardware_tag"].as_str().is_some_and(|s| !s.is_empty()));
 }
 

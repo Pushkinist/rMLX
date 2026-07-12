@@ -615,6 +615,9 @@ pub(crate) struct BaselineRecordArgs<'a> {
     pub kv_quant: rmlx_kv_quant::KvQuant,
     /// Final resolved `ctx_max`.
     pub ctx_max: i64,
+    /// Caller-supplied `--git-sha` value, or `None`. Provenance only — the
+    /// binary never derives this itself (see `RunIdentity`'s doc).
+    pub git_sha: Option<&'a str>,
 }
 
 /// Resolve a `--prompt-tokens N` flag to the canonical `prompts/longctx_<N/1024>k.json`
@@ -762,11 +765,18 @@ fn build_run_record(
         "metrics": metrics,
     });
 
-    // Identity (backend, backend_version, git_sha, build_profile, hardware_tag)
-    // comes from the single Rust source — baseline does not assemble it.
+    // Identity (backend, backend_version, build_profile, hardware_tag) comes
+    // from the single Rust source — baseline does not assemble it.
+    // `stamp_json` deliberately does not touch `git_sha`: that field is
+    // caller-supplied provenance (see `RunIdentity`'s doc), not something
+    // this binary derives. `--git-sha` is the only source for it here.
     RunIdentity::get()
         .stamp_json(&mut record)
         .map_err(|e| anyhow::anyhow!("stamp run identity: {e}"))?;
+    record
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("record is not a JSON object"))?
+        .insert("git_sha".to_string(), serde_json::Value::from(args.git_sha));
 
     Ok(record)
 }

@@ -338,6 +338,7 @@ record = {
     'decode_tps_stddev':  ${tps_stddev},
     'step_ms_mean':       ${ttft_mean},
     'first_32_words':     ${first_32_words},
+    'git_sha':            '${GIT_SHA}',
     'notes':              'step_ms_mean=wall/completion_tokens; first_32_words from temp=0 decode',
 }
 print(json.dumps(record))
@@ -405,6 +406,7 @@ output_first_64 = ' '.join(words)[:64]
 
 rec = {
     **json.loads(os.environ['RMLX_IDENTITY_JSON']),
+    'git_sha':         '${GIT_SHA}',
     'model_namespace': ns,
     'model':           mdl,
     'weight_quant':    weight_quant,

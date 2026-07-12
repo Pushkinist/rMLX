@@ -198,6 +198,7 @@ for entry in "${MODELS[@]}"; do
         --max-tokens "${MAX_TOKENS}" \
         --max-ctx "${MAX_CTX}" \
         --label "canary sha=${GIT_SHA}" \
+        --git-sha "${GIT_SHA}" \
         --record \
         > /dev/null 2>&1; then
         echo "  runs.db: ok" >&2

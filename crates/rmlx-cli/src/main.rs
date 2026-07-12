@@ -1035,6 +1035,13 @@ enum Cmd {
         /// view immediately. Used by the bench harness.
         #[arg(long, default_value_t = false)]
         record: bool,
+        /// Commit SHA to record as provenance on the emitted metrics row
+        /// (only meaningful with `--record`). Optional caller-supplied
+        /// value — the binary cannot honestly know what commit it was
+        /// built from, so this is never derived or guessed. Absent by
+        /// default (`git_sha` is `NULL`).
+        #[arg(long, value_name = "SHA")]
+        git_sha: Option<String>,
         /// Root directory to search for canonical bench prompt files
         /// (`longctx_<N>k.json`). When unset, the binary walks up from the
         /// current working directory looking for a `prompts/` subdirectory that
@@ -1158,6 +1165,12 @@ enum EvalCmd {
         /// it wants a quick smoke run.
         #[arg(long, default_value_t = 0)]
         max_tokens: usize,
+        /// Commit SHA to record as provenance on the emitted metrics row.
+        /// Optional caller-supplied value — the binary cannot honestly know
+        /// what commit it was built from, so this is never derived or
+        /// guessed. Absent by default (`git_sha` is `NULL`).
+        #[arg(long, value_name = "SHA")]
+        git_sha: Option<String>,
     },
 }
 
@@ -1212,19 +1225,6 @@ fn main() -> Result<()> {
     // the DB or spawn the drainer. Every writer reads it from here; no call
     // site carries its own toggle.
     rmlx_metrics::mode::init(cli.metrics_mode.mode());
-
-    // Force run-identity resolution here, synchronously, at startup — not
-    // lazily on whichever `EventRecorder::record()` call happens to run
-    // first. That first call currently lands in `commands::serve`, before
-    // the tokio runtime starts, which is what keeps the (bounded but
-    // non-trivial: several `git` subprocess spawns) cost off an async
-    // worker today — but that safety is an accident of code order, not a
-    // guarantee; `record()` is also called from inside the runtime
-    // (request handlers, the admission controller, the multimodal cache).
-    // Resolving here makes the ordering explicit: by the time any tokio
-    // worker could possibly call `record()`, identity is already cached and
-    // `RunIdentity::get()` is a free `OnceLock` read everywhere else.
-    let _ = rmlx_metrics::identity::RunIdentity::get();
 
     // Set RUST_BACKTRACE before init_tracing so the call happens while the
     // process is genuinely single-threaded — no background threads exist yet
@@ -1905,6 +1905,7 @@ fn main() -> Result<()> {
             max_prompt_tokens,
             label: bench_label,
             record,
+            git_sha,
             prompts_dir,
             yarn_factor,
             yarn_original_max,
@@ -2004,6 +2005,7 @@ fn main() -> Result<()> {
 
             let bench_label_ref = bench_label.as_deref();
             let prompt_id_ref = prompt_id_opt.as_deref();
+            let git_sha_ref = git_sha.as_deref();
             let record_args = if record {
                 Some(commands::baseline::BaselineRecordArgs {
                     label: bench_label_ref,
@@ -2011,6 +2013,7 @@ fn main() -> Result<()> {
                     prompt_body: prompt_body_opt,
                     kv_quant: kv_quant_resolved,
                     ctx_max: resolved_ctx_max,
+                    git_sha: git_sha_ref,
                 })
             } else {
                 None
@@ -2045,6 +2048,7 @@ fn main() -> Result<()> {
                 corpus,
                 device,
                 max_tokens,
+                git_sha,
             } => {
                 // claim the Metal GPU before loading the model so a
                 // running `rmlx serve` does not contend on the single-process
@@ -2053,7 +2057,15 @@ fn main() -> Result<()> {
                 let dev = parse_device(&device)?;
                 let _claim = acquire_claim_for_device(dev, SENTINEL_PORT)?;
                 run_ppl(
-                    &model, &text_file, ctx_window, stride, &corpus, &device, max_tokens, &run_id,
+                    &model,
+                    &text_file,
+                    ctx_window,
+                    stride,
+                    &corpus,
+                    &device,
+                    max_tokens,
+                    &run_id,
+                    git_sha.as_deref(),
                 )?;
             }
         },

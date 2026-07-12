@@ -1,34 +1,38 @@
 //! Run identity: who this binary is, and which run it is.
 //!
-//! Run-id format: `YYYYMMDD-HHMMSS-<short-git-sha|nogit>`.
+//! Run-id format: `YYYYMMDD-HHMMSS-<version>`.
 //!
-//! [`backend_version`], [`build_profile`] and [`git_short_sha`] are the single
-//! source for the identity a metrics row records about the binary that
-//! produced it. Nothing else may hand-roll them — see `docs/METRICS_DB.md` §8.5.
+//! [`backend_version`] and [`build_profile`] are the single source for the
+//! identity a metrics row records about the binary that produced it. Nothing
+//! else may hand-roll them — see `docs/METRICS_DB.md` §8.5.
 //!
-//! **Exact semantics of the `<sha>[-dirty]` pair** (CLAUDE.md hard rule 7 —
-//! document the truth, not the docstring):
-//!
-//! `<sha>` is the commit this binary was compiled from, baked in at build
-//! time. `-dirty` (applied by [`crate::runinfo`]'s callers, not baked into the
-//! sha itself — see [`source_tree_is_dirty`]) means the source tree at that
-//! same compile-time path had uncommitted changes when *this process*
-//! started — not at build time. An installed binary with no source tree on
-//! this machine carries no `-dirty` suffix, ever: there is nothing on disk
-//! that could be dirty.
+//! There is deliberately no `git_short_sha` / `source_tree_is_dirty` here.
+//! Four review rounds concluded the binary cannot honestly know the commit it
+//! runs from: not at runtime (the working directory it is launched from is
+//! not necessarily its own source checkout — `rmlx serve` is normally started
+//! from a user's project, not this repo), and not at build time either
+//! (baking in a compile-time SHA, then trying to detect whether the source
+//! tree had since gone "dirty" relative to it, required an entire
+//! workspace-root-discovery + rerun-if-changed + runtime-probe apparatus that
+//! kept producing new defects — wrong-repo detection, stale-commit detection,
+//! untracked-file false positives — without any downstream consumer that
+//! actually needed the binary to guess). `git_sha` is now purely
+//! caller-supplied provenance, exactly like `hardware_tag` already was: a
+//! bench script that runs `git rev-parse` in its own repo, or `rmlx baseline
+//! --git-sha <sha>` / `rmlx eval ppl --git-sha <sha>`, supplies it. The
+//! recording surface accepts provenance; it does not invent it. See
+//! `docs/METRICS_DB.md` §8.5.1.
 
 /// Build a stable run-id for the current process.
 ///
-/// Used by both `logs/<run-id>.jsonl` and `metrics/<run-id>.jsonl`. Never
-/// dirty-suffixed — see [`source_tree_is_dirty`] for the (deliberately
-/// separate, runtime-resolved) working-tree-cleanliness signal that
-/// `rmlx_metrics::identity::RunIdentity` folds into `git_sha`. A run-id is
-/// just a tracking string (`docs/METRICS_DB.md` §3.2), not a value compared
-/// across runs, so it does not need that extra runtime check.
+/// Used by both `logs/<run-id>.jsonl` and `metrics/<run-id>.jsonl`. A run-id
+/// is just a tracking string (`docs/METRICS_DB.md` §3.2), not a value
+/// compared across runs — the version discriminator is enough to tell apart
+/// log files from different builds without claiming a commit the binary
+/// cannot actually verify.
 pub fn make_run_id() -> String {
     let ts = chrono_now_compact();
-    let sha = git_short_sha().unwrap_or_else(|| "nogit".to_string());
-    format!("{ts}-{sha}")
+    format!("{ts}-{}", backend_version())
 }
 
 /// Semver of this binary — the single source for `observations.backend_version`.
@@ -61,125 +65,6 @@ fn chrono_now_compact() -> String {
         .map_or(0, |d| d.as_secs());
     let (y, m, d, hh, mm, ss) = unix_to_ymdhms(secs);
     format!("{y:04}{m:02}{d:02}-{hh:02}{mm:02}{ss:02}")
-}
-
-/// Short git SHA of the commit that produced *this binary*, or `None` when
-/// there was no git checkout to read at build time (e.g. built from a source
-/// tarball), or the checkout found was not this workspace (see `build.rs`).
-///
-/// **Never `-dirty` suffixed.** Baked in at compile time by `build.rs`,
-/// anchored to the workspace root — deliberately NOT read at runtime via `git
-/// rev-parse` in the process's working directory. An installed `rmlx` is
-/// normally launched from someone else's project (`rmlx serve` inside a
-/// user's repo): a runtime `git` invocation would stamp *that* repo's SHA
-/// into every metrics row this process produces. The whole point of this
-/// function is identity that is actually the binary's, not whatever happens
-/// to be in the current directory.
-///
-/// Working-tree cleanliness is a *runtime* fact (whether the tree has changed
-/// since this exact binary was compiled) and cannot be baked in without going
-/// stale the moment a source file is edited without touching whatever narrow
-/// set of paths a build script watches — see [`source_tree_is_dirty`].
-pub fn git_short_sha() -> Option<String> {
-    let sha = env!("RMLX_GIT_SHA");
-    if sha.is_empty() {
-        None
-    } else {
-        Some(sha.to_string())
-    }
-}
-
-/// True if the source tree that built this binary currently has uncommitted
-/// changes to TRACKED files, and is still on the exact commit this binary was
-/// compiled from — against the workspace root [`build.rs`](../../build.rs)
-/// stamped at compile time (never the runtime working directory).
-///
-/// Two self-consistency guards, both required, in addition to the base "is
-/// there even a source tree to check" gate:
-///
-/// - The tree at the compile-time path must still be a git repo whose OWN
-///   toplevel is exactly that path. `git` does normal upward repository
-///   discovery: if the checkout was deleted and the directory recreated
-///   inside an unrelated enclosing repo, `git -C <path> status` would
-///   otherwise silently report *that* repo's state. [`build.rs`](../../build.rs)
-///   already refuses to trust a mismatched toplevel at compile time (see its
-///   doc comment); this is the runtime equivalent of that same guard.
-/// - The tree's current `HEAD` must still be the exact commit the baked
-///   `RMLX_GIT_SHA` was taken from. If the tree has since moved to a
-///   different commit, "dirty relative to a commit it is no longer on" is
-///   unanswerable — this makes no claim rather than compose `<stale-sha>
-///   -dirty`, a string that would assert something about a commit the
-///   measurement was never actually taken at.
-///
-/// Ignores untracked files: `git diff --quiet HEAD` (compares the working
-/// tree against `HEAD`, both staged and unstaged) is used instead of `git
-/// status --porcelain`, which also flags untracked files — a stray untracked
-/// artifact (an editor swapfile, a `cargo install --git` checkout's
-/// `.cargo-ok` marker, …) was never compiled into the binary and must not
-/// flip it "dirty" permanently.
-///
-/// Memoized internally in a local `OnceLock` — every call after the first is
-/// a free read. Safe to call from anywhere; callers do not need to remember
-/// to cache it themselves.
-pub fn source_tree_is_dirty() -> bool {
-    static DIRTY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DIRTY.get_or_init(compute_source_tree_is_dirty)
-}
-
-fn compute_source_tree_is_dirty() -> bool {
-    let root = env!("RMLX_SOURCE_ROOT");
-    let baked_sha = env!("RMLX_GIT_SHA");
-    if root.is_empty() || baked_sha.is_empty() || !std::path::Path::new(root).is_dir() {
-        return false;
-    }
-
-    // Guard 1: `root` must still be its OWN repo's toplevel, not an
-    // enclosing repo git found by walking up.
-    let Some(toplevel) = git_stdout(root, &["rev-parse", "--show-toplevel"]) else {
-        return false;
-    };
-    let (Ok(toplevel_canon), Ok(root_canon)) = (
-        std::fs::canonicalize(toplevel.trim()),
-        std::fs::canonicalize(root),
-    ) else {
-        return false;
-    };
-    if toplevel_canon != root_canon {
-        return false;
-    }
-
-    // Guard 2: the tree must still be on the exact commit `RMLX_GIT_SHA`
-    // names — otherwise there is nothing self-consistent to report.
-    let Some(current_sha) = git_stdout(root, &["rev-parse", "--short=7", "HEAD"]) else {
-        return false;
-    };
-    if current_sha.trim() != baked_sha {
-        return false;
-    }
-
-    // Tracked-file changes only. Exit code 1 means "has a diff"; anything
-    // else (0 = clean, or a spawn/repo error) is treated as not-dirty —
-    // an honest "no claim" beats guessing dirty on an unexpected exit code.
-    std::process::Command::new("git")
-        .args(["-C", root, "diff", "--quiet", "HEAD"])
-        .status()
-        .ok()
-        .and_then(|s| s.code())
-        == Some(1)
-}
-
-/// Run `git -C <dir> <args>`, returning trimmed stdout on a successful exit,
-/// `None` on any failure.
-fn git_stdout(dir: &str, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Civil-time conversion for UTC. No leap-second handling — we don't need it.
