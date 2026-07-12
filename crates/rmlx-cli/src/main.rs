@@ -47,7 +47,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use rmlx_core::runinfo::make_run_id;
 use rmlx_metrics::events::EventRecorder;
 use rmlx_server::SENTINEL_PORT;
-use startup::{init_tracing, print_cache_type_table, LogLevel};
+use startup::{init_tracing, print_cache_type_table, LogLevel, MetricsArg};
 use tracing::info;
 
 use commands::metrics::{dispatch as metrics_dispatch, MetricsCmd};
@@ -192,6 +192,14 @@ struct Cli {
     /// when set. Default `info`.
     #[arg(long, value_enum, global = true, default_value_t = LogLevel::Info)]
     log: LogLevel,
+    /// Metrics recording level (off|events|full). Default `full`.
+    ///
+    /// `off` writes nothing — the drainer never spawns and `runs.db` is never
+    /// opened or created. `events` keeps the runtime event stream but records
+    /// no bench observations. Reading (`rmlx metrics best|export|query`) works
+    /// in every mode.
+    #[arg(long = "metrics", value_enum, global = true, default_value_t = MetricsArg::Full)]
+    metrics_mode: MetricsArg,
     /// Total size cap for `<RMLX_HOME>/logs/` in megabytes. When the directory
     /// exceeds this limit at startup, the oldest `.jsonl` files are deleted
     /// until the total is within the cap. `0` disables rotation (logs grow
@@ -1199,6 +1207,11 @@ fn main() -> Result<()> {
     // Parse CLI first so `--log` can shape the tracing filter.
     let cli = Cli::parse();
     let run_id = make_run_id();
+
+    // Resolve the metrics kill switch exactly once, before anything can open
+    // the DB or spawn the drainer. Every writer reads it from here; no call
+    // site carries its own toggle.
+    rmlx_metrics::mode::init(cli.metrics_mode.mode());
 
     // Set RUST_BACKTRACE before init_tracing so the call happens while the
     // process is genuinely single-threaded — no background threads exist yet

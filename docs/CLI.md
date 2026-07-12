@@ -35,6 +35,7 @@ verification.
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `--log` | `info \| debug \| verbose` | `info` | Log verbosity preset. `RUST_LOG` overrides this when set. `info` keeps per-token and per-layer trace events off; `debug` enables per-step phase events; `verbose` enables per-token, per-FFI, and per-layer trace events. |
+| `--metrics` | `off \| events \| full` | `full` | Metrics recording level. `off` writes nothing — the SPSC drainer is never spawned and `runs.db` is never opened or created. `events` keeps the runtime event stream but records no bench observations. Reading (`rmlx metrics best|export|query`) works in every mode. See [`docs/METRICS_DB.md`](METRICS_DB.md) §10.1.1. |
 
 ---
 
@@ -567,6 +568,49 @@ of `--inline`, `--file`, `--stdin`, or `--replay-pending` must be provided.
 | `--stdin` | off | Read JSON from stdin. |
 | `--dry-run` | off | Validate and show what would be written without committing. |
 | `--replay-pending` | off | Walk `metrics/buffer/pending/`, ingest each file, move failures to `failed/`. |
+
+#### `metrics identity`
+
+Print the §8.5 run-identity block of *this* binary: `backend`, `backend_version`,
+`git_sha`, `build_profile`, `hardware_tag`.
+
+This is how a non-Rust emitter learns who the measured binary is. Bench scripts
+merge the JSON block into their §8.5 record instead of hard-coding a version or
+guessing a build profile — see `scripts/lib/identity.sh` and
+`scripts/lib/rmlx_record.py`.
+
+```bash
+rmlx metrics identity --json
+# {"backend":"rmlx","backend_version":"0.2.8","git_sha":"aaac659","build_profile":"release","hardware_tag":"m5_max_128gb"}
+
+rmlx metrics identity          # human-readable
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--json` | off | Emit a single JSON object (the form bench scripts consume). |
+
+`build_profile` is the real Cargo profile name (`release`, `release-perf`,
+`release-debug`, `debug`), stamped at build time from `OUT_DIR` — not a
+`cfg!(debug_assertions)` guess, which cannot tell the three release profiles apart.
+
+#### `metrics validate`
+
+Validate a §8.5 record and write nothing. Runs the *same* `RunRecord::validate`
+the recorder runs, so a record that passes here will ingest. Exit 1 on rejection.
+
+```bash
+rmlx metrics validate --file metrics/buffer/pending/run.json
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--file <path>` | — | Read JSON from file. |
+| `--stdin` | off | Read JSON from stdin. |
+
+An `rmlx` record with a missing or non-semver `backend_version` is rejected —
+see [`docs/METRICS_DB.md`](METRICS_DB.md) §8.5.1. Other backends keep the field
+optional and free-form.
 
 #### `metrics best`
 

@@ -17,11 +17,10 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::Result;
+use rmlx_metrics::identity::RunIdentity;
 use rmlx_mlx::Device;
 use rmlx_models::{arch, ppl};
 use tracing::{info, instrument, warn};
-
-const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Run `rmlx eval ppl`.
 ///
@@ -167,14 +166,19 @@ pub(crate) fn run_ppl(
             score_ms,
             &weight_quant,
         )?;
+        if !rmlx_metrics::mode::observations_enabled() {
+            info!("ppl: observations disabled, no record written");
+            return Ok(());
+        }
+
         let buf_path = write_buffer_record(&record)?;
         info!(path = %buf_path.display(), "ppl: wrote §8.5 ingest record");
 
         let db_path = rmlx_core::paths::metrics_db_path();
         match rmlx_metrics::schema::open(&db_path) {
             Ok(mut conn) => {
-                let mut rec_inst =
-                    rmlx_metrics::recorder::Recorder::new(&mut conn, format!("rmlx-cli@{VERSION}"));
+                let inserted_by = RunIdentity::rmlx().inserted_by("rmlx-cli");
+                let mut rec_inst = rmlx_metrics::recorder::Recorder::new(&mut conn, inserted_by);
                 let run: rmlx_metrics::ingest::RunRecord = serde_json::from_value(record)
                     .map_err(|e| anyhow::anyhow!("deserialize RunRecord: {e}"))?;
                 match rec_inst.record_run(&run) {
@@ -231,19 +235,6 @@ fn build_ppl_run_record(
     let (ns, model_name) = rmlx_metrics::identity::split_model_path(&snapshot_str)
         .map_err(|e| anyhow::anyhow!("split_model_path({snapshot_str}): {e}"))?;
     let ts_utc = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    let hardware_tag =
-        std::env::var("RMLX_HARDWARE_TAG").unwrap_or_else(|_| "m5_max_128gb".to_string());
-
-    let git_sha: Option<String> = {
-        let parts: Vec<&str> = run_id.splitn(4, '-').collect();
-        parts.get(2).map(|s| {
-            if parts.get(3).copied() == Some("dirty") {
-                format!("{s}-dirty")
-            } else {
-                s.to_string()
-            }
-        })
-    };
 
     // Op-name pattern: `ppl_<corpus_id>` so multiple corpora can coexist in
     // the same table (`ppl_wikitext2`, future `ppl_c4`, ...).
@@ -260,8 +251,8 @@ fn build_ppl_run_record(
 
     let prompt_name = format!("{corpus}_ctx{ctx_window}_stride{stride}");
 
-    Ok(serde_json::json!({
-        "backend": "rmlx",
+    let mut record = serde_json::json!({
+        "schema_version": rmlx_metrics::ingest::RECORD_SCHEMA_VERSION,
         "model_namespace": ns,
         "model": model_name,
         // `weight_quant` is whitelist-validated by `rmlx_metrics::identity`;
@@ -277,8 +268,6 @@ fn build_ppl_run_record(
             "body": format!("ppl-corpus:{corpus}:ctx={ctx_window}:stride={stride}"),
         },
         "ts_utc": ts_utc,
-        "git_sha": git_sha,
-        "hardware_tag": hardware_tag,
         "prompt_tokens": n_tokens,
         "max_tokens": 0,
         "temperature": 0.0,
@@ -288,7 +277,14 @@ fn build_ppl_run_record(
         "notes": format!("corpus={corpus} ctx_window={ctx_window} stride={stride}"),
         "description": format!("ppl {run_id}"),
         "metrics": metrics,
-    }))
+    });
+
+    // Identity comes from the single Rust source — eval does not assemble it.
+    RunIdentity::rmlx()
+        .stamp_json(&mut record)
+        .map_err(|e| anyhow::anyhow!("stamp run identity: {e}"))?;
+
+    Ok(record)
 }
 
 /// Write a `RunRecord` JSON to `<RMLX_HOME>/metrics/buffer/pending/<ts>-<uuid>.json`.

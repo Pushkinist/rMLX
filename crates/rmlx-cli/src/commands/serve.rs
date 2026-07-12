@@ -1053,10 +1053,8 @@ pub(crate) fn run_serve(
         "rmlx serve starting"
     );
 
-    // Gather git-sha and hardware-tag for the SPSC drainer record context.
-    // Falls back to None for installed binaries with no git checkout — harmless.
-    let drainer_git_sha: Option<String> = rmlx_core::runinfo::git_short_sha();
-    let drainer_hw_tag = "m5_max_128gb".to_owned();
+    // Run identity for the SPSC drainer comes from RunIdentity::rmlx() inside
+    // the drainer itself — serve does not assemble it.
     let drainer_db_path = rmlx_core::paths::metrics_db_path();
 
     // F6/L18: SPSC async drainer db path for per-request SQLite metrics.
@@ -1074,8 +1072,7 @@ pub(crate) fn run_serve(
     rt.block_on(async {
         // F6/L18: spawn the SPSC metrics drainer task.
         // Must be inside block_on so tokio::spawn is available.
-        let drainer_handle = spawn_drainer(drainer_db_path, drainer_hw_tag, drainer_git_sha);
-        info!("metrics_drainer: SPSC drainer task started (F6/L18)");
+        let drainer_handle = spawn_drainer(drainer_db_path);
 
         let mut state = AppState {
             registry,

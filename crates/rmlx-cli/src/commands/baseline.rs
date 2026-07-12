@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use rmlx_metrics::events::EventRecorder;
+use rmlx_metrics::identity::RunIdentity;
 use rmlx_mlx::Device;
 use rmlx_models::arch;
 use tracing::{info, info_span, warn};
@@ -545,6 +546,11 @@ pub(crate) fn run_baseline(
             &preview_64,
             kv_cache_bytes,
         )?;
+        if !rmlx_metrics::mode::observations_enabled() {
+            info!("baseline: observations disabled, no record written");
+            return Ok(());
+        }
+
         let path = write_buffer_record(&record)?;
         info!(path = %path.display(), "baseline: wrote §8.5 ingest record");
 
@@ -554,9 +560,8 @@ pub(crate) fn run_baseline(
         let db_path = rmlx_core::paths::metrics_db_path();
         match rmlx_metrics::schema::open(&db_path) {
             Ok(mut conn) => {
-                const VERSION: &str = env!("CARGO_PKG_VERSION");
-                let mut rec_inst =
-                    rmlx_metrics::recorder::Recorder::new(&mut conn, format!("rmlx-cli@{VERSION}"));
+                let inserted_by = RunIdentity::rmlx().inserted_by("rmlx-cli");
+                let mut rec_inst = rmlx_metrics::recorder::Recorder::new(&mut conn, inserted_by);
                 let run: rmlx_metrics::ingest::RunRecord = serde_json::from_value(record)
                     .map_err(|e| anyhow::anyhow!("deserialize RunRecord: {e}"))?;
                 match rec_inst.record_run(&run) {
@@ -687,23 +692,6 @@ fn build_run_record(
         .map_err(|e| anyhow::anyhow!("split_model_path({snapshot_str}): {e}"))?;
 
     let ts_utc = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    let hardware_tag =
-        std::env::var("RMLX_HARDWARE_TAG").unwrap_or_else(|_| "m5_max_128gb".to_string());
-
-    // Extract git_sha from run_id (format: YYYYMMDD-HHMMSS-<sha>[-dirty]).
-    // Parts: [date, time, sha, optional-"dirty"]. The sha is the third segment.
-    let git_sha: Option<String> = {
-        let parts: Vec<&str> = run_id.splitn(4, '-').collect();
-        parts.get(2).map(|s| {
-            // Re-attach "-dirty" suffix if present so the sha matches the
-            // `observations.git_sha` column format expected by `rmlx metrics deltas`.
-            if parts.get(3).copied() == Some("dirty") {
-                format!("{s}-dirty")
-            } else {
-                s.to_string()
-            }
-        })
-    };
 
     // Prompt: prefer the canonical longctx body when known, else embed the
     // raw text under the supplied label.
@@ -748,8 +736,8 @@ fn build_run_record(
     }
     let metrics = serde_json::Value::Array(metrics);
 
-    Ok(serde_json::json!({
-        "backend": "rmlx",
+    let mut record = serde_json::json!({
+        "schema_version": rmlx_metrics::ingest::RECORD_SCHEMA_VERSION,
         "model_namespace": ns,
         "model": model,
         "weight_quant": weight_quant,
@@ -760,8 +748,6 @@ fn build_run_record(
             "body": prompt_body,
         },
         "ts_utc": ts_utc,
-        "git_sha": git_sha,
-        "hardware_tag": hardware_tag,
         "prompt_tokens": prompt_tokens,
         "max_tokens": max_tokens,
         "temperature": 0.0,
@@ -771,7 +757,15 @@ fn build_run_record(
         "notes": notes,
         "description": format!("baseline {run_id}"),
         "metrics": metrics,
-    }))
+    });
+
+    // Identity (backend, backend_version, git_sha, build_profile, hardware_tag)
+    // comes from the single Rust source — baseline does not assemble it.
+    RunIdentity::rmlx()
+        .stamp_json(&mut record)
+        .map_err(|e| anyhow::anyhow!("stamp run identity: {e}"))?;
+
+    Ok(record)
 }
 
 /// Write a `RunRecord` JSON to `<RMLX_HOME>/metrics/buffer/pending/<ts>-<uniq>.json`.

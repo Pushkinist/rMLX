@@ -9,6 +9,11 @@
 set -uo pipefail
 
 RMLX_BIN="${RMLX_BIN:-${RMLX_ROOT}/target/release/rmlx}"
+
+# Run identity (backend / version / git sha / build profile / hardware tag)
+# comes from the measured binary — never hard-coded here.
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/identity.sh"
+rmlx_export_identity "${RMLX_BIN}"
 PORT=62265
 WARMUP_RUNS=1
 MEASURE_RUNS=3
@@ -333,13 +338,12 @@ print(f'{dmean:.2f} {dstd:.2f}')
     local record_path="${RMLX_ROOT}/metrics/buffer/pending/${buf_ts}-${buf_uuid}.json"
 
     python3 -c "
-import json
+import json, os
 with open('${prompt_file}') as f:
     pf = json.load(f)
 prompt_body = pf.get('messages', pf.get('body', str(pf)))
 rec = {
-    'backend':         'rmlx',
-    'backend_version': '0.0.1',
+    **json.loads(os.environ['RMLX_IDENTITY_JSON']),
     'model_namespace': '${ns}',
     'model':           '${mdl}',
     'weight_quant':    '${weight_quant}',
@@ -351,9 +355,6 @@ rec = {
         'tokens_approx': int('${PROMPT_TOKENS}'),
     },
     'ts_utc':          '${TS_UTC}',
-    'git_sha':         '${GIT_SHA}',
-    'build_profile':   'release',
-    'hardware_tag':    'm5_max_128gb',
     'prompt_tokens':   int('${PROMPT_TOKENS}'),
     'max_tokens':      int('${MAX_TOKENS}'),
     'temperature':     0.0,
@@ -384,8 +385,9 @@ print(f'buffer: ${record_path}')
     fi
 
     python3 -c "
-import json
+import json, os
 rec = {
+    **json.loads(os.environ['RMLX_IDENTITY_JSON']),
     'run_id': '${run_id}',
     'ts_utc': '${TS_UTC}',
     'model_path': '${GEMMA_PATH}',
@@ -396,7 +398,6 @@ rec = {
     'decode_tps_stddev': float('${decode_stddev}'),
     'prefill_tps': float('${prefill_tps}'),
     'ttft_ms': float('${ttft_ms}'),
-    'git_sha': '${GIT_SHA}',
     'notes': 'gemma-matrix-bench',
 }
 print(json.dumps(rec))

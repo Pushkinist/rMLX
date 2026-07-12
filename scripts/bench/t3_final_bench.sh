@@ -11,6 +11,11 @@
 set -uo pipefail
 
 RMLX_BIN="${RMLX_BIN:-${RMLX_ROOT}/target/release/rmlx}"
+
+# Run identity (backend / version / git sha / build profile / hardware tag)
+# comes from the measured binary — never hard-coded here.
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/identity.sh"
+rmlx_export_identity "${RMLX_BIN}"
 PORT=62265
 WARMUP_RUNS=1
 MEASURE_RUNS=3
@@ -234,8 +239,9 @@ print(json.dumps(words))
 
     # Write legacy JSONL
     python3 -c "
-import json
+import json, os
 rec = {
+    **json.loads(os.environ['RMLX_IDENTITY_JSON']),
     'run_id': '${run_id}',
     'ts_utc': '${TS_UTC}',
     'model_path': '${model_path}',
@@ -243,7 +249,6 @@ rec = {
     'max_ctx': int('${max_ctx}'),
     'decode_tps_mean': float('${tps_mean}'),
     'decode_tps_stddev': float('${tps_stddev}'),
-    'git_sha': '${GIT_SHA}',
     'notes': 'final-bench',
 }
 print(json.dumps(rec))
@@ -283,8 +288,7 @@ prompt_body = pf['messages']
 words = ${first_32_words}
 output_first_64 = ' '.join(str(w) for w in words)[:64]
 rec = {
-    'backend':         'rmlx',
-    'backend_version': '0.0.1',
+    **json.loads(os.environ['RMLX_IDENTITY_JSON']),
     'model_namespace': '${ns}',
     'model':           '${mdl}',
     'weight_quant':    '${weight_quant}',
@@ -296,9 +300,6 @@ rec = {
         'tokens_approx': int('${prompt_tokens}'),
     },
     'ts_utc':          '${TS_UTC}',
-    'git_sha':         '${GIT_SHA}',
-    'build_profile':   'release',
-    'hardware_tag':    'm5_max_128gb',
     'prompt_tokens':   int('${prompt_tokens}'),
     'max_tokens':      int('${MAX_TOKENS}'),
     'temperature':     0.0,

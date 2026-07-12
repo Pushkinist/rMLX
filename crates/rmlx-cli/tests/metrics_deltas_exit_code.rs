@@ -26,11 +26,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use rmlx_metrics::{
-    ingest::{MetricEntry, PromptRef, RunRecord},
-    migrate,
-    recorder::Recorder,
-};
+use rmlx_metrics::{ingest::RunRecord, migrate, recorder::Recorder};
 use rusqlite::Connection;
 use serde_json::json;
 
@@ -68,7 +64,13 @@ fn persist_to(conn: &Connection, path: &Path) {
         .unwrap();
 }
 
-/// Minimal RunRecord builder.
+/// Minimal RunRecord fixture.
+///
+/// `RunRecord` is `#[non_exhaustive]`, so an out-of-crate struct literal is a
+/// compile error by design. External construction goes through either
+/// `RunRecordBuilder` (rMLX's own emitters) or the §8.5 wire shape, as here —
+/// this fixture needs to mint arbitrary backends and git SHAs, which the
+/// builder deliberately does not allow.
 fn make_run(
     backend: &str,
     model: &str,
@@ -77,39 +79,33 @@ fn make_run(
     ts: &str,
     git_sha: Option<&str>,
 ) -> RunRecord {
-    RunRecord {
-        backend: backend.into(),
-        backend_version: Some("0.0.1".into()),
-        model_namespace: "mlx-community".into(),
-        model: model.into(),
-        weight_quant: "mxfp8".into(),
-        kv_quant: "k8v8".into(),
-        ctx_max: 8192,
-        prompt: PromptRef::ByBody {
-            name: "test_prompt".into(),
-            body: json!("the quick brown fox"),
-            notes: None,
-            tokens_approx: Some(4),
+    serde_json::from_value(json!({
+        "schema_version": rmlx_metrics::ingest::RECORD_SCHEMA_VERSION,
+        "backend": backend,
+        "backend_version": "0.0.1",
+        "model_namespace": "mlx-community",
+        "model": model,
+        "weight_quant": "mxfp8",
+        "kv_quant": "k8v8",
+        "ctx_max": 8192,
+        "prompt": {
+            "name": "test_prompt",
+            "body": "the quick brown fox",
+            "tokens_approx": 4,
         },
-        ts_utc: ts.into(),
-        git_sha: git_sha.map(str::to_owned),
-        build_profile: Some("release".into()),
-        hardware_tag: "m5_max_128gb".into(),
-        prompt_tokens: Some(4),
-        max_tokens: Some(32),
-        temperature: Some(0.0),
-        seed: Some(0),
-        n_warmups: Some(1),
-        n_measure: Some(3),
-        output_first_64: None,
-        notes: None,
-        description: None,
-        metrics: vec![MetricEntry {
-            name: metric.into(),
-            value: Some(value),
-            stddev: None,
-        }],
-    }
+        "ts_utc": ts,
+        "git_sha": git_sha,
+        "build_profile": "release",
+        "hardware_tag": "m5_max_128gb",
+        "prompt_tokens": 4,
+        "max_tokens": 32,
+        "temperature": 0.0,
+        "seed": 0,
+        "n_warmups": 1,
+        "n_measure": 3,
+        "metrics": [{ "name": metric, "value": value }],
+    }))
+    .expect("valid §8.5 record")
 }
 
 /// Seed a DB with a baseline observation at `sha_base`, then a regressed

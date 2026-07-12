@@ -25,6 +25,7 @@ fn make_run(
     git_sha: Option<&str>,
 ) -> RunRecord {
     RunRecord {
+        schema_version: crate::ingest::RECORD_SCHEMA_VERSION,
         backend: backend.into(),
         backend_version: Some("0.0.1".into()),
         model_namespace: "mlx-community".into(),

@@ -19,7 +19,7 @@ use rusqlite::params;
 use rusqlite::Connection;
 
 use crate::error::{Error, Result};
-use crate::ingest::{prompt_body_sha256, PromptRef, RunRecord};
+use crate::ingest::{prompt_body_sha256, IdentityPolicy, PromptRef, RunRecord};
 use crate::prompts::{PromptId, PromptStore};
 use crate::registry;
 use crate::time_util::now_iso8601;
@@ -35,14 +35,35 @@ use crate::time_util::now_iso8601;
 pub struct Recorder<'a> {
     conn: &'a mut Connection,
     inserted_by: String,
+    policy: IdentityPolicy,
 }
 
 impl<'a> Recorder<'a> {
-    /// `inserted_by` should look like `"rmlx-cli@0.0.1"` — see §10.3 audit.
+    /// `inserted_by` should look like `"rmlx-cli@0.2.8"` — see §10.3 audit.
+    /// Build it with `RunIdentity::inserted_by` rather than a literal.
+    ///
+    /// Enforces the §8.5 run-identity contract: an `rmlx` record without a
+    /// semver `backend_version` is rejected.
     pub fn new(conn: &'a mut Connection, inserted_by: impl Into<String>) -> Self {
         Self {
             conn,
             inserted_by: inserted_by.into(),
+            policy: IdentityPolicy::Enforce,
+        }
+    }
+
+    /// Recorder for the one-shot import of pre-contract archives
+    /// (`rmlx metrics migrate`): legacy JSONL / CBB CSV / records-MD rows that
+    /// predate the identity contract and have no version to state.
+    ///
+    /// NEVER use this to record a new measurement — it is the one door around
+    /// the identity check, and it exists only because fabricating a semver for
+    /// a 2026-01 archive row would be exactly the bug the check prevents.
+    pub fn legacy_archive(conn: &'a mut Connection, inserted_by: impl Into<String>) -> Self {
+        Self {
+            conn,
+            inserted_by: inserted_by.into(),
+            policy: IdentityPolicy::LegacyArchive,
         }
     }
 
@@ -57,8 +78,10 @@ impl<'a> Recorder<'a> {
     /// opened. Any other failure inside the transaction causes a rollback — the
     /// DB is left unchanged.
     pub fn record_run(&mut self, run: &RunRecord) -> Result<RecordOutcome> {
-        // Step 1: validate before opening the transaction.
-        run.validate()?;
+        // Step 1: validate before opening the transaction. Every ingest path in
+        // the workspace funnels through here, so this is the single point that
+        // enforces the §8.5 contract.
+        run.validate_with(self.policy)?;
 
         // Step 2: begin transaction.
         let tx = self.conn.transaction()?;

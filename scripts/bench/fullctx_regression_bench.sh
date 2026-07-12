@@ -8,6 +8,11 @@
 set -euo pipefail
 
 RMLX_BIN="${RMLX_BIN:-${RMLX_ROOT}/target/release/rmlx}"
+
+# Run identity (backend / version / git sha / build profile / hardware tag)
+# comes from the measured binary — never hard-coded here.
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/identity.sh"
+rmlx_export_identity "${RMLX_BIN}"
 PORT=62265
 WARMUP_RUNS=1
 MEASURE_RUNS=3
@@ -209,13 +214,12 @@ print(f'{delta:+.1f}')
     local record_path="${RMLX_ROOT}/metrics/buffer/pending/${buf_ts}-${buf_uuid}.json"
 
     python3 - <<PYEOF > "${record_path}" 2>/dev/null || { log "WARN: failed to build record"; rm -f "${record_path}"; }
-import json
+import json, os
 with open('${prompt_file}') as f:
     pf = json.load(f)
 first_64 = '${first_text}'[:64] if '${first_text}' else ''
 rec = {
-    'backend':         'rmlx',
-    'backend_version': '0.0.1',
+    **json.loads(os.environ['RMLX_IDENTITY_JSON']),
     'model_namespace': '${ns}',
     'model':           '${mdl}',
     'weight_quant':    'q8_0',
@@ -227,9 +231,6 @@ rec = {
         'tokens_approx': int('${prompt_tokens}'),
     },
     'ts_utc':          '${TS_UTC}',
-    'git_sha':         '${GIT_SHA}',
-    'build_profile':   'release',
-    'hardware_tag':    'm5_max_128gb',
     'prompt_tokens':   int('${prompt_tokens}'),
     'max_tokens':      ${MAX_TOKENS},
     'temperature':     0.0,

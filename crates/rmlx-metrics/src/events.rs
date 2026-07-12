@@ -25,6 +25,7 @@ use rusqlite::{params, Connection};
 use serde::Serialize;
 
 use crate::error::{Error, Result};
+use crate::identity::RunIdentity;
 use crate::time_util::now_iso8601;
 use crate::{migrate, schema};
 
@@ -115,13 +116,23 @@ pub struct Measurement<'a> {
 
 /// DB-direct per-event recorder. Replaces `MetricsSink`. Open once per run;
 /// share via `Arc` across threads.
+///
+/// Every row is stamped with the same [`RunIdentity`] that `observations` rows
+/// carry, so the two tables agree on who produced a run without having to
+/// reverse-engineer a semver out of the SHA embedded in `run_id`.
+///
+/// Under `--metrics off` the recorder holds no connection: the SQLite file is
+/// never opened or created, and [`EventRecorder::record`] is an immediate
+/// `Ok(())`.
 #[allow(
     clippy::exhaustive_structs,
     reason = "internal recorder — fields are private impl detail; public API is the record() method, not struct literal construction"
 )]
 pub struct EventRecorder {
     run_id: String,
-    conn: Mutex<Connection>,
+    identity: RunIdentity,
+    /// `None` under `--metrics off` — no DB is opened.
+    conn: Option<Mutex<Connection>>,
 }
 
 #[allow(
@@ -147,7 +158,19 @@ impl EventRecorder {
 
     /// Same as [`open`] but lets the caller specify the DB path. Used by
     /// unit tests with a `tempdir`.
+    ///
+    /// Under `--metrics off` this opens nothing — not the file, not the parent
+    /// directory — and returns a recorder whose `record` is a no-op.
     pub fn open_at(db_path: &Path, run_id: &str) -> Result<Self> {
+        if !crate::mode::events_enabled() {
+            tracing::debug!(run_id, "events: --metrics off, no DB opened");
+            return Ok(Self {
+                run_id: run_id.to_owned(),
+                identity: RunIdentity::rmlx(),
+                conn: None,
+            });
+        }
+
         if let Some(parent) = db_path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent).map_err(|e| {
@@ -159,7 +182,8 @@ impl EventRecorder {
         migrate::run_pending(&mut conn)?;
         Ok(Self {
             run_id: run_id.to_owned(),
-            conn: Mutex::new(conn),
+            identity: RunIdentity::rmlx(),
+            conn: Some(Mutex::new(conn)),
         })
     }
 
@@ -167,17 +191,22 @@ impl EventRecorder {
     ///
     /// Returns `Err` on any SQLite failure — no retry. The hot path is one
     /// prepared `INSERT` per call; SQLite WAL absorbs concurrent writers.
+    ///
+    /// No-op under `--metrics off`.
     pub fn record(&self, m: &Measurement<'_>) -> Result<()> {
+        let Some(conn) = self.conn.as_ref() else {
+            return Ok(());
+        };
         let ts = now_iso8601()?;
-        let guard = self
-            .conn
+        let guard = conn
             .lock()
             .map_err(|_| Error::Schema("events: connection mutex poisoned".to_owned()))?;
         guard.execute(
             "INSERT INTO events (
                 run_id, ts_utc, model_path, quant_mode,
-                stage, op, value_unit, value, notes
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                stage, op, value_unit, value, notes,
+                backend_version, git_sha, build_profile
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 &self.run_id,
                 ts,
@@ -188,6 +217,9 @@ impl EventRecorder {
                 m.value_unit,
                 m.value,
                 m.notes,
+                &self.identity.backend_version,
+                &self.identity.git_sha,
+                &self.identity.build_profile,
             ],
         )?;
 

@@ -7,6 +7,8 @@
 //!
 //! # Public API
 //!
+//! - [`RunIdentity`] — who produced a metrics row: backend, version, git sha,
+//!   build profile, hardware tag. The ONE source for those fields in Rust.
 //! - [`canonicalize_kv_quant`] — normalise a KV-quant string to its canonical
 //!   lower-kebab form (e.g. `"K8V4"` → `"k8v4"`).
 //! - [`canonicalize`] — general field canonicalization against a whitelist.
@@ -14,8 +16,169 @@
 //!   `(org, repo)` for the `model_org` / `model_repo` DB columns.
 
 use std::path::Path;
+use std::sync::OnceLock;
+
+use serde::Serialize;
 
 use crate::error::{Error, Result};
+
+/// Default hardware tag when `RMLX_HARDWARE_TAG` is unset.
+const DEFAULT_HARDWARE_TAG: &str = "m5_max_128gb";
+
+// ── Run identity ──────────────────────────────────────────────────────────────
+
+/// The identity of the binary that produced a metrics row.
+///
+/// Rust emitters (the server drainer, `rmlx baseline`, `rmlx eval`) build one
+/// of these instead of hand-rolling the five fields; shell emitters get the
+/// same block as JSON from `rmlx metrics identity --json`. Both surfaces
+/// therefore agree by construction, and the §8.5 ingest validator rejects any
+/// `rmlx` record whose `backend_version` did not come from here.
+///
+/// See `docs/METRICS_DB.md` §8.5.
+#[allow(
+    clippy::exhaustive_structs,
+    reason = "closed identity block — these five fields are exactly the §8.5 run-identity contract; \
+              adding one is a contract change that must update the ingest shape and every emitter"
+)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunIdentity {
+    /// Canonical backend name — always `"rmlx"` for a binary built from this repo.
+    pub backend: String,
+    /// Semver of this binary (`[workspace.package].version`).
+    pub backend_version: String,
+    /// Short git SHA of the checkout, `-dirty` suffixed when the tree is dirty.
+    /// `None` for an installed binary with no checkout to interrogate.
+    pub git_sha: Option<String>,
+    /// Real Cargo profile name: `release`, `release-perf`, `release-debug`, `debug`.
+    pub build_profile: String,
+    /// Hardware the run happened on. `RMLX_HARDWARE_TAG` overrides the default.
+    pub hardware_tag: String,
+}
+
+/// Computed once per process. `git_short_sha()` shells out to `git`, and the
+/// drainer builds one record per telemetry event — recomputing identity per
+/// event would put two subprocess spawns on the batch-write path. None of the
+/// five fields can change while the process runs.
+static IDENTITY: OnceLock<RunIdentity> = OnceLock::new();
+
+impl RunIdentity {
+    /// Identity of the currently-running rMLX binary. Cached after first call.
+    pub fn rmlx() -> Self {
+        IDENTITY
+            .get_or_init(|| Self {
+                backend: "rmlx".to_string(),
+                backend_version: rmlx_core::runinfo::backend_version().to_string(),
+                git_sha: rmlx_core::runinfo::git_short_sha(),
+                build_profile: rmlx_core::runinfo::build_profile().to_string(),
+                hardware_tag: std::env::var("RMLX_HARDWARE_TAG")
+                    .unwrap_or_else(|_| DEFAULT_HARDWARE_TAG.to_string()),
+            })
+            .clone()
+    }
+
+    /// The `observations.inserted_by` audit string: `"<tool>@<semver>"`.
+    ///
+    /// e.g. `identity.inserted_by("rmlx-server")` → `"rmlx-server@0.2.8"`.
+    pub fn inserted_by(&self, tool: &str) -> String {
+        format!("{tool}@{}", self.backend_version)
+    }
+
+    /// Merge this identity into a §8.5 record that is still a `serde_json` object.
+    ///
+    /// For emitters that assemble the record with `serde_json::json!` rather
+    /// than a `RunRecord` struct literal. Overwrites any identity key already
+    /// present — the point is that the caller does not get to supply its own.
+    pub fn stamp_json(&self, record: &mut serde_json::Value) -> Result<()> {
+        let obj = record
+            .as_object_mut()
+            .ok_or_else(|| Error::InvalidIngestField {
+                field: "<record>".to_string(),
+                message: "expected a JSON object".to_string(),
+            })?;
+        obj.insert("backend".to_string(), self.backend.clone().into());
+        obj.insert(
+            "backend_version".to_string(),
+            self.backend_version.clone().into(),
+        );
+        obj.insert(
+            "git_sha".to_string(),
+            self.git_sha
+                .clone()
+                .map_or(serde_json::Value::Null, Into::into),
+        );
+        obj.insert(
+            "build_profile".to_string(),
+            self.build_profile.clone().into(),
+        );
+        obj.insert("hardware_tag".to_string(), self.hardware_tag.clone().into());
+        Ok(())
+    }
+}
+
+// ── Model-id canonicalization ─────────────────────────────────────────────────
+
+/// Split a snapshot id or path into `(model_namespace, model)`.
+///
+/// Accepts `"<ns>__<model>"` (the on-disk snapshot layout) and bare names.
+/// Falls back to the `"local"` namespace — always whitelisted — rather than
+/// failing, because a metrics row with an approximate namespace beats no row.
+///
+/// Lenient by design; [`split_model_path`] is the strict, erroring variant used
+/// where the caller can act on a bad path.
+pub fn split_model_id(model_id: &str) -> (String, String) {
+    // Tolerate a full path: only the final component carries the id.
+    let basename = Path::new(model_id)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(model_id);
+
+    basename.find("__").map_or_else(
+        || ("local".to_string(), basename.to_string()),
+        |idx| {
+            let (ns, rest) = basename.split_at(idx);
+            (ns.to_string(), rest.trim_start_matches('_').to_string())
+        },
+    )
+}
+
+/// Infer the on-disk weight quantization from a snapshot name.
+///
+/// Order matters — the more specific token wins (`mxfp8` before `8bit`).
+/// Falls back to `bf16`, which is the whitelist's "unquantized / we don't
+/// know" value.
+pub fn infer_weight_quant(model_id: &str) -> String {
+    let lower = model_id.to_lowercase();
+    for token in [
+        "mxfp8", "mxfp4", "nvfp4", "q4_k_m", "q8_0", "8bit", "4bit", "2bit", "3bit", "5bit",
+        "6bit", "fp16", "bf16", "paro",
+    ] {
+        if lower.contains(token) {
+            return token.to_string();
+        }
+    }
+    "bf16".to_string()
+}
+
+/// True when `v` is a semver `MAJOR.MINOR.PATCH`, with an optional
+/// `-prerelease` / `+build` suffix.
+///
+/// Deliberately hand-rolled rather than pulling in the `semver` crate: the only
+/// question asked is "did this come from a real Cargo version, or is it a git
+/// sha / a `head` / a fabricated literal?". A numeric three-part core answers
+/// that. The suffix is tolerated so an `0.3.0-rc.1` build does not have its
+/// metrics silently rejected.
+pub fn is_semver(v: &str) -> bool {
+    // "1.2.3-rc.1+meta" → "1.2.3"
+    let core = v.split(['-', '+']).next().unwrap_or(v);
+    let mut parts = core.split('.');
+    let numeric =
+        |p: Option<&str>| p.is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+    numeric(parts.next())
+        && numeric(parts.next())
+        && numeric(parts.next())
+        && parts.next().is_none()
+}
 
 /// Allowed values for the `backend` identity column (see docs/METRICS_DB.md §5.4).
 pub const BACKEND_WHITELIST: &[&str] = &[

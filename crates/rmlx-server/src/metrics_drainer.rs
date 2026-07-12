@@ -25,7 +25,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use rmlx_metrics::ingest::{MetricEntry, PromptRef, RunRecord};
+use rmlx_metrics::identity::RunIdentity;
+use rmlx_metrics::ingest::{MetricEntry, PromptRef, RunRecord, RunRecordBuilder};
 use rmlx_metrics::migrate;
 use rmlx_metrics::recorder::Recorder;
 use rmlx_metrics::schema;
@@ -198,7 +199,9 @@ pub enum MetricKind {
 /// `try_emit` is the only write path; it never blocks.
 #[derive(Debug, Clone)]
 pub struct DrainerHandle {
-    tx: mpsc::Sender<MetricEvent>,
+    /// `None` when observation recording is off — no task was spawned, so
+    /// events are dropped at the producer and no `RunRecord` is ever built.
+    tx: Option<mpsc::Sender<MetricEvent>>,
     /// Total events dropped due to channel full.
     dropped: Arc<AtomicU64>,
 }
@@ -208,8 +211,12 @@ impl DrainerHandle {
     ///
     /// Returns `true` if enqueued. On channel full, increments the dropped
     /// counter and returns `false` — the caller is never blocked.
+    /// Returns `false` immediately when metrics recording is disabled.
     pub fn try_emit(&self, event: MetricEvent) -> bool {
-        match self.tx.try_send(event) {
+        let Some(tx) = self.tx.as_ref() else {
+            return false;
+        };
+        match tx.try_send(event) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 let prev = self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -252,32 +259,32 @@ const FLUSH_INTERVAL_MS: u64 = 100;
 /// Spawn the drainer background task and return the producer handle.
 ///
 /// `db_path` — path to `metrics/runs.db`. Created (with migrations) if absent.
-/// `hardware_tag` — e.g. `"m5_max_128gb"`.
-/// `git_sha` — short SHA of the current build.
+/// Run identity (backend, version, git sha, build profile, hardware tag) is
+/// taken from `RunIdentity::rmlx()` — the drainer never invents it.
 ///
 /// The task lives for the duration of the tokio runtime. When the last
 /// `DrainerHandle` is dropped, the channel closes and the task drains remaining
 /// events then exits.
-pub fn spawn_drainer(
-    db_path: PathBuf,
-    hardware_tag: String,
-    git_sha: Option<String>,
-) -> DrainerHandle {
-    let (tx, rx) = mpsc::channel::<MetricEvent>(CHANNEL_CAPACITY);
+///
+/// Under any mode below `full` no task is spawned at all: the handle's sender is
+/// `None`, `try_emit` drops at the producer, and the DB is never touched.
+pub fn spawn_drainer(db_path: PathBuf) -> DrainerHandle {
     let dropped = Arc::new(AtomicU64::new(0));
 
-    // Clone the Arc for the task.
+    if !rmlx_metrics::mode::observations_enabled() {
+        tracing::info!("metrics_drainer: observations disabled, task not spawned");
+        return DrainerHandle { tx: None, dropped };
+    }
+
+    let (tx, rx) = mpsc::channel::<MetricEvent>(CHANNEL_CAPACITY);
     let dropped_task = Arc::clone(&dropped);
 
-    tokio::spawn(drainer_task(
-        rx,
-        db_path,
-        hardware_tag,
-        git_sha,
-        dropped_task,
-    ));
+    tokio::spawn(drainer_task(rx, db_path, dropped_task));
 
-    DrainerHandle { tx, dropped }
+    DrainerHandle {
+        tx: Some(tx),
+        dropped,
+    }
 }
 
 // ── Consumer task ─────────────────────────────────────────────────────────────
@@ -285,8 +292,6 @@ pub fn spawn_drainer(
 async fn drainer_task(
     mut rx: mpsc::Receiver<MetricEvent>,
     db_path: PathBuf,
-    hardware_tag: String,
-    git_sha: Option<String>,
     dropped: Arc<AtomicU64>,
 ) {
     tracing::info!(
@@ -310,7 +315,7 @@ async fn drainer_task(
                 Ok(Some(ev)) => batch.push(ev),
                 // Channel closed — drain remaining and exit.
                 Ok(None) => {
-                    flush_batch(&batch, &db_path, &hardware_tag, &git_sha, &dropped).await;
+                    flush_batch(&batch, &db_path, &dropped).await;
                     tracing::info!("metrics_drainer: channel closed, task exiting");
                     return;
                 }
@@ -320,33 +325,23 @@ async fn drainer_task(
         }
 
         if !batch.is_empty() {
-            flush_batch(&batch, &db_path, &hardware_tag, &git_sha, &dropped).await;
+            flush_batch(&batch, &db_path, &dropped).await;
             batch.clear();
         }
     }
 }
 
 /// Write the batch to SQLite inside `spawn_blocking` so no executor thread blocks.
-async fn flush_batch(
-    batch: &[MetricEvent],
-    db_path: &Path,
-    hardware_tag: &str,
-    git_sha: &Option<String>,
-    dropped: &Arc<AtomicU64>,
-) {
+async fn flush_batch(batch: &[MetricEvent], db_path: &Path, dropped: &Arc<AtomicU64>) {
     if batch.is_empty() {
         return;
     }
 
     let owned_batch = batch.to_vec();
     let db_path = db_path.to_path_buf(); // owned PathBuf for the spawn_blocking closure
-    let hardware_tag = hardware_tag.to_owned();
-    let git_sha = git_sha.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
-        write_batch_to_db(&owned_batch, &db_path, &hardware_tag, &git_sha)
-    })
-    .await;
+    let result =
+        tokio::task::spawn_blocking(move || write_batch_to_db(&owned_batch, &db_path)).await;
 
     match result {
         Ok(Ok(n)) => {
@@ -377,8 +372,6 @@ async fn flush_batch(
 fn write_batch_to_db(
     batch: &[MetricEvent],
     db_path: &Path,
-    hardware_tag: &str,
-    git_sha: &Option<String>,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     // Ensure parent dir exists.
     if let Some(parent) = db_path.parent() {
@@ -388,7 +381,10 @@ fn write_batch_to_db(
     let mut conn = schema::open(db_path)?;
     migrate::run_pending(&mut conn)?;
 
-    let mut recorder = Recorder::new(&mut conn, "rmlx-server@spsc");
+    // `inserted_by` carries the binary's real version, not a bare literal —
+    // the audit column is useless for triage without one.
+    let inserted_by = RunIdentity::rmlx().inserted_by("rmlx-server");
+    let mut recorder = Recorder::new(&mut conn, inserted_by);
     let mut total_obs = 0usize;
 
     for ev in batch {
@@ -410,7 +406,17 @@ fn write_batch_to_db(
             _ => {}
         }
 
-        let run = event_to_run_record(ev, hardware_tag, git_sha);
+        let run = match event_to_run_record(ev) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    model_id = %ev.model_id,
+                    error = %e,
+                    "metrics_drainer: could not build RunRecord for event, skipping"
+                );
+                continue;
+            }
+        };
         match recorder.record_run(&run) {
             Ok(outcome) => {
                 total_obs += outcome.observation_ids.len();
@@ -433,98 +439,26 @@ fn write_batch_to_db(
 /// One event → one observation row. Prompt is a fixed sentinel
 /// `"(live_request)"` so the recorder can dedup via sha256 without knowing
 /// the actual prompt body.
-fn event_to_run_record(
-    ev: &MetricEvent,
-    hardware_tag: &str,
-    git_sha: &Option<String>,
-) -> RunRecord {
-    let (model_namespace, model_name) = split_model_id(&ev.model_id);
-
-    // Infer weight_quant from the snapshot name (best-effort, e.g. "mxfp8", "8bit").
-    let weight_quant = infer_weight_quant(&ev.model_id);
-
-    let metrics = event_kind_to_metrics(&ev.kind);
-
-    RunRecord {
-        backend: "rmlx".into(),
-        backend_version: Some(env!("CARGO_PKG_VERSION").into()),
-        model_namespace,
-        model: model_name,
-        weight_quant,
-        kv_quant: canonical_kv_quant(&ev.kv_quant),
-        ctx_max: ev.ctx_max, // F2: real per-request effective_max_ctx threaded via MetricEvent
-        prompt: PromptRef::ByBody {
+///
+/// Identity, namespace/model split, weight-quant inference and kv-quant
+/// canonicalization all come from the builder — this function supplies the
+/// measurement and nothing else.
+fn event_to_run_record(ev: &MetricEvent) -> rmlx_metrics::error::Result<RunRecord> {
+    RunRecordBuilder::rmlx(
+        &ev.model_id,
+        &ev.kv_quant,
+        ev.ctx_max, // real per-request effective_max_ctx threaded via MetricEvent
+        PromptRef::ByBody {
             name: "live_request".into(),
             body: serde_json::Value::String("(live_request)".into()),
             notes: Some("per-request telemetry from SPSC drainer".into()),
             tokens_approx: None,
         },
-        ts_utc: ev.ts_utc.clone(),
-        git_sha: git_sha.clone(),
-        build_profile: Some(
-            if cfg!(debug_assertions) {
-                "debug"
-            } else {
-                "release"
-            }
-            .into(),
-        ),
-        hardware_tag: hardware_tag.into(),
-        prompt_tokens: None,
-        max_tokens: None,
-        temperature: None,
-        seed: None,
-        n_warmups: None,
-        n_measure: None,
-        output_first_64: None,
-        notes: Some("spsc_drainer".into()),
-        description: None,
-        metrics,
-    }
-}
-
-/// Split `"ns__model-name"` → `("ns", "model-name")`.
-///
-/// The namespace is kept with hyphens as-is so it matches the
-/// `NAMESPACE_WHITELIST` (e.g. `"mlx-community"`, `"z-lab"`).
-/// Falls back to `("local", model_id)` when no `__` separator is found —
-/// `"local"` is always in the whitelist.
-fn split_model_id(model_id: &str) -> (String, String) {
-    if let Some(idx) = model_id.find("__") {
-        let ns = model_id[..idx].to_owned(); // keep hyphens — whitelist uses them
-        let name = model_id[idx + 2..].to_owned();
-        (ns, name)
-    } else {
-        ("local".into(), model_id.to_owned())
-    }
-}
-
-/// Best-effort weight quant string from snapshot name.
-///
-/// Returns values that match `WEIGHT_QUANT_WHITELIST`.
-/// Falls back to `"bf16"` (always valid) when nothing matches.
-fn infer_weight_quant(model_id: &str) -> String {
-    let lower = model_id.to_lowercase();
-    // Order matters: check more specific tokens first.
-    for token in [
-        "mxfp8", "mxfp4", "nvfp4", "q4_k_m", "q8_0", "8bit", "4bit", "2bit", "3bit", "5bit",
-        "6bit", "fp16", "bf16", "paro",
-    ] {
-        if lower.contains(token) {
-            return token.into();
-        }
-    }
-    "bf16".into() // safest whitelist fallback — means "we don't know, treat as fp"
-}
-
-/// Map a kv_quant string to its canonical form for ingest.
-///
-/// Delegates to `identity::canonicalize_kv_quant` (parser-based — accepts
-/// the long-form `mixed_k<kb>g<kg>_v<vb>g<vg>` as well as `none`/`k8v4`/`k8v8`/
-/// `planar` and legacy `turbo4`/`turbo8`). Unknown / short aliases like
-/// `"mixed"` or `"auto"` fall back to `"none"` so the row still ingests.
-fn canonical_kv_quant(kv: &str) -> String {
-    rmlx_metrics::identity::canonicalize_kv_quant(kv).unwrap_or_else(|_| "none".into())
+    )?
+    .ts_utc(ev.ts_utc.clone())
+    .notes("spsc_drainer")
+    .metrics(event_kind_to_metrics(&ev.kind))
+    .build()
 }
 
 /// Map a `MetricKind` to the `MetricEntry` vec expected by `RunRecord`.

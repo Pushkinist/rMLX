@@ -1,6 +1,10 @@
-//! Run identity used by logs/ and metrics/ for filenames.
+//! Run identity: who this binary is, and which run it is.
 //!
-//! Format: `YYYYMMDD-HHMMSS-<short-git-sha|dirty>`.
+//! Run-id format: `YYYYMMDD-HHMMSS-<short-git-sha|dirty>`.
+//!
+//! [`backend_version`] and [`build_profile`] are the single source for the
+//! identity a metrics row records about the binary that produced it. Nothing
+//! else may hand-roll them — see `docs/METRICS_DB.md` §8.5.
 
 use std::process::Command;
 
@@ -11,6 +15,28 @@ pub fn make_run_id() -> String {
     let ts = chrono_now_compact();
     let sha = git_short_sha().unwrap_or_else(|| "dirty".to_string());
     format!("{ts}-{sha}")
+}
+
+/// Semver of this binary — the single source for `observations.backend_version`.
+///
+/// Every crate in the workspace sets `version.workspace = true`, so this is
+/// `[workspace.package].version` verbatim.
+pub fn backend_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+/// The Cargo profile this binary was built under, e.g. `release`,
+/// `release-perf`, `release-debug`, `debug`.
+///
+/// Stamped by `build.rs` from `OUT_DIR`. `cfg!(debug_assertions)` cannot be
+/// used here: it is off for all three release profiles, so it reports every
+/// one of them as plain `"release"` and silently makes cross-profile
+/// comparisons look like same-profile ones.
+///
+/// Falls back to `"unknown"` when the build layout is unrecognised — an honest
+/// unknown beats a wrong label.
+pub fn build_profile() -> &'static str {
+    env!("RMLX_BUILD_PROFILE")
 }
 
 fn chrono_now_compact() -> String {

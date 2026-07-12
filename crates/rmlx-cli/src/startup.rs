@@ -41,6 +41,39 @@ impl LogLevel {
 }
 
 // ---------------------------------------------------------------------------
+// MetricsArg — clap ValueEnum for the --metrics flag
+// ---------------------------------------------------------------------------
+
+/// How much telemetry this process writes to `runs.db`.
+///
+/// Resolved once at startup into `rmlx_metrics::mode`, which every writer then
+/// consults — no per-call-site toggle. Disables *writing* only: the `rmlx
+/// metrics` read commands (`best`, `export`, `query`, …) work in every mode,
+/// as do the explicitly user-invoked `record` / `migrate` writes.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum MetricsArg {
+    /// No DB writes at all. The drainer task is never spawned and the SQLite
+    /// file is never opened or created.
+    Off,
+    /// Runtime `events` only — no bench `observations`.
+    Events,
+    /// Everything (default).
+    #[default]
+    Full,
+}
+
+impl MetricsArg {
+    pub(crate) fn mode(self) -> rmlx_metrics::mode::MetricsMode {
+        use rmlx_metrics::mode::MetricsMode;
+        match self {
+            MetricsArg::Off => MetricsMode::Off,
+            MetricsArg::Events => MetricsMode::Events,
+            MetricsArg::Full => MetricsMode::Full,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // init_tracing
 // ---------------------------------------------------------------------------
 

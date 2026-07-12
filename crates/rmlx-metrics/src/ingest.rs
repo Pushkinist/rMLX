@@ -7,29 +7,55 @@
 //! # Public API
 //!
 //! - [`RunRecord`] — top-level envelope: identity fields + metric entries.
+//! - [`RunRecordBuilder`] — the ONLY way to build a record outside this crate.
 //! - [`PromptRef`] — either an inline prompt body or a SHA-256 reference to
 //!   a prompt already registered in the `prompts` table.
 //! - [`MetricEntry`] — one measurement: name, value, unit, direction.
 //! - [`prompt_body_sha256`] — canonical SHA-256 of a JSON prompt body,
 //!   used to content-address the `prompts` table.
+//!
+//! # Why `RunRecord` cannot be struct-literalled from outside
+//!
+//! It is `#[non_exhaustive]`. Twelve independent emitters each hand-rolling the
+//! identity block is what let `backend_version` rot into NULLs, `'0.0.1'`
+//! literals and raw git SHAs. Rust emitters must go through
+//! [`RunRecordBuilder::rmlx`], which fills identity and canonicalization itself
+//! and leaves the caller only the measurement.
 
 use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::identity;
+use crate::identity::{self, RunIdentity};
 use crate::registry;
+use crate::time_util::now_iso8601;
+
+/// Wire-format version of the §8.5 record shape understood by this binary.
+///
+/// Bump when the shape changes incompatibly. A record declaring a *higher*
+/// version is rejected loudly rather than silently mis-parsed; a record with
+/// no `schema_version` at all is assumed to be v1 (the shape that predates
+/// this field), so archived buffer files still replay.
+pub const RECORD_SCHEMA_VERSION: u32 = 1;
+
+fn default_schema_version() -> u32 {
+    1
+}
 
 // ── Core record ───────────────────────────────────────────────────────────────
 
-#[allow(
-    clippy::exhaustive_structs,
-    reason = "internal closed record struct — fields are the complete universal §8.5 run-record contract; constructed with struct-literal from rmlx-server; adding a field requires updating all RunRecord construction sites"
-)]
 /// Top-level §8.5 run record emitted by every benchmark backend (see docs/METRICS_DB.md §8.5).
+///
+/// `#[non_exhaustive]`: construct via [`RunRecordBuilder`] (Rust) or deserialize
+/// from the §8.5 JSON (scripts, other backends). A struct literal outside
+/// `rmlx-metrics` is a compile error, by design.
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRecord {
+    /// Wire-format version of this record. Defaults to 1 when absent.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     /// Canonical backend identifier (e.g. `"rmlx"`, `"mlx_lm"`).
     pub backend: String,
     /// Semver string of the backend binary, if known.
@@ -140,16 +166,79 @@ pub struct MetricEntry {
     pub stddev: Option<f64>,
 }
 
+// ── Identity policy ───────────────────────────────────────────────────────────
+
+/// How strictly the §8.5 run-identity fields are enforced.
+///
+/// The strict rule exists because `backend_version` is `Option` with
+/// `#[serde(default)]`: an emitter that forgets the key deserializes to `None`
+/// and the row lands with a silent NULL. Enforcing at ingest — the one place
+/// every writer funnels through — is what stops the next emitter regressing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(
+    clippy::exhaustive_enums,
+    reason = "closed policy — live ingest vs. one-shot legacy import; a third mode would be a contract change"
+)]
+pub enum IdentityPolicy {
+    /// Live ingest. An `rmlx` record MUST carry a semver `backend_version`.
+    /// Every path that records a new measurement uses this.
+    #[default]
+    Enforce,
+    /// One-shot import of pre-contract archives (`rmlx metrics migrate`).
+    ///
+    /// Those rows predate the identity contract and genuinely have no version
+    /// to state; fabricating one is exactly the bug this policy exists to
+    /// prevent. NEVER use for a new measurement.
+    LegacyArchive,
+}
+
 // ── RunRecord impl ────────────────────────────────────────────────────────────
 
 impl RunRecord {
-    /// Validates per §8.5 required fields + §4 metric registry + §5 whitelists.
+    /// Validates per §8.5 required fields + §4 metric registry + §5 whitelists,
+    /// enforcing the run-identity contract ([`IdentityPolicy::Enforce`]).
     ///
     /// Does NOT touch the DB. Returns `Ok(())` if the record is structurally
     /// accepted; returns the first specific error encountered otherwise.
     pub fn validate(&self) -> Result<()> {
+        self.validate_with(IdentityPolicy::Enforce)
+    }
+
+    /// [`RunRecord::validate`] with an explicit identity policy.
+    pub fn validate_with(&self, policy: IdentityPolicy) -> Result<()> {
+        // schema_version: a record from the future is a loud failure, never a
+        // silent mis-parse of fields this binary does not know about.
+        if self.schema_version > RECORD_SCHEMA_VERSION {
+            return Err(Error::InvalidIngestField {
+                field: "schema_version".to_string(),
+                message: format!(
+                    "record declares v{}, this binary understands up to v{RECORD_SCHEMA_VERSION} — upgrade rmlx",
+                    self.schema_version
+                ),
+            });
+        }
+
         // backend
         identity::canonicalize("backend", &self.backend, identity::BACKEND_WHITELIST)?;
+
+        // backend_version: rMLX is our own binary, so it always knows its own
+        // semver. Other backends legitimately have none (llama.cpp emits a
+        // build_commit) — leave the field free-form and optional for them.
+        if policy == IdentityPolicy::Enforce && self.backend == "rmlx" {
+            match self.backend_version.as_deref() {
+                Some(v) if identity::is_semver(v) => {}
+                Some(v) => {
+                    return Err(Error::MissingBackendVersion {
+                        got: format!("{v:?}"),
+                    })
+                }
+                None => {
+                    return Err(Error::MissingBackendVersion {
+                        got: "<null>".to_string(),
+                    })
+                }
+            }
+        }
 
         // model_namespace
         identity::canonicalize(
@@ -244,6 +333,160 @@ impl RunRecord {
     /// Used by the recorder to know what observations to write.
     pub fn measured_metrics(&self) -> impl Iterator<Item = &MetricEntry> {
         self.metrics.iter().filter(|m| m.value.is_some())
+    }
+}
+
+// ── Builder ───────────────────────────────────────────────────────────────────
+
+/// The one way to build a §8.5 record in Rust.
+///
+/// [`RunRecordBuilder::rmlx`] fills everything the caller has no business
+/// choosing:
+///
+/// * the whole identity block, from [`RunIdentity::rmlx`];
+/// * `model_namespace` / `model` / `weight_quant`, parsed and inferred from the
+///   model id ([`identity::split_model_id`], [`identity::infer_weight_quant`]);
+/// * `kv_quant`, canonicalized ([`identity::canonicalize_kv_quant`]);
+/// * `ts_utc`, as an ISO-8601 UTC stamp of now;
+/// * `schema_version`.
+///
+/// The caller supplies the measurement and nothing else. Adding a new metric is
+/// therefore a one-liner — `.metric("decode_tps_warm", Some(119.1), None)` — and
+/// there is no identity code to get wrong.
+#[derive(Debug, Clone)]
+pub struct RunRecordBuilder {
+    rec: RunRecord,
+}
+
+impl RunRecordBuilder {
+    /// Begin a record produced by *this* rMLX binary.
+    ///
+    /// `model_id` is a snapshot id or path (`"mlx-community__gemma-4-e2b-it-mxfp8"`,
+    /// or an absolute snapshot path); `kv_quant` is any form
+    /// [`identity::canonicalize_kv_quant`] accepts.
+    pub fn rmlx(model_id: &str, kv_quant: &str, ctx_max: i64, prompt: PromptRef) -> Result<Self> {
+        let ident = RunIdentity::rmlx();
+        let (model_namespace, model) = identity::split_model_id(model_id);
+        Ok(Self {
+            rec: RunRecord {
+                schema_version: RECORD_SCHEMA_VERSION,
+                backend: ident.backend,
+                backend_version: Some(ident.backend_version),
+                model_namespace,
+                model,
+                weight_quant: identity::infer_weight_quant(model_id),
+                kv_quant: identity::canonicalize_kv_quant(kv_quant)
+                    .unwrap_or_else(|_| "none".to_string()),
+                ctx_max,
+                prompt,
+                ts_utc: now_iso8601()?,
+                git_sha: ident.git_sha,
+                build_profile: Some(ident.build_profile),
+                hardware_tag: ident.hardware_tag,
+                prompt_tokens: None,
+                max_tokens: None,
+                temperature: None,
+                seed: None,
+                n_warmups: None,
+                n_measure: None,
+                output_first_64: None,
+                notes: None,
+                description: None,
+                metrics: Vec::new(),
+            },
+        })
+    }
+
+    /// Override the weight quant inferred from the model id.
+    #[must_use]
+    pub fn weight_quant(mut self, wq: impl Into<String>) -> Self {
+        self.rec.weight_quant = wq.into();
+        self
+    }
+
+    /// Override the measurement timestamp (defaults to now).
+    ///
+    /// Used by the server drainer, where the event was measured earlier than
+    /// the batch flush that records it.
+    #[must_use]
+    pub fn ts_utc(mut self, ts: impl Into<String>) -> Self {
+        self.rec.ts_utc = ts.into();
+        self
+    }
+
+    /// Bench-config counters: prompt/generated token counts.
+    #[must_use]
+    pub fn tokens(mut self, prompt_tokens: Option<i64>, max_tokens: Option<i64>) -> Self {
+        self.rec.prompt_tokens = prompt_tokens;
+        self.rec.max_tokens = max_tokens;
+        self
+    }
+
+    /// Bench-config sampling parameters.
+    #[must_use]
+    pub fn sampling(mut self, temperature: Option<f64>, seed: Option<i64>) -> Self {
+        self.rec.temperature = temperature;
+        self.rec.seed = seed;
+        self
+    }
+
+    /// Bench-config run counts: warmups discarded, measurements averaged.
+    #[must_use]
+    pub fn runs(mut self, n_warmups: Option<i64>, n_measure: Option<i64>) -> Self {
+        self.rec.n_warmups = n_warmups;
+        self.rec.n_measure = n_measure;
+        self
+    }
+
+    /// First ≤64 chars of generated output, for temp=0 equality probes.
+    #[must_use]
+    pub fn output_first_64(mut self, s: impl Into<String>) -> Self {
+        self.rec.output_first_64 = Some(s.into());
+        self
+    }
+
+    /// Machine-written auto-summary.
+    #[must_use]
+    pub fn notes(mut self, s: impl Into<String>) -> Self {
+        self.rec.notes = Some(s.into());
+        self
+    }
+
+    /// Human/Claude-written analysis of the run.
+    #[must_use]
+    pub fn description(mut self, s: impl Into<String>) -> Self {
+        self.rec.description = Some(s.into());
+        self
+    }
+
+    /// Append one measurement. `value = None` is recorded as a sparse skip.
+    #[must_use]
+    pub fn metric(
+        mut self,
+        name: impl Into<String>,
+        value: Option<f64>,
+        stddev: Option<f64>,
+    ) -> Self {
+        self.rec.metrics.push(MetricEntry {
+            name: name.into(),
+            value,
+            stddev,
+        });
+        self
+    }
+
+    /// Append many measurements at once.
+    #[must_use]
+    pub fn metrics(mut self, entries: impl IntoIterator<Item = MetricEntry>) -> Self {
+        self.rec.metrics.extend(entries);
+        self
+    }
+
+    /// Validate and finish. Fails exactly as ingest would — a record that
+    /// cannot be built could not have been recorded either.
+    pub fn build(self) -> Result<RunRecord> {
+        self.rec.validate()?;
+        Ok(self.rec)
     }
 }
 

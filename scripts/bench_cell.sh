@@ -63,6 +63,11 @@ WEIGHT_QUANT="$7"   # mxfp8 | paro | ... (whitelist)
 PROGRESS=${RMLX_ROOT}/BENCH_PROGRESS.md
 CBB=${CROSS_BENCH_ROOT:-../Cross-Backend-Bench}
 RMLX_DIR=${RMLX_ROOT}
+
+# Run identity (backend / version / git sha / build profile / hardware tag)
+# comes from the measured binary — never hard-coded here.
+source "$(dirname "${BASH_SOURCE[0]}")/lib/identity.sh"
+rmlx_export_identity "$RMLX_DIR/target/release/rmlx"
 PORT=62265
 CLAIM=/tmp/rmlx.${PORT}.claim
 BUDGET_S=$((BUDGET_MIN * 60))
@@ -368,7 +373,7 @@ import json, os, sys
 with open(os.environ["PROMPT_FILE"], "r") as f:
     body = json.load(f)
 rec = {
-  "backend": os.environ["BACKEND_VAL"],
+    **json.loads(os.environ['RMLX_IDENTITY_JSON']),
   "model_namespace": os.environ["NS_VAL"],
   "model": os.environ["MODEL_VAL"],
   "weight_quant": os.environ["WQ_VAL"],
@@ -376,7 +381,6 @@ rec = {
   "ctx_max": int(os.environ["CTX_VAL"]),
   "prompt": {"name": os.environ["PROMPT_NAME_VAL"], "body": body},
   "ts_utc": os.environ["TS_VAL"],
-  "hardware_tag": os.environ["HW_VAL"],
   "prompt_tokens": int(os.environ["PROMPT_TOK_VAL"]),
   "max_tokens": int(os.environ["MAX_TOK_VAL"]),
   "temperature": 0.0,
@@ -430,7 +434,7 @@ import json, os, sys
 with open(os.environ["PROMPT_FILE"], "r") as f:
     body = json.load(f)
 rec = {
-  "backend": os.environ["BACKEND_VAL"],
+    **json.loads(os.environ['RMLX_IDENTITY_JSON']),
   "model_namespace": os.environ["NS_VAL"],
   "model": os.environ["MODEL_VAL"],
   "weight_quant": os.environ["WQ_VAL"],
@@ -438,7 +442,6 @@ rec = {
   "ctx_max": int(os.environ["CTX_VAL"]),
   "prompt": {"name": os.environ["PROMPT_NAME_VAL"], "body": body},
   "ts_utc": os.environ["TS_VAL"],
-  "hardware_tag": os.environ["HW_VAL"],
   "prompt_tokens": int(os.environ["PROMPT_TOK_VAL"]),
   "max_tokens": int(os.environ["MAX_TOK_VAL"]),
   "temperature": 0.0,

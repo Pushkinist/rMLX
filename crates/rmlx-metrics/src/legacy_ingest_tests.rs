@@ -136,15 +136,21 @@ fn legacy_bf16_kv_quant_converts_to_none() {
     }"#;
     let run = try_parse_legacy(json).expect("should parse");
     assert_eq!(run.kv_quant, "none");
-    run.validate()
-        .expect("should validate after bf16 -> none mapping");
 }
 
+/// A pre-§8.5 rMLX buffer file carries no `backend_version` — the shape simply
+/// had no such key. Conversion still works, but the record is NOT ingestable:
+/// we will not invent a semver for it, and silently writing another NULL is the
+/// bug being fixed. It goes to `buffer/failed/` for triage.
 #[test]
-fn legacy_run_validates_after_conversion() {
+fn converted_legacy_rmlx_record_is_rejected_for_missing_identity() {
     let run = try_parse_legacy(legacy_json_with_prompt()).expect("should parse");
-    run.validate()
-        .expect("converted legacy record should validate");
+    assert_eq!(run.backend, "rmlx");
+    assert!(run.backend_version.is_none());
+    assert!(matches!(
+        run.validate().unwrap_err(),
+        crate::error::Error::MissingBackendVersion { .. }
+    ));
 }
 
 // ── parse_cbb_weight_quant ────────────────────────────────────────────────
@@ -291,11 +297,40 @@ fn try_parse_cbb_rmlx_mxfp8_k8v8() {
     assert!((dtps.value.unwrap() - 120.74).abs() < 0.01);
 }
 
+/// This CBB fixture carries `"backend_version": "379dcea"` — a git SHA stuffed
+/// into the semver column. It is one of the exact junk values found in the live
+/// DB. Conversion still works; ingest now rejects it instead of recording it.
 #[test]
-fn try_parse_cbb_rmlx_mxfp8_k8v8_validates() {
+fn cbb_rmlx_record_with_git_sha_as_version_is_rejected() {
     let run = try_parse_cbb(cbb_json_rmlx_mxfp8_kv_k8v8()).unwrap();
+    assert_eq!(run.backend_version.as_deref(), Some("379dcea"));
+    assert!(matches!(
+        run.validate().unwrap_err(),
+        crate::error::Error::MissingBackendVersion { .. }
+    ));
+}
+
+/// Cross-backend legacy ingest must keep working: a non-rMLX CBB record has no
+/// semver to give and is accepted as before.
+#[test]
+fn cbb_non_rmlx_record_still_validates_without_a_version() {
+    let json = r#"{
+        "backend": "mlx-lm-turboquant",
+        "model_namespace": "mlx-community",
+        "model": "Qwen3.6-35B-A3B-8bit",
+        "weight_quant": "affine g64 b8 + kv-turbo4",
+        "kv_quant": "none",
+        "ctx_max": 8192,
+        "prompt": {"name":"longctx_4k","body":"hi","tokens_approx":4096},
+        "ts_utc": "2026-05-10T18:45:00+00:00",
+        "hardware_tag": "m5_max_128gb",
+        "metrics": [{"name":"decode_tps_warm","value":55.3}]
+    }"#;
+    let run = try_parse_cbb(json).expect("should parse");
+    assert_eq!(run.backend, "mlx_lm_tq");
+    assert!(run.backend_version.is_none());
     run.validate()
-        .expect("CBB record should validate after conversion");
+        .expect("non-rMLX legacy record must still ingest");
 }
 
 #[test]

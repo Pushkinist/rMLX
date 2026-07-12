@@ -129,6 +129,11 @@ log "Pre-flight done."
 # ── Verify binary + model ─────────────────────────────────────────────────────
 
 [[ -f "${RMLX_BIN}" ]] || die "rmlx binary not found at ${RMLX_BIN}. Run: make build"
+
+# Run identity (backend / version / git sha / build profile / hardware tag)
+# comes from the measured binary — never hard-coded here.
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/identity.sh"
+rmlx_export_identity "${RMLX_BIN}"
 [[ -d "${MODEL_PATH}" ]] || die "model directory not found: ${MODEL_PATH}"
 
 # ── Start server ──────────────────────────────────────────────────────────────
@@ -333,8 +338,6 @@ record = {
     'decode_tps_stddev':  ${tps_stddev},
     'step_ms_mean':       ${ttft_mean},
     'first_32_words':     ${first_32_words},
-    'git_sha':            '${GIT_SHA}',
-    'build_profile':      '${BUILD_PROFILE}',
     'notes':              'step_ms_mean=wall/completion_tokens; first_32_words from temp=0 decode',
 }
 print(json.dumps(record))
@@ -401,8 +404,7 @@ words = ${first_32_words}
 output_first_64 = ' '.join(words)[:64]
 
 rec = {
-    'backend':         'rmlx',
-    'backend_version': '0.0.1',
+    **json.loads(os.environ['RMLX_IDENTITY_JSON']),
     'model_namespace': ns,
     'model':           mdl,
     'weight_quant':    weight_quant,
@@ -414,9 +416,6 @@ rec = {
         'tokens_approx': 4096,
     },
     'ts_utc':          '${TS_UTC}',
-    'git_sha':         '${GIT_SHA}',
-    'build_profile':   '${BUILD_PROFILE}',
-    'hardware_tag':    'm5_max_128gb',
     'prompt_tokens':   4096,
     'max_tokens':      int('${MAX_TOKENS_MEASURE}'),
     'temperature':     0.0,
