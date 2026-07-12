@@ -185,10 +185,7 @@ fn workspace_root() -> Option<PathBuf> {
         if cur.join("Cargo.lock").is_file() {
             return Some(cur.to_path_buf());
         }
-        match cur.parent() {
-            Some(p) => cur = p,
-            None => return None,
-        }
+        cur = cur.parent()?;
     }
 }
 
