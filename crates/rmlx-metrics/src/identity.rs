@@ -171,16 +171,21 @@ impl RunIdentity {
 /// The compile-time git SHA, `-dirty` suffixed if the source tree that built
 /// this binary has uncommitted changes right now.
 ///
-/// The one runtime `git status --porcelain` call this crate makes, made at
-/// most once (inside [`RunIdentity::get`]'s `OnceLock` initializer) — not
-/// per-request, per-event, or per-record. Skipped entirely — `git_sha` is
-/// returned bare — under `--metrics off`, since nothing under that mode ever
-/// reads the result; [`rmlx_core::runinfo::source_tree_is_dirty`] itself
-/// already no-ops (no subprocess spawned) when there is no compile-time
-/// source root to check, which is always true for an installed binary.
+/// Deliberately NOT gated on `--metrics off` — `git_sha` is a *value*, not a
+/// telemetry write, and `rmlx metrics identity --json` (the documented
+/// identity source for every shell/Python emitter, `docs/METRICS_DB.md` §8.5)
+/// is a read/print command that must report the true answer regardless of
+/// `--metrics` mode. Gating it here would make `rmlx metrics identity --json`
+/// and `rmlx --metrics off metrics identity --json` disagree on the same
+/// binary and the same tree — exactly the kind of inconsistent identity this
+/// whole contract exists to prevent. It would also buy nothing: on every
+/// telemetry-writing path, `EventRecorder::open_at` / `baseline` / `eval`
+/// already return before this function is ever reached under `off`, so the
+/// `OnceLock` in [`RunIdentity::get`] is what avoids the cost there, not a
+/// mode check here.
 fn git_sha_with_dirty_check() -> Option<String> {
     let sha = rmlx_core::runinfo::git_short_sha()?;
-    if crate::mode::events_enabled() && rmlx_core::runinfo::source_tree_is_dirty() {
+    if rmlx_core::runinfo::source_tree_is_dirty() {
         Some(format!("{sha}-dirty"))
     } else {
         Some(sha)

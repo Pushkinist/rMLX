@@ -71,7 +71,8 @@ pub enum Error {
     #[error(
         "ingest: backend 'rmlx' requires a semver backend_version (MAJOR.MINOR.PATCH), got {got}. \
          Shell emitters must take it from `rmlx metrics identity --json`; \
-         Rust emitters from `rmlx_metrics::identity::RunIdentity::rmlx()`. \
+         Rust emitters from `rmlx_metrics::ingest::RunRecordBuilder::rmlx()` \
+         (or `RunIdentity::get().stamp_json(&mut record)` for `json!`-built records). \
          See docs/METRICS_DB.md §8.5."
     )]
     MissingBackendVersion {

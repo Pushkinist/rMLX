@@ -115,7 +115,10 @@ fn find_workspace_root(start: &str) -> Option<String> {
     for _ in 0..8 {
         let candidate = dir.join("Cargo.toml");
         if let Ok(contents) = std::fs::read_to_string(&candidate) {
-            if contents.contains("[workspace]") {
+            // Line-exact match, not a substring search: `contains("[workspace]")`
+            // would also fire on a comment or a `description = "...[workspace]..."`
+            // string value anywhere in the file.
+            if contents.lines().any(|l| l.trim() == "[workspace]") {
                 return std::fs::canonicalize(&dir)
                     .ok()
                     .map(|p| p.to_string_lossy().into_owned());

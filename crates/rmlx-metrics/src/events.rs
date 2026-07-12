@@ -150,7 +150,22 @@ impl EventRecorder {
     /// Open the canonical runs DB (resolved via `rmlx_core::paths`) and
     /// ensure all migrations have run. Cheap on subsequent calls (the
     /// PRAGMA stack is per-connection but the schema is persistent).
+    ///
+    /// Under `--metrics off` this never even resolves the DB path — checked
+    /// here, before [`rmlx_core::paths::metrics_db_path`], not left to
+    /// [`open_at`](Self::open_at)'s own gate — because path resolution itself
+    /// is not free: `metrics_db_path` walks through `metrics_dir`, which
+    /// unconditionally `create_dir_all`s `<RMLX_HOME>/metrics/`. Calling it
+    /// and THEN checking the mode would still leave an empty `metrics/`
+    /// directory behind under `off`.
     pub fn open(run_id: &str) -> Result<Self> {
+        if !crate::mode::events_enabled() {
+            tracing::debug!(run_id, "events: --metrics off, no DB opened");
+            return Ok(Self {
+                run_id: run_id.to_owned(),
+                conn: None,
+            });
+        }
         let path = rmlx_core::paths::metrics_db_path();
         Self::open_at(&path, run_id)
     }
@@ -162,7 +177,10 @@ impl EventRecorder {
     /// directory, not even [`RunIdentity`] — and returns a recorder whose
     /// `record` is a no-op. Identity is resolved lazily inside [`record`](Self::record),
     /// only on the path that actually writes a row, so the off-mode early
-    /// return does no work at all to fill a field it will never read.
+    /// return does no work at all to fill a field it will never read. Carries
+    /// its own copy of the mode check (rather than relying solely on
+    /// [`open`](Self::open)'s) because this function is `pub` and callable
+    /// directly with an arbitrary path, bypassing `open`'s gate entirely.
     pub fn open_at(db_path: &Path, run_id: &str) -> Result<Self> {
         if !crate::mode::events_enabled() {
             tracing::debug!(run_id, "events: --metrics off, no DB opened");

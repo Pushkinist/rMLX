@@ -312,11 +312,16 @@ fn validate_accepts_good_and_rejects_bad_without_writing() {
 /// claim made in three doc comments (`mode.rs`, `events.rs`, `metrics_drainer.rs`)
 /// but, until this test, never actually checked.
 ///
-/// Uses `serve` with a nonexistent model path rather than a real model load:
-/// `EventRecorder::open` (the thing under test) runs in `main.rs` BEFORE any
-/// command-specific model loading, so the process reaches and exercises the
-/// `--metrics off` branch and then fails fast on the bad model path — no GPU,
-/// no model snapshot, no server needed for this specific property.
+/// Uses `info` with a nonexistent model path, not `serve`: `EventRecorder::open`
+/// (the thing under test) runs in `main.rs` before any command-specific model
+/// loading, for every subcommand except `metrics` / `profile` / `kv-calibrate`,
+/// so `info` reaches and exercises the `--metrics off` branch exactly like
+/// `serve` would — but `info` never binds a socket or spawns a runtime under
+/// ANY code path, so there is no future refactor of its bad-path handling
+/// that could turn this into a hang. `serve` does have such a path (an "eager
+/// preload failed; model will load on first request" fallback that keeps the
+/// server listening) — a property this test must not depend on. No GPU, no
+/// model snapshot needed.
 #[test]
 fn metrics_off_never_creates_runs_db() {
     let td = tempfile::tempdir().unwrap();
@@ -327,16 +332,14 @@ fn metrics_off_never_creates_runs_db() {
         .args([
             "--metrics",
             "off",
-            "serve",
+            "info",
             "--model",
             "/nonexistent/rmlx-metrics-off-probe",
-            "--port",
-            "0",
         ])
         .output()
-        .expect("launch serve");
+        .expect("launch info");
 
-    // Must fail (bad model path) — this test is not asserting serve succeeds.
+    // Must fail (bad model path) — this test is not asserting info succeeds.
     assert!(
         !out.status.success(),
         "expected a fast failure on the bogus model path"
@@ -365,15 +368,9 @@ fn default_metrics_mode_does_create_runs_db_on_the_same_fast_fail_path() {
 
     let out = Command::new(rmlx_bin())
         .env("RMLX_HOME", rmlx_home)
-        .args([
-            "serve",
-            "--model",
-            "/nonexistent/rmlx-metrics-off-probe",
-            "--port",
-            "0",
-        ])
+        .args(["info", "--model", "/nonexistent/rmlx-metrics-off-probe"])
         .output()
-        .expect("launch serve");
+        .expect("launch info");
 
     assert!(!out.status.success());
     assert!(

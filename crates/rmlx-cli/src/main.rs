@@ -1213,6 +1213,19 @@ fn main() -> Result<()> {
     // site carries its own toggle.
     rmlx_metrics::mode::init(cli.metrics_mode.mode());
 
+    // Force run-identity resolution here, synchronously, at startup — not
+    // lazily on whichever `EventRecorder::record()` call happens to run
+    // first. That first call currently lands in `commands::serve`, before
+    // the tokio runtime starts, which is what keeps the (bounded but
+    // non-trivial: several `git` subprocess spawns) cost off an async
+    // worker today — but that safety is an accident of code order, not a
+    // guarantee; `record()` is also called from inside the runtime
+    // (request handlers, the admission controller, the multimodal cache).
+    // Resolving here makes the ordering explicit: by the time any tokio
+    // worker could possibly call `record()`, identity is already cached and
+    // `RunIdentity::get()` is a free `OnceLock` read everywhere else.
+    let _ = rmlx_metrics::identity::RunIdentity::get();
+
     // Set RUST_BACKTRACE before init_tracing so the call happens while the
     // process is genuinely single-threaded — no background threads exist yet
     // (the tracing_appender non-blocking writer is spawned inside init_tracing
