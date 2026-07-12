@@ -17,10 +17,10 @@ use rmlx_metrics::identity::RunIdentity;
 
 /// Print the §8.5 run-identity block for this binary.
 pub(super) fn cmd_identity(json: bool) -> anyhow::Result<()> {
-    let ident = RunIdentity::rmlx();
+    let ident = RunIdentity::get();
 
     if json {
-        println!("{}", serde_json::to_string(&ident)?);
+        println!("{}", serde_json::to_string(ident)?);
         return Ok(());
     }
 
@@ -46,9 +46,9 @@ pub(super) fn cmd_validate(file: Option<PathBuf>, stdin: bool) -> anyhow::Result
     let measured = run.metrics.iter().filter(|m| m.value.is_some()).count();
     println!(
         "ok: backend={} version={} profile={} model={}/{} metrics={}",
-        run.backend,
-        run.backend_version.as_deref().unwrap_or("-"),
-        run.build_profile.as_deref().unwrap_or("-"),
+        run.backend(),
+        run.backend_version().unwrap_or("-"),
+        run.build_profile().unwrap_or("-"),
         run.model_namespace,
         run.model,
         measured,

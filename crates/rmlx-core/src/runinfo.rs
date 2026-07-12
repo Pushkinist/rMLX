@@ -2,11 +2,9 @@
 //!
 //! Run-id format: `YYYYMMDD-HHMMSS-<short-git-sha|dirty>`.
 //!
-//! [`backend_version`] and [`build_profile`] are the single source for the
-//! identity a metrics row records about the binary that produced it. Nothing
-//! else may hand-roll them — see `docs/METRICS_DB.md` §8.5.
-
-use std::process::Command;
+//! [`backend_version`], [`build_profile`] and [`git_short_sha`] are the single
+//! source for the identity a metrics row records about the binary that
+//! produced it. Nothing else may hand-roll them — see `docs/METRICS_DB.md` §8.5.
 
 /// Build a stable run-id for the current process.
 ///
@@ -49,26 +47,25 @@ fn chrono_now_compact() -> String {
     format!("{y:04}{m:02}{d:02}-{hh:02}{mm:02}{ss:02}")
 }
 
-/// Return the short git SHA of the current HEAD, or `None` when the working
-/// directory has no git repo (e.g. an installed binary without a checkout).
+/// Short git SHA (`-dirty` suffixed if the checkout had uncommitted changes at
+/// build time) of the source tree that produced *this binary*, or `None` when
+/// there was no git checkout to read (e.g. built from a source tarball).
+///
+/// Stamped by `build.rs` at compile time, anchored to `CARGO_MANIFEST_DIR` —
+/// deliberately NOT read at runtime via `git rev-parse` in the process's
+/// working directory. An installed `rmlx` is normally launched from someone
+/// else's project (`rmlx serve` inside a user's repo): a runtime `git`
+/// invocation would stamp *that* repo's SHA — plus a spurious `-dirty` from
+/// their uncommitted files — into every metrics row this process produces.
+/// The whole point of this module is identity that is actually the binary's,
+/// not whatever happens to be in the current directory.
 pub fn git_short_sha() -> Option<String> {
-    let out = Command::new("git")
-        .args(["rev-parse", "--short=7", "HEAD"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let sha = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    let sha = env!("RMLX_GIT_SHA");
     if sha.is_empty() {
-        return None;
+        None
+    } else {
+        Some(sha.to_string())
     }
-    let dirty = Command::new("git")
-        .args(["status", "--porcelain"])
-        .output()
-        .ok()
-        .is_some_and(|o| !o.stdout.is_empty());
-    Some(if dirty { format!("{sha}-dirty") } else { sha })
 }
 
 /// Civil-time conversion for UTC. No leap-second handling — we don't need it.

@@ -21,20 +21,15 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Locate the cargo-built `rmlx` binary.
+///
+/// `CARGO_BIN_EXE_rmlx` is injected by Cargo's integration-test runner and
+/// resolves to whatever profile/target dir this test binary was itself built
+/// under — unlike a hard-coded `target/debug/rmlx`, it is never absent under
+/// `--profile release-perf` or a custom `CARGO_TARGET_DIR`, and never
+/// silently stale (exercising a different binary than the one under test).
 fn rmlx_bin() -> PathBuf {
-    let manifest_dir =
-        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set by cargo");
-    let workspace_root = PathBuf::from(manifest_dir)
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root")
-        .to_path_buf();
-    let debug = workspace_root.join("target/debug/rmlx");
-    assert!(
-        debug.exists(),
-        "target/debug/rmlx not found — run `cargo build -p rmlx-cli` first"
-    );
-    debug
+    PathBuf::from(env!("CARGO_BIN_EXE_rmlx"))
 }
 
 fn init_db(td: &tempfile::TempDir) -> PathBuf {

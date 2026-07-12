@@ -130,7 +130,6 @@ pub struct Measurement<'a> {
 )]
 pub struct EventRecorder {
     run_id: String,
-    identity: RunIdentity,
     /// `None` under `--metrics off` — no DB is opened.
     conn: Option<Mutex<Connection>>,
 }
@@ -160,13 +159,15 @@ impl EventRecorder {
     /// unit tests with a `tempdir`.
     ///
     /// Under `--metrics off` this opens nothing — not the file, not the parent
-    /// directory — and returns a recorder whose `record` is a no-op.
+    /// directory, not even [`RunIdentity`] — and returns a recorder whose
+    /// `record` is a no-op. Identity is resolved lazily inside [`record`](Self::record),
+    /// only on the path that actually writes a row, so the off-mode early
+    /// return does no work at all to fill a field it will never read.
     pub fn open_at(db_path: &Path, run_id: &str) -> Result<Self> {
         if !crate::mode::events_enabled() {
             tracing::debug!(run_id, "events: --metrics off, no DB opened");
             return Ok(Self {
                 run_id: run_id.to_owned(),
-                identity: RunIdentity::rmlx(),
                 conn: None,
             });
         }
@@ -182,7 +183,6 @@ impl EventRecorder {
         migrate::run_pending(&mut conn)?;
         Ok(Self {
             run_id: run_id.to_owned(),
-            identity: RunIdentity::rmlx(),
             conn: Some(Mutex::new(conn)),
         })
     }
@@ -197,6 +197,10 @@ impl EventRecorder {
         let Some(conn) = self.conn.as_ref() else {
             return Ok(());
         };
+        // Resolved here, not stored on `self`: cheap after the first call
+        // anywhere in the process (a cached `&'static` read), and this way
+        // the `--metrics off` early return above never touches identity at all.
+        let identity = RunIdentity::get();
         let ts = now_iso8601()?;
         let guard = conn
             .lock()
@@ -217,9 +221,9 @@ impl EventRecorder {
                 m.value_unit,
                 m.value,
                 m.notes,
-                &self.identity.backend_version,
-                &self.identity.git_sha,
-                &self.identity.build_profile,
+                &identity.backend_version,
+                &identity.git_sha,
+                &identity.build_profile,
             ],
         )?;
 

@@ -383,7 +383,7 @@ fn write_batch_to_db(
 
     // `inserted_by` carries the binary's real version, not a bare literal —
     // the audit column is useless for triage without one.
-    let inserted_by = RunIdentity::rmlx().inserted_by("rmlx-server");
+    let inserted_by = RunIdentity::get().inserted_by("rmlx-server");
     let mut recorder = Recorder::new(&mut conn, inserted_by);
     let mut total_obs = 0usize;
 

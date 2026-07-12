@@ -510,6 +510,13 @@ pub(crate) fn run_baseline(
 
     // -- §8.5 universal record (Phase-8 bench harness) ------------------------
     if let Some(record_args) = record_args.as_ref() {
+        // Checked before building anything: `--metrics off` means a no-op at
+        // the producer, not "build the record, then throw it away".
+        if !rmlx_metrics::mode::observations_enabled() {
+            info!("baseline: observations disabled, no record written");
+            return Ok(());
+        }
+
         let weight_quant_str = cfg
             .as_ref()
             .and_then(|c| c.quantization.as_ref())
@@ -546,10 +553,6 @@ pub(crate) fn run_baseline(
             &preview_64,
             kv_cache_bytes,
         )?;
-        if !rmlx_metrics::mode::observations_enabled() {
-            info!("baseline: observations disabled, no record written");
-            return Ok(());
-        }
 
         let path = write_buffer_record(&record)?;
         info!(path = %path.display(), "baseline: wrote §8.5 ingest record");
@@ -560,7 +563,7 @@ pub(crate) fn run_baseline(
         let db_path = rmlx_core::paths::metrics_db_path();
         match rmlx_metrics::schema::open(&db_path) {
             Ok(mut conn) => {
-                let inserted_by = RunIdentity::rmlx().inserted_by("rmlx-cli");
+                let inserted_by = RunIdentity::get().inserted_by("rmlx-cli");
                 let mut rec_inst = rmlx_metrics::recorder::Recorder::new(&mut conn, inserted_by);
                 let run: rmlx_metrics::ingest::RunRecord = serde_json::from_value(record)
                     .map_err(|e| anyhow::anyhow!("deserialize RunRecord: {e}"))?;
@@ -761,7 +764,7 @@ fn build_run_record(
 
     // Identity (backend, backend_version, git_sha, build_profile, hardware_tag)
     // comes from the single Rust source — baseline does not assemble it.
-    RunIdentity::rmlx()
+    RunIdentity::get()
         .stamp_json(&mut record)
         .map_err(|e| anyhow::anyhow!("stamp run identity: {e}"))?;
 

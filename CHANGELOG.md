@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Metrics run identity unified.** `backend_version` / `git_sha` /
+  `build_profile` were previously hand-rolled by 12 independent emitters;
+  only one got `backend_version` right. Now there is one identity source per
+  language surface (`RunIdentity` in Rust, `rmlx metrics identity --json`
+  for scripts) and the §8.5 ingest validator rejects any `rmlx` record whose
+  `backend_version` is missing or not semver-shaped. See
+  `docs/METRICS_DB.md` §8.5.1 for the full contract.
+- `git_sha` is now stamped at **compile time**, anchored to the source tree
+  that built the binary — not read at runtime from the process's working
+  directory. An installed `rmlx` launched from inside an unrelated git repo
+  (the normal case for `rmlx serve` run from a user's project) previously
+  stamped *that repo's* SHA into every metrics row it produced.
+- `build_profile` now reliably distinguishes `release` / `release-perf` /
+  `release-debug` (previously `cfg!(debug_assertions)` reported all three as
+  `"release"`).
+
+### Fixed
+
+- **One-time pending-buffer quarantine.** `rmlx metrics record
+  --replay-pending` now rejects pre-contract `rmlx` buffer files (written
+  before the `backend_version` requirement existed) instead of ingesting
+  them as another NULL-version row. At the time of this change, 212 such
+  files sit in `metrics/buffer/pending/`; the first `--replay-pending` after
+  upgrading moves all of them to `metrics/buffer/failed/` and exits 2. This
+  is expected, one-time behavior — not a regression — see
+  `docs/METRICS_DB.md` §8.5.1.
+
 ## [0.2.8] - 2026-06-30
 
 Qwen3.5-family model-loading correctness and a CI-gateable smoke probe. The

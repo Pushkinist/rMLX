@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
+use rmlx_metrics::identity::RunIdentity;
 use rmlx_metrics::{recorder::Recorder, schema};
 
 // ---------------------------------------------------------------------------
@@ -141,7 +142,7 @@ pub(super) fn ingest_one(
         };
         println!(
             "dry-run: backend={} model={}/{} weight={} kv={} metrics={} prompt={} ts={}",
-            run.backend,
+            run.backend(),
             run.model_namespace,
             run.model,
             run.weight_quant,
@@ -156,8 +157,7 @@ pub(super) fn ingest_one(
     let mut conn =
         schema::open(db_path).with_context(|| format!("open DB at {}", db_path.display()))?;
 
-    const VERSION: &str = env!("CARGO_PKG_VERSION");
-    let inserted_by = format!("rmlx-cli@{VERSION}");
+    let inserted_by = RunIdentity::get().inserted_by("rmlx-cli");
     let mut rec = Recorder::new(&mut conn, inserted_by);
     let outcome = rec.record_run(&run).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(Some(outcome))

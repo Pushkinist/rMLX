@@ -59,7 +59,12 @@ impl<'a> Recorder<'a> {
     /// NEVER use this to record a new measurement — it is the one door around
     /// the identity check, and it exists only because fabricating a semver for
     /// a 2026-01 archive row would be exactly the bug the check prevents.
-    pub fn legacy_archive(conn: &'a mut Connection, inserted_by: impl Into<String>) -> Self {
+    ///
+    /// `pub(crate)`, not `pub`: the only legitimate caller is
+    /// `migrate::legacy`, in this same crate. Exposing this to `rmlx-cli` /
+    /// `rmlx-server` would hand the next emitter the exact escape hatch this
+    /// whole contract exists to close.
+    pub(crate) fn legacy_archive(conn: &'a mut Connection, inserted_by: impl Into<String>) -> Self {
         Self {
             conn,
             inserted_by: inserted_by.into(),

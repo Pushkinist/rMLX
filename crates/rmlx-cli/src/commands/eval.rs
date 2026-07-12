@@ -140,6 +140,13 @@ pub(crate) fn run_ppl(
 
     // -- §8.5 universal record -------------------------------------------------
     if !corpus.is_empty() {
+        // Checked before building anything: `--metrics off` means a no-op at
+        // the producer, not "build the record, then throw it away".
+        if !rmlx_metrics::mode::observations_enabled() {
+            info!("ppl: observations disabled, no record written");
+            return Ok(());
+        }
+
         // Derive a metrics-DB-accepted `weight_quant` tag from the snapshot
         // config. Mirrors the mapping in `run_baseline`.
         let cfg = rmlx_loader::load_config(model_path).ok();
@@ -166,10 +173,6 @@ pub(crate) fn run_ppl(
             score_ms,
             &weight_quant,
         )?;
-        if !rmlx_metrics::mode::observations_enabled() {
-            info!("ppl: observations disabled, no record written");
-            return Ok(());
-        }
 
         let buf_path = write_buffer_record(&record)?;
         info!(path = %buf_path.display(), "ppl: wrote §8.5 ingest record");
@@ -177,7 +180,7 @@ pub(crate) fn run_ppl(
         let db_path = rmlx_core::paths::metrics_db_path();
         match rmlx_metrics::schema::open(&db_path) {
             Ok(mut conn) => {
-                let inserted_by = RunIdentity::rmlx().inserted_by("rmlx-cli");
+                let inserted_by = RunIdentity::get().inserted_by("rmlx-cli");
                 let mut rec_inst = rmlx_metrics::recorder::Recorder::new(&mut conn, inserted_by);
                 let run: rmlx_metrics::ingest::RunRecord = serde_json::from_value(record)
                     .map_err(|e| anyhow::anyhow!("deserialize RunRecord: {e}"))?;
@@ -280,7 +283,7 @@ fn build_ppl_run_record(
     });
 
     // Identity comes from the single Rust source — eval does not assemble it.
-    RunIdentity::rmlx()
+    RunIdentity::get()
         .stamp_json(&mut record)
         .map_err(|e| anyhow::anyhow!("stamp run identity: {e}"))?;
 

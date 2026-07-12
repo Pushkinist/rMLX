@@ -919,24 +919,51 @@ They are produced in exactly **one place per language surface**. No emitter hand
 
 | Surface | Source | Notes |
 |---|---|---|
-| Rust | `rmlx_metrics::identity::RunIdentity::rmlx()` | Reads `rmlx_core::runinfo::{backend_version, git_short_sha, build_profile}`. Cached per process. |
+| Rust (borrow) | `rmlx_metrics::identity::RunIdentity::get()` | `&'static RunIdentity`, resolved once per process, no allocation after the first call. Prefer this. |
+| Rust (owned) | `rmlx_metrics::identity::RunIdentity::rmlx()` | `get().clone()`. Only for the one call site that must move the fields into an owned `RunRecord` (`RunRecordBuilder::rmlx`). |
 | Rust records | `rmlx_metrics::ingest::RunRecordBuilder::rmlx(...)` | Fills identity **and** `model_namespace` / `model` / `weight_quant` / `kv_quant` / `ts_utc` / `schema_version`. Caller supplies the measurement only. |
 | Shell / Python | `rmlx metrics identity --json` | `scripts/lib/identity.sh` exports it as `RMLX_IDENTITY_JSON`; `scripts/lib/rmlx_record.py` merges it. |
 
-`RunRecord` is `#[non_exhaustive]`: a struct literal outside `rmlx-metrics` is a **compile error**. Rust emitters must go through the builder.
+`RunRecord` is `#[non_exhaustive]` **and** its five identity fields
+(`backend`, `backend_version`, `git_sha`, `build_profile`, `hardware_tag`) are
+`pub(crate)`, read via getters (`RunRecord::backend()`, `.backend_version()`,
+…). Two separate holes, two separate closures: `#[non_exhaustive]` blocks a
+struct *literal* from outside `rmlx-metrics`; field privacy blocks mutating an
+*already-built* record (`let mut r = builder.build()?; r.backend_version =
+Some("0.0.1".into());` compiled and bypassed the validator before this). Rust
+emitters must go through `RunRecordBuilder`; nothing outside this crate can
+construct or mutate a `RunRecord`'s identity at all.
+
+This is a mutation-hole closure, not a provenance guarantee. `RunRecord::validate()`
+checks that `backend_version` is semver-*shaped*; it does not — cannot — verify
+that the value is authentic. A hand-written JSON buffer file with a
+fabricated-but-well-formed `"backend_version": "0.0.1"` still ingests cleanly.
+The fields being un-mutable only closes the in-*Rust* hole; a hand-edited
+buffer file is JSON text, not a `RunRecord` value, and goes through
+`Deserialize` (which, being generated inside this crate, can populate
+`pub(crate)` fields — that path is exactly what the validator gates).
 
 **Enforcement.** `RunRecord::validate()` is the single chokepoint — every ingest path (`record --file` / `--inline` / `--stdin`, `--replay-pending`, the in-process `Recorder`) runs it. Rules:
 
-- `backend == "rmlx"` **must** carry a semver `backend_version` (`MAJOR.MINOR.PATCH`, optional `-pre` / `+build` suffix). Missing, empty, or non-semver ⇒ ingest **fails loudly**, exit 1, buffer file preserved for triage.
+- `backend == "rmlx"` **must** carry a semver-*shaped* `backend_version` (`MAJOR.MINOR.PATCH`, optional `-pre` / `+build` suffix — see previous paragraph on what "shaped" does and doesn't guarantee). Missing, empty, or non-semver ⇒ ingest **fails loudly**, exit 1, buffer file preserved for triage.
 - Every other backend keeps `backend_version` free-form and optional — llama.cpp has no semver, it emits a `build_commit`. Cross-backend ingest is unaffected.
 
 Why rMLX only: it is our own binary, so it always knows its own version. A NULL there is a bug, not a limitation.
 
 **Identity is stamped at emit time, into the buffer file — never at ingest time.** A buffer replayed later by a newer binary keeps the identity of the build that produced it. `inserted_by` (`<tool>@<semver>`) separately records which tool did the insert. Build it with `RunIdentity::inserted_by(tool)`, not a literal.
 
-**`build_profile` is the real Cargo profile name** — `release`, `release-perf`, `release-debug`, `debug` — stamped by `crates/rmlx-core/build.rs` from `OUT_DIR`. Do **not** use `cfg!(debug_assertions)`: it is off for all three release profiles and collapses them to one `"release"` label, which silently turns a cross-profile comparison into what looks like a same-profile one.
+**`build_profile` is the real Cargo profile name** — `release`, `release-perf`, `release-debug`, `debug` — stamped by `crates/rmlx-core/build.rs` from `OUT_DIR` (the path component immediately before the LAST `build` component, so a `CARGO_TARGET_DIR` that itself contains an earlier `build/` component does not misfire). Do **not** use `cfg!(debug_assertions)`: it is off for all three release profiles and collapses them to one `"release"` label, which silently turns a cross-profile comparison into what looks like a same-profile one.
 
-**Pre-existing rows.** The DB still holds rows that predate this rule (NULL versions, `'0.0.1'` literals, git SHAs in the semver column). `<RMLX_HOME>/metrics/` is append-only — they are **not** backfilled or rewritten. They carry a real `git_sha`, so a sha→tag map could reconstruct the truth later if ever wanted. Legacy buffer files (pre-contract, `backend: rmlx`, no version) are now **rejected** on replay and land in `buffer/failed/` rather than adding more NULL rows.
+**`git_sha` is stamped at compile time, anchored to `CARGO_MANIFEST_DIR`** — the same `build.rs`, not a runtime `git rev-parse` in the process's working directory. An installed `rmlx` is normally launched from someone else's project (`rmlx serve` from inside a user's repo); a runtime lookup would stamp *that* repo's SHA — plus a spurious `-dirty` from their uncommitted files — into every row this process produces. `None` when there is no git checkout at build time (e.g. building from a source tarball), never a foreign repo's identity.
+
+**Pre-existing rows.** The DB still holds rows that predate this rule (NULL versions, `'0.0.1'` literals, git SHAs in the semver column). `<RMLX_HOME>/metrics/` is append-only — they are **not** backfilled or rewritten. They carry a real `git_sha`, so a sha→tag map could reconstruct the truth later if ever wanted.
+
+**One-time pending-buffer quarantine.** Buffer files written by an `rmlx` binary from before this contract landed (`backend: "rmlx"`, no `backend_version` key at all) are now **rejected** by `rmlx metrics record --replay-pending` instead of being silently ingested as another NULL row. Expect, on the first `--replay-pending` after upgrading past this point:
+
+- Each pre-contract file is moved to `metrics/buffer/failed/` (nothing is deleted).
+- `rmlx metrics record --replay-pending` exits **2** (its normal "some records failed" exit code) if any pre-contract files were present.
+- This is expected, one-time behavior for files that predate the contract — **not a new bug** and not something to "fix" by adding a bypass flag. There is deliberately no `--legacy-archive` (or similar) escape on `record`/`--replay-pending`: the only door around the identity check (`Recorder::legacy_archive`) is `pub(crate)`, reachable only from the one-shot `rmlx metrics migrate` importer for pre-DB archives, and an operator-facing bypass would turn an exceptional path into a routine one.
+- Those quarantined records carry a real `git_sha`; if ever wanted, they can be reconstructed via the same sha→tag map mentioned above and re-submitted with a real version. Backfilling them is out of scope here, same as the pre-existing DB rows.
 
 ### 8.5.2 Validating a record without writing it
 

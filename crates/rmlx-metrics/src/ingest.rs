@@ -50,17 +50,33 @@ fn default_schema_version() -> u32 {
 /// `#[non_exhaustive]`: construct via [`RunRecordBuilder`] (Rust) or deserialize
 /// from the §8.5 JSON (scripts, other backends). A struct literal outside
 /// `rmlx-metrics` is a compile error, by design.
+///
+/// The five run-identity fields (`backend`, `backend_version`, `git_sha`,
+/// `build_profile`, `hardware_tag`) are `pub(crate)`, not `pub`: `#[non_exhaustive]`
+/// blocks a struct *literal* from outside this crate, but every field was
+/// still individually mutable — `let mut r = builder.build()?; r.backend_version
+/// = Some("0.0.1".into());` compiled fine and bypassed the validator entirely,
+/// since `build()` validates once, at construction, not on every field write.
+/// Read them via the getters below; write them only through
+/// [`RunRecordBuilder`] or (in-crate) direct construction.
+///
+/// This does **not** mean every historical failure mode is now structurally
+/// impossible: [`RunRecord::validate`] checks that `backend_version` is
+/// semver-*shaped*, not that it is authentic. A fabricated-but-well-formed
+/// `"0.0.1"` from a hand-written JSON buffer file still ingests — the fields
+/// being non-`pub` only closes the in-Rust mutation hole, it is not a
+/// cryptographic attestation of provenance.
 #[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRecord {
     /// Wire-format version of this record. Defaults to 1 when absent.
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
-    /// Canonical backend identifier (e.g. `"rmlx"`, `"mlx_lm"`).
-    pub backend: String,
-    /// Semver string of the backend binary, if known.
+    /// Canonical backend identifier (e.g. `"rmlx"`, `"mlx_lm"`). Read via [`RunRecord::backend`].
+    pub(crate) backend: String,
+    /// Semver string of the backend binary, if known. Read via [`RunRecord::backend_version`].
     #[serde(default)]
-    pub backend_version: Option<String>,
+    pub(crate) backend_version: Option<String>,
     /// Model namespace from the whitelist (e.g. `"mlx-community"`).
     pub model_namespace: String,
     /// Model repository name within the namespace.
@@ -75,14 +91,14 @@ pub struct RunRecord {
     pub prompt: PromptRef,
     /// ISO-8601 UTC timestamp, validated as parseable.
     pub ts_utc: String,
-    /// Git commit SHA of the backend binary, if known.
+    /// Git commit SHA of the backend binary, if known. Read via [`RunRecord::git_sha`].
     #[serde(default)]
-    pub git_sha: Option<String>,
-    /// Cargo build profile (e.g. `"release"`, `"release-perf"`).
+    pub(crate) git_sha: Option<String>,
+    /// Cargo build profile (e.g. `"release"`, `"release-perf"`). Read via [`RunRecord::build_profile`].
     #[serde(default)]
-    pub build_profile: Option<String>,
-    /// Hardware tag identifying the test machine (e.g. `"m5_max_128gb"`).
-    pub hardware_tag: String,
+    pub(crate) build_profile: Option<String>,
+    /// Hardware tag identifying the test machine (e.g. `"m5_max_128gb"`). Read via [`RunRecord::hardware_tag`].
+    pub(crate) hardware_tag: String,
     /// Number of tokens in the prompt, as counted by the bench harness.
     #[serde(default)]
     pub prompt_tokens: Option<i64>,
@@ -112,6 +128,33 @@ pub struct RunRecord {
     pub description: Option<String>,
     /// One entry per measured metric; `value = None` entries are skipped.
     pub metrics: Vec<MetricEntry>,
+}
+
+impl RunRecord {
+    /// Canonical backend identifier (e.g. `"rmlx"`, `"mlx_lm"`).
+    pub fn backend(&self) -> &str {
+        &self.backend
+    }
+
+    /// Semver string of the backend binary, if known.
+    pub fn backend_version(&self) -> Option<&str> {
+        self.backend_version.as_deref()
+    }
+
+    /// Git commit SHA of the backend binary, if known.
+    pub fn git_sha(&self) -> Option<&str> {
+        self.git_sha.as_deref()
+    }
+
+    /// Cargo build profile (e.g. `"release"`, `"release-perf"`), if known.
+    pub fn build_profile(&self) -> Option<&str> {
+        self.build_profile.as_deref()
+    }
+
+    /// Hardware tag identifying the test machine (e.g. `"m5_max_128gb"`).
+    pub fn hardware_tag(&self) -> &str {
+        &self.hardware_tag
+    }
 }
 
 // ── Prompt ref ────────────────────────────────────────────────────────────────
@@ -174,12 +217,17 @@ pub struct MetricEntry {
 /// `#[serde(default)]`: an emitter that forgets the key deserializes to `None`
 /// and the row lands with a silent NULL. Enforcing at ingest — the one place
 /// every writer funnels through — is what stops the next emitter regressing.
+///
+/// `pub(crate)`: the `LegacyArchive` variant is the one door around the
+/// identity check (see [`crate::recorder::Recorder::legacy_archive`]), and
+/// keeping the whole enum crate-private means no crate outside `rmlx-metrics`
+/// can even name it, let alone select it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[allow(
     clippy::exhaustive_enums,
     reason = "closed policy — live ingest vs. one-shot legacy import; a third mode would be a contract change"
 )]
-pub enum IdentityPolicy {
+pub(crate) enum IdentityPolicy {
     /// Live ingest. An `rmlx` record MUST carry a semver `backend_version`.
     /// Every path that records a new measurement uses this.
     #[default]
@@ -205,7 +253,10 @@ impl RunRecord {
     }
 
     /// [`RunRecord::validate`] with an explicit identity policy.
-    pub fn validate_with(&self, policy: IdentityPolicy) -> Result<()> {
+    ///
+    /// `pub(crate)`: the policy choice is not a caller-facing knob. Every
+    /// external caller gets [`RunRecord::validate`] (always [`IdentityPolicy::Enforce`]).
+    pub(crate) fn validate_with(&self, policy: IdentityPolicy) -> Result<()> {
         // schema_version: a record from the future is a loud failure, never a
         // silent mis-parse of fields this binary does not know about.
         if self.schema_version > RECORD_SCHEMA_VERSION {
@@ -364,6 +415,12 @@ impl RunRecordBuilder {
     /// `model_id` is a snapshot id or path (`"mlx-community__gemma-4-e2b-it-mxfp8"`,
     /// or an absolute snapshot path); `kv_quant` is any form
     /// [`identity::canonicalize_kv_quant`] accepts.
+    ///
+    /// Returns `Err` when `kv_quant` does not canonicalize — silently falling
+    /// back to `"none"` would file an unrecognised KV-quant label (a typo, a
+    /// future codec) under the champion cell for *unquantised* KV. The caller
+    /// (server drainer, `baseline`, `eval`) already handles a builder `Err` by
+    /// skipping the record with a warning; propagate rather than mislabel.
     pub fn rmlx(model_id: &str, kv_quant: &str, ctx_max: i64, prompt: PromptRef) -> Result<Self> {
         let ident = RunIdentity::rmlx();
         let (model_namespace, model) = identity::split_model_id(model_id);
@@ -375,8 +432,7 @@ impl RunRecordBuilder {
                 model_namespace,
                 model,
                 weight_quant: identity::infer_weight_quant(model_id),
-                kv_quant: identity::canonicalize_kv_quant(kv_quant)
-                    .unwrap_or_else(|_| "none".to_string()),
+                kv_quant: identity::canonicalize_kv_quant(kv_quant)?,
                 ctx_max,
                 prompt,
                 ts_utc: now_iso8601()?,

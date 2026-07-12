@@ -56,25 +56,33 @@ pub struct RunIdentity {
     pub hardware_tag: String,
 }
 
-/// Computed once per process. `git_short_sha()` shells out to `git`, and the
-/// drainer builds one record per telemetry event — recomputing identity per
-/// event would put two subprocess spawns on the batch-write path. None of the
-/// five fields can change while the process runs.
+/// Computed once per process, cached in a `OnceLock`. None of the five fields
+/// can change while the process runs. `backend_version` / `build_profile` /
+/// `git_sha` are read from `build.rs`-stamped compile-time constants (no I/O);
+/// only `hardware_tag` touches the environment, via a single `std::env::var`.
 static IDENTITY: OnceLock<RunIdentity> = OnceLock::new();
 
 impl RunIdentity {
-    /// Identity of the currently-running rMLX binary. Cached after first call.
+    /// Identity of the currently-running rMLX binary — borrowed, no allocation
+    /// after the first call. Prefer this over [`RunIdentity::rmlx`]; the owned
+    /// form exists only for the one call site that must move the fields into
+    /// an owned [`crate::ingest::RunRecord`].
+    pub fn get() -> &'static RunIdentity {
+        IDENTITY.get_or_init(|| Self {
+            backend: "rmlx".to_string(),
+            backend_version: rmlx_core::runinfo::backend_version().to_string(),
+            git_sha: rmlx_core::runinfo::git_short_sha(),
+            build_profile: rmlx_core::runinfo::build_profile().to_string(),
+            hardware_tag: std::env::var("RMLX_HARDWARE_TAG")
+                .unwrap_or_else(|_| DEFAULT_HARDWARE_TAG.to_string()),
+        })
+    }
+
+    /// Owned clone of [`RunIdentity::get`]. Only for callers that must own a
+    /// `RunIdentity` value (moving its `String` fields into another owned
+    /// struct) — everything else should borrow via `get()`.
     pub fn rmlx() -> Self {
-        IDENTITY
-            .get_or_init(|| Self {
-                backend: "rmlx".to_string(),
-                backend_version: rmlx_core::runinfo::backend_version().to_string(),
-                git_sha: rmlx_core::runinfo::git_short_sha(),
-                build_profile: rmlx_core::runinfo::build_profile().to_string(),
-                hardware_tag: std::env::var("RMLX_HARDWARE_TAG")
-                    .unwrap_or_else(|_| DEFAULT_HARDWARE_TAG.to_string()),
-            })
-            .clone()
+        Self::get().clone()
     }
 
     /// The `observations.inserted_by` audit string: `"<tool>@<semver>"`.
