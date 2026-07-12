@@ -24,14 +24,11 @@ pub(super) fn cmd_identity(json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!("backend         {}", ident.backend);
-    println!("backend_version {}", ident.backend_version);
-    println!(
-        "git_sha         {}",
-        ident.git_sha.as_deref().unwrap_or("-")
-    );
-    println!("build_profile   {}", ident.build_profile);
-    println!("hardware_tag    {}", ident.hardware_tag);
+    println!("backend         {}", ident.backend());
+    println!("backend_version {}", ident.backend_version());
+    println!("git_sha         {}", ident.git_sha().unwrap_or("-"));
+    println!("build_profile   {}", ident.build_profile());
+    println!("hardware_tag    {}", ident.hardware_tag());
     Ok(())
 }
 

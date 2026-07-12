@@ -7,20 +7,34 @@
 //! # Public API
 //!
 //! - [`RunRecord`] — top-level envelope: identity fields + metric entries.
-//! - [`RunRecordBuilder`] — the ONLY way to build a record outside this crate.
+//! - [`RunRecordBuilder`] — the only way to *construct* a `RunRecord` in Rust
+//!   from outside this crate. See below for the other, deliberately open, door.
 //! - [`PromptRef`] — either an inline prompt body or a SHA-256 reference to
 //!   a prompt already registered in the `prompts` table.
 //! - [`MetricEntry`] — one measurement: name, value, unit, direction.
 //! - [`prompt_body_sha256`] — canonical SHA-256 of a JSON prompt body,
 //!   used to content-address the `prompts` table.
 //!
-//! # Why `RunRecord` cannot be struct-literalled from outside
+//! # Two ways to get a `RunRecord`, one gate
 //!
-//! It is `#[non_exhaustive]`. Twelve independent emitters each hand-rolling the
+//! `RunRecord` is `#[non_exhaustive]`, so a struct literal outside this crate
+//! is a compile error — Rust emitters go through [`RunRecordBuilder::rmlx`],
+//! which fills identity and canonicalization itself and leaves the caller
+//! only the measurement. Twelve independent emitters each hand-rolling the
 //! identity block is what let `backend_version` rot into NULLs, `'0.0.1'`
-//! literals and raw git SHAs. Rust emitters must go through
-//! [`RunRecordBuilder::rmlx`], which fills identity and canonicalization itself
-//! and leaves the caller only the measurement.
+//! literals and raw git SHAs.
+//!
+//! But `RunRecord` also derives `Deserialize`, and that door is deliberately
+//! open: shell/Python emitters, foreign backends (`llama_cpp`, `mlx_lm`, …),
+//! and `--replay-pending` all produce a `RunRecord` by parsing §8.5 JSON, with
+//! a caller-chosen identity block — replaying a buffer file must reproduce
+//! the *emitting* build's identity, not re-stamp whoever replays it (see
+//! `docs/METRICS_DB.md` §8.5.1). What makes this safe is not that the
+//! identity is unforgeable — a hand-edited buffer file can claim anything
+//! semver-shaped — it is that [`RunRecord::validate`] runs on every ingest
+//! path and is the actual gate. The builder is the *convenient*, correct-by
+//! -construction way to get one in Rust; `Deserialize` is the *open*,
+//! validated-on-the-way-in way everyone else gets one.
 
 use std::fmt::Write as _;
 

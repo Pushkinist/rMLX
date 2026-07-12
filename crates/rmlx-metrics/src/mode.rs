@@ -56,6 +56,22 @@ impl MetricsMode {
             Self::Full => "full",
         }
     }
+
+    /// True when the `events` table may be written under this mode.
+    ///
+    /// The predicate lives on the enum, not just as global-reading free
+    /// functions below, so it can be unit-tested against an explicit value —
+    /// asserting against a value read through the process-global `OnceLock`
+    /// would race any other test in the same binary that also touches it.
+    pub fn events_enabled(self) -> bool {
+        self != Self::Off
+    }
+
+    /// True when the `observations` table may be written by telemetry under
+    /// this mode.
+    pub fn observations_enabled(self) -> bool {
+        self == Self::Full
+    }
 }
 
 static MODE: OnceLock<MetricsMode> = OnceLock::new();
@@ -74,12 +90,12 @@ pub fn current() -> MetricsMode {
 
 /// True when the `events` table may be written (modes `events`, `full`).
 pub fn events_enabled() -> bool {
-    current() != MetricsMode::Off
+    current().events_enabled()
 }
 
 /// True when the `observations` table may be written by telemetry (mode `full`).
 pub fn observations_enabled() -> bool {
-    current() == MetricsMode::Full
+    current().observations_enabled()
 }
 
 #[cfg(test)]

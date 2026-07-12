@@ -35,31 +35,73 @@ const DEFAULT_HARDWARE_TAG: &str = "m5_max_128gb";
 /// therefore agree by construction, and the §8.5 ingest validator rejects any
 /// `rmlx` record whose `backend_version` did not come from here.
 ///
+/// All five fields are `pub(crate)`, read via the getters below. A `pub`
+/// field here would be the exact mutation hole closed on [`crate::ingest::RunRecord`]
+/// relocated one type upstream: `RunIdentity::stamp_json` takes `&self` and
+/// writes whatever fields it is given verbatim, with no validation of its
+/// own (validation happens later, in `RunRecord::validate`) — a caller outside
+/// this crate that could still write `RunIdentity { backend_version:
+/// "0.0.1".into(), .. }` or `id.backend_version = "0.0.1".into()` on an
+/// already-built value would forge exactly the identity block this whole
+/// contract exists to make un-forgeable. [`RunIdentity::get`] /
+/// [`RunIdentity::rmlx`] are the only way to obtain one.
+///
+/// `#[derive(Serialize)]` is unaffected by field visibility — `serde_derive`
+/// expands inside this crate — so `rmlx metrics identity --json` still emits
+/// the full block.
+///
 /// See `docs/METRICS_DB.md` §8.5.
-#[allow(
-    clippy::exhaustive_structs,
-    reason = "closed identity block — these five fields are exactly the §8.5 run-identity contract; \
-              adding one is a contract change that must update the ingest shape and every emitter"
-)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RunIdentity {
     /// Canonical backend name — always `"rmlx"` for a binary built from this repo.
-    pub backend: String,
+    pub(crate) backend: String,
     /// Semver of this binary (`[workspace.package].version`).
-    pub backend_version: String,
-    /// Short git SHA of the checkout, `-dirty` suffixed when the tree is dirty.
-    /// `None` for an installed binary with no checkout to interrogate.
-    pub git_sha: Option<String>,
+    pub(crate) backend_version: String,
+    /// Short git SHA of the checkout, `-dirty` suffixed when the tree had
+    /// uncommitted changes when this process started (not at build time —
+    /// see `rmlx_core::runinfo::source_tree_is_dirty`). `None` for an
+    /// installed binary with no checkout to interrogate.
+    pub(crate) git_sha: Option<String>,
     /// Real Cargo profile name: `release`, `release-perf`, `release-debug`, `debug`.
-    pub build_profile: String,
+    pub(crate) build_profile: String,
     /// Hardware the run happened on. `RMLX_HARDWARE_TAG` overrides the default.
-    pub hardware_tag: String,
+    pub(crate) hardware_tag: String,
+}
+
+impl RunIdentity {
+    /// Canonical backend name — always `"rmlx"` for a binary built from this repo.
+    pub fn backend(&self) -> &str {
+        &self.backend
+    }
+
+    /// Semver of this binary.
+    pub fn backend_version(&self) -> &str {
+        &self.backend_version
+    }
+
+    /// Short git SHA of the checkout, `-dirty` suffixed if applicable.
+    pub fn git_sha(&self) -> Option<&str> {
+        self.git_sha.as_deref()
+    }
+
+    /// Real Cargo profile name.
+    pub fn build_profile(&self) -> &str {
+        &self.build_profile
+    }
+
+    /// Hardware the run happened on.
+    pub fn hardware_tag(&self) -> &str {
+        &self.hardware_tag
+    }
 }
 
 /// Computed once per process, cached in a `OnceLock`. None of the five fields
 /// can change while the process runs. `backend_version` / `build_profile` /
-/// `git_sha` are read from `build.rs`-stamped compile-time constants (no I/O);
-/// only `hardware_tag` touches the environment, via a single `std::env::var`.
+/// the base `git_sha` are read from `build.rs`-stamped compile-time constants
+/// (no I/O). `hardware_tag` touches the environment via one `std::env::var`.
+/// The `-dirty` suffix on `git_sha` costs one `git status --porcelain`
+/// subprocess call, made at most once here — see
+/// [`rmlx_core::runinfo::source_tree_is_dirty`].
 static IDENTITY: OnceLock<RunIdentity> = OnceLock::new();
 
 impl RunIdentity {
@@ -71,17 +113,19 @@ impl RunIdentity {
         IDENTITY.get_or_init(|| Self {
             backend: "rmlx".to_string(),
             backend_version: rmlx_core::runinfo::backend_version().to_string(),
-            git_sha: rmlx_core::runinfo::git_short_sha(),
+            git_sha: git_sha_with_dirty_check(),
             build_profile: rmlx_core::runinfo::build_profile().to_string(),
             hardware_tag: std::env::var("RMLX_HARDWARE_TAG")
                 .unwrap_or_else(|_| DEFAULT_HARDWARE_TAG.to_string()),
         })
     }
 
-    /// Owned clone of [`RunIdentity::get`]. Only for callers that must own a
-    /// `RunIdentity` value (moving its `String` fields into another owned
-    /// struct) — everything else should borrow via `get()`.
-    pub fn rmlx() -> Self {
+    /// Owned clone of [`RunIdentity::get`]. `pub(crate)`: the only caller that
+    /// needs an owned value is [`crate::ingest::RunRecordBuilder::rmlx`],
+    /// which moves the fields into an owned [`crate::ingest::RunRecord`].
+    /// Everything else — in this crate or outside it — should borrow via
+    /// `get()`.
+    pub(crate) fn rmlx() -> Self {
         Self::get().clone()
     }
 
@@ -121,6 +165,25 @@ impl RunIdentity {
         );
         obj.insert("hardware_tag".to_string(), self.hardware_tag.clone().into());
         Ok(())
+    }
+}
+
+/// The compile-time git SHA, `-dirty` suffixed if the source tree that built
+/// this binary has uncommitted changes right now.
+///
+/// The one runtime `git status --porcelain` call this crate makes, made at
+/// most once (inside [`RunIdentity::get`]'s `OnceLock` initializer) — not
+/// per-request, per-event, or per-record. Skipped entirely — `git_sha` is
+/// returned bare — under `--metrics off`, since nothing under that mode ever
+/// reads the result; [`rmlx_core::runinfo::source_tree_is_dirty`] itself
+/// already no-ops (no subprocess spawned) when there is no compile-time
+/// source root to check, which is always true for an installed binary.
+fn git_sha_with_dirty_check() -> Option<String> {
+    let sha = rmlx_core::runinfo::git_short_sha()?;
+    if crate::mode::events_enabled() && rmlx_core::runinfo::source_tree_is_dirty() {
+        Some(format!("{sha}-dirty"))
+    } else {
+        Some(sha)
     }
 }
 

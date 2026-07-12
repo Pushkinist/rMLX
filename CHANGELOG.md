@@ -16,11 +16,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for scripts) and the §8.5 ingest validator rejects any `rmlx` record whose
   `backend_version` is missing or not semver-shaped. See
   `docs/METRICS_DB.md` §8.5.1 for the full contract.
-- `git_sha` is now stamped at **compile time**, anchored to the source tree
-  that built the binary — not read at runtime from the process's working
-  directory. An installed `rmlx` launched from inside an unrelated git repo
-  (the normal case for `rmlx serve` run from a user's project) previously
-  stamped *that repo's* SHA into every metrics row it produced.
+- `git_sha`'s commit is now stamped at **compile time**, anchored to the
+  workspace root that built the binary — not read at runtime from the
+  process's working directory, and never from an unrelated enclosing repo
+  (a source tree extracted inside someone else's checkout). An installed
+  `rmlx` launched from inside an unrelated git repo (the normal case for
+  `rmlx serve` run from a user's project) previously stamped *that repo's*
+  SHA into every metrics row it produced. The `-dirty` suffix is a separate,
+  deliberately runtime-resolved fact (one `git status --porcelain` at
+  metrics init, against the same compile-time path, skipped under
+  `--metrics off`) — baking it into the compile-time value would silently
+  freeze it stale the moment a source file is edited without also touching
+  the build script's narrow rebuild-watch list. See `docs/METRICS_DB.md`
+  §8.5.1 for the exact semantics.
 - `build_profile` now reliably distinguishes `release` / `release-perf` /
   `release-debug` (previously `cfg!(debug_assertions)` reported all three as
   `"release"`).

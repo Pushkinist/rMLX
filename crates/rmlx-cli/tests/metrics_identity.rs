@@ -305,3 +305,81 @@ fn validate_accepts_good_and_rejects_bad_without_writing() {
     assert!(!err.status.success());
     assert!(String::from_utf8_lossy(&err.stderr).contains("backend_version"));
 }
+
+// ── --metrics off: producer-side no-op, proven not just documented ───────────
+
+/// `rmlx --metrics off <cmd>` must never open, or create, `runs.db` — the
+/// claim made in three doc comments (`mode.rs`, `events.rs`, `metrics_drainer.rs`)
+/// but, until this test, never actually checked.
+///
+/// Uses `serve` with a nonexistent model path rather than a real model load:
+/// `EventRecorder::open` (the thing under test) runs in `main.rs` BEFORE any
+/// command-specific model loading, so the process reaches and exercises the
+/// `--metrics off` branch and then fails fast on the bad model path — no GPU,
+/// no model snapshot, no server needed for this specific property.
+#[test]
+fn metrics_off_never_creates_runs_db() {
+    let td = tempfile::tempdir().unwrap();
+    let rmlx_home = td.path();
+
+    let out = Command::new(rmlx_bin())
+        .env("RMLX_HOME", rmlx_home)
+        .args([
+            "--metrics",
+            "off",
+            "serve",
+            "--model",
+            "/nonexistent/rmlx-metrics-off-probe",
+            "--port",
+            "0",
+        ])
+        .output()
+        .expect("launch serve");
+
+    // Must fail (bad model path) — this test is not asserting serve succeeds.
+    assert!(
+        !out.status.success(),
+        "expected a fast failure on the bogus model path"
+    );
+
+    // `rmlx_core::paths::metrics_dir()` eagerly `create_dir_all`s the bare
+    // `metrics/` directory as a path-resolution side effect regardless of
+    // `--metrics` mode (pre-existing behavior, out of scope here) — so the
+    // directory existing is not the claim under test. The claim is
+    // specifically that `runs.db` is never opened or created.
+    assert!(
+        !rmlx_home.join("metrics/runs.db").exists(),
+        "--metrics off must not create runs.db: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Sibling positive control: WITHOUT `--metrics off` (default `full`), the
+/// same fast-failing invocation still reaches `EventRecorder::open` and DOES
+/// create `runs.db` — proving the previous test's absence is caused by the
+/// flag, not by the command failing before reaching that code at all.
+#[test]
+fn default_metrics_mode_does_create_runs_db_on_the_same_fast_fail_path() {
+    let td = tempfile::tempdir().unwrap();
+    let rmlx_home = td.path();
+
+    let out = Command::new(rmlx_bin())
+        .env("RMLX_HOME", rmlx_home)
+        .args([
+            "serve",
+            "--model",
+            "/nonexistent/rmlx-metrics-off-probe",
+            "--port",
+            "0",
+        ])
+        .output()
+        .expect("launch serve");
+
+    assert!(!out.status.success());
+    assert!(
+        rmlx_home.join("metrics/runs.db").exists(),
+        "default --metrics full should have created runs.db on this same \
+         fast-fail path (control for metrics_off_never_creates_runs_db): {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

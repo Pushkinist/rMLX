@@ -22,9 +22,15 @@ fn default_is_full() {
 
 #[test]
 fn gates_follow_the_mode() {
-    // Pure functions of the mode value — asserted without touching the global
-    // OnceLock, which other tests in this binary may already have set.
-    let gates = |m: MetricsMode| (m != MetricsMode::Off, m == MetricsMode::Full);
+    // Asserted against `MetricsMode`'s own predicate methods — the exact code
+    // the free functions `events_enabled()` / `observations_enabled()`
+    // delegate to (see `current().events_enabled()` etc. above), not a
+    // reimplemented closure that could drift from the shipped logic while
+    // still passing. Deliberately does NOT touch the process-global
+    // `OnceLock` (`init` / `current`) — that state is shared across every
+    // test in this binary, and asserting a specific value read through it
+    // would race any other test that also sets it.
+    let gates = |m: MetricsMode| (m.events_enabled(), m.observations_enabled());
 
     assert_eq!(gates(MetricsMode::Off), (false, false));
     assert_eq!(gates(MetricsMode::Events), (true, false));

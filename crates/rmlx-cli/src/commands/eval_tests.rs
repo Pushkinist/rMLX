@@ -68,15 +68,15 @@ fn build_record_stamps_identity_from_the_single_source() {
     )
     .expect("record builds");
 
-    let ident = RunIdentity::rmlx();
+    let ident = RunIdentity::get();
     assert_eq!(rec["backend"], "rmlx");
-    assert_eq!(rec["backend_version"], ident.backend_version);
-    assert_eq!(rec["build_profile"], ident.build_profile);
+    assert_eq!(rec["backend_version"], ident.backend_version());
+    assert_eq!(rec["build_profile"], ident.build_profile());
     assert_eq!(
         rec["git_sha"],
-        serde_json::to_value(&ident.git_sha).expect("git_sha to json")
+        serde_json::to_value(ident.git_sha()).expect("git_sha to json")
     );
-    assert_eq!(rec["hardware_tag"], ident.hardware_tag);
+    assert_eq!(rec["hardware_tag"], ident.hardware_tag());
 
     assert_eq!(rec["weight_quant"], "bf16");
     assert_eq!(rec["kv_quant"], "none");
