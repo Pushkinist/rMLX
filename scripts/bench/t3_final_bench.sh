@@ -28,6 +28,10 @@ QWEN_PATH="${RMLX_O_MODELS_ROOT:?Set RMLX_O_MODELS_ROOT - see .env.example}/mlx-
 GEMMA_PATH="${RMLX_O_MODELS_ROOT:?Set RMLX_O_MODELS_ROOT - see .env.example}/mlx-community__gemma-4-26b-a4b-it-mxfp8"
 
 GIT_SHA="$(git -C ${RMLX_ROOT} rev-parse --short HEAD 2>/dev/null || echo unknown)"
+# `unknown` is a fallback for run-ids and labels, never provenance — gate the
+# git_sha JSON key so a checkout without `.git` writes NULL, not "unknown".
+GIT_SHA_KV=""
+[[ "${GIT_SHA}" != unknown* ]] && GIT_SHA_KV="'git_sha': '${GIT_SHA}',"
 TS_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 mkdir -p "$(dirname "${REPORT_LOG}")"
@@ -249,7 +253,7 @@ rec = {
     'max_ctx': int('${max_ctx}'),
     'decode_tps_mean': float('${tps_mean}'),
     'decode_tps_stddev': float('${tps_stddev}'),
-    'git_sha': '${GIT_SHA}',
+    ${GIT_SHA_KV}
     'notes': 'final-bench',
 }
 print(json.dumps(rec))
@@ -290,7 +294,7 @@ words = ${first_32_words}
 output_first_64 = ' '.join(str(w) for w in words)[:64]
 rec = {
     **json.loads(os.environ['RMLX_IDENTITY_JSON']),
-    'git_sha':         '${GIT_SHA}',
+    ${GIT_SHA_KV}
     'model_namespace': '${ns}',
     'model':           '${mdl}',
     'weight_quant':    '${weight_quant}',

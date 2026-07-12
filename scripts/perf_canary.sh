@@ -192,13 +192,20 @@ for entry in "${MODELS[@]}"; do
     # same protocol: prompt-tokens/max-tokens/max-ctx as the measured runs, kv_quant=auto).
     # This is the authoritative canary record; use `make canary-gate` to gate regressions.
     echo "  recording into runs.db..." >&2
+    # "unknown" is a fallback for the --label text above, never provenance —
+    # a checkout without .git must not pass --git-sha at all.
+    # (top-level loop body, not a function — `local` is not valid here.)
+    git_sha_args=()
+    if [[ "${GIT_SHA}" != unknown* ]]; then
+        git_sha_args=(--git-sha "${GIT_SHA}")
+    fi
     if RMLX_HOME="${RMLX_HOME}" "${BINARY}" baseline \
         --model "${model_path}" \
         --prompt-tokens "${PROMPT_TOKENS}" \
         --max-tokens "${MAX_TOKENS}" \
         --max-ctx "${MAX_CTX}" \
         --label "canary sha=${GIT_SHA}" \
-        --git-sha "${GIT_SHA}" \
+        ${git_sha_args[@]+"${git_sha_args[@]}"} \
         --record \
         > /dev/null 2>&1; then
         echo "  runs.db: ok" >&2

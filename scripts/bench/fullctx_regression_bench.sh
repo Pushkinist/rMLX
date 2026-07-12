@@ -22,6 +22,10 @@ QWEN_PATH="${RMLX_O_MODELS_ROOT:?Set RMLX_O_MODELS_ROOT - see .env.example}/mlx-
 PROMPTS_DIR="${RMLX_ROOT}/prompts"
 
 GIT_SHA="$(git -C ${RMLX_ROOT} rev-parse --short HEAD 2>/dev/null || echo unknown)"
+# `unknown` is a fallback for run-ids and labels, never provenance — gate the
+# git_sha JSON key so a checkout without `.git` writes NULL, not "unknown".
+GIT_SHA_KV=""
+[[ "${GIT_SHA}" != unknown* ]] && GIT_SHA_KV="'git_sha': '${GIT_SHA}',"
 TS_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 REPORT_LOG="${RMLX_ROOT}/logs/fullctx_regression_$(date -u +%Y%m%d-%H%M%S).log"
 
@@ -220,7 +224,7 @@ with open('${prompt_file}') as f:
 first_64 = '${first_text}'[:64] if '${first_text}' else ''
 rec = {
     **json.loads(os.environ['RMLX_IDENTITY_JSON']),
-    'git_sha':         '${GIT_SHA}',
+    ${GIT_SHA_KV}
     'model_namespace': '${ns}',
     'model':           '${mdl}',
     'weight_quant':    'q8_0',

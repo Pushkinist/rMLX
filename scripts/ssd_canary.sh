@@ -451,7 +451,9 @@ metric_entries = [
 
 obj = {
     **json.loads(os.environ['RMLX_IDENTITY_JSON']),
-    "git_sha": git_sha,
+    # "unknown" is a fallback for the description label below, never
+    # provenance — a checkout without .git must not stamp git_sha at all.
+    **({"git_sha": git_sha} if not git_sha.startswith("unknown") else {}),
     "model_namespace": model_namespace,
     "model": model_basename,
     "weight_quant": weight_quant,

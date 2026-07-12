@@ -421,7 +421,9 @@ else:
 
 obj = {
     **json.loads(os.environ['RMLX_IDENTITY_JSON']),
-    "git_sha": git_sha,
+    # "unknown" is a fallback for the description label below, never
+    # provenance — a checkout without .git must not stamp git_sha at all.
+    **({"git_sha": git_sha} if not git_sha.startswith("unknown") else {}),
     "model_namespace": "mlx-community",
     "model": "gemma-4-e2b-it-mxfp8",
     "weight_quant": "mxfp8",

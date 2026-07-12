@@ -111,3 +111,34 @@ fn build_record_git_sha_absent_is_null() {
 
     assert!(rec["git_sha"].is_null());
 }
+
+/// `--git-sha ""` is not provenance either — normalized to the same `null`
+/// an absent flag gets, not stamped as a literal empty string.
+#[test]
+fn build_record_git_sha_blank_string_is_null() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model_dir = tmp.path().join("m3");
+    std::fs::create_dir_all(&model_dir).expect("mkdir m3");
+    let report = ppl::PplReport {
+        ppl: 1.0,
+        mean_nll: 0.0,
+        scored_tokens: 1,
+        windows: 1,
+    };
+    let rec = build_ppl_run_record(
+        "20260526-120000-0.2.8",
+        &model_dir,
+        "wikitext-2",
+        16,
+        8,
+        1,
+        &report,
+        0.0,
+        0.0,
+        "bf16",
+        Some(""),
+    )
+    .expect("record builds");
+
+    assert!(rec["git_sha"].is_null());
+}

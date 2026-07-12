@@ -76,6 +76,10 @@ RMLX_BIN="$RMLX_DIR/target/release/rmlx"
 # comes from the measured binary — never hard-coded here.
 source "$(dirname "${BASH_SOURCE[0]}")/lib/identity.sh"
 rmlx_export_identity "$RMLX_BIN"
+# git_sha is caller-supplied provenance, not part of RunIdentity — anchored
+# to RMLX_DIR (never the process cwd) so a run from another checkout cannot
+# stamp that repo's SHA into this one's observations.git_sha.
+GIT_SHA="$(git -C "${RMLX_DIR}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 BUFFER_DIR="$RMLX_DIR/.rmlx/metrics/buffer/pending"
 mkdir -p "$BUFFER_DIR"
 
@@ -175,12 +179,16 @@ emit_status_record() {
   PROMPT_TOK_VAL="$PROMPT_TOKENS" \
   NOTES_VAL="label=ctype-${combo_label} status=${status} ${extra_notes}" \
   DESC_VAL="bench_cache_types ${combo_label} ${status}" \
+  GIT_SHA_VAL="$GIT_SHA" \
   python3 -c '
 import json, os, sys
 with open(os.environ["PROMPT_FILE"], "r") as f:
     body = json.load(f)
 rec = {
     **json.loads(os.environ['RMLX_IDENTITY_JSON']),
+  # "unknown" is a fallback, never provenance — a checkout without .git
+  # must not stamp git_sha at all.
+  **({"git_sha": os.environ["GIT_SHA_VAL"]} if not os.environ["GIT_SHA_VAL"].startswith("unknown") else {}),
   "model_namespace": os.environ["NS_VAL"],
   "model": os.environ["MODEL_VAL"],
   "weight_quant": os.environ["WQ_VAL"],

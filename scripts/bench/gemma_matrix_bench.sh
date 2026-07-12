@@ -27,6 +27,10 @@ GEMMA_PATH="${RMLX_O_MODELS_ROOT:?Set RMLX_O_MODELS_ROOT - see .env.example}/mlx
 PROMPTS_DIR="${RMLX_ROOT}/prompts"
 
 GIT_SHA="$(git -C ${RMLX_ROOT} rev-parse --short HEAD 2>/dev/null || echo unknown)"
+# `unknown` is a fallback for run-ids and labels, never provenance — gate the
+# git_sha JSON key so a checkout without `.git` writes NULL, not "unknown".
+GIT_SHA_KV=""
+[[ "${GIT_SHA}" != unknown* ]] && GIT_SHA_KV="'git_sha': '${GIT_SHA}',"
 TS_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RUN_STAMP="$(date -u +%Y%m%d-%H%M%S)-${GIT_SHA}"
 
@@ -344,7 +348,7 @@ with open('${prompt_file}') as f:
 prompt_body = pf.get('messages', pf.get('body', str(pf)))
 rec = {
     **json.loads(os.environ['RMLX_IDENTITY_JSON']),
-    'git_sha':         '${GIT_SHA}',
+    ${GIT_SHA_KV}
     'model_namespace': '${ns}',
     'model':           '${mdl}',
     'weight_quant':    '${weight_quant}',
@@ -399,7 +403,7 @@ rec = {
     'decode_tps_stddev': float('${decode_stddev}'),
     'prefill_tps': float('${prefill_tps}'),
     'ttft_ms': float('${ttft_ms}'),
-    'git_sha': '${GIT_SHA}',
+    ${GIT_SHA_KV}
     'notes': 'gemma-matrix-bench',
 }
 print(json.dumps(rec))

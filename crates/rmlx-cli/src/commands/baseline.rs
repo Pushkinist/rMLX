@@ -773,10 +773,13 @@ fn build_run_record(
     RunIdentity::get()
         .stamp_json(&mut record)
         .map_err(|e| anyhow::anyhow!("stamp run identity: {e}"))?;
+    // Blank-string `--git-sha ""` is not provenance either — normalize it to
+    // the same `None` a caller who omitted the flag gets.
+    let git_sha = args.git_sha.filter(|s| !s.trim().is_empty());
     record
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("record is not a JSON object"))?
-        .insert("git_sha".to_string(), serde_json::Value::from(args.git_sha));
+        .insert("git_sha".to_string(), serde_json::Value::from(git_sha));
 
     Ok(record)
 }

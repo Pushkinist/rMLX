@@ -293,6 +293,9 @@ fn build_ppl_run_record(
     RunIdentity::get()
         .stamp_json(&mut record)
         .map_err(|e| anyhow::anyhow!("stamp run identity: {e}"))?;
+    // Blank-string `--git-sha ""` is not provenance either — normalize it to
+    // the same `None` a caller who omitted the flag gets.
+    let git_sha = git_sha.filter(|s| !s.trim().is_empty());
     record
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("record is not a JSON object"))?
