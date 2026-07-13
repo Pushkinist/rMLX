@@ -11,6 +11,13 @@ on:
   pull_request:
     branches: [main]
 
+# Both jobs only check out the repo and compile — no PR comments, no releases,
+# no package writes. Pinning least-privilege here rather than relying on the
+# repo-level default keeps the scope explicit, survives the workflow being
+# copied, and does not silently widen if that default is ever changed.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
