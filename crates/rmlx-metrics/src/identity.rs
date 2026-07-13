@@ -47,8 +47,11 @@ const DEFAULT_HARDWARE_TAG: &str = "m5_max_128gb";
 /// `hardware_tag` already is via `RMLX_HARDWARE_TAG`: a bench script that
 /// runs `git rev-parse` in its own repo, or `rmlx baseline --git-sha` /
 /// `rmlx eval ppl --git-sha`, supplies it directly on the record.
-/// `RunRecord.git_sha` and `observations.git_sha` / `events.git_sha` stay as
-/// ordinary nullable columns — see `docs/METRICS_DB.md` §8.5.1.
+/// `RunRecord.git_sha` and `observations.git_sha` stay as ordinary nullable
+/// columns — see `docs/METRICS_DB.md` §8.5.1. `events` has no `git_sha`
+/// column at all: it is written only by the in-process `EventRecorder`,
+/// never by a script or CLI flag, so there is no caller that could ever
+/// populate one (see migration `003_events_identity.sql`).
 ///
 /// All four fields are `pub(crate)`, read via the getters below. A `pub`
 /// field here would be the exact mutation hole closed on [`crate::ingest::RunRecord`]

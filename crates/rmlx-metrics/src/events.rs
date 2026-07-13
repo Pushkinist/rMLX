@@ -227,8 +227,8 @@ impl EventRecorder {
             "INSERT INTO events (
                 run_id, ts_utc, model_path, quant_mode,
                 stage, op, value_unit, value, notes,
-                backend_version, git_sha, build_profile
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                backend_version, build_profile
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 &self.run_id,
                 ts,
@@ -240,11 +240,6 @@ impl EventRecorder {
                 m.value,
                 m.notes,
                 &identity.backend_version,
-                // `events.git_sha` is a caller-supplied provenance column
-                // (see `RunIdentity`'s doc); the drainer has no caller-supplied
-                // git-sha input, so every event row this recorder writes gets
-                // an honest NULL here rather than a guessed value.
-                Option::<String>::None,
                 &identity.build_profile,
             ],
         )?;

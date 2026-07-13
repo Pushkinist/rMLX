@@ -262,3 +262,121 @@ fn kv_cache_bytes_produces_one_row() {
         .expect("value_unit row");
     assert_eq!(unit, "bytes", "value_unit must be 'bytes'");
 }
+
+// ── `events` schema-shape tolerance ─────────────────────────────────────────
+//
+// Migration `003_events_identity.sql` briefly added `events.git_sha` before
+// this contract settled on "events has no git_sha column" (the binary has no
+// caller-supplied provenance for it — see `events.rs`'s module doc). A DB
+// already migrated under the pre-fix 003 (the real `.rmlx/metrics/runs.db`
+// among them) keeps that stray, permanently-`NULL` column: migrations are
+// version-gated, so a DB already at `user_version=3` never re-runs 003. Both
+// shapes must record cleanly, since `EventRecorder::record`'s `INSERT` names
+// its columns explicitly either way.
+
+/// Fresh DB, amended 003 applied: `events` has no `git_sha` column at all.
+#[test]
+fn record_on_fresh_db_has_no_git_sha_column() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("runs.db");
+    let rec = EventRecorder::open_at(&db, "fresh-shape").expect("open");
+    rec.record(&Measurement {
+        model_path: "/m",
+        quant_mode: "none",
+        stage: "stage0",
+        op: "total_tensors",
+        value_unit: "count",
+        value: 1.0,
+        notes: "",
+    })
+    .expect("record on fresh (amended-003) schema");
+
+    let conn = schema::open(&db).expect("reopen");
+    let has_git_sha: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('events') WHERE name = 'git_sha'")
+        .expect("prepare pragma_table_info")
+        .exists([])
+        .expect("query pragma_table_info");
+    assert!(
+        !has_git_sha,
+        "fresh DB must not carry a git_sha column on events"
+    );
+
+    let backend_version: String = conn
+        .query_row(
+            "SELECT backend_version FROM events WHERE run_id = ?1",
+            params!["fresh-shape"],
+            |r| r.get(0),
+        )
+        .expect("backend_version row");
+    assert!(
+        !backend_version.is_empty(),
+        "backend_version must still be stamped"
+    );
+}
+
+/// Legacy-shape DB: `events` already carries the stray `git_sha` column from
+/// a pre-fix migration 003 (simulates the real, already-migrated database).
+/// `record()` must still succeed — the `INSERT`'s explicit column list never
+/// mentions `git_sha`, so an extra nullable column on the table is inert.
+#[test]
+fn record_on_legacy_db_with_stray_git_sha_column_still_works() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("runs.db");
+
+    // Build the DB by hand up through the pre-fix shape of migration 003,
+    // then mark it as already-migrated (`user_version = 3`) so
+    // `migrate::run_pending` skips re-applying 003 — exactly how a real,
+    // already-migrated database behaves.
+    {
+        let conn = schema::open(&db).expect("create");
+        conn.execute_batch(schema::MIGRATIONS[0].1)
+            .expect("apply 001_init");
+        conn.execute_batch(schema::MIGRATIONS[1].1)
+            .expect("apply 002_events");
+        conn.execute_batch(
+            "ALTER TABLE events ADD COLUMN backend_version TEXT;
+             ALTER TABLE events ADD COLUMN git_sha         TEXT;
+             ALTER TABLE events ADD COLUMN build_profile   TEXT;",
+        )
+        .expect("apply pre-fix 003 shape (with the stray git_sha column)");
+        conn.execute_batch("PRAGMA user_version = 3;")
+            .expect("mark schema as already migrated to 3");
+    }
+
+    let rec = EventRecorder::open_at(&db, "legacy-shape").expect("open");
+    rec.record(&Measurement {
+        model_path: "/m",
+        quant_mode: "none",
+        stage: "stage0",
+        op: "total_tensors",
+        value_unit: "count",
+        value: 1.0,
+        notes: "",
+    })
+    .expect("record on legacy (stray-git_sha-column) schema");
+
+    let conn = schema::open(&db).expect("reopen");
+    let has_git_sha: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('events') WHERE name = 'git_sha'")
+        .expect("prepare pragma_table_info")
+        .exists([])
+        .expect("query pragma_table_info");
+    assert!(has_git_sha, "test setup must preserve the stray column");
+
+    let (backend_version, git_sha): (String, Option<String>) = conn
+        .query_row(
+            "SELECT backend_version, git_sha FROM events WHERE run_id = ?1",
+            params!["legacy-shape"],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("row");
+    assert!(
+        !backend_version.is_empty(),
+        "backend_version must still be stamped"
+    );
+    assert!(
+        git_sha.is_none(),
+        "the stray git_sha column must stay NULL — nothing ever writes it"
+    );
+}

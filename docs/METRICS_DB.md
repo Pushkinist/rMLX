@@ -302,15 +302,26 @@ WAL absorbs concurrent writers.
 **Columns:** `id` (INTEGER PK), `run_id` (TEXT), `ts_utc` (TEXT), `model_path`
 (TEXT), `quant_mode` (TEXT), `stage` (TEXT), `op` (TEXT), `value_unit` (TEXT),
 `value` (REAL), `notes` (TEXT), plus the run-identity columns added by 003:
-`backend_version` (TEXT NULL), `git_sha` (TEXT NULL), `build_profile` (TEXT NULL).
+`backend_version` (TEXT NULL), `build_profile` (TEXT NULL).
 
 **Identity.** `backend_version` and `build_profile` are stamped from the same
-`RunIdentity` source `observations` uses (§8.5.1). `git_sha` is always `NULL`
-on `events` rows — the drainer has no caller-supplied git-sha input (there is
-no `--git-sha` flag on `rmlx serve`), and the column is provenance, not
-something `EventRecorder` derives. Before migration 003 `events` carried no
-identity at all. Rows written before 003 keep NULL; the table is append-only
-and is not backfilled.
+`RunIdentity` source `observations` uses (§8.5.1) — the binary genuinely
+knows both about itself, which makes an `events` row self-describing on its
+own. **`events` has no `git_sha` column.** Unlike `observations.git_sha`
+(caller-supplied provenance: a bench script's own `git rev-parse`, or
+`--git-sha` on `rmlx baseline` / `rmlx eval ppl`), `events` is written only by
+the in-process `EventRecorder` — there is no `rmlx serve` flag or script that
+could ever supply a commit SHA for it, so migration `003_events_identity.sql`
+deliberately does not add the column. Before migration 003 `events` carried
+no identity at all; rows written before 003 keep NULL for `backend_version` /
+`build_profile`, and the table is append-only, not backfilled.
+
+An earlier draft of migration 003 briefly did add `events.git_sha` before
+this contract settled; a small number of already-migrated databases may still
+carry that stray, permanently-`NULL` column from before the migration was
+amended. It is harmless — nothing selects it (every query names its columns
+explicitly) — and is not something to "fix" by hand-editing that database's
+schema.
 
 **`stage` / `op` vocabulary:**
 

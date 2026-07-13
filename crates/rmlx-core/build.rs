@@ -21,11 +21,13 @@
 //! workspace root, then a runtime dirty probe against that same path — added
 //! real defects across several review rounds for a value nothing downstream
 //! actually needed the binary to guess. `git_sha` is now purely
-//! caller-supplied provenance: `RunRecord.git_sha` / `observations.git_sha` /
-//! `events.git_sha` are ordinary nullable columns a caller (a bench script
-//! that already runs `git rev-parse` in its own repo, or `rmlx baseline
-//! --git-sha` / `rmlx eval ppl --git-sha`) may fill in. See
-//! `docs/METRICS_DB.md` §8.5.1.
+//! caller-supplied provenance: `RunRecord.git_sha` / `observations.git_sha`
+//! are ordinary nullable columns a caller (a bench script that already runs
+//! `git rev-parse` in its own repo, or `rmlx baseline --git-sha` / `rmlx eval
+//! ppl --git-sha`) may fill in. `events` has no such caller — it is written
+//! only by the in-process `EventRecorder`, never by a script or CLI flag — so
+//! it carries no `git_sha` column at all; see `docs/METRICS_DB.md` §8.5.1 and
+//! migration `003_events_identity.sql`.
 
 use std::path::Path;
 
