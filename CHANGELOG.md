@@ -7,42 +7,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-13
+
+Metrics run-identity is now trustworthy. `observations.backend_version` was
+wrong on 11 of 12 rMLX emitters — hard-coded `'0.0.1'` literals, absent values
+that silently became NULL, and raw git SHAs stuffed into a semver field. The
+root cause was structural: the §8.5 record had **12 construction sites and no
+single integration point**, so identity was merely the first field group to rot.
+This release replaces all of them with one builder that cannot be bypassed, one
+validator on every ingest path, and a rule the binary now follows without
+exception: **it stamps only what it can honestly know, and refuses to invent the
+rest.**
+
+The serving surface — HTTP API, `serve`, `chat` — is unchanged. The breaking
+changes are confined to the metrics/bench subsystem.
+
 ### Changed
 
-- **Metrics run identity unified.** `backend_version` / `git_sha` /
-  `build_profile` were previously hand-rolled by 12 independent emitters;
-  only one got `backend_version` right. Now there is one identity source per
-  language surface (`RunIdentity` in Rust, `rmlx metrics identity --json`
-  for scripts) and the §8.5 ingest validator rejects any `rmlx` record whose
-  `backend_version` is missing or not semver-shaped. See
-  `docs/METRICS_DB.md` §8.5.1 for the full contract.
-- `git_sha`'s commit is now stamped at **compile time**, anchored to the
-  workspace root that built the binary — not read at runtime from the
-  process's working directory, and never from an unrelated enclosing repo
-  (a source tree extracted inside someone else's checkout). An installed
-  `rmlx` launched from inside an unrelated git repo (the normal case for
-  `rmlx serve` run from a user's project) previously stamped *that repo's*
-  SHA into every metrics row it produced. The `-dirty` suffix is a separate,
-  deliberately runtime-resolved fact (one `git status --porcelain` at
-  metrics init, against the same compile-time path, skipped under
-  `--metrics off`) — baking it into the compile-time value would silently
-  freeze it stale the moment a source file is edited without also touching
-  the build script's narrow rebuild-watch list. See `docs/METRICS_DB.md`
-  §8.5.1 for the exact semantics.
+- **BREAKING — §8.5 ingest now validates run identity.** A record with
+  `backend: "rmlx"` must carry a semver-shaped `backend_version`; a missing or
+  malformed value is rejected on *every* ingest path (`metrics record --file`,
+  `--replay-pending`, and the in-process recorder) instead of failing open to a
+  NULL row. Other backends keep the field free-form and optional — llama.cpp has
+  no semver and legitimately emits `build_commit`. See `docs/METRICS_DB.md`
+  §8.5.1.
+- **BREAKING — the binary performs no git operations, at all.** Not at runtime,
+  not in `build.rs`. It previously resolved `git_sha` by shelling out to `git` in
+  the **process working directory**, so an installed `rmlx serve` launched from a
+  user's project stamped *that project's* HEAD — plus its `-dirty` state — into
+  every metrics row it produced. Baking the SHA in at compile time was tried and
+  rejected: Cargo does not re-run `build.rs` on source edits, so a work-in-progress
+  binary filed rows as if they came from the pristine commit.
+
+  `git_sha` is therefore **caller-supplied provenance**, exactly like
+  `hardware_tag`: bench scripts stamp it (they run `git -C <repo> rev-parse` in
+  their own checkout, where the question is cheap and honest), or a caller passes
+  the new `rmlx baseline --git-sha` / `rmlx eval ppl --git-sha`. Absent → `NULL`,
+  never guessed. Live-telemetry rows from the server carry `NULL`, which is
+  correct — nothing bisects them.
+- **BREAKING — `run_id` is now `YYYYMMDD-HHMMSS-<version>`**, not
+  `-<short-git-sha>`. Affects `logs/<run-id>.jsonl` filenames and `events.run_id`.
 - `build_profile` now reliably distinguishes `release` / `release-perf` /
-  `release-debug` (previously `cfg!(debug_assertions)` reported all three as
-  `"release"`).
+  `release-debug`. `cfg!(debug_assertions)` reported all three as `"release"`,
+  so cross-profile perf comparisons were silently comparing unlike builds.
+- `RunRecord` and `RunIdentity` can no longer be constructed or mutated outside
+  `rmlx-metrics`. A hand-rolled record, a forged identity, or a post-hoc field
+  write is now a compile error. Adding a new metric requires zero identity code.
+
+### Added
+
+- **`--metrics {off|events|full}`** (global, default `full`), mirroring the
+  existing `--log` flag. `off` is a producer-side no-op — no database opened, no
+  drainer thread spawned, no `runs.db` created.
+- **`rmlx metrics identity --json`** — the measured binary reports its own
+  identity block, so shell emitters never guess or hard-code it.
+- **`--git-sha <SHA>`** on `rmlx baseline` and `rmlx eval ppl`, for callers that
+  want commit attribution on a recorded run.
+- Migration `003` adds `backend_version` and `build_profile` to the `events`
+  table, stamped from the same identity source as `observations`.
 
 ### Fixed
 
-- **One-time pending-buffer quarantine.** `rmlx metrics record
-  --replay-pending` now rejects pre-contract `rmlx` buffer files (written
-  before the `backend_version` requirement existed) instead of ingesting
-  them as another NULL-version row. At the time of this change, 212 such
-  files sit in `metrics/buffer/pending/`; the first `--replay-pending` after
-  upgrading moves all of them to `metrics/buffer/failed/` and exits 2. This
-  is expected, one-time behavior — not a regression — see
+- **One-time pending-buffer quarantine.** `rmlx metrics record --replay-pending`
+  now rejects pre-contract `rmlx` buffer files (written before the
+  `backend_version` requirement existed) rather than ingesting them as another
+  NULL-version row. On the first run after upgrading, any such files move to
+  `metrics/buffer/failed/` and the command exits **2**. This is expected,
+  one-time behavior — not a regression. No file is deleted. See
   `docs/METRICS_DB.md` §8.5.1.
+- **RUSTSEC-2026-0204** — `crossbeam-epoch` bumped 0.9.18 → 0.9.20 (transitive,
+  via `criterion` → `rayon`). `make deny` and `make audit` are green again (#198,
+  #202).
+- Clippy lints introduced by Rust 1.97.0, which had turned `main` latently red:
+  every PR failed `build + clippy` regardless of content (#200).
+
+### Removed
+
+- The compile-time git SHA, the `RMLX_SOURCE_ROOT` stamp, and the runtime
+  working-tree `-dirty` probe — together roughly 300 lines, including the whole
+  of `build.rs`'s git handling (201 → 50 lines, it now only resolves the Cargo
+  profile). They were the source of a recurring wrong-but-plausible identity bug
+  that reappeared one layer down after each fix. Do not reintroduce them: the
+  binary cannot honestly answer "what commit am I?", so it no longer tries.
+- `events.git_sha` — a column no caller could ever fill. `events` is written only
+  by the binary, which has no SHA to give, and nothing read the column.
+
+### Dependencies
+
+- `rustc-hash` 2.1.2 → 2.1.3, `uuid` 1.23.4 → 1.23.5, `time` 0.3.51 → 0.3.53
+  (#201).
 
 ## [0.2.8] - 2026-06-30
 
@@ -652,7 +705,8 @@ inference + conversion backend for Apple Silicon — no Python at runtime.
 - Speculative drafters validated against their verifiers: Qwen 3.6 MTP sidecar
   and the Gemma 4 assistant drafter.
 
-[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.2.8...HEAD
+[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Pushkinist/rMLX/releases/tag/v0.3.0
 [0.2.8]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.8
 [0.2.7]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.7
 [0.2.6]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.6
