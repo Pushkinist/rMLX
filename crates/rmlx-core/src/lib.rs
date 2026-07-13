@@ -21,6 +21,10 @@
 )]
 
 pub mod apple_gpu;
+// Test-only: shares + tests the pure `profile_from_out_dir` logic that
+// `build.rs` uses. See `src/build_info.rs` for why this exists.
+#[cfg(test)]
+mod build_info;
 pub mod error;
 pub mod kvcache;
 pub mod mach_mem;

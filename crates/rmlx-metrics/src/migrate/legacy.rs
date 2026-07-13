@@ -11,7 +11,7 @@ use tracing::{info, warn};
 
 use crate::error::{Error, Result};
 use crate::identity;
-use crate::ingest::{MetricEntry, PromptRef, RunRecord};
+use crate::ingest::{MetricEntry, PromptRef, RunRecord, RECORD_SCHEMA_VERSION};
 use crate::recorder::Recorder;
 
 // ── Public options + report ───────────────────────────────────────────────────
@@ -335,6 +335,7 @@ fn ingest_jsonl_row(
     }
 
     let run = RunRecord {
+        schema_version: RECORD_SCHEMA_VERSION,
         backend: "rmlx".to_string(),
         backend_version: None,
         model_namespace,
@@ -364,7 +365,7 @@ fn ingest_jsonl_row(
         metrics,
     };
 
-    let mut rec = Recorder::new(conn, &opts.inserted_by);
+    let mut rec = Recorder::legacy_archive(conn, &opts.inserted_by);
     rec.record_run(&run)?;
     Ok(true)
 }
@@ -612,6 +613,7 @@ fn migrate_cbb_csv(
         ));
 
         let run = RunRecord {
+            schema_version: RECORD_SCHEMA_VERSION,
             backend,
             backend_version,
             model_namespace,
@@ -636,7 +638,7 @@ fn migrate_cbb_csv(
             metrics,
         };
 
-        match Recorder::new(conn, &opts.inserted_by).record_run(&run) {
+        match Recorder::legacy_archive(conn, &opts.inserted_by).record_run(&run) {
             Ok(_) => report.cbb_csv_rows_inserted += 1,
             Err(e) => {
                 report
@@ -781,6 +783,7 @@ fn migrate_records_md(
         ));
 
         let run = RunRecord {
+            schema_version: RECORD_SCHEMA_VERSION,
             backend,
             backend_version: None,
             model_namespace,
@@ -814,7 +817,7 @@ fn migrate_records_md(
             }],
         };
 
-        match Recorder::new(conn, &opts.inserted_by).record_run(&run) {
+        match Recorder::legacy_archive(conn, &opts.inserted_by).record_run(&run) {
             Ok(_) => report.records_md_cells_added += 1,
             Err(e) => {
                 warn!(legacy_key, error = %e, "MD fallback row rejected");

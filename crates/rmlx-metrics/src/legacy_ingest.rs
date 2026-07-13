@@ -38,7 +38,7 @@
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::ingest::{MetricEntry, PromptRef, RunRecord};
+use crate::ingest::{MetricEntry, PromptRef, RunRecord, RECORD_SCHEMA_VERSION};
 
 // ── Legacy observation entry ──────────────────────────────────────────────────
 
@@ -162,6 +162,7 @@ impl LegacyRunRecord {
         };
 
         Some(RunRecord {
+            schema_version: RECORD_SCHEMA_VERSION,
             backend: self.backend,
             backend_version: self.backend_version,
             model_namespace: self.model_namespace,
@@ -341,6 +342,7 @@ impl LegacyCbbRecord {
         };
 
         Some(RunRecord {
+            schema_version: RECORD_SCHEMA_VERSION,
             backend,
             backend_version: self.backend_version,
             model_namespace: self.model_namespace,

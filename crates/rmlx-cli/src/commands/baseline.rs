@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use rmlx_metrics::events::EventRecorder;
+use rmlx_metrics::identity::RunIdentity;
 use rmlx_mlx::Device;
 use rmlx_models::arch;
 use tracing::{info, info_span, warn};
@@ -509,6 +510,13 @@ pub(crate) fn run_baseline(
 
     // -- §8.5 universal record (Phase-8 bench harness) ------------------------
     if let Some(record_args) = record_args.as_ref() {
+        // Checked before building anything: `--metrics off` means a no-op at
+        // the producer, not "build the record, then throw it away".
+        if !rmlx_metrics::mode::observations_enabled() {
+            info!("baseline: observations disabled, no record written");
+            return Ok(());
+        }
+
         let weight_quant_str = cfg
             .as_ref()
             .and_then(|c| c.quantization.as_ref())
@@ -545,6 +553,7 @@ pub(crate) fn run_baseline(
             &preview_64,
             kv_cache_bytes,
         )?;
+
         let path = write_buffer_record(&record)?;
         info!(path = %path.display(), "baseline: wrote §8.5 ingest record");
 
@@ -554,9 +563,8 @@ pub(crate) fn run_baseline(
         let db_path = rmlx_core::paths::metrics_db_path();
         match rmlx_metrics::schema::open(&db_path) {
             Ok(mut conn) => {
-                const VERSION: &str = env!("CARGO_PKG_VERSION");
-                let mut rec_inst =
-                    rmlx_metrics::recorder::Recorder::new(&mut conn, format!("rmlx-cli@{VERSION}"));
+                let inserted_by = RunIdentity::get().inserted_by("rmlx-cli");
+                let mut rec_inst = rmlx_metrics::recorder::Recorder::new(&mut conn, inserted_by);
                 let run: rmlx_metrics::ingest::RunRecord = serde_json::from_value(record)
                     .map_err(|e| anyhow::anyhow!("deserialize RunRecord: {e}"))?;
                 match rec_inst.record_run(&run) {
@@ -607,6 +615,9 @@ pub(crate) struct BaselineRecordArgs<'a> {
     pub kv_quant: rmlx_kv_quant::KvQuant,
     /// Final resolved `ctx_max`.
     pub ctx_max: i64,
+    /// Caller-supplied `--git-sha` value, or `None`. Provenance only — the
+    /// binary never derives this itself (see `RunIdentity`'s doc).
+    pub git_sha: Option<&'a str>,
 }
 
 /// Resolve a `--prompt-tokens N` flag to the canonical `prompts/longctx_<N/1024>k.json`
@@ -687,23 +698,6 @@ fn build_run_record(
         .map_err(|e| anyhow::anyhow!("split_model_path({snapshot_str}): {e}"))?;
 
     let ts_utc = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    let hardware_tag =
-        std::env::var("RMLX_HARDWARE_TAG").unwrap_or_else(|_| "m5_max_128gb".to_string());
-
-    // Extract git_sha from run_id (format: YYYYMMDD-HHMMSS-<sha>[-dirty]).
-    // Parts: [date, time, sha, optional-"dirty"]. The sha is the third segment.
-    let git_sha: Option<String> = {
-        let parts: Vec<&str> = run_id.splitn(4, '-').collect();
-        parts.get(2).map(|s| {
-            // Re-attach "-dirty" suffix if present so the sha matches the
-            // `observations.git_sha` column format expected by `rmlx metrics deltas`.
-            if parts.get(3).copied() == Some("dirty") {
-                format!("{s}-dirty")
-            } else {
-                s.to_string()
-            }
-        })
-    };
 
     // Prompt: prefer the canonical longctx body when known, else embed the
     // raw text under the supplied label.
@@ -748,8 +742,8 @@ fn build_run_record(
     }
     let metrics = serde_json::Value::Array(metrics);
 
-    Ok(serde_json::json!({
-        "backend": "rmlx",
+    let mut record = serde_json::json!({
+        "schema_version": rmlx_metrics::ingest::RECORD_SCHEMA_VERSION,
         "model_namespace": ns,
         "model": model,
         "weight_quant": weight_quant,
@@ -760,8 +754,6 @@ fn build_run_record(
             "body": prompt_body,
         },
         "ts_utc": ts_utc,
-        "git_sha": git_sha,
-        "hardware_tag": hardware_tag,
         "prompt_tokens": prompt_tokens,
         "max_tokens": max_tokens,
         "temperature": 0.0,
@@ -771,7 +763,25 @@ fn build_run_record(
         "notes": notes,
         "description": format!("baseline {run_id}"),
         "metrics": metrics,
-    }))
+    });
+
+    // Identity (backend, backend_version, build_profile, hardware_tag) comes
+    // from the single Rust source — baseline does not assemble it.
+    // `stamp_json` deliberately does not touch `git_sha`: that field is
+    // caller-supplied provenance (see `RunIdentity`'s doc), not something
+    // this binary derives. `--git-sha` is the only source for it here.
+    RunIdentity::get()
+        .stamp_json(&mut record)
+        .map_err(|e| anyhow::anyhow!("stamp run identity: {e}"))?;
+    // Blank-string `--git-sha ""` is not provenance either — normalize it to
+    // the same `None` a caller who omitted the flag gets.
+    let git_sha = args.git_sha.filter(|s| !s.trim().is_empty());
+    record
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("record is not a JSON object"))?
+        .insert("git_sha".to_string(), serde_json::Value::from(git_sha));
+
+    Ok(record)
 }
 
 /// Write a `RunRecord` JSON to `<RMLX_HOME>/metrics/buffer/pending/<ts>-<uniq>.json`.

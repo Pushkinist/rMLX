@@ -39,6 +39,7 @@
 
 mod admin;
 mod export;
+mod identity_cmd;
 mod migrate_cmd;
 mod prompts_cmds;
 mod query_cmds;
@@ -96,6 +97,24 @@ pub(crate) enum MetricsAction {
         /// Walk metrics/buffer/pending/, attempt each, move failures to failed/.
         #[arg(long, default_value_t = false, conflicts_with_all = ["inline", "file", "stdin"])]
         replay_pending: bool,
+    },
+    /// Print this binary's §8.5 run-identity block (backend, version, git sha,
+    /// build profile, hardware tag). Shell emitters merge this instead of
+    /// hand-rolling or hard-coding the fields.
+    Identity {
+        /// Emit as a single JSON object (the form bench scripts consume).
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Validate a §8.5 record without writing it. Same validator the recorder
+    /// runs — not a second copy of the contract.
+    Validate {
+        /// Read JSON from path.
+        #[arg(long, conflicts_with = "stdin")]
+        file: Option<PathBuf>,
+        /// Read JSON from stdin.
+        #[arg(long, default_value_t = false)]
+        stdin: bool,
     },
     // ── Query / read API (§8.2) ───────────────────────────────────────────────
     /// Champion row for one (cell, metric). Resolves --prompt-name via PromptStore if --prompt-id absent.
@@ -355,6 +374,8 @@ pub(crate) fn dispatch(cmd: MetricsCmd) -> anyhow::Result<()> {
             dry_run,
             replay_pending,
         } => record::cmd_record(&db_path, inline, file, stdin, dry_run, replay_pending),
+        MetricsAction::Identity { json } => identity_cmd::cmd_identity(json),
+        MetricsAction::Validate { file, stdin } => identity_cmd::cmd_validate(file, stdin),
         MetricsAction::Best {
             backend,
             namespace,

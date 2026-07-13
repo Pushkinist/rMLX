@@ -47,7 +47,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use rmlx_core::runinfo::make_run_id;
 use rmlx_metrics::events::EventRecorder;
 use rmlx_server::SENTINEL_PORT;
-use startup::{init_tracing, print_cache_type_table, LogLevel};
+use startup::{init_tracing, print_cache_type_table, LogLevel, MetricsArg};
 use tracing::info;
 
 use commands::metrics::{dispatch as metrics_dispatch, MetricsCmd};
@@ -192,6 +192,14 @@ struct Cli {
     /// when set. Default `info`.
     #[arg(long, value_enum, global = true, default_value_t = LogLevel::Info)]
     log: LogLevel,
+    /// Metrics recording level (off|events|full). Default `full`.
+    ///
+    /// `off` writes nothing — the drainer never spawns and `runs.db` is never
+    /// opened or created. `events` keeps the runtime event stream but records
+    /// no bench observations. Reading (`rmlx metrics best|export|query`) works
+    /// in every mode.
+    #[arg(long = "metrics", value_enum, global = true, default_value_t = MetricsArg::Full)]
+    metrics_mode: MetricsArg,
     /// Total size cap for `<RMLX_HOME>/logs/` in megabytes. When the directory
     /// exceeds this limit at startup, the oldest `.jsonl` files are deleted
     /// until the total is within the cap. `0` disables rotation (logs grow
@@ -1027,6 +1035,13 @@ enum Cmd {
         /// view immediately. Used by the bench harness.
         #[arg(long, default_value_t = false)]
         record: bool,
+        /// Commit SHA to record as provenance on the emitted metrics row
+        /// (only meaningful with `--record`). Optional caller-supplied
+        /// value — the binary cannot honestly know what commit it was
+        /// built from, so this is never derived or guessed. Absent by
+        /// default (`git_sha` is `NULL`).
+        #[arg(long, value_name = "SHA")]
+        git_sha: Option<String>,
         /// Root directory to search for canonical bench prompt files
         /// (`longctx_<N>k.json`). When unset, the binary walks up from the
         /// current working directory looking for a `prompts/` subdirectory that
@@ -1150,6 +1165,12 @@ enum EvalCmd {
         /// it wants a quick smoke run.
         #[arg(long, default_value_t = 0)]
         max_tokens: usize,
+        /// Commit SHA to record as provenance on the emitted metrics row.
+        /// Optional caller-supplied value — the binary cannot honestly know
+        /// what commit it was built from, so this is never derived or
+        /// guessed. Absent by default (`git_sha` is `NULL`).
+        #[arg(long, value_name = "SHA")]
+        git_sha: Option<String>,
     },
 }
 
@@ -1199,6 +1220,11 @@ fn main() -> Result<()> {
     // Parse CLI first so `--log` can shape the tracing filter.
     let cli = Cli::parse();
     let run_id = make_run_id();
+
+    // Resolve the metrics kill switch exactly once, before anything can open
+    // the DB or spawn the drainer. Every writer reads it from here; no call
+    // site carries its own toggle.
+    rmlx_metrics::mode::init(cli.metrics_mode.mode());
 
     // Set RUST_BACKTRACE before init_tracing so the call happens while the
     // process is genuinely single-threaded — no background threads exist yet
@@ -1879,6 +1905,7 @@ fn main() -> Result<()> {
             max_prompt_tokens,
             label: bench_label,
             record,
+            git_sha,
             prompts_dir,
             yarn_factor,
             yarn_original_max,
@@ -1978,6 +2005,7 @@ fn main() -> Result<()> {
 
             let bench_label_ref = bench_label.as_deref();
             let prompt_id_ref = prompt_id_opt.as_deref();
+            let git_sha_ref = git_sha.as_deref();
             let record_args = if record {
                 Some(commands::baseline::BaselineRecordArgs {
                     label: bench_label_ref,
@@ -1985,6 +2013,7 @@ fn main() -> Result<()> {
                     prompt_body: prompt_body_opt,
                     kv_quant: kv_quant_resolved,
                     ctx_max: resolved_ctx_max,
+                    git_sha: git_sha_ref,
                 })
             } else {
                 None
@@ -2019,6 +2048,7 @@ fn main() -> Result<()> {
                 corpus,
                 device,
                 max_tokens,
+                git_sha,
             } => {
                 // claim the Metal GPU before loading the model so a
                 // running `rmlx serve` does not contend on the single-process
@@ -2027,7 +2057,15 @@ fn main() -> Result<()> {
                 let dev = parse_device(&device)?;
                 let _claim = acquire_claim_for_device(dev, SENTINEL_PORT)?;
                 run_ppl(
-                    &model, &text_file, ctx_window, stride, &corpus, &device, max_tokens, &run_id,
+                    &model,
+                    &text_file,
+                    ctx_window,
+                    stride,
+                    &corpus,
+                    &device,
+                    max_tokens,
+                    &run_id,
+                    git_sha.as_deref(),
                 )?;
             }
         },

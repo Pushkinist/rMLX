@@ -1,16 +1,60 @@
-//! Run identity used by logs/ and metrics/ for filenames.
+//! Run identity: who this binary is, and which run it is.
 //!
-//! Format: `YYYYMMDD-HHMMSS-<short-git-sha|dirty>`.
-
-use std::process::Command;
+//! Run-id format: `YYYYMMDD-HHMMSS-<version>`.
+//!
+//! [`backend_version`] and [`build_profile`] are the single source for the
+//! identity a metrics row records about the binary that produced it. Nothing
+//! else may hand-roll them — see `docs/METRICS_DB.md` §8.5.
+//!
+//! There is deliberately no `git_short_sha` / `source_tree_is_dirty` here.
+//! Four review rounds concluded the binary cannot honestly know the commit it
+//! runs from: not at runtime (the working directory it is launched from is
+//! not necessarily its own source checkout — `rmlx serve` is normally started
+//! from a user's project, not this repo), and not at build time either
+//! (baking in a compile-time SHA, then trying to detect whether the source
+//! tree had since gone "dirty" relative to it, required an entire
+//! workspace-root-discovery + rerun-if-changed + runtime-probe apparatus that
+//! kept producing new defects — wrong-repo detection, stale-commit detection,
+//! untracked-file false positives — without any downstream consumer that
+//! actually needed the binary to guess). `git_sha` is now purely
+//! caller-supplied provenance, exactly like `hardware_tag` already was: a
+//! bench script that runs `git rev-parse` in its own repo, or `rmlx baseline
+//! --git-sha <sha>` / `rmlx eval ppl --git-sha <sha>`, supplies it. The
+//! recording surface accepts provenance; it does not invent it. See
+//! `docs/METRICS_DB.md` §8.5.1.
 
 /// Build a stable run-id for the current process.
 ///
-/// Used by both `logs/<run-id>.jsonl` and `metrics/<run-id>.jsonl`.
+/// Used by both `logs/<run-id>.jsonl` and `metrics/<run-id>.jsonl`. A run-id
+/// is just a tracking string (`docs/METRICS_DB.md` §3.2), not a value
+/// compared across runs — the version discriminator is enough to tell apart
+/// log files from different builds without claiming a commit the binary
+/// cannot actually verify.
 pub fn make_run_id() -> String {
     let ts = chrono_now_compact();
-    let sha = git_short_sha().unwrap_or_else(|| "dirty".to_string());
-    format!("{ts}-{sha}")
+    format!("{ts}-{}", backend_version())
+}
+
+/// Semver of this binary — the single source for `observations.backend_version`.
+///
+/// Every crate in the workspace sets `version.workspace = true`, so this is
+/// `[workspace.package].version` verbatim.
+pub fn backend_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+/// The Cargo profile this binary was built under, e.g. `release`,
+/// `release-perf`, `release-debug`, `debug`.
+///
+/// Stamped by `build.rs` from `OUT_DIR`. `cfg!(debug_assertions)` cannot be
+/// used here: it is off for all three release profiles, so it reports every
+/// one of them as plain `"release"` and silently makes cross-profile
+/// comparisons look like same-profile ones.
+///
+/// Falls back to `"unknown"` when the build layout is unrecognised — an honest
+/// unknown beats a wrong label.
+pub fn build_profile() -> &'static str {
+    env!("RMLX_BUILD_PROFILE")
 }
 
 fn chrono_now_compact() -> String {
@@ -21,28 +65,6 @@ fn chrono_now_compact() -> String {
         .map_or(0, |d| d.as_secs());
     let (y, m, d, hh, mm, ss) = unix_to_ymdhms(secs);
     format!("{y:04}{m:02}{d:02}-{hh:02}{mm:02}{ss:02}")
-}
-
-/// Return the short git SHA of the current HEAD, or `None` when the working
-/// directory has no git repo (e.g. an installed binary without a checkout).
-pub fn git_short_sha() -> Option<String> {
-    let out = Command::new("git")
-        .args(["rev-parse", "--short=7", "HEAD"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let sha = String::from_utf8(out.stdout).ok()?.trim().to_string();
-    if sha.is_empty() {
-        return None;
-    }
-    let dirty = Command::new("git")
-        .args(["status", "--porcelain"])
-        .output()
-        .ok()
-        .is_some_and(|o| !o.stdout.is_empty());
-    Some(if dirty { format!("{sha}-dirty") } else { sha })
 }
 
 /// Civil-time conversion for UTC. No leap-second handling — we don't need it.

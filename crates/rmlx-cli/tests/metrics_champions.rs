@@ -70,6 +70,7 @@ fn run_metrics(db: &Path, subargs: &[&str]) -> std::process::Output {
 fn record_one(db: &Path, backend: &str, model: &str, metric: &str, value: f64, ts: &str) {
     let json = serde_json::json!({
         "backend": backend,
+        "backend_version": "0.2.8",
         "model_namespace": "mlx-community",
         "model": model,
         "weight_quant": "mxfp8",

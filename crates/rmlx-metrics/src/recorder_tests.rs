@@ -13,6 +13,7 @@ fn test_conn() -> Connection {
 
 fn base_run() -> RunRecord {
     RunRecord {
+        schema_version: crate::ingest::RECORD_SCHEMA_VERSION,
         backend: "rmlx".into(),
         backend_version: Some("0.0.1".into()),
         model_namespace: "mlx-community".into(),

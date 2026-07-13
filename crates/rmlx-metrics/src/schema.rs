@@ -16,6 +16,7 @@ use crate::error::Result;
 pub static MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("migrations/001_init.sql")),
     (2, include_str!("migrations/002_events.sql")),
+    (3, include_str!("migrations/003_events_identity.sql")),
 ];
 
 // ---------------------------------------------------------------------------

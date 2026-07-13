@@ -28,6 +28,11 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BINARY="${REPO_ROOT}/target/release-perf/rmlx"
+
+# Run identity (backend / version / git sha / build profile / hardware tag)
+# comes from the measured binary — never hard-coded here.
+source "$(dirname "${BASH_SOURCE[0]}")/lib/identity.sh"
+rmlx_export_identity "${BINARY}"
 PROMPT_DIR="${REPO_ROOT}/prompts/ssd_bench"
 
 # RMLX_HOME for this canary run — hermetic, wiped before run.
@@ -445,7 +450,10 @@ metric_entries = [
 ]
 
 obj = {
-    "backend": "rmlx",
+    **json.loads(os.environ['RMLX_IDENTITY_JSON']),
+    # "unknown" is a fallback for the description label below, never
+    # provenance — a checkout without .git must not stamp git_sha at all.
+    **({"git_sha": git_sha} if not git_sha.startswith("unknown") else {}),
     "model_namespace": model_namespace,
     "model": model_basename,
     "weight_quant": weight_quant,
@@ -456,9 +464,6 @@ obj = {
         "body": [{"role": "user", "content": "ssd_canary batch"}],
     },
     "ts_utc": ts_utc,
-    "git_sha": git_sha,
-    "build_profile": "release-perf",
-    "hardware_tag": hardware_tag,
     "temperature": temperature,
     "seed": seed,
     "notes": notes,
@@ -1099,7 +1104,6 @@ import json, os, time
 summary = {
     "ssd_canary_version": "1.0.0",
     "run_ts_utc": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-    "git_sha": "${GIT_SHA}",
     "model_id": "${MODEL_ID}",
     "rmlx_home": "${RMLX_HOME}",
     "dry_run": $( [[ "${DRY_RUN}" == "true" ]] && echo "True" || echo "False" ),

@@ -133,7 +133,7 @@ CREATE TABLE observations (
     -- run context (the run that produced THIS observation)
     run_id           TEXT    NOT NULL,             -- minted at DB write: '<YYYYMMDDHHMMSS>-<6hex>'
     ts_utc           TEXT    NOT NULL,             -- when measurement was taken (ISO-8601 UTC)
-    git_sha          TEXT,                         -- short sha at run time, '-dirty' suffix if uncommitted
+    git_sha          TEXT,                         -- caller-supplied provenance, see §8.5.1; NULL unless a caller set it
     build_profile    TEXT,                         -- 'release', 'release+pgo', 'debug'
     backend_version  TEXT,                         -- semver only, e.g. '0.0.1'
     hardware_tag     TEXT    NOT NULL,             -- 'm5_max_128gb' — context, no special invalidation logic
@@ -221,7 +221,7 @@ Run context (snapshot):
 |-------------------|-----------------------------------------------------------------------------------------------|
 | `run_id`          | Minted at DB write time. Format `<YYYYMMDDHHMMSS>-<6hex>`. Not a FK, just a tracking string.  |
 | `ts_utc`          | When the measurement was taken (ISO-8601 UTC). Distinct from `inserted_utc`.                  |
-| `git_sha`         | Short SHA of code that produced the measurement. `-dirty` suffix if working tree had unstaged changes (e.g. `599fb89-dirty`). |
+| `git_sha`         | Caller-supplied provenance, not derived by the binary — a bench script's own `git rev-parse`, or `--git-sha` on `rmlx baseline` / `rmlx eval ppl`. `NULL` unless a caller set it (e.g. every drainer/server-produced row). Some historical rows predating this contract carry a `-dirty` suffix that `deltas --since-sha` still matches; the binary never mints that suffix now. See §8.5.1. |
 | `build_profile`   | Cargo profile + flags hint. `release`, `release+pgo`, `release+lto`, `debug`.                 |
 | `backend_version` | Semver only, e.g. `0.0.1`, `0.21.0`. The backend name lives in `backend`.                     |
 | `hardware_tag`    | Hardware identifier, e.g. `m5_max_128gb`. Treated as a regular context column — different value = different cell, no special "invalidation" semantics. Mint a new tag when migrating to new hardware (`m5_ultra_256gb`). |
@@ -295,11 +295,33 @@ Tradeoff: every observation costs storage. Acceptable — see retention §10.2.
 
 ### 3.6 `events` table (runtime per-event stream)
 
-Schema migration `002_events.sql`. Written by `rmlx_metrics::events::EventRecorder`.
-One row per runtime event; append-only; WAL absorbs concurrent writers.
+Schema migrations `002_events.sql` + `003_events_identity.sql`. Written by
+`rmlx_metrics::events::EventRecorder`. One row per runtime event; append-only;
+WAL absorbs concurrent writers.
 
-**Columns:** `id` (INTEGER PK), `run_id` (TEXT), `ts_utc` (TEXT), `stage` (TEXT),
-`op` (TEXT), `label` (TEXT NULL), `value` (REAL NULL), `unit` (TEXT NULL).
+**Columns:** `id` (INTEGER PK), `run_id` (TEXT), `ts_utc` (TEXT), `model_path`
+(TEXT), `quant_mode` (TEXT), `stage` (TEXT), `op` (TEXT), `value_unit` (TEXT),
+`value` (REAL), `notes` (TEXT), plus the run-identity columns added by 003:
+`backend_version` (TEXT NULL), `build_profile` (TEXT NULL).
+
+**Identity.** `backend_version` and `build_profile` are stamped from the same
+`RunIdentity` source `observations` uses (§8.5.1) — the binary genuinely
+knows both about itself, which makes an `events` row self-describing on its
+own. **`events` has no `git_sha` column.** Unlike `observations.git_sha`
+(caller-supplied provenance: a bench script's own `git rev-parse`, or
+`--git-sha` on `rmlx baseline` / `rmlx eval ppl`), `events` is written only by
+the in-process `EventRecorder` — there is no `rmlx serve` flag or script that
+could ever supply a commit SHA for it, so migration `003_events_identity.sql`
+deliberately does not add the column. Before migration 003 `events` carried
+no identity at all; rows written before 003 keep NULL for `backend_version` /
+`build_profile`, and the table is append-only, not backfilled.
+
+An earlier draft of migration 003 briefly did add `events.git_sha` before
+this contract settled; a small number of already-migrated databases may still
+carry that stray, permanently-`NULL` column from before the migration was
+amended. It is harmless — nothing selects it (every query names its columns
+explicitly) — and is not something to "fix" by hand-editing that database's
+schema.
 
 **`stage` / `op` vocabulary:**
 
@@ -686,6 +708,15 @@ rmlx metrics record --inline '<json>'          # ingest one universal §8.5 reco
 rmlx metrics record --file <path>              # ingest one universal §8.5 record from file (preferred — see §8.4 buffer)
 rmlx metrics record --stdin                    # read record from stdin
 rmlx metrics record --inline '<json>' --dry-run  # validate + show what WOULD be written, no commit
+rmlx metrics record --replay-pending           # re-ingest every buffer/pending/ file
+```
+
+Run identity (§8.5.1):
+
+```bash
+rmlx metrics identity --json                   # the identity block, for shell/python emitters
+rmlx metrics identity                          # same, human-readable
+rmlx metrics validate --file <path>            # dry-run the ingest validator, write nothing
 ```
 
 Migration (one-shot, idempotent):
@@ -834,10 +865,13 @@ Recovery on next run: optional `rmlx metrics record --replay-pending` walks `met
 
 Single JSON object per run. The recorder fans out into N `observations` rows (one per non-null metric) inside one transaction. Atomic per-run insert. `bests` view re-evaluates lazily on next read.
 
+`schema_version` declares the wire shape (current: `1`). Absent ⇒ assumed `1`, so archived buffer files still replay. A record declaring a **higher** version is rejected loudly rather than silently mis-parsed.
+
 ```json
 {
+  "schema_version":  1,
   "backend":         "rmlx",
-  "backend_version": "0.0.1",
+  "backend_version": "0.2.8",
   "model_namespace": "mlx-community",
   "model":           "gemma-4-e2b-it-mxfp8",
   "weight_quant":    "mxfp8",
@@ -884,10 +918,106 @@ Single JSON object per run. The recorder fans out into N `observations` rows (on
 | `ts_utc`          | provenance, ISO-8601 UTC                                 |
 | `hardware_tag`    | provenance                                               |
 | `metrics`         | array, ≥1 entry with non-null value                      |
+| `backend_version` | **when `backend == "rmlx"`** — see §8.5.1                |
 
 **Optional fields** (recorder accepts missing or null):
 
-`backend_version`, `git_sha`, `build_profile`, `prompt_tokens`, `max_tokens`, `temperature`, `seed`, `n_warmups`, `n_measure`, `output_first_64`, `notes`, `description`.
+`schema_version` (defaults to 1), `git_sha`, `build_profile`, `prompt_tokens`, `max_tokens`, `temperature`, `seed`, `n_warmups`, `n_measure`, `output_first_64`, `notes`, `description`. Also `backend_version` — but only for non-rMLX backends (§8.5.1).
+
+### 8.5.1 Run identity (hard rule)
+
+The four identity fields — `backend`, `backend_version`, `build_profile`, `hardware_tag` — say **which binary produced the number**. Without them a metrics row cannot be compared across versions, and a wrong value is worse than no value.
+
+They are produced in exactly **one place per language surface**. No emitter hand-rolls them, ever.
+
+| Surface | Source | Notes |
+|---|---|---|
+| Rust (borrow) | `rmlx_metrics::identity::RunIdentity::get()` | `&'static RunIdentity`, resolved once per process, no allocation after the first call — a few `env!()` reads, no I/O, no subprocess. Prefer this. |
+| Rust (owned) | `rmlx_metrics::identity::RunIdentity::rmlx()` | `get().clone()`. Only for the one call site that must move the fields into an owned `RunRecord` (`RunRecordBuilder::rmlx`). |
+| Rust records | `rmlx_metrics::ingest::RunRecordBuilder::rmlx(...)` | Fills identity **and** `model_namespace` / `model` / `weight_quant` / `kv_quant` / `ts_utc` / `schema_version`. Caller supplies the measurement only. |
+| Shell / Python | `rmlx metrics identity --json` | `scripts/lib/identity.sh` exports it as `RMLX_IDENTITY_JSON`; merged into each record's JSON. |
+
+**`git_sha` is not an identity field.** The binary cannot honestly know the
+commit it was built from or the tree it runs against: the working directory a
+process is launched from is not necessarily its own source checkout (`rmlx
+serve` is normally started from a user's project, not this repo), and
+compile-time approaches fare no better — every attempt to bake a commit SHA in
+at build time, then detect whether the source tree had since gone "dirty"
+relative to it, required a workspace-root-discovery + rerun-if-changed +
+runtime-probe apparatus that produced new defects across several review
+rounds (wrong-repo detection, stale-commit detection, untracked-file false
+positives) for a value nothing downstream actually needed the binary to
+guess. **The binary does no git of any kind, at build time or runtime, in any
+mode.**
+
+`git_sha` is instead ordinary **caller-supplied provenance**, exactly like
+`hardware_tag` already was before this section existed — the recording
+surface accepts it; it does not invent it. Two ways a caller supplies it:
+
+- A bench script that already runs its own `git -C <repo> rev-parse --short
+  HEAD` stamps `"git_sha": "<sha>"` directly into the §8.5 JSON it emits,
+  after the identity spread so the explicit value wins.
+- `rmlx baseline --git-sha <sha>` / `rmlx eval ppl --git-sha <sha>` — optional
+  CLI flags on the two record-producing bench commands. Absent by default;
+  `git_sha` is then `NULL`, never guessed or derived.
+
+The server drainer (`EventRecorder`, and any `RunRecordBuilder::rmlx(...)`
+caller) has no `--git-sha` input at all, so `git_sha` is always `NULL` on
+those rows. That is honest, not a regression — see §8.1 for what the drainer
+records.
+
+`RunRecord` is `#[non_exhaustive]` **and** its five `pub(crate)` fields
+(`backend`, `backend_version`, `git_sha`, `build_profile`, `hardware_tag`) are
+read via getters (`RunRecord::backend()`, `.backend_version()`, `.git_sha()`,
+…). Two separate holes, two separate closures: `#[non_exhaustive]` blocks a
+struct *literal* from outside `rmlx-metrics`; field privacy blocks mutating an
+*already-built* record (`let mut r = builder.build()?; r.backend_version =
+Some("0.0.1".into());` compiled and bypassed the validator before this). Rust
+emitters must go through `RunRecordBuilder`; nothing outside this crate can
+construct or mutate a `RunRecord`'s identity fields at all. `git_sha` stays
+`pub(crate)` too even though it is caller-supplied, not binary-derived — the
+same mutation-hole closure applies to it, and `RunRecordBuilder` has no
+`.git_sha(...)` setter today (no Rust caller needs one yet; the two CLI flags
+above set the field directly on the assembled JSON, not through the builder).
+
+This is a mutation-hole closure, not a provenance guarantee. `RunRecord::validate()`
+checks that `backend_version` is semver-*shaped*; it does not — cannot — verify
+that the value is authentic. A hand-written JSON buffer file with a
+fabricated-but-well-formed `"backend_version": "0.0.1"` still ingests cleanly.
+The fields being un-mutable only closes the in-*Rust* hole; a hand-edited
+buffer file is JSON text, not a `RunRecord` value, and goes through
+`Deserialize` (which, being generated inside this crate, can populate
+`pub(crate)` fields — that path is exactly what the validator gates).
+
+**Enforcement.** `RunRecord::validate()` is the single chokepoint — every ingest path (`record --file` / `--inline` / `--stdin`, `--replay-pending`, the in-process `Recorder`) runs it. Rules:
+
+- `backend == "rmlx"` **must** carry a semver-*shaped* `backend_version` (`MAJOR.MINOR.PATCH`, optional `-pre` / `+build` suffix — see previous paragraph on what "shaped" does and doesn't guarantee). Missing, empty, or non-semver ⇒ ingest **fails loudly**, exit 1, buffer file preserved for triage.
+- Every other backend keeps `backend_version` free-form and optional — llama.cpp has no semver, it emits a `build_commit`. Cross-backend ingest is unaffected.
+- `git_sha` is never required and never validated beyond being an optional string — it is provenance, not identity.
+
+Why rMLX only: it is our own binary, so it always knows its own version. A NULL there is a bug, not a limitation.
+
+**Identity is stamped at emit time, into the buffer file — never at ingest time.** A buffer replayed later by a newer binary keeps the identity of the build that produced it. `inserted_by` (`<tool>@<semver>`) separately records which tool did the insert. Build it with `RunIdentity::inserted_by(tool)`, not a literal.
+
+**`build_profile` is the real Cargo profile name** — `release`, `release-perf`, `release-debug`, `debug` — stamped by `crates/rmlx-core/build.rs` from `OUT_DIR` (the path component immediately before the LAST `build` component, so a `CARGO_TARGET_DIR` that itself contains an earlier `build/` component does not misfire). Do **not** use `cfg!(debug_assertions)`: it is off for all three release profiles and collapses them to one `"release"` label, which silently turns a cross-profile comparison into what looks like a same-profile one. This is the *only* thing `build.rs` stamps — no git of any kind runs at build time.
+
+**Pre-existing rows.** The DB still holds rows that predate this rule (NULL versions, `'0.0.1'` literals, git SHAs in the semver column) and rows written while the binary still minted `git_sha` itself, some carrying a `-dirty` suffix. `<RMLX_HOME>/metrics/` is append-only — they are **not** backfilled or rewritten. `rmlx metrics deltas --since-sha` still matches the `-dirty` suffix on historical rows (`crates/rmlx-metrics/src/query/read.rs`) even though the binary will never mint it again.
+
+**One-time pending-buffer quarantine.** Buffer files written by an `rmlx` binary from before this contract landed (`backend: "rmlx"`, no `backend_version` key at all) are now **rejected** by `rmlx metrics record --replay-pending` instead of being silently ingested as another NULL row. Expect, on the first `--replay-pending` after upgrading past this point:
+
+- Each pre-contract file is moved to `metrics/buffer/failed/` (nothing is deleted).
+- `rmlx metrics record --replay-pending` exits **2** (its normal "some records failed" exit code) if any pre-contract files were present.
+- This is expected, one-time behavior for files that predate the contract — **not a new bug** and not something to "fix" by adding a bypass flag. There is deliberately no `--legacy-archive` (or similar) escape on `record`/`--replay-pending`: the only door around the identity check (`Recorder::legacy_archive`) is `pub(crate)`, reachable only from the one-shot `rmlx metrics migrate` importer for pre-DB archives, and an operator-facing bypass would turn an exceptional path into a routine one.
+- Those quarantined records carry a real `git_sha`; if ever wanted, they can be reconstructed via the same sha→tag map mentioned above and re-submitted with a real version. Backfilling them is out of scope here, same as the pre-existing DB rows.
+
+### 8.5.2 Validating a record without writing it
+
+```bash
+rmlx metrics validate --file <buffer.json>     # dry-run of the SAME validator the recorder runs
+rmlx metrics validate --stdin
+```
+
+Deliberately not a separate JSON Schema file: a second machine-readable copy of the contract is a second source of truth, and would drift — the exact failure this section exists to prevent.
 
 **Per-metric entry**:
 
@@ -1050,6 +1180,27 @@ Daily snapshot via `rmlx metrics backup`. Output dir: `metrics/backups/runs-<YYY
 - `--keep N` retains last N snapshots, deletes older. Default unlimited.
 - Backups are git-ignored. iCloud or external-disk sync is the user's responsibility.
 - `rmlx metrics restore --from <path>` snapshots current DB to `metrics/backups/pre-restore-<ts>.db` first, then atomic-rename the restore target into place.
+
+### 10.1.1 Turning metrics off (`--metrics`)
+
+Global CLI flag, mirroring `--log`. Default `full` — existing behaviour, nothing changes for existing users.
+
+| Mode | `events` | `observations` | Effect |
+|---|---|---|---|
+| `full` (default) | yes | yes | Current behaviour. |
+| `events` | yes | no | Runtime event stream only; no bench observations. |
+| `off` | no | no | **No DB writes at all.** The drainer task is never spawned and `runs.db` is never opened or created. |
+
+```bash
+rmlx --metrics off serve --model <snapshot>    # zero telemetry; no SQLite file appears
+rmlx --metrics events serve --model <snapshot>
+```
+
+The mode is resolved **once** at process start (`rmlx_metrics::mode::init`) and every writer reads it from there — there is no per-call-site toggle. `off` is a no-op at the *producer*: records are not built and thrown away, they are never built.
+
+`off` disables **writing**, not the whole subsystem. `rmlx metrics best|rank|compare|history|export|query` read the DB in every mode, and the explicitly user-invoked `rmlx metrics record` / `migrate` writes are commands, not telemetry — they are not gated.
+
+Not an environment variable: new env vars are an "Ask before" item in CLAUDE.md, and `--log` already establishes the flag pattern.
 
 ### 10.2 Retention policy
 
