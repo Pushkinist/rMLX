@@ -63,6 +63,15 @@ WEIGHT_QUANT="$7"   # mxfp8 | paro | ... (whitelist)
 PROGRESS=${RMLX_ROOT}/BENCH_PROGRESS.md
 CBB=${CROSS_BENCH_ROOT:-../Cross-Backend-Bench}
 RMLX_DIR=${RMLX_ROOT}
+
+# Run identity (backend / version / git sha / build profile / hardware tag)
+# comes from the measured binary — never hard-coded here.
+source "$(dirname "${BASH_SOURCE[0]}")/lib/identity.sh"
+rmlx_export_identity "$RMLX_DIR/target/release/rmlx"
+# git_sha is caller-supplied provenance, not part of RunIdentity — anchored
+# to RMLX_DIR (never the process cwd) so a run from another checkout cannot
+# stamp that repo's SHA into this one's observations.git_sha.
+GIT_SHA="$(git -C "${RMLX_DIR}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 PORT=62265
 CLAIM=/tmp/rmlx.${PORT}.claim
 BUDGET_S=$((BUDGET_MIN * 60))
@@ -363,12 +372,16 @@ if [ "$_CT_MODE" -eq 1 ]; then
     N_MEAS_VAL="$_MEASURED_EFF" \
     NOTES_VAL="${_NOTES} status=runtime_fail tps=${_MEDIAN_TPS:-0}" \
     DESC_VAL="bench_cell ct ${TAG} ${_LABEL_PREFIX_EFF} runtime_fail" \
+    GIT_SHA_VAL="$GIT_SHA" \
     python3 -c '
 import json, os, sys
 with open(os.environ["PROMPT_FILE"], "r") as f:
     body = json.load(f)
 rec = {
-  "backend": os.environ["BACKEND_VAL"],
+    **json.loads(os.environ['RMLX_IDENTITY_JSON']),
+  # "unknown" is a fallback, never provenance — a checkout without .git
+  # must not stamp git_sha at all.
+  **({"git_sha": os.environ["GIT_SHA_VAL"]} if not os.environ["GIT_SHA_VAL"].startswith("unknown") else {}),
   "model_namespace": os.environ["NS_VAL"],
   "model": os.environ["MODEL_VAL"],
   "weight_quant": os.environ["WQ_VAL"],
@@ -376,7 +389,6 @@ rec = {
   "ctx_max": int(os.environ["CTX_VAL"]),
   "prompt": {"name": os.environ["PROMPT_NAME_VAL"], "body": body},
   "ts_utc": os.environ["TS_VAL"],
-  "hardware_tag": os.environ["HW_VAL"],
   "prompt_tokens": int(os.environ["PROMPT_TOK_VAL"]),
   "max_tokens": int(os.environ["MAX_TOK_VAL"]),
   "temperature": 0.0,
@@ -425,12 +437,16 @@ json.dump(rec, sys.stdout, indent=2)
   TTFT_VAL="$_LAST_TTFT_MS" \
   LOAD_VAL="$_LAST_LOAD_MS" \
   RSS_VAL="$_LAST_RSS" \
+  GIT_SHA_VAL="$GIT_SHA" \
   python3 -c '
 import json, os, sys
 with open(os.environ["PROMPT_FILE"], "r") as f:
     body = json.load(f)
 rec = {
-  "backend": os.environ["BACKEND_VAL"],
+    **json.loads(os.environ['RMLX_IDENTITY_JSON']),
+  # "unknown" is a fallback, never provenance — a checkout without .git
+  # must not stamp git_sha at all.
+  **({"git_sha": os.environ["GIT_SHA_VAL"]} if not os.environ["GIT_SHA_VAL"].startswith("unknown") else {}),
   "model_namespace": os.environ["NS_VAL"],
   "model": os.environ["MODEL_VAL"],
   "weight_quant": os.environ["WQ_VAL"],
@@ -438,7 +454,6 @@ rec = {
   "ctx_max": int(os.environ["CTX_VAL"]),
   "prompt": {"name": os.environ["PROMPT_NAME_VAL"], "body": body},
   "ts_utc": os.environ["TS_VAL"],
-  "hardware_tag": os.environ["HW_VAL"],
   "prompt_tokens": int(os.environ["PROMPT_TOK_VAL"]),
   "max_tokens": int(os.environ["MAX_TOK_VAL"]),
   "temperature": 0.0,

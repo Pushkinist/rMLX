@@ -63,6 +63,23 @@ pub enum Error {
         message: String,
     },
 
+    /// An `rmlx` record carried a missing, empty, or non-semver `backend_version`.
+    ///
+    /// Only rMLX is held to this: it is our own binary, so it always knows its
+    /// own version. Other backends (llama.cpp emits a `build_commit`, not a
+    /// semver) keep the field free-form and optional.
+    #[error(
+        "ingest: backend 'rmlx' requires a semver backend_version (MAJOR.MINOR.PATCH), got {got}. \
+         Shell emitters must take it from `rmlx metrics identity --json`; \
+         Rust emitters from `rmlx_metrics::ingest::RunRecordBuilder::rmlx()` \
+         (or `RunIdentity::get().stamp_json(&mut record)` for `json!`-built records). \
+         See docs/METRICS_DB.md §8.5."
+    )]
+    MissingBackendVersion {
+        /// The offending value, quoted, or `<null>` when the key was absent.
+        got: String,
+    },
+
     /// Recorder-layer error (DB insert or transaction failure).
     #[error("recorder: {0}")]
     Recorder(String),

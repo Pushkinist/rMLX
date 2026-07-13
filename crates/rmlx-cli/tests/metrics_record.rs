@@ -82,6 +82,7 @@ fn obs_count(db: &Path) -> i64 {
 fn valid_record_json() -> String {
     serde_json::json!({
         "backend": "rmlx",
+        "backend_version": "0.2.8",
         "model_namespace": "mlx-community",
         "model": "gemma-4-e4b-it-mxfp8",
         "weight_quant": "mxfp8",

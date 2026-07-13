@@ -26,6 +26,11 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BINARY="${REPO_ROOT}/target/release-perf/rmlx"
+
+# Run identity (backend / version / git sha / build profile / hardware tag)
+# comes from the measured binary — never hard-coded here.
+source "$(dirname "${BASH_SOURCE[0]}")/lib/identity.sh"
+rmlx_export_identity "${BINARY}"
 RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
 LOG_DIR="${RMLX_HOME}/logs"
 BUFFER_DIR="${RMLX_HOME}/metrics/buffer/pending"
@@ -415,7 +420,10 @@ else:
     ]
 
 obj = {
-    "backend": "rmlx",
+    **json.loads(os.environ['RMLX_IDENTITY_JSON']),
+    # "unknown" is a fallback for the description label below, never
+    # provenance — a checkout without .git must not stamp git_sha at all.
+    **({"git_sha": git_sha} if not git_sha.startswith("unknown") else {}),
     "model_namespace": "mlx-community",
     "model": "gemma-4-e2b-it-mxfp8",
     "weight_quant": "mxfp8",
@@ -426,9 +434,6 @@ obj = {
         "body": prompt_body,
     },
     "ts_utc": ts_utc,
-    "git_sha": git_sha,
-    "build_profile": "release-perf",
-    "hardware_tag": hardware_tag,
     "prompt_tokens": 14,
     "max_tokens": max_tokens,
     "temperature": temperature,

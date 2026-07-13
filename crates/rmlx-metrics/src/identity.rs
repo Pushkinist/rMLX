@@ -7,6 +7,9 @@
 //!
 //! # Public API
 //!
+//! - [`RunIdentity`] — who produced a metrics row: backend, version, build
+//!   profile, hardware tag. The ONE source for those fields in Rust.
+//!   Deliberately does NOT include `git_sha` — see the struct doc for why.
 //! - [`canonicalize_kv_quant`] — normalise a KV-quant string to its canonical
 //!   lower-kebab form (e.g. `"K8V4"` → `"k8v4"`).
 //! - [`canonicalize`] — general field canonicalization against a whitelist.
@@ -14,8 +17,225 @@
 //!   `(org, repo)` for the `model_org` / `model_repo` DB columns.
 
 use std::path::Path;
+use std::sync::OnceLock;
+
+use serde::Serialize;
 
 use crate::error::{Error, Result};
+
+/// Default hardware tag when `RMLX_HARDWARE_TAG` is unset.
+const DEFAULT_HARDWARE_TAG: &str = "m5_max_128gb";
+
+// ── Run identity ──────────────────────────────────────────────────────────────
+
+/// The identity of the binary that produced a metrics row.
+///
+/// Rust emitters (the server drainer, `rmlx baseline`, `rmlx eval`) build one
+/// of these instead of hand-rolling the four fields; shell emitters get the
+/// same block as JSON from `rmlx metrics identity --json`. Both surfaces
+/// therefore agree by construction, and the §8.5 ingest validator rejects any
+/// `rmlx` record whose `backend_version` did not come from here.
+///
+/// **Deliberately has no `git_sha` field.** Four review rounds concluded the
+/// binary cannot honestly know the commit it runs from — not at runtime (its
+/// working directory is not necessarily its own source checkout), and not at
+/// build time either (a compile-time SHA plus a runtime "is the tree dirty"
+/// probe against a discovered workspace root kept producing new defects:
+/// wrong-repo detection, stale-commit detection, untracked-file false
+/// positives — for a value nothing downstream needed the binary to guess).
+/// `git_sha` is caller-supplied provenance instead, exactly like
+/// `hardware_tag` already is via `RMLX_HARDWARE_TAG`: a bench script that
+/// runs `git rev-parse` in its own repo, or `rmlx baseline --git-sha` /
+/// `rmlx eval ppl --git-sha`, supplies it directly on the record.
+/// `RunRecord.git_sha` and `observations.git_sha` stay as ordinary nullable
+/// columns — see `docs/METRICS_DB.md` §8.5.1. `events` has no `git_sha`
+/// column at all: it is written only by the in-process `EventRecorder`,
+/// never by a script or CLI flag, so there is no caller that could ever
+/// populate one (see migration `003_events_identity.sql`).
+///
+/// All four fields are `pub(crate)`, read via the getters below. A `pub`
+/// field here would be the exact mutation hole closed on [`crate::ingest::RunRecord`]
+/// relocated one type upstream: `RunIdentity::stamp_json` takes `&self` and
+/// writes whatever fields it is given verbatim, with no validation of its
+/// own (validation happens later, in `RunRecord::validate`) — a caller outside
+/// this crate that could still write `RunIdentity { backend_version:
+/// "0.0.1".into(), .. }` or `id.backend_version = "0.0.1".into()` on an
+/// already-built value would forge exactly the identity block this whole
+/// contract exists to make un-forgeable. [`RunIdentity::get`] /
+/// [`RunIdentity::rmlx`] are the only way to obtain one.
+///
+/// `#[derive(Serialize)]` is unaffected by field visibility — `serde_derive`
+/// expands inside this crate — so `rmlx metrics identity --json` still emits
+/// the full block.
+///
+/// See `docs/METRICS_DB.md` §8.5.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunIdentity {
+    /// Canonical backend name — always `"rmlx"` for a binary built from this repo.
+    pub(crate) backend: String,
+    /// Semver of this binary (`[workspace.package].version`).
+    pub(crate) backend_version: String,
+    /// Real Cargo profile name: `release`, `release-perf`, `release-debug`, `debug`.
+    pub(crate) build_profile: String,
+    /// Hardware the run happened on. `RMLX_HARDWARE_TAG` overrides the default.
+    pub(crate) hardware_tag: String,
+}
+
+impl RunIdentity {
+    /// Canonical backend name — always `"rmlx"` for a binary built from this repo.
+    pub fn backend(&self) -> &str {
+        &self.backend
+    }
+
+    /// Semver of this binary.
+    pub fn backend_version(&self) -> &str {
+        &self.backend_version
+    }
+
+    /// Real Cargo profile name.
+    pub fn build_profile(&self) -> &str {
+        &self.build_profile
+    }
+
+    /// Hardware the run happened on.
+    pub fn hardware_tag(&self) -> &str {
+        &self.hardware_tag
+    }
+}
+
+/// Computed once per process, cached in a `OnceLock`. None of the four fields
+/// can change while the process runs. `backend_version` / `build_profile` are
+/// read from `build.rs`-stamped compile-time constants; `hardware_tag`
+/// touches the environment via one `std::env::var`. No I/O, no subprocess
+/// spawn, ever — the binary does no git of any kind at runtime.
+static IDENTITY: OnceLock<RunIdentity> = OnceLock::new();
+
+impl RunIdentity {
+    /// Identity of the currently-running rMLX binary — borrowed, no allocation
+    /// after the first call. Prefer this over [`RunIdentity::rmlx`]; the owned
+    /// form exists only for the one call site that must move the fields into
+    /// an owned [`crate::ingest::RunRecord`].
+    pub fn get() -> &'static RunIdentity {
+        IDENTITY.get_or_init(|| Self {
+            backend: "rmlx".to_string(),
+            backend_version: rmlx_core::runinfo::backend_version().to_string(),
+            build_profile: rmlx_core::runinfo::build_profile().to_string(),
+            hardware_tag: std::env::var("RMLX_HARDWARE_TAG")
+                .unwrap_or_else(|_| DEFAULT_HARDWARE_TAG.to_string()),
+        })
+    }
+
+    /// Owned clone of [`RunIdentity::get`]. `pub(crate)`: the only caller that
+    /// needs an owned value is [`crate::ingest::RunRecordBuilder::rmlx`],
+    /// which moves the fields into an owned [`crate::ingest::RunRecord`].
+    /// Everything else — in this crate or outside it — should borrow via
+    /// `get()`.
+    pub(crate) fn rmlx() -> Self {
+        Self::get().clone()
+    }
+
+    /// The `observations.inserted_by` audit string: `"<tool>@<semver>"`.
+    ///
+    /// e.g. `identity.inserted_by("rmlx-server")` → `"rmlx-server@0.2.8"`.
+    pub fn inserted_by(&self, tool: &str) -> String {
+        format!("{tool}@{}", self.backend_version)
+    }
+
+    /// Merge this identity into a §8.5 record that is still a `serde_json` object.
+    ///
+    /// For emitters that assemble the record with `serde_json::json!` rather
+    /// than a `RunRecord` struct literal. Overwrites `backend` /
+    /// `backend_version` / `build_profile` / `hardware_tag` unconditionally —
+    /// the caller does not get to supply its own for those. Deliberately
+    /// leaves `git_sha` untouched: that field is caller-supplied provenance
+    /// (see the struct doc), not something this binary derives, so a caller
+    /// that already set it (a script's own `"git_sha": "<sha>"` key from its
+    /// own `git rev-parse`) keeps its value, and a caller that did not set it
+    /// gets the §8.5 default (absent ⇒ `None` on ingest).
+    pub fn stamp_json(&self, record: &mut serde_json::Value) -> Result<()> {
+        let obj = record
+            .as_object_mut()
+            .ok_or_else(|| Error::InvalidIngestField {
+                field: "<record>".to_string(),
+                message: "expected a JSON object".to_string(),
+            })?;
+        obj.insert("backend".to_string(), self.backend.clone().into());
+        obj.insert(
+            "backend_version".to_string(),
+            self.backend_version.clone().into(),
+        );
+        obj.insert(
+            "build_profile".to_string(),
+            self.build_profile.clone().into(),
+        );
+        obj.insert("hardware_tag".to_string(), self.hardware_tag.clone().into());
+        Ok(())
+    }
+}
+
+// ── Model-id canonicalization ─────────────────────────────────────────────────
+
+/// Split a snapshot id or path into `(model_namespace, model)`.
+///
+/// Accepts `"<ns>__<model>"` (the on-disk snapshot layout) and bare names.
+/// Falls back to the `"local"` namespace — always whitelisted — rather than
+/// failing, because a metrics row with an approximate namespace beats no row.
+///
+/// Lenient by design; [`split_model_path`] is the strict, erroring variant used
+/// where the caller can act on a bad path.
+pub fn split_model_id(model_id: &str) -> (String, String) {
+    // Tolerate a full path: only the final component carries the id.
+    let basename = Path::new(model_id)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(model_id);
+
+    basename.find("__").map_or_else(
+        || ("local".to_string(), basename.to_string()),
+        |idx| {
+            let (ns, rest) = basename.split_at(idx);
+            (ns.to_string(), rest.trim_start_matches('_').to_string())
+        },
+    )
+}
+
+/// Infer the on-disk weight quantization from a snapshot name.
+///
+/// Order matters — the more specific token wins (`mxfp8` before `8bit`).
+/// Falls back to `bf16`, which is the whitelist's "unquantized / we don't
+/// know" value.
+pub fn infer_weight_quant(model_id: &str) -> String {
+    let lower = model_id.to_lowercase();
+    for token in [
+        "mxfp8", "mxfp4", "nvfp4", "q4_k_m", "q8_0", "8bit", "4bit", "2bit", "3bit", "5bit",
+        "6bit", "fp16", "bf16", "paro",
+    ] {
+        if lower.contains(token) {
+            return token.to_string();
+        }
+    }
+    "bf16".to_string()
+}
+
+/// True when `v` is a semver `MAJOR.MINOR.PATCH`, with an optional
+/// `-prerelease` / `+build` suffix.
+///
+/// Deliberately hand-rolled rather than pulling in the `semver` crate: the only
+/// question asked is "did this come from a real Cargo version, or is it a git
+/// sha / a `head` / a fabricated literal?". A numeric three-part core answers
+/// that. The suffix is tolerated so an `0.3.0-rc.1` build does not have its
+/// metrics silently rejected.
+pub fn is_semver(v: &str) -> bool {
+    // "1.2.3-rc.1+meta" → "1.2.3"
+    let core = v.split(['-', '+']).next().unwrap_or(v);
+    let mut parts = core.split('.');
+    let numeric =
+        |p: Option<&str>| p.is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+    numeric(parts.next())
+        && numeric(parts.next())
+        && numeric(parts.next())
+        && parts.next().is_none()
+}
 
 /// Allowed values for the `backend` identity column (see docs/METRICS_DB.md §5.4).
 pub const BACKEND_WHITELIST: &[&str] = &[

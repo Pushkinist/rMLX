@@ -26,6 +26,7 @@ pub mod identity;
 pub mod ingest;
 pub mod legacy_ingest;
 pub mod migrate;
+pub mod mode;
 pub mod prompts;
 pub mod query;
 pub mod recorder;

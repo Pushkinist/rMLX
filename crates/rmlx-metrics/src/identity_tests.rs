@@ -62,7 +62,8 @@ fn split_model_path_unknown_namespace_errors() {
             assert_eq!(field, "model_namespace");
             assert_eq!(value, "foo");
         }
-        Error::Sqlite(_)
+        Error::MissingBackendVersion { .. }
+        | Error::Sqlite(_)
         | Error::Io(_)
         | Error::Schema(_)
         | Error::IdentityModelPath(_)
@@ -94,7 +95,8 @@ fn canonicalize_backend_unknown() {
             assert_eq!(field, "backend");
             assert_eq!(value, "pytorch");
         }
-        Error::Sqlite(_)
+        Error::MissingBackendVersion { .. }
+        | Error::Sqlite(_)
         | Error::Io(_)
         | Error::Schema(_)
         | Error::IdentityModelPath(_)
@@ -140,7 +142,8 @@ fn alias_normalization_non_backend_field_untouched() {
     let err = canonicalize("weight_quant", "llama.cpp", WEIGHT_QUANT_WHITELIST).unwrap_err();
     match err {
         Error::IdentityNotInWhitelist { field, .. } => assert_eq!(field, "weight_quant"),
-        Error::Sqlite(_)
+        Error::MissingBackendVersion { .. }
+        | Error::Sqlite(_)
         | Error::Io(_)
         | Error::Schema(_)
         | Error::IdentityModelPath(_)
@@ -170,7 +173,8 @@ fn canonicalize_kv_quant_unknown_errors() {
             assert_eq!(field, "kv_quant");
             assert_eq!(value, "kx99");
         }
-        Error::Sqlite(_)
+        Error::MissingBackendVersion { .. }
+        | Error::Sqlite(_)
         | Error::Io(_)
         | Error::Schema(_)
         | Error::IdentityModelPath(_)

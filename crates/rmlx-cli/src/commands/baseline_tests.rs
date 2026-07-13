@@ -116,3 +116,134 @@ fn phase_timing_single_token_falls_back_to_overall() {
     let t = compute_phase_timing(0.5, 0.5, 0.5, 1, 4096);
     assert!((t.decode_tps - t.overall_tps).abs() < 1e-9);
 }
+
+// -- build_run_record: git_sha provenance -----------------------------------
+//
+// Mirrors `eval_tests::build_record_stamps_identity_from_the_single_source` /
+// `build_record_git_sha_absent_is_null` — `build_run_record` is the OTHER
+// (and, via `perf_canary.sh`, the more heavily exercised) record builder that
+// threads `--git-sha` through, and it is pure — no model, no GPU claim.
+
+#[test]
+fn build_record_git_sha_survives_stamp_json() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model_dir = tmp.path().join("m");
+    std::fs::create_dir_all(&model_dir).expect("mkdir m");
+
+    let args = BaselineRecordArgs {
+        label: None,
+        prompt_id: Some("longctx_4k"),
+        prompt_body: Some(serde_json::json!([{"role": "user", "content": "hi"}])),
+        kv_quant: rmlx_kv_quant::KvQuant::None,
+        ctx_max: 4096,
+        git_sha: Some("cafebabe"),
+    };
+
+    let rec = build_run_record(
+        "20260526-120000-0.2.8",
+        &model_dir,
+        &args,
+        "fallback-label",
+        "prompt text",
+        "bf16",
+        16,
+        8,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        8,
+        "",
+        0,
+    )
+    .expect("record builds");
+
+    let ident = RunIdentity::get();
+    assert_eq!(rec["backend"], "rmlx");
+    assert_eq!(rec["backend_version"], ident.backend_version());
+    assert_eq!(rec["build_profile"], ident.build_profile());
+    assert_eq!(rec["git_sha"], "cafebabe");
+    assert_eq!(rec["hardware_tag"], ident.hardware_tag());
+}
+
+#[test]
+fn build_record_git_sha_absent_is_null() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model_dir = tmp.path().join("m2");
+    std::fs::create_dir_all(&model_dir).expect("mkdir m2");
+
+    let args = BaselineRecordArgs {
+        label: None,
+        prompt_id: Some("longctx_4k"),
+        prompt_body: Some(serde_json::json!([{"role": "user", "content": "hi"}])),
+        kv_quant: rmlx_kv_quant::KvQuant::None,
+        ctx_max: 4096,
+        git_sha: None,
+    };
+
+    let rec = build_run_record(
+        "20260526-120000-0.2.8",
+        &model_dir,
+        &args,
+        "fallback-label",
+        "prompt text",
+        "bf16",
+        16,
+        8,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        8,
+        "",
+        0,
+    )
+    .expect("record builds");
+
+    assert!(rec["git_sha"].is_null());
+}
+
+/// `--git-sha ""` is not provenance either — normalized to the same `null`
+/// an absent flag gets, not stamped as a literal empty string.
+#[test]
+fn build_record_git_sha_blank_string_is_null() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model_dir = tmp.path().join("m3");
+    std::fs::create_dir_all(&model_dir).expect("mkdir m3");
+
+    let args = BaselineRecordArgs {
+        label: None,
+        prompt_id: Some("longctx_4k"),
+        prompt_body: Some(serde_json::json!([{"role": "user", "content": "hi"}])),
+        kv_quant: rmlx_kv_quant::KvQuant::None,
+        ctx_max: 4096,
+        git_sha: Some(""),
+    };
+
+    let rec = build_run_record(
+        "20260526-120000-0.2.8",
+        &model_dir,
+        &args,
+        "fallback-label",
+        "prompt text",
+        "bf16",
+        16,
+        8,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        8,
+        "",
+        0,
+    )
+    .expect("record builds");
+
+    assert!(rec["git_sha"].is_null());
+}

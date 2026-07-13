@@ -347,6 +347,13 @@ pub fn deltas(
     let threshold = threshold_pct.unwrap_or(5.0);
 
     // Step 1: find the earliest ts_utc carrying that sha (or sha-dirty).
+    //
+    // The binary itself no longer mints a `-dirty` suffix (`git_sha` is now
+    // purely caller-supplied provenance — see `rmlx_core::runinfo`'s module
+    // doc). This match arm stays regardless: 100k+ historical rows written
+    // before that change carry the suffix, and `--since-sha` needs to keep
+    // finding them. Do not remove this as dead code — it is live history,
+    // not a live git probe.
     let dirty = format!("{since_sha}-dirty");
     let baseline_ts: Option<String> = conn
         .query_row(

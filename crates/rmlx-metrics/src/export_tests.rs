@@ -14,6 +14,7 @@ fn test_conn() -> Connection {
 fn seed_one(conn: &mut Connection, value: f64, description: Option<&str>) {
     let mut rec = Recorder::new(conn, "test@0.0.1");
     let run = RunRecord {
+        schema_version: crate::ingest::RECORD_SCHEMA_VERSION,
         backend: "rmlx".into(),
         backend_version: Some("0.0.1".into()),
         model_namespace: "mlx-community".into(),
@@ -60,8 +61,9 @@ fn seed_named(
 ) {
     let mut rec = Recorder::new(conn, "test@0.0.1");
     let run = RunRecord {
+        schema_version: crate::ingest::RECORD_SCHEMA_VERSION,
         backend: backend.into(),
-        backend_version: None,
+        backend_version: Some("0.2.8".into()),
         model_namespace: namespace.into(),
         model: model.into(),
         weight_quant: "mxfp8".into(),

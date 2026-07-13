@@ -82,6 +82,7 @@ fn json_lines(stdout: &str) -> Vec<&str> {
 fn record_one(db: &Path, ts: &str, value: f64, backend: &str) {
     let json = serde_json::json!({
         "backend": backend,
+        "backend_version": "0.2.8",
         "model_namespace": "mlx-community",
         "model": "gemma-4-e4b-it-mxfp8",
         "weight_quant": "mxfp8",
@@ -187,6 +188,7 @@ fn rank_orders_by_metric() {
     ] {
         let json = serde_json::json!({
             "backend": "rmlx",
+            "backend_version": "0.2.8",
             "model_namespace": "mlx-community",
             "model": "gemma-4-e4b-it-mxfp8",
             "weight_quant": "mxfp8",
@@ -415,6 +417,7 @@ fn describe_by_run_id_updates_all_rows_in_run() {
     // Insert a record with two metrics (two observation rows, same run_id).
     let json = serde_json::json!({
         "backend": "rmlx",
+        "backend_version": "0.2.8",
         "model_namespace": "mlx-community",
         "model": "gemma-4-e4b-it-mxfp8",
         "weight_quant": "mxfp8",

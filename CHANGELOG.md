@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Metrics run identity unified.** `backend_version` / `git_sha` /
+  `build_profile` were previously hand-rolled by 12 independent emitters;
+  only one got `backend_version` right. Now there is one identity source per
+  language surface (`RunIdentity` in Rust, `rmlx metrics identity --json`
+  for scripts) and the §8.5 ingest validator rejects any `rmlx` record whose
+  `backend_version` is missing or not semver-shaped. See
+  `docs/METRICS_DB.md` §8.5.1 for the full contract.
+- `git_sha`'s commit is now stamped at **compile time**, anchored to the
+  workspace root that built the binary — not read at runtime from the
+  process's working directory, and never from an unrelated enclosing repo
+  (a source tree extracted inside someone else's checkout). An installed
+  `rmlx` launched from inside an unrelated git repo (the normal case for
+  `rmlx serve` run from a user's project) previously stamped *that repo's*
+  SHA into every metrics row it produced. The `-dirty` suffix is a separate,
+  deliberately runtime-resolved fact (one `git status --porcelain` at
+  metrics init, against the same compile-time path, skipped under
+  `--metrics off`) — baking it into the compile-time value would silently
+  freeze it stale the moment a source file is edited without also touching
+  the build script's narrow rebuild-watch list. See `docs/METRICS_DB.md`
+  §8.5.1 for the exact semantics.
+- `build_profile` now reliably distinguishes `release` / `release-perf` /
+  `release-debug` (previously `cfg!(debug_assertions)` reported all three as
+  `"release"`).
+
+### Fixed
+
+- **One-time pending-buffer quarantine.** `rmlx metrics record
+  --replay-pending` now rejects pre-contract `rmlx` buffer files (written
+  before the `backend_version` requirement existed) instead of ingesting
+  them as another NULL-version row. At the time of this change, 212 such
+  files sit in `metrics/buffer/pending/`; the first `--replay-pending` after
+  upgrading moves all of them to `metrics/buffer/failed/` and exits 2. This
+  is expected, one-time behavior — not a regression — see
+  `docs/METRICS_DB.md` §8.5.1.
+
 ## [0.2.8] - 2026-06-30
 
 Qwen3.5-family model-loading correctness and a CI-gateable smoke probe. The

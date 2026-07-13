@@ -20,7 +20,7 @@ async fn round_trip_five_events() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("runs.db");
 
-    let handle = spawn_drainer(db_path.clone(), "test_hw".into(), Some("abc1234".into()));
+    let handle = spawn_drainer(db_path.clone());
 
     for i in 0u64..5 {
         let ok = handle.try_emit(make_event(MetricKind::KvCacheBytes(1024 * i)));
@@ -53,7 +53,7 @@ fn backpressure_increments_dropped_counter() {
     let (tx, _rx) = mpsc::channel::<MetricEvent>(2);
     let dropped = Arc::new(AtomicU64::new(0));
     let handle = DrainerHandle {
-        tx,
+        tx: Some(tx),
         dropped: Arc::clone(&dropped),
     };
 
@@ -78,14 +78,14 @@ fn backpressure_increments_dropped_counter() {
 
 #[test]
 fn split_model_id_with_separator() {
-    let (ns, name) = split_model_id("mlx-community__gemma-4-e2b-it-mxfp8");
+    let (ns, name) = rmlx_metrics::identity::split_model_id("mlx-community__gemma-4-e2b-it-mxfp8");
     assert_eq!(ns, "mlx-community"); // hyphens preserved for whitelist match
     assert_eq!(name, "gemma-4-e2b-it-mxfp8");
 }
 
 #[test]
 fn split_model_id_no_separator() {
-    let (ns, name) = split_model_id("my-model");
+    let (ns, name) = rmlx_metrics::identity::split_model_id("my-model");
     assert_eq!(ns, "local"); // "local" is always in NAMESPACE_WHITELIST
     assert_eq!(name, "my-model");
 }
@@ -120,7 +120,7 @@ fn load_phases_produces_five_metrics() {
 #[test]
 fn infer_weight_quant_mxfp8() {
     assert_eq!(
-        infer_weight_quant("mlx-community__gemma-4-e2b-it-mxfp8"),
+        rmlx_metrics::identity::infer_weight_quant("mlx-community__gemma-4-e2b-it-mxfp8"),
         "mxfp8"
     );
 }
@@ -128,7 +128,10 @@ fn infer_weight_quant_mxfp8() {
 #[test]
 fn infer_weight_quant_fallback() {
     // No token matches → "bf16" (always-valid whitelist fallback)
-    assert_eq!(infer_weight_quant("some-obscure-model"), "bf16");
+    assert_eq!(
+        rmlx_metrics::identity::infer_weight_quant("some-obscure-model"),
+        "bf16"
+    );
 }
 
 // ── F1b: PromptTokens / CompletionTokens mapping ────────────────────────
@@ -169,7 +172,7 @@ async fn f2_ctx_max_is_real_value_not_sentinel() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("runs.db");
 
-    let handle = spawn_drainer(db_path.clone(), "test_hw".into(), None);
+    let handle = spawn_drainer(db_path.clone());
 
     // Emit an event with a known ctx_max.
     let ev = MetricEvent {
@@ -259,7 +262,7 @@ async fn f9_itl_p99_and_spikes_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("runs.db");
 
-    let handle = spawn_drainer(db_path.clone(), "test_hw".into(), Some("abc1234".into()));
+    let handle = spawn_drainer(db_path.clone());
 
     handle.try_emit(make_event(MetricKind::ItlP99Ms(18.4)));
     handle.try_emit(make_event(MetricKind::ItlSpikes(2)));
