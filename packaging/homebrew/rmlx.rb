@@ -21,14 +21,14 @@
 class Rmlx < Formula
   desc "Rust-native, single-binary MLX inference + conversion backend for Apple Silicon"
   homepage "https://github.com/Pushkinist/rMLX"
-  url "https://github.com/Pushkinist/rMLX/archive/refs/tags/v0.2.8.tar.gz"
-  sha256 "faa60f4d8d0bd5f7f3db55650aa80a3fb5bbcacc236fba3ecc486d69cba196ca"
+  url "https://github.com/Pushkinist/rMLX/archive/refs/tags/v0.3.0.tar.gz"
+  sha256 "585359908253fac9462237f38a69d9e19d7053296a9a0fe74dbb529c701a46b1"
   license any_of: ["MIT", "Apache-2.0"]
   head "https://github.com/Pushkinist/rMLX.git", branch: "main"
 
   bottle do
-    root_url "https://github.com/Pushkinist/rMLX/releases/download/v0.2.8"
-    sha256 cellar: :any, arm64_tahoe: "58278f85e4f4f9f449c58110afc08b3554a36fe5fcde329bb2830c26f9f10c07"
+    root_url "https://github.com/Pushkinist/rMLX/releases/download/v0.3.0"
+    sha256 cellar: :any, arm64_tahoe: "4bd5ad4f87cdac86646e2da43015b1fd9b376ada0516ed6bca79d47dd7ac3aa7"
   end
 
   depends_on "rust" => :build
