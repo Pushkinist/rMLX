@@ -91,7 +91,7 @@ pub mod schema;
 pub use schema::{EngagePolicy, SchemaConstraint, SchemaError, SchemaNode};
 
 /// Whitespace bytes allowed outside strings.
-const WS: [u8; 4] = [b' ', b'\t', b'\n', b'\r'];
+const WS: [u8; 4] = *b" \t\n\r";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JsonState {

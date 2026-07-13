@@ -35,7 +35,7 @@ use serde_json::Value;
 use super::types::SchemaNode;
 
 /// Whitespace bytes allowed outside strings (mirrors `super::super::WS`).
-pub(super) const WS: [u8; 4] = [b' ', b'\t', b'\n', b'\r'];
+pub(super) const WS: [u8; 4] = *b" \t\n\r";
 
 // ────────────────── fence-suppression helper ────────────────────────────────
 

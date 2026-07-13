@@ -89,7 +89,7 @@ fn quant_rotor_k3_qjl_default_on() {
     // the encoder/decoder ran without panic. The QJL toggle lift is verified
     // by the dedicated lift test below.
     let _decoded = qk.dequant().unwrap();
-    assert!(qk.blocks.len() == 1);
+    assert_eq!(qk.blocks.len(), 1);
 }
 
 #[test]
