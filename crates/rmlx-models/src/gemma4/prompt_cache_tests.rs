@@ -92,7 +92,7 @@ fn kv_quant_mismatch_evicts_and_misses() {
         .find_best_prefix(&prompt_ids, FNV_OFFSET)
         .expect("block hit");
     let entry_quant = cache.slots[slot_idx].entry.kv_quant;
-    assert!(entry_quant != Some(runtime_quant));
+    assert_ne!(entry_quant, Some(runtime_quant));
     cache.evict_slot(slot_idx);
 
     assert_eq!(cache.slots.len(), 0);
@@ -125,7 +125,7 @@ fn kv_quant_legacy_none_evicts_and_misses() {
     let (slot_idx, _) = cache
         .find_best_prefix(&prompt_ids, FNV_OFFSET)
         .expect("block hit");
-    assert!(cache.slots[slot_idx].entry.kv_quant != Some(runtime_quant));
+    assert_ne!(cache.slots[slot_idx].entry.kv_quant, Some(runtime_quant));
     cache.evict_slot(slot_idx);
     assert_eq!(cache.slots.len(), 0);
     assert_eq!(cache.stats().evictions, 1);

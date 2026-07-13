@@ -914,7 +914,7 @@ fn reset_from_matches_fresh_clone() {
         "{\"name\":\"x\",\"size\":\"small\",\"tags\":[\"",
     ];
     // Bytes that drive the scratch into a different shape before each reset.
-    let dirtiers = [b'x', b'{', b'"', b'}', b'[', b' ', b',', b':', b']'];
+    let dirtiers = *b"x{\"}[ ,:]";
 
     for prefix in prefixes {
         let mut base = SchemaGrammar::new(root.clone());

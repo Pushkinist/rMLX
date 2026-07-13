@@ -80,15 +80,13 @@ pub(super) fn extract_top_level_json_value(text: &str) -> Option<String> {
     // syntactically bad), advance past it and try the next candidate.
     let mut search_from = 0usize;
     loop {
-        let start = match bytes[search_from..].iter().position(|&b| {
+        let off = bytes[search_from..].iter().position(|&b| {
             matches!(
                 b,
                 b'{' | b'[' | b'"' | b't' | b'f' | b'n' | b'-' | b'0'..=b'9'
             )
-        }) {
-            Some(off) => search_from + off,
-            None => return None,
-        };
+        })?;
+        let start = search_from + off;
 
         let result = try_extract_at(bytes, text, start);
         if let Some(v) = result {
