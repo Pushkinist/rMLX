@@ -65,6 +65,13 @@ pub struct AffineParams {
 
 // ── Validation ────────────────────────────────────────────────────────────────
 
+/// Affine bit-widths this build's dequant codec supports — CPU (`dequant_to_f32`
+/// below) and GPU (mlx-c `affine_dequantize_*` / `quantized_matmul` kernels)
+/// alike. Single source of truth: `validate_params` and any load-time
+/// pre-flight check (e.g. `rmlx_models::arch::loader`) must both read this
+/// constant rather than re-deriving the set.
+pub const SUPPORTED_BITS: [u8; 6] = [2, 3, 4, 5, 6, 8];
+
 /// Cold helper: construct the "bits not supported" error.
 ///
 /// Marked `#[cold]` so LLVM places this large `format!` block away from the hot
@@ -135,9 +142,8 @@ fn err_out_len(got: usize, exp: usize, rows: usize, cols: usize) -> Error {
 }
 
 fn validate_params(params: &AffineParams) -> Result<()> {
-    match params.bits {
-        2 | 3 | 4 | 5 | 6 | 8 => {}
-        b => return Err(err_bits(b)),
+    if !SUPPORTED_BITS.contains(&params.bits) {
+        return Err(err_bits(params.bits));
     }
     match params.group_size {
         32 | 64 | 128 => {}

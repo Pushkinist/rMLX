@@ -51,6 +51,9 @@ pub struct LoadOpts {
 /// # Errors
 /// Returns `Error::Config` if `config.json` cannot be read or parsed.
 /// Returns `Error::Model` if the architecture is not yet supported.
+/// Returns `Error::Quant` if the declared affine weight-quant bit-width (the
+/// global default or a `tensor_overrides` entry) is unsupported by this
+/// build's MLX/mlx-c.
 /// Returns `Error::Loader` / `Error::Mlx` if weight loading fails.
 #[tracing::instrument(skip_all, fields(model_dir = %model_dir.display()))]
 pub fn load_model(model_dir: &Path, _device: Device, opts: &LoadOpts) -> Result<Architecture> {
@@ -79,6 +82,14 @@ pub fn load_model(model_dir: &Path, _device: Device, opts: &LoadOpts) -> Result<
             "architecture '{arch_str}' not yet supported in v0.0.1; see arch.rs for how to add it"
         )));
     }
+
+    // Pre-flight: reject a weight-quant bit-width this build's mlx-c cannot
+    // dequantize, before any tensor I/O or GPU dispatch. Without this, an
+    // unsupported bit-width (e.g. 1-bit affine) "loads" successfully — MLX
+    // only tries to compile the dequant kernel lazily, at first prefill — and
+    // the model then dies per-token with a buried Metal kernel error instead
+    // of failing cleanly here.
+    preflight_weight_quant(&cfg, arch_str)?;
 
     // -- Phase 1: mmap -------------------------------------------------------
     let t_mmap_start = Instant::now();
@@ -295,6 +306,94 @@ pub fn load_model(model_dir: &Path, _device: Device, opts: &LoadOpts) -> Result<
     Ok(arch)
 }
 
+/// Reject a declared weight-quant bit-width this build's mlx-c has no
+/// dequant kernel for.
+///
+/// Only the literal `"affine"` mode (`config.json`'s `quantization.mode`,
+/// defaulting to `"affine"` when absent) has a variable bit-width kernel
+/// matrix — `SUPPORTED_BITS` lists exactly what
+/// `crates/rmlx-quant/src/affine.rs` (CPU codec) and this build's linked
+/// mlx-c (GPU `affine_dequantize_*_b_<bits>` / `quantized_matmul` kernels)
+/// both support. Every other mode string — a known fixed-format mode
+/// (`mxfp8`/`mxfp4`/`nvfp4`) or an unrecognized future one — is left alone.
+/// Gating on the exact string (rather than `QuantMode::from`'s
+/// "unknown -> affine" resolver-convenience fallback) matters here: treating
+/// an unrecognized mode as affine would false-reject a future fixed-format
+/// mode whose element width happens to fall outside the affine set.
+///
+/// Checks the model's global default *and* every `quantization.tensor_overrides`
+/// entry (one level deep — the schema is a flat tensor-name -> params map,
+/// not recursive, matching how every arch's `resolve_quant` looks overrides
+/// up). A supported global bit-width does not guarantee every override is
+/// supported: a config can declare a supported `bits` globally and still
+/// carry a `tensor_overrides` entry with an unsupported affine `bits` for one
+/// tensor, which would die at that tensor's first prefill exactly like the
+/// global case (`rmlx-loader/src/config_tests.rs::load_config_accepts_normal_tensor_overrides`
+/// documents this schema is real and accepted by `load_config`).
+fn preflight_weight_quant(cfg: &rmlx_loader::ModelConfig, arch_str: &str) -> Result<()> {
+    let Some(q) = cfg.quantization.as_ref() else {
+        return Ok(());
+    };
+    let default_mode = q.mode_or_default();
+    check_affine_bits(default_mode, q.bits, None, arch_str)?;
+
+    if let Some(overrides) = q.tensor_overrides.as_ref() {
+        for (tensor_name, ov) in overrides {
+            // An override's own `mode`, when present and non-empty, wins;
+            // otherwise it inherits the resolved global default mode — same
+            // rule `layers::quant::resolve_quant` applies at actual dequant
+            // time (the `.biases`-sibling force-affine rule is a tensor-data
+            // fact this config-only preflight cannot see, and is not needed
+            // here: it only ever narrows a non-affine mode *to* affine, and
+            // affine is exactly the mode this check already inspects).
+            let mode = ov
+                .mode
+                .as_deref()
+                .filter(|m| !m.is_empty())
+                .unwrap_or(default_mode);
+            check_affine_bits(mode, ov.bits, Some(tensor_name), arch_str)?;
+        }
+    }
+    Ok(())
+}
+
+/// Shared affine-bits gate for both the global default and a single
+/// `tensor_overrides` entry. `tensor` is `None` for the global check, `Some`
+/// for an override (named in the error so the operator knows which tensor
+/// triggered it).
+fn check_affine_bits(mode: &str, bits: u8, tensor: Option<&str>, arch_str: &str) -> Result<()> {
+    if mode != "affine" {
+        return Ok(());
+    }
+    if rmlx_quant::affine::SUPPORTED_BITS.contains(&bits) {
+        return Ok(());
+    }
+
+    let supported = rmlx_quant::affine::SUPPORTED_BITS
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let hint = if bits == 1 {
+        "; 1-bit needs ml-explore/mlx#3161 (unreleased)"
+    } else {
+        ""
+    };
+    let tensor_ctx = tensor.map_or_else(String::new, |t| format!(" (tensor_overrides['{t}'])"));
+    let msg = format!(
+        "weight quant bits={bits} (affine) unsupported by this build's MLX/mlx-c \
+         (supported: {supported}){hint}{tensor_ctx}"
+    );
+    tracing::error!(
+        arch = arch_str,
+        bits,
+        tensor = tensor.unwrap_or(""),
+        supported = %supported,
+        "arch::load_model: {msg}"
+    );
+    Err(Error::Quant(msg))
+}
+
 /// Pre-warm the GDN Metal kernel by dispatching one `gated_delta_step_gpu`
 /// call at the production chunk shape, compiling its Metal program at load
 /// time so the first real request pays no kernel-compile cost.
@@ -497,3 +596,7 @@ fn resolve_bos_id(model_dir: &Path) -> Result<u32> {
         model_dir.display()
     )))
 }
+
+#[cfg(test)]
+#[path = "loader_tests.rs"]
+mod loader_tests;
