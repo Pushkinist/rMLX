@@ -115,14 +115,52 @@ thread's default, and stores the handle in a thread-local for the thread's
 lifetime. It is idempotent and a no-op when the GPU is unavailable, with zero
 ML-semantic effect.
 
-**Contract:** every blocking-thread inference entry point must call it once
-before any GPU materialisation. Covered entries: the text generate dispatch
-(`arch::generate_greedy`), the image generate dispatch
+### Per-thread CPU stream context — `ensure_cpu_default_stream`
+
+The same thread-local-encoder problem exists on the CPU side, independently of
+the GPU one: MLX's CPU backend resolves a stream's `CommandEncoder` through a
+**thread-local** map first
+(`mlx/backend/cpu/encoder.cpp::get_command_encoder`), falling back to a
+process-global map and otherwise throwing `There is no Stream(cpu, N) in
+current thread.` A worker thread whose graph includes a CPU-scheduled op —
+e.g. the K8V8 `exit_prefill` quantization's scale reduction, which MLX places
+on the CPU stream even though the surrounding quantize dispatch runs on the
+GPU device — can fault the same way the GPU path did (issue #206).
+
+`rmlx_mlx::ensure_cpu_default_stream()` is the CPU analog of
+`ensure_gpu_default_stream()`: same mechanism (create a stream, register it as
+the calling thread's default, leak the handle in a thread-local for the
+thread's lifetime), same idempotency guarantee, zero ML-semantic effect.
+
+**Contract:** every blocking-thread inference entry point calls
+`ensure_cpu_default_stream()` **unconditionally** (not gated on the resolved
+device — a GPU-device forward can still schedule CPU-side ops), before
+`ensure_gpu_default_stream()` when both apply. Covered entries: the text
+generate dispatch (`arch::generate_greedy`), the image generate dispatch
 (`arch::generate_image` and the server's `run_qwen3vl_image`), the
-speculative-decode blocking closure, the audio-transcription blocking closure
-(`audio.rs` Whisper decode), and the embeddings compute closure
-(`embeddings.rs` `compute_embeddings`). New blocking-pool entry points that
-materialise GPU arrays must follow the same pattern.
+speculative-decode blocking closure, the
+audio-transcription blocking closure (`audio.rs` Whisper decode, and the CLI
+`transcribe` command), and the embeddings compute closure (`embeddings.rs`
+`compute_embeddings`). New blocking-pool entry points that materialise CPU or
+GPU arrays must follow the same pattern (both guards, CPU first).
+
+**Bounded leak (serve only).** Both guards deliberately leak their stream
+handle on thread exit — freeing it would drop the `CommandEncoder` entry a
+still-running eval might reference. Each leaked handle is also backed by its
+own MLX-internal OS thread, so the leak is only safe if the **set of distinct
+worker threads that ever call these guards is bounded**. `rmlx serve`
+(`crates/rmlx-cli/src/commands/serve.rs`) builds its tokio runtime with a
+capped `max_blocking_threads` and a long `thread_keep_alive`, so the blocking
+pool's worker threads are reused rather than idle-reaped-and-replaced under
+sporadic load — bounding the cumulative leak to that cap instead of growing
+unbounded over long serve uptime (which would otherwise eventually exhaust the
+~2 048 per-process pthread ceiling noted above). One-shot CLI commands
+(`chat`, `baseline`, `info`) are unaffected — the leak is bounded by the
+process lifetime regardless.
+
+See `docs/KV_CACHE.md` §5.7.5 and `docs/KV_QUANT.md` for the `exit_prefill`
+mechanism this guards, including the guard's limitation (it registers the
+*worker's own* stream — it does not fix a genuinely cross-thread eval).
 
 ### Null sentinel for optional arguments
 

@@ -66,7 +66,8 @@ fn main() -> anyhow::Result<()> {
         eprintln!("WARN: RMLX_FUSED_QK is not set to 1 — dispatch counter will stay 0 for q8/turbo codecs");
     }
 
-    // -- Ensure GPU stream is registered on this thread --
+    // -- Ensure CPU + GPU streams are registered on this thread --
+    rmlx_mlx::ensure_cpu_default_stream();
     rmlx_mlx::ensure_gpu_default_stream();
 
     // -- Load model --
