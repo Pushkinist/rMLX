@@ -173,8 +173,14 @@ pub fn ensure_gpu_default_stream() {
     thread_local! {
         static GPU_STREAM_INIT: Cell<bool> = const { Cell::new(false) };
         // The mlx_stream handle keeps the stream and its CommandEncoder alive.
-        // Intentionally leaked on thread exit (acceptable for tokio blocking
-        // pool threads that are long-lived).
+        // Intentionally leaked on thread exit — each leaked handle is also an
+        // MLX-internal OS thread. This is only safe because callers bound the
+        // set of distinct threads that ever run this: `rmlx serve` builds its
+        // tokio runtime with a capped `max_blocking_threads` and a long
+        // `thread_keep_alive` (see `crates/rmlx-cli/src/commands/serve.rs`)
+        // so the blocking pool's worker threads are reused, not
+        // idle-reaped-and-replaced — the cumulative leak is bounded by that
+        // cap, not merely "these threads are long-lived."
         static GPU_STREAM_HANDLE: Cell<sys::mlx_stream> =
             const { Cell::new(sys::mlx_stream { ctx: ptr::null_mut() }) };
     }
@@ -249,8 +255,12 @@ pub fn ensure_gpu_default_stream() {
 pub fn ensure_cpu_default_stream() {
     // Thread-local storage: init flag + stream handle. The handle is held for
     // the thread's lifetime so the CommandEncoder entry in the thread-local
-    // encoder map stays alive (intentionally leaked on thread exit — acceptable
-    // for the long-lived tokio blocking-pool workers this guards).
+    // encoder map stays alive — intentionally leaked on thread exit, same
+    // tradeoff and same bound as `ensure_gpu_default_stream` above: this is
+    // only safe because the tokio blocking pool this guards is capped
+    // (`max_blocking_threads`) and kept warm (`thread_keep_alive`) by
+    // `rmlx serve`, so the cumulative leak is bounded by that cap rather than
+    // relying on the workers simply being long-lived.
     thread_local! {
         static CPU_STREAM_INIT: Cell<bool> = const { Cell::new(false) };
         static CPU_STREAM_HANDLE: Cell<sys::mlx_stream> =

@@ -549,6 +549,52 @@ fn cpu_default_stream_guard_idempotent_on_worker_thread() {
     assert_eq!(out, vec![2.0f32, 4.0, 6.0, 8.0]);
 }
 
+/// CI-runnable, GPU-free negative control isolating the **CPU guard alone**
+/// (never calls `ensure_gpu_default_stream`) on a **scale-reduction** shaped
+/// CPU pipeline — `square → max-reduce → divide` — the same op shape as the
+/// K8V8 `exit_prefill` scale computation (`abs_max` reduction, then
+/// `scale = abs_max / 127`) that this fix targets, so a pass here cannot be
+/// explained away by the GPU guard mattering instead of the CPU one.
+///
+/// Honest scope note: MLX's own `default_stream(Device)` lazily self-registers
+/// a fresh per-thread stream + `CommandEncoder` on first use
+/// (`mlx/stream.cpp::default_stream` → `new_stream` → `cpu::new_stream`), so a
+/// worker thread that **builds and evaluates its own graph** already succeeds
+/// without any guard call — confirmed empirically (this exact op shape run
+/// with no guard on a spawned worker also passes). A true
+/// "faults-without-guard, succeeds-with-guard" negative control is therefore
+/// not constructible for this same-thread shape: the only fault class this fix
+/// addresses is genuinely cross-thread (an array built on one thread, eval'd on
+/// another — see `cross_thread_eval_faults_documents_mlx_limit`, which the
+/// guard does **not** cure either, since it registers the eval thread's *own*
+/// stream, not the foreign one). What this test *does* prove, CI-runnably and
+/// without any GPU dependency: the CPU guard alone (no GPU guard in the call
+/// path) is sufficient for a worker thread to build and evaluate a
+/// reduction-shaped CPU graph — the exact shape `exit_prefill` needs.
+#[test]
+fn cpu_guard_alone_handles_scale_reduction_on_worker_thread() {
+    let out = std::thread::spawn(|| {
+        // CPU guard only — deliberately no `ensure_gpu_default_stream()` call
+        // anywhere in this thread, so a pass cannot be attributed to the GPU
+        // guard.
+        ensure_cpu_default_stream();
+
+        // square → max-reduce → divide: the same op shape as the K8V8
+        // exit_prefill scale computation (abs_max reduction, then
+        // scale = abs_max / divisor), built AND evaluated on this worker.
+        let x = mk(&[1.0, -3.0, 2.0, -4.0]);
+        let squared = multiply(&x, &x, Device::Cpu).unwrap();
+        let reduced = max_axis(&squared, 0, Device::Cpu).unwrap(); // scalar: 16.0
+        let divisor = mk(&[2.0]);
+        let scale = divide(&reduced, &divisor, Device::Cpu).unwrap();
+        scale.eval().unwrap();
+        bytes_to_f32(&scale.to_bytes().unwrap())
+    })
+    .join()
+    .expect("worker thread panicked");
+    assert_eq!(out, vec![8.0f32]);
+}
+
 /// Executable documentation of the *true* fault class behind the
 /// "There is no Stream(cpu, N) in current thread" crash.
 ///
