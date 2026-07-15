@@ -80,6 +80,14 @@ pub fn load_model(model_dir: &Path, _device: Device, opts: &LoadOpts) -> Result<
         )));
     }
 
+    // Pre-flight: reject a weight-quant bit-width this build's mlx-c cannot
+    // dequantize, before any tensor I/O or GPU dispatch. Without this, an
+    // unsupported bit-width (e.g. 1-bit affine) "loads" successfully — MLX
+    // only tries to compile the dequant kernel lazily, at first prefill — and
+    // the model then dies per-token with a buried Metal kernel error instead
+    // of failing cleanly here.
+    preflight_weight_quant(&cfg, arch_str)?;
+
     // -- Phase 1: mmap -------------------------------------------------------
     let t_mmap_start = Instant::now();
     match load_shard_index(model_dir).and_then(|idx| ShardSet::open(model_dir, &idx)) {
@@ -295,6 +303,54 @@ pub fn load_model(model_dir: &Path, _device: Device, opts: &LoadOpts) -> Result<
     Ok(arch)
 }
 
+/// Reject a declared weight-quant bit-width this build's mlx-c has no
+/// dequant kernel for.
+///
+/// Only the affine family (`config.json`'s `quantization.mode`, defaulting to
+/// `"affine"`) has a variable bit-width kernel matrix — `SUPPORTED_BITS`
+/// lists exactly what `crates/rmlx-quant/src/affine.rs` (CPU codec) and this
+/// build's linked mlx-c (GPU `affine_dequantize_*_b_<bits>` /
+/// `quantized_matmul` kernels) both support. `mxfp8`/`mxfp4`/`nvfp4` are
+/// fixed-format (always 8-bit E4M3 / 4-bit E2M1 elements) and carry no
+/// equivalent variable-width risk, so they are not checked here.
+///
+/// Checks the model's global default only (`cfg.quantization`); per-tensor
+/// overrides inherit that default's bit-width in every known snapshot.
+fn preflight_weight_quant(cfg: &rmlx_loader::ModelConfig, arch_str: &str) -> Result<()> {
+    let Some(q) = cfg.quantization.as_ref() else {
+        return Ok(());
+    };
+    if crate::layers::QuantMode::from(q.mode_or_default()) != crate::layers::QuantMode::Affine {
+        return Ok(());
+    }
+    if rmlx_quant::affine::SUPPORTED_BITS.contains(&q.bits) {
+        return Ok(());
+    }
+
+    let bits = q.bits;
+    let supported = rmlx_quant::affine::SUPPORTED_BITS
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let hint = if bits == 1 {
+        "; 1-bit needs ml-explore/mlx#3161 (unreleased)"
+    } else {
+        ""
+    };
+    let msg = format!(
+        "weight quant bits={bits} (affine) unsupported by this build's MLX/mlx-c \
+         (supported: {supported}){hint}"
+    );
+    tracing::error!(
+        arch = arch_str,
+        bits,
+        supported = %supported,
+        "arch::load_model: {msg}"
+    );
+    Err(Error::Quant(msg))
+}
+
 /// Pre-warm the GDN Metal kernel by dispatching one `gated_delta_step_gpu`
 /// call at the production chunk shape, compiling its Metal program at load
 /// time so the first real request pays no kernel-compile cost.
@@ -497,3 +553,7 @@ fn resolve_bos_id(model_dir: &Path) -> Result<u32> {
         model_dir.display()
     )))
 }
+
+#[cfg(test)]
+#[path = "loader_tests.rs"]
+mod loader_tests;

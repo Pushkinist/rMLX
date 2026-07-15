@@ -201,8 +201,11 @@ Top-level `config.json` (same flat layout as Qwen2).
 
 ### Weight quantization
 
-Full coverage: bf16, affine (any group/bits), mxfp8. Bonsai-8B uses `g128 b2`
-(2-bit ternary affine — the `prism-ml/Ternary-Bonsai-8B-mlx-2bit` snapshot).
+Full coverage: bf16, affine (any group/bits in `{2,3,4,5,6,8}` — see
+`docs/WEIGHT_QUANTS.md` §4.4), mxfp8. Bonsai-8B uses `g128 b2` (2-bit ternary
+affine — the `prism-ml/Ternary-Bonsai-8B-mlx-2bit` snapshot). An affine
+`bits` value outside the supported set (e.g. an unreleased 1-bit checkpoint)
+is rejected at load, before the server advertises the model.
 
 ### KV quantization
 
@@ -347,6 +350,13 @@ uniformity cast to float (affine) scales — gated on `scales.dtype()`, not on t
 arch or global quant mode, so a mixed checkpoint loads both codecs correctly. The
 PARO variant (`Qwen3_5ForConditionalGeneration`) uses a paroquant layout detected
 by the `is_paroquant` signal in `KvCacheBuilder::resolve_default`.
+
+Affine `bits` is gated at load to `{2,3,4,5,6,8}` (`docs/WEIGHT_QUANTS.md`
+§4.4) — e.g. `prism-ml/Bonsai-27B-mlx-1bit` (structurally identical to the
+2-bit `Ternary-Bonsai-27B-mlx-2bit` sibling, `quantization.bits=1`) fails at
+load with a clear error rather than loading and then dying per-token at
+first prefill (no 1-bit `affine_dequantize` kernel in stock mlx-c; unreleased
+upstream, ml-explore/mlx#3161).
 
 ### KV quantization
 

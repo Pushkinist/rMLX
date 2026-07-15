@@ -78,7 +78,12 @@ Run these in order before declaring a new arch done.
 
 1. **Smoke-probe the snapshot.** Short generation, reject incoherent output —
    CLAUDE.md hard rule 6. Every new snapshot / quant gets a smoke probe before
-   it enters the registry. Surface and flags: `docs/CLI.md`.
+   it enters the registry. Surface and flags: `docs/CLI.md`. Before the smoke
+   probe even loads weights, `arch::load_model` (point 7) pre-flights the
+   declared affine `bits` against `rmlx_quant::affine::SUPPORTED_BITS` — a new
+   arch needs no extra code for this; it fires for every arch string
+   uniformly. Only add to it if a new *quant mode* (not arch) introduces its
+   own variable-bit-width kernel matrix — see `docs/WEIGHT_QUANTS.md` §4.4.
 2. **Add a golden-token test.** Temperature-0, byte-identical output against a
    recorded reference. Gate it with:
    ```
