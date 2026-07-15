@@ -239,7 +239,8 @@ dequant on the CPU path during model load.
 unreleased 1-bit affine checkpoint) has no dequant kernel in either the CPU
 codec (`affine.rs::validate_params`) or the linked mlx-c's GPU
 `affine_dequantize_*` / `quantized_matmul` kernels. `rmlx_models::arch::loader`
-pre-flights the model's declared `quantization.bits` against
+pre-flights the model's declared `quantization.bits` — the global default
+*and* every `quantization.tensor_overrides` entry — against
 `rmlx_quant::affine::SUPPORTED_BITS` before any tensor I/O — an unsupported
 bit-width fails the load immediately with one clear error instead of
 "loading" successfully and then dying per-token at first prefill with a
