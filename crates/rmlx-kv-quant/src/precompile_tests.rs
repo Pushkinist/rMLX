@@ -173,3 +173,45 @@ fn precompile_skips_cpu_hot_path_codecs() {
         );
     }
 }
+
+/// Faithful regression for the K8V8 `exit_prefill` stream-safety fix: run the
+/// exact q8_0 quantize + `Array::eval()` (the op K8V8 `exit_prefill` runs, and
+/// the one whose lazy eval faulted with "There is no Stream(cpu, N) in current
+/// thread") on a **freshly-spawned non-main worker thread**, after the worker
+/// registers its default streams via `ensure_cpu_default_stream` /
+/// `ensure_gpu_default_stream` — exactly as the `arch::generate_greedy` entry
+/// point does before every generation.
+///
+/// The graph is built AND evaluated on the same worker thread (the supported
+/// path); it must succeed. Requires a Metal GPU, so it is ignored by default and
+/// run with `-- --ignored` on a GPU host.
+#[test]
+#[ignore = "requires Metal GPU; run with `-- --ignored` in a GPU-capable environment"]
+fn k8v8_q8_quantize_eval_on_worker_thread() {
+    use rmlx_mlx::{Array, Dtype};
+
+    let ok = std::thread::spawn(|| {
+        // Register the worker's default CPU + GPU streams, as the generate
+        // entry point does. Idempotent.
+        rmlx_mlx::ensure_cpu_default_stream();
+        rmlx_mlx::ensure_gpu_default_stream();
+
+        // Shape mirrors a small K8V8 prefill K/V slice: [B=1, kv_h=1, S, D=256].
+        // 256 elements/token → group=128 aligned.
+        let shape = [1i32, 1, 8, 256];
+        let n: usize = shape.iter().map(|&d| d as usize).product();
+        let warm = Array::from_bytes(&vec![0u8; n * 2], &shape, Dtype::Bf16).unwrap();
+
+        // The exact exit_prefill K8V8 op: GPU q8 quantize, then eval.
+        let (codes, scales) = crate::q8_msl::q8_quantize_gpu(&warm, Device::Gpu).unwrap();
+        codes.eval().unwrap();
+        scales.eval().unwrap();
+        true
+    })
+    .join()
+    .expect("worker thread panicked");
+    assert!(
+        ok,
+        "K8V8 q8 quantize + eval must succeed on a spawned worker thread"
+    );
+}

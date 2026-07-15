@@ -1296,6 +1296,14 @@ regardless of the active codec; `exit_prefill` bulk-quantizes the accumulated
 prefix into the correct storage variant. Each `KvStorage` arm of `exit_prefill`
 is the codec-specific bulk-init path.
 
+`exit_prefill` runs on the request's `spawn_blocking` worker thread — the same
+thread the prefill forward built its graph on. That co-location matters because
+MLX ≥0.31 streams are thread-local: a cross-thread `Array::eval()` throws
+`There is no Stream(cpu, N) in current thread.` The generate entry points call
+`rmlx_mlx::ensure_cpu_default_stream()` to register the worker's own streams up
+front. See `docs/KV_CACHE.md` §5.7.5 for the mechanism, the guard, and its
+limitation.
+
 **Warm-TTFT decode contract.** `exit_prefill` also seeds a bf16 K+V
 decode mirror (`decode_fp16_k`/`decode_fp16_v`). Every quantized
 `update_<codec>` early-returns to `update_decode_fp16` while that seed is live

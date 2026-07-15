@@ -720,7 +720,9 @@ impl Generator for SpeculativeGenerator {
             // drafter round-loops dispatch into the verifier directly without
             // going through that entry, so register it here once per thread
             // entry — covers every drafter variant below with no ML-semantic
-            // effect.
+            // effect. The CPU stream is registered unconditionally (thread-local
+            // since MLX 0.31/0.32) so a CPU-scheduled op does not fault here.
+            rmlx_mlx::ensure_cpu_default_stream();
             if dispatcher.device() == rmlx_mlx::Device::Gpu {
                 rmlx_mlx::ensure_gpu_default_stream();
             }

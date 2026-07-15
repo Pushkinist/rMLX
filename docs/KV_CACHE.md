@@ -611,6 +611,49 @@ The bytes-per-element detector (an f32 input must store as 2 B/elem) lives in
 rmlx-kv-quant`), so a future arch leak trips CI. Full reference:
 `docs/KV_QUANT.md` §`KvStorage::None`.
 
+### 5.7.5 `exit_prefill` runs on a worker thread — MLX stream affinity
+
+`exit_prefill` (the bulk prefill→quant step) executes on the request's tokio
+`spawn_blocking` worker, the same thread the prefill forward built its graph on.
+That co-location is load-bearing because of an MLX threading contract:
+
+- Since MLX ≥0.31 the default CPU/GPU streams are **thread-local**
+  (`mlx/stream.cpp`: `static thread_local … default_streams`) and the CPU
+  backend resolves a stream's `CommandEncoder` through a **thread-local** map
+  first (`mlx/backend/cpu/encoder.cpp::get_command_encoder`). An `Array::eval()`
+  of ops that were **built on a different thread** throws
+  `There is no Stream(cpu, N) in current thread.` (surfaced by
+  `mlx-c … array.cpp`). Streams from `mx.new_stream` are documented as usable
+  only on their thread of creation.
+- A graph that is **built and evaluated on the same thread always evals cleanly**
+  — for CPU and GPU alike, whether or not any stream guard ran. Only a
+  *cross-thread* eval of an unscheduled (lazy) array faults; an
+  already-materialised array is safe to read from any thread.
+- The K8V8 `exit_prefill` q8 quantize + eval is therefore safe on its own (all
+  its ops are worker-built). The observed rare, self-healing
+  `no Stream(cpu, 0)` crash on dense `Qwen3_5ForConditionalGeneration` (issue
+  #206 — 48× per request, one per layer → zero tokens) is a *cross-thread* eval:
+  a stream-bound lazy op that crossed the load→generation thread boundary. It
+  self-heals once that shared array materialises.
+
+**Guard (worker-thread stream hygiene).** The generation entry points
+(`arch::generate_greedy`) call `rmlx_mlx::ensure_cpu_default_stream()` — the CPU
+analog of the pre-existing `ensure_gpu_default_stream()` — before building any
+graph, so the worker registers its **own** default CPU stream up front (GPU stays
+guarded by device, as before). This removes first-touch nondeterminism and keeps
+every worker-built graph (the whole per-request prefill/decode path,
+`exit_prefill` included) eval-clean. The same one-line CPU guard is mirrored at
+the other worker-thread eval entry points (embeddings, image, audio, transcribe,
+speculative).
+
+**Limitation (document-the-truth).** The guard registers the *worker's own*
+stream; it does **not** let a worker evaluate an array whose ops were built on
+another thread — that needs an MLX `thread_unsafe` (process-global) stream,
+which **mlx-c 0.6.0 does not expose**, or materialising the shared array on its
+building thread before hand-off. The mechanism and this bound are pinned by
+`cross_thread_eval_faults_documents_mlx_limit` (rmlx-mlx) and the worker-thread
+`k8v8_q8_quantize_eval_on_worker_thread` regression (rmlx-kv-quant).
+
 ### 5.8 TurboQuant requires Flash Attention
 
 The `tq4` V-side path is only valid through the Flash Attention dispatch.
