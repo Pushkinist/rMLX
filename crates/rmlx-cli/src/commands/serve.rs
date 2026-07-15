@@ -29,6 +29,7 @@
 )]
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rmlx_core::runinfo::make_run_id;
 use rmlx_loader::{discover_kv_calibration, load_config, load_head_budgets};
@@ -1064,8 +1065,29 @@ pub(crate) fn run_serve(
     // wastes cores that MLX needs for CPU dispatch during prefill/decode.
     // HTTP + SSE + idle-eviction never saturate more than 4 async workers;
     // blocking inference runs in the separate blocking-thread pool regardless.
+    //
+    // `max_blocking_threads` + `thread_keep_alive`: every `spawn_blocking`
+    // closure that touches MLX (generate, embeddings, image, audio,
+    // transcribe, speculative) registers a per-thread default CPU/GPU stream
+    // via `ensure_cpu_default_stream` / `ensure_gpu_default_stream`
+    // (`docs/FFI.md` § stream context) — deliberately leaked for the thread's
+    // lifetime, each backed by its own MLX-internal OS thread. Tokio's
+    // blocking pool has no cap and idle-reaps threads after 10s by default;
+    // under sporadic load that would create an unbounded, ever-growing set of
+    // distinct worker threads over long serve uptime, each leaking its own
+    // stream(s) — eventually exhausting the ~2048 per-process pthread ceiling
+    // (`docs/FFI.md`). Bounding `max_blocking_threads` caps the worst-case
+    // cumulative leak; a `thread_keep_alive` far longer than any realistic
+    // idle gap between requests keeps that bounded set of workers alive
+    // (reused, not reaped-and-replaced) so the cap is actually load-bearing.
+    // 128 is 2× the default `--max-queue-depth` (64), leaving headroom for
+    // concurrent audio/embeddings `spawn_blocking` calls alongside admitted
+    // generate requests — GPU work itself stays single-flight via the
+    // `gpu_queue` semaphore, so a modest cap does not throttle throughput.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
+        .max_blocking_threads(128)
+        .thread_keep_alive(Duration::from_secs(24 * 60 * 60))
         .enable_all()
         .build()
         .map_err(|e| anyhow::anyhow!("tokio runtime: {e}"))?;

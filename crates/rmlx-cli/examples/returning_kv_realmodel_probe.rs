@@ -79,6 +79,7 @@ fn main() -> anyhow::Result<()> {
     let fqk_on = rmlx_kv_quant::fused_qk_enabled();
     eprintln!("env: RMLX_TURBO_FLASH={tf_on} RMLX_FUSED_QK={fqk_on}");
 
+    rmlx_mlx::ensure_cpu_default_stream();
     rmlx_mlx::ensure_gpu_default_stream();
 
     eprintln!("loading model...");

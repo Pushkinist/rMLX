@@ -505,3 +505,130 @@ fn add_1000_iterations_no_thread_exhaustion() {
         );
     }
 }
+
+fn mk(v: &[f32]) -> Array {
+    Array::from_bytes(f32_as_bytes(v), &[v.len() as i32], Dtype::F32).unwrap()
+}
+
+/// The CPU analog of `gpu_default_stream_guard_idempotent_on_worker_thread`.
+///
+/// A tokio blocking-pool worker starts with no MLX stream context. Since MLX
+/// 0.31/0.32 the default CPU/GPU streams and the CPU command encoders are
+/// thread-local, so the generation entry points call `ensure_cpu_default_stream`
+/// (and its GPU sibling) once per worker before building/evaluating any graph.
+/// This runs that exact sequence on a freshly-spawned OS thread — the analog of
+/// a blocking-pool worker — and asserts the guard is safe + idempotent and that
+/// a CPU op *built and evaluated on that worker* succeeds.
+///
+/// Note (documented truth): this guard registers the *worker's own* default CPU
+/// stream. It makes worker-built graphs eval cleanly, but it does NOT let a
+/// worker evaluate an array whose ops were built on a *different* thread — that
+/// is an upstream MLX limitation (streams from `new_stream` are usable only on
+/// their thread of creation; see `cross_thread_eval_faults_documents_mlx_limit`).
+#[test]
+fn cpu_default_stream_guard_idempotent_on_worker_thread() {
+    let out = std::thread::spawn(|| {
+        // Establish the worker's default CPU stream, exactly as the generate
+        // entry points do before any materialisation.
+        ensure_cpu_default_stream();
+        // Idempotent: a second call from the same thread is a no-op.
+        ensure_cpu_default_stream();
+
+        // Build AND evaluate on this worker thread — the safe, supported path.
+        let c = add(
+            &mk(&[1.0, 2.0, 3.0, 4.0]),
+            &mk(&[1.0, 2.0, 3.0, 4.0]),
+            Device::Cpu,
+        )
+        .unwrap();
+        c.eval().unwrap();
+        bytes_to_f32(&c.to_bytes().unwrap())
+    })
+    .join()
+    .expect("worker thread panicked");
+    assert_eq!(out, vec![2.0f32, 4.0, 6.0, 8.0]);
+}
+
+/// CI-runnable, GPU-free negative control isolating the **CPU guard alone**
+/// (never calls `ensure_gpu_default_stream`) on a **scale-reduction** shaped
+/// CPU pipeline — `square → max-reduce → divide` — the same op shape as the
+/// K8V8 `exit_prefill` scale computation (`abs_max` reduction, then
+/// `scale = abs_max / 127`) that this fix targets, so a pass here cannot be
+/// explained away by the GPU guard mattering instead of the CPU one.
+///
+/// Honest scope note: MLX's own `default_stream(Device)` lazily self-registers
+/// a fresh per-thread stream + `CommandEncoder` on first use
+/// (`mlx/stream.cpp::default_stream` → `new_stream` → `cpu::new_stream`), so a
+/// worker thread that **builds and evaluates its own graph** already succeeds
+/// without any guard call — confirmed empirically (this exact op shape run
+/// with no guard on a spawned worker also passes). A true
+/// "faults-without-guard, succeeds-with-guard" negative control is therefore
+/// not constructible for this same-thread shape: the only fault class this fix
+/// addresses is genuinely cross-thread (an array built on one thread, eval'd on
+/// another — see `cross_thread_eval_faults_documents_mlx_limit`, which the
+/// guard does **not** cure either, since it registers the eval thread's *own*
+/// stream, not the foreign one). What this test *does* prove, CI-runnably and
+/// without any GPU dependency: the CPU guard alone (no GPU guard in the call
+/// path) is sufficient for a worker thread to build and evaluate a
+/// reduction-shaped CPU graph — the exact shape `exit_prefill` needs.
+#[test]
+fn cpu_guard_alone_handles_scale_reduction_on_worker_thread() {
+    let out = std::thread::spawn(|| {
+        // CPU guard only — deliberately no `ensure_gpu_default_stream()` call
+        // anywhere in this thread, so a pass cannot be attributed to the GPU
+        // guard.
+        ensure_cpu_default_stream();
+
+        // square → max-reduce → divide: the same op shape as the K8V8
+        // exit_prefill scale computation (abs_max reduction, then
+        // scale = abs_max / divisor), built AND evaluated on this worker.
+        let x = mk(&[1.0, -3.0, 2.0, -4.0]);
+        let squared = multiply(&x, &x, Device::Cpu).unwrap();
+        let reduced = max_axis(&squared, 0, Device::Cpu).unwrap(); // scalar: 16.0
+        let divisor = mk(&[2.0]);
+        let scale = divide(&reduced, &divisor, Device::Cpu).unwrap();
+        scale.eval().unwrap();
+        bytes_to_f32(&scale.to_bytes().unwrap())
+    })
+    .join()
+    .expect("worker thread panicked");
+    assert_eq!(out, vec![8.0f32]);
+}
+
+/// Executable documentation of the *true* fault class behind the
+/// "There is no Stream(cpu, N) in current thread" crash.
+///
+/// An MLX array whose ops were built on thread A carries that thread's stream
+/// affinity; evaluating it from thread B throws, because MLX ≥0.31 default
+/// streams (from `new_stream`) are usable only on their thread of creation and
+/// the CPU command-encoder map is thread-local. `ensure_cpu_default_stream` on
+/// the eval thread does NOT fix this (it registers a *different* stream). The
+/// only cures are (a) evaluate the array on its building thread (materialised
+/// arrays are then safe to read anywhere), or (b) an MLX `thread_unsafe` stream,
+/// which mlx-c 0.6.0 does not expose.
+///
+/// Ignored by default: it deliberately provokes an upstream error and is
+/// timing/version sensitive; it exists to pin the mechanism, not to gate CI.
+#[test]
+#[ignore = "documents upstream MLX cross-thread stream limitation; provokes an error on purpose"]
+fn cross_thread_eval_faults_documents_mlx_limit() {
+    // Establish this (main/test) thread's default CPU stream, then build a lazy
+    // op here so it is bound to this thread's stream.
+    let warm = add(&mk(&[1.0]), &mk(&[1.0]), Device::Cpu).unwrap();
+    warm.eval().unwrap();
+    let c = add(&mk(&[1.0, 2.0]), &mk(&[3.0, 4.0]), Device::Cpu).unwrap();
+
+    // Evaluate the here-built array on a different thread → upstream fault.
+    let res = std::thread::spawn(move || c.eval().map_err(|e| format!("{e}")))
+        .join()
+        .expect("worker thread panicked");
+    assert!(
+        res.is_err(),
+        "expected a cross-thread stream fault; got Ok — MLX behaviour changed"
+    );
+    let msg = res.unwrap_err();
+    assert!(
+        msg.contains("no Stream"),
+        "expected a 'There is no Stream(...)' fault, got: {msg}"
+    );
+}

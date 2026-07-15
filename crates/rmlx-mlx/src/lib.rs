@@ -173,8 +173,14 @@ pub fn ensure_gpu_default_stream() {
     thread_local! {
         static GPU_STREAM_INIT: Cell<bool> = const { Cell::new(false) };
         // The mlx_stream handle keeps the stream and its CommandEncoder alive.
-        // Intentionally leaked on thread exit (acceptable for tokio blocking
-        // pool threads that are long-lived).
+        // Intentionally leaked on thread exit — each leaked handle is also an
+        // MLX-internal OS thread. This is only safe because callers bound the
+        // set of distinct threads that ever run this: `rmlx serve` builds its
+        // tokio runtime with a capped `max_blocking_threads` and a long
+        // `thread_keep_alive` (see `crates/rmlx-cli/src/commands/serve.rs`)
+        // so the blocking pool's worker threads are reused, not
+        // idle-reaped-and-replaced — the cumulative leak is bounded by that
+        // cap, not merely "these threads are long-lived."
         static GPU_STREAM_HANDLE: Cell<sys::mlx_stream> =
             const { Cell::new(sys::mlx_stream { ctx: ptr::null_mut() }) };
     }
@@ -215,6 +221,88 @@ pub fn ensure_gpu_default_stream() {
         // Store the handle; do NOT call mlx_stream_free.
         GPU_STREAM_HANDLE.with(|cell| cell.set(stream));
         GPU_STREAM_INIT.with(|cell| cell.set(true));
+    }
+}
+
+/// Ensure a CPU stream is registered as the default stream for the **calling
+/// thread**, so any `Array::eval()` that schedules work on the CPU stream from
+/// this thread finds a registered command encoder.
+///
+/// This is the CPU analog of [`ensure_gpu_default_stream`]. Since MLX 0.31/0.32
+/// the default CPU/GPU streams are **thread-local** (`mlx/stream.cpp`:
+/// `static thread_local ... default_streams`) and the CPU backend resolves a
+/// stream's `CommandEncoder` through a **thread-local** map first
+/// (`mlx/backend/cpu/encoder.cpp::get_command_encoder`), falling back to a
+/// process-global map and otherwise throwing
+/// "There is no Stream(cpu, N) in current thread." A tokio blocking-pool worker
+/// that never called `mlx::core::new_stream` for the CPU device therefore
+/// faults the first time an op is scheduled on the CPU stream — e.g. the K8V8
+/// `exit_prefill` quantization, whose reduction MLX evaluates lazily on the CPU
+/// stream even when the model forward runs on the GPU device.
+///
+/// The mechanism mirrors the GPU guard exactly:
+///   1. Create a fresh CPU stream via `mlx_stream_new_device` — which calls
+///      `mlx::core::new_stream` → `cpu::new_stream`, registering a
+///      `CommandEncoder` for this stream index in the calling thread's
+///      thread-local encoder map.
+///   2. Set it as the calling thread's default CPU stream so every subsequent
+///      `default_stream(cpu)` / `with_stream(Device::Cpu, …)` on this thread
+///      resolves to a stream whose encoder is registered here.
+///   3. Store the handle in a thread-local for the thread's lifetime (do NOT
+///      free — that would drop the encoder entry).
+///
+/// Idempotent — subsequent calls from the same thread are no-ops.
+pub fn ensure_cpu_default_stream() {
+    // Thread-local storage: init flag + stream handle. The handle is held for
+    // the thread's lifetime so the CommandEncoder entry in the thread-local
+    // encoder map stays alive — intentionally leaked on thread exit, same
+    // tradeoff and same bound as `ensure_gpu_default_stream` above: this is
+    // only safe because the tokio blocking pool this guards is capped
+    // (`max_blocking_threads`) and kept warm (`thread_keep_alive`) by
+    // `rmlx serve`, so the cumulative leak is bounded by that cap rather than
+    // relying on the workers simply being long-lived.
+    thread_local! {
+        static CPU_STREAM_INIT: Cell<bool> = const { Cell::new(false) };
+        static CPU_STREAM_HANDLE: Cell<sys::mlx_stream> =
+            const { Cell::new(sys::mlx_stream { ctx: ptr::null_mut() }) };
+    }
+
+    if CPU_STREAM_INIT.with(Cell::get) {
+        return;
+    }
+
+    // SAFETY: mirror of ensure_gpu_default_stream for the CPU device.
+    // - mlx_device_new_type(MLX_CPU, 0): handle to the CPU device (always
+    //   available on Apple Silicon; ctx is non-null on success).
+    // - mlx_stream_new_device(cpu_dev): mlx::core::new_stream(cpu) →
+    //   cpu::new_stream(s), which registers a CommandEncoder for the new stream
+    //   index in the calling thread's thread-local encoder map. Returns a
+    //   ref-counted handle to the new stream.
+    // - mlx_set_default_stream(stream): store Stream(cpu, N) as the calling
+    //   thread's default; all subsequent mlx_default_cpu_stream_new() calls on
+    //   this thread return it.
+    // - mlx_device_free: releases the temporary device handle; the stream keeps
+    //   its own reference to the underlying device.
+    // - We store the stream handle in CPU_STREAM_HANDLE and do NOT call
+    //   mlx_stream_free — the CommandEncoder entry stays alive while the handle
+    //   is alive.
+    unsafe {
+        let cpu_dev = sys::mlx_device_new_type(sys::mlx_device_type_::MLX_CPU, 0);
+        if cpu_dev.ctx.is_null() {
+            return;
+        }
+        let stream = sys::mlx_stream_new_device(cpu_dev);
+        let _ = sys::mlx_device_free(cpu_dev);
+
+        if stream.ctx.is_null() {
+            return;
+        }
+
+        let _ = sys::mlx_set_default_stream(stream);
+
+        // Store the handle; do NOT call mlx_stream_free.
+        CPU_STREAM_HANDLE.with(|cell| cell.set(stream));
+        CPU_STREAM_INIT.with(|cell| cell.set(true));
     }
 }
 
