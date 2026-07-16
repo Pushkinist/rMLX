@@ -26,7 +26,9 @@ isoquant_dequantize_iso3.metal | isoquant_iso3.hdr.metal | codes_in:u,scales_in:
 k8vturbo3_quantize.metal | ../k8vturbo3_header.metal | inp:f,codes:u,scales:f
 k8vturbo3_dequantize.metal | ../k8vturbo3_header.metal | codes:u,scales:f,out:f
 planar_flash_decode_p1.metal | planar_flash_decode_p1.hdr.metal | query:f,k_codes:u,k_scales:f,k_rot32:u,v_flat:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
-planar_flash_decode_p2.metal | - | partial_o:f,tile_max:f,tile_sum_exp:f,dims_p2:u,dst:f
+# Codec-agnostic flash-decode pass-2 LSE merge; shared by the planar and rotor
+# flash-decode dispatchers (each registers its own kernel name over this body).
+flash_decode_merge_p2.metal | - | partial_o:f,tile_max:f,tile_sum_exp:f,dims_p2:u,dst:f
 planar_fused_qk_b3.metal | planar_fused_qk_b3.hdr.metal | query:f,codes:u,scales:f,rot32:u,scale_arr:f,dims:u,out:f
 planar_fused_qk_b4.metal | planar_fused_qk_b4.hdr.metal | query:f,codes:u,scales:f,rot32:u,scale_arr:f,dims:u,out:f
 planarquant_quantize.metal | planarquant_v4.hdr.metal | inp:f,codes:u,scales:f,rot32:u
@@ -50,6 +52,11 @@ rot_k_fwht_rotate_d64.metal | rot_k.hdr.metal | inp:f,out:f
 rot_k_fwht_rotate_d128.metal | rot_k.hdr.metal | inp:f,out:f
 rot_k_fwht_rotate_d256.metal | rot_k.hdr.metal | inp:f,out:f
 rot_k_fwht_rotate_d512.metal | rot_k.hdr.metal | inp:f,out:f
+# One flash-decode pass-1 body serves both rotor bit widths — the unpack width
+# arrives via the header (RF_BITS / RF_MASK), so each header gets its own probe
+# line over the same body.
+rotor_flash_decode_p1.metal | rotor_flash_decode_p1_b3.hdr.metal | query:f,codes:u,scales:f,norms:f,rotors:f,v_flat:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
+rotor_flash_decode_p1.metal | rotor_flash_decode_p1_b4.hdr.metal | query:f,codes:u,scales:f,norms:f,rotors:f,v_flat:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
 rotor_fused_qk_b3.metal | rotor_fused_qk_b3.hdr.metal | query:f,codes:u,scales:f,norms:f,rotors:f,mask:f,scale_arr:f,dims:u,out:f
 rotor_fused_qk_b4.metal | rotor_fused_qk_b4.hdr.metal | query:f,codes:u,scales:f,norms:f,rotors:f,mask:f,scale_arr:f,dims:u,out:f
 rotorquant_quantize_rotor3.metal | rotorquant_rotor3.hdr.metal | inp:f,rotors_in:f,n_groups:u,head_dim:u,codes_out:u,scales_out:f,norms_out:f

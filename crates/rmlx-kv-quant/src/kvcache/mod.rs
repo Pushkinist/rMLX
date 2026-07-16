@@ -87,6 +87,12 @@ mod resident_bytes_tests;
 #[path = "windowed_ring_sizing_tests.rs"]
 mod windowed_ring_sizing_tests;
 
+// Rotor K-only flash-decode reaches the kernel from the production
+// `update_and_sdpa` entry point.
+#[cfg(test)]
+#[path = "rotor_flash_dispatch_tests.rs"]
+mod rotor_flash_dispatch_tests;
+
 pub use core::KvCache;
 pub use fused_qk_dispatch::fused_qk_total_dispatch_count;
 // `FusedQkLayout` / `FusedQkShadow` are crate-internal

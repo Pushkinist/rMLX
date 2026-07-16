@@ -398,6 +398,10 @@ pub enum KvStorage {
     /// `KvCache::decode_fp16_v` (same machinery as `IsoKOnly3` /
     /// `PlanarK` / `None`).
     ///
+    /// Decode reads the packed K store directly via the rotor flash-decode MSL
+    /// kernel when the store carries no QJL sideband; a QJL store keeps the CPU
+    /// dequant path. See `docs/KV_QUANT.md` § `rotor_flash_decode`.
+    ///
     /// Layout tag: [`ROTOR_K_ONLY_3_LAYOUT_TAG`] or
     /// [`ROTOR_K_ONLY_3_QJL_LAYOUT_TAG`].
     RotorKOnly3 {
@@ -1995,7 +1999,10 @@ fn quant_rotor_v4_bytes(qv: Option<&QuantRotorV4>) -> u64 {
     })
 }
 
-/// Rotor3 K buffer (`QuantRotorK3`, CPU-only).
+/// Rotor3 K buffer (`QuantRotorK3`).
+///
+/// Counts the CPU blocks only. The GPU-resident ring (`RotorGpuK`) that backs
+/// the rotor flash-decode is accounted by `QuantRotorK3::byte_size`.
 ///
 /// Includes: static `rotors: Vec<f32>` (4 B), optional QJL projection matrix
 /// `qjl_s_matrix: Vec<f32>` (4 B), and per-token `RotorKBlocks`:
@@ -2020,7 +2027,8 @@ fn quant_rotor_k3_bytes(qk: Option<&QuantRotorK3>) -> u64 {
     })
 }
 
-/// Rotor4 K buffer (`QuantRotorK4`, CPU-only). Same layout as RotorK3.
+/// Rotor4 K buffer (`QuantRotorK4`). Same layout as RotorK3; same GPU-ring
+/// accounting note.
 fn quant_rotor_k4_bytes(qk: Option<&QuantRotorK4>) -> u64 {
     qk.map_or(0, |q| {
         let rotor_bytes = q.rotors.len() as u64 * 4;
