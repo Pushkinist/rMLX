@@ -424,7 +424,7 @@ impl KvCache {
     /// Returns the bf16 K buffer accumulated during prefill, in the layout
     /// `[1, n_kv_heads, S, head_dim]`. Populated only when the cache ran
     /// through the bf16 path (`KvQuant::None`) or when the Mixed/RotK paths
-    /// surfaced the bf16 accumulator via `update_and_sdpa_returning_kv`.
+    /// surfaced the bf16 accumulator via `update_and_sdpa_shared_source`.
     ///
     /// Intended exclusively for the offline `rmlx kv-calibrate
     /// --recipe head_budget` pass, which needs a host-side view of the

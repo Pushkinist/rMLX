@@ -11,9 +11,29 @@ mod tests {
     };
     use rmlx_kv_quant::kvcache::KvCache;
     use rmlx_kv_quant::storage::KvStorage;
-    use rmlx_kv_quant::{KvQuant, KV_MAX_SEQ_DEFAULT};
+    use rmlx_kv_quant::{KvQuant, SharedKv, KV_MAX_SEQ_DEFAULT};
     use rmlx_loader::KvCalibration;
     use rmlx_mlx::{Array, Device, Dtype};
+
+    /// Unwrap a producer's share into `(out, K, V)`.
+    ///
+    /// Every cache in this module runs on `Device::Cpu`, on a rotating ring, or
+    /// on the Mixed path — none of which can reach a fused-over-store arm — so
+    /// the share is always bf16 here. A `Store` share would mean a dispatch gate
+    /// regressed, hence the panic rather than a silent dequant.
+    #[allow(
+        clippy::panic,
+        reason = "test helper: a Store share on a CPU/rotating/Mixed cache is a gate regression, and must fail the test loudly"
+    )]
+    fn split_bf16_share(pair: (Array, SharedKv)) -> (Array, Array, Array) {
+        let (out, share) = pair;
+        match share {
+            SharedKv::Bf16(k, v) => (out, k, v),
+            SharedKv::Store { .. } => {
+                panic!("expected a bf16 share — no fused-over-store arm is eligible here")
+            }
+        }
+    }
 
     // Helper: make a [B, kv_h, S, D] F32 array with deterministic LCG data in [-1, 1].
     #[allow(
@@ -924,14 +944,14 @@ mod tests {
 
     /// Smoke test for the cross-layer-KV-sharing sibling wrapper on the K8V8
     /// path: build a cache, seed it with 16 tokens, run one decode step via
-    /// `update_and_sdpa_returning_kv`, assert the call returns three arrays
+    /// `update_and_sdpa_shared_source`, assert the call returns three arrays
     /// with the expected shapes.
     #[test]
     #[allow(
         clippy::expect_used,
         reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
     )]
-    fn update_and_sdpa_returning_kv_k8v8_smoke() {
+    fn update_and_sdpa_shared_source_k8v8_smoke() {
         let device = Device::Cpu;
         let n_kv_heads: i32 = 4;
         let head_dim: i32 = 128;
@@ -951,9 +971,11 @@ mod tests {
         cache
             .update(&k_pref, &v_pref, device)
             .expect("K8V8 prefill failed");
-        let (out, k_full, v_full) = cache
-            .update_and_sdpa_returning_kv(&queries, &new_k, &new_v, scale, "", None, device)
-            .expect("update_and_sdpa_returning_kv K8V8 failed");
+        let (out, k_full, v_full) = split_bf16_share(
+            cache
+                .update_and_sdpa_shared_source(&queries, &new_k, &new_v, scale, "", None, device)
+                .expect("update_and_sdpa_shared_source K8V8 failed"),
+        );
 
         // After one decode step on top of the 16-token prefill: total = 17.
         let total_kv: i32 = prefill_seq + 1;
@@ -982,7 +1004,7 @@ mod tests {
         clippy::expect_used,
         reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
     )]
-    fn update_and_sdpa_returning_kv_k8v4_smoke() {
+    fn update_and_sdpa_shared_source_k8v4_smoke() {
         let device = Device::Cpu;
         let n_kv_heads: i32 = 4;
         let head_dim: i32 = 128;
@@ -1002,9 +1024,11 @@ mod tests {
         cache
             .update(&k_pref, &v_pref, device)
             .expect("K8V4 prefill failed");
-        let (out, k_full, v_full) = cache
-            .update_and_sdpa_returning_kv(&queries, &new_k, &new_v, scale, "", None, device)
-            .expect("update_and_sdpa_returning_kv K8V4 failed");
+        let (out, k_full, v_full) = split_bf16_share(
+            cache
+                .update_and_sdpa_shared_source(&queries, &new_k, &new_v, scale, "", None, device)
+                .expect("update_and_sdpa_shared_source K8V4 failed"),
+        );
 
         let total_kv: i32 = prefill_seq + 1;
         assert_eq!(out.shape(), vec![1, n_kv_heads, 1, head_dim]);
@@ -1012,7 +1036,7 @@ mod tests {
         assert_eq!(v_full.shape(), vec![1, n_kv_heads, total_kv, head_dim]);
     }
 
-    /// `update_and_sdpa_returning_kv` now SUPPORTS Mixed caches via
+    /// `update_and_sdpa_shared_source` now SUPPORTS Mixed caches via
     /// dequant-before-share. The fused quantized SDPA stores K/V as quant
     /// 3-tuples, but the wrapper surfaces the accumulated bf16 K/V (prefill-raw
     /// during prefill, maintained `decode_fp16_k/v` during decode) so a
@@ -1042,7 +1066,7 @@ mod tests {
         clippy::unwrap_used,
         reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
     )]
-    fn update_and_sdpa_returning_kv_mixed_shared_kv() {
+    fn update_and_sdpa_shared_source_mixed_shared_kv() {
         let device = Device::Cpu;
         let n_kv_heads: i32 = 4;
         let head_dim: i32 = 128;
@@ -1068,9 +1092,13 @@ mod tests {
 
         // Prefill through the shared-KV wrapper — must NOT error for Mixed.
         cache.enter_prefill();
-        let (out_pref, k_pre_full, v_pre_full) = cache
-            .update_and_sdpa_returning_kv(&q_pref, &k_pref, &v_pref, scale, "causal", None, device)
-            .expect("Mixed prefill via returning_kv must succeed");
+        let (out_pref, k_pre_full, v_pre_full) = split_bf16_share(
+            cache
+                .update_and_sdpa_shared_source(
+                    &q_pref, &k_pref, &v_pref, scale, "causal", None, device,
+                )
+                .expect("Mixed prefill via the shared-source path must succeed"),
+        );
         cache.exit_prefill(device).expect("exit_prefill failed");
 
         assert_eq!(out_pref.shape(), vec![1, n_kv_heads, prefill_seq, head_dim]);
@@ -1091,9 +1119,11 @@ mod tests {
         );
 
         // One decode step: extend the prefix by exactly one token.
-        let (out, k_full, v_full) = cache
-            .update_and_sdpa_returning_kv(&queries, &new_k, &new_v, scale, "", None, device)
-            .expect("update_and_sdpa_returning_kv Mixed decode must succeed");
+        let (out, k_full, v_full) = split_bf16_share(
+            cache
+                .update_and_sdpa_shared_source(&queries, &new_k, &new_v, scale, "", None, device)
+                .expect("update_and_sdpa_shared_source Mixed decode must succeed"),
+        );
 
         let total_kv: i32 = prefill_seq + 1;
         assert_eq!(out.shape(), vec![1, n_kv_heads, 1, head_dim]);
@@ -1152,9 +1182,13 @@ mod tests {
         });
 
         cache.enter_prefill();
-        let (out_pref, _k_full, v_full) = cache
-            .update_and_sdpa_returning_kv(&q_pref, &k_pref, &v_pref, scale, "causal", None, device)
-            .expect("2-bit V Mixed prefill must succeed");
+        let (out_pref, _k_full, v_full) = split_bf16_share(
+            cache
+                .update_and_sdpa_shared_source(
+                    &q_pref, &k_pref, &v_pref, scale, "causal", None, device,
+                )
+                .expect("2-bit V Mixed prefill must succeed"),
+        );
         cache.exit_prefill(device).expect("exit_prefill failed");
 
         assert_eq!(v_full.shape(), vec![1, n_kv_heads, prefill_seq, head_dim]);
@@ -1462,7 +1496,7 @@ mod tests {
     /// regression: a Mixed-quant SWA (rotating) cache driven across a
     /// window-crossing prefill chunk must NOT broadcast-fail.
     ///
-    /// Before , `update_and_sdpa[_returning_kv]` short-circuited Mixed to
+    /// Previously, `update_and_sdpa[_shared_source]` short-circuited Mixed to
     /// `update_prefill_raw` (full, uncapped K of length `offset + seq`) BEFORE
     /// honoring the rotating ring. But the Gemma4 SWA attention mask is sized
     /// to the ring's window-capped K (`offset.min(window-1) + seq`). On the
@@ -1513,9 +1547,11 @@ mod tests {
         let (v1, _) = make_lcg_array(shape1, 0x3333_3333_u64);
         // First chunk: offset == 0 -> "causal", no explicit mask (matches
         // Gemma4 SWA prefill at offset 0).
-        let (_o1, _k1f, _v1f) = cache
-            .update_and_sdpa_returning_kv(&q1, &k1, &v1, scale, "causal", None, device)
-            .expect("chunk 1 prefill must succeed");
+        let (_o1, _k1f, _v1f) = split_bf16_share(
+            cache
+                .update_and_sdpa_shared_source(&q1, &k1, &v1, scale, "causal", None, device)
+                .expect("chunk 1 prefill must succeed"),
+        );
         assert_eq!(cache.offset(), c1);
 
         // Chunk 2: crosses the window. Build the SWA mask the way Gemma4 does:
@@ -1531,9 +1567,11 @@ mod tests {
 
         // Pre-fix: this errored with the (…,c2,c2+offset) vs (…,c2,eff+c2)
         // broadcast mismatch. Post-fix: Ok, K capped at the window.
-        let (out, k_full, v_full) = cache
-            .update_and_sdpa_returning_kv(&q2, &k2, &v2, scale, "array", Some(&mask), device)
-            .expect("window-crossing Mixed SWA chunk must not broadcast-fail");
+        let (out, k_full, v_full) = split_bf16_share(
+            cache
+                .update_and_sdpa_shared_source(&q2, &k2, &v2, scale, "array", Some(&mask), device)
+                .expect("window-crossing Mixed SWA chunk must not broadcast-fail"),
+        );
 
         // The crux: the ring's K length must equal the mask's key dimension
         // (`eff_offset + c2`), i.e. the window-capped length the mlx-lm

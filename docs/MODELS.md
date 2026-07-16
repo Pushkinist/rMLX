@@ -788,7 +788,7 @@ buffer.
 SWA layers whose K/V is produced by the model but immediately overwritten with
 the shared K/V from the preceding full-attention layer. Only the full-attention
 layers write independent K/V into the KV cache; SWA layers read the shared
-tensor supplied by `update_and_sdpa_returning_kv`. This halves the KV memory
+tensor supplied by `update_and_sdpa_shared_source`. This halves the KV memory
 footprint for those layers.
 
 **K=V sharing for full-attention layers (26B/31B).** When `attention_k_eq_v=true`,
@@ -878,7 +878,7 @@ Default resolution by signal:
 - `hidden_size >= 5376` (31B dense): `Planar`.
 
 Cross-layer KV sharing is compatible with all `KvQuant` modes. The
-`update_and_sdpa_returning_kv` path dequantizes to bf16 before passing the
+`update_and_sdpa_shared_source` path dequantizes to bf16 before passing the
 shared KV to consumer layers, so `Mixed` mode also works.
 
 ### Modalities

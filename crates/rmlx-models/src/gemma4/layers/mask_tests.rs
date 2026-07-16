@@ -23,6 +23,7 @@
 //! the mask key dim from `k_seq` to `k_seq + 1` and making
 //! `guard_invariant_producer_offset_matches_k_seq` RED.
 
+use rmlx_kv_quant::SharedKv;
 use rmlx_mlx::{Array, Device, Dtype};
 
 use super::{build_attn_mask, consumer_effective_offset, producer_effective_offset, LayerType};
@@ -257,6 +258,62 @@ fn guard_invariant_consumer_mask_matches_shared_k_len() {
         shape[3] < base_offset + seq,
         "offset-based sizing (base_offset + seq) would have been wider — the \
          #32-part-2 broadcast crash"
+    );
+}
+
+/// The consumer branch now reads its `total_kv_len` from `SharedKv::kv_len()`
+/// instead of `k.shape()[2]`, because a store-backed share has no bf16 K tensor
+/// to measure. That is a change to the producer→consumer interface the mask
+/// depends on, so pin it: for a bf16 share `kv_len()` must be *exactly*
+/// `k.shape()[2]`, i.e. the mask sizing is unchanged by the new interface.
+///
+/// A store-backed share's `kv_len()` is pinned to the producer's post-update
+/// offset in `rmlx_kv_quant::kvcache::shared_kv_tests`, which is the same
+/// quantity `k.shape()[2]` carries on the bf16 path.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "test asserts on known-good shapes; unwrap/expect failures are the assertion"
+)]
+fn shared_kv_len_reproduces_k_shape_sizing() {
+    let seq = 5;
+    let k_seq = 3222; // producer's post-update K length
+    let kv_h = 2;
+    let head_dim = 4;
+
+    // A bf16 share carrying a K of exactly `k_seq` keys.
+    let n = (kv_h * k_seq * head_dim) as usize;
+    let k = Array::from_f32_slice(&vec![0.5_f32; n], &[1, kv_h, k_seq, head_dim]).unwrap();
+    let v = Array::from_f32_slice(&vec![0.25_f32; n], &[1, kv_h, k_seq, head_dim]).unwrap();
+    let share = SharedKv::Bf16(k, v);
+
+    assert_eq!(
+        share.kv_len().unwrap(),
+        k_seq,
+        "a bf16 share's kv_len must equal k.shape()[2] — the value the consumer \
+         branch sized its mask from before the sharing interface changed"
+    );
+
+    // …and it drives the identical mask the old sizing produced.
+    let effective_offset = consumer_effective_offset(share.kv_len().unwrap(), seq);
+    let (mask, mode) = build_attn_mask(
+        LayerType::FullAttention,
+        seq,
+        effective_offset,
+        share.kv_len().unwrap(),
+        false,
+        512,
+        None,
+        Device::Cpu,
+    )
+    .unwrap();
+    assert_eq!(mode, "array");
+    assert_eq!(
+        mask.expect("array mode must carry a mask array").shape()[3],
+        k_seq,
+        "mask key dim must still equal the producer's K length"
     );
 }
 

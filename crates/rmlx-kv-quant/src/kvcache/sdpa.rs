@@ -19,7 +19,8 @@ use crate::planar_fused_qk_msl::planar_fused_qk;
 use crate::rotor_flash_decode_msl::{rotor_flash_decode_sdpa, ROTOR_FLASH_HEAD_DIM_MAX};
 use crate::storage::KvStorage;
 
-use super::helpers::storage_variant_name;
+use super::helpers::{f32_vec_to_array, storage_variant_name};
+use super::shared_kv::SharedKv;
 use super::KvCache;
 
 impl KvCache {
@@ -59,7 +60,7 @@ impl KvCache {
     }
 
     /// Inner Mixed-precision path shared by [`KvCache::update_and_sdpa_mixed`]
-    /// (the non-shared-KV hot path) and [`KvCache::update_and_sdpa_returning_kv`]
+    /// (the non-shared-KV hot path) and [`KvCache::update_and_sdpa_shared_source`]
     /// (cross-layer-KV archs such as Gemma4).
     ///
     /// `want_kv` controls whether the accumulated **bf16** K/V is surfaced for a
@@ -323,7 +324,7 @@ impl KvCache {
         )
     }
 
-    /// -review CRITICAL 1: `update_and_sdpa_returning_kv` variant for
+    /// -review CRITICAL 1: `update_and_sdpa_shared_source` variant for
     /// RotKTq4V. Runs the same K/V update and SDPA as
     /// `update_and_sdpa_rot_k_tq4v` but additionally surfaces the dequantized
     /// bf16 `(K, V)` so Gemma4 shared-KV consumer layers can receive them.
@@ -337,7 +338,7 @@ impl KvCache {
         clippy::indexing_slicing,
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
     )]
-    fn update_and_sdpa_rot_k_tq4v_returning_kv(
+    fn update_and_sdpa_rot_k_tq4v_shared_source(
         &mut self,
         queries: &Array,
         new_k: &Array,
@@ -449,7 +450,7 @@ impl KvCache {
                         Err(e) => {
                             tracing::warn!(
                                 reason = %e,
-                                "rot_k_fwht_rotate_gpu failed in returning_kv; \
+                                "rot_k_fwht_rotate_gpu failed on the shared-KV producer path; \
                                  falling back to v1 matmul Q rotation"
                             );
                             crate::rot_k::rotate_last_axis(queries, r, device)?
@@ -526,7 +527,7 @@ impl KvCache {
         // which disagrees with the ring-capped SWA attention mask on the
         // window-crossing chunk. Route rotating caches through the legacy
         // `update()` path (ring first) so the K shape matches the mask — same
-        // fix as `update_and_sdpa_returning_kv`. See `with_quant_max_seq_window`.
+        // fix as `update_and_sdpa_shared_source`. See `with_quant_max_seq_window`.
         if self.rotating.is_some() {
             tracing::Span::current().record("path", "rotating");
             let (k_full, v_full) = self.update(new_k, new_v, device)?;
@@ -747,36 +748,44 @@ impl KvCache {
     }
 
     /// Sibling of [`KvCache::update_and_sdpa`] for archs with **cross-layer KV
-    /// sharing** (e.g. Gemma3 / Gemma4). Returns the accumulated post-update
-    /// `(K, V)` alongside the SDPA output so the caller can hand the K/V
-    /// downstream to shared-KV consumer layers.
+    /// sharing**: runs this producer layer's own update + SDPA and reports what
+    /// its downstream consumer layers can attend over, as a [`SharedKv`].
     ///
-    /// For [`KvQuant::Mixed`] the fused quantized SDPA stores K/V as
-    /// quant 3-tuples, so this method routes through
-    /// [`KvCache::update_and_sdpa_mixed_inner`] with `want_kv = true`, which
-    /// surfaces the accumulated **bf16** K/V (the prefill-raw buffer during
-    /// prefill, the maintained `decode_fp16_k/v` during decode) — the same
-    /// values the quantized SDPA was computed from. All other quants (`None`,
-    /// `K8V4`, `K8V8`, `Planar`) route through [`KvCache::update`], which
-    /// dequantises and returns the accumulated bf16/fp32 K/V the wrapper needs.
+    /// The dispatch chain mirrors [`KvCache::update_and_sdpa`] arm for arm —
+    /// that symmetry is the contract. A codec that has a fused decode kernel
+    /// must reach it here too; if it does not, the producer is pushed onto the
+    /// legacy bf16 path and the fused kernel is silently dead for every model
+    /// with a shared-KV topology.
+    ///
+    /// Which [`SharedKv`] variant a step yields is decided by the codec, not by
+    /// the arch:
+    ///
+    /// * The fused-over-quant-store arms ([`Self::update_and_sdpa_planar_k_fused`],
+    ///   [`Self::update_and_sdpa_rotor_k_fused`]) never materialise bf16 K/V, so
+    ///   they yield [`SharedKv::Store`] and consumers re-enter the same kernel
+    ///   via [`Self::sdpa_shared`].
+    /// * Every other arm — rotating (SWA) rings, [`KvQuant::Mixed`] / RotK
+    ///   (which surface the bf16 accumulator the quantized SDPA was computed
+    ///   from), the TurboFlash / fused-QK dispatches (which maintain a bf16
+    ///   mirror anyway), and the legacy [`KvCache::update`] fallthrough — has a
+    ///   bf16 `(K, V)` in hand already and yields [`SharedKv::Bf16`], which all
+    ///   consumers share without a second materialisation.
     ///
     /// The SWA `rotating.is_some()` short-circuit inside [`KvCache::update`]
     /// still applies — SWA layers stay bf16 even when `self.quant` requests a
     /// non-rotation codec. No SWA-specific branching is needed here.
-    ///
-    /// Task 9: wrapped with a debug-level span (sibling of `update_and_sdpa`).
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(
         level = "debug",
-        name = "update_and_sdpa_returning_kv",
+        name = "update_and_sdpa_shared_source",
         skip(self, queries, new_k, new_v, additive_mask, mask_mode, scale, device),
         fields(
             kv_quant = %self.quant,
             offset = self.offset,
-            path = "returning_kv_legacy",
+            path = tracing::field::Empty,
         )
     )]
-    pub fn update_and_sdpa_returning_kv(
+    pub fn update_and_sdpa_shared_source(
         &mut self,
         queries: &Array,
         new_k: &Array,
@@ -785,7 +794,7 @@ impl KvCache {
         mask_mode: &str,
         additive_mask: Option<&Array>,
         device: Device,
-    ) -> Result<(Array, Array, Array)> {
+    ) -> Result<(Array, SharedKv)> {
         // SWA (rotating) layers stay bf16 for EVERY quant, including
         // Mixed/RotK (mlx-lm `RotatingKVCache.to_quantized` raises
         // NotImplementedError; see `with_quant_max_seq_window`). The
@@ -799,6 +808,7 @@ impl KvCache {
         // honors the ring first) keeps Mixed consistent with None/K8V8/K8V4/
         // Planar, all of which already reach the ring via `update()`.
         if self.rotating.is_some() {
+            tracing::Span::current().record("path", "rotating");
             let (k_full, v_full) = self.update(new_k, new_v, device)?;
             let out = scaled_dot_product_attention(
                 queries,
@@ -809,7 +819,7 @@ impl KvCache {
                 additive_mask,
                 device,
             )?;
-            return Ok((out, k_full, v_full));
+            return Ok((out, SharedKv::Bf16(k_full, v_full)));
         }
 
         // Mixed dequant-before-share. The fused quantized SDPA stores K/V
@@ -821,6 +831,7 @@ impl KvCache {
         // same path; the shared-KV consumer sees unrotated bf16 K (the SDPA
         // helper rotates Q internally, never the surfaced K).
         if self.quant.uses_mixed_path() {
+            tracing::Span::current().record("path", "mixed");
             let (out, kv) = self.update_and_sdpa_mixed_inner(
                 queries,
                 new_k,
@@ -832,21 +843,22 @@ impl KvCache {
             )?;
             let (k_full, v_full) = kv.ok_or_else(|| {
                 Error::Mlx(
-                    "update_and_sdpa_returning_kv: Mixed path returned no bf16 K/V \
+                    "update_and_sdpa_shared_source: Mixed path returned no bf16 K/V \
                      (want_kv=true must always surface the accumulator)"
                         .into(),
                 )
             })?;
-            return Ok((out, k_full, v_full));
+            return Ok((out, SharedKv::Bf16(k_full, v_full)));
         }
 
-        // / -review CRITICAL 1: RotKTq4V must be explicitly routed
-        // here before the `update()` fallthrough. `update()` returns an error for
-        // RotKTq4V ("Contract violation"), crashing Gemma4 shared-KV layers that
-        // call this method. Mirror the Mixed branch: run the hybrid SDPA and
-        // surface the dequantized bf16 K/V for downstream shared-KV consumers.
+        // RotKTq4V must be explicitly routed here before the `update()`
+        // fallthrough. `update()` returns an error for RotKTq4V ("Contract
+        // violation"), crashing shared-KV layers that call this method. Mirror
+        // the Mixed branch: run the hybrid SDPA and surface the dequantized
+        // bf16 K/V for downstream shared-KV consumers.
         if self.quant.uses_rot_k_tq4v_path() {
-            let (out, k_full, v_full) = self.update_and_sdpa_rot_k_tq4v_returning_kv(
+            tracing::Span::current().record("path", "rot_k_tq4v");
+            let (out, k_full, v_full) = self.update_and_sdpa_rot_k_tq4v_shared_source(
                 queries,
                 new_k,
                 new_v,
@@ -855,22 +867,31 @@ impl KvCache {
                 additive_mask,
                 device,
             )?;
-            return Ok((out, k_full, v_full));
+            return Ok((out, SharedKv::Bf16(k_full, v_full)));
         }
 
-        // TurboFlash + fused-QK dispatch hooks for cross-layer-KV producer
-        // layers (Gemma4). The dispatch chain mirrors the one in
-        // `update_and_sdpa`; we surface bf16 (K, V) by slicing the
-        // `decode_fp16_k/v` mirrors that those dispatch paths already
-        // maintain. Returns `None` when no dispatch arm is eligible — the
-        // legacy bf16 fallback below then runs unchanged.
-        if let Some((out, k_full, v_full)) =
-            self.try_dispatch_returning_kv(queries, new_k, new_v, scale, additive_mask, device)?
+        // Fused-over-quant-store arms. These read the packed store directly and
+        // deliberately never materialise a bf16 K prefix, so the share they
+        // hand downstream is the store itself. Same gates and same order as the
+        // matching arms in `update_and_sdpa` — a consumer of this cache
+        // re-enters the identical kernel through `sdpa_shared`.
+        if let Some((out, kv_len)) =
+            self.try_dispatch_shared_store(queries, new_k, new_v, scale, additive_mask, device)?
         {
-            tracing::Span::current().record("path", "returning_kv_dispatch");
-            return Ok((out, k_full, v_full));
+            return Ok((out, SharedKv::Store { kv_len }));
         }
 
+        // TurboFlash + fused-QK dispatch hooks. These maintain the bf16
+        // `decode_fp16_k/v` mirrors regardless, so the share is those exact
+        // tensors sliced to the current offset. Returns `None` when no arm is
+        // eligible — the legacy bf16 fallback below then runs unchanged.
+        if let Some((out, k_full, v_full)) =
+            self.try_dispatch_shared_bf16(queries, new_k, new_v, scale, additive_mask, device)?
+        {
+            return Ok((out, SharedKv::Bf16(k_full, v_full)));
+        }
+
+        tracing::Span::current().record("path", "legacy");
         let (k_full, v_full) = self.update(new_k, new_v, device)?;
         let out = scaled_dot_product_attention(
             queries,
@@ -881,11 +902,107 @@ impl KvCache {
             additive_mask,
             device,
         )?;
-        Ok((out, k_full, v_full))
+        Ok((out, SharedKv::Bf16(k_full, v_full)))
+    }
+
+    /// Run the fused-over-quant-store dispatch arms for a cross-layer-KV
+    /// producer layer, returning `(out, kv_len)` on a hit.
+    ///
+    /// Mirrors arms 1b / 1c of [`Self::update_and_sdpa`] — including their
+    /// pre-mutation gates — so a shared-KV producer reaches exactly the kernels
+    /// a non-sharing model reaches. `kv_len` is the store length the kernel
+    /// attended, which downstream consumers size their mask from.
+    ///
+    /// Returns `Ok(None)` when no arm is eligible, leaving the cache untouched
+    /// for the caller's next arm.
+    ///
+    /// General mechanism: nothing here is arch-specific. Every gate is keyed on
+    /// the codec's storage variant and the step's shape.
+    #[allow(clippy::too_many_arguments)]
+    fn try_dispatch_shared_store(
+        &mut self,
+        queries: &Array,
+        new_k: &Array,
+        new_v: &Array,
+        scale: f32,
+        additive_mask: Option<&Array>,
+        device: Device,
+    ) -> Result<Option<(Array, i32)>> {
+        let q_seq_is_decode = queries.shape().get(2).copied().unwrap_or(0) == 1;
+
+        // PlanarK fused-QK / flash-decode. The warm-TTFT gate mirrors
+        // `update_and_sdpa`: while the bf16 K seed is live every other codec
+        // decodes off it, so PlanarK must not be the sole codec re-encoding K
+        // through its lossy kernel every step.
+        if matches!(self.storage, KvStorage::PlanarK { .. })
+            && planar_fused_qk_enabled()
+            && device == Device::Gpu
+            && q_seq_is_decode
+        {
+            if self.decode_fp16_k.is_some() {
+                tracing::debug!(
+                    target: "rmlx_kv_quant::warm_ttft",
+                    path = "warm_ttft_bypass",
+                    codec = "PlanarK",
+                    offset = self.offset,
+                    "PlanarK shared-source dispatcher skipping fused-QK / \
+                     flash-decode kernels — bf16 K seed is live (warm-TTFT)"
+                );
+            } else if let Some(out) = self.update_and_sdpa_planar_k_fused(
+                queries,
+                new_k,
+                new_v,
+                scale,
+                additive_mask,
+                device,
+            )? {
+                tracing::Span::current().record("path", "planar_k_fused");
+                tracing::debug!(
+                    target: "rmlx_kv_quant::shared_kv",
+                    kernel = "planar_k_fused",
+                    offset = self.offset,
+                    "fused kernel dispatched on the shared-KV producer path — \
+                     consumers attend the quant store"
+                );
+                let kv_len = planar_k_accumulated_seq(&self.storage)?;
+                return Ok(Some((out, kv_len)));
+            }
+        }
+
+        // Rotor K-only flash-decode. Without it this codec CPU-dequants the
+        // whole K prefix every decode step with the GPU idle.
+        if matches!(
+            self.storage,
+            KvStorage::RotorKOnly3 { .. } | KvStorage::RotorKOnly4 { .. }
+        ) && device == Device::Gpu
+            && !rotor_k_store_uses_qjl(&self.storage)
+            && q_seq_is_decode
+        {
+            if let Some(out) = self.update_and_sdpa_rotor_k_fused(
+                queries,
+                new_k,
+                new_v,
+                scale,
+                additive_mask,
+                device,
+            )? {
+                tracing::debug!(
+                    target: "rmlx_kv_quant::shared_kv",
+                    kernel = "rotor_flash",
+                    offset = self.offset,
+                    "fused kernel dispatched on the shared-KV producer path — \
+                     consumers attend the quant store"
+                );
+                let kv_len = rotor_k_accumulated_seq(&self.storage)?;
+                return Ok(Some((out, kv_len)));
+            }
+        }
+
+        Ok(None)
     }
 
     /// Run the TurboFlash / fused-QK dispatch chain in the cross-layer-KV
-    /// (`update_and_sdpa_returning_kv`) context and surface the bf16 `(K, V)`
+    /// (`update_and_sdpa_shared_source`) context and surface the bf16 `(K, V)`
     /// consumed by shared-KV consumer layers.
     ///
     /// The chain mirrors `update_and_sdpa`:
@@ -906,11 +1023,10 @@ impl KvCache {
     /// gates off). This preserves Gemma4's default (gates OFF) behaviour
     /// bit-for-bit.
     ///
-    /// General mechanism: nothing here is Gemma4-specific. Any future
-    /// architecture that uses `update_and_sdpa_returning_kv` (medgemma,
-    /// Laguna, etc.) reaches the same dispatch chain.
+    /// General mechanism: nothing here is arch-specific. Any architecture that
+    /// uses `update_and_sdpa_shared_source` reaches the same dispatch chain.
     #[allow(clippy::too_many_arguments)]
-    fn try_dispatch_returning_kv(
+    fn try_dispatch_shared_bf16(
         &mut self,
         queries: &Array,
         new_k: &Array,
@@ -923,11 +1039,12 @@ impl KvCache {
         if let Some(out) =
             self.sdpa_dispatch_no_lock(queries, new_k, new_v, scale, additive_mask, device)?
         {
+            tracing::Span::current().record("path", "flash");
             tracing::debug!(
-                target: "rmlx_kv_quant::returning_kv",
+                target: "rmlx_kv_quant::shared_kv",
                 kernel = "turbo_flash",
                 offset = self.offset,
-                "TurboFlash dispatched on returning_kv path"
+                "TurboFlash dispatched on the shared-KV producer path"
             );
             let (k_full, v_full) = self.slice_decode_fp16_for_consumer(new_k, new_v, device)?;
             return Ok(Some((out, k_full, v_full)));
@@ -938,11 +1055,12 @@ impl KvCache {
         if let Some(out) =
             self.try_fused_qk_dispatch(queries, new_k, new_v, scale, additive_mask, device)?
         {
+            tracing::Span::current().record("path", "fused_qk");
             tracing::debug!(
-                target: "rmlx_kv_quant::returning_kv",
+                target: "rmlx_kv_quant::shared_kv",
                 kernel = "fused_qk",
                 offset = self.offset,
-                "fused-QK dispatched on returning_kv path"
+                "fused-QK dispatched on the shared-KV producer path"
             );
             let (k_full, v_full) = self.slice_decode_fp16_for_consumer(new_k, new_v, device)?;
             return Ok(Some((out, k_full, v_full)));
@@ -951,12 +1069,197 @@ impl KvCache {
         Ok(None)
     }
 
+    /// Consumer-side SDPA over the K/V a **producer** layer accumulated in this
+    /// cache, for a cross-layer-KV (shared-KV) topology.
+    ///
+    /// Read-only: no append, no offset advance. The producer already ran its
+    /// own `update_and_sdpa_shared_source` for this step; this only re-enters
+    /// the same fused kernel with the consumer's own `queries`.
+    ///
+    /// Only reachable when the producer reported [`SharedKv::Store`], i.e. the
+    /// codec ran a fused-over-quant-store kernel. `kv_len` is the length the
+    /// producer reported; it is checked against the store rather than trusted,
+    /// so a producer/consumer desync errors instead of silently attending the
+    /// wrong prefix.
+    ///
+    /// An unrecognised storage variant is an error, never a fallback: falling
+    /// back would answer with a different codec's numbers under the same name.
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "the wildcard arm returns Err — it never selects a concrete codec, so a new \
+                  storage variant fails loudly here instead of being silently decoded as another"
+    )]
+    pub fn sdpa_shared(
+        &self,
+        queries: &Array,
+        scale: f32,
+        additive_mask: Option<&Array>,
+        kv_len: i32,
+        device: Device,
+    ) -> Result<Array> {
+        match &self.storage {
+            KvStorage::RotorKOnly3 { .. } | KvStorage::RotorKOnly4 { .. } => {
+                let kv_seq = rotor_k_accumulated_seq(&self.storage)?;
+                Self::check_shared_kv_len(kv_len, kv_seq)?;
+                let v_full = self.slice_decode_fp16_v(kv_seq, device)?;
+                self.rotor_k_flash_over_store(
+                    queries,
+                    &v_full,
+                    scale,
+                    additive_mask,
+                    kv_seq,
+                    device,
+                )
+            }
+            KvStorage::PlanarK { .. } => {
+                let kv_seq = planar_k_accumulated_seq(&self.storage)?;
+                Self::check_shared_kv_len(kv_len, kv_seq)?;
+                let v_full = self.slice_decode_fp16_v(kv_seq, device)?;
+                self.planar_k_flash_over_store(
+                    queries,
+                    &v_full,
+                    scale,
+                    additive_mask,
+                    kv_seq,
+                    device,
+                )
+            }
+            other => Err(Error::Mlx(format!(
+                "sdpa_shared: storage variant {} has no fused-over-store consumer path — a \
+                 producer must not report a store-backed share for it",
+                storage_variant_name(other)
+            ))),
+        }
+    }
+
+    /// Materialise the `(K, V)` held by a store-backed share, as tensors.
+    ///
+    /// Cold path only — for callers that need K/V *tensors* rather than
+    /// attention output (e.g. handing a verifier's representative K/V to a
+    /// separate drafter model). This pays the full-prefix dequant the fused
+    /// kernel exists to avoid, so never call it per decode step.
+    ///
+    /// # Dtype
+    ///
+    /// The pair comes back at the **V mirror's dtype** — the activation-stream
+    /// dtype the model pushed into this cache (bf16 in production). K is cast to
+    /// match it.
+    ///
+    /// That cast is load-bearing, in both directions:
+    ///
+    /// * The rotor stores dequantise through a `Vec<f32>`, so K arrives F32.
+    ///   Handing an F32 K to a downstream model's attention alongside a bf16 V
+    ///   promotes that model's whole stream to f32 and doubles its KV residency.
+    /// * Hard-coding bf16 instead would be the mirror-image bug on a cache whose
+    ///   stream is wider: K would be silently downcast away from what the cache
+    ///   actually holds. Following V keeps the pair faithful to the stream.
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "the wildcard arm returns Err — it never selects a concrete codec, so a new \
+                  storage variant fails loudly here instead of being silently decoded as another"
+    )]
+    pub fn materialise_shared_kv(&self, kv_len: i32, device: Device) -> Result<(Array, Array)> {
+        let v_full = self.slice_decode_fp16_v(kv_len, device)?;
+        let stream_dtype = v_full.dtype();
+        let k_full = match &self.storage {
+            KvStorage::RotorKOnly3 { k: Some(ks), .. } => {
+                Self::check_shared_kv_len(kv_len, rotor_k_accumulated_seq(&self.storage)?)?;
+                f32_vec_to_array(&ks.dequant()?, &ks.shape)?
+            }
+            KvStorage::RotorKOnly4 { k: Some(ks), .. } => {
+                Self::check_shared_kv_len(kv_len, rotor_k_accumulated_seq(&self.storage)?)?;
+                f32_vec_to_array(&ks.dequant()?, &ks.shape)?
+            }
+            KvStorage::PlanarK { k: Some(ks), .. } => {
+                Self::check_shared_kv_len(kv_len, planar_k_accumulated_seq(&self.storage)?)?;
+                let (k_recon, k_arr) = ks.dequantize_choice(device, stream_dtype)?;
+                match k_arr {
+                    Some(arr) => arr,
+                    None => f32_vec_to_array(&k_recon, &ks.shape)?,
+                }
+            }
+            other => {
+                return Err(Error::Mlx(format!(
+                    "materialise_shared_kv: storage variant {} holds no store-backed share",
+                    storage_variant_name(other)
+                )))
+            }
+        };
+        let k_full = if k_full.dtype() == stream_dtype {
+            k_full
+        } else {
+            k_full.astype(stream_dtype, device)?
+        };
+        // Defence-in-depth: K and V go to the same downstream attention, so a
+        // dtype split between them would promote its stream to the wider of the
+        // two. The cast above should make this unreachable.
+        if k_full.dtype() != v_full.dtype() {
+            return Err(Error::Mlx(format!(
+                "materialise_shared_kv: K dtype {:?} != V dtype {:?} — a shared K/V pair \
+                 must be one dtype or it promotes the consumer's attention stream",
+                k_full.dtype(),
+                v_full.dtype()
+            )));
+        }
+        Ok((k_full, v_full))
+    }
+
+    /// Reject a producer/consumer length desync rather than attend the wrong
+    /// prefix. The two are written and read one step apart on the same cache,
+    /// so a mismatch is an internal invariant break.
+    fn check_shared_kv_len(reported: i32, actual: i32) -> Result<()> {
+        if reported == actual {
+            Ok(())
+        } else {
+            Err(Error::Mlx(format!(
+                "shared-KV length desync: producer reported kv_len={reported}, store holds \
+                 {actual}"
+            )))
+        }
+    }
+
+    /// Read-only slice of the bf16 V accumulator to `kv_seq` positions.
+    ///
+    /// Matches what `update_decode_fp16_v_only` returns to the producer on the
+    /// same step, so producer and consumer attend the identical V window.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by the rank-4 check immediately above"
+    )]
+    fn slice_decode_fp16_v(&self, kv_seq: i32, device: Device) -> Result<Array> {
+        let v_buf = self.decode_fp16_v.as_ref().ok_or_else(|| {
+            Error::Mlx(
+                "decode_fp16_v missing on a store-backed share — the fused arms maintain it on \
+                 every append, so this is an internal invariant violation"
+                    .to_owned(),
+            )
+        })?;
+        let v_shape = v_buf.shape();
+        if v_shape.len() != 4 {
+            return Err(Error::Mlx(format!(
+                "decode_fp16_v rank != 4, got {v_shape:?}"
+            )));
+        }
+        if kv_seq > v_shape[2] {
+            return Err(Error::Mlx(format!(
+                "shared-KV length {kv_seq} exceeds the bf16 V mirror (v_seq={})",
+                v_shape[2]
+            )));
+        }
+        v_buf.slice(
+            &[0_i32; 4],
+            &[v_shape[0], v_shape[1], kv_seq, v_shape[3]],
+            &[1_i32; 4],
+            device,
+        )
+    }
+
     /// Slice the bf16 K/V mirror to the current `self.offset` so a
     /// shared-KV consumer layer sees the same bf16 prefix the dispatch
     /// kernels operated on.
     ///
     /// Assumes the caller has just successfully dispatched a kernel from
-    /// `try_dispatch_returning_kv`. Both dispatch arms maintain
+    /// `try_dispatch_shared_bf16`. Both dispatch arms maintain
     /// `decode_fp16_k` / `decode_fp16_v` (TurboFlash via `update_decode_fp16`
     /// at `update_and_sdpa_k8v4_flash_inner`; fused-QK via
     /// `update_decode_fp16` inside `try_fused_qk_dispatch`).
@@ -1100,11 +1403,11 @@ impl KvCache {
         let k_f32_empty: Vec<f32> = Vec::new();
         ks.append(&k_f32_empty, &new_shape, new_k, device, max_seq)?;
 
-        // GPU packed view — `None` means buffers not populated (CPU path or
-        // very first call corner cases); fall through to legacy.
-        let Some((codes_arr, scales_arr, rot32_arr)) = ks.gpu_packed_view(device)? else {
+        // GPU buffers not populated (CPU path or very first call corner cases):
+        // fall through to legacy BEFORE any further mutation.
+        if ks.gpu_packed_view(device)?.is_none() {
             return Ok(None);
-        };
+        }
         let k_shape = ks.shape.clone();
         // k_shape = [B, kv_h, S, head_dim].
         if k_shape.len() != 4 {
@@ -1112,10 +1415,7 @@ impl KvCache {
                 "planar_k_fused: K shape rank != 4, got {k_shape:?}"
             )));
         }
-        let b = k_shape[0];
-        let kv_h = k_shape[1];
         let kv_seq = k_shape[2];
-        let head_dim = k_shape[3];
 
         // CRITICAL: advance `self.offset` BEFORE calling
         // `update_decode_fp16_v_only`.  The V-only helper (and the full
@@ -1139,6 +1439,75 @@ impl KvCache {
         // waste an O(seq) bf16 K buffer every decode step.  Mirrors the
         // pattern from `update_iso_k_only_3`/`_4`.
         let v_full = self.update_decode_fp16_v_only(new_v, max_seq, device)?;
+
+        // Past this point the cache is already mutated (store appended, offset
+        // advanced, bf16 V accumulated), so `Ok(None)` is no longer available —
+        // it would send the caller into the legacy `update()` path, which
+        // appends a second time. Every not-eligible condition is screened
+        // above.
+        let out =
+            self.planar_k_flash_over_store(queries, &v_full, scale, additive_mask, kv_seq, device)?;
+        Ok(Some(out))
+    }
+
+    /// Run the PlanarK fused-QK / flash-decode chain over the K already packed
+    /// in this cache's store — no append, no offset advance.
+    ///
+    /// Split out of [`Self::update_and_sdpa_planar_k_fused`] so a shared-KV
+    /// **consumer** layer can attend the producer's store through the exact
+    /// same kernels the producer used, instead of the producer having to
+    /// materialise bf16 K/V for it.
+    ///
+    /// `kv_seq` is the accumulated store length and `v_full` the matching bf16
+    /// V prefix; both come from the caller so producer and consumer read the
+    /// identical window.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "all index uses validated by the shape contracts at function entry"
+    )]
+    fn planar_k_flash_over_store(
+        &self,
+        queries: &Array,
+        v_full: &Array,
+        scale: f32,
+        additive_mask: Option<&Array>,
+        kv_seq: i32,
+        device: Device,
+    ) -> Result<Array> {
+        let KvStorage::PlanarK { k, .. } = &self.storage else {
+            return Err(Error::KvStorageMismatch {
+                expected: "PlanarK",
+                got: storage_variant_name(&self.storage),
+            });
+        };
+        let Some(ks) = k.as_ref() else {
+            return Err(Error::Mlx(
+                "planar_k_fused: K store absent after a maintained append — internal invariant \
+                 violated"
+                    .to_owned(),
+            ));
+        };
+        let Some((codes_arr, scales_arr, rot32_arr)) = ks.gpu_packed_view(device)? else {
+            return Err(Error::Mlx(
+                "planar_k_fused: GPU packed view absent after a maintained append — internal \
+                 invariant violated"
+                    .to_owned(),
+            ));
+        };
+        let k_shape = &ks.shape;
+        if k_shape.len() != 4 {
+            return Err(Error::Mlx(format!(
+                "planar_k_fused: K shape rank != 4, got {k_shape:?}"
+            )));
+        }
+        // The store the packed view was written from is the one source of truth
+        // for the attended length. A divergence would silently attend the wrong
+        // prefix rather than error.
+        Self::check_shared_kv_len(kv_seq, k_shape[2])?;
+        let b = k_shape[0];
+        let kv_h = k_shape[1];
+        let head_dim = k_shape[3];
 
         // Q shape: [B, n_q_heads, q_seq, head_dim].  GQA: heads_per_kv =
         // n_q_heads / kv_h (must divide evenly).
@@ -1179,7 +1548,7 @@ impl KvCache {
                 &codes_arr,
                 &scales_arr,
                 &rot32_arr,
-                &v_full,
+                v_full,
                 additive_mask,
                 b,
                 kv_h,
@@ -1190,12 +1559,11 @@ impl KvCache {
                 scale,
                 device,
             )?;
-            let out = if flash_out.dtype() == queries.dtype() {
-                flash_out
+            return if flash_out.dtype() == queries.dtype() {
+                Ok(flash_out)
             } else {
-                flash_out.astype(queries.dtype(), device)?
+                flash_out.astype(queries.dtype(), device)
             };
-            return Ok(Some(out));
         }
 
         // Pre-softmax scores via fused QK kernel — bits=4 (K-side PlanarK is
@@ -1232,12 +1600,11 @@ impl KvCache {
         let out = out_g.reshape(&[b, n_q_heads, 1, head_dim], device)?;
         // Match the legacy SDPA output dtype (bf16/f16 callers); softmax may
         // have promoted to f32.
-        let out = if out.dtype() == queries.dtype() {
-            out
+        if out.dtype() == queries.dtype() {
+            Ok(out)
         } else {
-            out.astype(queries.dtype(), device)?
-        };
-        Ok(Some(out))
+            out.astype(queries.dtype(), device)
+        }
     }
 
     /// Flash-decode dispatch for the rotor K-only storage variants
@@ -1282,7 +1649,6 @@ impl KvCache {
                 "rotor_k_fused: new_k rank != 4, got {new_shape:?}"
             )));
         }
-        let head_dim = new_shape[3];
         let new_seq = new_shape[2];
 
         // Shape gates — checked BEFORE any mutation so a reject is a clean
@@ -1297,13 +1663,12 @@ impl KvCache {
         let prev_seq = self.offset;
         // Not a rotor K-only cache: the caller's gate should have kept us out.
         // Fall through rather than mutate.
-        let bits = if matches!(self.storage, KvStorage::RotorKOnly3 { .. }) {
-            3_u8
-        } else if matches!(self.storage, KvStorage::RotorKOnly4 { .. }) {
-            4_u8
-        } else {
+        if !matches!(
+            self.storage,
+            KvStorage::RotorKOnly3 { .. } | KvStorage::RotorKOnly4 { .. }
+        ) {
             return Ok(None);
-        };
+        }
         self.rotor_k_gpu_append(new_k, &new_shape, device)?;
 
         // CRITICAL: advance `self.offset` BEFORE `update_decode_fp16_v_only` —
@@ -1333,12 +1698,65 @@ impl KvCache {
         // condition is screened at the call-site gate and by
         // `rotor_flash_shape_ok` BEFORE any mutation; reaching here without a
         // ring means an internal invariant broke, so fail loudly.
+        let out =
+            self.rotor_k_flash_over_store(queries, &v_full, scale, additive_mask, kv_seq, device)?;
+        Ok(Some(out))
+    }
+
+    /// Run the rotor flash-decode kernel over the K already packed in this
+    /// cache's store — no append, no offset advance.
+    ///
+    /// Split out of [`Self::update_and_sdpa_rotor_k_fused`] so a shared-KV
+    /// **consumer** layer can attend the producer's store through the exact
+    /// same kernel the producer used, instead of the producer having to
+    /// materialise bf16 K/V for it.
+    ///
+    /// `kv_seq` is the accumulated store length and `v_full` the matching bf16
+    /// V prefix; both come from the caller so producer and consumer read the
+    /// identical window.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "all index uses validated by the shape contracts at function entry"
+    )]
+    fn rotor_k_flash_over_store(
+        &self,
+        queries: &Array,
+        v_full: &Array,
+        scale: f32,
+        additive_mask: Option<&Array>,
+        kv_seq: i32,
+        device: Device,
+    ) -> Result<Array> {
+        // Select the bit width from the live storage variant. No wildcard arm:
+        // an unexpected variant must not be decoded with another codec's
+        // kernel.
+        let bits: u8 = if matches!(self.storage, KvStorage::RotorKOnly3 { .. }) {
+            3
+        } else if matches!(self.storage, KvStorage::RotorKOnly4 { .. }) {
+            4
+        } else {
+            return Err(Error::KvStorageMismatch {
+                expected: "RotorKOnly3 | RotorKOnly4",
+                got: storage_variant_name(&self.storage),
+            });
+        };
         let Some((codes, scales, norms, rotors)) = self.rotor_k_packed_view(kv_seq, device)? else {
             return Err(Error::Mlx(format!(
                 "rotor_k_fused: GPU ring absent after a maintained append \
                  (kv_seq={kv_seq}, bits={bits}) — internal invariant violated"
             )));
         };
+
+        let v_shape = v_full.shape();
+        if v_shape.len() != 4 {
+            return Err(Error::Mlx(format!(
+                "rotor_k_fused: V rank != 4, got {v_shape:?}"
+            )));
+        }
+        let b = v_shape[0];
+        let kv_h = v_shape[1];
+        let head_dim = v_shape[3];
 
         let q_shape = queries.shape();
         if q_shape.len() != 4 {
@@ -1354,8 +1772,6 @@ impl KvCache {
                 "rotor_k_fused: q_seq must be 1 (decode-only), got {q_seq}"
             )));
         }
-        let b = new_shape[0];
-        let kv_h = new_shape[1];
         if n_q_heads % kv_h != 0 {
             return Err(Error::Mlx(format!(
                 "rotor_k_fused: n_q_heads={n_q_heads} not divisible by kv_h={kv_h}"
@@ -1375,7 +1791,7 @@ impl KvCache {
                 &scales,
                 &norms,
                 &rotors,
-                &v_full,
+                v_full,
                 additive_mask,
                 b,
                 kv_h,
@@ -1391,7 +1807,7 @@ impl KvCache {
                 &scales,
                 &norms,
                 &rotors,
-                &v_full,
+                v_full,
                 additive_mask,
                 b,
                 kv_h,
@@ -1408,12 +1824,11 @@ impl KvCache {
                 )))
             }
         };
-        let out = if flash_out.dtype() == queries.dtype() {
-            flash_out
+        if flash_out.dtype() == queries.dtype() {
+            Ok(flash_out)
         } else {
-            flash_out.astype(queries.dtype(), device)?
-        };
-        Ok(Some(out))
+            flash_out.astype(queries.dtype(), device)
+        }
     }
 
     /// Shape gates for the rotor flash-decode kernel, evaluated before any
@@ -1516,6 +1931,27 @@ fn rotor_k_accumulated_seq(storage: &KvStorage) -> Result<i32> {
     shape.get(2).copied().ok_or_else(|| {
         Error::Mlx(format!(
             "rotor_k_fused: rotor K store shape {shape:?} has no seq axis"
+        ))
+    })
+}
+
+/// Accumulated sequence length held by the active PlanarK store.
+///
+/// Sibling of [`rotor_k_accumulated_seq`], and for the same reason: the store's
+/// own `shape[2]` is the length the packed buffers were written against, so it —
+/// not [`KvCache::offset`] — is what the kernel attends and what a shared-KV
+/// consumer must size its mask from.
+fn planar_k_accumulated_seq(storage: &KvStorage) -> Result<i32> {
+    let KvStorage::PlanarK { k: Some(ks), .. } = storage else {
+        return Err(Error::KvStorageMismatch {
+            expected: "PlanarK with a live K buffer",
+            got: storage_variant_name(storage),
+        });
+    };
+    ks.shape.get(2).copied().ok_or_else(|| {
+        Error::Mlx(format!(
+            "planar_k_fused: PlanarK store shape {:?} has no seq axis",
+            ks.shape
         ))
     })
 }

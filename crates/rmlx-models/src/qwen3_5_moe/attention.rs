@@ -139,7 +139,7 @@ impl FullAttention {
         // Route through `KvCache::update_and_sdpa` —
         // the universal wrapper that fuses cache update + SDPA and dispatches
         // to the Mixed, K8V4-flash, or legacy path based on quant type.
-        // No cross-layer KV sharing in Qwen3.5MoE, so the `_returning_kv`
+        // No cross-layer KV sharing in Qwen3.5MoE, so the `_shared_source`
         // sibling is not needed.
         let attn = if let Some(c) = cache {
             c.update_and_sdpa(

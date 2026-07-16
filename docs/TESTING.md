@@ -242,7 +242,7 @@ axis:
   `update_and_sdpa_planar_k_fused` → `planar_flash_decode_sdpa` chain
   activates. Consults `RMLX_PLANAR_FLASH_DECODE`. Bonsai-only Reachable
   arch (Qwen3.6 MoE rejects PlanarK at validate_resolved; Gemma4 routes
-  through `update_and_sdpa_returning_kv`).
+  through `update_and_sdpa_shared_source`).
 
 Neither family sets its env var directly — the kernel gates are
 `OnceLock`-latched. To compare OFF vs ON, run the shell driver:
@@ -460,7 +460,7 @@ They are read only inside test code (`tests/` and `*_tests.rs` files).
 | `RMLX_NIAH_KV_QUANT` | KV quant name (e.g. `k8v4`) | Override the KV quant used in NIAH long-context harness tests. |
 | `RMLX_APPLE10_STRICT` | `1` | Fail (not warn) on Apple10 head-dim=256 cosine gate below floor. |
 | `RMLX_FUSED_QK_STRICT` | `1` | Fail (not warn) on fused-QK parity tests. |
-| `RMLX_RETURNING_KV_STRICT` | `1` | Fail (not warn) on returning-KV dispatch parity tests. |
+| `RMLX_SHARED_SOURCE_STRICT` | `1` | Fail (not warn) on shared-KV producer dispatch parity tests. |
 | `RMLX_SPARSE_ATTN_STRICT` | `1` | Fail (not warn) on sparse-attn dispatch parity tests. |
 
 ---

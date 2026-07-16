@@ -483,7 +483,7 @@ Identical diagnostic for all four variants with variant name substituted. The co
 **Notes**:
 - Symmetric variants (`rotor3_sym` / `rotor4_sym`) match the corresponding V-only rotor anchors closely (~80–82 Gemma4, ~143–145 Bonsai), confirming the additional K-side rotor encode cost is amortised by the CPU decode path bottleneck.
 - K-only variants (`k_rotor3` / `k_rotor4`) are bottlenecked by the CPU-only rotor K-side decode + optional QJL projection. Bonsai shows wide cross-run variance (run 1 ~40 TPS, run 3 ~49 TPS) due to Metal graph JIT warm-up; Gemma4 is stable (~63–65 TPS). First run should not be treated as a regression floor.
-- **`k_rotor3/4` decode is now a fused MSL flash-decode** over the packed rotor store when `--rotor-qjl off` (`rotor_flash_decode`, see `docs/KV_QUANT.md`); the per-step full-prefix CPU dequant is gone. The anchors above are **not** superseded — they are 2-token short-prompt runs (§ below), where the prefix is empty and the dequant that this kernel removes costs nothing, so they measure a different thing. The kernel's effect scales with prefix length. Measured at a 4k prompt, `--rotor-qjl off`, medians of 3+ runs, before → after: Bonsai-8B `k_rotor3` 1.34 → **17.0**, `k_rotor4` 1.36 → **15.9**; medgemma-4B `k_rotor3` 7.37 → **51.8**, `k_rotor4` 7.34 → **52.1**. The default `--rotor-qjl on` path is unchanged (kernel dormant), as is Gemma4 (`update_and_sdpa_returning_kv` never reaches the kernel).
+- **`k_rotor3/4` decode is now a fused MSL flash-decode** over the packed rotor store when `--rotor-qjl off` (`rotor_flash_decode`, see `docs/KV_QUANT.md`); the per-step full-prefix CPU dequant is gone. The anchors above are **not** superseded — they are 2-token short-prompt runs (§ below), where the prefix is empty and the dequant that this kernel removes costs nothing, so they measure a different thing. The kernel's effect scales with prefix length. Measured at a 4k prompt, `--rotor-qjl off`, medians of 3+ runs, before → after: Bonsai-8B `k_rotor3` 1.34 → **17.0**, `k_rotor4` 1.36 → **15.9**; medgemma-4B `k_rotor3` 7.37 → **51.8**, `k_rotor4` 7.34 → **52.1**. The default `--rotor-qjl on` path is unchanged (kernel dormant), as is Gemma4 (`update_and_sdpa_shared_source` never reaches the kernel).
 - QJL toggle effect on Gemma4 `k_rotor3`: QJL ON = 66.5 TPS, QJL OFF = 73.2 TPS (encode cost). The QJL sideband is correctly stored / round-tripped; cosine lift on reconstructed K is deferred to a follow-up that applies QJL correction at score-time on the SDPA path.
 - All four variants are opt-in only — never an auto baseline.
 - Bonsai long-prompt (10867 tokens) fails with all quant variants (pre-existing SWA-layer zero-chunk bug). Use short prompt for this smoke.
@@ -827,7 +827,7 @@ per-step realloc.
 
 ### H6 — universal-wrapper dispatch — REJECT
 
-The `update_and_sdpa` / `update_and_sdpa_returning_kv` match-arm + indirect call
+The `update_and_sdpa` / `update_and_sdpa_shared_source` match-arm + indirect call
 is single-digit nanoseconds; a Bonsai decode step is ~8.96 ms (millions of ns).
 The wrapper self-time cannot be a measurable share, and the bucket breakdown
 shows decode time is dominated by the forward graph, not dispatch glue.
@@ -869,15 +869,13 @@ Reproduced live on `gemma-4-e4b-it-mxfp8` with `--cache-type-k q8_g128
 > bf16/K8V8/K8V4/Planar for shared-KV layers, or disable layer-KV sharing for
 > this arch.`
 
-emitted from `KvCache::update_and_sdpa_returning_kv` (`kvcache.rs:412`). Gemma4
-genuinely shares KV across layers (`num_kv_shared_layers`, `loader.rs:252-258`),
-and shared-KV layers route through the `returning_kv` path that rejects
-`KvQuant::Mixed`. This is the documented cross-layer-KV-sharing contract behaving correctly. The
-only flaw is *when* it fires — at first prefill (runtime_fail, value 0.00)
-rather than at startup. **ACCEPT** — this is correct-by-design and justifies
-the resolver guard: reject Mixed on the Gemma family at flag resolution and
-exit 78 at startup, so the user sees the error immediately instead of after a
-model load + prefill.
+emitted from the cross-layer-KV producer path. Gemma4 genuinely shares KV across
+layers (`num_kv_shared_layers`, `loader.rs:252-258`), and at the time of this
+run shared-KV layers rejected `KvQuant::Mixed`. **This finding is historical and
+its premise no longer holds**: the `SharedKvIncompatibleWithMixed` rejection was
+removed (`kv_cache/cache_type.rs`) — `KvCache::update_and_sdpa_shared_source`
+supports Mixed via dequant-before-share, so the combination is now valid and no
+resolver guard is needed. Kept for the record of what was measured.
 
 ### H9 — decode forward NOT compiled — characterized (NOT a catastrophe)
 
@@ -1138,7 +1136,7 @@ single-kernel trade-off. A follow-up generalises the contract to other codecs.
   Bonsai is the **sole reachable arch** for `planar_flash_decode_sdpa` today:
   Qwen3.6 MoE rejects `KvQuant::PlanarK` outright at `validate_resolved`
   (Contract A.y, `QwenMoePlanarKRejected`), and Gemma4 routes its
-  attention layer through `update_and_sdpa_returning_kv` for cross-layer KV
+  attention layer through `update_and_sdpa_shared_source` for cross-layer KV
   sharing (same shape as the `Unreachable TurboFlash` case).
 - Forced `--kv-quant planar` (resolves to `KvQuant::PlanarK`).
 - `--max-tokens 100`, `--max-ctx 8192` (4k prompt) / `--max-ctx 16384` (8k prompt).

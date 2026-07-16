@@ -50,6 +50,7 @@ mod fused_qk_dispatch;
 mod fused_qk_shadow;
 mod helpers;
 mod sdpa;
+mod shared_kv;
 mod update;
 
 // Warm-TTFT shortcut regression for PlanarK.
@@ -64,8 +65,13 @@ mod warm_ttft_cross_codec_tests;
 
 // Cross-layer-KV producer dispatch-chain extension.
 #[cfg(test)]
-#[path = "returning_kv_tests.rs"]
-mod returning_kv_tests;
+#[path = "shared_source_tests.rs"]
+mod shared_source_tests;
+
+// Shared-KV consumers attend the producer's quant store, not a bf16 dequant.
+#[cfg(test)]
+#[path = "shared_kv_tests.rs"]
+mod shared_kv_tests;
 
 // Dynamic grow + hard cap for `update_prefill_raw`.
 #[cfg(test)]
@@ -95,6 +101,7 @@ mod rotor_flash_dispatch_tests;
 
 pub use core::KvCache;
 pub use fused_qk_dispatch::fused_qk_total_dispatch_count;
+pub use shared_kv::SharedKv;
 // `FusedQkLayout` / `FusedQkShadow` are crate-internal
 // only; they carry mlx-rs `Array` in their storage and would leak the
 // upstream type if exposed. Downstream callers don't need them — the
