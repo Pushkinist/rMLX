@@ -389,47 +389,14 @@ fn builder_rejects_a_record_ingest_would_reject() {
     assert!(matches!(err, Error::NoMeasurements), "got {err:?}");
 }
 
-// ── kv_quant allow-list coverage (all codecs, full record ingest) ────────────
+// ── kv_quant is a free-form recorded label, full record ingest ───────────────
 
-/// A full record ingests (not just `canonicalize_kv_quant` in isolation) for
-/// every one of the 25 unit-variant `KvQuant` Display tokens. Reproduces the
-/// real-world drop: rotation/sym/planar/turbo codec rows were rejected at
-/// `RunRecord::validate()`, not just at the bare string-canonicalize call.
+/// A couple of real rotation-family codec names — the exact class the old
+/// hand-maintained allow-list dropped — ingest fine at the full-record
+/// level (not just the bare `canonicalize_kv_quant` call).
 #[test]
-fn record_ingests_for_every_unit_variant_kv_quant_codec() {
-    let tokens = [
-        "none",
-        "k8v4",
-        "k8v8",
-        "planar",
-        "planar3",
-        "planar_k",
-        "k8vturbo3",
-        "k8vturbo3tcq",
-        "k8vturbo2",
-        "k8vturbo2tcq",
-        "tsym3",
-        "tsym4",
-        "iso3",
-        "iso4",
-        "iso3_sym",
-        "iso4_sym",
-        "k_iso3",
-        "k_iso4",
-        "rotor3",
-        "rotor4",
-        "rotor3_sym",
-        "rotor4_sym",
-        "k_rotor3",
-        "k_rotor4",
-        "rot_k_tq4v",
-    ];
-    assert_eq!(
-        tokens.len(),
-        25,
-        "keep in sync with the 25 unit KvQuant variants"
-    );
-    for token in tokens {
+fn record_ingests_for_real_rotation_codec_names() {
+    for token in ["rotor4_sym", "k_rotor3"] {
         let mut r = valid_record();
         r.kv_quant = token.to_string();
         r.validate()
@@ -437,20 +404,38 @@ fn record_ingests_for_every_unit_variant_kv_quant_codec() {
     }
 }
 
-/// Payload-bearing `KvQuant` Display forms also ingest end-to-end.
+/// The core of the fix: a full record with a `kv_quant` token this binary
+/// has never heard of — a codec that does not exist yet, a typo, anything —
+/// still ingests. No allow-list, no drift; `is_valid_kv_quant_token`-style
+/// grammar mirrors are gone for good.
 #[test]
-fn record_ingests_for_payload_bearing_kv_quant_codecs() {
-    for token in [
-        "mixed_k8g128_v4g64",
-        "rot_k_v4g64",
-        "rotor_k_3_asym_v4_g128",
-        "rotor_k_4_asym_v3_g64",
-    ] {
+fn record_ingests_with_unknown_kv_quant_token() {
+    let mut r = valid_record();
+    r.kv_quant = "some_future_codec_v9".to_string();
+    r.validate().unwrap();
+}
+
+/// `bf16`/`f16` still alias to `none` at the full-record level.
+#[test]
+fn record_kv_quant_bf16_alias_still_normalizes() {
+    for alias in ["bf16", "f16"] {
         let mut r = valid_record();
-        r.kv_quant = token.to_string();
+        r.kv_quant = alias.to_string();
         r.validate()
-            .unwrap_or_else(|e| panic!("kv_quant {token:?} rejected: {e}"));
+            .unwrap_or_else(|e| panic!("kv_quant {alias:?} rejected: {e}"));
     }
+}
+
+// ── model_namespace is a free-form recorded label too ────────────────────────
+
+/// An unrecognized `model_namespace` — a new model host, a typo, a local
+/// finetune — must still record. Same footgun class as kv_quant: a fixed
+/// whitelist on a free-form recorded label silently drops valid rows.
+#[test]
+fn record_ingests_with_unknown_model_namespace() {
+    let mut r = valid_record();
+    r.model_namespace = "some-new-model-host".to_string();
+    r.validate().unwrap();
 }
 
 // ── §8.5 CBB record shape (`model` / `model_id` tolerance) ───────────────────

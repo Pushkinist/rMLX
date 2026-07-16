@@ -165,32 +165,7 @@ fn canonicalize_weight_quant_passthrough_lowercase() {
     assert_eq!(result, "mxfp8");
 }
 
-#[test]
-fn canonicalize_kv_quant_unknown_errors() {
-    let err = canonicalize_kv_quant("kx99").unwrap_err();
-    match err {
-        Error::IdentityNotInWhitelist { field, value, .. } => {
-            assert_eq!(field, "kv_quant");
-            assert_eq!(value, "kx99");
-        }
-        Error::MissingBackendVersion { .. }
-        | Error::Sqlite(_)
-        | Error::Io(_)
-        | Error::Schema(_)
-        | Error::IdentityModelPath(_)
-        | Error::UnknownMetric(_)
-        | Error::UnknownDirection(_)
-        | Error::InvalidTimestamp(_)
-        | Error::InvalidPrompt(_)
-        | Error::NoMeasurements
-        | Error::InvalidIngestField { .. }
-        | Error::Recorder(_)
-        | Error::Query(_)
-        | Error::Scope(_) => panic!("unexpected error: {err}"),
-    }
-}
-
-// --- canonicalize_kv_quant ---
+// --- canonicalize_kv_quant (permissive: free-form label, no whitelist) ---
 
 #[test]
 fn canonicalize_kv_quant_none_passes_through() {
@@ -201,6 +176,12 @@ fn canonicalize_kv_quant_none_passes_through() {
 fn canonicalize_kv_quant_bf16_alias_canonicalizes_to_none() {
     assert_eq!(canonicalize_kv_quant("bf16").unwrap(), "none");
     assert_eq!(canonicalize_kv_quant("f16").unwrap(), "none");
+}
+
+#[test]
+fn canonicalize_kv_quant_rotor_v_alias_canonicalizes() {
+    assert_eq!(canonicalize_kv_quant("rotor_v_3").unwrap(), "rotor3");
+    assert_eq!(canonicalize_kv_quant("rotor_v_4").unwrap(), "rotor4");
 }
 
 #[test]
@@ -216,8 +197,37 @@ fn canonicalize_kv_quant_legacy_turbo() {
     assert_eq!(canonicalize_kv_quant("turbo8").unwrap(), "turbo8");
 }
 
+/// A couple of real rotation-family codec names — the exact class the
+/// old hand-maintained allow-list dropped — record fine, verbatim.
 #[test]
-fn canonicalize_kv_quant_mixed_long_form() {
+fn canonicalize_kv_quant_real_rotation_codec_names_pass_through() {
+    assert_eq!(canonicalize_kv_quant("rotor4_sym").unwrap(), "rotor4_sym");
+    assert_eq!(canonicalize_kv_quant("k_rotor3").unwrap(), "k_rotor3");
+}
+
+/// The core of the fix: an arbitrary token this binary has never heard of
+/// — a codec that does not exist yet, a typo, anything — is recorded
+/// verbatim (lowercased) instead of rejected. No allow-list, no drift.
+#[test]
+fn canonicalize_kv_quant_unknown_token_records_verbatim() {
+    assert_eq!(
+        canonicalize_kv_quant("some_future_codec_v9").unwrap(),
+        "some_future_codec_v9"
+    );
+    assert_eq!(
+        canonicalize_kv_quant("Some_Future_Codec_V9").unwrap(),
+        "some_future_codec_v9"
+    );
+    assert_eq!(canonicalize_kv_quant("kx99").unwrap(), "kx99");
+}
+
+#[test]
+fn canonicalize_kv_quant_lowercases_and_trims() {
+    assert_eq!(canonicalize_kv_quant("  K8V4  ").unwrap(), "k8v4");
+}
+
+#[test]
+fn canonicalize_kv_quant_mixed_long_form_passes_through() {
     assert_eq!(
         canonicalize_kv_quant("mixed_k8g128_v4g64").unwrap(),
         "mixed_k8g128_v4g64"
@@ -228,91 +238,13 @@ fn canonicalize_kv_quant_mixed_long_form() {
     );
 }
 
+/// Previously-"malformed" `mixed_*` shapes no longer error — they are just
+/// another free-form label now, recorded verbatim.
 #[test]
-fn canonicalize_kv_quant_malformed_mixed_errors() {
-    assert!(canonicalize_kv_quant("mixed_garbage").is_err());
-    assert!(canonicalize_kv_quant("mixed_k8_v4").is_err());
-    assert!(canonicalize_kv_quant("mixed_x8g64_v4g64").is_err());
-}
-
-/// Every unit-variant `<KvQuant as Display>` token accepted without
-/// rejection (issue: the drainer allow-list was a stale hand-maintained
-/// mirror missing the rotation/sym/planar/turbo families). One entry per
-/// unit variant declared in `crates/rmlx-kv-quant/src/quant.rs`, excluding
-/// the four payload-bearing variants (`Mixed`, `RotK`, `RotorK3Asym`,
-/// `RotorK4Asym`) covered separately below.
-#[test]
-fn canonicalize_kv_quant_accepts_all_unit_variant_tokens() {
-    let tokens = [
-        "none",
-        "k8v4",
-        "k8v8",
-        "planar",
-        "planar3",
-        "planar_k",
-        "k8vturbo3",
-        "k8vturbo3tcq",
-        "k8vturbo2",
-        "k8vturbo2tcq",
-        "tsym3",
-        "tsym4",
-        "iso3",
-        "iso4",
-        "iso3_sym",
-        "iso4_sym",
-        "k_iso3",
-        "k_iso4",
-        "rotor3",
-        "rotor4",
-        "rotor3_sym",
-        "rotor4_sym",
-        "k_rotor3",
-        "k_rotor4",
-        "rot_k_tq4v",
-    ];
+fn canonicalize_kv_quant_malformed_mixed_records_verbatim() {
     assert_eq!(
-        tokens.len(),
-        25,
-        "keep in sync with the 25 unit KvQuant variants"
+        canonicalize_kv_quant("mixed_garbage").unwrap(),
+        "mixed_garbage"
     );
-    for token in tokens {
-        assert_eq!(
-            canonicalize_kv_quant(token).unwrap_or_else(|e| panic!("{token} rejected: {e}")),
-            token,
-            "token {token} did not canonicalize to itself"
-        );
-    }
-}
-
-/// The four payload-bearing `KvQuant` Display forms parse structurally
-/// (bits/group digits), mirroring `RotK` / `RotorK3Asym` / `RotorK4Asym`
-/// which the pre-fix allow-list did not accept at all.
-#[test]
-fn canonicalize_kv_quant_accepts_payload_variant_samples() {
-    for token in [
-        "mixed_k8g128_v4g64",
-        "rot_k_v4g64",
-        "rot_k_v8g128",
-        "rotor_k_3_asym_v4_g128",
-        "rotor_k_4_asym_v3_g64",
-    ] {
-        assert_eq!(
-            canonicalize_kv_quant(token).unwrap_or_else(|e| panic!("{token} rejected: {e}")),
-            token
-        );
-    }
-}
-
-#[test]
-fn canonicalize_kv_quant_rotor_v_alias_canonicalizes() {
-    assert_eq!(canonicalize_kv_quant("rotor_v_3").unwrap(), "rotor3");
-    assert_eq!(canonicalize_kv_quant("rotor_v_4").unwrap(), "rotor4");
-}
-
-#[test]
-fn canonicalize_kv_quant_malformed_rot_k_and_rotor_k_asym_errors() {
-    assert!(canonicalize_kv_quant("rot_k_v4").is_err());
-    assert!(canonicalize_kv_quant("rot_k_vxg64").is_err());
-    assert!(canonicalize_kv_quant("rotor_k_5_asym_v4_g128").is_err());
-    assert!(canonicalize_kv_quant("rotor_k_3_asym_v4g128").is_err());
+    assert_eq!(canonicalize_kv_quant("mixed_k8_v4").unwrap(), "mixed_k8_v4");
 }

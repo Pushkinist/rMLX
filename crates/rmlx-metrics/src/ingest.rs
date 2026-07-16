@@ -268,8 +268,11 @@ pub(crate) enum IdentityPolicy {
 // ── RunRecord impl ────────────────────────────────────────────────────────────
 
 impl RunRecord {
-    /// Validates per §8.5 required fields + §4 metric registry + §5 whitelists,
-    /// enforcing the run-identity contract ([`IdentityPolicy::Enforce`]).
+    /// Validates per §8.5 required fields + §4 metric registry + §5
+    /// whitelists (`backend`, `weight_quant`), enforcing the run-identity
+    /// contract ([`IdentityPolicy::Enforce`]). `model_namespace`, `model`,
+    /// and `kv_quant` are free-form recorded labels, not whitelisted — see
+    /// `identity::canonicalize_kv_quant`.
     ///
     /// Does NOT touch the DB. Returns `Ok(())` if the record is structurally
     /// accepted; returns the first specific error encountered otherwise.
@@ -316,12 +319,12 @@ impl RunRecord {
             }
         }
 
-        // model_namespace
-        identity::canonicalize(
-            "model_namespace",
-            &self.model_namespace,
-            identity::NAMESPACE_WHITELIST,
-        )?;
+        // model_namespace / model: free-form recorded labels, same as
+        // kv_quant (see `identity::canonicalize_kv_quant`) — not validated
+        // against `NAMESPACE_WHITELIST`. An unrecognized namespace (a new
+        // model host, a typo, a local finetune) must still record, not
+        // silently drop into `metrics/buffer/failed/`. `model` was already
+        // unchecked here; `model_namespace` now matches it.
 
         // weight_quant
         identity::canonicalize(
@@ -330,7 +333,9 @@ impl RunRecord {
             identity::WEIGHT_QUANT_WHITELIST,
         )?;
 
-        // kv_quant: parser-based validation accepts `mixed_k<>g<>_v<>g<>`.
+        // kv_quant: free-form recorded label, not validated — see
+        // `identity::canonicalize_kv_quant`. Always `Ok`; called for the
+        // alias normalization (`bf16`/`f16` → `none`), not as a gate.
         identity::canonicalize_kv_quant(&self.kv_quant)?;
 
         // ctx_max

@@ -461,7 +461,9 @@ Parser rules (filesystem layout `<root>/<namespace>__<model>` or `<root>/<namesp
 | HF id `meta-llama/Llama-3.2-3B-Instruct`                                           | `hf`              | `meta-llama/Llama-3.2-3B-Instruct`   |
 | local fine-tune `<root>/my-finetune-v1`                                            | `local`           | `my-finetune-v1`                     |
 
-Namespace whitelist (extend by editing this section): `mlx-community`, `z-lab`, `prism-ml`, `paramind`, `paro-team`, `ollama`, `hf`, `local`.
+Known namespaces (extend by editing `identity::NAMESPACE_WHITELIST`): `mlx-community`, `z-lab`, `prism-ml`, `paramind`, `paro-team`, `ollama`, `hf`, `local`. This list is consulted by `identity::split_model_path` — the strict path-splitting helper `rmlx baseline` / `rmlx eval` / legacy migration use when deriving a namespace from a caller-supplied path, where an unrecognized namespace is a genuine "I could not parse this path" error the caller can act on.
+
+**`model` and `model_namespace` are otherwise free-form recorded labels, same as `kv_quant` (§5.3).** The §8.5 ingest gate (`RunRecord::validate`) does not check either against a whitelist — an unrecognized namespace (a new model host, a typo, a local finetune someone renamed) still records rather than silently dropping into `metrics/buffer/failed/`. Only `split_model_path`'s stricter, opt-in path-derivation keeps whitelist-based rejection, because there the caller receives the error directly and can fix the input, instead of a record vanishing from an unattended bench run.
 
 Why a separate column rather than baking into the string:
 - Query "all `mlx-community` repackagings of Qwen3.6-35B" trivially.
@@ -474,9 +476,15 @@ Lowercase, no spaces. Match the cell-naming convention in `BENCHMARK_CHAMPIONS.m
 
 ### 5.3 `kv_quant` canonicalization
 
-Match runtime flag (`--kv-quant`), lowercase. Every `<KvQuant as Display>` token from `crates/rmlx-kv-quant/src/quant.rs` is accepted: the 25 unit-variant forms (`none`, `k8v4`, `k8v8`, `planar`, `planar3`, `planar_k`, `k8vturbo3`, `k8vturbo3tcq`, `k8vturbo2`, `k8vturbo2tcq`, `tsym3`, `tsym4`, `iso3`, `iso4`, `iso3_sym`, `iso4_sym`, `k_iso3`, `k_iso4`, `rotor3`, `rotor4`, `rotor3_sym`, `rotor4_sym`, `k_rotor3`, `k_rotor4`, `rot_k_tq4v`), the payload-bearing forms parsed structurally (`mixed_k<kb>g<kg>_v<vb>g<vg>`, `rot_k_v<vb>g<vg>`, `rotor_k_<3|4>_asym_v<vb>_g<vg>`), plus the aliases `bf16`/`f16` → `none`, `rotor_v_3`/`rotor_v_4` → `rotor3`/`rotor4`, and the legacy labels `turbo4`/`turbo8`.
+`kv_quant` is a **free-form recorded label, not validated against a fixed codec set**. `rmlx_metrics::identity::canonicalize_kv_quant` lowercases/trims the input and normalizes a tiny, stable set of aliases — `bf16`/`f16` → `none`, `rotor_v_3`/`rotor_v_4` → `rotor3`/`rotor4` — then records everything else, including a codec name this binary has never heard of, verbatim.
 
-**Drift guard.** `rmlx-metrics` must not depend on `rmlx-kv-quant` (Ask-before dep edge — see CLAUDE.md workspace dep graph), so `rmlx_metrics::identity::canonicalize_kv_quant` hand-mirrors this grammar as plain string matching instead of importing the `KvQuant` enum. `rmlx-models` (the one crate depending on both) carries a test — `crates/rmlx-models/src/kv_cache/metrics_identity_tests.rs` — that builds one instance of every `KvQuant` variant via `KvQuant::one_of_each_variant()` and asserts the metrics-side mirror accepts each `Display` form. Adding a `KvQuant` variant without updating `is_valid_kv_quant_token` in `crates/rmlx-metrics/src/identity.rs` fails that test.
+This is deliberate, not an oversight. An earlier version of this function hand-mirrored the closed `KvQuant` enum grammar (`crates/rmlx-kv-quant/src/quant.rs`) as an allow-list; `rmlx-metrics` must not depend on `rmlx-kv-quant` (Ask-before dep edge — see CLAUDE.md workspace dep graph), so that mirror could only ever be a hand-maintained copy, and it went stale the moment a new codec shipped, silently dropping every metrics row for it. There is no fix to "mirror it better" — any fixed allow-list on a free-form recorded label re-introduces the same drift. The metrics DB is a measurement log, not a type-checker for the codec registry; an unrecognized `kv_quant` value is exactly as valid a data point as a recognized one, and a typo is caught by eyeballing `rmlx metrics doctor` / query output, not by rejecting the row at ingest.
+
+The same reasoning applies to `model` and `model_namespace` — see §5.1.
+
+### 5.3.1 Legacy note
+
+Earlier revisions of this document described `kv_quant` as validated against a fixed list (`none`, `k8v4`, `k8v8`, `planar`, `turbo4`, `turbo8`, `mixed_k<kb>g<kg>_v<vb>g<vg>`) and, briefly, against the full `KvQuant` Display grammar with a cross-crate drift-guard test. Both were removed — the whitelist for silently dropping valid rows, the drift-guard because it kept the same enum coupling in a different shape (the moment a codec's `Display` form changed or a new one was added without a corresponding `rmlx-models` test update, rows would drop again). `canonicalize_kv_quant` is now the single, permanent implementation.
 
 ### 5.4 `backend` whitelist
 
@@ -911,10 +919,10 @@ Single JSON object per run. The recorder fans out into N `observations` rows (on
 | Field             | Why                                                      |
 |-------------------|----------------------------------------------------------|
 | `backend`         | PK column, must be in §5.4 whitelist                     |
-| `model_namespace` | PK column, must be in §5.1 whitelist                     |
-| `model`           | PK column. `model_id` accepted as a deserialize alias    |
-| `weight_quant`    | PK column                                                |
-| `kv_quant`        | PK column                                                |
+| `model_namespace` | PK column, free-form label (§5.1) — not whitelist-checked here |
+| `model`           | PK column, free-form label. `model_id` accepted as a deserialize alias |
+| `weight_quant`    | PK column, must be in §5.2 whitelist                     |
+| `kv_quant`        | PK column, free-form label (§5.3) — not whitelist-checked |
 | `ctx_max`         | PK column                                                |
 | `prompt`          | PK column (resolved/inserted in `prompts` first)         |
 | `ts_utc`          | provenance, ISO-8601 UTC                                 |
