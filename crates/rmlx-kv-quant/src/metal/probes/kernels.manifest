@@ -36,7 +36,11 @@ planarquant_dequantize_v3.metal | planarquant_v3.hdr.metal | codes:u,scales:f,ro
 q8_fused_qk.metal | - | query:f,codes:u,scales:f,mask:f,scale_arr:f,dims:u,out:f
 q8_quantize.metal | - | inp:f,codes:u,scales:f
 q8_dequantize.metal | - | codes:u,scales:f,out:f
-rot_k_fwht_quantize_d32.metal | rot_k.hdr.metal | inp:f,out_codes:u,out_scales:f,out_biases:f
+# No rot_k_fwht_quantize_d32: a 32-element row is shorter than the affine group size
+# (64), so the kernel's per-group SMEM would be a zero-length array — MSL that does not
+# compile. That shape is rejected in Rust (build_fwht_quantize_body returns Err) and the
+# caller falls back to the matmul path, so no d32 quantize kernel exists to probe.
+# Rotation has no group structure, so rot_k_fwht_rotate_d32 is real and is probed below.
 rot_k_fwht_quantize_d64.metal | rot_k.hdr.metal | inp:f,out_codes:u,out_scales:f,out_biases:f
 rot_k_fwht_quantize_d128.metal | rot_k.hdr.metal | inp:f,out_codes:u,out_scales:f,out_biases:f
 rot_k_fwht_quantize_d256.metal | rot_k.hdr.metal | inp:f,out_codes:u,out_scales:f,out_biases:f

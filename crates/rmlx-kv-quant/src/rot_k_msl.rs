@@ -117,9 +117,17 @@ pub fn rot_k_fused_enabled() -> bool {
 ///
 /// All must be powers of two; each requires its own kernel specialization
 /// because the Metal threadgroup size equals D (static per dispatch).
+///
+/// Rotation accepts every value here. The fused quantize additionally needs a
+/// row to hold at least one whole affine group, so it rejects any `D` smaller
+/// than [`FWHT_QUANT_GROUP_SIZE`] — see [`build_fwht_quantize_body`].
 const SUPPORTED_D: &[usize] = &[32, 64, 128, 256, 512];
 
-/// Returns `true` iff `d` is a supported FWHT kernel dimension.
+/// Returns `true` iff `d` is a supported FWHT *rotation* dimension.
+///
+/// Not sufficient for the fused quantize, which also requires
+/// `d % FWHT_QUANT_GROUP_SIZE == 0`; [`rot_k_fwht_quantize_gpu`] rejects the
+/// rest with a shape error, and its caller falls back to the matmul path.
 pub fn is_supported_d(d: usize) -> bool {
     SUPPORTED_D.contains(&d)
 }
@@ -159,17 +167,39 @@ pub const FWHT_QUANT_GROUP_SIZE: usize = 64;
 /// - Each thread quantizes its element to [0,255].
 /// 5. Pack 4 int8 codes per u32 via atomic OR (LSB-first).
 /// 6. lidg==0 writes scale and bias.
-fn build_fwht_quantize_body(d: usize) -> String {
+///
+/// # Errors
+///
+/// Returns [`Error::Quant`] when `d` is not a positive multiple of
+/// [`FWHT_QUANT_GROUP_SIZE`], or when no kernel specialization exists for it.
+fn build_fwht_quantize_body(d: usize) -> Result<String> {
     let gs = FWHT_QUANT_GROUP_SIZE;
-    debug_assert!(d.is_power_of_two() && d >= 32 && d.is_multiple_of(gs) && d.is_multiple_of(4));
-    match d {
-        32 => include_str!("metal/rot_k_fwht_quantize_d32.metal"),
+    // A row must hold at least one whole affine group: the kernel sizes its
+    // per-group SMEM as `grp_max[d / gs]`, so a row shorter than one group
+    // emits a zero-length threadgroup array, which is not valid MSL and fails
+    // at shader compile. Reject the shape here rather than assert it — a
+    // debug_assert is compiled out of release, which is precisely where the
+    // broken shader would reach the GPU.
+    let groups_per_row = d / gs;
+    if !d.is_multiple_of(gs) || groups_per_row == 0 {
+        return Err(Error::Quant(format!(
+            "rot_k FWHT quantize: head_dim {d} must be a positive multiple of the affine \
+             group size {gs} ({groups_per_row} whole groups per row)"
+        )));
+    }
+    debug_assert!(d.is_power_of_two() && d.is_multiple_of(4));
+    Ok(match d {
         64 => include_str!("metal/rot_k_fwht_quantize_d64.metal"),
         128 => include_str!("metal/rot_k_fwht_quantize_d128.metal"),
         256 => include_str!("metal/rot_k_fwht_quantize_d256.metal"),
-        _ => include_str!("metal/rot_k_fwht_quantize_d512.metal"),
+        512 => include_str!("metal/rot_k_fwht_quantize_d512.metal"),
+        _ => {
+            return Err(Error::Quant(format!(
+                "rot_k FWHT quantize: no kernel specialization for head_dim {d}"
+            )))
+        }
     }
-    .to_owned()
+    .to_owned())
 }
 
 /// Build the MSL body for the FWHT rotate-only kernel (Q pre-rotation).
@@ -185,10 +215,12 @@ fn build_fwht_rotate_body(d: usize) -> String {
     .to_owned()
 }
 
-// ---- Kernel singletons (one per supported D for quantize; one per D for rotate) --
+// ---- Kernel singletons (one per D that holds whole affine groups for quantize;
+// ---- one per supported D for rotate) ----------------------------------------
 
 struct FwhtKernels {
-    quantize_d32: OnceLock<Result<MetalKernel>>,
+    // No quantize_d32: a 32-element row is shorter than one affine group, so
+    // that specialization is a rejected shape rather than a kernel.
     quantize_d64: OnceLock<Result<MetalKernel>>,
     quantize_d128: OnceLock<Result<MetalKernel>>,
     quantize_d256: OnceLock<Result<MetalKernel>>,
@@ -205,7 +237,6 @@ struct FwhtKernels {
 // which is documented in metal_kernel.rs). Static means one instance per
 // process, matching the single-MLX-process requirement (CLAUDE.md hard rule 8).
 static FWHT_KERNELS: FwhtKernels = FwhtKernels {
-    quantize_d32: OnceLock::new(),
     quantize_d64: OnceLock::new(),
     quantize_d128: OnceLock::new(),
     quantize_d256: OnceLock::new(),
@@ -219,19 +250,19 @@ static FWHT_KERNELS: FwhtKernels = FwhtKernels {
 
 fn quant_kernel_for_d(d: usize) -> Result<&'static MetalKernel> {
     let cell = match d {
-        32 => &FWHT_KERNELS.quantize_d32,
         64 => &FWHT_KERNELS.quantize_d64,
         128 => &FWHT_KERNELS.quantize_d128,
         256 => &FWHT_KERNELS.quantize_d256,
         512 => &FWHT_KERNELS.quantize_d512,
         _ => {
-            return Err(Error::Mlx(format!(
-                "rot_k_msl: unsupported D={d} for FWHT quantize kernel"
+            return Err(Error::Quant(format!(
+                "rot_k_msl: no FWHT quantize kernel for head_dim {d}; each row must hold a \
+                 whole number of affine groups of {FWHT_QUANT_GROUP_SIZE}"
             )))
         }
     };
     cell.get_or_init(|| {
-        let body = build_fwht_quantize_body(d);
+        let body = build_fwht_quantize_body(d)?;
         MetalKernel::new(
             &format!("rmlx_rot_k_fwht_q8_d{d}"),
             kernel_header(),
