@@ -46,73 +46,14 @@ const THREADS_PER_GROUP: usize = WORDS_PER_GROUP;
 
 // MSL body: q8_0 quantize.
 // Grid: (n_groups * 32, 1, 1). Threadgroup: (32, 1, 1).
-const QUANTIZE_SOURCE: &str = r"
-    uint group_id = threadgroup_position_in_grid.x;
-    uint tid      = thread_position_in_threadgroup.x;  // 0..31
-
-    uint base = group_id * 128u + tid * 4u;
-
-    float x0 = inp[base + 0u];
-    float x1 = inp[base + 1u];
-    float x2 = inp[base + 2u];
-    float x3 = inp[base + 3u];
-
-    float local_max = max(max(abs(x0), abs(x1)), max(abs(x2), abs(x3)));
-
-    threadgroup float partial[32];
-    partial[tid] = local_max;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = 16u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            partial[tid] = max(partial[tid], partial[tid + stride]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float abs_max = partial[0];
-
-    float scale = (abs_max > 0.0f) ? (abs_max / 127.0f) : 0.0f;
-    if (tid == 0u) {
-        scales[group_id] = scale;
-    }
-
-    float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
-
-    int q0 = (int)clamp(rint(x0 * inv_scale), -128.0f, 127.0f);
-    int q1 = (int)clamp(rint(x1 * inv_scale), -128.0f, 127.0f);
-    int q2 = (int)clamp(rint(x2 * inv_scale), -128.0f, 127.0f);
-    int q3 = (int)clamp(rint(x3 * inv_scale), -128.0f, 127.0f);
-
-    uint b0 = (uint)(q0 & 0xFF);
-    uint b1 = (uint)(q1 & 0xFF);
-    uint b2 = (uint)(q2 & 0xFF);
-    uint b3 = (uint)(q3 & 0xFF);
-
-    uint word = b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u);
-    codes[group_id * 32u + tid] = word;
-";
+const QUANTIZE_SOURCE: &str = include_str!("metal/q8_quantize.metal");
 
 // MSL body: q8_0 dequantize.
 // Grid: (n_groups * 128, 1, 1). Threadgroup: (128, 1, 1).
 //
 // Templated on OutT so we can write directly to bf16 / f16 / f32 without a
 // follow-up astype kernel (saves one elementwise pass per layer per step).
-const DEQUANTIZE_SOURCE: &str = r"
-    uint gid      = thread_position_in_grid.x;
-    uint group_id = gid / 128u;
-    uint elem     = gid % 128u;
-
-    uint word_idx = group_id * 32u + (elem / 4u);
-    uint byte_pos = elem & 3u;
-    uint word     = codes[word_idx];
-    uint raw_byte = (word >> (byte_pos * 8u)) & 0xFFu;
-
-    int code = (int)raw_byte;
-    if (code & 0x80) { code -= 256; }
-
-    float scale = scales[group_id];
-    out[gid] = static_cast<OutT>(scale * (float)code);
-";
+const DEQUANTIZE_SOURCE: &str = include_str!("metal/q8_dequantize.metal");
 
 static QUANT_KERNEL: OnceLock<Result<MetalKernel>> = OnceLock::new();
 static DEQUANT_KERNEL: OnceLock<Result<MetalKernel>> = OnceLock::new();
