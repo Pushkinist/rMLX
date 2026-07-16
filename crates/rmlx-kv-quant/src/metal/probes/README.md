@@ -35,26 +35,49 @@ Codecs whose header is already a static file (`../turboquant_header.metal`,
 `../turbo_flash_header.metal`, …) are referenced directly from the manifest with
 a `../` prefix and need no snapshot here.
 
-## Refreshing a `*.hdr.metal` snapshot
+## Snapshots are pinned to their builders
 
-These are captured output, not hand-written. They only need refreshing when a
-Rust header builder changes what it emits. A stale snapshot surfaces as a probe
-compile failure naming the codec (typically an undeclared constant), so the gate
-tells you when it happened.
-
-To refresh, dump the builder's output for the codec in question. Add a temporary
-test to that module's sibling `*_tests.rs` (which can reach the private builder):
+These are captured output, not hand-written, so they can drift from the Rust
+builder that produced them. Every one is pinned by an equality test in the
+owning module's sibling `*_tests.rs` (`hdr_probe_snapshot*_match*_builder*`):
 
 ```rust
+assert_eq!(kernel_header(), include_str!("metal/probes/rot_k.hdr.metal"));
+```
+
+A builder that changes what it emits then fails `cargo test -p rmlx-kv-quant`
+with `stale snapshot: refresh <file>`. That test is what keeps a snapshot
+honest — the compile gate alone would only notice a constant being **added or
+renamed**. A changed *value*, or a *removed* constant, still compiles, so
+without the equality test the gate would keep passing while validating text the
+builders no longer emit.
+
+For the same reason the whitespace pre-commit hooks skip `*.hdr.metal`
+(see `.pre-commit-config.yaml`): trimming a captured trailing space would edit
+the capture out from under its test.
+
+## Refreshing a snapshot
+
+When a builder legitimately changes, refresh the capture by temporarily turning
+its guard into a writer, in the module's sibling `*_tests.rs`:
+
+```rust
+#[allow(clippy::unwrap_used, reason = "temporary snapshot refresh; removed before commit")]
 #[test]
-fn dump_header_tmp() {
-    std::fs::write("<path>/probes/<codec>.hdr.metal", build_<codec>_header(<bits>)).unwrap();
+fn refresh_snapshot_tmp() {
+    std::fs::write(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/src/metal/probes/rot_k.hdr.metal"),
+        kernel_header(),
+    )
+    .unwrap();
 }
 ```
 
-run `cargo test -p rmlx-kv-quant dump_header_tmp`, then remove the temporary
-test. The `bits` / parameter value to pass is whichever variant the manifest
-line names (e.g. `iso_fused_qk_b3.hdr.metal` ← `build_iso_fused_qk_header(3)`).
+Run `cargo test -p rmlx-kv-quant refresh_snapshot_tmp`, remove the temporary
+test, then re-run the guard to confirm it passes. `unwrap_used` is denied
+workspace-wide (tests included), hence the `#[allow]`. The parameter to pass is
+whichever variant the manifest line names — e.g. `iso_fused_qk_b3.hdr.metal` ←
+`build_iso_fused_qk_header(3)`.
 
 Snapshots are representative: the probe checks that the kernel text parses and
 resolves, not that the constants are numerically current. Numerical correctness

@@ -18,23 +18,23 @@ constant float ROTOR_CB[8] = {
 // Indexed row-major: MUL_T[i*8+j], MUL_S[i*8+j].
 // Bit-exact with crate::clifford::MUL_TABLE (re-derived from BASIS_BITS).
 constant uint MUL_T[64] = {
-    0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u,
-    1u, 0u, 4u, 5u, 2u, 3u, 7u, 6u,
-    2u, 4u, 0u, 6u, 1u, 7u, 3u, 5u,
-    3u, 5u, 6u, 0u, 7u, 1u, 2u, 4u,
-    4u, 2u, 1u, 7u, 0u, 6u, 5u, 3u,
-    5u, 3u, 7u, 1u, 6u, 0u, 4u, 2u,
-    6u, 7u, 3u, 2u, 5u, 4u, 0u, 1u,
+    0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u, 
+    1u, 0u, 4u, 5u, 2u, 3u, 7u, 6u, 
+    2u, 4u, 0u, 6u, 1u, 7u, 3u, 5u, 
+    3u, 5u, 6u, 0u, 7u, 1u, 2u, 4u, 
+    4u, 2u, 1u, 7u, 0u, 6u, 5u, 3u, 
+    5u, 3u, 7u, 1u, 6u, 0u, 4u, 2u, 
+    6u, 7u, 3u, 2u, 5u, 4u, 0u, 1u, 
     7u, 6u, 5u, 4u, 3u, 2u, 1u, 0u
 };
 
 constant float MUL_S[64] = {
-    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
-    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
-    1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f,
-    1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f,
-    1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f,
-    1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f,
-    1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f,
+    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 
+    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 
+    1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 
+    1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 
+    1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 
+    1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 
+    1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 
     1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f
 };

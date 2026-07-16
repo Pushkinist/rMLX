@@ -202,17 +202,29 @@ fn build_fwht_quantize_body(d: usize) -> Result<String> {
     .to_owned())
 }
 
-/// Build the MSL body for the FWHT rotate-only kernel (Q pre-rotation).
-fn build_fwht_rotate_body(d: usize) -> String {
+/// Select the pre-rendered MSL body for the FWHT rotate-only kernel (Q
+/// pre-rotation). Rotation has no group structure, so every [`SUPPORTED_D`]
+/// has a body.
+///
+/// # Errors
+///
+/// Returns [`Error::Quant`] when no kernel specialization exists for `d`,
+/// rather than handing back a body built for a different dimension.
+fn build_fwht_rotate_body(d: usize) -> Result<String> {
     debug_assert!(d.is_power_of_two() && d >= 32);
-    match d {
+    Ok(match d {
         32 => include_str!("metal/rot_k_fwht_rotate_d32.metal"),
         64 => include_str!("metal/rot_k_fwht_rotate_d64.metal"),
         128 => include_str!("metal/rot_k_fwht_rotate_d128.metal"),
         256 => include_str!("metal/rot_k_fwht_rotate_d256.metal"),
-        _ => include_str!("metal/rot_k_fwht_rotate_d512.metal"),
+        512 => include_str!("metal/rot_k_fwht_rotate_d512.metal"),
+        _ => {
+            return Err(Error::Quant(format!(
+                "rot_k FWHT rotate: no kernel specialization for head_dim {d}"
+            )))
+        }
     }
-    .to_owned()
+    .to_owned())
 }
 
 // ---- Kernel singletons (one per D that holds whole affine groups for quantize;
@@ -289,7 +301,7 @@ fn rotate_kernel_for_d(d: usize) -> Result<&'static MetalKernel> {
         }
     };
     cell.get_or_init(|| {
-        let body = build_fwht_rotate_body(d);
+        let body = build_fwht_rotate_body(d)?;
         MetalKernel::new(
             &format!("rmlx_rot_k_fwht_rotate_d{d}"),
             kernel_header(),

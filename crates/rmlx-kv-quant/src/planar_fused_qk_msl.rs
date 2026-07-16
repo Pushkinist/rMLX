@@ -171,33 +171,23 @@ fn build_qk_header(bits: u8) -> Result<String> {
 //
 // Grid: (S_kv, B * n_q_heads, 1).  Threadgroup: (D, 1, 1).
 
-/// Common kernel body shared by the 4-bit and 3-bit kernels.
-///
-/// The two variants only differ in
-///   * mask + shift arithmetic for `idx`,
-///   * `vals_per_word` (8 for 4-bit, 10 for 3-bit) and code-word indexing.
-///
-/// The rest of the body is shared verbatim.  Callers must pass `bits ∈ {3, 4}`
-/// — other values return an empty source (kernel build will then fail loudly).
-fn build_qk_kernel_source(bits: u8) -> String {
-    match bits {
-        4 => include_str!("metal/planar_fused_qk_b4.metal").to_owned(),
-        3 => include_str!("metal/planar_fused_qk_b3.metal").to_owned(),
-        // Caller validates bits at the public entry point; defending here is
-        // belt-and-suspenders.  Return an empty body so the kernel build
-        // surfaces a clear MSL compile error rather than panicking.
-        _ => String::new(),
-    }
-}
+// Two independent per-bits kernel bodies, one file each.
+//
+// They differ only in the mask + shift arithmetic for `idx` and in
+// `vals_per_word` (8 for 4-bit, 10 for 3-bit) with its code-word indexing —
+// roughly six lines. The remaining ~97% is duplicated between the two files:
+// a fix to the shared arithmetic must be applied to BOTH.
+const QK_SOURCE_V4: &str = include_str!("metal/planar_fused_qk_b4.metal");
+const QK_SOURCE_V3: &str = include_str!("metal/planar_fused_qk_b3.metal");
 
 // ── Kernel singletons ─────────────────────────────────────────────────────────
 
 static QK_KERNEL_V4: OnceLock<Result<MetalKernel>> = OnceLock::new();
 static QK_KERNEL_V3: OnceLock<Result<MetalKernel>> = OnceLock::new();
+// Headers are generated (rotation codebook), so they are memoised. The bodies
+// are compile-time constants and need no cache.
 static QK_HEADER_V4: OnceLock<std::result::Result<String, String>> = OnceLock::new();
 static QK_HEADER_V3: OnceLock<std::result::Result<String, String>> = OnceLock::new();
-static QK_SOURCE_V4: OnceLock<String> = OnceLock::new();
-static QK_SOURCE_V3: OnceLock<String> = OnceLock::new();
 
 fn header_for(bits: u8) -> Result<&'static str> {
     // Surface header-build errors instead of
@@ -220,8 +210,8 @@ fn header_for(bits: u8) -> Result<&'static str> {
 
 fn source_for(bits: u8) -> Result<&'static str> {
     match bits {
-        4 => Ok(QK_SOURCE_V4.get_or_init(|| build_qk_kernel_source(4))),
-        3 => Ok(QK_SOURCE_V3.get_or_init(|| build_qk_kernel_source(3))),
+        4 => Ok(QK_SOURCE_V4),
+        3 => Ok(QK_SOURCE_V3),
         _ => Err(Error::Mlx(format!(
             "planar_fused_qk: bits must be 3 or 4, got {bits}"
         ))),

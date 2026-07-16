@@ -413,3 +413,28 @@ fn budget_for_mass_rounds_up() {
     assert_eq!(budget_for_mass(64, 0.95), 61); // ceil(60.8) = 61
     assert_eq!(budget_for_mass(1, 0.95), 1);
 }
+
+/// Probe header snapshots must equal what the builders emit.
+///
+/// `make check-metal-compiles` prepends these snapshots to the kernel bodies.
+/// A builder that changes a constant's value, or drops one, without the
+/// snapshot being refreshed leaves the probe compiling text production no
+/// longer emits — the gate would keep passing while checking the wrong thing.
+/// Equality here turns that drift into a hard failure.
+#[allow(
+    clippy::expect_used,
+    reason = "a header that fails to build is itself the drift this test guards"
+)]
+#[test]
+fn hdr_probe_snapshots_match_builders() {
+    assert_eq!(
+        crate::sparse_attn::phase1_score_msl::p1_header().expect("phase1 header"),
+        include_str!("../metal/probes/sparse_attn_phase1_score.hdr.metal"),
+        "stale snapshot: refresh ../metal/probes/sparse_attn_phase1_score.hdr.metal"
+    );
+    assert_eq!(
+        crate::sparse_attn::phase2_sparse_attend_msl::p2_header().expect("phase2 header"),
+        include_str!("../metal/probes/sparse_attn_phase2_attend.hdr.metal"),
+        "stale snapshot: refresh ../metal/probes/sparse_attn_phase2_attend.hdr.metal"
+    );
+}

@@ -135,9 +135,7 @@ fn build_header() -> Result<String> {
 //   0. partial_o : f32 [n_tiles * n_bh * head_dim]
 //   1. tile_lse  : f32 [n_tiles * n_bh * 2]    (tile_max, tile_sum_exp)
 
-fn build_kernel_source() -> String {
-    include_str!("../metal/sparse_attn_phase2_attend.metal").to_owned()
-}
+const P2_SOURCE: &str = include_str!("../metal/sparse_attn_phase2_attend.metal");
 
 // ── Pass-2 LSE merge MSL source (mirror planar_flash_decode P2) ──────────────
 //
@@ -162,29 +160,25 @@ const MERGE_SOURCE: &str = include_str!("../metal/sparse_attn_phase2_merge.metal
 
 static P2_KERNEL: OnceLock<std::result::Result<MetalKernel, String>> = OnceLock::new();
 static P2_HEADER: OnceLock<std::result::Result<String, String>> = OnceLock::new();
-static P2_SOURCE: OnceLock<String> = OnceLock::new();
 static MERGE_KERNEL: OnceLock<std::result::Result<MetalKernel, String>> = OnceLock::new();
 
-fn p2_header() -> Result<&'static str> {
+/// The header is generated (codebook + tile constants), so it is memoised. The
+/// body is a compile-time constant and needs no cache.
+pub(crate) fn p2_header() -> Result<&'static str> {
     P2_HEADER
         .get_or_init(|| build_header().map_err(|e| e.to_string()))
         .as_deref()
         .map_err(|e| Error::Mlx(format!("phase2_sparse_attend header build: {e}")))
 }
 
-fn p2_source() -> &'static str {
-    P2_SOURCE.get_or_init(build_kernel_source)
-}
-
 fn p2_kernel() -> Result<&'static MetalKernel> {
     let header = p2_header()?;
-    let source = p2_source();
     P2_KERNEL
         .get_or_init(|| {
             MetalKernel::new(
                 "rmlx_sparse_attn_phase2_sparse_attend_v4",
                 header,
-                source,
+                P2_SOURCE,
                 &[
                     "query",
                     "k_codes",

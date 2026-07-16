@@ -38,7 +38,7 @@
 //! * **rMLX PlanarQuant uses a 16-entry Givens rotation codebook + per-pair
 //!   scale** (see `planar_fused_qk_msl`); the mtq reference assumes a single
 //!   fixed 45° Hadamard rotation and one scale per token.  The K decode path
-//!   here is verbatim with `planar_fused_qk_msl::build_qk_kernel_source`.
+//!   here is verbatim with the one in `metal/planar_fused_qk_b4.metal`.
 //! * **V is bf16 / f16 / f32 plain**, not planar-packed.  The dispatcher
 //!   passes V to the kernel in its native dtype; mlx-c auto-types the
 //!   `device const * v_flat` parameter and the kernel relies on MSL's
@@ -112,7 +112,7 @@ pub(crate) const TILE_SIZE: i32 = 64;
 /// to the largest production head_dim (Gemma4-26B class: 256).  The kernel
 /// uses static-sized threadgroup arrays of this length; raising it widens
 /// SMEM and lowers occupancy.  See the threadgroup-memory ceiling comment in
-/// `build_p1_kernel_source`.
+/// `metal/planar_flash_decode_p1.metal`.
 pub(crate) const PLANAR_FLASH_HEAD_DIM_MAX: i32 = 256;
 
 // ── MSL header builder ────────────────────────────────────────────────────────
@@ -214,13 +214,11 @@ fn build_flash_header(bits: u8) -> Result<String> {
 // 1. tile_max      : f32 [n_tiles * n_bh]
 // 2. tile_sum_exp  : f32 [n_tiles * n_bh]
 
-fn build_p1_kernel_source() -> String {
-    // 4-bit code unpack: 8 elements per u32, 4 bits each.  The 3-bit variant
-    // was wired speculatively in the initial port; YAGNI per CLAUDE.md
-    // Simplicity rule 4 (inline beats premature factoring) — drop the dead
-    // code path and re-add it the day a 3-bit K codec needs it.
-    include_str!("metal/planar_flash_decode_p1.metal").to_owned()
-}
+// P1 unpacks 4-bit codes, 8 elements per u32. A 3-bit variant was wired
+// speculatively in the initial port and dropped per CLAUDE.md Simplicity rule 4
+// (inline beats premature factoring) — re-add it the day a 3-bit K codec needs
+// one.
+const P1_SOURCE_V4: &str = include_str!("metal/planar_flash_decode_p1.metal");
 
 // ── Pass 2 MSL source ────────────────────────────────────────────────────────
 //
@@ -242,8 +240,9 @@ const P2_SOURCE: &str = include_str!("metal/planar_flash_decode_p2.metal");
 static P1_KERNEL_V4: OnceLock<std::result::Result<MetalKernel, String>> = OnceLock::new();
 static P2_KERNEL: OnceLock<std::result::Result<MetalKernel, String>> = OnceLock::new();
 
+/// The header is generated (rotation codebook), so it is memoised. The body is
+/// a compile-time constant and needs no cache.
 static P1_HEADER_V4: OnceLock<std::result::Result<String, String>> = OnceLock::new();
-static P1_SOURCE_V4: OnceLock<String> = OnceLock::new();
 
 fn p1_header_v4() -> Result<&'static str> {
     P1_HEADER_V4
@@ -252,19 +251,14 @@ fn p1_header_v4() -> Result<&'static str> {
         .map_err(|e| Error::Mlx(format!("planar_flash_decode header build: {e}")))
 }
 
-fn p1_source_v4() -> &'static str {
-    P1_SOURCE_V4.get_or_init(build_p1_kernel_source)
-}
-
 fn p1_kernel_v4() -> Result<&'static MetalKernel> {
     let header = p1_header_v4()?;
-    let source = p1_source_v4();
     P1_KERNEL_V4
         .get_or_init(|| {
             MetalKernel::new(
                 "rmlx_planar_flash_decode_p1_v4",
                 header,
-                source,
+                P1_SOURCE_V4,
                 &[
                     "query",
                     "k_codes",
@@ -371,7 +365,8 @@ pub fn planar_flash_decode_sdpa(
         let max = PLANAR_FLASH_HEAD_DIM_MAX;
         return Err(Error::Quant(format!(
             "planar_flash_decode: head_dim={head_dim} exceeds PLANAR_FLASH_HEAD_DIM_MAX={max}; \
-             raise the static threadgroup-array sizes in build_p1_kernel_source to support it"
+             raise the static threadgroup-array sizes in metal/planar_flash_decode_p1.metal \
+             to support it"
         )));
     }
     if heads_per_kv <= 0 {

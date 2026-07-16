@@ -665,3 +665,28 @@ fn rotor_v4_gpu_encode_then_cpu_decode_round_trip() {
         "rotor4 V (GPU-encode → CPU-decode) vs (CPU-encode → CPU-decode) max-abs-error {max_err:.2e} > 5e-3 (production hot path swap)",
     );
 }
+
+/// Probe header snapshots must equal what the builders emit.
+///
+/// `make check-metal-compiles` prepends these snapshots to the kernel bodies.
+/// A builder that changes a constant's value, or drops one, without the
+/// snapshot being refreshed leaves the probe compiling text production no
+/// longer emits — the gate would keep passing while checking the wrong thing.
+/// Equality here turns that drift into a hard failure.
+#[allow(
+    clippy::expect_used,
+    reason = "a header that fails to build is itself the drift this test guards"
+)]
+#[test]
+fn hdr_probe_snapshots_match_builders() {
+    assert_eq!(
+        kernel_header_rotor3().expect("rotor3 header"),
+        include_str!("metal/probes/rotorquant_rotor3.hdr.metal"),
+        "stale snapshot: refresh metal/probes/rotorquant_rotor3.hdr.metal"
+    );
+    assert_eq!(
+        kernel_header_rotor4().expect("rotor4 header"),
+        include_str!("metal/probes/rotorquant_rotor4.hdr.metal"),
+        "stale snapshot: refresh metal/probes/rotorquant_rotor4.hdr.metal"
+    );
+}

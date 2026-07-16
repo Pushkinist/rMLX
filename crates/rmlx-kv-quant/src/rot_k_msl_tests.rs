@@ -297,3 +297,19 @@ fn quantize_constant_group_reconstruction() {
         "constant group scale must be 0.0 (mirrors MLX)"
     );
 }
+
+/// Probe header snapshots must equal what the builders emit.
+///
+/// `make check-metal-compiles` prepends these snapshots to the kernel bodies.
+/// A builder that changes a constant's value, or drops one, without the
+/// snapshot being refreshed leaves the probe compiling text production no
+/// longer emits — the gate would keep passing while checking the wrong thing.
+/// Equality here turns that drift into a hard failure.
+#[test]
+fn hdr_probe_snapshot_matches_builder() {
+    assert_eq!(
+        kernel_header(),
+        include_str!("metal/probes/rot_k.hdr.metal"),
+        "stale snapshot: refresh metal/probes/rot_k.hdr.metal"
+    );
+}

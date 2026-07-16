@@ -1,12 +1,19 @@
 # Pre-commit hooks. Install once: `pre-commit install`
 # Run all hooks manually: `pre-commit run --all-files`
 
+# `probes/*.hdr.metal` are captured verbatim from the Rust header builders and
+# are equality-checked against them by unit tests. Whitespace fixups would edit
+# the capture out from under those tests, so the whitespace hooks skip them.
+GENERATED_CAPTURES: &generated_captures ^crates/rmlx-kv-quant/src/metal/probes/.*\.hdr\.metal$
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:
       - id: trailing-whitespace
+        exclude: *generated_captures
       - id: end-of-file-fixer
+        exclude: *generated_captures
       - id: check-yaml
       - id: check-toml
       - id: check-added-large-files

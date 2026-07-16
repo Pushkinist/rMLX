@@ -167,18 +167,28 @@ fn build_iso_fused_qk_header(bits: u8) -> String {
     s
 }
 
-/// Build the MSL kernel-body string parameterised by `bits`.
+/// Select the pre-rendered MSL kernel body for `bits`.
 ///
-/// The body templates only the unpack shift / mask:
-/// - BITS=3 → shift = `elem*3`, mask = `0x7u`.
-/// - BITS=4 → shift = `elem*4`, mask = `0xFu`.
-fn build_iso_fused_qk_source(bits: u8) -> String {
-    debug_assert!(bits == 3 || bits == 4, "iso fused-QK: bits must be 3 or 4");
-    match bits {
+/// There are two independent body files, one per BITS. They differ only in the
+/// unpack shift / mask (BITS=3 → shift `elem*3`, mask `0x7u`; BITS=4 → shift
+/// `elem*4`, mask `0xFu`); the rest is duplicated between them and must be
+/// edited in both.
+///
+/// # Errors
+///
+/// Returns [`Error::Quant`] for any `bits` outside {3, 4}, rather than
+/// silently handing back a body for the wrong bit width.
+fn build_iso_fused_qk_source(bits: u8) -> Result<String> {
+    Ok(match bits {
         3 => include_str!("metal/iso_fused_qk_b3.metal"),
-        _ => include_str!("metal/iso_fused_qk_b4.metal"),
+        4 => include_str!("metal/iso_fused_qk_b4.metal"),
+        _ => {
+            return Err(Error::Quant(format!(
+                "iso fused-QK: bits must be 3 or 4, got {bits}"
+            )))
+        }
     }
-    .to_owned()
+    .to_owned())
 }
 
 // ── Kernel singletons (one per BITS variant) ─────────────────────────────────
@@ -197,8 +207,8 @@ fn iso_qk_kernel(bits: u8) -> Result<&'static MetalKernel> {
         }
     };
     cell.get_or_init(|| {
+        let source = build_iso_fused_qk_source(bits)?;
         let header = build_iso_fused_qk_header(bits);
-        let source = build_iso_fused_qk_source(bits);
         let name = match bits {
             3 => "rmlx_iso3_fused_qk",
             _ => "rmlx_iso4_fused_qk",

@@ -285,17 +285,27 @@ fn build_rotor_fused_qk_header(bits: u8) -> String {
     s
 }
 
-/// Build the MSL kernel-body string parameterised by `bits`.
-fn build_rotor_fused_qk_source(bits: u8) -> String {
-    debug_assert!(
-        bits == 3 || bits == 4,
-        "rotor fused-QK: bits must be 3 or 4"
-    );
-    match bits {
+/// Select the pre-rendered MSL kernel body for `bits`.
+///
+/// There are two independent body files, one per BITS. They differ only in the
+/// unpack shift / mask; the rest is duplicated between them and must be edited
+/// in both.
+///
+/// # Errors
+///
+/// Returns [`Error::Quant`] for any `bits` outside {3, 4}, rather than
+/// silently handing back a body for the wrong bit width.
+fn build_rotor_fused_qk_source(bits: u8) -> Result<String> {
+    Ok(match bits {
         3 => include_str!("metal/rotor_fused_qk_b3.metal"),
-        _ => include_str!("metal/rotor_fused_qk_b4.metal"),
+        4 => include_str!("metal/rotor_fused_qk_b4.metal"),
+        _ => {
+            return Err(Error::Quant(format!(
+                "rotor fused-QK: bits must be 3 or 4, got {bits}"
+            )))
+        }
     }
-    .to_owned()
+    .to_owned())
 }
 
 // ── Kernel singletons (one per BITS variant) ─────────────────────────────────
@@ -314,8 +324,8 @@ fn rotor_qk_kernel(bits: u8) -> Result<&'static MetalKernel> {
         }
     };
     cell.get_or_init(|| {
+        let source = build_rotor_fused_qk_source(bits)?;
         let header = build_rotor_fused_qk_header(bits);
-        let source = build_rotor_fused_qk_source(bits);
         let name = match bits {
             3 => "rmlx_rotor3_fused_qk",
             _ => "rmlx_rotor4_fused_qk",

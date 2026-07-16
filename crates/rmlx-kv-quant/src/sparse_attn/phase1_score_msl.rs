@@ -24,10 +24,10 @@
 //!
 //! # K decode
 //!
-//! Bit-exact with `planar_flash_decode_msl::build_p1_kernel_source` /
-//! `planar_fused_qk_msl::build_qk_kernel_source` (4-bit Lloyd-Max
-//! codebook + per-pair Givens rotation + per-pair f32 scale; 32 elements
-//! per "group", 16 pairs per group).
+//! Bit-exact with `metal/planar_flash_decode_p1.metal` /
+//! `metal/planar_fused_qk_b4.metal` (4-bit Lloyd-Max codebook + per-pair
+//! Givens rotation + per-pair f32 scale; 32 elements per "group", 16 pairs
+//! per group).
 //!
 //! # Tile-size + head_dim ceiling
 //!
@@ -149,36 +149,30 @@ fn build_header() -> Result<String> {
 //   1. tile_top_indices : u32  [n_tiles * n_bh * TOP_PER_TILE]
 //   2. all_scores       : f32  [n_bh * kv_seq]
 
-fn build_kernel_source() -> String {
-    include_str!("../metal/sparse_attn_phase1_score.metal").to_owned()
-}
+const P1_SOURCE: &str = include_str!("../metal/sparse_attn_phase1_score.metal");
 
 // ── Kernel singletons ─────────────────────────────────────────────────────────
 
 static P1_KERNEL: OnceLock<std::result::Result<MetalKernel, String>> = OnceLock::new();
 static P1_HEADER: OnceLock<std::result::Result<String, String>> = OnceLock::new();
-static P1_SOURCE: OnceLock<String> = OnceLock::new();
 
-fn p1_header() -> Result<&'static str> {
+/// The header is generated (codebook + tile constants), so it is memoised. The
+/// body is a compile-time constant and needs no cache.
+pub(crate) fn p1_header() -> Result<&'static str> {
     P1_HEADER
         .get_or_init(|| build_header().map_err(|e| e.to_string()))
         .as_deref()
         .map_err(|e| Error::Mlx(format!("phase1_score header build: {e}")))
 }
 
-fn p1_source() -> &'static str {
-    P1_SOURCE.get_or_init(build_kernel_source)
-}
-
 fn p1_kernel() -> Result<&'static MetalKernel> {
     let header = p1_header()?;
-    let source = p1_source();
     P1_KERNEL
         .get_or_init(|| {
             MetalKernel::new(
                 "rmlx_sparse_attn_phase1_score_v4",
                 header,
-                source,
+                P1_SOURCE,
                 &[
                     "query",
                     "k_codes",
