@@ -659,6 +659,7 @@ fn rotor3_sync_ring(
     feed: RingFeed,
     new_shape: &[i32],
     head_dim: usize,
+    max_seq: i32,
     device: Device,
 ) -> Result<()> {
     let (b, kv_h, new_seq) = b_kv_h_new_seq(new_shape)?;
@@ -677,6 +678,7 @@ fn rotor3_sync_ring(
         head_dim as i32,
         prev_seq,
         new_seq,
+        max_seq,
         device,
     )
 }
@@ -688,6 +690,7 @@ fn rotor4_sync_ring(
     feed: RingFeed,
     new_shape: &[i32],
     head_dim: usize,
+    max_seq: i32,
     device: Device,
 ) -> Result<()> {
     let (b, kv_h, new_seq) = b_kv_h_new_seq(new_shape)?;
@@ -704,6 +707,7 @@ fn rotor4_sync_ring(
         head_dim as i32,
         prev_seq,
         new_seq,
+        max_seq,
         device,
     )
 }
@@ -715,12 +719,15 @@ fn rotor4_sync_ring(
 /// `rotorquant_msl.rs`).
 ///
 /// `feed` decides whether the GPU ring is maintained — see [`RingFeed`].
+/// `max_seq` is the window the cache is currently provisioned for, read from
+/// the active `KvStorage` variant by the caller and forwarded to the ring.
 fn rotor3_gpu_append_into_k_blocks(
     ks: &mut crate::storage::QuantRotorK3,
     new_k: &Array,
     new_shape: &[i32],
     device: Device,
     feed: RingFeed,
+    max_seq: i32,
 ) -> Result<()> {
     let head_dim = head_dim_from_shape(new_shape, "rotor3_gpu_append_into_k_blocks")?;
     ensure_k3_rotors(ks, head_dim);
@@ -735,17 +742,19 @@ fn rotor3_gpu_append_into_k_blocks(
         &ks.rotors,
         crate::rotorquant::ROTOR3_BITS,
     )?;
-    rotor3_sync_ring(ks, &gpu, feed, new_shape, head_dim, device)?;
+    rotor3_sync_ring(ks, &gpu, feed, new_shape, head_dim, max_seq, device)?;
     push_rotor3_k_block(ks, block, new_shape);
     Ok(())
 }
 
+/// Mirror of [`rotor3_gpu_append_into_k_blocks`] for `QuantRotorK4`.
 fn rotor4_gpu_append_into_k_blocks(
     ks: &mut crate::storage::QuantRotorK4,
     new_k: &Array,
     new_shape: &[i32],
     device: Device,
     feed: RingFeed,
+    max_seq: i32,
 ) -> Result<()> {
     let head_dim = head_dim_from_shape(new_shape, "rotor4_gpu_append_into_k_blocks")?;
     ensure_k4_rotors(ks, head_dim);
@@ -756,7 +765,7 @@ fn rotor4_gpu_append_into_k_blocks(
         &ks.rotors,
         crate::rotorquant::ROTOR4_BITS,
     )?;
-    rotor4_sync_ring(ks, &gpu, feed, new_shape, head_dim, device)?;
+    rotor4_sync_ring(ks, &gpu, feed, new_shape, head_dim, max_seq, device)?;
     push_rotor4_k_block(ks, block, new_shape);
     Ok(())
 }
@@ -789,14 +798,13 @@ pub(super) fn rotor3_k_only_gpu_append(
         }
         *k = Some(crate::storage::QuantRotorK3::new(
             init_shape,
-            max_seq,
             layer_idx_u32(cache.layer_idx),
         ));
     }
     let Some(ks) = k.as_mut() else {
         return Err(Error::Mlx("RotorKOnly3 K buffer absent after init".into()));
     };
-    rotor3_gpu_append_into_k_blocks(ks, new_k, new_shape, device, RingFeed::Maintain)
+    rotor3_gpu_append_into_k_blocks(ks, new_k, new_shape, device, RingFeed::Maintain, max_seq)
 }
 
 /// Mirror of [`rotor3_k_only_gpu_append`] for `RotorKOnly4`.
@@ -825,14 +833,13 @@ pub(super) fn rotor4_k_only_gpu_append(
         }
         *k = Some(crate::storage::QuantRotorK4::new(
             init_shape,
-            max_seq,
             layer_idx_u32(cache.layer_idx),
         ));
     }
     let Some(ks) = k.as_mut() else {
         return Err(Error::Mlx("RotorKOnly4 K buffer absent after init".into()));
     };
-    rotor4_gpu_append_into_k_blocks(ks, new_k, new_shape, device, RingFeed::Maintain)
+    rotor4_gpu_append_into_k_blocks(ks, new_k, new_shape, device, RingFeed::Maintain, max_seq)
 }
 
 /// Accumulated sequence length held by a rotor K storage `shape`
@@ -897,6 +904,12 @@ impl KvCache {
         }
 
         let new_seq = new_k.shape()[2];
+        // Provision the step before any mutation: `update_prefill_raw` runs the
+        // prefill-side check itself, so this covers the decode dispatch below,
+        // whose stores all cap their capacity at the storage `max_seq`.
+        if !self.in_prefill {
+            self.ensure_decode_capacity(self.offset + new_seq)?;
+        }
         self.offset += new_seq;
 
         if self.in_prefill {
@@ -1206,6 +1219,109 @@ impl KvCache {
             KvStorage::RotorKAsym3 { k, v, .. } => k.is_some() || v.is_some(),
             KvStorage::RotorKAsym4 { k, v, .. } => k.is_some() || v.is_some(),
         }
+    }
+
+    /// Grow the provisioned `max_seq` when the next **decode** append would
+    /// overflow it.
+    ///
+    /// `max_seq` is provisioned lazily: it starts at the small default and
+    /// [`Self::ensure_prefill_capacity`] grows it as the prompt fills. Decode
+    /// then appends one token per step, so a sequence that crosses the
+    /// provisioned bound has to grow it too. Without this, `max_seq` freezes at
+    /// whatever the prompt happened to need and every store that caps its own
+    /// capacity at `max_seq` stops accepting appends mid-stream — each in a
+    /// different way, none of them good:
+    ///
+    /// * the packed GPU rings raise a shape error and abort the decode step;
+    /// * the paged code buffers clamp their capacity and slice to zero length,
+    ///   surfacing as a downstream reshape failure;
+    /// * the bf16 mirrors stop expanding, so the append `slice_update`s out of
+    ///   bounds — depending on the shape either an MLX error or a **silent
+    ///   no-op** that drops the token while `offset` marches on.
+    ///
+    /// Growing here keeps one provisioning rule for both phases, so the stores
+    /// stay on the paged/realloc growth paths they already implement.
+    ///
+    /// Unlike the prefill path there is no "payload already materialised" guard:
+    /// at decode the payload always exists, and raising `max_seq` is precisely
+    /// what lets each store's own grow path extend it. That is safe wherever the
+    /// window is read per-append (`QuantK`, `QuantPlanarK`, `QuantRotorK{3,4}`,
+    /// `QuantIsoV3`, the bf16 mirrors), which is every store this function can
+    /// reach: each tracks its own capacity and copies the filled prefix forward
+    /// on realloc, so the scalar and the buffers cannot disagree.
+    ///
+    /// **Exception.** The head-major flash buffers latch their window into
+    /// `flash_max_seq` at allocation and never revisit it, so growing `max_seq`
+    /// does not extend them. They are unreachable from here — the TurboFlash
+    /// path is opt-in and has its own dispatch — and their append now fails
+    /// loudly rather than dropping silently, but they are not covered by the
+    /// invariant above.
+    ///
+    /// The hard cap and the `--max-ctx` ceiling still bound the growth: a
+    /// request that genuinely cannot fit is rejected loudly rather than
+    /// truncated.
+    pub(super) fn ensure_decode_capacity(&mut self, needed_seq: i32) -> Result<()> {
+        // Hard cap: opt-in via `RMLX_KV_MAX_SEQ_HARD_CAP`. Unset → no cap.
+        if let Some(cap) = kv_hard_cap() {
+            if needed_seq > cap {
+                tracing::warn!(
+                    requested = needed_seq,
+                    cap,
+                    "KV hard cap exceeded — rejecting decode step"
+                );
+                return Err(Error::KvHardCapExceeded {
+                    requested: needed_seq,
+                    cap,
+                });
+            }
+        }
+
+        // Virtual ceiling: the resolved `--max-ctx`. A decode step that would
+        // carry the sequence past it cannot be served by growing, so reject it
+        // with the same typed error the prefill path uses.
+        if let Some(ceiling) = self.max_seq_ceiling {
+            if needed_seq > ceiling {
+                tracing::warn!(
+                    requested = needed_seq,
+                    ceiling,
+                    "KV max-ctx ceiling exceeded — rejecting decode step"
+                );
+                return Err(Error::KvCeilingExceeded {
+                    requested: needed_seq,
+                    ceiling,
+                });
+            }
+        }
+
+        let current_max_seq = storage_max_seq(&self.storage);
+        if needed_seq <= current_max_seq {
+            return Ok(());
+        }
+
+        // Same next-power-of-two policy as the prefill grow, so one rule covers
+        // both phases. This writes a scalar; it reallocs nothing by itself. What
+        // it buys differs per store: the bf16 mirrors size themselves straight
+        // off `max_seq`, so they realloc once per doubling, while the packed
+        // rings round to whole `KV_PAGE_SIZE` pages and realloc on their own
+        // page cadence regardless of the doubling. `needed_seq <= ceiling` is
+        // guaranteed above, so the clamp still fits the request.
+        let new_max_seq = match self.max_seq_ceiling {
+            Some(ceiling) => next_pow2_seq(needed_seq).min(ceiling),
+            None => next_pow2_seq(needed_seq),
+        };
+
+        // info!, matching the prefill grow: a capacity commit fires O(log n)
+        // times per request (not per step) and re-sizes the bf16 mirrors, so it
+        // belongs in the default run log.
+        tracing::info!(
+            from = current_max_seq,
+            to = new_max_seq,
+            needed_seq,
+            "KV decode buffer grow"
+        );
+
+        set_storage_max_seq(&mut self.storage, new_max_seq);
+        Ok(())
     }
 
     /// Append a prefill K/V chunk into the per-layer raw prefill buffer.
@@ -2017,7 +2133,7 @@ impl KvCache {
                     shape: init_shape.clone(),
                     max_seq,
                 };
-                let mut qv = QuantIsoV3::new(init_shape, max_seq);
+                let mut qv = QuantIsoV3::new(init_shape);
                 // K-side: GPU affine q8_0 (same path as K8V4/K8V8).
                 qk.append(&k_f32, &new_shape, &k_full, device, max_seq)?;
                 // V-side: CPU IsoQuant 3-bit (no GPU path until T11d).
@@ -2251,7 +2367,7 @@ impl KvCache {
                 let mut init_shape = new_shape.clone();
                 init_shape[2] = 0;
                 let mut qk = crate::storage::QuantIsoK3::new(init_shape.clone(), max_seq);
-                let mut qv = QuantIsoV3::new(init_shape, max_seq);
+                let mut qv = QuantIsoV3::new(init_shape);
                 qk.append(&k_f32, &new_shape)?;
                 qv.append(&v_f32, &new_shape)?;
                 *k = Some(qk);
@@ -2371,7 +2487,6 @@ impl KvCache {
                 init_shape[2] = 0;
                 let mut qk = crate::storage::QuantRotorK3::new(
                     init_shape.clone(),
-                    max_seq,
                     layer_idx_u32(self.layer_idx),
                 );
                 let mut qv = QuantRotorV3::new(init_shape, max_seq, layer_idx_u32(self.layer_idx));
@@ -2407,7 +2522,6 @@ impl KvCache {
                 init_shape[2] = 0;
                 let mut qk = crate::storage::QuantRotorK4::new(
                     init_shape.clone(),
-                    max_seq,
                     layer_idx_u32(self.layer_idx),
                 );
                 let mut qv = QuantRotorV4::new(init_shape, max_seq, layer_idx_u32(self.layer_idx));
@@ -2423,14 +2537,6 @@ impl KvCache {
                     total_seq,
                     "exit_prefill RotorKOnly3: bulk-quantizing K (rotor3 CPU); V stays bf16"
                 );
-                let max_seq = match &self.storage {
-                    KvStorage::RotorKOnly3 { max_seq, .. } => *max_seq,
-                    _ => {
-                        return Err(Error::Mlx(
-                            "RotorKOnly3 exit_prefill: storage mismatch (KvQuant::RotorKOnly3 but storage is not RotorKOnly3)".into()
-                        ))
-                    }
-                };
                 let new_shape = k_full.shape();
                 let k_f32 = array_to_f32_vec(&k_full, device)?;
 
@@ -2441,11 +2547,8 @@ impl KvCache {
                 };
                 let mut init_shape = new_shape.clone();
                 init_shape[2] = 0;
-                let mut qk = crate::storage::QuantRotorK3::new(
-                    init_shape,
-                    max_seq,
-                    layer_idx_u32(self.layer_idx),
-                );
+                let mut qk =
+                    crate::storage::QuantRotorK3::new(init_shape, layer_idx_u32(self.layer_idx));
                 qk.append(&k_f32, &new_shape)?;
                 *k = Some(qk);
             }
@@ -2456,14 +2559,6 @@ impl KvCache {
                     total_seq,
                     "exit_prefill RotorKOnly4: bulk-quantizing K (rotor4 CPU); V stays bf16"
                 );
-                let max_seq = match &self.storage {
-                    KvStorage::RotorKOnly4 { max_seq, .. } => *max_seq,
-                    _ => {
-                        return Err(Error::Mlx(
-                            "RotorKOnly4 exit_prefill: storage mismatch (KvQuant::RotorKOnly4 but storage is not RotorKOnly4)".into()
-                        ))
-                    }
-                };
                 let new_shape = k_full.shape();
                 let k_f32 = array_to_f32_vec(&k_full, device)?;
 
@@ -2474,11 +2569,8 @@ impl KvCache {
                 };
                 let mut init_shape = new_shape.clone();
                 init_shape[2] = 0;
-                let mut qk = crate::storage::QuantRotorK4::new(
-                    init_shape,
-                    max_seq,
-                    layer_idx_u32(self.layer_idx),
-                );
+                let mut qk =
+                    crate::storage::QuantRotorK4::new(init_shape, layer_idx_u32(self.layer_idx));
                 qk.append(&k_f32, &new_shape)?;
                 *k = Some(qk);
             }
@@ -2522,7 +2614,6 @@ impl KvCache {
                 init_shape[2] = 0;
                 let mut qk = crate::storage::QuantRotorK3::new(
                     init_shape.clone(),
-                    max_seq,
                     layer_idx_u32(self.layer_idx),
                 );
                 let mut qv = QuantV::new_affine_decode(init_shape, v_bits, max_seq);
@@ -2570,7 +2661,6 @@ impl KvCache {
                 init_shape[2] = 0;
                 let mut qk = crate::storage::QuantRotorK4::new(
                     init_shape.clone(),
-                    max_seq,
                     layer_idx_u32(self.layer_idx),
                 );
                 let mut qv = QuantV::new_affine_decode(init_shape, v_bits, max_seq);
@@ -4598,8 +4688,20 @@ impl KvCache {
         let ks_stop = [b, kv_h, start + n, d / Q8_GROUP_SIZE as i32];
         let vc_stop = [b, kv_h, start + n, d / 8];
         let vs_stop = [b, kv_h, start + n, d / TQ4_GROUP as i32];
-        // Sanity: ensure we stay within the allocated max_seq.
-        debug_assert!(start + n <= max_seq, "flash append exceeds max_seq");
+        // The flash buffers latch their window at allocation, so an append past
+        // it cannot be served by growing here. It must not be waved through: the
+        // `slice_update` below would land out of bounds and silently no-op,
+        // dropping the token while `offset` advances. `debug_assert!` is not
+        // enough — the perf/release profiles compile it out, which is exactly
+        // where this would bite. Fail loudly instead.
+        if start + n > max_seq {
+            return Err(Error::Quant(format!(
+                "flash append: needed={} exceeds the allocated flash window \
+                 max_seq={max_seq} — the buffers were sized for a shorter \
+                 sequence and cannot be extended in place",
+                start + n
+            )));
+        }
 
         let kc_new = kc_buf.slice_update(&k_codes_4d, &sl_start, &kc_stop, &sl_strides, device)?;
         let ks_new = ks_buf.slice_update(&k_scales_4d, &sl_start, &ks_stop, &sl_strides, device)?;
@@ -4690,7 +4792,20 @@ impl KvCache {
         let ks_stop = [b, kv_h, start + n, d / Q8_GROUP_SIZE as i32];
         let vc_stop = [b, kv_h, start + n, d / 8];
         let vs_stop = [b, kv_h, start + n, d / TQ4_GROUP as i32];
-        debug_assert!(start + n <= max_seq, "flash append exceeds max_seq");
+        // The flash buffers latch their window at allocation, so an append past
+        // it cannot be served by growing here. It must not be waved through: the
+        // `slice_update` below would land out of bounds and silently no-op,
+        // dropping the token while `offset` advances. `debug_assert!` is not
+        // enough — the perf/release profiles compile it out, which is exactly
+        // where this would bite. Fail loudly instead.
+        if start + n > max_seq {
+            return Err(Error::Quant(format!(
+                "flash append: needed={} exceeds the allocated flash window \
+                 max_seq={max_seq} — the buffers were sized for a shorter \
+                 sequence and cannot be extended in place",
+                start + n
+            )));
+        }
 
         let kc_new = kc_buf.slice_update(&k_codes_4d, &sl_start, &kc_stop, &sl_strides, device)?;
         let ks_new = ks_buf.slice_update(&k_scales_4d, &sl_start, &ks_stop, &sl_strides, device)?;
@@ -5402,7 +5517,7 @@ impl KvCache {
         if v.is_none() {
             let mut init_shape = new_shape.clone();
             init_shape[2] = 0;
-            *v = Some(QuantIsoV3::new(init_shape, max_seq));
+            *v = Some(QuantIsoV3::new(init_shape));
         }
         let vs = v.as_mut().unwrap();
         // Per-phase trace instrumentation for the iso3 V hot path.
@@ -5417,7 +5532,7 @@ impl KvCache {
             // the encode outputs in a pre-allocated per-struct buffer so
             // `dequant_gpu` below can skip the CPU-staged `Array::from_bytes`
             // upload on every step.
-            vs.append_gpu(new_v, &new_shape, device)?;
+            vs.append_gpu(new_v, &new_shape, max_seq, device)?;
         } else {
             vs.append(&v_f32, &new_shape)?;
         }
@@ -5634,7 +5749,7 @@ impl KvCache {
         if v.is_none() {
             let mut init_shape = new_shape.clone();
             init_shape[2] = 0;
-            *v = Some(QuantIsoV3::new(init_shape, max_seq));
+            *v = Some(QuantIsoV3::new(init_shape));
         }
         let Some(vs) = v.as_mut() else {
             return Err(Error::Mlx("IsoSym3 V buffer absent after init".into()));
@@ -5645,7 +5760,7 @@ impl KvCache {
         let t_enc = std::time::Instant::now();
         if device == Device::Gpu {
             // Same GPU-resident mirror pattern as `update_iso3`.
-            vs.append_gpu(new_v, &new_shape, device)?;
+            vs.append_gpu(new_v, &new_shape, max_seq, device)?;
         } else {
             vs.append(&v_f32, &new_shape)?;
         }
@@ -6181,7 +6296,6 @@ impl KvCache {
             init_shape[2] = 0;
             *k = Some(crate::storage::QuantRotorK3::new(
                 init_shape,
-                max_seq,
                 layer_idx_u32(self.layer_idx),
             ));
         }
@@ -6189,7 +6303,14 @@ impl KvCache {
             return Err(Error::Mlx("RotorSym3 K buffer absent after init".into()));
         };
         if gpu_k_ok {
-            rotor3_gpu_append_into_k_blocks(ks, new_k, &new_shape, device, RingFeed::Skip)?;
+            rotor3_gpu_append_into_k_blocks(
+                ks,
+                new_k,
+                &new_shape,
+                device,
+                RingFeed::Skip,
+                max_seq,
+            )?;
         } else {
             ks.append(&k_f32, &new_shape)?;
         }
@@ -6266,7 +6387,6 @@ impl KvCache {
             init_shape[2] = 0;
             *k = Some(crate::storage::QuantRotorK4::new(
                 init_shape,
-                max_seq,
                 layer_idx_u32(self.layer_idx),
             ));
         }
@@ -6274,7 +6394,14 @@ impl KvCache {
             return Err(Error::Mlx("RotorSym4 K buffer absent after init".into()));
         };
         if gpu_k_ok {
-            rotor4_gpu_append_into_k_blocks(ks, new_k, &new_shape, device, RingFeed::Skip)?;
+            rotor4_gpu_append_into_k_blocks(
+                ks,
+                new_k,
+                &new_shape,
+                device,
+                RingFeed::Skip,
+                max_seq,
+            )?;
         } else {
             ks.append(&k_f32, &new_shape)?;
         }
@@ -6347,7 +6474,6 @@ impl KvCache {
             init_shape[2] = 0;
             *k = Some(crate::storage::QuantRotorK3::new(
                 init_shape,
-                max_seq,
                 layer_idx_u32(self.layer_idx),
             ));
         }
@@ -6355,7 +6481,14 @@ impl KvCache {
             return Err(Error::Mlx("RotorKOnly3 K buffer absent after init".into()));
         };
         if gpu_k_ok {
-            rotor3_gpu_append_into_k_blocks(ks, new_k, &new_shape, device, RingFeed::Maintain)?;
+            rotor3_gpu_append_into_k_blocks(
+                ks,
+                new_k,
+                &new_shape,
+                device,
+                RingFeed::Maintain,
+                max_seq,
+            )?;
         } else {
             ks.append(&k_f32, &new_shape)?;
         }
@@ -6401,7 +6534,6 @@ impl KvCache {
             init_shape[2] = 0;
             *k = Some(crate::storage::QuantRotorK4::new(
                 init_shape,
-                max_seq,
                 layer_idx_u32(self.layer_idx),
             ));
         }
@@ -6409,7 +6541,14 @@ impl KvCache {
             return Err(Error::Mlx("RotorKOnly4 K buffer absent after init".into()));
         };
         if gpu_k_ok {
-            rotor4_gpu_append_into_k_blocks(ks, new_k, &new_shape, device, RingFeed::Maintain)?;
+            rotor4_gpu_append_into_k_blocks(
+                ks,
+                new_k,
+                &new_shape,
+                device,
+                RingFeed::Maintain,
+                max_seq,
+            )?;
         } else {
             ks.append(&k_f32, &new_shape)?;
         }
@@ -6494,13 +6633,19 @@ impl KvCache {
             init_shape[2] = 0;
             *k = Some(crate::storage::QuantRotorK3::new(
                 init_shape,
-                max_seq,
                 layer_idx_u32(self.layer_idx),
             ));
         }
         let ks = k.as_mut().unwrap();
         if gpu_k_ok {
-            rotor3_gpu_append_into_k_blocks(ks, new_k, &new_shape, device, RingFeed::Skip)?;
+            rotor3_gpu_append_into_k_blocks(
+                ks,
+                new_k,
+                &new_shape,
+                device,
+                RingFeed::Skip,
+                max_seq,
+            )?;
         } else {
             ks.append(&k_f32, &new_shape)?;
         }
@@ -6580,13 +6725,19 @@ impl KvCache {
             init_shape[2] = 0;
             *k = Some(crate::storage::QuantRotorK4::new(
                 init_shape,
-                max_seq,
                 layer_idx_u32(self.layer_idx),
             ));
         }
         let ks = k.as_mut().unwrap();
         if gpu_k_ok {
-            rotor4_gpu_append_into_k_blocks(ks, new_k, &new_shape, device, RingFeed::Skip)?;
+            rotor4_gpu_append_into_k_blocks(
+                ks,
+                new_k,
+                &new_shape,
+                device,
+                RingFeed::Skip,
+                max_seq,
+            )?;
         } else {
             ks.append(&k_f32, &new_shape)?;
         }
@@ -6708,12 +6859,22 @@ pub(super) fn storage_max_seq(storage: &KvStorage) -> i32 {
 }
 
 /// Bump the `max_seq` recorded on the active storage variant. This is the
-/// single source of truth read by `update_prefill_raw`, `exit_prefill`, and
-/// the per-axis `QuantK::append` / `QuantV::append` capacity caps. Quant
-/// payload buffers (codes/scales) are not allocated yet at this point — the
-/// quantised storage is materialised in `exit_prefill` from the (now larger)
-/// raw prefill buffer, and `exit_prefill` reads `max_seq` from here — so
-/// already-quantised on-axis bytes do not exist to migrate.
+/// single source of truth read by `update_prefill_raw`, `exit_prefill`, and the
+/// per-axis `QuantK::append` / `QuantV::append` capacity caps.
+///
+/// Two callers, with different payload states — neither needs bytes migrated
+/// here:
+///
+/// * [`KvCache::ensure_prefill_capacity`] — no quantised payload exists yet
+///   (`storage_has_materialised_payload` refuses the grow otherwise). The
+///   storage is materialised later, in `exit_prefill`, from the now-larger raw
+///   prefill buffer, and reads `max_seq` from here.
+/// * [`KvCache::ensure_decode_capacity`] — the payload always exists. Raising
+///   the scalar is exactly what lets each store's own grow path extend itself
+///   on the next append: capacity is tracked per-store and the filled prefix is
+///   copied forward on realloc.
+///
+/// In both cases this writes a scalar only; no buffer is resized here.
 fn set_storage_max_seq(storage: &mut KvStorage, new_max_seq: i32) {
     match storage {
         KvStorage::K8V4 { max_seq, .. } => *max_seq = new_max_seq,

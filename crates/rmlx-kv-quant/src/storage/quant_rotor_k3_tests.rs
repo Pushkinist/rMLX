@@ -12,10 +12,8 @@ use crate::test_utils::{cosine_similarity_per_row, lcg_data, TEST_SEED};
 #[test]
 fn quant_rotor_k3_new_shapes_correct() {
     let init_shape = vec![1_i32, 4, 0, 128];
-    let max_seq = 64_i32;
-    let q = QuantRotorK3::new(init_shape.clone(), max_seq, 0);
+    let q = QuantRotorK3::new(init_shape.clone(), 0);
     assert_eq!(q.shape, init_shape, "shape preserved after new()");
-    assert_eq!(q.max_seq, max_seq, "max_seq preserved");
     assert_eq!(q.bits, ROTOR3_K_BITS);
     assert!(q.blocks.is_empty(), "no blocks after new()");
     assert!(!q.use_qjl(), "use_qjl false before first append");
@@ -37,11 +35,7 @@ fn quant_rotor_k3_roundtrip_no_qjl_matches_v_side() {
     let data = lcg_data(n_rows * head_dim, TEST_SEED);
     let new_shape = [b as i32, kv_h as i32, n_seq as i32, head_dim as i32];
 
-    let mut qk = QuantRotorK3::new(
-        vec![b as i32, kv_h as i32, 0_i32, head_dim as i32],
-        n_seq as i32,
-        0,
-    );
+    let mut qk = QuantRotorK3::new(vec![b as i32, kv_h as i32, 0_i32, head_dim as i32], 0);
     qk.append(&data, &new_shape).expect("append");
     assert_eq!(qk.blocks.len(), 1);
     assert_eq!(qk.shape[2], n_seq as i32);
@@ -83,7 +77,7 @@ fn quant_rotor_k3_qjl_default_on() {
     let data = lcg_data(n_seq * head_dim, TEST_SEED);
     let new_shape = [1_i32, 1, n_seq as i32, head_dim as i32];
 
-    let mut qk = QuantRotorK3::new(vec![1, 1, 0, head_dim as i32], 16, 0);
+    let mut qk = QuantRotorK3::new(vec![1, 1, 0, head_dim as i32], 0);
     qk.append(&data, &new_shape).unwrap();
     // The CLI may have installed QJL=on or QJL=off at startup; only check that
     // the encoder/decoder ran without panic. The QJL toggle lift is verified
@@ -99,7 +93,7 @@ fn quant_rotor_k3_reset_clears_seq() {
     let data = lcg_data(n_seq * head_dim, TEST_SEED);
     let new_shape = [1_i32, 1, n_seq as i32, head_dim as i32];
 
-    let mut qk = QuantRotorK3::new(vec![1, 1, 0, head_dim as i32], 16, 0);
+    let mut qk = QuantRotorK3::new(vec![1, 1, 0, head_dim as i32], 0);
     qk.append(&data, &new_shape).unwrap();
     assert_eq!(qk.shape[2], n_seq as i32);
 
@@ -125,7 +119,7 @@ fn quant_rotor_k3_cosine_empirical_floor_head_dim_128_no_qjl() {
     let data = lcg_data(n_rows * head_dim, TEST_SEED);
     let new_shape = [1_i32, 1, n_rows as i32, head_dim as i32];
 
-    let mut qk = QuantRotorK3::new(vec![1, 1, 0, head_dim as i32], n_rows as i32, 0);
+    let mut qk = QuantRotorK3::new(vec![1, 1, 0, head_dim as i32], 0);
     qk.append(&data, &new_shape).unwrap();
     let decoded = qk.dequant().unwrap();
     let stats = cosine_similarity_per_row(&data, &decoded, head_dim);
@@ -171,7 +165,7 @@ fn quant_rotor_k3_multi_append_matches_single_shot_gqa_with_qjl() {
         }
         out
     };
-    let mut qref = QuantRotorK3::new(vec![1, kv_h as i32, 0, head_dim as i32], 64, 7);
+    let mut qref = QuantRotorK3::new(vec![1, kv_h as i32, 0, head_dim as i32], 7);
     qref.append(
         &build(0, s_total),
         &[1, kv_h as i32, s_total as i32, head_dim as i32],
@@ -180,7 +174,7 @@ fn quant_rotor_k3_multi_append_matches_single_shot_gqa_with_qjl() {
     assert!(qref.use_qjl(), "QJL must be ON for this test");
     let reference = qref.dequant().unwrap();
 
-    let mut qv = QuantRotorK3::new(vec![1, kv_h as i32, 0, head_dim as i32], 64, 7);
+    let mut qv = QuantRotorK3::new(vec![1, kv_h as i32, 0, head_dim as i32], 7);
     qv.append(
         &build(0, chunk_a),
         &[1, kv_h as i32, chunk_a as i32, head_dim as i32],
@@ -214,11 +208,20 @@ fn quant_rotor_k3_multi_append_matches_single_shot_gqa_with_qjl() {
 // holds the truncated tokens — `packed_view` would then hand the kernel stale
 // keys past the truncation point. Silent wrong answer, no error.
 
+/// Provisioned window for the ring-lifecycle tests; larger than any chunk they append.
+const RING_TEST_MAX_SEQ: i32 = 64;
+
 #[allow(
     clippy::expect_used,
     reason = "test helper: a failure here is the assertion"
 )]
-fn seed_ring_via_gpu_append(ks: &mut QuantRotorK3, kv_h: i32, head_dim: i32, n_tokens: i32) {
+fn seed_ring_via_gpu_append(
+    ks: &mut QuantRotorK3,
+    kv_h: i32,
+    head_dim: i32,
+    n_tokens: i32,
+    max_seq: i32,
+) {
     use rmlx_mlx::{Array, Device, Dtype};
     let n_groups = n_groups_for(head_dim as usize) as i32;
     let cps = (kv_h * n_groups * n_tokens) as usize;
@@ -237,6 +240,7 @@ fn seed_ring_via_gpu_append(ks: &mut QuantRotorK3, kv_h: i32, head_dim: i32, n_t
         head_dim,
         0,
         n_tokens,
+        max_seq,
         Device::Gpu,
     )
     .expect("gpu_append");
@@ -248,9 +252,9 @@ fn quant_rotor_k3_reset_drops_the_gpu_ring() {
         return;
     }
     let (kv_h, head_dim) = (2_i32, 6_i32);
-    let mut ks = QuantRotorK3::new(vec![1, kv_h, 0, head_dim], 64, 0);
+    let mut ks = QuantRotorK3::new(vec![1, kv_h, 0, head_dim], 0);
     ks.rotors = make_rotor_table(0, 0, n_groups_for(head_dim as usize));
-    seed_ring_via_gpu_append(&mut ks, kv_h, head_dim, 3);
+    seed_ring_via_gpu_append(&mut ks, kv_h, head_dim, 3, RING_TEST_MAX_SEQ);
     assert!(ks.gpu.is_allocated(), "ring should be live before reset");
 
     ks.reset();
@@ -267,7 +271,7 @@ fn quant_rotor_k3_truncate_to_drops_the_gpu_ring() {
         return;
     }
     let (kv_h, head_dim) = (2_i32, 6_i32);
-    let mut ks = QuantRotorK3::new(vec![1, kv_h, 0, head_dim], 64, 0);
+    let mut ks = QuantRotorK3::new(vec![1, kv_h, 0, head_dim], 0);
     ks.rotors = make_rotor_table(0, 0, n_groups_for(head_dim as usize));
 
     // Two CPU appends so `truncate_to` has block boundaries to cut on.
@@ -279,7 +283,7 @@ fn quant_rotor_k3_truncate_to_drops_the_gpu_ring() {
     assert_eq!(ks.shape[2], 3);
 
     // A live ring covering all 3 tokens, then truncate back to 2.
-    seed_ring_via_gpu_append(&mut ks, kv_h, head_dim, 3);
+    seed_ring_via_gpu_append(&mut ks, kv_h, head_dim, 3, RING_TEST_MAX_SEQ);
     assert!(ks.gpu.is_allocated());
 
     ks.truncate_to(2);

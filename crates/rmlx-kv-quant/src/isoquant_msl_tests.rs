@@ -141,7 +141,7 @@ fn iso_v3_dequant_gpu_matches_dequant_cpu() {
     // Build storage by stuffing one CPU-encoded block.
     let (codes, scales, quaternions, norms) =
         iso_encode_fast(&data, head_dim, 4, 3).expect("iso_encode_fast bits=3");
-    let mut vs = QuantIsoV3::new(storage_shape, s_tokens as i32);
+    let mut vs = QuantIsoV3::new(storage_shape);
     vs.blocks.push(IsoBlocks {
         codes,
         scales,
@@ -260,7 +260,7 @@ fn iso_v3_dequant_gpu_empty_cache_returns_zero_array() {
         return;
     }
     let storage_shape: Vec<i32> = vec![1, 4, 0, 128];
-    let vs = QuantIsoV3::new(storage_shape, 0);
+    let vs = QuantIsoV3::new(storage_shape);
     let arr = vs.dequant_gpu(Device::Gpu).expect("dequant_gpu empty");
     assert_eq!(arr.shape(), vec![1, 4, 0, 128]);
 }
@@ -280,7 +280,7 @@ fn iso_v3_dequant_gpu_shape_divergence_errors() {
     // Declare a non-empty shape but leave `blocks` empty — actual_total = 0,
     // declared_total = 1 * 4 * 16 * 128 > 0, so the MEDIUM-1 guard must fire.
     let storage_shape: Vec<i32> = vec![1, 4, 16, 128];
-    let vs = QuantIsoV3::new(storage_shape, 16);
+    let vs = QuantIsoV3::new(storage_shape);
     let err = vs
         .dequant_gpu(Device::Gpu)
         .expect_err("shape divergence must error");

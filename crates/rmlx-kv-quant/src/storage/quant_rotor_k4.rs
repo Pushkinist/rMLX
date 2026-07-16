@@ -42,8 +42,6 @@ pub struct QuantRotorK4 {
     pub blocks: Vec<RotorKBlocks>,
     /// Accumulated shape `[B, kv_h, S_total, D]`.
     pub shape: Vec<i32>,
-    /// Maximum sequence length the storage was provisioned for.
-    pub max_seq: i32,
     /// Layer index used to seed the rotor table.
     pub layer_idx: u32,
     /// Head index (currently always 0).
@@ -60,7 +58,6 @@ impl std::fmt::Debug for QuantRotorK4 {
             .field("gpu_resident", &self.gpu.is_allocated())
             .field("n_blocks", &self.blocks.len())
             .field("shape", &self.shape)
-            .field("max_seq", &self.max_seq)
             .field("layer_idx", &self.layer_idx)
             .field("head_idx", &self.head_idx)
             .field("bits", &self.bits)
@@ -70,15 +67,16 @@ impl std::fmt::Debug for QuantRotorK4 {
 
 impl QuantRotorK4 {
     /// Construct an empty `QuantRotorK4`.
+    ///
+    /// The provisioned window is not stored here — see [`QuantRotorK3::new`].
     #[must_use]
-    pub fn new(init_shape: Vec<i32>, max_seq: i32, layer_idx: u32) -> Self {
+    pub fn new(init_shape: Vec<i32>, layer_idx: u32) -> Self {
         Self {
             rotors: Vec::new(),
             gpu: RotorGpuK::default(),
             qjl_s_matrix: None,
             blocks: Vec::new(),
             shape: init_shape,
-            max_seq,
             layer_idx,
             head_idx: 0,
             bits: ROTOR4_K_BITS,
@@ -86,14 +84,14 @@ impl QuantRotorK4 {
     }
 
     /// Build a `QuantRotorK4` from pre-computed CPU blocks (SSD hydrate path).
-    /// Takes `max_seq` explicitly — see [`QuantRotorK3::from_cpu_blocks`].
+    /// The provisioned window is not taken here — see
+    /// [`QuantRotorK3::from_cpu_blocks`].
     #[must_use]
     pub fn from_cpu_blocks(
         rotors: Vec<f32>,
         qjl_s_matrix: Option<Vec<f32>>,
         blocks: Vec<RotorKBlocks>,
         shape: Vec<i32>,
-        max_seq: i32,
         layer_idx: u32,
     ) -> Self {
         debug_assert!(
@@ -108,7 +106,6 @@ impl QuantRotorK4 {
             qjl_s_matrix,
             blocks,
             shape,
-            max_seq,
             layer_idx,
             head_idx: 0,
             bits: ROTOR4_K_BITS,
@@ -213,6 +210,8 @@ impl QuantRotorK4 {
     ///
     /// Forwards [`RotorGpuK::seed_from_cpu`] / [`RotorGpuK::append_encoded`]
     /// errors.
+    ///
+    /// `max_seq` is a parameter, not a field — see [`QuantRotorK3::gpu_append`].
     #[allow(clippy::too_many_arguments)]
     pub fn gpu_append(
         &mut self,
@@ -223,9 +222,9 @@ impl QuantRotorK4 {
         head_dim: i32,
         prev_seq: i32,
         new_seq: i32,
+        max_seq: i32,
         device: Device,
     ) -> Result<()> {
-        let max_seq = self.max_seq;
         if !self.gpu.is_allocated() && prev_seq > 0 {
             let (c, s, n) = self.flatten_blocks();
             self.gpu
@@ -304,7 +303,6 @@ impl QuantRotorK4 {
             qjl_s_matrix: self.qjl_s_matrix.clone(),
             blocks: self.blocks.clone(),
             shape: self.shape.clone(),
-            max_seq: self.max_seq,
             layer_idx: self.layer_idx,
             head_idx: self.head_idx,
             bits: self.bits,
