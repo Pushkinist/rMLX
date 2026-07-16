@@ -292,7 +292,8 @@ impl QuantRotorV4 {
 
     /// Push one GPU-encoded chunk into the GPU ring, seeding it from the
     /// accumulated CPU blocks first when it is not yet live. Mirror of
-    /// [`super::QuantRotorV3::gpu_append`].
+    /// [`super::QuantRotorV3::gpu_append`], including the per-call `max_seq`
+    /// window contract.
     ///
     /// # Errors
     ///
@@ -308,9 +309,9 @@ impl QuantRotorV4 {
         head_dim: i32,
         prev_seq: i32,
         new_seq: i32,
+        max_seq: i32,
         device: Device,
     ) -> Result<()> {
-        let max_seq = self.max_seq;
         if !self.gpu.is_allocated() && prev_seq > 0 {
             let (c, s, n) = self.flatten_blocks();
             self.gpu

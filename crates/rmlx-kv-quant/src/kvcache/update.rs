@@ -564,12 +564,17 @@ fn head_dim_from_shape(new_shape: &[i32], ctx: &str) -> Result<usize> {
 /// `feed` decides whether the GPU ring is maintained — see [`RingFeed`]. Only
 /// the symmetric codecs have a kernel that reads the V ring; the V-only rotor
 /// variants pass `Skip`.
+///
+/// `max_seq` is the window the cache is currently provisioned for, read from the
+/// active `KvStorage` variant by the caller and forwarded to the ring — same
+/// contract as the K-side sibling. Ignored when `feed` is `Skip`.
 fn rotor3_gpu_append_into_blocks(
     vs: &mut QuantRotorV3,
     new_v: &Array,
     new_shape: &[i32],
     device: Device,
     feed: RingFeed,
+    max_seq: i32,
 ) -> Result<()> {
     let head_dim = head_dim_from_shape(new_shape, "rotor3_gpu_append_into_blocks")?;
     ensure_v3_rotors(vs, head_dim);
@@ -580,17 +585,19 @@ fn rotor3_gpu_append_into_blocks(
         &vs.rotors,
         crate::rotorquant::ROTOR3_BITS,
     )?;
-    rotor3_v_sync_ring(vs, &gpu, feed, new_shape, head_dim, device)?;
+    rotor3_v_sync_ring(vs, &gpu, feed, new_shape, head_dim, max_seq, device)?;
     push_rotor3_v_block(vs, block, new_shape);
     Ok(())
 }
 
+/// Mirror of [`rotor3_gpu_append_into_blocks`] for [`QuantRotorV4`].
 fn rotor4_gpu_append_into_blocks(
     vs: &mut QuantRotorV4,
     new_v: &Array,
     new_shape: &[i32],
     device: Device,
     feed: RingFeed,
+    max_seq: i32,
 ) -> Result<()> {
     let head_dim = head_dim_from_shape(new_shape, "rotor4_gpu_append_into_blocks")?;
     ensure_v4_rotors(vs, head_dim);
@@ -601,7 +608,7 @@ fn rotor4_gpu_append_into_blocks(
         &vs.rotors,
         crate::rotorquant::ROTOR4_BITS,
     )?;
-    rotor4_v_sync_ring(vs, &gpu, feed, new_shape, head_dim, device)?;
+    rotor4_v_sync_ring(vs, &gpu, feed, new_shape, head_dim, max_seq, device)?;
     push_rotor4_v_block(vs, block, new_shape);
     Ok(())
 }
@@ -720,6 +727,7 @@ fn rotor3_v_sync_ring(
     feed: RingFeed,
     new_shape: &[i32],
     head_dim: usize,
+    max_seq: i32,
     device: Device,
 ) -> Result<()> {
     let (b, kv_h, new_seq) = b_kv_h_new_seq(new_shape)?;
@@ -738,6 +746,7 @@ fn rotor3_v_sync_ring(
         head_dim as i32,
         prev_seq,
         new_seq,
+        max_seq,
         device,
     )
 }
@@ -749,6 +758,7 @@ fn rotor4_v_sync_ring(
     feed: RingFeed,
     new_shape: &[i32],
     head_dim: usize,
+    max_seq: i32,
     device: Device,
 ) -> Result<()> {
     let (b, kv_h, new_seq) = b_kv_h_new_seq(new_shape)?;
@@ -765,6 +775,7 @@ fn rotor4_v_sync_ring(
         head_dim as i32,
         prev_seq,
         new_seq,
+        max_seq,
         device,
     )
 }
@@ -932,7 +943,6 @@ pub(super) fn rotor3_sym_gpu_append(
     if k.is_none() {
         *k = Some(crate::storage::QuantRotorK3::new(
             init_shape.clone(),
-            max_seq,
             layer_idx,
         ));
     }
@@ -942,11 +952,11 @@ pub(super) fn rotor3_sym_gpu_append(
     let Some(ks) = k.as_mut() else {
         return Err(Error::Mlx("RotorSym3 K buffer absent after init".into()));
     };
-    rotor3_gpu_append_into_k_blocks(ks, new_k, new_shape, device, RingFeed::Maintain)?;
+    rotor3_gpu_append_into_k_blocks(ks, new_k, new_shape, device, RingFeed::Maintain, max_seq)?;
     let Some(vs) = v.as_mut() else {
         return Err(Error::Mlx("RotorSym3 V buffer absent after init".into()));
     };
-    rotor3_gpu_append_into_blocks(vs, new_v, new_shape, device, RingFeed::Maintain)
+    rotor3_gpu_append_into_blocks(vs, new_v, new_shape, device, RingFeed::Maintain, max_seq)
 }
 
 /// Mirror of [`rotor3_sym_gpu_append`] for `RotorSym4`.
@@ -977,7 +987,6 @@ pub(super) fn rotor4_sym_gpu_append(
     if k.is_none() {
         *k = Some(crate::storage::QuantRotorK4::new(
             init_shape.clone(),
-            max_seq,
             layer_idx,
         ));
     }
@@ -987,11 +996,11 @@ pub(super) fn rotor4_sym_gpu_append(
     let Some(ks) = k.as_mut() else {
         return Err(Error::Mlx("RotorSym4 K buffer absent after init".into()));
     };
-    rotor4_gpu_append_into_k_blocks(ks, new_k, new_shape, device, RingFeed::Maintain)?;
+    rotor4_gpu_append_into_k_blocks(ks, new_k, new_shape, device, RingFeed::Maintain, max_seq)?;
     let Some(vs) = v.as_mut() else {
         return Err(Error::Mlx("RotorSym4 V buffer absent after init".into()));
     };
-    rotor4_gpu_append_into_blocks(vs, new_v, new_shape, device, RingFeed::Maintain)
+    rotor4_gpu_append_into_blocks(vs, new_v, new_shape, device, RingFeed::Maintain, max_seq)
 }
 
 /// The accumulated `[B, kv_h, S, D]` shape of a mirror-free store, for callers
@@ -6327,7 +6336,7 @@ impl KvCache {
         }
         let vs = v.as_mut().unwrap();
         if device == Device::Gpu {
-            rotor3_gpu_append_into_blocks(vs, new_v, &new_shape, device, RingFeed::Skip)?;
+            rotor3_gpu_append_into_blocks(vs, new_v, &new_shape, device, RingFeed::Skip, max_seq)?;
         } else {
             vs.append(&v_f32, &new_shape)?;
         }
@@ -6426,7 +6435,7 @@ impl KvCache {
         }
         let vs = v.as_mut().unwrap();
         if device == Device::Gpu {
-            rotor4_gpu_append_into_blocks(vs, new_v, &new_shape, device, RingFeed::Skip)?;
+            rotor4_gpu_append_into_blocks(vs, new_v, &new_shape, device, RingFeed::Skip, max_seq)?;
         } else {
             vs.append(&v_f32, &new_shape)?;
         }
@@ -6523,7 +6532,7 @@ impl KvCache {
             return Err(Error::Mlx("RotorSym3 V buffer absent after init".into()));
         };
         if use_gpu {
-            rotor3_gpu_append_into_blocks(vs, new_v, &new_shape, device, RingFeed::Skip)?;
+            rotor3_gpu_append_into_blocks(vs, new_v, &new_shape, device, RingFeed::Skip, max_seq)?;
         } else {
             vs.append(&v_f32, &new_shape)?;
         }
@@ -6614,7 +6623,7 @@ impl KvCache {
             return Err(Error::Mlx("RotorSym4 V buffer absent after init".into()));
         };
         if use_gpu {
-            rotor4_gpu_append_into_blocks(vs, new_v, &new_shape, device, RingFeed::Skip)?;
+            rotor4_gpu_append_into_blocks(vs, new_v, &new_shape, device, RingFeed::Skip, max_seq)?;
         } else {
             vs.append(&v_f32, &new_shape)?;
         }

@@ -2034,6 +2034,13 @@ impl KvCache {
         self.stream_dtype = Some(new_v.dtype());
 
         let prev_seq = self.offset;
+        // Provision this step before the first mutation: both packed rings are
+        // capped by the storage `max_seq`, so it has to cover
+        // `prev_seq + new_seq` before either append runs. Without it the window
+        // freezes at whatever the prompt needed and decode dies mid-stream once
+        // it crosses that bound — on both axes here, since neither has a bf16
+        // mirror to fall back to.
+        self.ensure_decode_capacity(prev_seq + new_seq)?;
         self.rotor_sym_gpu_append(new_k, new_v, &new_shape, device)?;
         self.offset = prev_seq + new_seq;
 

@@ -325,6 +325,11 @@ impl QuantRotorV3 {
     /// This only maintains the ring — the caller still pushes the matching CPU
     /// block, which stays the source of truth for `dequant()` and SSD spill.
     ///
+    /// `max_seq` is the window the cache is provisioned for **right now**, read
+    /// from the active `KvStorage` variant by the caller. It is a parameter
+    /// rather than the `self.max_seq` field so it cannot go stale as the window
+    /// grows during decode — the same contract the K-side ring uses.
+    ///
     /// # Errors
     ///
     /// Forwards [`RotorGpuK::seed_from_cpu`] / [`RotorGpuK::append_encoded`]
@@ -339,9 +344,9 @@ impl QuantRotorV3 {
         head_dim: i32,
         prev_seq: i32,
         new_seq: i32,
+        max_seq: i32,
         device: Device,
     ) -> Result<()> {
-        let max_seq = self.max_seq;
         if !self.gpu.is_allocated() && prev_seq > 0 {
             let (c, s, n) = self.flatten_blocks();
             self.gpu
