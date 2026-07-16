@@ -1315,10 +1315,29 @@ impl KvCache {
         let max_seq = rotor_k_max_seq(&self.storage)?;
         let v_full = self.update_decode_fp16_v_only(new_v, max_seq, device)?;
 
-        let kv_seq = self.offset;
+        // Take `kv_seq` from the store the ring was written from, not from
+        // `self.offset` — one source of truth. They must agree; a divergence
+        // would silently attend over the wrong prefix length rather than error.
+        // Same precedent as `update_and_sdpa_planar_k_fused` (`k_shape[2]`).
+        let kv_seq = rotor_k_accumulated_seq(&self.storage)?;
+        debug_assert_eq!(
+            kv_seq, self.offset,
+            "rotor_k_fused: store seq {kv_seq} != cache offset {} — the ring write \
+             and the attention length disagree",
+            self.offset
+        );
+        // Past this point the cache is already mutated (store appended, offset
+        // advanced, bf16 V accumulated), so `Ok(None)` is NOT available: it
+        // would send the caller into the legacy `update()` path, which appends
+        // K/V a second time and advances `offset` again. Every not-eligible
+        // condition is screened at the call-site gate and by
+        // `rotor_flash_shape_ok` BEFORE any mutation; reaching here without a
+        // ring means an internal invariant broke, so fail loudly.
         let Some((codes, scales, norms, rotors)) = self.rotor_k_packed_view(kv_seq, device)? else {
-            // Ring not live (e.g. QJL-on CPU append seeded the store).
-            return Ok(None);
+            return Err(Error::Mlx(format!(
+                "rotor_k_fused: GPU ring absent after a maintained append \
+                 (kv_seq={kv_seq}, bits={bits}) — internal invariant violated"
+            )));
         };
 
         let q_shape = queries.shape();
@@ -1345,6 +1364,10 @@ impl KvCache {
         let heads_per_kv = n_q_heads / kv_h;
 
         tracing::Span::current().record("path", "rotor_flash_decode");
+        // Select the bit width explicitly. A wildcard arm here would map any
+        // unexpected `bits` onto one width's kernel and decode the other's codes
+        // at the wrong unpack stride — silently wrong K, no error. `bits` is a
+        // plain integer, so no exhaustiveness lint would catch that.
         let flash_out = match bits {
             3 => rotor_flash_decode_sdpa::<3>(
                 queries,
@@ -1362,7 +1385,7 @@ impl KvCache {
                 scale,
                 device,
             )?,
-            _ => rotor_flash_decode_sdpa::<4>(
+            4 => rotor_flash_decode_sdpa::<4>(
                 queries,
                 &codes,
                 &scales,
@@ -1378,6 +1401,12 @@ impl KvCache {
                 scale,
                 device,
             )?,
+            other => {
+                return Err(Error::Quant(format!(
+                    "rotor_k_fused: unsupported bits={other} (only 3 and 4); \
+                     refusing to decode with another width's kernel"
+                )))
+            }
         };
         let out = if flash_out.dtype() == queries.dtype() {
             flash_out
@@ -1467,6 +1496,28 @@ fn rotor_k_store_uses_qjl(storage: &KvStorage) -> bool {
     } else {
         crate::rotor_qjl::rotor_qjl_enabled()
     }
+}
+
+/// Accumulated sequence length held by the active rotor K-only store.
+///
+/// The store's own `shape[2]` — the length the GPU ring was written against —
+/// so callers do not have to trust that `KvCache::offset` still agrees.
+fn rotor_k_accumulated_seq(storage: &KvStorage) -> Result<i32> {
+    let shape = if let KvStorage::RotorKOnly3 { k: Some(ks), .. } = storage {
+        &ks.shape
+    } else if let KvStorage::RotorKOnly4 { k: Some(ks), .. } = storage {
+        &ks.shape
+    } else {
+        return Err(Error::KvStorageMismatch {
+            expected: "RotorKOnly3 | RotorKOnly4 with a live K buffer",
+            got: storage_variant_name(storage),
+        });
+    };
+    shape.get(2).copied().ok_or_else(|| {
+        Error::Mlx(format!(
+            "rotor_k_fused: rotor K store shape {shape:?} has no seq axis"
+        ))
+    })
 }
 
 /// `max_seq` of the active rotor K-only storage variant.

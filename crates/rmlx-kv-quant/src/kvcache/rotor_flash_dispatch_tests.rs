@@ -55,10 +55,15 @@ fn f32_array(data: &[f32], shape: &[i32]) -> Array {
 /// store handed a non-empty rotor table keeps whatever `qjl_s_matrix` it was
 /// built with.
 fn seeded_cache(quant: KvQuant, kv_h: i32, head_dim: i32, use_qjl: bool) -> KvCache {
+    seeded_cache_b(quant, 1, kv_h, head_dim, use_qjl)
+}
+
+/// [`seeded_cache`] with an explicit batch dimension.
+fn seeded_cache_b(quant: KvQuant, b: i32, kv_h: i32, head_dim: i32, use_qjl: bool) -> KvCache {
     let n_groups = n_groups_for(head_dim as usize);
     let rotors = make_rotor_table(0, 0, n_groups);
     let qjl = use_qjl.then(|| make_qjl_projection(head_dim as usize));
-    let shape = vec![1, kv_h, 0, head_dim];
+    let shape = vec![b, kv_h, 0, head_dim];
 
     let storage = if quant == KvQuant::RotorKOnly4 {
         KvStorage::RotorKOnly4 {
@@ -208,6 +213,67 @@ fn rotor_k_only_decode_dispatches_at_head_dim_256() {
         "head_dim=256 decode did not dispatch (delta={})",
         probe.delta
     );
+}
+
+/// `b > 1` must skip the ring feed, not attempt (and fail) it.
+///
+/// `RotorGpuK`'s per-step stride is `kv_h * n_groups` and does not interleave
+/// batch, so a batched chunk cannot be laid into it: the encode arrays carry
+/// `b * kv_h * new_seq * n_groups` entries against a `new_seq * kv_h * n_groups`
+/// span. Attempting it returns `Err` and kills the request, where the CPU blocks
+/// (which handle `b > 1`) would have served it fine.
+///
+/// Drives the ring-maintaining entry point **directly** rather than through
+/// `update_and_sdpa`: the legacy `update_rotor_k_only_*` gates its GPU encode on
+/// the global `rotor_qjl_enabled()` env (default on), so a store-seeded
+/// end-to-end test would silently take the CPU append and never reach this
+/// guard — i.e. pass vacuously.
+fn batched_ring_feed_is_skipped(quant: KvQuant, bits_label: &str) {
+    let device = Device::Gpu;
+    let (b, kv_h, head_dim, new_seq) = (2_i32, 2_i32, 128_i32, 4_i32);
+    let mut cache = seeded_cache_b(quant, b, kv_h, head_dim, false);
+    let shape = [b, kv_h, new_seq, head_dim];
+    let k = f32_array(
+        &lcg_data((b * kv_h * new_seq * head_dim) as usize, 7),
+        &shape,
+    );
+
+    let res = if quant == KvQuant::RotorKOnly4 {
+        super::update::rotor4_k_only_gpu_append(&mut cache, &k, &shape, device)
+    } else {
+        super::update::rotor3_k_only_gpu_append(&mut cache, &k, &shape, device)
+    };
+    res.unwrap_or_else(|e| {
+        panic!("{bits_label}: batched GPU append must not error, got: {e}");
+    });
+
+    let ring_live = if let KvStorage::RotorKOnly3 { k: Some(ks), .. } = cache.storage() {
+        ks.gpu.is_allocated()
+    } else if let KvStorage::RotorKOnly4 { k: Some(ks), .. } = cache.storage() {
+        ks.gpu.is_allocated()
+    } else {
+        panic!("{bits_label}: store vanished");
+    };
+    assert!(
+        !ring_live,
+        "{bits_label}: a b>1 cache must not carry a ring — the stride cannot represent it"
+    );
+}
+
+#[test]
+fn rotor3_batched_gpu_append_skips_the_ring_instead_of_erroring() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    batched_ring_feed_is_skipped(KvQuant::RotorKOnly3, "rotor3");
+}
+
+#[test]
+fn rotor4_batched_gpu_append_skips_the_ring_instead_of_erroring() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    batched_ring_feed_is_skipped(KvQuant::RotorKOnly4, "rotor4");
 }
 
 #[test]

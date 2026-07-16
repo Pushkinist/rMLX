@@ -250,9 +250,19 @@ impl QuantRotorK3 {
     /// Concatenate the accumulated CPU blocks into flat sequence-major
     /// `(codes, scales, norms)` — the form [`RotorGpuK::seed_from_cpu`] wants.
     fn flatten_blocks(&self) -> (Vec<u32>, Vec<f32>, Vec<f32>) {
-        let mut codes = Vec::new();
-        let mut scales = Vec::new();
-        let mut norms = Vec::new();
+        // Exact capacities — the prefill seed concatenates the whole prefix
+        // (millions of entries at long context), so growing from empty would
+        // realloc+memcpy repeatedly.
+        let (n_codes, n_scales, n_norms) = self.blocks.iter().fold((0, 0, 0), |(c, s, n), blk| {
+            (
+                c + blk.codes.len(),
+                s + blk.scales.len(),
+                n + blk.norms.len(),
+            )
+        });
+        let mut codes = Vec::with_capacity(n_codes);
+        let mut scales = Vec::with_capacity(n_scales);
+        let mut norms = Vec::with_capacity(n_norms);
         for blk in &self.blocks {
             codes.extend_from_slice(&blk.codes);
             scales.extend_from_slice(&blk.scales);

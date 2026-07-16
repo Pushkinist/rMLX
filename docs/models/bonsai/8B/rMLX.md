@@ -52,9 +52,10 @@ directly. Bar (§3): WIN / TIE-on-noise / LOSS.
   > **Superseded for `k_rotor3/4` (with `--rotor-qjl off`).** Their per-step
   > full-prefix CPU dequant is replaced by a fused MSL flash-decode over the
   > packed rotor store (`rotor_flash_decode`, `docs/KV_QUANT.md`). Re-measured on
-  > this model at 4k: `k_rotor3` 1.34 → **16.2** TPS, `k_rotor4` 1.36 → **17.0**
-  > (24× over the `--rotor-qjl on` default). The rows below are a pre-kernel
-  > snapshot. `k_iso*` and the default `--rotor-qjl on` path are unchanged.
+  > this model at 4k: `k_rotor3` 1.34 → **17.0** TPS, `k_rotor4` 1.36 → **15.9**
+  > (medians of 3+ runs; ~26× over the `--rotor-qjl on` default). The rows below
+  > are a pre-kernel snapshot. `k_iso*` and the default `--rotor-qjl on` path are
+  > unchanged.
 
 ---
 

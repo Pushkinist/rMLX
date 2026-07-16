@@ -148,6 +148,19 @@ impl RotorGpuK {
         }
 
         if !self.is_allocated() {
+            // Allocating here and writing only `[prev_seq, needed)` would leave
+            // `[0, prev_seq)` zeroed — attention over a zeroed prefix, silently
+            // wrong rather than an error. A prefix that already exists must come
+            // in through `seed_from_cpu` first. Enforced here, not just in the
+            // `QuantRotorK::gpu_append` caller, because this type is publicly
+            // re-exported.
+            if prev_seq > 0 {
+                return Err(Error::Quant(format!(
+                    "RotorGpuK::append_encoded: ring is unallocated but prev_seq={prev_seq} \
+                     tokens already exist — seed_from_cpu() must upload the prefix first, \
+                     or [0, {prev_seq}) would silently read as zeros"
+                )));
+            }
             let cap = page_round(needed, max_seq);
             self.alloc(cap, device)?;
         } else if needed > self.capacity {

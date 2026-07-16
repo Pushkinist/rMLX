@@ -2559,9 +2559,35 @@ must not change how existing bytes are read.
 
 | Variant | Eligible? | Notes |
 |---|---|---|
-| `KvStorage::RotorKOnly3` / `RotorKOnly4`, QJL off | **YES** | GPU ring + `rotor_flash_decode_sdpa`. |
+| `KvStorage::RotorKOnly3` / `RotorKOnly4`, QJL off, `b == 1` | **YES** | GPU ring + `rotor_flash_decode_sdpa`. |
 | `KvStorage::RotorKOnly{3,4}`, QJL on | NO | Kernel cannot reproduce the QJL residual. |
+| `KvStorage::RotorKOnly{3,4}`, `b > 1` | NO | Ring stride does not interleave batch — see below. |
 | `Rotor{3,4}Sym`, `RotorK{3,4}Asym` | NO | V side is also rotor / affine-quantized; this kernel takes bf16 V only. Shares the K-decode half when a quant-V kernel lands. |
+
+### Ring eligibility is passed down, not inferred
+
+`RotorGpuK` is only built for the codecs that can actually read it. The rotor K
+GPU encode takes a `RingFeed` from its caller: `Maintain` from the two K-only
+paths (prefill `update_rotor_k_only_*` and the fused decode entry), `Skip` from
+the sym/asym mirrors. A ring for a non-eligible codec is not free —
+`capacity * kv_h * n_groups * 8 + capacity * kv_h * 4` bytes per layer, growing
+with context (order of a few hundred MB across a 36-layer model at 4k) — and
+nothing would ever read it.
+
+**Invariant: the ring either tracks `blocks` exactly, or it does not exist.** A
+skipped feed *clears* rather than leaving the ring behind. A stale ring (blocks
+grown, ring not) is the dangerous state: the next append takes `prev_seq` from
+the longer `shape` and writes past the ring's filled region, leaving the gap
+zeroed and attention silently wrong. Because a cleared ring re-seeds from
+`blocks` on the next maintained append (`seed_from_cpu`), this is self-healing —
+`reset()` / `truncate_to()` / a CPU `append()` all just drop it.
+
+**`b > 1` skips.** The ring's per-step stride is `kv_h * n_groups` and does not
+interleave batch, so a batched chunk cannot be laid into it (the encode carries
+`b` × the span). That degrades to the CPU dequant path, which handles `b > 1`
+correctly — it must not error, since a batched rotor cache worked before this
+kernel existed. Both the append (`rotor{3,4}_sync_ring`) and the dispatcher
+(`rotor_flash_shape_ok`) gate on it.
 
 ### Arch reachability
 
@@ -2579,19 +2605,23 @@ reaches it.
 
 ### Performance posture
 
-4k prompt, `release-perf`, `--rotor-qjl off`, decode TPS. "Before" is the same
-binary minus this change, so the delta is the kernel alone (the QJL flag is held
-constant across the pair).
+4k prompt, `release-perf`, `--rotor-qjl off`, decode TPS (median of 3+ runs).
+"Before" is the same binary minus this change, so the delta is the kernel alone
+(the QJL flag is held constant across the pair).
 
 | Model | Codec | Before | After | Gain |
 |---|---|---|---|---|
-| Bonsai-8B (Qwen3, D=128) | `k_rotor3` | 1.34 | **16.2** | 12.0× |
-| Bonsai-8B | `k_rotor4` | 1.36 | **17.0** | 12.5× |
-| medgemma-4B (Gemma3, D=256) | `k_rotor3` | 7.37 | **51.1** | 6.9× |
-| medgemma-4B | `k_rotor4` | 7.34 | **48.6** | 6.6× |
+| Bonsai-8B (Qwen3, D=128) | `k_rotor3` | 1.34 | **17.0** | 12.7× |
+| Bonsai-8B | `k_rotor4` | 1.36 | **15.9** | 11.7× |
+| medgemma-4B (Gemma3, D=256) | `k_rotor3` | 7.37 | **51.8** | 7.0× |
+| medgemma-4B | `k_rotor4` | 7.34 | **52.1** | 7.1× |
 
 Against the *default* (`--rotor-qjl on`) baseline the same cells move
-0.66 → 16.2 (Bonsai, 24×) and 2.35 → 51.1 (medgemma, 22×).
+0.66 → 17.0 (Bonsai, 26×) and 2.35 → 51.8 (medgemma, 22×).
+
+Bonsai is a noisy measurement target at this prompt size (k_rotor4 spans
+14.0–17.1 across 5 runs); medgemma is stable to ~±3%. Treat a single Bonsai run
+as indicative only.
 
 The QJL-on path is unchanged (medgemma `k_rotor3`: 2.37–2.40 before,
 2.34–2.36 after — the kernel is dormant and adds no work), as is Gemma4, where

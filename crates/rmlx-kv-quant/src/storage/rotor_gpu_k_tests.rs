@@ -334,6 +334,37 @@ fn clear_drops_the_ring() {
 }
 
 #[test]
+fn append_on_unallocated_ring_with_existing_prefix_errors() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    // The zeroed-prefix footgun: allocating here and writing only
+    // [prev_seq, needed) would leave [0, prev_seq) as zeros — silently wrong
+    // attention. Must be rejected rather than "helpfully" allocated.
+    let mut ring = RotorGpuK::default();
+    let err = ring.append_encoded(
+        &u32_arr(&[1, 2, 3, 4]),
+        &f32_arr(&[1.0, 2.0, 3.0, 4.0]),
+        &f32_arr(&[5.0, 6.0]),
+        KV_H,
+        HEAD_DIM,
+        5, // prev_seq > 0 on an unallocated ring
+        1,
+        64,
+        Device::Gpu,
+    );
+    assert!(
+        err.is_err(),
+        "appending at prev_seq>0 on an unallocated ring must error — \
+         seed_from_cpu() has to upload the prefix first"
+    );
+    assert!(
+        !ring.is_allocated(),
+        "the rejected append must not allocate"
+    );
+}
+
+#[test]
 fn append_beyond_max_seq_errors() {
     if skip_if_no_gpu_env() {
         return;

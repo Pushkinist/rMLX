@@ -54,6 +54,7 @@ fn ref_attention(
     q: &[f32],
     k_deq: &[f32],
     v: &[f32],
+    mask: Option<&[f32]>,
     n_q_heads: usize,
     kv_h: usize,
     kv_seq: usize,
@@ -74,6 +75,12 @@ fn ref_attention(
                 acc += q[hq * head_dim + d] * k_deq[k_row + d];
             }
             *score = acc * scale;
+        }
+        if let Some(m) = mask {
+            // Additive mask, laid out [b, n_q_heads, 1, kv_seq] with b == 1.
+            for (s, score) in scores.iter_mut().enumerate() {
+                *score += m[hq * kv_seq + s];
+            }
         }
 
         // Softmax (max-subtracted, matching the kernel's online form).
@@ -132,11 +139,28 @@ fn rotor_encode_for_test(
     )
 }
 
+/// Run the kernel against the CPU-dequant oracle for one shape, with no mask.
+fn run_oracle(bits: u8, kv_h: usize, heads_per_kv: usize, kv_seq: usize, head_dim: usize) -> bool {
+    run_oracle_masked(bits, kv_h, heads_per_kv, kv_seq, head_dim, false)
+}
+
 /// Run the kernel against the CPU-dequant oracle for one shape.
+///
+/// When `with_mask`, feeds a per-(q_head, key) additive mask with a distinct
+/// value in every cell, so a transposed or mis-strided mask index in either the
+/// kernel or the dispatcher changes the result instead of cancelling out.
 ///
 /// Returns `false` when the GPU is unavailable so the caller can skip.
 #[allow(clippy::expect_used, reason = "test helper: invariants documented")]
-fn run_oracle(bits: u8, kv_h: usize, heads_per_kv: usize, kv_seq: usize, head_dim: usize) -> bool {
+#[allow(clippy::too_many_arguments)]
+fn run_oracle_masked(
+    bits: u8,
+    kv_h: usize,
+    heads_per_kv: usize,
+    kv_seq: usize,
+    head_dim: usize,
+    with_mask: bool,
+) -> bool {
     if skip_if_no_gpu_env() {
         return false;
     }
@@ -155,6 +179,26 @@ fn run_oracle(bits: u8, kv_h: usize, heads_per_kv: usize, kv_seq: usize, head_di
     let q_arr = make_f32_array(&q, &[b as i32, n_q_heads as i32, 1, head_dim as i32]);
     let v_arr = make_f32_array(&v, &[b as i32, kv_h as i32, kv_seq as i32, head_dim as i32]);
 
+    // Asymmetric in both axes and never zero, so a (hq, s) index swap or a wrong
+    // stride shifts the scores rather than landing on an equal value. Includes a
+    // -inf-ish cell to exercise full suppression through the online softmax.
+    let mask_vec: Option<Vec<f32>> = with_mask.then(|| {
+        (0..n_q_heads * kv_seq)
+            .map(|i| {
+                let hq = i / kv_seq;
+                let s = i % kv_seq;
+                if hq == 0 && s == kv_seq / 2 {
+                    -1.0e30
+                } else {
+                    (hq as f32) * 0.25 - (s as f32) * 0.03125
+                }
+            })
+            .collect()
+    });
+    let mask_arr = mask_vec
+        .as_ref()
+        .map(|m| make_f32_array(m, &[b as i32, n_q_heads as i32, 1, kv_seq as i32]));
+
     let out = match bits {
         3 => rotor_flash_decode_sdpa::<3>(
             &q_arr,
@@ -163,7 +207,7 @@ fn run_oracle(bits: u8, kv_h: usize, heads_per_kv: usize, kv_seq: usize, head_di
             &norms,
             &rotors,
             &v_arr,
-            None,
+            mask_arr.as_ref(),
             b as i32,
             kv_h as i32,
             kv_seq as i32,
@@ -179,7 +223,7 @@ fn run_oracle(bits: u8, kv_h: usize, heads_per_kv: usize, kv_seq: usize, head_di
             &norms,
             &rotors,
             &v_arr,
-            None,
+            mask_arr.as_ref(),
             b as i32,
             kv_h as i32,
             kv_seq as i32,
@@ -192,7 +236,17 @@ fn run_oracle(bits: u8, kv_h: usize, heads_per_kv: usize, kv_seq: usize, head_di
     .expect("rotor_flash_decode_sdpa");
 
     let got = array_to_f32(&out);
-    let want = ref_attention(&q, &k_deq, &v, n_q_heads, kv_h, kv_seq, head_dim, scale);
+    let want = ref_attention(
+        &q,
+        &k_deq,
+        &v,
+        mask_vec.as_deref(),
+        n_q_heads,
+        kv_h,
+        kv_seq,
+        head_dim,
+        scale,
+    );
 
     assert_eq!(got.len(), want.len(), "bits={bits}: output length");
     let mut max_err = 0.0_f32;
@@ -250,6 +304,33 @@ fn rotor4_flash_decode_matches_reference_head_dim_512() {
 #[test]
 fn rotor3_flash_decode_matches_reference_head_dim_256() {
     run_oracle(3, 1, 4, 70, 256);
+}
+
+// ── Additive mask ─────────────────────────────────────────────────────────────
+//
+// Without these the kernel's mask read
+// (`mask_flat[(b * n_q_heads + hq) * kv_seq + t]`) and the dispatcher's mask
+// flatten are never executed — every other test passes `None`, so a transposed
+// or mis-strided mask index would pass the whole suite.
+
+#[test]
+fn rotor3_flash_decode_matches_reference_with_additive_mask() {
+    // kv_h=2, heads_per_kv=4 also pins the GQA (q_head -> kv_head) mapping: the
+    // mask is indexed by q_head while K is indexed by kv_head, so conflating the
+    // two shows up here.
+    run_oracle_masked(3, 2, 4, 40, 128, true);
+}
+
+#[test]
+fn rotor4_flash_decode_matches_reference_with_additive_mask() {
+    run_oracle_masked(4, 2, 4, 40, 128, true);
+}
+
+#[test]
+fn rotor3_flash_decode_matches_reference_with_mask_across_tiles() {
+    // Mask + multi-tile: the per-tile online softmax and the P2 merge both have
+    // to see the masked scores.
+    run_oracle_masked(3, 2, 4, (TILE_SIZE as usize) * 2 + 22, 128, true);
 }
 
 // ── Gates ─────────────────────────────────────────────────────────────────────
