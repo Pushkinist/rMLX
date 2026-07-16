@@ -18,15 +18,61 @@ use rmlx_mlx::Device;
 use rmlx_models::arch;
 use tracing::{info, info_span, warn};
 
-/// Maximum prompt token count.
+/// Default prompt token cap.
 ///
 /// Raised from the historical 4096 (which silently truncated CPU-mode runs to
 /// keep per-step times sane) to 65_536 so the bench harness can submit
-/// full 8k+ canonical prompts. The cap exists only as a sanity guard against
-/// pathologically large inputs; with the KV cache and chunked prefill in place,
-/// per-step time no longer scales with raw prompt length and the historic
-/// truncation rationale no longer applies.
+/// full 8k+ canonical prompts. On `--device cpu` this remains a genuine sanity
+/// guard: CPU forward is O(N^2), so a pathologically long prompt makes a bench
+/// run take pathologically long. On `--device gpu` that rationale does not
+/// apply -- per-step time no longer scales with raw prompt length once the KV
+/// cache and chunked prefill are in place -- so exceeding this default on GPU
+/// is treated as a hard error rather than a silent truncation (see
+/// `resolve_prompt_truncation`).
 pub(crate) const MAX_PROMPT_TOKENS: usize = 65_536;
+
+/// Decide how to handle a tokenized prompt longer than `max_prompt_tokens`.
+///
+/// Returns the effective prompt length to use (`Ok`), or an error when
+/// silently truncating would misrepresent the measurement.
+///
+/// - Prompt fits under the cap: no-op, returns the prompt length unchanged.
+/// - `--device cpu`: always silently truncates (with a `warn!`) -- CPU
+///   forward is genuinely O(N^2), so the cap is a real sanity guard and the
+///   historical behavior is preserved.
+/// - `--device gpu` with an *explicit* `--max-prompt-tokens` or
+///   `--allow-truncate`: the caller opted in, so truncate with a `warn!`
+///   exactly as before.
+/// - `--device gpu` with the default cap and no opt-in: a truncated run would
+///   silently record a shorter measurement that looks like a full-length one,
+///   so this is a hard error instead of a WARN-only truncation.
+pub(crate) fn resolve_prompt_truncation(
+    prompt_len: usize,
+    max_prompt_tokens: usize,
+    device: Device,
+    cap_is_explicit: bool,
+    allow_truncate: bool,
+) -> anyhow::Result<usize> {
+    if prompt_len <= max_prompt_tokens {
+        return Ok(prompt_len);
+    }
+
+    if device == Device::Cpu || cap_is_explicit || allow_truncate {
+        warn!(
+            original = prompt_len,
+            cap = max_prompt_tokens,
+            "baseline: prompt truncated to cap"
+        );
+        return Ok(max_prompt_tokens);
+    }
+
+    Err(anyhow::anyhow!(
+        "prompt has {prompt_len} tokens, exceeding the default --max-prompt-tokens cap of \
+         {max_prompt_tokens} on --device gpu. Silently truncating would record a shorter run \
+         that looks like a full-length measurement. Pass --max-prompt-tokens {prompt_len} (or \
+         higher) to measure the full prompt, or --allow-truncate to opt into truncation."
+    ))
+}
 
 /// Escape a field value for RFC 4180 CSV: wrap in double-quotes if the value
 /// contains a comma, double-quote, or newline, escaping interior double-quotes
@@ -136,8 +182,10 @@ pub(crate) fn compute_phase_timing(
 /// Record a performance baseline for the given model snapshot.
 ///
 /// Steps:
-/// 1. Parse device, read prompt file, tokenize, truncate to `max_prompt_tokens`
-///    (CLI-configurable; defaults to `MAX_PROMPT_TOKENS`).
+/// 1. Parse device, read prompt file, tokenize, then resolve against
+///    `max_prompt_tokens` (CLI-configurable; defaults to `MAX_PROMPT_TOKENS`)
+///    via `resolve_prompt_truncation` -- truncates on `--device cpu` or an
+///    explicit opt-in, errors loudly on `--device gpu` with the default cap.
 /// 2. `arch::load_model` -- capture `load_ms`.
 /// 3. `arch.generate_greedy` -- per-token `step_fn` callback captures wall-clock
 /// so prefill (TTFT) and steady-state decode are timed SEPARATELY.
@@ -160,6 +208,8 @@ pub(crate) fn run_baseline(
     kv_quant_override: Option<rmlx_kv_quant::KvQuant>,
     max_ctx_override: Option<i32>,
     max_prompt_tokens: usize,
+    cap_is_explicit: bool,
+    allow_truncate: bool,
     yarn_override: Option<rmlx_models::qwen3::YarnOverride>,
     sink: &EventRecorder,
     record_args: Option<BaselineRecordArgs<'_>>,
@@ -191,15 +241,17 @@ pub(crate) fn run_baseline(
 
     let mut prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
 
-    // Truncate to `max_prompt_tokens` (CLI-configurable; CPU forward time is O(N^2)).
-    if prompt_ids.len() > max_prompt_tokens {
-        warn!(
-            original = prompt_ids.len(),
-            cap = max_prompt_tokens,
-            "baseline: prompt truncated to cap"
-        );
-        prompt_ids.truncate(max_prompt_tokens);
-    }
+    // Truncate to `max_prompt_tokens` when the cap allows it; on GPU with the
+    // default (non-explicit) cap this is a hard error instead -- see
+    // `resolve_prompt_truncation`.
+    let effective_len = resolve_prompt_truncation(
+        prompt_ids.len(),
+        max_prompt_tokens,
+        device,
+        cap_is_explicit,
+        allow_truncate,
+    )?;
+    prompt_ids.truncate(effective_len);
     let prompt_token_count = prompt_ids.len();
 
     info!(
