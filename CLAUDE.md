@@ -123,6 +123,7 @@ coverage grows.
 8. **Single MLX process per Mac**. Hold the claim file; unload competing MLX
    servers before claiming the GPU; never bypass the claim silently.
 9. **`make ci-perf` builds + tests under `release-perf` (panic=unwind, debug-assertions off).** A failure there that doesn't reproduce under `dev` → rebuild under `release-debug` (full DWARF) and re-run the failing case to capture symbols. Never rely on the `dev` profile to reproduce a release-mode bug — codegen and inlining differ.
+10. **Every KV-cache codec ships an MSL (Metal) decode kernel.** A codec whose decode falls back to CPU dequant is not shippable — it strands the codec at single-digit TPS (GPU idle) and is a bug, not a valid mode. New KV codecs (and the decode path of existing ones) MUST decode on-GPU, reading the quant store directly (fused flash-decode-over-quant; see `docs/KV_QUANT.md`, `docs/FFI.md`, and #45). Each KV `.metal` kernel carries a **native-compilation test** (`xcrun -sdk macosx metal -c`, wired as `make check-metal-compiles` in `make ci`) so MSL syntax errors surface at CI, not on first GPU dispatch. Kernels stay **model-agnostic** — keyed off codec + shape (`head_dim`, `kv_heads`, `bits`), never an arch name.
 
 ## Coding style
 
