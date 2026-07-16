@@ -47,7 +47,7 @@ fn rotor_k3_qjl_sideband_captured() {
     let data = lcg_data(n_rows * head_dim, TEST_SEED);
     let new_shape = [1_i32, 1, n_rows as i32, head_dim as i32];
 
-    let mut qk = QuantRotorK3::new(vec![1, 1, 0, head_dim as i32], n_rows as i32, 0);
+    let mut qk = QuantRotorK3::new(vec![1, 1, 0, head_dim as i32], 0);
     qk.append(&data, &new_shape).unwrap();
     assert!(qk.use_qjl(), "QJL must be ON by default");
 
@@ -73,7 +73,7 @@ fn rotor_k3_qjl_disabled_emits_no_sideband() {
     let data = lcg_data(n_rows * head_dim, TEST_SEED);
     let new_shape = [1_i32, 1, n_rows as i32, head_dim as i32];
 
-    let mut qk = QuantRotorK3::new(vec![1, 1, 0, head_dim as i32], n_rows as i32, 0);
+    let mut qk = QuantRotorK3::new(vec![1, 1, 0, head_dim as i32], 0);
     qk.append(&data, &new_shape).unwrap();
     assert!(!qk.use_qjl(), "QJL must be OFF when env=0");
 
@@ -97,7 +97,7 @@ fn rotor_k4_qjl_sideband_captured() {
     let data = lcg_data(n_rows * head_dim, TEST_SEED);
     let new_shape = [1_i32, 1, n_rows as i32, head_dim as i32];
 
-    let mut qk = QuantRotorK4::new(vec![1, 1, 0, head_dim as i32], n_rows as i32, 0);
+    let mut qk = QuantRotorK4::new(vec![1, 1, 0, head_dim as i32], 0);
     qk.append(&data, &new_shape).unwrap();
     assert!(qk.use_qjl());
 

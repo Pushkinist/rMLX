@@ -1382,6 +1382,14 @@ impl KvCache {
     ) -> Result<Option<Array>> {
         use crate::storage::QuantPlanarK;
 
+        if !matches!(self.storage, KvStorage::PlanarK { .. }) {
+            return Ok(None);
+        }
+        // Provision this step before `max_seq` is read: it caps both the packed
+        // K append and the bf16 V mirror below. Ahead of the first mutation, so
+        // an over-ceiling request is a clean error rather than a torn cache.
+        self.ensure_decode_capacity(self.offset + new_k.shape()[2])?;
+
         // Extract & validate storage variant.
         let KvStorage::PlanarK { k, max_seq } = &mut self.storage else {
             return Ok(None);
@@ -1669,6 +1677,10 @@ impl KvCache {
         ) {
             return Ok(None);
         }
+        // Provision this step before the first mutation: both the packed ring
+        // below and the bf16 V mirror further down are capped by the storage
+        // `max_seq`, so it has to cover `prev_seq + new_seq` first.
+        self.ensure_decode_capacity(prev_seq + new_seq)?;
         self.rotor_k_gpu_append(new_k, &new_shape, device)?;
 
         // CRITICAL: advance `self.offset` BEFORE `update_decode_fp16_v_only` —
