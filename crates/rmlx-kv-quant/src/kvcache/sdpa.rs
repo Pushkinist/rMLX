@@ -16,6 +16,7 @@ use crate::mixed_quant::{mixed_quantized_sdpa, rot_k_tq4v_sdpa};
 use crate::planar_flash_decode_msl::{planar_flash_decode_enabled, planar_flash_decode_sdpa};
 use crate::planar_fused_qk::planar_fused_qk_enabled;
 use crate::planar_fused_qk_msl::planar_fused_qk;
+use crate::rotor_flash_decode_msl::{rotor_flash_decode_sdpa, ROTOR_FLASH_HEAD_DIM_MAX};
 use crate::storage::KvStorage;
 
 use super::helpers::storage_variant_name;
@@ -649,6 +650,46 @@ impl KvCache {
             }
         }
 
+        // 1c. Rotor K-only flash-decode fast path. Without it this codec
+        // CPU-dequants the entire K prefix on every decode step
+        // (`QuantRotorK{3,4}::dequant()` → `Vec<f32>` → re-upload), which is
+        // O(seq) host work per token with the GPU idle. The kernel reads the
+        // packed rotor store directly instead.
+        //
+        // The decode-only gate (q_seq == 1) is checked HERE, not in the helper:
+        // the helper mutates cache state (store append, bf16 V accumulate)
+        // before it knows whether it can complete the SDPA, so a late fallback
+        // would double-append.
+        //
+        // QJL gate: the 1-bit QJL residual is a per-token back-projection
+        // through a dense [head_dim, head_dim] matrix. Reproducing it in the
+        // flash inner loop would cost more bandwidth than the kernel saves, so
+        // a QJL-carrying store keeps the CPU dequant path. `--rotor-qjl off`
+        // reaches the kernel. Same reasoning as the fused-QK shadow path.
+        if matches!(
+            self.storage,
+            KvStorage::RotorKOnly3 { .. } | KvStorage::RotorKOnly4 { .. }
+        ) && device == Device::Gpu
+            && !rotor_k_store_uses_qjl(&self.storage)
+            && queries.shape().get(2).copied().unwrap_or(0) == 1
+        {
+            if let Some(out) = self.update_and_sdpa_rotor_k_fused(
+                queries,
+                new_k,
+                new_v,
+                scale,
+                additive_mask,
+                device,
+            )? {
+                tracing::trace!(
+                    kv_bytes = self.approx_bytes(),
+                    offset = self.offset,
+                    "kv cache bytes"
+                );
+                return Ok(out);
+            }
+        }
+
         // 2. K8V4 TurboFlash path (returns None when not eligible).
         if let Some(out) =
             self.sdpa_dispatch(queries, new_k, new_v, scale, additive_mask, device)?
@@ -1197,5 +1238,297 @@ impl KvCache {
             out.astype(queries.dtype(), device)?
         };
         Ok(Some(out))
+    }
+
+    /// Flash-decode dispatch for the rotor K-only storage variants
+    /// (`RotorKOnly3` / `RotorKOnly4`).
+    ///
+    /// Returns `Some(out)` when the fused kernel ran, `None` to fall through to
+    /// the legacy `update()` + SDPA path (which CPU-dequants the whole K
+    /// prefix every step).
+    ///
+    /// Steps:
+    ///   1. Append `new_k` into the rotor store — GPU encode into the packed
+    ///      ring, no dequant.
+    ///   2. Append `new_v` into the bf16 accumulator (V is bf16 for this codec).
+    ///   3. Take the ring's GPU packed view at the current `S`.
+    ///   4. Run [`rotor_flash_decode_sdpa`] — QK over the packed K + online
+    ///      softmax + bf16-V SV in two Metal dispatches.
+    ///
+    /// The full-prefix `QuantRotorK{3,4}::dequant()` is skipped — that is the
+    /// entire point: it is O(seq) CPU work per decode step.
+    ///
+    /// Caller must have already gated `q_seq == 1` and `device == Gpu` BEFORE
+    /// any cache mutation: this helper mutates cache state (append, bf16 V
+    /// accumulate) before it can know whether the kernel is eligible, so a
+    /// late fallback would double-append.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "all index uses validated by the shape contracts at function entry"
+    )]
+    fn update_and_sdpa_rotor_k_fused(
+        &mut self,
+        queries: &Array,
+        new_k: &Array,
+        new_v: &Array,
+        scale: f32,
+        additive_mask: Option<&Array>,
+        device: Device,
+    ) -> Result<Option<Array>> {
+        let new_shape = new_k.shape();
+        if new_shape.len() != 4 {
+            return Err(Error::Mlx(format!(
+                "rotor_k_fused: new_k rank != 4, got {new_shape:?}"
+            )));
+        }
+        let head_dim = new_shape[3];
+        let new_seq = new_shape[2];
+
+        // Shape gates — checked BEFORE any mutation so a reject is a clean
+        // fall-through to the legacy path.
+        if !Self::rotor_flash_shape_ok(&new_shape) {
+            return Ok(None);
+        }
+
+        // Append K into the rotor store (GPU encode → packed ring) and V into
+        // the bf16 mirror. `update_rotor_k_only_{3,4}` also runs the O(seq)
+        // dequant, so go through the storage append directly.
+        let prev_seq = self.offset;
+        // Not a rotor K-only cache: the caller's gate should have kept us out.
+        // Fall through rather than mutate.
+        let bits = if matches!(self.storage, KvStorage::RotorKOnly3 { .. }) {
+            3_u8
+        } else if matches!(self.storage, KvStorage::RotorKOnly4 { .. }) {
+            4_u8
+        } else {
+            return Ok(None);
+        };
+        self.rotor_k_gpu_append(new_k, &new_shape, device)?;
+
+        // CRITICAL: advance `self.offset` BEFORE `update_decode_fp16_v_only` —
+        // the V-only helper computes its write window as
+        // `[self.offset - new_seq, self.offset)`. Without the pre-increment
+        // every decode step overwrites the last V position instead of
+        // appending. Same ordering as `update_and_sdpa_planar_k_fused`.
+        self.offset = prev_seq + new_seq;
+        let max_seq = rotor_k_max_seq(&self.storage)?;
+        let v_full = self.update_decode_fp16_v_only(new_v, max_seq, device)?;
+
+        // Take `kv_seq` from the store the ring was written from, not from
+        // `self.offset` — one source of truth. They must agree; a divergence
+        // would silently attend over the wrong prefix length rather than error.
+        // Same precedent as `update_and_sdpa_planar_k_fused` (`k_shape[2]`).
+        let kv_seq = rotor_k_accumulated_seq(&self.storage)?;
+        debug_assert_eq!(
+            kv_seq, self.offset,
+            "rotor_k_fused: store seq {kv_seq} != cache offset {} — the ring write \
+             and the attention length disagree",
+            self.offset
+        );
+        // Past this point the cache is already mutated (store appended, offset
+        // advanced, bf16 V accumulated), so `Ok(None)` is NOT available: it
+        // would send the caller into the legacy `update()` path, which appends
+        // K/V a second time and advances `offset` again. Every not-eligible
+        // condition is screened at the call-site gate and by
+        // `rotor_flash_shape_ok` BEFORE any mutation; reaching here without a
+        // ring means an internal invariant broke, so fail loudly.
+        let Some((codes, scales, norms, rotors)) = self.rotor_k_packed_view(kv_seq, device)? else {
+            return Err(Error::Mlx(format!(
+                "rotor_k_fused: GPU ring absent after a maintained append \
+                 (kv_seq={kv_seq}, bits={bits}) — internal invariant violated"
+            )));
+        };
+
+        let q_shape = queries.shape();
+        if q_shape.len() != 4 {
+            return Err(Error::Mlx(format!(
+                "rotor_k_fused: Q shape rank != 4, got {q_shape:?}"
+            )));
+        }
+        let q_seq = q_shape[2];
+        let n_q_heads = q_shape[1];
+        // Defence-in-depth: the call site already gates decode-only.
+        if q_seq != 1 {
+            return Err(Error::Mlx(format!(
+                "rotor_k_fused: q_seq must be 1 (decode-only), got {q_seq}"
+            )));
+        }
+        let b = new_shape[0];
+        let kv_h = new_shape[1];
+        if n_q_heads % kv_h != 0 {
+            return Err(Error::Mlx(format!(
+                "rotor_k_fused: n_q_heads={n_q_heads} not divisible by kv_h={kv_h}"
+            )));
+        }
+        let heads_per_kv = n_q_heads / kv_h;
+
+        tracing::Span::current().record("path", "rotor_flash_decode");
+        // Select the bit width explicitly. A wildcard arm here would map any
+        // unexpected `bits` onto one width's kernel and decode the other's codes
+        // at the wrong unpack stride — silently wrong K, no error. `bits` is a
+        // plain integer, so no exhaustiveness lint would catch that.
+        let flash_out = match bits {
+            3 => rotor_flash_decode_sdpa::<3>(
+                queries,
+                &codes,
+                &scales,
+                &norms,
+                &rotors,
+                &v_full,
+                additive_mask,
+                b,
+                kv_h,
+                kv_seq,
+                head_dim,
+                heads_per_kv,
+                scale,
+                device,
+            )?,
+            4 => rotor_flash_decode_sdpa::<4>(
+                queries,
+                &codes,
+                &scales,
+                &norms,
+                &rotors,
+                &v_full,
+                additive_mask,
+                b,
+                kv_h,
+                kv_seq,
+                head_dim,
+                heads_per_kv,
+                scale,
+                device,
+            )?,
+            other => {
+                return Err(Error::Quant(format!(
+                    "rotor_k_fused: unsupported bits={other} (only 3 and 4); \
+                     refusing to decode with another width's kernel"
+                )))
+            }
+        };
+        let out = if flash_out.dtype() == queries.dtype() {
+            flash_out
+        } else {
+            flash_out.astype(queries.dtype(), device)?
+        };
+        Ok(Some(out))
+    }
+
+    /// Shape gates for the rotor flash-decode kernel, evaluated before any
+    /// cache mutation.
+    ///
+    /// Keyed off shape only — never an arch name. `b == 1` because the packed
+    /// ring's per-step stride does not interleave batch (one `KvCache` per
+    /// request); a batched cache falls back rather than read a layout the
+    /// kernel would misinterpret.
+    fn rotor_flash_shape_ok(new_shape: &[i32]) -> bool {
+        let (Some(&b), Some(&kv_h), Some(&head_dim)) =
+            (new_shape.first(), new_shape.get(1), new_shape.get(3))
+        else {
+            return false;
+        };
+        if b != 1 || kv_h <= 0 {
+            return false;
+        }
+        if head_dim <= 0 || head_dim > ROTOR_FLASH_HEAD_DIM_MAX {
+            return false;
+        }
+        // Tree reduction over `head_dim` threads.
+        (head_dim as u32).is_power_of_two()
+    }
+
+    /// GPU-append `new_k` into whichever rotor K-only store is active.
+    fn rotor_k_gpu_append(
+        &mut self,
+        new_k: &Array,
+        new_shape: &[i32],
+        device: Device,
+    ) -> Result<()> {
+        if matches!(self.storage, KvStorage::RotorKOnly3 { .. }) {
+            super::update::rotor3_k_only_gpu_append(self, new_k, new_shape, device)
+        } else if matches!(self.storage, KvStorage::RotorKOnly4 { .. }) {
+            super::update::rotor4_k_only_gpu_append(self, new_k, new_shape, device)
+        } else {
+            Err(Error::KvStorageMismatch {
+                expected: "RotorKOnly3 | RotorKOnly4",
+                got: storage_variant_name(&self.storage),
+            })
+        }
+    }
+
+    /// `(codes, scales, norms, rotors)` GPU view of the active rotor K store at
+    /// `kv_seq`, or `None` when the ring is not live.
+    fn rotor_k_packed_view(
+        &self,
+        kv_seq: i32,
+        device: Device,
+    ) -> Result<Option<(Array, Array, Array, Array)>> {
+        let (view, rotors) = if let KvStorage::RotorKOnly3 { k: Some(ks), .. } = &self.storage {
+            (ks.gpu_packed_view(kv_seq, device)?, &ks.rotors)
+        } else if let KvStorage::RotorKOnly4 { k: Some(ks), .. } = &self.storage {
+            (ks.gpu_packed_view(kv_seq, device)?, &ks.rotors)
+        } else {
+            return Ok(None);
+        };
+        let Some((codes, scales, norms)) = view else {
+            return Ok(None);
+        };
+        let rotors_arr = crate::rotorquant_msl::rotor_table_to_array(rotors)?;
+        Ok(Some((codes, scales, norms, rotors_arr)))
+    }
+}
+
+/// Whether the active rotor K-only store carries the QJL residual sideband.
+///
+/// Reads the **store's** decision rather than the global
+/// `rotor_qjl_enabled()` toggle. The codec fixes QJL at first append and never
+/// adds or drops the sideband mid-stream, so the store is the authority: a
+/// toggle flipped after the store was built must not change how its existing
+/// bytes are read. Before the first append there is no store yet, so the global
+/// toggle — the value the store is about to be built with — is the answer.
+fn rotor_k_store_uses_qjl(storage: &KvStorage) -> bool {
+    if let KvStorage::RotorKOnly3 { k: Some(ks), .. } = storage {
+        ks.use_qjl()
+    } else if let KvStorage::RotorKOnly4 { k: Some(ks), .. } = storage {
+        ks.use_qjl()
+    } else {
+        crate::rotor_qjl::rotor_qjl_enabled()
+    }
+}
+
+/// Accumulated sequence length held by the active rotor K-only store.
+///
+/// The store's own `shape[2]` — the length the GPU ring was written against —
+/// so callers do not have to trust that `KvCache::offset` still agrees.
+fn rotor_k_accumulated_seq(storage: &KvStorage) -> Result<i32> {
+    let shape = if let KvStorage::RotorKOnly3 { k: Some(ks), .. } = storage {
+        &ks.shape
+    } else if let KvStorage::RotorKOnly4 { k: Some(ks), .. } = storage {
+        &ks.shape
+    } else {
+        return Err(Error::KvStorageMismatch {
+            expected: "RotorKOnly3 | RotorKOnly4 with a live K buffer",
+            got: storage_variant_name(storage),
+        });
+    };
+    shape.get(2).copied().ok_or_else(|| {
+        Error::Mlx(format!(
+            "rotor_k_fused: rotor K store shape {shape:?} has no seq axis"
+        ))
+    })
+}
+
+/// `max_seq` of the active rotor K-only storage variant.
+fn rotor_k_max_seq(storage: &KvStorage) -> Result<i32> {
+    if let KvStorage::RotorKOnly3 { max_seq, .. } | KvStorage::RotorKOnly4 { max_seq, .. } = storage
+    {
+        Ok(*max_seq)
+    } else {
+        Err(Error::KvStorageMismatch {
+            expected: "RotorKOnly3 | RotorKOnly4",
+            got: storage_variant_name(storage),
+        })
     }
 }

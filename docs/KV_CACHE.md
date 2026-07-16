@@ -540,6 +540,17 @@ read the packed K buffer **per token**, so the fix is a coordinated change:
   in the flash / sparse kernels because V is the separate bf16 decode mirror
   (`decode_fp16_v`), not the planar-packed buffer.
 
+**Rotor K joins the same convention.** `QuantRotorK{3,4}`'s CPU blocks were
+already sequence-major (`append` calls `transpose_heads_seq` before encoding),
+but the GPU encode path (`rotor_gpu_encode_block`, QJL-off) fed the kernel the
+head-major chunk unreordered — consistent only because the decode step it ran on
+is `new_seq == 1`, where the transpose is the identity. The GPU-resident ring
+(`storage::RotorGpuK`) that backs `rotor_flash_decode` is sequence-major like the
+rest of the family, so the K-side GPU encode now reorders heads↔seq
+(`transpose` + `Array::contiguous`, skipped on the `new_seq == 1` hot path) to
+match its CPU sibling. The `rotor_flash_decode` P1 kernel indexes K as
+`kv_tok = (b * kv_seq + t) * kv_h + kv_h_idx`; V stays head-major (bf16 mirror).
+
 For a single decode token (`new_seq == 1`) the heads↔seq transpose is the
 identity, so the decode hot path is byte-unchanged; for a single cold-prefill
 chunk (`prev_seq == 0`) the append and dequant transposes cancel. PlanarQuant is

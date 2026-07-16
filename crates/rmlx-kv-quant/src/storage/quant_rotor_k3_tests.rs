@@ -204,3 +204,89 @@ fn quant_rotor_k3_multi_append_matches_single_shot_gqa_with_qjl() {
     );
     unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
 }
+
+// ── GPU ring lifecycle ────────────────────────────────────────────────────────
+//
+// `reset` / `truncate_to` shorten `blocks` + `shape[2]` while a longer GPU ring
+// may still be live. The ring must be dropped, not left behind: a stale ring is
+// longer than the store claims, so the next `gpu_append` takes `prev_seq` from
+// the (shorter) shape and writes into the middle of a ring whose tail still
+// holds the truncated tokens — `packed_view` would then hand the kernel stale
+// keys past the truncation point. Silent wrong answer, no error.
+
+#[allow(
+    clippy::expect_used,
+    reason = "test helper: a failure here is the assertion"
+)]
+fn seed_ring_via_gpu_append(ks: &mut QuantRotorK3, kv_h: i32, head_dim: i32, n_tokens: i32) {
+    use rmlx_mlx::{Array, Device, Dtype};
+    let n_groups = n_groups_for(head_dim as usize) as i32;
+    let cps = (kv_h * n_groups * n_tokens) as usize;
+    let nps = (kv_h * n_tokens) as usize;
+    let codes_b: Vec<u8> = (0..cps).flat_map(|i| (i as u32).to_le_bytes()).collect();
+    let scales_b: Vec<u8> = (0..cps).flat_map(|i| (i as f32).to_le_bytes()).collect();
+    let norms_b: Vec<u8> = (0..nps).flat_map(|i| (i as f32).to_le_bytes()).collect();
+    let codes = Array::from_bytes(&codes_b, &[cps as i32], Dtype::U32).expect("codes");
+    let scales = Array::from_bytes(&scales_b, &[cps as i32], Dtype::F32).expect("scales");
+    let norms = Array::from_bytes(&norms_b, &[nps as i32], Dtype::F32).expect("norms");
+    ks.gpu_append(
+        &codes,
+        &scales,
+        &norms,
+        kv_h,
+        head_dim,
+        0,
+        n_tokens,
+        Device::Gpu,
+    )
+    .expect("gpu_append");
+}
+
+#[test]
+fn quant_rotor_k3_reset_drops_the_gpu_ring() {
+    if crate::test_utils::skip_if_no_gpu_env() {
+        return;
+    }
+    let (kv_h, head_dim) = (2_i32, 6_i32);
+    let mut ks = QuantRotorK3::new(vec![1, kv_h, 0, head_dim], 64, 0);
+    ks.rotors = make_rotor_table(0, 0, n_groups_for(head_dim as usize));
+    seed_ring_via_gpu_append(&mut ks, kv_h, head_dim, 3);
+    assert!(ks.gpu.is_allocated(), "ring should be live before reset");
+
+    ks.reset();
+    assert!(
+        !ks.gpu.is_allocated(),
+        "reset() must drop the ring — a ring outliving the blocks it mirrors \
+         would serve stale keys on the next append"
+    );
+}
+
+#[test]
+fn quant_rotor_k3_truncate_to_drops_the_gpu_ring() {
+    if crate::test_utils::skip_if_no_gpu_env() {
+        return;
+    }
+    let (kv_h, head_dim) = (2_i32, 6_i32);
+    let mut ks = QuantRotorK3::new(vec![1, kv_h, 0, head_dim], 64, 0);
+    ks.rotors = make_rotor_table(0, 0, n_groups_for(head_dim as usize));
+
+    // Two CPU appends so `truncate_to` has block boundaries to cut on.
+    let per_tok = (kv_h * head_dim) as usize;
+    let d1 = lcg_data(per_tok * 2, TEST_SEED);
+    ks.append(&d1, &[1, kv_h, 2, head_dim]).expect("append 1");
+    let d2 = lcg_data(per_tok, TEST_SEED + 1);
+    ks.append(&d2, &[1, kv_h, 1, head_dim]).expect("append 2");
+    assert_eq!(ks.shape[2], 3);
+
+    // A live ring covering all 3 tokens, then truncate back to 2.
+    seed_ring_via_gpu_append(&mut ks, kv_h, head_dim, 3);
+    assert!(ks.gpu.is_allocated());
+
+    ks.truncate_to(2);
+    assert_eq!(ks.shape[2], 2);
+    assert!(
+        !ks.gpu.is_allocated(),
+        "truncate_to() must drop the ring — otherwise packed_view() would still \
+         expose the truncated token"
+    );
+}

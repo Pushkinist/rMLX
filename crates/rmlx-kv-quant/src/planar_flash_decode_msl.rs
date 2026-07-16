@@ -233,7 +233,11 @@ const P1_SOURCE_V4: &str = include_str!("metal/planar_flash_decode_p1.metal");
 //
 // Output:
 // 0. dst          : f32 [n_bh * head_dim]
-const P2_SOURCE: &str = include_str!("metal/planar_flash_decode_p2.metal");
+//
+// The body is codec-agnostic (pure LSE merge over the P1 partials), so it is
+// shared with `rotor_flash_decode_msl`. Each module registers its own
+// `MetalKernel` over the same source.
+const P2_SOURCE: &str = include_str!("metal/flash_decode_merge_p2.metal");
 
 // ── Kernel singletons ─────────────────────────────────────────────────────────
 

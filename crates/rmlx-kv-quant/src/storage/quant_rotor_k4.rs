@@ -12,6 +12,7 @@
 //! Quantized K buffer: `QuantRotorK4` (rotor4 K codec).
 
 use rmlx_core::error::Result;
+use rmlx_mlx::{Array, Device};
 
 use crate::clifford::make_rotor_table;
 use crate::rotorquant::{
@@ -19,6 +20,8 @@ use crate::rotorquant::{
     ROTOR4_BITS, ROTOR4_GROUP_SIZE,
 };
 use crate::storage::quant_rotor_k3::RotorKBlocks;
+
+use super::RotorGpuK;
 
 /// Bit-width of the rotor4 K codec.
 pub const ROTOR4_K_BITS: u8 = ROTOR4_BITS;
@@ -31,6 +34,8 @@ pub const ROTOR4_K_GROUP_SIZE: usize = ROTOR4_GROUP_SIZE;
 pub struct QuantRotorK4 {
     /// Static rotor table for this layer/head.
     pub rotors: Vec<f32>,
+    /// GPU-resident packed ring. Empty until the first `gpu_append`.
+    pub gpu: RotorGpuK,
     /// Static QJL projection matrix (None when QJL is disabled at first append).
     pub qjl_s_matrix: Option<Vec<f32>>,
     /// Accumulated per-token blocks.
@@ -52,6 +57,7 @@ impl std::fmt::Debug for QuantRotorK4 {
         f.debug_struct("QuantRotorK4")
             .field("n_rotors", &(self.rotors.len() / 4))
             .field("use_qjl", &self.qjl_s_matrix.is_some())
+            .field("gpu_resident", &self.gpu.is_allocated())
             .field("n_blocks", &self.blocks.len())
             .field("shape", &self.shape)
             .field("max_seq", &self.max_seq)
@@ -68,6 +74,7 @@ impl QuantRotorK4 {
     pub fn new(init_shape: Vec<i32>, max_seq: i32, layer_idx: u32) -> Self {
         Self {
             rotors: Vec::new(),
+            gpu: RotorGpuK::default(),
             qjl_s_matrix: None,
             blocks: Vec::new(),
             shape: init_shape,
@@ -95,6 +102,9 @@ impl QuantRotorK4 {
         );
         Self {
             rotors,
+            // Hydrated caches start CPU-only; the ring is rebuilt lazily from
+            // the next GPU append.
+            gpu: RotorGpuK::default(),
             qjl_s_matrix,
             blocks,
             shape,
@@ -160,12 +170,84 @@ impl QuantRotorK4 {
             n_tokens: n_tokens_total,
         });
 
+        // A CPU append does not touch the GPU ring, so any live ring is now a
+        // stale prefix. Drop it; the next `gpu_append` re-seeds from `blocks`.
+        self.gpu.clear();
+
         if self.shape.len() != 4 || self.shape[0] == 0 {
             self.shape = new_shape.to_vec();
         } else {
             self.shape[2] += new_shape[2];
         }
         Ok(())
+    }
+
+    /// Concatenate the accumulated CPU blocks into flat sequence-major
+    /// `(codes, scales, norms)`. See [`QuantRotorK3::flatten_blocks`].
+    fn flatten_blocks(&self) -> (Vec<u32>, Vec<f32>, Vec<f32>) {
+        // Exact capacities — the prefill seed concatenates the whole prefix
+        // (millions of entries at long context), so growing from empty would
+        // realloc+memcpy repeatedly.
+        let (n_codes, n_scales, n_norms) = self.blocks.iter().fold((0, 0, 0), |(c, s, n), blk| {
+            (
+                c + blk.codes.len(),
+                s + blk.scales.len(),
+                n + blk.norms.len(),
+            )
+        });
+        let mut codes = Vec::with_capacity(n_codes);
+        let mut scales = Vec::with_capacity(n_scales);
+        let mut norms = Vec::with_capacity(n_norms);
+        for blk in &self.blocks {
+            codes.extend_from_slice(&blk.codes);
+            scales.extend_from_slice(&blk.scales);
+            norms.extend_from_slice(&blk.norms);
+        }
+        (codes, scales, norms)
+    }
+
+    /// Push one GPU-encoded chunk into the GPU ring. Mirror of
+    /// [`QuantRotorK3::gpu_append`].
+    ///
+    /// # Errors
+    ///
+    /// Forwards [`RotorGpuK::seed_from_cpu`] / [`RotorGpuK::append_encoded`]
+    /// errors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gpu_append(
+        &mut self,
+        codes: &Array,
+        scales: &Array,
+        norms: &Array,
+        kv_h: i32,
+        head_dim: i32,
+        prev_seq: i32,
+        new_seq: i32,
+        device: Device,
+    ) -> Result<()> {
+        let max_seq = self.max_seq;
+        if !self.gpu.is_allocated() && prev_seq > 0 {
+            let (c, s, n) = self.flatten_blocks();
+            self.gpu
+                .seed_from_cpu(&c, &s, &n, kv_h, head_dim, prev_seq, max_seq, device)?;
+        }
+        self.gpu.append_encoded(
+            codes, scales, norms, kv_h, head_dim, prev_seq, new_seq, max_seq, device,
+        )
+    }
+
+    /// GPU packed view of the first `kv_seq` positions. Mirror of
+    /// [`QuantRotorK3::gpu_packed_view`].
+    ///
+    /// # Errors
+    ///
+    /// Forwards [`RotorGpuK::packed_view`] errors.
+    pub fn gpu_packed_view(
+        &self,
+        kv_seq: i32,
+        device: Device,
+    ) -> Result<Option<(Array, Array, Array)>> {
+        self.gpu.packed_view(kv_seq, device)
     }
 
     /// Reset the accumulated sequence to zero.
@@ -175,6 +257,7 @@ impl QuantRotorK4 {
     )]
     pub fn reset(&mut self) {
         self.blocks.clear();
+        self.gpu.clear();
         if self.shape.len() >= 4 {
             self.shape[2] = 0;
         }
@@ -198,6 +281,9 @@ impl QuantRotorK4 {
             }
         }
         self.blocks.truncate(keep);
+        // The ring's filled prefix no longer matches `blocks`; drop it rather
+        // than leave a longer-than-truncated prefix live.
+        self.gpu.clear();
         if self.shape.len() >= 4 {
             self.shape[2] = n;
         }
@@ -210,6 +296,11 @@ impl QuantRotorK4 {
     pub fn try_deep_clone(&self) -> Result<Self> {
         Ok(Self {
             rotors: self.rotors.clone(),
+            // The clone starts CPU-only: `blocks` carries the full payload, so
+            // the ring re-seeds from them on the clone's first GPU append.
+            // Sharing the source's Arrays would alias one ring across two
+            // independent caches.
+            gpu: RotorGpuK::default(),
             qjl_s_matrix: self.qjl_s_matrix.clone(),
             blocks: self.blocks.clone(),
             shape: self.shape.clone(),
@@ -234,7 +325,7 @@ impl QuantRotorK4 {
             total += blk.qjl_codes.len();
             total += blk.qjl_norms.len() * size_of::<f32>();
         }
-        total
+        total + self.gpu.byte_size()
     }
 
     /// True when the QJL sideband is active.
