@@ -376,7 +376,7 @@ pub fn generate_greedy<'a>(
                         PROMPT_CACHE.with_inner_mut(|guard| {
                             if let Some(cache) = guard.as_mut() {
                                 let lk = crate::qwen3_5_moe::prompt_cache::active_layout_key();
-                                cache.push(Qwen35MoeEntry {
+                                let stored = cache.push(Qwen35MoeEntry {
                                     prompt_token_ids: prompt_ids.to_vec(),
                                     block_hashes: crate::prompt_cache::chained_block_hashes_seeded(
                                         prompt_ids,
@@ -391,12 +391,14 @@ pub fn generate_greedy<'a>(
                                     kv_quant: Some(kv_quant),
                                     is_ssd_hydrated: false,
                                 });
-                                tracing::debug!(
-                                    prompt_len = prompt_ids.len(),
-                                    token_id = last_id,
-                                    n_slots = cache.slots.len(),
-                                    "qwen3_5moe generate_greedy: hydrated-tail — saved full snapshot"
-                                );
+                                if stored.is_some() {
+                                    tracing::debug!(
+                                        prompt_len = prompt_ids.len(),
+                                        token_id = last_id,
+                                        n_slots = cache.slots.len(),
+                                        "qwen3_5moe generate_greedy: hydrated-tail — saved full snapshot"
+                                    );
+                                }
                             }
                         });
                     }
@@ -567,7 +569,7 @@ pub fn generate_greedy<'a>(
                             // salt chained walk with the active layout_key. When
                             // tier is OFF, helper returns 0 ⇒ legacy un-salted digests.
                             let lk = crate::qwen3_5_moe::prompt_cache::active_layout_key();
-                            cache.push(Qwen35MoeEntry {
+                            let stored = cache.push(Qwen35MoeEntry {
                                 prompt_token_ids: prompt_ids.to_vec(),
                                 block_hashes: crate::prompt_cache::chained_block_hashes_seeded(
                                     prompt_ids,
@@ -582,12 +584,14 @@ pub fn generate_greedy<'a>(
                                 kv_quant: Some(kv_quant),
                                 is_ssd_hydrated: false,
                             });
-                            tracing::debug!(
-                                prompt_len = prompt_ids.len(),
-                                token_id = last_id,
-                                n_slots = cache.slots.len(),
-                                "qwen3_5moe generate_greedy: prompt cache MISS — saved snapshot"
-                            );
+                            if stored.is_some() {
+                                tracing::debug!(
+                                    prompt_len = prompt_ids.len(),
+                                    token_id = last_id,
+                                    n_slots = cache.slots.len(),
+                                    "qwen3_5moe generate_greedy: prompt cache MISS — saved snapshot"
+                                );
+                            }
                         }
                     });
                 }

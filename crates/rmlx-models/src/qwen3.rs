@@ -2154,15 +2154,16 @@ pub fn generate_greedy<'a>(
                     };
                     QWEN3_PROMPT_CACHE.with_inner_mut(|guard| {
                         if let Some(cache) = guard.as_mut() {
-                            cache.push(entry);
-                            let stats = cache.stats();
-                            tracing::debug!(
-                                prompt_len = prompt_ids.len(),
-                                cache_hits = stats.hits,
-                                cache_misses = stats.misses,
-                                cache_bytes = stats.bytes,
-                                "qwen3 generate_greedy: pushed snapshot to prompt cache (miss path)"
-                            );
+                            if cache.push(entry).is_some() {
+                                let stats = cache.stats();
+                                tracing::debug!(
+                                    prompt_len = prompt_ids.len(),
+                                    cache_hits = stats.hits,
+                                    cache_misses = stats.misses,
+                                    cache_bytes = stats.bytes,
+                                    "qwen3 generate_greedy: pushed snapshot to prompt cache (miss path)"
+                                );
+                            }
                         }
                     });
                 }
