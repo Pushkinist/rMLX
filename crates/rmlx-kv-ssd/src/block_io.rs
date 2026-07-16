@@ -2296,7 +2296,7 @@ fn read_layer(st: &SafeTensors<'_>, idx: usize, geom: &str, device: Device) -> R
             let shape = geom_shape(geom)?;
             let use_qjl = tag == ROTOR_SYM_3_QJL_LAYOUT_TAG;
             Ok(KvStorage::RotorSym3 {
-                k: Some(read_quant_rotor_k3(st, idx, &shape, max_seq, use_qjl)?),
+                k: Some(read_quant_rotor_k3(st, idx, &shape, use_qjl)?),
                 v: Some(read_quant_rotor_v3(st, idx, &shape)?),
                 max_seq,
             })
@@ -2307,7 +2307,7 @@ fn read_layer(st: &SafeTensors<'_>, idx: usize, geom: &str, device: Device) -> R
             let shape = geom_shape(geom)?;
             let use_qjl = tag == ROTOR_SYM_4_QJL_LAYOUT_TAG;
             Ok(KvStorage::RotorSym4 {
-                k: Some(read_quant_rotor_k4(st, idx, &shape, max_seq, use_qjl)?),
+                k: Some(read_quant_rotor_k4(st, idx, &shape, use_qjl)?),
                 v: Some(read_quant_rotor_v4(st, idx, &shape)?),
                 max_seq,
             })
@@ -2318,7 +2318,7 @@ fn read_layer(st: &SafeTensors<'_>, idx: usize, geom: &str, device: Device) -> R
             let shape = geom_shape(geom)?;
             let use_qjl = tag == ROTOR_K_ONLY_3_QJL_LAYOUT_TAG;
             Ok(KvStorage::RotorKOnly3 {
-                k: Some(read_quant_rotor_k3(st, idx, &shape, max_seq, use_qjl)?),
+                k: Some(read_quant_rotor_k3(st, idx, &shape, use_qjl)?),
                 max_seq,
             })
         }
@@ -2328,7 +2328,7 @@ fn read_layer(st: &SafeTensors<'_>, idx: usize, geom: &str, device: Device) -> R
             let shape = geom_shape(geom)?;
             let use_qjl = tag == ROTOR_K_ONLY_4_QJL_LAYOUT_TAG;
             Ok(KvStorage::RotorKOnly4 {
-                k: Some(read_quant_rotor_k4(st, idx, &shape, max_seq, use_qjl)?),
+                k: Some(read_quant_rotor_k4(st, idx, &shape, use_qjl)?),
                 max_seq,
             })
         }
@@ -2341,7 +2341,7 @@ fn read_layer(st: &SafeTensors<'_>, idx: usize, geom: &str, device: Device) -> R
             let max_seq = geom_i32(geom, "max_seq")?;
             let shape = geom_shape(geom)?;
             Ok(KvStorage::RotorKAsym3 {
-                k: Some(read_quant_rotor_k3(st, idx, &shape, max_seq, use_qjl)?),
+                k: Some(read_quant_rotor_k3(st, idx, &shape, use_qjl)?),
                 v: Some(read_quant_v_bits(st, idx, &shape, v_bits)?),
                 max_seq,
                 v_bits,
@@ -2355,7 +2355,7 @@ fn read_layer(st: &SafeTensors<'_>, idx: usize, geom: &str, device: Device) -> R
             let max_seq = geom_i32(geom, "max_seq")?;
             let shape = geom_shape(geom)?;
             Ok(KvStorage::RotorKAsym4 {
-                k: Some(read_quant_rotor_k4(st, idx, &shape, max_seq, use_qjl)?),
+                k: Some(read_quant_rotor_k4(st, idx, &shape, use_qjl)?),
                 v: Some(read_quant_v_bits(st, idx, &shape, v_bits)?),
                 max_seq,
                 v_bits,
@@ -3089,7 +3089,6 @@ fn read_quant_rotor_k3(
     st: &SafeTensors<'_>,
     idx: usize,
     shape: &[i32],
-    max_seq: i32,
     use_qjl: bool,
 ) -> Result<QuantRotorK3> {
     let codes_t = tensor_req(st, &format!("l{idx}.k.codes_packed"))?;
@@ -3138,7 +3137,6 @@ fn read_quant_rotor_k3(
         qjl_s_matrix,
         vec![block],
         shape.to_vec(),
-        max_seq,
         0,
     ))
 }
@@ -3152,7 +3150,6 @@ fn read_quant_rotor_k4(
     st: &SafeTensors<'_>,
     idx: usize,
     shape: &[i32],
-    max_seq: i32,
     use_qjl: bool,
 ) -> Result<QuantRotorK4> {
     let codes_t = tensor_req(st, &format!("l{idx}.k.codes_packed"))?;
@@ -3201,7 +3198,6 @@ fn read_quant_rotor_k4(
         qjl_s_matrix,
         vec![block],
         shape.to_vec(),
-        max_seq,
         0,
     ))
 }

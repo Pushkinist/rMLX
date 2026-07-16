@@ -10,10 +10,8 @@ use crate::test_utils::{cosine_similarity_per_row, lcg_data, TEST_SEED};
 #[test]
 fn quant_rotor_k4_new_shapes_correct() {
     let init_shape = vec![1_i32, 4, 0, 128];
-    let max_seq = 64_i32;
-    let q = QuantRotorK4::new(init_shape.clone(), max_seq, 0);
+    let q = QuantRotorK4::new(init_shape.clone(), 0);
     assert_eq!(q.shape, init_shape);
-    assert_eq!(q.max_seq, max_seq);
     assert_eq!(q.bits, ROTOR4_K_BITS);
 }
 
@@ -33,11 +31,7 @@ fn quant_rotor_k4_roundtrip_no_qjl_matches_v_side() {
     let data = lcg_data(n_rows * head_dim, TEST_SEED);
     let new_shape = [b as i32, kv_h as i32, n_seq as i32, head_dim as i32];
 
-    let mut qk = QuantRotorK4::new(
-        vec![b as i32, kv_h as i32, 0_i32, head_dim as i32],
-        n_seq as i32,
-        0,
-    );
+    let mut qk = QuantRotorK4::new(vec![b as i32, kv_h as i32, 0_i32, head_dim as i32], 0);
     qk.append(&data, &new_shape).unwrap();
     let decoded = qk.dequant().unwrap();
 
@@ -66,7 +60,7 @@ fn quant_rotor_k4_reset_clears_seq() {
     let data = lcg_data(n_seq * head_dim, TEST_SEED);
     let new_shape = [1_i32, 1, n_seq as i32, head_dim as i32];
 
-    let mut qk = QuantRotorK4::new(vec![1, 1, 0, head_dim as i32], 16, 0);
+    let mut qk = QuantRotorK4::new(vec![1, 1, 0, head_dim as i32], 0);
     qk.append(&data, &new_shape).unwrap();
     qk.reset();
     assert_eq!(qk.shape[2], 0);
@@ -87,7 +81,7 @@ fn quant_rotor_k4_cosine_empirical_floor_head_dim_128_no_qjl() {
     let data = lcg_data(n_rows * head_dim, TEST_SEED);
     let new_shape = [1_i32, 1, n_rows as i32, head_dim as i32];
 
-    let mut qk = QuantRotorK4::new(vec![1, 1, 0, head_dim as i32], n_rows as i32, 0);
+    let mut qk = QuantRotorK4::new(vec![1, 1, 0, head_dim as i32], 0);
     qk.append(&data, &new_shape).unwrap();
     let decoded = qk.dequant().unwrap();
     let stats = cosine_similarity_per_row(&data, &decoded, head_dim);
@@ -133,7 +127,7 @@ fn quant_rotor_k4_multi_append_matches_single_shot_gqa_with_qjl() {
         }
         out
     };
-    let mut qref = QuantRotorK4::new(vec![1, kv_h as i32, 0, head_dim as i32], 64, 7);
+    let mut qref = QuantRotorK4::new(vec![1, kv_h as i32, 0, head_dim as i32], 7);
     qref.append(
         &build(0, s_total),
         &[1, kv_h as i32, s_total as i32, head_dim as i32],
@@ -142,7 +136,7 @@ fn quant_rotor_k4_multi_append_matches_single_shot_gqa_with_qjl() {
     assert!(qref.use_qjl(), "QJL must be ON for this test");
     let reference = qref.dequant().unwrap();
 
-    let mut qv = QuantRotorK4::new(vec![1, kv_h as i32, 0, head_dim as i32], 64, 7);
+    let mut qv = QuantRotorK4::new(vec![1, kv_h as i32, 0, head_dim as i32], 7);
     qv.append(
         &build(0, chunk_a),
         &[1, kv_h as i32, chunk_a as i32, head_dim as i32],

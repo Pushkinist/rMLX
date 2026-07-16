@@ -68,8 +68,10 @@ pub struct QuantIsoV3 {
     pub blocks: Vec<IsoBlocks>,
     /// Accumulated shape `[B, kv_h, S_total, D]`.
     pub shape: Vec<i32>,
-    /// Maximum sequence length the storage was provisioned for.
-    pub max_seq: i32,
+    // The provisioned window is deliberately NOT a field: it lives on the
+    // `KvStorage` variant, grows as the sequence does, and is passed to
+    // `append_gpu` per call. A cached copy is a snapshot that goes stale the
+    // moment the window grows — the same trap `QuantRotorK{3,4}` used to carry.
     /// Bit-width tag (always [`ISO3_BITS`] for this codec; kept as a field for
     /// symmetry with the other `Quant*` structs and future-proofing).
     pub bits: u8,
@@ -113,7 +115,6 @@ impl std::fmt::Debug for QuantIsoV3 {
         f.debug_struct("QuantIsoV3")
             .field("n_blocks", &self.blocks.len())
             .field("shape", &self.shape)
-            .field("max_seq", &self.max_seq)
             .field("bits", &self.bits)
             .field("gpu_capacity", &self.gpu_capacity)
             .field("gpu_offset", &self.gpu_offset)
@@ -138,11 +139,10 @@ impl QuantIsoV3 {
     /// The seq dim of `init_shape` should be 0 — the first `append` call
     /// supplies `new_shape` with the actual seq increment.
     #[must_use]
-    pub fn new(init_shape: Vec<i32>, max_seq: i32) -> Self {
+    pub fn new(init_shape: Vec<i32>) -> Self {
         Self {
             blocks: Vec::new(),
             shape: init_shape,
-            max_seq,
             bits: ISO3_BITS,
             gpu_codes_buf: None,
             gpu_scales_buf: None,
@@ -225,11 +225,9 @@ impl QuantIsoV3 {
             shape.len() == 4,
             "QuantIsoV3::from_cpu_blocks expects a 4-element [B, kv_h, S, D] shape, got {shape:?}"
         );
-        let max_seq = if shape.len() >= 3 { shape[2] } else { 0 };
         Self {
             blocks,
             shape,
-            max_seq,
             bits: ISO3_BITS,
             // Hydrate path leaves the GPU mirror unallocated. The next
             // `dequant_gpu` call falls back to the CPU-staged upload path
@@ -309,7 +307,6 @@ impl QuantIsoV3 {
         Ok(Self {
             blocks: self.blocks.clone(),
             shape: self.shape.clone(),
-            max_seq: self.max_seq,
             bits: self.bits,
             // Handle refcount via `try_clone` (clone of the lazy MLX handle,
             // not a buffer copy — same pattern as `QuantV::try_deep_clone`).
@@ -433,7 +430,13 @@ impl QuantIsoV3 {
                   Matches `QuantV::append_inner` which carries the same lint allow for \
                   the same reason."
     )]
-    pub fn append_gpu(&mut self, v_arr: &Array, new_shape: &[i32], device: Device) -> Result<()> {
+    pub fn append_gpu(
+        &mut self,
+        v_arr: &Array,
+        new_shape: &[i32],
+        max_seq: i32,
+        device: Device,
+    ) -> Result<()> {
         if new_shape.len() != 4 {
             return Err(rmlx_core::error::Error::Mlx(format!(
                 "QuantIsoV3::append_gpu: expected 4D new_shape, got {new_shape:?}"
@@ -547,6 +550,7 @@ impl QuantIsoV3 {
             &codes_gpu,
             &scales_gpu,
             &norms_gpu,
+            max_seq,
             device,
         );
         match mirror_result {
@@ -605,12 +609,13 @@ impl QuantIsoV3 {
         codes_gpu: &Array,
         scales_gpu: &Array,
         norms_gpu: &Array,
+        max_seq: i32,
         device: Device,
     ) -> Result<()> {
         // ── Lazy-init the GPU mirror on first encode. ──────────────────────
         let init_cap = if self.gpu_codes_buf.is_none() {
-            if self.max_seq > 0 {
-                KV_PAGE_SIZE.min(self.max_seq)
+            if max_seq > 0 {
+                KV_PAGE_SIZE.min(max_seq)
             } else {
                 KV_PAGE_SIZE
             }
@@ -662,14 +667,13 @@ impl QuantIsoV3 {
             let needed = new_offset;
             let pages = (needed as usize).div_ceil(KV_PAGE_SIZE as usize) as i32;
             let mut new_cap = pages * KV_PAGE_SIZE;
-            if self.max_seq > 0 {
-                new_cap = new_cap.min(self.max_seq);
+            if max_seq > 0 {
+                new_cap = new_cap.min(max_seq);
             }
             if new_cap < needed {
                 return Err(rmlx_core::error::Error::Quant(format!(
-                    "append_gpu: needed={needed} > max_seq={max} — caller exceeded \
-                     declared cache capacity",
-                    max = self.max_seq
+                    "append_gpu: needed={needed} > max_seq={max_seq} — caller exceeded \
+                     declared cache capacity"
                 )));
             }
             let codes_len = (words_per_step * new_cap as usize) as i32;

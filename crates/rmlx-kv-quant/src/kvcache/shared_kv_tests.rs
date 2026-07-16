@@ -47,7 +47,6 @@ fn seeded_cache() -> KvCache {
             None,
             Vec::new(),
             vec![1, KV_H, 0, HEAD_DIM],
-            MAX_SEQ,
             0,
         )),
         max_seq: MAX_SEQ,

@@ -86,8 +86,6 @@ pub struct QuantRotorK3 {
     pub blocks: Vec<RotorKBlocks>,
     /// Accumulated shape `[B, kv_h, S_total, D]`.
     pub shape: Vec<i32>,
-    /// Maximum sequence length the storage was provisioned for.
-    pub max_seq: i32,
     /// Layer index (0-based) — used to seed the rotor table.
     pub layer_idx: u32,
     /// Head index (0-based). Currently always `0` (one rotor table per layer).
@@ -104,7 +102,6 @@ impl std::fmt::Debug for QuantRotorK3 {
             .field("gpu_resident", &self.gpu.is_allocated())
             .field("n_blocks", &self.blocks.len())
             .field("shape", &self.shape)
-            .field("max_seq", &self.max_seq)
             .field("layer_idx", &self.layer_idx)
             .field("head_idx", &self.head_idx)
             .field("bits", &self.bits)
@@ -117,15 +114,19 @@ impl QuantRotorK3 {
     ///
     /// Both `rotors` and `qjl_s_matrix` are left empty — they are populated
     /// lazily on the first `append` call once `head_dim` is known.
+    ///
+    /// The provisioned window is deliberately **not** stored here: it lives on
+    /// the `KvStorage` variant, grows as the sequence does, and is passed to
+    /// [`Self::gpu_append`] per call. A copy cached on the store would be a
+    /// snapshot that silently goes stale the moment the window grows.
     #[must_use]
-    pub fn new(init_shape: Vec<i32>, max_seq: i32, layer_idx: u32) -> Self {
+    pub fn new(init_shape: Vec<i32>, layer_idx: u32) -> Self {
         Self {
             rotors: Vec::new(),
             gpu: RotorGpuK::default(),
             qjl_s_matrix: None,
             blocks: Vec::new(),
             shape: init_shape,
-            max_seq,
             layer_idx,
             head_idx: 0,
             bits: ROTOR3_K_BITS,
@@ -134,10 +135,9 @@ impl QuantRotorK3 {
 
     /// Build a `QuantRotorK3` from pre-computed CPU blocks (SSD hydrate path).
     ///
-    /// `max_seq` is the provisioned model window for this layer (NOT the
-    /// accumulated sequence length `shape[2]`). Deriving `max_seq` from
-    /// `shape[2]` here was identified as a silent regression on next-append;
-    /// we take it explicitly from the start.
+    /// The provisioned window is not taken here — see [`Self::new`]. A hydrated
+    /// store therefore cannot disagree with the window the cache is currently
+    /// sized to, however long it sat on disk.
     ///
     /// When `qjl_s_matrix` is `Some(_)` the QJL sideband was active at write
     /// time; the reader hydrates accordingly.
@@ -147,7 +147,6 @@ impl QuantRotorK3 {
         qjl_s_matrix: Option<Vec<f32>>,
         blocks: Vec<RotorKBlocks>,
         shape: Vec<i32>,
-        max_seq: i32,
         layer_idx: u32,
     ) -> Self {
         debug_assert!(
@@ -162,7 +161,6 @@ impl QuantRotorK3 {
             qjl_s_matrix,
             blocks,
             shape,
-            max_seq,
             layer_idx,
             head_idx: 0,
             bits: ROTOR3_K_BITS,
@@ -281,6 +279,11 @@ impl QuantRotorK3 {
     /// This only maintains the ring — the caller still pushes the matching CPU
     /// block, which stays the source of truth for `dequant()` and SSD spill.
     ///
+    /// `max_seq` is the window the cache is provisioned for **right now**, read
+    /// from the active `KvStorage` variant by the caller. It is a parameter
+    /// rather than a field so it cannot go stale as the window grows during
+    /// decode — the same contract `QuantK::append` / `QuantPlanarK::append` use.
+    ///
     /// # Errors
     ///
     /// Forwards [`RotorGpuK::seed_from_cpu`] / [`RotorGpuK::append_encoded`]
@@ -295,9 +298,9 @@ impl QuantRotorK3 {
         head_dim: i32,
         prev_seq: i32,
         new_seq: i32,
+        max_seq: i32,
         device: Device,
     ) -> Result<()> {
-        let max_seq = self.max_seq;
         if !self.gpu.is_allocated() && prev_seq > 0 {
             let (c, s, n) = self.flatten_blocks();
             self.gpu
@@ -377,7 +380,6 @@ impl QuantRotorK3 {
             qjl_s_matrix: self.qjl_s_matrix.clone(),
             blocks: self.blocks.clone(),
             shape: self.shape.clone(),
-            max_seq: self.max_seq,
             layer_idx: self.layer_idx,
             head_idx: self.head_idx,
             bits: self.bits,

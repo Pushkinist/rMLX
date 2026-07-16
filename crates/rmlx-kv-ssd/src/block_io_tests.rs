@@ -239,9 +239,7 @@ fn build_storage(
                 norms,
                 n_tokens: n_tokens_total,
             };
-            let mut qv = QuantIsoV3::from_cpu_blocks(vec![blk], shape.to_vec());
-            // max_seq should reflect the provisioned window, not just S.
-            qv.max_seq = 4096;
+            let qv = QuantIsoV3::from_cpu_blocks(vec![blk], shape.to_vec());
             KvStorage::IsoV3 {
                 k: Some(QuantK::from_cpu_parts(kc, ks, shape.to_vec())),
                 v: Some(qv),
@@ -270,8 +268,7 @@ fn build_storage(
                 norms,
                 n_tokens: n_tokens_total,
             };
-            let mut qv = QuantIsoV4::from_cpu_blocks(vec![blk], shape.to_vec());
-            qv.max_seq = 4096;
+            let qv = QuantIsoV4::from_cpu_blocks(vec![blk], shape.to_vec());
             KvStorage::IsoV4 {
                 k: Some(QuantK::from_cpu_parts(kc, ks, shape.to_vec())),
                 v: Some(qv),
@@ -298,8 +295,7 @@ fn build_storage(
                 norms,
                 n_tokens: n_tokens_total,
             };
-            let mut qv = QuantRotorV3::from_cpu_blocks(rotors, vec![blk], shape.to_vec(), 0);
-            qv.max_seq = 4096;
+            let qv = QuantRotorV3::from_cpu_blocks(rotors, vec![blk], shape.to_vec(), 0);
             KvStorage::RotorV3 {
                 k: Some(QuantK::from_cpu_parts(kc, ks, shape.to_vec())),
                 v: Some(qv),
@@ -326,8 +322,7 @@ fn build_storage(
                 norms,
                 n_tokens: n_tokens_total,
             };
-            let mut qv = QuantRotorV4::from_cpu_blocks(rotors, vec![blk], shape.to_vec(), 0);
-            qv.max_seq = 4096;
+            let qv = QuantRotorV4::from_cpu_blocks(rotors, vec![blk], shape.to_vec(), 0);
             KvStorage::RotorV4 {
                 k: Some(QuantK::from_cpu_parts(kc, ks, shape.to_vec())),
                 v: Some(qv),
@@ -394,8 +389,7 @@ fn build_storage(
                 norms: v_norms,
                 n_tokens: n_tokens_total,
             };
-            let mut qv = QuantIsoV3::from_cpu_blocks(vec![v_blk], shape.to_vec());
-            qv.max_seq = 4096;
+            let qv = QuantIsoV3::from_cpu_blocks(vec![v_blk], shape.to_vec());
             KvStorage::IsoSym3 {
                 k: Some(qk),
                 v: Some(qv),
@@ -428,8 +422,7 @@ fn build_storage(
                 norms: v_norms,
                 n_tokens: n_tokens_total,
             };
-            let mut qv = QuantIsoV4::from_cpu_blocks(vec![v_blk], shape.to_vec());
-            qv.max_seq = 4096;
+            let qv = QuantIsoV4::from_cpu_blocks(vec![v_blk], shape.to_vec());
             KvStorage::IsoSym4 {
                 k: Some(qk),
                 v: Some(qv),
@@ -480,7 +473,7 @@ fn build_storage(
         // the QJL sideband (when active per env) is captured.
         KvQuant::Rotor3Sym => {
             use rmlx_kv_quant::storage::{QuantRotorK3, QuantRotorV3};
-            let mut qk = QuantRotorK3::new(vec![shape[0], shape[1], 0, shape[3]], 4096, 0);
+            let mut qk = QuantRotorK3::new(vec![shape[0], shape[1], 0, shape[3]], 0);
             qk.append(&k_data, shape).unwrap();
             let mut qv = QuantRotorV3::new(vec![shape[0], shape[1], 0, shape[3]], 4096, 0);
             qv.append(&v_data, shape).unwrap();
@@ -492,7 +485,7 @@ fn build_storage(
         }
         KvQuant::Rotor4Sym => {
             use rmlx_kv_quant::storage::{QuantRotorK4, QuantRotorV4};
-            let mut qk = QuantRotorK4::new(vec![shape[0], shape[1], 0, shape[3]], 4096, 0);
+            let mut qk = QuantRotorK4::new(vec![shape[0], shape[1], 0, shape[3]], 0);
             qk.append(&k_data, shape).unwrap();
             let mut qv = QuantRotorV4::new(vec![shape[0], shape[1], 0, shape[3]], 4096, 0);
             qv.append(&v_data, shape).unwrap();
@@ -504,7 +497,7 @@ fn build_storage(
         }
         KvQuant::RotorKOnly3 => {
             use rmlx_kv_quant::storage::QuantRotorK3;
-            let mut qk = QuantRotorK3::new(vec![shape[0], shape[1], 0, shape[3]], 4096, 0);
+            let mut qk = QuantRotorK3::new(vec![shape[0], shape[1], 0, shape[3]], 0);
             qk.append(&k_data, shape).unwrap();
             KvStorage::RotorKOnly3 {
                 k: Some(qk),
@@ -513,7 +506,7 @@ fn build_storage(
         }
         KvQuant::RotorKOnly4 => {
             use rmlx_kv_quant::storage::QuantRotorK4;
-            let mut qk = QuantRotorK4::new(vec![shape[0], shape[1], 0, shape[3]], 4096, 0);
+            let mut qk = QuantRotorK4::new(vec![shape[0], shape[1], 0, shape[3]], 0);
             qk.append(&k_data, shape).unwrap();
             KvStorage::RotorKOnly4 {
                 k: Some(qk),
@@ -526,7 +519,7 @@ fn build_storage(
             v_group_size,
         } => {
             use rmlx_kv_quant::storage::QuantRotorK3;
-            let mut qk = QuantRotorK3::new(vec![shape[0], shape[1], 0, shape[3]], 4096, 0);
+            let mut qk = QuantRotorK3::new(vec![shape[0], shape[1], 0, shape[3]], 0);
             qk.append(&k_data, shape).unwrap();
             // V: affine via TurboQuant V kernel (bits=v_bits). The SSD path uses
             // the QuantV codec — for tests we build with the same kernel the
@@ -546,7 +539,7 @@ fn build_storage(
             v_group_size,
         } => {
             use rmlx_kv_quant::storage::QuantRotorK4;
-            let mut qk = QuantRotorK4::new(vec![shape[0], shape[1], 0, shape[3]], 4096, 0);
+            let mut qk = QuantRotorK4::new(vec![shape[0], shape[1], 0, shape[3]], 0);
             qk.append(&k_data, shape).unwrap();
             let vblk = turbo_quantize_v(&v_data, v_bits, shape).unwrap();
             KvStorage::RotorKAsym4 {

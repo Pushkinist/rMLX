@@ -20,6 +20,15 @@
 //! silently short attention prefix. The growth itself is model-agnostic and
 //! lives on the shared storage `max_seq`, not in this codec.
 //!
+//! # Coverage boundary
+//!
+//! `HEAD_DIM` here is a power of two, so every step takes the **fused**
+//! flash-decode path. The legacy (non-fused) path — which a non-power-of-two
+//! `head_dim` selects, and which feeds the same ring — is covered by
+//! `tests/rotor_decode_grow_legacy.rs`. It lives in its own binary because it
+//! needs the process-global rotor-QJL toggle off. Both are needed: a fix to one
+//! path is not a fix to the other.
+//!
 //! # No env dependence
 //!
 //! These never touch `RMLX_ROTOR_QJL`: pre-seeding the store with a rotor table
@@ -75,7 +84,6 @@ fn seeded_cache(quant: KvQuant, max_seq: i32, ceiling: Option<i32>) -> KvCache {
                 None,
                 Vec::new(),
                 shape,
-                max_seq,
                 0,
             )),
             max_seq,
@@ -87,7 +95,6 @@ fn seeded_cache(quant: KvQuant, max_seq: i32, ceiling: Option<i32>) -> KvCache {
                 None,
                 Vec::new(),
                 shape,
-                max_seq,
                 0,
             )),
             max_seq,
@@ -178,11 +185,38 @@ fn ring_norms(cache: &KvCache, kv_seq: i32, device: Device) -> Option<Vec<f32>> 
     }
 }
 
+/// The bf16 V mirror's per-token slice at `seq`, flattened over heads.
+///
+/// The mirror is `[B, kv_h, max_seq, head_dim]`; a slot that was never written
+/// still reads as its `zeros()` init value.
+fn v_mirror_slot(cache: &KvCache, seq: i32, device: Device) -> Option<(i32, Vec<f32>)> {
+    let v = cache.decode_fp16_v.as_ref()?;
+    let shape = v.shape();
+    let (kv_h, cap, head_dim) = (shape[1], shape[2], shape[3]);
+    let row = v
+        .slice(
+            &[0, 0, seq, 0],
+            &[1, kv_h, seq + 1, head_dim],
+            &[1, 1, 1, 1],
+            device,
+        )
+        .ok()?
+        .astype(Dtype::F32, device)
+        .ok()?;
+    Some((cap, read_f32(&row)))
+}
+
 /// A prompt that exactly saturates the provisioned `max_seq` must still decode.
 ///
 /// This is the zero-headroom case: `prefill == max_seq`, so the very first
 /// generated token crosses the bound. Pre-fix the ring rejected it with
 /// `needed=129 exceeds max_seq=128` and decode died on step 1.
+///
+/// Also pins the V side. The K ring is only half the story: the bf16 V mirror is
+/// allocated `[B, kv_h, max_seq, head_dim]` and is bound by the *same* scalar, so
+/// growing the ring alone would let K extend while every V append landed
+/// out of bounds — a `slice_update` no-op, silent. Asserting `offset` alone
+/// cannot see that: `offset` advances either way.
 fn saturated_prompt_decodes(quant: KvQuant, label: &str) {
     let device = Device::Gpu;
     let mut cache = seeded_cache(quant, MAX_SEQ, None);
@@ -192,10 +226,28 @@ fn saturated_prompt_decodes(quant: KvQuant, label: &str) {
     decode_steps(&mut cache, 64, device)
         .unwrap_or_else(|e| panic!("{label}: decode past a saturated max_seq must not error: {e}"));
 
+    let total = MAX_SEQ + 64;
     assert_eq!(
         cache.offset(),
-        MAX_SEQ + 64,
+        total,
         "{label}: every decode step must land"
+    );
+
+    // V mirror grew in lockstep with the ring …
+    let (cap, last) = v_mirror_slot(&cache, total - 1, device)
+        .unwrap_or_else(|| panic!("{label}: V mirror absent — the test would prove nothing"));
+    assert!(
+        cap >= total,
+        "{label}: V mirror capacity {cap} < sequence {total} — V appends past the \
+         old bound were silently dropped while K grew"
+    );
+    // … and the last decoded token actually landed in it (a dropped append
+    // leaves the slot at its zero init).
+    assert!(
+        last.iter().any(|&x| x != 0.0),
+        "{label}: V mirror slot at seq={} is all zeros — the append was silently \
+         dropped and attention would read a zeroed value vector",
+        total - 1
     );
 }
 
