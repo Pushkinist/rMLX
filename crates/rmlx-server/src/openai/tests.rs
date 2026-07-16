@@ -26,6 +26,57 @@ async fn oom_parts(e: &rmlx_core::Error) -> (StatusCode, Option<String>, Value) 
     (status, retry, body)
 }
 
+/// `engine_error_type` must name every error exactly as `engine_error_response`
+/// spells it in the body it builds.
+///
+/// The two are hand-maintained mirrors of the same variant match, and a stream
+/// that dies mid-flight can only use the former (its status and headers are long
+/// gone) while the blocking route uses the latter. Any drift means one client
+/// sees a different `type` than another for the identical fault — on the key
+/// automation asserts on. A comment cannot enforce that; this test can.
+///
+/// Covers one representative per arm, including the wildcard.
+#[tokio::test]
+async fn engine_error_type_matches_response() {
+    use rmlx_core::OomPhase;
+    let cases: Vec<rmlx_core::Error> = vec![
+        rmlx_core::Error::SmokeProbe("nan".to_owned()),
+        rmlx_core::Error::Oom {
+            phase: OomPhase::LoadWeights,
+            requested_bytes: None,
+            peak_alloc_mb: None,
+            msg: "oom".to_owned(),
+        },
+        rmlx_core::Error::Oom {
+            phase: OomPhase::LoadKvCache,
+            requested_bytes: None,
+            peak_alloc_mb: None,
+            msg: "oom".to_owned(),
+        },
+        rmlx_core::Error::Oom {
+            phase: OomPhase::Generation,
+            requested_bytes: None,
+            peak_alloc_mb: None,
+            msg: "oom".to_owned(),
+        },
+        // wildcard arm — the common case for a mid-decode engine fault.
+        rmlx_core::Error::Mlx("device error".to_owned()),
+        rmlx_core::Error::Other("engine panic".to_owned()),
+    ];
+    for e in &cases {
+        let (_status, _retry, body) = oom_parts(e).await;
+        let from_response = body["error"]["type"]
+            .as_str()
+            .unwrap_or_else(|| panic!("response body carries no error.type for {e:?}: {body}"));
+        assert_eq!(
+            from_response,
+            errors::engine_error_type(e),
+            "engine_error_type drifted from engine_error_response for {e:?} — \
+             a streamed client would see a different `type` than a blocking one"
+        );
+    }
+}
+
 fn assert_mem_fields(err: &Value) {
     // J4 fields must always be present (value may be null if read_proc_mem
     // failed, but the key must exist). On macOS CI they are real numbers.
@@ -1930,7 +1981,7 @@ fn f8_successful_streaming_path_increments_no_error_counter() {
 }
 
 /// F8: an engine error token increments the correct category counter in the
-/// streaming path and emits a `[DONE]` sentinel.
+/// streaming path and terminates the stream with an error event + `[DONE]`.
 #[test]
 fn f8_engine_error_in_streaming_increments_counter() {
     let mut state = StreamState {
@@ -1968,12 +2019,26 @@ fn f8_engine_error_in_streaming_increments_counter() {
         Err(rmlx_core::Error::Mlx("device error".to_owned()));
     let events = handle_streaming_token(err_item, &mut state);
 
-    // Must emit exactly one [DONE] sentinel.
-    assert_eq!(events.len(), 1, "error token must emit exactly one event");
-    let ev_debug = format!("{:?}", events[0].as_ref().unwrap());
+    // Exactly one event: the error payload. A bare terminator would leave the
+    // client holding a truncated answer that looks complete, and the caller
+    // chains the `[DONE]` itself — emitting one here would duplicate it.
+    assert_eq!(
+        events.len(),
+        1,
+        "error token must emit exactly the error event"
+    );
+    let err_debug = format!("{:?}", events[0].as_ref().unwrap());
     assert!(
-        ev_debug.contains("[DONE]"),
-        "error event must be [DONE], got: {ev_debug}"
+        err_debug.contains("\\\"error\\\"") && err_debug.contains("device error"),
+        "error event must carry the OpenAI error envelope naming the cause, got: {err_debug}"
+    );
+    assert!(
+        err_debug.contains("service_unavailable"),
+        "error envelope must carry the stable `type` key automation asserts on, got: {err_debug}"
+    );
+    assert!(
+        !err_debug.contains("[DONE]"),
+        "the terminator is chained by the caller, not emitted here, got: {err_debug}"
     );
 
     // Upstream counter must be 1.

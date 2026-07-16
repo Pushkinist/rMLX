@@ -615,6 +615,84 @@ fn pipelined_decode_lp_k_captures() {
     );
 }
 
+/// A scripted forward that serves `rows` and then fails on call `fail_at`
+/// (0-based over calls into the loop), simulating a decode step that dies
+/// mid-stream — a store refusing an append, a Metal dispatch fault, etc.
+#[allow(clippy::unwrap_used)]
+fn scripted_failing<'r>(
+    rows: &'r [Vec<f32>],
+    calls: &'r Cell<usize>,
+    fail_at: usize,
+) -> impl FnMut(&Array) -> Result<Array> + 'r {
+    move |_y: &Array| {
+        let i = calls.get();
+        calls.set(i + 1);
+        if i == fail_at {
+            return Err(Error::Other("simulated decode step failure".to_owned()));
+        }
+        Ok(logits(
+            &rows
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| rows.last().unwrap().clone()),
+        ))
+    }
+}
+
+/// A decode step that fails must abort the request, not return the tokens
+/// produced so far.
+///
+/// Swallowing the error and breaking hands the caller a short token list that
+/// the server reports as `finish_reason="length"` — byte-identical to hitting
+/// the token cap. Every automated gate we have (bench harness, canary,
+/// regression gate, smoke probes) reads exactly those two signals, so a dead
+/// stream would pass all of them.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: expect_err IS the assertion — an Ok here is the regression under test, and its panic names it"
+)]
+fn pipelined_decode_propagates_step_failure() {
+    let _g = mlx_guard();
+    let tk = tiny_tokenizer(4);
+    let cfg = greedy_cfg();
+    let pen = no_penalties();
+    let mut rng = Pcg32::new(1);
+    // Never argmax an EOS id: the only way out of this loop is the failure.
+    let rows = vec![vec![0.0, 9.0, 0.0, 0.0]];
+    let calls = Cell::new(0);
+    let eos = [3u32];
+    let mut hist: Vec<u32> = vec![0];
+    let mut steps: Vec<ProbeStep> = vec![ProbeStep {
+        token_id: 0,
+        piece: "t0".to_string().into_boxed_str(),
+        max_abs_logit: 0.0,
+        nan_count: 0,
+        logprobs: None,
+    }];
+    let mut step_fn = |_: &ProbeStep| None;
+    let mut c = ctx(
+        &tk,
+        4,
+        32,
+        &eos,
+        &mut step_fn,
+        None,
+        &cfg,
+        &mut rng,
+        &pen,
+        &mut hist,
+        true,
+    );
+    // Two clean steps, then the third forward fails.
+    let err = pipelined_decode(&mut c, 0, &mut steps, scripted_failing(&rows, &calls, 2))
+        .expect_err("a failed decode step must surface as Err, not a short Ok generation");
+    assert!(
+        err.to_string().contains("simulated decode step failure"),
+        "the underlying cause must reach the caller verbatim, got: {err}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // chunked_prefill
 // ---------------------------------------------------------------------------

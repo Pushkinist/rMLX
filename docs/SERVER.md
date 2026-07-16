@@ -371,6 +371,23 @@ a populated `usage` object is appended before `[DONE]`.
 alongside the content delta. Chunks that carry no content token (role preamble,
 tool_call, usage chunk) omit the field.
 
+**Mid-stream failure**: when generation dies after the stream has started, the
+HTTP status is already `200`, so the failure is reported in the payload — an
+error event in the same envelope the blocking route returns, emitted in place
+of (never alongside) a terminal `finish_reason` chunk:
+
+```
+data: {"error":{"message":"…","type":"service_unavailable"}}
+
+data: [DONE]
+```
+
+A stream that carries no `finish_reason` chunk did **not** complete. Clients and
+harnesses must treat the absence of a terminal `finish_reason` — or the presence
+of an `error` key — as a failure, never as a short answer. `finish_reason` is
+never `"error"`: that value is not in the OpenAI enum, and the Anthropic mapping
+below would launder it into a successful `stop_reason`.
+
 ### Stop-sequence truncation
 
 The `stop` parameter (OpenAI `stop`, Anthropic `stop_sequences`) truncates the
@@ -414,6 +431,20 @@ Anthropic `stop_reason` field via `map_stop_reason` in
 | `"length"` (token cap) | `"max_tokens"` |
 | `"tool_calls"` | `"tool_use"` |
 | anything else / `None` | `"end_turn"` |
+
+The `anything else / None → "end_turn"` row is why a failed generation must
+never reach this mapping: it resolves every unknown reason to a *successful*
+stop. A stream that dies mid-flight instead terminates with Anthropic's native
+`error` event and emits no `message_delta` / `message_stop`:
+
+```
+event: error
+data: {"type":"error","error":{"type":"service_unavailable_error","message":"…"}}
+```
+
+A `/v1/messages` stream without a `message_stop` did not complete. The `type`
+carries this surface's `_error` suffix — matching what `/v1/messages` returns
+for the same fault on the blocking path, not the OpenAI spelling.
 
 `"stop_sequence"` is **never** produced by `map_stop_reason`. It is set
 exclusively by the stop-matching path in `blocking.rs` /
