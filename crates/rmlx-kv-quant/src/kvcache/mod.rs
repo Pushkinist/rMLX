@@ -78,6 +78,11 @@ mod shared_kv_tests;
 #[path = "prefill_grow_tests.rs"]
 mod prefill_grow_tests;
 
+// Decode-side growth of the provisioned `max_seq`.
+#[cfg(test)]
+#[path = "decode_grow_tests.rs"]
+mod decode_grow_tests;
+
 // Thread real layer_idx into rotor3/rotor4 KV-cache construction.
 #[cfg(test)]
 #[path = "rotor3_layer_idx_tests.rs"]

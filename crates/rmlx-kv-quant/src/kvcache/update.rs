@@ -796,6 +796,12 @@ pub(super) fn rotor3_k_only_gpu_append(
     let Some(ks) = k.as_mut() else {
         return Err(Error::Mlx("RotorKOnly3 K buffer absent after init".into()));
     };
+    // The store caches its own copy of the provisioned window, taken when it was
+    // built. The storage scalar is the single source of truth and grows as the
+    // sequence does, so refresh the copy here — otherwise the ring keeps sizing
+    // against the bound that was current at construction and rejects appends the
+    // cache has already made room for.
+    ks.max_seq = max_seq;
     rotor3_gpu_append_into_k_blocks(ks, new_k, new_shape, device, RingFeed::Maintain)
 }
 
@@ -832,6 +838,9 @@ pub(super) fn rotor4_k_only_gpu_append(
     let Some(ks) = k.as_mut() else {
         return Err(Error::Mlx("RotorKOnly4 K buffer absent after init".into()));
     };
+    // Refresh the store's cached window from the storage scalar — see
+    // [`rotor3_k_only_gpu_append`].
+    ks.max_seq = max_seq;
     rotor4_gpu_append_into_k_blocks(ks, new_k, new_shape, device, RingFeed::Maintain)
 }
 
@@ -897,6 +906,12 @@ impl KvCache {
         }
 
         let new_seq = new_k.shape()[2];
+        // Provision the step before any mutation: `update_prefill_raw` runs the
+        // prefill-side check itself, so this covers the decode dispatch below,
+        // whose stores all cap their capacity at the storage `max_seq`.
+        if !self.in_prefill {
+            self.ensure_decode_capacity(self.offset + new_seq)?;
+        }
         self.offset += new_seq;
 
         if self.in_prefill {
@@ -1206,6 +1221,93 @@ impl KvCache {
             KvStorage::RotorKAsym3 { k, v, .. } => k.is_some() || v.is_some(),
             KvStorage::RotorKAsym4 { k, v, .. } => k.is_some() || v.is_some(),
         }
+    }
+
+    /// Grow the provisioned `max_seq` when the next **decode** append would
+    /// overflow it.
+    ///
+    /// `max_seq` is provisioned lazily: it starts at the small default and
+    /// [`Self::ensure_prefill_capacity`] grows it as the prompt fills. Decode
+    /// then appends one token per step, so a sequence that crosses the
+    /// provisioned bound has to grow it too. Without this, `max_seq` freezes at
+    /// whatever the prompt happened to need and every store that caps its own
+    /// capacity at `max_seq` stops accepting appends mid-stream — each in a
+    /// different way, none of them good:
+    ///
+    /// * the packed GPU rings raise a shape error and abort the decode step;
+    /// * the paged code buffers clamp their capacity and slice to zero length,
+    ///   surfacing as a downstream reshape failure;
+    /// * the bf16 mirrors `slice_update` out of bounds, which is a **silent
+    ///   no-op** — the token never lands in the cache and attention quietly
+    ///   reads a short prefix.
+    ///
+    /// Growing here keeps one provisioning rule for both phases, so the stores
+    /// stay on the paged/realloc growth paths they already implement.
+    ///
+    /// Unlike the prefill path there is no "payload already materialised" guard:
+    /// at decode the payload always exists, and raising `max_seq` is precisely
+    /// what lets each store's own grow path extend it (capacity is tracked
+    /// per-store and copied forward on realloc, so the scalar and the buffers
+    /// cannot disagree).
+    ///
+    /// The hard cap and the `--max-ctx` ceiling still bound the growth: a
+    /// request that genuinely cannot fit is rejected loudly rather than
+    /// truncated.
+    pub(super) fn ensure_decode_capacity(&mut self, needed_seq: i32) -> Result<()> {
+        // Hard cap: opt-in via `RMLX_KV_MAX_SEQ_HARD_CAP`. Unset → no cap.
+        if let Some(cap) = kv_hard_cap() {
+            if needed_seq > cap {
+                tracing::warn!(
+                    requested = needed_seq,
+                    cap,
+                    "KV hard cap exceeded — rejecting decode step"
+                );
+                return Err(Error::KvHardCapExceeded {
+                    requested: needed_seq,
+                    cap,
+                });
+            }
+        }
+
+        // Virtual ceiling: the resolved `--max-ctx`. A decode step that would
+        // carry the sequence past it cannot be served by growing, so reject it
+        // with the same typed error the prefill path uses.
+        if let Some(ceiling) = self.max_seq_ceiling {
+            if needed_seq > ceiling {
+                tracing::warn!(
+                    requested = needed_seq,
+                    ceiling,
+                    "KV max-ctx ceiling exceeded — rejecting decode step"
+                );
+                return Err(Error::KvCeilingExceeded {
+                    requested: needed_seq,
+                    ceiling,
+                });
+            }
+        }
+
+        let current_max_seq = storage_max_seq(&self.storage);
+        if needed_seq <= current_max_seq {
+            return Ok(());
+        }
+
+        // Same doubling policy as the prefill grow: one realloc buys headroom
+        // for many decode steps instead of one per token. `needed_seq <=
+        // ceiling` is guaranteed above, so the clamp still fits the request.
+        let new_max_seq = match self.max_seq_ceiling {
+            Some(ceiling) => next_pow2_seq(needed_seq).min(ceiling),
+            None => next_pow2_seq(needed_seq),
+        };
+
+        tracing::debug!(
+            from = current_max_seq,
+            to = new_max_seq,
+            needed_seq,
+            "KV decode buffer grow"
+        );
+
+        set_storage_max_seq(&mut self.storage, new_max_seq);
+        Ok(())
     }
 
     /// Append a prefill K/V chunk into the per-layer raw prefill buffer.
