@@ -292,32 +292,6 @@ fn iso3_gpu_append_into_k_blocks(
 
 // ── Rotor3 / rotor4 MSL helpers ───────────────────────────────────────────────
 
-/// Encode a KV chunk (`new_kv`, shape `[B, kv_h, S, D]`) via the
-/// `bits`-bit rotor MSL kernel and return the resulting CPU
-/// [`RotorBlocks`].
-///
-/// The kernel is axis-agnostic: V-side and K-side (QJL off) callers feed
-/// identically-shaped slices and consume the same `(codes, scales, norms)`
-/// triple. The `rotors` slice is the static per-(layer, head) rotor table,
-/// flat `[n_groups * 4]` f32.
-///
-/// # Errors
-///
-/// Forwards Metal kernel / shape errors as `Error::Mlx` / `Error::Quant`.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "shape rank guarded to 4 immediately above each indexing site; new_shape[0..=3] are always in-bounds"
-)]
-fn rotor_gpu_encode_block(
-    new_kv: &Array,
-    new_shape: &[i32],
-    rotors: &[f32],
-    bits: u8,
-) -> Result<RotorBlocks> {
-    let (block, _gpu) = rotor_gpu_encode_block_retaining(new_kv, new_shape, rotors, bits)?;
-    Ok(block)
-}
-
 /// The GPU-resident `(codes, scales, norms)` triple a rotor encode produced,
 /// retained so a caller can push it straight into a GPU ring instead of
 /// re-uploading the downloaded CPU copy.
@@ -586,15 +560,27 @@ fn head_dim_from_shape(new_shape: &[i32], ctx: &str) -> Result<usize> {
 
 /// V-side convenience wrapper: GPU-encode + push onto a [`QuantRotorV3`]
 /// buffer. Lazy-inits the rotor table on first call.
+///
+/// `feed` decides whether the GPU ring is maintained — see [`RingFeed`]. Only
+/// the symmetric codecs have a kernel that reads the V ring; the V-only rotor
+/// variants pass `Skip`.
 fn rotor3_gpu_append_into_blocks(
     vs: &mut QuantRotorV3,
     new_v: &Array,
     new_shape: &[i32],
+    device: Device,
+    feed: RingFeed,
 ) -> Result<()> {
     let head_dim = head_dim_from_shape(new_shape, "rotor3_gpu_append_into_blocks")?;
     ensure_v3_rotors(vs, head_dim);
-    let block =
-        rotor_gpu_encode_block(new_v, new_shape, &vs.rotors, crate::rotorquant::ROTOR3_BITS)?;
+    let seq_major = rotor_chunk_seq_major(new_v, new_shape, device)?;
+    let (block, gpu) = rotor_gpu_encode_block_retaining(
+        &seq_major,
+        new_shape,
+        &vs.rotors,
+        crate::rotorquant::ROTOR3_BITS,
+    )?;
+    rotor3_v_sync_ring(vs, &gpu, feed, new_shape, head_dim, device)?;
     push_rotor3_v_block(vs, block, new_shape);
     Ok(())
 }
@@ -603,34 +589,46 @@ fn rotor4_gpu_append_into_blocks(
     vs: &mut QuantRotorV4,
     new_v: &Array,
     new_shape: &[i32],
+    device: Device,
+    feed: RingFeed,
 ) -> Result<()> {
     let head_dim = head_dim_from_shape(new_shape, "rotor4_gpu_append_into_blocks")?;
     ensure_v4_rotors(vs, head_dim);
-    let block =
-        rotor_gpu_encode_block(new_v, new_shape, &vs.rotors, crate::rotorquant::ROTOR4_BITS)?;
+    let seq_major = rotor_chunk_seq_major(new_v, new_shape, device)?;
+    let (block, gpu) = rotor_gpu_encode_block_retaining(
+        &seq_major,
+        new_shape,
+        &vs.rotors,
+        crate::rotorquant::ROTOR4_BITS,
+    )?;
+    rotor4_v_sync_ring(vs, &gpu, feed, new_shape, head_dim, device)?;
     push_rotor4_v_block(vs, block, new_shape);
     Ok(())
 }
 
-/// Whether a rotor K GPU append should also maintain the store's GPU ring.
+/// Whether a rotor GPU append (K or V side) should also maintain the store's
+/// GPU ring.
 ///
-/// Only the K-only codecs (`RotorKOnly3` / `RotorKOnly4`) have a kernel that
-/// reads the ring — `Rotor{3,4}Sym` and `RotorK{3,4}Asym` quantize V as well and
-/// the flash kernel takes bf16 V only, so a ring built for them is never read.
-/// It is not free: `capacity * kv_h * n_groups * 8 + capacity * kv_h * 4` bytes
-/// per layer, growing with context, which at 4k over a 36-layer model is on the
-/// order of a few hundred MB of pure waste.
+/// A ring is only built for the codecs that have a kernel which reads it:
+///
+/// * `RotorKOnly{3,4}` — K ring, read by the bf16-V flash decode.
+/// * `Rotor{3,4}Sym` — **both** K and V rings, read by the quant-V flash decode.
+/// * `RotorK{3,4}Asym` and the V-only `Rotor{3,4}` — no fused kernel, so `Skip`.
+///
+/// A ring is not free: `capacity * kv_h * n_groups * 8 + capacity * kv_h * 4`
+/// bytes per layer, growing with context, which at 4k over a 36-layer model is
+/// on the order of a few hundred MB. Building one nothing reads is pure waste.
 ///
 /// Passed down from the caller rather than inferred here, so eligibility lives
 /// with the dispatcher that knows it.
 ///
-/// Both K-only paths maintain — the prefill-time `update_rotor_k_only_*` as well
-/// as the fused decode entry. They only reach a GPU append when QJL is off,
-/// which is exactly when the flash kernel is eligible, so the ring they build is
-/// the one decode reads. Letting prefill fill it incrementally also avoids
-/// making the first decode step re-seed the whole prefix from the CPU blocks
-/// (`seed_from_cpu` still covers the paths that genuinely start cold: SSD
-/// hydrate, deep clone, and a mid-run fall back to the CPU append).
+/// The eligible paths maintain from prefill onwards, not just at the fused
+/// decode entry. They only reach a GPU append when QJL is off, which is exactly
+/// when the flash kernels are eligible, so the ring they build is the one decode
+/// reads. Letting prefill fill it incrementally also avoids making the first
+/// decode step re-seed the whole prefix from the CPU blocks (`seed_from_cpu`
+/// still covers the paths that genuinely start cold: SSD hydrate, deep clone,
+/// and a mid-run fall back to the CPU append).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RingFeed {
     /// Maintain the ring — the rotor flash-decode kernel will read it.
@@ -712,6 +710,65 @@ fn rotor4_sync_ring(
     )
 }
 
+/// V-side mirror of [`rotor3_sync_ring`] for [`QuantRotorV3`].
+///
+/// Same invariant, same `b > 1` skip, same self-healing re-seed — the ring type
+/// and its contract are axis-agnostic.
+fn rotor3_v_sync_ring(
+    vs: &mut QuantRotorV3,
+    gpu: &RotorEncodedGpu,
+    feed: RingFeed,
+    new_shape: &[i32],
+    head_dim: usize,
+    device: Device,
+) -> Result<()> {
+    let (b, kv_h, new_seq) = b_kv_h_new_seq(new_shape)?;
+    if feed != RingFeed::Maintain || b != 1 {
+        vs.gpu.clear();
+        return Ok(());
+    }
+    // Feed BEFORE `push_rotor3_v_block` — the push bumps `vs.shape[2]`, and the
+    // ring append needs `prev_seq`, the length before this chunk.
+    let prev_seq = accumulated_seq(&vs.shape);
+    vs.gpu_append(
+        &gpu.codes,
+        &gpu.scales,
+        &gpu.norms,
+        kv_h,
+        head_dim as i32,
+        prev_seq,
+        new_seq,
+        device,
+    )
+}
+
+/// Mirror of [`rotor3_v_sync_ring`] for [`QuantRotorV4`].
+fn rotor4_v_sync_ring(
+    vs: &mut QuantRotorV4,
+    gpu: &RotorEncodedGpu,
+    feed: RingFeed,
+    new_shape: &[i32],
+    head_dim: usize,
+    device: Device,
+) -> Result<()> {
+    let (b, kv_h, new_seq) = b_kv_h_new_seq(new_shape)?;
+    if feed != RingFeed::Maintain || b != 1 {
+        vs.gpu.clear();
+        return Ok(());
+    }
+    let prev_seq = accumulated_seq(&vs.shape);
+    vs.gpu_append(
+        &gpu.codes,
+        &gpu.scales,
+        &gpu.norms,
+        kv_h,
+        head_dim as i32,
+        prev_seq,
+        new_seq,
+        device,
+    )
+}
+
 /// K-side convenience wrapper, QJL off only. Caller MUST check
 /// [`crate::rotor_qjl::rotor_qjl_enabled`] returns `false` before invoking
 /// this; with QJL enabled, fall back to the CPU [`QuantRotorK3::append`] path
@@ -735,7 +792,7 @@ fn rotor3_gpu_append_into_k_blocks(
     // is true (mid-run CPU fallback after a GPU first-chunk needs it). The GPU
     // encode itself ignores the JL projection — this path is QJL-off-only by
     // dispatcher contract.
-    let seq_major = rotor_k_chunk_seq_major(new_k, new_shape, device)?;
+    let seq_major = rotor_chunk_seq_major(new_k, new_shape, device)?;
     let (block, gpu) = rotor_gpu_encode_block_retaining(
         &seq_major,
         new_shape,
@@ -758,7 +815,7 @@ fn rotor4_gpu_append_into_k_blocks(
 ) -> Result<()> {
     let head_dim = head_dim_from_shape(new_shape, "rotor4_gpu_append_into_k_blocks")?;
     ensure_k4_rotors(ks, head_dim);
-    let seq_major = rotor_k_chunk_seq_major(new_k, new_shape, device)?;
+    let seq_major = rotor_chunk_seq_major(new_k, new_shape, device)?;
     let (block, gpu) = rotor_gpu_encode_block_retaining(
         &seq_major,
         new_shape,
@@ -842,6 +899,121 @@ pub(super) fn rotor4_k_only_gpu_append(
     rotor4_gpu_append_into_k_blocks(ks, new_k, new_shape, device, RingFeed::Maintain, max_seq)
 }
 
+/// Append `new_k` / `new_v` into a live `RotorSym3` store's GPU rings (+ CPU
+/// blocks), lazily creating the stores on first use. No dequant on either axis —
+/// this is the entry point the rotor symmetric quant-V flash-decode SDPA path
+/// uses.
+///
+/// Both axes maintain their ring: the quant-V kernel reads K's *and* V's.
+///
+/// # Errors
+///
+/// Returns [`Error::KvStorageMismatch`] when the active storage is not
+/// `RotorSym3`, and forwards encode / ring errors.
+pub(super) fn rotor3_sym_gpu_append(
+    cache: &mut KvCache,
+    new_k: &Array,
+    new_v: &Array,
+    new_shape: &[i32],
+    device: Device,
+) -> Result<()> {
+    let layer_idx = layer_idx_u32(cache.layer_idx);
+    let KvStorage::RotorSym3 { k, v, max_seq } = &mut cache.storage else {
+        return Err(Error::KvStorageMismatch {
+            expected: "RotorSym3",
+            got: storage_variant_name(&cache.storage),
+        });
+    };
+    let max_seq = *max_seq;
+    let mut init_shape = new_shape.to_vec();
+    if let Some(s) = init_shape.get_mut(2) {
+        *s = 0;
+    }
+    if k.is_none() {
+        *k = Some(crate::storage::QuantRotorK3::new(
+            init_shape.clone(),
+            max_seq,
+            layer_idx,
+        ));
+    }
+    if v.is_none() {
+        *v = Some(QuantRotorV3::new(init_shape, max_seq, layer_idx));
+    }
+    let Some(ks) = k.as_mut() else {
+        return Err(Error::Mlx("RotorSym3 K buffer absent after init".into()));
+    };
+    rotor3_gpu_append_into_k_blocks(ks, new_k, new_shape, device, RingFeed::Maintain)?;
+    let Some(vs) = v.as_mut() else {
+        return Err(Error::Mlx("RotorSym3 V buffer absent after init".into()));
+    };
+    rotor3_gpu_append_into_blocks(vs, new_v, new_shape, device, RingFeed::Maintain)
+}
+
+/// Mirror of [`rotor3_sym_gpu_append`] for `RotorSym4`.
+///
+/// # Errors
+///
+/// Returns [`Error::KvStorageMismatch`] when the active storage is not
+/// `RotorSym4`, and forwards encode / ring errors.
+pub(super) fn rotor4_sym_gpu_append(
+    cache: &mut KvCache,
+    new_k: &Array,
+    new_v: &Array,
+    new_shape: &[i32],
+    device: Device,
+) -> Result<()> {
+    let layer_idx = layer_idx_u32(cache.layer_idx);
+    let KvStorage::RotorSym4 { k, v, max_seq } = &mut cache.storage else {
+        return Err(Error::KvStorageMismatch {
+            expected: "RotorSym4",
+            got: storage_variant_name(&cache.storage),
+        });
+    };
+    let max_seq = *max_seq;
+    let mut init_shape = new_shape.to_vec();
+    if let Some(s) = init_shape.get_mut(2) {
+        *s = 0;
+    }
+    if k.is_none() {
+        *k = Some(crate::storage::QuantRotorK4::new(
+            init_shape.clone(),
+            max_seq,
+            layer_idx,
+        ));
+    }
+    if v.is_none() {
+        *v = Some(QuantRotorV4::new(init_shape, max_seq, layer_idx));
+    }
+    let Some(ks) = k.as_mut() else {
+        return Err(Error::Mlx("RotorSym4 K buffer absent after init".into()));
+    };
+    rotor4_gpu_append_into_k_blocks(ks, new_k, new_shape, device, RingFeed::Maintain)?;
+    let Some(vs) = v.as_mut() else {
+        return Err(Error::Mlx("RotorSym4 V buffer absent after init".into()));
+    };
+    rotor4_gpu_append_into_blocks(vs, new_v, new_shape, device, RingFeed::Maintain)
+}
+
+/// The accumulated `[B, kv_h, S, D]` shape of a mirror-free store, for callers
+/// that can no longer read it off a bf16 decode seed.
+///
+/// Only the variants that keep **no** bf16 mirror need an entry: everything else
+/// reaches `decode_fp16_k` / `decode_fp16_v` first and never gets here. Returns
+/// `None` for a store that has not been appended to yet.
+fn storage_kv_shape(storage: &KvStorage) -> Option<&[i32]> {
+    // if-let chain rather than a match with a `_` arm: a wildcard over
+    // `KvStorage` would silently absorb a new mirror-free variant into "shape
+    // unknown", and `approx_bytes` would quietly report 0 for it.
+    let shape: &[i32] = if let KvStorage::RotorSym3 { k: Some(ks), .. } = storage {
+        &ks.shape
+    } else if let KvStorage::RotorSym4 { k: Some(ks), .. } = storage {
+        &ks.shape
+    } else {
+        return None;
+    };
+    (shape.len() == 4).then_some(shape)
+}
+
 /// Accumulated sequence length held by a rotor K storage `shape`
 /// (`[B, kv_h, S, D]`), or 0 for a not-yet-shaped buffer.
 fn accumulated_seq(shape: &[i32]) -> i32 {
@@ -861,23 +1033,28 @@ fn b_kv_h_new_seq(new_shape: &[i32]) -> Result<(i32, i32, i32)> {
     }
 }
 
-/// Reorder a head-major `[B, kv_h, S, D]` K chunk to the sequence-major
-/// `[B, S, kv_h, D]` element order the rotor store accumulates in.
+/// Reorder a head-major `[B, kv_h, S, D]` K or V chunk to the sequence-major
+/// `[B, S, kv_h, D]` element order the rotor stores accumulate in.
 ///
-/// The CPU `QuantRotorK{3,4}::append` transposes before encoding, so the GPU
-/// encode must too or the two produce different block layouts for a multi-token
-/// chunk with `kv_h > 1`. For the decode step (`S == 1`) this is the identity.
+/// The CPU `QuantRotorK{3,4}::append` / `QuantRotorV{3,4}::append` transpose
+/// before encoding, so the GPU encode must too or the two produce different
+/// block layouts for a multi-token chunk with `kv_h > 1` — `dequant()` would
+/// then un-transpose a store that was never transposed. For the decode step
+/// (`S == 1`) this is the identity.
+///
+/// Axis-agnostic, like the rotor codec itself: K and V feed it the same
+/// `[B, kv_h, S, D]` shape and want the same reorder.
 ///
 /// `transpose` yields a strided view and the rotor MSL kernel reads by raw
 /// linear offset (it ignores MLX lazy-transpose strides), so the permutation is
 /// materialised here.
-fn rotor_k_chunk_seq_major(new_k: &Array, new_shape: &[i32], device: Device) -> Result<Array> {
+fn rotor_chunk_seq_major(new_kv: &Array, new_shape: &[i32], device: Device) -> Result<Array> {
     let (_b, _kv_h, new_seq) = b_kv_h_new_seq(new_shape)?;
     if new_seq == 1 {
         // Identity permutation — skip the copy on the decode hot path.
-        return new_k.try_clone();
+        return new_kv.try_clone();
     }
-    new_k.transpose(&[0, 2, 1, 3], device)?.contiguous(device)
+    new_kv.transpose(&[0, 2, 1, 3], device)?.contiguous(device)
 }
 
 impl KvCache {
@@ -1526,15 +1703,17 @@ impl KvCache {
         // full max_seq-sized raw buffer. Saves up to (max_seq - total_seq) ×
         // B × kv_h × head_dim × 2 bytes per layer during the prefill phase.
         //
-        // The bf16 K seed is only materialised when a consumer actually reads
-        // it — either the `KvStorage::None` bf16 fallback below (always needs
-        // K) or a quant arm whose decode path honours the
-        // `decode_fp16_k.is_some()` shortcut (`feeds_bf16_k_at_decode()`).
-        // The K-only family reads neither, so its K clone+eval is skipped
-        // entirely. The V seed is always materialised — every quant arm reads
-        // it at decode.
-        let need_k_seed =
-            matches!(self.storage, KvStorage::None { .. }) || self.quant.feeds_bf16_k_at_decode();
+        // Each bf16 seed is only materialised when a consumer actually reads
+        // it — either the `KvStorage::None` bf16 fallback below (which IS these
+        // buffers, so it needs both) or a quant arm whose decode path honours
+        // the `decode_fp16_{k,v}` shortcut. The K-only family reads no K seed;
+        // the fused rotor symmetric codecs read neither, because their decode is
+        // a flash kernel over both packed rings. An unread seed is not a small
+        // waste: it is `total_seq * B * kv_h * head_dim * 2` bytes per layer per
+        // axis, the dominant residency term at long context.
+        let is_bf16_storage = matches!(self.storage, KvStorage::None { .. });
+        let need_k_seed = is_bf16_storage || self.quant.feeds_bf16_k_at_decode();
+        let need_v_seed = is_bf16_storage || self.quant.feeds_bf16_v_at_decode();
         let k_buf = if need_k_seed {
             let k = k_full.try_clone()?;
             k.eval()?;
@@ -1542,12 +1721,18 @@ impl KvCache {
         } else {
             None
         };
-        let v_buf = v_full.try_clone()?;
-        v_buf.eval()?;
+        let v_buf = if need_v_seed {
+            let v = v_full.try_clone()?;
+            v.eval()?;
+            Some(v)
+        } else {
+            None
+        };
         tracing::debug!(
             total_seq,
             max_seq = shape[2],
             k_seeded = need_k_seed,
+            v_seeded = need_v_seed,
             "exit_prefill: compact fp16 decode seed materialised (total_seq tokens)"
         );
         let decode_fp16_pair = Some((k_buf, v_buf));
@@ -1561,10 +1746,10 @@ impl KvCache {
         // unreachable!() when they find KvStorage::None instead.
         if matches!(self.storage, KvStorage::None { .. }) {
             if let Some((k_seed, v_seed)) = decode_fp16_pair {
-                // `need_k_seed` is true on this path (KvStorage::None), so the
-                // K clone above was materialised.
+                // `is_bf16_storage` is true on this path, so both clones above
+                // were materialised — these buffers *are* this codec's storage.
                 self.decode_fp16_k = k_seed;
-                self.decode_fp16_v = Some(v_seed);
+                self.decode_fp16_v = v_seed;
             }
             return Ok(());
         }
@@ -2678,15 +2863,16 @@ impl KvCache {
         //
         // For the K-only family (IsoKOnly3/4, RotorKOnly3/4) the K codec runs
         // every decode step and never reads `decode_fp16_k`, so populating the
-        // bf16 K seed was dead memory. The K seed is gated on
-        // `feeds_bf16_k_at_decode()` and dropped for those variants. The bf16
-        // **V** seed stays unconditional — the K-only decode path reads it
-        // via `update_decode_fp16_v_only`. Pure RAM reclaim; output unchanged.
+        // bf16 K seed was dead memory; they still read the bf16 **V** seed via
+        // `update_decode_fp16_v_only`. The fused rotor symmetric codecs
+        // (Rotor3Sym/Rotor4Sym) read neither — their decode is a flash kernel
+        // over both packed rings — so both seeds are dropped. Pure RAM reclaim;
+        // output unchanged.
         if let Some((k_buf, v_buf)) = decode_fp16_pair {
-            // `k_buf` is `Some` iff `feeds_bf16_k_at_decode()` (the K-only
-            // family produced `None` above and so seeds no bf16 K mirror).
+            // Each is `Some` iff the matching `feeds_bf16_{k,v}_at_decode()`
+            // said this codec's decode actually reads it.
             self.decode_fp16_k = k_buf;
-            self.decode_fp16_v = Some(v_buf);
+            self.decode_fp16_v = v_buf;
         }
 
         Ok(())
@@ -2723,26 +2909,29 @@ impl KvCache {
         //
         // The K-only family no longer populates `decode_fp16_k` (it was dead
         // memory), so fall through to `decode_fp16_v`, which is the same
-        // B·kv_h·head_dim shape and is still populated for those
-        // variants. Without this the K-only `approx_bytes` would read 0.
+        // B·kv_h·head_dim shape and is still populated for those variants.
+        // Without this the K-only `approx_bytes` would read 0.
+        //
+        // The fused rotor symmetric codecs populate NEITHER mirror, so they fall
+        // through again to the quant store's own accumulated shape — same
+        // `[B, kv_h, S, D]` layout, so the same B·kv_h·D product. Without that
+        // arm a mirror-free codec would report 0 KV bytes.
+        #[inline]
+        fn bhd_of(shape: &[i32]) -> u64 {
+            match shape {
+                [b, kv_h, _s, d] => *b as u64 * *kv_h as u64 * *d as u64,
+                _ => 0,
+            }
+        }
         let bhd: u64 = if let Some(k) = self.decode_fp16_k.as_ref().or(self.decode_fp16_v.as_ref())
         {
-            let s = k.shape();
-            if s.len() == 4 {
-                s[0] as u64 * s[1] as u64 * s[3] as u64
-            } else {
-                0
-            }
+            bhd_of(&k.shape())
+        } else if let Some(shape) = storage_kv_shape(&self.storage) {
+            bhd_of(shape)
         } else if let Some(ref rot) = self.rotating {
-            if let Some(k) = &rot.keys {
-                let s = k.shape();
-                if s.len() == 4 {
-                    s[0] as u64 * s[1] as u64 * s[3] as u64
-                } else {
-                    0
-                }
-            } else {
-                0
+            match &rot.keys {
+                Some(k) => bhd_of(&k.shape()),
+                None => 0,
             }
         } else {
             0
@@ -5407,6 +5596,9 @@ impl KvCache {
                 Some(a) => Some(a.try_clone()?),
                 None => None,
             },
+            // The clone serves the same model, so it inherits the stream dtype
+            // rather than re-learning it on its first append.
+            stream_dtype: self.stream_dtype,
             rotating: match &self.rotating {
                 Some(r) => Some(r.try_deep_clone()?),
                 None => None,
@@ -6135,7 +6327,7 @@ impl KvCache {
         }
         let vs = v.as_mut().unwrap();
         if device == Device::Gpu {
-            rotor3_gpu_append_into_blocks(vs, new_v, &new_shape)?;
+            rotor3_gpu_append_into_blocks(vs, new_v, &new_shape, device, RingFeed::Skip)?;
         } else {
             vs.append(&v_f32, &new_shape)?;
         }
@@ -6234,7 +6426,7 @@ impl KvCache {
         }
         let vs = v.as_mut().unwrap();
         if device == Device::Gpu {
-            rotor4_gpu_append_into_blocks(vs, new_v, &new_shape)?;
+            rotor4_gpu_append_into_blocks(vs, new_v, &new_shape, device, RingFeed::Skip)?;
         } else {
             vs.append(&v_f32, &new_shape)?;
         }
@@ -6331,7 +6523,7 @@ impl KvCache {
             return Err(Error::Mlx("RotorSym3 V buffer absent after init".into()));
         };
         if use_gpu {
-            rotor3_gpu_append_into_blocks(vs, new_v, &new_shape)?;
+            rotor3_gpu_append_into_blocks(vs, new_v, &new_shape, device, RingFeed::Skip)?;
         } else {
             vs.append(&v_f32, &new_shape)?;
         }
@@ -6422,7 +6614,7 @@ impl KvCache {
             return Err(Error::Mlx("RotorSym4 V buffer absent after init".into()));
         };
         if use_gpu {
-            rotor4_gpu_append_into_blocks(vs, new_v, &new_shape)?;
+            rotor4_gpu_append_into_blocks(vs, new_v, &new_shape, device, RingFeed::Skip)?;
         } else {
             vs.append(&v_f32, &new_shape)?;
         }

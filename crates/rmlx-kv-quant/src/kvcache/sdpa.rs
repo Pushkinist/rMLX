@@ -17,6 +17,9 @@ use crate::planar_flash_decode_msl::{planar_flash_decode_enabled, planar_flash_d
 use crate::planar_fused_qk::planar_fused_qk_enabled;
 use crate::planar_fused_qk_msl::planar_fused_qk;
 use crate::rotor_flash_decode_msl::{rotor_flash_decode_sdpa, ROTOR_FLASH_HEAD_DIM_MAX};
+use crate::rotor_flash_decode_symv_msl::{
+    rotor_flash_decode_symv_sdpa, RotorFlashShape, RotorPackedAxis,
+};
 use crate::storage::KvStorage;
 
 use super::helpers::{f32_vec_to_array, storage_variant_name};
@@ -691,6 +694,40 @@ impl KvCache {
             }
         }
 
+        // 1d. Rotor symmetric quant-K + quant-V flash-decode fast path. Without
+        // it this codec decodes from a full bf16 K+V mirror seeded at
+        // `exit_prefill` — the packed store is written and never read, so the
+        // codec is dormant and its KV footprint is *larger* than plain bf16.
+        // The kernel reads both packed rings directly, so no bf16 mirror is
+        // needed on either axis.
+        //
+        // Same gate ordering as the K-only arm above (1c): decode-only checked
+        // HERE, before the helper mutates cache state; QJL-carrying stores keep
+        // the CPU dequant path.
+        if matches!(
+            self.storage,
+            KvStorage::RotorSym3 { .. } | KvStorage::RotorSym4 { .. }
+        ) && device == Device::Gpu
+            && !rotor_sym_store_uses_qjl(&self.storage)
+            && queries.shape().get(2).copied().unwrap_or(0) == 1
+        {
+            if let Some(out) = self.update_and_sdpa_rotor_sym_fused(
+                queries,
+                new_k,
+                new_v,
+                scale,
+                additive_mask,
+                device,
+            )? {
+                tracing::trace!(
+                    kv_bytes = self.approx_bytes(),
+                    offset = self.offset,
+                    "kv cache bytes"
+                );
+                return Ok(out);
+            }
+        }
+
         // 2. K8V4 TurboFlash path (returns None when not eligible).
         if let Some(out) =
             self.sdpa_dispatch(queries, new_k, new_v, scale, additive_mask, device)?
@@ -998,6 +1035,36 @@ impl KvCache {
             }
         }
 
+        // Rotor symmetric quant-K + quant-V flash-decode. Without it this codec
+        // is pushed onto the legacy bf16 path on any shared-KV model and its
+        // fused kernel is silently dead there.
+        if matches!(
+            self.storage,
+            KvStorage::RotorSym3 { .. } | KvStorage::RotorSym4 { .. }
+        ) && device == Device::Gpu
+            && !rotor_sym_store_uses_qjl(&self.storage)
+            && q_seq_is_decode
+        {
+            if let Some(out) = self.update_and_sdpa_rotor_sym_fused(
+                queries,
+                new_k,
+                new_v,
+                scale,
+                additive_mask,
+                device,
+            )? {
+                tracing::debug!(
+                    target: "rmlx_kv_quant::shared_kv",
+                    kernel = "rotor_flash_symv",
+                    offset = self.offset,
+                    "fused kernel dispatched on the shared-KV producer path — \
+                     consumers attend the quant store"
+                );
+                let kv_len = rotor_sym_accumulated_seq(&self.storage)?;
+                return Ok(Some((out, kv_len)));
+            }
+        }
+
         Ok(None)
     }
 
@@ -1111,6 +1178,13 @@ impl KvCache {
                     device,
                 )
             }
+            // Both axes come from the quant store — no `slice_decode_fp16_v`,
+            // because this codec keeps no bf16 V to slice.
+            KvStorage::RotorSym3 { .. } | KvStorage::RotorSym4 { .. } => {
+                let kv_seq = rotor_sym_accumulated_seq(&self.storage)?;
+                Self::check_shared_kv_len(kv_len, kv_seq)?;
+                self.rotor_sym_flash_over_store(queries, scale, additive_mask, kv_seq, device)
+            }
             KvStorage::PlanarK { .. } => {
                 let kv_seq = planar_k_accumulated_seq(&self.storage)?;
                 Self::check_shared_kv_len(kv_len, kv_seq)?;
@@ -1159,24 +1233,59 @@ impl KvCache {
                   storage variant fails loudly here instead of being silently decoded as another"
     )]
     pub fn materialise_shared_kv(&self, kv_len: i32, device: Device) -> Result<(Array, Array)> {
-        let v_full = self.slice_decode_fp16_v(kv_len, device)?;
-        let stream_dtype = v_full.dtype();
-        let k_full = match &self.storage {
+        // Codecs that keep a bf16 V mirror take the stream dtype from it. The
+        // all-quant codecs kept none — by design, that mirror is what they exist
+        // to delete — so they read the dtype recorded at append time instead.
+        let (k_full, v_full, stream_dtype) = match &self.storage {
             KvStorage::RotorKOnly3 { k: Some(ks), .. } => {
                 Self::check_shared_kv_len(kv_len, rotor_k_accumulated_seq(&self.storage)?)?;
-                f32_vec_to_array(&ks.dequant()?, &ks.shape)?
+                let v_full = self.slice_decode_fp16_v(kv_len, device)?;
+                let dt = v_full.dtype();
+                (f32_vec_to_array(&ks.dequant()?, &ks.shape)?, v_full, dt)
             }
             KvStorage::RotorKOnly4 { k: Some(ks), .. } => {
                 Self::check_shared_kv_len(kv_len, rotor_k_accumulated_seq(&self.storage)?)?;
-                f32_vec_to_array(&ks.dequant()?, &ks.shape)?
+                let v_full = self.slice_decode_fp16_v(kv_len, device)?;
+                let dt = v_full.dtype();
+                (f32_vec_to_array(&ks.dequant()?, &ks.shape)?, v_full, dt)
             }
             KvStorage::PlanarK { k: Some(ks), .. } => {
                 Self::check_shared_kv_len(kv_len, planar_k_accumulated_seq(&self.storage)?)?;
-                let (k_recon, k_arr) = ks.dequantize_choice(device, stream_dtype)?;
-                match k_arr {
+                let v_full = self.slice_decode_fp16_v(kv_len, device)?;
+                let dt = v_full.dtype();
+                let (k_recon, k_arr) = ks.dequantize_choice(device, dt)?;
+                let k_full = match k_arr {
                     Some(arr) => arr,
                     None => f32_vec_to_array(&k_recon, &ks.shape)?,
-                }
+                };
+                (k_full, v_full, dt)
+            }
+            // Both axes dequantise off their own store. Cold path by contract —
+            // this is the full-prefix CPU dequant the fused kernel exists to
+            // avoid, so it must never run per decode step.
+            KvStorage::RotorSym3 {
+                k: Some(ks),
+                v: Some(vs),
+                ..
+            } => {
+                Self::check_shared_kv_len(kv_len, rotor_sym_accumulated_seq(&self.storage)?)?;
+                (
+                    f32_vec_to_array(&ks.dequant()?, &ks.shape)?,
+                    f32_vec_to_array(&vs.dequant()?, &vs.shape)?,
+                    self.recorded_stream_dtype()?,
+                )
+            }
+            KvStorage::RotorSym4 {
+                k: Some(ks),
+                v: Some(vs),
+                ..
+            } => {
+                Self::check_shared_kv_len(kv_len, rotor_sym_accumulated_seq(&self.storage)?)?;
+                (
+                    f32_vec_to_array(&ks.dequant()?, &ks.shape)?,
+                    f32_vec_to_array(&vs.dequant()?, &vs.shape)?,
+                    self.recorded_stream_dtype()?,
+                )
             }
             other => {
                 return Err(Error::Mlx(format!(
@@ -1184,6 +1293,11 @@ impl KvCache {
                     storage_variant_name(other)
                 )))
             }
+        };
+        let v_full = if v_full.dtype() == stream_dtype {
+            v_full
+        } else {
+            v_full.astype(stream_dtype, device)?
         };
         let k_full = if k_full.dtype() == stream_dtype {
             k_full
@@ -1202,6 +1316,22 @@ impl KvCache {
             )));
         }
         Ok((k_full, v_full))
+    }
+
+    /// The activation-stream dtype recorded at append time.
+    ///
+    /// The mirror-free codecs' only witness of what the model pushes. Absent
+    /// means nothing was ever appended, so there is no K/V to materialise
+    /// either — an error, not a guessed default: picking one here is exactly the
+    /// silent dtype promotion/downcast [`Self::materialise_shared_kv`] documents.
+    fn recorded_stream_dtype(&self) -> Result<Dtype> {
+        self.stream_dtype.ok_or_else(|| {
+            Error::Mlx(
+                "materialise_shared_kv: no stream dtype recorded — the cache holds a \
+                 store-backed share but nothing was ever appended through the fused path"
+                    .to_owned(),
+            )
+        })
     }
 
     /// Reject a producer/consumer length desync rather than attend the wrong
@@ -1843,6 +1973,290 @@ impl KvCache {
         }
     }
 
+    /// Flash-decode dispatch for the symmetric rotor storage variants
+    /// (`RotorSym3` / `RotorSym4`), over **quant K and quant V**.
+    ///
+    /// Returns `Some(out)` when the fused kernel ran, `None` to fall through to
+    /// the legacy `update()` + SDPA path.
+    ///
+    /// Steps:
+    ///   1. Append `new_k` **and** `new_v` into their rotor stores — GPU encode
+    ///      into the packed rings, no dequant on either axis.
+    ///   2. Take both rings' GPU packed views at the current `S`.
+    ///   3. Run [`rotor_flash_decode_symv_sdpa`] — QK over packed K + online
+    ///      softmax + SV over packed V, in two Metal dispatches.
+    ///
+    /// Unlike the K-only sibling this touches **no** bf16 buffer: there is no
+    /// `update_decode_fp16_v_only` call, because V is read from its own store.
+    /// That is the memory win — the codec's bf16 K+V mirror is what made a
+    /// ~3-bit-per-axis codec cost more than plain bf16.
+    ///
+    /// Caller must have already gated `q_seq == 1` and `device == Gpu` BEFORE
+    /// any cache mutation: this helper mutates cache state (both appends)
+    /// before it can know whether the kernel is eligible, so a late fallback
+    /// would double-append.
+    #[allow(clippy::too_many_arguments)]
+    fn update_and_sdpa_rotor_sym_fused(
+        &mut self,
+        queries: &Array,
+        new_k: &Array,
+        new_v: &Array,
+        scale: f32,
+        additive_mask: Option<&Array>,
+        device: Device,
+    ) -> Result<Option<Array>> {
+        let new_shape = new_k.shape();
+        if new_shape.len() != 4 {
+            return Err(Error::Mlx(format!(
+                "rotor_sym_fused: new_k rank != 4, got {new_shape:?}"
+            )));
+        }
+        let new_seq = new_shape.get(2).copied().unwrap_or(0);
+
+        // Shape gates — checked BEFORE any mutation so a reject is a clean
+        // fall-through to the legacy path.
+        if !Self::rotor_flash_shape_ok(&new_shape) {
+            return Ok(None);
+        }
+        // Not a rotor symmetric cache: the caller's gate should have kept us
+        // out. Fall through rather than mutate.
+        if !matches!(
+            self.storage,
+            KvStorage::RotorSym3 { .. } | KvStorage::RotorSym4 { .. }
+        ) {
+            return Ok(None);
+        }
+
+        // Record the stream dtype before the append consumes `new_v`: this codec
+        // keeps no bf16 mirror, so this is the only witness of what the model
+        // pushes, and `materialise_shared_kv` needs it to hand a drafter K/V at
+        // the right width.
+        self.stream_dtype = Some(new_v.dtype());
+
+        let prev_seq = self.offset;
+        self.rotor_sym_gpu_append(new_k, new_v, &new_shape, device)?;
+        self.offset = prev_seq + new_seq;
+
+        // Take `kv_seq` from the store the rings were written from, not from
+        // `self.offset` — one source of truth. Same precedent as
+        // `update_and_sdpa_rotor_k_fused`.
+        let kv_seq = rotor_sym_accumulated_seq(&self.storage)?;
+        debug_assert_eq!(
+            kv_seq, self.offset,
+            "rotor_sym_fused: store seq {kv_seq} != cache offset {} — the ring write \
+             and the attention length disagree",
+            self.offset
+        );
+        // Past this point the cache is already mutated (both stores appended,
+        // offset advanced), so `Ok(None)` is NOT available: it would send the
+        // caller into the legacy `update()` path, which appends K/V a second
+        // time and advances `offset` again. Every not-eligible condition is
+        // screened at the call-site gate and by `rotor_flash_shape_ok` BEFORE
+        // any mutation; reaching here without a ring means an internal
+        // invariant broke, so fail loudly.
+        let out = self.rotor_sym_flash_over_store(queries, scale, additive_mask, kv_seq, device)?;
+        Ok(Some(out))
+    }
+
+    /// Run the rotor symmetric quant-V flash-decode kernel over the K/V already
+    /// packed in this cache's stores — no append, no offset advance.
+    ///
+    /// Split out of [`Self::update_and_sdpa_rotor_sym_fused`] so a shared-KV
+    /// **consumer** layer can attend the producer's stores through the exact
+    /// same kernel the producer used, instead of the producer having to
+    /// materialise bf16 K/V for it.
+    fn rotor_sym_flash_over_store(
+        &self,
+        queries: &Array,
+        scale: f32,
+        additive_mask: Option<&Array>,
+        kv_seq: i32,
+        device: Device,
+    ) -> Result<Array> {
+        // Select the bit width from the live storage variant. No wildcard arm:
+        // an unexpected variant must not be decoded with another codec's
+        // kernel.
+        let bits: u8 = if matches!(self.storage, KvStorage::RotorSym3 { .. }) {
+            3
+        } else if matches!(self.storage, KvStorage::RotorSym4 { .. }) {
+            4
+        } else {
+            return Err(Error::KvStorageMismatch {
+                expected: "RotorSym3 | RotorSym4",
+                got: storage_variant_name(&self.storage),
+            });
+        };
+        let Some((k_view, v_view)) = self.rotor_sym_packed_views(kv_seq, device)? else {
+            return Err(Error::Mlx(format!(
+                "rotor_sym_fused: GPU ring absent after a maintained append \
+                 (kv_seq={kv_seq}, bits={bits}) — internal invariant violated"
+            )));
+        };
+        let (k_codes, k_scales, k_norms, k_rotors) = k_view;
+        let (v_codes, v_scales, v_norms, v_rotors) = v_view;
+
+        let store_shape = rotor_sym_store_shape(&self.storage)?;
+        let b = store_shape.first().copied().unwrap_or(0);
+        let kv_h = store_shape.get(1).copied().unwrap_or(0);
+        let head_dim = store_shape.get(3).copied().unwrap_or(0);
+
+        let q_shape = queries.shape();
+        if q_shape.len() != 4 {
+            return Err(Error::Mlx(format!(
+                "rotor_sym_fused: Q shape rank != 4, got {q_shape:?}"
+            )));
+        }
+        let q_seq = q_shape.get(2).copied().unwrap_or(0);
+        let n_q_heads = q_shape.get(1).copied().unwrap_or(0);
+        // Defence-in-depth: the call site already gates decode-only.
+        if q_seq != 1 {
+            return Err(Error::Mlx(format!(
+                "rotor_sym_fused: q_seq must be 1 (decode-only), got {q_seq}"
+            )));
+        }
+        if kv_h <= 0 || n_q_heads % kv_h != 0 {
+            return Err(Error::Mlx(format!(
+                "rotor_sym_fused: n_q_heads={n_q_heads} not divisible by kv_h={kv_h}"
+            )));
+        }
+        let heads_per_kv = n_q_heads / kv_h;
+
+        let shape = RotorFlashShape {
+            b,
+            kv_h,
+            kv_seq,
+            head_dim,
+            heads_per_kv,
+        };
+        let k_axis = RotorPackedAxis {
+            codes: &k_codes,
+            scales: &k_scales,
+            norms: &k_norms,
+            rotors: &k_rotors,
+        };
+        let v_axis = RotorPackedAxis {
+            codes: &v_codes,
+            scales: &v_scales,
+            norms: &v_norms,
+            rotors: &v_rotors,
+        };
+
+        tracing::Span::current().record("path", "rotor_flash_decode_symv");
+        // Select the bit width explicitly. A wildcard arm here would map any
+        // unexpected `bits` onto one width's kernel and decode the other's codes
+        // at the wrong unpack stride — silently wrong K/V, no error. `bits` is a
+        // plain integer, so no exhaustiveness lint would catch that.
+        let flash_out = match bits {
+            3 => rotor_flash_decode_symv_sdpa::<3>(
+                queries,
+                k_axis,
+                v_axis,
+                additive_mask,
+                shape,
+                scale,
+                device,
+            )?,
+            4 => rotor_flash_decode_symv_sdpa::<4>(
+                queries,
+                k_axis,
+                v_axis,
+                additive_mask,
+                shape,
+                scale,
+                device,
+            )?,
+            other => {
+                return Err(Error::Quant(format!(
+                    "rotor_sym_fused: unsupported bits={other} (only 3 and 4); \
+                     refusing to decode with another width's kernel"
+                )))
+            }
+        };
+        if flash_out.dtype() == queries.dtype() {
+            Ok(flash_out)
+        } else {
+            flash_out.astype(queries.dtype(), device)
+        }
+    }
+
+    /// GPU-append `new_k` / `new_v` into whichever rotor symmetric store is
+    /// active.
+    fn rotor_sym_gpu_append(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+        new_shape: &[i32],
+        device: Device,
+    ) -> Result<()> {
+        if matches!(self.storage, KvStorage::RotorSym3 { .. }) {
+            super::update::rotor3_sym_gpu_append(self, new_k, new_v, new_shape, device)
+        } else if matches!(self.storage, KvStorage::RotorSym4 { .. }) {
+            super::update::rotor4_sym_gpu_append(self, new_k, new_v, new_shape, device)
+        } else {
+            Err(Error::KvStorageMismatch {
+                expected: "RotorSym3 | RotorSym4",
+                got: storage_variant_name(&self.storage),
+            })
+        }
+    }
+
+    /// `(codes, scales, norms, rotors)` GPU views of BOTH axes of the active
+    /// rotor symmetric store at `kv_seq`, or `None` when either ring is not
+    /// live.
+    ///
+    /// Both-or-neither: a half-live pair would mean one axis reads the store and
+    /// the other reads zeros.
+    #[allow(clippy::type_complexity)]
+    fn rotor_sym_packed_views(
+        &self,
+        kv_seq: i32,
+        device: Device,
+    ) -> Result<Option<((Array, Array, Array, Array), (Array, Array, Array, Array))>> {
+        // if-let chain rather than a match with a `_` arm: the codec pair is
+        // narrow and a wildcard over `KvStorage` would silently absorb a new
+        // variant into "no ring" instead of naming it.
+        let (k_view, k_rotors, v_view, v_rotors) = if let KvStorage::RotorSym3 {
+            k: Some(ks),
+            v: Some(vs),
+            ..
+        } = &self.storage
+        {
+            (
+                ks.gpu_packed_view(kv_seq, device)?,
+                &ks.rotors,
+                vs.gpu_packed_view(kv_seq, device)?,
+                &vs.rotors,
+            )
+        } else if let KvStorage::RotorSym4 {
+            k: Some(ks),
+            v: Some(vs),
+            ..
+        } = &self.storage
+        {
+            (
+                ks.gpu_packed_view(kv_seq, device)?,
+                &ks.rotors,
+                vs.gpu_packed_view(kv_seq, device)?,
+                &vs.rotors,
+            )
+        } else {
+            return Ok(None);
+        };
+        let (Some((k_codes, k_scales, k_norms)), Some((v_codes, v_scales, v_norms))) =
+            (k_view, v_view)
+        else {
+            return Ok(None);
+        };
+        // Each axis carries its own table — reading V's codes against K's rotors
+        // would be silently wrong the day the two seeds diverge.
+        let k_rotors_arr = crate::rotorquant_msl::rotor_table_to_array(k_rotors)?;
+        let v_rotors_arr = crate::rotorquant_msl::rotor_table_to_array(v_rotors)?;
+        Ok(Some((
+            (k_codes, k_scales, k_norms, k_rotors_arr),
+            (v_codes, v_scales, v_norms, v_rotors_arr),
+        )))
+    }
+
     /// Shape gates for the rotor flash-decode kernel, evaluated before any
     /// cache mutation.
     ///
@@ -1850,6 +2264,9 @@ impl KvCache {
     /// ring's per-step stride does not interleave batch (one `KvCache` per
     /// request); a batched cache falls back rather than read a layout the
     /// kernel would misinterpret.
+    ///
+    /// Shared by the bf16-V and the quant-V rotor flash paths: both dispatch the
+    /// same grid over the same ring layout, so the same shape contract applies.
     fn rotor_flash_shape_ok(new_shape: &[i32]) -> bool {
         let (Some(&b), Some(&kv_h), Some(&head_dim)) =
             (new_shape.first(), new_shape.get(1), new_shape.get(3))
@@ -1923,6 +2340,87 @@ fn rotor_k_store_uses_qjl(storage: &KvStorage) -> bool {
     } else {
         crate::rotor_qjl::rotor_qjl_enabled()
     }
+}
+
+/// Whether the active rotor symmetric store carries the K-side QJL residual.
+///
+/// Same store-is-the-authority reasoning as [`rotor_k_store_uses_qjl`]: the
+/// codec fixes QJL at first append and never adds or drops the sideband
+/// mid-stream, so a toggle flipped afterwards must not change how existing bytes
+/// are read. Before the first append there is no store yet, so the global toggle
+/// — the value the store is about to be built with — is the answer.
+fn rotor_sym_store_uses_qjl(storage: &KvStorage) -> bool {
+    if let KvStorage::RotorSym3 { k: Some(ks), .. } = storage {
+        ks.use_qjl()
+    } else if let KvStorage::RotorSym4 { k: Some(ks), .. } = storage {
+        ks.use_qjl()
+    } else {
+        crate::rotor_qjl::rotor_qjl_enabled()
+    }
+}
+
+/// The K store's accumulated `[B, kv_h, S, D]` shape for the active rotor
+/// symmetric variant.
+fn rotor_sym_store_shape(storage: &KvStorage) -> Result<&[i32]> {
+    if let KvStorage::RotorSym3 { k: Some(ks), .. } = storage {
+        Ok(&ks.shape)
+    } else if let KvStorage::RotorSym4 { k: Some(ks), .. } = storage {
+        Ok(&ks.shape)
+    } else {
+        Err(Error::KvStorageMismatch {
+            expected: "RotorSym3 | RotorSym4 with a live K buffer",
+            got: storage_variant_name(storage),
+        })
+    }
+}
+
+/// Accumulated sequence length held by the active rotor symmetric store.
+///
+/// Reads the **K** store's `shape[2]` and checks the V store agrees. The two are
+/// appended in lockstep, so a divergence means one axis's ring was fed and the
+/// other was not — which would attend K over one prefix and V over another,
+/// silently. Sibling of [`rotor_k_accumulated_seq`].
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "the wildcard arm returns Err — it never selects a concrete codec, so a new storage \
+              variant fails loudly here instead of being silently decoded as another"
+)]
+fn rotor_sym_accumulated_seq(storage: &KvStorage) -> Result<i32> {
+    let (k_shape, v_shape) = match storage {
+        KvStorage::RotorSym3 {
+            k: Some(ks),
+            v: Some(vs),
+            ..
+        } => (&ks.shape, &vs.shape),
+        KvStorage::RotorSym4 {
+            k: Some(ks),
+            v: Some(vs),
+            ..
+        } => (&ks.shape, &vs.shape),
+        other => {
+            return Err(Error::KvStorageMismatch {
+                expected: "RotorSym3 | RotorSym4 with live K and V buffers",
+                got: storage_variant_name(other),
+            })
+        }
+    };
+    let k_seq = k_shape.get(2).copied().ok_or_else(|| {
+        Error::Mlx(format!(
+            "rotor_sym_fused: rotor K store shape {k_shape:?} has no seq axis"
+        ))
+    })?;
+    let v_seq = v_shape.get(2).copied().ok_or_else(|| {
+        Error::Mlx(format!(
+            "rotor_sym_fused: rotor V store shape {v_shape:?} has no seq axis"
+        ))
+    })?;
+    if k_seq != v_seq {
+        return Err(Error::Mlx(format!(
+            "rotor_sym_fused: K store seq {k_seq} != V store seq {v_seq} — the two axes \
+             would attend different prefixes"
+        )));
+    }
+    Ok(k_seq)
 }
 
 /// Accumulated sequence length held by the active rotor K-only store.

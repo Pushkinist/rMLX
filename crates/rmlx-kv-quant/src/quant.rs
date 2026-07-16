@@ -490,9 +490,9 @@ impl KvQuant {
     }
 
     /// True when the decode path reads the bf16 `decode_fp16_k` seed that
-    /// `exit_prefill` materialises (the warm-TTFT shortcut codecs: K8V*, *Sym,
-    /// Planar*, Turbo*, Iso*, Rotor* with a quantised-or-bf16 K mirror that
-    /// decode consults).
+    /// `exit_prefill` materialises (the warm-TTFT shortcut codecs: K8V*,
+    /// Planar*, Turbo*, Iso* with a quantised-or-bf16 K mirror that decode
+    /// consults).
     ///
     /// **False for the K-only family** (`IsoKOnly3/4`, `RotorKOnly3/4`): these
     /// re-quantise K at every decode step (`ks.append`) and route V through
@@ -501,19 +501,29 @@ impl KvQuant {
     /// dead memory. The bf16 **V** seed (`decode_fp16_v`) is still populated for
     /// them; only the K seed is gated.
     ///
+    /// **False for the fused rotor symmetric codecs** (`Rotor3Sym`,
+    /// `Rotor4Sym`): their decode is a flash kernel over both packed rings, so
+    /// neither axis reads a mirror. See [`Self::feeds_bf16_v_at_decode`].
+    ///
     /// The match is **exhaustive on purpose** (no wildcard `_`): adding a new
     /// `KvQuant` variant will produce a compile error until it is classified
     /// here, preventing a new K-only-style variant from silently defaulting to
-    /// `true` and reintroducing the F2 dead-seed leak.
+    /// `true` and reintroducing the dead-seed leak.
     pub fn feeds_bf16_k_at_decode(&self) -> bool {
         match self {
-            // K-only family: K is re-quantised at every decode step; decode
-            // never reads decode_fp16_k. exit_prefill skips the K seed for
-            // these variants.
+            // Two families never read a bf16 K at decode, for two reasons:
+            //
+            // * K-only (IsoKOnly*, RotorKOnly*) — K is re-quantised at every
+            //   decode step; V routes through `update_decode_fp16_v_only`.
+            // * Fused rotor symmetric (Rotor{3,4}Sym) — decode runs a flash
+            //   kernel straight off the packed K and V rings, so neither axis
+            //   reads a mirror (see `feeds_bf16_v_at_decode`).
             KvQuant::IsoKOnly3
             | KvQuant::IsoKOnly4
             | KvQuant::RotorKOnly3
-            | KvQuant::RotorKOnly4 => false,
+            | KvQuant::RotorKOnly4
+            | KvQuant::Rotor3Sym
+            | KvQuant::Rotor4Sym => false,
             // All other variants: decode reads the bf16 K seed materialised by
             // exit_prefill (the warm-TTFT shortcut codecs and bf16 KV).
             KvQuant::None
@@ -537,8 +547,61 @@ impl KvQuant {
             | KvQuant::Iso4Sym
             | KvQuant::Rotor3
             | KvQuant::Rotor4
-            | KvQuant::Rotor3Sym
-            | KvQuant::Rotor4Sym
+            | KvQuant::RotorK3Asym { .. }
+            | KvQuant::RotorK4Asym { .. } => true,
+        }
+    }
+
+    /// True when the decode path reads the bf16 `decode_fp16_v` seed that
+    /// `exit_prefill` materialises.
+    ///
+    /// Sibling of [`Self::feeds_bf16_k_at_decode`] for the V axis. Almost every
+    /// codec is `true`: even the K-only re-quantise family routes V through
+    /// `update_decode_fp16_v_only`, and `KvQuant::None` stores its bf16 V here
+    /// outright.
+    ///
+    /// **False only for the fused rotor symmetric codecs** (`Rotor3Sym`,
+    /// `Rotor4Sym`): `rotor_flash_decode_symv` unpacks V straight out of the
+    /// packed rotor ring inside the SV loop, so a bf16 V is never read. Keeping
+    /// one is not a small waste — a full `seq * head_dim * 2` bytes per layer of
+    /// V (plus the same for K) is the *dominant* term in these codecs' residency
+    /// and is what made a ~3-bits-per-axis codec cost more than plain bf16.
+    ///
+    /// Exhaustive on purpose, same reasoning as the K-side predicate: a new
+    /// variant must be classified rather than silently inherit a mirror.
+    pub fn feeds_bf16_v_at_decode(&self) -> bool {
+        match self {
+            // Fused rotor symmetric: V is unpacked from the quant store inside
+            // the flash kernel's SV loop; no bf16 V exists.
+            KvQuant::Rotor3Sym | KvQuant::Rotor4Sym => false,
+            // Everything else reads the bf16 V seed at decode — including the
+            // K-only family (via `update_decode_fp16_v_only`) and `None`, whose
+            // bf16 V *is* this buffer.
+            KvQuant::None
+            | KvQuant::K8V4
+            | KvQuant::K8V8
+            | KvQuant::Planar
+            | KvQuant::Planar3
+            | KvQuant::PlanarK
+            | KvQuant::Mixed { .. }
+            | KvQuant::RotK { .. }
+            | KvQuant::RotKTq4V
+            | KvQuant::K8VTurbo3
+            | KvQuant::K8VTurbo3Tcq
+            | KvQuant::K8VTurbo2
+            | KvQuant::K8VTurbo2Tcq
+            | KvQuant::TurboSym3
+            | KvQuant::TurboSym4
+            | KvQuant::Iso3
+            | KvQuant::Iso4
+            | KvQuant::Iso3Sym
+            | KvQuant::Iso4Sym
+            | KvQuant::IsoKOnly3
+            | KvQuant::IsoKOnly4
+            | KvQuant::Rotor3
+            | KvQuant::Rotor4
+            | KvQuant::RotorKOnly3
+            | KvQuant::RotorKOnly4
             | KvQuant::RotorK3Asym { .. }
             | KvQuant::RotorK4Asym { .. } => true,
         }
@@ -661,14 +724,30 @@ impl KvQuant {
             // is opt-in (RMLX_FUSED_QK) and does not fire on the standard flow.
             KvQuant::Rotor3
             | KvQuant::Rotor4
-            | KvQuant::Rotor3Sym
-            | KvQuant::Rotor4Sym
             | KvQuant::RotorK3Asym { .. }
             | KvQuant::RotorK4Asym { .. } => Some(
                 "RotorQuant (Clifford Cl(3,0)) encode + dequant run on CPU on the \
                  default hot path (the bf16 decode seed shadows the GPU branch); the \
                  GPU fused-QK encoder is opt-in (RMLX_FUSED_QK)",
             ),
+            // Symmetric rotor variants: NO bf16 decode-seed early-return — decode
+            // is the quant-V flash kernel over both packed rings. Same QJL gate as
+            // the K-only family, and for the same reason: the QJL residual cannot
+            // be reproduced in the flash inner loop, so a QJL-carrying store keeps
+            // the CPU dequant path on BOTH axes.
+            KvQuant::Rotor3Sym | KvQuant::Rotor4Sym => {
+                if crate::rotor_qjl::rotor_qjl_enabled() {
+                    Some(
+                        "RotorQuant (Clifford Cl(3,0)) symmetric with QJL enabled \
+                         (rotor_qjl_enabled): the QJL residual forces K and V onto the \
+                         CPU encode + dequant path every decode step; disable QJL \
+                         (--rotor-qjl off) to route both axes through the Metal \
+                         flash-decode kernel",
+                    )
+                } else {
+                    None
+                }
+            }
             // K-only rotor variants: NO bf16 decode-seed early-return — the rotor
             // K codec fires every decode step. `update_rotor_k_only_{3,4}` gates
             // the GPU K encode on `device == Gpu && !rotor_qjl_enabled()`:
@@ -826,11 +905,12 @@ impl KvQuant {
     /// the V-only variants (`Iso3`/`Iso4`/`Rotor3`/`Rotor4`) keep an 8-bit
     /// affine K, so their K side takes the generic path.
     ///
-    /// - **bf16 decode seed**: when [`Self::feeds_bf16_k_at_decode`] is true the
-    ///   codec keeps a full `seq * head_dim * 2` bf16 mirror of **V** (always)
-    ///   and **K** (unless it is a K-only re-quantize family). This is the
-    ///   warm-TTFT shortcut buffer and is the dominant term that can make a
-    ///   quantized global layer *larger* than bf16.
+    /// - **bf16 decode seed**: a codec keeps a full `seq * head_dim * 2` bf16
+    ///   mirror of each axis whose decode reads it —
+    ///   [`Self::feeds_bf16_k_at_decode`] for K, [`Self::feeds_bf16_v_at_decode`]
+    ///   for V. This is the warm-TTFT shortcut buffer and is the dominant term
+    ///   that can make a quantized global layer *larger* than bf16. Codecs with
+    ///   a fused decode over both packed axes keep neither.
     ///
     /// `None` (bf16) returns just the two bf16 buffers and no seed.
     ///
@@ -936,11 +1016,13 @@ impl KvQuant {
                 | KvQuant::Rotor3Sym
                 | KvQuant::Rotor4Sym
         );
-        // V seed is always retained by the warm-TTFT shortcut codecs (every
-        // quant arm reads `decode_fp16_v` at decode). K seed is retained unless
-        // this is a K-only re-quantize family (`feeds_bf16_k_at_decode == false`).
+        // Each seed is retained only when this codec's decode actually reads it
+        // — the same two predicates `exit_prefill` gates the real allocation on,
+        // so the estimate cannot drift from what is materialised. The K-only
+        // re-quantize family drops the K seed; the fused rotor symmetric codecs
+        // drop both.
         let k_bytes = side_bytes(k_bits, self.feeds_bf16_k_at_decode(), k_uses_family);
-        let v_bytes = side_bytes(v_bits, true, v_uses_family);
+        let v_bytes = side_bytes(v_bits, self.feeds_bf16_v_at_decode(), v_uses_family);
         k_bytes.saturating_add(v_bytes)
     }
 

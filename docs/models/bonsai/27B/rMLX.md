@@ -56,6 +56,19 @@ directly. KV-MB from serve events `op='kv_cache_bytes'` high-water (the `baselin
     4k–64k, but all four show a **reproducible 128k warm-cache decode stall**
     (aggregate craters to ~1–10 TPS while `itl_p50` implies ~28 TPS) — the matrix
     uses the **cold r0** number as the cell value and footnotes the stall.
+    > **`rotor3_sym` / `rotor4_sym` no longer belong in this tier.** Their decode
+    > is now a fused MSL flash over **both** packed rotor rings
+    > (`rotor_flash_decode_symv`, see `docs/KV_QUANT.md`), and `exit_prefill`
+    > seeds no bf16 K or V mirror for them — so the "no memory win" claim is
+    > retired: measured KV is **−34%** (Bonsai-8B 590 → 391 MB; gemma-4-e2b
+    > 36.1 → 23.5 MB). The mirror that fed the 128k warm-cache stall is gone.
+    > **The trade is not free:** the bf16 mirror was MLX's native bf16 flash and
+    > was *fast*; the fused kernel costs **−50…−90% decode** on the same shapes
+    > (Bonsai-8B ~145 → ~15 TPS; gemma-4-e2b ~135 → ~56). The bottleneck is the
+    > shared kernel shell — the bf16-V `k_rotor3` sibling is already ~23 TPS on
+    > that shape — not the V unpack. `iso3_sym` / `iso4_sym` are untouched and
+    > remain genuine Tier 2. Numbers here are a **pre-kernel snapshot** and were
+    > not re-run on the 27B.
   - **Tier 3 — CPU-bound, unusable** (the K-only family: `k_iso3/4`,
     `k_rotor3/4`): sub-8-bit rotation/iso K with **no Metal kernel** → CPU dequant
     fallback → **0.05–8.8 TPS**, GPU idle. Capped.

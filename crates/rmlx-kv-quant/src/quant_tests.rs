@@ -379,11 +379,23 @@ fn estimator_matches_actual_iso_rotor_encode_bytes() {
     let rotor_side_actual = 4 * (r_codes.len() + r_scales.len() + r_norms.len()) as u64;
     let est_r =
         KvQuant::Rotor3Sym.estimated_resident_bytes_per_layer(seq, head_dim as u64, kv_heads);
-    let expected_r = 2 * (rotor_side_actual + seed);
+    // Rotor3Sym quantizes BOTH sides and — unlike Iso3Sym — retains **no** bf16
+    // seed on either: its decode is a flash kernel over the two packed rings, so
+    // estimate = 2*side with no seed term. This is the codec's whole memory
+    // claim; if a seed ever creeps back the estimate and this test move together.
+    let expected_r = 2 * rotor_side_actual;
     let tol_r = expected_r / 10;
     assert!(
         est_r.abs_diff(expected_r) <= tol_r,
         "Rotor3Sym estimate {est_r} not within 10% of actual {expected_r}"
+    );
+    // The seedless estimate must be strictly below the seeded sibling's — the
+    // point of the fused path. Same codec shape, same bit width, so the gap is
+    // exactly the two mirrors.
+    assert!(
+        est_r < 2 * (rotor_side_actual + seed),
+        "Rotor3Sym must not carry a bf16 mirror: {est_r} should be below the seeded {}",
+        2 * (rotor_side_actual + seed)
     );
 
     // Net-saving must now be NEGATIVE for iso at head_dim=128.

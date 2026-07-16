@@ -65,6 +65,7 @@ pub mod rot_k;
 pub mod rot_k_msl;
 pub mod rotating;
 pub mod rotor_flash_decode_msl;
+pub mod rotor_flash_decode_symv_msl;
 pub mod rotor_fused_qk_msl;
 pub mod rotor_qjl;
 pub mod rotorquant;

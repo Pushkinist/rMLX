@@ -12,11 +12,14 @@
 //! Quantized V buffer: `QuantRotorV3` (rotor3 V codec).
 
 use rmlx_core::error::Result;
+use rmlx_mlx::{Array, Device};
 
 use crate::clifford::make_rotor_table;
 use crate::rotorquant::{
     n_groups_for, rotor3_decode, rotor3_encode, RotorQuantError, ROTOR3_BITS, ROTOR3_GROUP_SIZE,
 };
+
+use super::RotorGpuK;
 
 /// Bit-width of the rotor3 V codec (fixed at 3-bit — see
 /// [`crate::rotorquant::rotor3_encode`]).
@@ -52,14 +55,24 @@ pub struct RotorBlocks {
 ///   * `blocks` — per-append payload (`RotorBlocks`).
 ///   * `shape` — accumulated `[B, kv_h, S_total, D]`.
 ///
-/// CPU-only. SDPA falls through to the dequant-then-SDPA legacy fallback path
-/// (same as iso3 and iso4). The MSL kernel is deferred — see
-/// [`crate::rotorquant`] module docs.
+/// Carries both forms of the payload:
+///
+/// * `blocks` — CPU `RotorBlocks`, the source of truth for `dequant()` and the
+///   SSD spill/hydrate round-trip.
+/// * `gpu` — the optional GPU-resident packed ring ([`RotorGpuK`]), populated by
+///   `gpu_append`. When present it lets a fused flash-decode kernel read the V
+///   quant store directly instead of attending a bf16 mirror of V.
+///
+/// The ring type is named for the K side it landed with, but its payload
+/// (codes / per-group scales / per-token L2 norms) is exactly the rotor codec's
+/// own — the codec is axis-agnostic, so the V side reuses it verbatim.
 pub struct QuantRotorV3 {
     /// Static rotor table for this layer/head, flat `[n_groups * 4]` f32 in
     /// `[s, b12, b13, b23]` per-rotor order. Initialised lazily on first
     /// `append`; never replaced.
     pub rotors: Vec<f32>,
+    /// GPU-resident packed ring. Empty until the first `gpu_append`.
+    pub gpu: RotorGpuK,
     /// Accumulated per-token blocks (one entry per append call; `dequant`
     /// flattens them).
     pub blocks: Vec<RotorBlocks>,
@@ -81,6 +94,7 @@ impl std::fmt::Debug for QuantRotorV3 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QuantRotorV3")
             .field("n_rotors", &(self.rotors.len() / 4))
+            .field("gpu_resident", &self.gpu.is_allocated())
             .field("n_blocks", &self.blocks.len())
             .field("shape", &self.shape)
             .field("max_seq", &self.max_seq)
@@ -102,6 +116,7 @@ impl QuantRotorV3 {
     pub fn new(init_shape: Vec<i32>, max_seq: i32, layer_idx: u32) -> Self {
         Self {
             rotors: Vec::new(),
+            gpu: RotorGpuK::default(),
             blocks: Vec::new(),
             shape: init_shape,
             max_seq,
@@ -122,6 +137,7 @@ impl QuantRotorV3 {
     ) -> Self {
         Self {
             rotors,
+            gpu: RotorGpuK::default(),
             blocks: Vec::new(),
             shape: init_shape,
             max_seq,
@@ -146,6 +162,9 @@ impl QuantRotorV3 {
         let max_seq = if shape.len() >= 3 { shape[2] } else { 0 };
         Self {
             rotors,
+            // Hydrated caches start CPU-only; the ring is rebuilt lazily from
+            // the next GPU append.
+            gpu: RotorGpuK::default(),
             blocks,
             shape,
             max_seq,
@@ -202,6 +221,10 @@ impl QuantRotorV3 {
             n_tokens: n_tokens_total,
         });
 
+        // A CPU append does not touch the GPU ring, so any live ring is now a
+        // stale prefix. Drop it; the next `gpu_append` re-seeds from `blocks`.
+        self.gpu.clear();
+
         if self.shape.len() != 4 || self.shape[0] == 0 {
             self.shape = new_shape.to_vec();
         } else {
@@ -214,6 +237,7 @@ impl QuantRotorV3 {
     /// Does **not** touch the rotor table — that is layer-static.
     pub fn reset(&mut self) {
         self.blocks.clear();
+        self.gpu.clear();
         if self.shape.len() >= 4 {
             self.shape[2] = 0;
         }
@@ -236,6 +260,9 @@ impl QuantRotorV3 {
             }
         }
         self.blocks.truncate(keep);
+        // The ring's filled prefix no longer matches `blocks`; drop it rather
+        // than leave a longer-than-truncated prefix live.
+        self.gpu.clear();
         if self.shape.len() >= 4 {
             self.shape[2] = n;
         }
@@ -250,6 +277,11 @@ impl QuantRotorV3 {
     pub fn try_deep_clone(&self) -> Result<Self> {
         Ok(Self {
             rotors: self.rotors.clone(),
+            // The clone starts CPU-only: `blocks` carries the full payload, so
+            // the ring re-seeds from them on the clone's first GPU append.
+            // Sharing the source's Arrays would alias one ring across two
+            // independent caches.
+            gpu: RotorGpuK::default(),
             blocks: self.blocks.clone(),
             shape: self.shape.clone(),
             max_seq: self.max_seq,
@@ -259,10 +291,85 @@ impl QuantRotorV3 {
         })
     }
 
+    /// Concatenate the accumulated CPU blocks into flat sequence-major
+    /// `(codes, scales, norms)` — the form [`RotorGpuK::seed_from_cpu`] wants.
+    fn flatten_blocks(&self) -> (Vec<u32>, Vec<f32>, Vec<f32>) {
+        // Exact capacities — the prefill seed concatenates the whole prefix
+        // (millions of entries at long context), so growing from empty would
+        // realloc+memcpy repeatedly.
+        let (n_codes, n_scales, n_norms) = self.blocks.iter().fold((0, 0, 0), |(c, s, n), blk| {
+            (
+                c + blk.codes.len(),
+                s + blk.scales.len(),
+                n + blk.norms.len(),
+            )
+        });
+        let mut codes = Vec::with_capacity(n_codes);
+        let mut scales = Vec::with_capacity(n_scales);
+        let mut norms = Vec::with_capacity(n_norms);
+        for blk in &self.blocks {
+            codes.extend_from_slice(&blk.codes);
+            scales.extend_from_slice(&blk.scales);
+            norms.extend_from_slice(&blk.norms);
+        }
+        (codes, scales, norms)
+    }
+
+    /// Push one GPU-encoded chunk into the GPU ring, seeding the ring from the
+    /// accumulated CPU blocks first when it is not yet live.
+    ///
+    /// `codes` / `scales` / `norms` are the rotor encode kernel's GPU outputs
+    /// for a sequence-major chunk; `prev_seq` is the accumulated sequence length
+    /// **before** this chunk.
+    ///
+    /// This only maintains the ring — the caller still pushes the matching CPU
+    /// block, which stays the source of truth for `dequant()` and SSD spill.
+    ///
+    /// # Errors
+    ///
+    /// Forwards [`RotorGpuK::seed_from_cpu`] / [`RotorGpuK::append_encoded`]
+    /// errors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gpu_append(
+        &mut self,
+        codes: &Array,
+        scales: &Array,
+        norms: &Array,
+        kv_h: i32,
+        head_dim: i32,
+        prev_seq: i32,
+        new_seq: i32,
+        device: Device,
+    ) -> Result<()> {
+        let max_seq = self.max_seq;
+        if !self.gpu.is_allocated() && prev_seq > 0 {
+            let (c, s, n) = self.flatten_blocks();
+            self.gpu
+                .seed_from_cpu(&c, &s, &n, kv_h, head_dim, prev_seq, max_seq, device)?;
+        }
+        self.gpu.append_encoded(
+            codes, scales, norms, kv_h, head_dim, prev_seq, new_seq, max_seq, device,
+        )
+    }
+
+    /// GPU packed view of the first `kv_seq` positions, or `None` when the ring
+    /// is not live (CPU path — caller falls back to `dequant`).
+    ///
+    /// # Errors
+    ///
+    /// Forwards [`RotorGpuK::packed_view`] errors.
+    pub fn gpu_packed_view(
+        &self,
+        kv_seq: i32,
+        device: Device,
+    ) -> Result<Option<(Array, Array, Array)>> {
+        self.gpu.packed_view(kv_seq, device)
+    }
+
     /// Approximate byte footprint of the accumulated payload.
     ///
     /// Counts the rotor table **once** (it is layer-static) plus all
-    /// accumulated per-token block buffers.
+    /// accumulated per-token block buffers and the GPU ring when live.
     #[must_use]
     pub fn byte_size(&self) -> usize {
         let mut total = self.rotors.len() * size_of::<f32>();
@@ -271,7 +378,7 @@ impl QuantRotorV3 {
             total += blk.scales.len() * size_of::<f32>();
             total += blk.norms.len() * size_of::<f32>();
         }
-        total
+        total + self.gpu.byte_size()
     }
 
     /// Dequantize all accumulated V slices into one flat f32 vector of length
