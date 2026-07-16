@@ -270,8 +270,12 @@ full re-prefill. The Exact path verifies token identity by comparing
 `find_best_prefix` hit and every `push` advance it. Each slot carries a
 `last_used_seq` stamped at its last access.
 
-`push` runs two eviction passes before appending the new entry:
+`push` runs an admission guard, then two eviction passes, before appending the
+new entry:
 
+0. **Over-cap admission guard**: if the incoming entry's KV alone exceeds
+   `max_bytes`, the entry is **not admitted** — `push` returns `None` without
+   evicting any existing slot. See "Over-cap admission" below.
 1. **RAM cap**: while `total_kv_bytes + new_entry_bytes > max_bytes`, evict
    the slot with the smallest `last_used_seq`.
 2. **Slot count cap**: if `slots.len() == capacity`, evict the slot with the
@@ -279,7 +283,33 @@ full re-prefill. The Exact path verifies token identity by comparing
 
 Either cap triggers independently; the smaller cap wins. Each eviction
 increments `stats.evictions` and calls `spill_evicted` (the SSD sink
-hook, if attached).
+hook, if attached). `push` returns `Some(slot_index)` when the entry is stored
+and `None` when the admission guard rejects it.
+
+### Over-cap admission
+
+A single snapshot whose resident KV alone exceeds `max_bytes` is **refused
+admission** rather than stored above the cap. Without this guard, an empty (or
+near-empty) cache would happily store one entry many times larger than the cap —
+the RAM-cap eviction loop only evicts *other* slots and never refuses the
+incoming entry — silently violating the documented cap.
+
+The refusal is not just bookkeeping hygiene: admitting an over-cap snapshot is
+what caused the large-KV **warm-cache decode stall**. The next identical (warm)
+request takes the Exact path, which `deep_clone`s the stored snapshot
+(refcount-shared, no copy) and then, on the first decode append, triggers MLX
+copy-on-write of the whole KV — a *second* full-size residency. For a
+bf16-mirror KV codec at long context (tens of GB), that doubling pushes total
+residency past physical RAM and stalls decode with a single multi-hundred-second
+pause (steady-state `itl` stays healthy; only the aggregate craters).
+
+Refusing admission bounds peak residency to one live copy: the repeat request
+re-prefills exactly like the cold request instead of reusing an over-cap slot,
+so warm decode ≈ cold decode. The guard is model- and codec-agnostic — it keys
+off `entry.kv_bytes()` versus the cap, never an arch or codec name. Existing
+(smaller, valid) slots are left intact; the guard never evicts to make room for
+something that still could not fit. An SSD hydrate whose reconstructed block is
+over-cap is likewise treated as a miss (the caller re-prefills).
 
 The RAM cap is set once at process start:
 
@@ -511,10 +541,13 @@ Each run uses a fresh `RMLX_HOME` tempdir for hermeticity.
 | Env fallback | `RMLX_PROMPT_CACHE_MAX_BYTES` — bytes, decimal (undocumented compat). |
 | Default | 2 GiB. |
 | Scope | Process-global `OnceLock`; first call to `install_ram_cap` wins. |
+| Admission guard | `push`: an entry whose KV alone exceeds `max_bytes` is refused (`push` → `None`), no eviction. See "Over-cap admission". |
 | Eviction trigger | `push`: evicts LRU slots until `total_kv_bytes + new_entry_bytes <= max_bytes`. |
 
 The RAM cap and the slot count cap (`--prompt-cache-slots`) are independent.
-Either can trigger eviction first on a given `push`.
+Either can trigger eviction first on a given `push`. The over-cap admission
+guard runs first: a snapshot larger than the whole cap is never stored (it would
+both violate the cap and cause the warm-cache decode stall on reuse).
 
 ---
 
