@@ -135,194 +135,7 @@ fn build_header() -> Result<String> {
 //   0. partial_o : f32 [n_tiles * n_bh * head_dim]
 //   1. tile_lse  : f32 [n_tiles * n_bh * 2]    (tile_max, tile_sum_exp)
 
-#[allow(
-    clippy::uninlined_format_args,
-    reason = "named template args keep each MSL placeholder traceable to its Rust source value"
-)]
-fn build_kernel_source() -> String {
-    let vals_per_word: u32 = 8;
-    let decode_idx_expr = "(k_codes[code_word_abs] >> ((elem_in_group & 7u) * 4u)) & 0xFu";
-    let words_per_group: u32 = (GROUP_SIZE / 8) as u32;
-
-    format!(
-        r"
-    uint head_dim     = dims[0];
-    uint kv_seq       = dims[1];
-    uint n_bh         = dims[2];
-    uint kv_h         = dims[3];
-    uint heads_per_kv = dims[4];
-    uint n_tiles      = dims[5];
-
-    uint tile_idx = threadgroup_position_in_grid.x;
-    uint bh       = threadgroup_position_in_grid.y;
-    uint tid      = thread_position_in_threadgroup.x;
-
-    if (bh >= n_bh)         return;
-    if (tile_idx >= n_tiles) return;
-
-    uint n_q_heads = kv_h * heads_per_kv;
-    uint b         = bh / n_q_heads;
-    uint hq        = bh % n_q_heads;
-    uint kv_h_idx  = hq / heads_per_kv;
-
-    uint tile_start = tile_idx * SA2_TILE_SIZE;
-    uint tile_end   = tile_start + SA2_TILE_SIZE;
-    if (tile_end > kv_seq) tile_end = kv_seq;
-
-    float thr = head_threshold[bh];
-
-    // ── Tile-level early-exit ────────────────────────────────────────────
-    // Thread 0 scans, broadcasts via threadgroup memory.
-    threadgroup bool tile_has_survivors[1];
-    if (tid == 0u) {{
-        tile_has_survivors[0] = false;
-        for (uint t = tile_start; t < tile_end; t++) {{
-            if (all_scores[bh * kv_seq + t] >= thr) {{
-                tile_has_survivors[0] = true;
-                break;
-            }}
-        }}
-    }}
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (!tile_has_survivors[0]) {{
-        // Sentinel LSE + zero partial_o slice.
-        uint out_base = (tile_idx * n_bh + bh) * head_dim;
-        partial_o[out_base + tid] = 0.0f;
-        if (tid == 0u) {{
-            uint meta = (tile_idx * n_bh + bh) * 2u;
-            tile_lse[meta + 0u] = -INFINITY;
-            tile_lse[meta + 1u] = 0.0f;
-        }}
-        return;
-    }}
-
-    // Per-token K layout.
-    uint codes_words_per_tok    = (head_dim / 32u) * 4u;
-    uint scales_pairs_per_tok   = head_dim / 2u;
-    uint rot_words_per_tok      = head_dim / 16u;
-
-    uint group_id_in_head = tid / 32u;
-    uint elem_in_group    = tid % 32u;
-    uint pair_in_group    = elem_in_group / 2u;
-    uint elem_in_pair     = elem_in_group & 1u;
-
-    // ── Load Q ───────────────────────────────────────────────────────────
-    threadgroup float q_shared[256];
-    q_shared[tid] = query[bh * head_dim + tid];
-
-    threadgroup float k_pre_rot[256];
-    threadgroup float dot_shared[256];
-
-    // Online softmax broadcast slots.
-    threadgroup float s_max[1];
-    threadgroup float s_sum[1];
-    threadgroup float s_corr[1];
-    threadgroup float s_expsc[1];
-    if (tid == 0u) {{
-        s_max[0] = -INFINITY;
-        s_sum[0] = 0.0f;
-    }}
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float acc_v = 0.0f;
-
-    for (uint t = tile_start; t < tile_end; t++) {{
-        // Skip below-threshold tokens entirely.
-        float pre_score = all_scores[bh * kv_seq + t];
-        if (pre_score < thr) {{
-            continue;
-        }}
-
-        // ── Decode K[tid] for this (b, kv_h_idx, t) ──────────────────────
-        // K packing is SEQUENCE-major (`[B, S, kv_h, D]`): per token all heads
-        // are contiguous, matching QuantPlanarK's chunk-append layout. (V below
-        // stays head-major — it is the bf16 mirror, not the planar-packed buffer.)
-        uint kv_tok          = (b * kv_seq + t) * kv_h + kv_h_idx;
-        uint codes_tok_off   = kv_tok * codes_words_per_tok;
-        uint scales_tok_off  = kv_tok * scales_pairs_per_tok;
-        uint rot_tok_off     = kv_tok * rot_words_per_tok;
-
-        uint code_word_in_group = elem_in_group / {vals_per_word_u}u;
-        uint code_word_abs      = codes_tok_off + group_id_in_head * {words_per_group_u}u + code_word_in_group;
-        uint cb_idx             = {decode_idx_expr};
-
-        uint pair_global = group_id_in_head * 16u + pair_in_group;
-        float scale_pair = k_scales[scales_tok_off + pair_global];
-
-        uint rot_word_in_group = pair_in_group / 8u;
-        uint rot_word_abs      = rot_tok_off + group_id_in_head * 2u + rot_word_in_group;
-        uint rot_shift         = (pair_in_group & 7u) * 4u;
-        uint rot_idx           = (k_rot32[rot_word_abs] >> rot_shift) & 0xFu;
-
-        k_pre_rot[tid] = SA2_CB[cb_idx] * scale_pair;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        uint pair_base = tid - elem_in_pair;
-        float ya = k_pre_rot[pair_base];
-        float yb = k_pre_rot[pair_base + 1u];
-
-        float c     = SA2_ROT_CB[rot_idx][0];
-        float neg_s = SA2_ROT_CB[rot_idx][1];
-        float sv    = SA2_ROT_CB[rot_idx][2];
-        float c2    = SA2_ROT_CB[rot_idx][3];
-
-        float k_val = (elem_in_pair == 0u)
-            ? (c * ya + sv * yb)
-            : (neg_s * ya + c2 * yb);
-
-        // QK dot product + tree reduction.
-        dot_shared[tid] = q_shared[tid] * k_val;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint stride = head_dim >> 1; stride > 0u; stride >>= 1u) {{
-            if (tid < stride) {{
-                dot_shared[tid] += dot_shared[tid + stride];
-            }}
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }}
-
-        // ── Online softmax update (thread 0 broadcasts) ─────────────────
-        if (tid == 0u) {{
-            float score = dot_shared[0] * scale_arr[0];
-
-            float old_max = s_max[0];
-            float new_max = (score > old_max) ? score : old_max;
-            float corr    = exp(old_max - new_max);
-            float es      = exp(score - new_max);
-
-            s_max[0]   = new_max;
-            s_sum[0]   = s_sum[0] * corr + es;
-            s_corr[0]  = corr;
-            s_expsc[0] = es;
-        }}
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // ── V read + softmax-weighted accumulation ──────────────────────
-        float corr = s_corr[0];
-        float es   = s_expsc[0];
-
-        uint v_off = ((b * kv_h + kv_h_idx) * kv_seq + t) * head_dim + tid;
-        float v_val = v_flat[v_off];
-
-        acc_v = acc_v * corr + es * v_val;
-    }}
-
-    // ── Write per-tile partials + LSE ────────────────────────────────────
-    uint out_base = (tile_idx * n_bh + bh) * head_dim;
-    partial_o[out_base + tid] = acc_v;
-
-    if (tid == 0u) {{
-        uint meta = (tile_idx * n_bh + bh) * 2u;
-        tile_lse[meta + 0u] = s_max[0];
-        tile_lse[meta + 1u] = s_sum[0];
-    }}
-",
-        vals_per_word_u = vals_per_word,
-        words_per_group_u = words_per_group,
-        decode_idx_expr = decode_idx_expr,
-    )
-}
+const P2_SOURCE: &str = include_str!("../metal/sparse_attn_phase2_attend.metal");
 
 // ── Pass-2 LSE merge MSL source (mirror planar_flash_decode P2) ──────────────
 //
@@ -341,79 +154,31 @@ fn build_kernel_source() -> String {
 // from the unified `tile_lse` buffer instead of separate `tile_max` +
 // `tile_sum_exp` arrays.  Mathematically: collapse n_tiles per-tile
 // (m_t, l_t, O_t) into a single global (m, l, O) via log-sum-exp.
-const MERGE_SOURCE: &str = r"
-    uint head_dim = dims_p2[0];
-    uint n_tiles  = dims_p2[1];
-    uint n_bh     = dims_p2[2];
-
-    uint tid = thread_position_in_threadgroup.x;
-    uint bh  = threadgroup_position_in_grid.x;
-    if (bh >= n_bh) return;
-
-    threadgroup float g_max_buf[1];
-    threadgroup float g_sum_buf[1];
-
-    if (tid == 0u) {
-        float gmax = -INFINITY;
-        for (uint t = 0u; t < n_tiles; t++) {
-            float tmax = tile_lse[(t * n_bh + bh) * 2u + 0u];
-            if (tmax > gmax) gmax = tmax;
-        }
-        g_max_buf[0] = gmax;
-
-        float gsum = 0.0f;
-        for (uint t = 0u; t < n_tiles; t++) {
-            float tmax = tile_lse[(t * n_bh + bh) * 2u + 0u];
-            float tsum = tile_lse[(t * n_bh + bh) * 2u + 1u];
-            gsum += exp(tmax - gmax) * tsum;
-        }
-        g_sum_buf[0] = gsum;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float global_max = g_max_buf[0];
-    float global_sum = g_sum_buf[0];
-    float inv_sum    = (global_sum > 0.0f) ? (1.0f / global_sum) : 0.0f;
-
-    if (tid < head_dim) {
-        float accum = 0.0f;
-        for (uint t = 0u; t < n_tiles; t++) {
-            float tmax = tile_lse[(t * n_bh + bh) * 2u + 0u];
-            float corr = exp(tmax - global_max);
-            float pv   = partial_o[(t * n_bh + bh) * head_dim + tid];
-            accum += corr * pv;
-        }
-        dst[bh * head_dim + tid] = accum * inv_sum;
-    }
-";
+const MERGE_SOURCE: &str = include_str!("../metal/sparse_attn_phase2_merge.metal");
 
 // ── Kernel singletons ─────────────────────────────────────────────────────────
 
 static P2_KERNEL: OnceLock<std::result::Result<MetalKernel, String>> = OnceLock::new();
 static P2_HEADER: OnceLock<std::result::Result<String, String>> = OnceLock::new();
-static P2_SOURCE: OnceLock<String> = OnceLock::new();
 static MERGE_KERNEL: OnceLock<std::result::Result<MetalKernel, String>> = OnceLock::new();
 
-fn p2_header() -> Result<&'static str> {
+/// The header is generated (codebook + tile constants), so it is memoised. The
+/// body is a compile-time constant and needs no cache.
+pub(crate) fn p2_header() -> Result<&'static str> {
     P2_HEADER
         .get_or_init(|| build_header().map_err(|e| e.to_string()))
         .as_deref()
         .map_err(|e| Error::Mlx(format!("phase2_sparse_attend header build: {e}")))
 }
 
-fn p2_source() -> &'static str {
-    P2_SOURCE.get_or_init(build_kernel_source)
-}
-
 fn p2_kernel() -> Result<&'static MetalKernel> {
     let header = p2_header()?;
-    let source = p2_source();
     P2_KERNEL
         .get_or_init(|| {
             MetalKernel::new(
                 "rmlx_sparse_attn_phase2_sparse_attend_v4",
                 header,
-                source,
+                P2_SOURCE,
                 &[
                     "query",
                     "k_codes",

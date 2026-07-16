@@ -98,8 +98,12 @@ fn iso_kernel_source_smoke() {
     let h4 = build_iso_fused_qk_header(4);
     assert!(h3.contains("ISO_CB[8]"));
     assert!(h4.contains("ISO_CB[16]"));
-    assert!(!build_iso_fused_qk_source(3).is_empty());
-    assert!(!build_iso_fused_qk_source(4).is_empty());
+    assert!(build_iso_fused_qk_source(3).is_ok_and(|s| !s.is_empty()));
+    assert!(build_iso_fused_qk_source(4).is_ok_and(|s| !s.is_empty()));
+    // Any other bit width must fail loudly rather than silently hand back a
+    // body for the wrong width.
+    assert!(build_iso_fused_qk_source(5).is_err());
+    assert!(build_iso_fused_qk_source(0).is_err());
 }
 
 #[test]
@@ -810,5 +814,26 @@ fn iso_fused_qk_bits4_dispatch_count_increments() {
     assert!(
         after > before,
         "iso4 dispatch counter must increment: before={before} after={after}"
+    );
+}
+
+/// Probe header snapshots must equal what the builders emit.
+///
+/// `make check-metal-compiles` prepends these snapshots to the kernel bodies.
+/// A builder that changes a constant's value, or drops one, without the
+/// snapshot being refreshed leaves the probe compiling text production no
+/// longer emits — the gate would keep passing while checking the wrong thing.
+/// Equality here turns that drift into a hard failure.
+#[test]
+fn hdr_probe_snapshots_match_builders() {
+    assert_eq!(
+        build_iso_fused_qk_header(3),
+        include_str!("metal/probes/iso_fused_qk_b3.hdr.metal"),
+        "stale snapshot: refresh metal/probes/iso_fused_qk_b3.hdr.metal"
+    );
+    assert_eq!(
+        build_iso_fused_qk_header(4),
+        include_str!("metal/probes/iso_fused_qk_b4.hdr.metal"),
+        "stale snapshot: refresh metal/probes/iso_fused_qk_b4.hdr.metal"
     );
 }

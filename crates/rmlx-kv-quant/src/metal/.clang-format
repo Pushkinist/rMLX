@@ -1,0 +1,23 @@
+# clang-format config for Metal Shading Language (.metal) kernel bodies.
+#
+# MSL is a C++14 dialect, so clang-format's Cpp language mode formats it.
+# These files hold kernel *bodies* only (MLX supplies the function signature
+# at dispatch), so they are statement sequences at file scope.
+#
+# Style notes:
+# - Aligned assignments/declarations are the existing hand-written kernel
+#   style and carry meaning for dense index math; keep them.
+# - ColumnLimit 0 disables re-flowing: line breaks in the kernels are chosen
+#   to mirror the math, and reflowing them hurts readability without
+#   improving consistency.
+Language: Cpp
+BasedOnStyle: LLVM
+Standard: c++14
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 0
+AlignConsecutiveAssignments: true
+AlignConsecutiveDeclarations: false
+AlignTrailingComments: true
+SortIncludes: false

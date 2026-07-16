@@ -15,9 +15,9 @@ that avoids the fragile ABI of C++, making it safe to link from Rust via
 The `rmlx-mlx` crate is the only crate in the workspace that touches mlx-c
 directly. All other crates (`rmlx-models`, `rmlx-quant`, `rmlx-loader`,
 `rmlx-server`, `rmlx-cli`) call through the public API of `rmlx-mlx` and
-never see an `unsafe` block related to mlx-c. `rmlx-models` ships MSL byte
-blobs that are registered and dispatched through `rmlx-mlx`'s
-`metal_kernel` module.
+never see an `unsafe` block related to mlx-c. `rmlx-kv-quant` (KV-cache
+codecs) and `rmlx-models` (per-arch kernels) ship MSL source that is
+registered and dispatched through `rmlx-mlx`'s `metal_kernel` module.
 
 The crate does **not** depend on `mlx-rs` (the community Rust binding). It
 drives mlx-c directly to control every detail of the FFI contract.
@@ -524,6 +524,9 @@ with the Metal function signature and buffer declarations automatically:
 - `header` is MSL inserted before the kernel body; use it for `constant`
   array declarations and helper functions.
 
+For KV codecs the `source` argument is not a Rust literal — it is
+`include_str!` of a `.metal` file. See "`.metal` files + `include_str!`" below.
+
 ### `MetalKernelInvoke`
 
 Builder for a single dispatch. `add_input` clones the input `Array` (via
@@ -539,24 +542,83 @@ kernels that accumulate into outputs via `atomic_fetch_or_explicit` — without
 it, MLX may reuse a Metal buffer from its pool whose previous contents are
 non-zero, corrupting the result.
 
-### MSL kernels in `rmlx-models`
+### Where MSL lives
 
-`rmlx-models` ships MSL source strings for each KV-quant codec as
-`OnceLock<MetalKernel>` singletons registered on first use:
+MSL source is split across two crates:
 
-| Module | Codec | Group size |
-|--------|-------|-----------|
-| `q8_msl` | Symmetric 8-bit affine (q8_0) | 128 |
-| `turboquant_msl` | TurboQuant V4 (Lloyd-Max 4-bit) | 32 |
-| `planarquant_msl` | PlanarQuant | codec-specific |
-| `paroquant_msl` | ParoQuant | codec-specific |
-| `turbo_flash_msl` | TurboFlash (tq4 V, fused SDPA) | 32 |
-| `gated_delta_msl` | GatedDelta | codec-specific |
-| `sparse_v_msl` | Sparse-V | codec-specific |
+| Crate | Modules | Scope |
+|---|---|---|
+| `rmlx-kv-quant` | `src/*_msl.rs`, `src/sparse_attn/*_msl.rs` | Every KV-cache codec (q8, TurboQuant, PlanarQuant, IsoQuant, RotorQuant, rot-K, TCQ, TurboFlash, fused-QK, sparse-attn phases) |
+| `rmlx-models` | `paroquant_msl.rs`, `gated_delta_msl.rs` | Per-arch kernels — weight-side ParoQuant and GatedDeltaNet. Not KV codecs. |
 
-Each module declares its kernel once, encodes codebook constants as
-`constant float` MSL declarations in `header`, and writes MSL body source
-that matches the CPU reference path in the corresponding `*quant.rs` file.
+Each module registers its kernels once as `OnceLock<MetalKernel>` singletons
+on first use, and its MSL body matches the CPU reference path in the
+corresponding `*quant.rs` file.
+
+### `.metal` files + `include_str!` (KV codecs)
+
+KV kernel bodies live in **`.metal` files** under
+`crates/rmlx-kv-quant/src/metal/`, not in Rust string literals. They are
+embedded at **compile time**:
+
+```rust
+const QUANTIZE_SOURCE: &str = include_str!("metal/q8_quantize.metal");
+```
+
+`include_str!` — never a runtime `fs::read`. The binary stays single-file with
+no runtime data files (CLAUDE.md hard rule 2).
+
+**Body / header split.** A `.metal` file holds the kernel *body* only — MLX
+supplies the function signature and buffer declarations at dispatch. The
+`header` argument is separate, and comes from one of two places:
+
+- **Static header** — a `.metal` file of its own (`turboquant_header.metal`,
+  `turbo_flash_header.metal`, …), embedded the same way.
+- **Runtime-generated header** — a `build_*_header(..)` Rust function that
+  emits `constant` / `#define` declarations whose values are computed
+  (codebooks, rotation constants, quaternions, eps). These stay in Rust: they
+  are derived data, not source text. The kernel is assembled at registration as
+  `MetalKernel::new(name, header, include_str!("<body>.metal"), ..)`.
+
+**Parameterised bodies.** Where a body varies by a codec parameter, each
+variant gets its own `.metal` file and the builder selects between them
+(`iso_fused_qk_b3.metal` / `_b4.metal`; `rot_k_fwht_quantize_d{32..512}.metal`).
+The body text stays literal — parameters are not templated back into it at
+runtime.
+
+Adding a KV codec means adding a `.metal` decode kernel and a native compile
+test; see CLAUDE.md hard rule 10.
+
+### MSL gates (`make ci`, enforced in CI)
+
+Two gates run over `crates/rmlx-kv-quant/src/metal/*.metal`.
+
+| Target | Tool | Checks |
+|---|---|---|
+| `make check-metal-compiles` | `xcrun -sdk macosx metal` (full Xcode, not just the Command Line Tools) | Every KV kernel compiles natively, so an MSL syntax error surfaces at CI instead of on first GPU dispatch. |
+| `make check-metal-format` | `clang-format` (on `PATH` or via `xcrun -f clang-format` — it is not on `PATH` by default) | Every KV kernel is clang-format clean. MSL is a C++14 dialect; style is pinned by `src/metal/.clang-format`. |
+
+**Where they actually run.** Both gates skip when their tool is missing, so a
+Command-Line-Tools-only box is not blocked — but a skipping gate protects
+nothing, so the skip is local-only. The `msl` job in
+`.github/workflows/ci.yml` runs both with `METAL_STRICT=--strict`, which turns
+a missing tool into a hard failure. The GitHub macOS runner ships full Xcode,
+so the compile gate runs for real there; compiling MSL needs the toolchain,
+not a GPU, so it works on a runner with no usable Metal device. Install full
+Xcode (`xcode-select -s /Applications/Xcode.app`) to run the compile gate
+locally too — on Xcode 16.3+ the compiler is a separate component
+(`xcodebuild -downloadComponent MetalToolchain`).
+
+`check-metal-compiles` cannot compile a `.metal` file directly — a body is a
+run of statements at file scope, not a translation unit. It assembles a probe
+per kernel (`stdlib preamble + header + kernel { buffer aliases + body }`) and
+compiles that. `src/metal/probes/kernels.manifest` supplies the header and
+buffer list per body; `probes/README.md` documents the layout and how to
+refresh the captured header snapshots.
+
+Deliberately **not** wired: `clang-tidy` (wants a compilation database and is
+noisy on MSL) and MegaLinter (CI-heavy). The two gates above already cover
+syntax and style.
 
 ---
 
@@ -653,4 +715,4 @@ body.
 - `docs/WEIGHT_QUANTS.md` — weight quantization formats and how
   `quantized_matmul` / `dequantize` / `gather_qmm` interact with them.
 - `docs/KV_QUANT.md` — KV quantization format details; how the MSL kernels
-  in `rmlx-models/*_msl.rs` map to each codec.
+  in `rmlx-kv-quant/src/*_msl.rs` map to each codec.

@@ -108,52 +108,7 @@ const CB_MAX: f32 = 2.717_667;
 /// a byte in one lookup, used by the word-level dequantize kernel. The `half2`
 /// representation is bit-exact with the f32 CB values (half has enough precision
 /// for the 7-significant-digit centroids).
-const KERNEL_HEADER: &str = r"
-// 4-bit TurboQuant codebook: 16 Lloyd-Max optimal N(0,1) centroids.
-// Derived by turboquant_plus/turboquant/codebook.py::_lloyds_gaussian(sigma=1.0, n_iter=100).
-// Replaces prior N(0,1) quantile centroids.
-// Bit patterns match turboquant.rs::CODEBOOK_4BIT.
-constant float CB[16] = {
-    as_type<float>(0xC02DEE42u),  // -2.7176671
-    as_type<float>(0xC003563Bu),  // -2.0521381
-    as_type<float>(0xBFCCE718u),  // -1.6008024
-    as_type<float>(0xBF9EB6FAu),  // -1.2399590
-    as_type<float>(0xBF6DA172u),  // -0.9282447
-    as_type<float>(0xBF255816u),  // -0.6458753
-    as_type<float>(0xBEC329CBu),  // -0.3811782
-    as_type<float>(0xBE011273u),  // -0.1260469
-    as_type<float>(0x3E011273u),  //  0.1260469
-    as_type<float>(0x3EC329CBu),  //  0.3811782
-    as_type<float>(0x3F255816u),  //  0.6458753
-    as_type<float>(0x3F6DA172u),  //  0.9282447
-    as_type<float>(0x3F9EB6FAu),  //  1.2399590
-    as_type<float>(0x3FCCE718u),  //  1.6008024
-    as_type<float>(0x4003563Bu),  //  2.0521381
-    as_type<float>(0x402DEE42u)   //  2.7176671
-};
-
-// 15 decision boundaries: midpoints between consecutive Lloyd-Max centroids,
-// computed as (CB[i] + CB[i+1]) * 0.5f in single precision.
-// Bit patterns match what the CPU turboquant.rs::nearest_centroid computes
-// at runtime using the same formula.
-constant float BOUNDARIES[15] = {
-    as_type<float>(0xC018A23Eu),  // -2.3849025
-    as_type<float>(0xBFE9C9C7u),  // -1.8264703
-    as_type<float>(0xBFB5CF09u),  // -1.4203807
-    as_type<float>(0xBF8AC3DAu),  // -1.0841019
-    as_type<float>(0xBF497CC4u),  // -0.7870600
-    as_type<float>(0xBF03767Eu),  // -0.5135268
-    as_type<float>(0xBE81D982u),  // -0.2536126
-    as_type<float>(0x00000000u),  //  0.0000000
-    as_type<float>(0x3E81D982u),  //  0.2536126
-    as_type<float>(0x3F03767Eu),  //  0.5135268
-    as_type<float>(0x3F497CC4u),  //  0.7870600
-    as_type<float>(0x3F8AC3DAu),  //  1.0841019
-    as_type<float>(0x3FB5CF09u),  //  1.4203807
-    as_type<float>(0x3FE9C9C7u),  //  1.8264703
-    as_type<float>(0x4018A23Eu)   //  2.3849025
-};
-";
+const KERNEL_HEADER: &str = include_str!("metal/turboquant_header.metal");
 
 /// MSL body for `rmlx_tq4_quantize`.
 ///
@@ -170,64 +125,7 @@ constant float BOUNDARIES[15] = {
 /// Outputs:
 /// - `codes` u32 `[N_groups * 4]` — 4-bit packed, 8 indices per uint32
 /// - `scales` f32 `[N_groups]` — per-group max-abs scale
-const QUANTIZE_SOURCE: &str = r"
- // Each threadgroup handles one group of 32 elements.
- // threadgroup_position_in_grid.x = group index (0 .. N_groups-1).
- // thread_position_in_threadgroup.x = element within group (0 .. 31).
-    uint group_id = threadgroup_position_in_grid.x;
-    uint elem     = thread_position_in_threadgroup.x;
-
- // ── Step 1: load group into threadgroup shared memory ──────────────────
-    threadgroup float shared[32];
-    shared[elem] = inp[group_id * 32u + elem];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
- // ── Step 2: thread 0 finds max(|x|) and writes scale ──────────────────
- // Sequential scan by thread 0 mirrors the CPU path exactly.
- // scale = max(|x_i|) / CB_MAX where CB_MAX = 2.7176671 (Lloyd-Max N(0,1) 4-bit).
-    threadgroup float group_scale[1];
-    if (elem == 0u) {
-        float abs_max = 0.0f;
-        for (uint i = 0u; i < 32u; i++) {
-            float a = abs(shared[i]);
-            if (a > abs_max) { abs_max = a; }
-        }
- // Lloyd-Max N(0,1) 4-bit max centroid 2.7176671 (replaces prior 2.7326 quantile centroid).
-        const float cb_max = 2.7176671f;
-        group_scale[0] = (abs_max > 0.0f) ? (abs_max / cb_max) : 0.0f;
-        scales[group_id] = group_scale[0];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float scale = group_scale[0];
-
- // ── Step 3: each thread finds nearest centroid index ───────────────────
-    float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
-    float normalized = shared[elem] * inv_scale;
-
-    uint idx = 0u;
-    for (uint b = 0u; b < 15u; b++) {
-        if (normalized > BOUNDARIES[b]) {
-            idx++;
-        }
-    }
-
- // ── Step 4: pack 8 indices per uint32 word ─────────────────────────────
- // word 0 holds elements 0..7, word 1 holds elements 8..15, etc.
- // Within each word: element e occupies bits [e_in_word*4 .. e_in_word*4+3].
-    threadgroup uint idx_shared[32];
-    idx_shared[elem] = idx;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
- // Threads 0, 8, 16, 24 each pack one 32-bit word (8 elements × 4 bits).
-    if (elem % 8u == 0u) {
-        uint word_idx = group_id * 4u + (elem / 8u);
-        uint word = 0u;
-        for (uint i = 0u; i < 8u; i++) {
-            word |= (idx_shared[elem + i] & 0xFu) << (i * 4u);
-        }
-        codes[word_idx] = word;
-    }
-";
+const QUANTIZE_SOURCE: &str = include_str!("metal/turboquant_quantize.metal");
 
 /// MSL body for `rmlx_tq4_dequantize` — word-level dual-LUT path.
 ///
@@ -253,31 +151,7 @@ const QUANTIZE_SOURCE: &str = r"
 ///
 /// Outputs:
 /// - `out` OutT `[N_groups * 32]`
-const DEQUANTIZE_SOURCE: &str = r"
- // gid = word index (0 .. N_groups*4-1).
-    uint gid      = thread_position_in_grid.x;
-    uint group_id = gid / 4u;   // which group of 32 elements
-    uint word_off = gid % 4u;   // word within group (0..3), 8 elements each
-
-    uint word  = codes[gid];
-    float scale = scales[group_id];
-
- // Base output index for this word's 8 elements.
-    uint base_out = group_id * 32u + word_off * 8u;
-
- // Dual-LUT: decode each of the 4 bytes in the word, 2 nibbles per byte.
- // Equivalent to a 256-entry half2 LUT: CB_LUT[b] = (CB[b & 0xF], CB[b >> 4]).
- // CB is in Metal constant memory — repeated lookups hit L1 after first use.
-    for (uint byte_idx = 0u; byte_idx < 4u; byte_idx++) {
-        uint b   = (word >> (byte_idx * 8u)) & 0xFFu;
-        uint lo  = b & 0xFu;
-        uint hi  = b >> 4u;
-        float v0 = CB[lo] * scale;
-        float v1 = CB[hi] * scale;
-        out[base_out + byte_idx * 2u    ] = static_cast<OutT>(v0);
-        out[base_out + byte_idx * 2u + 1] = static_cast<OutT>(v1);
-    }
-";
+const DEQUANTIZE_SOURCE: &str = include_str!("metal/turboquant_dequantize.metal");
 
 /// MSL body for `rmlx_tq4_quantize_codebook_buffer`.
 ///
@@ -311,70 +185,7 @@ const DEQUANTIZE_SOURCE: &str = r"
 ///
 /// - `codes` u32 `[N_groups * 4]` — same layout as the hardwired path.
 /// - `scales` f32 `[N_groups]`.
-const QUANTIZE_CB_BUF_SOURCE: &str = r"
- // Each threadgroup handles one group of 32 elements.
-    uint group_id = threadgroup_position_in_grid.x;
-    uint elem     = thread_position_in_threadgroup.x;
-
- // ── Step 0: cache the 16-entry codebook in threadgroup memory ──────────
- // First 16 threads load one centroid each; the rest no-op the load.
-    threadgroup float cb_shared[16];
-    if (elem < 16u) {
-        cb_shared[elem] = cb[elem];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
- // ── Step 1: load group into threadgroup shared memory ──────────────────
-    threadgroup float shared[32];
-    shared[elem] = inp[group_id * 32u + elem];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
- // ── Step 2: thread 0 finds cb_max + group scale ────────────────────────
- // cb_max = max(|cb[i]|) over the 16 entries; scale = max(|x|) / cb_max.
-    threadgroup float group_scale[1];
-    if (elem == 0u) {
-        float cb_max = 0.0f;
-        for (uint i = 0u; i < 16u; i++) {
-            float a = abs(cb_shared[i]);
-            if (a > cb_max) { cb_max = a; }
-        }
-        float abs_max = 0.0f;
-        for (uint i = 0u; i < 32u; i++) {
-            float a = abs(shared[i]);
-            if (a > abs_max) { abs_max = a; }
-        }
-        group_scale[0] = (abs_max > 0.0f && cb_max > 0.0f) ? (abs_max / cb_max) : 0.0f;
-        scales[group_id] = group_scale[0];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float scale = group_scale[0];
-
- // ── Step 3: each thread finds nearest centroid via 15 runtime boundaries
-    float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
-    float normalized = shared[elem] * inv_scale;
-
-    uint idx = 0u;
-    for (uint b = 0u; b < 15u; b++) {
-        float boundary = (cb_shared[b] + cb_shared[b + 1u]) * 0.5f;
-        if (normalized > boundary) {
-            idx++;
-        }
-    }
-
- // ── Step 4: pack 8 indices per uint32 word (same layout as hardwired) ──
-    threadgroup uint idx_shared[32];
-    idx_shared[elem] = idx;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (elem % 8u == 0u) {
-        uint word_idx = group_id * 4u + (elem / 8u);
-        uint word = 0u;
-        for (uint i = 0u; i < 8u; i++) {
-            word |= (idx_shared[elem + i] & 0xFu) << (i * 4u);
-        }
-        codes[word_idx] = word;
-    }
-";
+const QUANTIZE_CB_BUF_SOURCE: &str = include_str!("metal/turboquant_quantize_cb_buf.metal");
 
 /// MSL body for `rmlx_tq4_dequantize_codebook_buffer`.
 ///
@@ -399,41 +210,7 @@ const QUANTIZE_CB_BUF_SOURCE: &str = r"
 /// # Outputs
 ///
 /// - `out` OutT `[N_groups * 32]`.
-const DEQUANTIZE_CB_BUF_SOURCE: &str = r"
-    uint gid      = thread_position_in_grid.x;
-    uint group_id = gid / 4u;
-    uint word_off = gid % 4u;
-    uint elem_in_grp = thread_position_in_threadgroup.x;
-
- // Cache the 16-entry codebook in threadgroup memory (4 threads per group:
- // each loads 4 entries to cover [0..16)). Guard on `elem_in_grp < 4u` so
- // any future threadgroup-size bump cannot OOB-write past cb_shared[15]
- // (mirrors the `elem < 16u` guard pattern in QUANTIZE_CB_BUF_SOURCE).
-    threadgroup float cb_shared[16];
-    if (elem_in_grp < 4u) {
-        uint base = elem_in_grp * 4u;
-        cb_shared[base + 0u] = cb[base + 0u];
-        cb_shared[base + 1u] = cb[base + 1u];
-        cb_shared[base + 2u] = cb[base + 2u];
-        cb_shared[base + 3u] = cb[base + 3u];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    uint word  = codes[gid];
-    float scale = scales[group_id];
-
-    uint base_out = group_id * 32u + word_off * 8u;
-
-    for (uint byte_idx = 0u; byte_idx < 4u; byte_idx++) {
-        uint b   = (word >> (byte_idx * 8u)) & 0xFFu;
-        uint lo  = b & 0xFu;
-        uint hi  = b >> 4u;
-        float v0 = cb_shared[lo] * scale;
-        float v1 = cb_shared[hi] * scale;
-        out[base_out + byte_idx * 2u    ] = static_cast<OutT>(v0);
-        out[base_out + byte_idx * 2u + 1] = static_cast<OutT>(v1);
-    }
-";
+const DEQUANTIZE_CB_BUF_SOURCE: &str = include_str!("metal/turboquant_dequantize_cb_buf.metal");
 
 // ── Kernel singletons ─────────────────────────────────────────────────────────
 

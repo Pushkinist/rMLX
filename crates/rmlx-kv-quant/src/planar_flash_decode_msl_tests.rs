@@ -433,3 +433,23 @@ fn planar_flash_decode_enabled_is_callable() {
     // test-run time.
     let _: bool = planar_flash_decode_enabled();
 }
+
+/// Probe header snapshots must equal what the builders emit.
+///
+/// `make check-metal-compiles` prepends these snapshots to the kernel bodies.
+/// A builder that changes a constant's value, or drops one, without the
+/// snapshot being refreshed leaves the probe compiling text production no
+/// longer emits — the gate would keep passing while checking the wrong thing.
+/// Equality here turns that drift into a hard failure.
+#[allow(
+    clippy::expect_used,
+    reason = "a header that fails to build is itself the drift this test guards"
+)]
+#[test]
+fn hdr_probe_snapshot_matches_builder() {
+    assert_eq!(
+        p1_header_v4().expect("planar flash P1 header"),
+        include_str!("metal/probes/planar_flash_decode_p1.hdr.metal"),
+        "stale snapshot: refresh metal/probes/planar_flash_decode_p1.hdr.metal"
+    );
+}
