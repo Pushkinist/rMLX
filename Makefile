@@ -55,7 +55,8 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         bench-codec-cell \
         smoke-codec-matrix \
         e2e \
-        file-size-report check-no-inline-tests check-no-scalar-f32-leak
+        file-size-report check-no-inline-tests check-no-scalar-f32-leak \
+        check-metal-compiles check-metal-format
 
 help:
 	@awk 'BEGIN{FS=":.*##"} /^[a-zA-Z_-]+:.*##/ {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -165,10 +166,18 @@ check-no-inline-tests: ## CI gate: fail if any non-test.rs file has inline #[cfg
 check-no-scalar-f32-leak: ## CI gate: fail if arch-layer code has unguarded scalar_f32( not followed by .astype(
 	@bash scripts/check_no_scalar_f32_leak.sh
 
+check-metal-compiles: ## CI gate: every KV .metal kernel compiles natively (skips without the Xcode Metal toolchain)
+	@bash scripts/check_metal_compiles.sh
+
+check-metal-format: ## CI gate: every KV .metal kernel is clang-format clean (skips without clang-format)
+	@bash scripts/check_metal_format.sh
+
 # ---- one-shot CI gate -------------------------------------------------
-ci: fmt-check lint test deny audit ci-metrics ## full pre-merge gate: fmt + clippy + test + deny + audit + metrics-sanity + inline-test gate
+ci: fmt-check lint test deny audit ci-metrics ## full pre-merge gate: fmt + clippy + test + deny + audit + metrics-sanity + inline-test + MSL gates
 	@bash scripts/check_no_inline_tests.sh
 	@bash scripts/check_no_scalar_f32_leak.sh
+	@bash scripts/check_metal_format.sh
+	@bash scripts/check_metal_compiles.sh
 	@bash scripts/file_size_report.sh || true
 	@echo "ci ok"
 
