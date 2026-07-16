@@ -1020,8 +1020,8 @@ enum Cmd {
         #[arg(long, visible_alias = "ctx-max")]
         max_ctx: Option<u32>,
         /// Truncate the tokenized prompt to at most this many tokens. Defaults to
-        /// the built-in cap (see long-help). Passing this flag explicitly opts
-        /// into truncation on `--device gpu`; raise it to bench longer contexts
+        /// the built-in cap (65536). Passing this flag explicitly opts into
+        /// truncation on `--device gpu`; raise it to bench longer contexts
         /// (e.g. 128k) without truncation. Must be >= 1.
         #[arg(long, value_name = "N")]
         max_prompt_tokens: Option<usize>,

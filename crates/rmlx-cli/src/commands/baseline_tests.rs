@@ -266,6 +266,15 @@ fn resolve_prompt_truncation_under_cap_is_a_noop_on_cpu() {
     assert_eq!(len, 1_000);
 }
 
+/// Equality boundary on the GPU-default (no opt-in) path: a prompt exactly
+/// at the cap must not error -- pins the `<=` guard against a `<` mutation.
+#[test]
+fn resolve_prompt_truncation_gpu_at_cap_exactly_is_a_noop() {
+    let len = resolve_prompt_truncation(65_536, 65_536, Device::Gpu, false, false)
+        .expect("prompt exactly at the default cap must not error");
+    assert_eq!(len, 65_536);
+}
+
 /// The bug this fixes: a >65536-token prompt on `--device gpu` with the
 /// default cap and no opt-in must fail loudly, not silently truncate down to
 /// a shorter measurement that looks like a full-length one.
