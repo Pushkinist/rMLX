@@ -267,80 +267,38 @@ pub const WEIGHT_QUANT_WHITELIST: &[&str] = &[
     "6bit", "8bit", "paro",
 ];
 
-/// Validate (and canonicalize) a `kv_quant` column value.
+/// Canonicalize a `kv_quant` column value.
 ///
-/// Replaces the fixed `KV_QUANT_WHITELIST` lookup. Accepts:
+/// `kv_quant` is a **free-form recorded label**, not a value validated
+/// against a fixed codec set. `rmlx-metrics` deliberately does not depend on
+/// `rmlx-kv-quant` (workspace dep-graph constraint — pulling the MLX-bound
+/// codec enum into the metrics crate is an Ask-before dep edge), so it
+/// cannot know the closed list of real `KvQuant` variants; a hand-maintained
+/// allow-list mirroring that enum went stale the moment a new codec shipped
+/// and silently dropped every row for it (the bug this function used to
+/// have). The fix is not a bigger mirror — it is to stop validating: any
+/// token this binary has never heard of is recorded verbatim rather than
+/// rejected. `rmlx metrics doctor` / ad-hoc queries are where an operator
+/// notices a typo, not a silent ingest-time drop.
 ///
-/// * the canonical Display forms emitted by `<KvQuant as Display>` —
-///   `"none"`, `"k8v4"`, `"k8v8"`, `"planar"`, and the long-form
-///   `"mixed_k<kb>g<kg>_v<vb>g<vg>"` (e.g. `"mixed_k8g128_v4g64"`).
-/// * the aliases `"bf16"` and `"f16"`, which canonicalize to `"none"`.
-/// * the legacy historical labels `"turbo4"` and `"turbo8"` (preserved
-///   verbatim for backward-compat with legacy-ingested rows).
+/// Only a tiny, stable set of aliases is normalized before recording:
 ///
-/// Lowercases input before checking. Returns the canonical form on success.
+/// * `"bf16"` / `"f16"` → `"none"` (both mean "unquantised KV").
+/// * `"rotor_v_3"` / `"rotor_v_4"` → `"rotor3"` / `"rotor4"` (alternate
+///   spelling of the same codec).
+///
+/// Everything else — including codec names this binary has never heard of —
+/// is lowercased/trimmed and passed through unchanged. Always `Ok`; kept as
+/// `Result<String>` so call sites (`self.kv_quant = canonicalize_kv_quant(...)? `)
+/// do not need to change if a future caller-side sanity check is added.
 pub fn canonicalize_kv_quant(value: &str) -> Result<String> {
-    let lower = value.to_lowercase();
-    if matches!(lower.as_str(), "turbo4" | "turbo8") {
-        return Ok(lower);
-    }
-    if is_valid_kv_quant_token(&lower) {
-        // Re-emit through the same matcher to canonicalize aliases (bf16/f16 → none).
-        return Ok(canonicalize_kv_quant_token(&lower));
-    }
-    Err(Error::IdentityNotInWhitelist {
-        field: "kv_quant".to_string(),
-        value: value.to_string(),
-        allowed: vec![
-            "none".to_string(),
-            "k8v4".to_string(),
-            "k8v8".to_string(),
-            "planar".to_string(),
-            "mixed_k<kb>g<kg>_v<vb>g<vg>".to_string(),
-            "turbo4".to_string(),
-            "turbo8".to_string(),
-        ],
-    })
-}
-
-/// Pure-string validator for a kv_quant token (lower-case). Mirrors the
-/// grammar in `<KvQuant as FromStr>` without importing `rmlx-models` (which
-/// would pull the MLX-bound types into the metrics crate). Update both in
-/// lockstep when the canonical grammar changes.
-fn is_valid_kv_quant_token(lower: &str) -> bool {
-    match lower {
-        "none" | "bf16" | "f16" | "k8v4" | "k8v8" | "planar" => true,
-        s if s.starts_with("mixed_") => parse_mixed_token(s).is_some(),
-        _ => false,
-    }
-}
-
-/// Canonicalize a validated lower-case token to its Display form
-/// (`bf16`/`f16` → `none`; everything else passes through).
-fn canonicalize_kv_quant_token(lower: &str) -> String {
-    match lower {
+    let lower = value.trim().to_lowercase();
+    Ok(match lower.as_str() {
         "bf16" | "f16" => "none".to_string(),
-        other => other.to_string(),
-    }
-}
-
-/// Returns `Some(())` iff `s` matches `mixed_k<u8>g<u16>_v<u8>g<u16>`.
-fn parse_mixed_token(s: &str) -> Option<()> {
-    let rest = s.strip_prefix("mixed_")?;
-    let (k_part, v_part) = rest.split_once('_')?;
-    let (kb, kg) = parse_side(k_part, 'k')?;
-    let (vb, vg) = parse_side(v_part, 'v')?;
-    // Smoke-check ranges (real `KvQuant::Mixed` uses `u8`/`u16`).
-    let _ = (kb, kg, vb, vg);
-    Some(())
-}
-
-fn parse_side(spec: &str, prefix: char) -> Option<(u8, u16)> {
-    let rest = spec.strip_prefix(prefix)?;
-    let (bits, group) = rest.split_once('g')?;
-    let bits: u8 = bits.parse().ok()?;
-    let group: u16 = group.parse().ok()?;
-    Some((bits, group))
+        "rotor_v_3" => "rotor3".to_string(),
+        "rotor_v_4" => "rotor4".to_string(),
+        _ => lower,
+    })
 }
 
 /// Normalize well-known backend aliases to their canonical form before
