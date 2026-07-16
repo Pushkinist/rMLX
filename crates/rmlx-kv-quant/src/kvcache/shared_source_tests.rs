@@ -53,7 +53,7 @@ const TEST_PREFILL_SEQ: i32 = 64;
 /// is unconditional on CPU hosts regardless of `RMLX_TURBO_FLASH` or
 /// `RMLX_FUSED_QK` env-var state. It does NOT prove that GPU dispatch works.
 #[test]
-fn returning_kv_cpu_device_suppresses_all_dispatch_arms() {
+fn shared_source_cpu_device_suppresses_all_dispatch_arms() {
     // Defensive: clear gates if a prior process / test latched them. These
     // gates use OnceLock so the value is per-process; the test relies on the
     // canonical default-off state.
@@ -121,7 +121,7 @@ fn returning_kv_cpu_device_suppresses_all_dispatch_arms() {
 /// dispatch path — shape correctness after TurboFlash dispatch is verified
 /// in `crates/rmlx-kv-quant/tests/shared_source_dispatch.rs`.
 #[test]
-fn returning_kv_cpu_device_legacy_fallback_surfaces_full_prefix_shape() {
+fn shared_source_cpu_device_legacy_fallback_surfaces_full_prefix_shape() {
     let device = Device::Cpu;
     let mut cache = KvCache::with_quant_max_seq(KvQuant::K8V4, TEST_MAX_SEQ);
 

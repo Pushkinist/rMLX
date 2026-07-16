@@ -869,15 +869,13 @@ Reproduced live on `gemma-4-e4b-it-mxfp8` with `--cache-type-k q8_g128
 > bf16/K8V8/K8V4/Planar for shared-KV layers, or disable layer-KV sharing for
 > this arch.`
 
-emitted from `KvCache::update_and_sdpa_shared_source` (`kvcache.rs:412`). Gemma4
-genuinely shares KV across layers (`num_kv_shared_layers`, `loader.rs:252-258`),
-and shared-KV layers route through the `returning_kv` path that rejects
-`KvQuant::Mixed`. This is the documented cross-layer-KV-sharing contract behaving correctly. The
-only flaw is *when* it fires — at first prefill (runtime_fail, value 0.00)
-rather than at startup. **ACCEPT** — this is correct-by-design and justifies
-the resolver guard: reject Mixed on the Gemma family at flag resolution and
-exit 78 at startup, so the user sees the error immediately instead of after a
-model load + prefill.
+emitted from the cross-layer-KV producer path. Gemma4 genuinely shares KV across
+layers (`num_kv_shared_layers`, `loader.rs:252-258`), and at the time of this
+run shared-KV layers rejected `KvQuant::Mixed`. **This finding is historical and
+its premise no longer holds**: the `SharedKvIncompatibleWithMixed` rejection was
+removed (`kv_cache/cache_type.rs`) — `KvCache::update_and_sdpa_shared_source`
+supports Mixed via dequant-before-share, so the combination is now valid and no
+resolver guard is needed. Kept for the record of what was measured.
 
 ### H9 — decode forward NOT compiled — characterized (NOT a catastrophe)
 

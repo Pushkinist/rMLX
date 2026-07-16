@@ -104,13 +104,18 @@ impl SharedKv {
         }
     }
 
-    /// Materialise the producer's K/V as bf16 tensors.
+    /// Materialise the producer's K/V as tensors.
     ///
     /// For callers that genuinely need *tensors* rather than attention output —
     /// e.g. handing a verifier's representative K/V to a separate drafter
     /// model. **Not** for the attention hot path: on a [`Self::Store`] share
     /// this pays the full-prefix dequant the fused kernel exists to avoid.
-    pub fn materialise_bf16(
+    ///
+    /// The pair comes back at the activation-stream dtype (bf16 in production);
+    /// K and V always agree, so a consumer's attention is never promoted to a
+    /// wider dtype by one half of the pair. See
+    /// [`KvCache::materialise_shared_kv`].
+    pub fn materialise(
         &self,
         producer: Option<&KvCache>,
         device: Device,
@@ -120,12 +125,12 @@ impl SharedKv {
             Self::Store { kv_len } => {
                 let cache = producer.ok_or_else(|| {
                     Error::Mlx(
-                        "SharedKv::Store: no producer cache supplied — cannot materialise bf16 \
-                         K/V without the store it lives in"
+                        "SharedKv::Store: no producer cache supplied — cannot materialise K/V \
+                         without the store it lives in"
                             .to_owned(),
                     )
                 })?;
-                cache.materialise_shared_kv_bf16(*kv_len, device)
+                cache.materialise_shared_kv(*kv_len, device)
             }
         }
     }

@@ -29,12 +29,13 @@
 //! each in a fresh process.
 //!
 //! A parallel **planar_flash_decode** family of cells (`niah_pflash_*`) consult
-//! `RMLX_PLANAR_FLASH_DECODE` and force `KvQuant::PlanarK`. Only
-//! `Qwen3ForCausalLM` (Bonsai) routes through `update_and_sdpa_planar_k_fused`;
+//! `RMLX_PLANAR_FLASH_DECODE` and force `KvQuant::PlanarK`. Bonsai
+//! (`Qwen3ForCausalLM`) reaches `update_and_sdpa_planar_k_fused` and dispatches;
 //! Qwen3.6 MoE rejects `PlanarK` outright at `validate_resolved`
-//! (`QwenMoePlanarKRejected`), and Gemma4 routes through
-//! `update_and_sdpa_shared_source` (same shape as the TurboFlash Unreachable
-//! case for that arch).
+//! (`QwenMoePlanarKRejected`); Gemma4 reaches the same fused arm via
+//! `update_and_sdpa_shared_source` but stays dormant behind the warm-TTFT
+//! bf16-K-seed gate. See [`FlashRouting`] — dormancy is always a gate, never a
+//! property of cross-layer KV sharing.
 //!
 //! # KV mode
 //!
@@ -341,21 +342,38 @@ fn run_one(
     }
 }
 
-/// Routing capability for the dispatch assertion.
+/// Expected kernel-dispatch outcome for a cell, in ON mode.
 ///
-/// `Reachable` — the arch routes through `KvCache::sdpa_dispatch` (e.g.
-/// Qwen3 / Qwen3.6). In ON mode the MSL kernel MUST fire; delta > 0.
+/// `Reachable` — the MSL kernel MUST fire; delta > 0.
 ///
-/// `Unreachable` — the arch routes through `update_and_sdpa_shared_source`
-/// (e.g. Gemma4 — cross-layer KV sharing requires the accumulated bf16
-/// K/V to be returned alongside SDPA out, which `turbo_flash_sdpa` does
-/// not produce). The kernel is structurally never invoked; the ON run is
-/// equivalent to OFF. Documented limitation; not a bug to chase from this
-/// review-fix cluster.
+/// `Dormant` — the kernel must NOT fire; delta == 0, so the ON run measures the
+/// legacy fallback and is equivalent to OFF.
+///
+/// **Dormancy is a gate/config fact, per cell — never a structural property of
+/// cross-layer KV sharing.** An earlier version of this comment claimed the
+/// shared-KV producer path "structurally never invokes" the kernel because it
+/// must return accumulated bf16 K/V alongside the SDPA output. Both halves are
+/// false: `update_and_sdpa_shared_source` reaches the TurboFlash, fused-QK,
+/// planar and rotor arms exactly as `update_and_sdpa` does, and a producer that
+/// runs a fused arm hands consumers `SharedKv::Store` rather than materialising
+/// bf16 (see `docs/KV_QUANT.md`). The measured reason per `Dormant` cell:
+///
+/// * **Gemma4 + Turbo** — TurboFlash requires `head_dim ∈ {128, 256}`; Gemma4's
+///   global layers are `head_dim=512`, so the kernel's own shape gate rejects
+///   them (`update_and_sdpa_k8v4_flash_inner`). Nothing to do with KV sharing.
+/// * **Gemma4 + Pflash** — the warm-TTFT bf16-K-seed gate keeps the PlanarK
+///   kernels dormant while the seed is live (`sdpa.rs`, `warm_ttft_bypass`).
+/// * **Qwen3.6 + Pflash** — the arch rejects `KvQuant::PlanarK` at
+///   `validate_resolved`, so the codec never runs at all.
+///
+/// Each of those is a gate that can move. Re-check the affected cells whenever
+/// the TurboFlash shape gate, the warm-TTFT gate, or a `validate_resolved`
+/// rejection changes — a cell going `delta > 0` means re-classify as
+/// `Reachable`, not that the kernel misfired.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 enum FlashRouting {
     Reachable,
-    Unreachable,
+    Dormant,
 }
 
 fn run_cell(model_path: &Path, ctx: usize, depth: f32, routing: FlashRouting) {
@@ -460,29 +478,25 @@ fn run_cell_kind(
                 model_path.display(),
             );
         }
-        ("ON", FlashRouting::Unreachable, _) => {
-            // Documented limitation. For Turbo: this arch's attention layer
-            // routes through `update_and_sdpa_shared_source`, which never
-            // reaches `sdpa_dispatch`. For Pflash: the arch rejects
-            // `KvQuant::PlanarK` at `validate_resolved` (Qwen MoE) or
-            // routes through `update_and_sdpa_shared_source` (Gemma4 cross-
-            // layer KV sharing). Either way the ON run is byte-identical to
-            // OFF and the dispatch counter must remain zero.
+        ("ON", FlashRouting::Dormant, _) => {
+            // A gate — not the shared-KV topology — keeps this cell's kernel
+            // dormant; see `FlashRouting` for the measured per-cell reason.
+            // The ON run is therefore byte-identical to OFF.
             assert_eq!(
                 dispatch_delta,
                 0,
-                "[niah] FAIL: family={family} routing=Unreachable but kernel still \
-                 dispatched (model={} ctx={ctx} depth={depth:.2}). Re-classify \
-                 this cell as Reachable.",
+                "[niah] FAIL: family={family} routing=Dormant but kernel still \
+                 dispatched (model={} ctx={ctx} depth={depth:.2}). A gate moved: \
+                 confirm which one, then re-classify this cell as Reachable.",
                 model_path.display(),
             );
             eprintln!(
-                "[niah] NOTE: family={family} model={} routing=Unreachable — ON \
+                "[niah] NOTE: family={family} model={} routing=Dormant — ON \
                  run measures the legacy fallback, NOT the MSL kernel.",
                 model_path.display(),
             );
         }
-        ("OFF", FlashRouting::Reachable | FlashRouting::Unreachable, _) => {
+        ("OFF", FlashRouting::Reachable | FlashRouting::Dormant, _) => {
             assert_eq!(
                 dispatch_delta,
                 0,
@@ -662,7 +676,7 @@ niah_cell!(
     niah_gemma4_8k_d10,
     "RMLX_TEST_MODEL_GEMMA4_E4B",
     EXPECTED_ARCHS_GEMMA4,
-    FlashRouting::Unreachable,
+    FlashRouting::Dormant,
     8_192,
     0.10
 );
@@ -670,7 +684,7 @@ niah_cell!(
     niah_gemma4_8k_d30,
     "RMLX_TEST_MODEL_GEMMA4_E4B",
     EXPECTED_ARCHS_GEMMA4,
-    FlashRouting::Unreachable,
+    FlashRouting::Dormant,
     8_192,
     0.30
 );
@@ -678,7 +692,7 @@ niah_cell!(
     niah_gemma4_8k_d50,
     "RMLX_TEST_MODEL_GEMMA4_E4B",
     EXPECTED_ARCHS_GEMMA4,
-    FlashRouting::Unreachable,
+    FlashRouting::Dormant,
     8_192,
     0.50
 );
@@ -686,7 +700,7 @@ niah_cell!(
     niah_gemma4_8k_d70,
     "RMLX_TEST_MODEL_GEMMA4_E4B",
     EXPECTED_ARCHS_GEMMA4,
-    FlashRouting::Unreachable,
+    FlashRouting::Dormant,
     8_192,
     0.70
 );
@@ -694,7 +708,7 @@ niah_cell!(
     niah_gemma4_8k_d90,
     "RMLX_TEST_MODEL_GEMMA4_E4B",
     EXPECTED_ARCHS_GEMMA4,
-    FlashRouting::Unreachable,
+    FlashRouting::Dormant,
     8_192,
     0.90
 );
@@ -703,7 +717,7 @@ niah_cell!(
     niah_gemma4_16k_d10,
     "RMLX_TEST_MODEL_GEMMA4_E4B",
     EXPECTED_ARCHS_GEMMA4,
-    FlashRouting::Unreachable,
+    FlashRouting::Dormant,
     16_384,
     0.10
 );
@@ -711,7 +725,7 @@ niah_cell!(
     niah_gemma4_16k_d30,
     "RMLX_TEST_MODEL_GEMMA4_E4B",
     EXPECTED_ARCHS_GEMMA4,
-    FlashRouting::Unreachable,
+    FlashRouting::Dormant,
     16_384,
     0.30
 );
@@ -719,7 +733,7 @@ niah_cell!(
     niah_gemma4_16k_d50,
     "RMLX_TEST_MODEL_GEMMA4_E4B",
     EXPECTED_ARCHS_GEMMA4,
-    FlashRouting::Unreachable,
+    FlashRouting::Dormant,
     16_384,
     0.50
 );
@@ -727,7 +741,7 @@ niah_cell!(
     niah_gemma4_16k_d70,
     "RMLX_TEST_MODEL_GEMMA4_E4B",
     EXPECTED_ARCHS_GEMMA4,
-    FlashRouting::Unreachable,
+    FlashRouting::Dormant,
     16_384,
     0.70
 );
@@ -735,7 +749,7 @@ niah_cell!(
     niah_gemma4_16k_d90,
     "RMLX_TEST_MODEL_GEMMA4_E4B",
     EXPECTED_ARCHS_GEMMA4,
-    FlashRouting::Unreachable,
+    FlashRouting::Dormant,
     16_384,
     0.90
 );
@@ -744,7 +758,7 @@ niah_cell!(
     niah_gemma4_32k_d10,
     "RMLX_TEST_MODEL_GEMMA4_E4B",
     EXPECTED_ARCHS_GEMMA4,
-    FlashRouting::Unreachable,
+    FlashRouting::Dormant,
     32_768,
     0.10
 );
@@ -752,7 +766,7 @@ niah_cell!(
     niah_gemma4_32k_d30,
     "RMLX_TEST_MODEL_GEMMA4_E4B",
     EXPECTED_ARCHS_GEMMA4,
-    FlashRouting::Unreachable,
+    FlashRouting::Dormant,
     32_768,
     0.30
 );
@@ -760,7 +774,7 @@ niah_cell!(
     niah_gemma4_32k_d50,
     "RMLX_TEST_MODEL_GEMMA4_E4B",
     EXPECTED_ARCHS_GEMMA4,
-    FlashRouting::Unreachable,
+    FlashRouting::Dormant,
     32_768,
     0.50
 );
@@ -768,7 +782,7 @@ niah_cell!(
     niah_gemma4_32k_d70,
     "RMLX_TEST_MODEL_GEMMA4_E4B",
     EXPECTED_ARCHS_GEMMA4,
-    FlashRouting::Unreachable,
+    FlashRouting::Dormant,
     32_768,
     0.70
 );
@@ -776,7 +790,7 @@ niah_cell!(
     niah_gemma4_32k_d90,
     "RMLX_TEST_MODEL_GEMMA4_E4B",
     EXPECTED_ARCHS_GEMMA4,
-    FlashRouting::Unreachable,
+    FlashRouting::Dormant,
     32_768,
     0.90
 );
@@ -916,13 +930,13 @@ niah_cell!(
 // Routing:
 // - Bonsai (`Qwen3ForCausalLM`)              → Reachable. Routes through
 //   `KvCache::update_and_sdpa` → `sdpa_dispatch` → `update_and_sdpa_planar_k_fused`.
-// - Qwen3.6 (`Qwen3_5MoeForConditionalGeneration`) → Unreachable. `validate_resolved`
+// - Qwen3.6 (`Qwen3_5MoeForConditionalGeneration`) → Dormant. `validate_resolved`
 //   rejects `KvQuant::PlanarK` outright with `QwenMoePlanarKRejected`. The
 //   cache is never built; the kernel can never dispatch. Cells are kept so
 //   the assertion enforces the routing contract.
-// - Gemma4 (`Gemma4ForConditionalGeneration`) → Unreachable. Routes through
-//   `update_and_sdpa_shared_source` for cross-layer KV sharing (same shape as
-//   the TurboFlash Unreachable case for this arch).
+// - Gemma4 (`Gemma4ForConditionalGeneration`) → Dormant. It DOES reach the same
+//   fused arm via `update_and_sdpa_shared_source`, but the warm-TTFT bf16-K-seed
+//   gate keeps the kernel dormant. Re-check if that gate changes.
 //
 // Bonsai max-pos = 16k (no YARN), so cells cap at 16k — matches the existing
 // TurboFlash Bonsai cells.
@@ -1025,16 +1039,16 @@ niah_pflash_cell!(
     0.90
 );
 
-// ── Qwen3.6 35B-A3B — Unreachable. PlanarK rejected at validate_resolved
+// ── Qwen3.6 35B-A3B — Dormant. PlanarK rejected at validate_resolved
 //   (`QwenMoePlanarKRejected`).  Cells exist so the dispatch-counter
-//   assertion enforces "Unreachable means delta == 0 even with ON". 32k per
+//   assertion enforces "Dormant means delta == 0 even with ON". 32k per
 //   ticket DoD ceiling. ─────────────────────────────────────────────────
 
 niah_pflash_cell!(
     niah_pflash_qwen36_32k_d10,
     "RMLX_TEST_MODEL_QWEN36",
     EXPECTED_ARCHS_QWEN36,
-    FlashRouting::Unreachable,
+    FlashRouting::Dormant,
     32_768,
     0.10
 );
@@ -1042,7 +1056,7 @@ niah_pflash_cell!(
     niah_pflash_qwen36_32k_d50,
     "RMLX_TEST_MODEL_QWEN36",
     EXPECTED_ARCHS_QWEN36,
-    FlashRouting::Unreachable,
+    FlashRouting::Dormant,
     32_768,
     0.50
 );
@@ -1050,20 +1064,20 @@ niah_pflash_cell!(
     niah_pflash_qwen36_32k_d90,
     "RMLX_TEST_MODEL_QWEN36",
     EXPECTED_ARCHS_QWEN36,
-    FlashRouting::Unreachable,
+    FlashRouting::Dormant,
     32_768,
     0.90
 );
 
-// ── Gemma4 e4b — Unreachable. Same shape as the TurboFlash Unreachable
-//   path: this arch routes through `update_and_sdpa_shared_source` for
-//   cross-layer KV sharing. ────────────────────────────────────────────
+// ── Gemma4 e4b — Dormant. The fused arm IS reached via
+//   `update_and_sdpa_shared_source`; the warm-TTFT bf16-K-seed gate is what
+//   keeps the kernel dormant. ──────────────────────────────────────────
 
 niah_pflash_cell!(
     niah_pflash_gemma4_32k_d10,
     "RMLX_TEST_MODEL_GEMMA4_E4B",
     EXPECTED_ARCHS_GEMMA4,
-    FlashRouting::Unreachable,
+    FlashRouting::Dormant,
     32_768,
     0.10
 );
@@ -1071,7 +1085,7 @@ niah_pflash_cell!(
     niah_pflash_gemma4_32k_d50,
     "RMLX_TEST_MODEL_GEMMA4_E4B",
     EXPECTED_ARCHS_GEMMA4,
-    FlashRouting::Unreachable,
+    FlashRouting::Dormant,
     32_768,
     0.50
 );
@@ -1079,7 +1093,7 @@ niah_pflash_cell!(
     niah_pflash_gemma4_32k_d90,
     "RMLX_TEST_MODEL_GEMMA4_E4B",
     EXPECTED_ARCHS_GEMMA4,
-    FlashRouting::Unreachable,
+    FlashRouting::Dormant,
     32_768,
     0.90
 );

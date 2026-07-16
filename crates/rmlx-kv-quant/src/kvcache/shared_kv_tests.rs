@@ -183,10 +183,128 @@ fn store_share_kv_len_tracks_producer_offset() {
     }
 }
 
-/// A store-backed share must never be silently answered from a cache that does
-/// not hold it. Both the missing-producer and the length-desync cases error.
+/// `materialise` must return K at the **stream dtype**, never a raw f32 dequant.
+///
+/// The pair goes to a separate downstream model's attention, so a K wider than
+/// V promotes that model's whole stream — the KV-promotion class this codebase
+/// has closed repeatedly. The rotor store dequantises through a `Vec<f32>`, so
+/// K arrives F32 and the cast to V's dtype is load-bearing: drop it and a bf16
+/// stream silently gets an f32 K.
+///
+/// Pinned against a **bf16** producer specifically, because that is the
+/// production shape — the other tests here push F32 K/V, which would hide the
+/// bug (F32 K matches an F32 V by accident).
 #[test]
-fn store_share_refuses_missing_producer_and_length_desync() {
+#[allow(
+    clippy::indexing_slicing,
+    reason = "test asserts on a known rank-4 shape"
+)]
+fn materialise_casts_k_to_the_stream_dtype() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    let device = Device::Gpu;
+    let mut cache = seeded_cache();
+
+    // bf16 K/V, as a real model pushes.
+    let bf16 = |data: &[f32], shape: &[i32]| -> Array {
+        f32_array(data, shape)
+            .astype(Dtype::Bf16, device)
+            .expect("cast to bf16")
+    };
+    let pf = (PREFILL * KV_H * HEAD_DIM) as usize;
+    let k = bf16(&lcg_data(pf, 1), &[1, KV_H, PREFILL, HEAD_DIM]);
+    let v = bf16(&lcg_data(pf, 2), &[1, KV_H, PREFILL, HEAD_DIM]);
+    let q = bf16(
+        &lcg_data((PREFILL * N_Q_HEADS * HEAD_DIM) as usize, 3),
+        &[1, N_Q_HEADS, PREFILL, HEAD_DIM],
+    );
+    cache
+        .update_and_sdpa_shared_source(&q, &k, &v, scale(), "causal", None, device)
+        .expect("bf16 prefill");
+    cache.exit_prefill(device).expect("exit_prefill");
+
+    let one = (KV_H * HEAD_DIM) as usize;
+    let k1 = bf16(&lcg_data(one, 11), &[1, KV_H, 1, HEAD_DIM]);
+    let v1 = bf16(&lcg_data(one, 21), &[1, KV_H, 1, HEAD_DIM]);
+    let q1 = bf16(
+        &lcg_data((N_Q_HEADS * HEAD_DIM) as usize, 31),
+        &[1, N_Q_HEADS, 1, HEAD_DIM],
+    );
+    let (out, share) = cache
+        .update_and_sdpa_shared_source(&q1, &k1, &v1, scale(), "", None, device)
+        .expect("bf16 decode");
+    out.eval().expect("out eval");
+    assert!(
+        matches!(share, SharedKv::Store { .. }),
+        "precondition: this must be a store-backed share, or the test proves nothing"
+    );
+
+    let (k_m, v_m) = share
+        .materialise(Some(&cache), device)
+        .expect("materialise a store-backed share");
+    assert_eq!(
+        v_m.dtype(),
+        Dtype::Bf16,
+        "precondition: the V mirror carries the bf16 stream dtype"
+    );
+    assert_eq!(
+        k_m.dtype(),
+        Dtype::Bf16,
+        "materialised K must follow the stream dtype — a raw f32 dequant here \
+         promotes the consumer model's attention stream to f32"
+    );
+    assert_eq!(k_m.dtype(), v_m.dtype(), "K and V must agree on dtype");
+    assert_eq!(
+        k_m.shape()[2],
+        share.kv_len().expect("kv_len"),
+        "materialised K must span the shared length"
+    );
+}
+
+/// `check_shared_kv_len` is the guard between a producer/consumer length desync
+/// and a silently-wrong attended prefix: a consumer that reads one key too many
+/// or too few gets a plausible-looking answer, not an error. Pin both
+/// directions against a live store — stubbing the guard to `Ok(())` must turn
+/// this red.
+#[test]
+fn store_share_refuses_length_desync_against_live_store() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    let device = Device::Gpu;
+    let mut cache = prefilled_producer();
+    let share = producer_decode_step(&mut cache, 0);
+    let live = share.kv_len().expect("kv_len");
+
+    let q = f32_array(
+        &lcg_data((N_Q_HEADS * HEAD_DIM) as usize, 77),
+        &[1, N_Q_HEADS, 1, HEAD_DIM],
+    );
+    // Sanity: the honest length must succeed, or the negatives below prove
+    // nothing (they would fail for an unrelated reason).
+    cache
+        .sdpa_shared(&q, scale(), None, live, device)
+        .expect("the live store length must be accepted");
+
+    for wrong in [live + 1, live - 1] {
+        assert!(
+            cache.sdpa_shared(&q, scale(), None, wrong, device).is_err(),
+            "sdpa_shared accepted kv_len={wrong} against a store holding {live} — a \
+             desync must error, not attend the wrong prefix"
+        );
+        assert!(
+            cache.materialise_shared_kv(wrong, device).is_err(),
+            "materialise_shared_kv accepted kv_len={wrong} against a store \
+             holding {live} — a desync must error"
+        );
+    }
+}
+
+/// A store-backed share must never be silently answered from a cache that does
+/// not hold it: no producer supplied, or a codec with no fused-over-store path.
+#[test]
+fn store_share_refuses_missing_producer_and_wrong_codec() {
     let device = Device::Gpu;
     let share = SharedKv::Store { kv_len: 8 };
     let q = f32_array(
@@ -198,7 +316,7 @@ fn store_share_refuses_missing_producer_and_length_desync() {
         "a store-backed share with no producer cache must error, not guess"
     );
     assert!(
-        share.materialise_bf16(None, device).is_err(),
+        share.materialise(None, device).is_err(),
         "materialising a store-backed share with no producer cache must error"
     );
 

@@ -1097,7 +1097,7 @@ mod tests {
                 .update_and_sdpa_shared_source(
                     &q_pref, &k_pref, &v_pref, scale, "causal", None, device,
                 )
-                .expect("Mixed prefill via returning_kv must succeed"),
+                .expect("Mixed prefill via the shared-source path must succeed"),
         );
         cache.exit_prefill(device).expect("exit_prefill failed");
 
@@ -1496,7 +1496,7 @@ mod tests {
     /// regression: a Mixed-quant SWA (rotating) cache driven across a
     /// window-crossing prefill chunk must NOT broadcast-fail.
     ///
-    /// Before , `update_and_sdpa[_returning_kv]` short-circuited Mixed to
+    /// Previously, `update_and_sdpa[_shared_source]` short-circuited Mixed to
     /// `update_prefill_raw` (full, uncapped K of length `offset + seq`) BEFORE
     /// honoring the rotating ring. But the Gemma4 SWA attention mask is sized
     /// to the ring's window-capped K (`offset.min(window-1) + seq`). On the

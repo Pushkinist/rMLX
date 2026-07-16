@@ -6,7 +6,7 @@
 //   1. `RMLX_TURBO_FLASH=1` + `RMLX_TURBO_FLASH_MIN=0` (zero threshold so
 //      TurboFlash fires on a short kv_seq):
 //      a. `turbo_flash_dispatch_count()` delta > 0 after a decode step (the
-//         kernel actually fired on the returning_kv path, not just gated).
+//         kernel actually fired on the shared-KV producer path, not just gated).
 //      b. The bf16 K surfaced to the consumer is byte-identical to slicing
 //         `decode_fp16_k` — proving the dispatch path surfaced the mirror
 //         rather than a flash-transformed K.
@@ -14,7 +14,7 @@
 //   2. `RMLX_TURBO_FLASH=0` (control group):
 //      Same prefill + decode; dispatch delta == 0 (gate correctly suppressed).
 //
-// `RMLX_RETURNING_KV_STRICT=1` — strict mode (used by CI):
+// `RMLX_SHARED_SOURCE_STRICT=1` — strict mode (used by CI):
 //   * When env=ON and delta == 0, panic instead of skip.
 //   * When the dispatch errors, panic instead of skip.
 //
@@ -92,7 +92,7 @@ fn skip_if_no_gpu() -> bool {
 }
 
 fn is_strict() -> bool {
-    std::env::var("RMLX_RETURNING_KV_STRICT").as_deref() == Ok("1")
+    std::env::var("RMLX_SHARED_SOURCE_STRICT").as_deref() == Ok("1")
 }
 
 // ── test parameters ───────────────────────────────────────────────────────────
@@ -134,7 +134,7 @@ fn build_prefilled_cache(
 ///   a. `turbo_flash_dispatch_count()` delta > 0 (kernel fired).
 ///   b. Surfaced K bytes == bf16 reference K bytes (mirror, not flash-transformed).
 ///
-/// `RMLX_RETURNING_KV_STRICT=1` turns a delta=0 skip into a panic.
+/// `RMLX_SHARED_SOURCE_STRICT=1` turns a delta=0 skip into a panic.
 #[test]
 #[ignore = "GPU Metal context: cargo test -p rmlx-kv-quant --test shared_source_dispatch -- --ignored --test-threads=1"]
 fn shared_source_turbo_flash_on_dispatch_fires_and_surfaces_bf16_mirror() {
@@ -202,7 +202,7 @@ fn shared_source_turbo_flash_on_dispatch_fires_and_surfaces_bf16_mirror() {
             );
             assert!(
                 !strict,
-                "RMLX_RETURNING_KV_STRICT=1 — update_and_sdpa_shared_source errored ({e}), \
+                "RMLX_SHARED_SOURCE_STRICT=1 — update_and_sdpa_shared_source errored ({e}), \
                  but strict mode requires the dispatch to succeed"
             );
             return;
@@ -214,13 +214,13 @@ fn shared_source_turbo_flash_on_dispatch_fires_and_surfaces_bf16_mirror() {
 
     if delta == 0 {
         eprintln!(
-            "TF=1: HOLD-soft — TurboFlash did not fire on the returning_kv path \
+            "TF=1: HOLD-soft — TurboFlash did not fire on the shared-KV producer path \
              (expected when head_dim not in {{128,256}} or kv_seq below threshold). \
              Skipping byte-identity assertion."
         );
         assert!(
             !strict,
-            "RMLX_RETURNING_KV_STRICT=1 — turbo_flash_dispatch_count did not increment; \
+            "RMLX_SHARED_SOURCE_STRICT=1 — turbo_flash_dispatch_count did not increment; \
              the kernel is expected to fire with RMLX_TURBO_FLASH=1 + RMLX_TURBO_FLASH_MIN=0 \
              at head_dim=128 in strict mode"
         );

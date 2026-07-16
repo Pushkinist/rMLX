@@ -338,7 +338,7 @@ impl KvCache {
         clippy::indexing_slicing,
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
     )]
-    fn update_and_sdpa_rot_k_tq4v_returning_kv(
+    fn update_and_sdpa_rot_k_tq4v_shared_source(
         &mut self,
         queries: &Array,
         new_k: &Array,
@@ -450,7 +450,7 @@ impl KvCache {
                         Err(e) => {
                             tracing::warn!(
                                 reason = %e,
-                                "rot_k_fwht_rotate_gpu failed in returning_kv; \
+                                "rot_k_fwht_rotate_gpu failed on the shared-KV producer path; \
                                  falling back to v1 matmul Q rotation"
                             );
                             crate::rot_k::rotate_last_axis(queries, r, device)?
@@ -858,7 +858,7 @@ impl KvCache {
         // bf16 K/V for downstream shared-KV consumers.
         if self.quant.uses_rot_k_tq4v_path() {
             tracing::Span::current().record("path", "rot_k_tq4v");
-            let (out, k_full, v_full) = self.update_and_sdpa_rot_k_tq4v_returning_kv(
+            let (out, k_full, v_full) = self.update_and_sdpa_rot_k_tq4v_shared_source(
                 queries,
                 new_k,
                 new_v,
@@ -964,7 +964,7 @@ impl KvCache {
                     "fused kernel dispatched on the shared-KV producer path — \
                      consumers attend the quant store"
                 );
-                let kv_len = self.offset;
+                let kv_len = planar_k_accumulated_seq(&self.storage)?;
                 return Ok(Some((out, kv_len)));
             }
         }
@@ -1112,14 +1112,15 @@ impl KvCache {
                 )
             }
             KvStorage::PlanarK { .. } => {
-                Self::check_shared_kv_len(kv_len, self.offset)?;
-                let v_full = self.slice_decode_fp16_v(self.offset, device)?;
+                let kv_seq = planar_k_accumulated_seq(&self.storage)?;
+                Self::check_shared_kv_len(kv_len, kv_seq)?;
+                let v_full = self.slice_decode_fp16_v(kv_seq, device)?;
                 self.planar_k_flash_over_store(
                     queries,
                     &v_full,
                     scale,
                     additive_mask,
-                    self.offset,
+                    kv_seq,
                     device,
                 )
             }
@@ -1131,22 +1132,35 @@ impl KvCache {
         }
     }
 
-    /// Materialise the bf16 `(K, V)` held by a store-backed share.
+    /// Materialise the `(K, V)` held by a store-backed share, as tensors.
     ///
     /// Cold path only — for callers that need K/V *tensors* rather than
     /// attention output (e.g. handing a verifier's representative K/V to a
     /// separate drafter model). This pays the full-prefix dequant the fused
     /// kernel exists to avoid, so never call it per decode step.
+    ///
+    /// # Dtype
+    ///
+    /// The pair comes back at the **V mirror's dtype** — the activation-stream
+    /// dtype the model pushed into this cache (bf16 in production). K is cast to
+    /// match it.
+    ///
+    /// That cast is load-bearing, in both directions:
+    ///
+    /// * The rotor stores dequantise through a `Vec<f32>`, so K arrives F32.
+    ///   Handing an F32 K to a downstream model's attention alongside a bf16 V
+    ///   promotes that model's whole stream to f32 and doubles its KV residency.
+    /// * Hard-coding bf16 instead would be the mirror-image bug on a cache whose
+    ///   stream is wider: K would be silently downcast away from what the cache
+    ///   actually holds. Following V keeps the pair faithful to the stream.
     #[allow(
         clippy::wildcard_enum_match_arm,
         reason = "the wildcard arm returns Err — it never selects a concrete codec, so a new \
                   storage variant fails loudly here instead of being silently decoded as another"
     )]
-    pub fn materialise_shared_kv_bf16(
-        &self,
-        kv_len: i32,
-        device: Device,
-    ) -> Result<(Array, Array)> {
+    pub fn materialise_shared_kv(&self, kv_len: i32, device: Device) -> Result<(Array, Array)> {
+        let v_full = self.slice_decode_fp16_v(kv_len, device)?;
+        let stream_dtype = v_full.dtype();
         let k_full = match &self.storage {
             KvStorage::RotorKOnly3 { k: Some(ks), .. } => {
                 Self::check_shared_kv_len(kv_len, rotor_k_accumulated_seq(&self.storage)?)?;
@@ -1157,8 +1171,8 @@ impl KvCache {
                 f32_vec_to_array(&ks.dequant()?, &ks.shape)?
             }
             KvStorage::PlanarK { k: Some(ks), .. } => {
-                Self::check_shared_kv_len(kv_len, self.offset)?;
-                let (k_recon, k_arr) = ks.dequantize_choice(device, Dtype::Bf16)?;
+                Self::check_shared_kv_len(kv_len, planar_k_accumulated_seq(&self.storage)?)?;
+                let (k_recon, k_arr) = ks.dequantize_choice(device, stream_dtype)?;
                 match k_arr {
                     Some(arr) => arr,
                     None => f32_vec_to_array(&k_recon, &ks.shape)?,
@@ -1166,12 +1180,27 @@ impl KvCache {
             }
             other => {
                 return Err(Error::Mlx(format!(
-                    "materialise_shared_kv_bf16: storage variant {} holds no store-backed share",
+                    "materialise_shared_kv: storage variant {} holds no store-backed share",
                     storage_variant_name(other)
                 )))
             }
         };
-        let v_full = self.slice_decode_fp16_v(kv_len, device)?;
+        let k_full = if k_full.dtype() == stream_dtype {
+            k_full
+        } else {
+            k_full.astype(stream_dtype, device)?
+        };
+        // Defence-in-depth: K and V go to the same downstream attention, so a
+        // dtype split between them would promote its stream to the wider of the
+        // two. The cast above should make this unreachable.
+        if k_full.dtype() != v_full.dtype() {
+            return Err(Error::Mlx(format!(
+                "materialise_shared_kv: K dtype {:?} != V dtype {:?} — a shared K/V pair \
+                 must be one dtype or it promotes the consumer's attention stream",
+                k_full.dtype(),
+                v_full.dtype()
+            )));
+        }
         Ok((k_full, v_full))
     }
 
@@ -1902,6 +1931,27 @@ fn rotor_k_accumulated_seq(storage: &KvStorage) -> Result<i32> {
     shape.get(2).copied().ok_or_else(|| {
         Error::Mlx(format!(
             "rotor_k_fused: rotor K store shape {shape:?} has no seq axis"
+        ))
+    })
+}
+
+/// Accumulated sequence length held by the active PlanarK store.
+///
+/// Sibling of [`rotor_k_accumulated_seq`], and for the same reason: the store's
+/// own `shape[2]` is the length the packed buffers were written against, so it —
+/// not [`KvCache::offset`] — is what the kernel attends and what a shared-KV
+/// consumer must size its mask from.
+fn planar_k_accumulated_seq(storage: &KvStorage) -> Result<i32> {
+    let KvStorage::PlanarK { k: Some(ks), .. } = storage else {
+        return Err(Error::KvStorageMismatch {
+            expected: "PlanarK with a live K buffer",
+            got: storage_variant_name(storage),
+        });
+    };
+    ks.shape.get(2).copied().ok_or_else(|| {
+        Error::Mlx(format!(
+            "planar_k_fused: PlanarK store shape {:?} has no seq axis",
+            ks.shape
         ))
     })
 }
