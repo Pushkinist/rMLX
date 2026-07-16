@@ -297,6 +297,34 @@ pub(crate) fn engine_error_response(e: &rmlx_core::Error) -> Response {
     }
 }
 
+/// The stable `type` key an engine error carries in the OpenAI error envelope.
+///
+/// Mirrors the arms of [`engine_error_response`]. A stream that dies mid-flight
+/// cannot reuse that function — the HTTP status and headers are already sent —
+/// but it must still name the failure identically, so a client sees the same
+/// `type` for the same fault whether it streamed the response or not. Keep the
+/// two in step; `engine_error_type_matches_response` fails if they drift.
+///
+/// OpenAI-surface strings only. The Anthropic surface has its own mirror
+/// (`anthropic::errors::engine_error_type`) because its type strings carry an
+/// `_error` suffix; do not call this one from there.
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "wildcard arm mirrors engine_error_response: every unenumerated variant maps to the same service_unavailable envelope there"
+)]
+pub(crate) fn engine_error_type(e: &rmlx_core::Error) -> &'static str {
+    use rmlx_core::OomPhase;
+    match e {
+        rmlx_core::Error::SmokeProbe(_) => "internal_error",
+        rmlx_core::Error::Oom { phase, .. } => match phase {
+            OomPhase::LoadWeights => "oom_during_load",
+            OomPhase::LoadKvCache => "oom_kv_cache",
+            OomPhase::Generation => "oom_mid_stream",
+        },
+        _ => "service_unavailable",
+    }
+}
+
 /// F8: classify an `rmlx_core::Error` into an `ApiErrorCategory`.
 ///
 /// Mirrors the match arms in `engine_error_response` so the same logic

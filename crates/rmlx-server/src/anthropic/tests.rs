@@ -32,6 +32,82 @@ fn assert_mem_fields(err: &Value) {
     }
 }
 
+fn engine_error_cases() -> Vec<rmlx_core::Error> {
+    use rmlx_core::OomPhase;
+    vec![
+        rmlx_core::Error::SmokeProbe("nan".to_owned()),
+        rmlx_core::Error::Oom {
+            phase: OomPhase::LoadWeights,
+            requested_bytes: None,
+            peak_alloc_mb: None,
+            msg: "oom".to_owned(),
+        },
+        rmlx_core::Error::Oom {
+            phase: OomPhase::LoadKvCache,
+            requested_bytes: None,
+            peak_alloc_mb: None,
+            msg: "oom".to_owned(),
+        },
+        rmlx_core::Error::Oom {
+            phase: OomPhase::Generation,
+            requested_bytes: None,
+            peak_alloc_mb: None,
+            msg: "oom".to_owned(),
+        },
+        // wildcard arm — the common case for a mid-decode engine fault.
+        rmlx_core::Error::Mlx("device error".to_owned()),
+        rmlx_core::Error::Other("engine panic".to_owned()),
+    ]
+}
+
+/// This surface's `engine_error_type` must name every error exactly as this
+/// surface's `engine_error_response` spells it.
+///
+/// `/v1/messages` streaming can only use the former (its status and headers are
+/// already sent) while blocking uses the latter. Drift means a streamed client
+/// sees a different `type` than a blocking one for the identical fault.
+#[tokio::test]
+async fn engine_error_type_matches_response() {
+    for e in &engine_error_cases() {
+        let (_status, _retry, body) = oom_parts(e).await;
+        let from_response = body["error"]["type"]
+            .as_str()
+            .unwrap_or_else(|| panic!("response body carries no error.type for {e:?}: {body}"));
+        assert_eq!(
+            from_response,
+            errors::engine_error_type(e),
+            "anthropic engine_error_type drifted from anthropic engine_error_response for {e:?}"
+        );
+    }
+}
+
+/// The Anthropic type strings deliberately diverge from OpenAI's: this surface
+/// carries an `_error` suffix on its non-OOM types. Pinned so nobody
+/// "deduplicates" the two mirrors into one shared function — that collapse is
+/// exactly what made `/v1/messages` streaming emit OpenAI spellings.
+///
+/// Only the OOM keys coincide, and that is intentional.
+#[test]
+fn engine_error_type_diverges_from_openai_surface() {
+    assert_eq!(
+        errors::engine_error_type(&rmlx_core::Error::Mlx("x".to_owned())),
+        "service_unavailable_error"
+    );
+    assert_eq!(
+        errors::engine_error_type(&rmlx_core::Error::SmokeProbe("x".to_owned())),
+        "internal_server_error"
+    );
+    // The OpenAI surface spells the same two faults without the suffix.
+    assert_eq!(
+        crate::openai::errors::engine_error_type(&rmlx_core::Error::Mlx("x".to_owned())),
+        "service_unavailable"
+    );
+    assert_eq!(
+        crate::openai::errors::engine_error_type(&rmlx_core::Error::SmokeProbe("x".to_owned())),
+        "internal_error"
+    );
+}
+
 #[tokio::test]
 async fn j3_oom_load_weights_507_retry() {
     let e = rmlx_core::Error::Oom {

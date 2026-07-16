@@ -292,16 +292,23 @@ pub(crate) fn pipelined_decode(
     for step_idx in 1..ctx.n_tokens {
         let step_t0 = Instant::now();
         let fwd_t0 = Instant::now();
+        // A failed forward aborts the request. Returning the tokens produced so
+        // far would be reported as a normal short generation
+        // (`finish_reason="length"`) — indistinguishable from hitting the token
+        // cap, so no caller, bench harness, or smoke probe could tell a dead
+        // stream from a healthy one. The error propagates to the server, which
+        // has an error channel on every surface.
         let decode_logits = match forward_step(&y) {
             Ok(l) => l,
             Err(e) => {
-                tracing::warn!(
+                tracing::error!(
                     arch = ctx.arch,
                     step = step_idx,
+                    emitted = steps.len(),
                     error = %e,
-                    "decode step failed, stopping early"
+                    "decode step failed, aborting generation"
                 );
-                break;
+                return Err(e);
             }
         };
 
