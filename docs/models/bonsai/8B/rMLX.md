@@ -49,6 +49,12 @@ directly. Bar (§3): WIN / TIE-on-noise / LOSS.
   CPU-dequant collapse, same class as Gemma4-31b iso_sym. **K-only codecs
   (`k_iso* / k_rotor*`) are unusable:** 0.4–5.8 TPS, CPU-bound (capped k_iso ≤16k,
   k_rotor ≤8k).
+  > **Superseded for `k_rotor3/4` (with `--rotor-qjl off`).** Their per-step
+  > full-prefix CPU dequant is replaced by a fused MSL flash-decode over the
+  > packed rotor store (`rotor_flash_decode`, `docs/KV_QUANT.md`). Re-measured on
+  > this model at 4k: `k_rotor3` 1.34 → **16.2** TPS, `k_rotor4` 1.36 → **17.0**
+  > (24× over the `--rotor-qjl on` default). The rows below are a pre-kernel
+  > snapshot. `k_iso*` and the default `--rotor-qjl on` path are unchanged.
 
 ---
 

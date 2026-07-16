@@ -338,6 +338,9 @@ be classified or the build fails.
     (`Some`); QJL **off** (`--rotor-qjl off`) →
     `rotor{3,4}_gpu_append_into_k_blocks` Metal MSL encode (`None`). The verdict
     reads the live `rotor_qjl_enabled()` gate so it tracks the dispatcher.
+    With QJL off the **decode** side is fused too — see
+    § `rotor_flash_decode` below — so the QJL-off path is fully GPU-resident,
+    not a hybrid.
 
   The `Some` cases are the source of the 30–60× first-forward slowdown and the
   monotonic decode decay as KV grows.
@@ -353,7 +356,7 @@ be classified or the build fails.
 | `iso3` / `iso4` / `iso3_sym` / `iso4_sym` | **CPU** | bf16 decode seed shadows the GPU iso branch; prefill V-encode on host |
 | `k_iso3` / `k_iso4` | **Metal (hybrid)** | iso K MSL encode every decode step (`k_iso3` also MSL dequant); dequant restages prefix host-side per step. `cpu_hot_path_reason() == None` |
 | `rotor3` / `rotor4` / `rotor*_sym` / `rotor_k_*_asym_*` | **CPU** | bf16 decode seed shadows the GPU branch; GPU fused-QK encoder is `RMLX_FUSED_QK`-only |
-| `k_rotor3` / `k_rotor4` | **QJL-dependent** | QJL on (default) → CPU; QJL off (`--rotor-qjl off`) → rotor K MSL encode (Metal, hybrid). Verdict reads `rotor_qjl_enabled()` |
+| `k_rotor3` / `k_rotor4` | **QJL-dependent** | QJL on (default) → CPU; QJL off (`--rotor-qjl off`) → **fully Metal**: rotor K MSL encode + `rotor_flash_decode` fused decode. Verdict reads `rotor_qjl_enabled()` |
 
 ### Load-time precompile
 
@@ -2486,6 +2489,119 @@ sensitive — see `.rmlx/bench/perf_canary.csv` rows tagged
 `planar-fused-qk-on` / `-off`).
 
 ---
+
+## `rotor_flash_decode` — fused MSL flash-decode over rotor-quant K
+
+Fused flash-decode for `KvStorage::RotorKOnly3` / `RotorKOnly4`: QK over the
+packed rotor K store + online softmax + bf16-V SV, in two Metal dispatches per
+decode step. The rotor codec's Cl(3,0) K-decode runs **inside** the attention
+inner loop, so no bf16 / f32 K is materialised and nothing restages through the
+host.
+
+**What it replaced.** `update_rotor_k_only_{3,4}` called
+`QuantRotorK{3,4}::dequant()` on every decode step — a full-prefix **CPU** rotor
+decode into a `Vec<f32>` plus a re-upload. That is O(seq) host work per token
+with the GPU idle, and it is what pinned the K-only rotor family in the
+"Tier 3 — CPU-bound" bucket (0.05–8.8 TPS, see `docs/models/bonsai/27B/rMLX.md`).
+The store is now GPU-resident (`storage::RotorGpuK`) and the kernel reads it
+directly.
+
+### Files
+
+* `crates/rmlx-kv-quant/src/rotor_flash_decode_msl.rs` — Rust dispatcher,
+  header builder, dispatch counters.
+* `crates/rmlx-kv-quant/src/metal/rotor_flash_decode_p1.metal` — pass-1 body
+  (one body for **both** bit widths).
+* `crates/rmlx-kv-quant/src/metal/flash_decode_merge_p2.metal` — codec-agnostic
+  pass-2 log-sum-exp merge, shared with `planar_flash_decode`.
+* `crates/rmlx-kv-quant/src/storage/rotor_gpu_k.rs` — `RotorGpuK`, the
+  GPU-resident packed ring (codes / per-group scales / per-token L2 norms) with
+  paged growth and CPU-prefix seeding.
+* `crates/rmlx-kv-quant/src/kvcache/sdpa.rs::update_and_sdpa_rotor_k_fused` —
+  dispatch site.
+
+### Bit width is a header parameter
+
+`bits ∈ {3, 4}` arrives via the header (`RF_BITS` / `RF_MASK`) alongside the
+matching Lloyd-Max codebook, so one `.metal` body serves both variants — the
+3-bit codes unpack at `shift = e*3, mask = 0x7`, the 4-bit at `e*4, 0xF`,
+matching `rotorquant::{unpack_group, unpack_group_4bit}`. Selection is explicit;
+any other `bits` is an `Err`, never a silent fallback to the wrong unpack width.
+
+### Reusable K-decode half
+
+The per-lane rotor decode is emitted into the **header** as the MSL function
+`rf_decode_k_lane(codes, scales, norms, rotors, tok_idx, n_groups, lane)` rather
+than inlined into the body. A quantized-V flash kernel needs the identical
+K-side decode and can call it unchanged. (Bodies in this repo are statement
+sequences spliced inside a generated kernel signature, so a body cannot define
+functions — the header is the only place a shared function can live.)
+
+### Gate
+
+No env var and no CLI flag: the path is on whenever it is applicable. Gates, in
+order — device is GPU, storage is a rotor K-only variant, the store does **not**
+carry QJL, `q_seq == 1`, `b == 1`, `head_dim` is a power of two and
+`<= ROTOR_FLASH_HEAD_DIM_MAX` (512). Any miss falls through to the legacy CPU
+dequant path.
+
+**QJL.** The optional 1-bit QJL residual (`--rotor-qjl on`, the default) is a
+per-token back-projection through a dense `[head_dim, head_dim]` matrix.
+Reproducing it in the flash inner loop would mean reading that whole matrix per
+token per threadgroup — far more bandwidth than the kernel saves — so a
+QJL-carrying store keeps the CPU dequant path. **`--rotor-qjl off` is required
+to reach the kernel.** The gate reads the *store's* sticky QJL decision
+(`use_qjl()`), not the live global toggle: the codec fixes QJL at first append
+and never adds or drops the sideband mid-stream, so a toggle flipped afterwards
+must not change how existing bytes are read.
+
+### Storage applicability
+
+| Variant | Eligible? | Notes |
+|---|---|---|
+| `KvStorage::RotorKOnly3` / `RotorKOnly4`, QJL off | **YES** | GPU ring + `rotor_flash_decode_sdpa`. |
+| `KvStorage::RotorKOnly{3,4}`, QJL on | NO | Kernel cannot reproduce the QJL residual. |
+| `Rotor{3,4}Sym`, `RotorK{3,4}Asym` | NO | V side is also rotor / affine-quantized; this kernel takes bf16 V only. Shares the K-decode half when a quant-V kernel lands. |
+
+### Arch reachability
+
+Keyed off codec + shape (`head_dim`, `kv_heads`, `bits`), never an arch name —
+so any arch that routes a rotor K-only cache through `KvCache::update_and_sdpa`
+reaches it.
+
+| Arch | Routing | Reachable? | Why |
+|---|---|---|---|
+| Bonsai (`Qwen3ForCausalLM`) | `update_and_sdpa` | **YES** | head_dim 128. Measured 78 dispatches / 8 tokens. |
+| medgemma (`Gemma3ForConditionalGeneration`) | `update_and_sdpa` | **YES** | head_dim 256, no cross-layer KV share. Measured 28 dispatches / 8 tokens. |
+| Qwen2 / Laguna / bitnet / Qwen3-VL-MoE | `update_and_sdpa` | **YES** (by shape) | Same entry point; subject to the shape gates. |
+| Gemma4 (`Gemma4ForConditionalGeneration`) | `update_and_sdpa_returning_kv` (cross-layer KV share) | **NO** | The producer layer's contract is to *return* `k_full` / `v_full` for the 20 consumer layers, which forces a bf16 K materialisation — exactly what this kernel avoids. Making it reachable means sharing the **quantized** store across layers, a separate change. Same unreachable shape as TurboFlash and `planar_flash_decode`. |
+| Qwen3.6 (`Qwen3_5MoeForConditionalGeneration`) | rejected at `cache_type::validate_resolved` | NO | Contract A.y — sub-4-bit K on Qwen MoE is a PPL disaster; the cache is never built. |
+
+### Performance posture
+
+4k prompt, `release-perf`, `--rotor-qjl off`, decode TPS. "Before" is the same
+binary minus this change, so the delta is the kernel alone (the QJL flag is held
+constant across the pair).
+
+| Model | Codec | Before | After | Gain |
+|---|---|---|---|---|
+| Bonsai-8B (Qwen3, D=128) | `k_rotor3` | 1.34 | **16.2** | 12.0× |
+| Bonsai-8B | `k_rotor4` | 1.36 | **17.0** | 12.5× |
+| medgemma-4B (Gemma3, D=256) | `k_rotor3` | 7.37 | **51.1** | 6.9× |
+| medgemma-4B | `k_rotor4` | 7.34 | **48.6** | 6.6× |
+
+Against the *default* (`--rotor-qjl on`) baseline the same cells move
+0.66 → 16.2 (Bonsai, 24×) and 2.35 → 51.1 (medgemma, 22×).
+
+The QJL-on path is unchanged (medgemma `k_rotor3`: 2.37–2.40 before,
+2.34–2.36 after — the kernel is dormant and adds no work), as is Gemma4, where
+the kernel does not fire.
+
+This makes the K-only rotor family **usable** rather than fast: it is still
+below `none` (Bonsai bf16 ≈ 110 TPS). The rotor sandwich is ~64 FMAs per group
+per lane and each of a group's 3 lanes redoes it, so the inner loop is
+compute-bound, not KV-bandwidth-bound. Narrowing that gap (sparse geometric
+product, one decode per group instead of per lane) is future work.
 
 ## `planar_flash_decode` — single-pass MSL flash-decode for PlanarK
 

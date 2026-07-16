@@ -59,6 +59,15 @@ directly. KV-MB from serve events `op='kv_cache_bytes'` high-water (the `baselin
   - **Tier 3 — CPU-bound, unusable** (the K-only family: `k_iso3/4`,
     `k_rotor3/4`): sub-8-bit rotation/iso K with **no Metal kernel** → CPU dequant
     fallback → **0.05–8.8 TPS**, GPU idle. Capped.
+    > **Superseded for `k_rotor3/4` (run with `--rotor-qjl off`).** The rotor
+    > K-only decode is now a fused MSL flash-decode over the packed rotor store
+    > (`rotor_flash_decode`, see `docs/KV_QUANT.md`), so the per-step full-prefix
+    > CPU dequant that produced these numbers is gone. Re-measured at 4k: Bonsai-8B
+    > 1.34 → 16.2 TPS, medgemma-4B 7.37 → 51.1 TPS. The numbers in this table are a
+    > pre-kernel snapshot and were **not** re-run on the 27B. Two caveats stand:
+    > the default `--rotor-qjl on` still takes the CPU path (the kernel cannot
+    > reproduce the QJL residual), and `k_iso3/4` is untouched — it keeps its own
+    > per-step host restaging.
 - **No long-ctx collapse (unlike the 8B).** On the 8B, `iso*`/`*_sym` cratered to
   ~6–13 TPS at 64k; on the 27B they hold **30–36 TPS at 64k**. GDN's shallow KV
   growth avoids the CPU-dequant collapse entirely — a big divergence from the 8B doc.

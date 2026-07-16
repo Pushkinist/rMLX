@@ -1,4 +1,9 @@
 
+// Codec-agnostic flash-decode pass-2 merge: folds the per-tile partial outputs
+// and their (max, sum_exp) LSE state into the final SDPA output. Reads nothing
+// codec-specific — no codebook, no header — so every flash-decode pass-1 kernel
+// shares this body regardless of how its K was stored.
+
 uint head_dim = dims_p2[0];
 uint n_tiles  = dims_p2[1];
 uint n_bh     = dims_p2[2];

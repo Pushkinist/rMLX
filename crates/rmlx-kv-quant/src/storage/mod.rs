@@ -46,6 +46,7 @@ mod quant_rotor_k4;
 mod quant_rotor_v3;
 mod quant_rotor_v4;
 mod quant_v;
+mod rotor_gpu_k;
 mod seq_layout;
 
 pub use kv_storage::{
@@ -72,6 +73,7 @@ pub use quant_rotor_k4::{QuantRotorK4, ROTOR4_K_BITS, ROTOR4_K_GROUP_SIZE};
 pub use quant_rotor_v3::{QuantRotorV3, RotorBlocks, ROTOR3_V_BITS, ROTOR3_V_GROUP_SIZE};
 pub use quant_rotor_v4::{QuantRotorV4, ROTOR4_V_BITS, ROTOR4_V_GROUP_SIZE};
 pub use quant_v::QuantV;
+pub use rotor_gpu_k::RotorGpuK;
 
 #[cfg(test)]
 #[path = "quant_rotor_k_qjl_tests.rs"]
