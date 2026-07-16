@@ -2724,17 +2724,50 @@ attend the quant store rather than forcing a bf16 materialisation. Verified at
 `--log verbose`: 14 `rotor_flash_decode_symv_sdpa` dispatches, 6 shared-KV
 producer dispatches, 0 CPU-dequant fallbacks.
 
-### Performance posture — the mirror was **fast**
+### Performance posture — the mirror was **fast**, and it stays fast at long ctx
 
-Same runs, decode TPS (median of 3 measured, warmup dropped; two independent
-paired runs shown as a range where they differ):
+Decode TPS, median of 3 measured runs (warmup dropped), serve-once per
+(binary, model, codec) sweeping prompt size against the lazy-grown ring.
+`--rotor-qjl off` throughout — QJL on forces both axes to the CPU path and the
+fused kernel never dispatches.
 
-| Model | Codec | bf16-mirror (before) | quant-V kernel (after) | Δ |
-|---|---|---|---|---|
-| Bonsai-8B | `rotor3_sym` | 145–148 | **14.1–15.8** | ≈ −89% |
-| Bonsai-8B | `rotor4_sym` | 142–150 | **14.2–15.7** | ≈ −90% |
-| gemma-4-e2b | `rotor3_sym` | 134–136 | **56.1–56.7** | ≈ −58% |
-| gemma-4-e2b | `rotor4_sym` | 113–136 | **55.8–56.2** | ≈ −50…−59% |
+| Model | Codec | ctx | bf16-mirror | quant-V kernel | Δ decode | Δ KV |
+|---|---|---|---|---|---|---|
+| Bonsai-8B | `rotor3_sym` | 4k | 143.6 | **15.0** | −89.6% | −33.0% |
+| Bonsai-8B | `rotor3_sym` | 16k | 97.3 | **7.8** | −92.0% | −34.0% |
+| Bonsai-8B | `rotor3_sym` | 32k | 69.1 | **4.6** | −93.3% | −34.0% |
+| Bonsai-8B | `rotor4_sym` | 4k | 142.5 | **14.9** | −89.6% | −33.0% |
+| Bonsai-8B | `rotor4_sym` | 16k | 99.3 | **7.8** | −92.2% | −34.0% |
+| Bonsai-8B | `rotor4_sym` | 32k | 69.0 | **4.7** | −93.2% | −34.0% |
+| gemma-4-e2b | `rotor3_sym` | 4k | 136.7 | **47.2** | −65.5% | −38.2% |
+| gemma-4-e2b | `rotor3_sym` | 16k | 121.2 | **24.4** | −79.9% | −41.6% |
+| gemma-4-e2b | `rotor3_sym` | 32k | 109.0 | **15.0** | −86.2% | −42.2% |
+| gemma-4-e2b | `rotor3_sym` | 64k | 96.2 | **8.4** | −91.2% | −42.4% |
+| gemma-4-e2b | `rotor3_sym` | 118k | 78.1 | **5.1** | −93.5% | −42.5% |
+| gemma-4-e2b | `rotor4_sym` | 4k…64k | 136.3…96.2 | **48.8…8.4** | −64.2…−91.2% | −38…−42% |
+
+**There is no crossover, and there cannot be one on this shell.** The intuition
+that long context is bandwidth-bound — so reading ~⅓ the bytes must eventually
+win — does not apply here, because the shell is not bandwidth-bound. Fitting
+`itl = a + b·kv_seq` over the sweep gives the marginal cost of one KV token:
+
+| Model | bf16-mirror `b` | quant-V `b` | ratio |
+|---|---|---|---|
+| Bonsai-8B (D=128) | 0.27 µs/tok | 5.37 µs/tok | **20×** |
+| gemma-4-e2b (D=256) | 0.05 µs/tok | 1.51 µs/tok | **33×** |
+
+A crossover needs the quant path's slope to be **lower** than the mirror's; it is
+20–33× **higher**, so the gap widens monotonically with context and the ratio
+tends to ~3–5% of the mirror as ctx → ∞. The bytes saved do not pay for the
+per-KV-token barrier tree the shell spends them on. The worst cell is the
+longest one, not the shortest.
+
+**The memory win is real** (−33…−42% KV) and has one visible long-context
+consequence: at 118k on gemma-4-e2b the mirror's 1.74 GB snapshot exceeds the
+default 1 GiB prompt-cache cap and is refused admission, so every request
+re-prefills (~56 s), while the 993 MB quant-V snapshot is admitted (17 s warm).
+That is a cap artifact, not a codec win — `--prompt-cache-ram-gb 4` admits the
+mirror too and takes it to **1 s** warm against quant-V's 17 s.
 
 **The regression is the kernel shell, not the V unpack.** On the same Bonsai
 shape, `k_rotor3` — the bf16-V `rotor_flash_decode` from which this kernel is
@@ -2752,9 +2785,11 @@ gap needs a different shell (simdgroup reductions instead of the barrier tree,
 one decode per group instead of per lane), which is `rotor_flash_decode`'s
 problem as much as this kernel's.
 
-**So `rotor{3,4}_sym` is a memory/throughput trade, not a free win**: −34% KV for
-−58…−90% decode. That was not the premise the work started from, and the
-disposition of the trade is a product decision, not one this kernel can settle.
+**So `rotor{3,4}_sym` is a memory/throughput trade, not a free win**: −33…−42% KV
+for −64…−94% decode, worst at long context. That was not the premise the work
+started from. Until the shell is rewritten the trade is not worth taking: the
+memory it buys is also purchasable by raising the prompt-cache cap, while the
+decode it costs is not purchasable at all.
 
 ### Bit width, gates, ring eligibility
 
