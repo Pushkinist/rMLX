@@ -168,6 +168,26 @@ pub(super) fn chunk_to_event(chunk: &ChatCompletionChunk) -> Event {
     Event::default().data(serde_json::to_string(chunk).unwrap_or_default())
 }
 
+/// Build the terminal error event for a stream that died mid-flight.
+///
+/// By the time a token errors the HTTP status is already 200 and the headers are
+/// gone, so the response payload is the only channel left to say the stream did
+/// not complete. Without this the client sees the deltas it already received
+/// followed by a bare `[DONE]` — a truncated answer that looks finished.
+///
+/// Shape mirrors the blocking route's OpenAI error envelope
+/// (`{"error":{"message","type"}}`), so the same fault reads the same either
+/// way. `type` is the stable automation key, `message` is human.
+pub(super) fn error_event(e: &rmlx_core::Error) -> Event {
+    let body = serde_json::json!({
+        "error": {
+            "message": e.to_string(),
+            "type": crate::openai::errors::engine_error_type(e),
+        }
+    });
+    Event::default().data(serde_json::to_string(&body).unwrap_or_default())
+}
+
 // ── Token handler ─────────────────────────────────────────────────────────────
 
 /// Map one input token to zero-or-more SSE events, updating `state`.
@@ -185,7 +205,16 @@ pub(crate) fn handle_streaming_token(
             state
                 .lifetime_requests_failed
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return vec![Ok(Event::default().data("[DONE]"))];
+            tracing::error!(
+                error = %e,
+                "generation stream failed mid-flight, emitting error event"
+            );
+            // Emit the error and nothing else. No `finish_reason` chunk: this
+            // stream has no finish reason, and claiming one would report the
+            // failure as a completion. The caller chains the terminating
+            // `[DONE]` onto every stream, so emitting one here would duplicate
+            // it.
+            return vec![Ok(error_event(&e))];
         }
         Ok(t) => t,
     };

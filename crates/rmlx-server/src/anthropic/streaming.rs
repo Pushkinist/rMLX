@@ -527,6 +527,11 @@ pub(super) async fn generate_streaming(
                         ));
                     }
 
+                    // Set when a token arrives as an engine error. The epilogue
+                    // reads it to terminate the stream as a failure instead of
+                    // a completion.
+                    let mut stream_error: Option<rmlx_core::Error> = None;
+
                     // `loop { match ... }` is intentional: the loop has
                     // multiple control-flow exits (return, continue,
                     // break). Refactoring to `while let Some(Ok(tok)) =
@@ -734,10 +739,46 @@ pub(super) async fn generate_streaming(
                                 // count mid-stream failures as failed requests.
                                 lifetime_requests_failed
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                tracing::error!(
+                                    error = %e,
+                                    "generation stream failed mid-flight, emitting error event"
+                                );
+                                // Hand the error to the epilogue. Breaking
+                                // without it would run the normal terminal
+                                // triplet, whose stop_reason resolves through
+                                // the `None` fallback to "end_turn" — reporting
+                                // a dead stream as a natural completion.
+                                stream_error = Some(e);
                                 break;
                             }
                             None => break,
                         }
+                    }
+
+                    // A stream that died has no completion to report. Terminate
+                    // with the failure instead of the normal terminal triplet,
+                    // whose stop_reason would resolve through the `None`
+                    // fallback to "end_turn" and report the dead stream as a
+                    // natural completion. Anthropic's streaming protocol
+                    // carries this as a native `error` event, so no
+                    // client-visible schema is invented here.
+                    //
+                    // The success-only bookkeeping below is skipped on purpose:
+                    // `requests_failed` is already counted at the error site,
+                    // and a failed request must not add itself to
+                    // `requests_completed` or emit completion-token metrics.
+                    if let Some(e) = stream_error {
+                        let payload = json!({
+                            "type": "error",
+                            "error": {
+                                "type": crate::openai::errors::engine_error_type(&e),
+                                "message": e.to_string(),
+                            }
+                        });
+                        return Some((
+                            Ok::<Event, std::convert::Infallible>(sse_event("error", &payload)),
+                            AnthropicState::Done,
+                        ));
                     }
 
                     // ── Epilogue ──────────────────────────────────────────

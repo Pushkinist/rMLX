@@ -559,15 +559,19 @@ fn decode_loop(
     for step_idx in 1..n_tokens {
         let step_t0 = Instant::now();
         let fwd_t0 = Instant::now();
+        // A failed forward aborts the request: returning the tokens produced so
+        // far reports as a normal short generation and hides the failure from
+        // the caller. Propagate to the server's error channel.
         let decode_logits = match model.forward_seq_with_cache(&[cur_id], Some(caches), device) {
             Ok(l) => l,
             Err(e) => {
-                tracing::warn!(
+                tracing::error!(
                     step = step_idx,
+                    emitted = steps.len(),
                     error = %e,
-                    "laguna generate_greedy: decode step failed, stopping early"
+                    "laguna generate_greedy: decode step failed, aborting generation"
                 );
-                break;
+                return Err(e);
             }
         };
         let fwd_dt = fwd_t0.elapsed().as_nanos();
