@@ -1058,7 +1058,7 @@ token? "frozen" = no (bf16 shortcut); "K-only" = K codec runs, V bf16.
 
 1. `Mixed`/`RotKTq4V` are driven through `update_and_sdpa` (the direct
    `update()` arm errors); the bf16 mirror is surfaced to cross-layer-KV
-   consumers via `update_and_sdpa_returning_kv` (see §10.2 Mixed note).
+   consumers via `update_and_sdpa_shared_source` (see §10.2 Mixed note).
 2. PlanarK was the **sole** codec missing the shortcut; it re-encoded K
    through lossy Lloyd-Max + Givens every decode step, which broke
    `niah_pflash_bonsai_8k_d50` retrieval. The fix (`b1d9dca`) restored the
@@ -1219,7 +1219,7 @@ to bottom; `auto` ties the top cluster within stddev.
 | `q8_g128` / `q6_g64` | —                     | —                        | —       | skip         |
 
 **Mixed is now supported on Gemma4 via dequant-before-share.** The former startup
-rejection is gone. `update_and_sdpa_returning_kv` now surfaces the accumulated
+rejection is gone. `update_and_sdpa_shared_source` now surfaces the accumulated
 **bf16** K/V (prefill-raw buffer during prefill, the maintained `decode_fp16`
 accumulator during decode — the same tensors the fused quantized SDPA was computed
 from) to the cross-layer-KV consumer layers. Verified coherent: e4b

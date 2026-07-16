@@ -31,7 +31,7 @@ use rmlx_mlx::{
 };
 
 use crate::layers::{Linear, RmsNorm};
-use rmlx_kv_quant::KvCache;
+use rmlx_kv_quant::{KvCache, SharedKv};
 
 use super::config::LayerType;
 
@@ -148,16 +148,20 @@ impl Attention {
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
     )]
     #[allow(clippy::too_many_arguments)]
+    /// `shared_kv` is the cross-layer-KV share for a consumer layer: the
+    /// producer's [`SharedKv`] plus the cache it lives in (`None` on cacheless
+    /// forwards, which can only ever yield [`SharedKv::Bf16`]). `None` marks a
+    /// layer that projects and caches its own K/V.
     pub(super) fn forward(
         &self,
         x: &Array,
-        shared_kv: Option<(&Array, &Array)>,
+        shared_kv: Option<(&SharedKv, Option<&KvCache>)>,
         offset: i32,
         cache: Option<&mut KvCache>,
         kv_is_rotating: bool,
         bidi_overlay: Option<&Array>,
         device: Device,
-    ) -> Result<(Array, Option<(Array, Array)>)> {
+    ) -> Result<(Array, Option<SharedKv>)> {
         let shape = x.shape(); // [batch, seq, hidden]
         let batch = shape[0];
         let seq = shape[1];
@@ -191,14 +195,14 @@ impl Attention {
         // Q on non-shared path: qk_norm_fused with K (see else branch).
         //
         // Cache-holding layers route SDPA through
-        // `KvCache::update_and_sdpa_returning_kv` — the universal wrapper's
-        // shared-KV variant that returns the accumulated `(K, V)` so the
-        // source-of-shared-KV layers can also fill `new_kv` for downstream
-        // consumers. `cache` is consumed here; below we branch on whether the
+        // `KvCache::update_and_sdpa_shared_source` — the universal wrapper's
+        // shared-KV variant that reports what downstream consumers can attend
+        // (the producer's bf16 tensors, or its quant store when a fused decode
+        // kernel ran). `cache` is consumed here; below we branch on whether the
         // wrapper has already run (`attn_out_holder`) or we still need a
-        // direct `scaled_dot_product_attention` on shared / cacheless K/V.
+        // consumer-side SDPA over the share.
         let mut attn_out_holder: Option<Array> = None;
-        let (q, k, v, new_kv) = if let Some((sk, sv)) = shared_kv {
+        let (q, new_kv) = if shared_kv.is_some() {
             // Shared KV: q_norm runs alone, then transpose + RoPE on Q.
             let q = self.q_norm.forward(&q, device)?;
             let q = q.transpose(&[0, 2, 1, 3], device)?; // [B, H, S, D]
@@ -219,7 +223,7 @@ impl Attention {
                     rope_with_freqs(&q, self.head_dim as i32, false, 1.0, offset, freqs, device)?
                 }
             };
-            (q, sk.try_clone()?, sv.try_clone()?, None)
+            (q, None)
         } else {
             let k_proj = self.k_proj.as_ref().ok_or_else(|| {
                 Error::Model("Attention: has_kv=false but no shared_kv provided".to_owned())
@@ -310,7 +314,7 @@ impl Attention {
             // offset from the non-rotating producer. RoPE still uses the
             // model-wide `offset` (absolute position); only the mask's key dim
             // is bound to the producer's own K length. See
-            // `update_and_sdpa_returning_kv` (rotating short-circuit) for the
+            // `update_and_sdpa_shared_source` (rotating short-circuit) for the
             // sibling Mixed-path fix this generalises.
             if let Some(c) = cache {
                 let producer_offset = c.offset();
@@ -331,12 +335,12 @@ impl Attention {
                     device,
                 )?;
                 // Cache-holding layer: route through the shared-KV variant of
-                // the universal wrapper. Returns (out, k_full, v_full) so the
-                // accumulated K/V can be handed to downstream consumer layers
-                // via `stored_kvs[layer_idx]` in `gemma4/model.rs`. : the
-                // wrapper now supports Mixed via dequant-before-share (returns
-                // the accumulated bf16 K/V), alongside None/K8V4/K8V8/Planar.
-                let (attn_out, k_full, v_full) = c.update_and_sdpa_returning_kv(
+                // the universal wrapper. Returns (out, share) where `share` is
+                // what downstream consumer layers attend — handed to them via
+                // `stored_kvs[layer_idx]` in `gemma4/model.rs`. The codec
+                // decides whether that share is bf16 tensors or the quant store
+                // itself; this layer neither knows nor cares.
+                let (attn_out, share) = c.update_and_sdpa_shared_source(
                     &q,
                     &k,
                     &v,
@@ -351,7 +355,7 @@ impl Attention {
                 // later layer hit the opaque mlx-c broadcast error.
                 if let Some(mask) = mask_holder_pre.as_ref() {
                     let mask_kv = mask.shape()[3];
-                    let k_seq = k_full.shape()[2];
+                    let k_seq = share.kv_len()?;
                     if mask_kv != k_seq {
                         return Err(Error::Model(format!(
                             "Gemma4 attention mask key dim {mask_kv} != K seq dim {k_seq} \
@@ -361,12 +365,7 @@ impl Attention {
                     }
                 }
                 attn_out_holder = Some(attn_out);
-                (
-                    q,
-                    k_full.try_clone()?,
-                    v_full.try_clone()?,
-                    Some((k_full, v_full)),
-                )
+                (q, Some(share))
             } else {
                 // No-cache forward (e.g. eval path with `caches: None`). The
                 // freshly-computed K is exactly `offset + seq` long, so size the
@@ -387,8 +386,6 @@ impl Attention {
                     bidi_overlay,
                     device,
                 )?;
-                let k_new = k.try_clone()?;
-                let v_new = v.try_clone()?;
                 let attn_out = scaled_dot_product_attention(
                     &q,
                     &k,
@@ -399,7 +396,7 @@ impl Attention {
                     device,
                 )?;
                 attn_out_holder = Some(attn_out);
-                (q, k, v, Some((k_new, v_new)))
+                (q, Some(SharedKv::Bf16(k, v)))
             }
         };
 
@@ -413,7 +410,7 @@ impl Attention {
         let _ = repeat_kv;
 
         // SDPA: cache-holding and no-cache-non-shared branches dispatched
-        // inline above (cache-holding via `update_and_sdpa_returning_kv`,
+        // inline above (cache-holding via `update_and_sdpa_shared_source`,
         // no-cache via direct SDPA). The shared-KV consumer branch reaches
         // this point with `attn_out_holder == None`; run direct SDPA here on
         // the upstream-shared K/V.
@@ -431,9 +428,11 @@ impl Attention {
             out
         } else {
             // Shared-KV consumer branch: K is fetched from the producer layer
-            // (`shared_kv`), not freshly projected here. Its seq dim
-            // (`k.shape()[2]`) is the ground truth for how many keys SDPA
-            // attends. Size the mask's key dim from that actual K length, NOT
+            // (`shared_kv`), not freshly projected here. The producer's K
+            // length (`share.kv_len()`) is the ground truth for how many keys
+            // SDPA attends — it is `k.shape()[2]` for a bf16 share and the
+            // store's accumulated length for a store-backed one.
+            // Size the mask's key dim from that actual K length, NOT
             // from the model-wide `offset` (#32 part 2): across a speculative
             // partial-accept verify rollback the producer cache is rolled back
             // while the model-wide `offset` (`cache_base_offset`, taken from the
@@ -452,7 +451,14 @@ impl Attention {
             // which is already baked into the producer's K length. No regression
             // on ordinary prefill/decode; the value only diverges (correctly)
             // when a rollback desynced `offset` from the K it shares.
-            let total_kv_len = k.shape()[2]; // [B, kv_heads, total_kv, D]
+            let (share, producer) = shared_kv.ok_or_else(|| {
+                Error::Model(
+                    "Gemma4 attention reached the consumer branch with no shared KV — a layer \
+                     that neither holds a cache nor receives a share cannot attend anything"
+                        .to_owned(),
+                )
+            })?;
+            let total_kv_len = share.kv_len()?;
             if total_kv_len < seq {
                 return Err(Error::Model(format!(
                     "Gemma4 consumer/shared-KV K seq dim {total_kv_len} < query seq {seq} \
@@ -485,7 +491,7 @@ impl Attention {
                     )));
                 }
             }
-            scaled_dot_product_attention(&q, &k, &v, 1.0, mask_mode, mask_holder.as_ref(), device)?
+            share.sdpa(producer, &q, 1.0, mask_mode, mask_holder.as_ref(), device)?
         };
         // [B, H, S, D] -> [B, S, H*D]
         let attn_out = attn_out.transpose(&[0, 2, 1, 3], device)?;

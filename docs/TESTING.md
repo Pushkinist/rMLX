@@ -242,7 +242,7 @@ axis:
   `update_and_sdpa_planar_k_fused` → `planar_flash_decode_sdpa` chain
   activates. Consults `RMLX_PLANAR_FLASH_DECODE`. Bonsai-only Reachable
   arch (Qwen3.6 MoE rejects PlanarK at validate_resolved; Gemma4 routes
-  through `update_and_sdpa_returning_kv`).
+  through `update_and_sdpa_shared_source`).
 
 Neither family sets its env var directly — the kernel gates are
 `OnceLock`-latched. To compare OFF vs ON, run the shell driver:

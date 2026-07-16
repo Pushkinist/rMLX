@@ -2600,7 +2600,7 @@ reaches it.
 | Bonsai (`Qwen3ForCausalLM`) | `update_and_sdpa` | **YES** | head_dim 128. Measured 78 dispatches / 8 tokens. |
 | medgemma (`Gemma3ForConditionalGeneration`) | `update_and_sdpa` | **YES** | head_dim 256, no cross-layer KV share. Measured 28 dispatches / 8 tokens. |
 | Qwen2 / Laguna / bitnet / Qwen3-VL-MoE | `update_and_sdpa` | **YES** (by shape) | Same entry point; subject to the shape gates. |
-| Gemma4 (`Gemma4ForConditionalGeneration`) | `update_and_sdpa_returning_kv` (cross-layer KV share) | **NO** | The producer layer's contract is to *return* `k_full` / `v_full` for the 20 consumer layers, which forces a bf16 K materialisation — exactly what this kernel avoids. Making it reachable means sharing the **quantized** store across layers, a separate change. Same unreachable shape as TurboFlash and `planar_flash_decode`. |
+| Any arch with cross-layer KV sharing (e.g. `Gemma4ForConditionalGeneration`) | `update_and_sdpa_shared_source` (cross-layer KV share) | **YES** | The producer runs the same fused arm a non-sharing model runs and reports `SharedKv::Store`; each consumer layer re-enters the same kernel over that store via `KvCache::sdpa_shared`. No bf16 K is materialised. Previously this path had no fused arm at all and every shared-KV model fell back to the O(seq) CPU dequant. |
 | Qwen3.6 (`Qwen3_5MoeForConditionalGeneration`) | rejected at `cache_type::validate_resolved` | NO | Contract A.y — sub-4-bit K on Qwen MoE is a PPL disaster; the cache is never built. |
 
 ### Performance posture
@@ -2665,7 +2665,7 @@ the production switch and sets/removes the env var before the
 | Variant | Eligible? | Notes |
 |---|---|---|
 | `KvStorage::PlanarK { k: QuantPlanarK, .. }` | **YES** | Sole route through `update_and_sdpa_planar_k_fused` → `planar_flash_decode_sdpa`. Requires power-of-two `head_dim`. |
-| Any other `KvStorage` variant | NO | Routed through `mixed_quantized_sdpa` or `update_and_sdpa_returning_kv`. |
+| Any other `KvStorage` variant | NO | Routed through `mixed_quantized_sdpa` or `update_and_sdpa_shared_source`. |
 
 ### Arch reachability
 
@@ -2673,7 +2673,7 @@ the production switch and sets/removes the env var before the
 |---|---|---|---|
 | Bonsai (`Qwen3ForCausalLM`) | `update_and_sdpa` → `sdpa_dispatch` → `update_and_sdpa_planar_k_fused` | **YES** | The only arch that both (a) routes through the fused-QK chain and (b) does not reject PlanarK at validate_resolved. |
 | Qwen3.6 (`Qwen3_5MoeForConditionalGeneration`) | rejected at `cache_type::validate_resolved` | NO | Contract A.y `QwenMoePlanarKRejected` — pre-existing PPL-disaster guard. The cache is never built; the kernel can never dispatch. |
-| Gemma4 (`Gemma4ForConditionalGeneration`) | `update_and_sdpa_returning_kv` (cross-layer KV share) | NO | The attention layer never enters `sdpa_dispatch` (same unreachable shape as TurboFlash). |
+| Any arch with cross-layer KV sharing (e.g. `Gemma4ForConditionalGeneration`) | `update_and_sdpa_shared_source` (cross-layer KV share) | YES | The shared-source chain mirrors `update_and_sdpa` arm for arm, so `sdpa_dispatch` is reached exactly as on a non-sharing model. |
 
 NIAH cells covering all three routes ship in
 `crates/rmlx-models/tests/niah_long_context.rs` (`niah_pflash_*`) and

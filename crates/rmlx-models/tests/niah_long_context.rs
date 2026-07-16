@@ -33,7 +33,7 @@
 //! `Qwen3ForCausalLM` (Bonsai) routes through `update_and_sdpa_planar_k_fused`;
 //! Qwen3.6 MoE rejects `PlanarK` outright at `validate_resolved`
 //! (`QwenMoePlanarKRejected`), and Gemma4 routes through
-//! `update_and_sdpa_returning_kv` (same shape as the TurboFlash Unreachable
+//! `update_and_sdpa_shared_source` (same shape as the TurboFlash Unreachable
 //! case for that arch).
 //!
 //! # KV mode
@@ -346,7 +346,7 @@ fn run_one(
 /// `Reachable` — the arch routes through `KvCache::sdpa_dispatch` (e.g.
 /// Qwen3 / Qwen3.6). In ON mode the MSL kernel MUST fire; delta > 0.
 ///
-/// `Unreachable` — the arch routes through `update_and_sdpa_returning_kv`
+/// `Unreachable` — the arch routes through `update_and_sdpa_shared_source`
 /// (e.g. Gemma4 — cross-layer KV sharing requires the accumulated bf16
 /// K/V to be returned alongside SDPA out, which `turbo_flash_sdpa` does
 /// not produce). The kernel is structurally never invoked; the ON run is
@@ -462,10 +462,10 @@ fn run_cell_kind(
         }
         ("ON", FlashRouting::Unreachable, _) => {
             // Documented limitation. For Turbo: this arch's attention layer
-            // routes through `update_and_sdpa_returning_kv`, which never
+            // routes through `update_and_sdpa_shared_source`, which never
             // reaches `sdpa_dispatch`. For Pflash: the arch rejects
             // `KvQuant::PlanarK` at `validate_resolved` (Qwen MoE) or
-            // routes through `update_and_sdpa_returning_kv` (Gemma4 cross-
+            // routes through `update_and_sdpa_shared_source` (Gemma4 cross-
             // layer KV sharing). Either way the ON run is byte-identical to
             // OFF and the dispatch counter must remain zero.
             assert_eq!(
@@ -921,7 +921,7 @@ niah_cell!(
 //   cache is never built; the kernel can never dispatch. Cells are kept so
 //   the assertion enforces the routing contract.
 // - Gemma4 (`Gemma4ForConditionalGeneration`) → Unreachable. Routes through
-//   `update_and_sdpa_returning_kv` for cross-layer KV sharing (same shape as
+//   `update_and_sdpa_shared_source` for cross-layer KV sharing (same shape as
 //   the TurboFlash Unreachable case for this arch).
 //
 // Bonsai max-pos = 16k (no YARN), so cells cap at 16k — matches the existing
@@ -1056,7 +1056,7 @@ niah_pflash_cell!(
 );
 
 // ── Gemma4 e4b — Unreachable. Same shape as the TurboFlash Unreachable
-//   path: this arch routes through `update_and_sdpa_returning_kv` for
+//   path: this arch routes through `update_and_sdpa_shared_source` for
 //   cross-layer KV sharing. ────────────────────────────────────────────
 
 niah_pflash_cell!(

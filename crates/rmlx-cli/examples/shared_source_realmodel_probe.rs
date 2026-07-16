@@ -1,13 +1,13 @@
-// Returning-KV real-model proof probe.
+// Shared-KV producer real-model proof probe.
 //
 // Drives a model through prefill + 64-token decode and reports BOTH the
 // TurboFlash dispatch counter and the fused-QK dispatch counter
-// delta plus decode-only TPS. Use with Gemma4 to verify the returning-KV
-// routing extension reaches the dispatch chain.
+// delta plus decode-only TPS. Use with any shared-KV model to verify the
+// cross-layer-KV producer routing reaches the dispatch chain.
 //
 // Usage:
 //   RMLX_TURBO_FLASH=1 cargo run --profile release-perf -p rmlx-cli \
-//     --example returning_kv_realmodel_probe -- <model_path> <codec> <kernel> "<prompt>"
+//     --example shared_source_realmodel_probe -- <model_path> <codec> <kernel> "<prompt>"
 //
 //   <kernel> : turbo_flash | fused_qk
 //
@@ -46,7 +46,7 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 5 {
         eprintln!(
-            "usage: returning_kv_realmodel_probe <model_path> <codec> <kernel> <prompt>\n  \
+            "usage: shared_source_realmodel_probe <model_path> <codec> <kernel> <prompt>\n  \
              codec : k8v4 | k8v8 | tsym3 | tsym4 | ...\n  \
              kernel: turbo_flash | fused_qk"
         );
