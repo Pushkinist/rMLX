@@ -603,11 +603,19 @@ impl<E: PromptCacheEntry> PromptCache<E> {
         self.ssd = Some(source);
         match result {
             Ok(Some(entry)) => {
-                self.push(entry);
-                self.stats.ssd_hits += 1;
-                // `push` appended at the end (after any eviction); the new
-                // entry is the last slot.
-                Some(self.slots.len() - 1)
+                if let Some(idx) = self.push(entry) {
+                    self.stats.ssd_hits += 1;
+                    Some(idx)
+                } else {
+                    // Reconstructed block's KV alone exceeds the RAM cap, so it
+                    // was refused admission — a hydrate that cannot be resident
+                    // is a miss; the caller re-prefills.
+                    tracing::debug!(
+                        prompt_len = prompt_ids.len(),
+                        "ssd-hydrate: reconstructed block exceeds RAM cap — treating as miss"
+                    );
+                    None
+                }
             }
             Ok(None) => None,
             Err(e) => {
@@ -755,9 +763,17 @@ impl<E: PromptCacheEntry> PromptCache<E> {
 
     /// Push a new entry, evicting LRU slot(s) as needed.
     ///
-    /// Eviction order:
+    /// Returns `Some(slot_index)` of the newly-stored slot, or `None` when the
+    /// entry was refused admission (its own KV alone exceeds the RAM cap — see
+    /// the over-cap guard below).
+    ///
+    /// Admission + eviction order:
+    /// 0. Over-cap guard: if the incoming entry's KV alone exceeds `max_bytes`,
+    ///    refuse admission (return `None`) WITHOUT evicting any existing slot.
     /// 1. While `total_kv_bytes + new_entry_bytes > max_bytes` and slots
+    ///    remain: evict the LRU slot.
     /// 2. If `slots.len() == capacity`: drop the slot with the smallest
+    ///    `last_used_seq`.
     ///
     /// Either cap can trigger independently. Each eviction increments
     /// `stats.evictions`.
@@ -765,8 +781,28 @@ impl<E: PromptCacheEntry> PromptCache<E> {
         clippy::indexing_slicing,
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
     )]
-    pub(crate) fn push(&mut self, entry: E) {
+    pub(crate) fn push(&mut self, entry: E) -> Option<usize> {
         let new_bytes = entry.kv_bytes();
+
+        // --- Over-cap admission guard ---
+        // A single snapshot whose resident KV alone exceeds the cap must not be
+        // admitted. Admitting it violates the cap and, worse, the next warm
+        // (Exact) hit deep-clones the slot and copy-on-writes the full-size KV
+        // on the first decode append — doubling peak residency and stalling
+        // decode. Refusing admission bounds peak memory to one live copy; the
+        // repeat request simply re-prefills, exactly like the cold request.
+        // Existing (smaller, valid) slots are left intact — evicting them to
+        // make room for an entry that still could not fit would only thrash.
+        if new_bytes > self.max_bytes {
+            tracing::warn!(
+                entry_bytes = new_bytes,
+                max_bytes = self.max_bytes,
+                n_slots = self.slots.len(),
+                "prompt cache: snapshot KV exceeds RAM cap — not admitted; \
+                 raise --prompt-cache-ram-gb to cache this context"
+            );
+            return None;
+        }
 
         // --- RAM-cap eviction ---
         let mut total: u64 = self.slots.iter().map(|s| s.entry.kv_bytes()).sum();
@@ -802,6 +838,7 @@ impl<E: PromptCacheEntry> PromptCache<E> {
             last_used_seq: self.seq,
             slot_uid,
         });
+        Some(self.slots.len() - 1)
     }
 
     /// Evict the slot at `idx` and bump `stats.evictions`.

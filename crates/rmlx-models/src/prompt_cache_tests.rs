@@ -731,6 +731,95 @@ fn evictions_counter_tracked() {
     assert_eq!(cache.stats().evictions, 2, "two evictions after 4th push");
 }
 
+/// Over-cap admission guard: a single snapshot whose KV alone exceeds the RAM
+/// cap must NOT be admitted. Admitting it violates the cap and, on the next
+/// warm (Exact) hit, forces a second full-size residency (deep_clone +
+/// copy-on-write of the whole KV on the first decode append) — the warm-cache
+/// decode stall on large-KV codecs. Refusing admission bounds peak memory to a
+/// single live copy and makes the repeat request re-prefill, exactly like the
+/// cold request (warm ≈ cold). Model- and codec-agnostic.
+#[test]
+fn over_cap_snapshot_is_not_admitted() {
+    let n = 2 * BLOCK_TOKENS; // 512 ids → kv_bytes() = 512 * 8 = 4096
+    let entry_bytes = n as u64 * 8;
+
+    // Cap strictly below one entry → the entry alone cannot fit.
+    let tiny_cap = entry_bytes - 1;
+    let mut cache: PromptCache<TestEntry> = PromptCache::with_max_bytes(4, tiny_cap);
+
+    let prompt = make_ids(n);
+    // Cold "store": the over-cap entry is refused admission.
+    let stored = cache.push(TestEntry::new(prompt.clone()));
+    assert!(
+        stored.is_none(),
+        "an over-cap snapshot must be refused admission"
+    );
+    assert_eq!(
+        cache.slots.len(),
+        0,
+        "no slot is created for an over-cap snapshot"
+    );
+
+    // Warm request for the SAME prompt: a Miss (re-prefill), NOT an Exact hit on
+    // an over-cap slot — the invariant that removes the warm-cache stall.
+    let warm = cache.find_best_prefix(&prompt, FNV_OFFSET);
+    assert!(
+        warm.is_none(),
+        "warm request must miss (re-prefill), not reuse an over-cap slot"
+    );
+
+    // An entry that DOES fit the cap is still admitted (guard is exactly at the
+    // boundary: `new_bytes > max_bytes`, so `== max_bytes` fits).
+    let mut ok_cache: PromptCache<TestEntry> = PromptCache::with_max_bytes(4, entry_bytes);
+    let ok_stored = ok_cache.push(TestEntry::new(prompt.clone()));
+    assert_eq!(ok_stored, Some(0), "an entry that fits the cap is admitted");
+    assert!(
+        ok_cache.find_best_prefix(&prompt, FNV_OFFSET).is_some(),
+        "a fitting entry is reusable"
+    );
+}
+
+/// Refusing an over-cap snapshot must leave existing (valid, smaller) slots
+/// intact — the guard never evicts to make room for something that still could
+/// not fit.
+#[test]
+fn over_cap_refusal_preserves_existing_slots() {
+    let small_n = BLOCK_TOKENS; // 256 ids → 2048 bytes
+    let small_bytes = small_n as u64 * 8;
+    // Cap holds the small entry but not the large one.
+    let cap = small_bytes + 100;
+    let mut cache: PromptCache<TestEntry> = PromptCache::with_max_bytes(4, cap);
+
+    let small_prompt: Vec<u32> = (0..small_n as u32).map(|x| x * 2).collect();
+    assert_eq!(
+        cache.push(TestEntry::new(small_prompt.clone())),
+        Some(0),
+        "the small entry fits and is admitted"
+    );
+
+    // Over-cap entry (distinct prompt so it cannot prefix-match): refused, and
+    // the pre-existing small slot survives with no eviction.
+    let big_prompt: Vec<u32> = (0..(4 * BLOCK_TOKENS) as u32).map(|x| x * 2 + 1).collect();
+    assert!(
+        cache.push(TestEntry::new(big_prompt)).is_none(),
+        "the over-cap entry is refused admission"
+    );
+    assert_eq!(
+        cache.slots.len(),
+        1,
+        "the valid small slot is left untouched by the over-cap refusal"
+    );
+    assert_eq!(
+        cache.stats().evictions,
+        0,
+        "an over-cap refusal evicts nothing"
+    );
+    assert!(
+        cache.find_best_prefix(&small_prompt, FNV_OFFSET).is_some(),
+        "the small slot is still reusable after the refusal"
+    );
+}
+
 /// C1: long-prompt block-aligned partial hit.
 ///
 /// Cache a 4096-token prompt (16 full 256-tok blocks). Query with a
@@ -1134,6 +1223,49 @@ fn ssd_miss_leaves_ram_untouched() {
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     assert_eq!(cache.stats().ssd_hits, 0);
     assert_eq!(cache.slots.len(), 0);
+}
+
+/// over-cap admission guard applies to the SSD-hydrate path too: a
+/// reconstructed block whose `kv_bytes()` alone exceeds the RAM cap is
+/// refused admission by `push`, so `hydrate_from_ssd` must surface it as a
+/// miss — NOT a served hit. `stats().ssd_hits` must NOT be bumped for an
+/// entry that was never actually stored in RAM.
+#[test]
+#[allow(
+    clippy::clone_on_ref_ptr,
+    reason = "intentional Arc::clone — explicit form aids grep for shared-ownership transfer sites"
+)]
+fn ssd_hydrate_over_cap_entry_is_not_counted_as_hit() {
+    let prompt: Vec<u32> = make_ids(2 * BLOCK_TOKENS); // kv_bytes() = 512 * 8 = 4096
+                                                       // Cap strictly below the entry the mock source will reconstruct.
+    let tiny_cap = (prompt.len() as u64 * 8) - 1;
+    let mut cache: PromptCache<TestEntry> = PromptCache::with_max_bytes(4, tiny_cap);
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    cache.set_ssd_source(Box::new(MockSource {
+        entry_ids: prompt.clone(),
+        calls: calls.clone(),
+    }));
+
+    let slot = cache.hydrate_from_ssd(&prompt);
+    assert!(
+        slot.is_none(),
+        "an over-cap reconstructed block must surface as a miss"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the source was queried exactly once"
+    );
+    assert_eq!(
+        cache.stats().ssd_hits,
+        0,
+        "an over-cap hydrate must NOT be counted as a served ssd_hit"
+    );
+    assert_eq!(
+        cache.slots.len(),
+        0,
+        "the over-cap block must not occupy a RAM slot"
+    );
 }
 
 /// correctness: a partial hit truncates to exactly the matched block
