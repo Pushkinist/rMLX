@@ -771,7 +771,7 @@ pub(super) async fn generate_streaming(
                         let payload = json!({
                             "type": "error",
                             "error": {
-                                "type": crate::openai::errors::engine_error_type(&e),
+                                "type": super::errors::engine_error_type(&e),
                                 "message": e.to_string(),
                             }
                         });

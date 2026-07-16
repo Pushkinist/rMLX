@@ -648,7 +648,6 @@ fn scripted_failing<'r>(
 /// regression gate, smoke probes) reads exactly those two signals, so a dead
 /// stream would pass all of them.
 #[test]
-#[allow(clippy::unwrap_used)]
 #[allow(
     clippy::expect_used,
     reason = "test-only: expect_err IS the assertion — an Ok here is the regression under test, and its panic names it"

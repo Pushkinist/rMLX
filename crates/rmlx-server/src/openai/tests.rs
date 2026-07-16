@@ -26,6 +26,57 @@ async fn oom_parts(e: &rmlx_core::Error) -> (StatusCode, Option<String>, Value) 
     (status, retry, body)
 }
 
+/// `engine_error_type` must name every error exactly as `engine_error_response`
+/// spells it in the body it builds.
+///
+/// The two are hand-maintained mirrors of the same variant match, and a stream
+/// that dies mid-flight can only use the former (its status and headers are long
+/// gone) while the blocking route uses the latter. Any drift means one client
+/// sees a different `type` than another for the identical fault — on the key
+/// automation asserts on. A comment cannot enforce that; this test can.
+///
+/// Covers one representative per arm, including the wildcard.
+#[tokio::test]
+async fn engine_error_type_matches_response() {
+    use rmlx_core::OomPhase;
+    let cases: Vec<rmlx_core::Error> = vec![
+        rmlx_core::Error::SmokeProbe("nan".to_owned()),
+        rmlx_core::Error::Oom {
+            phase: OomPhase::LoadWeights,
+            requested_bytes: None,
+            peak_alloc_mb: None,
+            msg: "oom".to_owned(),
+        },
+        rmlx_core::Error::Oom {
+            phase: OomPhase::LoadKvCache,
+            requested_bytes: None,
+            peak_alloc_mb: None,
+            msg: "oom".to_owned(),
+        },
+        rmlx_core::Error::Oom {
+            phase: OomPhase::Generation,
+            requested_bytes: None,
+            peak_alloc_mb: None,
+            msg: "oom".to_owned(),
+        },
+        // wildcard arm — the common case for a mid-decode engine fault.
+        rmlx_core::Error::Mlx("device error".to_owned()),
+        rmlx_core::Error::Other("engine panic".to_owned()),
+    ];
+    for e in &cases {
+        let (_status, _retry, body) = oom_parts(e).await;
+        let from_response = body["error"]["type"]
+            .as_str()
+            .unwrap_or_else(|| panic!("response body carries no error.type for {e:?}: {body}"));
+        assert_eq!(
+            from_response,
+            errors::engine_error_type(e),
+            "engine_error_type drifted from engine_error_response for {e:?} — \
+             a streamed client would see a different `type` than a blocking one"
+        );
+    }
+}
+
 fn assert_mem_fields(err: &Value) {
     // J4 fields must always be present (value may be null if read_proc_mem
     // failed, but the key must exist). On macOS CI they are real numbers.

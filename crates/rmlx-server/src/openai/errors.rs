@@ -303,7 +303,11 @@ pub(crate) fn engine_error_response(e: &rmlx_core::Error) -> Response {
 /// cannot reuse that function — the HTTP status and headers are already sent —
 /// but it must still name the failure identically, so a client sees the same
 /// `type` for the same fault whether it streamed the response or not. Keep the
-/// two in step.
+/// two in step; `engine_error_type_matches_response` fails if they drift.
+///
+/// OpenAI-surface strings only. The Anthropic surface has its own mirror
+/// (`anthropic::errors::engine_error_type`) because its type strings carry an
+/// `_error` suffix; do not call this one from there.
 #[allow(
     clippy::wildcard_enum_match_arm,
     reason = "wildcard arm mirrors engine_error_response: every unenumerated variant maps to the same service_unavailable envelope there"

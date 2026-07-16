@@ -121,3 +121,33 @@ pub(crate) fn engine_error_response(e: &rmlx_core::Error) -> Response {
         _ => service_unavailable(&e.to_string()),
     }
 }
+
+/// The stable `type` key an engine error carries in the Anthropic error
+/// envelope.
+///
+/// Mirrors the arms of [`engine_error_response`] above. A stream that dies
+/// mid-flight cannot reuse that function — the HTTP status and headers are
+/// already sent — but must still name the failure identically, so a client sees
+/// the same `type` for the same fault whether it streamed the response or not.
+///
+/// Deliberately NOT shared with the OpenAI surface: these strings carry this
+/// surface's `_error` suffix (`service_unavailable_error`,
+/// `internal_server_error`) and diverge from OpenAI's by design. Type strings
+/// are per-surface; only the OOM keys coincide. Keep this in step with
+/// `engine_error_response`, not with the OpenAI mirror.
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "mirrors engine_error_response: every unenumerated variant maps to the service_unavailable_error envelope there"
+)]
+pub(super) fn engine_error_type(e: &rmlx_core::Error) -> &'static str {
+    use rmlx_core::OomPhase;
+    match e {
+        rmlx_core::Error::SmokeProbe(_) => "internal_server_error",
+        rmlx_core::Error::Oom { phase, .. } => match phase {
+            OomPhase::LoadWeights => "oom_during_load",
+            OomPhase::LoadKvCache => "oom_kv_cache",
+            OomPhase::Generation => "oom_mid_stream",
+        },
+        _ => "service_unavailable_error",
+    }
+}

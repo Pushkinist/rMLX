@@ -11,10 +11,10 @@
 
 use std::time::Instant;
 
-use rmlx_core::error::Result;
+use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{argmax, Array, Device, Dtype};
 use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::constraint::ConstraintEngine;
 use crate::kv_cache::{kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N};
@@ -200,10 +200,13 @@ pub fn generate_greedy(
         c.enter_prefill();
     }
 
+    // A failed prefill aborts the request. Returning the (empty) step list
+    // instead reaches the operator as the engine's generic zero-token backstop,
+    // which names nothing — the real cause (a Metal fault, a store refusing an
+    // append) is erased. Propagate it verbatim.
     let mut last_logits: Option<Array> = None;
-    let mut prefill_ok = true;
     let n_chunks = prompt_ids.len().div_ceil(prefill_chunk);
-    'prefill: for (chunk_idx, chunk) in prompt_ids.chunks(prefill_chunk).enumerate() {
+    for (chunk_idx, chunk) in prompt_ids.chunks(prefill_chunk).enumerate() {
         let is_last = chunk_idx + 1 == n_chunks;
         match model.forward_seq_with_cache(chunk, Some(&mut caches), device) {
             Ok(logits) => {
@@ -212,42 +215,42 @@ pub fn generate_greedy(
                 } else {
                     for c in &caches {
                         if let Err(e) = c.eval_prefill_state() {
-                            warn!(
+                            tracing::error!(
                                 error = %e,
                                 chunk_len = chunk.len(),
-                                "bitnet generate_greedy: prefill chunk cache evaluation failed"
+                                "bitnet generate_greedy: prefill chunk cache evaluation failed, \
+                                 aborting generation"
                             );
-                            prefill_ok = false;
-                            break 'prefill;
+                            return Err(e);
                         }
                     }
                 }
             }
             Err(e) => {
-                warn!(
+                tracing::error!(
                     error = %e,
                     prompt_len = prompt_ids.len(),
-                    "bitnet generate_greedy: prefill chunk failed, returning empty"
+                    "bitnet generate_greedy: prefill chunk failed, aborting generation"
                 );
-                prefill_ok = false;
-                break 'prefill;
+                return Err(e);
             }
         }
     }
 
     for c in &mut caches {
         if let Err(e) = c.exit_prefill(device) {
-            warn!(error = %e, "bitnet generate_greedy: exit_prefill quantization failed");
-            prefill_ok = false;
-            break;
+            tracing::error!(
+                error = %e,
+                "bitnet generate_greedy: exit_prefill quantization failed, aborting generation"
+            );
+            return Err(e);
         }
     }
 
-    if !prefill_ok {
-        return Ok(steps);
-    }
     let Some(prefill_logits) = last_logits else {
-        return Ok(steps);
+        return Err(Error::Other(
+            "bitnet generate_greedy: prefill produced no logits (empty prompt)".to_owned(),
+        ));
     };
 
     let prefill_ns = prefill_t0.elapsed().as_nanos();

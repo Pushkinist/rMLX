@@ -439,10 +439,12 @@ stop. A stream that dies mid-flight instead terminates with Anthropic's native
 
 ```
 event: error
-data: {"type":"error","error":{"type":"service_unavailable","message":"…"}}
+data: {"type":"error","error":{"type":"service_unavailable_error","message":"…"}}
 ```
 
-A `/v1/messages` stream without a `message_stop` did not complete.
+A `/v1/messages` stream without a `message_stop` did not complete. The `type`
+carries this surface's `_error` suffix — matching what `/v1/messages` returns
+for the same fault on the blocking path, not the OpenAI spelling.
 
 `"stop_sequence"` is **never** produced by `map_stop_reason`. It is set
 exclusively by the stop-matching path in `blocking.rs` /

@@ -15,7 +15,7 @@
 )]
 use std::time::Instant;
 
-use rmlx_core::error::Result;
+use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{argmax, Array, Device, Dtype};
 
 use crate::constraint::ConstraintEngine;
@@ -273,11 +273,14 @@ pub fn generate_greedy(
     for c in &mut caches {
         c.enter_prefill();
     }
+    // A failed prefill aborts the request. Returning the (empty) step list
+    // instead reaches the operator as the engine's generic zero-token backstop,
+    // which names nothing — the real cause (a Metal fault, a store refusing an
+    // append) is erased. Propagate it verbatim.
     let prefill_logits = {
         let mut last_logits: Option<Array> = None;
-        let mut prefill_ok = true;
         let n_chunks = prompt_ids.len().div_ceil(prefill_chunk);
-        'prefill: for (chunk_idx, chunk) in prompt_ids.chunks(prefill_chunk).enumerate() {
+        for (chunk_idx, chunk) in prompt_ids.chunks(prefill_chunk).enumerate() {
             let is_last = chunk_idx + 1 == n_chunks;
             match model.forward_seq_with_cache(chunk, Some(&mut caches), device) {
                 Ok(logits) => {
@@ -286,39 +289,42 @@ pub fn generate_greedy(
                     } else {
                         for c in &caches {
                             if let Err(e) = c.eval_prefill_state() {
-                                tracing::warn!(
+                                tracing::error!(
                                     error = %e,
                                     chunk_len = chunk.len(),
-                                    "laguna generate_greedy: prefill chunk cache eval failed"
+                                    "laguna generate_greedy: prefill chunk cache eval failed, \
+                                     aborting generation"
                                 );
-                                prefill_ok = false;
-                                break 'prefill;
+                                return Err(e);
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    tracing::error!(
                         error = %e,
                         prompt_len = prompt_ids.len(),
-                        "laguna generate_greedy: prefill chunk failed, returning empty"
+                        "laguna generate_greedy: prefill chunk failed, aborting generation"
                     );
-                    prefill_ok = false;
-                    break 'prefill;
+                    return Err(e);
                 }
             }
         }
         for c in &mut caches {
             if let Err(e) = c.exit_prefill(device) {
-                tracing::warn!(error = %e, "laguna generate_greedy: exit_prefill quantization failed");
-                prefill_ok = false;
-                break;
+                tracing::error!(
+                    error = %e,
+                    "laguna generate_greedy: exit_prefill quantization failed, aborting generation"
+                );
+                return Err(e);
             }
         }
-        if !prefill_ok || last_logits.is_none() {
-            return Ok(steps);
-        }
-        last_logits.unwrap()
+        let Some(l) = last_logits else {
+            return Err(Error::Other(
+                "laguna generate_greedy: prefill produced no logits (empty prompt)".to_owned(),
+            ));
+        };
+        l
     };
 
     let logits_flat = prefill_logits.reshape(&[1, vocab], device)?;
