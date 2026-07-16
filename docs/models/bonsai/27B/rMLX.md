@@ -40,8 +40,9 @@ directly. KV-MB from serve events `op='kv_cache_bytes'` high-water (the `baselin
   the whole codec spread.
 - **rMLX prefill is the weak spot.** Cold TTFT is **~2.6–3.4× slower** than the
   mlx-lm/tq siblings at every size (815 s vs 318 s at 128k; 14.8 s vs 4.4 s at 4k).
-  Decode wins, prefill loses — the top perf follow-up (§4), likely the
-  GDN-prefill-chunk path (a known, not-yet-merged optimization).
+  Decode wins, prefill loses — the top perf follow-up (§4, **#216**): the GDN
+  recurrence kernel is sequential-in-T; the merged #155 chunk fix (64→2048) is
+  already spent, so this needs a chunkwise-parallel delta-rule prefill kernel.
 - **Three codec tiers** (§2, §4):
   - **Tier 1 — GPU-fused, fast, viable** (`none`, `k8v8`, `planar`/`planar_k`/
     `planar3`, `k8vturbo2/3`, `k8vturbo2tcq/3tcq`, `tsym3/4`, `iso3/4`, `rotor3/4`):
@@ -274,11 +275,17 @@ Ranked by impact:
    ctx — it needs an MSL flash-decode-over-quant kernel*. The 27B is the best
    argument yet for building it, because the GPU-kerneled members of the same
    families already win.
-2. **rMLX prefill is the weak spot — cold TTFT 2.6–3.4× slower than the siblings.**
-   `none` 815 s vs mlx-lm 318 s at 128k, and the same ratio at every size (§3).
-   Decode already wins; prefill is the gap that decides overall latency. Most
-   likely the GDN-prefill-chunk path — a known, not-yet-merged prefill-chunking
-   optimization (the same class of fix that cut Qwen3.6 GDN TTFT ~4×). Top perf
+2. **rMLX prefill is the weak spot — cold TTFT 2.6–3.4× slower than the siblings**
+   (**#216**). `none` 815 s vs mlx-lm 318 s at 128k, same ratio at every size (§3).
+   Root cause is **not** the chunk size: #155 (GDN kernel-always + prefill chunk
+   64→2048) is already merged and was active in this benched binary. The residual
+   cost is the **GDN recurrence kernel itself** (`gated_delta_msl.rs:110`) — a
+   *sequential* per-timestep scan (`for t in 0..T`, loop-carried state), so prefill
+   runs T=2048 serial steps/chunk over 48 GDN layers. Serial cost scales as
+   `num_gdn_layers × head_dim`: the 27B's `48×256` is **3.2×** the Qwen3.6-35B's
+   `30×128` (where #155 reached mlx-lm parity) — matching the observed gap. Fix =
+   a chunkwise-parallel delta-rule prefill kernel (Bonsai-8B, dense 2-bit, *no GDN*,
+   prefills fast on the same quant-GEMM path — confirming GDN is the delta). Top perf
    follow-up.
 3. **4-bit-V dequant is expensive on this arch — avoid tq4-V.** `k8v4`
    (−38…−76 % vs `none` from 8k up) and `rot_k_tq4v` (−11…−50 %) both crater
