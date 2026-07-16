@@ -117,9 +117,17 @@ pub fn rot_k_fused_enabled() -> bool {
 ///
 /// All must be powers of two; each requires its own kernel specialization
 /// because the Metal threadgroup size equals D (static per dispatch).
+///
+/// Rotation accepts every value here. The fused quantize additionally needs a
+/// row to hold at least one whole affine group, so it rejects any `D` smaller
+/// than [`FWHT_QUANT_GROUP_SIZE`] — see [`build_fwht_quantize_body`].
 const SUPPORTED_D: &[usize] = &[32, 64, 128, 256, 512];
 
-/// Returns `true` iff `d` is a supported FWHT kernel dimension.
+/// Returns `true` iff `d` is a supported FWHT *rotation* dimension.
+///
+/// Not sufficient for the fused quantize, which also requires
+/// `d % FWHT_QUANT_GROUP_SIZE == 0`; [`rot_k_fwht_quantize_gpu`] rejects the
+/// rest with a shape error, and its caller falls back to the matmul path.
 pub fn is_supported_d(d: usize) -> bool {
     SUPPORTED_D.contains(&d)
 }
@@ -159,129 +167,72 @@ pub const FWHT_QUANT_GROUP_SIZE: usize = 64;
 /// - Each thread quantizes its element to [0,255].
 /// 5. Pack 4 int8 codes per u32 via atomic OR (LSB-first).
 /// 6. lidg==0 writes scale and bias.
-fn build_fwht_quantize_body(d: usize) -> String {
+///
+/// # Errors
+///
+/// Returns [`Error::Quant`] when `d` is not a positive multiple of
+/// [`FWHT_QUANT_GROUP_SIZE`], or when no kernel specialization exists for it.
+fn build_fwht_quantize_body(d: usize) -> Result<String> {
     let gs = FWHT_QUANT_GROUP_SIZE;
-    let log2_d = d.trailing_zeros() as usize;
+    // A row must hold at least one whole affine group: the kernel sizes its
+    // per-group SMEM as `grp_max[d / gs]`, so a row shorter than one group
+    // emits a zero-length threadgroup array, which is not valid MSL and fails
+    // at shader compile. Reject the shape here rather than assert it — a
+    // debug_assert is compiled out of release, which is precisely where the
+    // broken shader would reach the GPU.
     let groups_per_row = d / gs;
-    let words_per_row = d / 4; // 4 x int8 per u32
-    debug_assert!(d.is_power_of_two() && d >= 32 && d.is_multiple_of(gs) && d.is_multiple_of(4));
-
-    format!(
-        r"
-    uint row  = threadgroup_position_in_grid.x;
-    uint tid  = thread_position_in_threadgroup.x;
-
-    const uint D_C           = {d}u;
-    const uint GROUP_SIZE_C  = {gs}u;
-    const uint LOG2_D_C      = {log2_d}u;
-    const uint GROUPS_ROW    = {groups_per_row}u;
-    const uint WORDS_ROW     = {words_per_row}u;
-    const float INV_SQRT_D   = 1.0f / sqrt((float)D_C);
-
-    threadgroup float buf[{d}];
-    buf[tid] = (float)inp[row * D_C + tid];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint s = 0u; s < LOG2_D_C; s++) {{
-        uint stride = 1u << s;
-        if ((tid & stride) == 0u) {{
-            uint j = tid + stride;
-            float a = buf[tid];
-            float b = buf[j];
-            buf[tid] = a + b;
-            buf[j]   = a - b;
-        }}
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }}
-
-    float x_rot = buf[tid] * INV_SQRT_D;
-    buf[tid] = x_rot;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    uint g    = tid / GROUP_SIZE_C;
-    uint lidg = tid % GROUP_SIZE_C;
-
-    threadgroup float grp_max[{groups_per_row}];
-    threadgroup float grp_min[{groups_per_row}];
-
-    if (lidg == 0u) {{
-        float gmax = buf[g * GROUP_SIZE_C];
-        float gmin = buf[g * GROUP_SIZE_C];
-        for (uint k = 1u; k < GROUP_SIZE_C; k++) {{
-            float v = buf[g * GROUP_SIZE_C + k];
-            if (v > gmax) gmax = v;
-            if (v < gmin) gmin = v;
-        }}
-        grp_max[g] = gmax;
-        grp_min[g] = gmin;
-    }}
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float gmax  = grp_max[g];
-    float gmin  = grp_min[g];
- // Constant group (all elements equal): MLX mx.quantize produces scale≈0
- // and bias=gmin, yielding code=0 for all elements (dequant = bias).
- // Mirror that convention: scale=0.0 makes the guard below emit code=0.
-    float scale = (gmax > gmin) ? ((gmax - gmin) / 255.0f) : 0.0f;
-    float bias  = gmin;
-
-    float v_norm = (scale > 0.0f) ? ((x_rot - bias) / scale) : 0.0f;
-    uint  code   = (uint)clamp(round(v_norm), 0.0f, 255.0f);
-
-    uint word_idx = row * WORDS_ROW + (tid / 4u);
-    uint shift    = (tid % 4u) * 8u;
-    atomic_fetch_or_explicit((device atomic_uint*)&out_codes[word_idx],
-                             (code & 0xFFu) << shift,
-                             memory_order_relaxed);
-
-    if (lidg == 0u) {{
-        uint sg_idx = row * GROUPS_ROW + g;
-        out_scales[sg_idx] = scale;
-        out_biases[sg_idx] = bias;
-    }}
-",
-    )
+    if !d.is_multiple_of(gs) || groups_per_row == 0 {
+        return Err(Error::Quant(format!(
+            "rot_k FWHT quantize: head_dim {d} must be a positive multiple of the affine \
+             group size {gs} ({groups_per_row} whole groups per row)"
+        )));
+    }
+    debug_assert!(d.is_power_of_two() && d.is_multiple_of(4));
+    Ok(match d {
+        64 => include_str!("metal/rot_k_fwht_quantize_d64.metal"),
+        128 => include_str!("metal/rot_k_fwht_quantize_d128.metal"),
+        256 => include_str!("metal/rot_k_fwht_quantize_d256.metal"),
+        512 => include_str!("metal/rot_k_fwht_quantize_d512.metal"),
+        _ => {
+            return Err(Error::Quant(format!(
+                "rot_k FWHT quantize: no kernel specialization for head_dim {d}"
+            )))
+        }
+    }
+    .to_owned())
 }
 
-/// Build the MSL body for the FWHT rotate-only kernel (Q pre-rotation).
-fn build_fwht_rotate_body(d: usize) -> String {
-    let log2_d = d.trailing_zeros() as usize;
+/// Select the pre-rendered MSL body for the FWHT rotate-only kernel (Q
+/// pre-rotation). Rotation has no group structure, so every [`SUPPORTED_D`]
+/// has a body.
+///
+/// # Errors
+///
+/// Returns [`Error::Quant`] when no kernel specialization exists for `d`,
+/// rather than handing back a body built for a different dimension.
+fn build_fwht_rotate_body(d: usize) -> Result<String> {
     debug_assert!(d.is_power_of_two() && d >= 32);
-
-    format!(
-        r"
-    uint row = threadgroup_position_in_grid.x;
-    uint tid = thread_position_in_threadgroup.x;
-
-    const uint D_C       = {d}u;
-    const uint LOG2_D_C  = {log2_d}u;
-    const float INV_SQRT_D = 1.0f / sqrt((float)D_C);
-
-    threadgroup float buf[{d}];
-    buf[tid] = (float)inp[row * D_C + tid];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint s = 0u; s < LOG2_D_C; s++) {{
-        uint stride = 1u << s;
-        if ((tid & stride) == 0u) {{
-            uint j = tid + stride;
-            float a = buf[tid];
-            float b = buf[j];
-            buf[tid] = a + b;
-            buf[j]   = a - b;
-        }}
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }}
-
-    out[row * D_C + tid] = buf[tid] * INV_SQRT_D;
-",
-    )
+    Ok(match d {
+        32 => include_str!("metal/rot_k_fwht_rotate_d32.metal"),
+        64 => include_str!("metal/rot_k_fwht_rotate_d64.metal"),
+        128 => include_str!("metal/rot_k_fwht_rotate_d128.metal"),
+        256 => include_str!("metal/rot_k_fwht_rotate_d256.metal"),
+        512 => include_str!("metal/rot_k_fwht_rotate_d512.metal"),
+        _ => {
+            return Err(Error::Quant(format!(
+                "rot_k FWHT rotate: no kernel specialization for head_dim {d}"
+            )))
+        }
+    }
+    .to_owned())
 }
 
-// ---- Kernel singletons (one per supported D for quantize; one per D for rotate) --
+// ---- Kernel singletons (one per D that holds whole affine groups for quantize;
+// ---- one per supported D for rotate) ----------------------------------------
 
 struct FwhtKernels {
-    quantize_d32: OnceLock<Result<MetalKernel>>,
+    // No quantize_d32: a 32-element row is shorter than one affine group, so
+    // that specialization is a rejected shape rather than a kernel.
     quantize_d64: OnceLock<Result<MetalKernel>>,
     quantize_d128: OnceLock<Result<MetalKernel>>,
     quantize_d256: OnceLock<Result<MetalKernel>>,
@@ -298,7 +249,6 @@ struct FwhtKernels {
 // which is documented in metal_kernel.rs). Static means one instance per
 // process, matching the single-MLX-process requirement (CLAUDE.md hard rule 8).
 static FWHT_KERNELS: FwhtKernels = FwhtKernels {
-    quantize_d32: OnceLock::new(),
     quantize_d64: OnceLock::new(),
     quantize_d128: OnceLock::new(),
     quantize_d256: OnceLock::new(),
@@ -312,19 +262,19 @@ static FWHT_KERNELS: FwhtKernels = FwhtKernels {
 
 fn quant_kernel_for_d(d: usize) -> Result<&'static MetalKernel> {
     let cell = match d {
-        32 => &FWHT_KERNELS.quantize_d32,
         64 => &FWHT_KERNELS.quantize_d64,
         128 => &FWHT_KERNELS.quantize_d128,
         256 => &FWHT_KERNELS.quantize_d256,
         512 => &FWHT_KERNELS.quantize_d512,
         _ => {
-            return Err(Error::Mlx(format!(
-                "rot_k_msl: unsupported D={d} for FWHT quantize kernel"
+            return Err(Error::Quant(format!(
+                "rot_k_msl: no FWHT quantize kernel for head_dim {d}; each row must hold a \
+                 whole number of affine groups of {FWHT_QUANT_GROUP_SIZE}"
             )))
         }
     };
     cell.get_or_init(|| {
-        let body = build_fwht_quantize_body(d);
+        let body = build_fwht_quantize_body(d)?;
         MetalKernel::new(
             &format!("rmlx_rot_k_fwht_q8_d{d}"),
             kernel_header(),
@@ -351,7 +301,7 @@ fn rotate_kernel_for_d(d: usize) -> Result<&'static MetalKernel> {
         }
     };
     cell.get_or_init(|| {
-        let body = build_fwht_rotate_body(d);
+        let body = build_fwht_rotate_body(d)?;
         MetalKernel::new(
             &format!("rmlx_rot_k_fwht_rotate_d{d}"),
             kernel_header(),

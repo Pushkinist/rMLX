@@ -1,0 +1,74 @@
+# Compile-probe manifest — drives `make check-metal-compiles`.
+#
+# The .metal files under ../ are kernel *bodies*: MLX supplies the function
+# signature and buffer declarations at dispatch, so a body is not a standalone
+# Metal translation unit. To syntax-check one, the gate assembles
+#
+#     <metal_stdlib preamble> + <header> + kernel probe { <buffer aliases> <body> }
+#
+# and compiles that. This file supplies, per body, the header to prepend and the
+# buffer names the body expects (with their dispatch dtype). Buffer names and
+# order mirror the `MetalKernel::new(.., input_names, output_names)` call sites;
+# dtypes mirror the arrays those sites pass / `add_output_shape` declares.
+#
+# Format:  <body.metal> | <header or -> | <name:type,...>
+#   type: u = uint buffer, f = float buffer
+#
+# Headers ending in `.hdr.metal` live in this directory and are snapshots of the
+# Rust-generated runtime headers (codebooks / rotation constants), captured for
+# the probe only — production still builds them at dispatch. Regenerate them if
+# a header builder changes; see README.md here.
+
+iso_fused_qk_b3.metal | iso_fused_qk_b3.hdr.metal | query:f,codes:u,scales:f,norms:f,mask:f,scale_arr:f,dims:u,out:f
+iso_fused_qk_b4.metal | iso_fused_qk_b4.hdr.metal | query:f,codes:u,scales:f,norms:f,mask:f,scale_arr:f,dims:u,out:f
+isoquant_quantize_iso3.metal | isoquant_iso3.hdr.metal | inp:f,n_groups:u,codes_out:u,scales_out:f,norms_out:f
+isoquant_dequantize_iso3.metal | isoquant_iso3.hdr.metal | codes_in:u,scales_in:f,norms_in:f,n_groups:u,out:f
+k8vturbo3_quantize.metal | ../k8vturbo3_header.metal | inp:f,codes:u,scales:f
+k8vturbo3_dequantize.metal | ../k8vturbo3_header.metal | codes:u,scales:f,out:f
+planar_flash_decode_p1.metal | planar_flash_decode_p1.hdr.metal | query:f,k_codes:u,k_scales:f,k_rot32:u,v_flat:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
+planar_flash_decode_p2.metal | - | partial_o:f,tile_max:f,tile_sum_exp:f,dims_p2:u,dst:f
+planar_fused_qk_b3.metal | planar_fused_qk_b3.hdr.metal | query:f,codes:u,scales:f,rot32:u,scale_arr:f,dims:u,out:f
+planar_fused_qk_b4.metal | planar_fused_qk_b4.hdr.metal | query:f,codes:u,scales:f,rot32:u,scale_arr:f,dims:u,out:f
+planarquant_quantize.metal | planarquant_v4.hdr.metal | inp:f,codes:u,scales:f,rot32:u
+planarquant_dequantize.metal | planarquant_v4.hdr.metal | codes:u,scales:f,rot32:u,out:f
+planarquant_quantize_v3.metal | planarquant_v3.hdr.metal | inp:f,codes:u,scales:f,rot32:u
+planarquant_dequantize_v3.metal | planarquant_v3.hdr.metal | codes:u,scales:f,rot32:u,out:f
+q8_fused_qk.metal | - | query:f,codes:u,scales:f,mask:f,scale_arr:f,dims:u,out:f
+q8_quantize.metal | - | inp:f,codes:u,scales:f
+q8_dequantize.metal | - | codes:u,scales:f,out:f
+# No rot_k_fwht_quantize_d32: a 32-element row is shorter than the affine group size
+# (64), so the kernel's per-group SMEM would be a zero-length array — MSL that does not
+# compile. That shape is rejected in Rust (build_fwht_quantize_body returns Err) and the
+# caller falls back to the matmul path, so no d32 quantize kernel exists to probe.
+# Rotation has no group structure, so rot_k_fwht_rotate_d32 is real and is probed below.
+rot_k_fwht_quantize_d64.metal | rot_k.hdr.metal | inp:f,out_codes:u,out_scales:f,out_biases:f
+rot_k_fwht_quantize_d128.metal | rot_k.hdr.metal | inp:f,out_codes:u,out_scales:f,out_biases:f
+rot_k_fwht_quantize_d256.metal | rot_k.hdr.metal | inp:f,out_codes:u,out_scales:f,out_biases:f
+rot_k_fwht_quantize_d512.metal | rot_k.hdr.metal | inp:f,out_codes:u,out_scales:f,out_biases:f
+rot_k_fwht_rotate_d32.metal | rot_k.hdr.metal | inp:f,out:f
+rot_k_fwht_rotate_d64.metal | rot_k.hdr.metal | inp:f,out:f
+rot_k_fwht_rotate_d128.metal | rot_k.hdr.metal | inp:f,out:f
+rot_k_fwht_rotate_d256.metal | rot_k.hdr.metal | inp:f,out:f
+rot_k_fwht_rotate_d512.metal | rot_k.hdr.metal | inp:f,out:f
+rotor_fused_qk_b3.metal | rotor_fused_qk_b3.hdr.metal | query:f,codes:u,scales:f,norms:f,rotors:f,mask:f,scale_arr:f,dims:u,out:f
+rotor_fused_qk_b4.metal | rotor_fused_qk_b4.hdr.metal | query:f,codes:u,scales:f,norms:f,rotors:f,mask:f,scale_arr:f,dims:u,out:f
+rotorquant_quantize_rotor3.metal | rotorquant_rotor3.hdr.metal | inp:f,rotors_in:f,n_groups:u,head_dim:u,codes_out:u,scales_out:f,norms_out:f
+rotorquant_dequantize_rotor3.metal | rotorquant_rotor3.hdr.metal | codes_in:u,scales_in:f,norms_in:f,rotors_in:f,n_groups:u,head_dim:u,out:f
+rotorquant_quantize_rotor4.metal | rotorquant_rotor4.hdr.metal | inp:f,rotors_in:f,n_groups:u,head_dim:u,codes_out:u,scales_out:f,norms_out:f
+rotorquant_dequantize_rotor4.metal | rotorquant_rotor4.hdr.metal | codes_in:u,scales_in:f,norms_in:f,rotors_in:f,n_groups:u,head_dim:u,out:f
+sparse_v.metal | sparse_v.hdr.metal | probs:f,v_codes:u,v_scales:f,v_biases:f,params:u,out:f
+tcq_v2_quantize.metal | ../tcq_v2_header.metal | inp:f,codes:u,scales:f
+tcq_v_quantize.metal | ../tcq_v_header.metal | inp:f,codes:u,scales:f
+turbo2_v_quantize.metal | ../turbo2_v_header.metal | inp:f,codes:u,scales:f
+turbo2_v_dequantize.metal | ../turbo2_v_header.metal | codes:u,scales:f,out:f
+turbo_flash_p1.metal | ../turbo_flash_header.metal | q_flat:f,k_codes:u,k_scales:f,v_codes:u,v_scales:f,mask_flat:f,params_p1:u,partial_out:f,partial_ms:f
+turbo_flash_p2.metal | ../turbo_flash_header.metal | partial_out:f,partial_ms:f,params_p2:u,dst:f
+turbo_k3_fused_qk.metal | ../turbo_k3_fused_qk_header.metal | query:f,codes:u,scales:f,mask:f,scale_arr:f,dims:u,out:f
+turbo_k4_fused_qk.metal | ../turbo_k4_fused_qk_header.metal | query:f,codes:u,scales:f,mask:f,scale_arr:f,dims:u,out:f
+turboquant_quantize.metal | ../turboquant_header.metal | inp:f,codes:u,scales:f
+turboquant_dequantize.metal | ../turboquant_header.metal | codes:u,scales:f,out:f
+turboquant_quantize_cb_buf.metal | - | inp:f,cb:f,codes:u,scales:f
+turboquant_dequantize_cb_buf.metal | - | codes:u,scales:f,cb:f,out:f
+sparse_attn_phase1_score.metal | sparse_attn_phase1_score.hdr.metal | query:f,k_codes:u,k_scales:f,k_rot32:u,scale_arr:f,dims:u,tile_top_scores:f,tile_top_indices:u,all_scores:f
+sparse_attn_phase2_attend.metal | sparse_attn_phase2_attend.hdr.metal | query:f,k_codes:u,k_scales:f,k_rot32:u,v_flat:f,all_scores:f,head_threshold:f,scale_arr:f,dims:u,partial_o:f,tile_lse:f
+sparse_attn_phase2_merge.metal | - | partial_o:f,tile_lse:f,dims_p2:u,dst:f

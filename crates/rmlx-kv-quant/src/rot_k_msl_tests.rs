@@ -173,6 +173,46 @@ fn supported_d_set_is_correct() {
     assert!(!is_supported_d(1024), "D=1024 not in SUPPORTED_D");
 }
 
+/// A row shorter than one affine group must be rejected, not asserted.
+///
+/// `head_dim < FWHT_QUANT_GROUP_SIZE` yields zero groups per row, which sized
+/// the kernel's per-group SMEM as a zero-length threadgroup array — MSL that
+/// does not compile. A `debug_assert` is compiled out of release, so release
+/// would have shipped the broken shader to the GPU. The builder must return a
+/// real error in every profile.
+#[allow(
+    clippy::expect_used,
+    reason = "test asserts the error path exists; a missing error is the failure being checked"
+)]
+#[test]
+fn fwht_quantize_rejects_head_dim_below_group_size() {
+    let err = build_fwht_quantize_body(FWHT_QUANT_GROUP_SIZE / 2)
+        .expect_err("head_dim below the affine group size must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&(FWHT_QUANT_GROUP_SIZE / 2).to_string()),
+        "error should name the offending head_dim: {msg}"
+    );
+    assert!(
+        msg.contains(&FWHT_QUANT_GROUP_SIZE.to_string()),
+        "error should name the affine group size: {msg}"
+    );
+
+    // Every shape that holds a whole number of groups still builds.
+    for d in [64usize, 128, 256, 512] {
+        assert!(
+            build_fwht_quantize_body(d).is_ok(),
+            "D={d} is a whole number of groups and must build"
+        );
+    }
+
+    // Rotation has no group structure, so the same D stays valid there.
+    assert!(
+        is_supported_d(FWHT_QUANT_GROUP_SIZE / 2),
+        "rotation must still accept D=32"
+    );
+}
+
 /// MEDIUM 1 fix: `rot_k_fwht_rotate_gpu` must preserve the input dtype.
 ///
 /// When Q is bf16, the output must also be bf16 (not silently widened to
@@ -255,5 +295,21 @@ fn quantize_constant_group_reconstruction() {
     assert_eq!(
         scale, 0.0_f32,
         "constant group scale must be 0.0 (mirrors MLX)"
+    );
+}
+
+/// Probe header snapshots must equal what the builders emit.
+///
+/// `make check-metal-compiles` prepends these snapshots to the kernel bodies.
+/// A builder that changes a constant's value, or drops one, without the
+/// snapshot being refreshed leaves the probe compiling text production no
+/// longer emits — the gate would keep passing while checking the wrong thing.
+/// Equality here turns that drift into a hard failure.
+#[test]
+fn hdr_probe_snapshot_matches_builder() {
+    assert_eq!(
+        kernel_header(),
+        include_str!("metal/probes/rot_k.hdr.metal"),
+        "stale snapshot: refresh metal/probes/rot_k.hdr.metal"
     );
 }

@@ -255,3 +255,19 @@ fn test_sparse_v_4bit_matches_reference() {
         }
     }
 }
+
+/// Probe header snapshots must equal what the builders emit.
+///
+/// `make check-metal-compiles` prepends these snapshots to the kernel bodies.
+/// A builder that changes a constant's value, or drops one, without the
+/// snapshot being refreshed leaves the probe compiling text production no
+/// longer emits — the gate would keep passing while checking the wrong thing.
+/// Equality here turns that drift into a hard failure.
+#[test]
+fn hdr_probe_snapshot_matches_builder() {
+    assert_eq!(
+        build_kernel_header(kernel_eps()),
+        include_str!("metal/probes/sparse_v.hdr.metal"),
+        "stale snapshot: refresh metal/probes/sparse_v.hdr.metal"
+    );
+}

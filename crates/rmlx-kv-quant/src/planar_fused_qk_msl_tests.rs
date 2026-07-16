@@ -403,3 +403,28 @@ fn planar_fused_qk_rejects_non_pow2_head_dim() {
         "expected pow-2 guard error, got: {msg}"
     );
 }
+
+/// Probe header snapshots must equal what the builders emit.
+///
+/// `make check-metal-compiles` prepends these snapshots to the kernel bodies.
+/// A builder that changes a constant's value, or drops one, without the
+/// snapshot being refreshed leaves the probe compiling text production no
+/// longer emits — the gate would keep passing while checking the wrong thing.
+/// Equality here turns that drift into a hard failure.
+#[allow(
+    clippy::expect_used,
+    reason = "a header that fails to build is itself the drift this test guards"
+)]
+#[test]
+fn hdr_probe_snapshots_match_builders() {
+    assert_eq!(
+        build_qk_header(3).expect("planar fused-QK bits=3 header"),
+        include_str!("metal/probes/planar_fused_qk_b3.hdr.metal"),
+        "stale snapshot: refresh metal/probes/planar_fused_qk_b3.hdr.metal"
+    );
+    assert_eq!(
+        build_qk_header(4).expect("planar fused-QK bits=4 header"),
+        include_str!("metal/probes/planar_fused_qk_b4.hdr.metal"),
+        "stale snapshot: refresh metal/probes/planar_fused_qk_b4.hdr.metal"
+    );
+}
