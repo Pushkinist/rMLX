@@ -304,9 +304,42 @@ rmlx baseline --model /path/to/snapshot --prompt-tokens 4096 --label "8k-bench"
 | `--kv-bits` | float | — | Bit-width alias. Mutually exclusive with `--kv-quant` and `--cache-type-*`. |
 | `--kv-group-size` | usize | 64 | Group size for `--kv-bits`. |
 | `--max-ctx` / `--ctx-max` | u32 | (from model) | KV cache buffer token capacity. Must be ≥ 256 when set. |
+| `--max-prompt-tokens` | usize | 65536 | Cap on the tokenized prompt length. See "Prompt-length cap" below — behavior differs by `--device`. Must be ≥ 1 when set. |
+| `--allow-truncate` | bool flag | off | Opt into silently truncating a too-long prompt to the `--max-prompt-tokens` cap on `--device gpu` instead of erroring. No effect on `--device cpu` (always truncates) or when `--max-prompt-tokens` is passed explicitly (that is itself an opt-in). |
 | `--label` | string | — | Free-form campaign label stamped into the metrics record's `notes` column. |
 | `--record` | bool flag | off | Emit a §8.5 `RunRecord` to the metrics buffer and ingest into `runs.db` in-process. |
 | `--git-sha` | string | — | Commit SHA to stamp on the emitted record's `git_sha` column (only meaningful with `--record`). Provenance the caller supplies — the binary does not and cannot determine the commit it was built from. Absent by default (`git_sha` is `NULL`). |
+
+#### Prompt-length cap
+
+`--max-prompt-tokens` guards against pathologically long prompts inflating
+bench time. The two devices have genuinely different behavior once the
+tokenized prompt exceeds the cap:
+
+- **`--device cpu`**: always truncates (with a `tracing::warn!`), matching the
+  historical behavior. CPU forward is O(N²), so the cap is a real sanity
+  guard against unbounded per-step cost.
+- **`--device gpu`** with the **default** cap (`--max-prompt-tokens` not
+  passed) and no `--allow-truncate`: **hard error**, not a truncation. Per-step
+  time no longer scales with raw prompt length on GPU once the KV cache and
+  chunked prefill are in place, so silently truncating would record a
+  shorter run that looks like a valid full-length measurement — a
+  long-context bench footgun. Raise the cap explicitly
+  (`--max-prompt-tokens <N>`) to measure the full prompt, or pass
+  `--allow-truncate` to opt into the old silent-truncate behavior.
+- **`--device gpu`** with an **explicit** `--max-prompt-tokens` or with
+  `--allow-truncate` set: truncates with a `tracing::warn!`, same as CPU —
+  the caller has explicitly opted in.
+
+```bash
+# 128k prompt on GPU: raise the cap to measure it in full (no truncation).
+rmlx baseline --model /path/to/snapshot --prompt-tokens 131072 \
+  --device gpu --max-ctx 131072 --max-prompt-tokens 131072
+
+# 128k prompt on GPU, default cap: errors loudly instead of silently
+# recording a 65536-token run under a 128k label.
+rmlx baseline --model /path/to/snapshot --prompt-tokens 131072 --device gpu
+```
 
 ---
 

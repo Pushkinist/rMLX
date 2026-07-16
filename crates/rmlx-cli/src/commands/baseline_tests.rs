@@ -247,3 +247,77 @@ fn build_record_git_sha_blank_string_is_null() {
 
     assert!(rec["git_sha"].is_null());
 }
+
+// ── resolve_prompt_truncation ────────────────────────────────────────────
+// Model-agnostic: pure function over (prompt_len, cap, device, flags), no
+// model load / GPU context involved.
+
+#[test]
+fn resolve_prompt_truncation_under_cap_is_a_noop_on_gpu() {
+    let len =
+        resolve_prompt_truncation(1_000, 65_536, Device::Gpu, false, false).expect("under cap");
+    assert_eq!(len, 1_000);
+}
+
+#[test]
+fn resolve_prompt_truncation_under_cap_is_a_noop_on_cpu() {
+    let len =
+        resolve_prompt_truncation(1_000, 65_536, Device::Cpu, false, false).expect("under cap");
+    assert_eq!(len, 1_000);
+}
+
+/// Equality boundary on the GPU-default (no opt-in) path: a prompt exactly
+/// at the cap must not error -- pins the `<=` guard against a `<` mutation.
+#[test]
+fn resolve_prompt_truncation_gpu_at_cap_exactly_is_a_noop() {
+    let len = resolve_prompt_truncation(65_536, 65_536, Device::Gpu, false, false)
+        .expect("prompt exactly at the default cap must not error");
+    assert_eq!(len, 65_536);
+}
+
+/// The bug this fixes: a >65536-token prompt on `--device gpu` with the
+/// default cap and no opt-in must fail loudly, not silently truncate down to
+/// a shorter measurement that looks like a full-length one.
+#[test]
+fn resolve_prompt_truncation_gpu_default_cap_over_limit_errors_loudly() {
+    let err = resolve_prompt_truncation(131_072, 65_536, Device::Gpu, false, false)
+        .expect_err("must error, not silently truncate");
+    let msg = err.to_string();
+    assert!(msg.contains("131072"), "{msg}");
+    assert!(msg.contains("65536"), "{msg}");
+    assert!(msg.contains("--max-prompt-tokens"), "{msg}");
+    assert!(msg.contains("--allow-truncate"), "{msg}");
+}
+
+#[test]
+fn resolve_prompt_truncation_gpu_explicit_cap_over_limit_truncates() {
+    // An explicit `--max-prompt-tokens` is itself the opt-in.
+    let len = resolve_prompt_truncation(131_072, 65_536, Device::Gpu, true, false)
+        .expect("explicit cap truncates instead of erroring");
+    assert_eq!(len, 65_536);
+}
+
+#[test]
+fn resolve_prompt_truncation_gpu_allow_truncate_over_limit_truncates() {
+    let len = resolve_prompt_truncation(131_072, 65_536, Device::Gpu, false, true)
+        .expect("--allow-truncate opts into truncation");
+    assert_eq!(len, 65_536);
+}
+
+/// `--device gpu` measuring the full length requires raising the cap; when
+/// the caller does that, the full prompt is measured (not truncated).
+#[test]
+fn resolve_prompt_truncation_gpu_full_length_when_cap_raised() {
+    let len = resolve_prompt_truncation(131_072, 131_072, Device::Gpu, true, false)
+        .expect("prompt exactly at the raised cap");
+    assert_eq!(len, 131_072);
+}
+
+#[test]
+fn resolve_prompt_truncation_cpu_over_limit_always_truncates() {
+    // CPU forward is genuinely O(N^2); the historical silent-truncate
+    // behavior is preserved regardless of explicit/allow-truncate flags.
+    let len = resolve_prompt_truncation(131_072, 65_536, Device::Cpu, false, false)
+        .expect("cpu always truncates");
+    assert_eq!(len, 65_536);
+}

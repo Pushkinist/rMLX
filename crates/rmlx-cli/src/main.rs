@@ -1019,12 +1019,19 @@ enum Cmd {
         /// set.
         #[arg(long, visible_alias = "ctx-max")]
         max_ctx: Option<u32>,
-        /// Truncate the tokenized prompt to at most this many tokens (CPU forward
-        /// is O(N^2), so a cap guards against pathological bench times). Defaults
-        /// to the built-in cap; raise it to bench longer contexts (e.g. 128k).
-        /// Must be >= 1.
-        #[arg(long, value_name = "N", default_value_t = commands::baseline::MAX_PROMPT_TOKENS)]
-        max_prompt_tokens: usize,
+        /// Truncate the tokenized prompt to at most this many tokens. Defaults to
+        /// the built-in cap (65536). Passing this flag explicitly opts into
+        /// truncation on `--device gpu`; raise it to bench longer contexts
+        /// (e.g. 128k) without truncation. Must be >= 1.
+        #[arg(long, value_name = "N")]
+        max_prompt_tokens: Option<usize>,
+        /// Opt into silently truncating a too-long prompt to the default
+        /// `--max-prompt-tokens` cap on `--device gpu` instead of erroring.
+        /// `--device cpu` always truncates (real O(N^2) forward cost) regardless
+        /// of this flag. Has no effect when `--max-prompt-tokens` is passed
+        /// explicitly (that is itself an opt-in to truncation).
+        #[arg(long, default_value_t = false)]
+        allow_truncate: bool,
         /// Free-form label stamped into the metrics record's `notes` column
         /// (used by the bench harness to group cells under a campaign name).
         #[arg(long)]
@@ -1903,6 +1910,7 @@ fn main() -> Result<()> {
             kv_group_size,
             max_ctx,
             max_prompt_tokens,
+            allow_truncate,
             label: bench_label,
             record,
             git_sha,
@@ -1910,7 +1918,10 @@ fn main() -> Result<()> {
             yarn_factor,
             yarn_original_max,
         } => {
-            let max_prompt_tokens = parse_max_prompt_tokens(max_prompt_tokens)?;
+            let cap_is_explicit = max_prompt_tokens.is_some();
+            let max_prompt_tokens = parse_max_prompt_tokens(
+                max_prompt_tokens.unwrap_or(commands::baseline::MAX_PROMPT_TOKENS),
+            )?;
             // --kv-preset pre-resolution. resolve_preset_arg runs the
             // auto-selector for KvPresetArg::Auto.
             let (dev, kv_quant_resolved, max_ctx_override) = if let Some(preset_arg) = kv_preset {
@@ -2034,6 +2045,8 @@ fn main() -> Result<()> {
                 Some(kv_quant_resolved),
                 max_ctx_override,
                 max_prompt_tokens,
+                cap_is_explicit,
+                allow_truncate,
                 yarn_override,
                 &sink,
                 record_args,
