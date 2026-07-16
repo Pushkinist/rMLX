@@ -25,10 +25,17 @@
 # the real-model smoke cover.
 #
 # The Metal compiler ships with full Xcode, not the Command Line Tools, so it is
-# absent on many dev/CI boxes. When it is missing the gate skips rather than
-# fails.
+# absent on a Command-Line-Tools-only dev box. When it is missing the gate skips
+# rather than fails.
 #
-# Exit 0 = all compiled (or skipped). Exit 1 = a kernel failed to compile.
+# `--strict` turns a missing compiler into a hard failure. CI passes it: the
+# GitHub macOS runner ships full Xcode, so a skip there would mean the gate
+# silently protected nothing. Compiling `.metal` needs the toolchain, not a GPU,
+# so this gate runs for real in CI even though the runner has no usable Metal
+# device. Detection and enforcement stay in one place so the two cannot drift.
+#
+# Exit 0 = all compiled (or skipped). Exit 1 = a kernel failed to compile, or
+# --strict and the Metal compiler is missing.
 
 set -uo pipefail
 
@@ -37,7 +44,21 @@ METAL_DIR="${REPO_ROOT}/crates/rmlx-kv-quant/src/metal"
 PROBE_DIR="${METAL_DIR}/probes"
 MANIFEST="${PROBE_DIR}/kernels.manifest"
 
+STRICT=0
+for arg in "$@"; do
+    case "${arg}" in
+        --strict) STRICT=1 ;;
+        *) echo "usage: $(basename "$0") [--strict]" >&2; exit 2 ;;
+    esac
+done
+
 if ! command -v xcrun >/dev/null 2>&1 || ! xcrun -sdk macosx -f metal >/dev/null 2>&1; then
+    if [ "${STRICT}" = 1 ]; then
+        echo "ERROR: --strict: Metal compiler not found (xcrun -sdk macosx -f metal)." >&2
+        echo "       Refusing to pass by skipping. This needs full Xcode, not just the" >&2
+        echo "       Command Line Tools: 'xcode-select -s /Applications/Xcode.app'." >&2
+        exit 1
+    fi
     echo "SKIP: Metal compiler not found (needs full Xcode, not just the Command Line Tools);"
     echo "      MSL compile gate not run. Install Xcode + 'xcode-select -s /Applications/Xcode.app'."
     exit 0

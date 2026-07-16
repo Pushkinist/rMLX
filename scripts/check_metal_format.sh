@@ -10,14 +10,28 @@
 # Command Line Tools and is reachable via `xcrun -f clang-format`. Some machines
 # instead have it from `brew install clang-format` / `brew install llvm`. Both
 # are accepted; when neither is present the gate skips rather than fails, since
-# toolchain availability varies across dev and CI machines.
+# toolchain availability varies across dev machines.
 #
-# Exit 0 = clean (or skipped). Exit 1 = a file needs reformatting.
+# `--strict` turns a missing clang-format into a hard failure. CI passes it: the
+# runner has the toolchain, so a skip there would mean the gate silently
+# protected nothing. Detection and enforcement stay in one place so the two
+# cannot drift.
+#
+# Exit 0 = clean (or skipped). Exit 1 = a file needs reformatting, or --strict
+# and clang-format is missing.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 METAL_DIR="${REPO_ROOT}/crates/rmlx-kv-quant/src/metal"
+
+STRICT=0
+for arg in "$@"; do
+    case "${arg}" in
+        --strict) STRICT=1 ;;
+        *) echo "usage: $(basename "$0") [--strict]" >&2; exit 2 ;;
+    esac
+done
 
 # Resolve clang-format: PATH first, then the Command Line Tools copy.
 CLANG_FORMAT=""
@@ -28,6 +42,12 @@ elif command -v xcrun >/dev/null 2>&1 && xcrun -f clang-format >/dev/null 2>&1; 
 fi
 
 if [ -z "${CLANG_FORMAT}" ]; then
+    if [ "${STRICT}" = 1 ]; then
+        echo "ERROR: --strict: clang-format not found (neither on PATH nor via xcrun -f)." >&2
+        echo "       Refusing to pass by skipping. Install it ('brew install clang-format'" >&2
+        echo "       or the Xcode Command Line Tools) or drop --strict." >&2
+        exit 1
+    fi
     echo "SKIP: clang-format not found (PATH or xcrun); MSL format gate not run."
     echo "      Install with 'brew install clang-format' or the Xcode Command Line Tools."
     exit 0

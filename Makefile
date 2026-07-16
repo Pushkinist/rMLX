@@ -166,11 +166,16 @@ check-no-inline-tests: ## CI gate: fail if any non-test.rs file has inline #[cfg
 check-no-scalar-f32-leak: ## CI gate: fail if arch-layer code has unguarded scalar_f32( not followed by .astype(
 	@bash scripts/check_no_scalar_f32_leak.sh
 
-check-metal-compiles: ## CI gate: every KV .metal kernel compiles natively (skips without the Xcode Metal toolchain)
-	@bash scripts/check_metal_compiles.sh
+# METAL_STRICT=--strict turns a missing toolchain into a hard failure instead of
+# a skip. CI sets it (the macOS runner ships the toolchain, so a skip there would
+# mean the gate protected nothing); local runs leave it empty and skip.
+METAL_STRICT ?=
 
-check-metal-format: ## CI gate: every KV .metal kernel is clang-format clean (skips without clang-format)
-	@bash scripts/check_metal_format.sh
+check-metal-compiles: ## CI gate: every KV .metal kernel compiles natively (skips without the Xcode Metal toolchain; METAL_STRICT=--strict to require it)
+	@bash scripts/check_metal_compiles.sh $(METAL_STRICT)
+
+check-metal-format: ## CI gate: every KV .metal kernel is clang-format clean (skips without clang-format; METAL_STRICT=--strict to require it)
+	@bash scripts/check_metal_format.sh $(METAL_STRICT)
 
 # ---- one-shot CI gate -------------------------------------------------
 ci: fmt-check lint test deny audit ci-metrics ## full pre-merge gate: fmt + clippy + test + deny + audit + metrics-sanity + inline-test + MSL gates

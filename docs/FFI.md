@@ -589,16 +589,25 @@ runtime.
 Adding a KV codec means adding a `.metal` decode kernel and a native compile
 test; see CLAUDE.md hard rule 10.
 
-### MSL gates (`make ci`)
+### MSL gates (`make ci`, enforced in CI)
 
-Two gates run over `crates/rmlx-kv-quant/src/metal/*.metal`. Both skip
-gracefully when their tool is absent, since toolchain availability varies
-across dev and CI machines.
+Two gates run over `crates/rmlx-kv-quant/src/metal/*.metal`.
 
 | Target | Tool | Checks |
 |---|---|---|
 | `make check-metal-compiles` | `xcrun -sdk macosx metal` (full Xcode, not just the Command Line Tools) | Every KV kernel compiles natively, so an MSL syntax error surfaces at CI instead of on first GPU dispatch. |
-| `make check-metal-format` | `clang-format` (on `PATH` or via `xcrun -f clang-format`) | Every KV kernel is clang-format clean. MSL is a C++14 dialect; style is pinned by `src/metal/.clang-format`. |
+| `make check-metal-format` | `clang-format` (on `PATH` or via `xcrun -f clang-format` — it is not on `PATH` by default) | Every KV kernel is clang-format clean. MSL is a C++14 dialect; style is pinned by `src/metal/.clang-format`. |
+
+**Where they actually run.** Both gates skip when their tool is missing, so a
+Command-Line-Tools-only box is not blocked — but a skipping gate protects
+nothing, so the skip is local-only. The `msl` job in
+`.github/workflows/ci.yml` runs both with `METAL_STRICT=--strict`, which turns
+a missing tool into a hard failure. The GitHub macOS runner ships full Xcode,
+so the compile gate runs for real there; compiling MSL needs the toolchain,
+not a GPU, so it works on a runner with no usable Metal device. Install full
+Xcode (`xcode-select -s /Applications/Xcode.app`) to run the compile gate
+locally too — on Xcode 16.3+ the compiler is a separate component
+(`xcodebuild -downloadComponent MetalToolchain`).
 
 `check-metal-compiles` cannot compile a `.metal` file directly — a body is a
 run of statements at file scope, not a translation unit. It assembles a probe

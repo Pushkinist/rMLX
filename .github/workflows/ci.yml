@@ -2,7 +2,9 @@
 #
 # `fmt` is link-free and always reliable. `build` needs the MLX / mlx-c
 # libraries (rMLX links the stable mlx-c C ABI; it does not vendor MLX), so it
-# installs them via Homebrew and points the build at the cellar prefix.
+# installs them via Homebrew and points the build at the cellar prefix. `msl`
+# needs neither Rust nor mlx-c — only the Metal toolchain the runner already
+# ships — so it stays a seconds-long standalone check.
 name: CI
 
 on:
@@ -11,7 +13,7 @@ on:
   pull_request:
     branches: [main]
 
-# Both jobs only check out the repo and compile — no PR comments, no releases,
+# Every job only checks out the repo and compiles — no PR comments, no releases,
 # no package writes. Pinning least-privilege here rather than relying on the
 # repo-level default keeps the scope explicit, survives the workflow being
 # copied, and does not silently widen if that default is ever changed.
@@ -31,6 +33,46 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
+
+  msl:
+    name: msl kernels (compile + format)
+    # macos-14 ships full Xcode, so the Metal compiler is available here (see the
+    # toolchain step) even though a Command-Line-Tools-only dev box has none.
+    # Compiling `.metal` needs the toolchain, not a GPU — so this gate runs for
+    # real on a runner with no usable Metal device. This is the job that makes
+    # MSL syntax errors surface at CI instead of on first GPU dispatch.
+    #
+    # No Rust toolchain and no mlx-c: both gates are bash + xcrun over the
+    # checked-in .metal files, so this job stays seconds-long and reports as its
+    # own named check.
+    runs-on: macos-14 # Apple Silicon; full Xcode
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # Xcode 16.3+ unbundled the Metal compiler into a downloadable component,
+      # so "full Xcode" no longer guarantees `xcrun metal`. Fetch it when it is
+      # missing, then assert it resolved: this job exists to compile MSL, so a
+      # missing compiler must fail here rather than quietly degrade.
+      - name: Ensure Metal toolchain
+        run: |
+          if ! xcrun -sdk macosx -f metal >/dev/null 2>&1; then
+            echo "Metal compiler absent — downloading the Metal toolchain component."
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun -sdk macosx -f metal \
+            || { echo "::error::Metal compiler unavailable; MSL gate cannot run"; exit 1; }
+      - name: Show toolchain
+        run: |
+          xcode-select -p
+          xcrun -sdk macosx metal --version 2>&1 | head -2 || true
+          "$(xcrun -f clang-format)" --version
+      # METAL_STRICT=--strict makes a missing toolchain a hard failure. Without
+      # it both gates skip when their tool is absent, which is correct locally
+      # and wrong here: on this runner the tools exist, so a skip would mean the
+      # gate silently passed without checking anything.
+      - name: .metal clang-format clean (strict)
+        run: make check-metal-format METAL_STRICT=--strict
+      - name: .metal kernels compile natively (strict)
+        run: make check-metal-compiles METAL_STRICT=--strict
 
   build:
     name: build + clippy
