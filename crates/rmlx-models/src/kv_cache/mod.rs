@@ -60,6 +60,10 @@ use rmlx_kv_quant::KvQuant;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+#[path = "metrics_identity_tests.rs"]
+mod metrics_identity_tests;
+
 // ── Public constant ───────────────────────────────────────────────────────────
 
 // `KV_MAX_SEQ_DEFAULT` lives in `rmlx_kv_quant::quant`.

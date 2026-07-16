@@ -95,6 +95,13 @@ pub struct RunRecord {
     /// Model namespace from the whitelist (e.g. `"mlx-community"`).
     pub model_namespace: String,
     /// Model repository name within the namespace.
+    ///
+    /// `model_id` is accepted as a deserialize alias for this field: the
+    /// canonical §8.5 wire key is `model` (see `docs/METRICS_DB.md` §8.5),
+    /// but the recorder tolerates a `model_id`-keyed record too, so a
+    /// differently-named emitter does not silently drop into
+    /// `metrics/buffer/failed/`.
+    #[serde(alias = "model_id")]
     pub model: String,
     /// Canonical weight quantization string (e.g. `"mxfp8"`, `"8bit"`).
     pub weight_quant: String,

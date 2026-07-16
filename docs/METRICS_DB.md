@@ -474,7 +474,9 @@ Lowercase, no spaces. Match the cell-naming convention in `BENCHMARK_CHAMPIONS.m
 
 ### 5.3 `kv_quant` canonicalization
 
-Match runtime flag. `none` (no KV quant), `k8v4`, `k8v8`, `planar`, `turbo4`, `turbo8`. Lowercase.
+Match runtime flag (`--kv-quant`), lowercase. Every `<KvQuant as Display>` token from `crates/rmlx-kv-quant/src/quant.rs` is accepted: the 25 unit-variant forms (`none`, `k8v4`, `k8v8`, `planar`, `planar3`, `planar_k`, `k8vturbo3`, `k8vturbo3tcq`, `k8vturbo2`, `k8vturbo2tcq`, `tsym3`, `tsym4`, `iso3`, `iso4`, `iso3_sym`, `iso4_sym`, `k_iso3`, `k_iso4`, `rotor3`, `rotor4`, `rotor3_sym`, `rotor4_sym`, `k_rotor3`, `k_rotor4`, `rot_k_tq4v`), the payload-bearing forms parsed structurally (`mixed_k<kb>g<kg>_v<vb>g<vg>`, `rot_k_v<vb>g<vg>`, `rotor_k_<3|4>_asym_v<vb>_g<vg>`), plus the aliases `bf16`/`f16` → `none`, `rotor_v_3`/`rotor_v_4` → `rotor3`/`rotor4`, and the legacy labels `turbo4`/`turbo8`.
+
+**Drift guard.** `rmlx-metrics` must not depend on `rmlx-kv-quant` (Ask-before dep edge — see CLAUDE.md workspace dep graph), so `rmlx_metrics::identity::canonicalize_kv_quant` hand-mirrors this grammar as plain string matching instead of importing the `KvQuant` enum. `rmlx-models` (the one crate depending on both) carries a test — `crates/rmlx-models/src/kv_cache/metrics_identity_tests.rs` — that builds one instance of every `KvQuant` variant via `KvQuant::one_of_each_variant()` and asserts the metrics-side mirror accepts each `Display` form. Adding a `KvQuant` variant without updating `is_valid_kv_quant_token` in `crates/rmlx-metrics/src/identity.rs` fails that test.
 
 ### 5.4 `backend` whitelist
 
@@ -910,7 +912,7 @@ Single JSON object per run. The recorder fans out into N `observations` rows (on
 |-------------------|----------------------------------------------------------|
 | `backend`         | PK column, must be in §5.4 whitelist                     |
 | `model_namespace` | PK column, must be in §5.1 whitelist                     |
-| `model`           | PK column                                                |
+| `model`           | PK column. `model_id` accepted as a deserialize alias    |
 | `weight_quant`    | PK column                                                |
 | `kv_quant`        | PK column                                                |
 | `ctx_max`         | PK column                                                |

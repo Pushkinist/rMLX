@@ -388,3 +388,118 @@ fn builder_rejects_a_record_ingest_would_reject() {
     .unwrap_err();
     assert!(matches!(err, Error::NoMeasurements), "got {err:?}");
 }
+
+// ── kv_quant allow-list coverage (all codecs, full record ingest) ────────────
+
+/// A full record ingests (not just `canonicalize_kv_quant` in isolation) for
+/// every one of the 25 unit-variant `KvQuant` Display tokens. Reproduces the
+/// real-world drop: rotation/sym/planar/turbo codec rows were rejected at
+/// `RunRecord::validate()`, not just at the bare string-canonicalize call.
+#[test]
+fn record_ingests_for_every_unit_variant_kv_quant_codec() {
+    let tokens = [
+        "none",
+        "k8v4",
+        "k8v8",
+        "planar",
+        "planar3",
+        "planar_k",
+        "k8vturbo3",
+        "k8vturbo3tcq",
+        "k8vturbo2",
+        "k8vturbo2tcq",
+        "tsym3",
+        "tsym4",
+        "iso3",
+        "iso4",
+        "iso3_sym",
+        "iso4_sym",
+        "k_iso3",
+        "k_iso4",
+        "rotor3",
+        "rotor4",
+        "rotor3_sym",
+        "rotor4_sym",
+        "k_rotor3",
+        "k_rotor4",
+        "rot_k_tq4v",
+    ];
+    assert_eq!(
+        tokens.len(),
+        25,
+        "keep in sync with the 25 unit KvQuant variants"
+    );
+    for token in tokens {
+        let mut r = valid_record();
+        r.kv_quant = token.to_string();
+        r.validate()
+            .unwrap_or_else(|e| panic!("kv_quant {token:?} rejected: {e}"));
+    }
+}
+
+/// Payload-bearing `KvQuant` Display forms also ingest end-to-end.
+#[test]
+fn record_ingests_for_payload_bearing_kv_quant_codecs() {
+    for token in [
+        "mixed_k8g128_v4g64",
+        "rot_k_v4g64",
+        "rotor_k_3_asym_v4_g128",
+        "rotor_k_4_asym_v3_g64",
+    ] {
+        let mut r = valid_record();
+        r.kv_quant = token.to_string();
+        r.validate()
+            .unwrap_or_else(|e| panic!("kv_quant {token:?} rejected: {e}"));
+    }
+}
+
+// ── §8.5 CBB record shape (`model` / `model_id` tolerance) ───────────────────
+
+/// A record shaped exactly like the CBB cross-backend §8.5 emitter (see
+/// `../Cross-Backend-Bench/runners/_common.py::_build_metrics_record`)
+/// deserializes and ingests cleanly.
+#[test]
+fn cbb_shaped_record_with_model_field_ingests() {
+    let json_str = r#"{
+        "backend": "rmlx",
+        "backend_version": "0.2.8",
+        "model_namespace": "prism-ml",
+        "model": "Ternary-Bonsai-8B-mlx-2bit",
+        "weight_quant": "2bit",
+        "kv_quant": "none",
+        "ctx_max": 8192,
+        "prompt": {"name": "longctx_4k", "tokens_approx": 4096, "body": "hi"},
+        "ts_utc": "2026-05-10T07:30:00Z",
+        "git_sha": null,
+        "build_profile": null,
+        "hardware_tag": "m5_max_128gb",
+        "notes": "cbb-runner",
+        "metrics": [{"name": "decode_tps_warm", "value": 100.0}]
+    }"#;
+    let r: RunRecord = serde_json::from_str(json_str).unwrap();
+    r.validate().unwrap();
+}
+
+/// A record using `model_id` instead of the canonical `model` key (a shape a
+/// future or foreign emitter could plausibly send) still ingests — the
+/// ingest tolerates the alias rather than silently landing in
+/// `metrics/buffer/failed/`.
+#[test]
+fn record_with_model_id_alias_ingests() {
+    let json_str = r#"{
+        "backend": "rmlx",
+        "backend_version": "0.2.8",
+        "model_namespace": "prism-ml",
+        "model_id": "Ternary-Bonsai-8B-mlx-2bit",
+        "weight_quant": "2bit",
+        "kv_quant": "none",
+        "ctx_max": 8192,
+        "prompt": {"name": "longctx_4k", "tokens_approx": 4096, "body": "hi"},
+        "ts_utc": "2026-05-10T07:30:00Z",
+        "hardware_tag": "m5_max_128gb",
+        "metrics": [{"name": "decode_tps_warm", "value": 100.0}]
+    }"#;
+    let r: RunRecord = serde_json::from_str(json_str).unwrap();
+    assert_eq!(r.model, "Ternary-Bonsai-8B-mlx-2bit");
+    r.validate().unwrap();
+}

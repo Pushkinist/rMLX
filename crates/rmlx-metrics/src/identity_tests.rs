@@ -234,3 +234,85 @@ fn canonicalize_kv_quant_malformed_mixed_errors() {
     assert!(canonicalize_kv_quant("mixed_k8_v4").is_err());
     assert!(canonicalize_kv_quant("mixed_x8g64_v4g64").is_err());
 }
+
+/// Every unit-variant `<KvQuant as Display>` token accepted without
+/// rejection (issue: the drainer allow-list was a stale hand-maintained
+/// mirror missing the rotation/sym/planar/turbo families). One entry per
+/// unit variant declared in `crates/rmlx-kv-quant/src/quant.rs`, excluding
+/// the four payload-bearing variants (`Mixed`, `RotK`, `RotorK3Asym`,
+/// `RotorK4Asym`) covered separately below.
+#[test]
+fn canonicalize_kv_quant_accepts_all_unit_variant_tokens() {
+    let tokens = [
+        "none",
+        "k8v4",
+        "k8v8",
+        "planar",
+        "planar3",
+        "planar_k",
+        "k8vturbo3",
+        "k8vturbo3tcq",
+        "k8vturbo2",
+        "k8vturbo2tcq",
+        "tsym3",
+        "tsym4",
+        "iso3",
+        "iso4",
+        "iso3_sym",
+        "iso4_sym",
+        "k_iso3",
+        "k_iso4",
+        "rotor3",
+        "rotor4",
+        "rotor3_sym",
+        "rotor4_sym",
+        "k_rotor3",
+        "k_rotor4",
+        "rot_k_tq4v",
+    ];
+    assert_eq!(
+        tokens.len(),
+        25,
+        "keep in sync with the 25 unit KvQuant variants"
+    );
+    for token in tokens {
+        assert_eq!(
+            canonicalize_kv_quant(token).unwrap_or_else(|e| panic!("{token} rejected: {e}")),
+            token,
+            "token {token} did not canonicalize to itself"
+        );
+    }
+}
+
+/// The four payload-bearing `KvQuant` Display forms parse structurally
+/// (bits/group digits), mirroring `RotK` / `RotorK3Asym` / `RotorK4Asym`
+/// which the pre-fix allow-list did not accept at all.
+#[test]
+fn canonicalize_kv_quant_accepts_payload_variant_samples() {
+    for token in [
+        "mixed_k8g128_v4g64",
+        "rot_k_v4g64",
+        "rot_k_v8g128",
+        "rotor_k_3_asym_v4_g128",
+        "rotor_k_4_asym_v3_g64",
+    ] {
+        assert_eq!(
+            canonicalize_kv_quant(token).unwrap_or_else(|e| panic!("{token} rejected: {e}")),
+            token
+        );
+    }
+}
+
+#[test]
+fn canonicalize_kv_quant_rotor_v_alias_canonicalizes() {
+    assert_eq!(canonicalize_kv_quant("rotor_v_3").unwrap(), "rotor3");
+    assert_eq!(canonicalize_kv_quant("rotor_v_4").unwrap(), "rotor4");
+}
+
+#[test]
+fn canonicalize_kv_quant_malformed_rot_k_and_rotor_k_asym_errors() {
+    assert!(canonicalize_kv_quant("rot_k_v4").is_err());
+    assert!(canonicalize_kv_quant("rot_k_vxg64").is_err());
+    assert!(canonicalize_kv_quant("rotor_k_5_asym_v4_g128").is_err());
+    assert!(canonicalize_kv_quant("rotor_k_3_asym_v4g128").is_err());
+}

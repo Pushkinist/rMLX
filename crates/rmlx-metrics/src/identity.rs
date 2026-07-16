@@ -269,11 +269,24 @@ pub const WEIGHT_QUANT_WHITELIST: &[&str] = &[
 
 /// Validate (and canonicalize) a `kv_quant` column value.
 ///
-/// Replaces the fixed `KV_QUANT_WHITELIST` lookup. Accepts:
+/// Replaces the fixed `KV_QUANT_WHITELIST` lookup. Accepts every token the
+/// canonical `<KvQuant as Display>` / `<KvQuant as FromStr>` grammar in
+/// `rmlx-kv-quant` can produce or parse:
 ///
-/// * the canonical Display forms emitted by `<KvQuant as Display>` —
-///   `"none"`, `"k8v4"`, `"k8v8"`, `"planar"`, and the long-form
-///   `"mixed_k<kb>g<kg>_v<vb>g<vg>"` (e.g. `"mixed_k8g128_v4g64"`).
+/// * the unit-variant Display forms — `"none"`, `"k8v4"`, `"k8v8"`,
+///   `"planar"`, `"planar3"`, `"planar_k"`, `"k8vturbo3"`, `"k8vturbo2"`,
+///   `"k8vturbo3tcq"`, `"k8vturbo2tcq"`, `"tsym3"`, `"tsym4"`, `"iso3"`,
+///   `"iso4"`, `"iso3_sym"`, `"iso4_sym"`, `"k_iso3"`, `"k_iso4"`, `"rotor3"`,
+///   `"rotor4"`, `"rotor3_sym"`, `"rotor4_sym"`, `"k_rotor3"`, `"k_rotor4"`,
+///   `"rot_k_tq4v"`.
+/// * the alias `"rotor_v_3"` / `"rotor_v_4"`, which canonicalize to
+///   `"rotor3"` / `"rotor4"`.
+/// * the payload-bearing Display forms, parsed structurally (bits/group
+///   digits only — the same "smoke-check ranges, don't re-validate
+///   semantics" stance the pre-existing `mixed_*` matcher took, since the
+///   real range checks live in `KvQuant::from_str` / `validate_resolved`):
+///   `"mixed_k<kb>g<kg>_v<vb>g<vg>"`, `"rot_k_v<vb>g<vg>"`,
+///   `"rotor_k_3_asym_v<vb>_g<vg>"`, `"rotor_k_4_asym_v<vb>_g<vg>"`.
 /// * the aliases `"bf16"` and `"f16"`, which canonicalize to `"none"`.
 /// * the legacy historical labels `"turbo4"` and `"turbo8"` (preserved
 ///   verbatim for backward-compat with legacy-ingested rows).
@@ -285,7 +298,7 @@ pub fn canonicalize_kv_quant(value: &str) -> Result<String> {
         return Ok(lower);
     }
     if is_valid_kv_quant_token(&lower) {
-        // Re-emit through the same matcher to canonicalize aliases (bf16/f16 → none).
+        // Re-emit through the same matcher to canonicalize aliases (bf16/f16 → none, rotor_v_* → rotor*).
         return Ok(canonicalize_kv_quant_token(&lower));
     }
     Err(Error::IdentityNotInWhitelist {
@@ -296,7 +309,17 @@ pub fn canonicalize_kv_quant(value: &str) -> Result<String> {
             "k8v4".to_string(),
             "k8v8".to_string(),
             "planar".to_string(),
+            "planar3".to_string(),
+            "planar_k".to_string(),
+            "k8vturbo2".to_string(),
+            "k8vturbo3".to_string(),
+            "tsym3/tsym4".to_string(),
+            "iso3/iso4/iso3_sym/iso4_sym/k_iso3/k_iso4".to_string(),
+            "rotor3/rotor4/rotor3_sym/rotor4_sym/k_rotor3/k_rotor4".to_string(),
+            "rot_k_tq4v".to_string(),
             "mixed_k<kb>g<kg>_v<vb>g<vg>".to_string(),
+            "rot_k_v<vb>g<vg>".to_string(),
+            "rotor_k_<3|4>_asym_v<vb>_g<vg>".to_string(),
             "turbo4".to_string(),
             "turbo8".to_string(),
         ],
@@ -304,22 +327,36 @@ pub fn canonicalize_kv_quant(value: &str) -> Result<String> {
 }
 
 /// Pure-string validator for a kv_quant token (lower-case). Mirrors the
-/// grammar in `<KvQuant as FromStr>` without importing `rmlx-models` (which
-/// would pull the MLX-bound types into the metrics crate). Update both in
-/// lockstep when the canonical grammar changes.
+/// grammar in `<KvQuant as FromStr>` (`crates/rmlx-kv-quant/src/quant.rs`)
+/// without importing `rmlx-kv-quant` (which would pull the MLX-bound types
+/// into the metrics crate). Update both in lockstep when the canonical
+/// grammar changes — the drift guard in `rmlx-models` (the one crate that
+/// depends on both this crate and `rmlx-kv-quant`) fails CI if this mirror
+/// falls behind.
 fn is_valid_kv_quant_token(lower: &str) -> bool {
     match lower {
-        "none" | "bf16" | "f16" | "k8v4" | "k8v8" | "planar" => true,
+        "none" | "bf16" | "f16" | "k8v4" | "k8v8" | "planar" | "planar3" | "planar_k"
+        | "k8vturbo3" | "k8vturbo2" | "k8vturbo3tcq" | "k8vturbo2tcq" | "tsym3" | "tsym4"
+        | "iso3" | "iso4" | "iso3_sym" | "iso4_sym" | "k_iso3" | "k_iso4" | "rotor3" | "rotor4"
+        | "rotor_v_3" | "rotor_v_4" | "rotor3_sym" | "rotor4_sym" | "k_rotor3" | "k_rotor4"
+        | "rot_k_tq4v" => true,
         s if s.starts_with("mixed_") => parse_mixed_token(s).is_some(),
+        s if s.starts_with("rot_k_v") => parse_rot_k_token(s).is_some(),
+        s if s.starts_with("rotor_k_3_asym_") || s.starts_with("rotor_k_4_asym_") => {
+            parse_rotor_k_asym_token(s).is_some()
+        }
         _ => false,
     }
 }
 
-/// Canonicalize a validated lower-case token to its Display form
-/// (`bf16`/`f16` → `none`; everything else passes through).
+/// Canonicalize a validated lower-case token to its Display form (`bf16`/
+/// `f16` → `none`, `rotor_v_3`/`rotor_v_4` → `rotor3`/`rotor4`; everything
+/// else passes through).
 fn canonicalize_kv_quant_token(lower: &str) -> String {
     match lower {
         "bf16" | "f16" => "none".to_string(),
+        "rotor_v_3" => "rotor3".to_string(),
+        "rotor_v_4" => "rotor4".to_string(),
         other => other.to_string(),
     }
 }
@@ -341,6 +378,32 @@ fn parse_side(spec: &str, prefix: char) -> Option<(u8, u16)> {
     let bits: u8 = bits.parse().ok()?;
     let group: u16 = group.parse().ok()?;
     Some((bits, group))
+}
+
+/// Returns `Some(())` iff `s` matches `rot_k_v<u8>g<u16>` (the `KvQuant::RotK`
+/// Display form — K-side rotation + affine V, no `_` between the bits and
+/// group digits).
+fn parse_rot_k_token(s: &str) -> Option<()> {
+    let rest = s.strip_prefix("rot_k_v")?;
+    let (bits, group) = rest.split_once('g')?;
+    let _: u8 = bits.parse().ok()?;
+    let _: u16 = group.parse().ok()?;
+    Some(())
+}
+
+/// Returns `Some(())` iff `s` matches
+/// `rotor_k_<3|4>_asym_v<u8>_g<u16>` (the `RotorK3Asym`/`RotorK4Asym`
+/// Display form — note the `_` between the bits and group digits, unlike
+/// `mixed_*` / `rot_k_v*`).
+fn parse_rotor_k_asym_token(s: &str) -> Option<()> {
+    let rest = s
+        .strip_prefix("rotor_k_3_asym_")
+        .or_else(|| s.strip_prefix("rotor_k_4_asym_"))?;
+    let rest = rest.strip_prefix('v')?;
+    let (bits, group) = rest.split_once("_g")?;
+    let _: u8 = bits.parse().ok()?;
+    let _: u16 = group.parse().ok()?;
+    Some(())
 }
 
 /// Normalize well-known backend aliases to their canonical form before
