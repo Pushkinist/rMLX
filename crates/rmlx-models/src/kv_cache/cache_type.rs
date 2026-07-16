@@ -838,7 +838,7 @@ pub enum ResolveError {
 
     // The former `SharedKvIncompatibleWithMixed` variant was removed.
     // Gemma3 / Gemma4 cross-layer KV sharing now supports `Mixed` via
-    // dequant-before-share in `KvCache::update_and_sdpa_returning_kv`,
+    // dequant-before-share in `KvCache::update_and_sdpa_shared_source`,
     // so the combination is valid.
     /// No defined `KvQuant` mapping for this `(K, V)` tuple.
     ///
@@ -1528,7 +1528,7 @@ fn is_qwen_moe(arch: &str) -> bool {
 /// changes cannot bypass the invariant.
 ///
 /// The former guard that rejected `Mixed` on Gemma3 / Gemma4 (cross-layer KV
-/// sharing) was removed. `KvCache::update_and_sdpa_returning_kv` supports
+/// sharing) was removed. `KvCache::update_and_sdpa_shared_source` supports
 /// `Mixed` via dequant-before-share — it surfaces the accumulated bf16 K/V
 /// (prefill-raw during prefill, maintained `decode_fp16` during decode) to
 /// the shared-KV consumer layers.

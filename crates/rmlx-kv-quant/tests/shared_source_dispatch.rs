@@ -1,12 +1,12 @@
-// GPU integration test: `update_and_sdpa_returning_kv` dispatch chain.
+// GPU integration test: `update_and_sdpa_shared_source` dispatch chain.
 //
-// Drives the public `KvCache::update_and_sdpa_returning_kv` path (Gemma4's
+// Drives the public `KvCache::update_and_sdpa_shared_source` path (Gemma4's
 // entry point) with K8V4 storage, head_dim=128. Asserts:
 //
 //   1. `RMLX_TURBO_FLASH=1` + `RMLX_TURBO_FLASH_MIN=0` (zero threshold so
 //      TurboFlash fires on a short kv_seq):
 //      a. `turbo_flash_dispatch_count()` delta > 0 after a decode step (the
-//         kernel actually fired on the returning_kv path, not just gated).
+//         kernel actually fired on the shared-KV producer path, not just gated).
 //      b. The bf16 K surfaced to the consumer is byte-identical to slicing
 //         `decode_fp16_k` — proving the dispatch path surfaced the mirror
 //         rather than a flash-transformed K.
@@ -14,12 +14,12 @@
 //   2. `RMLX_TURBO_FLASH=0` (control group):
 //      Same prefill + decode; dispatch delta == 0 (gate correctly suppressed).
 //
-// `RMLX_RETURNING_KV_STRICT=1` — strict mode (used by CI):
+// `RMLX_SHARED_SOURCE_STRICT=1` — strict mode (used by CI):
 //   * When env=ON and delta == 0, panic instead of skip.
 //   * When the dispatch errors, panic instead of skip.
 //
 // `#[ignore]` because it needs the Metal GPU. Run via:
-//   cargo test -p rmlx-kv-quant --test returning_kv_dispatch -- --ignored --test-threads=1
+//   cargo test -p rmlx-kv-quant --test shared_source_dispatch -- --ignored --test-threads=1
 //
 // Preflight: `pkill -f "rmlx serve" || true; rm -f /tmp/rmlx.*.claim`.
 // CLAUDE.md hard rule 8 (single MLX process): integration runner serialises
@@ -36,8 +36,27 @@
 )]
 
 use rmlx_kv_quant::turbo_flash_msl::turbo_flash_dispatch_count;
-use rmlx_kv_quant::{KvCache, KvQuant};
+use rmlx_kv_quant::{KvCache, KvQuant, SharedKv};
 use rmlx_mlx::{Array, Device, Dtype};
+
+/// Unwrap a producer's share into `(out, K, V)`.
+///
+/// K8V4 / `None` storage has no fused-over-store arm (TurboFlash and fused-QK
+/// both maintain the bf16 mirror), so the share here is always bf16. A `Store`
+/// share would mean a dispatch gate regressed.
+#[allow(
+    clippy::panic,
+    reason = "test helper: a Store share on a K8V4/None cache is a gate regression, and must fail the test loudly"
+)]
+fn split_bf16_share(pair: (Array, SharedKv)) -> (Array, Array, Array) {
+    let (out, share) = pair;
+    match share {
+        SharedKv::Bf16(k, v) => (out, k, v),
+        SharedKv::Store { .. } => {
+            panic!("expected a bf16 share — K8V4/None maintain the bf16 mirror")
+        }
+    }
+}
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -73,7 +92,7 @@ fn skip_if_no_gpu() -> bool {
 }
 
 fn is_strict() -> bool {
-    std::env::var("RMLX_RETURNING_KV_STRICT").as_deref() == Ok("1")
+    std::env::var("RMLX_SHARED_SOURCE_STRICT").as_deref() == Ok("1")
 }
 
 // ── test parameters ───────────────────────────────────────────────────────────
@@ -86,7 +105,7 @@ const HEAD_DIM: i32 = 128;
 const PREFILL_SEQ: i32 = 64;
 const MAX_SEQ: i32 = 4096;
 
-/// Build a K8V4 cache prefilled with 64 tokens via `update_and_sdpa_returning_kv`.
+/// Build a K8V4 cache prefilled with 64 tokens via `update_and_sdpa_shared_source`.
 fn build_prefilled_cache(
     device: Device,
     prefill_k: &Array,
@@ -97,10 +116,10 @@ fn build_prefilled_cache(
     let mut cache = KvCache::with_quant_max_seq(KvQuant::K8V4, MAX_SEQ);
     cache.enter_prefill();
     let _ = cache
-        .update_and_sdpa_returning_kv(
+        .update_and_sdpa_shared_source(
             prefill_q, prefill_k, prefill_v, scale, "causal", None, device,
         )
-        .expect("prefill returning_kv");
+        .expect("prefill shared source");
     cache.exit_prefill(device).expect("exit_prefill");
     assert_eq!(cache.offset(), PREFILL_SEQ, "cache offset after prefill");
     cache
@@ -108,17 +127,17 @@ fn build_prefilled_cache(
 
 // ── Test 1: RMLX_TURBO_FLASH=1 — dispatch fires, bf16 mirror surfaced ────────
 
-/// GPU: `update_and_sdpa_returning_kv` with TurboFlash ON must dispatch and
+/// GPU: `update_and_sdpa_shared_source` with TurboFlash ON must dispatch and
 /// surface the bf16 mirror K unchanged.
 ///
 /// With `RMLX_TURBO_FLASH=1` + `RMLX_TURBO_FLASH_MIN=0`:
 ///   a. `turbo_flash_dispatch_count()` delta > 0 (kernel fired).
 ///   b. Surfaced K bytes == bf16 reference K bytes (mirror, not flash-transformed).
 ///
-/// `RMLX_RETURNING_KV_STRICT=1` turns a delta=0 skip into a panic.
+/// `RMLX_SHARED_SOURCE_STRICT=1` turns a delta=0 skip into a panic.
 #[test]
-#[ignore = "GPU Metal context: cargo test -p rmlx-kv-quant --test returning_kv_dispatch -- --ignored --test-threads=1"]
-fn returning_kv_turbo_flash_on_dispatch_fires_and_surfaces_bf16_mirror() {
+#[ignore = "GPU Metal context: cargo test -p rmlx-kv-quant --test shared_source_dispatch -- --ignored --test-threads=1"]
+fn shared_source_turbo_flash_on_dispatch_fires_and_surfaces_bf16_mirror() {
     if skip_if_no_gpu() {
         return;
     }
@@ -172,18 +191,18 @@ fn returning_kv_turbo_flash_on_dispatch_fires_and_surfaces_bf16_mirror() {
 
     let tf_before = turbo_flash_dispatch_count();
     let result =
-        cache.update_and_sdpa_returning_kv(&q_dec, &new_k, &new_v, scale, "", None, device);
+        cache.update_and_sdpa_shared_source(&q_dec, &new_k, &new_v, scale, "", None, device);
     let tf_after = turbo_flash_dispatch_count();
 
-    let (_, k_surfaced, _) = match result {
+    let (_, k_surfaced, _) = match result.map(split_bf16_share) {
         Ok(triple) => triple,
         Err(e) => {
             eprintln!(
-                "TF=1: update_and_sdpa_returning_kv errored: {e} (skipping dispatch/parity assert)"
+                "TF=1: update_and_sdpa_shared_source errored: {e} (skipping dispatch/parity assert)"
             );
             assert!(
                 !strict,
-                "RMLX_RETURNING_KV_STRICT=1 — update_and_sdpa_returning_kv errored ({e}), \
+                "RMLX_SHARED_SOURCE_STRICT=1 — update_and_sdpa_shared_source errored ({e}), \
                  but strict mode requires the dispatch to succeed"
             );
             return;
@@ -195,13 +214,13 @@ fn returning_kv_turbo_flash_on_dispatch_fires_and_surfaces_bf16_mirror() {
 
     if delta == 0 {
         eprintln!(
-            "TF=1: HOLD-soft — TurboFlash did not fire on the returning_kv path \
+            "TF=1: HOLD-soft — TurboFlash did not fire on the shared-KV producer path \
              (expected when head_dim not in {{128,256}} or kv_seq below threshold). \
              Skipping byte-identity assertion."
         );
         assert!(
             !strict,
-            "RMLX_RETURNING_KV_STRICT=1 — turbo_flash_dispatch_count did not increment; \
+            "RMLX_SHARED_SOURCE_STRICT=1 — turbo_flash_dispatch_count did not increment; \
              the kernel is expected to fire with RMLX_TURBO_FLASH=1 + RMLX_TURBO_FLASH_MIN=0 \
              at head_dim=128 in strict mode"
         );
@@ -222,14 +241,16 @@ fn returning_kv_turbo_flash_on_dispatch_fires_and_surfaces_bf16_mirror() {
     let mut ref_cache = KvCache::with_quant_max_seq(KvQuant::None, MAX_SEQ);
     ref_cache.enter_prefill();
     let _ = ref_cache
-        .update_and_sdpa_returning_kv(
+        .update_and_sdpa_shared_source(
             &q_pref, &prefill_k, &prefill_v, scale, "causal", None, device,
         )
         .expect("ref prefill");
     ref_cache.exit_prefill(device).expect("ref exit_prefill");
-    let (_, k_ref, _) = ref_cache
-        .update_and_sdpa_returning_kv(&q_dec, &new_k, &new_v, scale, "", None, device)
-        .expect("ref decode");
+    let (_, k_ref, _) = split_bf16_share(
+        ref_cache
+            .update_and_sdpa_shared_source(&q_dec, &new_k, &new_v, scale, "", None, device)
+            .expect("ref decode"),
+    );
 
     let k_surf_bytes = array_to_bf16_bytes(&k_surfaced, device);
     let k_ref_bytes = array_to_bf16_bytes(&k_ref, device);
@@ -252,11 +273,11 @@ fn returning_kv_turbo_flash_on_dispatch_fires_and_surfaces_bf16_mirror() {
 
 // ── Test 2: RMLX_TURBO_FLASH=0 — dispatch stays dormant ─────────────────────
 
-/// GPU: `update_and_sdpa_returning_kv` with TurboFlash OFF — dispatch must
+/// GPU: `update_and_sdpa_shared_source` with TurboFlash OFF — dispatch must
 /// stay dormant and the legacy fallback must surface correctly-shaped K/V.
 #[test]
-#[ignore = "GPU Metal context: cargo test -p rmlx-kv-quant --test returning_kv_dispatch -- --ignored --test-threads=1"]
-fn returning_kv_turbo_flash_off_dispatch_stays_dormant() {
+#[ignore = "GPU Metal context: cargo test -p rmlx-kv-quant --test shared_source_dispatch -- --ignored --test-threads=1"]
+fn shared_source_turbo_flash_off_dispatch_stays_dormant() {
     if skip_if_no_gpu() {
         return;
     }
@@ -307,9 +328,11 @@ fn returning_kv_turbo_flash_off_dispatch_stays_dormant() {
         .expect("bf16 q_dec");
 
     let tf_before = turbo_flash_dispatch_count();
-    let (_, k_surfaced, v_surfaced) = cache
-        .update_and_sdpa_returning_kv(&q_dec, &new_k, &new_v, scale, "", None, device)
-        .expect("decode returning_kv with TF=0");
+    let (_, k_surfaced, v_surfaced) = split_bf16_share(
+        cache
+            .update_and_sdpa_shared_source(&q_dec, &new_k, &new_v, scale, "", None, device)
+            .expect("decode shared source with TF=0"),
+    );
     let tf_after = turbo_flash_dispatch_count();
 
     let delta = tf_after - tf_before;

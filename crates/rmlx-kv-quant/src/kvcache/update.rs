@@ -4268,7 +4268,7 @@ impl KvCache {
     /// behaviour to [`Self::update_and_sdpa_k8v4_flash`] except
     /// `RMLX_TURBO_FLASH_LOCK=1` is ignored: the bf16 `decode_fp16_k/v`
     /// mirror MUST stay current every decode step, because the caller
-    /// (`update_and_sdpa_returning_kv`) slices it to surface bf16 (K, V) for
+    /// (`update_and_sdpa_shared_source`) slices it to surface bf16 (K, V) for
     /// shared-KV consumer layers. Lock-on would freeze the mirror at the
     /// prefill prefix and silently drop decode tokens from the surfaced K/V.
     pub(super) fn update_and_sdpa_k8v4_flash_no_lock(
@@ -4378,7 +4378,7 @@ impl KvCache {
         // `flash_*` is quantised from `decode_fp16_k/v`. After that the
         // mirror is frozen at the prefill prefix.
         // Cross-layer-KV consumers (Gemma4) require the bf16 mirror to be
-        // updated every step so `update_and_sdpa_returning_kv` can slice it
+        // updated every step so `update_and_sdpa_shared_source` can slice it
         // back to the consumer. `force_lock_off` short-circuits the lock-on
         // optimisation in that case. Non-cross-layer-KV callers (the public
         // entry point) keep the optimisation.
@@ -4756,7 +4756,7 @@ impl KvCache {
     }
 
     /// Sibling of [`Self::sdpa_dispatch`] used by
-    /// `update_and_sdpa_returning_kv` (cross-layer-KV producers). Forces the
+    /// `update_and_sdpa_shared_source` (cross-layer-KV producers). Forces the
     /// TurboFlash lock-on optimisation OFF so the bf16 mirror stays current.
     pub(super) fn sdpa_dispatch_no_lock(
         &mut self,

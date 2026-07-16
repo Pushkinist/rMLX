@@ -19,7 +19,7 @@ use rmlx_mlx::{multiply, scalar_f32, Array, Device};
 use tracing::debug;
 
 use crate::layers::Embedding;
-use rmlx_kv_quant::KvCache;
+use rmlx_kv_quant::{KvCache, SharedKv};
 
 use super::config::Gemma4TextConfig;
 use super::decoder_layer::DecoderLayer;
@@ -52,6 +52,32 @@ fn cache_base_offset(caches: Option<&[KvCache]>) -> i32 {
         .find(|c| c.has_persistent_cache())
         .or_else(|| cs.first())
         .map_or(0, |c| c.offset())
+}
+
+/// Split the per-layer cache slice at `layer_idx` into the producer half and
+/// this layer's own slot.
+///
+/// A shared-KV consumer always reads an **earlier** layer's cache
+/// (`build_previous_kvs` points every shared layer back at the last non-shared
+/// layer of the same type), so the producer is always in `head` and this layer's
+/// own slot is always `tail[0]`. Splitting is what lets a consumer hold the
+/// producer cache immutably — a store-backed share is attended straight off it —
+/// while a producer holds its own slot mutably.
+///
+/// The slot is mandatory: `split_at_mut` happily returns an empty tail when the
+/// slice is shorter than the model, and a `None` producer slot would silently
+/// drop the layer into the cacheless branch — SDPA over freshly-projected K/V
+/// with no history and no append, i.e. a wrong answer rather than an error.
+fn split_layer_caches(cs: &mut [KvCache], layer_idx: usize) -> Result<(&[KvCache], &mut KvCache)> {
+    let n = cs.len();
+    let (head, tail) = cs.split_at_mut(layer_idx);
+    let own = tail.first_mut().ok_or_else(|| {
+        rmlx_core::error::Error::Model(format!(
+            "gemma4: cache slice holds {n} entries but layer {layer_idx} needs its own slot — \
+             callers must pass one cache per layer"
+        ))
+    })?;
+    Ok((head, own))
 }
 
 /// `<start_of_image>` / `<end_of_image>` marker token ids, as `i32` for the
@@ -197,19 +223,19 @@ impl Gemma4Text {
         let per_layer_inputs = self.compute_per_layer_inputs(&ids_arr, &h, device)?;
 
         // KV accumulation for shared-KV layers (same pattern as forward_arr/forward_h).
-        let mut stored_kvs: Vec<Option<(Array, Array)>> =
+        let mut stored_kvs: Vec<Option<SharedKv>> =
             (0..self.cfg.num_hidden_layers).map(|_| None).collect();
 
         let mut h = h;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             debug!(layer = layer_idx, "gemma4 forward_seq_logits_all layer");
             let prev_idx = self.previous_kvs[layer_idx];
+            // Cacheless forward: a producer here never runs a fused
+            // decode kernel, so every share is bf16 and carries no cache.
             let shared_kv = if prev_idx == layer_idx {
                 None
             } else {
-                stored_kvs[prev_idx]
-                    .as_ref()
-                    .map(|(k, v)| (k as &Array, v as &Array))
+                stored_kvs[prev_idx].as_ref().map(|s| (s, None))
             };
             let per_layer = per_layer_inputs.as_ref().map(|pli| &pli[layer_idx]);
             let (new_h, new_kv) = layer.forward(
@@ -411,7 +437,7 @@ impl Gemma4Text {
         let per_layer_inputs = self.compute_per_layer_inputs(ids_arr, &h, device)?;
 
         // KV storage: index = previous_kvs[layer_idx], value = (K, V) from that layer.
-        let mut stored_kvs: Vec<Option<(Array, Array)>> =
+        let mut stored_kvs: Vec<Option<SharedKv>> =
             (0..self.cfg.num_hidden_layers).map(|_| None).collect();
 
         let mut h = h;
@@ -432,12 +458,12 @@ impl Gemma4Text {
             None => {
                 for (layer_idx, layer) in self.layers.iter().enumerate() {
                     let prev_idx = self.previous_kvs[layer_idx];
+                    // Cacheless forward: a producer here never runs a fused
+                    // decode kernel, so every share is bf16 and carries no cache.
                     let shared_kv = if prev_idx == layer_idx {
                         None
                     } else {
-                        stored_kvs[prev_idx]
-                            .as_ref()
-                            .map(|(k, v)| (k as &Array, v as &Array))
+                        stored_kvs[prev_idx].as_ref().map(|s| (s, None))
                     };
                     let per_layer = per_layer_inputs.as_ref().map(|pli| &pli[layer_idx]);
                     let (new_h, new_kv) = layer.forward(
@@ -459,19 +485,20 @@ impl Gemma4Text {
             Some(cs) => {
                 for (layer_idx, layer) in self.layers.iter().enumerate() {
                     let prev_idx = self.previous_kvs[layer_idx];
-                    let shared_kv = if prev_idx == layer_idx {
-                        None
-                    } else {
-                        stored_kvs[prev_idx]
-                            .as_ref()
-                            .map(|(k, v)| (k as &Array, v as &Array))
-                    };
                     let per_layer = per_layer_inputs.as_ref().map(|pli| &pli[layer_idx]);
-                    // Shared-KV layers don't have their own cache entry; pass None.
-                    let cache = if prev_idx == layer_idx {
-                        Some(&mut cs[layer_idx])
+                    // A consumer layer reads an EARLIER layer's cache (the
+                    // sharing map always points back to the last non-shared
+                    // layer of the same type), so split the slice and hand the
+                    // producer cache over immutably: a store-backed share is
+                    // attended straight off it. Producer layers take their own
+                    // slot mutably. Shared-KV layers have no cache entry of
+                    // their own.
+                    let (head, own) = split_layer_caches(cs, layer_idx)?;
+                    let (cache, shared_kv) = if prev_idx == layer_idx {
+                        (Some(own), None)
                     } else {
-                        None
+                        let producer = head.get(prev_idx);
+                        (None, stored_kvs[prev_idx].as_ref().map(|s| (s, producer)))
                     };
                     let (new_h, new_kv) = layer.forward(
                         &h,
@@ -552,7 +579,7 @@ impl Gemma4Text {
 
         let per_layer_inputs = self.compute_per_layer_inputs(ids_arr, &h, device)?;
 
-        let mut stored_kvs: Vec<Option<(Array, Array)>> =
+        let mut stored_kvs: Vec<Option<SharedKv>> =
             (0..self.cfg.num_hidden_layers).map(|_| None).collect();
 
         let mut h = h;
@@ -570,12 +597,12 @@ impl Gemma4Text {
             None => {
                 for (layer_idx, layer) in self.layers.iter().enumerate() {
                     let prev_idx = self.previous_kvs[layer_idx];
+                    // Cacheless forward: a producer here never runs a fused
+                    // decode kernel, so every share is bf16 and carries no cache.
                     let shared_kv = if prev_idx == layer_idx {
                         None
                     } else {
-                        stored_kvs[prev_idx]
-                            .as_ref()
-                            .map(|(k, v)| (k as &Array, v as &Array))
+                        stored_kvs[prev_idx].as_ref().map(|s| (s, None))
                     };
                     let per_layer = per_layer_inputs.as_ref().map(|pli| &pli[layer_idx]);
                     let (new_h, new_kv) = layer.forward(
@@ -597,18 +624,19 @@ impl Gemma4Text {
             Some(cs) => {
                 for (layer_idx, layer) in self.layers.iter().enumerate() {
                     let prev_idx = self.previous_kvs[layer_idx];
-                    let shared_kv = if prev_idx == layer_idx {
-                        None
-                    } else {
-                        stored_kvs[prev_idx]
-                            .as_ref()
-                            .map(|(k, v)| (k as &Array, v as &Array))
-                    };
                     let per_layer = per_layer_inputs.as_ref().map(|pli| &pli[layer_idx]);
-                    let cache = if prev_idx == layer_idx {
-                        Some(&mut cs[layer_idx])
+                    // A consumer layer reads an EARLIER layer's cache (the
+                    // sharing map always points back to the last non-shared
+                    // layer of the same type), so split the slice and hand the
+                    // producer cache over immutably: a store-backed share is
+                    // attended straight off it. Producer layers take their own
+                    // slot mutably.
+                    let (head, own) = split_layer_caches(cs, layer_idx)?;
+                    let (cache, shared_kv) = if prev_idx == layer_idx {
+                        (Some(own), None)
                     } else {
-                        None
+                        let producer = head.get(prev_idx);
+                        (None, stored_kvs[prev_idx].as_ref().map(|s| (s, producer)))
                     };
                     let (new_h, new_kv) = layer.forward(
                         &h,
@@ -695,7 +723,7 @@ impl Gemma4Text {
 
         let per_layer_inputs = self.compute_per_layer_inputs(&ids_arr, &h, device)?;
 
-        let mut stored_kvs: Vec<Option<(Array, Array)>> =
+        let mut stored_kvs: Vec<Option<SharedKv>> =
             (0..self.cfg.num_hidden_layers).map(|_| None).collect();
 
         let mut h = h;
@@ -712,12 +740,12 @@ impl Gemma4Text {
             None => {
                 for (layer_idx, layer) in self.layers.iter().enumerate() {
                     let prev_idx = self.previous_kvs[layer_idx];
+                    // Cacheless forward: a producer here never runs a fused
+                    // decode kernel, so every share is bf16 and carries no cache.
                     let shared_kv = if prev_idx == layer_idx {
                         None
                     } else {
-                        stored_kvs[prev_idx]
-                            .as_ref()
-                            .map(|(k, v)| (k as &Array, v as &Array))
+                        stored_kvs[prev_idx].as_ref().map(|s| (s, None))
                     };
                     let per_layer = per_layer_inputs.as_ref().map(|pli| &pli[layer_idx]);
                     let (new_h, new_kv) = layer.forward(
@@ -739,18 +767,19 @@ impl Gemma4Text {
             Some(cs) => {
                 for (layer_idx, layer) in self.layers.iter().enumerate() {
                     let prev_idx = self.previous_kvs[layer_idx];
-                    let shared_kv = if prev_idx == layer_idx {
-                        None
-                    } else {
-                        stored_kvs[prev_idx]
-                            .as_ref()
-                            .map(|(k, v)| (k as &Array, v as &Array))
-                    };
                     let per_layer = per_layer_inputs.as_ref().map(|pli| &pli[layer_idx]);
-                    let cache = if prev_idx == layer_idx {
-                        Some(&mut cs[layer_idx])
+                    // A consumer layer reads an EARLIER layer's cache (the
+                    // sharing map always points back to the last non-shared
+                    // layer of the same type), so split the slice and hand the
+                    // producer cache over immutably: a store-backed share is
+                    // attended straight off it. Producer layers take their own
+                    // slot mutably.
+                    let (head, own) = split_layer_caches(cs, layer_idx)?;
+                    let (cache, shared_kv) = if prev_idx == layer_idx {
+                        (Some(own), None)
                     } else {
-                        None
+                        let producer = head.get(prev_idx);
+                        (None, stored_kvs[prev_idx].as_ref().map(|s| (s, producer)))
                     };
                     let (new_h, new_kv) = layer.forward(
                         &h,
@@ -832,7 +861,7 @@ impl Gemma4Text {
 
         let per_layer_inputs = self.compute_per_layer_inputs(&ids_arr, &h, device)?;
 
-        let mut stored_kvs: Vec<Option<(Array, Array)>> =
+        let mut stored_kvs: Vec<Option<SharedKv>> =
             (0..self.cfg.num_hidden_layers).map(|_| None).collect();
 
         let mut h = h;
@@ -845,18 +874,15 @@ impl Gemma4Text {
         let cs = &mut *caches;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let prev_idx = self.previous_kvs[layer_idx];
-            let shared_kv = if prev_idx == layer_idx {
-                None
-            } else {
-                stored_kvs[prev_idx]
-                    .as_ref()
-                    .map(|(k, v)| (k as &Array, v as &Array))
-            };
             let per_layer = per_layer_inputs.as_ref().map(|pli| &pli[layer_idx]);
-            let cache = if prev_idx == layer_idx {
-                Some(&mut cs[layer_idx])
+            // See `forward_h`: consumers read an earlier layer's cache, so the
+            // slice splits into the producer half and this layer's own slot.
+            let (head, own) = split_layer_caches(cs, layer_idx)?;
+            let (cache, shared_kv) = if prev_idx == layer_idx {
+                (Some(own), None)
             } else {
-                None
+                let producer = head.get(prev_idx);
+                (None, stored_kvs[prev_idx].as_ref().map(|s| (s, producer)))
             };
             let (new_h, new_kv) = layer.forward(
                 &h,
@@ -876,22 +902,32 @@ impl Gemma4Text {
 
         // Representative shared K/V: highest-index cache-holding layer of each
         // type (last-wins, matching the Python dict-overwrite semantics).
-        let pick = |want: super::config::LayerType| -> Option<(Array, Array)> {
+        //
+        // The drafter is a separate model with its own attention, so this is
+        // one of the few callers that needs K/V *tensors* rather than attention
+        // output: a store-backed share is materialised here, paying the dequant
+        // the fused decode kernel avoids on the hot path.
+        // A materialisation failure (length desync, missing bf16 V mirror,
+        // unsupported storage variant, absent producer cache) is propagated, not
+        // swallowed: collapsing it into "no K/V captured" would report a cause
+        // that is never the real one.
+        let cs = &*caches;
+        let pick = |want: super::config::LayerType| -> Result<Option<(Array, Array)>> {
             for i in (0..self.cfg.num_hidden_layers).rev() {
                 if self.cfg.layer_types[i] == want {
-                    if let Some((kk, vv)) = &stored_kvs[i] {
-                        return Some((kk.try_clone().ok()?, vv.try_clone().ok()?));
+                    if let Some(share) = &stored_kvs[i] {
+                        return share.materialise(cs.get(i), device).map(Some);
                     }
                 }
             }
-            None
+            Ok(None)
         };
-        let sliding_kv = pick(super::config::LayerType::SlidingAttention).ok_or_else(|| {
+        let sliding_kv = pick(super::config::LayerType::SlidingAttention)?.ok_or_else(|| {
             rmlx_core::error::Error::Model(
                 "forward_hidden_states_shared_kv: no sliding-layer K/V captured".into(),
             )
         })?;
-        let full_kv = pick(super::config::LayerType::FullAttention).ok_or_else(|| {
+        let full_kv = pick(super::config::LayerType::FullAttention)?.ok_or_else(|| {
             rmlx_core::error::Error::Model(
                 "forward_hidden_states_shared_kv: no full-layer K/V captured".into(),
             )

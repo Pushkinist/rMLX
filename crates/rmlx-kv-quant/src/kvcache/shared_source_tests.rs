@@ -1,7 +1,7 @@
-//! CPU-device behaviour pins for `update_and_sdpa_returning_kv`.
+//! CPU-device behaviour pins for `update_and_sdpa_shared_source`.
 //!
 //! These tests run on `Device::Cpu` and pin two structural properties of the
-//! `update_and_sdpa_returning_kv` code path that hold independently of GPU
+//! `update_and_sdpa_shared_source` code path that hold independently of GPU
 //! availability:
 //!
 //! * **CPU-device dispatch gating**: with `Device::Cpu`, both
@@ -18,10 +18,11 @@
 //!
 //! **What these tests do NOT cover**: GPU kernel dispatch (delta > 0).
 //! That is covered by the integration test at
-//! `crates/rmlx-kv-quant/tests/returning_kv_dispatch.rs` which runs
+//! `crates/rmlx-kv-quant/tests/shared_source_dispatch.rs` which runs
 //! under `#[ignore]` and requires `--test-threads=1` and a Metal GPU.
 
 use super::core::KvCache;
+use super::SharedKv;
 use crate::kvcache::fused_qk_total_dispatch_count;
 use crate::turbo_flash_msl::turbo_flash_dispatch_count;
 use crate::KvQuant;
@@ -52,7 +53,7 @@ const TEST_PREFILL_SEQ: i32 = 64;
 /// is unconditional on CPU hosts regardless of `RMLX_TURBO_FLASH` or
 /// `RMLX_FUSED_QK` env-var state. It does NOT prove that GPU dispatch works.
 #[test]
-fn returning_kv_cpu_device_suppresses_all_dispatch_arms() {
+fn shared_source_cpu_device_suppresses_all_dispatch_arms() {
     // Defensive: clear gates if a prior process / test latched them. These
     // gates use OnceLock so the value is per-process; the test relies on the
     // canonical default-off state.
@@ -72,12 +73,12 @@ fn returning_kv_cpu_device_suppresses_all_dispatch_arms() {
     let n_q_pref: usize = q_pref_shape.iter().map(|&d| d as usize).product();
     let q_pref = f32_arr(&vec![0.333f32; n_q_pref], &q_pref_shape);
 
-    // Prefill via the returning_kv entry — mirrors Gemma4's call site.
+    // Prefill via the shared-source entry — mirrors Gemma4's call site.
     let tf_before = turbo_flash_dispatch_count();
     let fqk_before = fused_qk_total_dispatch_count();
-    let (_out, _k, _v) = cache
-        .update_and_sdpa_returning_kv(&q_pref, &k_pref, &v_pref, 1.0, "causal", None, device)
-        .expect("prefill returning_kv");
+    let (_out, _share) = cache
+        .update_and_sdpa_shared_source(&q_pref, &k_pref, &v_pref, 1.0, "causal", None, device)
+        .expect("prefill shared source");
     cache.exit_prefill(device).expect("exit_prefill");
 
     // Decode step 1 — q_seq = 1.
@@ -89,9 +90,9 @@ fn returning_kv_cpu_device_suppresses_all_dispatch_arms() {
     let n_q_step: usize = q_step_shape.iter().map(|&d| d as usize).product();
     let q_step = f32_arr(&vec![0.666f32; n_q_step], &q_step_shape);
 
-    let (_out2, _k2, _v2) = cache
-        .update_and_sdpa_returning_kv(&q_step, &k_step, &v_step, 1.0, "", None, device)
-        .expect("decode returning_kv");
+    let (_out2, _share2) = cache
+        .update_and_sdpa_shared_source(&q_step, &k_step, &v_step, 1.0, "", None, device)
+        .expect("decode shared source");
 
     let tf_after = turbo_flash_dispatch_count();
     let fqk_after = fused_qk_total_dispatch_count();
@@ -111,16 +112,16 @@ fn returning_kv_cpu_device_suppresses_all_dispatch_arms() {
 /// CPU-device legacy shape contract: surfaced K/V is shaped `[B, kv_h, offset, D]`.
 ///
 /// The shared-KV consumer (Gemma4 cross-layer-KV) depends on `(K, V)` being
-/// shaped `[B, kv_h, offset, D]` after `update_and_sdpa_returning_kv`. This
+/// shaped `[B, kv_h, offset, D]` after `update_and_sdpa_shared_source`. This
 /// test exercises a decode step on `Device::Cpu` (where all dispatch arms
 /// gate off) and verifies the legacy bf16 fallback surfaces the full kv
 /// prefix with the correct shape.
 ///
 /// This pins the legacy-path shape contract. It does NOT exercise the GPU
 /// dispatch path — shape correctness after TurboFlash dispatch is verified
-/// in `crates/rmlx-kv-quant/tests/returning_kv_dispatch.rs`.
+/// in `crates/rmlx-kv-quant/tests/shared_source_dispatch.rs`.
 #[test]
-fn returning_kv_cpu_device_legacy_fallback_surfaces_full_prefix_shape() {
+fn shared_source_cpu_device_legacy_fallback_surfaces_full_prefix_shape() {
     let device = Device::Cpu;
     let mut cache = KvCache::with_quant_max_seq(KvQuant::K8V4, TEST_MAX_SEQ);
 
@@ -133,8 +134,8 @@ fn returning_kv_cpu_device_legacy_fallback_surfaces_full_prefix_shape() {
     let n_q_pref: usize = q_pref_shape.iter().map(|&d| d as usize).product();
     let q_pref = f32_arr(&vec![0.033f32; n_q_pref], &q_pref_shape);
     let _ = cache
-        .update_and_sdpa_returning_kv(&q_pref, &k_pref, &v_pref, 1.0, "causal", None, device)
-        .expect("prefill returning_kv");
+        .update_and_sdpa_shared_source(&q_pref, &k_pref, &v_pref, 1.0, "causal", None, device)
+        .expect("prefill shared source");
     cache.exit_prefill(device).expect("exit_prefill");
 
     let step_kv_shape = [1_i32, TEST_KV_H, 1, TEST_HEAD_DIM];
@@ -145,10 +146,14 @@ fn returning_kv_cpu_device_legacy_fallback_surfaces_full_prefix_shape() {
     let n_q_step: usize = q_step_shape.iter().map(|&d| d as usize).product();
     let q_step = f32_arr(&vec![0.066f32; n_q_step], &q_step_shape);
 
-    let (_out, k_full, v_full) = cache
-        .update_and_sdpa_returning_kv(&q_step, &k_step, &v_step, 1.0, "", None, device)
-        .expect("decode returning_kv");
+    let (_out, share) = cache
+        .update_and_sdpa_shared_source(&q_step, &k_step, &v_step, 1.0, "", None, device)
+        .expect("decode shared source");
 
+    // Every dispatch arm gates off on CPU, so this is the legacy bf16 share.
+    let SharedKv::Bf16(k_full, v_full) = &share else {
+        panic!("the CPU legacy fallback must surface a bf16 share");
+    };
     let expected = [1_i32, TEST_KV_H, TEST_PREFILL_SEQ + 1, TEST_HEAD_DIM];
     assert_eq!(
         k_full.shape(),

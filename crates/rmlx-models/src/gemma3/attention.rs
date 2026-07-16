@@ -189,7 +189,7 @@ impl Attention {
         // Route through `KvCache::update_and_sdpa` —
         // the universal wrapper that fuses cache update + SDPA and dispatches
         // to the Mixed, K8V4-flash, or legacy path based on quant type.
-        // No cross-layer KV sharing in Gemma3, so the `_returning_kv` sibling
+        // No cross-layer KV sharing in Gemma3, so the `_shared_source` sibling
         // is not needed.
         let attn_out = if let Some(c) = cache {
             c.update_and_sdpa(&q, &k, &v, self.scale, mask_mode, mask_ref, device)?
