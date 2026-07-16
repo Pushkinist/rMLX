@@ -388,3 +388,103 @@ fn builder_rejects_a_record_ingest_would_reject() {
     .unwrap_err();
     assert!(matches!(err, Error::NoMeasurements), "got {err:?}");
 }
+
+// ── kv_quant is a free-form recorded label, full record ingest ───────────────
+
+/// A couple of real rotation-family codec names — the exact class the old
+/// hand-maintained allow-list dropped — ingest fine at the full-record
+/// level (not just the bare `canonicalize_kv_quant` call).
+#[test]
+fn record_ingests_for_real_rotation_codec_names() {
+    for token in ["rotor4_sym", "k_rotor3"] {
+        let mut r = valid_record();
+        r.kv_quant = token.to_string();
+        r.validate()
+            .unwrap_or_else(|e| panic!("kv_quant {token:?} rejected: {e}"));
+    }
+}
+
+/// The core of the fix: a full record with a `kv_quant` token this binary
+/// has never heard of — a codec that does not exist yet, a typo, anything —
+/// still ingests. No allow-list, no drift; `is_valid_kv_quant_token`-style
+/// grammar mirrors are gone for good.
+#[test]
+fn record_ingests_with_unknown_kv_quant_token() {
+    let mut r = valid_record();
+    r.kv_quant = "some_future_codec_v9".to_string();
+    r.validate().unwrap();
+}
+
+/// `bf16`/`f16` still alias to `none` at the full-record level.
+#[test]
+fn record_kv_quant_bf16_alias_still_normalizes() {
+    for alias in ["bf16", "f16"] {
+        let mut r = valid_record();
+        r.kv_quant = alias.to_string();
+        r.validate()
+            .unwrap_or_else(|e| panic!("kv_quant {alias:?} rejected: {e}"));
+    }
+}
+
+// ── model_namespace is a free-form recorded label too ────────────────────────
+
+/// An unrecognized `model_namespace` — a new model host, a typo, a local
+/// finetune — must still record. Same footgun class as kv_quant: a fixed
+/// whitelist on a free-form recorded label silently drops valid rows.
+#[test]
+fn record_ingests_with_unknown_model_namespace() {
+    let mut r = valid_record();
+    r.model_namespace = "some-new-model-host".to_string();
+    r.validate().unwrap();
+}
+
+// ── §8.5 CBB record shape (`model` / `model_id` tolerance) ───────────────────
+
+/// A record shaped exactly like the CBB cross-backend §8.5 emitter (see
+/// `../Cross-Backend-Bench/runners/_common.py::_build_metrics_record`)
+/// deserializes and ingests cleanly.
+#[test]
+fn cbb_shaped_record_with_model_field_ingests() {
+    let json_str = r#"{
+        "backend": "rmlx",
+        "backend_version": "0.2.8",
+        "model_namespace": "prism-ml",
+        "model": "Ternary-Bonsai-8B-mlx-2bit",
+        "weight_quant": "2bit",
+        "kv_quant": "none",
+        "ctx_max": 8192,
+        "prompt": {"name": "longctx_4k", "tokens_approx": 4096, "body": "hi"},
+        "ts_utc": "2026-05-10T07:30:00Z",
+        "git_sha": null,
+        "build_profile": null,
+        "hardware_tag": "m5_max_128gb",
+        "notes": "cbb-runner",
+        "metrics": [{"name": "decode_tps_warm", "value": 100.0}]
+    }"#;
+    let r: RunRecord = serde_json::from_str(json_str).unwrap();
+    r.validate().unwrap();
+}
+
+/// A record using `model_id` instead of the canonical `model` key (a shape a
+/// future or foreign emitter could plausibly send) still ingests — the
+/// ingest tolerates the alias rather than silently landing in
+/// `metrics/buffer/failed/`.
+#[test]
+fn record_with_model_id_alias_ingests() {
+    let json_str = r#"{
+        "backend": "rmlx",
+        "backend_version": "0.2.8",
+        "model_namespace": "prism-ml",
+        "model_id": "Ternary-Bonsai-8B-mlx-2bit",
+        "weight_quant": "2bit",
+        "kv_quant": "none",
+        "ctx_max": 8192,
+        "prompt": {"name": "longctx_4k", "tokens_approx": 4096, "body": "hi"},
+        "ts_utc": "2026-05-10T07:30:00Z",
+        "hardware_tag": "m5_max_128gb",
+        "metrics": [{"name": "decode_tps_warm", "value": 100.0}]
+    }"#;
+    let r: RunRecord = serde_json::from_str(json_str).unwrap();
+    assert_eq!(r.model, "Ternary-Bonsai-8B-mlx-2bit");
+    r.validate().unwrap();
+}
