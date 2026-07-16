@@ -630,7 +630,7 @@ pub fn generate_greedy<'a>(
                             // above. Stacks with `layout_key` (XOR) exactly like
                             // the SSD-tier salt.
                             let lk = crate::gemma4::prompt_cache::active_layout_key();
-                            cache.push(Gemma4Entry {
+                            let stored = cache.push(Gemma4Entry {
                                 prompt_token_ids: prompt_ids.to_vec(),
                                 block_hashes: crate::prompt_cache::chained_block_hashes_seeded(
                                     prompt_ids,
@@ -644,13 +644,15 @@ pub fn generate_greedy<'a>(
                                 kv_quant: Some(kv_quant),
                                 is_ssd_hydrated: false,
                             });
-                            tracing::debug!(
-                                prompt_len = prompt_ids.len(),
-                                token_id = last_id,
-                                n_slots = cache.slots.len(),
-                                cache_path = if is_prefix { "prefix" } else { "miss" },
-                                "gemma4 generate_greedy: full-prompt snapshot saved"
-                            );
+                            if stored.is_some() {
+                                tracing::debug!(
+                                    prompt_len = prompt_ids.len(),
+                                    token_id = last_id,
+                                    n_slots = cache.slots.len(),
+                                    cache_path = if is_prefix { "prefix" } else { "miss" },
+                                    "gemma4 generate_greedy: full-prompt snapshot saved"
+                                );
+                            }
                         }
                     });
                 }

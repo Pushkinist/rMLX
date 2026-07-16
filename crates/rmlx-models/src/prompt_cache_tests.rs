@@ -1225,6 +1225,49 @@ fn ssd_miss_leaves_ram_untouched() {
     assert_eq!(cache.slots.len(), 0);
 }
 
+/// over-cap admission guard applies to the SSD-hydrate path too: a
+/// reconstructed block whose `kv_bytes()` alone exceeds the RAM cap is
+/// refused admission by `push`, so `hydrate_from_ssd` must surface it as a
+/// miss — NOT a served hit. `stats().ssd_hits` must NOT be bumped for an
+/// entry that was never actually stored in RAM.
+#[test]
+#[allow(
+    clippy::clone_on_ref_ptr,
+    reason = "intentional Arc::clone — explicit form aids grep for shared-ownership transfer sites"
+)]
+fn ssd_hydrate_over_cap_entry_is_not_counted_as_hit() {
+    let prompt: Vec<u32> = make_ids(2 * BLOCK_TOKENS); // kv_bytes() = 512 * 8 = 4096
+                                                       // Cap strictly below the entry the mock source will reconstruct.
+    let tiny_cap = (prompt.len() as u64 * 8) - 1;
+    let mut cache: PromptCache<TestEntry> = PromptCache::with_max_bytes(4, tiny_cap);
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    cache.set_ssd_source(Box::new(MockSource {
+        entry_ids: prompt.clone(),
+        calls: calls.clone(),
+    }));
+
+    let slot = cache.hydrate_from_ssd(&prompt);
+    assert!(
+        slot.is_none(),
+        "an over-cap reconstructed block must surface as a miss"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the source was queried exactly once"
+    );
+    assert_eq!(
+        cache.stats().ssd_hits,
+        0,
+        "an over-cap hydrate must NOT be counted as a served ssd_hit"
+    );
+    assert_eq!(
+        cache.slots.len(),
+        0,
+        "the over-cap block must not occupy a RAM slot"
+    );
+}
+
 /// correctness: a partial hit truncates to exactly the matched block
 /// boundary, so the re-prefilled tail starts at the correct absolute
 /// position `matched_blocks * BLOCK_TOKENS`. A wrong truncation length here

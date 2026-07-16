@@ -794,12 +794,12 @@ impl<E: PromptCacheEntry> PromptCache<E> {
         // Existing (smaller, valid) slots are left intact — evicting them to
         // make room for an entry that still could not fit would only thrash.
         if new_bytes > self.max_bytes {
-            tracing::debug!(
+            tracing::warn!(
                 entry_bytes = new_bytes,
                 max_bytes = self.max_bytes,
                 n_slots = self.slots.len(),
-                "prompt cache: snapshot KV exceeds RAM cap — not admitted \
-                 (a repeat request re-prefills instead of reusing an over-cap slot)"
+                "prompt cache: snapshot KV exceeds RAM cap — not admitted; \
+                 raise --prompt-cache-ram-gb to cache this context"
             );
             return None;
         }
