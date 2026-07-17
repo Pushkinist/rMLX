@@ -19,7 +19,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use rmlx_core::error::Result;
+use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{argmax, max_axis, Array, Device, Dtype};
 use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
 use tracing::{info, warn};
@@ -270,25 +270,34 @@ pub fn generate_greedy<'a>(
             c.enter_prefill();
         }
         let seq_i32 = prompt_ids.len() as i32;
-        let logits = match model.forward_arr_embeds(embeds, seq_i32, Some(&mut caches), device) {
-            Ok(l) => l,
+        // Every cache entered prefill above, so the exit_prefill sweep below is
+        // mandatory even when the forward fails: the cause is captured, the
+        // sweep runs, then the first cause propagates.
+        let mut first_err: Option<Error> = None;
+        let forward = match model.forward_arr_embeds(embeds, seq_i32, Some(&mut caches), device) {
+            Ok(l) => Some(l),
             Err(e) => {
-                tracing::warn!(error = %e, prompt_len = prompt_ids.len(), "gemma3 generate_greedy: image prefill failed, returning empty");
-                for c in &mut caches {
-                    let _ = c.exit_prefill(device);
-                }
-                return Ok(steps);
+                tracing::error!(error = %e, prompt_len = prompt_ids.len(), "gemma3 generate_greedy: image prefill failed, aborting generation");
+                first_err = Some(e);
+                None
             }
         };
         for c in &mut caches {
             if let Err(e) = c.exit_prefill(device) {
-                tracing::warn!(error = %e, "gemma3 generate_greedy: image exit_prefill quantization failed");
-                return Ok(steps);
+                tracing::error!(error = %e, "gemma3 generate_greedy: image exit_prefill quantization failed, aborting generation");
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
             }
         }
-        logits
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        forward.ok_or_else(|| {
+            Error::Model("gemma3 generate_greedy: image prefill produced no logits".to_owned())
+        })?
     } else {
-        let Some(logits) = chunked_prefill(
+        chunked_prefill(
             &mut caches,
             prompt_ids,
             prefill_chunk,
@@ -296,10 +305,6 @@ pub fn generate_greedy<'a>(
             "Gemma3ForConditionalGeneration",
             |chunk, caches| model.forward_seq_with_cache(chunk, Some(caches), device),
         )?
-        else {
-            return Ok(steps);
-        };
-        logits
     };
 
     let logits_flat = prefill_logits.reshape(&[1, vocab], device)?;

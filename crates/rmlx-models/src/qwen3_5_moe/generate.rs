@@ -18,7 +18,7 @@
 )]
 use std::time::Instant;
 
-use rmlx_core::error::Result;
+use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device};
 
 use crate::constraint::ConstraintEngine;
@@ -267,9 +267,12 @@ pub fn generate_greedy<'a>(
 
         let prefill_chunk = crate::prefill_chunk::prefill_chunk_for("qwen3_5_moe");
 
+        // No enter_prefill above (see the note on resumed caches) means no
+        // exit_prefill sweep is owed here, so a failure returns its cause
+        // immediately (unlike the shared helper, which must capture and sweep
+        // first).
         let prefill_logits = {
             let mut last_logits: Option<Array> = None;
-            let mut prefill_ok = true;
             let tail = &prompt_ids[prefix_len..];
             let n_chunks = tail.len().div_ceil(prefill_chunk);
             for (chunk_idx, chunk) in tail.chunks(prefill_chunk).enumerate() {
@@ -286,39 +289,37 @@ pub fn generate_greedy<'a>(
                         } else {
                             // Force-evaluate the KV cache state between chunks
                             // (avoids lazy-graph explosion, mirrors Path C).
-                            for c in &kv_caches {
-                                if let Err(e) = c.eval_prefill_state() {
-                                    tracing::warn!(
-                                        error = %e,
-                                        chunk_len = chunk.len(),
-                                        "qwen3_5moe generate_greedy (hydrated-tail): tail chunk eval failed"
-                                    );
-                                    prefill_ok = false;
-                                    break;
-                                }
+                            // Stops at the first failing cache.
+                            if let Some(e) =
+                                kv_caches.iter().find_map(|c| c.eval_prefill_state().err())
+                            {
+                                tracing::error!(
+                                    error = %e,
+                                    chunk_len = chunk.len(),
+                                    "qwen3_5moe generate_greedy (hydrated-tail): tail chunk eval failed, aborting generation"
+                                );
+                                return Err(e);
                             }
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(
+                        tracing::error!(
                             error = %e,
                             prefix_len,
                             tail_len,
-                            "qwen3_5moe generate_greedy (hydrated-tail): tail chunk failed, returning empty"
+                            "qwen3_5moe generate_greedy (hydrated-tail): tail chunk failed, aborting generation"
                         );
-                        prefill_ok = false;
-                        break;
+                        return Err(e);
                     }
-                }
-                if !prefill_ok {
-                    break;
                 }
             }
 
-            if !prefill_ok || last_logits.is_none() {
-                return Ok(steps);
-            }
-            last_logits.unwrap()
+            last_logits.ok_or_else(|| {
+                Error::Model(
+                    "qwen3_5moe generate_greedy (hydrated-tail): tail produced no logits"
+                        .to_owned(),
+                )
+            })?
         };
 
         let logits_flat = prefill_logits.reshape(&[1, vocab], device)?;
@@ -480,19 +481,16 @@ pub fn generate_greedy<'a>(
 
     // Fresh chunked prefill via the shared helper. It brackets the loop with
     // enter_prefill() / exit_prefill(), evals only the cache state on non-final
-    // chunks, and returns None on rejection. The GDN `lin_caches` are
+    // chunks, and propagates the cause on rejection. The GDN `lin_caches` are
     // closure-captured — the helper only owns `kv_caches`.
-    let Some(prefill_logits) = chunked_prefill(
+    let prefill_logits = chunked_prefill(
         &mut kv_caches,
         prompt_ids,
         prefill_chunk,
         device,
         "Qwen3_5MoeForConditionalGeneration",
         |chunk, kv| model.forward_seq_with_cache(chunk, Some(kv), Some(&mut lin_caches), device),
-    )?
-    else {
-        return Ok(steps);
-    };
+    )?;
 
     let logits_flat = prefill_logits.reshape(&[1, vocab], device)?;
     // top-k logprob capture (0 = disabled, hot-loop zero-overhead).

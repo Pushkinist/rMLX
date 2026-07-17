@@ -454,22 +454,40 @@ pub fn generate_greedy<'a>(
             c.enter_prefill();
         }
         let seq_i32 = prompt_ids.len() as i32;
-        let logits =
-            match model.forward_arr_embeds(embeds, &masked_ids, seq_i32, Some(&mut caches), device)
-            {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::warn!(error = %e, "generate_greedy: image prefill forward failed");
-                    return Ok(steps);
-                }
-            };
+        // Every cache entered prefill above, so the exit_prefill sweep below is
+        // mandatory even when the forward fails: the cause is captured, the
+        // sweep runs, then the first cause propagates.
+        let mut first_err: Option<rmlx_core::error::Error> = None;
+        let forward = match model.forward_arr_embeds(
+            embeds,
+            &masked_ids,
+            seq_i32,
+            Some(&mut caches),
+            device,
+        ) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                tracing::error!(error = %e, "generate_greedy: image prefill forward failed, aborting generation");
+                first_err = Some(e);
+                None
+            }
+        };
         for c in &mut caches {
             if let Err(e) = c.exit_prefill(device) {
-                tracing::warn!(error = %e, "generate_greedy: image exit_prefill failed");
-                return Ok(steps);
+                tracing::error!(error = %e, "generate_greedy: image exit_prefill failed, aborting generation");
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
             }
         }
-        logits
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        forward.ok_or_else(|| {
+            rmlx_core::error::Error::Model(
+                "generate_greedy: image prefill produced no logits".to_owned(),
+            )
+        })?
     } else if is_prefix {
         // Prefix (B1): per-arch tail re-prefill. The cloned snapshot is already
         // post-prefill quantized (offset == prefix_len), so the tail appends
@@ -478,10 +496,13 @@ pub fn generate_greedy<'a>(
         // buffer and exit_prefill would re-quantize only the tail). Non-final
         // chunks flush the quantized/decode_fp16 buffers via `eval_gpu_state`
         // (NOT `eval_prefill_state`); there is nothing to quantize on exit.
+        //
+        // No enter_prefill above means no exit_prefill sweep is owed here, so a
+        // failure returns its cause immediately (unlike the shared helper, which
+        // must capture and sweep first).
         let mut last_logits: Option<Array> = None;
-        let mut prefill_ok = true;
         let n_chunks = prefill_ids.len().div_ceil(prefill_chunk);
-        'prefill: for (chunk_idx, chunk) in prefill_ids.chunks(prefill_chunk).enumerate() {
+        for (chunk_idx, chunk) in prefill_ids.chunks(prefill_chunk).enumerate() {
             let is_last = chunk_idx + 1 == n_chunks;
             match model.forward_seq_with_cache(chunk, Some(&mut caches), device) {
                 Ok(logits) => {
@@ -492,39 +513,38 @@ pub fn generate_greedy<'a>(
                     } else {
                         // Non-final chunk: discard logits (lazy graph drops
                         // lm_head matmul) and flush only the decode-mode state.
-                        for c in &caches {
-                            if let Err(e) = c.eval_gpu_state() {
-                                tracing::warn!(
-                                    error = %e,
-                                    chunk_len = chunk.len(),
-                                    "generate_greedy: prefix tail chunk cache eval failed"
-                                );
-                                prefill_ok = false;
-                                break 'prefill;
-                            }
+                        // Stops at the first failing cache.
+                        if let Some(e) = caches.iter().find_map(|c| c.eval_gpu_state().err()) {
+                            tracing::error!(
+                                error = %e,
+                                chunk_len = chunk.len(),
+                                "generate_greedy: prefix tail chunk cache eval failed, aborting generation"
+                            );
+                            return Err(e);
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    tracing::error!(
                         error = %e,
                         prompt_len = prompt_ids.len(),
-                        "generate_greedy: prefix tail chunk failed, returning empty"
+                        "generate_greedy: prefix tail chunk failed, aborting generation"
                     );
-                    prefill_ok = false;
-                    break;
+                    return Err(e);
                 }
             }
         }
-        if !prefill_ok || last_logits.is_none() {
-            return Ok(steps);
-        }
-        last_logits.unwrap()
+        last_logits.ok_or_else(|| {
+            rmlx_core::error::Error::Model(
+                "generate_greedy: prefix tail produced no logits (empty tail)".to_owned(),
+            )
+        })?
     } else {
         // Miss: Fresh full re-prefill via the shared chunked_prefill helper. It
         // brackets the loop with enter_prefill() / exit_prefill(), evals only
-        // the cache state on non-final chunks, and returns None on rejection.
-        let Some(logits) = chunked_prefill(
+        // the cache state on non-final chunks, and propagates the cause when a
+        // chunk is rejected.
+        chunked_prefill(
             &mut caches,
             prompt_ids,
             prefill_chunk,
@@ -532,10 +552,6 @@ pub fn generate_greedy<'a>(
             "Gemma4ForConditionalGeneration",
             |chunk, caches| model.forward_seq_with_cache(chunk, Some(caches), device),
         )?
-        else {
-            return Ok(steps);
-        };
-        logits
     };
 
     let logits_flat = prefill_logits.reshape(&[1, vocab], device)?;

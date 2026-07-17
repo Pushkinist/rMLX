@@ -1620,6 +1620,18 @@ impl KvCache {
         Ok((k_full, v_full))
     }
 
+    /// True while the cache sits between `enter_prefill` and `exit_prefill`.
+    ///
+    /// Observable for the sweep invariant: every cache that entered prefill must
+    /// run `exit_prefill` before its prefill helper returns, on the failure path
+    /// as well as the success path. A cache left in prefill keeps un-finalized
+    /// state (no decode seed / un-quantized storage), and the next decode on it
+    /// errors or corrupts KV. Rotating caches never enter prefill (the ring is
+    /// the authority), so this stays false for them throughout.
+    pub fn in_prefill(&self) -> bool {
+        self.in_prefill
+    }
+
     /// Switch the cache into prefill mode (accumulates raw K/V before quantizing).
     pub fn enter_prefill(&mut self) {
         // Rotating cache handles prefill via update_concat directly.
