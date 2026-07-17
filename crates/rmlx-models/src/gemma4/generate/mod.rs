@@ -523,8 +523,9 @@ pub fn generate_greedy<'a>(
     } else {
         // Miss: Fresh full re-prefill via the shared chunked_prefill helper. It
         // brackets the loop with enter_prefill() / exit_prefill(), evals only
-        // the cache state on non-final chunks, and returns None on rejection.
-        let Some(logits) = chunked_prefill(
+        // the cache state on non-final chunks, and propagates the cause when a
+        // chunk is rejected.
+        chunked_prefill(
             &mut caches,
             prompt_ids,
             prefill_chunk,
@@ -532,10 +533,6 @@ pub fn generate_greedy<'a>(
             "Gemma4ForConditionalGeneration",
             |chunk, caches| model.forward_seq_with_cache(chunk, Some(caches), device),
         )?
-        else {
-            return Ok(steps);
-        };
-        logits
     };
 
     let logits_flat = prefill_logits.reshape(&[1, vocab], device)?;

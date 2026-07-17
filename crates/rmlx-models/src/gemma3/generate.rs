@@ -288,7 +288,7 @@ pub fn generate_greedy<'a>(
         }
         logits
     } else {
-        let Some(logits) = chunked_prefill(
+        chunked_prefill(
             &mut caches,
             prompt_ids,
             prefill_chunk,
@@ -296,10 +296,6 @@ pub fn generate_greedy<'a>(
             "Gemma3ForConditionalGeneration",
             |chunk, caches| model.forward_seq_with_cache(chunk, Some(caches), device),
         )?
-        else {
-            return Ok(steps);
-        };
-        logits
     };
 
     let logits_flat = prefill_logits.reshape(&[1, vocab], device)?;

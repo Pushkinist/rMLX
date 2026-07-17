@@ -480,19 +480,16 @@ pub fn generate_greedy<'a>(
 
     // Fresh chunked prefill via the shared helper. It brackets the loop with
     // enter_prefill() / exit_prefill(), evals only the cache state on non-final
-    // chunks, and returns None on rejection. The GDN `lin_caches` are
+    // chunks, and propagates the cause on rejection. The GDN `lin_caches` are
     // closure-captured — the helper only owns `kv_caches`.
-    let Some(prefill_logits) = chunked_prefill(
+    let prefill_logits = chunked_prefill(
         &mut kv_caches,
         prompt_ids,
         prefill_chunk,
         device,
         "Qwen3_5MoeForConditionalGeneration",
         |chunk, kv| model.forward_seq_with_cache(chunk, Some(kv), Some(&mut lin_caches), device),
-    )?
-    else {
-        return Ok(steps);
-    };
+    )?;
 
     let logits_flat = prefill_logits.reshape(&[1, vocab], device)?;
     // top-k logprob capture (0 = disabled, hot-loop zero-overhead).
