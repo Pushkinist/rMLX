@@ -1,7 +1,7 @@
-//! Unit tests for the rotor K GPU ring ([`RotorGpuK`]).
+//! Unit tests for the packed K GPU ring ([`QuantKGpuRing`]).
 //!
-//! The ring is the thing that makes the rotor K store readable by a Metal
-//! kernel without a host round-trip, so its prefix bookkeeping is
+//! The ring is the thing that makes a packed K store (rotor / iso) readable by
+//! a Metal kernel without a host round-trip, so its prefix bookkeeping is
 //! correctness-critical: a mis-seeded or mis-strided ring is silently wrong
 //! attention, not a slow path.
 
@@ -48,9 +48,13 @@ fn read_f32(a: &Array) -> Vec<f32> {
         .collect()
 }
 
-/// head_dim 6 → n_groups 2, so one sequence position with kv_h=2 is 4 code
-/// words and 2 norms. Small enough to assert element-by-element.
-const HEAD_DIM: i32 = 6;
+/// n_groups 2, so one sequence position with kv_h=2 is 4 code words and 2
+/// norms. Small enough to assert element-by-element.
+///
+/// The ring takes `n_groups` directly — how a codec derives it from `head_dim`
+/// (rotor `ceil(D/3)`, iso `D/4`) is the codec's rule, not the ring's, so no
+/// head_dim appears here.
+const N_GROUPS: i32 = 2;
 const KV_H: i32 = 2;
 const CODES_PER_STEP: usize = 4; // kv_h * n_groups = 2 * 2
 const NORMS_PER_STEP: usize = 2; // kv_h
@@ -60,7 +64,7 @@ fn new_ring_is_unallocated_and_views_none() {
     if skip_if_no_gpu_env() {
         return;
     }
-    let ring = RotorGpuK::default();
+    let ring = QuantKGpuRing::default();
     assert!(!ring.is_allocated());
     assert_eq!(ring.byte_size(), 0);
     let view = ring.packed_view(4, Device::Gpu).expect("packed_view");
@@ -75,7 +79,7 @@ fn append_then_view_round_trips_payload() {
     if skip_if_no_gpu_env() {
         return;
     }
-    let mut ring = RotorGpuK::default();
+    let mut ring = QuantKGpuRing::default();
     let codes: Vec<u32> = (0..CODES_PER_STEP as u32).collect();
     let scales: Vec<f32> = vec![0.5, 1.5, 2.5, 3.5];
     let norms: Vec<f32> = vec![7.0, 8.0];
@@ -85,7 +89,7 @@ fn append_then_view_round_trips_payload() {
         &f32_arr(&scales),
         &f32_arr(&norms),
         KV_H,
-        HEAD_DIM,
+        N_GROUPS,
         0,
         1,
         64,
@@ -107,7 +111,7 @@ fn sequential_appends_land_at_increasing_offsets() {
     if skip_if_no_gpu_env() {
         return;
     }
-    let mut ring = RotorGpuK::default();
+    let mut ring = QuantKGpuRing::default();
     // Three single-position appends; each step's payload is tagged by value so
     // a mis-strided write shows up as a wrong element, not just a wrong length.
     for step in 0..3_u32 {
@@ -123,7 +127,7 @@ fn sequential_appends_land_at_increasing_offsets() {
             &f32_arr(&scales),
             &f32_arr(&norms),
             KV_H,
-            HEAD_DIM,
+            N_GROUPS,
             step as i32,
             1,
             64,
@@ -163,13 +167,13 @@ fn seed_from_cpu_then_append_preserves_prefix() {
         .map(|i| i as f32 + 0.5)
         .collect();
 
-    let mut ring = RotorGpuK::default();
+    let mut ring = QuantKGpuRing::default();
     ring.seed_from_cpu(
         &cpu_codes,
         &cpu_scales,
         &cpu_norms,
         KV_H,
-        HEAD_DIM,
+        N_GROUPS,
         filled,
         64,
         Device::Gpu,
@@ -183,7 +187,7 @@ fn seed_from_cpu_then_append_preserves_prefix() {
         &f32_arr(&[9.0, 9.1, 9.2, 9.3]),
         &f32_arr(&[99.0, 99.1]),
         KV_H,
-        HEAD_DIM,
+        N_GROUPS,
         filled,
         1,
         64,
@@ -211,13 +215,13 @@ fn seed_is_a_no_op_once_allocated() {
     if skip_if_no_gpu_env() {
         return;
     }
-    let mut ring = RotorGpuK::default();
+    let mut ring = QuantKGpuRing::default();
     ring.append_encoded(
         &u32_arr(&[1, 2, 3, 4]),
         &f32_arr(&[1.0, 2.0, 3.0, 4.0]),
         &f32_arr(&[5.0, 6.0]),
         KV_H,
-        HEAD_DIM,
+        N_GROUPS,
         0,
         1,
         64,
@@ -231,7 +235,7 @@ fn seed_is_a_no_op_once_allocated() {
         &[0.0; CODES_PER_STEP],
         &[0.0; NORMS_PER_STEP],
         KV_H,
-        HEAD_DIM,
+        N_GROUPS,
         1,
         64,
         Device::Gpu,
@@ -256,7 +260,7 @@ fn growth_across_a_page_boundary_preserves_prefix() {
     }
     // KV_PAGE_SIZE positions fit in the first page; position KV_PAGE_SIZE
     // forces a realloc + prefix copy.
-    let mut ring = RotorGpuK::default();
+    let mut ring = QuantKGpuRing::default();
     let first = KV_PAGE_SIZE;
     let cpu_codes: Vec<u32> = (0..(first as usize * CODES_PER_STEP) as u32).collect();
     let cpu_scales: Vec<f32> = vec![1.0; first as usize * CODES_PER_STEP];
@@ -266,7 +270,7 @@ fn growth_across_a_page_boundary_preserves_prefix() {
         &cpu_scales,
         &cpu_norms,
         KV_H,
-        HEAD_DIM,
+        N_GROUPS,
         first,
         4096,
         Device::Gpu,
@@ -279,7 +283,7 @@ fn growth_across_a_page_boundary_preserves_prefix() {
         &f32_arr(&[1.0, 1.0, 1.0, 1.0]),
         &f32_arr(&[3.0, 3.0]),
         KV_H,
-        HEAD_DIM,
+        N_GROUPS,
         first,
         1,
         4096,
@@ -310,13 +314,13 @@ fn clear_drops_the_ring() {
     if skip_if_no_gpu_env() {
         return;
     }
-    let mut ring = RotorGpuK::default();
+    let mut ring = QuantKGpuRing::default();
     ring.append_encoded(
         &u32_arr(&[1, 2, 3, 4]),
         &f32_arr(&[1.0, 2.0, 3.0, 4.0]),
         &f32_arr(&[5.0, 6.0]),
         KV_H,
-        HEAD_DIM,
+        N_GROUPS,
         0,
         1,
         64,
@@ -341,13 +345,13 @@ fn append_on_unallocated_ring_with_existing_prefix_errors() {
     // The zeroed-prefix footgun: allocating here and writing only
     // [prev_seq, needed) would leave [0, prev_seq) as zeros — silently wrong
     // attention. Must be rejected rather than "helpfully" allocated.
-    let mut ring = RotorGpuK::default();
+    let mut ring = QuantKGpuRing::default();
     let err = ring.append_encoded(
         &u32_arr(&[1, 2, 3, 4]),
         &f32_arr(&[1.0, 2.0, 3.0, 4.0]),
         &f32_arr(&[5.0, 6.0]),
         KV_H,
-        HEAD_DIM,
+        N_GROUPS,
         5, // prev_seq > 0 on an unallocated ring
         1,
         64,
@@ -369,13 +373,13 @@ fn append_beyond_max_seq_errors() {
     if skip_if_no_gpu_env() {
         return;
     }
-    let mut ring = RotorGpuK::default();
+    let mut ring = QuantKGpuRing::default();
     let err = ring.append_encoded(
         &u32_arr(&[1, 2, 3, 4]),
         &f32_arr(&[1.0, 2.0, 3.0, 4.0]),
         &f32_arr(&[5.0, 6.0]),
         KV_H,
-        HEAD_DIM,
+        N_GROUPS,
         8,
         1,
         8, // max_seq — prev_seq + new_seq = 9 > 8
@@ -392,14 +396,14 @@ fn chunk_length_mismatch_errors() {
     if skip_if_no_gpu_env() {
         return;
     }
-    let mut ring = RotorGpuK::default();
+    let mut ring = QuantKGpuRing::default();
     // Two positions' worth of codes declared as new_seq = 1.
     let err = ring.append_encoded(
         &u32_arr(&[1, 2, 3, 4, 5, 6, 7, 8]),
         &f32_arr(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
         &f32_arr(&[5.0, 6.0]),
         KV_H,
-        HEAD_DIM,
+        N_GROUPS,
         0,
         1,
         64,
@@ -416,13 +420,13 @@ fn seed_length_mismatch_errors() {
     if skip_if_no_gpu_env() {
         return;
     }
-    let mut ring = RotorGpuK::default();
+    let mut ring = QuantKGpuRing::default();
     let err = ring.seed_from_cpu(
         &[1, 2, 3], // not filled_seq * kv_h * n_groups
         &[1.0, 2.0, 3.0],
         &[1.0, 2.0],
         KV_H,
-        HEAD_DIM,
+        N_GROUPS,
         1,
         64,
         Device::Gpu,

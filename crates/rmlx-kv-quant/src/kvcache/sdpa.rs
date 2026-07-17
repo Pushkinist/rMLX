@@ -12,12 +12,13 @@ use rmlx_mlx::{
     add, dequantize, matmul, scaled_dot_product_attention, softmax_precise, Array, Device, Dtype,
 };
 
+use crate::iso_flash_decode_msl::{iso_flash_decode_sdpa, ISO_FLASH_HEAD_DIM_MAX};
 use crate::mixed_quant::{mixed_quantized_sdpa, rot_k_tq4v_sdpa};
 use crate::planar_flash_decode_msl::{planar_flash_decode_enabled, planar_flash_decode_sdpa};
 use crate::planar_fused_qk::planar_fused_qk_enabled;
 use crate::planar_fused_qk_msl::planar_fused_qk;
 use crate::rotor_flash_decode_msl::{rotor_flash_decode_sdpa, ROTOR_FLASH_HEAD_DIM_MAX};
-use crate::storage::KvStorage;
+use crate::storage::{KvStorage, ISO_QUAT_BLOCK_SIZE};
 
 use super::helpers::{f32_vec_to_array, storage_variant_name};
 use super::shared_kv::SharedKv;
@@ -691,6 +692,42 @@ impl KvCache {
             }
         }
 
+        // 1d. Iso K-only flash-decode fast path. Same shape as the rotor arm
+        // above and for the same reason: without it this codec CPU-dequants the
+        // entire K prefix on every decode step (`QuantIsoK{3,4}::dequant()` →
+        // `Vec<f32>` → re-upload), which is O(seq) host work per token with the
+        // GPU idle. The kernel reads the packed iso ring directly instead.
+        //
+        // Iso has no QJL sideband — that is a rotor-only residual — so there is
+        // no equivalent gate here.
+        //
+        // The decode-only gate (q_seq == 1) is checked HERE, not in the helper:
+        // the helper mutates cache state (store append, bf16 V accumulate)
+        // before it knows whether it can complete the SDPA, so a late fallback
+        // would double-append.
+        if matches!(
+            self.storage,
+            KvStorage::IsoKOnly3 { .. } | KvStorage::IsoKOnly4 { .. }
+        ) && device == Device::Gpu
+            && queries.shape().get(2).copied().unwrap_or(0) == 1
+        {
+            if let Some(out) = self.update_and_sdpa_iso_k_fused(
+                queries,
+                new_k,
+                new_v,
+                scale,
+                additive_mask,
+                device,
+            )? {
+                tracing::trace!(
+                    kv_bytes = self.approx_bytes(),
+                    offset = self.offset,
+                    "kv cache bytes"
+                );
+                return Ok(out);
+            }
+        }
+
         // 2. K8V4 TurboFlash path (returns None when not eligible).
         if let Some(out) =
             self.sdpa_dispatch(queries, new_k, new_v, scale, additive_mask, device)?
@@ -705,11 +742,10 @@ impl KvCache {
             return Ok(out);
         }
 
-        // 2b. Head-major fused-QK shadow path (q8/turbo3/turbo4 today;
-        // iso/rotor are HOLD until GPU encoders ship). Decode-only,
-        // gated by `RMLX_FUSED_QK=1`. Returns `None` to fall through to the
-        // legacy bf16 SDPA path when any gate is off, when the codec has
-        // no GPU encoder yet, or when the bf16 mirror is not yet seeded
+        // 2b. Head-major fused-QK shadow path (q8/turbo3/turbo4/iso/rotor).
+        // Decode-only, gated by `RMLX_FUSED_QK=1`. Returns `None` to fall
+        // through to the legacy bf16 SDPA path when any gate is off, when the
+        // codec has no GPU encoder, or when the bf16 mirror is not yet seeded
         // (cold-prefill window).
         if let Some(out) =
             self.try_fused_qk_dispatch(queries, new_k, new_v, scale, additive_mask, device)?
@@ -998,6 +1034,35 @@ impl KvCache {
             }
         }
 
+        // Iso K-only flash-decode. Mirrors arm 1d of `update_and_sdpa`; without
+        // it a shared-KV model (Gemma4) would push this codec onto the legacy
+        // bf16 path and the kernel would be silently dead there.
+        if matches!(
+            self.storage,
+            KvStorage::IsoKOnly3 { .. } | KvStorage::IsoKOnly4 { .. }
+        ) && device == Device::Gpu
+            && q_seq_is_decode
+        {
+            if let Some(out) = self.update_and_sdpa_iso_k_fused(
+                queries,
+                new_k,
+                new_v,
+                scale,
+                additive_mask,
+                device,
+            )? {
+                tracing::debug!(
+                    target: "rmlx_kv_quant::shared_kv",
+                    kernel = "iso_flash",
+                    offset = self.offset,
+                    "fused kernel dispatched on the shared-KV producer path — \
+                     consumers attend the quant store"
+                );
+                let kv_len = iso_k_accumulated_seq(&self.storage)?;
+                return Ok(Some((out, kv_len)));
+            }
+        }
+
         Ok(None)
     }
 
@@ -1050,8 +1115,7 @@ impl KvCache {
             return Ok(Some((out, k_full, v_full)));
         }
 
-        // Head-major fused-QK shadow (q8/turbo3/turbo4 codecs today;
-        // iso/rotor HOLD pending GPU encoders).
+        // Head-major fused-QK shadow (q8/turbo3/turbo4/iso/rotor codecs).
         if let Some(out) =
             self.try_fused_qk_dispatch(queries, new_k, new_v, scale, additive_mask, device)?
         {
@@ -1111,6 +1175,12 @@ impl KvCache {
                     device,
                 )
             }
+            KvStorage::IsoKOnly3 { .. } | KvStorage::IsoKOnly4 { .. } => {
+                let kv_seq = iso_k_accumulated_seq(&self.storage)?;
+                Self::check_shared_kv_len(kv_len, kv_seq)?;
+                let v_full = self.slice_decode_fp16_v(kv_seq, device)?;
+                self.iso_k_flash_over_store(queries, &v_full, scale, additive_mask, kv_seq, device)
+            }
             KvStorage::PlanarK { .. } => {
                 let kv_seq = planar_k_accumulated_seq(&self.storage)?;
                 Self::check_shared_kv_len(kv_len, kv_seq)?;
@@ -1168,6 +1238,14 @@ impl KvCache {
             }
             KvStorage::RotorKOnly4 { k: Some(ks), .. } => {
                 Self::check_shared_kv_len(kv_len, rotor_k_accumulated_seq(&self.storage)?)?;
+                f32_vec_to_array(&ks.dequant()?, &ks.shape)?
+            }
+            KvStorage::IsoKOnly3 { k: Some(ks), .. } => {
+                Self::check_shared_kv_len(kv_len, iso_k_accumulated_seq(&self.storage)?)?;
+                f32_vec_to_array(&ks.dequant()?, &ks.shape)?
+            }
+            KvStorage::IsoKOnly4 { k: Some(ks), .. } => {
+                Self::check_shared_kv_len(kv_len, iso_k_accumulated_seq(&self.storage)?)?;
                 f32_vec_to_array(&ks.dequant()?, &ks.shape)?
             }
             KvStorage::PlanarK { k: Some(ks), .. } => {
@@ -1905,6 +1983,272 @@ impl KvCache {
         let rotors_arr = crate::rotorquant_msl::rotor_table_to_array(rotors)?;
         Ok(Some((codes, scales, norms, rotors_arr)))
     }
+
+    /// Flash-decode dispatch for the iso K-only storage variants
+    /// (`IsoKOnly3` / `IsoKOnly4`).
+    ///
+    /// Sibling of [`Self::update_and_sdpa_rotor_k_fused`] — see it for the full
+    /// rationale. Same shape, same ordering constraints:
+    ///
+    ///   1. Append `new_k` into the iso store — GPU encode into the packed ring,
+    ///      no dequant.
+    ///   2. Append `new_v` into the bf16 accumulator (V is bf16 for this codec).
+    ///   3. Run [`iso_flash_decode_sdpa`] over the ring's packed view.
+    ///
+    /// The full-prefix `QuantIsoK{3,4}::dequant()` is skipped — that is the
+    /// entire point: it is O(seq) CPU work per decode step.
+    ///
+    /// Caller must have already gated `q_seq == 1` and `device == Gpu` BEFORE
+    /// any cache mutation.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "all index uses validated by the shape contracts at function entry"
+    )]
+    fn update_and_sdpa_iso_k_fused(
+        &mut self,
+        queries: &Array,
+        new_k: &Array,
+        new_v: &Array,
+        scale: f32,
+        additive_mask: Option<&Array>,
+        device: Device,
+    ) -> Result<Option<Array>> {
+        let new_shape = new_k.shape();
+        if new_shape.len() != 4 {
+            return Err(Error::Mlx(format!(
+                "iso_k_fused: new_k rank != 4, got {new_shape:?}"
+            )));
+        }
+        let new_seq = new_shape[2];
+
+        // Shape gates — checked BEFORE any mutation so a reject is a clean
+        // fall-through to the legacy path.
+        if !Self::iso_flash_shape_ok(&new_shape) {
+            return Ok(None);
+        }
+
+        let prev_seq = self.offset;
+        // Not an iso K-only cache: the caller's gate should have kept us out.
+        // Fall through rather than mutate.
+        if !matches!(
+            self.storage,
+            KvStorage::IsoKOnly3 { .. } | KvStorage::IsoKOnly4 { .. }
+        ) {
+            return Ok(None);
+        }
+        // Provision this step before the first mutation: both the packed ring
+        // below and the bf16 V mirror further down are capped by the storage
+        // `max_seq`, so it has to cover `prev_seq + new_seq` first.
+        self.ensure_decode_capacity(prev_seq + new_seq)?;
+        self.iso_k_gpu_append(new_k, &new_shape, device)?;
+
+        // CRITICAL: advance `self.offset` BEFORE `update_decode_fp16_v_only` —
+        // the V-only helper computes its write window as
+        // `[self.offset - new_seq, self.offset)`. Without the pre-increment
+        // every decode step overwrites the last V position instead of
+        // appending. Same ordering as `update_and_sdpa_rotor_k_fused`.
+        self.offset = prev_seq + new_seq;
+        let max_seq = iso_k_max_seq(&self.storage)?;
+        let v_full = self.update_decode_fp16_v_only(new_v, max_seq, device)?;
+
+        // Take `kv_seq` from the store the ring was written from, not from
+        // `self.offset` — one source of truth.
+        let kv_seq = iso_k_accumulated_seq(&self.storage)?;
+        debug_assert_eq!(
+            kv_seq, self.offset,
+            "iso_k_fused: store seq {kv_seq} != cache offset {} — the ring write \
+             and the attention length disagree",
+            self.offset
+        );
+        // Past this point the cache is already mutated, so `Ok(None)` is NOT
+        // available: it would send the caller into the legacy `update()` path,
+        // which appends K/V a second time and advances `offset` again. Every
+        // not-eligible condition is screened at the call-site gate and by
+        // `iso_flash_shape_ok` BEFORE any mutation.
+        let out =
+            self.iso_k_flash_over_store(queries, &v_full, scale, additive_mask, kv_seq, device)?;
+        Ok(Some(out))
+    }
+
+    /// Run the iso flash-decode kernel over the K already packed in this cache's
+    /// store — no append, no offset advance.
+    ///
+    /// Split out of [`Self::update_and_sdpa_iso_k_fused`] so a shared-KV
+    /// **consumer** layer can attend the producer's store through the exact same
+    /// kernel the producer used. Sibling of
+    /// [`Self::rotor_k_flash_over_store`].
+    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "all index uses validated by the shape contracts at function entry"
+    )]
+    fn iso_k_flash_over_store(
+        &self,
+        queries: &Array,
+        v_full: &Array,
+        scale: f32,
+        additive_mask: Option<&Array>,
+        kv_seq: i32,
+        device: Device,
+    ) -> Result<Array> {
+        // Select the bit width from the live storage variant. No wildcard arm:
+        // an unexpected variant must not be decoded with another codec's kernel.
+        let bits: u8 = if matches!(self.storage, KvStorage::IsoKOnly3 { .. }) {
+            3
+        } else if matches!(self.storage, KvStorage::IsoKOnly4 { .. }) {
+            4
+        } else {
+            return Err(Error::KvStorageMismatch {
+                expected: "IsoKOnly3 | IsoKOnly4",
+                got: storage_variant_name(&self.storage),
+            });
+        };
+        let Some((codes, scales, norms)) = self.iso_k_packed_view(kv_seq, device)? else {
+            return Err(Error::Mlx(format!(
+                "iso_k_fused: GPU ring absent after a maintained append \
+                 (kv_seq={kv_seq}, bits={bits}) — internal invariant violated"
+            )));
+        };
+
+        let v_shape = v_full.shape();
+        if v_shape.len() != 4 {
+            return Err(Error::Mlx(format!(
+                "iso_k_fused: V rank != 4, got {v_shape:?}"
+            )));
+        }
+        let b = v_shape[0];
+        let kv_h = v_shape[1];
+        let head_dim = v_shape[3];
+
+        let q_shape = queries.shape();
+        if q_shape.len() != 4 {
+            return Err(Error::Mlx(format!(
+                "iso_k_fused: Q shape rank != 4, got {q_shape:?}"
+            )));
+        }
+        let q_seq = q_shape[2];
+        let n_q_heads = q_shape[1];
+        // Defence-in-depth: the call site already gates decode-only.
+        if q_seq != 1 {
+            return Err(Error::Mlx(format!(
+                "iso_k_fused: q_seq must be 1 (decode-only), got {q_seq}"
+            )));
+        }
+        if n_q_heads % kv_h != 0 {
+            return Err(Error::Mlx(format!(
+                "iso_k_fused: n_q_heads={n_q_heads} not divisible by kv_h={kv_h}"
+            )));
+        }
+        let heads_per_kv = n_q_heads / kv_h;
+
+        tracing::Span::current().record("path", "iso_flash_decode");
+        // Select the bit width explicitly. A wildcard arm here would map any
+        // unexpected `bits` onto one width's kernel and decode the other's codes
+        // at the wrong unpack stride — silently wrong K, no error. `bits` is a
+        // plain integer, so no exhaustiveness lint would catch that.
+        let flash_out = match bits {
+            3 => iso_flash_decode_sdpa::<3>(
+                queries,
+                &codes,
+                &scales,
+                &norms,
+                v_full,
+                additive_mask,
+                b,
+                kv_h,
+                kv_seq,
+                head_dim,
+                heads_per_kv,
+                scale,
+                device,
+            )?,
+            4 => iso_flash_decode_sdpa::<4>(
+                queries,
+                &codes,
+                &scales,
+                &norms,
+                v_full,
+                additive_mask,
+                b,
+                kv_h,
+                kv_seq,
+                head_dim,
+                heads_per_kv,
+                scale,
+                device,
+            )?,
+            other => {
+                return Err(Error::Quant(format!(
+                    "iso_k_fused: unsupported bits={other} (only 3 and 4); \
+                     refusing to decode with another width's kernel"
+                )))
+            }
+        };
+        if flash_out.dtype() == queries.dtype() {
+            Ok(flash_out)
+        } else {
+            flash_out.astype(queries.dtype(), device)
+        }
+    }
+
+    /// Shape gates for the iso flash-decode kernel, evaluated before any cache
+    /// mutation.
+    ///
+    /// Keyed off shape only — never an arch name. `b == 1` because the packed
+    /// ring's per-step stride does not interleave batch (one `KvCache` per
+    /// request); a batched cache falls back rather than read a layout the kernel
+    /// would misinterpret.
+    fn iso_flash_shape_ok(new_shape: &[i32]) -> bool {
+        let (Some(&b), Some(&kv_h), Some(&head_dim)) =
+            (new_shape.first(), new_shape.get(1), new_shape.get(3))
+        else {
+            return false;
+        };
+        if b != 1 || kv_h <= 0 {
+            return false;
+        }
+        if head_dim <= 0 || head_dim > ISO_FLASH_HEAD_DIM_MAX {
+            return false;
+        }
+        // One quaternion block per group — a partial trailing group has no
+        // defined decode.
+        if !(head_dim as usize).is_multiple_of(ISO_QUAT_BLOCK_SIZE) {
+            return false;
+        }
+        // Tree reduction over `head_dim` threads.
+        (head_dim as u32).is_power_of_two()
+    }
+
+    /// GPU-append `new_k` into whichever iso K-only store is active.
+    fn iso_k_gpu_append(&mut self, new_k: &Array, new_shape: &[i32], device: Device) -> Result<()> {
+        if matches!(self.storage, KvStorage::IsoKOnly3 { .. }) {
+            super::update::iso3_k_only_gpu_append(self, new_k, new_shape, device)
+        } else if matches!(self.storage, KvStorage::IsoKOnly4 { .. }) {
+            super::update::iso4_k_only_gpu_append(self, new_k, new_shape, device)
+        } else {
+            Err(Error::KvStorageMismatch {
+                expected: "IsoKOnly3 | IsoKOnly4",
+                got: storage_variant_name(&self.storage),
+            })
+        }
+    }
+
+    /// `(codes, scales, norms)` GPU view of the active iso K store at `kv_seq`,
+    /// or `None` when the ring is not live.
+    fn iso_k_packed_view(
+        &self,
+        kv_seq: i32,
+        device: Device,
+    ) -> Result<Option<(Array, Array, Array)>> {
+        if let KvStorage::IsoKOnly3 { k: Some(ks), .. } = &self.storage {
+            ks.gpu_packed_view(kv_seq, device)
+        } else if let KvStorage::IsoKOnly4 { k: Some(ks), .. } = &self.storage {
+            ks.gpu_packed_view(kv_seq, device)
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 /// Whether the active rotor K-only store carries the QJL residual sideband.
@@ -1966,6 +2310,46 @@ fn planar_k_accumulated_seq(storage: &KvStorage) -> Result<i32> {
             ks.shape
         ))
     })
+}
+
+/// Accumulated sequence length held by the active iso K-only store.
+///
+/// Sibling of [`rotor_k_accumulated_seq`]: the store's own `shape[2]` is the
+/// length the GPU ring was written against, so it — not [`KvCache::offset`] —
+/// is what the kernel attends and what a shared-KV consumer sizes its mask
+/// from.
+fn iso_k_accumulated_seq(storage: &KvStorage) -> Result<i32> {
+    let shape = if let KvStorage::IsoKOnly3 { k: Some(ks), .. } = storage {
+        &ks.shape
+    } else if let KvStorage::IsoKOnly4 { k: Some(ks), .. } = storage {
+        &ks.shape
+    } else {
+        return Err(Error::KvStorageMismatch {
+            expected: "IsoKOnly3 | IsoKOnly4 with a live K buffer",
+            got: storage_variant_name(storage),
+        });
+    };
+    shape.get(2).copied().ok_or_else(|| {
+        Error::Mlx(format!(
+            "iso_k_fused: iso K store shape {shape:?} has no seq axis"
+        ))
+    })
+}
+
+/// `max_seq` of the active iso K-only storage variant.
+///
+/// Read from the live `KvStorage` variant — which `ensure_decode_capacity` has
+/// just grown for this step — never from the store struct's own inert
+/// `max_seq` field, which is a prefill-time snapshot.
+fn iso_k_max_seq(storage: &KvStorage) -> Result<i32> {
+    if let KvStorage::IsoKOnly3 { max_seq, .. } | KvStorage::IsoKOnly4 { max_seq, .. } = storage {
+        Ok(*max_seq)
+    } else {
+        Err(Error::KvStorageMismatch {
+            expected: "IsoKOnly3 | IsoKOnly4",
+            got: storage_variant_name(storage),
+        })
+    }
 }
 
 /// `max_seq` of the active rotor K-only storage variant.

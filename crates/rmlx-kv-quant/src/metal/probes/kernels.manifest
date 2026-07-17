@@ -19,6 +19,11 @@
 # the probe only — production still builds them at dispatch. Regenerate them if
 # a header builder changes; see README.md here.
 
+# One flash-decode pass-1 body serves both iso bit widths — the unpack width
+# arrives via the header (IF_BITS / IF_MASK), so each header gets its own probe
+# line over the same body.
+iso_flash_decode_p1.metal | iso_flash_decode_p1_b3.hdr.metal | query:f,codes:u,scales:f,norms:f,v_flat:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
+iso_flash_decode_p1.metal | iso_flash_decode_p1_b4.hdr.metal | query:f,codes:u,scales:f,norms:f,v_flat:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
 iso_fused_qk_b3.metal | iso_fused_qk_b3.hdr.metal | query:f,codes:u,scales:f,norms:f,mask:f,scale_arr:f,dims:u,out:f
 iso_fused_qk_b4.metal | iso_fused_qk_b4.hdr.metal | query:f,codes:u,scales:f,norms:f,mask:f,scale_arr:f,dims:u,out:f
 isoquant_quantize_iso3.metal | isoquant_iso3.hdr.metal | inp:f,n_groups:u,codes_out:u,scales_out:f,norms_out:f
@@ -26,8 +31,9 @@ isoquant_dequantize_iso3.metal | isoquant_iso3.hdr.metal | codes_in:u,scales_in:
 k8vturbo3_quantize.metal | ../k8vturbo3_header.metal | inp:f,codes:u,scales:f
 k8vturbo3_dequantize.metal | ../k8vturbo3_header.metal | codes:u,scales:f,out:f
 planar_flash_decode_p1.metal | planar_flash_decode_p1.hdr.metal | query:f,k_codes:u,k_scales:f,k_rot32:u,v_flat:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
-# Codec-agnostic flash-decode pass-2 LSE merge; shared by the planar and rotor
-# flash-decode dispatchers (each registers its own kernel name over this body).
+# Codec-agnostic flash-decode pass-2 LSE merge; shared by the planar, rotor and
+# iso flash-decode dispatchers (each registers its own kernel name over this
+# body).
 flash_decode_merge_p2.metal | - | partial_o:f,tile_max:f,tile_sum_exp:f,dims_p2:u,dst:f
 planar_fused_qk_b3.metal | planar_fused_qk_b3.hdr.metal | query:f,codes:u,scales:f,rot32:u,scale_arr:f,dims:u,out:f
 planar_fused_qk_b4.metal | planar_fused_qk_b4.hdr.metal | query:f,codes:u,scales:f,rot32:u,scale_arr:f,dims:u,out:f
