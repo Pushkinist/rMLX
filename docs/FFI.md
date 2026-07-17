@@ -28,16 +28,176 @@ drives mlx-c directly to control every detail of the FFI contract.
 
 ### Versioned ABI
 
-mlx-c pins a specific MLX version. The build links against:
+mlx-c pins a specific MLX version. The build links `libmlxc.dylib` and
+`libmlx.dylib`, resolving each prefix in this order:
 
-- `libmlxc.dylib` — mlx-c 0.6.0, default prefix
-  `/opt/homebrew/Cellar/mlx-c/0.6.0_2/lib`.
-- `libmlx.dylib` — MLX 0.31.2, default prefix
-  `/opt/homebrew/Cellar/mlx/0.31.2/lib`.
+1. `MLX_C_PREFIX` / `MLX_PREFIX` — explicit override.
+2. `brew --prefix mlx-c` / `brew --prefix mlx`.
+3. `/opt/homebrew/opt/mlx-c` / `/opt/homebrew/opt/mlx` — the conventional
+   Homebrew `opt` symlink.
 
-Both prefixes are overridable via `MLX_C_PREFIX` / `MLX_PREFIX` env vars.
 `build.rs` asserts the dylibs exist and aborts the build with an actionable
 message if they are absent.
+
+Resolving to the `opt` path rather than a Cellar path is deliberate. Both
+dylibs' install names **are** `opt` paths:
+
+```
+$ otool -D /opt/homebrew/opt/mlx/lib/libmlx.dylib
+/opt/homebrew/opt/mlx/lib/libmlx.dylib
+```
+
+so that symlink decides what gets loaded at run time regardless of what the
+build pointed at. An upgrade repoints it and silently retargets an
+already-built binary — no rebuild, no relink, no diagnostic. Building against
+the same path the loader uses is what keeps compile-time and run-time on the
+same file; a hard-coded Cellar path drifts from it on the next upgrade.
+
+### Pinned MLX / mlx-c pair
+
+rMLX declares the MLX stack it is validated against in **one** place:
+
+```
+crates/rmlx-mlx/mlx-pin.txt
+```
+
+```
+mlx    0.31.2
+mlx-c  0.6.0_2
+```
+
+Nothing else in the tree declares these versions — `build.rs` reads that file,
+and bumping a line there is the whole change.
+
+**They bump together.** mlx-c is compiled against a specific mlx, and both
+resolve the moving `opt` symlink at run time, so a mismatched pair aborts at
+load:
+
+```
+dyld: Symbol not found: __ZN3mlx4core4fast12metal_kernelE...
+  Referenced from: .../mlx-c/0.6.0_3/lib/libmlxc.dylib
+  Expected in:     .../mlx/0.31.2/lib/libmlx.dylib
+```
+
+(mlx-c 0.6.0_3 is built against mlx 0.32.0. Same upstream 0.6.0 as `_2` — the
+Homebrew revision suffix is the only thing that distinguishes them, which is
+why the pin carries it.)
+
+#### Why the pin exists
+
+Homebrew's `mlx` 0.32.0 bottle ships **zero** `steel_gemm_fused_nax_*` kernels
+— the M5 Neural-Accelerator GEMM path. The pinned 0.31.2 bottle ships 145 of
+them:
+
+```sh
+strings "$(brew --prefix mlx)/lib/mlx.metallib" | grep -c steel_gemm_fused_nax
+# 0.31.2 -> 288      0.32.0 -> 0
+```
+
+(`grep -c` counts matching *lines*, not kernels: 145 distinct kernel functions
+appear on 288 lines. Only the zero is load-bearing — the build's probe is
+boolean and never counts.)
+
+Measured cost: ~3.8× lower GPU matmul throughput, 2.2–3.7× slower prefill on
+Neural-Accelerator-class hardware. Decode is bandwidth-bound and barely moves
+(gemma-4-e2b @4k, median of 3, same binary: prefill 6,916 → 15,352 t/s, decode
+124.5 → 119.9), so the symptom looks like a model-code defect rather than a
+toolchain one — it cost one investigation days of misattribution before the
+metallib was inspected.
+
+This is a **Homebrew bottle regression, not an MLX regression**: the upstream
+0.32.0 PyPI wheel ships the kernels and is fine. Tracked in
+[#216](https://github.com/Pushkinist/rMLX/issues/216).
+
+#### What the build checks
+
+`build.rs` warns — never fails — on two independent things:
+
+| Check | Fires when | Meaning |
+|---|---|---|
+| **Capability** | the resolved `mlx.metallib` contains no `steel_gemm_fused_nax` | the real defect; names both versions and the fix command |
+| **Pin drift** | resolved mlx/mlx-c ≠ the pinned pair, but the kernels are present | informational; the pair is unvalidated, and bumping the pin may be due |
+
+Warning rather than failing is deliberate: the pin records what *was validated
+here*, not a claim that everything else is broken. A correct non-bottle build
+of another version must still compile.
+
+The capability probe is the ground truth; the version pin only proxies for it.
+The probe is what keeps this from nagging forever once a fixed bottle ships —
+it simply passes. Neither check can be verified from a version number alone,
+which is why both exist.
+
+Version identity comes from different places per formula, of necessity: mlx
+ships `include/mlx/version.h` (authoritative, and works on non-Homebrew
+layouts), while mlx-c ships no version header at all — its identity is the keg
+directory name, which is also the only place the load-bearing revision suffix
+appears. A non-keg layout (a wheel, a hand-built tree) yields no version and
+the pin stays quiet rather than guessing.
+
+#### Fixing a machine that drifted
+
+Both kegs must already be in the Cellar (`ls /opt/homebrew/Cellar/mlx`):
+
+```sh
+ln -sfn ../Cellar/mlx/0.31.2 /opt/homebrew/opt/mlx && \
+ln -sfn ../Cellar/mlx-c/0.6.0_2 /opt/homebrew/opt/mlx-c && \
+brew pin mlx mlx-c && \
+cargo clean -p rmlx-mlx        # required — see below
+```
+
+`brew pin` stops a later `brew upgrade` from repointing the symlinks back.
+
+**The `cargo clean` is required, not hygiene.** Cargo re-runs a build script
+only when a `rerun-if-changed` path is *newer* than the last run, and it stats
+**through** the symlink. Repointing `opt/mlx` at the older validated keg moves
+the observed mtime **backwards** (0.31.2's metallib predates 0.32.0's), so a
+plain rebuild does not re-run `build.rs` at all: the crate keeps bindings
+generated against the wrong headers and a stale baked-in
+`RMLX_MLX_BUILD_VERSION`, while the loader picks up the newly-linked pair. That
+combination is the ABI abort this section exists to avoid. Touching
+`crates/rmlx-mlx/mlx-pin.txt` forces the same re-run if you prefer.
+
+#### Un-pinning when the bottle is fixed
+
+1. `brew unpin mlx mlx-c && brew upgrade mlx mlx-c`
+2. Verify the capability actually returned — this is the whole point:
+   ```sh
+   strings "$(brew --prefix mlx)/lib/mlx.metallib" | grep -c steel_gemm_fused_nax
+   # must be non-zero (288 on the 0.31.2 bottle); zero means the bottle is still broken
+   ```
+   Assert non-zero, not a particular count: the number is a `strings` line count
+   that tracks kernel-name spelling, and the build's probe only asks present/absent.
+3. Bump **both** lines in `crates/rmlx-mlx/mlx-pin.txt` to the new pair
+   (`brew list --versions mlx mlx-c` gives the keg names, revision suffix
+   included). Editing the pin file is itself a rebuild trigger, which is what
+   makes step 4 mean something.
+4. Rebuild and confirm the build emits no MLX warning — but only after
+   `cargo clean -p rmlx-mlx`. Upgrading normally moves mtimes forward, so the
+   re-run usually happens on its own; a *downgrade* does not, and then "no
+   warning" would merely mean the check never ran. Force it and the step is
+   real. Confirm `build.rs` actually ran with `cargo build -p rmlx-mlx -vv`
+   (its output appears only on a real run).
+5. Re-verify on a real prefill cell, not just the kernel count:
+   ```sh
+   rmlx baseline --model <gemma-4-e2b> --kv-quant none --max-ctx 8192 --prompt-tokens 4096
+   ```
+   Expect ~15k t/s prefill. A regression to ~7k means the kernels are present
+   but unused — reopen [#216](https://github.com/Pushkinist/rMLX/issues/216)
+   rather than re-pinning silently.
+
+Note that fixture lengths are nominal: `--prompt-tokens 4096` tokenizes to
+~4410 on Gemma, so pass `--max-ctx` deliberately or the prompt is rejected and
+the cell reports `prefill_tps=0`.
+
+### Runtime version skew
+
+The build-time pin cannot see a symlink that moves *after* the build. The FFI
+layer therefore also compares the version it was compiled against
+(`RMLX_MLX_BUILD_VERSION`, baked by `build.rs` from the resolved prefix's
+`version.h`) against `mlx_version()` of the library actually loaded, on the
+existing one-shot init, and warns on mismatch. Together the two checks cover
+both halves: the pin catches a bad stack at compile time, the skew warning
+catches a stack that changed underneath a built binary.
 
 ### Build pipeline (`build.rs`)
 
@@ -49,10 +209,29 @@ message if they are absent.
 3. `build.rs` post-processes `bindings.rs` to strip any `#![...]` inner
    attributes bindgen 0.71 emits at the file head — these are illegal inside
    the `include!()` call site in `sys.rs`.
-4. Rebuild is triggered on `MLX_C_PREFIX`, `MLX_PREFIX`, or `wrapper.h`
-   changes.
-5. rpath entries are emitted so the binary finds both dylibs at runtime
+4. The resolved MLX / mlx-c pair is checked against `mlx-pin.txt`, and the
+   resolved `mlx.metallib` is scanned for the fast GEMM kernels. Both warn,
+   neither fails — see "Pinned MLX / mlx-c pair" above.
+5. Rebuild is triggered on `MLX_C_PREFIX`, `MLX_PREFIX`, `wrapper.h`,
+   `build_support.rs`, `mlx-pin.txt`, or a *newer* resolved
+   `version.h` / `mlx.metallib` (each registered only when it exists — cargo
+   treats a missing trigger path as permanently dirty, which would re-run
+   bindgen on every build of a non-keg layout).
+
+   **Repointing the `opt` symlink does not reliably re-run these checks.** Cargo
+   compares mtimes through the symlink and re-runs only for a newer one, so
+   moving to an *older* keg — the recovery direction — looks like nothing
+   changed. Use `cargo clean -p rmlx-mlx` when repointing; the runtime
+   version-skew warning below is the backstop for a binary that was never
+   rebuilt.
+6. rpath entries are emitted so the binary finds both dylibs at runtime
    without `DYLD_LIBRARY_PATH`.
+
+`build.rs`'s pure logic (pin parsing, keg-version and header-version
+resolution, the metallib scan) lives in `build_support.rs`, `include!`d by both
+the build script and `tests/mlx_pin.rs`. A build script cannot be imported by
+the crate it builds, and this logic decides whether a known 3.8× perf cliff is
+reported at all — so it is covered by tests `cargo test` actually runs.
 
 ### `sys.rs` — raw bindings
 
