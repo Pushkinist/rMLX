@@ -250,17 +250,14 @@ pub fn generate_greedy(
         .collect();
 
     let prefill_chunk = crate::prefill_chunk::prefill_chunk_for("qwen3_vl_moe");
-    let Some(logits) = crate::decode_loop::chunked_prefill(
+    let logits = crate::decode_loop::chunked_prefill(
         &mut kv,
         prompt_ids,
         prefill_chunk,
         device,
         "Qwen3VLMoeForConditionalGeneration",
         |chunk, kv| model.forward_seq_with_cache(chunk, Some(kv), device),
-    )?
-    else {
-        return Ok(steps);
-    };
+    )?;
     let first = pick_token(
         &logits,
         vocab,

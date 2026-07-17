@@ -2010,17 +2010,14 @@ pub fn generate_greedy<'a>(
     // Chunk size is per-arch; default 256 for qwen3, override via
     // `RMLX_PREFILL_CHUNK` (global) or `RMLX_PREFILL_CHUNK_QWEN3` (per-arch).
     let prefill_chunk = crate::prefill_chunk::prefill_chunk_for("qwen3");
-    let Some(prefill_logits) = chunked_prefill(
+    let prefill_logits = chunked_prefill(
         &mut caches,
         prompt_ids,
         prefill_chunk,
         device,
         "Qwen3ForCausalLM",
         |chunk, caches| model.forward_seq_with_cache(chunk, Some(caches), device),
-    )?
-    else {
-        return Ok(steps);
-    };
+    )?;
 
     let logits_flat = prefill_logits.reshape(&[1, vocab], device)?;
     logits_flat.eval()?;

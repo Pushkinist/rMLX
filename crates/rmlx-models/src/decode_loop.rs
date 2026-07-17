@@ -25,7 +25,7 @@ use std::time::Instant;
 use rmlx_mlx::{argmax, Array, Device, Dtype};
 use tracing::info_span;
 
-use rmlx_core::error::Result;
+use rmlx_core::error::{Error, Result};
 
 use crate::constraint::ConstraintEngine;
 use crate::sampler::{
@@ -505,22 +505,29 @@ fn resolve_piece(ctx: &DecodeCtx<'_>, id: u32) -> Box<str> {
 }
 
 /// Fresh chunked prefill: `enter_prefill` → per-chunk forward + `eval_prefill_state`
-/// → `exit_prefill`. Returns the final-position logits, or `None` when prefill was
-/// rejected (caller returns `Ok(steps)` as today, unchanged).
+/// → `exit_prefill`. Returns the final-position logits, or the cause of the
+/// failure that prevented them.
+///
+/// A prefill that does not produce logits is a **failure, not an outcome**: the
+/// caller has no logits to sample from, so every path out of here that is not a
+/// final-position `Array` carries an `Err` naming why. Returning the cause is
+/// what keeps a rejected prefill from surfacing as a successful run reporting
+/// zeros — a bench harness reads throughput fields, not the log.
 ///
 /// `caches` is borrowed `&mut` by this fn (it brackets enter/exit and evals
 /// non-final chunk state) AND re-borrowed into `forward_chunk` per chunk — the
 /// closure takes `&mut Vec<KvCache>` so the arch's forward writes into the same
 /// caches this fn brackets.
 ///
+/// Failure ordering: the **first** cause wins. A failed chunk forward leaves the
+/// caches mid-prefill, so the `exit_prefill` sweep below it may fail too — but
+/// that second error is a consequence, not the diagnosis. Reporting the root
+/// cause is the whole point of propagating.
+///
 /// Deliberately Fresh-only. gemma4's prefix-append flush (`eval_gpu_state`, no
 /// enter/exit) and qwen3_5_moe's HydratedTail append (`eval_prefill_state`, no
 /// enter/exit) are two different flush protocols and stay per-arch — there is no
 /// `PrefillKind` enum.
-#[allow(
-    clippy::unnecessary_wraps,
-    reason = "Result is the documented contract: callers `?`-chain it, and the per-chunk forward / exit_prefill failures it folds into Ok(None) are genuinely fallible — the wrapper keeps the rejection path uniform with the loop call site"
-)]
 pub(crate) fn chunked_prefill(
     caches: &mut Vec<KvCache>,
     ids: &[u32],
@@ -528,14 +535,14 @@ pub(crate) fn chunked_prefill(
     device: Device,
     arch: &'static str,
     mut forward_chunk: impl FnMut(&[u32], &mut Vec<KvCache>) -> Result<Array>,
-) -> Result<Option<Array>> {
+) -> Result<Array> {
     for c in caches.iter_mut() {
         c.enter_prefill();
     }
     let mut last_logits: Option<Array> = None;
-    let mut prefill_ok = true;
+    let mut first_err: Option<Error> = None;
     let n_chunks = ids.len().div_ceil(chunk_size.max(1));
-    'prefill: for (chunk_idx, chunk) in ids.chunks(chunk_size.max(1)).enumerate() {
+    for (chunk_idx, chunk) in ids.chunks(chunk_size.max(1)).enumerate() {
         let is_last = chunk_idx + 1 == n_chunks;
         match forward_chunk(chunk, caches) {
             Ok(logits) => {
@@ -543,48 +550,60 @@ pub(crate) fn chunked_prefill(
                     last_logits = Some(logits);
                 } else {
                     // Eval only the cache prefill state, skip the lm_head matmul
-                    // for non-final chunks via lazy-graph pruning.
-                    for c in caches.iter() {
-                        if let Err(e) = c.eval_prefill_state() {
-                            tracing::warn!(
-                                arch,
-                                error = %e,
-                                chunk_len = chunk.len(),
-                                "prefill chunk cache eval failed"
-                            );
-                            prefill_ok = false;
-                            break 'prefill;
-                        }
+                    // for non-final chunks via lazy-graph pruning. Stops at the
+                    // first failing cache.
+                    if let Some(e) = caches.iter().find_map(|c| c.eval_prefill_state().err()) {
+                        tracing::error!(
+                            arch,
+                            error = %e,
+                            chunk_len = chunk.len(),
+                            "prefill chunk cache eval failed, aborting generation"
+                        );
+                        // Cause captured, not returned: the exit_prefill sweep
+                        // below is mandatory for every cache that entered
+                        // prefill. It runs, then this error propagates.
+                        first_err = Some(e);
+                        break;
                     }
                 }
             }
             Err(e) => {
-                tracing::warn!(
+                tracing::error!(
                     arch,
                     error = %e,
                     prompt_len = ids.len(),
-                    "prefill chunk failed, returning empty"
+                    "prefill chunk failed, aborting generation"
                 );
-                prefill_ok = false;
+                // Cause captured, not returned — see above.
+                first_err = Some(e);
                 break;
             }
         }
     }
     for c in caches.iter_mut() {
         if let Err(e) = c.exit_prefill(device) {
-            tracing::warn!(arch, error = %e, "prefill: exit_prefill quantization failed");
-            prefill_ok = false;
+            tracing::error!(arch, error = %e, "prefill: exit_prefill quantization failed, aborting generation");
             // No break: every cache entered prefill above and must run
             // exit_prefill, even after a failure — skipping it leaves the
             // remaining caches with un-finalized prefill state (no decode
             // seed / un-quantized storage) that corrupts any later reuse of
             // this Vec.
+            if first_err.is_none() {
+                first_err = Some(e);
+            }
         }
     }
-    if !prefill_ok || last_logits.is_none() {
-        return Ok(None);
+    if let Some(e) = first_err {
+        return Err(e);
     }
-    Ok(last_logits)
+    // Model, not Other: an empty prompt is deterministic, so the retry envelope
+    // must not replay it. Other classifies Migratable and would re-run a request
+    // that reproduces the same failure every time.
+    last_logits.ok_or_else(|| {
+        Error::Model(format!(
+            "prefill produced no logits (empty prompt), arch={arch}"
+        ))
+    })
 }
 
 #[cfg(test)]
