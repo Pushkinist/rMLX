@@ -1032,9 +1032,10 @@ sinusoidal fixture.
 (present in the 3-bit path) is deferred. Ships the naïve Viterbi path over
 the unmasked 2-bit codebook.
 
-**MSL hook**: `tcq_v2_msl::tcq_quantize_v2_gpu` is parity-tested CPU↔GPU
-(bit-identical codes + scales at 2-bit) but ships as a future-reference hook.
-The hot path forces `Device::Cpu`.
+**MSL hook**: removed — the parked GPU Viterbi kernel had no production
+dispatch path and rotted (kernel-load failure, never caught because its
+tests were `#[ignore]`d). The hot path forces `Device::Cpu`; a GPU kernel
+can be re-added later with a real dispatch caller from day one.
 
 **Calibration recipe**: `--recipe turbo2_tcq` in `rmlx kv-calibrate` maps to
 the internal `turboquant25` recipe (same as plain `turbo2`). No codebook

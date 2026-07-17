@@ -406,8 +406,8 @@ pub enum KvQuant {
     /// is already present in `QuantV`; wiring it for 2-bit TCQ is a follow-up.
     ///
     /// **Implementation scope**: CPU Viterbi encode + CPU dequant on the hot
-    /// path; the MSL Viterbi kernel ships as a future-reference hook in
-    /// `tcq_v2_msl.rs`.
+    /// path. A GPU Viterbi kernel is not currently wired — the previous
+    /// parked hook had no production dispatch caller and was removed.
     ///
     /// Opt-in **only** via `--kv-quant k8vturbo2tcq`; never an auto default.
     K8VTurbo2Tcq,
