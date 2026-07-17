@@ -56,7 +56,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         smoke-codec-matrix \
         e2e \
         file-size-report check-no-inline-tests check-no-scalar-f32-leak \
-        check-no-decode-swallow \
+        check-no-decode-swallow check-gpu-tests-ignored \
         check-metal-compiles check-metal-format
 
 help:
@@ -170,6 +170,9 @@ check-no-scalar-f32-leak: ## CI gate: fail if arch-layer code has unguarded scal
 check-no-decode-swallow: ## CI gate: fail if a decode-step failure breaks instead of propagating (would report as finish_reason="length")
 	@bash scripts/check_no_decode_swallow.sh
 
+check-gpu-tests-ignored: ## CI gate: fail if a GPU-touching rmlx-kv-quant test lacks #[ignore] (would abort the whole test binary under parallel cargo test)
+	@bash scripts/check_gpu_tests_ignored.sh
+
 # METAL_STRICT=--strict turns a missing toolchain into a hard failure instead of
 # a skip. CI sets it (the macOS runner ships the toolchain, so a skip there would
 # mean the gate protected nothing); local runs leave it empty and skip.
@@ -186,6 +189,7 @@ ci: fmt-check lint test deny audit ci-metrics ## full pre-merge gate: fmt + clip
 	@bash scripts/check_no_inline_tests.sh
 	@bash scripts/check_no_scalar_f32_leak.sh
 	@bash scripts/check_no_decode_swallow.sh
+	@bash scripts/check_gpu_tests_ignored.sh
 	@bash scripts/check_metal_format.sh
 	@bash scripts/check_metal_compiles.sh
 	@bash scripts/file_size_report.sh || true

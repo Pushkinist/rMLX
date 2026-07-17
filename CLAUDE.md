@@ -196,6 +196,17 @@ Hard rules:
   ```
   The CI gate `make check-no-inline-tests` enforces this as a hard-fail step
   in `make ci`. All workspace violations have been migrated.
+- **Hard rule: a test that reaches `Device::Gpu` carries `#[ignore]`.** A shared
+  Metal context driven from parallel `cargo test` threads aborts the whole test
+  binary ("Rust cannot catch foreign exceptions"), taking every other test in
+  the crate with it. Run them as
+  `cargo test -p <crate> --lib -- --ignored <filter> --test-threads=1`. A guard
+  that only exercises a check the dispatcher rejects **before** touching a
+  device-parameterized op is not a GPU test: pass `Device::Cpu` and leave it
+  un-ignored — ignoring a CPU test silently stops running it. The CI gate
+  `make check-gpu-tests-ignored` enforces this for `rmlx-kv-quant`; it keys on
+  shape (does the test reach `Device::Gpu`?), never on the ignore reason's text.
+  See `docs/TESTING.md`.
 - **Advisory: `make file-size-report`** prints files >1000 LOC. Non-failing.
   Also runs at the end of `make ci` (advisory, non-blocking).
 

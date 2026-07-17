@@ -269,17 +269,20 @@ fn run_oracle_masked(
 // ── Oracle: kernel == CPU dequant reference ───────────────────────────────────
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_decode -- --include-ignored --test-threads=1"]
 fn iso3_flash_decode_matches_cpu_dequant_reference() {
     // Bonsai / Qwen3 shape: head_dim 128, GQA 4:1.
     run_oracle(3, 2, 4, 40, 128);
 }
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_decode -- --include-ignored --test-threads=1"]
 fn iso4_flash_decode_matches_cpu_dequant_reference() {
     run_oracle(4, 2, 4, 40, 128);
 }
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_decode -- --include-ignored --test-threads=1"]
 fn iso3_flash_decode_matches_reference_across_tiles() {
     // kv_seq is set above TILE_SIZE so the P2 log-sum-exp merge runs over
     // several tiles rather than a single one.
@@ -287,28 +290,33 @@ fn iso3_flash_decode_matches_reference_across_tiles() {
 }
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_decode -- --include-ignored --test-threads=1"]
 fn iso4_flash_decode_matches_reference_across_tiles() {
     run_oracle(4, 1, 8, (TILE_SIZE as usize) * 2 + 22, 128);
 }
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_decode -- --include-ignored --test-threads=1"]
 fn iso3_flash_decode_matches_reference_head_dim_512() {
     // Gemma4 e2b/e4b global layers run head_dim = 512 with a single KV head.
     run_oracle(3, 1, 8, 70, 512);
 }
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_decode -- --include-ignored --test-threads=1"]
 fn iso4_flash_decode_matches_reference_head_dim_512() {
     run_oracle(4, 1, 8, 70, 512);
 }
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_decode -- --include-ignored --test-threads=1"]
 fn iso3_flash_decode_matches_reference_head_dim_256() {
     // medgemma / Gemma3 shape.
     run_oracle(3, 1, 4, 70, 256);
 }
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_decode -- --include-ignored --test-threads=1"]
 fn iso4_flash_decode_matches_reference_head_dim_256() {
     run_oracle(4, 1, 4, 70, 256);
 }
@@ -321,6 +329,7 @@ fn iso4_flash_decode_matches_reference_head_dim_256() {
 // or mis-strided mask index would pass the whole suite.
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_decode -- --include-ignored --test-threads=1"]
 fn iso3_flash_decode_matches_reference_with_additive_mask() {
     // kv_h=2, heads_per_kv=4 also pins the GQA (q_head -> kv_head) mapping: the
     // mask is indexed by q_head while K is indexed by kv_head, so conflating the
@@ -329,11 +338,13 @@ fn iso3_flash_decode_matches_reference_with_additive_mask() {
 }
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_decode -- --include-ignored --test-threads=1"]
 fn iso4_flash_decode_matches_reference_with_additive_mask() {
     run_oracle_masked(4, 2, 4, 40, 128, true);
 }
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_decode -- --include-ignored --test-threads=1"]
 fn iso3_flash_decode_matches_reference_with_mask_across_tiles() {
     // Mask + multi-tile: the per-tile online softmax and the P2 merge both have
     // to see the masked scores.
@@ -341,6 +352,7 @@ fn iso3_flash_decode_matches_reference_with_mask_across_tiles() {
 }
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_decode -- --include-ignored --test-threads=1"]
 fn iso4_flash_decode_matches_reference_with_mask_across_tiles() {
     run_oracle_masked(4, 2, 4, (TILE_SIZE as usize) * 2 + 22, 128, true);
 }
@@ -348,6 +360,7 @@ fn iso4_flash_decode_matches_reference_with_mask_across_tiles() {
 // ── GQA ───────────────────────────────────────────────────────────────────────
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_decode -- --include-ignored --test-threads=1"]
 fn iso3_flash_decode_matches_reference_multi_kv_head_gqa() {
     // kv_h=4 with heads_per_kv=2: several KV heads AND a GQA fan-out, so a
     // kv_h_idx derived with the wrong divisor reads another head's K.
@@ -355,28 +368,34 @@ fn iso3_flash_decode_matches_reference_multi_kv_head_gqa() {
 }
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_decode -- --include-ignored --test-threads=1"]
 fn iso4_flash_decode_matches_reference_multi_kv_head_gqa() {
     run_oracle(4, 4, 2, 40, 128);
 }
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_decode -- --include-ignored --test-threads=1"]
 fn iso3_flash_decode_matches_reference_mha_no_gqa() {
     // heads_per_kv=1 (plain MHA): kv_h_idx == hq, the degenerate GQA case.
     run_oracle(3, 4, 1, 40, 128);
 }
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_decode -- --include-ignored --test-threads=1"]
 fn iso4_flash_decode_matches_reference_mha_no_gqa() {
     run_oracle(4, 4, 1, 40, 128);
 }
 
 // ── Gates ─────────────────────────────────────────────────────────────────────
+//
+// Every gate below is rejected by a scalar shape check that runs before the
+// dispatcher touches a device-parameterized op, so these pass `Device::Cpu` and
+// stay un-ignored — they are the cheap always-on half of the suite. Handing them
+// `Device::Gpu` would claim a Metal context they never reach and force them
+// behind `--ignored` with the real parity tests.
 
 #[test]
 fn iso_flash_decode_rejects_non_pow2_head_dim() {
-    if skip_if_no_gpu_env() {
-        return;
-    }
     let dummy = make_f32_array(&[0.0], &[1]);
     let codes = make_u32_array(&[0], &[1]);
     // head_dim=96 is a multiple of the quaternion block size but not a power of
@@ -394,7 +413,7 @@ fn iso_flash_decode_rejects_non_pow2_head_dim() {
         96,
         1,
         1.0,
-        Device::Gpu,
+        Device::Cpu,
     );
     assert!(
         err.is_err(),
@@ -404,9 +423,6 @@ fn iso_flash_decode_rejects_non_pow2_head_dim() {
 
 #[test]
 fn iso_flash_decode_rejects_head_dim_above_max() {
-    if skip_if_no_gpu_env() {
-        return;
-    }
     let dummy = make_f32_array(&[0.0], &[1]);
     let codes = make_u32_array(&[0], &[1]);
     let err = iso_flash_decode_sdpa::<3>(
@@ -422,7 +438,7 @@ fn iso_flash_decode_rejects_head_dim_above_max() {
         ISO_FLASH_HEAD_DIM_MAX * 2,
         1,
         1.0,
-        Device::Gpu,
+        Device::Cpu,
     );
     assert!(
         err.is_err(),
@@ -433,9 +449,6 @@ fn iso_flash_decode_rejects_head_dim_above_max() {
 
 #[test]
 fn iso_flash_decode_rejects_unsupported_bits() {
-    if skip_if_no_gpu_env() {
-        return;
-    }
     let dummy = make_f32_array(&[0.0], &[1]);
     let codes = make_u32_array(&[0], &[1]);
     // BITS=5 must not silently decode as 3-bit or 4-bit.
@@ -452,7 +465,7 @@ fn iso_flash_decode_rejects_unsupported_bits() {
         128,
         1,
         1.0,
-        Device::Gpu,
+        Device::Cpu,
     );
     assert!(
         err.is_err(),
