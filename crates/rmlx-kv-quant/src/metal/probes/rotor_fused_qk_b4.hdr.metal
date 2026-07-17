@@ -1,7 +1,10 @@
 
 // Rotor fused-QK header — Cl(3,0) MUL_TABLE + Lloyd-Max N(0,1) codebook.
-// BITS = 4 (codebook = 16 entries).
+// BITS = 4 (codebook = 16 entries, mask = 0xF).
 // Bit-exact with crate::clifford::MUL_TABLE + lloyd_gaussian_codebook(4).
+
+#define RF_BITS 4u
+#define RF_MASK 0xFu
 
 constant float ROTOR_CB[16] = {
     as_type<float>(0xC02DEE42u),

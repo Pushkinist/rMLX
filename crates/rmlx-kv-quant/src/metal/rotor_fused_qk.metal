@@ -47,8 +47,8 @@ float rb23      = rotors[rotor_base + 3u];
 // Unpack 8 BITS-bit codes → centroid × scale → mv_q[0..8].
 float mv_q[8];
 for (uint e = 0u; e < 8u; ++e) {
-    uint shift = e * 4u;
-    uint idx   = (word >> shift) & 0xFu;
+    uint shift = e * RF_BITS;
+    uint idx   = (word >> shift) & RF_MASK;
     mv_q[e]    = ROTOR_CB[idx] * k_scale;
 }
 
