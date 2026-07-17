@@ -55,6 +55,35 @@ pub struct QuantPlanarK {
 }
 
 impl QuantPlanarK {
+    /// Resident bytes held by this store: CPU blocks plus the GPU mirror.
+    ///
+    /// Both are summed unconditionally — an SSD-hydrate init leaves the
+    /// pre-hydration CPU blocks resident under a live GPU mirror, so both are
+    /// real memory at once. Unallocated buffers contribute 0 on their own.
+    ///
+    /// The exhaustive destructure is the drift guard: a new buffer cannot be
+    /// added to this struct without this failing to compile.
+    #[must_use]
+    pub fn byte_size(&self) -> u64 {
+        let Self {
+            blocks,
+            gpu_codes_buf,
+            gpu_scales_buf,
+            gpu_rotations_buf,
+            // Geometry / bookkeeping about the buffers above, not allocations.
+            gpu_codes_words_per_step: _,
+            gpu_scales_per_step: _,
+            gpu_rotations_words_per_step: _,
+            gpu_capacity: _,
+            shape: _,
+            max_seq: _,
+        } = self;
+        blocks.iter().map(PlanarBlocks::byte_size).sum::<u64>()
+            + crate::bytes::opt_array_bytes(gpu_codes_buf.as_ref())
+            + crate::bytes::opt_array_bytes(gpu_scales_buf.as_ref())
+            + crate::bytes::opt_array_bytes(gpu_rotations_buf.as_ref())
+    }
+
     /// Create an empty `QuantPlanarK` with the accumulated shape initialised
     /// to `init_shape` (seq dimension = 0) and GPU buffers unallocated.
     /// Mirrors the `from_cpu_blocks` pattern but sets `max_seq` for later

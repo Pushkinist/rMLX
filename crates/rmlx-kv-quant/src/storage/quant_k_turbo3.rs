@@ -133,16 +133,31 @@ impl QuantKTurbo3 {
         }
     }
 
-    /// Approximate byte footprint of the accumulated payload (CPU path only;
-    /// GPU buffer size is `gpu_capacity * gpu_words_per_step * 4` bytes).
+    /// Resident bytes held by this store: CPU blocks plus the GPU mirror.
+    ///
+    /// Both are summed unconditionally — an SSD-hydrate init leaves the
+    /// pre-hydration CPU blocks resident under a live GPU mirror, so both are
+    /// real memory at once. Unallocated buffers contribute 0 on their own.
+    ///
+    /// The exhaustive destructure is the drift guard: a new buffer cannot be
+    /// added to this struct without this failing to compile.
     #[must_use]
-    pub fn byte_size(&self) -> usize {
-        let mut total = 0usize;
-        for blk in &self.blocks {
-            total += blk.codes.len();
-            total += blk.scales.len() * size_of::<f32>();
-        }
-        total
+    pub fn byte_size(&self) -> u64 {
+        let Self {
+            blocks,
+            gpu_codes_buf,
+            gpu_scales_buf,
+            // Geometry / bookkeeping about the buffers above, not allocations.
+            gpu_words_per_step: _,
+            gpu_scales_per_step: _,
+            gpu_capacity: _,
+            shape: _,
+            bits: _,
+            max_seq: _,
+        } = self;
+        blocks.iter().map(TurboBlocks::byte_size).sum::<u64>()
+            + crate::bytes::opt_array_bytes(gpu_codes_buf.as_ref())
+            + crate::bytes::opt_array_bytes(gpu_scales_buf.as_ref())
     }
 
     /// Dequantize all accumulated K slices to a flat f32 vec (CPU path).

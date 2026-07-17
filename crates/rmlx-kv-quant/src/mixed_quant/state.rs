@@ -33,6 +33,22 @@ pub struct MixedTuple {
 }
 
 impl MixedTuple {
+    /// Resident bytes of this quantized 3-tuple.
+    ///
+    /// The exhaustive destructure is the drift guard: a new buffer cannot be
+    /// added to this struct without this failing to compile.
+    #[must_use]
+    pub fn byte_size(&self) -> u64 {
+        let Self {
+            codes,
+            scales,
+            biases,
+        } = self;
+        crate::bytes::array_bytes(codes)
+            + crate::bytes::array_bytes(scales)
+            + crate::bytes::array_bytes(biases)
+    }
+
     /// Slice each of the three arrays along axis=2 to `[..., :off, :]`.
     #[allow(
         clippy::indexing_slicing,
@@ -155,6 +171,30 @@ pub struct MixedKvState {
 }
 
 impl MixedKvState {
+    /// Resident bytes held by this state: both quantized 3-tuples plus the
+    /// optional per-layer Hadamard rotation matrix.
+    ///
+    /// The exhaustive destructure is the drift guard: a new buffer cannot be
+    /// added to this struct without this failing to compile.
+    #[must_use]
+    pub fn byte_size(&self) -> u64 {
+        let Self {
+            keys,
+            values,
+            k_rotation,
+            // Codec parameters / bookkeeping, not allocations.
+            k_bits: _,
+            v_bits: _,
+            k_group_size: _,
+            v_group_size: _,
+            offset: _,
+            rotate_k: _,
+        } = self;
+        keys.as_ref().map_or(0, MixedTuple::byte_size)
+            + values.as_ref().map_or(0, MixedTuple::byte_size)
+            + k_rotation.as_ref().map_or(0, crate::bytes::array_bytes)
+    }
+
     pub fn new(k_bits: i32, v_bits: i32, k_group_size: i32, v_group_size: i32) -> Self {
         Self {
             k_bits,

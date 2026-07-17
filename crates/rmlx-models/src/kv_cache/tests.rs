@@ -605,32 +605,39 @@ mod tests {
         );
     }
 
-    // ── N16: approx_bytes unit tests ──────────────────────────────────────────
+    // ── resident_bytes unit tests ─────────────────────────────────────────────
+    //
+    // These assert against the buffers each cache really allocated, never
+    // against a per-codec bits-per-element figure. A nominal bit-width is not a
+    // cache's memory: q8_0 also carries per-group scales, and the quantized
+    // paths carry warm-TTFT bf16 seeds on top of the codes. Restating a formula
+    // here would only re-derive the accounting from itself and would go blind
+    // the moment a store grows a buffer.
 
     /// Zero offset → zero bytes regardless of quant mode.
     #[test]
-    fn approx_bytes_empty_cache_is_zero() {
+    fn resident_bytes_empty_cache_is_zero() {
         for quant in [KvQuant::K8V8, KvQuant::K8V4, KvQuant::None, KvQuant::Planar] {
             let cache = KvCache::with_quant(quant);
             assert_eq!(
-                cache.approx_bytes(),
+                cache.resident_bytes(),
                 0,
                 "empty {quant:?} cache must be 0 bytes"
             );
         }
     }
 
-    /// After a single update on `KvQuant::None` (bf16, 16-bit K + 16-bit V),
-    /// approx_bytes should equal: seq × B × kv_h × head_dim × (16+16)/8 bytes.
+    /// `KvQuant::None` holds nothing but the two bf16 mirrors, so its residency
+    /// is exactly their filled prefix — and its storage contributes nothing.
     ///
-    /// Shape: B=1, kv_h=4, seq=256, head_dim=128.
-    /// Expected = 256 × 1 × 4 × 128 × 4 = 524_288 bytes (512 KiB).
+    /// Shape: B=1, kv_h=4, seq=256, head_dim=128 → 256 × 4 × 128 × 2 B per
+    /// mirror, two mirrors.
     #[test]
     #[allow(
         clippy::expect_used,
         reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
     )]
-    fn approx_bytes_none_quant_matches_formula() {
+    fn resident_bytes_none_quant_is_the_two_bf16_mirrors() {
         let device = Device::Cpu;
         // Use a large max_seq so the cache isn't truncated.
         let mut cache = KvCache::with_quant_max_seq(KvQuant::None, 4096);
@@ -643,31 +650,29 @@ mod tests {
             .exit_prefill(device)
             .expect("exit_prefill must not fail");
 
-        // seq=256, B=1, kv_h=4, head_dim=128, bf16 (2 bytes each for K and V)
-        // Formula: seq × kv_h × head_dim × (k_bits + v_bits) / 8
-        let expected: u64 = 256 * 4 * 128 * 4; // (16+16)/8 = 4 bytes per element pair
         assert_eq!(
-            cache.approx_bytes(),
-            expected,
-            "None (bf16) cache: expected {expected} bytes, got {}",
-            cache.approx_bytes()
+            cache.storage().resident_bytes(),
+            0,
+            "KvStorage::None is geometry-only — the bf16 K/V live on the cache's mirrors"
+        );
+        // Two bf16 mirrors at the filled length: 256 × 4 × 128 × 2 B each.
+        let one_mirror: u64 = 256 * 4 * 128 * 2;
+        assert_eq!(
+            cache.resident_bytes(),
+            2 * one_mirror,
+            "None (bf16) cache must report exactly its two bf16 mirrors"
         );
     }
 
-    /// After a single update on `KvQuant::K8V8` (8-bit K + 8-bit V),
-    /// approx_bytes should equal:
-    /// seq × B × kv_h × head_dim × (8+8)/8 + warm-seed bytes
-    /// = 256 × 1 × 4 × 128 × 2 + 256 × 1 × 4 × 128 × 4
-    /// = 262_144 + 524_288 = 786_432 bytes.
-    ///
-    /// The warm-TTFT fp16 seed (decode_fp16_k/v) adds one 2-byte buffer per K
-    /// and V element at the filled sequence length.
+    /// `KvQuant::K8V8` residency is the q8_0 store plus **both** warm-TTFT bf16
+    /// seeds — and the store's real cost (codes *and* per-group scales) exceeds
+    /// the 8-bits-per-element the codec is named for.
     #[test]
     #[allow(
         clippy::expect_used,
         reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
     )]
-    fn approx_bytes_k8v8_matches_formula() {
+    fn resident_bytes_k8v8_counts_store_plus_both_seeds() {
         let device = Device::Cpu;
         let mut cache = KvCache::with_quant_max_seq(KvQuant::K8V8, 4096);
         cache.enter_prefill();
@@ -678,18 +683,23 @@ mod tests {
             .exit_prefill(device)
             .expect("exit_prefill must not fail");
 
-        // quant: K8V8 → (8+8)/8 = 2 bytes per elem pair × seq × bhd
-        // seed: fp16 seed = 4 bytes per elem pair (K+V both fp16) × seq × bhd
-        let bhd: u64 = 4 * 128; // kv_h=4, head_dim=128 (B=1 implicit)
         let seq: u64 = 256;
-        let quant_bytes = seq * bhd * 2; // (8+8)/8 = 2 bytes per (K,V) element
-        let seed_bytes = seq * bhd * 4; // decode_fp16 K+V combined (2+2 bytes)
-        let expected = quant_bytes + seed_bytes;
+        let bhd: u64 = 4 * 128; // kv_h=4, head_dim=128 (B=1 implicit)
+        let store = cache.storage().resident_bytes();
+        // Both seeds are live on K8V8 and both are bf16 at the filled length.
+        let seeds = seq * bhd * 2 * 2;
         assert_eq!(
-            cache.approx_bytes(),
-            expected,
-            "K8V8 cache: expected {expected} bytes, got {}",
-            cache.approx_bytes()
+            cache.resident_bytes(),
+            store + seeds,
+            "K8V8 must report its q8_0 store plus both bf16 seeds"
+        );
+        // The store is the codes *and* their per-group scales: strictly more
+        // than the codec's nominal 8 bits per element for K and V.
+        assert!(
+            store > seq * bhd * 2,
+            "q8_0 store ({store} B) must exceed the nominal 8-bit-per-element figure \
+             ({} B) — the per-group scales are real memory too",
+            seq * bhd * 2
         );
     }
 
@@ -1052,7 +1062,7 @@ mod tests {
     /// drops non-leading kv heads on any axis-2 sub-slice write into a larger
     /// pre-allocated buffer (a pre-existing primitive quirk, unrelated to —
     /// it corrupts K8V8/K8V4/None `decode_fp16` and `prefill_raw` accumulators on
-    /// CPU identically, which is why the existing `approx_bytes_*` CPU tests only
+    /// CPU identically, which is why the existing `resident_bytes_*` CPU tests only
     /// assert byte counts, never values). Therefore this test asserts shape,
     /// finiteness and offset progression on CPU; value-level coherence of the
     /// dequant-before-share K/V is validated by the Gemma4 e4b/26b Mixed baseline
@@ -1375,14 +1385,19 @@ mod tests {
     // each KvQuant variant stays within documented tolerance bands.
     //
     // DESIGN: uses codes-only bytes (seq * bhd * (k_bits + v_bits) / 8),
-    // NOT approx_bytes(), because:
-    // 1. The warm-TTFT fp16 seed included in approx_bytes is a transient
-    // buffer, not steady-state KV compression — including it in a ratio
-    // produces values < 1.0 (quantized "uses more" than bf16), which is
-    // misleading and not what the reference table (mlx-vlm / docs §4) cites.
-    // 2. The (k_bits, v_bits) mapping in approx_bytes IS the regression target:
-    // if any variant's bits change, the codes formula changes → ratio changes
-    // → this test fails.
+    // NOT resident_bytes(), because:
+    // 1. This table pins each codec's **nominal** bit-width ratio — the number
+    // the reference table (mlx-vlm / docs §4) cites. Real residency also
+    // carries per-group scales, warm-TTFT bf16 seeds and (for the ring-backed
+    // codecs) a GPU ring; folding those in produces ratios < 1.0 (quantized
+    // "uses more" than bf16), which is not what this table is about.
+    // 2. The (k_bits, v_bits) mapping below IS the regression target: if any
+    // variant's bits change, the codes formula changes → ratio changes → this
+    // test fails.
+    //
+    // This is the ONE place a bits-per-element figure is legitimate: it is the
+    // codec's advertised ratio, explicitly not a claim about resident memory.
+    // For memory, ask the store — see `KvCache::resident_bytes`.
     //
     // FIXED SHAPE: B=1, kv_h=8, head_dim=128, seq=1024
     // bhd = B * kv_h * head_dim = 1 * 8 * 128 = 1024
@@ -1408,11 +1423,11 @@ mod tests {
     // rMLX's q2_g64 is V-side only (k=8-bit, v=2-bit): (16+16)/(8+2) = 3.2×.
     // The V-only compression is 16/2 = 8× (codes) / ~6.4× effective (at g=64, scale overhead
     // adds ~1 byte per 64 elements). Both figures are correct for their context; the test
-    // uses the K+V combined ratio (3.2×), which is what approx_bytes computes.
+    // uses the K+V combined ratio (3.2×), which is the codecs nominal figure.
     // See docs/KV_CACHE.md §4 (q2_g64 row) and §5.10 (pure-2-bit-K gated).
 
     /// Pure-formula helper: codes-only KV bytes for a given shape and bit widths.
-    /// No GPU, no MLX operations. Mirrors the `kv_bytes` formula in `approx_bytes`.
+    /// No GPU, no MLX operations. Pure arithmetic over the codec bit-widths.
     fn codes_bytes(seq: u64, bhd: u64, k_bits: u64, v_bits: u64) -> u64 {
         seq * bhd * (k_bits + v_bits) / 8
     }

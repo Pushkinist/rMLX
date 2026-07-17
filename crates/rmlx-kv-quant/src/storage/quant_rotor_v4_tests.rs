@@ -82,12 +82,12 @@ fn quant_rotor_v4_byte_size_counts_rotors_once() {
     let data = vec![0.5_f32; 1 * 1 * 4 * head_dim];
     qv.append(&data, &new_shape).unwrap();
 
-    let rotors_bytes = qv.rotors.len() * size_of::<f32>();
+    let rotors_bytes = (qv.rotors.len() * size_of::<f32>()) as u64;
     let blocks_bytes = qv
         .blocks
         .iter()
-        .map(|b| b.codes.len() * 4 + b.scales.len() * 4 + b.norms.len() * 4)
-        .sum::<usize>();
+        .map(|b| (b.codes.len() * 4 + b.scales.len() * 4 + b.norms.len() * 4) as u64)
+        .sum::<u64>();
     assert_eq!(qv.byte_size(), rotors_bytes + blocks_bytes);
 
     // Appending a second block must not double-count rotors.
@@ -95,8 +95,8 @@ fn quant_rotor_v4_byte_size_counts_rotors_once() {
     let new_blocks_bytes = qv
         .blocks
         .iter()
-        .map(|b| b.codes.len() * 4 + b.scales.len() * 4 + b.norms.len() * 4)
-        .sum::<usize>();
+        .map(|b| (b.codes.len() * 4 + b.scales.len() * 4 + b.norms.len() * 4) as u64)
+        .sum::<u64>();
     assert_eq!(qv.byte_size(), rotors_bytes + new_blocks_bytes);
 }
 

@@ -40,6 +40,7 @@
 #[cfg(test)]
 pub(crate) mod test_utils;
 
+pub(crate) mod bytes;
 pub mod clifford;
 pub(crate) mod fused_qk_common;
 pub mod iso_flash_decode_msl;

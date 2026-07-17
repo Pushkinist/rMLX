@@ -194,8 +194,24 @@ impl PagedKStorage {
     }
 
     /// Actual on-device bytes across all allocated pages (codes + scales slabs).
+    ///
+    /// The exhaustive destructure is the drift guard: a new slab cannot be
+    /// added to this struct without this failing to compile.
     pub fn resident_bytes(&self) -> u64 {
-        self.codes.resident_bytes() + self.scales.resident_bytes()
+        let Self {
+            codes,
+            scales,
+            // Block table / geometry, not page allocations.
+            block_table: _,
+            total_tokens: _,
+            page_tokens: _,
+            tokens_in_last_page: _,
+            words_per_token: _,
+            scales_per_token: _,
+            shape: _,
+            max_seq: _,
+        } = self;
+        codes.resident_bytes() + scales.resident_bytes()
     }
 
     #[allow(
@@ -390,8 +406,25 @@ impl PagedVStorage {
     }
 
     /// Actual on-device bytes across all allocated pages (codes + scales slabs).
+    ///
+    /// The exhaustive destructure is the drift guard: a new slab cannot be
+    /// added to this struct without this failing to compile.
     pub fn resident_bytes(&self) -> u64 {
-        self.codes.resident_bytes() + self.scales.resident_bytes()
+        let Self {
+            codes,
+            scales,
+            // Block table / geometry, not page allocations.
+            block_table: _,
+            total_tokens: _,
+            page_tokens: _,
+            tokens_in_last_page: _,
+            words_per_token: _,
+            scales_per_token: _,
+            shape: _,
+            max_seq: _,
+            bits: _,
+        } = self;
+        codes.resident_bytes() + scales.resident_bytes()
     }
 
     #[allow(
@@ -617,8 +650,26 @@ impl PagedPlanarVStorage {
     }
 
     /// Actual on-device bytes across all allocated pages (codes + scales + rotations slabs).
+    ///
+    /// The exhaustive destructure is the drift guard: a new slab cannot be
+    /// added to this struct without this failing to compile.
     pub fn resident_bytes(&self) -> u64 {
-        self.codes.resident_bytes() + self.scales.resident_bytes() + self.rotations.resident_bytes()
+        let Self {
+            codes,
+            scales,
+            rotations,
+            // Block table / geometry, not page allocations.
+            block_table: _,
+            total_tokens: _,
+            page_tokens: _,
+            tokens_in_last_page: _,
+            codes_words_per_token: _,
+            scales_per_token: _,
+            rotations_words_per_token: _,
+            shape: _,
+            max_seq: _,
+        } = self;
+        codes.resident_bytes() + scales.resident_bytes() + rotations.resident_bytes()
     }
 
     #[allow(

@@ -53,6 +53,28 @@ pub struct IsoBlocks {
     pub n_tokens: usize,
 }
 
+impl IsoBlocks {
+    /// Heap bytes this block holds.
+    ///
+    /// The exhaustive destructure is the drift guard: a new payload field
+    /// cannot be added without this failing to compile. See [`crate::bytes`].
+    #[must_use]
+    pub fn byte_size(&self) -> u64 {
+        let Self {
+            codes,
+            scales,
+            quaternions,
+            norms,
+            // Inline metadata (no heap payload).
+            n_tokens: _,
+        } = self;
+        crate::bytes::vec_bytes(codes)
+            + crate::bytes::vec_bytes(scales)
+            + crate::bytes::vec_bytes(quaternions)
+            + crate::bytes::vec_bytes(norms)
+    }
+}
+
 /// Accumulated IsoQuant V cache (3-bit, quaternion SO(4) fast mode).
 ///
 /// Storage parallels [`crate::storage::QuantPlanarV`] but the per-group
@@ -329,27 +351,34 @@ impl QuantIsoV3 {
         })
     }
 
-    /// Approximate byte footprint of the accumulated payload.
+    /// Resident bytes held by this store: CPU blocks plus the GPU mirror.
+    ///
+    /// Both are summed unconditionally. `gpu_offset` advances independently of
+    /// `blocks`, so after an SSD-hydrate fallback the mirror and the CPU blocks
+    /// are resident at the same time; an either/or branch would drop one of
+    /// them. Unallocated buffers contribute 0 on their own.
+    ///
+    /// The exhaustive destructure is the drift guard: a new buffer cannot be
+    /// added to this struct without this failing to compile.
     #[must_use]
-    pub fn byte_size(&self) -> usize {
-        let mut total = 0usize;
-        for blk in &self.blocks {
-            total += blk.codes.len() * size_of::<u32>();
-            total += blk.scales.len() * size_of::<f32>();
-            total += blk.quaternions.len() * size_of::<f32>();
-            total += blk.norms.len() * size_of::<f32>();
-        }
-        // Include the GPU-resident mirror buffers when allocated. Size is
-        // derived from the per-step shape × current capacity (not blocks),
-        // because the buffers are pre-allocated.
-        if self.gpu_codes_buf.is_some() {
-            let cap = self.gpu_capacity.max(0) as usize;
-            total += cap * (self.gpu_words_per_step.max(0) as usize) * size_of::<u32>();
-            total += cap * (self.gpu_groups_per_step.max(0) as usize) * size_of::<f32>();
-            // norms mirror same per-group layout as scales.
-            total += cap * (self.gpu_groups_per_step.max(0) as usize) * size_of::<f32>();
-        }
-        total
+    pub fn byte_size(&self) -> u64 {
+        let Self {
+            blocks,
+            gpu_codes_buf,
+            gpu_scales_buf,
+            gpu_norms_buf,
+            // Geometry / bookkeeping about the buffers above, not allocations.
+            shape: _,
+            bits: _,
+            gpu_words_per_step: _,
+            gpu_groups_per_step: _,
+            gpu_capacity: _,
+            gpu_offset: _,
+        } = self;
+        blocks.iter().map(IsoBlocks::byte_size).sum::<u64>()
+            + crate::bytes::opt_array_bytes(gpu_codes_buf.as_ref())
+            + crate::bytes::opt_array_bytes(gpu_scales_buf.as_ref())
+            + crate::bytes::opt_array_bytes(gpu_norms_buf.as_ref())
     }
 
     /// Dequantize all accumulated V slices into one flat f32 vector

@@ -124,6 +124,46 @@ pub struct QuantV {
 }
 
 impl QuantV {
+    /// Resident bytes held by this store: CPU blocks, the GPU mirror, and the
+    /// TCQ sidebands (high-precision indices, value codebook and its GPU copy).
+    ///
+    /// All are summed unconditionally — an SSD-hydrate init leaves the
+    /// pre-hydration CPU blocks resident under a live GPU mirror, so both are
+    /// real memory at once. Unallocated buffers contribute 0 on their own.
+    ///
+    /// The exhaustive destructure is the drift guard: a new buffer cannot be
+    /// added to this struct without this failing to compile.
+    #[must_use]
+    pub fn byte_size(&self) -> u64 {
+        let Self {
+            blocks,
+            gpu_codes_buf,
+            gpu_scales_buf,
+            high_precision_indices,
+            value_codebook,
+            value_codebook_gpu,
+            // Geometry / bookkeeping about the buffers above, not allocations.
+            gpu_words_per_step: _,
+            gpu_scales_per_step: _,
+            gpu_capacity: _,
+            shape: _,
+            bits: _,
+            max_seq: _,
+            use_tcq: _,
+        } = self;
+        // `high_precision_indices` is a Vec of per-KV-head Vecs: sum the inner
+        // payloads, not just the outer Vec's headers.
+        let hpi: u64 = high_precision_indices.as_ref().map_or(0, |v| {
+            v.iter().map(|inner| crate::bytes::vec_bytes(inner)).sum()
+        });
+        blocks.iter().map(TurboBlocks::byte_size).sum::<u64>()
+            + crate::bytes::opt_array_bytes(gpu_codes_buf.as_ref())
+            + crate::bytes::opt_array_bytes(gpu_scales_buf.as_ref())
+            + hpi
+            + crate::bytes::opt_vec_bytes(value_codebook.as_ref())
+            + crate::bytes::opt_array_bytes(value_codebook_gpu.as_ref())
+    }
+
     /// Zero-state decode-init helper. Returns a fresh `QuantV` with cleared
     /// CPU/GPU buffers, the supplied `shape` / `bits` / `max_seq`, and all
     /// calibration / TCQ fields set to their default-off values.

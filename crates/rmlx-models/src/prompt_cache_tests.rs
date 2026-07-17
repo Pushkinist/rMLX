@@ -424,7 +424,7 @@ fn default_truncate_and_kv_bytes_over_real_caches() {
 }
 
 /// Default `kv_bytes` sums BOTH KV `resident_bytes` and linear-attn
-/// `approx_bytes`. Before this refactor only the qwen3.5-moe override summed
+/// `resident_bytes`. Before this refactor only the qwen3.5-moe override summed
 /// the lin half; the default body now makes that structural for every arch
 /// that returns a non-empty `lin_caches()`.
 #[test]
@@ -432,7 +432,7 @@ fn default_kv_bytes_sums_lin_caches() {
     let seq = (2 * BLOCK_TOKENS) as i32;
     let ids = make_ids(2 * BLOCK_TOKENS);
     // 1 real KvCache + 1 LinearAttnCache. Populate the lin state with real
-    // arrays so `approx_bytes() > 0` — an empty lin cache reports 0, which would
+    // arrays so `resident_bytes() > 0` — an empty lin cache reports 0, which would
     // make this test vacuous (it would pass even if the default body dropped the
     // `+ lin_caches()` term).
     let mut e = RealEntry::new(ids, seq, 1, 1);
@@ -446,7 +446,7 @@ fn default_kv_bytes_sums_lin_caches() {
     let lin_only: u64 = e
         .lin_caches()
         .iter()
-        .map(LinearAttnCache::approx_bytes)
+        .map(LinearAttnCache::resident_bytes)
         .sum();
     assert!(kv_only > 0, "the real KV cache contributes bytes");
     assert!(
@@ -456,7 +456,7 @@ fn default_kv_bytes_sums_lin_caches() {
     assert_eq!(
         e.kv_bytes(),
         kv_only + lin_only,
-        "default kv_bytes must equal KV resident_bytes + lin approx_bytes"
+        "default kv_bytes must equal KV resident_bytes + lin resident_bytes"
     );
 }
 

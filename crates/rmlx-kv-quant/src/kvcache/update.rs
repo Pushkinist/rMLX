@@ -2898,151 +2898,6 @@ impl KvCache {
         Ok(())
     }
 
-    /// Approximate RAM held by this cache slot, in bytes.
-    ///
-    /// Uses `self.offset` as the filled sequence length (not the pre-allocated
-    /// `max_seq`). Bits-per-element: 8 for K8V8/K8V4-K / Planar-K (q8_0),
-    /// 4 for K8V4-V / Planar-V / Mixed-V (4-bit codebook), 8 for Mixed-K,
-    /// 16 for None (bf16). Adds one factor-of-2 for the warm-TTFT fp16 seed
-    /// buffers (decode_fp16_k/v) when present.
-    ///
-    /// This is a best-effort estimate for the `/metrics/cache` endpoint —
-    /// not guaranteed to match Metal allocator accounting byte-for-byte.
-    ///
-    /// **Intentionally excludes paged-pool overhead**: paged KV storage
-    /// (`--paged-kv`) is default-OFF, so paged-pool overhead is always 0
-    /// on normal paths. If/when `paged_kv_enabled()` is flipped default-ON,
-    /// add a `paged_overhead_bytes()` method to `PagedKvArena` and sum it
-    /// alongside this estimate. See K15 in `docs/tasks/groups/group-K-backlog.md`.
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-    )]
-    pub fn approx_bytes(&self) -> u64 {
-        let seq = self.offset as u64;
-        if seq == 0 {
-            return 0;
-        }
-        // Derive B * kv_h * head_dim from a decode_fp16 buffer shape when
-        // available (most reliable post-prefill source), or from the rotating
-        // ring buffer. Fall back to zero if shape is unknown (cache never used).
-        //
-        // The K-only family no longer populates `decode_fp16_k` (it was dead
-        // memory), so fall through to `decode_fp16_v`, which is the same
-        // B·kv_h·head_dim shape and is still populated for those
-        // variants. Without this the K-only `approx_bytes` would read 0.
-        let bhd: u64 = if let Some(k) = self.decode_fp16_k.as_ref().or(self.decode_fp16_v.as_ref())
-        {
-            let s = k.shape();
-            if s.len() == 4 {
-                s[0] as u64 * s[1] as u64 * s[3] as u64
-            } else {
-                0
-            }
-        } else if let Some(ref rot) = self.rotating {
-            if let Some(k) = &rot.keys {
-                let s = k.shape();
-                if s.len() == 4 {
-                    s[0] as u64 * s[1] as u64 * s[3] as u64
-                } else {
-                    0
-                }
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-        if bhd == 0 {
-            return 0;
-        }
-        // bits per element for K and V respectively.
-        let (k_bits, v_bits): (u64, u64) = match self.quant {
-            KvQuant::None => (16, 16),
-            KvQuant::K8V8 => (8, 8),
-            KvQuant::K8V4 => (8, 4),
-            KvQuant::Planar => (8, 4),
-            // Planar3 — K is affine q8_0; V is PlanarQuant 3-bit (3.25-bit effective).
-            KvQuant::Planar3 => (8, 3),
-            KvQuant::Mixed { k_bits, v_bits, .. } => (u64::from(k_bits), u64::from(v_bits)),
-            // RotK: K is 8-bit affine in the rotated basis; V is v_bits.
-            KvQuant::RotK { v_bits, .. } => (8, u64::from(v_bits)),
-            // RotKTq4V: K is 8-bit rotated affine; V is TurboQuant 4-bit.
-            KvQuant::RotKTq4V => (8, 4),
-            // K8VTurbo3: K is affine q8_0; V is TurboQuant 3-bit.
-            KvQuant::K8VTurbo3 => (8, 3),
-            // TurboSym3 — both K and V are TurboQuant 3-bit.
-            KvQuant::TurboSym3 => (3, 3),
-            // TurboSym4 — both K and V are TurboQuant 4-bit.
-            KvQuant::TurboSym4 => (4, 4),
-            // PlanarK — K is PlanarQuant 4-bit; V is bf16.
-            KvQuant::PlanarK => (4, 16),
-            // K8VTurbo2 — K is affine q8_0; V is TurboQuant 2-bit.
-            KvQuant::K8VTurbo2 => (8, 2),
-            // Iso3 — K is affine q8_0; V is IsoQuant 3-bit (~3.25
-            // bits effective with the per-group quaternion / scale overhead).
-            KvQuant::Iso3 => (8, 3),
-            // Iso4 — K is affine q8_0; V is IsoQuant 4-bit (~4.25
-            // bits effective with the per-group quaternion / scale overhead).
-            KvQuant::Iso4 => (8, 4),
-            // Rotor3 — K is affine q8_0; V is rotor3 (~3.25 bits
-            // effective with the per-group scale + per-token norm overhead;
-            // rotor table is static per layer so amortises across tokens).
-            KvQuant::Rotor3 => (8, 3),
-            // Rotor4 — K is affine q8_0; V is rotor4 (~4.25 bits
-            // effective; same amortised rotor table as rotor3).
-            KvQuant::Rotor4 => (8, 4),
-            // K8VTurbo3Tcq — K affine q8_0; V is TurboQuant 3-bit
-            // (Viterbi assignment, same pack as K8VTurbo3 — encode-side change only).
-            KvQuant::K8VTurbo3Tcq => (8, 3),
-            // K8VTurbo2Tcq — K affine q8_0; V is TurboQuant 2-bit
-            // (Viterbi assignment, same pack as K8VTurbo2 — encode-side change only).
-            KvQuant::K8VTurbo2Tcq => (8, 2),
-            // Iso3Sym — both K and V are iso 3-bit (~3.25 bits per
-            // axis effective with per-group quaternion + scale overhead).
-            KvQuant::Iso3Sym => (3, 3),
-            // Iso4Sym — both K and V are iso 4-bit.
-            KvQuant::Iso4Sym => (4, 4),
-            // IsoKOnly3 — K iso 3-bit; V stays bf16.
-            KvQuant::IsoKOnly3 => (3, 16),
-            // IsoKOnly4 — K iso 4-bit; V stays bf16.
-            KvQuant::IsoKOnly4 => (4, 16),
-            // Rotor3Sym — both K and V are rotor3 (~3.25 bits per axis effective;
-            // rotor table + optional QJL projection are layer-static so amortise
-            // across tokens, not counted in seq-scaled bytes).
-            KvQuant::Rotor3Sym => (3, 3),
-            // Rotor4Sym — both K and V are rotor4.
-            KvQuant::Rotor4Sym => (4, 4),
-            // RotorKOnly3 — K rotor3; V stays bf16.
-            KvQuant::RotorKOnly3 => (3, 16),
-            // RotorKOnly4 — K rotor4; V stays bf16.
-            KvQuant::RotorKOnly4 => (4, 16),
-            // RotorK3Asym — K rotor3 (3-bit effective); V affine
-            // at v_bits. Same as RotorKOnly3 K side, with affine V replacing bf16.
-            KvQuant::RotorK3Asym { v_bits, .. } => (3, u64::from(v_bits)),
-            // RotorK4Asym — K rotor4 (4-bit effective); V affine at v_bits.
-            KvQuant::RotorK4Asym { v_bits, .. } => (4, u64::from(v_bits)),
-        };
-        let kv_bytes = seq * bhd * (k_bits + v_bits) / 8;
-        // Add warm-TTFT fp16 seed buffers when they exist (present for
-        // quantised paths after exit_prefill; decode_fp16 uses max_seq not
-        // offset, but the memory impact is modest so we count offset).
-        //
-        // Count the K and V seeds independently (each = seq × bhd × 2 bytes /
-        // bf16). The K-only family drops the K seed but keeps the V seed, so
-        // `approx_bytes` reflects a single 2-byte mirror, not 4.
-        // `KvQuant::None` carries no quantised storage and is not a warm-TTFT
-        // seed path, so it is excluded from the seed bytes.
-        let seed_bytes: u64 = if matches!(self.quant, KvQuant::None) {
-            0
-        } else {
-            let k_seed = u64::from(self.decode_fp16_k.is_some());
-            let v_seed = u64::from(self.decode_fp16_v.is_some());
-            seq * bhd * 2 * (k_seed + v_seed)
-        };
-        kv_bytes + seed_bytes
-    }
-
     /// Live-inference KV resident bytes held by this cache at the call-site.
     ///
     /// Reports the bytes of the K/V that actually serves decode — the *filled*
@@ -3070,100 +2925,96 @@ impl KvCache {
     /// - **Fused-QK shadow** (`fused_qk_shadow`): head-major K shadow used by
     ///   fused-QK dispatch (q8, turbo3/4-sym, iso3/4-sym, rotor3/4-sym, …).
     ///
-    /// Unlike [`approx_bytes`], the per-position size comes from the actual
-    /// `Array` shape × dtype of each live buffer (picking up per-layer head_dim
-    /// differences, e.g. windowed vs full-attention layers), scaled by the
-    /// filled length rather than a quant-bit formula.
+    /// The per-position size comes from the actual `Array` shape × dtype of
+    /// each live buffer (picking up per-layer head_dim differences, e.g.
+    /// windowed vs full-attention layers), scaled by the filled length. There
+    /// is deliberately no quant-bit formula anywhere in this total: a codec's
+    /// bytes are whatever its store actually allocated, which only the store
+    /// can answer.
+    ///
+    /// **Cost: O(blocks).** Asking the store is not free — the block-based
+    /// codecs walk a `Vec` that grows by one entry per decode step. Call this
+    /// at request boundaries (as the `kv_bytes` event does), not per-layer
+    /// per-decode-step: that would make a generation quadratic in context.
+    /// Do not "fix" the cost with a cached running counter — a byte total kept
+    /// alongside the buffers instead of read from them is the drifting mirror
+    /// this accounting exists to avoid.
     ///
     /// Returns 0 when the cache has never been used (`offset == 0` and no
     /// buffers are allocated). Safe to call at any point — no FFI eval, no
     /// data read, no mutation.
+    ///
+    /// The exhaustive destructure below is the drift guard: a new buffer cannot
+    /// be added to `KvCache` without this failing to compile.
     pub fn resident_bytes(&self) -> u64 {
-        // Helper: bytes of a single Array without FFI eval.
-        #[inline]
-        fn ab(a: &Array) -> u64 {
-            let n: u64 = a.shape().iter().map(|&d| d as u64).product();
-            n * a.dtype().itemsize() as u64
-        }
+        use crate::bytes::{array_bytes, filled_seq_bytes};
 
-        // Helper: bytes of the *filled* prefix of a `[B, kv_h, seq, D]` decode
-        // buffer. These per-position mirrors are pre-allocated to the
-        // max-context ceiling (full `max_seq`) and compacted to the filled
-        // length only after `exit_prefill`/decode reclaim — so the same config
-        // reports different totals depending on when the metric is read. Only
-        // `offset` positions ever hold live K/V that decode reads. Counting the
-        // whole ceiling-sized buffer inflates the live-inference KV total and
-        // makes bytes-per-KV-token incomparable across contexts (a run with a
-        // high ceiling reports far more than its active cache). Scale by the
-        // filled length, using each buffer's real per-position size (shape ×
-        // dtype, so per-layer head_dim and dtype are picked up), so the figure
-        // is the KV that serves decode regardless of read timing.
-        #[inline]
-        #[allow(
-            clippy::indexing_slicing,
-            reason = "indices 0..=3 are bounds-checked by the `s.len() != 4` early return above"
-        )]
-        fn filled_seq_bytes(a: &Array, filled: u64) -> u64 {
-            let s = a.shape();
-            if s.len() != 4 {
-                return ab(a);
-            }
-            let per_pos = s[0] as u64 * s[1] as u64 * s[3] as u64 * a.dtype().itemsize() as u64;
-            let cap = s[2] as u64;
-            per_pos * filled.min(cap)
-        }
+        // Naming every field is what makes this total drift-proof: a buffer
+        // added to `KvCache` cannot slip past the accounting unnoticed, because
+        // the pattern stops compiling until it is classified here.
+        let Self {
+            storage,
+            offset,
+            decode_fp16_k,
+            decode_fp16_v,
+            rotating,
+            flash_k_codes,
+            flash_k_scales,
+            flash_v_codes,
+            flash_v_scales,
+            fused_qk_shadow,
+            // Transient prefill staging: borrowed views handed straight to the
+            // encoder and dropped at `exit_prefill`, not cache residency.
+            prefill_raw_k: _,
+            prefill_raw_v: _,
+            // Configuration / bookkeeping, not allocations.
+            quant: _,
+            layer_idx: _,
+            in_prefill: _,
+            flash_max_seq: _,
+            flash_filled: _,
+            max_seq_ceiling: _,
+        } = self;
 
-        let offset = self.offset.max(0) as u64;
+        let offset = (*offset).max(0) as u64;
 
-        // 1. Quantized storage (codec-specific buffers; None → 0). Already
-        //    compacted to the filled length at `exit_prefill`.
-        let mut total = self.storage.resident_bytes();
+        // 1. Quantized storage (codec-specific buffers; None → 0). The store
+        //    owns its own byte total, GPU rings and mirrors included.
+        let mut total = storage.resident_bytes();
 
         // 2. fp16 decode seeds (KvQuant::None bf16 storage lives here too).
         //    Count only the filled prefix, not the ceiling-sized allocation.
-        if let Some(ref k) = self.decode_fp16_k {
+        if let Some(k) = decode_fp16_k {
             total += filled_seq_bytes(k, offset);
         }
-        if let Some(ref v) = self.decode_fp16_v {
+        if let Some(v) = decode_fp16_v {
             total += filled_seq_bytes(v, offset);
         }
 
         // 3. Rotating SWA ring buffer (bf16, sized to the sliding window). The
-        //    ring holds at most `window` live positions; early in a sequence
-        //    only `offset` are filled. Both are already ≤ the window allocation.
-        if let Some(ref rot) = self.rotating {
-            if let Some(ref k) = rot.keys {
-                total += filled_seq_bytes(k, offset);
-            }
-            if let Some(ref v) = rot.values {
-                total += filled_seq_bytes(v, offset);
-            }
+        //    ring owns its own byte total: reaching its buffers by field access
+        //    from here would let a buffer added to it go uncounted.
+        if let Some(rot) = rotating {
+            total += rot.byte_size(offset);
         }
 
         // 4. TurboFlash head-major K/V buffers (lazy; only for K8V4 path).
-        if let Some(ref c) = self.flash_k_codes {
-            total += ab(c);
+        if let Some(c) = flash_k_codes {
+            total += array_bytes(c);
         }
-        if let Some(ref s) = self.flash_k_scales {
-            total += ab(s);
+        if let Some(s) = flash_k_scales {
+            total += array_bytes(s);
         }
-        if let Some(ref c) = self.flash_v_codes {
-            total += ab(c);
+        if let Some(c) = flash_v_codes {
+            total += array_bytes(c);
         }
-        if let Some(ref s) = self.flash_v_scales {
-            total += ab(s);
+        if let Some(s) = flash_v_scales {
+            total += array_bytes(s);
         }
 
         // 5. Fused-QK shadow (head-major K shadow for fused-QK MSL kernels).
-        if let Some(ref shadow) = self.fused_qk_shadow {
-            total += ab(&shadow.k_codes);
-            total += ab(&shadow.k_scales);
-            if let Some(ref norms) = shadow.sideband_norms {
-                total += ab(norms);
-            }
-            if let Some(ref table) = shadow.sideband_rotor_table {
-                total += ab(table);
-            }
+        if let Some(shadow) = fused_qk_shadow {
+            total += shadow.byte_size();
         }
 
         total

@@ -14,7 +14,6 @@
 #![allow(clippy::match_same_arms, clippy::too_many_lines)]
 
 use rmlx_core::error::Result;
-use rmlx_mlx::Array;
 
 use super::{
     QuantIsoK3, QuantIsoK4, QuantIsoV3, QuantIsoV4, QuantK, QuantKTurbo3, QuantKTurbo4,
@@ -22,18 +21,6 @@ use super::{
 };
 use crate::paged::{PagedKStorage, PagedPlanarVStorage, PagedVStorage};
 use crate::KvQuant;
-
-// ── Byte-accounting helper ────────────────────────────────────────────────────
-
-/// Actual on-device bytes for a single `Array` — shape product × dtype item size.
-///
-/// Works entirely from array metadata (no FFI eval, no data read). Returns 0
-/// for zero-dimensional or empty arrays. Used by [`KvStorage::resident_bytes`].
-#[inline]
-fn array_nbytes(a: &Array) -> u64 {
-    let n: u64 = a.shape().iter().map(|&d| d as u64).product();
-    n * a.dtype().itemsize() as u64
-}
 
 /// Layout tag for symmetric TurboQuant 3-bit K + turbo3 V.
 ///
@@ -1559,117 +1546,169 @@ impl KvStorage {
         })
     }
 
-    /// Actual on-device byte footprint of the quantized storage buffers.
+    /// Resident byte footprint of this variant's quantized storage.
     ///
-    /// Sums the bytes of every allocated buffer in the storage variant:
-    /// - For GPU-backed variants (`QuantK`, `QuantV`, `QuantPlanarV`, …):
-    ///   actual `Array` shape × dtype item-size (allocated at `gpu_capacity`,
-    ///   not just filled tokens — the allocator uses power-of-two pages).
-    /// - For CPU-backed variants (`IsoBlocks`, `RotorBlocks`, …):
-    ///   sum of all `Vec` element sizes in bytes.
-    /// - `KvStorage::None` returns **0**: its buffers live on the parent
-    ///   `KvCache::decode_fp16_k/v` and are counted by `KvCache::resident_bytes`.
+    /// Every arm delegates to the owning store's own `byte_size`, which derives
+    /// the total from that store's real allocations — CPU blocks, GPU mirrors
+    /// and GPU rings alike. There is deliberately **no** per-codec byte formula
+    /// here: a second, hand-maintained restatement of what each store holds is
+    /// what let a store grow a GPU ring while this total stayed blind to it.
+    /// The store owns its own size; this function only routes.
     ///
-    /// Does **not** count the warm-TTFT fp16 decode-seed buffers
-    /// (`KvCache::decode_fp16_k/v`) — those are tallied separately in
-    /// [`KvCache::resident_bytes`] for all quantized variants.
+    /// GPU buffers count their full allocation (rings and mirrors are sized to
+    /// capacity, not to the filled prefix) — that is the memory actually held.
+    ///
+    /// **Excludes paged-pool overhead.** The `Paged` arm counts the pages the
+    /// slabs hold, not the arena bookkeeping around them. Paged KV
+    /// (`--paged-kv`) is default-OFF, so that overhead is 0 on every normal
+    /// path; if it is ever flipped default-ON, give `PagedKvArena` its own
+    /// `byte_size` and sum it in the `Paged` arm rather than estimating it here.
+    ///
+    /// `KvStorage::None` returns **0**: its buffers live on the parent
+    /// `KvCache::decode_fp16_k/v` and are counted by `KvCache::resident_bytes`,
+    /// which also adds the warm-TTFT fp16 decode seeds for quantized variants.
+    ///
+    /// The arms bind every field explicitly (no `..` rest-patterns): adding a
+    /// buffer to a variant is then a compile error here until it is accounted.
     #[allow(
         clippy::too_many_lines,
-        reason = "exhaustive match over all KvStorage variants — LOC-exempt: KvStorage has 30 variants; each arm is a one-to-three line byte summation that cannot be factored further without losing explicitness"
+        reason = "exhaustive match over all KvStorage variants — LOC-exempt: KvStorage has 30 variants; each arm is a one-to-three line delegation that cannot be factored further without losing explicitness"
     )]
     pub fn resident_bytes(&self) -> u64 {
         match self {
             // ── Unquantised (bf16) ─────────────────────────────────────────────
             // Buffers live on KvCache::decode_fp16_k/v; nothing extra here.
-            KvStorage::None { .. } => 0,
+            KvStorage::None { max_seq: _ } => 0,
 
             // ── K8V8 (K = q8_0, V = q8_0; V uses QuantK not QuantV) ─────────
-            KvStorage::K8V8 { k, v, .. } => quant_k_bytes(k.as_ref()) + quant_k_bytes(v.as_ref()),
+            KvStorage::K8V8 { k, v, max_seq: _ } => {
+                opt_bytes(k.as_ref(), QuantK::byte_size) + opt_bytes(v.as_ref(), QuantK::byte_size)
+            }
 
             // ── K8V4 / K8VTurbo* (K = q8_0, V = TurboQuant) ─────────────────
-            KvStorage::K8V4 { k, v, .. }
-            | KvStorage::K8VTurbo3 { k, v, .. }
-            | KvStorage::K8VTurbo3Tcq { k, v, .. }
-            | KvStorage::K8VTurbo2 { k, v, .. }
-            | KvStorage::K8VTurbo2Tcq { k, v, .. } => {
-                quant_k_bytes(k.as_ref()) + quant_v_bytes(v.as_ref())
+            KvStorage::K8V4 { k, v, max_seq: _ }
+            | KvStorage::K8VTurbo3 { k, v, max_seq: _ }
+            | KvStorage::K8VTurbo3Tcq { k, v, max_seq: _ }
+            | KvStorage::K8VTurbo2 { k, v, max_seq: _ }
+            | KvStorage::K8VTurbo2Tcq { k, v, max_seq: _ } => {
+                opt_bytes(k.as_ref(), QuantK::byte_size) + opt_bytes(v.as_ref(), QuantV::byte_size)
             }
 
             // ── Planar (K=q8, V=PlanarQuant) ─────────────────────────────────
-            KvStorage::Planar { k, v, .. } => {
-                quant_k_bytes(k.as_ref()) + quant_planar_v_bytes(v.as_ref())
+            KvStorage::Planar {
+                k,
+                v,
+                max_seq: _,
+                bits: _,
+            } => {
+                opt_bytes(k.as_ref(), QuantK::byte_size)
+                    + opt_bytes(v.as_ref(), QuantPlanarV::byte_size)
             }
 
             // ── PlanarK (K=PlanarQuant, V=bf16 on KvCache) ───────────────────
-            KvStorage::PlanarK { k, .. } => quant_planar_k_bytes(k.as_ref()),
+            KvStorage::PlanarK { k, max_seq: _ } => opt_bytes(k.as_ref(), QuantPlanarK::byte_size),
 
             // ── Mixed (MLX mx.quantize 3-tuples, opt. RotK) ───────────────────
-            KvStorage::Mixed { state, .. } => mixed_kv_state_bytes(state),
+            KvStorage::Mixed { state, max_seq: _ } => state.byte_size(),
 
             // ── RotKTq4V (rotated-K 3-tuple + TurboQuant V4) ─────────────────
-            KvStorage::RotKTq4V { k_state, v, .. } => {
-                mixed_kv_state_bytes(k_state) + quant_v_bytes(v.as_ref())
-            }
+            KvStorage::RotKTq4V {
+                k_state,
+                v,
+                max_seq: _,
+            } => k_state.byte_size() + opt_bytes(v.as_ref(), QuantV::byte_size),
 
             // ── Symmetric Turbo (K=TurboK3/4, V=TurboV) ─────────────────────
-            KvStorage::TurboSym3 { k, v, .. } => {
-                quant_k_turbo3_bytes(k.as_ref()) + quant_v_bytes(v.as_ref())
+            KvStorage::TurboSym3 { k, v, max_seq: _ } => {
+                opt_bytes(k.as_ref(), QuantKTurbo3::byte_size)
+                    + opt_bytes(v.as_ref(), QuantV::byte_size)
             }
-            KvStorage::TurboSym4 { k, v, .. } => {
-                quant_k_turbo4_bytes(k.as_ref()) + quant_v_bytes(v.as_ref())
+            KvStorage::TurboSym4 { k, v, max_seq: _ } => {
+                opt_bytes(k.as_ref(), QuantKTurbo4::byte_size)
+                    + opt_bytes(v.as_ref(), QuantV::byte_size)
             }
 
             // ── IsoQuant V (K=q8, V=Iso3/4) ──────────────────────────────────
-            KvStorage::IsoV3 { k, v, .. } => {
-                quant_k_bytes(k.as_ref()) + quant_iso_v3_bytes(v.as_ref())
+            KvStorage::IsoV3 { k, v, max_seq: _ } => {
+                opt_bytes(k.as_ref(), QuantK::byte_size)
+                    + opt_bytes(v.as_ref(), QuantIsoV3::byte_size)
             }
-            KvStorage::IsoV4 { k, v, .. } => {
-                quant_k_bytes(k.as_ref()) + quant_iso_v4_bytes(v.as_ref())
+            KvStorage::IsoV4 { k, v, max_seq: _ } => {
+                opt_bytes(k.as_ref(), QuantK::byte_size)
+                    + opt_bytes(v.as_ref(), QuantIsoV4::byte_size)
             }
 
             // ── IsoQuant Sym (K=IsoK3/4, V=IsoV3/4) ─────────────────────────
-            KvStorage::IsoSym3 { k, v, .. } => {
-                quant_iso_k3_bytes(k.as_ref()) + quant_iso_v3_bytes(v.as_ref())
+            KvStorage::IsoSym3 { k, v, max_seq: _ } => {
+                opt_bytes(k.as_ref(), QuantIsoK3::byte_size)
+                    + opt_bytes(v.as_ref(), QuantIsoV3::byte_size)
             }
-            KvStorage::IsoSym4 { k, v, .. } => {
-                quant_iso_k4_bytes(k.as_ref()) + quant_iso_v4_bytes(v.as_ref())
+            KvStorage::IsoSym4 { k, v, max_seq: _ } => {
+                opt_bytes(k.as_ref(), QuantIsoK4::byte_size)
+                    + opt_bytes(v.as_ref(), QuantIsoV4::byte_size)
             }
 
             // ── IsoKOnly (K=Iso3/4, V=bf16 on KvCache) ───────────────────────
-            KvStorage::IsoKOnly3 { k, .. } => quant_iso_k3_bytes(k.as_ref()),
-            KvStorage::IsoKOnly4 { k, .. } => quant_iso_k4_bytes(k.as_ref()),
+            KvStorage::IsoKOnly3 { k, max_seq: _ } => opt_bytes(k.as_ref(), QuantIsoK3::byte_size),
+            KvStorage::IsoKOnly4 { k, max_seq: _ } => opt_bytes(k.as_ref(), QuantIsoK4::byte_size),
 
             // ── RotorV (K=q8, V=Rotor3/4) ────────────────────────────────────
-            KvStorage::RotorV3 { k, v, .. } => {
-                quant_k_bytes(k.as_ref()) + quant_rotor_v3_bytes(v.as_ref())
+            KvStorage::RotorV3 { k, v, max_seq: _ } => {
+                opt_bytes(k.as_ref(), QuantK::byte_size)
+                    + opt_bytes(v.as_ref(), QuantRotorV3::byte_size)
             }
-            KvStorage::RotorV4 { k, v, .. } => {
-                quant_k_bytes(k.as_ref()) + quant_rotor_v4_bytes(v.as_ref())
+            KvStorage::RotorV4 { k, v, max_seq: _ } => {
+                opt_bytes(k.as_ref(), QuantK::byte_size)
+                    + opt_bytes(v.as_ref(), QuantRotorV4::byte_size)
             }
 
             // ── RotorSym (K=RotorK3/4, V=RotorV3/4) ─────────────────────────
-            KvStorage::RotorSym3 { k, v, .. } => {
-                quant_rotor_k3_bytes(k.as_ref()) + quant_rotor_v3_bytes(v.as_ref())
+            KvStorage::RotorSym3 { k, v, max_seq: _ } => {
+                opt_bytes(k.as_ref(), QuantRotorK3::byte_size)
+                    + opt_bytes(v.as_ref(), QuantRotorV3::byte_size)
             }
-            KvStorage::RotorSym4 { k, v, .. } => {
-                quant_rotor_k4_bytes(k.as_ref()) + quant_rotor_v4_bytes(v.as_ref())
+            KvStorage::RotorSym4 { k, v, max_seq: _ } => {
+                opt_bytes(k.as_ref(), QuantRotorK4::byte_size)
+                    + opt_bytes(v.as_ref(), QuantRotorV4::byte_size)
             }
 
             // ── RotorKOnly (K=RotorK3/4, V=bf16 on KvCache) ─────────────────
-            KvStorage::RotorKOnly3 { k, .. } => quant_rotor_k3_bytes(k.as_ref()),
-            KvStorage::RotorKOnly4 { k, .. } => quant_rotor_k4_bytes(k.as_ref()),
+            KvStorage::RotorKOnly3 { k, max_seq: _ } => {
+                opt_bytes(k.as_ref(), QuantRotorK3::byte_size)
+            }
+            KvStorage::RotorKOnly4 { k, max_seq: _ } => {
+                opt_bytes(k.as_ref(), QuantRotorK4::byte_size)
+            }
 
             // ── RotorKAsym (K=RotorK3/4, V=affine QuantV) ────────────────────
-            KvStorage::RotorKAsym3 { k, v, .. } => {
-                quant_rotor_k3_bytes(k.as_ref()) + quant_v_bytes(v.as_ref())
+            KvStorage::RotorKAsym3 {
+                k,
+                v,
+                max_seq: _,
+                v_bits: _,
+                v_group_size: _,
+            } => {
+                opt_bytes(k.as_ref(), QuantRotorK3::byte_size)
+                    + opt_bytes(v.as_ref(), QuantV::byte_size)
             }
-            KvStorage::RotorKAsym4 { k, v, .. } => {
-                quant_rotor_k4_bytes(k.as_ref()) + quant_v_bytes(v.as_ref())
+            KvStorage::RotorKAsym4 {
+                k,
+                v,
+                max_seq: _,
+                v_bits: _,
+                v_group_size: _,
+            } => {
+                opt_bytes(k.as_ref(), QuantRotorK4::byte_size)
+                    + opt_bytes(v.as_ref(), QuantV::byte_size)
             }
 
             // ── Paged (block-table KV, --paged-kv path) ───────────────────────
             KvStorage::Paged {
-                k, v_k8, v_planar, ..
+                k,
+                v_k8,
+                v_planar,
+                quant: _,
+                max_seq: _,
             } => {
                 let k_bytes = k.as_ref().map_or(0, PagedKStorage::resident_bytes);
                 // v_k8 / v_planar are Box-wrapped; closure used to deref through Box.
@@ -1681,369 +1720,7 @@ impl KvStorage {
     }
 }
 
-// ── Per-type byte-counting helpers ────────────────────────────────────────────
-//
-// Each function accepts an `Option<&T>` (None = storage not yet populated →
-// returns 0) and sums the actual buffer bytes for that codec type.
-
-/// Affine q8_0 K buffer (`QuantK`).
-///
-/// GPU path: `gpu_codes_buf` (u32) + `gpu_scales_buf` (f32) — sized to
-/// `gpu_capacity`, not just `offset`. CPU path: `codes` (u8) + `scales` (f32).
-///
-/// NOTE: After an SSD-hydrate init the GPU mirror is live (`gpu_codes_buf =
-/// Some`) *and* the pre-hydration CPU `codes`/`scales` are still resident in
-/// RAM (the hydrate upload path never clears them). Both allocations are
-/// counted.
-fn quant_k_bytes(qk: Option<&QuantK>) -> u64 {
-    let Some(qk) = qk else {
-        return 0;
-    };
-    if let Some(ref codes) = qk.gpu_codes_buf {
-        let scales_bytes = qk.gpu_scales_buf.as_ref().map_or(0, array_nbytes);
-        // Add any coexisting CPU residual (pre-hydration data not cleared on
-        // GPU-mirror init; see `QuantK::append_inner` hydrated-init block).
-        let cpu_residual = qk.codes.len() as u64 + qk.scales.len() as u64 * 4;
-        array_nbytes(codes) + scales_bytes + cpu_residual
-    } else {
-        // CPU path: codes = Vec<u8>, scales = Vec<f32>
-        qk.codes.len() as u64 + qk.scales.len() as u64 * 4
-    }
-}
-
-/// TurboQuant V buffer (`QuantV`), used for K8V4 / K8V8 / K8VTurbo* / RotorKAsym.
-///
-/// GPU path: `gpu_codes_buf` (u32) + `gpu_scales_buf` (f32). CPU path: sum of
-/// `TurboBlocks` — each block has `codes: Vec<u8>` (1 B/elem) and
-/// `scales: Vec<f32>` (4 B/elem).
-///
-/// NOTE: After an SSD-hydrate init the GPU mirror is live and the pre-hydration
-/// CPU `blocks` are still resident in RAM. Both are counted.
-fn quant_v_bytes(qv: Option<&QuantV>) -> u64 {
-    let Some(qv) = qv else {
-        return 0;
-    };
-    if let Some(ref codes) = qv.gpu_codes_buf {
-        let scales_bytes = qv.gpu_scales_buf.as_ref().map_or(0, array_nbytes);
-        // Add any coexisting CPU residual (pre-hydration blocks not cleared on
-        // GPU-mirror init; see `QuantV::append_inner` hydrated-init block).
-        let cpu_residual: u64 = qv
-            .blocks
-            .iter()
-            .map(|b| b.codes.len() as u64 + b.scales.len() as u64 * 4)
-            .sum();
-        array_nbytes(codes) + scales_bytes + cpu_residual
-    } else {
-        // CPU path: TurboBlocks — codes: Vec<u8>, scales: Vec<f32>
-        qv.blocks
-            .iter()
-            .map(|b| b.codes.len() as u64 + b.scales.len() as u64 * 4)
-            .sum()
-    }
-}
-
-/// PlanarQuant V buffer (`QuantPlanarV`), used for `Planar` variant.
-///
-/// GPU path: `gpu_codes_buf` (u32) + `gpu_scales_buf` (f32) +
-/// `gpu_rotations_buf` (u32). CPU path: sum of `PlanarBlocks` — each has
-/// `codes: Vec<u8>` (1 B), `scales: Vec<f32>` (4 B), `rotations: Vec<u8>` (1 B).
-///
-/// NOTE: After an SSD-hydrate init the GPU mirror is live and the pre-hydration
-/// CPU `blocks` are still resident in RAM. Both are counted.
-fn quant_planar_v_bytes(qv: Option<&QuantPlanarV>) -> u64 {
-    let Some(qv) = qv else {
-        return 0;
-    };
-    if let Some(ref codes) = qv.gpu_codes_buf {
-        let scales_bytes = qv.gpu_scales_buf.as_ref().map_or(0, array_nbytes);
-        let rot_bytes = qv.gpu_rotations_buf.as_ref().map_or(0, array_nbytes);
-        // Add any coexisting CPU residual (pre-hydration blocks not cleared on
-        // GPU-mirror init; see `QuantPlanarV::append` hydrated-init block).
-        let cpu_residual: u64 = qv
-            .blocks
-            .iter()
-            .map(|b| b.codes.len() as u64 + b.scales.len() as u64 * 4 + b.rotations.len() as u64)
-            .sum();
-        array_nbytes(codes) + scales_bytes + rot_bytes + cpu_residual
-    } else {
-        qv.blocks
-            .iter()
-            .map(|b| b.codes.len() as u64 + b.scales.len() as u64 * 4 + b.rotations.len() as u64)
-            .sum()
-    }
-}
-
-/// PlanarQuant K buffer (`QuantPlanarK`), used for `PlanarK` variant.
-///
-/// Same buffer layout as `QuantPlanarV` — GPU or CPU with codes/scales/rotations.
-///
-/// NOTE: After an SSD-hydrate init the GPU mirror is live and the pre-hydration
-/// CPU `blocks` are still resident in RAM. Both are counted.
-fn quant_planar_k_bytes(qk: Option<&QuantPlanarK>) -> u64 {
-    let Some(qk) = qk else {
-        return 0;
-    };
-    if let Some(ref codes) = qk.gpu_codes_buf {
-        let scales_bytes = qk.gpu_scales_buf.as_ref().map_or(0, array_nbytes);
-        let rot_bytes = qk.gpu_rotations_buf.as_ref().map_or(0, array_nbytes);
-        // Add any coexisting CPU residual (pre-hydration blocks not cleared on
-        // GPU-mirror init; see `QuantPlanarK::append` hydrated-init block).
-        let cpu_residual: u64 = qk
-            .blocks
-            .iter()
-            .map(|b| b.codes.len() as u64 + b.scales.len() as u64 * 4 + b.rotations.len() as u64)
-            .sum();
-        array_nbytes(codes) + scales_bytes + rot_bytes + cpu_residual
-    } else {
-        qk.blocks
-            .iter()
-            .map(|b| b.codes.len() as u64 + b.scales.len() as u64 * 4 + b.rotations.len() as u64)
-            .sum()
-    }
-}
-
-/// MLX mx.quantize 3-tuple state (`MixedKvState`).
-///
-/// Each `MixedTuple` has three `Array`s: codes (u32), scales (bf16/f32), biases
-/// (bf16/f32). Also includes the optional per-layer Hadamard rotation matrix
-/// (`k_rotation`: `Array`).
-fn mixed_kv_state_bytes(state: &crate::mixed_quant::MixedKvState) -> u64 {
-    fn tuple_bytes(t: &crate::mixed_quant::MixedTuple) -> u64 {
-        array_nbytes(&t.codes) + array_nbytes(&t.scales) + array_nbytes(&t.biases)
-    }
-    let k_bytes = state.keys.as_ref().map_or(0, tuple_bytes);
-    let v_bytes = state.values.as_ref().map_or(0, tuple_bytes);
-    let rot_bytes = state.k_rotation.as_ref().map_or(0, array_nbytes);
-    k_bytes + v_bytes + rot_bytes
-}
-
-/// TurboQuant 3-bit K buffer (`QuantKTurbo3`).
-///
-/// GPU path: `gpu_codes_buf` (u32) + `gpu_scales_buf` (f32).
-/// CPU path: sum of `TurboBlocks`.
-///
-/// NOTE: After an SSD-hydrate init the GPU mirror is live and the pre-hydration
-/// CPU `blocks` are still resident in RAM. Both are counted.
-fn quant_k_turbo3_bytes(qk: Option<&QuantKTurbo3>) -> u64 {
-    let Some(qk) = qk else {
-        return 0;
-    };
-    if let Some(ref codes) = qk.gpu_codes_buf {
-        let scales_bytes = qk.gpu_scales_buf.as_ref().map_or(0, array_nbytes);
-        // Add any coexisting CPU residual (pre-hydration blocks not cleared on
-        // GPU-mirror init; see `QuantKTurbo3::append` hydrated-init block).
-        let cpu_residual: u64 = qk
-            .blocks
-            .iter()
-            .map(|b| b.codes.len() as u64 + b.scales.len() as u64 * 4)
-            .sum();
-        array_nbytes(codes) + scales_bytes + cpu_residual
-    } else {
-        qk.blocks
-            .iter()
-            .map(|b| b.codes.len() as u64 + b.scales.len() as u64 * 4)
-            .sum()
-    }
-}
-
-/// TurboQuant 4-bit K buffer (`QuantKTurbo4`).
-///
-/// Same buffer layout as `QuantKTurbo3` — GPU codes/scales or CPU TurboBlocks.
-///
-/// NOTE: After an SSD-hydrate init the GPU mirror is live and the pre-hydration
-/// CPU `blocks` are still resident in RAM. Both are counted.
-fn quant_k_turbo4_bytes(qk: Option<&QuantKTurbo4>) -> u64 {
-    let Some(qk) = qk else {
-        return 0;
-    };
-    if let Some(ref codes) = qk.gpu_codes_buf {
-        let scales_bytes = qk.gpu_scales_buf.as_ref().map_or(0, array_nbytes);
-        // Add any coexisting CPU residual (pre-hydration blocks not cleared on
-        // GPU-mirror init; see `QuantKTurbo4::append` hydrated-init block).
-        let cpu_residual: u64 = qk
-            .blocks
-            .iter()
-            .map(|b| b.codes.len() as u64 + b.scales.len() as u64 * 4)
-            .sum();
-        array_nbytes(codes) + scales_bytes + cpu_residual
-    } else {
-        qk.blocks
-            .iter()
-            .map(|b| b.codes.len() as u64 + b.scales.len() as u64 * 4)
-            .sum()
-    }
-}
-
-/// IsoQuant 3-bit V buffer (`QuantIsoV3`).
-///
-/// GPU path (when `gpu_resident_iso` gate enabled): `gpu_codes_buf` (u32) +
-/// `gpu_scales_buf` (f32) + `gpu_norms_buf` (f32). CPU path: sum of
-/// `IsoBlocks` — each has `codes: Vec<u32>` (4 B), `scales: Vec<f32>` (4 B),
-/// `quaternions: Vec<f32>` (4 B), `norms: Vec<f32>` (4 B).
-///
-/// NOTE: `QuantIsoV3::gpu_offset` advances independently from `blocks` when
-/// CPU-only blocks are also appended, e.g. after an SSD-hydrate fallback
-/// (see `quant_iso_v.rs` field doc on `gpu_offset`). Both GPU-mirror and any
-/// coexisting CPU `blocks` are resident simultaneously, so both are counted.
-fn quant_iso_v3_bytes(qv: Option<&QuantIsoV3>) -> u64 {
-    let Some(qv) = qv else {
-        return 0;
-    };
-    // GPU path (crate-private fields accessed from within the same crate).
-    if let Some(ref codes) = qv.gpu_codes_buf {
-        let scales_bytes = qv.gpu_scales_buf.as_ref().map_or(0, array_nbytes);
-        let norms_bytes = qv.gpu_norms_buf.as_ref().map_or(0, array_nbytes);
-        // Add any coexisting CPU residual (blocks can be non-empty under a live
-        // GPU mirror after an SSD-hydrate fallback — gpu_offset advances
-        // independently; CPU blocks remain resident).
-        let cpu_residual: u64 = qv
-            .blocks
-            .iter()
-            .map(|b| {
-                b.codes.len() as u64 * 4
-                    + b.scales.len() as u64 * 4
-                    + b.quaternions.len() as u64 * 4
-                    + b.norms.len() as u64 * 4
-            })
-            .sum();
-        return array_nbytes(codes) + scales_bytes + norms_bytes + cpu_residual;
-    }
-    // CPU path.
-    qv.blocks
-        .iter()
-        .map(|b| {
-            b.codes.len() as u64 * 4
-                + b.scales.len() as u64 * 4
-                + b.quaternions.len() as u64 * 4
-                + b.norms.len() as u64 * 4
-        })
-        .sum()
-}
-
-/// IsoQuant 4-bit V buffer (`QuantIsoV4`, CPU-only).
-fn quant_iso_v4_bytes(qv: Option<&QuantIsoV4>) -> u64 {
-    qv.map_or(0, |q| {
-        q.blocks
-            .iter()
-            .map(|b| {
-                b.codes.len() as u64 * 4
-                    + b.scales.len() as u64 * 4
-                    + b.quaternions.len() as u64 * 4
-                    + b.norms.len() as u64 * 4
-            })
-            .sum()
-    })
-}
-
-/// IsoQuant 3-bit K buffer (`QuantIsoK3`, CPU-only). Same layout as IsoV3 blocks.
-fn quant_iso_k3_bytes(qk: Option<&QuantIsoK3>) -> u64 {
-    qk.map_or(0, |q| {
-        q.blocks
-            .iter()
-            .map(|b| {
-                b.codes.len() as u64 * 4
-                    + b.scales.len() as u64 * 4
-                    + b.quaternions.len() as u64 * 4
-                    + b.norms.len() as u64 * 4
-            })
-            .sum()
-    })
-}
-
-/// IsoQuant 4-bit K buffer (`QuantIsoK4`, CPU-only). Same block layout.
-fn quant_iso_k4_bytes(qk: Option<&QuantIsoK4>) -> u64 {
-    qk.map_or(0, |q| {
-        q.blocks
-            .iter()
-            .map(|b| {
-                b.codes.len() as u64 * 4
-                    + b.scales.len() as u64 * 4
-                    + b.quaternions.len() as u64 * 4
-                    + b.norms.len() as u64 * 4
-            })
-            .sum()
-    })
-}
-
-/// Rotor3 V buffer (`QuantRotorV3`, CPU-only).
-///
-/// Includes the static per-layer rotor table (`rotors: Vec<f32>`, 4 B each)
-/// and the per-token `RotorBlocks` payload: `codes: Vec<u32>` (4 B),
-/// `scales: Vec<f32>` (4 B), `norms: Vec<f32>` (4 B).
-fn quant_rotor_v3_bytes(qv: Option<&QuantRotorV3>) -> u64 {
-    qv.map_or(0, |q| {
-        let rotor_bytes = q.rotors.len() as u64 * 4;
-        let block_bytes: u64 = q
-            .blocks
-            .iter()
-            .map(|b| {
-                b.codes.len() as u64 * 4 + b.scales.len() as u64 * 4 + b.norms.len() as u64 * 4
-            })
-            .sum();
-        rotor_bytes + block_bytes
-    })
-}
-
-/// Rotor4 V buffer (`QuantRotorV4`, CPU-only). Same layout as RotorV3.
-fn quant_rotor_v4_bytes(qv: Option<&QuantRotorV4>) -> u64 {
-    qv.map_or(0, |q| {
-        let rotor_bytes = q.rotors.len() as u64 * 4;
-        let block_bytes: u64 = q
-            .blocks
-            .iter()
-            .map(|b| {
-                b.codes.len() as u64 * 4 + b.scales.len() as u64 * 4 + b.norms.len() as u64 * 4
-            })
-            .sum();
-        rotor_bytes + block_bytes
-    })
-}
-
-/// Rotor3 K buffer (`QuantRotorK3`).
-///
-/// Counts the CPU blocks only. The GPU-resident ring (`QuantKGpuRing`) that backs
-/// the rotor flash-decode is accounted by `QuantRotorK3::byte_size`.
-///
-/// Includes: static `rotors: Vec<f32>` (4 B), optional QJL projection matrix
-/// `qjl_s_matrix: Vec<f32>` (4 B), and per-token `RotorKBlocks`:
-/// `codes: Vec<u32>` (4 B), `scales: Vec<f32>` (4 B), `norms: Vec<f32>` (4 B),
-/// `qjl_codes: Vec<u8>` (1 B), `qjl_norms: Vec<f32>` (4 B).
-fn quant_rotor_k3_bytes(qk: Option<&QuantRotorK3>) -> u64 {
-    qk.map_or(0, |q| {
-        let rotor_bytes = q.rotors.len() as u64 * 4;
-        let qjl_mat_bytes = q.qjl_s_matrix.as_ref().map_or(0, |m| m.len() as u64 * 4);
-        let block_bytes: u64 = q
-            .blocks
-            .iter()
-            .map(|b| {
-                b.codes.len() as u64 * 4
-                    + b.scales.len() as u64 * 4
-                    + b.norms.len() as u64 * 4
-                    + b.qjl_codes.len() as u64
-                    + b.qjl_norms.len() as u64 * 4
-            })
-            .sum();
-        rotor_bytes + qjl_mat_bytes + block_bytes
-    })
-}
-
-/// Rotor4 K buffer (`QuantRotorK4`). Same layout as RotorK3; same GPU-ring
-/// accounting note.
-fn quant_rotor_k4_bytes(qk: Option<&QuantRotorK4>) -> u64 {
-    qk.map_or(0, |q| {
-        let rotor_bytes = q.rotors.len() as u64 * 4;
-        let qjl_mat_bytes = q.qjl_s_matrix.as_ref().map_or(0, |m| m.len() as u64 * 4);
-        let block_bytes: u64 = q
-            .blocks
-            .iter()
-            .map(|b| {
-                b.codes.len() as u64 * 4
-                    + b.scales.len() as u64 * 4
-                    + b.norms.len() as u64 * 4
-                    + b.qjl_codes.len() as u64
-                    + b.qjl_norms.len() as u64 * 4
-            })
-            .sum();
-        rotor_bytes + qjl_mat_bytes + block_bytes
-    })
+/// Bytes of an optional store slot; an unpopulated slot (`None`) holds nothing.
+fn opt_bytes<T>(slot: Option<&T>, byte_size: impl Fn(&T) -> u64) -> u64 {
+    slot.map_or(0, byte_size)
 }

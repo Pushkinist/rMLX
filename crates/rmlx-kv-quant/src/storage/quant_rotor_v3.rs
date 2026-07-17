@@ -43,6 +43,26 @@ pub struct RotorBlocks {
     pub n_tokens: usize,
 }
 
+impl RotorBlocks {
+    /// Heap bytes this block holds.
+    ///
+    /// The exhaustive destructure is the drift guard: a new payload field
+    /// cannot be added without this failing to compile. See [`crate::bytes`].
+    #[must_use]
+    pub fn byte_size(&self) -> u64 {
+        let Self {
+            codes,
+            scales,
+            norms,
+            // Inline metadata (no heap payload).
+            n_tokens: _,
+        } = self;
+        crate::bytes::vec_bytes(codes)
+            + crate::bytes::vec_bytes(scales)
+            + crate::bytes::vec_bytes(norms)
+    }
+}
+
 /// Accumulated rotor3 V cache.
 ///
 /// Holds:
@@ -259,19 +279,26 @@ impl QuantRotorV3 {
         })
     }
 
-    /// Approximate byte footprint of the accumulated payload.
+    /// Resident bytes held by this store.
     ///
     /// Counts the rotor table **once** (it is layer-static) plus all
     /// accumulated per-token block buffers.
+    ///
+    /// The exhaustive destructure is the drift guard: a new buffer cannot be
+    /// added to this struct without this failing to compile.
     #[must_use]
-    pub fn byte_size(&self) -> usize {
-        let mut total = self.rotors.len() * size_of::<f32>();
-        for blk in &self.blocks {
-            total += blk.codes.len() * size_of::<u32>();
-            total += blk.scales.len() * size_of::<f32>();
-            total += blk.norms.len() * size_of::<f32>();
-        }
-        total
+    pub fn byte_size(&self) -> u64 {
+        let Self {
+            rotors,
+            blocks,
+            // Geometry / tags, not allocations.
+            shape: _,
+            max_seq: _,
+            layer_idx: _,
+            head_idx: _,
+            bits: _,
+        } = self;
+        crate::bytes::vec_bytes(rotors) + blocks.iter().map(RotorBlocks::byte_size).sum::<u64>()
     }
 
     /// Dequantize all accumulated V slices into one flat f32 vector of length

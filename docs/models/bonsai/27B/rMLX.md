@@ -112,6 +112,22 @@ prompt-token cap and silently truncates, so the 131k fixture would read as a
 is 1.97× the 64k reading (4507 MB), matching the ~2× token ratio — confirming a
 genuine full-length prefill.
 
+> ⚠️ **KV-MB is SUSPECT (under-reported) for the `k_iso3` / `k_iso4` /
+> `k_rotor3` / `k_rotor4` rows.** These four codecs are the ring-backed K-only
+> family: their flash-decode path stands up a GPU ring during decode that the
+> byte accounting did not count when this matrix was captured, so the published
+> figure is CPU blocks only. The ring is roughly **+34% on top of the blocks**;
+> measured on the 8B sibling at 4k the decode-time total for `k_iso3` moved
+> 25.3 → 42.9 MB/layer once the ring was counted. The accounting is fixed, but
+> **these cells have not been re-measured** — treat them as a lower bound, not a
+> reading. Re-capture is tracked separately. Decode-TPS and TTFT in those rows
+> are unaffected (the ring was always allocated; only the metric was blind).
+> All other codecs' KV-MB is unaffected within this column's reading precision:
+> they allocate no ring, and their bytes already came from their real buffers.
+> The one exception is immaterial — the TurboQuant V store's optional TCQ
+> codebook and calibration indices are now counted too, which is O(100 B)
+> against an MB column.
+
 ---
 
 ## 1. rMLX snapshot benched

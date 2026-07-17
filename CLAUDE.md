@@ -302,7 +302,7 @@ Development runs at **info level** by default. Logs accumulate as a runtime-beha
 
 - **Log dir**: `<RMLX_HOME>/logs/` (resolved via `rmlx_core::paths::logs_dir()`).
 - **Verbosity flag**: `--log {info|debug|verbose}` (CLI-wide). `info` is the default; `debug` enables per-step phase events; `verbose` enables per-token / per-FFI / per-layer trace events.
-- **Per-token / per-layer trace events (e.g. `kv_bytes`) default OFF**; opt in with `--log verbose` or `RUST_LOG=...=trace`. This keeps `tracing` overhead out of steady-state decode.
+- **Per-token / per-layer trace events (e.g. per-token `token_id`, per-FFI dispatch) default OFF**; opt in with `--log verbose` or `RUST_LOG=...=trace`. This keeps `tracing` overhead out of steady-state decode. Level gating hides the *emission* cost, not the cost of *computing* a field: an event whose field is an O(seq) call still makes decode quadratic once the level is enabled. Compute such fields at request boundaries and emit them there (`kv_bytes` is one — it is a per-request `debug!`, not a per-layer `trace!`).
 - **EnvFilter precedence**: `RUST_LOG` (if set) > `--log` preset. `RUST_LOG=debug,rmlx=trace` remains the explicit escape hatch.
 - **Run-id**: `YYYYMMDD-HHMMSS-<version>`. One file per run: `<run-id>.jsonl`. (The binary does no git of any kind — see `docs/METRICS_DB.md` §8.5.1 — so the discriminator is the backend semver, not a commit SHA.)
 - **Total-size rotation**: at startup, oldest files are deleted until the directory total is ≤ `RMLX_LOG_CAP_MB` (default 100 MB). The in-flight log file is never a deletion candidate (rotation runs before the appender opens).
