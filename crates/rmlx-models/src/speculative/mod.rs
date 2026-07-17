@@ -1344,9 +1344,6 @@ pub fn prefill_chunked(
     mut lin_caches: Option<&mut [LinearAttnCache]>,
     device: Device,
 ) -> Result<()> {
-    if tokens.is_empty() {
-        return Ok(());
-    }
     // Dispatch the chunk size off the actual arch family: Gemma4 and the
     // Qwen3.5MoE hybrid use their own per-arch prefill chunk size.
     let prefill_chunk = if arch.needs_lin_caches() {
@@ -1354,33 +1351,79 @@ pub fn prefill_chunked(
     } else {
         crate::prefill_chunk::prefill_chunk_for("gemma4")
     };
+    prefill_chunked_with(tokens, caches, prefill_chunk, device, |chunk, caches| {
+        // Single-position last_k=1 forward — we only need cache update, not
+        // logits. The lazy graph drops the lm_head matmul on non-final chunks;
+        // on the final chunk we discard the returned Array. For GDN-bearing
+        // archs the recurrent lin_caches advance alongside kv_caches; Gemma4
+        // passes None. `as_deref_mut` reborrows per chunk.
+        arch.forward_seq_last_k_with_cache(chunk, 1, caches, lin_caches.as_deref_mut(), device)
+            .map(|_| ())
+    })
+}
+
+/// Bracket-and-sweep engine behind [`prefill_chunked`]: `enter_prefill` on every
+/// cache, run `forward` per chunk, then `exit_prefill` on every cache.
+///
+/// The `exit_prefill` sweep is **mandatory** and runs on the failure path too.
+/// On a chunk forward / eval failure this captures the first cause, breaks the
+/// chunk loop, then sweeps `exit_prefill` over **all** caches unconditionally
+/// (no early `?`, no `break` that skips a cache) before returning that first
+/// cause. A cache left mid-prefill keeps un-finalized state (no decode seed /
+/// un-quantized storage), and the next decode on it errors or corrupts KV — so
+/// stranding even one cache poisons any later reuse of this slice.
+///
+/// The forward is injected so the invariant is unit-testable without a live
+/// model: a test drives a failing forward and asserts no cache is left
+/// `in_prefill`.
+fn prefill_chunked_with(
+    tokens: &[u32],
+    caches: &mut [KvCache],
+    prefill_chunk: usize,
+    device: Device,
+    mut forward: impl FnMut(&[u32], &mut [KvCache]) -> Result<()>,
+) -> Result<()> {
+    if tokens.is_empty() {
+        return Ok(());
+    }
     for c in caches.iter_mut() {
         c.enter_prefill();
     }
+    let mut first_err: Option<Error> = None;
     let n_chunks = tokens.len().div_ceil(prefill_chunk);
-    for (chunk_idx, chunk) in tokens.chunks(prefill_chunk).enumerate() {
+    'chunks: for (chunk_idx, chunk) in tokens.chunks(prefill_chunk).enumerate() {
         let is_last = chunk_idx + 1 == n_chunks;
-        // Single-position last_k=1 forward — we only need cache update,
-        // not logits. The lazy graph drops the lm_head matmul on
-        // non-final chunks; on final chunk we discard the returned Array.
-        // For GDN-bearing archs the recurrent lin_caches advance alongside
-        // kv_caches; Gemma4 passes None. `as_deref_mut` reborrows per chunk.
-        let _ = arch.forward_seq_last_k_with_cache(
-            chunk,
-            1,
-            caches,
-            lin_caches.as_deref_mut(),
-            device,
-        )?;
+        if let Err(e) = forward(chunk, caches) {
+            tracing::error!(error = %e, "spec prefill chunk forward failed, aborting generation");
+            first_err = Some(e);
+            break 'chunks;
+        }
         // Flush command buffer between chunks via cache eval.
         if !is_last {
             for c in caches.iter() {
-                c.eval_prefill_state()?;
+                if let Err(e) = c.eval_prefill_state() {
+                    tracing::error!(error = %e, "spec prefill chunk cache eval failed, aborting generation");
+                    first_err = Some(e);
+                    break 'chunks;
+                }
             }
         }
     }
+    // Mandatory cleanup: every cache entered prefill above and must run
+    // exit_prefill, even after a failure — no break, no early `?`. Skipping it
+    // strands the remaining caches with un-finalized prefill state that
+    // corrupts any later reuse of this slice. The first cause wins; a secondary
+    // exit failure is logged (so it does not vanish) but does not overwrite it.
     for c in caches.iter_mut() {
-        c.exit_prefill(device)?;
+        if let Err(e) = c.exit_prefill(device) {
+            tracing::error!(error = %e, "spec prefill: exit_prefill failed during cleanup sweep");
+            if first_err.is_none() {
+                first_err = Some(e);
+            }
+        }
+    }
+    if let Some(e) = first_err {
+        return Err(e);
     }
     Ok(())
 }
