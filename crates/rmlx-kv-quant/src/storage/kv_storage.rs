@@ -2001,7 +2001,7 @@ fn quant_rotor_v4_bytes(qv: Option<&QuantRotorV4>) -> u64 {
 
 /// Rotor3 K buffer (`QuantRotorK3`).
 ///
-/// Counts the CPU blocks only. The GPU-resident ring (`RotorGpuK`) that backs
+/// Counts the CPU blocks only. The GPU-resident ring (`QuantKGpuRing`) that backs
 /// the rotor flash-decode is accounted by `QuantRotorK3::byte_size`.
 ///
 /// Includes: static `rotors: Vec<f32>` (4 B), optional QJL projection matrix

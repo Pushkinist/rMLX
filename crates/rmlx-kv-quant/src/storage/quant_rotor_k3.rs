@@ -14,7 +14,7 @@
 )]
 //! Quantized K buffer: `QuantRotorK3` (rotor3 K codec).
 
-use rmlx_core::error::Result;
+use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device};
 
 use crate::clifford::make_rotor_table;
@@ -23,7 +23,7 @@ use crate::rotorquant::{
     ROTOR3_BITS, ROTOR3_GROUP_SIZE,
 };
 
-use super::RotorGpuK;
+use super::QuantKGpuRing;
 
 /// Bit-width of the rotor3 K codec.
 pub const ROTOR3_K_BITS: u8 = ROTOR3_BITS;
@@ -69,7 +69,7 @@ pub struct RotorKBlocks {
 ///
 /// * `blocks` — CPU `RotorKBlocks`, the source of truth for `dequant()`, the
 ///   SSD spill/hydrate round-trip, and the QJL path.
-/// * `gpu` — the optional GPU-resident packed ring ([`RotorGpuK`]), populated by
+/// * `gpu` — the optional GPU-resident packed ring ([`QuantKGpuRing`]), populated by
 ///   `gpu_append` on the QJL-off GPU encode path. When present it lets the
 ///   rotor flash-decode kernel read the quant store directly instead of paying a
 ///   full-prefix CPU `dequant()` per decode step.
@@ -77,7 +77,7 @@ pub struct QuantRotorK3 {
     /// Static rotor table for this layer/head, flat `[n_groups * 4]` f32.
     pub rotors: Vec<f32>,
     /// GPU-resident packed ring. Empty until the first `gpu_append`.
-    pub gpu: RotorGpuK,
+    pub gpu: QuantKGpuRing,
     /// Static QJL projection matrix, flat `[qjl_dim * head_dim]` f32. `None`
     /// when QJL is disabled — chosen at first `append` time from the global
     /// [`crate::rotor_qjl::rotor_qjl_enabled`] toggle.
@@ -123,7 +123,7 @@ impl QuantRotorK3 {
     pub fn new(init_shape: Vec<i32>, layer_idx: u32) -> Self {
         Self {
             rotors: Vec::new(),
-            gpu: RotorGpuK::default(),
+            gpu: QuantKGpuRing::default(),
             qjl_s_matrix: None,
             blocks: Vec::new(),
             shape: init_shape,
@@ -157,7 +157,7 @@ impl QuantRotorK3 {
             rotors,
             // Hydrated caches start CPU-only; the ring is rebuilt lazily from
             // the next GPU append.
-            gpu: RotorGpuK::default(),
+            gpu: QuantKGpuRing::default(),
             qjl_s_matrix,
             blocks,
             shape,
@@ -186,7 +186,7 @@ impl QuantRotorK3 {
     )]
     pub fn append(&mut self, f32_data: &[f32], new_shape: &[i32]) -> Result<()> {
         if new_shape.len() != 4 {
-            return Err(rmlx_core::error::Error::Mlx(format!(
+            return Err(Error::Mlx(format!(
                 "QuantRotorK3::append: expected 4D new_shape, got {new_shape:?}"
             )));
         }
@@ -220,9 +220,7 @@ impl QuantRotorK3 {
             head_dim,
             self.qjl_s_matrix.as_deref(),
         )
-        .map_err(|e: RotorQuantError| {
-            rmlx_core::error::Error::Mlx(format!("rotor3_k encode: {e}"))
-        })?;
+        .map_err(|e: RotorQuantError| Error::Mlx(format!("rotor3_k encode: {e}")))?;
 
         self.blocks.push(RotorKBlocks {
             codes,
@@ -246,7 +244,7 @@ impl QuantRotorK3 {
     }
 
     /// Concatenate the accumulated CPU blocks into flat sequence-major
-    /// `(codes, scales, norms)` — the form [`RotorGpuK::seed_from_cpu`] wants.
+    /// `(codes, scales, norms)` — the form [`QuantKGpuRing::seed_from_cpu`] wants.
     fn flatten_blocks(&self) -> (Vec<u32>, Vec<f32>, Vec<f32>) {
         // Exact capacities — the prefill seed concatenates the whole prefix
         // (millions of entries at long context), so growing from empty would
@@ -286,7 +284,7 @@ impl QuantRotorK3 {
     ///
     /// # Errors
     ///
-    /// Forwards [`RotorGpuK::seed_from_cpu`] / [`RotorGpuK::append_encoded`]
+    /// Forwards [`QuantKGpuRing::seed_from_cpu`] / [`QuantKGpuRing::append_encoded`]
     /// errors.
     #[allow(clippy::too_many_arguments)]
     pub fn gpu_append(
@@ -301,13 +299,21 @@ impl QuantRotorK3 {
         max_seq: i32,
         device: Device,
     ) -> Result<()> {
+        // The ring is codec-agnostic and takes `n_groups`; the rotor group rule
+        // stays here, in the codec's own store.
+        let n_groups = i32::try_from(n_groups_for(usize::try_from(head_dim.max(0)).unwrap_or(0)))
+            .map_err(|_| {
+            Error::Quant(format!(
+                "QuantRotorK3::gpu_append: n_groups for head_dim={head_dim} exceeds i32::MAX"
+            ))
+        })?;
         if !self.gpu.is_allocated() && prev_seq > 0 {
             let (c, s, n) = self.flatten_blocks();
             self.gpu
-                .seed_from_cpu(&c, &s, &n, kv_h, head_dim, prev_seq, max_seq, device)?;
+                .seed_from_cpu(&c, &s, &n, kv_h, n_groups, prev_seq, max_seq, device)?;
         }
         self.gpu.append_encoded(
-            codes, scales, norms, kv_h, head_dim, prev_seq, new_seq, max_seq, device,
+            codes, scales, norms, kv_h, n_groups, prev_seq, new_seq, max_seq, device,
         )
     }
 
@@ -316,7 +322,7 @@ impl QuantRotorK3 {
     ///
     /// # Errors
     ///
-    /// Forwards [`RotorGpuK::packed_view`] errors.
+    /// Forwards [`QuantKGpuRing::packed_view`] errors.
     pub fn gpu_packed_view(
         &self,
         kv_seq: i32,
@@ -376,7 +382,7 @@ impl QuantRotorK3 {
             // the ring re-seeds from them on the clone's first GPU append.
             // Sharing the source's Arrays would alias one ring across two
             // independent caches.
-            gpu: RotorGpuK::default(),
+            gpu: QuantKGpuRing::default(),
             qjl_s_matrix: self.qjl_s_matrix.clone(),
             blocks: self.blocks.clone(),
             shape: self.shape.clone(),
@@ -423,7 +429,7 @@ impl QuantRotorK3 {
     )]
     pub fn dequant(&self) -> Result<Vec<f32>> {
         if self.shape.len() != 4 {
-            return Err(rmlx_core::error::Error::Mlx(format!(
+            return Err(Error::Mlx(format!(
                 "QuantRotorK3::dequant: malformed shape {:?}",
                 self.shape
             )));
@@ -438,7 +444,7 @@ impl QuantRotorK3 {
         }
 
         if self.rotors.is_empty() {
-            return Err(rmlx_core::error::Error::Mlx(
+            return Err(Error::Mlx(
                 "QuantRotorK3::dequant: rotor table is empty but blocks were appended".into(),
             ));
         }
@@ -454,9 +460,7 @@ impl QuantRotorK3 {
                 &blk.qjl_norms,
                 self.qjl_s_matrix.as_deref(),
             )
-            .map_err(|e: RotorQuantError| {
-                rmlx_core::error::Error::Mlx(format!("rotor3_k decode: {e}"))
-            })?;
+            .map_err(|e: RotorQuantError| Error::Mlx(format!("rotor3_k decode: {e}")))?;
             out.extend_from_slice(&dec);
         }
         if out.len() < total_elems {

@@ -326,12 +326,12 @@ be classified or the build fails.
     prefill) is CPU. The rotor family's GPU fused-QK encoder is gated OFF by
     default (`RMLX_FUSED_QK`).
   * **K-only iso** (`k_iso3` / `k_iso4`) → **`None`** (Metal). No bf16
-    early-return: `update_iso_k_only_{3,4}` dispatches the `iso{3,4}` MSL encode
-    kernel every decode step on GPU (`k_iso3` also runs the iso3 MSL dequant
-    kernel). Hybrid — the dequant restages the growing prefix host-side and
-    re-uploads via `Array::from_bytes` each step (a real, growing CPU cost) — but
-    a Metal kernel demonstrably dispatches, so it is **not** "no Metal kernel",
-    and must not be hard-rejected by the CPU-path classifier.
+    early-return: `update_and_sdpa_iso_k_fused` GPU-encodes the step into the
+    packed ring and `iso_flash_decode` reads that ring directly, so **both**
+    sides are GPU-resident and nothing restages through the host. Before the
+    flash-decode kernel this was a hybrid — the per-step dequant restaged the
+    growing prefix host-side and re-uploaded it via `Array::from_bytes` — which
+    is what held these codecs at single-digit TPS.
   * **K-only rotor** (`k_rotor3` / `k_rotor4`) → **QJL-dependent**. No bf16
     early-return; `update_rotor_k_only_{3,4}` gates the GPU K encode on
     `device == Gpu && !rotor_qjl_enabled()`. QJL **on** (default) → CPU
@@ -354,7 +354,7 @@ be classified or the build fails.
 | `mixed_*` / `rot_k_v*` / `rot_k_tq4v` | **Metal** | MLX-affine `mx.quantize` K + tq4/affine V (compiled Metal ops) |
 | `k8vturbo3` / `k8vturbo2` / `*tcq` / `tsym3` / `tsym4` | **Metal K**, CPU V (bounded) | K=q8_0 GPU; V CPU-forced by the −1 %/−2 % TPS gate, cost small |
 | `iso3` / `iso4` / `iso3_sym` / `iso4_sym` | **CPU** | bf16 decode seed shadows the GPU iso branch; prefill V-encode on host |
-| `k_iso3` / `k_iso4` | **Metal (hybrid)** | iso K MSL encode every decode step (`k_iso3` also MSL dequant); dequant restages prefix host-side per step. `cpu_hot_path_reason() == None` |
+| `k_iso3` / `k_iso4` | **fully Metal** | iso K MSL encode into the packed ring + `iso_flash_decode` fused decode over that ring. No host restaging. `cpu_hot_path_reason() == None` |
 | `rotor3` / `rotor4` / `rotor*_sym` / `rotor_k_*_asym_*` | **CPU** | bf16 decode seed shadows the GPU branch; GPU fused-QK encoder is `RMLX_FUSED_QK`-only |
 | `k_rotor3` / `k_rotor4` | **QJL-dependent** | QJL on (default) → CPU; QJL off (`--rotor-qjl off`) → **fully Metal**: rotor K MSL encode + `rotor_flash_decode` fused decode. Verdict reads `rotor_qjl_enabled()` |
 
@@ -1995,20 +1995,20 @@ rejected for Qwen3.5/3.6 MoE."` (positive guard test).
 the K side and the V side is rebuilt transparently from the live request's
 bf16 buffer on first decode step.
 
-**Status.** CPU-only on the hot path. The iso3 MSL kernel could in principle
-be reused on the K axis (it is axis-agnostic), but on-disk and SDPA paths use
-the CPU dequant fallback; an MSL re-wiring is a deferred follow-up.
+**Status.** GPU-resident on the hot path. `QuantIsoK3` / `QuantIsoK4` each embed
+a `QuantKGpuRing`; the K encode writes the packed ring on-GPU and
+`iso_flash_decode` reads that ring directly — see § `iso_flash_decode` below.
 
-**Decode-cost caveat.** `QuantIsoK3`/`QuantIsoK4` have no GPU-resident code
-mirror on the live decode path: the CPU `dequant()` re-materializes every
-accumulated block each step and the reconstructed K prefix is re-uploaded to
-the GPU via `Array::from_bytes` — an O(kv_seq) per-step cost that grows
-monotonically with context. (A `dequant_gpu` mirror exists but is gated behind
-`gpu_resident_iso_enabled()`, hardcoded `false` in `rmlx-kv-quant/src/lib.rs`,
-so it does not run.) The short-prompt anchors elsewhere in this doc (warm-TTFT
-masks the cost after step 1) do not show it; long-prompt decode does (k_iso3
-Bonsai ~59 TPS vs iso3_sym ~142). The GPU mirror is deferred until a bench arm
-shows a win on a FusedQkShadow-incompatible path.
+**Decode-cost caveat (historical — fixed).** These stores used to have no
+GPU-resident mirror on the live decode path: the CPU `dequant()` re-materialised
+every accumulated block each step and re-uploaded the reconstructed K prefix via
+`Array::from_bytes` — an O(kv_seq) per-step cost that grew monotonically with
+context. Short-prompt anchors (warm-TTFT masks the cost after step 1) hid it;
+long-prompt decode showed it. Measured on Bonsai-8B `k_iso3`, that cost was
+~48.5 µs per KV token, taking decode to 0.96 TPS at 16k and 0.59 at 32k. The
+flash-decode kernel removes it (16k: 0.96 → 10.6; 32k: 0.59 → 6.6). Kept here
+because the shape of the bug — an O(seq) host restage hidden behind a warm bf16
+seed — recurs across codecs.
 
 **Cosine empirical floors.** Measured on the LCG fixture at
 `head_dim=128, n_rows=16, TEST_SEED` (see `quant_iso_k{,4}_tests.rs`):
@@ -2503,7 +2503,7 @@ host.
 decode into a `Vec<f32>` plus a re-upload. That is O(seq) host work per token
 with the GPU idle, and it is what pinned the K-only rotor family in the
 "Tier 3 — CPU-bound" bucket (0.05–8.8 TPS, see `docs/models/bonsai/27B/rMLX.md`).
-The store is now GPU-resident (`storage::RotorGpuK`) and the kernel reads it
+The store is now GPU-resident (`storage::QuantKGpuRing`) and the kernel reads it
 directly.
 
 ### Files
@@ -2514,9 +2514,10 @@ directly.
   (one body for **both** bit widths).
 * `crates/rmlx-kv-quant/src/metal/flash_decode_merge_p2.metal` — codec-agnostic
   pass-2 log-sum-exp merge, shared with `planar_flash_decode`.
-* `crates/rmlx-kv-quant/src/storage/rotor_gpu_k.rs` — `RotorGpuK`, the
+* `crates/rmlx-kv-quant/src/storage/quant_k_gpu_ring.rs` — `QuantKGpuRing`, the
   GPU-resident packed ring (codes / per-group scales / per-token L2 norms) with
-  paged growth and CPU-prefix seeding.
+  paged growth and CPU-prefix seeding. Codec-agnostic: it is told `n_groups`
+  rather than deriving it, and is shared with the iso K stores.
 * `crates/rmlx-kv-quant/src/kvcache/sdpa.rs::update_and_sdpa_rotor_k_fused` —
   dispatch site.
 
@@ -2566,7 +2567,7 @@ must not change how existing bytes are read.
 
 ### Ring eligibility is passed down, not inferred
 
-`RotorGpuK` is only built for the codecs that can actually read it. The rotor K
+`QuantKGpuRing` is only built for the codecs that can actually read it. The rotor K
 GPU encode takes a `RingFeed` from its caller: `Maintain` from the two K-only
 paths (prefill `update_rotor_k_only_*` and the fused decode entry), `Skip` from
 the sym/asym mirrors. A ring for a non-eligible codec is not free —
@@ -2632,6 +2633,148 @@ below `none` (Bonsai bf16 ≈ 110 TPS). The rotor sandwich is ~64 FMAs per group
 per lane and each of a group's 3 lanes redoes it, so the inner loop is
 compute-bound, not KV-bandwidth-bound. Narrowing that gap (sparse geometric
 product, one decode per group instead of per lane) is future work.
+
+---
+
+## `iso_flash_decode` — fused MSL flash-decode over iso-quant K
+
+Sibling of `rotor_flash_decode` for `KvStorage::IsoKOnly3` / `IsoKOnly4`: QK over
+the packed iso K store + online softmax + bf16-V SV, in two Metal dispatches per
+decode step. Same two-pass shell, same shared
+`metal/flash_decode_merge_p2.metal`; only the K-decode differs.
+
+**What it replaced.** `update_iso_k_only_{3,4}` called `QuantIsoK{3,4}::dequant()`
+on every decode step — a full-prefix **CPU** iso decode into a `Vec<f32>` plus a
+re-upload. That is O(seq) host work per token with the GPU idle, and it is what
+pinned the K-only iso family in the "Tier 3 — CPU-bound" bucket. The store is now
+GPU-resident (`storage::QuantKGpuRing`, shared with rotor) and the kernel reads
+it directly.
+
+### Files
+
+* `crates/rmlx-kv-quant/src/iso_flash_decode_msl.rs` — Rust dispatcher, header
+  builder, dispatch counters, `assert_fixed_quat_blocks`.
+* `crates/rmlx-kv-quant/src/metal/iso_flash_decode_p1.metal` — pass-1 body (one
+  body for **both** bit widths).
+* `crates/rmlx-kv-quant/src/metal/flash_decode_merge_p2.metal` — codec-agnostic
+  pass-2 log-sum-exp merge, shared with `rotor_flash_decode` / `planar_flash_decode`.
+* `crates/rmlx-kv-quant/src/storage/quant_iso_k.rs` / `quant_iso_k4.rs` — the iso
+  K stores, each embedding a `QuantKGpuRing`.
+* `crates/rmlx-kv-quant/src/kvcache/sdpa.rs::update_and_sdpa_iso_k_fused` —
+  dispatch site (plus `try_dispatch_shared_store` / `sdpa_shared` for shared-KV
+  models).
+
+### Decode: one left Hamilton product, not a sandwich
+
+The iso codec encodes `r = q * v_unit` with the single fixed golden-ratio unit
+quaternion `FIXED_QUAT`, so the decode is `q̄ * r` — **one** left Hamilton
+product. Do not carry the rotor codec's `R̃ * mv * R` sandwich across; they are
+different algebras. This is also why iso's inner loop is much cheaper than
+rotor's: ~16 FMAs per group, not ~64.
+
+The decode is **self-contained per lane** — a group's four codes all live in one
+u32, so `if_decode_k_lane` unpacks them and runs the Hamilton product in
+registers with no threadgroup staging and no barrier. (The older
+`iso_fused_qk_*` kernel phrases the same math through SMEM + a barrier; a
+barrier per token inside a flash inner loop would serialise the tile.)
+
+### Fixed quaternion is baked into the header
+
+`iso_encode_fast` writes the one `FIXED_QUAT` constant into every slot of its
+per-group `quaternions` array, so the kernel bakes `q̄` in and the ring does not
+carry the quaternion table at all — storing `n_tokens * n_groups * 4` copies of
+one constant would be pure bandwidth.
+
+That is a real coupling, not an assumption. If the encoder ever emits per-group
+quaternions (its own docs float that as future work) this kernel would be
+silently wrong rather than merely stale, so `assert_fixed_quat_blocks` rejects a
+store whose quaternions are not `FIXED_QUAT`.
+
+### Bit width is a header parameter
+
+`bits ∈ {3, 4}` arrives via the header (`IF_BITS` / `IF_MASK`) alongside the
+matching Lloyd-Max codebook, so one `.metal` body serves both variants. Both
+widths pack one group of 4 into a single u32
+(`words_per_group = ceil(4 / (32 / BITS)) = 1`); element `e` sits at
+`[e*BITS, e*BITS + BITS)`. Selection is explicit; any other `bits` is an `Err`,
+never a silent fallback to the wrong unpack width.
+
+### Reusable K-decode half
+
+The per-lane iso decode is emitted into the **header** as the MSL function
+`if_decode_k_lane(codes, scales, norms, tok_idx, n_groups, lane)` rather than
+inlined into the body. A quantized-V flash kernel (the `iso*_sym` follow-up)
+needs the identical decode against the V store's `(codes, scales, norms)` triple
+and can call it unchanged.
+
+### Gate
+
+No env var and no CLI flag: the path is on whenever it is applicable. Gates, in
+order — device is GPU, storage is an iso K-only variant, `q_seq == 1`, `b == 1`,
+`head_dim` is a power of two, a multiple of the quaternion block size (4), and
+`<= ISO_FLASH_HEAD_DIM_MAX` (512). Any miss falls through to the legacy CPU
+dequant path.
+
+**No QJL analogue.** The 1-bit QJL residual is rotor-only, so unlike
+`k_rotor*` — which needs `--rotor-qjl off` to reach its kernel at all — `k_iso3`
+/ `k_iso4` reach this kernel at **stock defaults**.
+
+### Storage applicability
+
+| Variant | Eligible? | Notes |
+|---|---|---|
+| `KvStorage::IsoKOnly3` / `IsoKOnly4`, `b == 1` | **YES** | GPU ring + `iso_flash_decode_sdpa`. |
+| `KvStorage::IsoKOnly{3,4}`, `b > 1` | NO | Ring stride does not interleave batch. |
+| `Iso{3,4}Sym` | NO | V side is also iso-quantized; this kernel takes bf16 V only. Shares the K-decode half when a quant-V kernel lands. |
+
+### Measured
+
+`release-perf`, M-series, decode TPS, 3 measured runs per cell, median. Both A/B
+binaries verified by kernel-name string (`main` = 0 hits, `fix` = 1) and distinct
+sha256. Every `after` cell carries a positive dispatch witness
+(`rmlx_iso_flash_decode_p1_b{3,4}` in the log); every `before` cell has none.
+
+| Model | Codec | ctx (real tok) | Before | After | Gain |
+|---|---|---|---|---|---|
+| Bonsai-8B (Qwen3, D=128) | `k_iso3` | 4k (4085) | 4.24 | **18.9–19.9** | ~4.5× |
+| Bonsai-8B | `k_iso4` | 4k (4085) | 1.89 | **17.8–19.9** | ~9.9× |
+| Bonsai-8B | `k_iso3` | 16k (16913) | 0.96 | **10.59** | 11.0× |
+| Bonsai-8B | `k_iso3` | 32k (33612) | 0.59 | **6.63** | 11.2× |
+| gemma-4-e2b (Gemma4, D=256, shared-KV) | `k_iso3` | 4k | 44.65 | **64.80** | 1.45× |
+| medgemma-4B (Gemma3, D=256) | `k_iso3` | 4k | 21.96 | **51.96** | 2.4× |
+
+Bonsai at 4k is a noisy target (individual runs span 15.4–20.1 across repeats of
+the same binary), so its 4k cells are given as a range over two independent
+3-run medians; the 16k/32k cells and the other two models are stable to a few
+percent. Treat a single Bonsai 4k run as indicative only.
+
+The gain grows with context because the cost removed is O(seq) host work per
+token. Fitting `itl = a + b·kv_seq` over Bonsai `k_iso3` at 4k/16k/32k:
+
+| path | `a` (fixed) | `b` (per KV token) |
+|---|---|---|
+| before — CPU dequant | 101 ms | **48.5 µs** |
+| after — `iso_flash_decode` | 37 ms | **3.40 µs** |
+
+`b` is what decides whether a codec can win at long context, and it drops 14.3×.
+
+`gemma-4-e2b` gains least because only its global layers are iso-quantized (its
+SWA layers stay bf16), so the CPU dequant removed was a smaller share of the
+step. It dispatches via the shared-KV **store** path; without that wiring the
+kernel would be dead on every shared-KV model.
+
+This makes the K-only iso family **usable** rather than fast: Bonsai is still
+below `none` (bf16 ≈ 110 TPS). The residual 3.40 µs/KV-token is the flash-decode
+*shell*, not the iso decode — a barrier-tree reduction per token with most lanes
+idle. That is shared with `rotor_flash_decode` and is where further work belongs.
+
+**Memory.** The GPU ring is additional resident memory on top of the CPU blocks
+(~8.1 MB/layer vs 23.9 MB of blocks at Bonsai 4k — ~34%). Note the `kv_bytes`
+trace event does **not** show it: `approx_bytes` routes through
+`quant_iso_k3_bytes`, which counts CPU blocks only. Same gap as rotor — the
+ring is only counted by `QuantIsoK3::byte_size`.
+
+---
 
 ## `planar_flash_decode` — single-pass MSL flash-decode for PlanarK
 

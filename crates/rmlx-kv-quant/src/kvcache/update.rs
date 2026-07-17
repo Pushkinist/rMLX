@@ -13,9 +13,9 @@ use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{zeros, Array, Device, Dtype};
 
 use crate::storage::{
-    IsoBlocks, KvStorage, QuantIsoK3, QuantIsoK4, QuantIsoV3, QuantIsoV4, QuantK, QuantKTurbo3,
-    QuantKTurbo4, QuantPlanarK, QuantPlanarV, QuantRotorV3, QuantRotorV4, QuantV, RotorBlocks,
-    RotorKBlocks, ISO3_GROUP_SIZE, ISO4_GROUP_SIZE,
+    iso_n_groups_for, IsoBlocks, KvStorage, QuantIsoK3, QuantIsoK4, QuantIsoV3, QuantIsoV4, QuantK,
+    QuantKTurbo3, QuantKTurbo4, QuantPlanarK, QuantPlanarV, QuantRotorV3, QuantRotorV4, QuantV,
+    RotorBlocks, RotorKBlocks, ISO4_GROUP_SIZE, ISO_K3_BITS, ISO_K4_BITS,
 };
 use crate::turbo_flash_msl::{turbo_flash_lock_enabled, turbo_flash_sdpa, turbo_flash_should_run};
 use crate::KvQuant;
@@ -172,86 +172,28 @@ fn iso4_gpu_append_into_blocks(
     Ok(())
 }
 
-/// Convenience wrapper for the K-side iso4 codec
-/// ([`KvCache::update_iso_k_only_4`] and the K-side of
-/// [`KvCache::update_iso4_sym`]).
+/// Mirror of [`iso3_gpu_append_into_k_blocks`] for the iso4 codec — see it for
+/// the `feed` contract and why the chunk is reordered to sequence-major.
 fn iso4_gpu_append_into_k_blocks(
     ks: &mut QuantIsoK4,
     new_k: &Array,
     new_shape: &[i32],
+    device: Device,
+    feed: RingFeed,
+    max_seq: i32,
 ) -> Result<()> {
-    let block = iso4_gpu_encode_block(new_k, new_shape)?;
+    let head_dim = head_dim_from_shape(new_shape, "iso4_gpu_append_into_k_blocks")?;
+    let seq_major = packed_k_chunk_seq_major(new_k, new_shape, device)?;
+    let (block, gpu) = iso_gpu_encode_block_retaining(&seq_major, new_shape, ISO_K4_BITS)?;
+    iso4_sync_ring(ks, &gpu, feed, new_shape, head_dim, max_seq, device)?;
     push_iso4_k_block(ks, block, new_shape);
     Ok(())
 }
 
 // ── Iso3 MSL helpers (mirror of iso4) ────────────────────────────────────────
-
-/// Encode a KV chunk (`new_kv`, shape `[B, kv_h, S, D]`) via the iso3
-/// MSL kernel and return the resulting CPU [`IsoBlocks`].
-///
-/// Mirrors the CPU codec ([`crate::isoquant::iso_encode_fast`] with
-/// `bits = 3`): the returned block's `n_tokens` equals `B * kv_h * S`, codes
-/// are bit-packed identically (10 vals/u32, Planar3 pack convention), and the
-/// per-token L2 norm is preserved (deduplicated from the per-group GPU norm
-/// slot).
-///
-/// The kernel is axis-agnostic, so the same helper drives both the V-side
-/// ([`QuantIsoV3`]) and K-side ([`QuantIsoK3`]) appenders.
-///
-/// # Errors
-///
-/// Forwards Metal kernel / shape errors as `Error::Mlx` / `Error::Quant`.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "shape rank guarded to 4 immediately above each indexing site; new_shape[0..=3] are always in-bounds"
-)]
-fn iso3_gpu_encode_block(new_kv: &Array, new_shape: &[i32]) -> Result<IsoBlocks> {
-    if new_shape.len() != 4 {
-        return Err(Error::Mlx(format!(
-            "iso3_gpu_encode_block: expected 4D new_shape, got {new_shape:?}"
-        )));
-    }
-    let b = new_shape[0] as usize;
-    let kv_h = new_shape[1] as usize;
-    let s = new_shape[2] as usize;
-    let head_dim = new_shape[3] as usize;
-    let n_tokens_total = b * kv_h * s;
-    if !head_dim.is_multiple_of(ISO3_GROUP_SIZE) {
-        return Err(Error::Quant(format!(
-            "iso3_gpu_encode_block: head_dim={head_dim} must be a positive multiple of \
-             ISO3_GROUP_SIZE={ISO3_GROUP_SIZE}"
-        )));
-    }
-    let n_groups = head_dim / ISO3_GROUP_SIZE;
-
-    tracing::debug!(
-        target: "rmlx::kv_quant::iso3",
-        n_tokens = n_tokens_total,
-        n_groups,
-        head_dim,
-        "iso3 GPU encode block"
-    );
-
-    let (codes_arr, scales_arr, quats_arr, norms_arr) =
-        crate::isoquant_msl::iso_quantize_v3_gpu(new_kv, head_dim, Device::Gpu)?;
-    let (codes, scales, quaternions, norms) = crate::isoquant_msl::iso3_gpu_outputs_to_cpu(
-        &codes_arr,
-        &scales_arr,
-        &quats_arr,
-        &norms_arr,
-        n_tokens_total,
-        n_groups,
-    )?;
-
-    Ok(IsoBlocks {
-        codes,
-        scales,
-        quaternions,
-        norms,
-        n_tokens: n_tokens_total,
-    })
-}
+//
+// The iso3 K-side encode itself lives in `iso_gpu_encode_block_retaining`,
+// which serves both bit widths and hands back the GPU arrays the ring needs.
 
 // `push_iso3_v_block` was removed along with the V-side helper —
 // `QuantIsoV3::append_gpu` now owns shape bookkeeping for the V path. The
@@ -277,15 +219,32 @@ fn push_iso3_k_block(ks: &mut QuantIsoK3, block: IsoBlocks, new_shape: &[i32]) {
 // `QuantIsoV3::append_gpu` (which also writes the GPU-resident mirror). The
 // K-side wrapper below remains in use.
 
-/// Convenience wrapper for the K-side iso3 codec
-/// ([`KvCache::update_iso_k_only_3`] and the K-side of
-/// [`KvCache::update_iso3_sym`]).
+/// Append one iso3 K chunk: GPU encode → CPU blocks (+ the GPU ring when
+/// `feed` is [`RingFeed::Maintain`]).
+///
+/// Used by [`KvCache::update_iso_k_only_3`] and the K-side of
+/// [`KvCache::update_iso3_sym`] (both `RingFeed::Skip` — they dequant the whole
+/// prefix anyway), and by [`iso3_k_only_gpu_append`] on the flash-decode path
+/// (`RingFeed::Maintain`).
+///
+/// The chunk is reordered to sequence-major before encoding. That is not
+/// optional: `QuantIsoK3::append` (the CPU path) transposes, and
+/// `QuantIsoK3::dequant{,_gpu}` transpose *back* — so encoding head-major here
+/// would hand `dequant` head-major blocks it reads as sequence-major and
+/// scramble heads for any `kv_h > 1` chunk longer than one token. For the
+/// decode step (`S == 1`) the reorder is the identity.
 fn iso3_gpu_append_into_k_blocks(
     ks: &mut QuantIsoK3,
     new_k: &Array,
     new_shape: &[i32],
+    device: Device,
+    feed: RingFeed,
+    max_seq: i32,
 ) -> Result<()> {
-    let block = iso3_gpu_encode_block(new_k, new_shape)?;
+    let head_dim = head_dim_from_shape(new_shape, "iso3_gpu_append_into_k_blocks")?;
+    let seq_major = packed_k_chunk_seq_major(new_k, new_shape, device)?;
+    let (block, gpu) = iso_gpu_encode_block_retaining(&seq_major, new_shape, ISO_K3_BITS)?;
+    iso3_sync_ring(ks, &gpu, feed, new_shape, head_dim, max_seq, device)?;
     push_iso3_k_block(ks, block, new_shape);
     Ok(())
 }
@@ -318,10 +277,13 @@ fn rotor_gpu_encode_block(
     Ok(block)
 }
 
-/// The GPU-resident `(codes, scales, norms)` triple a rotor encode produced,
-/// retained so a caller can push it straight into a GPU ring instead of
-/// re-uploading the downloaded CPU copy.
-struct RotorEncodedGpu {
+/// The GPU-resident `(codes, scales, norms)` triple a packed-K encode produced
+/// (rotor or iso), retained so a caller can push it straight into a GPU ring
+/// instead of re-uploading the downloaded CPU copy.
+///
+/// `norms` is always the **per-token** form the decode kernels index
+/// (`norms[tok_idx]`), not the per-group form the encode kernels emit.
+struct PackedKEncodedGpu {
     codes: Array,
     scales: Array,
     norms: Array,
@@ -338,7 +300,7 @@ fn rotor_gpu_encode_block_retaining(
     new_shape: &[i32],
     rotors: &[f32],
     bits: u8,
-) -> Result<(RotorBlocks, RotorEncodedGpu)> {
+) -> Result<(RotorBlocks, PackedKEncodedGpu)> {
     if new_shape.len() != 4 {
         return Err(Error::Mlx(format!(
             "rotor_gpu_encode_block: expected 4D new_shape, got {new_shape:?}"
@@ -410,7 +372,7 @@ fn rotor_gpu_encode_block_retaining(
             norms,
             n_tokens: n_tokens_total,
         },
-        RotorEncodedGpu {
+        PackedKEncodedGpu {
             codes: codes_arr,
             scales: scales_arr,
             norms: norms_per_token,
@@ -418,20 +380,29 @@ fn rotor_gpu_encode_block_retaining(
     ))
 }
 
-/// Collapse the rotor encode kernel's per-group norms (`[n_tokens, n_groups]`,
+/// Collapse a packed-K encode kernel's per-group norms (`[n_tokens, n_groups]`,
 /// each row a repeat of that token's L2) to the per-token `[n_tokens]` form.
 ///
-/// GPU-side equivalent of the `norms_per_group[tok * n_groups]` pick in
-/// [`crate::rotorquant_msl::rotor_gpu_outputs_to_cpu`] — column 0 of each row.
+/// Shared by the rotor and iso encode paths — both kernels emit the per-group
+/// form and both rings store per-token. GPU-side equivalent of the
+/// `norms_per_group[tok * n_groups]` pick in
+/// [`crate::rotorquant_msl::rotor_gpu_outputs_to_cpu`] /
+/// [`crate::isoquant_msl::iso3_gpu_outputs_to_cpu`] — column 0 of each row.
 fn collapse_group_norms_to_token(
     norms_per_group: &Array,
     n_tokens: usize,
     n_groups: usize,
 ) -> Result<Array> {
-    let n_tokens_i32 = i32::try_from(n_tokens)
-        .map_err(|_| Error::Quant(format!("rotor norms: n_tokens={n_tokens} exceeds i32::MAX")))?;
-    let n_groups_i32 = i32::try_from(n_groups)
-        .map_err(|_| Error::Quant(format!("rotor norms: n_groups={n_groups} exceeds i32::MAX")))?;
+    let n_tokens_i32 = i32::try_from(n_tokens).map_err(|_| {
+        Error::Quant(format!(
+            "packed-K norms: n_tokens={n_tokens} exceeds i32::MAX"
+        ))
+    })?;
+    let n_groups_i32 = i32::try_from(n_groups).map_err(|_| {
+        Error::Quant(format!(
+            "packed-K norms: n_groups={n_groups} exceeds i32::MAX"
+        ))
+    })?;
     norms_per_group
         .reshape(&[n_tokens_i32, n_groups_i32], Device::Gpu)?
         .slice(&[0, 0], &[n_tokens_i32, 1], &[1, 1], Device::Gpu)?
@@ -649,13 +620,13 @@ enum RingFeed {
 /// cleared ring is re-seeded from `blocks` on the next maintained append, so
 /// this is self-healing rather than a one-way door.
 ///
-/// `b > 1` is a skip: [`crate::storage::RotorGpuK`]'s per-step stride is
+/// `b > 1` is a skip: [`crate::storage::QuantKGpuRing`]'s per-step stride is
 /// `kv_h * n_groups` and does not interleave batch, so a batched chunk cannot be
 /// laid into it. The CPU blocks (which do handle `b > 1`) stay the source of
 /// truth and the flash dispatcher's own `b == 1` gate keeps the kernel away.
 fn rotor3_sync_ring(
     ks: &mut crate::storage::QuantRotorK3,
-    gpu: &RotorEncodedGpu,
+    gpu: &PackedKEncodedGpu,
     feed: RingFeed,
     new_shape: &[i32],
     head_dim: usize,
@@ -686,7 +657,7 @@ fn rotor3_sync_ring(
 /// Mirror of [`rotor3_sync_ring`] for [`crate::storage::QuantRotorK4`].
 fn rotor4_sync_ring(
     ks: &mut crate::storage::QuantRotorK4,
-    gpu: &RotorEncodedGpu,
+    gpu: &PackedKEncodedGpu,
     feed: RingFeed,
     new_shape: &[i32],
     head_dim: usize,
@@ -735,7 +706,7 @@ fn rotor3_gpu_append_into_k_blocks(
     // is true (mid-run CPU fallback after a GPU first-chunk needs it). The GPU
     // encode itself ignores the JL projection — this path is QJL-off-only by
     // dispatcher contract.
-    let seq_major = rotor_k_chunk_seq_major(new_k, new_shape, device)?;
+    let seq_major = packed_k_chunk_seq_major(new_k, new_shape, device)?;
     let (block, gpu) = rotor_gpu_encode_block_retaining(
         &seq_major,
         new_shape,
@@ -758,7 +729,7 @@ fn rotor4_gpu_append_into_k_blocks(
 ) -> Result<()> {
     let head_dim = head_dim_from_shape(new_shape, "rotor4_gpu_append_into_k_blocks")?;
     ensure_k4_rotors(ks, head_dim);
-    let seq_major = rotor_k_chunk_seq_major(new_k, new_shape, device)?;
+    let seq_major = packed_k_chunk_seq_major(new_k, new_shape, device)?;
     let (block, gpu) = rotor_gpu_encode_block_retaining(
         &seq_major,
         new_shape,
@@ -862,22 +833,245 @@ fn b_kv_h_new_seq(new_shape: &[i32]) -> Result<(i32, i32, i32)> {
 }
 
 /// Reorder a head-major `[B, kv_h, S, D]` K chunk to the sequence-major
-/// `[B, S, kv_h, D]` element order the rotor store accumulates in.
+/// `[B, S, kv_h, D]` element order the packed K stores (rotor / iso)
+/// accumulate in.
 ///
-/// The CPU `QuantRotorK{3,4}::append` transposes before encoding, so the GPU
-/// encode must too or the two produce different block layouts for a multi-token
-/// chunk with `kv_h > 1`. For the decode step (`S == 1`) this is the identity.
+/// The CPU `QuantRotorK{3,4}::append` / `QuantIsoK{3,4}::append` transpose
+/// before encoding, so the GPU encode must too or the two produce different
+/// block layouts for a multi-token chunk with `kv_h > 1`. For the decode step
+/// (`S == 1`) this is the identity.
 ///
-/// `transpose` yields a strided view and the rotor MSL kernel reads by raw
-/// linear offset (it ignores MLX lazy-transpose strides), so the permutation is
+/// `transpose` yields a strided view and the MSL kernels read by raw linear
+/// offset (they ignore MLX lazy-transpose strides), so the permutation is
 /// materialised here.
-fn rotor_k_chunk_seq_major(new_k: &Array, new_shape: &[i32], device: Device) -> Result<Array> {
+fn packed_k_chunk_seq_major(new_k: &Array, new_shape: &[i32], device: Device) -> Result<Array> {
     let (_b, _kv_h, new_seq) = b_kv_h_new_seq(new_shape)?;
     if new_seq == 1 {
         // Identity permutation — skip the copy on the decode hot path.
         return new_k.try_clone();
     }
     new_k.transpose(&[0, 2, 1, 3], device)?.contiguous(device)
+}
+
+/// GPU-encode one iso K chunk, returning the CPU block **and** the GPU arrays
+/// the ring feed consumes.
+///
+/// Mirror of [`rotor_gpu_encode_block_retaining`] for the iso codec. The CPU
+/// download is kept for the same reason it is there: [`IsoBlocks`] is the
+/// source of truth for `dequant()` and the SSD spill, and `shape[2]` is bumped
+/// in lockstep with the block push, so skipping the block would leave `blocks`
+/// shorter than `shape[2]` — a gap `dequant()` silently zero-pads and a spill
+/// would persist as a truncated store.
+///
+/// `bits` selects the encode kernel explicitly; anything but 3 or 4 is an error
+/// rather than a silent fall-through to one width's kernel over the other's
+/// codes.
+fn iso_gpu_encode_block_retaining(
+    new_k: &Array,
+    new_shape: &[i32],
+    bits: u8,
+) -> Result<(IsoBlocks, PackedKEncodedGpu)> {
+    let head_dim = head_dim_from_shape(new_shape, "iso_gpu_encode_block_retaining")?;
+    let (b, kv_h, s) = b_kv_h_new_seq(new_shape)?;
+    let n_tokens_total = (b as usize) * (kv_h as usize) * (s as usize);
+    let n_groups = iso_n_groups_for(head_dim);
+    if n_groups == 0 {
+        return Err(Error::Quant(format!(
+            "iso_gpu_encode_block_retaining: head_dim={head_dim} yields no quaternion groups"
+        )));
+    }
+
+    let (codes_arr, scales_arr, quats_arr, norms_arr) = match bits {
+        ISO_K3_BITS => crate::isoquant_msl::iso_quantize_v3_gpu(new_k, head_dim, Device::Gpu)?,
+        ISO_K4_BITS => crate::isoquant_msl_v4::iso_quantize_v4_gpu(new_k, head_dim, Device::Gpu)?,
+        other => {
+            return Err(Error::Quant(format!(
+                "iso_gpu_encode_block_retaining: unsupported bits={other} (only 3 and 4); \
+                 refusing to encode with another width's kernel"
+            )))
+        }
+    };
+
+    // Select the readback by width explicitly. A `_` arm here would send a
+    // future width's codes through one of these two unpackers and silently
+    // produce a wrong CPU block — `bits` is a plain integer, so no
+    // exhaustiveness lint would catch it.
+    let (codes, scales, quats, norms) = match bits {
+        ISO_K3_BITS => crate::isoquant_msl::iso3_gpu_outputs_to_cpu(
+            &codes_arr,
+            &scales_arr,
+            &quats_arr,
+            &norms_arr,
+            n_tokens_total,
+            n_groups,
+        )?,
+        ISO_K4_BITS => crate::isoquant_msl_v4::iso4_gpu_outputs_to_cpu(
+            &codes_arr,
+            &scales_arr,
+            &quats_arr,
+            &norms_arr,
+            n_tokens_total,
+            n_groups,
+        )?,
+        other => {
+            return Err(Error::Quant(format!(
+                "iso_gpu_encode_block_retaining: unsupported bits={other} on readback \
+                 (only 3 and 4)"
+            )))
+        }
+    };
+
+    // The encode kernel emits norms **per group** (`[n_tokens * n_groups]`, the
+    // same per-token L2 replicated across a token's groups). The ring stores the
+    // per-token form the decode kernel indexes (`norms[tok_idx]`), so collapse
+    // it on the GPU to keep the ring feed off the host.
+    let norms_per_token = collapse_group_norms_to_token(&norms_arr, n_tokens_total, n_groups)?;
+
+    Ok((
+        IsoBlocks {
+            codes,
+            scales,
+            quaternions: quats,
+            norms,
+            n_tokens: n_tokens_total,
+        },
+        PackedKEncodedGpu {
+            codes: codes_arr,
+            scales: scales_arr,
+            norms: norms_per_token,
+        },
+    ))
+}
+
+/// Append `new_k` into a live `IsoKOnly3` store's GPU ring (+ CPU blocks),
+/// lazily creating the store on first use. No dequant — this is the entry point
+/// the iso flash-decode SDPA path uses.
+///
+/// # Errors
+///
+/// Returns [`Error::KvStorageMismatch`] when the active storage is not
+/// `IsoKOnly3`, and forwards encode / ring errors.
+pub(super) fn iso3_k_only_gpu_append(
+    cache: &mut KvCache,
+    new_k: &Array,
+    new_shape: &[i32],
+    device: Device,
+) -> Result<()> {
+    let KvStorage::IsoKOnly3 { k, max_seq } = &mut cache.storage else {
+        return Err(Error::KvStorageMismatch {
+            expected: "IsoKOnly3",
+            got: storage_variant_name(&cache.storage),
+        });
+    };
+    let max_seq = *max_seq;
+    if k.is_none() {
+        let mut init_shape = new_shape.to_vec();
+        if let Some(s) = init_shape.get_mut(2) {
+            *s = 0;
+        }
+        *k = Some(QuantIsoK3::new(init_shape, max_seq));
+    }
+    let Some(ks) = k.as_mut() else {
+        return Err(Error::Mlx("IsoKOnly3 K buffer absent after init".into()));
+    };
+    iso3_gpu_append_into_k_blocks(ks, new_k, new_shape, device, RingFeed::Maintain, max_seq)
+}
+
+/// Mirror of [`iso3_k_only_gpu_append`] for `IsoKOnly4`.
+///
+/// # Errors
+///
+/// Returns [`Error::KvStorageMismatch`] when the active storage is not
+/// `IsoKOnly4`, and forwards encode / ring errors.
+pub(super) fn iso4_k_only_gpu_append(
+    cache: &mut KvCache,
+    new_k: &Array,
+    new_shape: &[i32],
+    device: Device,
+) -> Result<()> {
+    let KvStorage::IsoKOnly4 { k, max_seq } = &mut cache.storage else {
+        return Err(Error::KvStorageMismatch {
+            expected: "IsoKOnly4",
+            got: storage_variant_name(&cache.storage),
+        });
+    };
+    let max_seq = *max_seq;
+    if k.is_none() {
+        let mut init_shape = new_shape.to_vec();
+        if let Some(s) = init_shape.get_mut(2) {
+            *s = 0;
+        }
+        *k = Some(QuantIsoK4::new(init_shape, max_seq));
+    }
+    let Some(ks) = k.as_mut() else {
+        return Err(Error::Mlx("IsoKOnly4 K buffer absent after init".into()));
+    };
+    iso4_gpu_append_into_k_blocks(ks, new_k, new_shape, device, RingFeed::Maintain, max_seq)
+}
+
+/// Feed one encoded iso3 chunk into the store's GPU ring.
+///
+/// `b > 1` is a skip for the same reason [`rotor3_sync_ring`] skips it:
+/// [`crate::storage::QuantKGpuRing`]'s per-step stride does not interleave
+/// batch. A skipped feed *clears* rather than leaving a stale ring — see the
+/// [`RingFeed`] invariant.
+fn iso3_sync_ring(
+    ks: &mut QuantIsoK3,
+    gpu: &PackedKEncodedGpu,
+    feed: RingFeed,
+    new_shape: &[i32],
+    head_dim: usize,
+    max_seq: i32,
+    device: Device,
+) -> Result<()> {
+    let (b, kv_h, new_seq) = b_kv_h_new_seq(new_shape)?;
+    if feed != RingFeed::Maintain || b != 1 {
+        ks.gpu.clear();
+        return Ok(());
+    }
+    // Feed BEFORE `push_iso3_k_block` — the push bumps `ks.shape[2]`, and the
+    // ring append needs `prev_seq`, the length before this chunk.
+    let prev_seq = accumulated_seq(&ks.shape);
+    ks.gpu_append(
+        &gpu.codes,
+        &gpu.scales,
+        &gpu.norms,
+        kv_h,
+        head_dim as i32,
+        prev_seq,
+        new_seq,
+        max_seq,
+        device,
+    )
+}
+
+/// Mirror of [`iso3_sync_ring`] for [`QuantIsoK4`].
+fn iso4_sync_ring(
+    ks: &mut QuantIsoK4,
+    gpu: &PackedKEncodedGpu,
+    feed: RingFeed,
+    new_shape: &[i32],
+    head_dim: usize,
+    max_seq: i32,
+    device: Device,
+) -> Result<()> {
+    let (b, kv_h, new_seq) = b_kv_h_new_seq(new_shape)?;
+    if feed != RingFeed::Maintain || b != 1 {
+        ks.gpu.clear();
+        return Ok(());
+    }
+    let prev_seq = accumulated_seq(&ks.shape);
+    ks.gpu_append(
+        &gpu.codes,
+        &gpu.scales,
+        &gpu.norms,
+        kv_h,
+        head_dim as i32,
+        prev_seq,
+        new_seq,
+        max_seq,
+        device,
+    )
 }
 
 impl KvCache {
@@ -5734,7 +5928,7 @@ impl KvCache {
             return Err(Error::Mlx("IsoSym3 K buffer absent after init".into()));
         };
         if device == Device::Gpu {
-            iso3_gpu_append_into_k_blocks(ks, new_k, &new_shape)?;
+            iso3_gpu_append_into_k_blocks(ks, new_k, &new_shape, device, RingFeed::Skip, max_seq)?;
         } else {
             ks.append(&k_f32, &new_shape)?;
         }
@@ -5863,7 +6057,7 @@ impl KvCache {
             return Err(Error::Mlx("IsoSym4 K buffer absent after init".into()));
         };
         if device == Device::Gpu {
-            iso4_gpu_append_into_k_blocks(ks, new_k, &new_shape)?;
+            iso4_gpu_append_into_k_blocks(ks, new_k, &new_shape, device, RingFeed::Skip, max_seq)?;
         } else {
             ks.append(&k_f32, &new_shape)?;
         }
@@ -5936,7 +6130,7 @@ impl KvCache {
         let head_dim = new_shape[3];
         let t_enc = std::time::Instant::now();
         if device == Device::Gpu {
-            iso3_gpu_append_into_k_blocks(ks, new_k, &new_shape)?;
+            iso3_gpu_append_into_k_blocks(ks, new_k, &new_shape, device, RingFeed::Skip, max_seq)?;
         } else {
             ks.append(&k_f32, &new_shape)?;
         }
@@ -6034,7 +6228,7 @@ impl KvCache {
             return Err(Error::Mlx("IsoKOnly4 K buffer absent after init".into()));
         };
         if device == Device::Gpu {
-            iso4_gpu_append_into_k_blocks(ks, new_k, &new_shape)?;
+            iso4_gpu_append_into_k_blocks(ks, new_k, &new_shape, device, RingFeed::Skip, max_seq)?;
         } else {
             ks.append(&k_f32, &new_shape)?;
         }

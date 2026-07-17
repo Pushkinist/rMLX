@@ -215,7 +215,7 @@ fn rotor_k_only_decode_dispatches_at_head_dim_256() {
 
 /// `b > 1` must skip the ring feed, not attempt (and fail) it.
 ///
-/// `RotorGpuK`'s per-step stride is `kv_h * n_groups` and does not interleave
+/// `QuantKGpuRing`'s per-step stride is `kv_h * n_groups` and does not interleave
 /// batch, so a batched chunk cannot be laid into it: the encode arrays carry
 /// `b * kv_h * new_seq * n_groups` entries against a `new_seq * kv_h * n_groups`
 /// span. Attempting it returns `Err` and kills the request, where the CPU blocks

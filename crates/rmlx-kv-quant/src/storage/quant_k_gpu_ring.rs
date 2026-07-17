@@ -1,17 +1,21 @@
-// Shared GPU-resident ring for the rotor K codecs (rotor3 / rotor4).
+// Shared GPU-resident ring for the packed K codecs that carry a
+// `(codes, per-group scales, per-token norm)` payload — rotor3 / rotor4 and
+// iso3 / iso4 today.
 //
-// `QuantRotorK3` and `QuantRotorK4` differ only in bit width and codebook, so
-// both embed this helper rather than each carrying its own copy of the buffer
-// bookkeeping.
+// Those stores differ in bit width, codebook, and rotation algebra, but their
+// ring bookkeeping is identical, so they embed this helper instead of each
+// carrying a copy. The ring is deliberately codec-agnostic: it is told
+// `n_groups` rather than deriving it, so no codec's group-size rule leaks in
+// here.
 #![allow(unreachable_pub, clippy::exhaustive_structs)]
-//! GPU packed ring for the rotor K store: `RotorGpuK`.
+//! GPU packed ring for a quantized K store: `QuantKGpuRing`.
 //!
 //! # Why this exists
 //!
-//! The rotor K codec's CPU form (`RotorKBlocks`) is a `Vec<u32>` per append.
-//! Decoding attention from it means `dequant()` — a full-prefix CPU decode plus
-//! re-upload on **every decode step**, which is O(seq) host work per token with
-//! the GPU idle.
+//! These K codecs' CPU form (`RotorKBlocks` / `IsoBlocks`) is a `Vec<u32>` per
+//! append. Decoding attention from it means `dequant()` — a full-prefix CPU
+//! decode plus re-upload on **every decode step**, which is O(seq) host work
+//! per token with the GPU idle.
 //!
 //! This ring keeps the same payload (codes / per-group scales / per-token L2
 //! norms) resident on the GPU, appended in place, so a flash-decode kernel can
@@ -23,8 +27,9 @@
 //! Buffers are flat and **sequence-major** — the canonical flat-KV layout in
 //! this crate. For a token at sequence position `s` and KV head `h`:
 //!
-//! * `codes[(s * kv_h + h) * n_groups + g]`  (1 u32 per group of 8 Cl(3,0)
-//!   multivector components)
+//! * `codes[(s * kv_h + h) * n_groups + g]`  (1 u32 per group; what a group
+//!   spans is the codec's business — 8 Cl(3,0) multivector components for
+//!   rotor, one 4-element quaternion block for iso)
 //! * `scales[(s * kv_h + h) * n_groups + g]` (1 f32 per group)
 //! * `norms[s * kv_h + h]`                   (1 f32 per token)
 //!
@@ -41,16 +46,14 @@
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{zeros, Array, Device, Dtype};
 
-use crate::rotorquant::n_groups_for;
-
 use super::KV_PAGE_SIZE;
 
-/// GPU-resident packed rotor K payload plus its growth bookkeeping.
+/// GPU-resident packed K payload plus its growth bookkeeping.
 ///
 /// `None` buffers mean "not yet allocated" — the ring is created lazily on the
 /// first GPU append, so a CPU-only cache never pays for it.
 #[derive(Debug, Default)]
-pub struct RotorGpuK {
+pub struct QuantKGpuRing {
     /// Packed codes, flat `u32 [capacity * kv_h * n_groups]`.
     pub codes: Option<Array>,
     /// Per-group scales, flat `f32 [capacity * kv_h * n_groups]`.
@@ -65,7 +68,7 @@ pub struct RotorGpuK {
     pub capacity: i32,
 }
 
-impl RotorGpuK {
+impl QuantKGpuRing {
     /// True once the ring has been allocated.
     #[must_use]
     pub fn is_allocated(&self) -> bool {
@@ -97,8 +100,12 @@ impl RotorGpuK {
 
     /// Append one already-encoded chunk into the ring at `prev_seq`.
     ///
-    /// `codes` / `scales` / `norms` are the GPU outputs of the rotor encode
+    /// `codes` / `scales` / `norms` are the GPU outputs of the codec's encode
     /// kernel for a **sequence-major** chunk of `new_seq` positions.
+    ///
+    /// `n_groups` is the codec's per-token group count — passed in rather than
+    /// derived, so the ring stays codec-agnostic (rotor's `ceil(head_dim / 3)`
+    /// and iso's `head_dim / 4` are both just an integer here).
     ///
     /// # Errors
     ///
@@ -110,19 +117,18 @@ impl RotorGpuK {
         scales: &Array,
         norms: &Array,
         kv_h: i32,
-        head_dim: i32,
+        n_groups: i32,
         prev_seq: i32,
         new_seq: i32,
         max_seq: i32,
         device: Device,
     ) -> Result<()> {
-        if kv_h <= 0 || head_dim <= 0 || new_seq <= 0 || prev_seq < 0 {
+        if kv_h <= 0 || n_groups <= 0 || new_seq <= 0 || prev_seq < 0 {
             return Err(Error::Quant(format!(
-                "RotorGpuK::append_encoded: bad shape kv_h={kv_h}, head_dim={head_dim}, \
+                "QuantKGpuRing::append_encoded: bad shape kv_h={kv_h}, n_groups={n_groups}, \
                  prev_seq={prev_seq}, new_seq={new_seq}"
             )));
         }
-        let n_groups = n_groups_for(head_dim as usize) as i32;
         let codes_per_step = kv_h * n_groups;
         let norms_per_step = kv_h;
 
@@ -130,7 +136,7 @@ impl RotorGpuK {
             && (self.codes_per_step != codes_per_step || self.norms_per_step != norms_per_step)
         {
             return Err(Error::Quant(format!(
-                "RotorGpuK::append_encoded: stride changed under a live ring \
+                "QuantKGpuRing::append_encoded: stride changed under a live ring \
                  (codes {} -> {codes_per_step}, norms {} -> {norms_per_step})",
                 self.codes_per_step, self.norms_per_step
             )));
@@ -140,10 +146,10 @@ impl RotorGpuK {
 
         let needed = prev_seq
             .checked_add(new_seq)
-            .ok_or_else(|| Error::Quant("RotorGpuK::append_encoded: seq overflow".into()))?;
+            .ok_or_else(|| Error::Quant("QuantKGpuRing::append_encoded: seq overflow".into()))?;
         if needed > max_seq {
             return Err(Error::Quant(format!(
-                "RotorGpuK::append_encoded: needed={needed} exceeds max_seq={max_seq}"
+                "QuantKGpuRing::append_encoded: needed={needed} exceeds max_seq={max_seq}"
             )));
         }
 
@@ -156,7 +162,7 @@ impl RotorGpuK {
             // re-exported.
             if prev_seq > 0 {
                 return Err(Error::Quant(format!(
-                    "RotorGpuK::append_encoded: ring is unallocated but prev_seq={prev_seq} \
+                    "QuantKGpuRing::append_encoded: ring is unallocated but prev_seq={prev_seq} \
                      tokens already exist — seed_from_cpu() must upload the prefix first, \
                      or [0, {prev_seq}) would silently read as zeros"
                 )));
@@ -204,7 +210,7 @@ impl RotorGpuK {
         scales: &[f32],
         norms: &[f32],
         kv_h: i32,
-        head_dim: i32,
+        n_groups: i32,
         filled_seq: i32,
         max_seq: i32,
         device: Device,
@@ -212,13 +218,12 @@ impl RotorGpuK {
         if self.is_allocated() {
             return Ok(());
         }
-        if kv_h <= 0 || head_dim <= 0 || filled_seq <= 0 {
+        if kv_h <= 0 || n_groups <= 0 || filled_seq <= 0 {
             return Err(Error::Quant(format!(
-                "RotorGpuK::seed_from_cpu: bad shape kv_h={kv_h}, head_dim={head_dim}, \
+                "QuantKGpuRing::seed_from_cpu: bad shape kv_h={kv_h}, n_groups={n_groups}, \
                  filled_seq={filled_seq}"
             )));
         }
-        let n_groups = n_groups_for(head_dim as usize) as i32;
         self.codes_per_step = kv_h * n_groups;
         self.norms_per_step = kv_h;
 
@@ -229,7 +234,7 @@ impl RotorGpuK {
             || norms.len() as i64 != want_norms
         {
             return Err(Error::Quant(format!(
-                "RotorGpuK::seed_from_cpu: CPU prefix length mismatch at filled_seq={filled_seq} \
+                "QuantKGpuRing::seed_from_cpu: CPU prefix length mismatch at filled_seq={filled_seq} \
                  (codes {} want {want_codes}, scales {} want {want_codes}, norms {} want \
                  {want_norms})",
                 codes.len(),
@@ -239,7 +244,7 @@ impl RotorGpuK {
         }
         if filled_seq > max_seq {
             return Err(Error::Quant(format!(
-                "RotorGpuK::seed_from_cpu: filled_seq={filled_seq} exceeds max_seq={max_seq}"
+                "QuantKGpuRing::seed_from_cpu: filled_seq={filled_seq} exceeds max_seq={max_seq}"
             )));
         }
 
@@ -257,7 +262,7 @@ impl RotorGpuK {
         tracing::debug!(
             filled_seq,
             cap,
-            "RotorGpuK: seeded ring from accumulated CPU blocks"
+            "QuantKGpuRing: seeded ring from accumulated CPU blocks"
         );
         Ok(())
     }
@@ -284,7 +289,7 @@ impl RotorGpuK {
         }
         if kv_seq > self.capacity {
             return Err(Error::Quant(format!(
-                "RotorGpuK::packed_view: kv_seq={kv_seq} exceeds capacity={}",
+                "QuantKGpuRing::packed_view: kv_seq={kv_seq} exceeds capacity={}",
                 self.capacity
             )));
         }
@@ -303,7 +308,7 @@ impl RotorGpuK {
         self.scales = Some(zeros(&[cap * cps], Dtype::F32, device)?);
         self.norms = Some(zeros(&[cap * nps], Dtype::F32, device)?);
         self.capacity = cap;
-        tracing::debug!(cap, cps, nps, "RotorGpuK: ring allocated");
+        tracing::debug!(cap, cps, nps, "QuantKGpuRing: ring allocated");
         Ok(())
     }
 
@@ -341,7 +346,7 @@ impl RotorGpuK {
             old_capacity,
             new_capacity = cap,
             prev_seq,
-            "RotorGpuK: ring grown"
+            "QuantKGpuRing: ring grown"
         );
         Ok(())
     }
@@ -369,7 +374,7 @@ fn regrow(
     }
     let old = old.ok_or_else(|| {
         Error::Mlx(format!(
-            "RotorGpuK::grow: {what} buffer vanished mid-grow (internal invariant)"
+            "QuantKGpuRing::grow: {what} buffer vanished mid-grow (internal invariant)"
         ))
     })?;
     let prefix = old.slice(&[0], &[filled], &[1], device)?;
@@ -384,14 +389,14 @@ fn write_range(
     stop: i32,
     device: Device,
 ) -> Result<()> {
-    let target = buf
-        .take()
-        .ok_or_else(|| Error::Mlx("RotorGpuK::append_encoded: buffer absent after alloc".into()))?;
+    let target = buf.take().ok_or_else(|| {
+        Error::Mlx("QuantKGpuRing::append_encoded: buffer absent after alloc".into())
+    })?;
     let span = stop - start;
     let src_len: i32 = src.shape().iter().product();
     if src_len != span {
         return Err(Error::Quant(format!(
-            "RotorGpuK::append_encoded: encoded chunk length {src_len} != target span {span}"
+            "QuantKGpuRing::append_encoded: encoded chunk length {src_len} != target span {span}"
         )));
     }
     let flat = src.reshape(&[span], device)?;
@@ -407,7 +412,7 @@ fn u32_slice_to_array(vals: &[u32]) -> Result<Array> {
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(vals.as_ptr().cast::<u8>(), vals.len() * 4) };
     let len = i32::try_from(vals.len())
-        .map_err(|_| Error::Quant("RotorGpuK: u32 prefix exceeds i32::MAX".into()))?;
+        .map_err(|_| Error::Quant("QuantKGpuRing: u32 prefix exceeds i32::MAX".into()))?;
     Array::from_bytes(bytes, &[len], Dtype::U32)
 }
 
@@ -418,19 +423,19 @@ fn f32_slice_to_array(vals: &[f32]) -> Result<Array> {
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(vals.as_ptr().cast::<u8>(), vals.len() * 4) };
     let len = i32::try_from(vals.len())
-        .map_err(|_| Error::Quant("RotorGpuK: f32 prefix exceeds i32::MAX".into()))?;
+        .map_err(|_| Error::Quant("QuantKGpuRing: f32 prefix exceeds i32::MAX".into()))?;
     Array::from_bytes(bytes, &[len], Dtype::F32)
 }
 
 fn slice_prefix(buf: Option<&Array>, len: i32, what: &str, device: Device) -> Result<Array> {
     let b = buf.ok_or_else(|| {
         Error::Mlx(format!(
-            "RotorGpuK::packed_view: {what} buffer absent (internal invariant)"
+            "QuantKGpuRing::packed_view: {what} buffer absent (internal invariant)"
         ))
     })?;
     b.slice(&[0], &[len], &[1], device)
 }
 
 #[cfg(test)]
-#[path = "rotor_gpu_k_tests.rs"]
-mod rotor_gpu_k_tests;
+#[path = "quant_k_gpu_ring_tests.rs"]
+mod quant_k_gpu_ring_tests;

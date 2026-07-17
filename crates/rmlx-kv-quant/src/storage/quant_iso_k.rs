@@ -16,34 +16,101 @@
 )]
 //! Quantized K buffer: `QuantIsoK3` (IsoQuant 3-bit K codec).
 
-use rmlx_core::error::Result;
+use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device, Dtype};
 
 use crate::isoquant::{iso_decode_fast, iso_encode_fast, IsoQuantError};
 use crate::storage::quant_iso_v::IsoBlocks;
 
+use super::QuantKGpuRing;
+
 /// Bit-width of the iso3 K codec (fixed at 3-bit — identical codebook to the
 /// V-side [`crate::storage::QuantIsoV3`]).
 pub const ISO_K3_BITS: u8 = 3;
 
-/// Quaternion-block size for the iso3 K codec (fixed at 4; one quaternion per
-/// group in fast mode).
-pub const ISO_K3_GROUP_SIZE: usize = 4;
+/// Elements per iso group: the component count of a quaternion.
+///
+/// **Codec-wide, and not a tunable.** The iso codec's group *is* one quaternion
+/// block (`iso_encode_fast` rotates `[w, x, y, z]` at a time), so this is fixed
+/// by the algebra rather than chosen per bit width — 3-bit and 4-bit iso differ
+/// in codebook and pack stride, never in this. The per-width aliases
+/// [`ISO_K3_GROUP_SIZE`] / [`crate::storage::ISO_K4_GROUP_SIZE`] are defined
+/// from it so they cannot drift apart: the iso4 GPU paths derive their ring
+/// stride through [`iso_n_groups_for`] while `QuantIsoK4::append` uses the K4
+/// alias, and a divergence would silently mismatch the iso4 ring against its
+/// own CPU blocks.
+pub const ISO_QUAT_BLOCK_SIZE: usize = 4;
+
+/// Quaternion-block size for the iso3 K codec. Alias of
+/// [`ISO_QUAT_BLOCK_SIZE`] — see it for why this is not independently tunable.
+pub const ISO_K3_GROUP_SIZE: usize = ISO_QUAT_BLOCK_SIZE;
+
+/// Per-token group count for an iso K row of `head_dim` elements — **both** bit
+/// widths.
+///
+/// One quaternion block per group, so `head_dim / 4`. This is iso's group rule
+/// and it lives here, in iso's own store — [`QuantKGpuRing`] is told the
+/// resulting integer and knows nothing about quaternions.
+#[must_use]
+pub fn iso_n_groups_for(head_dim: usize) -> usize {
+    head_dim / ISO_QUAT_BLOCK_SIZE
+}
+
+/// [`iso_n_groups_for`] with the group-size invariant enforced, as `i32`.
+///
+/// A `head_dim` that is not a multiple of the quaternion block size would
+/// silently truncate the last partial group, so it is an error rather than a
+/// rounded-down group count.
+///
+/// # Errors
+///
+/// Returns [`Error::Quant`] when `head_dim` is not a positive multiple of
+/// [`ISO_QUAT_BLOCK_SIZE`].
+pub(crate) fn iso_n_groups_i32(head_dim: i32, what: &str) -> Result<i32> {
+    let hd = usize::try_from(head_dim)
+        .map_err(|_| Error::Quant(format!("{what}: head_dim={head_dim} must be positive")))?;
+    if hd == 0 || !hd.is_multiple_of(ISO_QUAT_BLOCK_SIZE) {
+        return Err(Error::Quant(format!(
+            "{what}: head_dim={head_dim} must be a positive multiple of the quaternion \
+             block size {ISO_QUAT_BLOCK_SIZE}"
+        )));
+    }
+    i32::try_from(iso_n_groups_for(hd)).map_err(|_| {
+        Error::Quant(format!(
+            "{what}: n_groups for head_dim={head_dim} exceeds i32::MAX"
+        ))
+    })
+}
 
 /// Accumulated IsoQuant K cache (3-bit, quaternion SO(4) fast mode).
 ///
-/// CPU-only — no MSL kernel for K-side iso3 (the V-side iso3 MSL kernel
-/// in `isoquant_msl.rs` is structurally K/V-agnostic but the K-side dispatch
-/// path falls through to the dequant-then-SDPA legacy fallback). Storage
-/// payload layout is identical to [`crate::storage::QuantIsoV3`] — the only
-/// distinction at the storage level is the role on the SDPA path.
+/// Carries both forms of the payload:
+///
+/// * `blocks` — CPU [`IsoBlocks`], the source of truth for `dequant()` and the
+///   SSD spill/hydrate round-trip.
+/// * `gpu` — the optional GPU-resident packed ring ([`QuantKGpuRing`]),
+///   populated by [`Self::gpu_append`]. When present it lets the iso
+///   flash-decode kernel read the quant store directly instead of paying a
+///   full-prefix CPU `dequant()` per decode step.
+///
+/// Storage payload layout is identical to [`crate::storage::QuantIsoV3`] — the
+/// only distinction at the storage level is the role on the SDPA path.
 pub struct QuantIsoK3 {
     /// Accumulated per-token blocks (one entry per append call; `dequant`
     /// flattens them).
     pub blocks: Vec<IsoBlocks>,
+    /// GPU-resident packed ring. Empty until the first [`Self::gpu_append`].
+    pub gpu: QuantKGpuRing,
     /// Accumulated shape `[B, kv_h, S_total, D]`.
     pub shape: Vec<i32>,
     /// Maximum sequence length the storage was provisioned for.
+    ///
+    /// Inert: nothing sizes a buffer from it. The provisioned window that the
+    /// GPU ring grows against is a **per-call** `max_seq` argument to
+    /// [`Self::gpu_append`], read from the live `KvStorage` variant by the
+    /// caller. A snapshot cached here would go stale the moment the window
+    /// grows during decode, which is exactly how the rotor ring came to reject
+    /// valid appends mid-stream — do not wire the ring to this field.
     pub max_seq: i32,
     /// Bit-width tag (always [`ISO_K3_BITS`]).
     pub bits: u8,
@@ -53,6 +120,7 @@ impl std::fmt::Debug for QuantIsoK3 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QuantIsoK3")
             .field("n_blocks", &self.blocks.len())
+            .field("gpu_resident", &self.gpu.is_allocated())
             .field("shape", &self.shape)
             .field("max_seq", &self.max_seq)
             .field("bits", &self.bits)
@@ -66,6 +134,7 @@ impl QuantIsoK3 {
     pub fn new(init_shape: Vec<i32>, max_seq: i32) -> Self {
         Self {
             blocks: Vec::new(),
+            gpu: QuantKGpuRing::default(),
             shape: init_shape,
             max_seq,
             bits: ISO_K3_BITS,
@@ -78,7 +147,7 @@ impl QuantIsoK3 {
     /// Forwards any [`IsoQuantError`] from [`iso_encode_fast`].
     pub fn append(&mut self, f32_data: &[f32], new_shape: &[i32]) -> Result<()> {
         if new_shape.len() != 4 {
-            return Err(rmlx_core::error::Error::Mlx(format!(
+            return Err(Error::Mlx(format!(
                 "QuantIsoK3::append: expected 4D new_shape, got {new_shape:?}"
             )));
         }
@@ -97,9 +166,8 @@ impl QuantIsoK3 {
             super::seq_layout::transpose_heads_seq(f32_data, b, kv_h, new_seq, head_dim);
 
         let (codes, scales, quaternions, norms) =
-            iso_encode_fast(&seq_major, head_dim, ISO_K3_GROUP_SIZE, ISO_K3_BITS).map_err(
-                |e: IsoQuantError| rmlx_core::error::Error::Mlx(format!("iso_k3 encode: {e}")),
-            )?;
+            iso_encode_fast(&seq_major, head_dim, ISO_K3_GROUP_SIZE, ISO_K3_BITS)
+                .map_err(|e: IsoQuantError| Error::Mlx(format!("iso_k3 encode: {e}")))?;
 
         self.blocks.push(IsoBlocks {
             codes,
@@ -108,6 +176,10 @@ impl QuantIsoK3 {
             norms,
             n_tokens: n_tokens_total,
         });
+
+        // A CPU append does not touch the GPU ring, so any live ring is now a
+        // stale prefix. Drop it; the next `gpu_append` re-seeds from `blocks`.
+        self.gpu.clear();
 
         if self.shape.len() != 4 || self.shape[0] == 0 {
             self.shape = new_shape.to_vec();
@@ -132,6 +204,9 @@ impl QuantIsoK3 {
         );
         Self {
             blocks,
+            // Hydrated caches start CPU-only; the ring is rebuilt lazily from
+            // the next GPU append.
+            gpu: QuantKGpuRing::default(),
             shape,
             max_seq,
             bits: ISO_K3_BITS,
@@ -141,6 +216,9 @@ impl QuantIsoK3 {
     /// Reset the accumulated sequence length to zero.
     pub fn reset(&mut self) {
         self.blocks.clear();
+        // The ring would otherwise keep a prefix the CPU blocks no longer
+        // claim. Dropped here; the next `gpu_append` re-seeds from `blocks`.
+        self.gpu.clear();
         if self.shape.len() >= 4 {
             self.shape[2] = 0;
         }
@@ -160,6 +238,9 @@ impl QuantIsoK3 {
             }
         }
         self.blocks.truncate(keep);
+        // The ring's filled prefix no longer matches `blocks`; drop it rather
+        // than leave a longer-than-truncated prefix live.
+        self.gpu.clear();
         if self.shape.len() >= 4 {
             self.shape[2] = n;
         }
@@ -172,13 +253,105 @@ impl QuantIsoK3 {
     pub fn try_deep_clone(&self) -> Result<Self> {
         Ok(Self {
             blocks: self.blocks.clone(),
+            // The clone starts CPU-only: `blocks` carries the full payload, so
+            // the ring re-seeds from them on the clone's first GPU append.
+            // Sharing the source's Arrays would alias one ring across two
+            // independent caches.
+            gpu: QuantKGpuRing::default(),
             shape: self.shape.clone(),
             max_seq: self.max_seq,
             bits: self.bits,
         })
     }
 
+    /// Concatenate the accumulated CPU blocks into flat sequence-major
+    /// `(codes, scales, norms)` — the form [`QuantKGpuRing::seed_from_cpu`]
+    /// wants.
+    fn flatten_blocks(&self) -> (Vec<u32>, Vec<f32>, Vec<f32>) {
+        // Exact capacities — the prefill seed concatenates the whole prefix
+        // (millions of entries at long context), so growing from empty would
+        // realloc+memcpy repeatedly.
+        let (n_codes, n_scales, n_norms) = self.blocks.iter().fold((0, 0, 0), |(c, s, n), blk| {
+            (
+                c + blk.codes.len(),
+                s + blk.scales.len(),
+                n + blk.norms.len(),
+            )
+        });
+        let mut codes = Vec::with_capacity(n_codes);
+        let mut scales = Vec::with_capacity(n_scales);
+        let mut norms = Vec::with_capacity(n_norms);
+        for blk in &self.blocks {
+            codes.extend_from_slice(&blk.codes);
+            scales.extend_from_slice(&blk.scales);
+            norms.extend_from_slice(&blk.norms);
+        }
+        (codes, scales, norms)
+    }
+
+    /// Push one GPU-encoded chunk into the GPU ring, seeding the ring from the
+    /// accumulated CPU blocks first when it is not yet live.
+    ///
+    /// `codes` / `scales` / `norms` are the iso encode kernel's GPU outputs for
+    /// a **sequence-major** chunk; `norms` must already be per-token (the iso
+    /// quantize kernel emits a per-group norm slot — the caller deduplicates).
+    /// `prev_seq` is the accumulated sequence length **before** this chunk.
+    ///
+    /// This only maintains the ring — the caller still pushes the matching CPU
+    /// block, which stays the source of truth for `dequant()` and SSD spill.
+    ///
+    /// `max_seq` is the window the cache is provisioned for **right now**, read
+    /// from the active `KvStorage` variant by the caller. It is a parameter
+    /// rather than a field so it cannot go stale as the window grows during
+    /// decode — see the note on [`Self::max_seq`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Quant`] when `head_dim` violates the group-size
+    /// invariant, and forwards [`QuantKGpuRing::seed_from_cpu`] /
+    /// [`QuantKGpuRing::append_encoded`] errors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gpu_append(
+        &mut self,
+        codes: &Array,
+        scales: &Array,
+        norms: &Array,
+        kv_h: i32,
+        head_dim: i32,
+        prev_seq: i32,
+        new_seq: i32,
+        max_seq: i32,
+        device: Device,
+    ) -> Result<()> {
+        let n_groups = iso_n_groups_i32(head_dim, "QuantIsoK3::gpu_append")?;
+        if !self.gpu.is_allocated() && prev_seq > 0 {
+            let (c, s, n) = self.flatten_blocks();
+            self.gpu
+                .seed_from_cpu(&c, &s, &n, kv_h, n_groups, prev_seq, max_seq, device)?;
+        }
+        self.gpu.append_encoded(
+            codes, scales, norms, kv_h, n_groups, prev_seq, new_seq, max_seq, device,
+        )
+    }
+
+    /// GPU packed view of the first `kv_seq` positions, or `None` when the ring
+    /// is not live (CPU path — caller falls back to `dequant`).
+    ///
+    /// # Errors
+    ///
+    /// Forwards [`QuantKGpuRing::packed_view`] errors.
+    pub fn gpu_packed_view(
+        &self,
+        kv_seq: i32,
+        device: Device,
+    ) -> Result<Option<(Array, Array, Array)>> {
+        self.gpu.packed_view(kv_seq, device)
+    }
+
     /// Approximate byte footprint of the accumulated payload.
+    ///
+    /// Includes the GPU ring when live — it is real resident memory, so
+    /// omitting it would under-report this cache's KV bytes.
     #[must_use]
     pub fn byte_size(&self) -> usize {
         let mut total = 0usize;
@@ -188,7 +361,7 @@ impl QuantIsoK3 {
             total += blk.quaternions.len() * size_of::<f32>();
             total += blk.norms.len() * size_of::<f32>();
         }
-        total
+        total + self.gpu.byte_size()
     }
 
     /// Dequantize all accumulated K slices into one flat f32 vector of length
@@ -198,7 +371,7 @@ impl QuantIsoK3 {
     /// Returns an `Error::Mlx` if the underlying [`iso_decode_fast`] fails.
     pub fn dequant(&self) -> Result<Vec<f32>> {
         if self.shape.len() != 4 {
-            return Err(rmlx_core::error::Error::Mlx(format!(
+            return Err(Error::Mlx(format!(
                 "QuantIsoK3::dequant: malformed shape {:?}",
                 self.shape
             )));
@@ -216,9 +389,7 @@ impl QuantIsoK3 {
                 ISO_K3_GROUP_SIZE,
                 ISO_K3_BITS,
             )
-            .map_err(|e: IsoQuantError| {
-                rmlx_core::error::Error::Mlx(format!("iso_k3 decode: {e}"))
-            })?;
+            .map_err(|e: IsoQuantError| Error::Mlx(format!("iso_k3 decode: {e}")))?;
             out.extend_from_slice(&dec);
         }
         if out.len() < total_elems {
@@ -248,14 +419,14 @@ impl QuantIsoK3 {
     ///   `ISO_K3_GROUP_SIZE` multiple constraint.
     pub fn dequant_gpu(&self, device: Device) -> Result<Array> {
         if self.shape.len() != 4 {
-            return Err(rmlx_core::error::Error::Mlx(format!(
+            return Err(Error::Mlx(format!(
                 "QuantIsoK3::dequant_gpu: malformed shape {:?}",
                 self.shape
             )));
         }
         let head_dim = self.shape[3] as usize;
         if head_dim == 0 || !head_dim.is_multiple_of(ISO_K3_GROUP_SIZE) {
-            return Err(rmlx_core::error::Error::Quant(format!(
+            return Err(Error::Quant(format!(
                 "QuantIsoK3::dequant_gpu: head_dim={head_dim} must be a positive multiple of \
                  ISO_K3_GROUP_SIZE={ISO_K3_GROUP_SIZE}"
             )));
@@ -286,24 +457,20 @@ impl QuantIsoK3 {
             }
             // Checked arithmetic — see V-side mirror.
             let blk_groups = blk.n_tokens.checked_mul(n_groups).ok_or_else(|| {
-                rmlx_core::error::Error::Quant(
-                    "dequant_gpu: blk.n_tokens * n_groups overflow".to_owned(),
-                )
+                Error::Quant("dequant_gpu: blk.n_tokens * n_groups overflow".to_owned())
             })?;
-            total_groups = total_groups.checked_add(blk_groups).ok_or_else(|| {
-                rmlx_core::error::Error::Quant("dequant_gpu: total_groups overflow".to_owned())
-            })?;
+            total_groups = total_groups
+                .checked_add(blk_groups)
+                .ok_or_else(|| Error::Quant("dequant_gpu: total_groups overflow".to_owned()))?;
         }
 
         // Guard against silent shape divergence — see V-side mirror.
         let declared_total: usize = self.shape.iter().map(|&d| d as usize).product();
         let actual_total: usize = total_groups.checked_mul(ISO_K3_GROUP_SIZE).ok_or_else(|| {
-            rmlx_core::error::Error::Quant(
-                "dequant_gpu: total_groups * ISO_K3_GROUP_SIZE overflow".to_owned(),
-            )
+            Error::Quant("dequant_gpu: total_groups * ISO_K3_GROUP_SIZE overflow".to_owned())
         })?;
         if actual_total != declared_total {
-            return Err(rmlx_core::error::Error::Quant(format!(
+            return Err(Error::Quant(format!(
                 "dequant_gpu: actual_total={actual_total} (blocks×groups×group_size) != \
                  declared_total={declared_total} (prod(shape)={:?}); refusing to silently \
                  truncate/pad",
