@@ -10,13 +10,23 @@ FFI bindings to the brew-prebuilt `mlx-c` C ABI, plus a minimal safe Rust layer
 brew install mlx mlx-c
 ```
 
-Tested against `mlx-c 0.6.0_2` and `mlx 0.31.2`. Apple Silicon only.
+Apple Silicon only. The validated MLX / mlx-c pair is declared in
+[`mlx-pin.txt`](mlx-pin.txt) — that file is the single source of truth, so the
+versions are deliberately not repeated here. `build.rs` warns (never fails) when
+the resolved stack differs from it, or when the resolved `mlx.metallib` is
+missing the fast GEMM kernels. Rationale and the un-pin procedure:
+[`docs/FFI.md`](../../docs/FFI.md#pinned-mlx--mlx-c-pair).
 
 ## Environment variables
 
-| Variable | Default | Description |
-|---|---|---|
-| `MLX_C_PREFIX` | `/opt/homebrew/Cellar/mlx-c/0.6.0_2` | Root of the mlx-c cellar entry |
-| `MLX_PREFIX` | `/opt/homebrew/Cellar/mlx/0.31.2` | Root of the mlx cellar entry |
+Both are optional overrides. Unset, `build.rs` resolves each prefix via
+`brew --prefix <formula>`, falling back to `/opt/homebrew/opt/<formula>` — the
+`opt` symlink the dylibs' install names already point at, which is what keeps
+the library compiled against and the library loaded on the same file.
 
-Set these if you have a non-default Homebrew prefix or a different version pinned.
+| Variable | Description |
+|---|---|
+| `MLX_C_PREFIX` | Root of the mlx-c install (contains `lib/libmlxc.dylib`, `include/`) |
+| `MLX_PREFIX` | Root of the mlx install (contains `lib/libmlx.dylib`, `include/`) |
+
+Set these only for a non-Homebrew layout or a non-default Homebrew prefix.

@@ -52,6 +52,25 @@ fn resolve_prefix(env_key: &str, formula: &str) -> String {
     format!("/opt/homebrew/opt/{formula}")
 }
 
+/// Declare a rebuild trigger for a path, but only if it exists.
+///
+/// Cargo treats a listed path that is absent as permanently dirty, which would
+/// re-run this script — and bindgen — on every single build for anyone whose
+/// MLX is not laid out like a Homebrew keg. The probes already tolerate a
+/// missing file by going quiet, so the trigger must tolerate it too.
+///
+/// Note what this can and cannot catch: cargo compares mtimes and re-runs only
+/// for a *newer* one, and it stats through symlinks. Repointing `opt/mlx` at an
+/// older keg therefore moves the observed mtime backwards and does **not**
+/// trigger a re-run — recovering from a bad stack needs an explicit
+/// `cargo clean -p rmlx-mlx`, and the runtime version-skew warning is the
+/// backstop for a binary that was never rebuilt.
+fn rerun_if_present(path: &str) {
+    if std::path::Path::new(path).exists() {
+        println!("cargo:rerun-if-changed={path}");
+    }
+}
+
 /// Ask Homebrew where a formula lives. `None` when brew is absent, the formula
 /// is not installed, or the answer does not exist on disk.
 fn brew_prefix(formula: &str) -> Option<String> {
@@ -101,13 +120,12 @@ fn check_mlx_pin(mlx_prefix: &str, mlx_c_prefix: &str, mlx_version: &str) {
     // the ground truth the version pin only proxies for, and it keeps passing
     // on its own once a fixed bottle ships. `None` = no metallib to inspect.
     let metallib = format!("{mlx_prefix}/lib/mlx.metallib");
-    println!("cargo:rerun-if-changed={metallib}");
+    rerun_if_present(&metallib);
     let fast_gemm = std::fs::File::open(&metallib)
         .ok()
         .and_then(|f| contains_needle(f, NAX_GEMM_KERNEL.as_bytes(), SCAN_CHUNK).ok());
 
-    let drift = (mlx_version != "unknown" && mlx_version != pin_mlx)
-        || (mlx_c_version != "unknown" && mlx_c_version != pin_mlx_c);
+    let drift = pin_drift(mlx_version, &mlx_c_version, &pin);
 
     if fast_gemm == Some(false) {
         println!(
@@ -116,13 +134,13 @@ fn check_mlx_pin(mlx_prefix: &str, mlx_c_prefix: &str, mlx_version: &str) {
         );
         println!(
             "cargo:warning=  Those are the Neural-Accelerator GEMM path. Without them GPU matmul \
-             throughput measured ~3.8x lower and prefill 2.2-3.3x slower on \
+             throughput measured ~3.8x lower and prefill 2.2-3.7x slower on \
              Neural-Accelerator-class hardware. Decode is bandwidth-bound and looks normal, so \
              the symptom mimics a model-code defect."
         );
         println!(
             "cargo:warning=  rMLX pins the validated pair mlx {pin_mlx} + mlx-c {pin_mlx_c}, \
-             whose metallib ships 360 of them. Some Homebrew bottles omit the family entirely; a \
+             whose metallib ships them. Some Homebrew bottles omit the family entirely; a \
              non-bottle build of the same version can be fine."
         );
         println!(
@@ -131,12 +149,15 @@ fn check_mlx_pin(mlx_prefix: &str, mlx_c_prefix: &str, mlx_version: &str) {
         );
         println!(
             "cargo:warning=    ln -sfn ../Cellar/mlx/{pin_mlx} /opt/homebrew/opt/mlx && ln -sfn \
-             ../Cellar/mlx-c/{pin_mlx_c} /opt/homebrew/opt/mlx-c && brew pin mlx mlx-c"
+             ../Cellar/mlx-c/{pin_mlx_c} /opt/homebrew/opt/mlx-c && brew pin mlx mlx-c && cargo \
+             clean -p rmlx-mlx"
         );
         println!(
             "cargo:warning=  Repoint both: mlx and mlx-c are ABI-coupled and a mismatched pair \
-             aborts at load. Then rebuild. Pin: crates/rmlx-mlx/{PIN_FILE}; rationale and un-pin \
-             steps: docs/FFI.md."
+             aborts at load. The `cargo clean` is required, not tidiness: repointing to an older \
+             keg moves file times backwards, and cargo only re-runs a build script for a *newer* \
+             one — so a plain rebuild would silently keep these stale bindings. Pin: \
+             crates/rmlx-mlx/{PIN_FILE}; rationale and un-pin steps: docs/FFI.md."
         );
     } else if drift {
         println!(
@@ -198,7 +219,7 @@ fn main() {
     // rebuild and no error. The two versions can differ in ABI and in kernel
     // throughput, so the skew must not pass unnoticed.
     let version_header = format!("{mlx_prefix}/include/mlx/version.h");
-    println!("cargo:rerun-if-changed={version_header}");
+    rerun_if_present(&version_header);
     let build_version =
         read_mlx_version(&std::fs::read_to_string(&version_header).unwrap_or_default());
     println!("cargo:rustc-env=RMLX_MLX_BUILD_VERSION={build_version}");

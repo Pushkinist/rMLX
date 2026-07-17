@@ -57,6 +57,16 @@ fn keg_version_from(real: &std::path::Path, formula: &str) -> Option<String> {
     (parent == formula).then(|| version.to_owned())
 }
 
+/// Whether the resolved pair differs from the pinned one.
+///
+/// `"unknown"` means the version could not be established (a non-keg layout, an
+/// unreadable header) — that is "cannot verify", not "mismatch", so it never
+/// reports drift. Guessing there would warn at people whose install is simply
+/// shaped differently.
+fn pin_drift(mlx: &str, mlx_c: &str, pin: &MlxPin) -> bool {
+    (mlx != "unknown" && mlx != pin.mlx) || (mlx_c != "unknown" && mlx_c != pin.mlx_c)
+}
+
 /// Parse `MLX_VERSION_{MAJOR,MINOR,PATCH}` out of the text of MLX's `version.h`.
 ///
 /// The header is authoritative for the tree we compile against — a Cellar
@@ -92,11 +102,23 @@ fn contains_needle<R: std::io::Read>(
     let mut buf = vec![0_u8; chunk];
     let mut window: Vec<u8> = Vec::new();
     loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            return Ok(false);
-        }
-        window.extend(buf.iter().take(n).copied());
+        let n = match reader.read(&mut buf) {
+            Ok(0) => return Ok(false),
+            Ok(n) => n,
+            // A signal must not be mistaken for a failed probe: the caller reads
+            // an error as "cannot inspect" and goes quiet, which is precisely
+            // the outcome this scan exists to prevent.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        // `Read` guarantees n <= buf.len(); `get` states that without a panic
+        // path, and keeps the copy a memcpy rather than a byte-at-a-time loop.
+        let Some(filled) = buf.get(..n) else {
+            return Err(std::io::Error::other(
+                "reader reported more bytes than the buffer holds",
+            ));
+        };
+        window.extend_from_slice(filled);
         if window.windows(needle.len()).any(|w| w == needle) {
             return Ok(true);
         }

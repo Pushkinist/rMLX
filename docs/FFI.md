@@ -85,19 +85,25 @@ why the pin carries it.)
 
 #### Why the pin exists
 
-Homebrew's `mlx` 0.32.0 bottle ships **zero** of the ~360
-`steel_gemm_fused_nax_*` kernels — the M5 Neural-Accelerator GEMM path:
+Homebrew's `mlx` 0.32.0 bottle ships **zero** `steel_gemm_fused_nax_*` kernels
+— the M5 Neural-Accelerator GEMM path. The pinned 0.31.2 bottle ships 145 of
+them:
 
 ```sh
 strings "$(brew --prefix mlx)/lib/mlx.metallib" | grep -c steel_gemm_fused_nax
-# 0.31.2 -> 360      0.32.0 -> 0
+# 0.31.2 -> 288      0.32.0 -> 0
 ```
 
-Measured cost: ~3.8× lower GPU matmul throughput, 2.2–3.3× slower prefill on
+(`grep -c` counts matching *lines*, not kernels: 145 distinct kernel functions
+appear on 288 lines. Only the zero is load-bearing — the build's probe is
+boolean and never counts.)
+
+Measured cost: ~3.8× lower GPU matmul throughput, 2.2–3.7× slower prefill on
 Neural-Accelerator-class hardware. Decode is bandwidth-bound and barely moves
-(gemma-4-e2b @4k: prefill 7,080 → 15,592 t/s, decode 126.2 → 121.5), so the
-symptom looks like a model-code defect rather than a toolchain one — it cost
-one investigation days of misattribution before the metallib was inspected.
+(gemma-4-e2b @4k, median of 3, same binary: prefill 6,916 → 15,352 t/s, decode
+124.5 → 119.9), so the symptom looks like a model-code defect rather than a
+toolchain one — it cost one investigation days of misattribution before the
+metallib was inspected.
 
 This is a **Homebrew bottle regression, not an MLX regression**: the upstream
 0.32.0 PyPI wheel ships the kernels and is fine. Tracked in
@@ -135,11 +141,21 @@ Both kegs must already be in the Cellar (`ls /opt/homebrew/Cellar/mlx`):
 ```sh
 ln -sfn ../Cellar/mlx/0.31.2 /opt/homebrew/opt/mlx && \
 ln -sfn ../Cellar/mlx-c/0.6.0_2 /opt/homebrew/opt/mlx-c && \
-brew pin mlx mlx-c
+brew pin mlx mlx-c && \
+cargo clean -p rmlx-mlx        # required — see below
 ```
 
-Then rebuild. `brew pin` stops a later `brew upgrade` from repointing the
-symlinks back.
+`brew pin` stops a later `brew upgrade` from repointing the symlinks back.
+
+**The `cargo clean` is required, not hygiene.** Cargo re-runs a build script
+only when a `rerun-if-changed` path is *newer* than the last run, and it stats
+**through** the symlink. Repointing `opt/mlx` at the older validated keg moves
+the observed mtime **backwards** (0.31.2's metallib predates 0.32.0's), so a
+plain rebuild does not re-run `build.rs` at all: the crate keeps bindings
+generated against the wrong headers and a stale baked-in
+`RMLX_MLX_BUILD_VERSION`, while the loader picks up the newly-linked pair. That
+combination is the ABI abort this section exists to avoid. Touching
+`crates/rmlx-mlx/mlx-pin.txt` forces the same re-run if you prefer.
 
 #### Un-pinning when the bottle is fixed
 
@@ -147,12 +163,20 @@ symlinks back.
 2. Verify the capability actually returned — this is the whole point:
    ```sh
    strings "$(brew --prefix mlx)/lib/mlx.metallib" | grep -c steel_gemm_fused_nax
-   # must be ~360, not 0
+   # must be non-zero (288 on the 0.31.2 bottle); zero means the bottle is still broken
    ```
+   Assert non-zero, not a particular count: the number is a `strings` line count
+   that tracks kernel-name spelling, and the build's probe only asks present/absent.
 3. Bump **both** lines in `crates/rmlx-mlx/mlx-pin.txt` to the new pair
    (`brew list --versions mlx mlx-c` gives the keg names, revision suffix
-   included).
-4. Rebuild and confirm the build emits no MLX warning.
+   included). Editing the pin file is itself a rebuild trigger, which is what
+   makes step 4 mean something.
+4. Rebuild and confirm the build emits no MLX warning — but only after
+   `cargo clean -p rmlx-mlx`. Upgrading normally moves mtimes forward, so the
+   re-run usually happens on its own; a *downgrade* does not, and then "no
+   warning" would merely mean the check never ran. Force it and the step is
+   real. Confirm `build.rs` actually ran with `cargo build -p rmlx-mlx -vv`
+   (its output appears only on a real run).
 5. Re-verify on a real prefill cell, not just the kernel count:
    ```sh
    rmlx baseline --model <gemma-4-e2b> --kv-quant none --max-ctx 8192 --prompt-tokens 4096
@@ -189,9 +213,17 @@ catches a stack that changed underneath a built binary.
    resolved `mlx.metallib` is scanned for the fast GEMM kernels. Both warn,
    neither fails — see "Pinned MLX / mlx-c pair" above.
 5. Rebuild is triggered on `MLX_C_PREFIX`, `MLX_PREFIX`, `wrapper.h`,
-   `build_support.rs`, `mlx-pin.txt`, or a change to the resolved
-   `version.h` / `mlx.metallib` — so repointing the `opt` symlink re-runs the
-   checks.
+   `build_support.rs`, `mlx-pin.txt`, or a *newer* resolved
+   `version.h` / `mlx.metallib` (each registered only when it exists — cargo
+   treats a missing trigger path as permanently dirty, which would re-run
+   bindgen on every build of a non-keg layout).
+
+   **Repointing the `opt` symlink does not reliably re-run these checks.** Cargo
+   compares mtimes through the symlink and re-runs only for a newer one, so
+   moving to an *older* keg — the recovery direction — looks like nothing
+   changed. Use `cargo clean -p rmlx-mlx` when repointing; the runtime
+   version-skew warning below is the backstop for a binary that was never
+   rebuilt.
 6. rpath entries are emitted so the binary finds both dylibs at runtime
    without `DYLD_LIBRARY_PATH`.
 

@@ -50,6 +50,40 @@ fn parse_pin_rejects_unknown_or_malformed_lines() {
     assert_eq!(parse_pin("mlx 0.31.2 extra\nmlx-c 0.6.0_2\n"), None);
 }
 
+/// The pinned pair the drift cases are stated against.
+fn pin_fixture() -> MlxPin {
+    MlxPin {
+        mlx: "0.31.2".to_owned(),
+        mlx_c: "0.6.0_2".to_owned(),
+    }
+}
+
+#[test]
+fn no_drift_when_both_halves_match() {
+    assert!(!pin_drift("0.31.2", "0.6.0_2", &pin_fixture()));
+}
+
+#[test]
+fn drift_when_either_half_differs() {
+    // Either half alone is drift: the pair is the validated unit.
+    assert!(pin_drift("0.32.0", "0.6.0_2", &pin_fixture()));
+    assert!(pin_drift("0.31.2", "0.6.0_3", &pin_fixture()));
+    assert!(pin_drift("0.32.0", "0.6.0_3", &pin_fixture()));
+}
+
+#[test]
+fn unknown_never_reports_drift() {
+    // "unknown" is "cannot verify", not "mismatch" — a non-keg layout or an
+    // unreadable header must not warn at someone whose install is merely
+    // shaped differently.
+    assert!(!pin_drift("unknown", "unknown", &pin_fixture()));
+    assert!(!pin_drift("unknown", "0.6.0_2", &pin_fixture()));
+    assert!(!pin_drift("0.31.2", "unknown", &pin_fixture()));
+    // ...but a known-bad half still drifts even when the other is unknown.
+    assert!(pin_drift("unknown", "0.6.0_3", &pin_fixture()));
+    assert!(pin_drift("0.32.0", "unknown", &pin_fixture()));
+}
+
 #[test]
 fn keg_version_reads_the_homebrew_revision_suffix() {
     // The `_2` suffix is the load-bearing part: same upstream 0.6.0, built
