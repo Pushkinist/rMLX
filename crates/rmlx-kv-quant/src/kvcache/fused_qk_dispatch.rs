@@ -1,9 +1,11 @@
 // Production fused-QK dispatch using the head-major persistent K shadow.
 //
 // Enables the 6 rotor variants (Rotor3Sym, Rotor4Sym, RotorKOnly3,
-// RotorKOnly4, RotorKAsym{3,4}) on the fused-QK fast path via the
-// per-token + sideband-table array split. Iso variants remain held until
-// their K-side GPU encoder ships.
+// RotorKOnly4, RotorKAsym{3,4}) and the 4 iso variants (Iso3Sym, Iso4Sym,
+// IsoKOnly3, IsoKOnly4) on the fused-QK fast path via the per-token +
+// sideband-table array split. Iso carries the per-token norm sideband but no
+// rotor table — its rotation is one fixed quaternion baked into the kernel
+// header.
 //
 // Wires the fused-QK MSL kernel families (q8 = K8V*, TurboSym3, TurboSym4,
 // Rotor3Sym, Rotor4Sym, …) into the production decode path.
@@ -48,6 +50,7 @@ use crate::q8_msl::q8_quantize_gpu;
 use crate::rotor_fused_qk_msl::{rotor3_fused_qk_sdpa, rotor4_fused_qk_sdpa};
 use crate::rotorquant::{n_groups_for, ROTOR3_BITS, ROTOR4_BITS};
 use crate::rotorquant_msl::{rotor_quantize_v3_gpu, rotor_quantize_v4_gpu, rotor_table_to_array};
+use crate::storage::{iso_n_groups_for, ISO_K3_BITS, ISO_K3_GROUP_SIZE, ISO_K4_BITS};
 use crate::turbo_k3_fused_qk_msl::turbo_k3_fused_qk_sdpa;
 use crate::turbo_k4_fused_qk_msl::turbo_k4_fused_qk_sdpa;
 use crate::turboquant_msl::turbo_quantize_v4_gpu;
@@ -695,8 +698,12 @@ fn codec_is_rotor(codec: KvQuant) -> bool {
     )
 }
 
-/// Whether the codec has a GPU encoder wired in for the fused-QK shadow
-/// path. Iso variants remain HOLD until their K-side GPU encoders ship.
+/// Whether the codec has a GPU encoder wired in for the fused-QK shadow path.
+///
+/// Every codec listed here must have a matching arm in
+/// [`encode_chunk_to_head_major`] — the two lists are the same fact stated
+/// twice, and a codec in one but not the other either errors at encode or
+/// silently sits on the legacy path.
 fn codec_has_gpu_encoder(codec: KvQuant) -> bool {
     matches!(
         codec,
@@ -704,6 +711,10 @@ fn codec_has_gpu_encoder(codec: KvQuant) -> bool {
             | KvQuant::K8V8
             | KvQuant::TurboSym3
             | KvQuant::TurboSym4
+            | KvQuant::Iso3Sym
+            | KvQuant::Iso4Sym
+            | KvQuant::IsoKOnly3
+            | KvQuant::IsoKOnly4
             | KvQuant::Rotor3Sym
             | KvQuant::Rotor4Sym
             | KvQuant::RotorKOnly3
@@ -843,6 +854,12 @@ fn encode_chunk_to_head_major(
                 norms: None,
             })
         }
+        KvQuant::Iso3Sym | KvQuant::IsoKOnly3 => {
+            encode_chunk_iso(k_f32, b, kv_h, n, d, layout, ISO_K3_BITS, device)
+        }
+        KvQuant::Iso4Sym | KvQuant::IsoKOnly4 => {
+            encode_chunk_iso(k_f32, b, kv_h, n, d, layout, ISO_K4_BITS, device)
+        }
         KvQuant::Rotor3Sym | KvQuant::RotorKOnly3 | KvQuant::RotorK3Asym { .. } => {
             encode_chunk_rotor(
                 k_f32,
@@ -873,6 +890,70 @@ fn encode_chunk_to_head_major(
             "fused_qk encode: codec {codec:?} HOLD — GPU encoder not yet wired"
         ))),
     }
+}
+
+/// Iso chunk encode. Calls the K-side GPU quantize kernel and reshapes the flat
+/// `[n_tokens * n_groups]` outputs into the per-token head-major slabs the
+/// shadow stores. The per-token norm is extracted as the first group's norm
+/// slot, the same convention [`encode_chunk_rotor`] uses.
+///
+/// No rotor-table sideband: iso rotates every group by the same fixed
+/// golden-ratio quaternion, which the kernel header bakes in.
+///
+/// `bits` is selected explicitly by the caller; there is no default arm, so a
+/// width with no kernel errors rather than encoding through the other's.
+#[allow(clippy::too_many_arguments)]
+fn encode_chunk_iso(
+    k_f32: &Array,
+    b: i32,
+    kv_h: i32,
+    n: i32,
+    d: i32,
+    layout: crate::kvcache::fused_qk_shadow::FusedQkLayout,
+    bits: u8,
+    device: Device,
+) -> Result<ChunkEncoded> {
+    let d_usize = usize::try_from(d)
+        .map_err(|_| Error::Mlx(format!("fused_qk iso encode: negative head_dim={d}")))?;
+    if !d_usize.is_multiple_of(ISO_K3_GROUP_SIZE) {
+        return Err(Error::Mlx(format!(
+            "fused_qk iso encode: head_dim={d} must be a multiple of the quaternion block \
+             size {ISO_K3_GROUP_SIZE}"
+        )));
+    }
+    let n_groups = iso_n_groups_for(d_usize);
+    let n_groups_i32 = i32::try_from(n_groups).map_err(|_| {
+        Error::Mlx(format!(
+            "fused_qk iso encode: n_groups {n_groups} overflows"
+        ))
+    })?;
+
+    let (codes_flat, scales_flat, _quats, norms_flat) = match bits {
+        ISO_K3_BITS => crate::isoquant_msl::iso_quantize_v3_gpu(k_f32, d_usize, device)?,
+        ISO_K4_BITS => crate::isoquant_msl_v4::iso_quantize_v4_gpu(k_f32, d_usize, device)?,
+        other => {
+            return Err(Error::Mlx(format!(
+                "fused_qk iso encode: unsupported bits={other} (only 3 and 4); refusing to \
+                 encode with another width's kernel"
+            )))
+        }
+    };
+
+    // codes_flat / scales_flat shape: [n_tokens * n_groups]. Reshape to
+    // head-major — one u32 word per quaternion block at both bit widths.
+    let codes_4d = codes_flat.reshape(&[b, kv_h, n, n_groups_i32], device)?;
+    let scales_4d = scales_flat.reshape(&[b, kv_h, n, n_groups_i32], device)?;
+    // norms_flat is per-group; deduplicate to per-token by slicing the first
+    // slot of each token's group-tuple.
+    let norms_per_group = norms_flat.reshape(&[b, kv_h, n, n_groups_i32], device)?;
+    let norms_4d =
+        norms_per_group.slice(&[0_i32, 0, 0, 0], &[b, kv_h, n, 1], &[1_i32; 4], device)?;
+    assert_layout(layout, n_groups_i32, n_groups_i32)?;
+    Ok(ChunkEncoded {
+        codes: codes_4d,
+        scales: scales_4d,
+        norms: Some(norms_4d),
+    })
 }
 
 /// Rotor chunk encode. Calls the K-side GPU quantize kernel and reshapes

@@ -45,6 +45,7 @@ use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{zeros, Array, Device, Dtype};
 
 use crate::q8_msl::Q8_GROUP_SIZE;
+use crate::storage::ISO_K3_GROUP_SIZE;
 use crate::turboquant::GROUP_SIZE as TURBO_GROUP_SIZE;
 use crate::KvQuant;
 
@@ -142,19 +143,25 @@ impl FusedQkLayout {
                     n_groups: 0,
                 }
             }
-            // Iso3 / Iso4: codes = head_dim/4 u32, scales = head_dim/4 f32,
-            // plus 1 norm per token. The kernel shim expects
-            // `[scales_all | norms_all]` flat — the dispatch layer
-            // assembles that by concatenating the per-token scales
-            // (sliced to `kv_seq`) with the per-token norms.
-            //
-            // Iso variants are still gated off at `for_codec` until iso's
-            // K-side GPU encoder lands. The shadow can hold the layout but
-            // the dispatch site does not have a populated encoder for iso
-            // yet. Only the rotor variants below are enabled.
+            // Iso3 / Iso4: codes = head_dim/4 u32 (one word per quaternion
+            // block, both bit widths), scales = head_dim/4 f32, plus 1 norm
+            // per token. No rotor table — iso rotates every group by the same
+            // fixed golden-ratio quaternion, which the kernel header bakes in.
             KvQuant::Iso3Sym | KvQuant::IsoKOnly3 | KvQuant::Iso4Sym | KvQuant::IsoKOnly4 => {
-                warn_iso_hold_once(codec);
-                return Ok(None);
+                if !hd.is_multiple_of(ISO_K3_GROUP_SIZE) {
+                    return Err(Error::Quant(format!(
+                        "FusedQkLayout(iso): head_dim={head_dim} must be a multiple of \
+                         ISO_K3_GROUP_SIZE={ISO_K3_GROUP_SIZE}"
+                    )));
+                }
+                let n_groups = head_dim / ISO_K3_GROUP_SIZE as i32;
+                Self {
+                    codes_per_token: n_groups,
+                    scales_per_token: n_groups,
+                    has_norm: true,
+                    has_rotor_table: false,
+                    n_groups: 0,
+                }
             }
             // Rotor3 / Rotor4 (Sym + K-only + Asym): codes = ceil(head_dim/3)
             // u32, scales = ceil(head_dim/3) f32, 1 norm per token,
@@ -195,20 +202,6 @@ impl FusedQkLayout {
         };
         Ok(Some(layout))
     }
-}
-
-/// Emit a one-shot `tracing::warn!` when an iso codec hits the fused-QK
-/// shadow path. Iso remains held until its K-side GPU encoder ships.
-fn warn_iso_hold_once(codec: KvQuant) {
-    use std::sync::OnceLock;
-    static WARNED: OnceLock<()> = OnceLock::new();
-    WARNED.get_or_init(|| {
-        tracing::warn!(
-            ?codec,
-            "fused-QK: iso codec not yet enabled in the per-token shadow path \
-             (iso K-side GPU encoder followup); falling back to legacy bf16 SDPA"
-        );
-    });
 }
 
 /// Head-major persistent fused-QK K-side shadow buffer.

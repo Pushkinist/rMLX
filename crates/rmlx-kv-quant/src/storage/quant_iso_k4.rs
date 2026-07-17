@@ -12,9 +12,13 @@
 //! Quantized K buffer: `QuantIsoK4` (IsoQuant 4-bit K codec).
 
 use rmlx_core::error::Result;
+use rmlx_mlx::{Array, Device};
 
 use crate::isoquant::{iso_decode_fast, iso_encode_fast, IsoQuantError};
+use crate::storage::quant_iso_k::iso_n_groups_i32;
 use crate::storage::quant_iso_v::IsoBlocks;
+
+use super::QuantKGpuRing;
 
 /// Bit-width of the iso4 K codec (fixed at 4-bit).
 pub const ISO_K4_BITS: u8 = 4;
@@ -25,13 +29,19 @@ pub const ISO_K4_GROUP_SIZE: usize = 4;
 /// Accumulated IsoQuant K cache (4-bit, quaternion SO(4) fast mode).
 ///
 /// Same per-block payload as [`crate::storage::QuantIsoK3`] with `bits=4` and
-/// the dense 8-vals-per-u32 pack handled internally by `iso_encode_fast`.
+/// the dense 8-vals-per-u32 pack handled internally by `iso_encode_fast`, and
+/// the same optional GPU ring — see [`crate::storage::QuantIsoK3`] for the
+/// field semantics.
 pub struct QuantIsoK4 {
     /// Accumulated per-token blocks.
     pub blocks: Vec<IsoBlocks>,
+    /// GPU-resident packed ring. Empty until the first [`Self::gpu_append`].
+    pub gpu: QuantKGpuRing,
     /// Accumulated shape `[B, kv_h, S_total, D]`.
     pub shape: Vec<i32>,
-    /// Maximum sequence length provisioned.
+    /// Maximum sequence length provisioned. Inert — see
+    /// [`crate::storage::QuantIsoK3::max_seq`]; the ring grows against a
+    /// per-call `max_seq`, never this snapshot.
     pub max_seq: i32,
     /// Bit-width tag (always [`ISO_K4_BITS`]).
     pub bits: u8,
@@ -41,6 +51,7 @@ impl std::fmt::Debug for QuantIsoK4 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QuantIsoK4")
             .field("n_blocks", &self.blocks.len())
+            .field("gpu_resident", &self.gpu.is_allocated())
             .field("shape", &self.shape)
             .field("max_seq", &self.max_seq)
             .field("bits", &self.bits)
@@ -54,6 +65,7 @@ impl QuantIsoK4 {
     pub fn new(init_shape: Vec<i32>, max_seq: i32) -> Self {
         Self {
             blocks: Vec::new(),
+            gpu: QuantKGpuRing::default(),
             shape: init_shape,
             max_seq,
             bits: ISO_K4_BITS,
@@ -118,6 +130,9 @@ impl QuantIsoK4 {
         );
         Self {
             blocks,
+            // Hydrated caches start CPU-only; the ring is rebuilt lazily from
+            // the next GPU append.
+            gpu: QuantKGpuRing::default(),
             shape,
             max_seq,
             bits: ISO_K4_BITS,
@@ -127,6 +142,9 @@ impl QuantIsoK4 {
     /// Reset the accumulated sequence length to zero.
     pub fn reset(&mut self) {
         self.blocks.clear();
+        // The ring would otherwise keep a prefix the CPU blocks no longer
+        // claim. Dropped here; the next `gpu_append` re-seeds from `blocks`.
+        self.gpu.clear();
         if self.shape.len() >= 4 {
             self.shape[2] = 0;
         }
@@ -146,6 +164,9 @@ impl QuantIsoK4 {
             }
         }
         self.blocks.truncate(keep);
+        // The ring's filled prefix no longer matches `blocks`; drop it rather
+        // than leave a longer-than-truncated prefix live.
+        self.gpu.clear();
         if self.shape.len() >= 4 {
             self.shape[2] = n;
         }
@@ -158,13 +179,85 @@ impl QuantIsoK4 {
     pub fn try_deep_clone(&self) -> Result<Self> {
         Ok(Self {
             blocks: self.blocks.clone(),
+            // The clone starts CPU-only — see
+            // [`crate::storage::QuantIsoK3::try_deep_clone`].
+            gpu: QuantKGpuRing::default(),
             shape: self.shape.clone(),
             max_seq: self.max_seq,
             bits: self.bits,
         })
     }
 
-    /// Approximate byte footprint.
+    /// Concatenate the accumulated CPU blocks into flat sequence-major
+    /// `(codes, scales, norms)`. See
+    /// [`crate::storage::QuantIsoK3::flatten_blocks`].
+    fn flatten_blocks(&self) -> (Vec<u32>, Vec<f32>, Vec<f32>) {
+        let (n_codes, n_scales, n_norms) = self.blocks.iter().fold((0, 0, 0), |(c, s, n), blk| {
+            (
+                c + blk.codes.len(),
+                s + blk.scales.len(),
+                n + blk.norms.len(),
+            )
+        });
+        let mut codes = Vec::with_capacity(n_codes);
+        let mut scales = Vec::with_capacity(n_scales);
+        let mut norms = Vec::with_capacity(n_norms);
+        for blk in &self.blocks {
+            codes.extend_from_slice(&blk.codes);
+            scales.extend_from_slice(&blk.scales);
+            norms.extend_from_slice(&blk.norms);
+        }
+        (codes, scales, norms)
+    }
+
+    /// Push one GPU-encoded chunk into the GPU ring. Mirror of
+    /// [`crate::storage::QuantIsoK3::gpu_append`] — see it for the contract,
+    /// including why `max_seq` is a parameter and not a field.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`rmlx_core::error::Error::Quant`] when `head_dim` violates the
+    /// group-size invariant, and forwards ring errors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gpu_append(
+        &mut self,
+        codes: &Array,
+        scales: &Array,
+        norms: &Array,
+        kv_h: i32,
+        head_dim: i32,
+        prev_seq: i32,
+        new_seq: i32,
+        max_seq: i32,
+        device: Device,
+    ) -> Result<()> {
+        let n_groups = iso_n_groups_i32(head_dim, "QuantIsoK4::gpu_append")?;
+        if !self.gpu.is_allocated() && prev_seq > 0 {
+            let (c, s, n) = self.flatten_blocks();
+            self.gpu
+                .seed_from_cpu(&c, &s, &n, kv_h, n_groups, prev_seq, max_seq, device)?;
+        }
+        self.gpu.append_encoded(
+            codes, scales, norms, kv_h, n_groups, prev_seq, new_seq, max_seq, device,
+        )
+    }
+
+    /// GPU packed view of the first `kv_seq` positions. Mirror of
+    /// [`crate::storage::QuantIsoK3::gpu_packed_view`].
+    ///
+    /// # Errors
+    ///
+    /// Forwards [`QuantKGpuRing::packed_view`] errors.
+    pub fn gpu_packed_view(
+        &self,
+        kv_seq: i32,
+        device: Device,
+    ) -> Result<Option<(Array, Array, Array)>> {
+        self.gpu.packed_view(kv_seq, device)
+    }
+
+    /// Approximate byte footprint. Includes the GPU ring when live — it is
+    /// real resident memory.
     #[must_use]
     pub fn byte_size(&self) -> usize {
         let mut total = 0usize;
@@ -174,7 +267,7 @@ impl QuantIsoK4 {
             total += blk.quaternions.len() * size_of::<f32>();
             total += blk.norms.len() * size_of::<f32>();
         }
-        total
+        total + self.gpu.byte_size()
     }
 
     /// Dequantize all accumulated K slices into one flat f32 vector.

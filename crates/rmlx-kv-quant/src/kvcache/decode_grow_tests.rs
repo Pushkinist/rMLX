@@ -15,7 +15,7 @@
 //!
 //! # Why the rotor K-only codec
 //!
-//! It is the codec whose ring reports the overflow **loudly** (`RotorGpuK::
+//! It is the codec whose ring reports the overflow **loudly** (`QuantKGpuRing::
 //! append_encoded` errors), so a regression here is unambiguous rather than a
 //! silently short attention prefix. The growth itself is model-agnostic and
 //! lives on the shared storage `max_seq`, not in this codec.
