@@ -319,8 +319,8 @@ same Lloyd-Max 2-bit codebook, encode-side assignment differs):
 
 **Decision**: `K8VTurbo2Tcq` ships as **opt-in only** via
 `--kv-quant k8vturbo2tcq`. Never an auto baseline. CPU encode + CPU dequant
-on the hot path; MSL Viterbi 2-bit kernel (`tcq_v2_msl`) parked as
-future-reference hook.
+on the hot path; the parked MSL Viterbi 2-bit kernel (`tcq_v2_msl`) was
+never wired to a caller, rotted, and was removed rather than repaired.
 
 ## rotor3 smoke + decode-TPS anchor (2026-05-30)
 
