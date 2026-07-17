@@ -149,10 +149,11 @@ fn check_mlx_pin(mlx_prefix: &str, mlx_c_prefix: &str, mlx_version: &str, na_cla
         .and_then(|f| contains_needle(f, NAX_GEMM_KERNEL.as_bytes(), SCAN_CHUNK).ok());
 
     let drift = pin_drift(mlx_version, &mlx_c_version, &pin);
-    // `fast_gemm == None` (metallib unreadable) has nothing concrete to
-    // report either way, so it is folded into "kernels present" here: this
-    // gate's only job is to catch a *confirmed* absence.
-    let level = nax_warning_level(na_class_host, fast_gemm != Some(false));
+    // A confirmed absence (not `None` — an unreadable metallib has nothing
+    // concrete to report) is the only thing that gates both the nax report
+    // and, via `should_report_drift`, the separate pin-drift note.
+    let kernels_missing = fast_gemm == Some(false);
+    let level = nax_warning_level(na_class_host, !kernels_missing);
 
     match level {
         NaxWarningLevel::Loud => {
@@ -168,19 +169,20 @@ fn check_mlx_pin(mlx_prefix: &str, mlx_c_prefix: &str, mlx_version: &str, na_cla
                 println!("cargo:warning={line}");
             }
         }
-        NaxWarningLevel::Silent if drift => {
-            println!(
-                "cargo:warning=MLX pin drift: resolved mlx {mlx_version} + mlx-c {mlx_c_version}, but \
-                 rMLX pins mlx {pin_mlx} + mlx-c {pin_mlx_c} (crates/rmlx-mlx/{PIN_FILE})."
-            );
-            println!(
-                "cargo:warning=  The {NAX_GEMM_KERNEL} kernels the pin exists for are present, so GEMM \
-                 throughput should be unaffected. mlx and mlx-c are ABI-coupled though: an unvalidated \
-                 pair can abort at load with a dyld \"Symbol not found\". If this pair checks out, bump \
-                 both pin lines together. See docs/FFI.md."
-            );
+        NaxWarningLevel::Silent => {
+            if should_report_drift(kernels_missing, drift) {
+                println!(
+                    "cargo:warning=MLX pin drift: resolved mlx {mlx_version} + mlx-c {mlx_c_version}, but \
+                     rMLX pins mlx {pin_mlx} + mlx-c {pin_mlx_c} (crates/rmlx-mlx/{PIN_FILE})."
+                );
+                println!(
+                    "cargo:warning=  The {NAX_GEMM_KERNEL} kernels the pin exists for are present, so GEMM \
+                     throughput should be unaffected. mlx and mlx-c are ABI-coupled though: an unvalidated \
+                     pair can abort at load with a dyld \"Symbol not found\". If this pair checks out, bump \
+                     both pin lines together. See docs/FFI.md."
+                );
+            }
         }
-        NaxWarningLevel::Silent => {}
     }
 }
 

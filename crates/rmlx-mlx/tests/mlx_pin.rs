@@ -222,6 +222,22 @@ fn nax_warning_level_matrix() {
 }
 
 #[test]
+fn should_report_drift_matrix() {
+    // No drift -> never report, regardless of kernel presence.
+    assert!(!should_report_drift(false, false));
+    assert!(!should_report_drift(true, false));
+    // Drift, kernels present -> report (the original, untouched drift note).
+    assert!(should_report_drift(false, true));
+    // Drift, kernels confirmed missing -> stays suppressed on ANY host: this
+    // is the exact regression case. Before NA-class gating existed, a
+    // confirmed absence always took the loud branch and the drift branch was
+    // structurally unreachable underneath it. A non-NA host (macos-14 / M1)
+    // with both a confirmed absence and a version drift must still end up
+    // fully silent, not fall through to a different warning.
+    assert!(!should_report_drift(true, true));
+}
+
+#[test]
 fn ci_m1_runner_with_missing_kernels_stays_silent() {
     // The exact scenario the bug report describes: GitHub's macos-14 runners
     // are M1, which never had a Neural Accelerator, so the metallib

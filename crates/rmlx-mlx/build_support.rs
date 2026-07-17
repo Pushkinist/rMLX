@@ -89,11 +89,6 @@ fn read_mlx_version(src: &str) -> String {
     }
 }
 
-/// Whether `reader` yields `needle` anywhere, scanning in `chunk`-sized reads.
-///
-/// The metallib this scans is ~150 MB, which a build script has no business
-/// holding in memory. `chunk` is a parameter so the carry path — a needle that
-/// straddles two reads — is testable without a 150 MB fixture.
 /// Parse the Apple chip generation number out of a `machdep.cpu.brand_string`
 /// value, e.g. `"Apple M5 Max"` -> `Some(5)`.
 ///
@@ -152,6 +147,23 @@ fn nax_warning_level(na_class_host: bool, kernels_present: bool) -> NaxWarningLe
     }
 }
 
+/// Whether the separate "MLX pin drift" note should print, alongside — not
+/// instead of — the nax-missing-kernel report above.
+///
+/// A confirmed kernel absence takes over the report entirely, on any host:
+/// this mirrors the pre-existing `if kernels_missing { <nax report> } else if
+/// drift { <drift note> }` exclusivity exactly. Without this, gating the
+/// drift note on `NaxWarningLevel` alone would let it fire on a non-NA host
+/// whose kernels are missing — a state that was structurally unreachable
+/// before this file started distinguishing NA-class hosts, and a regression
+/// on the very audience (`macos-14` / M1 CI) this distinguishing exists for:
+/// that build would go from "loud" to "a different warning" instead of
+/// silent. `drift` alone is also stale prose once kernels are confirmed
+/// missing — its text asserts the kernels "are present".
+fn should_report_drift(kernels_missing: bool, drift: bool) -> bool {
+    drift && !kernels_missing
+}
+
 /// Build the loud missing-nax-kernel report lines (each printed by the
 /// caller as its own `cargo:warning=`).
 ///
@@ -207,6 +219,11 @@ fn nax_missing_kernel_lines(
     ]
 }
 
+/// Whether `reader` yields `needle` anywhere, scanning in `chunk`-sized reads.
+///
+/// The metallib this scans is ~150 MB, which a build script has no business
+/// holding in memory. `chunk` is a parameter so the carry path — a needle that
+/// straddles two reads — is testable without a 150 MB fixture.
 fn contains_needle<R: std::io::Read>(
     mut reader: R,
     needle: &[u8],
