@@ -247,6 +247,7 @@ fn seed_ring_via_gpu_append(
 }
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test quant_rotor_k3 -- --ignored --test-threads=1"]
 fn quant_rotor_k3_reset_drops_the_gpu_ring() {
     if crate::test_utils::skip_if_no_gpu_env() {
         return;
@@ -266,6 +267,7 @@ fn quant_rotor_k3_reset_drops_the_gpu_ring() {
 }
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test quant_rotor_k3 -- --ignored --test-threads=1"]
 fn quant_rotor_k3_truncate_to_drops_the_gpu_ring() {
     if crate::test_utils::skip_if_no_gpu_env() {
         return;

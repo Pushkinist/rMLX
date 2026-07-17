@@ -267,17 +267,20 @@ fn run_oracle_masked(
 // ── Oracle: kernel == CPU dequant reference ───────────────────────────────────
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --ignored --test-threads=1"]
 fn rotor3_flash_decode_matches_cpu_dequant_reference() {
     // Bonsai / Qwen3 shape: head_dim 128, GQA 4:1.
     run_oracle(3, 2, 4, 40, 128);
 }
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --ignored --test-threads=1"]
 fn rotor4_flash_decode_matches_cpu_dequant_reference() {
     run_oracle(4, 2, 4, 40, 128);
 }
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --ignored --test-threads=1"]
 fn rotor3_flash_decode_matches_reference_across_tiles() {
     // kv_seq is set above TILE_SIZE so the P2 log-sum-exp merge runs over
     // several tiles rather than a single one.
@@ -285,11 +288,13 @@ fn rotor3_flash_decode_matches_reference_across_tiles() {
 }
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --ignored --test-threads=1"]
 fn rotor4_flash_decode_matches_reference_across_tiles() {
     run_oracle(4, 1, 8, (TILE_SIZE as usize) * 2 + 22, 128);
 }
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --ignored --test-threads=1"]
 fn rotor3_flash_decode_matches_reference_head_dim_512() {
     // Gemma4 e2b/e4b global layers run head_dim = 512 with a single KV head.
     // head_dim % 3 != 0, so the last rotor group is tail-padded.
@@ -297,11 +302,13 @@ fn rotor3_flash_decode_matches_reference_head_dim_512() {
 }
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --ignored --test-threads=1"]
 fn rotor4_flash_decode_matches_reference_head_dim_512() {
     run_oracle(4, 1, 8, 70, 512);
 }
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --ignored --test-threads=1"]
 fn rotor3_flash_decode_matches_reference_head_dim_256() {
     run_oracle(3, 1, 4, 70, 256);
 }
@@ -314,6 +321,7 @@ fn rotor3_flash_decode_matches_reference_head_dim_256() {
 // or mis-strided mask index would pass the whole suite.
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --ignored --test-threads=1"]
 fn rotor3_flash_decode_matches_reference_with_additive_mask() {
     // kv_h=2, heads_per_kv=4 also pins the GQA (q_head -> kv_head) mapping: the
     // mask is indexed by q_head while K is indexed by kv_head, so conflating the
@@ -322,11 +330,13 @@ fn rotor3_flash_decode_matches_reference_with_additive_mask() {
 }
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --ignored --test-threads=1"]
 fn rotor4_flash_decode_matches_reference_with_additive_mask() {
     run_oracle_masked(4, 2, 4, 40, 128, true);
 }
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --ignored --test-threads=1"]
 fn rotor3_flash_decode_matches_reference_with_mask_across_tiles() {
     // Mask + multi-tile: the per-tile online softmax and the P2 merge both have
     // to see the masked scores.
@@ -334,12 +344,15 @@ fn rotor3_flash_decode_matches_reference_with_mask_across_tiles() {
 }
 
 // ── Gates ─────────────────────────────────────────────────────────────────────
+//
+// Every gate below is rejected by a scalar shape check that runs before the
+// dispatcher touches a device-parameterized op, so these pass `Device::Cpu` and
+// stay un-ignored — they are the cheap always-on half of the suite. Handing them
+// `Device::Gpu` would claim a Metal context they never reach and force them
+// behind `--ignored` with the real parity tests.
 
 #[test]
 fn rotor_flash_decode_rejects_non_pow2_head_dim() {
-    if skip_if_no_gpu_env() {
-        return;
-    }
     let dummy = make_f32_array(&[0.0], &[1]);
     let codes = make_u32_array(&[0], &[1]);
     let err = rotor_flash_decode_sdpa::<3>(
@@ -356,7 +369,7 @@ fn rotor_flash_decode_rejects_non_pow2_head_dim() {
         96,
         1,
         1.0,
-        Device::Gpu,
+        Device::Cpu,
     );
     assert!(
         err.is_err(),
@@ -366,9 +379,6 @@ fn rotor_flash_decode_rejects_non_pow2_head_dim() {
 
 #[test]
 fn rotor_flash_decode_rejects_head_dim_above_max() {
-    if skip_if_no_gpu_env() {
-        return;
-    }
     let dummy = make_f32_array(&[0.0], &[1]);
     let codes = make_u32_array(&[0], &[1]);
     let over = ROTOR_FLASH_HEAD_DIM_MAX * 2;
@@ -386,7 +396,7 @@ fn rotor_flash_decode_rejects_head_dim_above_max() {
         over,
         1,
         1.0,
-        Device::Gpu,
+        Device::Cpu,
     );
     assert!(
         err.is_err(),
@@ -396,9 +406,6 @@ fn rotor_flash_decode_rejects_head_dim_above_max() {
 
 #[test]
 fn rotor_flash_decode_rejects_unsupported_bits() {
-    if skip_if_no_gpu_env() {
-        return;
-    }
     let dummy = make_f32_array(&[0.0], &[1]);
     let codes = make_u32_array(&[0], &[1]);
     // An unknown bit width must be an explicit error, never a silent fallback
@@ -417,7 +424,7 @@ fn rotor_flash_decode_rejects_unsupported_bits() {
         128,
         1,
         1.0,
-        Device::Gpu,
+        Device::Cpu,
     );
     assert!(err.is_err(), "BITS=5 must be rejected");
 }
@@ -481,6 +488,7 @@ fn rotor_flash_header_exposes_reusable_decode_fn() {
 // fire") is asserted on cache-local state in
 // `kvcache::rotor_flash_dispatch_tests` instead.
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --ignored --test-threads=1"]
 fn rotor_flash_decode_dispatch_count_increments_on_gpu() {
     if skip_if_no_gpu_env() {
         return;
