@@ -65,8 +65,26 @@ struct DecodeOutcome {
     v_seed_live: bool,
     /// Cache offset after one decode step.
     offset: i32,
-    /// `approx_bytes()` residency estimate after one decode step.
-    approx_bytes: u64,
+    /// `resident_bytes()` residency total after one decode step.
+    resident_bytes: u64,
+}
+
+/// Bytes of the *filled* prefix of a `[B, kv_h, seq, D]` bf16 mirror, computed
+/// straight from the array's own shape and dtype.
+///
+/// The independent restatement is deliberate: it lets the residency asserts
+/// below anchor to the buffers the cache actually holds rather than to a
+/// per-codec bit-width formula, which is precisely the thing that reported a
+/// confident number for memory it was not measuring.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "test helper: decode mirrors are always the 4-D [B, kv_h, seq, D] shape asserted below"
+)]
+fn filled_mirror_bytes(a: &Array, filled: i32) -> u64 {
+    let s = a.shape();
+    assert_eq!(s.len(), 4, "decode mirror must be 4-D [B, kv_h, seq, D]");
+    let per_pos = s[0] as u64 * s[1] as u64 * s[3] as u64 * a.dtype().itemsize() as u64;
+    per_pos * (filled.max(0) as u64).min(s[2] as u64)
 }
 
 /// Drive a cache through prefill (one chunk) → exit_prefill → one decode step.
@@ -94,7 +112,7 @@ fn drive_one_decode(cache: &mut KvCache, device: Device) -> DecodeOutcome {
         k_seed_live: cache.decode_fp16_k_for_test().is_some(),
         v_seed_live: cache.decode_fp16_v_for_test().is_some(),
         offset: cache.offset(),
-        approx_bytes: cache.approx_bytes(),
+        resident_bytes: cache.resident_bytes(),
     }
 }
 
@@ -218,7 +236,7 @@ fn iso_sym3_warm_ttft_freezes_codec() {
 /// never reads the bf16 K seed. The K-seed materialisation is gated on
 /// `KvQuant::feeds_bf16_k_at_decode()`, which is `false` for the K-only family:
 /// the K seed is ABSENT while the V seed stays live, the K codec still
-/// advances one position per decode step, and `approx_bytes` drops by the
+/// advances one position per decode step, and the reported residency drops by the
 /// bf16 K-seed cost. Output is byte-unchanged.
 #[test]
 fn iso_k_only3_quant_at_decode() {
@@ -251,24 +269,21 @@ fn iso_k_only3_quant_at_decode() {
         TEST_PREFILL_SEQ + 1,
         "IsoKOnly3 offset after one decode step"
     );
-    // Residency: exact post-reclaim expectation.
-    //
-    // Formula: kv_bytes + seed_bytes
-    //   seq = TEST_PREFILL_SEQ + 1 = 257
-    //   bhd = 1 * TEST_KV_H * TEST_HEAD_DIM = 8 * 128 = 1024
-    //   k_bits = 3 (IsoKOnly3 K is IsoQuant 3-bit), v_bits = 16 (bf16 V)
-    //   kv_bytes = 257 * 1024 * (3 + 16) / 8 = 625_024
-    //   seed_bytes: k_seed absent, v_seed present →
-    //     257 * 1024 * 2 * 1 = 526_336
-    //   total = 625_024 + 526_336 = 1_151_360
-    //
-    // This assert FAILS if the K seed is still counted (pre-fix total was
-    // 1_151_360 + 526_336 = 1_677_696 — not equal to 1_151_360).
+    // Residency: the total must be exactly the two things this cache really
+    // holds — whatever the iso3 K store allocated, plus the filled prefix of
+    // the surviving bf16 V seed. Anchored to the live buffers, not to a
+    // nominal bit-width: iso3 blocks also carry per-group quaternions, scales
+    // and norms, so a "3 bits per element" figure would not be this cache's
+    // memory. Fails if the absent K seed is counted anyway, if the V seed is
+    // missed, or if either is double-counted.
+    let v_seed = cache
+        .decode_fp16_v_for_test()
+        .expect("V seed is live (asserted above)");
+    let expected = cache.storage().resident_bytes() + filled_mirror_bytes(v_seed, out.offset);
     assert_eq!(
-        out.approx_bytes, 1_151_360,
-        "IsoKOnly3: approx_bytes must equal quantised-K (3-bit) + bf16-V-seed; \
-         got {}",
-        out.approx_bytes,
+        out.resident_bytes, expected,
+        "IsoKOnly3: resident_bytes must equal the iso3 K store plus the bf16 V seed's \
+         filled prefix and nothing else",
     );
 }
 
@@ -301,23 +316,19 @@ fn rotor_k_only3_quant_at_decode() {
         TEST_PREFILL_SEQ + 1,
         "RotorKOnly3 offset after one decode step"
     );
-    // Residency: exact post-reclaim expectation.
-    //
-    // Formula: kv_bytes + seed_bytes
-    //   seq = TEST_PREFILL_SEQ + 1 = 257
-    //   bhd = 1 * TEST_KV_H * TEST_HEAD_DIM = 8 * 128 = 1024
-    //   k_bits = 3 (RotorKOnly3 K is rotor3, 3-bit effective), v_bits = 16 (bf16 V)
-    //   kv_bytes = 257 * 1024 * (3 + 16) / 8 = 625_024
-    //   seed_bytes: k_seed absent, v_seed present →
-    //     257 * 1024 * 2 * 1 = 526_336
-    //   total = 625_024 + 526_336 = 1_151_360
-    //
-    // This assert FAILS if the K seed is still counted (pre-fix total was
-    // 1_151_360 + 526_336 = 1_677_696 — not equal to 1_151_360).
+    // Residency: the total must be exactly the two things this cache really
+    // holds — whatever the rotor3 K store allocated (blocks plus the static
+    // rotor table, and the GPU ring once one is live), plus the filled prefix
+    // of the surviving bf16 V seed. Anchored to the live buffers, not to a
+    // nominal bit-width. Fails if the absent K seed is counted anyway, if the
+    // V seed is missed, or if either is double-counted.
+    let v_seed = cache
+        .decode_fp16_v_for_test()
+        .expect("V seed is live (asserted above)");
+    let expected = cache.storage().resident_bytes() + filled_mirror_bytes(v_seed, out.offset);
     assert_eq!(
-        out.approx_bytes, 1_151_360,
-        "RotorKOnly3: approx_bytes must equal quantised-K (3-bit) + bf16-V-seed; \
-         got {}",
-        out.approx_bytes,
+        out.resident_bytes, expected,
+        "RotorKOnly3: resident_bytes must equal the rotor3 K store plus the bf16 V seed's \
+         filled prefix and nothing else",
     );
 }

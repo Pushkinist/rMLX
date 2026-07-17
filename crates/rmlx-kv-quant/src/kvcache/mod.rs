@@ -27,7 +27,7 @@
 //!   [`KvCache::update_and_sdpa_k8v4_flash`], [`KvCache::update`].
 //! - Lifecycle: [`KvCache::enter_prefill`], [`KvCache::exit_prefill`],
 //!   [`KvCache::reset`], [`KvCache::truncate_to`].
-//! - Diagnostics: [`KvCache::approx_bytes`], [`KvCache::resident_bytes`],
+//! - Diagnostics: [`KvCache::resident_bytes`],
 //!   [`KvCache::offset`], [`KvCache::seq_len`].
 //!
 //! # See also
@@ -52,6 +52,11 @@ mod helpers;
 mod sdpa;
 mod shared_kv;
 mod update;
+
+// The GPU ring of the ring-backed K codecs is counted in resident_bytes.
+#[cfg(test)]
+#[path = "resident_ring_tests.rs"]
+mod resident_ring_tests;
 
 // Warm-TTFT shortcut regression for PlanarK.
 #[cfg(test)]

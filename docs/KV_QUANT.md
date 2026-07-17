@@ -255,16 +255,23 @@ cache-store boundary as **bf16 (400+/400+ prefill+decode store calls, zero f32)*
 and `bf16_param_casts_fp16_to_bf16` (helper-contract gate — RED if `bf16_param`
 stops casting fp16→bf16; loader call sites verified by real-model load proof).
 
-**Byte accounting.** Two methods report KV-cache size:
+**Byte accounting.** One method reports KV-cache size:
 
-- `KvCache::approx_bytes()` — formula-based estimate using stored shape fields.
-  Used for SWA ring sizing and internal shape guards. Can return 0 when shape
-  fields are absent (e.g. before the first prefill).
 - `KvCache::resident_bytes()` — actual on-device allocation: reads the real
   `Array` shape × `dtype.itemsize()` for every GPU buffer, and `Vec.len()`
-  for CPU codec blocks. Covers packed codes, scales, zero-points, and optional
-  rotation/residual buffers. This is the value recorded in `kv_cache_bytes`
-  metrics observations and returned by `rmlx baseline`.
+  for CPU codec blocks. Covers packed codes, scales, zero-points, optional
+  rotation/residual buffers, the GPU rings behind the ring-backed K codecs,
+  and the warm-TTFT bf16 mirrors. This is the value recorded in
+  `kv_cache_bytes` metrics observations, emitted as the `kv_bytes` trace
+  event, used for prompt-cache eviction, and returned by `rmlx baseline`.
+
+Each figure is delegated to the store that owns the buffers
+(`KvStorage::resident_bytes` → per-codec `byte_size`), so it is derived from
+the allocations themselves. There is deliberately **no** second, per-codec
+bits-per-element formula: one existed (`approx_bytes`) and drifted, reporting
+byte-identical totals for `k_iso3` and `k_rotor3` — two codecs with entirely
+different storage — while missing their GPU rings outright. A nominal
+bit-width is not a cache's memory.
 
 ### Per-request hot-swap
 
@@ -2769,10 +2776,16 @@ below `none` (bf16 ≈ 110 TPS). The residual 3.40 µs/KV-token is the flash-dec
 idle. That is shared with `rotor_flash_decode` and is where further work belongs.
 
 **Memory.** The GPU ring is additional resident memory on top of the CPU blocks
-(~8.1 MB/layer vs 23.9 MB of blocks at Bonsai 4k — ~34%). Note the `kv_bytes`
-trace event does **not** show it: `approx_bytes` routes through
-`quant_iso_k3_bytes`, which counts CPU blocks only. Same gap as rotor — the
-ring is only counted by `QuantIsoK3::byte_size`.
+(~8.1 MB/layer vs 23.9 MB of blocks at Bonsai 4k — ~34% on top of the blocks).
+It **is** counted: `KvStorage::resident_bytes` delegates to
+`QuantIsoK3::byte_size`, which sums the CPU blocks and the ring. Same for rotor.
+
+This was not always so. The byte total used to route through a per-codec
+bits-per-element formula that never read the store, so the ring was invisible
+and `k_iso3` and `k_rotor3` reported byte-identical KV. Measured on Bonsai-8B at
+4k, the decode-time `kv_bytes` for `k_iso3` went from 25.3 MB/layer to
+42.9 MB/layer once the total was derived from the allocations — the old figure
+accounted for only 60% of the process's RSS growth, the new one for 99%.
 
 ---
 

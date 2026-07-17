@@ -239,6 +239,30 @@ pub(crate) struct FusedQkShadow {
 }
 
 impl FusedQkShadow {
+    /// Resident bytes of the shadow's head-major K buffers and sidebands.
+    ///
+    /// Counted at full allocation — the shadow is sized to `max_seq` up front.
+    ///
+    /// The exhaustive destructure is the drift guard: a new buffer cannot be
+    /// added to this struct without this failing to compile.
+    pub(crate) fn byte_size(&self) -> u64 {
+        let Self {
+            k_codes,
+            k_scales,
+            sideband_norms,
+            sideband_rotor_table,
+            // Geometry / tags, not allocations.
+            max_seq: _,
+            filled: _,
+            codec: _,
+            layout: _,
+        } = self;
+        crate::bytes::array_bytes(k_codes)
+            + crate::bytes::array_bytes(k_scales)
+            + crate::bytes::opt_array_bytes(sideband_norms.as_ref())
+            + crate::bytes::opt_array_bytes(sideband_rotor_table.as_ref())
+    }
+
     /// Allocate a zero-init shadow for `[B, kv_h, max_seq, *]` plus any
     /// codec-specific sidebands. The rotor table sideband is allocated
     /// **zero-init** here; the dispatch layer seeds it from

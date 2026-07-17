@@ -305,7 +305,7 @@ pub(crate) trait PromptCacheEntry: Sized {
 
     /// Approximate RAM held by this entry's KV/recurrent state, in bytes.
     ///
-    /// Default body sums KV `resident_bytes` plus linear-attn `approx_bytes`
+    /// Default body sums KV `resident_bytes` plus linear-attn `resident_bytes`
     /// (the latter is empty for pure-attention archs). Used by
     /// `PromptCache::stats()` to populate `CacheStats::bytes` and by the
     /// RAM-cap eviction policy in `push`. Best-effort estimate — does not
@@ -318,7 +318,7 @@ pub(crate) trait PromptCacheEntry: Sized {
             + self
                 .lin_caches()
                 .iter()
-                .map(LinearAttnCache::approx_bytes)
+                .map(LinearAttnCache::resident_bytes)
                 .sum::<u64>()
     }
 

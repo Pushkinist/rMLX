@@ -542,7 +542,7 @@ impl KvCache {
                 device,
             )?;
             tracing::trace!(
-                kv_bytes = self.approx_bytes(),
+                kv_bytes = self.resident_bytes(),
                 offset = self.offset,
                 "kv cache bytes"
             );
@@ -561,7 +561,7 @@ impl KvCache {
                 device,
             )?;
             tracing::trace!(
-                kv_bytes = self.approx_bytes(),
+                kv_bytes = self.resident_bytes(),
                 offset = self.offset,
                 "kv cache bytes"
             );
@@ -576,7 +576,7 @@ impl KvCache {
             // Emit kv_bytes event for multi-turn growth tracking.
             // Demoted to trace! (per-layer per-step; opt in via --log verbose).
             tracing::trace!(
-                kv_bytes = self.approx_bytes(),
+                kv_bytes = self.resident_bytes(),
                 offset = self.offset,
                 "kv cache bytes"
             );
@@ -642,7 +642,7 @@ impl KvCache {
             )? {
                 tracing::Span::current().record("path", "planar_k_fused");
                 tracing::trace!(
-                    kv_bytes = self.approx_bytes(),
+                    kv_bytes = self.resident_bytes(),
                     offset = self.offset,
                     "kv cache bytes"
                 );
@@ -684,7 +684,7 @@ impl KvCache {
                 device,
             )? {
                 tracing::trace!(
-                    kv_bytes = self.approx_bytes(),
+                    kv_bytes = self.resident_bytes(),
                     offset = self.offset,
                     "kv cache bytes"
                 );
@@ -720,7 +720,7 @@ impl KvCache {
                 device,
             )? {
                 tracing::trace!(
-                    kv_bytes = self.approx_bytes(),
+                    kv_bytes = self.resident_bytes(),
                     offset = self.offset,
                     "kv cache bytes"
                 );
@@ -735,7 +735,7 @@ impl KvCache {
             tracing::Span::current().record("path", "flash");
             // Demoted to trace! (per-layer per-step; opt in via --log verbose).
             tracing::trace!(
-                kv_bytes = self.approx_bytes(),
+                kv_bytes = self.resident_bytes(),
                 offset = self.offset,
                 "kv cache bytes"
             );
@@ -752,7 +752,7 @@ impl KvCache {
         {
             tracing::Span::current().record("path", "fused_qk");
             tracing::trace!(
-                kv_bytes = self.approx_bytes(),
+                kv_bytes = self.resident_bytes(),
                 offset = self.offset,
                 "kv cache bytes"
             );
@@ -776,7 +776,7 @@ impl KvCache {
         )?;
         // Demoted to trace! (per-layer per-step; opt in via --log verbose).
         tracing::trace!(
-            kv_bytes = self.approx_bytes(),
+            kv_bytes = self.resident_bytes(),
             offset = self.offset,
             "kv cache bytes"
         );

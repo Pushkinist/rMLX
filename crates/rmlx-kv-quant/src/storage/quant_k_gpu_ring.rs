@@ -85,17 +85,29 @@ impl QuantKGpuRing {
         self.capacity = 0;
     }
 
-    /// Approximate resident byte footprint.
+    /// Resident byte footprint of the ring's GPU buffers.
+    ///
+    /// Read from each buffer's real shape × dtype rather than recomputed from
+    /// `capacity × *_per_step`: the buffers are the allocation, the step
+    /// counts are only bookkeeping about it. A ring that grew — or one whose
+    /// codes dtype changed — reports the truth here with nothing to update.
+    ///
+    /// The exhaustive destructure is the drift guard: a new buffer cannot be
+    /// added to this struct without this failing to compile.
     #[must_use]
-    pub fn byte_size(&self) -> usize {
-        if !self.is_allocated() {
-            return 0;
-        }
-        let cap = self.capacity.max(0) as usize;
-        let cps = self.codes_per_step.max(0) as usize;
-        let nps = self.norms_per_step.max(0) as usize;
-        // codes (u32) + scales (f32) + norms (f32).
-        cap * cps * 4 + cap * cps * 4 + cap * nps * 4
+    pub fn byte_size(&self) -> u64 {
+        let Self {
+            codes,
+            scales,
+            norms,
+            // Bookkeeping about the buffers above, not allocations of their own.
+            codes_per_step: _,
+            norms_per_step: _,
+            capacity: _,
+        } = self;
+        crate::bytes::opt_array_bytes(codes.as_ref())
+            + crate::bytes::opt_array_bytes(scales.as_ref())
+            + crate::bytes::opt_array_bytes(norms.as_ref())
     }
 
     /// Append one already-encoded chunk into the ring at `prev_seq`.

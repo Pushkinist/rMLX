@@ -348,20 +348,25 @@ impl QuantIsoK3 {
         self.gpu.packed_view(kv_seq, device)
     }
 
-    /// Approximate byte footprint of the accumulated payload.
+    /// Resident bytes held by this store: CPU blocks plus the GPU ring.
     ///
-    /// Includes the GPU ring when live — it is real resident memory, so
-    /// omitting it would under-report this cache's KV bytes.
+    /// The ring is real resident memory and is counted at its full allocation
+    /// — omitting it under-reports this cache's KV bytes, which is the number
+    /// the codec is judged on.
+    ///
+    /// The exhaustive destructure is the drift guard: a new buffer cannot be
+    /// added to this struct without this failing to compile.
     #[must_use]
-    pub fn byte_size(&self) -> usize {
-        let mut total = 0usize;
-        for blk in &self.blocks {
-            total += blk.codes.len() * size_of::<u32>();
-            total += blk.scales.len() * size_of::<f32>();
-            total += blk.quaternions.len() * size_of::<f32>();
-            total += blk.norms.len() * size_of::<f32>();
-        }
-        total + self.gpu.byte_size()
+    pub fn byte_size(&self) -> u64 {
+        let Self {
+            blocks,
+            gpu,
+            // Geometry / tags, not allocations.
+            shape: _,
+            max_seq: _,
+            bits: _,
+        } = self;
+        blocks.iter().map(IsoBlocks::byte_size).sum::<u64>() + gpu.byte_size()
     }
 
     /// Dequantize all accumulated K slices into one flat f32 vector of length

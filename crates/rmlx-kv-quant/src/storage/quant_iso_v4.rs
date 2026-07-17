@@ -177,17 +177,21 @@ impl QuantIsoV4 {
         })
     }
 
-    /// Approximate byte footprint of the accumulated payload.
+    /// Resident bytes held by this store (CPU blocks; this codec has no GPU
+    /// mirror).
+    ///
+    /// The exhaustive destructure is the drift guard: a new buffer cannot be
+    /// added to this struct without this failing to compile.
     #[must_use]
-    pub fn byte_size(&self) -> usize {
-        let mut total = 0usize;
-        for blk in &self.blocks {
-            total += blk.codes.len() * size_of::<u32>();
-            total += blk.scales.len() * size_of::<f32>();
-            total += blk.quaternions.len() * size_of::<f32>();
-            total += blk.norms.len() * size_of::<f32>();
-        }
-        total
+    pub fn byte_size(&self) -> u64 {
+        let Self {
+            blocks,
+            // Geometry / tags, not allocations.
+            shape: _,
+            max_seq: _,
+            bits: _,
+        } = self;
+        blocks.iter().map(IsoBlocks::byte_size).sum()
     }
 
     /// Dequantize all accumulated V slices into one flat f32 vector of length
