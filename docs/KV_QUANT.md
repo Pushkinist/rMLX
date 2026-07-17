@@ -261,9 +261,9 @@ stops casting fp16→bf16; loader call sites verified by real-model load proof).
   `Array` shape × `dtype.itemsize()` for every GPU buffer, and `Vec.len()`
   for CPU codec blocks. Covers packed codes, scales, zero-points, optional
   rotation/residual buffers, the GPU rings behind the ring-backed K codecs,
-  and the warm-TTFT bf16 mirrors. This is the value recorded in
-  `kv_cache_bytes` metrics observations, emitted as the `kv_bytes` trace
-  event, used for prompt-cache eviction, and returned by `rmlx baseline`.
+  and the warm-TTFT bf16 mirrors. It backs `kv_cache_bytes` observations, the
+  `kv_bytes` event, prompt-cache eviction, and `rmlx baseline`. **Cost is
+  O(blocks)** — call it at request boundaries, not per-layer per-decode-step.
 
 Each figure is delegated to the store that owns the buffers
 (`KvStorage::resident_bytes` → per-codec `byte_size`), so it is derived from
@@ -272,6 +272,22 @@ bits-per-element formula: one existed (`approx_bytes`) and drifted, reporting
 byte-identical totals for `k_iso3` and `k_rotor3` — two codecs with entirely
 different storage — while missing their GPU rings outright. A nominal
 bit-width is not a cache's memory.
+
+**Sample point differs per arch — read `kv_cache_bytes` accordingly.** The
+function is right everywhere; *when* each arch calls it is not yet uniform, so
+the recorded figure does not mean the same thing across the matrix:
+
+| Arch | Sampled | Sees the decode-time GPU ring? |
+|---|---|---|
+| gemma4, qwen3.5-moe | after the decode loop | yes |
+| qwen3 (exact-hit path) | after the decode loop | yes |
+| qwen3 (miss path), qwen2, laguna | at the prefill snapshot, before decode | **no** — no ring exists yet |
+
+So a single-request bench of a ring-backed codec on a pre-decode arch reports
+post-prefill KV, not steady-state decode KV — and `qwen3` reports both,
+depending on which path the request took. Unifying the sample point is tracked
+separately; until then, the ring-backed cells of a pre-decode arch are a lower
+bound.
 
 ### Per-request hot-swap
 

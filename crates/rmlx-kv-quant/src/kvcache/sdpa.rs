@@ -541,11 +541,6 @@ impl KvCache {
                 additive_mask,
                 device,
             )?;
-            tracing::trace!(
-                kv_bytes = self.resident_bytes(),
-                offset = self.offset,
-                "kv cache bytes"
-            );
             return Ok(out);
         }
 
@@ -560,11 +555,6 @@ impl KvCache {
                 additive_mask,
                 device,
             )?;
-            tracing::trace!(
-                kv_bytes = self.resident_bytes(),
-                offset = self.offset,
-                "kv cache bytes"
-            );
             return Ok(out);
         }
 
@@ -573,13 +563,6 @@ impl KvCache {
             tracing::Span::current().record("path", "mixed");
             let out =
                 self.update_and_sdpa_mixed(queries, new_k, new_v, scale, additive_mask, device)?;
-            // Emit kv_bytes event for multi-turn growth tracking.
-            // Demoted to trace! (per-layer per-step; opt in via --log verbose).
-            tracing::trace!(
-                kv_bytes = self.resident_bytes(),
-                offset = self.offset,
-                "kv cache bytes"
-            );
             return Ok(out);
         }
 
@@ -641,11 +624,6 @@ impl KvCache {
                 device,
             )? {
                 tracing::Span::current().record("path", "planar_k_fused");
-                tracing::trace!(
-                    kv_bytes = self.resident_bytes(),
-                    offset = self.offset,
-                    "kv cache bytes"
-                );
                 return Ok(out);
                 // Falls through to legacy when fused path is not yet eligible
                 // (e.g. prefill chunk before any GPU buffer exists, or CPU device).
@@ -683,11 +661,6 @@ impl KvCache {
                 additive_mask,
                 device,
             )? {
-                tracing::trace!(
-                    kv_bytes = self.resident_bytes(),
-                    offset = self.offset,
-                    "kv cache bytes"
-                );
                 return Ok(out);
             }
         }
@@ -719,11 +692,6 @@ impl KvCache {
                 additive_mask,
                 device,
             )? {
-                tracing::trace!(
-                    kv_bytes = self.resident_bytes(),
-                    offset = self.offset,
-                    "kv cache bytes"
-                );
                 return Ok(out);
             }
         }
@@ -733,12 +701,6 @@ impl KvCache {
             self.sdpa_dispatch(queries, new_k, new_v, scale, additive_mask, device)?
         {
             tracing::Span::current().record("path", "flash");
-            // Demoted to trace! (per-layer per-step; opt in via --log verbose).
-            tracing::trace!(
-                kv_bytes = self.resident_bytes(),
-                offset = self.offset,
-                "kv cache bytes"
-            );
             return Ok(out);
         }
 
@@ -751,11 +713,6 @@ impl KvCache {
             self.try_fused_qk_dispatch(queries, new_k, new_v, scale, additive_mask, device)?
         {
             tracing::Span::current().record("path", "fused_qk");
-            tracing::trace!(
-                kv_bytes = self.resident_bytes(),
-                offset = self.offset,
-                "kv cache bytes"
-            );
             return Ok(out);
         }
 
@@ -774,12 +731,6 @@ impl KvCache {
             additive_mask,
             device,
         )?;
-        // Demoted to trace! (per-layer per-step; opt in via --log verbose).
-        tracing::trace!(
-            kv_bytes = self.resident_bytes(),
-            offset = self.offset,
-            "kv cache bytes"
-        );
         Ok(out)
     }
 

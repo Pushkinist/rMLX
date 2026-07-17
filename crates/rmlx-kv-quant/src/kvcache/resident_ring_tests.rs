@@ -10,10 +10,22 @@
 //! are accepted or rejected on, so an invisible allocation silently invalidates
 //! the comparison.
 //!
-//! These tests pin the ring into the total. They assert against the ring's
-//! **own measured size**, never against a restatement of the accounting — a
-//! test that recomputes the formula under test proves only that arithmetic is
-//! deterministic.
+//! # What these prove, and what they do not
+//!
+//! These pin the ring into the total: standing one up must move
+//! `resident_bytes` by at least the ring's own reported size, across both
+//! ring-backed codecs and two contexts. That is the bug that was shipped — a
+//! delta of exactly zero.
+//!
+//! They do **not** validate the ring's *magnitude*. The anchor
+//! (`QuantKGpuRing::byte_size`, via `live_ring_bytes`) is part of the
+//! accounting under test — `QuantIsoK3::byte_size` is literally
+//! `blocks + gpu.byte_size()` — so a ring size that was uniformly wrong by a
+//! constant factor would still pass here. Magnitude is anchored elsewhere, by
+//! independent literals: `kv_cache/tests.rs`
+//! (`resident_bytes_none_quant_is_the_two_bf16_mirrors`,
+//! `ring_bytes_match_independent_geometry` below) and, at the whole-process
+//! level, the RSS cross-check recorded in `docs/KV_QUANT.md`.
 
 use super::KvCache;
 use crate::clifford::make_rotor_table;
@@ -62,6 +74,9 @@ fn ring_backed_cache(quant: KvQuant) -> KvCache {
 }
 
 /// The ring's own byte size, read from the store. `None` when no ring is live.
+///
+/// This is the accounting under test, not an independent oracle — see the
+/// module docs. `ring_bytes_match_independent_geometry` is the oracle.
 #[allow(
     clippy::wildcard_enum_match_arm,
     reason = "only the ring-backed K-only variants carry a ring; every other storage variant correctly reports no live ring"
@@ -75,14 +90,24 @@ fn live_ring_bytes(cache: &KvCache) -> Option<u64> {
     allocated.then_some(bytes)
 }
 
-/// Prefill, then decode until the flash path stands the ring up.
-///
-/// Returns `(bytes_before_ring, bytes_after_ring, ring_bytes)`.
+/// The ring's live capacity, read from its bookkeeping (not from its buffers).
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "only the ring-backed K-only variants carry a ring; every other storage variant has no capacity to report"
+)]
+fn live_ring_capacity(cache: &KvCache) -> Option<i32> {
+    match cache.storage() {
+        KvStorage::IsoKOnly3 { k: Some(ks), .. } if ks.gpu.is_allocated() => Some(ks.gpu.capacity),
+        _ => None,
+    }
+}
+
+/// Prefill `prefill` positions, then take one decode step — which is what
+/// stands the ring up. Returns `resident_bytes` from just before that step.
 #[allow(clippy::expect_used, reason = "test helper: invariants documented")]
-fn bytes_across_ring_allocation(quant: KvQuant, prefill: i32) -> (u64, u64, u64) {
+fn drive_to_ring(cache: &mut KvCache, prefill: i32) -> u64 {
     let device = Device::Gpu;
     let scale = 1.0_f32 / (HEAD_DIM as f32).sqrt();
-    let mut cache = ring_backed_cache(quant);
 
     // Prefill goes through the legacy path: CPU blocks accumulate, no ring yet.
     let pf = (prefill * KV_H * HEAD_DIM) as usize;
@@ -98,8 +123,8 @@ fn bytes_across_ring_allocation(quant: KvQuant, prefill: i32) -> (u64, u64, u64)
     cache.exit_prefill(device).expect("exit_prefill");
 
     assert!(
-        live_ring_bytes(&cache).is_none(),
-        "{quant}: no ring should exist before the first decode dispatch"
+        live_ring_bytes(cache).is_none(),
+        "no ring should exist before the first decode dispatch"
     );
     let before = cache.resident_bytes();
 
@@ -115,7 +140,15 @@ fn bytes_across_ring_allocation(quant: KvQuant, prefill: i32) -> (u64, u64, u64)
         .update_and_sdpa(&q1, &k1, &v1, scale, "", None, device)
         .expect("decode update_and_sdpa");
     out.eval().expect("decode out eval");
+    before
+}
 
+/// Prefill, then decode until the flash path stands the ring up.
+///
+/// Returns `(bytes_before_ring, bytes_after_ring, ring_bytes)`.
+fn bytes_across_ring_allocation(quant: KvQuant, prefill: i32) -> (u64, u64, u64) {
+    let mut cache = ring_backed_cache(quant);
+    let before = drive_to_ring(&mut cache, prefill);
     let ring = live_ring_bytes(&cache).unwrap_or_else(|| {
         panic!("{quant}: decode must stand up the GPU ring — the flash path cannot run without it")
     });
@@ -140,6 +173,44 @@ fn assert_ring_is_counted(quant: KvQuant, prefill: i32) {
         delta >= ring,
         "{quant} @ prefill={prefill}: resident_bytes grew by {delta} B but the ring alone \
          allocated {ring} B — the ring is not being counted (before={before}, after={after})"
+    );
+}
+
+/// The ring's reported size matches its documented layout, derived independently.
+///
+/// This is the magnitude oracle the delta tests deliberately are not. It does
+/// not call `byte_size`'s arithmetic: it rebuilds the total from the layout
+/// `QuantKGpuRing` documents for its three buffers —
+/// `codes: u32[cap * kv_h * n_groups]`, `scales: f32[cap * kv_h * n_groups]`,
+/// `norms: f32[cap * kv_h]`, with iso's `n_groups = head_dim / 4` — and
+/// compares. A dtype or element-count error in the accounting (the 4-vs-8 byte
+/// class) fails here; the delta tests would sail through it.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test resident_ring -- --ignored --test-threads=1"]
+fn ring_bytes_match_independent_geometry() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    let (_, _, reported) = bytes_across_ring_allocation(KvQuant::IsoKOnly3, 256);
+
+    // Rebuild the cache the same way to read its live capacity; the ring is
+    // page-rounded, so the capacity is the one value that must come from it.
+    let mut cache = ring_backed_cache(KvQuant::IsoKOnly3);
+    drive_to_ring(&mut cache, 256);
+    let cap = live_ring_capacity(&cache).expect("iso3 ring must be live after decode") as u64;
+
+    let kv_h = KV_H as u64;
+    let n_groups = HEAD_DIM as u64 / 4; // ISO_QUAT_BLOCK_SIZE
+    let codes = cap * kv_h * n_groups * 4; // u32
+    let scales = cap * kv_h * n_groups * 4; // f32
+    let norms = cap * kv_h * 4; // f32
+    let expected = codes + scales + norms;
+
+    assert_eq!(
+        reported, expected,
+        "iso3 ring reports {reported} B but its documented layout at capacity={cap} \
+         (kv_h={kv_h}, n_groups={n_groups}) is {expected} B \
+         (codes={codes} + scales={scales} + norms={norms})"
     );
 }
 

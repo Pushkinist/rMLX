@@ -2932,6 +2932,14 @@ impl KvCache {
     /// bytes are whatever its store actually allocated, which only the store
     /// can answer.
     ///
+    /// **Cost: O(blocks).** Asking the store is not free — the block-based
+    /// codecs walk a `Vec` that grows by one entry per decode step. Call this
+    /// at request boundaries (as the `kv_bytes` event does), not per-layer
+    /// per-decode-step: that would make a generation quadratic in context.
+    /// Do not "fix" the cost with a cached running counter — a byte total kept
+    /// alongside the buffers instead of read from them is the drifting mirror
+    /// this accounting exists to avoid.
+    ///
     /// Returns 0 when the cache has never been used (`offset == 0` and no
     /// buffers are allocated). Safe to call at any point — no FFI eval, no
     /// data read, no mutation.
@@ -2939,39 +2947,7 @@ impl KvCache {
     /// The exhaustive destructure below is the drift guard: a new buffer cannot
     /// be added to `KvCache` without this failing to compile.
     pub fn resident_bytes(&self) -> u64 {
-        // Helper: bytes of a single Array without FFI eval.
-        #[inline]
-        fn ab(a: &Array) -> u64 {
-            let n: u64 = a.shape().iter().map(|&d| d as u64).product();
-            n * a.dtype().itemsize() as u64
-        }
-
-        // Helper: bytes of the *filled* prefix of a `[B, kv_h, seq, D]` decode
-        // buffer. These per-position mirrors are pre-allocated to the
-        // max-context ceiling (full `max_seq`) and compacted to the filled
-        // length only after `exit_prefill`/decode reclaim — so the same config
-        // reports different totals depending on when the metric is read. Only
-        // `offset` positions ever hold live K/V that decode reads. Counting the
-        // whole ceiling-sized buffer inflates the live-inference KV total and
-        // makes bytes-per-KV-token incomparable across contexts (a run with a
-        // high ceiling reports far more than its active cache). Scale by the
-        // filled length, using each buffer's real per-position size (shape ×
-        // dtype, so per-layer head_dim and dtype are picked up), so the figure
-        // is the KV that serves decode regardless of read timing.
-        #[inline]
-        #[allow(
-            clippy::indexing_slicing,
-            reason = "indices 0..=3 are bounds-checked by the `s.len() != 4` early return above"
-        )]
-        fn filled_seq_bytes(a: &Array, filled: u64) -> u64 {
-            let s = a.shape();
-            if s.len() != 4 {
-                return ab(a);
-            }
-            let per_pos = s[0] as u64 * s[1] as u64 * s[3] as u64 * a.dtype().itemsize() as u64;
-            let cap = s[2] as u64;
-            per_pos * filled.min(cap)
-        }
+        use crate::bytes::{array_bytes, filled_seq_bytes};
 
         // Naming every field is what makes this total drift-proof: a buffer
         // added to `KvCache` cannot slip past the accounting unnoticed, because
@@ -3016,29 +2992,24 @@ impl KvCache {
         }
 
         // 3. Rotating SWA ring buffer (bf16, sized to the sliding window). The
-        //    ring holds at most `window` live positions; early in a sequence
-        //    only `offset` are filled. Both are already ≤ the window allocation.
+        //    ring owns its own byte total: reaching its buffers by field access
+        //    from here would let a buffer added to it go uncounted.
         if let Some(rot) = rotating {
-            if let Some(ref k) = rot.keys {
-                total += filled_seq_bytes(k, offset);
-            }
-            if let Some(ref v) = rot.values {
-                total += filled_seq_bytes(v, offset);
-            }
+            total += rot.byte_size(offset);
         }
 
         // 4. TurboFlash head-major K/V buffers (lazy; only for K8V4 path).
         if let Some(c) = flash_k_codes {
-            total += ab(c);
+            total += array_bytes(c);
         }
         if let Some(s) = flash_k_scales {
-            total += ab(s);
+            total += array_bytes(s);
         }
         if let Some(c) = flash_v_codes {
-            total += ab(c);
+            total += array_bytes(c);
         }
         if let Some(s) = flash_v_scales {
-            total += ab(s);
+            total += array_bytes(s);
         }
 
         // 5. Fused-QK shadow (head-major K shadow for fused-QK MSL kernels).

@@ -151,7 +151,7 @@ impl QuantV {
             max_seq: _,
             use_tcq: _,
         } = self;
-        // `high_precision_indices` is a Vec of per-block Vecs: sum the inner
+        // `high_precision_indices` is a Vec of per-KV-head Vecs: sum the inner
         // payloads, not just the outer Vec's headers.
         let hpi: u64 = high_precision_indices.as_ref().map_or(0, |v| {
             v.iter().map(|inner| crate::bytes::vec_bytes(inner)).sum()

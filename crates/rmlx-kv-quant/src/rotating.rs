@@ -64,6 +64,30 @@ pub(super) struct RotatingState {
 }
 
 impl RotatingState {
+    /// Resident bytes of the SWA ring, counting the filled prefix of each
+    /// buffer.
+    ///
+    /// The ring holds at most `max_size` live positions and is allocated to
+    /// that window; early in a sequence only `filled` of them carry K/V.
+    ///
+    /// The exhaustive destructure is the drift guard: a new buffer cannot be
+    /// added to this struct without this failing to compile. Reaching the ring's
+    /// buffers by field access from the caller would leave a third buffer
+    /// silently uncounted, which is the whole class this accounting closes.
+    pub(super) fn byte_size(&self, filled: u64) -> u64 {
+        let Self {
+            keys,
+            values,
+            // Ring bookkeeping, not allocations.
+            offset: _,
+            max_size: _,
+            keep: _,
+            idx: _,
+        } = self;
+        crate::bytes::opt_filled_seq_bytes(keys.as_ref(), filled)
+            + crate::bytes::opt_filled_seq_bytes(values.as_ref(), filled)
+    }
+
     pub(super) fn new(max_size: i32) -> Self {
         Self {
             keys: None,

@@ -122,8 +122,11 @@ genuine full-length prefill.
 > **these cells have not been re-measured** — treat them as a lower bound, not a
 > reading. Re-capture is tracked separately. Decode-TPS and TTFT in those rows
 > are unaffected (the ring was always allocated; only the metric was blind).
-> All other codecs' KV-MB is unaffected: they allocate no ring, and their bytes
-> were already read from their real buffers.
+> All other codecs' KV-MB is unaffected within this column's reading precision:
+> they allocate no ring, and their bytes already came from their real buffers.
+> The one exception is immaterial — the TurboQuant V store's optional TCQ
+> codebook and calibration indices are now counted too, which is O(100 B)
+> against an MB column.
 
 ---
 

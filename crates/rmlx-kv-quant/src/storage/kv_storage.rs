@@ -1558,6 +1558,12 @@ impl KvStorage {
     /// GPU buffers count their full allocation (rings and mirrors are sized to
     /// capacity, not to the filled prefix) — that is the memory actually held.
     ///
+    /// **Excludes paged-pool overhead.** The `Paged` arm counts the pages the
+    /// slabs hold, not the arena bookkeeping around them. Paged KV
+    /// (`--paged-kv`) is default-OFF, so that overhead is 0 on every normal
+    /// path; if it is ever flipped default-ON, give `PagedKvArena` its own
+    /// `byte_size` and sum it in the `Paged` arm rather than estimating it here.
+    ///
     /// `KvStorage::None` returns **0**: its buffers live on the parent
     /// `KvCache::decode_fp16_k/v` and are counted by `KvCache::resident_bytes`,
     /// which also adds the warm-TTFT fp16 decode seeds for quantized variants.

@@ -76,6 +76,12 @@ struct DecodeOutcome {
 /// below anchor to the buffers the cache actually holds rather than to a
 /// per-codec bit-width formula, which is precisely the thing that reported a
 /// confident number for memory it was not measuring.
+///
+/// Scope: this pins **which buffers are counted** — that the dead K seed is
+/// not, and the live V seed is. The K store's own total is taken from
+/// `KvStorage::resident_bytes`, i.e. from the accounting, so these do not
+/// independently validate the store's magnitude. `resident_ring_tests`
+/// (`ring_bytes_match_independent_geometry`) is where that is checked.
 #[allow(
     clippy::indexing_slicing,
     reason = "test helper: decode mirrors are always the 4-D [B, kv_h, seq, D] shape asserted below"
