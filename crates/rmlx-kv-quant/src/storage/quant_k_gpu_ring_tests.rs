@@ -60,6 +60,7 @@ const CODES_PER_STEP: usize = 4; // kv_h * n_groups = 2 * 2
 const NORMS_PER_STEP: usize = 2; // kv_h
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test quant_k_gpu_ring -- --ignored --test-threads=1"]
 fn new_ring_is_unallocated_and_views_none() {
     if skip_if_no_gpu_env() {
         return;
@@ -75,6 +76,7 @@ fn new_ring_is_unallocated_and_views_none() {
 }
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test quant_k_gpu_ring -- --ignored --test-threads=1"]
 fn append_then_view_round_trips_payload() {
     if skip_if_no_gpu_env() {
         return;
@@ -107,6 +109,7 @@ fn append_then_view_round_trips_payload() {
 }
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test quant_k_gpu_ring -- --ignored --test-threads=1"]
 fn sequential_appends_land_at_increasing_offsets() {
     if skip_if_no_gpu_env() {
         return;
@@ -150,6 +153,7 @@ fn sequential_appends_land_at_increasing_offsets() {
 }
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test quant_k_gpu_ring -- --ignored --test-threads=1"]
 fn seed_from_cpu_then_append_preserves_prefix() {
     if skip_if_no_gpu_env() {
         return;
@@ -211,6 +215,7 @@ fn seed_from_cpu_then_append_preserves_prefix() {
 }
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test quant_k_gpu_ring -- --ignored --test-threads=1"]
 fn seed_is_a_no_op_once_allocated() {
     if skip_if_no_gpu_env() {
         return;
@@ -254,6 +259,7 @@ fn seed_is_a_no_op_once_allocated() {
 }
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test quant_k_gpu_ring -- --ignored --test-threads=1"]
 fn growth_across_a_page_boundary_preserves_prefix() {
     if skip_if_no_gpu_env() {
         return;
@@ -310,6 +316,7 @@ fn growth_across_a_page_boundary_preserves_prefix() {
 }
 
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test quant_k_gpu_ring -- --ignored --test-threads=1"]
 fn clear_drops_the_ring() {
     if skip_if_no_gpu_env() {
         return;
@@ -337,11 +344,23 @@ fn clear_drops_the_ring() {
         .is_none());
 }
 
+// ── Shape guards ─────────────────────────────────────────────────────────────
+//
+// These assert that a malformed append / seed is rejected. None of them needs a
+// Metal context, so they pass `Device::Cpu` and stay un-ignored — the cheap
+// always-on half of the suite.
+//
+// The device argument is **load-bearing in `chunk_length_mismatch_errors`**,
+// not incidental: `prev_seq = 0` on an unallocated ring clears every
+// pre-allocation check, so the ring really does allocate (`alloc` -> `zeros`)
+// and only then does `write_range` catch the length mismatch. Passing
+// `Device::Gpu` there would make that a live Metal allocation and drag the test
+// behind `--ignored`. The other three are rejected before the ring allocates at
+// all: `prev_seq > 0` on an unallocated ring, `prev_seq + new_seq > max_seq`,
+// and the `seed_from_cpu` stride check all return first.
+
 #[test]
 fn append_on_unallocated_ring_with_existing_prefix_errors() {
-    if skip_if_no_gpu_env() {
-        return;
-    }
     // The zeroed-prefix footgun: allocating here and writing only
     // [prev_seq, needed) would leave [0, prev_seq) as zeros — silently wrong
     // attention. Must be rejected rather than "helpfully" allocated.
@@ -355,7 +374,7 @@ fn append_on_unallocated_ring_with_existing_prefix_errors() {
         5, // prev_seq > 0 on an unallocated ring
         1,
         64,
-        Device::Gpu,
+        Device::Cpu,
     );
     assert!(
         err.is_err(),
@@ -370,9 +389,6 @@ fn append_on_unallocated_ring_with_existing_prefix_errors() {
 
 #[test]
 fn append_beyond_max_seq_errors() {
-    if skip_if_no_gpu_env() {
-        return;
-    }
     let mut ring = QuantKGpuRing::default();
     let err = ring.append_encoded(
         &u32_arr(&[1, 2, 3, 4]),
@@ -383,7 +399,7 @@ fn append_beyond_max_seq_errors() {
         8,
         1,
         8, // max_seq — prev_seq + new_seq = 9 > 8
-        Device::Gpu,
+        Device::Cpu,
     );
     assert!(
         err.is_err(),
@@ -393,9 +409,6 @@ fn append_beyond_max_seq_errors() {
 
 #[test]
 fn chunk_length_mismatch_errors() {
-    if skip_if_no_gpu_env() {
-        return;
-    }
     let mut ring = QuantKGpuRing::default();
     // Two positions' worth of codes declared as new_seq = 1.
     let err = ring.append_encoded(
@@ -407,7 +420,7 @@ fn chunk_length_mismatch_errors() {
         0,
         1,
         64,
-        Device::Gpu,
+        Device::Cpu,
     );
     assert!(
         err.is_err(),
@@ -417,9 +430,6 @@ fn chunk_length_mismatch_errors() {
 
 #[test]
 fn seed_length_mismatch_errors() {
-    if skip_if_no_gpu_env() {
-        return;
-    }
     let mut ring = QuantKGpuRing::default();
     let err = ring.seed_from_cpu(
         &[1, 2, 3], // not filled_seq * kv_h * n_groups
@@ -429,7 +439,7 @@ fn seed_length_mismatch_errors() {
         N_GROUPS,
         1,
         64,
-        Device::Gpu,
+        Device::Cpu,
     );
     assert!(
         err.is_err(),

@@ -107,11 +107,49 @@ When env vars are unset, all snapshot-gated tests **skip** with an `[SKIP]` or
 `tracing::warn!` message and report success. The test suite is always green on
 machines without model snapshots (including CI).
 
-GPU-intensive tests are additionally marked `#[ignore]` and must be run
-explicitly:
+---
+
+## Metal-context `#[ignore]` convention (enforced)
+
+A test that drives the GPU is marked `#[ignore]` and run explicitly:
 
 ```bash
 cargo test --test embeddings_smoke -- --ignored --test-threads=1
+cargo test -p rmlx-kv-quant --lib -- --ignored <filter> --test-threads=1
+```
+
+This is a correctness requirement, not a runtime-saving convenience. `cargo
+test` runs a binary's tests on parallel threads, and a shared Metal context
+driven from several of them aborts the **whole process**:
+
+```
+fatal runtime error: Rust cannot catch foreign exceptions, aborting
+```
+
+Every other test in the crate dies with it. The failure is load-dependent — a
+couple of parallel GPU tests can pass for a long time before enough of them
+tip the binary over — and each one still passes when run alone, so a PR's own
+targeted run looks green. That is why the rule is mechanical rather than
+judgement-based.
+
+**Which tests get the attribute:** those that reach `Device::Gpu`, directly or
+through a helper. A guard that only exercises a shape check the dispatcher
+rejects before it touches a device-parameterized op is **not** a GPU test —
+pass it `Device::Cpu` and leave it un-ignored, so it keeps running in the
+default gate. Ignoring a CPU test is how a test silently stops running.
+
+`make check-gpu-tests-ignored` enforces this for `rmlx-kv-quant` and runs in
+`make ci` and in the hosted `source gates` job. It keys on the shape (does the
+test reach `Device::Gpu`?), never on the ignore reason's wording, which varies
+across the crate.
+
+### `#[ignore]` is not a place to park a broken test
+
+An ignored test runs only when someone asks for it, so a real failure can sit
+in the tree indefinitely. Run the ignored suites when touching a codec:
+
+```bash
+cargo test -p rmlx-kv-quant --lib -- --ignored --test-threads=1
 ```
 
 ---

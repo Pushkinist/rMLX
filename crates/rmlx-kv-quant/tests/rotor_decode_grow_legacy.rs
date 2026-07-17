@@ -123,11 +123,13 @@ fn legacy_path_grows(quant: KvQuant, label: &str) {
 }
 
 #[test]
+#[ignore = "GPU Metal context: cargo test -p rmlx-kv-quant --test rotor_decode_grow_legacy -- --ignored --test-threads=1"]
 fn rotor3_legacy_path_decode_grows_past_a_saturated_max_seq() {
     legacy_path_grows(KvQuant::RotorKOnly3, "rotor3");
 }
 
 #[test]
+#[ignore = "GPU Metal context: cargo test -p rmlx-kv-quant --test rotor_decode_grow_legacy -- --ignored --test-threads=1"]
 fn rotor4_legacy_path_decode_grows_past_a_saturated_max_seq() {
     legacy_path_grows(KvQuant::RotorKOnly4, "rotor4");
 }
@@ -136,6 +138,7 @@ fn rotor4_legacy_path_decode_grows_past_a_saturated_max_seq() {
 /// pins that the growth is shape-independent rather than traded from one shape
 /// to another.
 #[test]
+#[ignore = "GPU Metal context: cargo test -p rmlx-kv-quant --test rotor_decode_grow_legacy -- --ignored --test-threads=1"]
 fn rotor3_fused_path_still_grows_at_power_of_two_head_dim() {
     if skip_gpu() {
         return;
