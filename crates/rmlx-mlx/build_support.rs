@@ -89,6 +89,136 @@ fn read_mlx_version(src: &str) -> String {
     }
 }
 
+/// Parse the Apple chip generation number out of a `machdep.cpu.brand_string`
+/// value, e.g. `"Apple M5 Max"` -> `Some(5)`.
+///
+/// `None` covers anything that is not the `"Apple M<n>[ variant]"` shape
+/// Apple Silicon brand strings have used since M1 — an Intel brand string, an
+/// empty one, or a malformed reading. `is_na_class_host` treats that the same
+/// as "not NA-class": a probe that cannot identify the chip has nothing to
+/// assert and must stay quiet rather than guess.
+fn chip_generation(brand_string: &str) -> Option<u32> {
+    let after_m = brand_string.trim().strip_prefix("Apple M")?;
+    let digits: String = after_m.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Whether this host is Neural-Accelerator-class hardware — the GPU matmul
+/// path the `steel_gemm_fused_nax*` kernels exist for.
+///
+/// NA arrived with the M5 generation (macOS; A19 Pro on iOS, out of scope
+/// here since this crate targets macOS only). Do not confuse this with the
+/// Neural *Engine* (ANE): every Mac since M1 has an ANE, and it is unrelated
+/// to this GEMM path — gating on it would make every Mac "NA-class" and
+/// bring back the exact false positive this check exists to remove.
+fn is_na_class_host(brand_string: &str) -> bool {
+    chip_generation(brand_string).is_some_and(|gen| gen >= 5)
+}
+
+/// The two outcomes for the missing-nax-kernel report: shout only where the
+/// absence actually costs the host something.
+#[derive(Debug, PartialEq, Eq)]
+enum NaxWarningLevel {
+    /// Missing kernels cost this host nothing (no Neural Accelerator to feed,
+    /// or they are simply present) — say nothing about it.
+    Silent,
+    /// A Neural-Accelerator-class host is missing the kernels it needs.
+    Loud,
+}
+
+/// Decide whether the missing-nax-kernel report should be loud, given
+/// whether this host would benefit from the kernels and whether the metallib
+/// scan found them.
+///
+/// Pure so the full host x kernel-presence matrix is unit-testable without a
+/// metallib to scan or a real Mac model to probe: kernels present is silent
+/// regardless of host, and a non-NA (or unidentifiable) host is silent even
+/// when kernels are absent — only "NA-class host, confirmed absent" is loud.
+/// This is precisely the case GitHub's `macos-14` (M1) runners hit: kernels
+/// absent, but not NA-class, so silent.
+fn nax_warning_level(na_class_host: bool, kernels_present: bool) -> NaxWarningLevel {
+    if na_class_host && !kernels_present {
+        NaxWarningLevel::Loud
+    } else {
+        NaxWarningLevel::Silent
+    }
+}
+
+/// Whether the separate "MLX pin drift" note should print, alongside — not
+/// instead of — the nax-missing-kernel report above.
+///
+/// A confirmed kernel absence takes over the report entirely, on any host:
+/// this mirrors the pre-existing `if kernels_missing { <nax report> } else if
+/// drift { <drift note> }` exclusivity exactly. Without this, gating the
+/// drift note on `NaxWarningLevel` alone would let it fire on a non-NA host
+/// whose kernels are missing — a state that was structurally unreachable
+/// before this file started distinguishing NA-class hosts, and a regression
+/// on the very audience (`macos-14` / M1 CI) this distinguishing exists for:
+/// that build would go from "loud" to "a different warning" instead of
+/// silent. `drift` alone is also stale prose once kernels are confirmed
+/// missing — its text asserts the kernels "are present".
+fn should_report_drift(kernels_missing: bool, drift: bool) -> bool {
+    drift && !kernels_missing
+}
+
+/// Build the loud missing-nax-kernel report lines (each printed by the
+/// caller as its own `cargo:warning=`).
+///
+/// Pure: takes everything it needs to render, so the exact text — including
+/// that it never asserts a property of a bottle it did not inspect — is
+/// covered by tests without a real metallib or Homebrew install. Every claim
+/// here is scoped to `mlx_prefix`'s own metallib, the one the scan just
+/// read; it must never assert what the pinned pair's bottle contains in the
+/// abstract, since that bottle was not the one inspected.
+fn nax_missing_kernel_lines(
+    mlx_prefix: &str,
+    mlx_version: &str,
+    mlx_c_version: &str,
+    pin: &MlxPin,
+    kernel: &str,
+    pin_file_display: &str,
+) -> Vec<String> {
+    vec![
+        format!(
+            "MLX at {mlx_prefix} (mlx {mlx_version}, mlx-c {mlx_c_version}) ships no {kernel} \
+             kernels in lib/mlx.metallib."
+        ),
+        format!(
+            "  Those are the Neural-Accelerator GEMM path, and this is Neural-Accelerator-class \
+             hardware: without them GPU matmul throughput measured ~3.8x lower and prefill \
+             2.2-3.7x slower. Decode is bandwidth-bound and looks normal, so the symptom mimics \
+             a model-code defect."
+        ),
+        format!(
+            "  rMLX validates against mlx {} + mlx-c {}: on the bottle that pair was checked \
+             against, the kernels were present, but bottle contents vary by build runner — the \
+             version pin alone does not guarantee this or any other bottle carries them. Only \
+             the metallib scan above does. Some Homebrew bottles omit the family entirely; a \
+             non-bottle build of the same version can be fine.",
+            pin.mlx, pin.mlx_c
+        ),
+        "  Fix (Homebrew; both kegs must already be in the Cellar — check with \
+         `ls /opt/homebrew/Cellar/mlx`):"
+            .to_owned(),
+        format!(
+            "    ln -sfn ../Cellar/mlx/{} /opt/homebrew/opt/mlx && ln -sfn \
+             ../Cellar/mlx-c/{} /opt/homebrew/opt/mlx-c && brew pin mlx mlx-c && cargo \
+             clean -p rmlx-mlx",
+            pin.mlx, pin.mlx_c
+        ),
+        format!(
+            "  Repoint both: mlx and mlx-c are ABI-coupled and a mismatched pair aborts at load. \
+             The `cargo clean` is required, not tidiness: repointing to an older keg moves file \
+             times backwards, and cargo only re-runs a build script for a *newer* one — so a \
+             plain rebuild would silently keep these stale bindings. Pin: {pin_file_display}; \
+             rationale and un-pin steps: docs/FFI.md."
+        ),
+    ]
+}
+
 /// Whether `reader` yields `needle` anywhere, scanning in `chunk`-sized reads.
 ///
 /// The metallib this scans is ~150 MB, which a build script has no business
