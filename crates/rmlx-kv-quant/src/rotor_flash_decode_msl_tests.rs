@@ -267,20 +267,20 @@ fn run_oracle_masked(
 // ── Oracle: kernel == CPU dequant reference ───────────────────────────────────
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --ignored --test-threads=1"]
 fn rotor3_flash_decode_matches_cpu_dequant_reference() {
     // Bonsai / Qwen3 shape: head_dim 128, GQA 4:1.
     run_oracle(3, 2, 4, 40, 128);
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --ignored --test-threads=1"]
 fn rotor4_flash_decode_matches_cpu_dequant_reference() {
     run_oracle(4, 2, 4, 40, 128);
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --ignored --test-threads=1"]
 fn rotor3_flash_decode_matches_reference_across_tiles() {
     // kv_seq is set above TILE_SIZE so the P2 log-sum-exp merge runs over
     // several tiles rather than a single one.
@@ -288,13 +288,13 @@ fn rotor3_flash_decode_matches_reference_across_tiles() {
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --ignored --test-threads=1"]
 fn rotor4_flash_decode_matches_reference_across_tiles() {
     run_oracle(4, 1, 8, (TILE_SIZE as usize) * 2 + 22, 128);
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --ignored --test-threads=1"]
 fn rotor3_flash_decode_matches_reference_head_dim_512() {
     // Gemma4 e2b/e4b global layers run head_dim = 512 with a single KV head.
     // head_dim % 3 != 0, so the last rotor group is tail-padded.
@@ -302,13 +302,13 @@ fn rotor3_flash_decode_matches_reference_head_dim_512() {
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --ignored --test-threads=1"]
 fn rotor4_flash_decode_matches_reference_head_dim_512() {
     run_oracle(4, 1, 8, 70, 512);
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --ignored --test-threads=1"]
 fn rotor3_flash_decode_matches_reference_head_dim_256() {
     run_oracle(3, 1, 4, 70, 256);
 }
@@ -321,7 +321,7 @@ fn rotor3_flash_decode_matches_reference_head_dim_256() {
 // or mis-strided mask index would pass the whole suite.
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --ignored --test-threads=1"]
 fn rotor3_flash_decode_matches_reference_with_additive_mask() {
     // kv_h=2, heads_per_kv=4 also pins the GQA (q_head -> kv_head) mapping: the
     // mask is indexed by q_head while K is indexed by kv_head, so conflating the
@@ -330,13 +330,13 @@ fn rotor3_flash_decode_matches_reference_with_additive_mask() {
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --ignored --test-threads=1"]
 fn rotor4_flash_decode_matches_reference_with_additive_mask() {
     run_oracle_masked(4, 2, 4, 40, 128, true);
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --ignored --test-threads=1"]
 fn rotor3_flash_decode_matches_reference_with_mask_across_tiles() {
     // Mask + multi-tile: the per-tile online softmax and the P2 merge both have
     // to see the masked scores.
@@ -488,7 +488,7 @@ fn rotor_flash_header_exposes_reusable_decode_fn() {
 // fire") is asserted on cache-local state in
 // `kvcache::rotor_flash_dispatch_tests` instead.
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_decode -- --ignored --test-threads=1"]
 fn rotor_flash_decode_dispatch_count_increments_on_gpu() {
     if skip_if_no_gpu_env() {
         return;

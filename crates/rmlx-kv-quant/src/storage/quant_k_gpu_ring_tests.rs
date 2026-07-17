@@ -60,7 +60,7 @@ const CODES_PER_STEP: usize = 4; // kv_h * n_groups = 2 * 2
 const NORMS_PER_STEP: usize = 2; // kv_h
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test quant_k_gpu_ring -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test quant_k_gpu_ring -- --ignored --test-threads=1"]
 fn new_ring_is_unallocated_and_views_none() {
     if skip_if_no_gpu_env() {
         return;
@@ -76,7 +76,7 @@ fn new_ring_is_unallocated_and_views_none() {
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test quant_k_gpu_ring -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test quant_k_gpu_ring -- --ignored --test-threads=1"]
 fn append_then_view_round_trips_payload() {
     if skip_if_no_gpu_env() {
         return;
@@ -109,7 +109,7 @@ fn append_then_view_round_trips_payload() {
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test quant_k_gpu_ring -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test quant_k_gpu_ring -- --ignored --test-threads=1"]
 fn sequential_appends_land_at_increasing_offsets() {
     if skip_if_no_gpu_env() {
         return;
@@ -153,7 +153,7 @@ fn sequential_appends_land_at_increasing_offsets() {
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test quant_k_gpu_ring -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test quant_k_gpu_ring -- --ignored --test-threads=1"]
 fn seed_from_cpu_then_append_preserves_prefix() {
     if skip_if_no_gpu_env() {
         return;
@@ -215,7 +215,7 @@ fn seed_from_cpu_then_append_preserves_prefix() {
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test quant_k_gpu_ring -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test quant_k_gpu_ring -- --ignored --test-threads=1"]
 fn seed_is_a_no_op_once_allocated() {
     if skip_if_no_gpu_env() {
         return;
@@ -259,7 +259,7 @@ fn seed_is_a_no_op_once_allocated() {
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test quant_k_gpu_ring -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test quant_k_gpu_ring -- --ignored --test-threads=1"]
 fn growth_across_a_page_boundary_preserves_prefix() {
     if skip_if_no_gpu_env() {
         return;
@@ -316,7 +316,7 @@ fn growth_across_a_page_boundary_preserves_prefix() {
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test quant_k_gpu_ring -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test quant_k_gpu_ring -- --ignored --test-threads=1"]
 fn clear_drops_the_ring() {
     if skip_if_no_gpu_env() {
         return;
@@ -346,11 +346,18 @@ fn clear_drops_the_ring() {
 
 // ── Shape guards ─────────────────────────────────────────────────────────────
 //
-// Every guard below is rejected by a scalar shape check that runs before the
-// ring allocates or writes, so these pass `Device::Cpu` and stay un-ignored —
-// they are the cheap always-on half of the suite. Handing them `Device::Gpu`
-// would claim a Metal context they never reach and force them behind
-// `--ignored` with the tests that do.
+// These assert that a malformed append / seed is rejected. None of them needs a
+// Metal context, so they pass `Device::Cpu` and stay un-ignored — the cheap
+// always-on half of the suite.
+//
+// The device argument is **load-bearing in `chunk_length_mismatch_errors`**,
+// not incidental: `prev_seq = 0` on an unallocated ring clears every
+// pre-allocation check, so the ring really does allocate (`alloc` -> `zeros`)
+// and only then does `write_range` catch the length mismatch. Passing
+// `Device::Gpu` there would make that a live Metal allocation and drag the test
+// behind `--ignored`. The other three are rejected before the ring allocates at
+// all: `prev_seq > 0` on an unallocated ring, `prev_seq + new_seq > max_seq`,
+// and the `seed_from_cpu` stride check all return first.
 
 #[test]
 fn append_on_unallocated_ring_with_existing_prefix_errors() {

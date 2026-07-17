@@ -85,7 +85,7 @@ fn ref_weighted_sum(
 /// Two sparse token positions per head: prob=0.5 and prob=0.5.
 /// All other probs = 0 (skipped). Expected acc = 0.5 * 0.5 + 0.5 * 0.5 = 0.5.
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test sparse_v_msl -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test sparse_v_msl -- --ignored --test-threads=1"]
 #[allow(
     clippy::expect_used,
     reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
@@ -162,7 +162,7 @@ fn test_sparse_v_basic_8bit() {
 
 /// Test: 4-bit, compare GPU kernel against reference CPU for 2 KV heads.
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test sparse_v_msl -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test sparse_v_msl -- --ignored --test-threads=1"]
 #[allow(
     clippy::expect_used,
     reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"

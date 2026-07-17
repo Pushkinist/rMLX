@@ -252,7 +252,7 @@ fn saturated_prompt_decodes(quant: KvQuant, label: &str) {
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test decode_grow -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test decode_grow -- --ignored --test-threads=1"]
 fn rotor3_decode_grows_past_a_saturated_max_seq() {
     if skip_if_no_gpu_env() {
         return;
@@ -261,7 +261,7 @@ fn rotor3_decode_grows_past_a_saturated_max_seq() {
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test decode_grow -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test decode_grow -- --ignored --test-threads=1"]
 fn rotor4_decode_grows_past_a_saturated_max_seq() {
     if skip_if_no_gpu_env() {
         return;
@@ -274,7 +274,7 @@ fn rotor4_decode_grows_past_a_saturated_max_seq() {
 /// The incidental headroom (here 6 tokens) is what made this look healthy on a
 /// short generation: the bound only bites once generation outruns it.
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test decode_grow -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test decode_grow -- --ignored --test-threads=1"]
 fn rotor3_decode_grows_across_the_boundary_from_just_under() {
     if skip_if_no_gpu_env() {
         return;
@@ -295,7 +295,7 @@ fn rotor3_decode_grows_across_the_boundary_from_just_under() {
 /// The backstop matters as much as the growth: a request that genuinely cannot
 /// fit the configured context must be rejected, never quietly truncated.
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test decode_grow -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test decode_grow -- --ignored --test-threads=1"]
 fn decode_past_the_ceiling_errors_loudly() {
     if skip_if_no_gpu_env() {
         return;
@@ -326,7 +326,7 @@ fn decode_past_the_ceiling_errors_loudly() {
 /// (`sqrt(sum(x^2))`, un-quantised), so it is the one checked here: a dropped
 /// append reads back as `0.0` against a re-encode that never is.
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test decode_grow -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test decode_grow -- --ignored --test-threads=1"]
 fn decode_past_max_seq_lands_every_append_in_the_ring() {
     if skip_if_no_gpu_env() {
         return;

@@ -42,8 +42,8 @@ jobs:
     # is a `cargo test --workspace` that this workflow never runs. The check is
     # static (bash + awk over the checked-in sources), needs neither a Rust
     # toolchain, mlx-c, nor a GPU, so it stays seconds-long and reports as its
-    # own named check.
-    runs-on: macos-latest
+    # own named check — and runs on Linux, which bills at a tenth of macOS.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: GPU-touching tests carry the Metal-context #[ignore]

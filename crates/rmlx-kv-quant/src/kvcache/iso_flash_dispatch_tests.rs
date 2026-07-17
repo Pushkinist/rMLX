@@ -139,7 +139,7 @@ fn run_decode_steps(
 // ── The kernel is reached from the production entry point ─────────────────────
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_dispatch -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_dispatch -- --ignored --test-threads=1"]
 fn iso_k_only_3_decode_dispatches_flash_kernel() {
     if skip_if_no_gpu_env() {
         return;
@@ -155,7 +155,7 @@ fn iso_k_only_3_decode_dispatches_flash_kernel() {
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_dispatch -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_dispatch -- --ignored --test-threads=1"]
 fn iso_k_only_4_decode_dispatches_flash_kernel() {
     if skip_if_no_gpu_env() {
         return;
@@ -170,7 +170,7 @@ fn iso_k_only_4_decode_dispatches_flash_kernel() {
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_dispatch -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_dispatch -- --ignored --test-threads=1"]
 fn iso_k_only_decode_dispatches_across_a_tile_boundary() {
     if skip_if_no_gpu_env() {
         return;
@@ -186,7 +186,7 @@ fn iso_k_only_decode_dispatches_across_a_tile_boundary() {
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_dispatch -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_dispatch -- --ignored --test-threads=1"]
 fn iso_k_only_decode_dispatches_at_head_dim_256() {
     if skip_if_no_gpu_env() {
         return;
@@ -235,7 +235,7 @@ fn batched_ring_feed_is_skipped(quant: KvQuant, bits_label: &str) {
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_dispatch -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_dispatch -- --ignored --test-threads=1"]
 fn iso3_batched_gpu_append_skips_the_ring_instead_of_erroring() {
     if skip_if_no_gpu_env() {
         return;
@@ -244,7 +244,7 @@ fn iso3_batched_gpu_append_skips_the_ring_instead_of_erroring() {
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_dispatch -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_dispatch -- --ignored --test-threads=1"]
 fn iso4_batched_gpu_append_skips_the_ring_instead_of_erroring() {
     if skip_if_no_gpu_env() {
         return;
@@ -313,7 +313,7 @@ fn cpu_append_drops_a_live_ring(quant: KvQuant, bits_label: &str) {
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_dispatch -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_dispatch -- --ignored --test-threads=1"]
 fn iso3_cpu_append_drops_a_live_gpu_ring() {
     if skip_if_no_gpu_env() {
         return;
@@ -322,7 +322,7 @@ fn iso3_cpu_append_drops_a_live_gpu_ring() {
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_dispatch -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_dispatch -- --ignored --test-threads=1"]
 fn iso4_cpu_append_drops_a_live_gpu_ring() {
     if skip_if_no_gpu_env() {
         return;

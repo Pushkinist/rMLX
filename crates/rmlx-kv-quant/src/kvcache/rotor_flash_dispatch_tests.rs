@@ -155,7 +155,7 @@ fn run_decode_steps(
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_dispatch -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_dispatch -- --ignored --test-threads=1"]
 fn rotor_k_only_3_decode_dispatches_flash_kernel() {
     if skip_if_no_gpu_env() {
         return;
@@ -172,7 +172,7 @@ fn rotor_k_only_3_decode_dispatches_flash_kernel() {
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_dispatch -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_dispatch -- --ignored --test-threads=1"]
 fn rotor_k_only_4_decode_dispatches_flash_kernel() {
     if skip_if_no_gpu_env() {
         return;
@@ -187,7 +187,7 @@ fn rotor_k_only_4_decode_dispatches_flash_kernel() {
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_dispatch -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_dispatch -- --ignored --test-threads=1"]
 fn rotor_k_only_decode_dispatches_across_a_tile_boundary() {
     if skip_if_no_gpu_env() {
         return;
@@ -203,7 +203,7 @@ fn rotor_k_only_decode_dispatches_across_a_tile_boundary() {
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_dispatch -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_dispatch -- --ignored --test-threads=1"]
 fn rotor_k_only_decode_dispatches_at_head_dim_256() {
     if skip_if_no_gpu_env() {
         return;
@@ -263,7 +263,7 @@ fn batched_ring_feed_is_skipped(quant: KvQuant, bits_label: &str) {
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_dispatch -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_dispatch -- --ignored --test-threads=1"]
 fn rotor3_batched_gpu_append_skips_the_ring_instead_of_erroring() {
     if skip_if_no_gpu_env() {
         return;
@@ -272,7 +272,7 @@ fn rotor3_batched_gpu_append_skips_the_ring_instead_of_erroring() {
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_dispatch -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_dispatch -- --ignored --test-threads=1"]
 fn rotor4_batched_gpu_append_skips_the_ring_instead_of_erroring() {
     if skip_if_no_gpu_env() {
         return;
@@ -281,7 +281,7 @@ fn rotor4_batched_gpu_append_skips_the_ring_instead_of_erroring() {
 }
 
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_dispatch -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_dispatch -- --ignored --test-threads=1"]
 fn rotor_k_only_decode_stays_cpu_when_store_carries_qjl() {
     if skip_if_no_gpu_env() {
         return;

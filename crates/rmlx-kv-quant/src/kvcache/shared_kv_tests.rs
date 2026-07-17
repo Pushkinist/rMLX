@@ -106,7 +106,7 @@ fn producer_decode_step(cache: &mut KvCache, step: u64) -> SharedKv {
 /// and every step fell through to `update()`'s O(seq) CPU dequant, so the
 /// dispatch delta was 0 no matter what the codec supported.
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test shared_kv -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test shared_kv -- --ignored --test-threads=1"]
 fn shared_source_producer_dispatches_flash_kernel() {
     if skip_if_no_gpu_env() {
         return;
@@ -132,7 +132,7 @@ fn shared_source_producer_dispatches_flash_kernel() {
 /// A consumer attends the producer's store through the same kernel — the
 /// producer never materialises bf16 K/V on its behalf.
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test shared_kv -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test shared_kv -- --ignored --test-threads=1"]
 fn shared_consumer_attends_store_through_flash_kernel() {
     if skip_if_no_gpu_env() {
         return;
@@ -168,7 +168,7 @@ fn shared_consumer_attends_store_through_flash_kernel() {
 /// The consumer's mask is sized from the **producer's** K length. A store-backed
 /// share must report exactly what a bf16 share's `k.shape()[2]` would have.
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test shared_kv -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test shared_kv -- --ignored --test-threads=1"]
 fn store_share_kv_len_tracks_producer_offset() {
     if skip_if_no_gpu_env() {
         return;
@@ -197,7 +197,7 @@ fn store_share_kv_len_tracks_producer_offset() {
 /// production shape — the other tests here push F32 K/V, which would hide the
 /// bug (F32 K matches an F32 V by accident).
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test shared_kv -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test shared_kv -- --ignored --test-threads=1"]
 #[allow(
     clippy::indexing_slicing,
     reason = "test asserts on a known rank-4 shape"
@@ -271,7 +271,7 @@ fn materialise_casts_k_to_the_stream_dtype() {
 /// directions against a live store — stubbing the guard to `Ok(())` must turn
 /// this red.
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test shared_kv -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test shared_kv -- --ignored --test-threads=1"]
 fn store_share_refuses_length_desync_against_live_store() {
     if skip_if_no_gpu_env() {
         return;
@@ -340,7 +340,7 @@ fn store_share_refuses_missing_producer_and_wrong_codec() {
 /// `KvQuant::None` keeps the bf16 contract: the share is the stored tensors and
 /// consumers read them exactly as before.
 #[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test shared_kv -- --include-ignored --test-threads=1"]
+#[ignore = "GPU Metal context — run in isolation: cargo test shared_kv -- --ignored --test-threads=1"]
 fn none_quant_shares_bf16_unchanged() {
     if skip_if_no_gpu_env() {
         return;
