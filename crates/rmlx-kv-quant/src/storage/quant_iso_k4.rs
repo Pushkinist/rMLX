@@ -23,8 +23,12 @@ use super::QuantKGpuRing;
 /// Bit-width of the iso4 K codec (fixed at 4-bit).
 pub const ISO_K4_BITS: u8 = 4;
 
-/// Quaternion-block size for the iso4 K codec (fixed at 4 elements/group).
-pub const ISO_K4_GROUP_SIZE: usize = 4;
+/// Quaternion-block size for the iso4 K codec. Alias of
+/// [`crate::storage::ISO_QUAT_BLOCK_SIZE`] — one quaternion per group is fixed
+/// by the algebra, not chosen per bit width, and defining it from the shared
+/// constant is what stops this store's CPU blocks drifting away from the ring
+/// stride its GPU paths derive via `iso_n_groups_for`.
+pub const ISO_K4_GROUP_SIZE: usize = crate::storage::ISO_QUAT_BLOCK_SIZE;
 
 /// Accumulated IsoQuant K cache (4-bit, quaternion SO(4) fast mode).
 ///
@@ -106,6 +110,10 @@ impl QuantIsoK4 {
             norms,
             n_tokens: n_tokens_total,
         });
+
+        // A CPU append does not touch the GPU ring, so any live ring is now a
+        // stale prefix. Drop it; the next `gpu_append` re-seeds from `blocks`.
+        self.gpu.clear();
 
         if self.shape.len() != 4 || self.shape[0] == 0 {
             self.shape = new_shape.to_vec();

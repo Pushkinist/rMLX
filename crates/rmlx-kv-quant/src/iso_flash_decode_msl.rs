@@ -111,7 +111,7 @@ use rmlx_mlx::metal_kernel::{MetalKernel, MetalKernelInvoke};
 use rmlx_mlx::{Array, Device, Dtype};
 
 use crate::isoquant::FIXED_QUAT;
-use crate::storage::{iso_n_groups_for, ISO_K3_GROUP_SIZE};
+use crate::storage::{iso_n_groups_for, ISO_QUAT_BLOCK_SIZE};
 use crate::turboquant::lloyd_gaussian_codebook;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -139,19 +139,28 @@ static ISO4_FLASH_DECODE_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 
 /// Process-lifetime count of iso3 flash-decode P1 dispatches.
 ///
-/// Tests assert `delta > 0` to prove the MSL kernel actually fired rather than
-/// the caller silently falling back to the CPU dequant path. Production code
-/// does not consult this counter.
+/// The per-width breakdown of [`iso_flash_decode_dispatch_count`], for a caller
+/// that needs to tell the two apart. Production code does not consult it.
 pub fn iso3_flash_decode_dispatch_count() -> u64 {
     ISO3_FLASH_DECODE_DISPATCHES.load(Ordering::Relaxed)
 }
 
-/// Process-lifetime count of iso4 flash-decode P1 dispatches.
+/// Process-lifetime count of iso4 flash-decode P1 dispatches. See
+/// [`iso3_flash_decode_dispatch_count`].
 pub fn iso4_flash_decode_dispatch_count() -> u64 {
     ISO4_FLASH_DECODE_DISPATCHES.load(Ordering::Relaxed)
 }
 
 /// Combined process-lifetime count (3-bit + 4-bit).
+///
+/// `kvcache::iso_flash_dispatch_tests` asserts a positive delta across decode
+/// steps to prove the MSL kernel actually fired, rather than the caller silently
+/// falling back to the CPU dequant path this kernel exists to remove.
+///
+/// The counter is process-global, so a concurrent test can only ever *inflate* a
+/// delta: `>=` assertions on it are race-free, `== 0` ones are not. For the
+/// negative case assert on the cache's own ring instead (the flash path cannot
+/// run without it). Production code does not consult this counter.
 pub fn iso_flash_decode_dispatch_count() -> u64 {
     iso3_flash_decode_dispatch_count() + iso4_flash_decode_dispatch_count()
 }
@@ -175,7 +184,7 @@ pub fn iso_flash_decode_dispatch_count() -> u64 {
 /// codec's `R̃ * mv * R` sandwich is a different algebra; do not cross the two.)
 fn render_decode_fn() -> String {
     // Bound to a local so the group size is an inline `{gs}` capture below.
-    let gs = ISO_K3_GROUP_SIZE;
+    let gs = ISO_QUAT_BLOCK_SIZE;
     let mut s = String::new();
     let _ = write!(
         s,
@@ -504,10 +513,10 @@ pub fn iso_flash_decode_sdpa<const BITS: u8>(
              to support it"
         )));
     }
-    if !(head_dim as usize).is_multiple_of(ISO_K3_GROUP_SIZE) {
+    if !(head_dim as usize).is_multiple_of(ISO_QUAT_BLOCK_SIZE) {
         return Err(Error::Quant(format!(
             "iso_flash_decode: head_dim={head_dim} must be a multiple of the quaternion \
-             block size {ISO_K3_GROUP_SIZE}"
+             block size {ISO_QUAT_BLOCK_SIZE}"
         )));
     }
     if heads_per_kv <= 0 {

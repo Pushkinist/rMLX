@@ -18,7 +18,7 @@ use crate::planar_flash_decode_msl::{planar_flash_decode_enabled, planar_flash_d
 use crate::planar_fused_qk::planar_fused_qk_enabled;
 use crate::planar_fused_qk_msl::planar_fused_qk;
 use crate::rotor_flash_decode_msl::{rotor_flash_decode_sdpa, ROTOR_FLASH_HEAD_DIM_MAX};
-use crate::storage::{KvStorage, ISO_K3_GROUP_SIZE};
+use crate::storage::{KvStorage, ISO_QUAT_BLOCK_SIZE};
 
 use super::helpers::{f32_vec_to_array, storage_variant_name};
 use super::shared_kv::SharedKv;
@@ -2213,7 +2213,7 @@ impl KvCache {
         }
         // One quaternion block per group — a partial trailing group has no
         // defined decode.
-        if !(head_dim as usize).is_multiple_of(ISO_K3_GROUP_SIZE) {
+        if !(head_dim as usize).is_multiple_of(ISO_QUAT_BLOCK_SIZE) {
             return false;
         }
         // Tree reduction over `head_dim` threads.

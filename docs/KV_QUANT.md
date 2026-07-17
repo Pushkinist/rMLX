@@ -2736,12 +2736,17 @@ sha256. Every `after` cell carries a positive dispatch witness
 
 | Model | Codec | ctx (real tok) | Before | After | Gain |
 |---|---|---|---|---|---|
-| Bonsai-8B (Qwen3, D=128) | `k_iso3` | 4k (4085) | 4.24 | **19.85** | 4.7× |
-| Bonsai-8B | `k_iso4` | 4k (4085) | 1.89 | **19.88** | 10.5× |
+| Bonsai-8B (Qwen3, D=128) | `k_iso3` | 4k (4085) | 4.24 | **18.9–19.9** | ~4.5× |
+| Bonsai-8B | `k_iso4` | 4k (4085) | 1.89 | **17.8–19.9** | ~9.9× |
 | Bonsai-8B | `k_iso3` | 16k (16913) | 0.96 | **10.59** | 11.0× |
 | Bonsai-8B | `k_iso3` | 32k (33612) | 0.59 | **6.63** | 11.2× |
 | gemma-4-e2b (Gemma4, D=256, shared-KV) | `k_iso3` | 4k | 44.65 | **64.80** | 1.45× |
 | medgemma-4B (Gemma3, D=256) | `k_iso3` | 4k | 21.96 | **51.96** | 2.4× |
+
+Bonsai at 4k is a noisy target (individual runs span 15.4–20.1 across repeats of
+the same binary), so its 4k cells are given as a range over two independent
+3-run medians; the 16k/32k cells and the other two models are stable to a few
+percent. Treat a single Bonsai 4k run as indicative only.
 
 The gain grows with context because the cost removed is O(seq) host work per
 token. Fitting `itl = a + b·kv_seq` over Bonsai `k_iso3` at 4k/16k/32k:

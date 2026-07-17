@@ -28,18 +28,32 @@ use super::QuantKGpuRing;
 /// V-side [`crate::storage::QuantIsoV3`]).
 pub const ISO_K3_BITS: u8 = 3;
 
-/// Quaternion-block size for the iso3 K codec (fixed at 4; one quaternion per
-/// group in fast mode).
-pub const ISO_K3_GROUP_SIZE: usize = 4;
+/// Elements per iso group: the component count of a quaternion.
+///
+/// **Codec-wide, and not a tunable.** The iso codec's group *is* one quaternion
+/// block (`iso_encode_fast` rotates `[w, x, y, z]` at a time), so this is fixed
+/// by the algebra rather than chosen per bit width — 3-bit and 4-bit iso differ
+/// in codebook and pack stride, never in this. The per-width aliases
+/// [`ISO_K3_GROUP_SIZE`] / [`crate::storage::ISO_K4_GROUP_SIZE`] are defined
+/// from it so they cannot drift apart: the iso4 GPU paths derive their ring
+/// stride through [`iso_n_groups_for`] while `QuantIsoK4::append` uses the K4
+/// alias, and a divergence would silently mismatch the iso4 ring against its
+/// own CPU blocks.
+pub const ISO_QUAT_BLOCK_SIZE: usize = 4;
 
-/// Per-token group count for an iso K row of `head_dim` elements.
+/// Quaternion-block size for the iso3 K codec. Alias of
+/// [`ISO_QUAT_BLOCK_SIZE`] — see it for why this is not independently tunable.
+pub const ISO_K3_GROUP_SIZE: usize = ISO_QUAT_BLOCK_SIZE;
+
+/// Per-token group count for an iso K row of `head_dim` elements — **both** bit
+/// widths.
 ///
 /// One quaternion block per group, so `head_dim / 4`. This is iso's group rule
 /// and it lives here, in iso's own store — [`QuantKGpuRing`] is told the
 /// resulting integer and knows nothing about quaternions.
 #[must_use]
 pub fn iso_n_groups_for(head_dim: usize) -> usize {
-    head_dim / ISO_K3_GROUP_SIZE
+    head_dim / ISO_QUAT_BLOCK_SIZE
 }
 
 /// [`iso_n_groups_for`] with the group-size invariant enforced, as `i32`.
@@ -51,14 +65,14 @@ pub fn iso_n_groups_for(head_dim: usize) -> usize {
 /// # Errors
 ///
 /// Returns [`Error::Quant`] when `head_dim` is not a positive multiple of
-/// [`ISO_K3_GROUP_SIZE`].
+/// [`ISO_QUAT_BLOCK_SIZE`].
 pub(crate) fn iso_n_groups_i32(head_dim: i32, what: &str) -> Result<i32> {
     let hd = usize::try_from(head_dim)
         .map_err(|_| Error::Quant(format!("{what}: head_dim={head_dim} must be positive")))?;
-    if hd == 0 || !hd.is_multiple_of(ISO_K3_GROUP_SIZE) {
+    if hd == 0 || !hd.is_multiple_of(ISO_QUAT_BLOCK_SIZE) {
         return Err(Error::Quant(format!(
-            "{what}: head_dim={head_dim} must be a positive multiple of \
-             ISO_K3_GROUP_SIZE={ISO_K3_GROUP_SIZE}"
+            "{what}: head_dim={head_dim} must be a positive multiple of the quaternion \
+             block size {ISO_QUAT_BLOCK_SIZE}"
         )));
     }
     i32::try_from(iso_n_groups_for(hd)).map_err(|_| {

@@ -119,14 +119,14 @@ fn iso_encode_for_test(
     bits: u8,
 ) -> (Array, Array, Array, Vec<f32>) {
     let (codes, scales, quaternions, norms) =
-        iso_encode_fast(k_seq_major, head_dim, ISO_K3_GROUP_SIZE, bits).expect("iso_encode_fast");
+        iso_encode_fast(k_seq_major, head_dim, ISO_QUAT_BLOCK_SIZE, bits).expect("iso_encode_fast");
     let dequant = iso_decode_fast(
         &codes,
         &scales,
         &quaternions,
         &norms,
         head_dim,
-        ISO_K3_GROUP_SIZE,
+        ISO_QUAT_BLOCK_SIZE,
         bits,
     )
     .expect("iso_decode_fast");
@@ -215,7 +215,7 @@ fn run_oracle_masked(
             scale,
             Device::Gpu,
         ),
-        _ => iso_flash_decode_sdpa::<4>(
+        4 => iso_flash_decode_sdpa::<4>(
             &q_arr,
             &codes,
             &scales,
@@ -230,6 +230,10 @@ fn run_oracle_masked(
             scale,
             Device::Gpu,
         ),
+        // Not a `_` arm: a wildcard would silently run some other width's
+        // kernel under a test name asserting this one, and the assertion below
+        // would pass. Production rejects an unknown width here too.
+        other => panic!("run_oracle: unsupported bits={other} (only 3 and 4)"),
     }
     .expect("iso_flash_decode_sdpa");
 
@@ -351,9 +355,19 @@ fn iso3_flash_decode_matches_reference_multi_kv_head_gqa() {
 }
 
 #[test]
+fn iso4_flash_decode_matches_reference_multi_kv_head_gqa() {
+    run_oracle(4, 4, 2, 40, 128);
+}
+
+#[test]
 fn iso3_flash_decode_matches_reference_mha_no_gqa() {
     // heads_per_kv=1 (plain MHA): kv_h_idx == hq, the degenerate GQA case.
     run_oracle(3, 4, 1, 40, 128);
+}
+
+#[test]
+fn iso4_flash_decode_matches_reference_mha_no_gqa() {
+    run_oracle(4, 4, 1, 40, 128);
 }
 
 // ── Gates ─────────────────────────────────────────────────────────────────────
@@ -495,7 +509,7 @@ fn assert_fixed_quat_accepts_the_encoder_table() {
     let k = lcg_data(4 * 128, 0xD00D);
     #[allow(clippy::expect_used, reason = "test: fixed shape known-valid")]
     let (_c, _s, quaternions, _n) =
-        iso_encode_fast(&k, 128, ISO_K3_GROUP_SIZE, 3).expect("iso_encode_fast");
+        iso_encode_fast(&k, 128, ISO_QUAT_BLOCK_SIZE, 3).expect("iso_encode_fast");
     assert!(
         assert_fixed_quat_blocks(&quaternions, "test").is_ok(),
         "the encoder's own quaternion table must satisfy the kernel's fixed-quat contract"
@@ -523,6 +537,32 @@ fn assert_fixed_quat_rejects_a_ragged_table() {
         err.is_err(),
         "a quaternion table that is not a multiple of 4 is malformed"
     );
+}
+
+// ── Group-size aliases ────────────────────────────────────────────────────────
+
+#[test]
+fn both_iso_widths_share_the_quaternion_block_size() {
+    use crate::storage::{ISO_K3_GROUP_SIZE, ISO_K4_GROUP_SIZE};
+    // Every iso4 GPU path derives its ring stride through `iso_n_groups_for`
+    // (which uses ISO_QUAT_BLOCK_SIZE) while `QuantIsoK4::append` uses the K4
+    // alias. If those ever disagreed, the iso4 ring and the iso4 CPU blocks
+    // would silently describe different layouts.
+    assert_eq!(
+        ISO_K3_GROUP_SIZE, ISO_QUAT_BLOCK_SIZE,
+        "the iso3 alias must track the quaternion block size"
+    );
+    assert_eq!(
+        ISO_K4_GROUP_SIZE, ISO_QUAT_BLOCK_SIZE,
+        "the iso4 alias must track the quaternion block size"
+    );
+    assert_eq!(
+        ISO_QUAT_BLOCK_SIZE, 4,
+        "a quaternion has 4 components — this is algebra, not a tunable"
+    );
+    // The rule the whole ring stride rests on.
+    assert_eq!(iso_n_groups_for(128), 32, "D=128 -> 32 quaternion blocks");
+    assert_eq!(iso_n_groups_for(256), 64, "D=256 -> 64 quaternion blocks");
 }
 
 // ── Probe-snapshot drift guards ───────────────────────────────────────────────

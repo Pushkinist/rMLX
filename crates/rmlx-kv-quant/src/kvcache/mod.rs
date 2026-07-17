@@ -104,6 +104,12 @@ mod windowed_ring_sizing_tests;
 #[path = "rotor_flash_dispatch_tests.rs"]
 mod rotor_flash_dispatch_tests;
 
+// Iso K-only flash-decode reaches the kernel from the production
+// `update_and_sdpa` entry point, and its ring bookkeeping holds.
+#[cfg(test)]
+#[path = "iso_flash_dispatch_tests.rs"]
+mod iso_flash_dispatch_tests;
+
 pub use core::KvCache;
 pub use fused_qk_dispatch::fused_qk_total_dispatch_count;
 pub use shared_kv::SharedKv;

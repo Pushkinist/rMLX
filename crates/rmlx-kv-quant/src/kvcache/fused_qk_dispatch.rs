@@ -50,7 +50,7 @@ use crate::q8_msl::q8_quantize_gpu;
 use crate::rotor_fused_qk_msl::{rotor3_fused_qk_sdpa, rotor4_fused_qk_sdpa};
 use crate::rotorquant::{n_groups_for, ROTOR3_BITS, ROTOR4_BITS};
 use crate::rotorquant_msl::{rotor_quantize_v3_gpu, rotor_quantize_v4_gpu, rotor_table_to_array};
-use crate::storage::{iso_n_groups_for, ISO_K3_BITS, ISO_K3_GROUP_SIZE, ISO_K4_BITS};
+use crate::storage::{iso_n_groups_for, ISO_K3_BITS, ISO_K4_BITS, ISO_QUAT_BLOCK_SIZE};
 use crate::turbo_k3_fused_qk_msl::turbo_k3_fused_qk_sdpa;
 use crate::turbo_k4_fused_qk_msl::turbo_k4_fused_qk_sdpa;
 use crate::turboquant_msl::turbo_quantize_v4_gpu;
@@ -915,10 +915,10 @@ fn encode_chunk_iso(
 ) -> Result<ChunkEncoded> {
     let d_usize = usize::try_from(d)
         .map_err(|_| Error::Mlx(format!("fused_qk iso encode: negative head_dim={d}")))?;
-    if !d_usize.is_multiple_of(ISO_K3_GROUP_SIZE) {
+    if !d_usize.is_multiple_of(ISO_QUAT_BLOCK_SIZE) {
         return Err(Error::Mlx(format!(
             "fused_qk iso encode: head_dim={d} must be a multiple of the quaternion block \
-             size {ISO_K3_GROUP_SIZE}"
+             size {ISO_QUAT_BLOCK_SIZE}"
         )));
     }
     let n_groups = iso_n_groups_for(d_usize);

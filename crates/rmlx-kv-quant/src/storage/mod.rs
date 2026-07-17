@@ -59,7 +59,9 @@ pub use kv_storage::{
     ROTOR_SYM_3_QJL_LAYOUT_TAG, ROTOR_SYM_4_LAYOUT_TAG, ROTOR_SYM_4_QJL_LAYOUT_TAG,
     TURBOSYM3_LAYOUT_TAG, TURBOSYM4_LAYOUT_TAG,
 };
-pub use quant_iso_k::{iso_n_groups_for, QuantIsoK3, ISO_K3_BITS, ISO_K3_GROUP_SIZE};
+pub use quant_iso_k::{
+    iso_n_groups_for, QuantIsoK3, ISO_K3_BITS, ISO_K3_GROUP_SIZE, ISO_QUAT_BLOCK_SIZE,
+};
 pub use quant_iso_k4::{QuantIsoK4, ISO_K4_BITS, ISO_K4_GROUP_SIZE};
 pub use quant_iso_v::{IsoBlocks, QuantIsoV3, ISO3_BITS, ISO3_GROUP_SIZE};
 pub use quant_iso_v4::{QuantIsoV4, ISO4_BITS, ISO4_GROUP_SIZE};

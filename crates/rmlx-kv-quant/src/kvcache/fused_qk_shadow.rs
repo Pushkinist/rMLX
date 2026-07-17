@@ -45,7 +45,7 @@ use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{zeros, Array, Device, Dtype};
 
 use crate::q8_msl::Q8_GROUP_SIZE;
-use crate::storage::ISO_K3_GROUP_SIZE;
+use crate::storage::ISO_QUAT_BLOCK_SIZE;
 use crate::turboquant::GROUP_SIZE as TURBO_GROUP_SIZE;
 use crate::KvQuant;
 
@@ -148,13 +148,13 @@ impl FusedQkLayout {
             // per token. No rotor table — iso rotates every group by the same
             // fixed golden-ratio quaternion, which the kernel header bakes in.
             KvQuant::Iso3Sym | KvQuant::IsoKOnly3 | KvQuant::Iso4Sym | KvQuant::IsoKOnly4 => {
-                if !hd.is_multiple_of(ISO_K3_GROUP_SIZE) {
+                if !hd.is_multiple_of(ISO_QUAT_BLOCK_SIZE) {
                     return Err(Error::Quant(format!(
                         "FusedQkLayout(iso): head_dim={head_dim} must be a multiple of \
-                         ISO_K3_GROUP_SIZE={ISO_K3_GROUP_SIZE}"
+                         ISO_QUAT_BLOCK_SIZE={ISO_QUAT_BLOCK_SIZE}"
                     )));
                 }
-                let n_groups = head_dim / ISO_K3_GROUP_SIZE as i32;
+                let n_groups = head_dim / ISO_QUAT_BLOCK_SIZE as i32;
                 Self {
                     codes_per_token: n_groups,
                     scales_per_token: n_groups,
