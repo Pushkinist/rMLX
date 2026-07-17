@@ -18,37 +18,144 @@
 use std::env;
 use std::path::PathBuf;
 
-/// Parse `MLX_VERSION_{MAJOR,MINOR,PATCH}` out of MLX's `version.h`.
+// Pure resolution/parsing logic, shared with `tests/mlx_pin.rs`.
+include!("build_support.rs");
+
+/// Declares the MLX / mlx-c pair this build is validated against.
+const PIN_FILE: &str = "mlx-pin.txt";
+
+/// The GEMM kernel family whose presence in `mlx.metallib` is the capability
+/// the pin exists to guarantee. Missing entirely in some bottles.
+const NAX_GEMM_KERNEL: &str = "steel_gemm_fused_nax";
+
+/// Read size for the metallib scan.
+const SCAN_CHUNK: usize = 1 << 20;
+
+/// Resolve the install prefix of a Homebrew formula.
 ///
-/// The header is the authoritative source for the version of the tree we
-/// compile against — the Cellar directory name is only a Homebrew convention.
-/// Returns `"unknown"` when the header cannot be read or parsed; the runtime
-/// check treats that as "cannot verify" and stays quiet rather than crying
-/// wolf on a non-Homebrew layout.
-fn read_mlx_version(header: &str) -> String {
-    let Ok(src) = std::fs::read_to_string(header) else {
-        return "unknown".to_owned();
-    };
-    let field = |name: &str| -> Option<String> {
-        src.lines()
-            .find_map(|l| l.strip_prefix(&format!("#define {name} ")))
-            .map(|v| v.trim().to_owned())
-    };
-    match (
-        field("MLX_VERSION_MAJOR"),
-        field("MLX_VERSION_MINOR"),
-        field("MLX_VERSION_PATCH"),
-    ) {
-        (Some(a), Some(b), Some(c)) => format!("{a}.{b}.{c}"),
-        _ => "unknown".to_owned(),
+/// Order: explicit env override -> `brew --prefix <formula>` -> the
+/// conventional `opt` symlink.
+///
+/// Resolving to the `opt` path rather than a Cellar path is deliberate: the
+/// linked dylibs' install names *are* `opt` paths, so that is what gets loaded
+/// at run time no matter what this build points at. Compiling against the same
+/// path the loader will use is what keeps build and runtime the same file; a
+/// hard-coded Cellar path silently drifts from it on every upgrade.
+fn resolve_prefix(env_key: &str, formula: &str) -> String {
+    println!("cargo:rerun-if-env-changed={env_key}");
+    if let Ok(prefix) = env::var(env_key) {
+        return prefix;
+    }
+    if let Some(prefix) = brew_prefix(formula) {
+        return prefix;
+    }
+    format!("/opt/homebrew/opt/{formula}")
+}
+
+/// Ask Homebrew where a formula lives. `None` when brew is absent, the formula
+/// is not installed, or the answer does not exist on disk.
+fn brew_prefix(formula: &str) -> Option<String> {
+    let out = std::process::Command::new("brew")
+        .args(["--prefix", formula])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let prefix = String::from_utf8(out.stdout).ok()?.trim().to_owned();
+    (!prefix.is_empty() && std::path::Path::new(&prefix).exists()).then_some(prefix)
+}
+
+/// Compare the resolved MLX / mlx-c against the pinned pair, and check that the
+/// metallib actually carries the fast GEMM kernels.
+///
+/// Warn, never fail. The pin records what was validated here; it is not a
+/// statement that anything else is broken. A correct non-bottle build of
+/// another version must still build, so a hard error would be wrong.
+fn check_mlx_pin(mlx_prefix: &str, mlx_c_prefix: &str, mlx_version: &str) {
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let pin_path = format!("{manifest_dir}/{PIN_FILE}");
+    println!("cargo:rerun-if-changed={pin_path}");
+
+    let pin_src = std::fs::read_to_string(&pin_path)
+        .unwrap_or_else(|e| panic!("rmlx-mlx: cannot read the MLX pin at {pin_path}: {e}"));
+    let pin = parse_pin(&pin_src).unwrap_or_else(|| {
+        panic!(
+            "rmlx-mlx: {pin_path} must declare one `mlx <version>` line and one \
+             `mlx-c <version>` line (plus `#` comments). The two are pinned as a \
+             pair — see docs/FFI.md."
+        )
+    });
+    let (pin_mlx, pin_mlx_c) = (pin.mlx.as_str(), pin.mlx_c.as_str());
+
+    // mlx-c ships no version header, so its identity is the keg directory name
+    // — which is also the only place the Homebrew revision suffix appears, and
+    // that suffix is the whole point (0.6.0_2 and 0.6.0_3 are the same upstream
+    // release built against different mlx).
+    let mlx_c_version = std::fs::canonicalize(mlx_c_prefix)
+        .ok()
+        .and_then(|real| keg_version_from(&real, "mlx-c"))
+        .unwrap_or_else(|| "unknown".to_owned());
+
+    // The capability itself, read off the library that will be loaded. This is
+    // the ground truth the version pin only proxies for, and it keeps passing
+    // on its own once a fixed bottle ships. `None` = no metallib to inspect.
+    let metallib = format!("{mlx_prefix}/lib/mlx.metallib");
+    println!("cargo:rerun-if-changed={metallib}");
+    let fast_gemm = std::fs::File::open(&metallib)
+        .ok()
+        .and_then(|f| contains_needle(f, NAX_GEMM_KERNEL.as_bytes(), SCAN_CHUNK).ok());
+
+    let drift = (mlx_version != "unknown" && mlx_version != pin_mlx)
+        || (mlx_c_version != "unknown" && mlx_c_version != pin_mlx_c);
+
+    if fast_gemm == Some(false) {
+        println!(
+            "cargo:warning=MLX at {mlx_prefix} (mlx {mlx_version}, mlx-c {mlx_c_version}) ships \
+             no {NAX_GEMM_KERNEL} kernels in lib/mlx.metallib."
+        );
+        println!(
+            "cargo:warning=  Those are the Neural-Accelerator GEMM path. Without them GPU matmul \
+             throughput measured ~3.8x lower and prefill 2.2-3.3x slower on \
+             Neural-Accelerator-class hardware. Decode is bandwidth-bound and looks normal, so \
+             the symptom mimics a model-code defect."
+        );
+        println!(
+            "cargo:warning=  rMLX pins the validated pair mlx {pin_mlx} + mlx-c {pin_mlx_c}, \
+             whose metallib ships 360 of them. Some Homebrew bottles omit the family entirely; a \
+             non-bottle build of the same version can be fine."
+        );
+        println!(
+            "cargo:warning=  Fix (Homebrew; both kegs must already be in the Cellar — check with \
+             `ls /opt/homebrew/Cellar/mlx`):"
+        );
+        println!(
+            "cargo:warning=    ln -sfn ../Cellar/mlx/{pin_mlx} /opt/homebrew/opt/mlx && ln -sfn \
+             ../Cellar/mlx-c/{pin_mlx_c} /opt/homebrew/opt/mlx-c && brew pin mlx mlx-c"
+        );
+        println!(
+            "cargo:warning=  Repoint both: mlx and mlx-c are ABI-coupled and a mismatched pair \
+             aborts at load. Then rebuild. Pin: crates/rmlx-mlx/{PIN_FILE}; rationale and un-pin \
+             steps: docs/FFI.md."
+        );
+    } else if drift {
+        println!(
+            "cargo:warning=MLX pin drift: resolved mlx {mlx_version} + mlx-c {mlx_c_version}, but \
+             rMLX pins mlx {pin_mlx} + mlx-c {pin_mlx_c} (crates/rmlx-mlx/{PIN_FILE})."
+        );
+        println!(
+            "cargo:warning=  The {NAX_GEMM_KERNEL} kernels the pin exists for are present, so GEMM \
+             throughput should be unaffected. mlx and mlx-c are ABI-coupled though: an unvalidated \
+             pair can abort at load with a dyld \"Symbol not found\". If this pair checks out, bump \
+             both pin lines together. See docs/FFI.md."
+        );
     }
 }
 
 fn main() {
-    // Rebuild triggers.
-    println!("cargo:rerun-if-env-changed=MLX_C_PREFIX");
-    println!("cargo:rerun-if-env-changed=MLX_PREFIX");
+    // Rebuild triggers. (The prefix env vars are declared by resolve_prefix.)
     println!("cargo:rerun-if-changed=wrapper.h");
+    println!("cargo:rerun-if-changed=build_support.rs");
 
     // Target guard: Apple Silicon only.
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
@@ -60,11 +167,9 @@ fn main() {
          MLX runs only on Apple Silicon Metal."
     );
 
-    // Prefix resolution: env var → brew canonical path.
-    let mlx_c_prefix = env::var("MLX_C_PREFIX")
-        .unwrap_or_else(|_| "/opt/homebrew/Cellar/mlx-c/0.6.0_2".to_owned());
-    let mlx_prefix =
-        env::var("MLX_PREFIX").unwrap_or_else(|_| "/opt/homebrew/Cellar/mlx/0.31.2".to_owned());
+    // Prefix resolution: env var → brew → the `opt` symlink the loader uses.
+    let mlx_c_prefix = resolve_prefix("MLX_C_PREFIX", "mlx-c");
+    let mlx_prefix = resolve_prefix("MLX_PREFIX", "mlx");
 
     // Verify the dylibs exist, give a helpful message if not.
     let mlxc_lib = format!("{mlx_c_prefix}/lib/libmlxc.dylib");
@@ -94,8 +199,13 @@ fn main() {
     // throughput, so the skew must not pass unnoticed.
     let version_header = format!("{mlx_prefix}/include/mlx/version.h");
     println!("cargo:rerun-if-changed={version_header}");
-    let build_version = read_mlx_version(&version_header);
+    let build_version =
+        read_mlx_version(&std::fs::read_to_string(&version_header).unwrap_or_default());
     println!("cargo:rustc-env=RMLX_MLX_BUILD_VERSION={build_version}");
+
+    // Report a resolved stack that is not the validated one, or that cannot
+    // reach the fast GEMM path at all.
+    check_mlx_pin(&mlx_prefix, &mlx_c_prefix, &build_version);
 
     // Link search paths.
     println!("cargo:rustc-link-search=native={mlx_c_prefix}/lib");

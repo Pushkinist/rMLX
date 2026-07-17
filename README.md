@@ -141,12 +141,20 @@ baseline and has been retracted after a direct measurement.)
 brew install mlx-c          # provides the MLX + mlx-c libraries
 ```
 
-If your MLX install is not on the default homebrew cellar path, point the build
-at it:
+The build finds MLX via `brew --prefix` (or `/opt/homebrew/opt/…`) on its own.
+Point it elsewhere only if your install is somewhere else:
 
 ```sh
 export MLX_C_PREFIX="$(brew --prefix mlx-c)"   # dir containing lib/libmlxc.dylib + include/
+export MLX_PREFIX="$(brew --prefix mlx)"
 ```
+
+rMLX is validated against one MLX / mlx-c pair, declared in
+`crates/rmlx-mlx/mlx-pin.txt`. If your installed MLX differs, or if it is
+missing the fast GEMM kernels that some Homebrew bottles omit (a known bottle
+regression that costs ~3.8× GPU matmul throughput), the build prints a warning
+naming the fix. It is a warning, not an error — the build still succeeds. See
+[`docs/FFI.md`](docs/FFI.md#pinned-mlx--mlx-c-pair).
 
 ## Install
 
