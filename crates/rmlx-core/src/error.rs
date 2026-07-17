@@ -104,12 +104,14 @@ pub enum Error {
     #[error("unimplemented: {0}")]
     Unimplemented(&'static str),
 
-    /// Prefill requested a sequence length above the configured KV
+    /// A KV request needs a sequence length above the configured KV
     /// hard cap. The cap is opt-in via `RMLX_KV_MAX_SEQ_HARD_CAP` (no cap
     /// when unset). Raised before any large allocation so the caller can
     /// reject the request cleanly instead of triggering a broadcast-shape
-    /// error deep inside the prefill loop.
-    #[error("kv prefill request exceeds hard cap: requested={requested}, cap={cap}")]
+    /// error deep inside the cache path. Fires on either phase: prefill (the
+    /// prompt itself is too long) or decode (generation crosses the cap), so
+    /// the message names neither.
+    #[error("kv request exceeds hard cap: requested={requested}, cap={cap}")]
     KvHardCapExceeded {
         /// The needed sequence length (in tokens) that triggered the guard.
         requested: i32,
@@ -117,14 +119,14 @@ pub enum Error {
         cap: i32,
     },
 
-    /// Prefill requested a sequence length above the per-cache virtual
+    /// A KV request needs a sequence length above the per-cache virtual
     /// ceiling. The ceiling is the resolved `--max-ctx` (a virtual cap, not an
     /// eager allocation): the KV ring grows lazily up to it. Raised before any
-    /// allocation past the ceiling so an over-long prompt is rejected cleanly
-    /// instead of growing the ring beyond the operator-declared context bound.
-    #[error(
-        "kv prefill request exceeds max-ctx ceiling: requested={requested}, ceiling={ceiling}"
-    )]
+    /// allocation past the ceiling so a request is rejected cleanly instead of
+    /// growing the ring beyond the operator-declared context bound. Fires on
+    /// either phase: prefill (the prompt itself is over the ceiling) or decode
+    /// (generation crosses it mid-stream), so the message names neither.
+    #[error("kv request exceeds max-ctx ceiling: requested={requested}, ceiling={ceiling}")]
     KvCeilingExceeded {
         /// The needed sequence length (in tokens) that triggered the guard.
         requested: i32,
@@ -146,6 +148,50 @@ pub enum Error {
         /// correct alternative (e.g. the required assistant snapshot).
         reason: String,
     },
+}
+
+impl Error {
+    /// Whether this error is transient enough to justify a transparent retry
+    /// (e.g. token-replay of an interrupted stream).
+    ///
+    /// `true` — the failure is transient: a Metal-level fault (watchdog kill,
+    /// GPU-queue overflow, transient dispatch error) or a recovered engine
+    /// panic. Re-issuing the request may succeed.
+    ///
+    /// `false` — the failure is permanent, structural, or a policy rejection;
+    /// replaying would reproduce it. This includes the KV ceiling / hard-cap
+    /// rejections: the bound is identical on every attempt, whichever phase
+    /// (prefill or decode) crossed it, so a retry is futile.
+    ///
+    /// The match is exhaustive on purpose — **no wildcard arm**. This enum is
+    /// `#[non_exhaustive]`, which only relaxes exhaustiveness for *downstream*
+    /// crates; inside this crate the compiler still requires every variant to
+    /// be named. Adding a variant therefore fails the build here until it is
+    /// explicitly assigned a transient/permanent class, instead of a catch-all
+    /// silently laundering an unclassified error into one bucket.
+    #[must_use]
+    pub fn is_migratable(&self) -> bool {
+        match self {
+            // Transient Metal / engine failures — replay may succeed.
+            Error::Mlx(_) | Error::Other(_) => true,
+
+            // Permanent, structural, or policy failures — replay is futile.
+            Error::Io(_)
+            | Error::Config(_)
+            | Error::Loader(_)
+            | Error::Quant(_)
+            | Error::Model(_)
+            | Error::SmokeProbe(_)
+            | Error::Oom { .. }
+            | Error::ArchUnsupported { .. }
+            | Error::KvStorageMismatch { .. }
+            | Error::SsdTierAlreadyInstalled
+            | Error::Unimplemented(_)
+            | Error::KvHardCapExceeded { .. }
+            | Error::KvCeilingExceeded { .. }
+            | Error::SpeculativePairing { .. } => false,
+        }
+    }
 }
 
 /// The allocation phase in which an [`Error::Oom`] was raised.

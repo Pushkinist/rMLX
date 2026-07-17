@@ -372,10 +372,28 @@ fn stop_reason_none_is_end_turn() {
     assert_eq!(map_stop_reason(None), "end_turn");
 }
 
-/// Unknown reason falls back to "end_turn".
+/// An unrecognised finish reason must NOT be laundered into the successful
+/// "end_turn"; it surfaces as an explicit "error" stop reason.
 #[test]
-fn stop_reason_unknown_is_end_turn() {
-    assert_eq!(map_stop_reason(Some("whatever")), "end_turn");
+fn stop_reason_unknown_is_error_not_success() {
+    let mapped = map_stop_reason(Some("whatever"));
+    assert_ne!(
+        mapped, "end_turn",
+        "unknown finish reason must never map to the successful end_turn"
+    );
+    assert_eq!(mapped, "error");
+}
+
+/// A finish reason of "error" (e.g. an engine-emitted error terminal) maps to
+/// an explicit "error" stop reason — the masked-failure case that motivated
+/// making this mapping non-laundering. It must not become a successful stop.
+#[test]
+fn stop_reason_error_terminal_is_not_success() {
+    let mapped = map_stop_reason(Some("error"));
+    assert_ne!(mapped, "end_turn");
+    assert_ne!(mapped, "max_tokens");
+    assert_ne!(mapped, "tool_use");
+    assert_eq!(mapped, "error");
 }
 
 /// Compose blocking path — EOS finish → stop_reason:"end_turn",

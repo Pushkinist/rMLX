@@ -109,6 +109,27 @@ fn classify_speculative_pairing_is_fatal() {
     assert_eq!(classify(&err), RetryClass::Fatal);
 }
 
+#[test]
+fn classify_kv_ceiling_exceeded_is_fatal() {
+    // A request that overruns the `--max-ctx` ceiling hits the same ceiling on
+    // every attempt — whichever phase (prefill or decode) crossed it — so a
+    // replay is futile. Must be Fatal, never Migratable.
+    let err = E::KvCeilingExceeded {
+        requested: 641,
+        ceiling: 640,
+    };
+    assert_eq!(classify(&err), RetryClass::Fatal);
+}
+
+#[test]
+fn classify_kv_hard_cap_exceeded_is_fatal() {
+    let err = E::KvHardCapExceeded {
+        requested: 4097,
+        cap: 4096,
+    };
+    assert_eq!(classify(&err), RetryClass::Fatal);
+}
+
 // ── is_replayable() ──────────────────────────────────────────────────────
 
 fn req_with_temp(temperature: f32) -> GenerationRequest {

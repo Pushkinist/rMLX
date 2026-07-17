@@ -75,7 +75,15 @@ pub(super) fn record_metric(
 ///
 /// - `"length"` (token cap hit) → `"max_tokens"`
 /// - `"tool_calls"` (engine tool-call finish) → `"tool_use"`
-/// - `"stop"` (EOS / natural end) and everything else → `"end_turn"`
+/// - `"stop"` (explicit EOS) and `None` (unmarked clean terminal) → `"end_turn"`
+/// - any other / unrecognised finish reason → `"error"`
+///
+/// The unrecognised branch must **never** collapse to `"end_turn"`: an unknown
+/// or future finish reason (e.g. an engine-emitted `"error"` terminal) reported
+/// as a normal successful completion is a masked failure. Only reasons this
+/// mapper has an explicit success contract for become a successful stop; every
+/// other terminal surfaces as an explicit `"error"` stop reason a client or
+/// harness can detect.
 ///
 /// Note: `"stop_sequence"` is NOT produced here. A real stop-string match
 /// is detected by the stop-matcher path in `blocking.rs` / `streaming.rs`, which
@@ -85,8 +93,20 @@ pub(crate) fn map_stop_reason(finish_reason: Option<&str>) -> String {
     match finish_reason {
         Some("length") => "max_tokens".to_owned(),
         Some("tool_calls") => "tool_use".to_owned(),
-        // "stop" (natural EOS) and all unknown reasons → end_turn.
-        _ => "end_turn".to_owned(),
+        // Natural end of turn: an explicit EOS ("stop") or an unmarked clean
+        // terminal (None) are both legitimate successful completions.
+        Some("stop") | None => "end_turn".to_owned(),
+        // A finish reason this mapper has no success contract for. Do not
+        // launder it into "end_turn"; surface it as an explicit error stop
+        // reason so a failed/unexpected terminal is distinguishable from a
+        // genuine completion.
+        Some(other) => {
+            tracing::error!(
+                finish_reason = other,
+                "map_stop_reason: unrecognised finish reason; reporting error stop reason"
+            );
+            "error".to_owned()
+        }
     }
 }
 
