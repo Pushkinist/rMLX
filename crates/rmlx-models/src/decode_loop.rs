@@ -596,8 +596,11 @@ pub(crate) fn chunked_prefill(
     if let Some(e) = first_err {
         return Err(e);
     }
+    // Model, not Other: an empty prompt is deterministic, so the retry envelope
+    // must not replay it. Other classifies Migratable and would re-run a request
+    // that reproduces the same failure every time.
     last_logits.ok_or_else(|| {
-        Error::Other(format!(
+        Error::Model(format!(
             "prefill produced no logits (empty prompt), arch={arch}"
         ))
     })

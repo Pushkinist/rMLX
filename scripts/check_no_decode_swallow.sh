@@ -21,34 +21,35 @@
 #   refusing zeros silently absorbs it.
 #
 # WHY A GREP GATE
-#   The decode loop and the chunked prefill are copied per-arch (the shared
-#   pipelined loop and shared `chunked_prefill`, plus the bitnet / laguna /
-#   qwen2 hand-written ones). A unit test needs a concrete `&Model` per arch, so
-#   the per-arch copies are effectively untestable at unit scope — and a fix
-#   hand-applied to some copies but not others is precisely the "looks complete,
-#   isn't" failure this rule exists to prevent. The shared loops carry real unit
-#   tests (`pipelined_decode_propagates_step_failure`,
-#   `chunked_prefill_propagates_chunk_failure`); this gate covers every copy of
-#   the shape.
+#   The decode loop and the chunked prefill are copied per-arch. A unit test
+#   needs a concrete `&Model` per arch, so the per-arch copies are effectively
+#   untestable at unit scope — and a fix hand-applied to some copies but not
+#   others is precisely the "looks complete, isn't" failure this rule exists to
+#   prevent. The shared loops carry real unit tests
+#   (`pipelined_decode_propagates_step_failure`,
+#   `chunked_prefill_propagates_chunk_failure`); this gate covers the copies.
 #
-# THE RULE
-#   Every failure log site listed below must propagate the cause, either by
-#   returning it directly (`return Err`) or — where a mandatory cleanup sweep
-#   must run first — by capturing it (`= Some(e)`) for return after the sweep.
-#   A `break` with no capture is the swallow, and a `return Ok(` on a failure
-#   path is the fabricated success this gate exists to kill.
+# WHY THE SWALLOW RULE IS KEYED ON SHAPE, NOT ON MESSAGE TEXT
+#   An earlier revision anchored on log message text ("prefill chunk failed").
+#   Two live swallows evaded it purely by wording ("prefix tail chunk failed",
+#   "tail chunk failed") and the gate reported OK with the pinned bug present.
+#   Message-keyed anchors are whack-a-mole. RULE 1 therefore anchors on the
+#   structural marker every failure-log site in the arch layer shares —
+#   `error = %e` — and looks for the swallow itself.
 #
-#   The deferred-capture form is not a loophole: the shared `chunked_prefill`
-#   cannot `return Err` at the log site because every cache that entered prefill
-#   must run `exit_prefill` before the function leaves, or the remaining caches
-#   keep un-finalized prefill state that corrupts any later reuse. The cause is
-#   captured, the sweep runs, the cause propagates.
+# THE RULES
+#   1. SWALLOW (shape-keyed, arch layer): no failure-log site may return Ok or
+#      set a `*_ok = false` swallow flag from inside its own failure arm.
+#   2. DECODE (message-keyed): every `decode step failed` site must `return Err`.
+#   3. SWEEP (message-keyed): the shared chunked_prefill must CAPTURE its cause
+#      (`= Some(e)`), not `return Err` inline — see RULE 3 below.
 #
-# NOT YET COVERED
-#   The image-prefill failure sites (`image prefill failed`, and the image-path
-#   `exit_prefill quantization failed` in gemma3) still `return Ok(steps)`.
-#   Adding those anchors to PREFILL_ANCHORS below is a one-line change that goes
-#   red on exactly those sites — do it with the fix, not before.
+# SCOPE (what this does NOT cover)
+#   RULE 1 scans crates/rmlx-models/src only — the arch generate/prefill paths
+#   where this class lives. Failure sites in other crates are not covered.
+#   RULE 1 keys on `error = %e`; a failure-log site that does not carry the
+#   error as a structured field is invisible to it (and is a traceability bug
+#   in its own right — see the tracing rules in CLAUDE.md).
 #
 # Exit 0 = clean. Exit 1 = violation found.
 
@@ -57,79 +58,129 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-# Sites that must propagate at the log site itself — no cleanup is owed.
-DECODE_ANCHORS=(
-    'decode step failed'
-)
-
-# Sites that may defer propagation until after a mandatory cleanup sweep.
-PREFILL_ANCHORS=(
-    'prefill chunk failed'
-    'prefill chunk cache eval failed'
-)
-
-# Lines of context after the anchor in which the verdict must appear. The log
+# Lines of context after an anchor in which the verdict must appear. The log
 # macro spans several lines (fields, message, closing paren) before the control
 # flow; 8 covers the widest current site with room to spare.
 CONTEXT=8
 
 violations=0
 
-# Emit "file:line" for every non-test site logging $1.
-anchor_sites() {
-    grep -rn --include='*.rs' -F "$1" crates/ 2>/dev/null \
-        | grep -v '_tests\.rs:' | cut -d: -f1,2 || true
-}
+# Indent (leading spaces) of a line. rustfmt guarantees consistent indentation,
+# which is what makes the nesting test below meaningful.
+indent_of() { printf '%s' "$1" | awk '{ match($0, /[^ ]/); print RSTART - 1 }'; }
 
-# $1 = anchor, $2 = "direct" (return Err only) or "deferred" (capture allowed).
-check_anchor() {
-    local anchor="$1" mode="$2" site f ln end window
+# ── RULE 1: no swallow at any arch-layer failure-log site ────────────────────
+#
+# Anchor: `error = %e`, the structural marker shared by every failure-log site
+# in the arch layer.
+#
+# Verdict: a `return Ok(` or `*_ok = false` inside the anchor's own failure arm
+# is the swallow. The discriminator is NESTING, not distance: a swallow is
+# nested at or below the log statement, whereas a correct degrade-and-continue
+# site (`warn!` + fall through, e.g. "skipping prompt cache store") is followed
+# only by later SIBLING blocks, which are dedented relative to it.
+#
+# The `- 4` slack is one macro-continuation level: the anchor is often an
+# argument line of a multi-line `tracing::error!(...)`, one level deeper than
+# the statement it belongs to.
+check_swallow() {
+    local site f ln anchor_line a_ind limit win l l_ind
     while IFS= read -r site; do
         [ -z "${site}" ] && continue
         f="${site%%:*}"
         ln="${site##*:}"
-        end=$((ln + CONTEXT))
-        window="$(sed -n "${ln},${end}p" "${f}")"
-
-        # A fabricated success on a failure path — never allowed, either mode.
-        if printf '%s' "${window}" | grep -q 'return Ok('; then
-            echo "VIOLATION: ${f}:${ln} — '${anchor}' returns Ok on the failure path."
-            echo "    A failure reported as a successful run is the bug this gate pins."
-            printf '%s\n' "${window}" | sed 's/^/    | /'
+        anchor_line="$(sed -n "${ln}p" "${f}")"
+        a_ind="$(indent_of "${anchor_line}")"
+        limit=$((a_ind - 4))
+        win="$(sed -n "${ln},$((ln + CONTEXT))p" "${f}")"
+        while IFS= read -r l; do
+            printf '%s' "${l}" | grep -q 'return Ok(\|_ok = false' || continue
+            l_ind="$(indent_of "${l}")"
+            [ "${l_ind}" -ge "${limit}" ] || continue
+            echo "VIOLATION: ${f}:${ln} — failure-log site swallows the cause."
+            echo "    A 'return Ok(' / '*_ok = false' inside the failure arm reports a failed"
+            echo "    prefill or decode as a successful run. Propagate the cause instead."
+            printf '%s\n' "${win}" | sed 's/^/    | /'
             violations=$((violations + 1))
-            continue
-        fi
-
-        if printf '%s' "${window}" | grep -q 'return Err'; then
-            continue
-        fi
-        # Deferred propagation: cause captured now, returned after the sweep.
-        if [ "${mode}" = "deferred" ] && printf '%s' "${window}" | grep -q '= Some(e)'; then
-            continue
-        fi
-
-        if [ "${mode}" = "deferred" ]; then
-            echo "VIOLATION: ${f}:${ln} — '${anchor}' neither returns the cause ('return Err')"
-            echo "    nor captures it for propagation after the cleanup sweep ('= Some(e)')"
-            echo "    within ${CONTEXT} lines."
-        else
-            echo "VIOLATION: ${f}:${ln} — '${anchor}' is not followed by 'return Err' within ${CONTEXT} lines."
-        fi
-        printf '%s\n' "${window}" | sed 's/^/    | /'
-        violations=$((violations + 1))
-    done < <(anchor_sites "${anchor}")
+            break
+        done <<< "${win}"
+    done < <(grep -rn --include='*.rs' -F 'error = %e' crates/rmlx-models/src/ \
+        | grep -v '_tests\.rs:' | cut -d: -f1,2 || true)
 }
 
-for anchor in "${DECODE_ANCHORS[@]}"; do
-    check_anchor "${anchor}" direct
-done
-for anchor in "${PREFILL_ANCHORS[@]}"; do
-    check_anchor "${anchor}" deferred
+# ── RULE 2: a failed decode step must return Err at the site ─────────────────
+check_decode() {
+    local site f ln win
+    while IFS= read -r site; do
+        [ -z "${site}" ] && continue
+        f="${site%%:*}"
+        ln="${site##*:}"
+        win="$(sed -n "${ln},$((ln + CONTEXT))p" "${f}")"
+        if ! printf '%s' "${win}" | grep -q 'return Err'; then
+            echo "VIOLATION: ${f}:${ln} — 'decode step failed' is not followed by 'return Err' within ${CONTEXT} lines."
+            printf '%s\n' "${win}" | sed 's/^/    | /'
+            violations=$((violations + 1))
+        fi
+    done < <(grep -rn --include='*.rs' -F 'decode step failed' crates/ \
+        | grep -v '_tests\.rs:' | cut -d: -f1,2 || true)
+}
+
+# ── RULE 3: the shared chunked_prefill must capture, not return inline ───────
+#
+# These two sites are the ONLY ones that owe a cleanup sweep: chunked_prefill
+# calls `enter_prefill` on every cache up front, so it must run `exit_prefill`
+# on every cache before it leaves. A `return Err` at the log site skips the
+# sweep for the remaining caches, stranding them `in_prefill = true` — the next
+# decode on a stuck cache errors or corrupts KV. So here, and only here, the
+# correct form is to capture the cause and let the post-loop sweep run first.
+#
+# Message-keyed on purpose: "owes a sweep" is a property of this one function,
+# not a shape visible to grep. RULE 1 still covers these sites against the
+# swallow itself, and `chunked_prefill_runs_exit_sweep_on_failure` pins the
+# ordering invariant with a real test — this rule is the cheap early warning.
+SWEEP_ANCHORS=(
+    'prefill chunk failed'
+    'prefill chunk cache eval failed'
+)
+
+check_sweep() {
+    local anchor="$1" site f ln win
+    while IFS= read -r site; do
+        [ -z "${site}" ] && continue
+        f="${site%%:*}"
+        ln="${site##*:}"
+        # Only the shared helper owes a sweep; the per-arch copies that never
+        # call enter_prefill correctly return inline and are covered by RULE 1.
+        case "${f}" in
+        *decode_loop.rs) ;;
+        *) continue ;;
+        esac
+        win="$(sed -n "${ln},$((ln + CONTEXT))p" "${f}")"
+        if printf '%s' "${win}" | grep -q 'return Err'; then
+            echo "VIOLATION: ${f}:${ln} — '${anchor}' returns Err inline, skipping the exit_prefill sweep."
+            echo "    Every cache that entered prefill must run exit_prefill before this"
+            echo "    function leaves. Capture the cause ('= Some(e)') and let the sweep run."
+            printf '%s\n' "${win}" | sed 's/^/    | /'
+            violations=$((violations + 1))
+        elif ! printf '%s' "${win}" | grep -q '= Some(e)'; then
+            echo "VIOLATION: ${f}:${ln} — '${anchor}' neither captures the cause ('= Some(e)')"
+            echo "    for propagation after the exit_prefill sweep, nor propagates it at all."
+            printf '%s\n' "${win}" | sed 's/^/    | /'
+            violations=$((violations + 1))
+        fi
+    done < <(grep -rn --include='*.rs' -F "${anchor}" crates/ \
+        | grep -v '_tests\.rs:' | cut -d: -f1,2 || true)
+}
+
+check_swallow
+check_decode
+for anchor in "${SWEEP_ANCHORS[@]}"; do
+    check_sweep "${anchor}"
 done
 
 if [ "${violations}" -gt 0 ]; then
     echo
-    echo "FAIL: ${violations} failure site(s) swallow the error."
+    echo "FAIL: ${violations} failure site(s) swallow the error or skip the prefill sweep."
     echo "A decode step that fails must abort the request — returning the tokens"
     echo "produced so far is reported as finish_reason=\"length\", indistinguishable"
     echo "from a clean token-cap stop. A prefill chunk that fails must abort too —"
@@ -138,4 +189,4 @@ if [ "${violations}" -gt 0 ]; then
     exit 1
 fi
 
-echo "OK: every decode-step and prefill-chunk failure site propagates (no swallow)."
+echo "OK: no swallow at any arch-layer failure-log site; decode + prefill propagate."

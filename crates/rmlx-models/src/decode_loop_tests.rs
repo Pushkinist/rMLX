@@ -730,6 +730,41 @@ fn chunked_prefill_propagates_chunk_failure() {
     );
 }
 
+/// Every cache that entered prefill must run `exit_prefill` before
+/// `chunked_prefill` returns — on the failure path too.
+///
+/// This is why the failure sites capture the cause instead of returning it
+/// inline: an early `return Err` skips the sweep for the remaining caches,
+/// stranding them mid-prefill with un-finalized state, and the next decode on a
+/// stuck cache errors or corrupts KV. The capture-then-sweep ordering is load
+/// bearing, so it is pinned here rather than left to a comment.
+#[test]
+fn chunked_prefill_runs_exit_sweep_on_failure() {
+    let _g = mlx_guard();
+    let mut caches: Vec<KvCache> = (0..3)
+        .map(|_| KvCache::with_quant_max_seq(KvQuant::None, 8))
+        .collect();
+    let ids: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
+    // Fail on the FIRST chunk, so caches[1..] are the ones an inline `return
+    // Err` at the log site would strand. The closure also proves the assertion
+    // below is not vacuous: enter_prefill really did set the flag.
+    let forward_chunk = |_chunk: &[u32], caches: &mut Vec<KvCache>| -> Result<Array> {
+        assert!(
+            caches.iter().all(KvCache::in_prefill),
+            "precondition: chunked_prefill must have entered prefill on every cache"
+        );
+        Err(Error::Other("simulated first-chunk failure".to_owned()))
+    };
+    let _ = chunked_prefill(&mut caches, &ids, 4, Device::Cpu, "test", forward_chunk);
+    for (i, c) in caches.iter().enumerate() {
+        assert!(
+            !c.in_prefill(),
+            "cache {i} was left in prefill after a failed chunk — the exit_prefill \
+             sweep was skipped, so its state is un-finalized for the next decode"
+        );
+    }
+}
+
 #[test]
 #[allow(
     clippy::expect_used,
@@ -751,5 +786,12 @@ fn chunked_prefill_rejects_empty_prompt() {
     assert!(
         err.to_string().contains("prefill produced no logits"),
         "the empty-prompt cause must name itself, got: {err}"
+    );
+    // An empty prompt is deterministic: replaying it reproduces the failure.
+    // Model classifies Fatal; Other would classify Migratable and be replayed.
+    assert!(
+        matches!(err, Error::Model(_)),
+        "the empty-prompt cause must use a variant the retry envelope treats as \
+         fatal, or a doomed request is replayed; got: {err:?}"
     );
 }
