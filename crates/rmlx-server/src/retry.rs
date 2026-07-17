@@ -104,56 +104,23 @@ pub enum RetryClass {
 /// Classify an [`RmlxError`] as [`RetryClass::Migratable`] or
 /// [`RetryClass::Fatal`].
 ///
-/// ### Migratable
-/// - [`RmlxError::Mlx`] — Metal-level failure (watchdog kill, GPU-queue
-///   overflow, transient dispatch error). The string may contain `"watchdog"`,
-///   `"gpu_queue"`, `"device_memory"`, etc.; we treat **all** `Mlx` variants as
-///   migratable rather than pattern-matching on the opaque string, since any
-///   unexpected Metal failure is better retried than surfaced as a permanent 503.
-/// - [`RmlxError::Other`] — catch-all for transient engine panics that the
-///   blocking-thread harness recovers and wraps in `Other`.
+/// Delegates to [`RmlxError::is_migratable`]. The transient/permanent decision
+/// lives on the error type itself, where the match over the variants is
+/// exhaustive (no wildcard) in the crate that defines them — so a newly added
+/// error variant fails the build until it is explicitly classified, rather than
+/// a catch-all here silently defaulting an unclassified error to `Fatal`.
 ///
-/// ### Fatal
-/// - [`RmlxError::SmokeProbe`] — NaN logits → broken snapshot; retrying would
-///   reproduce the same NaN and consume budget pointlessly.
-/// - [`RmlxError::Oom`] — KV-cache or weight OOM. A retry would OOM again
-///   immediately; let J3's evict-and-retry path handle this separately.
-/// - [`RmlxError::Config`] / [`RmlxError::Loader`] / [`RmlxError::Quant`] /
-///   [`RmlxError::Model`] / [`RmlxError::Io`] — structural / configuration
-///   errors. A retry would produce the same error.
+/// - Migratable: [`RmlxError::Mlx`] (any Metal-level fault) and
+///   [`RmlxError::Other`] (a recovered engine panic). Both may succeed on a
+///   fresh attempt.
+/// - Fatal: every other variant — structural, configuration, OOM, smoke-probe,
+///   and the KV ceiling / hard-cap rejections (the bound is the same on every
+///   attempt, whichever phase crossed it).
 pub fn classify(err: &RmlxError) -> RetryClass {
-    match err {
-        // Transient Metal / engine errors — replay permitted.
-        RmlxError::Mlx(_) => RetryClass::Migratable,
-        RmlxError::Other(_) => RetryClass::Migratable,
-
-        // Permanent or policy errors — never replay.
-        RmlxError::SmokeProbe(_) => RetryClass::Fatal,
-        RmlxError::Oom { .. } => RetryClass::Fatal,
-        RmlxError::Config(_) => RetryClass::Fatal,
-        RmlxError::Loader(_) => RetryClass::Fatal,
-        RmlxError::Quant(_) => RetryClass::Fatal,
-        RmlxError::Model(_) => RetryClass::Fatal,
-        RmlxError::Io(_) => RetryClass::Fatal,
-        // Structured error variants — all Fatal.
-        RmlxError::ArchUnsupported { .. } => RetryClass::Fatal,
-        RmlxError::KvStorageMismatch { .. } => RetryClass::Fatal,
-        RmlxError::SsdTierAlreadyInstalled => RetryClass::Fatal,
-        RmlxError::Unimplemented(_) => RetryClass::Fatal,
-        // KV prefill request above the configured hard cap. The
-        // request is structurally too large for the current process limits;
-        // replaying would hit the same cap. Fatal.
-        RmlxError::KvHardCapExceeded { .. } => RetryClass::Fatal,
-        // KV prefill request above the resolved `--max-ctx` virtual ceiling.
-        // The prompt exceeds the operator-declared context bound; replaying
-        // would hit the same ceiling. Fatal (same class as the hard cap).
-        RmlxError::KvCeilingExceeded { .. } => RetryClass::Fatal,
-        // Unsupported `--draft-model` + `--draft-kind` pairing. Structural
-        // misconfiguration detected at load; replaying would hit the same
-        // rejection. Fatal.
-        RmlxError::SpeculativePairing { .. } => RetryClass::Fatal,
-        // Non-exhaustive catch-all: future variants default to Fatal.
-        _ => RetryClass::Fatal,
+    if err.is_migratable() {
+        RetryClass::Migratable
+    } else {
+        RetryClass::Fatal
     }
 }
 
