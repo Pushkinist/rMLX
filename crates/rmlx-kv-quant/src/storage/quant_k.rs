@@ -67,6 +67,35 @@ pub struct QuantK {
 use super::seq_layout::{transpose_heads_seq, transpose_seq_heads};
 
 impl QuantK {
+    /// Resident bytes held by this store: CPU codes/scales plus the GPU mirror.
+    ///
+    /// Both are summed unconditionally — an SSD-hydrate init leaves the
+    /// pre-hydration CPU `codes`/`scales` resident under a live GPU mirror (the
+    /// hydrate upload path never clears them), so both are real memory at once.
+    /// Unallocated buffers contribute 0 on their own.
+    ///
+    /// The exhaustive destructure is the drift guard: a new buffer cannot be
+    /// added to this struct without this failing to compile.
+    #[must_use]
+    pub fn byte_size(&self) -> u64 {
+        let Self {
+            codes,
+            scales,
+            gpu_codes_buf,
+            gpu_scales_buf,
+            // Geometry / bookkeeping about the buffers above, not allocations.
+            gpu_words_per_step: _,
+            gpu_scales_per_step: _,
+            gpu_capacity: _,
+            shape: _,
+            max_seq: _,
+        } = self;
+        crate::bytes::vec_bytes(codes)
+            + crate::bytes::vec_bytes(scales)
+            + crate::bytes::opt_array_bytes(gpu_codes_buf.as_ref())
+            + crate::bytes::opt_array_bytes(gpu_scales_buf.as_ref())
+    }
+
     /// Append a new K slice. Picks CPU or GPU path from `device`.
     #[allow(
         clippy::indexing_slicing,

@@ -153,6 +153,27 @@ pub struct PlanarBlocks {
     pub bits: u8,
 }
 
+impl PlanarBlocks {
+    /// Heap bytes this block holds.
+    ///
+    /// The exhaustive destructure is the drift guard: a new payload field
+    /// cannot be added without this failing to compile. See [`crate::bytes`].
+    #[must_use]
+    pub fn byte_size(&self) -> u64 {
+        let Self {
+            codes,
+            scales,
+            rotations,
+            // Inline metadata (no heap payload).
+            original_shape: _,
+            bits: _,
+        } = self;
+        crate::bytes::vec_bytes(codes)
+            + crate::bytes::vec_bytes(scales)
+            + crate::bytes::vec_bytes(rotations)
+    }
+}
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /// Pairs per block: `GROUP_SIZE / 2`.

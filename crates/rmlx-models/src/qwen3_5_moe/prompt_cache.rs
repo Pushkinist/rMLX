@@ -115,7 +115,7 @@ impl PromptCacheEntry for Qwen35MoeEntry {
 
     // Hybrid GDN arch: real recurrent caches. The default `truncate_kv_to`
     // deliberately cannot reach these (recurrent state is re-run on the tail,
-    // never sliced), and the default `kv_bytes` sums their `approx_bytes`.
+    // never sliced), and the default `kv_bytes` sums their `resident_bytes`.
     fn lin_caches(&self) -> &[LinearAttnCache] {
         &self.lin_caches
     }

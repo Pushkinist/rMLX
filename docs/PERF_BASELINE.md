@@ -2029,7 +2029,7 @@ re-quantises K every decode step and routes V through
 clone+eval+store on the new predicate `KvQuant::feeds_bf16_k_at_decode()`
 (`false` for the K-only family, `true` for every shortcut codec). The bf16 V
 seed stays unconditional; the `KvStorage::None` bf16-fallback path still forces
-the K seed. `approx_bytes` now counts K and V seeds independently.
+the K seed. `resident_bytes` counts K and V seeds independently.
 
 **Pure RAM reclaim — output byte-unchanged.** Verified on Bonsai-8B-2bit
 (`Qwen3ForCausalLM`), GPU, `release-perf`, 2026-06-03:
@@ -2056,6 +2056,6 @@ Bonsai: `num_kv_heads=8`, `head_dim=128`, `n_layers=36`):
 
 (Whole-process RSS at 4k is dominated by ~2.5 GB model weights + Metal buffers,
 so the per-cache K-seed delta is below RSS noise there; the deterministic
-`approx_bytes` accounting is the authoritative measure and is regression-locked
-by the warm-TTFT K-only tests, which assert the seed is absent and
-`approx_bytes` drops.)
+`resident_bytes` accounting is the authoritative measure and is regression-locked
+by the warm-TTFT K-only tests, which assert the seed is absent and that the
+reported total is the K store plus the surviving V seed and nothing else.)

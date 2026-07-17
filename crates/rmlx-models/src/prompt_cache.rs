@@ -305,7 +305,7 @@ pub(crate) trait PromptCacheEntry: Sized {
 
     /// Approximate RAM held by this entry's KV/recurrent state, in bytes.
     ///
-    /// Default body sums KV `resident_bytes` plus linear-attn `approx_bytes`
+    /// Default body sums KV `resident_bytes` plus linear-attn `resident_bytes`
     /// (the latter is empty for pure-attention archs). Used by
     /// `PromptCache::stats()` to populate `CacheStats::bytes` and by the
     /// RAM-cap eviction policy in `push`. Best-effort estimate — does not
@@ -318,7 +318,7 @@ pub(crate) trait PromptCacheEntry: Sized {
             + self
                 .lin_caches()
                 .iter()
-                .map(LinearAttnCache::approx_bytes)
+                .map(LinearAttnCache::resident_bytes)
                 .sum::<u64>()
     }
 
@@ -1373,7 +1373,15 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
 
     /// Store the KV-cache bytes for the just-finished request. Called by
     /// `generate_greedy` at request boundary.
+    ///
+    /// Also emits the `kv_bytes` event. This is the one place it is emitted:
+    /// `n` is already summed over every cache by the caller, so the event costs
+    /// nothing extra. Emitting it per-layer per-decode-step instead would call
+    /// `KvCache::resident_bytes` — which walks a block list that grows by one
+    /// entry per decode step — making a generation quadratic in context for the
+    /// sake of a diagnostic.
     pub(crate) fn store_kv_cache_bytes(&self, n: u64) {
+        tracing::debug!(kv_bytes = n, "kv cache bytes");
         self.last_kv_bytes
             .store(n, std::sync::atomic::Ordering::Relaxed);
     }

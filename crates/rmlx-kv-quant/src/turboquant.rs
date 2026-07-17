@@ -147,6 +147,24 @@ pub struct TurboBlocks {
     pub bits: u8,
 }
 
+impl TurboBlocks {
+    /// Heap bytes this block holds.
+    ///
+    /// The exhaustive destructure is the drift guard: a new payload field
+    /// cannot be added without this failing to compile. See [`crate::bytes`].
+    #[must_use]
+    pub fn byte_size(&self) -> u64 {
+        let Self {
+            codes,
+            scales,
+            // Inline metadata (no heap payload).
+            original_shape: _,
+            bits: _,
+        } = self;
+        crate::bytes::vec_bytes(codes) + crate::bytes::vec_bytes(scales)
+    }
+}
+
 /// Cold helper: "bits=8 not supported — use affine q8_0" error.
 ///
 /// This arm fires at validation time only (loader or parameter-check call),

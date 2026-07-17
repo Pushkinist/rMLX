@@ -111,22 +111,26 @@ impl LinearAttnCache {
         );
     }
 
-    /// Approximate RAM held by this recurrent state, in bytes.
+    /// Resident RAM held by this recurrent state, in bytes.
     ///
     /// Both `conv_state` and `delta_state` are fixed-shape tensors (independent
-    /// of sequence length). Assumes bf16 (2 bytes per element). Returns 0 if
-    /// neither field has been populated yet.
-    pub fn approx_bytes(&self) -> u64 {
-        let mut total: u64 = 0;
-        if let Some(a) = &self.conv_state {
-            let n: u64 = a.shape().iter().map(|&d| d as u64).product();
-            total += n * 2; // bf16
-        }
-        if let Some(a) = &self.delta_state {
-            let n: u64 = a.shape().iter().map(|&d| d as u64).product();
-            total += n * 4; // f32 (delta_state is always f32)
-        }
-        total
+    /// of sequence length). Each buffer's size comes from its own shape ×
+    /// dtype, so a state that is promoted to a wider dtype reports the truth
+    /// with nothing to update here — this total feeds the same `kv_bytes` sum
+    /// as the attention caches, and a hard-coded item size is how such a sum
+    /// silently drifts away from the memory it claims to measure.
+    ///
+    /// Returns 0 if neither field has been populated yet.
+    ///
+    /// The exhaustive destructure is the drift guard: a new buffer cannot be
+    /// added to this struct without this failing to compile.
+    pub fn resident_bytes(&self) -> u64 {
+        let Self {
+            conv_state,
+            delta_state,
+        } = self;
+        crate::bytes::opt_array_bytes(conv_state.as_ref())
+            + crate::bytes::opt_array_bytes(delta_state.as_ref())
     }
 
     /// Snapshot the recurrent state at the start of a speculative round.
