@@ -63,8 +63,11 @@ rot_k_fwht_rotate_d512.metal | rot_k.hdr.metal | inp:f,out:f
 # line over the same body.
 rotor_flash_decode_p1.metal | rotor_flash_decode_p1_b3.hdr.metal | query:f,codes:u,scales:f,norms:f,rotors:f,v_flat:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
 rotor_flash_decode_p1.metal | rotor_flash_decode_p1_b4.hdr.metal | query:f,codes:u,scales:f,norms:f,rotors:f,v_flat:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
-rotor_fused_qk_b3.metal | rotor_fused_qk_b3.hdr.metal | query:f,codes:u,scales:f,norms:f,rotors:f,mask:f,scale_arr:f,dims:u,out:f
-rotor_fused_qk_b4.metal | rotor_fused_qk_b4.hdr.metal | query:f,codes:u,scales:f,norms:f,rotors:f,mask:f,scale_arr:f,dims:u,out:f
+# One fused-QK body serves both rotor bit widths — the unpack width arrives via
+# the header (RF_BITS / RF_MASK), so each header gets its own probe line over the
+# same body.
+rotor_fused_qk.metal | rotor_fused_qk_b3.hdr.metal | query:f,codes:u,scales:f,norms:f,rotors:f,mask:f,scale_arr:f,dims:u,out:f
+rotor_fused_qk.metal | rotor_fused_qk_b4.hdr.metal | query:f,codes:u,scales:f,norms:f,rotors:f,mask:f,scale_arr:f,dims:u,out:f
 rotorquant_quantize_rotor3.metal | rotorquant_rotor3.hdr.metal | inp:f,rotors_in:f,n_groups:u,head_dim:u,codes_out:u,scales_out:f,norms_out:f
 rotorquant_dequantize_rotor3.metal | rotorquant_rotor3.hdr.metal | codes_in:u,scales_in:f,norms_in:f,rotors_in:f,n_groups:u,head_dim:u,out:f
 rotorquant_quantize_rotor4.metal | rotorquant_rotor4.hdr.metal | inp:f,rotors_in:f,n_groups:u,head_dim:u,codes_out:u,scales_out:f,norms_out:f
