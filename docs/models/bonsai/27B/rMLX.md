@@ -74,10 +74,31 @@ directly. KV-MB from serve events `op='kv_cache_bytes'` high-water (the `baselin
 - **`planar` direction-flip.** `planar` **beats** `none` on the 27B (+1…+9 %,
   growing with ctx) but **lost** to `none` on the 8B. Same build, opposite sign —
   flagged, not diagnosed (§5).
-- **4-bit-V still craters.** `k8v4` (51→30→22→16→10→**5.6**) and `rot_k_tq4v`
-  (48→42→34→27→19→**11.7**) — the tq4-V dequant cost, same class as the 8B. `k8v4`
-  is the worse of the two (4-bit-V is expensive on this arch). `k8v8` (8-bit V)
-  tracks `none`. **Avoid 4-bit V here.**
+- **4-bit-V is slow *and* broken (see the 2026-07-17 correction below).** The
+  `k8v4` decode cost is real — a clean re-measurement that keeps generation
+  *below* the KV boundary gives **50.4 / 15.5 / 5.0** TPS at 4k/32k/128k vs a
+  same-machine `k8v8` control **45.1 / 37.3 / 21.4** (a genuine, context-growing
+  tq4-V cost: `k8v4` ties `k8v8` at 4k, is 2.4× slower at 32k, 4.3× slower at
+  128k). `rot_k_tq4v` (48→…→11.7) shares it; `k8v8` (8-bit V) tracks `none`. But
+  `k8v4` decode *also* **crashes at the next power-of-two KV boundary** (still
+  live), so it cannot generate across a `2^k` boundary. **Avoid 4-bit V here.**
+
+> **Correction (2026-07-17, `626381e`, re: #241).** The `k8v4` row was suspected
+> to be a swallowed-crash artifact (#233/#235). Re-measurement refutes that for
+> the *numbers* and confirms it for the *runs*. The decode **rates are genuine**:
+> clean runs kept below the KV boundary (`max_tokens=200`, every step completes,
+> `finish_reason=length`) reproduce the recorded curve, and a same-machine `k8v8`
+> control confirms a real tq4-V cost — **so the tq4-V explanation stands.** But
+> every recorded `k8v4` cell was a **truncated crashing run**: `k8v4` decode dies
+> exactly when `prompt_len + generated` reaches `2^k`
+> (`reshape: array of size 0 into (1,4,1,64)`, the #233 class; #238 did **not**
+> fix the paged 4-bit-V path), delivering only 242–250 of the 256 requested
+> tokens. The per-token rate survived because the death is at the tail. The
+> failure is masked to the streaming client (`finish_reason=null` via the
+> retry-replay envelope), a #235-class gap on the streaming path. Net: `k8v4` is
+> **broken, not merely slow** — a stronger reason to avoid 4-bit V than this doc
+> originally gave. The boundary crash needs its own tracking bug. (`rot_k_tq4v`
+> shares the tq4-V decode cost; its boundary-crash behaviour was not re-verified.)
 - **`none` is the smallest KV of any codec** (bf16, ≈2 B/element): 419 MB @4k →
   8865 MB @128k. Every quantized codec carries a *larger* resident KV (1.20×–3.43×),
   so `none` is both the honest headline number and the memory winner (§2.1).
@@ -146,15 +167,17 @@ no speculative / MTP grid (§0).
 **Cell = `decodeTPS · r0TTFT(s) · KV-MB`.** decode + cold r0 TTFT from serve +
 `run_one` (load-once, chat-templated); `KV-MB` from the serve events-table
 `kv_cache_bytes` high-water-mark (§M). Markers: `†` = 128k value is the **cold r0**
-number (warm-cache decode stalls — Tier-2 `*_sym`, see below / §5). `—·—·—` =
-not captured. K-only rows (`k_iso* / k_rotor*`) are **capped, CPU-bound** — their
-decode is a reduced-token probe (`max_tokens 8–64`, n=1), not a steady-state
-256-token rate.
+number (warm-cache decode stalls — Tier-2 `*_sym`, see below / §5). `‡` = decode
+**crashes at the next power-of-two KV boundary** — the cell is a *truncated
+crashing run* (242–250 of 256 tokens; the per-token rate is genuine, but the run
+does not complete — see the §0 correction / §5 / §4.3). `—·—·—` = not captured.
+K-only rows (`k_iso* / k_rotor*`) are **capped, CPU-bound** — their decode is a
+reduced-token probe (`max_tokens 8–64`, n=1), not a steady-state 256-token rate.
 
 | KV | 4k | 8k | 16k | 32k | 64k | 128k |
 |---|---|---|---|---|---|---|
 | none | 50.9·14.8s·419 | 47.7·32.0s·692 | 41.7·67.9s·1237 | 37.9·147.5s·2327 | 31.3·335.0s·4507 | 23.7·815.4s·8865 |
-| k8v4 | 51.1·14.9s·519 | 29.7·32.2s·1063 | 22.4·70.2s·1979 | 15.7·144.9s·3811 | 10.0·315.4s·7477 | 5.6·773.6s·14795 |
+| k8v4‡ | 51.1·14.9s·519 | 29.7·32.2s·1063 | 22.4·70.2s·1979 | 15.7·144.9s·3811 | 10.0·315.4s·7477 | 5.6·773.6s·14795 |
 | k8v8 | 51.0·14.9s·535 | 47.6·32.1s·923 | 40.8·69.4s·1699 | 37.0·148.5s·3251 | 31.4·331.0s·6356 | 23.7·813.3s·12555 |
 | planar | 51.6·14.9s·631 | 48.4·32.1s·1115 | 44.9·64.8s·2084 | 40.2·139.9s·4021 | 33.6·314.4s·7895 | 25.8·768.0s·15630 |
 | planar3 | 50.3·14.9s·662 | 47.6·32.3s·1170 | 44.2·65.1s·2185 | 39.6·142.0s·4216 | 33.0·319.5s·8278 | 25.0·785.6s·16387 |
@@ -312,12 +335,18 @@ Ranked by impact:
    a chunkwise-parallel delta-rule prefill kernel (Bonsai-8B, dense 2-bit, *no GDN*,
    prefills fast on the same quant-GEMM path — confirming GDN is the delta). Top perf
    follow-up.
-3. **4-bit-V dequant is expensive on this arch — avoid tq4-V.** `k8v4`
-   (−38…−76 % vs `none` from 8k up) and `rot_k_tq4v` (−11…−50 %) both crater
-   progressively; `k8v8` (8-bit V) tracks `none`. `k8v4` is the worse of the two
-   (5.6 TPS @128k vs `rot_k_tq4v` 11.7 — the rotation K-side partially offsets the
-   shared tq4-V cost). Either a faster V-4bit decode kernel, or steer `auto` away
-   from 4-bit V on this arch.
+3. **4-bit-V is broken *and* slow — the boundary crash is the P0, the dequant
+   cost the P1.** *(a)* `k8v4` decode **crashes at the next power-of-two KV
+   boundary**: generation dies exactly when `prompt_len + generated` reaches
+   `2^k` (`reshape: array of size 0 into (1,4,1,64)`, the #233 class, still live
+   on `626381e` — #238 did not cover the paged 4-bit-V path). The retry envelope
+   then masks it as `finish_reason=null` to the streaming client (a #235-class
+   gap). This is a shippable-blocker bug, not a perf item — it needs its own
+   ticket. *(b)* Independently, the tq4-V **dequant cost is real** (clean,
+   boundary-safe re-measurement 2026-07-17: `k8v4` 50.4/15.5/5.0 vs a `k8v8`
+   control 45.1/37.3/21.4 at 4k/32k/128k — a tie at 4k growing to 4.3× slower at
+   128k); `rot_k_tq4v` shares it, `k8v8` (8-bit V) tracks `none`. Either a faster
+   V-4bit decode kernel, or steer `auto` away from 4-bit V on this arch.
 4. **`*_sym` 128k warm-cache decode stall — investigate the prompt-cache rebuild.**
    All four `*_sym` codecs show a reproducible single-large-stall on **warm-cache**
    128k requests: `itl_p50` stays healthy (~36 ms/tok ⇒ ~28 TPS) but the aggregate
@@ -363,8 +392,14 @@ Ranked by impact:
   `timeout 1400` killed the client ~15 s early, so no KV-MB/decode row exists);
   `k_rotor4` 128k **skipped** (time budget) and `k_rotor4` 16k/32k/64k are
   **KV-MB-only** (`max_tokens=1` fills, decode not measured).
-- **`k8v4` 4k→8k cliff** (51→30) then a smooth crater — the tq4-V cost appears from
-  8k up; reproduced by `rot_k_tq4v` (same tq4-V), so it is a real codec cost.
+- **`k8v4` is a real tq4-V cost *on top of* a boundary crash** (2026-07-17
+  re-measurement, #241). The rate curve is genuine — the 4k→8k cliff (51→30) then
+  smooth crater is a real tq4-V dequant cost (confirmed clean vs a same-machine
+  `k8v8` control), reproduced by `rot_k_tq4v`. But the recorded cells are also
+  **truncated crashing runs**: `k8v4` decode dies when `prompt_len + generated`
+  hits the next power of two (242–250 of 256 tokens delivered), so `k8v4` cannot
+  generate across a `2^k` boundary. The rate survived because the death is at the
+  tail; the codec is nonetheless broken for real use — see the §0 correction.
 - **No MTP / speculative** — Bonsai declares an MTP head but ships no `mtp.*`
   weights (inert).
 - **No §6 weight-quant sweep** — one on-disk 2-bit snapshot; no QAT siblings.
