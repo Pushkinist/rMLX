@@ -384,9 +384,11 @@ data: [DONE]
 
 A stream that carries no `finish_reason` chunk did **not** complete. Clients and
 harnesses must treat the absence of a terminal `finish_reason` — or the presence
-of an `error` key — as a failure, never as a short answer. `finish_reason` is
-never `"error"`: that value is not in the OpenAI enum, and the Anthropic mapping
-below would launder it into a successful `stop_reason`.
+of an `error` key — as a failure, never as a short answer. The engine does not
+currently emit `finish_reason:"error"` (it is not in the OpenAI enum); if it
+ever did, the Anthropic mapping below surfaces an unrecognised reason as an
+explicit `"error"` stop reason rather than laundering it into a successful
+`stop_reason`.
 
 ### Stop-sequence truncation
 
@@ -427,15 +429,17 @@ Anthropic `stop_reason` field via `map_stop_reason` in
 
 | Engine `finish_reason` | Anthropic `stop_reason` |
 |---|---|
-| `"stop"` (natural EOS) | `"end_turn"` |
+| `"stop"` (natural EOS) / `None` (unmarked clean terminal) | `"end_turn"` |
 | `"length"` (token cap) | `"max_tokens"` |
 | `"tool_calls"` | `"tool_use"` |
-| anything else / `None` | `"end_turn"` |
+| anything else (unrecognised) | `"error"` |
 
-The `anything else / None → "end_turn"` row is why a failed generation must
-never reach this mapping: it resolves every unknown reason to a *successful*
-stop. A stream that dies mid-flight instead terminates with Anthropic's native
-`error` event and emits no `message_delta` / `message_stop`:
+Only reasons with an explicit success contract map to a successful stop. An
+unrecognised or future reason maps to an explicit `"error"` stop reason — never
+laundered into `"end_turn"` — so a masked failure cannot be reported as a normal
+completion on `/v1/messages`. A stream that dies mid-flight does not reach this
+mapping at all: it terminates with Anthropic's native `error` event and emits no
+`message_delta` / `message_stop`:
 
 ```
 event: error
@@ -939,7 +943,14 @@ Errors are classified as `RetryClass::Migratable` or `RetryClass::Fatal`:
 | Class | Conditions | Action |
 |---|---|---|
 | `Migratable` | `RmlxError::Mlx` (any Metal error), `RmlxError::Other` (engine panic) | Replay permitted. |
-| `Fatal` | `SmokeProbe` (NaN logits), `Oom`, `Config`, `Loader`, `Quant`, `Model`, `Io` | No retry; surface error. |
+| `Fatal` | every other variant — `SmokeProbe` (NaN logits), `Oom`, `Config`, `Loader`, `Quant`, `Model`, `Io`, `ArchUnsupported`, `KvStorageMismatch`, `SsdTierAlreadyInstalled`, `Unimplemented`, `KvHardCapExceeded`, `KvCeilingExceeded`, `SpeculativePairing` | No retry; surface error. |
+
+`classify` delegates to `RmlxError::is_migratable`, whose match over the error
+enum is **exhaustive with no wildcard arm**. `RmlxError` is `#[non_exhaustive]`,
+so that match must live in the crate that defines the variants (`rmlx-core`);
+there, adding a variant fails the build until it is explicitly classified as
+transient or permanent — a new error can never silently default into a retry
+bucket.
 
 ### Skip conditions
 
