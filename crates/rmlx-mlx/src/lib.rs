@@ -83,7 +83,80 @@ pub(crate) fn install_error_handler() {
         unsafe {
             sys::mlx_set_error_handler(Some(handler), ptr::null_mut(), None);
         }
+        warn_on_mlx_version_skew();
     });
+}
+
+/// The MLX version `rmlx-mlx` was compiled against (from `mlx/version.h`,
+/// captured by `build.rs`). `"unknown"` when the header was unreadable.
+const MLX_BUILD_VERSION: &str = env!("RMLX_MLX_BUILD_VERSION");
+
+/// Read the MLX version of the dylib actually loaded into this process.
+///
+/// Returns `None` if mlx-c reports an error or hands back a null string.
+fn runtime_mlx_version() -> Option<String> {
+    // SAFETY: mlx_version writes an owned mlx_string on success (status 0).
+    // mlx_string_data borrows its NUL-terminated buffer, which stays valid
+    // until mlx_string_free; the value is copied out before freeing.
+    unsafe {
+        let mut s = sys::mlx_string_new();
+        if sys::mlx_version(&raw mut s) != 0 {
+            let _ = sys::mlx_string_free(s);
+            return None;
+        }
+        let data = sys::mlx_string_data(s);
+        let out = if data.is_null() {
+            None
+        } else {
+            Some(
+                std::ffi::CStr::from_ptr(data)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        };
+        let _ = sys::mlx_string_free(s);
+        out
+    }
+}
+
+/// Warn when the loaded MLX differs from the one this binary was built against.
+///
+/// The linked dylib's install name is a Homebrew `opt` symlink, so upgrading
+/// MLX silently redirects this binary to a different library and metallib with
+/// no rebuild. That skew is an ABI hazard and has been observed to cost a large
+/// factor of GPU matmul throughput, which shows up only as slow prefill — an
+/// easy defect to misattribute to model code. Surface it instead of letting it
+/// pass silently.
+///
+/// Warn (not fail): a skew is usually benign-but-slow, and a hard error here
+/// would brick every run on a host whose package manager moved ahead.
+fn warn_on_mlx_version_skew() {
+    if MLX_BUILD_VERSION == "unknown" {
+        return;
+    }
+    let Some(runtime) = runtime_mlx_version() else {
+        return;
+    };
+    // The runtime string carries a ".devYYYYMMDD+hash" suffix on dev builds;
+    // compare only the leading "major.minor.patch".
+    let runtime_core = runtime.split(['-', '+']).next().unwrap_or(&runtime);
+    let runtime_core = runtime_core
+        .split('.')
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(".");
+    if runtime_core != MLX_BUILD_VERSION {
+        tracing::warn!(
+            build_version = MLX_BUILD_VERSION,
+            runtime_version = %runtime,
+            "MLX build/runtime version skew: this binary was compiled against \
+             MLX {MLX_BUILD_VERSION} but loaded MLX {runtime}. The linked dylib \
+             resolves through a package-manager symlink, so an upgrade swaps it \
+             without a rebuild. Expect ABI risk and possible large GPU-throughput \
+             differences (prefill). Rebuild against the loaded version, or pin \
+             the package back to {MLX_BUILD_VERSION}."
+        );
+    }
 }
 
 /// Check the return code of a mlx-c function call.

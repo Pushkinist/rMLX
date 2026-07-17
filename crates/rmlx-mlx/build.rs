@@ -18,6 +18,32 @@
 use std::env;
 use std::path::PathBuf;
 
+/// Parse `MLX_VERSION_{MAJOR,MINOR,PATCH}` out of MLX's `version.h`.
+///
+/// The header is the authoritative source for the version of the tree we
+/// compile against — the Cellar directory name is only a Homebrew convention.
+/// Returns `"unknown"` when the header cannot be read or parsed; the runtime
+/// check treats that as "cannot verify" and stays quiet rather than crying
+/// wolf on a non-Homebrew layout.
+fn read_mlx_version(header: &str) -> String {
+    let Ok(src) = std::fs::read_to_string(header) else {
+        return "unknown".to_owned();
+    };
+    let field = |name: &str| -> Option<String> {
+        src.lines()
+            .find_map(|l| l.strip_prefix(&format!("#define {name} ")))
+            .map(|v| v.trim().to_owned())
+    };
+    match (
+        field("MLX_VERSION_MAJOR"),
+        field("MLX_VERSION_MINOR"),
+        field("MLX_VERSION_PATCH"),
+    ) {
+        (Some(a), Some(b), Some(c)) => format!("{a}.{b}.{c}"),
+        _ => "unknown".to_owned(),
+    }
+}
+
 fn main() {
     // Rebuild triggers.
     println!("cargo:rerun-if-env-changed=MLX_C_PREFIX");
@@ -55,6 +81,21 @@ fn main() {
          Install with: brew install mlx. \
          Or set MLX_PREFIX to the correct cellar path."
     );
+
+    // Record the MLX version we compile against, so the runtime can detect a
+    // build-vs-runtime skew.
+    //
+    // This matters because the linked dylib's install name is the Homebrew
+    // `opt` symlink (`/opt/homebrew/opt/mlx/lib/libmlx.dylib`), not the Cellar
+    // path resolved above. The symlink follows whatever version Homebrew has
+    // linked *now*, so upgrading MLX silently swaps the library this binary
+    // loads — a different dylib and a different `mlx.metallib` — with no
+    // rebuild and no error. The two versions can differ in ABI and in kernel
+    // throughput, so the skew must not pass unnoticed.
+    let version_header = format!("{mlx_prefix}/include/mlx/version.h");
+    println!("cargo:rerun-if-changed={version_header}");
+    let build_version = read_mlx_version(&version_header);
+    println!("cargo:rustc-env=RMLX_MLX_BUILD_VERSION={build_version}");
 
     // Link search paths.
     println!("cargo:rustc-link-search=native={mlx_c_prefix}/lib");
