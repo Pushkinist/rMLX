@@ -10,12 +10,16 @@
 //! pre-softmax QK score `[B, n_q_heads, 1, S_kv]` — all without materialising
 //! a bf16 / f32 K tensor in HBM.
 //!
-//! Parameterised by `const BITS: u8` at the Rust call site: two
-//! const-function-item dispatchers ([`ROTOR3_FUSED_QK_FN`] /
-//! [`ROTOR4_FUSED_QK_FN`]) select 3-bit (8-entry codebook) or 4-bit (16-entry
-//! codebook) kernel variants. Each variant has its own [`OnceLock`]-cached
-//! compiled [`MetalKernel`] because the MSL source strings differ (codebook
-//! table size + unpack mask / shift).
+//! Parameterised by `const BITS: u8` at the Rust call site
+//! ([`rotor3_fused_qk_sdpa`] / [`rotor4_fused_qk_sdpa`] select 3-bit (8-entry
+//! codebook) or 4-bit (16-entry codebook)). A **single** shared kernel body
+//! ([`build_rotor_fused_qk_source`]) serves both widths — the unpack width and
+//! codebook arrive in the per-BITS runtime header
+//! ([`build_rotor_fused_qk_header`]) as `RF_BITS` / `RF_MASK` plus the codebook
+//! table, so there is no per-BITS body to hand-keep in sync. Each width still
+//! gets its own [`OnceLock`]-cached compiled [`MetalKernel`] because the header
+//! (codebook table size + unpack macros) differs, so the assembled program
+//! differs.
 //!
 //! # Codec contract
 //!
@@ -263,6 +267,9 @@ fn build_rotor_fused_qk_header(bits: u8) -> String {
         n_entries,
         "rotor fused-QK: codebook entry count must match 2^BITS"
     );
+    // Unpack width parameters consumed by the shared kernel body: each of the
+    // 8 codes occupies `RF_BITS` bits of the packed u32, masked by `RF_MASK`.
+    let mask = n_entries as u32 - 1;
 
     let cb_hex: Vec<String> = cb
         .iter()
@@ -273,8 +280,12 @@ fn build_rotor_fused_qk_header(bits: u8) -> String {
     let _ = write!(
         s,
         "\n// Rotor fused-QK header — Cl(3,0) MUL_TABLE + Lloyd-Max N(0,1) codebook.\n\
-         // BITS = {bits} (codebook = {n_entries} entries).\n\
+         // BITS = {bits} (codebook = {n_entries} entries, mask = 0x{mask:X}).\n\
          // Bit-exact with crate::clifford::MUL_TABLE + lloyd_gaussian_codebook({bits}).\n"
+    );
+    let _ = write!(
+        s,
+        "\n#define RF_BITS {bits}u\n#define RF_MASK 0x{mask:X}u\n"
     );
     let _ = write!(
         s,
@@ -285,27 +296,24 @@ fn build_rotor_fused_qk_header(bits: u8) -> String {
     s
 }
 
-/// Select the pre-rendered MSL kernel body for `bits`.
+/// Return the shared MSL kernel body.
 ///
-/// There are two independent body files, one per BITS. They differ only in the
-/// unpack shift / mask; the rest is duplicated between them and must be edited
-/// in both.
+/// A single body serves both bit widths: the unpack width arrives from the
+/// header as `RF_BITS` / `RF_MASK` (see [`build_rotor_fused_qk_header`]), so
+/// there is no per-BITS body to keep in sync. The `bits` argument is still
+/// validated so an unsupported width fails loudly rather than compiling a body
+/// against a header that never defined its unpack macros.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Quant`] for any `bits` outside {3, 4}, rather than
-/// silently handing back a body for the wrong bit width.
+/// Returns [`Error::Quant`] for any `bits` outside {3, 4}.
 fn build_rotor_fused_qk_source(bits: u8) -> Result<String> {
-    Ok(match bits {
-        3 => include_str!("metal/rotor_fused_qk_b3.metal"),
-        4 => include_str!("metal/rotor_fused_qk_b4.metal"),
-        _ => {
-            return Err(Error::Quant(format!(
-                "rotor fused-QK: bits must be 3 or 4, got {bits}"
-            )))
-        }
+    if bits != 3 && bits != 4 {
+        return Err(Error::Quant(format!(
+            "rotor fused-QK: bits must be 3 or 4, got {bits}"
+        )));
     }
-    .to_owned())
+    Ok(include_str!("metal/rotor_fused_qk.metal").to_owned())
 }
 
 // ── Kernel singletons (one per BITS variant) ─────────────────────────────────
