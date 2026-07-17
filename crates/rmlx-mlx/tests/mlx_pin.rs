@@ -171,3 +171,133 @@ fn needle_absent_reports_false() {
     // A near-miss must not count: this is the 0-vs-360 distinction itself.
     assert!(!contains_needle(b"steel_gemm_fused_max".as_slice(), needle, 8).unwrap());
 }
+
+#[test]
+fn chip_generation_reads_the_marketing_number() {
+    assert_eq!(chip_generation("Apple M5 Max"), Some(5));
+    assert_eq!(chip_generation("Apple M5"), Some(5));
+    assert_eq!(chip_generation("Apple M1"), Some(1));
+    assert_eq!(chip_generation("Apple M2 Pro"), Some(2));
+    assert_eq!(chip_generation("Apple M4 Max"), Some(4));
+    assert_eq!(chip_generation("  Apple M3 Ultra  "), Some(3));
+}
+
+#[test]
+fn chip_generation_declines_non_apple_silicon_strings() {
+    assert_eq!(chip_generation(""), None);
+    assert_eq!(
+        chip_generation("Intel(R) Core(TM) i9-9880H CPU @ 2.30GHz"),
+        None
+    );
+    // Right prefix, no digits after it.
+    assert_eq!(chip_generation("Apple M"), None);
+}
+
+#[test]
+fn is_na_class_host_is_true_only_from_m5_onward() {
+    // The exact boundary this whole gate exists to draw: M1-M4 never had a
+    // Neural Accelerator, M5 and later do.
+    assert!(!is_na_class_host("Apple M1"));
+    assert!(!is_na_class_host("Apple M2 Pro"));
+    assert!(!is_na_class_host("Apple M3 Max"));
+    assert!(!is_na_class_host("Apple M4"));
+    assert!(is_na_class_host("Apple M5"));
+    assert!(is_na_class_host("Apple M5 Max"));
+    // Unidentifiable input must not be guessed as NA-class.
+    assert!(!is_na_class_host(""));
+    assert!(!is_na_class_host(
+        "Intel(R) Core(TM) i9-9880H CPU @ 2.30GHz"
+    ));
+}
+
+#[test]
+fn nax_warning_level_matrix() {
+    // NA-class host, kernels confirmed missing -> loud (today's behaviour).
+    assert_eq!(nax_warning_level(true, false), NaxWarningLevel::Loud);
+    // Non-NA host, kernels missing -> silent: exactly the macos-14 CI case.
+    assert_eq!(nax_warning_level(false, false), NaxWarningLevel::Silent);
+    // Kernels present -> silent regardless of host.
+    assert_eq!(nax_warning_level(true, true), NaxWarningLevel::Silent);
+    assert_eq!(nax_warning_level(false, true), NaxWarningLevel::Silent);
+}
+
+#[test]
+fn ci_m1_runner_with_missing_kernels_stays_silent() {
+    // The exact scenario the bug report describes: GitHub's macos-14 runners
+    // are M1, which never had a Neural Accelerator, so the metallib
+    // legitimately ships no nax kernels there and that must not be alarming.
+    // This cannot be run against real CI from this dev machine (it is an M5
+    // and cannot reproduce the missing-kernel finding), so the M1 brand
+    // string is asserted directly through the same pure decision the real
+    // build uses.
+    let ci_host = is_na_class_host("Apple M1");
+    assert!(!ci_host);
+    assert_eq!(nax_warning_level(ci_host, false), NaxWarningLevel::Silent);
+}
+
+#[test]
+fn dev_m5_host_with_kernels_present_stays_silent() {
+    // This machine, run for real: M5, and its Homebrew mlx 0.31.2 ships the
+    // nax kernels. The one cell of the matrix actually exercised on this box.
+    let dev_host = is_na_class_host("Apple M5 Max");
+    assert!(dev_host);
+    assert_eq!(nax_warning_level(dev_host, true), NaxWarningLevel::Silent);
+}
+
+/// The pin fixture with an mlx-c value distinct from the resolved one, so
+/// tests can tell "the pin's pair" from "the pair currently in scope" apart
+/// in assertions.
+fn nax_message_fixture_pin() -> MlxPin {
+    MlxPin {
+        mlx: "0.31.2".to_owned(),
+        mlx_c: "0.6.0_2".to_owned(),
+    }
+}
+
+#[test]
+fn loud_message_reports_the_absence_without_the_ships_them_contradiction() {
+    let pin = nax_message_fixture_pin();
+    let lines = nax_missing_kernel_lines(
+        "/opt/homebrew/opt/mlx",
+        "0.32.0",
+        "0.6.0_3",
+        &pin,
+        "steel_gemm_fused_nax",
+        "crates/rmlx-mlx/mlx-pin.txt",
+    );
+    let joined = lines.join("\n");
+
+    // States the finding plainly.
+    assert!(joined.contains("ships no steel_gemm_fused_nax kernels"));
+
+    // Must not restate the fixed self-contradiction: claiming, in the same
+    // breath as reporting an absence, that the pinned pair's metallib ships
+    // the very kernels just found missing.
+    assert!(
+        !joined.contains("whose metallib ships them"),
+        "must not assert what an uninspected bottle contains: {joined}"
+    );
+    // Must instead hedge: the pin records what one bottle had, not a promise
+    // about this or any other bottle.
+    assert!(
+        joined.contains("does not guarantee"),
+        "must hedge that the version pin alone promises nothing about kernel presence: {joined}"
+    );
+}
+
+#[test]
+fn loud_message_never_hard_fails() {
+    // The report is pure string-building with no I/O and no panics: whatever
+    // the inputs, it always yields lines to print with `cargo:warning=`,
+    // never a build abort. A public user on any layout must still build.
+    let pin = nax_message_fixture_pin();
+    let lines = nax_missing_kernel_lines(
+        "",
+        "unknown",
+        "unknown",
+        &pin,
+        "steel_gemm_fused_nax",
+        "crates/rmlx-mlx/mlx-pin.txt",
+    );
+    assert!(!lines.is_empty());
+}
