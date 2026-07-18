@@ -755,3 +755,192 @@ async fn row_count_all_retries_exhausted_three_attempts() {
         "exhausted-retry path must call generate 3 times"
     );
 }
+
+// ── prompt-aware replay reconstruction ─────────────────────────────────────
+//
+// `MockGenerator` ignores the prompt, so it re-emits the same sequence on
+// every attempt regardless of what `build_request` reconstructs — the blind
+// spot that let the prompt/skip_count double-count hide. The generators below
+// couple output to the prompt exactly as the real engine does (prefill the
+// prompt, emit only the deterministic continuation that follows it) so the
+// tests actually exercise the reconstructed (prompt, skip_count) pair.
+
+/// Prompt-aware engine model. `full` is the complete temp=0 generation for
+/// `base_prompt`. A request whose prompt extends `base_prompt` by `extra`
+/// tokens yields `full[extra..]` — the first `extra` continuation tokens are
+/// now part of the prompt, already consumed. Attempt 0 crashes after
+/// `crash_after` emitted tokens with a Migratable error; later attempts
+/// complete. A correct replay re-issues the *original* prompt (extra == 0), so
+/// the engine re-emits the delivered prefix and the loop skips exactly
+/// `delivered.len()` matching tokens. The buggy double-count appends the
+/// delivered tokens to the prompt (extra == delivered.len()), so the engine
+/// skips straight to the continuation and the skip compares mismatched
+/// positions → a spurious divergence.
+struct PromptAwareGen {
+    base_prompt_len: usize,
+    full: Vec<u32>,
+    crash_after: usize,
+    call_count: Arc<AtomicUsize>,
+}
+
+impl Generator for PromptAwareGen {
+    fn generate(
+        &self,
+        req: GenerationRequest,
+    ) -> Pin<Box<dyn futures::stream::Stream<Item = rmlx_core::Result<GenerationToken>> + Send>>
+    {
+        let attempt = self.call_count.fetch_add(1, Ordering::SeqCst);
+        let extra = req.prompt_tokens.len().saturating_sub(self.base_prompt_len);
+        let budget = req.max_tokens as usize;
+        let crash_after = self.crash_after;
+        let items: Vec<rmlx_core::Result<GenerationToken>> = self
+            .full
+            .iter()
+            .skip(extra)
+            .take(budget)
+            .copied()
+            .enumerate()
+            .flat_map(|(i, token_id)| {
+                if attempt == 0 && i == crash_after {
+                    return vec![Err(E::Mlx("Metal watchdog (mock)".to_owned()))];
+                }
+                vec![Ok(GenerationToken {
+                    token_id,
+                    piece: format!("t{token_id}"),
+                    done: false,
+                    finish_reason: None,
+                    is_thinking: false,
+                    logprobs: None,
+                })]
+            })
+            .collect();
+        Box::pin(futures::stream::iter(items))
+    }
+}
+
+/// Partial-delivery replay on the REAL prompt path must resume seamlessly.
+///
+/// Red-first: this fails against the double-count `build_request` (which
+/// appends the delivered tokens to the prompt *and* skips `delivered.len()`).
+/// With the prompt-aware engine the appended prompt shifts the continuation, so
+/// the skip compares `full[delivered.len()]` against `delivered[0]` and the
+/// replay spuriously diverges — the client receives an error instead of the
+/// full sequence. The consistent fix (original prompt, `skip_count =
+/// delivered.len()`) reproduces the delivered prefix exactly and resumes clean.
+#[tokio::test]
+async fn replay_partial_delivery_prompt_aware_seamless() {
+    let base_prompt = vec![7u32, 8, 9];
+    let full: Vec<u32> = vec![100, 101, 102, 103, 104, 105];
+    let gen = Arc::new(PromptAwareGen {
+        base_prompt_len: base_prompt.len(),
+        full: full.clone(),
+        crash_after: 2, // attempt 0 delivers 2 tokens then a Migratable error
+        call_count: Arc::new(AtomicUsize::new(0)),
+    });
+    let mut s = drive(gen, base_prompt, full.len() as u32, DEFAULT_MAX_RETRIES);
+    let mut received = vec![];
+    let mut err_msg: Option<String> = None;
+    while let Some(item) = s.next().await {
+        match item {
+            Ok(tok) => received.push(tok.token_id),
+            Err(e) => {
+                err_msg = Some(e.to_string());
+                break;
+            }
+        }
+    }
+    assert!(
+        err_msg.is_none(),
+        "prompt-aware partial-delivery replay must resume without a spurious \
+         prefix divergence; got error: {err_msg:?}"
+    );
+    assert_eq!(
+        received, full,
+        "client must see the full deterministic sequence exactly once across the replay"
+    );
+}
+
+/// A GENUINE prefix mismatch on replay must still surface as an error — the
+/// fix removes the *false* divergence, it must not disable divergence
+/// detection. `full_retry` differs from the delivered prefix at position 2
+/// even when replayed from the correct original prompt (simulated
+/// non-determinism), so the prefix-identity guard must fire.
+#[tokio::test]
+async fn replay_prompt_aware_true_divergence_still_caught() {
+    const DIVERGED_TOKEN: u32 = 999;
+    struct PromptAwareDivergeGen {
+        base_prompt_len: usize,
+        full_first: Vec<u32>,
+        full_retry: Vec<u32>,
+        crash_after: usize,
+        call_count: Arc<AtomicUsize>,
+    }
+    impl Generator for PromptAwareDivergeGen {
+        fn generate(
+            &self,
+            req: GenerationRequest,
+        ) -> Pin<Box<dyn futures::stream::Stream<Item = rmlx_core::Result<GenerationToken>> + Send>>
+        {
+            let attempt = self.call_count.fetch_add(1, Ordering::SeqCst);
+            let extra = req.prompt_tokens.len().saturating_sub(self.base_prompt_len);
+            let budget = req.max_tokens as usize;
+            let crash_after = self.crash_after;
+            let source = if attempt == 0 {
+                &self.full_first
+            } else {
+                &self.full_retry
+            };
+            let items: Vec<rmlx_core::Result<GenerationToken>> = source
+                .iter()
+                .skip(extra)
+                .take(budget)
+                .copied()
+                .enumerate()
+                .flat_map(|(i, token_id)| {
+                    if attempt == 0 && i == crash_after {
+                        return vec![Err(E::Mlx("Metal watchdog (mock)".to_owned()))];
+                    }
+                    vec![Ok(GenerationToken {
+                        token_id,
+                        piece: format!("t{token_id}"),
+                        done: false,
+                        finish_reason: None,
+                        is_thinking: false,
+                        logprobs: None,
+                    })]
+                })
+                .collect();
+            Box::pin(futures::stream::iter(items))
+        }
+    }
+
+    let base_prompt = vec![7u32, 8, 9];
+    let gen = Arc::new(PromptAwareDivergeGen {
+        base_prompt_len: base_prompt.len(),
+        // attempt 0 delivers 100,101,102 then crashes (crash_after = 3)
+        full_first: vec![100, 101, 102, 103, 104, 105],
+        // retry genuinely emits a different token at prefix position 2
+        full_retry: vec![100, 101, DIVERGED_TOKEN, 103, 104, 105],
+        crash_after: 3,
+        call_count: Arc::new(AtomicUsize::new(0)),
+    });
+    let mut s = drive(gen, base_prompt, 6, DEFAULT_MAX_RETRIES);
+    let mut delivered = vec![];
+    let mut got_error = false;
+    while let Some(item) = s.next().await {
+        if let Ok(tok) = item {
+            delivered.push(tok.token_id);
+        } else {
+            got_error = true;
+            break;
+        }
+    }
+    assert!(
+        got_error,
+        "a genuine prefix mismatch on replay must still surface as an error"
+    );
+    assert!(
+        !delivered.contains(&DIVERGED_TOKEN),
+        "the diverged token must never reach the client"
+    );
+}

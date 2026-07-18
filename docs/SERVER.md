@@ -969,11 +969,16 @@ When retry is disabled, the handler calls `generator.generate(req)` directly.
 1. Attempt 1 runs with the original `GenerationRequest` (holding the GPU
    admission permit).
 2. Each delivered token id is appended to `delivered`.
-3. On `Migratable` error: the request is rebuilt from a `RequestPlan` with
-   `prompt_tokens = original_prompt_tokens ++ delivered`. At `temperature=0`
-   the decode is deterministic, so the model reproduces the same continuation.
-   The task skips the first `delivered.len()` tokens of the new attempt,
-   asserting prefix identity, and forwards only the new continuation.
+3. On `Migratable` error: the request is rebuilt from a `RequestPlan` that
+   re-issues the **original** prompt unchanged with the full original
+   `max_tokens`. At `temperature=0` the decode is deterministic, so the engine
+   re-emits the already-delivered tokens as its first `delivered.len()` outputs
+   and then continues past the fault point. The task skips those first
+   `delivered.len()` tokens, asserting prefix identity, and forwards only the
+   new continuation. The delivered tokens are **not** appended to the prompt —
+   doing so would double-count them (consumed as prompt *and* skipped on
+   output), shifting the continuation so the skip compares mismatched positions
+   and every legitimate partial-delivery replay spuriously diverges.
 4. On `Fatal` error or attempt exhaustion: the error is forwarded to the caller.
 5. On channel-send failure (client disconnect): the task exits silently — that
    is intentional cancellation, not a transient fault.
