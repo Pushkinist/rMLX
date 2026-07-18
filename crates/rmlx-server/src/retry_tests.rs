@@ -452,6 +452,85 @@ async fn replay_stream_prefix_divergence_aborts() {
     );
 }
 
+/// A real decode-step crash must NOT be laundered into a synthetic "prefix
+/// divergence" message on replay. A deterministic decode crash (e.g. a KV
+/// boundary reshape) reproduces at the same point on retry, so the replay's
+/// first regenerated token differs from the delivered prefix and the divergence
+/// guard fires. The error the client receives must still carry the REAL cause —
+/// otherwise a finish_reason-keying caller cannot tell a crashed stream from a
+/// clean short one.
+#[tokio::test]
+async fn replay_divergence_surfaces_real_crash_not_laundered_message() {
+    // Attempt 0: emit 0,1,2 then a distinctive decode crash (delivers 3).
+    // Attempt 1: diverge at prefix position 2 — the divergence guard fires.
+    const CRASH_MSG: &str = "reshape: Cannot reshape array of size 0 into shape (1,8,1,32)";
+    struct CrashThenDivergeGen {
+        call_count: Arc<AtomicUsize>,
+        tokens: Vec<u32>,
+    }
+    impl Generator for CrashThenDivergeGen {
+        fn generate(
+            &self,
+            _req: GenerationRequest,
+        ) -> Pin<Box<dyn futures::stream::Stream<Item = rmlx_core::Result<GenerationToken>> + Send>>
+        {
+            let attempt = self.call_count.fetch_add(1, Ordering::SeqCst);
+            let tokens = self.tokens.clone();
+            let items: Vec<rmlx_core::Result<GenerationToken>> = tokens
+                .iter()
+                .enumerate()
+                .flat_map(|(i, &token_id)| {
+                    if attempt == 0 && i == 3 {
+                        return vec![Err(E::Mlx(CRASH_MSG.to_owned()))];
+                    }
+                    if attempt >= 1 && i == 2 {
+                        return vec![Ok(GenerationToken {
+                            token_id: 0xDEAD,
+                            piece: "DIVERGED".to_owned(),
+                            done: false,
+                            finish_reason: None,
+                            is_thinking: false,
+                            logprobs: None,
+                        })];
+                    }
+                    vec![Ok(GenerationToken {
+                        token_id,
+                        piece: format!("t{token_id}"),
+                        done: false,
+                        finish_reason: None,
+                        is_thinking: false,
+                        logprobs: None,
+                    })]
+                })
+                .collect();
+            Box::pin(futures::stream::iter(items))
+        }
+    }
+
+    let gen = Arc::new(CrashThenDivergeGen {
+        call_count: Arc::new(AtomicUsize::new(0)),
+        tokens: (0u32..10).collect(),
+    });
+    let mut s = drive(gen, vec![99u32], 10, 2);
+    let mut last_error: Option<String> = None;
+    while let Some(item) = s.next().await {
+        if let Err(e) = item {
+            last_error = Some(e.to_string());
+            break;
+        }
+    }
+    let err = last_error.expect("a decode crash must reach the client as an error");
+    assert!(
+        err.contains("Cannot reshape array of size 0"),
+        "the real decode crash must reach the client, not a laundered message; got: {err}"
+    );
+    assert!(
+        !err.contains("prefix divergence"),
+        "the retry envelope must not launder the crash into a synthetic \
+         'prefix divergence' message; got: {err}"
+    );
+}
+
 /// Underrun: retry terminates before reproducing the delivered prefix —
 /// stream ends with an error.
 #[tokio::test]
