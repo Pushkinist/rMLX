@@ -1574,6 +1574,30 @@ fn ensure_rotor_k_blocks_cover_shape(
     Ok(())
 }
 
+/// V-side mirror of [`ensure_rotor_k_blocks_cover_shape`]: a rotor V store must
+/// reach serialization with its CPU `blocks` covering the full accumulated
+/// `shape[2]`. On the fused symmetric decode path the store keeps a ring-only
+/// tail; the spill clone (`KvCache::try_deep_clone`) materialises it into
+/// complete blocks first. Reject a short store rather than persist a truncated V.
+fn ensure_rotor_v_blocks_cover_shape(
+    blocks_tokens: usize,
+    shape: &[i32],
+    idx: usize,
+) -> Result<()> {
+    if shape.len() != 4 {
+        return Ok(());
+    }
+    let full_tokens: usize = shape.iter().take(3).map(|&d| d.max(0) as usize).product();
+    if blocks_tokens != full_tokens {
+        return Err(BlockIoError::TruncatedStore(format!(
+            "l{idx}.v rotor store: CPU blocks hold {blocks_tokens} tokens but shape {shape:?} \
+             implies {full_tokens} — the ring-only decode tail was not materialised before spill"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 fn write_quant_rotor_k3(
     idx: usize,
     k: Option<&QuantRotorK3>,
@@ -1691,6 +1715,7 @@ fn write_quant_rotor_v3(
     out: &mut Vec<(String, OwnedTensor)>,
 ) -> Result<()> {
     let Some(qv) = v else { return Ok(()) };
+    ensure_rotor_v_blocks_cover_shape(qv.blocks.iter().map(|b| b.n_tokens).sum(), &qv.shape, idx)?;
     let mut codes: Vec<u8> = Vec::new();
     let mut scales: Vec<f32> = Vec::new();
     let mut norms: Vec<f32> = Vec::new();
@@ -1731,6 +1756,7 @@ fn write_quant_rotor_v4(
     out: &mut Vec<(String, OwnedTensor)>,
 ) -> Result<()> {
     let Some(qv) = v else { return Ok(()) };
+    ensure_rotor_v_blocks_cover_shape(qv.blocks.iter().map(|b| b.n_tokens).sum(), &qv.shape, idx)?;
     let mut codes: Vec<u8> = Vec::new();
     let mut scales: Vec<f32> = Vec::new();
     let mut norms: Vec<f32> = Vec::new();
