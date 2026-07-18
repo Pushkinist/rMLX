@@ -125,17 +125,24 @@ pub(crate) struct DecodeCtx<'a> {
     pub resolve_pieces: bool,
 }
 
-/// Proof that a generation's decode phase has completed on the calling thread.
+/// Witness that a generation's decode phase has completed on the calling thread.
 ///
-/// Minted only by the decode loops (`pipelined_decode` and the per-arch
-/// `decode_loop` / `decode_from` helpers) as their final act, and required by
-/// `ArchPromptCache::store_kv_cache_bytes`. This pins the `kv_cache_bytes`
-/// metric to a single lifecycle point: **after decode**, when every resident KV
-/// allocation — including the decode-time ring — exists. Sampling it at the
-/// prefill snapshot (before the ring is allocated) is a compile error, because
-/// no `PostDecode` is in scope there. Keyed off the decode lifecycle, never an
-/// arch: a codec whose ring is allocated during decode is invisible to a
-/// pre-decode sample regardless of the byte accounting.
+/// Minted as the final act of the decode loops (`pipelined_decode` and the
+/// per-arch `decode_loop` / `decode_from` helpers) and required by
+/// `ArchPromptCache::store_kv_cache_bytes`. It pins the `kv_cache_bytes` metric
+/// to a single lifecycle point: **after decode**, when every resident KV
+/// allocation — including the decode-time ring — exists. A codec whose ring is
+/// allocated during decode is invisible to a pre-decode sample regardless of the
+/// byte accounting, so keying the store off this witness (not off an arch) is
+/// what keeps the figure comparable.
+///
+/// This is a raised bar + review convention, **not** an unforgeable compile
+/// guarantee. The naive re-drift — moving the store back to the prefill snapshot
+/// and reusing the loop's witness — is a compile error, because that witness is
+/// not in scope there. But `seal()` is `pub(crate)` (each per-arch decode helper
+/// must mint its own), so a new arch *could* mint a fresh witness at the prefill
+/// point and compile. The backstop is review plus the `#[ignore]`d GPU re-drift
+/// test, which goes red if a path samples pre-decode.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PostDecode(());
 
@@ -143,7 +150,8 @@ impl PostDecode {
     /// Mint the witness. MUST be called only as the final act of a completed
     /// decode loop — it certifies "decode done, KV allocations are final". The
     /// private field keeps construction to this module + the per-arch loops that
-    /// go through it.
+    /// call it; it is not a hard capability (any in-crate caller can mint one),
+    /// so correct placement is still a review property.
     #[inline]
     #[must_use]
     pub(crate) fn seal() -> Self {

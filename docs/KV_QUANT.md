@@ -277,14 +277,28 @@ bit-width is not a cache's memory.
 recorded at a single lifecycle position — after the decode loop, when every
 resident KV allocation exists, including the decode-time GPU ring of a
 ring-backed codec. It means the same thing in every row of the matrix,
-regardless of arch or of whether the prompt cache hit.
+regardless of arch or of whether the prompt cache hit. "One lifecycle point"
+means **post-decode, and only when a decode actually ran**: a run that returns
+before the decode loop (immediate-EOS — the first sampled token is EOS — or a
+NaN-prefill abort) does **not** refresh `kv_cache_bytes` and leaves the prior
+value in place. That is uniform across every arch now (the exact-hit paths and
+gemma4 / gemma3 / qwen3.5-moe always behaved this way), and it loses no ring
+information: with zero decode steps no ring is ever allocated, so the value that
+is *not* written would equal the prefill snapshot.
 
-This is enforced structurally, not by convention. The store takes a `PostDecode`
-witness minted only by a completed decode loop (`pipelined_decode` and the
-per-arch `decode_loop` / `decode_from` helpers); recording the figure at the
-prefill snapshot — before the ring is allocated — is a compile error, because no
-witness is in scope there. A new arch cannot re-introduce the pre-decode /
-post-decode split silently. Keyed off the decode lifecycle, never an arch.
+The store takes a `PostDecode` witness minted only by a completed decode loop
+(`pipelined_decode` and the per-arch `decode_loop` / `decode_from` helpers) and
+required by `store_kv_cache_bytes`. This **raises the bar and documents the
+requirement**: the naive re-drift — co-locating the store back at the prefill
+snapshot, reusing the loop's witness — is a compile error, because that witness
+is not yet in scope there, and the witness parameter makes a wrong lifecycle
+obvious in review. It is **not** an unforgeable compile-time guarantee: `seal()`
+is `pub(crate)` (each per-arch decode helper has to mint its own), so a new arch
+*could* mint a fresh witness at the prefill point and compile. The backstop for
+that is review plus the `#[ignore]`d GPU re-drift test
+(`kv_bytes_hit_equals_miss`), which goes red if a path samples pre-decode — it
+runs on a manual GPU pass, not in `make ci`. Keyed off the decode lifecycle,
+never an arch.
 
 Earlier this differed per arch: gemma4 / qwen3.5-moe / gemma3 sampled after
 decode, while the qwen3-miss / qwen2 / laguna / bitnet / qwen3-vl-moe paths
