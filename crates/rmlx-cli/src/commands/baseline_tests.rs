@@ -1,3 +1,6 @@
+// gpu-test-gate: exempt — `Device::Gpu` here is a CLI policy/parse value passed
+// to pure functions (`resolve_prompt_truncation`, device-arg parsing); no test
+// in this file constructs or evaluates an mlx array. Must stay Metal-free.
 use super::*;
 use rmlx_mlx::Device;
 

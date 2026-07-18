@@ -138,10 +138,20 @@ rejects before it touches a device-parameterized op is **not** a GPU test —
 pass it `Device::Cpu` and leave it un-ignored, so it keeps running in the
 default gate. Ignoring a CPU test is how a test silently stops running.
 
-`make check-gpu-tests-ignored` enforces this for `rmlx-kv-quant` and runs in
-`make ci` and in the hosted `source gates` job. It keys on the shape (does the
-test reach `Device::Gpu`?), never on the ignore reason's wording, which varies
-across the crate.
+`make check-gpu-tests-ignored` enforces this across **every workspace member
+crate** (read from `Cargo.toml`, never hard-coded), scanning both unit-test
+roots — `src/**/*_tests.rs` *and* bare `src/**/tests.rs` — and the integration
+binaries under `tests/*.rs`. It runs in `make ci` and in the hosted `source
+gates` job. It keys on the shape (does the test reach `Device::Gpu`, directly,
+through a same-file helper, or via a module-scope `const … = Device::Gpu`?),
+never on the ignore reason's wording, which varies across the tree.
+
+Two known edges: (1) a file of pure device-*policy* tests — ones that pass
+`Device::Gpu` to a non-mlx function as a plain selector value, never a Metal
+dispatch — opts out with a `// gpu-test-gate: exempt — <reason>` marker and
+must stay free of Metal-driving tests; (2) the reachability seed is file-local,
+so a test that reaches Metal only through a helper defined in another module can
+draw a non-fatal false-positive warning — verify before acting on it.
 
 ### `#[ignore]` is not a place to park a broken test
 
