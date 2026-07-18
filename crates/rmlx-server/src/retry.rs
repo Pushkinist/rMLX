@@ -401,6 +401,14 @@ pub fn replay_stream(
         let mut delivered: Vec<u32> = Vec::new();
         let mut attempts_remaining = max_retries + 1; // total attempts including the first
         let mut next_req: Option<GenerationRequest> = Some(initial_req);
+        // The real engine error that triggered the current replay attempt. A
+        // replay that then diverges from — or underruns — the delivered prefix
+        // must surface THIS cause, not a synthetic "prefix divergence" /
+        // "underrun" message that launders the true fault (e.g. a decode-step
+        // crash) into an unrelated error. A finish_reason-keying client cannot
+        // tell a laundered error from a clean short stop, so the real cause has
+        // to travel with the failure. `None` on attempt 1 (no prior error).
+        let mut root_error: Option<RmlxError> = None;
 
         loop {
             // Attempt 1 uses initial_req (holds the GPU admission permit).
@@ -444,13 +452,22 @@ pub fn replay_stream(
                                     position = skipped,
                                     "replay prefix divergence; aborting retry"
                                 );
-                                let _ = tx
-                                    .send(Err(RmlxError::Other(format!(
+                                // Surface the real fault that triggered this
+                                // replay (a decode-step crash reproduces at the
+                                // same boundary on retry). Sending only the
+                                // divergence message here would launder that
+                                // crash into an unrelated error — the exact
+                                // masked-failure shape the loud-error contract
+                                // exists to prevent. Fall back to the divergence
+                                // message only when there is no prior cause.
+                                let err = root_error.take().unwrap_or_else(|| {
+                                    RmlxError::Other(format!(
                                         "replay prefix divergence at {skipped}: \
                                          expected {expected} got {}",
                                         tok.token_id
-                                    ))))
-                                    .await;
+                                    ))
+                                });
+                                let _ = tx.send(Err(err)).await;
                                 return;
                             }
                             skipped += 1;
@@ -477,11 +494,15 @@ pub fn replay_stream(
                     skip_count,
                     "retry terminated before reproducing delivered prefix"
                 );
-                let _ = tx
-                    .send(Err(RmlxError::Other(
+                // Same laundering guard as the divergence path: surface the real
+                // cause that triggered this replay rather than a bare underrun
+                // message that hides it.
+                let err = root_error.take().unwrap_or_else(|| {
+                    RmlxError::Other(
                         "replay underrun: retry EOS before prefix reproduced".to_owned(),
-                    )))
-                    .await;
+                    )
+                });
+                let _ = tx.send(Err(err)).await;
                 return;
             }
 
@@ -521,6 +542,9 @@ pub fn replay_stream(
                         attempts_remaining,
                         "replay_stream migratable error, retrying"
                     );
+                    // Preserve the real cause so a divergence / underrun on the
+                    // coming attempt surfaces it rather than a synthetic message.
+                    root_error = Some(err);
                     // next_req is None — loop will call plan.build_request.
                 }
             }
