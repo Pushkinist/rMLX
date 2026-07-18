@@ -1444,12 +1444,15 @@ impl KvCache {
     /// reach: each tracks its own capacity and copies the filled prefix forward
     /// on realloc, so the scalar and the buffers cannot disagree.
     ///
-    /// **Exception.** The head-major flash buffers latch their window into
-    /// `flash_max_seq` at allocation and never revisit it, so growing `max_seq`
-    /// does not extend them. They are unreachable from here — the TurboFlash
-    /// path is opt-in and has its own dispatch — and their append now fails
-    /// loudly rather than dropping silently, but they are not covered by the
-    /// invariant above.
+    /// **Head-major flash buffers.** These latch their window into
+    /// `flash_max_seq` at allocation, so raising `max_seq` here does not, by
+    /// itself, extend them. The TurboFlash path is opt-in and has its own
+    /// dispatch (`update_and_sdpa_k8v4_flash_inner`), which bypasses
+    /// `KvCache::update` — so it calls this function directly before its append
+    /// and re-sizes the latched buffers via `grow_flash_buffers` when the window
+    /// grew past `flash_max_seq`. That keeps the one provisioning rule covering
+    /// the flash path too, instead of letting the append walk off the frozen
+    /// window at the next power-of-two boundary.
     ///
     /// The hard cap and the `--max-ctx` ceiling still bound the growth: a
     /// request that genuinely cannot fit is rejected loudly rather than
@@ -4508,6 +4511,16 @@ impl KvCache {
         if self.decode_fp16_k.is_none() {
             return Ok(None);
         }
+        // Grow the provisioned decode window before the head-major append, the
+        // same rule the legacy `update()` path applies via `ensure_decode_capacity`.
+        // This flash dispatch bypasses `update()`, so without growing here the
+        // storage `max_seq` (and the bf16 mirror + latched flash buffers sized
+        // off it) freeze at the prefill length; the append then walks off the
+        // end at the next power-of-two boundary and slices an empty tensor
+        // (surfacing downstream as a `reshape … size 0`). A request that
+        // genuinely cannot fit is rejected loudly here (ceiling / hard cap)
+        // rather than crashing mid-append.
+        self.ensure_decode_capacity(kv_seq_after_update)?;
         let max_seq = match &self.storage {
             KvStorage::K8V4 { max_seq, .. } => *max_seq,
             _ => return Ok(None),
@@ -4568,15 +4581,25 @@ impl KvCache {
             // First-dispatch new chunk still comes from decode_fp16_k/v
             // (the mirror was just updated above so it contains the new token).
             self.append_flash_buffers_from_fp16(prev_offset, new_seq, device)?;
-        } else if lock_on {
-            // Subsequent dispatch under lock-on: quantise `new_k`/`new_v`
-            // directly into the persistent flash buffers — no bf16 round-trip.
-            self.append_flash_buffers_from_new(new_k, new_v, prev_offset, new_seq, device)?;
         } else {
-            // Subsequent dispatch, lock OFF: read the new chunk back through
-            // `decode_fp16_k/v` (which was just updated above). Preserves the
-            // original P2.A.1 behaviour bit-for-bit when lock is not requested.
-            self.append_flash_buffers_from_fp16(prev_offset, new_seq, device)?;
+            // Grow the latched head-major buffers when the storage window has
+            // grown past what they were allocated for — a power-of-two boundary
+            // crossed mid-decode. The buffers latch their capacity into
+            // `flash_max_seq` at allocation, so without re-sizing them here the
+            // append below overflows the frozen window.
+            if self.flash_max_seq < max_seq {
+                self.grow_flash_buffers(b, kv_h, head_dim, max_seq, device)?;
+            }
+            if lock_on {
+                // Subsequent dispatch under lock-on: quantise `new_k`/`new_v`
+                // directly into the persistent flash buffers — no bf16 round-trip.
+                self.append_flash_buffers_from_new(new_k, new_v, prev_offset, new_seq, device)?;
+            } else {
+                // Subsequent dispatch, lock OFF: read the new chunk back through
+                // `decode_fp16_k/v` (which was just updated above). Preserves the
+                // original behaviour bit-for-bit when lock is not requested.
+                self.append_flash_buffers_from_fp16(prev_offset, new_seq, device)?;
+            }
         }
 
         // Pull the persistent buffers as 1-D flat views for the kernel
@@ -4672,6 +4695,104 @@ impl KvCache {
         self.flash_v_scales = Some(zeros(&v_scales_shape, Dtype::F32, device)?);
         self.flash_max_seq = max_seq;
         self.flash_filled = 0;
+        Ok(())
+    }
+
+    /// Grow the head-major persistent K8V4 buffers to a larger `max_seq`,
+    /// preserving every already-written slot.
+    ///
+    /// The flash buffers latch their capacity into `flash_max_seq` at
+    /// [`Self::alloc_flash_buffers`] and never revisit it. When decode crosses a
+    /// power-of-two boundary the storage window grows (via
+    /// [`Self::ensure_decode_capacity`]) but these buffers do not — so the next
+    /// head-major append would walk off the frozen window. This reallocates each
+    /// buffer at the new capacity and copies the existing `[.., 0..old_max_seq, .]`
+    /// content forward, matching the copy-prefix-forward contract every other
+    /// grow path uses. It is codec-general (keyed off buffer shape, never an
+    /// arch) and lock-state agnostic — under `RMLX_TURBO_FLASH_LOCK` the flash
+    /// buffers are the sole K/V store, so copying them (rather than re-seeding
+    /// from the frozen bf16 mirror) is what preserves the decode tail.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    )]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "the four flash buffers are Some by the caller's is_none() guard; the grow path only runs after a first dispatch allocated them"
+    )]
+    fn grow_flash_buffers(
+        &mut self,
+        b: i32,
+        kv_h: i32,
+        head_dim: i32,
+        new_max_seq: i32,
+        device: Device,
+    ) -> Result<()> {
+        use crate::q8_msl::Q8_GROUP_SIZE;
+        use crate::turboquant::GROUP_SIZE as TQ4_GROUP;
+
+        let old_max_seq = self.flash_max_seq;
+        if new_max_seq <= old_max_seq {
+            return Ok(());
+        }
+
+        let k_codes_shape = [b, kv_h, new_max_seq, head_dim / 4];
+        let k_scales_shape = [b, kv_h, new_max_seq, head_dim / Q8_GROUP_SIZE as i32];
+        let v_codes_shape = [b, kv_h, new_max_seq, head_dim / 8];
+        let v_scales_shape = [b, kv_h, new_max_seq, head_dim / TQ4_GROUP as i32];
+
+        let sl_start = [0i32; 4];
+        let sl_strides = [1i32; 4];
+
+        let kc_old = self.flash_k_codes.take().unwrap();
+        let ks_old = self.flash_k_scales.take().unwrap();
+        let vc_old = self.flash_v_codes.take().unwrap();
+        let vs_old = self.flash_v_scales.take().unwrap();
+
+        let kc_stop = [b, kv_h, old_max_seq, head_dim / 4];
+        let ks_stop = [b, kv_h, old_max_seq, head_dim / Q8_GROUP_SIZE as i32];
+        let vc_stop = [b, kv_h, old_max_seq, head_dim / 8];
+        let vs_stop = [b, kv_h, old_max_seq, head_dim / TQ4_GROUP as i32];
+
+        let kc_new = zeros(&k_codes_shape, Dtype::U32, device)?.slice_update(
+            &kc_old,
+            &sl_start,
+            &kc_stop,
+            &sl_strides,
+            device,
+        )?;
+        let ks_new = zeros(&k_scales_shape, Dtype::F32, device)?.slice_update(
+            &ks_old,
+            &sl_start,
+            &ks_stop,
+            &sl_strides,
+            device,
+        )?;
+        let vc_new = zeros(&v_codes_shape, Dtype::U32, device)?.slice_update(
+            &vc_old,
+            &sl_start,
+            &vc_stop,
+            &sl_strides,
+            device,
+        )?;
+        let vs_new = zeros(&v_scales_shape, Dtype::F32, device)?.slice_update(
+            &vs_old,
+            &sl_start,
+            &vs_stop,
+            &sl_strides,
+            device,
+        )?;
+
+        self.flash_k_codes = Some(kc_new);
+        self.flash_k_scales = Some(ks_new);
+        self.flash_v_codes = Some(vc_new);
+        self.flash_v_scales = Some(vs_new);
+        self.flash_max_seq = new_max_seq;
+        tracing::info!(
+            from = old_max_seq,
+            to = new_max_seq,
+            "TurboFlash buffer grow"
+        );
         Ok(())
     }
 

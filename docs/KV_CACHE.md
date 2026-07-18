@@ -433,6 +433,22 @@ tq4 is genuinely unsupported at that head_dim, not a missing feature. tq4
 remains available wherever the FA head_dim ∈ {128, 256} (e.g. Qwen3 @ 128,
 Qwen3.5-MoE @ 256) via the `sdpa_dispatch` TurboFlash path.
 
+**Decode-time window growth (power-of-two boundary).** The TurboFlash path
+maintains its own head-major `[B, kv_h, max_seq, .]` code/scale buffers
+(`flash_*`), and only dispatches once `kv_seq > RMLX_TURBO_FLASH_MIN`. Because
+that dispatch bypasses the legacy `KvCache::update`, it must apply the same
+decode-side capacity rule that path does: `update_and_sdpa_k8v4_flash_inner`
+calls `ensure_decode_capacity` before it appends, and `grow_flash_buffers`
+re-sizes the latched head-major buffers (copying the filled prefix forward)
+whenever the storage window has grown past `flash_max_seq`. Without both, the
+window froze at the prefill length and the append walked off the end at the
+next power-of-two boundary — a `reshape … size 0` mid-decode. The `--max-ctx`
+ceiling / hard cap still bound the growth: a request that genuinely cannot fit
+is rejected loudly, never truncated. The `rot_k_tq4v` codec shares the tq4 V
+*format* but not this path — it decodes through `update_and_sdpa_rot_k_tq4v`
+with an uncapped `QuantV` V append and a growing `MixedKvState` K, so it grows
+at decode without the head-major buffers.
+
 ### 5.6 `planar4` requires `head_dim % 32 == 0`
 
 PlanarQuant's group size is 32. Same divisibility rule as §5.1, just
