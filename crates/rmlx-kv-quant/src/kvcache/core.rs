@@ -9,7 +9,7 @@
 #![allow(unsafe_code)]
 #![allow(clippy::too_many_lines)]
 
-use rmlx_mlx::Array;
+use rmlx_mlx::{Array, Dtype};
 
 use crate::kvcache::fused_qk_shadow::FusedQkShadow;
 use crate::rotating::RotatingState;
@@ -59,6 +59,18 @@ pub struct KvCache {
     pub(super) in_prefill: bool,
     pub(super) decode_fp16_k: Option<Array>,
     pub(super) decode_fp16_v: Option<Array>,
+    /// Activation-stream dtype the model appends into this cache, captured at
+    /// append time. `None` until the first append.
+    ///
+    /// Only the codecs that keep **no** bf16 mirror need it: every other path
+    /// reads the stream dtype straight off `decode_fp16_v`.
+    /// [`KvCache::materialise_shared_kv`] has to hand a drafter K/V at the
+    /// stream's dtype — the stores dequantise through `Vec<f32>`, and returning
+    /// that f32 would promote the drafter's whole attention stream and double
+    /// its KV residency, while hard-coding bf16 would silently downcast a wider
+    /// stream. Once the mirror is gone neither is derivable, so the dtype the
+    /// model actually pushed is recorded instead of guessed.
+    pub(super) stream_dtype: Option<Dtype>,
     /// If `Some`, this cache uses the SWA ring-buffer code path
     /// (RotatingKvCache port). Activated by SWA layers in
     /// `KvQuant::None` mode only.
@@ -224,6 +236,7 @@ impl KvCache {
             in_prefill: false,
             decode_fp16_k: None,
             decode_fp16_v: None,
+            stream_dtype: None,
             rotating: None,
             flash_k_codes: None,
             flash_k_scales: None,
@@ -252,6 +265,7 @@ impl KvCache {
             in_prefill: false,
             decode_fp16_k: None,
             decode_fp16_v: None,
+            stream_dtype: None,
             rotating: None,
             flash_k_codes: None,
             flash_k_scales: None,
