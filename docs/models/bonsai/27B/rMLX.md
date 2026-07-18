@@ -4,6 +4,44 @@
 > Champion (weight-comparable 2-bit tier) = **mlx-lm (no KV quant)**, decode TPS:
 > **45.1 / 41.7 / 40.6 / 36.8 / 30.2 / 23.0** (4k/8k/16k/32k/64k/128k).
 
+> **⚠️ Correction (2026-07-18) — the prefill / TTFT numbers below were a
+> Homebrew-MLX artifact; "prefill loses 2.6–3.4×" is FALSE.** This matrix was
+> benched (2026-07-15/16) on a Homebrew `mlx` 0.32.0 bottle that silently shipped
+> **zero** Neural-Accelerator (NAX) GEMM kernels on this M5 box — a ~3.8× GPU-matmul
+> loss that inflates **prefill only** (decode is matvec/bandwidth-bound and
+> unaffected). §3/§4 originally concluded rMLX prefill is 2.6–3.4× slower than the
+> siblings and blamed the GDN sequential-in-T recurrence. **Both are wrong.** After
+> pinning MLX back to the last NAX-present build (`steel_gemm_fused_nax_*` kernels
+> asserted present in the loaded `mlx.metallib`) and re-measuring the `none`-row
+> cold TTFT on the identical `longctx_Nk` fixtures (same binary, same prompts, cold
+> single prefill), the gap **largely closes**:
+>
+> | ctx | published (no-NAX brew mlx) | re-measured (pinned, NAX present) | factor |
+> |---|---|---|---|
+> | 4k | 14.8 s | **4.8 s** | 3.08× |
+> | 8k | 32.0 s | **10.7 s** | 3.00× |
+> | 16k | 67.9 s | **24.4 s** | 2.79× |
+> | 32k | 147.5 s | **53.4 s** | 2.76× |
+> | 64k | 335.0 s | **136.6 s** | 2.45× |
+> | 128k | 815.4 s | **408.8 s** | 1.99× |
+>
+> (4k–32k n=3 median, 64k/128k n=1; every run generated the full 256 tokens.) The
+> factor shrinks with context because GEMM is a larger fraction of short-prompt
+> prefill. Against the (NAX-correct, PyPI-wheel) mlx-lm champion prefill (4.4 / 10.7
+> / 20.6 / 43.7 / 109.9 / 317.8 s), rMLX prefill is now **~1.0–1.3× the champion** —
+> parity at 4k–8k, a small residual growing to ~1.3× at 128k — **not** a 3× collapse.
+> The NAX-regression root-cause profile puts the GDN recurrence at **~2 % of
+> prefill** (MLP dominates), so the original "48×256 serial GDN ⇒ 3.2×" arithmetic
+> was numerology — and the measured near-parity above confirms it independently.
+>
+> **Corrected here:** the `none`-row TTFT in §2, the §3 prefill table, the §0
+> prefill bullet, and the §4 prefill gap. **Unchanged (NAX-independent, still
+> valid):** every decode-TPS and KV-MB figure, and the `k8v4` decode correction
+> below. **Still an artifact — re-measure pending:** the TTFT (middle number) of the
+> other 24 codec rows in §2; prefill is ~codec-independent, so scale those down by
+> the per-column `none` factor above (~3.1× @4k → ~2.0× @128k) for the true
+> magnitude.
+
 **Model:** `prism-ml__Ternary-Bonsai-27B-mlx-2bit` —
 `Qwen3_5ForConditionalGeneration`, dense ~27B **text tower** of a VLM-shaped
 checkpoint (text-only bench), **2-bit affine** (group 128), **GatedDeltaNet
@@ -38,11 +76,14 @@ directly. KV-MB from serve events `op='kv_cache_bytes'` high-water (the `baselin
   range, ~2× falloff), because only 16/64 layers are full-attention (KV-growing);
   the other 48 GDN layers hold fixed-size recurrent state, which also compresses
   the whole codec spread.
-- **rMLX prefill is the weak spot.** Cold TTFT is **~2.6–3.4× slower** than the
-  mlx-lm/tq siblings at every size (815 s vs 318 s at 128k; 14.8 s vs 4.4 s at 4k).
-  Decode wins, prefill loses — the top perf follow-up (§4, **#216**): the GDN
-  recurrence kernel is sequential-in-T; the merged #155 chunk fix (64→2048) is
-  already spent, so this needs a chunkwise-parallel delta-rule prefill kernel.
+- **rMLX prefill — near parity (corrected 2026-07-18; first reported as a 2.6–3.4×
+  loss).** The original prefill numbers were measured on a Homebrew MLX bottle that
+  shipped zero NAX GEMM kernels (~3.8× matmul loss, prefill-only). Re-measured on the
+  pinned NAX-present MLX, `none` cold TTFT is **4.8 / 10.7 / 24.4 / 53.4 / 136.6 /
+  408.8 s** (4k…128k) — **at parity to ~1.3× the mlx-lm champion** (4.4 / 10.7 / 20.6
+  / 43.7 / 109.9 / 317.8 s), not the 2.6–3.4× loss this doc first reported. The GDN
+  recurrence is ~2 % of prefill, so the "sequential-in-T GDN ⇒ 3.2×" story was
+  numerology (see the correction at the top, §3, §4). Decode is unaffected.
 - **Three codec tiers** (§2, §4):
   - **Tier 1 — GPU-fused, fast, viable** (`none`, `k8v8`, `planar`/`planar_k`/
     `planar3`, `k8vturbo2/3`, `k8vturbo2tcq/3tcq`, `tsym3/4`, `iso3/4`, `rotor3/4`):
@@ -120,10 +161,14 @@ with room for 256 generated tokens.
 **`--max-timeout-secs 1800` is required for 128k.** `rmlx serve` enforces an
 independent **server-side per-request wall-clock cap**, default **600 s**, applied
 to SSE streams too and *not* overridden by the CBB client's `--request-timeout`.
-The genuine cold 128k prefill exceeds 600 s (`none` r0 = 815 s), so the first 128k
-attempt was killed at exactly `e2e_ms=600007` with HTTP 408. Every long-context
-serve here was relaunched with `--max-timeout-secs 1800`; all cold prefills landed
-inside that budget (worst case `iso4_sym` 903 s @128k).
+On the no-NAX brew mlx used for this campaign the cold 128k prefill exceeded 600 s
+(`none` r0 = 815 s), so the first 128k attempt was killed at exactly
+`e2e_ms=600007` with HTTP 408. Every long-context serve here was relaunched with
+`--max-timeout-secs 1800`; all cold prefills landed inside that budget (worst case
+`iso4_sym` 903 s @128k). *(Correction 2026-07-18: those seconds are the no-NAX
+artifact — re-measured on the pinned NAX-present MLX the 128k `none` prefill is
+408.8 s, comfortably under the 600 s cap; the extended timeout was a consequence of
+the missing GEMM kernels, not the true prefill cost. See the correction at the top.)*
 
 **KV-MB capture** uses the serve-side per-request events-table high-water-mark
 (`op='kv_cache_bytes'`, one row per request through the shared engine loop). The
@@ -166,7 +211,18 @@ no speculative / MTP grid (§0).
 
 **Cell = `decodeTPS · r0TTFT(s) · KV-MB`.** decode + cold r0 TTFT from serve +
 `run_one` (load-once, chat-templated); `KV-MB` from the serve events-table
-`kv_cache_bytes` high-water-mark (§M). Markers: `†` = 128k value is the **cold r0**
+`kv_cache_bytes` high-water-mark (§M).
+
+> **⚠️ TTFT column (the middle number) correction.** All r0TTFT values in this
+> table were measured on the no-NAX Homebrew MLX bottle and are inflated ~2.0–3.1×
+> (see the correction at the top). The **`none` row TTFT has been re-measured on the
+> pinned NAX-present MLX and replaced** (4.8 / 10.7 / 24.4 / 53.4 / 136.6 / 408.8 s).
+> The other 24 codec rows' TTFT is **still the no-NAX artifact — re-measure pending**;
+> prefill is ~codec-independent, so scale them down by the per-column `none` factor
+> (~3.1× @4k → ~2.0× @128k). Decode-TPS and KV-MB in every row are NAX-independent
+> and unchanged.
+
+Markers: `†` = 128k value is the **cold r0**
 number (warm-cache decode stalls — Tier-2 `*_sym`, see below / §5). `‡` = decode
 **crashes at the next power-of-two KV boundary** — the cell is a *truncated
 crashing run* (242–250 of 256 tokens; the per-token rate is genuine, but the run
@@ -176,7 +232,7 @@ reduced-token probe (`max_tokens 8–64`, n=1), not a steady-state 256-token rat
 
 | KV | 4k | 8k | 16k | 32k | 64k | 128k |
 |---|---|---|---|---|---|---|
-| none | 50.9·14.8s·419 | 47.7·32.0s·692 | 41.7·67.9s·1237 | 37.9·147.5s·2327 | 31.3·335.0s·4507 | 23.7·815.4s·8865 |
+| none | 50.9·4.8s·419 | 47.7·10.7s·692 | 41.7·24.4s·1237 | 37.9·53.4s·2327 | 31.3·136.6s·4507 | 23.7·408.8s·8865 |
 | k8v4‡ | 51.1·14.9s·519 | 29.7·32.2s·1063 | 22.4·70.2s·1979 | 15.7·144.9s·3811 | 10.0·315.4s·7477 | 5.6·773.6s·14795 |
 | k8v8 | 51.0·14.9s·535 | 47.6·32.1s·923 | 40.8·69.4s·1699 | 37.0·148.5s·3251 | 31.4·331.0s·6356 | 23.7·813.3s·12555 |
 | planar | 51.6·14.9s·631 | 48.4·32.1s·1115 | 44.9·64.8s·2084 | 40.2·139.9s·4021 | 33.6·314.4s·7895 | 25.8·768.0s·15630 |
@@ -210,7 +266,9 @@ reduced-token probe (`max_tokens 8–64`, n=1), not a steady-state 256-token rat
 > **Read the bolds with the tiers.** The 8k/16k/32k/64k winners are the `*_sym`
 > **bf16-mirror family (Tier 2)** — genuinely the fastest *raw* decode at those
 > sizes, but at **2.0–2.2× the `none` KV**, **~1.4–2.0× heavier cold prefill**
-> (`rotor3_sym` 64k TTFT 462 s vs `none` 335 s), and a **128k warm-cache stall**
+> (`rotor3_sym` 64k TTFT 462 s vs `none` 335 s — both no-NAX-artifact seconds; the
+> ratio is codec-relative and preserved even though the absolute seconds inflate),
+> and a **128k warm-cache stall**
 > (§5) — so **not** the recommended pick. Among the memory- and prefill-sane
 > **Tier-1** codecs, the **tcq pair** and **rotor3/rotor4** lead at long context
 > (`k8vturbo2tcq` +15.2 %, `k8vturbo3tcq` +14.8 %, `rotor4` +13.1 %, `rotor3`
@@ -289,21 +347,26 @@ cherry-picked "best codec" is used.
 > at parity, not a loss, in `SIBLINGS`). `none` is the champion-beating cell;
 > KV quant adds a little decode at long ctx (§2) but costs memory.
 
-**Prefill loses.** rMLX cold TTFT vs the champion's prefill (SIBLINGS §2b:
-4.4 / 10.7 / 20.6 / 43.7 / 109.9 / 317.8 s):
+**Prefill — near parity (corrected 2026-07-18).** rMLX `none` cold TTFT re-measured
+on the pinned NAX-present MLX (the published column was a no-NAX brew-mlx artifact —
+see the correction at the top) vs the champion's prefill (SIBLINGS §2b, measured on
+the NAX-correct PyPI wheel, so unaffected: 4.4 / 10.7 / 20.6 / 43.7 / 109.9 /
+317.8 s):
 
-| Prompt | rMLX `none` TTFT | champion TTFT | ratio | standing |
-|---|---|---|---|---|
-| 4k | 14.8 s | 4.4 s | 3.37× | 🔴 LOSS |
-| 8k | 32.0 s | 10.7 s | 2.99× | 🔴 LOSS |
-| 16k | 67.9 s | 20.6 s | 3.30× | 🔴 LOSS |
-| 32k | 147.5 s | 43.7 s | 3.38× | 🔴 LOSS |
-| 64k | 335.0 s | 109.9 s | 3.05× | 🔴 LOSS |
-| 128k | 815.4 s | 317.8 s | 2.57× | 🔴 LOSS |
+| Prompt | rMLX `none` TTFT (pinned) | was (no-NAX brew) | champion TTFT | ratio | standing |
+|---|---|---|---|---|---|
+| 4k | **4.8 s** | 14.8 s | 4.4 s | 1.09× | 🟢 ~TIE |
+| 8k | **10.7 s** | 32.0 s | 10.7 s | 1.00× | 🟢 TIE |
+| 16k | **24.4 s** | 67.9 s | 20.6 s | 1.18× | 🟡 near |
+| 32k | **53.4 s** | 147.5 s | 43.7 s | 1.22× | 🟡 near |
+| 64k | **136.6 s** | 335.0 s | 109.9 s | 1.24× | 🟡 near |
+| 128k | **408.8 s** | 815.4 s | 317.8 s | 1.29× | 🟡 near |
 
-Decode wins, prefill loses (~2.6–3.4× slower) at every size — the standing verdict
-is **decode-favourable, prefill-adverse**. Prefill is the single biggest rMLX gap
-on this arch (§4).
+rMLX prefill is **at parity to ~1.3× the champion** — tied at 4k–8k, a small
+residual (1.2–1.3×) that grows modestly with context. The earlier "2.6–3.4× loss"
+was entirely the missing-NAX GEMM artifact, not the backend. Decode wins, prefill is
+competitive — the standing verdict is **decode-favourable, prefill-competitive**.
+The small long-context residual is a minor follow-up (§4), no longer the headline gap.
 
 ---
 
@@ -323,18 +386,21 @@ Ranked by impact:
    ctx — it needs an MSL flash-decode-over-quant kernel*. The 27B is the best
    argument yet for building it, because the GPU-kerneled members of the same
    families already win.
-2. **rMLX prefill is the weak spot — cold TTFT 2.6–3.4× slower than the siblings**
-   (**#216**). `none` 815 s vs mlx-lm 318 s at 128k, same ratio at every size (§3).
-   Root cause is **not** the chunk size: #155 (GDN kernel-always + prefill chunk
-   64→2048) is already merged and was active in this benched binary. The residual
-   cost is the **GDN recurrence kernel itself** (`gated_delta_msl.rs:110`) — a
-   *sequential* per-timestep scan (`for t in 0..T`, loop-carried state), so prefill
-   runs T=2048 serial steps/chunk over 48 GDN layers. Serial cost scales as
-   `num_gdn_layers × head_dim`: the 27B's `48×256` is **3.2×** the Qwen3.6-35B's
-   `30×128` (where #155 reached mlx-lm parity) — matching the observed gap. Fix =
-   a chunkwise-parallel delta-rule prefill kernel (Bonsai-8B, dense 2-bit, *no GDN*,
-   prefills fast on the same quant-GEMM path — confirming GDN is the delta). Top perf
-   follow-up.
+2. **rMLX prefill — corrected to near-parity (was misdiagnosed as a 2.6–3.4× GDN
+   loss).** The original text here concluded prefill was 2.6–3.4× slower than the
+   siblings and pinned the blame on the GDN recurrence kernel
+   (`gated_delta_msl.rs`, a sequential per-timestep scan), arguing the 27B's
+   `48×256` serial cost was `3.2×` the Qwen3.6-35B's `30×128`. **That was numerology
+   on artifact data.** The campaign ran on a Homebrew MLX bottle missing every NAX
+   GEMM kernel (~3.8× matmul loss); re-measured on the pinned NAX-present MLX,
+   prefill is **at parity to ~1.3× the mlx-lm champion** (§3) — a measured
+   refutation of the 3× claim — and the NAX-regression root-cause profile puts the
+   GDN recurrence at **~2 % of prefill time** (MLP dominates), so GDN was never the
+   3× lever. The merged GDN-kernel-always + prefill-chunk
+   64→2048 fix (active in this binary) already brought this arch close. A small
+   residual long-context gap (1.2–1.3× at 32k–128k) remains and could still benefit
+   from a chunkwise-parallel delta-rule prefill kernel, but it is a **minor**
+   follow-up — not the headline weakness this section originally claimed.
 3. **4-bit-V is broken *and* slow — the boundary crash is the P0, the dequant
    cost the P1.** *(a)* `k8v4` decode **crashes at the next power-of-two KV
    boundary**: generation dies exactly when `prompt_len + generated` reaches
@@ -365,6 +431,14 @@ Ranked by impact:
 
 ## 5. Caveats
 
+- **Prefill/TTFT numbers were a no-NAX Homebrew-MLX artifact (corrected
+  2026-07-18).** The whole matrix was benched on an MLX bottle missing the NAX GEMM
+  kernels (~3.8× matmul loss, prefill-only). The `none`-row TTFT has been re-measured
+  on the pinned NAX-present MLX and replaced (§2/§3); the other codec rows' TTFT is
+  still the inflated artifact (scale by the per-column `none` factor, ~3.1× @4k →
+  ~2.0× @128k). Decode-TPS and KV-MB are NAX-independent and stand. The "prefill
+  loses 2.6–3.4×" verdict and the "GDN sequential-in-T ⇒ 3.2×" root-cause were both
+  false; corrected prefill is at parity to ~1.3× the champion.
 - **`none` is the headline number** and the smallest KV. The long-ctx codec win
   (tcq pair, `rotor3/4`, `planar*`: +5…+15 % at 128k) is real but memory-costly
   (1.28×–1.85× the `none` KV) and prefill-costly — not a free win.
