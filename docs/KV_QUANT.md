@@ -355,15 +355,19 @@ be classified or the build fails.
     flash-decode kernel this was a hybrid — the per-step dequant restaged the
     growing prefix host-side and re-uploaded it via `Array::from_bytes` — which
     is what held these codecs at single-digit TPS.
-  * **K-only rotor** (`k_rotor3` / `k_rotor4`) → **QJL-dependent**. No bf16
-    early-return; `update_rotor_k_only_{3,4}` gates the GPU K encode on
-    `device == Gpu && !rotor_qjl_enabled()`. QJL **on** (default) → CPU
-    (`Some`); QJL **off** (`--rotor-qjl off`) →
-    `rotor{3,4}_gpu_append_into_k_blocks` Metal MSL encode (`None`). The verdict
-    reads the live `rotor_qjl_enabled()` gate so it tracks the dispatcher.
-    With QJL off the **decode** side is fused too — see
-    § `rotor_flash_decode` below — so the QJL-off path is fully GPU-resident,
-    not a hybrid.
+  * **K-only rotor** (`k_rotor3` / `k_rotor4`) → **QJL-dependent, default
+    off**. No bf16 early-return; `update_rotor_k_only_{3,4}` gates the GPU K
+    encode on the store's sticky `use_qjl()` flag — fixed at first append, the
+    same source the sdpa fast path reads, so a later env toggle cannot
+    reinterpret bytes already written. QJL **off** (default) →
+    `rotor{3,4}_gpu_append_into_k_blocks` Metal MSL encode (`None`), and the
+    **decode** side is fused too (see § `rotor_flash_decode` below), so the
+    default path is fully GPU-resident. QJL **on** (opt-in `--rotor-qjl on`) →
+    CPU (`Some`): the 1-bit residual has no MSL kernel, so it forces the K
+    append + dequant onto the host every decode step (single-digit TPS). The
+    residual bought no measured accuracy in a two-arch context sweep — identical
+    temp=0 output and needle retrieval on vs off — so off is the default and on
+    is the fidelity / ablation knob.
 
   The `Some` cases are the source of the 30–60× first-forward slowdown and the
   monotonic decode decay as KV grows.
@@ -379,7 +383,7 @@ be classified or the build fails.
 | `iso3` / `iso4` / `iso3_sym` / `iso4_sym` | **CPU** | bf16 decode seed shadows the GPU iso branch; prefill V-encode on host |
 | `k_iso3` / `k_iso4` | **fully Metal** | iso K MSL encode into the packed ring + `iso_flash_decode` fused decode over that ring. No host restaging. `cpu_hot_path_reason() == None` |
 | `rotor3` / `rotor4` / `rotor*_sym` / `rotor_k_*_asym_*` | **CPU** | bf16 decode seed shadows the GPU branch; GPU fused-QK encoder is `RMLX_FUSED_QK`-only |
-| `k_rotor3` / `k_rotor4` | **QJL-dependent** | QJL on (default) → CPU; QJL off (`--rotor-qjl off`) → **fully Metal**: rotor K MSL encode + `rotor_flash_decode` fused decode. Verdict reads `rotor_qjl_enabled()` |
+| `k_rotor3` / `k_rotor4` | **QJL-dependent (default off)** | QJL off (default) → **fully Metal**: rotor K MSL encode + `rotor_flash_decode` fused decode; QJL on (`--rotor-qjl on`) → CPU. Gate reads the store's sticky `use_qjl()` |
 
 ### Load-time precompile
 
@@ -1871,8 +1875,8 @@ up in TTFT, not decode TPS.
 1-bit QJL residual correction that needs the JL projection matrix `S` at
 dequant time. The GPU dequant kernels in `rotorquant_msl.rs` do NOT
 replicate QJL — when `crate::rotor_qjl::rotor_qjl_enabled()` is `true`
-(the default), the K-side append/decode falls back to the CPU
-`rotor3_k_encode` / `rotor3_k_decode` path. With `--rotor-qjl off`, the
+(opt-in `--rotor-qjl on`), the K-side append/decode falls back to the CPU
+`rotor3_k_encode` / `rotor3_k_decode` path. With QJL off (**the default**), the
 GPU K-side kernel is engaged (TTFT drop measured on Bonsai 8B at ~10.8k
 prompt tokens: 28.3 s → 11.5 s vs CPU K-encode).
 

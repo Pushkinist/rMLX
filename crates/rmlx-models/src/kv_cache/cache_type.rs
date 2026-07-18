@@ -382,8 +382,9 @@ pub enum CacheType {
     ///
     /// Static per-(layer, head) rotor table + 3-bit Lloyd-Max codebook applied
     /// to the K axis. Carries an **optional 1-bit QJL residual sideband**
-    /// (default ON, toggle via `--rotor-qjl`). Pairs with V=`rotor_v_3` to
-    /// form `KvQuant::Rotor3Sym` or V=`bf16` to form `KvQuant::RotorKOnly3`.
+    /// (default OFF — QJL has no Metal kernel and forces the CPU path; toggle
+    /// via `--rotor-qjl on`). Pairs with V=`rotor_v_3` to form
+    /// `KvQuant::Rotor3Sym` or V=`bf16` to form `KvQuant::RotorKOnly3`.
     ///
     /// **Arch guard (Contract A.y — mandatory)**: K-side ≤4-bit on Qwen MoE
     /// is the PPL-disaster (218→8641); `combo_to_kv_quant` paths that map to

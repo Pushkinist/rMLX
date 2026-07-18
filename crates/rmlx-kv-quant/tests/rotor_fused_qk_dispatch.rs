@@ -119,9 +119,9 @@ fn set_fused_qk_on() {
         std::env::set_var("RMLX_FUSED_QK_MIN", "8");
     }
     // Ensure rotor QJL is OFF — the kernel does not consume the QJL
-    // residual. Note: the rotor_qjl default is ON when the env var is
-    // absent; we must explicitly set `0` to disable so the fused-QK
-    // dispatch passes the QJL fallback gate.
+    // residual. QJL is off by default, but set `0` explicitly so a stray
+    // `RMLX_ROTOR_QJL=1` in the environment cannot flip the dispatch onto
+    // the QJL CPU fallback and make this test flake.
     unsafe {
         std::env::set_var("RMLX_ROTOR_QJL", "0");
     }
