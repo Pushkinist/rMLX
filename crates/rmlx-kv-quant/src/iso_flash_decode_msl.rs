@@ -36,6 +36,16 @@
 //! explicit — any other `bits` is an `Err`, never a silent fallback to the
 //! wrong unpack width.
 //!
+//! # Reduction structure
+//!
+//! Pass 1 folds the QK dot with **simdgroup reductions** (`simd_sum`): each
+//! simdgroup collapses its 32 lanes with no threadgroup barrier and no
+//! idle-lane tree, and thread 0 folds the per-simdgroup partials. The iso
+//! decode stays **per-lane** — one quaternion block fits one u32, so it runs in
+//! registers with no threadgroup staging (see the next section) — since the
+//! only redundancy sharing would save is a few codebook lookups, not a
+//! sandwich.
+//!
 //! # Reusable K-decode half
 //!
 //! The per-lane iso decode lives in the header as the MSL function

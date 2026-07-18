@@ -264,6 +264,107 @@ fn run_oracle_masked(
     true
 }
 
+// ── Perf microbench (shell A/B) ───────────────────────────────────────────────
+//
+// Times the fused rotor flash-decode dispatch (P1 + P2 + eval) at fixed decode
+// shapes so the shell rewrite can be measured before/after on the same shape.
+// Not a correctness check — the oracles above own that. Prints median ms/call.
+
+#[allow(clippy::expect_used, reason = "perf microbench helper")]
+#[allow(
+    clippy::unwrap_used,
+    reason = "perf microbench: partial_cmp on finite times"
+)]
+fn bench_rotor(
+    bits: u8,
+    kv_h: usize,
+    heads_per_kv: usize,
+    kv_seq: usize,
+    head_dim: usize,
+    iters: usize,
+) -> f64 {
+    let b = 1_usize;
+    let n_q_heads = kv_h * heads_per_kv;
+    let n_tokens = kv_seq * kv_h;
+    let q = lcg_data(n_q_heads * head_dim, 0xA11CE);
+    let k = lcg_data(n_tokens * head_dim, 0xB0B);
+    let v = lcg_data(n_tokens * head_dim, 0xC0FFEE);
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    let (codes, scales, norms, rotors, _deq) = rotor_encode_for_test(&k, head_dim, bits);
+    let q_arr = make_f32_array(&q, &[b as i32, n_q_heads as i32, 1, head_dim as i32]);
+    let v_arr = make_f32_array(&v, &[b as i32, kv_h as i32, kv_seq as i32, head_dim as i32]);
+
+    let call = || {
+        let out = match bits {
+            3 => rotor_flash_decode_sdpa::<3>(
+                &q_arr,
+                &codes,
+                &scales,
+                &norms,
+                &rotors,
+                &v_arr,
+                None,
+                b as i32,
+                kv_h as i32,
+                kv_seq as i32,
+                head_dim as i32,
+                heads_per_kv as i32,
+                scale,
+                Device::Gpu,
+            ),
+            _ => rotor_flash_decode_sdpa::<4>(
+                &q_arr,
+                &codes,
+                &scales,
+                &norms,
+                &rotors,
+                &v_arr,
+                None,
+                b as i32,
+                kv_h as i32,
+                kv_seq as i32,
+                head_dim as i32,
+                heads_per_kv as i32,
+                scale,
+                Device::Gpu,
+            ),
+        }
+        .expect("rotor_flash_decode_sdpa");
+        out.eval().expect("eval");
+    };
+
+    for _ in 0..3 {
+        call();
+    }
+    let mut times = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let t = std::time::Instant::now();
+        call();
+        times.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    times[times.len() / 2]
+}
+
+#[test]
+#[ignore = "GPU perf microbench — run explicitly: cargo test rotor_flash_decode_microbench -- --ignored --nocapture --test-threads=1"]
+fn rotor_flash_decode_microbench() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    // (kv_h, heads_per_kv, head_dim): Bonsai/Qwen3 (128) and Gemma4 global (512).
+    for &(kv_h, hpk, head_dim) in &[(8_usize, 4_usize, 128_usize), (1, 8, 512)] {
+        for &kv_seq in &[4096_usize, 32768] {
+            let ms = bench_rotor(3, kv_h, hpk, kv_seq, head_dim, 25);
+            println!(
+                "MICROBENCH rotor3 head_dim={head_dim} kv_seq={kv_seq} kv_h={kv_h} hpk={hpk} \
+                 median_ms={ms:.4}"
+            );
+        }
+    }
+}
+
 // ── Oracle: kernel == CPU dequant reference ───────────────────────────────────
 
 #[test]

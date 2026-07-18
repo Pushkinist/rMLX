@@ -37,15 +37,25 @@
 //! explicit — any other `bits` is an `Err`, never a silent fallback to the
 //! wrong unpack width.
 //!
+//! # Reduction + decode structure
+//!
+//! Pass 1 folds the QK dot with **simdgroup reductions** (`simd_sum`): each
+//! simdgroup collapses its 32 lanes with no threadgroup barrier and no
+//! idle-lane tree, and thread 0 folds the per-simdgroup partials. The rotor
+//! K-decode runs **once per Cl(3,0) block** — the block leader stages all
+//! `RF_GROUP_SIZE` grade-1 lanes into threadgroup memory — rather than having
+//! every lane recompute the ~64-FMA inverse sandwich.
+//!
 //! # Reusable K-decode half
 //!
-//! The per-lane rotor decode lives in the header as the MSL function
-//! `rf_decode_k_lane(...)` rather than inline in the body. A future
-//! quantized-V flash kernel needs the identical K-side decode; emitting it as a
-//! header function lets that kernel call it directly instead of copying the
-//! sandwich. (MSL bodies in this repo are statement sequences spliced inside a
-//! generated kernel signature, so a body cannot define functions — the header
-//! is the only place a shared function can live.)
+//! The rotor decode lives in the header as two MSL functions:
+//! `rf_decode_k_group(...)` runs the sandwich once and writes a block's grade-1
+//! lanes, and `rf_decode_k_lane(...)` is the thin per-lane wrapper over it. A
+//! future quantized-V flash kernel needs the identical K-side decode; emitting
+//! them as header functions lets that kernel call them directly instead of
+//! copying the sandwich. (MSL bodies in this repo are statement sequences
+//! spliced inside a generated kernel signature, so a body cannot define
+//! functions — the header is the only place a shared function can live.)
 //!
 //! # Codec contract
 //!
@@ -225,46 +235,50 @@ fn render_mul_table() -> String {
     s
 }
 
-/// Emit the reusable per-lane rotor K-decode as an MSL function.
+/// Emit the reusable rotor K-decode as two MSL functions.
 ///
-/// This is the half a quantized-V flash kernel reuses verbatim: it consumes the
-/// rotor store (codes / scales / norms / rotors) plus a token index and a
-/// head-dim lane, and returns that lane's dequantised K value. Keeping it a
-/// header function (rather than inlining it into the pass-1 body) is what makes
-/// it callable from another kernel body.
+/// `rf_decode_k_group` runs the ~64-FMA inverse sandwich **once** for a Cl(3,0)
+/// block and writes all `RF_GROUP_SIZE` of its grade-1 lanes; the flash-decode
+/// body calls it once per group (its block leader) instead of once per lane, so
+/// the sandwich is not recomputed by every lane of the group.
+///
+/// `rf_decode_k_lane` is the thin per-lane wrapper a quantized-V flash kernel
+/// reuses verbatim: it consumes the rotor store (codes / scales / norms /
+/// rotors) plus a token index and a head-dim lane, and returns that lane's
+/// dequantised K value. It delegates to `rf_decode_k_group` so the sandwich math
+/// lives in exactly one place. Keeping both as header functions (rather than
+/// inlining into the pass-1 body) is what makes them callable from another
+/// kernel body.
 ///
 /// Mirrors [`crate::rotorquant::rotor3_decode`] step for step: unpack 8
 /// `RF_BITS`-bit codes from the group's single u32, centroid lookup × per-group
 /// scale, inverse sandwich `R̃ * mv_q * R`, grade-1 extraction, × per-token L2.
 fn render_decode_fn() -> String {
-    // Bound to a local so the group size is an inline `{gs}` capture below.
-    let gs = ROTOR3_GROUP_SIZE;
     let mut s = String::new();
     let _ = write!(
         s,
-        "\n// Decode one head-dim lane of a rotor-quantized token.\n\
+        "\n// Decode a whole Cl(3,0) block of a rotor-quantized token.\n\
          //\n\
          // `tok_idx` indexes the flat sequence-major token stream\n\
-         // (`(b * kv_seq + t) * kv_h + kv_h_idx`); `lane` is the head-dim slot\n\
-         // in [0, head_dim). Bit-exact with the CPU rotor{{3,4}}_decode.\n\
+         // (`(b * kv_seq + t) * kv_h + kv_h_idx`); `group_id` is the block index\n\
+         // in [0, n_groups). Writes the block's RF_GROUP_SIZE grade-1 lanes into\n\
+         // `out`. Bit-exact with the CPU rotor{{3,4}}_decode.\n\
          //\n\
-         // Shared surface: a quantized-V flash kernel calls this unchanged.\n\
-         inline float rf_decode_k_lane(\n\
+         // One decode per group: the sandwich runs once here rather than once\n\
+         // per head-dim lane.\n\
+         inline void rf_decode_k_group(\n\
          \x20   device const uint*  codes,\n\
          \x20   device const float* scales,\n\
          \x20   device const float* norms,\n\
          \x20   device const float* rotors,\n\
          \x20   uint                tok_idx,\n\
          \x20   uint                n_groups,\n\
-         \x20   uint                lane) {{\n\
-         \x20   // Each group of 3 head-dim slots is one Cl(3,0) rotor block.\n\
-         \x20   uint group_id_in_head = lane / {gs}u;\n\
-         \x20   uint lane_in_group    = lane - group_id_in_head * {gs}u;\n\
+         \x20   uint                group_id,\n\
+         \x20   thread float*       out) {{\n\
+         \x20   uint  word    = codes[tok_idx * n_groups + group_id];\n\
+         \x20   float k_scale = scales[tok_idx * n_groups + group_id];\n\
          \n\
-         \x20   uint  word    = codes[tok_idx * n_groups + group_id_in_head];\n\
-         \x20   float k_scale = scales[tok_idx * n_groups + group_id_in_head];\n\
-         \n\
-         \x20   uint  rotor_base = group_id_in_head * 4u;\n\
+         \x20   uint  rotor_base = group_id * 4u;\n\
          \x20   float rs         = rotors[rotor_base + 0u];\n\
          \x20   float rb12       = rotors[rotor_base + 1u];\n\
          \x20   float rb13       = rotors[rotor_base + 2u];\n\
@@ -314,8 +328,34 @@ fn render_decode_fn() -> String {
          \x20       }}\n\
          \x20   }}\n\
          \n\
-         \x20   // Grade-1 lives at MV indices 1..=3; rescale by the per-token L2.\n\
-         \x20   return restored[lane_in_group + 1u] * norms[tok_idx];\n\
+         \x20   // Grade-1 lives at MV indices 1..=RF_GROUP_SIZE; rescale by L2.\n\
+         \x20   float k_norm = norms[tok_idx];\n\
+         \x20   for (uint e = 0u; e < RF_GROUP_SIZE; ++e) {{\n\
+         \x20       out[e] = restored[e + 1u] * k_norm;\n\
+         \x20   }}\n\
+         }}\n\
+         \n\
+         // Decode one head-dim lane of a rotor-quantized token.\n\
+         //\n\
+         // Thin wrapper over rf_decode_k_group: resolves the lane's block, then\n\
+         // returns that lane's grade-1 component. `lane` is the head-dim slot in\n\
+         // [0, head_dim). Shared surface: a quantized-V flash kernel calls this\n\
+         // unchanged.\n\
+         inline float rf_decode_k_lane(\n\
+         \x20   device const uint*  codes,\n\
+         \x20   device const float* scales,\n\
+         \x20   device const float* norms,\n\
+         \x20   device const float* rotors,\n\
+         \x20   uint                tok_idx,\n\
+         \x20   uint                n_groups,\n\
+         \x20   uint                lane) {{\n\
+         \x20   // Each group of RF_GROUP_SIZE head-dim slots is one Cl(3,0) block.\n\
+         \x20   uint group_id_in_head = lane / RF_GROUP_SIZE;\n\
+         \x20   uint lane_in_group    = lane - group_id_in_head * RF_GROUP_SIZE;\n\
+         \x20   float g[RF_GROUP_SIZE];\n\
+         \x20   rf_decode_k_group(codes, scales, norms, rotors, tok_idx, n_groups,\n\
+         \x20                     group_id_in_head, g);\n\
+         \x20   return g[lane_in_group];\n\
          }}\n",
     );
     s
@@ -363,9 +403,13 @@ pub(crate) fn build_rotor_flash_header(bits: u8) -> Result<String> {
          // Bit-exact with crate::clifford::MUL_TABLE + \
          lloyd_gaussian_codebook({bits}).\n"
     );
+    // RF_GROUP_SIZE = grade-1 slots per Cl(3,0) block (codec constant, same for
+    // both bit widths).
+    let gs = ROTOR3_GROUP_SIZE;
     let _ = write!(
         s,
-        "\n#define RF_BITS {bits}u\n#define RF_MASK 0x{mask:X}u\n"
+        "\n#define RF_BITS {bits}u\n#define RF_MASK 0x{mask:X}u\n\
+         #define RF_GROUP_SIZE {gs}u\n"
     );
     let _ = write!(
         s,

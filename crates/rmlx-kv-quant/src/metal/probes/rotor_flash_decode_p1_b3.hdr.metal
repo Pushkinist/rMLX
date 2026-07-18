@@ -6,6 +6,7 @@
 
 #define RF_BITS 3u
 #define RF_MASK 0x7u
+#define RF_GROUP_SIZE 3u
 
 constant float RF_CB[8] = {
     as_type<float>(0xC009B977u),
@@ -43,29 +44,28 @@ constant float RF_MUL_S[64] = {
     1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f
 };
 
-// Decode one head-dim lane of a rotor-quantized token.
+// Decode a whole Cl(3,0) block of a rotor-quantized token.
 //
 // `tok_idx` indexes the flat sequence-major token stream
-// (`(b * kv_seq + t) * kv_h + kv_h_idx`); `lane` is the head-dim slot
-// in [0, head_dim). Bit-exact with the CPU rotor{3,4}_decode.
+// (`(b * kv_seq + t) * kv_h + kv_h_idx`); `group_id` is the block index
+// in [0, n_groups). Writes the block's RF_GROUP_SIZE grade-1 lanes into
+// `out`. Bit-exact with the CPU rotor{3,4}_decode.
 //
-// Shared surface: a quantized-V flash kernel calls this unchanged.
-inline float rf_decode_k_lane(
+// One decode per group: the sandwich runs once here rather than once
+// per head-dim lane.
+inline void rf_decode_k_group(
     device const uint*  codes,
     device const float* scales,
     device const float* norms,
     device const float* rotors,
     uint                tok_idx,
     uint                n_groups,
-    uint                lane) {
-    // Each group of 3 head-dim slots is one Cl(3,0) rotor block.
-    uint group_id_in_head = lane / 3u;
-    uint lane_in_group    = lane - group_id_in_head * 3u;
+    uint                group_id,
+    thread float*       out) {
+    uint  word    = codes[tok_idx * n_groups + group_id];
+    float k_scale = scales[tok_idx * n_groups + group_id];
 
-    uint  word    = codes[tok_idx * n_groups + group_id_in_head];
-    float k_scale = scales[tok_idx * n_groups + group_id_in_head];
-
-    uint  rotor_base = group_id_in_head * 4u;
+    uint  rotor_base = group_id * 4u;
     float rs         = rotors[rotor_base + 0u];
     float rb12       = rotors[rotor_base + 1u];
     float rb13       = rotors[rotor_base + 2u];
@@ -115,8 +115,34 @@ inline float rf_decode_k_lane(
         }
     }
 
-    // Grade-1 lives at MV indices 1..=3; rescale by the per-token L2.
-    return restored[lane_in_group + 1u] * norms[tok_idx];
+    // Grade-1 lives at MV indices 1..=RF_GROUP_SIZE; rescale by L2.
+    float k_norm = norms[tok_idx];
+    for (uint e = 0u; e < RF_GROUP_SIZE; ++e) {
+        out[e] = restored[e + 1u] * k_norm;
+    }
+}
+
+// Decode one head-dim lane of a rotor-quantized token.
+//
+// Thin wrapper over rf_decode_k_group: resolves the lane's block, then
+// returns that lane's grade-1 component. `lane` is the head-dim slot in
+// [0, head_dim). Shared surface: a quantized-V flash kernel calls this
+// unchanged.
+inline float rf_decode_k_lane(
+    device const uint*  codes,
+    device const float* scales,
+    device const float* norms,
+    device const float* rotors,
+    uint                tok_idx,
+    uint                n_groups,
+    uint                lane) {
+    // Each group of RF_GROUP_SIZE head-dim slots is one Cl(3,0) block.
+    uint group_id_in_head = lane / RF_GROUP_SIZE;
+    uint lane_in_group    = lane - group_id_in_head * RF_GROUP_SIZE;
+    float g[RF_GROUP_SIZE];
+    rf_decode_k_group(codes, scales, norms, rotors, tok_idx, n_groups,
+                      group_id_in_head, g);
+    return g[lane_in_group];
 }
 
 #define RF_TILE_SIZE 64u

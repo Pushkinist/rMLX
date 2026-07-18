@@ -109,9 +109,12 @@ while IFS= read -r line; do
         echo 'kernel void rmlx_msl_compile_probe('
         echo '    device uint*  probe_u [[buffer(0)]],'
         echo '    device float* probe_f [[buffer(1)]],'
-        echo '    uint3 thread_position_in_grid        [[thread_position_in_grid]],'
-        echo '    uint3 threadgroup_position_in_grid   [[threadgroup_position_in_grid]],'
-        echo '    uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]]) {'
+        echo '    uint3 thread_position_in_grid          [[thread_position_in_grid]],'
+        echo '    uint3 threadgroup_position_in_grid     [[threadgroup_position_in_grid]],'
+        echo '    uint3 thread_position_in_threadgroup   [[thread_position_in_threadgroup]],'
+        echo '    uint  thread_index_in_simdgroup        [[thread_index_in_simdgroup]],'
+        echo '    uint  simdgroup_index_in_threadgroup   [[simdgroup_index_in_threadgroup]],'
+        echo '    uint  simdgroups_per_threadgroup       [[simdgroups_per_threadgroup]]) {'
         # Buffer aliases: the names this body expects, at their dispatch dtype.
         IFS=',' read -ra bufs <<< "${buffers}"
         for b in "${bufs[@]}"; do

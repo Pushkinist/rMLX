@@ -13,6 +13,13 @@ uint tile_idx = threadgroup_position_in_grid.x;
 uint bh       = threadgroup_position_in_grid.y;
 uint tid      = thread_position_in_threadgroup.x;
 
+// SIMD-group coordinates (Apple GPU: 32 lanes per simdgroup). The threadgroup
+// is exactly `head_dim` threads and head_dim is a power of two >= 128, so every
+// simdgroup is full and `n_simd = head_dim / simd_width` covers the head.
+uint simd_lane = thread_index_in_simdgroup;
+uint simd_id   = simdgroup_index_in_threadgroup;
+uint n_simd    = simdgroups_per_threadgroup;
+
 if (bh >= n_bh)
     return;
 if (tile_idx >= n_tiles)
@@ -28,56 +35,55 @@ uint tile_end   = tile_start + IF_TILE_SIZE;
 if (tile_end > kv_seq)
     tile_end = kv_seq;
 
-// ── Load Q once into threadgroup memory ──────────────────────────────
-// SMEM ceiling: head_dim <= IF_HEAD_DIM_MAX (dispatcher-enforced). Two
-// float[IF_HEAD_DIM_MAX] arrays at the 512 ceiling = 4 KiB, well inside the
-// Apple GPU 32 KiB threadgroup-memory budget.
-threadgroup float q_shared[IF_HEAD_DIM_MAX];
-q_shared[tid] = query[bh * head_dim + tid];
+// ── Load this lane's Q into a register ────────────────────────────────
+// Each lane only ever multiplies its own head-dim slot, so Q lives in a
+// register rather than threadgroup memory.
+float q_lane = query[bh * head_dim + tid];
 
-// ── Online softmax broadcast slots ───────────────────────────────────
-threadgroup float s_max[1];
-threadgroup float s_sum[1];
+// ── Online-softmax broadcast slots ───────────────────────────────────
+// Thread 0 owns the authoritative running (max, sum) in registers across the
+// tile and broadcasts the per-token correction / exp-score so every lane can
+// rescale its V accumulator.
 threadgroup float s_corr[1];
 threadgroup float s_expsc[1];
 
-if (tid == 0u) {
-    s_max[0] = -INFINITY;
-    s_sum[0] = 0.0f;
-}
-threadgroup_barrier(mem_flags::mem_threadgroup);
+float run_max = -INFINITY;
+float run_sum = 0.0f;
 
 // Per-thread V accumulator (registers — never spills to threadgroup mem).
 float acc_v = 0.0f;
 
-// Shared scratch for the QK dot reduction.
-threadgroup float dot_shared[IF_HEAD_DIM_MAX];
+// Per-simdgroup QK-dot partials (folded by thread 0).
+threadgroup float dot_partials[IF_HEAD_DIM_MAX / 32];
 
 for (uint t = tile_start; t < tile_end; t++) {
     // ── Decode K[tid] for this (b, kv_h_idx, t) ──────────────────────
     // The iso K ring is SEQUENCE-major (`[B, S, kv_h, n_groups]`): per token
-    // all heads are contiguous, matching the chunk-append layout.
-    // (V below stays head-major — it is the separate bf16 mirror, not an
-    // iso-packed buffer.)
+    // all heads are contiguous, matching the chunk-append layout. (V below
+    // stays head-major — it is the separate bf16 mirror, not an iso-packed
+    // buffer.) The iso decode is self-contained per lane (one quaternion
+    // block fits one u32), so it stays in registers with no threadgroup stage.
     uint kv_tok = (b * kv_seq + t) * kv_h + kv_h_idx;
 
     float k_val = if_decode_k_lane(codes, scales, norms, kv_tok, n_groups, tid);
 
-    // ── QK dot product + tree reduction ─────────────────────────────
-    dot_shared[tid] = q_shared[tid] * k_val;
+    // ── QK dot via simdgroup reduction ───────────────────────────────
+    // simd_sum folds each simdgroup's 32 lanes with no threadgroup barrier and
+    // no idle-lane tree; one partial per simdgroup then folds on thread 0.
+    float prod     = q_lane * k_val;
+    float lane_sum = simd_sum(prod);
+    if (simd_lane == 0u) {
+        dot_partials[simd_id] = lane_sum;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // REQUIRES head_dim to be a power of two (dispatcher rejects non-pow-2).
-    for (uint stride = head_dim >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            dot_shared[tid] += dot_shared[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    // ── Thread 0: online softmax update + broadcast ──────────────────
+    // ── Thread 0: fold partials + online-softmax update + broadcast ───
     if (tid == 0u) {
-        float raw = dot_shared[0] * scale_arr[0];
+        float raw = 0.0f;
+        for (uint i = 0u; i < n_simd; i++) {
+            raw += dot_partials[i];
+        }
+        raw *= scale_arr[0];
         // Mask is per (b, q_head, t) — add inside thread 0.
         float mask_val = 0.0f;
         if (has_mask != 0u) {
@@ -85,13 +91,13 @@ for (uint t = tile_start; t < tile_end; t++) {
         }
         float score = raw + mask_val;
 
-        float old_max = s_max[0];
+        float old_max = run_max;
         float new_max = (score > old_max) ? score : old_max;
         float corr    = exp(old_max - new_max);
         float es      = exp(score - new_max);
 
-        s_max[0]   = new_max;
-        s_sum[0]   = s_sum[0] * corr + es;
+        run_max    = new_max;
+        run_sum    = run_sum * corr + es;
         s_corr[0]  = corr;
         s_expsc[0] = es;
     }
@@ -117,6 +123,6 @@ partial_o[out_base + tid] = acc_v;
 
 if (tid == 0u) {
     uint meta          = tile_idx * n_bh + bh;
-    tile_max[meta]     = s_max[0];
-    tile_sum_exp[meta] = s_sum[0];
+    tile_max[meta]     = run_max;
+    tile_sum_exp[meta] = run_sum;
 }
