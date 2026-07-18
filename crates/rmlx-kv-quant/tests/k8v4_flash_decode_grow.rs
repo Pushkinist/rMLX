@@ -156,9 +156,9 @@ fn decode_inputs(head_dim: i32, step: u64, device: Device) -> (Array, Array, Arr
     (k, q, v)
 }
 
-/// Drive a K8V4 TurboFlash cache and a bf16 reference cache in lock-step across
-/// two power-of-two boundaries, asserting the flash decode neither crashes nor
-/// diverges from bf16.
+/// Drive a growing K8V4 TurboFlash cache and a pre-sized K8V4 reference cache in
+/// lock-step across two power-of-two boundaries, asserting the flash decode
+/// neither crashes nor diverges from the pre-sized K8V4 reference.
 fn boundary_run(head_dim: i32, label: &str) {
     let device = Device::Gpu;
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
@@ -210,7 +210,7 @@ fn boundary_run(head_dim: i32, label: &str) {
         let offset = prefill_len as u64 + step + 1;
         assert!(
             cos >= CODEC_FLOOR,
-            "{label}: flash vs bf16 cosine {cos} < {CODEC_FLOOR} at offset {offset} — a frozen \
+            "{label}: flash vs pre-sized K8V4 cosine {cos} < {CODEC_FLOOR} at offset {offset} — a frozen \
              or truncated cache changes the attention output across the boundary"
         );
         if offset >= 129 {
