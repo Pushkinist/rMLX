@@ -1417,10 +1417,11 @@ fn arch_cache_with_inner_mut_round_trip() {
 #[test]
 fn arch_cache_kv_bytes_round_trip() {
     let arch: ArchPromptCache<TestEntry> = ArchPromptCache::new("test-bytes", ReusePolicy::Partial);
+    let post = crate::decode_loop::PostDecode::for_test();
     assert_eq!(arch.read_kv_cache_bytes(), 0, "fresh cache reports zero");
-    arch.store_kv_cache_bytes(424_242);
+    arch.store_kv_cache_bytes(424_242, post);
     assert_eq!(arch.read_kv_cache_bytes(), 424_242);
-    arch.store_kv_cache_bytes(0);
+    arch.store_kv_cache_bytes(0, post);
     assert_eq!(arch.read_kv_cache_bytes(), 0);
 }
 

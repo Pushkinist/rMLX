@@ -195,7 +195,7 @@ pub fn generate_greedy(
             return Ok(steps);
         }
 
-        decode_loop(
+        let post = decode_loop(
             model,
             tokenizer,
             &mut caches,
@@ -219,7 +219,7 @@ pub fn generate_greedy(
 
         {
             let kv_bytes: u64 = caches.iter().map(|c| c.resident_bytes()).sum();
-            store_kv_cache_bytes(kv_bytes);
+            store_kv_cache_bytes(kv_bytes, post);
         }
         log_decode_profile(
             0.0,
@@ -413,9 +413,10 @@ pub fn generate_greedy(
     // loop starts writing new decode-step K/V into them. Materialize the GPU
     // arrays on the current inference thread first so a later eviction on a
     // different tokio/Metal thread can re-eval them as a no-op (see qwen3.rs).
+    //
+    // `kv_cache_bytes` is NOT sampled here — this is the prefill snapshot,
+    // before the decode ring is allocated. It is recorded post-decode below.
     {
-        let kv_bytes: u64 = caches.iter().map(|c| c.resident_bytes()).sum();
-        store_kv_cache_bytes(kv_bytes);
         let cloned_caches: Result<Vec<KvCache>> =
             caches.iter().map(|c| c.try_deep_clone()).collect();
         if let Ok(kv_snapshot) = cloned_caches {
@@ -466,7 +467,7 @@ pub fn generate_greedy(
         return Ok(steps);
     }
 
-    decode_loop(
+    let post = decode_loop(
         model,
         tokenizer,
         &mut caches,
@@ -487,6 +488,14 @@ pub fn generate_greedy(
         &mut step_total_ns,
         &mut decode_steps,
     )?;
+
+    // Store KV-cache bytes post-decode: the decode ring is resident now, so the
+    // sample includes it on ring-backed codecs. Same lifecycle point as the
+    // exact-hit path above.
+    {
+        let kv_bytes: u64 = caches.iter().map(|c| c.resident_bytes()).sum();
+        store_kv_cache_bytes(kv_bytes, post);
+    }
 
     log_decode_profile(
         (prefill_total_ns as f64) / 1.0e6,
@@ -540,7 +549,7 @@ fn decode_loop(
     eval_total_ns: &mut u128,
     step_total_ns: &mut u128,
     decode_steps: &mut u32,
-) -> Result<()> {
+) -> Result<crate::decode_loop::PostDecode> {
     use crate::decode_loop::ProbeStep;
 
     let mut y: Array = {
@@ -761,7 +770,9 @@ fn decode_loop(
         }
     }
 
-    Ok(())
+    // Final act of the decode phase: mint the post-decode witness for the
+    // caller's `store_kv_cache_bytes`.
+    Ok(crate::decode_loop::PostDecode::seal())
 }
 
 /// Emit the `decode_profile` info event for one generate call.

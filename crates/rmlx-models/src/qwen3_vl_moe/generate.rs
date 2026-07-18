@@ -207,7 +207,7 @@ pub fn generate_greedy(
         // first_piece is its piece_for(...) string (stored at Miss-path push), so
         // replaying it on the cloned caches yields the same decoded sequence as a
         // cold run. Subsequent steps re-derive their piece via make_step.
-        decode_from(
+        let post = decode_from(
             model,
             tokenizer,
             &mut kv,
@@ -226,7 +226,7 @@ pub fn generate_greedy(
             token_history,
         )?;
         let kv_bytes: u64 = kv.iter().map(|c| c.resident_bytes()).sum();
-        store_kv_cache_bytes(kv_bytes);
+        store_kv_cache_bytes(kv_bytes, post);
         return Ok(steps);
     }
 
@@ -275,9 +275,12 @@ pub fn generate_greedy(
     // starts writing new decode-step K/V into them. Materialize the GPU arrays on
     // the current inference thread first so a later eviction on a different
     // tokio/Metal thread can re-eval them as a no-op (see qwen3.rs).
+    //
+    // `kv_cache_bytes` is NOT sampled here — this is the prefill snapshot,
+    // before the decode ring is allocated. It is recorded post-decode below,
+    // for every request (text and image), at the same lifecycle point as the
+    // exact-hit path.
     if !has_image {
-        let kv_bytes: u64 = kv.iter().map(|c| c.resident_bytes()).sum();
-        store_kv_cache_bytes(kv_bytes);
         let cloned_caches: Result<Vec<KvCache>> = kv.iter().map(|c| c.try_deep_clone()).collect();
         if let Ok(kv_snapshot) = cloned_caches {
             match kv_snapshot.iter().try_for_each(|c| c.eval_for_spill()) {
@@ -322,7 +325,7 @@ pub fn generate_greedy(
         }
     }
 
-    decode_from(
+    let post = decode_from(
         model,
         tokenizer,
         &mut kv,
@@ -340,6 +343,11 @@ pub fn generate_greedy(
         penalty_cfg,
         token_history,
     )?;
+    // Store KV-cache bytes post-decode: the decode ring is resident now, so the
+    // sample includes it on ring-backed codecs. Same lifecycle point as the
+    // exact-hit path above.
+    let kv_bytes: u64 = kv.iter().map(|c| c.resident_bytes()).sum();
+    store_kv_cache_bytes(kv_bytes, post);
     Ok(steps)
 }
 
@@ -374,7 +382,7 @@ fn decode_from(
     rng: &mut Pcg32,
     penalty_cfg: &PenaltyConfig,
     token_history: &mut Vec<u32>,
-) -> Result<()> {
+) -> Result<crate::decode_loop::PostDecode> {
     let mut next = first;
     let mut first_piece = first_piece;
     for _ in 0..n_tokens {
@@ -410,7 +418,9 @@ fn decode_from(
             device,
         )?;
     }
-    Ok(())
+    // Final act of the decode phase: mint the post-decode witness for the
+    // caller's `store_kv_cache_bytes`.
+    Ok(crate::decode_loop::PostDecode::seal())
 }
 
 /// Image-branch generation: ViT features already produced by the caller and
