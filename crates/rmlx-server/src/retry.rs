@@ -90,8 +90,9 @@ use crate::openai::ItlStore;
 /// Whether an [`RmlxError`] permits a transparent token-replay retry.
 ///
 /// `Migratable` — the error is transient and the stream can be reconstructed
-/// by re-issuing the request with already-delivered tokens appended to the
-/// prompt.
+/// by re-issuing the **original** request at `temperature == 0`; the engine
+/// re-emits the already-delivered tokens deterministically and the replay loop
+/// skips them.
 ///
 /// `Fatal` — the error is permanent or intentional (e.g. client cancelled,
 /// logic error). No retry should be attempted.
@@ -183,7 +184,7 @@ pub struct RequestPlan {
     pub model_id: String,
     /// Token ids of the original (pre-retry) prompt, without any delivered tokens.
     pub original_prompt_tokens: Vec<u32>,
-    /// Maximum new tokens from the original request, before subtracting delivered tokens.
+    /// Maximum new tokens from the original request; re-issued unchanged on every replay attempt.
     pub original_max_tokens: u32,
     /// Sampling parameters (temperature, top-p, etc.) frozen at plan creation.
     pub sampling: SamplingParams,
