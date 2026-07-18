@@ -63,6 +63,56 @@ fn quant_rotor_k3_roundtrip_no_qjl_matches_v_side() {
     unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
 }
 
+/// The `blocks == shape[2]` invariant is enforced loudly, never zero-padded.
+///
+/// A store whose CPU `blocks` cover fewer tokens than `shape[2]` claims, with
+/// no GPU ring to supply the tail, is the forbidden state (the naive "skip the
+/// per-step download" bug). Both `dequant()` and `try_deep_clone()` must reject
+/// it with an `Error` rather than fabricate a zeroed gap (`dequant`) or persist
+/// a truncated store (`try_deep_clone` — the SSD spill / prompt-cache clone).
+///
+/// Mutation check: revert `dequant()` to decode `self.blocks` + `out.resize(_,
+/// 0.0)` (the old zero-pad), or drop the `synced_rotor_k_blocks` reconcile —
+/// then `dequant()` returns `Ok` with a zeroed tail and this assertion flips
+/// RED.
+#[test]
+fn quant_rotor_k3_short_blocks_without_ring_is_loud_not_zero_padded() {
+    let kv_h = 2_i32;
+    let head_dim = 9_i32; // n_groups = 3, exact
+    let data = lcg_data((kv_h * 2 * head_dim) as usize, TEST_SEED);
+
+    // A real single block covering 2 tokens (QJL off via env-independent seed).
+    let mut src = QuantRotorK3::new(vec![1, kv_h, 0, head_dim], 0);
+    src.append(&data, &[1, kv_h, 2, head_dim]).expect("append");
+    assert_eq!(src.blocks.len(), 1, "one block for the 2-token append");
+
+    // Reassemble a store that *claims* shape[2] == 4 while its blocks cover only
+    // 2 tokens and no ring exists — the ring-only tail with the ring missing.
+    let truncated = QuantRotorK3::from_cpu_blocks(
+        src.rotors.clone(),
+        None,
+        src.blocks.clone(),
+        vec![1, kv_h, 4, head_dim],
+        0,
+    );
+    assert!(
+        !truncated.gpu.is_allocated(),
+        "precondition: no ring to cover the tail"
+    );
+
+    let dq = truncated.dequant();
+    assert!(
+        dq.is_err(),
+        "dequant must reject a short-blocks/no-ring store loudly, not zero-pad the tail; \
+         got Ok(len={:?})",
+        dq.map(|v| v.len())
+    );
+    assert!(
+        truncated.try_deep_clone().is_err(),
+        "try_deep_clone must refuse to materialise a truncated store (SSD spill / snapshot)"
+    );
+}
+
 #[test]
 fn quant_rotor_k3_qjl_default_on() {
     let _guard = crate::test_utils::ROTOR_QJL_ENV_LOCK

@@ -289,18 +289,15 @@ struct PackedKEncodedGpu {
     norms: Array,
 }
 
-/// [`rotor_gpu_encode_block`] that also hands back the GPU arrays.
-///
-/// The download to CPU still happens — `RotorBlocks` remains the source of
-/// truth for `dequant()` and the SSD spill/hydrate round-trip — but the K-side
-/// ring feed reuses the pre-download GPU arrays, so keeping the store
-/// GPU-resident costs no extra encode work.
-fn rotor_gpu_encode_block_retaining(
+/// GPU-encode one rotor K/V chunk, returning the raw kernel arrays plus the
+/// `(n_tokens_total, n_groups)` geometry the CPU download and ring feed both
+/// need. Shared by the block-retaining and ring-only encode wrappers.
+fn rotor_gpu_encode_arrays(
     new_kv: &Array,
     new_shape: &[i32],
     rotors: &[f32],
     bits: u8,
-) -> Result<(RotorBlocks, PackedKEncodedGpu)> {
+) -> Result<(Array, Array, Array, usize, usize)> {
     if new_shape.len() != 4 {
         return Err(Error::Mlx(format!(
             "rotor_gpu_encode_block: expected 4D new_shape, got {new_shape:?}"
@@ -330,25 +327,30 @@ fn rotor_gpu_encode_block_retaining(
     } else {
         crate::rotorquant_msl::rotor_quantize_v4_gpu(new_kv, &rotors_arr, head_dim, Device::Gpu)?
     };
-    // This download is a host round-trip per layer per decode step, and the
-    // fused decode path never reads the `RotorBlocks` it produces — so it looks
-    // like pure waste on that path. It is kept deliberately:
-    //
-    // * `RotorBlocks` is the source of truth for `dequant()` AND for the SSD
-    //   tier, which serialises `RotorKOnly{3,4}` block-by-block
-    //   (`rmlx_kv_ssd::block_io`). `push_*_k_block` bumps `shape[2]` in lockstep
-    //   with the push, so skipping the block would leave `blocks` shorter than
-    //   `shape[2]` — a gap `dequant()` silently zero-pads and a spill would
-    //   persist as a truncated store.
-    // * The win does not pay for that risk. Measured (Bonsai-8B, 4k, k_rotor3,
-    //   3 runs, decode TPS): with download 13.2 / 16.3 / 15.7 (median 15.7),
-    //   skipping it 19.0 / 16.8 / 17.1 (median 17.1) — ~9% on the median but the
-    //   ranges overlap, because the flash dispatcher already evaluates the ring
-    //   slices each step, so the encode is materialised either way and only the
-    //   host memcpy is saved.
-    //
-    // Dropping it needs a ring-only-tail design that can rebuild blocks on
-    // demand (or an SSD path that reads the ring), not a flag.
+    Ok((codes_arr, scales_arr, norms_arr, n_tokens_total, n_groups))
+}
+
+/// [`rotor_gpu_encode_block`] that also hands back the GPU arrays.
+///
+/// Used by the CPU-authoritative append paths (prefill, and the non-fused
+/// decode fallback): the `RotorBlocks` is the source of truth for `dequant()`
+/// and the SSD spill/hydrate round-trip, while the K-side ring feed reuses the
+/// pre-download GPU arrays so keeping the store GPU-resident costs no extra
+/// encode work.
+///
+/// The fused decode path does **not** use this — it uses
+/// [`rotor_gpu_encode_ring_only`], which skips the per-step host download
+/// entirely (a ring-only tail; the blocks are rebuilt from the ring on demand
+/// when `dequant()` / an SSD spill actually needs them).
+fn rotor_gpu_encode_block_retaining(
+    new_kv: &Array,
+    new_shape: &[i32],
+    rotors: &[f32],
+    bits: u8,
+) -> Result<(RotorBlocks, PackedKEncodedGpu)> {
+    let (codes_arr, scales_arr, norms_arr, n_tokens_total, n_groups) =
+        rotor_gpu_encode_arrays(new_kv, new_shape, rotors, bits)?;
+
     let (codes, scales, norms) = crate::rotorquant_msl::rotor_gpu_outputs_to_cpu(
         &codes_arr,
         &scales_arr,
@@ -378,6 +380,35 @@ fn rotor_gpu_encode_block_retaining(
             norms: norms_per_token,
         },
     ))
+}
+
+/// GPU-encode one rotor K chunk for the **ring-only** append path: feed the GPU
+/// ring without paying the per-step host download that
+/// [`rotor_gpu_encode_block_retaining`] does.
+///
+/// The fused decode kernel reads the ring, never the CPU `RotorBlocks`, so
+/// downloading and materialising a block per decode step is pure host work in
+/// the path whose purpose is removing host work. Skipping it leaves the ring
+/// the sole source of truth for the decode tail; the CPU blocks are rebuilt
+/// from the ring on demand at a `dequant()` / SSD-spill boundary
+/// (`synced_rotor_k_blocks`), and the `blocks`-vs-`shape[2]` invariant is
+/// enforced loudly there — never zero-padded.
+fn rotor_gpu_encode_ring_only(
+    new_kv: &Array,
+    new_shape: &[i32],
+    rotors: &[f32],
+    bits: u8,
+) -> Result<PackedKEncodedGpu> {
+    let (codes_arr, scales_arr, norms_arr, n_tokens_total, n_groups) =
+        rotor_gpu_encode_arrays(new_kv, new_shape, rotors, bits)?;
+    // Collapse per-group norms to the per-token form the ring stores (GPU-side,
+    // no host round-trip).
+    let norms_per_token = collapse_group_norms_to_token(&norms_arr, n_tokens_total, n_groups)?;
+    Ok(PackedKEncodedGpu {
+        codes: codes_arr,
+        scales: scales_arr,
+        norms: norms_per_token,
+    })
 }
 
 /// Collapse a packed-K encode kernel's per-group norms (`[n_tokens, n_groups]`,
@@ -484,13 +515,25 @@ fn push_rotor4_v_block(vs: &mut QuantRotorV4, block: RotorBlocks, new_shape: &[i
     }
 }
 
+/// Advance a rotor K store's accumulated `shape` by one appended chunk,
+/// matching the `QuantRotorK{3,4}::append` bookkeeping. Shared by the
+/// block-pushing and ring-only append paths so `shape[2]` advances identically
+/// whether or not a CPU block is materialised.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "shape rank-4 guard above each indexing site; new_shape rank validated by upstream encoder helper"
+)]
+fn bump_rotor_k_shape(shape: &mut Vec<i32>, new_shape: &[i32]) {
+    if shape.len() != 4 || shape[0] == 0 {
+        *shape = new_shape.to_vec();
+    } else {
+        shape[2] += new_shape[2];
+    }
+}
+
 /// Push a pre-built [`RotorBlocks`] onto a [`QuantRotorK3`] buffer (QJL OFF
 /// path — caller has already verified [`crate::rotor_qjl::rotor_qjl_enabled`]
 /// is `false`).
-#[allow(
-    clippy::indexing_slicing,
-    reason = "ks.shape rank-4 guard above each indexing site; new_shape rank validated by upstream encoder helper"
-)]
 fn push_rotor3_k_block(
     ks: &mut crate::storage::QuantRotorK3,
     block: RotorBlocks,
@@ -504,17 +547,9 @@ fn push_rotor3_k_block(
         qjl_norms: Vec::new(),
         n_tokens: block.n_tokens,
     });
-    if ks.shape.len() != 4 || ks.shape[0] == 0 {
-        ks.shape = new_shape.to_vec();
-    } else {
-        ks.shape[2] += new_shape[2];
-    }
+    bump_rotor_k_shape(&mut ks.shape, new_shape);
 }
 
-#[allow(
-    clippy::indexing_slicing,
-    reason = "ks.shape rank-4 guard above each indexing site; new_shape rank validated by upstream encoder helper"
-)]
 fn push_rotor4_k_block(
     ks: &mut crate::storage::QuantRotorK4,
     block: RotorBlocks,
@@ -528,11 +563,7 @@ fn push_rotor4_k_block(
         qjl_norms: Vec::new(),
         n_tokens: block.n_tokens,
     });
-    if ks.shape.len() != 4 || ks.shape[0] == 0 {
-        ks.shape = new_shape.to_vec();
-    } else {
-        ks.shape[2] += new_shape[2];
-    }
+    bump_rotor_k_shape(&mut ks.shape, new_shape);
 }
 
 /// Recover `head_dim` from a 4-D new_shape without silently swallowing
@@ -604,8 +635,17 @@ fn rotor4_gpu_append_into_blocks(
 /// hydrate, deep clone, and a mid-run fall back to the CPU append).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RingFeed {
-    /// Maintain the ring — the rotor flash-decode kernel will read it.
+    /// Maintain the ring **and** push a CPU block — the ring is the source of
+    /// truth for the flash-decode kernel, the block for `dequant()` / SSD spill.
+    /// Used by prefill and the non-fused decode fallback, which `dequant()` the
+    /// whole prefix on the same step and so need the block immediately.
     Maintain,
+    /// Maintain the ring **without** pushing a CPU block — a **ring-only tail**.
+    /// The fused decode path never reads the block, so skipping the per-step
+    /// host download is the win; the blocks are rebuilt from the ring on demand
+    /// at a `dequant()` / SSD-spill boundary. `shape[2]` still advances so the
+    /// ring and the attention length stay in lockstep.
+    MaintainRingOnly,
     /// Skip the ring. Any live ring is dropped (see the invariant below).
     Skip,
 }
@@ -634,7 +674,7 @@ fn rotor3_sync_ring(
     device: Device,
 ) -> Result<()> {
     let (b, kv_h, new_seq) = b_kv_h_new_seq(new_shape)?;
-    if feed != RingFeed::Maintain || b != 1 {
+    if feed == RingFeed::Skip || b != 1 {
         ks.gpu.clear();
         return Ok(());
     }
@@ -665,7 +705,7 @@ fn rotor4_sync_ring(
     device: Device,
 ) -> Result<()> {
     let (b, kv_h, new_seq) = b_kv_h_new_seq(new_shape)?;
-    if feed != RingFeed::Maintain || b != 1 {
+    if feed == RingFeed::Skip || b != 1 {
         ks.gpu.clear();
         return Ok(());
     }
@@ -707,13 +747,46 @@ fn rotor3_gpu_append_into_k_blocks(
     // encode itself ignores the JL projection — this path is QJL-off-only by
     // dispatcher contract.
     let seq_major = packed_k_chunk_seq_major(new_k, new_shape, device)?;
+    if is_ring_only_append(feed, new_shape) {
+        // Ring-only tail: feed the GPU ring, advance `shape[2]`, and skip the
+        // per-step host download + CPU block push. The ring is the source of
+        // truth for the decode tail; the blocks are rebuilt on demand at a
+        // `dequant()` / SSD-spill boundary.
+        let gpu = rotor_gpu_encode_ring_only(
+            &seq_major,
+            new_shape,
+            &ks.rotors,
+            crate::rotorquant::ROTOR3_BITS,
+        )?;
+        rotor3_sync_ring(
+            ks,
+            &gpu,
+            RingFeed::Maintain,
+            new_shape,
+            head_dim,
+            max_seq,
+            device,
+        )?;
+        bump_rotor_k_shape(&mut ks.shape, new_shape);
+        return Ok(());
+    }
+    // Block path: prefill / non-fused decode (Maintain), asym (Skip), and the
+    // `b > 1` fallback of a ring-only append. A ring-only feed that reaches here
+    // is a `b > 1` chunk — normalise it to Maintain so the shared ring feeder
+    // clears the ring for the un-representable batch and the CPU block carries
+    // the data.
+    let block_feed = if feed == RingFeed::Skip {
+        RingFeed::Skip
+    } else {
+        RingFeed::Maintain
+    };
     let (block, gpu) = rotor_gpu_encode_block_retaining(
         &seq_major,
         new_shape,
         &ks.rotors,
         crate::rotorquant::ROTOR3_BITS,
     )?;
-    rotor3_sync_ring(ks, &gpu, feed, new_shape, head_dim, max_seq, device)?;
+    rotor3_sync_ring(ks, &gpu, block_feed, new_shape, head_dim, max_seq, device)?;
     push_rotor3_k_block(ks, block, new_shape);
     Ok(())
 }
@@ -730,13 +803,40 @@ fn rotor4_gpu_append_into_k_blocks(
     let head_dim = head_dim_from_shape(new_shape, "rotor4_gpu_append_into_k_blocks")?;
     ensure_k4_rotors(ks, head_dim);
     let seq_major = packed_k_chunk_seq_major(new_k, new_shape, device)?;
+    if is_ring_only_append(feed, new_shape) {
+        // Ring-only tail — see [`rotor3_gpu_append_into_k_blocks`].
+        let gpu = rotor_gpu_encode_ring_only(
+            &seq_major,
+            new_shape,
+            &ks.rotors,
+            crate::rotorquant::ROTOR4_BITS,
+        )?;
+        rotor4_sync_ring(
+            ks,
+            &gpu,
+            RingFeed::Maintain,
+            new_shape,
+            head_dim,
+            max_seq,
+            device,
+        )?;
+        bump_rotor_k_shape(&mut ks.shape, new_shape);
+        return Ok(());
+    }
+    // Block path — see [`rotor3_gpu_append_into_k_blocks`] (b>1 ring-only
+    // fallback normalises to Maintain).
+    let block_feed = if feed == RingFeed::Skip {
+        RingFeed::Skip
+    } else {
+        RingFeed::Maintain
+    };
     let (block, gpu) = rotor_gpu_encode_block_retaining(
         &seq_major,
         new_shape,
         &ks.rotors,
         crate::rotorquant::ROTOR4_BITS,
     )?;
-    rotor4_sync_ring(ks, &gpu, feed, new_shape, head_dim, max_seq, device)?;
+    rotor4_sync_ring(ks, &gpu, block_feed, new_shape, head_dim, max_seq, device)?;
     push_rotor4_k_block(ks, block, new_shape);
     Ok(())
 }
@@ -775,7 +875,14 @@ pub(super) fn rotor3_k_only_gpu_append(
     let Some(ks) = k.as_mut() else {
         return Err(Error::Mlx("RotorKOnly3 K buffer absent after init".into()));
     };
-    rotor3_gpu_append_into_k_blocks(ks, new_k, new_shape, device, RingFeed::Maintain, max_seq)
+    rotor3_gpu_append_into_k_blocks(
+        ks,
+        new_k,
+        new_shape,
+        device,
+        RingFeed::MaintainRingOnly,
+        max_seq,
+    )
 }
 
 /// Mirror of [`rotor3_k_only_gpu_append`] for `RotorKOnly4`.
@@ -810,7 +917,14 @@ pub(super) fn rotor4_k_only_gpu_append(
     let Some(ks) = k.as_mut() else {
         return Err(Error::Mlx("RotorKOnly4 K buffer absent after init".into()));
     };
-    rotor4_gpu_append_into_k_blocks(ks, new_k, new_shape, device, RingFeed::Maintain, max_seq)
+    rotor4_gpu_append_into_k_blocks(
+        ks,
+        new_k,
+        new_shape,
+        device,
+        RingFeed::MaintainRingOnly,
+        max_seq,
+    )
 }
 
 /// Accumulated sequence length held by a rotor K storage `shape`
@@ -820,6 +934,21 @@ fn accumulated_seq(shape: &[i32]) -> i32 {
         return 0;
     }
     shape.get(2).copied().unwrap_or(0).max(0)
+}
+
+/// Whether an append should take the ring-only tail path (no CPU block push).
+///
+/// Only `feed == MaintainRingOnly` **and** `b == 1` qualify: the ring's
+/// per-step stride does not interleave batch, so a `b > 1` chunk cannot be laid
+/// into it. Because the ring-only path pushes no CPU block, a `b > 1` chunk
+/// here would clear the ring in `rotor*_sync_ring` and silently drop the chunk
+/// while still advancing `shape[2]` — the ring-vs-blocks divergence the
+/// invariant forbids. So `b > 1` falls back to the block-pushing path, which
+/// handles batch and keeps the CPU blocks the source of truth. (Per request the
+/// batch dim is fixed, so a `b > 1` cache never builds a ring-only tail to
+/// lose.)
+fn is_ring_only_append(feed: RingFeed, new_shape: &[i32]) -> bool {
+    feed == RingFeed::MaintainRingOnly && matches!(b_kv_h_new_seq(new_shape), Ok((1, _, _)))
 }
 
 /// `(b, kv_h, new_seq)` from a rank-4 `[B, kv_h, S, D]` shape.

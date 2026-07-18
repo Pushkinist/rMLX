@@ -19,7 +19,7 @@ use crate::rotorquant::{
     make_qjl_projection, n_groups_for, rotor4_k_decode, rotor4_k_encode, RotorQuantError,
     ROTOR4_BITS, ROTOR4_GROUP_SIZE,
 };
-use crate::storage::quant_rotor_k3::RotorKBlocks;
+use crate::storage::quant_rotor_k3::{synced_rotor_k_blocks, RotorKBlocks};
 
 use super::QuantKGpuRing;
 
@@ -299,6 +299,11 @@ impl QuantRotorK4 {
     /// # Errors
     /// Infallible on the CPU path; returns `Result` for parity.
     pub fn try_deep_clone(&self) -> Result<Self> {
+        // Materialise any ring-only tail into complete CPU blocks first — see
+        // [`QuantRotorK3::try_deep_clone`] for the full rationale (this is the
+        // single reconcile point for the prompt-cache and SSD spill clones).
+        let blocks =
+            synced_rotor_k_blocks(&self.blocks, &self.shape, &self.gpu, Device::Gpu)?.into_owned();
         Ok(Self {
             rotors: self.rotors.clone(),
             // The clone starts CPU-only: `blocks` carries the full payload, so
@@ -307,7 +312,7 @@ impl QuantRotorK4 {
             // independent caches.
             gpu: QuantKGpuRing::default(),
             qjl_s_matrix: self.qjl_s_matrix.clone(),
-            blocks: self.blocks.clone(),
+            blocks,
             shape: self.shape.clone(),
             layer_idx: self.layer_idx,
             head_idx: self.head_idx,
@@ -366,7 +371,11 @@ impl QuantRotorK4 {
         let total_elems: usize = self.shape.iter().map(|&d| d as usize).product();
         let mut out: Vec<f32> = Vec::with_capacity(total_elems);
 
-        if self.blocks.is_empty() {
+        // Reconcile CPU blocks with the GPU ring (ring-only decode tail rebuild;
+        // loud on an unrecoverable gap). See [`QuantRotorK3::dequant`].
+        let blocks = synced_rotor_k_blocks(&self.blocks, &self.shape, &self.gpu, Device::Gpu)?;
+
+        if blocks.is_empty() {
             out.resize(total_elems, 0.0);
             return Ok(out);
         }
@@ -377,7 +386,7 @@ impl QuantRotorK4 {
             ));
         }
 
-        for blk in &self.blocks {
+        for blk in blocks.iter() {
             let dec = rotor4_k_decode(
                 &blk.codes,
                 &blk.scales,
@@ -391,10 +400,15 @@ impl QuantRotorK4 {
             .map_err(|e: RotorQuantError| Error::Mlx(format!("rotor4_k decode: {e}")))?;
             out.extend_from_slice(&dec);
         }
-        if out.len() < total_elems {
-            out.resize(total_elems, 0.0);
-        } else if out.len() > total_elems {
-            out.truncate(total_elems);
+        // `synced_rotor_k_blocks` guarantees full coverage — a mismatch is an
+        // internal invariant break, surfaced loudly rather than zero-padded.
+        if out.len() != total_elems {
+            return Err(Error::Mlx(format!(
+                "QuantRotorK4::dequant: decoded {} elems but shape {:?} implies {total_elems} — \
+                 refusing to zero-pad / truncate",
+                out.len(),
+                self.shape
+            )));
         }
         // Blocks are sequence-major (see `append`); reorder back to head-major
         // `[B, kv_h, S, D]`.
