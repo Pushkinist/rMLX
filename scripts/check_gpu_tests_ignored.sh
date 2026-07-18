@@ -53,19 +53,21 @@
 # that has silently stopped running. It is a warning, not a failure: some
 # ignores are legitimately non-GPU (e.g. "requires mlx runtime").
 #
-# FILE EXEMPTION (device-as-value false positives)
+# PER-TEST EXEMPTION (device-as-value false positives)
 #   Detection is by shape: naming `Device::Gpu`. In compute crates that always
 #   means a Metal dispatch. In higher crates `Device` is a plain config enum —
 #   a test may pass `Device::Gpu` to a PURE function that only branches on it
 #   (e.g. a CLI truncation-policy resolver) and never touches Metal. No local
 #   shape separates `pure_fn(.., Device::Gpu, ..)` from `mlx_op(.., Device::Gpu)`,
 #   and the seed must stay broad (the real GPU tests bind `let d = Device::Gpu;`,
-#   so any narrower match would miss them). Such a file opts out with a marker
-#   on its own line:
-#       // gpu-test-gate: exempt — <reason>
-#   The file is then skipped entirely. Use it ONLY for files that contain no
-#   Metal-driving test; a reviewer audits each marker, and the file must stay
-#   free of GPU-dispatching tests (a new one there would be silently uncaught).
+#   so any narrower match would miss them). Such a test opts out with a
+#   line-leading marker inside its OWN attribute/comment block:
+#       // gpu-test-gate: exempt
+#   The exemption is scoped to that one `#[test]` fn — NOT the whole file — so a
+#   Metal-driving test added to the same file still trips the gate. The marker
+#   must lead its line and sit in the fn's attribute block; a copy inside a fn
+#   body does not exempt. A reviewer audits each marker; use it ONLY for a test
+#   that passes `Device::Gpu` as a value and never dispatches Metal.
 #
 # PARSING
 #   Relies on rustfmt layout (already enforced by `make fmt-check`): a `fn`
@@ -89,6 +91,12 @@ fi
 # Read `[workspace] members = [ ... ]` — the single source of the crate list.
 # Never hard-code a crate root: a moved/renamed crate must surface as a
 # fail-closed error below, not as a silently narrowed scan.
+#
+# NOTE: this parser assumes the one-member-per-line array layout. `make
+# fmt-check` (rustfmt) does NOT format `Cargo.toml`, so that layout is a
+# convention, not an enforced invariant — a reformat to a single-line array or
+# an inline comment could silently narrow the scan. The plausibility floor
+# below (parsed members vs. crate dirs on disk) guards against exactly that.
 members=()
 while IFS= read -r m; do
     [ -n "$m" ] && members+=("$m")
@@ -108,6 +116,23 @@ done < <(awk '
 if [ ${#members[@]} -eq 0 ]; then
     echo "ERROR: parsed 0 workspace members from ${CARGO_TOML}." >&2
     echo "A gate that scans nothing passes everything; refusing to report OK." >&2
+    exit 1
+fi
+
+# Plausibility floor: every crate under crates/ (a dir with its own Cargo.toml)
+# must be a parsed member. If the parse yields fewer, the members array layout
+# changed and the scan silently narrowed — the exact scope-loss class this gate
+# guards against. Fail closed. (A crate deliberately excluded from the workspace
+# would trip this; that is a reviewable event, not a silent narrowing.)
+disk_crates=0
+if [ -d "${REPO_ROOT}/crates" ]; then
+    disk_crates=$(find "${REPO_ROOT}/crates" -mindepth 2 -maxdepth 2 \
+        -name Cargo.toml -not -path "*/target/*" | wc -l | tr -d ' ')
+fi
+if [ "${#members[@]}" -lt "${disk_crates}" ]; then
+    echo "ERROR: parsed ${#members[@]} workspace members but ${disk_crates} crate dirs exist under crates/." >&2
+    echo "The members array in ${CARGO_TOML} likely changed layout and narrowed the scan." >&2
+    echo "Restore the one-member-per-line layout, or reconcile the members list." >&2
     exit 1
 fi
 
@@ -155,11 +180,6 @@ violations=""
 warnings=""
 
 for f in "${scan_files[@]}"; do
-    # A file may opt out of the GPU-dispatch check with an explicit marker
-    # (see FILE EXEMPTION in the header). Skip it entirely.
-    if grep -q "gpu-test-gate: exempt" "$f"; then
-        continue
-    fi
     out=$(awk -v fname="$f" '
         # ── Multi-line attribute continuation ────────────────────────────────
         in_attr {
@@ -171,6 +191,13 @@ for f in "${scan_files[@]}"; do
         /^[[:space:]]*#\[/ {
             attrs = attrs " " $0
             if ($0 !~ /\][[:space:]]*$/) { in_attr = 1 }
+            next
+        }
+        # ── Per-test exemption marker (line-leading, in the attr block) ─────
+        # Folds into the pending attribute block so it attaches to the NEXT fn
+        # only. Guarded by !in_fn so a copy inside a body cannot exempt.
+        !in_fn && /^[[:space:]]*\/\/[[:space:]]*gpu-test-gate:[[:space:]]*exempt([[:space:]]|$)/ {
+            attrs = attrs " GATE_EXEMPT"
             next
         }
         # ── Comments / doc comments keep the pending attribute block ────────
@@ -262,7 +289,9 @@ for f in "${scan_files[@]}"; do
                 f_ = order[i]
                 if (fn_attrs[f_] !~ /#\[test\]/) { continue }
                 has_ignore = (fn_attrs[f_] ~ /#\[ignore/)
-                if (gpu[f_] && !has_ignore) {
+                # Per-test opt-out for a device-as-value false positive.
+                exempt = (fn_attrs[f_] ~ /GATE_EXEMPT/)
+                if (gpu[f_] && !has_ignore && !exempt) {
                     printf "V  %s: %s\n", fname, f_
                 }
                 # Converse: an ignore claiming a Metal context on a test that

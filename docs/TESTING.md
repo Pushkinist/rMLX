@@ -146,12 +146,14 @@ gates` job. It keys on the shape (does the test reach `Device::Gpu`, directly,
 through a same-file helper, or via a module-scope `const … = Device::Gpu`?),
 never on the ignore reason's wording, which varies across the tree.
 
-Two known edges: (1) a file of pure device-*policy* tests — ones that pass
-`Device::Gpu` to a non-mlx function as a plain selector value, never a Metal
-dispatch — opts out with a `// gpu-test-gate: exempt — <reason>` marker and
-must stay free of Metal-driving tests; (2) the reachability seed is file-local,
-so a test that reaches Metal only through a helper defined in another module can
-draw a non-fatal false-positive warning — verify before acting on it.
+Two known edges: (1) a pure device-*policy* test — one that passes `Device::Gpu`
+to a non-mlx function as a plain selector value, never a Metal dispatch — opts
+out **per fn** with a line-leading `// gpu-test-gate: exempt` marker in its own
+attribute block (scoped to that one `#[test]`, so a Metal-driving test added to
+the same file still trips the gate; a copy of the marker inside a fn body does
+not exempt); (2) the reachability seed is file-local, so a test that reaches
+Metal only through a helper defined in another module can draw a non-fatal
+false-positive warning — verify before acting on it.
 
 ### `#[ignore]` is not a place to park a broken test
 
