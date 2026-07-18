@@ -616,11 +616,14 @@ impl KvQuant {
     /// - **K-only iso** (`IsoKOnly3/4`): NO bf16 early-return — the iso K MSL
     ///   kernel dispatches every decode step on GPU → `None` (Metal, hybrid:
     ///   dequant restages host-side each step, but a Metal kernel runs).
-    /// - **K-only rotor** (`RotorKOnly3/4`): NO bf16 early-return; the GPU K
-    ///   encode is gated on `device == Gpu && !rotor_qjl_enabled()`. QJL ON
-    ///   (default) → CPU (`Some`); QJL OFF → Metal (`None`). This arm reads the
-    ///   live [`crate::rotor_qjl::rotor_qjl_enabled`] gate so the verdict tracks
-    ///   the dispatcher.
+    /// - **K-only rotor** (`RotorKOnly3/4`): NO bf16 early-return; the runtime
+    ///   dispatcher (`update_rotor_k_only_{3,4}` and the sdpa fast path) gates
+    ///   the GPU K encode on the store's sticky `use_qjl()` flag. QJL off
+    ///   (default) → Metal (`None`); QJL on (opt-in `--rotor-qjl on`) → CPU
+    ///   (`Some`). This classifier reads the process-global
+    ///   [`crate::rotor_qjl::rotor_qjl_enabled`], which equals the store flag
+    ///   only before the store is built (it is the value the store takes at
+    ///   first append), so the verdict tracks the dispatcher on any live cache.
     ///
     /// The `Some(reason)` cases are the source of the 30–60× first-forward
     /// slowdown and the monotonic decode decay as KV grows. A `None` here MUST

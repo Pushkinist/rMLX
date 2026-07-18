@@ -4044,9 +4044,11 @@ impl KvCache {
     ///
     /// Structurally identical to [`Self::update_k8vturbo3_tcq`] — same K-side
     /// GPU-capable affine q8_0 path (same as K8V4 / K8VTurbo3), same forced-CPU
-    /// V-side (the Viterbi trellis assignment is sequential and CPU-only; there
-    /// is no MSL decode kernel for it). Only the V-side `bits` changes from 3
-    /// to 2.
+    /// V-side. TCQ is an **encode-side** Viterbi trellis assignment only; decode
+    /// is bit-identical to plain turbo and reuses the turbo GPU dequant. The
+    /// production V-encode runs forced-CPU here: the 2-bit TCQ encode has no
+    /// wired MSL kernel (its hook was removed), while the 3-bit encode kernel in
+    /// `tcq_v_msl.rs` stays parked. Only the V-side `bits` changes from 3 to 2.
     #[allow(
         clippy::indexing_slicing,
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
@@ -6333,11 +6335,19 @@ impl KvCache {
         }
 
         let new_shape = new_k.shape();
-        // GPU encode for both K and V when device == GPU and QJL is
-        // disabled. With QJL enabled the K-side falls back to CPU (the GPU
-        // kernel cannot replicate the QJL residual — see rotor_fused_qk_msl.rs).
+        // GPU encode for both K and V when device == GPU and the store carries
+        // no QJL residual. The QJL decision is sticky to the store (fixed at
+        // first append) — a later process-env toggle must not reinterpret bytes
+        // already written; read the store's own flag, same as the sdpa fast path
+        // and `update_rotor_k_only_*`. Env is the fallback only before the store
+        // exists. With QJL on the K-side falls back to CPU (the GPU kernel cannot
+        // replicate the QJL residual — see rotor_fused_qk_msl.rs).
+        let store_uses_qjl = match k.as_ref() {
+            Some(ks) => ks.use_qjl(),
+            None => crate::rotor_qjl::rotor_qjl_enabled(),
+        };
         let use_gpu = device == Device::Gpu;
-        let gpu_k_ok = use_gpu && !crate::rotor_qjl::rotor_qjl_enabled();
+        let gpu_k_ok = use_gpu && !store_uses_qjl;
         let k_f32 = if gpu_k_ok {
             Vec::new()
         } else {
@@ -6425,10 +6435,15 @@ impl KvCache {
         }
 
         let new_shape = new_k.shape();
-        // GPU encode when device == GPU. K-side opts out when QJL is
-        // enabled (see rotor3_sym mirror).
+        // GPU encode when device == GPU. K-side opts out when the store carries
+        // the QJL residual — read the store's sticky flag, not the live env (see
+        // rotor3_sym mirror).
+        let store_uses_qjl = match k.as_ref() {
+            Some(ks) => ks.use_qjl(),
+            None => crate::rotor_qjl::rotor_qjl_enabled(),
+        };
         let use_gpu = device == Device::Gpu;
-        let gpu_k_ok = use_gpu && !crate::rotor_qjl::rotor_qjl_enabled();
+        let gpu_k_ok = use_gpu && !store_uses_qjl;
         let k_f32 = if gpu_k_ok {
             Vec::new()
         } else {
@@ -6691,7 +6706,14 @@ impl KvCache {
         }
 
         let new_shape = new_k.shape();
-        let gpu_k_ok = device == Device::Gpu && !crate::rotor_qjl::rotor_qjl_enabled();
+        // Gate the GPU K encode on the store's sticky QJL flag (fixed at first
+        // append), not the live env — a later toggle must not reinterpret bytes
+        // already written. Env is the fallback only before the store exists.
+        let store_uses_qjl = match k.as_ref() {
+            Some(ks) => ks.use_qjl(),
+            None => crate::rotor_qjl::rotor_qjl_enabled(),
+        };
+        let gpu_k_ok = device == Device::Gpu && !store_uses_qjl;
         let k_f32 = if gpu_k_ok {
             Vec::new()
         } else {
@@ -6783,7 +6805,14 @@ impl KvCache {
         }
 
         let new_shape = new_k.shape();
-        let gpu_k_ok = device == Device::Gpu && !crate::rotor_qjl::rotor_qjl_enabled();
+        // Gate the GPU K encode on the store's sticky QJL flag (fixed at first
+        // append), not the live env — a later toggle must not reinterpret bytes
+        // already written. Env is the fallback only before the store exists.
+        let store_uses_qjl = match k.as_ref() {
+            Some(ks) => ks.use_qjl(),
+            None => crate::rotor_qjl::rotor_qjl_enabled(),
+        };
+        let gpu_k_ok = device == Device::Gpu && !store_uses_qjl;
         let k_f32 = if gpu_k_ok {
             Vec::new()
         } else {
