@@ -13,10 +13,11 @@
 //! 4. On a [`RetryClass::Migratable`] error: rebuilds the request via
 //!    [`RequestPlan::build_request`], increments the attempt counter, and
 //!    restarts from step 1 (attempts 2..=N use the plan, not the original req).
-//!    The new attempt re-runs from the extended prompt (original + delivered)
-//!    at `temperature == 0`, so it deterministically reproduces the same token
-//!    sequence. The task then *skips* the first `delivered.len()` tokens and
-//!    forwards only the new continuation, asserting prefix identity.
+//!    The new attempt re-runs from the *original* prompt at `temperature == 0`,
+//!    so it deterministically re-emits the already-delivered tokens as its
+//!    first outputs, then continues past the fault point. The task then *skips*
+//!    the first `delivered.len()` tokens and forwards only the new
+//!    continuation, asserting prefix identity.
 //! 5. On [`RetryClass::Fatal`] or attempt exhaustion: sends the error through
 //!    the channel and exits.
 //! 6. When the channel send fails (client disconnected / HTTP drop): exits
@@ -41,10 +42,15 @@
 //!
 //! ## Prompt-continuation strategy
 //!
-//! `build_request` concatenates `original_prompt_tokens` with `delivered_token_ids`
-//! into a single extended token sequence. At `temperature == 0` the decode is
-//! deterministic, so the model reproduces the same continuation — the client
-//! sees a seamless stream once the skip logic drops the prefix.
+//! `build_request` re-issues the *original* prompt unchanged. At
+//! `temperature == 0` the decode is deterministic, so the engine re-emits the
+//! already-delivered tokens as its first `delivered.len()` outputs and then
+//! continues past the fault point; the skip logic drops that reproduced prefix
+//! so the client sees a seamless stream. The delivered tokens are **not** also
+//! appended to the prompt: doing so would double-count them (consumed as
+//! prompt *and* skipped on output), so the engine's continuation would no
+//! longer line up with the delivered prefix and every legitimate
+//! partial-delivery replay would spuriously report a prefix divergence.
 //!
 //! ## single-emit invariant
 //!
@@ -84,8 +90,9 @@ use crate::openai::ItlStore;
 /// Whether an [`RmlxError`] permits a transparent token-replay retry.
 ///
 /// `Migratable` — the error is transient and the stream can be reconstructed
-/// by re-issuing the request with already-delivered tokens appended to the
-/// prompt.
+/// by re-issuing the **original** request at `temperature == 0`; the engine
+/// re-emits the already-delivered tokens deterministically and the replay loop
+/// skips them.
 ///
 /// `Fatal` — the error is permanent or intentional (e.g. client cancelled,
 /// logic error). No retry should be attempted.
@@ -177,7 +184,7 @@ pub struct RequestPlan {
     pub model_id: String,
     /// Token ids of the original (pre-retry) prompt, without any delivered tokens.
     pub original_prompt_tokens: Vec<u32>,
-    /// Maximum new tokens from the original request, before subtracting delivered tokens.
+    /// Maximum new tokens from the original request; re-issued unchanged on every replay attempt.
     pub original_max_tokens: u32,
     /// Sampling parameters (temperature, top-p, etc.) frozen at plan creation.
     pub sampling: SamplingParams,
@@ -269,21 +276,22 @@ impl RequestPlan {
 
     /// Build a [`GenerationRequest`] for a retry attempt (attempt 2 onward).
     ///
-    /// - `delivered` — token ids already sent to the client; appended to the
-    ///   original prompt so the engine re-generates from the extended prefix.
-    pub fn build_request(&self, delivered: &[u32]) -> GenerationRequest {
-        let mut prompt_tokens =
-            Vec::with_capacity(self.original_prompt_tokens.len() + delivered.len());
-        prompt_tokens.extend_from_slice(&self.original_prompt_tokens);
-        prompt_tokens.extend_from_slice(delivered);
-        let max_tokens = self
-            .original_max_tokens
-            .saturating_sub(u32::try_from(delivered.len()).unwrap_or(u32::MAX))
-            .max(1);
+    /// The replay re-issues the **original** prompt unchanged. At
+    /// `temperature == 0` the engine deterministically re-emits the
+    /// already-delivered tokens as its first outputs; the replay loop skips
+    /// exactly `delivered.len()` of them (its `skip_count`) while asserting
+    /// prefix identity, then forwards the continuation. The delivered tokens
+    /// are therefore **not** appended to the prompt, and the token budget stays
+    /// at the original value — the engine re-generates the delivered prefix and
+    /// then the remaining continuation, so the total new-token count still
+    /// equals `original_max_tokens`. Appending the delivered tokens to the
+    /// prompt (or shrinking the budget by their count) would double-count them
+    /// and make every legitimate partial-delivery replay spuriously diverge.
+    pub fn build_request(&self) -> GenerationRequest {
         GenerationRequest {
             model_id: self.model_id.clone(),
-            prompt_tokens,
-            max_tokens,
+            prompt_tokens: self.original_prompt_tokens.clone(),
+            max_tokens: self.original_max_tokens.max(1),
             sampling: self.sampling.clone(),
             stop: self.stop.clone(),
             stream: self.stream,
@@ -415,7 +423,7 @@ pub fn replay_stream(
             // Subsequent attempts build a fresh request from the plan.
             let req = match next_req.take() {
                 Some(r) => r,
-                None => plan.build_request(&delivered),
+                None => plan.build_request(),
             };
             let skip_count = delivered.len();
             let model_id = &plan.model_id;
