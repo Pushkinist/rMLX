@@ -24,6 +24,7 @@ fn array_to_f32(a: &Array) -> Vec<f32> {
 ///
 /// Runs unconditionally — the CI/dev host has a GPU (Apple Silicon M-series).
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test metal_kernel -- --ignored --test-threads=1"]
 fn metal_kernel_add_one_gpu() {
     let kernel = MetalKernel::new(
         "rmlx_add_one",
@@ -76,6 +77,7 @@ fn new_rejects_nul_in_output_name() {
 /// in `apply` rather than `new`. Both outcomes are acceptable; what must
 /// NOT happen is a panic or UB.
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test metal_kernel -- --ignored --test-threads=1"]
 fn metal_kernel_bad_source_does_not_panic() {
     let result = MetalKernel::new(
         "rmlx_bad_kernel_test",

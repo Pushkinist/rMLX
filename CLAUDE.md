@@ -204,9 +204,13 @@ Hard rules:
   that only exercises a check the dispatcher rejects **before** touching a
   device-parameterized op is not a GPU test: pass `Device::Cpu` and leave it
   un-ignored — ignoring a CPU test silently stops running it. The CI gate
-  `make check-gpu-tests-ignored` enforces this for `rmlx-kv-quant`; it keys on
-  shape (does the test reach `Device::Gpu`?), never on the ignore reason's text.
-  See `docs/TESTING.md`.
+  `make check-gpu-tests-ignored` enforces this across **every workspace member
+  crate** (from `Cargo.toml`), scanning `src/**/{*_tests.rs,tests.rs}` and
+  `tests/*.rs`; it keys on shape (does the test reach `Device::Gpu`?), never on
+  the ignore reason's text. A pure device-*policy* test (passes `Device::Gpu`
+  as a plain value, never dispatches Metal) opts out **per fn** with a
+  line-leading `// gpu-test-gate: exempt` marker in its own attribute block —
+  scoped to that one `#[test]`, not the whole file. See `docs/TESTING.md`.
 - **Advisory: `make file-size-report`** prints files >1000 LOC. Non-failing.
   Also runs at the end of `make ci` (advisory, non-blocking).
 

@@ -170,7 +170,7 @@ check-no-scalar-f32-leak: ## CI gate: fail if arch-layer code has unguarded scal
 check-no-decode-swallow: ## CI gate: fail if a decode-step failure breaks instead of propagating (would report as finish_reason="length")
 	@bash scripts/check_no_decode_swallow.sh
 
-check-gpu-tests-ignored: ## CI gate: fail if a GPU-touching rmlx-kv-quant test lacks #[ignore] (would abort the whole test binary under parallel cargo test)
+check-gpu-tests-ignored: ## CI gate: fail if a GPU-touching test in ANY workspace member lacks #[ignore] (would abort the whole test binary under parallel cargo test)
 	@bash scripts/check_gpu_tests_ignored.sh
 
 # METAL_STRICT=--strict turns a missing toolchain into a hard failure instead of

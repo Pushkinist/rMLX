@@ -35,6 +35,7 @@ fn raw_closure_apply_works() {
 /// - Same shape invoked twice uses the compiled cache (no panic, correct output).
 /// - Closure correctly transforms inputs on both the trace call and the cache hit.
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test compile_shapeless -- --ignored --test-threads=1"]
 fn compile_shapeless_cache_hit() {
     // Simple element-wise double: arr + arr = 2 * arr
     let cls = Closure::from_fn(|inputs| {

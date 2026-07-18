@@ -6,6 +6,7 @@ use super::{voiced_segments, SileroVad, VadState, HOP_LENGTH};
 
 /// Verify the VAD model loads successfully from the embedded asset.
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test vad -- --ignored --test-threads=1"]
 fn test_vad_loads() {
     let vad = SileroVad::load(Device::Gpu);
     assert!(vad.is_ok(), "VAD load failed: {:?}", vad.err());
@@ -13,6 +14,7 @@ fn test_vad_loads() {
 
 /// Silence (all-zeros) should produce low voice probability.
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test vad -- --ignored --test-threads=1"]
 fn test_silence_gives_low_prob() {
     let vad = SileroVad::load(Device::Gpu).expect("VAD load");
     // 0.5 s of silence at 16kHz = 8000 samples
@@ -32,6 +34,7 @@ fn test_silence_gives_low_prob() {
 /// (The VAD is designed to detect speech, not pure tones, but this at least
 /// verifies the signal propagates through the model rather than being suppressed.)
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test vad -- --ignored --test-threads=1"]
 fn test_sine_vs_silence() {
     let vad = SileroVad::load(Device::Gpu).expect("VAD load");
 
@@ -65,6 +68,7 @@ fn test_sine_vs_silence() {
 /// Integration test: concatenate a 5s clip 7 times to get >30s audio and
 /// verify the VAD runs without errors.
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test vad -- --ignored --test-threads=1"]
 fn test_long_audio_no_panic() {
     let vad = SileroVad::load(Device::Gpu).expect("VAD load");
 
