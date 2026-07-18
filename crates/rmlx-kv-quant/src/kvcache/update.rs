@@ -587,14 +587,67 @@ fn rotor3_gpu_append_into_blocks(
     let head_dim = head_dim_from_shape(new_shape, "rotor3_gpu_append_into_blocks")?;
     ensure_v3_rotors(vs, head_dim);
     let seq_major = packed_k_chunk_seq_major(new_v, new_shape, device)?;
+    if is_ring_only_append(feed, new_shape) {
+        // Ring-only tail: feed the GPU ring, advance `shape[2]`, and skip the
+        // per-step host download + CPU block push. The ring is the source of
+        // truth for the decode tail; the blocks are rebuilt on demand at a
+        // `dequant()` / SSD-spill boundary (`synced_rotor_v_blocks`). Mirror of
+        // the K-side `rotor3_gpu_append_into_k_blocks`.
+        let gpu = rotor_gpu_encode_ring_only(
+            &seq_major,
+            new_shape,
+            &vs.rotors,
+            crate::rotorquant::ROTOR3_BITS,
+        )?;
+        rotor3_v_sync_ring(
+            vs,
+            &gpu,
+            RingFeed::Maintain,
+            new_shape,
+            head_dim,
+            max_seq,
+            device,
+        )?;
+        bump_rotor_k_shape(&mut vs.shape, new_shape);
+        return Ok(());
+    }
+    // Block path: prefill / non-fused decode (Maintain) and the V-only variants
+    // (Skip). A ring-only feed that reaches here is a `b > 1` chunk — normalise
+    // it to Maintain so the shared ring feeder clears the ring for the
+    // un-representable batch and the CPU block carries the data.
+    materialize_rotor_v3_ring_tail(vs, device)?;
+    let block_feed = if feed == RingFeed::Skip {
+        RingFeed::Skip
+    } else {
+        RingFeed::Maintain
+    };
     let (block, gpu) = rotor_gpu_encode_block_retaining(
         &seq_major,
         new_shape,
         &vs.rotors,
         crate::rotorquant::ROTOR3_BITS,
     )?;
-    rotor3_v_sync_ring(vs, &gpu, feed, new_shape, head_dim, max_seq, device)?;
+    rotor3_v_sync_ring(vs, &gpu, block_feed, new_shape, head_dim, max_seq, device)?;
     push_rotor3_v_block(vs, block, new_shape);
+    Ok(())
+}
+
+/// Reconcile a pre-existing ring-only decode tail into `vs.blocks` before a
+/// block-path append — mirror of [`materialize_rotor_k3_ring_tail`]. No-op when
+/// `blocks` already cover `shape[2]` (the common prefill / V-only case — reads
+/// no GPU).
+fn materialize_rotor_v3_ring_tail(vs: &mut QuantRotorV3, device: Device) -> Result<()> {
+    if !vs.gpu.is_allocated() {
+        return Ok(());
+    }
+    let rebuilt =
+        match crate::storage::synced_rotor_v_blocks(&vs.blocks, &vs.shape, &vs.gpu, device)? {
+            std::borrow::Cow::Owned(full) => Some(full),
+            std::borrow::Cow::Borrowed(_) => None,
+        };
+    if let Some(full) = rebuilt {
+        vs.blocks = full;
+    }
     Ok(())
 }
 
@@ -610,23 +663,66 @@ fn rotor4_gpu_append_into_blocks(
     let head_dim = head_dim_from_shape(new_shape, "rotor4_gpu_append_into_blocks")?;
     ensure_v4_rotors(vs, head_dim);
     let seq_major = packed_k_chunk_seq_major(new_v, new_shape, device)?;
+    if is_ring_only_append(feed, new_shape) {
+        // Ring-only tail — see [`rotor3_gpu_append_into_blocks`].
+        let gpu = rotor_gpu_encode_ring_only(
+            &seq_major,
+            new_shape,
+            &vs.rotors,
+            crate::rotorquant::ROTOR4_BITS,
+        )?;
+        rotor4_v_sync_ring(
+            vs,
+            &gpu,
+            RingFeed::Maintain,
+            new_shape,
+            head_dim,
+            max_seq,
+            device,
+        )?;
+        bump_rotor_k_shape(&mut vs.shape, new_shape);
+        return Ok(());
+    }
+    // Block path — see [`rotor3_gpu_append_into_blocks`].
+    materialize_rotor_v4_ring_tail(vs, device)?;
+    let block_feed = if feed == RingFeed::Skip {
+        RingFeed::Skip
+    } else {
+        RingFeed::Maintain
+    };
     let (block, gpu) = rotor_gpu_encode_block_retaining(
         &seq_major,
         new_shape,
         &vs.rotors,
         crate::rotorquant::ROTOR4_BITS,
     )?;
-    rotor4_v_sync_ring(vs, &gpu, feed, new_shape, head_dim, max_seq, device)?;
+    rotor4_v_sync_ring(vs, &gpu, block_feed, new_shape, head_dim, max_seq, device)?;
     push_rotor4_v_block(vs, block, new_shape);
+    Ok(())
+}
+
+/// Mirror of [`materialize_rotor_v3_ring_tail`] for [`QuantRotorV4`].
+fn materialize_rotor_v4_ring_tail(vs: &mut QuantRotorV4, device: Device) -> Result<()> {
+    if !vs.gpu.is_allocated() {
+        return Ok(());
+    }
+    let rebuilt =
+        match crate::storage::synced_rotor_v_blocks(&vs.blocks, &vs.shape, &vs.gpu, device)? {
+            std::borrow::Cow::Owned(full) => Some(full),
+            std::borrow::Cow::Borrowed(_) => None,
+        };
+    if let Some(full) = rebuilt {
+        vs.blocks = full;
+    }
     Ok(())
 }
 
 /// V-side mirror of [`rotor3_sync_ring`] for [`QuantRotorV3`].
 ///
 /// Same invariant, same `b > 1` skip, same self-healing re-seed — the ring type
-/// and its contract are axis-agnostic. `MaintainRingOnly` is never fed to V (the
-/// symmetric append uses `Maintain` on both axes), so anything other than
-/// `Maintain` clears.
+/// and its contract are axis-agnostic. Only ever receives `Maintain` (ring-only
+/// tail and block path both feed the ring) or `Skip` (V-only), so anything other
+/// than `Maintain` clears.
 fn rotor3_v_sync_ring(
     vs: &mut QuantRotorV3,
     gpu: &PackedKEncodedGpu,
@@ -1091,11 +1187,71 @@ pub(super) fn rotor3_sym_gpu_append(
     let Some(ks) = k.as_mut() else {
         return Err(Error::Mlx("RotorSym3 K buffer absent after init".into()));
     };
-    rotor3_gpu_append_into_k_blocks(ks, new_k, new_shape, device, RingFeed::Maintain, max_seq)?;
+    rotor3_gpu_append_into_k_blocks(
+        ks,
+        new_k,
+        new_shape,
+        device,
+        RingFeed::MaintainRingOnly,
+        max_seq,
+    )?;
+    // Ring is now the sole resident store for K — drop the redundant CPU blocks
+    // (the prefill prefix, seeded into the ring on the first fused-decode step).
+    // See the note in the V append below; this is what turns the codec's ~34%
+    // logical compression into a resident-RAM win.
+    drop_blocks_when_ring_live_k3(ks);
     let Some(vs) = v.as_mut() else {
         return Err(Error::Mlx("RotorSym3 V buffer absent after init".into()));
     };
-    rotor3_gpu_append_into_blocks(vs, new_v, new_shape, device, RingFeed::Maintain, max_seq)
+    rotor3_gpu_append_into_blocks(
+        vs,
+        new_v,
+        new_shape,
+        device,
+        RingFeed::MaintainRingOnly,
+        max_seq,
+    )?;
+    // The GPU ring holds the full prefix; the fused decode reads the ring, and
+    // `dequant` / SSD spill / clone / truncate rebuild the CPU blocks on demand
+    // from it (`synced_rotor_v_blocks`). A later GPU chunk (spec-verify) takes
+    // the block path, which materialises the ring tail before its Skip clear, so
+    // no ring-clear ever loses data; a CPU-only run never allocates the ring.
+    drop_blocks_when_ring_live_v3(vs);
+    Ok(())
+}
+
+/// Drop a rotor K store's CPU blocks once its GPU ring is live — the ring is
+/// then the sole resident copy. No-op until the ring is allocated (before the
+/// first GPU append) or for any store that never feeds a ring.
+fn drop_blocks_when_ring_live_k3(ks: &mut crate::storage::QuantRotorK3) {
+    if ks.gpu.is_allocated() {
+        ks.blocks.clear();
+        ks.blocks.shrink_to_fit();
+    }
+}
+
+/// Mirror of [`drop_blocks_when_ring_live_k3`] for [`QuantRotorK4`].
+fn drop_blocks_when_ring_live_k4(ks: &mut crate::storage::QuantRotorK4) {
+    if ks.gpu.is_allocated() {
+        ks.blocks.clear();
+        ks.blocks.shrink_to_fit();
+    }
+}
+
+/// Drop a rotor V store's CPU blocks once its GPU ring is live.
+fn drop_blocks_when_ring_live_v3(vs: &mut QuantRotorV3) {
+    if vs.gpu.is_allocated() {
+        vs.blocks.clear();
+        vs.blocks.shrink_to_fit();
+    }
+}
+
+/// Mirror of [`drop_blocks_when_ring_live_v3`] for [`QuantRotorV4`].
+fn drop_blocks_when_ring_live_v4(vs: &mut QuantRotorV4) {
+    if vs.gpu.is_allocated() {
+        vs.blocks.clear();
+        vs.blocks.shrink_to_fit();
+    }
 }
 
 /// Mirror of [`rotor3_sym_gpu_append`] for `RotorSym4`.
@@ -1135,11 +1291,28 @@ pub(super) fn rotor4_sym_gpu_append(
     let Some(ks) = k.as_mut() else {
         return Err(Error::Mlx("RotorSym4 K buffer absent after init".into()));
     };
-    rotor4_gpu_append_into_k_blocks(ks, new_k, new_shape, device, RingFeed::Maintain, max_seq)?;
+    rotor4_gpu_append_into_k_blocks(
+        ks,
+        new_k,
+        new_shape,
+        device,
+        RingFeed::MaintainRingOnly,
+        max_seq,
+    )?;
+    drop_blocks_when_ring_live_k4(ks);
     let Some(vs) = v.as_mut() else {
         return Err(Error::Mlx("RotorSym4 V buffer absent after init".into()));
     };
-    rotor4_gpu_append_into_blocks(vs, new_v, new_shape, device, RingFeed::Maintain, max_seq)
+    rotor4_gpu_append_into_blocks(
+        vs,
+        new_v,
+        new_shape,
+        device,
+        RingFeed::MaintainRingOnly,
+        max_seq,
+    )?;
+    drop_blocks_when_ring_live_v4(vs);
+    Ok(())
 }
 
 /// Accumulated sequence length held by a rotor K storage `shape`

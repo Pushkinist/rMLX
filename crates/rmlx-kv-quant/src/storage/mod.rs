@@ -74,6 +74,7 @@ pub use quant_planar_v::QuantPlanarV;
 pub(crate) use quant_rotor_k3::synced_rotor_k_blocks;
 pub use quant_rotor_k3::{QuantRotorK3, RotorKBlocks, ROTOR3_K_BITS, ROTOR3_K_GROUP_SIZE};
 pub use quant_rotor_k4::{QuantRotorK4, ROTOR4_K_BITS, ROTOR4_K_GROUP_SIZE};
+pub(crate) use quant_rotor_v3::synced_rotor_v_blocks;
 pub use quant_rotor_v3::{QuantRotorV3, RotorBlocks, ROTOR3_V_BITS, ROTOR3_V_GROUP_SIZE};
 pub use quant_rotor_v4::{QuantRotorV4, ROTOR4_V_BITS, ROTOR4_V_GROUP_SIZE};
 pub use quant_v::QuantV;

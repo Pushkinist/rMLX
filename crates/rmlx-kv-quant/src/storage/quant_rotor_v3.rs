@@ -265,6 +265,17 @@ impl QuantRotorV3 {
     ///
     /// Drops trailing blocks until the cumulative `n_tokens` count is `<= n`
     /// and lowers `shape[2]` to `n`. Does **not** touch the rotor table.
+    ///
+    /// The GPU ring is **kept**, not cleared — mirror of the K store's
+    /// `truncate_to`. Lowering `shape[2]` to `n` makes the ring's logical fill
+    /// `n`; the stale `[n, prev)` capacity is overwritten by the next append and
+    /// never read (`packed_view` slices to `shape[2]`). This preserves any
+    /// ring-only decode tail up to `n`, so `dequant` / an SSD spill can still
+    /// rebuild it via `synced_rotor_v_blocks`. Clearing the ring here would
+    /// discard the tail (the only copy of `[frozen_prefix, n)`), leaving `blocks`
+    /// short of `shape[2]` with no ring — the divergent state `dequant` rejects
+    /// loudly, which would abort generation on the speculative-decode rollback
+    /// path.
     pub fn truncate_to(&mut self, n: i32) {
         let n_usize = n.max(0) as usize;
         let mut acc: usize = 0;
@@ -278,21 +289,29 @@ impl QuantRotorV3 {
             }
         }
         self.blocks.truncate(keep);
-        // The ring's filled prefix no longer matches `blocks`; drop it rather
-        // than leave a longer-than-truncated prefix live.
-        self.gpu.clear();
+        // NB: no `self.gpu.clear()` — the ring is the source of truth for a
+        // ring-only decode tail; see the doc comment above.
         if self.shape.len() >= 4 {
             self.shape[2] = n;
         }
     }
 
-    /// Deep-clone (CPU path is plain `Vec` clones).
+    /// Deep-clone.
+    ///
+    /// Materialises any ring-only decode tail into complete CPU blocks first:
+    /// the clone starts CPU-only (the ring is not cloned), and both the
+    /// prompt-cache snapshot and the SSD spill clone route through here, so this
+    /// is the single point where a store leaving the live decode loop reconciles
+    /// its blocks with the ring. A short-blocks clone with no ring would silently
+    /// truncate the store — refused loudly by `synced_rotor_v_blocks` instead.
     ///
     /// # Errors
     ///
-    /// Currently infallible on the CPU path; returns `Result` for parity with
-    /// the other `Quant*` structs.
+    /// Forwards a [`synced_rotor_v_blocks`] reconciliation error (blocks over-run
+    /// `shape[2]`, or a ring-only tail exists but the ring is absent / too short).
     pub fn try_deep_clone(&self) -> Result<Self> {
+        let blocks =
+            synced_rotor_v_blocks(&self.blocks, &self.shape, &self.gpu, Device::Gpu)?.into_owned();
         Ok(Self {
             rotors: self.rotors.clone(),
             // The clone starts CPU-only: `blocks` carries the full payload, so
@@ -300,7 +319,7 @@ impl QuantRotorV3 {
             // Sharing the source's Arrays would alias one ring across two
             // independent caches.
             gpu: QuantKGpuRing::default(),
-            blocks: self.blocks.clone(),
+            blocks,
             shape: self.shape.clone(),
             max_seq: self.max_seq,
             layer_idx: self.layer_idx,
@@ -428,8 +447,9 @@ impl QuantRotorV3 {
     ///
     /// # Errors
     ///
-    /// Returns an `Error::Mlx` if the underlying [`rotor3_decode`] fails for
-    /// any block, or if `rotors` is empty (no append happened yet).
+    /// Returns an `Error::Mlx` if the underlying [`rotor3_decode`] fails for any
+    /// block, if `rotors` is empty (no append happened yet), or a
+    /// [`synced_rotor_v_blocks`] reconciliation error.
     pub fn dequant(&self) -> Result<Vec<f32>> {
         if self.shape.len() != 4 {
             return Err(Error::Mlx(format!(
@@ -441,7 +461,14 @@ impl QuantRotorV3 {
         let total_elems: usize = self.shape.iter().map(|&d| d as usize).product();
         let mut out: Vec<f32> = Vec::with_capacity(total_elems);
 
-        if self.blocks.is_empty() {
+        // Reconcile the CPU blocks with the GPU ring: on the fused symmetric
+        // decode path the decode tail lives only in the ring (`blocks` trail
+        // `shape[2]`), and this rebuilds it on demand rather than decoding a
+        // short prefix and zero-padding the gap. Loud on any unrecoverable
+        // disagreement.
+        let blocks = synced_rotor_v_blocks(&self.blocks, &self.shape, &self.gpu, Device::Gpu)?;
+
+        if blocks.is_empty() {
             // No tokens written yet — return zeros padded to the declared shape.
             out.resize(total_elems, 0.0);
             return Ok(out);
@@ -453,15 +480,21 @@ impl QuantRotorV3 {
             ));
         }
 
-        for blk in &self.blocks {
+        for blk in blocks.iter() {
             let dec = rotor3_decode(&blk.codes, &blk.scales, &blk.norms, &self.rotors, head_dim)
                 .map_err(|e: RotorQuantError| Error::Mlx(format!("rotor3 decode: {e}")))?;
             out.extend_from_slice(&dec);
         }
-        if out.len() < total_elems {
-            out.resize(total_elems, 0.0);
-        } else if out.len() > total_elems {
-            out.truncate(total_elems);
+        // `synced_rotor_v_blocks` guarantees the blocks cover `shape[2]`, so a
+        // length mismatch here is an internal invariant break — surface it loudly
+        // rather than zero-padding or truncating a decoded prefix.
+        if out.len() != total_elems {
+            return Err(Error::Mlx(format!(
+                "QuantRotorV3::dequant: decoded {} elems but shape {:?} implies {total_elems} — \
+                 refusing to zero-pad / truncate",
+                out.len(),
+                self.shape
+            )));
         }
         // Blocks are sequence-major (see `append`); reorder back to head-major
         // `[B, kv_h, S, D]`.
@@ -471,6 +504,93 @@ impl QuantRotorV3 {
         let out = super::seq_layout::transpose_seq_heads(&out, b, s, kv_h, head_dim);
         Ok(out)
     }
+}
+
+/// Reconcile a rotor-V store's CPU `blocks` with its GPU ring so the returned
+/// slice covers the full accumulated `shape[2]`.
+///
+/// On the fused symmetric decode path the per-step CPU block download is skipped
+/// — the GPU ring is the source of truth for the decode tail, and `blocks` trail
+/// `shape[2]` (a **ring-only tail**). This rebuilds the missing prefix from the
+/// ring on demand — the single point where a block consumer (`dequant`, or the
+/// SSD spill via `try_deep_clone`) reconciles the two. When `blocks` already
+/// cover `shape[2]` (the CPU append and SSD-hydrate paths, and every V-only
+/// rotor cache, which never feeds the ring) the borrow is returned untouched, so
+/// those paths pay no GPU readback.
+///
+/// **Invariant (enforced loudly, never zero-padded):** `blocks` track the ring
+/// exactly, or the ring exists and supplies the tail. Any state where the CPU
+/// blocks fall short of `shape[2]` and the ring cannot make up the difference is
+/// an `Error` — the caller must not fabricate a zeroed gap.
+///
+/// Shared by [`QuantRotorV3`] and [`super::QuantRotorV4`] (the block payload and
+/// ring layout are identical modulo codes bit-width). Mirror of the K-side
+/// `synced_rotor_k_blocks`.
+///
+/// # Errors
+///
+/// Returns [`rmlx_core::error::Error::Quant`] on a malformed shape, when the
+/// blocks over-run `shape[2]`, or when a ring-only tail exists but the ring is
+/// absent / too short to cover it.
+pub(crate) fn synced_rotor_v_blocks<'a>(
+    blocks: &'a [RotorBlocks],
+    shape: &[i32],
+    gpu: &QuantKGpuRing,
+    device: Device,
+) -> Result<std::borrow::Cow<'a, [RotorBlocks]>> {
+    if shape.len() != 4 {
+        return Err(Error::Quant(format!(
+            "synced_rotor_v_blocks: malformed shape {shape:?}"
+        )));
+    }
+    let b = shape.first().copied().unwrap_or(0).max(0) as usize;
+    let kv_h = shape.get(1).copied().unwrap_or(0).max(0) as usize;
+    let full_seq = shape.get(2).copied().unwrap_or(0).max(0) as usize;
+    let head_dim = shape.get(3).copied().unwrap_or(0).max(0) as usize;
+    let full_tokens = b * kv_h * full_seq;
+    let blocks_tokens: usize = blocks.iter().map(|blk| blk.n_tokens).sum();
+
+    if blocks_tokens == full_tokens {
+        return Ok(std::borrow::Cow::Borrowed(blocks));
+    }
+    if blocks_tokens > full_tokens {
+        return Err(Error::Quant(format!(
+            "rotor V store: CPU blocks hold {blocks_tokens} tokens but shape[2] implies \
+             {full_tokens} — blocks over-run the accumulated shape (internal invariant)"
+        )));
+    }
+
+    // Ring-only tail: the GPU ring must supply the whole prefix. It is
+    // sequence-major and stores per-token norms already, so the readback is one
+    // block covering `[0, full_seq)`. Refuse to fabricate a zeroed gap.
+    let seq_i32 = i32::try_from(full_seq).map_err(|_| {
+        Error::Quant(format!(
+            "rotor V store: shape[2]={full_seq} exceeds i32::MAX"
+        ))
+    })?;
+    let Some((codes, scales, norms)) = gpu.packed_view_cpu(seq_i32, device)? else {
+        return Err(Error::Quant(format!(
+            "rotor V store: CPU blocks cover {blocks_tokens} tokens but shape[2] needs \
+             {full_tokens} and the GPU ring is absent — refusing to zero-pad the decode tail"
+        )));
+    };
+    let n_groups = n_groups_for(head_dim);
+    let want_codes = full_tokens * n_groups;
+    if codes.len() != want_codes || scales.len() != want_codes || norms.len() != full_tokens {
+        return Err(Error::Quant(format!(
+            "rotor V store: ring readback size mismatch (codes {} scales {} norms {}, \
+             want codes/scales {want_codes} norms {full_tokens}) — cannot rebuild blocks",
+            codes.len(),
+            scales.len(),
+            norms.len(),
+        )));
+    }
+    Ok(std::borrow::Cow::Owned(vec![RotorBlocks {
+        codes,
+        scales,
+        norms,
+        n_tokens: full_tokens,
+    }]))
 }
 
 #[cfg(test)]

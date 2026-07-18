@@ -25,7 +25,7 @@ use crate::clifford::make_rotor_table;
 use crate::rotorquant::{
     n_groups_for, rotor4_decode, rotor4_encode, RotorQuantError, ROTOR4_BITS, ROTOR4_GROUP_SIZE,
 };
-use crate::storage::quant_rotor_v3::RotorBlocks;
+use crate::storage::quant_rotor_v3::{synced_rotor_v_blocks, RotorBlocks};
 
 use super::QuantKGpuRing;
 
@@ -221,8 +221,9 @@ impl QuantRotorV4 {
 
     /// Truncate the accumulated sequence to `n` tokens.
     ///
-    /// Drops trailing blocks until the cumulative `n_tokens` count is `<= n`
-    /// and lowers `shape[2]` to `n`. Does **not** touch the rotor table.
+    /// Mirror of [`super::QuantRotorV3::truncate_to`]: the GPU ring is **kept**,
+    /// not cleared, so a ring-only decode tail up to `n` survives and `dequant` /
+    /// an SSD spill can rebuild it via [`synced_rotor_v_blocks`].
     pub fn truncate_to(&mut self, n: i32) {
         let n_usize = n.max(0) as usize;
         let mut acc: usize = 0;
@@ -236,21 +237,22 @@ impl QuantRotorV4 {
             }
         }
         self.blocks.truncate(keep);
-        // The ring's filled prefix no longer matches `blocks`; drop it rather
-        // than leave a longer-than-truncated prefix live.
-        self.gpu.clear();
+        // NB: no `self.gpu.clear()` — the ring is the source of truth for a
+        // ring-only decode tail; see [`super::QuantRotorV3::truncate_to`].
         if self.shape.len() >= 4 {
             self.shape[2] = n;
         }
     }
 
-    /// Deep-clone (CPU path is plain `Vec` clones).
+    /// Deep-clone. Materialises any ring-only decode tail into complete blocks
+    /// first — mirror of [`super::QuantRotorV3::try_deep_clone`].
     ///
     /// # Errors
     ///
-    /// Currently infallible on the CPU path; returns `Result` for parity with
-    /// the other `Quant*` structs.
+    /// Forwards a [`synced_rotor_v_blocks`] reconciliation error.
     pub fn try_deep_clone(&self) -> Result<Self> {
+        let blocks =
+            synced_rotor_v_blocks(&self.blocks, &self.shape, &self.gpu, Device::Gpu)?.into_owned();
         Ok(Self {
             rotors: self.rotors.clone(),
             // The clone starts CPU-only: `blocks` carries the full payload, so
@@ -258,7 +260,7 @@ impl QuantRotorV4 {
             // Sharing the source's Arrays would alias one ring across two
             // independent caches.
             gpu: QuantKGpuRing::default(),
-            blocks: self.blocks.clone(),
+            blocks,
             shape: self.shape.clone(),
             max_seq: self.max_seq,
             layer_idx: self.layer_idx,
@@ -371,8 +373,9 @@ impl QuantRotorV4 {
     ///
     /// # Errors
     ///
-    /// Returns an `Error::Mlx` if the underlying [`rotor4_decode`] fails for
-    /// any block, or if `rotors` is empty (no append happened yet).
+    /// Returns an `Error::Mlx` if the underlying [`rotor4_decode`] fails for any
+    /// block, if `rotors` is empty (no append happened yet), or a
+    /// [`synced_rotor_v_blocks`] reconciliation error.
     pub fn dequant(&self) -> Result<Vec<f32>> {
         if self.shape.len() != 4 {
             return Err(Error::Mlx(format!(
@@ -384,7 +387,11 @@ impl QuantRotorV4 {
         let total_elems: usize = self.shape.iter().map(|&d| d as usize).product();
         let mut out: Vec<f32> = Vec::with_capacity(total_elems);
 
-        if self.blocks.is_empty() {
+        // Reconcile the ring-only decode tail — see
+        // [`super::QuantRotorV3::dequant`].
+        let blocks = synced_rotor_v_blocks(&self.blocks, &self.shape, &self.gpu, Device::Gpu)?;
+
+        if blocks.is_empty() {
             out.resize(total_elems, 0.0);
             return Ok(out);
         }
@@ -395,15 +402,19 @@ impl QuantRotorV4 {
             ));
         }
 
-        for blk in &self.blocks {
+        for blk in blocks.iter() {
             let dec = rotor4_decode(&blk.codes, &blk.scales, &blk.norms, &self.rotors, head_dim)
                 .map_err(|e: RotorQuantError| Error::Mlx(format!("rotor4 decode: {e}")))?;
             out.extend_from_slice(&dec);
         }
-        if out.len() < total_elems {
-            out.resize(total_elems, 0.0);
-        } else if out.len() > total_elems {
-            out.truncate(total_elems);
+        // Loud invariant — see [`super::QuantRotorV3::dequant`].
+        if out.len() != total_elems {
+            return Err(Error::Mlx(format!(
+                "QuantRotorV4::dequant: decoded {} elems but shape {:?} implies {total_elems} — \
+                 refusing to zero-pad / truncate",
+                out.len(),
+                self.shape
+            )));
         }
         // Blocks are sequence-major (see `append`); reorder back to head-major
         // `[B, kv_h, S, D]`.
