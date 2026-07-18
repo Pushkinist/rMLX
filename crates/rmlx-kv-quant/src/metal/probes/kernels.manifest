@@ -63,6 +63,13 @@ rot_k_fwht_rotate_d512.metal | rot_k.hdr.metal | inp:f,out:f
 # line over the same body.
 rotor_flash_decode_p1.metal | rotor_flash_decode_p1_b3.hdr.metal | query:f,codes:u,scales:f,norms:f,rotors:f,v_flat:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
 rotor_flash_decode_p1.metal | rotor_flash_decode_p1_b4.hdr.metal | query:f,codes:u,scales:f,norms:f,rotors:f,v_flat:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
+# The all-quant sibling: same two headers (both axes of a symmetric rotor codec
+# share one bit width, so RF_BITS covers the K and the V unpack), and it calls
+# the header's `rf_decode_k_group` for both. V arrives as its own packed ring
+# instead of a bf16 mirror, hence v_codes/v_scales/v_norms/v_rotors in place of
+# v_flat.
+rotor_flash_decode_symv_p1.metal | rotor_flash_decode_p1_b3.hdr.metal | query:f,k_codes:u,k_scales:f,k_norms:f,k_rotors:f,v_codes:u,v_scales:f,v_norms:f,v_rotors:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
+rotor_flash_decode_symv_p1.metal | rotor_flash_decode_p1_b4.hdr.metal | query:f,k_codes:u,k_scales:f,k_norms:f,k_rotors:f,v_codes:u,v_scales:f,v_norms:f,v_rotors:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
 # One fused-QK body serves both rotor bit widths — the unpack width arrives via
 # the header (RF_BITS / RF_MASK), so each header gets its own probe line over the
 # same body.

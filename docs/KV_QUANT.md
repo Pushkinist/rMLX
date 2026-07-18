@@ -2610,7 +2610,8 @@ must not change how existing bytes are read.
 | `KvStorage::RotorKOnly3` / `RotorKOnly4`, QJL off, `b == 1` | **YES** | GPU ring + `rotor_flash_decode_sdpa`. |
 | `KvStorage::RotorKOnly{3,4}`, QJL on | NO | Kernel cannot reproduce the QJL residual. |
 | `KvStorage::RotorKOnly{3,4}`, `b > 1` | NO | Ring stride does not interleave batch — see below. |
-| `Rotor{3,4}Sym`, `RotorK{3,4}Asym` | NO | V side is also rotor / affine-quantized; this kernel takes bf16 V only. Shares the K-decode half when a quant-V kernel lands. |
+| `Rotor{3,4}Sym` | NO (this kernel) | Both axes are rotor-quantized; they decode through the all-quant sibling `rotor_flash_decode_symv` instead (see below), which reads V from its own packed ring rather than a bf16 mirror. |
+| `RotorK{3,4}Asym` | NO | V is affine-quantized (TurboQuant), not rotor; no fused kernel yet, so it keeps the bf16 decode path. |
 
 ### Ring eligibility is passed down, not inferred
 
@@ -2716,6 +2717,71 @@ below `none` (Bonsai bf16 ≈ 110 TPS). The rotor sandwich is ~64 FMAs per group
 per lane and each of a group's 3 lanes redoes it, so the inner loop is
 compute-bound, not KV-bandwidth-bound. Narrowing that gap (sparse geometric
 product, one decode per group instead of per lane) is future work.
+
+---
+
+## `rotor_flash_decode_symv` — fused flash-decode over rotor-quant K **and** V
+
+The all-quant sibling of `rotor_flash_decode`, for `KvStorage::RotorSym3` /
+`RotorSym4`. It reads **both** axes straight from their packed rotor rings —
+there is no bf16 K or V mirror at all — so the symmetric rotor codecs finally
+carry only their advertised ~3-bits-per-axis cost.
+
+**What it replaced.** `Rotor{3,4}Sym` quantized both axes at `exit_prefill` and
+then decoded from a full bf16 K+V mirror (`decode_fp16_k` / `decode_fp16_v`),
+which `update_rotor{3,4}_sym` short-circuited to on its first line: the packed
+store was written and never read. The codec was dormant, and a codec advertising
+~3 bits/axis actually carried bf16 K + bf16 V *plus* its codes — i.e. **more**
+resident KV than plain bf16. Dropping the mirror turns the advertised
+compression into a real resident-byte win (measured ≈ −34% resident KV: Bonsai-8B
+590.0 → 390.8 MB, gemma-4-e2b 36.1 → 23.5 MB on a 1838-token prompt).
+
+### Reuse of the K-decode half
+
+The header ([`build_rotor_flash_header`], shared verbatim with the bf16-V
+sibling) emits the Cl(3,0) block decode as the MSL function `rf_decode_k_group`.
+This kernel calls it **twice per token** — once over the K ring, once over the
+V ring — because the rotor codec is axis-agnostic (`rotor{3,4}_encode` (V) and
+`rotor{3,4}_k_encode` (K) are the same function; the K fork only adds the
+optional QJL sideband, and the dispatcher fires only with QJL off). Both axes
+share one bit width by construction, so a single `RF_BITS` covers the K and the
+V unpack, and both probe against the existing header snapshots. Following the
+one-decode-per-group shell, each block's leader stages its group's grade-1 lanes
+into threadgroup memory (separate `k_shared` / `v_shared`) so the ~64-FMA
+sandwich runs once per Cl(3,0) block per axis rather than once per lane.
+
+### Files
+
+* `crates/rmlx-kv-quant/src/rotor_flash_decode_symv_msl.rs` — dispatcher +
+  counters; reuses the sibling's header builder.
+* `crates/rmlx-kv-quant/src/metal/rotor_flash_decode_symv_p1.metal` — pass-1
+  body (one body for both bit widths). Pass-2 is the shared LSE merge.
+* `crates/rmlx-kv-quant/src/storage/quant_rotor_v{3,4}.rs` — the V stores gain
+  the same `QuantKGpuRing` the K stores carry, fed via `RingFeed::Maintain` from
+  the symmetric append.
+* `crates/rmlx-kv-quant/src/kvcache/sdpa.rs::update_and_sdpa_rotor_sym_fused` —
+  dispatch site (main + shared-KV producer + consumer paths).
+
+### Gate
+
+Same shape as the K-only path: device is GPU, storage is `RotorSym{3,4}`, the
+store does **not** carry QJL, `q_seq == 1`, `b == 1`, `head_dim` a power of two
+`<= 512`. A QJL-carrying store keeps the CPU dequant path on both axes (the QJL
+residual is not reproducible in the flash inner loop). `feeds_bf16_k_at_decode`
+**and** `feeds_bf16_v_at_decode` are both false for these variants, so
+`exit_prefill` allocates neither seed and the resident-byte estimate reads the
+same two predicates — it cannot drift from what is materialised.
+
+### Speed vs. the mirror (honest)
+
+Dropping the mirror is a **memory** win, not a decode-speed win on the current
+two-pass shell. Against the MLX bf16 flash attention the dormant mirror used, the
+fused quant-K + quant-V path is materially slower at long context — the dominant
+gap is the two-pass flash-decode shell, not the V unpack. So `rotor*_sym` remains
+opt-in (`--kv-quant rotor3_sym` / `rotor4_sym`); it is the right pick when
+resident KV is the binding constraint, not when peak decode TPS is. Closing the
+speed gap needs a single-pass simdgroup flash-decode that beats MLX bf16 flash
+(tracked with `#45`).
 
 ---
 

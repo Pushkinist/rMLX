@@ -60,6 +60,10 @@ fn v_only_iso_rotor_families_are_cpu_fallback_with_reason() {
     // encode that runs (at prefill) is CPU. They carry MSL (q8 K-side) but must
     // report a CPU-hot-path reason. This is grounded in the dispatcher, not by
     // fiat — flip the verdict and this test must flip with it.
+    // Note: the rotor **symmetric** codecs (`Rotor3Sym` / `Rotor4Sym`) are NOT
+    // in this list — with QJL off (the default) their decode is the quant-V
+    // flash kernel over both packed rings, so their hot path is Metal. That
+    // verdict is checked in `rotor_symmetric_families_are_metal_when_qjl_off`.
     for kq in [
         KvQuant::Iso3,
         KvQuant::Iso4,
@@ -67,8 +71,6 @@ fn v_only_iso_rotor_families_are_cpu_fallback_with_reason() {
         KvQuant::Iso4Sym,
         KvQuant::Rotor3,
         KvQuant::Rotor4,
-        KvQuant::Rotor3Sym,
-        KvQuant::Rotor4Sym,
         KvQuant::RotorK3Asym {
             v_bits: 8,
             v_group_size: 128,
@@ -85,6 +87,30 @@ fn v_only_iso_rotor_families_are_cpu_fallback_with_reason() {
         assert!(
             kq.cpu_hot_path_reason().is_some(),
             "{kq} (V-only iso/rotor or rotor-K-asym) must be flagged as a CPU-hot-path codec"
+        );
+    }
+}
+
+#[test]
+fn rotor_symmetric_families_are_metal_when_qjl_off() {
+    // `Rotor3Sym` / `Rotor4Sym` have NO bf16 decode-seed early-return: with QJL
+    // off (the default) decode is the quant-V flash kernel over both packed
+    // rings, so the verdict must be `None` (Metal) — mirror of the K-only iso
+    // test. A QJL-carrying store still keeps the CPU dequant path; that branch
+    // is gated on the global toggle and not exercised here (QJL is off by
+    // default). Grounded in the dispatcher, not by fiat.
+    assert!(
+        !crate::rotor_qjl::rotor_qjl_enabled(),
+        "test assumes the default QJL-off state"
+    );
+    for kq in [KvQuant::Rotor3Sym, KvQuant::Rotor4Sym] {
+        assert!(
+            kq.carries_msl(),
+            "{kq} carries MSL (rotor K + quant-V flash kernels)"
+        );
+        assert!(
+            kq.cpu_hot_path_reason().is_none(),
+            "{kq} decodes through the quant-V flash kernel with QJL off — must be Metal (None)"
         );
     }
 }
