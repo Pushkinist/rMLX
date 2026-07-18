@@ -273,21 +273,26 @@ byte-identical totals for `k_iso3` and `k_rotor3` — two codecs with entirely
 different storage — while missing their GPU rings outright. A nominal
 bit-width is not a cache's memory.
 
-**Sample point differs per arch — read `kv_cache_bytes` accordingly.** The
-function is right everywhere; *when* each arch calls it is not yet uniform, so
-the recorded figure does not mean the same thing across the matrix:
+**One sample point across every arch: post-decode.** `kv_cache_bytes` is
+recorded at a single lifecycle position — after the decode loop, when every
+resident KV allocation exists, including the decode-time GPU ring of a
+ring-backed codec. It means the same thing in every row of the matrix,
+regardless of arch or of whether the prompt cache hit.
 
-| Arch | Sampled | Sees the decode-time GPU ring? |
-|---|---|---|
-| gemma4, qwen3.5-moe | after the decode loop | yes |
-| qwen3 (exact-hit path) | after the decode loop | yes |
-| qwen3 (miss path), qwen2, laguna | at the prefill snapshot, before decode | **no** — no ring exists yet |
+This is enforced structurally, not by convention. The store takes a `PostDecode`
+witness minted only by a completed decode loop (`pipelined_decode` and the
+per-arch `decode_loop` / `decode_from` helpers); recording the figure at the
+prefill snapshot — before the ring is allocated — is a compile error, because no
+witness is in scope there. A new arch cannot re-introduce the pre-decode /
+post-decode split silently. Keyed off the decode lifecycle, never an arch.
 
-So a single-request bench of a ring-backed codec on a pre-decode arch reports
-post-prefill KV, not steady-state decode KV — and `qwen3` reports both,
-depending on which path the request took. Unifying the sample point is tracked
-separately; until then, the ring-backed cells of a pre-decode arch are a lower
-bound.
+Earlier this differed per arch: gemma4 / qwen3.5-moe / gemma3 sampled after
+decode, while the qwen3-miss / qwen2 / laguna / bitnet / qwen3-vl-moe paths
+sampled at the prefill snapshot (before the ring existed), and qwen3 recorded
+either figure depending on whether the prompt cache hit. Ring-backed cells of
+those pre-decode arches were a lower bound; they now include the ring. The
+prompt-cache snapshot is still cloned at the prefill point (it stores the
+prompt's KV, not decode KV) — only the *metric* moved to post-decode.
 
 ### Per-request hot-swap
 

@@ -332,9 +332,10 @@ fn qwen3_ssd_hydrate_promotes_entry_into_ram() {
 /// CPU-only — no model, no GPU.
 #[test]
 fn qwen3_kv_bytes_store_read_roundtrip() {
+    let post = crate::decode_loop::PostDecode::for_test();
     // Simulate the Miss path store.
     let sentinel_miss: u64 = 123_456_789;
-    QWEN3_PROMPT_CACHE.store_kv_cache_bytes(sentinel_miss);
+    QWEN3_PROMPT_CACHE.store_kv_cache_bytes(sentinel_miss, post);
     assert_eq!(
         read_kv_cache_bytes(),
         sentinel_miss,
@@ -343,7 +344,7 @@ fn qwen3_kv_bytes_store_read_roundtrip() {
 
     // Simulate the Exact-hit path store (same atomic, same semantics).
     let sentinel_hit: u64 = 987_654_321;
-    QWEN3_PROMPT_CACHE.store_kv_cache_bytes(sentinel_hit);
+    QWEN3_PROMPT_CACHE.store_kv_cache_bytes(sentinel_hit, post);
     assert_eq!(
         read_kv_cache_bytes(),
         sentinel_hit,
@@ -351,7 +352,7 @@ fn qwen3_kv_bytes_store_read_roundtrip() {
     );
 
     // Reset to 0 so parallel tests see a clean state.
-    QWEN3_PROMPT_CACHE.store_kv_cache_bytes(0);
+    QWEN3_PROMPT_CACHE.store_kv_cache_bytes(0, post);
 }
 
 /// qwen3 dense is on the `ExactOnly` policy.

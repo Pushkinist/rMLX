@@ -256,7 +256,7 @@ pub fn generate_greedy<'a>(
             return Ok(steps);
         }
 
-        let stats = {
+        let (stats, post) = {
             let mut ctx = DecodeCtx {
                 tokenizer,
                 vocab,
@@ -295,8 +295,8 @@ pub fn generate_greedy<'a>(
             cache_path = "exact",
             "decode_profile"
         );
-        // store KV-cache bytes for the /metrics/cache endpoint.
-        store_kv_cache_bytes(kv_caches.iter().map(|c| c.resident_bytes()).sum());
+        // store KV-cache bytes for the /metrics/cache endpoint (post-decode).
+        store_kv_cache_bytes(kv_caches.iter().map(|c| c.resident_bytes()).sum(), post);
         return Ok(steps);
     }
 
@@ -710,7 +710,7 @@ pub fn generate_greedy<'a>(
     // async_eval → drain previous pending → feed) overlaps host sampling with
     // the in-flight GPU forward; see decode_loop.rs. gemma4 is pure-KV, so the
     // closure threads only `caches`.
-    let stats = pipelined_decode(&mut ctx, last_id, &mut steps, |y| {
+    let (stats, post) = pipelined_decode(&mut ctx, last_id, &mut steps, |y| {
         model.forward_arr(y, 1, Some(&mut caches), device)
     })?;
 
@@ -738,9 +738,9 @@ pub fn generate_greedy<'a>(
            "decode_profile"
        );
 
-    // N16: store KV-cache bytes for the /metrics/cache endpoint.
+    // N16: store KV-cache bytes for the /metrics/cache endpoint (post-decode).
     let kv_bytes: u64 = caches.iter().map(|c| c.resident_bytes()).sum();
-    store_kv_cache_bytes(kv_bytes);
+    store_kv_cache_bytes(kv_bytes, post);
 
     Ok(steps)
 }

@@ -1927,7 +1927,7 @@ pub fn generate_greedy<'a>(
 
         // Shared pipelined decode loop. The exact-hit funnel is just
         // "caches + last_id → decode"; the loop is the call site.
-        let stats = {
+        let (stats, post) = {
             let mut ctx = DecodeCtx {
                 tokenizer,
                 vocab,
@@ -1964,11 +1964,11 @@ pub fn generate_greedy<'a>(
             eval_per_step_ms = eval_ms / n,
             "decode_profile"
         );
-        // Store KV-cache bytes on exact-hit path (mirrors the Miss path store at
-        // the prefill snapshot block below). Once per generate call, after decode.
+        // Store KV-cache bytes on exact-hit path. Once per generate call, after
+        // decode — same lifecycle point as the Miss path store below.
         {
             let kv_bytes: u64 = kv_caches.iter().map(|c| c.resident_bytes()).sum();
-            QWEN3_PROMPT_CACHE.store_kv_cache_bytes(kv_bytes);
+            QWEN3_PROMPT_CACHE.store_kv_cache_bytes(kv_bytes, post);
         }
         return Ok(steps);
     }
@@ -2104,9 +2104,12 @@ pub fn generate_greedy<'a>(
     // Push this prefill snapshot to the prompt cache (Miss → store).
     // We clone the post-prefill KV caches (refcount bump, no data copy) before
     // the decode loop starts writing new decode-step K/V into them.
+    //
+    // The `kv_cache_bytes` metric is NOT sampled here: this is the prefill
+    // snapshot, before the decode loop allocates its ring, so a sample here
+    // would omit the ring on ring-backed codecs. It is recorded post-decode
+    // below, gated by the `PostDecode` witness.
     {
-        let kv_bytes: u64 = caches.iter().map(|c| c.resident_bytes()).sum();
-        QWEN3_PROMPT_CACHE.store_kv_cache_bytes(kv_bytes);
         let cloned_caches: Result<Vec<KvCache>> =
             caches.iter().map(|c| c.try_deep_clone()).collect();
         if let Ok(kv_snapshot) = cloned_caches {
@@ -2180,9 +2183,17 @@ pub fn generate_greedy<'a>(
     // The pipeline ordering (choose_token → async_eval → drain previous pending →
     // feed) overlaps host sampling with the in-flight GPU forward; see
     // decode_loop.rs.
-    let stats = pipelined_decode(&mut ctx, last_id, &mut steps, |y| {
+    let (stats, post) = pipelined_decode(&mut ctx, last_id, &mut steps, |y| {
         model.forward_arr(y, 1, Some(&mut caches), device)
     })?;
+
+    // Store KV-cache bytes post-decode: the decode ring is resident now, so the
+    // sample includes it on ring-backed codecs. Same lifecycle point as the
+    // exact-hit path above.
+    {
+        let kv_bytes: u64 = caches.iter().map(|c| c.resident_bytes()).sum();
+        QWEN3_PROMPT_CACHE.store_kv_cache_bytes(kv_bytes, post);
+    }
 
     let prefill_ms = (prefill_total_ns as f64) / 1.0e6;
     let forward_ms = (stats.forward_total_ns as f64) / 1.0e6;

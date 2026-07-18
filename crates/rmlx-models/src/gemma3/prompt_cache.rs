@@ -255,8 +255,8 @@ pub fn read_kv_cache_bytes() -> u64 {
 }
 
 /// Record the KV-cache byte total for the just-completed request.
-pub(crate) fn store_kv_cache_bytes(n: u64) {
-    PROMPT_CACHE.store_kv_cache_bytes(n);
+pub(crate) fn store_kv_cache_bytes(n: u64, post: crate::decode_loop::PostDecode) {
+    PROMPT_CACHE.store_kv_cache_bytes(n, post);
 }
 
 #[cfg(test)]
