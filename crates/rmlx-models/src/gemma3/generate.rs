@@ -446,7 +446,7 @@ pub fn generate_greedy<'a>(
     // pipeline ordering (choose_token → async_eval → drain previous pending →
     // feed) overlaps host sampling with the in-flight GPU forward; see
     // decode_loop.rs. gemma3 is pure-KV, so the closure threads only `caches`.
-    let stats = pipelined_decode(&mut ctx, last_id, &mut steps, |y| {
+    let (stats, post) = pipelined_decode(&mut ctx, last_id, &mut steps, |y| {
         model.forward_arr(y, 1, Some(&mut caches), device)
     })?;
 
@@ -469,8 +469,8 @@ pub fn generate_greedy<'a>(
         "decode_profile"
     );
 
-    // store KV-cache bytes for the /metrics/cache endpoint.
-    store_kv_cache_bytes(caches.iter().map(KvCache::resident_bytes).sum());
+    // store KV-cache bytes for the /metrics/cache endpoint (post-decode).
+    store_kv_cache_bytes(caches.iter().map(KvCache::resident_bytes).sum(), post);
 
     Ok(steps)
 }
@@ -527,7 +527,7 @@ fn exact_hit_decode<'a>(
         return Ok(steps);
     }
 
-    let stats = {
+    let (stats, post) = {
         let mut ctx = DecodeCtx {
             tokenizer,
             vocab,
@@ -566,8 +566,8 @@ fn exact_hit_decode<'a>(
         "decode_profile"
     );
 
-    // store KV-cache bytes for the /metrics/cache endpoint.
-    store_kv_cache_bytes(caches.iter().map(KvCache::resident_bytes).sum());
+    // store KV-cache bytes for the /metrics/cache endpoint (post-decode).
+    store_kv_cache_bytes(caches.iter().map(KvCache::resident_bytes).sum(), post);
 
     Ok(steps)
 }

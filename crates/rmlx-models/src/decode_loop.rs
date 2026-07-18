@@ -125,6 +125,48 @@ pub(crate) struct DecodeCtx<'a> {
     pub resolve_pieces: bool,
 }
 
+/// Witness that a generation's decode phase has completed on the calling thread.
+///
+/// Minted as the final act of the decode loops (`pipelined_decode` and the
+/// per-arch `decode_loop` / `decode_from` helpers) and required by
+/// `ArchPromptCache::store_kv_cache_bytes`. It pins the `kv_cache_bytes` metric
+/// to a single lifecycle point: **after decode**, when every resident KV
+/// allocation — including the decode-time ring — exists. A codec whose ring is
+/// allocated during decode is invisible to a pre-decode sample regardless of the
+/// byte accounting, so keying the store off this witness (not off an arch) is
+/// what keeps the figure comparable.
+///
+/// This is a raised bar + review convention, **not** an unforgeable compile
+/// guarantee. The naive re-drift — moving the store back to the prefill snapshot
+/// and reusing the loop's witness — is a compile error, because that witness is
+/// not in scope there. But `seal()` is `pub(crate)` (each per-arch decode helper
+/// must mint its own), so a new arch *could* mint a fresh witness at the prefill
+/// point and compile. The backstop is review plus the `#[ignore]`d GPU re-drift
+/// test, which goes red if a path samples pre-decode.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PostDecode(());
+
+impl PostDecode {
+    /// Mint the witness. MUST be called only as the final act of a completed
+    /// decode loop — it certifies "decode done, KV allocations are final". The
+    /// private field keeps construction to this module + the per-arch loops that
+    /// call it; it is not a hard capability (any in-crate caller can mint one),
+    /// so correct placement is still a review property.
+    #[inline]
+    #[must_use]
+    pub(crate) fn seal() -> Self {
+        Self(())
+    }
+
+    /// Test-only witness for unit tests that record a sentinel byte count
+    /// without running a real decode loop.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn for_test() -> Self {
+        Self(())
+    }
+}
+
 /// Decode-loop timing accumulators, returned for arch-side `decode_profile`
 /// emission. Nanoseconds; the arch converts to the milliseconds field shapes
 /// `scripts/aggregate_decode_profile.py` parses.
@@ -264,7 +306,7 @@ pub(crate) fn pipelined_decode(
     first_id: u32,
     steps: &mut Vec<ProbeStep>,
     mut forward_step: impl FnMut(&Array) -> Result<Array>,
-) -> Result<DecodeStats> {
+) -> Result<(DecodeStats, PostDecode)> {
     let mut stats = DecodeStats::default();
     let device = ctx.device;
     let vocab = ctx.vocab;
@@ -486,7 +528,10 @@ pub(crate) fn pipelined_decode(
         }
     }
 
-    Ok(stats)
+    // Final act of the decode phase: mint the post-decode witness. The caller
+    // needs it to record `kv_cache_bytes`, so the metric can only be sampled
+    // here — after the decode-time ring is resident.
+    Ok((stats, PostDecode::seal()))
 }
 
 /// Resolve the per-token `piece`: `tokenizer.id_to_token` when `resolve_pieces`,

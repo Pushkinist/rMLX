@@ -201,7 +201,7 @@ pub fn generate_greedy<'a>(
         // "caches + last_id → decode"; the loop is the call site. The GDN
         // `lin_caches` are CLOSURE-CAPTURED — the shared loop never learns
         // they exist; only the forward closure threads them through.
-        {
+        let (_, post) = {
             let mut ctx = DecodeCtx {
                 tokenizer,
                 vocab,
@@ -219,12 +219,12 @@ pub fn generate_greedy<'a>(
             };
             pipelined_decode(&mut ctx, last_id, &mut steps, |y| {
                 model.forward_arr(y, 1, Some(&mut kv_caches), Some(&mut lin_caches), device)
-            })?;
-        }
-        // N16: store KV-cache bytes (KV + linear-attn state) for /metrics/cache.
+            })?
+        };
+        // N16: store KV-cache bytes (KV + linear-attn state) for /metrics/cache (post-decode).
         let kv_bytes: u64 = kv_caches.iter().map(|c| c.resident_bytes()).sum::<u64>()
             + lin_caches.iter().map(|c| c.resident_bytes()).sum::<u64>();
-        store_kv_cache_bytes(kv_bytes);
+        store_kv_cache_bytes(kv_bytes, post);
         return Ok(steps);
     }
 
@@ -429,13 +429,13 @@ pub fn generate_greedy<'a>(
 
         // Shared pipelined decode loop. GDN `lin_caches` are closure-captured —
         // the loop never learns they exist.
-        pipelined_decode(&mut ctx, last_id, &mut steps, |y| {
+        let (_, post) = pipelined_decode(&mut ctx, last_id, &mut steps, |y| {
             model.forward_arr(y, 1, Some(&mut kv_caches), Some(&mut lin_caches), device)
         })?;
 
         let kv_bytes: u64 = kv_caches.iter().map(|c| c.resident_bytes()).sum::<u64>()
             + lin_caches.iter().map(|c| c.resident_bytes()).sum::<u64>();
-        store_kv_cache_bytes(kv_bytes);
+        store_kv_cache_bytes(kv_bytes, post);
         return Ok(steps);
     }
 
@@ -633,7 +633,7 @@ pub fn generate_greedy<'a>(
     // Miss funnel is just "caches + last_id → decode"; the loop is the call
     // site. The GDN `lin_caches` are closure-captured — the loop never learns
     // they exist.
-    let stats = pipelined_decode(&mut ctx, last_id, &mut steps, |y| {
+    let (stats, post) = pipelined_decode(&mut ctx, last_id, &mut steps, |y| {
         model.forward_arr(y, 1, Some(&mut kv_caches), Some(&mut lin_caches), device)
     })?;
 
@@ -655,10 +655,10 @@ pub fn generate_greedy<'a>(
         "decode_profile"
     );
 
-    // N16: store KV-cache bytes (KV + linear-attn state) for /metrics/cache.
+    // N16: store KV-cache bytes (KV + linear-attn state) for /metrics/cache (post-decode).
     let kv_bytes: u64 = kv_caches.iter().map(|c| c.resident_bytes()).sum::<u64>()
         + lin_caches.iter().map(|c| c.resident_bytes()).sum::<u64>();
-    store_kv_cache_bytes(kv_bytes);
+    store_kv_cache_bytes(kv_bytes, post);
 
     Ok(steps)
 }

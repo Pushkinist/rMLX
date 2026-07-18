@@ -273,21 +273,40 @@ byte-identical totals for `k_iso3` and `k_rotor3` — two codecs with entirely
 different storage — while missing their GPU rings outright. A nominal
 bit-width is not a cache's memory.
 
-**Sample point differs per arch — read `kv_cache_bytes` accordingly.** The
-function is right everywhere; *when* each arch calls it is not yet uniform, so
-the recorded figure does not mean the same thing across the matrix:
+**One sample point across every arch: post-decode.** `kv_cache_bytes` is
+recorded at a single lifecycle position — after the decode loop, when every
+resident KV allocation exists, including the decode-time GPU ring of a
+ring-backed codec. It means the same thing in every row of the matrix,
+regardless of arch or of whether the prompt cache hit. "One lifecycle point"
+means **post-decode, and only when a decode actually ran**: a run that returns
+before the decode loop (immediate-EOS — the first sampled token is EOS — or a
+NaN-prefill abort) does **not** refresh `kv_cache_bytes` and leaves the prior
+value in place. That is uniform across every arch now (the exact-hit paths and
+gemma4 / gemma3 / qwen3.5-moe always behaved this way), and it loses no ring
+information: with zero decode steps no ring is ever allocated, so the value that
+is *not* written would equal the prefill snapshot.
 
-| Arch | Sampled | Sees the decode-time GPU ring? |
-|---|---|---|
-| gemma4, qwen3.5-moe | after the decode loop | yes |
-| qwen3 (exact-hit path) | after the decode loop | yes |
-| qwen3 (miss path), qwen2, laguna | at the prefill snapshot, before decode | **no** — no ring exists yet |
+The store takes a `PostDecode` witness minted only by a completed decode loop
+(`pipelined_decode` and the per-arch `decode_loop` / `decode_from` helpers) and
+required by `store_kv_cache_bytes`. This **raises the bar and documents the
+requirement**: the naive re-drift — co-locating the store back at the prefill
+snapshot, reusing the loop's witness — is a compile error, because that witness
+is not yet in scope there, and the witness parameter makes a wrong lifecycle
+obvious in review. It is **not** an unforgeable compile-time guarantee: `seal()`
+is `pub(crate)` (each per-arch decode helper has to mint its own), so a new arch
+*could* mint a fresh witness at the prefill point and compile. The backstop for
+that is review plus the `#[ignore]`d GPU re-drift test
+(`kv_bytes_hit_equals_miss`), which goes red if a path samples pre-decode — it
+runs on a manual GPU pass, not in `make ci`. Keyed off the decode lifecycle,
+never an arch.
 
-So a single-request bench of a ring-backed codec on a pre-decode arch reports
-post-prefill KV, not steady-state decode KV — and `qwen3` reports both,
-depending on which path the request took. Unifying the sample point is tracked
-separately; until then, the ring-backed cells of a pre-decode arch are a lower
-bound.
+Earlier this differed per arch: gemma4 / qwen3.5-moe / gemma3 sampled after
+decode, while the qwen3-miss / qwen2 / laguna / bitnet / qwen3-vl-moe paths
+sampled at the prefill snapshot (before the ring existed), and qwen3 recorded
+either figure depending on whether the prompt cache hit. Ring-backed cells of
+those pre-decode arches were a lower bound; they now include the ring. The
+prompt-cache snapshot is still cloned at the prefill point (it stores the
+prompt's KV, not decode KV) — only the *metric* moved to post-decode.
 
 ### Per-request hot-swap
 

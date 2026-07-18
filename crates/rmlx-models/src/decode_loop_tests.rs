@@ -434,7 +434,7 @@ fn pipelined_decode_stops_on_eos() {
         &mut hist,
         true,
     );
-    let stats = pipelined_decode(&mut c, 0, &mut steps, scripted(&rows, &calls)).unwrap();
+    let (stats, _post) = pipelined_decode(&mut c, 0, &mut steps, scripted(&rows, &calls)).unwrap();
     let ids: Vec<u32> = steps.iter().map(|s| s.token_id).collect();
     // emitted stream: first_id 0, then 1, then EOS 3.
     assert_eq!(ids, vec![0, 1, 3], "decode stops once EOS is emitted");
