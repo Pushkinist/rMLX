@@ -1,6 +1,12 @@
+// Device-policy tests: `Device::Gpu` here is a selector value passed to pure
+// functions (`resolve_prompt_truncation`, device-arg parsing), never a Metal
+// dispatch. Each such test carries a per-fn `gpu-test-gate: exempt` marker so
+// the shape gate does not treat the value as a GPU test — while any genuinely
+// Metal-driving test added to this file still trips the gate.
 use super::*;
 use rmlx_mlx::Device;
 
+// gpu-test-gate: exempt
 #[test]
 fn device_arg_accepts_cpu_and_gpu() {
     // Valid devices must not return Err.
@@ -22,6 +28,7 @@ fn device_arg_accepts_cpu_and_gpu() {
     ));
 }
 
+// gpu-test-gate: exempt
 #[test]
 fn device_arg_rejects_tpu() {
     let result: anyhow::Result<Device> = match "tpu" {
@@ -252,6 +259,7 @@ fn build_record_git_sha_blank_string_is_null() {
 // Model-agnostic: pure function over (prompt_len, cap, device, flags), no
 // model load / GPU context involved.
 
+// gpu-test-gate: exempt
 #[test]
 fn resolve_prompt_truncation_under_cap_is_a_noop_on_gpu() {
     let len =
@@ -268,6 +276,7 @@ fn resolve_prompt_truncation_under_cap_is_a_noop_on_cpu() {
 
 /// Equality boundary on the GPU-default (no opt-in) path: a prompt exactly
 /// at the cap must not error -- pins the `<=` guard against a `<` mutation.
+// gpu-test-gate: exempt
 #[test]
 fn resolve_prompt_truncation_gpu_at_cap_exactly_is_a_noop() {
     let len = resolve_prompt_truncation(65_536, 65_536, Device::Gpu, false, false)
@@ -278,6 +287,7 @@ fn resolve_prompt_truncation_gpu_at_cap_exactly_is_a_noop() {
 /// The bug this fixes: a >65536-token prompt on `--device gpu` with the
 /// default cap and no opt-in must fail loudly, not silently truncate down to
 /// a shorter measurement that looks like a full-length one.
+// gpu-test-gate: exempt
 #[test]
 fn resolve_prompt_truncation_gpu_default_cap_over_limit_errors_loudly() {
     let err = resolve_prompt_truncation(131_072, 65_536, Device::Gpu, false, false)
@@ -289,6 +299,7 @@ fn resolve_prompt_truncation_gpu_default_cap_over_limit_errors_loudly() {
     assert!(msg.contains("--allow-truncate"), "{msg}");
 }
 
+// gpu-test-gate: exempt
 #[test]
 fn resolve_prompt_truncation_gpu_explicit_cap_over_limit_truncates() {
     // An explicit `--max-prompt-tokens` is itself the opt-in.
@@ -297,6 +308,7 @@ fn resolve_prompt_truncation_gpu_explicit_cap_over_limit_truncates() {
     assert_eq!(len, 65_536);
 }
 
+// gpu-test-gate: exempt
 #[test]
 fn resolve_prompt_truncation_gpu_allow_truncate_over_limit_truncates() {
     let len = resolve_prompt_truncation(131_072, 65_536, Device::Gpu, false, true)
@@ -306,6 +318,7 @@ fn resolve_prompt_truncation_gpu_allow_truncate_over_limit_truncates() {
 
 /// `--device gpu` measuring the full length requires raising the cap; when
 /// the caller does that, the full prompt is measured (not truncated).
+// gpu-test-gate: exempt
 #[test]
 fn resolve_prompt_truncation_gpu_full_length_when_cap_raised() {
     let len = resolve_prompt_truncation(131_072, 131_072, Device::Gpu, true, false)

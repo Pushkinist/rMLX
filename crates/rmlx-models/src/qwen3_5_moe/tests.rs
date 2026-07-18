@@ -334,6 +334,7 @@ fn prompt_cache_identical_prompt_is_exact_not_partial() {
 ///
 /// MLX requires group_size ∈ {32, 64, 128} — smaller values have no kernel.
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test paro_weight_conversion_matmul -- --ignored --test-threads=1"]
 #[allow(
     clippy::expect_used,
     reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
@@ -479,6 +480,7 @@ fn paro_weight_conversion_matmul() {
 /// - returns dtype BF16 (the `astype Bf16` else-arm fires because dequantize
 ///   returns the scales dtype = F16 ≠ BF16).
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test embed_lookup -- --ignored --test-threads=1"]
 #[allow(
     clippy::expect_used,
     reason = "values established by construction; .expect() message documents the invariant"
@@ -594,6 +596,7 @@ fn embed_lookup_f16_scales_selects_correct_row_and_casts_to_bf16() {
 /// - ids=[2] selects the CORRECT row (all output values ≈ 2.0),
 /// - output dtype is BF16 (the direct `Ok(dq)` passthrough arm fires).
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test embed_lookup -- --ignored --test-threads=1"]
 #[allow(
     clippy::expect_used,
     reason = "values established by construction; .expect() message documents the invariant"

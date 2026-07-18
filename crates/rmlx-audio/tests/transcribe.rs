@@ -216,6 +216,7 @@ fn transcribe_file(
 /// Portable smoke: a known `say` sentence transcribes correctly and is
 /// deterministic across two runs at temp=0.
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test say_clip -- --ignored --test-threads=1"]
 fn say_clip_deterministic() {
     let Some(t) = load_transcriber() else {
         eprintln!("skip say_clip_deterministic: whisper snapshot not present");
@@ -256,6 +257,7 @@ fn say_clip_deterministic() {
 /// Long-form regression: transcribe every fixture audio with a sibling VTT and
 /// assert normalized WER ≤ threshold on the FULL file.
 #[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test long_form_regression -- --ignored --test-threads=1"]
 fn long_form_regression() {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     if !fixtures.exists() {
