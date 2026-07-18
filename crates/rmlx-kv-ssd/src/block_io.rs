@@ -135,6 +135,10 @@ pub enum BlockIoError {
     /// A referenced tensor was absent from the file.
     #[error("KV block: missing tensor '{0}'")]
     MissingTensor(String),
+    /// A store was handed to serialization with its CPU blocks shorter than its
+    /// accumulated `shape[2]` — persisting it would truncate the store.
+    #[error("KV block: refusing to persist a truncated store: {0}")]
+    TruncatedStore(String),
 }
 
 impl From<BlockIoError> for Error {
@@ -1541,16 +1545,42 @@ fn write_quant_iso_k4(
 /// The QJL fields are omitted when the cache has no `qjl_s_matrix`. The
 /// geometry tag (`ROTOR_SYM_3_QJL_LAYOUT_TAG` vs. `ROTOR_SYM_3_LAYOUT_TAG`)
 /// is the load-bearing signal to the reader.
-#[allow(
-    clippy::unnecessary_wraps,
-    reason = "returns Result<()> for consistency with all other write_quant_* helpers; callers use ? on this"
-)]
+/// Loud guard: a rotor K store must reach serialization with its CPU `blocks`
+/// covering the full accumulated `shape[2]`.
+///
+/// On the fused decode path the store keeps a **ring-only tail** — `blocks`
+/// trail `shape[2]`, with the GPU ring holding the decode tail. The spill clone
+/// (`KvCache::try_deep_clone`) materialises that tail into complete blocks
+/// before the store reaches here; if it did not, serializing `qk.blocks`
+/// directly would persist a **truncated** store. Rather than silently write the
+/// short prefix, reject it — the invariant is enforced at the persistence
+/// boundary too, not only at the codec.
+fn ensure_rotor_k_blocks_cover_shape(
+    blocks_tokens: usize,
+    shape: &[i32],
+    idx: usize,
+) -> Result<()> {
+    if shape.len() != 4 {
+        return Ok(());
+    }
+    let full_tokens: usize = shape.iter().take(3).map(|&d| d.max(0) as usize).product();
+    if blocks_tokens != full_tokens {
+        return Err(BlockIoError::TruncatedStore(format!(
+            "l{idx}.k rotor store: CPU blocks hold {blocks_tokens} tokens but shape {shape:?} \
+             implies {full_tokens} — the ring-only decode tail was not materialised before spill"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 fn write_quant_rotor_k3(
     idx: usize,
     k: Option<&QuantRotorK3>,
     out: &mut Vec<(String, OwnedTensor)>,
 ) -> Result<()> {
     let Some(qk) = k else { return Ok(()) };
+    ensure_rotor_k_blocks_cover_shape(qk.blocks.iter().map(|b| b.n_tokens).sum(), &qk.shape, idx)?;
     let mut codes: Vec<u8> = Vec::new();
     let mut scales: Vec<f32> = Vec::new();
     let mut norms: Vec<f32> = Vec::new();
@@ -1592,16 +1622,13 @@ fn write_quant_rotor_k3(
 /// Serialize a `QuantRotorK4` K payload (rotor4 K codec).
 /// Identical wire layout to [`write_quant_rotor_k3`]; bit-width encoded in
 /// the geometry tag.
-#[allow(
-    clippy::unnecessary_wraps,
-    reason = "returns Result<()> for consistency with all other write_quant_* helpers; callers use ? on this"
-)]
 fn write_quant_rotor_k4(
     idx: usize,
     k: Option<&QuantRotorK4>,
     out: &mut Vec<(String, OwnedTensor)>,
 ) -> Result<()> {
     let Some(qk) = k else { return Ok(()) };
+    ensure_rotor_k_blocks_cover_shape(qk.blocks.iter().map(|b| b.n_tokens).sum(), &qk.shape, idx)?;
     let mut codes: Vec<u8> = Vec::new();
     let mut scales: Vec<f32> = Vec::new();
     let mut norms: Vec<f32> = Vec::new();

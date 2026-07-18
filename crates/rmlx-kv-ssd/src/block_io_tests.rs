@@ -2756,3 +2756,187 @@ fn ssd_roundtrip_preserves_layer_idx_positional() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+// ── Rotor K-only ring-only tail: SSD spill preserves the full store ──────────
+
+/// Global cosine / max-abs-err helpers for the ring-only-tail round-trip.
+fn max_abs_err(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0_f32, f32::max)
+}
+
+/// Build a rotor3 K-only cache with QJL pinned OFF (env-independent: a
+/// pre-seeded rotor table keeps `qjl_s_matrix == None`). This is the state the
+/// fused GPU decode path requires.
+#[allow(
+    clippy::unwrap_used,
+    reason = "test helper: values established by construction"
+)]
+fn seeded_rotor_k3_cache(kv_h: i32, head_dim: i32, max_seq: i32) -> KvCache {
+    let n_groups = rmlx_kv_quant::rotorquant::n_groups_for(head_dim as usize);
+    let rotors = rmlx_kv_quant::clifford::make_rotor_table(0, 0, n_groups);
+    let storage = KvStorage::RotorKOnly3 {
+        k: Some(QuantRotorK3::from_cpu_blocks(
+            rotors,
+            None,
+            Vec::new(),
+            vec![1, kv_h, 0, head_dim],
+            0,
+        )),
+        max_seq,
+    };
+    KvCache::from_storage(storage, KvQuant::RotorKOnly3, 0, 0)
+}
+
+/// `(dequant, shape[2], cpu_block_tokens)` for a rotor3 K-only cache.
+#[allow(
+    clippy::unwrap_used,
+    reason = "test helper: values established by construction"
+)]
+fn rotor_k3_probe(cache: &KvCache) -> (Vec<f32>, i32, usize) {
+    match cache.storage() {
+        KvStorage::RotorKOnly3 { k: Some(ks), .. } => (
+            ks.dequant().unwrap(),
+            ks.shape.get(2).copied().unwrap_or(0),
+            ks.blocks.iter().map(|b| b.n_tokens).sum(),
+        ),
+        _ => panic!("expected a live RotorKOnly3 store"),
+    }
+}
+
+/// The write path refuses to persist a rotor K store whose CPU blocks fall
+/// short of `shape[2]` with no ring — a truncated store. Runs on CPU (no Metal).
+///
+/// Mutation check: delete the `ensure_rotor_k_blocks_cover_shape` guard in
+/// `write_quant_rotor_k3` — the writer then silently serializes the short prefix
+/// and this assertion flips RED (`write` returns `Ok`).
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test: values established by construction earlier in this fn"
+)]
+fn write_rejects_truncated_rotor_k_store() {
+    let kv_h = 2_i32;
+    let head_dim = 9_i32; // n_groups = 3, exact
+    let data = lcg((kv_h * 2 * head_dim) as usize, 0x51D);
+
+    // A real single block covering 2 tokens.
+    let mut src = QuantRotorK3::new(vec![1, kv_h, 0, head_dim], 0);
+    src.append(&data, &[1, kv_h, 2, head_dim]).unwrap();
+
+    // Claim shape[2] == 4 while the blocks cover only 2 tokens and no ring
+    // exists — the ring-only tail with the ring missing.
+    let truncated = QuantRotorK3::from_cpu_blocks(
+        src.rotors.clone(),
+        None,
+        src.blocks.clone(),
+        vec![1, kv_h, 4, head_dim],
+        0,
+    );
+    let layers = vec![KvStorage::RotorKOnly3 {
+        k: Some(truncated),
+        max_seq: 64,
+    }];
+    let path = tmp_path("rotor_k_truncated");
+    let res =
+        KvBlockWriter::new(MODEL_ID, KvQuant::RotorKOnly3, &layers, &[]).write(&path, Device::Cpu);
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        res.is_err(),
+        "writer must reject a truncated rotor K store (short blocks, no ring), got Ok"
+    );
+}
+
+/// Full SSD spill/hydrate round-trip after a ring-only-tail decode.
+///
+/// After prefill + N fused decode steps the store keeps a ring-only tail (CPU
+/// blocks frozen at prefill; the decode tail lives only in the GPU ring). The
+/// spill clone (`KvCache::try_deep_clone`) materialises that tail into complete
+/// blocks, so `write_caches` → hydrate restores the **full** store — not a
+/// prefix truncated at the last CPU block. Asserted byte-exact against the live
+/// store's own `dequant()`.
+///
+/// Mutation check: make `try_deep_clone` clone `self.blocks` directly (drop the
+/// `synced_rotor_k_blocks` reconcile) — the clone then carries only the frozen
+/// prefill prefix, `write_caches` trips the `ensure_rotor_k_blocks_cover_shape`
+/// guard, and `.expect("write_caches")` panics (RED).
+#[test]
+#[ignore = "GPU Metal context — run: cargo test -p rmlx-kv-ssd rotor_k_only_ring_only_tail_ssd -- --ignored --test-threads=1"]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "test: values established by construction earlier in this fn"
+)]
+fn rotor_k_only_ring_only_tail_ssd_round_trip() {
+    let device = Device::Gpu;
+    let (kv_h, n_q, head_dim, prefill, steps) = (2_i32, 8_i32, 128_i32, 6_i32, 5_i32);
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    let mut c = seeded_rotor_k3_cache(kv_h, head_dim, 512);
+    let k = arr(
+        &lcg((prefill * kv_h * head_dim) as usize, 11),
+        &[1, kv_h, prefill, head_dim],
+    );
+    let v = arr(
+        &lcg((prefill * kv_h * head_dim) as usize, 12),
+        &[1, kv_h, prefill, head_dim],
+    );
+    let q = arr(
+        &lcg((prefill * n_q * head_dim) as usize, 13),
+        &[1, n_q, prefill, head_dim],
+    );
+    c.update_and_sdpa(&q, &k, &v, scale, "causal", None, device)
+        .unwrap();
+    c.exit_prefill(device).unwrap();
+    for i in 0..steps {
+        let k1 = arr(
+            &lcg((kv_h * head_dim) as usize, 31 + i as u64),
+            &[1, kv_h, 1, head_dim],
+        );
+        let v1 = arr(
+            &lcg((kv_h * head_dim) as usize, 41 + i as u64),
+            &[1, kv_h, 1, head_dim],
+        );
+        let q1 = arr(
+            &lcg((n_q * head_dim) as usize, 51 + i as u64),
+            &[1, n_q, 1, head_dim],
+        );
+        c.update_and_sdpa(&q1, &k1, &v1, scale, "", None, device)
+            .unwrap()
+            .eval()
+            .unwrap();
+    }
+
+    // Ring-only tail precondition + live full-prefix dequant.
+    let (orig_dq, orig_seq, block_tokens) = rotor_k3_probe(&c);
+    assert_eq!(orig_seq, prefill + steps, "shape[2] advanced with the ring");
+    assert_eq!(
+        block_tokens,
+        (prefill * kv_h) as usize,
+        "CPU blocks frozen at prefill (ring-only tail)"
+    );
+
+    // Spill clone (materialises the tail) → write → hydrate.
+    let clone = c.try_deep_clone().unwrap();
+    let path = tmp_path("rotor_k_ring_only_tail");
+    write_caches(&path, device, MODEL_ID, KvQuant::RotorKOnly3, &[clone], &[])
+        .expect("write_caches must persist the full materialised store");
+    let (hydrated, _lin) = read_caches(&path, device, MODEL_ID, KvQuant::RotorKOnly3).unwrap();
+    let _ = std::fs::remove_file(&path);
+
+    let (hy_dq, hy_seq, _) = rotor_k3_probe(&hydrated[0]);
+    assert_eq!(
+        hy_seq,
+        prefill + steps,
+        "hydrated store must carry the full decoded length, not a truncated prefix"
+    );
+    assert_eq!(hy_dq.len(), orig_dq.len(), "hydrated K length mismatch");
+    let err = max_abs_err(&orig_dq, &hy_dq);
+    assert!(
+        err < 1e-6,
+        "hydrated K must match the live ring-only-tail dequant byte-for-byte (err={err})"
+    );
+}

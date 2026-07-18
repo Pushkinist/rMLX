@@ -276,6 +276,18 @@ exceeded), the spill hook receives the evicted entry. The spiller:
    `sync_channel` (depth 16). If the channel is full, the job is dropped and a
    `warn!` is logged — back-pressure never stalls decode.
 
+   The clone is `KvCache::try_deep_clone`. For a rotor K-only cache (`k_rotor3`
+   / `k_rotor4`) this is also the point where a **ring-only decode tail** is
+   reconciled: the fused decode path keeps the CPU `blocks` frozen at the
+   prefill prefix while the GPU ring carries the decode tail (see
+   `docs/KV_QUANT.md` § "Ring eligibility"), so the clone materialises the tail
+   back into complete CPU blocks from the ring. `block_io::write_quant_rotor_k{3,4}`
+   serialize `blocks`, so without this the spill would persist a store truncated
+   at the last CPU block. The serializer additionally refuses to write any rotor
+   K store whose blocks fall short of `shape[2]`
+   (`ensure_rotor_k_blocks_cover_shape` → `BlockIoError::TruncatedStore`) — the
+   invariant is enforced at the persistence boundary, not only at the codec.
+
 2. **Drain thread (`rmlx-kv-spill`):** receives jobs from the channel.
    - Serializes via `block_io::write_caches` — forces MLX arrays to host
      bytes (CPU eval), writes to `<namespace_dir>/<hash>.kvb`.

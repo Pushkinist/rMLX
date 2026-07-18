@@ -2615,27 +2615,63 @@ must not change how existing bytes are read.
 ### Ring eligibility is passed down, not inferred
 
 `QuantKGpuRing` is only built for the codecs that can actually read it. The rotor K
-GPU encode takes a `RingFeed` from its caller: `Maintain` from the two K-only
-paths (prefill `update_rotor_k_only_*` and the fused decode entry), `Skip` from
-the sym/asym mirrors. A ring for a non-eligible codec is not free —
+GPU encode takes a `RingFeed` from its caller, one of three modes:
+
+- **`Maintain`** — feed the ring **and** push a CPU block. Used by prefill
+  (`update_rotor_k_only_*`) and the non-fused decode fallback, which `dequant()`
+  the whole prefix on the same step and so need the block immediately.
+- **`MaintainRingOnly`** — feed the ring **without** pushing a CPU block: a
+  **ring-only tail**. Used by the fused decode entry
+  (`rotor{3,4}_k_only_gpu_append`). The flash kernel reads the ring, never the
+  block, so skipping the per-step host download (`rotor_gpu_outputs_to_cpu`) is
+  the win; `shape[2]` still advances so the ring and the attention length stay
+  in lockstep.
+- **`Skip`** — clear the ring. Used by the sym/asym mirrors, and as the `b > 1`
+  fallback of a ring-only feed (which reverts to the block path).
+
+A ring for a non-eligible codec is not free —
 `capacity * kv_h * n_groups * 8 + capacity * kv_h * 4` bytes per layer, growing
 with context (order of a few hundred MB across a 36-layer model at 4k) — and
 nothing would ever read it.
 
-**Invariant: the ring either tracks `blocks` exactly, or it does not exist.** A
-skipped feed *clears* rather than leaving the ring behind. A stale ring (blocks
-grown, ring not) is the dangerous state: the next append takes `prev_seq` from
-the longer `shape` and writes past the ring's filled region, leaving the gap
-zeroed and attention silently wrong. Because a cleared ring re-seeds from
-`blocks` on the next maintained append (`seed_from_cpu`), this is self-healing —
-`reset()` / `truncate_to()` / a CPU `append()` all just drop it.
+**Invariant: the CPU `blocks` track `shape[2]` exactly, or the GPU ring holds
+the tail and the blocks are rebuilt from it on demand — never a silent gap.**
+Two regimes satisfy it:
+
+- *Blocks-authoritative* (Maintain / CPU `append` / SSD hydrate): `blocks` cover
+  the full `shape[2]`; the ring, when live, mirrors them and re-seeds from
+  `blocks` (`seed_from_cpu`) after a drop (`reset()`, a CPU `append()`).
+- *Ring-only tail* (fused decode): `blocks` freeze at the prefill prefix while
+  the ring carries the decode tail, so `blocks` trail `shape[2]`. The blocks are
+  rebuilt from the ring on demand — `synced_rotor_k_blocks` reconciles them at
+  every consumer boundary (`dequant`, and the SSD-spill / prompt-cache clone
+  `try_deep_clone`).
+
+`truncate_to` **keeps** the ring (it does not `clear()`): it lowers `shape[2]`
+to `n` and leaves the ring's `[n, prev)` capacity to be overwritten by the next
+append, exactly like the flat GPU-buffer codecs (`QuantK` / K8V4 just lower
+`shape[2]`). This preserves a ring-only decode tail up to `n` across the
+speculative-decode partial-accept rollback; clearing it there would discard the
+tail (the only copy of `[frozen_prefix, n)`) and abort the next `dequant`. Both
+mutators reconcile: the block-path append (`materialize_*_ring_tail`)
+materialises any pre-existing ring-only tail into `blocks` before pushing, so
+`blocks` stay a contiguous prefix.
+
+The forbidden state is `blocks` short of `shape[2]` with **no** ring to supply
+the tail: `dequant()` would zero-pad the gap (silently wrong attention) and an
+SSD spill would persist a truncated store. That state is rejected **loudly**
+(an `Error`, never a `debug_assert` — those compile out under `release-perf`):
+`synced_rotor_k_blocks` at the codec and `ensure_rotor_k_blocks_cover_shape` at
+the SSD serialization boundary both refuse it rather than fabricate zeros.
 
 **`b > 1` skips.** The ring's per-step stride is `kv_h * n_groups` and does not
 interleave batch, so a batched chunk cannot be laid into it (the encode carries
-`b` × the span). That degrades to the CPU dequant path, which handles `b > 1`
-correctly — it must not error, since a batched rotor cache worked before this
-kernel existed. Both the append (`rotor{3,4}_sync_ring`) and the dispatcher
-(`rotor_flash_shape_ok`) gate on it.
+`b` × the span). A `MaintainRingOnly` feed with `b > 1` therefore falls back to
+the block path (which handles `b > 1` correctly and keeps the CPU blocks the
+source of truth) — it must not error, since a batched rotor cache worked before
+this kernel existed. Per request the batch dim is fixed, so a `b > 1` cache
+never builds a ring-only tail to lose. Both the append (`rotor{3,4}_sync_ring`)
+and the dispatcher (`rotor_flash_shape_ok`) gate on it.
 
 ### Arch reachability
 
