@@ -226,10 +226,10 @@ fn rotor_k_only_decode_dispatches_at_head_dim_256() {
 /// (which handle `b > 1`) would have served it fine.
 ///
 /// Drives the ring-maintaining entry point **directly** rather than through
-/// `update_and_sdpa`: the legacy `update_rotor_k_only_*` gates its GPU encode on
-/// the global `rotor_qjl_enabled()` env (default on), so a store-seeded
-/// end-to-end test would silently take the CPU append and never reach this
-/// guard — i.e. pass vacuously.
+/// `update_and_sdpa`: the fused SDPA dispatcher carries its own `b == 1` gate
+/// that keeps the flash kernel away from a batched chunk, so an end-to-end call
+/// would never reach the ring-feed skip this test exercises. Feeding the `b > 1`
+/// chunk straight to the append entry point puts it directly on the skip path.
 fn batched_ring_feed_is_skipped(quant: KvQuant, bits_label: &str) {
     let device = Device::Gpu;
     let (b, kv_h, head_dim, new_seq) = (2_i32, 2_i32, 128_i32, 4_i32);

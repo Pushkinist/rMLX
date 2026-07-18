@@ -40,8 +40,10 @@ fn rotor_k3_qjl_sideband_captured() {
     let _guard = crate::test_utils::ROTOR_QJL_ENV_LOCK
         .lock()
         .expect("env lock poisoned");
+    // QJL is off by default; this test exercises the sideband-capture path, so
+    // enable it explicitly.
     // SAFETY: ROTOR_QJL_ENV_LOCK held — no concurrent env reader/writer in this binary.
-    unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
+    unsafe { std::env::set_var("RMLX_ROTOR_QJL", "1") };
     let head_dim = 128;
     let n_rows = 16;
     let data = lcg_data(n_rows * head_dim, TEST_SEED);
@@ -49,7 +51,7 @@ fn rotor_k3_qjl_sideband_captured() {
 
     let mut qk = QuantRotorK3::new(vec![1, 1, 0, head_dim as i32], 0);
     qk.append(&data, &new_shape).unwrap();
-    assert!(qk.use_qjl(), "QJL must be ON by default");
+    assert!(qk.use_qjl(), "QJL must be ON when explicitly enabled");
 
     let blk = &qk.blocks[0];
     assert_eq!(
@@ -58,6 +60,9 @@ fn rotor_k3_qjl_sideband_captured() {
         "QJL byte count per token = ceil(head_dim/8) = ceil(128/8) = 16"
     );
     assert_eq!(blk.qjl_norms.len(), n_rows, "one qjl_norm per token");
+
+    // SAFETY: ROTOR_QJL_ENV_LOCK held.
+    unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
 }
 
 /// When the env disables QJL, no sideband bytes are emitted.
@@ -90,8 +95,9 @@ fn rotor_k4_qjl_sideband_captured() {
     let _guard = crate::test_utils::ROTOR_QJL_ENV_LOCK
         .lock()
         .expect("env lock poisoned");
+    // QJL is off by default; enable it explicitly for this sideband test.
     // SAFETY: ROTOR_QJL_ENV_LOCK held — no concurrent env reader/writer in this binary.
-    unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
+    unsafe { std::env::set_var("RMLX_ROTOR_QJL", "1") };
     let head_dim = 128;
     let n_rows = 8;
     let data = lcg_data(n_rows * head_dim, TEST_SEED);
@@ -104,4 +110,7 @@ fn rotor_k4_qjl_sideband_captured() {
     let blk = &qk.blocks[0];
     assert_eq!(blk.qjl_codes.len(), n_rows * head_dim.div_ceil(8));
     assert_eq!(blk.qjl_norms.len(), n_rows);
+
+    // SAFETY: ROTOR_QJL_ENV_LOCK held.
+    unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
 }

@@ -4044,8 +4044,9 @@ impl KvCache {
     ///
     /// Structurally identical to [`Self::update_k8vturbo3_tcq`] — same K-side
     /// GPU-capable affine q8_0 path (same as K8V4 / K8VTurbo3), same forced-CPU
-    /// V-side (Viterbi loop is sequential; the MSL kernel ships as a future-ref
-    /// hook in `tcq_v2_msl.rs`). Only the V-side `bits` changes from 3 to 2.
+    /// V-side (the Viterbi trellis assignment is sequential and CPU-only; there
+    /// is no MSL decode kernel for it). Only the V-side `bits` changes from 3
+    /// to 2.
     #[allow(
         clippy::indexing_slicing,
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
@@ -6518,8 +6519,17 @@ impl KvCache {
         let max_seq = *max_seq;
 
         let new_shape = new_k.shape();
-        // GPU encode for K when device == GPU AND QJL is disabled.
-        let gpu_k_ok = device == Device::Gpu && !crate::rotor_qjl::rotor_qjl_enabled();
+        // GPU encode for K when device == GPU AND this store was written without
+        // QJL. The QJL decision is sticky to the store — fixed at first append —
+        // so a later process-env toggle must not reinterpret bytes already
+        // written. Read the store's own flag, the same source the sdpa fused
+        // fast path consults; fall back to the env only before the store exists,
+        // i.e. the value the store is about to be built with.
+        let store_uses_qjl = match k.as_ref() {
+            Some(ks) => ks.use_qjl(),
+            None => crate::rotor_qjl::rotor_qjl_enabled(),
+        };
+        let gpu_k_ok = device == Device::Gpu && !store_uses_qjl;
         let k_f32 = if gpu_k_ok {
             Vec::new()
         } else {
@@ -6579,7 +6589,15 @@ impl KvCache {
         let max_seq = *max_seq;
 
         let new_shape = new_k.shape();
-        let gpu_k_ok = device == Device::Gpu && !crate::rotor_qjl::rotor_qjl_enabled();
+        // See `update_rotor_k_only_3`: gate the GPU encode on the store's sticky
+        // QJL flag (fixed at first append), not the current process env, so a
+        // later toggle cannot reinterpret bytes already written. Env is the
+        // fallback only before the store exists.
+        let store_uses_qjl = match k.as_ref() {
+            Some(ks) => ks.use_qjl(),
+            None => crate::rotor_qjl::rotor_qjl_enabled(),
+        };
+        let gpu_k_ok = device == Device::Gpu && !store_uses_qjl;
         let k_f32 = if gpu_k_ok {
             Vec::new()
         } else {

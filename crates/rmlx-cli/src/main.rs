@@ -215,10 +215,13 @@ struct Cli {
     )]
     log_cap_mb: u64,
     /// Toggle the K-side 1-bit QJL residual for the rotor3_sym /
-    /// rotor4_sym / k_rotor3 / k_rotor4 codecs. Default `on` (spec mandate).
-    /// `--rotor-qjl off` disables the QJL sideband for ablation / bench.
-    /// Env fallback `RMLX_ROTOR_QJL=0` honored when this flag is absent.
-    #[arg(long, value_enum, global = true, default_value_t = RotorQjlArg::On)]
+    /// rotor4_sym / k_rotor3 / k_rotor4 codecs. Default `off`: QJL has no Metal
+    /// kernel, so turning it on forces the rotor K path onto CPU (single-digit
+    /// TPS) with no measured accuracy gain; off routes the rotor K encode
+    /// through the Metal fused-decode kernel. Pass `--rotor-qjl on` to opt into
+    /// the residual for ablation / fidelity study.
+    /// Env fallback `RMLX_ROTOR_QJL=1` honored when this flag is absent.
+    #[arg(long, value_enum, global = true, default_value_t = RotorQjlArg::Off)]
     rotor_qjl: RotorQjlArg,
     /// Route pre-softmax QK over PlanarQuant-packed K through the fused MSL
     /// kernel (`planar_fused_qk`).  Default `on`; `off` reverts to the legacy

@@ -2,9 +2,19 @@
 //! rotor K-side codecs (rotor3_sym / rotor4_sym / k_rotor3 / k_rotor4).
 //!
 //! Mirrors the [`paged_kv_enabled`](crate::paged::paged_kv_enabled) precedent:
-//! CLI > env > default. Default is **on** (`true`) per spec — the K-side
-//! residual is the load-bearing fidelity lift for the rotor K codecs, and
-//! turning it off is the explicit ablation/bench knob.
+//! CLI > env > default. Default is **off** (`false`).
+//!
+//! # Why off by default
+//!
+//! The QJL sideband has no MSL kernel, so turning it on forces the rotor K
+//! encode + dequant onto the CPU on every decode step — the GPU sits idle and
+//! the codec decodes at single-digit (often sub-1) TPS. With QJL off the rotor
+//! K path runs the Metal fused flash-decode-over-quant kernel, recovering
+//! roughly 16-70x decode and 3-4x prefill/TTFT. Measured across two
+//! architectures and a context sweep (short prompts and a long-context needle),
+//! the 1-bit residual bought no measurable accuracy — identical temp=0 output
+//! and identical needle retrieval on vs off. So the fast Metal path is the
+//! default, and QJL is the opt-in fidelity / ablation knob.
 //!
 //! # Storage cost
 //!
@@ -23,8 +33,8 @@ use std::sync::OnceLock;
 
 /// Environment variable mirror of the CLI flag.
 ///
-/// `RMLX_ROTOR_QJL=0` (or `off`, `false`) explicitly disables; any other value
-/// (or absence) leaves QJL **enabled** per spec default.
+/// `RMLX_ROTOR_QJL=1` (or `on`, `true`, `yes`) explicitly enables; any other
+/// value (or absence) leaves QJL **disabled** per the default.
 const ROTOR_QJL_ENV: &str = "RMLX_ROTOR_QJL";
 
 /// CLI-set override. Once set by `install_rotor_qjl`, takes precedence over the
@@ -44,15 +54,18 @@ pub fn install_rotor_qjl(enabled: bool) {
         return;
     }
     if enabled {
-        tracing::info!("rotor K-side QJL residual ENABLED (default; CLI --rotor-qjl=on)");
+        tracing::info!(
+            "rotor K-side QJL residual ENABLED (CLI --rotor-qjl=on) — opt-in; disables the \
+             rotor Metal fused-decode path and runs the K encode + dequant on CPU"
+        );
     } else {
-        tracing::info!("rotor K-side QJL residual DISABLED (CLI --rotor-qjl=off)");
+        tracing::info!("rotor K-side QJL residual DISABLED (default; CLI --rotor-qjl=off)");
     }
 }
 
 /// Returns `true` when the K-side QJL residual codec is enabled.
 ///
-/// Resolution order: CLI install > env var > default `true`. Not cached — the
+/// Resolution order: CLI install > env var > default `false`. Not cached — the
 /// cold-path call sites (`KvStorage::new`, `update_*_sym`, `update_rotor_k_*`)
 /// re-read on every construction so env changes after first call still propagate.
 pub fn rotor_qjl_enabled() -> bool {
@@ -62,9 +75,9 @@ pub fn rotor_qjl_enabled() -> bool {
     match std::env::var(ROTOR_QJL_ENV) {
         Ok(v) => {
             let trimmed = v.trim();
-            !matches!(trimmed, "0" | "off" | "false" | "no")
+            matches!(trimmed, "1" | "on" | "true" | "yes")
         }
-        Err(_) => true,
+        Err(_) => false,
     }
 }
 

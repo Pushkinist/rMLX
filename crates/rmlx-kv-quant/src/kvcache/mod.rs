@@ -115,6 +115,12 @@ mod rotor_flash_dispatch_tests;
 #[path = "iso_flash_dispatch_tests.rs"]
 mod iso_flash_dispatch_tests;
 
+// The rotor K-only `update()` decode path gates its GPU encode on the store's
+// sticky QJL flag, not the process-global env.
+#[cfg(test)]
+#[path = "rotor_qjl_store_gate_tests.rs"]
+mod rotor_qjl_store_gate_tests;
+
 pub use core::KvCache;
 pub use fused_qk_dispatch::fused_qk_total_dispatch_count;
 pub use shared_kv::SharedKv;

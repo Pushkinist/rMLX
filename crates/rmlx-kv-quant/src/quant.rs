@@ -671,9 +671,10 @@ impl KvQuant {
             ),
             // K-only rotor variants: NO bf16 decode-seed early-return — the rotor
             // K codec fires every decode step. `update_rotor_k_only_{3,4}` gates
-            // the GPU K encode on `device == Gpu && !rotor_qjl_enabled()`:
-            //   - QJL ON (default): K append runs on CPU → CPU hot path.
-            //   - QJL OFF (`--rotor-qjl off`): `rotor{3,4}_gpu_append_into_k_blocks`
+            // the GPU K encode on the store's sticky QJL flag (`use_qjl()`, fixed
+            // at first append), matching the sdpa fast path:
+            //   - QJL on (opt-in `--rotor-qjl on`): K append runs on CPU → CPU hot path.
+            //   - QJL off (default): `rotor{3,4}_gpu_append_into_k_blocks`
             //     dispatches the per-codec rotor MSL encode kernel → Metal hot
             //     path (hybrid: the dequant restages host-side each step, but a
             //     Metal kernel dispatches), so it is NOT a CPU-only codec.
