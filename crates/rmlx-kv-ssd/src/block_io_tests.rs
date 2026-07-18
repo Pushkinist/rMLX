@@ -2400,12 +2400,13 @@ fn roundtrip_rotor_sym_3_no_qjl() {
     unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
 }
 
-/// Rotor3Sym SSD round-trip with QJL ON (default).
+/// Rotor3Sym SSD round-trip with QJL ON (explicitly enabled — QJL is off by
+/// default).
 #[test]
 #[allow(clippy::indexing_slicing, clippy::unwrap_used)]
 fn roundtrip_rotor_sym_3_qjl() {
     let _guard = ROTOR_QJL_ENV_LOCK.lock().unwrap();
-    unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
+    unsafe { std::env::set_var("RMLX_ROTOR_QJL", "1") };
     let device = Device::Cpu;
     let shape = &[1i32, 2, 4, 128];
     let (storage, _) = build_storage(KvQuant::Rotor3Sym, shape, 0xA140_2302, device);
@@ -2417,7 +2418,7 @@ fn roundtrip_rotor_sym_3_qjl() {
     };
     assert!(
         !qjl_codes_before.is_empty(),
-        "QJL must be ON by default at build time"
+        "QJL sideband must be present at build time when explicitly enabled"
     );
     let layers = vec![storage];
     let path = tmp_path("rotor_sym_3_qjl");
@@ -2442,14 +2443,15 @@ fn roundtrip_rotor_sym_3_qjl() {
         "QJL signs must hydrate bit-identically"
     );
     assert!(use_qjl_after, "use_qjl must be ON after hydrate");
+    unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
 }
 
-/// Rotor4Sym SSD round-trip with QJL ON.
+/// Rotor4Sym SSD round-trip with QJL ON (explicitly enabled).
 #[test]
 #[allow(clippy::indexing_slicing, clippy::unwrap_used)]
 fn roundtrip_rotor_sym_4_qjl() {
     let _guard = ROTOR_QJL_ENV_LOCK.lock().unwrap();
-    unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
+    unsafe { std::env::set_var("RMLX_ROTOR_QJL", "1") };
     let device = Device::Cpu;
     let shape = &[1i32, 2, 4, 128];
     let (storage, _) = build_storage(KvQuant::Rotor4Sym, shape, 0xA140_2303, device);
@@ -2472,6 +2474,7 @@ fn roundtrip_rotor_sym_4_qjl() {
     };
     assert_eq!(k_codes_before, k_codes_after);
     assert!(use_qjl_after);
+    unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
 }
 
 /// Rotor4Sym SSD round-trip with QJL OFF.
@@ -2590,12 +2593,12 @@ fn roundtrip_rotor_k4_asym_v3_g64() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// RotorKOnly3 SSD round-trip with QJL ON.
+/// RotorKOnly3 SSD round-trip with QJL ON (explicitly enabled).
 #[test]
 #[allow(clippy::indexing_slicing, clippy::unwrap_used)]
 fn roundtrip_rotor_k_only_3_qjl() {
     let _guard = ROTOR_QJL_ENV_LOCK.lock().unwrap();
-    unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
+    unsafe { std::env::set_var("RMLX_ROTOR_QJL", "1") };
     let device = Device::Cpu;
     let shape = &[1i32, 2, 4, 128];
     let (storage, _) = build_storage(KvQuant::RotorKOnly3, shape, 0xA140_2305, device);
@@ -2613,6 +2616,7 @@ fn roundtrip_rotor_k_only_3_qjl() {
         _ => panic!("expected RotorKOnly3 after hydrate"),
     };
     assert!(use_qjl_after);
+    unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
 }
 
 /// RotorKOnly3 SSD round-trip with QJL OFF.
@@ -2642,12 +2646,12 @@ fn roundtrip_rotor_k_only_3_no_qjl() {
     unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
 }
 
-/// RotorKOnly4 SSD round-trip with QJL ON.
+/// RotorKOnly4 SSD round-trip with QJL ON (explicitly enabled).
 #[test]
 #[allow(clippy::indexing_slicing, clippy::unwrap_used)]
 fn roundtrip_rotor_k_only_4_qjl() {
     let _guard = ROTOR_QJL_ENV_LOCK.lock().unwrap();
-    unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
+    unsafe { std::env::set_var("RMLX_ROTOR_QJL", "1") };
     let device = Device::Cpu;
     let shape = &[1i32, 2, 4, 128];
     let (storage, _) = build_storage(KvQuant::RotorKOnly4, shape, 0xA140_2307, device);
@@ -2665,6 +2669,7 @@ fn roundtrip_rotor_k_only_4_qjl() {
         _ => panic!("expected RotorKOnly4 after hydrate"),
     };
     assert!(use_qjl_after);
+    unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
 }
 
 /// RotorKOnly4 SSD round-trip with QJL OFF.
