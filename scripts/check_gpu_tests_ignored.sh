@@ -32,13 +32,34 @@
 #   the ignore *reason* text, which varies across the tree and would make the
 #   gate green while the class stayed live.
 #
-# KNOWN LIMITATION (file-local fixed point)
-#   The reachability fixed point runs per file. A `#[test]` that reaches Metal
-#   ONLY through a helper defined in another file (e.g. a `tests/common/mod.rs`
-#   `run_golden_test`) is not seen. Those helpers' callers are `#[ignore]`d
-#   today, so nothing is un-caught now, but a new un-ignored cross-file caller
-#   would slip through. Closing this needs a whole-tree (not per-file) pass and
-#   is tracked as a separate follow-up.
+# REACHABILITY IS WHOLE-CRATE, NOT PER-FILE
+#   The fn call-graph is built across ALL of a crate's scanned files together
+#   (not one file at a time). A `#[test]` that reaches Metal ONLY through a
+#   helper defined in a DIFFERENT scanned file — the canonical case being a
+#   `tests/common/mod.rs` helper such as `run_golden_test` that binds
+#   `let device = Device::Gpu;` and is called as `common::run_golden_test(..)`
+#   from each `tests/<arch>_golden_tokens.rs` binary — is now seen. Call
+#   resolution is collision-safe (two files may define same-named helpers):
+#     * an UNqualified call `helper(..)` binds to a same-file definition only;
+#     * a QUALIFIED call `module::helper(..)` binds to a helper defined in the
+#       file whose module name is `module` (the directory name for a `mod.rs`,
+#       otherwise the file stem).
+#   So a CPU-only `helper()` in file A is never tainted by a same-named GPU
+#   `helper()` in unrelated file B — the unqualified call binds to A's own.
+#
+# RESIDUAL (documented honestly — the gate narrows the blind spot, it does not
+# claim to erase every path):
+#   * A helper defined in a NON-scanned regular source file (e.g.
+#     `crates/rmlx-models/src/paroquant_msl.rs`) reached from its sibling
+#     `*_tests.rs` via `use super::*` is not traced — only the crate's SCANNED
+#     test roots are in the graph. (The present instance, `kernel_rpt1()`,
+#     builds a `MetalKernel` and never names `Device::Gpu`, so no gate shape
+#     matches it regardless of reachability.)
+#   * An UNqualified cross-file call resolved through a glob import
+#     (`use module::*; helper()`) is not traced across files — cross-file
+#     binding requires the `module::` qualifier. This is the price of
+#     collision-safety and it fails toward MISSING a path, never toward a
+#     false positive.
 #
 # THE FIX FOR A VIOLATION — pick the one that is true:
 #   * The test really drives the GPU -> add the attribute:
@@ -51,7 +72,9 @@
 # Also emits a non-fatal WARNING for the converse — a test whose `#[ignore]`
 # claims a Metal context but which never reaches `Device::Gpu`. That is a test
 # that has silently stopped running. It is a warning, not a failure: some
-# ignores are legitimately non-GPU (e.g. "requires mlx runtime").
+# ignores are legitimately non-GPU (e.g. "requires mlx runtime"), and a helper
+# in a non-scanned source file (see RESIDUAL) is a legitimate reason a
+# Metal-driving test looks GPU-free to this gate.
 #
 # PER-TEST EXEMPTION (device-as-value false positives)
 #   Detection is by shape: naming `Device::Gpu`. In compute crates that always
@@ -136,11 +159,182 @@ if [ "${#members[@]}" -lt "${disk_crates}" ]; then
     exit 1
 fi
 
+# The awk detector, shared across every crate's scan. Reads all of a crate's
+# scanned files in one pass (FILENAME distinguishes them) and builds a
+# whole-crate fn call-graph, so a cross-file helper is reachable. Emits
+# `V  <file>: <fn>` for a violation and `W  <file>: <fn>` for the converse
+# warning. Kept in a variable so the per-crate loop invokes one identical
+# program over each crate's file list.
+read -r -d '' AWK_DETECT <<'AWK' || true
+    # New file: reset the per-file parse state and derive this file's module
+    # name (directory name for a mod.rs, otherwise the file stem). The module
+    # name is how a QUALIFIED cross-file call `module::helper(..)` binds.
+    FNR == 1 {
+        in_attr = 0; attrs = ""; in_fn = 0; curid = 0; close_marker = ""
+        nseg = split(FILENAME, seg, "/")
+        base = seg[nseg]
+        if (base == "mod.rs" && nseg >= 2) {
+            curmod = seg[nseg - 1]
+        } else {
+            curmod = base
+            sub(/\.rs$/, "", curmod)
+        }
+    }
+
+    # ── Multi-line attribute continuation ────────────────────────────────
+    in_attr {
+        attrs = attrs " " $0
+        if ($0 ~ /^[[:space:]]*\)\]/) { in_attr = 0 }
+        next
+    }
+    # ── Attribute (any indent) ──────────────────────────────────────────
+    /^[[:space:]]*#\[/ {
+        attrs = attrs " " $0
+        if ($0 !~ /\][[:space:]]*$/) { in_attr = 1 }
+        next
+    }
+    # ── Per-test exemption marker (line-leading, in the attr block) ─────
+    # Folds into the pending attribute block so it attaches to the NEXT fn
+    # only. Guarded by !in_fn so a copy inside a body cannot exempt.
+    !in_fn && /^[[:space:]]*\/\/[[:space:]]*gpu-test-gate:[[:space:]]*exempt([[:space:]]|$)/ {
+        attrs = attrs " GATE_EXEMPT"
+        next
+    }
+    # ── Comments / doc comments keep the pending attribute block ────────
+    /^[[:space:]]*\/\// { next }
+
+    # ── Module-scope `const NAME: Device = Device::Gpu;` ────────────────
+    # A test that uses NAME (rather than the Device::Gpu literal) is still
+    # GPU-touching; record the alias, scoped to THIS file, so a same-named
+    # const in another file does not leak across the crate.
+    !in_fn && /^[[:space:]]*const[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:[[:space:]]*Device[[:space:]]*=[[:space:]]*Device::Gpu/ {
+        cname = $0
+        sub(/^[[:space:]]*const[[:space:]]+/, "", cname)
+        sub(/[^A-Za-z0-9_].*$/, "", cname)
+        gpu_const[FILENAME SUBSEP cname] = 1
+        attrs = ""
+        next
+    }
+
+    # ── fn item at any indent (top-level or inside an inherent impl) ────
+    !in_fn && /^[[:space:]]*(pub[^ ]* )?(async )?fn [a-zA-Z0-9_]+/ {
+        line = $0
+        indent = line
+        sub(/[^[:space:]].*$/, "", indent)   # leading whitespace only
+        name = line
+        sub(/^[[:space:]]*(pub[^ ]* )?(async )?fn /, "", name)
+        sub(/[^a-zA-Z0-9_].*$/, "", name)
+        G++
+        order[++ord_n] = G
+        name_of[G] = name
+        file_of[G] = FILENAME
+        mod_of[G] = curmod
+        attrs_of[G] = attrs
+        body_of[G] = line
+        curid = G
+        in_fn = 1
+        close_marker = indent "}"
+        attrs = ""
+        next
+    }
+    # ── Close of the captured fn: `}` at the fn keyword indent ──────────
+    in_fn && $0 == close_marker {
+        in_fn = 0
+        curid = 0
+        attrs = ""
+        next
+    }
+    # Body lines, with line comments stripped: prose that names a GPU
+    # helper or Device::Gpu must not make the fn look GPU-touching.
+    in_fn {
+        line = $0
+        sub(/\/\/.*$/, "", line)
+        body_of[curid] = body_of[curid] " " line
+        next
+    }
+    # Any other line drops a dangling attribute block.
+    /^[[:space:]]*[^[:space:]]/ { attrs = "" }
+
+    END {
+        # ── Seed: fns naming Device::Gpu (literal) or a file-scoped
+        #    `const … = Device::Gpu` alias in their own body. Seeds feed a
+        #    worklist; the GPU set is small, so we pop each GPU fn once and
+        #    taint its callers rather than sweep every pair every round.
+        qh = 0; qt = 0
+        for (g = 1; g <= G; g++) {
+            b = body_of[g]
+            isg = (b ~ /Device::Gpu/) ? 1 : 0
+            if (!isg) {
+                f = file_of[g]
+                for (key in gpu_const) {
+                    si = index(key, SUBSEP)
+                    kf = substr(key, 1, si - 1)
+                    kc = substr(key, si + 1)
+                    if (kf == f && b ~ ("(^|[^A-Za-z0-9_])" kc "([^A-Za-z0-9_]|$)")) {
+                        isg = 1
+                        break
+                    }
+                }
+            }
+            if (isg) { gpu[g] = 1; queue[++qt] = g }
+        }
+
+        # ── Fixed point via worklist. Pop a GPU fn h; any not-yet-GPU fn
+        #    that CALLS h becomes GPU. Resolution is collision-safe:
+        #      * same file  -> unqualified/method call `h(` (any qualifier
+        #        char admitted, as a file has no two free fns of one name);
+        #      * other file -> QUALIFIED call `mod_of[h] :: h (`.
+        #    A cheap index() substring prune avoids compiling the anchored
+        #    regex for the vast majority of (caller, callee) pairs.
+        while (qh < qt) {
+            h = queue[++qh]
+            nm = name_of[h]
+            hf = file_of[h]
+            hq = mod_of[h]
+            same_re = "(^|[^a-zA-Z0-9_])" nm "([[:space:]]*::[[:space:]]*<[^;{]*>)?[[:space:]]*\\("
+            qual_re = "(^|[^A-Za-z0-9_])" hq "[[:space:]]*::[[:space:]]*" nm "([[:space:]]*::[[:space:]]*<[^;{]*>)?[[:space:]]*\\("
+            for (c = 1; c <= G; c++) {
+                if (gpu[c]) { continue }
+                if (index(body_of[c], nm) == 0) { continue }
+                matched = 0
+                if (file_of[c] == hf) {
+                    if (body_of[c] ~ same_re) { matched = 1 }
+                }
+                if (!matched && body_of[c] ~ qual_re) { matched = 1 }
+                if (matched) {
+                    gpu[c] = 1
+                    queue[++qt] = c
+                }
+            }
+        }
+
+        # ── Report, in source order across the crate's files ────────────
+        for (i = 1; i <= ord_n; i++) {
+            g = order[i]
+            if (attrs_of[g] !~ /#\[test\]/) { continue }
+            has_ignore = (attrs_of[g] ~ /#\[ignore/)
+            exempt = (attrs_of[g] ~ /GATE_EXEMPT/)
+            if (gpu[g] && !has_ignore && !exempt) {
+                printf "V  %s: %s\n", file_of[g], name_of[g]
+            }
+            # Converse: an ignore claiming a Metal context on a test that
+            # never reaches one. Warn — the test may have stopped running
+            # (or reaches Metal only via a non-scanned source-file helper).
+            if (!gpu[g] && has_ignore && attrs_of[g] ~ /#\[ignore[^]]*([Mm]etal|GPU)/) {
+                printf "W  %s: %s\n", file_of[g], name_of[g]
+            }
+        }
+    }
+AWK
+
 # Fail closed per member. A member listed in Cargo.toml whose dir or `src/` is
 # missing means the crate moved or was renamed — break loudly rather than let
 # the gate report OK over a narrowed scan (this workspace has extracted crates
 # before; see the dep graph in CLAUDE.md).
-scan_files=()
+total_files=0
+violations=""
+warnings=""
+
 for crate in "${members[@]}"; do
     crate_dir="${REPO_ROOT}/${crate}"
     src_dir="${crate_dir}/src"
@@ -157,151 +351,25 @@ for crate in "${members[@]}"; do
         exit 1
     fi
 
+    # Gather this crate's scanned files. Whole-crate reachability needs every
+    # scanned file of the crate in ONE awk pass, so collect them per crate.
+    crate_files=()
     # Unit tests: match both `<name>_tests.rs` and bare `tests.rs`.
-    while IFS= read -r -d '' f; do scan_files+=("$f"); done < <(
+    while IFS= read -r -d '' f; do crate_files+=("$f"); done < <(
         find "${src_dir}" \( -name "*_tests.rs" -o -name "tests.rs" \) \
             -not -path "*/target/*" -print0
     )
-    # Integration binaries (optional per crate).
+    # Integration binaries + their shared modules (optional per crate).
     if [ -d "${tests_dir}" ]; then
-        while IFS= read -r -d '' f; do scan_files+=("$f"); done < <(
+        while IFS= read -r -d '' f; do crate_files+=("$f"); done < <(
             find "${tests_dir}" -name "*.rs" -not -path "*/target/*" -print0
         )
     fi
-done
 
-if [ ${#scan_files[@]} -eq 0 ]; then
-    echo "ERROR: matched 0 test files across ${#members[@]} workspace members." >&2
-    echo "A gate that scans nothing passes everything; refusing to report OK." >&2
-    exit 1
-fi
+    [ ${#crate_files[@]} -eq 0 ] && continue
+    total_files=$((total_files + ${#crate_files[@]}))
 
-violations=""
-warnings=""
-
-for f in "${scan_files[@]}"; do
-    out=$(awk -v fname="$f" '
-        # ── Multi-line attribute continuation ────────────────────────────────
-        in_attr {
-            attrs = attrs " " $0
-            if ($0 ~ /^[[:space:]]*\)\]/) { in_attr = 0 }
-            next
-        }
-        # ── Attribute (any indent) ──────────────────────────────────────────
-        /^[[:space:]]*#\[/ {
-            attrs = attrs " " $0
-            if ($0 !~ /\][[:space:]]*$/) { in_attr = 1 }
-            next
-        }
-        # ── Per-test exemption marker (line-leading, in the attr block) ─────
-        # Folds into the pending attribute block so it attaches to the NEXT fn
-        # only. Guarded by !in_fn so a copy inside a body cannot exempt.
-        !in_fn && /^[[:space:]]*\/\/[[:space:]]*gpu-test-gate:[[:space:]]*exempt([[:space:]]|$)/ {
-            attrs = attrs " GATE_EXEMPT"
-            next
-        }
-        # ── Comments / doc comments keep the pending attribute block ────────
-        /^[[:space:]]*\/\// { next }
-
-        # ── Module-scope `const NAME: Device = Device::Gpu;` ────────────────
-        # A test that uses NAME (rather than the Device::Gpu literal) is still
-        # GPU-touching; record the alias so the seed below can see it.
-        !in_fn && /^[[:space:]]*const[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:[[:space:]]*Device[[:space:]]*=[[:space:]]*Device::Gpu/ {
-            cname = $0
-            sub(/^[[:space:]]*const[[:space:]]+/, "", cname)
-            sub(/[^A-Za-z0-9_].*$/, "", cname)
-            gpu_const[cname] = 1
-            attrs = ""
-            next
-        }
-
-        # ── fn item at any indent (top-level or inside an inherent impl) ────
-        !in_fn && /^[[:space:]]*(pub[^ ]* )?(async )?fn [a-zA-Z0-9_]+/ {
-            line = $0
-            indent = line
-            sub(/[^[:space:]].*$/, "", indent)   # leading whitespace only
-            name = line
-            sub(/^[[:space:]]*(pub[^ ]* )?(async )?fn /, "", name)
-            sub(/[^a-zA-Z0-9_].*$/, "", name)
-            order[++n] = name
-            fn_attrs[name] = attrs
-            body[name] = line
-            cur = name
-            in_fn = 1
-            close_marker = indent "}"
-            attrs = ""
-            next
-        }
-        # ── Close of the captured fn: `}` at the fn keyword indent ──────────
-        in_fn && $0 == close_marker {
-            in_fn = 0
-            cur = ""
-            attrs = ""
-            next
-        }
-        # Body lines, with line comments stripped: prose that names a GPU
-        # helper or Device::Gpu must not make the fn look GPU-touching.
-        in_fn {
-            line = $0
-            sub(/\/\/.*$/, "", line)
-            body[cur] = body[cur] " " line
-            next
-        }
-        # Any other line drops a dangling attribute block.
-        /^[[:space:]]*[^[:space:]]/ { attrs = "" }
-
-        END {
-            # Seed: fns that name Device::Gpu (literal) or a module-scope
-            # `const … = Device::Gpu` alias in their own body.
-            for (f_ in body) {
-                is_gpu = (body[f_] ~ /Device::Gpu/) ? 1 : 0
-                if (!is_gpu) {
-                    for (c in gpu_const) {
-                        if (body[f_] ~ ("(^|[^A-Za-z0-9_])" c "([^A-Za-z0-9_]|$)")) {
-                            is_gpu = 1
-                            break
-                        }
-                    }
-                }
-                gpu[f_] = is_gpu
-            }
-            # Fixed point: a fn that *calls* a GPU-reaching fn is GPU-reaching.
-            # Match a call site — `name(` or `name::<T>(` (turbofish) — not a
-            # bare mention, so a name in a doc reference or a string does not
-            # propagate. A leading `.` is admitted so method calls count.
-            changed = 1
-            while (changed) {
-                changed = 0
-                for (caller in body) {
-                    if (gpu[caller]) { continue }
-                    for (callee in body) {
-                        if (caller == callee || !gpu[callee]) { continue }
-                        if (body[caller] ~ ("(^|[^a-zA-Z0-9_])" callee \
-                                            "([[:space:]]*::[[:space:]]*<[^;{]*>)?[[:space:]]*\\(")) {
-                            gpu[caller] = 1
-                            changed = 1
-                            break
-                        }
-                    }
-                }
-            }
-            for (i = 1; i <= n; i++) {
-                f_ = order[i]
-                if (fn_attrs[f_] !~ /#\[test\]/) { continue }
-                has_ignore = (fn_attrs[f_] ~ /#\[ignore/)
-                # Per-test opt-out for a device-as-value false positive.
-                exempt = (fn_attrs[f_] ~ /GATE_EXEMPT/)
-                if (gpu[f_] && !has_ignore && !exempt) {
-                    printf "V  %s: %s\n", fname, f_
-                }
-                # Converse: an ignore claiming a Metal context on a test that
-                # never reaches one. Warn — the test has stopped running.
-                if (!gpu[f_] && has_ignore && fn_attrs[f_] ~ /#\[ignore[^]]*([Mm]etal|GPU)/) {
-                    printf "W  %s: %s\n", fname, f_
-                }
-            }
-        }
-    ' "$f")
+    out=$(awk "$AWK_DETECT" "${crate_files[@]}")
     while IFS= read -r line; do
         [ -z "$line" ] && continue
         case "$line" in
@@ -311,14 +379,21 @@ for f in "${scan_files[@]}"; do
     done <<< "$out"
 done
 
+if [ "${total_files}" -eq 0 ]; then
+    echo "ERROR: matched 0 test files across ${#members[@]} workspace members." >&2
+    echo "A gate that scans nothing passes everything; refusing to report OK." >&2
+    exit 1
+fi
+
 if [ -n "$warnings" ]; then
-    echo "WARNING (non-fatal): #[ignore] claims a Metal context but no Device::Gpu is visible in-file:" >&2
+    echo "WARNING (non-fatal): #[ignore] claims a Metal context but no Device::Gpu is reachable in the scanned roots:" >&2
     printf '%s' "$warnings" >&2
     echo "  -> If the test truly does not touch the GPU, drop the #[ignore] (and pass" >&2
     echo "     Device::Cpu) — an ignored CPU test is a test that silently stopped running." >&2
-    echo "  -> But the seed is file-local: a test reaching Metal ONLY through a helper" >&2
-    echo "     defined in another module (e.g. a kernel-builder in the parent) is a false" >&2
-    echo "     positive here and the #[ignore] is correct. Verify before removing it." >&2
+    echo "  -> But reachability covers only the crate's scanned test roots: a test that" >&2
+    echo "     reaches Metal ONLY through a helper in a non-scanned source file (e.g. a" >&2
+    echo "     kernel-builder in the parent module) is a false positive here and the" >&2
+    echo "     #[ignore] is correct. Verify before removing it." >&2
     echo >&2
 fi
 
@@ -338,4 +413,4 @@ if [ -n "$violations" ]; then
     exit 1
 fi
 
-echo "OK: every GPU-touching test carries #[ignore] (${#scan_files[@]} files across ${#members[@]} workspace members)."
+echo "OK: every GPU-touching test carries #[ignore] (${total_files} files across ${#members[@]} workspace members)."
