@@ -268,13 +268,18 @@ impl QuantRotorK4 {
         }
     }
 
-    /// Truncate the accumulated sequence to `n` tokens.
+    /// Truncate the accumulated sequence to `n` positions.
+    ///
+    /// See [`QuantRotorK3::truncate_to`] — the GPU ring is kept (not cleared) so
+    /// a ring-only decode tail up to `n` survives, matching the flat GPU-buffer
+    /// codecs' truncate semantics.
     #[allow(
         clippy::indexing_slicing,
         reason = "shape.len() >= 4 checked immediately before indexing shape[2]"
     )]
     pub fn truncate_to(&mut self, n: i32) {
-        let n_usize = n.max(0) as usize;
+        let n = n.max(0);
+        let n_usize = n as usize;
         let mut acc: usize = 0;
         let mut keep = 0usize;
         for (i, blk) in self.blocks.iter().enumerate() {
@@ -286,9 +291,7 @@ impl QuantRotorK4 {
             }
         }
         self.blocks.truncate(keep);
-        // The ring's filled prefix no longer matches `blocks`; drop it rather
-        // than leave a longer-than-truncated prefix live.
-        self.gpu.clear();
+        // NB: no `self.gpu.clear()` — the ring holds the ring-only decode tail.
         if self.shape.len() >= 4 {
             self.shape[2] = n;
         }

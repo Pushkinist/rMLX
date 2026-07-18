@@ -775,6 +775,7 @@ fn rotor3_gpu_append_into_k_blocks(
     // is a `b > 1` chunk — normalise it to Maintain so the shared ring feeder
     // clears the ring for the un-representable batch and the CPU block carries
     // the data.
+    materialize_rotor_k3_ring_tail(ks, device)?;
     let block_feed = if feed == RingFeed::Skip {
         RingFeed::Skip
     } else {
@@ -788,6 +789,54 @@ fn rotor3_gpu_append_into_k_blocks(
     )?;
     rotor3_sync_ring(ks, &gpu, block_feed, new_shape, head_dim, max_seq, device)?;
     push_rotor3_k_block(ks, block, new_shape);
+    Ok(())
+}
+
+/// Reconcile a pre-existing ring-only decode tail into `ks.blocks` before a
+/// block-path append, so `blocks` stay a contiguous prefix after the push.
+///
+/// Both rotor-K mutators must reconcile the ring: `truncate_to` keeps the ring
+/// (the tail lives there), and this block-path append materialises the tail
+/// into `blocks` so a later push does not leave a non-contiguous
+/// prefix-then-gap-then-tail. No-op when `blocks` already cover `shape[2]` (the
+/// common prefill / asym case — reads no GPU). Not reachable today (batch dim is
+/// fixed per request, so a fused→multi-token-append transition does not occur),
+/// but closing it keeps the "blocks are always a contiguous prefix" invariant
+/// true at every mutator.
+fn materialize_rotor_k3_ring_tail(
+    ks: &mut crate::storage::QuantRotorK3,
+    device: Device,
+) -> Result<()> {
+    if !ks.gpu.is_allocated() {
+        return Ok(());
+    }
+    let rebuilt =
+        match crate::storage::synced_rotor_k_blocks(&ks.blocks, &ks.shape, &ks.gpu, device)? {
+            std::borrow::Cow::Owned(full) => Some(full),
+            std::borrow::Cow::Borrowed(_) => None,
+        };
+    if let Some(full) = rebuilt {
+        ks.blocks = full;
+    }
+    Ok(())
+}
+
+/// Mirror of [`materialize_rotor_k3_ring_tail`] for [`crate::storage::QuantRotorK4`].
+fn materialize_rotor_k4_ring_tail(
+    ks: &mut crate::storage::QuantRotorK4,
+    device: Device,
+) -> Result<()> {
+    if !ks.gpu.is_allocated() {
+        return Ok(());
+    }
+    let rebuilt =
+        match crate::storage::synced_rotor_k_blocks(&ks.blocks, &ks.shape, &ks.gpu, device)? {
+            std::borrow::Cow::Owned(full) => Some(full),
+            std::borrow::Cow::Borrowed(_) => None,
+        };
+    if let Some(full) = rebuilt {
+        ks.blocks = full;
+    }
     Ok(())
 }
 
@@ -825,6 +874,7 @@ fn rotor4_gpu_append_into_k_blocks(
     }
     // Block path — see [`rotor3_gpu_append_into_k_blocks`] (b>1 ring-only
     // fallback normalises to Maintain).
+    materialize_rotor_k4_ring_tail(ks, device)?;
     let block_feed = if feed == RingFeed::Skip {
         RingFeed::Skip
     } else {

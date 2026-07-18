@@ -371,13 +371,25 @@ impl QuantRotorK3 {
         }
     }
 
-    /// Truncate the accumulated sequence to `n` tokens.
+    /// Truncate the accumulated sequence to `n` positions.
+    ///
+    /// The GPU ring is **kept**, not cleared: this mirrors how the flat GPU-buffer
+    /// codecs truncate (`QuantK` / K8V4 etc. just lower `shape[2]` and overwrite
+    /// on the next append). Lowering `shape[2]` to `n` makes the ring's logical
+    /// fill `n`; the stale `[n, prev)` capacity is overwritten by the next append
+    /// and never read (`packed_view` always slices to `shape[2]`). This preserves
+    /// any ring-only decode tail up to `n`, so `dequant` / an SSD spill can still
+    /// rebuild it. Clearing the ring here — the previous behaviour — discarded
+    /// the tail (the only copy of `[frozen_prefix, n)`), leaving `blocks` short
+    /// of `shape[2]` with no ring: the divergent state the codec rejects loudly,
+    /// which would abort generation on the speculative-decode rollback path.
     #[allow(
         clippy::indexing_slicing,
         reason = "shape.len() >= 4 checked immediately before indexing shape[2]"
     )]
     pub fn truncate_to(&mut self, n: i32) {
-        let n_usize = n.max(0) as usize;
+        let n = n.max(0);
+        let n_usize = n as usize;
         let mut acc: usize = 0;
         let mut keep = 0usize;
         for (i, blk) in self.blocks.iter().enumerate() {
@@ -389,9 +401,8 @@ impl QuantRotorK3 {
             }
         }
         self.blocks.truncate(keep);
-        // The ring's filled prefix no longer matches `blocks`; drop it rather
-        // than leave a longer-than-truncated prefix live.
-        self.gpu.clear();
+        // NB: no `self.gpu.clear()` — the ring is the source of truth for a
+        // ring-only decode tail; see the doc comment above.
         if self.shape.len() >= 4 {
             self.shape[2] = n;
         }

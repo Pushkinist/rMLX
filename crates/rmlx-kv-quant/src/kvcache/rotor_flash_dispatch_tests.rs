@@ -479,3 +479,136 @@ fn rotor_k_only_4_ring_only_tail_dequant_is_full_prefix() {
     }
     ring_only_tail_dequant_is_full_prefix(KvQuant::RotorKOnly4);
 }
+
+/// Truncating a LIVE rotor-K-only cache mid single-token fused decode (the
+/// speculative-decode partial-accept rollback) must NOT discard the ring-only
+/// tail: a subsequent decode step + `dequant` succeed with the correct full
+/// prefix, not an abort or a zero-padded gap.
+///
+/// After prefill + `steps` fused decode steps the store carries a ring-only
+/// tail. `truncate_to(prefill + keep)` rolls back the rejected tail; the GPU
+/// ring is kept (mirroring the flat GPU-buffer codecs), so the kept prefix
+/// `[0, prefill + keep)` survives in the ring. One more decode step then
+/// overwrites position `prefill + keep`, and `dequant` returns the full
+/// `prefill + keep + 1` prefix — byte/cosine-exact vs a CPU re-encode of the
+/// surviving tokens.
+///
+/// Mutation check: re-introduce `self.gpu.clear()` in `QuantRotorK{3,4}::
+/// truncate_to`. The ring (the only copy of the tail) is then dropped; the next
+/// fused append `seed_from_cpu`s the frozen prefill blocks against the larger
+/// `shape[2]` and errors (length mismatch), so `.expect("decode after
+/// truncate")` panics — RED.
+#[allow(clippy::expect_used, reason = "test: invariants documented")]
+fn ring_only_tail_truncate_then_decode(quant: KvQuant) {
+    let device = Device::Gpu;
+    let (kv_h, n_q_heads, head_dim, prefill, steps, keep) =
+        (2_i32, 8_i32, 128_i32, 6_i32, 5_i32, 2_i32);
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    let pf_n = (prefill * kv_h * head_dim) as usize;
+    let k_prefill = lcg_data(pf_n, 101);
+    let step_ks: Vec<Vec<f32>> = (0..steps)
+        .map(|s| lcg_data((kv_h * head_dim) as usize, 201 + s as u64))
+        .collect();
+    let k_new = lcg_data((kv_h * head_dim) as usize, 999);
+
+    let mut cache = seeded_cache(quant, kv_h, head_dim, false);
+    let k = f32_array(&k_prefill, &[1, kv_h, prefill, head_dim]);
+    let v = f32_array(&lcg_data(pf_n, 102), &[1, kv_h, prefill, head_dim]);
+    let q = f32_array(
+        &lcg_data((prefill * n_q_heads * head_dim) as usize, 103),
+        &[1, n_q_heads, prefill, head_dim],
+    );
+    cache
+        .update_and_sdpa(&q, &k, &v, scale, "causal", None, device)
+        .expect("prefill update_and_sdpa");
+    cache.exit_prefill(device).expect("exit_prefill");
+    for (i, ks_step) in step_ks.iter().enumerate() {
+        let k1 = f32_array(ks_step, &[1, kv_h, 1, head_dim]);
+        let v1 = f32_array(
+            &lcg_data((kv_h * head_dim) as usize, 301 + i as u64),
+            &[1, kv_h, 1, head_dim],
+        );
+        let q1 = f32_array(
+            &lcg_data((n_q_heads * head_dim) as usize, 401 + i as u64),
+            &[1, n_q_heads, 1, head_dim],
+        );
+        cache
+            .update_and_sdpa(&q1, &k1, &v1, scale, "", None, device)
+            .expect("decode update_and_sdpa")
+            .eval()
+            .expect("decode out eval");
+    }
+
+    // Roll back to prefill + keep (partial-accept), then decode one more token.
+    let m = prefill + keep;
+    cache.truncate_to(m);
+    assert_eq!(
+        cache.offset(),
+        m,
+        "offset must roll back to the truncate target"
+    );
+    {
+        let k1 = f32_array(&k_new, &[1, kv_h, 1, head_dim]);
+        let v1 = f32_array(
+            &lcg_data((kv_h * head_dim) as usize, 777),
+            &[1, kv_h, 1, head_dim],
+        );
+        let q1 = f32_array(
+            &lcg_data((n_q_heads * head_dim) as usize, 888),
+            &[1, n_q_heads, 1, head_dim],
+        );
+        cache
+            .update_and_sdpa(&q1, &k1, &v1, scale, "", None, device)
+            .expect("decode after truncate")
+            .eval()
+            .expect("post-truncate decode eval");
+    }
+
+    let (dq, shape, _blocks_tokens, ring_live) = rotor_k_store_probe(&cache);
+    assert!(
+        ring_live,
+        "ring must stay live across truncate (kept, not cleared)"
+    );
+    let final_seq = m + 1;
+    assert_eq!(
+        shape.get(2).copied().unwrap_or(0),
+        final_seq,
+        "shape[2] must be prefill+keep+1 after the post-truncate decode"
+    );
+    assert_eq!(
+        dq.len(),
+        (kv_h * final_seq * head_dim) as usize,
+        "dequant must cover the full post-truncate prefix (no abort, no zero-pad)"
+    );
+
+    // Reference: prefill + the kept decode tokens + the new token.
+    let mut surviving: Vec<Vec<f32>> = step_ks[..keep as usize].to_vec();
+    surviving.push(k_new);
+    let ref_dq = cpu_reference_dequant(quant, kv_h, head_dim, &k_prefill, &surviving, prefill);
+    assert_eq!(ref_dq.len(), dq.len(), "reference length mismatch");
+    let cos = mean_cosine(&dq, &ref_dq);
+    assert!(
+        cos > 0.99,
+        "post-truncate dequant vs CPU reference cosine {cos} too low — the ring-only \
+         tail was discarded (rejected/zeroed tokens) instead of the kept prefix"
+    );
+}
+
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_dispatch -- --ignored --test-threads=1"]
+fn rotor_k_only_3_ring_only_tail_truncate_then_decode() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    ring_only_tail_truncate_then_decode(KvQuant::RotorKOnly3);
+}
+
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_dispatch -- --ignored --test-threads=1"]
+fn rotor_k_only_4_ring_only_tail_truncate_then_decode() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    ring_only_tail_truncate_then_decode(KvQuant::RotorKOnly4);
+}

@@ -2640,13 +2640,22 @@ Two regimes satisfy it:
 
 - *Blocks-authoritative* (Maintain / CPU `append` / SSD hydrate): `blocks` cover
   the full `shape[2]`; the ring, when live, mirrors them and re-seeds from
-  `blocks` (`seed_from_cpu`) after any drop (`reset()`, `truncate_to()`, a CPU
-  `append()`).
+  `blocks` (`seed_from_cpu`) after a drop (`reset()`, a CPU `append()`).
 - *Ring-only tail* (fused decode): `blocks` freeze at the prefill prefix while
   the ring carries the decode tail, so `blocks` trail `shape[2]`. The blocks are
   rebuilt from the ring on demand — `synced_rotor_k_blocks` reconciles them at
   every consumer boundary (`dequant`, and the SSD-spill / prompt-cache clone
   `try_deep_clone`).
+
+`truncate_to` **keeps** the ring (it does not `clear()`): it lowers `shape[2]`
+to `n` and leaves the ring's `[n, prev)` capacity to be overwritten by the next
+append, exactly like the flat GPU-buffer codecs (`QuantK` / K8V4 just lower
+`shape[2]`). This preserves a ring-only decode tail up to `n` across the
+speculative-decode partial-accept rollback; clearing it there would discard the
+tail (the only copy of `[frozen_prefix, n)`) and abort the next `dequant`. Both
+mutators reconcile: the block-path append (`materialize_*_ring_tail`)
+materialises any pre-existing ring-only tail into `blocks` before pushing, so
+`blocks` stay a contiguous prefix.
 
 The forbidden state is `blocks` short of `shape[2]` with **no** ring to supply
 the tail: `dequant()` would zero-pad the gap (silently wrong attention) and an
