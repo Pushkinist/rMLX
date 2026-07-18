@@ -14,8 +14,9 @@ uint bh       = threadgroup_position_in_grid.y;
 uint tid      = thread_position_in_threadgroup.x;
 
 // SIMD-group coordinates (Apple GPU: 32 lanes per simdgroup). The threadgroup
-// is exactly `head_dim` threads and head_dim is a power of two >= 128, so every
-// simdgroup is full and `n_simd = head_dim / simd_width` covers the head.
+// is exactly `head_dim` threads (power-of-two, dispatcher-enforced). The fold
+// below uses the runtime `n_simd = simdgroups_per_threadgroup`, which covers the
+// head whether or not the last simdgroup is full.
 uint simd_lane = thread_index_in_simdgroup;
 uint simd_id   = simdgroup_index_in_threadgroup;
 uint n_simd    = simdgroups_per_threadgroup;
