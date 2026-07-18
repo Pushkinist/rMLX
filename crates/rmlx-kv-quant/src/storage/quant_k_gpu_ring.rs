@@ -313,6 +313,38 @@ impl QuantKGpuRing {
         Ok(Some((codes, scales, norms)))
     }
 
+    /// Download the first `kv_seq` filled positions to CPU as flat
+    /// sequence-major `(codes, per-group scales, per-token norms)` vectors.
+    ///
+    /// The CPU form the packed K stores accumulate their `blocks` in
+    /// (`RotorKBlocks` / `IsoBlocks`) is byte-identical to this download: the
+    /// ring was fed the encode kernel's own GPU arrays, and it already stores
+    /// **per-token** norms (collapsed at feed time), so no group→token collapse
+    /// is applied here. Returns `None` when the ring is not live.
+    ///
+    /// Cold path — used to rebuild the CPU blocks on demand for a store whose
+    /// decode tail lives only in the ring (`dequant` / SSD spill), never per
+    /// decode step.
+    ///
+    /// # Errors
+    ///
+    /// Forwards [`Self::packed_view`] errors and any MLX eval / readback
+    /// failure.
+    pub fn packed_view_cpu(
+        &self,
+        kv_seq: i32,
+        device: Device,
+    ) -> Result<Option<(Vec<u32>, Vec<f32>, Vec<f32>)>> {
+        let Some((codes, scales, norms)) = self.packed_view(kv_seq, device)? else {
+            return Ok(None);
+        };
+        Ok(Some((
+            array_to_u32_vec(&codes)?,
+            array_to_f32_vec(&scales)?,
+            array_to_f32_vec(&norms)?,
+        )))
+    }
+
     fn alloc(&mut self, cap: i32, device: Device) -> Result<()> {
         let cps = self.codes_per_step;
         let nps = self.norms_per_step;
@@ -437,6 +469,32 @@ fn f32_slice_to_array(vals: &[f32]) -> Result<Array> {
     let len = i32::try_from(vals.len())
         .map_err(|_| Error::Quant("QuantKGpuRing: f32 prefix exceeds i32::MAX".into()))?;
     Array::from_bytes(bytes, &[len], Dtype::F32)
+}
+
+/// Download a flat `u32` GPU array to a `Vec<u32>`.
+#[allow(
+    clippy::expect_used,
+    reason = "chunks_exact(4) yields slices of exactly 4 bytes"
+)]
+fn array_to_u32_vec(a: &Array) -> Result<Vec<u32>> {
+    a.eval()?;
+    Ok(a.to_bytes()?
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes(b.try_into().expect("len 4 by chunks_exact contract")))
+        .collect())
+}
+
+/// Download a flat `f32` GPU array to a `Vec<f32>`.
+#[allow(
+    clippy::expect_used,
+    reason = "chunks_exact(4) yields slices of exactly 4 bytes"
+)]
+fn array_to_f32_vec(a: &Array) -> Result<Vec<f32>> {
+    a.eval()?;
+    Ok(a.to_bytes()?
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().expect("len 4 by chunks_exact contract")))
+        .collect())
 }
 
 fn slice_prefix(buf: Option<&Array>, len: i32, what: &str, device: Device) -> Result<Array> {
