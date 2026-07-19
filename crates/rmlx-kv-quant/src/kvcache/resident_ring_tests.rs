@@ -109,6 +109,22 @@ fn drive_to_ring(cache: &mut KvCache, prefill: i32) -> u64 {
     let device = Device::Gpu;
     let scale = 1.0_f32 / (HEAD_DIM as f32).sqrt();
 
+    // `enter_prefill()` is load-bearing here, not cosmetic: without it
+    // `in_prefill` stays `false` (the `from_storage` / `with_quant_max_seq`
+    // default), so the "prefill" call below does not take the raw bf16
+    // accumulator path (`update_prefill_raw`) — it falls through
+    // `update_and_sdpa`'s legacy arm straight into the per-codec decode-style
+    // updater (`update_rotor_k_only_3`), which — for RotorKOnly3, once
+    // `--rotor-qjl` defaults off — GPU-encodes and stands the ring up right
+    // there, even for a multi-token chunk. That is a real production path too
+    // (e.g. an SSD-hydrated cache fed a multi-token catch-up chunk), but it is
+    // not what this helper means by "prefill": calling `enter_prefill()`
+    // routes the chunk through the true raw-accumulator prefill path (ring
+    // stays dormant until the first single-token decode step), matching every
+    // other codec's `drive_to_ring` behaviour and restoring the precondition
+    // this test actually wants to check.
+    cache.enter_prefill();
+
     // Prefill goes through the legacy path: CPU blocks accumulate, no ring yet.
     let pf = (prefill * KV_H * HEAD_DIM) as usize;
     let k = f32_array(&lcg_data(pf, 1), &[1, KV_H, prefill, HEAD_DIM]);
