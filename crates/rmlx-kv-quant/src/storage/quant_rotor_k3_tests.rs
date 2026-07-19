@@ -316,33 +316,81 @@ fn quant_rotor_k3_reset_drops_the_gpu_ring() {
     );
 }
 
+/// `truncate_to()` must KEEP the GPU ring, not drop it.
+///
+/// The ring is the only copy of a fused-decode ring-only tail (`blocks` can
+/// trail `shape[2]` on that path — see `synced_rotor_k_blocks`), and a whole
+/// CPU block that does not wholly fit the truncated target is dropped
+/// outright rather than split. Clearing the ring here (the pre-fix behaviour)
+/// would strand the kept prefix with nothing to rebuild it from, and
+/// `dequant()` / an SSD spill would hit the "blocks short of shape[2], no
+/// ring" guard and abort instead of returning the kept tokens.
+///
+/// `kv_h = 1` keeps `RotorKBlocks::n_tokens` (`b * kv_h * seq`) directly
+/// comparable to the truncate target `n` (a raw sequence position), so which
+/// blocks `truncate_to` keeps is unambiguous here.
+///
+/// Mutation check: re-introduce `self.gpu.clear()` in `truncate_to`. The ring
+/// (the only remaining copy of the kept token, since the 2-token CPU block
+/// was dropped) is then gone, so `dequant()` hits the no-ring guard and
+/// returns `Err` instead of `Ok` — RED.
 #[test]
 #[ignore = "GPU Metal context — run in isolation: cargo test quant_rotor_k3 -- --ignored --test-threads=1"]
-fn quant_rotor_k3_truncate_to_drops_the_gpu_ring() {
+fn quant_rotor_k3_truncate_to_keeps_the_gpu_ring() {
     if crate::test_utils::skip_if_no_gpu_env() {
         return;
     }
-    let (kv_h, head_dim) = (2_i32, 6_i32);
+    let (kv_h, head_dim) = (1_i32, 6_i32);
     let mut ks = QuantRotorK3::new(vec![1, kv_h, 0, head_dim], 0);
     ks.rotors = make_rotor_table(0, 0, n_groups_for(head_dim as usize));
 
-    // Two CPU appends so `truncate_to` has block boundaries to cut on.
+    // One CPU-side append covering 2 tokens.
     let per_tok = (kv_h * head_dim) as usize;
     let d1 = lcg_data(per_tok * 2, TEST_SEED);
-    ks.append(&d1, &[1, kv_h, 2, head_dim]).expect("append 1");
-    let d2 = lcg_data(per_tok, TEST_SEED + 1);
-    ks.append(&d2, &[1, kv_h, 1, head_dim]).expect("append 2");
-    assert_eq!(ks.shape[2], 3);
+    ks.append(&d1, &[1, kv_h, 2, head_dim]).expect("append");
+    assert_eq!(ks.shape[2], 2);
 
-    // A live ring covering all 3 tokens, then truncate back to 2.
-    seed_ring_via_gpu_append(&mut ks, kv_h, head_dim, 3, RING_TEST_MAX_SEQ);
+    // A live ring covering both tokens.
+    seed_ring_via_gpu_append(&mut ks, kv_h, head_dim, 2, RING_TEST_MAX_SEQ);
     assert!(ks.gpu.is_allocated());
 
-    ks.truncate_to(2);
-    assert_eq!(ks.shape[2], 2);
+    // Truncate to seq=1, mid-block: the sole 2-token CPU block does not wholly
+    // fit the target, so it is dropped entirely rather than split — the kept
+    // token must be rebuilt from the ring, not zero-padded or errored.
+    ks.truncate_to(1);
+    assert_eq!(ks.shape[2], 1);
     assert!(
-        !ks.gpu.is_allocated(),
-        "truncate_to() must drop the ring — otherwise packed_view() would still \
-         expose the truncated token"
+        ks.blocks.is_empty(),
+        "precondition: the 2-token block doesn't wholly fit target seq=1, so it \
+         is dropped — the kept token must come from the ring"
+    );
+    assert!(
+        ks.gpu.is_allocated(),
+        "truncate_to() must KEEP the ring — it is the source of truth for a \
+         ring-only decode tail; dropping it here would strand the only copy \
+         of the kept token and abort the next dequant/spill"
+    );
+
+    // dequant() must rebuild the kept token from the ring — not error, not
+    // zero-pad — and must return the ring's actual bytes, not garbage.
+    let dq = ks
+        .dequant()
+        .expect("dequant after truncate must read the kept token from the ring");
+    let n_groups = n_groups_for(head_dim as usize);
+    let ref_codes: Vec<u32> = (0..n_groups as u32).collect();
+    let ref_scales: Vec<f32> = (0..n_groups).map(|i| i as f32).collect();
+    let ref_norms = vec![0.0_f32];
+    let reference = rotor3_decode(
+        &ref_codes,
+        &ref_scales,
+        &ref_norms,
+        &ks.rotors,
+        head_dim as usize,
+    )
+    .expect("reference decode of the seeded ring token");
+    assert_eq!(
+        dq, reference,
+        "dequant() after truncate must return the ring's actual content for the \
+         kept token, not a zero-padded/garbage buffer"
     );
 }
