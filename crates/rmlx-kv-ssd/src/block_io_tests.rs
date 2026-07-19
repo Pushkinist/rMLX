@@ -3187,6 +3187,139 @@ fn iso_sym3_probe(cache: &KvCache) -> (Vec<f32>, Vec<f32>, i32, usize, usize) {
     }
 }
 
+/// Scalar reference attention over head-major (`[1, kv_h, S, D]`) K/V, for the
+/// short-kv_seq fallback correctness check.
+#[allow(clippy::indexing_slicing, clippy::too_many_arguments)]
+fn ref_attn_head_major(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    n_q: usize,
+    kv_h: usize,
+    s: usize,
+    d: usize,
+    scale: f32,
+) -> Vec<f32> {
+    let hpk = n_q / kv_h;
+    let mut out = vec![0.0_f32; n_q * d];
+    for hq in 0..n_q {
+        let h = hq / hpk;
+        let mut scores = vec![0.0_f32; s];
+        for (si, sc) in scores.iter_mut().enumerate() {
+            let mut acc = 0.0_f32;
+            for di in 0..d {
+                acc += q[hq * d + di] * k[(h * s + si) * d + di];
+            }
+            *sc = acc * scale;
+        }
+        let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut den = 0.0_f32;
+        for sc in &mut scores {
+            *sc = (*sc - m).exp();
+            den += *sc;
+        }
+        for di in 0..d {
+            let mut acc = 0.0_f32;
+            for (si, &p) in scores.iter().enumerate() {
+                acc += p * v[(h * s + si) * d + di];
+            }
+            out[hq * d + di] = acc / den;
+        }
+    }
+    out
+}
+
+/// Short-prompt smoke (hard rule 6) for the `kv_h == 1` single-KV-head shape
+/// (Gemma4 global layers): with the fused `iso3_sym` codec live, a decode at a
+/// small `kv_seq` used to abort because MLX binds the ring's tiny norms slice in
+/// the `constant` address space, which the flash kernel's `if_decode_k_lane`
+/// rejects. The `RING_NORMS_DEVICE_MIN` gate now falls those steps back to a CPU
+/// dequant SDPA. Asserts no abort AND numerically-correct output (vs a scalar
+/// reference over the store's own dequant) for `kv_seq` 2, 3, 4, 7, 15 — all
+/// below the compile floor.
+///
+/// Mutation check: delete the `RING_NORMS_DEVICE_MIN` gate in
+/// `update_and_sdpa_iso_sym_fused` (and the consumer guard in
+/// `iso_sym_flash_over_store`) → the `kv_seq == 2` step aborts with
+/// "Unable to build metal library from source … if_decode_k_lane" (RED).
+#[test]
+#[ignore = "GPU Metal context — run: cargo test -p rmlx-kv-ssd iso_sym_short_kv_seq_kv_h1 -- --ignored --test-threads=1"]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn iso_sym_short_kv_seq_kv_h1_falls_back_correctly() {
+    let device = Device::Gpu;
+    let n_q = 8_i32;
+    let kv_h = 1_i32; // single KV head — the Gemma4 global-layer shape
+    let head_dim = 512_i32;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    for kv_seq in [2_i32, 3, 4, 7, 15] {
+        let prefill = kv_seq - 1;
+        let mut c = seeded_iso_sym3_cache(kv_h, head_dim, 512);
+        let k = arr(
+            &lcg((prefill * kv_h * head_dim) as usize, 31),
+            &[1, kv_h, prefill, head_dim],
+        );
+        let v = arr(
+            &lcg((prefill * kv_h * head_dim) as usize, 32),
+            &[1, kv_h, prefill, head_dim],
+        );
+        let q = arr(
+            &lcg((prefill * n_q * head_dim) as usize, 33),
+            &[1, n_q, prefill, head_dim],
+        );
+        c.update_and_sdpa(&q, &k, &v, scale, "causal", None, device)
+            .unwrap();
+        c.exit_prefill(device).unwrap();
+
+        let qd = lcg((n_q * head_dim) as usize, 41);
+        let q1 = arr(&qd, &[1, n_q, 1, head_dim]);
+        let k1 = arr(
+            &lcg((kv_h * head_dim) as usize, 42),
+            &[1, kv_h, 1, head_dim],
+        );
+        let v1 = arr(
+            &lcg((kv_h * head_dim) as usize, 43),
+            &[1, kv_h, 1, head_dim],
+        );
+
+        // MUST NOT abort — the gate falls back to CPU dequant SDPA.
+        let out = c
+            .update_and_sdpa(&q1, &k1, &v1, scale, "", None, device)
+            .expect("short kv_seq at kv_h==1 must not abort — the fused gate falls back to CPU");
+        let got = to_vec(&out);
+        assert_eq!(
+            got.len(),
+            (n_q * head_dim) as usize,
+            "kv_seq={kv_seq}: shape"
+        );
+        assert!(
+            got.iter().all(|x| x.is_finite()),
+            "kv_seq={kv_seq}: output must be finite"
+        );
+
+        // Correctness: scalar attention over the store's own dequant (which the
+        // fallback rebuilds from the ring). Both decode the same iso values, so
+        // the only divergence is summation order — well inside bf16 tolerance.
+        let (k_deq, v_deq, seq, _, _) = iso_sym3_probe(&c);
+        assert_eq!(seq, kv_seq, "kv_seq={kv_seq}: store length");
+        let want = ref_attn_head_major(
+            &qd,
+            &k_deq,
+            &v_deq,
+            n_q as usize,
+            kv_h as usize,
+            kv_seq as usize,
+            head_dim as usize,
+            scale,
+        );
+        let err = max_abs_err(&got, &want);
+        assert!(
+            err < 2e-3,
+            "kv_seq={kv_seq}: fallback output max_abs_err={err} exceeds bf16 tolerance"
+        );
+    }
+}
+
 /// The write path refuses to persist an iso **V** store whose CPU blocks fall
 /// short of `shape[2]` with no ring — a truncated store. Runs on CPU (no Metal).
 ///

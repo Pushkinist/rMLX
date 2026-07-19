@@ -28,6 +28,23 @@ use super::helpers::{f32_vec_to_array, storage_variant_name};
 use super::shared_kv::SharedKv;
 use super::KvCache;
 
+/// Minimum per-token norms element count (`b * kv_h * kv_seq`) for which the iso
+/// quant-V flash kernel may be dispatched.
+///
+/// The ring's per-token norms slice is handed to the kernel as an input buffer.
+/// MLX binds an input in the **`constant`** address space when its element count
+/// is small, but the shared `if_decode_k_lane` declares its norms parameter
+/// `device const float*` — an address-space mismatch that fails the MSL compile
+/// at first dispatch. The threshold was **measured** at 8 (a ring-only decode at
+/// `kv_h == 1` aborts for `kv_seq` 2–7 and succeeds from 8 on, for every
+/// `head_dim`); this floor is set above it for margin. Below it the caller falls
+/// back to the CPU dequant path — correct, and the KV at that point is tiny.
+///
+/// This is reachable on a normal short chat prompt against a single-KV-head model
+/// (Gemma4 global layers are `kv_h == 1`): a 2-token prompt reaches `kv_seq == 2`
+/// on the first decode step, well below the compile floor.
+const RING_NORMS_DEVICE_MIN: i64 = 16;
+
 impl KvCache {
     /// Mixed-precision one-shot append + quantized SDPA.
     ///
@@ -2747,6 +2764,17 @@ impl KvCache {
         ) {
             return Ok(None);
         }
+        // Short-kv_seq guard (checked BEFORE any mutation so the reject is a clean
+        // fall-through to the legacy CPU dequant path): the flash kernel's ring
+        // norms slice binds `constant` when its element count is small — see
+        // [`RING_NORMS_DEVICE_MIN`]. At `kv_h == 1` (Gemma4 global layers) this is
+        // reachable by a normal short chat prompt, so it is a hard gate.
+        let b = new_shape.first().copied().unwrap_or(0);
+        let kv_h = new_shape.get(1).copied().unwrap_or(0);
+        let kv_seq_after = self.offset + new_seq;
+        if i64::from(b) * i64::from(kv_h) * i64::from(kv_seq_after) < RING_NORMS_DEVICE_MIN {
+            return Ok(None);
+        }
 
         // Record the stream dtype before the append consumes `new_v`: this codec
         // keeps no bf16 mirror, so this is the only witness of what the model
@@ -2763,14 +2791,11 @@ impl KvCache {
         self.offset = prev_seq + new_seq;
 
         // Take `kv_seq` from the store the rings were written from, not from
-        // `self.offset` — one source of truth.
+        // `self.offset` — one source of truth. (`iso_sym_accumulated_seq` is that
+        // source and cross-checks the K and V store lengths; no `debug_assert`
+        // stands in for a KV invariant here, since it compiles out under
+        // release-perf.)
         let kv_seq = iso_sym_accumulated_seq(&self.storage)?;
-        debug_assert_eq!(
-            kv_seq, self.offset,
-            "iso_sym_fused: store seq {kv_seq} != cache offset {} — the ring write \
-             and the attention length disagree",
-            self.offset
-        );
         // Past this point the cache is already mutated (both stores appended,
         // offset advanced), so `Ok(None)` is NOT available: it would send the
         // caller into the legacy `update()` path, which appends K/V a second time.
@@ -2807,6 +2832,19 @@ impl KvCache {
                 got: storage_variant_name(&self.storage),
             });
         };
+        let store_shape = iso_sym_store_shape(&self.storage)?;
+        let b = store_shape.first().copied().unwrap_or(0);
+        let kv_h = store_shape.get(1).copied().unwrap_or(0);
+        let head_dim = store_shape.get(3).copied().unwrap_or(0);
+
+        // Short-kv_seq guard for the shared-KV **consumer** path (which cannot
+        // `Ok(None)`-fall-through like the producer): dequant both stores and run
+        // standard SDPA when the ring norms slice would bind `constant`. Same
+        // floor as the producer — see [`RING_NORMS_DEVICE_MIN`].
+        if i64::from(b) * i64::from(kv_h) * i64::from(kv_seq) < RING_NORMS_DEVICE_MIN {
+            return self.iso_sym_cpu_sdpa_fallback(queries, scale, additive_mask, device);
+        }
+
         let Some((k_view, v_view)) = self.iso_sym_packed_views(kv_seq, device)? else {
             return Err(Error::Mlx(format!(
                 "iso_sym_fused: GPU ring absent after a maintained append \
@@ -2815,11 +2853,6 @@ impl KvCache {
         };
         let (k_codes, k_scales, k_norms) = k_view;
         let (v_codes, v_scales, v_norms) = v_view;
-
-        let store_shape = iso_sym_store_shape(&self.storage)?;
-        let b = store_shape.first().copied().unwrap_or(0);
-        let kv_h = store_shape.get(1).copied().unwrap_or(0);
-        let head_dim = store_shape.get(3).copied().unwrap_or(0);
 
         let q_shape = queries.shape();
         if q_shape.len() != 4 {
@@ -2893,6 +2926,72 @@ impl KvCache {
             Ok(flash_out)
         } else {
             flash_out.astype(queries.dtype(), device)
+        }
+    }
+
+    /// CPU-dequant SDPA fallback for the iso symmetric codecs, used only when the
+    /// accumulated `kv_seq` is below [`RING_NORMS_DEVICE_MIN`] (the first few
+    /// short-prompt decode steps, where the flash kernel's ring norms slice would
+    /// bind `constant`). Dequants both stores — rebuilding any ring-only tail via
+    /// their own `dequant()` — into head-major `[B, kv_h, S, D]` f32 and runs
+    /// standard SDPA (GQA + additive mask handled by `scaled_dot_product_attention`).
+    /// The KV is tiny here, so the full-prefix dequant is cheap.
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "the wildcard arm returns Err — a new storage variant fails loudly rather than \
+                  being silently attended as another"
+    )]
+    fn iso_sym_cpu_sdpa_fallback(
+        &self,
+        queries: &Array,
+        scale: f32,
+        additive_mask: Option<&Array>,
+        device: Device,
+    ) -> Result<Array> {
+        let (k_full, k_shape, v_full, v_shape) = match &self.storage {
+            KvStorage::IsoSym3 {
+                k: Some(ks),
+                v: Some(vs),
+                ..
+            } => (
+                ks.dequant()?,
+                ks.shape.clone(),
+                vs.dequant()?,
+                vs.shape.clone(),
+            ),
+            KvStorage::IsoSym4 {
+                k: Some(ks),
+                v: Some(vs),
+                ..
+            } => (
+                ks.dequant()?,
+                ks.shape.clone(),
+                vs.dequant()?,
+                vs.shape.clone(),
+            ),
+            other => {
+                return Err(Error::KvStorageMismatch {
+                    expected: "IsoSym3 | IsoSym4 with live K and V buffers",
+                    got: storage_variant_name(other),
+                })
+            }
+        };
+        let k_arr = f32_vec_to_array(&k_full, &k_shape)?;
+        let v_arr = f32_vec_to_array(&v_full, &v_shape)?;
+        let mask_mode = if additive_mask.is_some() { "array" } else { "" };
+        let out = scaled_dot_product_attention(
+            queries,
+            &k_arr,
+            &v_arr,
+            scale,
+            mask_mode,
+            additive_mask,
+            device,
+        )?;
+        if out.dtype() == queries.dtype() {
+            Ok(out)
+        } else {
+            out.astype(queries.dtype(), device)
         }
     }
 
