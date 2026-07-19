@@ -359,16 +359,27 @@ fn estimator_matches_actual_iso_rotor_encode_bytes() {
         crate::isoquant::iso_encode_fast(&v, head_dim, 4, 3).unwrap();
     let iso_side_actual = 4 * (codes.len() + scales.len() + quats.len() + norms.len()) as u64;
 
-    // Iso3Sym quantizes BOTH sides with the iso codec and retains bf16 seeds
-    // for both (warm-TTFT): estimate = 2*(side + seed).
+    // Iso3Sym quantizes BOTH sides with the iso codec and — like Rotor3Sym —
+    // retains **no** bf16 seed on either: its decode is the quant-V flash kernel
+    // over both packed iso rings, so estimate = 2*side with no seed term. (The
+    // estimator still counts the quaternion sideband, matching the CPU encode
+    // bytes; the resident ring drops it, so real residency is below this — the
+    // estimate is a conservative upper bound, not a census.)
     let elems = seq * head_dim as u64 * kv_heads;
     let seed = elems * 2;
     let est = KvQuant::Iso3Sym.estimated_resident_bytes_per_layer(seq, head_dim as u64, kv_heads);
-    let expected = 2 * (iso_side_actual + seed);
+    let expected = 2 * iso_side_actual;
     let tol = expected / 10; // ±10%
     assert!(
         est.abs_diff(expected) <= tol,
         "Iso3Sym estimate {est} not within 10% of actual {expected}"
+    );
+    // The seedless estimate must be strictly below the seeded sibling's — the
+    // point of the fused path.
+    assert!(
+        est < 2 * (iso_side_actual + seed),
+        "Iso3Sym must not carry a bf16 mirror: {est} should be below the seeded {}",
+        2 * (iso_side_actual + seed)
     );
 
     // rotor3: per-token = n_groups*(code u32 + scale f32) + norm f32.

@@ -3146,6 +3146,282 @@ fn rotor_sym_ring_only_tail_ssd_round_trip() {
     );
 }
 
+// ── Iso symmetric ring-only-tail (sole-store) ─────────────────────────────────
+
+fn seeded_iso_sym3_cache(kv_h: i32, head_dim: i32, max_seq: i32) -> KvCache {
+    let storage = KvStorage::IsoSym3 {
+        k: Some(QuantIsoK3::from_cpu_blocks(
+            Vec::new(),
+            vec![1, kv_h, 0, head_dim],
+            max_seq,
+        )),
+        v: Some(QuantIsoV3::from_cpu_blocks(
+            Vec::new(),
+            vec![1, kv_h, 0, head_dim],
+        )),
+        max_seq,
+    };
+    KvCache::from_storage(storage, KvQuant::Iso3Sym, 0, 0)
+}
+
+/// `(k_dequant, v_dequant, shape[2], k_block_tokens, v_block_tokens)` for an
+/// iso3 symmetric cache.
+#[allow(
+    clippy::unwrap_used,
+    reason = "test helper: values established by construction"
+)]
+fn iso_sym3_probe(cache: &KvCache) -> (Vec<f32>, Vec<f32>, i32, usize, usize) {
+    match cache.storage() {
+        KvStorage::IsoSym3 {
+            k: Some(ks),
+            v: Some(vs),
+            ..
+        } => (
+            ks.dequant().unwrap(),
+            vs.dequant().unwrap(),
+            ks.shape.get(2).copied().unwrap_or(0),
+            ks.blocks.iter().map(|b| b.n_tokens).sum(),
+            vs.blocks.iter().map(|b| b.n_tokens).sum(),
+        ),
+        _ => panic!("expected a live IsoSym3 store"),
+    }
+}
+
+/// The write path refuses to persist an iso **V** store whose CPU blocks fall
+/// short of `shape[2]` with no ring — a truncated store. Runs on CPU (no Metal).
+///
+/// Mutation check: delete the `ensure_iso_blocks_cover_shape` guard in
+/// `write_quant_iso_v3` — the writer then silently serializes the short prefix
+/// and this assertion flips RED (`write` returns `Ok`).
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test: values established by construction earlier in this fn"
+)]
+fn write_rejects_truncated_iso_store() {
+    let kv_h = 2_i32;
+    let head_dim = 8_i32; // multiple of ISO_QUAT_BLOCK_SIZE (4); n_groups = 2
+    let data = lcg((kv_h * 2 * head_dim) as usize, 0x1D0);
+
+    // A real single V block covering 2 tokens.
+    let mut src = QuantIsoV3::new(vec![1, kv_h, 0, head_dim]);
+    src.append(&data, &[1, kv_h, 2, head_dim]).unwrap();
+
+    // Claim shape[2] == 4 while the blocks cover only 2 tokens and no ring
+    // exists — the ring-only tail with the ring missing. Pair with a well-formed
+    // K store so the sym layer is valid on the K side.
+    let truncated_v = QuantIsoV3::from_cpu_blocks(src.blocks.clone(), vec![1, kv_h, 4, head_dim]);
+    let mut k_src = QuantIsoK3::new(vec![1, kv_h, 0, head_dim], 64);
+    let k_data = lcg((kv_h * 4 * head_dim) as usize, 0x2E0);
+    k_src.append(&k_data, &[1, kv_h, 4, head_dim]).unwrap();
+
+    let layers = vec![KvStorage::IsoSym3 {
+        k: Some(k_src),
+        v: Some(truncated_v),
+        max_seq: 64,
+    }];
+    let path = tmp_path("iso_v_truncated");
+    let res =
+        KvBlockWriter::new(MODEL_ID, KvQuant::Iso3Sym, &layers, &[]).write(&path, Device::Cpu);
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        res.is_err(),
+        "writer must reject a truncated iso V store (short blocks, no ring), got Ok"
+    );
+}
+
+/// Full SSD spill/hydrate round-trip after a **symmetric** iso ring-only-tail
+/// decode: both K and V decode tails live only in their GPU rings, are
+/// materialised by the spill clone, and hydrate byte-exact. Also proves the V
+/// dequant-full-prefix rebuild (`synced_iso_v_blocks`) from the ring.
+///
+/// Mutation checks:
+/// * dequant skip-rebuild: make `synced_iso_v_blocks` return
+///   `Cow::Borrowed(blocks)` always — the frozen short prefix trips the loud
+///   `refusing to zero-pad` error in `dequant` (RED, not a silent zero-pad).
+/// * SSD spill: make `QuantIsoV3::try_deep_clone` clone `self.blocks` directly
+///   (drop the synced reconcile) — `write_caches` trips
+///   `ensure_iso_blocks_cover_shape` → `TruncatedStore` (RED).
+#[test]
+#[ignore = "GPU Metal context — run: cargo test -p rmlx-kv-ssd iso_sym_ring_only_tail_ssd -- --ignored --test-threads=1"]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "test: values established by construction earlier in this fn"
+)]
+fn iso_sym_ring_only_tail_ssd_round_trip() {
+    let device = Device::Gpu;
+    let (kv_h, n_q, head_dim, prefill, steps) = (2_i32, 8_i32, 128_i32, 6_i32, 5_i32);
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    let mut c = seeded_iso_sym3_cache(kv_h, head_dim, 512);
+    let k = arr(
+        &lcg((prefill * kv_h * head_dim) as usize, 61),
+        &[1, kv_h, prefill, head_dim],
+    );
+    let v = arr(
+        &lcg((prefill * kv_h * head_dim) as usize, 62),
+        &[1, kv_h, prefill, head_dim],
+    );
+    let q = arr(
+        &lcg((prefill * n_q * head_dim) as usize, 63),
+        &[1, n_q, prefill, head_dim],
+    );
+    c.update_and_sdpa(&q, &k, &v, scale, "causal", None, device)
+        .unwrap();
+    c.exit_prefill(device).unwrap();
+    for i in 0..steps {
+        let k1 = arr(
+            &lcg((kv_h * head_dim) as usize, 71 + i as u64),
+            &[1, kv_h, 1, head_dim],
+        );
+        let v1 = arr(
+            &lcg((kv_h * head_dim) as usize, 81 + i as u64),
+            &[1, kv_h, 1, head_dim],
+        );
+        let q1 = arr(
+            &lcg((n_q * head_dim) as usize, 91 + i as u64),
+            &[1, n_q, 1, head_dim],
+        );
+        c.update_and_sdpa(&q1, &k1, &v1, scale, "", None, device)
+            .unwrap()
+            .eval()
+            .unwrap();
+    }
+
+    // Ring-as-sole-store precondition on BOTH axes + live full-prefix dequant.
+    let (orig_k, orig_v, orig_seq, k_block_tokens, v_block_tokens) = iso_sym3_probe(&c);
+    assert_eq!(orig_seq, prefill + steps, "shape[2] advanced with the ring");
+    assert_eq!(
+        k_block_tokens, 0,
+        "K CPU blocks dropped — the ring is the sole resident store"
+    );
+    assert_eq!(
+        v_block_tokens, 0,
+        "V CPU blocks dropped — the ring is the sole resident store (dequant rebuilt from ring)"
+    );
+
+    // Spill clone (materialises both tails) → write → hydrate.
+    let clone = c.try_deep_clone().unwrap();
+    let path = tmp_path("iso_sym_ring_only_tail");
+    write_caches(&path, device, MODEL_ID, KvQuant::Iso3Sym, &[clone], &[])
+        .expect("write_caches must persist the full materialised sym store");
+    let (hydrated, _lin) = read_caches(&path, device, MODEL_ID, KvQuant::Iso3Sym).unwrap();
+    let _ = std::fs::remove_file(&path);
+
+    let (hy_k, hy_v, hy_seq, _, _) = iso_sym3_probe(&hydrated[0]);
+    assert_eq!(
+        hy_seq,
+        prefill + steps,
+        "hydrated sym store must carry the full decoded length"
+    );
+    assert_eq!(hy_k.len(), orig_k.len(), "hydrated K length mismatch");
+    assert_eq!(hy_v.len(), orig_v.len(), "hydrated V length mismatch");
+    assert!(
+        max_abs_err(&orig_k, &hy_k) < 1e-6,
+        "hydrated K must match the live ring-only-tail dequant byte-for-byte"
+    );
+    assert!(
+        max_abs_err(&orig_v, &hy_v) < 1e-6,
+        "hydrated V must match the live ring-only-tail dequant byte-for-byte"
+    );
+}
+
+/// `truncate_to` keeps the V ring so a ring-only decode tail survives the
+/// speculative-decode rollback: after truncating mid-fused-decode, `dequant`
+/// still rebuilds the full `[0, n)` prefix from the ring instead of aborting on
+/// a short-blocks store.
+///
+/// On the sole-store path the CPU blocks are already empty (dropped once the ring
+/// went live), so `truncate_to`'s block loop is a no-op and the pre-existing
+/// `n_tokens`-vs-`n` unit mismatch (a separate, out-of-scope bug that only bites a
+/// non-empty `kv_h > 1` block set) does not engage — the ring supplies the whole
+/// kept prefix. `kv_h == 2` here to keep the fused kernel on the same
+/// multi-head path the round-trip test exercises.
+///
+/// Mutation check: re-add `self.gpu.clear()` to `QuantIsoV3::truncate_to` — the
+/// ring is dropped, the V blocks fall short of `shape[2]` with no ring, and
+/// `dequant()` returns the loud `synced_iso_v_blocks` error (RED).
+#[test]
+#[ignore = "GPU Metal context — run: cargo test -p rmlx-kv-ssd iso_sym_truncate_keeps_ring -- --ignored --test-threads=1"]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "test: values established by construction earlier in this fn"
+)]
+fn iso_sym_truncate_keeps_ring_tail() {
+    let device = Device::Gpu;
+    let (kv_h, n_q, head_dim, prefill, steps) = (2_i32, 8_i32, 128_i32, 6_i32, 6_i32);
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    let mut c = seeded_iso_sym3_cache(kv_h, head_dim, 512);
+    let k = arr(
+        &lcg((prefill * kv_h * head_dim) as usize, 101),
+        &[1, kv_h, prefill, head_dim],
+    );
+    let v = arr(
+        &lcg((prefill * kv_h * head_dim) as usize, 102),
+        &[1, kv_h, prefill, head_dim],
+    );
+    let q = arr(
+        &lcg((prefill * n_q * head_dim) as usize, 103),
+        &[1, n_q, prefill, head_dim],
+    );
+    c.update_and_sdpa(&q, &k, &v, scale, "causal", None, device)
+        .unwrap();
+    c.exit_prefill(device).unwrap();
+    for i in 0..steps {
+        let k1 = arr(
+            &lcg((kv_h * head_dim) as usize, 111 + i as u64),
+            &[1, kv_h, 1, head_dim],
+        );
+        let v1 = arr(
+            &lcg((kv_h * head_dim) as usize, 121 + i as u64),
+            &[1, kv_h, 1, head_dim],
+        );
+        let q1 = arr(
+            &lcg((n_q * head_dim) as usize, 131 + i as u64),
+            &[1, n_q, 1, head_dim],
+        );
+        c.update_and_sdpa(&q1, &k1, &v1, scale, "", None, device)
+            .unwrap()
+            .eval()
+            .unwrap();
+    }
+
+    // Full-length dequant before truncation (the reference prefix).
+    let (_ok, orig_v, orig_seq, _, _) = iso_sym3_probe(&c);
+    assert_eq!(orig_seq, prefill + steps);
+    let per_tok = (kv_h * head_dim) as usize;
+
+    // Truncate into the ring-only tail and confirm dequant still rebuilds it.
+    let keep = prefill + steps - 3;
+    c.truncate_to(keep);
+    let (_k2, v_after, seq_after, _, _) = iso_sym3_probe(&c);
+    assert_eq!(seq_after, keep, "shape[2] lowered to the truncation point");
+    assert_eq!(
+        v_after.len(),
+        (keep as usize) * per_tok,
+        "V dequant covers the kept prefix — the ring supplied the tail, no abort"
+    );
+    // Both dequants are head-major `[1, kv_h, S, D]`, so the sequence axis is in
+    // the middle — compare per (head, seq-position) rather than a flat slice.
+    let (orig_s, hd) = ((prefill + steps) as usize, head_dim as usize);
+    let keep_s = keep as usize;
+    for h in 0..kv_h as usize {
+        for s in 0..keep_s {
+            let a = &orig_v[(h * orig_s + s) * hd..(h * orig_s + s) * hd + hd];
+            let b = &v_after[(h * keep_s + s) * hd..(h * keep_s + s) * hd + hd];
+            assert!(
+                max_abs_err(a, b) < 1e-6,
+                "kept V (head {h}, pos {s}) must match the pre-truncation dequant"
+            );
+        }
+    }
+}
+
 /// `truncate_to` keeps the V ring so a ring-only decode tail survives the
 /// speculative-decode rollback: after truncating mid-fused-decode, `dequant`
 /// still rebuilds the full `[0, n)` prefix from the ring instead of aborting on
