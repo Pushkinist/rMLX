@@ -356,6 +356,12 @@ Every code-touching change runs a regression smoke before declaring done:
 the three test-target families (Gemma4, Qwen3.6, Bonsai) **plus any model
 the change touches**, each at its best-known KV quant.
 
+- **Correctness first, on ≥2 architectures.** Any code-touching change proves
+  correct output on real models spanning ≥2 archs — minimum **gemma4-e2b**
+  (single-KV-head `kv_h == 1`, shared-KV) **+ Ternary-Bonsai-8B** (`kv_h > 1`,
+  dense). A KV/kernel fix that holds at one arch/shape can silently fail at
+  another (`kv_h == 1` vs `kv_h > 1`, power-of-two vs non-power-of-two
+  `head_dim`). Unit tests alone are not proof; serve the model.
 - Decode TPS within ±1% of the recorded best for that model at that KV mode.
 - Beat a record at any cell → update `BENCHMARK_CHAMPIONS.md` **and** the report.
 - Regress >5% → STOP and report — do not commit.
