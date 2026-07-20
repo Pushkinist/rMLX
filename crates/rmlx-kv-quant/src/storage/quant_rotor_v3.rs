@@ -263,8 +263,10 @@ impl QuantRotorV3 {
 
     /// Truncate the accumulated sequence to `n` tokens.
     ///
-    /// Drops trailing blocks until the cumulative `n_tokens` count is `<= n`
-    /// and lowers `shape[2]` to `n`. Does **not** touch the rotor table.
+    /// Drops trailing blocks until the cumulative `n_tokens` count is
+    /// `<= n * b * kv_h` (block `n_tokens` counts rows, not sequence positions —
+    /// see [`super::truncate_keep_count`]) and lowers `shape[2]` to `n`. Does
+    /// **not** touch the rotor table.
     ///
     /// The GPU ring is **kept**, not cleared — mirror of the K store's
     /// `truncate_to`. Lowering `shape[2]` to `n` makes the ring's logical fill
