@@ -112,6 +112,7 @@ use rmlx_core::error::{Error, Result};
 use rmlx_mlx::metal_kernel::{MetalKernel, MetalKernelInvoke};
 use rmlx_mlx::{Array, Device, Dtype};
 
+use crate::flash_decode_common::pad_norms_to_device_floor;
 use crate::rotor_flash_decode_msl::{
     build_rotor_flash_header, ROTOR_FLASH_HEAD_DIM_MAX, TILE_SIZE,
 };
@@ -412,6 +413,13 @@ pub fn rotor_flash_decode_symv_sdpa<const BITS: u8>(
     };
     let (k_codes, k_scales, k_norms, k_rotors) = flatten_axis(k)?;
     let (v_codes, v_scales, v_norms, v_rotors) = flatten_axis(v)?;
+
+    // GPU-native small-`norms`-buffer floor — see
+    // [`crate::flash_decode_common::pad_norms_to_device_floor`]. Same trap and
+    // fix as the iso sibling: `rf_decode_k_lane` also declares `norms`
+    // `device const float*`.
+    let k_norms = pad_norms_to_device_floor(k_norms, tok_count, device)?;
+    let v_norms = pad_norms_to_device_floor(v_norms, tok_count, device)?;
 
     // ── Mask ──────────────────────────────────────────────────────────────
     let (mask_flat, has_mask) = if let Some(m) = additive_mask {

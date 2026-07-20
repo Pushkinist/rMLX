@@ -3189,7 +3189,11 @@ fn iso_sym3_probe(cache: &KvCache) -> (Vec<f32>, Vec<f32>, i32, usize, usize) {
 
 /// Scalar reference attention over head-major (`[1, kv_h, S, D]`) K/V, for the
 /// short-kv_seq fallback correctness check.
-#[allow(clippy::indexing_slicing, clippy::too_many_arguments)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by \
+              slice length"
+)]
 fn ref_attn_head_major(
     q: &[f32],
     k: &[f32],
@@ -3231,21 +3235,32 @@ fn ref_attn_head_major(
 
 /// Short-prompt smoke (hard rule 6) for the `kv_h == 1` single-KV-head shape
 /// (Gemma4 global layers): with the fused `iso3_sym` codec live, a decode at a
-/// small `kv_seq` used to abort because MLX binds the ring's tiny norms slice in
-/// the `constant` address space, which the flash kernel's `if_decode_k_lane`
-/// rejects. The `RING_NORMS_DEVICE_MIN` gate now falls those steps back to a CPU
-/// dequant SDPA. Asserts no abort AND numerically-correct output (vs a scalar
-/// reference over the store's own dequant) for `kv_seq` 2, 3, 4, 7, 15 — all
-/// below the compile floor.
+/// small `kv_seq` used to abort because MLX binds the ring's tiny per-token
+/// `norms` slice in the `constant` address space, which the flash kernel's
+/// `if_decode_k_lane` (`device const float*`) rejects. `iso_flash_decode_symv_sdpa`
+/// now zero-pads `norms` up to its `NORMS_DEVICE_MIN` floor (16) before
+/// dispatch whenever `b*kv_h*kv_seq` is below it, so the fused GPU kernel runs at
+/// every `kv_seq >= 1` with no CPU dequant fallback (hard rule 10): the padding
+/// is allocated but never read, since the kernel's per-tile loop bound is the
+/// real `kv_seq` carried in `dims`, not the buffer length. Asserts no abort AND
+/// numerically-correct output (vs a scalar reference over the store's own
+/// dequant) for `kv_seq` 2, 3, 4, 7, 15 — all below the compile floor.
 ///
-/// Mutation check: delete the `RING_NORMS_DEVICE_MIN` gate in
-/// `update_and_sdpa_iso_sym_fused` (and the consumer guard in
-/// `iso_sym_flash_over_store`) → the `kv_seq == 2` step aborts with
-/// "Unable to build metal library from source … if_decode_k_lane" (RED).
+/// Mutation check: force `iso_flash_decode_symv_sdpa`'s norms-padding closure to
+/// skip padding (return the unpadded array unconditionally) → the `kv_seq == 2`
+/// step aborts with "Unable to build metal library from source … cannot pass
+/// pointer to address space 'constant' as a pointer to address space 'device' …
+/// if_decode_k_lane" (RED).
 #[test]
 #[ignore = "GPU Metal context — run: cargo test -p rmlx-kv-ssd iso_sym_short_kv_seq_kv_h1 -- --ignored --test-threads=1"]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
-fn iso_sym_short_kv_seq_kv_h1_falls_back_correctly() {
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "test: values established by construction; GPU dispatch failures asserted via \
+              .expect messages"
+)]
+fn iso_sym_short_kv_seq_kv_h1_stays_on_gpu() {
     let device = Device::Gpu;
     let n_q = 8_i32;
     let kv_h = 1_i32; // single KV head — the Gemma4 global-layer shape
@@ -3282,10 +3297,12 @@ fn iso_sym_short_kv_seq_kv_h1_falls_back_correctly() {
             &[1, kv_h, 1, head_dim],
         );
 
-        // MUST NOT abort — the gate falls back to CPU dequant SDPA.
+        // MUST NOT abort — the kernel dispatcher pads the small norms buffer.
         let out = c
             .update_and_sdpa(&q1, &k1, &v1, scale, "", None, device)
-            .expect("short kv_seq at kv_h==1 must not abort — the fused gate falls back to CPU");
+            .expect(
+                "short kv_seq at kv_h==1 must not abort — norms is zero-padded before dispatch",
+            );
         let got = to_vec(&out);
         assert_eq!(
             got.len(),
@@ -3297,9 +3314,10 @@ fn iso_sym_short_kv_seq_kv_h1_falls_back_correctly() {
             "kv_seq={kv_seq}: output must be finite"
         );
 
-        // Correctness: scalar attention over the store's own dequant (which the
-        // fallback rebuilds from the ring). Both decode the same iso values, so
-        // the only divergence is summation order — well inside bf16 tolerance.
+        // Correctness: scalar attention over the store's own dequant (which
+        // transparently rebuilds the ring-only tail). Both decode the same iso
+        // values, so the only divergence is summation order — well inside bf16
+        // tolerance.
         let (k_deq, v_deq, seq, _, _) = iso_sym3_probe(&c);
         assert_eq!(seq, kv_seq, "kv_seq={kv_seq}: store length");
         let want = ref_attn_head_major(
@@ -3315,9 +3333,239 @@ fn iso_sym_short_kv_seq_kv_h1_falls_back_correctly() {
         let err = max_abs_err(&got, &want);
         assert!(
             err < 2e-3,
-            "kv_seq={kv_seq}: fallback output max_abs_err={err} exceeds bf16 tolerance"
+            "kv_seq={kv_seq}: padded-dispatch output max_abs_err={err} exceeds bf16 tolerance"
         );
     }
+}
+
+/// CONTINUITY correctness across the `NORMS_DEVICE_MIN` padding floor (16): a
+/// single continuous `kv_h == 1` iso3_sym cache decoded ONE token at a time
+/// from below the floor through well above it, on the SAME cache/ring for
+/// every step, driven **in parallel** with an independent `KvStorage::None`
+/// (unquantised bf16/f32) reference cache fed the identical per-step tokens.
+/// Unlike [`iso_sym_short_kv_seq_kv_h1_stays_on_gpu`] above (which builds a
+/// **fresh** cache per `kv_seq` via a bulk prefill call, so each `kv_seq` is
+/// only ever reached once), this exercises the ring-only decode tail growing
+/// continuously through the point where `iso_flash_decode_symv_sdpa` stops
+/// padding `norms` (once `b*kv_h*kv_seq >= 16`) and starts passing it through
+/// unpadded.
+///
+/// The reference is deliberately **independent of the store under test**: an
+/// earlier version of this test compared the kernel's output against a
+/// scalar reference built from `iso_sym3_probe`'s `dequant()` — which
+/// rebuilds from the SAME ring the kernel just read. A ring corruption both
+/// reads see identically (e.g. a dropped or duplicated append) would pass
+/// that check with `err≈0`; "didn't error" is not "correct" for a silent-KV
+/// class of bug. The bf16 cache instead runs its own `update()` /
+/// `scaled_dot_product_attention` over its own independently-accumulated
+/// K/V, sharing no state with the iso ring at all, so a dropped/misordered
+/// token in the iso ring surfaces as a real divergence between the two
+/// outputs — a gross softmax shift over a materially different key set,
+/// against random per-step K/V/Q — not just quantisation noise.
+///
+/// Mutation check: same as [`iso_sym_short_kv_seq_kv_h1_stays_on_gpu`] —
+/// forcing `iso_flash_decode_symv_sdpa`'s norms-padding closure to skip
+/// padding makes the very first decode step (`kv_seq == 2`) abort before
+/// this test can reach the floor at all.
+#[test]
+#[ignore = "GPU Metal context — run: cargo test -p rmlx-kv-ssd iso_sym_transition_across_ring_norms_floor -- --ignored --test-threads=1"]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "test: values established by construction; GPU dispatch failures asserted via \
+              .expect/.unwrap_or_else messages"
+)]
+fn iso_sym_transition_across_ring_norms_floor() {
+    let device = Device::Gpu;
+    let n_q = 8_i32;
+    let kv_h = 1_i32; // single KV head — the Gemma4 global-layer shape
+    let head_dim = 512_i32;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    const FLOOR: i32 = 16; // mirrors NORMS_DEVICE_MIN in flash_decode_common.rs
+                           // 3-bit iso quant error on both K and V vs the independent bf16
+                           // reference: measured max_abs_err ~0.14 at kv_seq=2, staying under 0.2
+                           // through kv_seq=24 over this test's random LCG data. A single wrong
+                           // token's V fed to the reference (simulating a dropped/misordered token)
+                           // measured max_abs_err ~0.57 at the same kv_seq=2 — comfortably above
+                           // this floor, so genuine quant noise and a lost-token bug do not overlap.
+    const ISO_QUANT_TOL: f32 = 0.3;
+
+    let mut iso = seeded_iso_sym3_cache(kv_h, head_dim, 512);
+    let mut bf16 = KvCache::from_storage(KvStorage::None { max_seq: 512 }, KvQuant::None, 0, 0);
+
+    // Identical one-token prefill on both caches, matching a realistic short
+    // chat prompt: kv_seq == 1 before the first decode step.
+    let prefill = 1_i32;
+    let k0 = arr(
+        &lcg((prefill * kv_h * head_dim) as usize, 51),
+        &[1, kv_h, prefill, head_dim],
+    );
+    let v0 = arr(
+        &lcg((prefill * kv_h * head_dim) as usize, 52),
+        &[1, kv_h, prefill, head_dim],
+    );
+    let q0 = arr(
+        &lcg((prefill * n_q * head_dim) as usize, 53),
+        &[1, n_q, prefill, head_dim],
+    );
+    iso.update_and_sdpa(&q0, &k0, &v0, scale, "causal", None, device)
+        .unwrap();
+    iso.exit_prefill(device).unwrap();
+    bf16.update_and_sdpa(&q0, &k0, &v0, scale, "causal", None, device)
+        .unwrap();
+    bf16.exit_prefill(device).unwrap();
+
+    // Decode one token at a time, kv_seq 2..24 — well below the floor through
+    // well above it — feeding the identical tokens into both caches.
+    let mut crossed_floor = false;
+    for step in 0_i32..23 {
+        let kv_seq = 2 + step;
+        let qd = lcg((n_q * head_dim) as usize, 1_000 + step as u64);
+        let kd = lcg((kv_h * head_dim) as usize, 2_000 + step as u64);
+        let vd = lcg((kv_h * head_dim) as usize, 3_000 + step as u64);
+        let q1 = arr(&qd, &[1, n_q, 1, head_dim]);
+        let k1 = arr(&kd, &[1, kv_h, 1, head_dim]);
+        let v1 = arr(&vd, &[1, kv_h, 1, head_dim]);
+
+        let iso_out = iso
+            .update_and_sdpa(&q1, &k1, &v1, scale, "", None, device)
+            .unwrap_or_else(|e| {
+                panic!("kv_seq={kv_seq}: must not abort across the ring-norms floor: {e}")
+            });
+        let bf16_out = bf16
+            .update_and_sdpa(&q1, &k1, &v1, scale, "", None, device)
+            .expect("bf16 reference cache must not fail — plain SDPA, no custom kernel");
+
+        let got = to_vec(&iso_out);
+        let want = to_vec(&bf16_out);
+        assert!(
+            got.iter().all(|x| x.is_finite()),
+            "kv_seq={kv_seq}: output must be finite"
+        );
+
+        // Decisive check: the iso3_sym kernel's output vs the INDEPENDENT
+        // bf16 reference cache's output — two separate stores, two separate
+        // code paths, sharing no ring — so a dropped or misordered pre-floor
+        // token in the iso ring cannot pass silently.
+        let err = max_abs_err(&got, &want);
+        assert!(
+            err < ISO_QUANT_TOL,
+            "kv_seq={kv_seq}: iso3_sym vs independent bf16 reference max_abs_err={err} exceeds \
+             tolerance {ISO_QUANT_TOL} (floor={FLOOR}) — the ring's per-step append/reseed \
+             bookkeeping likely dropped or misordered a token"
+        );
+
+        if kv_seq >= FLOOR {
+            crossed_floor = true;
+        }
+    }
+    assert!(
+        crossed_floor,
+        "test did not actually reach kv_seq >= {FLOOR} — padding floor unexercised"
+    );
+}
+
+/// Rotor sibling of [`iso_sym_transition_across_ring_norms_floor`] — same
+/// independent-bf16-reference design, same `kv_h == 1` continuity coverage
+/// across [`flash_decode_common::NORMS_DEVICE_MIN`], for the `rotor3_sym`
+/// codec (`rotor_flash_decode_symv_sdpa`, `rf_decode_k_group`). Rotor's
+/// `norms` buffer hits the identical MLX small-buffer `constant`-binding trap
+/// as iso — same root cause, same [`crate::flash_decode_common`] fix.
+///
+/// Mutation check: forcing `rotor_flash_decode_symv_sdpa`'s norms-padding
+/// closure (`pad_norms_to_device_floor`) to skip padding makes the very first
+/// decode step (`kv_seq == 2`) abort with the same address-space-mismatch
+/// class of MSL error (`rf_decode_k_group`, `constant` vs `device`) before
+/// this test can reach the floor at all.
+#[test]
+#[ignore = "GPU Metal context — run: cargo test -p rmlx-kv-ssd rotor_sym_transition_across_ring_norms_floor -- --ignored --test-threads=1"]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "test: values established by construction; GPU dispatch failures asserted via \
+              .expect/.unwrap_or_else messages"
+)]
+fn rotor_sym_transition_across_ring_norms_floor() {
+    let device = Device::Gpu;
+    let n_q = 8_i32;
+    let kv_h = 1_i32; // single KV head — the Gemma4 global-layer shape
+    let head_dim = 512_i32;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    const FLOOR: i32 = 16; // mirrors NORMS_DEVICE_MIN in flash_decode_common.rs
+                           // 3-bit rotor quant error on both K and V vs the independent bf16
+                           // reference: measured max_abs_err ~0.15 at kv_seq=2, staying under 0.2
+                           // through kv_seq=24 over this test's random LCG data — same order as
+                           // ISO_QUANT_TOL above, same margin reasoning.
+    const ROTOR_QUANT_TOL: f32 = 0.3;
+
+    let mut rotor = seeded_rotor_sym3_cache(kv_h, head_dim, 512);
+    let mut bf16 = KvCache::from_storage(KvStorage::None { max_seq: 512 }, KvQuant::None, 0, 0);
+
+    let prefill = 1_i32;
+    let k0 = arr(
+        &lcg((prefill * kv_h * head_dim) as usize, 61),
+        &[1, kv_h, prefill, head_dim],
+    );
+    let v0 = arr(
+        &lcg((prefill * kv_h * head_dim) as usize, 62),
+        &[1, kv_h, prefill, head_dim],
+    );
+    let q0 = arr(
+        &lcg((prefill * n_q * head_dim) as usize, 63),
+        &[1, n_q, prefill, head_dim],
+    );
+    rotor
+        .update_and_sdpa(&q0, &k0, &v0, scale, "causal", None, device)
+        .unwrap();
+    rotor.exit_prefill(device).unwrap();
+    bf16.update_and_sdpa(&q0, &k0, &v0, scale, "causal", None, device)
+        .unwrap();
+    bf16.exit_prefill(device).unwrap();
+
+    let mut crossed_floor = false;
+    for step in 0_i32..23 {
+        let kv_seq = 2 + step;
+        let qd = lcg((n_q * head_dim) as usize, 4_000 + step as u64);
+        let kd = lcg((kv_h * head_dim) as usize, 5_000 + step as u64);
+        let vd = lcg((kv_h * head_dim) as usize, 6_000 + step as u64);
+        let q1 = arr(&qd, &[1, n_q, 1, head_dim]);
+        let k1 = arr(&kd, &[1, kv_h, 1, head_dim]);
+        let v1 = arr(&vd, &[1, kv_h, 1, head_dim]);
+
+        let rotor_out = rotor
+            .update_and_sdpa(&q1, &k1, &v1, scale, "", None, device)
+            .unwrap_or_else(|e| {
+                panic!("kv_seq={kv_seq}: must not abort across the ring-norms floor: {e}")
+            });
+        let bf16_out = bf16
+            .update_and_sdpa(&q1, &k1, &v1, scale, "", None, device)
+            .expect("bf16 reference cache must not fail — plain SDPA, no custom kernel");
+
+        let got = to_vec(&rotor_out);
+        let want = to_vec(&bf16_out);
+        assert!(
+            got.iter().all(|x| x.is_finite()),
+            "kv_seq={kv_seq}: output must be finite"
+        );
+
+        let err = max_abs_err(&got, &want);
+        assert!(
+            err < ROTOR_QUANT_TOL,
+            "kv_seq={kv_seq}: rotor3_sym vs independent bf16 reference max_abs_err={err} exceeds \
+             tolerance {ROTOR_QUANT_TOL} (floor={FLOOR}) — the ring's per-step append/reseed \
+             bookkeeping likely dropped or misordered a token"
+        );
+
+        if kv_seq >= FLOOR {
+            crossed_floor = true;
+        }
+    }
+    assert!(
+        crossed_floor,
+        "test did not actually reach kv_seq >= {FLOOR} — padding floor unexercised"
+    );
 }
 
 /// The write path refuses to persist an iso **V** store whose CPU blocks fall

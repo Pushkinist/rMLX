@@ -103,6 +103,7 @@ use rmlx_core::error::{Error, Result};
 use rmlx_mlx::metal_kernel::{MetalKernel, MetalKernelInvoke};
 use rmlx_mlx::{Array, Device, Dtype};
 
+use crate::flash_decode_common::pad_norms_to_device_floor;
 use crate::iso_flash_decode_msl::{build_iso_flash_header, ISO_FLASH_HEAD_DIM_MAX, TILE_SIZE};
 use crate::storage::{iso_n_groups_for, ISO_QUAT_BLOCK_SIZE};
 
@@ -395,6 +396,11 @@ pub fn iso_flash_decode_symv_sdpa<const BITS: u8>(
     };
     let (k_codes, k_scales, k_norms) = flatten_axis(k)?;
     let (v_codes, v_scales, v_norms) = flatten_axis(v)?;
+
+    // GPU-native small-`norms`-buffer floor — see
+    // [`crate::flash_decode_common::pad_norms_to_device_floor`].
+    let k_norms = pad_norms_to_device_floor(k_norms, tok_count, device)?;
+    let v_norms = pad_norms_to_device_floor(v_norms, tok_count, device)?;
 
     // ── Mask ──────────────────────────────────────────────────────────────
     let (mask_flat, has_mask) = if let Some(m) = additive_mask {
