@@ -695,7 +695,25 @@ graph.
 The `source` parameter is the **body** of the kernel function. MLX wraps it
 with the Metal function signature and buffer declarations automatically:
 
-- Input buffers: `device const T* <name>` (auto-typed from array dtype).
+- Input buffers: `device const T* <name>` for most arrays (auto-typed from
+  array dtype) — **but not always**. MLX silently switches an input's
+  outer-kernel parameter to the `constant` address space instead of `device`
+  when the array is small (measured trip point: fewer than 8 elements, for
+  every dtype and shape tried); this is an internal MLX size heuristic, not
+  something a caller can pin per-argument. If the kernel body calls a
+  header/body helper function whose parameter is hard-declared
+  `device const T*`, that call fails the MSL compile the moment a small
+  enough array reaches it (`Unable to build metal library from source: no
+  matching function ... cannot pass pointer to address space 'constant' as a
+  pointer to address space 'device'`) — a **first-dispatch** failure, not a
+  `MetalKernel::new`-time one, so it can ship silently until a small enough
+  input shows up in production. Any kernel whose input can legitimately be
+  tiny at a valid call (e.g. a per-token `norms` buffer at low `kv_seq`) must
+  pad that array up past the trip point before dispatch rather than assume
+  `device` binding. See `rmlx_kv_quant::flash_decode_common::pad_norms_to_device_floor`
+  (floor 16, 2× the measured 8-element trip point for margin) — the general
+  fix shared by `iso_flash_decode_symv_sdpa` and `rotor_flash_decode_symv_sdpa`,
+  documented per-codec in `docs/KV_QUANT.md`.
 - Output buffers: `device T* <name>`.
 - Built-ins: `thread_position_in_grid` (uint3),
   `threadgroup_position_in_grid` (uint3),
