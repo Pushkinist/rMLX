@@ -515,13 +515,15 @@ impl KvQuant {
             //
             // * K-only (IsoKOnly*, RotorKOnly*) — K is re-quantised at every
             //   decode step; V routes through `update_decode_fp16_v_only`.
-            // * Fused rotor symmetric (Rotor{3,4}Sym) — decode runs a flash
-            //   kernel straight off the packed K and V rings, so neither axis
-            //   reads a mirror (see `feeds_bf16_v_at_decode`).
+            // * Fused symmetric (Iso{3,4}Sym, Rotor{3,4}Sym) — decode runs a
+            //   flash kernel straight off the packed K and V rings, so neither
+            //   axis reads a mirror (see `feeds_bf16_v_at_decode`).
             KvQuant::IsoKOnly3
             | KvQuant::IsoKOnly4
             | KvQuant::RotorKOnly3
             | KvQuant::RotorKOnly4
+            | KvQuant::Iso3Sym
+            | KvQuant::Iso4Sym
             | KvQuant::Rotor3Sym
             | KvQuant::Rotor4Sym => false,
             // All other variants: decode reads the bf16 K seed materialised by
@@ -543,8 +545,6 @@ impl KvQuant {
             | KvQuant::TurboSym4
             | KvQuant::Iso3
             | KvQuant::Iso4
-            | KvQuant::Iso3Sym
-            | KvQuant::Iso4Sym
             | KvQuant::Rotor3
             | KvQuant::Rotor4
             | KvQuant::RotorK3Asym { .. }
@@ -560,9 +560,9 @@ impl KvQuant {
     /// `update_decode_fp16_v_only`, and `KvQuant::None` stores its bf16 V here
     /// outright.
     ///
-    /// **False only for the fused rotor symmetric codecs** (`Rotor3Sym`,
-    /// `Rotor4Sym`): `rotor_flash_decode_symv` unpacks V straight out of the
-    /// packed rotor ring inside the SV loop, so a bf16 V is never read. Keeping
+    /// **False only for the fused symmetric codecs** (`Iso3Sym`, `Iso4Sym`,
+    /// `Rotor3Sym`, `Rotor4Sym`): the quant-V flash kernel unpacks V straight out
+    /// of the packed ring inside the SV loop, so a bf16 V is never read. Keeping
     /// one is not a small waste — a full `seq * head_dim * 2` bytes per layer of
     /// V (plus the same for K) is the *dominant* term in these codecs' residency
     /// and is what made a ~3-bits-per-axis codec cost more than plain bf16.
@@ -571,9 +571,9 @@ impl KvQuant {
     /// variant must be classified rather than silently inherit a mirror.
     pub fn feeds_bf16_v_at_decode(&self) -> bool {
         match self {
-            // Fused rotor symmetric: V is unpacked from the quant store inside
-            // the flash kernel's SV loop; no bf16 V exists.
-            KvQuant::Rotor3Sym | KvQuant::Rotor4Sym => false,
+            // Fused symmetric: V is unpacked from the quant store inside the
+            // flash kernel's SV loop; no bf16 V exists.
+            KvQuant::Iso3Sym | KvQuant::Iso4Sym | KvQuant::Rotor3Sym | KvQuant::Rotor4Sym => false,
             // Everything else reads the bf16 V seed at decode — including the
             // K-only family (via `update_decode_fp16_v_only`) and `None`, whose
             // bf16 V *is* this buffer.
@@ -594,8 +594,6 @@ impl KvQuant {
             | KvQuant::TurboSym4
             | KvQuant::Iso3
             | KvQuant::Iso4
-            | KvQuant::Iso3Sym
-            | KvQuant::Iso4Sym
             | KvQuant::IsoKOnly3
             | KvQuant::IsoKOnly4
             | KvQuant::Rotor3
@@ -709,11 +707,16 @@ impl KvQuant {
             // `update_iso3*` early-returns to the warm-TTFT bf16 decode seed
             // (`decode_fp16_k.is_some()`), so the GPU iso branch is shadowed;
             // the iso V-encode that does run (at prefill) is CPU.
-            KvQuant::Iso3 | KvQuant::Iso4 | KvQuant::Iso3Sym | KvQuant::Iso4Sym => Some(
+            KvQuant::Iso3 | KvQuant::Iso4 => Some(
                 "IsoQuant (quaternion SO(4)) V-only: a GPU iso encode/dequant branch \
                  exists but is shadowed by the bf16 decode seed; prefill V-encode runs \
                  on CPU",
             ),
+            // Symmetric iso variants: NO bf16 decode-seed early-return — decode
+            // is the quant-V flash kernel over both packed iso rings. Iso carries
+            // no QJL sideband, so there is no CPU-fallback gate; the hot path is
+            // Metal.
+            KvQuant::Iso3Sym | KvQuant::Iso4Sym => None,
             // K-only iso variants: NO bf16 decode-seed early-return — the iso K
             // codec fires every decode step. On GPU, `update_iso_k_only_{3,4}`
             // dispatches the real iso{3,4} MSL encode kernel; IsoKOnly3 also runs

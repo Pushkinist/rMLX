@@ -60,15 +60,14 @@ fn v_only_iso_rotor_families_are_cpu_fallback_with_reason() {
     // encode that runs (at prefill) is CPU. They carry MSL (q8 K-side) but must
     // report a CPU-hot-path reason. This is grounded in the dispatcher, not by
     // fiat — flip the verdict and this test must flip with it.
-    // Note: the rotor **symmetric** codecs (`Rotor3Sym` / `Rotor4Sym`) are NOT
-    // in this list — with QJL off (the default) their decode is the quant-V
-    // flash kernel over both packed rings, so their hot path is Metal. That
-    // verdict is checked in `rotor_symmetric_families_are_metal_when_qjl_off`.
+    // Note: the **symmetric** codecs (`Iso{3,4}Sym`, `Rotor{3,4}Sym`) are NOT in
+    // this list — their decode is the quant-V flash kernel over both packed
+    // rings, so their hot path is Metal. Those verdicts are checked in
+    // `iso_symmetric_families_are_metal` /
+    // `rotor_symmetric_families_are_metal_when_qjl_off`.
     for kq in [
         KvQuant::Iso3,
         KvQuant::Iso4,
-        KvQuant::Iso3Sym,
-        KvQuant::Iso4Sym,
         KvQuant::Rotor3,
         KvQuant::Rotor4,
         KvQuant::RotorK3Asym {
@@ -111,6 +110,24 @@ fn rotor_symmetric_families_are_metal_when_qjl_off() {
         assert!(
             kq.cpu_hot_path_reason().is_none(),
             "{kq} decodes through the quant-V flash kernel with QJL off — must be Metal (None)"
+        );
+    }
+}
+
+#[test]
+fn iso_symmetric_families_are_metal() {
+    // `Iso3Sym` / `Iso4Sym` have NO bf16 decode-seed early-return: decode is the
+    // quant-V flash kernel over both packed iso rings, so the verdict must be
+    // `None` (Metal). Iso carries no QJL sideband, so there is no CPU-fallback
+    // gate — unlike the rotor sym mirror. Grounded in the dispatcher, not by fiat.
+    for kq in [KvQuant::Iso3Sym, KvQuant::Iso4Sym] {
+        assert!(
+            kq.carries_msl(),
+            "{kq} carries MSL (iso K + quant-V flash kernels)"
+        );
+        assert!(
+            kq.cpu_hot_path_reason().is_none(),
+            "{kq} decodes through the quant-V flash kernel — must be Metal (None)"
         );
     }
 }
@@ -184,7 +201,7 @@ fn precompile_skips_cpu_hot_path_codecs() {
     // Even on a GPU device the precompile is a documented no-op for the V-only
     // iso/rotor CPU-fallback codecs (nothing to warm). We can only assert the
     // classifier off-device, which the function consults to take the skip branch.
-    for kq in [KvQuant::Rotor3, KvQuant::Iso3, KvQuant::Iso4Sym] {
+    for kq in [KvQuant::Rotor3, KvQuant::Iso3, KvQuant::Iso4] {
         assert!(
             kq.cpu_hot_path_reason().is_some(),
             "{kq} drives the precompile cpu_hot_path skip branch"
