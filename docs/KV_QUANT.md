@@ -399,7 +399,8 @@ be classified or the build fails.
 | `k8v4` / `k8v8` / `planar` / `planar3` / `planar_k` | **Metal** | q8_0 K + tq4 / planar V GPU kernels |
 | `mixed_*` / `rot_k_v*` / `rot_k_tq4v` | **Metal** | MLX-affine `mx.quantize` K + tq4/affine V (compiled Metal ops) |
 | `k8vturbo3` / `k8vturbo2` / `*tcq` / `tsym3` / `tsym4` | **Metal K**, CPU V (bounded) | K=q8_0 GPU; V CPU-forced by the −1 %/−2 % TPS gate, cost small |
-| `iso3` / `iso4` / `iso3_sym` / `iso4_sym` | **CPU** | bf16 decode seed shadows the GPU iso branch; prefill V-encode on host |
+| `iso3` / `iso4` | **CPU** | bf16 decode seed shadows the GPU iso branch; prefill V-encode on host |
+| `iso3_sym` / `iso4_sym` | **fully Metal** | both axes iso-quantized; decode is `iso_flash_decode_symv` over both packed rings (no bf16 mirror). Ring-as-sole-store. `cpu_hot_path_reason() == None` |
 | `k_iso3` / `k_iso4` | **fully Metal** | iso K MSL encode into the packed ring + `iso_flash_decode` fused decode over that ring. No host restaging. `cpu_hot_path_reason() == None` |
 | `rotor3` / `rotor4` / `rotor*_sym` / `rotor_k_*_asym_*` | **CPU** | bf16 decode seed shadows the GPU branch; GPU fused-QK encoder is `RMLX_FUSED_QK`-only |
 | `k_rotor3` / `k_rotor4` | **QJL-dependent (default off)** | QJL off (default) → **fully Metal**: rotor K MSL encode + `rotor_flash_decode` fused decode; QJL on (`--rotor-qjl on`) → CPU. Gate reads the store's sticky `use_qjl()` |
@@ -2783,6 +2784,51 @@ resident KV is the binding constraint, not when peak decode TPS is. Closing the
 speed gap needs a single-pass simdgroup flash-decode that beats MLX bf16 flash
 (tracked with `#45`).
 
+### Short-prompt abort at `kv_h == 1` — small-`norms`-buffer device floor
+
+Both symv kernels — this one and `iso_flash_decode_symv` below — bind a
+per-token `norms` array as a kernel input. MLX's custom-kernel builder binds
+a small input array's outer-kernel parameter in the **`constant`** address
+space instead of `device` (an internal size heuristic — see
+`docs/FFI.md` § "MSL source conventions"), but the shared decode helpers each
+kernel calls (`if_decode_k_lane` for iso, `rf_decode_k_group` for rotor)
+declare their `norms` parameter `device const float*` — an address-space
+mismatch that fails the MSL compile at first dispatch
+(`cannot pass pointer to address space 'constant' as a pointer to address
+space 'device'`). Measured trip point: `b * kv_h * kv_seq < 8` aborts, `>= 8`
+does not, for every `head_dim`.
+
+This is reachable on a **normal short chat prompt** against a single-KV-head
+model — Gemma4 global layers are `kv_h == 1`, so a 2-token prompt reaches
+`kv_seq == 2` on the very first decode step, well below the trip point.
+
+**Fix (general, both codecs).**
+`rmlx_kv_quant::flash_decode_common::pad_norms_to_device_floor` zero-pads the
+flat `norms` array up to `NORMS_DEVICE_MIN` (16, a 2× margin over the
+measured 8-element trip point) before dispatch whenever
+`b * kv_h * kv_seq` is below it. Both kernels' per-tile decode loop is
+bounded by the real `kv_seq` carried in their `dims` buffer, not by the
+`norms` buffer's allocated length, so the padding is allocated but never
+read — correctness is unaffected. `iso_flash_decode_symv_sdpa` and
+`rotor_flash_decode_symv_sdpa` both call this one shared helper; there is no
+per-codec copy. This keeps both fused kernels on the GPU at **every**
+`kv_seq >= 1` with **no CPU dequant fallback** (hard rule 10) — an earlier,
+superseded version of this fix routed small-`kv_seq` steps to a CPU dequant
+SDPA (`RING_NORMS_DEVICE_MIN` gate + `iso_sym_cpu_sdpa_fallback`); that gate
+and fallback function are gone, replaced by the padding above.
+
+Regression coverage (hard rule 6): `iso_sym_short_kv_seq_kv_h1_stays_on_gpu`
+and the continuity tests `iso_sym_transition_across_ring_norms_floor` /
+`rotor_sym_transition_across_ring_norms_floor` in
+`crates/rmlx-kv-ssd/src/block_io_tests.rs` drive `kv_h == 1` decode across
+and through the padding floor, on both codecs, checked against an
+**independent** `KvStorage::None` (bf16/f32) reference cache fed the
+identical per-step tokens — not a scalar reference rebuilt from the same
+ring the kernel just read, which a ring corruption both reads see
+identically would pass silently. Mutation: disabling
+`pad_norms_to_device_floor` reproduces the `kv_seq == 2` abort on both
+codecs (`if_decode_k_lane` / `rf_decode_k_group`, `constant` vs `device`).
+
 ---
 
 ## `iso_flash_decode` — fused MSL flash-decode over iso-quant K
@@ -2874,7 +2920,7 @@ dequant path.
 |---|---|---|
 | `KvStorage::IsoKOnly3` / `IsoKOnly4`, `b == 1` | **YES** | GPU ring + `iso_flash_decode_sdpa`. |
 | `KvStorage::IsoKOnly{3,4}`, `b > 1` | NO | Ring stride does not interleave batch. |
-| `Iso{3,4}Sym` | NO | V side is also iso-quantized; this kernel takes bf16 V only. Shares the K-decode half when a quant-V kernel lands. |
+| `Iso{3,4}Sym` | NO (this kernel) | Both axes are iso-quantized; they decode through the all-quant sibling `iso_flash_decode_symv` instead, which reads V from its own packed ring rather than a bf16 mirror (ring-as-sole-store). Shares the per-lane K-decode half (`if_decode_k_lane`). |
 
 ### Measured
 

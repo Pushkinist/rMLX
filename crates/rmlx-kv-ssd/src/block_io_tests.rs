@@ -3146,6 +3146,665 @@ fn rotor_sym_ring_only_tail_ssd_round_trip() {
     );
 }
 
+// ── Iso symmetric ring-only-tail (sole-store) ─────────────────────────────────
+
+fn seeded_iso_sym3_cache(kv_h: i32, head_dim: i32, max_seq: i32) -> KvCache {
+    let storage = KvStorage::IsoSym3 {
+        k: Some(QuantIsoK3::from_cpu_blocks(
+            Vec::new(),
+            vec![1, kv_h, 0, head_dim],
+            max_seq,
+        )),
+        v: Some(QuantIsoV3::from_cpu_blocks(
+            Vec::new(),
+            vec![1, kv_h, 0, head_dim],
+        )),
+        max_seq,
+    };
+    KvCache::from_storage(storage, KvQuant::Iso3Sym, 0, 0)
+}
+
+/// `(k_dequant, v_dequant, shape[2], k_block_tokens, v_block_tokens)` for an
+/// iso3 symmetric cache.
+#[allow(
+    clippy::unwrap_used,
+    reason = "test helper: values established by construction"
+)]
+fn iso_sym3_probe(cache: &KvCache) -> (Vec<f32>, Vec<f32>, i32, usize, usize) {
+    match cache.storage() {
+        KvStorage::IsoSym3 {
+            k: Some(ks),
+            v: Some(vs),
+            ..
+        } => (
+            ks.dequant().unwrap(),
+            vs.dequant().unwrap(),
+            ks.shape.get(2).copied().unwrap_or(0),
+            ks.blocks.iter().map(|b| b.n_tokens).sum(),
+            vs.blocks.iter().map(|b| b.n_tokens).sum(),
+        ),
+        _ => panic!("expected a live IsoSym3 store"),
+    }
+}
+
+/// Scalar reference attention over head-major (`[1, kv_h, S, D]`) K/V, for the
+/// short-kv_seq fallback correctness check.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by \
+              slice length"
+)]
+fn ref_attn_head_major(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    n_q: usize,
+    kv_h: usize,
+    s: usize,
+    d: usize,
+    scale: f32,
+) -> Vec<f32> {
+    let hpk = n_q / kv_h;
+    let mut out = vec![0.0_f32; n_q * d];
+    for hq in 0..n_q {
+        let h = hq / hpk;
+        let mut scores = vec![0.0_f32; s];
+        for (si, sc) in scores.iter_mut().enumerate() {
+            let mut acc = 0.0_f32;
+            for di in 0..d {
+                acc += q[hq * d + di] * k[(h * s + si) * d + di];
+            }
+            *sc = acc * scale;
+        }
+        let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut den = 0.0_f32;
+        for sc in &mut scores {
+            *sc = (*sc - m).exp();
+            den += *sc;
+        }
+        for di in 0..d {
+            let mut acc = 0.0_f32;
+            for (si, &p) in scores.iter().enumerate() {
+                acc += p * v[(h * s + si) * d + di];
+            }
+            out[hq * d + di] = acc / den;
+        }
+    }
+    out
+}
+
+/// Short-prompt smoke (hard rule 6) for the `kv_h == 1` single-KV-head shape
+/// (Gemma4 global layers): with the fused `iso3_sym` codec live, a decode at a
+/// small `kv_seq` used to abort because MLX binds the ring's tiny per-token
+/// `norms` slice in the `constant` address space, which the flash kernel's
+/// `if_decode_k_lane` (`device const float*`) rejects. `iso_flash_decode_symv_sdpa`
+/// now zero-pads `norms` up to its `NORMS_DEVICE_MIN` floor (16) before
+/// dispatch whenever `b*kv_h*kv_seq` is below it, so the fused GPU kernel runs at
+/// every `kv_seq >= 1` with no CPU dequant fallback (hard rule 10): the padding
+/// is allocated but never read, since the kernel's per-tile loop bound is the
+/// real `kv_seq` carried in `dims`, not the buffer length. Asserts no abort AND
+/// numerically-correct output (vs a scalar reference over the store's own
+/// dequant) for `kv_seq` 2, 3, 4, 7, 15 — all below the compile floor.
+///
+/// Mutation check: force `iso_flash_decode_symv_sdpa`'s norms-padding helper
+/// `pad_norms_to_device_floor` to skip padding (return the unpadded array
+/// unconditionally) → the `kv_seq == 2`
+/// step aborts with "Unable to build metal library from source … cannot pass
+/// pointer to address space 'constant' as a pointer to address space 'device' …
+/// if_decode_k_lane" (RED).
+#[test]
+#[ignore = "GPU Metal context — run: cargo test -p rmlx-kv-ssd iso_sym_short_kv_seq_kv_h1 -- --ignored --test-threads=1"]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "test: values established by construction; GPU dispatch failures asserted via \
+              .expect messages"
+)]
+fn iso_sym_short_kv_seq_kv_h1_stays_on_gpu() {
+    let device = Device::Gpu;
+    let n_q = 8_i32;
+    let kv_h = 1_i32; // single KV head — the Gemma4 global-layer shape
+    let head_dim = 512_i32;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    for kv_seq in [2_i32, 3, 4, 7, 15] {
+        let prefill = kv_seq - 1;
+        let mut c = seeded_iso_sym3_cache(kv_h, head_dim, 512);
+        let k = arr(
+            &lcg((prefill * kv_h * head_dim) as usize, 31),
+            &[1, kv_h, prefill, head_dim],
+        );
+        let v = arr(
+            &lcg((prefill * kv_h * head_dim) as usize, 32),
+            &[1, kv_h, prefill, head_dim],
+        );
+        let q = arr(
+            &lcg((prefill * n_q * head_dim) as usize, 33),
+            &[1, n_q, prefill, head_dim],
+        );
+        c.update_and_sdpa(&q, &k, &v, scale, "causal", None, device)
+            .unwrap();
+        c.exit_prefill(device).unwrap();
+
+        let qd = lcg((n_q * head_dim) as usize, 41);
+        let q1 = arr(&qd, &[1, n_q, 1, head_dim]);
+        let k1 = arr(
+            &lcg((kv_h * head_dim) as usize, 42),
+            &[1, kv_h, 1, head_dim],
+        );
+        let v1 = arr(
+            &lcg((kv_h * head_dim) as usize, 43),
+            &[1, kv_h, 1, head_dim],
+        );
+
+        // MUST NOT abort — the kernel dispatcher pads the small norms buffer.
+        let out = c
+            .update_and_sdpa(&q1, &k1, &v1, scale, "", None, device)
+            .expect(
+                "short kv_seq at kv_h==1 must not abort — norms is zero-padded before dispatch",
+            );
+        let got = to_vec(&out);
+        assert_eq!(
+            got.len(),
+            (n_q * head_dim) as usize,
+            "kv_seq={kv_seq}: shape"
+        );
+        assert!(
+            got.iter().all(|x| x.is_finite()),
+            "kv_seq={kv_seq}: output must be finite"
+        );
+
+        // Correctness: scalar attention over the store's own dequant (which
+        // transparently rebuilds the ring-only tail). Both decode the same iso
+        // values, so the only divergence is summation order — well inside bf16
+        // tolerance.
+        let (k_deq, v_deq, seq, _, _) = iso_sym3_probe(&c);
+        assert_eq!(seq, kv_seq, "kv_seq={kv_seq}: store length");
+        let want = ref_attn_head_major(
+            &qd,
+            &k_deq,
+            &v_deq,
+            n_q as usize,
+            kv_h as usize,
+            kv_seq as usize,
+            head_dim as usize,
+            scale,
+        );
+        let err = max_abs_err(&got, &want);
+        assert!(
+            err < 2e-3,
+            "kv_seq={kv_seq}: padded-dispatch output max_abs_err={err} exceeds bf16 tolerance"
+        );
+    }
+}
+
+/// CONTINUITY correctness across the `NORMS_DEVICE_MIN` padding floor (16): a
+/// single continuous `kv_h == 1` iso3_sym cache decoded ONE token at a time
+/// from below the floor through well above it, on the SAME cache/ring for
+/// every step, driven **in parallel** with an independent `KvStorage::None`
+/// (unquantised bf16/f32) reference cache fed the identical per-step tokens.
+/// Unlike [`iso_sym_short_kv_seq_kv_h1_stays_on_gpu`] above (which builds a
+/// **fresh** cache per `kv_seq` via a bulk prefill call, so each `kv_seq` is
+/// only ever reached once), this exercises the ring-only decode tail growing
+/// continuously through the point where `iso_flash_decode_symv_sdpa` stops
+/// padding `norms` (once `b*kv_h*kv_seq >= 16`) and starts passing it through
+/// unpadded.
+///
+/// The reference is deliberately **independent of the store under test**: an
+/// earlier version of this test compared the kernel's output against a
+/// scalar reference built from `iso_sym3_probe`'s `dequant()` — which
+/// rebuilds from the SAME ring the kernel just read. A ring corruption both
+/// reads see identically (e.g. a dropped or duplicated append) would pass
+/// that check with `err≈0`; "didn't error" is not "correct" for a silent-KV
+/// class of bug. The bf16 cache instead runs its own `update()` /
+/// `scaled_dot_product_attention` over its own independently-accumulated
+/// K/V, sharing no state with the iso ring at all, so a dropped/misordered
+/// token in the iso ring surfaces as a real divergence between the two
+/// outputs — a gross softmax shift over a materially different key set,
+/// against random per-step K/V/Q — not just quantisation noise.
+///
+/// Mutation check: same as [`iso_sym_short_kv_seq_kv_h1_stays_on_gpu`] —
+/// forcing `iso_flash_decode_symv_sdpa`'s norms-padding helper
+/// `pad_norms_to_device_floor` to skip padding makes the very first decode
+/// step (`kv_seq == 2`) abort before
+/// this test can reach the floor at all.
+#[test]
+#[ignore = "GPU Metal context — run: cargo test -p rmlx-kv-ssd iso_sym_transition_across_ring_norms_floor -- --ignored --test-threads=1"]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "test: values established by construction; GPU dispatch failures asserted via \
+              .expect/.unwrap_or_else messages"
+)]
+fn iso_sym_transition_across_ring_norms_floor() {
+    let device = Device::Gpu;
+    let n_q = 8_i32;
+    let kv_h = 1_i32; // single KV head — the Gemma4 global-layer shape
+    let head_dim = 512_i32;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    const FLOOR: i32 = 16; // mirrors NORMS_DEVICE_MIN in flash_decode_common.rs
+                           // 3-bit iso quant error on both K and V vs the independent bf16
+                           // reference: measured max_abs_err ~0.14 at kv_seq=2, staying under 0.2
+                           // through kv_seq=24 over this test's random LCG data. A single wrong
+                           // token's V fed to the reference (simulating a dropped/misordered token)
+                           // measured max_abs_err ~0.57 at the same kv_seq=2 — comfortably above
+                           // this floor, so genuine quant noise and a lost-token bug do not overlap.
+    const ISO_QUANT_TOL: f32 = 0.3;
+
+    let mut iso = seeded_iso_sym3_cache(kv_h, head_dim, 512);
+    let mut bf16 = KvCache::from_storage(KvStorage::None { max_seq: 512 }, KvQuant::None, 0, 0);
+
+    // Identical one-token prefill on both caches, matching a realistic short
+    // chat prompt: kv_seq == 1 before the first decode step.
+    let prefill = 1_i32;
+    let k0 = arr(
+        &lcg((prefill * kv_h * head_dim) as usize, 51),
+        &[1, kv_h, prefill, head_dim],
+    );
+    let v0 = arr(
+        &lcg((prefill * kv_h * head_dim) as usize, 52),
+        &[1, kv_h, prefill, head_dim],
+    );
+    let q0 = arr(
+        &lcg((prefill * n_q * head_dim) as usize, 53),
+        &[1, n_q, prefill, head_dim],
+    );
+    iso.update_and_sdpa(&q0, &k0, &v0, scale, "causal", None, device)
+        .unwrap();
+    iso.exit_prefill(device).unwrap();
+    bf16.update_and_sdpa(&q0, &k0, &v0, scale, "causal", None, device)
+        .unwrap();
+    bf16.exit_prefill(device).unwrap();
+
+    // Decode one token at a time, kv_seq 2..24 — well below the floor through
+    // well above it — feeding the identical tokens into both caches.
+    let mut crossed_floor = false;
+    for step in 0_i32..23 {
+        let kv_seq = 2 + step;
+        let qd = lcg((n_q * head_dim) as usize, 1_000 + step as u64);
+        let kd = lcg((kv_h * head_dim) as usize, 2_000 + step as u64);
+        let vd = lcg((kv_h * head_dim) as usize, 3_000 + step as u64);
+        let q1 = arr(&qd, &[1, n_q, 1, head_dim]);
+        let k1 = arr(&kd, &[1, kv_h, 1, head_dim]);
+        let v1 = arr(&vd, &[1, kv_h, 1, head_dim]);
+
+        let iso_out = iso
+            .update_and_sdpa(&q1, &k1, &v1, scale, "", None, device)
+            .unwrap_or_else(|e| {
+                panic!("kv_seq={kv_seq}: must not abort across the ring-norms floor: {e}")
+            });
+        let bf16_out = bf16
+            .update_and_sdpa(&q1, &k1, &v1, scale, "", None, device)
+            .expect("bf16 reference cache must not fail — plain SDPA, no custom kernel");
+
+        let got = to_vec(&iso_out);
+        let want = to_vec(&bf16_out);
+        assert!(
+            got.iter().all(|x| x.is_finite()),
+            "kv_seq={kv_seq}: output must be finite"
+        );
+
+        // Decisive check: the iso3_sym kernel's output vs the INDEPENDENT
+        // bf16 reference cache's output — two separate stores, two separate
+        // code paths, sharing no ring — so a dropped or misordered pre-floor
+        // token in the iso ring cannot pass silently.
+        let err = max_abs_err(&got, &want);
+        assert!(
+            err < ISO_QUANT_TOL,
+            "kv_seq={kv_seq}: iso3_sym vs independent bf16 reference max_abs_err={err} exceeds \
+             tolerance {ISO_QUANT_TOL} (floor={FLOOR}) — the ring's per-step append/reseed \
+             bookkeeping likely dropped or misordered a token"
+        );
+
+        if kv_seq >= FLOOR {
+            crossed_floor = true;
+        }
+    }
+    assert!(
+        crossed_floor,
+        "test did not actually reach kv_seq >= {FLOOR} — padding floor unexercised"
+    );
+}
+
+/// Rotor sibling of [`iso_sym_transition_across_ring_norms_floor`] — same
+/// independent-bf16-reference design, same `kv_h == 1` continuity coverage
+/// across [`flash_decode_common::NORMS_DEVICE_MIN`], for the `rotor3_sym`
+/// codec (`rotor_flash_decode_symv_sdpa`, `rf_decode_k_group`). Rotor's
+/// `norms` buffer hits the identical MLX small-buffer `constant`-binding trap
+/// as iso — same root cause, same [`crate::flash_decode_common`] fix.
+///
+/// Mutation check: forcing `rotor_flash_decode_symv_sdpa`'s norms-padding
+/// helper `pad_norms_to_device_floor` to skip padding makes the very first
+/// decode step (`kv_seq == 2`) abort with the same address-space-mismatch
+/// class of MSL error (`rf_decode_k_group`, `constant` vs `device`) before
+/// this test can reach the floor at all.
+#[test]
+#[ignore = "GPU Metal context — run: cargo test -p rmlx-kv-ssd rotor_sym_transition_across_ring_norms_floor -- --ignored --test-threads=1"]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "test: values established by construction; GPU dispatch failures asserted via \
+              .expect/.unwrap_or_else messages"
+)]
+fn rotor_sym_transition_across_ring_norms_floor() {
+    let device = Device::Gpu;
+    let n_q = 8_i32;
+    let kv_h = 1_i32; // single KV head — the Gemma4 global-layer shape
+    let head_dim = 512_i32;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    const FLOOR: i32 = 16; // mirrors NORMS_DEVICE_MIN in flash_decode_common.rs
+                           // 3-bit rotor quant error on both K and V vs the independent bf16
+                           // reference: measured max_abs_err ~0.15 at kv_seq=2, staying under 0.2
+                           // through kv_seq=24 over this test's random LCG data — same order as
+                           // ISO_QUANT_TOL above, same margin reasoning.
+    const ROTOR_QUANT_TOL: f32 = 0.3;
+
+    let mut rotor = seeded_rotor_sym3_cache(kv_h, head_dim, 512);
+    let mut bf16 = KvCache::from_storage(KvStorage::None { max_seq: 512 }, KvQuant::None, 0, 0);
+
+    let prefill = 1_i32;
+    let k0 = arr(
+        &lcg((prefill * kv_h * head_dim) as usize, 61),
+        &[1, kv_h, prefill, head_dim],
+    );
+    let v0 = arr(
+        &lcg((prefill * kv_h * head_dim) as usize, 62),
+        &[1, kv_h, prefill, head_dim],
+    );
+    let q0 = arr(
+        &lcg((prefill * n_q * head_dim) as usize, 63),
+        &[1, n_q, prefill, head_dim],
+    );
+    rotor
+        .update_and_sdpa(&q0, &k0, &v0, scale, "causal", None, device)
+        .unwrap();
+    rotor.exit_prefill(device).unwrap();
+    bf16.update_and_sdpa(&q0, &k0, &v0, scale, "causal", None, device)
+        .unwrap();
+    bf16.exit_prefill(device).unwrap();
+
+    let mut crossed_floor = false;
+    for step in 0_i32..23 {
+        let kv_seq = 2 + step;
+        let qd = lcg((n_q * head_dim) as usize, 4_000 + step as u64);
+        let kd = lcg((kv_h * head_dim) as usize, 5_000 + step as u64);
+        let vd = lcg((kv_h * head_dim) as usize, 6_000 + step as u64);
+        let q1 = arr(&qd, &[1, n_q, 1, head_dim]);
+        let k1 = arr(&kd, &[1, kv_h, 1, head_dim]);
+        let v1 = arr(&vd, &[1, kv_h, 1, head_dim]);
+
+        let rotor_out = rotor
+            .update_and_sdpa(&q1, &k1, &v1, scale, "", None, device)
+            .unwrap_or_else(|e| {
+                panic!("kv_seq={kv_seq}: must not abort across the ring-norms floor: {e}")
+            });
+        let bf16_out = bf16
+            .update_and_sdpa(&q1, &k1, &v1, scale, "", None, device)
+            .expect("bf16 reference cache must not fail — plain SDPA, no custom kernel");
+
+        let got = to_vec(&rotor_out);
+        let want = to_vec(&bf16_out);
+        assert!(
+            got.iter().all(|x| x.is_finite()),
+            "kv_seq={kv_seq}: output must be finite"
+        );
+
+        let err = max_abs_err(&got, &want);
+        assert!(
+            err < ROTOR_QUANT_TOL,
+            "kv_seq={kv_seq}: rotor3_sym vs independent bf16 reference max_abs_err={err} exceeds \
+             tolerance {ROTOR_QUANT_TOL} (floor={FLOOR}) — the ring's per-step append/reseed \
+             bookkeeping likely dropped or misordered a token"
+        );
+
+        if kv_seq >= FLOOR {
+            crossed_floor = true;
+        }
+    }
+    assert!(
+        crossed_floor,
+        "test did not actually reach kv_seq >= {FLOOR} — padding floor unexercised"
+    );
+}
+
+/// The write path refuses to persist an iso **V** store whose CPU blocks fall
+/// short of `shape[2]` with no ring — a truncated store. Runs on CPU (no Metal).
+///
+/// Mutation check: delete the `ensure_iso_blocks_cover_shape` guard in
+/// `write_quant_iso_v3` — the writer then silently serializes the short prefix
+/// and this assertion flips RED (`write` returns `Ok`).
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test: values established by construction earlier in this fn"
+)]
+fn write_rejects_truncated_iso_store() {
+    let kv_h = 2_i32;
+    let head_dim = 8_i32; // multiple of ISO_QUAT_BLOCK_SIZE (4); n_groups = 2
+    let data = lcg((kv_h * 2 * head_dim) as usize, 0x1D0);
+
+    // A real single V block covering 2 tokens.
+    let mut src = QuantIsoV3::new(vec![1, kv_h, 0, head_dim]);
+    src.append(&data, &[1, kv_h, 2, head_dim]).unwrap();
+
+    // Claim shape[2] == 4 while the blocks cover only 2 tokens and no ring
+    // exists — the ring-only tail with the ring missing. Pair with a well-formed
+    // K store so the sym layer is valid on the K side.
+    let truncated_v = QuantIsoV3::from_cpu_blocks(src.blocks.clone(), vec![1, kv_h, 4, head_dim]);
+    let mut k_src = QuantIsoK3::new(vec![1, kv_h, 0, head_dim], 64);
+    let k_data = lcg((kv_h * 4 * head_dim) as usize, 0x2E0);
+    k_src.append(&k_data, &[1, kv_h, 4, head_dim]).unwrap();
+
+    let layers = vec![KvStorage::IsoSym3 {
+        k: Some(k_src),
+        v: Some(truncated_v),
+        max_seq: 64,
+    }];
+    let path = tmp_path("iso_v_truncated");
+    let res =
+        KvBlockWriter::new(MODEL_ID, KvQuant::Iso3Sym, &layers, &[]).write(&path, Device::Cpu);
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        res.is_err(),
+        "writer must reject a truncated iso V store (short blocks, no ring), got Ok"
+    );
+}
+
+/// Full SSD spill/hydrate round-trip after a **symmetric** iso ring-only-tail
+/// decode: both K and V decode tails live only in their GPU rings, are
+/// materialised by the spill clone, and hydrate byte-exact. Also proves the V
+/// dequant-full-prefix rebuild (`synced_iso_v_blocks`) from the ring.
+///
+/// Mutation checks:
+/// * dequant skip-rebuild: make `synced_iso_v_blocks` return
+///   `Cow::Borrowed(blocks)` always — the frozen short prefix trips the loud
+///   `refusing to zero-pad` error in `dequant` (RED, not a silent zero-pad).
+/// * SSD spill: make `QuantIsoV3::try_deep_clone` clone `self.blocks` directly
+///   (drop the synced reconcile) — `write_caches` trips
+///   `ensure_iso_blocks_cover_shape` → `TruncatedStore` (RED).
+#[test]
+#[ignore = "GPU Metal context — run: cargo test -p rmlx-kv-ssd iso_sym_ring_only_tail_ssd -- --ignored --test-threads=1"]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "test: values established by construction earlier in this fn"
+)]
+fn iso_sym_ring_only_tail_ssd_round_trip() {
+    let device = Device::Gpu;
+    let (kv_h, n_q, head_dim, prefill, steps) = (2_i32, 8_i32, 128_i32, 6_i32, 5_i32);
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    let mut c = seeded_iso_sym3_cache(kv_h, head_dim, 512);
+    let k = arr(
+        &lcg((prefill * kv_h * head_dim) as usize, 61),
+        &[1, kv_h, prefill, head_dim],
+    );
+    let v = arr(
+        &lcg((prefill * kv_h * head_dim) as usize, 62),
+        &[1, kv_h, prefill, head_dim],
+    );
+    let q = arr(
+        &lcg((prefill * n_q * head_dim) as usize, 63),
+        &[1, n_q, prefill, head_dim],
+    );
+    c.update_and_sdpa(&q, &k, &v, scale, "causal", None, device)
+        .unwrap();
+    c.exit_prefill(device).unwrap();
+    for i in 0..steps {
+        let k1 = arr(
+            &lcg((kv_h * head_dim) as usize, 71 + i as u64),
+            &[1, kv_h, 1, head_dim],
+        );
+        let v1 = arr(
+            &lcg((kv_h * head_dim) as usize, 81 + i as u64),
+            &[1, kv_h, 1, head_dim],
+        );
+        let q1 = arr(
+            &lcg((n_q * head_dim) as usize, 91 + i as u64),
+            &[1, n_q, 1, head_dim],
+        );
+        c.update_and_sdpa(&q1, &k1, &v1, scale, "", None, device)
+            .unwrap()
+            .eval()
+            .unwrap();
+    }
+
+    // Ring-as-sole-store precondition on BOTH axes + live full-prefix dequant.
+    let (orig_k, orig_v, orig_seq, k_block_tokens, v_block_tokens) = iso_sym3_probe(&c);
+    assert_eq!(orig_seq, prefill + steps, "shape[2] advanced with the ring");
+    assert_eq!(
+        k_block_tokens, 0,
+        "K CPU blocks dropped — the ring is the sole resident store"
+    );
+    assert_eq!(
+        v_block_tokens, 0,
+        "V CPU blocks dropped — the ring is the sole resident store (dequant rebuilt from ring)"
+    );
+
+    // Spill clone (materialises both tails) → write → hydrate.
+    let clone = c.try_deep_clone().unwrap();
+    let path = tmp_path("iso_sym_ring_only_tail");
+    write_caches(&path, device, MODEL_ID, KvQuant::Iso3Sym, &[clone], &[])
+        .expect("write_caches must persist the full materialised sym store");
+    let (hydrated, _lin) = read_caches(&path, device, MODEL_ID, KvQuant::Iso3Sym).unwrap();
+    let _ = std::fs::remove_file(&path);
+
+    let (hy_k, hy_v, hy_seq, _, _) = iso_sym3_probe(&hydrated[0]);
+    assert_eq!(
+        hy_seq,
+        prefill + steps,
+        "hydrated sym store must carry the full decoded length"
+    );
+    assert_eq!(hy_k.len(), orig_k.len(), "hydrated K length mismatch");
+    assert_eq!(hy_v.len(), orig_v.len(), "hydrated V length mismatch");
+    assert!(
+        max_abs_err(&orig_k, &hy_k) < 1e-6,
+        "hydrated K must match the live ring-only-tail dequant byte-for-byte"
+    );
+    assert!(
+        max_abs_err(&orig_v, &hy_v) < 1e-6,
+        "hydrated V must match the live ring-only-tail dequant byte-for-byte"
+    );
+}
+
+/// `truncate_to` keeps the V ring so a ring-only decode tail survives the
+/// speculative-decode rollback: after truncating mid-fused-decode, `dequant`
+/// still rebuilds the full `[0, n)` prefix from the ring instead of aborting on
+/// a short-blocks store.
+///
+/// On the sole-store path the CPU blocks are already empty (dropped once the ring
+/// went live), so `truncate_to`'s block loop is a no-op and the pre-existing
+/// `n_tokens`-vs-`n` unit mismatch (a separate, out-of-scope bug that only bites a
+/// non-empty `kv_h > 1` block set) does not engage — the ring supplies the whole
+/// kept prefix. `kv_h == 2` here to keep the fused kernel on the same
+/// multi-head path the round-trip test exercises.
+///
+/// Mutation check: re-add `self.gpu.clear()` to `QuantIsoV3::truncate_to` — the
+/// ring is dropped, the V blocks fall short of `shape[2]` with no ring, and
+/// `dequant()` returns the loud `synced_iso_v_blocks` error (RED).
+#[test]
+#[ignore = "GPU Metal context — run: cargo test -p rmlx-kv-ssd iso_sym_truncate_keeps_ring -- --ignored --test-threads=1"]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "test: values established by construction earlier in this fn"
+)]
+fn iso_sym_truncate_keeps_ring_tail() {
+    let device = Device::Gpu;
+    let (kv_h, n_q, head_dim, prefill, steps) = (2_i32, 8_i32, 128_i32, 6_i32, 6_i32);
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    let mut c = seeded_iso_sym3_cache(kv_h, head_dim, 512);
+    let k = arr(
+        &lcg((prefill * kv_h * head_dim) as usize, 101),
+        &[1, kv_h, prefill, head_dim],
+    );
+    let v = arr(
+        &lcg((prefill * kv_h * head_dim) as usize, 102),
+        &[1, kv_h, prefill, head_dim],
+    );
+    let q = arr(
+        &lcg((prefill * n_q * head_dim) as usize, 103),
+        &[1, n_q, prefill, head_dim],
+    );
+    c.update_and_sdpa(&q, &k, &v, scale, "causal", None, device)
+        .unwrap();
+    c.exit_prefill(device).unwrap();
+    for i in 0..steps {
+        let k1 = arr(
+            &lcg((kv_h * head_dim) as usize, 111 + i as u64),
+            &[1, kv_h, 1, head_dim],
+        );
+        let v1 = arr(
+            &lcg((kv_h * head_dim) as usize, 121 + i as u64),
+            &[1, kv_h, 1, head_dim],
+        );
+        let q1 = arr(
+            &lcg((n_q * head_dim) as usize, 131 + i as u64),
+            &[1, n_q, 1, head_dim],
+        );
+        c.update_and_sdpa(&q1, &k1, &v1, scale, "", None, device)
+            .unwrap()
+            .eval()
+            .unwrap();
+    }
+
+    // Full-length dequant before truncation (the reference prefix).
+    let (_ok, orig_v, orig_seq, _, _) = iso_sym3_probe(&c);
+    assert_eq!(orig_seq, prefill + steps);
+    let per_tok = (kv_h * head_dim) as usize;
+
+    // Truncate into the ring-only tail and confirm dequant still rebuilds it.
+    let keep = prefill + steps - 3;
+    c.truncate_to(keep);
+    let (_k2, v_after, seq_after, _, _) = iso_sym3_probe(&c);
+    assert_eq!(seq_after, keep, "shape[2] lowered to the truncation point");
+    assert_eq!(
+        v_after.len(),
+        (keep as usize) * per_tok,
+        "V dequant covers the kept prefix — the ring supplied the tail, no abort"
+    );
+    // Both dequants are head-major `[1, kv_h, S, D]`, so the sequence axis is in
+    // the middle — compare per (head, seq-position) rather than a flat slice.
+    let (orig_s, hd) = ((prefill + steps) as usize, head_dim as usize);
+    let keep_s = keep as usize;
+    for h in 0..kv_h as usize {
+        for s in 0..keep_s {
+            let a = &orig_v[(h * orig_s + s) * hd..(h * orig_s + s) * hd + hd];
+            let b = &v_after[(h * keep_s + s) * hd..(h * keep_s + s) * hd + hd];
+            assert!(
+                max_abs_err(a, b) < 1e-6,
+                "kept V (head {h}, pos {s}) must match the pre-truncation dequant"
+            );
+        }
+    }
+}
+
 /// `truncate_to` keeps the V ring so a ring-only decode tail survives the
 /// speculative-decode rollback: after truncating mid-fused-decode, `dequant`
 /// still rebuilds the full `[0, n)` prefix from the ring instead of aborting on
