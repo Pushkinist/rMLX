@@ -20,7 +20,7 @@ use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device, Dtype};
 
 use crate::isoquant::{iso_decode_fast, iso_encode_fast, IsoQuantError};
-use crate::storage::quant_iso_v::IsoBlocks;
+use crate::storage::quant_iso_v::{synced_iso_v_blocks, IsoBlocks};
 
 use super::QuantKGpuRing;
 
@@ -225,39 +225,47 @@ impl QuantIsoK3 {
     }
 
     /// Truncate the accumulated sequence to `n` tokens.
+    ///
+    /// The GPU ring is **kept**, not cleared — mirror of the rotor K store's
+    /// `truncate_to`. Lowering `shape[2]` to `n` makes the ring's logical fill
+    /// `n`; the stale `[n, prev)` capacity is overwritten by the next append and
+    /// never read (`packed_view` slices to `shape[2]`). This preserves any
+    /// ring-only decode tail up to `n`, so `dequant` / an SSD spill can still
+    /// rebuild it via [`synced_iso_v_blocks`]. Clearing the ring here would
+    /// discard the tail (the only copy of `[frozen_prefix, n)`), leaving `blocks`
+    /// short of `shape[2]` with no ring — the divergent state `dequant` rejects
+    /// loudly, which would abort generation on the speculative-decode rollback
+    /// path.
     pub fn truncate_to(&mut self, n: i32) {
-        let n_usize = n.max(0) as usize;
-        let mut acc: usize = 0;
-        let mut keep = 0usize;
-        for (i, blk) in self.blocks.iter().enumerate() {
-            if acc + blk.n_tokens <= n_usize {
-                acc += blk.n_tokens;
-                keep = i + 1;
-            } else {
-                break;
-            }
-        }
+        let keep =
+            super::truncate_keep_count(self.blocks.iter().map(|blk| blk.n_tokens), &self.shape, n);
         self.blocks.truncate(keep);
-        // The ring's filled prefix no longer matches `blocks`; drop it rather
-        // than leave a longer-than-truncated prefix live.
-        self.gpu.clear();
+        // NB: no `self.gpu.clear()` — the ring is the source of truth for a
+        // ring-only decode tail; see the doc comment above.
         if self.shape.len() >= 4 {
             self.shape[2] = n;
         }
     }
 
-    /// Deep-clone (CPU path is plain `Vec` clones).
+    /// Deep-clone.
+    ///
+    /// Materialises any ring-only decode tail into complete CPU blocks first —
+    /// mirror of [`super::QuantIsoV3::try_deep_clone`]. A short-blocks clone with
+    /// no ring would silently truncate the store; [`synced_iso_v_blocks`] rejects
+    /// that loudly instead.
     ///
     /// # Errors
-    /// Currently infallible on the CPU path; returns `Result` for parity.
+    /// Forwards a [`synced_iso_v_blocks`] reconciliation error.
     pub fn try_deep_clone(&self) -> Result<Self> {
+        let blocks =
+            synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, Device::Gpu)?.into_owned();
         Ok(Self {
-            blocks: self.blocks.clone(),
             // The clone starts CPU-only: `blocks` carries the full payload, so
             // the ring re-seeds from them on the clone's first GPU append.
             // Sharing the source's Arrays would alias one ring across two
             // independent caches.
             gpu: QuantKGpuRing::default(),
+            blocks,
             shape: self.shape.clone(),
             max_seq: self.max_seq,
             bits: self.bits,
@@ -384,7 +392,29 @@ impl QuantIsoK3 {
         let head_dim = self.shape[3] as usize;
         let total_elems: usize = self.shape.iter().map(|&d| d as usize).product();
         let mut out: Vec<f32> = Vec::with_capacity(total_elems);
-        for blk in &self.blocks {
+
+        // Reconcile the CPU blocks with the GPU ring: on the fused K-only /
+        // symmetric decode path the decode tail lives only in the ring
+        // (`blocks` trail `shape[2]`), and this rebuilds it on demand rather than
+        // decoding a short prefix and zero-padding the gap. Loud on any
+        // unrecoverable disagreement.
+        let blocks = synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, Device::Gpu)?;
+
+        if blocks.is_empty() {
+            // Loud on a lost decode tail — see [`super::QuantIsoV3::dequant`].
+            // (Zeros are layout-invariant, so the genuine no-token case needs no
+            // reorder.)
+            if total_elems != 0 {
+                return Err(Error::Mlx(format!(
+                    "QuantIsoK3::dequant: no blocks but shape {:?} implies {total_elems} elems — \
+                     refusing to zero-pad a lost decode tail",
+                    self.shape
+                )));
+            }
+            return Ok(out);
+        }
+
+        for blk in blocks.iter() {
             let dec = iso_decode_fast(
                 &blk.codes,
                 &blk.scales,
@@ -397,10 +427,16 @@ impl QuantIsoK3 {
             .map_err(|e: IsoQuantError| Error::Mlx(format!("iso_k3 decode: {e}")))?;
             out.extend_from_slice(&dec);
         }
-        if out.len() < total_elems {
-            out.resize(total_elems, 0.0);
-        } else if out.len() > total_elems {
-            out.truncate(total_elems);
+        // `synced_iso_v_blocks` guarantees the blocks cover `shape[2]`, so a
+        // length mismatch here is an internal invariant break — surface it loudly
+        // rather than zero-padding or truncating a decoded prefix.
+        if out.len() != total_elems {
+            return Err(Error::Mlx(format!(
+                "QuantIsoK3::dequant: decoded {} elems but shape {:?} implies {total_elems} — \
+                 refusing to zero-pad / truncate",
+                out.len(),
+                self.shape
+            )));
         }
         // Blocks are sequence-major (see `append`); reorder back to the logical
         // head-major `[B, kv_h, S, D]`.

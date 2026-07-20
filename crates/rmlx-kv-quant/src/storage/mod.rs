@@ -63,6 +63,7 @@ pub use quant_iso_k::{
     iso_n_groups_for, QuantIsoK3, ISO_K3_BITS, ISO_K3_GROUP_SIZE, ISO_QUAT_BLOCK_SIZE,
 };
 pub use quant_iso_k4::{QuantIsoK4, ISO_K4_BITS, ISO_K4_GROUP_SIZE};
+pub(crate) use quant_iso_v::synced_iso_v_blocks;
 pub use quant_iso_v::{IsoBlocks, QuantIsoV3, ISO3_BITS, ISO3_GROUP_SIZE};
 pub use quant_iso_v4::{QuantIsoV4, ISO4_BITS, ISO4_GROUP_SIZE};
 pub use quant_k::QuantK;
@@ -88,6 +89,11 @@ mod quant_rotor_k_qjl_tests;
 #[path = "quant_planar_k_tests.rs"]
 mod quant_planar_k_tests;
 
+// `truncate_keep_count` row/sequence unit-conversion tests (#284).
+#[cfg(test)]
+#[path = "truncate_keep_count_tests.rs"]
+mod truncate_keep_count_tests;
+
 // ── Paged KV growth ───────────────────────────────────────────────────────────
 //
 // GPU quantized buffers are allocated in multiples of PAGE_SIZE tokens instead
@@ -101,3 +107,50 @@ mod quant_planar_k_tests;
 // capped at max_seq. At 64K / 256 that is at most 256 reallocations total per
 // layer per request — acceptable versus ~40% peak-memory reduction.
 pub const KV_PAGE_SIZE: i32 = 256;
+
+// ── Shared truncate-to-sequence helper ───────────────────────────────────────
+//
+// Every rotor/iso K and V store accumulates per-append blocks whose `n_tokens`
+// field counts **rows** (`b * kv_h * seq_of_block`), not raw sequence
+// positions — see the dequant-time reconciliation guards (e.g.
+// `synced_rotor_v_blocks`, `synced_iso_v_blocks`) that sum `n_tokens` and
+// compare against `b * kv_h * shape[2]`. `truncate_to(n)` takes `n` as a
+// **sequence** target, so `n` must be converted to the same row units before
+// it is compared against the cumulative `n_tokens` — otherwise, at `kv_h > 1`
+// (or `b > 1`), each block's `n_tokens` is inflated by that factor and the
+// walk overshoots the target early, dropping blocks that should have been
+// kept. This was invisible at `b * kv_h == 1` (the row and sequence counts
+// coincide there), which is how the bug shipped.
+
+/// Compute how many leading blocks to keep when truncating a KV-quant store's
+/// accumulated sequence to `n` tokens.
+///
+/// `block_tokens` is each block's `n_tokens` (rows), in append order.
+/// `shape` is the store's `[b, kv_h, seq, head_dim]`. Returns the count of
+/// leading blocks whose summed `n_tokens` is `<= n * b * kv_h`.
+///
+/// A degenerate `b * kv_h == 0` shape (nothing appended yet) keeps no blocks.
+pub(crate) fn truncate_keep_count(
+    block_tokens: impl Iterator<Item = usize>,
+    shape: &[i32],
+    n: i32,
+) -> usize {
+    let b = shape.first().copied().unwrap_or(0).max(0) as usize;
+    let kv_h = shape.get(1).copied().unwrap_or(0).max(0) as usize;
+    let factor = b.saturating_mul(kv_h);
+    if factor == 0 {
+        return 0;
+    }
+    let n_rows = (n.max(0) as usize).saturating_mul(factor);
+    let mut acc: usize = 0;
+    let mut keep = 0usize;
+    for (i, tokens) in block_tokens.enumerate() {
+        if acc + tokens <= n_rows {
+            acc += tokens;
+            keep = i + 1;
+        } else {
+            break;
+        }
+    }
+    keep
+}

@@ -184,8 +184,29 @@ fn iso4_gpu_append_into_k_blocks(
 ) -> Result<()> {
     let head_dim = head_dim_from_shape(new_shape, "iso4_gpu_append_into_k_blocks")?;
     let seq_major = packed_k_chunk_seq_major(new_k, new_shape, device)?;
+    if is_ring_only_append(feed, new_shape) {
+        // Ring-only tail — see [`iso3_gpu_append_into_k_blocks`].
+        let gpu = iso_gpu_encode_ring_only(&seq_major, new_shape, ISO_K4_BITS)?;
+        iso4_sync_ring(
+            ks,
+            &gpu,
+            RingFeed::Maintain,
+            new_shape,
+            head_dim,
+            max_seq,
+            device,
+        )?;
+        bump_rotor_k_shape(&mut ks.shape, new_shape);
+        return Ok(());
+    }
+    materialize_iso_k4_ring_tail(ks, device)?;
+    let block_feed = if feed == RingFeed::Skip {
+        RingFeed::Skip
+    } else {
+        RingFeed::Maintain
+    };
     let (block, gpu) = iso_gpu_encode_block_retaining(&seq_major, new_shape, ISO_K4_BITS)?;
-    iso4_sync_ring(ks, &gpu, feed, new_shape, head_dim, max_seq, device)?;
+    iso4_sync_ring(ks, &gpu, block_feed, new_shape, head_dim, max_seq, device)?;
     push_iso4_k_block(ks, block, new_shape);
     Ok(())
 }
@@ -243,8 +264,36 @@ fn iso3_gpu_append_into_k_blocks(
 ) -> Result<()> {
     let head_dim = head_dim_from_shape(new_shape, "iso3_gpu_append_into_k_blocks")?;
     let seq_major = packed_k_chunk_seq_major(new_k, new_shape, device)?;
+    if is_ring_only_append(feed, new_shape) {
+        // Ring-only tail: feed the GPU ring, advance `shape[2]`, and skip the
+        // per-step host download + CPU block push. The ring is the source of
+        // truth for the decode tail; the blocks are rebuilt on demand at a
+        // `dequant()` / SSD-spill boundary (`synced_iso_v_blocks`).
+        let gpu = iso_gpu_encode_ring_only(&seq_major, new_shape, ISO_K3_BITS)?;
+        iso3_sync_ring(
+            ks,
+            &gpu,
+            RingFeed::Maintain,
+            new_shape,
+            head_dim,
+            max_seq,
+            device,
+        )?;
+        bump_rotor_k_shape(&mut ks.shape, new_shape);
+        return Ok(());
+    }
+    // Block path: prefill / non-fused decode (Maintain) and the K-side of the
+    // legacy sym fallback (Skip). A ring-only feed that reaches here is a `b > 1`
+    // chunk — normalise it to Maintain so the shared ring feeder clears the ring
+    // for the un-representable batch and the CPU block carries the data.
+    materialize_iso_k3_ring_tail(ks, device)?;
+    let block_feed = if feed == RingFeed::Skip {
+        RingFeed::Skip
+    } else {
+        RingFeed::Maintain
+    };
     let (block, gpu) = iso_gpu_encode_block_retaining(&seq_major, new_shape, ISO_K3_BITS)?;
-    iso3_sync_ring(ks, &gpu, feed, new_shape, head_dim, max_seq, device)?;
+    iso3_sync_ring(ks, &gpu, block_feed, new_shape, head_dim, max_seq, device)?;
     push_iso3_k_block(ks, block, new_shape);
     Ok(())
 }
@@ -1460,6 +1509,119 @@ fn iso_gpu_encode_block_retaining(
     ))
 }
 
+/// GPU-encode one iso K/V chunk for the **ring-only** append path: feed the GPU
+/// ring without paying the per-step host download that
+/// [`iso_gpu_encode_block_retaining`] does.
+///
+/// The fused decode kernel reads the ring, never the CPU `IsoBlocks`, so
+/// downloading and materialising a block per decode step is pure host work in
+/// the path whose purpose is removing host work. Skipping it leaves the ring the
+/// sole source of truth for the decode tail; the CPU blocks are rebuilt from the
+/// ring on demand at a `dequant()` / SSD-spill boundary (`synced_iso_v_blocks`),
+/// and the `blocks`-vs-`shape[2]` invariant is enforced loudly there — never
+/// zero-padded. Mirror of [`rotor_gpu_encode_ring_only`].
+///
+/// `bits` selects the encode kernel explicitly; anything but 3 or 4 is an error.
+fn iso_gpu_encode_ring_only(
+    new_kv: &Array,
+    new_shape: &[i32],
+    bits: u8,
+) -> Result<PackedKEncodedGpu> {
+    let head_dim = head_dim_from_shape(new_shape, "iso_gpu_encode_ring_only")?;
+    let (b, kv_h, s) = b_kv_h_new_seq(new_shape)?;
+    let n_tokens_total = (b as usize) * (kv_h as usize) * (s as usize);
+    let n_groups = iso_n_groups_for(head_dim);
+    if n_groups == 0 {
+        return Err(Error::Quant(format!(
+            "iso_gpu_encode_ring_only: head_dim={head_dim} yields no quaternion groups"
+        )));
+    }
+    let (codes_arr, scales_arr, _quats_arr, norms_arr) = match bits {
+        ISO_K3_BITS => crate::isoquant_msl::iso_quantize_v3_gpu(new_kv, head_dim, Device::Gpu)?,
+        ISO_K4_BITS => crate::isoquant_msl_v4::iso_quantize_v4_gpu(new_kv, head_dim, Device::Gpu)?,
+        other => {
+            return Err(Error::Quant(format!(
+                "iso_gpu_encode_ring_only: unsupported bits={other} (only 3 and 4); \
+                 refusing to encode with another width's kernel"
+            )))
+        }
+    };
+    // Collapse per-group norms to the per-token form the ring stores (GPU-side,
+    // no host round-trip).
+    let norms_per_token = collapse_group_norms_to_token(&norms_arr, n_tokens_total, n_groups)?;
+    Ok(PackedKEncodedGpu {
+        codes: codes_arr,
+        scales: scales_arr,
+        norms: norms_per_token,
+    })
+}
+
+/// Reconcile a pre-existing ring-only decode tail into `ks.blocks` before a
+/// block-path append — iso mirror of [`materialize_rotor_k3_ring_tail`]. No-op
+/// when `blocks` already cover `shape[2]` (reads no GPU).
+fn materialize_iso_k3_ring_tail(ks: &mut QuantIsoK3, device: Device) -> Result<()> {
+    if !ks.gpu.is_allocated() {
+        return Ok(());
+    }
+    let rebuilt = match crate::storage::synced_iso_v_blocks(&ks.blocks, &ks.shape, &ks.gpu, device)?
+    {
+        std::borrow::Cow::Owned(full) => Some(full),
+        std::borrow::Cow::Borrowed(_) => None,
+    };
+    if let Some(full) = rebuilt {
+        ks.blocks = full;
+    }
+    Ok(())
+}
+
+/// Mirror of [`materialize_iso_k3_ring_tail`] for [`QuantIsoK4`].
+fn materialize_iso_k4_ring_tail(ks: &mut QuantIsoK4, device: Device) -> Result<()> {
+    if !ks.gpu.is_allocated() {
+        return Ok(());
+    }
+    let rebuilt = match crate::storage::synced_iso_v_blocks(&ks.blocks, &ks.shape, &ks.gpu, device)?
+    {
+        std::borrow::Cow::Owned(full) => Some(full),
+        std::borrow::Cow::Borrowed(_) => None,
+    };
+    if let Some(full) = rebuilt {
+        ks.blocks = full;
+    }
+    Ok(())
+}
+
+/// Mirror of [`materialize_iso_k3_ring_tail`] for [`QuantIsoV3`].
+fn materialize_iso_v3_ring_tail(vs: &mut QuantIsoV3, device: Device) -> Result<()> {
+    if !vs.gpu.is_allocated() {
+        return Ok(());
+    }
+    let rebuilt = match crate::storage::synced_iso_v_blocks(&vs.blocks, &vs.shape, &vs.gpu, device)?
+    {
+        std::borrow::Cow::Owned(full) => Some(full),
+        std::borrow::Cow::Borrowed(_) => None,
+    };
+    if let Some(full) = rebuilt {
+        vs.blocks = full;
+    }
+    Ok(())
+}
+
+/// Mirror of [`materialize_iso_v3_ring_tail`] for [`QuantIsoV4`].
+fn materialize_iso_v4_ring_tail(vs: &mut QuantIsoV4, device: Device) -> Result<()> {
+    if !vs.gpu.is_allocated() {
+        return Ok(());
+    }
+    let rebuilt = match crate::storage::synced_iso_v_blocks(&vs.blocks, &vs.shape, &vs.gpu, device)?
+    {
+        std::borrow::Cow::Owned(full) => Some(full),
+        std::borrow::Cow::Borrowed(_) => None,
+    };
+    if let Some(full) = rebuilt {
+        vs.blocks = full;
+    }
+    Ok(())
+}
+
 /// Append `new_k` into a live `IsoKOnly3` store's GPU ring (+ CPU blocks),
 /// lazily creating the store on first use. No dequant — this is the entry point
 /// the iso flash-decode SDPA path uses.
@@ -1491,7 +1653,19 @@ pub(super) fn iso3_k_only_gpu_append(
     let Some(ks) = k.as_mut() else {
         return Err(Error::Mlx("IsoKOnly3 K buffer absent after init".into()));
     };
-    iso3_gpu_append_into_k_blocks(ks, new_k, new_shape, device, RingFeed::Maintain, max_seq)
+    // Ring-only tail: the fused iso K-only flash decode reads the ring, never the
+    // CPU blocks, so skip the per-step host download; the blocks are rebuilt from
+    // the ring on demand at a `dequant()` / SSD-spill boundary.
+    iso3_gpu_append_into_k_blocks(
+        ks,
+        new_k,
+        new_shape,
+        device,
+        RingFeed::MaintainRingOnly,
+        max_seq,
+    )?;
+    drop_blocks_when_ring_live_iso_k3(ks);
+    Ok(())
 }
 
 /// Mirror of [`iso3_k_only_gpu_append`] for `IsoKOnly4`.
@@ -1523,7 +1697,309 @@ pub(super) fn iso4_k_only_gpu_append(
     let Some(ks) = k.as_mut() else {
         return Err(Error::Mlx("IsoKOnly4 K buffer absent after init".into()));
     };
-    iso4_gpu_append_into_k_blocks(ks, new_k, new_shape, device, RingFeed::Maintain, max_seq)
+    // Ring-only tail — see [`iso3_k_only_gpu_append`].
+    iso4_gpu_append_into_k_blocks(
+        ks,
+        new_k,
+        new_shape,
+        device,
+        RingFeed::MaintainRingOnly,
+        max_seq,
+    )?;
+    drop_blocks_when_ring_live_iso_k4(ks);
+    Ok(())
+}
+
+/// Append `new_k` / `new_v` into a live `IsoSym3` store's GPU rings (ring-only
+/// tail on both axes), lazily creating the stores on first use. No dequant on
+/// either axis — this is the entry point the iso symmetric quant-V flash-decode
+/// SDPA path uses. Mirror of [`rotor3_sym_gpu_append`].
+///
+/// # Errors
+///
+/// Returns [`Error::KvStorageMismatch`] when the active storage is not
+/// `IsoSym3`, and forwards encode / ring errors.
+pub(super) fn iso3_sym_gpu_append(
+    cache: &mut KvCache,
+    new_k: &Array,
+    new_v: &Array,
+    new_shape: &[i32],
+    device: Device,
+) -> Result<()> {
+    let KvStorage::IsoSym3 { k, v, max_seq } = &mut cache.storage else {
+        return Err(Error::KvStorageMismatch {
+            expected: "IsoSym3",
+            got: storage_variant_name(&cache.storage),
+        });
+    };
+    let max_seq = *max_seq;
+    let mut init_shape = new_shape.to_vec();
+    if let Some(s) = init_shape.get_mut(2) {
+        *s = 0;
+    }
+    if k.is_none() {
+        *k = Some(QuantIsoK3::new(init_shape.clone(), max_seq));
+    }
+    if v.is_none() {
+        *v = Some(QuantIsoV3::new(init_shape));
+    }
+    let Some(ks) = k.as_mut() else {
+        return Err(Error::Mlx("IsoSym3 K buffer absent after init".into()));
+    };
+    iso3_gpu_append_into_k_blocks(
+        ks,
+        new_k,
+        new_shape,
+        device,
+        RingFeed::MaintainRingOnly,
+        max_seq,
+    )?;
+    // Ring is now the sole resident store for K — drop the redundant CPU blocks
+    // (the prefill prefix, seeded into the ring on the first fused-decode step).
+    drop_blocks_when_ring_live_iso_k3(ks);
+    let Some(vs) = v.as_mut() else {
+        return Err(Error::Mlx("IsoSym3 V buffer absent after init".into()));
+    };
+    iso3_gpu_append_into_v_blocks(
+        vs,
+        new_v,
+        new_shape,
+        device,
+        RingFeed::MaintainRingOnly,
+        max_seq,
+    )?;
+    // The GPU ring holds the full prefix; the fused decode reads the ring, and
+    // `dequant` / SSD spill / clone / truncate rebuild the CPU blocks on demand
+    // from it (`synced_iso_v_blocks`).
+    drop_blocks_when_ring_live_iso_v3(vs);
+    Ok(())
+}
+
+/// Mirror of [`iso3_sym_gpu_append`] for `IsoSym4`.
+///
+/// # Errors
+///
+/// Returns [`Error::KvStorageMismatch`] when the active storage is not
+/// `IsoSym4`, and forwards encode / ring errors.
+pub(super) fn iso4_sym_gpu_append(
+    cache: &mut KvCache,
+    new_k: &Array,
+    new_v: &Array,
+    new_shape: &[i32],
+    device: Device,
+) -> Result<()> {
+    let KvStorage::IsoSym4 { k, v, max_seq } = &mut cache.storage else {
+        return Err(Error::KvStorageMismatch {
+            expected: "IsoSym4",
+            got: storage_variant_name(&cache.storage),
+        });
+    };
+    let max_seq = *max_seq;
+    let mut init_shape = new_shape.to_vec();
+    if let Some(s) = init_shape.get_mut(2) {
+        *s = 0;
+    }
+    if k.is_none() {
+        *k = Some(QuantIsoK4::new(init_shape.clone(), max_seq));
+    }
+    if v.is_none() {
+        *v = Some(QuantIsoV4::new(init_shape, max_seq));
+    }
+    let Some(ks) = k.as_mut() else {
+        return Err(Error::Mlx("IsoSym4 K buffer absent after init".into()));
+    };
+    iso4_gpu_append_into_k_blocks(
+        ks,
+        new_k,
+        new_shape,
+        device,
+        RingFeed::MaintainRingOnly,
+        max_seq,
+    )?;
+    drop_blocks_when_ring_live_iso_k4(ks);
+    let Some(vs) = v.as_mut() else {
+        return Err(Error::Mlx("IsoSym4 V buffer absent after init".into()));
+    };
+    iso4_gpu_append_into_v_blocks(
+        vs,
+        new_v,
+        new_shape,
+        device,
+        RingFeed::MaintainRingOnly,
+        max_seq,
+    )?;
+    drop_blocks_when_ring_live_iso_v4(vs);
+    Ok(())
+}
+
+/// Drop an iso K store's CPU blocks once its GPU ring is live — the ring is then
+/// the sole resident copy. No-op until the ring is allocated or for any store
+/// that never feeds a ring.
+fn drop_blocks_when_ring_live_iso_k3(ks: &mut QuantIsoK3) {
+    if ks.gpu.is_allocated() {
+        ks.blocks.clear();
+        ks.blocks.shrink_to_fit();
+    }
+}
+
+/// Mirror of [`drop_blocks_when_ring_live_iso_k3`] for [`QuantIsoK4`].
+fn drop_blocks_when_ring_live_iso_k4(ks: &mut QuantIsoK4) {
+    if ks.gpu.is_allocated() {
+        ks.blocks.clear();
+        ks.blocks.shrink_to_fit();
+    }
+}
+
+/// Drop an iso V store's CPU blocks once its GPU ring is live.
+fn drop_blocks_when_ring_live_iso_v3(vs: &mut QuantIsoV3) {
+    if vs.gpu.is_allocated() {
+        vs.blocks.clear();
+        vs.blocks.shrink_to_fit();
+    }
+}
+
+/// Mirror of [`drop_blocks_when_ring_live_iso_v3`] for [`QuantIsoV4`].
+fn drop_blocks_when_ring_live_iso_v4(vs: &mut QuantIsoV4) {
+    if vs.gpu.is_allocated() {
+        vs.blocks.clear();
+        vs.blocks.shrink_to_fit();
+    }
+}
+
+/// V-side append with a ring-only branch — mirror of
+/// [`iso3_gpu_append_into_k_blocks`] for [`QuantIsoV3`]. The iso codec is
+/// axis-agnostic, so V encodes through the same kernel as K.
+fn iso3_gpu_append_into_v_blocks(
+    vs: &mut QuantIsoV3,
+    new_v: &Array,
+    new_shape: &[i32],
+    device: Device,
+    feed: RingFeed,
+    max_seq: i32,
+) -> Result<()> {
+    let head_dim = head_dim_from_shape(new_shape, "iso3_gpu_append_into_v_blocks")?;
+    let seq_major = packed_k_chunk_seq_major(new_v, new_shape, device)?;
+    if is_ring_only_append(feed, new_shape) {
+        let gpu = iso_gpu_encode_ring_only(&seq_major, new_shape, ISO_K3_BITS)?;
+        iso3_v_sync_ring(
+            vs,
+            &gpu,
+            RingFeed::Maintain,
+            new_shape,
+            head_dim,
+            max_seq,
+            device,
+        )?;
+        bump_rotor_k_shape(&mut vs.shape, new_shape);
+        return Ok(());
+    }
+    materialize_iso_v3_ring_tail(vs, device)?;
+    let block_feed = if feed == RingFeed::Skip {
+        RingFeed::Skip
+    } else {
+        RingFeed::Maintain
+    };
+    let (block, gpu) = iso_gpu_encode_block_retaining(&seq_major, new_shape, ISO_K3_BITS)?;
+    iso3_v_sync_ring(vs, &gpu, block_feed, new_shape, head_dim, max_seq, device)?;
+    vs.blocks.push(block);
+    bump_rotor_k_shape(&mut vs.shape, new_shape);
+    Ok(())
+}
+
+/// Mirror of [`iso3_gpu_append_into_v_blocks`] for [`QuantIsoV4`].
+fn iso4_gpu_append_into_v_blocks(
+    vs: &mut QuantIsoV4,
+    new_v: &Array,
+    new_shape: &[i32],
+    device: Device,
+    feed: RingFeed,
+    max_seq: i32,
+) -> Result<()> {
+    let head_dim = head_dim_from_shape(new_shape, "iso4_gpu_append_into_v_blocks")?;
+    let seq_major = packed_k_chunk_seq_major(new_v, new_shape, device)?;
+    if is_ring_only_append(feed, new_shape) {
+        let gpu = iso_gpu_encode_ring_only(&seq_major, new_shape, ISO_K4_BITS)?;
+        iso4_v_sync_ring(
+            vs,
+            &gpu,
+            RingFeed::Maintain,
+            new_shape,
+            head_dim,
+            max_seq,
+            device,
+        )?;
+        bump_rotor_k_shape(&mut vs.shape, new_shape);
+        return Ok(());
+    }
+    materialize_iso_v4_ring_tail(vs, device)?;
+    let block_feed = if feed == RingFeed::Skip {
+        RingFeed::Skip
+    } else {
+        RingFeed::Maintain
+    };
+    let (block, gpu) = iso_gpu_encode_block_retaining(&seq_major, new_shape, ISO_K4_BITS)?;
+    iso4_v_sync_ring(vs, &gpu, block_feed, new_shape, head_dim, max_seq, device)?;
+    vs.blocks.push(block);
+    bump_rotor_k_shape(&mut vs.shape, new_shape);
+    Ok(())
+}
+
+/// V-side mirror of [`iso3_sync_ring`] for [`QuantIsoV3`].
+fn iso3_v_sync_ring(
+    vs: &mut QuantIsoV3,
+    gpu: &PackedKEncodedGpu,
+    feed: RingFeed,
+    new_shape: &[i32],
+    head_dim: usize,
+    max_seq: i32,
+    device: Device,
+) -> Result<()> {
+    let (b, kv_h, new_seq) = b_kv_h_new_seq(new_shape)?;
+    if feed != RingFeed::Maintain || b != 1 {
+        vs.gpu.clear();
+        return Ok(());
+    }
+    let prev_seq = accumulated_seq(&vs.shape);
+    vs.gpu_append(
+        &gpu.codes,
+        &gpu.scales,
+        &gpu.norms,
+        kv_h,
+        head_dim as i32,
+        prev_seq,
+        new_seq,
+        max_seq,
+        device,
+    )
+}
+
+/// Mirror of [`iso3_v_sync_ring`] for [`QuantIsoV4`].
+fn iso4_v_sync_ring(
+    vs: &mut QuantIsoV4,
+    gpu: &PackedKEncodedGpu,
+    feed: RingFeed,
+    new_shape: &[i32],
+    head_dim: usize,
+    max_seq: i32,
+    device: Device,
+) -> Result<()> {
+    let (b, kv_h, new_seq) = b_kv_h_new_seq(new_shape)?;
+    if feed != RingFeed::Maintain || b != 1 {
+        vs.gpu.clear();
+        return Ok(());
+    }
+    let prev_seq = accumulated_seq(&vs.shape);
+    vs.gpu_append(
+        &gpu.codes,
+        &gpu.scales,
+        &gpu.norms,
+        kv_h,
+        head_dim as i32,
+        prev_seq,
+        new_seq,
+        max_seq,
+        device,
+    )
 }
 
 /// Feed one encoded iso3 chunk into the store's GPU ring.

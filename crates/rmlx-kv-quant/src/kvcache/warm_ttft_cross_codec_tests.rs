@@ -6,13 +6,17 @@
 //! than code-reading:
 //!
 //! 1. **Shortcut codecs** (`decode_fp16_k.is_some()` early-return present):
-//!    K8V4, K8V8, Iso3Sym (asserted in this file). TurboSym3 is covered by
-//!    code-reading (same `update_decode_fp16` dispatch path); PlanarK is
-//!    asserted in the sibling `warm_ttft_tests.rs`. After `exit_prefill`
-//!    the bf16 K+V mirror is live; every decode `update()` routes through
-//!    `update_decode_fp16` and the quant codec stays **frozen** (its
-//!    `shape[2]` does not advance past the prefill length). Decode-phase K
-//!    AND V are bf16, not re-quantised.
+//!    K8V4, K8V8 (asserted in this file). TurboSym3 is covered by code-reading
+//!    (same `update_decode_fp16` dispatch path); PlanarK is asserted in the
+//!    sibling `warm_ttft_tests.rs`. After `exit_prefill` the bf16 K+V mirror is
+//!    live; every decode `update()` routes through `update_decode_fp16` and the
+//!    quant codec stays **frozen** (its `shape[2]` does not advance past the
+//!    prefill length). Decode-phase K AND V are bf16, not re-quantised.
+//!
+//!    `Iso3Sym` used to be in this class but is now a **fused symmetric** codec:
+//!    it keeps no bf16 mirror on either axis (decode reads both packed iso
+//!    rings), so it is asserted alongside the K-only family below rather than
+//!    here — see `iso_sym3_fused_no_seed_at_decode`.
 //!
 //! 2. **K-only codecs** (no `decode_fp16_k.is_some()` shortcut in the
 //!    `update_<arch>` body; V via the V-only helper): IsoKOnly3,
@@ -233,9 +237,38 @@ fn k8v8_warm_ttft_freezes_codec() {
     assert_shortcut_codec(KvQuant::K8V8, k8_codec_seq);
 }
 
+/// Fused-symmetric contract: `Iso3Sym` is NOT a warm-TTFT shortcut codec. Its
+/// decode is the quant-V flash kernel over both packed iso rings (on GPU) / a
+/// re-quantise of both axes (on CPU), so NEITHER bf16 seed is materialised
+/// (`feeds_bf16_k_at_decode` and `feeds_bf16_v_at_decode` are both `false`) and
+/// the K codec advances one position per decode step rather than freezing.
 #[test]
-fn iso_sym3_warm_ttft_freezes_codec() {
-    assert_shortcut_codec(KvQuant::Iso3Sym, iso_sym3_k_codec_seq);
+fn iso_sym3_fused_no_seed_at_decode() {
+    let device = Device::Cpu;
+    let mut cache = KvCache::with_quant_max_seq(KvQuant::Iso3Sym, TEST_MAX_SEQ);
+    let out = drive_one_decode(&mut cache, device);
+
+    // Fused symmetric: neither bf16 seed is materialised — the codec exists to
+    // delete that mirror.
+    assert!(
+        !out.k_seed_live,
+        "Iso3Sym: exit_prefill must NOT populate decode_fp16_k (fused, no mirror)"
+    );
+    assert!(
+        !out.v_seed_live,
+        "Iso3Sym: exit_prefill must NOT populate decode_fp16_v (fused, no mirror)"
+    );
+    // The K codec advances at decode — no warm-TTFT shortcut.
+    assert_eq!(
+        iso_sym3_k_codec_seq(&cache),
+        TEST_PREFILL_SEQ + 1,
+        "Iso3Sym: K codec MUST advance by 1 per decode step (no bf16 seed to freeze on)"
+    );
+    assert_eq!(
+        out.offset,
+        TEST_PREFILL_SEQ + 1,
+        "Iso3Sym offset after one decode step"
+    );
 }
 
 /// K-only contract: IsoKOnly3 quantises K at every decode step and

@@ -11,12 +11,12 @@
 )]
 //! Quantized K buffer: `QuantIsoK4` (IsoQuant 4-bit K codec).
 
-use rmlx_core::error::Result;
+use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device};
 
 use crate::isoquant::{iso_decode_fast, iso_encode_fast, IsoQuantError};
 use crate::storage::quant_iso_k::iso_n_groups_i32;
-use crate::storage::quant_iso_v::IsoBlocks;
+use crate::storage::quant_iso_v::{synced_iso_v_blocks, IsoBlocks};
 
 use super::QuantKGpuRing;
 
@@ -82,7 +82,7 @@ impl QuantIsoK4 {
     /// Forwards any [`IsoQuantError`] from [`iso_encode_fast`].
     pub fn append(&mut self, f32_data: &[f32], new_shape: &[i32]) -> Result<()> {
         if new_shape.len() != 4 {
-            return Err(rmlx_core::error::Error::Mlx(format!(
+            return Err(Error::Mlx(format!(
                 "QuantIsoK4::append: expected 4D new_shape, got {new_shape:?}"
             )));
         }
@@ -99,9 +99,8 @@ impl QuantIsoK4 {
             super::seq_layout::transpose_heads_seq(f32_data, b, kv_h, new_seq, head_dim);
 
         let (codes, scales, quaternions, norms) =
-            iso_encode_fast(&seq_major, head_dim, ISO_K4_GROUP_SIZE, ISO_K4_BITS).map_err(
-                |e: IsoQuantError| rmlx_core::error::Error::Mlx(format!("iso_k4 encode: {e}")),
-            )?;
+            iso_encode_fast(&seq_major, head_dim, ISO_K4_GROUP_SIZE, ISO_K4_BITS)
+                .map_err(|e: IsoQuantError| Error::Mlx(format!("iso_k4 encode: {e}")))?;
 
         self.blocks.push(IsoBlocks {
             codes,
@@ -159,22 +158,16 @@ impl QuantIsoK4 {
     }
 
     /// Truncate the accumulated sequence to `n` tokens.
+    ///
+    /// The GPU ring is **kept**, not cleared — mirror of
+    /// [`crate::storage::QuantIsoK3::truncate_to`] (the ring-only-tail
+    /// treatment). Clearing it would discard a ring-only decode tail.
     pub fn truncate_to(&mut self, n: i32) {
-        let n_usize = n.max(0) as usize;
-        let mut acc: usize = 0;
-        let mut keep = 0usize;
-        for (i, blk) in self.blocks.iter().enumerate() {
-            if acc + blk.n_tokens <= n_usize {
-                acc += blk.n_tokens;
-                keep = i + 1;
-            } else {
-                break;
-            }
-        }
+        let keep =
+            super::truncate_keep_count(self.blocks.iter().map(|blk| blk.n_tokens), &self.shape, n);
         self.blocks.truncate(keep);
-        // The ring's filled prefix no longer matches `blocks`; drop it rather
-        // than leave a longer-than-truncated prefix live.
-        self.gpu.clear();
+        // NB: no `self.gpu.clear()` — the ring is the source of truth for a
+        // ring-only decode tail; see the doc comment above.
         if self.shape.len() >= 4 {
             self.shape[2] = n;
         }
@@ -182,14 +175,19 @@ impl QuantIsoK4 {
 
     /// Deep-clone.
     ///
+    /// Materialises any ring-only decode tail into complete CPU blocks first —
+    /// mirror of [`crate::storage::QuantIsoK3::try_deep_clone`].
+    ///
     /// # Errors
-    /// Currently infallible on the CPU path; returns `Result` for parity.
+    /// Forwards a [`synced_iso_v_blocks`] reconciliation error.
     pub fn try_deep_clone(&self) -> Result<Self> {
+        let blocks =
+            synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, Device::Gpu)?.into_owned();
         Ok(Self {
-            blocks: self.blocks.clone(),
             // The clone starts CPU-only — see
             // [`crate::storage::QuantIsoK3::try_deep_clone`].
             gpu: QuantKGpuRing::default(),
+            blocks,
             shape: self.shape.clone(),
             max_seq: self.max_seq,
             bits: self.bits,
@@ -224,7 +222,7 @@ impl QuantIsoK4 {
     ///
     /// # Errors
     ///
-    /// Returns [`rmlx_core::error::Error::Quant`] when `head_dim` violates the
+    /// Returns [`Error::Quant`] when `head_dim` violates the
     /// group-size invariant, and forwards ring errors.
     #[allow(clippy::too_many_arguments)]
     pub fn gpu_append(
@@ -289,7 +287,7 @@ impl QuantIsoK4 {
     /// Returns an `Error::Mlx` if the underlying [`iso_decode_fast`] fails.
     pub fn dequant(&self) -> Result<Vec<f32>> {
         if self.shape.len() != 4 {
-            return Err(rmlx_core::error::Error::Mlx(format!(
+            return Err(Error::Mlx(format!(
                 "QuantIsoK4::dequant: malformed shape {:?}",
                 self.shape
             )));
@@ -297,7 +295,24 @@ impl QuantIsoK4 {
         let head_dim = self.shape[3] as usize;
         let total_elems: usize = self.shape.iter().map(|&d| d as usize).product();
         let mut out: Vec<f32> = Vec::with_capacity(total_elems);
-        for blk in &self.blocks {
+
+        // Reconcile the ring-only decode tail — see
+        // [`crate::storage::QuantIsoK3::dequant`].
+        let blocks = synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, Device::Gpu)?;
+
+        if blocks.is_empty() {
+            // Loud on a lost decode tail — see [`crate::storage::QuantIsoK3::dequant`].
+            if total_elems != 0 {
+                return Err(Error::Mlx(format!(
+                    "QuantIsoK4::dequant: no blocks but shape {:?} implies {total_elems} elems — \
+                     refusing to zero-pad a lost decode tail",
+                    self.shape
+                )));
+            }
+            return Ok(out);
+        }
+
+        for blk in blocks.iter() {
             let dec = iso_decode_fast(
                 &blk.codes,
                 &blk.scales,
@@ -307,15 +322,17 @@ impl QuantIsoK4 {
                 ISO_K4_GROUP_SIZE,
                 ISO_K4_BITS,
             )
-            .map_err(|e: IsoQuantError| {
-                rmlx_core::error::Error::Mlx(format!("iso_k4 decode: {e}"))
-            })?;
+            .map_err(|e: IsoQuantError| Error::Mlx(format!("iso_k4 decode: {e}")))?;
             out.extend_from_slice(&dec);
         }
-        if out.len() < total_elems {
-            out.resize(total_elems, 0.0);
-        } else if out.len() > total_elems {
-            out.truncate(total_elems);
+        // Loud invariant — see [`crate::storage::QuantIsoK3::dequant`].
+        if out.len() != total_elems {
+            return Err(Error::Mlx(format!(
+                "QuantIsoK4::dequant: decoded {} elems but shape {:?} implies {total_elems} — \
+                 refusing to zero-pad / truncate",
+                out.len(),
+                self.shape
+            )));
         }
         // Blocks are sequence-major (see `append`); reorder back to head-major
         // `[B, kv_h, S, D]`.

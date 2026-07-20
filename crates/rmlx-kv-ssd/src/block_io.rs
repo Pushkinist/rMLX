@@ -1380,6 +1380,12 @@ fn write_quant_iso_v3(
     out: &mut Vec<(String, OwnedTensor)>,
 ) -> Result<()> {
     let Some(qv) = v else { return Ok(()) };
+    ensure_iso_blocks_cover_shape(
+        qv.blocks.iter().map(|b| b.n_tokens).sum(),
+        &qv.shape,
+        idx,
+        "v",
+    )?;
     let mut codes: Vec<u8> = Vec::new();
     let mut scales: Vec<f32> = Vec::new();
     let mut quaternions: Vec<f32> = Vec::new();
@@ -1423,6 +1429,12 @@ fn write_quant_iso_v4(
     out: &mut Vec<(String, OwnedTensor)>,
 ) -> Result<()> {
     let Some(qv) = v else { return Ok(()) };
+    ensure_iso_blocks_cover_shape(
+        qv.blocks.iter().map(|b| b.n_tokens).sum(),
+        &qv.shape,
+        idx,
+        "v",
+    )?;
     let mut codes: Vec<u8> = Vec::new();
     let mut scales: Vec<f32> = Vec::new();
     let mut quaternions: Vec<f32> = Vec::new();
@@ -1463,6 +1475,12 @@ fn write_quant_iso_k3(
     out: &mut Vec<(String, OwnedTensor)>,
 ) -> Result<()> {
     let Some(qk) = k else { return Ok(()) };
+    ensure_iso_blocks_cover_shape(
+        qk.blocks.iter().map(|b| b.n_tokens).sum(),
+        &qk.shape,
+        idx,
+        "k",
+    )?;
     let mut codes: Vec<u8> = Vec::new();
     let mut scales: Vec<f32> = Vec::new();
     let mut quaternions: Vec<f32> = Vec::new();
@@ -1503,6 +1521,12 @@ fn write_quant_iso_k4(
     out: &mut Vec<(String, OwnedTensor)>,
 ) -> Result<()> {
     let Some(qk) = k else { return Ok(()) };
+    ensure_iso_blocks_cover_shape(
+        qk.blocks.iter().map(|b| b.n_tokens).sum(),
+        &qk.shape,
+        idx,
+        "k",
+    )?;
     let mut codes: Vec<u8> = Vec::new();
     let mut scales: Vec<f32> = Vec::new();
     let mut quaternions: Vec<f32> = Vec::new();
@@ -1591,6 +1615,33 @@ fn ensure_rotor_v_blocks_cover_shape(
     if blocks_tokens != full_tokens {
         return Err(BlockIoError::TruncatedStore(format!(
             "l{idx}.v rotor store: CPU blocks hold {blocks_tokens} tokens but shape {shape:?} \
+             implies {full_tokens} — the ring-only decode tail was not materialised before spill"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+/// Iso mirror of [`ensure_rotor_v_blocks_cover_shape`], for either axis.
+///
+/// An iso K store (K-only or symmetric) and an iso V store (symmetric) both keep
+/// a ring-only decode tail on the fused path; the spill clone
+/// (`KvCache::try_deep_clone`) materialises it into complete blocks first. Reject
+/// a short store rather than persist a truncated iso payload. `axis` is `"k"` or
+/// `"v"` for the diagnostic.
+fn ensure_iso_blocks_cover_shape(
+    blocks_tokens: usize,
+    shape: &[i32],
+    idx: usize,
+    axis: &str,
+) -> Result<()> {
+    if shape.len() != 4 {
+        return Ok(());
+    }
+    let full_tokens: usize = shape.iter().take(3).map(|&d| d.max(0) as usize).product();
+    if blocks_tokens != full_tokens {
+        return Err(BlockIoError::TruncatedStore(format!(
+            "l{idx}.{axis} iso store: CPU blocks hold {blocks_tokens} tokens but shape {shape:?} \
              implies {full_tokens} — the ring-only decode tail was not materialised before spill"
         ))
         .into());
