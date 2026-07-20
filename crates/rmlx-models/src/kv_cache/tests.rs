@@ -746,6 +746,77 @@ mod tests {
         }
     }
 
+    /// Falsifies #284 at the real production entry point: `KvCache::update` →
+    /// dispatch → `QuantIsoV3::append`, then `KvCache::truncate_to` → dispatch
+    /// → `QuantIsoV3::truncate_to`, at `kv_h = 4` (`kv_h == 1` is the masked
+    /// case that hides the bug — see `kv_cache_truncate_k8v8_path` above,
+    /// which stays at `kv_h == 1` on purpose as the pre-existing regression
+    /// baseline).
+    ///
+    /// One token appended per `update` call so every block is exactly one
+    /// sequence position (block boundaries align with truncate targets).
+    /// This is the same production path SWA-context-slide, speculative-decode
+    /// rollback, and prompt-cache partial-prefix trim all drive — see
+    /// `docs/KV_QUANT.md` for the reachability audit per arch (Bonsai-8B
+    /// currently has no live serve trigger; Gemma4's prompt-cache `Partial`
+    /// reuse policy does).
+    #[test]
+    #[allow(
+        clippy::expect_used,
+        reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+    )]
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "wildcard arm is the correct fallthrough for unsupported arch/quant variants; exhaustive expansion would require updating on every new variant"
+    )]
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "shape[2] index bounded by the codec's fixed 4-element [B, kv_h, S, D] shape, established by construction"
+    )]
+    fn kv_cache_truncate_iso3_kv_h_gt_1_path() {
+        let mut cache = KvCache::with_quant_max_seq(KvQuant::Iso3, 32);
+
+        let device = Device::Cpu;
+        let kv_h = 4_i32;
+        let head_dim = 32_i32; // kv_h * head_dim = 128 = Q8_GROUP_SIZE (K-side q8_0)
+        let total_tokens = 8;
+        for tok in 0..total_tokens {
+            let k = make_lcg_array(&[1, kv_h, 1, head_dim], 10 + tok as u64).0;
+            let v = make_lcg_array(&[1, kv_h, 1, head_dim], 11 + tok as u64).0;
+            cache.update(&k, &v, device).expect("update must not fail");
+        }
+        assert_eq!(cache.offset(), total_tokens);
+
+        let keep = 3;
+        cache.truncate_to(keep);
+        assert_eq!(cache.offset(), keep, "offset must equal truncation target");
+        match &cache.storage {
+            KvStorage::IsoV3 { v, .. } => {
+                let vs = v
+                    .as_ref()
+                    .expect("V codec must be populated after 8 appends");
+                assert_eq!(
+                    vs.shape[2], keep,
+                    "QuantIsoV3 shape[2] must equal truncation target"
+                );
+                assert_eq!(
+                    vs.blocks.len(),
+                    keep as usize,
+                    "must keep exactly `keep` blocks, not floor(keep / kv_h) (#284)"
+                );
+                let kept_rows: usize = vs.blocks.iter().map(|b| b.n_tokens).sum();
+                assert_eq!(
+                    kept_rows,
+                    keep as usize * kv_h as usize,
+                    "kept rows must equal keep * kv_h, not keep (#284)"
+                );
+                vs.dequant()
+                    .expect("dequant must succeed after truncate at kv_h>1 (#284)");
+            }
+            _ => panic!("expected IsoV3 storage"),
+        }
+    }
+
     // ── kv_quant_for_layer unit tests ────────────────────────────────────────
 
     #[test]

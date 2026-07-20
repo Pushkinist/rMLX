@@ -237,17 +237,8 @@ impl QuantIsoK3 {
     /// loudly, which would abort generation on the speculative-decode rollback
     /// path.
     pub fn truncate_to(&mut self, n: i32) {
-        let n_usize = n.max(0) as usize;
-        let mut acc: usize = 0;
-        let mut keep = 0usize;
-        for (i, blk) in self.blocks.iter().enumerate() {
-            if acc + blk.n_tokens <= n_usize {
-                acc += blk.n_tokens;
-                keep = i + 1;
-            } else {
-                break;
-            }
-        }
+        let keep =
+            super::truncate_keep_count(self.blocks.iter().map(|blk| blk.n_tokens), &self.shape, n);
         self.blocks.truncate(keep);
         // NB: no `self.gpu.clear()` — the ring is the source of truth for a
         // ring-only decode tail; see the doc comment above.
