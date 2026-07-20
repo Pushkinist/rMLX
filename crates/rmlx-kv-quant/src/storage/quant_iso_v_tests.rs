@@ -689,3 +689,83 @@ fn iso_v3_ssd_roundtrip_preserves_dequant_output() {
         "spill→hydrate dequant divergence max_abs = {max_abs:.6} (>= 1e-5)"
     );
 }
+
+/// Falsifies #284: `quant_iso_v_truncate_to_keeps_first_n` above only runs at
+/// `kv_h == 1`, where each block's `n_tokens` already equals its sequence
+/// length (rows == seq). At `kv_h > 1`, `n_tokens` is inflated by `kv_h` and
+/// `truncate_to(n)` must convert `n` to row units before comparing, or it
+/// keeps `floor(n / kv_h)` blocks instead of `n`.
+///
+/// Builds one block per token (CPU-only, no GPU ring ever touched), truncates
+/// mid-sequence at a block boundary, and requires the result to exactly match
+/// a reference store built from only the first `keep_tokens`.
+///
+/// Mutation check: reverting `truncate_to` to compare
+/// `acc + blk.n_tokens <= n as usize` (raw, not row-scaled) makes the
+/// `kv_h > 1` case RED — `blocks.len()` drops and `dequant()` returns `Err`.
+#[test]
+fn quant_iso_v_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
+    let head_dim = 8_usize;
+    let total_tokens = 4_usize;
+    let keep_tokens = 2_usize;
+    let val = |h: usize, tok: usize, d: usize| {
+        (h as f32) * 100.0 + (tok as f32) * 10.0 + (d as f32) * 0.5 + 1.0
+    };
+
+    for kv_h in [1_usize, 4_usize] {
+        let token_data = |tok: usize| -> Vec<f32> {
+            let mut out = vec![0.0_f32; kv_h * head_dim];
+            for h in 0..kv_h {
+                for d in 0..head_dim {
+                    out[h * head_dim + d] = val(h, tok, d);
+                }
+            }
+            out
+        };
+        let new_shape = [1_i32, kv_h as i32, 1, head_dim as i32];
+
+        let mut store = QuantIsoV3::new(vec![1_i32, kv_h as i32, 0, head_dim as i32]);
+        for tok in 0..total_tokens {
+            store.append(&token_data(tok), &new_shape).unwrap();
+        }
+        assert_eq!(
+            store.blocks.len(),
+            total_tokens,
+            "one block per token append (kv_h={kv_h})"
+        );
+
+        store.truncate_to(keep_tokens as i32);
+
+        assert_eq!(
+            store.shape[2], keep_tokens as i32,
+            "shape[2] must equal keep_tokens (kv_h={kv_h})"
+        );
+        assert_eq!(
+            store.blocks.len(),
+            keep_tokens,
+            "truncate_to must keep exactly keep_tokens blocks, not floor(keep_tokens / kv_h) (kv_h={kv_h})"
+        );
+        let kept_rows: usize = store.blocks.iter().map(|blk| blk.n_tokens).sum();
+        assert_eq!(
+            kept_rows,
+            keep_tokens * kv_h,
+            "kept rows must equal keep_tokens * b * kv_h (kv_h={kv_h})"
+        );
+
+        let decoded = store
+            .dequant()
+            .expect("dequant must succeed after truncate at kv_h>1 (#284)");
+
+        let mut reference = QuantIsoV3::new(vec![1_i32, kv_h as i32, 0, head_dim as i32]);
+        for tok in 0..keep_tokens {
+            reference.append(&token_data(tok), &new_shape).unwrap();
+        }
+        let ref_decoded = reference.dequant().unwrap();
+
+        assert_eq!(
+            decoded, ref_decoded,
+            "truncated store must exactly match a store built from only the \
+             first keep_tokens (kv_h={kv_h})"
+        );
+    }
+}

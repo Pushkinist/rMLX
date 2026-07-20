@@ -2659,6 +2659,43 @@ mutators reconcile: the block-path append (`materialize_*_ring_tail`)
 materialises any pre-existing ring-only tail into `blocks` before pushing, so
 `blocks` stay a contiguous prefix.
 
+**Row vs. sequence units.** Every rotor/iso K and V store's per-append
+`RotorBlocks` / `IsoBlocks` carries `n_tokens` counting **rows**
+(`b * kv_h * seq_of_block`), not sequence positions, but `truncate_to(n)`
+takes `n` as a **sequence** target. Deciding which leading blocks to keep must
+therefore compare cumulative `n_tokens` against `n * b * kv_h`, not against
+`n` directly — at `kv_h > 1` (or `b > 1`) a raw comparison undercounts and
+drops blocks that should have been kept, landing the store in exactly the
+forbidden gap described below. This was invisible at `b * kv_h == 1` (rows and
+sequence positions coincide), which is how the bug shipped and how it stayed
+latent until a `kv_h > 1` truncation path was exercised (#284). All eight
+rotor/iso K and V codecs share one crate-internal conversion helper,
+`truncate_keep_count` in `rmlx-kv-quant/src/storage/mod.rs`, so the unit
+conversion is defined once rather than re-derived per codec.
+
+**Real-serve reachability audit (per #284).** `KvCache::truncate_to` has three
+production callers: prompt-cache partial-prefix trim
+(`PromptCacheEntry::truncate_kv_to`), SWA context handling, and
+speculative-decode partial-accept rollback (MTP / DFlash / Eagle3 / the
+gemma4-assistant self-speculative path). Whether any of them can reach a
+`kv_h > 1` rotor/iso store depends on the arch:
+- **Bonsai (`Qwen3ForCausalLM`, `kv_h = 8`)** — no live trigger today.
+  Its prompt-cache `ReusePolicy` is `ExactOnly` (partial-prefix trim never
+  fires), and no speculative-decode drafter currently targets plain
+  `Qwen3ForCausalLM`.
+- **Gemma4 (e.g. e4b, `kv_h = 2`)** — reachable in principle: its
+  `ReusePolicy::Partial` performs exactly this trim on a real partial-prefix
+  cache hit, and gemma4-assistant self-speculative decode also rolls back via
+  `truncate_to`.
+
+The fix is proven at the codec level (all eight `*_tests.rs` files, `kv_h`
+values 1 and 4) and at the full `KvCache::update` / `KvCache::truncate_to`
+dispatch level (`kv_cache_truncate_iso3_kv_h_gt_1_path` in
+`rmlx-models/src/kv_cache/tests.rs`, `kv_h = 4`) rather than via a live HTTP
+trigger. `truncate_keep_count` reads `shape[1]` directly with no per-arch or
+hardcoded head-count branch, so `kv_h = 4` and Bonsai's real `kv_h = 8`
+exercise the identical code path — no arch-specific behavior exists to miss.
+
 The forbidden state is `blocks` short of `shape[2]` with **no** ring to supply
 the tail: `dequant()` would zero-pad the gap (silently wrong attention) and an
 SSD spill would persist a truncated store. That state is rejected **loudly**

@@ -160,3 +160,83 @@ fn quant_rotor_k4_multi_append_matches_single_shot_gqa_with_qjl() {
     );
     unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
 }
+
+/// Falsifies #284: at `kv_h > 1`, `truncate_to(n)` must keep exactly the
+/// leading blocks covering sequence `[0, n)`, not `floor(n / kv_h)` of them.
+/// CPU-only (no GPU ring touched). See `quant_rotor_k3_tests.rs` for the
+/// full rationale + mutation-check note.
+#[test]
+fn quant_rotor_k4_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
+    let _guard = crate::test_utils::ROTOR_QJL_ENV_LOCK
+        .lock()
+        .expect("env lock poisoned");
+    // SAFETY: ROTOR_QJL_ENV_LOCK held — no concurrent env reader/writer.
+    unsafe { std::env::set_var("RMLX_ROTOR_QJL", "0") };
+
+    let head_dim = 9_usize;
+    let total_tokens = 4_usize;
+    let keep_tokens = 2_usize;
+    let val = |h: usize, tok: usize, d: usize| {
+        (h as f32) * 100.0 + (tok as f32) * 10.0 + (d as f32) * 0.5 + 1.0
+    };
+
+    for kv_h in [1_usize, 4_usize] {
+        let token_data = |tok: usize| -> Vec<f32> {
+            let mut out = vec![0.0_f32; kv_h * head_dim];
+            for h in 0..kv_h {
+                for d in 0..head_dim {
+                    out[h * head_dim + d] = val(h, tok, d);
+                }
+            }
+            out
+        };
+        let new_shape = [1_i32, kv_h as i32, 1, head_dim as i32];
+
+        let mut store = QuantRotorK4::new(vec![1_i32, kv_h as i32, 0, head_dim as i32], 5);
+        for tok in 0..total_tokens {
+            store.append(&token_data(tok), &new_shape).unwrap();
+        }
+        assert_eq!(
+            store.blocks.len(),
+            total_tokens,
+            "one block per token append (kv_h={kv_h})"
+        );
+
+        store.truncate_to(keep_tokens as i32);
+
+        assert_eq!(
+            store.shape[2], keep_tokens as i32,
+            "shape[2] must equal keep_tokens (kv_h={kv_h})"
+        );
+        assert_eq!(
+            store.blocks.len(),
+            keep_tokens,
+            "truncate_to must keep exactly keep_tokens blocks, not floor(keep_tokens / kv_h) (kv_h={kv_h})"
+        );
+        let kept_rows: usize = store.blocks.iter().map(|blk| blk.n_tokens).sum();
+        assert_eq!(
+            kept_rows,
+            keep_tokens * kv_h,
+            "kept rows must equal keep_tokens * b * kv_h (kv_h={kv_h})"
+        );
+
+        let decoded = store
+            .dequant()
+            .expect("dequant must succeed after truncate at kv_h>1 (#284)");
+
+        let mut reference = QuantRotorK4::new(vec![1_i32, kv_h as i32, 0, head_dim as i32], 5);
+        for tok in 0..keep_tokens {
+            reference.append(&token_data(tok), &new_shape).unwrap();
+        }
+        let ref_decoded = reference.dequant().unwrap();
+
+        assert_eq!(
+            decoded, ref_decoded,
+            "truncated store must exactly match a store built from only the \
+             first keep_tokens (kv_h={kv_h})"
+        );
+    }
+
+    // SAFETY: ROTOR_QJL_ENV_LOCK still held.
+    unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
+}
