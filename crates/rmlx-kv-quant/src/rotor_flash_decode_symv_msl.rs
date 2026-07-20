@@ -416,8 +416,8 @@ pub fn rotor_flash_decode_symv_sdpa<const BITS: u8>(
 
     // GPU-native small-`norms`-buffer floor — see
     // [`crate::flash_decode_common::pad_norms_to_device_floor`]. Same trap and
-    // fix as the iso sibling: `rf_decode_k_lane` also declares `norms`
-    // `device const float*`.
+    // fix as the iso sibling: `rf_decode_k_group` (the decoder the symv P1 body
+    // calls) also declares `norms` `device const float*`.
     let k_norms = pad_norms_to_device_floor(k_norms, tok_count, device)?;
     let v_norms = pad_norms_to_device_floor(v_norms, tok_count, device)?;
 

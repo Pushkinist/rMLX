@@ -3246,8 +3246,9 @@ fn ref_attn_head_major(
 /// numerically-correct output (vs a scalar reference over the store's own
 /// dequant) for `kv_seq` 2, 3, 4, 7, 15 — all below the compile floor.
 ///
-/// Mutation check: force `iso_flash_decode_symv_sdpa`'s norms-padding closure to
-/// skip padding (return the unpadded array unconditionally) → the `kv_seq == 2`
+/// Mutation check: force `iso_flash_decode_symv_sdpa`'s norms-padding helper
+/// `pad_norms_to_device_floor` to skip padding (return the unpadded array
+/// unconditionally) → the `kv_seq == 2`
 /// step aborts with "Unable to build metal library from source … cannot pass
 /// pointer to address space 'constant' as a pointer to address space 'device' …
 /// if_decode_k_lane" (RED).
@@ -3364,8 +3365,9 @@ fn iso_sym_short_kv_seq_kv_h1_stays_on_gpu() {
 /// against random per-step K/V/Q — not just quantisation noise.
 ///
 /// Mutation check: same as [`iso_sym_short_kv_seq_kv_h1_stays_on_gpu`] —
-/// forcing `iso_flash_decode_symv_sdpa`'s norms-padding closure to skip
-/// padding makes the very first decode step (`kv_seq == 2`) abort before
+/// forcing `iso_flash_decode_symv_sdpa`'s norms-padding helper
+/// `pad_norms_to_device_floor` to skip padding makes the very first decode
+/// step (`kv_seq == 2`) abort before
 /// this test can reach the floor at all.
 #[test]
 #[ignore = "GPU Metal context — run: cargo test -p rmlx-kv-ssd iso_sym_transition_across_ring_norms_floor -- --ignored --test-threads=1"]
@@ -3474,7 +3476,7 @@ fn iso_sym_transition_across_ring_norms_floor() {
 /// as iso — same root cause, same [`crate::flash_decode_common`] fix.
 ///
 /// Mutation check: forcing `rotor_flash_decode_symv_sdpa`'s norms-padding
-/// closure (`pad_norms_to_device_floor`) to skip padding makes the very first
+/// helper `pad_norms_to_device_floor` to skip padding makes the very first
 /// decode step (`kv_seq == 2`) abort with the same address-space-mismatch
 /// class of MSL error (`rf_decode_k_group`, `constant` vs `device`) before
 /// this test can reach the floor at all.
