@@ -295,14 +295,15 @@ Tradeoff: every observation costs storage. Acceptable — see retention §10.2.
 
 ### 3.6 `events` table (runtime per-event stream)
 
-Schema migrations `002_events.sql` + `003_events_identity.sql`. Written by
-`rmlx_metrics::events::EventRecorder`. One row per runtime event; append-only;
-WAL absorbs concurrent writers.
+Schema migrations `002_events.sql` + `003_events_identity.sql` +
+`004_events_mlx_nax.sql`. Written by `rmlx_metrics::events::EventRecorder`.
+One row per runtime event; append-only; WAL absorbs concurrent writers.
 
 **Columns:** `id` (INTEGER PK), `run_id` (TEXT), `ts_utc` (TEXT), `model_path`
 (TEXT), `quant_mode` (TEXT), `stage` (TEXT), `op` (TEXT), `value_unit` (TEXT),
 `value` (REAL), `notes` (TEXT), plus the run-identity columns added by 003:
-`backend_version` (TEXT NULL), `build_profile` (TEXT NULL).
+`backend_version` (TEXT NULL), `build_profile` (TEXT NULL), and by 004:
+`mlx_nax` (TEXT NULL).
 
 **Identity.** `backend_version` and `build_profile` are stamped from the same
 `RunIdentity` source `observations` uses (§8.5.1) — the binary genuinely
@@ -322,6 +323,45 @@ carry that stray, permanently-`NULL` column from before the migration was
 amended. It is harmless — nothing selects it (every query names its columns
 explicitly) — and is not something to "fix" by hand-editing that database's
 schema.
+
+**`mlx_nax` (migration `004_events_mlx_nax.sql`).** Whether the Homebrew MLX
+this binary linked against ships the `steel_gemm_fused_nax*` GEMM kernels:
+`"present"` / `"absent"` / `"unknown"`. On Neural-Accelerator-class hardware
+(M5-family and later) their absence costs ~3.8x GPU-matmul throughput and
+2.2-3.7x slower prefill — decode is bandwidth-bound and unaffected, which is
+exactly why this silently passed for weeks (see
+`.rmlx/mlx-homebrew-nax-regression.md`). A bench row is otherwise unable to
+say whether it ran against a nax-capable build.
+
+Same "binary genuinely knows this about itself" category as
+`backend_version` / `build_profile`, but the fact originates in a different
+crate: `crates/rmlx-mlx/build.rs` scans `lib/mlx.metallib` at compile time
+(the same `kernels_present` detection the missing-kernel build warning uses,
+not a second detection path) and stamps `RMLX_MLX_NAX` via
+`cargo:rustc-env`. `rmlx-metrics` cannot read that constant directly —
+`cargo:rustc-env` only reaches the compiler invocation of the crate whose
+build script set it, and `rmlx-metrics` deliberately does not depend on
+`rmlx-mlx` (whose build script hard-requires a working Homebrew MLX/mlx-c
+install — a dependency this generic, cross-backend metrics crate must not
+carry). `rmlx-cli::main()` is the one binary that links both, so it calls
+`rmlx_metrics::identity::set_mlx_nax(rmlx_mlx::NAX_CAPABILITY)` once at
+startup — the same process-wide one-shot-`OnceLock` pattern already used for
+`install_rotor_qjl` / `install_planar_fused_qk` — before the first
+`RunIdentity::get()` / `EventRecorder::record`. A process that never calls it
+(unit tests, tools that don't link `rmlx-mlx`) reads `"unknown"`, which is
+honest: no capability was ever supplied. Free-form TEXT, not validated
+against an enum — same rule as every other recorded label (kv_quant/model,
+#214).
+
+Nullable: rows written before migration 004 keep NULL. Append-only — no
+backfill, no UPDATE. Historical rows recorded roughly 2026-07-13 through the
+Homebrew fix landing may have run against the no-nax `mlx` 0.32.0 bottle with
+degraded prefill numbers (decode unaffected) — see
+`.rmlx/mlx-homebrew-nax-regression.md` for the suspect window and the
+evidence. Those pre-migration rows are **not** retroactively annotated with
+`mlx_nax` — they simply carry NULL, and doing otherwise would violate this
+table's append-only/no-UPDATE contract; a bench row from before this column
+existed has no honest way to state its nax capability after the fact.
 
 **`stage` / `op` vocabulary:**
 

@@ -285,6 +285,25 @@ fn observations_no_pk_collision() {
 }
 
 // -----------------------------------------------------------------------
+// events — migration 004 adds mlx_nax
+// -----------------------------------------------------------------------
+
+#[test]
+fn events_table_has_mlx_nax_column() {
+    let conn = init_fresh();
+
+    let has_mlx_nax: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('events') WHERE name = 'mlx_nax'")
+        .unwrap()
+        .exists([])
+        .unwrap();
+    assert!(
+        has_mlx_nax,
+        "a fresh DB must carry migration 004's mlx_nax column on events"
+    );
+}
+
+// -----------------------------------------------------------------------
 // schema_meta — seed rows present after init
 // -----------------------------------------------------------------------
 

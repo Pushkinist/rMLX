@@ -1,5 +1,32 @@
 # Perf Baseline
 
+## Caveat: Homebrew MLX no-nax bottle degraded prefill numbers (~2026-07-13 onward)
+
+Homebrew's `mlx` 0.32.0 bottle silently ships **zero**
+`steel_gemm_fused_nax_*` GEMM kernels on the `arm64_tahoe` build target — a
+Homebrew formula defect, not an MLX or rMLX bug. On Neural-Accelerator-class
+hardware (M5-family and later) this costs ~3.8x GPU-matmul throughput and
+2.2-3.7x slower **prefill**; decode is bandwidth-bound and unaffected, which
+is exactly why it went unnoticed. Full root-cause, evidence, and the
+Homebrew-side fix options: `.rmlx/mlx-homebrew-nax-regression.md`.
+
+**Any prefill number in this file recorded while the dev box had `mlx`
+0.32.0 installed (roughly 2026-07-13, when that bottle was poured, through
+the pin back to 0.31.2 on 2026-07-17) is suspect** — it may read 2-3.7x
+slower than a nax-capable run of the same cell. Decode-TPS and KV-MB figures
+in the same window are unaffected and remain trustworthy. This is exactly
+what falsified the GDN sequential-in-T root-cause theory for the Bonsai-27B
+prefill regression (rMLX issue #216): the real cause was the missing-nax
+bottle, not model code.
+
+This file is **not** retroactively edited to mark individual affected rows —
+there is no reliable way to tell, after the fact, which historical bench
+invocation ran against which `mlx` build without re-running it. Going
+forward, `events.mlx_nax` (`"present"` / `"absent"` / `"unknown"`, migration
+`004_events_mlx_nax.sql`) records this per run in `runs.db`, so future rows
+are self-describing; see `docs/METRICS_DB.md` §3.6. Historical `runs.db`
+rows are likewise not backfilled — that table is append-only.
+
 ## Baseline KV-cache reuse
 
 **Verdict: CORRECT-reuse.** The `rmlx baseline` decode loop appends one new

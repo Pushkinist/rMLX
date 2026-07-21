@@ -238,6 +238,29 @@ fn canonicalize_kv_quant_mixed_long_form_passes_through() {
     );
 }
 
+// --- mlx_nax ---
+//
+// Asserted against `mlx_nax_or_unknown()` directly, not `RunIdentity::get()`:
+// `IDENTITY` is a process-wide `OnceLock` shared with every other test in
+// this binary, so whichever test runs first decides its cached value for
+// the rest of the run. `MLX_NAX` has no such contention — nothing else in
+// this crate ever calls `set_mlx_nax`, so this test is its only writer
+// regardless of execution order.
+
+#[test]
+fn mlx_nax_defaults_to_unknown_then_takes_the_first_set_value() {
+    assert_eq!(
+        mlx_nax_or_unknown(),
+        "unknown",
+        "no caller has set it yet in this process"
+    );
+    set_mlx_nax("present");
+    assert_eq!(mlx_nax_or_unknown(), "present");
+    // First writer wins — a later call must not override it.
+    set_mlx_nax("absent");
+    assert_eq!(mlx_nax_or_unknown(), "present");
+}
+
 /// Previously-"malformed" `mixed_*` shapes no longer error — they are just
 /// another free-form label now, recorded verbatim.
 #[test]

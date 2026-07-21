@@ -114,7 +114,17 @@ fn brand_string() -> Option<String> {
 /// kernels only matter on Neural-Accelerator-class hardware (M5-family and
 /// later), so their absence on anything else — including every GitHub
 /// `macos-14` (M1) runner — is expected and silent.
-fn check_mlx_pin(mlx_prefix: &str, mlx_c_prefix: &str, mlx_version: &str, na_class_host: bool) {
+///
+/// Returns the raw metallib-scan result (`Some(true)` present, `Some(false)`
+/// confirmed absent, `None` unreadable) so the caller can record it in run
+/// identity via `RMLX_MLX_NAX` — the same detection this function already
+/// does for the warning above, not a second scan.
+fn check_mlx_pin(
+    mlx_prefix: &str,
+    mlx_c_prefix: &str,
+    mlx_version: &str,
+    na_class_host: bool,
+) -> Option<bool> {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let pin_path = format!("{manifest_dir}/{PIN_FILE}");
     println!("cargo:rerun-if-changed={pin_path}");
@@ -184,6 +194,8 @@ fn check_mlx_pin(mlx_prefix: &str, mlx_c_prefix: &str, mlx_version: &str, na_cla
             }
         }
     }
+
+    fast_gemm
 }
 
 fn main() {
@@ -245,7 +257,16 @@ fn main() {
 
     // Report a resolved stack that is not the validated one, or that cannot
     // reach the fast GEMM path at all.
-    check_mlx_pin(&mlx_prefix, &mlx_c_prefix, &build_version, na_class_host);
+    let fast_gemm = check_mlx_pin(&mlx_prefix, &mlx_c_prefix, &build_version, na_class_host);
+
+    // Record the same metallib-scan result in run identity, so bench rows are
+    // self-describing about whether they ran against the nax GEMM kernels
+    // (present), a confirmed-missing bottle (absent), or an unreadable
+    // metallib (unknown) — see docs/METRICS_DB.md.
+    println!(
+        "cargo:rustc-env=RMLX_MLX_NAX={}",
+        nax_capability_str(fast_gemm)
+    );
 
     // Link search paths.
     println!("cargo:rustc-link-search=native={mlx_c_prefix}/lib");

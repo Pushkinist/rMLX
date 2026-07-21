@@ -91,6 +91,24 @@ pub(crate) fn install_error_handler() {
 /// captured by `build.rs`). `"unknown"` when the header was unreadable.
 const MLX_BUILD_VERSION: &str = env!("RMLX_MLX_BUILD_VERSION");
 
+/// Whether the MLX this build links against ships the `steel_gemm_fused_nax*`
+/// GEMM kernels — `"present"` / `"absent"` / `"unknown"`. Stamped by
+/// `build.rs` from the same metallib scan that drives the missing-kernel
+/// build warning (`crates/rmlx-mlx/build.rs`, `check_mlx_pin`).
+///
+/// `pub` (unlike `MLX_BUILD_VERSION`): this is the one fact about the MLX
+/// build that a downstream binary genuinely cannot derive itself, and the
+/// only channel it has out of this crate. `rmlx-metrics::identity` cannot
+/// read `RMLX_MLX_NAX` directly — `cargo:rustc-env` from this crate's build
+/// script only reaches this crate's own compiler invocation, and
+/// `rmlx-metrics` deliberately does not depend on `rmlx-mlx` (its build
+/// script hard-requires a working Homebrew MLX/mlx-c install, which
+/// `rmlx-metrics` must not need). So `rmlx-cli::main()` — the one binary that
+/// links both — reads this constant and calls
+/// `rmlx_metrics::identity::set_mlx_nax` with it once at startup, before any
+/// metrics recording. See `docs/METRICS_DB.md`.
+pub const NAX_CAPABILITY: &str = env!("RMLX_MLX_NAX");
+
 /// Read the MLX version of the dylib actually loaded into this process.
 ///
 /// Returns `None` if mlx-c reports an error or hands back a null string.
