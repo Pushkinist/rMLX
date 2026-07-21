@@ -380,3 +380,42 @@ fn record_on_legacy_db_with_stray_git_sha_column_still_works() {
         "the stray git_sha column must stay NULL — nothing ever writes it"
     );
 }
+
+/// `mlx_nax` is populated on every insert, exactly like `backend_version` /
+/// `build_profile` — sourced from the same process-wide [`crate::identity::RunIdentity`]
+/// [`EventRecorder::record`] already reads for those two columns. The exact
+/// string ("present" / "absent" / "unknown") depends on whether
+/// `crate::identity::set_mlx_nax` was ever called in this process (only
+/// `rmlx-cli::main()` does, in production) — this test asserts the row is
+/// never NULL and always matches whatever the cached identity reports at
+/// insert time, not a specific value.
+#[test]
+fn record_populates_mlx_nax() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("runs.db");
+    let rec = EventRecorder::open_at(&db, "mlx-nax-run").expect("open");
+    rec.record(&Measurement {
+        model_path: "/m",
+        quant_mode: "none",
+        stage: "stage0",
+        op: "total_tensors",
+        value_unit: "count",
+        value: 1.0,
+        notes: "",
+    })
+    .expect("record");
+
+    let conn = schema::open(&db).expect("reopen");
+    let mlx_nax: Option<String> = conn
+        .query_row(
+            "SELECT mlx_nax FROM events WHERE run_id = ?1",
+            params!["mlx-nax-run"],
+            |r| r.get(0),
+        )
+        .expect("mlx_nax row");
+    assert_eq!(
+        mlx_nax.as_deref(),
+        Some(RunIdentity::get().mlx_nax()),
+        "mlx_nax must be populated from the same identity backend_version/build_profile use"
+    );
+}

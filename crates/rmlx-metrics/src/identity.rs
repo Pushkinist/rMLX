@@ -53,7 +53,7 @@ const DEFAULT_HARDWARE_TAG: &str = "m5_max_128gb";
 /// never by a script or CLI flag, so there is no caller that could ever
 /// populate one (see migration `003_events_identity.sql`).
 ///
-/// All four fields are `pub(crate)`, read via the getters below. A `pub`
+/// All five fields are `pub(crate)`, read via the getters below. A `pub`
 /// field here would be the exact mutation hole closed on [`crate::ingest::RunRecord`]
 /// relocated one type upstream: `RunIdentity::stamp_json` takes `&self` and
 /// writes whatever fields it is given verbatim, with no validation of its
@@ -79,6 +79,9 @@ pub struct RunIdentity {
     pub(crate) build_profile: String,
     /// Hardware the run happened on. `RMLX_HARDWARE_TAG` overrides the default.
     pub(crate) hardware_tag: String,
+    /// MLX nax-GEMM-kernel capability: `"present"` / `"absent"` / `"unknown"`.
+    /// See [`set_mlx_nax`] for where this actually comes from.
+    pub(crate) mlx_nax: String,
 }
 
 impl RunIdentity {
@@ -101,13 +104,60 @@ impl RunIdentity {
     pub fn hardware_tag(&self) -> &str {
         &self.hardware_tag
     }
+
+    /// MLX nax-GEMM-kernel capability this run built against.
+    pub fn mlx_nax(&self) -> &str {
+        &self.mlx_nax
+    }
 }
 
-/// Computed once per process, cached in a `OnceLock`. None of the four fields
-/// can change while the process runs. `backend_version` / `build_profile` are
+/// Process-wide MLX nax-GEMM-kernel capability, set at most once via
+/// [`set_mlx_nax`] before [`RunIdentity::get`] first runs.
+///
+/// This crate cannot compute the value itself: the metallib scan that knows
+/// it lives in `crates/rmlx-mlx/build.rs` (`RMLX_MLX_NAX`, stamped from the
+/// same `kernels_present` detection the missing-kernel warning uses), and
+/// `rmlx-metrics` deliberately does not depend on `rmlx-mlx` — that crate's
+/// build script hard-requires a working Homebrew MLX/mlx-c install, which
+/// would make this generic, cross-backend metrics crate un-buildable without
+/// one. `env!("RMLX_MLX_NAX")` also would not help here even with the
+/// dependency: `cargo:rustc-env` only reaches the compiler invocation of the
+/// package whose build script set it, never a different crate's. So the
+/// value is supplied at runtime instead, exactly once, by the only binary
+/// that actually links `rmlx-mlx` (`rmlx-cli`), the same way it installs its
+/// other process-wide one-shot toggles (`install_rotor_qjl`,
+/// `install_planar_fused_qk`) — before any metrics recording starts.
+static MLX_NAX: OnceLock<String> = OnceLock::new();
+
+/// Record the MLX nax-GEMM-kernel capability baked into `rmlx-mlx` at compile
+/// time (`rmlx_mlx::NAX_CAPABILITY` — `"present"` / `"absent"` / `"unknown"`).
+///
+/// Call once, from `main()`, before the first [`RunIdentity::get`] /
+/// `EventRecorder::record`. A call after `RunIdentity::get()` has already run
+/// is too late — the cached identity is already built — and a second call
+/// with a different value is silently ignored (first writer wins): both are
+/// programming errors this function has no way to reject retroactively, so
+/// it stays a plain best-effort setter rather than panicking. A process that
+/// never calls it (unit tests, tools that don't link `rmlx-mlx`) reads
+/// `"unknown"` from [`RunIdentity::mlx_nax`], which is honest — no capability
+/// was ever supplied.
+pub fn set_mlx_nax(value: &str) {
+    let _ = MLX_NAX.set(value.to_owned());
+}
+
+fn mlx_nax_or_unknown() -> String {
+    MLX_NAX
+        .get()
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Computed once per process, cached in a `OnceLock`. None of the fields can
+/// change while the process runs. `backend_version` / `build_profile` are
 /// read from `build.rs`-stamped compile-time constants; `hardware_tag`
-/// touches the environment via one `std::env::var`. No I/O, no subprocess
-/// spawn, ever — the binary does no git of any kind at runtime.
+/// touches the environment via one `std::env::var`; `mlx_nax` reads whatever
+/// [`set_mlx_nax`] was given (or `"unknown"` if never called). No I/O, no
+/// subprocess spawn, ever — the binary does no git of any kind at runtime.
 static IDENTITY: OnceLock<RunIdentity> = OnceLock::new();
 
 impl RunIdentity {
@@ -122,6 +172,7 @@ impl RunIdentity {
             build_profile: rmlx_core::runinfo::build_profile().to_string(),
             hardware_tag: std::env::var("RMLX_HARDWARE_TAG")
                 .unwrap_or_else(|_| DEFAULT_HARDWARE_TAG.to_string()),
+            mlx_nax: mlx_nax_or_unknown(),
         })
     }
 
