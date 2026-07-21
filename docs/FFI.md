@@ -122,6 +122,18 @@ Warning rather than failing is deliberate: the pin records what *was validated
 here*, not a claim that everything else is broken. A correct non-bottle build
 of another version must still compile.
 
+#### Run identity: `RMLX_MLX_NAX`
+
+The same metallib scan also stamps `cargo:rustc-env=RMLX_MLX_NAX=<present|absent|unknown>`
+(exposed as `rmlx_mlx::NAX_CAPABILITY`) — not a second detection path, the same
+`fast_gemm` result the two warnings above already computed. `rmlx-cli::main()`
+forwards it into `rmlx-metrics`'s run identity
+(`rmlx_metrics::identity::set_mlx_nax`), so every `events` row records whether
+that run built against a nax-capable MLX. See `docs/METRICS_DB.md` §3.6 for
+the column and why the propagation goes through a runtime setter rather than
+a second `env!()` read (`cargo:rustc-env` only reaches the compiler
+invocation of the crate whose build script set it).
+
 The capability probe is the ground truth; the version pin only proxies for it.
 The probe is what keeps this from nagging forever once a fixed bottle ships —
 it simply passes. Neither check can be verified from a version number alone,

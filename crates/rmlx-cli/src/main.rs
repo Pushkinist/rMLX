@@ -1236,6 +1236,13 @@ fn main() -> Result<()> {
     // site carries its own toggle.
     rmlx_metrics::mode::init(cli.metrics_mode.mode());
 
+    // Record the MLX nax-GEMM-kernel capability this binary was built with,
+    // before the first `RunIdentity::get()` / `EventRecorder::record`.
+    // `rmlx-metrics` cannot read this itself (see `identity::set_mlx_nax`
+    // doc) — `rmlx-cli` is the one binary that links both `rmlx-mlx` and
+    // `rmlx-metrics`, so it is the only place that can supply it.
+    rmlx_metrics::identity::set_mlx_nax(rmlx_mlx::NAX_CAPABILITY);
+
     // Set RUST_BACKTRACE before init_tracing so the call happens while the
     // process is genuinely single-threaded — no background threads exist yet
     // (the tracing_appender non-blocking writer is spawned inside init_tracing

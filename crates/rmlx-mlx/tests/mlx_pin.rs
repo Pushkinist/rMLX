@@ -211,6 +211,16 @@ fn is_na_class_host_is_true_only_from_m5_onward() {
 }
 
 #[test]
+fn nax_capability_str_matrix() {
+    // The exact tri-state recorded in RMLX_MLX_NAX / events.mlx_nax: a
+    // confirmed scan result maps straight through, an unreadable metallib
+    // must not be guessed as either present or absent.
+    assert_eq!(nax_capability_str(Some(true)), "present");
+    assert_eq!(nax_capability_str(Some(false)), "absent");
+    assert_eq!(nax_capability_str(None), "unknown");
+}
+
+#[test]
 fn nax_warning_level_matrix() {
     // NA-class host, kernels confirmed missing -> loud (today's behaviour).
     assert_eq!(nax_warning_level(true, false), NaxWarningLevel::Loud);

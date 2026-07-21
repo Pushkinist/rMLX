@@ -227,8 +227,8 @@ impl EventRecorder {
             "INSERT INTO events (
                 run_id, ts_utc, model_path, quant_mode,
                 stage, op, value_unit, value, notes,
-                backend_version, build_profile
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                backend_version, build_profile, mlx_nax
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 &self.run_id,
                 ts,
@@ -241,6 +241,7 @@ impl EventRecorder {
                 m.notes,
                 &identity.backend_version,
                 &identity.build_profile,
+                &identity.mlx_nax,
             ],
         )?;
 

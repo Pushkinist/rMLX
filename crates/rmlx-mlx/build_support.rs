@@ -219,6 +219,22 @@ fn nax_missing_kernel_lines(
     ]
 }
 
+/// Render the metallib nax-kernel scan as the tri-state string recorded in
+/// run identity (`RMLX_MLX_NAX`, then `events.mlx_nax`).
+///
+/// Reuses the exact `Option<bool>` `check_mlx_pin` already computes from the
+/// metallib scan — `Some(true)`/`Some(false)` are a confirmed presence or
+/// absence, `None` is "no metallib to inspect" (unreadable or missing file).
+/// The third case is `"unknown"`, not a guess in either direction: a build
+/// that cannot look must not report a capability it never observed.
+fn nax_capability_str(fast_gemm: Option<bool>) -> &'static str {
+    match fast_gemm {
+        Some(true) => "present",
+        Some(false) => "absent",
+        None => "unknown",
+    }
+}
+
 /// Whether `reader` yields `needle` anywhere, scanning in `chunk`-sized reads.
 ///
 /// The metallib this scans is ~150 MB, which a build script has no business
