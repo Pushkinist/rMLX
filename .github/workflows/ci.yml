@@ -28,7 +28,7 @@ jobs:
     name: rustfmt
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: rustfmt
@@ -45,7 +45,7 @@ jobs:
     # own named check — and runs on Linux, which bills at a tenth of macOS.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: GPU-touching tests carry the Metal-context #[ignore]
         run: make check-gpu-tests-ignored
 
@@ -62,7 +62,7 @@ jobs:
     # own named check.
     runs-on: macos-14 # Apple Silicon; full Xcode
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Xcode 16.3+ unbundled the Metal compiler into a downloadable component,
       # so "full Xcode" no longer guarantees `xcrun metal`. Fetch it when it is
       # missing, then assert it resolved: this job exists to compile MSL, so a
@@ -93,7 +93,7 @@ jobs:
     name: build + clippy
     runs-on: macos-14 # Apple Silicon
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy
