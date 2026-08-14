@@ -1,6 +1,3 @@
-// CLI binary: user-facing output. tracing carries the structured record; the
-// operator needs the trace path on stdout to open it.
-#![allow(clippy::print_stdout)]
 //! Driver for `rmlx baseline --gpu-capture` — the debug-only Metal GPU trace of
 //! a bounded window of steady-state decode.
 //!

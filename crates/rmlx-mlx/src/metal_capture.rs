@@ -19,6 +19,16 @@
 //! [`step`] once per step and knows nothing about paths, counts, or Metal, so
 //! the hook is model- and codec-agnostic.
 //!
+//! # Precondition: one decode stream
+//!
+//! The driver is process-global but the hook lives in the shared decode loop,
+//! which the server drives once per in-flight request. With two generations
+//! decoding at once the window would count their steps as one sum and the trace
+//! would bracket an arbitrary interleaving of both. Only `rmlx baseline` arms a
+//! capture today and it decodes a single stream on one thread, so this holds;
+//! [`step`] warns once if it is ever ticked from another thread rather than
+//! quietly producing a trace that means something else.
+//!
 //! # Prerequisite outside our control
 //!
 //! Apple only inserts the Metal capture layer into a process when the
@@ -48,10 +58,13 @@ use rmlx_core::error::Error;
 /// drop (or when [`CaptureScope::stop`] is called explicitly).
 ///
 /// Only one scope may be active at a time — the Metal capture manager is
-/// process-global. The driver in this module owns the single scope; construct
-/// one directly only in tests.
-#[allow(missing_debug_implementations)]
-pub struct CaptureScope {
+/// process-global, and starting a second capture while one is live raises an
+/// Objective-C exception, which crosses the FFI boundary as a foreign exception
+/// and aborts the process instead of returning an `Err` we could report. So the
+/// type is crate-private: the driver below is the only constructor and the
+/// compiler, not a comment, enforces the single-scope invariant.
+#[derive(Debug)]
+pub(crate) struct CaptureScope {
     stopped: bool,
 }
 
@@ -60,7 +73,7 @@ impl CaptureScope {
     ///
     /// Returns `Err` if the capture layer is not inserted, the path already
     /// exists, or Metal is unavailable.
-    pub fn start(path: &Path) -> Result<Self> {
+    pub(crate) fn start(path: &Path) -> Result<Self> {
         install_error_handler();
         let path_str = path.to_str().ok_or_else(|| {
             Error::Mlx(format!(
@@ -78,7 +91,7 @@ impl CaptureScope {
     }
 
     /// Stop the capture explicitly. A no-op if already stopped.
-    pub fn stop(&mut self) -> Result<()> {
+    pub(crate) fn stop(&mut self) -> Result<()> {
         if self.stopped {
             return Ok(());
         }
@@ -93,8 +106,19 @@ impl CaptureScope {
 
 impl Drop for CaptureScope {
     fn drop(&mut self) {
-        // Best-effort: Drop cannot propagate. `finish` is the path that reports
-        // a failing stop; this only covers an early unwind.
+        // Best-effort: Drop cannot propagate, so `finish` stays the path that
+        // reports a failing stop. What this actually covers is the local
+        // bindings below that `take()` the scope out of the driver and then
+        // fail in `stop()` — there the value is dropped on the `?` and stopping
+        // twice is a no-op, because `stop` latches `stopped` before the call.
+        //
+        // What it does NOT cover is an unwind through the decode loop: the live
+        // scope is owned by the process-global `DRIVER` static, and statics are
+        // never dropped. A panic mid-window therefore skips `finish`, leaves
+        // `mlx_metal_stop_capture` uncalled, and exits with an unfinalised
+        // bundle. That failure is loud on its own — the process dies with the
+        // panic — unlike the silent successful-run-with-no-trace this module
+        // exists to remove, so it is documented here rather than papered over.
         if let Err(e) = self.stop() {
             tracing::error!(error = %e, "metal capture failed to stop on drop");
         }
@@ -149,13 +173,19 @@ impl Window {
     }
 
     /// Observe one decode-step boundary and report the action it triggers.
+    ///
+    /// `skip` and `steps` come straight from CLI flags, so their sum is
+    /// saturating: this module ships under `release-debug`, which has
+    /// `overflow-checks` off, and a wrapped bound would silently open the
+    /// window at the wrong step and report nonsense — the opposite of the
+    /// diagnostic's purpose.
     pub const fn tick(&mut self) -> Action {
         self.seen += 1;
         if !self.opened && self.seen > self.skip {
             self.opened = true;
             return Action::Open;
         }
-        if self.opened && !self.closed && self.seen > self.skip + self.steps {
+        if self.opened && !self.closed && self.seen > self.skip.saturating_add(self.steps) {
             self.closed = true;
             return Action::Close;
         }
@@ -171,7 +201,7 @@ impl Window {
     /// Boundaries the generation must reach for the window to open at all.
     #[must_use]
     pub const fn steps_needed_to_open(&self) -> u32 {
-        self.skip + 1
+        self.skip.saturating_add(1)
     }
 
     /// Whether the window ever opened.
@@ -249,9 +279,13 @@ pub fn validate(path: &Path, layer_inserted: bool, steps: u32) -> Result<()> {
 ///
 /// The loop drives one boundary per token after the prefill token, and the
 /// closing boundary is itself a step that has to exist — hence the `+ 2`.
+///
+/// Saturating for the same reason as [`Window::tick`]: both operands are
+/// CLI-supplied and `release-debug` does not check overflow, so a wrapped
+/// minimum would wave through a generation far too short to hold the window.
 #[must_use]
 pub const fn min_tokens_for_window(skip: u32, steps: u32) -> u32 {
-    skip + steps + 2
+    skip.saturating_add(steps).saturating_add(2)
 }
 
 /// Whether Apple's Metal capture layer is present in this process.
@@ -299,13 +333,21 @@ struct Driver {
     path: PathBuf,
     window: Window,
     scope: Option<CaptureScope>,
+    /// Thread that armed the capture. The window counts decode steps, not
+    /// per-request decode steps, so a tick from anywhere else means the trace
+    /// no longer brackets one generation — see the module's single-stream
+    /// precondition.
+    armed_on: std::thread::ThreadId,
+    /// Latch so the cross-thread warning is emitted once, not once per step.
+    foreign_tick_warned: bool,
 }
 
 static DRIVER: Mutex<Option<Driver>> = Mutex::new(None);
 
 /// A poisoned driver lock means a panic unwound through a capture step. The
-/// state behind it is a counter plus an `Option<CaptureScope>`, both of which
-/// stay meaningful after an unwind, so recovering beats aborting the process.
+/// state behind it is counters, latches and an `Option<CaptureScope>`, all of
+/// which stay meaningful after an unwind, so recovering beats aborting the
+/// process.
 fn driver() -> MutexGuard<'static, Option<Driver>> {
     DRIVER.lock().unwrap_or_else(|poisoned| {
         tracing::warn!("metal capture driver lock was poisoned; recovering");
@@ -333,6 +375,8 @@ pub fn arm(path: PathBuf, skip: u32, steps: u32) -> Result<()> {
         path,
         window: Window::new(skip, steps),
         scope: None,
+        armed_on: std::thread::current().id(),
+        foreign_tick_warned: false,
     });
     Ok(())
 }
@@ -347,6 +391,14 @@ pub fn step() -> Result<()> {
     let Some(d) = guard.as_mut() else {
         return Ok(());
     };
+    if !d.foreign_tick_warned && std::thread::current().id() != d.armed_on {
+        d.foreign_tick_warned = true;
+        tracing::warn!(
+            "GPU capture window ticked from a thread other than the one that armed it. \
+             If more than one generation is decoding, the window counts their steps as \
+             one sum and the trace brackets an interleaving of both."
+        );
+    }
     match d.window.tick() {
         Action::Idle => Ok(()),
         Action::Open => {

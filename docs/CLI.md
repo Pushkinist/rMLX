@@ -334,9 +334,9 @@ nor the per-step hook it drives is linked in. See
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
-| `--gpu-capture` | path | — | Write a Metal GPU trace of a bounded window of steady-state decode to this path (a `.gputrace` bundle). Mutually exclusive with `--record`. |
+| `--gpu-capture` | path | — | Write a Metal GPU trace of a bounded window of steady-state decode to this path (a `.gputrace` bundle). Mutually exclusive with `--record`, and forces `--metrics off`. |
 | `--gpu-capture-skip` | u32 | 4 | Decode steps to run before the window opens, so first-touch kernel compilation and pipeline warm-up stay out of the trace. Requires `--gpu-capture`. |
-| `--gpu-capture-steps` | u32 | 8 | Decode steps inside the window. Requires `--gpu-capture`. |
+| `--gpu-capture-steps` | u32 | 8 | Decode steps inside the window. Keep it at 8 or more — the decode loop is pipelined, so a narrower window holds a strict subset of the kernels a step actually runs. Requires `--gpu-capture`. |
 
 The process must be launched with `MTL_CAPTURE_ENABLED=1`. That is Apple's —
 Metal inserts the capture layer at launch and cannot do so afterwards — not an
@@ -349,8 +349,14 @@ model loads** where possible: no capture layer, an occupied destination, a
 missing parent directory, a zero-wide window, or a `--max-tokens` too small to
 open, fill and close the window (it needs `skip + steps + 2`). A generation that
 stops early and never reaches the window is an error at the end of the run.
-`--record` is rejected outright because capture perturbs every timing `baseline`
-measures.
+
+Capture perturbs every timing `baseline` measures — decode collapses to
+single-digit TPS inside the window — so none of a capture run's numbers may
+reach a metrics surface. `--record` is rejected outright, and `--gpu-capture`
+additionally forces the process metrics mode to `off` whatever `--metrics` says,
+which is what actually keeps the `events` table and
+`<RMLX_HOME>/metrics/baseline.csv` clean; the flag conflict alone only covered
+the `observations` row.
 
 #### Chat-JSON prompt tokenization
 

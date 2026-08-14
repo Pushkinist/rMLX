@@ -4,14 +4,19 @@
 #
 # Why this exists: on M5 the Neural Accelerator is part of the GPU, so profiling
 # nax needs no special tooling — the ordinary Metal capture path covers it
-# (ml-explore/mlx#3182). For MSL kernel questions we need GPU-side counters
-# (occupancy, ALU vs memory bound, achieved bandwidth, dispatch gaps), which
-# host stack sampling (samply) cannot show.
+# (ml-explore/mlx#3182). MSL kernel questions are answered GPU-side, which host
+# stack sampling (samply) cannot show: the bundle names the pipelines the window
+# ran, and replaying it in Xcode with Profile produces the counters.
 #
 # The capture window matters: a whole run is unusably large and dominated by
 # load + prefill, which is not what we are studying. The engine opens the scope
 # after --skip decode steps and closes it --steps later, so the trace holds
 # steady-state decode and nothing else.
+#
+# Keep --steps at 8 or more. The decode loop is pipelined, so a step's work
+# straddles the window boundary: a 1-step window's kernel set is a strict subset
+# of an 8-step one (it misses the gather_front* embedding lookups), and reading
+# it as "the kernels decode runs" is wrong.
 #
 # Prerequisites (checked below, each with the fix):
 #   - Xcode (not just Command Line Tools) selected via xcode-select
@@ -125,7 +130,11 @@ fi
 
 mkdir -p "$OUT_DIR"
 stamp=$(date +%Y%m%d-%H%M%S)
-trace="$OUT_DIR/${KV_QUANT}-${PROMPT_TOKENS}tok-${stamp}.gputrace"
+# The model goes in the name: bundles are multi-GB and land side by side, and
+# without it two runs of the same codec and prompt size are indistinguishable
+# short of reverse-engineering kernel names out of the archive.
+model_tag=$(basename "${MODEL%/}")
+trace="$OUT_DIR/${model_tag}-${KV_QUANT}-${PROMPT_TOKENS}tok-${stamp}.gputrace"
 
 # Give the KV ring room for the prompt plus the generation, so the run is not
 # rejected for context before it ever decodes.
@@ -167,8 +176,12 @@ echo ""
 echo "done: $trace"
 echo "open with:  open '$trace'"
 echo ""
-echo "In Xcode, the questions this trace should answer:"
-echo "  - per-dispatch kernel time for the flash-decode kernel vs the gaps between dispatches"
-echo "    (a large gap = host round-trip, e.g. the k_iso*/k_rotor* prefix restage)"
-echo "  - limiter counters: ALU vs memory bound, occupancy, achieved bandwidth"
-echo "    (tells whether a quant decode kernel is compute- or bandwidth-limited)"
+echo "What this bundle holds, and what it does not:"
+echo "  - kernel identity is in the bundle already: which pipelines the window"
+echo "    referenced, and which of them were actually used. No Xcode needed."
+echo "  - per-dispatch time, ALU-vs-memory limiter, occupancy and achieved"
+echo "    bandwidth are NOT in it. Open it in Xcode and press Profile: that"
+echo "    replays the capture on-device with counters enabled and writes them."
+echo "  - the gaps between dispatches as they happened in THIS run are not"
+echo "    recoverable at all — a replay has the replay's schedule. For host"
+echo "    round-trips use:  xcrun xctrace record --template 'Metal System Trace'"

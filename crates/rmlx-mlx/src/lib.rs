@@ -1,3 +1,10 @@
+// LOC-exempt: crate root of the mlx-c wrapper. `Array` — the owned handle every
+// other module in the workspace passes around — is inseparable from the
+// crate-private FFI plumbing it calls on every op: the thread-local error
+// capture behind `check_status`, the process-global default-stream helper, the
+// quant-mode CString cache, and the null-handle sentinel for optional
+// arguments. Splitting `Array` out would export that plumbing across a module
+// boundary purely to move lines, with no reader benefit.
 //! Safe Rust wrapper around the brew-prebuilt `mlx-c` library.
 //!
 //! # Quick start

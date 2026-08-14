@@ -7,8 +7,14 @@
 //! cargo test -p rmlx-cli --features metal-capture gpu_capture
 //! ```
 //!
-//! None of them arms the process-global capture driver — every case here is
-//! rejected, or observed, before any Metal state is touched.
+//! None of them arms the process-global capture driver, and none may: the
+//! driver is a `static`, so a test that leaves it armed changes what its
+//! siblings observe, order- and thread-dependently. Every case here is either
+//! rejected before the driver is set, or observes a driver that was never
+//! armed. Any case that reaches the real `arm` must be rejected on a branch
+//! that does not depend on the environment the test happens to run in —
+//! `MTL_CAPTURE_ENABLED=1` is exported in exactly the shell someone developing
+//! this feature uses, and it flips the capture-layer branch.
 
 use std::path::Path;
 
@@ -38,12 +44,20 @@ fn rejects_a_generation_too_short_to_close_the_window() {
 #[test]
 fn accepts_the_exact_minimum_token_count() {
     // The boundary case must NOT be rejected, or the driver is overstating the
-    // requirement. It fails later (no capture layer in a test process), but the
-    // token-count gate is what is under test here.
-    let err = arm(Some(Path::new("/tmp/rmlx-exact.gputrace")), 4, 8, 14)
+    // requirement. The destination sits in a directory that does not exist, so
+    // whatever the environment says about the capture layer, `validate` rejects
+    // the request before the driver is armed — the assertion is about the token
+    // gate alone, and this test cannot leave state behind for its siblings.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("no-such-dir").join("exact.gputrace");
+    let err = arm(Some(&path), 4, 8, 14)
         .err()
         .map(|e| e.to_string())
         .unwrap_or_default();
+    assert!(
+        !err.is_empty(),
+        "the request must still be rejected — on the destination, not the token count"
+    );
     assert!(
         !err.contains("--max-tokens"),
         "14 tokens is exactly enough and must clear the token gate, got: {err}"

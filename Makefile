@@ -86,7 +86,10 @@ target-size-report: ## advisory: print target/ size + hint when over threshold (
 build-capture: ## build the debug-only GPU-capture binary (release-debug + metal-capture)
 	cargo build --profile release-debug --features rmlx-cli/metal-capture
 
-test-capture: ## run the GPU-capture unit tests (feature-gated, so plain `make test` skips them)
+# `make test` is `cargo test --workspace` without --all-features, so it compiles
+# these out entirely. Run from `ci` as well, or an off-by-one in the window
+# policy passes the gate green.
+test-capture: ## run the GPU-capture unit tests (feature-gated, so plain `make test` skips them; also a `make ci` step)
 	cargo test -p rmlx-mlx --features metal-capture --lib metal_capture
 	cargo test -p rmlx-cli --features metal-capture --bin rmlx gpu_capture
 
@@ -218,7 +221,7 @@ check-metal-format: ## CI gate: every KV .metal kernel is clang-format clean (sk
 	@bash scripts/check_metal_format.sh $(METAL_STRICT)
 
 # ---- one-shot CI gate -------------------------------------------------
-ci: fmt-check lint test deny audit ci-metrics ## full pre-merge gate: fmt + clippy + test + deny + audit + metrics-sanity + inline-test + MSL gates
+ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gate: fmt + clippy + test + feature-gated capture tests + deny + audit + metrics-sanity + inline-test + MSL gates
 	@bash scripts/check_no_inline_tests.sh
 	@bash scripts/check_no_scalar_f32_leak.sh
 	@bash scripts/check_no_decode_swallow.sh
