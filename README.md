@@ -156,6 +156,41 @@ regression that costs ~3.8× GPU matmul throughput), the build prints a warning
 naming the fix. It is a warning, not an error — the build still succeeds. See
 [`docs/FFI.md`](docs/FFI.md#pinned-mlx--mlx-c-pair).
 
+### On M5 and later: check for the Neural Accelerator kernels
+
+M5 introduced the Neural Accelerator (NAX). Some Homebrew MLX bottles are built
+in a way that silently omits the NAX kernels, which costs roughly **2–3.8× on
+prefill** while leaving decode largely untouched — so the loss is easy to miss.
+On M1–M4 there is no NAX and nothing to check: those bottles legitimately
+contain no NAX kernels.
+
+```sh
+strings "$(brew --prefix mlx)/lib/mlx.metallib" | grep -c steel_gemm_fused_nax
+# M5+: expect a non-zero count. 0 means your MLX bottle has no NAX kernels.
+# M1-M4: 0 is normal and expected.
+```
+
+Contributors can run this (and the rest of the toolchain checks) with
+`make mlx-preflight`.
+
+### Extra tooling for kernel work (contributors only)
+
+Not needed to build or run rMLX — only to compile-check or profile the Metal
+kernels:
+
+- **Full Xcode** (not just the Command Line Tools), selected with
+  `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer`.
+- **The Metal Toolchain component**, which Xcode does not install by default:
+
+```sh
+xcodebuild -downloadComponent MetalToolchain
+```
+
+With both present, `make check-metal-compiles` compiles every KV `.metal`
+kernel natively, and `make profile-gputrace` captures a GPU trace for Xcode.
+Without them, the compile gate reports `SKIP` (CI still enforces it) — see
+[`docs/PROFILING.md`](docs/PROFILING.md).
+
 ## Install
 
 All paths build from source — rMLX links the system MLX/mlx-c libraries, so MLX
