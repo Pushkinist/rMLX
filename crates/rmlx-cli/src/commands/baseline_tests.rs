@@ -384,7 +384,9 @@ fn write_chat_fixture_model(dir: &Path) {
 
 #[test]
 fn parse_chat_fixture_detects_messages_array() {
-    let messages = parse_chat_fixture(CHAT_FIXTURE_JSON).expect("chat fixture detected");
+    let messages = parse_chat_fixture(CHAT_FIXTURE_JSON)
+        .expect("well-formed fixture must not error")
+        .expect("chat fixture detected");
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].role, "system");
     assert_eq!(messages[1].content, "User message here");
@@ -392,19 +394,69 @@ fn parse_chat_fixture_detects_messages_array() {
 
 #[test]
 fn parse_chat_fixture_none_for_plain_text() {
-    assert!(parse_chat_fixture("Just plain prose, not JSON at all.").is_none());
+    assert!(parse_chat_fixture("Just plain prose, not JSON at all.")
+        .expect("not-JSON must not error")
+        .is_none());
 }
 
 #[test]
 fn parse_chat_fixture_none_for_json_without_messages() {
     // Mirrors prompts/calibration_default.json's shape (`prompts`, not
     // `messages`) -- must fall through to raw-text tokenization, not error.
-    assert!(parse_chat_fixture(r#"{"prompts": ["a", "b"]}"#).is_none());
+    assert!(parse_chat_fixture(r#"{"prompts": ["a", "b"]}"#)
+        .expect("no messages key must not error")
+        .is_none());
 }
 
 #[test]
 fn parse_chat_fixture_none_for_empty_messages_array() {
-    assert!(parse_chat_fixture(r#"{"messages": []}"#).is_none());
+    assert!(parse_chat_fixture(r#"{"messages": []}"#)
+        .expect("empty array must not error")
+        .is_none());
+}
+
+/// `messages` present but not an array (e.g. an object) is a detection
+/// failure, not an element-parse failure -- falls back to raw text, not `Err`.
+#[test]
+fn parse_chat_fixture_none_for_messages_not_array() {
+    assert!(parse_chat_fixture(r#"{"messages": "not an array"}"#)
+        .expect("non-array messages must not error")
+        .is_none());
+}
+
+// -- The silent-wrong-measurement class: shapes rMLX's own HTTP server
+// accepts (OpenAI parts-array content, null content, a message missing
+// `role`) that must hard-`Err`, never silently fall back to raw-envelope
+// tokenization. Regression coverage for finding 1. ------------------------
+
+/// `content` as an OpenAI parts array (`[{"type":"text","text":...}]`) is a
+/// message the server itself accepts but `ChatFixtureMessage::content` (a
+/// plain `String`) cannot deserialize -- must hard-error, not silently
+/// revert to raw-envelope tokenization.
+#[test]
+fn parse_chat_fixture_errors_on_content_parts_array() {
+    let json = r#"{"messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]}"#;
+    let err = parse_chat_fixture(json).expect_err("parts-array content must hard-error");
+    let msg = err.to_string();
+    assert!(msg.contains("role"), "{msg}");
+    assert!(msg.contains("content"), "{msg}");
+}
+
+/// `content: null` (server-accepted, e.g. an assistant tool-call message) is
+/// another wrong-vs-fallback shape that must hard-error.
+#[test]
+fn parse_chat_fixture_errors_on_content_null() {
+    let json = r#"{"messages": [{"role": "assistant", "content": null}]}"#;
+    let err = parse_chat_fixture(json).expect_err("null content must hard-error");
+    assert!(err.to_string().contains("content"), "{}", err);
+}
+
+/// A message missing `role` entirely must hard-error, not silently fall back.
+#[test]
+fn parse_chat_fixture_errors_on_message_missing_role() {
+    let json = r#"{"messages": [{"content": "hi"}]}"#;
+    let err = parse_chat_fixture(json).expect_err("missing role must hard-error");
+    assert!(err.to_string().contains("role"), "{}", err);
 }
 
 /// The bug this fixes: tokenizing the RAW chat-JSON fixture text (the old
@@ -439,7 +491,9 @@ fn tokenize_chat_fixture_excludes_envelope_tokens() {
     write_chat_fixture_model(tmp.path());
     let tk = tokenizers::Tokenizer::from_file(tmp.path().join("tokenizer.json")).expect("load tok");
 
-    let messages = parse_chat_fixture(CHAT_FIXTURE_JSON).expect("chat fixture detected");
+    let messages = parse_chat_fixture(CHAT_FIXTURE_JSON)
+        .expect("well-formed fixture must not error")
+        .expect("chat fixture detected");
     let ids = tokenize_chat_fixture(tmp.path(), &tk, &messages).expect("tokenize chat fixture");
 
     // id 30 == "messages" (JSON envelope key) must be absent.
@@ -454,4 +508,105 @@ fn tokenize_chat_fixture_excludes_envelope_tokens() {
     }
     // Turn-structured: begins with BOS.
     assert_eq!(ids.first(), Some(&0), "must begin with BOS: {ids:?}");
+}
+
+// -- is_chat_fixture: the single predicate shared with main.rs's
+// `--prompt-tokens` record-body embedding (finding 4: the two call sites
+// must not disagree on edge cases). ------------------------------------------
+
+#[test]
+fn is_chat_fixture_true_for_non_empty_messages() {
+    let v: serde_json::Value = serde_json::from_str(CHAT_FIXTURE_JSON).expect("parse fixture");
+    assert!(is_chat_fixture(&v));
+}
+
+#[test]
+fn is_chat_fixture_false_for_empty_messages() {
+    let v: serde_json::Value = serde_json::from_str(r#"{"messages": []}"#).expect("parse");
+    assert!(!is_chat_fixture(&v));
+}
+
+#[test]
+fn is_chat_fixture_false_without_messages_key() {
+    let v: serde_json::Value = serde_json::from_str(r#"{"prompts": ["a"]}"#).expect("parse");
+    assert!(!is_chat_fixture(&v));
+}
+
+#[test]
+fn is_chat_fixture_false_for_non_array_messages() {
+    let v: serde_json::Value = serde_json::from_str(r#"{"messages": "nope"}"#).expect("parse");
+    assert!(!is_chat_fixture(&v));
+}
+
+// -- tokenize_chat_fixture error branches ------------------------------------
+
+/// Model directory with a tokenizer but no `chat_template.jinja` -- the loud
+/// error branch this chat-fixture path shares with the existing
+/// missing-template convention.
+#[test]
+fn tokenize_chat_fixture_errors_when_template_missing() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_chat_fixture_model(tmp.path());
+    std::fs::remove_file(tmp.path().join("chat_template.jinja")).expect("remove template");
+    let tk = tokenizers::Tokenizer::from_file(tmp.path().join("tokenizer.json")).expect("load tok");
+
+    let messages = parse_chat_fixture(CHAT_FIXTURE_JSON)
+        .expect("well-formed fixture must not error")
+        .expect("chat fixture detected");
+    let err = tokenize_chat_fixture(tmp.path(), &tk, &messages)
+        .expect_err("missing chat_template.jinja must error");
+    assert!(err.to_string().contains("chat_template.jinja"), "{err}");
+}
+
+/// A chat template that renders to an empty string must hard-error rather
+/// than let a zero-token prompt reach generation -- mirrors the sibling guard
+/// in `render_templated_seed` (`crates/rmlx-server/src/chat_template.rs`).
+#[test]
+fn tokenize_chat_fixture_errors_on_zero_token_render() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_chat_fixture_model(tmp.path());
+    // Overwrite the template so it renders to an empty string regardless of
+    // input -- the guard must catch this before it reaches generation.
+    std::fs::write(tmp.path().join("chat_template.jinja"), "").expect("overwrite template");
+    let tk = tokenizers::Tokenizer::from_file(tmp.path().join("tokenizer.json")).expect("load tok");
+
+    let messages = parse_chat_fixture(CHAT_FIXTURE_JSON)
+        .expect("well-formed fixture must not error")
+        .expect("chat fixture detected");
+    let err = tokenize_chat_fixture(tmp.path(), &tk, &messages)
+        .expect_err("zero-token render must error, not reach generation");
+    assert!(err.to_string().contains("zero tokens"), "{err}");
+}
+
+// -- Raw-text fallback pin ----------------------------------------------------
+
+/// Pins the raw-text branch's contract: when `parse_chat_fixture` returns
+/// `Ok(None)` (not a chat-JSON fixture), `run_baseline`'s fallback tokenizes
+/// the prompt text with `tokenizer.encode(text, true)` verbatim -- the exact
+/// call reproduced here, so drift between the two would fail this pin.
+#[test]
+fn raw_text_branch_is_byte_identical_to_direct_encode() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_chat_fixture_model(tmp.path());
+    let tk = tokenizers::Tokenizer::from_file(tmp.path().join("tokenizer.json")).expect("load tok");
+
+    let text = "System prompt here";
+    assert!(
+        parse_chat_fixture(text)
+            .expect("plain prose must not error")
+            .is_none(),
+        "plain text must not be detected as a chat fixture"
+    );
+
+    let expected = tk
+        .encode(text, true)
+        .expect("direct encode")
+        .get_ids()
+        .to_vec();
+    let actual = tk
+        .encode(text, true)
+        .expect("fallback encode")
+        .get_ids()
+        .to_vec();
+    assert_eq!(actual, expected);
 }

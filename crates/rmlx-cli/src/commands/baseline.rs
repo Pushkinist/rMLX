@@ -181,23 +181,61 @@ pub(crate) fn compute_phase_timing(
 
 /// One message in a chat-JSON prompt fixture (`prompts/longctx_<N>k.json`):
 /// `{"messages": [{"role": "...", "content": "..."}, ...], ...}`.
-#[derive(serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 struct ChatFixtureMessage {
     role: String,
     content: String,
 }
 
-/// Parse `prompt_text` as a chat-JSON fixture. Returns `None` when the text
-/// is not valid JSON, has no `messages` array, or the array is empty -- the
-/// caller then falls back to tokenizing `prompt_text` verbatim as raw text
-/// (the plain-`.txt` fixture path).
-fn parse_chat_fixture(prompt_text: &str) -> Option<Vec<ChatFixtureMessage>> {
-    #[derive(serde::Deserialize)]
-    struct ChatFixture {
-        messages: Vec<ChatFixtureMessage>,
+/// `true` when `value` is a JSON object carrying a non-empty `messages`
+/// array -- the single "is this a chat-JSON fixture" predicate shared by
+/// `parse_chat_fixture` (tokenization, below) and the CLI's `--prompt-tokens`
+/// record-body embedding (`main.rs`), so the two call sites cannot disagree
+/// on edge cases such as `messages: []`.
+pub(crate) fn is_chat_fixture(value: &serde_json::Value) -> bool {
+    value
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|arr| !arr.is_empty())
+}
+
+/// Parse `prompt_text` as a chat-JSON fixture.
+///
+/// Returns `Ok(None)` when `prompt_text` is not a chat-JSON fixture at all --
+/// not valid JSON, not a JSON object, no `messages` key, `messages` is not an
+/// array, or the array is empty (per [`is_chat_fixture`]) -- the caller then
+/// falls back to tokenizing `prompt_text` verbatim as raw text (the
+/// plain-`.txt` fixture path).
+///
+/// Returns `Err` when `prompt_text` unambiguously IS a chat-JSON fixture (a
+/// non-empty `messages` array) but one or more elements do not deserialize
+/// into the `{"role": "<string>", "content": "<string>"}` shape this baseline
+/// harness supports -- e.g. an OpenAI parts-array `content`, `content:
+/// null`, or a message missing `role`. Silently falling back to
+/// raw-envelope tokenization in that case would record a wrong measurement
+/// with no error, so this matches the existing loud-failure convention for a
+/// missing `chat_template.jinja`.
+fn parse_chat_fixture(prompt_text: &str) -> anyhow::Result<Option<Vec<ChatFixtureMessage>>> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(prompt_text) else {
+        return Ok(None);
+    };
+    if !is_chat_fixture(&value) {
+        return Ok(None);
     }
-    let fixture: ChatFixture = serde_json::from_str(prompt_text).ok()?;
-    (!fixture.messages.is_empty()).then_some(fixture.messages)
+    // `is_chat_fixture` already proved `messages` is present and a non-empty
+    // array; `.get()` (not indexing) keeps this panic-free regardless.
+    let Some(messages) = value.get("messages") else {
+        return Ok(None);
+    };
+    serde_json::from_value(messages.clone())
+        .map(Some)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "prompt is a chat-JSON fixture (non-empty \"messages\" array) but its elements \
+                 do not match the expected {{\"role\": \"<string>\", \"content\": \"<string>\"}} \
+                 shape: {e}"
+            )
+        })
 }
 
 /// Render `messages` through `<model_path>/chat_template.jinja` and tokenize
@@ -243,8 +281,14 @@ fn tokenize_chat_fixture(
         .render(&tpl_messages, &opts)
         .map_err(|e| anyhow::anyhow!("render chat_template.jinja: {e}"))?;
 
-    rmlx_server::tokenizer_io::encode(tokenizer, &rendered.text)
-        .map_err(|e| anyhow::anyhow!("tokenize rendered chat prompt: {e}"))
+    let ids = rmlx_server::tokenizer_io::encode(tokenizer, &rendered.text)
+        .map_err(|e| anyhow::anyhow!("tokenize rendered chat prompt: {e}"))?;
+    if ids.is_empty() {
+        return Err(anyhow::anyhow!(
+            "chat-JSON fixture rendered through chat_template.jinja encoded to zero tokens"
+        ));
+    }
+    Ok(ids)
 }
 
 /// Record a performance baseline for the given model snapshot.
@@ -311,8 +355,10 @@ pub(crate) fn run_baseline(
     // are counted -- matching the HTTP chat-completions path. Anything else
     // (e.g. the default plain-text fixture) is tokenized as raw text with
     // add_special_tokens=true so BOS is prepended naturally.
-    let mut prompt_ids: Vec<u32> = if let Some(messages) = parse_chat_fixture(&prompt_text) {
-        tokenize_chat_fixture(model_path, &tokenizer, &messages)?
+    let chat_fixture_messages = parse_chat_fixture(&prompt_text)?;
+    let template_used = chat_fixture_messages.is_some();
+    let mut prompt_ids: Vec<u32> = if let Some(messages) = &chat_fixture_messages {
+        tokenize_chat_fixture(model_path, &tokenizer, messages)?
     } else {
         let encoding = tokenizer
             .encode(prompt_text.as_str(), true)
@@ -338,6 +384,7 @@ pub(crate) fn run_baseline(
         device = device_str,
         prompt_tokens = prompt_token_count,
         max_tokens,
+        template_used,
         "baseline: starting"
     );
 

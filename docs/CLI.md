@@ -322,6 +322,18 @@ envelope + syntax tokens (keys like `messages`, `role`, `prompt_tokens`, …).
 A plain-text `--prompt` file (the bundled default fixture) is tokenized
 as-is, unaffected.
 
+Detection is deliberately narrow: a file is treated as a chat-JSON fixture
+only when it parses as JSON *and* has a non-empty `messages` array. Anything
+else (not JSON, no `messages` key, `messages` not an array, or an empty
+array) falls back to raw-text tokenization — that is a legitimate plain-text
+prompt, not a malformed fixture. A file that IS a chat-JSON fixture (a
+non-empty `messages` array) but whose elements do not match the
+`{"role": "<string>", "content": "<string>"}` shape this harness supports —
+e.g. an OpenAI parts-array `content`, `content: null`, or a message missing
+`role` — is a **hard error** naming the expected shape, not a silent
+fallback: reverting to raw-envelope tokenization in that case would record a
+wrong `prompt_tokens` measurement with no indication anything went wrong.
+
 #### Prompt-length cap
 
 `--max-prompt-tokens` guards against pathologically long prompts inflating
