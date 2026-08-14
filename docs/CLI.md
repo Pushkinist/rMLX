@@ -392,8 +392,9 @@ and reports four quantities as a median with the observed run-to-run range:
 | `ttft_ms` | Prefill through first token. |
 | `itl_p50_ms` / `itl_p99_ms` | Inter-token latency percentiles **within** a run (nearest-rank over the gaps between consecutive token arrivals). |
 | `decode_tps` | Steady-state decode rate over tokens 2..N — prefill excluded. |
-| `prefill_tps` | Prompt tokens / TTFT. |
+| `prefill_tps` | Prompt tokens / TTFT. Reported as `n/a` when undefined, never as `0`. |
 | `kv_cache_bytes` | Filled-prefix KV cache bytes, sampled post-decode. |
+| `token_digest` | FNV-1a-64 over the run's token ids. Identical across every run of a cell, or the run aborts. |
 
 ```bash
 rmlx bench --model /path/to/snapshot --prompt-tokens 4096 --max-tokens 128
@@ -409,6 +410,7 @@ itl_p50_ms                 9.012          8.998          9.031       0.4%
 itl_p99_ms                 9.877          9.640         10.204       6.3%
 decode_tps               110.914        110.612        111.083       0.4%
 kv_cache_bytes         134217728      134217728      134217728       0.0%
+tokens: digest=0x8f2a1c47bd9e0356 (identical across every run)
 host: cpus=16 load_1m=1.20→1.35
 ```
 
@@ -420,11 +422,34 @@ host: cpus=16 load_1m=1.20→1.35
 | Output | one-line summary | median + min/max + range% per metric |
 | ITL percentiles | no | yes (p50, p99) |
 | Writes to `runs.db` | with `--record` | never — prints only |
-| Prompt-cache slots | 1 | 0 (every run is a fresh prefill) |
+| Prompt-cache slots | 1 | 1, cleared before every run (so every run is a fresh prefill) |
+| Output check | prints a decoded preview | token-stream digest, required identical across runs |
 
 Use `baseline --record` when a row must land in the append-only store; use
 `bench` when the question is "what is this cell's number, and how much do I
 trust it".
+
+**Their TTFTs are not the same quantity, and should not be compared directly.**
+`baseline` measures the *first* generation in a fresh process. `bench` discards
+`--warmup` generations first, so it measures a *warmed, repeated* generation.
+In-process TTFT genuinely moves between the two, and the direction depends on
+the context length. Measured on gemma-4-e2b and Ternary-Bonsai-8B (`--kv-quant
+none`, 4096-token prompt, 128 generated):
+
+| | gemma-4-e2b | Ternary-Bonsai-8B |
+|---|---|---|
+| `baseline` (median of 3 invocations) | 257 ms | 1272 ms |
+| `bench` generation 1 (`--warmup 0`) | 250 ms (**−2.6%**) | 1297 ms (**+2.0%**) |
+| `bench` median (`--warmup 1`) | 207 ms (−19%) | 1345 ms (+5.8%) |
+
+Generation 1 agrees with `baseline` on both architectures; the divergence is the
+warmup, not a disagreement about what a TTFT is. Compare `bench` TTFTs to other
+`bench` TTFTs at the same `--warmup`, and `baseline` TTFTs to other `baseline`
+TTFTs. Decode TPS does not have this problem — it averages the steady-state
+gaps *within* a generation, so it is robust in both tools.
+
+At long context the movement is large enough that `bench` refuses to report a
+median at all until the cell settles — see the drift refusal below.
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
@@ -455,12 +480,33 @@ is a hard error naming the cause, never a silent zero or a plausible default:
 - **`--runs 1`.** A single measurement has no observable spread, and this
   instrument does not report a central value without one. Checked before any
   file is opened.
-- **A run served from the prompt cache.** `bench` uses zero prompt-cache slots
-  so every run performs a real prefill, and then *verifies* it from the arch's
-  cache counters: no hits, and at least one miss. A hit means the post-prefill
-  KV snapshot was replayed, so the run's TTFT is a cache-replay time — small,
-  stable, and not a time-to-first-token. Absent counters are refused too:
-  nothing observable would then say a prefill happened.
+- **A run served from the prompt cache.** `bench` clears the arch's prompt cache
+  before every generation so each run performs a real prefill, and then
+  *verifies* it from the arch's cache counters: no hits, and at least one miss.
+  A hit means the post-prefill KV snapshot was replayed, so the run's TTFT is a
+  cache-replay time — small, stable, and not a time-to-first-token. Absent
+  counters are refused too: nothing observable would then say a prefill
+  happened. (Requesting a zero-slot cache would *not* achieve this: slot
+  capacity is clamped to a minimum of one.)
+- **A metric that trended across the runs.** `Spread` sorts, so a value that
+  climbs from run to run is reported as a wide *range* around a median — and a
+  wide range reads as noise. It is not: a drifting cell has no central value,
+  and its median is a point on a ramp that depends on where the operator
+  stopped. `bench` fits a line to `ttft_ms`, `decode_tps`, `itl_p50_ms`,
+  `prefill_tps` and `kv_cache_bytes` **in collection order** and aborts when the
+  first-to-last change exceeds 10% of the median, in either direction, naming
+  the values in run order. Raise `--warmup` until consecutive runs agree.
+  `itl_p99_ms` is exempt: nearest-rank p99 over a 128-token run is the
+  second-largest inter-token gap, so its run-to-run movement tracks whether one
+  run hit a stall rather than whether the cell settled. Its spread is still
+  printed.
+- **Runs that decoded different tokens.** Every run in a cell feeds the same
+  prompt to the same model at temperature 0, so every run must emit a
+  byte-identical token stream. `bench` digests each run's token ids (FNV-1a-64,
+  warmup runs included) and aborts when they disagree. This is not only a
+  reproducibility check: a KV cache that silently stops being written decodes
+  *faster* while producing wrong tokens, so a timing-only instrument is biased
+  toward accepting exactly that defect.
 - **A KV-byte figure the run did not report.** The arch's byte count is read as
   a `(bytes, seq)` pair (`Architecture::kv_cache_bytes_sample`), sampled before
   and after each generation. If `seq` did not advance, the readable value

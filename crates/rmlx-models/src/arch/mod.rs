@@ -1245,6 +1245,27 @@ impl Architecture {
         }
     }
 
+    /// Drop every snapshot held by this arch's prompt cache and reset its
+    /// hit/miss counters, so the next generation is a guaranteed miss and
+    /// performs a real prefill.
+    ///
+    /// The measurement commands use this to make repeated generations of the
+    /// same prompt comparable. Requesting a zero-slot cache does not achieve
+    /// that: slot capacity is clamped to a minimum of one, so a "zero-slot"
+    /// cache still stores and can still serve a snapshot.
+    pub fn clear_prompt_cache(&self) {
+        match self {
+            Architecture::Gemma4(_) => crate::gemma4::prompt_cache::PROMPT_CACHE.clear(),
+            Architecture::Gemma3(_) => crate::gemma3::prompt_cache::PROMPT_CACHE.clear(),
+            Architecture::Qwen3_5Moe(_) => crate::qwen3_5_moe::prompt_cache::PROMPT_CACHE.clear(),
+            Architecture::Qwen3(_) => crate::qwen3::QWEN3_PROMPT_CACHE.clear(),
+            Architecture::Qwen2(_) => crate::qwen2::prompt_cache::PROMPT_CACHE.clear(),
+            Architecture::BitNet(_) => crate::bitnet::prompt_cache::PROMPT_CACHE.clear(),
+            Architecture::Qwen3VlMoe(_) => crate::qwen3_vl_moe::prompt_cache::PROMPT_CACHE.clear(),
+            Architecture::Laguna(_) => crate::laguna::prompt_cache::PROMPT_CACHE.clear(),
+        }
+    }
+
     /// Actual on-device KV-cache bytes used by the most recent `generate_greedy`
     /// call on this architecture, paired with the store sequence they were
     /// written at.
@@ -1253,8 +1274,9 @@ impl Architecture {
     /// via `store_kv_cache_bytes` at the end of every generate call.
     ///
     /// Callers that *record* the byte count as a measurement must sample this
-    /// before and after the generation and require [`KvBytesSample::seq`] to
-    /// have advanced. Without that check, a generation that returns before
+    /// before and after the generation and require
+    /// [`crate::prompt_cache::KvBytesSample::seq`] to have advanced. Without
+    /// that check, a generation that returns before
     /// reaching the store (an early-out prefill path, or an arch that does not
     /// maintain the static) yields the previous call's byte count — or the `0`
     /// initialiser — with nothing to distinguish it from a fresh reading.

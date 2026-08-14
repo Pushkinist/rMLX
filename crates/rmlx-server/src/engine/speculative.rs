@@ -819,6 +819,13 @@ impl Generator for SpeculativeGenerator {
                 None
             };
 
+            // Sampled before the generation so the byte count emitted below can
+            // be attributed to *this* one: the store sequence must advance
+            // across the call, or the readable figure belongs to an earlier
+            // generation. The rows below land in the append-only events table,
+            // where a wrong value cannot be taken back.
+            let kv_before = rmlx_models::gemma4::gemma4_kv_cache_bytes_sample();
+
             let result = if let Some(drafter_arc) = eagle3_drafter.as_ref() {
                 // EAGLE-3 round-loop (greedy). Autoregressive draft +
                 // multi-layer hidden capture + d2t remap + GDN snapshot/restore
@@ -1011,7 +1018,36 @@ impl Generator for SpeculativeGenerator {
                     // F6/L18: emit KV-cache bytes to SPSC drainer (SpeculativeGenerator
                     // always wraps a Gemma4 verifier, so the global static applies).
                     {
-                        let kv_bytes = rmlx_models::gemma4::gemma4_kv_cache_bytes_sample().bytes;
+                        // Attribute the byte count to this generation before
+                        // recording it: an unchanged store sequence means the
+                        // readable figure is an earlier generation's, and a
+                        // reported zero means the accounting is wrong. Neither
+                        // is recordable — skip the row and say why.
+                        let kv_bytes = match rmlx_models::classify_kv_bytes(
+                            kv_before,
+                            rmlx_models::gemma4::gemma4_kv_cache_bytes_sample(),
+                        ) {
+                            rmlx_models::KvBytesVerdict::Reported(n) => n,
+                            rmlx_models::KvBytesVerdict::Unreported => {
+                                tracing::warn!(
+                                    model_id = %model_id_for_log,
+                                    "speculative generation reported no KV-cache byte count \
+                                     (store sequence did not advance); skipping the \
+                                     kv_cache_bytes row rather than recording an earlier \
+                                     generation's figure"
+                                );
+                                0
+                            }
+                            rmlx_models::KvBytesVerdict::ReportedZero => {
+                                tracing::warn!(
+                                    model_id = %model_id_for_log,
+                                    "speculative generation reported a KV cache of 0 bytes \
+                                     after a real prefill — the byte accounting is wrong, not \
+                                     the cache; skipping the kv_cache_bytes row"
+                                );
+                                0
+                            }
+                        };
                         if kv_bytes > 0 {
                             if let Some(ref drainer) = metrics_drainer {
                                 use crate::metrics_drainer::{MetricEvent, MetricKind};

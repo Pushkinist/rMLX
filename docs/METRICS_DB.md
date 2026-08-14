@@ -754,10 +754,19 @@ spread interactively, including the runs that get thrown away. When a figure is
 worth keeping, `rmlx baseline --record` is the path that writes it.
 
 `bench` is also where the refusal rules live in executable form — a
-prompt-cache-served run, a KV-byte figure the run did not itself report, and a
-`--runs 1` invocation are all hard errors there. Any future recording path that
-measures the same quantities should refuse on the same conditions rather than
-record a plausible-looking value.
+prompt-cache-served run, a KV-byte figure the run did not itself report, a
+metric that trended across the runs instead of settling, runs that decoded
+different tokens, and a `--runs 1` invocation are all hard errors there. Any
+recording path that measures the same quantities refuses on the same conditions
+rather than record a plausible-looking value.
+
+The `kv_cache_bytes` rule is already carried by the two paths that *write*:
+`rmlx baseline --record` and the server's speculative-decode request boundary
+both sample `kv_cache_bytes_sample()` before and after the generation and
+require the store sequence to have advanced. When it has not, the figure
+readable belongs to an earlier generation, and both paths `warn!` and omit the
+row rather than append it — the refusal matters more here than in `bench`,
+because `bench` can be re-run and an `observations` row cannot be taken back.
 
 ### 8.2 Subcommands
 

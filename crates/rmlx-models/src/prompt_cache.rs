@@ -201,6 +201,51 @@ pub struct KvBytesSample {
     pub seq: u64,
 }
 
+/// What a pair of [`KvBytesSample`] reads taken around one generation says
+/// about the byte count that generation produced.
+#[allow(
+    clippy::exhaustive_enums,
+    reason = "closed by construction: the sequence either advanced or it did not, and if it \
+              did the byte count is either zero or not. There is no fourth state, and a \
+              wildcard arm at the call sites would defeat the purpose of the distinction"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvBytesVerdict {
+    /// The generation reported a non-zero byte count. Usable.
+    Reported(u64),
+    /// The generation reported nothing: the readable value belongs to an
+    /// earlier generation, or is the never-written initialiser. This is the
+    /// state that a bare `-> u64` accessor collapses into "0" or, worse, into
+    /// the previous run's plausible-looking figure.
+    Unreported,
+    /// The generation did report, and reported zero bytes. Distinct from
+    /// [`KvBytesVerdict::Unreported`]: the plumbing works and the answer is
+    /// still not usable as a resident-KV measurement after a real prefill.
+    ReportedZero,
+}
+
+/// Classify the byte count a generation produced, from the store sequence
+/// observed before and after it.
+///
+/// Detection ("did this generation report?") is decided by the sequence, and
+/// only then is the value interpreted. Collapsing the two — treating a zero, or
+/// an unchanged sequence, as "no KV" — is what silently records one run's
+/// number under another run's label.
+///
+/// Every caller that *records* or *reports* a KV-byte figure as a measurement
+/// goes through this. A caller that only displays the last-known value
+/// (`/metrics/cache`) may read the bare count.
+#[must_use]
+pub const fn classify_kv_bytes(before: KvBytesSample, after: KvBytesSample) -> KvBytesVerdict {
+    if after.seq <= before.seq {
+        return KvBytesVerdict::Unreported;
+    }
+    if after.bytes == 0 {
+        return KvBytesVerdict::ReportedZero;
+    }
+    KvBytesVerdict::Reported(after.bytes)
+}
+
 // ---------------------------------------------------------------------------
 // PromptCacheEntry trait
 // ---------------------------------------------------------------------------
@@ -666,7 +711,6 @@ impl<E: PromptCacheEntry> PromptCache<E> {
 
     /// Clear all slots and reset stats.
     /// Called when model is unloaded or capacity changes.
-    #[allow(dead_code)]
     pub(crate) fn clear(&mut self) {
         self.slots.clear();
         self.stats = CacheStats::default();
@@ -1131,6 +1175,22 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
         }
     }
 
+    /// Drop every cached snapshot and reset the hit/miss counters, keeping the
+    /// cache object itself — its capacity and its installed SSD sinks — in
+    /// place. A no-op when no generation has built the cache yet.
+    ///
+    /// This is the supported way to make the next request a guaranteed miss.
+    /// Asking for a zero-slot cache is not: capacity is clamped to a minimum of
+    /// one slot, so a "zero-slot" cache still stores and can still serve a
+    /// snapshot.
+    pub(crate) fn clear(&self) {
+        self.with_inner_mut(|slot| {
+            if let Some(cache) = slot.as_mut() {
+                cache.clear();
+            }
+        });
+    }
+
     /// Wire the spiller + hydrator onto this arch's prompt cache
     /// for `namespace` at `kv_quant` (/ ). Records the attach params
     /// so they survive a later cache re-creation, then installs the sinks on
@@ -1406,15 +1466,27 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
     /// `seq == 0` means no generation on this arch has reported a figure yet,
     /// so `bytes` is the `0` initialiser and not a measurement.
     pub(crate) fn read_kv_cache_bytes_sample(&self) -> KvBytesSample {
-        // Load the sequence LAST: a concurrent store bumps `last_kv_bytes`
-        // before the sequence, so a sequence read after the byte read can only
-        // under-report progress. A caller comparing sequences then sees "no new
-        // reading" and refuses, rather than pairing a fresh byte count with a
-        // stale sequence and reporting it as its own.
+        // Load the sequence FIRST, and with Acquire. The writer stores
+        // `last_kv_bytes` before releasing the sequence, so observing sequence
+        // `k` guarantees the byte count for generation `k` is already visible:
+        // the byte load that follows returns generation `k`'s figure or a later
+        // one. The pairing invariant is therefore "bytes is never *older* than
+        // seq", which is the direction that matters — a caller comparing
+        // sequences can refuse a reading that was in fact valid, but can never
+        // accept a stale byte count as a fresh generation's measurement.
+        //
+        // The opposite order does not hold: an Acquire load only orders the
+        // accesses that follow it, so reading bytes first leaves that load
+        // outside the release/acquire edge (and free to sink below it on
+        // aarch64). The reader could then pair generation `k-1`'s bytes with
+        // sequence `k` — exactly the stale-value-under-a-fresh-label failure
+        // `KvBytesSample` exists to make impossible.
+        //
+        // No seqlock needed: the payload is a single `u64`, which cannot tear.
+        let seq = self.kv_bytes_seq.load(std::sync::atomic::Ordering::Acquire);
         let bytes = self
             .last_kv_bytes
             .load(std::sync::atomic::Ordering::Relaxed);
-        let seq = self.kv_bytes_seq.load(std::sync::atomic::Ordering::Acquire);
         KvBytesSample { bytes, seq }
     }
 

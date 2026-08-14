@@ -17,18 +17,18 @@
 //!    not a time-to-first-token), are hard errors — not a fast-looking number.
 //! 2. **It never reports a bare central value.** Every metric carries its
 //!    observed min/max across the measured runs, and `--runs` is rejected below
-//!    2 so there is always a spread to report.
+//!    2 so there is always a spread to report. A metric that *trends* across
+//!    those runs has no central value at all, and is refused rather than
+//!    summarised — see [`detect_drift`].
 //!
 //! `bench` is read-only with respect to the metrics database: it prints, it
 //! does not record. Use `rmlx baseline --record` for the append-only store.
-
-#![allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use rmlx_mlx::Device;
-use rmlx_models::arch;
+use rmlx_models::{arch, classify_kv_bytes, CacheStats, KvBytesVerdict};
 use tracing::{info, warn};
 
 use super::baseline::tokenize_prompt_text;
@@ -42,14 +42,32 @@ pub(crate) const MIN_RUNS: u32 = 2;
 
 /// Prompt-cache slots used for every bench generation.
 ///
-/// Zero, deliberately. `bench` runs N generations of the *same* prompt in one
-/// process; with any slots at all, run 2 onwards would be served from the
-/// prompt cache, skip prefill entirely, and report a TTFT of a few milliseconds
-/// that looks like a very fast prefill instead of a measurement that was never
-/// taken. Zero slots makes every run a cache miss and therefore a real prefill.
-/// `assert_prefill_measured` re-checks that per run rather than trusting this
-/// constant.
-const BENCH_PROMPT_CACHE_SLOTS: usize = 0;
+/// One — an ordinary single-slot cache, the same shape `rmlx baseline` serves
+/// under. `bench` runs N generations of the *same* prompt in one process, so
+/// run 2 onwards would be served from the prompt cache, skip prefill entirely,
+/// and report a TTFT of a few milliseconds that looks like a very fast prefill
+/// instead of a measurement that was never taken.
+///
+/// What prevents that is [`arch::Architecture::clear_prompt_cache`], called
+/// before every generation: the cache is emptied, so the next request is a
+/// guaranteed miss and a real prefill. Asking for *zero* slots would not do it
+/// — capacity is clamped to a minimum of one, so a "zero-slot" cache still
+/// stores and can still serve a snapshot.
+///
+/// `assert_prefill_measured` re-checks the outcome per run rather than trusting
+/// either the constant or the clear.
+const BENCH_PROMPT_CACHE_SLOTS: usize = 1;
+
+/// Largest run-to-run trend a metric may show and still be summarised, as a
+/// percentage of its median. See [`detect_drift`].
+///
+/// Ten percent, calibrated against what this instrument is used for: it accepts
+/// or rejects changes at the repo's ±1% decode-TPS band and its >5%
+/// regression-stop line. A cell whose own metric moves more than twice that
+/// line across its own runs cannot support either comparison, whichever way it
+/// moves — an improving ramp means the cell had not converged just as much as a
+/// degrading one does.
+const TREND_MAX_DRIFT_PCT: f64 = 10.0;
 
 // ---------------------------------------------------------------------------
 // Spread — a central value that carries its observed range
@@ -75,11 +93,14 @@ impl Spread {
     /// Summarise a sample. `None` for an empty sample — there is no median of
     /// nothing, and returning a zero would be indistinguishable from a real
     /// measurement of zero.
-    pub(crate) fn of(values: &[f64]) -> Option<Self> {
+    ///
+    /// Takes the sample by value and sorts it in place: the caller has already
+    /// built the vector, and a borrowing signature would only copy it again.
+    pub(crate) fn of(values: Vec<f64>) -> Option<Self> {
         if values.is_empty() {
             return None;
         }
-        let mut sorted = values.to_vec();
+        let mut sorted = values;
         sorted.sort_by(f64::total_cmp);
         let n = sorted.len();
         // Bounds: `sorted` is non-empty (checked above), so `first`/`last` are
@@ -129,45 +150,87 @@ pub(crate) fn percentile_sorted(sorted: &[f64], q: f64) -> Option<f64> {
 }
 
 // ---------------------------------------------------------------------------
-// KV-byte reading — three states, not two
+// Drift — a trend is not a spread
 // ---------------------------------------------------------------------------
 
-/// What a pair of `kv_cache_bytes_sample()` reads around one generation says
-/// about the byte count that generation produced.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum KvBytesVerdict {
-    /// The generation reported a non-zero byte count. Usable.
-    Reported(u64),
-    /// The generation reported nothing: the readable value belongs to an
-    /// earlier generation, or is the never-written initialiser. This is the
-    /// state that a bare `-> u64` accessor collapses into "0" or, worse, into
-    /// the previous run's plausible-looking figure.
-    Unreported,
-    /// The generation did report, and reported zero bytes. Distinct from
-    /// `Unreported`: the plumbing works and the answer is still not usable as a
-    /// resident-KV measurement after a real prefill.
-    ReportedZero,
+/// Detect a run-to-run trend in `values`, **in collection order**.
+///
+/// Returns the fitted change from the first measured run to the last as a
+/// signed percentage of the median — positive means the metric rose.
+///
+/// [`Spread`] is order-blind by construction: it sorts. A metric that climbs
+/// monotonically from run to run therefore reports as a wide *spread*, and a
+/// wide spread is read as noise around a central value. It is not — a drifting
+/// cell has no central value, and its median is a point on a ramp that depends
+/// on where the operator stopped measuring.
+///
+/// The test is the least-squares slope over the run index, scaled to the whole
+/// run sequence and expressed against the median. Ordinary regression rather
+/// than a monotonicity test on purpose: a real ramp with one noisy step is
+/// still a ramp, and would escape a strict-monotonic check the moment `--runs`
+/// grew past three.
+///
+/// At the default three runs, a sample whose spread is very wide fits a slope
+/// in *whatever* order it arrives — with a 40%-wide sample, every permutation
+/// clears the threshold. That is not a flaw to tune away: three runs cannot
+/// separate a ramp from that much noise, and a cell that noisy has no
+/// trustworthy median either. Both are refused, which is the safe direction;
+/// the error prints the values in run order so the operator can see which it
+/// was.
+///
+/// `None` when there is no trend worth refusing over: fewer than two runs (no
+/// order to speak of), a zero median (no scale to express the change against),
+/// or a fitted change within [`TREND_MAX_DRIFT_PCT`].
+pub(crate) fn detect_drift(values_in_order: &[f64], median: f64) -> Option<f64> {
+    let n = values_in_order.len();
+    if n < 2 || median == 0.0 {
+        return None;
+    }
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "n is the run count — single digits in every real invocation"
+    )]
+    let n_f = n as f64;
+    let mean_x = (n_f - 1.0) / 2.0;
+    let mean_y = values_in_order.iter().sum::<f64>() / n_f;
+    let (mut sxy, mut sxx) = (0.0_f64, 0.0_f64);
+    for (i, y) in values_in_order.iter().enumerate() {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "i indexes the run count — single digits in every real invocation"
+        )]
+        let dx = i as f64 - mean_x;
+        sxy += dx * (y - mean_y);
+        sxx += dx * dx;
+    }
+    if sxx == 0.0 {
+        return None;
+    }
+    // Slope per run, scaled across the whole sequence: first run to last.
+    let pct_of_median = sxy / sxx * (n_f - 1.0) / median.abs() * 100.0;
+    (pct_of_median.abs() > TREND_MAX_DRIFT_PCT).then_some(pct_of_median)
 }
 
-/// Classify the byte count a generation produced from the store sequence
-/// observed before and after it.
-///
-/// Detection ("did this generation report?") is decided by the sequence, and
-/// only then is the value interpreted. Collapsing the two — treating a zero, or
-/// an unchanged sequence, as "no KV" — is what silently records one run's
-/// number under another run's label.
-pub(crate) const fn classify_kv_bytes(
-    before: rmlx_models::KvBytesSample,
-    after: rmlx_models::KvBytesSample,
-) -> KvBytesVerdict {
-    if after.seq <= before.seq {
-        return KvBytesVerdict::Unreported;
-    }
-    if after.bytes == 0 {
-        return KvBytesVerdict::ReportedZero;
-    }
-    KvBytesVerdict::Reported(after.bytes)
+/// Refuse to summarise a metric that trended across its own runs.
+fn assert_no_drift(name: &str, values_in_order: &[f64], median: f64) -> anyhow::Result<()> {
+    let Some(pct) = detect_drift(values_in_order, median) else {
+        return Ok(());
+    };
+    let direction = if pct > 0.0 { "rose" } else { "fell" };
+    let ordered: Vec<String> = values_in_order.iter().map(|v| format!("{v:.3}")).collect();
+    Err(anyhow::anyhow!(
+        "{name} {direction} {:.1}% from the first measured run to the last ({}, in run order): \
+         this is a trend, not a spread, and its median is not a measurement. The cell had not \
+         reached a steady state — raise --warmup until consecutive runs agree, or measure a \
+         cell that settles",
+        pct.abs(),
+        ordered.join(" → ")
+    ))
 }
+
+// ---------------------------------------------------------------------------
+// KV-byte reading — three states, not two
+// ---------------------------------------------------------------------------
 
 /// Turn a verdict into a usable byte count or the reason there is none.
 fn kv_bytes_or_reason(verdict: KvBytesVerdict, arch_class: &str) -> anyhow::Result<u64> {
@@ -194,7 +257,12 @@ fn kv_bytes_or_reason(verdict: KvBytesVerdict, arch_class: &str) -> anyhow::Resu
 /// Check that one measured generation actually ran prefill.
 ///
 /// `stats` is the arch's prompt-cache counters read *after* the generation, or
-/// `None` when the arch has no cache to report. Two conditions, both necessary:
+/// `None` when the arch has no cache to report. Taken as the named
+/// [`CacheStats`] rather than a `(hits, misses)` pair: with a tuple, swapping
+/// the two at the call site type-checks, passes every test that builds tuples
+/// directly, and silently inverts the guard.
+///
+/// Two conditions, both necessary:
 ///
 /// - **`hits == 0`.** A hit means the post-prefill KV snapshot was replayed, so
 ///   the run's TTFT is a cache-replay time, not a time-to-first-token — a
@@ -203,14 +271,13 @@ fn kv_bytes_or_reason(verdict: KvBytesVerdict, arch_class: &str) -> anyhow::Resu
 ///   a prefill genuinely happened. Counters that report nothing certify
 ///   nothing.
 ///
-/// Absolute counters rather than a before/after delta, deliberately: a cache
-/// configured with zero slots is rebuilt on each generation, which resets the
-/// counters, and a delta across a reset reads as "no activity". The rule holds
-/// either way — under stable counters a repeat that was served shows `hits > 0`,
-/// and under reset counters the freshly-built cache shows `hits == 0,
-/// misses == 1`.
-pub(crate) fn assert_prefill_measured(stats: Option<(u64, u64)>) -> anyhow::Result<()> {
-    let Some((hits, misses)) = stats else {
+/// Absolute counters rather than a before/after delta, deliberately: the
+/// per-run `clear_prompt_cache` resets the counters along with the slots, and a
+/// delta across a reset reads as "no activity". The rule holds either way —
+/// under stable counters a repeat that was served shows `hits > 0`, and after a
+/// clear the run shows `hits == 0, misses == 1`.
+pub(crate) fn assert_prefill_measured(stats: Option<&CacheStats>) -> anyhow::Result<()> {
+    let Some(&CacheStats { hits, misses, .. }) = stats else {
         return Err(anyhow::anyhow!(
             "measured run reported no prompt-cache stats, so nothing certifies that it \
              performed a prefill rather than replaying a snapshot. Refusing to report its \
@@ -285,6 +352,22 @@ pub(crate) fn load_is_contended(load_1m: f64, cpus: usize) -> bool {
 // One measured run
 // ---------------------------------------------------------------------------
 
+/// FNV-1a-64 over a run's token ids.
+///
+/// Stable across processes and releases (unlike `DefaultHasher`), so two
+/// invocations of `bench` on the same cell can be compared by eye from the
+/// printed digest.
+pub(crate) fn token_stream_digest(token_ids: impl IntoIterator<Item = u32>) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for id in token_ids {
+        for b in id.to_le_bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+    }
+    h
+}
+
 /// Everything one generation contributes to the summary.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RunSample {
@@ -292,8 +375,9 @@ pub(crate) struct RunSample {
     pub ttft_ms: f64,
     /// Steady-state decode rate over tokens 2..N, tokens/second.
     pub decode_tps: f64,
-    /// Prefill throughput, prompt tokens/second.
-    pub prefill_tps: f64,
+    /// Prefill throughput, prompt tokens/second. `None` when the run produced
+    /// nothing to divide by — never a zero standing in for one.
+    pub prefill_tps: Option<f64>,
     /// Median inter-token latency within the run, milliseconds.
     pub itl_p50_ms: f64,
     /// 99th-percentile inter-token latency within the run, milliseconds.
@@ -302,6 +386,9 @@ pub(crate) struct RunSample {
     pub kv_cache_bytes: u64,
     /// Tokens actually generated.
     pub n_generated: usize,
+    /// FNV-1a-64 over the run's token ids. Every run in a cell decodes the same
+    /// prompt at temperature 0, so every run must produce the same digest.
+    pub token_digest: u64,
 }
 
 /// Derive a run's metrics from the per-token arrival times.
@@ -319,6 +406,7 @@ pub(crate) fn sample_from_arrivals(
     arrivals_s: &[f64],
     prompt_tokens: usize,
     kv_cache_bytes: u64,
+    token_digest: u64,
 ) -> Option<RunSample> {
     if arrivals_s.len() < 2 {
         return None;
@@ -338,11 +426,14 @@ pub(crate) fn sample_from_arrivals(
     } else {
         return None;
     };
-    let prefill_tps = if first > 0.0 && prompt_tokens > 0 {
-        prompt_tokens as f64 / first
-    } else {
-        0.0
-    };
+    // `None`, not `0.0`: a zero here would be summarised and printed exactly
+    // like a measured throughput of zero — the one thing this file exists to
+    // prevent.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "prompt lengths are far below 2^53; f64 is exact over the whole range"
+    )]
+    let prefill_tps = (first > 0.0 && prompt_tokens > 0).then(|| prompt_tokens as f64 / first);
 
     Some(RunSample {
         ttft_ms: first * 1000.0,
@@ -352,6 +443,7 @@ pub(crate) fn sample_from_arrivals(
         itl_p99_ms: percentile_sorted(&itl_ms, 0.99)?,
         kv_cache_bytes,
         n_generated: arrivals_s.len(),
+        token_digest,
     })
 }
 
@@ -409,6 +501,11 @@ fn measure_one(
     let penalty_cfg = rmlx_models::PenaltyConfig::default();
     let mut token_history: Vec<u32> = Vec::new();
 
+    // Empty the prompt cache so this generation is a guaranteed miss and runs a
+    // real prefill. Done here, before the clock starts, so the clearing is not
+    // charged to the TTFT it protects.
+    model.clear_prompt_cache();
+
     let kv_before = model.kv_cache_bytes_sample();
 
     // Per-token arrival stamps. Reserved once, so the callback never allocates
@@ -439,7 +536,7 @@ fn measure_one(
         )
         .map_err(|e| anyhow::anyhow!("generate_greedy: {e}"))?;
 
-    assert_prefill_measured(model.cache_stats().map(|s| (s.hits, s.misses)))?;
+    assert_prefill_measured(model.cache_stats().as_ref())?;
 
     let kv_cache_bytes = kv_bytes_or_reason(
         classify_kv_bytes(kv_before, model.kv_cache_bytes_sample()),
@@ -459,42 +556,92 @@ fn measure_one(
         ));
     }
 
-    sample_from_arrivals(&arrivals_s, prompt_ids.len(), kv_cache_bytes).ok_or_else(|| {
-        anyhow::anyhow!(
-            "run generated {} token(s); at least 2 are needed for an inter-token latency \
+    let token_digest = token_stream_digest(steps.iter().map(|s| s.token_id));
+
+    sample_from_arrivals(&arrivals_s, prompt_ids.len(), kv_cache_bytes, token_digest).ok_or_else(
+        || {
+            anyhow::anyhow!(
+                "run generated {} token(s); at least 2 are needed for an inter-token latency \
              and a steady-state decode rate. Raise --max-tokens",
-            arrivals_s.len()
-        )
-    })
+                arrivals_s.len()
+            )
+        },
+    )
 }
 
 /// Summary of one bench cell.
 struct BenchSummary {
     ttft_ms: Spread,
     decode_tps: Spread,
-    prefill_tps: Spread,
+    /// `None` when any run could not produce a prefill throughput. A cell where
+    /// only some runs have one is not a cell.
+    prefill_tps: Option<Spread>,
     itl_p50_ms: Spread,
     itl_p99_ms: Spread,
     kv_bytes: Spread,
+    /// The one token-stream digest every run agreed on.
+    token_digest: u64,
 }
 
-/// Fold the measured runs into per-metric spreads.
+/// Fold the measured runs into per-metric spreads, refusing any metric that
+/// trended across the runs instead of settling.
 ///
-/// `None` when `samples` is empty; every metric is summarised from the same
-/// runs, so either all of them exist or none do.
-fn summarize(samples: &[RunSample]) -> Option<BenchSummary> {
-    let pick = |f: fn(&RunSample) -> f64| Spread::of(&samples.iter().map(f).collect::<Vec<_>>());
-    Some(BenchSummary {
-        ttft_ms: pick(|s| s.ttft_ms)?,
-        decode_tps: pick(|s| s.decode_tps)?,
-        prefill_tps: pick(|s| s.prefill_tps)?,
-        itl_p50_ms: pick(|s| s.itl_p50_ms)?,
-        itl_p99_ms: pick(|s| s.itl_p99_ms)?,
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "KV byte totals are far below 2^53; f64 is exact over the whole range"
-        )]
-        kv_bytes: pick(|s| s.kv_cache_bytes as f64)?,
+/// Errors when `samples` is empty, and when any checked metric drifted. Every
+/// metric is summarised from the same runs, so either all of them exist or none
+/// do — there is no partial summary.
+fn summarize(samples: &[RunSample]) -> anyhow::Result<BenchSummary> {
+    let missing = || anyhow::anyhow!("no measured runs completed — nothing to summarise");
+
+    // Each metric is checked for a trend *in collection order* before its
+    // order-blind spread is accepted.
+    let checked = |name: &str, f: fn(&RunSample) -> f64| -> anyhow::Result<Spread> {
+        let in_order: Vec<f64> = samples.iter().map(f).collect();
+        let spread = Spread::of(in_order.clone()).ok_or_else(missing)?;
+        assert_no_drift(name, &in_order, spread.median)?;
+        Ok(spread)
+    };
+
+    let ttft_ms = checked("ttft_ms", |s| s.ttft_ms)?;
+    let decode_tps = checked("decode_tps", |s| s.decode_tps)?;
+    let itl_p50_ms = checked("itl_p50_ms", |s| s.itl_p50_ms)?;
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "KV byte totals are far below 2^53; f64 is exact over the whole range"
+    )]
+    let kv_bytes = checked("kv_cache_bytes", |s| s.kv_cache_bytes as f64)?;
+
+    // `itl_p99_ms` is deliberately NOT drift-checked. Nearest-rank p99 over a
+    // 128-token run is the second-largest inter-token gap: an extreme-order
+    // statistic whose run-to-run movement is dominated by whether that one run
+    // happened to hit a stall, not by whether the cell has settled. Measured
+    // gemma-4-e2b at 4k: ttft, decode TPS and ITL p50 all moved 5-6% across
+    // three runs while p99 moved 26% — checking it would abort cells whose
+    // measurements are fine. Its spread is still printed, so the tail stays
+    // visible; it is just not evidence of a trend.
+    let itl_p99_ms =
+        Spread::of(samples.iter().map(|s| s.itl_p99_ms).collect()).ok_or_else(missing)?;
+
+    // Prefill throughput is present only if every run produced one.
+    let prefill_in_order: Option<Vec<f64>> = samples.iter().map(|s| s.prefill_tps).collect();
+    let prefill_tps = match prefill_in_order {
+        Some(v) => {
+            let spread = Spread::of(v.clone()).ok_or_else(missing)?;
+            assert_no_drift("prefill_tps", &v, spread.median)?;
+            Some(spread)
+        }
+        None => None,
+    };
+
+    let token_digest = samples.first().ok_or_else(missing)?.token_digest;
+
+    Ok(BenchSummary {
+        ttft_ms,
+        decode_tps,
+        prefill_tps,
+        itl_p50_ms,
+        itl_p99_ms,
+        kv_bytes,
+        token_digest,
     })
 }
 
@@ -526,6 +673,30 @@ fn prepare_prompt(args: &BenchArgs, tokenizer: &tokenizers::Tokenizer) -> anyhow
     Ok(prompt_ids)
 }
 
+/// Check that a run decoded the same tokens as the cell's first run.
+///
+/// Every run in a cell feeds the same prompt to the same model at temperature 0
+/// with a fixed seed, so every run must emit a byte-identical token stream. A
+/// cell whose runs disagree is not measuring one thing N times, and its timings
+/// describe N different generations.
+///
+/// This is also the only output check `bench` performs, and it is load-bearing
+/// beyond reproducibility: a KV cache that silently stops being written decodes
+/// *faster* while producing wrong tokens, so a timing-only instrument is biased
+/// toward accepting exactly that defect.
+fn assert_same_token_stream(label: &str, expected: u64, got: u64) -> anyhow::Result<()> {
+    if expected == got {
+        return Ok(());
+    }
+    Err(anyhow::anyhow!(
+        "{label} decoded a different token stream than the first run of this cell \
+         (digest {got:#018x} vs {expected:#018x}). Every run here decodes the same prompt at \
+         temperature 0, so the runs are not repeats of one measurement — and a cache that \
+         stops being written decodes faster while producing wrong tokens. Refusing to \
+         summarise them as one cell"
+    ))
+}
+
 /// Run the warmup runs (discarded) then the measured ones.
 ///
 /// A failure in any run aborts the whole invocation: a summary built from the
@@ -537,16 +708,32 @@ fn collect_samples(
     prompt_ids: &[u32],
     args: &BenchArgs,
 ) -> anyhow::Result<Vec<RunSample>> {
+    // The warmup runs are discarded as measurements, but their tokens are still
+    // evidence: a warmup that decodes something else than the measured runs is
+    // the same defect and costs nothing to catch.
+    let mut expected_digest: Option<u64> = None;
+    let mut check_digest = |label: &str, s: &RunSample| -> anyhow::Result<()> {
+        match expected_digest {
+            None => {
+                expected_digest = Some(s.token_digest);
+                Ok(())
+            }
+            Some(e) => assert_same_token_stream(label, e, s.token_digest),
+        }
+    };
+
     for i in 0..args.warmup {
         info!(run = i + 1, of = args.warmup, "bench: warmup run");
-        measure_one(model, tokenizer, prompt_ids, args)
+        let s = measure_one(model, tokenizer, prompt_ids, args)
             .map_err(|e| anyhow::anyhow!("warmup run {} failed: {e}", i + 1))?;
+        check_digest(&format!("warmup run {}", i + 1), &s)?;
     }
 
     let mut samples: Vec<RunSample> = Vec::with_capacity(args.runs as usize);
     for i in 0..args.runs {
         let s = measure_one(model, tokenizer, prompt_ids, args)
             .map_err(|e| anyhow::anyhow!("measured run {} failed: {e}", i + 1))?;
+        check_digest(&format!("measured run {}", i + 1), &s)?;
         info!(
             run = i + 1,
             of = args.runs,
@@ -555,6 +742,7 @@ fn collect_samples(
             itl_p50_ms = s.itl_p50_ms,
             itl_p99_ms = s.itl_p99_ms,
             kv_cache_bytes = s.kv_cache_bytes,
+            token_digest = format!("{:#018x}", s.token_digest),
             "bench: measured run"
         );
         samples.push(s);
@@ -563,6 +751,10 @@ fn collect_samples(
 }
 
 /// Execute `rmlx bench`.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "owns the argument bundle for the whole invocation; main.rs builds it and hands it over"
+)]
 pub(crate) fn run_bench(args: BenchArgs) -> anyhow::Result<()> {
     if args.runs < MIN_RUNS {
         return Err(anyhow::anyhow!(
@@ -591,8 +783,7 @@ pub(crate) fn run_bench(args: BenchArgs) -> anyhow::Result<()> {
     info!(load_ms, arch = model.arch_class(), "bench: model loaded");
 
     let samples = collect_samples(&model, &tokenizer, &prompt_ids, &args)?;
-    let summary = summarize(&samples)
-        .ok_or_else(|| anyhow::anyhow!("no measured runs completed — nothing to summarise"))?;
+    let summary = summarize(&samples)?;
 
     let load_after = load_average_1m();
     let ctx = ReportCtx {
@@ -665,10 +856,11 @@ fn emit_json(ctx: &ReportCtx<'_>, s: &BenchSummary, samples: &[RunSample]) -> an
         "load_1m_after": ctx.load_after,
         "cpus": ctx.cpus,
         "contended": ctx.contended,
+        "token_digest": format!("{:#018x}", s.token_digest),
         "metrics": {
             "ttft_ms": spread_json(&s.ttft_ms),
             "decode_tps": spread_json(&s.decode_tps),
-            "prefill_tps": spread_json(&s.prefill_tps),
+            "prefill_tps": s.prefill_tps.as_ref().map(spread_json),
             "itl_p50_ms": spread_json(&s.itl_p50_ms),
             "itl_p99_ms": spread_json(&s.itl_p99_ms),
             "kv_cache_bytes": spread_json(&s.kv_bytes),
@@ -680,6 +872,7 @@ fn emit_json(ctx: &ReportCtx<'_>, s: &BenchSummary, samples: &[RunSample]) -> an
             "itl_p50_ms": r.itl_p50_ms,
             "itl_p99_ms": r.itl_p99_ms,
             "kv_cache_bytes": r.kv_cache_bytes,
+            "token_digest": format!("{:#018x}", r.token_digest),
         })).collect::<Vec<_>>(),
     });
     println!("{}", serde_json::to_string_pretty(&doc)?);
@@ -720,8 +913,17 @@ fn emit_table(ctx: &ReportCtx<'_>, s: &BenchSummary) {
     row("itl_p50_ms", &s.itl_p50_ms, 3);
     row("itl_p99_ms", &s.itl_p99_ms, 3);
     row("decode_tps", &s.decode_tps, 3);
-    row("prefill_tps", &s.prefill_tps, 1);
+    match s.prefill_tps.as_ref() {
+        Some(v) => row("prefill_tps", v, 1),
+        // No run produced a prefill throughput. Say so rather than print a
+        // zero that reads as a measured throughput of zero.
+        None => println!("{:<16} {:>14}", "prefill_tps", "n/a"),
+    }
     row("kv_cache_bytes", &s.kv_bytes, 0);
+    println!(
+        "tokens: digest={:#018x} (identical across every run)",
+        s.token_digest
+    );
 
     let fmt_load = |l: Option<f64>| l.map_or_else(|| "n/a".to_owned(), |v| format!("{v:.2}"));
     println!(
