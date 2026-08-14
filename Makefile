@@ -59,6 +59,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         e2e \
         file-size-report check-no-inline-tests check-no-scalar-f32-leak \
         check-no-decode-swallow check-gpu-tests-ignored \
+        check-no-kernel-input-eval \
         check-metal-compiles check-metal-format
 
 help:
@@ -227,6 +228,9 @@ check-no-decode-swallow: ## CI gate: fail if a decode-step failure breaks instea
 check-gpu-tests-ignored: ## CI gate: fail if a GPU-touching test in ANY workspace member lacks #[ignore] (would abort the whole test binary under parallel cargo test)
 	@bash scripts/check_gpu_tests_ignored.sh
 
+check-no-kernel-input-eval: ## CI gate: fail if a flash-decode dispatcher blocks on Array::eval() (serialises host vs GPU once per layer per decode step)
+	@bash scripts/check_no_kernel_input_eval.sh
+
 # METAL_STRICT=--strict turns a missing toolchain into a hard failure instead of
 # a skip. CI sets it (the macOS runner ships the toolchain, so a skip there would
 # mean the gate protected nothing); local runs leave it empty and skip.
@@ -244,6 +248,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_no_scalar_f32_leak.sh
 	@bash scripts/check_no_decode_swallow.sh
 	@bash scripts/check_gpu_tests_ignored.sh
+	@bash scripts/check_no_kernel_input_eval.sh
 	@bash scripts/check_metal_format.sh
 	@bash scripts/check_metal_compiles.sh
 	@bash scripts/file_size_report.sh || true

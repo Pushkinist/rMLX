@@ -2893,14 +2893,33 @@ same two predicates — it cannot drift from what is materialised.
 
 ### Speed vs. the mirror (honest)
 
-Dropping the mirror is a **memory** win, not a decode-speed win on the current
-two-pass shell. Against the MLX bf16 flash attention the dormant mirror used, the
-fused quant-K + quant-V path is materially slower at long context — the dominant
-gap is the two-pass flash-decode shell, not the V unpack. So `rotor*_sym` remains
-opt-in (`--kv-quant rotor3_sym` / `rotor4_sym`); it is the right pick when
-resident KV is the binding constraint, not when peak decode TPS is. Closing the
-speed gap needs a single-pass simdgroup flash-decode that beats MLX bf16 flash
-(tracked with `#45`).
+Dropping the mirror is **neither** a memory win nor a decode-speed win. It is
+not a memory win because the store is not smaller than bf16 to begin with (see
+"Memory truth" above — 21.75 bits/value for rotor, 16.25 for iso), so there is
+no bandwidth prize to collect and no context at which a crossover exists. It is
+not a speed win because the two-pass flash-decode shell — a per-token
+threadgroup barrier pair with a thread-0-only softmax section, one threadgroup
+per *query* head (so `heads_per_kv` threadgroups re-read the same KV stream),
+and an f32 `partial_o` round trip between P1 and P2 — costs more per token than
+MLX's bf16 flash attention over the same bytes.
+
+What is **no longer** part of that gap: until the dispatchers were made lazy,
+every one of these kernels forced `Array::eval()` on its inputs immediately
+before dispatch, which blocked the host on the GPU once per attention layer per
+decode step. That alone was worth 1.2–2.9× decode across iso and rotor, K-only
+and `_sym`, on both `kv_h = 8` and `kv_h = 1` architectures — the `_sym` pair at
+a 4k prompt on Ternary-Bonsai-8B went 19.1 → 55.1 TPS with an unchanged token
+digest. Any per-codec marginal-cost figure recorded before that (including the
+tables in `docs/models/bonsai/8B/rMLX.md` §2 and issue #292) is measuring the
+dispatcher, not the kernel. `make check-no-kernel-input-eval` keeps it from
+coming back.
+
+So these codecs remain opt-in (`--kv-quant rotor3_sym` / `rotor4_sym`, and the
+iso pair), and remain research codecs for quality experiments and kernel work —
+not memory or throughput candidates. Closing the remaining speed gap needs a
+single-pass simdgroup flash-decode that beats MLX bf16 flash (tracked with
+`#45`); closing the memory gap needs a repacked store, which is a redesign, not
+a kernel change.
 
 ### Short-prompt abort at `kv_h == 1` — small-`norms`-buffer device floor
 

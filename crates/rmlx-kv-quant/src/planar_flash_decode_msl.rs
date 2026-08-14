@@ -472,9 +472,14 @@ pub fn planar_flash_decode_sdpa(
             .map_err(|e| Error::Mlx(format!("planar_flash_decode dims: {e}")))?
     };
 
-    // Materialise inputs to flush any pending lazy ops before kernel dispatch
-    // (guards against the planar_quantize atomic-OR race discovered during
-    // fused-QK development).
+    // eval-ok: kept as an ordering barrier for the planar_quantize atomic-OR
+    // race found during fused-QK development — a different reason from the
+    // row-contiguous precaution the iso/rotor dispatchers carried, which was
+    // redundant against `ensure_row_contiguous` and has been removed. The
+    // barrier costs the same per-layer host stall those did, so if the race is
+    // real it belongs in the quantize kernel rather than here; that has not
+    // been re-verified, and this path is off by default
+    // (`--planar-flash-decode auto` = OFF), so the barrier stays for now.
     q_f32.eval()?;
     codes_flat.eval()?;
     scales_flat.eval()?;

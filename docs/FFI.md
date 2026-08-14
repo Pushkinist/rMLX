@@ -460,6 +460,21 @@ methods trigger execution:
   current step's argmax is still being read back to the CPU, mirroring
   mlx-lm's `mx.async_eval` pattern in `generate.py`.
 
+**Never `eval()` a kernel's inputs before dispatching it.** `Array::eval()`
+blocks the calling thread until the GPU has produced the array, so an `eval()`
+inside a per-layer dispatcher runs the forward pass one layer at a time with
+nothing queued ahead — the host and the GPU stop overlapping. It produces
+byte-identical output, which is why the cost hides: it shows up only as a
+decode rate several times below what the kernel can reach. A KV flash-decode
+dispatcher paying this on every attention layer measured **2.7× below** its own
+rate on Ternary-Bonsai-8B once the `eval()` calls were dropped, with the token
+digest unchanged. Pass lazy arrays to `MetalKernel::apply` and let MLX schedule
+the graph; the row-contiguous guarantee a raw-linear kernel needs comes from
+`ensure_row_contiguous` (below), not from forcing evaluation. The CI gate
+`make check-no-kernel-input-eval` enforces this for the flash-decode
+dispatchers, with an `// eval-ok: <reason>` marker for a genuinely load-bearing
+barrier.
+
 ### Data readback
 
 `Array::to_bytes()` forces evaluation (`eval()`) before reading, then calls
@@ -685,6 +700,15 @@ mlx-c copies them internally.
 `ensure_row_contiguous = true` is always set — the safer default for custom
 kernels. `atomic_outputs = false` unless the kernel requires read-modify-write
 atomics (e.g. `atomic_fetch_or_explicit`).
+
+`ensure_row_contiguous` is what makes it safe for a kernel body to index its
+buffers by raw linear offset: MLX copies any input that is not row-contiguous
+(a lazy transpose, a strided view) before the dispatch. Callers therefore do
+**not** need to materialise inputs themselves — see "Never `eval()` a kernel's
+inputs" under Evaluation. It does not fix a *semantic* layout disagreement: an
+array whose logical axis order is not the one the kernel indexes is still wrong
+after the copy, and that is what the canonical seq-major KV store layout is
+for.
 
 `MetalKernel::apply` takes a `MetalKernelInvoke` by value (consumed), builds
 input/output `mlx_vector_array` handles, dispatches via
