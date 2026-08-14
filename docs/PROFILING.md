@@ -133,18 +133,51 @@ Note: the global allocator is replaced when this feature is active, so jemalloc 
 - Which allocations are short-lived (high alloc + dealloc rate = pressure hot spots).
 - Useful for auditing `rmlx-loader` mmap vs full-read behaviour and KV-cache growth.
 
-## 5. Metal GPU capture (deferred — symbol confirmed in bindings)
+## 5. Metal GPU capture (the tool for kernel work)
 
-`mlx_metal_start_capture` / `mlx_metal_stop_capture` exist in the bound mlx-c library
-(confirmed in `target/debug/build/rmlx-mlx-*/out/bindings.rs` lines 2864-2868).
+**This is the right profiler for MSL kernel questions**, not samply. Kernel cost
+lives on the GPU: occupancy, ALU-vs-memory limiter, achieved bandwidth, and the
+gaps between dispatches (a large gap means a host round-trip). Host stack
+sampling cannot see any of it.
 
-Safe wrappers are not yet exposed in `rmlx-mlx::lib`. When needed (Stage 1.4+):
+On M5 the Neural Accelerator is **part of the GPU**, so profiling nax needs no
+special tooling — the ordinary Metal capture path covers it
+([ml-explore/mlx#3182](https://github.com/ml-explore/mlx/issues/3182)).
 
-1. Add `pub fn metal_start_capture(path: &Path) -> Result<()>` in `rmlx-mlx/src/lib.rs`
-   calling `sys::mlx_metal_start_capture(c_path_ptr)`.
-2. Gate on a CLI flag or dedicated env var checked at engine boot
-   (`engine.rs` or `baseline.rs`).
-3. Open `.gputrace` in Instruments → Metal System Trace.
+`rmlx_mlx::metal_capture::CaptureScope` is an RAII guard over
+`mlx_metal_start_capture` / `mlx_metal_stop_capture`, behind the
+`metal-capture` feature so release builds pay nothing.
+
+### Prerequisites
+
+Full **Xcode**, not just Command Line Tools — traces cannot be replayed without
+it:
+
+```sh
+sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+```
+
+### Capture
+
+```sh
+cargo build --profile release-debug --features rmlx-mlx/metal-capture
+make profile-gputrace CODEC=iso3_sym MODEL=/path/to/snapshot
+```
+
+The window is a short generation, deliberately: a whole run is unusably large
+and dominated by model load and prefill, which is not what kernel work studies.
+Traces land in `.rmlx/traces/`; `open` them in Xcode.
+
+### What to read in the trace
+
+| Question | Where |
+|---|---|
+| Is the kernel itself slow, or is time lost between dispatches? | per-dispatch duration vs inter-dispatch gap — a large gap is a host round-trip (e.g. a per-step prefix restage) |
+| Compute-bound or bandwidth-bound? | limiter / ALU utilisation vs achieved bandwidth counters |
+| Is the codec's own kernel even running? | dispatch list — a codec that decodes via the bf16 mirror shows no flash-decode dispatch at all |
+
+See also [Analyzing Apple GPU performance using counter
+statistics](https://developer.apple.com/documentation/xcode/analyzing-apple-gpu-performance-using-counter-statistics).
 
 ## 6. Ad-hoc cardinality counting with the `counts` crate
 

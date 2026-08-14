@@ -51,6 +51,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         build-perf build-debug test-perf ci-perf model-check model-check-full \
         profile-samply profile-samply-debug profile-instruments bench asm perf-iter \
         canary canary-gate \
+        mlx-preflight mlx-restore-pin target-gc profile-gputrace \
         ssd-canary ssd-canary-gate \
         bench-codec-cell \
         smoke-codec-matrix \
@@ -71,6 +72,23 @@ check:           ## cargo check (fast, no codegen)
 
 test:            ## cargo test --workspace
 	cargo test --workspace
+
+mlx-preflight:   ## verify the linked MLX stack (and nax kernels on M5+) before benching
+	bash scripts/mlx_preflight.sh
+
+target-gc:       ## report stale target/ profiles (APPLY=1 to prune; target/ has no size cap)
+	bash scripts/target_gc.sh $(if $(APPLY),--apply,) $(if $(ALL),--all,)
+
+profile-gputrace: ## capture a decode-window Metal GPU trace for Xcode (CODEC= MODEL= required)
+	@if [ -z "$(CODEC)" ] || [ -z "$(MODEL)" ]; then \
+		echo "Usage: make profile-gputrace CODEC=<codec> MODEL=<snapshot-abs-path> [PROMPT_TOKENS=4096] [GEN=16]"; \
+		exit 2; \
+	fi
+	bash scripts/gpu_capture.sh --kv-quant $(CODEC) --model $(MODEL) \
+		$(if $(PROMPT_TOKENS),--prompt-tokens $(PROMPT_TOKENS),) $(if $(GEN),--gen $(GEN),)
+
+mlx-restore-pin: ## restore mlx 0.31.2 + mlx-c 0.6.0_2 (nax-capable pair) and relink
+	bash scripts/mlx_restore_pin.sh
 
 build-perf:      ## cargo build --profile release-perf (debug-assertions off, stripped)
 	cargo build --workspace --profile release-perf
@@ -345,7 +363,7 @@ CANARY_THRESHOLD_PCT ?= 3
 # SHA to compare against for canary-gate; required — no default.
 # Usage: make canary-gate SHA=3ba8aee
 
-canary: build-perf  ## run 3-model TPS canary (records into runs.db + legacy CSV); requires release-perf binary
+canary: mlx-preflight build-perf  ## run 3-model TPS canary (records into runs.db + legacy CSV); requires release-perf binary
 	@pkill -f "rmlx serve" || true; pkill -f mlx_lm || true; sleep 1; rm -f /tmp/rmlx.*.claim
 	bash scripts/perf_canary.sh
 
@@ -469,7 +487,7 @@ ssd-canary-gate:   ## gate SSD-tier regressions; SHA= required, THRESHOLD_PCT=3 
 # See scripts/bench_codec_cell.sh for full options (--max-tokens, --prompt-len).
 # CSV schema documented in docs/PERF_BASELINE.md § "Per-codec × per-model cells".
 
-bench-codec-cell:   ## bench one codec × one model cell (CODEC= MODEL= required); appends to .rmlx/bench/codec_cells.csv
+bench-codec-cell: mlx-preflight  ## bench one codec × one model cell (CODEC= MODEL= required); appends to .rmlx/bench/codec_cells.csv
 	@if [ -z "$(CODEC)" ] || [ -z "$(MODEL)" ]; then \
 		echo "Usage: make bench-codec-cell CODEC=<codec> MODEL=<snapshot-abs-path>"; \
 		exit 2; \
