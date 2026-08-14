@@ -888,6 +888,15 @@ pub fn mtp_generate_greedy(
         block_size = block_total,
         "mtp_generate_greedy: done"
     );
+
+    // Report the verifier's resident KV, so a caller that sampled the verifier
+    // arch around this call can attribute the figure to it. This round loop
+    // never goes through `Architecture::generate_greedy`, so nothing else
+    // writes it.
+    verifier.store_kv_cache_bytes(
+        crate::speculative::verifier_kv_bytes(&v_caches, Some(&v_lin)),
+        crate::decode_loop::PostDecode::seal(),
+    );
     Ok(emitted)
 }
 

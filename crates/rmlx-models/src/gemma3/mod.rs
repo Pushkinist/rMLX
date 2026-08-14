@@ -52,7 +52,7 @@ pub use generate::{generate_greedy, probe_forward};
 pub use loader::load_from_path;
 pub use model::Gemma3Text;
 pub use prompt_cache::read_cache_stats as gemma3_cache_stats;
-pub use prompt_cache::read_kv_cache_bytes as gemma3_kv_cache_bytes;
+pub use prompt_cache::read_kv_cache_bytes_sample as gemma3_kv_cache_bytes_sample;
 pub use vision::{
     build_inputs_embeds, load_vision_tower, Gemma3ImageProcessor, Gemma3PixelValues,
     MultiModalProjector, VisionModel, BOI_TOKEN_ID, EOI_TOKEN_ID, IMAGE_TOKEN_ID,
