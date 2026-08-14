@@ -1069,6 +1069,31 @@ enum Cmd {
         /// Env: `RMLX_YARN_ORIGINAL_MAX`.
         #[arg(long, env = "RMLX_YARN_ORIGINAL_MAX", value_name = "U32")]
         yarn_original_max: Option<u32>,
+        /// Write a Metal GPU trace of a bounded window of steady-state decode
+        /// to PATH (a `.gputrace` bundle, opened in Xcode). Debug builds only —
+        /// this flag exists only when the binary is built with
+        /// `--features rmlx-cli/metal-capture`.
+        ///
+        /// The process must have been launched with `MTL_CAPTURE_ENABLED=1`;
+        /// Metal inserts the capture layer at launch and cannot do so later.
+        /// `scripts/gpu_capture.sh` handles both.
+        ///
+        /// Capture perturbs every timing this command measures, so it cannot be
+        /// combined with `--record`.
+        #[cfg(feature = "metal-capture")]
+        #[arg(long, value_name = "PATH", conflicts_with = "record")]
+        gpu_capture: Option<PathBuf>,
+        /// Decode steps to run before the GPU-capture window opens. Skipping the
+        /// first steps keeps first-touch kernel compilation and pipeline warm-up
+        /// out of the trace.
+        #[cfg(feature = "metal-capture")]
+        #[arg(long, value_name = "N", default_value_t = 4, requires = "gpu_capture")]
+        gpu_capture_skip: u32,
+        /// Decode steps inside the GPU-capture window. Keep it small — every
+        /// captured dispatch is serialised into the bundle.
+        #[cfg(feature = "metal-capture")]
+        #[arg(long, value_name = "N", default_value_t = 8, requires = "gpu_capture")]
+        gpu_capture_steps: u32,
     },
     /// Repeated-run decode instrument: TTFT, ITL p50/p99, decode TPS and
     /// filled-prefix KV bytes for one (model, KV codec, context, generation)
@@ -1334,6 +1359,28 @@ fn resolve_prompts_root(prompts_dir: Option<PathBuf>) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("prompts"))
 }
 
+/// Whether this invocation asks for a GPU trace capture.
+///
+/// Read before the metrics kill switch is resolved: a captured run's numbers are
+/// instrumentation artefacts, not measurements, and must not reach any metrics
+/// surface. See the call site in [`main`].
+#[cfg(feature = "metal-capture")]
+fn gpu_capture_requested(cmd: &Cmd) -> bool {
+    matches!(
+        cmd,
+        Cmd::Baseline {
+            gpu_capture: Some(_),
+            ..
+        }
+    )
+}
+
+/// Without the capture feature there is no flag to ask with.
+#[cfg(not(feature = "metal-capture"))]
+const fn gpu_capture_requested(_cmd: &Cmd) -> bool {
+    false
+}
+
 #[allow(
     clippy::expect_used,
     reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
@@ -1362,7 +1409,20 @@ fn main() -> Result<()> {
     // Resolve the metrics kill switch exactly once, before anything can open
     // the DB or spawn the drainer. Every writer reads it from here; no call
     // site carries its own toggle.
-    rmlx_metrics::mode::init(cli.metrics_mode.mode());
+    //
+    // A GPU-capture run is instrumentation, not measurement: the capture layer
+    // serialises every dispatch and collapses decode to single-digit TPS, so
+    // every number the run produces is false. Force the switch off for it. The
+    // clap conflict with `--record` covers the §8.5 observations row only —
+    // the `events` rows and the `metrics/baseline.csv` append happen outside
+    // it, so without this a hand-run capture still wrote a ~2.5 TPS row into
+    // append-only surfaces.
+    let capture_forces_metrics_off = gpu_capture_requested(&cli.cmd);
+    rmlx_metrics::mode::init(if capture_forces_metrics_off {
+        rmlx_metrics::mode::MetricsMode::Off
+    } else {
+        cli.metrics_mode.mode()
+    });
 
     // Record the MLX nax-GEMM-kernel capability this binary was built with,
     // before the first `RunIdentity::get()` / `EventRecorder::record`.
@@ -1389,6 +1449,14 @@ fn main() -> Result<()> {
         }
     }
     let _guard = init_tracing(&run_id, cli.log, cli.log_cap_mb)?;
+
+    // Reported after tracing is up, since the decision above predates it.
+    if capture_forces_metrics_off {
+        info!(
+            "--gpu-capture: metrics forced off — a capture-distorted run writes no events \
+             row, no baseline.csv row and no observation"
+        );
+    }
 
     // Install the rotor-QJL toggle before any cache construction.
     // This is a process-wide one-shot OnceLock; safe to call once at startup.
@@ -2055,7 +2123,24 @@ fn main() -> Result<()> {
             prompts_dir,
             yarn_factor,
             yarn_original_max,
+            #[cfg(feature = "metal-capture")]
+            gpu_capture,
+            #[cfg(feature = "metal-capture")]
+            gpu_capture_skip,
+            #[cfg(feature = "metal-capture")]
+            gpu_capture_steps,
         } => {
+            // Arm the GPU-capture window before anything expensive happens: a
+            // request that cannot be honoured must cost seconds, not a full
+            // weight load followed by a failure at the first decode step.
+            #[cfg(feature = "metal-capture")]
+            let capture_requested = commands::gpu_capture::arm(
+                gpu_capture.as_deref(),
+                gpu_capture_skip,
+                gpu_capture_steps,
+                max_tokens,
+            )?;
+
             let cap_is_explicit = max_prompt_tokens.is_some();
             let max_prompt_tokens = parse_max_prompt_tokens(
                 max_prompt_tokens.unwrap_or(commands::baseline::MAX_PROMPT_TOKENS),
@@ -2158,7 +2243,7 @@ fn main() -> Result<()> {
                 factor,
                 original_max: yarn_original_max.map_or(0.0, |v| v as f32),
             });
-            run_baseline(
+            let baseline_result = run_baseline(
                 &model,
                 &effective_prompt_path,
                 &device,
@@ -2173,7 +2258,15 @@ fn main() -> Result<()> {
                 yarn_override,
                 &sink,
                 record_args,
-            )?;
+            );
+            // Always stop and report the capture, including when the run failed —
+            // otherwise a live scope leaks and the trace is never finalised. The
+            // run's own error still wins, since it is the root cause.
+            #[cfg(feature = "metal-capture")]
+            let capture_result = commands::gpu_capture::report(capture_requested);
+            baseline_result?;
+            #[cfg(feature = "metal-capture")]
+            capture_result?;
         }
         Cmd::Bench {
             model,

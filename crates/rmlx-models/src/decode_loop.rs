@@ -332,6 +332,15 @@ pub(crate) fn pipelined_decode(
     let mut forced_next: Option<u32> = None;
 
     for step_idx in 1..ctx.n_tokens {
+        // Debug-only GPU-trace window. Compiled out entirely without the
+        // `metal-capture` feature, so an ordinary build has no branch here.
+        // Ticked before the step's work so the trace brackets whole steps, and
+        // driven from the shared loop so the window is model- and
+        // codec-agnostic. A capture that cannot start aborts the run rather
+        // than leaving it silently uncaptured.
+        #[cfg(feature = "metal-capture")]
+        rmlx_mlx::metal_capture::step()?;
+
         let step_t0 = Instant::now();
         let fwd_t0 = Instant::now();
         // A failed forward aborts the request. Returning the tokens produced so

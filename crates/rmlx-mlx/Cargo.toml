@@ -20,8 +20,8 @@ safetensors = { workspace = true }
 
 [features]
 # Feature-gated GPU trace capture via MTLCaptureManager (debug only).
-# Enables `rmlx_mlx::metal_capture::CaptureScope` — a drop-guard RAII wrapper
-# around mlx_metal_start_capture / mlx_metal_stop_capture.
+# Enables `rmlx_mlx::metal_capture` — the arm / step / finish driver over
+# mlx_metal_start_capture / mlx_metal_stop_capture, plus the pure window policy.
 # Do NOT enable in release builds; the feature tag keeps binaries clean.
 metal-capture = []
 

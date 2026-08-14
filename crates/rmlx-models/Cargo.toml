@@ -33,6 +33,12 @@ image        = { workspace = true }
 symphonia = { workspace = true }
 rustfft   = { workspace = true }
 
+[features]
+# Debug-only Metal GPU trace capture over a bounded decode window. Adds the
+# per-step hook in the shared decode loop; off, that hook does not exist.
+# Never enable in a release build.
+metal-capture = ["rmlx-mlx/metal-capture"]
+
 [dev-dependencies]
 tempfile = { workspace = true }
 # Criterion micro-benchmarks for prefix-index strategies. Pulled
