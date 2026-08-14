@@ -671,54 +671,64 @@ pub(crate) fn run_baseline(
     }
 
     // -- Append to metrics/baseline.csv ---------------------------------------
-    let ts_utc = chrono::Utc::now()
-        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-        .to_string();
+    // Gated on the same kill switch as the DB. `--metrics off` means this run
+    // records nothing, and baseline.csv is a metrics surface under
+    // <RMLX_HOME>/metrics/ exactly like runs.db is — an append here is as
+    // permanent as a row there. Left ungated, a run with the DB shut off (a GPU
+    // capture, say, whose timings are meaningless by construction) still left a
+    // row behind.
+    if rmlx_metrics::mode::current() == rmlx_metrics::mode::MetricsMode::Off {
+        info!("baseline: --metrics off, no baseline.csv row written");
+    } else {
+        let ts_utc = chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
 
-    // Truncate first-50 to 200 chars then CSV-escape.
-    let output_cell = baseline_csv_escape(&notes_truncated);
+        // Truncate first-50 to 200 chars then CSV-escape.
+        let output_cell = baseline_csv_escape(&notes_truncated);
 
-    let csv_path = rmlx_core::paths::metrics_dir().join("baseline.csv");
+        let csv_path = rmlx_core::paths::metrics_dir().join("baseline.csv");
 
-    // Header written only when the file is absent or zero-length.
-    let write_header =
-        !csv_path.exists() || std::fs::metadata(&csv_path).map_or(true, |m| m.len() == 0);
+        // Header written only when the file is absent or zero-length.
+        let write_header =
+            !csv_path.exists() || std::fs::metadata(&csv_path).map_or(true, |m| m.len() == 0);
 
-    let mut csv_file = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(&csv_path)
-        .map_err(|e| anyhow::anyhow!("open {}: {e}", csv_path.display()))?;
+        let mut csv_file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&csv_path)
+            .map_err(|e| anyhow::anyhow!("open {}: {e}", csv_path.display()))?;
 
-    if write_header {
-        csv_file.write_all(
-            b"run_id,timestamp_utc,backend,model_basename,quantization_type,context_size,\
-              prompt,device,prompt_tokens,load_ms,ttft_ms,tps,peak_rss_mb,output_first_50\n",
-        )?;
+        if write_header {
+            csv_file.write_all(
+                b"run_id,timestamp_utc,backend,model_basename,quantization_type,context_size,\
+                  prompt,device,prompt_tokens,load_ms,ttft_ms,tps,peak_rss_mb,output_first_50\n",
+            )?;
+        }
+
+        let row = format!(
+            "{},{},rMLX,{},{},{},{},{},{},{:.0},{:.0},{:.3},{:.1},{}\n",
+            baseline_csv_escape(run_id),
+            ts_utc,
+            baseline_csv_escape(model_basename),
+            baseline_csv_escape(&quantization_type),
+            context_size,
+            baseline_csv_escape(prompt_label),
+            baseline_csv_escape(device_str),
+            prompt_token_count,
+            load_ms,
+            ttft_ms,
+            tps,
+            rss_mb,
+            output_cell,
+        );
+        csv_file
+            .write_all(row.as_bytes())
+            .map_err(|e| anyhow::anyhow!("write baseline.csv row: {e}"))?;
+        csv_file
+            .flush()
+            .map_err(|e| anyhow::anyhow!("flush baseline.csv: {e}"))?;
     }
-
-    let row = format!(
-        "{},{},rMLX,{},{},{},{},{},{},{:.0},{:.0},{:.3},{:.1},{}\n",
-        baseline_csv_escape(run_id),
-        ts_utc,
-        baseline_csv_escape(model_basename),
-        baseline_csv_escape(&quantization_type),
-        context_size,
-        baseline_csv_escape(prompt_label),
-        baseline_csv_escape(device_str),
-        prompt_token_count,
-        load_ms,
-        ttft_ms,
-        tps,
-        rss_mb,
-        output_cell,
-    );
-    csv_file
-        .write_all(row.as_bytes())
-        .map_err(|e| anyhow::anyhow!("write baseline.csv row: {e}"))?;
-    csv_file
-        .flush()
-        .map_err(|e| anyhow::anyhow!("flush baseline.csv: {e}"))?;
 
     info!(
         load_ms,

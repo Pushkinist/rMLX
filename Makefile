@@ -52,6 +52,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         profile-samply profile-samply-debug profile-instruments bench asm perf-iter \
         canary canary-gate \
         mlx-preflight mlx-restore-pin target-gc target-size-report profile-gputrace \
+        build-capture test-capture \
         ssd-canary ssd-canary-gate \
         bench-codec-cell \
         smoke-codec-matrix \
@@ -82,13 +83,27 @@ target-gc:       ## report stale target/ profiles (APPLY=1 to prune; target/ has
 target-size-report: ## advisory: print target/ size + hint when over threshold (non-failing; also runs at the end of `make ci`)
 	@bash scripts/target_size_report.sh
 
+build-capture: ## build the debug-only GPU-capture binary (release-debug + metal-capture)
+	cargo build --profile release-debug --features rmlx-cli/metal-capture
+
+# `make test` is `cargo test --workspace` without --all-features, so it compiles
+# these out entirely. Run from `ci` as well, or an off-by-one in the window
+# policy passes the gate green.
+test-capture: ## run the GPU-capture unit tests (feature-gated, so plain `make test` skips them; also a `make ci` step)
+	cargo test -p rmlx-mlx --features metal-capture --lib metal_capture
+	cargo test -p rmlx-cli --features metal-capture --bin rmlx gpu_capture
+
 profile-gputrace: ## capture a decode-window Metal GPU trace for Xcode (CODEC= MODEL= required)
 	@if [ -z "$(CODEC)" ] || [ -z "$(MODEL)" ]; then \
-		echo "Usage: make profile-gputrace CODEC=<codec> MODEL=<snapshot-abs-path> [PROMPT_TOKENS=4096] [GEN=16]"; \
+		echo "Usage: make profile-gputrace CODEC=<codec> MODEL=<snapshot-abs-path> \
+[PROMPT_TOKENS=4096] [SKIP=4] [STEPS=8] [GEN=N]"; \
+		echo "Needs a binary from \`make build-capture\`."; \
 		exit 2; \
 	fi
 	bash scripts/gpu_capture.sh --kv-quant $(CODEC) --model $(MODEL) \
-		$(if $(PROMPT_TOKENS),--prompt-tokens $(PROMPT_TOKENS),) $(if $(GEN),--gen $(GEN),)
+		$(if $(PROMPT_TOKENS),--prompt-tokens $(PROMPT_TOKENS),) \
+		$(if $(SKIP),--skip $(SKIP),) $(if $(STEPS),--steps $(STEPS),) \
+		$(if $(GEN),--gen $(GEN),)
 
 mlx-restore-pin: ## restore mlx 0.31.2 + mlx-c 0.6.0_2 (nax-capable pair) and relink
 	bash scripts/mlx_restore_pin.sh
@@ -206,7 +221,7 @@ check-metal-format: ## CI gate: every KV .metal kernel is clang-format clean (sk
 	@bash scripts/check_metal_format.sh $(METAL_STRICT)
 
 # ---- one-shot CI gate -------------------------------------------------
-ci: fmt-check lint test deny audit ci-metrics ## full pre-merge gate: fmt + clippy + test + deny + audit + metrics-sanity + inline-test + MSL gates
+ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gate: fmt + clippy + test + feature-gated capture tests + deny + audit + metrics-sanity + inline-test + MSL gates
 	@bash scripts/check_no_inline_tests.sh
 	@bash scripts/check_no_scalar_f32_leak.sh
 	@bash scripts/check_no_decode_swallow.sh

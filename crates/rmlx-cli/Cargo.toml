@@ -54,6 +54,10 @@ tikv-jemallocator = { workspace = true }
 # Then: ./target/debug/rmlx baseline ...  (writes dhat-heap.json on exit)
 [features]
 dhat-heap = ["dep:dhat"]
+# Debug-only Metal GPU trace capture. Adds the `--gpu-capture*` flags to
+# `rmlx baseline` and the per-step hook in the shared decode loop. Off, neither
+# the flags nor the hook exist, so a release binary cannot capture at all.
+metal-capture = ["rmlx-mlx/metal-capture", "rmlx-models/metal-capture"]
 
 [dev-dependencies]
 tempfile     = { workspace = true }
