@@ -213,6 +213,11 @@ Hard rules:
   scoped to that one `#[test]`, not the whole file. See `docs/TESTING.md`.
 - **Advisory: `make file-size-report`** prints files >1000 LOC. Non-failing.
   Also runs at the end of `make ci` (advisory, non-blocking).
+- **Advisory: `make target-size-report`** prints `target/` size and, past a
+  50 GB threshold, a hint to run `make target-gc` (the staleness-based
+  pruner, see `scripts/target_gc.sh`). `target/` has no size cap; this just
+  makes growth visible. Non-failing. Also runs at the end of `make ci`
+  (advisory, non-blocking).
 
 ## Comments and identifiers (hard rule)
 

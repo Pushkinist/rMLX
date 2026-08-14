@@ -51,7 +51,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         build-perf build-debug test-perf ci-perf model-check model-check-full \
         profile-samply profile-samply-debug profile-instruments bench asm perf-iter \
         canary canary-gate \
-        mlx-preflight mlx-restore-pin target-gc profile-gputrace \
+        mlx-preflight mlx-restore-pin target-gc target-size-report profile-gputrace \
         ssd-canary ssd-canary-gate \
         bench-codec-cell \
         smoke-codec-matrix \
@@ -78,6 +78,9 @@ mlx-preflight:   ## verify the linked MLX stack (and nax kernels on M5+) before 
 
 target-gc:       ## report stale target/ profiles (APPLY=1 to prune; target/ has no size cap)
 	bash scripts/target_gc.sh $(if $(APPLY),--apply,) $(if $(ALL),--all,)
+
+target-size-report: ## advisory: print target/ size + hint when over threshold (non-failing; also runs at the end of `make ci`)
+	@bash scripts/target_size_report.sh
 
 profile-gputrace: ## capture a decode-window Metal GPU trace for Xcode (CODEC= MODEL= required)
 	@if [ -z "$(CODEC)" ] || [ -z "$(MODEL)" ]; then \
@@ -211,6 +214,7 @@ ci: fmt-check lint test deny audit ci-metrics ## full pre-merge gate: fmt + clip
 	@bash scripts/check_metal_format.sh
 	@bash scripts/check_metal_compiles.sh
 	@bash scripts/file_size_report.sh || true
+	@bash scripts/target_size_report.sh || true
 	@echo "ci ok"
 
 # tag: derive v<version> from the single source of truth
