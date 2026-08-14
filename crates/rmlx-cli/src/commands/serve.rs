@@ -51,13 +51,18 @@ use tracing::{info, warn};
 ///
 /// | cell (Bonsai-8B, `kv_h=8`, `head_dim=128`) | off | on | |
 /// |---|---|---|---|
-/// | k8v4 @16k, `--max-ctx 65536` | 89.4 TPS | 19.3 TPS | 4.6× slower |
 /// | k8v4 @16k, `--max-ctx 16640` | 82.8 TPS | 24.2 TPS | 3.4× slower |
-/// | k8v4 @32k, `--max-ctx 65536` | 61.3 TPS | 10.5 TPS | 5.9× slower |
+/// | k8v4 @16k, `--max-ctx 65536` | 89.4 TPS | 19.3 TPS † | ~4.6× slower |
+/// | k8v4 @32k, `--max-ctx 65536` | 61.3 TPS | 10.5 TPS † | ~5.9× slower |
 ///
 /// Same binary, same cell, back to back, temp=0, `--turbo-flash` the only
 /// difference; the generated-token digest is identical in both arms, so this is
-/// pure cost, not a fidelity trade. Tightening the ring 4× recovers part of it
+/// pure cost, not a fidelity trade. † The two `--max-ctx 65536` ON cells were
+/// refused by `rmlx bench`'s settle gate — the 32k ON arm decoded
+/// 12.0 → 10.5 → 8.8 TPS across its three runs and never reached steady state —
+/// so those two figures are log read-outs, not certified medians. The
+/// `--max-ctx 16640` pair settled on both sides; 3.4× is the certified floor.
+/// Tightening the ring 4× recovers part of it
 /// but not the bulk, so it is not a `--max-ctx` sizing artefact. The `on` arm
 /// also holds ~722 MB more resident KV (the persistent head-major flash buffers
 /// sit on top of the bf16 mirror and the packed store). On a shared-KV /

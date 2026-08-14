@@ -649,12 +649,18 @@ generates them several times slower.
 
 | cell (Bonsai-8B, `kv_h=8`, `head_dim=128`, `rmlx bench` n=3) | off | on | |
 |---|---|---|---|
-| k8v4 @16k, `--max-ctx 65536` | 89.4 TPS | 19.3 TPS | 4.6× slower |
-| k8v4 @16k, `--max-ctx 16640` | 82.8 TPS | 24.2 TPS | 3.4× slower |
-| k8v4 @32k, `--max-ctx 65536` | 61.3 TPS | 10.5 TPS | 5.9× slower |
+| k8v4 @16k, `--max-ctx 16640` | 82.8 TPS | 24.2 TPS | **3.4× slower** |
+| k8v4 @16k, `--max-ctx 65536` | 89.4 TPS | 19.3 TPS † | ~4.6× slower |
+| k8v4 @32k, `--max-ctx 65536` | 61.3 TPS | 10.5 TPS † | ~5.9× slower |
 
 Same binary, same cell, back to back; identical generated-token digest in both
-arms. Shrinking the ring 4× recovers part of the gap but not the bulk, so this
+arms. † The `--max-ctx 65536` ON cells were **refused** by `rmlx bench`'s settle
+gate and their figures are medians read out of the run log, not certified
+measurements — the 32k ON arm decoded 12.0 → 10.5 → 8.8 TPS over its three runs
+(TTFT 22.1 → 30.9 → 37.7 s) and never reached a steady state at all, which is a
+finding in its own right rather than a number to quote. The `--max-ctx 16640`
+pair settled on both sides (ON range 0.69%) and is the one fully certified A/B;
+take 3.4× as the floor of the effect. Shrinking the ring 4× recovers part of the gap but not the bulk, so this
 is not a `--max-ctx` sizing artefact. The `on` arm also holds ~722 MB more
 resident KV at 16k — the persistent head-major flash buffers sit *on top of*
 the bf16 mirror and the packed store rather than replacing either. On a

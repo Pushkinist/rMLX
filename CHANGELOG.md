@@ -26,9 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolved ON for every recognised Apple family. On the one storage the kernel
   serves (K8V4, `kv_seq > 4096`) it decodes 3.4–5.9× *slower* than the generic
   path while emitting a byte-identical token digest, and holds ~722 MB more
-  resident KV: Bonsai-8B `rmlx bench` n=3, k8v4@16k 89.4 → 19.3 TPS
-  (`--max-ctx 65536`), 82.8 → 24.2 (`--max-ctx 16640`, so not a ring-sizing
-  artefact), k8v4@32k 61.3 → 10.5. Inert on a shared-KV/windowed arch
+  resident KV: Bonsai-8B `rmlx bench` n=3, k8v4@16k 82.8 → 24.2 TPS at
+  `--max-ctx 16640` (both arms settled — the certified floor, and proof this is
+  not a ring-sizing artefact); at `--max-ctx 65536`, 89.4 → 19.3 @16k and
+  61.3 → 10.5 @32k, though both ON cells there were *refused* by bench's settle
+  gate (the 32k ON arm decoded 12.0 → 10.5 → 8.8 across its runs and never
+  reached steady state). Inert on a shared-KV/windowed arch
   (gemma-4-e2b ±0.3%, inside the 1.3% noise floor). This retires the per-family
   default-ON policy; the validations behind it were crash/fidelity clearances
   (32k NIAH on Apple ≤9, the Apple10 `head_dim = 256` hazard re-drive) and are

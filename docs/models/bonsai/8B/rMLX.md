@@ -419,9 +419,13 @@ Ranked by impact:
    `k8v4`'s crater from 8k up to "an inherently costly generic-path V-4bit
    dequant on this arch". It is not the codec — it is the **TurboFlash MSL
    kernel**, which `--turbo-flash=auto` enabled on every recognised Apple
-   family, this host included. Back-to-back on the same binary, `k8v4`@32k
-   decodes **61.3 TPS with the kernel off and 10.5 TPS with it on**, for a
-   byte-identical token digest. The 0.2.5 and 0.3.0 matrices were both taken
+   family, this host included. Back-to-back on the same binary, `k8v4`@16k at
+   `--max-ctx 16640` decodes **82.8 TPS with the kernel off and 24.2 TPS with
+   it on** — both arms settled, both emitting a byte-identical token digest.
+   At `--max-ctx 65536` the gap reads wider still (89.4 → 19.3 @16k, 61.3 →
+   10.5 @32k) but those ON cells were refused by bench's settle gate — the 32k
+   ON arm decoded 12.0 → 10.5 → 8.8 across three runs without ever reaching
+   steady state — so 3.4× is the certified floor, not the headline. The 0.2.5 and 0.3.0 matrices were both taken
    through `rmlx serve`, which resolved the gate ON; `rmlx bench` never
    resolved it at all, which is why the crater vanishes there. Both halves are
    fixed: the gate is now global (every subcommand resolves it identically) and
