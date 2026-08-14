@@ -173,14 +173,81 @@ pass is the K-only / sym-iso family's memory footprint:
 | k8vturbo2/3 | 12876–13084 | 1.22–1.24× | 1.22–1.24× | | planar/planar3 | 16828 | 1.60× | 1.60× |
 | k8vturbo2/3tcq | 12876–13084 | 1.22–1.24× | 1.22–1.24× | | planar_k | 15112 | 1.43× | 1.43× |
 | k8v4 | 13292 | 1.26× | 1.26× | | k8v8 | 13968 | 1.33× | 1.33× |
-| rot_k_tq4v | 13351 | 1.27× | 1.27× | | k_rotor3/4 | 16255 | 1.54× | 1.14× (broken) |
+| rot_k_tq4v | 13351 | 1.27× | 1.27× | | k_rotor3/4 | **11898**† | **1.115×**† | 1.14× (broken) |
+
+† `k_rotor3/4` is the one cell re-measured after the CPU-block defect below was
+fixed: 11,897,787,872 B at 64k against that run's own `none` of 10,671,734,784 B.
+Pre-fix the same run read 16,477,668,320 B (1.544×) — the 16255 / 1.54× this
+table used to carry. Every other row is the earlier sweep (its `none` reads
+10536 MB, ~1.3% under the re-measurement's, which is why the ratio and not the
+absolute is the comparable number).
 
 `k_iso3/4` and `iso3_sym/4_sym` dropped to essentially **1.00–1.01× `none`**
-(from 1.64× / 2.91×) — a real, large memory win from whatever sole-store /
-GPU-ring rework shipped alongside the new kernels. `k_rotor3/4` moved the
-other way (1.14×→1.54×) — worth a note but not a regression given the prior
-1.14× figure was explicitly marked "(broken)" in 0.2.5 (an artifact of the
-CPU-bound path, not a real measurement of the intended GPU-ring layout).
+(from 1.64× / 2.91×) once the GPU ring became their sole resident store. That
+is a large improvement on the previous figure but it is **not a memory win**:
+1.00× `none` means "ties bf16", and the format cannot do better than tie. iso
+spends one whole `u32` code word **and** one `f32` scale per 4-element group
+(16.25 bits/value at head\_dim=128) and rotor one of each per 3-element group
+(21.75), against bf16's 16.0 — so the nominal 3-bit / 4-bit width never
+reaches storage, and the 3-bit and 4-bit member of each family measure
+byte-identical here. `none` is the memory floor at every context and no member
+of this family can undercut it. See `docs/KV_QUANT.md` § "Memory truth".
+
+`k_rotor3/4`'s 1.54× was a **defect, not the layout**: the K-only rotor append
+never dropped its CPU blocks once the ring was live, so the prefill prefix
+stayed resident twice (the `_sym` appends always dropped theirs — hence 1.23×
+against the K-only pair's 1.54×). Fixed. Re-measured A/B on the same binary
+pair, prompts 4k / 16k / 64k, 3 runs each:
+
+| model | prompt | before | after | vs `none` after |
+|---|---|---|---|---|
+| Bonsai-8B (`kv_h=8`, D=128) | 4k | 990.0 MB | **717.2 MB** (−27.6%) | 1.118× |
+| Bonsai-8B | 16k | 4090.7 MB | **2959.4 MB** (−27.7%) | 1.119× |
+| Bonsai-8B | 64k | 16,477,668,320 B | **11,897,787,872 B** (−27.79%) | 1.544× → **1.115×** |
+| gemma-4-e2b (`kv_h=1`, D=256) | 4k | 53.9 MB | **37.0 MB** (−31.4%) | 1.163× |
+| gemma-4-e2b | 16k | 201.3 MB | **130.7 MB** (−35.1%) | 1.169× |
+| gemma-4-e2b | 64k | 786,057,912 B | **502,473,744 B** (−36.08%) | 1.830× → **1.170×** |
+
+The win survives and grows with context — it is a per-token duplication, so it
+scales with the prefix, and the 64k cell is where the post-fix layout ratio
+should be read. Same-run `none` baseline at 64k: Bonsai 10,671,734,784 B;
+gemma-4-e2b ≈429.5 MB (both e2b ratios resolve to it). Every other codec
+measured byte-identical across the binary pair (0.00% delta).
+
+#### Decode cost of the fix: zero, demonstrated against a null control
+
+The honest way to read a small decode delta is to measure something whose true
+delta is known to be zero in the same session. `k_iso3` is that control here:
+its drop call already existed before this change, the diff provably cannot reach
+its decode path, and it measures byte-identical on both binaries. Anything it
+reads is the instrument.
+
+| model | prompt | `k_rotor3` (treatment) | `k_iso3` (null control, true delta = 0) |
+|---|---|---|---|
+| Bonsai-8B | 32k | **+0.13%** [95% CI −2.17, +2.42] | +0.60% |
+| gemma-4-e2b | 32k | **+0.13%** [95% CI −2.78, +3.03] | +0.56% |
+
+At 32k the instrument resolves and the answer is clean: the treatment's delta is
+*smaller than the control's*, and both sit inside a ±2–3% interval. TTFT −0.03%
+±0.3%. Dropping a redundant CPU copy costs nothing at decode, which is what the
+layout predicts.
+
+**Do not measure this cell at 4k.** The same null control — a change with no
+possible effect — reads **−11.22%** [95% CI −28.50, +6.06] at gen=8 and −2.26%
+at gen=128 on Bonsai/4k (ABBA-paired, n=6, on `forward_total_ms`). The 4k cell
+has no resolving power, so a 4k number for this codec measures the machine, not
+the code. Nor does pairing rescue it: the 4k treatment run, re-analysed as the
+paired design ABBA exists to create, reads −9.7% (t = −3.06, df 7, p ≈ 0.018) —
+a "significant" regression in a cell whose own control says zero. The earlier
+4k and 16k decode figures for `k_rotor3` / `k_rotor4` are below this noise floor
+and are deliberately not quoted here as measurements.
+
+**The measurement machine was not quiescent.** A co-resident VM held 100–154%
+CPU with load average ≈6 for the duration. That is the direct cause of the
+short-context cells being unusable: at 4k the per-step work is small enough that
+scheduler contention dominates it. The 32k cells still resolve because their
+per-step work is large by comparison. Reproduce long-context, or on an idle
+machine, or both.
 
 ### 2.2 Marginal decode cost (ms per 1k KV tokens), fit over 8k→64k
 
@@ -190,6 +257,16 @@ cells. `a` = fixed per-step cost (ms), `b` = marginal cost per 1k resident KV
 tokens (ms) — the number that predicts whether a codec can ever beat bf16 at
 long context. Grouped by whether a named flash-decode-over-quant kernel
 dispatches (confirmed via untimed verbose probe at 64k).
+
+**Read `b` as an ordering, not as a coefficient, and ignore `a` for the symv
+tier.** One global straight line over four cells is the wrong model for a curve
+that bends: where the fit reports a *negative* `a` (`iso3_sym` −4.53,
+`iso4_sym` −52.59, `rotor4_sym` −52.55) it is asserting a negative fixed
+per-step cost, which is not a thing — least-squares is absorbing convexity into
+the intercept, and the 64k cell it leans on hardest is n=1. The tier separation
+below (generic path ≪ K-only kernels ≪ symv kernels) survives that; the
+individual `a` values do not. For a number to act on, take the segment-wise
+marginal cost between two replicated adjacent cells rather than a global fit.
 
 | codec | a (ms) | b (ms/1k tok) | kernel dispatched |
 |---|---|---|---|

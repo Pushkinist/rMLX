@@ -69,7 +69,8 @@ use crate::decode_loop::{
     capture_logprobs, choose_token, chunked_prefill, pipelined_decode, DecodeCtx,
 };
 use crate::kv_cache::{
-    kv_max_seq_and_ceiling, kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
+    kv_max_seq_and_ceiling, kv_quant_for_layer, warn_if_kv_codec_net_negative, KvLayerShape,
+    LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
 };
 use crate::layers::{resolve_quant, QuantParams};
 use crate::load_util::{bf16_param, bf16_scales, Weights};
@@ -2000,6 +2001,24 @@ pub fn generate_greedy<'a>(
                 .with_layer_idx(i)
         })
         .collect();
+
+    // Advise once if the resolved codec is estimated to increase resident KV vs
+    // bf16 on this layer mix. Keyed on geometry + codec only, exactly as the
+    // other arches call it — a codec that costs more memory than bf16 does so
+    // because of its store layout, which no architecture can change, so the
+    // operator has to hear it on every arch and not only where it happened to
+    // be wired first. Every qwen3 layer is full-attention (no sliding window).
+    {
+        let layer_shapes: Vec<KvLayerShape> = (0..n_layers)
+            .map(|_| KvLayerShape {
+                head_dim: model.cfg.head_dim as u64,
+                kv_heads: model.cfg.num_key_value_heads as u64,
+                window: None,
+            })
+            .collect();
+        let eff_seq = (max_seq_ceiling.max(0) as u64).max(prompt_ids.len() as u64);
+        warn_if_kv_codec_net_negative(kv_quant, &layer_shapes, eff_seq);
+    }
 
     // Prefill: encode the prompt in fixed-size chunks via the shared Fresh
     // chunked-prefill helper. It brackets the loop with enter_prefill() /

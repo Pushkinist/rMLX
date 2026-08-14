@@ -1149,7 +1149,14 @@ pub(super) fn rotor3_k_only_gpu_append(
         device,
         RingFeed::MaintainRingOnly,
         max_seq,
-    )
+    )?;
+    // Ring is now the sole resident store for K — drop the redundant CPU blocks,
+    // exactly as the symmetric append does. Without this the prefill prefix stays
+    // resident in `blocks` for the whole request on top of the ring that already
+    // holds the same packed bytes, inflating the codec's resident KV well above
+    // what its own layout costs.
+    drop_blocks_when_ring_live_k3(ks);
+    Ok(())
 }
 
 /// Mirror of [`rotor3_k_only_gpu_append`] for `RotorKOnly4`.
@@ -1191,7 +1198,10 @@ pub(super) fn rotor4_k_only_gpu_append(
         device,
         RingFeed::MaintainRingOnly,
         max_seq,
-    )
+    )?;
+    // Ring is the sole resident store — see [`rotor3_k_only_gpu_append`].
+    drop_blocks_when_ring_live_k4(ks);
+    Ok(())
 }
 
 /// Append `new_k` / `new_v` into a live `RotorSym3` store's GPU rings (+ CPU

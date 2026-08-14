@@ -66,6 +66,16 @@
 //! the 3.25 bpe target reported by the Python `rotorquant` reference — is
 //! gated on the follow-up (deferred).
 //!
+//! **"Pre-scale" is doing a lot of work in that number, and the delivered
+//! figure is what matters.** The 24 code bits occupy a whole `u32`, and the
+//! per-group `f32` scale sits beside it, so the store spends **8 B per 3
+//! values** — 21.33 bits per value — plus 4 B per token for the norm:
+//! **21.75 bits per value at `head_dim = 128`, against bf16's 16.0.** rotor4
+//! fills all 32 code bits instead of 24 and therefore occupies *byte-identical*
+//! storage. No rotor codec is smaller than bf16 at any `head_dim`; see
+//! `docs/KV_QUANT.md` § "Memory truth" and the
+//! `iso_and_rotor_k_codecs_are_never_a_memory_win` guard.
+//!
 //! # No QJL residual
 //!
 //! V-side codec only — the 1-bit QJL residual stage from

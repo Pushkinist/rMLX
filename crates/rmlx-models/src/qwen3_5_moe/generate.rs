@@ -26,7 +26,8 @@ use crate::decode_loop::{
     capture_logprobs, choose_token, chunked_prefill, pipelined_decode, DecodeCtx,
 };
 use crate::kv_cache::{
-    kv_max_seq_and_ceiling, kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
+    kv_max_seq_and_ceiling, kv_quant_for_layer, warn_if_kv_codec_net_negative, KvLayerShape,
+    LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
 };
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
@@ -478,6 +479,26 @@ pub fn generate_greedy<'a>(
     let mut lin_caches: Vec<LinearAttnCache> = (0..model.cfg.num_hidden_layers)
         .map(|_| LinearAttnCache::new())
         .collect();
+
+    // Advise once if the resolved codec is estimated to increase resident KV vs
+    // bf16. Keyed on geometry + codec only, exactly as the other arches call it
+    // — a codec that costs more memory than bf16 does so because of its store
+    // layout, which no architecture can change, so the operator has to hear it
+    // on every arch and not only where it happened to be wired first. Only the
+    // full-attention layers hold a token-indexed KV cache; the linear-attention
+    // (GDN) layers carry a fixed-size recurrent state the codec never touches.
+    {
+        let layer_shapes: Vec<KvLayerShape> = (0..n_layers)
+            .filter(|i| (i + 1).is_multiple_of(model.cfg.full_attention_interval))
+            .map(|_| KvLayerShape {
+                head_dim: model.cfg.head_dim as u64,
+                kv_heads: model.cfg.num_key_value_heads as u64,
+                window: None,
+            })
+            .collect();
+        let eff_seq = (max_seq_ceiling.max(0) as u64).max(prompt_ids.len() as u64);
+        warn_if_kv_codec_net_negative(kv_quant, &layer_shapes, eff_seq);
+    }
 
     // Fresh chunked prefill via the shared helper. It brackets the loop with
     // enter_prefill() / exit_prefill(), evals only the cache state on non-final

@@ -187,18 +187,25 @@ Recorded per `(codec, model)` cell. A.y-excluded combos (e.g. K8VTurbo3 K-side �
 
 `—` = cell not measured yet. SKIP marks A.y-rejected combos.
 
-**Why `k_iso*` / `k_rotor*` trail their `*_sym` siblings.** Counter-intuitively
-the K-only variants (bf16 V) decode *slower* than the fully-symmetric ones on
-Bonsai (e.g. k_iso3 59 vs iso3_sym 142, k_rotor3 45 vs rotor3_sym 145). The
-K-side iso/rotor codecs have no GPU-resident code mirror on the live decode
-path: the CPU `dequant()` re-materializes the full K prefix each step and the
-result is re-uploaded via `Array::from_bytes` (rotor additionally applies an
-O(head_dim²)-per-token QJL score correction under the default `--rotor-qjl
-on`), an O(kv_seq) per-step cost the `*_sym` path amortizes through its
-warm-TTFT bf16 seed. (The `dequant_gpu` mirror is gated off by
-`gpu_resident_iso_enabled()`.) These anchors are
-short-prompt; the gap widens with context. See `docs/KV_QUANT.md` "iso/rotor
-K-side variants" and `gpu_resident_iso_enabled` in `rmlx-kv-quant/src/lib.rs`.
+**The iso / rotor Bonsai anchors above are stale — do not gate on them.** They
+were recorded before the flash-decode-over-quant kernels
+(`iso_flash_decode_sdpa`, `iso_flash_decode_symv_sdpa`, and the rotor pair) and
+before `--rotor-qjl` flipped to default `off`, and they encode a causal story
+that no longer holds. The paragraph they carried claimed the K-only variants
+trail their `*_sym` siblings because the K side had no GPU-resident code mirror
+and paid a CPU `dequant()` of the whole prefix per step. Both halves are now
+false: the K-only stores keep a GPU ring the kernel reads directly, and the
+measured relation is **inverted** — on Bonsai-8B at a 4k prompt `k_iso3`
+decodes at ≈19 TPS against `iso3_sym`'s ≈14, and the gap widens with context.
+Symmetric codecs are now the slower tier, because quantizing V puts a second
+dequant inside the decode kernel. Live numbers per (codec, context) live in
+`docs/models/bonsai/8B/rMLX.md` §2; re-record these cells before using them.
+
+**Neither tier competes with `none` on either axis.** The whole iso/rotor
+family stores one `u32` code word plus one `f32` scale per group, so it is
+never smaller than bf16 (see `docs/KV_QUANT.md` "Memory truth"), and its
+decode is several times `none`'s. Bench them for kernel work and quality
+study, not as memory or throughput candidates.
 
 Each new codec: invoke `scripts/bench_codec_cell.sh --kv-quant <codec> --model <model>` per cell (3 cells per codec, A.y-excluded skipped), then append to this table.
 
