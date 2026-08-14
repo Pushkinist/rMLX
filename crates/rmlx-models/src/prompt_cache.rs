@@ -709,8 +709,13 @@ impl<E: PromptCacheEntry> PromptCache<E> {
         }
     }
 
-    /// Clear all slots and reset stats.
+    /// Clear all RAM slots and reset stats.
     /// Called when model is unloaded or capacity changes.
+    ///
+    /// RAM only. An attached SSD source ([`Self::set_ssd_source`]) survives, so
+    /// the next lookup can still miss in RAM and be served by
+    /// [`Self::hydrate_from_ssd`] — which bumps `stats.ssd_hits`, not
+    /// `stats.hits`. This is not a guarantee that the next request prefills.
     pub(crate) fn clear(&mut self) {
         self.slots.clear();
         self.stats = CacheStats::default();

@@ -17,9 +17,13 @@
 //!    not a time-to-first-token), are hard errors — not a fast-looking number.
 //! 2. **It never reports a bare central value.** Every metric carries its
 //!    observed min/max across the measured runs, and `--runs` is rejected below
-//!    2 so there is always a spread to report. A metric that *trends* across
-//!    those runs has no central value at all, and is refused rather than
-//!    summarised — see [`detect_drift`].
+//!    2 so there is always a spread to report. A metric that never settled
+//!    across those runs has no central value at all, and is refused rather than
+//!    summarised — whether it settled is decided by two independent gates, one
+//!    per shape a cell fails to settle in: a *trend* (see [`detect_drift`]) and
+//!    a *range* too wide to call noise around a centre (see
+//!    [`SETTLED_MAX_RANGE_PCT`]). Which metrics are gated is enumerated on
+//!    [`Metric::gate`], not left to which call sites happen to check.
 //!
 //! `bench` is read-only with respect to the metrics database: it prints, it
 //! does not record. Use `rmlx baseline --record` for the append-only store.
@@ -49,13 +53,15 @@ pub(crate) const MIN_RUNS: u32 = 2;
 /// instead of a measurement that was never taken.
 ///
 /// What prevents that is [`arch::Architecture::clear_prompt_cache`], called
-/// before every generation: the cache is emptied, so the next request is a
-/// guaranteed miss and a real prefill. Asking for *zero* slots would not do it
-/// — capacity is clamped to a minimum of one, so a "zero-slot" cache still
-/// stores and can still serve a snapshot.
+/// before every generation: the RAM slots are emptied, so the next request
+/// misses. Asking for *zero* slots would not do it — capacity is clamped to a
+/// minimum of one, so a "zero-slot" cache still stores and can still serve a
+/// snapshot.
 ///
-/// `assert_prefill_measured` re-checks the outcome per run rather than trusting
-/// either the constant or the clear.
+/// A RAM miss is not the same as a prefill: the clear does not detach an SSD KV
+/// source, which can serve the miss from a `.kvb` instead. So
+/// `assert_prefill_measured` checks the outcome of every run rather than
+/// trusting either the constant or the clear.
 const BENCH_PROMPT_CACHE_SLOTS: usize = 1;
 
 /// Largest run-to-run trend a metric may show and still be summarised, as a
@@ -67,7 +73,66 @@ const BENCH_PROMPT_CACHE_SLOTS: usize = 1;
 /// line across its own runs cannot support either comparison, whichever way it
 /// moves — an improving ramp means the cell had not converged just as much as a
 /// degrading one does.
+///
+/// This is a floor, not the whole test: clearing it says the fitted change is
+/// *large*, not that it is a trend. See [`TREND_MIN_RESID_MULTIPLE`].
 const TREND_MAX_DRIFT_PCT: f64 = 10.0;
+
+/// How far the fitted change must exceed the cell's own residual scatter before
+/// it is called a trend.
+///
+/// The percentage floor alone has no noise anchoring, and at the default
+/// `--runs 3` the fit is thin enough for that to matter: with three runs the
+/// least-squares change reduces exactly to `last − first`, so the middle run
+/// contributes nothing but its share of the median and a single zig-zag reads
+/// as a slope. `[100, 118, 88]` fits to −12% and would be refused as a decline
+/// it plainly is not.
+///
+/// Requiring the fitted change to also dominate the scatter *about* the fitted
+/// line separates the two: on a real ramp the residuals are small next to the
+/// change (a measured 17.8 s → 25.5 s TTFT ramp fits 6831 ms against a 2×RMS of
+/// 1479), while on a zig-zag they are the same size as it (2×RMS 22.6 against a
+/// fitted 12). Two is the multiple because at three runs a zig-zag has the fixed
+/// residual pattern `(−k, +2k, −k)`, whose RMS is `k√2` — so its scatter is
+/// always the same order as the step that produced it, and a multiple of two
+/// puts the `[100, 118, 88]` case (2×RMS 22.6 vs fitted 12) on the refuse side
+/// with margin, while leaving real ramps — whose residuals are a small fraction
+/// of the change — several times clear of it.
+///
+/// Both conditions must hold. Refusing on scatter alone would abort settled
+/// cells (a tight cell has tiny residuals *and* a tiny change), and refusing on
+/// percentage alone is the noise-driven abort whose documented remedy — raise
+/// `--warmup` and re-measure — is measure-until-it-passes.
+const TREND_MIN_RESID_MULTIPLE: f64 = 2.0;
+
+/// Largest observed range a gated metric may show and still be summarised, as a
+/// percentage of its median. See [`Spread::range_pct`].
+///
+/// The trend gate only refuses movement that goes *one way*. A cell can fail to
+/// settle without trending — a single-run spike has slope zero at any
+/// magnitude, and a late-onset step fits to a smaller and smaller slope as
+/// `--runs` grows (a last-run jump of `d` fits to `1.33d` at three runs but only
+/// `0.29d` at twenty), so the operator's natural response to a noisy abort would
+/// otherwise make the guard weaker. The range gate closes both: it is
+/// order-blind on purpose, and refuses "did not settle" whichever shape it takes.
+///
+/// Fifteen percent, from this instrument's own measured settled cells — ten
+/// cells across gemma-4-e2b and Ternary-Bonsai-8B at 4k, 32k and 64k, all
+/// pinned in `a_settled_cell_clears_the_range_gate`. Most gated metrics of a
+/// settled cell range under 2% (tightest: 0.17%), but two settled cells on that
+/// same host produced a 7.56% TTFT range and a 7.09% decode-TPS range, and the
+/// widest *accepted* wobble on record is the 8.35% TTFT range pinned in
+/// `the_threshold_separates_warmup_wobble_from_a_ramp`. So the settled
+/// population is not 2%-wide, it has a ~8% tail, and a ceiling near 10% would
+/// leave that tail about 1.2× of margin — it would abort settled cells on a bad
+/// day. Fifteen sits at 1.8× the worst accepted case while still refusing a
+/// spike or a late step, which run to tens of percent.
+///
+/// Only [`Gate::Settled`] metrics are checked. `itl_p99_ms` in particular
+/// ranged 58.6% on a cell whose every other metric ranged under 2% — an
+/// extreme-order statistic has no settled range to speak of, which is why it is
+/// reported rather than gated.
+const SETTLED_MAX_RANGE_PCT: f64 = 15.0;
 
 // ---------------------------------------------------------------------------
 // Spread — a central value that carries its observed range
@@ -94,13 +159,14 @@ impl Spread {
     /// nothing, and returning a zero would be indistinguishable from a real
     /// measurement of zero.
     ///
-    /// Takes the sample by value and sorts it in place: the caller has already
-    /// built the vector, and a borrowing signature would only copy it again.
-    pub(crate) fn of(values: Vec<f64>) -> Option<Self> {
+    /// Borrows: every caller also needs the values in collection order for the
+    /// settle gates, so a by-value signature would have them clone first and
+    /// allocate exactly as often.
+    pub(crate) fn of(values: &[f64]) -> Option<Self> {
         if values.is_empty() {
             return None;
         }
-        let mut sorted = values;
+        let mut sorted = values.to_vec();
         sorted.sort_by(f64::total_cmp);
         let n = sorted.len();
         // Bounds: `sorted` is non-empty (checked above), so `first`/`last` are
@@ -167,20 +233,34 @@ pub(crate) fn percentile_sorted(sorted: &[f64], q: f64) -> Option<f64> {
 /// The test is the least-squares slope over the run index, scaled to the whole
 /// run sequence and expressed against the median. Ordinary regression rather
 /// than a monotonicity test on purpose: a real ramp with one noisy step is
-/// still a ramp, and would escape a strict-monotonic check the moment `--runs`
-/// grew past three.
+/// still a ramp, and would escape a strict-monotonic check once `--runs` grows
+/// past three. At exactly three runs that robustness is not there to be had —
+/// `mean_x` is 1 and the `ȳ` terms cancel, so the fitted change reduces
+/// *exactly* to `last − first` and the middle run contributes nothing but its
+/// share of the median. That degeneracy is why the percentage test is not the
+/// whole test.
 ///
-/// At the default three runs, a sample whose spread is very wide fits a slope
-/// in *whatever* order it arrives — with a 40%-wide sample, every permutation
-/// clears the threshold. That is not a flaw to tune away: three runs cannot
-/// separate a ramp from that much noise, and a cell that noisy has no
-/// trustworthy median either. Both are refused, which is the safe direction;
-/// the error prints the values in run order so the operator can see which it
-/// was.
+/// Two conditions, both necessary. The fitted change must clear
+/// [`TREND_MAX_DRIFT_PCT`] of the median — it has to be *large* — and it must
+/// also exceed [`TREND_MIN_RESID_MULTIPLE`] times the RMS of the residuals about
+/// the fitted line — it has to be large *relative to the cell's own scatter*. A
+/// percentage alone cannot tell a ramp from a zig-zag at three runs, where the
+/// fit degenerates to `last − first`; the residual test is what supplies the
+/// missing noise anchoring.
+///
+/// The residual RMS divides by `n`, not by the regression's `n − 2` degrees of
+/// freedom. With the default three runs `n − 2` is one, and the resulting
+/// estimate swings by a factor of `√3` for no gain: the quantity wanted here is
+/// "how far do these points sit off the line", not an unbiased variance.
+///
+/// At the two-run minimum the line passes through both points, so the residual
+/// RMS is exactly zero and the percentage floor governs alone. That is the right
+/// answer rather than a gap: with two points there is no scatter to measure, and
+/// anything else would be inventing one.
 ///
 /// `None` when there is no trend worth refusing over: fewer than two runs (no
 /// order to speak of), a zero median (no scale to express the change against),
-/// or a fitted change within [`TREND_MAX_DRIFT_PCT`].
+/// or a fitted change that fails either condition.
 pub(crate) fn detect_drift(values_in_order: &[f64], median: f64) -> Option<f64> {
     let n = values_in_order.len();
     if n < 2 || median == 0.0 {
@@ -206,26 +286,59 @@ pub(crate) fn detect_drift(values_in_order: &[f64], median: f64) -> Option<f64> 
     if sxx == 0.0 {
         return None;
     }
-    // Slope per run, scaled across the whole sequence: first run to last.
-    let pct_of_median = sxy / sxx * (n_f - 1.0) / median.abs() * 100.0;
-    (pct_of_median.abs() > TREND_MAX_DRIFT_PCT).then_some(pct_of_median)
+    let slope = sxy / sxx;
+    // Change across the whole sequence: first measured run to last.
+    let fitted_change = slope * (n_f - 1.0);
+    let pct_of_median = fitted_change / median.abs() * 100.0;
+    if pct_of_median.abs() <= TREND_MAX_DRIFT_PCT {
+        return None;
+    }
+    // Scatter about the fitted line. A change that does not dominate this is a
+    // sample that happens to end higher than it started, not a trend.
+    let mut sq_resid = 0.0_f64;
+    for (i, y) in values_in_order.iter().enumerate() {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "i indexes the run count — single digits in every real invocation"
+        )]
+        let dx = i as f64 - mean_x;
+        let resid = y - (mean_y + slope * dx);
+        sq_resid += resid * resid;
+    }
+    let resid_rms = (sq_resid / n_f).sqrt();
+    (fitted_change.abs() > TREND_MIN_RESID_MULTIPLE * resid_rms).then_some(pct_of_median)
 }
 
-/// Refuse to summarise a metric that trended across its own runs.
-fn assert_no_drift(name: &str, values_in_order: &[f64], median: f64) -> anyhow::Result<()> {
-    let Some(pct) = detect_drift(values_in_order, median) else {
-        return Ok(());
-    };
-    let direction = if pct > 0.0 { "rose" } else { "fell" };
+/// Why a metric cannot be summarised as one cell, or `None` when it settled.
+///
+/// Two shapes of not-settling, checked in order of how specific the diagnosis
+/// is. A trend names *which way* the cell was moving and has a remedy (more
+/// warmup); a wide range only says the runs never converged, and its remedy is
+/// the host, not the run count. Reported as a string rather than raised here so
+/// the caller can name every metric that failed instead of only the first.
+fn settle_refusal(name: &str, values_in_order: &[f64], spread: &Spread) -> Option<String> {
     let ordered: Vec<String> = values_in_order.iter().map(|v| format!("{v:.3}")).collect();
-    Err(anyhow::anyhow!(
-        "{name} {direction} {:.1}% from the first measured run to the last ({}, in run order): \
-         this is a trend, not a spread, and its median is not a measurement. The cell had not \
-         reached a steady state — raise --warmup until consecutive runs agree, or measure a \
-         cell that settles",
-        pct.abs(),
-        ordered.join(" → ")
-    ))
+    let ordered = ordered.join(" → ");
+    if let Some(pct) = detect_drift(values_in_order, spread.median) {
+        let direction = if pct > 0.0 { "rose" } else { "fell" };
+        return Some(format!(
+            "{name} {direction} {:.1}% from the first measured run to the last ({ordered}, in \
+             run order): this is a trend, not a spread, and its median is not a measurement. \
+             The cell had not reached a steady state — raise --warmup until consecutive runs \
+             agree, or measure a cell that settles",
+            pct.abs(),
+        ));
+    }
+    let range_pct = spread.range_pct();
+    if range_pct > SETTLED_MAX_RANGE_PCT {
+        return Some(format!(
+            "{name} spanned {range_pct:.1}% of its median across the measured runs ({ordered}, \
+             in run order), over the {SETTLED_MAX_RANGE_PCT:.0}% ceiling: the runs never \
+             converged on a value, so the median is the middle of a scatter rather than a \
+             measurement. Quiet the host, or measure a cell that settles"
+        ));
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -262,11 +375,18 @@ fn kv_bytes_or_reason(verdict: KvBytesVerdict, arch_class: &str) -> anyhow::Resu
 /// the two at the call site type-checks, passes every test that builds tuples
 /// directly, and silently inverts the guard.
 ///
-/// Two conditions, both necessary:
+/// Three conditions, all necessary:
 ///
 /// - **`hits == 0`.** A hit means the post-prefill KV snapshot was replayed, so
 ///   the run's TTFT is a cache-replay time, not a time-to-first-token — a
 ///   number that is small, stable, and wrong.
+/// - **`ssd_hits == 0`.** A RAM miss that the SSD tier served is *also* a
+///   skipped prefill, and it does not show up in `hits`: `hydrate_from_ssd`
+///   bumps its own counter after `find_best_prefix` has already recorded the
+///   miss. Clearing the RAM slots does not detach the SSD source, so the
+///   emptied-cache guarantee that makes `hits == 0, misses == 1` mean "a real
+///   prefill ran" holds only while nothing hydrates. Reading the run's TTFT off
+///   a `.kvb` reconstruction is the same defect wearing a different counter.
 /// - **`misses >= 1`.** The cache was consulted and did not serve this run, so
 ///   a prefill genuinely happened. Counters that report nothing certify
 ///   nothing.
@@ -277,7 +397,13 @@ fn kv_bytes_or_reason(verdict: KvBytesVerdict, arch_class: &str) -> anyhow::Resu
 /// under stable counters a repeat that was served shows `hits > 0`, and after a
 /// clear the run shows `hits == 0, misses == 1`.
 pub(crate) fn assert_prefill_measured(stats: Option<&CacheStats>) -> anyhow::Result<()> {
-    let Some(&CacheStats { hits, misses, .. }) = stats else {
+    let Some(&CacheStats {
+        hits,
+        misses,
+        ssd_hits,
+        ..
+    }) = stats
+    else {
         return Err(anyhow::anyhow!(
             "measured run reported no prompt-cache stats, so nothing certifies that it \
              performed a prefill rather than replaying a snapshot. Refusing to report its \
@@ -289,6 +415,14 @@ pub(crate) fn assert_prefill_measured(stats: Option<&CacheStats>) -> anyhow::Res
             "measured run was served from the prompt cache ({hits} hit(s), {misses} miss(es)): \
              prefill was skipped, so its TTFT and prefill throughput are cache-replay times, \
              not measurements. Refusing to report them"
+        ));
+    }
+    if ssd_hits > 0 {
+        return Err(anyhow::anyhow!(
+            "measured run was served from the SSD KV tier ({ssd_hits} hydrate(s)): the RAM \
+             cache missed, but the blocks were reconstructed from a .kvb file instead of \
+             being prefilled, so its TTFT is a hydrate time. Emptying the RAM slots does not \
+             detach the SSD source. Refusing to report it"
         ));
     }
     if misses == 0 {
@@ -569,7 +703,117 @@ fn measure_one(
     )
 }
 
+// ---------------------------------------------------------------------------
+// Metrics — one enumeration, one gate decision each
+// ---------------------------------------------------------------------------
+
+/// What the summary requires of a metric before it will report it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Gate {
+    /// The cell must have settled in this metric: no run-to-run trend, and a
+    /// range narrow enough to be noise around a centre.
+    Settled,
+    /// Reported with its spread, never gated. Each metric that opts out states
+    /// why on [`Metric::gate`].
+    Ungated,
+}
+
+/// Every metric one bench cell reports.
+///
+/// The point of the enum is [`Metric::gate`]: whether a metric is checked for
+/// settling used to be positional — a call that was made for some metrics and
+/// simply absent for others — so a metric added later inherited whichever
+/// treatment its author happened to copy. Here the exhaustive match makes the
+/// choice mandatory: a new variant does not compile until it names its gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Metric {
+    TtftMs,
+    DecodeTps,
+    PrefillTps,
+    ItlP50Ms,
+    ItlP99Ms,
+    KvCacheBytes,
+}
+
+impl Metric {
+    /// Reporting order, which is also summary-row order.
+    pub(crate) const ALL: [Self; 6] = [
+        Self::TtftMs,
+        Self::ItlP50Ms,
+        Self::ItlP99Ms,
+        Self::DecodeTps,
+        Self::PrefillTps,
+        Self::KvCacheBytes,
+    ];
+
+    /// Label used in the summary and in every refusal message.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::TtftMs => "ttft_ms",
+            Self::DecodeTps => "decode_tps",
+            Self::PrefillTps => "prefill_tps",
+            Self::ItlP50Ms => "itl_p50_ms",
+            Self::ItlP99Ms => "itl_p99_ms",
+            Self::KvCacheBytes => "kv_cache_bytes",
+        }
+    }
+
+    /// Whether the cell has to have settled in this metric.
+    #[allow(
+        clippy::match_same_arms,
+        reason = "the two ungated metrics opt out for unrelated reasons and each states its own; \
+                  merging the arms would drop one of the two justifications and leave the next \
+                  metric added inheriting whichever it landed beside"
+    )]
+    pub(crate) const fn gate(self) -> Gate {
+        match self {
+            // The three robust per-run quantities plus the byte total. These
+            // are what a decision gets made on, so a cell that has not settled
+            // in any of them cannot support one.
+            Self::TtftMs | Self::DecodeTps | Self::ItlP50Ms | Self::KvCacheBytes => Gate::Settled,
+
+            // Nearest-rank p99 over a 128-token run is the second-largest
+            // inter-token gap: an extreme-order statistic whose run-to-run
+            // movement is dominated by whether that one run happened to hit a
+            // stall, not by whether the cell has settled. Measured gemma-4-e2b
+            // at 4k: ttft, decode TPS and ITL p50 all moved 5-6% across three
+            // runs while p99 moved 26%. Gating it would abort cells whose
+            // measurements are fine; its spread is still printed, so the tail
+            // stays visible.
+            Self::ItlP99Ms => Gate::Ungated,
+
+            // An exact deterministic reciprocal of `ttft_ms` — the prompt is
+            // identical in every run of a cell, so `prompt_tokens / ttft` adds
+            // no independent evidence. Gating it would test `ttft_ms` twice
+            // under a nonlinear transform, and the two could disagree purely on
+            // where the middle run landed. `ttft_ms` carries the gate.
+            Self::PrefillTps => Gate::Ungated,
+        }
+    }
+
+    /// This metric's per-run values in collection order.
+    ///
+    /// `None` when a run could not produce the quantity at all — only
+    /// [`Metric::PrefillTps`] can be absent, and a cell where only some runs
+    /// have one is not a cell.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "KV byte totals are far below 2^53; f64 is exact over the whole range"
+    )]
+    fn values(self, samples: &[RunSample]) -> Option<Vec<f64>> {
+        match self {
+            Self::TtftMs => Some(samples.iter().map(|s| s.ttft_ms).collect()),
+            Self::DecodeTps => Some(samples.iter().map(|s| s.decode_tps).collect()),
+            Self::PrefillTps => samples.iter().map(|s| s.prefill_tps).collect(),
+            Self::ItlP50Ms => Some(samples.iter().map(|s| s.itl_p50_ms).collect()),
+            Self::ItlP99Ms => Some(samples.iter().map(|s| s.itl_p99_ms).collect()),
+            Self::KvCacheBytes => Some(samples.iter().map(|s| s.kv_cache_bytes as f64).collect()),
+        }
+    }
+}
+
 /// Summary of one bench cell.
+#[derive(Debug)]
 struct BenchSummary {
     ttft_ms: Spread,
     decode_tps: Spread,
@@ -583,65 +827,54 @@ struct BenchSummary {
     token_digest: u64,
 }
 
-/// Fold the measured runs into per-metric spreads, refusing any metric that
-/// trended across the runs instead of settling.
+/// Fold the measured runs into per-metric spreads, refusing any metric in which
+/// the cell did not settle.
 ///
-/// Errors when `samples` is empty, and when any checked metric drifted. Every
-/// metric is summarised from the same runs, so either all of them exist or none
-/// do — there is no partial summary.
+/// Errors when `samples` is empty, and when any [`Gate::Settled`] metric
+/// trended or scattered. Every metric is summarised from the same runs, so
+/// either all of them exist or none do — there is no partial summary.
+///
+/// Every gated metric is checked before anything is refused, so the error names
+/// *all* of them. Refusing at the first one hides how much of the cell moved,
+/// which is the difference between "one metric wobbled" and "the whole run was
+/// contended".
 fn summarize(samples: &[RunSample]) -> anyhow::Result<BenchSummary> {
     let missing = || anyhow::anyhow!("no measured runs completed — nothing to summarise");
 
-    // Each metric is checked for a trend *in collection order* before its
-    // order-blind spread is accepted.
-    let checked = |name: &str, f: fn(&RunSample) -> f64| -> anyhow::Result<Spread> {
-        let in_order: Vec<f64> = samples.iter().map(f).collect();
-        let spread = Spread::of(in_order.clone()).ok_or_else(missing)?;
-        assert_no_drift(name, &in_order, spread.median)?;
-        Ok(spread)
-    };
-
-    let ttft_ms = checked("ttft_ms", |s| s.ttft_ms)?;
-    let decode_tps = checked("decode_tps", |s| s.decode_tps)?;
-    let itl_p50_ms = checked("itl_p50_ms", |s| s.itl_p50_ms)?;
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "KV byte totals are far below 2^53; f64 is exact over the whole range"
-    )]
-    let kv_bytes = checked("kv_cache_bytes", |s| s.kv_cache_bytes as f64)?;
-
-    // `itl_p99_ms` is deliberately NOT drift-checked. Nearest-rank p99 over a
-    // 128-token run is the second-largest inter-token gap: an extreme-order
-    // statistic whose run-to-run movement is dominated by whether that one run
-    // happened to hit a stall, not by whether the cell has settled. Measured
-    // gemma-4-e2b at 4k: ttft, decode TPS and ITL p50 all moved 5-6% across
-    // three runs while p99 moved 26% — checking it would abort cells whose
-    // measurements are fine. Its spread is still printed, so the tail stays
-    // visible; it is just not evidence of a trend.
-    let itl_p99_ms =
-        Spread::of(samples.iter().map(|s| s.itl_p99_ms).collect()).ok_or_else(missing)?;
-
-    // Prefill throughput is present only if every run produced one.
-    let prefill_in_order: Option<Vec<f64>> = samples.iter().map(|s| s.prefill_tps).collect();
-    let prefill_tps = match prefill_in_order {
-        Some(v) => {
-            let spread = Spread::of(v.clone()).ok_or_else(missing)?;
-            assert_no_drift("prefill_tps", &v, spread.median)?;
-            Some(spread)
+    let mut spreads: Vec<(Metric, Spread)> = Vec::with_capacity(Metric::ALL.len());
+    let mut refusals: Vec<String> = Vec::new();
+    for metric in Metric::ALL {
+        let Some(in_order) = metric.values(samples) else {
+            continue;
+        };
+        let spread = Spread::of(&in_order).ok_or_else(missing)?;
+        if metric.gate() == Gate::Settled {
+            refusals.extend(settle_refusal(metric.name(), &in_order, &spread));
         }
-        None => None,
-    };
+        spreads.push((metric, spread));
+    }
+    if !refusals.is_empty() {
+        return Err(anyhow::anyhow!(
+            "this cell did not settle in {} of its {} gated metric(s), so it has no median to \
+             report:\n  - {}",
+            refusals.len(),
+            Metric::ALL
+                .iter()
+                .filter(|m| m.gate() == Gate::Settled)
+                .count(),
+            refusals.join("\n  - ")
+        ));
+    }
 
-    let token_digest = samples.first().ok_or_else(missing)?.token_digest;
-
+    let get = |metric: Metric| spreads.iter().find(|(m, _)| *m == metric).map(|&(_, s)| s);
     Ok(BenchSummary {
-        ttft_ms,
-        decode_tps,
-        prefill_tps,
-        itl_p50_ms,
-        itl_p99_ms,
-        kv_bytes,
-        token_digest,
+        ttft_ms: get(Metric::TtftMs).ok_or_else(missing)?,
+        decode_tps: get(Metric::DecodeTps).ok_or_else(missing)?,
+        prefill_tps: get(Metric::PrefillTps),
+        itl_p50_ms: get(Metric::ItlP50Ms).ok_or_else(missing)?,
+        itl_p99_ms: get(Metric::ItlP99Ms).ok_or_else(missing)?,
+        kv_bytes: get(Metric::KvCacheBytes).ok_or_else(missing)?,
+        token_digest: samples.first().ok_or_else(missing)?.token_digest,
     })
 }
 
@@ -673,7 +906,7 @@ fn prepare_prompt(args: &BenchArgs, tokenizer: &tokenizers::Tokenizer) -> anyhow
     Ok(prompt_ids)
 }
 
-/// Check that a run decoded the same tokens as the cell's first run.
+/// Check that every run of the cell decoded the same tokens.
 ///
 /// Every run in a cell feeds the same prompt to the same model at temperature 0
 /// with a fixed seed, so every run must emit a byte-identical token stream. A
@@ -684,16 +917,44 @@ fn prepare_prompt(args: &BenchArgs, tokenizer: &tokenizers::Tokenizer) -> anyhow
 /// beyond reproducibility: a KV cache that silently stops being written decodes
 /// *faster* while producing wrong tokens, so a timing-only instrument is biased
 /// toward accepting exactly that defect.
-fn assert_same_token_stream(label: &str, expected: u64, got: u64) -> anyhow::Result<()> {
-    if expected == got {
+///
+/// The reference is the **most common** digest, not the first run's. Anchoring
+/// on run 1 makes a cold-start defect — the case a repeated-run instrument is
+/// most likely to meet — report every *later* run as the deviant one, pointing
+/// the operator away from the run that actually misbehaved. The message lists
+/// every run with its digest either way, so a two-run cell with no majority is
+/// still fully described.
+fn assert_one_token_stream(runs: &[(String, u64)]) -> anyhow::Result<()> {
+    let mut counts: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    for &(_, digest) in runs {
+        *counts.entry(digest).or_insert(0) += 1;
+    }
+    if counts.len() <= 1 {
         return Ok(());
     }
+    // Ties broken by the smaller digest, so the message is deterministic.
+    let (majority, majority_n) = counts
+        .into_iter()
+        .max_by_key(|&(digest, n)| (n, std::cmp::Reverse(digest)))
+        .ok_or_else(|| anyhow::anyhow!("no runs to compare token streams across"))?;
+    let listing: Vec<String> = runs
+        .iter()
+        .map(|(label, digest)| {
+            let mark = if *digest == majority {
+                ""
+            } else {
+                "  <-- differs"
+            };
+            format!("{label}: {digest:#018x}{mark}")
+        })
+        .collect();
     Err(anyhow::anyhow!(
-        "{label} decoded a different token stream than the first run of this cell \
-         (digest {got:#018x} vs {expected:#018x}). Every run here decodes the same prompt at \
-         temperature 0, so the runs are not repeats of one measurement — and a cache that \
-         stops being written decodes faster while producing wrong tokens. Refusing to \
-         summarise them as one cell"
+        "the runs of this cell decoded different token streams, so they are not repeats of one \
+         measurement — and a cache that stops being written decodes faster while producing \
+         wrong tokens. Most common digest {majority:#018x} ({majority_n} of {} run(s)):\n  {}\n\
+         Refusing to summarise them as one cell",
+        runs.len(),
+        listing.join("\n  ")
     ))
 }
 
@@ -710,35 +971,32 @@ fn collect_samples(
 ) -> anyhow::Result<Vec<RunSample>> {
     // The warmup runs are discarded as measurements, but their tokens are still
     // evidence: a warmup that decodes something else than the measured runs is
-    // the same defect and costs nothing to catch.
-    let mut expected_digest: Option<u64> = None;
-    let mut check_digest = |label: &str, s: &RunSample| -> anyhow::Result<()> {
-        match expected_digest {
-            None => {
-                expected_digest = Some(s.token_digest);
-                Ok(())
-            }
-            Some(e) => assert_same_token_stream(label, e, s.token_digest),
-        }
-    };
+    // the same defect and costs nothing to catch. Digests are compared once, at
+    // the end, over every run — see `assert_one_token_stream`.
+    let mut digests: Vec<(String, u64)> = Vec::with_capacity((args.warmup + args.runs) as usize);
 
     for i in 0..args.warmup {
         info!(run = i + 1, of = args.warmup, "bench: warmup run");
         let s = measure_one(model, tokenizer, prompt_ids, args)
             .map_err(|e| anyhow::anyhow!("warmup run {} failed: {e}", i + 1))?;
-        check_digest(&format!("warmup run {}", i + 1), &s)?;
+        digests.push((format!("warmup run {}", i + 1), s.token_digest));
     }
 
     let mut samples: Vec<RunSample> = Vec::with_capacity(args.runs as usize);
     for i in 0..args.runs {
         let s = measure_one(model, tokenizer, prompt_ids, args)
             .map_err(|e| anyhow::anyhow!("measured run {} failed: {e}", i + 1))?;
-        check_digest(&format!("measured run {}", i + 1), &s)?;
+        digests.push((format!("measured run {}", i + 1), s.token_digest));
+        // Every reported metric appears here, so a run that the summary later
+        // refuses is still recoverable from the log — including `prefill_tps`,
+        // which is otherwise only ever printed as part of a summary that a
+        // refusal discards.
         info!(
             run = i + 1,
             of = args.runs,
             ttft_ms = s.ttft_ms,
             decode_tps = s.decode_tps,
+            prefill_tps = s.prefill_tps,
             itl_p50_ms = s.itl_p50_ms,
             itl_p99_ms = s.itl_p99_ms,
             kv_cache_bytes = s.kv_cache_bytes,
@@ -747,6 +1005,7 @@ fn collect_samples(
         );
         samples.push(s);
     }
+    assert_one_token_stream(&digests)?;
     Ok(samples)
 }
 

@@ -29,6 +29,13 @@ fn cache_stats(hits: u64, misses: u64) -> CacheStats {
     s
 }
 
+/// The same counters, plus the SSD-tier hydrate count.
+fn cache_stats_ssd(hits: u64, misses: u64, ssd_hits: u64) -> CacheStats {
+    let mut s = cache_stats(hits, misses);
+    s.ssd_hits = ssd_hits;
+    s
+}
+
 // ── KV bytes: three states, not two ─────────────────────────────────
 
 /// The load-bearing case. A generation that never reached its KV-byte store
@@ -156,20 +163,39 @@ fn a_hit_is_refused_regardless_of_miss_count() {
     assert!(assert_prefill_measured(Some(&cache_stats(7, 0))).is_err());
 }
 
+/// The shape that gets past a hits/misses-only guard: emptying the RAM slots
+/// does not detach the SSD source, so the run misses in RAM (`hits == 0`,
+/// `misses == 1` — a clean bill of health) and is then served by hydrating a
+/// `.kvb`. Its "TTFT" is a reconstruction time.
+#[test]
+fn an_ssd_hydrate_is_refused_even_though_it_looks_like_a_clean_miss() {
+    let hydrated = cache_stats_ssd(0, 1, 1);
+    assert!(
+        assert_prefill_measured(Some(&cache_stats(0, 1))).is_ok(),
+        "the same counters without the hydrate are a genuine prefill"
+    );
+    let msg = assert_prefill_measured(Some(&hydrated))
+        .expect_err("a hydrated run did not prefill")
+        .to_string();
+    assert!(msg.contains("SSD KV tier"), "got: {msg}");
+    // And it is a distinct diagnosis from a RAM hit — the operator needs to
+    // know which tier served it.
+    let ram_hit = assert_prefill_measured(Some(&cache_stats(1, 1)))
+        .expect_err("a RAM hit did not prefill either")
+        .to_string();
+    assert_ne!(msg, ram_hit);
+}
+
 // ── Spread: no central value without its range ─────────────────────
 
 #[test]
 fn spread_of_empty_sample_is_none() {
-    assert_eq!(
-        Spread::of(Vec::new()),
-        None,
-        "a median of nothing is not zero"
-    );
+    assert_eq!(Spread::of(&[]), None, "a median of nothing is not zero");
 }
 
 #[test]
 fn spread_reports_median_and_observed_range() {
-    let s = Spread::of(vec![110.0, 100.0, 105.0]).expect("non-empty");
+    let s = Spread::of(&[110.0, 100.0, 105.0]).expect("non-empty");
     assert!((s.median - 105.0).abs() < 1e-9);
     assert!((s.min - 100.0).abs() < 1e-9);
     assert!((s.max - 110.0).abs() < 1e-9);
@@ -184,7 +210,7 @@ fn spread_reports_median_and_observed_range() {
 
 #[test]
 fn spread_median_of_even_sample_averages_the_middle_two() {
-    let s = Spread::of(vec![1.0, 2.0, 3.0, 4.0]).expect("non-empty");
+    let s = Spread::of(&[1.0, 2.0, 3.0, 4.0]).expect("non-empty");
     assert!((s.median - 2.5).abs() < 1e-9);
 }
 
@@ -192,8 +218,8 @@ fn spread_median_of_even_sample_averages_the_middle_two() {
 /// same thing — that collapse is what made single-run numbers look conclusive.
 #[test]
 fn equal_medians_with_different_stability_are_distinguishable() {
-    let tight = Spread::of(vec![99.9, 100.0, 100.1]).expect("non-empty");
-    let loose = Spread::of(vec![70.0, 100.0, 130.0]).expect("non-empty");
+    let tight = Spread::of(&[99.9, 100.0, 100.1]).expect("non-empty");
+    let loose = Spread::of(&[70.0, 100.0, 130.0]).expect("non-empty");
     assert!((tight.median - loose.median).abs() < 1e-9);
     assert!(
         loose.range_pct() > tight.range_pct() * 10.0,
@@ -368,6 +394,13 @@ fn unparseable_loadavg_is_absent_not_zero() {
 
 // ── Drift: a trend is not a spread ──────────────────────────────────
 
+/// Settle a metric the way `summarize` does, so the tests exercise both gates
+/// together rather than either one in isolation.
+fn settle(name: &str, values_in_order: &[f64]) -> Option<String> {
+    let spread = Spread::of(values_in_order).expect("non-empty sample");
+    settle_refusal(name, values_in_order, &spread)
+}
+
 /// The measured case this guard was built for: gemma-4-e2b at 64k, three
 /// consecutive in-process generations, TTFT in milliseconds. `Spread` sorts,
 /// so it reports this as a wide range around a median; in collection order it
@@ -375,29 +408,31 @@ fn unparseable_loadavg_is_absent_not_zero() {
 #[test]
 fn measured_ttft_ramp_is_detected_as_drift() {
     let in_order = [17_769.4, 22_764.3, 25_475.1];
-    let spread = Spread::of(in_order.to_vec()).expect("non-empty");
+    let spread = Spread::of(&in_order).expect("non-empty");
     let pct = detect_drift(&in_order, spread.median).expect("a 43% ramp is a trend");
     assert!(
         pct > 30.0,
         "fitted drift {pct:.1}% understates a 17.8s → 25.5s ramp"
     );
-    let err = assert_no_drift("ttft_ms", &in_order, spread.median)
-        .expect_err("a drifting metric must not be summarised");
-    let msg = err.to_string();
+    let msg = settle("ttft_ms", &in_order).expect("a drifting metric must not be summarised");
     assert!(msg.contains("trend, not a spread"), "got: {msg}");
     assert!(msg.contains("rose"), "must name the direction: {msg}");
 }
 
-/// Order is the whole point: a one-run spike that starts and ends at the same
-/// place is spread, while the same magnitude of movement spent going one way is
-/// a trend. `Spread` cannot tell them apart, because it sorts before it looks —
-/// both of these produce an identical median and an identical range.
+/// Order is the whole point for the *trend* gate: a one-run spike that starts
+/// and ends at the same place has slope zero, while the same magnitude of
+/// movement spent going one way is a trend.
+///
+/// A spike is still not a settled cell, though, and at 30% of the median it is
+/// nowhere near one — so it is the range gate, not the trend gate, that refuses
+/// it. Both must be present: the trend gate alone would pass a spike of any
+/// magnitude whatsoever.
 #[test]
 fn a_spike_is_spread_but_a_ramp_is_drift() {
     let spike = [100.0, 130.0, 100.0];
     let ramp = [100.0, 115.0, 130.0];
-    let spike_spread = Spread::of(spike.to_vec()).expect("non-empty");
-    let ramp_spread = Spread::of(ramp.to_vec()).expect("non-empty");
+    let spike_spread = Spread::of(&spike).expect("non-empty");
+    let ramp_spread = Spread::of(&ramp).expect("non-empty");
     assert!(
         (spike_spread.max - ramp_spread.max).abs() < 1e-9
             && (spike_spread.min - ramp_spread.min).abs() < 1e-9,
@@ -412,6 +447,46 @@ fn a_spike_is_spread_but_a_ramp_is_drift() {
         detect_drift(&ramp, ramp_spread.median).is_some(),
         "the same movement spent going one way is a trend"
     );
+    let spike_msg = settle("ttft_ms", &spike).expect("a 30% spike is not a settled cell");
+    assert!(
+        spike_msg.contains("never converged"),
+        "a spike must be refused by the range gate, not the trend gate: {spike_msg}"
+    );
+}
+
+/// An unbounded spike is the shape the trend gate cannot see at all: slope
+/// stays zero however large it gets, so without a range gate a 40%-wide cell
+/// would be summarised as if its median meant something.
+#[test]
+fn an_arbitrarily_large_spike_is_still_refused() {
+    for magnitude in [140.0, 300.0, 10_000.0] {
+        let spike = [100.0, magnitude, 100.0];
+        assert_eq!(
+            detect_drift(&spike, 100.0),
+            None,
+            "a spike has no slope at any magnitude — {magnitude} must not read as a trend"
+        );
+        assert!(
+            settle("ttft_ms", &spike).is_some(),
+            "spike of {magnitude} must still be refused as unsettled"
+        );
+    }
+}
+
+/// Late-onset drift: the fitted change of a single last-run jump shrinks as
+/// `--runs` grows (`6d(n−1)/n²` — `1.33d` at 3 runs, `0.29d` at 20), so raising
+/// `--runs` in response to a noisy abort would otherwise make the guard weaker.
+/// The range gate does not care how many runs the jump is diluted across.
+#[test]
+fn a_late_onset_step_is_refused_however_many_runs_dilute_it() {
+    for n in [3_usize, 10, 20] {
+        let mut values: Vec<f64> = std::iter::repeat_n(100.0, n - 1).collect();
+        values.push(130.0); // a +30% jump on the final run
+        assert!(
+            settle("decode_tps", &values).is_some(),
+            "a +30% final-run step over {n} runs must be refused"
+        );
+    }
 }
 
 /// Decode TPS falling across runs is the same defect with the opposite sign —
@@ -419,13 +494,35 @@ fn a_spike_is_spread_but_a_ramp_is_drift() {
 #[test]
 fn a_falling_metric_drifts_too() {
     let in_order = [129.24, 126.74, 115.59];
-    let spread = Spread::of(in_order.to_vec()).expect("non-empty");
+    let spread = Spread::of(&in_order).expect("non-empty");
     let pct = detect_drift(&in_order, spread.median).expect("a 10.6% decline is a trend");
     assert!(pct < 0.0, "direction must be signed");
-    let msg = assert_no_drift("decode_tps", &in_order, spread.median)
-        .expect_err("a falling metric is still drifting")
-        .to_string();
+    let msg = settle("decode_tps", &in_order).expect("a falling metric is still drifting");
     assert!(msg.contains("fell"), "got: {msg}");
+}
+
+/// A zig-zag is scatter, not a trend. With three runs the fitted change reduces
+/// to `last − first`, so the middle run contributes nothing and this sample
+/// fits a −12% "decline" it plainly does not have. Its residuals about the
+/// fitted line are twice the size of the change (2×RMS 22.6 vs 12), which is
+/// what the noise anchoring exists to notice.
+#[test]
+fn a_zig_zag_is_scatter_not_a_trend() {
+    let in_order = [100.0, 118.0, 88.0];
+    assert_eq!(
+        detect_drift(&in_order, 100.0),
+        None,
+        "a sample that jumped up and then further down is not a ramp, however far the \
+         endpoints happen to sit apart"
+    );
+    // It is still not a settled cell — the *range* gate is what refuses it, and
+    // it says so as scatter rather than as a decline.
+    let msg = settle("decode_tps", &in_order).expect("30% of the median is not settled");
+    assert!(msg.contains("never converged"), "got: {msg}");
+    assert!(
+        !msg.contains("fell"),
+        "a zig-zag must not be reported as a direction: {msg}"
+    );
 }
 
 /// A settled cell must pass. These are the measured gemma-4-e2b ITL p50 values
@@ -434,9 +531,9 @@ fn a_falling_metric_drifts_too() {
 #[test]
 fn a_settled_metric_is_not_drift() {
     let in_order = [9.455, 9.840, 9.538];
-    let spread = Spread::of(in_order.to_vec()).expect("non-empty");
+    let spread = Spread::of(&in_order).expect("non-empty");
     assert_eq!(detect_drift(&in_order, spread.median), None);
-    assert!(assert_no_drift("itl_p50_ms", &in_order, spread.median).is_ok());
+    assert_eq!(settle("itl_p50_ms", &in_order), None);
 }
 
 /// A constant metric has no trend and no scale problem. Measured KV bytes are
@@ -454,6 +551,8 @@ fn a_constant_metric_is_not_drift() {
 #[test]
 fn the_threshold_separates_warmup_wobble_from_a_ramp() {
     // Settled-enough: measured ttft, decode TPS and ITL p50 from one cell.
+    // Checked through the whole settle decision, not just the trend half — a
+    // range gate tightened past these would abort cells that are fine.
     for (name, v, med) in [
         ("ttft_ms", [209.207, 215.761, 198.285], 209.207),
         ("decode_tps", [119.178, 121.846, 126.562], 121.846),
@@ -464,9 +563,105 @@ fn the_threshold_separates_warmup_wobble_from_a_ramp() {
             None,
             "{name} is ordinary warmup wobble and must not abort the cell"
         );
+        assert_eq!(
+            settle(name, &v),
+            None,
+            "{name} is ordinary warmup wobble and must clear both gates"
+        );
     }
     // A real ramp from the same model at 64k must still be caught.
     assert!(detect_drift(&[17_065.0, 22_768.2, 24_684.6], 22_768.2).is_some());
+    assert!(settle("ttft_ms", &[17_065.0, 22_768.2, 24_684.6]).is_some());
+}
+
+/// The range ceiling is calibrated against cells this instrument itself
+/// measured as settled: gemma-4-e2b at 64k and Ternary-Bonsai-8B at 4k, 32k and
+/// 64k, all `--kv-quant none --runs 3` on an 18-core host carrying a 1-minute
+/// load of 3.4-16.3. Every gated metric of a settled cell must clear the
+/// ceiling, or the ceiling is refusing measurements rather than protecting them.
+///
+/// Both groups matter. The tight group is what the instrument looks like when
+/// nothing goes wrong; the wide group is the same instrument, same models, on a
+/// host that hiccupped once mid-cell — still a settled cell, and the reason the
+/// ceiling is not set near the tight group.
+#[test]
+fn a_settled_cell_clears_the_range_gate() {
+    // Tight: most gated metrics of a settled cell live here.
+    for (cell, name, v) in [
+        (
+            "e2b-64k w3",
+            "ttft_ms",
+            [22_562.683, 22_632.198, 22_776.669],
+        ),
+        ("e2b-64k w3", "itl_p50_ms", [9.855, 9.942, 9.998]),
+        ("bonsai-4k w0", "decode_tps", [137.677, 138.533, 136.919]),
+        ("bonsai-4k w1", "itl_p50_ms", [7.122, 6.980, 7.128]),
+        (
+            "bonsai-32k w2",
+            "ttft_ms",
+            [19_510.139, 19_522.153, 19_543.872],
+        ),
+        ("bonsai-32k w2", "decode_tps", [66.474, 65.434, 65.330]),
+        (
+            "bonsai-64k w0",
+            "ttft_ms",
+            [58_050.704, 59_936.437, 59_895.033],
+        ),
+        ("bonsai-64k w0", "decode_tps", [39.640, 38.301, 39.072]),
+    ] {
+        let spread = Spread::of(&v).expect("non-empty");
+        assert!(
+            spread.range_pct() < SETTLED_MAX_RANGE_PCT / 4.0,
+            "{cell} {name} is a tight settled cell and must clear the \
+             {SETTLED_MAX_RANGE_PCT}% ceiling with at least 4x margin, observed range {:.2}%",
+            spread.range_pct()
+        );
+        assert_eq!(settle(name, &v), None, "{cell} {name} must not be refused");
+    }
+
+    // Wide but still settled: one run of the cell caught a host hiccup. These
+    // are what stops the ceiling from being set near the tight group — at 10%
+    // they would have had ~1.2x of margin.
+    for (cell, name, v) in [
+        ("bonsai-4k w1", "ttft_ms", [1204.071, 1300.797, 1279.021]),
+        ("e2b-64k w3", "decode_tps", [99.327, 99.607, 92.561]),
+    ] {
+        let spread = Spread::of(&v).expect("non-empty");
+        assert!(
+            spread.range_pct() > 7.0 && spread.range_pct() < SETTLED_MAX_RANGE_PCT,
+            "{cell} {name} is the wide tail of the settled population, observed range {:.2}%",
+            spread.range_pct()
+        );
+        assert_eq!(
+            settle(name, &v),
+            None,
+            "{cell} {name} settled and must not be refused"
+        );
+    }
+}
+
+/// A settled cell's `itl_p99_ms`: 58.6% of range on a gemma-4-e2b 64k cell
+/// whose every gated metric ranged under 2%. This is the measurement behind
+/// [`Gate::Ungated`] for p99 — gating it would abort settled cells, and no
+/// plausible ceiling separates it from a real defect.
+#[test]
+fn the_tail_statistic_would_abort_settled_cells_if_it_were_gated() {
+    let p99 = [16.337, 10.261, 10.370]; // e2b-64k --warmup 3
+    let spread = Spread::of(&p99).expect("non-empty");
+    assert!(
+        spread.range_pct() > SETTLED_MAX_RANGE_PCT,
+        "p99 ranged {:.1}% on a settled cell — the reason it is not gated",
+        spread.range_pct()
+    );
+    assert_eq!(Metric::ItlP99Ms.gate(), Gate::Ungated);
+}
+
+/// KV bytes are bit-identical across the runs of a cell, so a range gate that
+/// keyed off anything but the observed values would show up here first.
+#[test]
+fn a_constant_metric_clears_both_gates() {
+    let in_order = [649_353_216.0, 649_353_216.0, 649_353_216.0];
+    assert_eq!(settle("kv_cache_bytes", &in_order), None);
 }
 
 /// Mutation check: the guard must key on the run-to-run *trend*, not on the
@@ -502,11 +697,71 @@ fn a_differing_token_stream_is_refused() {
     let a = token_stream_digest([1_u32, 2, 3, 4]);
     let b = token_stream_digest([1_u32, 2, 3, 5]);
     assert_ne!(a, b, "one differing token must change the digest");
-    let msg = assert_same_token_stream("measured run 2", a, b)
-        .expect_err("runs of one cell must decode the same tokens")
-        .to_string();
-    assert!(msg.contains("different token stream"), "got: {msg}");
-    assert!(assert_same_token_stream("measured run 2", a, a).is_ok());
+    let msg = assert_one_token_stream(&[
+        ("measured run 1".to_owned(), a),
+        ("measured run 2".to_owned(), b),
+    ])
+    .expect_err("runs of one cell must decode the same tokens")
+    .to_string();
+    assert!(msg.contains("different token streams"), "got: {msg}");
+    assert!(assert_one_token_stream(&[
+        ("measured run 1".to_owned(), a),
+        ("measured run 2".to_owned(), a),
+    ])
+    .is_ok());
+}
+
+/// A cold-start defect corrupts run 1, not runs 2-N. Anchoring on the first run
+/// would report every later run as the deviant one and send the operator after
+/// the wrong runs; the majority is what identifies the outlier.
+#[test]
+fn the_outlier_run_is_named_not_the_majority() {
+    let good = token_stream_digest([1_u32, 2, 3]);
+    let cold = token_stream_digest([9_u32, 9, 9]);
+    let msg = assert_one_token_stream(&[
+        ("warmup run 1".to_owned(), cold),
+        ("measured run 1".to_owned(), good),
+        ("measured run 2".to_owned(), good),
+        ("measured run 3".to_owned(), good),
+    ])
+    .expect_err("a cell with two different streams is not one cell")
+    .to_string();
+    assert!(
+        msg.contains(&format!("Most common digest {good:#018x} (3 of 4 run(s))")),
+        "the majority stream must be named as the reference: {msg}"
+    );
+    // Every run is listed, and only the cold one is marked.
+    assert_eq!(
+        msg.matches("<-- differs").count(),
+        1,
+        "exactly the outlier is marked: {msg}"
+    );
+    assert!(
+        msg.contains("warmup run 1")
+            && msg.contains("measured run 1")
+            && msg.contains("measured run 3"),
+        "every run must be listed with its digest: {msg}"
+    );
+}
+
+/// With two runs and two digests there is no majority. The instrument must
+/// still name both rather than silently picking one as correct.
+#[test]
+fn a_two_run_disagreement_names_both() {
+    let a = token_stream_digest([1_u32]);
+    let b = token_stream_digest([2_u32]);
+    let msg = assert_one_token_stream(&[
+        ("measured run 1".to_owned(), a),
+        ("measured run 2".to_owned(), b),
+    ])
+    .expect_err("two different streams are not one cell")
+    .to_string();
+    assert!(msg.contains(&format!("{a:#018x}")), "got: {msg}");
+    assert!(msg.contains(&format!("{b:#018x}")), "got: {msg}");
+    assert!(
+        msg.contains("1 of 2 run(s)"),
+        "no majority is stated: {msg}"
+    );
 }
 
 /// Order matters: a digest that ignored it would pass a run that emitted the
@@ -551,4 +806,105 @@ fn prefill_throughput_is_absent_not_zero_when_undefined() {
 fn prefill_throughput_is_absent_when_the_first_token_is_instant() {
     let s = sample_from_arrivals(&[0.0, 0.1, 0.2], 1000, 4096, 0xabc).expect("enough tokens");
     assert_eq!(s.prefill_tps, None);
+}
+
+// ── Which metrics are gated is enumerated, not positional ───────────
+
+/// One run's worth of sample, with every metric settable.
+fn run_sample(ttft_ms: f64, decode_tps: f64, kv: u64) -> RunSample {
+    RunSample {
+        ttft_ms,
+        decode_tps,
+        prefill_tps: Some(1000.0 / ttft_ms),
+        itl_p50_ms: 10.0,
+        itl_p99_ms: 12.0,
+        kv_cache_bytes: kv,
+        n_generated: 128,
+        token_digest: 0xabc,
+    }
+}
+
+/// The gate decision is a total function of the metric. This does not merely
+/// re-state the match — it pins that both lists are non-empty, so a change that
+/// gated everything (aborting settled cells on p99 noise) or gated nothing
+/// (the state this guard replaced) fails here.
+#[test]
+fn every_metric_names_a_gate_and_both_lists_are_populated() {
+    let gated: Vec<&str> = Metric::ALL
+        .iter()
+        .filter(|m| m.gate() == Gate::Settled)
+        .map(|m| m.name())
+        .collect();
+    let ungated: Vec<&str> = Metric::ALL
+        .iter()
+        .filter(|m| m.gate() == Gate::Ungated)
+        .map(|m| m.name())
+        .collect();
+    assert_eq!(
+        gated,
+        vec!["ttft_ms", "itl_p50_ms", "decode_tps", "kv_cache_bytes"],
+        "the metrics a decision is made on must all be gated"
+    );
+    assert_eq!(
+        ungated,
+        vec!["itl_p99_ms", "prefill_tps"],
+        "p99 is an extreme-order statistic and prefill_tps is a reciprocal of ttft_ms; \
+         both are reported, neither is evidence"
+    );
+    assert_eq!(
+        gated.len() + ungated.len(),
+        Metric::ALL.len(),
+        "every metric is in exactly one list"
+    );
+}
+
+/// `prefill_tps` is `prompt_tokens / ttft`, with `prompt_tokens` identical in
+/// every run of a cell — so gating it would test `ttft_ms` twice under a
+/// nonlinear transform, and the transform is what decides whether they agree.
+/// Its verdict must not be able to abort a cell, whatever it says on its own.
+#[test]
+fn prefill_tps_cannot_abort_a_cell() {
+    assert_eq!(Metric::PrefillTps.gate(), Gate::Ungated);
+    // A blatant ramp in prefill_tps, on runs whose gated metrics all settled.
+    let mut samples = [
+        run_sample(1000.0, 100.0, 4096),
+        run_sample(1000.0, 100.0, 4096),
+        run_sample(1000.0, 100.0, 4096),
+    ];
+    samples[0].prefill_tps = Some(500.0);
+    samples[1].prefill_tps = Some(750.0);
+    samples[2].prefill_tps = Some(1000.0);
+    let prefill = [500.0, 750.0, 1000.0];
+    assert!(
+        settle("prefill_tps", &prefill).is_some(),
+        "the values themselves are a ramp — the point is that nothing asks"
+    );
+    let summary = summarize(&samples).expect("gated metrics settled, so the cell stands");
+    let reported = summary
+        .prefill_tps
+        .expect("dropping the gate must not drop the reporting");
+    assert!((reported.median - 750.0).abs() < 1e-9);
+    assert!(reported.range_pct() > 60.0, "its spread is still visible");
+}
+
+/// A contended run moves more than one metric. Refusing at the first hides how
+/// much of the cell moved, which is the difference between "one metric wobbled"
+/// and "the whole run was contended".
+#[test]
+fn every_unsettled_metric_is_named_not_just_the_first() {
+    // ttft ramps, decode TPS falls, kv bytes stay put.
+    let samples = [
+        run_sample(1000.0, 130.0, 4096),
+        run_sample(1400.0, 126.0, 4096),
+        run_sample(1800.0, 112.0, 4096),
+    ];
+    let msg = summarize(&samples)
+        .expect_err("a cell that moved in two metrics is not summarisable")
+        .to_string();
+    assert!(msg.contains("ttft_ms"), "got: {msg}");
+    assert!(msg.contains("decode_tps"), "got: {msg}");
+    assert!(
+        msg.contains("2 of its 4 gated metric(s)"),
+        "the count of moved metrics is what says how bad it was: {msg}"
+    );
 }

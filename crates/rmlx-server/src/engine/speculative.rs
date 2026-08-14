@@ -824,7 +824,14 @@ impl Generator for SpeculativeGenerator {
             // across the call, or the readable figure belongs to an earlier
             // generation. The rows below land in the append-only events table,
             // where a wrong value cannot be taken back.
-            let kv_before = rmlx_models::gemma4::gemma4_kv_cache_bytes_sample();
+            //
+            // Read off the **verifier's own** architecture. The byte statics are
+            // per arch, and the drafter branches below run against a
+            // Qwen3.5/3.6-MoE verifier, not a Gemma4 one — sampling a fixed
+            // arch's static here would compare a reading of some other model's
+            // cache before and after, and hand back that model's bytes as this
+            // request's whenever it happened to generate in between.
+            let kv_before = dispatcher.verifier.kv_cache_bytes_sample();
 
             let result = if let Some(drafter_arc) = eagle3_drafter.as_ref() {
                 // EAGLE-3 round-loop (greedy). Autoregressive draft +
@@ -1015,8 +1022,8 @@ impl Generator for SpeculativeGenerator {
                     } else {
                         "length".to_owned()
                     };
-                    // F6/L18: emit KV-cache bytes to SPSC drainer (SpeculativeGenerator
-                    // always wraps a Gemma4 verifier, so the global static applies).
+                    // F6/L18: emit KV-cache bytes to the SPSC drainer, read off
+                    // the verifier's own arch static (see `kv_before`).
                     {
                         // Attribute the byte count to this generation before
                         // recording it: an unchanged store sequence means the
@@ -1025,16 +1032,21 @@ impl Generator for SpeculativeGenerator {
                         // is recordable — skip the row and say why.
                         let kv_bytes = match rmlx_models::classify_kv_bytes(
                             kv_before,
-                            rmlx_models::gemma4::gemma4_kv_cache_bytes_sample(),
+                            dispatcher.verifier.kv_cache_bytes_sample(),
                         ) {
                             rmlx_models::KvBytesVerdict::Reported(n) => n,
                             rmlx_models::KvBytesVerdict::Unreported => {
+                                // Every round loop reports at the end of its
+                                // decode phase, so this is now reachable only
+                                // for a generation that returned before one —
+                                // an immediate EOS on the prefill bonus token.
                                 tracing::warn!(
                                     model_id = %model_id_for_log,
+                                    arch = dispatcher.verifier.arch_class(),
                                     "speculative generation reported no KV-cache byte count \
-                                     (store sequence did not advance); skipping the \
-                                     kv_cache_bytes row rather than recording an earlier \
-                                     generation's figure"
+                                     (store sequence did not advance, so it ended before its \
+                                     decode phase); skipping the kv_cache_bytes row rather \
+                                     than recording an earlier generation's figure"
                                 );
                                 0
                             }

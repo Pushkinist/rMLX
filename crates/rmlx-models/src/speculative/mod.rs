@@ -46,6 +46,18 @@ use crate::kv_cache::KvCacheBuilder;
 pub use draft_kind::DraftKind;
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache, KV_MAX_SEQ_DEFAULT};
 
+/// Resident KV bytes held by a verifier's own caches.
+///
+/// Same basis as the per-arch `generate_greedy` byte total: the attention
+/// caches plus, on hybrid archs, the recurrent linear-attention state. Only the
+/// verifier's caches count — the draft's are an implementation detail of the
+/// accelerator, and including them would make a speculative row incomparable
+/// with the ordinary row for the same model and context.
+pub(crate) fn verifier_kv_bytes(kv: &[KvCache], lin: Option<&[LinearAttnCache]>) -> u64 {
+    kv.iter().map(KvCache::resident_bytes).sum::<u64>()
+        + lin.map_or(0, |l| l.iter().map(LinearAttnCache::resident_bytes).sum())
+}
+
 /// Holds a (verifier, draft) pair for speculative decoding.
 ///
 /// Phase 1 invariants:
@@ -923,6 +935,15 @@ impl SpeculativeDispatcher {
             "spec_generate_greedy_cached: done"
         );
 
+        // Report the verifier's resident KV, so a caller that sampled the
+        // verifier arch around this call can attribute the figure to it. This
+        // path never goes through `Architecture::generate_greedy`, so nothing
+        // else writes it.
+        self.verifier.store_kv_cache_bytes(
+            verifier_kv_bytes(&verifier_caches, verifier_lin.as_deref()),
+            crate::decode_loop::PostDecode::seal(),
+        );
+
         Ok(emitted)
     }
 
@@ -1321,6 +1342,13 @@ impl SpeculativeDispatcher {
             verifier_ms = (verifier_ns as f64) / 1.0e6,
             k,
             "spec_generate_stochastic_cached: done"
+        );
+
+        // See the greedy path: the verifier's own resident KV, reported so the
+        // caller can attribute it to this call.
+        self.verifier.store_kv_cache_bytes(
+            verifier_kv_bytes(&verifier_caches, verifier_lin.as_deref()),
+            crate::decode_loop::PostDecode::seal(),
         );
 
         Ok(emitted)
