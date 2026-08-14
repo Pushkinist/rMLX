@@ -856,9 +856,21 @@ impl KvQuant {
     /// value for iso and 21.75 for rotor at `head_dim = 128`, against bf16's
     /// 16.0. The width below is what the codebook quantizes to, not what
     /// reaches memory. [`Self::estimated_resident_bytes_per_layer`] therefore
-    /// does not size those two families from this number at all — it models
-    /// their group layout directly — and only reads it to tell a packed side
-    /// from a bf16 one (`bits >= 16`).
+    /// does not size those two families from this number at all — it sizes them
+    /// from their group layout — and only reads it to tell a packed side from a
+    /// bf16 one (`bits >= 16`).
+    ///
+    /// That layout model is a **conservative upper bound, not a census**, on the
+    /// iso side: it charges the 4×`f32` quaternion per group that the CPU
+    /// `IsoBlocks` carry, and the resident GPU ring does not hold one (its three
+    /// buffers are codes / scales / norms; the rotation is the compile-time
+    /// [`crate::isoquant::FIXED_QUAT`]). So a ring-backed iso side is estimated
+    /// at 24 B per 4-value group against the 8 B it actually holds. The sign of
+    /// the net-benefit decision is unaffected — 8 B per 4 values already exceeds
+    /// bf16's 8 B before the per-token norm — but the magnitude reported in the
+    /// advisory's `est_extra_bytes` is high for `k_iso*` / `iso*_sym`.
+    /// `estimator_matches_actual_iso_rotor_encode_bytes` anchors the estimate to
+    /// the CPU-encode bytes deliberately.
     ///
     /// Used by [`Self::estimated_resident_bytes_per_layer`] to size the packed
     /// codes of the generic (affine / turbo / planar) families; the per-group
@@ -918,6 +930,13 @@ impl KvQuant {
     ///   four f32 quaternion, plus one f32 norm per token. The quaternion
     ///   sideband dominates and makes an iso side *larger* than bf16 at
     ///   `head_dim <= 256` — the generic cadence above underestimates it ~12×.
+    ///   That sideband is the **CPU-block** layout: the resident GPU ring the
+    ///   K-only and symmetric iso codecs decode from carries codes / scales /
+    ///   norms only (the rotation is the compile-time `FIXED_QUAT`), so for
+    ///   those members this term over-counts by 16 B per group — 3× the 8 B the
+    ///   ring holds. Kept: it is an upper bound, and the sign this estimate
+    ///   exists to decide is the same either way (8 B per 4 values already
+    ///   exceeds bf16's 8 B).
     /// - **rotor (group 3)**: per 3-element group one code u32 + one f32 scale,
     ///   plus one f32 norm per token. The static per-(layer, head) rotor table
     ///   is not per-token and is omitted (estimate, not census).
@@ -958,7 +977,9 @@ impl KvQuant {
         // - bf16 side (bits >= 16): one bf16 buffer, counted once.
         // - iso (group 4): per 4-elem group 1 code u32 + 1 f32 scale + 4 f32
         //   quaternion; plus 1 f32 norm per token. The quaternion sideband
-        //   dominates and makes iso larger than bf16 at head_dim <= 256.
+        //   dominates and makes iso larger than bf16 at head_dim <= 256. It is
+        //   the CPU-block layout — a ring-resident iso side drops it, so this
+        //   is an upper bound for those members (see the doc comment).
         // - rotor (group 3): per 3-elem group 1 code u32 + 1 f32 scale; plus
         //   1 f32 norm per token. (Static per-(layer,head) rotor table is not
         //   per-token and is omitted, consistent with estimate-not-census.)
