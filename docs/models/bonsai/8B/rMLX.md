@@ -68,25 +68,33 @@ discarded. Bar (§3): WIN / TIE-on-noise / LOSS.
   (30608→10640 MB @64k, 2.91×→1.01× `none`, essentially free now) — the
   codec got cheap on memory and expensive on compute at exactly the context
   length it exists to serve.
-- **NEW finding this pass: a broad mid/long-context regression across 11
-  non-kernel-dispatching codecs**, all -6…-34% at 16k–64k while `none` and
-  `k8v8` hold exact parity (§4, detailed table). Affected:
-  `iso3, iso4, rotor3, rotor4, planar, planar3, planar_k, k8vturbo3,
-  k8vturbo3tcq, tsym3, tsym4` (**tsym4 added** — as regressed as tsym3, e.g.
-  64k **38.0→29.0, −23.7%**, worse than tsym3's −14.1%). Not present in
-  `k8v4`, `k8vturbo2`, `k8vturbo2tcq`, `rot_k_tq4v` (flat or only borderline
-  cells). Filed as **issue #293** — see §4 for the shared-cause hypothesis and
-  exact per-cell deltas.
-- **No codec is CPU-bound at any size, at decode.** Every codec that has a
+- **A mid/long-context regression was reported across 11 codecs (−6…−34% at
+  16k–64k) and filed as issue #293. Re-measurement retracts most of it — see
+  §4.2.** Two things were wrong. (a) The grouping label "non-kernel-dispatching
+  codecs" is not what the code says: `KvQuant::carries_msl()` is `true` for all
+  eleven (only `none` carries no MSL at all), and
+  `KvQuant::cpu_hot_path_reason()` returns `None` — Metal on the hot path — for
+  seven of them (`planar`, `planar3`, `planar_k`, `k8vturbo3`, `k8vturbo3tcq`,
+  `tsym3`, `tsym4`). Only `iso3/4` and `rotor3/4` are CPU-hot-path, and only at
+  **prefill**. The declared-unaffected set (`none`, `k8v8`, `k8vturbo2`,
+  `k8v4`, `rot_k_tq4v`) is classifier-identical to the declared-affected set,
+  so the grouping never had a mechanism behind it. (b) The per-cell magnitudes
+  were harness artefacts: two runs of the **same binary** disagreed by 29% at
+  `none`@32k (61.5 vs 47.76) and reversed the codec ordering. Under `rmlx bench`
+  the same cells hold parity or move a fraction of the reported amount.
+- **No codec is CPU-bound at any size, at decode.** Every codec with a
   dedicated flash-decode-over-quant kernel (`_sym`, K-only) was confirmed
   dispatching it at 4k *and* 64k via untimed verbose kernel-dispatch probes;
-  every codec without one (`none`-adjacent, plain/turbo family, `iso3/4`,
-  `rotor3/4`, `k8v4`, `rot_k_tq4v`) shows zero CPU-dequant/host-download log
-  lines. The one caveat: `iso3/4`/`rotor3/4` (non-sym) carry a documented
-  CPU-side V-encode at **prefill only** (`cpu_hot_path_reason()` in
-  `quant.rs`) — decode itself reads a bf16 seed and is full-speed GPU; this
-  is why `iso3/4`/`rotor3/4` track `none`'s TPS shape but not its prefill
-  time.
+  every other codec shows zero CPU-dequant/host-download log lines. Note the
+  distinction the classifier draws, because it is easy to mis-state: **carrying
+  MSL and dispatching a flash-decode kernel are different properties.**
+  `carries_msl()` is `true` for every codec except `none`; a codec can carry
+  MSL, decode entirely on GPU, and still dispatch no *flash-decode* kernel,
+  because the warm-TTFT bf16 seed absorbs the decode window. The one caveat:
+  `iso3/4`/`rotor3/4` (non-sym) carry a documented CPU-side V-encode at
+  **prefill only** (`cpu_hot_path_reason()` in `quant.rs`) — decode itself
+  reads a bf16 seed and is full-speed GPU; this is why `iso3/4`/`rotor3/4`
+  track `none`'s TPS shape but not its prefill time.
 
 ---
 
@@ -344,9 +352,10 @@ Ranked by impact:
    2.21–3.37 ms/1k. Filed as **issue #292**. No path to viability without a
    kernel fix; until fixed, `_sym` is strictly dominated by `none` on both
    decode and memory at every context measured.
-2. **NEW — broad mid/long-context regression (16k–64k) across 11
-   non-kernel-dispatching codecs, `none`/`k8v8` unaffected** (**issue #293**).
-   Exact per-cell deltas vs 0.2.5:
+2. **RETRACTED — the "11 non-kernel-dispatching codecs" regression does not
+   reproduce; `k8v4`'s long-standing "crater" is the TurboFlash kernel**
+   (**issue #293**). Original claim, kept for the record — per-cell deltas
+   vs 0.2.5, `rmlx serve` + CBB harness:
 
    | codec | 16k | 32k | 64k |
    |---|---|---|---|
@@ -370,39 +379,70 @@ Ranked by impact:
    less-broken one; the genuine, monotonic regression window for iso3/iso4 is
    8k–32k.)*
 
-   **Hypothesis (not verified by bisection — flagging as a starting point,
-   not a conclusion):** every regressed codec in this table shows
-   `NO_NAMED_KERNEL_EVENT` on the kernel-dispatch probe — i.e. all of them
-   decode through the *same generic, non-codec-specific path* that `none`
-   also uses. `none` (no quant at all) and `k8v8` (symmetric 8-bit K+V, the
-   most heavily-trodden codec) are the two codecs in that shared-path group
-   that are *not* regressed; everything else sharing the path is. That
-   points at the shared decode/attention scaffolding picking up per-step
-   overhead for quantized-but-kernel-less codecs specifically, rather than
-   ten independent per-codec regressions. It is not a clean bit-width split
-   either: `k8vturbo2`/`k8vturbo2tcq` (mostly unaffected) sit right next to
-   `k8vturbo3`/`k8vturbo3tcq` (clearly regressed) in the same family, and
-   `k8v4` (4-bit V, unaffected) sits next to `rot_k_tq4v` (4-bit V, mildly
-   regressed −7…−12%) — so whatever changed is sensitive to specific
-   codec/shape combinations within the shared path, not a uniform per-request
-   tax. Recommend a `git bisect` across the recent shared-path work (the
-   flash-decode shell rewrite and GPU-native norms-padding commits are the
-   two most likely candidates given they touch common ring/mask
-   construction) before assuming a single-line fix.
+   **What re-measurement found.** Re-run with `rmlx bench` (n=3 + 1 warmup per
+   cell, one process per cell, prompt cache cleared per run, medians, and the
+   tool's own settle gate refusing any cell that trends rather than spreads):
+
+   | codec@ctx | ratio to `none`, 0.2.5 | ratio to `none`, now | shift |
+   |---|---|---|---|
+   | planar@16k | 0.943 | 0.943 | **0.0%** |
+   | planar@32k | 0.904 | 0.955 | **+5.6%** |
+   | tsym3@16k | 1.040 | 0.984 | −5.4% |
+   | tsym3@32k | 1.080 | 1.006 | −6.9% |
+   | iso3@16k | 0.988 | 0.899 | −9.0% |
+   | iso3@32k | 1.031 | 0.888 | −13.9% |
+   | k8v8@16k *(declared control)* | 0.890 | 0.963 | +8.2% |
+   | k8v8@32k *(declared control)* | 0.928 | 0.971 | +4.6% |
+
+   `planar`, whose claimed −16.9% @16k was among the largest cells, is
+   **unchanged to three decimal places**. `k8v8`, the declared control,
+   *improved* more than several "regressed" codecs moved. Only the
+   `cpu_hot_path_reason()` family (`iso3`, and `tsym3` mildly) shifts at all,
+   at roughly a third of the claimed magnitude and monotonically with context —
+   consistent with store size (iso3 holds 11.3 GB at 32k against `none`'s
+   5.4 GB, so it pays 2.1× the per-step KV maintenance bandwidth) rather than
+   with a shared-path tax.
+
+   **Why the original numbers moved: the harness, not the codecs.** Two runs of
+   the *same* binary put `none`@32k at 61.5 and 47.76 — 29% apart — and
+   reversed the codec ordering between them (`planar`/`none` @32k reads 0.813
+   in one and 1.139 in the other). Under `rmlx bench`, `none`@32k measures
+   65.81 and, re-run after the whole rest of the matrix, 65.75 — **0.1%
+   apart**. So the machine is not the problem; serving each codec once and
+   taking a single unguarded measurement is. Measured noise floors on this
+   host: ≤2.4% within a cell, 0.1–0.9% across processes minutes apart, and up
+   to **7.3%** across sessions an hour apart (a `k8v4`@32k gemma cell whose
+   configuration provably did not change read 99.0 then 106.2). Most of the
+   retracted table sits inside that last band.
+
+   **What the re-measurement did surface.** §4.4 below used to attribute
+   `k8v4`'s crater from 8k up to "an inherently costly generic-path V-4bit
+   dequant on this arch". It is not the codec — it is the **TurboFlash MSL
+   kernel**, which `--turbo-flash=auto` enabled on every recognised Apple
+   family, this host included. Back-to-back on the same binary, `k8v4`@32k
+   decodes **61.3 TPS with the kernel off and 10.5 TPS with it on**, for a
+   byte-identical token digest. The 0.2.5 and 0.3.0 matrices were both taken
+   through `rmlx serve`, which resolved the gate ON; `rmlx bench` never
+   resolved it at all, which is why the crater vanishes there. Both halves are
+   fixed: the gate is now global (every subcommand resolves it identically) and
+   `auto` now holds OFF. `k8v4` re-measures at 88.8 @16k / 61.8 @32k under the
+   shipped default.
 3. **K-only codecs are usable now but not fast at long context** (4–5 TPS
    @64k). A real, working, GPU codec — no further urgency, but not a
    long-context recommendation either. Memory is now essentially free
    (1.00–1.54× `none`), so if a use case genuinely needs sub-8-bit K only,
    this is viable where it was not before.
-4. **`k8v4` / `rot_k_tq4v` (4-bit-V) are unchanged from 0.2.5's crater from
-   8k up** (§2 table; k8v4 39.3→41.3 @8k is noise, still craters to 6.7 @64k;
-   rot_k_tq4v 74.9→69.5 @8k, mild −7…−12% drift at longer ctx, same shape as
-   before). Marginal cost (§2.2) confirms this is a real, expensive,
-   *non*-kernel GPU dequant path (1.16–2.23 ms/1k) — not CPU-bound, just an
-   inherently costly generic-path V-4bit dequant on this arch. Unfixed since
-   0.2.5; still the lowest-priority item since `k8v8` (8-bit V) tracks `none`
-   at every size and is the honest recommendation whenever V compression is
-   wanted.
+4. **`k8v4`'s crater from 8k up was the TurboFlash kernel, and is fixed.**
+   Every `k8v4` cell in §2 (39.3 @8k, down to 6.7 @64k) was measured through
+   `rmlx serve`, where `--turbo-flash=auto` resolved ON. It is not "an
+   inherently costly generic-path V-4bit dequant on this arch" — that reading
+   was wrong, and the §2.2 marginal-cost fit for `k8v4` describes the kernel,
+   not the codec. With the gate off, `k8v4` decodes **88.8 TPS @16k and 61.8
+   @32k** (`rmlx bench`, n=3), i.e. within a few percent of `none`, for a
+   byte-identical token digest. `auto` now holds OFF (see `docs/KV_QUANT.md`
+   §TurboFlash), so this is the shipped behaviour. `rot_k_tq4v` is untouched by
+   the gate — TurboFlash only serves K8V4 storage — and its mild −7…−12% drift
+   at longer ctx stands as previously described.
 5. **`*_sym` / `*tcq` prefill remains the heaviest cost family** — unchanged
    shape from 0.2.5 (`k8vturbo3tcq` 64k TTFT 108.5s vs `none`'s 64.8s).
 
@@ -412,7 +452,14 @@ Ranked by impact:
 
 - **`none` is still the headline number and the smallest KV**, unchanged
   from 0.2.5 in every respect measured.
-- **64k is n=1 measured** — point estimate, same caveat as 0.2.5.
+- **Every decode cell in §2 was measured through `rmlx serve` with
+  `--turbo-flash=auto`, which resolved ON.** For `k8v4` — the only storage
+  TurboFlash serves — that means §2's cells are kernel-on numbers and read
+  3.4–5.9× low from 16k up; see §4.4. Every other codec is unaffected by the
+  gate. Cells re-measured with `rmlx bench` are labelled as such in §4.2.
+- **64k is n=1 measured** — point estimate, same caveat as 0.2.5. A single
+  unguarded measurement is now known to be worth less than it looks on this
+  host: see the noise-floor figures in §4.2 (up to 7.3% across sessions).
 - **`rmlx baseline --prompt-tokens` used to tokenize the raw JSON fixture**
   **file text** (envelope + syntax), not just message content — a real,
   separate finding from this pass, since fixed. For `longctx_64k.json` that

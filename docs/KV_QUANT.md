@@ -641,25 +641,47 @@ appended per-token via 4-D `slice_update`. The `turbo_flash_sdpa` Metal
 kernel reads these buffers directly — no dequantize round-trip. Enabled by
 `RMLX_TURBO_FLASH=1` or `turbo_flash_lock_enabled()`.
 
-**TurboFlash default-on policy**: `--turbo-flash`
-accepts `{on, off, auto}` with `auto` as the default. `auto` resolves at
-startup via `rmlx_core::apple_gpu::apple_silicon_generation()`:
-- Apple ≤9 (M1/M2/M3/M4) → ON (validated: 32k NIAH × 3 models on M3,
-  commit fcb2e894ccc4; 100% needle retrieval at 5 depths × 3 ctx tiers).
-- Apple10 (M5+) → ON: the historical `head_dim = 256`
-  hazard was re-driven on M5 Max via
-  `crates/rmlx-kv-quant/tests/apple10_head_dim_256.rs` (synthetic
-  K8V4, smoke + 16-step decode stress + TF=0 control). No SIGSEGV,
-  dispatch fired, cosine min 0.997 vs bf16.
-- Apple11+ (M6 +) → ON with an `info`-level log noting the family has not
-  been hw-validated yet. Operators that hit a regression can force OFF
-  with `--turbo-flash off`.
-- Unknown / non-Apple-Silicon hosts (sysctl probe failed) → OFF
-  (conservative).
+**TurboFlash default-OFF policy (HOLD)**: `--turbo-flash` accepts
+`{on, off, auto}` with `auto` as the default, and `auto` resolves **OFF on
+every host**. The kernel passes its correctness gates and fails its throughput
+one: at temp=0 it generates the same tokens as the generic K8V4 path, and it
+generates them several times slower.
 
-`--turbo-flash on` is an explicit force-ON. `--turbo-flash off` is a hard
-override that removes `RMLX_TURBO_FLASH` from the environment so a stale
-shell value cannot latch the OnceLock back to true.
+| cell (Bonsai-8B, `kv_h=8`, `head_dim=128`, `rmlx bench` n=3) | off | on | |
+|---|---|---|---|
+| k8v4 @16k, `--max-ctx 65536` | 89.4 TPS | 19.3 TPS | 4.6× slower |
+| k8v4 @16k, `--max-ctx 16640` | 82.8 TPS | 24.2 TPS | 3.4× slower |
+| k8v4 @32k, `--max-ctx 65536` | 61.3 TPS | 10.5 TPS | 5.9× slower |
+
+Same binary, same cell, back to back; identical generated-token digest in both
+arms. Shrinking the ring 4× recovers part of the gap but not the bulk, so this
+is not a `--max-ctx` sizing artefact. The `on` arm also holds ~722 MB more
+resident KV at 16k — the persistent head-major flash buffers sit *on top of*
+the bf16 mirror and the packed store rather than replacing either. On a
+shared-KV / windowed arch (gemma-4-e2b, `kv_h=1`, `head_dim=256`, SWA 512) the
+kernel is inert (±0.3%, inside the 1.3% noise floor measured at `k8v4`@4k where
+the `kv_seq > 4096` gate stops it firing at all), so there is no arch where it
+currently pays.
+
+This supersedes the previous per-family default-ON policy. The validations that
+policy rested on are unaffected and still stand — they were crash/fidelity
+clearances, never throughput ones: 32k NIAH × 3 models on Apple ≤9
+(commit fcb2e894ccc4, 100% needle retrieval at 5 depths × 3 ctx tiers), and the
+Apple10 `head_dim = 256` hazard re-drive on M5 Max via
+`crates/rmlx-kv-quant/tests/apple10_head_dim_256.rs` (no SIGSEGV, dispatch
+fired, cosine min 0.997 vs bf16). Lifting the HOLD needs a decode measurement,
+not another one of those.
+
+`--turbo-flash on` is an explicit force-ON — the opt-in for ablation and for
+the re-measurement that would lift the HOLD. `--turbo-flash off` is a hard
+override that removes `RMLX_TURBO_FLASH` from the environment so a stale shell
+value cannot latch the OnceLock back to true; `auto` leaves an existing
+`RMLX_TURBO_FLASH=1` alone, so an operator who opted in keeps the kernel.
+
+`--turbo-flash` is a **global** flag: it resolves in `main` before subcommand
+dispatch, so `rmlx bench` / `rmlx baseline` measure the same kernel
+configuration `rmlx serve` runs. Until that was fixed the two disagreed on this
+very gate, and the measurement commands were the ones reading OFF.
 
 **head_dim coverage (TurboFlash kernel)**: `head_dim ∈ {128, 256}`. The
 P1 kernel's register arrays (`q_vals`, `o_state`, `v_decoded`) are sized

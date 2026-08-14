@@ -41,22 +41,37 @@ use rmlx_server::{
 };
 use tracing::{info, warn};
 
-/// `--turbo-flash` tri-state. Default `Auto` resolves at startup based on the
-/// host's Apple GPU family (see [`apply_turbo_flags`]).
+/// `--turbo-flash` tri-state. Default `Auto` resolves **OFF** on every host.
 ///
-/// Replaces the previous `bool` flag so the default can be hardware-gated.
-/// Apple ≤9 (M1/M2/M3/M4) — TurboFlash validated, on by default.
-/// Apple ≥10 (M5+) — was conservatively off by default until the M5 hazard
-/// could be re-validated.
+/// The kernel is correct — it is a throughput loss. TurboFlash is the only
+/// consumer of the K8V4 flash path (`turbo_flash_should_run`: K8V4 storage,
+/// `q_seq == 1`, `kv_seq > 4096`, `head_dim ∈ {128, 256}`), and on the one
+/// shape where it engages it decodes several times slower than the generic
+/// path it replaces while producing byte-identical tokens:
 ///
-/// The M5 hazard at `head_dim = 256` was re-validated on M5 Max via
-/// `tests/apple10_head_dim_256.rs` and did not reproduce — dispatch fired
-/// across smoke + 16-step decode stress, cosine min 0.997 vs bf16 reference,
-/// no SIGSEGV. `Auto` now resolves ON on Apple10+; the
-/// `apply_turbo_flags::Auto` arm logs an info-level note on Apple11+ hosts
-/// (M6+) that the kernel is optimistically enabled and operators can fall
-/// back to `--turbo-flash off` if a regression appears on the new family.
-/// See `docs/reports/apple10-head-dim-256-revalidation.md`.
+/// | cell (Bonsai-8B, `kv_h=8`, `head_dim=128`) | off | on | |
+/// |---|---|---|---|
+/// | k8v4 @16k, `--max-ctx 65536` | 89.4 TPS | 19.3 TPS | 4.6× slower |
+/// | k8v4 @16k, `--max-ctx 16640` | 82.8 TPS | 24.2 TPS | 3.4× slower |
+/// | k8v4 @32k, `--max-ctx 65536` | 61.3 TPS | 10.5 TPS | 5.9× slower |
+///
+/// Same binary, same cell, back to back, temp=0, `--turbo-flash` the only
+/// difference; the generated-token digest is identical in both arms, so this is
+/// pure cost, not a fidelity trade. Tightening the ring 4× recovers part of it
+/// but not the bulk, so it is not a `--max-ctx` sizing artefact. The `on` arm
+/// also holds ~722 MB more resident KV (the persistent head-major flash buffers
+/// sit on top of the bf16 mirror and the packed store). On a shared-KV /
+/// windowed arch (gemma-4-e2b, `kv_h=1`, `head_dim=256`, SWA 512) the kernel is
+/// inert: ±0.3%, inside the 1.3% noise floor measured at `k8v4`@4k where the
+/// `kv_seq > 4096` gate keeps it from firing at all.
+///
+/// `Auto` therefore holds OFF — the same HOLD posture
+/// [`PlanarFlashDecodeMode`] already takes for the same reason. `on` remains
+/// the explicit opt-in for ablation and for the re-validation that would lift
+/// the HOLD. Nothing else changes: the kernel, its tests, and the
+/// `head_dim = 256` hazard re-validation
+/// (`docs/reports/apple10-head-dim-256-revalidation.md`, a *crash/fidelity*
+/// clearance, never a throughput one) all stand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub(crate) enum TurboFlashMode {
     /// Force the TurboFlash MSL kernel on. Sets `RMLX_TURBO_FLASH=1`.
@@ -64,10 +79,8 @@ pub(crate) enum TurboFlashMode {
     /// Force the TurboFlash MSL kernel off. Does NOT clear an existing
     /// `RMLX_TURBO_FLASH=1` env-var — explicit env wins for back-compat.
     Off,
-    /// Hardware-gated default. Apple ≤10 → on (M5 hazard cleared by the
-    /// head_dim=256 re-validation, 2026-06). Apple11+ → on with an operator-visible info
-    /// log noting the family has not been re-validated yet. Unknown /
-    /// non-Apple-Silicon hosts → off (conservative — `sysctl` probe failed).
+    /// Resolves to OFF on every host: the kernel is a measured 3.4–5.9× decode
+    /// loss on the one codec it serves. HOLD until a re-measurement clears it.
     #[default]
     Auto,
 }
@@ -93,19 +106,19 @@ impl std::fmt::Display for TurboFlashMode {
 ///   cannot latch the `OnceLock` to true after we've explicitly asked for
 ///   OFF. Previously this arm was a no-op, which meant `--turbo-flash off`
 ///   was silently a no-op whenever the shell had `RMLX_TURBO_FLASH=1` set.
-/// - [`TurboFlashMode::Auto`] → consult [`rmlx_core::apple_gpu::apple_silicon_generation`]
-///   and set `RMLX_TURBO_FLASH=1` for every recognised Apple family. The
-///   previous family ≥ 10 → OFF clause was retired (2026-06) after the M5
-///   hazard at `head_dim = 256` was re-validated on M5 Max and did not
-///   reproduce. Unknown / non-Apple-Silicon hosts still stay OFF (sysctl
-///   probe failed → conservative). `Auto` is the only mode that honours
-///   pre-existing `RMLX_TURBO_FLASH=1` env (back-compat path).
+/// - [`TurboFlashMode::Auto`] → resolves OFF on every host (see
+///   [`TurboFlashMode`] for the measurements). The Apple family is still probed
+///   and logged so an operator can see which host the HOLD applied to. `Auto`
+///   is the only mode that honours a pre-existing `RMLX_TURBO_FLASH=1` env
+///   (back-compat path) — it does not remove the var, so a shell that opts in
+///   still gets the kernel.
 ///
 /// `turbo_flash_lock` is unchanged: `true` → force-set, `false` → leave env
 /// untouched.
 ///
-/// Must be called before any inference (i.e. before the server starts
-/// accepting requests), ensuring the `OnceLock` is not yet initialised.
+/// Called from `main` before subcommand dispatch, so the `OnceLock` is not yet
+/// initialised and every command — server and measurement alike — sees the same
+/// resolution.
 pub(crate) fn apply_turbo_flags(turbo_flash: TurboFlashMode, turbo_flash_lock: bool) {
     let family = rmlx_core::apple_gpu::apple_silicon_generation();
     apply_turbo_flags_inner(turbo_flash, turbo_flash_lock, family);
@@ -113,12 +126,13 @@ pub(crate) fn apply_turbo_flags(turbo_flash: TurboFlashMode, turbo_flash_lock: b
 
 /// Pure inner of [`apply_turbo_flags`] parameterised on the Apple-Silicon GPU
 /// family. Splitting the family probe out lets unit tests drive every Auto arm
-/// (Apple ≤9, Apple10, Apple11+, unknown host) regardless of which family the
-/// CI host actually reports.
+/// (recognised family vs unknown host) regardless of which family the CI host
+/// actually reports. `Auto` resolves OFF for both, so the parameter now only
+/// selects which log line is emitted — it is kept so a future per-family flip
+/// has a seam and a test surface.
 ///
 /// `family = None` mirrors `apple_silicon_generation()` returning `None`
-/// (sysctl probe failed / non-Apple-Silicon). The conservative OFF default
-/// for that case is preserved.
+/// (sysctl probe failed / non-Apple-Silicon).
 pub(crate) fn apply_turbo_flags_inner(
     turbo_flash: TurboFlashMode,
     turbo_flash_lock: bool,
@@ -126,93 +140,67 @@ pub(crate) fn apply_turbo_flags_inner(
 ) {
     // Explicit Off is a hard override — remove the env var so a stale
     // RMLX_TURBO_FLASH=1 in the shell cannot latch the OnceLock to true.
-    // Safe here because apply_turbo_flags runs at the top of run_serve,
-    // before the tokio runtime is built and before any other thread exists.
+    // Safe here because apply_turbo_flags runs from `main` before the tokio
+    // runtime is built and before any other thread exists.
     if turbo_flash == TurboFlashMode::Off {
         std::env::remove_var("RMLX_TURBO_FLASH");
     }
     let resolved_on = match turbo_flash {
         TurboFlashMode::On => true,
         TurboFlashMode::Off => false,
-        // The Apple10 (M5+) hazard was re-validated on M5 Max at the documented
-        // `head_dim = 256` configuration using `tests/apple10_head_dim_256.rs`
-        // (synthetic K8V4, RMLX_TURBO_FLASH=1, smoke + 16-step decode stress).
-        // Result: no SIGSEGV, dispatch fired, cosine min 0.997 vs bf16 reference
-        // — the documented hazard did NOT reproduce. Auto therefore resolves ON
-        // across the full Apple7..Apple10+ surface; the previous family ≥ 10 →
-        // OFF clause was retired.
-        // See `docs/reports/apple10-head-dim-256-revalidation.md`.
-        // Apple11+ (M6+) hosts log a `tracing::warn!` noting that the kernel has
-        // not been hw-validated on that family yet — the gate still resolves ON
-        // (Auto stays optimistic on new families once a prior family has cleared)
-        // so the canary catches regressions early rather than silently fall back.
-        // Operators on Apple11+ who hit a regression can force OFF with
-        // `--turbo-flash off`. The `warn` level (not `info`) gives an
-        // operator-visible signal; squelch via RUST_LOG if the noise is unwanted.
-        TurboFlashMode::Auto => match family {
-            Some(f) if f <= 9 => {
+        // Auto is a HOLD on every host. The kernel is correct — its output
+        // digest matches the generic path token for token — but on the one
+        // storage it serves (K8V4, kv_seq > 4096) it decodes 3.4-5.9x slower
+        // than the path it replaces and carries several hundred MB of extra
+        // resident KV for the privilege. Defaulting a measured decode loss ON
+        // is worse than shipping no kernel at all, so Auto stays OFF until a
+        // re-measurement clears it. See `TurboFlashMode` for the cells.
+        // The family is still probed so the log names the host the HOLD
+        // applied to.
+        TurboFlashMode::Auto => {
+            if let Some(f) = family {
                 tracing::info!(
                     family = f,
-                    "A11: --turbo-flash=auto on Apple{f} (≤9) — \
-                     enabling TurboFlash (validated 32k NIAH on M3)"
+                    "--turbo-flash=auto on Apple{f} — resolved OFF (HOLD: the \
+                     kernel decodes 3.4-5.9x slower than the generic K8V4 path \
+                     at kv_seq > 4096 for byte-identical output). Use \
+                     --turbo-flash on to override."
                 );
-                true
-            }
-            Some(10) => {
-                tracing::info!(
-                    family = 10,
-                    "A11: --turbo-flash=auto on Apple10 (M5+) — enabling TurboFlash \
-                     (head_dim=256 re-validation cleared the M5 hazard, \
-                     dispatch + cosine green; see \
-                     docs/reports/apple10-head-dim-256-revalidation.md)"
-                );
-                true
-            }
-            Some(f) => {
+            } else {
                 tracing::warn!(
-                    family = f,
-                    "A11: --turbo-flash=auto on Apple{f} — enabling TurboFlash \
-                     (kernel is hw-validated through Apple10; newer families \
-                     assumed clean until proven otherwise. Re-validation should \
-                     run on each new Apple gen as it becomes available. Use \
-                     --turbo-flash off to force OFF if you hit a regression.)"
+                    "--turbo-flash=auto on unknown host (sysctl probe failed) — \
+                     resolved OFF (conservative). Use --turbo-flash on to override."
                 );
-                true
             }
-            None => {
-                tracing::warn!(
-                    "A11: --turbo-flash=auto on unknown host (sysctl probe failed) — \
-                     defaulting OFF (conservative). Use --turbo-flash on to override."
-                );
-                false
-            }
-        },
+            false
+        }
     };
     if resolved_on {
-        // SAFETY: set_var is safe here: apply_turbo_flags is called at the top of
-        // run_serve(), before the tokio runtime is constructed. No other thread
-        // exists that could concurrently read the environment.
+        // SAFETY: set_var is safe here: apply_turbo_flags is called from `main`
+        // before the tokio runtime is constructed and before any subcommand
+        // dispatch. No other thread exists that could concurrently read the
+        // environment.
         std::env::set_var("RMLX_TURBO_FLASH", "1");
         tracing::info!(
             mode = %turbo_flash,
-            "A11: --turbo-flash resolved ON; RMLX_TURBO_FLASH=1 applied"
+            "--turbo-flash resolved ON; RMLX_TURBO_FLASH=1 applied"
         );
     } else if turbo_flash == TurboFlashMode::Off {
         tracing::info!(
             mode = %turbo_flash,
-            "A11: --turbo-flash resolved OFF (hard override); \
+            "--turbo-flash resolved OFF (hard override); \
              RMLX_TURBO_FLASH removed from env"
         );
     } else {
         tracing::info!(
             mode = %turbo_flash,
-            "A11: --turbo-flash resolved OFF; env untouched (pre-existing \
+            "--turbo-flash resolved OFF; env untouched (pre-existing \
              RMLX_TURBO_FLASH=1 still honoured for Auto back-compat)"
         );
     }
     if turbo_flash_lock {
         std::env::set_var("RMLX_TURBO_FLASH_LOCK", "1");
-        tracing::info!("A11: --turbo-flash-lock flag set; RMLX_TURBO_FLASH_LOCK=1 applied");
+        tracing::info!("--turbo-flash-lock flag set; RMLX_TURBO_FLASH_LOCK=1 applied");
     }
 }
 
@@ -599,9 +587,6 @@ pub(crate) fn run_serve(
     draft_block_size: Option<usize>,
     max_tokens_cap: u32,
     max_timeout_secs: u64,
-    turbo_flash: TurboFlashMode,
-    turbo_flash_lock: bool,
-    planar_flash_decode: PlanarFlashDecodeMode,
     require_smoke_probe: bool,
     max_loaded_models: usize,
     max_queue_depth: usize,
@@ -640,10 +625,10 @@ pub(crate) fn run_serve(
     image_max_tokens: Option<usize>,
     sink: &EventRecorder,
 ) -> anyhow::Result<()> {
-    // A11: bridge CLI flags into env before any OnceLock consumers run.
-    apply_turbo_flags(turbo_flash, turbo_flash_lock);
-    // Same OnceLock-before-runtime contract as apply_turbo_flags.
-    apply_planar_flash_decode_flags(planar_flash_decode);
+    // The TurboFlash / planar-flash-decode gates are resolved in `main`, before
+    // any subcommand dispatch, alongside `--fused-qk` and `--sparse-attn`. They
+    // are process-wide `OnceLock`s, so resolving them per-subcommand would let
+    // `serve` and the measurement commands disagree on the kernel set.
 
     // load projects.toml and resolve caps via the precedence chain:
     // CLI flag > [project.<name>] > [global] > built-in default.

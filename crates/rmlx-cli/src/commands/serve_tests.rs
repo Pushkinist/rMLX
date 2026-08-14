@@ -225,14 +225,12 @@ fn planar_flash_decode_off_unset_env_stays_unset() {
 }
 
 #[test]
-fn turbo_flash_auto_gated_on_apple_family() {
+fn turbo_flash_auto_holds_off_on_this_host() {
     // Asserts on std::env::var(TF), not on turbo_flash_enabled(). See MED-2.
     //
-    // Auto now resolves ON on every recognised Apple family (M1 through
-    // M5+ and forward). The only Auto-OFF path is an unknown / non-Apple
-    // host where `apple_silicon_generation()` returns `None` (sysctl probe
-    // failed). The previous Apple≥10 → OFF clause was retired with the
-    // head_dim=256 re-validation (2026-06).
+    // Auto is a HOLD on every host, recognised family or not: the kernel is a
+    // measured 3.4-5.9x decode loss on K8V4 at kv_seq > 4096 for byte-identical
+    // output. Whichever family this host reports, the env must stay unset.
     let _guard = ENV_LOCK.lock().unwrap();
     remove(TF);
     remove(TFL);
@@ -240,120 +238,62 @@ fn turbo_flash_auto_gated_on_apple_family() {
     apply_turbo_flags(TurboFlashMode::Auto, false);
 
     let family = rmlx_core::apple_gpu::apple_silicon_generation();
-    match family {
-        Some(f) => assert_eq!(
-            get(TF).as_deref(),
-            Some("1"),
-            "Auto on Apple{f} must set RMLX_TURBO_FLASH=1 (post-revalidation policy)"
-        ),
-        None => assert_eq!(
-            get(TF),
-            None,
-            "Auto on unknown / non-Apple-Silicon host must leave \
-             RMLX_TURBO_FLASH unset (sysctl probe failed → conservative; \
-             was: {:?})",
-            get(TF)
-        ),
-    }
+    assert_eq!(
+        get(TF),
+        None,
+        "Auto must leave RMLX_TURBO_FLASH unset (HOLD) on family {family:?}; was: {:?}",
+        get(TF)
+    );
     remove(TF);
 }
 
 // ── parametric Auto-arm tests for apply_turbo_flags_inner ────────────────────
 //
 // `apply_turbo_flags` itself can only test the host's actual Apple-Silicon
-// family, so the Apple10 and Apple11+ Auto arms never run on a non-M5/non-M6
-// CI host. `apply_turbo_flags_inner(turbo_flash, lock, family)` is a pure
-// parameterised inner, so the tests below can drive every Auto arm directly.
-// The env-setter contract is unchanged: same OnceLock-latching constraint as
-// the parent tests, same `ENV_LOCK` serialisation.
+// family. `apply_turbo_flags_inner(turbo_flash, lock, family)` is a pure
+// parameterised inner, so the tests below can drive every family arm directly
+// regardless of the CI host. The env-setter contract is unchanged: same
+// OnceLock-latching constraint as the parent tests, same `ENV_LOCK`
+// serialisation.
+//
+// Auto is a HOLD on every family. These tests are the guard that a future
+// per-family flip has to justify itself against a decode measurement rather
+// than a correctness one: the kernel already passes its crash/fidelity gates,
+// and it is still 3.4-5.9x slower than the path it replaces.
 
 #[test]
-fn apply_turbo_flags_inner_apple7_auto_on() {
-    // Apple7 (M1) — Auto must set RMLX_TURBO_FLASH=1 (validated 32k NIAH).
+fn apply_turbo_flags_inner_auto_holds_off_on_every_family() {
     let _guard = ENV_LOCK.lock().unwrap();
-    remove(TF);
-    remove(TFL);
+    // Apple7 (M1) .. Apple11+ (M6+), plus the unknown/non-Apple host.
+    for family in [Some(7), Some(9), Some(10), Some(11), None] {
+        remove(TF);
+        remove(TFL);
 
-    apply_turbo_flags_inner(TurboFlashMode::Auto, false, Some(7));
+        apply_turbo_flags_inner(TurboFlashMode::Auto, false, family);
 
-    assert_eq!(
-        get(TF).as_deref(),
-        Some("1"),
-        "Auto on Apple7 must set RMLX_TURBO_FLASH=1"
-    );
+        assert_eq!(
+            get(TF),
+            None,
+            "Auto on family {family:?} must leave RMLX_TURBO_FLASH unset (HOLD)"
+        );
+    }
     remove(TF);
 }
 
 #[test]
-fn apply_turbo_flags_inner_apple9_auto_on() {
-    // Apple9 (M4) — Auto must set RMLX_TURBO_FLASH=1 (upper bound of the
-    // ≤9 arm).
+fn apply_turbo_flags_inner_auto_does_not_clear_an_opt_in_env() {
+    // Auto is a HOLD, not a hard override: an operator who exported
+    // RMLX_TURBO_FLASH=1 still gets the kernel. Only `--turbo-flash off`
+    // removes the var.
     let _guard = ENV_LOCK.lock().unwrap();
-    remove(TF);
-    remove(TFL);
-
-    apply_turbo_flags_inner(TurboFlashMode::Auto, false, Some(9));
-
-    assert_eq!(
-        get(TF).as_deref(),
-        Some("1"),
-        "Auto on Apple9 must set RMLX_TURBO_FLASH=1"
-    );
-    remove(TF);
-}
-
-#[test]
-fn apply_turbo_flags_inner_apple10_auto_on() {
-    // Auto on Apple10 (M5+) is now ON after the head_dim=256 re-validation
-    // cleared the M5 hazard. The previous Apple10 → OFF clause is gone.
-    let _guard = ENV_LOCK.lock().unwrap();
-    remove(TF);
-    remove(TFL);
+    std::env::set_var(TF, "1");
 
     apply_turbo_flags_inner(TurboFlashMode::Auto, false, Some(10));
 
     assert_eq!(
         get(TF).as_deref(),
         Some("1"),
-        "Auto on Apple10 must set RMLX_TURBO_FLASH=1 (head_dim=256 re-validation flip)"
-    );
-    remove(TF);
-}
-
-#[test]
-fn apply_turbo_flags_inner_apple11_auto_on() {
-    // Optimistic-ON policy for untested future gens. The warn log (Apple≥11
-    // arm) is operator-visible; the env still resolves ON so the canary
-    // catches regressions early on M6+ rather than silently falling back.
-    // Squelch via RUST_LOG if the warn is noise.
-    let _guard = ENV_LOCK.lock().unwrap();
-    remove(TF);
-    remove(TFL);
-
-    apply_turbo_flags_inner(TurboFlashMode::Auto, false, Some(11));
-
-    assert_eq!(
-        get(TF).as_deref(),
-        Some("1"),
-        "Auto on Apple11+ must set RMLX_TURBO_FLASH=1 (optimistic-ON policy)"
-    );
-    remove(TF);
-}
-
-#[test]
-fn apply_turbo_flags_inner_unknown_auto_off() {
-    // Unknown / non-Apple-Silicon host (sysctl probe failed). Conservative OFF
-    // is preserved — this is the only Auto path that does NOT set the env var.
-    let _guard = ENV_LOCK.lock().unwrap();
-    remove(TF);
-    remove(TFL);
-
-    apply_turbo_flags_inner(TurboFlashMode::Auto, false, None);
-
-    assert_eq!(
-        get(TF),
-        None,
-        "Auto on unknown host must leave RMLX_TURBO_FLASH unset (conservative)"
+        "Auto must leave a pre-existing RMLX_TURBO_FLASH=1 alone (back-compat)"
     );
     remove(TF);
 }
