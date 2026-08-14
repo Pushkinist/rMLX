@@ -250,6 +250,43 @@ struct Cli {
     /// `=1` in the shell cannot latch the `OnceLock` to true.
     #[arg(long, value_enum, global = true, default_value_t = SparseAttnMode::Auto)]
     sparse_attn: SparseAttnMode,
+    /// TurboFlash MSL attention kernel. Default `auto`.
+    ///
+    /// `auto` (default): resolves OFF on every host. On the one storage it
+    /// serves (K8V4, `kv_seq > 4096`) the kernel decodes 2.0–4.25× slower than
+    /// the generic path — the loss grows with `kv_seq` — holds ~722 MB more
+    /// resident KV, and is not bit-exact, so it perturbs the generated tokens
+    /// as well. HOLD until a decode re-measurement clears it.
+    /// `on`: force-set RMLX_TURBO_FLASH=1 before first inference (ablation, and
+    /// the escape hatch for that re-measurement).
+    /// `off`: hard override — removes RMLX_TURBO_FLASH from env so a stale
+    /// shell value cannot latch the OnceLock back to true.
+    ///
+    /// Global: every subcommand resolves this the same way, so `rmlx bench`
+    /// and `rmlx baseline` measure the kernel configuration `rmlx serve` runs.
+    #[arg(long, value_enum, global = true, default_value_t = TurboFlashMode::Auto)]
+    turbo_flash: TurboFlashMode,
+    /// Enable the TurboFlash lock variant. Default OFF.
+    ///
+    /// Skips bf16 K/V buffer maintenance once the persistent flash buffers are seeded.
+    /// Has no effect unless --turbo-flash (or RMLX_TURBO_FLASH=1) is also active.
+    /// When absent, RMLX_TURBO_FLASH_LOCK=1 in the environment is still honoured
+    /// (back-compat). CLI flag takes precedence over env when set.
+    #[arg(long, global = true, default_value_t = false)]
+    turbo_flash_lock: bool,
+    /// PlanarQuant flash-decode MSL kernel. Default `auto`.
+    ///
+    /// `auto` (default): OFF on every host — the warm-TTFT bf16-K seed shadows
+    /// the kernel on the normal generate flow, so there is no measurable TPS
+    /// win to flip Auto for.
+    /// `on`: force-set `RMLX_PLANAR_FLASH_DECODE=1` before first inference.
+    /// `off`: HARD override — remove `RMLX_PLANAR_FLASH_DECODE` from env
+    /// so a stale `=1` in the shell cannot latch the `OnceLock` to true.
+    ///
+    /// Only takes effect for PlanarK-storage layers (i.e.
+    /// `--kv-quant planar_k`); other KV variants fall through unchanged.
+    #[arg(long, value_enum, global = true, default_value_t = PlanarFlashDecodeMode::Auto)]
+    planar_flash_decode: PlanarFlashDecodeMode,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -412,45 +449,6 @@ enum Cmd {
         /// Default 600 (10 minutes).
         #[arg(long)]
         max_timeout_secs: Option<u64>,
-        /// TurboFlash MSL attention kernel (A11). Default `auto`.
-        ///
-        /// `auto` (default): hardware-gated. On Apple ≤9 (M1/M2/M3/M4) →
-        /// TurboFlash ON (validated 32k NIAH on M3, 3 models, 5 depths).
-        /// On Apple10 (M5+) → ON since the 2026-06 re-validation of the
-        /// historical `head_dim = 256` hazard on M5 Max found it does not
-        /// reproduce (see
-        /// `docs/reports/apple10-head-dim-256-revalidation.md`).
-        /// Apple11+ (M6+) → ON with an info-level log noting the family has
-        /// not been hw-validated yet; fall back to `off` if you hit a
-        /// regression.
-        /// Unknown / non-Apple-Silicon hosts → OFF (conservative, sysctl
-        /// probe failed).
-        ///
-        /// `on`: force-set RMLX_TURBO_FLASH=1 before first inference.
-        /// `off`: hard override — removes RMLX_TURBO_FLASH from env so a
-        /// stale shell value cannot latch the OnceLock back to true.
-        #[arg(long, value_enum, default_value_t = TurboFlashMode::Auto)]
-        turbo_flash: TurboFlashMode,
-        /// Enable the TurboFlash lock variant (A11). Default OFF.
-        ///
-        /// Skips bf16 K/V buffer maintenance once the persistent flash buffers are seeded.
-        /// Has no effect unless --turbo-flash (or RMLX_TURBO_FLASH=1) is also active.
-        /// When absent, RMLX_TURBO_FLASH_LOCK=1 in the environment is still honoured
-        /// (back-compat). CLI flag takes precedence over env when set.
-        #[arg(long, default_value_t = false)]
-        turbo_flash_lock: bool,
-        /// PlanarQuant flash-decode MSL kernel. Default `auto`.
-        ///
-        /// `auto` (default): currently OFF on every host until the phase 4-5
-        /// NIAH gate runs (Bonsai + Qwen3.6 with `--kv-quant planar_k`).
-        /// `on`: force-set `RMLX_PLANAR_FLASH_DECODE=1` before first inference.
-        /// `off`: HARD override — remove `RMLX_PLANAR_FLASH_DECODE` from env
-        /// so a stale `=1` in the shell cannot latch the `OnceLock` to true.
-        ///
-        /// Only takes effect for PlanarK-storage layers (i.e.
-        /// `--kv-quant planar_k`); other KV variants fall through unchanged.
-        #[arg(long, value_enum, default_value_t = PlanarFlashDecodeMode::Auto)]
-        planar_flash_decode: PlanarFlashDecodeMode,
         /// Run the 8-token smoke probe on first model load (B5). Default OFF.
         ///
         /// When set, the server runs `classify_smoke` on the snapshot before
@@ -1476,6 +1474,15 @@ fn main() -> Result<()> {
     // resolved value on first call.
     commands::serve::apply_sparse_attn_flags(cli.sparse_attn);
 
+    // Same contract for the two flash-decode kernel gates. These resolve here,
+    // not inside `run_serve`, so that every subcommand that runs inference —
+    // `bench`, `baseline`, `eval`, `chat`, `generate` — sees the same kernel
+    // configuration the server does. Resolving them only for `serve` made the
+    // measurement commands silently benchmark a different kernel set than the
+    // one production runs.
+    commands::serve::apply_turbo_flags(cli.turbo_flash, cli.turbo_flash_lock);
+    commands::serve::apply_planar_flash_decode_flags(cli.planar_flash_decode);
+
     // Install the process-wide panic hook.
     // Emits tracing::error! with structured fields (payload, location, thread,
     // optional backtrace) and writes a sidecar txt file to the logs dir.
@@ -1569,9 +1576,6 @@ fn main() -> Result<()> {
             draft_block_size,
             max_tokens_cap,
             max_timeout_secs,
-            turbo_flash,
-            turbo_flash_lock,
-            planar_flash_decode,
             require_smoke_probe,
             max_loaded_models,
             max_queue_depth,
@@ -1890,9 +1894,6 @@ fn main() -> Result<()> {
                 draft_block_size,
                 max_tokens_cap,
                 max_timeout_secs,
-                turbo_flash,
-                turbo_flash_lock,
-                planar_flash_decode,
                 require_smoke_probe,
                 max_loaded_models,
                 max_queue_depth,

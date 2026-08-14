@@ -641,25 +641,86 @@ appended per-token via 4-D `slice_update`. The `turbo_flash_sdpa` Metal
 kernel reads these buffers directly — no dequantize round-trip. Enabled by
 `RMLX_TURBO_FLASH=1` or `turbo_flash_lock_enabled()`.
 
-**TurboFlash default-on policy**: `--turbo-flash`
-accepts `{on, off, auto}` with `auto` as the default. `auto` resolves at
-startup via `rmlx_core::apple_gpu::apple_silicon_generation()`:
-- Apple ≤9 (M1/M2/M3/M4) → ON (validated: 32k NIAH × 3 models on M3,
-  commit fcb2e894ccc4; 100% needle retrieval at 5 depths × 3 ctx tiers).
-- Apple10 (M5+) → ON: the historical `head_dim = 256`
-  hazard was re-driven on M5 Max via
-  `crates/rmlx-kv-quant/tests/apple10_head_dim_256.rs` (synthetic
-  K8V4, smoke + 16-step decode stress + TF=0 control). No SIGSEGV,
-  dispatch fired, cosine min 0.997 vs bf16.
-- Apple11+ (M6 +) → ON with an `info`-level log noting the family has not
-  been hw-validated yet. Operators that hit a regression can force OFF
-  with `--turbo-flash off`.
-- Unknown / non-Apple-Silicon hosts (sysctl probe failed) → OFF
-  (conservative).
+**TurboFlash default-OFF policy (HOLD)**: `--turbo-flash` accepts
+`{on, off, auto}` with `auto` as the default, and `auto` resolves **OFF on
+every host**. The kernel passes its crash and fidelity gates and fails its
+throughput one: everywhere it fires it decodes several times slower than the
+generic K8V4 path, and because it is not bit-exact it also perturbs the
+generated tokens.
 
-`--turbo-flash on` is an explicit force-ON. `--turbo-flash off` is a hard
-override that removes `RMLX_TURBO_FLASH` from the environment so a stale
-shell value cannot latch the OnceLock back to true.
+Measured with `rmlx bench` (n=3 + warmup, one process per cell, medians,
+settle gate enforced) on a quiet host — same binary, temp=0, `--turbo-flash`
+the only difference:
+
+| cell | on vs off | token digest |
+|---|---|---|
+| Bonsai-8B `k8v4` @~1.7k (`RMLX_TURBO_FLASH_MIN=0`) | 1.93× slower | — |
+| Bonsai-8B `k8v4` @8k | 2.74× slower | **differs** |
+| Bonsai-8B `k8v4` @16k | 3.48× slower | identical |
+| Bonsai-8B `k8v4` @32k (63.25 → 14.89 TPS) | 4.25× slower | **differs** |
+| Bonsai-27B `k8v4` @16k | 1.98× slower | identical |
+
+The loss scales with `kv_seq` rather than being a fixed per-request penalty.
+Every cell above settled on both sides with zero settle-gate refusals (32k
+ranges: 1.14% off, 3.42% on). Dispatch was proven by counter, not inferred:
+1638 kernel dispatches in the ON arm against 0 in the OFF arm. Shrinking the
+ring 4× recovers part of the gap but not the bulk, so this is not a
+`--max-ctx` sizing artefact. The `on` arm also holds 722 468 864 B more
+resident KV at 16k — the persistent head-major flash buffers sit *on top of*
+the bf16 mirror and the packed store rather than replacing either.
+
+**The output is not identical.** An earlier revision of this section claimed a
+byte-identical token digest in both arms; that held on one cell and was
+generalised from it. The kernel is not bit-exact — SDPA cosine against the
+bf16 reference is ≈0.997, the V turbo-4 codec floor — and at temp=0 that flips
+greedy argmax ties prompt-dependently. Two of the four cells that fire at the
+production threshold (8k and 32k) return a different digest, deterministically
+and stably across every run of each arm; 16k and Bonsai-27B@16k happen to
+match. Reproduce it on Bonsai-8B at 8k with `rmlx bench --kv-quant k8v4
+--max-ctx 16384 --prompt-tokens 8192 --max-tokens 64 --runs 2 --warmup 1`:
+
+| arm | decode TPS | token digest | `kv_cache_bytes` |
+|---|---:|---|---:|
+| gate OFF | 110.80 | `0xb0273cf32cb9b715` | 1 668 005 888 |
+| gate ON (`RMLX_TURBO_FLASH=1`) | 42.05 | `0x75a6992e38913e64` | 2 029 240 320 |
+
+TurboFlash is therefore a decode loss *and* an output perturbation, not pure
+cost. That 8k cell also pins the extra resident KV to 361 234 432 B — exactly
+half the 16k figure, so the flash buffers scale linearly with the ring.
+
+**gemma-4-e2b is a null control, not a second architecture.** On that
+shared-KV / windowed arch (`kv_h=1`, `head_dim=256`, SWA 512) the ±0.3% A/B at
+`k8v4`@4k is inside the 1.3% noise floor — but the reason is that the kernel
+never runs: `kv_cache_bytes` is bit-identical across both arms
+(156 850 176 B), which proves the persistent flash buffers are never even
+allocated and the `kv_seq > 4096` gate stops every dispatch. That is evidence
+the gate holds, not evidence about where the kernel pays. The second *firing*
+architecture is **Bonsai-27B** (`Qwen3_5ForConditionalGeneration`,
+`head_dim=256`, `kv_h=4`), which loses 1.98× at 16k. Both supported head_dims
+lose, so there is no arch where the kernel currently pays.
+
+This supersedes the previous per-family default-ON policy. The validations that
+policy rested on are unaffected and still stand — they were crash/fidelity
+clearances, never throughput ones: 32k NIAH × 3 models on Apple ≤9
+(commit fcb2e894ccc4, 100% needle retrieval at 5 depths × 3 ctx tiers), and the
+Apple10 `head_dim = 256` hazard re-drive on M5 Max via
+`crates/rmlx-kv-quant/tests/apple10_head_dim_256.rs` (no SIGSEGV, dispatch
+fired, cosine min 0.997 vs bf16). Lifting the HOLD needs a decode measurement,
+not another one of those.
+
+`--turbo-flash on` is an explicit force-ON — the opt-in for ablation and for
+the re-measurement that would lift the HOLD. `--turbo-flash off` is a hard
+override that removes `RMLX_TURBO_FLASH` from the environment so a stale shell
+value cannot latch the OnceLock back to true; `auto` leaves an existing
+`RMLX_TURBO_FLASH=1` alone, so an operator who opted in keeps the kernel. That
+last combination — flag resolving OFF while the kernel actually runs — logs at
+`warn!` and names the cost, so a variable exported once in a shell or a CI job
+cannot carry the regression silently.
+
+`--turbo-flash` is a **global** flag: it resolves in `main` before subcommand
+dispatch, so `rmlx bench` / `rmlx baseline` measure the same kernel
+configuration `rmlx serve` runs. Until that was fixed the two disagreed on this
+very gate, and the measurement commands were the ones reading OFF.
 
 **head_dim coverage (TurboFlash kernel)**: `head_dim ∈ {128, 256}`. The
 P1 kernel's register arrays (`q_vals`, `o_state`, `v_decoded`) are sized

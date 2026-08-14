@@ -37,12 +37,16 @@
 //! floor. Same numerics at both head dims.
 //!
 //! The documented hazard does not reproduce against the current kernel
-//! surface. `apply_turbo_flags::Auto` now resolves ON across Apple7 through
-//! Apple10+ (Apple11+ is optimistically ON with an operator-visible info log
-//! until that family is hw-validated). See
-//! `docs/reports/apple10-head-dim-256-revalidation.md` for the verbatim
-//! numbers and the kernel changes that almost certainly closed the original
-//! failure mode.
+//! surface. See `docs/reports/apple10-head-dim-256-revalidation.md` for the
+//! verbatim numbers and the kernel changes that almost certainly closed the
+//! original failure mode.
+//!
+//! That clearance is crash/fidelity only, and was never a throughput one. On
+//! throughput the kernel loses: `--turbo-flash auto` resolves **OFF on every
+//! host**, because at `kv_seq > 4096` it decodes 2.0-4.25x slower than the
+//! generic K8V4 path it replaces (see
+//! `rmlx_cli::commands::serve::TurboFlashMode` for the measured cells).
+//! Enabling it is an explicit opt-in.
 //!
 //! The smoke-probe trip-wire below is retained as armour against any future
 //! drift in the kernel that might revive the `!!!!!!`-style garbage-token
@@ -112,10 +116,13 @@ use rmlx_mlx::{Array, Device, Dtype};
 
 /// Returns true when the TurboFlash kernel is enabled by env var.
 ///
-/// Default OFF at the env level; the CLI `--turbo-flash auto` (default)
-/// resolves to `RMLX_TURBO_FLASH=1` via `rmlx_cli::commands::serve::apply_turbo_flags`
-/// on every recognised Apple GPU family after the 2026-06 re-validation — see the
-/// module-level rustdoc for the Apple10 hazard timeline.
+/// Default OFF at the env level, and the CLI leaves it that way:
+/// `--turbo-flash auto` (the default) resolves **OFF on every host** via
+/// `rmlx_cli::commands::serve::apply_turbo_flags` — a throughput HOLD, see
+/// `rmlx_cli::commands::serve::TurboFlashMode` for the cells. Only
+/// `--turbo-flash on`, or an explicit `RMLX_TURBO_FLASH=1` in the environment,
+/// turns the kernel on. The 2026-06 Apple10 re-validation in the module-level
+/// rustdoc still stands; it cleared the crash/fidelity hazard, not throughput.
 pub fn turbo_flash_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| matches!(std::env::var("RMLX_TURBO_FLASH").as_deref(), Ok("1")))
