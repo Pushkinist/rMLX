@@ -173,14 +173,42 @@ pass is the K-only / sym-iso family's memory footprint:
 | k8vturbo2/3 | 12876–13084 | 1.22–1.24× | 1.22–1.24× | | planar/planar3 | 16828 | 1.60× | 1.60× |
 | k8vturbo2/3tcq | 12876–13084 | 1.22–1.24× | 1.22–1.24× | | planar_k | 15112 | 1.43× | 1.43× |
 | k8v4 | 13292 | 1.26× | 1.26× | | k8v8 | 13968 | 1.33× | 1.33× |
-| rot_k_tq4v | 13351 | 1.27× | 1.27× | | k_rotor3/4 | 16255 | 1.54× | 1.14× (broken) |
+| rot_k_tq4v | 13351 | 1.27× | 1.27× | | k_rotor3/4 | 16255 (stale) | 1.54× (defect; **1.12×** re-measured at 4k/16k — see below) | 1.14× (broken) |
 
 `k_iso3/4` and `iso3_sym/4_sym` dropped to essentially **1.00–1.01× `none`**
-(from 1.64× / 2.91×) — a real, large memory win from whatever sole-store /
-GPU-ring rework shipped alongside the new kernels. `k_rotor3/4` moved the
-other way (1.14×→1.54×) — worth a note but not a regression given the prior
-1.14× figure was explicitly marked "(broken)" in 0.2.5 (an artifact of the
-CPU-bound path, not a real measurement of the intended GPU-ring layout).
+(from 1.64× / 2.91×) once the GPU ring became their sole resident store. That
+is a large improvement on the previous figure but it is **not a memory win**:
+1.00× `none` means "ties bf16", and the format cannot do better than tie. iso
+spends one whole `u32` code word **and** one `f32` scale per 4-element group
+(16.25 bits/value at head\_dim=128) and rotor one of each per 3-element group
+(21.75), against bf16's 16.0 — so the nominal 3-bit / 4-bit width never
+reaches storage, and the 3-bit and 4-bit member of each family measure
+byte-identical here. `none` is the memory floor at every context and no member
+of this family can undercut it. See `docs/KV_QUANT.md` § "Memory truth".
+
+`k_rotor3/4`'s 1.54× was a **defect, not the layout**: the K-only rotor append
+never dropped its CPU blocks once the ring was live, so the prefill prefix
+stayed resident twice (the `_sym` appends always dropped theirs — hence 1.23×
+against the K-only pair's 1.54×). Fixed. Re-measured A/B on the same binary
+pair, prompt 4k and 16k, 3 runs each:
+
+| model | prompt | before | after | vs `none` after |
+|---|---|---|---|---|
+| Bonsai-8B (`kv_h=8`, D=128) | 4k | 990.0 MB | **717.2 MB** (−27.6%) | 1.118× |
+| Bonsai-8B | 16k | 4090.7 MB | **2959.4 MB** (−27.7%) | 1.119× |
+| gemma-4-e2b (`kv_h=1`, D=256) | 4k | 53.9 MB | **37.0 MB** (−31.4%) | 1.163× |
+| gemma-4-e2b | 16k | 201.3 MB | **130.7 MB** (−35.1%) | 1.169× |
+
+Every other codec measured byte-identical across that pair (0.00% delta), and
+decode TPS moved only within run-to-run spread: a position-balanced A/B at 16k
+(n=6 per side, 128 generated tokens) put `k_rotor3` at +0.23% and `k_rotor4` at
+−1.76%, with TTFT flat to 0.2%.
+
+**Measure this cell at 16k or longer, not at 4k.** On an M5 Max the 4k
+`k_rotor3` decode is bimodal — it lands at either ≈19.5 or ≈23.9 TPS, a 20%
+swing, on either binary, with TTFT rock-steady at 2340 ± 8 ms. n=8 per side is
+not enough to see through that; the 16k/32k cells hold a 1–3% spread and are
+where an A/B on this codec is resolvable.
 
 ### 2.2 Marginal decode cost (ms per 1k KV tokens), fit over 8k→64k
 
@@ -190,6 +218,16 @@ cells. `a` = fixed per-step cost (ms), `b` = marginal cost per 1k resident KV
 tokens (ms) — the number that predicts whether a codec can ever beat bf16 at
 long context. Grouped by whether a named flash-decode-over-quant kernel
 dispatches (confirmed via untimed verbose probe at 64k).
+
+**Read `b` as an ordering, not as a coefficient, and ignore `a` for the symv
+tier.** One global straight line over four cells is the wrong model for a curve
+that bends: where the fit reports a *negative* `a` (`iso3_sym` −4.53,
+`iso4_sym` −52.59, `rotor4_sym` −52.55) it is asserting a negative fixed
+per-step cost, which is not a thing — least-squares is absorbing convexity into
+the intercept, and the 64k cell it leans on hardest is n=1. The tier separation
+below (generic path ≪ K-only kernels ≪ symv kernels) survives that; the
+individual `a` values do not. For a number to act on, take the segment-wise
+marginal cost between two replicated adjacent cells rather than a global fit.
 
 | codec | a (ms) | b (ms/1k tok) | kernel dispatched |
 |---|---|---|---|

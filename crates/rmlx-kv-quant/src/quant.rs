@@ -287,8 +287,10 @@ pub enum KvQuant {
     /// 4.25-bit V codec — same Clifford Cl(3,0) sandwich as rotor3 with the
     /// 16-centroid Lloyd-Max N(0,1) codebook and dense 8-vals-per-u32 pack
     /// (iso4 convention: 8 codes × 4 bits = 32 bits = 1 u32 per group).
-    /// ~10.7 bpe pre-scale at bits=4 (single-codebook simplification; grade-aware
-    /// split deferred per spec).
+    /// ~10.7 bpe in codes at bits=4 (single-codebook simplification; grade-aware
+    /// split deferred per spec) — but the per-group `f32` scale sits beside the
+    /// `u32` code word, so **21.75 bits per value reach the store**, above
+    /// bf16's 16.0. Not a memory win; see `crate::rotorquant` § "Effective bpe".
     ///
     /// **Implementation scope**: CPU codec only. SDPA falls through to the
     /// dequant-then-SDPA legacy fallback path. No MSL kernel (deferred). Single-
@@ -839,16 +841,28 @@ impl KvQuant {
         }
     }
 
-    /// Effective per-side `(k_bits, v_bits)` an estimator can use to model the
-    /// packed-code footprint of this codec, model-agnostically.
+    /// Per-side `(k_bits, v_bits)` **codebook** width an estimator can use to
+    /// model this codec, model-agnostically.
     ///
-    /// These are the bit-widths of the **stored codes** per element, not a
-    /// quality claim. `None` (bf16) reports 16/16. K-only codecs report a bf16
-    /// (16-bit) V; V-only codecs (PlanarK) report a bf16 (16-bit) K. The
-    /// rotor/iso/turbo families report their nominal code width.
+    /// A codebook width, not a delivered density and not a quality claim.
+    /// `None` (bf16) reports 16/16 — for that codec the two coincide. K-only
+    /// codecs report a bf16 (16-bit) V; V-only codecs (PlanarK) report a bf16
+    /// (16-bit) K.
+    ///
+    /// **The iso and rotor families do not store at their codebook width.**
+    /// Their stores spend one whole `u32` code word *and* one `f32` scale per
+    /// group — 4 head-dim slots for iso, 3 for rotor — so a 3-bit and a 4-bit
+    /// member of either family occupy byte-identical storage: 16.25 bits per
+    /// value for iso and 21.75 for rotor at `head_dim = 128`, against bf16's
+    /// 16.0. The width below is what the codebook quantizes to, not what
+    /// reaches memory. [`Self::estimated_resident_bytes_per_layer`] therefore
+    /// does not size those two families from this number at all — it models
+    /// their group layout directly — and only reads it to tell a packed side
+    /// from a bf16 one (`bits >= 16`).
     ///
     /// Used by [`Self::estimated_resident_bytes_per_layer`] to size the packed
-    /// codes; the per-group scale / rotation / bias overhead is added there.
+    /// codes of the generic (affine / turbo / planar) families; the per-group
+    /// scale / rotation / bias overhead is added there.
     #[must_use]
     #[allow(
         clippy::match_same_arms,
