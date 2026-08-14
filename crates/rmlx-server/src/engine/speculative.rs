@@ -503,7 +503,7 @@ impl Generator for SpeculativeGenerator {
 
     fn kv_cache_bytes(&self) -> u64 {
         // SpeculativeDispatcher wraps a Gemma4 verifier — reads its static.
-        rmlx_models::gemma4::gemma4_kv_cache_bytes()
+        rmlx_models::gemma4::gemma4_kv_cache_bytes_sample().bytes
     }
 
     fn load_phases(&self) -> Option<rmlx_models::LoadPhases> {
@@ -1011,7 +1011,7 @@ impl Generator for SpeculativeGenerator {
                     // F6/L18: emit KV-cache bytes to SPSC drainer (SpeculativeGenerator
                     // always wraps a Gemma4 verifier, so the global static applies).
                     {
-                        let kv_bytes = rmlx_models::gemma4::gemma4_kv_cache_bytes();
+                        let kv_bytes = rmlx_models::gemma4::gemma4_kv_cache_bytes_sample().bytes;
                         if kv_bytes > 0 {
                             if let Some(ref drainer) = metrics_drainer {
                                 use crate::metrics_drainer::{MetricEvent, MetricKind};

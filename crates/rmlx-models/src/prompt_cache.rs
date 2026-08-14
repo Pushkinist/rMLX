@@ -178,6 +178,30 @@ pub struct CacheStats {
 }
 
 // ---------------------------------------------------------------------------
+// KvBytesSample
+// ---------------------------------------------------------------------------
+
+/// A read of an arch's last-request KV-cache byte total, tagged with the store
+/// sequence it was written at.
+///
+/// The bare byte count is ambiguous: `0` is both the never-written initialiser
+/// and a legal (if suspicious) reading, and a non-zero value read after a
+/// generation that never reported one is the *previous* generation's figure.
+/// Callers that record the number as a measurement need to tell those apart, so
+/// they sample the pair before and after the generation and require `seq` to
+/// have advanced. See [`crate::arch::Architecture::kv_cache_bytes_sample`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KvBytesSample {
+    /// Byte total recorded by the most recent `store_kv_cache_bytes` call.
+    /// Meaningless unless `seq > 0`.
+    pub bytes: u64,
+    /// Number of `store_kv_cache_bytes` calls on this arch since process start.
+    /// `0` means no generation has reported a figure.
+    pub seq: u64,
+}
+
+// ---------------------------------------------------------------------------
 // PromptCacheEntry trait
 // ---------------------------------------------------------------------------
 
@@ -1017,6 +1041,16 @@ pub(crate) struct ArchPromptCache<E: PromptCacheEntry> {
     attach: std::sync::Mutex<Option<AttachParams>>,
     /// Last-request KV-cache byte total, surfaced via `/metrics/cache`.
     last_kv_bytes: std::sync::atomic::AtomicU64,
+    /// Number of `store_kv_cache_bytes` calls on this arch since process start.
+    ///
+    /// `last_kv_bytes` alone cannot tell "no generation has reported a figure
+    /// yet" from "a generation reported zero", nor "this generation reported"
+    /// from "you are reading the previous generation's figure". Both collapse
+    /// to a plausible-looking number a caller would record as a measurement.
+    /// The sequence makes the distinction observable: a caller that samples it
+    /// before and after a generation knows whether the byte count it reads
+    /// belongs to that generation.
+    kv_bytes_seq: std::sync::atomic::AtomicU64,
 }
 
 impl<E: PromptCacheEntry> ArchPromptCache<E> {
@@ -1029,6 +1063,7 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
             inner: std::sync::Mutex::new(None),
             attach: std::sync::Mutex::new(None),
             last_kv_bytes: std::sync::atomic::AtomicU64::new(0),
+            kv_bytes_seq: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1365,10 +1400,22 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
             .map(PromptCache::stats)
     }
 
-    /// Read the KV-cache bytes from the last completed request (0 if none).
-    pub(crate) fn read_kv_cache_bytes(&self) -> u64 {
-        self.last_kv_bytes
-            .load(std::sync::atomic::Ordering::Relaxed)
+    /// Read the KV-cache bytes from the last completed request, paired with the
+    /// store sequence they were written at.
+    ///
+    /// `seq == 0` means no generation on this arch has reported a figure yet,
+    /// so `bytes` is the `0` initialiser and not a measurement.
+    pub(crate) fn read_kv_cache_bytes_sample(&self) -> KvBytesSample {
+        // Load the sequence LAST: a concurrent store bumps `last_kv_bytes`
+        // before the sequence, so a sequence read after the byte read can only
+        // under-report progress. A caller comparing sequences then sees "no new
+        // reading" and refuses, rather than pairing a fresh byte count with a
+        // stale sequence and reporting it as its own.
+        let bytes = self
+            .last_kv_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let seq = self.kv_bytes_seq.load(std::sync::atomic::Ordering::Acquire);
+        KvBytesSample { bytes, seq }
     }
 
     /// Store the KV-cache bytes for the just-finished request. Called by
@@ -1390,6 +1437,10 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
         tracing::debug!(kv_bytes = n, "kv cache bytes");
         self.last_kv_bytes
             .store(n, std::sync::atomic::Ordering::Relaxed);
+        // Release-ordered so a reader that observes the bumped sequence also
+        // observes the byte count that goes with it.
+        self.kv_bytes_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 }
 

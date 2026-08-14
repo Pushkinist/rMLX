@@ -403,7 +403,7 @@ Source of truth for `observations.metric`, `.unit`, `.direction`. Add to this ta
 | `model_load_ms`       | `ms`    | `lower_better`  | Wall time from `serve` start to "ready" log line.                       |
 | `peak_rss_mb`         | `mb`    | `lower_better`  | Peak resident set during the run.                                       |
 | `metal_peak_alloc_mb` | `mb`    | `lower_better`  | Peak Metal device allocation (from `mx.metal.get_peak_memory()`).       |
-| `kv_cache_bytes`      | `bytes` | `lower_better`  | Live-inference KV resident bytes at end of generation: the *filled* prefix of the cache that actually serves decode (packed codes + scales + rotation/residual buffers, plus the per-position bf16/f32 decode buffers scaled to the filled length). Reads real Array shapes × dtype via `KvCache::resident_bytes`, but counts only `offset` positions of the seq-scaled buffers — the bf16/f32 decode mirrors are pre-allocated to the `--max-ctx` ceiling, so counting the whole allocation would inflate the figure and make bytes-per-KV-token depend on the ceiling rather than the prompt. Excludes any prompt-cache snapshot clone (held separately, never summed). Sampled at ONE lifecycle point on every arch — **after the decode loop**, when the decode-time GPU ring of a ring-backed codec is resident — so the figure is comparable across archs and across prompt-cache hit/miss. "One lifecycle point" means post-decode *and only when a decode ran*: an immediate-EOS or NaN-prefill run (no decode loop) does not refresh this metric and keeps the prior value — uniform across archs, and lossless since with no decode there is no ring. The requirement is gated by a witness: `store_kv_cache_bytes` takes a `PostDecode` minted only by a completed decode loop, so re-co-locating the store at the prefill snapshot fails to compile (the loop's witness is not in scope there). It is a raised bar + review convention backed by a manual-GPU re-drift test, not an unforgeable compile guarantee — `seal()` is `pub(crate)`. |
+| `kv_cache_bytes`      | `bytes` | `lower_better`  | Live-inference KV resident bytes at end of generation: the *filled* prefix of the cache that actually serves decode (packed codes + scales + rotation/residual buffers, plus the per-position bf16/f32 decode buffers scaled to the filled length). Reads real Array shapes × dtype via `KvCache::resident_bytes`, but counts only `offset` positions of the seq-scaled buffers — the bf16/f32 decode mirrors are pre-allocated to the `--max-ctx` ceiling, so counting the whole allocation would inflate the figure and make bytes-per-KV-token depend on the ceiling rather than the prompt. Excludes any prompt-cache snapshot clone (held separately, never summed). Sampled at ONE lifecycle point on every arch — **after the decode loop**, when the decode-time GPU ring of a ring-backed codec is resident — so the figure is comparable across archs and across prompt-cache hit/miss. "One lifecycle point" means post-decode *and only when a decode ran*: an immediate-EOS or NaN-prefill run (no decode loop) does not refresh this metric and keeps the prior value — uniform across archs, and lossless since with no decode there is no ring. The requirement is gated by a witness: `store_kv_cache_bytes` takes a `PostDecode` minted only by a completed decode loop, so re-co-locating the store at the prefill snapshot fails to compile (the loop's witness is not in scope there). It is a raised bar + review convention backed by a manual-GPU re-drift test, not an unforgeable compile guarantee — `seal()` is `pub(crate)`. **Reading it back:** the "keeps the prior value" case above means a bare byte count cannot be attributed to a particular generation. `Architecture::kv_cache_bytes_sample()` therefore returns `(bytes, seq)`, where `seq` counts `store_kv_cache_bytes` calls on that arch. A caller that *records* the figure samples the pair before and after the generation and requires `seq` to have advanced; if it did not, the readable count belongs to an earlier generation (or is the unset `0` initialiser) and must be refused, not written. `Architecture::kv_cache_bytes()` returns the bare count and is for display surfaces (`/metrics/cache`) that have no generation boundary to check against — do not record from it. |
 | `tps_per_gb_ram`      | `ratio` | `higher_better` | `decode_tps_warm / peak_rss_gb` — runtime efficiency.                   |
 | `task_pass_at_1`      | `ratio` | `higher_better` | Quality probe pass rate (CBB-style). 0.0–1.0.                           |
 | `prompt_cache_block_hits`        | `count` | `higher_better` | Cumulative 256-tok blocks served from a cached prefix.   |
@@ -739,6 +739,25 @@ Crate plan:
 - `crates/rmlx-metrics/` — new lib crate. Owns DB connection, schema migrations, canonicalization (§5), metric registry (§4), prompt registry, ingest API.
 - `crates/rmlx-cli` — adds `metrics` subcommand wrapping the lib.
 - Deps: `rusqlite` (bundled feature for static SQLite), `serde` for JSONL row deserialization.
+
+### 8.1.1 What is NOT a recording path: `rmlx bench`
+
+`rmlx bench` (see [`docs/CLI.md`](CLI.md#bench)) measures the same quantities —
+TTFT, ITL p50/p99, decode TPS, `kv_cache_bytes` — over N repeated runs of one
+cell and prints medians with the observed range. It **writes nothing**: no
+buffer file, no `observations` row, no `bests` entry. Looking for its numbers in
+`runs.db` will find nothing, by design.
+
+The split is deliberate. `runs.db` is append-only, so a row recorded under the
+wrong conditions is permanent; `bench` exists to *establish* a number and its
+spread interactively, including the runs that get thrown away. When a figure is
+worth keeping, `rmlx baseline --record` is the path that writes it.
+
+`bench` is also where the refusal rules live in executable form — a
+prompt-cache-served run, a KV-byte figure the run did not itself report, and a
+`--runs 1` invocation are all hard errors there. Any future recording path that
+measures the same quantities should refuse on the same conditions rather than
+record a plausible-looking value.
 
 ### 8.2 Subcommands
 

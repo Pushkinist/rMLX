@@ -18,7 +18,8 @@ Subcommands:
 | `serve` | OpenAI + Anthropic-compatible HTTP inference server |
 | `chat` | Interactive REPL for ad-hoc model testing |
 | `info` | Print arch + quant metadata for a snapshot; no inference |
-| `baseline` | Measure load time, TTFT, decode TPS, peak RSS |
+| `baseline` | Measure load time, TTFT, decode TPS, peak RSS — one run, one metrics row |
+| `bench` | Repeated-run decode instrument: TTFT, ITL p50/p99, decode TPS, KV bytes with run-to-run spread; prints only |
 | `healthcheck` | Shell-able readiness probe; JSON or plain text output |
 | `metrics` | Metrics database management (schema, query, export) |
 | `eval ppl` | Offline perplexity evaluation over a text corpus |
@@ -377,6 +378,112 @@ rmlx baseline --model /path/to/snapshot --prompt-tokens 131072 \
 # recording a 65536-token run under a 128k label.
 rmlx baseline --model /path/to/snapshot --prompt-tokens 131072 --device gpu
 ```
+
+---
+
+### `bench`
+
+Repeated-run decode instrument for one (model, KV codec, context, generation
+length) cell. Serves the cell `--warmup` + `--runs` times **in one process**
+and reports four quantities as a median with the observed run-to-run range:
+
+| Metric | Meaning |
+|---|---|
+| `ttft_ms` | Prefill through first token. |
+| `itl_p50_ms` / `itl_p99_ms` | Inter-token latency percentiles **within** a run (nearest-rank over the gaps between consecutive token arrivals). |
+| `decode_tps` | Steady-state decode rate over tokens 2..N — prefill excluded. |
+| `prefill_tps` | Prompt tokens / TTFT. |
+| `kv_cache_bytes` | Filled-prefix KV cache bytes, sampled post-decode. |
+
+```bash
+rmlx bench --model /path/to/snapshot --prompt-tokens 4096 --max-tokens 128
+rmlx bench --model /path/to/snapshot --prompt-tokens 32768 --max-ctx 40960 \
+  --kv-quant k8v4 --runs 5 --warmup 1 --json
+```
+
+```text
+bench: model=… arch=Qwen3ForCausalLM kv_quant=… prompt=longctx_4k prompt_tokens=4096 …
+metric                   median            min            max    range%
+ttft_ms                  512.30         509.11         514.90       1.1%
+itl_p50_ms                 9.012          8.998          9.031       0.4%
+itl_p99_ms                 9.877          9.640         10.204       6.3%
+decode_tps               110.914        110.612        111.083       0.4%
+kv_cache_bytes         134217728      134217728      134217728       0.0%
+host: cpus=16 load_1m=1.20→1.35
+```
+
+#### `bench` vs `baseline`
+
+| | `baseline` | `bench` |
+|---|---|---|
+| Runs per invocation | 1 | `--warmup` + `--runs` (min 2 measured) |
+| Output | one-line summary | median + min/max + range% per metric |
+| ITL percentiles | no | yes (p50, p99) |
+| Writes to `runs.db` | with `--record` | never — prints only |
+| Prompt-cache slots | 1 | 0 (every run is a fresh prefill) |
+
+Use `baseline --record` when a row must land in the append-only store; use
+`bench` when the question is "what is this cell's number, and how much do I
+trust it".
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `--model` | path | required | Path to the model snapshot directory. |
+| `--prompt` | path | bundled fixture | Prompt file. Same plain-text / chat-JSON handling as `baseline`. Mutually exclusive with `--prompt-tokens`. |
+| `--prompt-tokens` | u32 | — | Canonical bench prompt from `prompts/longctx_<N/1024>k.json`. Mutually exclusive with `--prompt`. |
+| `--device` | `cpu \| gpu` | `gpu` | Inference device. |
+| `--max-tokens` / `--gen-tokens` | u32 | 128 | Tokens generated per run. |
+| `--runs` | u32 | 3 | Measured runs. **Must be ≥ 2** — see "Refusals" below. |
+| `--warmup` | u32 | 1 | Discarded runs before the measured ones. |
+| `--kv-quant` | string | `auto` | KV cache quantization preset. |
+| `--kv-preset` | string | — | Named KV-cache preset. Same values and exclusions as `baseline`. |
+| `--cache-type-k` / `--ctk`, `--cache-type-v` / `--ctv` | string | — | Per-side KV codec. Mutually exclusive with `--kv-quant`. |
+| `--kv-bits` | float | — | Bit-width alias. Mutually exclusive with `--kv-quant` and `--cache-type-*`. |
+| `--kv-group-size` | usize | 64 | Group size for `--kv-bits`. |
+| `--max-ctx` / `--ctx-max` | u32 | (from model) | KV cache buffer token capacity. Must be ≥ 256 when set. |
+| `--max-prompt-tokens` | usize | 65536 | Cap on the tokenized prompt length. Same device-dependent semantics as `baseline`. |
+| `--allow-truncate` | bool flag | off | Opt into truncating an over-cap prompt on `--device gpu`. |
+| `--json` | bool flag | off | Emit one JSON object (per-metric spreads plus every individual run) instead of the table. |
+| `--prompts-dir` | path | (cwd walk) | Root to search for `longctx_<N>k.json`. Env: `RMLX_PROMPTS_DIR`. |
+
+#### Refusals
+
+The numbers `bench` prints are used to accept or reject work, so it aborts
+rather than print one whose measurement conditions did not hold. Each of these
+is a hard error naming the cause, never a silent zero or a plausible default:
+
+- **`--runs 1`.** A single measurement has no observable spread, and this
+  instrument does not report a central value without one. Checked before any
+  file is opened.
+- **A run served from the prompt cache.** `bench` uses zero prompt-cache slots
+  so every run performs a real prefill, and then *verifies* it from the arch's
+  cache counters: no hits, and at least one miss. A hit means the post-prefill
+  KV snapshot was replayed, so the run's TTFT is a cache-replay time — small,
+  stable, and not a time-to-first-token. Absent counters are refused too:
+  nothing observable would then say a prefill happened.
+- **A KV-byte figure the run did not report.** The arch's byte count is read as
+  a `(bytes, seq)` pair (`Architecture::kv_cache_bytes_sample`), sampled before
+  and after each generation. If `seq` did not advance, the readable value
+  belongs to an *earlier* generation (or is the unset initialiser) and is
+  refused. A reported-but-zero count is a separate, differently-worded error:
+  the reporting path worked and the byte accounting is what is wrong.
+- **A callback/token count mismatch**, which would mean the arrival timestamps
+  cannot be attributed to the returned tokens.
+- **Fewer than 2 tokens generated**, which yields no inter-token interval and
+  no steady-state rate. `bench` does not substitute the combined
+  prefill+decode number in their place.
+
+#### Host contention
+
+`bench` reads the 1-minute load average before and after the measured runs and
+prints both. When either sample is at or above the CPU count, the summary is
+marked `CONTENDED` (and a `warn!` is emitted): the numbers are a lower bound
+taken on a busy host, not quiet-machine figures. An unreadable load average is
+reported as `n/a`, never as `0.00`.
+
+`bench` does not abort on contention — measuring under known load is a
+legitimate thing to do deliberately — it just makes it impossible to mistake
+the result for a quiet-machine one afterwards.
 
 ---
 
@@ -1077,6 +1184,26 @@ rmlx baseline \
   --kv-quant k8v8 \
   --label "phase-3-gate" \
   --record
+```
+
+### Bench a KV-codec cell with its spread
+
+```bash
+# Three measured runs after one warmup; median + range per metric.
+rmlx bench \
+  --model /path/to/snapshot \
+  --prompt-tokens 4096 \
+  --max-tokens 128 \
+  --kv-quant k8v4
+
+# Long context, machine-readable, five runs for a tighter range.
+rmlx bench \
+  --model /path/to/snapshot \
+  --prompt-tokens 32768 \
+  --max-ctx 40960 \
+  --max-tokens 128 \
+  --runs 5 \
+  --json
 ```
 
 ### Metrics database operations

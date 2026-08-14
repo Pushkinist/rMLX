@@ -1246,21 +1246,39 @@ impl Architecture {
     }
 
     /// Actual on-device KV-cache bytes used by the most recent `generate_greedy`
-    /// call on this architecture.
+    /// call on this architecture, paired with the store sequence they were
+    /// written at.
     ///
     /// Reads the arch-specific prompt-cache static that `generate_greedy` writes
     /// via `store_kv_cache_bytes` at the end of every generate call.
-    pub fn kv_cache_bytes(&self) -> u64 {
+    ///
+    /// Callers that *record* the byte count as a measurement must sample this
+    /// before and after the generation and require [`KvBytesSample::seq`] to
+    /// have advanced. Without that check, a generation that returns before
+    /// reaching the store (an early-out prefill path, or an arch that does not
+    /// maintain the static) yields the previous call's byte count — or the `0`
+    /// initialiser — with nothing to distinguish it from a fresh reading.
+    pub fn kv_cache_bytes_sample(&self) -> crate::prompt_cache::KvBytesSample {
         match self {
-            Architecture::Gemma4(_) => crate::gemma4::gemma4_kv_cache_bytes(),
-            Architecture::Gemma3(_) => crate::gemma3::gemma3_kv_cache_bytes(),
-            Architecture::Qwen3_5Moe(_) => crate::qwen3_5_moe::qwen3_5_moe_kv_cache_bytes(),
-            Architecture::Qwen3(_) => crate::qwen3::read_kv_cache_bytes(),
-            Architecture::Qwen2(_) => crate::qwen2::qwen2_kv_cache_bytes(),
-            Architecture::BitNet(_) => crate::bitnet::bitnet_kv_cache_bytes(),
-            Architecture::Qwen3VlMoe(_) => crate::qwen3_vl_moe::qwen3_vl_moe_kv_cache_bytes(),
-            Architecture::Laguna(_) => crate::laguna::laguna_kv_cache_bytes(),
+            Architecture::Gemma4(_) => crate::gemma4::gemma4_kv_cache_bytes_sample(),
+            Architecture::Gemma3(_) => crate::gemma3::gemma3_kv_cache_bytes_sample(),
+            Architecture::Qwen3_5Moe(_) => crate::qwen3_5_moe::qwen3_5_moe_kv_cache_bytes_sample(),
+            Architecture::Qwen3(_) => crate::qwen3::read_kv_cache_bytes_sample(),
+            Architecture::Qwen2(_) => crate::qwen2::qwen2_kv_cache_bytes_sample(),
+            Architecture::BitNet(_) => crate::bitnet::bitnet_kv_cache_bytes_sample(),
+            Architecture::Qwen3VlMoe(_) => {
+                crate::qwen3_vl_moe::qwen3_vl_moe_kv_cache_bytes_sample()
+            }
+            Architecture::Laguna(_) => crate::laguna::laguna_kv_cache_bytes_sample(),
         }
+    }
+
+    /// Bare byte count from [`Self::kv_cache_bytes_sample`], for the reporting
+    /// surfaces (`/metrics/cache`, the server's per-request gauge) that display
+    /// the last-known figure and have no generation boundary to check it
+    /// against.
+    pub fn kv_cache_bytes(&self) -> u64 {
+        self.kv_cache_bytes_sample().bytes
     }
 
     /// Arch-pinned auto-KV default, when the arch must not take the

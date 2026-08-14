@@ -106,7 +106,7 @@ use commands::serve::{FusedQkMode, PlanarFlashDecodeMode, SparseAttnMode, TurboF
 use commands::{
     acquire_claim_for_device, build_cache_type_spec, parse_device, parse_kv_bits_combo,
     parse_kv_bits_fractional, parse_kv_preset, parse_kv_quant, parse_max_ctx,
-    parse_max_prompt_tokens, resolve_model_flags, resolve_preset_arg, run_baseline,
+    parse_max_prompt_tokens, resolve_model_flags, resolve_preset_arg, run_baseline, run_bench,
     run_healthcheck, run_info, run_kv_calibrate, run_ppl, run_serve,
 };
 
@@ -1070,6 +1070,110 @@ enum Cmd {
         #[arg(long, env = "RMLX_YARN_ORIGINAL_MAX", value_name = "U32")]
         yarn_original_max: Option<u32>,
     },
+    /// Repeated-run decode instrument: TTFT, ITL p50/p99, decode TPS and
+    /// filled-prefix KV bytes for one (model, KV codec, context, generation)
+    /// cell, as a median plus the observed run-to-run range.
+    ///
+    /// Unlike `baseline` (one run, one row appended to the metrics store),
+    /// `bench` runs the cell `--warmup` + `--runs` times in one process,
+    /// prints the spread, and writes nothing. It aborts rather than print a
+    /// number whose measurement conditions did not hold — a run served from
+    /// the prompt cache (so its TTFT is a replay time) and a KV-byte figure
+    /// the run did not itself report are both hard errors.
+    Bench {
+        /// Path to the model snapshot directory.
+        #[arg(long)]
+        model: PathBuf,
+        /// Path to the prompt file. Defaults to the bundled fixture. Mutually
+        /// exclusive with `--prompt-tokens`.
+        #[arg(
+            long,
+            default_value = "crates/rmlx-cli/tests/fixtures/baseline_prompt.txt",
+            conflicts_with = "prompt_tokens"
+        )]
+        prompt: PathBuf,
+        /// Select a canonical bench prompt from `prompts/longctx_<N/1024>k.json`
+        /// (e.g. `--prompt-tokens 4096` → `prompts/longctx_4k.json`). Mutually
+        /// exclusive with `--prompt`.
+        #[arg(long, value_name = "N")]
+        prompt_tokens: Option<u32>,
+        /// Device: "cpu" or "gpu".
+        #[arg(long, default_value = "gpu")]
+        device: String,
+        /// Tokens to generate per run. Visible alias `--gen-tokens`.
+        #[arg(long, visible_alias = "gen-tokens", default_value_t = 128)]
+        max_tokens: u32,
+        /// Measured runs. Must be >= 2 — a single run has no observable spread.
+        #[arg(long, default_value_t = 3)]
+        runs: u32,
+        /// Discarded warmup runs before the measured ones.
+        #[arg(long, default_value_t = 1)]
+        warmup: u32,
+        /// KV cache quantization: "auto" (arch default), "bf16" (unquantised
+        /// cache; alias "none"), "k8v4", "k8v8", "planar", ...
+        #[arg(long, default_value = "auto")]
+        kv_quant: String,
+        /// Named KV-cache preset (see `rmlx baseline --help` long-help).
+        /// Mutually exclusive with `--kv-quant`, `--cache-type-k`,
+        /// `--cache-type-v` and `--kv-bits`.
+        #[arg(
+            long,
+            value_name = "NAME",
+            conflicts_with_all = &["kv_quant", "cache_type_k", "cache_type_v", "kv_bits"],
+            value_parser = parse_kv_preset,
+            long_help = KV_PRESET_LONG_HELP,
+        )]
+        kv_preset: Option<KvPresetArg>,
+        /// Per-side KV cache codec for K (see long-help).
+        #[arg(
+            long = "cache-type-k",
+            visible_alias = "ctk",
+            value_name = "TAG",
+            conflicts_with = "kv_quant",
+            long_help = CACHE_TYPE_K_LONG_HELP,
+        )]
+        cache_type_k: Option<String>,
+        /// Per-side KV cache codec for V (see long-help).
+        #[arg(
+            long = "cache-type-v",
+            visible_alias = "ctv",
+            value_name = "TAG",
+            conflicts_with = "kv_quant",
+            long_help = CACHE_TYPE_V_LONG_HELP,
+        )]
+        cache_type_v: Option<String>,
+        /// Integer bit-width KV quantization alias. See long-help.
+        #[arg(
+            long,
+            value_name = "BITS",
+            conflicts_with_all = &["kv_quant", "cache_type_k", "cache_type_v"],
+            long_help = KV_BITS_LONG_HELP,
+        )]
+        kv_bits: Option<f32>,
+        /// Group size for --kv-bits (default 64). See --kv-bits long-help.
+        #[arg(long, value_name = "N", requires = "kv_bits")]
+        kv_group_size: Option<usize>,
+        /// Maximum context length (tokens) for the KV cache buffer. Visible
+        /// alias `--ctx-max`. Must be >= 256 when set.
+        #[arg(long, visible_alias = "ctx-max")]
+        max_ctx: Option<u32>,
+        /// Truncate the tokenized prompt to at most this many tokens. Defaults
+        /// to the built-in cap (65536). Same device-dependent semantics as
+        /// `rmlx baseline --max-prompt-tokens`.
+        #[arg(long, value_name = "N")]
+        max_prompt_tokens: Option<usize>,
+        /// Opt into silently truncating a too-long prompt on `--device gpu`
+        /// instead of erroring.
+        #[arg(long, default_value_t = false)]
+        allow_truncate: bool,
+        /// Emit the summary as one JSON object instead of the text table.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Root directory to search for canonical bench prompt files
+        /// (`longctx_<N>k.json`). Env: `RMLX_PROMPTS_DIR`.
+        #[arg(long, env = "RMLX_PROMPTS_DIR", value_name = "PATH")]
+        prompts_dir: Option<PathBuf>,
+    },
     /// Manage named server profiles in `<RMLX_HOME>/profiles.toml`.
     Profile {
         #[command(subcommand)]
@@ -1205,6 +1309,30 @@ const DEFAULT_MAX_TOKENS_CAP: u32 = u32::MAX;
 const DEFAULT_MAX_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_MAX_LOADED_MODELS: usize = 1;
 const DEFAULT_MAX_QUEUE_DEPTH: usize = 64;
+
+/// Locate the canonical bench-prompt directory (`prompts/longctx_<N>k.json`).
+///
+/// An explicit `--prompts-dir` wins; otherwise walk up from cwd looking for a
+/// `prompts/` subdirectory that contains `longctx_4k.json` (the workspace-root
+/// convention the bench harnesses use), falling back to `prompts/` relative to
+/// cwd. Shared by `baseline` and `bench` so both resolve `--prompt-tokens N`
+/// against the same directory.
+fn resolve_prompts_root(prompts_dir: Option<PathBuf>) -> PathBuf {
+    prompts_dir
+        .or_else(|| {
+            let mut cur = std::env::current_dir().ok()?;
+            loop {
+                let p = cur.join("prompts");
+                if p.join("longctx_4k.json").exists() {
+                    return Some(p);
+                }
+                if !cur.pop() {
+                    return None;
+                }
+            }
+        })
+        .unwrap_or_else(|| PathBuf::from("prompts"))
+}
 
 #[allow(
     clippy::expect_used,
@@ -1961,22 +2089,7 @@ fn main() -> Result<()> {
             // Resolve --prompt-tokens → canonical longctx file when present.
             // The prompts/ dir lives at the workspace root; locate it via the
             // --prompts-dir flag (env: RMLX_PROMPTS_DIR) or a cwd-walk.
-            let prompts_root = prompts_dir
-                .or_else(|| {
-                    // Walk up from cwd for `prompts/longctx_4k.json` (mirrors
-                    // the workspace-root convention used by the bench harness).
-                    let mut cur = std::env::current_dir().ok()?;
-                    loop {
-                        let p = cur.join("prompts");
-                        if p.join("longctx_4k.json").exists() {
-                            return Some(p);
-                        }
-                        if !cur.pop() {
-                            return None;
-                        }
-                    }
-                })
-                .unwrap_or_else(|| PathBuf::from("prompts"));
+            let prompts_root = resolve_prompts_root(prompts_dir);
 
             let (effective_prompt_path, prompt_id_opt, prompt_body_opt): (
                 PathBuf,
@@ -2061,6 +2174,76 @@ fn main() -> Result<()> {
                 &sink,
                 record_args,
             )?;
+        }
+        Cmd::Bench {
+            model,
+            prompt,
+            prompt_tokens,
+            device,
+            max_tokens,
+            runs,
+            warmup,
+            kv_quant,
+            kv_preset,
+            cache_type_k,
+            cache_type_v,
+            kv_bits,
+            kv_group_size,
+            max_ctx,
+            max_prompt_tokens,
+            allow_truncate,
+            json,
+            prompts_dir,
+        } => {
+            let cap_is_explicit = max_prompt_tokens.is_some();
+            let max_prompt_tokens = parse_max_prompt_tokens(
+                max_prompt_tokens.unwrap_or(commands::baseline::MAX_PROMPT_TOKENS),
+            )?;
+            // Same KV resolution ladder as `baseline`, so a cell benched here
+            // and a cell recorded there name the same codec.
+            let (dev, kv_quant_resolved, max_ctx_override) = if let Some(preset_arg) = kv_preset {
+                let max_ctx_override = parse_max_ctx(max_ctx)?;
+                let dev = parse_device(&device)?;
+                let cfg = rmlx_loader::load_config(&model)
+                    .map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
+                let preset_kq = resolve_preset_arg(preset_arg, &cfg, max_ctx_override);
+                info!(kv_quant = ?preset_kq, "--kv-preset resolved");
+                let kq = commands::parse::resolve_kv_quant(&cfg, Some(preset_kq), None);
+                (dev, kq, max_ctx_override)
+            } else {
+                resolve_model_flags(
+                    &model,
+                    &kv_quant,
+                    cache_type_k.as_deref(),
+                    cache_type_v.as_deref(),
+                    max_ctx,
+                    &device,
+                    "rmlx bench",
+                    kv_bits,
+                    kv_group_size,
+                )?
+            };
+            let _claim = acquire_claim_for_device(dev, SENTINEL_PORT)?;
+
+            let prompts_root = resolve_prompts_root(prompts_dir);
+            let (prompt_path, prompt_label) =
+                commands::bench::resolve_prompt(&prompts_root, prompt, prompt_tokens)?;
+
+            run_bench(commands::bench::BenchArgs {
+                model,
+                prompt: prompt_path,
+                prompt_label,
+                device: dev,
+                max_tokens,
+                runs,
+                warmup,
+                kv_quant: kv_quant_resolved,
+                max_ctx: max_ctx_override,
+                max_prompt_tokens,
+                cap_is_explicit,
+                allow_truncate,
+                json,
+            })?;
         }
         Cmd::Eval { cmd } => match cmd {
             EvalCmd::Ppl {
