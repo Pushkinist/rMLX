@@ -292,7 +292,7 @@ rmlx baseline --model /path/to/snapshot --prompt-tokens 4096 --label "8k-bench"
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `--model` | path | required | Path to the model snapshot directory. |
-| `--prompt` | path | bundled fixture | Path to a plain-text prompt file. Mutually exclusive with `--prompt-tokens`. |
+| `--prompt` | path | bundled fixture | Path to a prompt file. Mutually exclusive with `--prompt-tokens`. A plain-text file is tokenized as-is; a chat-JSON file (`{"messages": [{"role": ..., "content": ...}, ...], ...}`) is rendered through the model's `chat_template.jinja` first (see below). |
 | `--prompt-tokens` | u32 | — | Select a canonical bench prompt from `prompts/longctx_<N/1024>k.json`. Mutually exclusive with `--prompt`. |
 | `--device` | `cpu \| gpu` | `gpu` | Inference device. |
 | `--max-tokens` / `--gen-tokens` | u32 | 32 | Number of tokens to generate. |
@@ -309,6 +309,18 @@ rmlx baseline --model /path/to/snapshot --prompt-tokens 4096 --label "8k-bench"
 | `--label` | string | — | Free-form campaign label stamped into the metrics record's `notes` column. |
 | `--record` | bool flag | off | Emit a §8.5 `RunRecord` to the metrics buffer and ingest into `runs.db` in-process. |
 | `--git-sha` | string | — | Commit SHA to stamp on the emitted record's `git_sha` column (only meaningful with `--record`). Provenance the caller supplies — the binary does not and cannot determine the commit it was built from. Absent by default (`git_sha` is `NULL`). |
+
+#### Chat-JSON prompt tokenization
+
+The canonical `prompts/longctx_<N/1024>k.json` fixtures (and any `--prompt`
+file with the same shape) are a JSON envelope around a `messages` array, not
+raw prompt text. `baseline` detects this shape and renders the messages
+through the model's `chat_template.jinja` before tokenizing — the same
+render-then-tokenize path the HTTP chat-completions route uses — so
+`--prompt-tokens N` measures N *content* tokens, not the fixture's JSON
+envelope + syntax tokens (keys like `messages`, `role`, `prompt_tokens`, …).
+A plain-text `--prompt` file (the bundled default fixture) is tokenized
+as-is, unaffected.
 
 #### Prompt-length cap
 

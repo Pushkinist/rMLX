@@ -334,3 +334,124 @@ fn resolve_prompt_truncation_cpu_over_limit_always_truncates() {
         .expect("cpu always truncates");
     assert_eq!(len, 65_536);
 }
+
+// ── chat-JSON fixture tokenization (bug: baseline tokenized the raw JSON
+// envelope, not the message content) ────────────────────────────────────
+//
+// A chat-JSON bench fixture (`prompts/longctx_<N>k.json`) is a JSON envelope
+// around a `messages` array. `run_baseline` must tokenize the *rendered
+// message content* through the model's chat_template.jinja, matching the
+// HTTP chat-completions path -- not the raw JSON envelope + syntax text.
+// `write_chat_fixture_model` builds a tiny WordLevel tokenizer +
+// chat_template.jinja pair (mirrors
+// `chat_template_tests::write_smoke_fixture`) so these tests run with no
+// real model snapshot.
+
+/// Fixture JSON: two messages plus non-content envelope fields
+/// (`prompt_tokens`, `label`) that must never end up in the token count.
+const CHAT_FIXTURE_JSON: &str = r#"{"messages": [{"role": "system", "content": "System prompt here"}, {"role": "user", "content": "User message here"}], "prompt_tokens": 999, "label": "test"}"#;
+
+fn write_chat_fixture_model(dir: &Path) {
+    // "messages"/"role"/"content"/"prompt_tokens"/"label"/"test" are JSON
+    // envelope/key vocabulary -- present in the raw fixture text but absent
+    // from the rendered message content, so their token ids are the
+    // discriminator between the buggy raw-tokenize path and the fixed
+    // template-rendered path.
+    let vocab = r#"{
+        "<unk>":2,"<bos>":0,
+        "<start_of_turn>":10,"<end_of_turn>":11,
+        "system":12,"user":13,"model":14,
+        "System":20,"prompt":21,"here":22,"User":23,"message":24,
+        "messages":30,"role":31,"content":32,"prompt_tokens":33,"label":34,"test":35
+    }"#;
+    let added = r#"[
+        {"id":0,"content":"<bos>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},
+        {"id":10,"content":"<start_of_turn>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},
+        {"id":11,"content":"<end_of_turn>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}
+    ]"#;
+    let tok_json = format!(
+        r#"{{"version":"1.0","truncation":null,"padding":null,"added_tokens":{added},"normalizer":null,"pre_tokenizer":{{"type":"Whitespace"}},"post_processor":null,"decoder":null,"model":{{"type":"WordLevel","vocab":{vocab},"unk_token":"<unk>"}}}}"#
+    );
+    std::fs::write(dir.join("tokenizer.json"), tok_json).expect("write tokenizer.json");
+    std::fs::write(
+        dir.join("tokenizer_config.json"),
+        r#"{"bos_token":"<bos>","eos_token":"<eos>"}"#,
+    )
+    .expect("write tokenizer_config.json");
+    let tpl = "{{ bos_token }} {% for m in messages %}<start_of_turn> {{ m.role }} {{ m.content }} <end_of_turn> {% endfor %}{% if add_generation_prompt %}<start_of_turn> model{% endif %}";
+    std::fs::write(dir.join("chat_template.jinja"), tpl).expect("write chat_template.jinja");
+}
+
+#[test]
+fn parse_chat_fixture_detects_messages_array() {
+    let messages = parse_chat_fixture(CHAT_FIXTURE_JSON).expect("chat fixture detected");
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].role, "system");
+    assert_eq!(messages[1].content, "User message here");
+}
+
+#[test]
+fn parse_chat_fixture_none_for_plain_text() {
+    assert!(parse_chat_fixture("Just plain prose, not JSON at all.").is_none());
+}
+
+#[test]
+fn parse_chat_fixture_none_for_json_without_messages() {
+    // Mirrors prompts/calibration_default.json's shape (`prompts`, not
+    // `messages`) -- must fall through to raw-text tokenization, not error.
+    assert!(parse_chat_fixture(r#"{"prompts": ["a", "b"]}"#).is_none());
+}
+
+#[test]
+fn parse_chat_fixture_none_for_empty_messages_array() {
+    assert!(parse_chat_fixture(r#"{"messages": []}"#).is_none());
+}
+
+/// The bug this fixes: tokenizing the RAW chat-JSON fixture text (the old
+/// `run_baseline` behavior -- `tokenizer.encode(prompt_text, true)` with no
+/// fixture detection) counts the JSON envelope key `"messages"` as a real
+/// prompt token even though it is pure structure, not content.
+#[test]
+fn raw_json_tokenize_counts_envelope_keys_as_tokens() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_chat_fixture_model(tmp.path());
+    let tk = tokenizers::Tokenizer::from_file(tmp.path().join("tokenizer.json")).expect("load tok");
+
+    let raw_ids = tk
+        .encode(CHAT_FIXTURE_JSON, true)
+        .expect("encode raw")
+        .get_ids()
+        .to_vec();
+    // id 30 == "messages", the envelope key -- present only because the raw
+    // JSON text (not the rendered content) was tokenized.
+    assert!(
+        raw_ids.contains(&30),
+        "expected raw-JSON tokenize to include the envelope key token: {raw_ids:?}"
+    );
+}
+
+/// `tokenize_chat_fixture` renders only the message content through the chat
+/// template -- the JSON envelope key `"messages"` must never appear in the
+/// tokenized output, and the actual content words must.
+#[test]
+fn tokenize_chat_fixture_excludes_envelope_tokens() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_chat_fixture_model(tmp.path());
+    let tk = tokenizers::Tokenizer::from_file(tmp.path().join("tokenizer.json")).expect("load tok");
+
+    let messages = parse_chat_fixture(CHAT_FIXTURE_JSON).expect("chat fixture detected");
+    let ids = tokenize_chat_fixture(tmp.path(), &tk, &messages).expect("tokenize chat fixture");
+
+    // id 30 == "messages" (JSON envelope key) must be absent.
+    assert!(
+        !ids.contains(&30),
+        "chat-template tokenization must not include the JSON envelope key: {ids:?}"
+    );
+    // Real message content must be present: System(20), prompt(21), here(22),
+    // User(23), message(24).
+    for t in [20u32, 21, 22, 23, 24] {
+        assert!(ids.contains(&t), "missing content token {t}: {ids:?}");
+    }
+    // Turn-structured: begins with BOS.
+    assert_eq!(ids.first(), Some(&0), "must begin with BOS: {ids:?}");
+}
