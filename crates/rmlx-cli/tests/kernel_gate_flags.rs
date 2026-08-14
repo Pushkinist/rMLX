@@ -30,22 +30,30 @@ struct RunResult {
 
 /// Run the built `rmlx` binary with an isolated `RMLX_HOME` and `RUST_LOG=info`
 /// so the gate-resolution `tracing::info!` lines are emitted.
+///
+/// `RMLX_HOME` is a `TempDir` dropped at the end of the call, so the run's logs
+/// and metrics DB are removed instead of accumulating under the system temp dir
+/// on every `cargo test`.
 fn run(args: &[&str]) -> RunResult {
-    let rmlx_home = std::env::temp_dir().join(format!("rmlx_gate_{}_{}", std::process::id(), {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static CTR: AtomicU64 = AtomicU64::new(0);
-        CTR.fetch_add(1, Ordering::Relaxed)
-    }));
-    let out = Command::new(env!("CARGO_BIN_EXE_rmlx"))
-        .env("RUST_LOG", "info")
+    run_with_env(args, &[])
+}
+
+/// [`run`] plus extra environment variables, applied after the gate vars are
+/// cleared so a test can deliberately pre-set one of them.
+fn run_with_env(args: &[&str], extra_env: &[(&str, &str)]) -> RunResult {
+    let rmlx_home = tempfile::TempDir::new().expect("failed to create RMLX_HOME tempdir");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rmlx"));
+    cmd.env("RUST_LOG", "info")
         // A stale shell value would latch the OnceLock and mask the flag.
         .env_remove("RMLX_TURBO_FLASH")
         .env_remove("RMLX_TURBO_FLASH_LOCK")
         .env_remove("RMLX_PLANAR_FLASH_DECODE")
-        .env("RMLX_HOME", &rmlx_home)
-        .args(args)
-        .output()
-        .expect("failed to spawn rmlx subprocess");
+        .env("RMLX_HOME", rmlx_home.path())
+        .args(args);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("failed to spawn rmlx subprocess");
     RunResult {
         exit_code: out.status.code().unwrap_or(-1),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -107,6 +115,51 @@ fn kernel_gate_flags_accepted_after_the_subcommand() {
     assert!(
         r.stderr.contains("--turbo-flash resolved ON"),
         "explicit `on` did not resolve ON; stderr: {}",
+        r.stderr
+    );
+}
+
+/// `auto` honours a pre-existing `RMLX_TURBO_FLASH=1` for back-compat, which
+/// means the flag resolves OFF while the kernel actually runs. That combination
+/// is a known 2.0-4.25x decode loss, so it must be operator-visible rather than
+/// silent: the resolution logs at `warn!` and names the cost.
+#[test]
+fn turbo_flash_auto_warns_when_the_env_opt_in_is_set() {
+    let r = run_with_env(&["profile", "list"], &[("RMLX_TURBO_FLASH", "1")]);
+    assert_eq!(r.exit_code, 0, "expected exit 0; stderr was: {}", r.stderr);
+    assert!(
+        r.stderr.contains("WARN") && r.stderr.contains("the kernel stays ON"),
+        "a pre-set RMLX_TURBO_FLASH=1 under `auto` must warn that the kernel is \
+         still ON; stderr: {}",
+        r.stderr
+    );
+    // The plain "env untouched" info line is the *other* branch: it must not be
+    // what an opted-in operator sees. Match the flag name too — the sibling
+    // gates emit the same suffix on their own quiet branches.
+    assert!(
+        !r.stderr
+            .contains("--turbo-flash resolved OFF; env untouched"),
+        "the quiet OFF line must not fire when RMLX_TURBO_FLASH=1 is set; \
+         stderr: {}",
+        r.stderr
+    );
+}
+
+/// With the env var absent, `auto` takes the quiet branch — no warn, no claim
+/// that anything is still on.
+#[test]
+fn turbo_flash_auto_is_quiet_without_the_env_opt_in() {
+    let r = run(&["profile", "list"]);
+    assert_eq!(r.exit_code, 0, "expected exit 0; stderr was: {}", r.stderr);
+    assert!(
+        r.stderr
+            .contains("--turbo-flash resolved OFF; env untouched"),
+        "auto with no env opt-in must log the quiet OFF line; stderr: {}",
+        r.stderr
+    );
+    assert!(
+        !r.stderr.contains("the kernel stays ON"),
+        "the opt-in warn must not fire when RMLX_TURBO_FLASH is unset; stderr: {}",
         r.stderr
     );
 }

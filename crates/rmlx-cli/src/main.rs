@@ -252,11 +252,11 @@ struct Cli {
     sparse_attn: SparseAttnMode,
     /// TurboFlash MSL attention kernel. Default `auto`.
     ///
-    /// `auto` (default): resolves OFF on every host. The kernel is correct —
-    /// its generated-token digest matches the generic path — but on the one
-    /// storage it serves (K8V4, `kv_seq > 4096`) it decodes 3.4–5.9× slower
-    /// than that path and holds several hundred MB of extra resident KV.
-    /// HOLD until a decode re-measurement clears it.
+    /// `auto` (default): resolves OFF on every host. On the one storage it
+    /// serves (K8V4, `kv_seq > 4096`) the kernel decodes 2.0–4.25× slower than
+    /// the generic path — the loss grows with `kv_seq` — holds ~722 MB more
+    /// resident KV, and is not bit-exact, so it perturbs the generated tokens
+    /// as well. HOLD until a decode re-measurement clears it.
     /// `on`: force-set RMLX_TURBO_FLASH=1 before first inference (ablation, and
     /// the escape hatch for that re-measurement).
     /// `off`: hard override — removes RMLX_TURBO_FLASH from env so a stale

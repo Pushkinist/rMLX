@@ -421,16 +421,33 @@ Ranked by impact:
    kernel**, which `--turbo-flash=auto` enabled on every recognised Apple
    family, this host included. Back-to-back on the same binary, `k8v4`@16k at
    `--max-ctx 16640` decodes **82.8 TPS with the kernel off and 24.2 TPS with
-   it on** — both arms settled, both emitting a byte-identical token digest.
-   At `--max-ctx 65536` the gap reads wider still (89.4 → 19.3 @16k, 61.3 →
-   10.5 @32k) but those ON cells were refused by bench's settle gate — the 32k
-   ON arm decoded 12.0 → 10.5 → 8.8 across three runs without ever reaching
-   steady state — so 3.4× is the certified floor, not the headline. The 0.2.5 and 0.3.0 matrices were both taken
-   through `rmlx serve`, which resolved the gate ON; `rmlx bench` never
-   resolved it at all, which is why the crater vanishes there. Both halves are
-   fixed: the gate is now global (every subcommand resolves it identically) and
-   `auto` now holds OFF. `k8v4` re-measures at 88.8 @16k / 61.8 @32k under the
-   shipped default.
+   it on** — both arms settled. Re-driven on a quiet host, the whole ladder
+   certifies with zero settle-gate refusals and shows the loss scaling with
+   `kv_seq` rather than sitting at a fixed penalty: **1.93× @~1.7k** (threshold
+   forced to zero), **2.74× @8k**, **3.48× @16k**, **4.25× @32k**
+   (63.25 → 14.89 TPS, ranges 1.14% / 3.42%). Dispatch was proven by counter,
+   not inferred: 1638 in the ON arm, 0 in the OFF arm. The earlier
+   `--max-ctx 65536` read-outs (89.4 → 19.3 @16k, 61.3 → 10.5 @32k, quoted as
+   "~5.9×") were taken on a contended host, refused by bench's settle gate, and
+   are superseded by the certified ladder above. The 0.2.5 and 0.3.0 matrices
+   were both taken through `rmlx serve`, which resolved the gate ON; `rmlx
+   bench` never resolved it at all, which is why the crater vanishes there.
+   Both halves are fixed: the gate is now global (every subcommand resolves it
+   identically) and `auto` now holds OFF. `k8v4` re-measures at 88.8 @16k /
+   61.8 @32k under the shipped default.
+
+   **The two arms do not emit the same tokens.** An earlier revision of this
+   section said they did, on the strength of the 16k cell. They do not: the
+   kernel is not bit-exact (SDPA cosine ≈0.997 against bf16, the V turbo-4
+   codec floor), and at temp=0 that flips greedy argmax ties prompt-dependently.
+   Of the four cells that fire at the production threshold, 16k and
+   Bonsai-27B@16k match while **8k and 32k diverge**, stably across every run of
+   each arm. Reproduced here at 8k (`rmlx bench --kv-quant k8v4 --max-ctx 16384
+   --prompt-tokens 8192 --max-tokens 64 --runs 2 --warmup 1`): gate OFF gives
+   110.80 TPS / digest `0xb0273cf32cb9b715` / 1 668 005 888 B KV, gate ON gives
+   42.05 TPS / digest `0x75a6992e38913e64` / 2 029 240 320 B. The kernel is a
+   decode loss *and* an output perturbation, and the 361 MB of extra KV at 8k is
+   exactly half the 16k figure — the flash buffers scale with the ring.
 3. **K-only codecs are usable now but not fast at long context** (4–5 TPS
    @64k). A real, working, GPU codec — no further urgency, but not a
    long-context recommendation either. Memory is now essentially free
@@ -442,9 +459,10 @@ Ranked by impact:
    inherently costly generic-path V-4bit dequant on this arch" — that reading
    was wrong, and the §2.2 marginal-cost fit for `k8v4` describes the kernel,
    not the codec. With the gate off, `k8v4` decodes **88.8 TPS @16k and 61.8
-   @32k** (`rmlx bench`, n=3), i.e. within a few percent of `none`, for a
-   byte-identical token digest. `auto` now holds OFF (see `docs/KV_QUANT.md`
-   §TurboFlash), so this is the shipped behaviour. `rot_k_tq4v` is untouched by
+   @32k** (`rmlx bench`, n=3), i.e. within a few percent of `none` — and, since
+   the kernel is not bit-exact, on a token stream that is the generic path's
+   rather than the kernel's (see §4.2). `auto` now holds OFF (see
+   `docs/KV_QUANT.md` §TurboFlash), so this is the shipped behaviour. `rot_k_tq4v` is untouched by
    the gate — TurboFlash only serves K8V4 storage — and its mild −7…−12% drift
    at longer ctx stands as previously described.
 5. **`*_sym` / `*tcq` prefill remains the heaviest cost family** — unchanged
@@ -459,8 +477,9 @@ Ranked by impact:
 - **Every decode cell in §2 was measured through `rmlx serve` with
   `--turbo-flash=auto`, which resolved ON.** For `k8v4` — the only storage
   TurboFlash serves — that means §2's cells are kernel-on numbers and read
-  3.4–5.9× low from 16k up; see §4.4. Every other codec is unaffected by the
-  gate. Cells re-measured with `rmlx bench` are labelled as such in §4.2.
+  2.7–4.25× low from 8k up (the loss grows with `kv_seq`); see §4.4. Every
+  other codec is unaffected by the gate. Cells re-measured with `rmlx bench`
+  are labelled as such in §4.2.
 - **64k is n=1 measured** — point estimate, same caveat as 0.2.5. A single
   unguarded measurement is now known to be worth less than it looks on this
   host: see the noise-floor figures in §4.2 (up to 7.3% across sessions).

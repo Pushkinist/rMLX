@@ -43,32 +43,47 @@ use tracing::{info, warn};
 
 /// `--turbo-flash` tri-state. Default `Auto` resolves **OFF** on every host.
 ///
-/// The kernel is correct — it is a throughput loss. TurboFlash is the only
-/// consumer of the K8V4 flash path (`turbo_flash_should_run`: K8V4 storage,
-/// `q_seq == 1`, `kv_seq > 4096`, `head_dim ∈ {128, 256}`), and on the one
-/// shape where it engages it decodes several times slower than the generic
-/// path it replaces while producing byte-identical tokens:
+/// The kernel is cleared on crash and fidelity and fails on throughput.
+/// TurboFlash is the only consumer of the K8V4 flash path
+/// (`turbo_flash_should_run`: K8V4 storage, `q_seq == 1`, `kv_seq > 4096`,
+/// `head_dim ∈ {128, 256}`), and everywhere it engages it decodes several
+/// times slower than the generic path it replaces. Measured with `rmlx bench`
+/// (n=3 + warmup, one process per cell, medians, settle gate enforced) on a
+/// quiet host — same binary, temp=0, `--turbo-flash` the only difference:
 ///
-/// | cell (Bonsai-8B, `kv_h=8`, `head_dim=128`) | off | on | |
-/// |---|---|---|---|
-/// | k8v4 @16k, `--max-ctx 16640` | 82.8 TPS | 24.2 TPS | 3.4× slower |
-/// | k8v4 @16k, `--max-ctx 65536` | 89.4 TPS | 19.3 TPS † | ~4.6× slower |
-/// | k8v4 @32k, `--max-ctx 65536` | 61.3 TPS | 10.5 TPS † | ~5.9× slower |
+/// | cell | on vs off | token digest |
+/// |---|---|---|
+/// | Bonsai-8B k8v4 @~1.7k (`RMLX_TURBO_FLASH_MIN=0`) | 1.93× slower | — |
+/// | Bonsai-8B k8v4 @8k | 2.74× slower | **differs** |
+/// | Bonsai-8B k8v4 @16k | 3.48× slower | identical |
+/// | Bonsai-8B k8v4 @32k (63.25 → 14.89 TPS) | 4.25× slower | **differs** |
+/// | Bonsai-27B k8v4 @16k | 1.98× slower | identical |
 ///
-/// Same binary, same cell, back to back, temp=0, `--turbo-flash` the only
-/// difference; the generated-token digest is identical in both arms, so this is
-/// pure cost, not a fidelity trade. † The two `--max-ctx 65536` ON cells were
-/// refused by `rmlx bench`'s settle gate — the 32k ON arm decoded
-/// 12.0 → 10.5 → 8.8 TPS across its three runs and never reached steady state —
-/// so those two figures are log read-outs, not certified medians. The
-/// `--max-ctx 16640` pair settled on both sides; 3.4× is the certified floor.
-/// Tightening the ring 4× recovers part of it
-/// but not the bulk, so it is not a `--max-ctx` sizing artefact. The `on` arm
-/// also holds ~722 MB more resident KV (the persistent head-major flash buffers
-/// sit on top of the bf16 mirror and the packed store). On a shared-KV /
-/// windowed arch (gemma-4-e2b, `kv_h=1`, `head_dim=256`, SWA 512) the kernel is
-/// inert: ±0.3%, inside the 1.3% noise floor measured at `k8v4`@4k where the
-/// `kv_seq > 4096` gate keeps it from firing at all.
+/// The loss scales with `kv_seq` rather than being a fixed per-request
+/// penalty. Dispatch was proven by counter, not inferred: 1638 kernel
+/// dispatches in the ON arm against 0 in the OFF arm. The ON arm also holds
+/// 722 468 864 B more resident KV at 16k — the persistent head-major flash
+/// buffers sit *on top of* the bf16 mirror and the packed store rather than
+/// replacing either. Tightening the ring 4× recovers part of the gap but not
+/// the bulk, so it is not a `--max-ctx` sizing artefact.
+///
+/// **The output is not identical.** An earlier revision of this doc claimed a
+/// byte-identical token digest in both arms; that held on one cell and was
+/// generalised. The kernel is not bit-exact — SDPA cosine against the bf16
+/// reference is ≈0.997, the V turbo-4 codec floor — and at temp=0 that flips
+/// greedy argmax ties prompt-dependently. Two of the four cells that fire at
+/// the production threshold produce a different digest, deterministically and
+/// stably across all three runs per arm. So this is a decode loss *and* an
+/// output perturbation, not pure cost.
+///
+/// `gemma-4-e2b` (`kv_h=1`, `head_dim=256`, SWA 512) is a **null control**,
+/// not a second architecture: at 4k its `kv_cache_bytes` is bit-identical
+/// across both arms (156 850 176 B), which proves the flash buffers are never
+/// allocated and the kernel never dispatches there — the `kv_seq > 4096` gate
+/// stops it. Its ±0.3% is evidence that the gate holds, not evidence about
+/// where the kernel pays. The second *firing* architecture is Bonsai-27B
+/// (`Qwen3_5ForConditionalGeneration`, `head_dim=256`, `kv_h=4`), and it loses
+/// too: both supported head_dims lose.
 ///
 /// `Auto` therefore holds OFF — the same HOLD posture
 /// [`PlanarFlashDecodeMode`] already takes for the same reason. `on` remains
@@ -84,8 +99,9 @@ pub(crate) enum TurboFlashMode {
     /// Force the TurboFlash MSL kernel off. Does NOT clear an existing
     /// `RMLX_TURBO_FLASH=1` env-var — explicit env wins for back-compat.
     Off,
-    /// Resolves to OFF on every host: the kernel is a measured 3.4–5.9× decode
-    /// loss on the one codec it serves. HOLD until a re-measurement clears it.
+    /// Resolves to OFF on every host: the kernel is a measured 2.0–4.25×
+    /// decode loss on the one codec it serves, and it perturbs the generated
+    /// tokens. HOLD until a re-measurement clears it.
     #[default]
     Auto,
 }
@@ -116,7 +132,8 @@ impl std::fmt::Display for TurboFlashMode {
 ///   and logged so an operator can see which host the HOLD applied to. `Auto`
 ///   is the only mode that honours a pre-existing `RMLX_TURBO_FLASH=1` env
 ///   (back-compat path) — it does not remove the var, so a shell that opts in
-///   still gets the kernel.
+///   still gets the kernel. That case logs at `warn!`, because the flag then
+///   reads OFF while the kernel is in fact ON and costing 2.0–4.25× decode.
 ///
 /// `turbo_flash_lock` is unchanged: `true` → force-set, `false` → leave env
 /// untouched.
@@ -125,50 +142,30 @@ impl std::fmt::Display for TurboFlashMode {
 /// initialised and every command — server and measurement alike — sees the same
 /// resolution.
 pub(crate) fn apply_turbo_flags(turbo_flash: TurboFlashMode, turbo_flash_lock: bool) {
-    let family = rmlx_core::apple_gpu::apple_silicon_generation();
-    apply_turbo_flags_inner(turbo_flash, turbo_flash_lock, family);
-}
-
-/// Pure inner of [`apply_turbo_flags`] parameterised on the Apple-Silicon GPU
-/// family. Splitting the family probe out lets unit tests drive every Auto arm
-/// (recognised family vs unknown host) regardless of which family the CI host
-/// actually reports. `Auto` resolves OFF for both, so the parameter now only
-/// selects which log line is emitted — it is kept so a future per-family flip
-/// has a seam and a test surface.
-///
-/// `family = None` mirrors `apple_silicon_generation()` returning `None`
-/// (sysctl probe failed / non-Apple-Silicon).
-pub(crate) fn apply_turbo_flags_inner(
-    turbo_flash: TurboFlashMode,
-    turbo_flash_lock: bool,
-    family: Option<u8>,
-) {
     // Explicit Off is a hard override — remove the env var so a stale
     // RMLX_TURBO_FLASH=1 in the shell cannot latch the OnceLock to true.
-    // Safe here because apply_turbo_flags runs from `main` before the tokio
-    // runtime is built and before any other thread exists.
+    // SAFETY: same invariant as the `set_var` below.
     if turbo_flash == TurboFlashMode::Off {
         std::env::remove_var("RMLX_TURBO_FLASH");
     }
     let resolved_on = match turbo_flash {
         TurboFlashMode::On => true,
         TurboFlashMode::Off => false,
-        // Auto is a HOLD on every host. The kernel is correct — its output
-        // digest matches the generic path token for token — but on the one
-        // storage it serves (K8V4, kv_seq > 4096) it decodes 3.4-5.9x slower
-        // than the path it replaces and carries several hundred MB of extra
-        // resident KV for the privilege. Defaulting a measured decode loss ON
-        // is worse than shipping no kernel at all, so Auto stays OFF until a
-        // re-measurement clears it. See `TurboFlashMode` for the cells.
-        // The family is still probed so the log names the host the HOLD
-        // applied to.
+        // Auto is a HOLD on every host. On the one storage it serves (K8V4,
+        // kv_seq > 4096) the kernel decodes 2.0-4.25x slower than the path it
+        // replaces, carries several hundred MB of extra resident KV for the
+        // privilege, and — not being bit-exact — perturbs the generated tokens
+        // on top of that. Defaulting a measured decode loss ON is worse than
+        // shipping no kernel at all, so Auto stays OFF until a re-measurement
+        // clears it. See `TurboFlashMode` for the cells. The family is still
+        // probed so the log names the host the HOLD applied to.
         TurboFlashMode::Auto => {
-            if let Some(f) = family {
+            if let Some(family) = rmlx_core::apple_gpu::apple_silicon_generation() {
                 tracing::info!(
-                    family = f,
-                    "--turbo-flash=auto on Apple{f} — resolved OFF (HOLD: the \
-                     kernel decodes 3.4-5.9x slower than the generic K8V4 path \
-                     at kv_seq > 4096 for byte-identical output). Use \
+                    family,
+                    "--turbo-flash=auto on Apple{family} — resolved OFF (HOLD: the \
+                     kernel decodes 2.0-4.25x slower than the generic K8V4 path \
+                     at kv_seq > 4096 and perturbs the output). Use \
                      --turbo-flash on to override."
                 );
             } else {
@@ -181,10 +178,11 @@ pub(crate) fn apply_turbo_flags_inner(
         }
     };
     if resolved_on {
-        // SAFETY: set_var is safe here: apply_turbo_flags is called from `main`
-        // before the tokio runtime is constructed and before any subcommand
-        // dispatch. No other thread exists that could concurrently read the
-        // environment.
+        // SAFETY: `set_var` mutates process-global state. This runs from
+        // `main`, before subcommand dispatch and before the tokio runtime is
+        // built. The one thread already alive is the tracing-appender writer
+        // spawned by `init_tracing`, and it never reads the environment, so no
+        // concurrent `getenv` can race this `setenv`.
         std::env::set_var("RMLX_TURBO_FLASH", "1");
         tracing::info!(
             mode = %turbo_flash,
@@ -196,11 +194,23 @@ pub(crate) fn apply_turbo_flags_inner(
             "--turbo-flash resolved OFF (hard override); \
              RMLX_TURBO_FLASH removed from env"
         );
+    } else if std::env::var("RMLX_TURBO_FLASH").as_deref() == Ok("1") {
+        // Auto does not clear an operator's opt-in, so the effective state
+        // here is ON even though the flag resolved OFF. Say so at warn level:
+        // a variable exported once in a shell, a CI job or a profile would
+        // otherwise carry a known decode regression silently, and the flag
+        // would read OFF while the kernel ran.
+        tracing::warn!(
+            mode = %turbo_flash,
+            "--turbo-flash resolved OFF but RMLX_TURBO_FLASH=1 is set in the \
+             environment — the kernel stays ON (auto honours an explicit \
+             opt-in). That is a 2.0-4.25x decode loss on K8V4 at kv_seq > 4096. \
+             Unset the variable or pass --turbo-flash off."
+        );
     } else {
         tracing::info!(
             mode = %turbo_flash,
-            "--turbo-flash resolved OFF; env untouched (pre-existing \
-             RMLX_TURBO_FLASH=1 still honoured for Auto back-compat)"
+            "--turbo-flash resolved OFF; env untouched"
         );
     }
     if turbo_flash_lock {
@@ -209,16 +219,15 @@ pub(crate) fn apply_turbo_flags_inner(
     }
 }
 
-/// `--planar-flash-decode` tri-state. Default `Auto` resolves at startup
-/// based on the host's Apple GPU family — same Apple ≤9 vs ≥10 hazard
-/// policy as `TurboFlashMode`. The two flash kernels share the same family
-/// of register-pressure / threadgroup-memory failure modes, so until the
-/// planar-flash decode is proven on Apple ≥10 we mirror the TurboFlash
-/// defaults conservatively.
+/// `--planar-flash-decode` tri-state. Default `Auto` resolves **OFF** on every
+/// host — a HOLD, not a hardware gate. It shares the env-var / `OnceLock`
+/// bridging pattern and the HOLD posture with [`TurboFlashMode`], but not any
+/// per-family policy: neither flag has one.
 ///
 /// Added with the planar_flash_decode MSL kernel (2026-05). Defaults OFF;
 /// validation found no measurable speedup (-0.19% at 4k canary) and NIAH was
-/// blocked by a pre-existing bug. HOLD until both are resolved.
+/// blocked by a pre-existing bug. The `Auto` variant doc below carries the
+/// current posture in full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub(crate) enum PlanarFlashDecodeMode {
     /// Force the planar_flash_decode kernel on. Sets `RMLX_PLANAR_FLASH_DECODE=1`.
@@ -311,8 +320,10 @@ pub(crate) fn apply_planar_flash_decode_flags(mode: PlanarFlashDecodeMode) {
         }
     };
     if resolved_on {
-        // SAFETY: called at the top of `run_serve` before the tokio runtime
-        // or any worker thread exists; no concurrent env reader.
+        // SAFETY: called from `main` before subcommand dispatch and before the
+        // tokio runtime is built. The one thread already alive is the
+        // tracing-appender writer spawned by `init_tracing`, and it never reads
+        // the environment, so no concurrent `getenv` can race this `setenv`.
         std::env::set_var("RMLX_PLANAR_FLASH_DECODE", "1");
         tracing::info!(
             mode = %mode,
@@ -413,8 +424,10 @@ pub(crate) fn apply_fused_qk_flags(mode: FusedQkMode) {
         }
     };
     if resolved_on {
-        // SAFETY: called at the top of `run_serve` before the tokio runtime
-        // or any worker thread exists; no concurrent env reader.
+        // SAFETY: called from `main` before subcommand dispatch and before the
+        // tokio runtime is built. The one thread already alive is the
+        // tracing-appender writer spawned by `init_tracing`, and it never reads
+        // the environment, so no concurrent `getenv` can race this `setenv`.
         std::env::set_var("RMLX_FUSED_QK", "1");
         tracing::info!(
             mode = %mode,
@@ -537,8 +550,10 @@ pub(crate) fn apply_sparse_attn_flags(mode: SparseAttnMode) {
         }
     };
     if resolved_on {
-        // SAFETY: called at the top of `run_serve` before the tokio runtime
-        // or any worker thread exists; no concurrent env reader.
+        // SAFETY: called from `main` before subcommand dispatch and before the
+        // tokio runtime is built. The one thread already alive is the
+        // tracing-appender writer spawned by `init_tracing`, and it never reads
+        // the environment, so no concurrent `getenv` can race this `setenv`.
         std::env::set_var("RMLX_SPARSE_ATTN", "1");
         tracing::info!(
             mode = %mode,

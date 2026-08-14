@@ -1,7 +1,6 @@
 use super::{
     apply_fused_qk_flags, apply_planar_flash_decode_flags, apply_sparse_attn_flags,
-    apply_turbo_flags, apply_turbo_flags_inner, FusedQkMode, PlanarFlashDecodeMode, SparseAttnMode,
-    TurboFlashMode,
+    apply_turbo_flags, FusedQkMode, PlanarFlashDecodeMode, SparseAttnMode, TurboFlashMode,
 };
 use std::sync::Mutex;
 
@@ -68,8 +67,9 @@ fn remove(key: &str) {
 
 #[test]
 fn turbo_flash_on_sets_env() {
-    // Asserts on std::env::var(TF), not on turbo_flash_enabled().
-    // See MED-2 comment above.
+    // Asserts on std::env::var(TF), not on turbo_flash_enabled(): that gate is
+    // a OnceLock latched on first read, so reading it here would couple the
+    // test to whichever test in this binary ran first.
     let _guard = ENV_LOCK.lock().unwrap();
     remove(TF);
     remove(TFL);
@@ -92,7 +92,8 @@ fn turbo_flash_on_sets_env() {
 
 #[test]
 fn turbo_flash_off_hard_override_removes_env() {
-    // Asserts on std::env::var(TF), not on turbo_flash_enabled(). See MED-2.
+    // Asserts on std::env::var(TF), not on turbo_flash_enabled(): that gate is
+    // a OnceLock latched on first read and cannot be reset between tests.
     //
     // Explicit `--turbo-flash off` is a HARD override. If the shell sets
     // RMLX_TURBO_FLASH=1 and the user then passes `--turbo-flash off`, the
@@ -124,7 +125,8 @@ fn turbo_flash_off_hard_override_removes_env() {
 
 #[test]
 fn turbo_flash_off_unset_env_stays_unset() {
-    // Asserts on std::env::var(TF), not on turbo_flash_enabled(). See MED-2.
+    // Asserts on std::env::var(TF), not on turbo_flash_enabled(): that gate is
+    // a OnceLock latched on first read and cannot be reset between tests.
     let _guard = ENV_LOCK.lock().unwrap();
     remove(TF);
     remove(TFL);
@@ -170,9 +172,9 @@ fn planar_flash_decode_on_sets_env() {
 
 #[test]
 fn planar_flash_decode_off_hard_override_removes_env() {
-    // Same HIGH-2 semantics as turbo_flash off: a stale shell RMLX_PFD=1
-    // must NOT be allowed to latch the OnceLock to true when the user
-    // explicitly passes `--planar-flash-decode off`.
+    // Same hard-override semantics as turbo_flash off: a stale shell
+    // RMLX_PLANAR_FLASH_DECODE=1 must NOT be allowed to latch the OnceLock to
+    // true when the user explicitly passes `--planar-flash-decode off`.
     let _guard = ENV_LOCK.lock().unwrap();
     std::env::set_var(PFD, "1");
 
@@ -226,11 +228,12 @@ fn planar_flash_decode_off_unset_env_stays_unset() {
 
 #[test]
 fn turbo_flash_auto_holds_off_on_this_host() {
-    // Asserts on std::env::var(TF), not on turbo_flash_enabled(). See MED-2.
+    // Asserts on std::env::var(TF), not on turbo_flash_enabled(): that gate is
+    // a OnceLock latched on first read and cannot be reset between tests.
     //
     // Auto is a HOLD on every host, recognised family or not: the kernel is a
-    // measured 3.4-5.9x decode loss on K8V4 at kv_seq > 4096 for byte-identical
-    // output. Whichever family this host reports, the env must stay unset.
+    // measured 2.0-4.25x decode loss on K8V4 at kv_seq > 4096 and it perturbs
+    // the output. Whichever family this host reports, the env must stay unset.
     let _guard = ENV_LOCK.lock().unwrap();
     remove(TF);
     remove(TFL);
@@ -247,90 +250,21 @@ fn turbo_flash_auto_holds_off_on_this_host() {
     remove(TF);
 }
 
-// ── parametric Auto-arm tests for apply_turbo_flags_inner ────────────────────
-//
-// `apply_turbo_flags` itself can only test the host's actual Apple-Silicon
-// family. `apply_turbo_flags_inner(turbo_flash, lock, family)` is a pure
-// parameterised inner, so the tests below can drive every family arm directly
-// regardless of the CI host. The env-setter contract is unchanged: same
-// OnceLock-latching constraint as the parent tests, same `ENV_LOCK`
-// serialisation.
-//
-// Auto is a HOLD on every family. These tests are the guard that a future
-// per-family flip has to justify itself against a decode measurement rather
-// than a correctness one: the kernel already passes its crash/fidelity gates,
-// and it is still 3.4-5.9x slower than the path it replaces.
-
 #[test]
-fn apply_turbo_flags_inner_auto_holds_off_on_every_family() {
-    let _guard = ENV_LOCK.lock().unwrap();
-    // Apple7 (M1) .. Apple11+ (M6+), plus the unknown/non-Apple host.
-    for family in [Some(7), Some(9), Some(10), Some(11), None] {
-        remove(TF);
-        remove(TFL);
-
-        apply_turbo_flags_inner(TurboFlashMode::Auto, false, family);
-
-        assert_eq!(
-            get(TF),
-            None,
-            "Auto on family {family:?} must leave RMLX_TURBO_FLASH unset (HOLD)"
-        );
-    }
-    remove(TF);
-}
-
-#[test]
-fn apply_turbo_flags_inner_auto_does_not_clear_an_opt_in_env() {
+fn turbo_flash_auto_does_not_clear_an_opt_in_env() {
     // Auto is a HOLD, not a hard override: an operator who exported
-    // RMLX_TURBO_FLASH=1 still gets the kernel. Only `--turbo-flash off`
-    // removes the var.
+    // RMLX_TURBO_FLASH=1 still gets the kernel (and a warn! saying so). Only
+    // `--turbo-flash off` removes the var. Family-independent, so this holds
+    // on whichever host runs it.
     let _guard = ENV_LOCK.lock().unwrap();
     std::env::set_var(TF, "1");
 
-    apply_turbo_flags_inner(TurboFlashMode::Auto, false, Some(10));
+    apply_turbo_flags(TurboFlashMode::Auto, false);
 
     assert_eq!(
         get(TF).as_deref(),
         Some("1"),
         "Auto must leave a pre-existing RMLX_TURBO_FLASH=1 alone (back-compat)"
-    );
-    remove(TF);
-}
-
-#[test]
-fn apply_turbo_flags_inner_off_hard_override() {
-    // Off is a hard override regardless of family. Pre-existing
-    // RMLX_TURBO_FLASH=1 must be removed so the OnceLock latch in
-    // turbo_flash_msl cannot seal `true` on first read.
-    let _guard = ENV_LOCK.lock().unwrap();
-    std::env::set_var(TF, "1");
-
-    apply_turbo_flags_inner(TurboFlashMode::Off, false, Some(10));
-
-    assert_eq!(
-        get(TF),
-        None,
-        "Off must remove RMLX_TURBO_FLASH (hard override) on any family"
-    );
-    remove(TF);
-}
-
-#[test]
-fn apply_turbo_flags_inner_on_force_overrides_unknown_host() {
-    // Explicit On must force-set RMLX_TURBO_FLASH=1 even on an unknown host
-    // where Auto would have defaulted OFF. The flag is the operator's escape
-    // hatch into the kernel.
-    let _guard = ENV_LOCK.lock().unwrap();
-    remove(TF);
-    remove(TFL);
-
-    apply_turbo_flags_inner(TurboFlashMode::On, false, None);
-
-    assert_eq!(
-        get(TF).as_deref(),
-        Some("1"),
-        "On must force RMLX_TURBO_FLASH=1 regardless of family"
     );
     remove(TF);
 }
