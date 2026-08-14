@@ -52,15 +52,33 @@ for arg in "$@"; do
     esac
 done
 
-if ! command -v xcrun >/dev/null 2>&1 || ! xcrun -sdk macosx -f metal >/dev/null 2>&1; then
+# Probe by *executing* the compiler, not by resolving its path. With Xcode
+# selected but the separately-downloaded Metal Toolchain component absent,
+# `xcrun -f metal` happily prints a path while every invocation fails with
+# "cannot execute tool 'metal' due to missing Metal Toolchain" — which would
+# otherwise be reported as a compile failure for every kernel in the manifest.
+metal_unavailable_reason=""
+if ! command -v xcrun >/dev/null 2>&1; then
+    metal_unavailable_reason="xcrun not found"
+elif ! metal_probe="$(xcrun -sdk macosx metal --version 2>&1)"; then
+    case "${metal_probe}" in
+        *"missing Metal Toolchain"*)
+            metal_unavailable_reason="Xcode is selected but the Metal Toolchain component is not installed; run: xcodebuild -downloadComponent MetalToolchain"
+            ;;
+        *)
+            metal_unavailable_reason="Metal compiler not usable (needs full Xcode, not just the Command Line Tools): xcode-select -s /Applications/Xcode.app"
+            ;;
+    esac
+fi
+
+if [ -n "${metal_unavailable_reason}" ]; then
     if [ "${STRICT}" = 1 ]; then
-        echo "ERROR: --strict: Metal compiler not found (xcrun -sdk macosx -f metal)." >&2
-        echo "       Refusing to pass by skipping. This needs full Xcode, not just the" >&2
-        echo "       Command Line Tools: 'xcode-select -s /Applications/Xcode.app'." >&2
+        echo "ERROR: --strict: ${metal_unavailable_reason}" >&2
+        echo "       Refusing to pass by skipping." >&2
         exit 1
     fi
-    echo "SKIP: Metal compiler not found (needs full Xcode, not just the Command Line Tools);"
-    echo "      MSL compile gate not run. Install Xcode + 'xcode-select -s /Applications/Xcode.app'."
+    echo "SKIP: ${metal_unavailable_reason}"
+    echo "      MSL compile gate not run."
     exit 0
 fi
 
