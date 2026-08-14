@@ -1989,7 +1989,7 @@ fn main() -> Result<()> {
                     // Read the canonical JSON for embedding in PromptRef::ByBody.
                     let raw = std::fs::read_to_string(&path)?;
                     let obj: serde_json::Value = serde_json::from_str(&raw)?;
-                    let body = if obj.get("messages").is_some_and(serde_json::Value::is_array) {
+                    let body = if commands::baseline::is_chat_fixture(&obj) {
                         obj["messages"].clone()
                     } else {
                         obj

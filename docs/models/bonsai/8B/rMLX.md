@@ -96,10 +96,11 @@ Unchanged from 0.2.5: rMLX `serve`'s KV ring grows lazily, so every codec is
 served **once** at `--max-ctx 65536` and all five prompt sizes sweep against
 the resident lazy-grown ring. The 64k fixture (`longctx_64k.json`, ~63.3k
 Bonsai tokens via the server's own chat-template tokenization) fits the
-ceiling with room for 256 generated tokens — verified directly this pass (see
-§5 caveats: this is *not* the same code path as `rmlx baseline
---prompt-tokens`, which tokenizes the raw JSON envelope and needs an explicit
-`--max-prompt-tokens` headroom to avoid a hard, correct error post-#223).
+ceiling with room for 256 generated tokens — verified directly this pass.
+`rmlx baseline --prompt-tokens` now shares this same chat-template
+tokenization (a chat-JSON fixture is rendered through `chat_template.jinja`
+before tokenizing, not fed to the tokenizer raw) so it agrees with `serve`'s
+token count and needs no `--max-prompt-tokens` headroom for this fixture.
 
 ---
 
@@ -335,20 +336,24 @@ Ranked by impact:
 - **`none` is still the headline number and the smallest KV**, unchanged
   from 0.2.5 in every respect measured.
 - **64k is n=1 measured** — point estimate, same caveat as 0.2.5.
-- **`rmlx baseline --prompt-tokens` tokenizes the raw JSON fixture file text**
-  (envelope + syntax), not just message content — this is a real, separate
-  finding from this pass. For `longctx_64k.json` that produces ~69.7k tokens,
-  over both the model's 65536 ctx ceiling and the default
-  `--max-prompt-tokens` cap; post-#223 ("error loudly on GPU prompt
-  truncation") this is a hard, correct error rather than 0.2.5-era silent
+- **`rmlx baseline --prompt-tokens` used to tokenize the raw JSON fixture**
+  **file text** (envelope + syntax), not just message content — a real,
+  separate finding from this pass, since fixed. For `longctx_64k.json` that
+  produced ~69.7k tokens, over both the model's 65536 ctx ceiling and the
+  default `--max-prompt-tokens` cap; post-#223 ("error loudly on GPU prompt
+  truncation") this was a hard, correct error rather than 0.2.5-era silent
   truncation. All KV-MB cells in this doc were measured with an explicit
   `--max-prompt-tokens 65528` (headroom for `--max-tokens 8`), reproducing
   the same effective 65536-token fill the 0.2.5 baseline almost certainly
   measured (validated: `none`@64k KV-MB landed at 10536 MB, matching 0.2.5 to
-  the byte). This bug is specific to the `baseline --prompt-tokens` CLI path
-  and does **not** affect the decode-TPS/TTFT cells, which go through the
+  the byte). The bug was specific to the `baseline --prompt-tokens` CLI path
+  and did **not** affect the decode-TPS/TTFT cells, which go through the
   server's normal chat-completions endpoint and its own correct
-  chat-templated tokenization.
+  chat-templated tokenization. **Fixed**: `baseline` now renders a chat-JSON
+  fixture through `chat_template.jinja` before tokenizing, matching the
+  server path (`longctx_64k.json` now measures ~63.3k content tokens, no
+  `--max-prompt-tokens` override needed); the workaround above documents how
+  this pass's numbers were obtained, not current required usage.
 - **No codec is CPU-bound at decode, at any size** — every kernel-dispatching
   codec confirmed dispatching at 4k and 64k; every non-dispatching codec
   shows zero CPU-dequant/host-download log lines at either end of the range.

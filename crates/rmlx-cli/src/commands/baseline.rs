@@ -179,6 +179,118 @@ pub(crate) fn compute_phase_timing(
     }
 }
 
+/// One message in a chat-JSON prompt fixture (`prompts/longctx_<N>k.json`):
+/// `{"messages": [{"role": "...", "content": "..."}, ...], ...}`.
+#[derive(Debug, serde::Deserialize)]
+struct ChatFixtureMessage {
+    role: String,
+    content: String,
+}
+
+/// `true` when `value` is a JSON object carrying a non-empty `messages`
+/// array -- the single "is this a chat-JSON fixture" predicate shared by
+/// `parse_chat_fixture` (tokenization, below) and the CLI's `--prompt-tokens`
+/// record-body embedding (`main.rs`), so the two call sites cannot disagree
+/// on edge cases such as `messages: []`.
+pub(crate) fn is_chat_fixture(value: &serde_json::Value) -> bool {
+    value
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|arr| !arr.is_empty())
+}
+
+/// Parse `prompt_text` as a chat-JSON fixture.
+///
+/// Returns `Ok(None)` when `prompt_text` is not a chat-JSON fixture at all --
+/// not valid JSON, not a JSON object, no `messages` key, `messages` is not an
+/// array, or the array is empty (per [`is_chat_fixture`]) -- the caller then
+/// falls back to tokenizing `prompt_text` verbatim as raw text (the
+/// plain-`.txt` fixture path).
+///
+/// Returns `Err` when `prompt_text` unambiguously IS a chat-JSON fixture (a
+/// non-empty `messages` array) but one or more elements do not deserialize
+/// into the `{"role": "<string>", "content": "<string>"}` shape this baseline
+/// harness supports -- e.g. an OpenAI parts-array `content`, `content:
+/// null`, or a message missing `role`. Silently falling back to
+/// raw-envelope tokenization in that case would record a wrong measurement
+/// with no error, so this matches the existing loud-failure convention for a
+/// missing `chat_template.jinja`.
+fn parse_chat_fixture(prompt_text: &str) -> anyhow::Result<Option<Vec<ChatFixtureMessage>>> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(prompt_text) else {
+        return Ok(None);
+    };
+    if !is_chat_fixture(&value) {
+        return Ok(None);
+    }
+    // `is_chat_fixture` already proved `messages` is present and a non-empty
+    // array; `.get()` (not indexing) keeps this panic-free regardless.
+    let Some(messages) = value.get("messages") else {
+        return Ok(None);
+    };
+    serde_json::from_value(messages.clone())
+        .map(Some)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "prompt is a chat-JSON fixture (non-empty \"messages\" array) but its elements \
+                 do not match the expected {{\"role\": \"<string>\", \"content\": \"<string>\"}} \
+                 shape: {e}"
+            )
+        })
+}
+
+/// Render `messages` through `<model_path>/chat_template.jinja` and tokenize
+/// the result -- the same render-then-tokenize path the HTTP
+/// chat-completions route uses (`crates/rmlx-server/src/openai/chat.rs`), so
+/// `--prompt-tokens N` measures N *content* tokens rather than a chat-JSON
+/// fixture's raw envelope + syntax tokens.
+fn tokenize_chat_fixture(
+    model_path: &Path,
+    tokenizer: &tokenizers::Tokenizer,
+    messages: &[ChatFixtureMessage],
+) -> anyhow::Result<Vec<u32>> {
+    let template_src =
+        rmlx_server::chat_template::load_template_source(model_path).map_err(|e| {
+            anyhow::anyhow!(
+                "prompt is a chat-JSON fixture but {} has no usable chat_template.jinja: {e}",
+                model_path.display()
+            )
+        })?;
+    let template = rmlx_server::chat_template::ChatTemplate::new(template_src)
+        .map_err(|e| anyhow::anyhow!("compile chat_template.jinja: {e}"))?;
+    let cfg = rmlx_server::tokenizer_io::load_tokenizer_config(model_path)
+        .map_err(|e| anyhow::anyhow!("load tokenizer_config.json: {e}"))?;
+    let bos_token = cfg.bos_token.unwrap_or_default();
+    let eos_token = cfg.eos_token.unwrap_or_default();
+
+    let tpl_messages: Vec<rmlx_server::chat_template::ChatMessageTpl<'_>> = messages
+        .iter()
+        .map(|m| rmlx_server::chat_template::ChatMessageTpl {
+            role: m.role.as_str(),
+            content: m.content.as_str(),
+            ..Default::default()
+        })
+        .collect();
+    let opts = rmlx_server::chat_template::RenderOpts {
+        bos_token: &bos_token,
+        eos_token: &eos_token,
+        add_generation_prompt: true,
+        tools: &[],
+        enable_thinking: None,
+    };
+    let rendered = template
+        .render(&tpl_messages, &opts)
+        .map_err(|e| anyhow::anyhow!("render chat_template.jinja: {e}"))?;
+
+    let ids = rmlx_server::tokenizer_io::encode(tokenizer, &rendered.text)
+        .map_err(|e| anyhow::anyhow!("tokenize rendered chat prompt: {e}"))?;
+    if ids.is_empty() {
+        return Err(anyhow::anyhow!(
+            "chat-JSON fixture rendered through chat_template.jinja encoded to zero tokens"
+        ));
+    }
+    Ok(ids)
+}
+
 /// Record a performance baseline for the given model snapshot.
 ///
 /// Steps:
@@ -186,6 +298,10 @@ pub(crate) fn compute_phase_timing(
 ///    `max_prompt_tokens` (CLI-configurable; defaults to `MAX_PROMPT_TOKENS`)
 ///    via `resolve_prompt_truncation` -- truncates on `--device cpu` or an
 ///    explicit opt-in, errors loudly on `--device gpu` with the default cap.
+///    A chat-JSON fixture (`{"messages": [...], ...}`, e.g.
+///    `prompts/longctx_<N>k.json`) is rendered through the model's real
+///    `chat_template.jinja` first, so the token count reflects the message
+///    content rather than the fixture's JSON envelope + syntax.
 /// 2. `arch::load_model` -- capture `load_ms`.
 /// 3. `arch.generate_greedy` -- per-token `step_fn` callback captures wall-clock
 /// so prefill (TTFT) and steady-state decode are timed SEPARATELY.
@@ -234,12 +350,21 @@ pub(crate) fn run_baseline(
     let tokenizer = tokenizers::Tokenizer::from_file(&tk_path)
         .map_err(|e| anyhow::anyhow!("cannot load tokenizer.json: {e}"))?;
 
-    // Tokenize with add_special_tokens=true so BOS is prepended naturally.
-    let encoding = tokenizer
-        .encode(prompt_text.as_str(), true)
-        .map_err(|e| anyhow::anyhow!("tokenize prompt: {e}"))?;
-
-    let mut prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
+    // A chat-JSON fixture (`{"messages": [...], ...}`) is rendered through the
+    // model's real chat_template.jinja and only the resulting content tokens
+    // are counted -- matching the HTTP chat-completions path. Anything else
+    // (e.g. the default plain-text fixture) is tokenized as raw text with
+    // add_special_tokens=true so BOS is prepended naturally.
+    let chat_fixture_messages = parse_chat_fixture(&prompt_text)?;
+    let template_used = chat_fixture_messages.is_some();
+    let mut prompt_ids: Vec<u32> = if let Some(messages) = &chat_fixture_messages {
+        tokenize_chat_fixture(model_path, &tokenizer, messages)?
+    } else {
+        let encoding = tokenizer
+            .encode(prompt_text.as_str(), true)
+            .map_err(|e| anyhow::anyhow!("tokenize prompt: {e}"))?;
+        encoding.get_ids().to_vec()
+    };
 
     // Truncate to `max_prompt_tokens` when the cap allows it; on GPU with the
     // default (non-explicit) cap this is a hard error instead -- see
@@ -259,6 +384,7 @@ pub(crate) fn run_baseline(
         device = device_str,
         prompt_tokens = prompt_token_count,
         max_tokens,
+        template_used,
         "baseline: starting"
     );
 
