@@ -176,23 +176,60 @@ with `nm -u target/release/rmlx | grep mlx_metal_start_capture` (empty).
 
 ### Prerequisites
 
-1. Full **Xcode**, not just Command Line Tools — traces cannot be replayed
-   without it:
+Capture and *replay* need different things, and the split is why a trace can be
+written successfully and still show nothing when opened. All of them are checked
+before a run writes anything — `scripts/gpu_capture.sh` refuses up front rather
+than after several GB.
+
+**To capture:**
+
+1. A binary built with the feature:
+
+   ```sh
+   make build-capture     # cargo build --profile release-debug --features rmlx-cli/metal-capture, then signs it
+   ```
+
+2. `MTL_CAPTURE_ENABLED=1` in the process environment. This is **Apple's** —
+   Metal inserts the capture layer at launch and there is no in-process way to
+   add it later — not an rMLX configuration knob. The wrapper script sets it;
+   without it the run aborts before loading the model and says so.
+
+**For Apple's GPU tools to attach to the process** (developer mode plus the
+debuggable entitlement are what let them attach at all — a capture taken by a
+process they may not attach to is not usable in the Xcode GPU debugger),
+checked by `scripts/gputrace_preflight.sh` / `make gputrace-preflight`:
+
+3. Full **Xcode**, not just Command Line Tools:
 
    ```sh
    sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
    ```
 
-2. A binary built with the feature:
+4. **Developer mode** enabled — Xcode's GPU tools cannot attach without it:
 
    ```sh
-   make build-capture     # cargo build --profile release-debug --features rmlx-cli/metal-capture
+   sudo DevToolsSecurity -enable
    ```
 
-3. `MTL_CAPTURE_ENABLED=1` in the process environment. This is **Apple's** —
-   Metal inserts the capture layer at launch and there is no in-process way to
-   add it later — not an rMLX configuration knob. The wrapper script sets it;
-   without it the run aborts before loading the model and says so.
+5. The capture binary signed with **`com.apple.security.get-task-allow`** —
+   Apple's "this process may be attached to" marker. Cargo emits an ad-hoc
+   *linker-signed* binary that carries no entitlements at all, so a plain
+   `cargo build` fails this. `make build-capture` re-signs with
+   `scripts/rmlx-capture.entitlements` as part of the build; `codesign --force`
+   is idempotent, so it also repairs a binary a bare `cargo build` re-created.
+   The re-sign is inert for throughput — measured on gemma-4-e2b at 4k, decode
+   128.5 TPS signed against 128.4 unsigned (+0.10%, inside a 2.2% run-to-run
+   range), identical token digest.
+
+   Verify by hand with:
+
+   ```sh
+   codesign -d --entitlements - target/release-debug/rmlx
+   ```
+
+6. The Metal toolchain, for the shader recompilation a replay does
+   (`xcodebuild -downloadComponent MetalToolchain`). Advisory — the preflight
+   warns rather than failing, since capture itself does not need it.
 
 ### Capture
 
@@ -204,9 +241,11 @@ bash scripts/gpu_capture.sh --kv-quant iso3_sym --model /path/to/snapshot \
 ```
 
 Traces land in `.rmlx/traces/` named
-`<model>-<codec>-<prompt>tok-<timestamp>.gputrace`; `open` them in Xcode. The
-script runs the MLX preflight, refuses a binary built without the feature, and
-sizes `--max-ctx` for the prompt.
+`<model>-<codec>-<prompt>tok-<timestamp>.gputrace`. The script runs the MLX
+preflight, refuses a binary built without the feature, refuses a host that
+cannot attach (developer mode, entitlement — *before* the multi-GB write), sizes
+`--max-ctx` for the prompt, and enforces the trace-directory cap afterwards
+(see [Keeping `.rmlx/traces` bounded](#keeping-rmlxtraces-bounded)).
 
 A capture run's timings are worthless (see below), so `--gpu-capture` forces the
 metrics kill switch to `off` for the whole process — no `events` row, no
@@ -247,54 +286,140 @@ large constant term.
 ### What a `.gputrace` actually answers
 
 Three questions people run this for. They need three different things, and only
-the first is in the bundle you just wrote. Measured across five bundles from
-this path: **no `.gpuprofiler_raw`, and zero timestamp, duration or counter
-payloads anywhere** — the only `counter`-ish string in a whole 6 GB bundle is
-one empty `counterSampleBuffers` category label.
+the first is in the bundle you just wrote. Measured across six bundles from this
+path — including ones captured with developer mode on and an entitled binary:
+**no `.gpuprofiler_raw`, and zero timestamp, duration or counter payloads
+anywhere** — the only `counter`-ish string in a whole 6 GB bundle is one empty
+`counterSampleBuffers` category label.
 
-**1. Kernel identity — in the bundle, offline, no Xcode.**
+**1. Kernel identity — in the bundle, offline, no Xcode. This is the reason to
+capture.**
 
 `<trace>/device-resources-0x<addr>` names every pipeline and function the window
-referenced, by mangled MSL name, and `<trace>/metadata` counts how many of them
-went unused:
-
-```sh
-strings <trace>/device-resources-0x* | grep -oE 'gather_front[a-z0-9_]*' | sort -u
-plutil -p <trace>/metadata | grep unused   # unusedComputePipelineStateCount, ...
-```
+referenced, by mangled MSL name; `unused-device-resources-0x<addr>` holds the
+ones the capture layer recorded as unused. Read them with the bundle tools
+below, not by hand — the record layout has traps (see
+[Working with a bundle](#working-with-a-bundle)).
 
 That is enough to answer "is the codec's own kernel running at all, or is it
 decoding through the bf16 mirror?" — the question that motivated the capture
-window in the first place.
+window in the first place, and the one that produced the `iso3_sym` ⊃ `none`
+finding.
 
-**2. Per-dispatch time, limiter counters, occupancy, achieved bandwidth — GUI
-only, and they do not exist until you ask for them.**
+**2. Per-dispatch time, limiter counters, occupancy, achieved bandwidth — do
+not plan a session around these. Most of them do not exist on this hardware.**
 
-Open the bundle in Xcode and press **Profile**. That *replays* the capture
-on-device with counters enabled, and the replay is what creates
-`.gpuprofiler_raw`. There is no headless replay tool: on Xcode 26.6 `xctrace`
-offers `record` / `import` / `export` / `symbolicate` and nothing that replays a
-capture, so this step cannot be scripted or run over ssh. Background: [Analyzing
-Apple GPU performance using
-counter
-statistics](https://developer.apple.com/documentation/xcode/analyzing-apple-gpu-performance-using-counter-statistics).
+- Timing appears only in `.gpuprofiler_raw`, and only Xcode's **GUI** Profile
+  replay writes it. There is no scriptable equivalent: `xctrace` has no replay
+  verb (Xcode 26.6 offers `record` / `import` / `export` / `remodel` /
+  `symbolicate`), `/System/Library/CoreServices/MTLReplayer.app` has hidden
+  `--replay` / `--counters` flags but hangs and is killed without Xcode's XPC
+  session, and Xcode 26's MCP server exposes nothing that touches a gputrace.
+- The counters people actually want are **unsupported on M5 Max**:
+  `supportsCounterSampling(atDispatchBoundary)` is false, `device.counterSets`
+  returns exactly one set (`GPUTimestamp`), and the *Metal GPU Counters*
+  template refuses with "Selected counter profile is not supported on target
+  device".
 
-**3. Gaps between dispatches as they occurred in your run — not in a frame
-capture. Ever.**
+So an empty timeline in Xcode is the expected state of these bundles, not a
+misconfiguration to chase.
+
+**3. Wall-clock GPU timing and the gaps between submissions — use Metal System
+Trace, not a capture. Ever.**
 
 A replay has the replay's schedule, not the schedule of the run you captured.
 Host round-trips — the blocking `Array::eval()` per layer per step, a per-step
 prefix restage — will **not** show up in a `.gputrace`, no matter how it is
-replayed. That needs a timeline instrument over the live process:
+replayed. A timeline instrument over the live process does show them, headlessly
+and with nanosecond resolution:
 
 ```sh
-xcrun xctrace record --template 'Metal System Trace' --launch -- \
+xcrun xctrace record --template 'Metal System Trace' --no-prompt \
+  --output run.trace --time-limit 8s --launch -- \
   ./target/release-debug/rmlx --metrics off baseline --model /path/to/snapshot ...
+
+xcrun xctrace export --input run.trace \
+  --xpath '/trace-toc/run[@number="1"]/data/table[@schema="metal-gpu-intervals"]' \
+  --output gpu.xml
 ```
 
-Budget the session accordingly: if the hypothesis is "the GPU is idle waiting on
-the host", a GPU capture is the wrong artifact and will cost a day proving
-nothing.
+That table gives per-GPU-submission `start` and `duration` in nanoseconds,
+`gpu-channel-name`, `start-latency` (the CPU→GPU gap), and `cmdbuffer-id` /
+`encoder-id`, per process; `metal-application-encoders-list` and
+`metal-command-buffer-completed` join on those ids. Measured run-to-run spread:
+0.06%. Three things to know before using it:
+
+- **`--attach <pid>` does not work** for this template — it reports "No
+  configuration information received, will have to guess" and exports zero rows.
+  Metal instrumentation has to be present at launch: use `--launch --` (or
+  `--all-processes`, which does pick up a running process).
+- The export XML uses an **`id`/`ref` back-reference encoding** with positional
+  columns and `<sentinel/>` for NULL. A naive parser silently misaligns columns,
+  which reads as plausible-but-wrong numbers rather than an error.
+- **Volume**: an 8 s trace is a ~145 MB bundle and ~44 MB of XML for one table.
+  Bound it with `--time-limit`.
+
+Pipeline and function names do **not** survive the export (only encoder,
+command-buffer, buffer and queue labels), and the driver coalesces consecutive
+compute encoders into one GPU kick — so one row can cover several encoders. Pair
+it with the identity list from a capture when you need to know *which* kernel.
+
+### Working with a bundle
+
+A 6 GB bundle is opaque, and its layout is Apple's — not a stable contract. Four
+scripts cover the operations that have actually been needed. Each one checks the
+structure it depends on and fails loudly, by name, when the layout moves: an
+empty list is never printed in place of "could not read this".
+
+| Command | What it answers |
+|---|---|
+| `bash scripts/gputrace_summary.sh <bundle>` | What was captured (model, codec, prompt size, when — read back from the harness naming convention), total and command-stream size, and whether a `.gpuprofiler_raw` is present. |
+| `bash scripts/gputrace_kernels.sh <bundle>` | Which Metal functions the window referenced, and which the capture layer recorded as unused. `--set used\|unused\|all`, `--names-only` for piping. |
+| `bash scripts/gputrace_diff.sh <a> <b>` | What A's window referenced that B's did not, and vice versa — the codec-vs-codec or commit-vs-commit A/B. |
+| `bash scripts/gputrace_preflight.sh` | The host-side prerequisites above, each with its fix. Also `make gputrace-preflight`. |
+
+Worked example — the same comparison that first had to be done by hand, on two
+captures of gemma-4-e2b at 4k taken minutes apart:
+
+```console
+$ bash scripts/gputrace_diff.sh <none>.gputrace <iso3_sym>.gputrace
+shared: 37
+only in A (0):
+only in B (9):
+  custom_kernel_rmlx_iso_flash_decode_symv_p1_b3
+  custom_kernel_rmlx_iso_flash_decode_symv_p2
+  custom_kernel_rmlx_iso3_quantize
+  ...
+```
+
+Two limits worth knowing. Some function records store their name by object id
+rather than inline; those are counted and reported (`… 46 named, 12 stored by
+object id`) instead of silently dropped, so the named list is a subset, not the
+whole set. And a `.gputrace` holds no dispatch *counts* — the command stream
+references pipelines by object id, so "which kernels ran" is answerable offline
+but "how many times" is not.
+
+### Keeping `.rmlx/traces` bounded
+
+Bundles are ~6 GB each — roughly the model's resident footprint — and a single
+A/B session produces several. Unlike `target/`, they are not cheap to
+regenerate: each is a model load plus a capture run. So the directory is
+**capped**, not expired on a timer:
+
+- keep the newest **6** bundles, and at most **40 GB** total;
+- eviction is oldest-first, never the bundle just written, and every removal is
+  printed with its reason and the space reclaimed;
+- `scripts/gpu_capture.sh` enforces the cap after a successful capture — the
+  point of a cap is to stop a session filling the disk, and an advisory the
+  operator runs afterwards does not do that. Pass `--keep-all`
+  (`make profile-gputrace … KEEP_ALL=1`) for a session that wants more.
+
+```sh
+make traces-gc                                   # report: what is over the caps
+make traces-gc APPLY=1                           # enforce them
+make traces-gc APPLY=1 MAX_COUNT=12 MAX_TOTAL_GB=80
+bash scripts/traces_gc.sh --apply --max-age-days 7   # optional extra age rule
+```
 
 ### Tests
 

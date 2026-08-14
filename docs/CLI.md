@@ -354,6 +354,21 @@ rMLX knob: the trace path and the window come from the flags above.
 `scripts/gpu_capture.sh` (`make profile-gputrace`) sets it and runs the
 toolchain preflight.
 
+Two host-side prerequisites are **not** about this binary's flags but decide
+whether Apple's GPU tools can attach to the process at all: developer mode
+(`sudo DevToolsSecurity -enable`) and the `com.apple.security.get-task-allow`
+entitlement on the binary. Cargo's linker-signed ad-hoc signature carries no
+entitlements, so `make build-capture` re-signs the binary with
+`scripts/rmlx-capture.entitlements` as part of the build. Both are checked by
+`scripts/gputrace_preflight.sh` (`make gputrace-preflight`), which
+`scripts/gpu_capture.sh` runs *before* the capture rather than after several GB
+have been written. See [`docs/PROFILING.md` §5](PROFILING.md).
+
+Bundles are ~6 GB. After a successful capture `scripts/gpu_capture.sh` bounds
+`.rmlx/traces/` to the newest 6 bundles / 40 GB, evicting oldest-first and
+printing every removal; `--keep-all` (`make profile-gputrace … KEEP_ALL=1`)
+skips that, and `make traces-gc` reports or enforces the caps on demand.
+
 Every way a capture can fail to happen is a non-zero exit, checked **before the
 model loads** where possible: no capture layer, an occupied destination, a
 missing parent directory, a zero-wide window, or a `--max-tokens` too small to

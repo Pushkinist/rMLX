@@ -19,9 +19,12 @@
 # it as "the kernels decode runs" is wrong.
 #
 # Prerequisites (checked below, each with the fix):
-#   - Xcode (not just Command Line Tools) selected via xcode-select
 #   - a binary built with the metal-capture feature (the flags do not exist
 #     otherwise — a release build cannot capture at all)
+#   - the replay prerequisites, via scripts/gputrace_preflight.sh: Xcode (not
+#     just Command Line Tools) selected, developer mode enabled, and the binary
+#     signed with com.apple.security.get-task-allow. A capture written without
+#     those is several GB that Xcode opens and shows nothing for.
 #   - MTL_CAPTURE_ENABLED=1 in the child environment; Metal inserts the capture
 #     layer at launch and cannot do so afterwards. This script sets it.
 #
@@ -29,8 +32,12 @@
 #   bash scripts/gpu_capture.sh --kv-quant iso3_sym --model /path/to/snapshot
 #   bash scripts/gpu_capture.sh --kv-quant none --model ... --prompt-tokens 4096 \
 #       --skip 4 --steps 8
+#   bash scripts/gpu_capture.sh ... --keep-all     # do not enforce the trace cap
 #
-# Output: a .gputrace bundle under .rmlx/traces/, ready to open in Xcode.
+# Output: a .gputrace bundle under .rmlx/traces/, ready to open in Xcode. After
+# a successful capture the trace directory is bounded by scripts/traces_gc.sh
+# (oldest-first, never the new bundle, every removal printed); --keep-all skips
+# that for a session that wants to keep more than the cap.
 
 set -uo pipefail
 
@@ -41,6 +48,7 @@ SKIP=4
 STEPS=8
 GEN=""
 OUT_DIR=".rmlx/traces"
+KEEP_ALL=0
 
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -72,6 +80,10 @@ while [ $# -gt 0 ]; do
 		OUT_DIR="$2"
 		shift 2
 		;;
+	--keep-all)
+		KEEP_ALL=1
+		shift
+		;;
 	*)
 		echo "unknown argument: $1" >&2
 		exit 2
@@ -81,7 +93,7 @@ done
 
 if [ -z "$KV_QUANT" ] || [ -z "$MODEL" ]; then
 	echo "usage: $0 --kv-quant <codec> --model <snapshot-abs-path>" >&2
-	echo "       [--prompt-tokens N] [--skip N] [--steps N] [--gen N] [--out-dir DIR]" >&2
+	echo "       [--prompt-tokens N] [--skip N] [--steps N] [--gen N] [--out-dir DIR] [--keep-all]" >&2
 	exit 2
 fi
 
@@ -98,23 +110,11 @@ elif [ "$GEN" -lt "$min_gen" ]; then
 	exit 2
 fi
 
-# --- 1. Xcode must be selected; Command Line Tools alone cannot replay traces --
-dev_dir=$(xcode-select -p 2>/dev/null)
-if [ "${dev_dir##*/}" = "CommandLineTools" ]; then
-	echo "ERROR: xcode-select points at Command Line Tools, not Xcode." >&2
-	echo "  GPU traces need the full Xcode toolchain. Select it with:" >&2
-	echo "    sudo xcode-select -s /Applications/Xcode.app/Contents/Developer" >&2
-	exit 1
-fi
-
-# --- 2. toolchain sanity: same gate the bench path uses ---------------------
-bash scripts/mlx_preflight.sh || exit 1
-
-# --- 3. binary must carry the capture feature ------------------------------
+# --- 1. binary must carry the capture feature ------------------------------
 # The --gpu-capture flags are compiled out without it, so their absence from
 # --help is the authoritative check: a release binary cannot capture at all.
 BIN="target/release-debug/rmlx"
-BUILD_HINT="cargo build --profile release-debug --features rmlx-cli/metal-capture"
+BUILD_HINT="make build-capture     # cargo build --profile release-debug --features rmlx-cli/metal-capture, then sign it"
 if [ ! -x "$BIN" ]; then
 	echo "ERROR: $BIN not found." >&2
 	echo "  Build it with the capture feature and full debug info:" >&2
@@ -127,6 +127,16 @@ if ! "$BIN" baseline --help 2>/dev/null | grep -q -- '--gpu-capture'; then
 	echo "    $BUILD_HINT" >&2
 	exit 1
 fi
+
+# --- 2. host must be able to REPLAY what we are about to write --------------
+# Xcode selected, developer mode on, and the binary signed with
+# com.apple.security.get-task-allow. Checked here, before the run, because a
+# capture from an unentitled process or a host without developer mode still
+# writes several GB and only reveals the problem as an empty Xcode timeline.
+bash scripts/gputrace_preflight.sh --binary "$BIN" || exit 1
+
+# --- 3. toolchain sanity: same gate the bench path uses ---------------------
+bash scripts/mlx_preflight.sh || exit 1
 
 mkdir -p "$OUT_DIR"
 stamp=$(date +%Y%m%d-%H%M%S)
@@ -176,12 +186,31 @@ echo ""
 echo "done: $trace"
 echo "open with:  open '$trace'"
 echo ""
+
+# Bound the collection, right after a successful capture. Bundles are ~6 GB and
+# a session of A/B captures fills a disk long before anything "ages out", so the
+# cap is enforced here rather than left as an advisory the operator runs later —
+# by the time a disk is full the run in flight has already failed. Eviction is
+# oldest-first, never the bundle just written, and every removal is printed.
+# --keep-all skips it for a session that genuinely wants more than the cap.
+if [ "$KEEP_ALL" = "1" ]; then
+	echo "retention: --keep-all, cap not enforced ($(ls -d "$OUT_DIR"/*.gputrace 2>/dev/null | wc -l | tr -d ' ') bundles in $OUT_DIR)"
+else
+	bash scripts/traces_gc.sh --apply --dir "$OUT_DIR"
+fi
+echo ""
+echo "Offline, no Xcode:"
+echo "  bash scripts/gputrace_summary.sh '$trace'"
+echo "  bash scripts/gputrace_kernels.sh '$trace'"
+echo "  bash scripts/gputrace_diff.sh <other.gputrace> '$trace'"
+echo ""
 echo "What this bundle holds, and what it does not:"
 echo "  - kernel identity is in the bundle already: which pipelines the window"
 echo "    referenced, and which of them were actually used. No Xcode needed."
-echo "  - per-dispatch time, ALU-vs-memory limiter, occupancy and achieved"
-echo "    bandwidth are NOT in it. Open it in Xcode and press Profile: that"
-echo "    replays the capture on-device with counters enabled and writes them."
-echo "  - the gaps between dispatches as they happened in THIS run are not"
-echo "    recoverable at all — a replay has the replay's schedule. For host"
-echo "    round-trips use:  xcrun xctrace record --template 'Metal System Trace'"
+echo "  - no timing of any kind. Only Xcode's GUI Profile replay writes a"
+echo "    .gpuprofiler_raw, and the per-dispatch counters people want are not"
+echo "    supported on this GPU. An empty Xcode timeline is expected here."
+echo "  - for wall-clock GPU time and CPU->GPU gaps, record the live process:"
+echo "      xcrun xctrace record --template 'Metal System Trace' --no-prompt \\"
+echo "        --output run.trace --time-limit 8s --launch -- <rmlx ...>"
+echo "    See docs/PROFILING.md §5 for the export and its parsing traps."

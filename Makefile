@@ -52,7 +52,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         profile-samply profile-samply-debug profile-instruments bench asm perf-iter \
         canary canary-gate \
         mlx-preflight mlx-restore-pin target-gc target-size-report profile-gputrace \
-        build-capture test-capture \
+        build-capture test-capture gputrace-preflight traces-gc \
         ssd-canary ssd-canary-gate \
         bench-codec-cell \
         smoke-codec-matrix \
@@ -83,8 +83,26 @@ target-gc:       ## report stale target/ profiles (APPLY=1 to prune; target/ has
 target-size-report: ## advisory: print target/ size + hint when over threshold (non-failing; also runs at the end of `make ci`)
 	@bash scripts/target_size_report.sh
 
-build-capture: ## build the debug-only GPU-capture binary (release-debug + metal-capture)
+# The re-sign is not optional decoration. Cargo emits an ad-hoc *linker-signed*
+# binary with no entitlements at all; com.apple.security.get-task-allow is what
+# marks the process attachable by Apple's developer tools, which is a
+# prerequisite for the GPU debugger to work with what it captured.
+# `codesign --force` is idempotent, so this also repairs a binary that a plain
+# `cargo build` re-created without it.
+build-capture: ## build + entitle the debug-only GPU-capture binary (release-debug + metal-capture, signed so Apple's GPU tools can attach)
 	cargo build --profile release-debug --features rmlx-cli/metal-capture
+	codesign --force --sign - --entitlements scripts/rmlx-capture.entitlements \
+		target/release-debug/rmlx
+	@bash scripts/gputrace_preflight.sh --binary target/release-debug/rmlx
+
+gputrace-preflight: ## check the GPU-tools prerequisites (developer mode, get-task-allow, Xcode selected, Metal toolchain)
+	@bash scripts/gputrace_preflight.sh $(if $(BIN),--binary $(BIN),)
+
+traces-gc:       ## report .rmlx/traces against the retention caps (APPLY=1 to prune; MAX_COUNT=/MAX_TOTAL_GB=/MAX_AGE_DAYS= to retune)
+	bash scripts/traces_gc.sh $(if $(APPLY),--apply,) $(if $(ALL),--all,) \
+		$(if $(MAX_COUNT),--max-count $(MAX_COUNT),) \
+		$(if $(MAX_TOTAL_GB),--max-total-gb $(MAX_TOTAL_GB),) \
+		$(if $(MAX_AGE_DAYS),--max-age-days $(MAX_AGE_DAYS),)
 
 # `make test` is `cargo test --workspace` without --all-features, so it compiles
 # these out entirely. Run from `ci` as well, or an off-by-one in the window
@@ -93,17 +111,17 @@ test-capture: ## run the GPU-capture unit tests (feature-gated, so plain `make t
 	cargo test -p rmlx-mlx --features metal-capture --lib metal_capture
 	cargo test -p rmlx-cli --features metal-capture --bin rmlx gpu_capture
 
-profile-gputrace: ## capture a decode-window Metal GPU trace for Xcode (CODEC= MODEL= required)
+profile-gputrace: ## capture a decode-window Metal GPU trace (CODEC= MODEL= required; enforces the .rmlx/traces cap unless KEEP_ALL=1)
 	@if [ -z "$(CODEC)" ] || [ -z "$(MODEL)" ]; then \
 		echo "Usage: make profile-gputrace CODEC=<codec> MODEL=<snapshot-abs-path> \
-[PROMPT_TOKENS=4096] [SKIP=4] [STEPS=8] [GEN=N]"; \
+[PROMPT_TOKENS=4096] [SKIP=4] [STEPS=8] [GEN=N] [KEEP_ALL=1]"; \
 		echo "Needs a binary from \`make build-capture\`."; \
 		exit 2; \
 	fi
 	bash scripts/gpu_capture.sh --kv-quant $(CODEC) --model $(MODEL) \
 		$(if $(PROMPT_TOKENS),--prompt-tokens $(PROMPT_TOKENS),) \
 		$(if $(SKIP),--skip $(SKIP),) $(if $(STEPS),--steps $(STEPS),) \
-		$(if $(GEN),--gen $(GEN),)
+		$(if $(GEN),--gen $(GEN),) $(if $(KEEP_ALL),--keep-all,)
 
 mlx-restore-pin: ## restore mlx 0.31.2 + mlx-c 0.6.0_2 (nax-capable pair) and relink
 	bash scripts/mlx_restore_pin.sh
