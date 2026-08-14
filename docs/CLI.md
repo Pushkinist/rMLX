@@ -324,6 +324,34 @@ rmlx baseline --model /path/to/snapshot --prompt-tokens 4096 --label "8k-bench"
 | `--record` | bool flag | off | Emit a §8.5 `RunRecord` to the metrics buffer and ingest into `runs.db` in-process. |
 | `--git-sha` | string | — | Commit SHA to stamp on the emitted record's `git_sha` column (only meaningful with `--record`). Provenance the caller supplies — the binary does not and cannot determine the commit it was built from. Absent by default (`git_sha` is `NULL`). |
 
+#### GPU-capture flags (debug builds only)
+
+Three further flags exist **only** when the binary is built with
+`--features rmlx-cli/metal-capture`. A release binary does not have them —
+`--gpu-capture` there is an "unexpected argument" error, and neither the flag
+nor the per-step hook it drives is linked in. See
+[`docs/PROFILING.md` §5](PROFILING.md) for the workflow.
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `--gpu-capture` | path | — | Write a Metal GPU trace of a bounded window of steady-state decode to this path (a `.gputrace` bundle). Mutually exclusive with `--record`. |
+| `--gpu-capture-skip` | u32 | 4 | Decode steps to run before the window opens, so first-touch kernel compilation and pipeline warm-up stay out of the trace. Requires `--gpu-capture`. |
+| `--gpu-capture-steps` | u32 | 8 | Decode steps inside the window. Requires `--gpu-capture`. |
+
+The process must be launched with `MTL_CAPTURE_ENABLED=1`. That is Apple's —
+Metal inserts the capture layer at launch and cannot do so afterwards — not an
+rMLX knob: the trace path and the window come from the flags above.
+`scripts/gpu_capture.sh` (`make profile-gputrace`) sets it and runs the
+toolchain preflight.
+
+Every way a capture can fail to happen is a non-zero exit, checked **before the
+model loads** where possible: no capture layer, an occupied destination, a
+missing parent directory, a zero-wide window, or a `--max-tokens` too small to
+open, fill and close the window (it needs `skip + steps + 2`). A generation that
+stops early and never reaches the window is an error at the end of the run.
+`--record` is rejected outright because capture perturbs every timing `baseline`
+measures.
+
 #### Chat-JSON prompt tokenization
 
 The canonical `prompts/longctx_<N/1024>k.json` fixtures (and any `--prompt`

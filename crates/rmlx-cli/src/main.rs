@@ -1069,6 +1069,31 @@ enum Cmd {
         /// Env: `RMLX_YARN_ORIGINAL_MAX`.
         #[arg(long, env = "RMLX_YARN_ORIGINAL_MAX", value_name = "U32")]
         yarn_original_max: Option<u32>,
+        /// Write a Metal GPU trace of a bounded window of steady-state decode
+        /// to PATH (a `.gputrace` bundle, opened in Xcode). Debug builds only —
+        /// this flag exists only when the binary is built with
+        /// `--features rmlx-cli/metal-capture`.
+        ///
+        /// The process must have been launched with `MTL_CAPTURE_ENABLED=1`;
+        /// Metal inserts the capture layer at launch and cannot do so later.
+        /// `scripts/gpu_capture.sh` handles both.
+        ///
+        /// Capture perturbs every timing this command measures, so it cannot be
+        /// combined with `--record`.
+        #[cfg(feature = "metal-capture")]
+        #[arg(long, value_name = "PATH", conflicts_with = "record")]
+        gpu_capture: Option<PathBuf>,
+        /// Decode steps to run before the GPU-capture window opens. Skipping the
+        /// first steps keeps first-touch kernel compilation and pipeline warm-up
+        /// out of the trace.
+        #[cfg(feature = "metal-capture")]
+        #[arg(long, value_name = "N", default_value_t = 4, requires = "gpu_capture")]
+        gpu_capture_skip: u32,
+        /// Decode steps inside the GPU-capture window. Keep it small — every
+        /// captured dispatch is serialised into the bundle.
+        #[cfg(feature = "metal-capture")]
+        #[arg(long, value_name = "N", default_value_t = 8, requires = "gpu_capture")]
+        gpu_capture_steps: u32,
     },
     /// Repeated-run decode instrument: TTFT, ITL p50/p99, decode TPS and
     /// filled-prefix KV bytes for one (model, KV codec, context, generation)
@@ -2055,7 +2080,24 @@ fn main() -> Result<()> {
             prompts_dir,
             yarn_factor,
             yarn_original_max,
+            #[cfg(feature = "metal-capture")]
+            gpu_capture,
+            #[cfg(feature = "metal-capture")]
+            gpu_capture_skip,
+            #[cfg(feature = "metal-capture")]
+            gpu_capture_steps,
         } => {
+            // Arm the GPU-capture window before anything expensive happens: a
+            // request that cannot be honoured must cost seconds, not a full
+            // weight load followed by a failure at the first decode step.
+            #[cfg(feature = "metal-capture")]
+            let capture_requested = commands::gpu_capture::arm(
+                gpu_capture.as_deref(),
+                gpu_capture_skip,
+                gpu_capture_steps,
+                max_tokens,
+            )?;
+
             let cap_is_explicit = max_prompt_tokens.is_some();
             let max_prompt_tokens = parse_max_prompt_tokens(
                 max_prompt_tokens.unwrap_or(commands::baseline::MAX_PROMPT_TOKENS),
@@ -2158,7 +2200,7 @@ fn main() -> Result<()> {
                 factor,
                 original_max: yarn_original_max.map_or(0.0, |v| v as f32),
             });
-            run_baseline(
+            let baseline_result = run_baseline(
                 &model,
                 &effective_prompt_path,
                 &device,
@@ -2173,7 +2215,15 @@ fn main() -> Result<()> {
                 yarn_override,
                 &sink,
                 record_args,
-            )?;
+            );
+            // Always stop and report the capture, including when the run failed —
+            // otherwise a live scope leaks and the trace is never finalised. The
+            // run's own error still wins, since it is the root cause.
+            #[cfg(feature = "metal-capture")]
+            let capture_result = commands::gpu_capture::report(capture_requested);
+            baseline_result?;
+            #[cfg(feature = "metal-capture")]
+            capture_result?;
         }
         Cmd::Bench {
             model,

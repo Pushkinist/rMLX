@@ -4,6 +4,8 @@ pub(crate) mod baseline;
 pub(crate) mod bench;
 pub(crate) mod calibration_softmax;
 pub(crate) mod eval;
+#[cfg(feature = "metal-capture")]
+pub(crate) mod gpu_capture;
 pub(crate) mod healthcheck;
 pub(crate) mod info;
 pub(crate) mod kv_calibrate;

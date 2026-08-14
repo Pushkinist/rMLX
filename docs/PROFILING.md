@@ -144,29 +144,89 @@ On M5 the Neural Accelerator is **part of the GPU**, so profiling nax needs no
 special tooling — the ordinary Metal capture path covers it
 ([ml-explore/mlx#3182](https://github.com/ml-explore/mlx/issues/3182)).
 
-`rmlx_mlx::metal_capture::CaptureScope` is an RAII guard over
-`mlx_metal_start_capture` / `mlx_metal_stop_capture`, behind the
-`metal-capture` feature so release builds pay nothing.
+### How the window works
+
+The capture is a **bounded window of decode steps**, not a whole run: a run is
+dominated by weight load and prefill, which is not what kernel work studies, and
+a full-run trace is unusably large.
+
+`rmlx_mlx::metal_capture` owns the whole mechanism behind the `metal-capture`
+feature. `CaptureScope` is the RAII guard over `mlx_metal_start_capture` /
+`mlx_metal_stop_capture`; `Window` is the pure policy that decides when the
+scope opens and closes. The one hook is a `step()` call at the top of the
+**shared** decode loop (`rmlx_models::decode_loop::pipelined_decode`), so the
+window is model- and codec-agnostic — every arch that uses that loop (gemma4,
+gemma3, qwen3, qwen3.5-MoE) is covered with no per-arch wiring.
+
+With `--gpu-capture-skip 4 --gpu-capture-steps 8` the scope opens before decode
+step 5 and closes before step 13: eight whole steps, no load, no prefill.
+
+**Off, none of it exists.** Without the feature there is no flag, no hook, no
+`Window`, and no undefined reference to `mlx_metal_start_capture` — verifiable
+with `nm -u target/release/rmlx | grep mlx_metal_start_capture` (empty).
 
 ### Prerequisites
 
-Full **Xcode**, not just Command Line Tools — traces cannot be replayed without
-it:
+1. Full **Xcode**, not just Command Line Tools — traces cannot be replayed
+   without it:
 
-```sh
-sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-```
+   ```sh
+   sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+   ```
+
+2. A binary built with the feature:
+
+   ```sh
+   make build-capture     # cargo build --profile release-debug --features rmlx-cli/metal-capture
+   ```
+
+3. `MTL_CAPTURE_ENABLED=1` in the process environment. This is **Apple's** —
+   Metal inserts the capture layer at launch and there is no in-process way to
+   add it later — not an rMLX configuration knob. The wrapper script sets it;
+   without it the run aborts before loading the model and says so.
 
 ### Capture
 
 ```sh
-cargo build --profile release-debug --features rmlx-mlx/metal-capture
 make profile-gputrace CODEC=iso3_sym MODEL=/path/to/snapshot
+# or, with the window spelled out:
+bash scripts/gpu_capture.sh --kv-quant iso3_sym --model /path/to/snapshot \
+  --prompt-tokens 4096 --skip 4 --steps 8
 ```
 
-The window is a short generation, deliberately: a whole run is unusably large
-and dominated by model load and prefill, which is not what kernel work studies.
-Traces land in `.rmlx/traces/`; `open` them in Xcode.
+Traces land in `.rmlx/traces/`; `open` them in Xcode. The script runs the MLX
+preflight, refuses a binary built without the feature, sizes `--max-ctx` for the
+prompt, and passes `--metrics off` — a capture run's timings are worthless (see
+below) and must never reach `runs.db`.
+
+Driving it directly is the same thing without the guard rails:
+
+```sh
+MTL_CAPTURE_ENABLED=1 ./target/release-debug/rmlx --metrics off baseline \
+  --model /path/to/snapshot --kv-quant none \
+  --prompt-tokens 4096 --max-tokens 18 --max-ctx 4700 \
+  --gpu-capture .rmlx/traces/run.gputrace --gpu-capture-skip 4 --gpu-capture-steps 8
+```
+
+### What it costs
+
+Capture serialises and records every dispatch and snapshots every resident GPU
+buffer. Two consequences worth planning for:
+
+- **Decode collapses** to single-digit TPS during the window (measured: ~2.5 TPS
+  on gemma-4-e2b against ~127 TPS for the same cell uncaptured). Timings from a
+  capture run are meaningless — `--gpu-capture` is rejected with `--record` for
+  exactly this reason.
+- **Bundles are large** — the resource snapshot dominates, so the floor is
+  roughly the model's resident footprint. ~6 GB for an e2b-class model at 4k
+  context, near-identical for an 8-step and a 16-step window. Delete traces when
+  you are done with them; `.rmlx/traces/` has no size cap.
+
+The *command stream* (`<trace>/capture`) is the part that scales with the
+window — measured at ~2.2–2.6 MB per decode step with a fixed floor under 0.2%
+of an 8-step stream. That near-zero intercept is the check that a trace really
+holds only the decode window: model load or prefill inside it would show up as a
+large constant term.
 
 ### What to read in the trace
 
@@ -178,6 +238,16 @@ Traces land in `.rmlx/traces/`; `open` them in Xcode.
 
 See also [Analyzing Apple GPU performance using counter
 statistics](https://developer.apple.com/documentation/xcode/analyzing-apple-gpu-performance-using-counter-statistics).
+
+### Tests
+
+The window policy and the request validation are pure and unit-tested, but the
+tests are behind the same feature, so a plain `cargo test` does not compile
+them. Run them with:
+
+```sh
+make test-capture
+```
 
 ## 6. Ad-hoc cardinality counting with the `counts` crate
 

@@ -30,6 +30,11 @@
 )]
 
 pub mod compile;
+/// Bounded-window Metal GPU trace capture. Debug-only: compiled out entirely
+/// unless the `metal-capture` feature is enabled, so a release build carries no
+/// state, no decode-path branch, and no route to `MTLCaptureManager`.
+#[cfg(feature = "metal-capture")]
+pub mod metal_capture;
 pub mod metal_kernel;
 mod sys;
 
@@ -1178,88 +1183,6 @@ pub mod metal {
         let recommended = device_info_size("max_recommended_working_set_size")?;
         let old = set_wired_limit(recommended)?;
         Ok(Some((recommended, old)))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Metal capture (debug feature only)
-// ---------------------------------------------------------------------------
-//
-// `CaptureScope` is a RAII drop-guard around `mlx_metal_start_capture` /
-// `mlx_metal_stop_capture`. Guarded by the `metal-capture` feature flag so
-// release builds pay exactly zero overhead.
-//
-// # Usage (Instruments GPU trace)
-//
-// 1. Build with `--features rmlx-mlx/metal-capture`.
-// 2. Construct `CaptureScope::start("/tmp/rmlx.gputrace").unwrap()` before the
-// hot path; drop (or call `.stop()`) after.
-// 3. Open the `.gputrace` bundle in Xcode Instruments → Metal System Trace.
-//
-// # mlx-c API
-//
-// `mlx_metal_start_capture(path: *const c_char) -> int` — 0 = ok, non-0 = error.
-// `mlx_metal_stop_capture() -> int` — 0 = ok, non-0 = error.
-// Both are in `mlx/c/metal.h` (mlx-c 0.6.0).
-
-/// RAII Metal GPU trace capture scope (enabled by the `metal-capture` feature).
-#[cfg(feature = "metal-capture")]
-pub mod metal_capture {
-    use std::ffi::CString;
-
-    use crate::{check_status, install_error_handler, sys, Result};
-
-    /// RAII guard that starts a Metal GPU trace on construction and stops it
-    /// on drop (or when `stop()` is called explicitly).
-    ///
-    /// # Safety
-    /// Only one `CaptureScope` should be active at a time — the Metal capture
-    /// manager is process-global. Constructing two overlapping scopes is
-    /// defined behaviour (the second `start_capture` is a no-op per mlx-c
-    /// docs), but the resulting trace will be incomplete.
-    #[allow(missing_debug_implementations)]
-    pub struct CaptureScope {
-        stopped: bool,
-    }
-
-    impl CaptureScope {
-        /// Start a Metal capture writing to `path` (e.g. `"/tmp/rmlx.gputrace"`).
-        ///
-        /// Returns `Err` if Metal is unavailable or the capture backend returns
-        /// a non-zero status.
-        pub fn start(path: &str) -> Result<Self> {
-            install_error_handler();
-            let path_c = CString::new(path).map_err(|e| {
-                crate::Error::Mlx(format!("CaptureScope::start: path contains NUL: {e}"))
-            })?;
-            // SAFETY: path_c is a valid NUL-terminated string.
-            let status = unsafe { sys::mlx_metal_start_capture(path_c.as_ptr()) };
-            // SAFETY: called immediately after the C function on the same thread.
-            unsafe { check_status(status, "metal_capture::start") }?;
-            Ok(CaptureScope { stopped: false })
-        }
-
-        /// Stop the capture explicitly. A no-op if already stopped.
-        ///
-        /// Returns `Err` if the stop call returns non-zero.
-        pub fn stop(&mut self) -> Result<()> {
-            if self.stopped {
-                return Ok(());
-            }
-            self.stopped = true;
-            install_error_handler();
-            // SAFETY: no preconditions; mlx_metal_stop_capture is idempotent per docs.
-            let status = unsafe { sys::mlx_metal_stop_capture() };
-            // SAFETY: called immediately after the C function on the same thread.
-            unsafe { check_status(status, "metal_capture::stop") }
-        }
-    }
-
-    impl Drop for CaptureScope {
-        fn drop(&mut self) {
-            // Best-effort: ignore errors on drop (can't propagate from Drop).
-            let _ = self.stop();
-        }
     }
 }
 
