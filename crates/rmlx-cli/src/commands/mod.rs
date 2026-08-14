@@ -1,6 +1,7 @@
 //! CLI command implementations.
 
 pub(crate) mod baseline;
+pub(crate) mod bench;
 pub(crate) mod calibration_softmax;
 pub(crate) mod eval;
 pub(crate) mod healthcheck;
@@ -14,6 +15,7 @@ pub(crate) mod serve;
 pub(crate) mod transcribe;
 
 pub(crate) use baseline::run_baseline;
+pub(crate) use bench::run_bench;
 pub(crate) use eval::run_ppl;
 pub(crate) use healthcheck::run_healthcheck;
 pub(crate) use info::run_info;

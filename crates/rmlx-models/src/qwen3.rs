@@ -75,8 +75,8 @@ use crate::kv_cache::{
 use crate::layers::{resolve_quant, QuantParams};
 use crate::load_util::{bf16_param, bf16_scales, Weights};
 use crate::prompt_cache::{
-    chained_block_hashes_seeded, ArchPromptCache, Consumed, PromptCacheEntry, ReusePolicy,
-    SsdHydrate, FNV_OFFSET,
+    chained_block_hashes_seeded, ArchPromptCache, Consumed, KvBytesSample, PromptCacheEntry,
+    ReusePolicy, SsdHydrate, FNV_OFFSET,
 };
 use crate::sampler::TokenLogprobs;
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
@@ -261,8 +261,8 @@ pub fn read_cache_stats() -> Option<crate::prompt_cache::CacheStats> {
 }
 
 /// Read the KV-cache bytes from the last completed Qwen3 request.
-pub fn read_kv_cache_bytes() -> u64 {
-    QWEN3_PROMPT_CACHE.read_kv_cache_bytes()
+pub fn read_kv_cache_bytes_sample() -> KvBytesSample {
+    QWEN3_PROMPT_CACHE.read_kv_cache_bytes_sample()
 }
 
 // ---------------------------------------------------------------------------

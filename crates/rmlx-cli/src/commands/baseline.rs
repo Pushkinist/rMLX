@@ -215,6 +215,29 @@ pub(crate) fn is_chat_fixture(value: &serde_json::Value) -> bool {
 /// raw-envelope tokenization in that case would record a wrong measurement
 /// with no error, so this matches the existing loud-failure convention for a
 /// missing `chat_template.jinja`.
+/// Tokenize a prompt file the way the bench harnesses measure it.
+///
+/// Returns `(prompt_ids, template_used)`. A chat-JSON fixture is rendered
+/// through the model's `chat_template.jinja` first; anything else is tokenized
+/// as raw text with `add_special_tokens=true`. Shared by `rmlx baseline` and
+/// `rmlx bench` so the two cannot disagree on what "N prompt tokens" means.
+pub(crate) fn tokenize_prompt_text(
+    model_path: &Path,
+    tokenizer: &tokenizers::Tokenizer,
+    prompt_text: &str,
+) -> anyhow::Result<(Vec<u32>, bool)> {
+    if let Some(messages) = parse_chat_fixture(prompt_text)? {
+        return Ok((
+            tokenize_chat_fixture(model_path, tokenizer, &messages)?,
+            true,
+        ));
+    }
+    let encoding = tokenizer
+        .encode(prompt_text, true)
+        .map_err(|e| anyhow::anyhow!("tokenize prompt: {e}"))?;
+    Ok((encoding.get_ids().to_vec(), false))
+}
+
 fn parse_chat_fixture(prompt_text: &str) -> anyhow::Result<Option<Vec<ChatFixtureMessage>>> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(prompt_text) else {
         return Ok(None);
@@ -355,16 +378,8 @@ pub(crate) fn run_baseline(
     // are counted -- matching the HTTP chat-completions path. Anything else
     // (e.g. the default plain-text fixture) is tokenized as raw text with
     // add_special_tokens=true so BOS is prepended naturally.
-    let chat_fixture_messages = parse_chat_fixture(&prompt_text)?;
-    let template_used = chat_fixture_messages.is_some();
-    let mut prompt_ids: Vec<u32> = if let Some(messages) = &chat_fixture_messages {
-        tokenize_chat_fixture(model_path, &tokenizer, messages)?
-    } else {
-        let encoding = tokenizer
-            .encode(prompt_text.as_str(), true)
-            .map_err(|e| anyhow::anyhow!("tokenize prompt: {e}"))?;
-        encoding.get_ids().to_vec()
-    };
+    let (mut prompt_ids, template_used) =
+        tokenize_prompt_text(model_path, &tokenizer, &prompt_text)?;
 
     // Truncate to `max_prompt_tokens` when the cap allows it; on GPU with the
     // default (non-explicit) cap this is a hard error instead -- see
@@ -451,6 +466,7 @@ pub(crate) fn run_baseline(
         last_cb_s = elapsed;
         None
     };
+    let kv_before = model.kv_cache_bytes_sample();
     let steps = model
         .generate_greedy(
             &tokenizer,
@@ -471,9 +487,37 @@ pub(crate) fn run_baseline(
         .map_err(|e| anyhow::anyhow!("generate_greedy: {e}"))?;
     let generate_elapsed = ts_generate_start.elapsed();
     // Read actual on-device KV-cache bytes from the arch-specific static that
-    // `generate_greedy` writes via `store_kv_cache_bytes`.  Returns 0 for
-    // architectures that do not yet maintain that static.
-    let kv_cache_bytes: u64 = model.kv_cache_bytes();
+    // `generate_greedy` writes via `store_kv_cache_bytes`.
+    //
+    // `--record` appends to the metrics store, where a wrong row is permanent,
+    // so the figure is attributed to *this* generation before it is kept: the
+    // store sequence must have advanced across the call. Anything else — an
+    // arch that does not maintain the static, a prefill that returned early —
+    // leaves an earlier generation's byte count readable, and recording that
+    // under this run's label is the failure the sequence exists to prevent.
+    // Both unusable verdicts collapse to `0`, which the downstream `> 0` gates
+    // already omit from the record; the `warn!` says which one happened.
+    let kv_cache_bytes: u64 =
+        match rmlx_models::classify_kv_bytes(kv_before, model.kv_cache_bytes_sample()) {
+            rmlx_models::KvBytesVerdict::Reported(n) => n,
+            rmlx_models::KvBytesVerdict::Unreported => {
+                tracing::warn!(
+                    arch = model.arch_class(),
+                    "generation reported no KV-cache byte count (store sequence did not advance); \
+                 omitting kv_cache_bytes from this run rather than recording an earlier \
+                 generation's figure"
+                );
+                0
+            }
+            rmlx_models::KvBytesVerdict::ReportedZero => {
+                tracing::warn!(
+                    arch = model.arch_class(),
+                    "generation reported a KV cache of 0 bytes after a real prefill — the byte \
+                 accounting is wrong, not the cache; omitting kv_cache_bytes from this run"
+                );
+                0
+            }
+        };
     // Drop the span guard explicitly so the span closes (and its elapsed_ms is
     // emitted to the JSONL log) right here — before the summary println below.
     drop(_decode_span_guard);

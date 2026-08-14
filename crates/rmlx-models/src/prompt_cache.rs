@@ -178,6 +178,75 @@ pub struct CacheStats {
 }
 
 // ---------------------------------------------------------------------------
+// KvBytesSample
+// ---------------------------------------------------------------------------
+
+/// A read of an arch's last-request KV-cache byte total, tagged with the store
+/// sequence it was written at.
+///
+/// The bare byte count is ambiguous: `0` is both the never-written initialiser
+/// and a legal (if suspicious) reading, and a non-zero value read after a
+/// generation that never reported one is the *previous* generation's figure.
+/// Callers that record the number as a measurement need to tell those apart, so
+/// they sample the pair before and after the generation and require `seq` to
+/// have advanced. See [`crate::arch::Architecture::kv_cache_bytes_sample`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KvBytesSample {
+    /// Byte total recorded by the most recent `store_kv_cache_bytes` call.
+    /// Meaningless unless `seq > 0`.
+    pub bytes: u64,
+    /// Number of `store_kv_cache_bytes` calls on this arch since process start.
+    /// `0` means no generation has reported a figure.
+    pub seq: u64,
+}
+
+/// What a pair of [`KvBytesSample`] reads taken around one generation says
+/// about the byte count that generation produced.
+#[allow(
+    clippy::exhaustive_enums,
+    reason = "closed by construction: the sequence either advanced or it did not, and if it \
+              did the byte count is either zero or not. There is no fourth state, and a \
+              wildcard arm at the call sites would defeat the purpose of the distinction"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvBytesVerdict {
+    /// The generation reported a non-zero byte count. Usable.
+    Reported(u64),
+    /// The generation reported nothing: the readable value belongs to an
+    /// earlier generation, or is the never-written initialiser. This is the
+    /// state that a bare `-> u64` accessor collapses into "0" or, worse, into
+    /// the previous run's plausible-looking figure.
+    Unreported,
+    /// The generation did report, and reported zero bytes. Distinct from
+    /// [`KvBytesVerdict::Unreported`]: the plumbing works and the answer is
+    /// still not usable as a resident-KV measurement after a real prefill.
+    ReportedZero,
+}
+
+/// Classify the byte count a generation produced, from the store sequence
+/// observed before and after it.
+///
+/// Detection ("did this generation report?") is decided by the sequence, and
+/// only then is the value interpreted. Collapsing the two — treating a zero, or
+/// an unchanged sequence, as "no KV" — is what silently records one run's
+/// number under another run's label.
+///
+/// Every caller that *records* or *reports* a KV-byte figure as a measurement
+/// goes through this. A caller that only displays the last-known value
+/// (`/metrics/cache`) may read the bare count.
+#[must_use]
+pub const fn classify_kv_bytes(before: KvBytesSample, after: KvBytesSample) -> KvBytesVerdict {
+    if after.seq <= before.seq {
+        return KvBytesVerdict::Unreported;
+    }
+    if after.bytes == 0 {
+        return KvBytesVerdict::ReportedZero;
+    }
+    KvBytesVerdict::Reported(after.bytes)
+}
+
+// ---------------------------------------------------------------------------
 // PromptCacheEntry trait
 // ---------------------------------------------------------------------------
 
@@ -640,9 +709,13 @@ impl<E: PromptCacheEntry> PromptCache<E> {
         }
     }
 
-    /// Clear all slots and reset stats.
+    /// Clear all RAM slots and reset stats.
     /// Called when model is unloaded or capacity changes.
-    #[allow(dead_code)]
+    ///
+    /// RAM only. An attached SSD source ([`Self::set_ssd_source`]) survives, so
+    /// the next lookup can still miss in RAM and be served by
+    /// [`Self::hydrate_from_ssd`] — which bumps `stats.ssd_hits`, not
+    /// `stats.hits`. This is not a guarantee that the next request prefills.
     pub(crate) fn clear(&mut self) {
         self.slots.clear();
         self.stats = CacheStats::default();
@@ -1017,6 +1090,16 @@ pub(crate) struct ArchPromptCache<E: PromptCacheEntry> {
     attach: std::sync::Mutex<Option<AttachParams>>,
     /// Last-request KV-cache byte total, surfaced via `/metrics/cache`.
     last_kv_bytes: std::sync::atomic::AtomicU64,
+    /// Number of `store_kv_cache_bytes` calls on this arch since process start.
+    ///
+    /// `last_kv_bytes` alone cannot tell "no generation has reported a figure
+    /// yet" from "a generation reported zero", nor "this generation reported"
+    /// from "you are reading the previous generation's figure". Both collapse
+    /// to a plausible-looking number a caller would record as a measurement.
+    /// The sequence makes the distinction observable: a caller that samples it
+    /// before and after a generation knows whether the byte count it reads
+    /// belongs to that generation.
+    kv_bytes_seq: std::sync::atomic::AtomicU64,
 }
 
 impl<E: PromptCacheEntry> ArchPromptCache<E> {
@@ -1029,6 +1112,7 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
             inner: std::sync::Mutex::new(None),
             attach: std::sync::Mutex::new(None),
             last_kv_bytes: std::sync::atomic::AtomicU64::new(0),
+            kv_bytes_seq: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1094,6 +1178,22 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
                 *guard = Some(cache);
             }
         }
+    }
+
+    /// Drop every cached snapshot and reset the hit/miss counters, keeping the
+    /// cache object itself — its capacity and its installed SSD sinks — in
+    /// place. A no-op when no generation has built the cache yet.
+    ///
+    /// This is the supported way to make the next request a guaranteed miss.
+    /// Asking for a zero-slot cache is not: capacity is clamped to a minimum of
+    /// one slot, so a "zero-slot" cache still stores and can still serve a
+    /// snapshot.
+    pub(crate) fn clear(&self) {
+        self.with_inner_mut(|slot| {
+            if let Some(cache) = slot.as_mut() {
+                cache.clear();
+            }
+        });
     }
 
     /// Wire the spiller + hydrator onto this arch's prompt cache
@@ -1365,10 +1465,34 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
             .map(PromptCache::stats)
     }
 
-    /// Read the KV-cache bytes from the last completed request (0 if none).
-    pub(crate) fn read_kv_cache_bytes(&self) -> u64 {
-        self.last_kv_bytes
-            .load(std::sync::atomic::Ordering::Relaxed)
+    /// Read the KV-cache bytes from the last completed request, paired with the
+    /// store sequence they were written at.
+    ///
+    /// `seq == 0` means no generation on this arch has reported a figure yet,
+    /// so `bytes` is the `0` initialiser and not a measurement.
+    pub(crate) fn read_kv_cache_bytes_sample(&self) -> KvBytesSample {
+        // Load the sequence FIRST, and with Acquire. The writer stores
+        // `last_kv_bytes` before releasing the sequence, so observing sequence
+        // `k` guarantees the byte count for generation `k` is already visible:
+        // the byte load that follows returns generation `k`'s figure or a later
+        // one. The pairing invariant is therefore "bytes is never *older* than
+        // seq", which is the direction that matters — a caller comparing
+        // sequences can refuse a reading that was in fact valid, but can never
+        // accept a stale byte count as a fresh generation's measurement.
+        //
+        // The opposite order does not hold: an Acquire load only orders the
+        // accesses that follow it, so reading bytes first leaves that load
+        // outside the release/acquire edge (and free to sink below it on
+        // aarch64). The reader could then pair generation `k-1`'s bytes with
+        // sequence `k` — exactly the stale-value-under-a-fresh-label failure
+        // `KvBytesSample` exists to make impossible.
+        //
+        // No seqlock needed: the payload is a single `u64`, which cannot tear.
+        let seq = self.kv_bytes_seq.load(std::sync::atomic::Ordering::Acquire);
+        let bytes = self
+            .last_kv_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        KvBytesSample { bytes, seq }
     }
 
     /// Store the KV-cache bytes for the just-finished request. Called by
@@ -1390,6 +1514,10 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
         tracing::debug!(kv_bytes = n, "kv cache bytes");
         self.last_kv_bytes
             .store(n, std::sync::atomic::Ordering::Relaxed);
+        // Release-ordered so a reader that observes the bumped sequence also
+        // observes the byte count that goes with it.
+        self.kv_bytes_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 }
 

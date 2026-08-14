@@ -30,7 +30,8 @@
 use rmlx_core::error::Result;
 
 use crate::prompt_cache::{
-    ArchPromptCache, CacheStats, PromptCacheEntry, ReuseKind, ReusePolicy, SsdHydrate, BLOCK_TOKENS,
+    ArchPromptCache, CacheStats, KvBytesSample, PromptCacheEntry, ReuseKind, ReusePolicy,
+    SsdHydrate, BLOCK_TOKENS,
 };
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 use rmlx_kv_ssd::{HydratedBlock, SsdHydrator};
@@ -348,8 +349,8 @@ pub fn read_cache_stats() -> Option<CacheStats> {
 }
 
 /// Read the KV-cache bytes from the last completed Gemma4 request.
-pub fn read_kv_cache_bytes() -> u64 {
-    PROMPT_CACHE.read_kv_cache_bytes()
+pub fn read_kv_cache_bytes_sample() -> KvBytesSample {
+    PROMPT_CACHE.read_kv_cache_bytes_sample()
 }
 
 /// Record the KV-cache byte total for the just-completed request. Called by

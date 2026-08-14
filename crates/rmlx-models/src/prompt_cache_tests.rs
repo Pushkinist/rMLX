@@ -1412,17 +1412,56 @@ fn arch_cache_with_inner_mut_round_trip() {
     });
 }
 
-/// unit test #4: `store_kv_cache_bytes` + `read_kv_cache_bytes`
+/// unit test #4: `store_kv_cache_bytes` + `read_kv_cache_bytes_sample`
 /// round-trip. Mirrors the per-request /metrics/cache wire path.
 #[test]
 fn arch_cache_kv_bytes_round_trip() {
     let arch: ArchPromptCache<TestEntry> = ArchPromptCache::new("test-bytes", ReusePolicy::Partial);
     let post = crate::decode_loop::PostDecode::for_test();
-    assert_eq!(arch.read_kv_cache_bytes(), 0, "fresh cache reports zero");
+    assert_eq!(
+        arch.read_kv_cache_bytes_sample().bytes,
+        0,
+        "fresh cache reports zero"
+    );
     arch.store_kv_cache_bytes(424_242, post);
-    assert_eq!(arch.read_kv_cache_bytes(), 424_242);
+    assert_eq!(arch.read_kv_cache_bytes_sample().bytes, 424_242);
     arch.store_kv_cache_bytes(0, post);
-    assert_eq!(arch.read_kv_cache_bytes(), 0);
+    assert_eq!(arch.read_kv_cache_bytes_sample().bytes, 0);
+}
+
+/// The store sequence separates "no generation has reported a byte count" from
+/// "a generation reported zero" — two states the bare byte value collapses into
+/// the same `0`. A caller that records the figure as a measurement reads the
+/// sequence, not the value, to decide whether it has one.
+#[test]
+fn arch_cache_kv_bytes_seq_distinguishes_unreported_from_zero() {
+    let arch: ArchPromptCache<TestEntry> = ArchPromptCache::new("test-seq", ReusePolicy::Partial);
+    let post = crate::decode_loop::PostDecode::for_test();
+
+    let fresh = arch.read_kv_cache_bytes_sample();
+    assert_eq!(fresh.seq, 0, "no store yet — sequence must still be zero");
+
+    // A genuine store of zero bytes is NOT the same state as "never stored",
+    // even though both report `bytes == 0`.
+    arch.store_kv_cache_bytes(0, post);
+    let reported_zero = arch.read_kv_cache_bytes_sample();
+    assert_eq!(reported_zero.bytes, 0);
+    assert_eq!(
+        reported_zero.seq, 1,
+        "a store of zero must still advance the sequence — otherwise it is \
+         indistinguishable from never having stored"
+    );
+
+    // Every store advances it, so a caller can tell "this generation reported"
+    // from "I am reading the previous generation's figure".
+    arch.store_kv_cache_bytes(4096, post);
+    assert_eq!(
+        arch.read_kv_cache_bytes_sample(),
+        KvBytesSample {
+            bytes: 4096,
+            seq: 2
+        }
+    );
 }
 
 /// unit test #5: `read_cache_stats` returns `None` for an

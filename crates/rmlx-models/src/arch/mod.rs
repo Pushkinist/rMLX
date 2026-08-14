@@ -1245,22 +1245,102 @@ impl Architecture {
         }
     }
 
+    /// Drop every snapshot held by this arch's prompt cache and reset its
+    /// hit/miss counters, so the next generation misses in RAM.
+    ///
+    /// The measurement commands use this to make repeated generations of the
+    /// same prompt comparable. Requesting a zero-slot cache does not achieve
+    /// that: slot capacity is clamped to a minimum of one, so a "zero-slot"
+    /// cache still stores and can still serve a snapshot.
+    ///
+    /// **A RAM miss is not the same as a prefill.** This clears RAM slots only;
+    /// an attached SSD KV tier keeps its source, and the next request can still
+    /// be served by hydrating a `.kvb` — recorded as `ssd_hits`, never as
+    /// `hits`. A caller that needs the next generation to *prefill* must check
+    /// the outcome (`hits == 0 && ssd_hits == 0`) rather than trust this call.
+    /// The SSD tier is attached only from the server today, so the measurement
+    /// commands do not meet it in practice; they check anyway.
+    pub fn clear_prompt_cache(&self) {
+        match self {
+            Architecture::Gemma4(_) => crate::gemma4::prompt_cache::PROMPT_CACHE.clear(),
+            Architecture::Gemma3(_) => crate::gemma3::prompt_cache::PROMPT_CACHE.clear(),
+            Architecture::Qwen3_5Moe(_) => crate::qwen3_5_moe::prompt_cache::PROMPT_CACHE.clear(),
+            Architecture::Qwen3(_) => crate::qwen3::QWEN3_PROMPT_CACHE.clear(),
+            Architecture::Qwen2(_) => crate::qwen2::prompt_cache::PROMPT_CACHE.clear(),
+            Architecture::BitNet(_) => crate::bitnet::prompt_cache::PROMPT_CACHE.clear(),
+            Architecture::Qwen3VlMoe(_) => crate::qwen3_vl_moe::prompt_cache::PROMPT_CACHE.clear(),
+            Architecture::Laguna(_) => crate::laguna::prompt_cache::PROMPT_CACHE.clear(),
+        }
+    }
+
     /// Actual on-device KV-cache bytes used by the most recent `generate_greedy`
-    /// call on this architecture.
+    /// call on this architecture, paired with the store sequence they were
+    /// written at.
     ///
     /// Reads the arch-specific prompt-cache static that `generate_greedy` writes
     /// via `store_kv_cache_bytes` at the end of every generate call.
-    pub fn kv_cache_bytes(&self) -> u64 {
+    ///
+    /// Callers that *record* the byte count as a measurement must sample this
+    /// before and after the generation and require
+    /// [`crate::prompt_cache::KvBytesSample::seq`] to have advanced. Without
+    /// that check, a generation that returns before
+    /// reaching the store (an early-out prefill path, or an arch that does not
+    /// maintain the static) yields the previous call's byte count — or the `0`
+    /// initialiser — with nothing to distinguish it from a fresh reading.
+    pub fn kv_cache_bytes_sample(&self) -> crate::prompt_cache::KvBytesSample {
         match self {
-            Architecture::Gemma4(_) => crate::gemma4::gemma4_kv_cache_bytes(),
-            Architecture::Gemma3(_) => crate::gemma3::gemma3_kv_cache_bytes(),
-            Architecture::Qwen3_5Moe(_) => crate::qwen3_5_moe::qwen3_5_moe_kv_cache_bytes(),
-            Architecture::Qwen3(_) => crate::qwen3::read_kv_cache_bytes(),
-            Architecture::Qwen2(_) => crate::qwen2::qwen2_kv_cache_bytes(),
-            Architecture::BitNet(_) => crate::bitnet::bitnet_kv_cache_bytes(),
-            Architecture::Qwen3VlMoe(_) => crate::qwen3_vl_moe::qwen3_vl_moe_kv_cache_bytes(),
-            Architecture::Laguna(_) => crate::laguna::laguna_kv_cache_bytes(),
+            Architecture::Gemma4(_) => crate::gemma4::gemma4_kv_cache_bytes_sample(),
+            Architecture::Gemma3(_) => crate::gemma3::gemma3_kv_cache_bytes_sample(),
+            Architecture::Qwen3_5Moe(_) => crate::qwen3_5_moe::qwen3_5_moe_kv_cache_bytes_sample(),
+            Architecture::Qwen3(_) => crate::qwen3::read_kv_cache_bytes_sample(),
+            Architecture::Qwen2(_) => crate::qwen2::qwen2_kv_cache_bytes_sample(),
+            Architecture::BitNet(_) => crate::bitnet::bitnet_kv_cache_bytes_sample(),
+            Architecture::Qwen3VlMoe(_) => {
+                crate::qwen3_vl_moe::qwen3_vl_moe_kv_cache_bytes_sample()
+            }
+            Architecture::Laguna(_) => crate::laguna::laguna_kv_cache_bytes_sample(),
         }
+    }
+
+    /// Record the KV-cache byte total the generation that just finished on this
+    /// architecture produced.
+    ///
+    /// The write counterpart of [`Self::kv_cache_bytes_sample`], dispatching to
+    /// the same per-arch static. Generation paths that own their caches
+    /// directly — the speculative round loops, which never call
+    /// `generate_greedy` and so never reach an arch's own store site — report
+    /// through here, so a caller that samples around the call can attribute the
+    /// figure to it. Without the store, every such caller reads
+    /// [`crate::prompt_cache::KvBytesVerdict::Unreported`] forever: correct, but
+    /// no measurement.
+    ///
+    /// `post` is the witness minted by the decode phase, which pins the sample
+    /// to after decode — see [`crate::decode_loop::PostDecode`].
+    pub(crate) fn store_kv_cache_bytes(&self, n: u64, post: crate::decode_loop::PostDecode) {
+        match self {
+            Architecture::Gemma4(_) => crate::gemma4::prompt_cache::store_kv_cache_bytes(n, post),
+            Architecture::Gemma3(_) => crate::gemma3::prompt_cache::store_kv_cache_bytes(n, post),
+            Architecture::Qwen3_5Moe(_) => {
+                crate::qwen3_5_moe::prompt_cache::store_kv_cache_bytes(n, post);
+            }
+            Architecture::Qwen3(_) => {
+                crate::qwen3::QWEN3_PROMPT_CACHE.store_kv_cache_bytes(n, post);
+            }
+            Architecture::Qwen2(_) => crate::qwen2::prompt_cache::store_kv_cache_bytes(n, post),
+            Architecture::BitNet(_) => crate::bitnet::prompt_cache::store_kv_cache_bytes(n, post),
+            Architecture::Qwen3VlMoe(_) => {
+                crate::qwen3_vl_moe::prompt_cache::store_kv_cache_bytes(n, post);
+            }
+            Architecture::Laguna(_) => crate::laguna::prompt_cache::store_kv_cache_bytes(n, post),
+        }
+    }
+
+    /// Bare byte count from [`Self::kv_cache_bytes_sample`], for the reporting
+    /// surfaces (`/metrics/cache`, the server's per-request gauge) that display
+    /// the last-known figure and have no generation boundary to check it
+    /// against.
+    pub fn kv_cache_bytes(&self) -> u64 {
+        self.kv_cache_bytes_sample().bytes
     }
 
     /// Arch-pinned auto-KV default, when the arch must not take the

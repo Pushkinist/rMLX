@@ -31,4 +31,4 @@ pub use generate::generate_greedy;
 pub use loader::load_from_path;
 pub use model::Qwen2Text;
 pub use prompt_cache::read_cache_stats as qwen2_cache_stats;
-pub use prompt_cache::read_kv_cache_bytes as qwen2_kv_cache_bytes;
+pub use prompt_cache::read_kv_cache_bytes_sample as qwen2_kv_cache_bytes_sample;

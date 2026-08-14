@@ -337,18 +337,18 @@ fn qwen3_kv_bytes_store_read_roundtrip() {
     let sentinel_miss: u64 = 123_456_789;
     QWEN3_PROMPT_CACHE.store_kv_cache_bytes(sentinel_miss, post);
     assert_eq!(
-        read_kv_cache_bytes(),
+        read_kv_cache_bytes_sample().bytes,
         sentinel_miss,
-        "read_kv_cache_bytes() must return the value stored on the Miss path"
+        "read_kv_cache_bytes_sample() must return the value stored on the Miss path"
     );
 
     // Simulate the Exact-hit path store (same atomic, same semantics).
     let sentinel_hit: u64 = 987_654_321;
     QWEN3_PROMPT_CACHE.store_kv_cache_bytes(sentinel_hit, post);
     assert_eq!(
-        read_kv_cache_bytes(),
+        read_kv_cache_bytes_sample().bytes,
         sentinel_hit,
-        "read_kv_cache_bytes() must return the value stored on the Exact-hit path"
+        "read_kv_cache_bytes_sample() must return the value stored on the Exact-hit path"
     );
 
     // Reset to 0 so parallel tests see a clean state.
