@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Kernel-gate flags are global, so the instrument measures what the server
+  runs.** `--turbo-flash`, `--turbo-flash-lock` and `--planar-flash-decode`
+  were resolved inside `run_serve`, while their four sibling gates
+  (`--fused-qk`, `--sparse-attn`, `--rotor-qjl`, `--planar-fused-qk`) resolved
+  in `main`. All of them drive process-wide `OnceLock`s, so the split meant
+  `rmlx serve` and `rmlx bench` / `rmlx baseline` disagreed about which Metal
+  kernels were live on the same host — the measurement commands never resolved
+  the gates at all. The three flags are now `global = true` and resolve in
+  `main` beside the others; both `rmlx --turbo-flash off serve …` and
+  `rmlx serve --turbo-flash off …` continue to work.
+
+### Changed
+
+- **`--turbo-flash=auto` now resolves OFF on every host (HOLD).** It previously
+  resolved ON for every recognised Apple family. On the one storage the kernel
+  serves (K8V4, `kv_seq > 4096`) it decodes 2.0–4.25× *slower* than the generic
+  path and holds ~722 MB more resident KV. `rmlx bench` n=3 on a quiet host,
+  zero settle-gate refusals, with the loss scaling with `kv_seq` rather than
+  sitting at a fixed penalty: Bonsai-8B k8v4 1.93× @~1.7k (threshold forced to
+  zero), 2.74× @8k, 3.48× @16k, 4.25× @32k (63.25 → 14.89 TPS); Bonsai-27B
+  k8v4 1.98× @16k. Dispatch proven by counter — 1638 ON vs 0 OFF. The kernel is
+  also **not** bit-exact (SDPA cosine ≈0.997, the V turbo-4 codec floor), so at
+  temp=0 it perturbs greedy argmax ties: two of those four production-threshold
+  cells return a different token digest. gemma-4-e2b is a null control rather
+  than a second architecture — its `kv_cache_bytes` is bit-identical in both
+  arms, so the kernel never dispatches there at all. This retires the
+  per-family default-ON policy; the validations behind it were crash/fidelity
+  clearances (32k NIAH on Apple ≤9, the Apple10 `head_dim = 256` hazard
+  re-drive) and are unaffected — lifting the HOLD needs a decode measurement.
+  `--turbo-flash on` remains the opt-in, and `auto` still honours a pre-set
+  `RMLX_TURBO_FLASH=1` — now with a `warn!` naming the cost, since in that case
+  the flag reads OFF while the kernel runs. Consequence: `k8v4` on Bonsai-8B
+  decodes 88.8 TPS @16k and 61.8 @32k out of the box, where the documented
+  "crater from 8k up" had it at 39.3 @8k falling to 6.7 @64k. That crater was
+  the kernel, not the codec.
+
 ## [0.3.0] - 2026-07-13
 
 Metrics run-identity is now trustworthy. `observations.backend_version` was
