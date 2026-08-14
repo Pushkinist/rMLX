@@ -12,10 +12,11 @@
 //!
 //! # What these prove, and what they do not
 //!
-//! These pin the ring into the total: standing one up must move
-//! `resident_bytes` by at least the ring's own reported size, across both
-//! ring-backed codecs and two contexts. That is the bug that was shipped — a
-//! delta of exactly zero.
+//! These pin the ring into the total: once it is live it is the K store's whole
+//! payload (the CPU blocks are dropped in the same step), so the store's own
+//! byte total must equal it, across all four ring-backed K-only codecs (both
+//! bit widths of both families) and two contexts.
+//! The bug that was shipped — a total blind to the ring — reads 0 here.
 //!
 //! They do **not** validate the ring's *magnitude*. The anchor
 //! (`QuantKGpuRing::byte_size`, via `live_ring_bytes`) is part of the
@@ -31,7 +32,7 @@ use super::KvCache;
 use crate::clifford::make_rotor_table;
 use crate::quant::KvQuant;
 use crate::rotorquant::n_groups_for;
-use crate::storage::{KvStorage, QuantIsoK3, QuantRotorK3};
+use crate::storage::{KvStorage, QuantIsoK3, QuantIsoK4, QuantRotorK3, QuantRotorK4};
 use crate::test_utils::{lcg_data, skip_if_no_gpu_env};
 use rmlx_mlx::{Array, Device, Dtype};
 
@@ -47,20 +48,41 @@ fn f32_array(data: &[f32], shape: &[i32]) -> Array {
 }
 
 /// Build an empty K-only cache for a ring-backed codec.
+///
+/// All four members of the two ring-backed K-only families are covered. The
+/// bit-width siblings share a store layout and a fused decode arm, so a helper
+/// that only knew the 3-bit ones would leave the 4-bit halves of both families
+/// undriven — the exact "one member of a sibling pair was missed" shape these
+/// tests exist to catch.
 #[allow(
     clippy::wildcard_enum_match_arm,
-    reason = "test helper covers exactly the two ring-backed K-only codecs it is called with; any other variant is a caller bug the unreachable! surfaces immediately"
+    reason = "test helper covers exactly the four ring-backed K-only codecs it is called with; any other variant is a caller bug the unreachable! surfaces immediately"
 )]
 fn ring_backed_cache(quant: KvQuant) -> KvCache {
     let shape = vec![1, KV_H, 0, HEAD_DIM];
+    let rotor_table = || make_rotor_table(0, 0, n_groups_for(HEAD_DIM as usize));
     let storage = match quant {
         KvQuant::IsoKOnly3 => KvStorage::IsoKOnly3 {
             k: Some(QuantIsoK3::from_cpu_blocks(Vec::new(), shape, MAX_SEQ)),
             max_seq: MAX_SEQ,
         },
+        KvQuant::IsoKOnly4 => KvStorage::IsoKOnly4 {
+            k: Some(QuantIsoK4::from_cpu_blocks(Vec::new(), shape, MAX_SEQ)),
+            max_seq: MAX_SEQ,
+        },
         KvQuant::RotorKOnly3 => KvStorage::RotorKOnly3 {
             k: Some(QuantRotorK3::from_cpu_blocks(
-                make_rotor_table(0, 0, n_groups_for(HEAD_DIM as usize)),
+                rotor_table(),
+                None,
+                Vec::new(),
+                shape,
+                0,
+            )),
+            max_seq: MAX_SEQ,
+        },
+        KvQuant::RotorKOnly4 => KvStorage::RotorKOnly4 {
+            k: Some(QuantRotorK4::from_cpu_blocks(
+                rotor_table(),
                 None,
                 Vec::new(),
                 shape,
@@ -73,6 +95,14 @@ fn ring_backed_cache(quant: KvQuant) -> KvCache {
     KvCache::from_storage(storage, quant, 0, 0)
 }
 
+/// Every ring-backed K-only codec, both bit widths of both families.
+const RING_BACKED_K_ONLY: [KvQuant; 4] = [
+    KvQuant::IsoKOnly3,
+    KvQuant::IsoKOnly4,
+    KvQuant::RotorKOnly3,
+    KvQuant::RotorKOnly4,
+];
+
 /// The ring's own byte size, read from the store. `None` when no ring is live.
 ///
 /// This is the accounting under test, not an independent oracle — see the
@@ -84,10 +114,76 @@ fn ring_backed_cache(quant: KvQuant) -> KvCache {
 fn live_ring_bytes(cache: &KvCache) -> Option<u64> {
     let (allocated, bytes) = match cache.storage() {
         KvStorage::IsoKOnly3 { k: Some(ks), .. } => (ks.gpu.is_allocated(), ks.gpu.byte_size()),
+        KvStorage::IsoKOnly4 { k: Some(ks), .. } => (ks.gpu.is_allocated(), ks.gpu.byte_size()),
         KvStorage::RotorKOnly3 { k: Some(ks), .. } => (ks.gpu.is_allocated(), ks.gpu.byte_size()),
+        KvStorage::RotorKOnly4 { k: Some(ks), .. } => (ks.gpu.is_allocated(), ks.gpu.byte_size()),
         _ => (false, 0),
     };
     allocated.then_some(bytes)
+}
+
+/// Tokens still held by the store's CPU blocks. `None` when the store is absent.
+///
+/// Once the ring is live it is the sole resident copy of the packed K prefix, so
+/// this must be `Some(0)` for every ring-backed K-only codec. A non-zero count
+/// there is the prefill prefix retained a second time, on top of the ring that
+/// already holds it.
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "only the ring-backed K-only variants carry CPU blocks alongside a ring; every other storage variant has none to report"
+)]
+fn cpu_block_tokens(cache: &KvCache) -> Option<usize> {
+    match cache.storage() {
+        KvStorage::IsoKOnly3 { k: Some(ks), .. } => {
+            Some(ks.blocks.iter().map(|b| b.n_tokens).sum())
+        }
+        KvStorage::IsoKOnly4 { k: Some(ks), .. } => {
+            Some(ks.blocks.iter().map(|b| b.n_tokens).sum())
+        }
+        KvStorage::RotorKOnly3 { k: Some(ks), .. } => {
+            Some(ks.blocks.iter().map(|b| b.n_tokens).sum())
+        }
+        KvStorage::RotorKOnly4 { k: Some(ks), .. } => {
+            Some(ks.blocks.iter().map(|b| b.n_tokens).sum())
+        }
+        _ => None,
+    }
+}
+
+/// Bytes the K store reports for itself (CPU blocks + GPU ring + sidebands).
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "only the ring-backed K-only variants are driven here; any other storage variant holds no K store to size"
+)]
+fn k_store_bytes(cache: &KvCache) -> u64 {
+    match cache.storage() {
+        KvStorage::IsoKOnly3 { k: Some(ks), .. } => ks.byte_size(),
+        KvStorage::IsoKOnly4 { k: Some(ks), .. } => ks.byte_size(),
+        KvStorage::RotorKOnly3 { k: Some(ks), .. } => ks.byte_size(),
+        KvStorage::RotorKOnly4 { k: Some(ks), .. } => ks.byte_size(),
+        _ => 0,
+    }
+}
+
+/// Bytes the K store holds that are **not** per-token: rotor's static
+/// per-(layer, head) rotation table and its optional QJL projection, which are
+/// generated once and amortise over every token in the layer. Iso's rotation is
+/// a compile-time constant (`FIXED_QUAT`), so it stores none.
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "only the rotor store carries a static rotation sideband; every other variant here has none"
+)]
+fn k_store_static_bytes(cache: &KvCache) -> u64 {
+    let f32_bytes = |n: usize| (n * size_of::<f32>()) as u64;
+    match cache.storage() {
+        KvStorage::RotorKOnly3 { k: Some(ks), .. } => {
+            f32_bytes(ks.rotors.len()) + ks.qjl_s_matrix.as_ref().map_or(0, |m| f32_bytes(m.len()))
+        }
+        KvStorage::RotorKOnly4 { k: Some(ks), .. } => {
+            f32_bytes(ks.rotors.len()) + ks.qjl_s_matrix.as_ref().map_or(0, |m| f32_bytes(m.len()))
+        }
+        _ => 0,
+    }
 }
 
 /// The ring's live capacity, read from its bookkeeping (not from its buffers).
@@ -103,9 +199,9 @@ fn live_ring_capacity(cache: &KvCache) -> Option<i32> {
 }
 
 /// Prefill `prefill` positions, then take one decode step — which is what
-/// stands the ring up. Returns `resident_bytes` from just before that step.
+/// stands the ring up.
 #[allow(clippy::expect_used, reason = "test helper: invariants documented")]
-fn drive_to_ring(cache: &mut KvCache, prefill: i32) -> u64 {
+fn drive_to_ring(cache: &mut KvCache, prefill: i32) {
     let device = Device::Gpu;
     let scale = 1.0_f32 / (HEAD_DIM as f32).sqrt();
 
@@ -142,7 +238,6 @@ fn drive_to_ring(cache: &mut KvCache, prefill: i32) -> u64 {
         live_ring_bytes(cache).is_none(),
         "no ring should exist before the first decode dispatch"
     );
-    let before = cache.resident_bytes();
 
     // First decode step seeds the ring from the accumulated CPU prefix.
     let one = (KV_H * HEAD_DIM) as usize;
@@ -156,39 +251,62 @@ fn drive_to_ring(cache: &mut KvCache, prefill: i32) -> u64 {
         .update_and_sdpa(&q1, &k1, &v1, scale, "", None, device)
         .expect("decode update_and_sdpa");
     out.eval().expect("decode out eval");
-    before
 }
 
 /// Prefill, then decode until the flash path stands the ring up.
 ///
-/// Returns `(bytes_before_ring, bytes_after_ring, ring_bytes)`.
-fn bytes_across_ring_allocation(quant: KvQuant, prefill: i32) -> (u64, u64, u64) {
+/// Returns the driven cache and its live ring size.
+fn cache_with_live_ring(quant: KvQuant, prefill: i32) -> (KvCache, u64) {
     let mut cache = ring_backed_cache(quant);
-    let before = drive_to_ring(&mut cache, prefill);
+    drive_to_ring(&mut cache, prefill);
     let ring = live_ring_bytes(&cache).unwrap_or_else(|| {
         panic!("{quant}: decode must stand up the GPU ring — the flash path cannot run without it")
     });
-    (before, cache.resident_bytes(), ring)
+    (cache, ring)
 }
 
-/// Standing up the ring must move the reported total by at least the ring's
-/// own size.
+/// The live ring is the K store's whole per-token payload, and it reaches the
+/// cache total.
 ///
-/// `>=` not `==`: the same decode step also appends one position of K to the
-/// CPU blocks and advances the bf16 V mirror's filled prefix, so the total
-/// legitimately grows by a little more than the ring alone. What must never
-/// happen again is a delta of zero.
+/// Once the ring is live the store drops its CPU blocks, so everything the
+/// store holds is the ring plus its static rotation sideband. That makes this
+/// the sharpest form of the check this file exists for: a total blind to the
+/// ring reports the sideband alone here (0 B for iso), not a number that is
+/// merely too small. (An earlier form compared the total across the allocating
+/// decode step; that cannot work, because the same step also releases the
+/// blocks — the delta is a difference of two large terms, not the ring.)
 fn assert_ring_is_counted(quant: KvQuant, prefill: i32) {
-    let (before, after, ring) = bytes_across_ring_allocation(quant, prefill);
+    let (cache, ring) = cache_with_live_ring(quant, prefill);
     assert!(
         ring > 0,
         "{quant}: a live ring must have non-zero size (prefill={prefill})"
     );
-    let delta = after.saturating_sub(before);
+    let store = k_store_bytes(&cache);
+    let expected = ring + k_store_static_bytes(&cache);
+    assert_eq!(
+        store, expected,
+        "{quant} @ prefill={prefill}: the K store reports {store} B but its live ring plus \
+         static rotation sideband is {expected} B — with the CPU blocks dropped the two must \
+         be the same number"
+    );
+    // The slack over the ring is pinned, not left open. `total >= ring` alone is
+    // satisfiable by a total that has stopped counting the bf16 V mirror these
+    // K-only codecs decode V from — it would keep passing while silently
+    // measuring less than it claims to. The mirror's size is derived here from
+    // geometry (`kv_h * filled * head_dim` bf16 elements), independently of the
+    // accounting under test, and `filled` is the prefill chunk plus the one
+    // decode step `drive_to_ring` takes. A lower bound on purpose: a codec that
+    // also keeps a K seed, or a mirror at a wider dtype, only makes `total`
+    // larger.
+    let total = cache.resident_bytes();
+    let filled = (prefill + 1) as u64;
+    let v_mirror = (KV_H as u64) * filled * (HEAD_DIM as u64) * 2;
+    let floor = ring + v_mirror;
     assert!(
-        delta >= ring,
-        "{quant} @ prefill={prefill}: resident_bytes grew by {delta} B but the ring alone \
-         allocated {ring} B — the ring is not being counted (before={before}, after={after})"
+        total >= floor,
+        "{quant} @ prefill={prefill}: resident_bytes is {total} B, below the {floor} B it must \
+         hold ({ring} B ring + {v_mirror} B bf16 V mirror over {filled} filled positions) — \
+         either the ring is not reaching the cache-level total or the V mirror stopped counting"
     );
 }
 
@@ -207,12 +325,9 @@ fn ring_bytes_match_independent_geometry() {
     if skip_if_no_gpu_env() {
         return;
     }
-    let (_, _, reported) = bytes_across_ring_allocation(KvQuant::IsoKOnly3, 256);
-
-    // Rebuild the cache the same way to read its live capacity; the ring is
-    // page-rounded, so the capacity is the one value that must come from it.
-    let mut cache = ring_backed_cache(KvQuant::IsoKOnly3);
-    drive_to_ring(&mut cache, 256);
+    let (cache, reported) = cache_with_live_ring(KvQuant::IsoKOnly3, 256);
+    // The ring is page-rounded, so the capacity is the one value that must come
+    // from it rather than from the prefill length.
     let cap = live_ring_capacity(&cache).expect("iso3 ring must be live after decode") as u64;
 
     let kv_h = KV_H as u64;
@@ -248,19 +363,52 @@ fn rotor_k_only3_ring_is_counted_in_resident_bytes() {
     assert_ring_is_counted(KvQuant::RotorKOnly3, 256);
 }
 
+/// A live ring makes the CPU blocks redundant — every ring-backed K-only codec
+/// must drop them.
+///
+/// The ring and the blocks hold the same packed prefix in the same layout, so a
+/// store that keeps both pays for the prefix twice and reports a KV total well
+/// above what its own format costs. Swept over **all four** ring-backed K-only
+/// codecs — both bit widths of both families — and two contexts: the drop is a
+/// property of "the ring is the sole store", not of one codec at one size.
+///
+/// Sweeping the bit-width siblings is the point, not thoroughness for its own
+/// sake. The defect this guards was one member of a sibling pair missing the
+/// drop call while the other had it; each width has its own append function and
+/// its own call site, so covering only the 3-bit ones would leave the 4-bit
+/// halves free to repeat it.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test resident_ring -- --ignored --test-threads=1"]
+fn ring_backed_k_only_codecs_drop_their_cpu_blocks() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    for quant in RING_BACKED_K_ONLY {
+        for prefill in [128, 512] {
+            let (cache, _ring) = cache_with_live_ring(quant, prefill);
+            assert_eq!(
+                cpu_block_tokens(&cache),
+                Some(0),
+                "{quant} @ prefill={prefill}: the ring is live, so the CPU blocks are a \
+                 second copy of the same packed prefix and must have been dropped"
+            );
+        }
+    }
+}
+
 /// The ring stays counted as it grows with context.
 ///
 /// A single context is not enough: the ring is allocated in pages and re-seeded
 /// as the prefix grows, so an accounting that happened to be right at one size
-/// can still be wrong at another. Sweeps both ring-backed codecs across two
-/// contexts.
+/// can still be wrong at another. Sweeps all four ring-backed K-only codecs
+/// across two contexts.
 #[test]
 #[ignore = "GPU Metal context — run in isolation: cargo test resident_ring -- --ignored --test-threads=1"]
 fn ring_stays_counted_across_contexts() {
     if skip_if_no_gpu_env() {
         return;
     }
-    for quant in [KvQuant::IsoKOnly3, KvQuant::RotorKOnly3] {
+    for quant in RING_BACKED_K_ONLY {
         for prefill in [128, 512] {
             assert_ring_is_counted(quant, prefill);
         }

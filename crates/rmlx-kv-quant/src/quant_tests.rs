@@ -427,3 +427,47 @@ fn estimator_matches_actual_iso_rotor_encode_bytes() {
         "Iso3 (affine K) estimate {est_v_only} must be below Iso3Sym (iso K) {est}"
     );
 }
+
+/// None of the eight iso / rotor codecs that quantize K can be a memory win —
+/// at any context, any `head_dim`, any KV-head count.
+///
+/// Both families spend one whole `u32` code word **and** one `f32` scale per
+/// group — 4 head-dim slots for iso, 3 for rotor — so a packed side costs at
+/// least 2 B per value (iso) or 2.67 B per value (rotor) before its per-token
+/// norm, while bf16 costs exactly 2. The nominal 3-bit / 4-bit codebook width
+/// never reaches the store, which is why the 3-bit and 4-bit member of each
+/// family occupy byte-identical storage. No shape amortizes that away: the
+/// overhead is per token, not fixed.
+///
+/// Pinned as a sweep so a future store layout that genuinely does buy
+/// compression has to update this test deliberately, rather than quietly
+/// re-introducing a saving claim the format never delivered.
+#[test]
+fn iso_and_rotor_k_codecs_are_never_a_memory_win() {
+    let codecs = [
+        KvQuant::IsoKOnly3,
+        KvQuant::IsoKOnly4,
+        KvQuant::Iso3Sym,
+        KvQuant::Iso4Sym,
+        KvQuant::RotorKOnly3,
+        KvQuant::RotorKOnly4,
+        KvQuant::Rotor3Sym,
+        KvQuant::Rotor4Sym,
+    ];
+    for q in codecs {
+        for head_dim in [64_u64, 128, 256, 512] {
+            for kv_heads in [1_u64, 8] {
+                for seq in [256_u64, 4096, 65_536] {
+                    let saving = q.estimated_net_saving_per_layer(seq, head_dim, kv_heads, false);
+                    assert!(
+                        saving < 0,
+                        "{q} at seq={seq} head_dim={head_dim} kv_heads={kv_heads} reports a \
+                         {saving} B saving vs bf16 — the group-bound store cannot be smaller \
+                         than bf16, so a non-negative number here means the layout model has \
+                         drifted from the store"
+                    );
+                }
+            }
+        }
+    }
+}

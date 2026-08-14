@@ -1635,13 +1635,32 @@ where `*` is the **Hamilton product** and `v ∈ ℝ⁴` is treated as a quatern
 
 **Dequantize:** unpack → centroid lookup → rescale → inverse rotate → renorm.
 
-**Memory truth.** iso stores, per 4-element group, a packed code word, an
-f32 scale, and a 4×f32 quaternion, plus one f32 norm per token — ≈772 B per
-token per kv_head at head_dim=128 versus 256 B for bf16. **iso3/iso4 are
-net-NEGATIVE on memory at head_dim ≤ 256**; they are research codecs for
-quality experiments, not size wins. The resolve-time net-negative warn
-(`estimated_resident_bytes_per_layer` models the quaternion + norm sidebands
-exactly) accounts for these sidebands.
+**Memory truth.** iso spends, per 4-element group, one whole `u32` code word
+**and** one `f32` scale — 8 B for 4 values — plus one `f32` norm per token.
+The nominal codebook width never reaches the store: iso3 uses 12 of its 32
+code bits and iso4 uses 16, so **iso3 and iso4 occupy byte-identical
+storage**. At head_dim=128 that is 260 B per token per kv_head against bf16's
+256 B: **16.25 bits per value, 1.02× bf16**. The result is head_dim
+independent — at head_dim=512 it is 1028 B against 1024 B.
+
+Stores that keep the CPU `IsoBlocks` (the V-only `iso3` / `iso4` codecs) add a
+4×f32 quaternion per group on top, taking the same token to ≈772 B (≈48.25
+bits per value, 3.0× bf16). That sideband is the constant `FIXED_QUAT`
+replicated per group, not data — the GPU ring the K-only and symmetric codecs
+decode from does not carry it, which is why `k_iso3/4` and `iso3_sym/4_sym`
+measure ≈1.00–1.02× `none` while `iso3` / `iso4` measure ≈2.1×.
+
+**No iso codec is a memory win, at any head_dim.** 8 B per 4 values is exactly
+bf16's density before the per-token norm is added, so the packed side is
+strictly larger than the bf16 side it replaces for every shape. These are
+research codecs for quality experiments and kernel work, not size wins. The
+sign is pinned by `iso_and_rotor_k_codecs_are_never_a_memory_win`
+(`crates/rmlx-kv-quant/src/quant_tests.rs`) and surfaced to the operator by
+the resolve-time net-negative warn, which the Gemma4, Qwen3 and Qwen3.5-MoE
+generate paths call (the remaining arches do not call it yet).
+`estimated_resident_bytes_per_layer` models the group layout directly (never
+the codebook width) and counts the quaternion sideband, so its number is a
+conservative upper bound for the ring-resident members.
 
 **`head_dim % 4 == 0` constraint.** iso3 operates in groups of 4. Any
 `head_dim` not divisible by 4 is rejected at encode/decode time with
@@ -1754,7 +1773,8 @@ differences are the codebook (16 centroids vs 8) and the pack density
 | Property | iso3 | iso4 |
 |---|---|---|
 | Code bits / element | 3 | 4 |
-| Effective bits / element (incl. quaternion + norm sidebands) | ≈48.25 (≈772 B/token at head\_dim=128 — see Memory truth in iso3 section) | ≈52.25 (≈836 B/token at head\_dim=128: same quaternion + norm overhead, 4-bit codes) |
+| Delivered bits / element, ring-resident (`k_iso*`, `*_sym`) | **16.25** (260 B/token at head\_dim=128 — see Memory truth in iso3 section) | **16.25** — byte-identical to iso3; the codebook width never reaches the store |
+| Delivered bits / element, CPU-blocks-resident (`iso3` / `iso4`) | ≈48.25 (≈772 B/token at head\_dim=128, incl. the constant quaternion sideband) | ≈48.25 — same sideband, same code word |
 | Codebook | `lloyd_gaussian_codebook(3)` (8 centroids) | `lloyd_gaussian_codebook(4)` (16 centroids) |
 | Pack density (per u32) | 10 vals (30 bits used, 2 wasted) | 8 vals (32 bits used, 0 wasted) |
 | Rotation | Golden-ratio fixed quaternion (`FIXED_QUAT`) | Same |
@@ -1835,7 +1855,7 @@ amortises across every token in the layer.
 
 | Property | rotor3 |
 |---|---|
-| Effective bits / element | ~8 bpe pre-scale (8 codes × 3 bits per group of 3 real grade-1 elements + per-group scale + per-token norm). The 3.25 bpe target reported by the Python `rotorquant` reference is gated on the grade-aware codebook follow-up (deferred — see below). |
+| Delivered bits / element | **21.75** at head\_dim=128 (348 B/token/kv\_head vs bf16's 256 B, **1.36× bf16**). The store spends one whole `u32` code word **and** one `f32` scale per group of 3 real grade-1 elements — 8 B for 3 values — plus one `f32` norm per token. The codes alone are ~8 bpe; the `f32` scale more than doubles that, and rotor3 and rotor4 therefore occupy byte-identical storage. The 3.25 bpe target reported by the Python `rotorquant` reference is gated on the grade-aware codebook follow-up (deferred — see below). **No rotor codec is a memory win at any head\_dim** — see the iso3 "Memory truth" note and `iso_and_rotor_k_codecs_are_never_a_memory_win`. |
 | Codebook | `lloyd_gaussian_codebook(3)` (8 centroids), shared across all 8 mv components (single-codebook simplification) |
 | Pack density (per u32) | 10 vals (planar3 / iso3 convention; 8 codes ≤ 30 bits per group, 1 u32 per group) |
 | Rotation | Static per-(layer, head) rotor table `[n_groups, 4]` in `[s, b12, b13, b23]` form, seeded from `ROTORQUANT_GLOBAL_SEED ^ (layer << 32) ^ (head << 16) + group` (see [`crate::clifford`]) |
@@ -1962,7 +1982,7 @@ codebook and packing:
 
 | Property | rotor4 |
 |---|---|
-| Effective bits / element | ~10.7 bpe pre-scale (8 codes × 4 bits = 32 bits per group of 3 real grade-1 elements = exactly 1 u32, plus per-group f32 scale + per-token norm). Same grade-aware split deferral as rotor3. |
+| Delivered bits / element | **21.75** at head\_dim=128 — byte-identical to rotor3 (8 codes × 4 bits = exactly 1 `u32` per group of 3 real grade-1 elements, plus the same per-group `f32` scale and per-token norm; rotor3 spends 24 of the same 32 code bits). Codes alone are ~10.7 bpe. Same grade-aware split deferral as rotor3, and the same "never a memory win" conclusion. |
 | Codebook | `lloyd_gaussian_codebook(4)` (16 centroids), shared across all 8 mv components (single-codebook simplification, same as rotor3) |
 | Pack density (per u32) | 8 vals / u32 (dense 4-bit packing: 8 components × 4 bits = 32 bits = 1 u32 per group; `ROTOR4_WORDS_PER_GROUP = 1`) |
 | Rotation | Same static per-(layer, head) rotor table as rotor3 (`[n_groups, 4]`); seeded from the same `ROTORQUANT_GLOBAL_SEED` formula |

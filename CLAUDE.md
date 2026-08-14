@@ -263,8 +263,8 @@ hand — keeps the CI gate and the local gate identical.
 | `make info` | Dump arch + quant info for `$(MODEL)`. |
 | `make logs-tail` | `tail -f` newest `logs/*.jsonl`. |
 | `make metrics-summary` | `cat metrics/summary.csv`. |
-| `make model-check` | `cargo test -p rmlx-{models,runtime,quant}` only — no server/cli/metrics; <30 s, no model needed. |
-| `make model-check-full MODEL=…` | Same three crates + golden-token integration tests. Pass one model path; each golden reads `config.json` and skips gracefully when arch does not match — matching arch runs+passes, others skip. Target is green for any single test-target model. |
+| `make model-check` | `cargo test -p rmlx-{models,runtime,quant,kv-quant}` only — no server/cli/metrics; <30 s, no model needed. |
+| `make model-check-full MODEL=…` | `cargo test -p rmlx-{models,runtime,quant}` (note: **not** `rmlx-kv-quant`) + golden-token integration tests. Pass one model path; each golden reads `config.json` and skips gracefully when arch does not match — matching arch runs+passes, others skip. Target is green for any single test-target model. |
 
 `MODEL` and `PORT` override at the CLI: `make info MODEL=/path/to/snapshot`.
 
