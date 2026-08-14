@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
-# Check the host-side prerequisites for capturing a Metal GPU trace AND for
-# replaying it in Xcode.
+# Check the host-side prerequisites for Apple's GPU tools to work with a Metal
+# capture of this binary.
 #
-# Capture and replay have different requirements, and the split is why a trace
-# can be written successfully and still show nothing when opened:
+# Two different things gate a session, and confusing them is why a trace can be
+# written successfully and still be useless:
 #
 #   - capture needs the Metal capture layer (MTL_CAPTURE_ENABLED at launch) and
 #     a binary built with the metal-capture feature. scripts/gpu_capture.sh owns
 #     both; they are build-side, not host-side, so they are not checked here.
-#   - replay (Xcode -> Profile, the step that produces per-dispatch timings and
-#     writes .gpuprofiler_raw into the bundle) needs the host to be in developer
-#     mode, full Xcode selected, and the captured process to have been
-#     debuggable — i.e. signed with com.apple.security.get-task-allow. Cargo's
-#     linker-signed ad-hoc signature carries no entitlements at all, so a
-#     freshly built binary fails that last one by default.
+#   - the GPU tools attaching to the process needs the host in developer mode,
+#     full Xcode selected, and the process marked debuggable — i.e. signed with
+#     com.apple.security.get-task-allow. Cargo's linker-signed ad-hoc signature
+#     carries no entitlements at all, so a freshly built binary fails that one
+#     by default.
+#
+# What this does NOT promise: per-dispatch timings. Only Xcode's GUI Profile
+# replay writes .gpuprofiler_raw, it cannot be driven headlessly, and the
+# counters behind it are unsupported on this GPU — see docs/PROFILING.md §5,
+# which points at Metal System Trace for wall-clock GPU time.
 #
 # Every failure names its exact fix. Run it standalone before a session, or let
 # scripts/gpu_capture.sh run it — it refuses there before the multi-GB write.
@@ -22,7 +26,7 @@
 #   bash scripts/gputrace_preflight.sh
 #   bash scripts/gputrace_preflight.sh --binary target/release-debug/rmlx
 #
-# Exit: 0 = every replay prerequisite met (warnings may still print)
+# Exit: 0 = every prerequisite met (warnings may still print)
 #       1 = at least one prerequisite unmet (each printed with its fix)
 #       2 = usage error
 
@@ -81,14 +85,14 @@ else
 fi
 
 # --- 2. developer mode ------------------------------------------------------
-# Without it the GPU tools cannot attach or replay. Note the third branch: an
+# Without it the GPU tools cannot attach at all. Note the third branch: an
 # unrecognised DevToolsSecurity output is reported as unreadable rather than
 # quietly treated as "disabled" or "fine".
 dts=$(DevToolsSecurity -status 2>&1)
 case "$dts" in
 *"currently enabled"*) pass "developer mode enabled" ;;
 *"currently disabled"*)
-	bad "developer mode is disabled — Xcode's GPU tools cannot replay a trace." \
+	bad "developer mode is disabled — Apple's GPU tools cannot attach at all." \
 		"sudo DevToolsSecurity -enable"
 	;;
 *)
@@ -118,8 +122,8 @@ else
 	elif [ -z "$ents" ]; then
 		# A cargo binary is linker-signed: signed, but with an empty entitlement set.
 		bad "$BIN carries no entitlements at all (cargo's linker-signed ad-hoc signature)." \
-			"Xcode's GPU tools cannot replay a capture taken from a process" \
-			"they were not allowed to attach to. Re-sign it:" \
+			"Apple's GPU tools may not attach to a process that is not marked" \
+			"debuggable, so a capture from it is not usable in them. Re-sign it:" \
 			"$SIGN_HINT_A" \
 			"$SIGN_HINT_B"
 	elif ! printf '%s' "$ents" | plutil -lint - >/dev/null 2>&1; then
@@ -136,8 +140,8 @@ else
 				"$SIGN_HINT_A"
 		else
 			bad "$BIN carries no com.apple.security.get-task-allow entitlement." \
-				"Xcode's GPU tools cannot replay a capture taken from a process" \
-				"they were not allowed to attach to. Re-sign it:" \
+				"Apple's GPU tools may not attach to a process that is not marked" \
+				"debuggable, so a capture from it is not usable in them. Re-sign it:" \
 				"$SIGN_HINT_A" \
 				"$SIGN_HINT_B"
 		fi
@@ -145,13 +149,13 @@ else
 fi
 
 # --- 4. Metal toolchain (advisory) ------------------------------------------
-# A replay recompiles the captured pipelines, so a missing Metal toolchain
+# Anything that recompiles the captured pipelines needs it, so its absence
 # turns into a confusing Xcode-side failure. Advisory, not fatal: capture
 # itself does not need it.
 if xcrun -sdk macosx metal --version >/dev/null 2>&1; then
 	pass "Metal toolchain present: $(xcrun -sdk macosx metal --version 2>&1 | head -1)"
 else
-	warn "Metal toolchain not installed — a replay that recompiles shaders will fail."
+	warn "Metal toolchain not installed — anything recompiling captured shaders will fail."
 	warn "Install it with:  xcodebuild -downloadComponent MetalToolchain"
 fi
 
@@ -159,5 +163,5 @@ if [ "$fail" -ne 0 ]; then
 	echo "preflight FAILED — fix the items above before capturing." >&2
 	exit 1
 fi
-echo "preflight ok — capture and Xcode replay prerequisites are met"
+echo "preflight ok — Apple's GPU tools can attach to this binary on this host"
 exit 0
