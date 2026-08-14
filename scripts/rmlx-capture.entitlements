@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Debug-only entitlement for the GPU-capture binary (`make build-capture`).
+
+  com.apple.security.get-task-allow marks the process debuggable, which is what
+  lets Apple's developer tools attach to it. Without it a capture is written but
+  cannot be replayed in Xcode, so no per-dispatch timings ever exist.
+
+  This is never part of a release artifact: only the release-debug capture
+  binary is signed with it, and a release build is signed by nothing here.
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.get-task-allow</key>
+	<true/>
+</dict>
+</plist>
