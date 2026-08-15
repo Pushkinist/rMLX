@@ -64,8 +64,12 @@ fn parity_check_fails_on_length_mismatch() {
 /// that silently no-oped when the var happened to be `"1"` already.
 #[test]
 fn skip_if_no_gpu_env_strict_membership() {
+    // `skip_if_no_gpu_env()` is read at the top of every GPU test in this
+    // binary, so mutating `RMLX_SKIP_GPU` unguarded can flip one of them from
+    // skip to run (or back) mid-flight — the exact opt-out those tests rely on.
+    let _guard = crate::test_utils::env_lock();
     let prior = std::env::var("RMLX_SKIP_GPU").ok();
-    // SAFETY: single-threaded test; we restore the prior value before exit.
+    // SAFETY: env lock held — no concurrent env reader/writer.
     unsafe { std::env::set_var("RMLX_SKIP_GPU", "0") };
     assert!(!skip_if_no_gpu_env(), "RMLX_SKIP_GPU=0 must return false");
     unsafe { std::env::set_var("RMLX_SKIP_GPU", "true") };

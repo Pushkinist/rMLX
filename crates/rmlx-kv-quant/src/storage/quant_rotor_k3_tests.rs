@@ -21,10 +21,8 @@ fn quant_rotor_k3_new_shapes_correct() {
 
 #[test]
 fn quant_rotor_k3_roundtrip_no_qjl_matches_v_side() {
-    let _guard = crate::test_utils::ROTOR_QJL_ENV_LOCK
-        .lock()
-        .expect("env lock poisoned");
-    // SAFETY: ROTOR_QJL_ENV_LOCK held — no concurrent env reader/writer in this binary.
+    let _guard = crate::test_utils::env_lock();
+    // SAFETY: env lock held — no concurrent env reader/writer in this binary.
     unsafe { std::env::set_var("RMLX_ROTOR_QJL", "0") };
 
     let b = 1;
@@ -115,11 +113,9 @@ fn quant_rotor_k3_short_blocks_without_ring_is_loud_not_zero_padded() {
 
 #[test]
 fn quant_rotor_k3_qjl_default_on() {
-    let _guard = crate::test_utils::ROTOR_QJL_ENV_LOCK
-        .lock()
-        .expect("env lock poisoned");
+    let _guard = crate::test_utils::env_lock();
     // Default ON when no env override is set.
-    // SAFETY: ROTOR_QJL_ENV_LOCK held — no concurrent env reader/writer in this binary.
+    // SAFETY: env lock held — no concurrent env reader/writer in this binary.
     unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
 
     let head_dim = 9;
@@ -158,10 +154,8 @@ fn quant_rotor_k3_reset_clears_seq() {
 /// the rotor3 single-codebook simplification noise).
 #[test]
 fn quant_rotor_k3_cosine_empirical_floor_head_dim_128_no_qjl() {
-    let _guard = crate::test_utils::ROTOR_QJL_ENV_LOCK
-        .lock()
-        .expect("env lock poisoned");
-    // SAFETY: ROTOR_QJL_ENV_LOCK held — no concurrent env reader/writer in this binary.
+    let _guard = crate::test_utils::env_lock();
+    // SAFETY: env lock held — no concurrent env reader/writer in this binary.
     unsafe { std::env::set_var("RMLX_ROTOR_QJL", "0") };
 
     let head_dim = 128;
@@ -189,10 +183,8 @@ fn quant_rotor_k3_cosine_empirical_floor_head_dim_128_no_qjl() {
 /// values surface any head transposition as a large error.
 #[test]
 fn quant_rotor_k3_multi_append_matches_single_shot_gqa_with_qjl() {
-    let _guard = crate::test_utils::ROTOR_QJL_ENV_LOCK
-        .lock()
-        .expect("env lock poisoned");
-    // SAFETY: ROTOR_QJL_ENV_LOCK held — no concurrent env reader/writer in this binary.
+    let _guard = crate::test_utils::env_lock();
+    // SAFETY: env lock held — no concurrent env reader/writer in this binary.
     unsafe { std::env::set_var("RMLX_ROTOR_QJL", "1") };
 
     let kv_h = 3_usize;
@@ -414,10 +406,8 @@ fn quant_rotor_k3_truncate_to_keeps_the_gpu_ring() {
 /// from).
 #[test]
 fn quant_rotor_k3_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
-    let _guard = crate::test_utils::ROTOR_QJL_ENV_LOCK
-        .lock()
-        .expect("env lock poisoned");
-    // SAFETY: ROTOR_QJL_ENV_LOCK held — no concurrent env reader/writer.
+    let _guard = crate::test_utils::env_lock();
+    // SAFETY: env lock held — no concurrent env reader/writer.
     unsafe { std::env::set_var("RMLX_ROTOR_QJL", "0") };
 
     let head_dim = 9_usize; // n_groups = 3, exact
@@ -484,6 +474,6 @@ fn quant_rotor_k3_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
         );
     }
 
-    // SAFETY: ROTOR_QJL_ENV_LOCK still held.
+    // SAFETY: env lock still held.
     unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
 }

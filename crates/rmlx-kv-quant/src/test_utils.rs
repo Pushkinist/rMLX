@@ -34,37 +34,56 @@
 //! | rot_k FWHT + affine q8 | 0.10 | one 8-bit quant step for D=128 FWHT range |
 //! | q8_0 group-128 affine | 5e-3 | f32 rounding in min/max scan |
 
-/// Process-global lock for tests that mutate `RMLX_ROTOR_QJL` in the env.
+/// Process-global lock for every test in this binary that touches the
+/// environment — as a **writer or a reader**.
 ///
-/// Hold for the **entire** test body (set → build → encode/decode → assert →
-/// clear). This prevents POSIX UB (setenv / getenv are not async-signal-safe
-/// across concurrent threads in a multi-threaded test binary).
+/// The granularity is the whole environment, not one variable: `setenv` is UB
+/// against a concurrent `getenv` of *any* key, so a per-variable lock would be
+/// unsound. Acquire it via [`env_lock`].
 ///
-/// Pattern imported from `rmlx-kv-ssd::block_io_tests`. `rmlx-kv-ssd` imports
-/// this constant rather than defining its own so there is a single source of
-/// truth.
+/// Hold it for the **entire** test body (set → build → encode/decode → assert →
+/// clear), not just across the mutation. A reader that samples an env-backed
+/// gate without it observes another test's in-flight mutation and fails
+/// intermittently — an unexplained flake that teaches everyone to re-run rather
+/// than investigate, and launders real failures in the process.
+///
+/// `rmlx-kv-ssd` keeps its own lock: it is a separate crate, so its tests run in
+/// a separate binary (separate process) and share no environment with this one.
 ///
 /// # Usage
 ///
 /// ```ignore
 /// #[test]
 /// fn my_test() {
-///     let _guard = crate::test_utils::ROTOR_QJL_ENV_LOCK
-///         .lock()
-///         .expect("env lock poisoned");
-///     // SAFETY: ROTOR_QJL_ENV_LOCK held — no concurrent env reader/writer.
+///     let _guard = crate::test_utils::env_lock();
+///     // SAFETY: env lock held — no concurrent env reader/writer.
 ///     unsafe { std::env::set_var("RMLX_ROTOR_QJL", "0"); }
 ///     // ... test body ...
 ///     unsafe { std::env::remove_var("RMLX_ROTOR_QJL"); }
 /// }
 /// ```
-pub(crate) static ROTOR_QJL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire [`ENV_LOCK`] for the caller's scope.
+///
+/// Poisoning is recovered rather than propagated: the guarded state is `()`, so
+/// a panic while holding the lock leaves nothing inconsistent, and re-panicking
+/// here would replace every subsequent test's real failure with "env lock
+/// poisoned" — hiding the one test that actually broke behind a cascade.
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Returns `true` if the `RMLX_SKIP_GPU` environment variable is set to `"1"`.
 ///
 /// Parity tests call this at the top of their body as an additional opt-out
 /// beyond `#[ignore]`.  When `RMLX_SKIP_GPU=1`, the test exits silently
 /// without touching the GPU, even when run with `--include-ignored`.
+///
+/// This reads a process-global that a test in this binary mutates, so any test
+/// that *writes* `RMLX_SKIP_GPU` must hold [`env_lock`] while it does.
 pub(crate) fn skip_if_no_gpu_env() -> bool {
     std::env::var("RMLX_SKIP_GPU").as_deref() == Ok("1")
 }

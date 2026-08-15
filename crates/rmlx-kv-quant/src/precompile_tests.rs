@@ -98,6 +98,12 @@ fn rotor_symmetric_families_are_metal_when_qjl_off() {
     // test. A QJL-carrying store still keeps the CPU dequant path; that branch
     // is gated on the global toggle and not exercised here (QJL is off by
     // default). Grounded in the dispatcher, not by fiat.
+    //
+    // The whole body is a *reader* of the process-global QJL gate — the explicit
+    // check below and every `cpu_hot_path_reason()` call in the loop — so it must
+    // serialize against the tests that drive `RMLX_ROTOR_QJL`, or it samples one
+    // of their in-flight mutations and fails intermittently.
+    let _guard = crate::test_utils::env_lock();
     assert!(
         !crate::rotor_qjl::rotor_qjl_enabled(),
         "test assumes the default QJL-off state"
@@ -158,9 +164,7 @@ fn k_only_rotor_families_are_qjl_aware() {
     // `!rotor_qjl_enabled()`. The verdict tracks the live QJL gate: QJL on (the
     // default) → CPU (`Some`); QJL off → Metal (`None`). Drive both states via
     // the same env the dispatcher reads, so the test is tied to the dispatcher.
-    let _guard = crate::test_utils::ROTOR_QJL_ENV_LOCK
-        .lock()
-        .expect("env lock poisoned");
+    let _guard = crate::test_utils::env_lock();
     // The codec identity (K-only rotor) is QJL-independent — assert it always.
     for kq in [KvQuant::RotorKOnly3, KvQuant::RotorKOnly4] {
         assert!(
@@ -177,7 +181,7 @@ fn k_only_rotor_families_are_qjl_aware() {
     }
     let prev = std::env::var("RMLX_ROTOR_QJL").ok();
     for kq in [KvQuant::RotorKOnly3, KvQuant::RotorKOnly4] {
-        // SAFETY: ROTOR_QJL_ENV_LOCK held — no concurrent env reader/writer.
+        // SAFETY: env lock held — no concurrent env reader/writer.
         unsafe { std::env::set_var("RMLX_ROTOR_QJL", "1") };
         assert!(
             kq.cpu_hot_path_reason().is_some(),
@@ -189,7 +193,7 @@ fn k_only_rotor_families_are_qjl_aware() {
             "{kq} with QJL off dispatches the rotor K MSL kernel — must be Metal (None)"
         );
     }
-    // SAFETY: ROTOR_QJL_ENV_LOCK held.
+    // SAFETY: env lock held.
     match prev {
         Some(p) => unsafe { std::env::set_var("RMLX_ROTOR_QJL", p) },
         None => unsafe { std::env::remove_var("RMLX_ROTOR_QJL") },
