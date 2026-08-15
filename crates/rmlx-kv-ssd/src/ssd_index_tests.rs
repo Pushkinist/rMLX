@@ -127,6 +127,170 @@ fn cross_layout_lookup_is_a_miss() {
     );
 }
 
+// ── LRU stamp granularity ─────────────────────────────────────────────────
+
+/// Microseconds alone are not a total order: a burst of calls fits inside one,
+/// and a clock stepped backwards by NTP would hand out a decreasing value.
+/// Eviction has no tiebreak column, so the stamp source itself has to be the
+/// total order.
+#[test]
+fn now_stamp_us_is_strictly_increasing() {
+    let stamps: Vec<u64> = (0..10_000).map(|_| now_stamp_us()).collect();
+    for pair in stamps.windows(2) {
+        if let [a, b] = *pair {
+            assert!(b > a, "stamp {b} did not advance past {a}");
+        }
+    }
+}
+
+/// The eviction victim must be the least *recently used* block, not an
+/// arbitrary member of whatever set shares a coarse timestamp.
+///
+/// Everything here — eight `record`s and three `touch`es — happens inside a
+/// single wall-clock second, which is the ordinary case for a server under
+/// load. At second granularity every row carries the same `last_used`,
+/// `ORDER BY last_used ASC` has no tiebreak, and SQLite yields rows in
+/// insert order: eviction then takes `b0..b2` (the three blocks that were
+/// just touched and are the *most* recently used) and keeps `b3..b5`. The
+/// touches are deliberately applied to the earliest-inserted blocks so the
+/// two orderings disagree on every row rather than by luck.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn evict_lru_picks_the_least_recently_used_within_one_second() {
+    let idx = open();
+    let names: Vec<String> = (0..8).map(|i| format!("b{i}")).collect();
+    for name in &names {
+        idx.record(
+            name,
+            LK_A,
+            &PathBuf::from(format!("/tmp/{name}.kvb")),
+            "m",
+            "k",
+            1000,
+        )
+        .unwrap();
+    }
+
+    // Re-use b0, b1, b2 — they become the three most recently used blocks.
+    // LRU order is now b3, b4, b5, b6, b7, b0, b1, b2.
+    for name in names.iter().take(3) {
+        idx.touch(name, LK_A).unwrap();
+    }
+
+    // 8000 bytes down to 5000 evicts exactly the three oldest: b3, b4, b5.
+    let evicted = idx.evict_lru_until(5000).unwrap();
+    let got: Vec<String> = evicted
+        .paths
+        .iter()
+        .map(|p| p.file_stem().unwrap_or_default().to_string_lossy().into())
+        .collect();
+    assert_eq!(
+        got,
+        vec!["b3".to_string(), "b4".to_string(), "b5".to_string()],
+        "eviction must take the least recently used blocks, in LRU order"
+    );
+    for name in ["b0", "b1", "b2", "b6", "b7"] {
+        assert!(
+            idx.lookup(name, LK_A).unwrap().is_some(),
+            "{name} was more recently used than every evicted block and must survive"
+        );
+    }
+}
+
+/// The stamps have to separate blocks written from different threads too —
+/// that is where the tie was originally observed, and a coarse clock ties
+/// hardest exactly when request rate is highest.
+///
+/// Two properties, both false at second granularity: every row carries a
+/// distinct stamp, and within one thread the stamps follow the order that
+/// thread touched its own blocks in.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+fn concurrent_touches_get_distinct_ordered_stamps() {
+    use std::sync::{Arc, Barrier};
+
+    const THREADS: usize = 3;
+    const PER_THREAD: usize = 16;
+
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("index.db");
+    let _seed = SsdKvIndex::open_at(&db).unwrap();
+
+    // Every thread has to be running before any is joined, so the spawns are
+    // collected up front rather than folded into the join.
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let mut handles = Vec::with_capacity(THREADS);
+    for t in 0..THREADS {
+        let (db, barrier) = (db.clone(), Arc::clone(&barrier));
+        handles.push(std::thread::spawn(move || {
+            let idx = SsdKvIndex::open_at(&db).unwrap();
+            let names: Vec<String> = (0..PER_THREAD).map(|i| format!("t{t}-{i:02}")).collect();
+            barrier.wait();
+            for name in &names {
+                idx.record(
+                    name,
+                    LK_A,
+                    &PathBuf::from(format!("/tmp/{name}.kvb")),
+                    "m",
+                    "k",
+                    1,
+                )
+                .unwrap();
+            }
+            // Touch in a fixed order; the resulting stamps must follow it.
+            for name in &names {
+                idx.touch(name, LK_A).unwrap();
+            }
+            names
+        }));
+    }
+
+    let mut per_thread: Vec<Vec<String>> = Vec::with_capacity(THREADS);
+    for h in handles {
+        per_thread.push(h.join().expect("worker thread panicked"));
+    }
+
+    let idx = SsdKvIndex::open_at(&db).unwrap();
+    let stamp = |name: &str| {
+        idx.lookup(name, LK_A)
+            .unwrap()
+            .expect("row present")
+            .last_used
+    };
+
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for names in &per_thread {
+        let mut prev: Option<u64> = None;
+        for name in names {
+            let s = stamp(name);
+            assert!(
+                seen.insert(s),
+                "stamp {s} collides across rows; a shared stamp leaves eviction \
+                 without a tiebreak and the victim arbitrary"
+            );
+            if let Some(p) = prev {
+                assert!(
+                    s > p,
+                    "{name} was touched after the previous block in its thread \
+                     but carries stamp {s} <= {p}"
+                );
+            }
+            prev = Some(s);
+        }
+    }
+    assert_eq!(seen.len(), THREADS * PER_THREAD);
+}
+
 // ── evict_lru_until ───────────────────────────────────────────────────────
 
 #[test]
@@ -309,7 +473,7 @@ fn open_at_tempfile_roundtrip() {
         .unwrap();
     }
 
-    // Re-open — schema v2 + row persists.
+    // Re-open — schema version accepted + row persists.
     let idx2 = SsdKvIndex::open_at(&db).unwrap();
     let row = idx2
         .lookup(&hash_to_hex(42), LK_A)
@@ -320,7 +484,7 @@ fn open_at_tempfile_roundtrip() {
     assert_eq!(row.layout_key, LK_A);
 }
 
-/// unit test #5: an existing DB tagged with `schema_version != 2`
+/// unit test #5: an existing DB tagged with an unknown `schema_version`
 /// surfaces `SchemaMismatch`.
 #[test]
 #[allow(
@@ -352,7 +516,7 @@ fn schema_mismatch_on_unknown_version() {
 /// A DB whose `kv_blocks` table exists but has NO `schema_version` table
 /// is the pre-release v1 layout. `install_config` was supposed to wipe
 /// such namespaces; if `open_at` is asked to consume one directly it must
-/// surface `SchemaMismatch { found: 1, expected: 2 }`.
+/// surface `SchemaMismatch { found: 1, .. }`.
 #[test]
 #[allow(
     clippy::unwrap_used,
@@ -529,4 +693,79 @@ fn single_namespace_no_global_budget_noop() {
     assert_eq!(report.blocks_evicted, 0);
     let idx = SsdKvIndex::open_at(&alpha.join("index.db")).unwrap();
     assert_eq!(idx.total_bytes().unwrap(), 3000);
+}
+
+/// The pool sweep merges rows from independent namespace databases, so its
+/// ordering has to come from the stamp itself — no per-database counter could
+/// compare `alpha`'s rows against `beta`'s.
+///
+/// Recorded and touched inside one wall-clock second, as a live pool is. At
+/// second granularity all six rows tie and the sweep falls back to its
+/// `(namespace, hash)` tiebreak, which evicts `alpha/a0`, `alpha/a1`,
+/// `alpha/a2` — alphabetically first, and here the three *most* recently used.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn evict_pool_lru_orders_across_namespaces_within_one_second() {
+    let tmp = TempDir::new().unwrap();
+    let kv_root = tmp.path().to_path_buf();
+
+    // Recorded oldest-first across both namespaces, interleaved.
+    let alpha = seed_ns_recorded(&kv_root, "alpha", &["a0", "a1", "a2"]);
+    let beta = seed_ns_recorded(&kv_root, "beta", &["b0", "b1", "b2"]);
+
+    // Re-use alpha's blocks: they become the three most recently used in the
+    // pool. LRU order is now b0, b1, b2, a0, a1, a2.
+    {
+        let idx_a = SsdKvIndex::open_at(&alpha.join("index.db")).unwrap();
+        for name in ["a0", "a1", "a2"] {
+            idx_a.touch(name, LK_A).unwrap();
+        }
+    }
+
+    // 6000 bytes down to 3500 evicts three rows: the beta blocks.
+    let report = evict_pool_lru_until(&kv_root, 3500).unwrap();
+    assert_eq!(report.blocks_evicted, 3);
+    assert_eq!(
+        report.namespaces_touched, 1,
+        "only beta holds least-recently-used blocks, so only beta may be touched"
+    );
+
+    let idx_a = SsdKvIndex::open_at(&alpha.join("index.db")).unwrap();
+    let idx_b = SsdKvIndex::open_at(&beta.join("index.db")).unwrap();
+    for name in ["a0", "a1", "a2"] {
+        assert!(
+            idx_a.lookup(name, LK_A).unwrap().is_some(),
+            "{name} was used after every beta block and must survive"
+        );
+        assert!(alpha.join(format!("{name}.kvb")).exists());
+    }
+    for name in ["b0", "b1", "b2"] {
+        assert!(
+            idx_b.lookup(name, LK_A).unwrap().is_none(),
+            "{name} evicted"
+        );
+        assert!(!beta.join(format!("{name}.kvb")).exists());
+    }
+}
+
+/// Like [`seed_ns_rows`] but stamps each row through the public `record` path
+/// instead of hand-writing a `last_used` value, so the rows carry whatever
+/// granularity the index actually issues.
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn seed_ns_recorded(kv_root: &Path, ns: &str, names: &[&str]) -> PathBuf {
+    let ns_dir = kv_root.join(ns);
+    fs::create_dir_all(&ns_dir).unwrap();
+    let idx = SsdKvIndex::open_at(&ns_dir.join("index.db")).unwrap();
+    for name in names {
+        let p = ns_dir.join(format!("{name}.kvb"));
+        fs::write(&p, vec![0u8; 1000]).unwrap();
+        idx.record(name, LK_A, &p, ns, "k8v8", 1000).unwrap();
+    }
+    ns_dir
 }

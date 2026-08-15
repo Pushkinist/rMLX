@@ -29,13 +29,14 @@
 //!
 //! ## Pre-release schema wipe
 //!
-//! rMLX is unreleased, so the index schema bumped from implicit v1 → explicit
-//! v2 by wiping rather than migrating. [`install_config`] walks every
-//! `<RMLX_HOME>/cache/kv/<ns>/` namespace BEFORE any [`SsdKvIndex::open`]
-//! runs: if `<ns>/index.db` exists and lacks the `schema_version` table, the
-//! ENTIRE namespace dir is removed (`fs::remove_dir_all`) and dropped bytes
-//! are logged with an `ssd_cache_pre_release_wipe` event. The pass is
-//! idempotent — a second boot with the v2 schema is a no-op (dropped_bytes=0).
+//! rMLX is unreleased, so the index schema advances by wiping rather than
+//! migrating. [`install_config`] walks every `<RMLX_HOME>/cache/kv/<ns>/`
+//! namespace BEFORE any [`SsdKvIndex::open`] runs: if `<ns>/index.db` holds a
+//! `kv_blocks` table at any schema version other than the current one (a
+//! missing `schema_version` table being the pre-release v1 layout), the ENTIRE
+//! namespace dir is removed (`fs::remove_dir_all`) and dropped bytes are logged
+//! with an `ssd_cache_pre_release_wipe` event. The pass is idempotent — a
+//! second boot at the current schema is a no-op (dropped_bytes=0).
 
 use std::borrow::Cow;
 use std::path::Path;
@@ -93,7 +94,7 @@ static CONFIG: OnceLock<Option<SsdTierConfig>> = OnceLock::new();
 /// builds, a second call PANICS to surface the bug. The wipe runs
 /// unconditionally on the first call, including when the tier is OFF — that
 /// way switching `--kv-ssd-cache-gb` 0 → N between restarts cannot resurrect
-/// a v1 namespace.
+/// a namespace at a superseded schema.
 ///
 /// callers must pass an `SsdTierConfig` directly. `per_project_budgets`
 /// MUST be empty in — populated by from `projects.toml`. After
@@ -143,7 +144,7 @@ pub fn install_config(cfg: SsdTierConfig) -> Result<()> {
     }
 
     // single startup pass; runs BEFORE any namespace SsdKvIndex::open.
-    wipe_pre_release_v1_namespaces(&rmlx_core::paths::cache_dir().join("kv"));
+    wipe_stale_schema_namespaces(&rmlx_core::paths::cache_dir().join("kv"));
 
     // cross-namespace LRU enforcement. No-op when global_budget == 0.
     if let Some(c) = CONFIG.get().and_then(|v| v.as_ref()) {
@@ -424,9 +425,9 @@ pub(crate) fn enforce_namespace_budget(
 }
 
 /// pre-release schema wipe: walk every namespace under `kv_root` and
-/// remove any whose `index.db` lacks the v2 `schema_version` table.
+/// remove any whose `index.db` is not at the current schema version.
 ///
-/// Idempotent — on a clean v2 boot every namespace is skipped, dropped_bytes
+/// Idempotent — on a clean boot every namespace is skipped, dropped_bytes
 /// is 0, and no `fs::remove_dir_all` runs. Emits a single
 /// `ssd_cache_pre_release_wipe` event listing the removed namespaces.
 ///
@@ -439,7 +440,7 @@ pub(crate) fn enforce_namespace_budget(
               byte accumulation, and structured tracing — sequential with no \
               natural split that would not fragment the schema-wipe logic"
 )]
-fn wipe_pre_release_v1_namespaces(kv_root: &Path) {
+fn wipe_stale_schema_namespaces(kv_root: &Path) {
     if !kv_root.exists() {
         return;
     }
@@ -467,7 +468,7 @@ fn wipe_pre_release_v1_namespaces(kv_root: &Path) {
         if !db_path.exists() {
             continue; // empty namespace dir — nothing to migrate
         }
-        if !is_pre_release_v1(&db_path) {
+        if !is_stale_schema(&db_path) {
             continue;
         }
 
@@ -509,32 +510,31 @@ fn wipe_pre_release_v1_namespaces(kv_root: &Path) {
     }
 }
 
-/// True iff `index.db` is a SQLite file holding the v1 `kv_blocks` table but
-/// lacking the v2 `schema_version` table. Any error opening / inspecting the
-/// file is treated as "not v1" (leave it alone) — the in-place `SsdKvIndex::open`
-/// will surface a `SchemaMismatch` on a future schema and the operator can
-/// investigate, rather than this helper silently wiping unrelated DBs.
+/// True iff `index.db` is a SQLite file holding a `kv_blocks` table whose
+/// schema version is not the one this binary writes. A missing
+/// `schema_version` table reads as the pre-release v1 layout.
+///
+/// Any error opening / inspecting the file is treated as "leave it alone", as
+/// is a file with no `kv_blocks` table at all — this helper must never wipe a
+/// DB it does not recognise as a KV index.
+///
+/// Version mismatch in either direction is wiped, not just an older one. The
+/// tier is a pure cache with no source-of-truth content, so a binary that
+/// cannot read a namespace has exactly two options: reclaim the bytes, or
+/// strand them and disable the namespace for that run — the latter is what a
+/// downgrade used to do, leaving the directory on disk with nothing able to
+/// reclaim it.
 #[allow(
     clippy::manual_let_else,
     reason = "early-return on Err(_) is cleaner here: the connection is consumed \
               in a separate query_row call, so the let-else form would need to \
               restructure non-trivially around the borrow"
 )]
-fn is_pre_release_v1(db_path: &Path) -> bool {
+fn is_stale_schema(db_path: &Path) -> bool {
     let conn = match rusqlite::Connection::open(db_path) {
         Ok(c) => c,
         Err(_) => return false,
     };
-    let has_schema_version: bool = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'",
-            [],
-            |_| Ok(true),
-        )
-        .unwrap_or(false);
-    if has_schema_version {
-        return false;
-    }
     let has_kv_blocks: bool = conn
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='kv_blocks'",
@@ -542,7 +542,15 @@ fn is_pre_release_v1(db_path: &Path) -> bool {
             |_| Ok(true),
         )
         .unwrap_or(false);
-    has_kv_blocks
+    if !has_kv_blocks {
+        return false;
+    }
+    // Absent schema_version table ⇒ pre-release v1.
+    match crate::ssd_index::read_schema_version(&conn) {
+        Ok(Some(v)) => v != crate::ssd_index::SCHEMA_VERSION,
+        Ok(None) => true,
+        Err(_) => false,
+    }
 }
 
 /// Sum the size of every file inside `dir` (non-recursive enough — namespaces

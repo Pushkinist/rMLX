@@ -63,7 +63,7 @@ fn compute_layout_key_is_distinct_across_tuples() {
     }
 }
 
-// ── wipe_pre_release_v1_namespaces ────────────────────────────────
+// ── wipe_stale_schema_namespaces ──────────────────────────────────
 
 /// Seed a v1-shaped namespace dir on disk under `kv_root`: a dummy `.kvb`
 /// file plus an `index.db` whose `kv_blocks` table matches the pre-
@@ -105,18 +105,38 @@ fn seed_v1_namespace(kv_root: &Path, ns: &str) -> std::path::PathBuf {
     clippy::unwrap_used,
     reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
 )]
-fn seed_v2_namespace(kv_root: &Path, ns: &str) -> std::path::PathBuf {
+fn seed_current_schema_namespace(kv_root: &Path, ns: &str) -> std::path::PathBuf {
     let ns_dir = kv_root.join(ns);
     std::fs::create_dir_all(&ns_dir).unwrap();
     let db_path = ns_dir.join("index.db");
-    // SsdKvIndex::open_at seeds a fresh v2 schema on a non-existent file.
-    let _ = SsdKvIndex::open_at(&db_path).expect("seed v2");
+    // SsdKvIndex::open_at seeds the current schema on a non-existent file.
+    let _ = SsdKvIndex::open_at(&db_path).expect("seed current schema");
+    ns_dir
+}
+
+/// Seed a namespace holding the current table shape but tagged with an
+/// explicit `schema_version` of `version`, plus a dummy `.kvb`.
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn seed_namespace_at_version(kv_root: &Path, ns: &str, version: i64) -> std::path::PathBuf {
+    let ns_dir = kv_root.join(ns);
+    std::fs::create_dir_all(&ns_dir).unwrap();
+    std::fs::write(ns_dir.join("dummy.kvb"), b"placeholder").unwrap();
+    let conn = rusqlite::Connection::open(ns_dir.join("index.db")).unwrap();
+    conn.execute_batch(crate::ssd_index::SCHEMA_TABLES).unwrap();
+    conn.execute(
+        "INSERT INTO schema_version (version) VALUES (?1)",
+        rusqlite::params![version],
+    )
+    .unwrap();
     ns_dir
 }
 
 /// unit test #3: wipe-on-upgrade. Seed a v1 namespace, drive
-/// `wipe_pre_release_v1_namespaces`, assert the dir is gone and a fresh
-/// `SsdKvIndex::open_at` against the (now-absent) path succeeds with v2.
+/// `wipe_stale_schema_namespaces`, assert the dir is gone and a fresh
+/// `SsdKvIndex::open_at` against the (now-absent) path succeeds.
 #[test]
 #[allow(
     clippy::expect_used,
@@ -132,47 +152,78 @@ fn wipe_removes_pre_release_v1_namespace() {
     let ns_dir = seed_v1_namespace(&kv_root, "wipe-v1");
 
     assert!(ns_dir.exists(), "fixture should seed namespace dir");
-    wipe_pre_release_v1_namespaces(&kv_root);
+    wipe_stale_schema_namespaces(&kv_root);
     assert!(!ns_dir.exists(), "v1 namespace must be removed");
 
-    // Re-creating the namespace (as a real model load would) → fresh v2 DB.
+    // Re-creating the namespace (as a real model load would) → fresh DB.
     std::fs::create_dir_all(&ns_dir).unwrap();
     let db_path = ns_dir.join("index.db");
-    let idx = SsdKvIndex::open_at(&db_path).expect("fresh v2 open");
+    let idx = SsdKvIndex::open_at(&db_path).expect("fresh open");
     // Sanity: empty index.
     assert_eq!(idx.total_bytes().unwrap(), 0);
 }
 
-/// unit test #4: no-op on an already-v2 namespace.
+/// A superseded-but-tagged namespace has to be reclaimed too, not only the
+/// untagged v1 layout. `last_used` moved from seconds to microseconds without
+/// changing the table shape, so a v2 DB opens cleanly at the SQL level and its
+/// rows would silently mix two units three orders of magnitude apart.
+///
+/// Leaving it in place is worse than a wipe: `SsdKvIndex::open` rejects the
+/// version, so the namespace is disabled for the run and its `.kvb` bytes are
+/// stranded with nothing able to reclaim them.
 #[test]
 #[allow(
     clippy::unwrap_used,
     reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
 )]
-fn wipe_is_noop_on_v2_namespace() {
+fn wipe_removes_superseded_schema_namespace() {
     let tmp = tempfile::TempDir::new().unwrap();
     let kv_root = tmp.path().to_path_buf();
-    let ns_dir = seed_v2_namespace(&kv_root, "wipe-v2");
+    let stale = seed_namespace_at_version(&kv_root, "wipe-v2", 2);
+    let current = seed_current_schema_namespace(&kv_root, "keep-current");
+
+    wipe_stale_schema_namespaces(&kv_root);
+
+    assert!(
+        !stale.exists(),
+        "superseded-schema namespace must be removed"
+    );
+    assert!(
+        current.exists(),
+        "current-schema namespace must survive the same pass"
+    );
+}
+
+/// unit test #4: no-op on a namespace already at the current schema.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn wipe_is_noop_on_current_schema_namespace() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let kv_root = tmp.path().to_path_buf();
+    let ns_dir = seed_current_schema_namespace(&kv_root, "wipe-current");
     let db_path = ns_dir.join("index.db");
 
     let before_meta = std::fs::metadata(&db_path).unwrap();
     let before_mtime = before_meta.modified().unwrap();
     let before_size = before_meta.len();
 
-    wipe_pre_release_v1_namespaces(&kv_root);
+    wipe_stale_schema_namespaces(&kv_root);
 
-    assert!(ns_dir.exists(), "v2 namespace must survive the wipe");
-    assert!(db_path.exists(), "v2 index.db must survive the wipe");
+    assert!(ns_dir.exists(), "namespace must survive the wipe");
+    assert!(db_path.exists(), "index.db must survive the wipe");
     let after_meta = std::fs::metadata(&db_path).unwrap();
     // mtime must not regress; size must be unchanged.
     assert_eq!(
         after_meta.len(),
         before_size,
-        "v2 index.db size must not change"
+        "index.db size must not change"
     );
     assert!(
         after_meta.modified().unwrap() >= before_mtime,
-        "v2 index.db mtime must not regress"
+        "index.db mtime must not regress"
     );
 }
 

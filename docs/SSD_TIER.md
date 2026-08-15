@@ -60,7 +60,7 @@ flag itself is not an error.
 │  Tier 3 — SSD                                                       │
 │  <RMLX_HOME>/cache/kv/<namespace>/                                  │
 │    <hash>.kvb          — safetensors block file (one per KV slot)   │
-│    index.db            — SsdKvIndex v2 (SQLite, WAL mode)           │
+│    index.db            — SsdKvIndex v3 (SQLite, WAL mode)           │
 │                                                                     │
 │  On RAM miss: SsdHydrator reads .kvb → GPU upload → promote to     │
 │  Tier 1 without re-prefill.                                         │
@@ -92,10 +92,12 @@ fields zero → tier OFF; the `OnceLock` stores `None`.
 At startup, `install_config` runs two operations before any model loads:
 
 1. **Pre-release schema wipe** — scans every `<RMLX_HOME>/cache/kv/<ns>/`
-   directory. If `index.db` lacks the `schema_version` table (v1 layout), the
-   entire namespace directory is removed (`fs::remove_dir_all`) and a
-   `ssd_cache_pre_release_wipe` tracing event records the dropped bytes.
-   Idempotent: a clean v2 boot is a no-op.
+   directory. If `index.db` holds a `kv_blocks` table at any `schema_version`
+   other than the current one (a missing `schema_version` table reads as the v1
+   layout), the entire namespace directory is removed (`fs::remove_dir_all`)
+   and a `ssd_cache_pre_release_wipe` tracing event records the dropped bytes.
+   Idempotent: a clean boot at the current schema is a no-op. A directory with
+   no `kv_blocks` table is never touched.
 
 2. **Cross-namespace LRU enforcement** — when `global_budget_bytes > 0`,
    calls `evict_pool_lru_until` to bring the pool under the global ceiling
@@ -106,7 +108,7 @@ Effective per-namespace ceiling when both budgets are set:
 
 ---
 
-## SsdKvIndex — Schema v2
+## SsdKvIndex — Schema v3
 
 Each namespace has one SQLite database at
 `<RMLX_HOME>/cache/kv/<namespace>/index.db`. The database runs in WAL mode
@@ -120,14 +122,39 @@ kv_blocks (
     model_id    TEXT    NOT NULL,   -- "<arch>/<snapshot>" identity string
     kv_quant    TEXT    NOT NULL,   -- KvQuant Display string (e.g. "k8v4")
     byte_size   INTEGER NOT NULL,   -- on-disk byte size of the .kvb file
-    last_used   INTEGER NOT NULL,   -- unix epoch seconds (updated on touch)
+    last_used   INTEGER NOT NULL,   -- unix epoch MICROSECONDS (see below)
     PRIMARY KEY (hash, layout_key)
 )
 
 schema_version (
-    version     INTEGER PRIMARY KEY NOT NULL   -- 2
+    version     INTEGER PRIMARY KEY NOT NULL   -- 3
 )
 ```
+
+### last_used is the LRU total order
+
+Eviction sorts on `last_used` and nothing else, so the column has to be a
+**total order over accesses**, not just an approximate one. `record` and
+`touch` stamp it from `ssd_index::now_stamp_us`, which reads the wall clock in
+microseconds and clamps the result above the highest value the process has
+already issued. That covers the two ways a raw clock stops being usable here:
+several writes inside one microsecond, and a clock stepped backwards by NTP.
+
+Seconds do not work. Under any realistic request rate many blocks land in the
+same second, `ORDER BY last_used ASC` has no tiebreak, and the victim becomes
+whichever row SQLite happens to yield first — a block used 900 ms ago can be
+discarded ahead of one used 100 ms ago, so the tier can throw away exactly the
+prefix it is about to be asked for. The degradation toward random replacement
+grows with request rate, i.e. it is worst when the tier matters most.
+
+It stays a wall-clock value rather than a plain counter for two reasons: the
+cross-namespace sweep merges rows from independent namespace databases and has
+to compare them (a per-database counter means nothing outside its own
+database), and the ordering has to survive a restart.
+
+Because the stamp source is already a total order, no tiebreak column is
+needed and the `kv_blocks_last_used` index stays single-column — the index that
+keeps eviction from sorting the whole table.
 
 ### Composite Primary Key
 
@@ -145,20 +172,35 @@ behaviour — `layout_key` is weight-independent on purpose.
 
 ### Schema Version Enforcement
 
-`SsdKvIndex::open` inspects the DB before touching any v2 tables:
+`SsdKvIndex::open` inspects the DB before touching any table:
 
-- File absent → creates v2 schema, inserts `schema_version = 2`.
+- File absent → creates the current schema, inserts `schema_version = 3`.
 - File present, `schema_version` table missing → `SchemaMismatch` (pre-release v1 DB; should have been wiped by `install_config`).
-- File present, `schema_version != 2` → `SchemaMismatch` (future schema this binary cannot interpret).
-- File present, `schema_version == 2` → open succeeds.
+- File present, `schema_version != 3` → `SchemaMismatch` (a schema this binary cannot interpret).
+- File present, `schema_version == 3` → open succeeds.
 
-### V1 → V2 Migration
+### Migration
 
-rMLX is unreleased. The v1 → v2 transition is a **one-time wipe**, not a
-row-by-row migration. A v1 DB has a `kv_blocks` table whose `hash` column is
-the sole primary key (no `layout_key` column, no `schema_version` table).
-`install_config` removes the entire namespace directory for any such DB before
-any `SsdKvIndex::open` call runs in-process.
+rMLX is unreleased, so every schema transition is a **one-time wipe**, not a
+row-by-row migration. The tier holds nothing that is not regenerable, so the
+cost of a wipe is one re-prefill per dropped block.
+
+| From | What changed | What happens to existing data |
+|---|---|---|
+| v1 (no `schema_version` table, `hash` is the sole PK) | `layout_key` column + composite PK + `schema_version` table | Namespace dir removed at startup |
+| v2 | `last_used` unit: seconds → microseconds | Namespace dir removed at startup |
+
+`install_config` removes the entire namespace directory for any `index.db`
+whose version is not the current one, before any `SsdKvIndex::open` call runs
+in-process. A v2 table could not simply be reused: the shape is identical, so
+new microsecond rows and old second rows would coexist three orders of
+magnitude apart, reporting nonsense to any operator query and leaving the old
+rows as coarsely ordered among themselves as before.
+
+The mismatch is wiped in **either** direction, not only for older versions. A
+namespace this binary cannot read has exactly two possible fates — reclaim the
+bytes, or strand them while `SsdKvIndex::open` disables the namespace for the
+run — and nothing else reclaims a stranded namespace.
 
 ---
 
@@ -408,7 +450,9 @@ Algorithm:
 
 2. If pool_bytes <= global_budget_bytes: return EvictionReport (no-op).
 
-3. Sort merged list ascending by last_used (oldest first, tie-break by namespace + hash).
+3. Sort merged list ascending by last_used (oldest first; the namespace + hash
+   tie-break is dead weight now that stamps are a total order, and is kept only
+   to make the sort itself deterministic).
 
 4. Walk oldest-first, accumulate evictions until running_total <= global_budget_bytes.
 
@@ -623,10 +667,11 @@ is a startup error (exit 2).
   the eviction order. An interrupted cleanup therefore leaves an unreferenced
   row, which `prune_missing` reclaims at the next attach, rather than an
   unreferenced file, which nothing reclaims. A re-spill of the same hash landing
-  between a failed read and its cleanup can still cost that block; the row and
-  the file are the same for identical content, and `last_used` is
-  second-granular, so there is nothing to compare-and-delete against short of a
-  per-row generation counter.
+  between a failed read and its cleanup can still cost that block: the row and
+  the file are the same for identical content, so the cleanup cannot tell the
+  re-spilled row from the one it read. (`last_used` distinguishes them, but the
+  reader captured no stamp to compare against, so acting on it would need a
+  compare-and-delete the cleanup path does not have.)
 - Index open failures disable the tier for the affected namespace; other
   namespaces and the RAM cache are unaffected.
 

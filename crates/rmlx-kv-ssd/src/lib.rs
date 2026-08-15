@@ -4,7 +4,7 @@
 //! Owns the entire SSD KV story:
 //!
 //! - [`ssd_index`] — SQLite index of on-disk `.kvb` blocks (`SsdKvIndex`,
-//!   schema v2, LRU eviction, layout-key column).
+//!   schema v3, LRU eviction, layout-key column).
 //! - [`block_io`] — `KvBlockWriter` / `KvBlockReader` (safetensors record
 //!   format per `KvStorage` variant) — the authoritative dispatch for
 //!   Contract B (every codec adds one match arm here).
