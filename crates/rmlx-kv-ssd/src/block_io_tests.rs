@@ -2864,9 +2864,10 @@ fn write_rejects_truncated_rotor_k_store() {
 /// running.
 ///
 /// Mutation check: make `try_deep_clone` clone `self.blocks` directly (drop the
-/// `synced_rotor_k_blocks` reconcile) — the clone then carries only the frozen
-/// prefill prefix, `write_caches` trips the `ensure_rotor_k_blocks_cover_shape`
-/// guard, and `.expect("write_caches")` panics (RED).
+/// `synced_rotor_k_blocks` reconcile) — the clone then carries no blocks at all,
+/// the ring having been the sole copy, so `write_caches` trips the
+/// `ensure_rotor_k_blocks_cover_shape` guard on 0 != prefill+steps tokens and
+/// `.expect("write_caches")` panics (RED).
 #[test]
 #[ignore = "GPU Metal context — run: cargo test -p rmlx-kv-ssd rotor_k_only_ring_only_tail_ssd -- --ignored --test-threads=1"]
 #[allow(

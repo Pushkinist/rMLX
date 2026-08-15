@@ -52,28 +52,87 @@
 ///
 /// # Usage
 ///
+/// The guard restores the managed keys when it drops, so a test sets what it
+/// needs and does not clean up:
+///
 /// ```ignore
 /// #[test]
 /// fn my_test() {
 ///     let _guard = crate::test_utils::env_lock();
 ///     // SAFETY: env lock held — no concurrent env reader/writer.
 ///     unsafe { std::env::set_var("RMLX_ROTOR_QJL", "0"); }
-///     // ... test body ...
-///     unsafe { std::env::remove_var("RMLX_ROTOR_QJL"); }
+///     // ... test body; no restore needed, `_guard` handles it ...
 /// }
 /// ```
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Acquire [`ENV_LOCK`] for the caller's scope.
+/// Environment keys the test suite mutates, snapshotted and restored by
+/// [`EnvGuard`].
 ///
-/// Poisoning is recovered rather than propagated: the guarded state is `()`, so
-/// a panic while holding the lock leaves nothing inconsistent, and re-panicking
-/// here would replace every subsequent test's real failure with "env lock
-/// poisoned" — hiding the one test that actually broke behind a cascade.
-pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    ENV_LOCK
+/// Only `RMLX_ROTOR_QJL` qualifies: it is the one process-global that tests
+/// write, and it is deliberately not `OnceLock`-latched, so a leaked value
+/// changes what every later test observes. Keys that tests merely *read*
+/// (`RMLX_SKIP_GPU`, `RMLX_TURBO_FLASH`) need the lock, not restoration.
+const MANAGED_ENV_KEYS: [&str; 1] = ["RMLX_ROTOR_QJL"];
+
+/// Holds [`ENV_LOCK`] and restores [`MANAGED_ENV_KEYS`] to their pre-acquisition
+/// values on drop — including while unwinding from a failed assertion.
+///
+/// That last part is the point. Every writer in this suite is shaped
+/// `set_var` → `assert!` → restore, so a failing assertion used to skip its own
+/// restore and leak the value into every subsequent test; the next reader then
+/// failed with "test assumes the default QJL-off state" and buried the assertion
+/// that actually broke. Restoring in `Drop` makes the writers unwind-safe
+/// without each of them having to be.
+pub(crate) struct EnvGuard {
+    /// Dropped after `Drop::drop` returns, so the restore below runs while the
+    /// lock is still held.
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prev: [(&'static str, Option<String>); MANAGED_ENV_KEYS.len()],
+}
+
+impl Drop for EnvGuard {
+    #[allow(unsafe_code, reason = "env restore under the lock this guard holds")]
+    fn drop(&mut self) {
+        for (key, prev) in &self.prev {
+            // SAFETY: `_lock` is still held (fields drop after this fn returns),
+            // so there is no concurrent env reader or writer in this binary.
+            match prev {
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+    }
+}
+
+/// Acquire [`ENV_LOCK`], snapshotting [`MANAGED_ENV_KEYS`] for restoration.
+///
+/// Poisoning is recovered rather than propagated. That is sound *because* of
+/// the `Drop` restore above: the panicking test's guard put the managed keys
+/// back on its way out, so the environment this caller inherits is the one it
+/// would have seen had that test passed. Propagating instead would replace every
+/// later test's real failure with "env lock poisoned", hiding the one that broke
+/// behind a cascade.
+pub(crate) fn env_lock() -> EnvGuard {
+    let lock = ENV_LOCK
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    EnvGuard {
+        _lock: lock,
+        prev: MANAGED_ENV_KEYS.map(|key| (key, std::env::var(key).ok())),
+    }
+}
+
+/// Whether an `RMLX_SKIP_GPU` value means "skip": strictly `Some("1")`.
+///
+/// Split out from [`skip_if_no_gpu_env`] so the membership rule can be tested
+/// without touching the process environment. Setting `RMLX_SKIP_GPU` to probe
+/// this would be unsound: [`skip_if_no_gpu_env`] is read at the top of every
+/// GPU test in this binary, and none of them hold the lock, so a transient
+/// write can flip a live test between "run" and "silent skip" — a false green,
+/// or a Metal test un-ignored into a parallel run.
+pub(crate) fn skip_value_means_skip(value: Option<&str>) -> bool {
+    value == Some("1")
 }
 
 /// Returns `true` if the `RMLX_SKIP_GPU` environment variable is set to `"1"`.
@@ -81,11 +140,8 @@ pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
 /// Parity tests call this at the top of their body as an additional opt-out
 /// beyond `#[ignore]`.  When `RMLX_SKIP_GPU=1`, the test exits silently
 /// without touching the GPU, even when run with `--include-ignored`.
-///
-/// This reads a process-global that a test in this binary mutates, so any test
-/// that *writes* `RMLX_SKIP_GPU` must hold [`env_lock`] while it does.
 pub(crate) fn skip_if_no_gpu_env() -> bool {
-    std::env::var("RMLX_SKIP_GPU").as_deref() == Ok("1")
+    skip_value_means_skip(std::env::var("RMLX_SKIP_GPU").ok().as_deref())
 }
 
 /// Run `cpu_path` and `msl_path` on `input` and assert max-abs-error ≤ `tol`.

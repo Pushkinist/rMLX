@@ -369,6 +369,18 @@ for crate in "${members[@]}"; do
         exit 1
     fi
 
+    # The cargo package name, for `--list` consumers that feed it to
+    # `cargo test -p`. Read from the manifest rather than assumed equal to the
+    # directory basename: the two happen to match for every member today, but a
+    # mismatch would surface as an opaque "package not found" from cargo instead
+    # of failing at this gate, which is the fail-closed discipline the rest of
+    # this script follows.
+    pkg_name="$(awk -F'"' '/^name[[:space:]]*=/{print $2; exit}' "${crate_dir}/Cargo.toml" 2>/dev/null)"
+    if [ -z "${pkg_name}" ]; then
+        echo "ERROR: could not read [package] name from ${crate_dir}/Cargo.toml." >&2
+        exit 1
+    fi
+
     # Gather this crate's scanned files. Whole-crate reachability needs every
     # scanned file of the crate in ONE awk pass, so collect them per crate.
     crate_files=()
@@ -393,7 +405,7 @@ for crate in "${members[@]}"; do
         case "$line" in
             "V  "*) violations="${violations}  ${line#V  }"$'\n' ;;
             "W  "*) warnings="${warnings}  ${line#W  }"$'\n' ;;
-            "T  "*) gpu_tests="${gpu_tests}$(basename "${crate}")"$'\t'"${line##*: }"$'\n' ;;
+            "T  "*) gpu_tests="${gpu_tests}${pkg_name}"$'\t'"${line##*: }"$'\n' ;;
         esac
     done <<< "$out"
 done

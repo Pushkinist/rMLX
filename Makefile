@@ -154,7 +154,7 @@ ci-perf:         ## pre-push gate under release-perf (separate from make ci; run
 # GPU test is red on main — wiring a known-red step into a shared gate just
 # teaches people to skip the gate.
 gpu-test:        ## run the GPU/Metal #[ignore] tests serialized (CRATE= FILTER= to narrow); needs exclusive machine access
-	@bash scripts/run_gpu_tests.sh $(if $(CRATE),--crate $(CRATE),) $(if $(FILTER),--filter $(FILTER),)
+	@bash scripts/run_gpu_tests.sh $(if $(CRATE),--crate '$(CRATE)',) $(if $(FILTER),--filter '$(FILTER)',)
 
 # model-check: run only the model-logic crates (rmlx-models, rmlx-runtime,
 # rmlx-quant) plus the KV-codec crate (rmlx-kv-quant). Excludes server, CLI, and

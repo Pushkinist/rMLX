@@ -7,6 +7,11 @@ fn test_turbo_flash_disabled_by_default() {
     //
     // To test with env var set, run:
     // RMLX_TURBO_FLASH=1 cargo test turbo_flash
+    //
+    // The `env::var` below is a raw, unlatched read, so it takes the env lock
+    // like any other reader: `setenv` is UB against a concurrent `getenv` of ANY
+    // key, and other tests in this binary write `RMLX_ROTOR_QJL`.
+    let _guard = crate::test_utils::env_lock();
     if std::env::var("RMLX_TURBO_FLASH").as_deref() != Ok("1") {
         assert!(
             !turbo_flash_enabled(),
@@ -46,6 +51,8 @@ fn test_turbo_flash_should_run_gated() {
     // 4. kv_seq > TURBO_FLASH_MIN_KV_SEQ
 
     // With default env (RMLX_TURBO_FLASH unset or "0"), should never run.
+    // Raw unlatched env read — takes the lock, as every reader must.
+    let _guard = crate::test_utils::env_lock();
     if std::env::var("RMLX_TURBO_FLASH").as_deref() != Ok("1") {
         assert!(!turbo_flash_should_run(1, 8192));
         assert!(!turbo_flash_should_run(1, 100));

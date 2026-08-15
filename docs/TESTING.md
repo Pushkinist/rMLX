@@ -179,13 +179,33 @@ reasons unrelated to Metal — live network access, a missing cargo feature,
 `ignore`-marked doc-comment pseudo-code — and sweeping those in would keep this
 gate permanently red for things it cannot speak to.
 
-It **refuses to report OK if it executed no tests** (per crate and overall) — a
-filter that matches nothing is an error, not a green run — and refuses to start
-while another MLX process holds the GPU (CLAUDE.md hard rule 8).
+It is fail-closed in three ways:
+
+* **Coverage.** Every classified test must actually run. If a crate executes
+  fewer tests than were classified for it — a renamed fn, a target no longer
+  built, a test compiled out behind a feature — that is an error. Checking only
+  for "executed zero" would let 237 of 238 run and still report green.
+* **`RMLX_SKIP_GPU=1` is refused outright.** Every classified test opens with
+  `if skip_if_no_gpu_env() { return; }`, so with it set the whole suite returns
+  before touching Metal and the gate would happily print `OK: 324 GPU tests
+  passed` having dispatched nothing. It is a documented setting for Metal-less
+  environments, so a stale export in a dev shell would otherwise disarm the one
+  step that proves the GPU path works.
+* **Exclusive GPU.** It refuses to start while another MLX process holds the
+  Metal context (CLAUDE.md hard rule 8).
 
 `make gpu-test` is not part of `make ci`: it needs the Metal context to itself
 and is too slow to block every commit. Run it before merging anything in the
 codec layer.
+
+### Known-red baseline
+
+`make gpu-test` currently exits 1 on a clean tree. Four tests in the
+`rmlx-kv-quant` rotor fused-QK dispatch integration binary fail with
+`rotor fused-QK dispatch delta = 0` — the sym and K-only rotor codecs no longer
+reach the fused-QK kernel, while their K-asym siblings still do. This is tracked
+separately and is not a regression from any recent change; it is why the target
+is not yet wired into `ci-perf`. Anything failing **beyond** those four is yours.
 
 ### `#[ignore]` is not a place to park a broken test
 
@@ -550,26 +570,49 @@ They are read only inside test code (`tests/` and `*_tests.rs` files).
 ## Env-backed gates: readers need the lock too
 
 `rmlx-kv-quant` exposes `test_utils::env_lock()`, a process-global guard for
-every test in that binary that touches the environment. Two rules:
+every test in that binary that touches the environment. Three rules:
 
 1. **Hold it for the whole test body**, not just across the mutation.
 2. **Readers take it as well as writers.** A test that merely *reads* an
-   env-backed gate — `rotor_qjl_enabled()`, `skip_if_no_gpu_env()`, or anything
-   that calls them, such as `KvQuant::cpu_hot_path_reason()` — races the tests
-   that set `RMLX_ROTOR_QJL` / `RMLX_SKIP_GPU` and fails intermittently.
+   env-backed gate — `rotor_qjl_enabled()`, a raw
+   `std::env::var("RMLX_TURBO_FLASH")`, or anything that calls them, such as
+   `KvQuant::cpu_hot_path_reason()` — races the tests that set
+   `RMLX_ROTOR_QJL` and fails intermittently. Note that a *latched* accessor
+   being safe does not make a raw `env::var` of the same key safe.
+3. **Establish the state you assert.** The lock serializes access; it does not
+   reset it. A test that asserts "QJL is off" without clearing
+   `RMLX_ROTOR_QJL` first fails for anyone who has it exported, with a message
+   that blames the test.
 
 The granularity is the whole environment, not one variable: `setenv` is UB
 against a concurrent `getenv` of *any* key, so one lock is the correct scope and
 a per-variable lock would be unsound.
 
+`env_lock()` returns an `EnvGuard` that **restores the managed keys on drop**,
+including while unwinding from a failed assertion. Tests therefore set what they
+need and do not clean up. This is not a convenience: every writer is shaped
+`set_var` → `assert!` → restore, so before the guard existed a failing assertion
+skipped its own restore and leaked the value into every later test, which then
+failed with a message about its own precondition and buried the assertion that
+actually broke.
+
 Gates latched behind a `OnceLock` (`RMLX_TURBO_FLASH`, `RMLX_FUSED_QK`,
 `RMLX_SPARSE_ATTN`, `RMLX_PLANAR_FLASH_DECODE`) read the env exactly once per
 process, so no test can flip them mid-run — that is why the shell drivers set
 them per-process instead. `RMLX_ROTOR_QJL` is deliberately **not** latched (it is
-re-read on every construction), which is what makes it raceable.
+re-read on every construction), which is what makes it raceable, and it is the
+only key `EnvGuard` manages.
+
+`RMLX_SKIP_GPU` is deliberately **never written** by any test. Its reader
+`skip_if_no_gpu_env()` runs at the top of every `#[ignore]`d GPU test and none of
+those take the lock, so a transient write could silently skip a live GPU test or
+un-ignore a Metal one into a parallel run. The membership rule is factored out as
+the pure `skip_value_means_skip()` and tested directly instead.
 
 `rmlx-kv-ssd` keeps its own lock: separate crate, separate test binary,
 separate process, no shared environment.
+
+---
 
 ## In-process tests must not rely on the `paths::home()` `OnceLock`
 

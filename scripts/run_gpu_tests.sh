@@ -31,13 +31,22 @@
 #
 # FAIL-CLOSED
 #   A gate that silently runs nothing passes everything. This one refuses to
-#   report OK unless it executed tests: an empty classification, a crate whose
-#   listed tests all failed to match, and a `--filter` that selects nothing are
-#   all errors, not green runs.
+#   report OK unless it executed every test the classifier named: an empty
+#   classification, a `--filter` that selects nothing, and a crate that executed
+#   FEWER tests than were classified for it are all errors, not green runs. The
+#   last one is the important case — checking only for "executed zero" lets 237
+#   of 238 run and still call it green, which is the classifier/runner divergence
+#   this design exists to prevent, surviving one layer down.
 #
-#   Tests that skip internally (model-gated cells with no snapshot present,
-#   `RMLX_SKIP_GPU=1`) still count as executed. That is accepted: this gate
-#   proves the suite RAN; per-test skip logic is the suite's own contract.
+#   `RMLX_SKIP_GPU=1` is refused outright rather than tolerated. Every classified
+#   test opens with `if skip_if_no_gpu_env() { return; }`, so with it set the
+#   whole suite returns before touching Metal and the gate would report a
+#   comfortable "OK: N GPU tests passed" having dispatched nothing. This gate
+#   exists to prove the GPU path RAN.
+#
+#   Model-gated cells that skip because no snapshot is present still count as
+#   executed; that is the suite's own documented contract and is not a
+#   process-wide off switch.
 #
 # USAGE
 #   bash scripts/run_gpu_tests.sh
@@ -47,6 +56,10 @@
 # Exit 0 = every selected GPU test passed. Exit 1 = a failure, or a run that
 # executed nothing.
 
+# No `-e`: cargo's exit code is captured explicitly via PIPESTATUS, and one
+# failing crate must not abort the remaining crates. The `[ ... ] && echo` guard
+# idioms below also return 1 when the guard is false, which `-e` would treat as
+# a fatal error.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -70,6 +83,17 @@ while [ $# -gt 0 ]; do
         *) echo "ERROR: unknown argument '$1'" >&2; usage >&2; exit 1 ;;
     esac
 done
+
+# Every classified test starts with `if skip_if_no_gpu_env() { return; }`, so
+# this variable turns the entire suite into no-ops that still report as passed.
+# It is a documented setting for Metal-less environments, which means a stale
+# export in a dev shell would silently disarm the one step that proves the GPU
+# path works. Refuse rather than run a hollow suite.
+if [ "${RMLX_SKIP_GPU:-}" = "1" ]; then
+    echo "ERROR: RMLX_SKIP_GPU=1 — every GPU test would return before touching Metal." >&2
+    echo "This gate proves the GPU path RAN; unset it (or use 'make test' instead)." >&2
+    exit 1
+fi
 
 # CLAUDE.md hard rule 8 — a single MLX process per Mac. These tests build their
 # own Metal context; a co-resident server already holding the GPU makes any
@@ -100,10 +124,14 @@ while IFS=$'\t' read -r crate fn_name; do
     esac
 done <<< "${listing}"
 
+# `sort -u`, not `uniq`: uniq collapses only ADJACENT duplicates, which happens
+# to hold because the classifier's outer loop is per-member — but nothing
+# enforces that emit order, and a future change to it would silently run a crate
+# twice. Crate order is irrelevant to the run.
 crates=()
 while IFS= read -r c; do
     [ -n "$c" ] && crates+=("$c")
-done < <(printf '%s' "${selected}" | cut -f1 | uniq)
+done < <(printf '%s' "${selected}" | cut -f1 | sort -u)
 
 if [ ${#crates[@]} -eq 0 ]; then
     echo "ERROR: selection matched no GPU tests." >&2
@@ -118,20 +146,46 @@ total_passed=0
 total_failed=0
 
 for crate in "${crates[@]}"; do
+    # `classified` counts the classifier's LINES, not its unique names, because
+    # each line is a distinct `#[test]` fn: seven names are defined in more than
+    # one module today (e.g. `gpu_two_append_multi_head_roundtrip` x3), and those
+    # are three separate tests that all run. Deduping the coverage target would
+    # accept two of the three vanishing. The filter LIST is deduped, since
+    # passing one substring twice selects nothing extra.
+    classified=0
     filters=()
     while IFS=$'\t' read -r c fn_name; do
-        [ "$c" = "${crate}" ] && filters+=("${fn_name}")
+        [ "$c" = "${crate}" ] || continue
+        classified=$((classified + 1))
     done <<< "${selected}"
-    echo "── ${crate} (${#filters[@]} GPU tests) ──────────────────────────"
+    while IFS= read -r fn_name; do
+        [ -n "${fn_name}" ] && filters+=("${fn_name}")
+    done < <(printf '%s' "${selected}" | awk -F'\t' -v c="${crate}" '$1 == c {print $2}' | sort -u)
+    echo "── ${crate} (${classified} GPU tests) ──────────────────────────"
 
     log="$(mktemp -t "rmlx-gpu-test-${crate}")"
+    # `--tests` selects every target with `test = true` — the lib's unit tests,
+    # each bin's unit tests, and the `tests/*.rs` integration binaries. That is
+    # exactly the set the classifier scans, so the runner cannot be pointed at
+    # more or less than the rule covers. It is also the only spelling that gets
+    # all three without breaking:
+    #   * `--lib` hard-errors with "no library targets found in package" on a
+    #     bin-only member such as rmlx-cli, which the classifier does scan.
+    #   * `--all-targets` drags in benches, and criterion harnesses reject
+    #     `--ignored` outright ("error: unexpected argument found").
+    #   * doc-tests stay out either way, deliberately: `--ignored` makes rustdoc
+    #     compile ```ignore blocks, which are prose, not tests.
+    #
     # Names come from the classifier as bare fn identifiers, while libtest
     # matches against the full `module::path::fn` — so these are substring
     # filters, not `--exact`. Over-matching a sibling is harmless (it runs one
-    # extra test); under-matching is what fail-closed below catches.
-    # `--lib --bins --tests` excludes doc-tests: `--ignored` makes rustdoc
-    # compile ```ignore blocks, which are prose, not tests.
-    cargo test -p "${crate}" --lib --bins --tests -- \
+    # extra test); under-matching is what the coverage check below catches.
+    #
+    # `--no-fail-fast` is load-bearing for that check: without it cargo stops
+    # after the first test binary that fails, so every later binary in the crate
+    # silently never runs and the coverage shortfall reports as "a filter
+    # stopped matching" when the real cause was an earlier failure.
+    cargo test --no-fail-fast -p "${crate}" --tests -- \
         --ignored --test-threads=1 "${filters[@]}" 2>&1 | tee "${log}"
     rc=${PIPESTATUS[0]}
 
@@ -144,22 +198,36 @@ for crate in "${crates[@]}"; do
         }
         END { printf "%d %d", p, f }
     ' "${log}")"
+    # Harvest the failing test names while the log still exists — a red gate
+    # that only names the crate leaves an operator unable to tell their own
+    # regression from the known baseline without re-running by hand.
+    crate_fails="$(awk '
+        /^failures:$/ { f = 1; next }
+        /^test result:/ { f = 0 }
+        f && /^    [A-Za-z_]/ { print $1 }
+    ' "${log}" | sort -u)"
     rm -f "${log}"
     crate_passed=${counts% *}
     crate_failed=${counts#* }
     total_passed=$((total_passed + crate_passed))
     total_failed=$((total_failed + crate_failed))
+    executed=$((crate_passed + crate_failed))
 
-    # Per-crate fail-closed: the classifier said this crate has GPU tests, so a
-    # run that executed none of them means the filters stopped matching (a
-    # renamed test, a moved target) — silence, not success.
-    if [ "$((crate_passed + crate_failed))" -eq 0 ]; then
-        echo "ERROR: ${crate} has ${#filters[@]} classified GPU tests but executed 0." >&2
-        failed_crates="${failed_crates}  ${crate} (executed 0)"$'\n'
+    # Coverage check: every classified test must have actually run. A shortfall
+    # means a filter stopped matching — a renamed fn, a target that is no longer
+    # built, a test compiled out behind a feature — which is silence, not
+    # success. Over-matching inflates `executed` and is harmless, so this is a
+    # one-sided `-lt`.
+    if [ "${executed}" -lt "${classified}" ]; then
+        echo "ERROR: ${crate} classified ${classified} GPU tests but executed ${executed} — a filter stopped matching." >&2
+        failed_crates="${failed_crates}  ${crate}: under-matched (${executed}/${classified} executed)"$'\n'
         continue
     fi
     if [ "${rc}" -ne 0 ]; then
-        failed_crates="${failed_crates}  ${crate}"$'\n'
+        failed_crates="${failed_crates}  ${crate}:"$'\n'
+        if [ -n "${crate_fails}" ]; then
+            failed_crates="${failed_crates}$(printf '    %s\n' ${crate_fails})"$'\n'
+        fi
     fi
 done
 
@@ -169,7 +237,9 @@ if [ -n "${failed_crates}" ]; then
     printf '%s' "${failed_crates}" >&2
     echo >&2
     echo "Reproduce one crate with:" >&2
-    echo "  cargo test -p <crate> --lib --bins --tests -- --ignored --test-threads=1 <filter>" >&2
+    echo "  cargo test --no-fail-fast -p <crate> --tests -- --ignored --test-threads=1 <filter>" >&2
+    echo "Known-red baseline (tracked separately): the four rotor fused-QK dispatch" >&2
+    echo "tests in rmlx-kv-quant reporting 'dispatch delta = 0'. See docs/TESTING.md." >&2
     exit 1
 fi
 
