@@ -270,7 +270,12 @@ fn qwen3_ssd_hydrate_promotes_entry_into_ram() {
             clippy::clone_on_ref_ptr,
             reason = "intentional Arc::clone — explicit form aids grep for shared-ownership transfer sites"
         )]
-        fn hydrate(&self, prompt_ids: &[u32]) -> Result<Option<Qwen3Entry>> {
+        fn hydrate(
+            &self,
+            prompt_ids: &[u32],
+            _seed: u64,
+            _kv_quant: KvQuant,
+        ) -> Result<Option<Qwen3Entry>> {
             self.calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if prompt_ids.len() < BLOCK_TOKENS {
@@ -305,7 +310,7 @@ fn qwen3_ssd_hydrate_promotes_entry_into_ram() {
     assert!(before.is_none(), "RAM must be empty before hydrate");
 
     // Hydrate from mock SSD.
-    let promoted = cache.hydrate_from_ssd(&prompt_ids);
+    let promoted = cache.hydrate_from_ssd(&prompt_ids, FNV_OFFSET, KvQuant::K8V8);
     assert!(
         promoted.is_some(),
         "mock SSD source must return a hit for a 2-block prompt"
@@ -518,8 +523,10 @@ fn qwen3_hydrated_exact_no_tail_not_placeholder() {
     QWEN3_PROMPT_CACHE.with_inner_mut(|guard| {
         if let Some(cache) = guard.as_mut() {
             cache.clear();
-            let block_hashes =
-                chained_block_hashes_seeded(&prompt_ids, FNV_OFFSET ^ kv_quant.cache_key_salt());
+            let block_hashes = chained_block_hashes_seeded(
+                &prompt_ids,
+                crate::prompt_cache::cache_seed(0, kv_quant, model.model_sig),
+            );
             let kv_snap: Result<Vec<_>> =
                 full_kv_caches.iter().map(KvCache::try_deep_clone).collect();
             let kv_snap = kv_snap.expect("kv clone");
@@ -815,8 +822,10 @@ fn qwen3_consume_engine_migration_golden() {
     clear_cache();
     QWEN3_PROMPT_CACHE.with_inner_mut(|guard| {
         if let Some(cache) = guard.as_mut() {
-            let block_hashes =
-                chained_block_hashes_seeded(&prompt_ids, FNV_OFFSET ^ kv_quant.cache_key_salt());
+            let block_hashes = chained_block_hashes_seeded(
+                &prompt_ids,
+                crate::prompt_cache::cache_seed(0, kv_quant, model.model_sig),
+            );
             let kv_snap: Result<Vec<_>> =
                 full_kv_caches.iter().map(KvCache::try_deep_clone).collect();
             cache.push(Qwen3Entry {

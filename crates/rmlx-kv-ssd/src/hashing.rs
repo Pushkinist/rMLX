@@ -1,4 +1,5 @@
-//! Chained FNV-1a-64 block-digest helpers + the 256-token block constant.
+//! Chained FNV-1a-64 block-digest helpers, the 256-token block constant, and
+//! the one prompt-cache seed definition shared by RAM and disk.
 //!
 //! Migrated from `rmlx_models::prompt_cache` so the SSD modules (`spill`,
 //! `hydrate`, `ssd_tier`) can use them without a back-edge into `rmlx-models`.
@@ -6,6 +7,13 @@
 //! definitions; in-crate `crate::prompt_cache::FNV_OFFSET` / `BLOCK_TOKENS` /
 //! `chained_block_hashes_seeded` call sites in `rmlx-models` resolve via
 //! `pub use rmlx_kv_ssd::*` re-exports in `prompt_cache.rs`.
+//!
+//! [`cache_seed`] lives here, below both consumers, for the same reason: the
+//! RAM prompt cache (in `rmlx-models`) and the SSD hydrate probe (in this
+//! crate) have to seed the same digest stream, and this is the deepest crate
+//! both can call.
+
+use rmlx_kv_quant::KvQuant;
 
 /// Prefix-match block size, in tokens (oMLX-parity).
 ///
@@ -20,6 +28,34 @@ pub const BLOCK_TOKENS: usize = 256;
 pub const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 /// FNV-1a-64 standard prime.
 pub const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// The block-digest seed that a prompt-cache lookup, its matching push, the
+/// SSD spill row and the SSD hydrate probe must all use.
+///
+/// Three things partition the key, and every one of them is a case where reusing
+/// another entry's K/V would be wrong rather than merely unhelpful:
+///
+/// - `model_sig` — **which model produced this K/V.** The prompt cache is one
+///   static per architecture, so two models of the same arch resident at once
+///   (the multi-model registry, or a speculative pair) share it. Without this
+///   term, model B's identical prompt matches model A's slot, the token-id
+///   equality check passes because the tokens *are* equal, and B decodes from
+///   A's K/V and A's first token — wrong output, silently. The SSD tier needs
+///   it for the same reason and one more: `--project` collapses every loaded
+///   model onto one namespace, so the on-disk directory is not a per-model
+///   partition either.
+/// - `layout_key` — the SSD tier's `(arch, n_layers, n_kv_heads, head_dim,
+///   kv_quant)` shape key, or `0` when the tier is OFF. It is a *shape*
+///   identity and carries no model identity, which is why `model_sig` is a
+///   separate term rather than something to fold into it.
+/// - `kv_quant` — the codec the stored K/V is packed under.
+///
+/// One function, in the crate below every caller, so no side can compute the
+/// seed on its own: a push seeded differently from the query is not a bug that
+/// surfaces as a wrong answer, it surfaces as a cache that silently never hits.
+pub fn cache_seed(layout_key: u64, kv_quant: KvQuant, model_sig: u64) -> u64 {
+    FNV_OFFSET ^ layout_key ^ kv_quant.cache_key_salt() ^ model_sig
+}
 
 /// Chained FNV-1a-64 block digests over the full 256-token blocks of `ids`.
 ///
@@ -46,24 +82,23 @@ pub fn chained_block_hashes(ids: &[u32]) -> Vec<u64> {
 ///
 /// ## Mixing function
 ///
-/// The layout-key salt lives at the call site, NOT inside this function:
+/// The salt lives at the call site, NOT inside this function:
 ///
 /// ```text
-/// seed = FNV_OFFSET ^ layout_key
+/// seed    = cache_seed(layout_key, kv_quant, model_sig)
 /// digests = chained_block_hashes_seeded(ids, seed)
 /// ```
 ///
-/// where `layout_key` is a stable u64 hash over
-/// `(arch, n_layers, n_kv_heads, head_dim, kv_quant)` (see
-/// [`crate::ssd_tier::compute_layout_key`]). XOR is the documented mixing
-/// function — simpler than re-keying the FNV prime and keeps the existing
-/// avalanche behaviour intact. When the caller passes the bare `FNV_OFFSET`
-/// (layout-key salt absent), digests collapse to the legacy un-salted stream.
-/// Different layouts produce disjoint chained-digest streams for the
-/// same `ids`, so a prompt cached at one KV layout cannot accidentally collide
-/// with the same prompt cached at another layout. Pairs with the
-/// `(hash, layout_key)` composite PK on the `kv_blocks` SSD index for
-/// defence-in-depth.
+/// Every production caller — RAM push, RAM query, SSD spill key, SSD hydrate
+/// probe — builds that seed with [`cache_seed`] and nothing else. XOR is the
+/// documented mixing function — simpler than re-keying the FNV prime and keeps
+/// the existing avalanche behaviour intact. When the caller passes the bare
+/// `FNV_OFFSET` (no salt at all), digests collapse to the legacy un-salted
+/// stream, which is what the tests and the un-seeded wrapper use. Different
+/// models / layouts / codecs produce disjoint chained-digest streams for the
+/// same `ids`, so a prompt cached under one of them cannot collide with the
+/// same prompt cached under another. Pairs with the `(hash, layout_key)`
+/// composite PK on the `kv_blocks` SSD index for defence-in-depth.
 #[allow(
     clippy::indexing_slicing,
     reason = "loop bounds: b < n_blocks where n_blocks = ids.len() / BLOCK_TOKENS, \

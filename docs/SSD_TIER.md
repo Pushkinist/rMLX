@@ -7,9 +7,12 @@ they can be reloaded on subsequent requests without a full re-prefill.
 > **Crate ownership:** The SSD tier lives in the workspace member crate
 > **`rmlx-kv-ssd`** — `crates/rmlx-kv-ssd/`. It owns the index, spill,
 > hydrate, block-I/O, layout-key salt, the 5 Prometheus hook globals, the
-> `SsdHydrate<E>` trait, and the chained FNV-1a-64 block-digest helpers
+> `SsdHydrate<E>` trait, the chained FNV-1a-64 block-digest helpers
 > (`BLOCK_TOKENS`, `chained_block_hashes`, `chained_block_hashes_seeded`,
-> `FNV_OFFSET`, `FNV_PRIME`). The per-arch `attach_ssd_tier` dispatcher
+> `FNV_OFFSET`, `FNV_PRIME`) and the `cache_seed` those helpers are seeded
+> with — which the RAM prompt cache in `rmlx-models` re-exports rather than
+> redefines, so both tiers hash under one formula. The per-arch
+> `attach_ssd_tier` dispatcher
 > (Gemma4 / Qwen3 / Qwen3.5-MoE) stays in `rmlx-models::ssd_tier` because the
 > arch-specific `SsdHydrate<Entry>` / `SpillSink<Entry>` impls live in
 > `rmlx-models`. Dep edge: `rmlx-models → rmlx-kv-ssd → rmlx-kv-quant`
@@ -254,10 +257,11 @@ for every distinct input tuple. It is **not** weight-dependent: reloading the
 same architecture at the same `kv_quant` from a different snapshot yields the
 same `layout_key` and shares the cache, which is correct.
 
-The key salts the chained block hash stream at the call site:
+The key is one of the three terms of the block-hash seed, built at the call site
+by `rmlx_kv_ssd::hashing::cache_seed`:
 
 ```text
-seed    = FNV_OFFSET ^ layout_key
+seed    = FNV_OFFSET ^ layout_key ^ kv_quant.cache_key_salt() ^ model_sig
 digests = chained_block_hashes_seeded(ids, seed)
 ```
 
@@ -265,9 +269,68 @@ XOR mixing keeps the existing FNV avalanche behaviour intact. Different layouts
 produce disjoint digest streams for the same token sequence, so a block cached
 under one KV layout cannot collide with the same block cached under another.
 
+`cache_seed` is a single function, in `rmlx-kv-ssd` — below both the RAM prompt
+cache in `rmlx-models` and the SSD hydrate probe in `rmlx-kv-ssd` — so neither
+side can define the seed independently. The RAM push, the RAM query, the spill
+key (`SpillJob::hash` is the last digest of the pushed entry) and the hydrate
+probe are four sites that must agree bit for bit; a probe that omits one term is
+not a wrong answer, it is a tier that silently never hits.
+
+**The seed is computed once per request and passed down, not recomputed.**
+`ArchPromptCache::consume` builds it, hands the same `u64` to
+`find_best_prefix` and to `hydrate_from_ssd`, and the hydrator probes the index
+and recomputes the promoted entry's block hashes from that value. The four
+sites therefore share one variable rather than four evaluations that have to
+keep agreeing.
+
+That is a correctness requirement, not tidiness. `SsdHydrator` is installed on
+the **per-architecture** prompt cache and outlives the model that installed it:
+`--max-loaded-models` lets several models of one arch be resident, and
+`attach_ssd_tier` overwrites the single attach slot on each load, so the
+installed hydrator belongs to whichever model attached last. A hydrator that
+remembered a `model_sig` would seed every other resident model's probe with the
+wrong identity — the same silent 0-hit, reintroduced. The same argument applies
+to `kv_quant`: it is per *request* (`kv_quant` in the request body hot-swaps the
+codec), so an attach-time codec would mis-seed every hot-swapped request and
+then reject the rows those requests wrote as header mismatches.
+
+`SsdHydrator` therefore holds only namespace-scoped state — the index, the
+directory, and the `layout_key` stamped on the rows in it — which the spiller
+filling that namespace is installed from the same parameters, so the two always
+agree. `layout_key` is a *shape* key and carries no model identity, and
+`--project` collapses several models onto one namespace directory, so the seed's
+model term is the only thing that keeps two models' blocks apart on disk.
+
 `layout_key` is resolved and logged (as a 16-char hex string, field
 `layout_key`) at `attach_at_load` before the index is opened, so operators can
 correlate log rows with the active layout during debugging.
+
+### Blocks written under an older seed
+
+The key is content-addressed, so changing a seed term does not corrupt anything
+— it re-partitions. Rows written before a term existed are simply digests that
+nothing will ever probe for: still readable, still valid, permanently cold.
+
+They are **not** purged, and deliberately so.
+
+A targeted purge is not expressible: nothing in a `kv_blocks` row distinguishes
+"written under an older seed" from "written for a prompt that has not come back
+yet". A `SCHEMA_VERSION` bump *would* clear them — `wipe_stale_schema_namespaces`
+runs from `install_config` before any `SsdKvIndex::open` and removes any
+namespace whose recorded version is below this binary's, tagged or untagged, so
+`open` then recreates the namespace empty (see
+`wipe_removes_superseded_schema_namespace`). It is rejected for what it costs,
+not because it would not work: it discards every **live** block in the namespace
+along with the cold ones, to reclaim rows that are already first in line for
+reclamation.
+
+That line is the eviction path already in place: cold rows carry the oldest
+`last_used`, and both `startup_maintenance` (at attach) and the spill drain
+thread (after every recorded block) evict oldest-first until the namespace is
+inside `--kv-ssd-cache-gb`. So they are the first thing dropped once the budget
+binds, and until then they cost disk inside a ceiling the operator set — never a
+wrong hit, never a stall. An operator who wants the space back immediately can
+delete `<RMLX_HOME>/cache/kv/<namespace>/`; the tier rebuilds it.
 
 ## Live reconfiguration
 
@@ -285,9 +348,9 @@ orthogonal to the read-only-weights insight that makes codec/ctx hot-swap cheap.
 
 The codec partitioning applied to the **RAM** prompt cache
 (`KvQuant::cache_key_salt()` XOR'd into the block-hash seed) composes correctly
-with `layout_key`: on an SSD-active run the seed mixes both, so RAM slots are
-codec-partitioned even though the SSD tier itself stays single-codec for the
-resident lifetime.
+with `layout_key` and `model_sig`: on an SSD-active run `cache_seed` mixes all
+three, so RAM slots are codec- and model-partitioned even though the SSD tier
+itself stays single-codec for the resident lifetime.
 
 ### What a live *budget* change would take
 
@@ -338,7 +401,9 @@ thread** (the cold path that would otherwise pay a full re-prefill):
 
 ```text
 Phase 1 — SQLite prefix lookup
-    Compute: chained = chained_block_hashes_seeded(prompt_ids, FNV_OFFSET ^ layout_key)
+    Given:   seed  — the caller's `cache_seed(...)`, the same u64 the RAM query ran
+             kv_quant — the request's codec
+    Compute: chained = chained_block_hashes_seeded(prompt_ids, seed)
     Call:    SsdKvIndex::lookup_longest_prefix(chained, layout_key)
     Result:  (block_count, KvBlockRow) or miss → return None
 
@@ -734,6 +799,7 @@ per-arch trait impls in `rmlx-models` (Gemma4 / Qwen3 / Qwen3.5-MoE
 | `SsdTierConfig`, `install_config`, `active`, `compute_layout_key` | already `pub` | `rmlx_kv_ssd::ssd_tier` |
 | `set_ssd_event_recorder`, `set_ssd_{spill_prom,hydrate_prom,bytes_used,evict_total}_hook` | `pub` | `rmlx_kv_ssd::hooks` |
 | `BLOCK_TOKENS`, `FNV_OFFSET`, `FNV_PRIME`, `chained_block_hashes`, `chained_block_hashes_seeded` | `pub(crate)` in `prompt_cache` | `rmlx_kv_ssd::hashing` (pub) |
+| `cache_seed` | `pub(crate)` in `prompt_cache` | `rmlx_kv_ssd::hashing` (pub); `prompt_cache` re-exports it |
 
 The promoted structs (`SpillJob`, `HydratedBlock`) carry an
 `#[allow(clippy::exhaustive_structs, reason = "promoted: …")]`

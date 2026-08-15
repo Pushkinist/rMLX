@@ -175,8 +175,13 @@ impl PromptCacheEntry for Qwen35MoeEntry {
 // ---------------------------------------------------------------------------
 
 impl SsdHydrate<Qwen35MoeEntry> for SsdHydrator {
-    fn hydrate(&self, prompt_ids: &[u32]) -> Result<Option<Qwen35MoeEntry>> {
-        let Some((block, block_hashes)) = self.lookup_seeded(prompt_ids)? else {
+    fn hydrate(
+        &self,
+        prompt_ids: &[u32],
+        seed: u64,
+        kv_quant: KvQuant,
+    ) -> Result<Option<Qwen35MoeEntry>> {
+        let Some((block, block_hashes)) = self.lookup_seeded(prompt_ids, seed, kv_quant)? else {
             return Ok(None);
         };
         let HydratedBlock {
@@ -191,7 +196,7 @@ impl SsdHydrate<Qwen35MoeEntry> for SsdHydrator {
             lin_caches,
             first_id: 0,
             first_piece: String::new(),
-            kv_quant: Some(self.kv_quant()),
+            kv_quant: Some(kv_quant),
             // SSD-hydrated entries store only the block-aligned prefix.
             // The generate loop uses this flag to re-prefill the tail tokens
             // before decoding (HydratedTail path). See `Qwen35MoeEntry::is_ssd_hydrated`.

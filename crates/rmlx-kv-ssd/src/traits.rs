@@ -6,6 +6,7 @@
 //! `pub(crate)` to `pub` to cross the new crate boundary.
 
 use rmlx_core::error::Result;
+use rmlx_kv_quant::KvQuant;
 
 /// Source that reconstructs a prompt-cache entry from the SSD tier
 /// (`.kvb` + [`crate::SsdKvIndex`]) on a RAM-cache miss.
@@ -14,10 +15,19 @@ use rmlx_core::error::Result;
 /// evicted entry, `SsdHydrate` reads one back. Generic over the entry type so
 /// the prompt cache stays arch-agnostic and the source is mockable in tests.
 ///
-/// `hydrate` is given the request's full prompt token IDs. The implementation
-/// queries the index for the longest matching block-hash prefix, reads the
-/// `.kvb`, verifies its `model_id`/`kv_quant` metadata, and reconstructs the
-/// arch entry. It returns:
+/// `hydrate` is given the request's full prompt token IDs, plus the two facts
+/// that identify what the request is asking for: the `seed` the RAM cache is
+/// querying under and the `kv_quant` it is running. **Both are per-request and
+/// must be passed, never read off the source.** A hydrate source is installed
+/// once per arch and outlives the model that installed it — several models of
+/// one architecture can be resident at a time, and the KV codec is
+/// per-request — so any value the source remembers from its own construction
+/// belongs to whichever model attached last, not to the request in hand.
+/// Seeding the probe from such a value is how the tier silently stops hitting.
+///
+/// The implementation queries the index for the longest matching block-hash
+/// prefix, reads the `.kvb`, verifies its `model_id`/`kv_quant` metadata, and
+/// reconstructs the arch entry. It returns:
 /// - `Ok(Some(entry))` — an SSD hit; the cache promotes it into RAM.
 /// - `Ok(None)` — a true SSD miss (no indexed prefix).
 /// - `Err(_)` — never returned by the production impl: corruption
@@ -29,6 +39,7 @@ use rmlx_core::error::Result;
 ///
 /// Must not panic.
 pub trait SsdHydrate<E>: Send {
-    /// Attempt to reconstruct an entry for `prompt_ids` from the SSD tier.
-    fn hydrate(&self, prompt_ids: &[u32]) -> Result<Option<E>>;
+    /// Attempt to reconstruct an entry for `prompt_ids` from the SSD tier
+    /// under the requesting model's `seed` and the request's `kv_quant`.
+    fn hydrate(&self, prompt_ids: &[u32], seed: u64, kv_quant: KvQuant) -> Result<Option<E>>;
 }

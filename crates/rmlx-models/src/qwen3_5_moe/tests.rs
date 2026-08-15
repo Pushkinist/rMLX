@@ -3066,9 +3066,11 @@ fn qwen3_5_moe_consume_engine_migration_golden() {
             if let Some(cache) = guard.as_mut() {
                 let block_hashes = crate::prompt_cache::chained_block_hashes_seeded(
                     key_ids,
-                    crate::prompt_cache::FNV_OFFSET
-                        ^ prompt_cache::active_layout_key()
-                        ^ kv_quant.cache_key_salt(),
+                    crate::prompt_cache::cache_seed(
+                        prompt_cache::active_layout_key(),
+                        kv_quant,
+                        model.model_sig,
+                    ),
                 );
                 cache.push(Qwen35MoeEntry {
                     prompt_token_ids: key_ids.to_vec(),
