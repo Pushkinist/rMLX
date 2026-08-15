@@ -12,7 +12,7 @@
 //! The sibling `rotor_flash_dispatch_tests.rs` is deliberately env-free. This
 //! test is the opposite: it *seeds a QJL-off store, flips the env ON, and asks
 //! the update path which way it goes*. The store must win. Env writes are
-//! serialized on `ROTOR_QJL_ENV_LOCK`.
+//! serialized on the shared test env lock.
 //!
 //! # Mutation contract
 //!
@@ -28,7 +28,7 @@ use crate::quant::KvQuant;
 use crate::rotor_flash_decode_msl::rotor_flash_decode_dispatch_count;
 use crate::rotorquant::n_groups_for;
 use crate::storage::{KvStorage, QuantRotorK3, QuantRotorK4};
-use crate::test_utils::{lcg_data, skip_if_no_gpu_env, ROTOR_QJL_ENV_LOCK};
+use crate::test_utils::{env_lock, lcg_data, skip_if_no_gpu_env};
 use rmlx_mlx::{Array, Device, Dtype};
 
 const MAX_SEQ: i32 = 512;
@@ -97,13 +97,13 @@ fn store_flag_beats_env(quant: KvQuant) {
     let kv_h = 2_i32;
     let head_dim = 128_i32;
 
-    let _guard = ROTOR_QJL_ENV_LOCK.lock().expect("env lock poisoned");
+    let _guard = env_lock();
     // The CLI override shadows the env; if some other test installed it, the env
     // flip below is a no-op and the test cannot prove the store beats the env.
     if crate::rotor_qjl::rotor_qjl_cli_is_set() {
         return;
     }
-    // SAFETY: ROTOR_QJL_ENV_LOCK held — no concurrent env reader/writer.
+    // SAFETY: env lock held — no concurrent env reader/writer.
     unsafe { std::env::set_var("RMLX_ROTOR_QJL", "1") };
     // Precondition: the env must actually read ON, otherwise the mutant (which
     // gates on the env) would also take the GPU branch and survive.
@@ -122,7 +122,7 @@ fn store_flag_beats_env(quant: KvQuant) {
     k_full.eval().expect("k eval");
     v_full.eval().expect("v eval");
 
-    // SAFETY: ROTOR_QJL_ENV_LOCK still held.
+    // SAFETY: env lock still held.
     unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
 
     assert!(
@@ -171,12 +171,12 @@ fn default_reaches_fused_kernel(quant: KvQuant) {
     let device = Device::Gpu;
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
 
-    let _guard = ROTOR_QJL_ENV_LOCK.lock().expect("env lock poisoned");
+    let _guard = env_lock();
     if crate::rotor_qjl::rotor_qjl_cli_is_set() {
         return;
     }
     // Stock defaults: no env override.
-    // SAFETY: ROTOR_QJL_ENV_LOCK held — no concurrent env reader/writer.
+    // SAFETY: env lock held — no concurrent env reader/writer.
     unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
     // The whole point of this test is that the *default* keeps QJL off so the
     // fused path is reachable. Assert the default here so a future re-flip to

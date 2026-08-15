@@ -371,18 +371,25 @@ fn cpu_reference_dequant(
     }
 }
 
-/// Full-prefix correctness of the ring-only decode tail.
+/// Full-prefix correctness once the GPU ring is the store's only copy of K.
 ///
-/// After prefill + N fused decode steps the rotor K store's CPU `blocks` stay
-/// frozen at the prefill prefix — the per-step host download is skipped, so the
-/// decode tail lives only in the GPU ring. `dequant()` must still return the
-/// FULL prefix, rebuilt from the ring, with **no zero-padded gap**. Proven
-/// against a CPU-only reference store fed the identical K tokens.
+/// After prefill + N fused decode steps a rotor K-only store holds **nothing**
+/// on the host: the per-step block download is skipped, and the append releases
+/// the seeded prefill blocks as soon as the ring goes live, so the ring carries
+/// the whole `[0, prefill + steps)` prefix on its own. `dequant()` must still
+/// return the FULL prefix, rebuilt from the ring, with **no zero-padded gap**.
+/// Proven against a CPU-only reference store fed the identical K tokens.
+///
+/// The empty-blocks precondition is what makes the comparison load-bearing: with
+/// a host copy still resident, `dequant()` could pass by reading it and prove
+/// nothing about the ring.
 ///
 /// Mutation check: make `dequant()` decode `self.blocks` directly instead of
-/// `synced_rotor_k_blocks(...)`. It then decodes only the frozen prefill prefix
-/// and the loud length guard fires (`dequant` → `Err`, `.expect` panics — RED),
-/// catching exactly the truncation / zero-pad the ring rebuild prevents.
+/// `synced_rotor_k_blocks(...)`. With no host blocks left it decodes nothing,
+/// falls into the empty-store arm and returns a correctly-sized all-zero buffer
+/// — the length guard is satisfied, and the cosine against the CPU reference
+/// collapses to 0 (RED), catching exactly the zeroed prefix the ring rebuild
+/// prevents.
 #[allow(clippy::expect_used, reason = "test: invariants documented")]
 fn ring_only_tail_dequant_is_full_prefix(quant: KvQuant) {
     let device = Device::Gpu;
@@ -429,14 +436,15 @@ fn ring_only_tail_dequant_is_full_prefix(quant: KvQuant) {
     let full_seq = prefill + steps;
     let full_len = (kv_h * full_seq * head_dim) as usize;
 
-    // Ring-only-tail precondition: blocks froze at the prefill prefix, and the
-    // ring carries the decode tail.
+    // Ring-only precondition: the ring is live and is the store's sole copy of
+    // K — the append released the seeded prefill blocks. Anything left on the
+    // host would let the dequant below pass without touching the ring.
     assert!(ring_live, "ring must be live for the fused decode tail");
     assert_eq!(
         blocks_tokens,
-        (prefill * kv_h) as usize,
-        "CPU blocks must stay frozen at the prefill prefix (ring-only tail); got \
-         {blocks_tokens} tokens, shape[2]={}",
+        0,
+        "CPU blocks must be released once the ring is live (ring is the sole \
+         resident copy); got {blocks_tokens} tokens, shape[2]={}",
         shape.get(2).copied().unwrap_or(0)
     );
     assert_eq!(

@@ -37,12 +37,10 @@ use crate::test_utils::{lcg_data, TEST_SEED};
 /// `qjl_codes` + `qjl_norms` per token.
 #[test]
 fn rotor_k3_qjl_sideband_captured() {
-    let _guard = crate::test_utils::ROTOR_QJL_ENV_LOCK
-        .lock()
-        .expect("env lock poisoned");
+    let _guard = crate::test_utils::env_lock();
     // QJL is off by default; this test exercises the sideband-capture path, so
     // enable it explicitly.
-    // SAFETY: ROTOR_QJL_ENV_LOCK held — no concurrent env reader/writer in this binary.
+    // SAFETY: env lock held — no concurrent env reader/writer in this binary.
     unsafe { std::env::set_var("RMLX_ROTOR_QJL", "1") };
     let head_dim = 128;
     let n_rows = 16;
@@ -61,17 +59,15 @@ fn rotor_k3_qjl_sideband_captured() {
     );
     assert_eq!(blk.qjl_norms.len(), n_rows, "one qjl_norm per token");
 
-    // SAFETY: ROTOR_QJL_ENV_LOCK held.
+    // SAFETY: env lock held.
     unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
 }
 
 /// When the env disables QJL, no sideband bytes are emitted.
 #[test]
 fn rotor_k3_qjl_disabled_emits_no_sideband() {
-    let _guard = crate::test_utils::ROTOR_QJL_ENV_LOCK
-        .lock()
-        .expect("env lock poisoned");
-    // SAFETY: ROTOR_QJL_ENV_LOCK held — no concurrent env reader/writer in this binary.
+    let _guard = crate::test_utils::env_lock();
+    // SAFETY: env lock held — no concurrent env reader/writer in this binary.
     unsafe { std::env::set_var("RMLX_ROTOR_QJL", "0") };
     let head_dim = 128;
     let n_rows = 8;
@@ -92,11 +88,9 @@ fn rotor_k3_qjl_disabled_emits_no_sideband() {
 /// Same parity check on rotor4_k.
 #[test]
 fn rotor_k4_qjl_sideband_captured() {
-    let _guard = crate::test_utils::ROTOR_QJL_ENV_LOCK
-        .lock()
-        .expect("env lock poisoned");
+    let _guard = crate::test_utils::env_lock();
     // QJL is off by default; enable it explicitly for this sideband test.
-    // SAFETY: ROTOR_QJL_ENV_LOCK held — no concurrent env reader/writer in this binary.
+    // SAFETY: env lock held — no concurrent env reader/writer in this binary.
     unsafe { std::env::set_var("RMLX_ROTOR_QJL", "1") };
     let head_dim = 128;
     let n_rows = 8;
@@ -111,6 +105,6 @@ fn rotor_k4_qjl_sideband_captured() {
     assert_eq!(blk.qjl_codes.len(), n_rows * head_dim.div_ceil(8));
     assert_eq!(blk.qjl_norms.len(), n_rows);
 
-    // SAFETY: ROTOR_QJL_ENV_LOCK held.
+    // SAFETY: env lock held.
     unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
 }
