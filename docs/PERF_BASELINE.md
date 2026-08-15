@@ -287,8 +287,9 @@ way past it.
 every base mode, `KvQuant::None` included, so the `none` control on a 36-layer
 dense arch is a 26-bf16 / 10-K8V8 mixture. See `docs/KV_QUANT.md`
 §Layer-adaptive overrides for the mechanism and the measured per-arch ratios.
-Restating this table against true bf16. That denominator is derived, not
-separately measured, but it is checkable: at `S = 31 553 + 128 − 1 = 31 680`
+The table below restates this one against true bf16. That denominator is
+derived, not separately measured, but it is checkable: at
+`S = 31 553 + 128 − 1 = 31 680`
 (the fixture length above, `rmlx bench --max-tokens` default 128) the
 `filled_seq_bytes` identity for a `KvStorage::None` layer gives
 `36 × 4096 B/token × 31 680 = 4 671 406 080`, and adding the 10 promoted
@@ -298,8 +299,15 @@ the byte:
 
 | model | `none` ÷ true bf16 | `k_iso3` ÷ true bf16 | `k_rotor3` ÷ true bf16 |
 |---|---|---|---|
-| Bonsai-8B | **1.144×** | **1.150×** | **1.274×** |
+| Bonsai-8B | **1.144×** (at 32k) | **1.150×** | **1.274×** |
 | gemma-4-e2b | 1.000× | 1.003× | 1.167× |
+
+Bonsai's `none` ÷ bf16 drifts slightly with context, which is why
+`docs/KV_QUANT.md` quotes 1.145× and this table 1.144×: the bf16 term scales
+with filled length while the promoted layers' q8_0 term scales with
+`KV_PAGE_SIZE`-rounded *capacity*, so the ratio is 1.1447 at `S = 3801`,
+1.1435 here at `S = 31 680`, and tends to 1.1432 as the rounding washes out.
+Treat it as 1.14× and read the exact figure at the context you care about.
 
 gemma-4-e2b is unaffected because none of its promoted layers owns a
 quantizable cache — layers 0 and 1 are sliding (bf16 rotating ring regardless
@@ -322,10 +330,13 @@ ms/1k across models instead. Counted from the per-dispatch `trace!` under
 `--log verbose`, the flash-decode kernel fires once per full-attention layer
 per decode step and is handed the full prefix — 26 of 36 layers on Bonsai (the
 first 2 and last 8 are promoted to K8V8), 7 of 35 on e2b. Those 7 e2b
-dispatches read only **3** distinct caches: `num_kv_shared_layers = 20` leaves
-layers 15+ without a cache of their own, so the four later full-attention
-layers attend over the caches of layers 4, 9 and 14. What remains is
-per-KV-token work inside the kernel, not data movement.
+dispatches read only **3** distinct caches. `num_kv_shared_layers = 20` leaves
+layers 15+ without a cache of their own, and `build_previous_kvs`
+(`gemma4/loader.rs`) points each of them at the **last** non-shared layer of
+its attention type — layer 14 for full-attention. So layers 19, 24, 29 and 34
+all attend over layer 14's cache, while layers 4 and 9 serve one dispatch
+each: three caches, seven dispatches, five of them on layer 14. What remains
+is per-KV-token work inside the kernel, not data movement.
 
 Each new codec: invoke `scripts/bench_codec_cell.sh --kv-quant <codec> --model <model>` per cell (3 cells per codec, A.y-excluded skipped), then append to this table.
 

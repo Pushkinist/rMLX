@@ -136,9 +136,11 @@ mutually exclusive.
 > promotes the first 2 and last 8 layers to `K8V8` under *every* base mode,
 > `none` included. Wherever those layers hold a real token-indexed cache the
 > run is a bf16/K8V8 mixture — measured 1.145× true bf16 on Ternary-Bonsai-8B,
-> 1.109× on Qwen3.6-35B-A3B, and 1.000× on gemma-4 e2b/e4b (where the promotion
-> is cancelled by sliding-window and shared-KV layers). Per-arch counts and the
-> byte math: `docs/KV_QUANT.md` § "Layer-adaptive overrides".
+> 1.109× on Qwen3.6-35B-A3B and 1.000× on gemma-4-e2b. gemma-4-e4b is 1.000×
+> by the same layer-structure argument rather than by measurement: its
+> promoted head layers are sliding and its promoted tail is entirely shared-KV,
+> so nothing the promotion touches owns a quantizable cache. Per-arch counts
+> and the byte math: `docs/KV_QUANT.md` § "Layer-adaptive overrides".
 
 > **Per-request override (issue #26).** `--kv-quant` and `--max-ctx` set the
 > **launch defaults**. On a running server, the OpenAI route accepts per-request

@@ -19,8 +19,14 @@
 //! `KvQuant::None` path (removed then restored) is opt-in via `--kv-quant
 //! none` (alias `bf16`), as the closest available comparison against mlx-lm's
 //! bf16-KV champion. It holds a `[B, kv_h, S, D]` bf16 K and V buffer per
-//! layer, grown lazily toward the `--max-ctx` ceiling rather than allocated at
-//! it. Auto-resolver default is unchanged (still K8V8).
+//! layer. On the arches that adopted the lazy ring — gemma4, qwen3,
+//! qwen3_5_moe, qwen3_vl_moe, the ones that call `kv_max_seq_and_ceiling` and
+//! `with_max_seq_ceiling` — that buffer starts small and grows toward the
+//! `--max-ctx` ceiling instead of being allocated at it. laguna, gemma3,
+//! qwen2 and bitnet still construct at the resolved `--max-ctx`
+//! (`max_ctx_override.unwrap_or(KV_MAX_SEQ_DEFAULT)`, no ceiling set), so a
+//! large `--max-ctx` is an eager allocation there. Auto-resolver default is
+//! unchanged (still K8V8).
 //!
 //! `none` is **not** a pure-bf16 control: [`kv_quant_for_layer`] promotes the
 //! boundary layers to `K8V8` under every base mode, `None` included, so on an

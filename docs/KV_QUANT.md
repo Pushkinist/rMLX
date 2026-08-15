@@ -1486,6 +1486,12 @@ same shape — so the "true bf16" column is not an unchecked derivation:
 | gemma-4-e2b (`Gemma4…`) | 12 SWA + 3 global, of 35 | **0** | 31 776 768 | 31 776 768 | **1.000×** |
 | Qwen3.6-35B-A3B (`Qwen3_5Moe…`) | 10 global, of 40 | 2 | 88 215 552 | 79 564 800 | **1.109×** |
 
+The ratios drift a little with context — the bf16 term scales with filled
+length while the promoted layers' q8_0 term scales with `KV_PAGE_SIZE`-rounded
+capacity — so Bonsai reads 1.1447 at the `S = 3801` measured here, 1.1435 at
+32k (`docs/PERF_BASELINE.md`), tending to 1.1432. Treat these as 1.14× and
+1.11×, not as constants.
+
 How each row closes, at cache offset `S = prompt_len + max_tokens - 1`. The
 per-token rates come from `KvCache::resident_bytes`: a `KvStorage::None` layer
 is `filled_seq_bytes` over the two bf16 mirrors, a q8_0 layer adds packed codes

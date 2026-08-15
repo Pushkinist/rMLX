@@ -119,7 +119,7 @@ two are easy to conflate:
 |---|---|---|
 | Prefill attention, `head_dim` 64 or 128, Q not f32 | **yes**, `steel_attention_<dtype>_bq64_…` | MLX's `sdpa_full` takes the NAX branch unless `head_dim == 80` or Q is f32 without TF32 |
 | Prefill attention, `head_dim` 256 or 512 | no | MLX has no fused prefill kernel at either width, NAX or otherwise. See [Head-dim dispatch](#head-dim-dispatch-and-the-unfused-fallback) — that gap is about a missing kernel *shape*, not about NAX |
-| Decode attention, any `head_dim`, any codec | no | `bq64` is a query tile of 64; decode is `q_seq = 1`, and MLX routes `q_seq <= 8` to `sdpa_vector`, which has no NAX variant |
+| Decode attention, any `head_dim`, any codec | no | `bq64` is a query tile of 64, and decode is `q_seq = 1`. At `head_dim` ≤ 256 MLX routes `q_seq <= 8` to `sdpa_vector`, which has no NAX variant; at 512 there is no vector kernel either and decode falls to the composite path. Neither reaches NAX |
 | Our own `.metal` kernels | no | all of them are `q_seq = 1` decode kernels. NAX's one matmul tile shape has an M floor of 16; at `q_seq = 1` the only M available is `heads_per_kv` (4–8 on our models), so the tile can never be more than half filled |
 
 So the bf16 mirror's decode advantage over a quantized codec is bandwidth and
@@ -752,41 +752,68 @@ Gemma-4 is **not** a `head_dim` 256 model end-to-end: only its
 window-bounded layers are 256 wide, and the layers whose `kL` grows with the
 prompt are 512 wide. That distinction decides who actually pays.
 
-**What the fallback costs.** Isolated `mx.fast.scaled_dot_product_attention`,
-mlx 0.31.2, M5 Max, bf16, causal, `q_seq = kv_seq = L`, best-of-5; a repeat run
-of the 8192 cells moved every figure by under 1.5%. A fused kernel present at
-both widths would land near **2.0×** going 128 → 256, because doubling
-`head_dim` doubles the FLOPs:
+**What the fallback costs.** Reproduce with
+[`scripts/sdpa_headdim_bench.py`](../scripts/sdpa_headdim_bench.py), which
+prints the metallib inventory it measured against — **re-run it when the pin
+moves**, because these numbers are only valid for the kernel set above. Below:
+mlx 0.31.2, M5 Max, bf16, causal, `q_seq = kv_seq = L`, best-of-5 after a
+pipeline pre-warm, median of two runs. `L ≥ 8192` reproduced within 6%; the
+`L = 2048` row is launch-bound and is not load-bearing.
 
-| q:kv heads | L | `head_dim` 128 | 256 | 512 | 256 ÷ 128 |
-|---|---|---|---|---|---|
-| 8:1 | 2 048 | 1.42 ms | 2.29 ms | 2.30 ms | 1.61× |
-| 8:1 | 8 192 | 3.04 ms | 17.30 ms | 26.31 ms | **5.69×** |
-| 8:1 | 32 768 | 42.7 ms | 310.6 ms | 473.3 ms | **7.27×** |
-| 32:8 | 2 048 | 0.98 ms | 4.54 ms | 6.90 ms | **4.63×** |
-| 32:8 | 8 192 | 11.06 ms | 71.54 ms | 108.23 ms | **6.47×** |
-| 32:8 | 32 768 | 198.0 ms | 1 308.0 ms | 2 105.6 ms | **6.61×** |
+| q:kv heads | L | `head_dim` 128 | 256 | 512 | 256 ÷ 128 | peak, 256 |
+|---|---|---|---|---|---|---|
+| 8:1 | 2 048 | 0.71 ms | 1.27 ms | 1.73 ms | 1.79× | 99 MB |
+| 8:1 | 8 192 | 3.03 ms | 17.28 ms | 26.17 ms | **5.70×** | 1.25 GB |
+| 8:1 | 32 768 | 44.5 ms | 313.0 ms | 489.9 ms | **7.03×** | 18.7 GB |
+| 32:8 | 2 048 | 1.07 ms | 4.64 ms | 7.00 ms | **4.35×** | 390 MB |
+| 32:8 | 8 192 | 11.9 ms | 72.0 ms | 107.8 ms | **6.06×** | 4.8 GB |
+| 32:8 | 32 768 | 200.1 ms | 1 276.1 ms | 2 142.3 ms | **6.38×** | 71.7 GB |
 
-In achieved throughput: `head_dim` 128 reaches 88–103 TF/s at `L ≥ 8192`,
-`head_dim` 256 sits at 27–32 TF/s — roughly a third, for work that is only
-twice as large.
+A fused kernel present at both widths would land near 2.0×, since doubling
+`head_dim` doubles the FLOPs. Every cell from `L = 2048` up at 32:8, and from
+`L = 8192` up at 8:1, is past 4×. Only the smallest cell is inside the
+"costs little" band, so the gap is a real cost, not a curiosity.
+
+**Why it is more than 2×.** The two paths do not perform the same work, and
+the `causal` section of the harness measures it directly — `causal ÷ unmasked`
+at `L = 8192`:
+
+| `head_dim` | 8:1 | 32:8 | reading |
+|---|---|---|---|
+| 128 (fused) | 0.566 | 0.511 | skips fully-masked tiles — does ~half the rectangle |
+| 256 (composite) | 1.318 | 1.331 | computes the whole rectangle, then pays to build and apply the mask |
+| 512 (composite) | 1.160 | 1.150 | same |
+
+So going 128 → 256 costs 2× for the wider head **and another 2× for losing the
+causal skip** — 4× the arithmetic. Normalising each path by the work it
+actually performs (`2·H·L²·D` fused, `4·H·L²·D` composite), the fused path
+sustains 44–49 TF/s and the composite 28–32 TF/s. That closes the measurement:
+`4 × (46.2 / 30.5) = 6.06×` against 6.06× measured at 32:8 / 8192, and
+`4 × (44.0 / 27.6) = 6.38×` against 6.38× at 32:8 / 32768. The composite path
+is not catastrophically inefficient per FLOP — it is asked to do four times as
+many, and it materialises the score tensor to do them.
+
+Quoting a single dense-equivalent `4·H·L²·D` rate for both would overstate the
+fused path by 2×; the ratios above are convention-free either way.
 
 The 512 column is the control. Both 256 and 512 are unfused, and 512 ÷ 256
-measures 1.00–1.61× — *below* the 2.0× FLOP ideal, which is what a shared
+lands at 1.36–1.68× — *below* the 2.0× FLOP ideal, which is what a shared
 composite path predicts: its fixed `[H, L, L]` score cost does not grow with
 `head_dim`. The cliff is at the 128 → 256 boundary, not "wider heads are
 slower".
 
-Peak memory is the same story told in bytes. At `L = 32768`, 32:8:
-671 MB at `head_dim` 128 against **71.7 GB** at 256 — the materialised score
-tensor is 32 × 32768² × 2 B = 68.7 GB on its own.
+Peak memory is the same story told in bytes: at `L = 32768`, 32:8, 671 MB at
+`head_dim` 128 against **71.7 GB** at 256 — the materialised score tensor is
+32 × 32768² × 2 B = 68.7 GB on its own.
 
 Decode is unaffected in the way that matters: at `q_seq = 1` the score tensor
-is `[H, 1, kL]`, so the composite path has no O(L²) term. Measured at the one
-decode cell that clears this host's ~200 µs dispatch floor (32:8,
-`kL = 32768`), the unfused 512-wide path reads KV at 312 GB/s against the
-256-wide vector kernel's 360 GB/s; every other decode cell was dispatch-bound
-and cannot resolve a kernel-level difference.
+is `[H, 1, kL]`, so the composite path has no O(L²) term. In the only decode
+shape that stays clear of this host's ~200 µs dispatch floor (32:8,
+`kL = 32768`, three runs) the unfused 512-wide path reads KV at ≈315 GB/s
+against the 256-wide vector kernel's ≈355 GB/s — a modest deficit, not a
+cliff. Every other decode cell moved by up to 2.2× run to run and cannot
+resolve a kernel-level difference; the harness prints them all so that stays
+visible rather than being quoted selectively.
 
 **What rMLX actually pays.** Less than the isolated `L = kL` numbers above,
 for two structural reasons:
