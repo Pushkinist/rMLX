@@ -11,7 +11,7 @@
 //! The path is always resolved through `rmlx_core::paths` — never a
 //! hard-coded or CWD-relative string.
 //!
-//! # Schema (v3 — )
+//! # Schema (v3)
 //!
 //! ```text
 //! kv_blocks (
@@ -33,7 +33,8 @@
 //! ```
 //!
 //! `last_used` is microseconds, not seconds, and [`now_stamp_us`] hands out a
-//! strictly increasing value. Eviction orders by that column alone, so a
+//! value that strictly increases within the process (carried across restarts
+//! by [`adopt_persisted_stamps`]). Eviction orders by that column alone, so a
 //! coarse clock made every row touched in the same interval tie and left the
 //! victim to whatever order SQLite happened to yield — the failure mode grows
 //! with request rate, which is when the tier matters most.
@@ -106,10 +107,16 @@ type Result<T> = std::result::Result<T, SsdKvIndexError>;
 ///
 /// - v1 → v2: `layout_key` column + composite PK + the `schema_version` table.
 /// - v2 → v3: `last_used` changed unit from seconds to microseconds. The column
-///   type is unchanged, but a v2 row and a v3 row are three orders of magnitude
-///   apart, so the two must never share a table — a mixed table would report
-///   nonsense to any operator query and leave the v2 rows ordered among
-///   themselves as coarsely as before.
+///   type and the table shape are unchanged; only the stored unit moved, so
+///   v2 rows must not be left to sit beside v3 rows three orders of magnitude
+///   away.
+///
+/// v2 rows are **convertible** — `UPDATE kv_blocks SET last_used = last_used *
+/// 1000000` is the whole migration. They are wiped anyway, and that is a
+/// choice, not a constraint: rMLX is unreleased, the tier is a pure cache
+/// whose worst loss is one re-prefill per block, and carrying migration code
+/// (plus the branch in the wipe pass that has to let a v2 DB through so it can
+/// be converted) buys nothing a warm cache does not rebuild in minutes.
 pub(crate) const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA_PRAGMAS: &str = "
@@ -119,7 +126,7 @@ PRAGMA foreign_keys = ON;
 PRAGMA busy_timeout = 5000;
 ";
 
-pub(crate) const SCHEMA_TABLES: &str = "
+const SCHEMA_TABLES: &str = "
 CREATE TABLE IF NOT EXISTS kv_blocks (
     hash        TEXT    NOT NULL,
     layout_key  INTEGER NOT NULL,
@@ -248,28 +255,29 @@ impl SsdKvIndex {
             // them first would mask a pre-release v1 layout.
             let version = read_schema_version(&conn)?;
             match version {
-                Some(v) if v == SCHEMA_VERSION => {
-                    conn.execute_batch(SCHEMA_INDEXES)?;
-                    Ok(Self { conn })
+                Some(v) if v == SCHEMA_VERSION => conn.execute_batch(SCHEMA_INDEXES)?,
+                Some(v) => {
+                    return Err(SsdKvIndexError::SchemaMismatch {
+                        found: v,
+                        expected: SCHEMA_VERSION,
+                    })
                 }
-                Some(v) => Err(SsdKvIndexError::SchemaMismatch {
-                    found: v,
-                    expected: SCHEMA_VERSION,
-                }),
                 None => {
                     // Pre-release v1 — the cross-namespace wipe in
                     // ssd_tier::install_config should have removed this DB
                     // before we got here.
-                    Err(SsdKvIndexError::SchemaMismatch {
+                    return Err(SsdKvIndexError::SchemaMismatch {
                         found: 1,
                         expected: SCHEMA_VERSION,
-                    })
+                    });
                 }
             }
         } else {
             init_current_schema(&conn)?;
-            Ok(Self { conn })
         }
+
+        adopt_persisted_stamps(&conn)?;
+        Ok(Self { conn })
     }
 
     // ── Read ─────────────────────────────────────────────────────────────────
@@ -748,12 +756,20 @@ pub fn evict_pool_lru_until(kv_root: &Path, global_budget_bytes: u64) -> Result<
 /// version row).
 fn init_current_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA_PRAGMAS)?;
-    conn.execute_batch(SCHEMA_TABLES)?;
-    conn.execute_batch(SCHEMA_INDEXES)?;
-    conn.execute(
+    // The tables and the version row commit together. Another process running
+    // the stale-schema wipe must never see `kv_blocks` without a
+    // `schema_version` row: that reads as version 0, which is "superseded", and
+    // the pass would delete a namespace this call is still creating.
+    // `PRAGMA journal_mode` cannot run inside a transaction, so the pragmas
+    // stay outside it.
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(SCHEMA_TABLES)?;
+    tx.execute_batch(SCHEMA_INDEXES)?;
+    tx.execute(
         "INSERT OR IGNORE INTO schema_version (version) VALUES (?1)",
         params![SCHEMA_VERSION],
     )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -792,36 +808,69 @@ pub fn hash_to_hex(digest: u64) -> String {
     format!("{digest:016x}")
 }
 
-/// Highest stamp this process has issued. Guards the two ways a raw wall clock
-/// stops being a usable LRU key: two writes inside the same microsecond, and a
-/// clock stepped backwards by NTP.
+/// Highest stamp this process has issued, seeded on every index open from what
+/// is already on disk ([`adopt_persisted_stamps`]). Guards the two ways a raw
+/// wall clock stops being a usable LRU key: two writes inside the same
+/// microsecond, and a clock that moved backwards.
 static LAST_STAMP_US: AtomicU64 = AtomicU64::new(0);
 
-/// Strictly increasing microseconds since the unix epoch.
+/// Microseconds since the unix epoch, strictly increasing **within this
+/// process** (up to the u64 microsecond epoch, around the year 586524, past
+/// which it saturates).
 ///
 /// Eviction orders rows by this value alone, so equal values put the victim
 /// choice back on whatever order SQLite happens to yield. Clamping against the
 /// last stamp issued makes the sequence strictly increasing across every thread
-/// in the process — which is a total order, so ties do not arise and no
-/// tiebreak column is needed.
+/// here, and [`adopt_persisted_stamps`] carries that across a restart.
+///
+/// It is **not** a total order over a namespace shared by two processes: the
+/// Metal claim file is keyed by port, so two servers on different ports can
+/// each write the same pool, and two writes in the same microsecond from
+/// different processes still tie. The pool sweep's `(namespace, hash)`
+/// tiebreak is what keeps that case deterministic.
 ///
 /// It stays a wall-clock value rather than a plain counter because the
 /// cross-namespace sweep merges rows from independent namespace databases and
 /// has to compare them; a per-database counter carries no meaning outside its
-/// own database, and a counter alone would not survive a restart.
+/// own database.
 fn now_stamp_us() -> u64 {
     let wall = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_micros() as u64;
-    let mut issued = wall;
-    // The closure never returns None, so `fetch_update` cannot fail; `issued`
-    // holds the value from the invocation whose compare-exchange won.
-    let _ = LAST_STAMP_US.fetch_update(Ordering::AcqRel, Ordering::Acquire, |prev| {
-        issued = wall.max(prev.saturating_add(1));
-        Some(issued)
-    });
-    issued
+    let mut prev = LAST_STAMP_US.load(Ordering::Acquire);
+    loop {
+        let next = wall.max(prev.saturating_add(1));
+        match LAST_STAMP_US.compare_exchange_weak(prev, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return next,
+            Err(observed) => prev = observed,
+        }
+    }
+}
+
+/// Raise [`LAST_STAMP_US`] above every stamp already stored in `conn`.
+///
+/// The clamp is process state and starts at zero, so on its own it does not
+/// survive a restart. If the wall clock moved backwards while the process was
+/// down — an NTP step, a manual date change, RTC drift across sleep — every
+/// block written after the restart would stamp *below* the rows already on
+/// disk and be evicted first. That inversion persists for as long as the clock
+/// lags, which is worse than the same-second tie it replaced.
+///
+/// Reading the persisted maximum on open also picks up rows another process
+/// wrote, so two servers sharing a pool converge on each other's stamps at
+/// every open instead of drifting apart.
+///
+/// One indexed `MAX(last_used)` per open — the `kv_blocks_last_used` index
+/// makes it a single b-tree descent, not a scan.
+fn adopt_persisted_stamps(conn: &Connection) -> Result<()> {
+    let max_seen: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(last_used), 0) FROM kv_blocks",
+        [],
+        |r| r.get(0),
+    )?;
+    LAST_STAMP_US.fetch_max(max_seen.max(0) as u64, Ordering::AcqRel);
+    Ok(())
 }
 
 fn row_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<KvBlockRow> {

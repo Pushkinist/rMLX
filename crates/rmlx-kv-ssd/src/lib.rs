@@ -11,7 +11,7 @@
 //! - [`spill`] — `SsdSpiller` + `SpillJob` + bounded-channel drain thread.
 //! - [`hydrate`] — `SsdHydrator` for on-demand RAM-miss reload.
 //! - [`ssd_tier`] — `install_config`, `attach_at_load`, `compute_layout_key`,
-//!   pre-release v1 wipe.
+//!   stale-schema namespace wipe.
 //! - [`hooks`] — process-global Prometheus hook setters + SSD event recorder.
 //! - [`traits::SsdHydrate`] — single trait arch entries implement; bridges the
 //!   prompt cache to the SSD hydrator.

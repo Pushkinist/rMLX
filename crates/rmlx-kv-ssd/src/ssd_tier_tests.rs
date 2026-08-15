@@ -114,18 +114,40 @@ fn seed_current_schema_namespace(kv_root: &Path, ns: &str) -> std::path::PathBuf
     ns_dir
 }
 
-/// Seed a namespace holding the current table shape but tagged with an
-/// explicit `schema_version` of `version`, plus a dummy `.kvb`.
+/// Seed a namespace at the **v2** table shape, tagged with an explicit
+/// `schema_version` of `version`, plus a dummy `.kvb`.
+///
+/// The DDL is written out here rather than reused from the production
+/// constant, the same way `seed_v1_namespace` does: a migration fixture has to
+/// pin the historical shape it claims to be, or a later schema bump silently
+/// turns it into a test of the current shape wearing an old version number.
+/// v2 and v3 differ only in the unit stored in `last_used`, so this is also
+/// what a real v2 file looks like.
 #[allow(
     clippy::unwrap_used,
-    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    reason = "fixture setup under a temp dir this test owns; a failure is a broken fixture, not a condition under test"
 )]
 fn seed_namespace_at_version(kv_root: &Path, ns: &str, version: i64) -> std::path::PathBuf {
     let ns_dir = kv_root.join(ns);
     std::fs::create_dir_all(&ns_dir).unwrap();
     std::fs::write(ns_dir.join("dummy.kvb"), b"placeholder").unwrap();
     let conn = rusqlite::Connection::open(ns_dir.join("index.db")).unwrap();
-    conn.execute_batch(crate::ssd_index::SCHEMA_TABLES).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE kv_blocks (
+            hash        TEXT    NOT NULL,
+            layout_key  INTEGER NOT NULL,
+            path        TEXT    NOT NULL,
+            model_id    TEXT    NOT NULL,
+            kv_quant    TEXT    NOT NULL,
+            byte_size   INTEGER NOT NULL,
+            last_used   INTEGER NOT NULL,
+            PRIMARY KEY (hash, layout_key)
+        );
+        CREATE TABLE schema_version (
+            version INTEGER PRIMARY KEY NOT NULL
+        );",
+    )
+    .unwrap();
     conn.execute(
         "INSERT INTO schema_version (version) VALUES (?1)",
         rusqlite::params![version],
@@ -168,13 +190,14 @@ fn wipe_removes_pre_release_v1_namespace() {
 /// changing the table shape, so a v2 DB opens cleanly at the SQL level and its
 /// rows would silently mix two units three orders of magnitude apart.
 ///
-/// Leaving it in place is worse than a wipe: `SsdKvIndex::open` rejects the
-/// version, so the namespace is disabled for the run and its `.kvb` bytes are
-/// stranded with nothing able to reclaim them.
+/// Left in place it is dead weight: `SsdKvIndex::open` rejects the version, so
+/// the namespace is disabled for the run and its `.kvb` bytes sit there with
+/// nothing able to reclaim them. Only versions this binary supersedes are
+/// wiped — see `wipe_keeps_a_namespace_from_a_newer_binary`.
 #[test]
 #[allow(
     clippy::unwrap_used,
-    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    reason = "fixture setup under a temp dir this test owns; a failure is a broken fixture, not a condition under test"
 )]
 fn wipe_removes_superseded_schema_namespace() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -191,6 +214,121 @@ fn wipe_removes_superseded_schema_namespace() {
     assert!(
         current.exists(),
         "current-schema namespace must survive the same pass"
+    );
+}
+
+/// A namespace written by a **newer** binary must survive. Two rMLX builds on
+/// one machine at different schema versions is the ordinary case here (a
+/// tap-installed release beside a dev build), and wiping forward means the
+/// older binary silently destroys the newer one's whole KV pool on every
+/// alternate boot. Stranded bytes are a reclamation problem; they do not
+/// license deleting a cache this binary simply cannot read.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "fixture setup under a temp dir this test owns; a failure is a broken fixture, not a condition under test"
+)]
+fn wipe_keeps_a_namespace_from_a_newer_binary() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let kv_root = tmp.path().to_path_buf();
+    let newer = seed_namespace_at_version(
+        &kv_root,
+        "from-the-future",
+        crate::ssd_index::SCHEMA_VERSION + 1,
+    );
+
+    wipe_stale_schema_namespaces(&kv_root);
+
+    assert!(
+        newer.exists(),
+        "a namespace at a newer schema must be left for the binary that wrote it"
+    );
+    assert!(
+        newer.join("index.db").exists(),
+        "its index must be intact, not merely its directory"
+    );
+}
+
+/// Schema creation must be atomic. `SCHEMA_TABLES` creates `kv_blocks` and
+/// `schema_version`; the version *row* lands later. A concurrent
+/// `wipe_stale_schema_namespaces` that reads the DB in between sees a
+/// `kv_blocks` table and an empty `schema_version`, which
+/// `read_schema_version` reports as version 0 — stale — and the pass deletes a
+/// namespace another process is in the middle of creating.
+///
+/// The property is that the half-built state is never observable from another
+/// connection, which SQLite guarantees once the three steps share one
+/// transaction.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "temp-dir SQLite fixtures created by this test; a failure is a broken fixture, not a condition under test"
+)]
+#[allow(
+    clippy::expect_used,
+    reason = "thread join: a panic in the worker is a test failure and must surface, not be swallowed"
+)]
+fn schema_init_never_exposes_tables_without_their_version_row() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    const ROUNDS: usize = 60;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    let observed_half_built = Arc::new(AtomicU64::new(0));
+    let rounds_run = Arc::new(AtomicU64::new(0));
+
+    let watcher = {
+        let (root, observed, rounds_run) = (
+            root.clone(),
+            Arc::clone(&observed_half_built),
+            Arc::clone(&rounds_run),
+        );
+        std::thread::spawn(move || {
+            while rounds_run.load(Ordering::Acquire) < ROUNDS as u64 {
+                for i in 0..ROUNDS {
+                    let db = root.join(format!("ns{i}")).join("index.db");
+                    if !db.exists() {
+                        continue;
+                    }
+                    let Ok(conn) = rusqlite::Connection::open(&db) else {
+                        continue;
+                    };
+                    let has_blocks = conn
+                        .query_row(
+                            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='kv_blocks'",
+                            [],
+                            |_| Ok(true),
+                        )
+                        .unwrap_or(false);
+                    if !has_blocks {
+                        continue;
+                    }
+                    // Exactly what `is_stale_schema` asks. Version 0 means the
+                    // table exists but carries no row yet.
+                    if matches!(crate::ssd_index::read_schema_version(&conn), Ok(Some(0))) {
+                        observed.fetch_add(1, Ordering::AcqRel);
+                    }
+                }
+                std::thread::yield_now();
+            }
+        })
+    };
+
+    for i in 0..ROUNDS {
+        let dir = root.join(format!("ns{i}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _idx = SsdKvIndex::open_at(&dir.join("index.db")).unwrap();
+        rounds_run.fetch_add(1, Ordering::AcqRel);
+    }
+    watcher.join().expect("watcher thread panicked");
+
+    assert_eq!(
+        observed_half_built.load(Ordering::Acquire),
+        0,
+        "another process observed kv_blocks without its schema_version row; the \
+         wipe pass would have deleted a namespace mid-creation"
     );
 }
 

@@ -91,11 +91,13 @@ fields zero → tier OFF; the `OnceLock` stores `None`.
 
 At startup, `install_config` runs two operations before any model loads:
 
-1. **Pre-release schema wipe** — scans every `<RMLX_HOME>/cache/kv/<ns>/`
-   directory. If `index.db` holds a `kv_blocks` table at any `schema_version`
-   other than the current one (a missing `schema_version` table reads as the v1
-   layout), the entire namespace directory is removed (`fs::remove_dir_all`)
-   and a `ssd_cache_pre_release_wipe` tracing event records the dropped bytes.
+1. **Stale-schema wipe** — scans every `<RMLX_HOME>/cache/kv/<ns>/` directory.
+   If `index.db` holds a `kv_blocks` table at a `schema_version` this binary
+   supersedes (a missing `schema_version` table reads as the v1 layout), the
+   entire namespace directory is removed (`fs::remove_dir_all`) and a
+   `ssd_cache_pre_release_wipe` tracing event records the dropped bytes plus
+   the version each namespace was found at. A **newer** version is left in
+   place and warned about instead (see "Namespaces from a newer binary").
    Idempotent: a clean boot at the current schema is a no-op. A directory with
    no `kv_blocks` table is never touched.
 
@@ -131,14 +133,12 @@ schema_version (
 )
 ```
 
-### last_used is the LRU total order
+### last_used is the LRU ordering key
 
-Eviction sorts on `last_used` and nothing else, so the column has to be a
-**total order over accesses**, not just an approximate one. `record` and
-`touch` stamp it from `ssd_index::now_stamp_us`, which reads the wall clock in
-microseconds and clamps the result above the highest value the process has
-already issued. That covers the two ways a raw clock stops being usable here:
-several writes inside one microsecond, and a clock stepped backwards by NTP.
+Eviction sorts on `last_used` and nothing else, so the column has to order
+accesses, not merely approximate them. `record` and `touch` stamp it from
+`ssd_index::now_stamp_us`, which reads the wall clock in microseconds and
+clamps the result above the highest value **this process** has issued.
 
 Seconds do not work. Under any realistic request rate many blocks land in the
 same second, `ORDER BY last_used ASC` has no tiebreak, and the victim becomes
@@ -147,14 +147,31 @@ discarded ahead of one used 100 ms ago, so the tier can throw away exactly the
 prefix it is about to be asked for. The degradation toward random replacement
 grows with request rate, i.e. it is worst when the tier matters most.
 
-It stays a wall-clock value rather than a plain counter for two reasons: the
+It stays a wall-clock value rather than a plain counter because the
 cross-namespace sweep merges rows from independent namespace databases and has
-to compare them (a per-database counter means nothing outside its own
-database), and the ordering has to survive a restart.
+to compare them; a per-database counter means nothing outside its own database.
 
-Because the stamp source is already a total order, no tiebreak column is
-needed and the `kv_blocks_last_used` index stays single-column — the index that
-keeps eviction from sorting the whole table.
+**Durability across restarts.** The clamp is process state and starts at zero,
+so `SsdKvIndex::open_at` seeds it from `MAX(last_used)` in the namespace it is
+opening (`adopt_persisted_stamps`, one indexed b-tree descent). Without that,
+a restart that follows a backwards clock step — NTP correction, a manual date
+change, RTC drift across sleep — writes blocks that sort *below* every row
+already on disk and evicts the newest data first, for as long as the clock
+lags. That inversion is persistent, and therefore worse than the same-second
+tie it replaced.
+
+**Scope: one process.** The stamps are a total order within a server, not
+across two. The Metal claim file is keyed by port (`/tmp/rmlx.<port>.claim`),
+so two `rmlx serve` instances on different ports each run `install_config` and
+can write the same pool; two writes landing in the same microsecond from
+different processes still tie. Seeding the clamp at every open narrows the
+window (each open adopts the other's stamps) but does not close it, and
+`evict_lru_until`'s `ORDER BY last_used ASC` has no tiebreak. The pool sweep's
+`(namespace, hash)` tiebreak is what keeps *that* path deterministic.
+
+No tiebreak column was added, so the `kv_blocks_last_used` index stays
+single-column — that is the index that keeps eviction from sorting the whole
+table.
 
 ### Composite Primary Key
 
@@ -176,7 +193,7 @@ behaviour — `layout_key` is weight-independent on purpose.
 
 - File absent → creates the current schema, inserts `schema_version = 3`.
 - File present, `schema_version` table missing → `SchemaMismatch` (pre-release v1 DB; should have been wiped by `install_config`).
-- File present, `schema_version != 3` → `SchemaMismatch` (a schema this binary cannot interpret).
+- File present, `schema_version != 3` → `SchemaMismatch` (a schema this binary cannot interpret; older ones are wiped by `install_config` first, newer ones are deliberately left in place).
 - File present, `schema_version == 3` → open succeeds.
 
 ### Migration
@@ -190,17 +207,31 @@ cost of a wipe is one re-prefill per dropped block.
 | v1 (no `schema_version` table, `hash` is the sole PK) | `layout_key` column + composite PK + `schema_version` table | Namespace dir removed at startup |
 | v2 | `last_used` unit: seconds → microseconds | Namespace dir removed at startup |
 
-`install_config` removes the entire namespace directory for any `index.db`
-whose version is not the current one, before any `SsdKvIndex::open` call runs
-in-process. A v2 table could not simply be reused: the shape is identical, so
-new microsecond rows and old second rows would coexist three orders of
-magnitude apart, reporting nonsense to any operator query and leaving the old
-rows as coarsely ordered among themselves as before.
+`install_config` removes the entire namespace directory for any `index.db` at a
+version this binary **supersedes**, before any `SsdKvIndex::open` call runs
+in-process.
 
-The mismatch is wiped in **either** direction, not only for older versions. A
-namespace this binary cannot read has exactly two possible fates — reclaim the
-bytes, or strand them while `SsdKvIndex::open` disables the namespace for the
-run — and nothing else reclaims a stranded namespace.
+The v2 case is a deliberate choice, not a forced one. The table shape did not
+change, so the rows are convertible in a single statement (`UPDATE kv_blocks
+SET last_used = last_used * 1000000`). They are wiped anyway because rMLX is
+pre-release and carrying migration code — plus the branch in the wipe pass that
+would have to let a v2 DB through to be converted — buys nothing that a warm
+cache does not rebuild in minutes. What is *not* an option is leaving v2 rows
+in place unconverted: they would sit three orders of magnitude below every new
+row and be evicted first regardless of use.
+
+### Namespaces from a newer binary
+
+A namespace at a version **newer** than this binary's is left alone and
+`warn!`ed (`event = "ssd_cache_newer_schema_skipped"`, with `found_version` and
+`expected_version`). Two rMLX builds at different schema versions on one
+machine is ordinary — a tap-installed release beside a dev build — and wiping
+forward would have the older binary destroy the newer one's whole pool on every
+alternate boot. This build cannot use such a namespace; reclaiming its bytes is
+an operator action, and the warning names the directory.
+
+A directory whose `index.db` has no `kv_blocks` table, or cannot be read at
+all, is never touched.
 
 ---
 
@@ -450,9 +481,9 @@ Algorithm:
 
 2. If pool_bytes <= global_budget_bytes: return EvictionReport (no-op).
 
-3. Sort merged list ascending by last_used (oldest first; the namespace + hash
-   tie-break is dead weight now that stamps are a total order, and is kept only
-   to make the sort itself deterministic).
+3. Sort merged list ascending by last_used (oldest first, tie-break by
+   namespace + hash — the stamp source only totally orders one process, so this
+   is what keeps the victim deterministic when two servers share the pool).
 
 4. Walk oldest-first, accumulate evictions until running_total <= global_budget_bytes.
 
@@ -621,7 +652,7 @@ is a startup error (exit 2).
 **Startup sequence (per serve invocation)**
 
 1. `install_config` is called once before any model loads.
-2. Pre-release v1 namespace wipe runs across all `<RMLX_HOME>/cache/kv/` dirs.
+2. Stale-schema namespace wipe runs across all `<RMLX_HOME>/cache/kv/` dirs.
 3. If `global_budget_bytes > 0`, cross-namespace LRU runs (`evict_pool_lru_until`).
 4. For each model loaded: `attach_at_load` → per-namespace startup maintenance
    (prune missing blocks, evict to per-namespace budget), then spiller +

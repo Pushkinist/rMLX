@@ -27,16 +27,21 @@
 //! still collide on `layout_key` and therefore share their cache, which is the
 //! intended behaviour — `layout_key` is weight-independent on purpose.
 //!
-//! ## Pre-release schema wipe
+//! ## Stale-schema wipe
 //!
 //! rMLX is unreleased, so the index schema advances by wiping rather than
 //! migrating. [`install_config`] walks every `<RMLX_HOME>/cache/kv/<ns>/`
 //! namespace BEFORE any [`SsdKvIndex::open`] runs: if `<ns>/index.db` holds a
-//! `kv_blocks` table at any schema version other than the current one (a
-//! missing `schema_version` table being the pre-release v1 layout), the ENTIRE
+//! `kv_blocks` table at a schema version this binary **supersedes** (a missing
+//! `schema_version` table being the pre-release v1 layout), the ENTIRE
 //! namespace dir is removed (`fs::remove_dir_all`) and dropped bytes are logged
 //! with an `ssd_cache_pre_release_wipe` event. The pass is idempotent — a
 //! second boot at the current schema is a no-op (dropped_bytes=0).
+//!
+//! A namespace at a **newer** version is left in place and `warn!`ed: two rMLX
+//! builds at different schema versions on one machine is ordinary, and wiping
+//! forward would let the older one destroy the newer one's pool on every
+//! alternate boot.
 
 use std::borrow::Cow;
 use std::path::Path;
@@ -424,12 +429,20 @@ pub(crate) fn enforce_namespace_budget(
     evict_count
 }
 
-/// pre-release schema wipe: walk every namespace under `kv_root` and
-/// remove any whose `index.db` is not at the current schema version.
+/// Stale-schema wipe: walk every namespace under `kv_root` and remove any
+/// whose `index.db` is at a schema version this binary supersedes.
+///
+/// A namespace at a **newer** version is left alone and `warn!`ed. Two rMLX
+/// builds on one machine at different schema versions is ordinary (a
+/// tap-installed release beside a dev build); wiping forward would have the
+/// older binary destroy the newer one's whole pool on every alternate boot.
+/// Reclaiming those bytes is a garbage-collection problem, and the operator
+/// gets the namespace name and version to act on.
 ///
 /// Idempotent — on a clean boot every namespace is skipped, dropped_bytes
 /// is 0, and no `fs::remove_dir_all` runs. Emits a single
-/// `ssd_cache_pre_release_wipe` event listing the removed namespaces.
+/// `ssd_cache_pre_release_wipe` event listing the removed namespaces with the
+/// version each was found at.
 ///
 /// Best-effort: I/O errors on individual entries are `warn!`ed and the walk
 /// continues. Public only for the `cfg(test)` harness that exercises the wipe
@@ -456,7 +469,7 @@ fn wipe_stale_schema_namespaces(kv_root: &Path) {
         }
     };
 
-    let mut wiped_namespaces: Vec<String> = Vec::new();
+    let mut wiped_namespaces: Vec<(String, i64)> = Vec::new();
     let mut total_dropped_bytes: u64 = 0;
 
     for entry in entries.flatten() {
@@ -468,20 +481,35 @@ fn wipe_stale_schema_namespaces(kv_root: &Path) {
         if !db_path.exists() {
             continue; // empty namespace dir — nothing to migrate
         }
-        if !is_stale_schema(&db_path) {
-            continue;
-        }
-
-        let dropped = dir_size_bytes(&ns_path);
+        let Some(found) = namespace_schema_version(&db_path) else {
+            continue; // not a KV index, or unreadable — never ours to remove
+        };
         let ns_name = ns_path
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("?")
             .to_string();
 
+        if found > crate::ssd_index::SCHEMA_VERSION {
+            tracing::warn!(
+                event = "ssd_cache_newer_schema_skipped",
+                namespace = %ns_name,
+                found_version = found,
+                expected_version = crate::ssd_index::SCHEMA_VERSION,
+                "namespace was written by a newer rMLX; leaving it for that \
+                 binary. This build cannot use it — remove the directory by \
+                 hand to reclaim the space."
+            );
+            continue;
+        }
+        if found == crate::ssd_index::SCHEMA_VERSION {
+            continue;
+        }
+
+        let dropped = dir_size_bytes(&ns_path);
         match std::fs::remove_dir_all(&ns_path) {
             Ok(()) => {
-                wiped_namespaces.push(ns_name);
+                wiped_namespaces.push((ns_name, found));
                 total_dropped_bytes += dropped;
             }
             Err(e) => tracing::warn!(
@@ -495,8 +523,9 @@ fn wipe_stale_schema_namespaces(kv_root: &Path) {
     if wiped_namespaces.is_empty() {
         tracing::debug!(
             event = "ssd_cache_pre_release_wipe",
-            namespaces = ?Vec::<String>::new(),
+            namespaces = ?Vec::<(String, i64)>::new(),
             dropped_bytes = 0u64,
+            expected_version = crate::ssd_index::SCHEMA_VERSION,
             "ssd-cache wipe pass — nothing to drop"
         );
     } else {
@@ -504,36 +533,34 @@ fn wipe_stale_schema_namespaces(kv_root: &Path) {
             event = "ssd_cache_pre_release_wipe",
             namespaces = ?wiped_namespaces,
             dropped_bytes = total_dropped_bytes,
-            reason = "pre-release schema upgrade",
-            "dropped pre-release v1 namespaces"
+            expected_version = crate::ssd_index::SCHEMA_VERSION,
+            reason = "index schema superseded",
+            "dropped namespaces at a superseded index schema"
         );
     }
 }
 
-/// True iff `index.db` is a SQLite file holding a `kv_blocks` table whose
-/// schema version is not the one this binary writes. A missing
-/// `schema_version` table reads as the pre-release v1 layout.
+/// The `kv_blocks` schema version `index.db` advertises, or `None` when the
+/// file is not one of our KV indexes.
 ///
-/// Any error opening / inspecting the file is treated as "leave it alone", as
-/// is a file with no `kv_blocks` table at all — this helper must never wipe a
-/// DB it does not recognise as a KV index.
+/// `Some(1)` is the pre-release layout (a `kv_blocks` table and no
+/// `schema_version` table). `None` covers a file that cannot be opened, has no
+/// `kv_blocks` table, or whose version cannot be read — the caller removes
+/// directories, so anything unrecognised must be left alone.
 ///
-/// Version mismatch in either direction is wiped, not just an older one. The
-/// tier is a pure cache with no source-of-truth content, so a binary that
-/// cannot read a namespace has exactly two options: reclaim the bytes, or
-/// strand them and disable the namespace for that run — the latter is what a
-/// downgrade used to do, leaving the directory on disk with nothing able to
-/// reclaim it.
+/// Returning the version rather than a stale/not-stale verdict keeps the
+/// policy (wipe older, warn on newer) at the call site, where the log event
+/// that reports it also lives.
 #[allow(
     clippy::manual_let_else,
     reason = "early-return on Err(_) is cleaner here: the connection is consumed \
               in a separate query_row call, so the let-else form would need to \
               restructure non-trivially around the borrow"
 )]
-fn is_stale_schema(db_path: &Path) -> bool {
+fn namespace_schema_version(db_path: &Path) -> Option<i64> {
     let conn = match rusqlite::Connection::open(db_path) {
         Ok(c) => c,
-        Err(_) => return false,
+        Err(_) => return None,
     };
     let has_kv_blocks: bool = conn
         .query_row(
@@ -543,13 +570,12 @@ fn is_stale_schema(db_path: &Path) -> bool {
         )
         .unwrap_or(false);
     if !has_kv_blocks {
-        return false;
+        return None;
     }
-    // Absent schema_version table ⇒ pre-release v1.
     match crate::ssd_index::read_schema_version(&conn) {
-        Ok(Some(v)) => v != crate::ssd_index::SCHEMA_VERSION,
-        Ok(None) => true,
-        Err(_) => false,
+        Ok(Some(v)) => Some(v),
+        Ok(None) => Some(1), // pre-release v1: no schema_version table
+        Err(_) => None,
     }
 }
 

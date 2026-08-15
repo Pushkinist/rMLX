@@ -157,7 +157,7 @@ fn now_stamp_us_is_strictly_increasing() {
 #[test]
 #[allow(
     clippy::unwrap_used,
-    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    reason = "every unwrap is on an in-memory SQLite index this test just opened; a failure is a broken fixture and must abort rather than be reported as a passing eviction"
 )]
 fn evict_lru_picks_the_least_recently_used_within_one_second() {
     let idx = open();
@@ -210,11 +210,11 @@ fn evict_lru_picks_the_least_recently_used_within_one_second() {
 #[test]
 #[allow(
     clippy::unwrap_used,
-    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    reason = "temp-dir SQLite opens and writes from the worker threads; a failure inside a worker is a broken fixture and must abort that thread so the join surfaces it"
 )]
 #[allow(
     clippy::expect_used,
-    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+    reason = "thread join plus lookups of rows the workers just wrote; a missing row or a panicked worker is a test failure and must surface rather than be swallowed"
 )]
 fn concurrent_touches_get_distinct_ordered_stamps() {
     use std::sync::{Arc, Barrier};
@@ -289,6 +289,75 @@ fn concurrent_touches_get_distinct_ordered_stamps() {
         }
     }
     assert_eq!(seen.len(), THREADS * PER_THREAD);
+}
+
+/// A clamp that only remembers what *this* process issued is not durable. A
+/// restart reloads it at zero, so if the wall clock moved backwards while the
+/// process was down (NTP step, manual date change, RTC drift across sleep)
+/// every freshly written block stamps *below* the rows already on disk and
+/// becomes the first eviction victim. That inversion persists for as long as
+/// the clock lags — strictly worse than the same-second tie, which at least
+/// resolved itself a second later.
+///
+/// Persisting rows stamped ahead of the current clock and then opening the
+/// index fresh is exactly what a restart after a backwards step looks like
+/// from the index's point of view.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "fixture setup on a temp-dir SQLite DB this test just created; a failure here is a broken fixture and should abort the test"
+)]
+#[allow(
+    clippy::expect_used,
+    reason = "the row was inserted a few lines above, so its absence is a broken fixture rather than a condition under test"
+)]
+fn a_fresh_open_orders_new_blocks_above_rows_written_before_a_clock_step() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("index.db");
+    // 10 s beyond the stamp source's current position, i.e. the clock has since
+    // stepped back by 10 s relative to what is already persisted.
+    let ahead = now_stamp_us() + 10_000_000;
+    {
+        let idx = SsdKvIndex::open_at(&db).unwrap();
+        idx.conn
+            .execute(
+                "INSERT INTO kv_blocks
+                 (hash, layout_key, path, model_id, kv_quant, byte_size, last_used)
+                 VALUES ('before', ?1, '/tmp/before.kvb', 'm', 'k', 1000, ?2)",
+                params![LK_A as i64, ahead as i64],
+            )
+            .unwrap();
+    }
+
+    // The restart.
+    let idx = SsdKvIndex::open_at(&db).unwrap();
+    idx.record(
+        "after",
+        LK_A,
+        &PathBuf::from("/tmp/after.kvb"),
+        "m",
+        "k",
+        1000,
+    )
+    .unwrap();
+
+    let before = idx.lookup("before", LK_A).unwrap().expect("seeded row");
+    let after = idx.lookup("after", LK_A).unwrap().expect("recorded row");
+    assert!(
+        after.last_used > before.last_used,
+        "a block written after the restart carries stamp {} but the row already \
+         on disk carries {}; the newer block would be evicted first",
+        after.last_used,
+        before.last_used
+    );
+
+    // The evictor has to agree, not just the raw column.
+    let evicted = idx.evict_lru_until(1000).unwrap();
+    assert_eq!(
+        evicted.paths,
+        vec![PathBuf::from("/tmp/before.kvb")],
+        "eviction must take the older block, not the one written after the restart"
+    );
 }
 
 // ── evict_lru_until ───────────────────────────────────────────────────────
@@ -706,7 +775,7 @@ fn single_namespace_no_global_budget_noop() {
 #[test]
 #[allow(
     clippy::unwrap_used,
-    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    reason = "temp-dir namespace databases and their .kvb files, all created by this test; a failure is a broken fixture and must abort rather than be reported as a passing sweep"
 )]
 fn evict_pool_lru_orders_across_namespaces_within_one_second() {
     let tmp = TempDir::new().unwrap();
@@ -756,7 +825,7 @@ fn evict_pool_lru_orders_across_namespaces_within_one_second() {
 /// granularity the index actually issues.
 #[allow(
     clippy::unwrap_used,
-    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    reason = "fixture setup: creates a namespace dir, its index and its .kvb files under a temp dir; a failure here is a broken fixture, not a condition under test"
 )]
 fn seed_ns_recorded(kv_root: &Path, ns: &str, names: &[&str]) -> PathBuf {
     let ns_dir = kv_root.join(ns);
