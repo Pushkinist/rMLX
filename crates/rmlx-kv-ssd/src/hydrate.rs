@@ -46,7 +46,7 @@ use rmlx_kv_quant::KvQuant;
 use crate::block_io::read_caches_timed;
 use crate::hashing::{chained_block_hashes_seeded, BLOCK_TOKENS, FNV_OFFSET};
 use crate::hooks::{call_ssd_hydrate_prom_hook, ssd_event_recorder};
-use crate::ssd_index::SsdKvIndex;
+use crate::ssd_index::{KvBlockRow, SsdKvIndex};
 
 /// A reconstructed SSD block ready to be wrapped as an arch prompt-cache entry.
 ///
@@ -247,14 +247,14 @@ impl SsdHydrator {
 
         // ── Phases 2–4: file read + dequant + GPU upload (timed inside block_io) ──
         match read_caches_timed(&row.path, self.device, &self.model_id, self.kv_quant) {
-            Ok((
+            Ok(Some((
                 kv_caches,
                 lin_caches,
                 bytes_read,
                 dur_read_us,
                 dur_dequant_us,
                 dur_finalize_us,
-            )) => {
+            ))) => {
                 // ── Phase 5: SQLite touch (LRU update) ────────────────────────
                 let t_touch = Instant::now();
                 if let Err(e) = self.index.touch(&row.hash, row.layout_key) {
@@ -326,26 +326,48 @@ impl SsdHydrator {
                     lin_caches,
                 }))
             }
+            Ok(None) => {
+                // The block was evicted between this lookup and the read. LRU
+                // eviction deletes the row first, so the row is normally gone
+                // already; dropping it here covers an evictor that did not get
+                // to unlink. Nothing to remove from disk, and nothing wrong.
+                tracing::debug!(
+                    hash = %row.hash,
+                    path = %row.path.display(),
+                    "ssd-hydrate: block evicted under the read, falling back to prefill"
+                );
+                self.drop_row(&row);
+                Ok(None)
+            }
             Err(e) => {
-                // Corrupt / metadata-mismatch / read error: delete file + row,
-                // fall through to prefill.
+                // Genuinely bad block (truncated, wrong header, unreadable):
+                // delete row + file, fall through to prefill.
                 tracing::warn!(
                     hash = %row.hash,
                     path = %row.path.display(),
                     error = %e,
-                    "ssd-hydrate: corrupt block, deleting file + index row, falling back to prefill"
+                    "ssd-hydrate: corrupt block, deleting index row + file, falling back to prefill"
                 );
+                // Row before file, the same order LRU eviction uses: it makes an
+                // interrupted cleanup leave an unreferenced row, which
+                // `prune_missing` reclaims, instead of an unreferenced file,
+                // which nothing does.
+                self.drop_row(&row);
                 let _ = std::fs::remove_file(&row.path);
-                if let Err(de) = self.index.delete(&row.hash, row.layout_key) {
-                    tracing::warn!(
-                        hash = %row.hash,
-                        layout_key = row.layout_key,
-                        error = %de,
-                        "ssd-hydrate: index row delete failed"
-                    );
-                }
                 Ok(None)
             }
+        }
+    }
+
+    /// Drop `row`'s index entry after a read that could not be served.
+    fn drop_row(&self, row: &KvBlockRow) {
+        if let Err(e) = self.index.delete(&row.hash, row.layout_key) {
+            tracing::warn!(
+                hash = %row.hash,
+                layout_key = row.layout_key,
+                error = %e,
+                "ssd-hydrate: index row delete failed"
+            );
         }
     }
 }

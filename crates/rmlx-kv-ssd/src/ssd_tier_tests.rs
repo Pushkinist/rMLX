@@ -222,6 +222,113 @@ fn startup_maintenance_prunes_and_evicts_to_budget() {
     assert!(surviving_files <= 1);
 }
 
+// ── Runtime budget enforcement ────────────────────────────────────────────
+
+/// Seed `dir`'s index with `n` blocks of `size` bytes each, returning the
+/// opened index. Every block has a real file on disk so eviction has something
+/// to remove.
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn seed_blocks(dir: &Path, ns: &str, lk: u64, n: usize, size: usize) -> SsdKvIndex {
+    std::fs::create_dir_all(dir).unwrap();
+    let idx = SsdKvIndex::open_at(&dir.join("index.db")).unwrap();
+    for i in 0..n {
+        let name = format!("blk{i:04}");
+        let p = dir.join(format!("{name}.kvb"));
+        std::fs::write(&p, vec![0u8; size]).unwrap();
+        idx.record(&name, lk, &p, ns, "k8v8", size as u64).unwrap();
+    }
+    idx
+}
+
+/// The tier only grew and never shrank between model loads: nothing in the
+/// serving path called `evict_lru_until`, so a namespace that spilled past
+/// `--kv-ssd-cache-gb` stayed past it until the next attach. This is the pass
+/// that closes that, and the property it owns is "the footprint comes back
+/// under the ceiling, and the bytes that left disk really left disk".
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn enforce_namespace_budget_brings_footprint_within_budget() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ns = "budget-ns";
+    let dir = tmp.path().join(ns);
+    let lk: u64 = 0x0f0f_0f0f_0f0f_0f0f;
+    let idx = seed_blocks(&dir, ns, lk, 5, 1000);
+    assert_eq!(idx.total_bytes().unwrap(), 5000);
+
+    let evicted = enforce_namespace_budget(&idx, ns, 2500);
+
+    assert_eq!(
+        evicted, 3,
+        "5 x 1000 bytes down to 2500 evicts three blocks"
+    );
+    assert!(idx.total_bytes().unwrap() <= 2500);
+    // The index and the disk must agree: no row may point at a file that the
+    // pass deleted, and no deleted row may leave its file behind.
+    assert_eq!(idx.prune_missing().unwrap(), 0, "no row lost its file");
+    let files_left = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "kvb"))
+        .count();
+    assert_eq!(files_left, 2, "evicted blocks must be gone from disk");
+}
+
+/// Zero is the one budget where the two possible readings — "no ceiling" and
+/// "keep nothing" — differ by the whole namespace. The tier-level routine reads
+/// it as "no ceiling" for every caller, so no call site has to be wrapped to
+/// survive it. (The literal reading still lives on the raw index API, which
+/// `evict_zero_budget_evicts_all` pins.)
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn enforce_namespace_budget_ignores_a_zero_budget() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ns = "zero-budget-ns";
+    let lk: u64 = 0x1234;
+
+    let dir = tmp.path().join("ns");
+    let idx = seed_blocks(&dir, ns, lk, 3, 100);
+    assert_eq!(enforce_namespace_budget(&idx, ns, 0), 0);
+    assert_eq!(
+        idx.total_bytes().unwrap(),
+        300,
+        "an unconfigured ceiling must not empty the namespace"
+    );
+}
+
+/// `--kv-ssd-global-gb N --kv-ssd-cache-gb 0` turns the tier on, so the
+/// namespace ceiling it resolves to has to be a real ceiling. Resolving it to
+/// zero gave the attach path "delete everything" and the runtime path "never
+/// enforce" off the same config.
+#[test]
+fn effective_namespace_budget_never_yields_zero_while_the_tier_is_on() {
+    let cfg = |per_ns: u64, global: u64| SsdTierConfig {
+        per_namespace_budget_bytes: per_ns,
+        global_budget_bytes: global,
+        default_namespace: None,
+        per_project_budgets: BTreeMap::default(),
+    };
+
+    // No per-namespace ceiling: the global pool governs the namespace alone.
+    assert_eq!(effective_namespace_budget(&cfg(0, 900)), 900);
+    // No global pool: the per-namespace budget stands alone.
+    assert_eq!(effective_namespace_budget(&cfg(700, 0)), 700);
+    // Both set: the tighter of the two, either way round.
+    assert_eq!(effective_namespace_budget(&cfg(700, 900)), 700);
+    assert_eq!(effective_namespace_budget(&cfg(900, 700)), 700);
+    // Both zero is the tier being off; nothing enforces, and the eviction
+    // routine treats the zero as "no ceiling" rather than "keep nothing".
+    assert_eq!(effective_namespace_budget(&cfg(0, 0)), 0);
+}
+
 /// unit test: double `install_config` returns `Err(SsdTierAlreadyInstalled)`.
 ///
 /// Test process is shared, so this test (and only this test) drives the
