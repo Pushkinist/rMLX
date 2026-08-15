@@ -81,6 +81,15 @@ pub struct Qwen3VlMoeText {
     pub(super) layers: Vec<DecoderLayer>,
     pub(super) final_norm: RmsNorm,
     pub(super) lm_head: Option<Linear>,
+    /// Resident-KV byte total of this instance's last generation, paired with a
+    /// store sequence. Per model instance, never per arch — two models of the
+    /// same architecture must not write each other's figure.
+    pub(crate) kv_bytes: crate::kv_bytes::KvBytesCounter,
+    /// Stable identity of the snapshot this instance was loaded from, folded
+    /// into the prompt-cache key. The prompt cache is one static per arch, so
+    /// without it a second model of the same arch serves its K/V from this
+    /// one's slots. See [`crate::prompt_cache::cache_seed`].
+    pub(crate) model_sig: u64,
 }
 
 /// Full Qwen3-VL-MoE model: the text decoder plus the image-token / vision

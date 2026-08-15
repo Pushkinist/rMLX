@@ -197,15 +197,55 @@ Every entry type implements:
 - `attach: Mutex<Option<AttachParams>>` — SSD tier attachment parameters
   (namespace, `kv_quant`, `layout_key`, device). Recorded so they survive a
   capacity-change cache re-creation.
-- `last_kv_bytes: AtomicU64` — KV byte total of the last completed request,
-  surfaced by `/metrics/cache`.
 - `policy: ReusePolicy` — read by the generate loop; enforced at runtime, not
   by a comment.
+
+The resident-KV byte counter is **not** here. It is per model *instance*
+(`kv_bytes::KvBytesCounter`, a field on each arch's model struct) because this
+shell is per arch *type*: two models of the same architecture sharing it would
+cross-attribute each other's byte totals into the append-only `events` table.
+See `docs/METRICS_DB.md` §`kv_cache_bytes`.
 
 `ArchPromptCache::ensure(capacity)` is a no-op when the existing cache already
 has the correct capacity. If the capacity changes (e.g. `--prompt-cache-slots`
 changes between model loads), the cache is rebuilt and the SSD sinks are
 re-installed from the recorded `attach` params.
+
+`ensure` runs once per generation on every arch, so the comparison is against
+what the cache actually stores and holds for every value, `0` included. A
+capacity that never compares equal to itself would rebuild on every request —
+discarding snapshots, resetting the hit/miss counters and re-installing the SSD
+sinks each time. That reads as "caching is off" from the outside, and it zeroes
+any measurement taken as `after - before` around a generation.
+
+### Zero slots
+
+`--prompt-cache-slots 0` disables the cache as a real state. The cache object is
+still built and still counts its misses, but `push` refuses every entry, so
+`slots` stays empty, `find_best_prefix` can only miss, and every request runs a
+full prefill. Nothing is clamped to one slot.
+
+The SSD tier is disabled with it: `hydrate_from_ssd` returns before querying the
+source, because a hydrated entry could only be refused admission. So a zero-slot
+server keeps `ssd_hits` at 0 and does no `.kvb` reads — the "every request runs a
+full prefill" above holds literally, not just for the RAM tier.
+
+A request carrying an `X-Session-Id` header does not change this. Session
+KV-reuse widens the configured slot count by one slot per active session
+(`session_cache::effective_prompt_cache_slots`), and a configured `0` is left
+alone: a header must not switch on a cache the operator switched off, and
+alternating capacities would rebuild the cache on every request.
+
+To make a *single* request miss without changing the configuration, use
+`ArchPromptCache::clear()` (`Architecture::clear_prompt_cache`), which empties
+the slots and resets the counters while keeping the capacity and the installed
+SSD sinks. That is what `rmlx bench` does: measuring a zero-slot cache would
+time a cache no operator runs.
+
+For `clear()` — unlike zero slots — a RAM miss is still not the same as a
+prefill: it leaves the SSD source attached, so the next request can be served
+from a `.kvb` and recorded as `ssd_hits`. A caller that needs a real prefill
+checks `hits == 0 && ssd_hits == 0` rather than trusting the clear.
 
 ---
 
@@ -273,12 +313,14 @@ full re-prefill. The Exact path verifies token identity by comparing
 `push` runs an admission guard, then two eviction passes, before appending the
 new entry:
 
-0. **Over-cap admission guard**: if the incoming entry's KV alone exceeds
+0. **Zero-capacity guard**: a cache configured with no slots stores nothing —
+   `push` returns `None`. See "Zero slots" above.
+1. **Over-cap admission guard**: if the incoming entry's KV alone exceeds
    `max_bytes`, the entry is **not admitted** — `push` returns `None` without
    evicting any existing slot. See "Over-cap admission" below.
-1. **RAM cap**: while `total_kv_bytes + new_entry_bytes > max_bytes`, evict
+2. **RAM cap**: while `total_kv_bytes + new_entry_bytes > max_bytes`, evict
    the slot with the smallest `last_used_seq`.
-2. **Slot count cap**: if `slots.len() == capacity`, evict the slot with the
+3. **Slot count cap**: if `slots.len() == capacity`, evict the slot with the
    smallest `last_used_seq`.
 
 Either cap triggers independently; the smaller cap wins. Each eviction

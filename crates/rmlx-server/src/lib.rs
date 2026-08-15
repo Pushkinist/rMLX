@@ -78,7 +78,7 @@ pub use openai::{
     TtftStore, UnloadReason, ITL_RING_CAPACITY, TTFT_RING_CAPACITY,
 };
 pub use registry::{ModelEntry, ModelRegistry, RegistryConfig, RegistryConfigEntry};
-pub use session_cache::{SessionCache, SessionKey};
+pub use session_cache::{effective_prompt_cache_slots, SessionCache, SessionKey};
 
 /// Build the axum `Router` for the full API surface.
 ///

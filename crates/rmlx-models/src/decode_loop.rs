@@ -129,7 +129,7 @@ pub(crate) struct DecodeCtx<'a> {
 ///
 /// Minted as the final act of the decode loops (`pipelined_decode` and the
 /// per-arch `decode_loop` / `decode_from` helpers) and required by
-/// `ArchPromptCache::store_kv_cache_bytes`. It pins the `kv_cache_bytes` metric
+/// `KvBytesCounter::store`. It pins the `kv_cache_bytes` metric
 /// to a single lifecycle point: **after decode**, when every resident KV
 /// allocation — including the decode-time ring — exists. A codec whose ring is
 /// allocated during decode is invisible to a pre-decode sample regardless of the

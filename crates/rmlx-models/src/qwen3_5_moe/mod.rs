@@ -33,7 +33,6 @@ pub use loader::{load_from_path, load_from_path_paro};
 pub use model::Qwen3_5MoeText;
 pub(crate) use mtp_layer::{MtpLayer, MtpLayerDims};
 pub use prompt_cache::read_cache_stats as qwen3_5_moe_cache_stats;
-pub use prompt_cache::read_kv_cache_bytes_sample as qwen3_5_moe_kv_cache_bytes_sample;
 
 // ---------------------------------------------------------------------------
 // Tests

@@ -92,7 +92,7 @@ impl TestEntry {
     /// consume seed for `kv_quant` on a RAM-only run (`layout_key == 0`), and
     /// tag the entry with that same `kv_quant` so the quant-guard accepts it.
     fn for_quant(ids: Vec<u32>, kv_quant: KvQuant) -> Self {
-        let seed = FNV_OFFSET ^ kv_quant.cache_key_salt();
+        let seed = cache_seed(0, kv_quant, TEST_SIG);
         let hashes = chained_block_hashes_seeded(&ids, seed);
         TestEntry {
             ids,
@@ -1188,6 +1188,37 @@ fn ssd_hydrate_populates_ram_and_bumps_counter() {
     assert_eq!(blocks, 2, "full 2-block prefix served from RAM");
 }
 
+/// A zero-slot cache never touches the SSD source.
+///
+/// Hydrating would read a `.kvb` and rebuild its K/V only for `push` to refuse
+/// it — per request, for the life of the process — and the refusal would be
+/// reported as a RAM-cap overflow, which is not the cause. The call-count
+/// assertion is the load-bearing one: returning `None` after doing the work
+/// would satisfy the other two.
+#[test]
+fn zero_slots_never_reads_the_ssd_source() {
+    let prompt: Vec<u32> = make_ids(2 * BLOCK_TOKENS);
+    let mut cache: PromptCache<TestEntry> = PromptCache::new(0);
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    cache.set_ssd_source(Box::new(MockSource {
+        entry_ids: prompt.clone(),
+        calls: std::sync::Arc::clone(&calls),
+    }));
+
+    assert!(
+        cache.hydrate_from_ssd(&prompt).is_none(),
+        "a zero-slot cache cannot admit a hydrated entry"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the source must not be queried at all — a disk read whose result can \
+         only be discarded is pure waste"
+    );
+    assert_eq!(cache.stats().ssd_hits, 0);
+    assert_eq!(cache.slots.len(), 0, "RAM untouched");
+}
+
 /// with no SSD source attached (`None`), `hydrate_from_ssd` is inert
 /// and `ssd_hits` stays 0 — today's RAM-only behavior is unchanged.
 #[test]
@@ -1410,58 +1441,6 @@ fn arch_cache_with_inner_mut_round_trip() {
         let cloned = cache.slots[0].entry.deep_clone().unwrap();
         assert_eq!(cloned.prompt_token_ids(), &ids[..]);
     });
-}
-
-/// unit test #4: `store_kv_cache_bytes` + `read_kv_cache_bytes_sample`
-/// round-trip. Mirrors the per-request /metrics/cache wire path.
-#[test]
-fn arch_cache_kv_bytes_round_trip() {
-    let arch: ArchPromptCache<TestEntry> = ArchPromptCache::new("test-bytes", ReusePolicy::Partial);
-    let post = crate::decode_loop::PostDecode::for_test();
-    assert_eq!(
-        arch.read_kv_cache_bytes_sample().bytes,
-        0,
-        "fresh cache reports zero"
-    );
-    arch.store_kv_cache_bytes(424_242, post);
-    assert_eq!(arch.read_kv_cache_bytes_sample().bytes, 424_242);
-    arch.store_kv_cache_bytes(0, post);
-    assert_eq!(arch.read_kv_cache_bytes_sample().bytes, 0);
-}
-
-/// The store sequence separates "no generation has reported a byte count" from
-/// "a generation reported zero" — two states the bare byte value collapses into
-/// the same `0`. A caller that records the figure as a measurement reads the
-/// sequence, not the value, to decide whether it has one.
-#[test]
-fn arch_cache_kv_bytes_seq_distinguishes_unreported_from_zero() {
-    let arch: ArchPromptCache<TestEntry> = ArchPromptCache::new("test-seq", ReusePolicy::Partial);
-    let post = crate::decode_loop::PostDecode::for_test();
-
-    let fresh = arch.read_kv_cache_bytes_sample();
-    assert_eq!(fresh.seq, 0, "no store yet — sequence must still be zero");
-
-    // A genuine store of zero bytes is NOT the same state as "never stored",
-    // even though both report `bytes == 0`.
-    arch.store_kv_cache_bytes(0, post);
-    let reported_zero = arch.read_kv_cache_bytes_sample();
-    assert_eq!(reported_zero.bytes, 0);
-    assert_eq!(
-        reported_zero.seq, 1,
-        "a store of zero must still advance the sequence — otherwise it is \
-         indistinguishable from never having stored"
-    );
-
-    // Every store advances it, so a caller can tell "this generation reported"
-    // from "I am reading the previous generation's figure".
-    arch.store_kv_cache_bytes(4096, post);
-    assert_eq!(
-        arch.read_kv_cache_bytes_sample(),
-        KvBytesSample {
-            bytes: 4096,
-            seq: 2
-        }
-    );
 }
 
 /// unit test #5: `read_cache_stats` returns `None` for an
@@ -1750,6 +1729,14 @@ fn ssd_hydrate_seed_symmetry_with_nonzero_layout_key() {
 /// tagged to match via `TestEntry::for_quant`).
 const TEST_QUANT: KvQuant = KvQuant::K8V8;
 
+/// Model signature every consume test pushes and queries under. `TestEntry::
+/// for_quant` seeds its digests with it, so a query carrying a *different*
+/// signature must not match — see `consume_other_model_sig_is_miss`.
+const TEST_SIG: u64 = 0x1111_2222_3333_4444;
+
+/// A second model's signature. Same arch, same static cache, different model.
+const OTHER_SIG: u64 = 0x5555_6666_7777_8888;
+
 /// Compact discriminant of a `Consumed` for golden-pair assertions.
 #[derive(Debug, PartialEq, Eq)]
 enum ConsumedTag {
@@ -1782,8 +1769,45 @@ fn consume_one(
         *g = Some(PromptCache::new(4));
         g.as_mut().unwrap().push(pushed);
     });
-    let out = arch.consume(prompt_ids, TEST_QUANT, has_image);
+    let out = arch.consume(prompt_ids, TEST_QUANT, has_image, TEST_SIG);
     (arch, out)
+}
+
+/// A second model of the same architecture must not be served another model's
+/// K/V, even when the prompts are token-for-token identical.
+///
+/// The prompt cache is one static per arch, so both models share it, and the
+/// `Exact` arm's token-id equality check cannot separate them — the tokens
+/// really are equal. Only the model term in the key can. Serving the hit would
+/// replay model A's K/V and A's first decode token through model B's weights:
+/// wrong output, no error.
+///
+/// Paired with `consume_exact_ram_entry` directly above, which is the same
+/// setup at the *same* signature and must still hit — otherwise this test
+/// passes for the trivial reason that nothing ever matches.
+#[test]
+fn consume_other_model_sig_is_miss() {
+    let prompt = make_ids(2 * BLOCK_TOKENS);
+    let arch: ArchPromptCache<TestEntry> =
+        ArchPromptCache::new("test-two-models", ReusePolicy::Partial);
+    arch.ensure(4);
+    arch.with_inner_mut(|g| {
+        if let Some(cache) = g.as_mut() {
+            cache.push(TestEntry::for_quant(prompt.clone(), TEST_QUANT));
+        }
+    });
+
+    assert_eq!(
+        tag(&arch.consume(&prompt, TEST_QUANT, false, TEST_SIG)),
+        ConsumedTag::Exact,
+        "the model that stored the slot must still be served from it"
+    );
+    assert_eq!(
+        tag(&arch.consume(&prompt, TEST_QUANT, false, OTHER_SIG)),
+        ConsumedTag::Miss,
+        "a different model of the same arch must re-prefill, not decode from \
+         another model's K/V"
+    );
 }
 
 /// RAM exact hit: stored ids == request ids, not hydrated → `Exact`.
@@ -1929,13 +1953,13 @@ fn consume_has_image_is_miss_no_cache_touch() {
     });
 
     // Image request: Miss, and the cache is not consulted/evicted.
-    let img = arch.consume(&prompt, TEST_QUANT, true);
+    let img = arch.consume(&prompt, TEST_QUANT, true, TEST_SIG);
     assert_eq!(tag(&img), ConsumedTag::Miss);
     let slots = arch.with_inner_mut(|g| g.as_ref().unwrap().slots.len());
     assert_eq!(slots, 1, "image request must not evict the existing entry");
 
     // The surviving entry is still served as Exact to a text request.
-    let txt = arch.consume(&prompt, TEST_QUANT, false);
+    let txt = arch.consume(&prompt, TEST_QUANT, false, TEST_SIG);
     assert_eq!(tag(&txt), ConsumedTag::Exact);
 }
 
@@ -1982,7 +2006,7 @@ fn consume_quant_mismatch_evicts_and_misses() {
     let prompt = make_ids(2 * BLOCK_TOKENS);
     // Salt with the runtime seed so find_best_prefix matches, but tag a DIFFERENT
     // stored quant so the quant-guard rejects it.
-    let runtime_seed = FNV_OFFSET ^ TEST_QUANT.cache_key_salt();
+    let runtime_seed = cache_seed(0, TEST_QUANT, TEST_SIG);
     let mut entry = TestEntry::new_seeded(prompt.clone(), runtime_seed);
     entry.kv_quant = Some(KvQuant::K8V4); // != TEST_QUANT (K8V8)
 
@@ -1991,7 +2015,7 @@ fn consume_quant_mismatch_evicts_and_misses() {
         *g = Some(PromptCache::new(4));
         g.as_mut().unwrap().push(entry);
     });
-    let out = arch.consume(&prompt, TEST_QUANT, false);
+    let out = arch.consume(&prompt, TEST_QUANT, false, TEST_SIG);
     assert_eq!(tag(&out), ConsumedTag::Miss);
     let slots = arch.with_inner_mut(|g| g.as_ref().unwrap().slots.len());
     assert_eq!(slots, 0, "quant-mismatch must evict the unusable slot");
@@ -2119,11 +2143,11 @@ fn consume_degrade_branches_each_emit_one_debug() {
             let arch: ArchPromptCache<TestEntry> =
                 ArchPromptCache::new("test", ReusePolicy::ExactOnly);
             arch.with_inner_mut(|g| *g = Some(PromptCache::new(4)));
-            let _ = arch.consume(&prompt, TEST_QUANT, true);
+            let _ = arch.consume(&prompt, TEST_QUANT, true, TEST_SIG);
         }
         // 2. quant_mismatch → "quant_mismatch".
         {
-            let runtime_seed = FNV_OFFSET ^ TEST_QUANT.cache_key_salt();
+            let runtime_seed = cache_seed(0, TEST_QUANT, TEST_SIG);
             let mut entry = TestEntry::new_seeded(prompt.clone(), runtime_seed);
             entry.kv_quant = Some(KvQuant::K8V4);
             let arch: ArchPromptCache<TestEntry> =
@@ -2132,7 +2156,7 @@ fn consume_degrade_branches_each_emit_one_debug() {
                 *g = Some(PromptCache::new(4));
                 g.as_mut().unwrap().push(entry);
             });
-            let _ = arch.consume(&prompt, TEST_QUANT, false);
+            let _ = arch.consume(&prompt, TEST_QUANT, false, TEST_SIG);
         }
         // 3. incomplete_hydrate (Partial, hydrated, incomplete) → "incomplete_hydrate".
         {
@@ -2150,7 +2174,7 @@ fn consume_degrade_branches_each_emit_one_debug() {
                 *g = Some(PromptCache::new(4));
                 g.as_mut().unwrap().push(entry);
             });
-            let _ = arch.consume(&req, TEST_QUANT, false);
+            let _ = arch.consume(&req, TEST_QUANT, false, TEST_SIG);
         }
         // 4. non_reusable (Partial, fresh partial, hook returns None) → "non_reusable".
         {
@@ -2164,7 +2188,7 @@ fn consume_degrade_branches_each_emit_one_debug() {
                 *g = Some(PromptCache::new(4));
                 g.as_mut().unwrap().push(entry);
             });
-            let _ = arch.consume(&req, TEST_QUANT, false);
+            let _ = arch.consume(&req, TEST_QUANT, false, TEST_SIG);
         }
         // 5. hydrated_declined_to_exact (ExactOnly, fresh partial, not token-equal,
         //    reuse not permitted) → "hydrated_declined_to_exact".
@@ -2179,7 +2203,7 @@ fn consume_degrade_branches_each_emit_one_debug() {
                 *g = Some(PromptCache::new(4));
                 g.as_mut().unwrap().push(entry);
             });
-            let _ = arch.consume(&req, TEST_QUANT, false);
+            let _ = arch.consume(&req, TEST_QUANT, false, TEST_SIG);
         }
         // 6. hydrated equal-length: reuse-eligible (complete) but the hook
         //    declines (strict-less) → "non_reusable".
@@ -2195,7 +2219,7 @@ fn consume_degrade_branches_each_emit_one_debug() {
                 *g = Some(PromptCache::new(4));
                 g.as_mut().unwrap().push(entry);
             });
-            let _ = arch.consume(&prompt, TEST_QUANT, false);
+            let _ = arch.consume(&prompt, TEST_QUANT, false, TEST_SIG);
         }
     });
 
@@ -2211,5 +2235,136 @@ fn consume_degrade_branches_each_emit_one_debug() {
             "non_reusable".to_owned(),
         ],
         "each consume degrade branch must emit exactly one debug!{{branch=...}}"
+    );
+}
+
+// ── ensure() + the zero-slot cache ──────────────────────────────────────────
+//
+// `ensure` runs once per generation on every arch, so its "already the right
+// capacity" arm has to be reachable for every value it is called with. When it
+// is not, the cache is rebuilt per generation: snapshots are discarded, the
+// hit/miss counters restart at zero, and the SSD sinks are re-installed — which
+// looks like "caching is off" from the outside while in fact building and
+// throwing away a cache each time. The counters are the sharp edge: a caller
+// reading cache activity as `after - before` around a generation then reads
+// `0 - 0` and cannot tell that from "nothing happened".
+//
+// The tests below need `ensure`, which is bounded on `SsdHydrator:
+// SsdHydrate<E>`. The SSD tier is never attached here, so this impl exists only
+// to satisfy that bound and is never called.
+impl SsdHydrate<TestEntry> for SsdHydrator {
+    fn hydrate(&self, _prompt_ids: &[u32]) -> Result<Option<TestEntry>> {
+        Ok(None)
+    }
+}
+
+/// Cumulative miss count observable across an arch cache, or 0 before the first
+/// `ensure` builds it.
+fn misses(arch: &ArchPromptCache<TestEntry>) -> u64 {
+    arch.read_cache_stats().map_or(0, |s| s.misses)
+}
+
+/// Two zero-slot generations must leave a cumulative miss count of 2.
+///
+/// Each generation calls `ensure(0)` and then consults the cache once. Reading
+/// `1` means the second `ensure(0)` rebuilt the cache and reset the counters, so
+/// the first generation's miss is gone.
+#[test]
+fn zero_slots_accumulates_misses_across_generations() {
+    let arch: ArchPromptCache<TestEntry> =
+        ArchPromptCache::new("test-zero-slots", ReusePolicy::Partial);
+    let prompt = make_ids(2 * BLOCK_TOKENS);
+
+    arch.ensure(0);
+    assert_eq!(
+        tag(&arch.consume(&prompt, TEST_QUANT, false, TEST_SIG)),
+        ConsumedTag::Miss
+    );
+    assert_eq!(misses(&arch), 1, "first generation must record its miss");
+
+    arch.ensure(0);
+    assert_eq!(
+        misses(&arch),
+        1,
+        "ensure(0) on a cache already built with 0 slots must be a no-op — a rebuild \
+         here resets the counters and erases the first generation's miss"
+    );
+
+    assert_eq!(
+        tag(&arch.consume(&prompt, TEST_QUANT, false, TEST_SIG)),
+        ConsumedTag::Miss
+    );
+    assert_eq!(
+        misses(&arch),
+        2,
+        "two zero-slot generations are two misses; 1 means the counters restarted"
+    );
+}
+
+/// Zero slots is a real disabled state, not a one-slot cache.
+///
+/// A snapshot offered to it is refused, so a repeat of the identical prompt
+/// cannot be served from RAM and re-prefills — which is what an operator asking
+/// for zero slots is asking for.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test-only: `ensure` on the line above installs the cache the closure unwraps"
+)]
+fn zero_slots_stores_nothing() {
+    let arch: ArchPromptCache<TestEntry> =
+        ArchPromptCache::new("test-zero-store", ReusePolicy::Partial);
+    let prompt = make_ids(2 * BLOCK_TOKENS);
+
+    arch.ensure(0);
+    let stored = arch.with_inner_mut(|g| {
+        g.as_mut()
+            .unwrap()
+            .push(TestEntry::for_quant(prompt.clone(), TEST_QUANT))
+    });
+    assert_eq!(
+        stored, None,
+        "a zero-slot cache must refuse admission rather than store into a clamped slot"
+    );
+
+    assert_eq!(
+        tag(&arch.consume(&prompt, TEST_QUANT, false, TEST_SIG)),
+        ConsumedTag::Miss,
+        "an identical repeat must still miss — a zero-slot cache serves nothing"
+    );
+}
+
+/// `ensure` still rebuilds when the capacity genuinely changes, and still does
+/// not when it has not. Without this the repair could be "never rebuild", which
+/// would silently ignore a capacity change between model loads.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test-only: `ensure` on the line above installs the cache the closure unwraps"
+)]
+fn ensure_rebuilds_only_on_a_real_capacity_change() {
+    let arch: ArchPromptCache<TestEntry> =
+        ArchPromptCache::new("test-ensure-rebuild", ReusePolicy::Partial);
+    let prompt = make_ids(2 * BLOCK_TOKENS);
+
+    arch.ensure(4);
+    arch.with_inner_mut(|g| {
+        g.as_mut()
+            .unwrap()
+            .push(TestEntry::for_quant(prompt.clone(), TEST_QUANT));
+    });
+
+    arch.ensure(4);
+    assert_eq!(
+        tag(&arch.consume(&prompt, TEST_QUANT, false, TEST_SIG)),
+        ConsumedTag::Exact,
+        "the same capacity must keep the stored snapshot"
+    );
+
+    arch.ensure(2);
+    assert_eq!(
+        tag(&arch.consume(&prompt, TEST_QUANT, false, TEST_SIG)),
+        ConsumedTag::Miss,
+        "a changed capacity must rebuild the cache and discard its snapshots"
     );
 }

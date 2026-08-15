@@ -1135,6 +1135,7 @@ fn slot_test_state(registry: ModelRegistry, max_loaded_models: usize) -> AppStat
         max_tokens_cap: u32::MAX,
         max_timeout_secs: 600,
         session_cache: Arc::new(PLMutex::new(SessionCache::new(4))),
+        prompt_cache_slots: 4,
         ttft_store: TtftStore::default(),
         itl_store: ItlStore::default(),
         metrics_drainer: None,

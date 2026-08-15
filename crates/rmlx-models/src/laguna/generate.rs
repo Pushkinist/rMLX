@@ -20,14 +20,12 @@ use rmlx_mlx::{argmax, Array, Device, Dtype};
 
 use crate::constraint::ConstraintEngine;
 use crate::kv_cache::{kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N};
-use crate::prompt_cache::{chained_block_hashes_seeded, Consumed, ReusePolicy, FNV_OFFSET};
+use crate::prompt_cache::{chained_block_hashes_seeded, Consumed, ReusePolicy};
 use crate::sampler::apply_mask_argmax;
 use rmlx_kv_quant::{KvCache, KV_MAX_SEQ_DEFAULT};
 
 use super::model::LagunaText;
-use super::prompt_cache::{
-    active_layout_key, ensure_prompt_cache, store_kv_cache_bytes, LagunaEntry, PROMPT_CACHE,
-};
+use super::prompt_cache::{active_layout_key, ensure_prompt_cache, LagunaEntry, PROMPT_CACHE};
 
 // ---------------------------------------------------------------------------
 // Smoke probe -- generate_greedy
@@ -94,6 +92,7 @@ fn max_abs_from_bytes(bytes: &[u8], dtype: Dtype) -> f32 {
 /// Recommended: 4. Only the Exact hit path is active (identical-prompt repeat
 /// skips re-prefill entirely, same `ReusePolicy::ExactOnly` contract as Qwen2
 /// and BitNet).
+/// Pass 0 to disable the cache: nothing is stored, so every request prefills.
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::indexing_slicing,
@@ -167,7 +166,7 @@ pub fn generate_greedy(
     );
     // Laguna is text-only (no vision tower), so there is never an image prompt;
     // the engine's has_image bypass is belt-and-suspenders.
-    let consumed = PROMPT_CACHE.consume(prompt_ids, kv_quant, false);
+    let consumed = PROMPT_CACHE.consume(prompt_ids, kv_quant, false, model.model_sig);
 
     // Path A: exact cache hit — skip re-prefill, replay the stored first token,
     // then run the shared decode loop on the cloned caches.
@@ -221,7 +220,7 @@ pub fn generate_greedy(
 
         {
             let kv_bytes: u64 = caches.iter().map(|c| c.resident_bytes()).sum();
-            store_kv_cache_bytes(kv_bytes, post);
+            model.kv_bytes.store(kv_bytes, post);
         }
         tracing::info!(
             arch = "LagunaForCausalLM",
@@ -437,7 +436,7 @@ pub fn generate_greedy(
                     let lk = active_layout_key();
                     let block_hashes = chained_block_hashes_seeded(
                         prompt_ids,
-                        FNV_OFFSET ^ lk ^ kv_quant.cache_key_salt(),
+                        crate::prompt_cache::cache_seed(lk, kv_quant, model.model_sig),
                     );
                     let entry = LagunaEntry {
                         prompt_token_ids: prompt_ids.to_vec(),
@@ -503,7 +502,7 @@ pub fn generate_greedy(
     // exact-hit path above.
     {
         let kv_bytes: u64 = caches.iter().map(|c| c.resident_bytes()).sum();
-        store_kv_cache_bytes(kv_bytes, post);
+        model.kv_bytes.store(kv_bytes, post);
     }
 
     let prefill_ms = (prefill_total_ns as f64) / 1.0e6;
