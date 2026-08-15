@@ -138,7 +138,10 @@ mutually exclusive.
 > reloading weights — one resident model can serve multiple KV codecs / context
 > ceilings. Requests that omit the fields use these launch defaults. See
 > `docs/SERVER.md` § "Per-request KV-config hot-swap". `--kv-ssd-cache-gb` stays
-> launch-fixed (SSD live reconfig deferred — `docs/SSD_TIER.md`).
+> launch-fixed — there is no route to change it on a running server — but the
+> value it is set to is enforced continuously, not only at model load, so the
+> ceiling holds for the life of the process (`docs/SSD_TIER.md` §
+> "Evict-to-budget (runtime)").
 
 **KV-bits mapping** (`--kv-bits` + `--kv-group-size`):
 

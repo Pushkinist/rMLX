@@ -222,6 +222,94 @@ fn startup_maintenance_prunes_and_evicts_to_budget() {
     assert!(surviving_files <= 1);
 }
 
+// ── Runtime budget enforcement ────────────────────────────────────────────
+
+/// Seed `dir`'s index with `n` blocks of `size` bytes each, returning the
+/// opened index. Every block has a real file on disk so eviction has something
+/// to remove.
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn seed_blocks(dir: &Path, ns: &str, lk: u64, n: usize, size: usize) -> SsdKvIndex {
+    std::fs::create_dir_all(dir).unwrap();
+    let idx = SsdKvIndex::open_at(&dir.join("index.db")).unwrap();
+    for i in 0..n {
+        let name = format!("blk{i:04}");
+        let p = dir.join(format!("{name}.kvb"));
+        std::fs::write(&p, vec![0u8; size]).unwrap();
+        idx.record(&name, lk, &p, ns, "k8v8", size as u64).unwrap();
+    }
+    idx
+}
+
+/// The tier only grew and never shrank between model loads: nothing in the
+/// serving path called `evict_lru_until`, so a namespace that spilled past
+/// `--kv-ssd-cache-gb` stayed past it until the next attach. This is the pass
+/// that closes that, and the property it owns is "the footprint comes back
+/// under the ceiling, and the bytes that left disk really left disk".
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn enforce_namespace_budget_brings_footprint_within_budget() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ns = "budget-ns";
+    let dir = tmp.path().join(ns);
+    let lk: u64 = 0x0f0f_0f0f_0f0f_0f0f;
+    let idx = seed_blocks(&dir, ns, lk, 5, 1000);
+    assert_eq!(idx.total_bytes().unwrap(), 5000);
+
+    let evicted = enforce_namespace_budget(&idx, ns, 2500);
+
+    assert_eq!(
+        evicted, 3,
+        "5 x 1000 bytes down to 2500 evicts three blocks"
+    );
+    assert!(idx.total_bytes().unwrap() <= 2500);
+    // The index and the disk must agree: no row may point at a file that the
+    // pass deleted, and no deleted row may leave its file behind.
+    assert_eq!(idx.prune_missing().unwrap(), 0, "no row lost its file");
+    let files_left = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "kvb"))
+        .count();
+    assert_eq!(files_left, 2, "evicted blocks must be gone from disk");
+}
+
+/// A zero budget means "no ceiling configured", but `evict_lru_until` reads a
+/// zero budget as "keep nothing". [`enforce_budget_after_spill`] is the gate
+/// between those two readings, and this pins both sides of it: the raw pass
+/// empties the namespace, the gated one leaves it alone.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn enforce_budget_after_spill_ignores_a_zero_budget() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ns = "zero-budget-ns";
+    let lk: u64 = 0x1234;
+
+    // Ungated: a zero budget is "keep nothing".
+    let raw_dir = tmp.path().join("raw");
+    let raw = seed_blocks(&raw_dir, ns, lk, 3, 100);
+    assert_eq!(enforce_namespace_budget(&raw, ns, 0), 3);
+    assert_eq!(raw.total_bytes().unwrap(), 0);
+
+    // Gated: a zero budget is "no ceiling", so nothing moves.
+    let gated_dir = tmp.path().join("gated");
+    let gated = seed_blocks(&gated_dir, ns, lk, 3, 100);
+    enforce_budget_after_spill(&gated, ns, 0);
+    assert_eq!(
+        gated.total_bytes().unwrap(),
+        300,
+        "an unconfigured ceiling must not empty the namespace"
+    );
+}
+
 /// unit test: double `install_config` returns `Err(SsdTierAlreadyInstalled)`.
 ///
 /// Test process is shared, so this test (and only this test) drives the

@@ -262,8 +262,9 @@ quant for a 128k request, `none` for a short chat) with zero downtime.
 - **Single-MLX claim is unaffected** — one model stays resident throughout.
 - **Anthropic `/v1/messages`** does not expose these fields (stricter wire
   spec); it always uses the launch default.
-- **Deferred:** live SSD-tier reconfiguration (per-request `kv_ssd` toggle) is
-  **not** implemented — see `docs/SSD_TIER.md` § "Live reconfiguration (deferred)".
+- **Not offered:** a per-request `kv_ssd` toggle. The SSD tier is per-namespace
+  global machinery, not a lookup salt, so it cannot be overridden for one
+  request — see `docs/SSD_TIER.md` § "Live reconfiguration".
 
 ### Multimodal content parts — image + native audio input
 

@@ -522,9 +522,10 @@ enum Cmd {
         /// `<RMLX_HOME>/cache/kv/<namespace>/` and a RAM miss is served from the
         /// longest cached block-aligned prefix on disk. The namespace is the
         /// model id unless `--project` overrides it. Eviction within the
-        /// namespace is LRU-by-size, kept under this ceiling; budgets persist
-        /// across restarts (the on-disk index is pruned + evicted-to-budget at
-        /// startup). Because `rmlx serve` runs a single MLX process, one
+        /// namespace is LRU-by-size: the ceiling is enforced at model load
+        /// (index pruned + evicted-to-budget) and again after every block the
+        /// spill thread writes, so it holds for the life of the process and not
+        /// only at startup. Because `rmlx serve` runs a single MLX process, one
         /// namespace is active at a time, so this per-namespace ceiling is also
         /// the global ceiling.
         #[arg(long, value_name = "GIB", default_value_t = 0.0)]

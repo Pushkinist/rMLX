@@ -537,6 +537,376 @@ fn ssd_hit_lookup_emits_hydrate_event() {
     assert_eq!(block_count, 1, "one block reconstructed");
 }
 
+// ── Budget enforcement racing in-flight hydrates ──────────────────────────
+
+/// Enforcing the on-disk budget while requests are hydrating is the shape this
+/// repo has been bitten by before: a cache write that quietly does the wrong
+/// thing reports no error, and the run just produces different output. So the
+/// property under test is not "it did not crash" — it is that **every block a
+/// racing hydrate is handed is the block it asked for**, checked against the
+/// K-dequant of the exact cache that was spilled under that prompt.
+///
+/// Why the invariant holds, and what would break it: a block is only reachable
+/// through its own `(hash, layout_key)` row, `evict_lru_until` deletes that row
+/// before the `.kvb` is unlinked, and a read of a vanished or half-written file
+/// fails the header check and takes the existing corrupt-block path (drop the
+/// row, `warn!`, miss). Every racing outcome therefore collapses to a miss and
+/// a full prefill. A regression that reused a row's path after its own row was
+/// gone, or that shared one file across two hashes, would surface here as a
+/// content mismatch rather than as a crash.
+///
+/// Three threads model the production tier: the spill drain thread growing the
+/// namespace, the budget pass shrinking it, and a request thread hydrating. The
+/// pre-race pass pins that the content check can pass on real data, so a run in
+/// which the race produced only misses cannot pass vacuously.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn budget_enforcement_racing_hydrates_never_serves_a_foreign_block() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    const RACE_PASSES: usize = 40;
+    const NS: &str = "race-ns";
+
+    let device = Device::Cpu;
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let db = dir.join("index.db");
+    let fx = Arc::new(seed_race_fixture(&dir, &db, device));
+    // Room for half the prompts, so the filler the writer thread adds keeps
+    // pushing the namespace over and the budget pass keeps having work.
+    let budget = fx.block_bytes * (RACE_PROMPTS as u64 / 2);
+
+    // Pre-race pass on quiet state: every prompt hits and its content is its
+    // own. This is what stops the racing assertions below from passing on a run
+    // that only ever saw misses.
+    {
+        let hydrator = SsdHydrator::with_index(
+            MODEL_ID,
+            QUANT,
+            RACE_LK,
+            device,
+            dir.clone(),
+            SsdKvIndex::open_at(&db).unwrap(),
+        );
+        for i in 0..RACE_PROMPTS {
+            let block = hydrator
+                .lookup(&fx.prompts[i])
+                .unwrap()
+                .expect("quiet-state lookup must hit");
+            assert_own_block(&block, &fx, i, device, "quiet-state");
+        }
+    }
+
+    let barrier = Arc::new(Barrier::new(3));
+    let stop = Arc::new(AtomicU64::new(0));
+    let evicted_total = Arc::new(AtomicU64::new(0));
+
+    // Thread 1 — the budget pass, standing in for the spill drain thread's
+    // post-write enforcement.
+    let evictor = {
+        let (db, barrier, stop, evicted_total) = (
+            db.clone(),
+            Arc::clone(&barrier),
+            Arc::clone(&stop),
+            Arc::clone(&evicted_total),
+        );
+        std::thread::spawn(move || {
+            let idx = SsdKvIndex::open_at(&db).unwrap();
+            barrier.wait();
+            while stop.load(Ordering::Acquire) == 0 {
+                let n = crate::ssd_tier::enforce_namespace_budget(&idx, NS, budget);
+                evicted_total.fetch_add(n, Ordering::AcqRel);
+                std::thread::yield_now();
+            }
+        })
+    };
+
+    // Thread 2 — namespace growth. Fresh keys every time, exactly as a spiller
+    // records a block it has just written.
+    let writer = {
+        let (db, dir, barrier, stop, block_bytes) = (
+            db.clone(),
+            dir.clone(),
+            Arc::clone(&barrier),
+            Arc::clone(&stop),
+            fx.block_bytes,
+        );
+        std::thread::spawn(move || {
+            let idx = SsdKvIndex::open_at(&db).unwrap();
+            barrier.wait();
+            let mut n = 0u64;
+            while stop.load(Ordering::Acquire) == 0 {
+                let key = format!("filler{n:012x}");
+                let p = dir.join(format!("{key}.kvb"));
+                if std::fs::write(&p, vec![0u8; block_bytes as usize]).is_ok() {
+                    let _ =
+                        idx.record(&key, RACE_LK, &p, MODEL_ID, &QUANT.to_string(), block_bytes);
+                }
+                n += 1;
+                std::thread::yield_now();
+            }
+        })
+    };
+
+    // Thread 3 — the request thread. Re-records its own block after a miss,
+    // which is what a real miss leads to (prefill, then spill on eviction).
+    let hydrator_thread = {
+        let (barrier, fx) = (Arc::clone(&barrier), Arc::clone(&fx));
+        std::thread::spawn(move || {
+            let re_index = SsdKvIndex::open_at(&db).unwrap();
+            let hydrator = SsdHydrator::with_index(
+                MODEL_ID,
+                QUANT,
+                RACE_LK,
+                device,
+                dir.clone(),
+                SsdKvIndex::open_at(&db).unwrap(),
+            );
+            barrier.wait();
+            let (mut hits, mut misses) = (0u64, 0u64);
+            for _ in 0..RACE_PASSES {
+                for i in 0..RACE_PROMPTS {
+                    match hydrator.lookup(&fx.prompts[i]) {
+                        Ok(Some(block)) => {
+                            hits += 1;
+                            assert_own_block(&block, &fx, i, device, "racing");
+                        }
+                        Ok(None) => {
+                            misses += 1;
+                            // Re-record from the bytes captured at seed time —
+                            // no MLX work off the seeding thread.
+                            let p = dir.join(format!("{}.kvb", fx.keys[i]));
+                            if std::fs::write(&p, &fx.kvb_bytes[i]).is_ok() {
+                                let _ = re_index.record(
+                                    &fx.keys[i],
+                                    RACE_LK,
+                                    &p,
+                                    MODEL_ID,
+                                    &QUANT.to_string(),
+                                    fx.kvb_bytes[i].len() as u64,
+                                );
+                            }
+                        }
+                        Err(e) => panic!("hydrate must never surface an error, got {e}"),
+                    }
+                }
+            }
+            (hits, misses)
+        })
+    };
+
+    let (hits, misses) = hydrator_thread.join().expect("hydrator thread panicked");
+    stop.store(1, Ordering::Release);
+    evictor.join().expect("evictor thread panicked");
+    writer.join().expect("writer thread panicked");
+
+    assert_eq!(
+        hits + misses,
+        (RACE_PASSES * RACE_PROMPTS) as u64,
+        "every racing lookup must resolve to a hit or a miss"
+    );
+    assert!(
+        evicted_total.load(Ordering::Acquire) > 0,
+        "the budget pass must have actually evicted during the race, \
+         otherwise nothing was raced"
+    );
+}
+
+/// Prompts (and therefore indexed blocks) in the racing-budget fixture.
+const RACE_PROMPTS: usize = 6;
+/// Layout key the racing-budget fixture spills and probes under.
+const RACE_LK: u64 = 0x00c0_ffee_0000_0001;
+
+/// One indexed block per prompt, plus everything a checker needs to tell those
+/// blocks apart after a round trip through the tier.
+struct RaceFixture {
+    /// Token ids per prompt; one full block each.
+    prompts: Vec<Vec<u32>>,
+    /// Index/`.kvb` key per prompt (the salted chained digest).
+    keys: Vec<String>,
+    /// K dequant of the cache that was spilled under each prompt.
+    expected_k: Vec<Vec<f32>>,
+    /// Raw `.kvb` bytes per prompt, so a miss can be re-recorded without doing
+    /// MLX work off the thread that built the caches.
+    kvb_bytes: Vec<Vec<u8>>,
+    /// On-disk size of one block, the unit the budget is expressed in.
+    block_bytes: u64,
+}
+
+/// Seed `dir`'s index with one block per prompt. Each prompt gets its own token
+/// ids *and* its own KV content, which is what makes "served the wrong block"
+/// observable in the data rather than only in the token ids.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn seed_race_fixture(dir: &std::path::Path, db: &std::path::Path, device: Device) -> RaceFixture {
+    let index = SsdKvIndex::open_at(db).unwrap();
+    let prompts: Vec<Vec<u32>> = (0..RACE_PROMPTS)
+        .map(|i| {
+            let base = (i as u32 + 1) * 100_000;
+            (base..base + BLOCK_TOKENS as u32).collect()
+        })
+        .collect();
+    let mut keys = Vec::with_capacity(RACE_PROMPTS);
+    let mut expected_k = Vec::with_capacity(RACE_PROMPTS);
+    let mut kvb_bytes = Vec::with_capacity(RACE_PROMPTS);
+    for (i, ids) in prompts.iter().enumerate() {
+        let chained =
+            chained_block_hashes_seeded(ids, FNV_OFFSET ^ RACE_LK ^ QUANT.cache_key_salt());
+        assert_eq!(chained.len(), 1);
+        let key = hash_to_hex_local(chained[0]);
+        let cache = build_kvcache(BLOCK_TOKENS as i32, 0x9E11 + i as u64 * 977);
+        expected_k.push(probe_k(&cache, device));
+        let path = dir.join(format!("{key}.kvb"));
+        write_caches(&path, device, MODEL_ID, QUANT, &[cache], &[]).unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+        index
+            .record(&key, RACE_LK, &path, MODEL_ID, &QUANT.to_string(), size)
+            .unwrap();
+        kvb_bytes.push(std::fs::read(&path).unwrap());
+        keys.push(key);
+    }
+    let block_bytes = index.total_bytes().unwrap() / RACE_PROMPTS as u64;
+    RaceFixture {
+        prompts,
+        keys,
+        expected_k,
+        kvb_bytes,
+        block_bytes,
+    }
+}
+
+/// Assert `block` is the block that was spilled under `fx.prompts[i]` — both
+/// its token ids and its K content. Content is what catches a block served
+/// under the wrong key; token ids alone would not, since they are recomputed
+/// from the caller's own prompt.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+fn assert_own_block(
+    block: &HydratedBlock,
+    fx: &RaceFixture,
+    i: usize,
+    device: Device,
+    whence: &str,
+) {
+    assert_eq!(
+        &block.prompt_ids, &fx.prompts[i],
+        "{whence}: hydrate served prompt {i} foreign token ids"
+    );
+    let got = probe_k(&block.kv_caches[0], device);
+    assert_eq!(got.len(), fx.expected_k[i].len());
+    let err = fx.expected_k[i]
+        .iter()
+        .zip(&got)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        err < 1e-3,
+        "{whence}: hydrate served prompt {i} a block whose K content is not its own \
+         (max err {err})"
+    );
+}
+
+/// A row whose `.kvb` is gone — what a budget pass interrupted between its row
+/// delete and its file unlink leaves behind, and what an operator's `rm` leaves
+/// behind — must read as a clean miss that also repairs the row, and the
+/// namespace must stay usable afterwards. Half-applied maintenance leaves a
+/// working tier, not a poisoned one.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: single full block yields exactly one chained digest, asserted before index"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn hydrate_of_a_row_whose_file_vanished_is_a_miss_and_leaves_the_tier_usable() {
+    const LK: u64 = 0x00c0_ffee_0000_0002;
+
+    let device = Device::Cpu;
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let db = dir.join("index.db");
+    let index = SsdKvIndex::open_at(&db).unwrap();
+
+    let prompt_ids: Vec<u32> = (0..BLOCK_TOKENS as u32).collect();
+    let chained =
+        chained_block_hashes_seeded(&prompt_ids, FNV_OFFSET ^ LK ^ QUANT.cache_key_salt());
+    assert_eq!(chained.len(), 1);
+    let key = hash_to_hex_local(chained[0]);
+    let path = dir.join(format!("{key}.kvb"));
+
+    let cache = build_kvcache(BLOCK_TOKENS as i32, 0x7E57);
+    let expected = probe_k(&cache, device);
+    write_caches(&path, device, MODEL_ID, QUANT, &[cache], &[]).unwrap();
+    let size = std::fs::metadata(&path).unwrap().len();
+    let kvb = std::fs::read(&path).unwrap();
+    index
+        .record(&key, LK, &path, MODEL_ID, &QUANT.to_string(), size)
+        .unwrap();
+
+    // Row survives, file does not — the half-applied state.
+    std::fs::remove_file(&path).unwrap();
+
+    let hydrator = SsdHydrator::with_index(
+        MODEL_ID,
+        QUANT,
+        LK,
+        device,
+        dir,
+        SsdKvIndex::open_at(&db).unwrap(),
+    );
+    assert!(
+        hydrator.lookup(&prompt_ids).unwrap().is_none(),
+        "a row pointing at a vanished file must read as a miss"
+    );
+    assert!(
+        index.lookup(&key, LK).unwrap().is_none(),
+        "the dangling row must be dropped, not left to miss forever"
+    );
+
+    // The namespace is still usable: re-spill the same block and hydrate it.
+    std::fs::write(&path, &kvb).unwrap();
+    index
+        .record(&key, LK, &path, MODEL_ID, &QUANT.to_string(), size)
+        .unwrap();
+    let block = hydrator
+        .lookup(&prompt_ids)
+        .unwrap()
+        .expect("re-spilled block must hydrate");
+    let got = probe_k(&block.kv_caches[0], device);
+    let err = expected
+        .iter()
+        .zip(&got)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(err < 1e-3, "re-spilled block round-trip error {err}");
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────
 
 fn hash_to_hex_local(d: u64) -> String {

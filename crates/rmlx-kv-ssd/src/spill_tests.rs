@@ -12,6 +12,11 @@ const MODEL_ID: &str = "Gemma4ForConditionalGeneration/test-snap";
 /// placeholder so the recorded row's `layout_key` column is observable.
 const TEST_LAYOUT_KEY: u64 = 0xa55a_5aa5_d00d_d00du64;
 
+/// "No on-disk ceiling configured" — what `SsdSpiller::spawn` resolves to when
+/// the SSD tier is unconfigured. Tests that are not about the budget pass it so
+/// their block counts do not depend on eviction.
+const NO_BUDGET: u64 = 0;
+
 fn job(hash: u64) -> SpillJob {
     SpillJob {
         hash,
@@ -42,8 +47,14 @@ fn spill_writes_file_and_index_row() {
     let index = SsdKvIndex::open_at(&db).unwrap();
 
     let hash = 0xdead_beef_0000_0001u64;
-    let (spiller, handle) =
-        SsdSpiller::spawn_with_index(MODEL_ID, TEST_LAYOUT_KEY, Device::Cpu, dir.clone(), index);
+    let (spiller, handle) = SsdSpiller::spawn_with_index(
+        MODEL_ID,
+        TEST_LAYOUT_KEY,
+        Device::Cpu,
+        dir.clone(),
+        index,
+        NO_BUDGET,
+    );
     spiller.try_spill(job(hash));
     drop(spiller); // close the channel so the drain thread exits
     handle.join().unwrap();
@@ -95,8 +106,14 @@ fn spill_failure_does_not_panic_and_drains_on() {
 
     let db = tmp.path().join("index.db");
     let index = SsdKvIndex::open_at(&db).unwrap();
-    let (spiller, handle) =
-        SsdSpiller::spawn_with_index(MODEL_ID, TEST_LAYOUT_KEY, Device::Cpu, bad_dir, index);
+    let (spiller, handle) = SsdSpiller::spawn_with_index(
+        MODEL_ID,
+        TEST_LAYOUT_KEY,
+        Device::Cpu,
+        bad_dir,
+        index,
+        NO_BUDGET,
+    );
 
     // This job must fail to serialize but not crash the thread.
     spiller.try_spill(job(0x1111));
@@ -169,6 +186,68 @@ fn spawn_returns_handle_that_exits_on_drop() {
     assert_eq!(spiller.model_id(), format!("{MODEL_ID}-spawn"));
     assert_eq!(spiller.layout_key(), TEST_LAYOUT_KEY);
     drop(spiller); // closing the channel lets the production drain thread exit
+}
+
+/// The drain thread is the only writer that grows the namespace, and between
+/// model loads nothing else evicts — so if it does not enforce the configured
+/// ceiling, a long-lived `serve` runs past `--kv-ssd-cache-gb` for its whole
+/// lifetime and only comes back under it at the next attach. Spill more blocks
+/// than the budget holds and require the drain thread to have evicted down to
+/// it by the time it exits.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn drain_thread_evicts_to_the_namespace_budget() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let db = dir.join("index.db");
+
+    // Size one block by spilling a single job with no budget, then set the
+    // budget to two blocks' worth. Deriving the budget from the measured block
+    // size keeps the test independent of the .kvb serialization size.
+    let probe_index = SsdKvIndex::open_at(&db).unwrap();
+    let (probe_spiller, probe_handle) = SsdSpiller::spawn_with_index(
+        MODEL_ID,
+        TEST_LAYOUT_KEY,
+        Device::Cpu,
+        dir.clone(),
+        probe_index,
+        NO_BUDGET,
+    );
+    probe_spiller.try_spill(job(0x9000));
+    drop(probe_spiller);
+    probe_handle.join().unwrap();
+    let one_block = SsdKvIndex::open_at(&db).unwrap().total_bytes().unwrap();
+    assert!(one_block > 0, "probe spill must have recorded a block");
+    let budget = one_block * 2;
+
+    // Now spill six blocks through a drain thread that knows the budget.
+    let index = SsdKvIndex::open_at(&db).unwrap();
+    let (spiller, handle) =
+        SsdSpiller::spawn_with_index(MODEL_ID, TEST_LAYOUT_KEY, Device::Cpu, dir, index, budget);
+    for i in 0..6u64 {
+        spiller.try_spill(job(0x9100 + i));
+        // The channel is bounded and `try_spill` drops on overflow; the drain
+        // has to keep up for the block count to be the one under test.
+        thread::sleep(std::time::Duration::from_millis(5));
+    }
+    drop(spiller);
+    handle.join().unwrap();
+
+    let idx = SsdKvIndex::open_at(&db).unwrap();
+    let total = idx.total_bytes().unwrap();
+    assert!(
+        total <= budget,
+        "drain thread must hold the namespace at or under its {budget}-byte \
+         budget, found {total}"
+    );
+    assert_eq!(
+        idx.prune_missing().unwrap(),
+        0,
+        "every surviving row must still have its .kvb on disk"
+    );
 }
 
 /// SSD-tier observability (step2-A): after a successful `drain_one`, the
