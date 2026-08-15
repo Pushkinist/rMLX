@@ -18,6 +18,24 @@
 #
 # Builds from source (depends_on "rust" => :build) and links the Homebrew MLX
 # (depends_on "mlx-c"), so the mlx-c rpath always matches the user's MLX install.
+#
+# The `mlx-c` dependency is deliberately unversioned, and must stay that way.
+# rMLX pins one validated mlx / mlx-c pair for development
+# (crates/rmlx-mlx/mlx-pin.txt), but that pin exists for a bottle regression
+# that only costs anything on M5-and-later hardware — the generation that has a
+# GPU Neural Accelerator. On M1-M4 the same MLX is entirely correct, and
+# requiring an older release there would force a downgrade for a benefit that
+# hardware cannot use. The pin is a this-machine, this-generation workaround,
+# not a product requirement.
+#
+# What ships to users instead is a runtime check: rmlx probes the mlx.metallib
+# of the library it actually loaded and warns on startup only when the host has
+# a Neural Accelerator and the kernels are missing. That stays true after a
+# `brew upgrade mlx` moves the symlink underneath an already-installed rmlx,
+# which no version constraint here could. See crates/rmlx-mlx/src/nax.rs and
+# docs/FFI.md. There is no `caveats` block for the same reason: it would print
+# for every user on every Mac, and the runtime warning reaches exactly the
+# hosts the finding applies to.
 class Rmlx < Formula
   desc "Rust-native, single-binary MLX inference + conversion backend for Apple Silicon"
   homepage "https://github.com/Pushkinist/rMLX"
