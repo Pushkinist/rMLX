@@ -109,6 +109,41 @@ This is a **Homebrew bottle regression, not an MLX regression**: the upstream
 0.32.0 PyPI wheel ships the kernels and is fine. Tracked in
 [#216](https://github.com/Pushkinist/rMLX/issues/216).
 
+#### Where NAX can appear, and where it cannot
+
+The pin buys the NAX **GEMM** path (`steel_gemm_fused_nax_*`), which every
+model's matmuls go through. NAX **attention** is a far narrower thing, and the
+two are easy to conflate:
+
+| Path | NAX? | Why |
+|---|---|---|
+| Prefill attention, `head_dim` 64 or 128, Q not f32 | **yes**, `steel_attention_<dtype>_bq64_…` | MLX's `sdpa_full` takes the NAX branch unless `head_dim == 80` or Q is f32 without TF32 |
+| Prefill attention, `head_dim` 256 | no | MLX ships `steel_attention` for `bd` 64 / 80 / 128 only — a 256-wide head has no fused prefill kernel at all and runs the composite matmul+softmax fallback |
+| Decode attention, any `head_dim`, any codec | no | `bq64` is a query tile of 64; decode is `q_seq = 1`, and MLX routes `q_seq <= 8` to `sdpa_vector`, which has no NAX variant |
+| Our own `.metal` kernels | no | all of them are `q_seq = 1` decode kernels. NAX's one matmul tile shape has an M floor of 16; at `q_seq = 1` the only M available is `heads_per_kv` (4–8 on our models), so the tile can never be more than half filled |
+
+So the bf16 mirror's decode advantage over a quantized codec is bandwidth and
+kernel quality, **not** NAX — no decode path on any codec reaches it, and a
+hand-written decode kernel could not either. Only prefill is in play, and only
+for a 64- or 128-wide head.
+
+Measured on this host (M5 Max, mlx 0.31.2), from the per-pipeline binary
+archives inside a GPU capture — the whole `mlx.metallib` is also embedded in a
+bundle, so only the small per-pipeline archives are evidence of a *created*
+pipeline:
+
+- Ternary-Bonsai-8B (`head_dim` 128) creates three
+  `steel_attention_bfloat16_bq64_bk32_bd128_wm4_wn1_mask*` pipelines — the
+  causal, aligned-masked and unaligned-masked prefill permutations. NAX is
+  engaged and Q is already bf16, so there is no f32 gate to fix.
+- gemma-4-e2b (`head_dim` 256) creates none, on the same tooling and prompt
+  size. It does create `steel_gemm_fused_nax_*`, i.e. NAX GEMM is live for a
+  model whose attention can never use NAX.
+- Both decode through `sdpa_vector`.
+
+Of the test targets only Bonsai-8B is `head_dim` 128; the gemma-4 family, the
+Qwen3.6 / Qwen3.5 family (Bonsai-27B included) and medgemma are all 256.
+
 #### What the build checks
 
 `build.rs` warns — never fails — on two independent things:
