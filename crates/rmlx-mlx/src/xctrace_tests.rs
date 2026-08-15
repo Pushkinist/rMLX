@@ -249,13 +249,147 @@ fn asking_for_a_column_the_schema_lacks_is_an_error_not_a_none() {
 }
 
 #[test]
-fn a_different_table_is_refused_by_name() {
+fn a_different_table_is_refused_by_name_on_both_skip_branches() {
     let xml = doc(ROWS_HAPPY).replace("metal-gpu-intervals", "metal-driver-intervals");
-    let err = summarise_gpu_intervals(&xml, all()).expect_err("the wrong table must be refused");
+    // The skip branch reads columns another schema need not have, so before the
+    // check was hoisted out of the row walk the same input refused as
+    // WrongSchema with skip 0 and as UnknownColumn with skip 1.
+    for skip_ms in [0, 1] {
+        let err = summarise_gpu_intervals(
+            &xml,
+            SummaryFilter {
+                process: None,
+                skip_ms,
+            },
+        )
+        .expect_err("the wrong table must be refused");
+        assert!(
+            matches!(err, XctraceError::WrongSchema { ref actual, .. } if actual == "metal-driver-intervals"),
+            "skip_ms={skip_ms} got {err}"
+        );
+    }
+}
+
+#[test]
+fn a_null_start_is_refused_rather_than_read_as_zero() {
+    // The row is otherwise well formed and the count is right, so nothing but
+    // an explicit NULL check sees this. Read as 0 it pins the computed origin
+    // of a window to zero: the skip silently reverts to trace-relative, the
+    // SkipExceedsSpan guard cannot fire, and span_ns inflates.
+    let rows = "<row><sentinel/><duration fmt=\"b\">2</duration>\
+                <sentinel/><gpu-channel-name fmt=\"Compute\">Compute</gpu-channel-name>\
+                <process fmt=\"rmlx (1)\"></process></row>";
+    for skip_ms in [0, 1] {
+        let err = summarise_gpu_intervals(
+            &doc(rows),
+            SummaryFilter {
+                process: None,
+                skip_ms,
+            },
+        )
+        .expect_err("a NULL start must be refused");
+        assert!(
+            matches!(err, XctraceError::NullCell { ref mnemonic, .. } if mnemonic == "start"),
+            "skip_ms={skip_ms} got {err}"
+        );
+    }
+}
+
+#[test]
+fn a_null_duration_is_refused_rather_than_read_as_zero() {
+    let rows = "<row><start-time fmt=\"a\">1</start-time><sentinel/>\
+                <sentinel/><gpu-channel-name fmt=\"Compute\">Compute</gpu-channel-name>\
+                <process fmt=\"rmlx (1)\"></process></row>";
+    let err = summarise_gpu_intervals(&doc(rows), all()).expect_err("a NULL duration is refused");
     assert!(
-        matches!(err, XctraceError::WrongSchema { ref actual, .. } if actual == "metal-driver-intervals"),
+        matches!(err, XctraceError::NullCell { ref mnemonic, .. } if mnemonic == "duration"),
         "got {err}"
     );
+}
+
+#[test]
+fn a_self_closing_row_is_refused_not_skipped() {
+    // Skipping it reports an export of them as NoRows — "the recording captured
+    // nothing" — instead of as the layout change it is.
+    let err = collect(&doc("<row/>")).expect_err("an empty row element must be refused");
+    assert!(
+        matches!(
+            err,
+            XctraceError::ColumnCountMismatch {
+                expected: 5,
+                actual: 0,
+                ..
+            }
+        ),
+        "got {err}"
+    );
+}
+
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "fixture is a literal in this file; a parse failure here is the test failing"
+)]
+fn a_pretty_printed_schema_parses_identically() {
+    // A real pretty-printer indents INSIDE the leaf elements as well as between
+    // them, so the mnemonic's text node arrives as "\n        start\n      ".
+    // Untrimmed that becomes the column name and every lookup fails; the
+    // close-reset does not help, because the text belongs to the open element.
+    let pretty = SCHEMA
+        .replace("><col>", ">\n    <col>\n      ")
+        .replace("<mnemonic>", "<mnemonic>\n        ")
+        .replace("</mnemonic>", "\n      </mnemonic>\n      ")
+        .replace("<engineering-type>", "<engineering-type>\n        ")
+        .replace("</engineering-type>", "\n      </engineering-type>\n    ")
+        .replace("</col>", "</col>\n");
+    assert!(
+        pretty.contains("<mnemonic>\n        start"),
+        "fixture must indent inside the element"
+    );
+    let xml = format!(
+        "<?xml version=\"1.0\"?><trace-query-result><node xpath='x'>{pretty}{ROWS_HAPPY}</node></trace-query-result>"
+    );
+    let summary = summarise_gpu_intervals(&xml, only("rmlx")).unwrap();
+    let compact = summarise_gpu_intervals(&doc(ROWS_HAPPY), only("rmlx")).unwrap();
+    assert_eq!(summary.rows_matched, compact.rows_matched);
+    assert_eq!(summary.span_ns(), compact.span_ns());
+    assert_eq!(summary_csv(&summary), summary_csv(&compact));
+}
+
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "fixture is a literal in this file; a parse failure here is the test failing"
+)]
+fn text_after_a_closed_element_is_not_attributed_to_it() {
+    // The whitespace trim covers a pretty-printed export; this covers the other
+    // half of the same fix. Without clearing the state on </mnemonic>, the
+    // stray text below is read as the mnemonic and the column becomes
+    // unaddressable — the schema parses, and every later lookup fails.
+    let schema = SCHEMA.replacen("</mnemonic>", "</mnemonic>stray", 1);
+    let xml = format!(
+        "<?xml version=\"1.0\"?><trace-query-result><node xpath='x'>{schema}{ROWS_HAPPY}</node></trace-query-result>"
+    );
+    let summary = summarise_gpu_intervals(&xml, only("rmlx")).unwrap();
+    assert_eq!(summary.rows_matched, 2);
+}
+
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "fixture is a literal in this file; a parse failure here is the test failing"
+)]
+fn a_channel_with_no_latency_sample_reports_empty_not_zero() {
+    // Every row's start-latency is a sentinel, so the truth is "not measured".
+    // A 0 here reads as a zero CPU->GPU gap, the most interesting possible
+    // result, to any script that does not also read latency_samples.
+    let rows = "<row><start-time fmt=\"a\">1000</start-time><duration fmt=\"b\">10</duration>\
+                <sentinel/><gpu-channel-name fmt=\"Compute\">Compute</gpu-channel-name>\
+                <process fmt=\"rmlx (1)\"></process></row>";
+    let summary = summarise_gpu_intervals(&doc(rows), all()).unwrap();
+    let csv = summary_csv(&summary);
+    let row = csv.lines().nth(1).unwrap();
+    assert_eq!(row, "Compute,1,10,10,10,0,,,", "got {row}");
 }
 
 #[test]

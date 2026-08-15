@@ -92,6 +92,26 @@ fn per_second(count: u64, span_ns: u64) -> String {
     format!("{rate:.1}")
 }
 
+/// Busy time as a share of the span. Labelled "of span" rather than "duty
+/// cycle" when several channels are populated, because their busy times overlap
+/// and the sum can exceed the span.
+fn busy_fraction(summary: &GpuIntervalSummary, populated: usize) -> String {
+    let span = summary.span_ns();
+    if span == 0 {
+        return "n/a".to_owned();
+    }
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "display only; a --time-limit-bounded span stays far inside f64's exact integer range"
+    )]
+    let pct = summary.busy_ns() as f64 * 100.0 / span as f64;
+    if populated > 1 {
+        format!("{pct:.1}% of span, summed")
+    } else {
+        format!("{pct:.1}% of span")
+    }
+}
+
 fn report(summary: &GpuIntervalSummary, args: &Args) {
     println!(
         "rows: {} total, {} matched{}{}",
@@ -106,12 +126,38 @@ fn report(summary: &GpuIntervalSummary, args: &Args) {
             String::new()
         }
     );
+    // The busy FRACTION is the number to read `start-latency` against, so print
+    // it rather than leaving it to be computed by hand from two other columns.
+    // At a high fraction the gap is queueing behind work already submitted; the
+    // host-stall signal is idle GPU, i.e. span - busy.
+    let populated = summary
+        .channels
+        .iter()
+        .filter(|c| c.submissions > 0)
+        .count();
     println!(
-        "span: {} ms   gpu busy: {} ms (channels overlap)   {} submissions/s",
+        "span: {} ms   gpu busy: {} ms ({})   idle: {} ms   {} submissions/s",
         ms(summary.span_ns()),
         ms(summary.busy_ns()),
+        busy_fraction(summary, populated),
+        ms(summary.span_ns().saturating_sub(summary.busy_ns())),
         per_second(summary.rows_matched, summary.span_ns())
     );
+    if summary.busy_ns() > summary.span_ns() {
+        // Only definitely wrong in this direction: concurrent channels overlap,
+        // so their summed busy time can exceed the wall-clock span outright.
+        println!(
+            "note: busy exceeds span — {populated} channels ran concurrently and their \
+             busy times overlap, so this is a sum, not a duty cycle."
+        );
+    } else if populated > 1 {
+        // Not an error, just an accounting caveat: read the dominant channel's
+        // own busy against the span for a duty cycle.
+        println!(
+            "note: busy is summed over {populated} channels; for a duty cycle read the \
+             dominant channel's busy against the span."
+        );
+    }
     println!();
     println!(
         "{:<10} {:>8} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",

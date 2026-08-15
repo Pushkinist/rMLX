@@ -132,6 +132,15 @@ pub enum XctraceError {
         available: String,
     },
 
+    /// A column that must carry a value was NULL.
+    #[error("row {row} column '{mnemonic}': <sentinel/> where a value is required")]
+    NullCell {
+        /// Zero-based row number.
+        row: usize,
+        /// Mnemonic of the offending column.
+        mnemonic: String,
+    },
+
     /// A cell that must hold an integer did not.
     #[error("row {row} column '{mnemonic}': {value:?} is not an integer")]
     NotAnInteger {
@@ -287,6 +296,13 @@ impl RowView<'_> {
     ///
     /// # Errors
     /// [`XctraceError::UnknownColumn`] when the schema has no such column.
+    ///
+    /// The `ColumnCountMismatch` arm is defence in depth and is not reachable
+    /// today: `finish_row` has already proven the row has exactly one cell per
+    /// declared column before a `RowView` can exist, so an index that
+    /// `column_index` returned is always in range. It is kept rather than
+    /// replaced with an unreachable-panic so that a future change to that
+    /// invariant surfaces as the parser's own named refusal.
     pub fn cell(&self, mnemonic: &str) -> Result<&Cell> {
         let idx = self.schema.column_index(mnemonic)?;
         self.cells
@@ -315,6 +331,24 @@ impl RowView<'_> {
                 mnemonic: mnemonic.to_owned(),
                 value: text.to_owned(),
             })
+    }
+
+    /// Integer value under `mnemonic`, refusing a NULL.
+    ///
+    /// For the load-bearing numeric columns, where a `<sentinel/>` read as `0`
+    /// is a measurement rather than an absence: a NULL `start` pins the
+    /// computed origin of a window to zero, which silently turns a
+    /// process-relative skip back into a trace-relative one and inflates the
+    /// reported span.
+    ///
+    /// # Errors
+    /// [`XctraceError::NullCell`] when the cell is NULL, plus everything
+    /// [`Self::u64`] can raise.
+    pub fn u64_required(&self, mnemonic: &str) -> Result<u64> {
+        self.u64(mnemonic)?.ok_or_else(|| XctraceError::NullCell {
+            row: self.row,
+            mnemonic: mnemonic.to_owned(),
+        })
     }
 
     /// Display form under `mnemonic`, or `None` when the cell is NULL.
@@ -355,30 +389,41 @@ impl<'a> Scanner<'a> {
         Self { src, pos: 0 }
     }
 
+    // Loops rather than recursing over skipped declarations, comments and CDATA:
+    // tail-call elimination is not a language guarantee, and a run of them in a
+    // 100 MB document would grow the stack linearly under an unoptimised build.
     fn next(&mut self) -> Result<Option<Event<'a>>> {
-        let rest = self.src.get(self.pos..).unwrap_or_default();
-        if rest.is_empty() {
-            return Ok(None);
-        }
-        if !rest.starts_with('<') {
-            // Text run up to the next tag.
-            let end = rest.find('<').unwrap_or(rest.len());
-            let text = rest.get(..end).unwrap_or_default();
-            self.pos += end;
-            return Ok(Some(Event::Text(text)));
-        }
-        // Declarations, comments and CDATA carry nothing this parser needs, but
-        // skipping them blindly would also skip a malformed tag, so each is
-        // matched by its own terminator and an unterminated one is an error.
-        for (open, close) in [("<?", "?>"), ("<!--", "-->"), ("<![CDATA[", "]]>")] {
-            if rest.starts_with(open) {
-                let Some(end) = rest.find(close) else {
-                    return malformed(self.pos, format!("unterminated {open}"));
-                };
-                self.pos += end + close.len();
-                return self.next();
+        let rest = loop {
+            let rest = self.src.get(self.pos..).unwrap_or_default();
+            if rest.is_empty() {
+                return Ok(None);
             }
-        }
+            if !rest.starts_with('<') {
+                // Text run up to the next tag.
+                let end = rest.find('<').unwrap_or(rest.len());
+                let text = rest.get(..end).unwrap_or_default();
+                self.pos += end;
+                return Ok(Some(Event::Text(text)));
+            }
+            // Declarations, comments and CDATA carry nothing this parser needs,
+            // but skipping them blindly would also skip a malformed tag, so each
+            // is matched by its own terminator and an unterminated one is an
+            // error.
+            let mut skipped = false;
+            for (open, close) in [("<?", "?>"), ("<!--", "-->"), ("<![CDATA[", "]]>")] {
+                if rest.starts_with(open) {
+                    let Some(end) = rest.find(close) else {
+                        return malformed(self.pos, format!("unterminated {open}"));
+                    };
+                    self.pos += end + close.len();
+                    skipped = true;
+                    break;
+                }
+            }
+            if !skipped {
+                break rest;
+            }
+        };
         let Some(close_idx) = rest.find('>') else {
             return malformed(self.pos, "unterminated tag");
         };
@@ -529,6 +574,19 @@ where
                 visit(&view)?;
                 row_index += 1;
             }
+            // A self-closing <row/> carries no cells at all. Skipping it would
+            // surface an export of them as NoRows ("the recording captured
+            // nothing") instead of as the layout change it is.
+            Event::Empty { name: "row", .. } => {
+                let Some(schema) = schema.as_ref() else {
+                    return Err(XctraceError::MissingSchema);
+                };
+                return Err(XctraceError::ColumnCountMismatch {
+                    row: row_index,
+                    expected: schema.columns.len(),
+                    actual: 0,
+                });
+            }
             Event::Open { .. } | Event::Empty { .. } | Event::Close { .. } | Event::Text(_) => {}
         }
     }
@@ -540,6 +598,28 @@ where
         });
     }
     Ok(schema)
+}
+
+/// Reads only the `<schema>` header, without visiting a single row.
+///
+/// Lets a caller reject the wrong table before choosing how to walk it, so a
+/// mis-aimed `--xpath` refuses the same way whatever options were passed.
+///
+/// # Errors
+/// [`XctraceError::MissingSchema`] when the document has no schema element,
+/// plus any scanning error.
+pub fn schema_of(xml: &str) -> Result<Schema> {
+    let mut scanner = Scanner::new(xml);
+    while let Some(event) = scanner.next()? {
+        if let Event::Open {
+            name: "schema",
+            attrs,
+        } = event
+        {
+            return parse_schema(&mut scanner, attrs);
+        }
+    }
+    Err(XctraceError::MissingSchema)
 }
 
 fn parse_schema(scanner: &mut Scanner<'_>, attrs: &str) -> Result<Schema> {
@@ -558,11 +638,24 @@ fn parse_schema(scanner: &mut Scanner<'_>, attrs: &str) -> Result<Schema> {
                     _ => None,
                 };
             }
-            Event::Text(text) => match current {
-                Some("mnemonic") => mnemonic = Some(unescape(text)),
-                Some("engineering-type") => engineering_type = Some(unescape(text)),
-                _ => {}
-            },
+            // Clearing on close is what makes this safe against a
+            // pretty-printed export: without it the state survives past
+            // </mnemonic>, and the indentation before the next element
+            // overwrites the mnemonic just read with whitespace. parse_row
+            // already guards the same way.
+            Event::Close {
+                name: "mnemonic" | "engineering-type",
+            } => current = None,
+            Event::Text(text) => {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    match current {
+                        Some("mnemonic") => mnemonic = Some(unescape(trimmed)),
+                        Some("engineering-type") => engineering_type = Some(unescape(trimmed)),
+                        _ => {}
+                    }
+                }
+            }
             Event::Close { name: "col" } => {
                 let index = columns.len();
                 columns.push(Column {

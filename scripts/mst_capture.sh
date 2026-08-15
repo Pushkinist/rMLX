@@ -55,7 +55,8 @@ KV_QUANT="none"
 PROMPT_TOKENS=4096
 MAX_TOKENS=400
 TIME_LIMIT=12
-SKIP_MS=0
+# Empty means "not supplied" — the run's own measured prefill is used instead.
+SKIP_MS=""
 BIN="target/release/rmlx"
 KEEP=5
 OUT_DIR=""
@@ -68,8 +69,10 @@ usage: mst_capture.sh --model <snapshot-abs-path>
          [--max-tokens N]         tokens to decode (default 400)
          [--time-limit S]         seconds to record (default 12)
          [--skip-ms N]            drop the first N ms of THIS PROCESS's GPU work
-                                  from the summary, i.e. prefill. Weight load
-                                  submits nothing and is absent already.
+                                  from the summary. DEFAULT: the prefill_ms this
+                                  very run reported, read back from its own log,
+                                  so the decode window needs no guessing. Weight
+                                  load submits nothing and is absent already.
          [--binary PATH]          rmlx to run (default target/release/rmlx)
          [--keep N]               .trace bundles to retain (default 5)
          [--out-dir DIR]          default <RMLX_HOME>/traces/mst
@@ -97,7 +100,73 @@ if [ -z "$MODEL" ]; then
 	exit 2
 fi
 
-cd "$(dirname "$0")/.." || exit 1
+# Unvalidated numbers reach xctrace and rmlx as nonsense that fails much later
+# and much less clearly — `--time-limit abc` becomes the literal `abcs`.
+require_uint() { # name value
+	case "$2" in
+	'' | *[!0-9]*)
+		echo "ERROR: $1 must be a non-negative integer, got '$2'" >&2
+		exit 2
+		;;
+	esac
+}
+require_uint --time-limit "$TIME_LIMIT"
+require_uint --max-tokens "$MAX_TOKENS"
+require_uint --keep "$KEEP"
+require_uint --prompt-tokens "$PROMPT_TOKENS"
+[ -n "$SKIP_MS" ] && require_uint --skip-ms "$SKIP_MS"
+
+# baseline resolves --prompt-tokens to a checked-in fixture, so an unlisted size
+# is rejected after the model has loaded. Catch it here instead.
+case "$PROMPT_TOKENS" in
+4096 | 8192 | 16384 | 32768 | 65536 | 131072) ;;
+*)
+	echo "ERROR: --prompt-tokens $PROMPT_TOKENS has no prompt fixture." >&2
+	echo "  Valid: 4096, 8192, 16384, 32768, 65536, 131072 (prompts/longctx_*.json)" >&2
+	exit 2
+	;;
+esac
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT" || exit 1
+
+RMLX_HOME_DIR="${RMLX_HOME:-$PWD/.rmlx}"
+[ -n "$OUT_DIR" ] || OUT_DIR="$RMLX_HOME_DIR/traces/mst"
+mkdir -p "$OUT_DIR" || exit 1
+
+# Retention runs on EVERY exit, not only the happy one. The failure paths below
+# — bad arguments, a run that produced no rows — are the common ones while
+# debugging, which is exactly when bundles pile up at ~300-400 MB each, and a
+# bound that only applies to successful runs is not a bound.
+#
+# The bundle just written is excluded BY NAME. Guarding by ordinal position
+# alone deletes it whenever KEEP is 0, which `make profile-mst KEEP=0` reaches:
+# GNU make treats the string "0" as true, so `$(if 0,...)` passes it straight
+# through. KEEP is validated as an integer above, so `[` cannot fall through to
+# the delete on a non-numeric value either.
+prune_traces() {
+	rc=$?
+	# The bundle just written occupies one of the KEEP slots — but only if this
+	# run got far enough to write one. Reserving it unconditionally would prune
+	# one bundle too many on every preflight failure.
+	limit="$KEEP"
+	if [ -n "${trace:-}" ] && [ -e "${trace:-}" ]; then
+		limit=$((KEEP > 0 ? KEEP - 1 : 0))
+	fi
+	kept=0
+	while IFS= read -r old; do
+		[ -n "$old" ] || continue
+		[ "$old" = "${trace:-}" ] && continue
+		kept=$((kept + 1))
+		[ "$kept" -le "$limit" ] && continue
+		old_base="${old%.trace}"
+		size=$(du -sh "$old" 2>/dev/null | cut -f1)
+		rm -rf "$old" "${old_base}.gpu-intervals.xml" "${old_base}.channels.csv"
+		echo "retention: removed $(basename "$old") (${size:-?}, beyond the newest $KEEP)"
+	done < <(ls -1dt "$OUT_DIR"/*.trace 2>/dev/null)
+	return "$rc"
+}
+trap prune_traces EXIT
 
 if [ ! -x "$BIN" ]; then
 	echo "ERROR: $BIN not found or not executable." >&2
@@ -126,9 +195,6 @@ if pgrep -f 'rmlx serve|mlx_lm|paroquant|omlx' >/dev/null 2>&1; then
 	exit 1
 fi
 
-RMLX_HOME_DIR="${RMLX_HOME:-$PWD/.rmlx}"
-[ -n "$OUT_DIR" ] || OUT_DIR="$RMLX_HOME_DIR/traces/mst"
-mkdir -p "$OUT_DIR" || exit 1
 
 stamp=$(date +%Y%m%d-%H%M%S)
 model_tag=$(basename "${MODEL%/}")
@@ -192,15 +258,55 @@ if [ $rc -ne 0 ] || [ ! -s "$xml" ]; then
 	exit 1
 fi
 
+# Nothing in the GPU-interval table marks where prefill ends — weight load
+# submits no work, so the process's first row is already prefill and the
+# boundary is invisible. The run itself knows: `decode_profile{prefill_ms}` is a
+# plain info! event, so it is in the run's own log at the default level even
+# though `xctrace --launch` swallowed the child's stdout.
+if [ -z "$SKIP_MS" ]; then
+	log_file=$(ls -1t "$RMLX_HOME_DIR"/logs/*.jsonl 2>/dev/null | head -1)
+	if [ -n "$log_file" ]; then
+		SKIP_MS=$(python3 "$REPO_ROOT/scripts/lib/prefill_ms.py" "$log_file")
+	fi
+	if [ -n "$SKIP_MS" ]; then
+		echo "skip:       ${SKIP_MS} ms — measured prefill_ms, read back from this run's log"
+	else
+		SKIP_MS=0
+		echo "WARNING: no decode_profile{prefill_ms} in ${log_file:-<no log>}; the" >&2
+		echo "  summary below INCLUDES prefill. Pass --skip-ms explicitly." >&2
+	fi
+fi
+
+# --release, not the dev default: a 100 MB-scale scan, run twice below, must not
+# make the harness the slowest step in the loop it measures.
+summarise() { # skip_ms [csv_path]
+	if [ -n "${2:-}" ]; then
+		cargo run -q --release -p rmlx-mlx --features metal-capture --example gpu_timeline -- \
+			--input "$xml" --process "$(basename "$BIN")" --skip-ms "$1" --csv "$2"
+	else
+		cargo run -q --release -p rmlx-mlx --features metal-capture --example gpu_timeline -- \
+			--input "$xml" --process "$(basename "$BIN")" --skip-ms "$1"
+	fi
+}
+
+# Both windows are printed. The full one is what the within-run cross-check
+# needs (its span should equal prefill_ms + step_total_ms from the same log);
+# the decode-only one is what kernel questions are asked of.
 echo ""
+echo "== full window (prefill included) =============================="
+summarise 0
+rc=$?
+if [ $rc -eq 0 ] && [ "$SKIP_MS" != "0" ]; then
+	echo ""
+	echo "== decode-only window (first ${SKIP_MS} ms skipped) ============"
+	summarise "$SKIP_MS" "$csv"
+	rc=$?
+elif [ $rc -eq 0 ]; then
+	summarise 0 "$csv" >/dev/null
+	rc=$?
+fi
 # The parser refuses a misaligned or empty table rather than printing zeros, so
 # its exit code is load-bearing here.
-cargo run -q -p rmlx-mlx --features metal-capture --example gpu_timeline -- \
-	--input "$xml" \
-	--process "$(basename "$BIN")" \
-	--skip-ms "$SKIP_MS" \
-	--csv "$csv"
-rc=$?
 if [ $rc -ne 0 ]; then
 	echo "ERROR: summarising $xml failed (exit $rc)" >&2
 	echo "  If it reports no rows for this process, the run itself failed and" >&2
@@ -209,26 +315,6 @@ if [ $rc -ne 0 ]; then
 	exit $rc
 fi
 
-# --- retention --------------------------------------------------------------
-# Enforced here rather than left as an advisory: a bundle is ~145 MB per 8 s and
-# an A/B session writes several, so by the time anyone runs a cleanup the disk
-# is already full and the run in flight has already failed. Oldest first, never
-# the bundle just written, every removal printed with what it reclaimed.
-echo ""
-kept=0
-removed=0
-while IFS= read -r old; do
-	[ -n "$old" ] || continue
-	kept=$((kept + 1))
-	[ "$kept" -le "$KEEP" ] && continue
-	old_base="${old%.trace}"
-	size=$(du -sh "$old" 2>/dev/null | cut -f1)
-	rm -rf "$old" "${old_base}.gpu-intervals.xml" "${old_base}.channels.csv"
-	echo "retention: removed $(basename "$old") (${size:-?}, beyond the newest $KEEP)"
-	removed=$((removed + 1))
-done < <(ls -1dt "$OUT_DIR"/*.trace 2>/dev/null)
-echo "retention: $((kept - removed)) bundle(s) kept in $OUT_DIR (cap $KEEP)"
-
 echo ""
 echo "bundle: $trace"
 echo "table:  $xml"
@@ -236,9 +322,3 @@ echo "csv:    $csv"
 echo ""
 echo "This table has no kernel names — pair it with a capture when you need to"
 echo "know WHICH kernel: bash scripts/gputrace_kernels.sh <bundle>.gputrace"
-if [ "$SKIP_MS" = "0" ]; then
-	echo ""
-	echo "The summary above still includes prefill. For a decode-only window, re-run"
-	echo "the summary with a skip past it (prefill is roughly prompt_tokens/prefill_tps):"
-	echo "  target/debug/examples/gpu_timeline --input '$xml' --process $(basename "$BIN") --skip-ms 500"
-fi

@@ -340,10 +340,10 @@ replayed. A timeline instrument over the live process does show them, headlessly
 and with nanosecond resolution. That path is built:
 
 ```sh
-make profile-mst MODEL=/path/to/snapshot SKIP_MS=500
+make profile-mst MODEL=/path/to/snapshot
 # or, spelled out:
 bash scripts/mst_capture.sh --model /path/to/snapshot --kv-quant none \
-  --prompt-tokens 4096 --max-tokens 600 --time-limit 18 --skip-ms 500
+  --prompt-tokens 4096 --max-tokens 600 --time-limit 18
 ```
 
 It records the live process, exports the `metal-gpu-intervals` table, parses it
@@ -353,8 +353,8 @@ and prints a per-channel table plus a CSV a script can assert on. See
 The table gives per-GPU-submission `start` and `duration` in nanoseconds,
 `gpu-channel-name`, `start-latency` (the CPU→GPU gap), and `cmdbuffer-id` /
 `encoder-id`, per process; `metal-application-encoders-list` and
-`metal-command-buffer-completed` join on those ids. Measured run-to-run spread:
-0.06%. Four things to know before using it:
+`metal-command-buffer-completed` join on those ids. Five things to know before
+using it:
 
 - **`--attach <pid>` does not work** for this template — it reports "No
   configuration information received, will have to guess" and exports zero rows.
@@ -362,11 +362,24 @@ The table gives per-GPU-submission `start` and `duration` in nanoseconds,
   `--all-processes`, which does pick up a running process). The harness uses
   `--launch`, which is why a recording always starts at process launch.
 - **Weight load leaves no rows**; prefill does. Load is CPU and file I/O, so it
-  is simply absent from a GPU-interval table however long it took. `--skip-ms`
-  is therefore measured from *the matched process's own first submission*, not
-  from the start of the trace — that makes one value work across models
-  regardless of how long they take to load. Roughly
-  `prompt_tokens / prefill_tps` milliseconds covers prefill.
+  is simply absent from a GPU-interval table however long it took, and the
+  traced process's very first row is already prefill. Nothing in the table marks
+  where prefill ends, and no `--skip-ms` value discovers it — re-summarising one
+  export at several skips just slides the window, `span(S) == span(0) - S` to
+  under 0.3 ms. The boundary has to come from outside, so the harness reads the
+  run's **own** `decode_profile{prefill_ms}` back out of
+  `<RMLX_HOME>/logs/<run-id>.jsonl` and defaults `--skip-ms` to it. That event
+  is a plain `info!`, so it is present at the default log level even though
+  `xctrace --launch` swallowed the child's stdout. An explicit `--skip-ms` still
+  wins; when no such event is found the harness says so and summarises the full
+  window rather than pretending. `--skip-ms` counts from the matched process's
+  own first submission, not from the start of the trace.
+- **Tracing costs about 1–3% of decode throughput.** Alternating traced and
+  untraced runs of the same cell, comparing each run's own
+  `n_steps / step_total_ms`: gemma-4-e2b −2.8% (n=3 pairs, this machine under
+  load) and −0.9% (n=3, independently, quiet). That straddles CLAUDE.md's ±1%
+  regression band, which is why `--metrics off` is forced: a traced run's
+  throughput must never be recorded.
 - The export XML uses an **`id`/`ref` back-reference encoding** with positional
   columns and `<sentinel/>` for NULL. A naive parser silently misaligns columns,
   which reads as plausible-but-wrong numbers rather than an error.
@@ -376,7 +389,10 @@ The table gives per-GPU-submission `start` and `duration` in nanoseconds,
 - **Volume**: a bundle runs ~300–400 MB and the one-table export ~110 MB for a
   ~15 s recording. Bound it with `--time-limit`; `.rmlx/traces/mst` keeps the
   newest `--keep` bundles (default 5) and prunes the rest, sidecar XML and CSV
-  included, after every successful run.
+  included, on **every** exit — a run that refuses its arguments is exactly when
+  bundles pile up, so a bound that only applied on success would not be one.
+  `make traces-gc` does not cover this directory: it owns `.gputrace` bundles
+  only, and its reported total is scoped to those.
 
 Pipeline and function names do **not** survive the export (only encoder,
 command-buffer, buffer and queue labels), and the driver coalesces consecutive
@@ -385,24 +401,54 @@ it with the identity list from a capture when you need to know *which* kernel.
 
 #### Reading the timeline
 
-Measured decode-only windows, `--kv-quant none`, 4096-token prompt, 600 tokens:
+Measured with `--kv-quant none`, a 4096-token prompt and 600 decoded tokens.
+`--skip-ms` is the run's own reported `prefill_ms`, which is what the harness
+defaults to:
 
-| Model | Compute subs | GPU busy / span | `start-latency` p50 | subs / token |
+| Model | `prefill_ms` | skip used | Compute subs | Compute busy / span | `start-latency` p50 |
+|---|---|---|---|---|---|
+| gemma-4-e2b-it-mxfp8 | 257.5 | 257 ms | 27 055 | 4908 / 5055 ms (97.1%) | 4.18 ms |
+| Ternary-Bonsai-8B-mlx-2bit | 1372.7 | 1373 ms | 44 534 | 4504 / 4690 ms (96.0%) | 6.27 ms |
+
+Note how far apart the two prefills are: a single hand-picked skip cannot serve
+both. A 500 ms skip leaves roughly a fifth of Bonsai's window as prefill while
+overshooting e2b's by 240 ms.
+
+**Cross-check the window within the run, against the same run's log.** The
+predictor is exact enough to be a gate:
+
+| Model | full span | `prefill_ms + step_total_ms` | decode span | `step_total_ms` |
 |---|---|---|---|---|
-| gemma-4-e2b-it-mxfp8 | 26 027 | 4653 / 4705 ms (98.9%) | 4.25 ms | 45.8 |
-| Ternary-Bonsai-8B-mlx-2bit | 42 816 | 4274 / 4346 ms (98.4%) | 6.18 ms | 74.4 |
+| gemma-4-e2b | 5311.96 ms | 5319.9 ms (0.15%) | 5054.86 ms | 5062.4 ms (0.15%) |
+| Ternary-Bonsai-8B | 6063.09 ms | 6044.0 ms (0.32%) | 4689.73 ms | 4671.3 ms (0.39%) |
 
-Cross-check the window against a decode rate from an untraced run of the same
-cell before trusting it: e2b measured 120.8 decode TPS, so 600 tokens is 4.97 s
-against a 4.71 s window that starts 500 ms into GPU work (0.2% agreement);
-Bonsai measured 132.3 TPS, 4.53 s against a 4.35 s window (0.5%). A window that
-disagrees is not the window you think it is.
+Do **not** cross-check against a decode rate from a *separate* untraced run: the
+two runs differ by the observer effect above and by ordinary run-to-run spread,
+and the comparison also has to add the prefill term back. Both windows are
+printed by the harness for exactly this reason.
 
-**`start-latency` is queueing delay, not host stall, whenever the GPU is
-saturated.** At ~99% busy the gap measures how much work is already queued ahead
-of a submission — a 4 ms p50 against a 0.14 ms p50 duration means roughly 30
-submissions deep, not 4 ms of idle GPU waiting on the host. It is the *idle*
-case that indicts a host round-trip, so read it together with the busy fraction.
+Run-to-run spread of the span is **0.04%–0.33%** (n=4 per model): 0.04% on
+Bonsai, 0.33% on e2b. The 0.06% quoted for a toy compute workload is a floor,
+not a bound.
+
+**`start-latency` measures queueing in both regimes — it is not a host-stall
+signal.** It is the gap between a command buffer being *created* (committed) and
+starting on the GPU, so it can only ever see backlog. At 97% busy that is what
+it reports: a 4.18 ms p50 against a 0.14 ms p50 duration is roughly 30
+submissions deep on e2b, ~176 on Bonsai. But it does not rise when the host is
+the bottleneck — it falls, because the queue is empty. Measured on a
+deliberately host-bound cell (gemma-4-e2b `--kv-quant k_rotor3 --rotor-qjl on`,
+which forces the rotor K path onto the CPU and decodes at ~4 TPS):
+
+| cell | Compute busy / span | `dur` p50 | `start-latency` p50 |
+|---|---|---|---|
+| e2b `none` (saturated) | 4908 / 5055 ms (97.1%) | 0.144 ms | 4.18 ms |
+| e2b `k_rotor3` + QJL (host-bound) | 416 / 7196 ms (5.8%) | 0.158 ms | **2.42 ms** |
+
+**The host-stall signal is idle GPU time — `span - busy`**, which the harness
+prints as `idle:`. In the host-bound row above that is 6.78 s of a 7.20 s
+window; the run's own log agrees, at 249 ms per decode step. Read `idle` first,
+and read `start-latency` as queue depth.
 
 ### Working with a bundle
 
@@ -593,7 +639,7 @@ Notes:
 | Flamegraph (needs sudo) | `sudo cargo flamegraph --bin rmlx -- baseline ...` |
 | Heap profile | `cargo build --features rmlx-cli/dhat-heap && ./target/debug/rmlx baseline ...` |
 | GPU kernel identity (which kernels ran) | `make profile-gputrace CODEC=... MODEL=...` — see §5 |
-| GPU timing + CPU→GPU gap | `make profile-mst MODEL=... SKIP_MS=500` — see §5 |
+| GPU timing + CPU→GPU gap | `make profile-mst MODEL=...` — see §5 |
 | Ad-hoc branch counts | `eprintln!` + `counts` crate |
 | Process memory snapshot | `rmlx_core::mach_mem::read_proc_mem()` — see §9 |
 | Prefill-chunk override | `RMLX_PREFILL_CHUNK_<ARCH>=<n>` — see §10 |

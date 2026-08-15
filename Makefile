@@ -134,14 +134,18 @@ profile-gputrace: ## capture a decode-window Metal GPU trace (CODEC= MODEL= requ
 # table rather than printing plausible wrong numbers.
 #
 # The recording starts at process launch (xctrace --attach is broken for this
-# template), so it includes weight load and prefill — SKIP_MS= leaves them out
-# of the summary.
-profile-mst: ## record a Metal System Trace of a live rmlx run and summarise GPU time + CPU->GPU gap (MODEL= required; CODEC= TIME_LIMIT= SKIP_MS= PROMPT_TOKENS= GEN= KEEP=)
-	@if [ -z "$(MODEL)" ]; then \
-		echo "Usage: make profile-mst MODEL=<snapshot-abs-path> \
-[CODEC=none] [TIME_LIMIT=12] [SKIP_MS=4000] [PROMPT_TOKENS=512] [GEN=400] [KEEP=5]"; \
-		exit 2; \
-	fi
+# template). Weight load submits no GPU work so it leaves no rows, but prefill
+# does: SKIP_MS= drops it from the summary, and DEFAULTS to the prefill_ms the
+# run itself reported, so the decode boundary is measured rather than guessed.
+# PROMPT_TOKENS must be a size with a checked-in prompt fixture.
+# MODEL falls back to the workspace default like `make serve` / `make info`, so
+# there is no "MODEL is required" guard to write here — it could never fire.
+# scripts/mst_capture.sh validates the snapshot path and every numeric argument.
+#
+#   make profile-mst MODEL=<snapshot-abs-path> [CODEC=none] [TIME_LIMIT=18]
+#     [SKIP_MS=<default: the run's measured prefill_ms>] [GEN=600] [KEEP=5]
+#     [PROMPT_TOKENS=4096|8192|16384|32768|65536|131072]
+profile-mst: ## record a Metal System Trace of a live rmlx run and summarise GPU time + CPU->GPU gap (CODEC= TIME_LIMIT= SKIP_MS= PROMPT_TOKENS= GEN= KEEP=)
 	bash scripts/mst_capture.sh --model $(MODEL) \
 		$(if $(CODEC),--kv-quant $(CODEC),) \
 		$(if $(TIME_LIMIT),--time-limit $(TIME_LIMIT),) \

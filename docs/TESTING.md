@@ -216,7 +216,7 @@ validation and **scans the output**, failing the run when a diagnostic appears:
 Invalid device store at offset 4000064, executing kernel function: "custom_kernel_rmlx_q8_quantize"
 ```
 
-Four things decide how this is wired, each of which would otherwise produce a
+Five things decide how this is wired, each of which would otherwise produce a
 gate that runs and can never fire:
 
 * **The exit code is not the signal.** With validation on, cargo *still* exits 0
@@ -234,9 +234,21 @@ gate that runs and can never fire:
   process's stderr while libtest is mid-line, so a report routinely appears
   appended to a `test some::name ... ` prefix. Matching `^Invalid` catches only
   about half of them.
-* **The validation banner is asserted.** If Metal never prints `Metal GPU
-  Validation Enabled`, the suite ran uninstrumented and its silence proves
-  nothing, so the runner refuses to report OK.
+* **The validation banner is asserted, per crate.** If Metal never prints `Metal
+  GPU Validation Enabled` for a crate, that crate ran uninstrumented and its
+  silence proves nothing. (A crate reported this way has usually failed to
+  *build*: no test binary means no Metal device and therefore no banner.)
+* **A positive control runs first.** The banner proves the instrumentation
+  loaded; it says nothing about whether the *detector* still matches what the
+  layer emits, and the detector is a hand-written pattern over an undocumented,
+  version-specific message. So the runner first executes a kernel that stores
+  out of bounds on purpose — `crates/rmlx-kv-quant/src/shader_validation_canary.rs`,
+  behind the `shader-validation-canary` feature so nothing else builds it — and
+  refuses to trust a clean scan unless that produced a diagnostic it matched.
+  The canary declines to dispatch unless validation is on, so the deliberate
+  out-of-bounds write is never a real one. It is excluded from the population
+  `make gpu-test` derives from the ignore-rule classifier, since it is the
+  gate's self-test rather than a correctness test.
 
 Buffer labels would make a hit even more direct, but MLX owns the Metal
 allocator and mlx-c exposes no labelling API, so KV stores appear as
@@ -245,8 +257,33 @@ instead, and rMLX does control that: `custom_kernel_rmlx_<codec>_<op>` names the
 codec and the operation exactly.
 
 Validation costs throughput, so it belongs on this target and **not** on any
-cell whose numbers get recorded. `VALIDATE=0` opts out; the cost on a
-flash-decode subset measured 1.08 s → 1.11 s of test time.
+cell whose numbers get recorded. `VALIDATE=0` opts out.
+
+**What it costs.** On the `rmlx-kv-quant` GPU suite: **133 s → 157 s, +18%**
+(alternating pairs; an independent run measured 131.2 s → 154.6 s, +17.8%, n=3).
+A cold first run inflates the uninstrumented baseline, so compare adjacent runs.
+On real inference it is far worse — Ternary-Bonsai-8B decode 126.6 → 21.7 TPS,
+a **5.8× slowdown** (n=3 each). That is the reason this never goes near a perf
+cell.
+
+**Never draw a conclusion about model *output* from a validated run.** The unit
+suites are invariant — 234 passed and the same 4 known-red failures in every
+repetition of both modes, with zero invalid-access reports — but real inference
+is not. Ternary-Bonsai-8B (Qwen3 dense) intermittently degenerates under
+validation: it emits a single token (id 0, `"!"`), reports `tps=0.064`, and
+exits 0 with no diagnostic on stderr and nothing in Unified Logging. Reproduced
+here 1 run in 3 at `--kv-quant k8v8` under `FAIL_MODE=allow`, and independently
+6 in 12 at `k8v8` and 2 in 4 at `none`, against 0 of 13 unvalidated runs.
+gemma-4-e2b is clean throughout, so it is architecture-specific on this host.
+
+`MTL_SHADER_VALIDATION_FAIL_MODE` was tried as a discriminator, on the theory
+that `zerofill` silently dropping a KV store would explain it. It does not:
+`allow` permits the write and is where the degeneration reproduced, while
+`zerofill` — the setting this gate uses — was clean 3 of 3. So this is **not**
+evidence of an out-of-bounds write in the Qwen3 path, and no invalid access is
+ever reported. Whether it is a latent engine defect that instrumentation
+perturbs into visibility or a defect in the instrumentation itself is unresolved
+and tracked outside this document.
 
 Current state: the whole `rmlx-kv-quant` GPU suite (238 classified tests) runs
 clean under validation — zero invalid accesses.

@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use super::{for_each_row, Result, XctraceError};
+use super::{for_each_row, schema_of, Result, XctraceError};
 
 /// Schema this summary reads. Exported with
 /// `--xpath '/trace-toc/run[@number="1"]/data/table[@schema="metal-gpu-intervals"]'`.
@@ -132,6 +132,18 @@ pub struct SummaryFilter<'a> {
 /// empty summary is indistinguishable from a run that recorded nothing, and
 /// reporting zeros for it is how a profiling harness lies.
 pub fn summarise_gpu_intervals(xml: &str, filter: SummaryFilter<'_>) -> Result<GpuIntervalSummary> {
+    // Checked up front, from the header alone, so the wrong table refuses
+    // identically whatever the options say. Left inside the row walk it would
+    // be reached only after a full pass, and the `skip_ms > 0` branch — which
+    // reads columns this schema may not have — would refuse with
+    // `UnknownColumn` instead: same input, two different named failures.
+    let schema = schema_of(xml)?;
+    if schema.name != GPU_INTERVALS_SCHEMA {
+        return Err(XctraceError::WrongSchema {
+            expected: GPU_INTERVALS_SCHEMA.to_owned(),
+            actual: schema.name,
+        });
+    }
     if filter.skip_ms == 0 {
         return summarise_from(xml, filter.process, 0);
     }
@@ -146,9 +158,13 @@ pub fn summarise_gpu_intervals(xml: &str, filter: SummaryFilter<'_>) -> Result<G
                 return Ok(());
             }
         }
-        let start = row.u64("start")?.unwrap_or_default();
+        // Required, not defaulted: one NULL `start` would pin `earliest` to 0,
+        // and the origin below would collapse to a bare `skip_ms` — a
+        // trace-relative floor wearing a process-relative label, with the
+        // SkipExceedsSpan guard unable to fire.
+        let start = row.u64_required("start")?;
         earliest = earliest.min(start);
-        latest = latest.max(start.saturating_add(row.u64("duration")?.unwrap_or_default()));
+        latest = latest.max(start.saturating_add(row.u64_required("duration")?));
         Ok(())
     })?;
     if earliest == u64::MAX {
@@ -183,34 +199,40 @@ fn summarise_from(
 
     let schema = for_each_row(xml, |row| {
         summary.rows_total += 1;
-        let process = row.fmt("process")?.unwrap_or("<unattributed>").to_owned();
-        *processes.entry(process.clone()).or_default() += 1;
-        if let Some(want) = process_filter {
-            if !process.contains(want) {
-                return Ok(());
+        // Looked up by borrow and only allocated on first sight: the trip count
+        // here is rows in the export — hundreds of thousands — while the key
+        // sets are a handful of processes and three channels.
+        let process = row.fmt("process")?.unwrap_or("<unattributed>");
+        match processes.get_mut(process) {
+            Some(n) => *n += 1,
+            None => {
+                processes.insert(process.to_owned(), 1);
             }
         }
-        let start = row.u64("start")?.unwrap_or_default();
+        let keep = process_filter.is_none_or(|want| process.contains(want));
+        if !keep {
+            return Ok(());
+        }
+        // See the note in summarise_gpu_intervals: a NULL here is an absence,
+        // and read as 0 it would set first_start to 0 and inflate span_ns.
+        let start = row.u64_required("start")?;
         if start < start_floor_ns {
             return Ok(());
         }
         summary.rows_matched += 1;
 
-        let duration = row.u64("duration")?.unwrap_or_default();
+        let duration = row.u64_required("duration")?;
         first_start = first_start.min(start);
         summary.last_end_ns = summary.last_end_ns.max(start.saturating_add(duration));
 
-        let channel = row
-            .cell("channel-name")?
-            .text()
-            .unwrap_or("<none>")
-            .to_owned();
-        let stats = channels
-            .entry(channel.clone())
-            .or_insert_with(|| ChannelStats {
-                channel,
+        let channel = row.cell("channel-name")?.text().unwrap_or("<none>");
+        let stats = match channels.get_mut(channel) {
+            Some(stats) => stats,
+            None => channels.entry(channel.to_owned()).or_insert(ChannelStats {
+                channel: channel.to_owned(),
                 ..ChannelStats::default()
-            });
+            }),
+        };
         stats.submissions += 1;
         stats.busy_ns = stats.busy_ns.saturating_add(duration);
         stats.durations_ns.push(duration);
@@ -220,12 +242,6 @@ fn summarise_from(
         Ok(())
     })?;
 
-    if schema.name != GPU_INTERVALS_SCHEMA {
-        return Err(XctraceError::WrongSchema {
-            expected: GPU_INTERVALS_SCHEMA.to_owned(),
-            actual: schema.name,
-        });
-    }
     if summary.rows_matched == 0 {
         let mut what = schema.name;
         if let Some(f) = process_filter {
@@ -269,6 +285,16 @@ pub fn summary_csv(summary: &GpuIntervalSummary) -> String {
          latency_samples,latency_p50_ns,latency_p95_ns,latency_max_ns\n",
     );
     for c in &summary.channels {
+        // Empty, not 0, when nothing was measured: "no CPU->GPU gap" is the most
+        // interesting result this table can report, and a script that forgets to
+        // read latency_samples would otherwise record a fabricated best.
+        let lat = |p: u8| {
+            if c.latency_samples() == 0 {
+                String::new()
+            } else {
+                c.latency_pct(p).to_string()
+            }
+        };
         // Writing to a String cannot fail; the Result is discarded deliberately.
         let _ = writeln!(
             out,
@@ -279,9 +305,9 @@ pub fn summary_csv(summary: &GpuIntervalSummary) -> String {
             c.duration_pct(50),
             c.duration_pct(95),
             c.latency_samples(),
-            c.latency_pct(50),
-            c.latency_pct(95),
-            c.latency_pct(100),
+            lat(50),
+            lat(95),
+            lat(100),
         );
     }
     out
