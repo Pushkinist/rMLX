@@ -2849,14 +2849,19 @@ fn write_rejects_truncated_rotor_k_store() {
     );
 }
 
-/// Full SSD spill/hydrate round-trip after a ring-only-tail decode.
+/// Full SSD spill/hydrate round-trip when the GPU ring is the store's only copy.
 ///
-/// After prefill + N fused decode steps the store keeps a ring-only tail (CPU
-/// blocks frozen at prefill; the decode tail lives only in the GPU ring). The
-/// spill clone (`KvCache::try_deep_clone`) materialises that tail into complete
-/// blocks, so `write_caches` → hydrate restores the **full** store — not a
-/// prefix truncated at the last CPU block. Asserted byte-exact against the live
-/// store's own `dequant()`.
+/// After prefill + N fused decode steps a rotor K-only store holds nothing on
+/// the host: the per-step block download is skipped, and the append releases the
+/// seeded prefill blocks once the ring is live, so the ring carries the whole
+/// prefix. The spill clone (`KvCache::try_deep_clone`) rebuilds it from the ring
+/// into complete blocks, so `write_caches` → hydrate restores the **full** store
+/// — not a prefix truncated at the last CPU block. Asserted byte-exact against
+/// the live store's own `dequant()`.
+///
+/// The empty-blocks precondition is what makes the round-trip load-bearing: with
+/// a host copy still resident the clone could pass without the ring rebuild ever
+/// running.
 ///
 /// Mutation check: make `try_deep_clone` clone `self.blocks` directly (drop the
 /// `synced_rotor_k_blocks` reconcile) — the clone then carries only the frozen
@@ -2910,13 +2915,13 @@ fn rotor_k_only_ring_only_tail_ssd_round_trip() {
             .unwrap();
     }
 
-    // Ring-only tail precondition + live full-prefix dequant.
+    // Ring-only precondition + live full-prefix dequant: the ring is the store's
+    // sole copy of K, so everything below exercises the rebuild-from-ring path.
     let (orig_dq, orig_seq, block_tokens) = rotor_k3_probe(&c);
     assert_eq!(orig_seq, prefill + steps, "shape[2] advanced with the ring");
     assert_eq!(
-        block_tokens,
-        (prefill * kv_h) as usize,
-        "CPU blocks frozen at prefill (ring-only tail)"
+        block_tokens, 0,
+        "CPU blocks must be released once the ring is live (ring is the sole resident copy)"
     );
 
     // Spill clone (materialises the tail) → write → hydrate.
