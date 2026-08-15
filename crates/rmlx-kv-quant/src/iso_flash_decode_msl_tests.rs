@@ -456,6 +456,196 @@ fn iso4_flash_decode_matches_reference_with_mask_across_tiles() {
     run_oracle_masked(4, 2, 4, (TILE_SIZE as usize) * 2 + 22, 128, true);
 }
 
+// ── Lazy, non-row-contiguous mask ─────────────────────────────────────────────
+//
+// The dispatcher no longer calls `mask_flat.eval()`. The mask is the one input
+// built by `astype` + `reshape` rather than `reshape` alone, and it is the only
+// input a caller can hand over as a strided view (`additive_mask` is a
+// pass-through parameter from `sdpa.rs`). Every other test in this file feeds a
+// freshly-built contiguous mask, so none of them would notice if dropping the
+// eval had cost the mask path something.
+//
+// This one feeds a transposed (non-row-contiguous) mask three ways and requires
+// all three to agree:
+//
+//   lazy      — strided view, never evaluated by the caller
+//   evaluated — same strided view, `eval()`ed first: what the removed call did.
+//               `eval()` materialises but does not relayout, so this array is
+//               still non-row-contiguous — which is why the removed call was
+//               never the source of the layout guarantee.
+//   contiguous — explicitly relaid out, the layout the kernel actually needs.
+//
+// Agreement proves the row-contiguous copy is applied by MLX inside the
+// kernel's `eval_gpu` (via `ensure_row_contiguous`), independent of when — or
+// whether — the caller materialises the input.
+
+/// How the transposed mask is handed to the dispatcher.
+#[derive(Clone, Copy)]
+enum MaskPrep {
+    /// Strided view, never evaluated by the caller — the post-fix path.
+    Lazy,
+    /// Strided view, `eval()`ed first — what the removed call did.
+    Evaluated,
+    /// Explicitly relaid out row-contiguous.
+    Contiguous,
+}
+
+/// Dispatch iso flash-decode with a mask supplied as a **transposed** view.
+///
+/// `prep` selects how that view is materialised before the dispatch, so the
+/// caller varies only the mask's materialisation/layout while holding
+/// everything else identical. Returns `None` when the GPU is unavailable.
+#[allow(clippy::expect_used, reason = "test helper: invariants documented")]
+fn iso_decode_with_transposed_mask(bits: u8, mask_bf16: bool, prep: MaskPrep) -> Option<Vec<f32>> {
+    if skip_if_no_gpu_env() {
+        return None;
+    }
+    let (b, kv_h, heads_per_kv, kv_seq, head_dim) =
+        (1_usize, 2_usize, 4_usize, 40_usize, 128_usize);
+    let n_q_heads = kv_h * heads_per_kv;
+    let n_tokens = kv_seq * kv_h;
+
+    let q = lcg_data(n_q_heads * head_dim, 0xA11CE);
+    let k = lcg_data(n_tokens * head_dim, 0xB0B);
+    let v = lcg_data(n_tokens * head_dim, 0xC0FFEE);
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    let (codes, scales, norms, _k_deq) = iso_encode_for_test(&k, head_dim, bits);
+    let q_arr = make_f32_array(&q, &[b as i32, n_q_heads as i32, 1, head_dim as i32]);
+    let v_arr = make_f32_array(&v, &[b as i32, kv_h as i32, kv_seq as i32, head_dim as i32]);
+
+    // Build the mask in key-major order `[b, kv_seq, n_q_heads]`, then transpose
+    // to the `[b, n_q_heads, kv_seq]` the dispatcher expects. The result is a
+    // strided view over the key-major buffer, not a row-contiguous array.
+    let mask_km: Vec<f32> = (0..kv_seq * n_q_heads)
+        .map(|i| {
+            let s = i / n_q_heads;
+            let hq = i % n_q_heads;
+            if hq == 0 && s == kv_seq / 2 {
+                -1.0e30
+            } else {
+                (hq as f32) * 0.25 - (s as f32) * 0.03125
+            }
+        })
+        .collect();
+    let mask_src = make_f32_array(&mask_km, &[b as i32, kv_seq as i32, n_q_heads as i32]);
+    let mask_src = if mask_bf16 {
+        mask_src
+            .astype(Dtype::Bf16, Device::Gpu)
+            .expect("mask astype bf16")
+    } else {
+        mask_src
+    };
+    let mask_t = mask_src
+        .transpose(&[0, 2, 1], Device::Gpu)
+        .expect("mask transpose");
+    let mask = match prep {
+        MaskPrep::Lazy => mask_t,
+        MaskPrep::Evaluated => {
+            mask_t.eval().expect("mask eval");
+            mask_t
+        }
+        MaskPrep::Contiguous => mask_t.contiguous(Device::Gpu).expect("mask contiguous"),
+    };
+
+    let out = match bits {
+        3 => iso_flash_decode_sdpa::<3>(
+            &q_arr,
+            &codes,
+            &scales,
+            &norms,
+            &v_arr,
+            Some(&mask),
+            b as i32,
+            kv_h as i32,
+            kv_seq as i32,
+            head_dim as i32,
+            heads_per_kv as i32,
+            scale,
+            Device::Gpu,
+        ),
+        4 => iso_flash_decode_sdpa::<4>(
+            &q_arr,
+            &codes,
+            &scales,
+            &norms,
+            &v_arr,
+            Some(&mask),
+            b as i32,
+            kv_h as i32,
+            kv_seq as i32,
+            head_dim as i32,
+            heads_per_kv as i32,
+            scale,
+            Device::Gpu,
+        ),
+        other => panic!("iso_decode_with_transposed_mask: unsupported bits={other}"),
+    }
+    .expect("iso_flash_decode_sdpa");
+
+    Some(array_to_f32(&out))
+}
+
+/// Assert the three mask materialisation/layout variants agree elementwise.
+#[allow(clippy::expect_used, reason = "test helper: invariants documented")]
+fn assert_lazy_mask_matches_evaluated(bits: u8, mask_bf16: bool) {
+    let Some(lazy) = iso_decode_with_transposed_mask(bits, mask_bf16, MaskPrep::Lazy) else {
+        return;
+    };
+    let evaluated = iso_decode_with_transposed_mask(bits, mask_bf16, MaskPrep::Evaluated)
+        .expect("gpu available on first call");
+    let contiguous = iso_decode_with_transposed_mask(bits, mask_bf16, MaskPrep::Contiguous)
+        .expect("gpu available on first call");
+
+    assert_eq!(lazy.len(), evaluated.len(), "bits={bits}: output length");
+    assert_eq!(lazy.len(), contiguous.len(), "bits={bits}: output length");
+    assert!(!lazy.is_empty(), "bits={bits}: empty output");
+
+    let mut max_eval_err = 0.0_f32;
+    let mut max_contig_err = 0.0_f32;
+    for ((l, e), c) in lazy.iter().zip(evaluated.iter()).zip(contiguous.iter()) {
+        assert!(l.is_finite(), "bits={bits}: non-finite output {l}");
+        max_eval_err = max_eval_err.max((l - e).abs());
+        max_contig_err = max_contig_err.max((l - c).abs());
+    }
+    assert!(
+        max_eval_err < 1e-5,
+        "bits={bits} bf16={mask_bf16}: lazy mask diverges from the pre-fix \
+         evaluated mask by {max_eval_err}"
+    );
+    assert!(
+        max_contig_err < 1e-5,
+        "bits={bits} bf16={mask_bf16}: lazy mask diverges from an explicitly \
+         row-contiguous mask by {max_contig_err}"
+    );
+}
+
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_decode -- --ignored --test-threads=1"]
+fn iso3_flash_decode_lazy_noncontiguous_f32_mask_matches_evaluated() {
+    assert_lazy_mask_matches_evaluated(3, false);
+}
+
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_decode -- --ignored --test-threads=1"]
+fn iso4_flash_decode_lazy_noncontiguous_f32_mask_matches_evaluated() {
+    assert_lazy_mask_matches_evaluated(4, false);
+}
+
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_decode -- --ignored --test-threads=1"]
+fn iso3_flash_decode_lazy_noncontiguous_bf16_mask_matches_evaluated() {
+    // bf16 source exercises the dispatcher's `astype` + `reshape` mask branch,
+    // the one the removed `mask_flat.eval()` sat directly behind.
+    assert_lazy_mask_matches_evaluated(3, true);
+}
+
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test iso_flash_decode -- --ignored --test-threads=1"]
+fn iso4_flash_decode_lazy_noncontiguous_bf16_mask_matches_evaluated() {
+    assert_lazy_mask_matches_evaluated(4, true);
+}
+
 // ── GQA ───────────────────────────────────────────────────────────────────────
 
 #[test]

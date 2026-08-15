@@ -496,14 +496,10 @@ pub fn rotor_fused_qk_sdpa_generic<const BITS: u8>(
         Array::from_bytes(bytes, &[6], Dtype::U32)?
     };
 
-    q_f32.eval()?;
-    codes_flat.eval()?;
-    scales_flat.eval()?;
-    norms_flat.eval()?;
-    rotors_flat.eval()?;
-    mask_flat.eval()?;
-    scale_arr.eval()?;
-    dims_arr.eval()?;
+    // Inputs stay lazy: `MetalKernel::apply` enqueues a graph node, so MLX
+    // materialises them — and applies `ensure_row_contiguous` — inside the
+    // kernel's own `eval_gpu`. A blocking eval here would only stall the host
+    // once per layer per decode step. See `crate::flash_decode_common` docs.
 
     let kernel = rotor_qk_kernel(BITS)?;
     let mut invoke = MetalKernelInvoke::new();

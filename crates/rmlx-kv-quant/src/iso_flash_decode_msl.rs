@@ -623,19 +623,11 @@ pub fn iso_flash_decode_sdpa<const BITS: u8>(
             .map_err(|e| Error::Mlx(format!("iso_flash_decode dims: {e}")))?
     };
 
-    // Materialise inputs to flush any pending lazy ops before kernel dispatch.
-    // The MSL kernels read by raw linear offset and ignore MLX lazy-transpose
-    // strides, so a pending permutation must be resolved here.
-    q_f32.eval()?;
-    codes_flat.eval()?;
-    scales_flat.eval()?;
-    norms_flat.eval()?;
-    v_flat.eval()?;
-    if has_mask == 1 {
-        mask_flat.eval()?;
-    }
-    scale_arr.eval()?;
-    dims_arr.eval()?;
+    // Inputs stay lazy — do NOT force-evaluate them here. `MetalKernel::apply`
+    // enqueues a graph node, so MLX materialises every input, and applies the
+    // `ensure_row_contiguous` copy, inside the kernel's own `eval_gpu`; a
+    // blocking eval buys no ordering and stalls the host once per layer per
+    // decode step. Full argument: `crate::flash_decode_common` module docs.
 
     // ── P1 dispatch ───────────────────────────────────────────────────────
     let kern_p1 = p1_kernel(BITS)?;

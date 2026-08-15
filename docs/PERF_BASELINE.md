@@ -193,13 +193,50 @@ were recorded before the flash-decode-over-quant kernels
 before `--rotor-qjl` flipped to default `off`, and they encode a causal story
 that no longer holds. The paragraph they carried claimed the K-only variants
 trail their `*_sym` siblings because the K side had no GPU-resident code mirror
-and paid a CPU `dequant()` of the whole prefix per step. Both halves are now
-false: the K-only stores keep a GPU ring the kernel reads directly, and the
-measured relation is **inverted** — on Bonsai-8B at a 4k prompt `k_iso3`
-decodes at ≈19 TPS against `iso3_sym`'s ≈14, and the gap widens with context.
-Symmetric codecs are now the slower tier, because quantizing V puts a second
-dequant inside the decode kernel. Live numbers per (codec, context) live in
-`docs/models/bonsai/8B/rMLX.md` §2; re-record these cells before using them.
+and paid a CPU `dequant()` of the whole prefix per step. Both halves are false:
+the K-only stores keep a GPU ring the kernel reads directly, and neither the
+K-only nor the `_sym` tier is CPU-bound at decode.
+
+The successor claim — that the `_sym` tier is the slower one *because
+quantizing V puts a second dequant inside the decode kernel* — is also wrong,
+and the reason it read that way was a dispatcher defect, not the V axis. Every
+iso / rotor flash-decode dispatcher forced `Array::eval()` on its kernel inputs
+immediately before dispatch, blocking the host on the GPU once per attention
+layer per decode step. Removing it (the graph is left lazy; MLX's
+`ensure_row_contiguous` already supplies the layout guarantee the raw-linear
+kernels need) is worth **1.17–2.89×** decode across the family, with the token
+digest, the KV bytes and TTFT all unchanged. Measured `rmlx bench`, n=3 per
+cell, `release-perf`, one binary pair:
+
+| model | ctx | `iso3_sym` | `k_iso3` | `rotor3_sym` | `k_rotor3` | `none` (control) |
+|---|---|---|---|---|---|---|
+| Bonsai-8B | 4k | 19.09 → **55.15** | — → 56.98 | — | — | 138.5 → 139.2 (+0.5%) |
+| Bonsai-8B | 16k | 11.00 → **19.01** | 14.90 → **24.37** | 10.13 → **16.03** | 13.73 → **21.59** | 93.7 → 93.3 (−0.5%) |
+| Bonsai-8B | 32k | 7.67 → **10.44** | 9.81 → **13.53** | — | — | 65.1 → 63.9 (−1.9%) |
+| gemma-4-e2b | 4k | 65.57 → **100.20** | 76.33 → **107.09** | — | — | 129.1 → 128.1 (−0.7%) |
+| gemma-4-e2b | 16k | 42.42 → **57.04** | 53.73 → **66.64** | 35.15 → **44.52** | 47.70 → **58.07** | 119.4 → 120.8 (+1.2%) |
+| gemma-4-e2b | 32k | 29.56 → **35.58** | 37.76 → **44.34** | — | — | 112.9 → 113.9 (+0.9%) |
+
+`none` is the null control: it reaches none of the four changed dispatchers, and
+its six cells bound the session's measurement noise at ±1.9%. The Bonsai
+`k_iso3` 4k base cell is absent because `rmlx bench` refused it — the pre-fix
+binary scattered 19.65 / 24.71 / 19.76 TPS (25.6% of median) at that cell, over
+the 15% settle ceiling. Narrower run-to-run spread after the fix is a
+consistent second-order effect: a host-side GPU wait per layer makes the cell
+sensitive to host scheduling (e2b `iso3_sym` @4k: 7.41% range → 0.77%).
+
+**Every absolute decode-TPS number in the family recorded before this change
+measures the dispatcher, not the kernel** — re-record before use. Live numbers
+per (codec, context) live in `docs/models/bonsai/8B/rMLX.md` §2.
+
+**Marginal-cost figures (ms per 1k KV tokens) are not invalidated.** The eval was
+a fixed cost per decode step — one host↔GPU round trip per attention layer,
+independent of KV length — so it lands entirely in the intercept of
+`ms/step = a + b × (KV tokens/1000)` and a slope cancels it by construction.
+Fitted across this binary pair: `a` 41.14 → **7.01 ms/step (−83%)**, `b` 2.437 →
+**2.449 ms/1k KV tokens (+0.5%)**. The ≈34 ms/step recovered is ≈0.16 ms per
+eval over the layer count, a textbook round trip. A published ms/1k table stays
+valid; do not discard one on the strength of this fix.
 
 **Neither tier competes with `none` on either axis.** The whole iso/rotor
 family stores one `u32` code word plus one `f32` scale per group, so it is
