@@ -375,17 +375,34 @@ The small long-context residual is a minor follow-up (§4), no longer the headli
 Ranked by impact:
 
 1. **Fused MSL flash-decode-over-quant kernels for the Tier-2 (`*_sym`) and
-   Tier-3 (`k_*`) families — the headline.** The matrix proves the ROI: the iso /
-   rotor codecs are the **fastest in the whole sweep when they have a GPU decode
-   kernel** (`rotor3/4` +7…+13 % vs `none`; `iso3` +13 % at 16k). Their sub-8-bit
-   and symmetric variants have **no Metal kernel**, so they fall back to a CPU
-   dequant seed (Tier 3) or a dormant bf16-mirror (Tier 2). A real fused
-   flash-decode-over-quant kernel for these would convert **8 currently
-   useless / mirror cells** (4 `*_sym` + 4 `k_*`) into viable ones. This is the
-   known blocker: *per-step `quantized_matmul` can't beat MLX bf16 flash at long
-   ctx — it needs an MSL flash-decode-over-quant kernel*. The 27B is the best
-   argument yet for building it, because the GPU-kerneled members of the same
-   families already win.
+   Tier-3 (`k_*`) families — built, and the ROI argument did not survive it.**
+   The original text here read: *the iso / rotor codecs are the fastest in the
+   whole sweep when they have a GPU decode kernel (`rotor3/4` +7…+13 % vs `none`;
+   `iso3` +13 % at 16k), their sub-8-bit and symmetric variants have no Metal
+   kernel, so a real fused flash-decode-over-quant kernel would convert 8
+   currently useless / mirror cells (4 `*_sym` + 4 `k_*`) into viable ones.*
+
+   Those kernels were then written — `iso_flash_decode`, `rotor_flash_decode` and
+   the `_symv` pair — and all 8 cells now decode straight off the packed store
+   with no mirror. **They did not become viable.** Two independent reasons, both
+   measured after the fact:
+
+   * The stores are not smaller than bf16 (16.25 bits/value for iso, 21.75 for
+     rotor, against bf16's 16.0), so there was never a bandwidth prize to
+     collect — see "Memory truth" in `docs/KV_QUANT.md`.
+   * The kernel shell itself achieves only 4–14 % of MLX `sdpa_vector`'s
+     per-byte throughput, chiefly because its P1 grid is indexed by *query* head
+     and so re-reads the whole KV stream `heads_per_kv` times. Even the densest
+     store in the tree is too fat to clear that bar. The `ρ < ε` arithmetic,
+     the two-architecture measurement and the corollary for `kv_h == 1` are in
+     `docs/KV_QUANT.md` § "Fused flash-decode over a quant store — the break-even
+     condition".
+
+   The premise that misled this item was *"the GPU-kerneled members of the same
+   families already win, so a kernel is the missing piece"*. `rotor3/4` and
+   `iso3` win because they decode through the **bf16 mirror**, i.e. through MLX's
+   own SDPA — not because their codec math is fast at decode. They were never
+   evidence about a hand-written kernel.
 2. **rMLX prefill — corrected to near-parity (was misdiagnosed as a 2.6–3.4× GDN
    loss).** The original text here concluded prefill was 2.6–3.4× slower than the
    siblings and pinned the blame on the GDN recurrence kernel
