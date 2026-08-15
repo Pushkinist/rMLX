@@ -146,7 +146,7 @@ fn mlx_version_degrades_to_unknown() {
     reason = "reads from an in-memory slice, which cannot fail"
 )]
 fn needle_is_found_across_a_chunk_boundary() {
-    let needle = b"steel_gemm_fused_nax";
+    let needle = NAX_GEMM_KERNEL.as_bytes();
     // Straddle a read boundary: the match exists only if the tail is carried.
     let mut haystack = vec![b'.'; 7];
     haystack.extend_from_slice(needle);
@@ -165,7 +165,7 @@ fn needle_is_found_across_a_chunk_boundary() {
     reason = "reads from an in-memory slice, which cannot fail"
 )]
 fn needle_absent_reports_false() {
-    let needle = b"steel_gemm_fused_nax";
+    let needle = NAX_GEMM_KERNEL.as_bytes();
     assert!(!contains_needle(b"".as_slice(), needle, 8).unwrap());
     assert!(!contains_needle(b"steel_gemm_fused_na".as_slice(), needle, 8).unwrap());
     // A near-miss must not count: this is the 0-vs-360 distinction itself.
@@ -288,13 +288,13 @@ fn loud_message_reports_the_absence_without_the_ships_them_contradiction() {
         "0.32.0",
         "0.6.0_3",
         &pin,
-        "steel_gemm_fused_nax",
+        NAX_GEMM_KERNEL,
         "crates/rmlx-mlx/mlx-pin.txt",
     );
     let joined = lines.join("\n");
 
     // States the finding plainly.
-    assert!(joined.contains("ships no steel_gemm_fused_nax kernels"));
+    assert!(joined.contains(&format!("ships no {NAX_GEMM_KERNEL} kernels")));
 
     // Must not restate the fixed self-contradiction: claiming, in the same
     // breath as reporting an absence, that the pinned pair's metallib ships
@@ -322,7 +322,7 @@ fn loud_message_never_hard_fails() {
         "unknown",
         "unknown",
         &pin,
-        "steel_gemm_fused_nax",
+        NAX_GEMM_KERNEL,
         "crates/rmlx-mlx/mlx-pin.txt",
     );
     assert!(!lines.is_empty());

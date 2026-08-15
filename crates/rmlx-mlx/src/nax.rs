@@ -17,8 +17,9 @@
 //! majority of Macs. Warning there would be noise on hardware that cannot use
 //! the kernels either way, and a warning most people learn to ignore is worse
 //! than no warning at all — it would bury the one host where the absence
-//! costs something. So the host-class gate runs first, and when it says no,
-//! nothing else runs: no file is opened and nothing is logged above `debug`.
+//! costs something. So the host-class gate runs ahead of every other step: on
+//! a host with no Neural Accelerator neither the dyld image walk nor the
+//! metallib open happens, and nothing is logged above `debug`.
 //!
 //! # What the absence costs
 //!
@@ -32,10 +33,11 @@ use std::path::{Path, PathBuf};
 
 /// The GEMM kernel family only Neural-Accelerator hardware can run.
 ///
-/// Spelled here as well as in `build.rs`: a build script cannot import from
-/// the crate it builds, so the two copies are structural rather than an
+/// Spelled here as well as in `build_support.rs`: a build script cannot import
+/// from the crate it builds, so the two copies are structural rather than an
 /// oversight. Both must name the same family, or the build-time and runtime
-/// answers describe different things.
+/// answers describe different things — `build_side_names_the_same_kernel_family`
+/// pins them together, because nothing in the compiler does.
 const NAX_GEMM_KERNEL: &str = "steel_gemm_fused_nax";
 
 /// Apple GPU family that introduced the per-core Neural Accelerator.
@@ -85,22 +87,38 @@ pub(crate) enum NaxFinding {
     Scanned {
         /// Whether the scan found the nax GEMM kernel family.
         kernels_present: bool,
+        /// The metallib that answered. Carried in the variant rather than
+        /// re-derived at the warning site: the warning has to name the file it
+        /// read, and a second, independently-obtained path could disagree with
+        /// this one — which would silently demote a confirmed absence to a
+        /// `debug!` instead of failing.
+        metallib: PathBuf,
     },
 }
 
 impl NaxFinding {
-    /// Whether this finding is worth saying out loud.
+    /// The metallib to name out loud, or `None` when there is nothing to say.
     ///
     /// Loud only for a confirmed absence on hardware that can use the kernels.
     /// Present is silent, a non-NA host is silent even when they are absent,
     /// and an uninspectable metallib is silent because it establishes nothing.
-    pub(crate) const fn warrants_warning(&self) -> bool {
-        matches!(
-            self,
+    ///
+    /// Returning the path rather than a bool is what keeps the decision and the
+    /// thing the warning talks about a single observation: both come out of the
+    /// same match arm.
+    pub(crate) fn warning_target(&self) -> Option<&Path> {
+        match self {
             Self::Scanned {
-                kernels_present: false
-            }
-        )
+                kernels_present: false,
+                metallib,
+            } => Some(metallib),
+            Self::NotNaClass
+            | Self::Unverified
+            | Self::Scanned {
+                kernels_present: true,
+                ..
+            } => None,
+        }
     }
 }
 
@@ -133,7 +151,10 @@ fn evaluate(gpu_family: Option<u8>, metallib: Option<&Path>) -> NaxFinding {
         return NaxFinding::Unverified;
     };
     match metallib_has_nax_kernels(path) {
-        Ok(kernels_present) => NaxFinding::Scanned { kernels_present },
+        Ok(kernels_present) => NaxFinding::Scanned {
+            kernels_present,
+            metallib: path.to_path_buf(),
+        },
         Err(e) => {
             tracing::debug!(
                 metallib = %path.display(),
@@ -154,13 +175,14 @@ fn evaluate(gpu_family: Option<u8>, metallib: Option<&Path>) -> NaxFinding {
 /// is the expected one but was built without the kernels.
 pub(crate) fn warn_if_nax_kernels_missing() {
     let gpu_family = rmlx_core::apple_gpu::apple_silicon_generation();
-    let metallib = loaded_metallib_path();
+    let metallib = metallib_to_scan(gpu_family);
+    // `evaluate` applies the host-class gate again. That is not redundant
+    // bookkeeping: it has to stay a total function of its inputs, which is what
+    // makes the host-class x kernel-presence matrix testable on a machine that
+    // is only ever one of those hosts.
     let finding = evaluate(gpu_family, metallib.as_deref());
 
-    // A confirmed absence always has a path to name — `warrants_warning` needs
-    // a scan result, and only a readable path produces one. Binding both keeps
-    // that an observation rather than an assumption with a fallback.
-    if let (true, Some(path)) = (finding.warrants_warning(), metallib.as_deref()) {
+    if let Some(path) = finding.warning_target() {
         tracing::warn!(
             gpu_family = ?gpu_family,
             metallib = %path.display(),
@@ -188,6 +210,21 @@ pub(crate) fn warn_if_nax_kernels_missing() {
     }
 }
 
+/// The metallib worth scanning on this host, or `None` when there is none.
+///
+/// The host-class gate sits here, ahead of the dyld image walk, so a host with
+/// no Neural Accelerator skips the walk as well as the metallib open. Walking
+/// every loaded image is not "nothing runs", which is what the module claims
+/// pre-M5 hosts pay.
+///
+/// Named rather than folded into its one caller so that skip is observable:
+/// the caller does I/O and emits tracing, but this is a total function of the
+/// host class, and in a process that has MLX loaded a `None` here can only mean
+/// the walk did not happen.
+fn metallib_to_scan(gpu_family: Option<u8>) -> Option<PathBuf> {
+    is_na_class(gpu_family).then(loaded_metallib_path).flatten()
+}
+
 /// Path of the `mlx.metallib` belonging to the `libmlx.dylib` dyld loaded.
 fn loaded_metallib_path() -> Option<PathBuf> {
     Some(loaded_libmlx_path()?.parent()?.join(METALLIB_FILE))
@@ -201,12 +238,24 @@ fn loaded_libmlx_path() -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt as _;
 
     // SAFETY: both functions are libSystem's read-only accessors over dyld's
-    // loaded-image list. `index` is bounded by the count read immediately
-    // before it, and `_dyld_get_image_name` returns either null or a
-    // NUL-terminated string dyld owns for the image's lifetime; the bytes are
-    // copied out before this returns. The list is mutated only by dlopen /
-    // dlclose, and this runs from the crate's one-shot MLX init, which does
-    // neither.
+    // loaded-image list, which is process-wide state — so the invariant that
+    // has to hold is process-wide too, not a property of this thread. Other
+    // threads are already running by this point (the tracing appender, and
+    // tokio workers under `serve`), so assume the list can move underneath the
+    // loop and check what that can do:
+    //
+    // - The count is a snapshot. A concurrent load only appends, so a stale
+    //   count under-reports and the walk misses a newly added image — it never
+    //   reads out of range. A concurrent unload would make `index` stale in the
+    //   other direction, and `_dyld_get_image_name` answers an out-of-range
+    //   index with null, which the null check skips. Either way this degrades
+    //   to a missed image, never to a bad read.
+    // - The name pointer belongs to dyld and stays valid for as long as the
+    //   image is loaded; the bytes are copied into an owned `PathBuf` before
+    //   this returns. Only unloading that image could free it, and nothing in
+    //   this process unloads one: the workspace calls neither `dlopen` nor
+    //   `dlclose`, and MLX and Metal load images without ever unloading them.
+    //   So there is no window in which the copy could race a free.
     unsafe {
         for index in 0.._dyld_image_count() {
             let raw = _dyld_get_image_name(index);
@@ -229,15 +278,38 @@ fn metallib_has_nax_kernels(path: &Path) -> std::io::Result<bool> {
     contains_nax_kernel(std::fs::File::open(path)?, SCAN_CHUNK)
 }
 
+/// Whether `hay` contains `needle`, skipping ahead on `first` — the needle's
+/// first byte — rather than comparing at every offset.
+///
+/// That skip is the difference between this and the equivalent scan in
+/// `build_support.rs`, and it is why this one can sit on a startup path: a
+/// per-offset comparison over a ~150 MB metallib takes seconds.
+fn has_needle(hay: &[u8], needle: &[u8], first: u8) -> bool {
+    let mut from = 0_usize;
+    while let Some(offset) = hay
+        .get(from..)
+        .and_then(|tail| tail.iter().position(|&b| b == first))
+    {
+        let start = from + offset;
+        if hay
+            .get(start..)
+            .is_some_and(|tail| tail.starts_with(needle))
+        {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
 /// Whether `reader` yields [`NAX_GEMM_KERNEL`] anywhere, scanning in
 /// `chunk`-sized reads.
 ///
-/// Skips ahead on the needle's first byte rather than comparing at every
-/// offset. That is the difference between this and the equivalent scan in
-/// `build_support.rs`, and it is why this one can sit on a startup path: a
-/// per-offset comparison over ~124 MB takes seconds, this takes ~47 ms for a
-/// full pass and ~2 ms in the common case, where the first match arrives a
-/// couple of MB in and ends the scan early.
+/// Each read is searched where it lands. Only the last needle-1 bytes are
+/// carried forward, and only they are ever copied — a match that begins any
+/// earlier was already either found or ruled out in the read it began in. The
+/// file is ~124-158 MB and the buffer this needs is 19 bytes, so nothing
+/// between those two sizes should be memcpy'd on a startup path.
 ///
 /// `chunk` is a parameter so the carry path — a match straddling two reads —
 /// is testable without a 124 MB fixture.
@@ -246,8 +318,20 @@ fn contains_nax_kernel<R: Read>(mut reader: R, chunk: usize) -> std::io::Result<
     let Some(&first) = needle.first() else {
         return Ok(false);
     };
+    if chunk == 0 {
+        // A zero-length buffer makes `read` answer `Ok(0)` without touching the
+        // stream, which the loop below would take for end-of-file and report as
+        // a confirmed absence — established by reading nothing. Refuse, so the
+        // caller lands in `Unverified` instead.
+        return Err(std::io::Error::other(
+            "metallib scan needs a non-zero read size",
+        ));
+    }
+    // The most a match starting in one read can extend into the next.
+    let tail_len = needle.len().saturating_sub(1);
     let mut buf = vec![0_u8; chunk];
-    let mut window: Vec<u8> = Vec::new();
+    let mut carry: Vec<u8> = Vec::with_capacity(tail_len);
+    let mut bridge: Vec<u8> = Vec::with_capacity(tail_len.saturating_mul(2));
     loop {
         let n = match reader.read(&mut buf) {
             Ok(0) => return Ok(false),
@@ -259,33 +343,44 @@ fn contains_nax_kernel<R: Read>(mut reader: R, chunk: usize) -> std::io::Result<
             Err(e) => return Err(e),
         };
         // `Read` guarantees n <= buf.len(); `get` states that without a panic
-        // path and keeps the copy a memcpy.
+        // path.
         let Some(filled) = buf.get(..n) else {
             return Err(std::io::Error::other(
                 "reader reported more bytes than the buffer holds",
             ));
         };
-        window.extend_from_slice(filled);
 
-        let mut from = 0_usize;
-        while let Some(offset) = window
-            .get(from..)
-            .and_then(|tail| tail.iter().position(|&b| b == first))
-        {
-            let start = from + offset;
-            if window
-                .get(start..)
-                .is_some_and(|tail| tail.starts_with(needle))
-            {
+        // Matches that *start* in the carried tail. They run at most needle-1
+        // bytes past it, so joining that much of this read is enough — the read
+        // is never copied wholesale.
+        if !carry.is_empty() {
+            bridge.clear();
+            bridge.extend_from_slice(&carry);
+            if let Some(head) = filled.get(..tail_len.min(filled.len())) {
+                bridge.extend_from_slice(head);
+            }
+            if has_needle(&bridge, needle, first) {
                 return Ok(true);
             }
-            from = start + 1;
+        }
+        // Matches that start in this read are found in it directly, in place.
+        if has_needle(filled, needle, first) {
+            return Ok(true);
         }
 
-        // Keep the last needle-1 bytes: a match straddling this read and the
-        // next one lives entirely inside that tail plus what comes after.
-        let consumed = window.len().saturating_sub(needle.len().saturating_sub(1));
-        window.drain(..consumed);
+        // Carry the last needle-1 bytes of the stream so far. A match beginning
+        // inside them is exactly the one neither search above could have
+        // settled, and it is all the next read needs.
+        let keep_from = filled.len().saturating_sub(tail_len);
+        if keep_from > 0 {
+            // This read alone supplies the whole tail; nothing older survives.
+            carry.clear();
+        }
+        if let Some(tail) = filled.get(keep_from..) {
+            carry.extend_from_slice(tail);
+        }
+        let excess = carry.len().saturating_sub(tail_len);
+        carry.drain(..excess);
     }
 }
 

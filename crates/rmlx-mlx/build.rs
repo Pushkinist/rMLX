@@ -24,10 +24,6 @@ include!("build_support.rs");
 /// Declares the MLX / mlx-c pair this build is validated against.
 const PIN_FILE: &str = "mlx-pin.txt";
 
-/// The GEMM kernel family whose presence in `mlx.metallib` is the capability
-/// the pin exists to guarantee. Missing entirely in some bottles.
-const NAX_GEMM_KERNEL: &str = "steel_gemm_fused_nax";
-
 /// Read size for the metallib scan.
 const SCAN_CHUNK: usize = 1 << 20;
 

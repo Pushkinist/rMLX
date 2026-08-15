@@ -16,7 +16,7 @@ use rmlx_core::apple_gpu::parse_apple_generation;
 
 use super::{
     contains_nax_kernel, evaluate, is_na_class, loaded_libmlx_path, loaded_metallib_path,
-    NaxFinding, LIBMLX_FILE, METALLIB_FILE, NAX_GEMM_KERNEL,
+    metallib_to_scan, NaxFinding, LIBMLX_FILE, METALLIB_FILE, NAX_GEMM_KERNEL,
 };
 
 // ---------------------------------------------------------------------------
@@ -135,12 +135,16 @@ fn na_class_host_with_no_kernels_warns() {
         assert_eq!(
             finding,
             NaxFinding::Scanned {
-                kernels_present: false
+                kernels_present: false,
+                metallib: fixture.path().to_path_buf(),
             },
             "{brand} must scan and confirm the absence"
         );
-        assert!(
-            finding.warrants_warning(),
+        // The warning names the file the scan actually read, out of the same
+        // variant that decided to warn — not a path re-derived beside it.
+        assert_eq!(
+            finding.warning_target(),
+            Some(fixture.path()),
             "{brand} on a nax-less metallib is the whole point of the probe: {finding:?}"
         );
     }
@@ -155,12 +159,14 @@ fn na_class_host_with_kernels_is_silent() {
     assert_eq!(
         finding,
         NaxFinding::Scanned {
-            kernels_present: true
+            kernels_present: true,
+            metallib: fixture.path().to_path_buf(),
         },
         "the scan must confirm the kernels it was pointed at"
     );
-    assert!(
-        !finding.warrants_warning(),
+    assert_eq!(
+        finding.warning_target(),
+        None,
         "a working stack must not warn: {finding:?}"
     );
 }
@@ -176,8 +182,9 @@ fn pre_m5_host_with_no_kernels_is_silent() {
     let fixture = Fixture::new("pre-m5-absent", &without_nax());
     for brand in ["Apple M1", "Apple M2 Pro", "Apple M3 Max", "Apple M4 Pro"] {
         let finding = evaluate(parse_apple_generation(brand), Some(fixture.path()));
-        assert!(
-            !finding.warrants_warning(),
+        assert_eq!(
+            finding.warning_target(),
+            None,
             "{brand} legitimately ships zero nax kernels and must never be warned: {finding:?}"
         );
     }
@@ -200,6 +207,32 @@ fn pre_m5_host_never_scans_the_metallib() {
     }
 }
 
+/// …and the gate sits ahead of the dyld image walk as well, not only ahead of
+/// the metallib open. Walking every loaded image is real work, and the module
+/// claims a pre-M5 host pays none.
+///
+/// This test binary links `libmlx.dylib`, so the walk *can* find it — the
+/// precondition below states that outright. A `None` for a pre-M5 host can
+/// therefore only mean the walk never ran.
+#[test]
+fn pre_m5_host_never_walks_the_image_list() {
+    assert!(
+        loaded_metallib_path().is_some(),
+        "precondition: this binary links libmlx, so the walk must be able to name it"
+    );
+    for brand in ["Apple M1", "Apple M2 Pro", "Apple M3 Max", "Apple M4 Pro"] {
+        assert_eq!(
+            metallib_to_scan(parse_apple_generation(brand)),
+            None,
+            "{brand} must not pay for the image walk either"
+        );
+    }
+    assert!(
+        metallib_to_scan(parse_apple_generation("Apple M5 Max")).is_some(),
+        "an NA-class host must still get the path it has to scan"
+    );
+}
+
 /// An unidentifiable chip is handled as not-NA-class end to end, not just in
 /// the predicate: no scan, no warning.
 #[test]
@@ -211,7 +244,7 @@ fn unidentified_host_neither_scans_nor_warns() {
     );
 
     assert_eq!(finding, NaxFinding::NotNaClass);
-    assert!(!finding.warrants_warning(), "{finding:?}");
+    assert_eq!(finding.warning_target(), None, "{finding:?}");
 }
 
 /// "Could not look" is not "absent". An NA-class host whose metallib is
@@ -230,7 +263,7 @@ fn na_class_host_with_unreadable_metallib_is_silent() {
         NaxFinding::Unverified,
         "an unreadable metallib is unverified, not confirmed absent"
     );
-    assert!(!finding.warrants_warning(), "{finding:?}");
+    assert_eq!(finding.warning_target(), None, "{finding:?}");
 }
 
 /// No metallib path at all (dyld had no `libmlx.dylib` to point at) is the
@@ -240,7 +273,7 @@ fn na_class_host_with_no_metallib_path_is_silent() {
     let finding = evaluate(parse_apple_generation("Apple M5 Max"), None);
 
     assert_eq!(finding, NaxFinding::Unverified);
-    assert!(!finding.warrants_warning(), "{finding:?}");
+    assert_eq!(finding.warning_target(), None, "{finding:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -306,12 +339,52 @@ fn scan_matches_a_needle_straddling_two_reads() {
     }
 }
 
+/// The same carry path with reads far larger than the needle, which is the
+/// shape the real 1 MB scan has: the tail is taken from the end of a full
+/// buffer rather than accumulated out of scraps, and the sweep above — whose
+/// chunks are all smaller than the needle — never reaches that branch.
+#[test]
+fn scan_matches_a_needle_straddling_two_full_size_reads() {
+    let needle = NAX_GEMM_KERNEL.as_bytes();
+    for chunk in [needle.len() + 1, 64, 4096] {
+        for in_first_read in 1..needle.len() {
+            let mut body = vec![b'z'; chunk - in_first_read];
+            body.extend_from_slice(needle);
+            body.extend_from_slice(&[b'z'; 7]);
+            assert!(
+                contains_nax_kernel(body.as_slice(), chunk).expect("scan"),
+                "needle with {in_first_read} byte(s) in a {chunk}-byte read must still be found"
+            );
+        }
+    }
+}
+
 /// A chunk far smaller than the needle still works — the retained tail grows
 /// the window until a full needle fits.
 #[test]
 fn scan_works_with_a_chunk_smaller_than_the_needle() {
     let body = [&vec![b'z'; 40][..], NAX_GEMM_KERNEL.as_bytes(), b"tail"].concat();
     assert!(contains_nax_kernel(body.as_slice(), 1).expect("scan"));
+}
+
+/// A zero read size cannot establish anything, so it must not answer "absent".
+///
+/// `read` into a zero-length buffer returns `Ok(0)` without touching the
+/// stream, which is indistinguishable from end-of-file — so a scan that
+/// accepted it would report a confirmed absence having read no bytes, and
+/// `evaluate` would turn that into a warning. Production always passes
+/// `SCAN_CHUNK`; the parameter exists so tests can vary it, which is exactly
+/// how a zero would get here.
+#[test]
+fn scan_refuses_a_zero_read_size() {
+    let body = [&vec![b'z'; 8][..], NAX_GEMM_KERNEL.as_bytes()].concat();
+    assert!(
+        contains_nax_kernel(body.as_slice(), 0).is_err(),
+        "a zero read size must surface as an error, not as a confirmed absence"
+    );
+    // Including when the kernels really are absent — the error is about not
+    // having looked, not about what was there.
+    assert!(contains_nax_kernel(without_nax().as_slice(), 0).is_err());
 }
 
 /// The scan reads a real file through the same entry point `evaluate` uses.
@@ -331,6 +404,30 @@ fn scan_reads_a_file_on_disk() {
     assert!(
         super::metallib_has_nax_kernels(Path::new("/nonexistent/mlx.metallib")).is_err(),
         "a missing file must surface as an error, not as a confirmed absence"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Kernel-family name drift
+// ---------------------------------------------------------------------------
+
+/// The kernel family is spelled twice — here for the runtime probe, and in
+/// `build_support.rs` for the build-time scan — because a build script cannot
+/// import from the crate it builds. Nothing in the compiler couples the two.
+///
+/// Renaming one copy alone leaves the runtime probe scanning for a string no
+/// metallib ever contained, so it would report a confirmed absence on every
+/// host: a permanent false warning on exactly the M5 machines this exists for,
+/// with everything still compiling and every other test still passing. Pin them.
+#[test]
+fn build_side_names_the_same_kernel_family() {
+    const BUILD_SUPPORT: &str = include_str!("../build_support.rs");
+
+    let declaration = format!("const NAX_GEMM_KERNEL: &str = \"{NAX_GEMM_KERNEL}\";");
+    assert!(
+        BUILD_SUPPORT.contains(&declaration),
+        "build_support.rs must declare `{declaration}`: the build-time scan and this \
+         runtime probe have to name one family, or their answers describe different things"
     );
 }
 

@@ -262,8 +262,8 @@ the GPU Neural Accelerator, which arrives with M5 — Apple GPU family 10 in
 `rmlx_core::apple_gpu`. Every earlier generation legitimately ships zero of
 them at every MLX version, so a warning there would be noise on the majority
 of Macs and would train people to ignore the one host where the absence costs
-something. The gate runs first, and when it says "no Neural Accelerator"
-nothing else runs: the metallib is never opened.
+something. The gate runs ahead of every other step, and when it says "no Neural
+Accelerator" neither the dyld image walk nor the metallib open happens.
 
 | Host | Kernels | Result |
 |---|---|---|
@@ -272,11 +272,13 @@ nothing else runs: the metallib is never opened.
 | M5+ | metallib unreadable / not found | `debug!` only — "could not look" is not "absent" |
 | M1–M4, or chip unidentifiable | either | `debug!` only; **no scan at all** |
 
-Measured cost on the release binary (M5 Max): **~1.2 ms** when the kernels are
-present (the first match lands a couple of MB in and ends the scan), ~49 ms for
-a full pass over a 124 MB metallib with none, and **~0** on a pre-M5 host,
-which never opens the file. It runs once per process, on the init that already
-precedes a multi-second model load.
+Measured cost on the release binary (M5 Max, warm page cache, best of 5):
+**~0.7 ms** when the kernels are present — the first match lands a couple of MB
+into the 158 MB metallib and ends the scan — and **~49 ms** for a full pass over
+a metallib of the same size with none. On a pre-M5 host it is **~1.3 µs**, which
+is the `sysctl` chip query and nothing else: the dyld image walk (~220 ns) and
+the file open are both behind the gate. It runs once per process, on the init
+that already precedes a multi-second model load.
 
 The wording is scoped to **prefill / TTFT** deliberately: NAX is unreachable at
 decode by construction (see "Where NAX can appear, and where it cannot"), so a
