@@ -101,6 +101,16 @@
 
 set -euo pipefail
 
+# --list: print the COMPLIANT set (GPU-touching tests that carry #[ignore]) as
+# `<crate><TAB><fn>` and exit, instead of enforcing. `scripts/run_gpu_tests.sh`
+# consumes this so the rule and the runner cannot cover different populations —
+# a GPU test this gate mandates is by construction a GPU test that gets run.
+LIST_MODE=0
+if [ "${1:-}" = "--list" ]; then
+    LIST_MODE=1
+    shift
+fi
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CARGO_TOML="${REPO_ROOT}/Cargo.toml"
 
@@ -317,6 +327,13 @@ read -r -d '' AWK_DETECT <<'AWK' || true
             if (gpu[g] && !has_ignore && !exempt) {
                 printf "V  %s: %s\n", file_of[g], name_of[g]
             }
+            # The compliant set: GPU-touching AND ignored. This is exactly the
+            # population `scripts/run_gpu_tests.sh` must execute, so it is
+            # derived from the same classifier rather than from a second,
+            # drifting list. Exempt fns are device-as-value, not Metal.
+            if (gpu[g] && has_ignore && !exempt) {
+                printf "T  %s: %s\n", file_of[g], name_of[g]
+            }
             # Converse: an ignore claiming a Metal context on a test that
             # never reaches one. Warn — the test may have stopped running
             # (or reaches Metal only via a non-scanned source-file helper).
@@ -334,6 +351,7 @@ AWK
 total_files=0
 violations=""
 warnings=""
+gpu_tests=""
 
 for crate in "${members[@]}"; do
     crate_dir="${REPO_ROOT}/${crate}"
@@ -348,6 +366,18 @@ for crate in "${members[@]}"; do
     if [ ! -d "${src_dir}" ]; then
         echo "ERROR: ${src_dir} does not exist — this gate is scanning nothing for '${crate}'." >&2
         echo "The crate moved or was renamed; update Cargo.toml members." >&2
+        exit 1
+    fi
+
+    # The cargo package name, for `--list` consumers that feed it to
+    # `cargo test -p`. Read from the manifest rather than assumed equal to the
+    # directory basename: the two happen to match for every member today, but a
+    # mismatch would surface as an opaque "package not found" from cargo instead
+    # of failing at this gate, which is the fail-closed discipline the rest of
+    # this script follows.
+    pkg_name="$(awk -F'"' '/^name[[:space:]]*=/{print $2; exit}' "${crate_dir}/Cargo.toml" 2>/dev/null)"
+    if [ -z "${pkg_name}" ]; then
+        echo "ERROR: could not read [package] name from ${crate_dir}/Cargo.toml." >&2
         exit 1
     fi
 
@@ -375,6 +405,7 @@ for crate in "${members[@]}"; do
         case "$line" in
             "V  "*) violations="${violations}  ${line#V  }"$'\n' ;;
             "W  "*) warnings="${warnings}  ${line#W  }"$'\n' ;;
+            "T  "*) gpu_tests="${gpu_tests}${pkg_name}"$'\t'"${line##*: }"$'\n' ;;
         esac
     done <<< "$out"
 done
@@ -383,6 +414,16 @@ if [ "${total_files}" -eq 0 ]; then
     echo "ERROR: matched 0 test files across ${#members[@]} workspace members." >&2
     echo "A gate that scans nothing passes everything; refusing to report OK." >&2
     exit 1
+fi
+
+if [ "${LIST_MODE}" -eq 1 ]; then
+    if [ -z "${gpu_tests}" ]; then
+        echo "ERROR: classified 0 GPU-touching #[ignore] tests across ${total_files} files." >&2
+        echo "The detector found nothing to run; refusing to emit an empty list." >&2
+        exit 1
+    fi
+    printf '%s' "${gpu_tests}"
+    exit 0
 fi
 
 if [ -n "$warnings" ]; then

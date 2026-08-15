@@ -1,9 +1,5 @@
-// unsafe_code: std::env::set_var / remove_var are unsafe in Rust 1.95+;
-// used in skip_if_no_gpu_env_strict_membership to pin env state for the test.
-#![allow(unsafe_code)]
-
 use super::{
-    cosine_similarity_per_row, fwht_normalize, lcg_data, skip_if_no_gpu_env,
+    cosine_similarity_per_row, fwht_normalize, lcg_data, skip_if_no_gpu_env, skip_value_means_skip,
     vectorized_parity_check, TEST_SEED,
 };
 
@@ -57,34 +53,89 @@ fn parity_check_fails_on_length_mismatch() {
     );
 }
 
-/// `skip_if_no_gpu_env` strict membership test: only `"1"` returns true.
+/// `RMLX_SKIP_GPU` strict membership: only `"1"` means skip.
 ///
-/// Sets the env var to each interesting value in turn, asserts the expected
-/// result, then restores the prior value.  Replaces the old conditional test
-/// that silently no-oped when the var happened to be `"1"` already.
+/// Asserted against the pure `skip_value_means_skip` rather than by writing the
+/// process environment. Writing it would be unsound at any parallelism: the
+/// reader `skip_if_no_gpu_env()` runs at the top of every `#[ignore]`d GPU test
+/// in this binary and none of them take the env lock, so a transient `"1"` can
+/// silently skip a live GPU test (a false green) and a transient `"0"` can
+/// un-ignore a Metal test into a parallel run. The membership rule is pure, so
+/// nothing is lost by testing it as such.
 #[test]
-fn skip_if_no_gpu_env_strict_membership() {
-    let prior = std::env::var("RMLX_SKIP_GPU").ok();
-    // SAFETY: single-threaded test; we restore the prior value before exit.
-    unsafe { std::env::set_var("RMLX_SKIP_GPU", "0") };
-    assert!(!skip_if_no_gpu_env(), "RMLX_SKIP_GPU=0 must return false");
-    unsafe { std::env::set_var("RMLX_SKIP_GPU", "true") };
+fn skip_value_means_skip_is_strict_membership() {
     assert!(
-        !skip_if_no_gpu_env(),
-        "RMLX_SKIP_GPU=true must return false"
+        skip_value_means_skip(Some("1")),
+        "RMLX_SKIP_GPU=1 must mean skip"
     );
-    unsafe { std::env::remove_var("RMLX_SKIP_GPU") };
     assert!(
-        !skip_if_no_gpu_env(),
-        "RMLX_SKIP_GPU unset must return false"
+        !skip_value_means_skip(Some("0")),
+        "RMLX_SKIP_GPU=0 must not mean skip"
     );
-    unsafe { std::env::set_var("RMLX_SKIP_GPU", "1") };
-    assert!(skip_if_no_gpu_env(), "RMLX_SKIP_GPU=1 must return true");
-    // restore
-    match prior {
-        Some(v) => unsafe { std::env::set_var("RMLX_SKIP_GPU", v) },
-        None => unsafe { std::env::remove_var("RMLX_SKIP_GPU") },
-    }
+    assert!(
+        !skip_value_means_skip(Some("true")),
+        "RMLX_SKIP_GPU=true must not mean skip"
+    );
+    assert!(
+        !skip_value_means_skip(Some("")),
+        "RMLX_SKIP_GPU= (empty) must not mean skip"
+    );
+    assert!(
+        !skip_value_means_skip(None),
+        "RMLX_SKIP_GPU unset must not mean skip"
+    );
+}
+
+/// The env reader is wired to the membership rule above, not a second copy of
+/// it: whatever the process environment currently holds, the two agree.
+#[test]
+fn skip_if_no_gpu_env_matches_the_membership_rule() {
+    let observed = std::env::var("RMLX_SKIP_GPU").ok();
+    assert_eq!(
+        skip_if_no_gpu_env(),
+        skip_value_means_skip(observed.as_deref()),
+        "skip_if_no_gpu_env must delegate to skip_value_means_skip"
+    );
+}
+
+/// `EnvGuard` restores a managed key even when the holder panics.
+///
+/// This is the whole reason the guard exists. Every env writer in this suite is
+/// shaped `set_var` → `assert!` → restore, so a failing assertion skips its own
+/// restore; without a `Drop` restore the dirty value leaks into every later test
+/// and the next reader fails about its own precondition, burying the assertion
+/// that actually broke.
+///
+/// The lock is not reentrant, so each phase takes it in its own scope and the
+/// panicking closure acquires its own. The deliberate panic also poisons the
+/// lock, so this exercises the poison recovery in `env_lock()` at the same time.
+///
+/// Mutation check: delete the `impl Drop for EnvGuard` body — the key stays at
+/// `"1"` after the unwind and the final assertion fails (RED).
+#[test]
+#[allow(unsafe_code)]
+fn env_guard_restores_managed_key_when_the_holder_panics() {
+    let before = {
+        let _guard = crate::test_utils::env_lock();
+        std::env::var("RMLX_ROTOR_QJL").ok()
+    };
+
+    let caught = std::panic::catch_unwind(|| {
+        let _guard = crate::test_utils::env_lock();
+        // SAFETY: env lock held — no concurrent env reader/writer.
+        unsafe { std::env::set_var("RMLX_ROTOR_QJL", "1") };
+        panic!("simulated assertion failure while the environment is dirty");
+    });
+    assert!(caught.is_err(), "the closure was supposed to panic");
+
+    let after = {
+        let _guard = crate::test_utils::env_lock();
+        std::env::var("RMLX_ROTOR_QJL").ok()
+    };
+    assert_eq!(
+        before, after,
+        "EnvGuard must restore RMLX_ROTOR_QJL while unwinding, not leak it"
+    );
 }
 
 // ── cosine_similarity_per_row self-tests ─────────────────────────────────────

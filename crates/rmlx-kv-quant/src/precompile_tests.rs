@@ -91,6 +91,7 @@ fn v_only_iso_rotor_families_are_cpu_fallback_with_reason() {
 }
 
 #[test]
+#[allow(unsafe_code)]
 fn rotor_symmetric_families_are_metal_when_qjl_off() {
     // `Rotor3Sym` / `Rotor4Sym` have NO bf16 decode-seed early-return: with QJL
     // off (the default) decode is the quant-V flash kernel over both packed
@@ -98,9 +99,26 @@ fn rotor_symmetric_families_are_metal_when_qjl_off() {
     // test. A QJL-carrying store still keeps the CPU dequant path; that branch
     // is gated on the global toggle and not exercised here (QJL is off by
     // default). Grounded in the dispatcher, not by fiat.
+    //
+    // The whole body is a *reader* of the process-global QJL gate — the explicit
+    // check below and every `cpu_hot_path_reason()` call in the loop — so it must
+    // serialize against the tests that drive `RMLX_ROTOR_QJL`, or it samples one
+    // of their in-flight mutations and fails intermittently.
+    //
+    // The lock serializes access; it does not reset state. So establish the
+    // QJL-off precondition rather than asserting one this test never set — an
+    // inherited `RMLX_ROTOR_QJL=1` (a developer's export, `RMLX_ROTOR_QJL=1 make
+    // test`) would otherwise fail here with a message blaming the test. The
+    // guard restores the prior value on drop.
+    let _guard = crate::test_utils::env_lock();
+    if crate::rotor_qjl::rotor_qjl_cli_is_set() {
+        return;
+    }
+    // SAFETY: env lock held — no concurrent env reader/writer.
+    unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
     assert!(
         !crate::rotor_qjl::rotor_qjl_enabled(),
-        "test assumes the default QJL-off state"
+        "QJL must be off once the env override is cleared and no CLI override is installed"
     );
     for kq in [KvQuant::Rotor3Sym, KvQuant::Rotor4Sym] {
         assert!(
@@ -158,9 +176,7 @@ fn k_only_rotor_families_are_qjl_aware() {
     // `!rotor_qjl_enabled()`. The verdict tracks the live QJL gate: QJL on (the
     // default) → CPU (`Some`); QJL off → Metal (`None`). Drive both states via
     // the same env the dispatcher reads, so the test is tied to the dispatcher.
-    let _guard = crate::test_utils::ROTOR_QJL_ENV_LOCK
-        .lock()
-        .expect("env lock poisoned");
+    let _guard = crate::test_utils::env_lock();
     // The codec identity (K-only rotor) is QJL-independent — assert it always.
     for kq in [KvQuant::RotorKOnly3, KvQuant::RotorKOnly4] {
         assert!(
@@ -175,9 +191,8 @@ fn k_only_rotor_families_are_qjl_aware() {
     if crate::rotor_qjl::rotor_qjl_cli_is_set() {
         return;
     }
-    let prev = std::env::var("RMLX_ROTOR_QJL").ok();
     for kq in [KvQuant::RotorKOnly3, KvQuant::RotorKOnly4] {
-        // SAFETY: ROTOR_QJL_ENV_LOCK held — no concurrent env reader/writer.
+        // SAFETY: env lock held — no concurrent env reader/writer.
         unsafe { std::env::set_var("RMLX_ROTOR_QJL", "1") };
         assert!(
             kq.cpu_hot_path_reason().is_some(),
@@ -189,11 +204,9 @@ fn k_only_rotor_families_are_qjl_aware() {
             "{kq} with QJL off dispatches the rotor K MSL kernel — must be Metal (None)"
         );
     }
-    // SAFETY: ROTOR_QJL_ENV_LOCK held.
-    match prev {
-        Some(p) => unsafe { std::env::set_var("RMLX_ROTOR_QJL", p) },
-        None => unsafe { std::env::remove_var("RMLX_ROTOR_QJL") },
-    }
+    // No manual restore: `_guard` puts `RMLX_ROTOR_QJL` back on drop, including
+    // while unwinding from either assertion above. Restoring here would only
+    // cover the path that does not need it.
 }
 
 #[test]
