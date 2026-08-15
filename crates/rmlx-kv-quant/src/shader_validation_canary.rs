@@ -71,9 +71,15 @@ pub fn dispatch_out_of_bounds_store(device: Device) -> Result<()> {
 
     let mut outputs = kernel.apply(invoke, device)?;
     if let Some(out) = outputs.first_mut() {
-        // Forces the dispatch to actually run; without it the lazy graph may
-        // never submit and the canary would report a clean scan for a kernel
-        // that never executed.
+        // eval-ok: the dispatch IS the product here, not the value. Nothing
+        // ever reads this output — the canary exists to make the GPU execute an
+        // invalid store so the validation layer reports it — so MLX has no
+        // reason to materialise the node and, left lazy, the kernel never runs.
+        // Measured with validation on: with this eval the run emits one
+        // "Invalid device store … custom_kernel_rmlx_shader_validation_canary";
+        // without it, zero, with the validation banner present either way. A
+        // canary that does not dispatch would let the gate certify its detector
+        // against silence.
         out.eval()?;
     }
     Ok(())
