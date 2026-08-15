@@ -127,8 +127,6 @@ while IFS=$'\t' read -r _ path; do
 done <<<"$listing"
 
 n=${#bundles[@]}
-total_before=$(du -sk "$DIR" 2>/dev/null | awk '{print $1}')
-total_before=${total_before:-0}
 
 kb_of() { du -sk "$1" 2>/dev/null | awk '{print $1}'; }
 h_of() { du -sh "$1" 2>/dev/null | awk '{print $1}'; }
@@ -145,6 +143,12 @@ for i in $(seq 0 $((n - 1))); do
 	running_total=$((running_total + k))
 	reason[i]=""
 done
+# Scoped to the bundles this script can actually evict, NOT `du` over the whole
+# directory: `.rmlx/traces/mst/` holds Metal System Trace bundles, which have
+# their own retention in scripts/mst_capture.sh and are invisible to the glob
+# above. Counting them here would report a total against a cap that can never
+# act on it.
+total_before=$running_total
 
 max_total_kb=$((MAX_TOTAL_GB * 1024 * 1024))
 
@@ -210,8 +214,7 @@ gb() { echo $(($1 / 1024 / 1024)); }
 
 echo ""
 if [ "$APPLY" = "1" ]; then
-	total_after=$(du -sk "$DIR" 2>/dev/null | awk '{print $1}')
-	total_after=${total_after:-0}
+	total_after=$((total_before - reclaimed))
 	echo "$DIR: $(gb "$total_before")G -> $(gb "$total_after")G, $evicted pruned (reclaimed $(gb "$reclaimed")G); caps: $MAX_COUNT bundles / ${MAX_TOTAL_GB}G"
 else
 	if [ "$evicted" -eq 0 ]; then

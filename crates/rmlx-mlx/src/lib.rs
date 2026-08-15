@@ -45,6 +45,11 @@ pub mod metal_capture;
 pub mod metal_kernel;
 mod nax;
 mod sys;
+/// Parser for `xcrun xctrace export` XML — the headless route to GPU wall-clock
+/// timing and the CPU→GPU gap. Debug-only, behind the same feature as
+/// `metal_capture`: it is profiling tooling, not part of the served binary.
+#[cfg(feature = "metal-capture")]
+pub mod xctrace;
 
 use std::cell::Cell;
 use std::ptr;
