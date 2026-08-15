@@ -584,9 +584,16 @@ fn budget_enforcement_racing_hydrates_never_serves_a_foreign_block() {
     let dir = tmp.path().to_path_buf();
     let db = dir.join("index.db");
     let fx = Arc::new(seed_race_fixture(&dir, &db, device));
-    // Room for half the prompts, so the filler the writer thread adds keeps
-    // pushing the namespace over and the budget pass keeps having work.
-    let budget = fx.block_bytes * (RACE_PROMPTS as u64 / 2);
+    // Sized so both arms of the race stay well populated: the writer's filler
+    // keeps the namespace over the ceiling (so the budget pass always has work
+    // and lookups keep missing), while the prompt blocks are not crowded down to
+    // a survival rate that would let a slow box reach zero hits and skip the
+    // content check entirely. `last_used` is unix *seconds* (`unix_now`) and the
+    // race finishes well inside one, so every row ties and `ORDER BY last_used
+    // ASC` has no tiebreak — which block gets evicted is arbitrary, and headroom
+    // is what keeps `hits > 0` robust rather than lucky. Measured: ~31% hits,
+    // ~69% misses over 240 lookups.
+    let budget = fx.block_bytes * (RACE_PROMPTS as u64 * 4);
 
     // Pre-race pass on quiet state: every prompt hits and its content is its
     // own. This is what stops the racing assertions below from passing on a run
@@ -712,6 +719,16 @@ fn budget_enforcement_racing_hydrates_never_serves_a_foreign_block() {
     evictor.join().expect("evictor thread panicked");
     writer.join().expect("writer thread panicked");
 
+    // `assert_own_block` — the whole point of the test — only runs on a hit, so
+    // a run that raced its way to zero hits would pass without ever checking a
+    // block's content. Nothing else here catches that: `hits + misses` is
+    // tautological, and `evicted_total` only shows the evictor ran.
+    assert!(
+        hits > 0,
+        "no racing lookup hit ({hits} hits / {misses} misses), so the content \
+         check never ran; the run proves nothing about which block a racing \
+         hydrate is served"
+    );
     assert_eq!(
         hits + misses,
         (RACE_PASSES * RACE_PROMPTS) as u64,

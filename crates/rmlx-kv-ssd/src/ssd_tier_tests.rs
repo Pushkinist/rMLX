@@ -279,35 +279,54 @@ fn enforce_namespace_budget_brings_footprint_within_budget() {
     assert_eq!(files_left, 2, "evicted blocks must be gone from disk");
 }
 
-/// A zero budget means "no ceiling configured", but `evict_lru_until` reads a
-/// zero budget as "keep nothing". [`enforce_budget_after_spill`] is the gate
-/// between those two readings, and this pins both sides of it: the raw pass
-/// empties the namespace, the gated one leaves it alone.
+/// Zero is the one budget where the two possible readings — "no ceiling" and
+/// "keep nothing" — differ by the whole namespace. The tier-level routine reads
+/// it as "no ceiling" for every caller, so no call site has to be wrapped to
+/// survive it. (The literal reading still lives on the raw index API, which
+/// `evict_zero_budget_evicts_all` pins.)
 #[test]
 #[allow(
     clippy::unwrap_used,
     reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
 )]
-fn enforce_budget_after_spill_ignores_a_zero_budget() {
+fn enforce_namespace_budget_ignores_a_zero_budget() {
     let tmp = tempfile::TempDir::new().unwrap();
     let ns = "zero-budget-ns";
     let lk: u64 = 0x1234;
 
-    // Ungated: a zero budget is "keep nothing".
-    let raw_dir = tmp.path().join("raw");
-    let raw = seed_blocks(&raw_dir, ns, lk, 3, 100);
-    assert_eq!(enforce_namespace_budget(&raw, ns, 0), 3);
-    assert_eq!(raw.total_bytes().unwrap(), 0);
-
-    // Gated: a zero budget is "no ceiling", so nothing moves.
-    let gated_dir = tmp.path().join("gated");
-    let gated = seed_blocks(&gated_dir, ns, lk, 3, 100);
-    enforce_budget_after_spill(&gated, ns, 0);
+    let dir = tmp.path().join("ns");
+    let idx = seed_blocks(&dir, ns, lk, 3, 100);
+    assert_eq!(enforce_namespace_budget(&idx, ns, 0), 0);
     assert_eq!(
-        gated.total_bytes().unwrap(),
+        idx.total_bytes().unwrap(),
         300,
         "an unconfigured ceiling must not empty the namespace"
     );
+}
+
+/// `--kv-ssd-global-gb N --kv-ssd-cache-gb 0` turns the tier on, so the
+/// namespace ceiling it resolves to has to be a real ceiling. Resolving it to
+/// zero gave the attach path "delete everything" and the runtime path "never
+/// enforce" off the same config.
+#[test]
+fn effective_namespace_budget_never_yields_zero_while_the_tier_is_on() {
+    let cfg = |per_ns: u64, global: u64| SsdTierConfig {
+        per_namespace_budget_bytes: per_ns,
+        global_budget_bytes: global,
+        default_namespace: None,
+        per_project_budgets: BTreeMap::default(),
+    };
+
+    // No per-namespace ceiling: the global pool governs the namespace alone.
+    assert_eq!(effective_namespace_budget(&cfg(0, 900)), 900);
+    // No global pool: the per-namespace budget stands alone.
+    assert_eq!(effective_namespace_budget(&cfg(700, 0)), 700);
+    // Both set: the tighter of the two, either way round.
+    assert_eq!(effective_namespace_budget(&cfg(700, 900)), 700);
+    assert_eq!(effective_namespace_budget(&cfg(900, 700)), 700);
+    // Both zero is the tier being off; nothing enforces, and the eviction
+    // routine treats the zero as "no ceiling" rather than "keep nothing".
+    assert_eq!(effective_namespace_budget(&cfg(0, 0)), 0);
 }
 
 /// unit test: double `install_config` returns `Err(SsdTierAlreadyInstalled)`.

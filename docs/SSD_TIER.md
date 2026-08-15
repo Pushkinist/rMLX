@@ -338,9 +338,10 @@ effectively disabled.
 `SsdSpiller::spawn` resolves the namespace byte ceiling once, from the installed
 config via `ssd_tier::effective_namespace_budget` — the same figure the
 attach-time maintenance pass evicts to. After each block it records, the drain
-thread calls `enforce_budget_after_spill`, which evicts LRU-first until the
+thread calls `enforce_namespace_budget`, which evicts LRU-first until the
 namespace is back within that ceiling and republishes `rmlx_ssd_bytes_used` /
-`rmlx_ssd_evict_total`.
+`rmlx_ssd_evict_total`. That is the same routine the attach path runs, so the
+two cannot disagree about what the configured budget means.
 
 The drain thread owns this because it is the only writer that grows the tier, it
 already holds the index handle, and it runs off the inference path. Without it
@@ -350,16 +351,36 @@ model loads grew past `--kv-ssd-cache-gb` for its whole lifetime, and the
 loaded. (Measured on a 4-request session: gemma-4-e2b at a 0.02 GiB ceiling held
 47.1 MB, Ternary-Bonsai-8B at a 0.3 GiB ceiling held 980.6 MB.)
 
-A budget of `0` means "no ceiling configured", and
-`enforce_budget_after_spill` returns without touching the index for it —
-`evict_lru_until(0)` would read a zero budget as "keep nothing".
+`effective_namespace_budget` resolves the ceiling as: no per-namespace budget →
+the global pool ceiling governs the namespace alone; no global pool → the
+per-namespace budget stands alone; both set → the tighter of the two. It
+therefore only yields `0` when the tier is off, so a zero can never mean
+"ceiling of zero bytes". `enforce_namespace_budget` treats `0` as "no ceiling
+configured" for every caller and evicts nothing — the literal "keep nothing"
+reading stays on the raw `SsdKvIndex::evict_lru_until` API.
 
-The pass is safe against in-flight hydrates on the same namespace. Rows are
-deleted before their `.kvb` files, so a concurrent lookup either does not find
-the row (a plain miss) or fails its read and takes the existing corrupt-block
-path — drop the row, `warn!`, full prefill. A block is only ever reachable
-through its own `(hash, layout_key)` row, so no reader can be handed a block
-other than the one it asked for.
+Eviction reads rows in `last_used` order and runs after every spilled block, so
+it must not be O(rows): the scan stops as soon as the running total is back under
+the ceiling, an index on `last_used` keeps SQLite from sorting the table to find
+the oldest row, and the post-eviction footprint is returned rather than re-summed
+by the caller. Measured at 100k rows (≈200 GiB of 2 MiB blocks), one block over
+budget: ~41 ms → ~3.1 ms per spilled block, the remainder being the one
+`SUM(byte_size)` that decides whether there is anything to do.
+
+The deletes run in a single transaction, so a SQLite failure part-way leaves the
+index untouched instead of dropping rows whose files the caller is never told to
+unlink — those files would be unreclaimable, since `prune_missing` drops rows
+whose file vanished and not the inverse. Only rows this call actually deleted are
+returned, so the eviction count published to `rmlx_ssd_evict_total` cannot
+double-count a row a second evictor removed first.
+
+The pass is safe against in-flight hydrates on the same namespace, in this
+specific sense: **no reader is handed a block other than the one it asked for**.
+Rows are deleted before their `.kvb` files, and a block is only reachable through
+its own `(hash, layout_key)` row, so a concurrent lookup either does not find the
+row (a plain miss) or finds its file already gone and falls through to a full
+prefill. It is not a claim that no block is lost — the hydrate-side cleanup can
+still drop a block that a re-spill recreated underneath it (see below).
 
 The job carries the last chained-block digest of the entry's prompt as `hash`
 (the block's identity), plus `layout_key`, `model_id`, `kv_quant`, and the
@@ -593,7 +614,19 @@ is a startup error (exit 2).
 - Spill errors are always `warn!`-logged and dropped; the inference path is
   unaffected.
 - Hydrate errors (corrupt file, metadata mismatch) are `warn!`-logged; the
-  request falls through to a full re-prefill.
+  request falls through to a full re-prefill. A block whose file is simply
+  *gone* is not one of these: LRU eviction unlinks blocks whose rows it has
+  already deleted, so a hydrate finding no file is the routine outcome of a
+  racing eviction. That case is `debug!`-logged and treated as a miss, so a tier
+  running normally at its ceiling does not stream corruption warnings.
+- Both cleanup paths delete the index row before unlinking the file, matching
+  the eviction order. An interrupted cleanup therefore leaves an unreferenced
+  row, which `prune_missing` reclaims at the next attach, rather than an
+  unreferenced file, which nothing reclaims. A re-spill of the same hash landing
+  between a failed read and its cleanup can still cost that block; the row and
+  the file are the same for identical content, and `last_used` is
+  second-granular, so there is nothing to compare-and-delete against short of a
+  per-row generation counter.
 - Index open failures disable the tier for the affected namespace; other
   namespaces and the RAM cache are unaffected.
 

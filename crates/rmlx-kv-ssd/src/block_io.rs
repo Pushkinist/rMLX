@@ -385,9 +385,14 @@ pub(crate) fn read_caches(
     model_id: &str,
     kv_quant: KvQuant,
 ) -> Result<(Vec<KvCache>, Vec<LinearAttnCache>)> {
-    let (kv_caches, lin_caches, _, _, _, _) = read_caches_inner(path, device, model_id, kv_quant)?;
+    let (kv_caches, lin_caches, _, _, _, _) = read_caches_inner(path, device, model_id, kv_quant)?
+        .ok_or_else(|| Error::Mlx(format!("KV block read: {} not found", path.display())))?;
     Ok((kv_caches, lin_caches))
 }
+
+/// Reconstructed caches plus the hydrate phase timings:
+/// `(kv_caches, lin_caches, bytes_read, dur_read_us, dur_dequant_us, dur_finalize_us)`.
+type TimedCaches = (Vec<KvCache>, Vec<LinearAttnCache>, u64, u64, u64, u64);
 
 /// Timed variant of [`read_caches`] for SSD-tier hydrate observability.
 ///
@@ -400,31 +405,38 @@ pub(crate) fn read_caches(
 ///   reconstruction / dequant).
 /// - `dur_finalize_us` — time to wrap each reconstructed [`KvStorage`] into a
 ///   decode-ready [`KvCache`]; CPU-only struct construction, not a GPU upload.
+///
+/// `Ok(None)` means the file is no longer on disk — the routine outcome of an
+/// LRU eviction landing between the index lookup and the read. The caller
+/// distinguishes it from `Err` (a genuinely bad block) on the type.
 pub(crate) fn read_caches_timed(
     path: &Path,
     device: Device,
     model_id: &str,
     kv_quant: KvQuant,
-) -> Result<(Vec<KvCache>, Vec<LinearAttnCache>, u64, u64, u64, u64)> {
+) -> Result<Option<TimedCaches>> {
     read_caches_inner(path, device, model_id, kv_quant)
 }
 
 /// Shared core for [`read_caches`] and [`read_caches_timed`].
 ///
-/// Returns `(kv_caches, lin_caches, bytes_read, dur_read_us, dur_dequant_us, dur_finalize_us)`.
+/// Returns `(kv_caches, lin_caches, bytes_read, dur_read_us, dur_dequant_us, dur_finalize_us)`,
+/// or `Ok(None)` when the block file does not exist.
 /// Mirrors the write-side `serialize_block_refs` pattern.
 fn read_caches_inner(
     path: &Path,
     device: Device,
     model_id: &str,
     kv_quant: KvQuant,
-) -> Result<(Vec<KvCache>, Vec<LinearAttnCache>, u64, u64, u64, u64)> {
+) -> Result<Option<TimedCaches>> {
     use std::time::Instant;
 
     let bytes_read = std::fs::metadata(path).map_or(0, |m| m.len());
 
     let t_read = Instant::now();
-    let reader = KvBlockReader::open(path)?;
+    let Some(reader) = KvBlockReader::open_existing(path)? else {
+        return Ok(None);
+    };
     let dur_read_us = t_read.elapsed().as_micros() as u64;
 
     let t_dequant = Instant::now();
@@ -451,14 +463,14 @@ fn read_caches_inner(
         .collect();
     let dur_finalize_us = t_finalize.elapsed().as_micros() as u64;
 
-    Ok((
+    Ok(Some((
         kv_caches,
         lin_caches,
         bytes_read,
         dur_read_us,
         dur_dequant_us,
         dur_finalize_us,
-    ))
+    )))
 }
 
 /// Shared serialization core over an owned-slice of storages.
@@ -2009,8 +2021,24 @@ pub struct KvBlockReader {
 impl KvBlockReader {
     /// Load the file into memory. Header verification happens in [`Self::hydrate`].
     pub fn open(path: &Path) -> Result<Self> {
-        let bytes = std::fs::read(path).map_err(|e| Error::Mlx(format!("KV block read: {e}")))?;
-        Ok(Self { bytes })
+        Self::open_existing(path)?
+            .ok_or_else(|| Error::Mlx(format!("KV block read: {} not found", path.display())))
+    }
+
+    /// Like [`Self::open`], but reports a file that is not there as `Ok(None)`
+    /// rather than an error.
+    ///
+    /// LRU eviction unlinks blocks whose rows it has already deleted, so a
+    /// hydrate that read the row a moment earlier finds the file gone as a
+    /// matter of routine. That is a miss, not corruption, and the single
+    /// `fs::read` classifies it without a second `stat` (and without the
+    /// window one would open).
+    pub fn open_existing(path: &Path) -> Result<Option<Self>> {
+        match std::fs::read(path) {
+            Ok(bytes) => Ok(Some(Self { bytes })),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::Mlx(format!("KV block read: {e}"))),
+        }
     }
 
     /// Read the `model_id` header without hydrating.

@@ -229,9 +229,6 @@ fn drain_thread_evicts_to_the_namespace_budget() {
         SsdSpiller::spawn_with_index(MODEL_ID, TEST_LAYOUT_KEY, Device::Cpu, dir, index, budget);
     for i in 0..6u64 {
         spiller.try_spill(job(0x9100 + i));
-        // The channel is bounded and `try_spill` drops on overflow; the drain
-        // has to keep up for the block count to be the one under test.
-        thread::sleep(std::time::Duration::from_millis(5));
     }
     drop(spiller);
     handle.join().unwrap();

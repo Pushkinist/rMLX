@@ -158,16 +158,21 @@ fn evict_lru_returns_oldest_first_and_leaves_within_budget() {
         .unwrap();
 
     let evicted = idx.evict_lru_until(1500).unwrap();
-    assert_eq!(evicted.len(), 2);
-    assert_eq!(evicted[0], path("aaa"));
-    assert_eq!(evicted[1], path("bbb"));
+    assert_eq!(evicted.paths.len(), 2);
+    assert_eq!(evicted.paths[0], path("aaa"));
+    assert_eq!(evicted.paths[1], path("bbb"));
+    assert_eq!(
+        evicted.total_bytes_after, 1000,
+        "the reported footprint must be the post-eviction one"
+    );
 
     assert!(idx.lookup("ccc", LK_A).unwrap().is_some());
     assert!(idx.lookup("aaa", LK_A).unwrap().is_none());
     assert!(idx.lookup("bbb", LK_A).unwrap().is_none());
 
     let evicted2 = idx.evict_lru_until(1500).unwrap();
-    assert!(evicted2.is_empty());
+    assert!(evicted2.paths.is_empty());
+    assert_eq!(evicted2.total_bytes_after, 1000);
 }
 
 #[test]
@@ -202,7 +207,8 @@ fn total_bytes_sums_all_rows_and_tracks_eviction() {
 fn evict_empty_index_is_noop() {
     let idx = open();
     let evicted = idx.evict_lru_until(0).unwrap();
-    assert!(evicted.is_empty());
+    assert!(evicted.paths.is_empty());
+    assert_eq!(evicted.total_bytes_after, 0);
 }
 
 #[test]
@@ -227,9 +233,10 @@ fn evict_zero_budget_evicts_all() {
         )
         .unwrap();
     let evicted = idx.evict_lru_until(0).unwrap();
-    assert_eq!(evicted.len(), 2);
-    assert_eq!(evicted[0], PathBuf::from("/tmp/x.kvb"));
-    assert_eq!(evicted[1], PathBuf::from("/tmp/y.kvb"));
+    assert_eq!(evicted.paths.len(), 2);
+    assert_eq!(evicted.paths[0], PathBuf::from("/tmp/x.kvb"));
+    assert_eq!(evicted.paths[1], PathBuf::from("/tmp/y.kvb"));
+    assert_eq!(evicted.total_bytes_after, 0);
 }
 
 // ── prune_missing ─────────────────────────────────────────────────────────

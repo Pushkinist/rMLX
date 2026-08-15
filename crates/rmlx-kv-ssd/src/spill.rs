@@ -152,7 +152,7 @@ impl SsdSpiller {
                 tracing::info!(namespace = %ns, dir = %dir.display(), budget_bytes, "kv-spill: drain thread started");
                 for job in rx {
                     if drain_one(&index, &dir, device, job) {
-                        crate::ssd_tier::enforce_budget_after_spill(&index, &ns, budget_bytes);
+                        crate::ssd_tier::enforce_namespace_budget(&index, &ns, budget_bytes);
                     }
                 }
                 tracing::debug!(namespace = %ns, "kv-spill: drain thread exiting (all senders dropped)");
@@ -193,7 +193,7 @@ impl SsdSpiller {
             .spawn(move || {
                 for job in rx {
                     if drain_one_inner(&index, &dir, device, job, None) {
-                        crate::ssd_tier::enforce_budget_after_spill(&index, &ns, budget_bytes);
+                        crate::ssd_tier::enforce_namespace_budget(&index, &ns, budget_bytes);
                     }
                 }
             })

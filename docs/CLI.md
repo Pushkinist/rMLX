@@ -109,9 +109,9 @@ mutually exclusive.
 | `--tts-model-path` | path | — | Path to a Qwen3-TTS model snapshot directory. Required for `POST /v1/audio/speech`. Codec decoder not yet implemented; returns 501 until then. Env: `RMLX_TTS_MODEL_PATH`. |
 | `--tts-tokenizer-path` | path | — | Path to the Qwen3-TTS speech tokenizer snapshot directory. Used alongside `--tts-model-path`. Env: `RMLX_TTS_TOKENIZER_PATH`. |
 | `--mm-cache-bytes` | usize | `536870912` (512 MiB) | Byte budget for the multimodal encoder-output cache. Vision-tower (and Whisper-encoder) outputs are cached keyed on the post-preprocess pixel/PCM content hash **plus the producing model's identity** so repeated calls with identical inputs skip the encoder. The model-identity component means a shared cache in multi-model `--registry` mode never serves one model's encoder output to another for the same image/audio (cached outputs are projected to a model's hidden size and must not cross models). `0` disables the cache. Env: `RMLX_MM_CACHE_BYTES`. |
-| `--kv-ssd-cache-gb` | f64 | 0.0 | SSD prompt-cache tier budget in GiB per namespace. `0` = tier off (RAM-only). Blocks land in `<RMLX_HOME>/cache/kv/<namespace>/`. |
+| `--kv-ssd-cache-gb` | f64 | 0.0 | SSD prompt-cache tier budget in GiB per namespace. `0` = no per-namespace ceiling (tier off unless `--kv-ssd-global-gb > 0`). Blocks land in `<RMLX_HOME>/cache/kv/<namespace>/`. |
 | `--project` | string | (model id) | SSD prompt-cache namespace name. Requires `--kv-ssd-cache-gb > 0`. |
-| `--kv-ssd-global-gb` | f64 | 0.0 | Global SSD pool ceiling across all namespaces in GiB. `0` = no global cap. Effective per-namespace ceiling is `min(--kv-ssd-cache-gb, --kv-ssd-global-gb)` when global > 0. |
+| `--kv-ssd-global-gb` | f64 | 0.0 | Global SSD pool ceiling across all namespaces in GiB. `0` = no global cap. Effective per-namespace ceiling is the tighter of the two flags when both are > 0, and whichever one is set when only one is — a `0` is "unconfigured", never a zero-byte ceiling. |
 | `--prompt-cache-ram-gb` | f64 | 2.0 | RAM cap for the in-process prompt cache in GiB. |
 | `--paged-kv` | bool flag | off | Route K8V4/K8V8/Planar caches through the block-table paged storage path. Incompatible with `bf16`/`none` and `rot_k*` cache types. |
 | `--paged-kv-page-tokens` | i32 | 32 | Tokens per paged-KV block. Requires `--paged-kv`. |

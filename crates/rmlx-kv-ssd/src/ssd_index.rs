@@ -28,7 +28,14 @@
 //! schema_version (
 //! version INTEGER PRIMARY KEY NOT NULL -- 2
 //! )
+//!
+//! INDEX kv_blocks_last_used ON kv_blocks (last_used) -- LRU eviction order
 //! ```
+//!
+//! The `last_used` index is created idempotently on every open: it carries no
+//! row-format change, so it needs no `schema_version` bump, and LRU eviction
+//! runs after every spilled block and would otherwise sort the whole table to
+//! find the oldest row.
 //!
 //! The `(hash, layout_key)` composite PK is defence-in-depth: the chained
 //! digests stores under a given `layout_key` are already disjoint from
@@ -115,6 +122,18 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 ";
 
+/// LRU eviction runs after every spilled block and reads rows in `last_used`
+/// order. Without this index SQLite sorts the whole table before it can yield
+/// the first row, so stopping the scan early saves the row decode but not the
+/// sort — the dominant cost at a large ceiling.
+///
+/// Indexes carry no row-format change, so this is created idempotently on every
+/// open rather than being tied to a `schema_version` bump (which would wipe
+/// existing namespaces for no reason).
+const SCHEMA_INDEXES: &str = "
+CREATE INDEX IF NOT EXISTS kv_blocks_last_used ON kv_blocks (last_used);
+";
+
 // ── Row ───────────────────────────────────────────────────────────────────────
 
 /// A single row from the `kv_blocks` table.
@@ -136,6 +155,19 @@ pub struct KvBlockRow {
     pub byte_size: u64,
     /// Unix epoch timestamp of last access.
     pub last_used: u64,
+}
+
+/// Outcome of one [`SsdKvIndex::evict_lru_until`] pass over a namespace.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default)]
+pub struct NamespaceEviction {
+    /// Absolute paths of the `.kvb` files whose rows this call removed. A row
+    /// another evictor took first is absent, so `paths.len()` is the number of
+    /// rows genuinely evicted here and every path is one this caller owns.
+    pub paths: Vec<PathBuf>,
+    /// Indexed footprint in bytes once the deletes committed. Saves the caller
+    /// a second `SUM(byte_size)` over the table.
+    pub total_bytes_after: u64,
 }
 
 // ── Index ─────────────────────────────────────────────────────────────────────
@@ -202,7 +234,10 @@ impl SsdKvIndex {
             // them first would mask a pre-release v1 layout.
             let version = read_schema_version(&conn)?;
             match version {
-                Some(v) if v == SCHEMA_VERSION => Ok(Self { conn }),
+                Some(v) if v == SCHEMA_VERSION => {
+                    conn.execute_batch(SCHEMA_INDEXES)?;
+                    Ok(Self { conn })
+                }
                 Some(v) => Err(SsdKvIndexError::SchemaMismatch {
                     found: v,
                     expected: SCHEMA_VERSION,
@@ -338,63 +373,82 @@ impl SsdKvIndex {
     /// Evict the oldest-used blocks until the total `byte_size` in the index is
     /// ≤ `budget_bytes`.
     ///
-    /// Rows are deleted in ascending `last_used` order (oldest first). The
-    /// method returns the **absolute paths** of the evicted `.kvb` files so
-    /// the caller can delete them from disk.
+    /// Rows are deleted in ascending `last_used` order (oldest first), inside a
+    /// single transaction, so a failure part-way leaves the index exactly as it
+    /// was rather than dropping rows whose files the caller never gets told to
+    /// unlink. `budget_bytes == 0` is taken literally here ("keep nothing") —
+    /// the tier-level "no ceiling configured" reading lives in
+    /// [`crate::ssd_tier::enforce_namespace_budget`].
     ///
-    /// If the total stored size is already within budget, returns an empty vec.
-    pub fn evict_lru_until(&self, budget_bytes: u64) -> Result<Vec<PathBuf>> {
-        let total: i64 = self
-            .conn
-            .query_row(
-                "SELECT COALESCE(SUM(byte_size), 0) FROM kv_blocks",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-
-        if total <= 0 || total as u64 <= budget_bytes {
-            return Ok(Vec::new());
+    /// The returned [`NamespaceEviction`] carries the **absolute paths** of the
+    /// `.kvb` files whose rows this call actually removed, so the caller can
+    /// unlink exactly those, plus the resulting footprint.
+    ///
+    /// Runs after every spilled block, so it must not be O(rows): the scan stops
+    /// as soon as the running total is within budget instead of materialising
+    /// the whole table, and projects only the four columns eviction needs.
+    pub fn evict_lru_until(&self, budget_bytes: u64) -> Result<NamespaceEviction> {
+        let total = self.total_bytes()?;
+        if total <= budget_bytes {
+            return Ok(NamespaceEviction {
+                paths: Vec::new(),
+                total_bytes_after: total,
+            });
         }
 
-        // Collect candidates oldest-first.
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT hash, layout_key, path, model_id, kv_quant, byte_size, last_used
-             FROM kv_blocks ORDER BY last_used ASC",
-        )?;
-        let all: Vec<KvBlockRow> = stmt
-            .query_map([], row_from_row)?
-            .collect::<std::result::Result<_, _>>()?;
-
-        let mut running: u64 = total as u64;
-        let mut evicted_paths: Vec<PathBuf> = Vec::new();
-        let mut evicted_keys: Vec<(String, u64)> = Vec::new();
-
-        for row in all {
-            if running <= budget_bytes {
-                break;
-            }
-            tracing::info!(
-                hash = %row.hash,
-                layout_key = row.layout_key,
-                path = %row.path.display(),
-                byte_size = row.byte_size,
-                last_used = row.last_used,
-                "kv-index: evicting block (LRU)"
-            );
-            running = running.saturating_sub(row.byte_size);
-            evicted_paths.push(row.path.clone());
-            evicted_keys.push((row.hash.clone(), row.layout_key));
-        }
-
-        for (hash, lk) in &evicted_keys {
-            self.conn.execute(
-                "DELETE FROM kv_blocks WHERE hash = ?1 AND layout_key = ?2",
-                params![hash, *lk as i64],
+        // Oldest-first candidates, taking only as many as it takes to get under
+        // the ceiling.
+        let mut candidates: Vec<(String, u64, PathBuf, u64)> = Vec::new();
+        {
+            let mut stmt = self.conn.prepare_cached(
+                "SELECT hash, layout_key, path, byte_size
+                 FROM kv_blocks ORDER BY last_used ASC",
             )?;
+            let mut rows = stmt.query([])?;
+            let mut running = total;
+            while running > budget_bytes {
+                let Some(r) = rows.next()? else { break };
+                let byte_size = r.get::<_, i64>(3)?.max(0) as u64;
+                running = running.saturating_sub(byte_size);
+                candidates.push((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as u64,
+                    PathBuf::from(r.get::<_, String>(2)?),
+                    byte_size,
+                ));
+            }
         }
 
-        Ok(evicted_paths)
+        // One transaction: either every selected row goes, or none does, so the
+        // returned paths always match what was actually removed.
+        let tx = self.conn.unchecked_transaction()?;
+        let mut paths: Vec<PathBuf> = Vec::with_capacity(candidates.len());
+        let mut freed: u64 = 0;
+        for (hash, layout_key, path, byte_size) in candidates {
+            let n = tx.execute(
+                "DELETE FROM kv_blocks WHERE hash = ?1 AND layout_key = ?2",
+                params![hash, layout_key as i64],
+            )?;
+            // A no-op DELETE means another evictor already took this row; it
+            // owns the file, so this call neither counts it nor unlinks it.
+            if n > 0 {
+                tracing::debug!(
+                    hash = %hash,
+                    layout_key,
+                    path = %path.display(),
+                    byte_size,
+                    "kv-index: evicting block (LRU)"
+                );
+                freed = freed.saturating_add(byte_size);
+                paths.push(path);
+            }
+        }
+        tx.commit()?;
+
+        Ok(NamespaceEviction {
+            paths,
+            total_bytes_after: total.saturating_sub(freed),
+        })
     }
 
     /// Total `byte_size` summed over all indexed blocks.
@@ -680,6 +734,7 @@ pub fn evict_pool_lru_until(kv_root: &Path, global_budget_bytes: u64) -> Result<
 fn init_v2_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA_PRAGMAS)?;
     conn.execute_batch(SCHEMA_TABLES)?;
+    conn.execute_batch(SCHEMA_INDEXES)?;
     conn.execute(
         "INSERT OR IGNORE INTO schema_version (version) VALUES (?1)",
         params![SCHEMA_VERSION],
