@@ -517,14 +517,18 @@ enum Cmd {
         /// SSD prompt-cache tier budget, in GiB. GLOBAL ceiling over the
         /// active cache namespace's on-disk KV blocks.
         ///
-        /// Default 0 = tier OFF (RAM-only prompt cache, unchanged behaviour).
-        /// When > 0, RAM-evicted prompt-cache snapshots spill to
+        /// Default 0 = no per-namespace ceiling. With `--kv-ssd-global-gb` also
+        /// 0 that means the tier is OFF (RAM-only prompt cache, unchanged
+        /// behaviour); with a global pool set, the tier is on and the pool
+        /// ceiling governs this namespace on its own.
+        /// When the tier is on, RAM-evicted prompt-cache snapshots spill to
         /// `<RMLX_HOME>/cache/kv/<namespace>/` and a RAM miss is served from the
         /// longest cached block-aligned prefix on disk. The namespace is the
         /// model id unless `--project` overrides it. Eviction within the
-        /// namespace is LRU-by-size, kept under this ceiling; budgets persist
-        /// across restarts (the on-disk index is pruned + evicted-to-budget at
-        /// startup). Because `rmlx serve` runs a single MLX process, one
+        /// namespace is LRU-by-size: the ceiling is enforced at model load
+        /// (index pruned + evicted-to-budget) and again after every block the
+        /// spill thread writes, so it holds for the life of the process and not
+        /// only at startup. Because `rmlx serve` runs a single MLX process, one
         /// namespace is active at a time, so this per-namespace ceiling is also
         /// the global ceiling.
         #[arg(long, value_name = "GIB", default_value_t = 0.0)]
@@ -550,9 +554,10 @@ enum Cmd {
         /// exceeds the global budget, the per-namespace ceiling is implicitly
         /// clamped (`min(per_ns, global)`), and a warning is emitted.
         ///
-        /// Precedence (per-namespace ceiling effective value):
-        /// `min(--kv-ssd-cache-gb, --kv-ssd-global-gb)` when global > 0,
-        /// else `--kv-ssd-cache-gb`.
+        /// Precedence (per-namespace ceiling effective value): the tighter of
+        /// the two when both are > 0; whichever one is set when only one is;
+        /// and no ceiling at all when neither is (the tier is off). A zero on
+        /// either flag is "unconfigured", never "a ceiling of zero bytes".
         #[arg(long, value_name = "GIB", default_value_t = 0.0)]
         kv_ssd_global_gb: f64,
         /// RAM cap for the in-process prompt cache, in GiB.

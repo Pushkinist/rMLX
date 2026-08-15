@@ -92,6 +92,13 @@ pub struct SpillJob {
 /// The drain thread owns the [`SsdKvIndex`] and the destination directory, and
 /// lives for the process lifetime (the join handle is dropped — the thread
 /// exits when all senders are dropped).
+///
+/// It is also where the namespace's on-disk budget is enforced. The drain
+/// thread is the only writer that grows the tier, it already holds an index
+/// handle, and it runs off the inference path — so it evicts to budget after
+/// every block it records. Nothing else evicts between model loads, so without
+/// that pass a long-lived `serve` would exceed `--kv-ssd-cache-gb` for its
+/// whole lifetime and only come back under the ceiling at the next attach.
 #[allow(missing_debug_implementations)]
 pub struct SsdSpiller {
     tx: SyncSender<SpillJob>,
@@ -116,10 +123,18 @@ impl SsdSpiller {
     /// On index-open failure the drain thread logs `warn!` and exits; the
     /// sender side still accepts (and silently drops) jobs, so the cache keeps
     /// working with spill effectively disabled.
+    ///
+    /// The namespace byte ceiling is resolved once here from the installed
+    /// SSD-tier config, so it is the same figure the attach-time maintenance
+    /// pass evicted to. `0` (tier unconfigured) leaves the drain thread with no
+    /// ceiling to enforce, exactly as before.
     pub fn spawn(model_id: impl Into<String>, layout_key: u64, device: Device) -> Self {
         let model_id = model_id.into();
         let (tx, rx) = sync_channel::<SpillJob>(SPILL_CHANNEL_CAP);
 
+        let budget_bytes = crate::ssd_tier::active()
+            .as_ref()
+            .map_or(0, crate::ssd_tier::effective_namespace_budget);
         let ns = model_id.clone();
         let _ = thread::Builder::new()
             .name("rmlx-kv-spill".into())
@@ -134,9 +149,11 @@ impl SsdSpiller {
                         return;
                     }
                 };
-                tracing::info!(namespace = %ns, dir = %dir.display(), "kv-spill: drain thread started");
+                tracing::info!(namespace = %ns, dir = %dir.display(), budget_bytes, "kv-spill: drain thread started");
                 for job in rx {
-                    drain_one(&index, &dir, device, job);
+                    if drain_one(&index, &dir, device, job) {
+                        crate::ssd_tier::enforce_namespace_budget(&index, &ns, budget_bytes);
+                    }
                 }
                 tracing::debug!(namespace = %ns, "kv-spill: drain thread exiting (all senders dropped)");
             });
@@ -151,8 +168,10 @@ impl SsdSpiller {
     /// Test-only: spawn a drain thread bound to an explicit `dir` + `index`,
     /// bypassing `paths::kv_cache_dir` so tests are hermetic (no env-var
     /// coupling, no shared workspace `.rmlx/`). Same drain semantics as
-    /// [`Self::spawn`]. Returns the handle plus the spawned thread's
-    /// `JoinHandle` so a test can join after dropping the sender.
+    /// [`Self::spawn`], including the post-spill evict-to-budget pass —
+    /// `budget_bytes` stands in for what [`Self::spawn`] reads from the
+    /// installed config (`0` = no ceiling). Returns the handle plus the spawned
+    /// thread's `JoinHandle` so a test can join after dropping the sender.
     #[cfg(test)]
     #[allow(
         clippy::expect_used,
@@ -164,14 +183,18 @@ impl SsdSpiller {
         device: Device,
         dir: PathBuf,
         index: SsdKvIndex,
+        budget_bytes: u64,
     ) -> (Self, thread::JoinHandle<()>) {
         let model_id = model_id.into();
+        let ns = model_id.clone();
         let (tx, rx) = sync_channel::<SpillJob>(SPILL_CHANNEL_CAP);
         let handle = thread::Builder::new()
             .name("rmlx-kv-spill-test".into())
             .spawn(move || {
                 for job in rx {
-                    drain_one_inner(&index, &dir, device, job, None);
+                    if drain_one_inner(&index, &dir, device, job, None) {
+                        crate::ssd_tier::enforce_namespace_budget(&index, &ns, budget_bytes);
+                    }
                 }
             })
             .expect("spawn test drain thread");
@@ -211,6 +234,9 @@ impl SsdSpiller {
                 }
             })
             .expect("spawn test drain thread");
+        // No budget pass: this variant exists to observe the emitted spill
+        // event, and an eviction racing that observation would make the row
+        // count it asserts on depend on timing.
         (
             Self {
                 tx,
@@ -258,8 +284,12 @@ impl SsdSpiller {
 /// Fire-and-forget: any error is `warn!`ed and the job dropped. Never panics.
 /// Emits a [`SsdSpillEvent`] via the process-global event recorder (if set)
 /// with per-phase timing and byte count.
-fn drain_one(index: &SsdKvIndex, dir: &std::path::Path, device: Device, job: SpillJob) {
-    drain_one_inner(index, dir, device, job, None);
+///
+/// Returns `true` only when the block reached the index, which is the one
+/// outcome that grew the namespace and therefore the only one worth running an
+/// evict-to-budget pass after.
+fn drain_one(index: &SsdKvIndex, dir: &std::path::Path, device: Device, job: SpillJob) -> bool {
+    drain_one_inner(index, dir, device, job, None)
 }
 
 /// Core of [`drain_one`], factored so tests can inject an explicit recorder.
@@ -278,7 +308,7 @@ fn drain_one_inner(
     device: Device,
     job: SpillJob,
     test_recorder: Option<&EventRecorder>,
-) {
+) -> bool {
     let SpillJob {
         hash,
         layout_key,
@@ -303,7 +333,7 @@ fn drain_one_inner(
                     "kv-spill: serialize failed, dropping job"
                 );
                 let _ = std::fs::remove_file(&path);
-                return;
+                return false;
             }
         };
 
@@ -324,7 +354,7 @@ fn drain_one_inner(
             error = %e,
             "kv-spill: index record failed, dropping job"
         );
-        return;
+        return false;
     }
     let dur_index_us = t_idx.elapsed().as_micros() as u64;
     let dur_us = t0.elapsed().as_micros() as u64;
@@ -371,6 +401,7 @@ fn drain_one_inner(
     // Feed the Prometheus histogram accumulator (registered by rmlx-server at
     // startup via `set_ssd_spill_prom_hook`). No-op when unset.
     call_ssd_spill_prom_hook(dur_us, byte_size);
+    true
 }
 
 #[cfg(test)]

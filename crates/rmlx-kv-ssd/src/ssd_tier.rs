@@ -166,6 +166,24 @@ pub fn active() -> Option<SsdTierConfig> {
     CONFIG.get().cloned().flatten()
 }
 
+/// The byte ceiling one namespace may occupy under `cfg`.
+///
+/// A zero budget on either side means "that dimension is unconfigured", not
+/// "keep nothing": with no per-namespace budget the global pool ceiling governs
+/// the namespace on its own, and with no global pool the per-namespace budget
+/// stands alone. When both are set the namespace is capped by the tighter of
+/// the two. The result is therefore non-zero whenever the tier is on (which
+/// [`install_config`] defines as at least one budget being non-zero), so the
+/// attach-time maintenance pass and the spill drain thread — the two callers —
+/// always read the same ceiling as a ceiling.
+pub(crate) fn effective_namespace_budget(cfg: &SsdTierConfig) -> u64 {
+    match (cfg.per_namespace_budget_bytes, cfg.global_budget_bytes) {
+        (0, global) => global,
+        (per_ns, 0) => per_ns,
+        (per_ns, global) => per_ns.min(global),
+    }
+}
+
 /// Resolve the on-disk namespace for `model_id` under the active config.
 ///
 /// Returns a borrowed slice of `cfg.default_namespace` when present, or an
@@ -276,13 +294,7 @@ pub fn prepare_attach(
 
     // Startup maintenance: drop rows whose .kvb vanished, then evict
     // oldest-first until the persisted footprint is within budget.
-    // Per-namespace budget is implicitly capped by the global pool ceiling
-    // (`min(per_ns, global)`); when global == 0 the per-ns budget stands alone.
-    let effective_per_ns = if cfg.global_budget_bytes > 0 {
-        cfg.per_namespace_budget_bytes.min(cfg.global_budget_bytes)
-    } else {
-        cfg.per_namespace_budget_bytes
-    };
+    let effective_per_ns = effective_namespace_budget(&cfg);
     // Open the namespace index here — this is the single `paths::home()`
     // resolution on the attach path — then hand the opened handle to the
     // maintenance routine. Keeping the open at the boundary means the
@@ -316,12 +328,6 @@ pub fn prepare_attach(
 /// the attach path. This keeps the routine root-injectable (tests open against
 /// a temp dir) and free of the `OnceLock` ordering hazard.
 #[allow(
-    clippy::cognitive_complexity,
-    reason = "prune → evict → prometheus hooks: sequential best-effort operations \
-              each with their own error arms; splitting would obscure the linear \
-              maintenance sequence"
-)]
-#[allow(
     clippy::semicolon_if_nothing_returned,
     reason = "tracing macros expand to expressions in macro position; the trailing \
               tracing::info! / tracing::warn! in match arms are the last expression, \
@@ -339,40 +345,82 @@ fn startup_maintenance(index: &SsdKvIndex, namespace: &str, budget_bytes: u64) {
         Ok(_) => {}
         Err(e) => tracing::warn!(namespace, error = %e, "ssd-tier prune_missing failed"),
     }
-    let before = index.total_bytes().unwrap_or(0);
-    let evict_count = match index.evict_lru_until(budget_bytes) {
-        Ok(evicted) => {
-            for p in &evicted {
-                if let Err(e) = std::fs::remove_file(p) {
-                    tracing::warn!(path = %p.display(), error = %e, "ssd-tier evicted-block file remove failed");
-                }
-            }
-            let after = index.total_bytes().unwrap_or(0);
-            tracing::info!(
-                namespace,
-                budget_bytes,
-                bytes_before = before,
-                bytes_after = after,
-                evicted = evicted.len(),
-                "ssd-tier startup evict-to-budget complete"
-            );
-            evicted.len() as u64
-        }
+    enforce_namespace_budget(index, namespace, budget_bytes);
+}
+
+/// Evict oldest-first until the namespace footprint is within `budget_bytes`,
+/// delete each evicted `.kvb`, and republish the two Prometheus hooks. Returns
+/// the number of blocks evicted.
+///
+/// This is the single eviction routine for the tier: the attach-time
+/// maintenance pass runs it after `prune_missing`, and the spill drain thread
+/// runs it after each block it writes, so the configured budget holds for the
+/// whole life of the process instead of only at the moment a model is loaded.
+///
+/// `budget_bytes == 0` means "no ceiling configured" and evicts nothing.
+/// [`effective_namespace_budget`] only yields zero when the tier is off, so
+/// this is a backstop: eviction is the one operation where the two readings of
+/// zero differ by the whole namespace, and no caller gets to pick the wrong one.
+///
+/// Best-effort throughout: an index error is `warn!`ed and treated as "evicted
+/// nothing"; a file that is already gone is not an error (an operator's `rm`
+/// reaching the block first leaves exactly the state this pass wanted).
+///
+/// **Safe to run against a namespace with in-flight hydrate + spill traffic**,
+/// in this specific sense: no reader is ever handed a block other than the one
+/// it asked for. A block is only reachable through its own `(hash, layout_key)`
+/// row, and `evict_lru_until` commits the row deletion before this fn unlinks
+/// the file, so a concurrent lookup either misses outright or fails its read and
+/// falls through to a full prefill. It does **not** claim every block survives:
+/// the hydrate-side cleanup path can still drop a block that a re-spill
+/// recreated underneath it (see `SsdHydrator::lookup_inner`).
+pub(crate) fn enforce_namespace_budget(
+    index: &SsdKvIndex,
+    namespace: &str,
+    budget_bytes: u64,
+) -> u64 {
+    if budget_bytes == 0 {
+        return 0;
+    }
+    let eviction = match index.evict_lru_until(budget_bytes) {
+        Ok(e) => e,
         Err(e) => {
             tracing::warn!(namespace, error = %e, "ssd-tier evict_lru_until failed");
-            0
+            return 0;
         }
     };
-
-    // Publish the eviction count to the Prometheus counter hook.
-    // evict_count == 0 when already within budget — no counter bump needed.
-    if evict_count > 0 {
-        call_ssd_evict_total_hook(namespace, evict_count);
+    for p in &eviction.paths {
+        match std::fs::remove_file(p) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(path = %p.display(), error = %e, "ssd-tier evicted-block file remove failed");
+            }
+        }
     }
 
-    // Publish the on-disk footprint to the Prometheus gauge after maintenance.
-    let total = index.total_bytes().unwrap_or(0);
-    call_ssd_bytes_used_hook(namespace, total);
+    // Publish the eviction count to the Prometheus counter hook.
+    // Zero when already within budget — no counter bump needed.
+    let evict_count = eviction.paths.len() as u64;
+    if evict_count > 0 {
+        call_ssd_evict_total_hook(namespace, evict_count);
+        // One aggregate per pass. The per-row line is `debug!`: at the ceiling
+        // this runs after every spilled block, and an info-per-row would rotate
+        // the run's log history out against `RMLX_LOG_CAP_MB`.
+        tracing::info!(
+            namespace,
+            budget_bytes,
+            evicted = evict_count,
+            bytes_after = eviction.total_bytes_after,
+            "ssd-tier evict-to-budget complete"
+        );
+    }
+
+    // Publish the on-disk footprint to the Prometheus gauge. Running on every
+    // spill is what keeps `rmlx_ssd_bytes_used` tracking the tier instead of
+    // freezing at the value measured when the model was loaded.
+    call_ssd_bytes_used_hook(namespace, eviction.total_bytes_after);
+    evict_count
 }
 
 /// pre-release schema wipe: walk every namespace under `kv_root` and
