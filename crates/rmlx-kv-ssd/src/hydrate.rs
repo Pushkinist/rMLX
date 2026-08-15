@@ -13,8 +13,9 @@
 //! ## Flow (per RAM miss)
 //!
 //! 1. Compute the prompt's chained block hashes (`chained_block_hashes_seeded`,
-//!    seeded with `FNV_OFFSET ^ layout_key ^ kv_quant.cache_key_salt()` — the
-//!    spill-side key).
+//!    seeded with [`crate::hashing::cache_seed`] — the same function the RAM
+//!    push side calls, so the probe cannot drift from the key the spill side
+//!    wrote).
 //! 2. `SsdKvIndex::lookup_longest_prefix` — the longest cached block-aligned
 //!    prefix (longest-first scan of the candidate prefix digests).
 //! 3. On a hit: `block_io::read_caches` reads the `.kvb`, verifying the
@@ -44,7 +45,7 @@ use rmlx_kv_quant::linear_attn::LinearAttnCache;
 use rmlx_kv_quant::KvQuant;
 
 use crate::block_io::read_caches_timed;
-use crate::hashing::{chained_block_hashes_seeded, BLOCK_TOKENS, FNV_OFFSET};
+use crate::hashing::{cache_seed, chained_block_hashes_seeded, BLOCK_TOKENS};
 use crate::hooks::{call_ssd_hydrate_prom_hook, ssd_event_recorder};
 use crate::ssd_index::{KvBlockRow, SsdKvIndex};
 
@@ -87,6 +88,11 @@ pub struct SsdHydrator {
     /// Salts the chained-hash digest stream and pins index lookups under the
     /// composite `(hash, layout_key)` PK.
     layout_key: u64,
+    /// Stable per-model identity of the model this hydrator serves, as carried
+    /// by that model's prompt-cache entries. Part of the probe seed because the
+    /// RAM push side folds it into the digests the spill side then persists —
+    /// and because `--project` puts several models in one namespace.
+    model_sig: u64,
     device: Device,
 }
 
@@ -101,6 +107,7 @@ impl SsdHydrator {
         model_id: impl Into<String>,
         kv_quant: KvQuant,
         layout_key: u64,
+        model_sig: u64,
         device: Device,
     ) -> rmlx_core::error::Result<Self> {
         let model_id = model_id.into();
@@ -113,6 +120,7 @@ impl SsdHydrator {
             model_id,
             kv_quant,
             layout_key,
+            model_sig,
             device,
         })
     }
@@ -124,6 +132,7 @@ impl SsdHydrator {
         model_id: impl Into<String>,
         kv_quant: KvQuant,
         layout_key: u64,
+        model_sig: u64,
         device: Device,
         dir: PathBuf,
         index: SsdKvIndex,
@@ -134,6 +143,7 @@ impl SsdHydrator {
             model_id: model_id.into(),
             kv_quant,
             layout_key,
+            model_sig,
             device,
         }
     }
@@ -156,11 +166,24 @@ impl SsdHydrator {
         self.layout_key
     }
 
+    /// The digest seed for everything this hydrator does — the index probe and
+    /// the post-hydrate recompute alike.
+    ///
+    /// Both of those have to reproduce the stream the RAM push side stored the
+    /// entry under, so both go through [`cache_seed`] with this hydrator's own
+    /// `(layout_key, kv_quant, model_sig)`. Recomputing either one by hand is
+    /// how the probe silently stopped matching what spill wrote.
+    fn probe_seed(&self) -> u64 {
+        cache_seed(self.layout_key, self.kv_quant, self.model_sig)
+    }
+
     /// Index lookup + recompute of the RAM-side seeded block-hash chain for the
-    /// matched block-aligned prefix. The seed partitions prompt-cache keys by KV
-    /// layout and codec; the arch-side recompute after hydrate MUST use this exact
-    /// formula or hydrated entries are unfindable in the RAM cache. (The index
-    /// probe inside `lookup()` has its own seed — they must agree.)
+    /// matched block-aligned prefix. The seed partitions prompt-cache keys by
+    /// model, KV layout and codec; the arch-side recompute after hydrate MUST
+    /// use the same [`probe_seed`] the index probe inside `lookup()` uses, or
+    /// hydrated entries are unfindable in the RAM cache.
+    ///
+    /// [`probe_seed`]: SsdHydrator::probe_seed
     pub fn lookup_seeded(
         &self,
         prompt_ids: &[u32],
@@ -168,8 +191,7 @@ impl SsdHydrator {
         let Some(block) = self.lookup(prompt_ids)? else {
             return Ok(None);
         };
-        let seed = FNV_OFFSET ^ self.layout_key ^ self.kv_quant.cache_key_salt();
-        let hashes = chained_block_hashes_seeded(&block.prompt_ids, seed);
+        let hashes = chained_block_hashes_seeded(&block.prompt_ids, self.probe_seed());
         Ok(Some((block, hashes)))
     }
 
@@ -217,18 +239,12 @@ impl SsdHydrator {
         prompt_ids: &[u32],
         test_recorder: Option<&EventRecorder>,
     ) -> rmlx_core::error::Result<Option<HydratedBlock>> {
-        // seed the chained walk with `FNV_OFFSET ^ layout_key ^
-        // kv_quant.cache_key_salt()` so the probe digest stream is byte-identical
-        // to the spill side's key (the spill/RAM-push/post-hydrate-recompute
-        // paths all seed with this same salted value). Without the codec salt the
-        // probe could never match a row the spill side wrote, so the SSD tier
-        // would silently 0-hit. A zero `layout_key` with the codec salt is the
-        // per-codec partition (same tokens under different codecs occupy disjoint
-        // digest streams).
-        let chained = chained_block_hashes_seeded(
-            prompt_ids,
-            FNV_OFFSET ^ self.layout_key ^ self.kv_quant.cache_key_salt(),
-        );
+        // Seed the chained walk through `probe_seed` — the shared `cache_seed`
+        // the RAM push side used to build the digests the spill side then wrote
+        // to the index. Any term this probe omits (model, layout, codec) is a
+        // term the stored key has and the probe does not, and the tier silently
+        // 0-hits: every request re-prefills and nothing reports an error.
+        let chained = chained_block_hashes_seeded(prompt_ids, self.probe_seed());
         if chained.is_empty() {
             return Ok(None); // < one full block → nothing indexable
         }

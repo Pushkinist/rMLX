@@ -89,30 +89,12 @@ pub(crate) fn model_cache_sig(model_dir: &std::path::Path) -> u64 {
     crate::multimodal_cache::model_sig(&id)
 }
 
-/// The block-digest seed a prompt-cache lookup and its matching push must both
-/// use.
-///
-/// Three things partition the key, and every one of them is a case where reusing
-/// another entry's K/V would be wrong rather than merely unhelpful:
-///
-/// - `model_sig` — **which model produced this K/V.** The prompt cache is one
-///   static per architecture, so two models of the same arch resident at once
-///   (the multi-model registry, or a speculative pair) share it. Without this
-///   term, model B's identical prompt matches model A's slot, the token-id
-///   equality check passes because the tokens *are* equal, and B decodes from
-///   A's K/V and A's first token — wrong output, silently.
-/// - `layout_key` — the SSD tier's `(arch, n_layers, n_kv_heads, head_dim,
-///   kv_quant)` shape key, or `0` when the tier is OFF. It is a *shape*
-///   identity and carries no model identity, which is why `model_sig` is a
-///   separate term rather than something to fold into it.
-/// - `kv_quant` — the codec the stored K/V is packed under.
-///
-/// One function so the lookup and push sides cannot drift: a push seeded
-/// differently from the query is not a bug that surfaces as a wrong answer, it
-/// surfaces as a cache that silently never hits.
-pub(crate) fn cache_seed(layout_key: u64, kv_quant: KvQuant, model_sig: u64) -> u64 {
-    FNV_OFFSET ^ layout_key ^ kv_quant.cache_key_salt() ^ model_sig
-}
+// The seed itself is defined in `rmlx-kv-ssd` next to the FNV walk it feeds,
+// because the SSD hydrate probe has to produce the same digest stream as this
+// RAM cache and cannot see `rmlx-models`. Re-exported so in-crate call sites
+// keep the `crate::prompt_cache::cache_seed` path. Do NOT reintroduce a local
+// copy of the formula here — see `rmlx_kv_ssd::hashing::cache_seed`.
+pub(crate) use rmlx_kv_ssd::cache_seed;
 
 /// Default RAM cap for the prompt cache (2 GiB).
 pub(crate) const DEFAULT_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -553,10 +535,10 @@ pub(crate) struct PromptCache<E: PromptCacheEntry> {
     /// pluggable longest-prefix index. Mirrors `self.slots` —
     /// every entry in `slots` has exactly one corresponding entry here
     /// keyed by `(slot.entry.block_hashes(), layout_key=0)` with payload =
-    /// `slot.slot_uid`. Layout disambiguation is already baked into the
-    /// stored `block_hashes` by the per-arch push path
-    /// (`chained_block_hashes_seeded(ids, FNV_OFFSET ^ layout_key)`), so we
-    /// pass `0` to the trait and rely on hash inequality alone.
+    /// `slot.slot_uid`. Model / layout / codec disambiguation is already baked
+    /// into the stored `block_hashes` by the per-arch push path
+    /// (`chained_block_hashes_seeded(ids, cache_seed(…))`), so we pass `0` to
+    /// the trait and rely on hash inequality alone.
     ///
     /// On the Linear path this index is built + maintained for parity with
     /// the Radix path (used by the differential test in the bench)
@@ -1050,6 +1032,10 @@ pub(crate) struct AttachParams {
     pub(crate) namespace: String,
     pub(crate) kv_quant: KvQuant,
     pub(crate) layout_key: u64,
+    /// Stable identity of the model being attached, from its own
+    /// [`model_cache_sig`]. The hydrator needs it because the blocks on disk
+    /// are keyed by the RAM push seed, which includes it — see [`cache_seed`].
+    pub(crate) model_sig: u64,
     pub(crate) device: rmlx_mlx::Device,
 }
 
@@ -1201,11 +1187,17 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
     /// for `namespace` at `kv_quant` (/ ). Records the attach params
     /// so they survive a later cache re-creation, then installs the sinks on
     /// the live cache when one already exists.
+    ///
+    /// `model_sig` is the attaching model's own signature, the same value its
+    /// generate loop passes to [`Self::consume`]. It reaches the hydrator so
+    /// the SSD probe seeds the digest stream exactly as the RAM push side did;
+    /// without it the tier reads a `.kvb` directory it can never match.
     pub(crate) fn attach_ssd_tier(
         &self,
         namespace: &str,
         kv_quant: KvQuant,
         layout_key: u64,
+        model_sig: u64,
         device: rmlx_mlx::Device,
     ) where
         SsdSpiller: SpillSink<E>,
@@ -1215,6 +1207,7 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
             namespace: namespace.to_string(),
             kv_quant,
             layout_key,
+            model_sig,
             device,
         };
         *self
@@ -1488,7 +1481,13 @@ where
         p.layout_key,
         p.device,
     )));
-    match SsdHydrator::open(&p.namespace, p.kv_quant, p.layout_key, p.device) {
+    match SsdHydrator::open(
+        &p.namespace,
+        p.kv_quant,
+        p.layout_key,
+        p.model_sig,
+        p.device,
+    ) {
         Ok(h) => cache.set_ssd_source(Box::new(h)),
         Err(e) => tracing::warn!(
             namespace = %p.namespace,

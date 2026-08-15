@@ -68,27 +68,45 @@ Because each block's digest folds in the previous block's digest as its seed,
 comparing `digest[k]` proves the entire `(k+1)*256`-token prefix is
 byte-identical — no per-token rescan is needed at lookup time.
 
-### Layout-key salt
+### The seed: `cache_seed`
 
-When the SSD tier is active, the starting seed is salted:
+The starting seed is not written out at any call site. It is built by one
+function, `rmlx_kv_ssd::hashing::cache_seed`:
 
 ```
-seed = FNV_OFFSET ^ layout_key
+seed = FNV_OFFSET ^ layout_key ^ kv_quant.cache_key_salt() ^ model_sig
 ```
 
-where `layout_key` is a stable FNV-1a-64 hash over
-`(arch, n_layers, n_kv_heads, head_dim, kv_quant)` computed in
-`ssd_tier::compute_layout_key`. Salting ensures that two snapshots of the
-same prompt at different KV layouts (e.g. `k8v8` vs `k8v4`) produce disjoint
-digest streams and cannot accidentally share cache blocks.
+Four places have to produce the same digest stream — the RAM push, the
+`find_best_prefix` query, the SSD spill key, and the SSD hydrate probe — and a
+push seeded differently from the query does not surface as a wrong answer. It
+surfaces as a cache that silently never hits. So `cache_seed` lives in
+`rmlx-kv-ssd`, the deepest crate all four can call (`rmlx-kv-ssd` must never
+depend on `rmlx-models`; `prompt_cache.rs` re-exports it). Do not re-derive the
+formula anywhere.
 
-When the SSD tier is off (no salt, `layout_key = 0`), the seed is
-`FNV_OFFSET ^ 0 = FNV_OFFSET` — the same as the bare un-salted form. RAM-only
-behaviour is therefore byte-identical to the legacy pre-SSD path.
+The three terms:
+
+- **`model_sig`** — which model produced this K/V. The prompt cache is one
+  static per *architecture*, so two models of the same arch resident at once
+  (multi-model `--registry`, or a speculative pair) share it, and the `Exact`
+  arm's token-id equality cannot separate them: the tokens really are equal.
+  Derived from the snapshot directory's own name, so it survives a restart for
+  the SSD tier. On the SSD side it matters for one more reason — `--project`
+  collapses several models onto one namespace directory, so the directory is not
+  a per-model partition either.
+- **`layout_key`** — a stable FNV-1a-64 hash over
+  `(arch, n_layers, n_kv_heads, head_dim, kv_quant)` from
+  `ssd_tier::compute_layout_key`, or `0` when the SSD tier is off. It ensures
+  two snapshots of the same prompt at different KV layouts (e.g. `k8v8` vs
+  `k8v4`) cannot share cache blocks. It is a *shape* key and carries no model
+  identity, which is why `model_sig` is a separate term.
+- **`kv_quant`** — the codec the stored K/V is packed under. See "Codec
+  namespacing" below.
 
 The seeded variant is `chained_block_hashes_seeded(ids, seed)`. The un-seeded
 convenience wrapper `chained_block_hashes(ids)` calls it with the bare
-`FNV_OFFSET`. All production callers pass the salted seed; the bare wrapper
+`FNV_OFFSET`. All production callers pass a `cache_seed`; the bare wrapper
 is retained for tests and for backward-compat verification.
 
 The SSD index also stores `(hash, layout_key)` as a composite primary key,
@@ -99,12 +117,8 @@ providing defence-in-depth against hash collisions across layouts.
 A single resident model can serve requests under **different KV codecs**
 (per-request `kv_quant` hot-swap, no weight reload — see `docs/SERVER.md`).
 Because cached K/V bytes are codec-specific, a prefix cached under `none` (bf16)
-**must not** serve a `k8v4` request. The block-hash seed therefore folds in a
-per-codec salt as well:
-
-```
-seed = FNV_OFFSET ^ layout_key ^ kv_quant.cache_key_salt()
-```
+**must not** serve a `k8v4` request. That is the `kv_quant.cache_key_salt()`
+term of [`cache_seed`](#the-seed-cache_seed).
 
 `KvQuant::cache_key_salt()` is a stable FNV-1a-64 hash over the codec's
 canonical `Display` string (`"none"`, `"k8v4"`, `"mixed_k8g64_v4g64"`, …), so it
@@ -255,11 +269,11 @@ checks `hits == 0 && ssd_hits == 0` rather than trusting the clear.
 find_best_prefix(prompt_ids, seed) -> Option<(slot_index, matched_blocks)>
 ```
 
-The `seed` (issue #26) is the `FNV_OFFSET ^ layout_key ^ codec_salt` the caller
-also uses on the push side, so the query digest stream partitions by
-`(layout, codec)` — a slot stored under a different KV codec or SSD layout never
-matches. Pass the bare `FNV_OFFSET` for the legacy un-salted stream (RAM-only,
-single-codec, `layout_key = 0`).
+The `seed` is the [`cache_seed`](#the-seed-cache_seed) the caller also uses on
+the push side, so the query digest stream partitions by `(model, layout,
+codec)` — a slot stored by a different model, under a different KV codec, or at
+a different SSD layout never matches. Pass the bare `FNV_OFFSET` for the legacy
+un-salted stream (tests only).
 
 1. Compute chained block hashes for `prompt_ids` using `seed`.
 2. Scan all slots (Linear path) or query the radix tree (Radix path).
