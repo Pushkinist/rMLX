@@ -156,13 +156,23 @@ regression that costs ~3.8× GPU matmul throughput), the build prints a warning
 naming the fix. It is a warning, not an error — the build still succeeds. See
 [`docs/FFI.md`](docs/FFI.md#pinned-mlx--mlx-c-pair).
 
-### On M5 and later: check for the Neural Accelerator kernels
+### On M5 and later: the Neural Accelerator kernels
 
 M5 introduced the Neural Accelerator (NAX). Some Homebrew MLX bottles are built
-in a way that silently omits the NAX kernels, which costs roughly **2–3.8× on
-prefill** while leaving decode largely untouched — so the loss is easy to miss.
-On M1–M4 there is no NAX and nothing to check: those bottles legitimately
-contain no NAX kernels.
+in a way that silently omits the NAX kernels, which costs roughly **2–3.7× on
+prefill / time-to-first-token** while leaving decode untouched — output stays
+correct and only TTFT regresses, so the loss is easy to misread as a model-code
+problem. On M1–M4 there is no NAX and nothing to check: those bottles
+legitimately contain no NAX kernels, at every MLX version.
+
+**rMLX checks this for you.** On startup it scans the `mlx.metallib` of the MLX
+it actually loaded, and warns only when the host has a Neural Accelerator *and*
+the kernels are absent. That is the honest check for an installed binary: a
+prebuilt bottle links MLX through a package-manager symlink, so the MLX it runs
+against is yours, not the one it was built with. Pre-M5 hosts never see the
+warning and never pay for the scan.
+
+To check by hand — or to confirm a fix took:
 
 ```sh
 strings "$(brew --prefix mlx)/lib/mlx.metallib" | grep -c steel_gemm_fused_nax
@@ -170,8 +180,10 @@ strings "$(brew --prefix mlx)/lib/mlx.metallib" | grep -c steel_gemm_fused_nax
 # M1-M4: 0 is normal and expected.
 ```
 
-Contributors can run this (and the rest of the toolchain checks) with
-`make mlx-preflight`.
+Published rMLX **prefill** numbers assume the kernels are present; TTFT measured
+on a stack without them is not comparable to them. Decode numbers are unaffected
+either way. Contributors can run this (and the rest of the toolchain checks)
+with `make mlx-preflight`.
 
 ### Extra tooling for kernel work (contributors only)
 

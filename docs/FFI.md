@@ -246,6 +246,42 @@ existing one-shot init, and warns on mismatch. Together the two checks cover
 both halves: the pin catches a bad stack at compile time, the skew warning
 catches a stack that changed underneath a built binary.
 
+### Runtime NAX capability (`src/nax.rs`)
+
+A version match is not a capability match, and neither survives distribution.
+`RMLX_MLX_NAX` describes the machine that *built* the binary; a Homebrew bottle
+or release tarball links `libmlx.dylib` through the moving `opt` symlink, so it
+runs against the installing user's MLX, which may be a different bottle of the
+same version. `src/nax.rs` therefore repeats the metallib scan at run time, on
+the same one-shot init as the skew warning, against the library **dyld actually
+loaded** (found by walking dyld's image list for `libmlx.dylib`, then reading
+its colocated `mlx.metallib`).
+
+**Host-class gated, and that gate is the point.** The kernels only exist for
+the GPU Neural Accelerator, which arrives with M5 — Apple GPU family 10 in
+`rmlx_core::apple_gpu`. Every earlier generation legitimately ships zero of
+them at every MLX version, so a warning there would be noise on the majority
+of Macs and would train people to ignore the one host where the absence costs
+something. The gate runs first, and when it says "no Neural Accelerator"
+nothing else runs: the metallib is never opened.
+
+| Host | Kernels | Result |
+|---|---|---|
+| M5+ | absent (confirmed) | `warn!` — names prefill/TTFT, the metallib, and the check command |
+| M5+ | present | `debug!` only |
+| M5+ | metallib unreadable / not found | `debug!` only — "could not look" is not "absent" |
+| M1–M4, or chip unidentifiable | either | `debug!` only; **no scan at all** |
+
+Measured cost on the release binary (M5 Max): **~1.2 ms** when the kernels are
+present (the first match lands a couple of MB in and ends the scan), ~49 ms for
+a full pass over a 124 MB metallib with none, and **~0** on a pre-M5 host,
+which never opens the file. It runs once per process, on the init that already
+precedes a multi-second model load.
+
+The wording is scoped to **prefill / TTFT** deliberately: NAX is unreachable at
+decode by construction (see "Where NAX can appear, and where it cannot"), so a
+warning implying a general slowdown would be wrong.
+
 ### Build pipeline (`build.rs`)
 
 1. Target guard: `aarch64-apple-darwin` only. The assertion fires at compile
