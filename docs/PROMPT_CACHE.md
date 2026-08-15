@@ -85,6 +85,15 @@ surfaces as a cache that silently never hits. So `cache_seed` lives in
 depend on `rmlx-models`; `prompt_cache.rs` re-exports it). Do not re-derive the
 formula anywhere.
 
+**Computed once per request, then passed down.** `ArchPromptCache::consume`
+evaluates `cache_seed` and hands the resulting `u64` to `find_best_prefix` and
+to `hydrate_from_ssd`, which forwards it to the SSD source; the source probes
+the index with it and recomputes the promoted entry's block hashes from it. One
+variable, not four evaluations that have to keep agreeing. In particular the SSD
+source must never seed from state of its own — it is installed per *arch* and
+shared by every resident model of that arch, so anything it remembered belongs
+to whichever model attached last. See `docs/SSD_TIER.md`.
+
 The three terms:
 
 - **`model_sig`** — which model produced this K/V. The prompt cache is one
@@ -112,7 +121,7 @@ is retained for tests and for backward-compat verification.
 The SSD index also stores `(hash, layout_key)` as a composite primary key,
 providing defence-in-depth against hash collisions across layouts.
 
-### Codec namespacing (issue #26)
+### Codec namespacing
 
 A single resident model can serve requests under **different KV codecs**
 (per-request `kv_quant` hot-swap, no weight reload — see `docs/SERVER.md`).
@@ -123,9 +132,12 @@ term of [`cache_seed`](#the-seed-cache_seed).
 `KvQuant::cache_key_salt()` is a stable FNV-1a-64 hash over the codec's
 canonical `Display` string (`"none"`, `"k8v4"`, `"mixed_k8g64_v4g64"`, …), so it
 covers every variant including payload-bearing ones (`Mixed`, `RotK`,
-`RotorK*Asym`). Both the push side (storing a slot) and the
-[`find_best_prefix`](#find_best_prefix-lookup) query side salt with the same
-value, so two requests with identical tokens but different codecs produce
+`RotorK*Asym`). The push side (storing a slot), the
+[`find_best_prefix`](#find_best_prefix-lookup) query side and the SSD hydrate
+probe all salt with the request's codec — the hydrate probe is handed it rather
+than remembering the launch codec, or a hot-swapped request would probe the
+wrong digest stream and then reject its own stored rows as header mismatches —
+so two requests with identical tokens but different codecs produce
 **disjoint digest streams** and occupy **distinct cache slots**. A codec switch
 is a clean cross-codec miss — the other codec's slot survives and is reusable
 again under its own codec, rather than being thrash-evicted.
@@ -439,8 +451,11 @@ payload to a spill job. `offer_evicted` must not block the decode thread.
 `allocate_blocks`, `register_blocks`, `match_blocks`, and `scan_matches`.
 
 **Hash family**: FNV-1a-64 with `layout_key` mixing (`FNV_OFFSET ^
-layout_key`), consistent with `chained_block_hashes_seeded`. The reference
-uses xxh3; rMLX uses FNV to avoid adding a new dependency.
+layout_key`). Same hash family as the prompt cache, **not** the same key: this
+is `CacheKey::chained_seed`, which folds an optional `lora_salt` and `mm_hash`
+and carries no model or codec term, so its digests are not interchangeable with
+`cache_seed`'s and cannot address `.kvb` rows. The reference uses xxh3; rMLX
+uses FNV to avoid adding a new dependency.
 
 **Lock order**: `attachments → store`, never reversed. The store mutex is
 never held while calling into an `OverflowSink` (non-blocking `try_send`).

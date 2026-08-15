@@ -1,5 +1,6 @@
 use super::*;
 use crate::block_io::write_caches;
+use crate::hashing::cache_seed;
 use rmlx_mlx::{Array, Device, Dtype};
 use tempfile::TempDir;
 
@@ -112,17 +113,13 @@ fn ssd_hit_reconstructs_block_within_tolerance() {
         .unwrap();
 
     // Hydrate.
-    let hydrator = SsdHydrator::with_index(
-        MODEL_ID,
-        QUANT,
-        TEST_LAYOUT_KEY,
-        TEST_MODEL_SIG,
-        device,
-        dir,
-        index,
-    );
+    let hydrator = SsdHydrator::with_index(MODEL_ID, TEST_LAYOUT_KEY, device, dir, index);
     let block = hydrator
-        .lookup(&prompt_ids)
+        .lookup(
+            &prompt_ids,
+            cache_seed(TEST_LAYOUT_KEY, QUANT, TEST_MODEL_SIG),
+            QUANT,
+        )
         .unwrap()
         .expect("SSD hit expected");
     assert_eq!(block.prompt_ids, prompt_ids, "matched prefix ids");
@@ -193,30 +190,36 @@ fn salted_keyed_block_is_found_by_probe() {
 
     // Hydrate with the same non-zero layout key → probe must produce the salted
     // digest and match the recorded row.
-    let hydrator = SsdHydrator::with_index(MODEL_ID, QUANT, LK, TEST_MODEL_SIG, device, dir, index);
+    let hydrator = SsdHydrator::with_index(MODEL_ID, LK, device, dir, index);
     let block = hydrator
-        .lookup(&prompt_ids)
+        .lookup(&prompt_ids, cache_seed(LK, QUANT, TEST_MODEL_SIG), QUANT)
         .unwrap()
         .expect("salted-keyed SSD block must be found by the probe");
     assert_eq!(block.prompt_ids, prompt_ids, "matched prefix ids");
     assert_eq!(block.kv_caches.len(), 1, "one reconstructed layer");
 }
 
-/// The probe seed is the RAM push seed, and it partitions by model.
+/// The probe seed is the RAM push seed, and it partitions by model — through
+/// **one** hydrator, which is all production has.
 ///
-/// Both halves are asserted against the *same* on-disk row, because either one
-/// alone is satisfiable by a broken hydrator:
+/// The hydrate source is installed on a per-architecture prompt cache, so two
+/// resident models of one arch share this single instance. The test therefore
+/// builds one `SsdHydrator` and probes it under two different models' seeds,
+/// rather than building one hydrator per model — a per-model hydrator is a
+/// configuration that cannot occur, and testing it would prove nothing about
+/// the code that runs.
 ///
-/// 1. **Own model hits.** The row is keyed exactly as the RAM push side keys a
-///    slot — `cache_seed(layout_key, kv_quant, model_sig)` with all three terms
-///    non-trivial — and the hydrator carrying that `model_sig` must find it. A
-///    probe that omits the model term computes a different digest stream, finds
-///    nothing, and the tier 0-hits in silence: no error, just a full re-prefill
-///    on every repeat.
-/// 2. **Another model misses.** A hydrator for a *different* model over the
-///    same namespace must not find that row. `--project` puts several models in
-///    one `.kvb` directory, so the directory is not a per-model partition and
-///    the seed is the only thing keeping them apart.
+/// Both halves are asserted against the *same* on-disk row through that one
+/// instance, because either alone is satisfiable by a broken probe:
+///
+/// 1. **The owning model hits.** The row is keyed exactly as the RAM push side
+///    keys a slot — `cache_seed(layout_key, kv_quant, model_sig)`, all three
+///    terms non-trivial. A probe that drops a term computes a different digest
+///    stream, finds nothing, and the tier 0-hits in silence: no error, just a
+///    full re-prefill on every repeat.
+/// 2. **The other model misses.** `--project` puts several models in one `.kvb`
+///    directory, so the directory is not a per-model partition; the seed is the
+///    only thing keeping them apart.
 ///
 /// Half 1 alone passes for a probe that matches everything; half 2 alone passes
 /// for a probe that matches nothing (which is precisely the defect). Together
@@ -232,7 +235,7 @@ fn salted_keyed_block_is_found_by_probe() {
 )]
 #[allow(
     clippy::unwrap_used,
-    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    reason = "fixture setup under a temp dir this test owns; a failure is a broken fixture, not a condition under test"
 )]
 fn probe_finds_own_models_block_and_not_another_models() {
     /// Non-zero so the layout term is live alongside the model term.
@@ -267,37 +270,46 @@ fn probe_finds_own_models_block_and_not_another_models() {
         .record(&key, LK, &path, MODEL_ID, &QUANT.to_string(), size)
         .unwrap();
 
+    // The one hydrator both models share, exactly as the per-arch attach slot
+    // holds one.
+    let shared = SsdHydrator::with_index(MODEL_ID, LK, device, dir, index2(&db));
+
     // ── 1. The model that spilled it gets it back. ───────────────────────────
-    let mine = SsdHydrator::with_index(
-        MODEL_ID,
-        QUANT,
-        LK,
-        TEST_MODEL_SIG,
-        device,
-        dir.clone(),
-        SsdKvIndex::open_at(&db).unwrap(),
-    );
-    let block = mine
-        .lookup(&prompt_ids)
+    let block = shared
+        .lookup(&prompt_ids, cache_seed(LK, QUANT, TEST_MODEL_SIG), QUANT)
         .unwrap()
         .expect("a block keyed by the RAM push seed must be found by the probe");
     assert_eq!(block.prompt_ids, prompt_ids, "matched prefix ids");
     assert_eq!(block.kv_caches.len(), 1, "one reconstructed layer");
 
-    // ── 2. A different model over the same namespace does not. ───────────────
-    let theirs = SsdHydrator::with_index(
-        MODEL_ID,
-        QUANT,
-        LK,
-        OTHER_MODEL_SIG,
-        device,
-        dir,
-        SsdKvIndex::open_at(&db).unwrap(),
-    );
+    // ── 2. The other model, through that same hydrator, does not. ────────────
     assert!(
-        theirs.lookup(&prompt_ids).unwrap().is_none(),
-        "another model's hydrator must not hydrate this model's K/V"
+        shared
+            .lookup(&prompt_ids, cache_seed(LK, QUANT, OTHER_MODEL_SIG), QUANT)
+            .unwrap()
+            .is_none(),
+        "the shared hydrator must not serve one model's K/V to another"
     );
+
+    // ── 3. …and the row survived the miss, so half 2 was isolation and not a
+    //       deletion that would make any later probe miss too. ───────────────
+    assert!(
+        shared
+            .lookup(&prompt_ids, cache_seed(LK, QUANT, TEST_MODEL_SIG), QUANT)
+            .unwrap()
+            .is_some(),
+        "the owning model must still hit after the other model's miss"
+    );
+}
+
+/// A second handle on the same index DB, for tests that need the hydrator to
+/// own one while still asserting against another.
+#[allow(
+    clippy::unwrap_used,
+    reason = "fixture setup under a temp dir the calling test owns; a failure is a broken fixture, not a condition under test"
+)]
+fn index2(db: &std::path::Path) -> SsdKvIndex {
+    SsdKvIndex::open_at(db).unwrap()
 }
 
 /// `lookup_seeded` returns a `Vec<u64>` equal to the canonical seed recompute:
@@ -355,9 +367,9 @@ fn lookup_seeded_matches_arch_recompute() {
         .record(&key, LK, &path, MODEL_ID, &QUANT.to_string(), size)
         .unwrap();
 
-    let hydrator = SsdHydrator::with_index(MODEL_ID, QUANT, LK, TEST_MODEL_SIG, device, dir, index);
+    let hydrator = SsdHydrator::with_index(MODEL_ID, LK, device, dir, index);
     let (block, hashes) = hydrator
-        .lookup_seeded(&input_ids)
+        .lookup_seeded(&input_ids, cache_seed(LK, QUANT, TEST_MODEL_SIG), QUANT)
         .unwrap()
         .expect("lookup_seeded must find the first-block prefix of the 2-block input");
 
@@ -426,16 +438,14 @@ fn corrupt_block_deletes_file_and_row_returns_miss() {
         )
         .unwrap();
 
-    let hydrator = SsdHydrator::with_index(
-        MODEL_ID,
-        QUANT,
-        TEST_LAYOUT_KEY,
-        TEST_MODEL_SIG,
-        device,
-        dir,
-        index,
-    );
-    let res = hydrator.lookup(&prompt_ids).unwrap();
+    let hydrator = SsdHydrator::with_index(MODEL_ID, TEST_LAYOUT_KEY, device, dir, index);
+    let res = hydrator
+        .lookup(
+            &prompt_ids,
+            cache_seed(TEST_LAYOUT_KEY, QUANT, TEST_MODEL_SIG),
+            QUANT,
+        )
+        .unwrap();
     assert!(res.is_none(), "corrupt block must surface as a miss");
     assert!(!path.exists(), "corrupt .kvb file must be deleted");
 
@@ -486,16 +496,15 @@ fn metadata_mismatch_treated_as_corrupt() {
     // unit test #8: layout_key matches but the .kvb header advertises
     // a different kv_quant; lookup must surface as miss AND delete file +
     // index row.
-    let hydrator = SsdHydrator::with_index(
-        MODEL_ID,
-        KvQuant::K8V4,
-        TEST_LAYOUT_KEY,
-        TEST_MODEL_SIG,
-        device,
-        dir,
-        index,
-    );
-    assert!(hydrator.lookup(&prompt_ids).unwrap().is_none());
+    let hydrator = SsdHydrator::with_index(MODEL_ID, TEST_LAYOUT_KEY, device, dir, index);
+    assert!(hydrator
+        .lookup(
+            &prompt_ids,
+            cache_seed(TEST_LAYOUT_KEY, KvQuant::K8V4, TEST_MODEL_SIG),
+            KvQuant::K8V4,
+        )
+        .unwrap()
+        .is_none());
     assert!(!path.exists(), "mismatched .kvb file must be deleted");
 
     // Row must also be gone (verify against a freshly reopened index DB).
@@ -518,15 +527,20 @@ fn no_indexed_prefix_is_miss() {
     let index = SsdKvIndex::open_at(&tmp.path().join("index.db")).unwrap();
     let hydrator = SsdHydrator::with_index(
         MODEL_ID,
-        QUANT,
         TEST_LAYOUT_KEY,
-        TEST_MODEL_SIG,
         device,
         tmp.path().to_path_buf(),
         index,
     );
     let prompt_ids: Vec<u32> = (0..BLOCK_TOKENS as u32).collect();
-    assert!(hydrator.lookup(&prompt_ids).unwrap().is_none());
+    assert!(hydrator
+        .lookup(
+            &prompt_ids,
+            cache_seed(TEST_LAYOUT_KEY, QUANT, TEST_MODEL_SIG),
+            QUANT
+        )
+        .unwrap()
+        .is_none());
 }
 
 /// Sub-one-block prompts have no chained digest → never queried.
@@ -541,15 +555,20 @@ fn short_prompt_never_queried() {
     let index = SsdKvIndex::open_at(&tmp.path().join("index.db")).unwrap();
     let hydrator = SsdHydrator::with_index(
         MODEL_ID,
-        QUANT,
         TEST_LAYOUT_KEY,
-        TEST_MODEL_SIG,
         device,
         tmp.path().to_path_buf(),
         index,
     );
     let short: Vec<u32> = (0..(BLOCK_TOKENS as u32 - 1)).collect();
-    assert!(hydrator.lookup(&short).unwrap().is_none());
+    assert!(hydrator
+        .lookup(
+            &short,
+            cache_seed(TEST_LAYOUT_KEY, QUANT, TEST_MODEL_SIG),
+            QUANT
+        )
+        .unwrap()
+        .is_none());
 }
 
 /// SSD-tier observability (step2-D): after a successful `lookup` (SSD hit),
@@ -610,17 +629,14 @@ fn ssd_hit_lookup_emits_hydrate_event() {
     let rec =
         EventRecorder::open_at(&events_db_path, "hydrate-test-run").expect("open event recorder");
 
-    let hydrator = SsdHydrator::with_index(
-        MODEL_ID,
-        QUANT,
-        TEST_LAYOUT_KEY,
-        TEST_MODEL_SIG,
-        device,
-        dir,
-        index,
-    );
+    let hydrator = SsdHydrator::with_index(MODEL_ID, TEST_LAYOUT_KEY, device, dir, index);
     let block = hydrator
-        .lookup_with_recorder(&prompt_ids, &rec)
+        .lookup_with_recorder(
+            &prompt_ids,
+            cache_seed(TEST_LAYOUT_KEY, QUANT, TEST_MODEL_SIG),
+            QUANT,
+            &rec,
+        )
         .unwrap()
         .expect("SSD hit expected");
 
@@ -737,16 +753,18 @@ fn budget_enforcement_racing_hydrates_never_serves_a_foreign_block() {
     {
         let hydrator = SsdHydrator::with_index(
             MODEL_ID,
-            QUANT,
             RACE_LK,
-            TEST_MODEL_SIG,
             device,
             dir.clone(),
             SsdKvIndex::open_at(&db).unwrap(),
         );
         for i in 0..RACE_PROMPTS {
             let block = hydrator
-                .lookup(&fx.prompts[i])
+                .lookup(
+                    &fx.prompts[i],
+                    cache_seed(RACE_LK, QUANT, TEST_MODEL_SIG),
+                    QUANT,
+                )
                 .unwrap()
                 .expect("quiet-state lookup must hit");
             assert_own_block(&block, &fx, i, device, "quiet-state");
@@ -812,9 +830,7 @@ fn budget_enforcement_racing_hydrates_never_serves_a_foreign_block() {
             let re_index = SsdKvIndex::open_at(&db).unwrap();
             let hydrator = SsdHydrator::with_index(
                 MODEL_ID,
-                QUANT,
                 RACE_LK,
-                TEST_MODEL_SIG,
                 device,
                 dir.clone(),
                 SsdKvIndex::open_at(&db).unwrap(),
@@ -823,7 +839,11 @@ fn budget_enforcement_racing_hydrates_never_serves_a_foreign_block() {
             let (mut hits, mut misses) = (0u64, 0u64);
             for _ in 0..RACE_PASSES {
                 for i in 0..RACE_PROMPTS {
-                    match hydrator.lookup(&fx.prompts[i]) {
+                    match hydrator.lookup(
+                        &fx.prompts[i],
+                        cache_seed(RACE_LK, QUANT, TEST_MODEL_SIG),
+                        QUANT,
+                    ) {
                         Ok(Some(block)) => {
                             hits += 1;
                             assert_own_block(&block, &fx, i, device, "racing");
@@ -1025,17 +1045,13 @@ fn hydrate_of_a_row_whose_file_vanished_is_a_miss_and_leaves_the_tier_usable() {
     // Row survives, file does not — the half-applied state.
     std::fs::remove_file(&path).unwrap();
 
-    let hydrator = SsdHydrator::with_index(
-        MODEL_ID,
-        QUANT,
-        LK,
-        TEST_MODEL_SIG,
-        device,
-        dir,
-        SsdKvIndex::open_at(&db).unwrap(),
-    );
+    let hydrator =
+        SsdHydrator::with_index(MODEL_ID, LK, device, dir, SsdKvIndex::open_at(&db).unwrap());
     assert!(
-        hydrator.lookup(&prompt_ids).unwrap().is_none(),
+        hydrator
+            .lookup(&prompt_ids, cache_seed(LK, QUANT, TEST_MODEL_SIG), QUANT)
+            .unwrap()
+            .is_none(),
         "a row pointing at a vanished file must read as a miss"
     );
     assert!(
@@ -1049,7 +1065,7 @@ fn hydrate_of_a_row_whose_file_vanished_is_a_miss_and_leaves_the_tier_usable() {
         .record(&key, LK, &path, MODEL_ID, &QUANT.to_string(), size)
         .unwrap();
     let block = hydrator
-        .lookup(&prompt_ids)
+        .lookup(&prompt_ids, cache_seed(LK, QUANT, TEST_MODEL_SIG), QUANT)
         .unwrap()
         .expect("re-spilled block must hydrate");
     let got = probe_k(&block.kv_caches[0], device);

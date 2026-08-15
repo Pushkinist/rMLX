@@ -226,8 +226,13 @@ fn qwen3_active_layout_key() -> u64 {
 /// the entry is flagged `is_ssd_hydrated = true`; the generate loop excludes it
 /// from the Exact fast path and recomputes the real first token via re-prefill.
 impl SsdHydrate<Qwen3Entry> for SsdHydrator {
-    fn hydrate(&self, prompt_ids: &[u32]) -> Result<Option<Qwen3Entry>> {
-        let Some((block, block_hashes)) = self.lookup_seeded(prompt_ids)? else {
+    fn hydrate(
+        &self,
+        prompt_ids: &[u32],
+        seed: u64,
+        kv_quant: KvQuant,
+    ) -> Result<Option<Qwen3Entry>> {
+        let Some((block, block_hashes)) = self.lookup_seeded(prompt_ids, seed, kv_quant)? else {
             return Ok(None);
         };
         let HydratedBlock {
@@ -243,7 +248,7 @@ impl SsdHydrate<Qwen3Entry> for SsdHydrator {
             first_piece: String::new(),
             // SSD block stores no first decode token, so no logprob to replay.
             first_logprobs: None,
-            kv_quant: Some(self.kv_quant()),
+            kv_quant: Some(kv_quant),
             // Block-aligned prefix only; the placeholder first_id must not be
             // replayed — the generate loop re-prefills to recompute it.
             is_ssd_hydrated: true,

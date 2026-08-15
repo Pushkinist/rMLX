@@ -1138,7 +1138,12 @@ struct MockSource {
 }
 
 impl SsdHydrate<TestEntry> for MockSource {
-    fn hydrate(&self, prompt_ids: &[u32]) -> Result<Option<TestEntry>> {
+    fn hydrate(
+        &self,
+        prompt_ids: &[u32],
+        _seed: u64,
+        _kv_quant: KvQuant,
+    ) -> Result<Option<TestEntry>> {
         self.calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if prompt_ids.len() < BLOCK_TOKENS {
@@ -1173,7 +1178,7 @@ fn ssd_hydrate_populates_ram_and_bumps_counter() {
     assert_eq!(cache.stats().ssd_hits, 0);
 
     // Hydrate from SSD → promoted into RAM, counter bumped.
-    let slot = cache.hydrate_from_ssd(&prompt);
+    let slot = cache.hydrate_from_ssd(&prompt, FNV_OFFSET, TEST_QUANT);
     assert!(slot.is_some(), "SSD hit must populate a RAM slot");
     assert_eq!(cache.stats().ssd_hits, 1, "ssd_hits must increment on hit");
     assert_eq!(cache.slots.len(), 1, "one slot now populated");
@@ -1206,7 +1211,9 @@ fn zero_slots_never_reads_the_ssd_source() {
     }));
 
     assert!(
-        cache.hydrate_from_ssd(&prompt).is_none(),
+        cache
+            .hydrate_from_ssd(&prompt, FNV_OFFSET, TEST_QUANT)
+            .is_none(),
         "a zero-slot cache cannot admit a hydrated entry"
     );
     assert_eq!(
@@ -1227,7 +1234,9 @@ fn no_ssd_source_is_inert() {
     let mut cache: PromptCache<TestEntry> = PromptCache::new(4);
     assert!(cache.find_best_prefix(&prompt, FNV_OFFSET).is_none());
     assert!(
-        cache.hydrate_from_ssd(&prompt).is_none(),
+        cache
+            .hydrate_from_ssd(&prompt, FNV_OFFSET, TEST_QUANT)
+            .is_none(),
         "no SSD source → always a miss"
     );
     assert_eq!(cache.stats().ssd_hits, 0, "ssd_hits stays 0 with no source");
@@ -1250,7 +1259,12 @@ fn ssd_miss_leaves_ram_untouched() {
         entry_ids: short.clone(),
         calls: calls.clone(),
     }));
-    assert!(cache.hydrate_from_ssd(&short).is_none(), "SSD miss");
+    assert!(
+        cache
+            .hydrate_from_ssd(&short, FNV_OFFSET, TEST_QUANT)
+            .is_none(),
+        "SSD miss"
+    );
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     assert_eq!(cache.stats().ssd_hits, 0);
     assert_eq!(cache.slots.len(), 0);
@@ -1277,7 +1291,7 @@ fn ssd_hydrate_over_cap_entry_is_not_counted_as_hit() {
         calls: calls.clone(),
     }));
 
-    let slot = cache.hydrate_from_ssd(&prompt);
+    let slot = cache.hydrate_from_ssd(&prompt, FNV_OFFSET, TEST_QUANT);
     assert!(
         slot.is_none(),
         "an over-cap reconstructed block must surface as a miss"
@@ -1578,28 +1592,32 @@ fn codec_partitioned_key_blocks_cross_codec_serve() {
     );
 }
 
-// ── SSD hydrate seed symmetry (issue #26 reviewer fix) ────────────────────
+// ── SSD hydrate seed symmetry ────────────────────────────────────────────────
 //
-// Regression guard for the SSD hydrate path fixed in the review of #26:
-// `SsdHydrate<E>` impls must build the hydrated entry's `block_hashes` with
-// `FNV_OFFSET ^ layout_key ^ kv_quant.cache_key_salt()` — the same seed the
-// RAM push and `find_best_prefix` query use.  If the codec salt is omitted
-// from the hydrate seed, `find_best_prefix` can never match a hydrated entry
-// on SSD-active runs (non-zero `layout_key`) → guaranteed prefix MISS despite
-// a valid on-disk block.
+// A hydrate source is handed the seed the RAM query is running under, and must
+// build the promoted entry's `block_hashes` from *that value*. Any source that
+// instead seeds from something it remembered — a codec or a model identity it
+// captured when it was installed — returns an entry `find_best_prefix` cannot
+// match. The block was read off disk, `ssd_hits` was incremented, an LRU slot
+// was evicted to make room, and the request re-prefills anyway. Nothing errors.
+//
+// The source is installed once per architecture and outlives the model that
+// installed it, so "something it remembered" is not hypothetical: it is
+// whichever model attached last, at whatever codec the server launched with.
 
-/// A mock `SsdHydrate<TestEntry>` whose returned entry uses the fully-salted
-/// seed (`FNV_OFFSET ^ layout_key ^ codec_salt`), mirroring the corrected
-/// production impls.
-struct MockHydrateSalted {
+/// A mock `SsdHydrate<TestEntry>` that seeds from the passed-in `seed`, as the
+/// production `SsdHydrator::lookup_seeded` does.
+struct MockHydrateFromSeed {
     ids: Vec<u32>,
-    layout_key: u64,
-    codec_salt: u64,
 }
 
-impl SsdHydrate<TestEntry> for MockHydrateSalted {
-    fn hydrate(&self, _prompt_ids: &[u32]) -> rmlx_core::error::Result<Option<TestEntry>> {
-        let seed = FNV_OFFSET ^ self.layout_key ^ self.codec_salt;
+impl SsdHydrate<TestEntry> for MockHydrateFromSeed {
+    fn hydrate(
+        &self,
+        _prompt_ids: &[u32],
+        seed: u64,
+        _kv_quant: KvQuant,
+    ) -> rmlx_core::error::Result<Option<TestEntry>> {
         let hashes = chained_block_hashes_seeded(&self.ids, seed);
         Ok(Some(TestEntry {
             ids: self.ids.clone(),
@@ -1613,17 +1631,22 @@ impl SsdHydrate<TestEntry> for MockHydrateSalted {
     }
 }
 
-/// Same as above but uses only `FNV_OFFSET ^ layout_key` (codec salt
-/// omitted) — reproduces the pre-fix bug so we can confirm it misses.
-struct MockHydrateUnsalted {
+/// A mock that ignores the passed seed and rebuilds one from state captured at
+/// construction — the defect shape. Stands in for a hydrator that remembered a
+/// model signature or a codec from its own attach.
+struct MockHydrateSelfSeeded {
     ids: Vec<u32>,
-    layout_key: u64,
+    stale_seed: u64,
 }
 
-impl SsdHydrate<TestEntry> for MockHydrateUnsalted {
-    fn hydrate(&self, _prompt_ids: &[u32]) -> rmlx_core::error::Result<Option<TestEntry>> {
-        let seed = FNV_OFFSET ^ self.layout_key;
-        let hashes = chained_block_hashes_seeded(&self.ids, seed);
+impl SsdHydrate<TestEntry> for MockHydrateSelfSeeded {
+    fn hydrate(
+        &self,
+        _prompt_ids: &[u32],
+        _seed: u64,
+        _kv_quant: KvQuant,
+    ) -> rmlx_core::error::Result<Option<TestEntry>> {
+        let hashes = chained_block_hashes_seeded(&self.ids, self.stale_seed);
         Ok(Some(TestEntry {
             ids: self.ids.clone(),
             hashes,
@@ -1636,83 +1659,311 @@ impl SsdHydrate<TestEntry> for MockHydrateUnsalted {
     }
 }
 
-/// Issue #26 review — SSD hydrate seed must include the codec salt.
+/// A hydrated entry is findable exactly when its source used the query's seed.
 ///
-/// With a non-zero `layout_key` and a non-trivial codec salt:
-/// 1. A hydrated entry built with the **full** seed (`FNV_OFFSET ^
-///    layout_key ^ codec_salt`) is found by a same-seed `find_best_prefix`
-///    query (corrected behavior — HIT).
-/// 2. A hydrated entry built with the **unsalted** seed (`FNV_OFFSET ^
-///    layout_key`, codec salt omitted) is NOT found by the same-codec
-///    query (pre-fix bug — MISS, here tested as the negative case to confirm
-///    the fix is load-bearing).
-/// 3. A correct hydrated entry is NOT found by a different-codec query
-///    (cross-codec isolation still holds).
+/// 1. Source seeds from the passed value → the query that triggered the hydrate
+///    finds the promoted entry (HIT).
+/// 2. Source seeds from its own captured state → the same query cannot find it
+///    (MISS). This is the failure being guarded against, asserted as a negative
+///    so case 1 cannot pass by matching everything.
+/// 3. A correctly hydrated entry is still not found by a different-codec query
+///    — the seed's codec term keeps doing its job.
 #[test]
 #[allow(
     clippy::unwrap_used,
     reason = "test-only: values established by construction"
 )]
-fn ssd_hydrate_seed_symmetry_with_nonzero_layout_key() {
-    use rmlx_kv_quant::KvQuant;
-
+fn hydrated_entry_is_findable_only_when_seeded_from_the_query() {
     // Non-zero layout_key to exercise the SSD-active code path.
     let layout_key: u64 = 0xdead_beef_0000_0001;
     let codec_a = KvQuant::K8V4;
     let codec_b = KvQuant::K8V8;
-    let codec_salt_a = codec_a.cache_key_salt();
-    let codec_salt_b = codec_b.cache_key_salt();
     assert_ne!(
-        codec_salt_a, codec_salt_b,
+        codec_a.cache_key_salt(),
+        codec_b.cache_key_salt(),
         "codecs must have distinct salts"
     );
 
-    let full_seed_a = FNV_OFFSET ^ layout_key ^ codec_salt_a;
+    // Two models of this arch; both seeds are what `consume` would compute.
+    let seed_a = cache_seed(layout_key, codec_a, TEST_SIG);
+    let seed_other_model = cache_seed(layout_key, codec_a, OTHER_SIG);
 
-    // 2-block prompt.
     let prompt_ids: Vec<u32> = make_ids(2 * BLOCK_TOKENS);
 
-    // ── Case 1: corrected hydrate (salted) → same-codec query HITs ──────────
+    // ── Case 1: source honours the passed seed → query HITs ─────────────────
     let mut cache_correct: PromptCache<TestEntry> = PromptCache::new(4);
-    cache_correct.set_ssd_source(Box::new(MockHydrateSalted {
+    cache_correct.set_ssd_source(Box::new(MockHydrateFromSeed {
         ids: prompt_ids.clone(),
-        layout_key,
-        codec_salt: codec_salt_a,
     }));
-    let before = cache_correct.find_best_prefix(&prompt_ids, full_seed_a);
-    assert!(before.is_none(), "RAM empty before hydrate");
-    let promoted = cache_correct.hydrate_from_ssd(&prompt_ids);
+    assert!(
+        cache_correct
+            .find_best_prefix(&prompt_ids, seed_a)
+            .is_none(),
+        "RAM empty before hydrate"
+    );
+    let promoted = cache_correct.hydrate_from_ssd(&prompt_ids, seed_a, codec_a);
     assert!(promoted.is_some(), "mock SSD source must hydrate");
-    let after = cache_correct.find_best_prefix(&prompt_ids, full_seed_a);
+    let after = cache_correct.find_best_prefix(&prompt_ids, seed_a);
     assert!(
         after.is_some(),
-        "salted hydrated entry must be found by same-codec query (corrected behavior)"
+        "an entry seeded from the query's seed must be found by that query"
     );
     assert_eq!(after.unwrap().1, 2, "full 2-block prefix must match");
 
-    // ── Case 2: pre-fix hydrate (unsalted seed) → same-codec query MISSes ───
-    // This is the negative case that would have silently re-prefilled before
-    // the fix.  The hydrated entry's hashes are built from
-    // `FNV_OFFSET ^ layout_key` but the query uses `full_seed_a`
-    // (`FNV_OFFSET ^ layout_key ^ codec_salt_a`) → disjoint streams → MISS.
+    // ── Case 2: source seeds from captured state → same query MISSes ────────
+    // `stale_seed` is another resident model's seed: exactly what a hydrator
+    // that remembered the last-attached model's signature would produce.
     let mut cache_broken: PromptCache<TestEntry> = PromptCache::new(4);
-    cache_broken.set_ssd_source(Box::new(MockHydrateUnsalted {
+    cache_broken.set_ssd_source(Box::new(MockHydrateSelfSeeded {
         ids: prompt_ids.clone(),
-        layout_key,
+        stale_seed: seed_other_model,
     }));
-    cache_broken.hydrate_from_ssd(&prompt_ids);
-    let after_broken = cache_broken.find_best_prefix(&prompt_ids, full_seed_a);
+    cache_broken.hydrate_from_ssd(&prompt_ids, seed_a, codec_a);
     assert!(
-        after_broken.is_none(),
-        "pre-fix (unsalted) hydrated entry must NOT be found by salted query (negative case)"
+        cache_broken.find_best_prefix(&prompt_ids, seed_a).is_none(),
+        "an entry seeded from the source's own state is unfindable by the query \
+         that asked for it — the silent 0-hit"
     );
 
-    // ── Case 3: corrected hydrate under codec A → different-codec query MISSes
-    let full_seed_b = FNV_OFFSET ^ layout_key ^ codec_salt_b;
-    let cross_codec = cache_correct.find_best_prefix(&prompt_ids, full_seed_b);
+    // ── Case 3: correct hydrate under codec A → codec-B query MISSes ────────
+    let seed_b = cache_seed(layout_key, codec_b, TEST_SIG);
     assert!(
-        cross_codec.is_none(),
+        cache_correct
+            .find_best_prefix(&prompt_ids, seed_b)
+            .is_none(),
         "codec-A hydrated entry must not cross-serve a codec-B query"
+    );
+}
+
+// ── Two models of one arch through the single per-arch SSD attach slot ───────
+//
+// `ArchPromptCache` holds ONE `Mutex<Option<AttachParams>>` and ONE hydrate
+// source; `attach_ssd_tier` overwrites both wholesale, and the server can hold
+// several models of an architecture resident at once (`--max-loaded-models`).
+// So whichever model loads last owns the installed source, and every other
+// resident model of that arch is served by it.
+//
+// That is only correct while the source carries no per-model state. These tests
+// pin it: the identity comes from the request, so the shared source serves each
+// model its own blocks and neither model's blocks to the other.
+
+/// A stand-in for the on-disk tier: a content-addressed store keyed by the seed
+/// a block was written under, which is exactly how `.kvb` rows behave (the
+/// index key is the last chained digest, and the chain starts at the seed).
+///
+/// Holds no model identity and no codec of its own — it answers whatever seed
+/// it is asked with, which is what makes it shareable across models.
+///
+/// Rows carry a block-aligned prefix of the prompt, strictly shorter than it,
+/// as real spilled blocks do: the trailing partial block is never stored.
+struct SeedKeyedStore {
+    /// Seeds that have a block on "disk", with the token ids of each block.
+    rows: Vec<(u64, Vec<u32>)>,
+    /// Every seed this store was probed with, in order.
+    probed: std::sync::Mutex<Vec<u64>>,
+}
+
+impl SsdHydrate<TestEntry> for SeedKeyedStore {
+    fn hydrate(
+        &self,
+        _prompt_ids: &[u32],
+        seed: u64,
+        kv_quant: KvQuant,
+    ) -> rmlx_core::error::Result<Option<TestEntry>> {
+        self.probed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(seed);
+        let Some((_, ids)) = self.rows.iter().find(|(s, _)| *s == seed) else {
+            return Ok(None); // no row under that seed — a true miss
+        };
+        Ok(Some(TestEntry {
+            ids: ids.clone(),
+            hashes: chained_block_hashes_seeded(ids, seed),
+            truncated_to: std::cell::Cell::new(None),
+            is_ssd_hydrated: true,
+            kv_quant: Some(kv_quant),
+            hydrate_complete: true,
+            reuse_kind: Some(ReuseKind::StrictPrefix {
+                prefix_len: ids.len(),
+            }),
+        }))
+    }
+}
+
+/// Install `store` as the SSD source of a fresh cache on `arch`.
+#[allow(
+    clippy::unwrap_used,
+    reason = "the cache is installed inside the same closure, immediately above the use"
+)]
+fn with_ssd_store(
+    arch: &ArchPromptCache<TestEntry>,
+    store: SeedKeyedStore,
+) -> std::sync::Arc<std::sync::Mutex<Vec<u64>>> {
+    let probed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    arch.with_inner_mut(|g| {
+        *g = Some(PromptCache::new(4));
+        g.as_mut().unwrap().set_ssd_source(Box::new(store));
+    });
+    probed
+}
+
+/// Two models of one arch, one shared hydrate source: each hydrates its own
+/// block and neither hydrates the other's.
+///
+/// Model A's block is the only one on disk. A must get it (or the tier is
+/// silently dead for A), and B must not (or B decodes from A's K/V). Both go
+/// through the same source instance, which is the only arrangement production
+/// has — the per-arch attach slot holds one.
+#[test]
+fn two_models_of_one_arch_share_a_source_and_not_each_others_blocks() {
+    let prompt = make_ids(2 * BLOCK_TOKENS);
+    // The block-aligned prefix a real spill would hold: `make_ids` is a
+    // prefix-stable range, so this is exactly `prompt`'s first block.
+    let stored = make_ids(BLOCK_TOKENS);
+
+    // `active_layout_key()` is 0 here (no attach recorded), so these are the
+    // seeds `consume` will compute for the two models.
+    let seed_a = cache_seed(0, TEST_QUANT, TEST_SIG);
+    let seed_b = cache_seed(0, TEST_QUANT, OTHER_SIG);
+    assert_ne!(seed_a, seed_b, "two models must not share a seed");
+
+    // ── Model A: its block is on disk under its own seed → hydrate. ──────────
+    let arch: ArchPromptCache<TestEntry> =
+        ArchPromptCache::new("test-two-models-ssd", ReusePolicy::Partial);
+    with_ssd_store(
+        &arch,
+        SeedKeyedStore {
+            rows: vec![(seed_a, stored.clone())],
+            probed: std::sync::Mutex::new(Vec::new()),
+        },
+    );
+    let _ = arch.consume(&prompt, TEST_QUANT, false, TEST_SIG);
+    assert_eq!(
+        arch.read_cache_stats().map(|s| s.ssd_hits),
+        Some(1),
+        "the model whose block is on disk must be served from the SSD tier"
+    );
+
+    // ── Model B: same source, same prompt, same codec, different model. ──────
+    let arch_b: ArchPromptCache<TestEntry> =
+        ArchPromptCache::new("test-two-models-ssd", ReusePolicy::Partial);
+    with_ssd_store(
+        &arch_b,
+        SeedKeyedStore {
+            rows: vec![(seed_a, stored)],
+            probed: std::sync::Mutex::new(Vec::new()),
+        },
+    );
+    let consumed_b = arch_b.consume(&prompt, TEST_QUANT, false, OTHER_SIG);
+    assert_eq!(
+        arch_b.read_cache_stats().map(|s| s.ssd_hits),
+        Some(0),
+        "another model of the same arch must not be served A's block"
+    );
+    assert_eq!(
+        tag(&consumed_b),
+        ConsumedTag::Miss,
+        "B re-prefills rather than decoding from A's K/V"
+    );
+}
+
+/// Both models resident against one source that holds *both* their blocks:
+/// each is served its own, and the tier is live for both.
+///
+/// This is the half a snapshotted-at-attach identity fails. With the source
+/// pinned to whichever model attached last, one of these two would report
+/// `ssd_hits == 0` for a block that is sitting on disk.
+#[test]
+fn each_resident_model_hydrates_its_own_block_from_the_shared_source() {
+    let prompt = make_ids(2 * BLOCK_TOKENS);
+    // The block-aligned prefix a real spill would hold: `make_ids` is a
+    // prefix-stable range, so this is exactly `prompt`'s first block.
+    let stored = make_ids(BLOCK_TOKENS);
+    let seed_a = cache_seed(0, TEST_QUANT, TEST_SIG);
+    let seed_b = cache_seed(0, TEST_QUANT, OTHER_SIG);
+
+    for (sig, label) in [(TEST_SIG, "model A"), (OTHER_SIG, "model B")] {
+        let arch: ArchPromptCache<TestEntry> =
+            ArchPromptCache::new("test-both-resident", ReusePolicy::Partial);
+        // Both models' blocks are on disk, as they would be after both have
+        // served the prompt once and been evicted from RAM.
+        with_ssd_store(
+            &arch,
+            SeedKeyedStore {
+                rows: vec![(seed_a, stored.clone()), (seed_b, stored.clone())],
+                probed: std::sync::Mutex::new(Vec::new()),
+            },
+        );
+        let consumed = arch.consume(&prompt, TEST_QUANT, false, sig);
+        assert_eq!(
+            arch.read_cache_stats().map(|s| s.ssd_hits),
+            Some(1),
+            "{label} must hydrate its own block from the shared source"
+        );
+        // A hydrate the follow-up lookup cannot match is a miss that got
+        // counted as a hit: the block was read, an LRU slot was evicted for it,
+        // and the request re-prefills anyway. Assert the promoted entry is
+        // actually served, not merely that the counter moved.
+        assert_ne!(
+            tag(&consumed),
+            ConsumedTag::Miss,
+            "{label}'s hydrated block must be matched by the query that asked \
+             for it, not counted as a hit and then re-prefilled"
+        );
+    }
+}
+
+/// The request's codec reaches the source, not the launch codec.
+///
+/// A hot-swapped request (`kv_quant` in the request body) probes under its own
+/// codec's seed and tags the reconstructed entry with it. A source that
+/// substituted an attach-time codec would probe the wrong digest stream, and
+/// then tag the entry so the quant guard evicts it.
+#[test]
+fn hydrate_probes_under_the_requests_codec_not_the_launch_codec() {
+    let prompt = make_ids(2 * BLOCK_TOKENS);
+    // The block-aligned prefix a real spill would hold: `make_ids` is a
+    // prefix-stable range, so this is exactly `prompt`'s first block.
+    let stored = make_ids(BLOCK_TOKENS);
+    let launch = KvQuant::K8V8;
+    let request = KvQuant::K8V4;
+    assert_ne!(launch, request);
+
+    // Only the hot-swapped codec's block is on disk.
+    let seed_request = cache_seed(0, request, TEST_SIG);
+
+    let arch: ArchPromptCache<TestEntry> =
+        ArchPromptCache::new("test-codec-hotswap", ReusePolicy::Partial);
+    with_ssd_store(
+        &arch,
+        SeedKeyedStore {
+            rows: vec![(seed_request, stored.clone())],
+            probed: std::sync::Mutex::new(Vec::new()),
+        },
+    );
+    let _ = arch.consume(&prompt, request, false, TEST_SIG);
+    assert_eq!(
+        arch.read_cache_stats().map(|s| s.ssd_hits),
+        Some(1),
+        "a request at the hot-swapped codec must find the block it stored"
+    );
+
+    // And the launch codec must not reach that block.
+    let arch2: ArchPromptCache<TestEntry> =
+        ArchPromptCache::new("test-codec-hotswap", ReusePolicy::Partial);
+    with_ssd_store(
+        &arch2,
+        SeedKeyedStore {
+            rows: vec![(seed_request, stored)],
+            probed: std::sync::Mutex::new(Vec::new()),
+        },
+    );
+    let _ = arch2.consume(&prompt, launch, false, TEST_SIG);
+    assert_eq!(
+        arch2.read_cache_stats().map(|s| s.ssd_hits),
+        Some(0),
+        "a request at another codec must not be served that block"
     );
 }
 
@@ -2253,7 +2504,12 @@ fn consume_degrade_branches_each_emit_one_debug() {
 // SsdHydrate<E>`. The SSD tier is never attached here, so this impl exists only
 // to satisfy that bound and is never called.
 impl SsdHydrate<TestEntry> for SsdHydrator {
-    fn hydrate(&self, _prompt_ids: &[u32]) -> Result<Option<TestEntry>> {
+    fn hydrate(
+        &self,
+        _prompt_ids: &[u32],
+        _seed: u64,
+        _kv_quant: KvQuant,
+    ) -> Result<Option<TestEntry>> {
         Ok(None)
     }
 }

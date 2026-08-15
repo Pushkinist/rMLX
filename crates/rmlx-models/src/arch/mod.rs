@@ -747,27 +747,6 @@ impl Architecture {
         }
     }
 
-    /// Stable per-model signature this instance seeds its prompt-cache pushes
-    /// with (`prompt_cache::model_cache_sig` of the snapshot directory).
-    ///
-    /// Exposed so the SSD-tier attach can hand the hydrator the *same* value
-    /// the generate loop uses, rather than re-deriving one from an id string
-    /// that may not be the snapshot directory name. Two derivations of the
-    /// same identity is exactly the drift the shared `cache_seed` exists to
-    /// prevent.
-    pub fn model_sig(&self) -> u64 {
-        match self {
-            Architecture::Gemma4(m) => m.model_sig,
-            Architecture::Gemma3(m) => m.model_sig,
-            Architecture::Qwen2(m) => m.model_sig,
-            Architecture::Qwen3(m) => m.model_sig,
-            Architecture::Laguna(m) => m.model_sig,
-            Architecture::Qwen3_5Moe(m) => m.model_sig,
-            Architecture::Qwen3VlMoe(m) => m.text.model_sig,
-            Architecture::BitNet(m) => m.model_sig,
-        }
-    }
-
     /// Vocabulary size (for logit slicing / argmax).
     pub fn vocab_size(&self) -> usize {
         match self {

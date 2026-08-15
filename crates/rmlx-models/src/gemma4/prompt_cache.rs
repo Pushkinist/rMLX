@@ -295,8 +295,13 @@ impl PromptCacheEntry for Gemma4Entry {
 // ---------------------------------------------------------------------------
 
 impl SsdHydrate<Gemma4Entry> for SsdHydrator {
-    fn hydrate(&self, prompt_ids: &[u32]) -> Result<Option<Gemma4Entry>> {
-        let Some((block, block_hashes)) = self.lookup_seeded(prompt_ids)? else {
+    fn hydrate(
+        &self,
+        prompt_ids: &[u32],
+        seed: u64,
+        kv_quant: KvQuant,
+    ) -> Result<Option<Gemma4Entry>> {
+        let Some((block, block_hashes)) = self.lookup_seeded(prompt_ids, seed, kv_quant)? else {
             return Ok(None);
         };
         let HydratedBlock {
@@ -310,7 +315,7 @@ impl SsdHydrate<Gemma4Entry> for SsdHydrator {
             kv_caches,
             first_id: 0,
             first_piece: String::new(),
-            kv_quant: Some(self.kv_quant()),
+            kv_quant: Some(kv_quant),
             // Block-aligned prefix only; the placeholder first_id must not be
             // replayed — the generate loop re-prefills to recompute it.
             is_ssd_hydrated: true,

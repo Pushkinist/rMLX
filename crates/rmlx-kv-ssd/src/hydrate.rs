@@ -12,10 +12,11 @@
 //!
 //! ## Flow (per RAM miss)
 //!
-//! 1. Compute the prompt's chained block hashes (`chained_block_hashes_seeded`,
-//!    seeded with [`crate::hashing::cache_seed`] — the same function the RAM
-//!    push side calls, so the probe cannot drift from the key the spill side
-//!    wrote).
+//! 1. Compute the prompt's chained block hashes (`chained_block_hashes_seeded`)
+//!    from the `seed` the caller passed in — the very `u64` the RAM cache is
+//!    querying under, not a second one computed here. The probe therefore
+//!    cannot drift from the key the spill side wrote; there is no second
+//!    computation to drift.
 //! 2. `SsdKvIndex::lookup_longest_prefix` — the longest cached block-aligned
 //!    prefix (longest-first scan of the candidate prefix digests).
 //! 3. On a hit: `block_io::read_caches` reads the `.kvb`, verifying the
@@ -45,7 +46,7 @@ use rmlx_kv_quant::linear_attn::LinearAttnCache;
 use rmlx_kv_quant::KvQuant;
 
 use crate::block_io::read_caches_timed;
-use crate::hashing::{cache_seed, chained_block_hashes_seeded, BLOCK_TOKENS};
+use crate::hashing::{chained_block_hashes_seeded, BLOCK_TOKENS};
 use crate::hooks::{call_ssd_hydrate_prom_hook, ssd_event_recorder};
 use crate::ssd_index::{KvBlockRow, SsdKvIndex};
 
@@ -69,11 +70,21 @@ pub struct HydratedBlock {
     pub lin_caches: Vec<LinearAttnCache>,
 }
 
-/// SSD-tier hydrate source: owns an [`SsdKvIndex`] + the model identity.
+/// SSD-tier hydrate source: owns an [`SsdKvIndex`] + the namespace it reads.
 ///
-/// One per loaded model (its `model_id` doubles as the spill namespace, exactly
-/// as [`super::spill::SsdSpiller`]). The index is opened once at construction
-/// and reused for every lookup.
+/// Deliberately holds **no** per-model or per-request identity. It is installed
+/// on a per-*architecture* prompt cache and outlives the model that installed
+/// it: several models of one arch can be resident at a time, and the KV codec
+/// is chosen per request. Anything this struct remembered about "the model" or
+/// "the codec" would be whatever attached last, and seeding a probe from it
+/// would silently stop matching for every other model and every hot-swapped
+/// codec. The caller passes those facts to [`Self::lookup`] instead.
+///
+/// What it does own is the namespace: the `SsdKvIndex` and the `.kvb`
+/// directory, resolved once at construction, and the `layout_key` stamped on
+/// the rows in it. Those are properties of the store, and the spiller writing
+/// into that store is installed from the same attach parameters, so the two
+/// always agree.
 #[allow(missing_debug_implementations)]
 pub struct SsdHydrator {
     index: SsdKvIndex,
@@ -83,21 +94,15 @@ pub struct SsdHydrator {
     #[allow(dead_code)]
     dir: PathBuf,
     model_id: String,
-    kv_quant: KvQuant,
-    /// stable u64 hash over the arch + KV layout for this snapshot.
-    /// Salts the chained-hash digest stream and pins index lookups under the
-    /// composite `(hash, layout_key)` PK.
+    /// stable u64 hash over the arch + KV layout of the namespace's rows.
+    /// Pins index lookups under the composite `(hash, layout_key)` PK; it is a
+    /// property of the store, matched by the spiller that fills it.
     layout_key: u64,
-    /// Stable per-model identity of the model this hydrator serves, as carried
-    /// by that model's prompt-cache entries. Part of the probe seed because the
-    /// RAM push side folds it into the digests the spill side then persists —
-    /// and because `--project` puts several models in one namespace.
-    model_sig: u64,
     device: Device,
 }
 
 impl SsdHydrator {
-    /// Open the hydrate source for `model_id` at the configured KV quant.
+    /// Open the hydrate source for the `model_id` namespace.
     ///
     /// The `.kvb` directory + index DB are resolved via
     /// `paths::kv_cache_dir(model_id)` — the same namespace the spiller
@@ -105,9 +110,7 @@ impl SsdHydrator {
     /// (model-load) decides whether to proceed without an SSD tier.
     pub fn open(
         model_id: impl Into<String>,
-        kv_quant: KvQuant,
         layout_key: u64,
-        model_sig: u64,
         device: Device,
     ) -> rmlx_core::error::Result<Self> {
         let model_id = model_id.into();
@@ -118,9 +121,7 @@ impl SsdHydrator {
             index,
             dir,
             model_id,
-            kv_quant,
             layout_key,
-            model_sig,
             device,
         })
     }
@@ -130,9 +131,7 @@ impl SsdHydrator {
     #[cfg(test)]
     pub fn with_index(
         model_id: impl Into<String>,
-        kv_quant: KvQuant,
         layout_key: u64,
-        model_sig: u64,
         device: Device,
         dir: PathBuf,
         index: SsdKvIndex,
@@ -141,9 +140,7 @@ impl SsdHydrator {
             index,
             dir,
             model_id: model_id.into(),
-            kv_quant,
             layout_key,
-            model_sig,
             device,
         }
     }
@@ -155,43 +152,28 @@ impl SsdHydrator {
         &self.model_id
     }
 
-    /// The KV quant this hydrator verifies + tags reconstructed entries with.
-    pub fn kv_quant(&self) -> KvQuant {
-        self.kv_quant
-    }
-
-    /// layout key in effect for this hydrator. Salts chained-hash
-    /// digests and pins the `(hash, layout_key)` composite-PK lookup.
+    /// layout key of the namespace's rows. Pins the `(hash, layout_key)`
+    /// composite-PK lookup.
     pub fn layout_key(&self) -> u64 {
         self.layout_key
     }
 
-    /// The digest seed for everything this hydrator does — the index probe and
-    /// the post-hydrate recompute alike.
+    /// Index lookup plus the block-hash chain the RAM cache will look the
+    /// promoted entry up by, both under the caller's `seed`.
     ///
-    /// Both of those have to reproduce the stream the RAM push side stored the
-    /// entry under, so both go through [`cache_seed`] with this hydrator's own
-    /// `(layout_key, kv_quant, model_sig)`. Recomputing either one by hand is
-    /// how the probe silently stopped matching what spill wrote.
-    fn probe_seed(&self) -> u64 {
-        cache_seed(self.layout_key, self.kv_quant, self.model_sig)
-    }
-
-    /// Index lookup + recompute of the RAM-side seeded block-hash chain for the
-    /// matched block-aligned prefix. The seed partitions prompt-cache keys by
-    /// model, KV layout and codec; the arch-side recompute after hydrate MUST
-    /// use the same [`probe_seed`] the index probe inside `lookup()` uses, or
-    /// hydrated entries are unfindable in the RAM cache.
-    ///
-    /// [`probe_seed`]: SsdHydrator::probe_seed
+    /// The recompute reuses the same `seed` value the probe used, so the
+    /// hydrated entry is findable by the query that triggered the hydrate by
+    /// construction — there is no second seed to keep in step.
     pub fn lookup_seeded(
         &self,
         prompt_ids: &[u32],
+        seed: u64,
+        kv_quant: KvQuant,
     ) -> rmlx_core::error::Result<Option<(HydratedBlock, Vec<u64>)>> {
-        let Some(block) = self.lookup(prompt_ids)? else {
+        let Some(block) = self.lookup(prompt_ids, seed, kv_quant)? else {
             return Ok(None);
         };
-        let hashes = chained_block_hashes_seeded(&block.prompt_ids, self.probe_seed());
+        let hashes = chained_block_hashes_seeded(&block.prompt_ids, seed);
         Ok(Some((block, hashes)))
     }
 
@@ -199,11 +181,20 @@ impl SsdHydrator {
     /// `prompt_ids`. Returns `Ok(Some(_))` on an SSD hit, `Ok(None)` on a true
     /// miss **or** on corruption (after deleting the bad file + row + `warn!`).
     ///
+    /// `seed` is the requesting model's prompt-cache seed and `kv_quant` the
+    /// codec the request is running; both come from the caller, never from this
+    /// struct — see the type docs for why.
+    ///
     /// Never panics. The arch `SsdHydrate<E>` impl calls this and wraps the
     /// result as its concrete entry. Emits a [`SsdHydrateEvent`] via the
     /// process-global event recorder (if set) with per-phase timing.
-    pub fn lookup(&self, prompt_ids: &[u32]) -> rmlx_core::error::Result<Option<HydratedBlock>> {
-        self.lookup_inner(prompt_ids, None)
+    pub fn lookup(
+        &self,
+        prompt_ids: &[u32],
+        seed: u64,
+        kv_quant: KvQuant,
+    ) -> rmlx_core::error::Result<Option<HydratedBlock>> {
+        self.lookup_inner(prompt_ids, seed, kv_quant, None)
     }
 
     /// Test-only: like [`lookup`] but uses an explicit `EventRecorder` for
@@ -212,9 +203,11 @@ impl SsdHydrator {
     pub fn lookup_with_recorder(
         &self,
         prompt_ids: &[u32],
+        seed: u64,
+        kv_quant: KvQuant,
         recorder: &EventRecorder,
     ) -> rmlx_core::error::Result<Option<HydratedBlock>> {
-        self.lookup_inner(prompt_ids, Some(recorder))
+        self.lookup_inner(prompt_ids, seed, kv_quant, Some(recorder))
     }
 
     /// Core of [`lookup`]. `test_recorder` overrides the process-global when
@@ -237,14 +230,17 @@ impl SsdHydrator {
     fn lookup_inner(
         &self,
         prompt_ids: &[u32],
+        seed: u64,
+        kv_quant: KvQuant,
         test_recorder: Option<&EventRecorder>,
     ) -> rmlx_core::error::Result<Option<HydratedBlock>> {
-        // Seed the chained walk through `probe_seed` — the shared `cache_seed`
-        // the RAM push side used to build the digests the spill side then wrote
-        // to the index. Any term this probe omits (model, layout, codec) is a
-        // term the stored key has and the probe does not, and the tier silently
-        // 0-hits: every request re-prefills and nothing reports an error.
-        let chained = chained_block_hashes_seeded(prompt_ids, self.probe_seed());
+        // The caller's seed, used as given. It is the same `u64` the RAM query
+        // is running and the same one the push side built the stored digests
+        // from, so probe and key agree by construction rather than by two
+        // computations happening to match. Recomputing it here from state this
+        // struct remembered is what made the tier silently 0-hit: every request
+        // re-prefills and nothing reports an error.
+        let chained = chained_block_hashes_seeded(prompt_ids, seed);
         if chained.is_empty() {
             return Ok(None); // < one full block → nothing indexable
         }
@@ -262,7 +258,13 @@ impl SsdHydrator {
         let dur_lookup_us = t0.elapsed().as_micros() as u64;
 
         // ── Phases 2–4: file read + dequant + GPU upload (timed inside block_io) ──
-        match read_caches_timed(&row.path, self.device, &self.model_id, self.kv_quant) {
+        // Verify the block against the *request's* codec. A row whose digest
+        // the request matched but whose header codec differs is genuinely
+        // anomalous — the codec salt is part of the seed, so a codec-A row
+        // cannot produce a codec-B digest. Checking an attach-time codec here
+        // instead would reject perfectly good rows written by a hot-swapped
+        // request, and delete them as corrupt.
+        match read_caches_timed(&row.path, self.device, &self.model_id, kv_quant) {
             Ok(Some((
                 kv_caches,
                 lin_caches,

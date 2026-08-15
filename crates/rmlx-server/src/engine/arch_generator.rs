@@ -427,9 +427,6 @@ impl ArchGenerator {
         let n_layers = model.num_hidden_layers();
         let n_kv_heads = model.num_key_value_heads();
         let head_dim = model.head_dim();
-        // The model's own signature, not one re-derived from `model_id`: the
-        // hydrate probe has to seed the digest stream with the exact value the
-        // generate loop pushes RAM slots under, or the tier never hits.
         rmlx_models::ssd_tier::attach_at_load(
             arch_name,
             &model_id,
@@ -437,7 +434,6 @@ impl ArchGenerator {
             n_layers,
             n_kv_heads,
             head_dim,
-            model.model_sig(),
             device,
         );
 

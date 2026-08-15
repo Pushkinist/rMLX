@@ -270,18 +270,36 @@ produce disjoint digest streams for the same token sequence, so a block cached
 under one KV layout cannot collide with the same block cached under another.
 
 `cache_seed` is a single function, in `rmlx-kv-ssd` — below both the RAM prompt
-cache in `rmlx-models` and the SSD hydrate probe in `rmlx-kv-ssd` — precisely so
-neither side can compute the seed independently. The RAM push, the RAM query,
-the spill key (`SpillJob::hash` is the last digest of the pushed entry) and the
-hydrate probe are four sites that must agree bit for bit; a probe that omits one
-term is not a wrong answer, it is a tier that silently never hits.
+cache in `rmlx-models` and the SSD hydrate probe in `rmlx-kv-ssd` — so neither
+side can define the seed independently. The RAM push, the RAM query, the spill
+key (`SpillJob::hash` is the last digest of the pushed entry) and the hydrate
+probe are four sites that must agree bit for bit; a probe that omits one term is
+not a wrong answer, it is a tier that silently never hits.
 
-`model_sig` is the loaded model's own signature, threaded from
-`Architecture::model_sig()` through `attach_at_load` into the hydrator — not
-re-derived from a name string at the attach site. `layout_key` is a *shape* key
-and carries no model identity, and `--project` collapses several models onto one
-namespace directory, so the seed's model term is the only thing that keeps two
-models' blocks apart on disk.
+**The seed is computed once per request and passed down, not recomputed.**
+`ArchPromptCache::consume` builds it, hands the same `u64` to
+`find_best_prefix` and to `hydrate_from_ssd`, and the hydrator probes the index
+and recomputes the promoted entry's block hashes from that value. The four
+sites therefore share one variable rather than four evaluations that have to
+keep agreeing.
+
+That is a correctness requirement, not tidiness. `SsdHydrator` is installed on
+the **per-architecture** prompt cache and outlives the model that installed it:
+`--max-loaded-models` lets several models of one arch be resident, and
+`attach_ssd_tier` overwrites the single attach slot on each load, so the
+installed hydrator belongs to whichever model attached last. A hydrator that
+remembered a `model_sig` would seed every other resident model's probe with the
+wrong identity — the same silent 0-hit, reintroduced. The same argument applies
+to `kv_quant`: it is per *request* (`kv_quant` in the request body hot-swaps the
+codec), so an attach-time codec would mis-seed every hot-swapped request and
+then reject the rows those requests wrote as header mismatches.
+
+`SsdHydrator` therefore holds only namespace-scoped state — the index, the
+directory, and the `layout_key` stamped on the rows in it — which the spiller
+filling that namespace is installed from the same parameters, so the two always
+agree. `layout_key` is a *shape* key and carries no model identity, and
+`--project` collapses several models onto one namespace directory, so the seed's
+model term is the only thing that keeps two models' blocks apart on disk.
 
 `layout_key` is resolved and logged (as a 16-char hex string, field
 `layout_key`) at `attach_at_load` before the index is opened, so operators can
@@ -293,21 +311,26 @@ The key is content-addressed, so changing a seed term does not corrupt anything
 — it re-partitions. Rows written before a term existed are simply digests that
 nothing will ever probe for: still readable, still valid, permanently cold.
 
-They are **not** purged, and deliberately so. Nothing in a `kv_blocks` row
-distinguishes "written under an older seed" from "written for a prompt that has
-not come back yet", so a targeted purge is not expressible; and the alternative,
-a `SCHEMA_VERSION` bump, is the wrong tool — `SsdKvIndex::open` answers a
-version it does not recognise with `SchemaMismatch`, which fails the namespace
-outright rather than clearing it (only a *missing* `schema_version` table
-triggers the pre-release wipe).
+They are **not** purged, and deliberately so.
 
-What happens instead is the eviction path already in place: cold rows carry the
-oldest `last_used`, and both `startup_maintenance` (at attach) and the spill
-drain thread (after every recorded block) evict oldest-first until the namespace
-is inside `--kv-ssd-cache-gb`. So they are the *first* thing reclaimed once the
-budget binds, and until then they cost disk inside a ceiling the operator set —
-never a wrong hit, never a stall. An operator who wants the space back
-immediately can delete `<RMLX_HOME>/cache/kv/<namespace>/`; the tier rebuilds it.
+A targeted purge is not expressible: nothing in a `kv_blocks` row distinguishes
+"written under an older seed" from "written for a prompt that has not come back
+yet". A `SCHEMA_VERSION` bump *would* clear them — `wipe_stale_schema_namespaces`
+runs from `install_config` before any `SsdKvIndex::open` and removes any
+namespace whose recorded version is below this binary's, tagged or untagged, so
+`open` then recreates the namespace empty (see
+`wipe_removes_superseded_schema_namespace`). It is rejected for what it costs,
+not because it would not work: it discards every **live** block in the namespace
+along with the cold ones, to reclaim rows that are already first in line for
+reclamation.
+
+That line is the eviction path already in place: cold rows carry the oldest
+`last_used`, and both `startup_maintenance` (at attach) and the spill drain
+thread (after every recorded block) evict oldest-first until the namespace is
+inside `--kv-ssd-cache-gb`. So they are the first thing dropped once the budget
+binds, and until then they cost disk inside a ceiling the operator set — never a
+wrong hit, never a stall. An operator who wants the space back immediately can
+delete `<RMLX_HOME>/cache/kv/<namespace>/`; the tier rebuilds it.
 
 ## Live reconfiguration
 
@@ -378,7 +401,9 @@ thread** (the cold path that would otherwise pay a full re-prefill):
 
 ```text
 Phase 1 — SQLite prefix lookup
-    Compute: chained = chained_block_hashes_seeded(prompt_ids, cache_seed(layout_key, kv_quant, model_sig))
+    Given:   seed  — the caller's `cache_seed(...)`, the same u64 the RAM query ran
+             kv_quant — the request's codec
+    Compute: chained = chained_block_hashes_seeded(prompt_ids, seed)
     Call:    SsdKvIndex::lookup_longest_prefix(chained, layout_key)
     Result:  (block_count, KvBlockRow) or miss → return None
 
