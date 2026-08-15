@@ -21,6 +21,12 @@ use rmlx_mlx::Device;
 /// `(n_layers, n_kv_heads, head_dim)` are taken from the loaded model's
 /// config and folded into the `layout_key` that the spiller/hydrator carry.
 ///
+/// No model identity is threaded here on purpose. The per-arch attach slot
+/// holds one set of parameters and the last load wins, so a per-model value
+/// recorded at attach would be wrong for every other resident model of the
+/// arch. The hydrate probe takes the requesting model's seed from the request
+/// instead.
+///
 /// The per-namespace SSD work (maintenance, layout-key compute,
 /// logging) lives in [`rmlx_kv_ssd::prepare_attach`]; only the per-arch
 /// `attach_ssd_tier` dispatch remains here because the trait impls

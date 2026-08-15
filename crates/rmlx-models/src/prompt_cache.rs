@@ -89,30 +89,12 @@ pub(crate) fn model_cache_sig(model_dir: &std::path::Path) -> u64 {
     crate::multimodal_cache::model_sig(&id)
 }
 
-/// The block-digest seed a prompt-cache lookup and its matching push must both
-/// use.
-///
-/// Three things partition the key, and every one of them is a case where reusing
-/// another entry's K/V would be wrong rather than merely unhelpful:
-///
-/// - `model_sig` — **which model produced this K/V.** The prompt cache is one
-///   static per architecture, so two models of the same arch resident at once
-///   (the multi-model registry, or a speculative pair) share it. Without this
-///   term, model B's identical prompt matches model A's slot, the token-id
-///   equality check passes because the tokens *are* equal, and B decodes from
-///   A's K/V and A's first token — wrong output, silently.
-/// - `layout_key` — the SSD tier's `(arch, n_layers, n_kv_heads, head_dim,
-///   kv_quant)` shape key, or `0` when the tier is OFF. It is a *shape*
-///   identity and carries no model identity, which is why `model_sig` is a
-///   separate term rather than something to fold into it.
-/// - `kv_quant` — the codec the stored K/V is packed under.
-///
-/// One function so the lookup and push sides cannot drift: a push seeded
-/// differently from the query is not a bug that surfaces as a wrong answer, it
-/// surfaces as a cache that silently never hits.
-pub(crate) fn cache_seed(layout_key: u64, kv_quant: KvQuant, model_sig: u64) -> u64 {
-    FNV_OFFSET ^ layout_key ^ kv_quant.cache_key_salt() ^ model_sig
-}
+// The seed itself is defined in `rmlx-kv-ssd` next to the FNV walk it feeds,
+// because the SSD hydrate probe has to produce the same digest stream as this
+// RAM cache and cannot see `rmlx-models`. Re-exported so in-crate call sites
+// keep the `crate::prompt_cache::cache_seed` path. Do NOT reintroduce a local
+// copy of the formula here — see `rmlx_kv_ssd::hashing::cache_seed`.
+pub(crate) use rmlx_kv_ssd::cache_seed;
 
 /// Default RAM cap for the prompt cache (2 GiB).
 pub(crate) const DEFAULT_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -553,10 +535,10 @@ pub(crate) struct PromptCache<E: PromptCacheEntry> {
     /// pluggable longest-prefix index. Mirrors `self.slots` —
     /// every entry in `slots` has exactly one corresponding entry here
     /// keyed by `(slot.entry.block_hashes(), layout_key=0)` with payload =
-    /// `slot.slot_uid`. Layout disambiguation is already baked into the
-    /// stored `block_hashes` by the per-arch push path
-    /// (`chained_block_hashes_seeded(ids, FNV_OFFSET ^ layout_key)`), so we
-    /// pass `0` to the trait and rely on hash inequality alone.
+    /// `slot.slot_uid`. Model / layout / codec disambiguation is already baked
+    /// into the stored `block_hashes` by the per-arch push path
+    /// (`chained_block_hashes_seeded(ids, cache_seed(…))`), so we pass `0` to
+    /// the trait and rely on hash inequality alone.
     ///
     /// On the Linear path this index is built + maintained for parity with
     /// the Radix path (used by the differential test in the bench)
@@ -637,13 +619,25 @@ impl<E: PromptCacheEntry> PromptCache<E> {
     /// returned. On a miss, or when no SSD source is attached, returns `None`
     /// and the caller falls through to a full prefill.
     ///
-    /// Call this only after [`find_best_prefix`] returns `None`. Corruption
-    /// (bad read / metadata mismatch / missing file) is handled inside the
-    /// source impl (delete file + index row, `warn!`) and surfaces as a miss
-    /// here — this method never panics.
+    /// Call this only after [`find_best_prefix`] returns `None`, and pass it
+    /// the **same** `seed` that call used: the source probes the index with
+    /// that value and recomputes the promoted entry's block hashes from it, so
+    /// the retried `find_best_prefix` matches what was just hydrated. `kv_quant`
+    /// is the request's codec, used to verify the block header and tag the
+    /// reconstructed entry — the source holds neither value itself, because it
+    /// is shared by every model of the arch and every hot-swapped codec.
+    ///
+    /// Corruption (bad read / metadata mismatch / missing file) is handled
+    /// inside the source impl (delete file + index row, `warn!`) and surfaces
+    /// as a miss here — this method never panics.
     ///
     /// [`find_best_prefix`]: PromptCache::find_best_prefix
-    pub(crate) fn hydrate_from_ssd(&mut self, prompt_ids: &[u32]) -> Option<usize> {
+    pub(crate) fn hydrate_from_ssd(
+        &mut self,
+        prompt_ids: &[u32],
+        seed: u64,
+        kv_quant: KvQuant,
+    ) -> Option<usize> {
         // A zero-slot cache can admit nothing, so hydrating would read a `.kvb`
         // off disk and reconstruct its K/V only for `push` to refuse it — once
         // per request, for the life of the process. Worse, the refusal would
@@ -655,7 +649,7 @@ impl<E: PromptCacheEntry> PromptCache<E> {
         // Take the source out so the `&self` borrow during `hydrate` does not
         // conflict with the `&mut self` `push` below; put it back after.
         let source = self.ssd.take()?;
-        let result = source.hydrate(prompt_ids);
+        let result = source.hydrate(prompt_ids, seed, kv_quant);
         self.ssd = Some(source);
         match result {
             Ok(Some(entry)) => {
@@ -736,13 +730,12 @@ impl<E: PromptCacheEntry> PromptCache<E> {
         prompt_ids: &[u32],
         seed: u64,
     ) -> Option<(usize, usize)> {
-        // Issue #26: `seed` salts the query digest stream so it partitions by
-        // the same `(layout_key, codec)` the push side seeds with. Different
-        // KV codecs (or SSD layouts) for the same tokens produce disjoint
-        // digest streams and never match each other's slots — the codec
-        // namespacing that lets a resident model serve multiple KV codecs
-        // without cross-serving cached KV. Pass `FNV_OFFSET` for the legacy
-        // un-salted stream (RAM-only, single-codec, layout_key=0).
+        // `seed` salts the query digest stream so it partitions by the same
+        // `(model, layout, codec)` the push side seeds with — see `cache_seed`.
+        // A different model of this arch, a different KV codec, or a different
+        // SSD layout produces a disjoint digest stream for the same tokens and
+        // never matches another's slots. Pass `FNV_OFFSET` for the legacy
+        // un-salted stream (tests only).
         let want = chained_block_hashes_seeded(prompt_ids, seed);
 
         let (best_idx, best_blocks) = match self.prefix_index_kind {
@@ -1048,7 +1041,6 @@ pub(crate) enum ReusePolicy {
 #[derive(Clone)]
 pub(crate) struct AttachParams {
     pub(crate) namespace: String,
-    pub(crate) kv_quant: KvQuant,
     pub(crate) layout_key: u64,
     pub(crate) device: rmlx_mlx::Device,
 }
@@ -1201,6 +1193,13 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
     /// for `namespace` at `kv_quant` (/ ). Records the attach params
     /// so they survive a later cache re-creation, then installs the sinks on
     /// the live cache when one already exists.
+    ///
+    /// These parameters describe the on-disk **store** — which namespace, which
+    /// layout the rows in it carry. They deliberately do not carry the
+    /// attaching model's identity or codec: this is one slot per architecture
+    /// and the last attach wins, so a per-model value recorded here would be
+    /// wrong for every other resident model of the arch. Per-request identity
+    /// reaches the hydrator through [`Self::consume`] instead.
     pub(crate) fn attach_ssd_tier(
         &self,
         namespace: &str,
@@ -1211,9 +1210,11 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
         SsdSpiller: SpillSink<E>,
         SsdHydrator: SsdHydrate<E>,
     {
+        // `kv_quant` is logged, not stored: it is the launch codec, and any
+        // request may hot-swap it. Storing it would put an attach-time codec
+        // where a per-request one belongs.
         let params = AttachParams {
             namespace: namespace.to_string(),
-            kv_quant,
             layout_key,
             device,
         };
@@ -1344,7 +1345,7 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
         // block into RAM; re-run find_best_prefix so the promoted slot is
         // matched + quant-checked by the path below.
         let mut raw_match = cache.find_best_prefix(prompt_ids, seed);
-        if raw_match.is_none() && cache.hydrate_from_ssd(prompt_ids).is_some() {
+        if raw_match.is_none() && cache.hydrate_from_ssd(prompt_ids, seed, kv_quant).is_some() {
             raw_match = cache.find_best_prefix(prompt_ids, seed);
         }
 
@@ -1488,7 +1489,7 @@ where
         p.layout_key,
         p.device,
     )));
-    match SsdHydrator::open(&p.namespace, p.kv_quant, p.layout_key, p.device) {
+    match SsdHydrator::open(&p.namespace, p.layout_key, p.device) {
         Ok(h) => cache.set_ssd_source(Box::new(h)),
         Err(e) => tracing::warn!(
             namespace = %p.namespace,

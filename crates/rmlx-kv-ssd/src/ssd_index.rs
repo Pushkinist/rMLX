@@ -299,12 +299,13 @@ impl SsdKvIndex {
     /// Find the longest stored block-aligned prefix for a prompt at this
     /// layout (+ ).
     ///
-    /// `chained` is `prompt_cache::chained_block_hashes_seeded(ids, FNV_OFFSET ^
-    /// layout_key)` — one chained FNV-1a-64 digest per full 256-token block.
-    /// The digest at index `k-1` uniquely identifies the entire `k`-block
-    /// prefix under this `layout_key`, so it is exactly the spill key
-    /// wrote for a `k`-block snapshot at the same layout. Walks longest-first
-    /// and returns the first that hits the index under `(hash, layout_key)`.
+    /// `chained` is `chained_block_hashes_seeded(ids, cache_seed(layout_key,
+    /// kv_quant, model_sig))` — one chained FNV-1a-64 digest per full 256-token
+    /// block. The digest at index `k-1` uniquely identifies the entire
+    /// `k`-block prefix under that seed, so it is exactly the key the spill side
+    /// wrote for a `k`-block snapshot of the same model, layout and codec.
+    /// Walks longest-first and returns the first that hits the index under
+    /// `(hash, layout_key)`.
     #[allow(
         clippy::indexing_slicing,
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"

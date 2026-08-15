@@ -1,8 +1,15 @@
 //! Stable hash helpers for the block manager.
 //!
-//! Block hashing uses FNV-1a-64 — same family as `prompt_cache.rs` — so SSD
-//! `.kvb` rows persisted by earlier commits keep working. The layout key is mixed in
-//! via `FNV_OFFSET ^ layout_key`.
+//! Block hashing uses FNV-1a-64, the same family as the prompt cache, and for
+//! the same reasons: deterministic across runs, cheap, no new dependency.
+//!
+//! It is **not** the prompt cache's `cache_seed` and does not produce the same
+//! digest stream. This module keys a different store with a different identity —
+//! `CacheKey::chained_seed` mixes `layout_key` with an optional `lora_salt` and
+//! `mm_hash` through a rotate/multiply chain, terms `cache_seed` does not have,
+//! and it has no model or codec term. So these digests cannot address `.kvb`
+//! rows and are not interchangeable with them. The block manager is not wired
+//! into `serve` today; when it is, it needs its own store, not the SSD tier's.
 
 use crate::prompt_cache::{FNV_OFFSET, FNV_PRIME};
 

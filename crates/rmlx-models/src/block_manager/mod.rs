@@ -26,8 +26,10 @@
 //! ## Hash family
 //!
 //! Block hashing keeps the project-wide FNV-1a-64 family
-//! (see `prompt_cache::chained_block_hashes_seeded`). `layout_key` is
-//! mixed via `FNV_OFFSET ^ layout_key`. The reference uses xxh3 with 4
+//! (see `prompt_cache::chained_block_hashes_seeded`), but not its key:
+//! `layout_key` is mixed via `FNV_OFFSET ^ layout_key` with no model or codec
+//! term, so these digests are a separate address space from the prompt cache's
+//! `cache_seed` and cannot address `.kvb` rows. The reference uses xxh3 with 4
 //! distinct 192-byte secrets for the TinyLFU CMS; we instead derive 4
 //! independent FNV streams from 4 stable u64 seeds — same algorithmic
 //! properties (4 independent counter slots, 4-bit ceiling, halving decay) and
