@@ -244,6 +244,52 @@ never smaller than bf16 (see `docs/KV_QUANT.md` "Memory truth"), and its
 decode is several times `none`'s. Bench them for kernel work and quality
 study, not as memory or throughput candidates.
 
+#### K-only family, re-recorded after the dispatcher fix
+
+The table above left the K-only family incomplete: `k_iso4` / `k_rotor4` were
+never re-recorded, and the Bonsai `k_iso3` 4k cell was refused pre-fix. These
+are the completed cells on the post-fix tree, `rmlx bench` n=3 + 1 warmup,
+`release-perf`, scratch `RMLX_HOME`, `--metrics off`. Prompt lengths are the
+tokenized fixtures: Bonsai 3770 / 15629 / 31553, e2b 4117 / 17148 / 34355.
+Run-to-run range was ≤2.1% in every cell and the token digest was identical
+across the runs of a cell.
+
+| model | codec | 4k | 16k | 32k | KV bytes @32k | × `none` |
+|---|---|---|---|---|---|---|
+| Bonsai-8B | `none` (control) | 140.32 | 95.74 | 67.40 | 5,341,839,360 | 1.000 |
+| Bonsai-8B | `k_iso3` | **60.28** | 26.17 | 14.36 | 5,371,658,240 | 1.006 |
+| Bonsai-8B | `k_iso4` | **60.56** | — | — | — | — |
+| Bonsai-8B | `k_rotor3` | **54.24** | 22.41 | 12.33 | 5,952,718,304 | 1.114 |
+| Bonsai-8B | `k_rotor4` | **54.10** | — | — | — | — |
+| gemma-4-e2b | `none` (control) | 126.82 | 119.29 | 112.55 | 218,148,864 | 1.000 |
+| gemma-4-e2b | `k_iso3` | **107.15** | 66.74 | 44.44 | 218,803,200 | 1.003 |
+| gemma-4-e2b | `k_iso4` | **107.97** | — | — | — | — |
+| gemma-4-e2b | `k_rotor3` | **101.58** | 58.34 | 37.12 | 254,477,328 | 1.167 |
+| gemma-4-e2b | `k_rotor4` | **100.73** | — | — | — | — |
+
+The KV-bytes column is the reason to stop optimizing this family for
+throughput: `k_iso3/4` measures **1.003–1.006×** `none` and `k_rotor3/4`
+**1.11–1.17×**. A codec that is not smaller than bf16 has no bandwidth prize
+to collect, so parity with `none` is the ceiling, not a milestone on the way
+past it.
+
+Marginal cost over the replicated 16k→32k segment (`itl_p50` ms per 1k KV
+tokens) is unchanged by the dispatcher fix, as predicted — the fix moved the
+intercept, not the slope:
+
+| model | `none` | `k_iso3` | `k_rotor3` |
+|---|---|---|---|
+| Bonsai-8B | 0.261 | 1.799 (6.9×) | 2.178 (8.3×) |
+| gemma-4-e2b | 0.025 | 0.432 | 0.567 |
+
+Read e2b's ratio-to-`none` with care: only its 7 global layers grow, so the
+`none` denominator is near zero and the ratio inflates. Compare the absolute
+ms/1k across models instead. Counted from the per-dispatch `trace!` under
+`--log verbose`, the flash-decode kernel fires once per *growing* attention
+layer per decode step and is handed the full prefix — 26 of 36 layers on
+Bonsai (the first 2 and last 8 are forced to K8V8), 7 of 35 on e2b. What
+remains is per-KV-token work inside the kernel, not data movement.
+
 Each new codec: invoke `scripts/bench_codec_cell.sh --kv-quant <codec> --model <model>` per cell (3 cells per codec, A.y-excluded skipped), then append to this table.
 
 **Champions regen**: regenerate `BENCHMARK_CHAMPIONS.md` via `rmlx metrics export --markdown` after each cell lands. If that command is unavailable, manual fallback: hand-edit `BENCHMARK_CHAMPIONS.md` with cell + recorded TPS, cite source CSV row.
