@@ -48,7 +48,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         metrics-init metrics-doctor metrics-doctor-fix metrics-export \
         metrics-backup metrics-replay-pending metrics-prompts-sync \
         metrics-champions metrics-champions-rmlx \
-        build-perf build-debug test-perf ci-perf model-check model-check-full \
+        build-perf build-debug test-perf ci-perf gpu-test model-check model-check-full \
         profile-samply profile-samply-debug profile-instruments bench asm perf-iter \
         canary canary-gate \
         mlx-preflight mlx-restore-pin target-gc target-size-report profile-gputrace \
@@ -139,6 +139,22 @@ test-perf:       ## cargo test --profile release-perf (release-perf profile, pan
 ci-perf:         ## pre-push gate under release-perf (separate from make ci; run before merging perf-sensitive changes)
 	$(MAKE) test-perf
 	@echo "ci-perf ok"
+
+# gpu-test: the execution step for the tests `check-gpu-tests-ignored` mandates.
+# Every test reaching Device::Gpu must carry #[ignore] (a shared Metal context
+# driven from parallel cargo-test threads aborts the whole binary), and until
+# this target existed nothing ran them: `make test` passes no --ignored and the
+# hosted CI has no Metal. GPU decode correctness for every KV codec sits in that
+# category, and tests in it have gone red on main and stayed red undetected.
+#
+# It is NOT part of `make ci`: it needs exclusive access to the Metal context and
+# is far too slow to block every commit. Run it before merging anything in the
+# codec layer. Folding it into `ci-perf` (the one target that already assumes
+# exclusive machine access) is the natural next step, but is blocked while any
+# GPU test is red on main — wiring a known-red step into a shared gate just
+# teaches people to skip the gate.
+gpu-test:        ## run the GPU/Metal #[ignore] tests serialized (CRATE= FILTER= to narrow); needs exclusive machine access
+	@bash scripts/run_gpu_tests.sh $(if $(CRATE),--crate $(CRATE),) $(if $(FILTER),--filter $(FILTER),)
 
 # model-check: run only the model-logic crates (rmlx-models, rmlx-runtime,
 # rmlx-quant) plus the KV-codec crate (rmlx-kv-quant). Excludes server, CLI, and

@@ -155,14 +155,46 @@ not exempt); (2) the reachability seed is file-local, so a test that reaches
 Metal only through a helper defined in another module can draw a non-fatal
 false-positive warning — verify before acting on it.
 
-### `#[ignore]` is not a place to park a broken test
+### Running them: `make gpu-test`
 
-An ignored test runs only when someone asks for it, so a real failure can sit
-in the tree indefinitely. Run the ignored suites when touching a codec:
+`make test` is `cargo test --workspace` — it passes no `--ignored`, so it skips
+every test above. The hosted CI runs no tests at all and has no Metal. For a
+long time nothing ran them, and GPU tests went red on `main` and stayed red
+while every gate reported green. `make gpu-test` is the step that runs them:
 
 ```bash
-cargo test -p rmlx-kv-quant --lib -- --ignored --test-threads=1
+make gpu-test                                   # every member crate
+make gpu-test CRATE=rmlx-kv-quant               # one crate
+make gpu-test CRATE=rmlx-kv-quant FILTER=rotor_flash
 ```
+
+It runs exactly the set `check_gpu_tests_ignored.sh --list` classifies — the
+`#[test]` fns that reach `Device::Gpu` **and** carry `#[ignore]`. Deriving the
+population from the enforcing gate's own classifier is the point: a separate
+hand-maintained list would drift, and the rule would end up mandating `#[ignore]`
+on tests the runner never visits.
+
+It deliberately does **not** run every `#[ignore]` test. Many are ignored for
+reasons unrelated to Metal — live network access, a missing cargo feature,
+`ignore`-marked doc-comment pseudo-code — and sweeping those in would keep this
+gate permanently red for things it cannot speak to.
+
+It **refuses to report OK if it executed no tests** (per crate and overall) — a
+filter that matches nothing is an error, not a green run — and refuses to start
+while another MLX process holds the GPU (CLAUDE.md hard rule 8).
+
+`make gpu-test` is not part of `make ci`: it needs the Metal context to itself
+and is too slow to block every commit. Run it before merging anything in the
+codec layer.
+
+### `#[ignore]` is not a place to park a broken test
+
+An ignored test runs only when someone asks for it, so a real failure can sit in
+the tree indefinitely — that is the failure mode `make gpu-test` exists to close,
+not one it makes impossible. A test edited until it goes green is the same defect
+wearing a different hat: when a deliberate behaviour change makes an assertion
+stale, re-point the assertion at the new contract and then mutation-check it
+(revert the change; the repaired test must go red), rather than relaxing it.
 
 ---
 
@@ -514,6 +546,30 @@ They are read only inside test code (`tests/` and `*_tests.rs` files).
 | `RMLX_SPARSE_ATTN_STRICT` | `1` | Fail (not warn) on sparse-attn dispatch parity tests. |
 
 ---
+
+## Env-backed gates: readers need the lock too
+
+`rmlx-kv-quant` exposes `test_utils::env_lock()`, a process-global guard for
+every test in that binary that touches the environment. Two rules:
+
+1. **Hold it for the whole test body**, not just across the mutation.
+2. **Readers take it as well as writers.** A test that merely *reads* an
+   env-backed gate — `rotor_qjl_enabled()`, `skip_if_no_gpu_env()`, or anything
+   that calls them, such as `KvQuant::cpu_hot_path_reason()` — races the tests
+   that set `RMLX_ROTOR_QJL` / `RMLX_SKIP_GPU` and fails intermittently.
+
+The granularity is the whole environment, not one variable: `setenv` is UB
+against a concurrent `getenv` of *any* key, so one lock is the correct scope and
+a per-variable lock would be unsound.
+
+Gates latched behind a `OnceLock` (`RMLX_TURBO_FLASH`, `RMLX_FUSED_QK`,
+`RMLX_SPARSE_ATTN`, `RMLX_PLANAR_FLASH_DECODE`) read the env exactly once per
+process, so no test can flip them mid-run — that is why the shell drivers set
+them per-process instead. `RMLX_ROTOR_QJL` is deliberately **not** latched (it is
+re-read on every construction), which is what makes it raceable.
+
+`rmlx-kv-ssd` keeps its own lock: separate crate, separate test binary,
+separate process, no shared environment.
 
 ## In-process tests must not rely on the `paths::home()` `OnceLock`
 

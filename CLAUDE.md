@@ -199,8 +199,13 @@ Hard rules:
 - **Hard rule: a test that reaches `Device::Gpu` carries `#[ignore]`.** A shared
   Metal context driven from parallel `cargo test` threads aborts the whole test
   binary ("Rust cannot catch foreign exceptions"), taking every other test in
-  the crate with it. Run them as
-  `cargo test -p <crate> --lib -- --ignored <filter> --test-threads=1`. A guard
+  the crate with it. Run them with **`make gpu-test`** (every member crate,
+  serialized; `CRATE=` / `FILTER=` to narrow), or by hand as
+  `cargo test -p <crate> --lib -- --ignored <filter> --test-threads=1`.
+  `make gpu-test` is the only step that executes them — `make test` passes no
+  `--ignored` and the hosted CI has no Metal — so it is mandatory before merging
+  anything in the codec layer. It is deliberately not in `make ci` (needs the
+  Metal context to itself). A guard
   that only exercises a check the dispatcher rejects **before** touching a
   device-parameterized op is not a GPU test: pass `Device::Cpu` and leave it
   un-ignored — ignoring a CPU test silently stops running it. The CI gate
@@ -245,7 +250,8 @@ hand — keeps the CI gate and the local gate identical.
 | `make` / `make help` | List targets. |
 | `make build` | `cargo build --workspace --release`. |
 | `make check` | `cargo check --workspace --all-targets` (fast). |
-| `make test` | `cargo test --workspace`. |
+| `make test` | `cargo test --workspace` — **skips every `#[ignore]` GPU test**. |
+| `make gpu-test` | Run the GPU/Metal `#[ignore]` tests, `--test-threads=1` (`CRATE=` / `FILTER=` narrow). Needs exclusive machine access. Not in `make ci`. |
 | `make fmt` / `make fmt-check` | Write / check `cargo fmt`. |
 | `make lint` | `cargo clippy -D warnings`. |
 | `make audit` | `cargo audit` with RustSec ignores from `deny.toml`. |
