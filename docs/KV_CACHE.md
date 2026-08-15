@@ -487,7 +487,8 @@ the identity *at the logical-mapping level* (the transposes cancel), so the
 common path stays correct. It is **byte-identical** to the pre-fix head-major
 grouping only when `head_dim % 128 == 0` — then every q8 group of 128 stays
 inside one head. That holds for every current QuantK-routed target arch
-(Qwen3.5-MoE linear `head_dim=128`, Gemma3 and Gemma4 text KV `head_dim=256`),
+(Qwen3.5-MoE linear `head_dim=128`, Gemma3 text KV `head_dim=256`, Gemma4 text
+KV `head_dim=256` on SWA layers and `512` on full-attention layers),
 so the cold path is byte-identical in practice. When `head_dim` is not a
 multiple of 128 (no current target arch, but exercised by the `d=64` cross-head
 round-trip test) a q8 group spans a (head,token) boundary, so its per-group

@@ -881,6 +881,39 @@ mod tests {
         }
     }
 
+    /// `KvQuant::None` is **not** exempt from the boundary promotion.
+    ///
+    /// This is what makes `--kv-quant none` a bf16/K8V8 mixture rather than a
+    /// bf16 control on any architecture whose boundary layers hold a real
+    /// token-indexed cache — and every published "vs `none`" ratio is read
+    /// against that mixture. `K8V8` is the only base mode the override leaves
+    /// alone; adding a second exemption here would silently change what a
+    /// recorded control measured.
+    #[test]
+    fn kv_quant_for_layer_promotes_none_base_at_boundaries() {
+        // 36 layers, every one full-attention: Ternary-Bonsai-8B's shape, the
+        // arch where the promotion is fully in effect.
+        let n = 36;
+        let base = KvQuant::None;
+        let promoted: Vec<usize> = (0..n)
+            .filter(|&i| {
+                kv_quant_for_layer(i, n, base, LAYER_ADAPTIVE_TAIL_N, LAYER_ADAPTIVE_HEAD_N) != base
+            })
+            .collect();
+        assert_eq!(
+            promoted,
+            vec![0, 1, 28, 29, 30, 31, 32, 33, 34, 35],
+            "`none` must be promoted on the first 2 + last 8 layers, not passed through"
+        );
+        for &i in &promoted {
+            assert_eq!(
+                kv_quant_for_layer(i, n, base, LAYER_ADAPTIVE_TAIL_N, LAYER_ADAPTIVE_HEAD_N),
+                KvQuant::K8V8,
+                "promoted layer {i} must land on K8V8"
+            );
+        }
+    }
+
     #[test]
     fn kv_quant_for_layer_planar_tail_overridden() {
         // Planar base: last 8 of 40 layers become K8V8; head 2 also become K8V8.
