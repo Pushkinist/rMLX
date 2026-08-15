@@ -434,6 +434,178 @@ fn planar_flash_decode_enabled_is_callable() {
     let _: bool = planar_flash_decode_enabled();
 }
 
+// ── Bit-exactness vs the production split chain ───────────────────────────
+//
+// `planar_k_flash_over_store` has exactly two arms over one packed store:
+// the single-pass flash kernel, and the split chain
+// (`planar_fused_qk` → mask add → `softmax_precise` → GQA matmul). The
+// helper below runs *both* arms on the same inputs and reports how many
+// output elements differ bit-for-bit, so the two arms are never assumed
+// equal from a run in which only one of them executed.
+
+/// Run both `planar_k_flash_over_store` arms over one packed K and return
+/// `(n_elements, n_bitwise_differences, max_abs_err)`.
+///
+/// Mirrors the production chain step for step, including the f32 softmax and
+/// the GQA reshape/matmul, so the numbers describe the arms operators
+/// actually select between — not a host-side approximation of them.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "test helper: parameter pack mirrors the dispatcher's shape surface"
+)]
+#[allow(clippy::expect_used, reason = "test helper: invariants documented")]
+fn flash_vs_split_chain(
+    b: i32,
+    kv_h: i32,
+    heads_per_kv: i32,
+    kv_seq: i32,
+    head_dim: i32,
+    seed: u64,
+) -> (usize, usize, f32) {
+    use rmlx_mlx::{matmul, softmax_precise};
+
+    let n_q_heads = kv_h * heads_per_kv;
+    let scale: f32 = 1.0 / (head_dim as f32).sqrt();
+    let device = Device::Gpu;
+
+    let k_shape = [b, kv_h, kv_seq, head_dim];
+    let k_n: usize = k_shape.iter().map(|&d| d as usize).product();
+    let k_arr = make_f32_array(&lcg_data(k_n, seed), &k_shape);
+    let q_shape = [b, n_q_heads, 1, head_dim];
+    let q_n: usize = q_shape.iter().map(|&d| d as usize).product();
+    let q_arr = make_f32_array(&lcg_data(q_n, seed ^ 0x1111_1111), &q_shape);
+    let v_shape = [b, kv_h, kv_seq, head_dim];
+    let v_n: usize = v_shape.iter().map(|&d| d as usize).product();
+    let v_arr = make_f32_array(&lcg_data(v_n, seed ^ 0x2222_2222), &v_shape)
+        .astype(Dtype::Bf16, device)
+        .expect("V bf16");
+
+    // Pack K seq-major, the layout both kernels index.
+    let k_seq = k_arr
+        .transpose(&[0, 2, 1, 3], device)
+        .expect("transpose k seq-major")
+        .contiguous(device)
+        .expect("contiguous k seq-major");
+    let (codes, scales, rot32) =
+        planar_quantize_v4_gpu(&k_seq, device).expect("planar_quantize_v4_gpu");
+
+    // Arm A — single-pass flash kernel.
+    let flash = planar_flash_decode_sdpa(
+        &q_arr,
+        &codes,
+        &scales,
+        &rot32,
+        &v_arr,
+        None,
+        b,
+        kv_h,
+        kv_seq,
+        head_dim,
+        heads_per_kv,
+        4,
+        scale,
+        device,
+    )
+    .expect("planar_flash_decode_sdpa");
+
+    // Arm B — split chain, verbatim from `planar_k_flash_over_store`.
+    let scores = planar_fused_qk(
+        &q_arr,
+        &codes,
+        &scales,
+        &rot32,
+        b,
+        kv_h,
+        kv_seq,
+        head_dim,
+        heads_per_kv,
+        4,
+        scale,
+        device,
+    )
+    .expect("planar_fused_qk");
+    let probs = softmax_precise(&scores, -1, device).expect("softmax_precise");
+    let probs_g = probs
+        .reshape(&[b, kv_h, heads_per_kv, 1, kv_seq], device)
+        .expect("probs reshape");
+    let v_g = v_arr
+        .reshape(&[b, kv_h, 1, kv_seq, head_dim], device)
+        .expect("v reshape");
+    let out_g = matmul(&probs_g, &v_g, device).expect("GQA matmul");
+    let split = out_g
+        .reshape(&[b, n_q_heads, 1, head_dim], device)
+        .expect("out reshape");
+
+    let a = array_to_f32(&flash.astype(Dtype::F32, device).expect("flash f32"));
+    let s = array_to_f32(&split.astype(Dtype::F32, device).expect("split f32"));
+    assert_eq!(a.len(), s.len(), "arm output lengths differ");
+    let mut diffs = 0_usize;
+    let mut max_err = 0.0_f32;
+    for (x, y) in a.iter().zip(s.iter()) {
+        if x.to_bits() != y.to_bits() {
+            diffs += 1;
+        }
+        let e = (x - y).abs();
+        if e > max_err {
+            max_err = e;
+        }
+    }
+    (a.len(), diffs, max_err)
+}
+
+/// The flash kernel and the split chain are **not** bit-exact.
+///
+/// Both arms decode the same packed K, but the flash kernel folds the
+/// softmax into a per-tile online (log-sum-exp) reduction while the split
+/// chain materialises the full score row and calls `softmax_precise`. The
+/// two summation orders differ, so the results differ in the low mantissa
+/// bits. This test pins that as a measured fact across short and long
+/// `kv_seq` and both test-target head shapes, because the surrounding docs
+/// used to assert byte-identity from a single cell.
+///
+/// Failing *upward* (zero differences everywhere) is also a real signal —
+/// it would mean one arm stopped running, which is exactly the inert A/B
+/// this file exists to prevent.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test planar_flash_decode -- --include-ignored --test-threads=1"]
+fn planar_flash_decode_is_not_bit_exact_vs_split_chain() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    // (kv_h, heads_per_kv, head_dim): Bonsai-8B-shaped GQA at head_dim=128
+    // and a kv_h=1 single-KV-head shape at head_dim=256.
+    let shapes = [(8_i32, 4_i32, 128_i32), (1_i32, 8_i32, 256_i32)];
+    let contexts = [64_i32, 512, 4096];
+    let mut any_diff = false;
+    for (kv_h, heads_per_kv, head_dim) in shapes {
+        for kv_seq in contexts {
+            let seed = 0x9E37_79B9_u64
+                .wrapping_mul(kv_seq as u64)
+                .wrapping_add(head_dim as u64);
+            let (n, diffs, max_err) =
+                flash_vs_split_chain(1, kv_h, heads_per_kv, kv_seq, head_dim, seed);
+            eprintln!(
+                "[planar flash vs split] kv_h={kv_h} heads_per_kv={heads_per_kv} \
+                 head_dim={head_dim} kv_seq={kv_seq}: {diffs}/{n} elements differ \
+                 bitwise, max_abs_err={max_err:.3e}"
+            );
+            assert!(
+                max_err < 1e-3,
+                "kv_h={kv_h} head_dim={head_dim} kv_seq={kv_seq}: arms disagree by \
+                 {max_err:.3e} — that is a correctness bug, not rounding"
+            );
+            if diffs > 0 {
+                any_diff = true;
+            }
+        }
+    }
+    assert!(
+        any_diff,
+        "every cell matched bit-for-bit — either the kernel became bit-exact \
+         (update the docs) or one arm did not run (the A/B is inert)"
+    );
+}
+
 /// Probe header snapshots must equal what the builders emit.
 ///
 /// `make check-metal-compiles` prepends these snapshots to the kernel bodies.

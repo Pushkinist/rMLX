@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The fused-QK dispatch table listed eight codecs it could never serve, and
+  a strict-mode test asserted four of them dispatch.** The head-major fused-QK
+  shadow is seeded by re-encoding the bf16 K mirror, so a codec only reaches
+  that path when it keeps one (`KvQuant::feeds_bf16_k_at_decode`).
+  `Iso{3,4}Sym`, `IsoKOnly{3,4}`, `Rotor{3,4}Sym` and `RotorKOnly{3,4}` keep
+  none by design — each decodes through its own flash-decode-over-quant kernel
+  straight off the packed ring — so listing them was listing entries no shape
+  on no architecture could reach. The tables in `rmlx-kv-quant` and
+  `rmlx-models` are pruned to the reachable set (q8, `TurboSym3`, `TurboSym4`,
+  `RotorK{3,4}Asym`), and a unit test pins the entry ⇒ bf16-K-mirror
+  implication so a ninth cannot be added silently.
+  `crates/rmlx-kv-quant/tests/rotor_fused_qk_dispatch.rs` becomes a routing
+  contract: for each rotor codec it asserts which kernel family fired **and**
+  that the other two did not, which the previous test never checked in either
+  direction.
+- **The rotor fused-QK kernel is reachable and does dispatch.** Proven on two
+  architectures at both supported head widths — Ternary-Bonsai-8B
+  (`Qwen3ForCausalLM`, `kv_h=8`, `head_dim=128`, `--ctk rotor_k_3 --ctv q4_g64
+  --fused-qk on`): 2418 `rotor_fused_qk_sdpa: dispatch` trace events; ornith-9b
+  (`Qwen3_5ForConditionalGeneration`, `kv_h=4`, `head_dim=256`, `--ctk
+  rotor_k_4`): 126. It is the *only* GPU decode kernel for the two rotor-asym
+  codecs, which have no flash-decode arm.
+- **`lookup_fused_qk` matched payload-bearing variants by `PartialEq`.** The
+  rotor-asym entries carry a `(v_bits, v_group_size)` V-side payload the K-side
+  kernel never reads, so an equality lookup would resolve only the one V
+  configuration the table spells out and silently return `None` for every
+  other. It now matches by variant discriminant.
+- **`planar_flash_decode` was documented as byte-identical to the split
+  chain; it is not, in any cell.** Both arms decode the same packed K, but the
+  flash kernel folds the softmax into a per-tile online log-sum-exp reduction
+  while the split chain materialises the score row and calls `softmax_precise`
+  — different summation orders, different low mantissa bits. Measured across
+  three contexts (64 / 512 / 4096) on two head shapes: 6 of 6 cells diverge,
+  3621–3890 of 4096 elements at `head_dim=128` and all 2048 at `head_dim=256`,
+  max abs error 1.96e-8 to 1.21e-4. The claim is now stated as measured in
+  `docs/KV_QUANT.md`, `docs/CLI.md` and the `--planar-flash-decode` rustdoc,
+  and a GPU test pins it. The serve-path A/B that produced the original claim
+  cannot settle it either way: with the warm-TTFT bf16-K seed live, **neither**
+  `--planar-flash-decode on` nor `off` dispatches the kernel (measured 0 and 0,
+  2418 warm-TTFT bypasses, identical digests) — an A/B whose arms both skip the
+  kernel confirms any equivalence put to it.
 - **Kernel-gate flags are global, so the instrument measures what the server
   runs.** `--turbo-flash`, `--turbo-flash-lock` and `--planar-flash-decode`
   were resolved inside `run_serve`, while their four sibling gates
@@ -20,7 +61,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `main` beside the others; both `rmlx --turbo-flash off serve …` and
   `rmlx serve --turbo-flash off …` continue to work.
 
+### Added
+
+- **Per-dispatch `trace!` on the two PlanarQuant kernels**
+  (`planar_flash_decode_sdpa: dispatch`, `planar_fused_qk: dispatch`), matching
+  every sibling KV kernel. Their in-process dispatch counters have no caller
+  outside tests, so these events are the only way a shipped binary can answer
+  "did this kernel run".
+- **`fused_qk: skipped` trace with a `reason` field.** Every fall-through in
+  `try_fused_qk_dispatch` now names the gate that rejected, and the `head_dim`
+  gate carries the observed value. This is what identified the Gemma4 result
+  below in one run instead of by reading the dispatcher.
+
 ### Changed
+
+- **Documented that no Gemma4 model can reach a fused-QK kernel.** Gemma4
+  quantises only its full-attention layers, which use `global_head_dim = 512`,
+  and the fused-QK shims are hard-gated on `head_dim ∈ {128, 256}`. A Gemma4
+  run with a fused-QK codec logs `fused_qk: skipped` with
+  `reason = "head_dim not in {128, 256}"` and `head_dim = 512`. The rotor and
+  iso flash-decode kernels accept up to 512 and do fire there.
 
 - **`--turbo-flash=auto` now resolves OFF on every host (HOLD).** It previously
   resolved ON for every recognised Apple family. On the one storage the kernel
@@ -44,6 +104,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decodes 88.8 TPS @16k and 61.8 @32k out of the box, where the documented
   "crater from 8k up" had it at 39.3 @8k falling to 6.7 @64k. That crater was
   the kernel, not the codec.
+
+### Removed
+
+- **`iso_fused_qk` MSL kernel retired.** Its only possible callers were four
+  codecs that keep no bf16 K mirror, so it could not dispatch from any
+  production path; every iso codec decodes through `iso_flash_decode` /
+  `iso_flash_decode_symv` instead. The dispatcher, both `.metal` bodies, both
+  probe headers, the manifest rows, the tests and the doc references are all
+  gone rather than left compiling and CI-checked for nothing.
 
 ## [0.3.0] - 2026-07-13
 

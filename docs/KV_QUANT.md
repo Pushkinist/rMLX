@@ -3221,9 +3221,8 @@ rotor's: ~16 FMAs per group, not ~64.
 
 The decode is **self-contained per lane** — a group's four codes all live in one
 u32, so `if_decode_k_lane` unpacks them and runs the Hamilton product in
-registers with no threadgroup staging and no barrier. (The older
-`iso_fused_qk_*` kernel phrases the same math through SMEM + a barrier; a
-barrier per token inside a flash inner loop would serialise the tile.)
+registers with no threadgroup staging and no barrier — a barrier per token
+inside a flash inner loop would serialise the tile.
 
 ### Fixed quaternion is baked into the header
 
@@ -3383,11 +3382,57 @@ or OFF cells.
 | 4k prompt × 100 decode | 96.648 TPS | 96.460 TPS | -0.19% | 1.764 | 0.278 |
 | 8k prompt × 100 decode (smoke) | 75.833 | 75.060 | -1.0% | n=1 | n=1 |
 
-The flash-decode kernel produces **byte-identical output** to the split chain
-with **6× lower stddev** at the 4k canary shape, but does not beat the split
-chain mean at this decode-token budget. The fused single-kernel save is
-balanced by the loss of the upstream MLX flash kernel's tuning. See
-`docs/PERF_BASELINE.md` for full data.
+The flash-decode kernel shows **6× lower stddev** at the 4k canary shape but
+does not beat the split-chain mean at this decode-token budget. The fused
+single-kernel save is balanced by the loss of the upstream MLX flash kernel's
+tuning. See `docs/PERF_BASELINE.md` for full data.
+
+### Numerical relationship to the split chain — measured, not bit-exact
+
+The kernel is **not** byte-identical to the split chain, in any cell measured.
+Both arms decode the same packed K, but the flash kernel folds the softmax
+into a per-tile online log-sum-exp reduction while the split chain materialises
+the whole score row and calls `softmax_precise`; the summation orders differ,
+so the results differ in the low mantissa bits.
+
+Measured by `planar_flash_decode_is_not_bit_exact_vs_split_chain`
+(`crates/rmlx-kv-quant/src/planar_flash_decode_msl_tests.rs`), running both
+arms over one packed store with bf16 V:
+
+| `kv_h` × `heads_per_kv` | `head_dim` | `kv_seq` | elements differing bitwise | max abs err |
+|---|---:|---:|---:|---:|
+| 8 × 4 | 128 | 64 | 3621 / 4096 | 8.94e-8 |
+| 8 × 4 | 128 | 512 | 3696 / 4096 | 2.98e-8 |
+| 8 × 4 | 128 | 4096 | 3890 / 4096 | 1.96e-8 |
+| 1 × 8 | 256 | 64 | 2048 / 2048 | 1.21e-4 |
+| 1 × 8 | 256 | 512 | 2048 / 2048 | 3.75e-5 |
+| 1 × 8 | 256 | 4096 | 2048 / 2048 | 1.40e-5 |
+
+Six of six cells diverge — this is not "byte-identical at the cells tested",
+it is byte-identical at none of them. The divergences stay far below a bf16
+ULP at the output magnitudes involved, so the kernel is a faithful
+implementation of the same attention; it is simply not lossless, and must not
+be described as such. The same claim shape was retracted for TurboFlash, where
+a sub-ULP difference flipped greedy argmax ties prompt-dependently at
+temperature 0.
+
+**The serve-path A/B cannot settle this.** `--planar-flash-decode on|off` on a
+normal generate flow compares two runs in which the kernel never dispatches at
+all: the warm-TTFT bf16-K seed is live for the whole post-prefill decode window
+and the PlanarK dispatcher bypasses both the fused-QK chain and the flash
+kernel (see "Correctness gap" below). Measured on Ternary-Bonsai-8B,
+`--kv-quant planar_k`, 4096-token prompt, 32 generated, 1 warmup + 2 measured
+runs, `--log verbose`:
+
+| Arm | `planar_flash_decode_sdpa: dispatch` | `planar_fused_qk: dispatch` | `warm_ttft_bypass` | token digest |
+|---|---:|---:|---:|---|
+| `--planar-flash-decode on` | 0 | 0 | 2418 | `0x8d52921f8217bb27` |
+| `--planar-flash-decode off` | 0 | 0 | 2418 | `0x8d52921f8217bb27` |
+
+The digests match because both arms took the same branch. An A/B in which
+neither arm dispatches the kernel under test confirms any equivalence put to
+it; count the per-dispatch `trace!` events before drawing a conclusion from
+one.
 
 ### Correctness gap — RESOLVED (warm-TTFT bf16-K shortcut)
 
@@ -3450,54 +3495,90 @@ benches.
 
 ## Fused-QK head-major K storage
 
-The q8 / TurboSym3 / TurboSym4 fused-QK MSL kernels are reachable from the
-production decode path. These kernels were GPU-parity-correct but initially
-unreachable at decode time because the per-codec K storage was either
-CPU-only (`QuantKTurbo3`) or chunk-major (`QuantK` / `K8V*`), neither of
-which matches the kernels' head-major flat-buffer contract. Iso
-(`Iso3/4Sym`, `IsoKOnly3/4`) and rotor (`Rotor3/4Sym`, `RotorKOnly3/4`)
-shims need a *segregated* combined buffer plus, for rotor, a per-(layer, head)
-rotor table — neither expressible in a per-token shadow row. They are HOLD
-pending a shadow split into `{per_token, sideband_table}`.
+The fused-QK MSL kernels compute pre-softmax `QK` straight off a head-major
+packed K shadow, skipping the K dequant round-trip. They are reached from the
+production decode path by q8 (`K8V4` / `K8V8`), `TurboSym3`, `TurboSym4`, and
+the two rotor-asym codecs (`RotorK3Asym` / `RotorK4Asym`).
 
-### Storage shape — q8 / turbo3 / turbo4
+### Which codecs can reach this path, and why the rest cannot
 
-Added on `KvCache` as `fused_qk_shadow: Option<FusedQkShadow>`. Two
-flat GPU arrays:
+The shadow is built by **re-encoding the bf16 K mirror** (`decode_fp16_k`)
+that `exit_prefill` materialises. `exit_prefill` only materialises that mirror
+for codecs whose `KvQuant::feeds_bf16_k_at_decode()` is true. Eight codecs
+return false there — `Iso3Sym`, `Iso4Sym`, `IsoKOnly3`, `IsoKOnly4`,
+`Rotor3Sym`, `Rotor4Sym`, `RotorKOnly3`, `RotorKOnly4` — because each decodes
+through its own flash-decode-over-quant kernel reading the packed ring
+directly, which is the point of not keeping a second bf16 copy of K.
+
+So those eight can **never** reach the fused-QK path: not at any `head_dim`,
+not at any batch size, not on any architecture. It is a codec property, not an
+arm-ordering accident. They were listed in the dispatch table anyway until the
+tables were pruned to the reachable set; the iso fused-QK kernel, whose only
+possible callers were four of those eight, was retired with them.
+
+Decode routing for the rotation-KV families, at `b = 1`:
+
+| Codec | Decode kernel | Where |
+|---|---|---|
+| `Iso3Sym` / `Iso4Sym` | `iso_flash_decode_symv` | `update_and_sdpa` iso-sym arm |
+| `IsoKOnly3` / `IsoKOnly4` | `iso_flash_decode` | `update_and_sdpa` iso-K-only arm |
+| `Rotor3Sym` / `Rotor4Sym` | `rotor_flash_decode_symv` | `update_and_sdpa` rotor-sym arm |
+| `RotorKOnly3` / `RotorKOnly4` | `rotor_flash_decode` | `update_and_sdpa` rotor-K-only arm |
+| `RotorK3Asym` / `RotorK4Asym` | `rotor_fused_qk` | fused-QK shadow path — **no flash arm exists**, so this is its only GPU decode kernel |
+
+The rotor-asym pair therefore depends on `--fused-qk on`. With the shipped
+default (`auto`, which resolves OFF) their decode serves from the warm bf16
+mirror instead — correct output, no rotor kernel. Pinned by
+`crates/rmlx-kv-quant/tests/rotor_fused_qk_dispatch.rs`, which asserts for
+each rotor codec both that the expected kernel fired and that the other two
+did not.
+
+### `head_dim` reachability
+
+The kernel shims are hard-gated on `head_dim ∈ {128, 256}`. That excludes
+**every Gemma4 model**: Gemma4 quantises only its full-attention (global)
+layers, and those use `global_head_dim = 512`. A Gemma4 run with a fused-QK
+codec logs `fused_qk: skipped` with `reason = "head_dim not in {128, 256}"`
+and `head_dim = 512` under `--log verbose`. The rotor/iso flash-decode
+kernels accept up to 512, so Gemma4 does reach those.
+
+### Storage shape
+
+Added on `KvCache` as `fused_qk_shadow: Option<FusedQkShadow>`:
 
 | Buffer | Shape | Per-token payload |
 |---|---|---|
 | `k_codes` | `u32 [B, kv_h, max_seq, codes_per_token]` | codec-specific packed codes |
-| `k_combined_scales` | `f32 [B, kv_h, max_seq, combined_per_token]` | per-group f32 scales (no sidebands) |
+| `k_scales` | `f32 [B, kv_h, max_seq, scales_per_token]` | per-group f32 scales |
+| `sideband_norms` | `f32 [B, kv_h, max_seq, 1]` | per-token L2 norm (rotor only) |
+| `sideband_rotor_table` | `f32 [n_groups * 4]` | static per-layer rotor table (rotor only) |
 
 The per-codec layout is computed by
 `FusedQkLayout::for_codec(KvQuant, head_dim) -> Result<Option<Self>>` in
-`crates/rmlx-kv-quant/src/kvcache/fused_qk_shadow.rs`. Wired codec
-entries:
+`crates/rmlx-kv-quant/src/kvcache/fused_qk_shadow.rs`:
 
-| `KvQuant` | `codes_per_token` (u32) | `combined_per_token` (f32) | sidebands |
+| `KvQuant` | `codes_per_token` (u32) | `scales_per_token` (f32) | sidebands |
 |---|---|---|---|
 | K8V4, K8V8 | `head_dim/4` | `head_dim/128` | — |
 | TurboSym3 | `head_dim*3/32` | `head_dim/32` | — |
 | TurboSym4 | `head_dim/8` | `head_dim/32` | — |
-| Iso3Sym/IsoKOnly3, Iso4Sym/IsoKOnly4 | — | — | **HOLD** — `for_codec` returns `Ok(None)`; shadow split needed |
-| Rotor3Sym/RotorKOnly3, Rotor4Sym/RotorKOnly4 | — | — | **HOLD** — same; plus rotor table cannot be per-token |
+| RotorK3Asym, RotorK4Asym | `ceil(head_dim/3)` | `ceil(head_dim/3)` | per-token norm + rotor table |
+| any codec with no bf16 K mirror | — | — | `for_codec` returns `Ok(None)` — unreachable, see above |
 
-The q8 / turbo3 / turbo4 kernel shims read the codes / scales buffers
-as flat 1-D inputs of length `tok_count * payload_per_token` where
-`tok_count = B * kv_h * kv_seq`. The shadow is sliced
-`[B, kv_h, max_seq, payload] → [B, kv_h, kv_seq, payload]` and
-flattened on every dispatch — the dim-2 slice is non-contiguous, so
-the flatten forces a per-step materialisation (see KV_CACHE.md §9.5
-"Per-step cost framing").
+The kernel shims read the codes / scales buffers as flat 1-D inputs of length
+`tok_count * payload_per_token` where `tok_count = B * kv_h * kv_seq`. The
+shadow is sliced `[B, kv_h, max_seq, payload] → [B, kv_h, kv_seq, payload]`
+and flattened on every dispatch — the dim-2 slice is non-contiguous, so the
+flatten forces a per-step materialisation (see KV_CACHE.md §9.5 "Per-step cost
+framing").
 
 ### Dispatch wire-in
 
 `KvCache::try_fused_qk_dispatch` in
-`crates/rmlx-kv-quant/src/kvcache/fused_qk_dispatch.rs:113` is called
-from `update_and_sdpa` (`crates/rmlx-kv-quant/src/kvcache/sdpa.rs:631`)
-right after the K8V4-TurboFlash branch and before the legacy bf16 SDPA
-fallback. Gates (in order):
+`crates/rmlx-kv-quant/src/kvcache/fused_qk_dispatch.rs` is called from
+`update_and_sdpa` right after the K8V4-TurboFlash branch and before the legacy
+bf16 SDPA fallback, and from `try_dispatch_shared_bf16` on the cross-layer-KV
+producer path. Gates (in order):
 
 1. `RMLX_FUSED_QK=1` (CLI flag `--fused-qk on|off|auto`,
    `rmlx_kv_quant::fused_qk_enabled()`).
@@ -3509,35 +3590,47 @@ fallback. Gates (in order):
 6. Codec is in the in-crate `lookup_fused_qk_kernel` table (mirrors the
    public `rmlx_models::kv_cache::attention_dispatch::FUSED_QK_TABLE`).
 7. The codec has a GPU encoder wired in (`codec_has_gpu_encoder`).
-8. `decode_fp16_k` is seeded (post-prefill).
+8. Rotor only: `--rotor-qjl` is off (the kernel does not reproduce the 1-bit
+   K-side residual).
+9. `decode_fp16_k` is seeded.
 
-The shadow is allocated lazily on the first dispatch (seeded by
-quantising the prefill bf16 prefix in `decode_fp16_k`) then appended
-head-major every subsequent decode step via 4-D `slice_update` at
-`[:, :, prev_offset:prev_offset+new_seq, :]`. Bf16 `decode_fp16_k/v`
-stay maintained as the fallback path.
+Every fall-through emits `fused_qk: skipped` at `trace!` with a `reason`
+field naming the gate, so `--log verbose` distinguishes "gate rejected" from
+"codec has no kernel" without reading the dispatcher. The `head_dim` gate also
+logs the observed value.
+
+The shadow is allocated lazily on the first dispatch (seeded by quantising the
+prefill bf16 prefix in `decode_fp16_k`) then appended head-major every
+subsequent decode step via 4-D `slice_update` at
+`[:, :, prev_offset:prev_offset+new_seq, :]`. Bf16 `decode_fp16_k/v` stay
+maintained as the fallback path.
 
 ### Codec coverage
 
 | Codec family | GPU encoder | Status |
 |---|---|---|
-| q8 (K8V4, K8V8) | `q8_quantize_gpu` | **Wired** — cosine ≥ 0.999 vs bf16; dispatch delta proven |
-| TurboSym3 | `turbo_quantize_v3_gpu` (axis-agnostic) | **Wired** — cosine ≥ 0.998 vs bf16 |
-| TurboSym4 | `turbo_quantize_v4_gpu` (axis-agnostic) | **Wired** — cosine ≥ 0.999 vs bf16 |
-| Iso3Sym / IsoKOnly3 / Iso4Sym / IsoKOnly4 | iso V-side GPU encoder exists; K-side blocked on shadow split | **HOLD** — `for_codec` returns `Ok(None)`; per-token shadow can't host segregated `[scales \| norms]` combined buffer |
-| Rotor3Sym / RotorKOnly3 / Rotor4Sym / RotorKOnly4 | rotor K GPU encoder MISSING; also blocked on shadow split | **HOLD** — per-(layer,head) rotor table is not per-token |
+| q8 (K8V4, K8V8) | `q8_quantize_gpu` | Wired — cosine ≥ 0.999 vs bf16; dispatch delta proven |
+| TurboSym3 | `turbo_quantize_v3_gpu` (axis-agnostic) | Wired — cosine ≥ 0.998 vs bf16 |
+| TurboSym4 | `turbo_quantize_v4_gpu` (axis-agnostic) | Wired — cosine ≥ 0.999 vs bf16 |
+| RotorK3Asym / RotorK4Asym | `rotor_quantize_v3_gpu` / `rotor_quantize_v4_gpu` | Wired — sole GPU decode path for these codecs |
 
-### Dispatch counter
+### Dispatch counter and trace
 
-Aggregated across all 5 kernel families by
-`rmlx_kv_quant::kvcache::fused_qk_total_dispatch_count()`. NIAH / parity
-tests use `delta = after - before > 0` to prove the kernel actually
-fired through the production path.
+`rmlx_kv_quant::kvcache::fused_qk_total_dispatch_count()` aggregates the
+per-family counters; in-process tests use `delta = after - before > 0`. That
+counter has no caller outside tests and is unreachable from a shipped binary —
+from a real run, count the per-dispatch `trace!` events instead
+(`q8_fused_qk_sdpa: dispatch`, `turbo_k{3,4}_fused_qk_sdpa: dispatch`,
+`rotor_fused_qk_sdpa: dispatch`) in the run's `<RMLX_HOME>/logs/*.jsonl`
+under `--log verbose`.
 
 ### See also
 
 * `crates/rmlx-kv-quant/tests/fused_qk_dispatch.rs` — GPU integration
   tests for q8 + TurboSym3 + TurboSym4.
+* `crates/rmlx-kv-quant/tests/rotor_fused_qk_dispatch.rs` — the rotor
+  routing contract (which kernel each rotor codec reaches, and which it
+  must not).
 
 ---
 

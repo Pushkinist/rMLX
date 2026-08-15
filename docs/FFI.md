@@ -1058,7 +1058,8 @@ supplies the function signature and buffer declarations at dispatch. The
 
 **Parameterised bodies.** Where a body varies by a codec parameter, each
 variant gets its own `.metal` file and the builder selects between them
-(`iso_fused_qk_b3.metal` / `_b4.metal`; `rot_k_fwht_quantize_d{32..512}.metal`).
+(`planar_fused_qk_b3.metal` / `_b4.metal`;
+`rot_k_fwht_quantize_d{32..512}.metal`).
 The body text stays literal — parameters are not templated back into it at
 runtime.
 

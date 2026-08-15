@@ -70,43 +70,31 @@ fn fused_qk_layout_turbo_sym4_head_dim_128() {
 }
 
 #[test]
-fn fused_qk_layout_iso_codecs_head_dim_128() {
-    // All four iso variants share one K-side layout: one u32 word and one f32
-    // scale per quaternion block (head_dim / 4 = 32 at D=128), plus the
-    // per-token L2 norm sideband. No rotor table — iso's rotation is a single
-    // fixed quaternion baked into the kernel header, so `n_groups` (which sizes
-    // that table) stays 0.
+fn fused_qk_layout_absent_for_codecs_that_keep_no_bf16_k() {
+    // The shadow is seeded by re-encoding `decode_fp16_k`. These eight codecs
+    // keep no bf16 K at decode (each runs its own flash-decode kernel over the
+    // packed ring), so `exit_prefill` never materialises that seed and the
+    // fused-QK path can never serve them. A layout for them would describe a
+    // buffer nothing allocates.
     for codec in [
         KvQuant::Iso3Sym,
         KvQuant::IsoKOnly3,
         KvQuant::Iso4Sym,
         KvQuant::IsoKOnly4,
+        KvQuant::Rotor3Sym,
+        KvQuant::Rotor4Sym,
+        KvQuant::RotorKOnly3,
+        KvQuant::RotorKOnly4,
     ] {
-        let l = FusedQkLayout::for_codec(codec, 128)
-            .expect("layout result")
-            .unwrap_or_else(|| panic!("{codec:?} has a fused-QK entry"));
-        assert_eq!(l.codes_per_token, 32, "{codec:?}: codes = head_dim / 4");
-        assert_eq!(l.scales_per_token, 32, "{codec:?}: scales = head_dim / 4");
-        assert!(l.has_norm, "{codec:?}: iso carries a per-token L2 norm");
         assert!(
-            !l.has_rotor_table,
-            "{codec:?}: iso has no rotor table — its quaternion is fixed"
+            !codec.feeds_bf16_k_at_decode(),
+            "{codec:?}: this test's premise is that the codec keeps no bf16 K"
         );
-        assert_eq!(
-            l.n_groups, 0,
-            "{codec:?}: n_groups sizes the rotor table only"
-        );
-    }
-}
-
-#[test]
-fn fused_qk_layout_iso_rejects_head_dim_off_the_quaternion_block() {
-    // A head_dim that is not a multiple of 4 would drop a partial trailing
-    // quaternion block. That must error rather than silently round down.
-    for codec in [KvQuant::Iso3Sym, KvQuant::IsoKOnly4] {
         assert!(
-            FusedQkLayout::for_codec(codec, 130).is_err(),
-            "{codec:?}: head_dim=130 is not a whole number of quaternion blocks"
+            FusedQkLayout::for_codec(codec, 128)
+                .expect("layout result")
+                .is_none(),
+            "{codec:?}: must have no fused-QK layout — it can never reach that path"
         );
     }
 }
@@ -237,52 +225,6 @@ fn fused_qk_encoder_coverage_matches_the_kernel_table() {
 }
 
 #[test]
-fn fused_qk_layout_rotor3_sym_head_dim_128() {
-    // Rotor3 variants produce a layout with norms + rotor table.
-    let l = FusedQkLayout::for_codec(KvQuant::Rotor3Sym, 128)
-        .expect("layout result")
-        .expect("rotor3 has fused-QK entry");
-    // n_groups = ceil(128/3) = 43.
-    assert_eq!(l.codes_per_token, 43);
-    assert_eq!(l.scales_per_token, 43);
-    assert_eq!(l.n_groups, 43);
-    assert!(l.has_norm, "rotor has per-token norm sideband");
-    assert!(l.has_rotor_table, "rotor has static rotor table sideband");
-}
-
-#[test]
-fn fused_qk_layout_rotor4_sym_head_dim_128() {
-    let l = FusedQkLayout::for_codec(KvQuant::Rotor4Sym, 128)
-        .expect("layout result")
-        .expect("rotor4 has fused-QK entry");
-    assert_eq!(l.codes_per_token, 43);
-    assert_eq!(l.scales_per_token, 43);
-    assert_eq!(l.n_groups, 43);
-    assert!(l.has_norm);
-    assert!(l.has_rotor_table);
-}
-
-#[test]
-fn fused_qk_layout_rotor_k_only_3() {
-    let l = FusedQkLayout::for_codec(KvQuant::RotorKOnly3, 128)
-        .expect("layout result")
-        .expect("rotor_k_only_3 has fused-QK entry");
-    assert_eq!(l.codes_per_token, 43);
-    assert!(l.has_norm);
-    assert!(l.has_rotor_table);
-}
-
-#[test]
-fn fused_qk_layout_rotor_k_only_4() {
-    let l = FusedQkLayout::for_codec(KvQuant::RotorKOnly4, 128)
-        .expect("layout result")
-        .expect("rotor_k_only_4 has fused-QK entry");
-    assert_eq!(l.codes_per_token, 43);
-    assert!(l.has_norm);
-    assert!(l.has_rotor_table);
-}
-
-#[test]
 fn fused_qk_layout_rotor_k_asym_3() {
     let l = FusedQkLayout::for_codec(
         KvQuant::RotorK3Asym {
@@ -312,6 +254,29 @@ fn fused_qk_layout_rotor_k_asym_4() {
     assert_eq!(l.codes_per_token, 43);
     assert!(l.has_norm);
     assert!(l.has_rotor_table);
+}
+
+#[test]
+fn fused_qk_table_matches_the_bf16_k_mirror_contract() {
+    // `try_fused_qk_dispatch` seeds the head-major shadow by re-encoding
+    // `decode_fp16_k`, and `exit_prefill` only materialises that seed when
+    // `feeds_bf16_k_at_decode()` is true. A codec listed here without the
+    // mirror is unreachable at every shape on every arch — the state this
+    // table was in for `Iso{3,4}Sym`, `IsoKOnly{3,4}`, `Rotor{3,4}Sym` and
+    // `RotorKOnly{3,4}`, all of which decode through their own
+    // flash-decode-over-quant kernel instead.
+    //
+    // Asserted one-directionally: the mirror is necessary, not sufficient
+    // (plenty of codecs keep a bf16 K and have no fused-QK kernel at all).
+    for &codec in ALL_KV_QUANTS {
+        if lookup_fused_qk_kernel(codec).is_some() {
+            assert!(
+                codec.feeds_bf16_k_at_decode(),
+                "{codec:?}: mapped to a fused-QK kernel but keeps no bf16 K mirror, so the \
+                 shadow can never be seeded — the entry is unreachable"
+            );
+        }
+    }
 }
 
 #[test]

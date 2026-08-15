@@ -380,6 +380,19 @@ pub fn planar_fused_qk(
 
     let kernel = qk_kernel(bits)?;
     PLANAR_FUSED_QK_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+    // Per-dispatch trace, matching every sibling KV kernel. The in-process
+    // counter above has no caller outside tests, so this event is the only
+    // way a shipped binary can answer "did this kernel run".
+    tracing::trace!(
+        bits,
+        b,
+        n_q_heads,
+        kv_h,
+        kv_seq,
+        head_dim,
+        heads_per_kv,
+        "planar_fused_qk: dispatch"
+    );
     let mut invoke = MetalKernelInvoke::new();
     invoke.add_input(&q_f32)?;
     invoke.add_input(&codes_flat)?;

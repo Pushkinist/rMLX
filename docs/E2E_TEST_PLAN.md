@@ -274,7 +274,7 @@ specialised kernels. That dimension is therefore covered by the **in-crate
 dispatch-counter tests**, not E2E:
 
 - `crates/rmlx-models/tests/sparse_attn_dispatch.rs` (`RMLX_SPARSE_ATTN_STRICT=1`)
-- `crates/rmlx-kv-quant/src/iso_fused_qk_msl_tests.rs` (`*_dispatch_count_increments`)
+- `crates/rmlx-kv-quant/tests/rotor_fused_qk_dispatch.rs` (rotor decode routing contract)
 
 The E2E `dispatch_fired` row asserts the one thing that **is** externally
 observable: the attention-dispatch instrumentation fires (`update_and_sdpa`

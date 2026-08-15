@@ -68,87 +68,108 @@ fn make_dummy_sparse_inputs<'a>(
 
 // ── Table completeness ────────────────────────────────────────────────────────
 
-/// The table must contain exactly 8 entries (7 KvQuant pairs + Rotor4Sym
-/// which brings the total to 8 for the two rotor variants).
-///
-/// Spec: 7 (codec, KvQuant) pairs total; Rotor3Sym and Rotor4Sym are listed
-/// separately making 8 entries in the table.
+/// The table lists exactly the codecs that can reach the fused-QK path.
 #[test]
-fn fused_qk_table_has_eight_entries() {
+fn fused_qk_table_lists_only_reachable_codecs() {
     assert_eq!(
         FUSED_QK_TABLE.len(),
-        8,
-        "FUSED_QK_TABLE must have 8 entries (K8V4, K8V8, TurboSym3, TurboSym4, \
-         Iso3Sym, Iso4Sym, Rotor3Sym, Rotor4Sym)"
+        6,
+        "FUSED_QK_TABLE must have 6 entries (K8V4, K8V8, TurboSym3, TurboSym4, \
+         RotorK3Asym, RotorK4Asym)"
     );
 }
 
-/// All 8 entries expose real fused-QK kernels.
+/// Every entry has a kernel, and every entry's codec keeps the bf16 K mirror
+/// the fused-QK shadow is seeded from.
+///
+/// The mirror check is the load-bearing half: a codec with no bf16 K can never
+/// reach this path at any shape on any arch, so listing one would be listing a
+/// kernel nothing dispatches. That was the table's state for the iso and rotor
+/// `*Sym` / `*KOnly` codecs, each of which decodes through its own
+/// flash-decode-over-quant kernel instead.
 #[test]
-fn fused_qk_table_pending_kernels_match_executors() {
+fn fused_qk_table_entries_are_dispatchable() {
     for entry in FUSED_QK_TABLE {
-        let landed = matches!(
-            entry.kv_quant,
-            KvQuant::K8V4
-                | KvQuant::K8V8
-                | KvQuant::TurboSym3
-                | KvQuant::TurboSym4
-                | KvQuant::Iso3Sym
-                | KvQuant::Iso4Sym
-                | KvQuant::Rotor3Sym
-                | KvQuant::Rotor4Sym
+        assert!(
+            entry.kernel.is_some(),
+            "entry for {:?} must have kernel=Some",
+            entry.kv_quant
         );
         assert!(
-            landed && entry.kernel.is_some(),
-            "entry for {:?} must have kernel=Some",
+            entry.kv_quant.feeds_bf16_k_at_decode(),
+            "entry for {:?} keeps no bf16 K mirror, so the fused-QK shadow can never be \
+             seeded for it — the entry is unreachable",
             entry.kv_quant
         );
     }
 }
 
-/// lookup_fused_qk returns Some for all 8 spec-mandated KvQuant targets.
-///
-/// The in-crate mirror in
-/// `rmlx_kv_quant::kvcache::fused_qk_dispatch::lookup_fused_qk_kernel` is a
-/// SUPERSET of this public table: it additionally maps the four `*KOnly*`
-/// variants (`IsoKOnly3`, `IsoKOnly4`, `RotorKOnly3`, `RotorKOnly4`) to the
-/// same kernels as their `*Sym` counterparts, because the K-side decode is
-/// identical (only V-side codec differs, and V-side is the SDPA caller's
-/// responsibility — see attention_dispatch.rs:186-188 for the rationale).
-/// The public table stays at the 8 `*Sym` entries because that is the
-/// canonical key the model-side dispatch consumes; this test asserts that
-/// the 8 entries are all populated and the `*KOnly*` variants are
-/// intentionally absent from the public surface.
+/// `lookup_fused_qk` resolves every codec that has a fused-QK kernel, and
+/// refuses the ones that keep no bf16 K mirror.
 #[test]
-fn lookup_fused_qk_pending_kernels_match_executors() {
+fn lookup_fused_qk_resolves_the_reachable_codecs() {
     for kq in [
         KvQuant::K8V4,
         KvQuant::K8V8,
         KvQuant::TurboSym3,
         KvQuant::TurboSym4,
-        KvQuant::Iso3Sym,
-        KvQuant::Iso4Sym,
-        KvQuant::Rotor3Sym,
-        KvQuant::Rotor4Sym,
+        KvQuant::RotorK3Asym {
+            v_bits: 4,
+            v_group_size: 64,
+        },
+        KvQuant::RotorK4Asym {
+            v_bits: 4,
+            v_group_size: 64,
+        },
     ] {
         assert!(
             lookup_fused_qk(kq).is_some(),
             "lookup_fused_qk({kq:?}) must return Some"
         );
     }
-    // The `*KOnly*` variants are deliberately ABSENT from the public table
-    // (the codec-layer mirror covers them; this surface stays canonical
-    // on `*Sym`).
+    // These decode through their own flash-decode-over-quant kernel and keep
+    // no bf16 K, so the fused-QK shadow can never be seeded for them.
     for kq in [
+        KvQuant::Iso3Sym,
+        KvQuant::Iso4Sym,
         KvQuant::IsoKOnly3,
         KvQuant::IsoKOnly4,
+        KvQuant::Rotor3Sym,
+        KvQuant::Rotor4Sym,
         KvQuant::RotorKOnly3,
         KvQuant::RotorKOnly4,
     ] {
         assert!(
             lookup_fused_qk(kq).is_none(),
-            "lookup_fused_qk({kq:?}) must return None on the PUBLIC table \
-             (the in-crate codec mirror is a superset; the public surface stays canonical on *Sym)"
+            "lookup_fused_qk({kq:?}) must return None — the codec keeps no bf16 K mirror"
+        );
+    }
+}
+
+/// The rotor-asym entries are matched by variant, not by V-side payload.
+///
+/// The table spells one `(v_bits, v_group_size)` pair per rotor-asym entry.
+/// The V codec never reaches a K-side kernel, so every other V configuration
+/// must resolve to the same kernel; a `PartialEq` lookup would silently return
+/// `None` for all of them.
+#[test]
+fn lookup_fused_qk_ignores_the_rotor_asym_v_payload() {
+    for (v_bits, v_group_size) in [(2_u8, 64_u16), (3, 64), (4, 32), (4, 128)] {
+        assert!(
+            lookup_fused_qk(KvQuant::RotorK3Asym {
+                v_bits,
+                v_group_size
+            })
+            .is_some(),
+            "RotorK3Asym(v_bits={v_bits}, v_group_size={v_group_size}) must resolve"
+        );
+        assert!(
+            lookup_fused_qk(KvQuant::RotorK4Asym {
+                v_bits,
+                v_group_size
+            })
+            .is_some(),
+            "RotorK4Asym(v_bits={v_bits}, v_group_size={v_group_size}) must resolve"
         );
     }
 }
@@ -231,7 +252,7 @@ fn lookup_fused_qk_returns_none_for_non_table_variants() {
 
 // ── Table entry correctness ───────────────────────────────────────────────────
 
-/// The table contains entries for all 7 spec-mandated KvQuant targets.
+/// The table contains an entry for every codec with a fused-QK kernel.
 #[test]
 fn fused_qk_table_contains_all_spec_entries() {
     let required = [
@@ -239,13 +260,20 @@ fn fused_qk_table_contains_all_spec_entries() {
         KvQuant::K8V8,
         KvQuant::TurboSym3,
         KvQuant::TurboSym4,
-        KvQuant::Iso3Sym,
-        KvQuant::Iso4Sym,
-        KvQuant::Rotor3Sym,
-        KvQuant::Rotor4Sym,
+        KvQuant::RotorK3Asym {
+            v_bits: 4,
+            v_group_size: 64,
+        },
+        KvQuant::RotorK4Asym {
+            v_bits: 4,
+            v_group_size: 64,
+        },
     ];
     for kq in required {
-        let found = FUSED_QK_TABLE.iter().any(|e| e.kv_quant == kq);
+        let want = std::mem::discriminant(&kq);
+        let found = FUSED_QK_TABLE
+            .iter()
+            .any(|e| std::mem::discriminant(&e.kv_quant) == want);
         assert!(found, "FUSED_QK_TABLE must contain an entry for {kq:?}");
     }
 }

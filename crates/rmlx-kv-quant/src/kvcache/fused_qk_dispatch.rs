@@ -1,14 +1,16 @@
 // Production fused-QK dispatch using the head-major persistent K shadow.
 //
-// Enables the 6 rotor variants (Rotor3Sym, Rotor4Sym, RotorKOnly3,
-// RotorKOnly4, RotorKAsym{3,4}) and the 4 iso variants (Iso3Sym, Iso4Sym,
-// IsoKOnly3, IsoKOnly4) on the fused-QK fast path via the per-token +
-// sideband-table array split. Iso carries the per-token norm sideband but no
-// rotor table — its rotation is one fixed quaternion baked into the kernel
-// header.
+// Serves the codecs that keep a bf16 K mirror at decode and have a fused-QK
+// MSL kernel: q8 (`K8V4` / `K8V8`), `TurboSym3`, `TurboSym4`, and the two
+// rotor-asym variants (`RotorK{3,4}Asym`) via the per-token + sideband-table
+// array split. Rotor carries both a per-token norm and a static rotor table.
 //
-// Wires the fused-QK MSL kernel families (q8 = K8V*, TurboSym3, TurboSym4,
-// Rotor3Sym, Rotor4Sym, …) into the production decode path.
+// Codecs that decode straight off their packed ring — `Iso{3,4}Sym`,
+// `IsoKOnly{3,4}`, `Rotor{3,4}Sym`, `RotorKOnly{3,4}` — keep no bf16 K, so
+// this path cannot seed a shadow for them and does not list them. Each has a
+// dedicated flash-decode-over-quant kernel reached earlier in
+// `update_and_sdpa`; the rotor-asym pair is the one rotor codec with no such
+// arm, which is why this is its only GPU decode path.
 //
 // The kernel shims share a uniform `FusedQkFn` 13-arg signature; sidebands
 // are passed as separate `Option<&Array>` args (pre-fix the dispatch site
@@ -41,7 +43,6 @@ use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{matmul, softmax_precise, Array, Device, Dtype};
 
 use crate::fused_qk_enabled;
-use crate::iso_fused_qk_msl::{iso3_fused_qk_sdpa, iso4_fused_qk_sdpa};
 use crate::k8vturbo3_append_msl::turbo_quantize_v3_gpu;
 use crate::kvcache::fused_qk_shadow::FusedQkShadow;
 use crate::kvcache::KvCache;
@@ -50,7 +51,6 @@ use crate::q8_msl::q8_quantize_gpu;
 use crate::rotor_fused_qk_msl::{rotor3_fused_qk_sdpa, rotor4_fused_qk_sdpa};
 use crate::rotorquant::{n_groups_for, ROTOR3_BITS, ROTOR4_BITS};
 use crate::rotorquant_msl::{rotor_quantize_v3_gpu, rotor_quantize_v4_gpu, rotor_table_to_array};
-use crate::storage::{iso_n_groups_for, ISO_K3_BITS, ISO_K4_BITS, ISO_QUAT_BLOCK_SIZE};
 use crate::turbo_k3_fused_qk_msl::turbo_k3_fused_qk_sdpa;
 use crate::turbo_k4_fused_qk_msl::turbo_k4_fused_qk_sdpa;
 use crate::turboquant_msl::turbo_quantize_v4_gpu;
@@ -99,20 +99,30 @@ type FusedQkFn = fn(
     /* device        */ Device,
 ) -> Result<Array>;
 
-/// In-crate mirror of `FUSED_QK_TABLE`. The public table in
-/// `rmlx-models::kv_cache::attention_dispatch::FUSED_QK_TABLE` lists the
-/// 8 `*Sym` entries (K8V4, K8V8, TurboSym3, TurboSym4, Iso3Sym, Iso4Sym,
-/// Rotor3Sym, Rotor4Sym). This in-crate mirror is a **superset**: it
-/// additionally maps the `*KOnly*` and rotor-asym codecs to the same
-/// kernels as their `*Sym` counterparts because the K-side decode is
-/// identical (only the V-side codec differs and the V-side is the SDPA
-/// caller's responsibility, not the fused-QK kernel's — see
-/// `attention_dispatch.rs:186-188`).
+/// Codec → fused-QK kernel map, in-crate mirror of
+/// `rmlx-models::kv_cache::attention_dispatch::FUSED_QK_TABLE`.
+///
+/// # Reachability
+///
+/// The shadow this path drives is built by re-encoding the bf16 K mirror
+/// (`decode_fp16_k`), so a codec can only get here when it keeps that
+/// mirror — [`KvQuant::feeds_bf16_k_at_decode`]. That is not a property of
+/// the kernel but of the codec: `Iso{3,4}Sym`, `IsoKOnly{3,4}`,
+/// `Rotor{3,4}Sym` and `RotorKOnly{3,4}` deliberately keep **no** bf16 K,
+/// because each decodes through its own flash-decode-over-quant kernel
+/// straight off the packed ring. `exit_prefill` never materialises a K seed
+/// for them, so listing them here would be listing codecs this path can
+/// never serve at any shape, on any arch.
+///
+/// The table is therefore exactly the codecs that both have a kernel and
+/// feed a bf16 K: q8 (`K8V4` / `K8V8`), `TurboSym3`, `TurboSym4`, and the
+/// two rotor-asym variants. The rotor-asym pair is the only rotor codec
+/// with no flash-decode arm, which makes this its sole GPU decode path.
+/// `fused_qk_table_matches_the_bf16_k_mirror_contract` pins the
+/// biconditional.
 const Q8_FN: FusedQkFn = q8_fused_qk_sdpa;
 const TURBO_K3_FN: FusedQkFn = turbo_k3_fused_qk_sdpa;
 const TURBO_K4_FN: FusedQkFn = turbo_k4_fused_qk_sdpa;
-const ISO3_FN: FusedQkFn = iso3_fused_qk_sdpa;
-const ISO4_FN: FusedQkFn = iso4_fused_qk_sdpa;
 const ROTOR3_FN: FusedQkFn = rotor3_fused_qk_sdpa;
 const ROTOR4_FN: FusedQkFn = rotor4_fused_qk_sdpa;
 
@@ -121,10 +131,8 @@ fn lookup_fused_qk_kernel(q: KvQuant) -> Option<FusedQkFn> {
         KvQuant::K8V4 | KvQuant::K8V8 => Some(Q8_FN),
         KvQuant::TurboSym3 => Some(TURBO_K3_FN),
         KvQuant::TurboSym4 => Some(TURBO_K4_FN),
-        KvQuant::Iso3Sym | KvQuant::IsoKOnly3 => Some(ISO3_FN),
-        KvQuant::Iso4Sym | KvQuant::IsoKOnly4 => Some(ISO4_FN),
-        KvQuant::Rotor3Sym | KvQuant::RotorKOnly3 | KvQuant::RotorK3Asym { .. } => Some(ROTOR3_FN),
-        KvQuant::Rotor4Sym | KvQuant::RotorKOnly4 | KvQuant::RotorK4Asym { .. } => Some(ROTOR4_FN),
+        KvQuant::RotorK3Asym { .. } => Some(ROTOR3_FN),
+        KvQuant::RotorK4Asym { .. } => Some(ROTOR4_FN),
         _ => None,
     }
 }
@@ -136,8 +144,6 @@ pub fn fused_qk_total_dispatch_count() -> u64 {
     crate::q8_fused_qk_msl::q8_fused_qk_dispatch_count()
         + crate::turbo_k3_fused_qk_msl::turbo_k3_fused_qk_dispatch_count()
         + crate::turbo_k4_fused_qk_msl::turbo_k4_fused_qk_dispatch_count()
-        + crate::iso_fused_qk_msl::iso3_fused_qk_dispatch_count()
-        + crate::iso_fused_qk_msl::iso4_fused_qk_dispatch_count()
         + crate::rotor_fused_qk_msl::rotor3_fused_qk_dispatch_count()
         + crate::rotor_fused_qk_msl::rotor4_fused_qk_dispatch_count()
 }
@@ -155,6 +161,12 @@ impl KvCache {
     /// threshold, codec has a GPU encoder available, and (for rotor
     /// codecs) the QJL toggle is OFF (the kernel does not consume the
     /// QJL residual — see `rotor_fused_qk_msl.rs`).
+    ///
+    /// Every fall-through emits a `trace!` naming the gate that rejected
+    /// (`fused_qk: skipped`, field `reason`). A silent `Ok(None)` is
+    /// indistinguishable from a codec that has no kernel at all, which
+    /// makes "the kernel never fires" unanswerable from a shipped binary;
+    /// the reason field is the answer.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn try_fused_qk_dispatch(
         &mut self,
@@ -177,25 +189,38 @@ impl KvCache {
             return Ok(None);
         }
         if new_k.shape().len() != 4 {
+            self.trace_fused_qk_skip("new_k rank != 4");
             return Ok(None);
         }
         let head_dim = new_k.shape()[3];
         // Kernel shims are hard-gated on head_dim ∈ {128, 256}.
         if head_dim != 128 && head_dim != 256 {
+            // Carries the observed `head_dim`: the whole point of this
+            // rejection is which value was seen, and a bare reason string
+            // sends the reader back to the model config to guess.
+            tracing::trace!(
+                codec = ?self.quant,
+                offset = self.offset,
+                head_dim,
+                reason = "head_dim not in {128, 256}",
+                "fused_qk: skipped"
+            );
             return Ok(None);
         }
         let new_seq = new_k.shape()[2];
         let kv_seq_after = self.offset + new_seq;
         if kv_seq_after < min_kv_seq() {
+            self.trace_fused_qk_skip("kv_seq below RMLX_FUSED_QK_MIN");
             return Ok(None);
         }
         let codec = self.quant;
-        let kernel = match lookup_fused_qk_kernel(codec) {
-            Some(k) => k,
-            None => return Ok(None),
+        let Some(kernel) = lookup_fused_qk_kernel(codec) else {
+            self.trace_fused_qk_skip("codec has no fused-QK kernel");
+            return Ok(None);
         };
         // GPU encoder coverage gate.
         if !codec_has_gpu_encoder(codec) {
+            self.trace_fused_qk_skip("codec has no GPU K encoder");
             return Ok(None);
         }
         // Rotor QJL fallback gate. When QJL is enabled the kernel
@@ -203,19 +228,17 @@ impl KvCache {
         // SDPA. This mirrors the K-side encode discipline
         // (`gpu_k_ok = use_gpu && !rotor_qjl_enabled()`).
         if codec_is_rotor(codec) && crate::rotor_qjl::rotor_qjl_enabled() {
-            tracing::trace!(
-                ?codec,
-                "fused_qk: rotor + QJL enabled → fall back to legacy bf16 SDPA"
-            );
+            self.trace_fused_qk_skip("rotor + QJL enabled");
             return Ok(None);
         }
         // The bf16 mirror is required to seed the shadow on first dispatch.
         if self.decode_fp16_k.is_none() {
+            self.trace_fused_qk_skip("no bf16 K mirror to seed the shadow");
             return Ok(None);
         }
-        let max_seq = match self.storage_max_seq_for_fused_qk() {
-            Some(m) => m,
-            None => return Ok(None),
+        let Some(max_seq) = self.storage_max_seq_for_fused_qk() else {
+            self.trace_fused_qk_skip("storage variant carries no max_seq");
+            return Ok(None);
         };
 
         let prev_offset = self.offset;
@@ -434,6 +457,21 @@ impl KvCache {
             shadow.filled = kv_seq;
         }
         Ok(Some(out))
+    }
+
+    /// Name the gate that sent a decode step past the fused-QK fast path.
+    ///
+    /// Emitted at `trace!` (so it is off unless `--log verbose`), once per
+    /// rejected layer-step. Without it a fall-through is invisible and
+    /// "the kernel does not dispatch" cannot be told apart from "the codec
+    /// has no kernel" or "the shape is out of range" in a shipped binary.
+    fn trace_fused_qk_skip(&self, reason: &'static str) {
+        tracing::trace!(
+            codec = ?self.quant,
+            offset = self.offset,
+            reason,
+            "fused_qk: skipped"
+        );
     }
 
     /// Return the rotor K-storage `head_idx` for the active storage variant,
@@ -711,14 +749,6 @@ fn codec_has_gpu_encoder(codec: KvQuant) -> bool {
             | KvQuant::K8V8
             | KvQuant::TurboSym3
             | KvQuant::TurboSym4
-            | KvQuant::Iso3Sym
-            | KvQuant::Iso4Sym
-            | KvQuant::IsoKOnly3
-            | KvQuant::IsoKOnly4
-            | KvQuant::Rotor3Sym
-            | KvQuant::Rotor4Sym
-            | KvQuant::RotorKOnly3
-            | KvQuant::RotorKOnly4
             | KvQuant::RotorK3Asym { .. }
             | KvQuant::RotorK4Asym { .. }
     )
@@ -854,106 +884,32 @@ fn encode_chunk_to_head_major(
                 norms: None,
             })
         }
-        KvQuant::Iso3Sym | KvQuant::IsoKOnly3 => {
-            encode_chunk_iso(k_f32, b, kv_h, n, d, layout, ISO_K3_BITS, device)
-        }
-        KvQuant::Iso4Sym | KvQuant::IsoKOnly4 => {
-            encode_chunk_iso(k_f32, b, kv_h, n, d, layout, ISO_K4_BITS, device)
-        }
-        KvQuant::Rotor3Sym | KvQuant::RotorKOnly3 | KvQuant::RotorK3Asym { .. } => {
-            encode_chunk_rotor(
-                k_f32,
-                rotor_table,
-                b,
-                kv_h,
-                n,
-                d,
-                layout,
-                ROTOR3_BITS,
-                device,
-            )
-        }
-        KvQuant::Rotor4Sym | KvQuant::RotorKOnly4 | KvQuant::RotorK4Asym { .. } => {
-            encode_chunk_rotor(
-                k_f32,
-                rotor_table,
-                b,
-                kv_h,
-                n,
-                d,
-                layout,
-                ROTOR4_BITS,
-                device,
-            )
-        }
+        KvQuant::RotorK3Asym { .. } => encode_chunk_rotor(
+            k_f32,
+            rotor_table,
+            b,
+            kv_h,
+            n,
+            d,
+            layout,
+            ROTOR3_BITS,
+            device,
+        ),
+        KvQuant::RotorK4Asym { .. } => encode_chunk_rotor(
+            k_f32,
+            rotor_table,
+            b,
+            kv_h,
+            n,
+            d,
+            layout,
+            ROTOR4_BITS,
+            device,
+        ),
         _ => Err(Error::Mlx(format!(
             "fused_qk encode: codec {codec:?} HOLD — GPU encoder not yet wired"
         ))),
     }
-}
-
-/// Iso chunk encode. Calls the K-side GPU quantize kernel and reshapes the flat
-/// `[n_tokens * n_groups]` outputs into the per-token head-major slabs the
-/// shadow stores. The per-token norm is extracted as the first group's norm
-/// slot, the same convention [`encode_chunk_rotor`] uses.
-///
-/// No rotor-table sideband: iso rotates every group by the same fixed
-/// golden-ratio quaternion, which the kernel header bakes in.
-///
-/// `bits` is selected explicitly by the caller; there is no default arm, so a
-/// width with no kernel errors rather than encoding through the other's.
-#[allow(clippy::too_many_arguments)]
-fn encode_chunk_iso(
-    k_f32: &Array,
-    b: i32,
-    kv_h: i32,
-    n: i32,
-    d: i32,
-    layout: crate::kvcache::fused_qk_shadow::FusedQkLayout,
-    bits: u8,
-    device: Device,
-) -> Result<ChunkEncoded> {
-    let d_usize = usize::try_from(d)
-        .map_err(|_| Error::Mlx(format!("fused_qk iso encode: negative head_dim={d}")))?;
-    if !d_usize.is_multiple_of(ISO_QUAT_BLOCK_SIZE) {
-        return Err(Error::Mlx(format!(
-            "fused_qk iso encode: head_dim={d} must be a multiple of the quaternion block \
-             size {ISO_QUAT_BLOCK_SIZE}"
-        )));
-    }
-    let n_groups = iso_n_groups_for(d_usize);
-    let n_groups_i32 = i32::try_from(n_groups).map_err(|_| {
-        Error::Mlx(format!(
-            "fused_qk iso encode: n_groups {n_groups} overflows"
-        ))
-    })?;
-
-    let (codes_flat, scales_flat, _quats, norms_flat) = match bits {
-        ISO_K3_BITS => crate::isoquant_msl::iso_quantize_v3_gpu(k_f32, d_usize, device)?,
-        ISO_K4_BITS => crate::isoquant_msl_v4::iso_quantize_v4_gpu(k_f32, d_usize, device)?,
-        other => {
-            return Err(Error::Mlx(format!(
-                "fused_qk iso encode: unsupported bits={other} (only 3 and 4); refusing to \
-                 encode with another width's kernel"
-            )))
-        }
-    };
-
-    // codes_flat / scales_flat shape: [n_tokens * n_groups]. Reshape to
-    // head-major — one u32 word per quaternion block at both bit widths.
-    let codes_4d = codes_flat.reshape(&[b, kv_h, n, n_groups_i32], device)?;
-    let scales_4d = scales_flat.reshape(&[b, kv_h, n, n_groups_i32], device)?;
-    // norms_flat is per-group; deduplicate to per-token by slicing the first
-    // slot of each token's group-tuple.
-    let norms_per_group = norms_flat.reshape(&[b, kv_h, n, n_groups_i32], device)?;
-    let norms_4d =
-        norms_per_group.slice(&[0_i32, 0, 0, 0], &[b, kv_h, n, 1], &[1_i32; 4], device)?;
-    assert_layout(layout, n_groups_i32, n_groups_i32)?;
-    Ok(ChunkEncoded {
-        codes: codes_4d,
-        scales: scales_4d,
-        norms: Some(norms_4d),
-    })
 }
 
 /// Rotor chunk encode. Calls the K-side GPU quantize kernel and reshapes

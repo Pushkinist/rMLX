@@ -4,67 +4,54 @@
 //!
 //! This module owns the static dispatch table that maps a [`KvQuant`] variant
 //! to the corresponding fused-QK kernel function.
-//! The table is a `&[FusedQkEntry]` of 7 entries covering all K-side codec
-//! variants that have a fused-QK kernel.
 //!
 //! # Production dispatch
 //!
-//! [`FUSED_QK_TABLE`] is also reachable through the production
-//! dispatch path inside [`rmlx_kv_quant::kvcache::KvCache::try_fused_qk_dispatch`]
-//! that uses an **in-crate mirror** of the same table
-//! (`rmlx_kv_quant::kvcache::fused_qk_dispatch::lookup_fused_qk_kernel`)
-//! — the codec-layer dispatcher cannot depend on this crate
-//! (`rmlx-models`) per the workspace dep-graph rule. Both tables list
-//! the same 8 entries and must stay in sync; an inline-test gate in
-//! `attention_dispatch_tests.rs::lookup_fused_qk_pending_kernels_match_executors`
-//! verifies every variant resolves through this side.
+//! The production decode path is
+//! [`rmlx_kv_quant::kvcache::KvCache::try_fused_qk_dispatch`], which uses an
+//! **in-crate mirror** of this table
+//! (`rmlx_kv_quant::kvcache::fused_qk_dispatch::lookup_fused_qk_kernel`) — the
+//! codec-layer dispatcher cannot depend on this crate (`rmlx-models`) per the
+//! workspace dep-graph rule. The two tables list the same variants and must
+//! stay in sync; `attention_dispatch_tests.rs` gates this side.
 //!
-//! Wired codec coverage: q8 (K8V*, K8V4), TurboSym3,
-//! TurboSym4. HOLD codecs (kernel landed, K-side GPU encoder pending):
-//! Iso3Sym, Iso4Sym, IsoKOnly3, IsoKOnly4, Rotor3Sym, Rotor4Sym,
-//! RotorKOnly3, RotorKOnly4. See `docs/reports/fused-qk-head-major-k.md`
-//! for the storage shape, dispatch site (file:line in `rmlx-kv-quant`),
-//! and HOLD ticket details.
+//! # Coverage, and what is deliberately absent
+//!
+//! Covered: q8 (`K8V4` / `K8V8`), `TurboSym3`, `TurboSym4`, `RotorK3Asym`,
+//! `RotorK4Asym`.
+//!
+//! The fused-QK path builds its head-major K shadow by re-encoding the bf16 K
+//! mirror, so a codec only reaches it when it keeps one
+//! (`KvQuant::feeds_bf16_k_at_decode`). `Iso{3,4}Sym`, `IsoKOnly{3,4}`,
+//! `Rotor{3,4}Sym` and `RotorKOnly{3,4}` keep no bf16 K — each decodes through
+//! its own flash-decode-over-quant kernel straight off the packed ring — so
+//! they are absent here rather than listed and unreachable. `RotorK{3,4}Asym`
+//! is the one rotor family member with no flash-decode arm, which makes
+//! fused-QK its only GPU decode path.
 //!
 //! # Kernel function type
 //!
-//! The concrete kernel signature is "TBD by first kernel".
-//! Executor B (q8) defines the canonical type; this file documents the expected
-//! shape in the `FusedQkEntry` rustdoc and uses a placeholder `fn` type until
-//! the first executor lands.
-//!
-//! Expected (non-binding) shape for Executor B:
-//!
-//! ```text
-//! fn(
-//!     query:    &rmlx_mlx::Array,   // [B, n_q_heads, head_dim]
-//!     k_packed: &rmlx_mlx::Array,   // codec-specific packed K tensor
-//!     k_scales: &rmlx_mlx::Array,   // per-group scales (or rotation aux)
-//!     scale:    f32,                // 1/sqrt(head_dim) softmax pre-scale
-//! ) -> rmlx_core::error::Result<rmlx_mlx::Array>
-//! // Returns [B, n_q_heads, S_kv] pre-softmax scores (f32).
-//! ```
-//!
-//! Iso / rotor variants need an extra `bits: u8` param and rotor needs
-//! `k_qjl: Option<&Array>`.  The dispatch site adapts via a thin per-codec
-//! shim function stored as the `kernel` slot.
+//! [`FusedQkFn`] is the canonical signature; every entry stores one. Codecs
+//! that need extra data (rotor's per-token norms and static rotor table) get
+//! it through the `Option<&Array>` sideband slots rather than a per-codec
+//! signature, so the table stays one type wide. Bit width is baked into the
+//! shim (`rotor3_fused_qk_sdpa` vs `rotor4_fused_qk_sdpa`), not passed.
 //!
 //! # Usage
 //!
 //! ```ignore
-//! if let Some(_kernel_fn) = lookup_fused_qk(kv_quant) {
-//!     // call kernel_fn(query, k_packed, k_scales, scale)?
+//! if let Some(kernel_fn) = lookup_fused_qk(kv_quant) {
+//!     // call kernel_fn(query, k_codes, k_scales, k_norms, k_rotor_table, ...)
 //! }
 //! ```
 //!
 //! # Table maintenance
 //!
-//! One row per (codec, KvQuant) pair.  The table is `&[FusedQkEntry]` so
-//! entries are iterated linearly; with 7 entries the cost is negligible at
-//! decode time.  Each entry documents which Executor fills the `kernel` slot.
+//! One row per (codec, KvQuant) pair, iterated linearly — at this size the
+//! scan cost is negligible at decode time. A new row needs the same row in
+//! the codec-layer mirror, and the codec must keep a bf16 K mirror.
 
 use rmlx_core::error::Result;
-use rmlx_kv_quant::iso_fused_qk_msl::{iso3_fused_qk_sdpa, iso4_fused_qk_sdpa};
 use rmlx_kv_quant::q8_fused_qk_msl::q8_fused_qk_sdpa;
 use rmlx_kv_quant::rotor_fused_qk_msl::{rotor3_fused_qk_sdpa, rotor4_fused_qk_sdpa};
 use rmlx_kv_quant::sparse_attn::phase1_score_msl::{phase1_score, TOP_PER_TILE};
@@ -81,10 +68,10 @@ use rmlx_mlx::{Array, Device, Dtype};
 
 /// Canonical fused-QK kernel function type.
 ///
-/// Canonical fused-QK kernel function type, first defined by Executor B (q8).
-/// Every codec dispatches through this signature; codecs that need extra
-/// codec-specific data (rotor `k_qjl`, iso `bits`) pass it via a thin
-/// per-codec shim closure stored at the call site, or extend this type.
+/// Every codec dispatches through this signature; codec-specific extras
+/// (rotor's per-token L2 norms and static rotor table) ride the
+/// `Option<&Array>` sideband slots, and bit width is fixed by which shim the
+/// table stores.
 ///
 /// # Parameter contract
 ///
@@ -126,8 +113,9 @@ pub type FusedQkFn = fn(
 
 /// One entry in the fused-QK dispatch table.
 ///
-/// Maps a [`KvQuant`] variant to its compiled kernel function.  `kernel` is
-/// `None` until the corresponding Executor lands the MSL implementation.
+/// Maps a [`KvQuant`] variant to its compiled kernel function. `kernel` is
+/// `None` for a variant whose MSL implementation has not landed; the dispatch
+/// site then falls through to the legacy dequant+SDPA path.
 #[allow(
     clippy::exhaustive_structs,
     reason = "closed dispatch-table entry — field set is the complete (kv_quant, kernel) \
@@ -137,7 +125,8 @@ pub type FusedQkFn = fn(
 pub struct FusedQkEntry {
     /// The KvQuant variant this entry covers.
     pub kv_quant: KvQuant,
-    /// The compiled kernel function, or `None` while the Executor is pending.
+    /// The compiled kernel function, or `None` while no MSL implementation
+    /// exists.
     ///
     /// `None` entries cause the dispatch site to fall through to the legacy
     /// dequant+SDPA path — correct behaviour until the kernel is implemented.
@@ -157,10 +146,6 @@ const TURBO_K3_FUSED_QK_FN: FusedQkFn = turbo_k3_fused_qk_sdpa;
 // TurboSym4 K-side fused-QK kernel.
 const TURBO_K4_FUSED_QK_FN: FusedQkFn = turbo_k4_fused_qk_sdpa;
 
-// IsoQuant K-side fused-QK kernels (bits=3 and bits=4).
-const ISO3_FUSED_QK_FN: FusedQkFn = iso3_fused_qk_sdpa;
-const ISO4_FUSED_QK_FN: FusedQkFn = iso4_fused_qk_sdpa;
-
 // RotorQuant K-side fused-QK kernels (bits=3 and bits=4).
 const ROTOR3_FUSED_QK_FN: FusedQkFn = rotor3_fused_qk_sdpa;
 const ROTOR4_FUSED_QK_FN: FusedQkFn = rotor4_fused_qk_sdpa;
@@ -169,22 +154,19 @@ const ROTOR4_FUSED_QK_FN: FusedQkFn = rotor4_fused_qk_sdpa;
 
 /// Fused-QK dispatch table.
 ///
-/// 8 entries; all `kernel` slots are `Some(...)`.
+/// 6 entries; all `kernel` slots are `Some(...)`.
 ///
-/// | Entry | KvQuant       | K codec         | A.y? | Executor |
-/// |-------|---------------|-----------------|------|----------|
-/// | 0     | K8V4          | q8_0 8-bit K    | No   | B        |
-/// | 1     | K8V8          | q8_0 8-bit K    | No   | B        |
-/// | 2     | TurboSym3     | turbo3 K 3-bit  | Yes  | C        |
-/// | 3     | TurboSym4     | turbo4 K 4-bit  | Yes  | D        |
-/// | 4     | Iso3Sym       | iso K bits=3    | Yes  | E        |
-/// | 5     | Iso4Sym       | iso K bits=4    | Yes  | E        |
-/// | 6     | Rotor3Sym     | rotor K bits=3  | Yes  | F        |
-/// | 7     | Rotor4Sym     | rotor K bits=4  | Yes  | F        |
+/// | Entry | KvQuant       | K codec         | A.y? |
+/// |-------|---------------|-----------------|------|
+/// | 0     | K8V4          | q8_0 8-bit K    | No   |
+/// | 1     | K8V8          | q8_0 8-bit K    | No   |
+/// | 2     | TurboSym3     | turbo3 K 3-bit  | Yes  |
+/// | 3     | TurboSym4     | turbo4 K 4-bit  | Yes  |
+/// | 4     | RotorK3Asym   | rotor K bits=3  | Yes  |
+/// | 5     | RotorK4Asym   | rotor K bits=4  | Yes  |
 ///
-/// Note: `IsoKOnly3`, `IsoKOnly4`, `RotorKOnly3`, `RotorKOnly4` share the
-/// same kernel as their `*Sym` counterpart (V side differs but K decode is
-/// identical).  Executor E / F may add those entries when wiring.
+/// The iso and rotor `*Sym` / `*KOnly` codecs are absent on purpose — see the
+/// module docs' "what is deliberately absent".
 pub static FUSED_QK_TABLE: &[FusedQkEntry] = &[
     // ── q8_0 K ───────────────────────────────────────────────────────────────
     // Both K8V4 and K8V8 share the same K-side codec (q8_0 affine 8-bit,
@@ -218,49 +200,37 @@ pub static FUSED_QK_TABLE: &[FusedQkEntry] = &[
         kv_quant: KvQuant::TurboSym4,
         kernel: Some(TURBO_K4_FUSED_QK_FN),
     },
-    // ── iso K-side bits=3 ────────────────────────────────────────────────────
-    // Per-group quaternion SO(4) rotation (inverse) × Lloyd-Max 3-bit codebook
-    // lookup × per-group f32 scale × per-token f32 L2 norm. The `FusedQkFn`
-    // signature was widened so the caller passes
-    // `k_norms: Some(per-token L2)` as a separate Array (pre-fix-cycle the
-    // caller concatenated `[scales | norms]` into `k_scales` and the shim
-    // split it back; that concat cost dominated decode at long context).
-    // K-side 3-bit ⇒ A.y guard required (Qwen3.5-MoE rejected at session
-    // start by `validate_resolved` in `cache_type.rs`, not here).
-    FusedQkEntry {
-        kv_quant: KvQuant::Iso3Sym,
-        kernel: Some(ISO3_FUSED_QK_FN),
-    },
-    // ── iso K-side bits=4 ────────────────────────────────────────────────────
-    // Same shape as bits=3 with a 16-entry Lloyd-Max codebook + 4-bit unpack.
-    // K-side 4-bit ⇒ A.y guard required (Qwen3.5-MoE rejected at session
-    // start by `validate_resolved` in `cache_type.rs`, not here).
-    FusedQkEntry {
-        kv_quant: KvQuant::Iso4Sym,
-        kernel: Some(ISO4_FUSED_QK_FN),
-    },
-    // ── rotor K-side bits=3 ──────────────────────────────────────────────────
+    // ── rotor-asym K-side bits=3 ─────────────────────────────────────────────
     // Per-group inverse Cl(3,0) Clifford rotor sandwich `R̃ * mv_q * R`
     // (rendered MUL_TABLE in MSL) × Lloyd-Max 3-bit codebook lookup × per-group
-    // f32 scale × per-token f32 L2 norm. The `FusedQkFn` signature was widened
-    // so the caller passes `k_norms: Some(per-token L2)`
-    // and `k_rotor_table: Some([n_groups * 4])` as separate Arrays (previously
-    // the caller concatenated `[scales | norms | rotors]` into
-    // `k_scales` and the shim split it back; that concat cost dominated
-    // decode at long context — see commit f42aa0f).
+    // f32 scale × per-token f32 L2 norm. The caller passes
+    // `k_norms: Some(per-token L2)` and `k_rotor_table: Some([n_groups * 4])`
+    // as separate Arrays.
+    //
+    // The `v_bits` / `v_group_size` payload below is a placeholder: it selects
+    // the V-side codec, which never reaches a K-side fused-QK kernel, and
+    // [`lookup_fused_qk`] matches this entry by discriminant so every V
+    // configuration resolves to the same kernel.
+    //
     // K-side 3-bit ⇒ A.y guard required (Qwen3.5-MoE rejected at session
     // start by `validate_resolved` in `cache_type.rs`, not here).
     FusedQkEntry {
-        kv_quant: KvQuant::Rotor3Sym,
+        kv_quant: KvQuant::RotorK3Asym {
+            v_bits: 4,
+            v_group_size: 64,
+        },
         kernel: Some(ROTOR3_FUSED_QK_FN),
     },
-    // ── rotor K-side bits=4 ──────────────────────────────────────────────────
+    // ── rotor-asym K-side bits=4 ─────────────────────────────────────────────
     // Same shape as bits=3 with a 16-entry Lloyd-Max codebook + 4-bit unpack
     // (8 codes × 4 bits = 32 bits → 1 u32 word per group, dense pack).
     // K-side 4-bit ⇒ A.y guard required (Qwen3.5-MoE rejected at session
     // start by `validate_resolved` in `cache_type.rs`, not here).
     FusedQkEntry {
-        kv_quant: KvQuant::Rotor4Sym,
+        kv_quant: KvQuant::RotorK4Asym {
+            v_bits: 4,
+            v_group_size: 64,
+        },
         kernel: Some(ROTOR4_FUSED_QK_FN),
     },
 ];
@@ -269,15 +239,22 @@ pub static FUSED_QK_TABLE: &[FusedQkEntry] = &[
 
 /// Look up the fused-QK kernel for `kv_quant`.
 ///
-/// Returns the first `Some` kernel in [`FUSED_QK_TABLE`] whose `kv_quant`
-/// matches.  Returns `None` when:
-/// - The variant has no table entry (i.e. it is not a fused-QK target), or
-/// - The entry's `kernel` slot is still `None` (Executor B-F pending).
+/// Returns the first `Some` kernel in [`FUSED_QK_TABLE`] whose variant
+/// matches, or `None` when the variant has no entry (it is not a fused-QK
+/// target). Callers must fall through to the legacy dequant+SDPA path on
+/// `None`.
 ///
-/// Callers must fall through to the legacy dequant+SDPA path on `None`.
+/// Matching is by **variant discriminant**, not by `PartialEq`. The
+/// rotor-asym entries carry a `(v_bits, v_group_size)` payload that selects a
+/// V-side codec, and the V side never reaches a fused-QK kernel — a K-side
+/// lookup that compared payloads would resolve `RotorK3Asym` only for the one
+/// V configuration the table happens to spell out and silently miss every
+/// other. The unit variants are unaffected: discriminant equality and
+/// `PartialEq` agree for them.
 pub fn lookup_fused_qk(kv_quant: KvQuant) -> Option<FusedQkFn> {
+    let want = std::mem::discriminant(&kv_quant);
     for entry in FUSED_QK_TABLE {
-        if entry.kv_quant == kv_quant {
+        if std::mem::discriminant(&entry.kv_quant) == want {
             return entry.kernel;
         }
     }

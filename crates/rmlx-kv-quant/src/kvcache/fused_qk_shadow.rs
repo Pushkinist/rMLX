@@ -8,7 +8,7 @@
 //
 //   * `k_codes`              — `u32 [B, kv_h, max_seq, codes_per_token]`
 //   * `k_scales`             — `f32 [B, kv_h, max_seq, scales_per_token]`
-//   * `sideband_norms`       — `f32 [B, kv_h, max_seq, 1]` (iso / rotor only)
+//   * `sideband_norms`       — `f32 [B, kv_h, max_seq, 1]` (rotor only)
 //   * `sideband_rotor_table` — `f32 [n_groups * 4]` (rotor only, static-per-layer)
 //
 // The `FusedQkFn` kernel signature uses 13 args; sidebands are passed as
@@ -20,21 +20,18 @@
 //
 // The widened signature delivers:
 //   * `k_scales`      — flat `[B * kv_h * kv_seq * scales_per_token]`
-//   * `k_norms`       — `Option<&Array>`; iso / rotor pass
+//   * `k_norms`       — `Option<&Array>`; rotor passes
 //                       `Some(per-token L2 norms)`, q8 / turbo pass `None`.
 //   * `k_rotor_table` — `Option<&Array>`; rotor passes
 //                       `Some([n_groups * 4])` static-per-layer table,
-//                       iso / q8 / turbo pass `None`.
+//                       q8 / turbo pass `None`.
 //
 // Layout summary by codec family (which sidebands the shim consumes):
 //
 //   q8 / turbo3 / turbo4: per-token scales only — `has_norm = false`,
 //                         `has_rotor_table = false`. Shim ignores
 //                         `k_norms` and `k_rotor_table`.
-//   iso3 / iso4         : per-token scales + per-token norm —
-//                         `has_norm = true`, `has_rotor_table = false`.
-//                         Shim reads `k_norms`, ignores `k_rotor_table`.
-//   rotor3 / rotor4     : per-token scales + per-token norm + static rotor
+//   rotor-asym 3 / 4    : per-token scales + per-token norm + static rotor
 //                         table — `has_norm = true`, `has_rotor_table = true`.
 //                         Shim reads both `k_norms` and `k_rotor_table`.
 //
@@ -45,7 +42,6 @@ use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{zeros, Array, Device, Dtype};
 
 use crate::q8_msl::Q8_GROUP_SIZE;
-use crate::storage::ISO_QUAT_BLOCK_SIZE;
 use crate::turboquant::GROUP_SIZE as TURBO_GROUP_SIZE;
 use crate::KvQuant;
 
@@ -143,30 +139,15 @@ impl FusedQkLayout {
                     n_groups: 0,
                 }
             }
-            // Iso3 / Iso4: codes = head_dim/4 u32 (one word per quaternion
-            // block, both bit widths), scales = head_dim/4 f32, plus 1 norm
-            // per token. No rotor table — iso rotates every group by the same
-            // fixed golden-ratio quaternion, which the kernel header bakes in.
-            KvQuant::Iso3Sym | KvQuant::IsoKOnly3 | KvQuant::Iso4Sym | KvQuant::IsoKOnly4 => {
-                if !hd.is_multiple_of(ISO_QUAT_BLOCK_SIZE) {
-                    return Err(Error::Quant(format!(
-                        "FusedQkLayout(iso): head_dim={head_dim} must be a multiple of \
-                         ISO_QUAT_BLOCK_SIZE={ISO_QUAT_BLOCK_SIZE}"
-                    )));
-                }
-                let n_groups = head_dim / ISO_QUAT_BLOCK_SIZE as i32;
-                Self {
-                    codes_per_token: n_groups,
-                    scales_per_token: n_groups,
-                    has_norm: true,
-                    has_rotor_table: false,
-                    n_groups: 0,
-                }
-            }
-            // Rotor3 / Rotor4 (Sym + K-only + Asym): codes = ceil(head_dim/3)
-            // u32, scales = ceil(head_dim/3) f32, 1 norm per token,
-            // plus a static `[n_groups * 4]` rotor table broadcast across tokens.
-            KvQuant::Rotor3Sym | KvQuant::RotorKOnly3 | KvQuant::RotorK3Asym { .. } => {
+            // Rotor-asym 3 / 4: codes = ceil(head_dim/3) u32, scales =
+            // ceil(head_dim/3) f32, 1 norm per token, plus a static
+            // `[n_groups * 4]` rotor table broadcast across tokens.
+            //
+            // The rotor `Sym` / `KOnly` variants are absent on purpose: they
+            // keep no bf16 K mirror, so the shadow can never be seeded for
+            // them and their decode runs a flash-decode kernel over the packed
+            // ring instead. Same for every iso variant.
+            KvQuant::RotorK3Asym { .. } => {
                 let n_groups_usize = crate::rotorquant::n_groups_for(hd);
                 if n_groups_usize == 0 || n_groups_usize > i32::MAX as usize {
                     return Err(Error::Quant(format!(
@@ -182,7 +163,7 @@ impl FusedQkLayout {
                     n_groups,
                 }
             }
-            KvQuant::Rotor4Sym | KvQuant::RotorKOnly4 | KvQuant::RotorK4Asym { .. } => {
+            KvQuant::RotorK4Asym { .. } => {
                 let n_groups_usize = crate::rotorquant::n_groups_for(hd);
                 if n_groups_usize == 0 || n_groups_usize > i32::MAX as usize {
                     return Err(Error::Quant(format!(
