@@ -9,6 +9,16 @@
 // Paths and traits are fully qualified: an `include!`d file cannot own imports
 // without colliding with whichever file pulled it in.
 
+/// The GEMM kernel family whose presence in `mlx.metallib` is the capability
+/// the pin exists to guarantee. Missing entirely in some bottles.
+///
+/// Lives here rather than in `build.rs` so the build script, its tests and the
+/// runtime probe do not each carry their own copy of the string. The runtime
+/// probe (`src/nax.rs`) still needs its own — a build script cannot be imported
+/// from the crate it builds — and `build_side_names_the_same_kernel_family`
+/// pins that one to this one.
+const NAX_GEMM_KERNEL: &str = "steel_gemm_fused_nax";
+
 /// The MLX / mlx-c pair declared by `mlx-pin.txt`.
 #[derive(Debug, PartialEq, Eq)]
 struct MlxPin {

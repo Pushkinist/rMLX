@@ -43,6 +43,7 @@ pub mod compile;
 #[cfg(feature = "metal-capture")]
 pub mod metal_capture;
 pub mod metal_kernel;
+mod nax;
 mod sys;
 
 use std::cell::Cell;
@@ -96,6 +97,7 @@ pub(crate) fn install_error_handler() {
             sys::mlx_set_error_handler(Some(handler), ptr::null_mut(), None);
         }
         warn_on_mlx_version_skew();
+        nax::warn_if_nax_kernels_missing();
     });
 }
 
@@ -119,6 +121,13 @@ const MLX_BUILD_VERSION: &str = env!("RMLX_MLX_BUILD_VERSION");
 /// links both — reads this constant and calls
 /// `rmlx_metrics::identity::set_mlx_nax` with it once at startup, before any
 /// metrics recording. See `docs/METRICS_DB.md`.
+///
+/// This describes the machine that **built** the binary — the right answer for
+/// a source install, the wrong one for a prebuilt bottle or release tarball,
+/// which link MLX through a package-manager symlink and load whatever the
+/// installing user has. The operator-facing answer therefore comes from the
+/// crate-private `nax` module's runtime probe of the library actually loaded,
+/// not from here.
 pub const NAX_CAPABILITY: &str = env!("RMLX_MLX_NAX");
 
 /// Read the MLX version of the dylib actually loaded into this process.

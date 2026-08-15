@@ -17,6 +17,27 @@ crates are `publish = false`). There is no separate `VERSION` file.
   the binary links.
 - A published tap repo `Pushkinist/homebrew-rmlx` for `brew tap`.
 
+> **What the shipped artifacts resolve MLX to.** Both the bottle and the
+> release tarball link `libmlx.dylib` / `libmlxc.dylib` through the moving
+> `/opt/homebrew/opt/...` symlinks, so **neither carries the MLX it was built
+> against** — each runs against whatever the installing user has, which
+> `depends_on "mlx-c"` resolves to the current release. Two consequences worth
+> holding onto when reading a user report:
+>
+> - The `RMLX_MLX_NAX` baked into the artifact describes the **release
+>   machine**, not the user's. `events.mlx_nax` from a distributed binary is
+>   the builder's answer. The user-facing answer is the runtime probe in
+>   `crates/rmlx-mlx/src/nax.rs`, which reads the metallib actually loaded and
+>   warns only on Neural-Accelerator hosts (see `docs/FFI.md`).
+> - Run `make mlx-preflight` on the release machine before step 8's keg build.
+>   It does not change what users get, but it keeps the release machine's own
+>   published prefill numbers honest.
+>
+> The formula deliberately does **not** pin an MLX version — that would force a
+> downgrade on M1–M4 users for a benefit their hardware has no use for. The
+> rationale is in `packaging/homebrew/rmlx.rb`; do not "fix" it by adding a
+> version constraint.
+
 ## Cut a release
 
 1. **Bump** `version` in `Cargo.toml` `[workspace.package]`.
