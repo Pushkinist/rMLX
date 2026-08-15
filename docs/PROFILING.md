@@ -143,9 +143,15 @@ answers](#what-a-gputrace-actually-answers) below splits the three questions
 people conflate; read it before planning a session, because one of the three is
 not answerable from a capture at all.
 
-On M5 the Neural Accelerator is **part of the GPU**, so profiling nax needs no
-special tooling — the ordinary Metal capture path covers it
-([ml-explore/mlx#3182](https://github.com/ml-explore/mlx/issues/3182)).
+On M5 the Neural Accelerator is part of the GPU, so there is no separate NAX
+tool and none is needed
+([ml-explore/mlx#3182](https://github.com/ml-explore/mlx/issues/3182)): a
+capture *names* NAX pipelines like any other — `steel_gemm_fused_nax_*` for
+matmul, `steel_attention_*_bq64_*` for attention, where **`bq64` means the NAX
+attention branch was taken and `bq32` means it was not**. It does not *time*
+them, on this hardware or any other; see [What a `.gputrace` actually
+answers](#what-a-gputrace-actually-answers). Which paths can reach NAX at all
+is in [`docs/FFI.md`](FFI.md#where-nax-can-appear-and-where-it-cannot).
 
 ### How the window works
 
