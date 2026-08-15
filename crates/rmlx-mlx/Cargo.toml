@@ -18,10 +18,20 @@ thiserror   = { workspace = true }
 tracing     = { workspace = true }
 safetensors = { workspace = true }
 
+# Profiling-only tool: parses an `xctrace export` and summarises GPU submission
+# time and the CPU->GPU gap. `required-features` keeps it out of
+# `cargo check --all-targets`, which builds with no features on.
+[[example]]
+name = "gpu_timeline"
+path = "examples/gpu_timeline.rs"
+required-features = ["metal-capture"]
+
 [features]
-# Feature-gated GPU trace capture via MTLCaptureManager (debug only).
-# Enables `rmlx_mlx::metal_capture` — the arm / step / finish driver over
-# mlx_metal_start_capture / mlx_metal_stop_capture, plus the pure window policy.
+# Feature-gated GPU profiling (debug only). Two things ride on it:
+#   * `rmlx_mlx::metal_capture` — the arm / step / finish driver over
+#     mlx_metal_start_capture / mlx_metal_stop_capture, plus the window policy.
+#   * `rmlx_mlx::xctrace` — the `xctrace export` XML parser behind
+#     `scripts/mst_capture.sh`.
 # Do NOT enable in release builds; the feature tag keeps binaries clean.
 metal-capture = []
 

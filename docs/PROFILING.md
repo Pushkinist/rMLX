@@ -337,38 +337,72 @@ A replay has the replay's schedule, not the schedule of the run you captured.
 Host round-trips — the blocking `Array::eval()` per layer per step, a per-step
 prefix restage — will **not** show up in a `.gputrace`, no matter how it is
 replayed. A timeline instrument over the live process does show them, headlessly
-and with nanosecond resolution:
+and with nanosecond resolution. That path is built:
 
 ```sh
-xcrun xctrace record --template 'Metal System Trace' --no-prompt \
-  --output run.trace --time-limit 8s --launch -- \
-  ./target/release-debug/rmlx --metrics off baseline --model /path/to/snapshot ...
-
-xcrun xctrace export --input run.trace \
-  --xpath '/trace-toc/run[@number="1"]/data/table[@schema="metal-gpu-intervals"]' \
-  --output gpu.xml
+make profile-mst MODEL=/path/to/snapshot SKIP_MS=500
+# or, spelled out:
+bash scripts/mst_capture.sh --model /path/to/snapshot --kv-quant none \
+  --prompt-tokens 4096 --max-tokens 600 --time-limit 18 --skip-ms 500
 ```
 
-That table gives per-GPU-submission `start` and `duration` in nanoseconds,
+It records the live process, exports the `metal-gpu-intervals` table, parses it
+and prints a per-channel table plus a CSV a script can assert on. See
+[Reading the timeline](#reading-the-timeline) for what the numbers mean.
+
+The table gives per-GPU-submission `start` and `duration` in nanoseconds,
 `gpu-channel-name`, `start-latency` (the CPU→GPU gap), and `cmdbuffer-id` /
 `encoder-id`, per process; `metal-application-encoders-list` and
 `metal-command-buffer-completed` join on those ids. Measured run-to-run spread:
-0.06%. Three things to know before using it:
+0.06%. Four things to know before using it:
 
 - **`--attach <pid>` does not work** for this template — it reports "No
   configuration information received, will have to guess" and exports zero rows.
   Metal instrumentation has to be present at launch: use `--launch --` (or
-  `--all-processes`, which does pick up a running process).
+  `--all-processes`, which does pick up a running process). The harness uses
+  `--launch`, which is why a recording always starts at process launch.
+- **Weight load leaves no rows**; prefill does. Load is CPU and file I/O, so it
+  is simply absent from a GPU-interval table however long it took. `--skip-ms`
+  is therefore measured from *the matched process's own first submission*, not
+  from the start of the trace — that makes one value work across models
+  regardless of how long they take to load. Roughly
+  `prompt_tokens / prefill_tps` milliseconds covers prefill.
 - The export XML uses an **`id`/`ref` back-reference encoding** with positional
   columns and `<sentinel/>` for NULL. A naive parser silently misaligns columns,
   which reads as plausible-but-wrong numbers rather than an error.
-- **Volume**: an 8 s trace is a ~145 MB bundle and ~44 MB of XML for one table.
-  Bound it with `--time-limit`.
+  `rmlx_mlx::xctrace` refuses instead: it checks a row's cell count against the
+  schema, checks every cell's tag against the column's declared
+  `engineering-type`, and rejects an unresolvable `ref`.
+- **Volume**: a bundle runs ~300–400 MB and the one-table export ~110 MB for a
+  ~15 s recording. Bound it with `--time-limit`; `.rmlx/traces/mst` keeps the
+  newest `--keep` bundles (default 5) and prunes the rest, sidecar XML and CSV
+  included, after every successful run.
 
 Pipeline and function names do **not** survive the export (only encoder,
 command-buffer, buffer and queue labels), and the driver coalesces consecutive
 compute encoders into one GPU kick — so one row can cover several encoders. Pair
 it with the identity list from a capture when you need to know *which* kernel.
+
+#### Reading the timeline
+
+Measured decode-only windows, `--kv-quant none`, 4096-token prompt, 600 tokens:
+
+| Model | Compute subs | GPU busy / span | `start-latency` p50 | subs / token |
+|---|---|---|---|---|
+| gemma-4-e2b-it-mxfp8 | 26 027 | 4653 / 4705 ms (98.9%) | 4.25 ms | 45.8 |
+| Ternary-Bonsai-8B-mlx-2bit | 42 816 | 4274 / 4346 ms (98.4%) | 6.18 ms | 74.4 |
+
+Cross-check the window against a decode rate from an untraced run of the same
+cell before trusting it: e2b measured 120.8 decode TPS, so 600 tokens is 4.97 s
+against a 4.71 s window that starts 500 ms into GPU work (0.2% agreement);
+Bonsai measured 132.3 TPS, 4.53 s against a 4.35 s window (0.5%). A window that
+disagrees is not the window you think it is.
+
+**`start-latency` is queueing delay, not host stall, whenever the GPU is
+saturated.** At ~99% busy the gap measures how much work is already queued ahead
+of a submission — a 4 ms p50 against a 0.14 ms p50 duration means roughly 30
+submissions deep, not 4 ms of idle GPU waiting on the host. It is the *idle*
+case that indicts a host round-trip, so read it together with the busy fraction.
 
 ### Working with a bundle
 
@@ -429,9 +463,9 @@ bash scripts/traces_gc.sh --apply --max-age-days 7   # optional extra age rule
 
 ### Tests
 
-The window policy and the request validation are pure and unit-tested, but the
-tests are behind the same feature, so a plain `cargo test` does not compile
-them. Run them with:
+The window policy, the request validation and the `xctrace` export parser are
+pure and unit-tested, but the tests are behind the same feature, so a plain
+`cargo test` does not compile them. Run them with:
 
 ```sh
 make test-capture
@@ -439,6 +473,13 @@ make test-capture
 
 `make ci` runs that target too — without it, an off-by-one in the window policy
 would pass the gate green, since `make test` compiles these tests out entirely.
+
+The parser's tests are mostly *refusals*, and deliberately so: each pairs a
+fixture carrying one of the export encoding's traps with a mutated twin that
+must be rejected — a dropped `<sentinel/>`, a one-column shift that keeps the
+cell count intact, a dangling `ref`, a `ref` into a still-open element, a
+non-numeric duration, the wrong table, and a filter that selects nothing. Every
+one of those, accepted, yields a well-formed table of wrong numbers.
 
 ## 6. Ad-hoc cardinality counting with the `counts` crate
 
@@ -551,7 +592,8 @@ Notes:
 | Native Apple profiler | `make profile-instruments MODEL=...` |
 | Flamegraph (needs sudo) | `sudo cargo flamegraph --bin rmlx -- baseline ...` |
 | Heap profile | `cargo build --features rmlx-cli/dhat-heap && ./target/debug/rmlx baseline ...` |
-| GPU capture | Deferred — see §5 above |
+| GPU kernel identity (which kernels ran) | `make profile-gputrace CODEC=... MODEL=...` — see §5 |
+| GPU timing + CPU→GPU gap | `make profile-mst MODEL=... SKIP_MS=500` — see §5 |
 | Ad-hoc branch counts | `eprintln!` + `counts` crate |
 | Process memory snapshot | `rmlx_core::mach_mem::read_proc_mem()` — see §9 |
 | Prefill-chunk override | `RMLX_PREFILL_CHUNK_<ARCH>=<n>` — see §10 |

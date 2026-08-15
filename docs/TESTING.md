@@ -166,6 +166,7 @@ while every gate reported green. `make gpu-test` is the step that runs them:
 make gpu-test                                   # every member crate
 make gpu-test CRATE=rmlx-kv-quant               # one crate
 make gpu-test CRATE=rmlx-kv-quant FILTER=rotor_flash
+make gpu-test VALIDATE=0                        # without shader validation
 ```
 
 It runs exactly the set `check_gpu_tests_ignored.sh --list` classifies — the
@@ -197,6 +198,58 @@ It is fail-closed in three ways:
 `make gpu-test` is not part of `make ci`: it needs the Metal context to itself
 and is too slow to block every commit. Run it before merging anything in the
 codec layer.
+
+### Metal shader validation (on by default here)
+
+Running the GPU tests is necessary but not sufficient, because the failure this
+layer is prone to **does not fail a test**. An out-of-bounds device store from a
+Metal kernel is dropped: the command buffer completes, `cb.error` is `nil`, the
+process exits 0, and the assertions downstream of the frozen buffer still pass.
+Measured on a deliberately broken `q8_quantize` kernel — both GPU tests over it
+reported `ok` and the runner printed `OK: 2 GPU tests passed`, with no output of
+any kind about the invalid write.
+
+`make gpu-test` therefore instruments every pipeline with Metal's shader
+validation and **scans the output**, failing the run when a diagnostic appears:
+
+```
+Invalid device store at offset 4000064, executing kernel function: "custom_kernel_rmlx_q8_quantize"
+```
+
+Four things decide how this is wired, each of which would otherwise produce a
+gate that runs and can never fire:
+
+* **The exit code is not the signal.** With validation on, cargo *still* exits 0
+  and the tests *still* report `ok`. Only the diagnostic text distinguishes the
+  broken tree from the clean one.
+* **`MTL_SHADER_VALIDATION=1` alone reports nothing to stderr.**
+  `MTL_SHADER_VALIDATION_REPORT_TO_STDERR` defaults to `0`, so reports go to
+  Unified Logging (`man MetalValidation`). `scripts/run_gpu_tests.sh` owns the
+  whole `MTL_SHADER_VALIDATION_*` environment rather than inheriting it —
+  `DEFAULT_STATE`, `DISABLE_PIPELINES`, `ENABLE_ERROR_REPORTING`,
+  `GLOBAL_MEMORY`, `THREADGROUP_MEMORY`, `FAIL_MODE`, `REPORT_TO_STDERR` are all
+  pinned — so no stale export in a dev shell can leave it looking armed while
+  blind.
+* **The diagnostic is not line-anchored.** The validation layer writes to the
+  process's stderr while libtest is mid-line, so a report routinely appears
+  appended to a `test some::name ... ` prefix. Matching `^Invalid` catches only
+  about half of them.
+* **The validation banner is asserted.** If Metal never prints `Metal GPU
+  Validation Enabled`, the suite ran uninstrumented and its silence proves
+  nothing, so the runner refuses to report OK.
+
+Buffer labels would make a hit even more direct, but MLX owns the Metal
+allocator and mlx-c exposes no labelling API, so KV stores appear as
+`buffer: <unnamed>`. The **kernel function name** carries the attribution
+instead, and rMLX does control that: `custom_kernel_rmlx_<codec>_<op>` names the
+codec and the operation exactly.
+
+Validation costs throughput, so it belongs on this target and **not** on any
+cell whose numbers get recorded. `VALIDATE=0` opts out; the cost on a
+flash-decode subset measured 1.08 s → 1.11 s of test time.
+
+Current state: the whole `rmlx-kv-quant` GPU suite (238 classified tests) runs
+clean under validation — zero invalid accesses.
 
 ### Known-red baseline
 

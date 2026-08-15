@@ -52,6 +52,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         profile-samply profile-samply-debug profile-instruments bench asm perf-iter \
         canary canary-gate \
         mlx-preflight mlx-restore-pin target-gc target-size-report profile-gputrace \
+        profile-mst \
         build-capture test-capture gputrace-preflight traces-gc \
         ssd-canary ssd-canary-gate \
         bench-codec-cell \
@@ -108,8 +109,9 @@ traces-gc:       ## report .rmlx/traces against the retention caps (APPLY=1 to p
 # `make test` is `cargo test --workspace` without --all-features, so it compiles
 # these out entirely. Run from `ci` as well, or an off-by-one in the window
 # policy passes the gate green.
-test-capture: ## run the GPU-capture unit tests (feature-gated, so plain `make test` skips them; also a `make ci` step)
+test-capture: ## run the feature-gated GPU-profiling unit tests (capture window + xctrace parser; plain `make test` skips them; also a `make ci` step)
 	cargo test -p rmlx-mlx --features metal-capture --lib metal_capture
+	cargo test -p rmlx-mlx --features metal-capture --lib xctrace
 	cargo test -p rmlx-cli --features metal-capture --bin rmlx gpu_capture
 
 profile-gputrace: ## capture a decode-window Metal GPU trace (CODEC= MODEL= required; enforces the .rmlx/traces cap unless KEEP_ALL=1)
@@ -123,6 +125,30 @@ profile-gputrace: ## capture a decode-window Metal GPU trace (CODEC= MODEL= requ
 		$(if $(PROMPT_TOKENS),--prompt-tokens $(PROMPT_TOKENS),) \
 		$(if $(SKIP),--skip $(SKIP),) $(if $(STEPS),--steps $(STEPS),) \
 		$(if $(GEN),--gen $(GEN),) $(if $(KEEP_ALL),--keep-all,)
+
+# profile-mst: the timing half of GPU profiling. A .gputrace answers WHICH
+# kernels ran; this answers HOW LONG they took and how long the GPU waited on
+# the host (start-latency, the CPU->GPU gap) — the one signal a capture cannot
+# give, since a replay has the replay's schedule. Records the live process,
+# exports metal-gpu-intervals and parses it; the parser refuses a misaligned
+# table rather than printing plausible wrong numbers.
+#
+# The recording starts at process launch (xctrace --attach is broken for this
+# template), so it includes weight load and prefill — SKIP_MS= leaves them out
+# of the summary.
+profile-mst: ## record a Metal System Trace of a live rmlx run and summarise GPU time + CPU->GPU gap (MODEL= required; CODEC= TIME_LIMIT= SKIP_MS= PROMPT_TOKENS= GEN= KEEP=)
+	@if [ -z "$(MODEL)" ]; then \
+		echo "Usage: make profile-mst MODEL=<snapshot-abs-path> \
+[CODEC=none] [TIME_LIMIT=12] [SKIP_MS=4000] [PROMPT_TOKENS=512] [GEN=400] [KEEP=5]"; \
+		exit 2; \
+	fi
+	bash scripts/mst_capture.sh --model $(MODEL) \
+		$(if $(CODEC),--kv-quant $(CODEC),) \
+		$(if $(TIME_LIMIT),--time-limit $(TIME_LIMIT),) \
+		$(if $(SKIP_MS),--skip-ms $(SKIP_MS),) \
+		$(if $(PROMPT_TOKENS),--prompt-tokens $(PROMPT_TOKENS),) \
+		$(if $(GEN),--max-tokens $(GEN),) \
+		$(if $(KEEP),--keep $(KEEP),)
 
 mlx-restore-pin: ## restore mlx 0.31.2 + mlx-c 0.6.0_2 (nax-capable pair) and relink
 	bash scripts/mlx_restore_pin.sh
@@ -153,8 +179,16 @@ ci-perf:         ## pre-push gate under release-perf (separate from make ci; run
 # exclusive machine access) is the natural next step, but is blocked while any
 # GPU test is red on main — wiring a known-red step into a shared gate just
 # teaches people to skip the gate.
-gpu-test:        ## run the GPU/Metal #[ignore] tests serialized (CRATE= FILTER= to narrow); needs exclusive machine access
-	@bash scripts/run_gpu_tests.sh $(if $(CRATE),--crate '$(CRATE)',) $(if $(FILTER),--filter '$(FILTER)',)
+#
+# Metal shader validation is ON here. An out-of-bounds device store is dropped
+# silently — command buffer completes, cb.error is nil, cargo exits 0, and the
+# tests over the frozen buffer still pass — so without instrumentation this
+# target cannot see the repo's documented silent-corruption class at all. It
+# costs throughput, which is why it lives on this target and not on any cell
+# whose numbers get recorded. VALIDATE=0 opts out.
+gpu-test:        ## run the GPU/Metal #[ignore] tests serialized under Metal shader validation (CRATE= FILTER= to narrow, VALIDATE=0 to skip instrumentation); needs exclusive machine access
+	@bash scripts/run_gpu_tests.sh $(if $(CRATE),--crate '$(CRATE)',) $(if $(FILTER),--filter '$(FILTER)',) \
+		$(if $(filter 0,$(VALIDATE)),--no-shader-validation,)
 
 # model-check: run only the model-logic crates (rmlx-models, rmlx-runtime,
 # rmlx-quant) plus the KV-codec crate (rmlx-kv-quant). Excludes server, CLI, and
