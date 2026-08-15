@@ -677,8 +677,9 @@ impl KvQuant {
     ///   so the GPU iso/rotor branch is shadowed and the codec encode that does
     ///   run (at prefill) is CPU → `Some(reason)`.
     /// - **K-only iso** (`IsoKOnly3/4`): NO bf16 early-return — the iso K MSL
-    ///   kernel dispatches every decode step on GPU → `None` (Metal, hybrid:
-    ///   dequant restages host-side each step, but a Metal kernel runs).
+    ///   kernel dispatches every decode step on GPU → `None` (Metal, and
+    ///   GPU-resident end to end: the flash-decode kernel reads the packed ring
+    ///   in place, so the growing prefix never crosses to the host).
     /// - **K-only rotor** (`RotorKOnly3/4`): NO bf16 early-return; the runtime
     ///   dispatcher (`update_rotor_k_only_{3,4}` and the sdpa fast path) gates
     ///   the GPU K encode on the store's sticky `use_qjl()` flag. QJL off
@@ -700,7 +701,7 @@ impl KvQuant {
     /// Exhaustive on purpose (no wildcard) so a new variant must be classified.
     #[allow(
         clippy::match_same_arms,
-        reason = "the K-only iso arm returns None like the Metal arm but is kept separate to document the per-codec Metal-vs-CPU verdict this fn exists for: a Metal kernel dispatches for the K-only iso codec, distinct from the genuinely-Metal q8/turbo codecs and from the QJL-gated rotor arm. Merging the arms would erase that distinction."
+        reason = "the K-only iso arm returns None like the Metal arm but is kept separate to document the per-codec Metal-vs-CPU verdict this fn exists for: the K-only iso codec reaches Metal by its own encode + flash-decode kernels rather than the shared q8/turbo path, and unlike the rotor arm it carries no QJL gate that could flip the verdict. Merging the arms would erase that per-codec record."
     )]
     pub fn cpu_hot_path_reason(&self) -> Option<&'static str> {
         match self {
@@ -722,9 +723,11 @@ impl KvQuant {
             // K-only iso variants: NO bf16 decode-seed early-return — the iso K
             // codec fires every decode step. On GPU, `update_iso_k_only_{3,4}`
             // dispatches the real iso{3,4} MSL encode kernel; IsoKOnly3 also runs
-            // the iso3 MSL dequant kernel. This is a Metal hot path (a hybrid —
-            // the dequant restages the growing prefix host-side each step — but a
-            // Metal kernel demonstrably dispatches, so it is NOT a CPU-only codec).
+            // the iso3 MSL dequant kernel. Decode reads the packed ring through
+            // the iso flash-decode kernel, so the growing prefix stays on device;
+            // the only host readback (`packed_view_cpu`) is reached from
+            // `dequant()` / `dequant_gpu()` at a block-rebuild or SSD-spill
+            // boundary, never from a decode step. Metal hot path, no host stage.
             KvQuant::IsoKOnly3 | KvQuant::IsoKOnly4 => None,
             // V-only rotor variants and the rotor-K-asym variants early-return to
             // the bf16 decode seed at decode (`decode_fp16_k.is_some()`), so the
@@ -762,9 +765,9 @@ impl KvQuant {
             // at first append), matching the sdpa fast path:
             //   - QJL on (opt-in `--rotor-qjl on`): K append runs on CPU → CPU hot path.
             //   - QJL off (default): `rotor{3,4}_gpu_append_into_k_blocks`
-            //     dispatches the per-codec rotor MSL encode kernel → Metal hot
-            //     path (hybrid: the dequant restages host-side each step, but a
-            //     Metal kernel dispatches), so it is NOT a CPU-only codec.
+            //     dispatches the per-codec rotor MSL encode kernel, and decode
+            //     reads the packed ring through the rotor flash-decode kernel →
+            //     Metal hot path, GPU-resident end to end, no host stage.
             KvQuant::RotorKOnly3 | KvQuant::RotorKOnly4 => {
                 if crate::rotor_qjl::rotor_qjl_enabled() {
                     Some(
