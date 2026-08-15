@@ -243,5 +243,6 @@ pub fn load_from_path(model_dir: &Path) -> Result<LagunaText> {
         layers,
         final_norm,
         lm_head,
+        kv_bytes: crate::kv_bytes::KvBytesCounter::new(),
     })
 }

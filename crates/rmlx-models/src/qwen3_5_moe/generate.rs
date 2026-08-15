@@ -32,9 +32,7 @@ use crate::kv_cache::{
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
 use super::model::Qwen3_5MoeText;
-use super::prompt_cache::{
-    ensure_prompt_cache, store_kv_cache_bytes, Qwen35MoeEntry, PROMPT_CACHE,
-};
+use super::prompt_cache::{ensure_prompt_cache, Qwen35MoeEntry, PROMPT_CACHE};
 use crate::prompt_cache::{Consumed, ReuseKind, ReusePolicy};
 
 /// Greedy autoregressive generation using KV-cache prefill + decode.
@@ -225,7 +223,7 @@ pub fn generate_greedy<'a>(
         // N16: store KV-cache bytes (KV + linear-attn state) for /metrics/cache (post-decode).
         let kv_bytes: u64 = kv_caches.iter().map(|c| c.resident_bytes()).sum::<u64>()
             + lin_caches.iter().map(|c| c.resident_bytes()).sum::<u64>();
-        store_kv_cache_bytes(kv_bytes, post);
+        model.kv_bytes.store(kv_bytes, post);
         return Ok(steps);
     }
 
@@ -436,7 +434,7 @@ pub fn generate_greedy<'a>(
 
         let kv_bytes: u64 = kv_caches.iter().map(|c| c.resident_bytes()).sum::<u64>()
             + lin_caches.iter().map(|c| c.resident_bytes()).sum::<u64>();
-        store_kv_cache_bytes(kv_bytes, post);
+        model.kv_bytes.store(kv_bytes, post);
         return Ok(steps);
     }
 
@@ -679,7 +677,7 @@ pub fn generate_greedy<'a>(
     // N16: store KV-cache bytes (KV + linear-attn state) for /metrics/cache (post-decode).
     let kv_bytes: u64 = kv_caches.iter().map(|c| c.resident_bytes()).sum::<u64>()
         + lin_caches.iter().map(|c| c.resident_bytes()).sum::<u64>();
-    store_kv_cache_bytes(kv_bytes, post);
+    model.kv_bytes.store(kv_bytes, post);
 
     Ok(steps)
 }

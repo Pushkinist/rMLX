@@ -1412,58 +1412,6 @@ fn arch_cache_with_inner_mut_round_trip() {
     });
 }
 
-/// unit test #4: `store_kv_cache_bytes` + `read_kv_cache_bytes_sample`
-/// round-trip. Mirrors the per-request /metrics/cache wire path.
-#[test]
-fn arch_cache_kv_bytes_round_trip() {
-    let arch: ArchPromptCache<TestEntry> = ArchPromptCache::new("test-bytes", ReusePolicy::Partial);
-    let post = crate::decode_loop::PostDecode::for_test();
-    assert_eq!(
-        arch.read_kv_cache_bytes_sample().bytes,
-        0,
-        "fresh cache reports zero"
-    );
-    arch.store_kv_cache_bytes(424_242, post);
-    assert_eq!(arch.read_kv_cache_bytes_sample().bytes, 424_242);
-    arch.store_kv_cache_bytes(0, post);
-    assert_eq!(arch.read_kv_cache_bytes_sample().bytes, 0);
-}
-
-/// The store sequence separates "no generation has reported a byte count" from
-/// "a generation reported zero" — two states the bare byte value collapses into
-/// the same `0`. A caller that records the figure as a measurement reads the
-/// sequence, not the value, to decide whether it has one.
-#[test]
-fn arch_cache_kv_bytes_seq_distinguishes_unreported_from_zero() {
-    let arch: ArchPromptCache<TestEntry> = ArchPromptCache::new("test-seq", ReusePolicy::Partial);
-    let post = crate::decode_loop::PostDecode::for_test();
-
-    let fresh = arch.read_kv_cache_bytes_sample();
-    assert_eq!(fresh.seq, 0, "no store yet — sequence must still be zero");
-
-    // A genuine store of zero bytes is NOT the same state as "never stored",
-    // even though both report `bytes == 0`.
-    arch.store_kv_cache_bytes(0, post);
-    let reported_zero = arch.read_kv_cache_bytes_sample();
-    assert_eq!(reported_zero.bytes, 0);
-    assert_eq!(
-        reported_zero.seq, 1,
-        "a store of zero must still advance the sequence — otherwise it is \
-         indistinguishable from never having stored"
-    );
-
-    // Every store advances it, so a caller can tell "this generation reported"
-    // from "I am reading the previous generation's figure".
-    arch.store_kv_cache_bytes(4096, post);
-    assert_eq!(
-        arch.read_kv_cache_bytes_sample(),
-        KvBytesSample {
-            bytes: 4096,
-            seq: 2
-        }
-    );
-}
-
 /// unit test #5: `read_cache_stats` returns `None` for an
 /// uninitialised arch cache (no requests served yet). After installing a
 /// fresh `PromptCache`, the stats are observable.
@@ -2211,5 +2159,136 @@ fn consume_degrade_branches_each_emit_one_debug() {
             "non_reusable".to_owned(),
         ],
         "each consume degrade branch must emit exactly one debug!{{branch=...}}"
+    );
+}
+
+// ── ensure() + the zero-slot cache ──────────────────────────────────────────
+//
+// `ensure` runs once per generation on every arch, so its "already the right
+// capacity" arm has to be reachable for every value it is called with. When it
+// is not, the cache is rebuilt per generation: snapshots are discarded, the
+// hit/miss counters restart at zero, and the SSD sinks are re-installed — which
+// looks like "caching is off" from the outside while in fact building and
+// throwing away a cache each time. The counters are the sharp edge: a caller
+// reading cache activity as `after - before` around a generation then reads
+// `0 - 0` and cannot tell that from "nothing happened".
+//
+// The tests below need `ensure`, which is bounded on `SsdHydrator:
+// SsdHydrate<E>`. The SSD tier is never attached here, so this impl exists only
+// to satisfy that bound and is never called.
+impl SsdHydrate<TestEntry> for SsdHydrator {
+    fn hydrate(&self, _prompt_ids: &[u32]) -> Result<Option<TestEntry>> {
+        Ok(None)
+    }
+}
+
+/// Cumulative miss count observable across an arch cache, or 0 before the first
+/// `ensure` builds it.
+fn misses(arch: &ArchPromptCache<TestEntry>) -> u64 {
+    arch.read_cache_stats().map_or(0, |s| s.misses)
+}
+
+/// Two zero-slot generations must leave a cumulative miss count of 2.
+///
+/// Each generation calls `ensure(0)` and then consults the cache once. Reading
+/// `1` means the second `ensure(0)` rebuilt the cache and reset the counters, so
+/// the first generation's miss is gone.
+#[test]
+fn zero_slots_accumulates_misses_across_generations() {
+    let arch: ArchPromptCache<TestEntry> =
+        ArchPromptCache::new("test-zero-slots", ReusePolicy::Partial);
+    let prompt = make_ids(2 * BLOCK_TOKENS);
+
+    arch.ensure(0);
+    assert_eq!(
+        tag(&arch.consume(&prompt, TEST_QUANT, false)),
+        ConsumedTag::Miss
+    );
+    assert_eq!(misses(&arch), 1, "first generation must record its miss");
+
+    arch.ensure(0);
+    assert_eq!(
+        misses(&arch),
+        1,
+        "ensure(0) on a cache already built with 0 slots must be a no-op — a rebuild \
+         here resets the counters and erases the first generation's miss"
+    );
+
+    assert_eq!(
+        tag(&arch.consume(&prompt, TEST_QUANT, false)),
+        ConsumedTag::Miss
+    );
+    assert_eq!(
+        misses(&arch),
+        2,
+        "two zero-slot generations are two misses; 1 means the counters restarted"
+    );
+}
+
+/// Zero slots is a real disabled state, not a one-slot cache.
+///
+/// A snapshot offered to it is refused, so a repeat of the identical prompt
+/// cannot be served from RAM and re-prefills — which is what an operator asking
+/// for zero slots is asking for.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test-only: `ensure` on the line above installs the cache the closure unwraps"
+)]
+fn zero_slots_stores_nothing() {
+    let arch: ArchPromptCache<TestEntry> =
+        ArchPromptCache::new("test-zero-store", ReusePolicy::Partial);
+    let prompt = make_ids(2 * BLOCK_TOKENS);
+
+    arch.ensure(0);
+    let stored = arch.with_inner_mut(|g| {
+        g.as_mut()
+            .unwrap()
+            .push(TestEntry::for_quant(prompt.clone(), TEST_QUANT))
+    });
+    assert_eq!(
+        stored, None,
+        "a zero-slot cache must refuse admission rather than store into a clamped slot"
+    );
+
+    assert_eq!(
+        tag(&arch.consume(&prompt, TEST_QUANT, false)),
+        ConsumedTag::Miss,
+        "an identical repeat must still miss — a zero-slot cache serves nothing"
+    );
+}
+
+/// `ensure` still rebuilds when the capacity genuinely changes, and still does
+/// not when it has not. Without this the repair could be "never rebuild", which
+/// would silently ignore a capacity change between model loads.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test-only: `ensure` on the line above installs the cache the closure unwraps"
+)]
+fn ensure_rebuilds_only_on_a_real_capacity_change() {
+    let arch: ArchPromptCache<TestEntry> =
+        ArchPromptCache::new("test-ensure-rebuild", ReusePolicy::Partial);
+    let prompt = make_ids(2 * BLOCK_TOKENS);
+
+    arch.ensure(4);
+    arch.with_inner_mut(|g| {
+        g.as_mut()
+            .unwrap()
+            .push(TestEntry::for_quant(prompt.clone(), TEST_QUANT));
+    });
+
+    arch.ensure(4);
+    assert_eq!(
+        tag(&arch.consume(&prompt, TEST_QUANT, false)),
+        ConsumedTag::Exact,
+        "the same capacity must keep the stored snapshot"
+    );
+
+    arch.ensure(2);
+    assert_eq!(
+        tag(&arch.consume(&prompt, TEST_QUANT, false)),
+        ConsumedTag::Miss,
+        "a changed capacity must rebuild the cache and discard its snapshots"
     );
 }

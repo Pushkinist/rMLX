@@ -1274,64 +1274,63 @@ impl Architecture {
     }
 
     /// Actual on-device KV-cache bytes used by the most recent `generate_greedy`
-    /// call on this architecture, paired with the store sequence they were
+    /// call on **this model instance**, paired with the store sequence they were
     /// written at.
     ///
-    /// Reads the arch-specific prompt-cache static that `generate_greedy` writes
-    /// via `store_kv_cache_bytes` at the end of every generate call.
+    /// Reads the [`crate::kv_bytes::KvBytesCounter`] the model owns, which its
+    /// generate path writes at the end of every generate call. Per instance, not
+    /// per arch: two models of the same architecture resident at once each keep
+    /// their own count, so a reader can never be handed the other one's figure
+    /// under this one's name.
     ///
     /// Callers that *record* the byte count as a measurement must sample this
     /// before and after the generation and require
-    /// [`crate::prompt_cache::KvBytesSample::seq`] to have advanced. Without
-    /// that check, a generation that returns before
-    /// reaching the store (an early-out prefill path, or an arch that does not
-    /// maintain the static) yields the previous call's byte count — or the `0`
-    /// initialiser — with nothing to distinguish it from a fresh reading.
-    pub fn kv_cache_bytes_sample(&self) -> crate::prompt_cache::KvBytesSample {
+    /// [`crate::kv_bytes::KvBytesSample::seq`] to have advanced. Without that
+    /// check, a generation that returns before reaching the store (an early-out
+    /// prefill path, or an arch that does not maintain the counter) yields the
+    /// previous call's byte count — or the `0` initialiser — with nothing to
+    /// distinguish it from a fresh reading.
+    pub fn kv_cache_bytes_sample(&self) -> crate::kv_bytes::KvBytesSample {
         match self {
-            Architecture::Gemma4(_) => crate::gemma4::gemma4_kv_cache_bytes_sample(),
-            Architecture::Gemma3(_) => crate::gemma3::gemma3_kv_cache_bytes_sample(),
-            Architecture::Qwen3_5Moe(_) => crate::qwen3_5_moe::qwen3_5_moe_kv_cache_bytes_sample(),
-            Architecture::Qwen3(_) => crate::qwen3::read_kv_cache_bytes_sample(),
-            Architecture::Qwen2(_) => crate::qwen2::qwen2_kv_cache_bytes_sample(),
-            Architecture::BitNet(_) => crate::bitnet::bitnet_kv_cache_bytes_sample(),
-            Architecture::Qwen3VlMoe(_) => {
-                crate::qwen3_vl_moe::qwen3_vl_moe_kv_cache_bytes_sample()
-            }
-            Architecture::Laguna(_) => crate::laguna::laguna_kv_cache_bytes_sample(),
+            Architecture::Gemma4(m) => m.kv_bytes.sample(),
+            Architecture::Gemma3(m) => m.kv_bytes.sample(),
+            Architecture::Qwen3_5Moe(m) => m.kv_bytes.sample(),
+            Architecture::Qwen3(m) => m.kv_bytes.sample(),
+            Architecture::Qwen2(m) => m.kv_bytes.sample(),
+            Architecture::BitNet(m) => m.kv_bytes.sample(),
+            Architecture::Qwen3VlMoe(m) => m.text.kv_bytes.sample(),
+            Architecture::Laguna(m) => m.kv_bytes.sample(),
         }
     }
 
     /// Record the KV-cache byte total the generation that just finished on this
-    /// architecture produced.
+    /// model instance produced.
     ///
-    /// The write counterpart of [`Self::kv_cache_bytes_sample`], dispatching to
-    /// the same per-arch static. Generation paths that own their caches
+    /// The write counterpart of [`Self::kv_cache_bytes_sample`], reaching the
+    /// same per-instance counter. Generation paths that own their caches
     /// directly — the speculative round loops, which never call
     /// `generate_greedy` and so never reach an arch's own store site — report
     /// through here, so a caller that samples around the call can attribute the
     /// figure to it. Without the store, every such caller reads
-    /// [`crate::prompt_cache::KvBytesVerdict::Unreported`] forever: correct, but
+    /// [`crate::kv_bytes::KvBytesVerdict::Unreported`] forever: correct, but
     /// no measurement.
+    ///
+    /// A speculative pair reports on its **verifier**, which is the model whose
+    /// KV the figure describes. When draft and verifier share an architecture
+    /// that is still unambiguous, because each holds its own counter.
     ///
     /// `post` is the witness minted by the decode phase, which pins the sample
     /// to after decode — see [`crate::decode_loop::PostDecode`].
     pub(crate) fn store_kv_cache_bytes(&self, n: u64, post: crate::decode_loop::PostDecode) {
         match self {
-            Architecture::Gemma4(_) => crate::gemma4::prompt_cache::store_kv_cache_bytes(n, post),
-            Architecture::Gemma3(_) => crate::gemma3::prompt_cache::store_kv_cache_bytes(n, post),
-            Architecture::Qwen3_5Moe(_) => {
-                crate::qwen3_5_moe::prompt_cache::store_kv_cache_bytes(n, post);
-            }
-            Architecture::Qwen3(_) => {
-                crate::qwen3::QWEN3_PROMPT_CACHE.store_kv_cache_bytes(n, post);
-            }
-            Architecture::Qwen2(_) => crate::qwen2::prompt_cache::store_kv_cache_bytes(n, post),
-            Architecture::BitNet(_) => crate::bitnet::prompt_cache::store_kv_cache_bytes(n, post),
-            Architecture::Qwen3VlMoe(_) => {
-                crate::qwen3_vl_moe::prompt_cache::store_kv_cache_bytes(n, post);
-            }
-            Architecture::Laguna(_) => crate::laguna::prompt_cache::store_kv_cache_bytes(n, post),
+            Architecture::Gemma4(m) => m.kv_bytes.store(n, post),
+            Architecture::Gemma3(m) => m.kv_bytes.store(n, post),
+            Architecture::Qwen3_5Moe(m) => m.kv_bytes.store(n, post),
+            Architecture::Qwen3(m) => m.kv_bytes.store(n, post),
+            Architecture::Qwen2(m) => m.kv_bytes.store(n, post),
+            Architecture::BitNet(m) => m.kv_bytes.store(n, post),
+            Architecture::Qwen3VlMoe(m) => m.text.kv_bytes.store(n, post),
+            Architecture::Laguna(m) => m.kv_bytes.store(n, post),
         }
     }
 

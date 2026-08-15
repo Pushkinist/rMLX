@@ -42,7 +42,6 @@ pub use generate::generate_greedy;
 pub use loader::load_from_path;
 pub use model::BitNetText;
 pub use prompt_cache::read_cache_stats as bitnet_cache_stats;
-pub use prompt_cache::read_kv_cache_bytes_sample as bitnet_kv_cache_bytes_sample;
 
 #[cfg(test)]
 #[path = "tests.rs"]

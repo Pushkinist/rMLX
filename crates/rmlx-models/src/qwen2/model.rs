@@ -406,6 +406,10 @@ pub struct Qwen2Text {
     pub(super) final_norm: RmsNorm,
     /// `None` when `tie_word_embeddings = true`.
     pub(super) lm_head: Option<Linear>,
+    /// Resident-KV byte total of this instance's last generation, paired with a
+    /// store sequence. Per model instance, never per arch — two models of the
+    /// same architecture must not write each other's figure.
+    pub(crate) kv_bytes: crate::kv_bytes::KvBytesCounter,
 }
 
 impl Qwen2Text {

@@ -55,7 +55,6 @@ pub use preprocessor::{
     Gemma4ImageProcessorConfig, Gemma4PixelValues, MAX_SUPPORTED_SOFT_TOKENS,
 };
 pub use prompt_cache::read_cache_stats as gemma4_cache_stats;
-pub use prompt_cache::read_kv_cache_bytes_sample as gemma4_kv_cache_bytes_sample;
 pub use vision::unified::{
     build_unified_inputs_embeds, is_unified_arch, load_unified_vision_embedder,
     unified_image_processor_config, unified_num_soft_tokens, UnifiedVisionConfig,

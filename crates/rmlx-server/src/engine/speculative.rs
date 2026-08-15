@@ -502,8 +502,12 @@ impl Generator for SpeculativeGenerator {
     }
 
     fn kv_cache_bytes(&self) -> u64 {
-        // SpeculativeDispatcher wraps a Gemma4 verifier — reads its static.
-        rmlx_models::gemma4::gemma4_kv_cache_bytes_sample().bytes
+        // The KV this figure describes is the verifier's, and the counter lives
+        // on the verifier instance — so read it there rather than naming an
+        // arch. Verifier arch varies with the drafter (eagle3 / dflash / mtp
+        // require a Qwen3.5-MoE verifier), so a hard-coded arch reads another
+        // model's number for most pairs.
+        self.dispatcher.verifier.kv_cache_bytes()
     }
 
     fn load_phases(&self) -> Option<rmlx_models::LoadPhases> {

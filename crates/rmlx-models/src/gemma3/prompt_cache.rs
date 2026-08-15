@@ -1,8 +1,8 @@
 //! Gemma3 prompt-cache entry + global.
 //!
 //! The heavy lifting (static cache, SSD attach/install, ensure, stats readback,
-//! last-bytes counter, and the find → SSD-hydrate retry → quant-guard → Exact →
-//! Miss consume decision) is unified in
+//! and the find → SSD-hydrate retry → quant-guard → Exact → Miss consume
+//! decision) is unified in
 //! [`crate::prompt_cache::ArchPromptCache`]. This file keeps only the genuinely
 //! Gemma3-specific bits:
 //!
@@ -50,9 +50,7 @@
 #![allow(clippy::redundant_closure_for_method_calls)]
 use rmlx_core::error::Result;
 
-use crate::prompt_cache::{
-    ArchPromptCache, CacheStats, KvBytesSample, PromptCacheEntry, ReusePolicy, SsdHydrate,
-};
+use crate::prompt_cache::{ArchPromptCache, CacheStats, PromptCacheEntry, ReusePolicy, SsdHydrate};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 use rmlx_kv_ssd::{HydratedBlock, SsdHydrator};
 
@@ -249,16 +247,6 @@ pub(crate) fn ensure_prompt_cache(capacity: usize) {
 /// Read the current hit/miss/bytes stats for the Gemma3 prompt cache.
 pub fn read_cache_stats() -> Option<CacheStats> {
     PROMPT_CACHE.read_cache_stats()
-}
-
-/// Read the KV-cache bytes from the last completed Gemma3 request.
-pub fn read_kv_cache_bytes_sample() -> KvBytesSample {
-    PROMPT_CACHE.read_kv_cache_bytes_sample()
-}
-
-/// Record the KV-cache byte total for the just-completed request.
-pub(crate) fn store_kv_cache_bytes(n: u64, post: crate::decode_loop::PostDecode) {
-    PROMPT_CACHE.store_kv_cache_bytes(n, post);
 }
 
 #[cfg(test)]

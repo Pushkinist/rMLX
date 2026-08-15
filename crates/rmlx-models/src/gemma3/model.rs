@@ -26,6 +26,10 @@ pub struct Gemma3Text {
     pub(super) layers: Vec<DecoderLayer>,
     pub(super) final_norm: super::layers::RmsNormShifted,
     pub(super) lm_head: Option<Linear>, // None when weight-tied to embed_tokens
+    /// Resident-KV byte total of this instance's last generation, paired with a
+    /// store sequence. Per model instance, never per arch — two models of the
+    /// same architecture must not write each other's figure.
+    pub(crate) kv_bytes: crate::kv_bytes::KvBytesCounter,
 }
 
 impl Gemma3Text {

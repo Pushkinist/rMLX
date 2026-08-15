@@ -173,6 +173,10 @@ pub struct Gemma4Text {
     pub(super) final_norm: crate::layers::RmsNorm,
     /// `previous_kvs[i]` = index of the layer whose KV layer `i` should use.
     pub(super) previous_kvs: Vec<usize>,
+    /// Resident-KV byte total of this instance's last generation, paired with a
+    /// store sequence. Per model instance, never per arch — two models of the
+    /// same architecture must not write each other's figure.
+    pub(crate) kv_bytes: crate::kv_bytes::KvBytesCounter,
 }
 
 impl Gemma4Text {

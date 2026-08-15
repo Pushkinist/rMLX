@@ -24,9 +24,7 @@ use crate::sampler::apply_mask_argmax;
 use rmlx_kv_quant::{KvCache, KV_MAX_SEQ_DEFAULT};
 
 use super::model::Qwen2Text;
-use super::prompt_cache::{
-    active_layout_key, ensure_prompt_cache, store_kv_cache_bytes, Qwen2Entry, PROMPT_CACHE,
-};
+use super::prompt_cache::{active_layout_key, ensure_prompt_cache, Qwen2Entry, PROMPT_CACHE};
 
 // ---------------------------------------------------------------------------
 // Smoke probe — generate_greedy
@@ -219,7 +217,7 @@ pub fn generate_greedy(
 
         {
             let kv_bytes: u64 = caches.iter().map(|c| c.resident_bytes()).sum();
-            store_kv_cache_bytes(kv_bytes, post);
+            model.kv_bytes.store(kv_bytes, post);
         }
         log_decode_profile(
             0.0,
@@ -494,7 +492,7 @@ pub fn generate_greedy(
     // exact-hit path above.
     {
         let kv_bytes: u64 = caches.iter().map(|c| c.resident_bytes()).sum();
-        store_kv_cache_bytes(kv_bytes, post);
+        model.kv_bytes.store(kv_bytes, post);
     }
 
     log_decode_profile(

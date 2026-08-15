@@ -38,6 +38,7 @@ pub mod gated_delta_msl;
 pub mod gemma3;
 pub mod gemma4;
 pub mod jina_v4;
+pub mod kv_bytes;
 pub mod kv_cache;
 pub mod laguna;
 pub mod layers;
@@ -77,6 +78,7 @@ pub use decode_loop::{ProbeStep, SmokeVerdict};
 // per-arch `attach_at_load` switch and calls `rmlx_kv_ssd::prepare_attach`.
 // The `pub use rmlx_kv_ssd as kv_ssd;` convenience alias was dropped —
 // there were zero callers. Import directly from `rmlx_kv_ssd`.
-pub use prompt_cache::{classify_kv_bytes, CacheStats, KvBytesSample, KvBytesVerdict};
+pub use kv_bytes::{classify_kv_bytes, KvBytesSample, KvBytesVerdict};
+pub use prompt_cache::CacheStats;
 pub use sampler::{Pcg32, PenaltyConfig, SamplerConfig, TokenLogprobs};
 pub use speculative::{DraftKind, SpeculativeDispatcher};

@@ -25,9 +25,7 @@ use crate::sampler::apply_mask_argmax;
 use rmlx_kv_quant::{KvCache, KV_MAX_SEQ_DEFAULT};
 
 use super::model::LagunaText;
-use super::prompt_cache::{
-    active_layout_key, ensure_prompt_cache, store_kv_cache_bytes, LagunaEntry, PROMPT_CACHE,
-};
+use super::prompt_cache::{active_layout_key, ensure_prompt_cache, LagunaEntry, PROMPT_CACHE};
 
 // ---------------------------------------------------------------------------
 // Smoke probe -- generate_greedy
@@ -221,7 +219,7 @@ pub fn generate_greedy(
 
         {
             let kv_bytes: u64 = caches.iter().map(|c| c.resident_bytes()).sum();
-            store_kv_cache_bytes(kv_bytes, post);
+            model.kv_bytes.store(kv_bytes, post);
         }
         tracing::info!(
             arch = "LagunaForCausalLM",
@@ -503,7 +501,7 @@ pub fn generate_greedy(
     // exact-hit path above.
     {
         let kv_bytes: u64 = caches.iter().map(|c| c.resident_bytes()).sum();
-        store_kv_cache_bytes(kv_bytes, post);
+        model.kv_bytes.store(kv_bytes, post);
     }
 
     let prefill_ms = (prefill_total_ns as f64) / 1.0e6;

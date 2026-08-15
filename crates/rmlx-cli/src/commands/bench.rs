@@ -54,9 +54,9 @@ pub(crate) const MIN_RUNS: u32 = 2;
 ///
 /// What prevents that is [`arch::Architecture::clear_prompt_cache`], called
 /// before every generation: the RAM slots are emptied, so the next request
-/// misses. Asking for *zero* slots would not do it — capacity is clamped to a
-/// minimum of one, so a "zero-slot" cache still stores and can still serve a
-/// snapshot.
+/// misses. Asking for *zero* slots would also miss every time, but it would
+/// measure a cache no operator runs — the point is to time the configuration
+/// that gets served, with its snapshots dropped between runs.
 ///
 /// A RAM miss is not the same as a prefill: the clear does not detach an SSD KV
 /// source, which can serve the miss from a `.kvb` instead. So

@@ -25,6 +25,11 @@
 //!      zero if the sample point ever drifts back before decode. That makes it a
 //!      re-drift guard: move the sample to pre-decode and this test goes red.
 //!
+//! A third, `kv_bytes_counter_is_per_model_instance`, loads the snapshot TWICE
+//! and proves a generation on one instance does not move the other's sample.
+//! Two models of the *same* architecture is the discriminator: an arch-keyed
+//! counter is correct for every other pairing and wrong only for this one.
+//!
 //! `#[ignore]` so plain `cargo test` skips it (needs a real model + GPU).
 
 #![allow(
@@ -328,5 +333,91 @@ fn kv_bytes_grows_with_decode_length() {
         "a longer decode ({n_long} tokens = {bytes_long} B) must record MORE KV bytes than a \
          shorter one ({n_short} tokens = {bytes_short} B) at equal prefill length — equality \
          means the sample was taken before decode, so the decode-time ring is invisible"
+    );
+}
+
+/// Cross-attribution guard: the KV-byte counter belongs to a model *instance*.
+///
+/// The same snapshot is loaded twice, so both models share an architecture —
+/// the one pairing an arch-keyed counter cannot tell apart. Model B then runs a
+/// generation sized to record a clearly different byte total, and model A's
+/// sample is read without A having generated again.
+///
+/// With a per-arch counter, B's store advances the sequence A's bracket is
+/// watching, `classify_kv_bytes` returns `Reported(B's bytes)`, and that figure
+/// is written to the append-only `events` table under A's name. With a
+/// per-instance counter A's sample is untouched and the verdict is
+/// `Unreported`, which is the truth: A did not generate.
+///
+/// `slots = 0` disables the prompt cache, so every generation below is a real
+/// prefill and neither model can be served from the other's snapshot.
+#[ignore]
+#[test]
+fn kv_bytes_counter_is_per_model_instance() {
+    let Some((model_a, tokenizer)) = load() else {
+        return;
+    };
+    let Some((model_b, _)) = load() else {
+        return;
+    };
+
+    let encode = |text: &str| -> Vec<u32> {
+        tokenizer
+            .encode(text, true)
+            .expect("tokenize")
+            .get_ids()
+            .to_vec()
+    };
+    // Distinct prompts and decode lengths, so B's recorded figure differs from
+    // A's and a leaked value is visible in the bytes as well as the sequence.
+    let prompt_a = encode("Alpha bravo charlie delta echo foxtrot golf hotel.");
+    let prompt_b = encode(
+        &"Kilo lima mike november oscar papa quebec romeo sierra tango uniform victor. ".repeat(24),
+    );
+
+    let a0 = model_a.kv_cache_bytes_sample();
+    let a_bytes = generate_and_read_bytes(&model_a, &tokenizer, &prompt_a, 8, RING_CODEC, 0);
+    let a1 = model_a.kv_cache_bytes_sample();
+
+    // A's own generation must move A's sample — otherwise the assertions below
+    // hold for a model that reports nothing at all, and prove nothing.
+    assert!(
+        a1.seq > a0.seq,
+        "model A's own generation must advance its own sequence ({} -> {})",
+        a0.seq,
+        a1.seq
+    );
+    assert!(a_bytes > 0, "model A recorded zero KV bytes");
+
+    // A whole generation on B, with no generation on A.
+    let b_bytes = generate_and_read_bytes(&model_b, &tokenizer, &prompt_b, 128, RING_CODEC, 0);
+    let a2 = model_a.kv_cache_bytes_sample();
+
+    println!(
+        "[kv_bytes_counter_is_per_model_instance] arch={} codec={RING_CODEC} \
+         a_bytes={a_bytes} b_bytes={b_bytes} a_seq={} -> {} -> {}",
+        model_a.arch_class(),
+        a0.seq,
+        a1.seq,
+        a2.seq
+    );
+
+    // The two figures must actually differ, or a leak would be invisible.
+    assert_ne!(
+        a_bytes, b_bytes,
+        "the two generations must record different byte totals for this test to \
+         discriminate — raise the difference in prompt or decode length"
+    );
+
+    assert_eq!(
+        a2, a1,
+        "a generation on another model of the same architecture must not move this \
+         model's sample"
+    );
+    assert_eq!(
+        rmlx_models::classify_kv_bytes(a1, a2),
+        rmlx_models::KvBytesVerdict::Unreported,
+        "with no generation of its own, model A must have nothing to record — not \
+         model B's byte count wearing model A's label"
     );
 }

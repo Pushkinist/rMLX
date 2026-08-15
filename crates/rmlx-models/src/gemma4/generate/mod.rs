@@ -51,7 +51,7 @@ use crate::prompt_cache::{Consumed, ReuseKind, ReusePolicy, BLOCK_TOKENS};
 use rmlx_kv_quant::{KvCache, KvQuant};
 
 use super::model::Gemma4Text;
-use super::prompt_cache::{ensure_prompt_cache, store_kv_cache_bytes, Gemma4Entry, PROMPT_CACHE};
+use super::prompt_cache::{ensure_prompt_cache, Gemma4Entry, PROMPT_CACHE};
 
 // ---------------------------------------------------------------------------
 // Generate
@@ -65,8 +65,8 @@ use super::prompt_cache::{ensure_prompt_cache, store_kv_cache_bytes, Gemma4Entry
 ///
 /// `prompt_cache_slots` — number of post-prefill KV snapshots kept across
 /// requests. Pass 1 for single-slot; pass N for multi-slot prefix matching.
-/// Recommended: 4. Set to 0 to disable caching (treated as 1 by the
-/// underlying `PromptCache::new(capacity.max(1))`).
+/// Recommended: 4. Pass 0 to disable the cache: nothing is stored, so every
+/// request prefills.
 ///
 /// See CLAUDE.md "mxfp8 broken-snapshot hazard" for why NaN detection exists.
 #[allow(clippy::too_many_arguments)]
@@ -296,7 +296,9 @@ pub fn generate_greedy<'a>(
             "decode_profile"
         );
         // store KV-cache bytes for the /metrics/cache endpoint (post-decode).
-        store_kv_cache_bytes(kv_caches.iter().map(|c| c.resident_bytes()).sum(), post);
+        model
+            .kv_bytes
+            .store(kv_caches.iter().map(|c| c.resident_bytes()).sum(), post);
         return Ok(steps);
     }
 
@@ -740,7 +742,7 @@ pub fn generate_greedy<'a>(
 
     // N16: store KV-cache bytes for the /metrics/cache endpoint (post-decode).
     let kv_bytes: u64 = caches.iter().map(|c| c.resident_bytes()).sum();
-    store_kv_cache_bytes(kv_bytes, post);
+    model.kv_bytes.store(kv_bytes, post);
 
     Ok(steps)
 }

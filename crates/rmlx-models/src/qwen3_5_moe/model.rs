@@ -68,6 +68,10 @@ pub struct Qwen3_5MoeText {
     /// Cached gathered LM-head rows for the EAGLE-3 restricted-vocab hot-path.
     /// Populated lazily on the first call to `hot_logits_from_final_hidden`.
     pub(super) cached_hot_head: std::sync::OnceLock<CachedHotHead>,
+    /// Resident-KV byte total of this instance's last generation, paired with a
+    /// store sequence. Per model instance, never per arch — two models of the
+    /// same architecture must not write each other's figure.
+    pub(crate) kv_bytes: crate::kv_bytes::KvBytesCounter,
 }
 
 impl Qwen3_5MoeText {

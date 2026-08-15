@@ -40,9 +40,7 @@ use rmlx_kv_quant::{KvCache, KvQuant};
 use super::image::{scatter_vision_features, visual_token_positions};
 use super::model::Qwen3VlMoeText;
 use super::mrope::{get_rope_index, RopeIndex3D};
-use super::prompt_cache::{
-    active_layout_key, ensure_prompt_cache, store_kv_cache_bytes, Qwen3VlMoeEntry, PROMPT_CACHE,
-};
+use super::prompt_cache::{active_layout_key, ensure_prompt_cache, Qwen3VlMoeEntry, PROMPT_CACHE};
 use super::vision::VisionOutput;
 
 /// Trailing-window size for repetition penalties (matches the other archs).
@@ -226,7 +224,7 @@ pub fn generate_greedy(
             token_history,
         )?;
         let kv_bytes: u64 = kv.iter().map(|c| c.resident_bytes()).sum();
-        store_kv_cache_bytes(kv_bytes, post);
+        model.kv_bytes.store(kv_bytes, post);
         return Ok(steps);
     }
 
@@ -347,7 +345,7 @@ pub fn generate_greedy(
     // sample includes it on ring-backed codecs. Same lifecycle point as the
     // exact-hit path above.
     let kv_bytes: u64 = kv.iter().map(|c| c.resident_bytes()).sum();
-    store_kv_cache_bytes(kv_bytes, post);
+    model.kv_bytes.store(kv_bytes, post);
     Ok(steps)
 }
 

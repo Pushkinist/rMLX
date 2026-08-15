@@ -34,9 +34,7 @@ use rmlx_kv_quant::{KvCache, KV_MAX_SEQ_DEFAULT};
 
 use super::loader::load_from_path;
 use super::model::Gemma3Text;
-use super::prompt_cache::{
-    active_layout_key, ensure_prompt_cache, store_kv_cache_bytes, Gemma3Entry, PROMPT_CACHE,
-};
+use super::prompt_cache::{active_layout_key, ensure_prompt_cache, Gemma3Entry, PROMPT_CACHE};
 
 // ---------------------------------------------------------------------------
 // probe_forward -- CLI entry point
@@ -470,7 +468,9 @@ pub fn generate_greedy<'a>(
     );
 
     // store KV-cache bytes for the /metrics/cache endpoint (post-decode).
-    store_kv_cache_bytes(caches.iter().map(KvCache::resident_bytes).sum(), post);
+    model
+        .kv_bytes
+        .store(caches.iter().map(KvCache::resident_bytes).sum(), post);
 
     Ok(steps)
 }
@@ -567,7 +567,9 @@ fn exact_hit_decode<'a>(
     );
 
     // store KV-cache bytes for the /metrics/cache endpoint (post-decode).
-    store_kv_cache_bytes(caches.iter().map(KvCache::resident_bytes).sum(), post);
+    model
+        .kv_bytes
+        .store(caches.iter().map(KvCache::resident_bytes).sum(), post);
 
     Ok(steps)
 }

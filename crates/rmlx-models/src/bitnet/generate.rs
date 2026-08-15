@@ -23,9 +23,7 @@ use crate::sampler::apply_mask_argmax;
 use rmlx_kv_quant::{KvCache, KV_MAX_SEQ_DEFAULT};
 
 use super::model::BitNetText;
-use super::prompt_cache::{
-    active_layout_key, ensure_prompt_cache, store_kv_cache_bytes, BitNetEntry, PROMPT_CACHE,
-};
+use super::prompt_cache::{active_layout_key, ensure_prompt_cache, BitNetEntry, PROMPT_CACHE};
 
 // ---------------------------------------------------------------------------
 // Greedy generation
@@ -160,7 +158,7 @@ pub fn generate_greedy(
 
         {
             let kv_bytes: u64 = caches.iter().map(|c| c.resident_bytes()).sum();
-            store_kv_cache_bytes(kv_bytes, post);
+            model.kv_bytes.store(kv_bytes, post);
         }
         info!(
             arch = "BitNetForCausalLM",
@@ -430,7 +428,7 @@ pub fn generate_greedy(
     // exact-hit path above.
     {
         let kv_bytes: u64 = caches.iter().map(|c| c.resident_bytes()).sum();
-        store_kv_cache_bytes(kv_bytes, post);
+        model.kv_bytes.store(kv_bytes, post);
     }
 
     info!(
