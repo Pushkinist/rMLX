@@ -1123,6 +1123,9 @@ pub(crate) fn run_serve(
             session_cache: Arc::new(parking_lot::Mutex::new(rmlx_server::SessionCache::new(
                 session_cache_max_sessions,
             ))),
+            // The configured base the session path widens (and, at 0, must not
+            // re-enable).
+            prompt_cache_slots,
             // L6: TTFT ring-buffer — empty at startup, populated on first request.
             ttft_store: TtftStore::default(),
             // M30: ITL ring-buffer — empty at startup, populated after first decode.

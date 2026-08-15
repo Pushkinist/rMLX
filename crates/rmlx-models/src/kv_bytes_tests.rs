@@ -3,7 +3,7 @@ use super::*;
 /// Store → sample round-trip. Mirrors the per-request `/metrics/cache` wire path.
 #[test]
 fn counter_round_trip() {
-    let counter = KvBytesCounter::new();
+    let counter = KvBytesCounter::default();
     let post = crate::decode_loop::PostDecode::for_test();
     assert_eq!(counter.sample().bytes, 0, "fresh counter reports zero");
     counter.store(424_242, post);
@@ -18,7 +18,7 @@ fn counter_round_trip() {
 /// sequence, not the value, to decide whether it has one.
 #[test]
 fn seq_distinguishes_unreported_from_zero() {
-    let counter = KvBytesCounter::new();
+    let counter = KvBytesCounter::default();
     let post = crate::decode_loop::PostDecode::for_test();
 
     assert_eq!(
@@ -62,8 +62,8 @@ fn seq_distinguishes_unreported_from_zero() {
 /// `tests/kv_bytes_sample_point.rs::kv_bytes_counter_is_per_model_instance`.
 #[test]
 fn two_counters_do_not_cross_attribute() {
-    let a = KvBytesCounter::new();
-    let b = KvBytesCounter::new();
+    let a = KvBytesCounter::default();
+    let b = KvBytesCounter::default();
     let post = crate::decode_loop::PostDecode::for_test();
 
     a.store(1_000, post);

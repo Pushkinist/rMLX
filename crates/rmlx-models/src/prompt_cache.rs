@@ -69,9 +69,50 @@ pub(crate) use rmlx_kv_ssd::{
     chained_block_hashes_seeded, SsdHydrate, BLOCK_TOKENS, FNV_OFFSET, FNV_PRIME,
 };
 // `chained_block_hashes` (the un-seeded form) is no longer used by this module
-// directly — `find_best_prefix` now always salts with a caller-supplied seed
-// (issue #26). It is still consumed by sibling `#[path]` test modules and by
+// directly — `find_best_prefix` now always salts with a caller-supplied seed.
+// It is still consumed by sibling `#[path]` test modules and by
 // `gemma4::prompt_cache`, which import it directly from `rmlx_kv_ssd`.
+
+/// Stable per-model identity, folded into the prompt-cache key by
+/// [`cache_seed`].
+///
+/// Derived from the snapshot directory's own name (its registry id, e.g.
+/// `mlx-community__gemma-4-e2b-it-mxfp8`) rather than the full path, so the
+/// same model resolves to the same signature whichever absolute path it was
+/// loaded through — the SSD tier's `.kvb` digests are seeded with this, and
+/// they have to survive a restart.
+pub(crate) fn model_cache_sig(model_dir: &std::path::Path) -> u64 {
+    let id = model_dir
+        .file_name()
+        .map_or_else(|| model_dir.as_os_str(), |name| name)
+        .to_string_lossy();
+    crate::multimodal_cache::model_sig(&id)
+}
+
+/// The block-digest seed a prompt-cache lookup and its matching push must both
+/// use.
+///
+/// Three things partition the key, and every one of them is a case where reusing
+/// another entry's K/V would be wrong rather than merely unhelpful:
+///
+/// - `model_sig` — **which model produced this K/V.** The prompt cache is one
+///   static per architecture, so two models of the same arch resident at once
+///   (the multi-model registry, or a speculative pair) share it. Without this
+///   term, model B's identical prompt matches model A's slot, the token-id
+///   equality check passes because the tokens *are* equal, and B decodes from
+///   A's K/V and A's first token — wrong output, silently.
+/// - `layout_key` — the SSD tier's `(arch, n_layers, n_kv_heads, head_dim,
+///   kv_quant)` shape key, or `0` when the tier is OFF. It is a *shape*
+///   identity and carries no model identity, which is why `model_sig` is a
+///   separate term rather than something to fold into it.
+/// - `kv_quant` — the codec the stored K/V is packed under.
+///
+/// One function so the lookup and push sides cannot drift: a push seeded
+/// differently from the query is not a bug that surfaces as a wrong answer, it
+/// surfaces as a cache that silently never hits.
+pub(crate) fn cache_seed(layout_key: u64, kv_quant: KvQuant, model_sig: u64) -> u64 {
+    FNV_OFFSET ^ layout_key ^ kv_quant.cache_key_salt() ^ model_sig
+}
 
 /// Default RAM cap for the prompt cache (2 GiB).
 pub(crate) const DEFAULT_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -603,6 +644,14 @@ impl<E: PromptCacheEntry> PromptCache<E> {
     ///
     /// [`find_best_prefix`]: PromptCache::find_best_prefix
     pub(crate) fn hydrate_from_ssd(&mut self, prompt_ids: &[u32]) -> Option<usize> {
+        // A zero-slot cache can admit nothing, so hydrating would read a `.kvb`
+        // off disk and reconstruct its K/V only for `push` to refuse it — once
+        // per request, for the life of the process. Worse, the refusal would
+        // arrive at the over-cap branch below and be logged as "exceeds RAM
+        // cap", which is not what happened.
+        if self.capacity == 0 {
+            return None;
+        }
         // Take the source out so the `&self` borrow during `hydrate` does not
         // conflict with the `&mut self` `push` below; put it back after.
         let source = self.ssd.take()?;
@@ -1211,9 +1260,10 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
     ///    find, no evict side-effect). The cached K/V is keyed by token ids
     ///    only; an image prompt's K/V depends on scattered vision features, so
     ///    it must never be served from or stored under a token-id key.
-    /// 2. Compute the codec-partitioned seed from `active_layout_key()` +
-    ///    `kv_quant.cache_key_salt()` so a slot stored under a different KV codec
-    ///    never cross-serves.
+    /// 2. Compute the partitioned seed via [`cache_seed`] from
+    ///    `active_layout_key()` + the KV codec + `model_sig`, so a slot stored
+    ///    by a different model, under a different codec, or for a different
+    ///    cache layout never cross-serves.
     /// 3. `find_best_prefix` (capturing `block_count`) + the hydrate-from-SSD
     ///    retry (no-op when the tier is OFF).
     /// 4. Quant-mismatch guard: a stored `KvQuant` that differs from the runtime
@@ -1232,11 +1282,17 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
     /// Every degrade branch emits exactly one `debug!{branch, reason}` so the
     /// decision is reconstructable from a single run's log — the cached arches
     /// previously had silent degrade arms.
+    ///
+    /// `model_sig` identifies the model asking. It is not decoration: this
+    /// cache is one static per *architecture*, so it is shared by every model
+    /// of that arch the process has resident, and the token-id equality the
+    /// `Exact` arm checks cannot tell two models' identical prompts apart.
     pub(crate) fn consume(
         &self,
         prompt_ids: &[u32],
         kv_quant: KvQuant,
         has_image: bool,
+        model_sig: u64,
     ) -> Consumed<E> {
         // (1) Image prompts bypass the cache entirely — no find, no evict.
         if has_image {
@@ -1249,9 +1305,10 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
             return Consumed::Miss;
         }
 
-        // (2) Codec-partitioned seed: identical to the per-arch push seed, so a
-        // slot stored under a different KV codec / layout never matches.
-        let seed = FNV_OFFSET ^ self.active_layout_key() ^ kv_quant.cache_key_salt();
+        // (2) Partitioned seed: identical to the per-arch push seed, so a slot
+        // stored by a different model, or under a different KV codec / layout,
+        // never matches.
+        let seed = cache_seed(self.active_layout_key(), kv_quant, model_sig);
         let policy = self.policy;
         let arch = self.arch_name;
 

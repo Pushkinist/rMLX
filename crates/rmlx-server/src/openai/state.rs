@@ -579,6 +579,17 @@ pub struct AppState {
     /// effective `prompt_cache_slots` (base + active_count) passed to
     /// `generate_greedy` via `GenerationRequest::effective_prompt_cache_slots`.
     pub session_cache: Arc<PLMutex<SessionCache>>,
+    /// Prompt-cache slots this server was configured with
+    /// (`--prompt-cache-slots`), before any per-request session adjustment.
+    ///
+    /// The session-KV-reuse path needs it for two reasons. It has to widen the
+    /// operator's setting rather than replace it — a hard-coded base gives
+    /// someone who asked for 8 slots a 4-slot cache. And `0` means the cache is
+    /// disabled, which a request header must not be able to undo: re-enabling
+    /// it would store snapshots on a server configured to store none, and the
+    /// alternation between the two capacities would rebuild the cache on every
+    /// request.
+    pub prompt_cache_slots: usize,
     /// Rolling ring-buffer of per-request TTFT samples (L6).
     ///
     /// Written by `generate_streaming` when the first token arrives from the

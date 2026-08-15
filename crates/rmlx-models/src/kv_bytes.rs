@@ -107,28 +107,26 @@ pub const fn classify_kv_bytes(before: KvBytesSample, after: KvBytesSample) -> K
 /// Held as a field on each arch's model struct, so a reader that has the model
 /// has the counter, and no other model can advance it. `&self` stores keep it
 /// usable from the generate paths, which only ever borrow the model.
+///
+/// `pub(crate)`: nothing outside this crate can hold one, and `store` is the
+/// only way to write it. A counter an external caller could construct but never
+/// write is a shape that invites reading a value nobody set.
+///
+/// `Default` (all zeros) is the only constructor — a fresh counter has reported
+/// nothing, which `sample()` reports as `seq == 0`.
 #[derive(Debug, Default)]
-pub struct KvBytesCounter {
+pub(crate) struct KvBytesCounter {
     bytes: AtomicU64,
     seq: AtomicU64,
 }
 
 impl KvBytesCounter {
-    /// A counter that has never been written.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            bytes: AtomicU64::new(0),
-            seq: AtomicU64::new(0),
-        }
-    }
-
     /// Read the byte total paired with the sequence it was written at.
     ///
     /// `seq == 0` means no generation on this model has reported a figure yet,
     /// so `bytes` is the `0` initialiser and not a measurement.
     #[must_use]
-    pub fn sample(&self) -> KvBytesSample {
+    pub(crate) fn sample(&self) -> KvBytesSample {
         // Load the sequence FIRST, and with Acquire. The writer stores `bytes`
         // before releasing the sequence, so observing sequence `k` guarantees
         // the byte count for generation `k` is already visible: the byte load

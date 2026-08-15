@@ -401,6 +401,7 @@ pub fn load_from_path(model_dir: &Path) -> Result<BitNetText> {
         embed_tokens_t,
         layers,
         final_norm,
-        kv_bytes: crate::kv_bytes::KvBytesCounter::new(),
+        kv_bytes: crate::kv_bytes::KvBytesCounter::default(),
+        model_sig: crate::prompt_cache::model_cache_sig(model_dir),
     })
 }

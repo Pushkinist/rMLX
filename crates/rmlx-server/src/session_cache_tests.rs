@@ -84,3 +84,34 @@ fn max_sessions_enforced_at_zero() {
     cache.touch(key("m", "s2"), 1);
     assert_eq!(cache.active_count(), 1, "capacity must be at least 1");
 }
+
+/// A zero-slot server stays zero-slot for a session-bearing request.
+///
+/// `--prompt-cache-slots 0` disables the prompt cache. The session path used to
+/// widen a hard-coded 4, so an `X-Session-Id` header re-enabled a cache the
+/// operator had switched off — snapshots stored and Exact hits served on a
+/// server configured to store none — and alternating between 0 and 4+n rebuilt
+/// the cache on every request.
+#[test]
+fn zero_base_is_not_re_enabled_by_a_session() {
+    assert_eq!(effective_prompt_cache_slots(0, 0), None);
+    assert_eq!(
+        effective_prompt_cache_slots(0, 7),
+        None,
+        "no number of active sessions may switch a disabled cache back on"
+    );
+}
+
+/// A non-zero base is the operator's number, widened — never replaced by a
+/// literal. Widening a hard-coded 4 gives someone who configured 8 a smaller
+/// cache than they asked for.
+#[test]
+fn non_zero_base_is_widened_not_replaced() {
+    assert_eq!(effective_prompt_cache_slots(1, 0), Some(1));
+    assert_eq!(effective_prompt_cache_slots(4, 3), Some(7));
+    assert_eq!(
+        effective_prompt_cache_slots(8, 2),
+        Some(10),
+        "a base of 8 must not collapse to 4 + active"
+    );
+}

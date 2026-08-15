@@ -168,6 +168,30 @@ impl SessionCache {
     }
 }
 
+/// Prompt-cache slot count for a request that carries an `X-Session-Id`.
+///
+/// The configured base widened by one slot per active session, so the FIFO
+/// `PromptCache` never evicts a live session's snapshot. `None` means "leave the
+/// generator's own setting alone".
+///
+/// Two properties this exists to hold, both of which an inline expression at
+/// each route got wrong:
+///
+/// - **A base of 0 stays 0.** Zero slots is the disabled cache; a request header
+///   must not be able to turn on a cache the operator switched off. It would
+///   also alternate capacities across mixed traffic, and `ensure` rebuilds — and
+///   resets the hit/miss counters — every time the capacity changes.
+/// - **The base is the operator's, not a literal.** Widening a hard-coded 4
+///   hands someone who configured 8 slots a smaller cache than they asked for.
+#[must_use]
+pub const fn effective_prompt_cache_slots(base: usize, active_sessions: usize) -> Option<usize> {
+    if base == 0 {
+        None
+    } else {
+        Some(base + active_sessions)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

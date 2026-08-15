@@ -333,7 +333,8 @@ pub fn load_from_path(model_dir: &Path) -> Result<Qwen3_5MoeText> {
         final_norm,
         lm_head,
         cached_hot_head: std::sync::OnceLock::new(),
-        kv_bytes: crate::kv_bytes::KvBytesCounter::new(),
+        kv_bytes: crate::kv_bytes::KvBytesCounter::default(),
+        model_sig: crate::prompt_cache::model_cache_sig(model_dir),
     })
 }
 
@@ -649,6 +650,7 @@ pub fn load_from_path_paro(model_dir: &Path) -> Result<Qwen3_5MoeText> {
         final_norm,
         lm_head,
         cached_hot_head: std::sync::OnceLock::new(),
-        kv_bytes: crate::kv_bytes::KvBytesCounter::new(),
+        kv_bytes: crate::kv_bytes::KvBytesCounter::default(),
+        model_sig: crate::prompt_cache::model_cache_sig(model_dir),
     })
 }

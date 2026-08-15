@@ -225,15 +225,27 @@ still built and still counts its misses, but `push` refuses every entry, so
 `slots` stays empty, `find_best_prefix` can only miss, and every request runs a
 full prefill. Nothing is clamped to one slot.
 
+The SSD tier is disabled with it: `hydrate_from_ssd` returns before querying the
+source, because a hydrated entry could only be refused admission. So a zero-slot
+server keeps `ssd_hits` at 0 and does no `.kvb` reads — the "every request runs a
+full prefill" above holds literally, not just for the RAM tier.
+
+A request carrying an `X-Session-Id` header does not change this. Session
+KV-reuse widens the configured slot count by one slot per active session
+(`session_cache::effective_prompt_cache_slots`), and a configured `0` is left
+alone: a header must not switch on a cache the operator switched off, and
+alternating capacities would rebuild the cache on every request.
+
 To make a *single* request miss without changing the configuration, use
 `ArchPromptCache::clear()` (`Architecture::clear_prompt_cache`), which empties
 the slots and resets the counters while keeping the capacity and the installed
 SSD sinks. That is what `rmlx bench` does: measuring a zero-slot cache would
 time a cache no operator runs.
 
-A RAM miss is still not the same as a prefill — an attached SSD KV tier can
-serve it from a `.kvb` and record `ssd_hits`. Neither zero slots nor `clear()`
-detaches that source.
+For `clear()` — unlike zero slots — a RAM miss is still not the same as a
+prefill: it leaves the SSD source attached, so the next request can be served
+from a `.kvb` and recorded as `ssd_hits`. A caller that needs a real prefill
+checks `hits == 0 && ssd_hits == 0` rather than trusting the clear.
 
 ---
 

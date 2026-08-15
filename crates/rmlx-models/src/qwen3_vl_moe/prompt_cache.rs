@@ -186,7 +186,8 @@ pub(crate) fn active_layout_key() -> u64 {
     PROMPT_CACHE.active_layout_key()
 }
 
-/// Ensure the global prompt cache is initialised with at least `capacity` slots.
+/// Ensure the global prompt cache is initialised with exactly `capacity` slots;
+/// `0` disables it (nothing is stored, every request prefills).
 pub(crate) fn ensure_prompt_cache(capacity: usize) {
     PROMPT_CACHE.ensure(capacity);
 }

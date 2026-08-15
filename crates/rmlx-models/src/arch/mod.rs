@@ -1249,9 +1249,9 @@ impl Architecture {
     /// hit/miss counters, so the next generation misses in RAM.
     ///
     /// The measurement commands use this to make repeated generations of the
-    /// same prompt comparable. Requesting a zero-slot cache does not achieve
-    /// that: slot capacity is clamped to a minimum of one, so a "zero-slot"
-    /// cache still stores and can still serve a snapshot.
+    /// same prompt comparable while keeping the cache configured as production
+    /// has it. Reconfiguring to zero slots also misses every time, but it
+    /// measures a different cache than the one being served.
     ///
     /// **A RAM miss is not the same as a prefill.** This clears RAM slots only;
     /// an attached SSD KV tier keeps its source, and the next request can still

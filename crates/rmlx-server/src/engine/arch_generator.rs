@@ -1060,6 +1060,16 @@ impl Generator for ArchGenerator {
             // rejected above), so at most one of these is `Some`.
             let multimodal_inputs = image_inputs.or(audio_inputs);
 
+            // Sampled before the generation so the byte count recorded below can
+            // be attributed to *this* one. The counter is per model instance, so
+            // this closes the "which model" question — but not "which
+            // generation": a run that returns before its store (immediate EOS,
+            // NaN prefill, any early-out) leaves the previous run's figure
+            // readable on this very instance, and the rows below land in the
+            // append-only observations/events tables where a wrong value cannot
+            // be taken back.
+            let kv_before = model.kv_cache_bytes_sample();
+
             let steps_result = if qvl_image {
                 // SAFETY: qvl_image is true only when vision.as_deref() matched
                 // Some(VisionBundle::Qwen3VlMoe{..}) two lines above, so this
@@ -1248,11 +1258,43 @@ impl Generator for ArchGenerator {
             }
 
             // N16: emit per-request KV-cache bytes to tracing.
-            // Reads the arch-specific atomic written by generate_greedy at request
-            // boundary — no lock contention with inference at this point.
+            // Reads the counter on this model instance, written by
+            // generate_greedy at request boundary — no lock contention with
+            // inference at this point.
             // F6/L18: also emit via SPSC drainer for SQLite persistence.
             {
-                let kv_bytes = model.kv_cache_bytes();
+                // Attribute the byte count to this generation before recording
+                // it: an unchanged store sequence means the readable figure is
+                // an earlier generation's, and a reported zero means the
+                // accounting is wrong rather than the cache empty. Neither is
+                // recordable — skip the row and say why. `0` here falls through
+                // the `kv_bytes > 0` gate below, which is the skip.
+                let kv_bytes = match rmlx_models::classify_kv_bytes(
+                    kv_before,
+                    model.kv_cache_bytes_sample(),
+                ) {
+                    rmlx_models::KvBytesVerdict::Reported(n) => n,
+                    rmlx_models::KvBytesVerdict::Unreported => {
+                        tracing::warn!(
+                            model_id = %model_id_for_log,
+                            arch = model.arch_class(),
+                            "generation reported no KV-cache byte count (store sequence did \
+                             not advance, so it ended before its decode phase); skipping the \
+                             kv_cache_bytes row rather than recording an earlier \
+                             generation's figure"
+                        );
+                        0
+                    }
+                    rmlx_models::KvBytesVerdict::ReportedZero => {
+                        tracing::warn!(
+                            model_id = %model_id_for_log,
+                            "generation reported a KV cache of 0 bytes after a real prefill — \
+                             the byte accounting is wrong, not the cache; skipping the \
+                             kv_cache_bytes row"
+                        );
+                        0
+                    }
+                };
                 // Reuse `kv_quant_label` so payload-bearing
                 // variants (RotorK*Asym, Mixed, RotK) render with their full
                 // tag (e.g. `rotor_k_3_asym_v8_g128`). Previously this match

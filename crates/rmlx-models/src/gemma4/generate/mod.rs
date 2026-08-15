@@ -180,7 +180,7 @@ pub fn generate_greedy<'a>(
     // falls through to Path C (full re-prefill).
     let mut exact_hit: Option<(Vec<KvCache>, u32, String)> = None;
     let mut prefix_hit: Option<(Vec<KvCache>, usize)> = None;
-    match PROMPT_CACHE.consume(prompt_ids, kv_quant, has_image) {
+    match PROMPT_CACHE.consume(prompt_ids, kv_quant, has_image, model.model_sig) {
         Consumed::Exact(cloned) => {
             tracing::debug!(
                 prompt_len = prompt_ids.len(),
@@ -652,9 +652,7 @@ pub fn generate_greedy<'a>(
                                 prompt_token_ids: prompt_ids.to_vec(),
                                 block_hashes: crate::prompt_cache::chained_block_hashes_seeded(
                                     prompt_ids,
-                                    crate::prompt_cache::FNV_OFFSET
-                                        ^ lk
-                                        ^ kv_quant.cache_key_salt(),
+                                    crate::prompt_cache::cache_seed(lk, kv_quant, model.model_sig),
                                 ),
                                 kv_caches: kvs,
                                 first_id: last_id,

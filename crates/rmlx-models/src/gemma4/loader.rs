@@ -340,7 +340,8 @@ pub fn load_from_path(model_dir: &Path) -> Result<Gemma4Text> {
         layers,
         final_norm,
         previous_kvs,
-        kv_bytes: crate::kv_bytes::KvBytesCounter::new(),
+        kv_bytes: crate::kv_bytes::KvBytesCounter::default(),
+        model_sig: crate::prompt_cache::model_cache_sig(model_dir),
     })
 }
 
@@ -691,7 +692,8 @@ pub fn load_from_path_paro(model_dir: &Path) -> Result<Gemma4Text> {
         layers,
         final_norm,
         previous_kvs,
-        kv_bytes: crate::kv_bytes::KvBytesCounter::new(),
+        kv_bytes: crate::kv_bytes::KvBytesCounter::default(),
+        model_sig: crate::prompt_cache::model_cache_sig(model_dir),
     })
 }
 

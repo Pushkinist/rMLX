@@ -497,8 +497,12 @@ impl Generator for SpeculativeGenerator {
     }
 
     fn cache_stats(&self) -> Option<rmlx_models::CacheStats> {
-        // SpeculativeDispatcher wraps a Gemma4 verifier — reads its static.
-        rmlx_models::gemma4::gemma4_cache_stats()
+        // These stats belong to the prompt cache the verifier actually uses, so
+        // dispatch on the verifier. The cache is one static per architecture,
+        // and the verifier's architecture varies with the drafter — eagle3 /
+        // dflash / mtp all require a Qwen3.5-MoE verifier — so naming a fixed
+        // arch here reports some other architecture's cache for most pairs.
+        self.dispatcher.verifier.cache_stats()
     }
 
     fn kv_cache_bytes(&self) -> u64 {
@@ -829,12 +833,10 @@ impl Generator for SpeculativeGenerator {
             // generation. The rows below land in the append-only events table,
             // where a wrong value cannot be taken back.
             //
-            // Read off the **verifier's own** architecture. The byte statics are
-            // per arch, and the drafter branches below run against a
-            // Qwen3.5/3.6-MoE verifier, not a Gemma4 one — sampling a fixed
-            // arch's static here would compare a reading of some other model's
-            // cache before and after, and hand back that model's bytes as this
-            // request's whenever it happened to generate in between.
+            // Read off the **verifier instance** — the model whose KV this
+            // figure describes. The counter is a field on the model, not an
+            // arch-keyed location, so this is exact even when draft and
+            // verifier share an architecture.
             let kv_before = dispatcher.verifier.kv_cache_bytes_sample();
 
             let result = if let Some(drafter_arc) = eagle3_drafter.as_ref() {
@@ -1027,7 +1029,7 @@ impl Generator for SpeculativeGenerator {
                         "length".to_owned()
                     };
                     // F6/L18: emit KV-cache bytes to the SPSC drainer, read off
-                    // the verifier's own arch static (see `kv_before`).
+                    // the verifier instance's own counter (see `kv_before`).
                     {
                         // Attribute the byte count to this generation before
                         // recording it: an unchanged store sequence means the
