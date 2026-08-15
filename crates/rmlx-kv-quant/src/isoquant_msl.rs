@@ -486,6 +486,9 @@ pub fn iso3_gpu_outputs_to_cpu(
         ));
     }
 
+    // eval-ok: host readback — the `to_bytes()` below copies this array to
+    // CPU, so it has to be materialised first. Not a kernel-input barrier: this
+    // runs once per quantize call, off the per-decode-step path.
     codes_gpu.eval()?;
     #[allow(
         clippy::expect_used,
@@ -496,6 +499,9 @@ pub fn iso3_gpu_outputs_to_cpu(
         .chunks_exact(4)
         .map(|b| u32::from_le_bytes(b.try_into().expect("len 4 by chunks_exact contract")))
         .collect();
+    // eval-ok: host readback — the `to_bytes()` below copies this array to
+    // CPU, so it has to be materialised first. Not a kernel-input barrier: this
+    // runs once per quantize call, off the per-decode-step path.
     scales_gpu.eval()?;
     #[allow(
         clippy::expect_used,
@@ -506,6 +512,9 @@ pub fn iso3_gpu_outputs_to_cpu(
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes(b.try_into().expect("len 4 by chunks_exact contract")))
         .collect();
+    // eval-ok: host readback — the `to_bytes()` below copies this array to
+    // CPU, so it has to be materialised first. Not a kernel-input barrier: this
+    // runs once per quantize call, off the per-decode-step path.
     norms_gpu.eval()?;
     #[allow(
         clippy::expect_used,

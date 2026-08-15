@@ -48,11 +48,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: GPU-touching tests carry the Metal-context #[ignore]
         run: make check-gpu-tests-ignored
-      # A flash-decode dispatcher that blocks on Array::eval() produces exactly
+      # A Metal-kernel dispatcher that blocks on Array::eval() produces exactly
       # the right tokens, so no test can see it — it only shows up as a decode
       # rate several times below what the codec should reach. Static gate.
-      - name: flash-decode dispatchers keep their inputs lazy
+      - name: kernel dispatchers keep their inputs lazy
         run: make check-no-kernel-input-eval
+      # ...and the gate above is only worth its runtime if it still fires when
+      # the eval is spelled differently, moved to a sub-directory, or hidden one
+      # call deep in a shared scaffold. Fixture trees pin that recall.
+      - name: the lazy-inputs gate still catches what it is for
+        run: make check-no-kernel-input-eval-fixtures
 
   msl:
     name: msl kernels (compile + format)

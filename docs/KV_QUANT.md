@@ -2909,10 +2909,22 @@ before dispatch, which blocked the host on the GPU once per attention layer per
 decode step. That alone was worth 1.2–2.9× decode across iso and rotor, K-only
 and `_sym`, on both `kv_h = 8` and `kv_h = 1` architectures — the `_sym` pair at
 a 4k prompt on Ternary-Bonsai-8B went 19.1 → 55.1 TPS with an unchanged token
-digest. Any per-codec marginal-cost figure recorded before that (including the
-tables in `docs/models/bonsai/8B/rMLX.md` §2 and issue #292) is measuring the
-dispatcher, not the kernel. `make check-no-kernel-input-eval` keeps it from
-coming back.
+digest.
+
+**What that invalidates, and what it does not.** The eval was a *fixed* cost per
+decode step — one host↔GPU round trip per attention layer, the same count
+whatever the KV length. It therefore moves the **intercept** of per-step decode
+time and leaves the **slope** alone. Fitting `ms/step = a + b × (KV tokens/1000)`
+across the binary pair: `a` 41.14 → **7.01 ms/step (−83%)**, `b` 2.437 → **2.449
+ms/1k KV tokens (+0.5%)** — ≈34 ms/step recovered, which over the layer count is
+≈0.16 ms per eval, a textbook round trip.
+
+So: every **absolute decode-TPS** cell for these codecs recorded before this
+change measures the dispatcher and must be re-recorded — including the tables in
+`docs/models/bonsai/8B/rMLX.md` §2 and issue #292. **Marginal-cost figures
+(ms/1k KV tokens) survive**: a slope cancels a fixed per-step cost by
+construction, so a published ms/1k table is still valid and should not be
+discarded. `make check-no-kernel-input-eval` keeps the defect from coming back.
 
 So these codecs remain opt-in (`--kv-quant rotor3_sym` / `rotor4_sym`, and the
 iso pair), and remain research codecs for quality experiments and kernel work —

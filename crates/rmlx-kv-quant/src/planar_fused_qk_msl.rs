@@ -368,16 +368,15 @@ pub fn planar_fused_qk(
     .collect();
     let dims_arr = Array::from_bytes(&dims_bytes, &[4], Dtype::U32)?;
 
-    // Materialise all inputs before dispatch — upstream lazy ops (e.g. the
-    // planar quantize atomic-OR accumulation) may still be pending, which
-    // would let the fused-QK kernel read partially-populated buffers and
-    // produce garbage (~1e38 magnitudes seen in early development).
-    q_f32.eval()?;
-    codes_flat.eval()?;
-    scales_flat.eval()?;
-    rot32_flat.eval()?;
-    scale_arr.eval()?;
-    dims_arr.eval()?;
+    // Inputs stay lazy: `MetalKernel::apply` enqueues a graph node, so MLX
+    // materialises them — and applies `ensure_row_contiguous` — inside the
+    // kernel's own `eval_gpu`. A blocking eval here would only stall the host
+    // once per layer per decode step. See `crate::flash_decode_common` docs.
+    //
+    // The former justification here — a barrier against pending
+    // `planar_quantize` atomic-OR accumulation — described a hazard that is
+    // handled where it arises: `planar_quantize_v4_gpu` zero-initialises its
+    // atomically-ORed outputs (`set_init_value(0.0)`).
 
     let kernel = qk_kernel(bits)?;
     PLANAR_FUSED_QK_DISPATCHES.fetch_add(1, Ordering::Relaxed);

@@ -472,24 +472,20 @@ pub fn planar_flash_decode_sdpa(
             .map_err(|e| Error::Mlx(format!("planar_flash_decode dims: {e}")))?
     };
 
-    // eval-ok: kept as an ordering barrier for the planar_quantize atomic-OR
-    // race found during fused-QK development — a different reason from the
-    // row-contiguous precaution the iso/rotor dispatchers carried, which was
-    // redundant against `ensure_row_contiguous` and has been removed. The
-    // barrier costs the same per-layer host stall those did, so if the race is
-    // real it belongs in the quantize kernel rather than here; that has not
-    // been re-verified, and this path is off by default
-    // (`--planar-flash-decode auto` = OFF), so the barrier stays for now.
-    q_f32.eval()?;
-    codes_flat.eval()?;
-    scales_flat.eval()?;
-    rot_flat.eval()?;
-    v_flat.eval()?;
-    if has_mask == 1 {
-        mask_flat.eval()?;
-    }
-    scale_arr.eval()?;
-    dims_arr.eval()?;
+    // Inputs stay lazy — do NOT force-evaluate them here. `MetalKernel::apply`
+    // enqueues a graph node, so MLX materialises every input, and applies the
+    // `ensure_row_contiguous` copy, inside the kernel's own `eval_gpu`; a
+    // blocking eval buys no ordering and stalls the host once per layer per
+    // decode step. Full argument: `crate::flash_decode_common` module docs.
+    //
+    // These calls also used to be justified as a barrier against a
+    // `planar_quantize` atomic-OR race. That hazard is handled where it
+    // arises: `planar_quantize_v4_gpu` zero-initialises its atomically-ORed
+    // outputs (`set_init_value(0.0)`), same as the iso and rotor quantize
+    // kernels. A blocking eval on the *decode* kernel's inputs could not have
+    // repaired a corrupted *quantize* output in any case — it only shifts
+    // timing, which is what a barrier masking a race looks like rather than a
+    // fix for one.
 
     // ── P1 dispatch ───────────────────────────────────────────────────────
     let kern_p1 = p1_kernel_v4()?;

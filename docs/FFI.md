@@ -468,12 +468,34 @@ byte-identical output, which is why the cost hides: it shows up only as a
 decode rate several times below what the kernel can reach. A KV flash-decode
 dispatcher paying this on every attention layer measured **2.7× below** its own
 rate on Ternary-Bonsai-8B once the `eval()` calls were dropped, with the token
-digest unchanged. Pass lazy arrays to `MetalKernel::apply` and let MLX schedule
-the graph; the row-contiguous guarantee a raw-linear kernel needs comes from
-`ensure_row_contiguous` (below), not from forcing evaluation. The CI gate
-`make check-no-kernel-input-eval` enforces this for the flash-decode
-dispatchers, with an `// eval-ok: <reason>` marker for a genuinely load-bearing
-barrier.
+digest unchanged.
+
+Pass lazy arrays to `MetalKernel::apply` and let MLX schedule the graph. Two
+facts make that safe, and both are worth stating because the comment this rule
+replaced got each of them wrong:
+
+* **Ordering.** `MetalKernel::apply` enqueues an MLX `fast::CustomKernel` graph
+  node; it does not dispatch. MLX runs that node's `eval_gpu` only once every
+  input edge is materialised, and applies the `ensure_row_contiguous` copy
+  (below) inside that same `eval_gpu`. A kernel cannot read an uncomputed or
+  strided buffer, so a caller-side `eval()` buys no ordering — it only changes
+  *when* the host blocks.
+* **Layout.** `Array::eval()` materialises but does **not** relayout. MLX's
+  `Transpose` is a strided view over a shared buffer, so an evaluated transpose
+  is still non-row-contiguous. The layout guarantee for a raw-linear kernel
+  always came from `reshape` plus `ensure_row_contiguous`, never from forcing
+  evaluation.
+
+The CI gate `make check-no-kernel-input-eval` enforces this across every
+custom-Metal-kernel dispatcher and shared dispatcher scaffold in the KV codec
+layer (keyed on the file constructing a `MetalKernelInvoke`, or being a
+`*_common.rs` scaffold — not on a codec name), with an `// eval-ok: <reason>`
+marker for a genuinely load-bearing call such as a host readback before
+`to_bytes()`. One marker exempts one call.
+`make check-no-kernel-input-eval-fixtures` is the gate's own recall test: a
+fixture tree per evasion (UFCS `Array::eval(&x)`, an eval moved into a shared
+`_common.rs` helper, a dispatcher relocated into a sub-directory, a marker
+leaking onto a following loop) pinned to the exit code the gate must produce.
 
 ### Data readback
 

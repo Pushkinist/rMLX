@@ -225,9 +225,18 @@ the 15% settle ceiling. Narrower run-to-run spread after the fix is a
 consistent second-order effect: a host-side GPU wait per layer makes the cell
 sensitive to host scheduling (e2b `iso3_sym` @4k: 7.41% range → 0.77%).
 
-**Every number in the family recorded before this change measures the
-dispatcher, not the kernel** — re-record before use. Live numbers per (codec,
-context) live in `docs/models/bonsai/8B/rMLX.md` §2.
+**Every absolute decode-TPS number in the family recorded before this change
+measures the dispatcher, not the kernel** — re-record before use. Live numbers
+per (codec, context) live in `docs/models/bonsai/8B/rMLX.md` §2.
+
+**Marginal-cost figures (ms per 1k KV tokens) are not invalidated.** The eval was
+a fixed cost per decode step — one host↔GPU round trip per attention layer,
+independent of KV length — so it lands entirely in the intercept of
+`ms/step = a + b × (KV tokens/1000)` and a slope cancels it by construction.
+Fitted across this binary pair: `a` 41.14 → **7.01 ms/step (−83%)**, `b` 2.437 →
+**2.449 ms/1k KV tokens (+0.5%)**. The ≈34 ms/step recovered is ≈0.16 ms per
+eval over the layer count, a textbook round trip. A published ms/1k table stays
+valid; do not discard one on the strength of this fix.
 
 **Neither tier competes with `none` on either axis.** The whole iso/rotor
 family stores one `u32` code word plus one `f32` scale per group, so it is

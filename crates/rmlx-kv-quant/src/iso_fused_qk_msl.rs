@@ -317,9 +317,10 @@ pub fn iso_fused_qk_sdpa<const BITS: u8>(
     let codes_flat = k_codes.reshape(&[codes_total as i32], device)?;
     let scales_flat = k_scales.reshape(&[scales_total as i32], device)?;
     let norms_flat = k_norms.reshape(&[norms_total as i32], device)?;
-    codes_flat.eval()?;
-    scales_flat.eval()?;
-    norms_flat.eval()?;
+    // Inputs stay lazy: `MetalKernel::apply` enqueues a graph node, so MLX
+    // materialises them — and applies `ensure_row_contiguous` — inside the
+    // kernel's own `eval_gpu`. A blocking eval here would only stall the host
+    // once per layer per decode step. See `crate::flash_decode_common` docs.
 
     let kernel = iso_qk_kernel(BITS)?;
     let mut invoke = MetalKernelInvoke::new();

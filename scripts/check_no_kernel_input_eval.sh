@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # scripts/check_no_kernel_input_eval.sh — CI gate: flag blocking Array::eval()
-# on a flash-decode kernel's inputs.
+# in a custom-Metal-kernel dispatcher.
+#
+# usage: check_no_kernel_input_eval.sh [SRC_DIR] [MIN_FILES]
 #
 # PROBLEM
 # -------
 # `Array::eval()` is a synchronous graph evaluation: it blocks the calling
-# thread until the GPU has produced the array. A flash-decode dispatcher runs
+# thread until the GPU has produced the array. A decode-path dispatcher runs
 # once per attention layer per decode step, so an `eval()` on its inputs
 # serialises the host against the GPU that many times per token — the forward
 # pass then advances one layer at a time with nothing queued ahead, and the
@@ -15,65 +17,104 @@
 #
 # WHY THE PRECAUTION IS NOT NEEDED
 # --------------------------------
-# These kernels read their buffers by raw linear offset, so they need
-# row-contiguous inputs. That guarantee already comes from the custom-kernel
-# builder: `MetalKernel::new` passes `ensure_row_contiguous`, and MLX copies any
-# non-row-contiguous input before the dispatch. A blocking `eval()` adds nothing
-# to it.
+# `MetalKernel::apply` enqueues an MLX `fast::CustomKernel` graph node; it does
+# not dispatch. MLX runs that node's `eval_gpu` only once every input edge is
+# materialised, and the row-contiguous copy (`ensure_row_contiguous`, passed by
+# `MetalKernel::new`) happens inside that same `eval_gpu`. A kernel therefore
+# cannot read an uncomputed or strided buffer, and a caller-side `eval()` adds
+# no ordering the graph does not already give. The long-form version of this
+# argument lives in one place — the `flash_decode_common` module docs.
 #
-# WHAT THIS GATE CHECKS
-# ---------------------
-# Every non-test `*flash_decode*_msl.rs` under crates/rmlx-kv-quant/src/ is
-# scanned for `.eval()` calls. A hit is a violation unless it carries an
-# `// eval-ok: <reason>` marker, either on the same line or in the contiguous
-# block of comments / `eval()` calls / block delimiters directly above it.
+# WHAT THIS GATE SCANS
+# --------------------
+# Recursively under SRC_DIR (default `crates/rmlx-kv-quant/src`), every
+# non-test `.rs` file that is either
 #
-# Keyed on shape (a flash-decode dispatcher forcing evaluation), never on a
-# codec or architecture name.
+#   * a custom-Metal-kernel dispatcher — it constructs a `MetalKernelInvoke`, or
+#   * a shared dispatcher scaffold — its name ends in `_common.rs`.
 #
-# Exit 0 = clean. Exit 1 = violation found.
+# Keyed on shape, never on a codec or architecture name, so a dispatcher that
+# is renamed, or moved into a sub-directory, stays in scope. The `_common.rs`
+# arm is what keeps an eval from being hidden one call deep in a helper that
+# every dispatcher already imports.
+#
+# A `.eval(` / `::eval(` call is a violation unless the *same* call carries an
+# `// eval-ok: <reason>` marker — on its own line, or on the contiguous comment
+# lines directly above it. One marker exempts exactly one call.
+#
+# Exit 0 = clean. Exit 1 = violation, or fewer dispatchers found than expected.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SRC_DIR="$ROOT/crates/rmlx-kv-quant/src"
+SRC_DIR="${1:-$ROOT/crates/rmlx-kv-quant/src}"
 
-shopt -s nullglob
+# Vacuity floor. A rename or a relocation that drops a dispatcher out of the
+# scan must fail the gate, not silently shrink its coverage — so the expected
+# file count is pinned, not merely required to be non-zero. Raise it when a
+# dispatcher is added; a drop below it means coverage was lost.
+MIN_FILES="${2:-${CHECK_EVAL_MIN_FILES:-27}}"
+
+if [ ! -d "$SRC_DIR" ]; then
+    echo "check-no-kernel-input-eval: scan root does not exist: $SRC_DIR" >&2
+    exit 1
+fi
+
 FILES=()
-for f in "$SRC_DIR"/*flash_decode*_msl.rs; do
-    case "$f" in
-        *_tests.rs) continue ;;
-    esac
+while IFS= read -r f; do
     FILES+=("$f")
-done
-shopt -u nullglob
+done < <(
+    find "$SRC_DIR" -type f -name '*.rs' \
+        ! -name '*_tests.rs' ! -name 'tests.rs' \
+        \( -name '*_common.rs' -o -exec grep -lq 'MetalKernelInvoke' {} \; \) \
+        -print | sort
+)
 
-if [ ${#FILES[@]} -eq 0 ]; then
-    echo "check-no-kernel-input-eval: no flash-decode dispatcher found under $SRC_DIR" >&2
-    echo "the gate would pass vacuously — fix the scan path" >&2
+if [ "${#FILES[@]}" -lt "$MIN_FILES" ]; then
+    echo "check-no-kernel-input-eval: found ${#FILES[@]} dispatcher/scaffold files under" >&2
+    echo "  $SRC_DIR" >&2
+    echo "but expected at least $MIN_FILES." >&2
+    echo "A dispatcher was renamed, moved or deleted and the scan lost coverage." >&2
+    echo "Fix the scan (or lower the pinned floor deliberately) — do not ignore this." >&2
     exit 1
 fi
 
 VIOLATIONS=0
 for f in "${FILES[@]}"; do
     out=$(awk '
-        # Track the contiguous run of lines that may carry the marker for the
-        # eval below: comments, other eval() calls, and bare block delimiters.
         {
             line = $0
             stripped = line
             gsub(/^[ \t]+|[ \t]+$/, "", stripped)
+
+            # Strip a trailing line comment before looking for a call, so a
+            # comment that merely mentions eval() is not a violation.
+            code = line
+            sub(/\/\/.*$/, "", code)
+
+            is_full_comment = (stripped ~ /^\/\//)
+            has_marker      = (stripped ~ /\/\/.*eval-ok:/)
+            is_eval         = (code ~ /(\.|::)eval[[:space:]]*\(/)
         }
-        stripped ~ /eval-ok:/ { marked = 1 }
-        {
-            is_comment = (stripped ~ /^\/\//)
-            is_eval     = (index(line, ".eval()") > 0)
-            is_delim    = (stripped == "}" || stripped ~ /^(if|for)[ (].*\{$/ || stripped == "")
-            has_eval    = is_eval && !is_comment
+
+        # Same-line marker: exempts this call and nothing else.
+        has_marker && is_eval { armed = 0; next }
+
+        # Comment-line marker: arms exactly one following call.
+        has_marker { armed = 1; next }
+
+        is_eval {
+            if (armed) { armed = 0; next }
+            printf "%s:%d: %s\n", FILENAME, FNR, stripped
+            bad = 1
+            next
         }
-        has_eval && !marked { printf "%s:%d: %s\n", FILENAME, FNR, stripped; bad = 1 }
-        # A line that is none of the above ends the marker run.
-        !(is_comment || is_eval || is_delim) { marked = 0 }
+
+        # Further comment lines keep the marker armed; anything else disarms it,
+        # so a marker cannot leak across an intervening statement or block.
+        is_full_comment { next }
+        { armed = 0 }
+
         END { exit bad ? 1 : 0 }
     ' "$f") || VIOLATIONS=1
     if [ -n "$out" ]; then
@@ -86,22 +127,25 @@ if [ "$VIOLATIONS" -ne 0 ]; then
 
 check-no-kernel-input-eval: FAIL
 
-A flash-decode dispatcher force-evaluates an array. `Array::eval()` blocks the
-calling thread on the GPU; called once per layer per decode step it serialises
-the whole forward pass and costs multiples of the decode rate, with no change
-to the produced tokens.
+A custom-Metal-kernel dispatcher force-evaluates an array. `Array::eval()`
+blocks the calling thread on the GPU; called once per layer per decode step it
+serialises the whole forward pass and costs multiples of the decode rate, with
+no change to the produced tokens.
 
-The row-contiguous guarantee these raw-linear kernels need already comes from
-`MetalKernel::new`, which passes `ensure_row_contiguous` — drop the eval and
-leave the graph lazy.
+`MetalKernel::apply` enqueues a graph node, not a dispatch: MLX materialises
+every input — and applies the `ensure_row_contiguous` copy — inside the
+kernel's own `eval_gpu`. Drop the eval and leave the graph lazy.
 
-If a specific eval really is load-bearing, say why at the call site:
+If a specific eval really is load-bearing (a host readback, or an ordering
+constraint the graph genuinely cannot express), say why at the call site:
 
-    // eval-ok: <reason this dispatch cannot be lazy>
+    // eval-ok: <reason this one call cannot be lazy>
     some_array.eval()?;
+
+One marker exempts one call.
 
 EOF
     exit 1
 fi
 
-echo "check-no-kernel-input-eval: ok (${#FILES[@]} flash-decode dispatchers scanned)"
+echo "check-no-kernel-input-eval: ok (${#FILES[@]} dispatcher/scaffold files scanned)"

@@ -623,11 +623,11 @@ pub fn iso_flash_decode_sdpa<const BITS: u8>(
             .map_err(|e| Error::Mlx(format!("iso_flash_decode dims: {e}")))?
     };
 
-    // Inputs stay lazy — do NOT force-evaluate them here. The raw-linear read
-    // needs row-contiguous buffers, and `MetalKernel::new` already asks MLX for
-    // that (`ensure_row_contiguous`), which copies a strided input before
-    // dispatch. A blocking `Array::eval` adds nothing to that guarantee and
-    // serialises the caller against the GPU once per layer per decode step.
+    // Inputs stay lazy — do NOT force-evaluate them here. `MetalKernel::apply`
+    // enqueues a graph node, so MLX materialises every input, and applies the
+    // `ensure_row_contiguous` copy, inside the kernel's own `eval_gpu`; a
+    // blocking eval buys no ordering and stalls the host once per layer per
+    // decode step. Full argument: `crate::flash_decode_common` module docs.
 
     // ── P1 dispatch ───────────────────────────────────────────────────────
     let kern_p1 = p1_kernel(BITS)?;
