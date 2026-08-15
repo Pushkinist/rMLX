@@ -707,7 +707,7 @@ audio fields under `audio_config`.
 | `num_key_value_heads` | int | SWA-layer KV heads |
 | `num_global_key_value_heads` | int | full-attention KV heads (26B/31B) |
 | `head_dim` | int | 256 for SWA layers |
-| `global_head_dim` | int | 512 for full-attention layers (31B) |
+| `global_head_dim` | int | 512 for full-attention layers (every size: e2b, e4b, 26B, 31B) |
 | `intermediate_size` | int | dense MLP width |
 | `vocab_size` | int | 262 144 |
 | `sliding_window` | int | SWA window (default 512) |
@@ -798,8 +798,11 @@ for full-attention layers is taken from `num_global_key_value_heads` in this
 case.
 
 **Dual head dimensions.** SWA layers use `head_dim` (256); full-attention
-layers use `global_head_dim` (512 on 31B). Partial rotary factor applies to
-`global_head_dim` for the full-attention RoPE.
+layers use `global_head_dim` (512 on every size, e2b through 31B — see
+`gemma4/loader.rs`). Partial rotary factor applies to `global_head_dim` for
+the full-attention RoPE. No gemma-4 layer is 128 wide, which is why none of
+them reaches MLX's fused attention kernel — see `docs/FFI.md`
+§`scaled_dot_product_attention`.
 
 **AltUp residual.** `hidden_size_per_layer_input` enables an AltUp-style
 residual gate when non-zero.

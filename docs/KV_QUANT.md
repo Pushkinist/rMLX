@@ -554,7 +554,8 @@ logical-mapping level, so the common path stays correct. The cold output is
 **byte-identical** to the pre-fix head-major grouping only when
 `head_dim % 128 == 0` (every q8 group of 128 stays inside one head) — which
 holds for every current QuantK-routed target arch (Qwen3.5-MoE linear
-`head_dim=128`, Gemma3 and Gemma4 text KV `head_dim=256`), so the cold path is
+`head_dim=128`, Gemma3 text KV `head_dim=256`, Gemma4 text KV `head_dim=256`
+on SWA layers and `512` on full-attention layers), so the cold path is
 byte-identical in practice. When `head_dim` is not a multiple of 128 (no current
 target arch, but exercised directly by the `d=64` cross-head round-trip test) a
 q8 group of 128 spans a (head,token) boundary and its per-group `abs_max` scale
@@ -1437,14 +1438,104 @@ request-level `KvQuant`:
 vectors carry the highest per-token information density; forcing 8-bit
 recovers PPL quality lost to aggressive V quantization.
 
-**Head layers** (at context ≥ 32K, `LAYER_ADAPTIVE_HEAD_N = 2`): the first 2
-layers are forced to `K8V8`. First-layer K/V vectors carry large absolute
-magnitudes (embedding residual is large before deep normalisation); q8_0
-on the first 2 layers recovers 37–91% of turbo2 quality degradation at ≥32K
-context.
+**Head layers** (`LAYER_ADAPTIVE_HEAD_N = 2`): the first 2 layers are forced to
+`K8V8`. First-layer K/V vectors carry large absolute magnitudes (embedding
+residual is large before deep normalisation). The reference sweep that set this
+constant measured 37–91% of turbo2's quality degradation recovered at ≥32K
+context — but that is the *evidence* for the constant, not a gate on it.
+`kv_quant_for_layer` is never handed a context length and promotes the first 2
+layers at every prompt size.
 
-When the base mode is already `K8V8`, both overrides are no-ops. The override
-is by absolute layer index; it is arch-agnostic.
+When the base mode is already `K8V8`, both overrides are no-ops.
+
+### `--kv-quant none` is not bf16
+
+`KvQuant::None` is **not** exempt. `kv_quant_for_layer` promotes head and tail
+layers whatever the base mode is, so wherever those layers hold a real
+token-indexed cache, `--kv-quant none` allocates a **mixture** of bf16 and
+K8V8 — not a bf16 control. Every "vs `none`" ratio in this repo is therefore a
+ratio between two mixtures, and on the architecture where the promotion bites
+hardest the denominator is already 1.14× true bf16.
+
+The override is by absolute layer index and carries no arch branch, but its
+*effect* is strongly per-arch, because two independent things can make a
+promoted layer a no-op:
+
+- **Windowed layers ignore the codec.** A cache built with a sliding window
+  runs the bf16 rotating ring regardless of the flag
+  (`KvCache::with_quant_max_seq_window` — mlx-lm's
+  `RotatingKVCache.to_quantized` raises `NotImplementedError` and rMLX matches
+  it). Promoting an SWA layer to `K8V8` changes nothing it stores.
+- **Shared-KV layers own no cache.** Gemma4's `num_kv_shared_layers` points
+  every layer from `n_layers - num_kv_shared_layers` onward back at an earlier
+  layer's cache (`gemma4/loader.rs::build_previous_kvs`); those layers are
+  handed `cache: None` and their own slot stays empty. Promoting them changes
+  nothing either.
+
+On gemma-4 e2b and e4b **both** filters apply and cancel the policy entirely:
+the only promoted layers that own a cache are 0 and 1, and both are sliding.
+
+Measured with `rmlx baseline --prompt-tokens 4096 --max-tokens 32 --max-ctx
+8192 --metrics off --log debug`, reading the per-generation `kv_bytes` event.
+Each row is pinned by two runs — `--kv-quant none` and `--kv-quant k8v8` at the
+same shape — so the "true bf16" column is not an unchecked derivation:
+
+| model | attention layers holding KV | promoted layers that change storage | `none`, attention KV | true bf16 | `none` ÷ bf16 |
+|---|---|---|---|---|---|
+| Ternary-Bonsai-8B (`Qwen3ForCausalLM`) | 36 global, of 36 | 10 | 641 581 056 | 560 480 256 | **1.145×** |
+| gemma-4-e2b (`Gemma4…`) | 12 SWA + 3 global, of 35 | **0** | 31 776 768 | 31 776 768 | **1.000×** |
+| Qwen3.6-35B-A3B (`Qwen3_5Moe…`) | 10 global, of 40 | 2 | 88 215 552 | 79 564 800 | **1.109×** |
+
+The ratios drift a little with context — the bf16 term scales with filled
+length while the promoted layers' q8_0 term scales with `KV_PAGE_SIZE`-rounded
+capacity — so Bonsai reads 1.1447 at the `S = 3801` measured here, 1.1435 at
+32k (`docs/PERF_BASELINE.md`), tending to 1.1432. Treat these as 1.14× and
+1.11×, not as constants.
+
+How each row closes, at cache offset `S = prompt_len + max_tokens - 1`. The
+per-token rates come from `KvCache::resident_bytes`: a `KvStorage::None` layer
+is `filled_seq_bytes` over the two bf16 mirrors, a q8_0 layer adds packed codes
+plus one `f32` scale per 128 values over a `KV_PAGE_SIZE = 256`-rounded
+capacity.
+
+- **Bonsai-8B** (`S = 3801`, `kv_h = 8`, `head_dim = 128`, capacity 3840). A
+  bf16 layer holds `2 × 8 × 128 × 2 B = 4096 B` per token, so true bf16 is
+  `36 × 4096 × 3801 = 560 480 256`. A promoted layer adds `2112 B` per token
+  of q8_0 K+V. That predicts `k8v8` at
+  `36 × (4096 × 3801 + 2112 × 3840) = 852 443 136` — measured 852 443 136, so
+  the split behind the `none` figure is pinned, not assumed.
+- **gemma-4-e2b** (`S = 4148`). 12 SWA rings at `2 × 1 × 256 × 2 B = 1024 B`
+  per token, capped at the 512 window, plus 3 global caches at
+  `2 × 1 × 512 × 2 B = 2048 B` per token — `global_head_dim` is 512, not 256.
+  The pure-bf16 identity `12 × 1024 × 512 + 3 × 2048 × 4148 = 31 776 768` is
+  the measured `none` **to the byte**: the promotion adds nothing. `k8v8`
+  measured 45 563 904, exactly `31 776 768 + 3 × 1056 × 4352`, confirming only
+  the 3 global caches are quantizable.
+- **Qwen3.6-35B-A3B** (`S = 3885`, capacity 4096). True bf16 over the 10
+  full-attention layers is `10 × 2048 × 3885 = 79 564 800`. Measured
+  `k8v8 − none = 34 603 008` = `8 × 1056 × 4096`, i.e. only 8 layers changed —
+  which is what identifies the other 2 as already promoted under `none`, adding
+  `2 × 1056 × 4096 = 8 650 752`.
+
+The raw `kv_bytes` on the Qwen3.5 family is larger than the attention-KV column
+above (152 604 672 under `none` here) because it also sums the fixed-size GDN
+recurrent state — 64 389 120 B, codec-independent, and it cancels exactly
+between the two runs. Against that denominator the ratio dilutes to 1.060×.
+The 1.109× is the attention-KV ratio, which is the one a codec comparison is
+about.
+
+Two things follow for anyone reading a codec table:
+
+1. A codec measured at `1.04× none` on Bonsai is `1.19×` true bf16. The
+   correction is a factor, not a rounding error.
+2. Cross-architecture ratios against `none` are not like-for-like: the same
+   flag means pure bf16 on gemma-4 e2b/e4b and a 26/10 mixture on Bonsai-8B.
+
+Recording the effective mixture alongside `kv_bytes` was considered and not
+done: the total is summed at 14 per-arch call sites, and threading a codec
+histogram through all of them buys a diagnostic that this table already states
+per architecture. The requested codec remains the correct *label* for a metrics
+row — what was missing was the interpretation, which is now here.
 
 ---
 
@@ -1709,7 +1800,10 @@ Stores that keep the CPU `IsoBlocks` (the V-only `iso3` / `iso4` codecs) add a
 bits per value, 3.0× bf16). That sideband is the constant `FIXED_QUAT`
 replicated per group, not data — the GPU ring the K-only and symmetric codecs
 decode from does not carry it, which is why `k_iso3/4` and `iso3_sym/4_sym`
-measure ≈1.00–1.02× `none` while `iso3` / `iso4` measure ≈2.1×.
+measure ≈1.00–1.02× `none` while `iso3` / `iso4` measure ≈2.1×. Those are
+whole-cache ratios against the `none` *control*, which is itself a mixture on
+some architectures — see §"`--kv-quant none` is not bf16". The per-group
+figures above are the store density and are unaffected.
 
 **No iso codec is a memory win, at any head_dim.** 8 B per 4 values is exactly
 bf16's density before the per-token norm is added, so the packed side is
