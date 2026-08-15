@@ -2619,6 +2619,112 @@ sensitive — see `.rmlx/bench/perf_canary.csv` rows tagged
 
 ---
 
+## Fused flash-decode over a quant store — the break-even condition
+
+The four sections that follow — plus TurboFlash, whose posture and measured
+cells live on `rmlx_cli::commands::serve::TurboFlashMode` — each describe a
+hand-written MSL kernel that reads a packed KV store directly at decode instead
+of a bf16 mirror. They all exist for one reason: a smaller store means fewer
+bytes moved per decode step. This section states the condition under which that
+trade actually pays, and records what it measures on this tree. Read it before
+concluding that a new fused kernel — or a denser store — will make some codec
+win.
+
+### The condition
+
+Two quantities, both measurable with `rmlx bench`:
+
+* **ρ** — bytes the fused kernel reads, over bytes MLX `sdpa_vector` reads from
+  the bf16 mirror for the same cell. Measured as the codec's resident KV in
+  excess of `none`'s.
+* **ε** — the fraction of MLX `sdpa_vector`'s per-byte throughput the
+  hand-written kernel achieves: `ε = ρ / (marginal-slope ratio vs none)`, where
+  the slope is `b` in `ms/step = a + b·(KV tokens/1000)`.
+
+A fused decode beats bf16 iff **ρ < ε**. Note that ε is a property of the
+*kernel shell*, not of the codec, and ρ is a property of the *store*, not of the
+kernel — so a codec and a kernel can each be reasonable and the pair still lose.
+
+### Measured (`d8a6169`, release-perf, M5 Max, n=3, contended host)
+
+| kernel | arch | `heads_per_kv` | ρ | slope ratio | ε |
+|---|---|---|---|---|---|
+| TurboFlash (`k8v4`) | Bonsai-8B | 4 | 0.262 | 6.37× | **0.041** |
+| `iso_flash_decode_symv` (`iso3_sym`) | Bonsai-8B | 4 | 1.013 | 7.51× | **0.135** |
+| `iso_flash_decode_symv` (`iso3_sym`) | gemma-4-e2b | 8 | ~1.01 | 19.2× | **0.052** |
+
+The TurboFlash row is the sharpest statement available: at 32k on Bonsai-8B the
+fused path reads **3.8× fewer bytes** and costs **6.4× more time per KV token**.
+Decode through these kernels is **not bandwidth-bound**, so a smaller store does
+not buy time.
+
+Dispatch was witnessed, not inferred. `--turbo-flash on` at a 4k prompt (below
+the kernel's own `kv_seq > 4096` gate) is bit-identical to `off` in resident
+bytes and within noise on TPS; dropping the gate at the *same* prompt moves
+resident KV by +180 MB and decode 129.8 → 65.9 TPS. The 16k/32k byte deltas
+(+722 MB / +1445 MB, exactly linear in `kv_seq`) are the kernel engaging.
+
+### Why ε is small — grid geometry
+
+Every P1 kernel here indexes its grid by **query** head (`n_bh = b · n_q_heads`)
+and addresses KV with `kv_h_idx = hq / heads_per_kv`. So `heads_per_kv`
+threadgroups each stream the identical KV bytes. That caps the shell at
+**ε ≤ 1/heads_per_kv** before any kernel-body cost:
+
+| arch | `heads_per_kv` | geometric ceiling | measured ε |
+|---|---|---|---|
+| Bonsai-8B | 4 | 0.250 | 0.135 (54% of ceiling) |
+| gemma-4-e2b | 8 | 0.125 | 0.052 (42% of ceiling) |
+
+Measured ε differs between the two archs by 2.6×; `heads_per_kv` alone predicts
+2.0×. The geometry is the dominant term. The residual ≈2× is the f32
+`partial_o` P1→P2 DRAM round trip plus the thread-0-serial online-softmax
+section, where all but one lane idle twice per KV token.
+
+**Corollary for `kv_h == 1` architectures.** e2b's geometric ceiling (0.125) is
+*below* the densest store in the tree (`tsym3`, ρ = 0.158). On such an arch no
+fused decode over any store that exists or has been proposed can beat bf16 **even
+with a perfect kernel body**, until the grid stops re-reading KV per query head.
+
+### What ρ would have to be
+
+| kernel efficiency | break-even store (bf16 = 32 bits per K+V pair) |
+|---|---|
+| ε = 0.135 (best measured) | 4.3 bits/pair = **2.2 bits per value per axis** |
+| ε = 0.052 (e2b) | 1.7 bits/pair = **0.83 bits per value per axis** |
+| ε = 0.041 (TurboFlash) | 1.3 bits/pair = **0.66 bits per value per axis** |
+
+Against what exists or has been specced:
+
+| store | bits/value | ρ | clears ε = 0.135? |
+|---|---|---|---|
+| `tsym3` — densest store in the tree | 2.5 | 0.158 | no, 1.2× over |
+| the repacked iso/rotor store specced in "Memory truth" | 3.75 | 0.234 | no, 1.7× over |
+| rotor with its structurally-zero components dropped | 14.0 | 0.876 | no, 6.5× over |
+| iso / rotor as stored today | 16.25 / 21.75 | 1.02 / 1.36 | no |
+
+**The binding constraint is ε, not ρ.** Repacking a store is necessary for some
+of these codecs to stop costing memory, but it is not sufficient to make a fused
+decode win, and on `kv_h == 1` it is not even close. Order kernel-shell work
+first; judge a store repack on its memory merits, not on an expected decode win.
+
+### The honest read on the mirror-fed codecs
+
+`k8v4` and `tsym3` still produce a token digest **bit-identical to `none`** at
+4k / 16k / 32k on both architectures. A q8/q4/turbo3 store cannot reproduce bf16
+output bit-exactly over 64 greedy steps at 32k, so this is direct evidence that
+their quant store is not on the decode read path — the mirror is. They pay for
+the store in resident bytes (+26% and +16% at 32k on Bonsai) and in prefill
+(`tsym3` TTFT 23.1 s vs `none` 19.2 s at 32k) and get nothing back at decode.
+
+That remains a real defect. What the table above rules out is the *specific*
+remedy of pointing a hand-written flash-decode kernel at those stores: it has
+been built twice — TurboFlash for `k8v4`, the iso/rotor flash-decode pair for the
+eight `_sym` / K-only codecs — and both lose, for a reason that is structural and
+now quantified.
+
+---
+
 ## `rotor_flash_decode` — fused MSL flash-decode over rotor-quant K
 
 Fused flash-decode for `KvStorage::RotorKOnly3` / `RotorKOnly4`: QK over the
@@ -2929,9 +3035,12 @@ discarded. `make check-no-kernel-input-eval` keeps the defect from coming back.
 So these codecs remain opt-in (`--kv-quant rotor3_sym` / `rotor4_sym`, and the
 iso pair), and remain research codecs for quality experiments and kernel work —
 not memory or throughput candidates. Closing the remaining speed gap needs a
-single-pass simdgroup flash-decode that beats MLX bf16 flash (tracked with
-`#45`); closing the memory gap needs a repacked store, which is a redesign, not
-a kernel change.
+flash-decode shell that stops re-reading KV once per query head, drops the f32
+P1→P2 partial round trip, and stops serialising the online softmax on one lane;
+closing the memory gap needs a repacked store, which is a redesign, not a kernel
+change. Neither alone is enough — see "Fused flash-decode over a quant store —
+the break-even condition" above for the measured `ρ < ε` arithmetic and why the
+shell, not the store, is the binding constraint.
 
 ### Short-prompt abort at `kv_h == 1` — small-`norms`-buffer device floor
 

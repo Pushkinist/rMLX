@@ -244,6 +244,15 @@ never smaller than bf16 (see `docs/KV_QUANT.md` "Memory truth"), and its
 decode is several times `none`'s. Bench them for kernel work and quality
 study, not as memory or throughput candidates.
 
+**A denser store would not rescue them either.** Post-fix marginal cost puts the
+hand-written flash-decode shell at 4–14% of MLX `sdpa_vector`'s per-byte
+throughput, measured on both `kv_h = 8` and `kv_h = 1`, so break-even needs a
+store of 0.7–2.2 bits per value per axis — denser than anything in the tree or
+on the roadmap. The arithmetic, the two-architecture measurement and the grid
+geometry that causes it are in `docs/KV_QUANT.md` § "Fused flash-decode over a
+quant store — the break-even condition". Do not spend kernel effort on this
+family expecting a decode win without first moving that number.
+
 #### K-only family, re-recorded after the dispatcher fix
 
 The table above left the K-only family incomplete: `k_iso4` / `k_rotor4` were
