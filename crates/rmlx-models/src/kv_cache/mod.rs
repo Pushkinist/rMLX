@@ -16,12 +16,17 @@
 //! # Quantization modes (S2.4)
 //!
 //! Default KV caches are quantized (K8V4, K8V8, Planar). The unquantised
-//! `KvQuant::None` path (removed then restored)
-//! is opt-in only via `--kv-quant none` (alias `bf16`) for apples-to-apples
-//! comparison against mlx-lm's bf16-KV champion. It pre-allocates a
-//! `[B, kv_h, max_seq, D]` bf16 buffer per layer for both K and V — at 4096
-//! ctx this is fine; at 128k ctx it would be ~64 GB. Auto-resolver default
-//! is unchanged (still K8V8).
+//! `KvQuant::None` path (removed then restored) is opt-in via `--kv-quant
+//! none` (alias `bf16`), as the closest available comparison against mlx-lm's
+//! bf16-KV champion. It holds a `[B, kv_h, S, D]` bf16 K and V buffer per
+//! layer, grown lazily toward the `--max-ctx` ceiling rather than allocated at
+//! it. Auto-resolver default is unchanged (still K8V8).
+//!
+//! `none` is **not** a pure-bf16 control: [`kv_quant_for_layer`] promotes the
+//! boundary layers to `K8V8` under every base mode, `None` included, so on an
+//! arch whose boundary layers hold a real cache the run is a mixture. See the
+//! per-arch counts and measured ratios in `docs/KV_QUANT.md`
+//! §Layer-adaptive overrides before reading any "vs `none`" number.
 //!
 //! `KvQuant::K8V4` is a CLAUDE.md-mandated baseline for Qwen MoE PPL recovery:
 //! - K uses affine q8_0 (symmetric 8-bit, `group_size=128`).
@@ -71,11 +76,13 @@ mod tests;
 pub const LAYER_ADAPTIVE_TAIL_N: usize = 8;
 
 /// Default number of head layers forced to `KvQuant::K8V8` by
-/// [`kv_quant_for_layer`] when `ctx >= 32K`.
+/// [`kv_quant_for_layer`], at every context length.
 ///
 /// Bench findings show first-layer KV vectors carry the highest absolute magnitudes
 /// (embedding residual is large before deep normalisation) and that forcing
-/// q8_0 on the first 2 layers recovers 37–91% of turbo2 quality loss.
+/// q8_0 on the first 2 layers recovers 37–91% of turbo2 quality loss at ≥32K
+/// context. That sweep is the evidence for the constant, not a gate on it:
+/// [`kv_quant_for_layer`] is never handed a context length.
 pub const LAYER_ADAPTIVE_HEAD_N: usize = 2;
 
 /// Layer-adaptive KV quantization.
@@ -92,7 +99,8 @@ pub const LAYER_ADAPTIVE_HEAD_N: usize = 2;
 ///   V-quant (turbo3/planar).
 /// - **Head**: first-layer K/V vectors carry large absolute magnitudes
 ///   (embedding residual before deep normalisation). q8_0 on the first 2
-///   layers recovers 37–91% of turbo2 quality degradation at ≥32K ctx.
+///   layers was measured to recover 37–91% of turbo2 quality degradation at
+///   ≥32K ctx; the promotion itself is unconditional.
 ///
 /// # Usage
 ///
@@ -114,9 +122,15 @@ pub const LAYER_ADAPTIVE_HEAD_N: usize = 2;
 /// override is by layer index, not by model name or KV mode — no hardcoded
 /// model branches.
 ///
-/// When `base_quant` is already `KvQuant::K8V8`, the override is a no-op.
-/// The only observable change is on `KvQuant::Planar`, `KvQuant::K8V4` (V
-/// side), and `KvQuant::Mixed` boundary layers, which are promoted to K8V8.
+/// `KvQuant::K8V8` is the only base mode for which this is a no-op. **Every**
+/// other base mode is promoted on the boundary layers — `KvQuant::None`
+/// included, so `--kv-quant none` allocates a bf16/K8V8 *mixture* rather than
+/// a bf16 control wherever those layers hold a real token-indexed cache. Two
+/// per-arch filters can still cancel the promotion in practice: a windowed
+/// layer runs the bf16 rotating ring regardless of the flag, and a shared-KV
+/// layer (Gemma4 `num_kv_shared_layers`) owns no cache to promote. Per-arch
+/// counts and the measured byte ratios are in `docs/KV_QUANT.md`
+/// §Layer-adaptive overrides.
 ///
 /// When `head_n == 0` and `tail_n == 0`, `base_quant` is always returned.
 pub fn kv_quant_for_layer(

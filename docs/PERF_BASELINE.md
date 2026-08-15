@@ -278,9 +278,34 @@ across the runs of a cell.
 
 The KV-bytes column is the reason to stop optimizing this family for
 throughput: `k_iso3/4` measures **1.003–1.006×** `none` and `k_rotor3/4`
-**1.11–1.17×**. A codec that is not smaller than bf16 has no bandwidth prize
-to collect, so parity with `none` is the ceiling, not a milestone on the way
-past it.
+**1.11–1.17×**. A codec that is not smaller than the bf16 it replaces has no
+bandwidth prize to collect, so parity is the ceiling, not a milestone on the
+way past it.
+
+**`none` is not bf16 on Bonsai — read the ratios accordingly.**
+`kv_quant_for_layer` promotes the first 2 and last 8 layers to `K8V8` under
+every base mode, `KvQuant::None` included, so the `none` control on a 36-layer
+dense arch is a 26-bf16 / 10-K8V8 mixture. See `docs/KV_QUANT.md`
+§Layer-adaptive overrides for the mechanism and the measured per-arch ratios.
+Restating this table against true bf16. That denominator is derived, not
+separately measured, but it is checkable: at `S = 31 553 + 128 − 1 = 31 680`
+(the fixture length above, `rmlx bench --max-tokens` default 128) the
+`filled_seq_bytes` identity for a `KvStorage::None` layer gives
+`36 × 4096 B/token × 31 680 = 4 671 406 080`, and adding the 10 promoted
+layers' q8_0 stores at `2112 B/token × 31 744` (capacity page-rounded to
+`KV_PAGE_SIZE = 256`) reproduces the recorded `none` figure 5 341 839 360 to
+the byte:
+
+| model | `none` ÷ true bf16 | `k_iso3` ÷ true bf16 | `k_rotor3` ÷ true bf16 |
+|---|---|---|---|
+| Bonsai-8B | **1.144×** | **1.150×** | **1.274×** |
+| gemma-4-e2b | 1.000× | 1.003× | 1.167× |
+
+gemma-4-e2b is unaffected because none of its promoted layers owns a
+quantizable cache — layers 0 and 1 are sliding (bf16 rotating ring regardless
+of the flag) and the last 8 are shared-KV consumers with no cache slot of their
+own. The correction is a Bonsai-side factor, not a table-wide one, which is
+itself the point: a "vs `none`" ratio is not comparable across architectures.
 
 Marginal cost over the replicated 16k→32k segment (`itl_p50` ms per 1k KV
 tokens) is unchanged by the dispatcher fix, as predicted — the fix moved the
@@ -291,13 +316,16 @@ intercept, not the slope:
 | Bonsai-8B | 0.261 | 1.799 (6.9×) | 2.178 (8.3×) |
 | gemma-4-e2b | 0.025 | 0.432 | 0.567 |
 
-Read e2b's ratio-to-`none` with care: only its 7 global layers grow, so the
+Read e2b's ratio-to-`none` with care: only its global layers grow, so the
 `none` denominator is near zero and the ratio inflates. Compare the absolute
 ms/1k across models instead. Counted from the per-dispatch `trace!` under
-`--log verbose`, the flash-decode kernel fires once per *growing* attention
-layer per decode step and is handed the full prefix — 26 of 36 layers on
-Bonsai (the first 2 and last 8 are forced to K8V8), 7 of 35 on e2b. What
-remains is per-KV-token work inside the kernel, not data movement.
+`--log verbose`, the flash-decode kernel fires once per full-attention layer
+per decode step and is handed the full prefix — 26 of 36 layers on Bonsai (the
+first 2 and last 8 are promoted to K8V8), 7 of 35 on e2b. Those 7 e2b
+dispatches read only **3** distinct caches: `num_kv_shared_layers = 20` leaves
+layers 15+ without a cache of their own, so the four later full-attention
+layers attend over the caches of layers 4, 9 and 14. What remains is
+per-KV-token work inside the kernel, not data movement.
 
 Each new codec: invoke `scripts/bench_codec_cell.sh --kv-quant <codec> --model <model>` per cell (3 cells per codec, A.y-excluded skipped), then append to this table.
 

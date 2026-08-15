@@ -118,7 +118,7 @@ two are easy to conflate:
 | Path | NAX? | Why |
 |---|---|---|
 | Prefill attention, `head_dim` 64 or 128, Q not f32 | **yes**, `steel_attention_<dtype>_bq64_…` | MLX's `sdpa_full` takes the NAX branch unless `head_dim == 80` or Q is f32 without TF32 |
-| Prefill attention, `head_dim` 256 | no | MLX ships `steel_attention` for `bd` 64 / 80 / 128 only — a 256-wide head has no fused prefill kernel at all and runs the composite matmul+softmax fallback |
+| Prefill attention, `head_dim` 256 or 512 | no | MLX has no fused prefill kernel at either width, NAX or otherwise. See [Head-dim dispatch](#head-dim-dispatch-and-the-unfused-fallback) — that gap is about a missing kernel *shape*, not about NAX |
 | Decode attention, any `head_dim`, any codec | no | `bq64` is a query tile of 64; decode is `q_seq = 1`, and MLX routes `q_seq <= 8` to `sdpa_vector`, which has no NAX variant |
 | Our own `.metal` kernels | no | all of them are `q_seq = 1` decode kernels. NAX's one matmul tile shape has an M floor of 16; at `q_seq = 1` the only M available is `heads_per_kv` (4–8 on our models), so the tile can never be more than half filled |
 
@@ -132,17 +132,17 @@ archives inside a GPU capture — the whole `mlx.metallib` is also embedded in a
 bundle, so only the small per-pipeline archives are evidence of a *created*
 pipeline:
 
-- Ternary-Bonsai-8B (`head_dim` 128) creates three
+- Ternary-Bonsai-8B (every layer `head_dim` 128) creates three
   `steel_attention_bfloat16_bq64_bk32_bd128_wm4_wn1_mask*` pipelines — the
   causal, aligned-masked and unaligned-masked prefill permutations. NAX is
   engaged and Q is already bf16, so there is no f32 gate to fix.
-- gemma-4-e2b (`head_dim` 256) creates none, on the same tooling and prompt
-  size. It does create `steel_gemm_fused_nax_*`, i.e. NAX GEMM is live for a
-  model whose attention can never use NAX.
-- Both decode through `sdpa_vector`.
+- gemma-4-e2b creates none, on the same tooling and prompt size. Its sliding
+  layers are 256-wide and its full-attention layers 512-wide, and MLX ships no
+  fused attention kernel at either. It does create `steel_gemm_fused_nax_*`,
+  i.e. NAX GEMM is live for a model whose attention can never use NAX.
 
-Of the test targets only Bonsai-8B is `head_dim` 128; the gemma-4 family, the
-Qwen3.6 / Qwen3.5 family (Bonsai-27B included) and medgemma are all 256.
+Which widths reach which kernel, and what the fallback costs, is
+[Head-dim dispatch](#head-dim-dispatch-and-the-unfused-fallback).
 
 #### What the build checks
 
@@ -696,8 +696,7 @@ is ignored when `freqs` is provided; `has_value = false` is set on the
 
 ### `scaled_dot_product_attention`
 
-Fused FlashAttention-style SDPA. Wraps
-`mlx_fast_scaled_dot_product_attention`. Arguments:
+Wraps `mlx_fast_scaled_dot_product_attention`. Arguments:
 
 - `q`, `k`, `v`: `[batch, n_heads, seq_len, head_dim]`.
 - `scale`: `1/sqrt(head_dim)` or `1.0` (Gemma4 uses `1.0`).
@@ -705,6 +704,128 @@ Fused FlashAttention-style SDPA. Wraps
   `"additive"` (caller supplies additive mask), or `""` (no mask).
 - `mask_arr`: ignored when `mask_mode = "causal"`; null sentinel when `None`.
 - `sinks`: always null sentinel (not used at this stage).
+
+It is **not** unconditionally a FlashAttention kernel. Whether the call reaches
+a fused kernel or a composite graph is decided by `head_dim`, silently.
+
+#### Head-dim dispatch and the unfused fallback
+
+`ScaledDotProductAttention::use_fallback`
+(`mlx/backend/metal/scaled_dot_product_attention.cpp:618-636`, v0.31.2) gates
+on `head_dim` and on `q_seq`:
+
+| Route | `head_dim` accepted | Other conditions |
+|---|---|---|
+| `sdpa_full` (fused `steel_attention`) | 64, 80, 128 | `q_seq > 8` (prefill), and the mask is absent, an array, or causal with `q_seq <= kL` |
+| `sdpa_vector` (fused) | 64, 96, 128, 256 | `q_seq <= 8` (decode), `q_seq <= kL`, `q_seq × gqa_factor <= 32` |
+| composite graph | any | whatever both gates reject |
+
+The composite route is the unfused lambda at `mlx/fast.cpp:717` —
+`matmul(q, kᵀ)` → mask → `softmax` → `matmul`, with the
+`[B, n_heads, L_q, L_k]` score tensor **materialised**.
+
+The shipped kernel inventory agrees with the gate:
+
+```sh
+LIB="$(brew --prefix mlx)/lib/mlx.metallib"
+xcrun metal-nm --defined-only "$LIB" | grep -o 'steel_attention[a-z0-9_]*' | sort -u
+# ... _bd64_ / _bd80_ / _bd128_ only — no bd256, no bd512
+xcrun metal-nm --defined-only "$LIB" | grep -o 'sdpa_vector[a-z0-9_]*' | sort -u
+# ... _64_64 / _96_96 / _128_128 / _256_256 — no 512
+```
+
+So above `head_dim` 128 there is **no fused prefill kernel at all**, and at
+`head_dim` 512 there is no fused decode kernel either.
+
+**Which of our models sit where** (per-layer `head_dim` from each snapshot's
+`config.json`; the gemma-4 split is applied in `gemma4/loader.rs`, sliding
+layers take `head_dim`, full-attention layers take `global_head_dim`):
+
+| Family | Windowed / linear layers | Full-attention layers | Fused prefill? |
+|---|---|---|---|
+| Ternary-Bonsai-8B (`Qwen3ForCausalLM`) | — (all 36 are full-attention) | 128 | **yes** |
+| gemma-4 e2b / e4b / 26b / 31b | 256, SWA (`kL ≤ window`) | **512** | no, at either width |
+| medgemma 1.5 4b (`Gemma3…`) | 256, SWA (`kL ≤ window`) | 256 | no |
+| Qwen3.6-35B-A3B, Bonsai-27B (`Qwen3_5…`) | GDN — no SDPA | 256 | no |
+
+Gemma-4 is **not** a `head_dim` 256 model end-to-end: only its
+window-bounded layers are 256 wide, and the layers whose `kL` grows with the
+prompt are 512 wide. That distinction decides who actually pays.
+
+**What the fallback costs.** Isolated `mx.fast.scaled_dot_product_attention`,
+mlx 0.31.2, M5 Max, bf16, causal, `q_seq = kv_seq = L`, best-of-5; a repeat run
+of the 8192 cells moved every figure by under 1.5%. A fused kernel present at
+both widths would land near **2.0×** going 128 → 256, because doubling
+`head_dim` doubles the FLOPs:
+
+| q:kv heads | L | `head_dim` 128 | 256 | 512 | 256 ÷ 128 |
+|---|---|---|---|---|---|
+| 8:1 | 2 048 | 1.42 ms | 2.29 ms | 2.30 ms | 1.61× |
+| 8:1 | 8 192 | 3.04 ms | 17.30 ms | 26.31 ms | **5.69×** |
+| 8:1 | 32 768 | 42.7 ms | 310.6 ms | 473.3 ms | **7.27×** |
+| 32:8 | 2 048 | 0.98 ms | 4.54 ms | 6.90 ms | **4.63×** |
+| 32:8 | 8 192 | 11.06 ms | 71.54 ms | 108.23 ms | **6.47×** |
+| 32:8 | 32 768 | 198.0 ms | 1 308.0 ms | 2 105.6 ms | **6.61×** |
+
+In achieved throughput: `head_dim` 128 reaches 88–103 TF/s at `L ≥ 8192`,
+`head_dim` 256 sits at 27–32 TF/s — roughly a third, for work that is only
+twice as large.
+
+The 512 column is the control. Both 256 and 512 are unfused, and 512 ÷ 256
+measures 1.00–1.61× — *below* the 2.0× FLOP ideal, which is what a shared
+composite path predicts: its fixed `[H, L, L]` score cost does not grow with
+`head_dim`. The cliff is at the 128 → 256 boundary, not "wider heads are
+slower".
+
+Peak memory is the same story told in bytes. At `L = 32768`, 32:8:
+671 MB at `head_dim` 128 against **71.7 GB** at 256 — the materialised score
+tensor is 32 × 32768² × 2 B = 68.7 GB on its own.
+
+Decode is unaffected in the way that matters: at `q_seq = 1` the score tensor
+is `[H, 1, kL]`, so the composite path has no O(L²) term. Measured at the one
+decode cell that clears this host's ~200 µs dispatch floor (32:8,
+`kL = 32768`), the unfused 512-wide path reads KV at 312 GB/s against the
+256-wide vector kernel's 360 GB/s; every other decode cell was dispatch-bound
+and cannot resolve a kernel-level difference.
+
+**What rMLX actually pays.** Less than the isolated `L = kL` numbers above,
+for two structural reasons:
+
+- Prefill is chunked per arch (`prefill_chunk.rs`: gemma-4 1024,
+  Qwen3.5-MoE 2048), so the score tensor is `[H_q, chunk, kL]` — linear in
+  `kL`, not quadratic in the prompt. It is still large in absolute terms:
+  Qwen3.6-35B-A3B (16 q heads, chunk 2048) materialises 2.1 GB per
+  full-attention layer per chunk at `kL = 32768`, 8.6 GB at 128k. Chunking
+  bounds the growth, it does not remove the tensor.
+- On gemma-4 the 256-wide layers are sliding-window, so their `kL` is capped
+  at 512 / 1024 tokens no matter how long the prompt is.
+
+The families that pay a *growing*-`kL` composite cost are Qwen3.5 / Qwen3.6
+(10 of 40 layers on Qwen3.6-35B-A3B, 16 of 64 on Bonsai-27B), medgemma
+(5 of 34), and gemma-4's global layers — the last at 512, where no upstream
+proposal reaches.
+
+**Upstream status** (ml-explore/mlx, checked 2026-08-16). This belongs
+upstream, and it is already in flight there; none of it has merged:
+
+| PR | What | State |
+|---|---|---|
+| [#3293](https://github.com/ml-explore/mlx/pull/3293) | `head_dim=256` in `sdpa_full` + a `bd=256` steel instantiation | closed, unmerged |
+| [#3660](https://github.com/ml-explore/mlx/pull/3660) | revival of #3293 for 192/256, routed above `kL > 16384` | closed, unmerged |
+| [#3842](https://github.com/ml-explore/mlx/pull/3842) | a NAX `bd=256` full-attention path | open |
+| [#4185](https://github.com/ml-explore/mlx/pull/4185) | `force_fused` flag, which also restores 192/256 behind it | open |
+
+#3660 was closed with "we decided to add a `force_fused` option to the API to
+let users make the decision, instead of providing builtin heuristics" — so the
+direction upstream is an explicit opt-in, not a wider default. **No proposal
+covers `head_dim` 512**, so gemma-4's global layers stay composite regardless.
+
+There is nothing to port until a release ships one of these. A hand-written
+`bd=256` flash kernel here is not on the table: it duplicates upstream work,
+and the one attention-kernel class this repo has hand-written — flash-*decode*
+over a quant store — landed at 4–14% of MLX's per-byte throughput
+(`docs/PERF_BASELINE.md`). That is a different kernel, but it is the only
+calibration we have for what writing one here costs.
 
 ---
 
