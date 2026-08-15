@@ -88,7 +88,7 @@ mutually exclusive.
 | `--kv-group-size` | usize | 64 | Group size for `--kv-bits`. Requires `--kv-bits`. |
 | `--max-ctx` | u32 | (from model) | **Virtual ceiling** on context length, in tokens — NOT an eager allocation. The KV ring starts small (`KV_MAX_SEQ_DEFAULT = 4096`) and grows lazily up to this ceiling as the prompt fills; prompts over the ceiling are rejected. Short requests on a large-`--max-ctx` server thus decode at full speed (no long-context working-set tax — see `docs/KV_CACHE.md` §4.6). Derives from `max_position_embeddings` capped at 4096 when unset. Must be ≥ 256 when set. |
 | `--idle-timeout-secs` | string | `15m` | Idle time before the model is unloaded. Accepts an integer count of seconds (`30`, `900`) OR a Go-style duration (`30s`, `15m`, `2h`, `24h`). Negative (`-1`) pins the model forever; `0` unloads after each response. Per-request override on **native** routes only (`POST /v1/models/{id}/load` body field `keep_alive`); OpenAI/Anthropic compat routes do not parse the field but still reset the timer on use. **Interaction with the single-MLX claim file:** the timer never bypasses the claim — when TTL fires it unloads the slot in-process; the cross-process claim file (`/tmp/rmlx.<port>.claim`) remains held for the lifetime of the `rmlx serve` process. |
-| `--prompt-cache-slots` | usize | 4 | Number of prompt-cache slots for multi-slot prefix matching. Set to `1` for legacy single-slot exact-match behaviour. |
+| `--prompt-cache-slots` | usize | 4 | Number of prompt-cache slots for multi-slot prefix matching. Set to `1` for legacy single-slot exact-match behaviour. **`0` disables the prompt cache**: no snapshot is ever stored, so every request runs a full prefill. It is a real state, not a one-slot cache — see `docs/PROMPT_CACHE.md` §Zero slots. A request carrying an `X-Session-Id` header widens this number by one slot per active session (session KV-reuse); `0` is not widened — a disabled cache stays disabled. |
 | `--draft-model` | path | — | Path to a draft model for speculative decoding. Requires `--draft-kind`. |
 | `--draft-kind` | `mtp \| dflash \| eagle3` | — | Drafter architecture. Requires `--draft-model`. Env: `MLX_VLM_DRAFT_KIND`. |
 | `--draft-block-size` | usize | 4 | Tokens proposed per speculative round. Env: `MLX_VLM_DRAFT_BLOCK_SIZE`. |
@@ -548,8 +548,9 @@ is a hard error naming the cause, never a silent zero or a plausible default:
   A hit means the post-prefill KV snapshot was replayed, so the run's TTFT is a
   cache-replay time — small, stable, and not a time-to-first-token. Absent
   counters are refused too: nothing observable would then say a prefill
-  happened. (Requesting a zero-slot cache would *not* achieve this: slot
-  capacity is clamped to a minimum of one.)
+  happened. (Reconfiguring to zero slots would also miss every time, but
+  it would measure a cache no operator runs; `bench` times the served
+  configuration with its snapshots dropped between runs.)
 - **A metric that trended across the runs.** `Spread` sorts, so a value that
   climbs from run to run is reported as a wide *range* around a median — and a
   wide range reads as noise. It is not: a drifting cell has no central value,
@@ -569,11 +570,12 @@ is a hard error naming the cause, never a silent zero or a plausible default:
   reproducibility check: a KV cache that silently stops being written decodes
   *faster* while producing wrong tokens, so a timing-only instrument is biased
   toward accepting exactly that defect.
-- **A KV-byte figure the run did not report.** The arch's byte count is read as
+- **A KV-byte figure the run did not report.** The model's byte count is read as
   a `(bytes, seq)` pair (`Architecture::kv_cache_bytes_sample`), sampled before
-  and after each generation. If `seq` did not advance, the readable value
-  belongs to an *earlier* generation (or is the unset initialiser) and is
-  refused. A reported-but-zero count is a separate, differently-worded error:
+  and after each generation. The counter is per model instance, so `seq` can
+  only be advanced by a generation on *this* model. If `seq` did not advance,
+  the readable value belongs to an *earlier* generation (or is the unset
+  initialiser) and is refused. A reported-but-zero count is a separate, differently-worded error:
   the reporting path worked and the byte accounting is what is wrong.
 - **A callback/token count mismatch**, which would mean the arrival timestamps
   cannot be attributed to the returned tokens.

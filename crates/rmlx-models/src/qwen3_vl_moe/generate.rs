@@ -33,16 +33,14 @@ use rmlx_mlx::{Array, Device, Dtype};
 use crate::constraint::ConstraintEngine;
 use crate::decode_loop::ProbeStep;
 use crate::kv_cache::kv_max_seq_and_ceiling;
-use crate::prompt_cache::{chained_block_hashes_seeded, Consumed, ReusePolicy, FNV_OFFSET};
+use crate::prompt_cache::{chained_block_hashes_seeded, Consumed, ReusePolicy};
 use crate::sampler::{apply_mask_argmax, sample_token_array, Pcg32, PenaltyConfig, SamplerConfig};
 use rmlx_kv_quant::{KvCache, KvQuant};
 
 use super::image::{scatter_vision_features, visual_token_positions};
 use super::model::Qwen3VlMoeText;
 use super::mrope::{get_rope_index, RopeIndex3D};
-use super::prompt_cache::{
-    active_layout_key, ensure_prompt_cache, store_kv_cache_bytes, Qwen3VlMoeEntry, PROMPT_CACHE,
-};
+use super::prompt_cache::{active_layout_key, ensure_prompt_cache, Qwen3VlMoeEntry, PROMPT_CACHE};
 use super::vision::VisionOutput;
 
 /// Trailing-window size for repetition penalties (matches the other archs).
@@ -129,7 +127,8 @@ fn make_step(token_id: u32, tokenizer: &tokenizers::Tokenizer) -> ProbeStep {
 /// requests. Pass 1 for single-slot; pass N for multi-slot prefix matching.
 /// Recommended: 4. Only the Exact-hit path is active under
 /// [`ReusePolicy::ExactOnly`] (identical-prompt repeat skips re-prefill
-/// entirely, same contract as Qwen2 / Qwen3 dense). `max_ctx_override` sizes the
+/// entirely, same contract as Qwen2 / Qwen3 dense). Pass 0 to disable the cache:
+/// nothing is stored, so every request prefills. `max_ctx_override` sizes the
 /// KV ring ceiling so a long prompt (up to the effective `--max-ctx`) grows to
 /// fit and an over-cap prompt is rejected cleanly; see [`generate_image`].
 #[allow(clippy::too_many_arguments)]
@@ -187,7 +186,7 @@ pub fn generate_greedy(
     // The text path never carries image ids (images route to generate_image), so
     // has_image is always false here; the engine's bypass is belt-and-suspenders.
     let has_image = false;
-    let consumed = PROMPT_CACHE.consume(prompt_ids, kv_quant, has_image);
+    let consumed = PROMPT_CACHE.consume(prompt_ids, kv_quant, has_image, model.model_sig);
 
     // Path A: exact cache hit — skip re-prefill, replay the stored first token,
     // then run the shared decode loop on the cloned caches.
@@ -226,7 +225,7 @@ pub fn generate_greedy(
             token_history,
         )?;
         let kv_bytes: u64 = kv.iter().map(|c| c.resident_bytes()).sum();
-        store_kv_cache_bytes(kv_bytes, post);
+        model.kv_bytes.store(kv_bytes, post);
         return Ok(steps);
     }
 
@@ -292,7 +291,7 @@ pub fn generate_greedy(
                     let lk = active_layout_key();
                     let block_hashes = chained_block_hashes_seeded(
                         prompt_ids,
-                        FNV_OFFSET ^ lk ^ kv_quant.cache_key_salt(),
+                        crate::prompt_cache::cache_seed(lk, kv_quant, model.model_sig),
                     );
                     let first_piece = piece_for(first, tokenizer);
                     let entry = Qwen3VlMoeEntry {
@@ -347,7 +346,7 @@ pub fn generate_greedy(
     // sample includes it on ring-backed codecs. Same lifecycle point as the
     // exact-hit path above.
     let kv_bytes: u64 = kv.iter().map(|c| c.resident_bytes()).sum();
-    store_kv_cache_bytes(kv_bytes, post);
+    model.kv_bytes.store(kv_bytes, post);
     Ok(steps)
 }
 

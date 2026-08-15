@@ -29,14 +29,12 @@ use crate::decode_loop::{
     capture_logprobs, choose_token, chunked_prefill, pipelined_decode, DecodeCtx,
 };
 use crate::kv_cache::{kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N};
-use crate::prompt_cache::{chained_block_hashes_seeded, Consumed, ReusePolicy, FNV_OFFSET};
+use crate::prompt_cache::{chained_block_hashes_seeded, Consumed, ReusePolicy};
 use rmlx_kv_quant::{KvCache, KV_MAX_SEQ_DEFAULT};
 
 use super::loader::load_from_path;
 use super::model::Gemma3Text;
-use super::prompt_cache::{
-    active_layout_key, ensure_prompt_cache, store_kv_cache_bytes, Gemma3Entry, PROMPT_CACHE,
-};
+use super::prompt_cache::{active_layout_key, ensure_prompt_cache, Gemma3Entry, PROMPT_CACHE};
 
 // ---------------------------------------------------------------------------
 // probe_forward -- CLI entry point
@@ -99,6 +97,10 @@ pub fn probe_forward(model_dir: &Path, token_id: u32, device: Device) -> Result<
 // is shared with qwen2/qwen3/gemma3/laguna.
 
 /// Greedy autoregressive generation using KV-cache prefill + decode.
+///
+/// `prompt_cache_slots` — number of post-prefill KV snapshots kept across
+/// requests. Pass 1 for single-slot; pass N for multi-slot prefix matching.
+/// Pass 0 to disable the cache: nothing is stored, so every request prefills.
 ///
 /// Returns `Vec<ProbeStep>` -- same shape as `gemma4::generate_greedy`.
 #[allow(clippy::too_many_arguments)]
@@ -197,7 +199,9 @@ pub fn generate_greedy<'a>(
     // returns Miss without touching the cache (mirrored by the `!has_image`
     // store gate below).
     if !has_image {
-        if let Consumed::Exact(cloned) = PROMPT_CACHE.consume(prompt_ids, kv_quant, false) {
+        if let Consumed::Exact(cloned) =
+            PROMPT_CACHE.consume(prompt_ids, kv_quant, false, model.model_sig)
+        {
             return exact_hit_decode(
                 model,
                 tokenizer,
@@ -386,7 +390,7 @@ pub fn generate_greedy<'a>(
                     let lk = active_layout_key();
                     let block_hashes = chained_block_hashes_seeded(
                         prompt_ids,
-                        FNV_OFFSET ^ lk ^ kv_quant.cache_key_salt(),
+                        crate::prompt_cache::cache_seed(lk, kv_quant, model.model_sig),
                     );
                     let entry = Gemma3Entry {
                         prompt_token_ids: prompt_ids.to_vec(),
@@ -470,7 +474,9 @@ pub fn generate_greedy<'a>(
     );
 
     // store KV-cache bytes for the /metrics/cache endpoint (post-decode).
-    store_kv_cache_bytes(caches.iter().map(KvCache::resident_bytes).sum(), post);
+    model
+        .kv_bytes
+        .store(caches.iter().map(KvCache::resident_bytes).sum(), post);
 
     Ok(steps)
 }
@@ -567,7 +573,9 @@ fn exact_hit_decode<'a>(
     );
 
     // store KV-cache bytes for the /metrics/cache endpoint (post-decode).
-    store_kv_cache_bytes(caches.iter().map(KvCache::resident_bytes).sum(), post);
+    model
+        .kv_bytes
+        .store(caches.iter().map(KvCache::resident_bytes).sum(), post);
 
     Ok(steps)
 }

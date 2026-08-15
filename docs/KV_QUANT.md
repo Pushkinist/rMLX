@@ -288,7 +288,7 @@ is *not* written would equal the prefill snapshot.
 
 The store takes a `PostDecode` witness minted only by a completed decode loop
 (`pipelined_decode` and the per-arch `decode_loop` / `decode_from` helpers) and
-required by `store_kv_cache_bytes`. This **raises the bar and documents the
+required by `KvBytesCounter::store`. This **raises the bar and documents the
 requirement**: the naive re-drift — co-locating the store back at the prefill
 snapshot, reusing the loop's witness — is a compile error, because that witness
 is not yet in scope there, and the witness parameter makes a wrong lifecycle

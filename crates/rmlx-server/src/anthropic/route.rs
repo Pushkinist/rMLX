@@ -461,16 +461,20 @@ pub(crate) async fn messages(
         };
         let mut sc = state.session_cache.lock();
         let is_hit = sc.touch(key, prompt_tokens.len());
-        let effective = 4 + sc.active_count();
+        // Same rule as the OpenAI route: widen the configured base, and leave a
+        // base of 0 disabled — see `openai::chat`.
+        let base = state.prompt_cache_slots;
+        let effective = crate::session_cache::effective_prompt_cache_slots(base, sc.active_count());
         tracing::debug!(
             model_id = %req.model,
             session_id = %sid,
             is_hit,
             active_sessions = sc.active_count(),
+            base_prompt_cache_slots = base,
             effective_prompt_cache_slots = effective,
             "messages: session cache lookup"
         );
-        Some(effective)
+        effective
     } else {
         None
     };

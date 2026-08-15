@@ -32,9 +32,7 @@ use crate::kv_cache::{
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
 use super::model::Qwen3_5MoeText;
-use super::prompt_cache::{
-    ensure_prompt_cache, store_kv_cache_bytes, Qwen35MoeEntry, PROMPT_CACHE,
-};
+use super::prompt_cache::{ensure_prompt_cache, Qwen35MoeEntry, PROMPT_CACHE};
 use crate::prompt_cache::{Consumed, ReuseKind, ReusePolicy};
 
 /// Greedy autoregressive generation using KV-cache prefill + decode.
@@ -44,6 +42,7 @@ use crate::prompt_cache::{Consumed, ReuseKind, ReusePolicy};
 /// `prompt_cache_slots` controls the number of post-prefill KV snapshots kept
 /// across requests. Pass 1 for the legacy single-slot behaviour; pass N for
 /// multi-slot prefix matching. Default recommended value: 4.
+/// Pass 0 to disable the cache: nothing is stored, so every request prefills.
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::indexing_slicing,
@@ -131,7 +130,7 @@ pub fn generate_greedy<'a>(
 
     // image prompts never reach this arch (text path only), so `has_image` is
     // always false here; the engine bypass is belt-and-suspenders.
-    let consumed = PROMPT_CACHE.consume(prompt_ids, kv_quant, false);
+    let consumed = PROMPT_CACHE.consume(prompt_ids, kv_quant, false, model.model_sig);
 
     // `exact_hit` carries the Path-A locals; `hydrated_tail` carries the Path-B
     // tail-re-prefill locals. `Consumed::Miss` leaves both `None` and falls
@@ -225,7 +224,7 @@ pub fn generate_greedy<'a>(
         // N16: store KV-cache bytes (KV + linear-attn state) for /metrics/cache (post-decode).
         let kv_bytes: u64 = kv_caches.iter().map(|c| c.resident_bytes()).sum::<u64>()
             + lin_caches.iter().map(|c| c.resident_bytes()).sum::<u64>();
-        store_kv_cache_bytes(kv_bytes, post);
+        model.kv_bytes.store(kv_bytes, post);
         return Ok(steps);
     }
 
@@ -381,11 +380,9 @@ pub fn generate_greedy<'a>(
                                 let stored = cache.push(Qwen35MoeEntry {
                                     prompt_token_ids: prompt_ids.to_vec(),
                                     block_hashes: crate::prompt_cache::chained_block_hashes_seeded(
-                                        prompt_ids,
-                                        crate::prompt_cache::FNV_OFFSET
-                                            ^ lk
-                                            ^ kv_quant.cache_key_salt(),
-                                    ),
+                                    prompt_ids,
+                                    crate::prompt_cache::cache_seed(lk, kv_quant, model.model_sig),
+                                ),
                                     kv_caches: kvs,
                                     lin_caches: lins,
                                     first_id: last_id,
@@ -436,7 +433,7 @@ pub fn generate_greedy<'a>(
 
         let kv_bytes: u64 = kv_caches.iter().map(|c| c.resident_bytes()).sum::<u64>()
             + lin_caches.iter().map(|c| c.resident_bytes()).sum::<u64>();
-        store_kv_cache_bytes(kv_bytes, post);
+        model.kv_bytes.store(kv_bytes, post);
         return Ok(steps);
     }
 
@@ -592,9 +589,7 @@ pub fn generate_greedy<'a>(
                                 prompt_token_ids: prompt_ids.to_vec(),
                                 block_hashes: crate::prompt_cache::chained_block_hashes_seeded(
                                     prompt_ids,
-                                    crate::prompt_cache::FNV_OFFSET
-                                        ^ lk
-                                        ^ kv_quant.cache_key_salt(),
+                                    crate::prompt_cache::cache_seed(lk, kv_quant, model.model_sig),
                                 ),
                                 kv_caches: kvs,
                                 lin_caches: lins,
@@ -679,7 +674,7 @@ pub fn generate_greedy<'a>(
     // N16: store KV-cache bytes (KV + linear-attn state) for /metrics/cache (post-decode).
     let kv_bytes: u64 = kv_caches.iter().map(|c| c.resident_bytes()).sum::<u64>()
         + lin_caches.iter().map(|c| c.resident_bytes()).sum::<u64>();
-    store_kv_cache_bytes(kv_bytes, post);
+    model.kv_bytes.store(kv_bytes, post);
 
     Ok(steps)
 }

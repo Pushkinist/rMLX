@@ -75,8 +75,8 @@ use crate::kv_cache::{
 use crate::layers::{resolve_quant, QuantParams};
 use crate::load_util::{bf16_param, bf16_scales, Weights};
 use crate::prompt_cache::{
-    chained_block_hashes_seeded, ArchPromptCache, Consumed, KvBytesSample, PromptCacheEntry,
-    ReusePolicy, SsdHydrate, FNV_OFFSET,
+    chained_block_hashes_seeded, ArchPromptCache, Consumed, PromptCacheEntry, ReusePolicy,
+    SsdHydrate,
 };
 use crate::sampler::TokenLogprobs;
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
@@ -258,11 +258,6 @@ fn ensure_qwen3_prompt_cache(capacity: usize) {
 /// Read the current hit/miss/bytes stats for the Qwen3 prompt cache.
 pub fn read_cache_stats() -> Option<crate::prompt_cache::CacheStats> {
     QWEN3_PROMPT_CACHE.read_cache_stats()
-}
-
-/// Read the KV-cache bytes from the last completed Qwen3 request.
-pub fn read_kv_cache_bytes_sample() -> KvBytesSample {
-    QWEN3_PROMPT_CACHE.read_kv_cache_bytes_sample()
 }
 
 // ---------------------------------------------------------------------------
@@ -1585,6 +1580,15 @@ pub struct Qwen3Text {
     final_norm: RmsNorm,
     /// `None` when `tie_word_embeddings = true`.
     lm_head: Option<Linear>,
+    /// Resident-KV byte total of this instance's last generation, paired with a
+    /// store sequence. Per model instance, never per arch — two models of the
+    /// same architecture must not write each other's figure.
+    pub(crate) kv_bytes: crate::kv_bytes::KvBytesCounter,
+    /// Stable identity of the snapshot this instance was loaded from, folded
+    /// into the prompt-cache key. The prompt cache is one static per arch, so
+    /// without it a second model of the same arch serves its K/V from this
+    /// one's slots. See [`crate::prompt_cache::cache_seed`].
+    pub(crate) model_sig: u64,
 }
 
 impl Qwen3Text {
@@ -1815,6 +1819,7 @@ fn max_abs_from_bytes(bytes: &[u8], dtype: Dtype) -> f32 {
 /// requests. Pass 1 for single-slot; pass N for multi-slot prefix matching.
 /// Recommended: 4. Only the Exact hit path is active (identical-prompt repeat
 /// skips re-prefill entirely, same contract as Qwen3_5Moe).
+/// Pass 0 to disable the cache: nothing is stored, so every request prefills.
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::indexing_slicing,
@@ -1883,7 +1888,7 @@ pub fn generate_greedy<'a>(
         "Qwen3 prompt cache must be ExactOnly — pure-attention with no GDN recurrent state \
          cannot safely reuse a partial prefix whose residual state is not stored",
     );
-    let consumed = QWEN3_PROMPT_CACHE.consume(prompt_ids, kv_quant, false);
+    let consumed = QWEN3_PROMPT_CACHE.consume(prompt_ids, kv_quant, false, model.model_sig);
 
     // Path A: exact cache hit — skip re-prefill, jump straight to decode.
     if let Consumed::Exact(cloned) = consumed {
@@ -1969,7 +1974,7 @@ pub fn generate_greedy<'a>(
         // decode — same lifecycle point as the Miss path store below.
         {
             let kv_bytes: u64 = kv_caches.iter().map(|c| c.resident_bytes()).sum();
-            QWEN3_PROMPT_CACHE.store_kv_cache_bytes(kv_bytes, post);
+            model.kv_bytes.store(kv_bytes, post);
         }
         return Ok(steps);
     }
@@ -2149,7 +2154,7 @@ pub fn generate_greedy<'a>(
                     let lk = qwen3_active_layout_key();
                     let block_hashes = chained_block_hashes_seeded(
                         prompt_ids,
-                        FNV_OFFSET ^ lk ^ kv_quant.cache_key_salt(),
+                        crate::prompt_cache::cache_seed(lk, kv_quant, model.model_sig),
                     );
                     // Capture the first-token logprobs at the OpenAI ceiling so
                     // a later exact-hit replays a true logprob (truncated to its own
@@ -2211,7 +2216,7 @@ pub fn generate_greedy<'a>(
     // exact-hit path above.
     {
         let kv_bytes: u64 = caches.iter().map(|c| c.resident_bytes()).sum();
-        QWEN3_PROMPT_CACHE.store_kv_cache_bytes(kv_bytes, post);
+        model.kv_bytes.store(kv_bytes, post);
     }
 
     let prefill_ms = (prefill_total_ns as f64) / 1.0e6;
@@ -2473,6 +2478,8 @@ pub fn load_from_path(model_dir: &Path, yarn_override: Option<&YarnOverride>) ->
         layers,
         final_norm,
         lm_head,
+        kv_bytes: crate::kv_bytes::KvBytesCounter::default(),
+        model_sig: crate::prompt_cache::model_cache_sig(model_dir),
     })
 }
 

@@ -26,9 +26,15 @@ pub trait Generator: Send + Sync {
 
     /// Return the KV-cache bytes from the last completed request for this generator.
     ///
-    /// Reads from the arch-specific atomic written by `generate_greedy` at
-    /// request boundary (N16). Returns 0 when no request has completed yet or
-    /// the arch does not track KV-cache bytes.
+    /// Reads the counter on the model instance this generator serves, written
+    /// by `generate_greedy` at request boundary (N16). Returns 0 when no
+    /// request has completed yet or the arch does not track KV-cache bytes.
+    ///
+    /// This is a **display** surface: it hands back the last-known count with
+    /// no generation boundary to check it against, so it may be a previous
+    /// request's figure. Do not record from it — a recording path brackets the
+    /// generation with `Architecture::kv_cache_bytes_sample` and refuses when
+    /// the store sequence did not advance.
     fn kv_cache_bytes(&self) -> u64 {
         0
     }

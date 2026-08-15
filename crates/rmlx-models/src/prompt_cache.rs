@@ -69,9 +69,50 @@ pub(crate) use rmlx_kv_ssd::{
     chained_block_hashes_seeded, SsdHydrate, BLOCK_TOKENS, FNV_OFFSET, FNV_PRIME,
 };
 // `chained_block_hashes` (the un-seeded form) is no longer used by this module
-// directly — `find_best_prefix` now always salts with a caller-supplied seed
-// (issue #26). It is still consumed by sibling `#[path]` test modules and by
+// directly — `find_best_prefix` now always salts with a caller-supplied seed.
+// It is still consumed by sibling `#[path]` test modules and by
 // `gemma4::prompt_cache`, which import it directly from `rmlx_kv_ssd`.
+
+/// Stable per-model identity, folded into the prompt-cache key by
+/// [`cache_seed`].
+///
+/// Derived from the snapshot directory's own name (its registry id, e.g.
+/// `mlx-community__gemma-4-e2b-it-mxfp8`) rather than the full path, so the
+/// same model resolves to the same signature whichever absolute path it was
+/// loaded through — the SSD tier's `.kvb` digests are seeded with this, and
+/// they have to survive a restart.
+pub(crate) fn model_cache_sig(model_dir: &std::path::Path) -> u64 {
+    let id = model_dir
+        .file_name()
+        .map_or_else(|| model_dir.as_os_str(), |name| name)
+        .to_string_lossy();
+    crate::multimodal_cache::model_sig(&id)
+}
+
+/// The block-digest seed a prompt-cache lookup and its matching push must both
+/// use.
+///
+/// Three things partition the key, and every one of them is a case where reusing
+/// another entry's K/V would be wrong rather than merely unhelpful:
+///
+/// - `model_sig` — **which model produced this K/V.** The prompt cache is one
+///   static per architecture, so two models of the same arch resident at once
+///   (the multi-model registry, or a speculative pair) share it. Without this
+///   term, model B's identical prompt matches model A's slot, the token-id
+///   equality check passes because the tokens *are* equal, and B decodes from
+///   A's K/V and A's first token — wrong output, silently.
+/// - `layout_key` — the SSD tier's `(arch, n_layers, n_kv_heads, head_dim,
+///   kv_quant)` shape key, or `0` when the tier is OFF. It is a *shape*
+///   identity and carries no model identity, which is why `model_sig` is a
+///   separate term rather than something to fold into it.
+/// - `kv_quant` — the codec the stored K/V is packed under.
+///
+/// One function so the lookup and push sides cannot drift: a push seeded
+/// differently from the query is not a bug that surfaces as a wrong answer, it
+/// surfaces as a cache that silently never hits.
+pub(crate) fn cache_seed(layout_key: u64, kv_quant: KvQuant, model_sig: u64) -> u64 {
+    FNV_OFFSET ^ layout_key ^ kv_quant.cache_key_salt() ^ model_sig
+}
 
 /// Default RAM cap for the prompt cache (2 GiB).
 pub(crate) const DEFAULT_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -175,75 +216,6 @@ pub struct CacheStats {
     /// prefix block was read back from a `.kvb` file and promoted into RAM.
     /// Zero when no SSD source is attached (the RAM-only default).
     pub ssd_hits: u64,
-}
-
-// ---------------------------------------------------------------------------
-// KvBytesSample
-// ---------------------------------------------------------------------------
-
-/// A read of an arch's last-request KV-cache byte total, tagged with the store
-/// sequence it was written at.
-///
-/// The bare byte count is ambiguous: `0` is both the never-written initialiser
-/// and a legal (if suspicious) reading, and a non-zero value read after a
-/// generation that never reported one is the *previous* generation's figure.
-/// Callers that record the number as a measurement need to tell those apart, so
-/// they sample the pair before and after the generation and require `seq` to
-/// have advanced. See [`crate::arch::Architecture::kv_cache_bytes_sample`].
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct KvBytesSample {
-    /// Byte total recorded by the most recent `store_kv_cache_bytes` call.
-    /// Meaningless unless `seq > 0`.
-    pub bytes: u64,
-    /// Number of `store_kv_cache_bytes` calls on this arch since process start.
-    /// `0` means no generation has reported a figure.
-    pub seq: u64,
-}
-
-/// What a pair of [`KvBytesSample`] reads taken around one generation says
-/// about the byte count that generation produced.
-#[allow(
-    clippy::exhaustive_enums,
-    reason = "closed by construction: the sequence either advanced or it did not, and if it \
-              did the byte count is either zero or not. There is no fourth state, and a \
-              wildcard arm at the call sites would defeat the purpose of the distinction"
-)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KvBytesVerdict {
-    /// The generation reported a non-zero byte count. Usable.
-    Reported(u64),
-    /// The generation reported nothing: the readable value belongs to an
-    /// earlier generation, or is the never-written initialiser. This is the
-    /// state that a bare `-> u64` accessor collapses into "0" or, worse, into
-    /// the previous run's plausible-looking figure.
-    Unreported,
-    /// The generation did report, and reported zero bytes. Distinct from
-    /// [`KvBytesVerdict::Unreported`]: the plumbing works and the answer is
-    /// still not usable as a resident-KV measurement after a real prefill.
-    ReportedZero,
-}
-
-/// Classify the byte count a generation produced, from the store sequence
-/// observed before and after it.
-///
-/// Detection ("did this generation report?") is decided by the sequence, and
-/// only then is the value interpreted. Collapsing the two — treating a zero, or
-/// an unchanged sequence, as "no KV" — is what silently records one run's
-/// number under another run's label.
-///
-/// Every caller that *records* or *reports* a KV-byte figure as a measurement
-/// goes through this. A caller that only displays the last-known value
-/// (`/metrics/cache`) may read the bare count.
-#[must_use]
-pub const fn classify_kv_bytes(before: KvBytesSample, after: KvBytesSample) -> KvBytesVerdict {
-    if after.seq <= before.seq {
-        return KvBytesVerdict::Unreported;
-    }
-    if after.bytes == 0 {
-        return KvBytesVerdict::ReportedZero;
-    }
-    KvBytesVerdict::Reported(after.bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -597,11 +569,18 @@ pub(crate) struct PromptCache<E: PromptCacheEntry> {
 }
 
 impl<E: PromptCacheEntry> PromptCache<E> {
-    /// Create a new cache with the given slot capacity (minimum 1).
+    /// Create a new cache with the given slot capacity.
+    ///
+    /// `capacity == 0` is a real state, not a degenerate one-slot cache: the
+    /// cache is built, counts its misses and keeps its SSD sinks, but [`push`]
+    /// refuses every entry, so nothing is ever stored and every request
+    /// prefills. That is what `--prompt-cache-slots 0` means.
     ///
     /// RAM cap is taken from the process-global resolver
     /// ([`active_ram_cap_bytes`]): CLI `--prompt-cache-ram-gb` if installed,
     /// else default 2 GiB.
+    ///
+    /// [`push`]: PromptCache::push
     pub(crate) fn new(capacity: usize) -> Self {
         Self::with_max_bytes(capacity, active_ram_cap_bytes())
     }
@@ -610,8 +589,8 @@ impl<E: PromptCacheEntry> PromptCache<E> {
     pub(crate) fn with_max_bytes(capacity: usize, max_bytes: u64) -> Self {
         let kind = active_prefix_index_kind();
         Self {
-            slots: Vec::with_capacity(capacity.max(1)),
-            capacity: capacity.max(1),
+            slots: Vec::with_capacity(capacity),
+            capacity,
             max_bytes,
             seq: 0,
             stats: CacheStats::default(),
@@ -665,6 +644,14 @@ impl<E: PromptCacheEntry> PromptCache<E> {
     ///
     /// [`find_best_prefix`]: PromptCache::find_best_prefix
     pub(crate) fn hydrate_from_ssd(&mut self, prompt_ids: &[u32]) -> Option<usize> {
+        // A zero-slot cache can admit nothing, so hydrating would read a `.kvb`
+        // off disk and reconstruct its K/V only for `push` to refuse it — once
+        // per request, for the life of the process. Worse, the refusal would
+        // arrive at the over-cap branch below and be logged as "exceeds RAM
+        // cap", which is not what happened.
+        if self.capacity == 0 {
+            return None;
+        }
         // Take the source out so the `&self` borrow during `hydrate` does not
         // conflict with the `&mut self` `push` below; put it back after.
         let source = self.ssd.take()?;
@@ -841,11 +828,13 @@ impl<E: PromptCacheEntry> PromptCache<E> {
     /// the over-cap guard below).
     ///
     /// Admission + eviction order:
-    /// 0. Over-cap guard: if the incoming entry's KV alone exceeds `max_bytes`,
+    /// 0. Zero-capacity guard: a cache with no slots stores nothing — refuse
+    ///    admission (return `None`).
+    /// 1. Over-cap guard: if the incoming entry's KV alone exceeds `max_bytes`,
     ///    refuse admission (return `None`) WITHOUT evicting any existing slot.
-    /// 1. While `total_kv_bytes + new_entry_bytes > max_bytes` and slots
+    /// 2. While `total_kv_bytes + new_entry_bytes > max_bytes` and slots
     ///    remain: evict the LRU slot.
-    /// 2. If `slots.len() == capacity`: drop the slot with the smallest
+    /// 3. If `slots.len() == capacity`: drop the slot with the smallest
     ///    `last_used_seq`.
     ///
     /// Either cap can trigger independently. Each eviction increments
@@ -855,6 +844,19 @@ impl<E: PromptCacheEntry> PromptCache<E> {
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
     )]
     pub(crate) fn push(&mut self, entry: E) -> Option<usize> {
+        // --- Zero-capacity guard ---
+        // `capacity == 0` is the disabled cache. Refusing here is what makes it
+        // disabled: `slots` then stays empty for the process's lifetime, so
+        // `find_best_prefix` can only miss and every request prefills. It also
+        // keeps the slot-count eviction below from asking an empty `slots` for
+        // its LRU index.
+        if self.capacity == 0 {
+            tracing::debug!(
+                "prompt cache: zero slots configured — snapshot not stored, next request prefills"
+            );
+            return None;
+        }
+
         let new_bytes = entry.kv_bytes();
 
         // --- Over-cap admission guard ---
@@ -1055,9 +1057,14 @@ pub(crate) struct AttachParams {
 ///
 /// Collapses the duplicated static state that every arch's `prompt_cache.rs`
 /// used to keep (its `Mutex<Option<PromptCache<E>>>`, `Mutex<Option<Attach…>>`,
-/// `AtomicU64` last-bytes counter, plus the matching `ensure` / `attach` /
-/// `read_stats` boilerplate) into one generic type. Each arch keeps a single
+/// plus the matching `ensure` / `attach` / `read_stats` boilerplate) into one
+/// generic type. Each arch keeps a single
 /// `static PROMPT_CACHE: ArchPromptCache<MyEntry> = ArchPromptCache::new(…)`.
+///
+/// The resident-KV byte counter is deliberately NOT here: it is per model
+/// *instance* ([`crate::kv_bytes::KvBytesCounter`], a field on each arch's model
+/// struct), because two models of the same arch sharing this static would
+/// cross-attribute each other's byte totals.
 ///
 /// The genuinely per-arch parts that stay outside this struct:
 /// - the `Entry` struct (Gemma4 = KV only, Qwen3 = KV only, Qwen3.5-MoE =
@@ -1088,18 +1095,6 @@ pub(crate) struct ArchPromptCache<E: PromptCacheEntry> {
     /// every cache re-creation so a capacity bump never silently drops the
     /// tier.
     attach: std::sync::Mutex<Option<AttachParams>>,
-    /// Last-request KV-cache byte total, surfaced via `/metrics/cache`.
-    last_kv_bytes: std::sync::atomic::AtomicU64,
-    /// Number of `store_kv_cache_bytes` calls on this arch since process start.
-    ///
-    /// `last_kv_bytes` alone cannot tell "no generation has reported a figure
-    /// yet" from "a generation reported zero", nor "this generation reported"
-    /// from "you are reading the previous generation's figure". Both collapse
-    /// to a plausible-looking number a caller would record as a measurement.
-    /// The sequence makes the distinction observable: a caller that samples it
-    /// before and after a generation knows whether the byte count it reads
-    /// belongs to that generation.
-    kv_bytes_seq: std::sync::atomic::AtomicU64,
 }
 
 impl<E: PromptCacheEntry> ArchPromptCache<E> {
@@ -1111,8 +1106,6 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
             policy,
             inner: std::sync::Mutex::new(None),
             attach: std::sync::Mutex::new(None),
-            last_kv_bytes: std::sync::atomic::AtomicU64::new(0),
-            kv_bytes_seq: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1146,11 +1139,19 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
         f(&mut guard)
     }
 
-    /// Ensure the cache is initialised with at least `capacity` slots. If the
-    /// existing cache already has the same capacity, this is a no-op. Otherwise
-    /// the cache is rebuilt (old snapshots discarded) and the SSD spiller /
+    /// Ensure the cache is initialised with `capacity` slots. If the existing
+    /// cache already has the same capacity, this is a no-op. Otherwise the
+    /// cache is rebuilt (old snapshots discarded) and the SSD spiller /
     /// hydrator are re-installed from the recorded `attach` params (no-op when
     /// the tier is OFF).
+    ///
+    /// The comparison is against what the cache actually stores, so it holds
+    /// for every value including `0`. It has to: this runs once per generation
+    /// on every arch, and a capacity that never compares equal would rebuild
+    /// (and reset the hit/miss counters, and re-install the SSD sinks) on every
+    /// request, which reads as "disabled" while in fact discarding a freshly
+    /// built cache each time. `0` disables the cache by refusing admission —
+    /// see [`PromptCache::new`] — not by failing to match itself.
     ///
     /// `SsdSpiller: SpillSink<E>` and `SsdHydrator: SsdHydrate<E>` bound the
     /// call so only archs with both trait impls reach this method.
@@ -1184,10 +1185,10 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
     /// cache object itself — its capacity and its installed SSD sinks — in
     /// place. A no-op when no generation has built the cache yet.
     ///
-    /// This is the supported way to make the next request a guaranteed miss.
-    /// Asking for a zero-slot cache is not: capacity is clamped to a minimum of
-    /// one slot, so a "zero-slot" cache still stores and can still serve a
-    /// snapshot.
+    /// This is the way to make the next request a guaranteed miss while keeping
+    /// the cache configured as production has it — which is what a measurement
+    /// wants. Reconfiguring to zero slots also misses every time, but it
+    /// measures a different cache than the one being served.
     pub(crate) fn clear(&self) {
         self.with_inner_mut(|slot| {
             if let Some(cache) = slot.as_mut() {
@@ -1259,9 +1260,10 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
     ///    find, no evict side-effect). The cached K/V is keyed by token ids
     ///    only; an image prompt's K/V depends on scattered vision features, so
     ///    it must never be served from or stored under a token-id key.
-    /// 2. Compute the codec-partitioned seed from `active_layout_key()` +
-    ///    `kv_quant.cache_key_salt()` so a slot stored under a different KV codec
-    ///    never cross-serves.
+    /// 2. Compute the partitioned seed via [`cache_seed`] from
+    ///    `active_layout_key()` + the KV codec + `model_sig`, so a slot stored
+    ///    by a different model, under a different codec, or for a different
+    ///    cache layout never cross-serves.
     /// 3. `find_best_prefix` (capturing `block_count`) + the hydrate-from-SSD
     ///    retry (no-op when the tier is OFF).
     /// 4. Quant-mismatch guard: a stored `KvQuant` that differs from the runtime
@@ -1280,11 +1282,17 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
     /// Every degrade branch emits exactly one `debug!{branch, reason}` so the
     /// decision is reconstructable from a single run's log — the cached arches
     /// previously had silent degrade arms.
+    ///
+    /// `model_sig` identifies the model asking. It is not decoration: this
+    /// cache is one static per *architecture*, so it is shared by every model
+    /// of that arch the process has resident, and the token-id equality the
+    /// `Exact` arm checks cannot tell two models' identical prompts apart.
     pub(crate) fn consume(
         &self,
         prompt_ids: &[u32],
         kv_quant: KvQuant,
         has_image: bool,
+        model_sig: u64,
     ) -> Consumed<E> {
         // (1) Image prompts bypass the cache entirely — no find, no evict.
         if has_image {
@@ -1297,9 +1305,10 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
             return Consumed::Miss;
         }
 
-        // (2) Codec-partitioned seed: identical to the per-arch push seed, so a
-        // slot stored under a different KV codec / layout never matches.
-        let seed = FNV_OFFSET ^ self.active_layout_key() ^ kv_quant.cache_key_salt();
+        // (2) Partitioned seed: identical to the per-arch push seed, so a slot
+        // stored by a different model, or under a different KV codec / layout,
+        // never matches.
+        let seed = cache_seed(self.active_layout_key(), kv_quant, model_sig);
         let policy = self.policy;
         let arch = self.arch_name;
 
@@ -1463,61 +1472,6 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .map(PromptCache::stats)
-    }
-
-    /// Read the KV-cache bytes from the last completed request, paired with the
-    /// store sequence they were written at.
-    ///
-    /// `seq == 0` means no generation on this arch has reported a figure yet,
-    /// so `bytes` is the `0` initialiser and not a measurement.
-    pub(crate) fn read_kv_cache_bytes_sample(&self) -> KvBytesSample {
-        // Load the sequence FIRST, and with Acquire. The writer stores
-        // `last_kv_bytes` before releasing the sequence, so observing sequence
-        // `k` guarantees the byte count for generation `k` is already visible:
-        // the byte load that follows returns generation `k`'s figure or a later
-        // one. The pairing invariant is therefore "bytes is never *older* than
-        // seq", which is the direction that matters — a caller comparing
-        // sequences can refuse a reading that was in fact valid, but can never
-        // accept a stale byte count as a fresh generation's measurement.
-        //
-        // The opposite order does not hold: an Acquire load only orders the
-        // accesses that follow it, so reading bytes first leaves that load
-        // outside the release/acquire edge (and free to sink below it on
-        // aarch64). The reader could then pair generation `k-1`'s bytes with
-        // sequence `k` — exactly the stale-value-under-a-fresh-label failure
-        // `KvBytesSample` exists to make impossible.
-        //
-        // No seqlock needed: the payload is a single `u64`, which cannot tear.
-        let seq = self.kv_bytes_seq.load(std::sync::atomic::Ordering::Acquire);
-        let bytes = self
-            .last_kv_bytes
-            .load(std::sync::atomic::Ordering::Relaxed);
-        KvBytesSample { bytes, seq }
-    }
-
-    /// Store the KV-cache bytes for the just-finished request. Called by
-    /// `generate_greedy` at request boundary.
-    ///
-    /// The `PostDecode` witness pins the sample to a single lifecycle point:
-    /// after the decode loop, when every resident KV allocation (incl. the
-    /// decode-time ring) exists. It is minted only by the decode loops, so a
-    /// caller cannot record `kv_cache_bytes` at the prefill snapshot — a
-    /// pre-decode number would silently omit the ring on ring-backed codecs.
-    ///
-    /// Also emits the `kv_bytes` event. This is the one place it is emitted:
-    /// `n` is already summed over every cache by the caller, so the event costs
-    /// nothing extra. Emitting it per-layer per-decode-step instead would call
-    /// `KvCache::resident_bytes` — which walks a block list that grows by one
-    /// entry per decode step — making a generation quadratic in context for the
-    /// sake of a diagnostic.
-    pub(crate) fn store_kv_cache_bytes(&self, n: u64, _post: crate::decode_loop::PostDecode) {
-        tracing::debug!(kv_bytes = n, "kv cache bytes");
-        self.last_kv_bytes
-            .store(n, std::sync::atomic::Ordering::Relaxed);
-        // Release-ordered so a reader that observes the bumped sequence also
-        // observes the byte count that goes with it.
-        self.kv_bytes_seq
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 }
 

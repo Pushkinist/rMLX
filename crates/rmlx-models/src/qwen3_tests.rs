@@ -1,5 +1,5 @@
 use super::*;
-use crate::prompt_cache::{PromptCache, SpillSink, BLOCK_TOKENS};
+use crate::prompt_cache::{PromptCache, SpillSink, BLOCK_TOKENS, FNV_OFFSET};
 use rmlx_kv_ssd::chained_block_hashes;
 
 /// Unit test: per-head q_norm shape is preserved.
@@ -323,36 +323,6 @@ fn qwen3_ssd_hydrate_promotes_entry_into_ram() {
         after.is_some(),
         "promoted entry must be findable in RAM after hydrate"
     );
-}
-
-/// / : KV-bytes atomic store/read round-trip via the
-/// unified `ArchPromptCache` last-bytes counter. Exercises the two store
-/// sites: the Miss path (post-prefill snapshot push in `generate_greedy`)
-/// and the Exact-hit path (added by , before `return Ok(steps)`).
-/// CPU-only — no model, no GPU.
-#[test]
-fn qwen3_kv_bytes_store_read_roundtrip() {
-    let post = crate::decode_loop::PostDecode::for_test();
-    // Simulate the Miss path store.
-    let sentinel_miss: u64 = 123_456_789;
-    QWEN3_PROMPT_CACHE.store_kv_cache_bytes(sentinel_miss, post);
-    assert_eq!(
-        read_kv_cache_bytes_sample().bytes,
-        sentinel_miss,
-        "read_kv_cache_bytes_sample() must return the value stored on the Miss path"
-    );
-
-    // Simulate the Exact-hit path store (same atomic, same semantics).
-    let sentinel_hit: u64 = 987_654_321;
-    QWEN3_PROMPT_CACHE.store_kv_cache_bytes(sentinel_hit, post);
-    assert_eq!(
-        read_kv_cache_bytes_sample().bytes,
-        sentinel_hit,
-        "read_kv_cache_bytes_sample() must return the value stored on the Exact-hit path"
-    );
-
-    // Reset to 0 so parallel tests see a clean state.
-    QWEN3_PROMPT_CACHE.store_kv_cache_bytes(0, post);
 }
 
 /// qwen3 dense is on the `ExactOnly` policy.

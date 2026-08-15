@@ -642,18 +642,25 @@ pub(crate) async fn chat_completions(
         };
         let mut sc = state.session_cache.lock();
         let is_hit = sc.touch(key, prompt_tokens.len());
-        // base_slots=4 (generator default) + one slot per active session so the
-        // FIFO PromptCache never evicts a live session's snapshot.
-        let effective = 4 + sc.active_count();
+        // The server's configured base widened by one slot per active session,
+        // so the FIFO PromptCache never evicts a live session's snapshot.
+        //
+        // A base of 0 is the disabled cache and stays disabled: a request
+        // header must not be able to turn on a cache the operator switched
+        // off, and mixing the two capacities would rebuild the cache on every
+        // request as `ensure` alternated between them.
+        let base = state.prompt_cache_slots;
+        let effective = crate::session_cache::effective_prompt_cache_slots(base, sc.active_count());
         tracing::debug!(
             model_id = %req.model,
             session_id = %sid,
             is_hit,
             active_sessions = sc.active_count(),
+            base_prompt_cache_slots = base,
             effective_prompt_cache_slots = effective,
             "chat_completions: session cache lookup"
         );
-        Some(effective)
+        effective
     } else {
         None
     };

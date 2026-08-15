@@ -125,6 +125,7 @@ fn scripted_state(pieces: &'static [&'static str]) -> (AppState, tempfile::TempD
         max_tokens_cap: u32::MAX,
         max_timeout_secs: 600,
         session_cache: Arc::new(parking_lot::Mutex::new(SessionCache::new(4))),
+        prompt_cache_slots: 4,
         ttft_store: TtftStore::default(),
         itl_store: ItlStore::default(),
         metrics_drainer: None,
