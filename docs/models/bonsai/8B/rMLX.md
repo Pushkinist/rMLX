@@ -24,6 +24,36 @@ discarded. Bar (§3): WIN / TIE-on-noise / LOSS.
 > because they were CPU-bound; that cap is gone — both families now run the
 > complete 4k–64k range on the new flash-decode-over-quant kernels (§0, §4).
 
+> ⚠️ **Superseded for the iso / rotor rows (2026-08-15).** Every `iso*` / `rotor*`
+> / `k_iso*` / `k_rotor*` **absolute decode-TPS** cell in this document — the §2
+> matrix and the §0 root-cause bullets that rest on it — was
+> measured against a dispatcher that forced `Array::eval()` on its kernel inputs
+> once per attention layer per decode step, blocking the host on the GPU. With
+> that removed, a paired `rmlx bench` A/B (n=3, one binary pair, `none` as the
+> null control) reads **+17% to +189%** on those codecs at unchanged token
+> digest, KV bytes and TTFT: Bonsai `iso3_sym` 19.09 → **55.15** @4k,
+> 11.00 → **19.01** @16k, 7.67 → **10.44** @32k; `k_iso3` 14.90 → **24.37**
+> @16k; `rotor3_sym` 10.13 → **16.03** @16k; `k_rotor3` 13.73 → **21.59** @16k.
+> The `none` control moved −1.9…+1.2% across six cells. Full table in
+> `docs/PERF_BASELINE.md` § "The iso / rotor Bonsai anchors above are stale".
+>
+> One conclusion in §0 is therefore **withdrawn**: that the `_sym` penalty is a
+> V-side dequant cost inside the symv kernel. It was the dispatcher, and the
+> K-only kernels paid it identically.
+>
+> **§2.2's marginal-cost fits (ms per 1k KV tokens) are NOT withdrawn.** The eval
+> was a fixed cost per decode step — one host↔GPU round trip per attention layer,
+> whatever the KV length — so it moves the intercept of
+> `ms/step = a + b × (KV tokens/1000)` and a slope cancels it by construction.
+> Measured across the binary pair: `a` 41.14 → **7.01 ms/step (−83%)**,
+> `b` 2.437 → **2.449 ms/1k (+0.5%)**. Cite the ms/1k table; re-record the TPS
+> cells.
+>
+> What is **not** withdrawn either: `none` is still the fastest and the
+> smallest at every context, and no member of this family beats it after the
+> fix — the format is not smaller than bf16 (#310), so there is no
+> crossover to reach.
+
 ---
 
 ## 0. TL;DR
@@ -57,14 +87,22 @@ discarded. Bar (§3): WIN / TIE-on-noise / LOSS.
   worse than the 0.2.5 CPU path it was built to replace. The symv
   flash-decode kernel provably dispatches on GPU at every size (confirmed via
   `iso_flash_decode_symv_sdpa` / `rotor_flash_decode_symv_sdpa` probes,
-  including at 64k) — this is a genuine marginal-cost defect in the new
-  kernel, not a dispatch failure. Root-caused to the V-side dequant **inside
-  the symv kernel specifically** — *not* to quantized-V in general
-  (`rot_k_tq4v` quantizes V on the generic path and is cheap at 1.16 ms/1k),
-  and *not* to the flash-decode scaffolding in general (the K-only kernels are
-  costly but stable): marginal cost **6.25–9.42 ms per 1k KV tokens** vs the
-  K-only (quantized-K-only, bf16-V) family's **2.25–3.49 ms/1k** and `none`'s
-  **0.33 ms/1k** (§2.2) — filed as issue #292. KV memory did improve sharply
+  including at 64k) — this is a genuine marginal-cost defect, not a dispatch
+  failure. **The root cause originally recorded here — a V-side dequant inside
+  the symv kernel — is withdrawn (2026-08-15).** The dominant term was the
+  dispatcher, which blocked the host on `Array::eval()` once per attention layer
+  per decode step; that cost is paid identically by the K-only kernels and is
+  not V-specific at all. Removing it lifts `iso3_sym` 19.09 → 55.15 TPS @4k and
+  `k_iso3` 14.90 → 24.37 @16k, and closes most of the `_sym` vs K-only gap this
+  bullet was built on (at 4k the two are now 55.15 vs 56.98, 3% apart). Every
+  **absolute TPS** figure in this bullet and in §2 therefore measures the
+  dispatcher and must be re-recorded. The **marginal-cost** numbers below —
+  **6.25–9.42 ms per 1k KV tokens** for `_sym`, **2.25–3.49 ms/1k** K-only,
+  `none`'s **0.33 ms/1k** (§2.2) — **stand**: the eval was a fixed per-step cost
+  (one host round trip per attention layer, whatever the KV length), so it lands
+  in the intercept and a slope cancels it. Measured across the binary pair, the
+  intercept fell 41.14 → 7.01 ms/step (−83%) while the slope moved 2.437 → 2.449
+  ms/1k (+0.5%). Filed as issue #292. KV memory did improve sharply
   (30608→10640 MB @64k, 2.91×→1.01× `none`, essentially free now) — the
   codec got cheap on memory and expensive on compute at exactly the context
   length it exists to serve.

@@ -107,10 +107,10 @@ pub(crate) fn build_fused_qk_setup(
     }
     let dims_arr = Array::from_bytes(&dims_bytes, &[5], Dtype::U32)?;
 
-    q_f32.eval()?;
-    mask_flat.eval()?;
-    scale_arr.eval()?;
-    dims_arr.eval()?;
+    // Inputs stay lazy: `MetalKernel::apply` enqueues a graph node, so MLX
+    // materialises them — and applies `ensure_row_contiguous` — inside the
+    // kernel's own `eval_gpu`. A blocking eval here would only stall the host
+    // once per layer per decode step. See `crate::flash_decode_common` docs.
 
     let out_total: i64 = i64::from(b) * i64::from(n_q_heads) * i64::from(kv_seq);
     let grid_x: i64 = i64::from(kv_seq) * i64::from(head_dim);

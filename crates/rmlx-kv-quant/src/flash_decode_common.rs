@@ -29,6 +29,43 @@
 //! chat prompt against a single-KV-head model (Gemma4 global layers are
 //! `kv_h == 1`), where a 2-token prompt reaches `kv_seq == 2` on the first
 //! decode step, well below the compile floor.
+//!
+//! # Why a kernel dispatcher must not `eval()` its inputs
+//!
+//! This is the canonical statement of the rule; the MSL dispatchers point here
+//! rather than repeating it, so the argument cannot drift between copies. The
+//! CI gate `make check-no-kernel-input-eval` enforces it.
+//!
+//! These kernels read their buffers by raw linear offset, so they need
+//! row-contiguous inputs. Historically every dispatcher forced
+//! `Array::eval()` on each input immediately before dispatch, on the reasoning
+//! that a pending lazy transpose would otherwise be read with the wrong
+//! strides. **Both halves of that reasoning are wrong:**
+//!
+//! * **Ordering.** `rmlx_mlx::metal_kernel::MetalKernel::apply` enqueues an
+//!   MLX `fast::CustomKernel` **graph node**; it does not dispatch.
+//!   MLX runs that node's `eval_gpu` only once every input edge is itself
+//!   materialised, and the `ensure_row_contiguous` copy — requested by
+//!   `MetalKernel::new` — is applied inside that same `eval_gpu`. The kernel
+//!   therefore cannot observe an uncomputed or strided buffer. A caller-side
+//!   `eval()` buys no ordering the graph does not already provide; it only
+//!   moves *when* the host blocks.
+//! * **Layout.** `Array::eval()` materialises but does **not** relayout. MLX's
+//!   `Transpose` is a strided view over a shared buffer, so an evaluated
+//!   transpose is still non-row-contiguous — evaluating it would not have
+//!   fixed the stride problem the comment claimed to be guarding. The layout
+//!   guarantee comes from `reshape` plus `ensure_row_contiguous`, and always
+//!   did.
+//!
+//! The cost of the eval was not small: it blocks the calling thread on the GPU
+//! once per attention layer per decode step, so the forward pass advances one
+//! layer at a time with nothing queued ahead. Removing it is a fixed
+//! per-step saving (it collapses the per-step intercept, not the per-KV-token
+//! slope) worth multiples of the decode rate at short context.
+//!
+//! An eval that is genuinely load-bearing — a host readback before
+//! `to_bytes()`, say — stays, and says so at the call site with an
+//! `// eval-ok: <reason>` marker.
 
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{pad, Array, Device};

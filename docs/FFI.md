@@ -460,6 +460,43 @@ methods trigger execution:
   current step's argmax is still being read back to the CPU, mirroring
   mlx-lm's `mx.async_eval` pattern in `generate.py`.
 
+**Never `eval()` a kernel's inputs before dispatching it.** `Array::eval()`
+blocks the calling thread until the GPU has produced the array, so an `eval()`
+inside a per-layer dispatcher runs the forward pass one layer at a time with
+nothing queued ahead — the host and the GPU stop overlapping. It produces
+byte-identical output, which is why the cost hides: it shows up only as a
+decode rate several times below what the kernel can reach. A KV flash-decode
+dispatcher paying this on every attention layer measured **2.7× below** its own
+rate on Ternary-Bonsai-8B once the `eval()` calls were dropped, with the token
+digest unchanged.
+
+Pass lazy arrays to `MetalKernel::apply` and let MLX schedule the graph. Two
+facts make that safe, and both are worth stating because the comment this rule
+replaced got each of them wrong:
+
+* **Ordering.** `MetalKernel::apply` enqueues an MLX `fast::CustomKernel` graph
+  node; it does not dispatch. MLX runs that node's `eval_gpu` only once every
+  input edge is materialised, and applies the `ensure_row_contiguous` copy
+  (below) inside that same `eval_gpu`. A kernel cannot read an uncomputed or
+  strided buffer, so a caller-side `eval()` buys no ordering — it only changes
+  *when* the host blocks.
+* **Layout.** `Array::eval()` materialises but does **not** relayout. MLX's
+  `Transpose` is a strided view over a shared buffer, so an evaluated transpose
+  is still non-row-contiguous. The layout guarantee for a raw-linear kernel
+  always came from `reshape` plus `ensure_row_contiguous`, never from forcing
+  evaluation.
+
+The CI gate `make check-no-kernel-input-eval` enforces this across every
+custom-Metal-kernel dispatcher and shared dispatcher scaffold in the KV codec
+layer (keyed on the file constructing a `MetalKernelInvoke`, or being a
+`*_common.rs` scaffold — not on a codec name), with an `// eval-ok: <reason>`
+marker for a genuinely load-bearing call such as a host readback before
+`to_bytes()`. One marker exempts one call.
+`make check-no-kernel-input-eval-fixtures` is the gate's own recall test: a
+fixture tree per evasion (UFCS `Array::eval(&x)`, an eval moved into a shared
+`_common.rs` helper, a dispatcher relocated into a sub-directory, a marker
+leaking onto a following loop) pinned to the exit code the gate must produce.
+
 ### Data readback
 
 `Array::to_bytes()` forces evaluation (`eval()`) before reading, then calls
@@ -685,6 +722,15 @@ mlx-c copies them internally.
 `ensure_row_contiguous = true` is always set — the safer default for custom
 kernels. `atomic_outputs = false` unless the kernel requires read-modify-write
 atomics (e.g. `atomic_fetch_or_explicit`).
+
+`ensure_row_contiguous` is what makes it safe for a kernel body to index its
+buffers by raw linear offset: MLX copies any input that is not row-contiguous
+(a lazy transpose, a strided view) before the dispatch. Callers therefore do
+**not** need to materialise inputs themselves — see "Never `eval()` a kernel's
+inputs" under Evaluation. It does not fix a *semantic* layout disagreement: an
+array whose logical axis order is not the one the kernel indexes is still wrong
+after the copy, and that is what the canonical seq-major KV store layout is
+for.
 
 `MetalKernel::apply` takes a `MetalKernelInvoke` by value (consumed), builds
 input/output `mlx_vector_array` handles, dispatches via
