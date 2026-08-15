@@ -4,14 +4,14 @@
 //! Owns the entire SSD KV story:
 //!
 //! - [`ssd_index`] — SQLite index of on-disk `.kvb` blocks (`SsdKvIndex`,
-//!   schema v2, LRU eviction, layout-key column).
+//!   schema v3, LRU eviction, layout-key column).
 //! - [`block_io`] — `KvBlockWriter` / `KvBlockReader` (safetensors record
 //!   format per `KvStorage` variant) — the authoritative dispatch for
 //!   Contract B (every codec adds one match arm here).
 //! - [`spill`] — `SsdSpiller` + `SpillJob` + bounded-channel drain thread.
 //! - [`hydrate`] — `SsdHydrator` for on-demand RAM-miss reload.
 //! - [`ssd_tier`] — `install_config`, `attach_at_load`, `compute_layout_key`,
-//!   pre-release v1 wipe.
+//!   stale-schema namespace wipe.
 //! - [`hooks`] — process-global Prometheus hook setters + SSD event recorder.
 //! - [`traits::SsdHydrate`] — single trait arch entries implement; bridges the
 //!   prompt cache to the SSD hydrator.

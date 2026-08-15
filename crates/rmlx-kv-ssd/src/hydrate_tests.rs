@@ -588,11 +588,11 @@ fn budget_enforcement_racing_hydrates_never_serves_a_foreign_block() {
     // keeps the namespace over the ceiling (so the budget pass always has work
     // and lookups keep missing), while the prompt blocks are not crowded down to
     // a survival rate that would let a slow box reach zero hits and skip the
-    // content check entirely. `last_used` is unix *seconds* (`unix_now`) and the
-    // race finishes well inside one, so every row ties and `ORDER BY last_used
-    // ASC` has no tiebreak — which block gets evicted is arbitrary, and headroom
-    // is what keeps `hits > 0` robust rather than lucky. Measured: ~31% hits,
-    // ~69% misses over 240 lookups.
+    // content check entirely. A hit does touch its block to the back of the
+    // eviction queue, but the writer records fresh filler continuously and every
+    // one of those lands ahead of it, so a prompt block survives only until
+    // enough newer filler arrives — the headroom is what keeps `hits > 0`
+    // robust rather than lucky. Measured: ~32-42% hits over 240 lookups.
     let budget = fx.block_bytes * (RACE_PROMPTS as u64 * 4);
 
     // Pre-race pass on quiet state: every prompt hits and its content is its
