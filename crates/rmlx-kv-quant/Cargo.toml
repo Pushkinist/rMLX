@@ -18,3 +18,10 @@ thiserror  = { workspace = true }
 tracing    = { workspace = true }
 
 [dev-dependencies]
+
+# Positive control for the shader-validation gate: a kernel that stores out of
+# bounds on purpose, so `scripts/run_gpu_tests.sh` can prove its detector still
+# matches this toolchain's report before trusting a clean scan. Off by default —
+# nothing builds it unless the gate asks for it.
+[features]
+shader-validation-canary = []

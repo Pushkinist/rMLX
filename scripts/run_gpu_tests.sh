@@ -48,13 +48,44 @@
 #   executed; that is the suite's own documented contract and is not a
 #   process-wide off switch.
 #
+# SHADER VALIDATION (--shader-validation, on by default)
+#   An out-of-bounds device store from a Metal kernel is silently dropped: the
+#   command buffer completes, `cb.error` is nil, the process exits 0, and the
+#   assertions downstream of the frozen buffer still pass. That is this repo's
+#   documented silent-corruption class, and no amount of `cargo test` sees it —
+#   measured on a deliberately broken q8 quantize kernel, both GPU tests over it
+#   passed with no output at all.
+#
+#   Metal's shader validation instruments every pipeline and reports the invalid
+#   access, naming the kernel function. Two details decide the implementation:
+#
+#     * The report never reaches the exit code. Even with validation on, cargo
+#       exits 0 and the tests report `ok`. The signal is a diagnostic in the
+#       output, so this gate SCANS for it; a gate that trusts the exit code
+#       passes while the diagnostic scrolls past.
+#     * MTL_SHADER_VALIDATION=1 alone is not enough. Reports go to Unified
+#       Logging unless MTL_SHADER_VALIDATION_REPORT_TO_STDERR is set — it
+#       defaults to 0 (`man MetalValidation`). Setting only the first variable
+#       yields a gate that runs, prints its banner, and can never fire.
+#
+#   So this script owns the whole MTL_SHADER_VALIDATION_* environment rather
+#   than inheriting it: every knob that can disable instrumentation or muzzle
+#   reporting is pinned explicitly, so no stale export in a dev shell can leave
+#   the gate looking armed while it is blind. It then asserts the validation
+#   banner actually appeared — if the layer did not load, the run proved nothing
+#   and reporting green would be a lie.
+#
+#   Validation costs throughput, so it belongs here and not in any cell whose
+#   numbers get recorded. Pass --no-shader-validation to opt out.
+#
 # USAGE
 #   bash scripts/run_gpu_tests.sh
 #   bash scripts/run_gpu_tests.sh --crate rmlx-kv-quant
 #   bash scripts/run_gpu_tests.sh --crate rmlx-kv-quant --filter rotor_flash
+#   bash scripts/run_gpu_tests.sh --no-shader-validation
 #
-# Exit 0 = every selected GPU test passed. Exit 1 = a failure, or a run that
-# executed nothing.
+# Exit 0 = every selected GPU test passed. Exit 1 = a failure, a shader
+# validation diagnostic, or a run that executed nothing.
 
 # No `-e`: cargo's exit code is captured explicitly via PIPESTATUS, and one
 # failing crate must not abort the remaining crates. The `[ ... ] && echo` guard
@@ -67,22 +98,85 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 usage() {
     cat <<'USAGE'
 Usage: run_gpu_tests.sh [--crate <name>] [--filter <substring>]
+                        [--shader-validation | --no-shader-validation]
 
-  --crate <name>       restrict to one workspace member (e.g. rmlx-kv-quant)
-  --filter <substring> restrict to GPU test fns whose name contains <substring>
+  --crate <name>          restrict to one workspace member (e.g. rmlx-kv-quant)
+  --filter <substring>    restrict to GPU test fns whose name contains <substring>
+  --shader-validation     instrument every Metal pipeline and fail on an invalid
+                          memory access (default)
+  --no-shader-validation  run the tests uninstrumented
 USAGE
 }
 
 ONLY_CRATE=""
 FILTER=""
+SHADER_VALIDATION=1
 while [ $# -gt 0 ]; do
     case "$1" in
         --crate)  ONLY_CRATE="${2:?--crate needs a value}"; shift 2 ;;
         --filter) FILTER="${2:?--filter needs a value}"; shift 2 ;;
+        --shader-validation)    SHADER_VALIDATION=1; shift ;;
+        --no-shader-validation) SHADER_VALIDATION=0; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "ERROR: unknown argument '$1'" >&2; usage >&2; exit 1 ;;
     esac
 done
+
+# Pinned rather than inherited. Every one of these can silently disarm the
+# gate: DEFAULT_STATE=none skips instrumenting pipelines, DISABLE_PIPELINES
+# exempts named ones, GLOBAL_MEMORY=0 / THREADGROUP_MEMORY=0 drop the
+# instrumentation this gate is about, ENABLE_ERROR_REPORTING=0 detects and says
+# nothing, and REPORT_TO_STDERR defaults to 0 so reports land in Unified
+# Logging where nothing here reads them. FAIL_MODE=zerofill keeps the run alive
+# after the first hit (invalid writes are dropped), so one run reports every
+# offending kernel instead of the first. See `man MetalValidation`.
+#
+# Naming these is not enough on its own: `env NAME=VALUE` overrides exactly what
+# it names and passes the rest of the environment through, so any other MTL_*
+# knob — a stale export, or one a future toolchain adds — still reaches the test
+# process. `mtl_unset` below clears the whole MTL_* namespace first, so the
+# pinned set is the entire Metal configuration the tests run under.
+mtl_validation_env=(
+    MTL_SHADER_VALIDATION=1
+    MTL_SHADER_VALIDATION_DEFAULT_STATE=all
+    MTL_SHADER_VALIDATION_DISABLE_PIPELINES=
+    MTL_SHADER_VALIDATION_ENABLE_ERROR_REPORTING=1
+    MTL_SHADER_VALIDATION_GLOBAL_MEMORY=1
+    MTL_SHADER_VALIDATION_THREADGROUP_MEMORY=1
+    MTL_SHADER_VALIDATION_FAIL_MODE=zerofill
+    MTL_SHADER_VALIDATION_REPORT_TO_STDERR=1
+)
+# Every inherited MTL_* name, as `-u NAME` pairs for `env`. Built once, before
+# any crate runs. It is non-empty in practice only when the caller has such
+# exports, so it is expanded alongside a non-empty array and never alone — an
+# empty array expansion under `set -u` is an error on the bash 3.2 that
+# `/usr/bin/env bash` resolves to here.
+mtl_unset=()
+while IFS='=' read -r mtl_name _; do
+    case "${mtl_name}" in
+    MTL_*) mtl_unset+=(-u "${mtl_name}") ;;
+    esac
+done < <(env)
+
+# Printed by Metal at device creation once the layer is live. Its absence means
+# the run was uninstrumented no matter what the variables above say.
+VALIDATION_BANNER='Metal GPU Validation Enabled'
+# Shape of every report seen from this layer, across device and threadgroup
+# memory, loads and stores:
+#   Invalid device store at offset 4000068, executing kernel function: "..."
+# Deliberately NOT anchored at line start: the layer writes to the process's
+# stderr while libtest is mid-line, so a report routinely lands appended to a
+# `test some::name ... ` prefix, and `^Invalid` sees only the ones that happen
+# to start a line. Requiring one of the two markers within a bounded distance
+# is what keeps a test's own "invalid" wording from forging a hit.
+VALIDATION_DIAGNOSTIC='Invalid .{0,120}(at offset [0-9]+|executing kernel function:)'
+
+# Same environment the crates run under, hoisted so the canary above can use it.
+# `${arr[@]+"${arr[@]}"}` is the portable spelling: mtl_unset is empty whenever
+# the caller exported no MTL_* names, and expanding an empty array is an
+# unbound-variable error under `set -u` on the bash 3.2 that `/usr/bin/env bash`
+# resolves to here — being adjacent to a non-empty array does not help.
+validation_prefix_canary=(env ${mtl_unset[@]+"${mtl_unset[@]}"} "${mtl_validation_env[@]}")
 
 # Every classified test starts with `if skip_if_no_gpu_env() { return; }`, so
 # this variable turns the entire suite into no-ops that still report as passed.
@@ -115,9 +209,16 @@ if [ -z "${listing}" ]; then
 fi
 
 # Apply the narrowing options, then group what is left by crate.
+# The canary is the gate's own positive control, not part of the correctness
+# suite: it is run separately, first, with its own feature enabled. Left in this
+# population the coverage check would demand it run in the ordinary pass, where
+# the feature is off and it is not compiled at all.
+CANARY_TEST="shader_validation_canary_emits_an_invalid_access_report"
+
 selected=""
 while IFS=$'\t' read -r crate fn_name; do
     [ -z "${crate}" ] && continue
+    [ "${fn_name}" = "${CANARY_TEST}" ] && continue
     if [ -n "${ONLY_CRATE}" ] && [ "${crate}" != "${ONLY_CRATE}" ]; then continue; fi
     case "${fn_name}" in
         *"${FILTER}"*) selected="${selected}${crate}"$'\t'"${fn_name}"$'\n' ;;
@@ -144,6 +245,37 @@ fi
 failed_crates=""
 total_passed=0
 total_failed=0
+validation_hits=""
+
+if [ "${SHADER_VALIDATION}" = "1" ]; then
+    echo "shader validation: ON (invalid Metal memory access fails this run)"
+    # A positive control, run before anything is trusted to be clean. The
+    # banner proves the instrumentation LOADED; it says nothing about whether
+    # the detector below still matches what this toolchain emits, and
+    # VALIDATION_DIAGNOSTIC is a hand-written pattern over an undocumented,
+    # version-specific message. Without this, a wording change at the next Xcode
+    # bump turns the gate into one that runs, banners, and never fires.
+    #
+    # The canary kernel stores out of bounds on purpose and lives behind its own
+    # feature, so it is not built into any ordinary test run.
+    canary_log="$(mktemp -t rmlx-gpu-canary)"
+    "${validation_prefix_canary[@]}" cargo test --no-fail-fast -p rmlx-kv-quant \
+        --features shader-validation-canary --lib -- \
+        --ignored --test-threads=1 "${CANARY_TEST}" >"${canary_log}" 2>&1
+    if ! grep -Eq "${VALIDATION_DIAGNOSTIC}" "${canary_log}"; then
+        echo "ERROR: the out-of-bounds canary produced no diagnostic this scan would" >&2
+        echo "  match, so a clean scan proves nothing. Either the canary did not run" >&2
+        echo "  or this toolchain's report format changed." >&2
+        echo "  Pattern: ${VALIDATION_DIAGNOSTIC}" >&2
+        echo "  Log: ${canary_log}" >&2
+        exit 1
+    fi
+    rm -f "${canary_log}"
+    echo "shader validation: detector confirmed against a deliberate OOB store"
+else
+    echo "shader validation: OFF (--no-shader-validation) — an out-of-bounds"
+    echo "  device store will be dropped silently and this run will not see it."
+fi
 
 for crate in "${crates[@]}"; do
     # `classified` counts the classifier's LINES, not its unique names, because
@@ -185,7 +317,16 @@ for crate in "${crates[@]}"; do
     # after the first test binary that fails, so every later binary in the crate
     # silently never runs and the coverage shortfall reports as "a filter
     # stopped matching" when the real cause was an earlier failure.
-    cargo test --no-fail-fast -p "${crate}" --tests -- \
+    # `env` prefix, not `export`: the validation settings apply to the test
+    # process and nothing else, and the empty-valued DISABLE_PIPELINES entry
+    # overrides a stale export rather than merging with it. The prefix keeps a
+    # bare `env` when validation is off, because expanding an empty array is an
+    # unbound-variable error under `set -u` on the bash 3.2 that
+    # `/usr/bin/env bash` resolves to here.
+    validation_prefix=(env)
+    [ "${SHADER_VALIDATION}" = "1" ] &&
+        validation_prefix=(env ${mtl_unset[@]+"${mtl_unset[@]}"} "${mtl_validation_env[@]}")
+    "${validation_prefix[@]}" cargo test --no-fail-fast -p "${crate}" --tests -- \
         --ignored --test-threads=1 "${filters[@]}" 2>&1 | tee "${log}"
     rc=${PIPESTATUS[0]}
 
@@ -206,6 +347,27 @@ for crate in "${crates[@]}"; do
         /^test result:/ { f = 0 }
         f && /^    [A-Za-z_]/ { print $1 }
     ' "${log}" | sort -u)"
+
+    if [ "${SHADER_VALIDATION}" = "1" ]; then
+        # Per crate, matching the coverage check's granularity. A single global
+        # OR would let one crate's banner vouch for a crate whose tests all
+        # returned before creating a Metal device.
+        if ! grep -qF "${VALIDATION_BANNER}" "${log}"; then
+            failed_crates="${failed_crates}  ${crate}: ran uninstrumented (no validation banner)"$'\n'
+        fi
+        # Report the kernel each hit names, deduped — a codec's kernel name is
+        # the actionable identifier here. The buffer field is not: MLX owns the
+        # allocator, so KV stores come through as `buffer: <unnamed>`.
+        hits="$(grep -Eo "${VALIDATION_DIAGNOSTIC}[^\"]*\"[^\"]*\"" "${log}" \
+                | grep -Eo 'kernel function: "[^"]*"' | sort | uniq -c | sort -rn)"
+        n_hits="$(grep -Ec "${VALIDATION_DIAGNOSTIC}" "${log}")"
+        if [ "${n_hits}" -gt 0 ]; then
+            validation_hits="${validation_hits}  ${crate}: ${n_hits} invalid access(es)"$'\n'
+            if [ -n "${hits}" ]; then
+                validation_hits="${validation_hits}$(printf '%s\n' "${hits}" | sed 's/^/    /')"$'\n'
+            fi
+        fi
+    fi
     rm -f "${log}"
     crate_passed=${counts% *}
     crate_failed=${counts#* }
@@ -226,12 +388,29 @@ for crate in "${crates[@]}"; do
     if [ "${rc}" -ne 0 ]; then
         failed_crates="${failed_crates}  ${crate}:"$'\n'
         if [ -n "${crate_fails}" ]; then
-            failed_crates="${failed_crates}$(printf '    %s\n' ${crate_fails})"$'\n'
+            # Read loop, not an unquoted expansion: splitting on newlines that
+            # way also glob-expands each test name against the cwd.
+            while IFS= read -r fail_name; do
+                [ -n "${fail_name}" ] &&
+                    failed_crates="${failed_crates}    ${fail_name}"$'\n'
+            done <<< "${crate_fails}"
         fi
     fi
 done
 
 echo
+# An invalid access is a failure even though every test reported `ok` and cargo
+# exited 0 — that is the whole point: the store is dropped, the buffer freezes,
+# and the assertions downstream of it still pass.
+if [ "${SHADER_VALIDATION}" = "1" ] && [ -n "${validation_hits}" ]; then
+    echo "ERROR: Metal shader validation reported invalid memory access:" >&2
+    printf '%s' "${validation_hits}" >&2
+    echo >&2
+    echo "An out-of-bounds device store is DROPPED, not raised: the tests above" >&2
+    echo "still passed and cargo still exited 0. Treat this as corruption." >&2
+    exit 1
+fi
+
 if [ -n "${failed_crates}" ]; then
     echo "ERROR: GPU tests failed in:" >&2
     printf '%s' "${failed_crates}" >&2
@@ -240,7 +419,13 @@ if [ -n "${failed_crates}" ]; then
     echo "  cargo test --no-fail-fast -p <crate> --tests -- --ignored --test-threads=1 <filter>" >&2
     echo "Known-red baseline (tracked separately): the four rotor fused-QK dispatch" >&2
     echo "tests in rmlx-kv-quant reporting 'dispatch delta = 0'. See docs/TESTING.md." >&2
+    echo "A crate reported as 'ran uninstrumented' usually failed to BUILD: no test" >&2
+    echo "binary means no Metal device and therefore no validation banner." >&2
     exit 1
 fi
 
-echo "OK: ${total_passed} GPU tests passed across ${#crates[@]} workspace member(s)."
+if [ "${SHADER_VALIDATION}" = "1" ]; then
+    echo "OK: ${total_passed} GPU tests passed across ${#crates[@]} workspace member(s), shader validation clean."
+else
+    echo "OK: ${total_passed} GPU tests passed across ${#crates[@]} workspace member(s) (uninstrumented)."
+fi
