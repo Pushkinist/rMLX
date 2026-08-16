@@ -439,3 +439,59 @@ fn mlp_silu_shape() {
     out.eval().unwrap();
     assert_eq!(out.shape(), vec![1, 4], "mlp silu output shape");
 }
+
+/// Both prefill masks agree cell-for-cell with the rule they document, across
+/// offsets and windows that exercise every branch (first chunk, continuation,
+/// window narrower and wider than the chunk).
+///
+/// This is the guard on how the masks are *built*: they are assembled from MLX
+/// position vectors rather than a scalar host loop, so a broadcasting or
+/// off-by-one slip would silently open or close attention rather than fail.
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "mask construction on Device::Cpu is infallible for these shapes; unwrap asserts that"
+)]
+fn prefill_masks_match_their_documented_rule() {
+    let open = |v: f32| v == 0.0;
+    for &(offset, new_seq) in &[(0, 1), (0, 4), (2, 3), (5, 1), (7, 9), (33, 16)] {
+        let cols = (offset + new_seq) as usize;
+        let rows = new_seq as usize;
+
+        let causal = build_chunked_prefill_mask(offset, new_seq, Device::Cpu).unwrap();
+        assert_eq!(causal.shape(), vec![1, 1, new_seq, offset + new_seq]);
+        let vals = mask_bf16_to_f32(&causal);
+        assert_eq!(vals.len(), rows * cols);
+        for i in 0..rows {
+            for j in 0..cols {
+                let q_abs = offset as usize + i;
+                assert_eq!(
+                    open(vals[i * cols + j]),
+                    j <= q_abs,
+                    "causal ({offset},{new_seq}) cell ({i},{j})"
+                );
+            }
+        }
+
+        for &window in &[1_usize, 2, 3, 8, 64] {
+            let swa = build_swa_prefill_mask(offset, new_seq, window, Device::Cpu).unwrap();
+            assert_eq!(swa.shape(), vec![1, 1, new_seq, offset + new_seq]);
+            let vals = mask_bf16_to_f32(&swa);
+            for i in 0..rows {
+                for j in 0..cols {
+                    let q_abs = offset as usize + i;
+                    let expect = j <= q_abs && q_abs - j < window;
+                    assert_eq!(
+                        open(vals[i * cols + j]),
+                        expect,
+                        "swa ({offset},{new_seq},w={window}) cell ({i},{j})"
+                    );
+                }
+            }
+        }
+    }
+}

@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Prefill attention masks are built on device, not scalar-filled on the
+  host.** `build_chunked_prefill_mask` and `build_swa_prefill_mask` allocated
+  three full-size buffers per call — an `f32` `Vec`, its upload, and the bf16
+  cast — for a mask that is O(`seq` × `kv_len`). A 68 898-token gemma-4-e2b
+  prefill spent 69.5% of its main-thread samples there and drove free memory to
+  zero, which made every repeated in-process generation slower than the last
+  (gen3/gen1 prefill 1.24–1.33). The builders now compose the mask from MLX
+  position vectors (`arange` → broadcast compare → `where`), so it is produced
+  where it is consumed and never crosses the host boundary. Shared by every
+  architecture that chunk-prefills, and bit-identical: temp=0 token digests are
+  unchanged at 4k / 16k / 32k / 64k on gemma-4-e2b and at 4k / 64k on
+  Ternary-Bonsai-8B.
+
+  Measured `rmlx bench --kv-quant none --warmup 0 --runs 3`, quiet host, free
+  memory settled before each cell:
+
+  | cell | gen-1 prefill | gen3/gen1 | free-memory drop | compressor growth |
+  |---|---|---|---|---|
+  | gemma-4-e2b @68 898 before | 13 673–14 024 ms | 1.24–1.33 | 79.6–83.1 GiB (to 0.1 GiB) | +14.0–15.2 GiB |
+  | gemma-4-e2b @68 898 after | 4 762–5 277 ms | 0.97–1.00 | 52.8–61.2 GiB (to 12–24 GiB) | +0.00 GiB |
+  | Ternary-Bonsai-8B @68 898 before | 60 032 ms | 1.022 | to 0.1 GiB | +0.00 GiB |
+  | Ternary-Bonsai-8B @68 898 after | 59 296 ms | 1.030 | to 18.6 GiB | +0.00 GiB |
+
+  Bonsai's prefill time is unchanged (±3%, it is GPU-bound behind MLX's fused
+  `head_dim=128` kernel) but it no longer exhausts host memory to get there.
+  Decode TPS and `kv_cache_bytes` are unchanged on both architectures.
+
+  Note for anyone tempted by the obvious next step: **sharing one mask across
+  the layers of a forward call makes this worse, not better.** A mask handed to
+  every layer is a graph node with many consumers, so its buffer stays live for
+  the whole forward and the allocator cannot recycle it between layers —
+  measured at 2× the prefill time (9.5 s vs 4.8 s) and ~19 GiB more transient
+  demand on the same cell. `layers/mask.rs` records this.
 - **The fused-QK dispatch table listed eight codecs it could never serve, and
   a strict-mode test asserted four of them dispatch.** The head-major fused-QK
   shadow is seeded by re-encoding the bf16 K mirror, so a codec only reaches
