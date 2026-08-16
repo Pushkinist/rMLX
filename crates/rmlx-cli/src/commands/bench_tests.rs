@@ -229,17 +229,17 @@ fn equal_medians_with_different_stability_are_distinguishable() {
     );
 }
 
-/// The instrument has no single-run mode. The check fires before any file is
-/// read, so a bogus model path cannot be what produced the error.
-#[test]
-fn single_run_invocation_is_refused_before_any_io() {
-    let args = BenchArgs {
+/// A greedy, otherwise-valid argument bundle pointing at paths that do not
+/// exist, so any error a test observes came from an argument check rather than
+/// from I/O.
+fn unrunnable_args(runs: u32) -> BenchArgs {
+    BenchArgs {
         model: PathBuf::from("/nonexistent/model"),
         prompt: PathBuf::from("/nonexistent/prompt.txt"),
         prompt_label: "x".to_owned(),
         device: Device::Cpu,
         max_tokens: 8,
-        runs: 1,
+        runs,
         warmup: 0,
         kv_quant: rmlx_kv_quant::KvQuant::None,
         max_ctx: None,
@@ -247,13 +247,125 @@ fn single_run_invocation_is_refused_before_any_io() {
         cap_is_explicit: false,
         allow_truncate: false,
         json: false,
-    };
-    let msg = run_bench(args)
+        temperature: 0.0,
+        top_p: 1.0,
+        repetition_penalty: 1.0,
+    }
+}
+
+/// The instrument has no single-run mode. The check fires before any file is
+/// read, so a bogus model path cannot be what produced the error.
+#[test]
+fn single_run_invocation_is_refused_before_any_io() {
+    let msg = run_bench(unrunnable_args(1))
         .expect_err("--runs 1 must be refused")
         .to_string();
     assert!(
         msg.contains("--runs must be at least"),
         "must refuse for lack of spread, not for the missing paths: {msg}"
+    );
+}
+
+// ── Sampler knobs ───────────────────────────────────────────────────
+
+/// A NaN temperature fails the decode loop's `> 0.0` gate silently: the cell
+/// would run greedy while every label on it said otherwise. Rejected up front,
+/// before the model is loaded.
+#[test]
+fn nan_temperature_is_refused() {
+    let mut args = unrunnable_args(3);
+    args.temperature = f32::NAN;
+    let msg = run_bench(args)
+        .expect_err("NaN temperature must be refused")
+        .to_string();
+    assert!(msg.contains("--temperature"), "wrong rejection: {msg}");
+}
+
+#[test]
+fn negative_temperature_is_refused() {
+    let mut args = unrunnable_args(3);
+    args.temperature = -0.5;
+    let msg = run_bench(args)
+        .expect_err("negative temperature must be refused")
+        .to_string();
+    assert!(msg.contains("--temperature"), "wrong rejection: {msg}");
+}
+
+/// `top_p` outside `(0, 1]` filters every token or none of them; neither is a
+/// nucleus. The sampler's own gate would quietly no-op instead.
+#[test]
+fn out_of_range_top_p_is_refused() {
+    for bad in [0.0f32, -0.1, 1.5, f32::NAN] {
+        let mut args = unrunnable_args(3);
+        args.top_p = bad;
+        let msg = run_bench(args)
+            .expect_err("out-of-range --top-p must be refused")
+            .to_string();
+        assert!(msg.contains("--top-p"), "wrong rejection for {bad}: {msg}");
+    }
+}
+
+/// A repetition penalty of zero divides positive logits by zero; a negative one
+/// flips their sign. Both produce a token stream that is not a penalised one.
+#[test]
+fn non_positive_repetition_penalty_is_refused() {
+    for bad in [0.0f32, -1.0, f32::NAN] {
+        let mut args = unrunnable_args(3);
+        args.repetition_penalty = bad;
+        let msg = run_bench(args)
+            .expect_err("non-positive --repetition-penalty must be refused")
+            .to_string();
+        assert!(
+            msg.contains("--repetition-penalty"),
+            "wrong rejection for {bad}: {msg}"
+        );
+    }
+}
+
+/// The identity values must pass — a guard that refuses the default would be
+/// vacuously "correct" on every test above.
+#[test]
+fn default_sampler_knobs_pass_validation() {
+    let msg = run_bench(unrunnable_args(3))
+        .expect_err("the nonexistent model path must be what fails")
+        .to_string();
+    assert!(
+        !msg.contains("--temperature")
+            && !msg.contains("--top-p")
+            && !msg.contains("--repetition-penalty"),
+        "greedy defaults must clear the sampler checks: {msg}"
+    );
+}
+
+/// The label the summary prints keys off the same condition the decode loop
+/// uses to leave the GPU argmax path.
+#[test]
+fn host_sampled_matches_the_decode_loop_gate() {
+    let greedy = unrunnable_args(3);
+    assert!(
+        !greedy.host_sampled(),
+        "temperature 0, no penalty: GPU path"
+    );
+
+    let mut sampled = unrunnable_args(3);
+    sampled.temperature = 0.7;
+    assert!(
+        sampled.host_sampled(),
+        "temperature > 0 reads logits to host"
+    );
+
+    let mut penalised = unrunnable_args(3);
+    penalised.repetition_penalty = 1.1;
+    assert!(
+        penalised.host_sampled(),
+        "a penalty reads logits to host even at temperature 0"
+    );
+
+    let mut nucleus_only = unrunnable_args(3);
+    nucleus_only.top_p = 0.9;
+    assert!(
+        !nucleus_only.host_sampled(),
+        "top_p alone does nothing at temperature 0 — the sampler never runs"
     );
 }
 
