@@ -902,7 +902,11 @@ Storing rotated K (`K_rot = K Rᵀ`) and pre-rotating queries (`Q_rot = Q Rᵀ`)
 before the score matmul leaves attention scores identical to the unrotated
 computation up to quantization error on `K_rot`. A Hadamard rotation
 decorrelates K channels and equalizes their dynamic range, reducing affine
-quantization error in the rotated basis.
+quantization error in the rotated basis — **but only when the channels were
+unequal to begin with**. Measured against the identical unrotated quantizer:
+**+1.81 bits** on outlier-channel data and **−0.63 bits** on i.i.d. uniform
+data, where the transform raises the peak-to-RMS ratio the group scale is set
+by. See "Codec fidelity — measured" below.
 
 K is never inverse-rotated — the rotation cancels algebraically. This
 distinguishes rot_k from V-side rotation schemes (PlanarQuant, TurboQuant)
@@ -935,9 +939,14 @@ precomputed `R` matrix.
 
 **CLI**: `--ctk rot_k [--ctv <affine-tag>]`.
 
-**Cosine gate**: K-side cosine similarity ≥ 0.9970 (mean), ≥ 0.9950 (min)
+**Cosine gate**: K-side cosine similarity ≥ 0.9970 (mean), ≥ 0.9990 (min)
 on LCG fixture data (head_dim=64, 8-bit affine group_size=64).
-Test: `rot_k_hadamard_8bit_cosine_gate` in `rot_k_tests.rs`.
+Test: `rot_k_hadamard_8bit_cosine_gate` in `rot_k_tests.rs`. That gate
+measures the quantizer, not the rotation — deleting the Hadamard leaves cosine
+at 0.999881 against 0.999989, inside its 0.001 slack, so it passes.
+The rotation is gated by `rot_k_hadamard_buys_bits_on_outlier_data_and_costs_them_on_iid_data`
+and `hadamard_incoherence_ratio_beats_every_block_local_rotation` in
+`rotation_fidelity_tests.rs`.
 
 ---
 
@@ -1047,6 +1056,13 @@ plain turbo3 on unstructured data with the same codebook. A state-dependent
 (grade-aware) codebook would be required to obtain a shaping gain; that
 follow-up is deferred. The `>=` quality gate in `tcq_tests.rs` is satisfied
 by equality and does not demonstrate a strict improvement over plain turbo3.
+
+**Measured claw-back: 0.000 dB**, at both shipped widths, on i.i.d. Gaussian
+(codes byte-identical to plain turbo) *and* on a dim-axis sweep (codes differ
+by tie-breaking, distortion identical to four decimals — the stronger
+statement, and the one the non-strict cosine gate cannot make). Pinned by
+`trellis_coded_quantization_claws_back_nothing` in `rate_distortion_tests.rs`,
+as an equality, so giving the trellis a real constraint turns it red.
 
 **Bench** (canary shape 4096 prompt, 100 decode tokens, release-perf binary, 3-run mean):
 
@@ -4003,8 +4019,164 @@ removed in a future cleanup.
 
 ---
 
+## Codec fidelity — measured
+
+Two CPU-only measurement surfaces in `rmlx-kv-quant`, both deterministic from
+`TEST_SEED`, both inside `make model-check`. Neither needs a model snapshot or
+the GPU. See `docs/TESTING.md` for how to run them and for the helper list.
+
+### Incoherence — does the rotation do anything
+
+`crates/rmlx-kv-quant/src/rotation_fidelity_tests.rs`.
+
+The per-codec cosine gates all run on the i.i.d.-uniform LCG fixture, which is
+already close to maximally incoherent (mean `mu = sqrt(d)·max|x_i|/||x||_2` of
+1.72 at `head_dim = 128`, against a minimum of 1). A decorrelating rotation
+cannot improve that and in fact makes it slightly worse — the Hadamard pushes
+uniform toward Gaussian, whose `mu` is 2.87. **The LCG cosine gates therefore
+carry no information about rotation quality: an identity rotation passes every
+one of them.**
+
+The outlier fixture is i.i.d. Gaussian with 4 of 128 channels scaled 20x, a
+model of the persistent per-channel Key outliers reported by KIVI
+(arXiv:2402.02750) and KVQuant (arXiv:2401.18079) at the magnitude ratio
+reported for emergent outlier features (arXiv:2208.07339). Mean `mu` = 8.37
+(p99 10.72).
+
+The channel **count** is not from the literature — 4 of 128 is 3.1%, some 30x
+denser than the reported emergent-outlier fraction. It is chosen so that every
+affine group of 64 contains an outlier, the condition under which a
+full-dimension rotation has something to recover across the whole row. Both
+fixture parameters are swept rather than asserted: `mu` against the ratio is
+monotone, and `mu` against the channel count rises, peaks near 2 channels, then
+decays back to exactly the i.i.d. value once every channel is scaled (a pure
+change of units, which `mu` is invariant to).
+
+A block-`b` orthogonal transform can reduce `mu` by at most `sqrt(b)`: the peak
+coordinate's block preserves its L2 norm, and a `b`-vector's max is at least
+its norm over `sqrt(b)`. Measured on the outlier fixture at `head_dim = 128`:
+
+| Family | Transform | Block | `mu` ceiling | `mu` reduction |
+|---|---|---|---:|---:|
+| `rot_k` / `RotK` | Walsh-Hadamard, full `head_dim` | 128 | 11.31x | **3.89x** |
+| `iso3` / `iso4` | isoclinic SO(4), fixed quaternion | 4 | 2.00x | 1.38x |
+| `planar3` | Givens, 16-entry codebook, per-pair search | 2 | 1.41x | 1.19x |
+| `planar4` | Givens, 16-entry codebook, per-pair search | 2 | 1.41x | 1.15x |
+| `rotor3` / `rotor4` | Cl(3,0) rotor sandwich, static per (layer, head) | 3 | 1.73x | 1.08–1.21x |
+
+The rotor row is a range, not a point. Only the groups holding outlier channels
+move `mu` — four rotors of 43 at `head_dim = 128` — so a single `(layer, head)`
+table is a four-sample estimate. Across eight draws the reduction spans
+1.0815x–1.2089x; the gate pins the weakest, so it describes the family rather
+than one layer.
+
+Only `rot_k` applies a full-dimension transform. The block-local families
+deliver between 1.15x and 1.38x, well under their own ceilings, because their
+rotations are fixed (iso, rotor) or fitted to reconstruction error rather than
+to incoherence (planar). **This is not a defect in them** — they buy packing
+efficiency, a different axis — but the "rotation" naming implies a capability
+only one family has.
+
+`rot_k` end to end, against the identical `affine q8 group=64` quantizer with
+the Hadamard deleted:
+
+| Fixture | rotated | unrotated | delta |
+|---|---:|---:|---:|
+| outlier channels | 46.95 dB | 36.06 dB | **+1.81 bits** |
+| i.i.d. uniform (LCG) | 44.53 dB | 48.30 dB | **−0.63 bits** |
+
+The rotation is worth most of two bits where it matters and costs two thirds of
+a bit where it does not. Both directions are gated.
+
+The gain is exactly `log2(peak_plain / peak_rotated)` over the affine group,
+which is the same quantity the block ceiling bounds: a block-`b` transform can
+buy at most `0.5·log2(b)` bits. That is what makes the 1.5-bit gate a
+separation rather than a fitted number — it demands an effective block of 8 or
+more. Substitutes measure 0.91 bits (the same Hadamard truncated to blocks of
+4) and 0.47 (the iso quaternion), both rejected.
+
+### Rate-distortion — is the bit width delivering
+
+`crates/rmlx-kv-quant/src/rate_distortion_tests.rs`.
+
+Measured against the fixed-rate Lloyd-Max SQNR for the standard normal (Max
+1960, Table I): 4.396 / 9.300 / 14.616 / 20.224 dB at 1–4 bits. That anchor is
+**not** the rate-distortion bound (`6.02·b` dB) and assumes a quantizer matched
+to the source, spending no rate on its scale. Every codec here stores a
+per-group scale, so it can legitimately land above the anchor; the rate column
+is what makes the dB interpretable. i.i.d. Gaussian fixture, 256 x 128:
+
+| Codec | bits | measured | anchor | wasted bits | stored bits/value |
+|---|---:|---:|---:|---:|---:|
+| turbo | 2 | 7.232 dB | 9.300 dB | +0.344 | 3.00 |
+| turbo | 3 | 14.956 dB | 14.616 dB | −0.056 | 4.00 |
+| turbo | 4 | 21.630 dB | 20.224 dB | −0.233 | 5.00 |
+| tcq | 2 | 7.232 dB | 9.300 dB | +0.344 | 3.00 |
+| tcq | 3 | 14.956 dB | 14.616 dB | −0.056 | 4.00 |
+| planar | 3 | 40.604 dB | 14.616 dB | −4.316 | 22.00 |
+| planar | 4 | 36.724 dB | 20.224 dB | −2.741 | 22.00 |
+| iso | 3 | 19.292 dB | 14.616 dB | −0.777 | 48.25 † |
+| iso | 4 | 25.395 dB | 20.224 dB | −0.859 | 48.25 † |
+| rotor | 3 | 20.432 dB | 14.616 dB | −0.966 | 21.75 |
+| rotor | 4 | 26.555 dB | 20.224 dB | −1.052 | 21.75 |
+
+No shipped cell is short of its anchor by more than 0.35 bits.
+
+† **The iso rate is path-specific.** 48.25 is the CPU `IsoBlocks` figure, which
+carries a per-group quaternion sideband; it is the right number for the V-only
+`iso3` / `iso4` stores. `k_iso3/4` and `iso3_sym/4_sym` decode from a GPU ring
+that does not carry the quaternion — it is the constant `FIXED_QUAT` replicated
+per group, not data — and sit at **16.25** bits/value. See § iso3 "Memory
+truth". Read against rotor's 21.75 without that distinction the table inverts
+the comparison: on the ring path iso is the cheaper of the two. Distortion is
+identical on both paths, so only the rate column is affected.
+
+**The small-group-scale mismatch is not a loss.** Deriving the scale from the
+maximum of 3 or 4 samples presents the codebook with data of standard deviation
+≈ 1.47 rather than 1, but the small groups come out *ahead* of the anchor, not
+behind it: the group maximum is a strong conditioning statistic, it is
+reconstructed near-exactly by construction, and the two or three remaining
+elements are then known to be smaller than it. The shortfall is at the other
+end of the range — large groups at low bit widths (`turbo`/`tcq` at 2 bits,
+one f32 scale per 32 values, +0.34 bits).
+
+**The 3-bit and 4-bit widths of iso, rotor and planar cost byte-identical
+storage** — already stated for iso under § iso3 "Memory truth" and for rotor in
+the `rotorquant` module docs; what is new here is the consequence. All three
+pack under the shared `32 / bits` vals-per-word convention, and at every shipped group size the word count is the same for
+`bits = 3` and `bits = 4`. Each family therefore has one strictly dominated
+width — same bytes, worse quality:
+
+| Family | 3-bit | 4-bit | Dominated |
+|---|---:|---:|---|
+| iso | 19.29 dB | 25.40 dB | `iso3` loses 6.10 dB for nothing |
+| rotor | 20.43 dB | 26.56 dB | `rotor3` loses 6.12 dB for nothing |
+| planar | 40.60 dB | 36.72 dB | **`planar4` loses 3.88 dB for nothing** |
+
+The planar direction is the surprising one, and it reproduces on the LCG
+fixture: measured mean cosine 0.999956 for planar3 against 0.999901 for
+planar4. Do **not** read the committed cosine floors (`planar_v3` 0.9989 against
+`planar_v4` 0.9942) as corroboration — they are not commensurable. The v3 floor
+is a local measurement minus 0.001; the v4 floor is an upstream README anchor
+minus 0.001 and is not a measurement of this code at all. The real signal is the
+5.5e-5 gap between the measured means, not the 4.7e-3 gap between those floors.
+Per pair the larger element is pinned to the outermost
+centroid, leaving the smaller on the grid `centroid / max_centroid`, whose
+outermost gap is `(2.152 − 1.344)/2.152 = 0.375` at 3 bits and
+`(2.718 − 2.052)/2.718 = 0.245` at 4 bits — only 1.5x finer, while the 16-angle
+Givens search that must land *both* elements on centroids gets no larger. The
+extra bit does not pay for itself. All three are pinned by
+`byte_identical_bit_widths_leave_one_width_dominated`; fixing the packing or
+the codebook is a separate change.
+
+**TCQ's claw-back measures 0.000 dB.** See the trellis degeneracy note under
+`K8VTurbo3Tcq` below.
+
+---
+
 ## See also
 
 - `docs/KV_CACHE.md` — flag surface, Qwen MoE PPL disaster, codec matrix.
 - `docs/WEIGHT_QUANTS.md` — weight quantization families (separate from KV).
 - `docs/SSD_TIER.md` — SSD spill / hydrate for long-context eviction.
+- `docs/TESTING.md` — cosine, incoherence and rate-distortion gates; helpers.

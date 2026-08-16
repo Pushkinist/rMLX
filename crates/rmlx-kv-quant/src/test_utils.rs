@@ -314,6 +314,353 @@ pub(crate) fn lcg_data(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
+/// Generate `n` standard-normal f32 values from the same pinned Knuth LCG as
+/// [`lcg_data`], via Box–Muller.
+///
+/// Deterministic for a fixed `seed`; never `thread_rng`. Pairs of uniforms are
+/// consumed per pair of outputs; an odd `n` discards the second variate of the
+/// final pair.
+///
+/// `u1` is drawn on `(0, 1]` (`+1` before the divide) so `ln(u1)` is finite;
+/// `u2` on `[0, 1)`. Accumulated in f64 and narrowed once, so the output is
+/// bit-stable across optimisation levels.
+pub(crate) fn gaussian_data(n: usize, seed: u64) -> Vec<f32> {
+    const TWO_POW_32: f64 = 4_294_967_296.0;
+    let mut state = seed;
+    let mut next_u32 = || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (state >> 32) as u32
+    };
+
+    let mut out = Vec::with_capacity(n);
+    while out.len() < n {
+        let u1 = (f64::from(next_u32()) + 1.0) / TWO_POW_32; // (0, 1]
+        let u2 = f64::from(next_u32()) / TWO_POW_32; // [0, 1)
+        let r = (-2.0 * u1.ln()).sqrt();
+        let theta = std::f64::consts::TAU * u2;
+        out.push((r * theta.cos()) as f32);
+        if out.len() < n {
+            out.push((r * theta.sin()) as f32);
+        }
+    }
+    out
+}
+
+/// Generate `[n_rows, head_dim]` f32 modelling the **K-cache outlier-channel**
+/// shape: i.i.d. standard-normal base with `n_outlier_channels` persistent
+/// channels scaled by `outlier_ratio`.
+///
+/// # Why this shape
+///
+/// Uniform / i.i.d. fixtures are already close to maximally incoherent, so a
+/// rotation cannot improve them and a gate built on one cannot see rotation
+/// quality at all (see [`incoherence_per_row`]). Real K-cache activations are
+/// not i.i.d.: the reported structure is a handful of **fixed channels whose
+/// magnitude is large in every token**, which is why the KV-quantization
+/// literature quantizes Keys per-channel and Values per-token, and why the
+/// rotation-KV family exists at all.
+///
+/// * KIVI (Liu et al., ICML 2024, arXiv:2402.02750) — the Key cache has a few
+///   fixed channels with large magnitudes; the Value cache has no such pattern.
+/// * KVQuant (Hooper et al., NeurIPS 2024, arXiv:2401.18079) — same
+///   observation; motivates per-channel Key quantization.
+/// * LLM.int8() (Dettmers et al., 2022, arXiv:2208.07339) — emergent outlier
+///   features occupy a fraction of a percent of the hidden dimensions at
+///   magnitudes on the order of 20× the rest. That report is the source of the
+///   `20.0` default ratio in [`OUTLIER_RATIO`]; it is **not** the source of the
+///   channel count, see [`OUTLIER_CHANNELS`].
+/// * QuIP (Chee et al., 2023, arXiv:2307.13304) and QuaRot (Ashkboos et al.,
+///   2024, arXiv:2404.00456) — a full-dimension (randomized) Hadamard is the
+///   standard remedy, and the incoherence parameter is the standard measure of
+///   whether it worked.
+///
+/// This is a **model** of that shape, not a capture of any particular layer:
+/// the base is exactly i.i.d. Gaussian and every outlier channel gets the same
+/// ratio. It is adversarial in the one axis that matters here — a few
+/// coordinates carry most of the mass — and it is reproducible from a seed.
+///
+/// # Channel placement
+///
+/// Indices are `(i · head_dim / n + i · OUTLIER_CHANNEL_TWIST) mod head_dim`:
+/// an even spread so the channels cover the row, plus a stride so their
+/// **intra-block offsets differ**. The twist is load-bearing. A plain even
+/// spread at `head_dim = 128` with 4 channels gives 0 / 32 / 64 / 96, every one
+/// of which sits at offset 0 of a block of 2, 3 or 4 — the most aligned
+/// placement available, not a neutral one. That is harmless for iso, whose left
+/// quaternion product has the same largest column magnitude in every slot, but
+/// planar's per-pair Givens search is not symmetric under swapping the pair, so
+/// a constant offset would put an unmeasured bias into a pinned number. With
+/// the twist the four channels land on 0 / 37 / 74 / 111, whose offsets are
+/// distinct mod 4, cover both residues mod 2, and take three of three values
+/// mod 3.
+///
+/// # Panics
+///
+/// Panics (test-only) if `head_dim == 0` or
+/// `n_outlier_channels > head_dim`.
+pub(crate) fn outlier_channel_data(
+    n_rows: usize,
+    head_dim: usize,
+    n_outlier_channels: usize,
+    outlier_ratio: f32,
+    seed: u64,
+) -> Vec<f32> {
+    assert!(head_dim > 0, "outlier_channel_data: head_dim must be > 0");
+    assert!(
+        n_outlier_channels <= head_dim,
+        "outlier_channel_data: n_outlier_channels={n_outlier_channels} exceeds head_dim={head_dim}",
+    );
+
+    let mut data = gaussian_data(n_rows * head_dim, seed);
+    for channel in outlier_channels(head_dim, n_outlier_channels) {
+        for row in 0..n_rows {
+            // row < n_rows and channel < head_dim, so the index is in bounds.
+            data[row * head_dim + channel] *= outlier_ratio;
+        }
+    }
+    data
+}
+
+/// Stride applied on top of the even spread in [`outlier_channels`] so the
+/// chosen channels do not all share one intra-block offset.
+///
+/// 5 is coprime to 2, 3 and 4 — the block sizes of every rotation family here —
+/// so successive channels advance through the offsets rather than repeating one.
+const OUTLIER_CHANNEL_TWIST: usize = 5;
+
+/// Which channels [`outlier_channel_data`] scales. See its "Channel placement".
+///
+/// The twist is coprime to the block sizes but not to every `head_dim`, so for
+/// some counts the raw formula collides. Colliding slots walk forward to the
+/// next free channel, which keeps the result exactly `n_outlier_channels`
+/// distinct channels for any `n_outlier_channels <= head_dim` — without that, a
+/// channel scaled twice would get `ratio²` and the count would silently be an
+/// over-estimate.
+///
+/// # Panics
+///
+/// Panics (test-only) if `n_outlier_channels > head_dim`.
+pub(crate) fn outlier_channels(head_dim: usize, n_outlier_channels: usize) -> Vec<usize> {
+    assert!(
+        n_outlier_channels <= head_dim,
+        "outlier_channels: {n_outlier_channels} channels requested of head_dim={head_dim}",
+    );
+    let mut taken = vec![false; head_dim];
+    let mut out = Vec::with_capacity(n_outlier_channels);
+    for i in 0..n_outlier_channels {
+        let mut channel =
+            (i * head_dim / n_outlier_channels + i * OUTLIER_CHANNEL_TWIST) % head_dim;
+        while taken[channel] {
+            channel = (channel + 1) % head_dim;
+        }
+        taken[channel] = true;
+        out.push(channel);
+    }
+    out
+}
+
+/// Rows in the canonical outlier fixture — enough that the p99 of the per-row
+/// statistic is meaningful.
+pub(crate) const OUTLIER_ROWS: usize = 256;
+
+/// `head_dim` of the canonical outlier fixture. 128 is a real shipped head_dim
+/// (Bonsai / Qwen3) and a power of two, so the full-dimension Hadamard applies.
+pub(crate) const OUTLIER_HEAD_DIM: usize = 128;
+
+/// Outlier channels in the canonical fixture: 4 of 128 = 3.1%.
+///
+/// Deliberately **denser than the literature**, which puts emergent outlier
+/// features at a fraction of a percent of the hidden dimensions. The density is
+/// chosen so that every affine group of 64 — the group `rot_k` sets its 8-bit
+/// scale over — contains an outlier, which is the condition under which a
+/// full-dimension rotation has something to recover across the whole row. At a
+/// literature-faithful 0.8% (one channel of 128) one of the two groups is clean
+/// and the row-averaged gain roughly halves; the fixture would still be
+/// adversarial, just less uniformly so.
+///
+/// `outlier_channel_count_monotonically_raises_incoherence` sweeps this the way
+/// `outlier_ratio_monotonically_raises_incoherence` sweeps the magnitude, so
+/// neither parameter is a bare assertion.
+pub(crate) const OUTLIER_CHANNELS: usize = 4;
+
+/// Magnitude ratio of an outlier channel to the Gaussian base — the order of
+/// magnitude reported for emergent outlier features (arXiv:2208.07339).
+pub(crate) const OUTLIER_RATIO: f32 = 20.0;
+
+/// The canonical outlier-channel fixture every rotation gate measures against.
+pub(crate) fn outlier_fixture() -> Vec<f32> {
+    outlier_channel_data(
+        OUTLIER_ROWS,
+        OUTLIER_HEAD_DIM,
+        OUTLIER_CHANNELS,
+        OUTLIER_RATIO,
+        TEST_SEED,
+    )
+}
+
+// ── Incoherence statistic ────────────────────────────────────────────────────
+
+/// Summary statistics from [`incoherence_per_row`].
+pub(crate) struct IncoherenceStats {
+    /// Mean of `mu` across all rows.
+    pub mean: f64,
+    /// 99th percentile of `mu` (nearest-rank) — the tail a quantizer's range
+    /// has to cover.
+    pub p99: f64,
+    /// Maximum `mu` across all rows.
+    pub max: f64,
+    /// Number of rows processed.
+    pub n_rows: usize,
+}
+
+/// Per-row incoherence `mu(x) = sqrt(d) · max_i |x_i| / ||x||_2`.
+///
+/// `mu = 1` for a perfectly flat vector and `mu = sqrt(d)` for a one-hot
+/// vector, so it is a normalized peak-to-RMS ratio: exactly the quantity a
+/// uniform quantizer's range is set by, and exactly what a decorrelating
+/// rotation is supposed to reduce. The name and normalization follow QuIP
+/// (arXiv:2307.13304).
+///
+/// An all-zero row is defined as `mu = 1.0` — it is flat, and the ratio is
+/// otherwise `0/0`.
+///
+/// # Panics
+///
+/// Panics (test-only) if `head_dim == 0` or does not evenly divide `x.len()`,
+/// or if `x` is empty.
+pub(crate) fn incoherence_per_row(x: &[f32], head_dim: usize) -> IncoherenceStats {
+    assert!(
+        head_dim > 0 && !x.is_empty() && x.len().is_multiple_of(head_dim),
+        "incoherence_per_row: head_dim={head_dim} does not evenly divide a non-empty len={}",
+        x.len(),
+    );
+
+    let sqrt_d = (head_dim as f64).sqrt();
+    let mut mus: Vec<f64> = x
+        .chunks_exact(head_dim)
+        .map(|row| {
+            let peak = row
+                .iter()
+                .fold(0.0f64, |acc, &v| acc.max(f64::from(v).abs()));
+            let l2 = row
+                .iter()
+                .fold(0.0f64, |acc, &v| f64::from(v).mul_add(f64::from(v), acc))
+                .sqrt();
+            if l2 <= 0.0 {
+                1.0
+            } else {
+                sqrt_d * peak / l2
+            }
+        })
+        .collect();
+
+    let n_rows = mus.len();
+    let mean = mus.iter().sum::<f64>() / n_rows as f64;
+    mus.sort_by(f64::total_cmp);
+    // Nearest-rank p99: the smallest value at or above 99% of the sorted rows.
+    let rank = ((n_rows as f64) * 0.99).ceil().max(1.0) as usize;
+    let p99 = mus[rank.min(n_rows) - 1];
+    let max = mus[n_rows - 1];
+
+    IncoherenceStats {
+        mean,
+        p99,
+        max,
+        n_rows,
+    }
+}
+
+// ── Rate-distortion reference ────────────────────────────────────────────────
+
+/// dB per bit for a scalar quantizer: `20 · log10(2)`.
+///
+/// One extra bit halves the quantizer step, so it buys this much SQNR. Used to
+/// convert a dB shortfall into the directly meaningful unit — see
+/// [`wasted_bits`].
+pub(crate) const DB_PER_BIT: f64 = 6.020_599_913_279_624;
+
+/// SQNR in dB achievable by a **fixed-rate Lloyd-Max quantizer on the standard
+/// normal**, indexed by `bits - 1` for `bits ∈ {1, 2, 3, 4}`.
+///
+/// These are *not* the rate-distortion bound. The bound is `6.02 · b` dB and an
+/// optimally entropy-coded scalar quantizer sits ~1.53 dB below it (the gap
+/// between cubic quantizer cells and sphere packing); a fixed-rate Lloyd-Max
+/// quantizer is lower still. The values here are `10 · log10(1 / D)` for the
+/// classical minimum mean-square distortions `D` of Max (1960),
+/// "Quantizing for Minimum Distortion", IRE Trans. Inf. Theory 6(1), Table I:
+///
+/// | bits | levels | `D` | anchor |
+/// |---|---|---|---|
+/// | 1 | 2 | 0.363 4 | 4.396 dB |
+/// | 2 | 4 | 0.117 5 | 9.300 dB |
+/// | 3 | 8 | 0.034 54 | 14.616 dB |
+/// | 4 | 16 | 0.009 497 | 20.224 dB |
+///
+/// The anchor assumes the quantizer is **matched to the source** — it knows
+/// sigma and spends no rate saying so. Every codec here instead derives a scale
+/// from a per-group maximum and stores it, so the comparison is not
+/// apples-to-apples in the codec's favour: the codec pays extra rate for the
+/// scale and can therefore legitimately land *above* the anchor. What the
+/// anchor is good for is the other direction — landing well below it at the
+/// same nominal bit width means the bits are not buying what they should.
+pub(crate) const LLOYD_MAX_GAUSSIAN_SQNR_DB: [f64; 4] = [4.396, 9.300, 14.616, 20.224];
+
+/// [`LLOYD_MAX_GAUSSIAN_SQNR_DB`] for `bits`.
+///
+/// # Panics
+///
+/// Panics (test-only) for `bits` outside `1..=4` — no anchor is tabulated.
+pub(crate) fn lloyd_max_anchor_db(bits: u8) -> f64 {
+    assert!(
+        (1..=4).contains(&bits),
+        "lloyd_max_anchor_db: no Lloyd-Max anchor tabulated for bits={bits}",
+    );
+    LLOYD_MAX_GAUSSIAN_SQNR_DB[usize::from(bits) - 1]
+}
+
+/// Signal-to-quantization-noise ratio in dB: `10 · log10(P_signal / P_error)`.
+///
+/// Both powers are accumulated in f64. A zero error power returns
+/// `f64::INFINITY` (a lossless round-trip), and a zero signal power returns
+/// `f64::NEG_INFINITY` unless the error is also zero.
+///
+/// # Panics
+///
+/// Panics (test-only) if the two slices differ in length or are empty.
+pub(crate) fn sqnr_db(reference: &[f32], decoded: &[f32]) -> f64 {
+    assert_eq!(
+        reference.len(),
+        decoded.len(),
+        "sqnr_db: reference and decoded lengths differ ({} vs {})",
+        reference.len(),
+        decoded.len(),
+    );
+    assert!(!reference.is_empty(), "sqnr_db: empty input");
+
+    let mut signal = 0.0f64;
+    let mut error = 0.0f64;
+    for (&r, &d) in reference.iter().zip(decoded.iter()) {
+        let rf = f64::from(r);
+        let e = rf - f64::from(d);
+        signal = rf.mul_add(rf, signal);
+        error = e.mul_add(e, error);
+    }
+    if error <= 0.0 {
+        return f64::INFINITY;
+    }
+    10.0 * (signal / error).log10()
+}
+
+/// Shortfall of `measured_db` against `anchor_db`, expressed in bits.
+///
+/// Positive means the codec is that many bits short of the anchor; negative
+/// means it is ahead of it. See [`DB_PER_BIT`].
+pub(crate) fn wasted_bits(measured_db: f64, anchor_db: f64) -> f64 {
+    (anchor_db - measured_db) / DB_PER_BIT
+}
+
 /// Apply a normalized Walsh–Hadamard transform (FWHT) in-place, row-wise.
 ///
 /// `buf` is processed as `buf.len() / n` rows of `n` elements each. After the
