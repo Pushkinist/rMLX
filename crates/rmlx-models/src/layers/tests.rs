@@ -458,6 +458,10 @@ fn mlp_silu_shape() {
 )]
 fn prefill_masks_match_their_documented_rule() {
     let open = |v: f32| v == 0.0;
+    // Assert the blocked magnitude too, not just which cells are open: a
+    // blocked cell that is merely down-weighted still attends, which is the
+    // silent-wrong-output failure this test exists to catch.
+    let blocked = |v: f32| v < -1e29;
     for &(offset, new_seq) in &[(0, 1), (0, 4), (2, 3), (5, 1), (7, 9), (33, 16)] {
         let cols = (offset + new_seq) as usize;
         let rows = new_seq as usize;
@@ -469,15 +473,21 @@ fn prefill_masks_match_their_documented_rule() {
         for i in 0..rows {
             for j in 0..cols {
                 let q_abs = offset as usize + i;
+                let cell = vals[i * cols + j];
                 assert_eq!(
-                    open(vals[i * cols + j]),
+                    open(cell),
                     j <= q_abs,
                     "causal ({offset},{new_seq}) cell ({i},{j})"
+                );
+                assert_eq!(
+                    blocked(cell),
+                    j > q_abs,
+                    "causal ({offset},{new_seq}) blocked magnitude at ({i},{j}): {cell}"
                 );
             }
         }
 
-        for &window in &[1_usize, 2, 3, 8, 64] {
+        for &window in &[0_usize, 1, 2, 3, 8, 64] {
             let swa = build_swa_prefill_mask(offset, new_seq, window, Device::Cpu).unwrap();
             assert_eq!(swa.shape(), vec![1, 1, new_seq, offset + new_seq]);
             let vals = mask_bf16_to_f32(&swa);
@@ -485,13 +495,59 @@ fn prefill_masks_match_their_documented_rule() {
                 for j in 0..cols {
                     let q_abs = offset as usize + i;
                     let expect = j <= q_abs && q_abs - j < window;
+                    let cell = vals[i * cols + j];
                     assert_eq!(
-                        open(vals[i * cols + j]),
+                        open(cell),
                         expect,
                         "swa ({offset},{new_seq},w={window}) cell ({i},{j})"
+                    );
+                    assert_eq!(
+                        blocked(cell),
+                        !expect,
+                        "swa ({offset},{new_seq},w={window}) blocked magnitude at ({i},{j}): {cell}"
                     );
                 }
             }
         }
+    }
+}
+
+/// Every mask leaves the builders as BF16, and adding one to a BF16 score
+/// tensor keeps that tensor BF16.
+///
+/// The masks are assembled from `arange` position vectors, which MLX produces
+/// as F32. That F32 must stop at the comparison: the comparison yields a bool,
+/// and the `where` selects between two BF16 scalars. If any of it reached the
+/// output instead, an "array"-mode mask would promote the attention scores it
+/// is added to, widening the residual stream and the KV cache behind it — the
+/// F32-leak class, which is silent because the values stay correct.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "mask construction on Device::Cpu is infallible for these shapes; unwrap asserts that"
+)]
+fn masks_are_bf16_and_do_not_widen_scores() {
+    let dev = Device::Cpu;
+    let masks = [
+        ("chunked", build_chunked_prefill_mask(2, 3, dev).unwrap()),
+        ("swa-banded", build_swa_prefill_mask(2, 3, 2, dev).unwrap()),
+        (
+            "swa-decode",
+            build_swa_decode_mask(7, 4, dev)
+                .unwrap()
+                .expect("total_kv_len > window must yield a mask"),
+        ),
+    ];
+    for (name, mask) in &masks {
+        assert_eq!(mask.dtype(), Dtype::Bf16, "{name} mask dtype");
+        // An additive mask is summed into the scores; that sum must not widen.
+        let scores = rmlx_mlx::zeros(&mask.shape(), Dtype::Bf16, dev).unwrap();
+        let masked = rmlx_mlx::add(&scores, mask, dev).unwrap();
+        assert_eq!(
+            masked.dtype(),
+            Dtype::Bf16,
+            "{name} mask promoted BF16 scores"
+        );
     }
 }
