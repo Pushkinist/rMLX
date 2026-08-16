@@ -49,6 +49,7 @@
 
 #![allow(clippy::redundant_closure_for_method_calls)]
 use rmlx_core::error::Result;
+use rmlx_core::DispatchPolicy;
 
 use crate::prompt_cache::{ArchPromptCache, CacheStats, PromptCacheEntry, ReusePolicy, SsdHydrate};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
@@ -203,8 +204,10 @@ impl SsdHydrate<Gemma3Entry> for SsdHydrator {
         prompt_ids: &[u32],
         seed: u64,
         kv_quant: KvQuant,
+        policy: DispatchPolicy,
     ) -> Result<Option<Gemma3Entry>> {
-        let Some((block, block_hashes)) = self.lookup_seeded(prompt_ids, seed, kv_quant)? else {
+        let Some((block, block_hashes)) = self.lookup_seeded(prompt_ids, seed, kv_quant, policy)?
+        else {
             return Ok(None);
         };
         let HydratedBlock {

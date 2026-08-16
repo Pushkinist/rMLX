@@ -366,7 +366,7 @@ be classified or the build fails.
     early-return to the warm-TTFT bf16 decode seed (`decode_fp16_k.is_some()`),
     so the GPU iso/rotor branch is shadowed; the codec encode that runs (at
     prefill) is CPU. The rotor family's GPU fused-QK encoder is gated OFF by
-    default (`RMLX_FUSED_QK`).
+    default (`--fused-qk`).
   * **K-only iso** (`k_iso3` / `k_iso4`) → **`None`** (Metal). No bf16
     early-return: `update_and_sdpa_iso_k_fused` GPU-encodes the step into the
     packed ring and `iso_flash_decode` reads that ring directly, so **both**
@@ -402,7 +402,7 @@ be classified or the build fails.
 | `iso3` / `iso4` | **CPU** | bf16 decode seed shadows the GPU iso branch; prefill V-encode on host |
 | `iso3_sym` / `iso4_sym` | **fully Metal** | both axes iso-quantized; decode is `iso_flash_decode_symv` over both packed rings (no bf16 mirror). Ring-as-sole-store. `cpu_hot_path_reason() == None` |
 | `k_iso3` / `k_iso4` | **fully Metal** | iso K MSL encode into the packed ring + `iso_flash_decode` fused decode over that ring. No host restaging. `cpu_hot_path_reason() == None` |
-| `rotor3` / `rotor4` / `rotor*_sym` / `rotor_k_*_asym_*` | **CPU** | bf16 decode seed shadows the GPU branch; GPU fused-QK encoder is `RMLX_FUSED_QK`-only |
+| `rotor3` / `rotor4` / `rotor*_sym` / `rotor_k_*_asym_*` | **CPU** | bf16 decode seed shadows the GPU branch; GPU fused-QK encoder is `--fused-qk`-only |
 | `k_rotor3` / `k_rotor4` | **QJL-dependent (default off)** | QJL off (default) → **fully Metal**: rotor K MSL encode + `rotor_flash_decode` fused decode; QJL on (`--rotor-qjl on`) → CPU. Gate reads the store's sticky `use_qjl()` |
 
 ### Load-time precompile
@@ -640,7 +640,7 @@ parallel set of head-major buffers (`flash_k_codes`, `flash_k_scales`,
 are seeded once from the prefill bf16 prefix on the first decode step, then
 appended per-token via 4-D `slice_update`. The `turbo_flash_sdpa` Metal
 kernel reads these buffers directly — no dequantize round-trip. Enabled by
-`RMLX_TURBO_FLASH=1` or `turbo_flash_lock_enabled()`.
+`DispatchPolicy::turbo_flash` (or `turbo_flash_lock`) on the cache's policy.
 
 **TurboFlash default-OFF policy (HOLD)**: `--turbo-flash` accepts
 `{on, off, auto}` with `auto` as the default, and `auto` resolves **OFF on
@@ -683,7 +683,7 @@ match. Reproduce it on Bonsai-8B at 8k with `rmlx bench --kv-quant k8v4
 | arm | decode TPS | token digest | `kv_cache_bytes` |
 |---|---:|---|---:|
 | gate OFF | 110.80 | `0xb0273cf32cb9b715` | 1 668 005 888 |
-| gate ON (`RMLX_TURBO_FLASH=1`) | 42.05 | `0x75a6992e38913e64` | 2 029 240 320 |
+| gate ON (`--turbo-flash on`) | 42.05 | `0x75a6992e38913e64` | 2 029 240 320 |
 
 TurboFlash is therefore a decode loss *and* an output perturbation, not pure
 cost. That 8k cell also pins the extra resident KV to 361 234 432 B — exactly
@@ -711,9 +711,8 @@ not another one of those.
 
 `--turbo-flash on` is an explicit force-ON — the opt-in for ablation and for
 the re-measurement that would lift the HOLD. `--turbo-flash off` is a hard
-override that removes `RMLX_TURBO_FLASH` from the environment so a stale shell
-value cannot latch the OnceLock back to true; `auto` leaves an existing
-`RMLX_TURBO_FLASH=1` alone, so an operator who opted in keeps the kernel. That
+override that a stale shell `RMLX_TURBO_FLASH=1` does not survive; `auto`
+honours that variable, so an operator who opted in keeps the kernel. That
 last combination — flag resolving OFF while the kernel actually runs — logs at
 `warn!` and names the cost, so a variable exported once in a shell or a CI job
 cannot carry the regression silently.
@@ -919,7 +918,8 @@ Construction requires a power-of-two head_dim (Sylvester recurrence).
 **v1 path** (`rot_k.rs`): plain MLX `matmul` against a precomputed `[D, D]`
 matrix. Correct and coherent; O(D²) arithmetic per step.
 
-**Fused FWHT kernel** (`rot_k_msl.rs`, opt-in via `RMLX_ROT_K_FUSED=1`):
+**Fused FWHT kernel** (`rot_k_msl.rs`, opt-in via `--rot-k-fused on` /
+`RMLX_ROT_K_FUSED=1` → `DispatchPolicy::rot_k_fused`):
 Fast Walsh-Hadamard Transform in Metal threadgroup shared memory, fused with
 affine-8-bit quantize in a single kernel pass. O(D log₂ D) arithmetic and no
 intermediate DRAM allocation for `K_rot`. For D=128 (Bonsai): 896 arithmetic
@@ -3357,22 +3357,20 @@ bf16 V buffers. Two-pass tile structure mirrors TurboFlash
 ### Files
 
 * `crates/rmlx-kv-quant/src/planar_flash_decode_msl.rs` — MSL kernel,
-  Rust dispatcher, `planar_flash_decode_enabled()` env gate, dispatch
-  counter for NIAH.
+  Rust dispatcher, dispatch counter for NIAH.
 * `crates/rmlx-kv-quant/src/kvcache/sdpa.rs::update_and_sdpa_planar_k_fused`
-  — dispatch site (when `planar_flash_decode_enabled()` is true, replaces
-  the split fused-QK chain).
-* `crates/rmlx-cli/src/commands/serve.rs::apply_planar_flash_decode_flags`
+  — dispatch site (when the cache's `DispatchPolicy::planar_flash_decode` is
+  set, replaces the split fused-QK chain).
+* `crates/rmlx-cli/src/commands/serve.rs::resolve_planar_flash_decode`
   — `--planar-flash-decode {on|off|auto}` CLI flag. Auto resolves OFF on
   every host (see below).
 
 ### Gate
 
-`RMLX_PLANAR_FLASH_DECODE=1` enables the kernel.  CLI flag
-`--planar-flash-decode {on|off|auto}` (in `rmlx serve`, default `auto`) is
-the production switch and sets/removes the env var before the
-`OnceLock` latches.  Default OFF on every host as of 2026-05-31 — see
-"Auto-flip status" below.
+`DispatchPolicy::planar_flash_decode` enables the kernel. CLI flag
+`--planar-flash-decode {on|off|auto}` (default `auto`) is the production
+switch; `RMLX_PLANAR_FLASH_DECODE=1` is the `auto` fallback. Default OFF on
+every host as of 2026-05-31 — see "Auto-flip status" below.
 
 ### Storage applicability
 
@@ -3633,13 +3631,14 @@ framing").
 bf16 SDPA fallback, and from `try_dispatch_shared_bf16` on the cross-layer-KV
 producer path. Gates (in order):
 
-1. `RMLX_FUSED_QK=1` (CLI flag `--fused-qk on|off|auto`,
-   `rmlx_kv_quant::fused_qk_enabled()`).
+1. `DispatchPolicy::fused_qk` on the cache's policy (CLI flag
+   `--fused-qk on|off|auto`, `auto` fallback `RMLX_FUSED_QK=1`).
 2. `Device::Gpu`.
 3. `q_seq == 1` (decode-only).
 4. `head_dim ∈ {128, 256}` (kernel hard gate).
-5. `kv_seq ≥ RMLX_FUSED_QK_MIN` (default 512; sub-threshold caches go to
-   bf16 SDPA where the launch overhead is not amortised).
+5. `kv_seq ≥ DispatchPolicy::fused_qk_min_kv_seq` (default 512, override
+   `RMLX_FUSED_QK_MIN`; sub-threshold caches go to bf16 SDPA where the launch
+   overhead is not amortised).
 6. Codec is in the `lookup_fused_qk_kernel` table. This is the only such
    table: `rmlx-models` used to carry a public mirror of it with no caller,
    which was removed rather than hand-synced against the one that runs.
@@ -3710,10 +3709,9 @@ Two-phase MSL kernel pair in `crates/rmlx-kv-quant/src/sparse_attn/`:
 | `phase2_sparse_attend_msl::phase2_sparse_attend` | Runs SDPA only on the phase-1 selected slots; per-tile partials are LSE-merged into the final attention output. |
 
 Dispatcher: `rmlx_models::kv_cache::attention_dispatch::sparse_attn_dispatch_if_enabled`.
-Gate: [`rmlx_kv_quant::sparse_attn_enabled`](../crates/rmlx-kv-quant/src/sparse_attn.rs)
-reads `RMLX_SPARSE_ATTN=1` once into a `OnceLock`. CLI flag:
-`--sparse-attn {auto|on|off}` (default `auto` → OFF on every host;
-see `docs/CLI.md`).
+Gate: `DispatchPolicy::sparse_attn`, passed to the dispatcher by its caller.
+CLI flag: `--sparse-attn {auto|on|off}` (default `auto` → OFF on every host;
+`auto` fallback `RMLX_SPARSE_ATTN=1`; see `docs/CLI.md`).
 
 ### Head budgets (`head_budgets.json`)
 
@@ -3844,15 +3842,15 @@ Aggregated dispatch counter
 returns the process-lifetime sum of P1 + P2 enqueues; one
 `sparse_attn_dispatch` call increments the counter by exactly 2.
 
-Auto-policy: `apply_sparse_attn_flags::Auto` resolves OFF on every host
+Auto-policy: `resolve_sparse_attn` on `Auto` resolves OFF on every host
 (same posture as `PlanarFlashDecodeMode::Auto`). The On override sets
-`RMLX_SPARSE_ATTN=1` but does NOT cause the kernels to fire on a
+`DispatchPolicy::sparse_attn` but does NOT cause the kernels to fire on a
 warm-TTFT decode — that contract is structural, not gated.
 
 Invariant tests:
 
 * `crates/rmlx-models/tests/sparse_attn_dispatch.rs::sparse_attn_dormant_on_warm_ttft_update_and_sdpa`
-  — warm PlanarK cache through `update_and_sdpa` with `RMLX_SPARSE_ATTN=1` keeps the counter flat.
+  — warm PlanarK cache through `update_and_sdpa` under a `sparse_attn: true` policy keeps the counter flat.
 * `crates/rmlx-models/tests/sparse_attn_dispatch.rs::sparse_attn_dispatches_on_seedless_planar_k`
   — seedless PlanarQuant-packed buffer through `sparse_attn_dispatch` increments the counter by exactly 2 and cosine ≥ 0.99 vs dense `planar_flash_decode_sdpa`.
 

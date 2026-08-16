@@ -1,5 +1,6 @@
 use super::*;
 use crate::prompt_cache::{PromptCache, ReuseKind, FNV_OFFSET};
+use rmlx_core::DispatchPolicy;
 use rmlx_kv_quant::storage::KvStorage;
 use rmlx_kv_quant::KvQuant;
 
@@ -193,7 +194,13 @@ fn hydrate_complete_for_resident_snapshot() {
 fn hydrate_incomplete_when_swa_layer_empty() {
     // Full-attention layer: real K8V8 storage with a recorded offset (the
     // hydrate path reconstructs these with payload).
-    let full = KvCache::from_storage(KvStorage::new(KvQuant::K8V8, 8192), KvQuant::K8V8, 256, 0);
+    let full = KvCache::from_storage(
+        KvStorage::new(KvQuant::K8V8, 8192),
+        KvQuant::K8V8,
+        256,
+        0,
+        DispatchPolicy::default(),
+    );
     assert!(
         full.has_persistent_cache(),
         "K8V8 full-attn layer must report persistent cache"
@@ -201,7 +208,13 @@ fn hydrate_incomplete_when_swa_layer_empty() {
     // SWA layer: payload-less None (rotating ring dropped on spill), no bf16
     // seed restored — exactly what `block_io` reconstructs for a gemma4 SWA
     // layer on hydrate.
-    let swa = KvCache::from_storage(KvStorage::None { max_seq: 512 }, KvQuant::K8V8, 256, 1);
+    let swa = KvCache::from_storage(
+        KvStorage::None { max_seq: 512 },
+        KvQuant::K8V8,
+        256,
+        1,
+        DispatchPolicy::default(),
+    );
     assert!(
         !swa.has_persistent_cache() && swa.decode_fp16_kv().is_none(),
         "dropped-SWA layer must be payload-less None with no bf16 seed"
@@ -598,6 +611,7 @@ fn gemma4_consume_engine_migration_golden() {
                 kv_quant,
                 BLOCK_TOKENS as i32,
                 i,
+                DispatchPolicy::default(),
             );
             assert!(
                 !c.has_persistent_cache() && c.decode_fp16_kv().is_none(),

@@ -55,6 +55,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use rmlx_core::error::{Error, Result};
+use rmlx_core::DispatchPolicy;
 use rmlx_loader::{load_config, load_shard_index, ShardSet};
 use rmlx_mlx::compile::{compile_shapeless, Closure};
 use rmlx_mlx::{
@@ -231,8 +232,10 @@ impl SsdHydrate<Qwen3Entry> for SsdHydrator {
         prompt_ids: &[u32],
         seed: u64,
         kv_quant: KvQuant,
+        policy: DispatchPolicy,
     ) -> Result<Option<Qwen3Entry>> {
-        let Some((block, block_hashes)) = self.lookup_seeded(prompt_ids, seed, kv_quant)? else {
+        let Some((block, block_hashes)) = self.lookup_seeded(prompt_ids, seed, kv_quant, policy)?
+        else {
             return Ok(None);
         };
         let HydratedBlock {

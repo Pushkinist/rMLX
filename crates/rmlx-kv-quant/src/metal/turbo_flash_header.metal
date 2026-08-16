@@ -6,8 +6,8 @@
 // dequantization arithmetic but the same split-K pattern. The initial B1
 // validation (2026-05) reproduced a SIGSEGV at head_dim=256, 32k on M5 Max;
 // a 2026-06 re-validation on M5 Max showed the failure did not reproduce.
-// CLI default: --turbo-flash auto resolves ON Apple10+.
-// Env override: RMLX_TURBO_FLASH=0 hard-disables.
+// CLI default: --turbo-flash auto resolves OFF on every host (throughput HOLD).
+// --turbo-flash on is the explicit opt-in; --turbo-flash off is a hard override.
 //
 // K format: rMLX q8_0 (group_size=128, f32 scale, i8 codes packed 4/u32).
 // V format: rMLX turbo4 (group_size=32, f32 scale, 4-bit Lloyd-Max 8/u32).

@@ -15,7 +15,7 @@ use rmlx_mlx::{
 use crate::iso_flash_decode_msl::{iso_flash_decode_sdpa, ISO_FLASH_HEAD_DIM_MAX};
 use crate::iso_flash_decode_symv_msl::{iso_flash_decode_symv_sdpa, IsoFlashShape, IsoPackedAxis};
 use crate::mixed_quant::{mixed_quantized_sdpa, rot_k_tq4v_sdpa};
-use crate::planar_flash_decode_msl::{planar_flash_decode_enabled, planar_flash_decode_sdpa};
+use crate::planar_flash_decode_msl::planar_flash_decode_sdpa;
 use crate::planar_fused_qk::planar_fused_qk_enabled;
 use crate::planar_fused_qk_msl::planar_fused_qk;
 use crate::rotor_flash_decode_msl::{rotor_flash_decode_sdpa, ROTOR_FLASH_HEAD_DIM_MAX};
@@ -98,6 +98,10 @@ impl KvCache {
         want_kv: bool,
         device: Device,
     ) -> Result<(Array, Option<(Array, Array)>)> {
+        // Snapshot the policy once, before the storage borrow: it is a plain
+        // Copy value and the dispatch decisions below must not vary within a
+        // single call.
+        let policy = self.policy;
         let (k_bits, v_bits, k_group_size, v_group_size) =
             self.quant.mixed_params().ok_or_else(|| {
                 Error::Mlx("update_and_sdpa_mixed called on non-Mixed-path cache".into())
@@ -155,7 +159,7 @@ impl KvCache {
             }
         };
 
-        let (k_tuple, v_tuple) = state.update_and_fetch(new_k, new_v, device)?;
+        let (k_tuple, v_tuple) = state.update_and_fetch(new_k, new_v, device, policy)?;
 
         // pass the K-rotation (if any) so SDPA pre-rotates Q. `k_tuple` /
         // `v_tuple` are owned, so the mutable borrow of `state` above has ended;
@@ -178,6 +182,7 @@ impl KvCache {
             v_bits,
             k_rotation.as_ref(),
             device,
+            policy,
         )?;
 
         // maintain the bf16 accumulator for cross-layer-KV consumers.
@@ -227,6 +232,7 @@ impl KvCache {
         additive_mask: Option<&Array>,
         device: Device,
     ) -> Result<Array> {
+        let policy = self.policy;
         let new_seq = new_k.shape()[2];
         let prev_offset = self.offset;
         self.offset = prev_offset + new_seq;
@@ -264,7 +270,7 @@ impl KvCache {
         };
 
         // Append and fetch K (rotated + affine quantized 3-tuple).
-        let k_tuple = k_state.update_k_and_fetch(new_k, device)?;
+        let k_tuple = k_state.update_k_and_fetch(new_k, device, policy)?;
 
         // Borrow k_rotation for Q pre-rotation (after mutable borrow of k_state ends).
         let k_rotation = k_state
@@ -326,6 +332,7 @@ impl KvCache {
             8,  // k_bits fixed for RotKTq4V
             k_rotation.as_ref(),
             device,
+            policy,
         )
     }
 
@@ -353,6 +360,7 @@ impl KvCache {
         additive_mask: Option<&Array>,
         device: Device,
     ) -> Result<(Array, Array, Array)> {
+        let policy = self.policy;
         let new_seq = new_k.shape()[2];
         let prev_offset = self.offset;
         self.offset = prev_offset + new_seq;
@@ -385,7 +393,7 @@ impl KvCache {
         };
 
         // Append and fetch K 3-tuple.
-        let k_tuple = k_state.update_k_and_fetch(new_k, device)?;
+        let k_tuple = k_state.update_k_and_fetch(new_k, device, policy)?;
         let k_rotation = k_state
             .k_rotation
             .as_ref()
@@ -447,8 +455,7 @@ impl KvCache {
         let q_ref: &Array = match k_rotation.as_ref() {
             Some(r) => {
                 let d = *queries.shape().last().unwrap_or(&0) as usize;
-                let try_fused =
-                    crate::rot_k_msl::rot_k_fused_enabled() && crate::rot_k_msl::is_supported_d(d);
+                let try_fused = policy.rot_k_fused && crate::rot_k_msl::is_supported_d(d);
                 queries_owned = if try_fused {
                     match crate::rot_k_msl::rot_k_fwht_rotate_gpu(queries, device) {
                         Ok(q_rot) => q_rot,
@@ -762,7 +769,7 @@ impl KvCache {
         }
 
         // 2b. Head-major fused-QK shadow path (q8/turbo3/turbo4/rotor-asym).
-        // Decode-only, gated by `RMLX_FUSED_QK=1`. Returns `None` to fall
+        // Decode-only, gated by `DispatchPolicy::fused_qk`. Returns `None` to fall
         // through to the legacy bf16 SDPA path when any gate is off, when the
         // codec has no GPU encoder, or when the bf16 mirror is not yet seeded
         // (cold-prefill window).
@@ -1785,13 +1792,13 @@ impl KvCache {
         let heads_per_kv = n_q_heads / kv_h;
 
         // ── Planar flash decode (single-pass fused QK + softmax + SV) ──
-        // When `RMLX_PLANAR_FLASH_DECODE=1` is set (or the CLI flag resolves
-        // to On / Auto-on), bypass the fused-QK chain entirely — the flash
+        // When the cache's policy selects planar flash decode, bypass the
+        // fused-QK chain entirely — the flash
         // kernel does scores + softmax + SV in two Metal dispatches and emits
         // the final output directly. Head_dim must be a power of two (the
         // kernel tree-reduction relies on it); non-pow-2 dims fall through
         // to the fused-QK chain.
-        if planar_flash_decode_enabled() && (head_dim as u32).is_power_of_two() {
+        if self.policy.planar_flash_decode && (head_dim as u32).is_power_of_two() {
             tracing::Span::current().record("path", "planar_flash_decode");
             let flash_out = planar_flash_decode_sdpa(
                 queries,

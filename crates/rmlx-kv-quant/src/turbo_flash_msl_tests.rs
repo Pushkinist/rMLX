@@ -1,23 +1,14 @@
 use super::*;
+use rmlx_core::DispatchPolicy;
 
 #[test]
 fn test_turbo_flash_disabled_by_default() {
-    // Unless RMLX_TURBO_FLASH=1 is set in the test environment, this should
-    // return false. This guards against accidentally flipping default-ON.
-    //
-    // To test with env var set, run:
-    // RMLX_TURBO_FLASH=1 cargo test turbo_flash
-    //
-    // The `env::var` below is a raw, unlatched read, so it takes the env lock
-    // like any other reader: `setenv` is UB against a concurrent `getenv` of ANY
-    // key, and other tests in this binary write `RMLX_ROTOR_QJL`.
-    let _guard = crate::test_utils::env_lock();
-    if std::env::var("RMLX_TURBO_FLASH").as_deref() != Ok("1") {
-        assert!(
-            !turbo_flash_enabled(),
-            "TurboFlash must be default-OFF (RMLX_TURBO_FLASH=1 not set)"
-        );
-    }
+    // The default policy selects the generic path. This guards against
+    // accidentally flipping default-ON.
+    assert!(
+        !DispatchPolicy::default().turbo_flash,
+        "TurboFlash must be default-OFF"
+    );
 }
 
 #[test]
@@ -45,16 +36,37 @@ fn test_smoke_probe_detects_corruption() {
 #[test]
 fn test_turbo_flash_should_run_gated() {
     // should_run requires:
-    // 1. turbo_flash_enabled() (RMLX_TURBO_FLASH=1)
+    // 1. policy.turbo_flash
     // 2. !corrupted
     // 3. q_seq == 1
-    // 4. kv_seq > TURBO_FLASH_MIN_KV_SEQ
+    // 4. kv_seq > policy.turbo_flash_min_kv_seq
 
-    // With default env (RMLX_TURBO_FLASH unset or "0"), should never run.
-    // Raw unlatched env read — takes the lock, as every reader must.
-    let _guard = crate::test_utils::env_lock();
-    if std::env::var("RMLX_TURBO_FLASH").as_deref() != Ok("1") {
-        assert!(!turbo_flash_should_run(1, 8192));
-        assert!(!turbo_flash_should_run(1, 100));
-    }
+    let off = DispatchPolicy::default();
+    assert!(!turbo_flash_should_run(&off, 1, 8192));
+    assert!(!turbo_flash_should_run(&off, 1, 100));
+
+    // Each remaining condition is checked against a policy that satisfies the
+    // gate, so a dropped condition cannot pass by accident.
+    let on = DispatchPolicy {
+        turbo_flash: true,
+        ..DispatchPolicy::default()
+    };
+    assert!(turbo_flash_should_run(&on, 1, 8192), "gate must open");
+    assert!(
+        !turbo_flash_should_run(&on, 1, 100),
+        "kv_seq below the policy threshold must not run"
+    );
+    assert!(
+        !turbo_flash_should_run(&on, 2, 8192),
+        "prefill (q_seq > 1) must not run"
+    );
+    let low_threshold = DispatchPolicy {
+        turbo_flash: true,
+        turbo_flash_min_kv_seq: 0,
+        ..DispatchPolicy::default()
+    };
+    assert!(
+        turbo_flash_should_run(&low_threshold, 1, 100),
+        "the threshold must come from the policy, not a constant"
+    );
 }

@@ -1,6 +1,7 @@
 use super::*;
 use crate::block_io::write_caches;
 use crate::hashing::cache_seed;
+use rmlx_core::DispatchPolicy;
 use rmlx_mlx::{Array, Device, Dtype};
 use tempfile::TempDir;
 
@@ -119,6 +120,7 @@ fn ssd_hit_reconstructs_block_within_tolerance() {
             &prompt_ids,
             cache_seed(TEST_LAYOUT_KEY, QUANT, TEST_MODEL_SIG),
             QUANT,
+            DispatchPolicy::default(),
         )
         .unwrap()
         .expect("SSD hit expected");
@@ -192,7 +194,12 @@ fn salted_keyed_block_is_found_by_probe() {
     // digest and match the recorded row.
     let hydrator = SsdHydrator::with_index(MODEL_ID, LK, device, dir, index);
     let block = hydrator
-        .lookup(&prompt_ids, cache_seed(LK, QUANT, TEST_MODEL_SIG), QUANT)
+        .lookup(
+            &prompt_ids,
+            cache_seed(LK, QUANT, TEST_MODEL_SIG),
+            QUANT,
+            DispatchPolicy::default(),
+        )
         .unwrap()
         .expect("salted-keyed SSD block must be found by the probe");
     assert_eq!(block.prompt_ids, prompt_ids, "matched prefix ids");
@@ -276,7 +283,12 @@ fn probe_finds_own_models_block_and_not_another_models() {
 
     // ── 1. The model that spilled it gets it back. ───────────────────────────
     let block = shared
-        .lookup(&prompt_ids, cache_seed(LK, QUANT, TEST_MODEL_SIG), QUANT)
+        .lookup(
+            &prompt_ids,
+            cache_seed(LK, QUANT, TEST_MODEL_SIG),
+            QUANT,
+            DispatchPolicy::default(),
+        )
         .unwrap()
         .expect("a block keyed by the RAM push seed must be found by the probe");
     assert_eq!(block.prompt_ids, prompt_ids, "matched prefix ids");
@@ -285,7 +297,12 @@ fn probe_finds_own_models_block_and_not_another_models() {
     // ── 2. The other model, through that same hydrator, does not. ────────────
     assert!(
         shared
-            .lookup(&prompt_ids, cache_seed(LK, QUANT, OTHER_MODEL_SIG), QUANT)
+            .lookup(
+                &prompt_ids,
+                cache_seed(LK, QUANT, OTHER_MODEL_SIG),
+                QUANT,
+                DispatchPolicy::default()
+            )
             .unwrap()
             .is_none(),
         "the shared hydrator must not serve one model's K/V to another"
@@ -295,7 +312,12 @@ fn probe_finds_own_models_block_and_not_another_models() {
     //       deletion that would make any later probe miss too. ───────────────
     assert!(
         shared
-            .lookup(&prompt_ids, cache_seed(LK, QUANT, TEST_MODEL_SIG), QUANT)
+            .lookup(
+                &prompt_ids,
+                cache_seed(LK, QUANT, TEST_MODEL_SIG),
+                QUANT,
+                DispatchPolicy::default()
+            )
             .unwrap()
             .is_some(),
         "the owning model must still hit after the other model's miss"
@@ -369,7 +391,12 @@ fn lookup_seeded_matches_arch_recompute() {
 
     let hydrator = SsdHydrator::with_index(MODEL_ID, LK, device, dir, index);
     let (block, hashes) = hydrator
-        .lookup_seeded(&input_ids, cache_seed(LK, QUANT, TEST_MODEL_SIG), QUANT)
+        .lookup_seeded(
+            &input_ids,
+            cache_seed(LK, QUANT, TEST_MODEL_SIG),
+            QUANT,
+            DispatchPolicy::default(),
+        )
         .unwrap()
         .expect("lookup_seeded must find the first-block prefix of the 2-block input");
 
@@ -444,6 +471,7 @@ fn corrupt_block_deletes_file_and_row_returns_miss() {
             &prompt_ids,
             cache_seed(TEST_LAYOUT_KEY, QUANT, TEST_MODEL_SIG),
             QUANT,
+            DispatchPolicy::default(),
         )
         .unwrap();
     assert!(res.is_none(), "corrupt block must surface as a miss");
@@ -502,6 +530,7 @@ fn metadata_mismatch_treated_as_corrupt() {
             &prompt_ids,
             cache_seed(TEST_LAYOUT_KEY, KvQuant::K8V4, TEST_MODEL_SIG),
             KvQuant::K8V4,
+            DispatchPolicy::default(),
         )
         .unwrap()
         .is_none());
@@ -537,7 +566,8 @@ fn no_indexed_prefix_is_miss() {
         .lookup(
             &prompt_ids,
             cache_seed(TEST_LAYOUT_KEY, QUANT, TEST_MODEL_SIG),
-            QUANT
+            QUANT,
+            DispatchPolicy::default(),
         )
         .unwrap()
         .is_none());
@@ -565,7 +595,8 @@ fn short_prompt_never_queried() {
         .lookup(
             &short,
             cache_seed(TEST_LAYOUT_KEY, QUANT, TEST_MODEL_SIG),
-            QUANT
+            QUANT,
+            DispatchPolicy::default(),
         )
         .unwrap()
         .is_none());
@@ -635,6 +666,7 @@ fn ssd_hit_lookup_emits_hydrate_event() {
             &prompt_ids,
             cache_seed(TEST_LAYOUT_KEY, QUANT, TEST_MODEL_SIG),
             QUANT,
+            DispatchPolicy::default(),
             &rec,
         )
         .unwrap()
@@ -764,6 +796,7 @@ fn budget_enforcement_racing_hydrates_never_serves_a_foreign_block() {
                     &fx.prompts[i],
                     cache_seed(RACE_LK, QUANT, TEST_MODEL_SIG),
                     QUANT,
+                    DispatchPolicy::default(),
                 )
                 .unwrap()
                 .expect("quiet-state lookup must hit");
@@ -843,6 +876,7 @@ fn budget_enforcement_racing_hydrates_never_serves_a_foreign_block() {
                         &fx.prompts[i],
                         cache_seed(RACE_LK, QUANT, TEST_MODEL_SIG),
                         QUANT,
+                        DispatchPolicy::default(),
                     ) {
                         Ok(Some(block)) => {
                             hits += 1;
@@ -1049,7 +1083,12 @@ fn hydrate_of_a_row_whose_file_vanished_is_a_miss_and_leaves_the_tier_usable() {
         SsdHydrator::with_index(MODEL_ID, LK, device, dir, SsdKvIndex::open_at(&db).unwrap());
     assert!(
         hydrator
-            .lookup(&prompt_ids, cache_seed(LK, QUANT, TEST_MODEL_SIG), QUANT)
+            .lookup(
+                &prompt_ids,
+                cache_seed(LK, QUANT, TEST_MODEL_SIG),
+                QUANT,
+                DispatchPolicy::default()
+            )
             .unwrap()
             .is_none(),
         "a row pointing at a vanished file must read as a miss"
@@ -1065,7 +1104,12 @@ fn hydrate_of_a_row_whose_file_vanished_is_a_miss_and_leaves_the_tier_usable() {
         .record(&key, LK, &path, MODEL_ID, &QUANT.to_string(), size)
         .unwrap();
     let block = hydrator
-        .lookup(&prompt_ids, cache_seed(LK, QUANT, TEST_MODEL_SIG), QUANT)
+        .lookup(
+            &prompt_ids,
+            cache_seed(LK, QUANT, TEST_MODEL_SIG),
+            QUANT,
+            DispatchPolicy::default(),
+        )
         .unwrap()
         .expect("re-spilled block must hydrate");
     let got = probe_k(&block.kv_caches[0], device);

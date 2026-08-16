@@ -425,15 +425,6 @@ fn planar_flash_decode_dispatch_count_increments_on_gpu() {
     );
 }
 
-#[test]
-fn planar_flash_decode_enabled_is_callable() {
-    // Smoke: the gate accessor must be callable from any thread without
-    // panicking.  Value is OnceLock-cached after first read; this is the
-    // first read in non-ignored test order, so it latches the env state at
-    // test-run time.
-    let _: bool = planar_flash_decode_enabled();
-}
-
 // ── Bit-exactness vs the production split chain ───────────────────────────
 //
 // `planar_k_flash_over_store` has exactly two arms over one packed store:

@@ -15,8 +15,9 @@
 
 //! Mixed-precision KV buffer types: `MixedTuple` and `MixedKvState`.
 
-use crate::rot_k_msl::{rot_k_fused_enabled, rot_k_fwht_quantize_gpu};
+use crate::rot_k_msl::rot_k_fwht_quantize_gpu;
 use rmlx_core::error::{Error, Result};
+use rmlx_core::DispatchPolicy;
 use rmlx_mlx::{quantize, zeros, Array, Device, Dtype};
 
 /// Pre-allocation step size — matches `MixedQuantKVCache.step = 256`.
@@ -267,17 +268,19 @@ impl MixedKvState {
         super::super::rot_k::rotate_last_axis(keys, r, device)
     }
 
-    /// rotate K and quantize in one step (fused FWHT kernel when enabled).
+    /// rotate K and quantize in one step (fused FWHT kernel when the caller's
+    /// policy selects it).
     pub fn rotate_k_and_quantize(
         &mut self,
         keys: &Array,
         device: Device,
+        policy: DispatchPolicy,
     ) -> Result<(Array, Array, Array)> {
         if !self.rotate_k {
             return quantize(keys, self.k_group_size, self.k_bits, device);
         }
 
-        if rot_k_fused_enabled() {
+        if policy.rot_k_fused {
             let d = *keys
                 .shape()
                 .last()
@@ -424,6 +427,7 @@ impl MixedKvState {
         keys: &Array,
         values: &Array,
         device: Device,
+        policy: DispatchPolicy,
     ) -> Result<()> {
         let k_shape = keys.shape();
         let v_shape = values.shape();
@@ -434,7 +438,7 @@ impl MixedKvState {
         let v_dim = v_shape[3];
         let scales_dtype = keys.dtype();
 
-        let (k_codes, k_scales, k_biases) = self.rotate_k_and_quantize(keys, device)?;
+        let (k_codes, k_scales, k_biases) = self.rotate_k_and_quantize(keys, device, policy)?;
         let (v_codes, v_scales, v_biases) =
             quantize(values, self.v_group_size, self.v_bits, device)?;
 
@@ -464,8 +468,9 @@ impl MixedKvState {
         &mut self,
         keys: &Array,
         device: Device,
+        policy: DispatchPolicy,
     ) -> Result<(Array, Array, Array)> {
-        self.rotate_k_and_quantize(keys, device)
+        self.rotate_k_and_quantize(keys, device, policy)
     }
 
     #[allow(
@@ -476,7 +481,12 @@ impl MixedKvState {
         clippy::indexing_slicing,
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
     )]
-    pub fn update_k_and_fetch(&mut self, new_k: &Array, device: Device) -> Result<MixedTuple> {
+    pub fn update_k_and_fetch(
+        &mut self,
+        new_k: &Array,
+        device: Device,
+        policy: DispatchPolicy,
+    ) -> Result<MixedTuple> {
         let prev = self.offset;
         let k_shape = new_k.shape();
         let b = k_shape[0];
@@ -516,7 +526,7 @@ impl MixedKvState {
         self.offset = prev + num_steps;
         let off = self.offset;
 
-        let (k_codes, k_scales, k_biases) = self.rotate_k_and_quantize(new_k, device)?;
+        let (k_codes, k_scales, k_biases) = self.rotate_k_and_quantize(new_k, device, policy)?;
         let k_new = MixedTuple {
             codes: k_codes,
             scales: k_scales,
@@ -542,6 +552,7 @@ impl MixedKvState {
         keys: &Array,
         values: &Array,
         device: Device,
+        policy: DispatchPolicy,
     ) -> Result<(MixedTuple, MixedTuple)> {
         let prev = self.offset;
         let k_shape = keys.shape();
@@ -595,7 +606,7 @@ impl MixedKvState {
         self.offset = prev + num_steps;
         let off = self.offset;
 
-        let (k_codes, k_scales, k_biases) = self.rotate_k_and_quantize(keys, device)?;
+        let (k_codes, k_scales, k_biases) = self.rotate_k_and_quantize(keys, device, policy)?;
         let (v_codes, v_scales, v_biases) =
             quantize(values, self.v_group_size, self.v_bits, device)?;
         let k_new = MixedTuple {

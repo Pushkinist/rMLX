@@ -629,8 +629,9 @@ axis:
   arch (Qwen3.6 MoE rejects PlanarK at validate_resolved; Gemma4 routes
   through `update_and_sdpa_shared_source`).
 
-Neither family sets its env var directly — the kernel gates are
-`OnceLock`-latched. To compare OFF vs ON, run the shell driver:
+Neither family sets its env var directly — the harness reads the resolved
+process-default policy, which the shell driver sets per process. To compare
+OFF vs ON, run:
 
 ```bash
 # Default — TurboFlash cells, OFF then ON
@@ -860,8 +861,8 @@ every test in that binary that touches the environment. Three rules:
    env-backed gate — `rotor_qjl_enabled()`, a raw
    `std::env::var("RMLX_TURBO_FLASH")`, or anything that calls them, such as
    `KvQuant::cpu_hot_path_reason()` — races the tests that set
-   `RMLX_ROTOR_QJL` and fails intermittently. Note that a *latched* accessor
-   being safe does not make a raw `env::var` of the same key safe.
+   `RMLX_ROTOR_QJL` and fails intermittently. Prefer a value the test owns
+   (`.with_dispatch_policy(…)`) over an env read wherever one exists.
 3. **Establish the state you assert.** The lock serializes access; it does not
    reset it. A test that asserts "QJL is off" without clearing
    `RMLX_ROTOR_QJL` first fails for anyone who has it exported, with a message
@@ -879,12 +880,18 @@ skipped its own restore and leaked the value into every later test, which then
 failed with a message about its own precondition and buried the assertion that
 actually broke.
 
-Gates latched behind a `OnceLock` (`RMLX_TURBO_FLASH`, `RMLX_FUSED_QK`,
-`RMLX_SPARSE_ATTN`, `RMLX_PLANAR_FLASH_DECODE`) read the env exactly once per
-process, so no test can flip them mid-run — that is why the shell drivers set
-them per-process instead. `RMLX_ROTOR_QJL` is deliberately **not** latched (it is
-re-read on every construction), which is what makes it raceable, and it is the
-only key `EnvGuard` manages.
+The kernel gates (`RMLX_TURBO_FLASH`, `RMLX_FUSED_QK`, `RMLX_SPARSE_ATTN`,
+`RMLX_PLANAR_FLASH_DECODE`, `RMLX_ROT_K_FUSED`) are **not** env reads at the
+dispatch site: they seed a [`DispatchPolicy`](../crates/rmlx-core/src/dispatch_policy.rs)
+that each `KvCache` captures at construction. A test that wants a gate on
+should build its cache with `.with_dispatch_policy(…)` and take no env lock at
+all — that is both race-free and the only way to have two gate states live in
+one binary. Setting the env var still works for a whole process (it is the
+`auto` fallback), which is what the shell drivers do.
+
+`RMLX_ROTOR_QJL` is deliberately **not** latched (it is re-read on every
+construction), which is what makes it raceable, and it is the only key
+`EnvGuard` manages.
 
 `RMLX_SKIP_GPU` is deliberately **never written** by any test. Its reader
 `skip_if_no_gpu_env()` runs at the top of every `#[ignore]`d GPU test and none of

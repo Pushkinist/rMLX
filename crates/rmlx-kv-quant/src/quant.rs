@@ -732,14 +732,14 @@ impl KvQuant {
             // V-only rotor variants and the rotor-K-asym variants early-return to
             // the bf16 decode seed at decode (`decode_fp16_k.is_some()`), so the
             // rotor K codec only fires at prefill on CPU; the GPU fused-QK encoder
-            // is opt-in (RMLX_FUSED_QK) and does not fire on the standard flow.
+            // is opt-in (`--fused-qk`) and does not fire on the standard flow.
             KvQuant::Rotor3
             | KvQuant::Rotor4
             | KvQuant::RotorK3Asym { .. }
             | KvQuant::RotorK4Asym { .. } => Some(
                 "RotorQuant (Clifford Cl(3,0)) encode + dequant run on CPU on the \
                  default hot path (the bf16 decode seed shadows the GPU branch); the \
-                 GPU fused-QK encoder is opt-in (RMLX_FUSED_QK)",
+                 GPU fused-QK encoder is opt-in (--fused-qk)",
             ),
             // Symmetric rotor variants: NO bf16 decode-seed early-return — decode
             // is the quant-V flash kernel over both packed rings. Same QJL gate as

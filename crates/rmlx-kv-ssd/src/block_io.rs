@@ -60,6 +60,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use rmlx_core::error::{Error, Result};
+use rmlx_core::DispatchPolicy;
 use rmlx_kv_quant::planarquant::PlanarBlocks;
 use rmlx_kv_quant::turboquant::TurboBlocks;
 use rmlx_mlx::{Array, Device, Dtype};
@@ -384,9 +385,11 @@ pub(crate) fn read_caches(
     device: Device,
     model_id: &str,
     kv_quant: KvQuant,
+    policy: DispatchPolicy,
 ) -> Result<(Vec<KvCache>, Vec<LinearAttnCache>)> {
-    let (kv_caches, lin_caches, _, _, _, _) = read_caches_inner(path, device, model_id, kv_quant)?
-        .ok_or_else(|| Error::Mlx(format!("KV block read: {} not found", path.display())))?;
+    let (kv_caches, lin_caches, _, _, _, _) =
+        read_caches_inner(path, device, model_id, kv_quant, policy)?
+            .ok_or_else(|| Error::Mlx(format!("KV block read: {} not found", path.display())))?;
     Ok((kv_caches, lin_caches))
 }
 
@@ -414,8 +417,9 @@ pub(crate) fn read_caches_timed(
     device: Device,
     model_id: &str,
     kv_quant: KvQuant,
+    policy: DispatchPolicy,
 ) -> Result<Option<TimedCaches>> {
-    read_caches_inner(path, device, model_id, kv_quant)
+    read_caches_inner(path, device, model_id, kv_quant, policy)
 }
 
 /// Shared core for [`read_caches`] and [`read_caches_timed`].
@@ -428,6 +432,7 @@ fn read_caches_inner(
     device: Device,
     model_id: &str,
     kv_quant: KvQuant,
+    policy: DispatchPolicy,
 ) -> Result<Option<TimedCaches>> {
     use std::time::Instant;
 
@@ -454,7 +459,7 @@ fn read_caches_inner(
         .zip(none_bf16)
         .enumerate()
         .map(|(layer_idx, (s, bf16))| {
-            let cache = KvCache::from_storage(s, kv_quant, offset, layer_idx);
+            let cache = KvCache::from_storage(s, kv_quant, offset, layer_idx, policy);
             match bf16 {
                 Some((k, v)) => cache.with_decode_fp16_seed(k, v),
                 None => cache,

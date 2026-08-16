@@ -18,6 +18,7 @@ use crate::clifford::make_rotor_table;
 use crate::kvcache::KvCache;
 use crate::storage::{KvStorage, QuantRotorV3, QuantRotorV4};
 use crate::KvQuant;
+use rmlx_core::DispatchPolicy;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -258,8 +259,20 @@ fn rotor3_from_storage_records_layer_idx() {
     // KvStorage::None is the simplest variant; we only need to verify the
     // builder field passthrough. The codec-specific storage round-trip is
     // exercised by the existing block_io_tests hydrate suite.
-    let cache_l0 = KvCache::from_storage(KvStorage::None { max_seq: 1024 }, KvQuant::Rotor3, 0, 0);
-    let cache_l7 = KvCache::from_storage(KvStorage::None { max_seq: 1024 }, KvQuant::Rotor3, 0, 7);
+    let cache_l0 = KvCache::from_storage(
+        KvStorage::None { max_seq: 1024 },
+        KvQuant::Rotor3,
+        0,
+        0,
+        DispatchPolicy::default(),
+    );
+    let cache_l7 = KvCache::from_storage(
+        KvStorage::None { max_seq: 1024 },
+        KvQuant::Rotor3,
+        0,
+        7,
+        DispatchPolicy::default(),
+    );
 
     assert_eq!(cache_l0.layer_idx, 0, "from_storage layer_idx=0 preserved");
     assert_eq!(cache_l7.layer_idx, 7, "from_storage layer_idx=7 preserved");

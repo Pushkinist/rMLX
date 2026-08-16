@@ -1442,8 +1442,8 @@ single-kernel trade-off. A follow-up generalises the contract to other codecs.
 - `--max-tokens 100`, `--max-ctx 8192` (4k prompt) / `--max-ctx 16384` (8k prompt).
 - Single MLX process per Hard Rule 8 (preflight: pkill rmlx serve / mlx_lm; sleep; rm claim).
 - 1 warmup + 3 measured runs per toggle.
-- Gate: `RMLX_PLANAR_FLASH_DECODE={0|1}` env-var; the production CLI flag
-  `--planar-flash-decode` is `serve`-only.
+- Gate: `RMLX_PLANAR_FLASH_DECODE={0|1}` env-var (the `auto` fallback for the
+  `--planar-flash-decode` flag, which is global).
 
 ### Decode-TPS results (Bonsai, planar_k, 3-run measured)
 
@@ -1506,7 +1506,7 @@ Neither condition is met:
 - Perf gain: -0.19% (within noise; well below 10% gate).
 - NIAH correctness: blocked by the pre-existing PlanarK + chunked-prefill bug.
 
-`apply_planar_flash_decode_flags(Auto)` stays OFF on every host
+`resolve_planar_flash_decode(Auto, …)` stays OFF on every host
 (`crates/rmlx-cli/src/commands/serve.rs:230`).  The CLI override
 `--planar-flash-decode on` remains available for opt-in experimentation.
 
@@ -2063,8 +2063,8 @@ For q8 / turbo3 / turbo4 the per-step cost is ~43× smaller because
 
 ### Why this is not a regression we need to revert
 
-The default `--fused-qk auto` keeps `RMLX_FUSED_QK` unset →
-`try_fused_qk_dispatch` short-circuits at the env gate. Bonsai default-quant
+The default `--fused-qk auto` resolves `DispatchPolicy::fused_qk` to false →
+`try_fused_qk_dispatch` short-circuits at the policy gate. Bonsai default-quant
 canary (116.247 TPS) is within noise of the recorded anchor (109.86 TPS).
 No default path runs through the rotor fused-QK code.
 

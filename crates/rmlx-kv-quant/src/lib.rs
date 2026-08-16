@@ -103,50 +103,23 @@ pub use kvcache::{KvCache, SharedKv};
 pub use linear_attn::LinearAttnCache;
 pub use quant::{validate_rotor_k_asym_v, KvQuant, KvQuantParseError, KV_MAX_SEQ_DEFAULT};
 
-// ── Fused-QK global enable gate ──────────────────────────────────────────────
-
-/// Returns `true` when the generalized fused-QK kernels are enabled via the
-/// `RMLX_FUSED_QK=1` environment variable.
-///
-/// Default OFF (env var absent or not `"1"`).  Mirrors the
-/// [`planar_flash_decode_msl::planar_flash_decode_enabled`] OnceLock pattern:
-/// the value is latched on first call and cached for the process lifetime.
-///
-/// The CLI flag `--fused-qk {on|off|auto}` in `rmlx-cli::commands::serve`
-/// sets `RMLX_FUSED_QK=1` (or removes it) before the first inference, which
-/// ensures this OnceLock reads the resolved value on first call.
-pub fn fused_qk_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| matches!(std::env::var("RMLX_FUSED_QK").as_deref(), Ok("1")))
-}
-
-// ── Sparse-attention global enable gate ──────────────────────────────────────
-
-/// Returns `true` when the two-phase sparse-attention dispatch is enabled via
-/// the `RMLX_SPARSE_ATTN=1` environment variable.
-///
-/// Default OFF (env var absent or not `"1"`). Mirrors the
-/// [`fused_qk_enabled`] OnceLock pattern: the value is latched on first call
-/// and cached for the process lifetime.
-///
-/// The CLI flag `--sparse-attn {on|off|auto}` in `rmlx-cli::commands::serve`
-/// sets `RMLX_SPARSE_ATTN=1` (or removes it) before the first inference, which
-/// ensures this `OnceLock` reads the resolved value on first call.
-///
-/// **Audit verdict** (Path C, warm-TTFT dormant): the two-phase kernels are
-/// wired and dispatch-counter-instrumented, but the production
-/// `update_and_sdpa` path always shortcuts through the bf16-K seed materialised
-/// by `exit_prefill`. Setting this gate to true does NOT make sparse-attn fire
-/// on the normal generate flow; the kernels are reserved for **seedless**
-/// workloads (synthetic PlanarK caches, PPL eval, future prompt-cache hits that
-/// skip prefill). See [`sparse_attn::sparse_attn_total_dispatch_count`] for
-/// the dispatch counter aggregator.
-pub fn sparse_attn_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| matches!(std::env::var("RMLX_SPARSE_ATTN").as_deref(), Ok("1")))
-}
+// ── Kernel-path selection ────────────────────────────────────────────────────
+//
+// The fused-QK, sparse-attention, TurboFlash, planar-flash-decode and rot_k
+// fused-FWHT kernel gates all live on [`rmlx_core::DispatchPolicy`]. Every
+// `KvCache` captures a policy at construction ([`KvCache::dispatch_policy`])
+// and the dispatch sites read it from there, so two caches built under
+// different policies stay independent and both can run in one process.
+//
+// **Sparse-attention audit verdict** (warm-TTFT dormant): the two-phase
+// kernels are wired and dispatch-counter-instrumented, but the production
+// `update_and_sdpa` path always shortcuts through the bf16-K seed materialised
+// by `exit_prefill`. Setting `DispatchPolicy::sparse_attn` does NOT make
+// sparse-attn fire on the normal generate flow; the kernels are reserved for
+// **seedless** workloads (synthetic PlanarK caches, PPL eval, future
+// prompt-cache hits that skip prefill). See
+// [`sparse_attn::sparse_attn_total_dispatch_count`] for the dispatch counter
+// aggregator.
 
 // ── GPU-resident iso-blocks mirror gate ──────────────────────────────────────
 

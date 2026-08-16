@@ -1,5 +1,6 @@
 use super::*;
 use crate::KvQuant;
+use rmlx_core::DispatchPolicy;
 use rmlx_mlx::{Array, Device, Dtype};
 
 #[allow(
@@ -41,7 +42,8 @@ fn hydrate_none_storage_k8v8_quant_update_no_panic() {
         KvStorage::None { max_seq: 4096 },
         KvQuant::K8V8,
         256, // offset: 256 tokens already "cached"
-        0,   // layer_idx: 0 for this test helper
+        0,   // layer_idx: 0 for this test helper,
+        DispatchPolicy::default(),
     );
     // One decode step: shape [B=1, kv_h=2, seq=1, D=128]
     let shape = [1i32, 2, 1, 128];
@@ -72,7 +74,13 @@ fn hydrate_none_storage_k8v4_and_planar_quant_update_no_panic() {
     let v = f32_arr(&vec![0.2f32; n], &shape);
 
     for quant in [KvQuant::K8V4, KvQuant::Planar] {
-        let mut cache = KvCache::from_storage(KvStorage::None { max_seq: 4096 }, quant, 256, 0);
+        let mut cache = KvCache::from_storage(
+            KvStorage::None { max_seq: 4096 },
+            quant,
+            256,
+            0,
+            DispatchPolicy::default(),
+        );
         let result = cache.update(&k, &v, device);
         assert!(
             result.is_ok(),
@@ -94,7 +102,13 @@ fn hydrate_none_storage_k8v4_and_planar_quant_update_no_panic() {
 fn hydrate_none_storage_k8v8_quant_exit_prefill_no_panic() {
     let device = Device::Cpu;
     // Simulate a fresh hydrated SWA layer: offset=0, storage=None, quant=K8V8.
-    let mut cache = KvCache::from_storage(KvStorage::None { max_seq: 4096 }, KvQuant::K8V8, 0, 0);
+    let mut cache = KvCache::from_storage(
+        KvStorage::None { max_seq: 4096 },
+        KvQuant::K8V8,
+        0,
+        0,
+        DispatchPolicy::default(),
+    );
     cache.enter_prefill();
     // Feed a 4-token prefill chunk: shape [B=1, kv_h=2, seq=4, D=128]
     let shape = [1i32, 2, 4, 128];

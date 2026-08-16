@@ -37,19 +37,30 @@ verification.
 |---|---|---|---|
 | `--log` | `info \| debug \| verbose` | `info` | Log verbosity preset. `RUST_LOG` overrides this when set. `info` keeps per-token and per-layer trace events off; `debug` enables per-step phase events; `verbose` enables per-token, per-FFI, and per-layer trace events. |
 | `--metrics` | `off \| events \| full` | `full` | Metrics recording level. `off` writes nothing — the SPSC drainer is never spawned and `runs.db` is never opened or created. `events` keeps the runtime event stream but records no bench observations. Reading (`rmlx metrics best|export|query`) works in every mode. See [`docs/METRICS_DB.md`](METRICS_DB.md) §10.1.1. |
-| `--turbo-flash` | `on` \| `off` \| `auto` | `auto` | TurboFlash MSL attention kernel (K8V4 storage, `kv_seq > 4096`, `head_dim ∈ {128, 256}`). `auto` (default) resolves **OFF on every host** — a HOLD, not a hardware gate. The kernel decodes 2.0–4.25× slower than the generic K8V4 path, and the loss grows with `kv_seq` (`rmlx bench` n=3, quiet host: Bonsai-8B k8v4 1.93× @~1.7k with the threshold forced to zero, 2.74× @8k, 3.48× @16k, 4.25× @32k where 63.25→14.89 TPS; Bonsai-27B k8v4 1.98× @16k), while holding ~722 MB more resident KV. It is also not bit-exact (SDPA cosine ≈0.997, the V turbo-4 codec floor), so it perturbs the generated tokens: two of those four production-threshold cells return a different token digest at temp=0. gemma-4-e2b is a **null control**, not a second arch — its `kv_cache_bytes` is bit-identical across both arms, so the kernel never dispatches there. This replaces the previous per-Apple-family default-ON policy; the validations behind that policy were crash/fidelity clearances (32k NIAH on Apple ≤9; the `head_dim = 256` M5 Max hazard re-drive) and still stand — lifting the HOLD needs a *decode* measurement. `on` forces `RMLX_TURBO_FLASH=1` (ablation / re-validation opt-in). `off` hard-overrides by removing `RMLX_TURBO_FLASH` from the environment so a stale `=1` cannot latch the OnceLock; `auto` leaves an existing `=1` alone and logs a `warn!` that the kernel is still ON. See `docs/KV_QUANT.md` §TurboFlash. |
+| `--turbo-flash` | `on` \| `off` \| `auto` | `auto` | TurboFlash MSL attention kernel (K8V4 storage, `kv_seq > 4096`, `head_dim ∈ {128, 256}`). `auto` (default) resolves **OFF on every host** — a HOLD, not a hardware gate. The kernel decodes 2.0–4.25× slower than the generic K8V4 path, and the loss grows with `kv_seq` (`rmlx bench` n=3, quiet host: Bonsai-8B k8v4 1.93× @~1.7k with the threshold forced to zero, 2.74× @8k, 3.48× @16k, 4.25× @32k where 63.25→14.89 TPS; Bonsai-27B k8v4 1.98× @16k), while holding ~722 MB more resident KV. It is also not bit-exact (SDPA cosine ≈0.997, the V turbo-4 codec floor), so it perturbs the generated tokens: two of those four production-threshold cells return a different token digest at temp=0. gemma-4-e2b is a **null control**, not a second arch — its `kv_cache_bytes` is bit-identical across both arms, so the kernel never dispatches there. This replaces the previous per-Apple-family default-ON policy; the validations behind that policy were crash/fidelity clearances (32k NIAH on Apple ≤9; the `head_dim = 256` M5 Max hazard re-drive) and still stand — lifting the HOLD needs a *decode* measurement. `on` turns the kernel on (ablation / re-validation opt-in). `off` hard-overrides — an exported `RMLX_TURBO_FLASH=1` does not survive it; `auto` honours that variable and logs a `warn!` that the kernel is still ON. See `docs/KV_QUANT.md` §TurboFlash. |
 | `--turbo-flash-lock` | bool flag | off | Enable TurboFlash lock variant. Has no effect unless `--turbo-flash` or `RMLX_TURBO_FLASH=1` is also active. |
-| `--planar-flash-decode` | `on` \| `off` \| `auto` | `auto` | PlanarK single-pass flash-decode MSL kernel. `auto` (default): resolves OFF on every host — no measurable decode-TPS gain (-0.19% mean at 4k canary; well below the ≥10% Auto-flip gate). The kernel is **not** bit-exact with the split chain: its per-tile online softmax sums in a different order. Measured at the dtype the dispatcher returns, the two arms differ in 4 of 6 cells and agree in 2 — the clean pair is `head_dim=128` at short context, so a single-cell check confirms byte-identity by luck (`docs/KV_QUANT.md` § "Numerical relationship to the split chain"). Note also that flipping this flag on a normal generate flow changes nothing, because the warm-TTFT bf16-K seed keeps **both** arms off the kernel — measured 0 dispatches either way on Bonsai at 4k. A pre-existing PlanarK-on-Bonsai long-prompt chunked-prefill bug (`docs/KV_QUANT.md` §"Correctness gap") also prevented the NIAH correctness anchor from passing on the only reachable arch. `on` forces `RMLX_PLANAR_FLASH_DECODE=1` (opt-in ablation). `off` **hard-overrides** — removes any pre-existing `RMLX_PLANAR_FLASH_DECODE` from the env so a stale `=1` cannot latch the OnceLock. |
+| `--planar-flash-decode` | `on` \| `off` \| `auto` | `auto` | PlanarK single-pass flash-decode MSL kernel. `auto` (default): resolves OFF on every host — no measurable decode-TPS gain (-0.19% mean at 4k canary; well below the ≥10% Auto-flip gate). The kernel is **not** bit-exact with the split chain: its per-tile online softmax sums in a different order. Measured at the dtype the dispatcher returns, the two arms differ in 4 of 6 cells and agree in 2 — the clean pair is `head_dim=128` at short context, so a single-cell check confirms byte-identity by luck (`docs/KV_QUANT.md` § "Numerical relationship to the split chain"). Note also that flipping this flag on a normal generate flow changes nothing, because the warm-TTFT bf16-K seed keeps **both** arms off the kernel — measured 0 dispatches either way on Bonsai at 4k. A pre-existing PlanarK-on-Bonsai long-prompt chunked-prefill bug (`docs/KV_QUANT.md` §"Correctness gap") also prevented the NIAH correctness anchor from passing on the only reachable arch. `on` turns the kernel on (opt-in ablation). `off` **hard-overrides** — an exported `RMLX_PLANAR_FLASH_DECODE=1` does not survive it. |
+| `--rot-k-fused` | `on` \| `off` \| `auto` | `auto` | Fused FWHT + affine-quantize MSL kernel for the rot_k codec families (`--kv-quant rot_k_v<bits>g<group>`, e.g. `rot_k_v4g64`, and `rot_k_tq4v`); every other codec ignores it. `auto` (default): OFF — the rotate-by-matmul path is the validated one; an exported `RMLX_ROT_K_FUSED=1` is honoured. `on` forces the fused kernel. `off` **hard-overrides** that variable. |
 
-**Kernel gates are global on purpose.** `--turbo-flash`, `--turbo-flash-lock`,
-`--planar-flash-decode`, `--fused-qk`, `--sparse-attn`, `--rotor-qjl` and
-`--planar-fused-qk` all drive process-wide `OnceLock`s in `rmlx-kv-quant`, and
-all of them resolve in `main` **before subcommand dispatch**. That is what makes
+**Kernel gates resolve once, in `main`.** `--turbo-flash`, `--turbo-flash-lock`,
+`--planar-flash-decode`, `--fused-qk`, `--sparse-attn` and `--rot-k-fused` fold
+into one [`DispatchPolicy`](../crates/rmlx-core/src/dispatch_policy.rs) value
+**before subcommand dispatch**; `--rotor-qjl` and `--planar-fused-qk` still
+drive their own process-wide `OnceLock`s. Resolving in `main` is what makes
 `rmlx bench` and `rmlx baseline` measure the kernel configuration `rmlx serve`
 actually runs: a gate resolved for `serve` only would have `--turbo-flash=auto`
 land ON in the server and unset in the instrument on the very same host. Because
 the flags are `global`, both spellings work — `rmlx --turbo-flash off serve …`
 and `rmlx serve --turbo-flash off …`.
+
+Each KV cache captures the resolved policy at construction and reads it at
+dispatch, so the value is per cache rather than per process. Two caches built
+under different policies run side by side in one process — the property an
+interleaved A/B of two kernel paths needs, and the one the `OnceLock` gates
+could not provide. Libraries that embed rMLX without the CLI get
+`DispatchPolicy::from_env()` as the process default; `rmlx_core::set_dispatch_policy`
+replaces it at any point, and caches already built keep the policy they
+captured.
 
 ---
 
@@ -777,8 +788,8 @@ The prompts file is SHA-256-hashed and the hex digest is recorded in
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
-| `--sparse-attn` | enum `auto\|on\|off` | `auto` | Two-phase sparse-attention dispatcher gate. `auto` resolves OFF on every host (warm-TTFT dormant by design). `on` force-sets `RMLX_SPARSE_ATTN=1` before first inference but does NOT cause the kernels to fire on the normal generate flow — that contract is structural (the bf16-K seed shortcut absorbs the decode window). `off` is a hard override: removes `RMLX_SPARSE_ATTN` from the process env so a stale shell-set `=1` cannot latch the OnceLock to `true`. |
-| `RMLX_SPARSE_ATTN` | env var | unset | Read once at first `sparse_attn_enabled()` call. `=1` enables the dispatch gate; absent or any other value disables. `--sparse-attn` resolves the env var before any inference runs. |
+| `--sparse-attn` | enum `auto\|on\|off` | `auto` | Two-phase sparse-attention dispatcher gate. `auto` resolves OFF on every host (warm-TTFT dormant by design). `on` sets `DispatchPolicy::sparse_attn` but does NOT cause the kernels to fire on the normal generate flow — that contract is structural (the bf16-K seed shortcut absorbs the decode window). `off` is a hard override: an exported `RMLX_SPARSE_ATTN=1` does not survive it. |
+| `RMLX_SPARSE_ATTN` | env var | unset | The `auto` fallback. `=1` enables the dispatch gate; absent or any other value disables. |
 
 The two-phase sparse-attention kernels operate over PlanarQuant-K packed
 buffers and stay dormant on warm-TTFT decode windows (every quantised codec
@@ -1194,23 +1205,26 @@ persistent shell configuration.
 
 ### Internal / advanced (not needed for normal use)
 
-These variables are read once via `OnceLock` at first use. They exist as
-bridges for the corresponding CLI flags, or as dev / ablation toggles that
-have no user-facing flag. **Prefer the matching `--flag` where one exists** —
-the env var is only the internal bridge that the flag writes before the first
-inference call latches the lock.
+These are dev / ablation toggles. **Prefer the matching `--flag` where one
+exists** — the env var is only the `auto` fallback for embedders and shell
+sessions, and an explicit `on` / `off` flag overrides it.
+
+The first six feed [`DispatchPolicy::from_env`](../crates/rmlx-core/src/dispatch_policy.rs),
+read once per process to seed the default policy that each KV cache captures.
+They are **not** latched gates: `rmlx_core::set_dispatch_policy` replaces the
+default at any point, and a cache can carry its own policy regardless.
 
 | Variable | Flag (if any) | Default | Description |
 |---|---|---|---|
-| `RMLX_TURBO_FLASH` | `--turbo-flash` | unset (resolves OFF) | Set to `1` to enable the TurboFlash MSL attention kernel. `--turbo-flash on` force-sets this var; `--turbo-flash off` hard-removes it so a stale `=1` cannot latch the OnceLock; `auto` (the default) leaves it alone, so exporting `=1` is still a valid opt-in — and logs a `warn!` naming the decode cost, since the flag then reads OFF while the kernel runs. Prefer `--turbo-flash`. |
-| `RMLX_TURBO_FLASH_LOCK` | `--turbo-flash-lock` | unset | Set to `1` to enable the TurboFlash lock variant. The CLI flag takes precedence. Prefer `--turbo-flash-lock`. |
-| `RMLX_TURBO_FLASH_MIN` | — | `1` | Minimum batch-sequence count below which TurboFlash is bypassed regardless of the `RMLX_TURBO_FLASH` gate. Dev tuning only. |
-| `RMLX_PLANAR_FLASH_DECODE` | `--planar-flash-decode` | unset (resolves OFF) | Set to `1` to enable the `planar_flash_decode` MSL kernel. `--planar-flash-decode on` force-sets; `--planar-flash-decode off` hard-removes. Only applies to `KvStorage::PlanarK` caches. Prefer `--planar-flash-decode`. |
-| `RMLX_FUSED_QK` | `--fused-qk` | unset (resolves OFF) | Set to `1` to enable the fused-QK MSL kernel for PlanarK caches. `--fused-qk on` force-sets; `--fused-qk off` hard-removes. Prefer `--fused-qk`. |
-| `RMLX_FUSED_QK_MIN` | — | `1` | Minimum sequence length threshold for fused-QK dispatch. Dev tuning only. |
-| `RMLX_SPARSE_ATTN` | `--sparse-attn` | unset (resolves OFF) | Set to `1` to enable the two-phase sparse-attention dispatcher. `--sparse-attn on` force-sets; `--sparse-attn off` hard-removes. Prefer `--sparse-attn`. |
+| `RMLX_TURBO_FLASH` | `--turbo-flash` | unset (resolves OFF) | Set to `1` to enable the TurboFlash MSL attention kernel. `--turbo-flash on` / `off` override it either way; `auto` (the default) honours it, so exporting `=1` is still a valid opt-in — and logs a `warn!` naming the decode cost, since the flag then reads `auto` while the kernel runs. Prefer `--turbo-flash`. |
+| `RMLX_TURBO_FLASH_LOCK` | `--turbo-flash-lock` | unset | Set to `1` to enable the TurboFlash lock variant. Passing the flag also enables it; there is no `off` arm, so clearing it means unsetting the variable. Prefer `--turbo-flash-lock`. |
+| `RMLX_TURBO_FLASH_MIN` | — | `4096` | Minimum `kv_seq` below which TurboFlash is bypassed regardless of the gate. Negative values clamp to `0`; an unparseable value warns and falls back to the default. Dev tuning only — proof runs set `0` so dispatch fires on short prompts. |
+| `RMLX_PLANAR_FLASH_DECODE` | `--planar-flash-decode` | unset (resolves OFF) | Set to `1` to enable the `planar_flash_decode` MSL kernel. `--planar-flash-decode on` / `off` override it. Only applies to `KvStorage::PlanarK` caches. Prefer `--planar-flash-decode`. |
+| `RMLX_FUSED_QK` | `--fused-qk` | unset (resolves OFF) | Set to `1` to enable the generalized fused-QK MSL kernels. `--fused-qk on` / `off` override it. Prefer `--fused-qk`. |
+| `RMLX_FUSED_QK_MIN` | — | `512` | Minimum `kv_seq` for fused-QK dispatch; an unparseable value warns and falls back to the default. Dev tuning only. |
+| `RMLX_SPARSE_ATTN` | `--sparse-attn` | unset (resolves OFF) | Set to `1` to enable the two-phase sparse-attention dispatcher. `--sparse-attn on` / `off` override it. Prefer `--sparse-attn`. |
+| `RMLX_ROT_K_FUSED` | `--rot-k-fused` | unset (resolves OFF) | Set to `1` to route rot_k decode steps through the fused FWHT MSL path. `--rot-k-fused on` / `off` override it. Prefer `--rot-k-fused`. |
 | `RMLX_ROTOR_QJL` | `--rotor-qjl` | unset (default OFF for rotor codecs) | Set to `1` to enable the K-side 1-bit QJL residual for rotor-K codecs (opt-in — forces the CPU path). Prefer `--rotor-qjl on`. |
-| `RMLX_ROT_K_FUSED` | — | unset (resolves OFF) | Set to `1` to route rot_k decode steps through the fused MSL path. No CLI flag — ablation / bench only. |
 | `RMLX_EAGLE3_NO_FCS` | — | unset | Set to any value to disable the FCS (final correction step) in Eagle3 speculative decoding. Ablation only. |
 | `RMLX_PREFILL_CHUNK` | — | (per-arch default) | Override the global prefill chunk size (tokens per forward pass). Also accepts per-arch form `RMLX_PREFILL_CHUNK_<ARCH>` (e.g. `RMLX_PREFILL_CHUNK_QWEN3_5_MOE=256`). Per-arch override takes precedence over the global. Dev tuning. |
 | `RMLX_KV_MAX_SEQ_HARD_CAP` | — | unset (no cap) | Opt-in hard cap on KV sequence length. When set, the KV cache rejects any extension beyond this token count. `--max-ctx` is the normal gate; this env is a last-resort safety guard. |
