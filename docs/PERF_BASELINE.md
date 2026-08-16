@@ -501,6 +501,23 @@ metrics DB.
 - Warmup 1 discarded, 3 measured runs; median decode_tps + sample stddev reported in CSV
 - DB record: one `rmlx baseline --record` call per model after the measured runs
 
+**The canary decodes greedily, and that is a scope limit, not a detail.**
+`rmlx baseline` has no sampler knobs, so every canary and A/B number in this
+file is the GPU-argmax path. It is also *not* the served default: a
+`/v1/chat/completions` request that omits sampling fields resolves temperature
+from `generation_config.json` or a hard-coded `1.0`, and several snapshots ship
+`top_p` and `top_k` alongside it, so ordinary served traffic takes the
+host-selection path on every token. Measured at 4k, that path costs 9–14 % of
+decode throughput at temperature alone, 5–12 % at a repetition penalty alone,
+and about a quarter of it once a nucleus filter is on. No canary run can observe
+any of it; use `rmlx bench --temperature / --top-p / --top-k /
+--repetition-penalty` and the `sampler_profile` event. See § *Host-sampler cost*
+below and `docs/SAMPLING.md`.
+
+Those figures are from gemma-4-**e2b**, Ternary-Bonsai-8B and Qwen3.6-35B-A3B.
+Only two of the three are canary models — the canary's Gemma4 is **e4b**, and no
+sampled cell was taken on it.
+
 **Per-model kv_quant resolved by arch resolver (auto):**
 - Bonsai (Qwen3ForCausalLM, 2bit): `mixed_k8g64_v4g64`
 - Gemma4-e4b (mxfp8): `k8v8`
@@ -527,6 +544,74 @@ decode_tps (the bf16 q/k/v compute is cheaper than the prior f32 path); Gemma4
 and Qwen3.6 (separate arch files) are unchanged. On the `none` path the gain
 widens with context as KV bandwidth dominates: Bonsai `none` decode_tps
 ~101→~135 at 4 k, ~48→~83 at 16 k, ~19→~38 at 64 k.
+
+## Host-sampler cost — PROVISIONAL, NOT AN ANCHOR (2026-08-16)
+
+First measurement of the sampling / penalty / mask / logprob path, which every
+other table in this file excludes. **Nothing here is an anchor**: it is not
+interleaved, it was taken on a host the A/B harness refused, and no regression
+gate should diff against it. The interpretation, the full per-knob tables and
+the caveats live in `docs/SAMPLING.md` § *Cost of the host path*; this section
+records the provenance and the verdict.
+
+**Why it is provisional.** `scripts/perf_ab.sh` refused this host with exit 125
+— a VM at 114 % of a core, later joined by an npm process at 131 %. The
+threshold was not raised and `--allow-busy-host` was not passed. What follows
+are single-arm, non-interleaved medians. The dataset's own noise floor is about
+2.5 percentage points: at 4k, gemma-4-e2b's `temp 0.7 + rep 1.1` cell measured
+*faster* (113.86 tok/s) than its `temp 0.7` cell (111.03) despite doing strictly
+more work. No throughput delta below that is reported as an effect, and the
+per-cell throughput deltas are therefore recorded in `docs/SAMPLING.md` rather
+than here.
+
+**Binary**: `target/release-perf/rmlx`. **Harness**: `rmlx bench --max-tokens
+100`, scratch `RMLX_HOME`, `--metrics off`; 1 warmup + 3 measured runs at 4k, 1
++ 2 at 16k/64k. **Hardware**: M5 Max.
+
+`share%` is `sampler_profile{sample_share_pct}` — host-side sampler wall-clock
+over step wall-clock, over the steps that took the host path — as the **median
+over the measured generations**, the warmup's event discarded. It is a
+within-step ratio, so it survives a cell whose `decode_tps` the harness refused
+to median, and two cells below are in exactly that state.
+
+`sample` is `O(vocab)` and context-invariant while `step` grows with context, so
+the share is a falling curve and a single short-context point is its maximum.
+Per-context, `temperature 0.7` / `repetition-penalty 1.1`:
+
+| model | codec | 4k | 16k | 64k |
+|---|---|---|---|---|
+| mlx-community__gemma-4-e2b-it-mxfp8 | auto | 10.00 / 2.76 | 9.29 / 2.63 | 8.30 / 2.24 |
+| mlx-community__Qwen3.6-35B-A3B-8bit | auto | 6.98 / 2.04 | 6.56 / 1.94 | 4.58 / 1.41 |
+| mlx-community__Qwen3.6-35B-A3B-8bit | none | — | 6.68 / 2.12 | 5.25 / 1.47 |
+| prism-ml__Ternary-Bonsai-8B-mlx-2bit | auto | 5.80 / 1.78 | 0.65 / 0.19 | 0.18 / 0.06 |
+| prism-ml__Ternary-Bonsai-8B-mlx-2bit | none | — | 4.54 / 1.42 | 2.10 / 0.60 |
+
+**The two Bonsai `auto` long-context rows are not usable.** That codec
+(`mixed_k8g64_v4g64`) decodes at 13.2 tok/s at 16k and 3.6 at 64k — 76 and
+282 ms per step against the ~12 and ~26 ms the `--kv-quant none` anchors above
+record, with `sync_per_step_ms` still at 2.8 ms, so the extra time is host work
+inside the forward. Their share is divided by a separate defect. That gap is
+itself worth a look; it is not this section's subject.
+
+**Verdict against the issue's kill criterion** (host share under 3 % for both
+temperature and repetition penalty): **not met.** It holds in exactly one of the
+nine legitimate (model, context, codec) cells — Ternary-Bonsai-8B at 64k on
+`none`, 2.10 / 0.60 — and fails everywhere else, including at 64k on both other
+architectures. Sliding-window attention barely dilutes it at all: gemma-4-e2b
+still pays 8.3 % at 64k because its step time hardly grows with context.
+
+**Correctness of the instrumenting change**, recorded here because it is the
+evidence a reviewer needs and a bench digest cannot supply it (that check
+compares runs of one binary inside one process):
+
+| binary | sha256 (head) | `sample_share_pct` in image | `bench --top-k` | gemma-4-e2b greedy digest | Ternary-Bonsai-8B greedy digest |
+|---|---|---|---|---|---|
+| `rmlx.main` (main) | `c51cafa64597f127` | absent | absent | `0xda06c1ec7c73fbb3` | `0xa14ed09c9440e9db` |
+| `rmlx.patch` (branch) | `2132dc9138630908` | present | present | `0xda06c1ec7c73fbb3` | `0xa14ed09c9440e9db` |
+
+Two separately built binaries, verified distinct by digest and by a symbol check
+in each direction, produce byte-identical greedy token streams on both required
+architectures at the 4k canary shape.
 
 ## K8VTurbo3 promotion bench (2026-05-30)
 
