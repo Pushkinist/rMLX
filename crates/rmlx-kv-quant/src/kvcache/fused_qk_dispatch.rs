@@ -155,18 +155,21 @@ impl KvCache {
     /// dispatches a fused-QK kernel and assembles the SDPA output;
     /// returns `None` to fall through to the legacy dequant + SDPA path.
     ///
-    /// Gates (in order): env-var (`RMLX_FUSED_QK=1`), GPU device, decode-
-    /// only (`q_seq == 1`), codec is in the fused-QK table, `head_dim` is
-    /// in the kernel-supported set (128 or 256), `kv_seq` ≥ minimum
-    /// threshold, codec has a GPU encoder available, and (for rotor
-    /// codecs) the QJL toggle is OFF (the kernel does not consume the
-    /// QJL residual — see `rotor_fused_qk_msl.rs`).
+    /// Gates, in order: env-var (`RMLX_FUSED_QK=1`), GPU device, decode-only
+    /// (`q_seq == 1`), `new_k` rank 4, `head_dim` in the kernel-supported set
+    /// (128 or 256), `kv_seq` ≥ minimum threshold, codec is in the fused-QK
+    /// table, codec has a GPU encoder available, (for rotor codecs) the QJL
+    /// toggle is OFF (the kernel does not consume the QJL residual — see
+    /// `rotor_fused_qk_msl.rs`), the bf16 K mirror is seeded, the storage
+    /// variant carries a `max_seq`, and the step does not overflow it.
     ///
-    /// Every fall-through emits a `trace!` naming the gate that rejected
-    /// (`fused_qk: skipped`, field `reason`). A silent `Ok(None)` is
-    /// indistinguishable from a codec that has no kernel at all, which
-    /// makes "the kernel never fires" unanswerable from a shipped binary;
-    /// the reason field is the answer.
+    /// **Every** fall-through emits a `trace!` naming the gate that rejected
+    /// (`fused_qk: skipped`, field `reason`); the `head_dim` gate also carries
+    /// the value it saw, and the overflow gate additionally raises a one-shot
+    /// `warn!`. A silent `Ok(None)` is indistinguishable from a codec that has
+    /// no kernel at all, which makes "the kernel never fires" unanswerable
+    /// from a shipped binary — the reason field is the answer, and it has to
+    /// cover the off-by-default gate too or the common case logs nothing.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn try_fused_qk_dispatch(
         &mut self,
@@ -178,14 +181,21 @@ impl KvCache {
         device: Device,
     ) -> Result<Option<Array>> {
         if !fused_qk_enabled() {
+            // The most common rejection by far — the CLI gate resolves OFF by
+            // default, so this is what an operator asking "why doesn't the
+            // kernel fire" is usually looking at. Tracing it is the difference
+            // between that answer and an empty log.
+            self.trace_fused_qk_skip("--fused-qk is off");
             return Ok(None);
         }
         if device != Device::Gpu {
+            self.trace_fused_qk_skip("device is not GPU");
             return Ok(None);
         }
         // Decode-only path.
         let q_shape = queries.shape();
         if q_shape.len() != 4 || q_shape[2] != 1 {
+            self.trace_fused_qk_skip("not a decode step (q_seq != 1)");
             return Ok(None);
         }
         if new_k.shape().len() != 4 {
@@ -264,7 +274,12 @@ impl KvCache {
         // gate Bonsai 8B `--ctk k_rotor3 --ctv rotor_v_3 --fused-qk on`
         // crashes at decode step `max_seq - prefill_len`.
         if prev_offset + new_seq > max_seq {
+            // The `warn!` fires once per process; every later step would be
+            // silent without the per-step trace, and "the kernel stopped
+            // firing mid-run" is exactly the case that needs a per-step
+            // record.
             warn_kv_overflow_once(codec, prev_offset, new_seq, max_seq);
+            self.trace_fused_qk_skip("kv overflow (offset + new_seq > max_seq)");
             return Ok(None);
         }
 
@@ -475,16 +490,16 @@ impl KvCache {
     }
 
     /// Return the rotor K-storage `head_idx` for the active storage variant,
-    /// or `None` when the active codec is not rotor / has no allocated K
-    /// storage. Used by the dispatch path's `debug_assert!` to confirm
+    /// or `None` when the active storage is not rotor-asym / has no allocated
+    /// K storage. Used by the dispatch path's `debug_assert!` to confirm
     /// `seed_rotor_table`'s `head_idx=0` hardcode matches reality.
+    ///
+    /// Only the asym variants are listed: the rotor `Sym` / `KOnly` codecs are
+    /// rejected by the kernel-table gate several steps earlier, so this is
+    /// never called with their storage.
     fn active_storage_rotor_head_idx(&self) -> Option<u32> {
         use crate::storage::KvStorage;
         match &self.storage {
-            KvStorage::RotorSym3 { k: Some(k), .. } => Some(k.head_idx),
-            KvStorage::RotorSym4 { k: Some(k), .. } => Some(k.head_idx),
-            KvStorage::RotorKOnly3 { k: Some(k), .. } => Some(k.head_idx),
-            KvStorage::RotorKOnly4 { k: Some(k), .. } => Some(k.head_idx),
             KvStorage::RotorKAsym3 { k: Some(k), .. } => Some(k.head_idx),
             KvStorage::RotorKAsym4 { k: Some(k), .. } => Some(k.head_idx),
             _ => None,
@@ -493,6 +508,10 @@ impl KvCache {
 
     /// Look up the `max_seq` the shadow should be sized to, taken from the
     /// active storage variant.
+    ///
+    /// One arm per codec the kernel table admits — anything else returns
+    /// `None` and the caller falls through. Rotating (SWA) variants are among
+    /// those: they carry no `max_seq` the shadow could be sized to.
     fn storage_max_seq_for_fused_qk(&self) -> Option<i32> {
         use crate::storage::KvStorage;
         let m = match &self.storage {
@@ -500,11 +519,6 @@ impl KvCache {
             KvStorage::K8V8 { max_seq, .. } => *max_seq,
             KvStorage::TurboSym3 { max_seq, .. } => *max_seq,
             KvStorage::TurboSym4 { max_seq, .. } => *max_seq,
-            // Rotor storage variants (Sym + K-only + Asym, both 3-bit and 4-bit).
-            KvStorage::RotorSym3 { max_seq, .. } => *max_seq,
-            KvStorage::RotorSym4 { max_seq, .. } => *max_seq,
-            KvStorage::RotorKOnly3 { max_seq, .. } => *max_seq,
-            KvStorage::RotorKOnly4 { max_seq, .. } => *max_seq,
             KvStorage::RotorKAsym3 { max_seq, .. } => *max_seq,
             KvStorage::RotorKAsym4 { max_seq, .. } => *max_seq,
             _ => return None,
@@ -723,16 +737,15 @@ fn warn_kv_overflow_once(codec: KvQuant, prev_offset: i32, new_seq: i32, max_seq
     });
 }
 
-/// Predicate for any rotor-family codec.
+/// Predicate for the rotor codecs this path serves.
+///
+/// Only the asym pair: every call site sits after the kernel-table gate, which
+/// already rejected the rotor `Sym` / `KOnly` variants. Listing them here would
+/// describe a case the predicate cannot be asked about.
 fn codec_is_rotor(codec: KvQuant) -> bool {
     matches!(
         codec,
-        KvQuant::Rotor3Sym
-            | KvQuant::Rotor4Sym
-            | KvQuant::RotorKOnly3
-            | KvQuant::RotorKOnly4
-            | KvQuant::RotorK3Asym { .. }
-            | KvQuant::RotorK4Asym { .. }
+        KvQuant::RotorK3Asym { .. } | KvQuant::RotorK4Asym { .. }
     )
 }
 
@@ -827,7 +840,7 @@ struct ChunkEncoded {
     codes: Array,
     /// `f32 [B, kv_h, n, scales_per_token]`.
     scales: Array,
-    /// `f32 [B, kv_h, n, 1]` for iso/rotor; `None` for q8/turbo.
+    /// `f32 [B, kv_h, n, 1]` for rotor-asym; `None` for q8/turbo.
     norms: Option<Array>,
 }
 

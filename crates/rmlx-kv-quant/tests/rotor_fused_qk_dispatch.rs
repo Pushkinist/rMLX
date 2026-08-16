@@ -101,9 +101,18 @@ fn lcg_data(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-/// Drive prefill + one decode step on `codec` and assert the decode landed on
-/// `expect` — and on nothing else.
-fn assert_routes_to(codec: KvQuant, name: &str, expect: Kernel) {
+/// Drive prefill + one decode step on `codec`, assert the decode landed on
+/// `expect` and on nothing else, and return the decoded output as f32.
+///
+/// The returned values let a caller anchor a `Kernel::None` expectation with
+/// positive evidence: three zero counters say only that no rotor kernel ran,
+/// which any unrelated early exit would also satisfy.
+///
+/// Normalised to f32 on the way out because the arms do not agree on output
+/// dtype — the flash-decode arms return the caller's bf16 while the legacy
+/// SDPA fallback returns f32 (its dequantised K/V are f32). Comparing raw
+/// bytes across arms would compare dtypes, not values.
+fn assert_routes_to(codec: KvQuant, name: &str, expect: Kernel) -> Vec<f32> {
     let device = Device::Gpu;
     let b: i32 = 1;
     let kv_h: i32 = 2;
@@ -170,8 +179,19 @@ fn assert_routes_to(codec: KvQuant, name: &str, expect: Kernel) {
     assert_kernel(name, "rotor_flash_decode", d_k_only, want_k_only);
     assert_kernel(name, "rotor_flash_decode_symv", d_sym_v, want_sym_v);
 
-    out.eval().expect("eval rotor SDPA output");
-    let _ = out.to_bytes().expect("rotor SDPA output materialised");
+    let out_f32 = out
+        .astype(Dtype::F32, device)
+        .expect("rotor SDPA output to f32");
+    out_f32.eval().expect("eval rotor SDPA output");
+    let bytes = out_f32.to_bytes().expect("rotor SDPA output materialised");
+    bytes
+        .chunks_exact(4)
+        .map(|c| {
+            let mut w = [0_u8; 4];
+            w.copy_from_slice(c);
+            f32::from_le_bytes(w)
+        })
+        .collect()
 }
 
 fn assert_kernel(name: &str, kernel: &str, delta: u64, wanted: bool) {
@@ -289,6 +309,14 @@ fn rotor_qjl_on_falls_back_to_legacy_sdpa() {
     // QJL-carrying store (`rotor_sym_store_uses_qjl`) and `try_fused_qk_dispatch`
     // short-circuits, because neither kernel reproduces the 1-bit K-side
     // residual. The legacy bf16 SDPA path takes over.
+    //
+    // Three zero counters alone would not prove that. Any future early exit —
+    // an SWA short-circuit, an added guard, a codec that stopped building its
+    // store — leaves them at zero too, and the test would stay green while the
+    // QJL contract it names went unexercised. So the negative is anchored by a
+    // positive: the same decode with QJL **off** must produce different output.
+    // The residual is a per-token K-side correction, so identical output means
+    // it was not applied and the QJL arm is not what ran.
     if skip_if_no_gpu() {
         return;
     }
@@ -299,12 +327,47 @@ fn rotor_qjl_on_falls_back_to_legacy_sdpa() {
     unsafe {
         std::env::set_var("RMLX_FUSED_QK_MIN", "8");
     }
+
+    // Reference arm: QJL off, same codec and same inputs. `rotor_qjl_enabled()`
+    // re-reads the env on every call (no `OnceLock`), and the store latches the
+    // flag at its first append, so the two caches below are independent.
+    unsafe {
+        std::env::set_var("RMLX_ROTOR_QJL", "0");
+    }
+    let qjl_off = assert_routes_to(
+        KvQuant::Rotor3Sym,
+        "Rotor3Sym, QJL off (reference arm)",
+        Kernel::FlashSymV,
+    );
+
     unsafe {
         std::env::set_var("RMLX_ROTOR_QJL", "1");
     }
-    assert_routes_to(KvQuant::Rotor3Sym, "Rotor3Sym + QJL", Kernel::None);
+    let qjl_on = assert_routes_to(KvQuant::Rotor3Sym, "Rotor3Sym + QJL", Kernel::None);
     // Clean up env for subsequent tests.
     unsafe {
         std::env::remove_var("RMLX_ROTOR_QJL");
     }
+
+    assert_eq!(
+        qjl_off.len(),
+        qjl_on.len(),
+        "QJL on/off produced different element counts — the two arms are not \
+         comparable and the anchor below means nothing"
+    );
+    let differing = qjl_off
+        .iter()
+        .zip(qjl_on.iter())
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    eprintln!(
+        "Rotor3Sym QJL anchor: {differing}/{} output elements differ between QJL off and on",
+        qjl_off.len()
+    );
+    assert!(
+        differing > 0,
+        "QJL on and QJL off decoded identical output — the 1-bit K-side residual \
+         was not applied, so the zero dispatch counters above are not evidence \
+         that the QJL fallback ran"
+    );
 }

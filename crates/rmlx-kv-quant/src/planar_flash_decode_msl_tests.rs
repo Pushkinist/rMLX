@@ -443,16 +443,30 @@ fn planar_flash_decode_enabled_is_callable() {
 // output elements differ bit-for-bit, so the two arms are never assumed
 // equal from a run in which only one of them executed.
 
-/// Run both `planar_k_flash_over_store` arms over one packed K and return
-/// `(n_elements, n_bitwise_differences, max_abs_err)`.
+/// Bit-difference counts for one cell, at both dtypes the production arms
+/// pass through.
+struct ArmDiff {
+    /// Output element count.
+    n: usize,
+    /// Elements differing bitwise in the **f32 accumulator**, i.e. before the
+    /// closing output cast. This is the kernels' own arithmetic.
+    diffs_f32: usize,
+    /// Largest absolute f32-accumulator difference.
+    max_err_f32: f32,
+    /// Elements differing bitwise **after** `astype(queries.dtype())` — the
+    /// bf16 the dispatcher actually returns to the model. This is the number
+    /// that decides whether a caller can observe the two arms apart.
+    diffs_bf16: usize,
+}
+
+/// Run both `planar_k_flash_over_store` arms over one packed K.
 ///
-/// Mirrors the production chain step for step, including the f32 softmax and
-/// the GQA reshape/matmul, so the numbers describe the arms operators
-/// actually select between — not a host-side approximation of them.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "test helper: parameter pack mirrors the dispatcher's shape surface"
-)]
+/// Mirrors the production chain step for step: bf16 Q as the model streams it,
+/// the f32 softmax, the GQA reshape/matmul, **and** the closing
+/// `astype(queries.dtype())` that the dispatcher applies to both returns. The
+/// output cast matters: it is the last thing that happens to either arm before
+/// the value reaches the model, and dropping it measures an intermediate no
+/// caller sees.
 #[allow(clippy::expect_used, reason = "test helper: invariants documented")]
 fn flash_vs_split_chain(
     b: i32,
@@ -461,7 +475,7 @@ fn flash_vs_split_chain(
     kv_seq: i32,
     head_dim: i32,
     seed: u64,
-) -> (usize, usize, f32) {
+) -> ArmDiff {
     use rmlx_mlx::{matmul, softmax_precise};
 
     let n_q_heads = kv_h * heads_per_kv;
@@ -473,7 +487,11 @@ fn flash_vs_split_chain(
     let k_arr = make_f32_array(&lcg_data(k_n, seed), &k_shape);
     let q_shape = [b, n_q_heads, 1, head_dim];
     let q_n: usize = q_shape.iter().map(|&d| d as usize).product();
-    let q_arr = make_f32_array(&lcg_data(q_n, seed ^ 0x1111_1111), &q_shape);
+    // Production streams bf16 queries, and `queries.dtype()` is what both arms
+    // cast their output to on the way out.
+    let q_arr = make_f32_array(&lcg_data(q_n, seed ^ 0x1111_1111), &q_shape)
+        .astype(Dtype::Bf16, device)
+        .expect("Q bf16");
     let v_shape = [b, kv_h, kv_seq, head_dim];
     let v_n: usize = v_shape.iter().map(|&d| d as usize).product();
     let v_arr = make_f32_array(&lcg_data(v_n, seed ^ 0x2222_2222), &v_shape)
@@ -536,36 +554,76 @@ fn flash_vs_split_chain(
         .reshape(&[b, n_q_heads, 1, head_dim], device)
         .expect("out reshape");
 
+    // ── f32 accumulator: the kernels' own arithmetic, pre-cast ────────────
     let a = array_to_f32(&flash.astype(Dtype::F32, device).expect("flash f32"));
     let s = array_to_f32(&split.astype(Dtype::F32, device).expect("split f32"));
     assert_eq!(a.len(), s.len(), "arm output lengths differ");
-    let mut diffs = 0_usize;
-    let mut max_err = 0.0_f32;
+    let mut diffs_f32 = 0_usize;
+    let mut max_err_f32 = 0.0_f32;
     for (x, y) in a.iter().zip(s.iter()) {
         if x.to_bits() != y.to_bits() {
-            diffs += 1;
+            diffs_f32 += 1;
         }
         let e = (x - y).abs();
-        if e > max_err {
-            max_err = e;
+        if e > max_err_f32 {
+            max_err_f32 = e;
         }
     }
-    (a.len(), diffs, max_err)
+
+    // ── bf16 output: what the dispatcher hands back ───────────────────────
+    // Both arms end with `astype(queries.dtype())`. Reading the cast results
+    // back as f32 is lossless (every bf16 is exactly representable), so a
+    // bitwise f32 comparison here is a bitwise bf16 comparison.
+    let flash_out = flash
+        .astype(q_arr.dtype(), device)
+        .expect("flash -> q dtype");
+    let split_out = split
+        .astype(q_arr.dtype(), device)
+        .expect("split -> q dtype");
+    let ao = array_to_f32(&flash_out.astype(Dtype::F32, device).expect("flash out f32"));
+    let so = array_to_f32(&split_out.astype(Dtype::F32, device).expect("split out f32"));
+    let diffs_bf16 = ao
+        .iter()
+        .zip(so.iter())
+        .filter(|(x, y)| x.to_bits() != y.to_bits())
+        .count();
+
+    ArmDiff {
+        n: a.len(),
+        diffs_f32,
+        max_err_f32,
+        diffs_bf16,
+    }
 }
 
-/// The flash kernel and the split chain are **not** bit-exact.
+/// The flash kernel is **not** byte-identical to the split chain at the dtype
+/// the dispatcher returns — but whether a given cell diverges is shape- and
+/// context-dependent, and some cells are clean.
 ///
-/// Both arms decode the same packed K, but the flash kernel folds the
-/// softmax into a per-tile online (log-sum-exp) reduction while the split
-/// chain materialises the full score row and calls `softmax_precise`. The
-/// two summation orders differ, so the results differ in the low mantissa
-/// bits. This test pins that as a measured fact across short and long
-/// `kv_seq` and both test-target head shapes, because the surrounding docs
-/// used to assert byte-identity from a single cell.
+/// Both arms decode the same packed K. The flash kernel folds the softmax into
+/// a per-tile online (log-sum-exp) reduction while the split chain materialises
+/// the full score row and calls `softmax_precise`; the summation orders differ,
+/// so the f32 accumulators differ in the low mantissa bits. Whether that
+/// survives the closing `astype(queries.dtype())` depends on how close the
+/// exact value sits to a bf16 rounding boundary, which is a property of the
+/// data — so the divergence appears in some cells and not others.
 ///
-/// Failing *upward* (zero differences everywhere) is also a real signal —
-/// it would mean one arm stopped running, which is exactly the inert A/B
-/// this file exists to prevent.
+/// **That variability is the reason this test sweeps.** A single cell at
+/// `head_dim=128, kv_seq<=512` returns zero bf16 differences and would
+/// "confirm" byte-identity outright.
+///
+/// Three assertions, each load-bearing:
+///
+/// * `any_f32_diff` is the **null control**. Zero differences even in the f32
+///   accumulator would mean the two arms are not actually two arms — an inert
+///   A/B confirms any equivalence put to it.
+/// * `any_bf16_diff` is the **claim**: at least one cell is observably
+///   different to a caller, so the two paths are not interchangeable and must
+///   not be documented as lossless.
+/// * the `max_err_f32` bound separates rounding from a correctness break. The
+///   observed spread is ~2e-8 (head_dim=128) to ~1.2e-4 (head_dim=256), all
+///   well inside a bf16 ULP at these magnitudes; a jump past 1e-3 is a bug,
+///   not a summation order.
 #[test]
 #[ignore = "GPU Metal context — run in isolation: cargo test planar_flash_decode -- --include-ignored --test-threads=1"]
 fn planar_flash_decode_is_not_bit_exact_vs_split_chain() {
@@ -576,33 +634,44 @@ fn planar_flash_decode_is_not_bit_exact_vs_split_chain() {
     // and a kv_h=1 single-KV-head shape at head_dim=256.
     let shapes = [(8_i32, 4_i32, 128_i32), (1_i32, 8_i32, 256_i32)];
     let contexts = [64_i32, 512, 4096];
-    let mut any_diff = false;
+    let mut any_f32_diff = false;
+    let mut any_bf16_diff = false;
     for (kv_h, heads_per_kv, head_dim) in shapes {
         for kv_seq in contexts {
             let seed = 0x9E37_79B9_u64
                 .wrapping_mul(kv_seq as u64)
                 .wrapping_add(head_dim as u64);
-            let (n, diffs, max_err) =
-                flash_vs_split_chain(1, kv_h, heads_per_kv, kv_seq, head_dim, seed);
+            let d = flash_vs_split_chain(1, kv_h, heads_per_kv, kv_seq, head_dim, seed);
             eprintln!(
                 "[planar flash vs split] kv_h={kv_h} heads_per_kv={heads_per_kv} \
-                 head_dim={head_dim} kv_seq={kv_seq}: {diffs}/{n} elements differ \
-                 bitwise, max_abs_err={max_err:.3e}"
+                 head_dim={head_dim} kv_seq={kv_seq}: f32 accumulator {}/{} differ \
+                 (max_abs_err={:.3e}), bf16 output {}/{} differ",
+                d.diffs_f32, d.n, d.max_err_f32, d.diffs_bf16, d.n
             );
             assert!(
-                max_err < 1e-3,
+                d.max_err_f32 < 1e-3,
                 "kv_h={kv_h} head_dim={head_dim} kv_seq={kv_seq}: arms disagree by \
-                 {max_err:.3e} — that is a correctness bug, not rounding"
+                 {:.3e} — that is a correctness bug, not a summation order",
+                d.max_err_f32
             );
-            if diffs > 0 {
-                any_diff = true;
+            if d.diffs_f32 > 0 {
+                any_f32_diff = true;
+            }
+            if d.diffs_bf16 > 0 {
+                any_bf16_diff = true;
             }
         }
     }
     assert!(
-        any_diff,
-        "every cell matched bit-for-bit — either the kernel became bit-exact \
-         (update the docs) or one arm did not run (the A/B is inert)"
+        any_f32_diff,
+        "no cell differed even in the f32 accumulator — the two arms are not \
+         actually two arms (one did not run), so nothing above proves anything"
+    );
+    assert!(
+        any_bf16_diff,
+        "every cell agreed bit-for-bit at the returned dtype — if that is now \
+         genuinely true the docs must be updated to say the arms are \
+         interchangeable, but check first that both arms still ran"
     );
 }
 

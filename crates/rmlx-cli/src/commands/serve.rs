@@ -282,9 +282,11 @@ impl std::fmt::Display for PlanarFlashDecodeMode {
 ///   and that is not evidence the two paths agree: neither arm dispatches the
 ///   kernel, so the identical output is the warm-TTFT bypass in both. Where
 ///   the kernel does run, it is **not** bit-exact with the split chain — the
-///   online per-tile softmax sums in a different order. See `docs/KV_QUANT.md`
-///   § "Numerical relationship to the split chain" for the measured
-///   cell-by-cell table.
+///   online per-tile softmax sums in a different order. At the dtype the
+///   dispatcher returns, that survives in 4 of 6 measured cells and vanishes
+///   in 2, so a one-cell check will confirm byte-identity about a third of the
+///   time. See `docs/KV_QUANT.md` § "Numerical relationship to the split
+///   chain" for the cell-by-cell table.
 ///
 /// Must be called before any inference (i.e. before the server starts
 /// accepting requests), ensuring the `OnceLock` is not yet initialised.

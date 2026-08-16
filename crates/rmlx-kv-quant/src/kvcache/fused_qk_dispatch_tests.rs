@@ -257,6 +257,30 @@ fn fused_qk_layout_rotor_k_asym_4() {
 }
 
 #[test]
+fn fused_qk_layout_coverage_matches_the_kernel_table() {
+    // Third of the three lists that must agree — `lookup_fused_qk_kernel`,
+    // `codec_has_gpu_encoder` and `FusedQkLayout::for_codec`. The first pair
+    // is pinned above; this pins the layout against the kernel table.
+    //
+    // A codec with a kernel but no layout does NOT fall back:
+    // `FusedQkShadow::allocate` turns the missing layout into a hard `Err` at
+    // the first decode dispatch, so the codec crashes rather than taking the
+    // legacy path. Asserted as a biconditional over every variant, not over a
+    // list of the codecs already known to agree.
+    for &codec in ALL_KV_QUANTS {
+        let has_layout = FusedQkLayout::for_codec(codec, 128)
+            .unwrap_or_else(|e| panic!("{codec:?}: layout query errored at head_dim=128: {e}"))
+            .is_some();
+        assert_eq!(
+            lookup_fused_qk_kernel(codec).is_some(),
+            has_layout,
+            "{codec:?}: kernel table and layout table disagree — a codec with a kernel but \
+             no layout hard-errors at first dispatch instead of falling back"
+        );
+    }
+}
+
+#[test]
 fn fused_qk_table_matches_the_bf16_k_mirror_contract() {
     // `try_fused_qk_dispatch` seeds the head-major shadow by re-encoding
     // `decode_fp16_k`, and `exit_prefill` only materialises that seed when

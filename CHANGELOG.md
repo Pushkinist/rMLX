@@ -25,41 +25,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that the other two did not, which the previous test never checked in either
   direction.
 - **The rotor fused-QK kernel is reachable and does dispatch.** Proven on two
-  architectures at both supported head widths — Ternary-Bonsai-8B
-  (`Qwen3ForCausalLM`, `kv_h=8`, `head_dim=128`, `--ctk rotor_k_3 --ctv q4_g64
-  --fused-qk on`): 2418 `rotor_fused_qk_sdpa: dispatch` trace events; ornith-9b
-  (`Qwen3_5ForConditionalGeneration`, `kv_h=4`, `head_dim=256`, `--ctk
-  rotor_k_4`): 126. It is the *only* GPU decode kernel for the two rotor-asym
-  codecs, which have no flash-decode arm.
-- **`lookup_fused_qk` matched payload-bearing variants by `PartialEq`.** The
-  rotor-asym entries carry a `(v_bits, v_group_size)` V-side payload the K-side
-  kernel never reads, so an equality lookup would resolve only the one V
-  configuration the table spells out and silently return `None` for every
-  other. It now matches by variant discriminant.
+  architectures at both supported head widths, counting per-dispatch `trace!`
+  events in the run's `.jsonl` under `--log verbose`:
+  - Ternary-Bonsai-8B (`Qwen3ForCausalLM`, `kv_h=8`, `head_dim=128`),
+    `rmlx --log verbose --metrics off --fused-qk on bench --prompt-tokens 4096
+    --max-ctx 8192 --ctk rotor_k_3 --ctv q4_g64 --max-tokens 32 --runs 2
+    --warmup 1` → codec resolves to `rotor_k_3_asym_v4_g64`, 2418
+    `rotor_fused_qk_sdpa: dispatch`.
+  - ornith-1.0-9b (`kv_h=4`, `head_dim=256`), same flags with `--ctk rotor_k_4
+    --ctv q4_g64 --max-tokens 8` → codec resolves to `rotor_k_4_asym_v4_g64`,
+    126 dispatches.
+
+  Both need an explicit affine `--ctv`: `--ctk rotor_k_*` alone takes the
+  arch-default V and `combo_to_kv_quant` then yields `RotorKOnly*`, which
+  routes to `rotor_flash_decode` instead. Only an accepted affine V produces
+  the asym codec this kernel serves.
+
+  It is the *only* GPU decode kernel for the two rotor-asym codecs, which have
+  no flash-decode arm.
 - **`planar_flash_decode` was documented as byte-identical to the split
-  chain; it is not, in any cell.** Both arms decode the same packed K, but the
-  flash kernel folds the softmax into a per-tile online log-sum-exp reduction
-  while the split chain materialises the score row and calls `softmax_precise`
-  — different summation orders, different low mantissa bits. Measured across
-  three contexts (64 / 512 / 4096) on two head shapes: 6 of 6 cells diverge,
-  3621–3890 of 4096 elements at `head_dim=128` and all 2048 at `head_dim=256`,
-  max abs error 1.96e-8 to 1.21e-4. The claim is now stated as measured in
-  `docs/KV_QUANT.md`, `docs/CLI.md` and the `--planar-flash-decode` rustdoc,
-  and a GPU test pins it. The serve-path A/B that produced the original claim
-  cannot settle it either way: with the warm-TTFT bf16-K seed live, **neither**
-  `--planar-flash-decode on` nor `off` dispatches the kernel (measured 0 and 0,
-  2418 warm-TTFT bypasses, identical digests) — an A/B whose arms both skip the
-  kernel confirms any equivalence put to it.
-- **Kernel-gate flags are global, so the instrument measures what the server
-  runs.** `--turbo-flash`, `--turbo-flash-lock` and `--planar-flash-decode`
-  were resolved inside `run_serve`, while their four sibling gates
-  (`--fused-qk`, `--sparse-attn`, `--rotor-qjl`, `--planar-fused-qk`) resolved
-  in `main`. All of them drive process-wide `OnceLock`s, so the split meant
-  `rmlx serve` and `rmlx bench` / `rmlx baseline` disagreed about which Metal
-  kernels were live on the same host — the measurement commands never resolved
-  the gates at all. The three flags are now `global = true` and resolve in
-  `main` beside the others; both `rmlx --turbo-flash off serve …` and
-  `rmlx serve --turbo-flash off …` continue to work.
+  chain; it is not — but only some cells show it.** Both arms decode the same
+  packed K; the flash kernel folds the softmax into a per-tile online
+  log-sum-exp reduction while the split chain materialises the score row and
+  calls `softmax_precise`. Different summation orders, different low mantissa
+  bits. Measured with production dtypes throughout — bf16 Q as the model
+  streams it, and the closing `astype(queries.dtype())` both arms apply — over
+  three contexts on two head shapes:
+
+  | `kv_h` × `hpkv` | `head_dim` | `kv_seq` | f32 accumulator differs | max abs err | **bf16 output differs** |
+  |---|---:|---:|---:|---:|---:|
+  | 8 × 4 | 128 | 64 | 3569/4096 | 8.94e-8 | **0/4096** |
+  | 8 × 4 | 128 | 512 | 3643/4096 | 2.98e-8 | **0/4096** |
+  | 8 × 4 | 128 | 4096 | 3863/4096 | 2.05e-8 | **3/4096** |
+  | 1 × 8 | 256 | 64 | 2048/2048 | 1.13e-4 | **273/2048** |
+  | 1 × 8 | 256 | 512 | 2048/2048 | 3.55e-5 | **280/2048** |
+  | 1 × 8 | 256 | 4096 | 2048/2048 | 1.46e-5 | **298/2048** |
+
+  Every cell differs in the f32 accumulator, but the divergence only survives
+  the bf16 output cast in 4 of 6 — the two `head_dim=128` short-context cells
+  are bit-identical to a caller. That is the same shape as the TurboFlash
+  retraction: a single-cell check at `head_dim=128, kv_seq<=512` would have
+  "confirmed" byte-identity outright. The claim is now stated as measured, with
+  the sweep, in `docs/KV_QUANT.md`, `docs/CLI.md` and the
+  `--planar-flash-decode` rustdoc, and a GPU test pins both halves (some cell
+  differs at bf16; every cell differs at f32, the null control).
+
+  The serve-path A/B cannot settle it either way: with the warm-TTFT bf16-K
+  seed live, **neither** `--planar-flash-decode on` nor `off` dispatches the
+  kernel (measured 0 and 0, 2418 warm-TTFT bypasses, identical digests) — an
+  A/B whose arms both skip the kernel confirms any equivalence put to it.
 
 ### Added
 
@@ -113,6 +127,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `iso_flash_decode_symv` instead. The dispatcher, both `.metal` bodies, both
   probe headers, the manifest rows, the tests and the doc references are all
   gone rather than left compiling and CI-checked for nothing.
+- **`rmlx_models::kv_cache::attention_dispatch::FUSED_QK_TABLE`,
+  `lookup_fused_qk` and `FusedQkEntry` removed**, with their tests. They were a
+  public mirror of the codec layer's codec → kernel map with **zero** non-test
+  callers: production dispatch has always gone through
+  `rmlx_kv_quant`'s own `lookup_fused_qk_kernel`, because the codec layer
+  cannot depend on `rmlx-models` per the workspace dep-graph rule. A second
+  copy that nothing reads can only drift from the one that runs — which is
+  what had happened. Same "nothing runs it" criterion as the iso kernel above.
+  The module keeps its sparse-attention dispatch, which does have callers.
 
 ## [0.3.0] - 2026-07-13
 

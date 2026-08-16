@@ -48,8 +48,8 @@ use crate::KvQuant;
 /// Per-token payload geometry for a fused-QK codec.
 ///
 /// Tells the shadow how big the head-major slot at one token is, plus
-/// whether the codec carries sideband norms (iso/rotor) and a static
-/// rotor table (rotor only). The dispatch layer reads these flags to
+/// whether the codec carries sideband norms and a static rotor table
+/// (rotor-asym only). The dispatch layer reads these flags to
 /// decide whether to allocate / concat the optional sidebands at call
 /// time.
 #[allow(
@@ -62,7 +62,7 @@ pub(crate) struct FusedQkLayout {
     pub(crate) codes_per_token: i32,
     /// Number of f32 scales stored per token (excludes sidebands).
     pub(crate) scales_per_token: i32,
-    /// `true` ⇒ allocate the per-token norm sideband (iso / rotor).
+    /// `true` ⇒ allocate the per-token norm sideband (rotor-asym only).
     pub(crate) has_norm: bool,
     /// `true` ⇒ allocate the static per-layer rotor table sideband
     /// (rotor only — both `Sym` and K-only / asym).
@@ -190,7 +190,7 @@ impl FusedQkLayout {
 /// Per-token arrays:
 ///   * `k_codes`        — `u32 [B, kv_h, max_seq, codes_per_token]`
 ///   * `k_scales`       — `f32 [B, kv_h, max_seq, scales_per_token]`
-///   * `sideband_norms` — `f32 [B, kv_h, max_seq, 1]` (iso/rotor only)
+///   * `sideband_norms` — `f32 [B, kv_h, max_seq, 1]` (rotor-asym only)
 ///
 /// Static per-layer sideband:
 ///   * `sideband_rotor_table` — `f32 [n_groups * 4]` (rotor only)
@@ -203,7 +203,7 @@ impl FusedQkLayout {
 pub(crate) struct FusedQkShadow {
     pub(super) k_codes: Array,
     pub(super) k_scales: Array,
-    /// Per-token norm sideband (iso / rotor codecs). `None` for
+    /// Per-token norm sideband (rotor-asym codecs). `None` for
     /// q8 / turbo where the shim does not consume norms.
     pub(super) sideband_norms: Option<Array>,
     /// Static per-layer rotor table `[n_groups * 4]` f32.
