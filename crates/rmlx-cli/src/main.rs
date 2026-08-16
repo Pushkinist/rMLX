@@ -1233,11 +1233,18 @@ enum Cmd {
         /// greedy. The seed is the fixed default, so runs stay comparable.
         #[arg(long, default_value_t = 0.0, value_name = "FLOAT")]
         temperature: f32,
-        /// Nucleus threshold. Applied only when `--temperature` is positive;
-        /// `1.0` (the default) disables it. Its cost is an ordering pass over
-        /// the whole vocabulary, so bench it separately from temperature alone.
+        /// Nucleus threshold. Requires `--temperature` > 0; `1.0` (the default)
+        /// disables it. Its cost is an ordering pass over the whole vocabulary,
+        /// so bench it separately from temperature alone.
         #[arg(long, default_value_t = 1.0, value_name = "FLOAT")]
         top_p: f32,
+        /// Top-k cutoff. Requires `--temperature` > 0; `0` (the default)
+        /// disables it. Also an ordering pass over the whole vocabulary. Needed
+        /// to reproduce the served default: several snapshots ship a `top_k` in
+        /// `generation_config.json`, so a request that omits sampling fields
+        /// gets one.
+        #[arg(long, default_value_t = 0, value_name = "N")]
+        top_k: u32,
         /// Sign-aware multiplicative repetition penalty over the trailing
         /// 20-token window. `1.0` (the default) is the exact no-op. A value
         /// other than 1 reads the logits row to the host even at temperature 0.
@@ -2336,6 +2343,7 @@ fn main() -> Result<()> {
             prompts_dir,
             temperature,
             top_p,
+            top_k,
             repetition_penalty,
         } => {
             let cap_is_explicit = max_prompt_tokens.is_some();
@@ -2388,6 +2396,7 @@ fn main() -> Result<()> {
                 json,
                 temperature,
                 top_p,
+                top_k,
                 repetition_penalty,
             })?;
         }

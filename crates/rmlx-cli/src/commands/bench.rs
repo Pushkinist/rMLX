@@ -618,9 +618,17 @@ pub(crate) struct BenchArgs {
     pub temperature: f32,
     /// Nucleus threshold; `1.0` disables it.
     pub top_p: f32,
+    /// Top-k cutoff; `0` disables it.
+    pub top_k: u32,
     /// Sign-aware multiplicative repetition penalty; `1.0` is the no-op.
     pub repetition_penalty: f32,
 }
+
+/// Upper bound on `--temperature`, matching the one the HTTP surface and
+/// `--default-temperature` already enforce. Above it the distribution flattens
+/// toward uniform over the vocabulary, and at infinity it is exactly uniform —
+/// benchable, but not a cell any served request can reach.
+const MAX_TEMPERATURE: f32 = 2.0;
 
 impl BenchArgs {
     /// `true` when the cell routes through the host sampler rather than the GPU
@@ -639,11 +647,25 @@ impl BenchArgs {
     /// Reject sampler knobs that cannot produce a meaningful cell, before the
     /// model is loaded. A NaN temperature would silently fail the `> 0.0` gate
     /// and bench greedy under a sampling label; a non-positive repetition
-    /// penalty divides positive logits by zero or flips their sign.
+    /// penalty divides positive logits by zero or flips their sign; and a
+    /// distribution filter at temperature 0 is never reached at all, so the cell
+    /// would be recorded carrying a setting it did not exercise.
+    #[allow(
+        clippy::float_cmp,
+        reason = "exact identity comparisons on purpose: these gates must agree with the sampler's own exact identity checks, and a tolerance would let a knob through that the sampler treats as set"
+    )]
     fn validate_sampling(&self) -> anyhow::Result<()> {
         if self.temperature.is_nan() || self.temperature < 0.0 {
             return Err(anyhow::anyhow!(
                 "--temperature must be >= 0 (got {}); 0 is greedy",
+                self.temperature
+            ));
+        }
+        if self.temperature > MAX_TEMPERATURE {
+            return Err(anyhow::anyhow!(
+                "--temperature must be <= {MAX_TEMPERATURE} (got {}); that is the bound the HTTP \
+                 surface and --default-temperature enforce, so a higher value benches a cell no \
+                 served request can reach",
                 self.temperature
             ));
         }
@@ -657,6 +679,19 @@ impl BenchArgs {
             return Err(anyhow::anyhow!(
                 "--repetition-penalty must be > 0 (got {}); 1 is the exact no-op",
                 self.repetition_penalty
+            ));
+        }
+        // The distribution filters live downstream of the softmax, which only the
+        // temperature path runs. At temperature 0 the cell is a GPU argmax and
+        // never reaches them, so accepting the flag would record a nucleus or
+        // top-k setting against a cell that applied neither.
+        if self.temperature == 0.0 && (self.top_p != 1.0 || self.top_k != 0) {
+            return Err(anyhow::anyhow!(
+                "--top-p / --top-k require --temperature > 0 (got top_p={}, top_k={} at \
+                 temperature 0): both filter the post-softmax distribution, which the greedy \
+                 path never builds, so the cell would carry a setting it did not exercise",
+                self.top_p,
+                self.top_k
             ));
         }
         Ok(())
@@ -676,7 +711,7 @@ fn measure_one(
     let sampler_cfg = rmlx_models::SamplerConfig {
         temperature: args.temperature,
         top_p: args.top_p,
-        top_k: 0,
+        top_k: args.top_k,
         min_p: 0.0,
         seed: None,
         top_logprobs_k: 0,
@@ -1174,6 +1209,7 @@ fn emit_json(ctx: &ReportCtx<'_>, s: &BenchSummary, samples: &[RunSample]) -> an
             "host_sampled": ctx.args.host_sampled(),
             "temperature": ctx.args.temperature,
             "top_p": ctx.args.top_p,
+            "top_k": ctx.args.top_k,
             "repetition_penalty": ctx.args.repetition_penalty,
         },
         "metrics": {
@@ -1218,8 +1254,8 @@ fn emit_table(ctx: &ReportCtx<'_>, s: &BenchSummary) {
     // it was — but a sampled cell can never be mistaken for a greedy one.
     if ctx.args.host_sampled() {
         println!(
-            "sampling: host path — temperature={} top_p={} repetition_penalty={}",
-            ctx.args.temperature, ctx.args.top_p, ctx.args.repetition_penalty
+            "sampling: host path — temperature={} top_p={} top_k={} repetition_penalty={}",
+            ctx.args.temperature, ctx.args.top_p, ctx.args.top_k, ctx.args.repetition_penalty
         );
     }
     println!(

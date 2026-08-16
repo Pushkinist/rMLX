@@ -571,33 +571,53 @@ agree; see the drift refusal below.
 | `--allow-truncate` | bool flag | off | Opt into truncating an over-cap prompt on `--device gpu`. |
 | `--json` | bool flag | off | Emit one JSON object (per-metric spreads plus every individual run) instead of the table. |
 | `--prompts-dir` | path | (cwd walk) | Root to search for `longctx_<N>k.json`. Env: `RMLX_PROMPTS_DIR`. |
-| `--temperature` | f32 | `0.0` | `0` is greedy (GPU argmax, no logits row read back). Positive routes the cell through the host sampler. |
-| `--top-p` | f32 | `1.0` | Nucleus threshold, applied only when `--temperature` is positive. `1.0` disables it. |
+| `--temperature` | f32 | `0.0` | `0` is greedy (GPU argmax, no logits row read back). Positive routes the cell through the host sampler. Bounded to `[0, 2]`, the same range the HTTP surface and `--default-temperature` enforce. |
+| `--top-p` | f32 | `1.0` | Nucleus threshold. Requires `--temperature > 0`; `1.0` disables it. |
+| `--top-k` | u32 | `0` | Top-k cutoff. Requires `--temperature > 0`; `0` disables it. |
 | `--repetition-penalty` | f32 | `1.0` | Sign-aware multiplicative penalty over the trailing 20-token window. `1.0` is the exact no-op. |
 
 #### Benching the host sampler
 
-Every other shape this binary measures is greedy, so without these three flags
+Every other shape this binary measures is greedy, so without these four flags
 the sampling / penalty path is invisible to the bench harness — and to
-`scripts/perf_canary.sh`, which is greedy-only. It is not free: see
-`docs/SAMPLING.md` § *Cost of the host path* for the measured figures.
+`scripts/perf_canary.sh`, which is greedy-only. That path is what ordinary
+served traffic takes: a request omitting sampling fields resolves temperature
+from `generation_config.json` or a hard-coded `1.0`, and several snapshots ship
+`top_p` and `top_k` with it. It is not free: see `docs/SAMPLING.md` § *Cost of
+the host path*.
 
 ```bash
+# the issue's two named knobs
 rmlx bench --model /path/to/snapshot --prompt-tokens 4096 --max-tokens 100 \
   --temperature 0.7 --repetition-penalty 1.1
+
+# what a served request that omits sampling fields actually gets, for a
+# snapshot whose generation_config.json carries top_p 0.95 / top_k 64
+rmlx bench --model /path/to/snapshot --prompt-tokens 4096 --max-tokens 100 \
+  --temperature 1.0 --top-p 0.95 --top-k 64
 ```
 
 The seed is the fixed default and the RNG is fresh per run, so a sampled cell
 still produces one token stream across every run — the digest check applies
 unchanged. A cell that is not greedy is named on its own line in the table and
-under `sampling` in the JSON, so it cannot be read as a greedy one. Values
-outside their valid ranges (a NaN or negative temperature, a `--top-p` outside
-`(0, 1]`, a non-positive `--repetition-penalty`) are refused before the model
-loads rather than silently no-opping into a greedy run wearing a sampled label.
+under `sampling` in the JSON, so it cannot be read as a greedy one.
 
-Per-step host-sampler timings for the run land in the `sampler_profile` tracing
-event (`sync_per_step_ms`, `sample_per_step_ms`, `step_per_step_ms`,
-`sample_share_pct`), emitted only when a step took the host path.
+Refused before the model loads, rather than silently no-opping into a greedy run
+wearing a sampled label:
+
+- a NaN or negative `--temperature`, or one above 2;
+- a `--top-p` outside `(0, 1]`;
+- a non-positive `--repetition-penalty`;
+- `--top-p` or `--top-k` at `--temperature 0`. Both filter the post-softmax
+  distribution, which the greedy path never builds, so the cell would be
+  recorded carrying a setting it did not exercise.
+
+Per-step host-sampler timings land in the `sampler_profile` tracing event
+(`sync_per_step_ms`, `sample_per_step_ms`, `step_per_step_ms`,
+`sample_share_pct`), emitted only when a step took the host path — **once per
+generation**, so a `--warmup 1 --runs 3` cell writes four events. Take the
+median of the last three; the first is the warmup's. The event is not folded
+into the summary table or the JSON.
 
 #### Refusals
 

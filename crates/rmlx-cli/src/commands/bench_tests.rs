@@ -1,3 +1,7 @@
+// LOC-exempt: sibling test file for one command. Its length tracks the number of
+// refusals `rmlx bench` makes, and each refusal's test carries the reasoning for
+// why that measurement condition is load-bearing — prose that is the point, not
+// padding. Splitting by topic would separate a guard from the argument for it.
 //! Unit tests for the `rmlx bench` instrument.
 //!
 //! The subject here is the instrument's refusal behaviour, not its arithmetic:
@@ -249,6 +253,7 @@ fn unrunnable_args(runs: u32) -> BenchArgs {
         json: false,
         temperature: 0.0,
         top_p: 1.0,
+        top_k: 0,
         repetition_penalty: 1.0,
     }
 }
@@ -297,12 +302,66 @@ fn negative_temperature_is_refused() {
 fn out_of_range_top_p_is_refused() {
     for bad in [0.0f32, -0.1, 1.5, f32::NAN] {
         let mut args = unrunnable_args(3);
+        args.temperature = 0.7;
         args.top_p = bad;
         let msg = run_bench(args)
             .expect_err("out-of-range --top-p must be refused")
             .to_string();
         assert!(msg.contains("--top-p"), "wrong rejection for {bad}: {msg}");
     }
+}
+
+/// The binary bounds temperature to [0, 2] on the HTTP surface and on
+/// `--default-temperature`. Above that the distribution flattens toward uniform
+/// over the vocabulary; at infinity it is exactly uniform. Benching a cell no
+/// served request can reach is not a measurement of anything served.
+#[test]
+fn above_range_temperature_is_refused() {
+    for bad in [2.5f32, f32::INFINITY] {
+        let mut args = unrunnable_args(3);
+        args.temperature = bad;
+        let msg = run_bench(args)
+            .expect_err("out-of-range --temperature must be refused")
+            .to_string();
+        assert!(
+            msg.contains("--temperature"),
+            "wrong rejection for {bad}: {msg}"
+        );
+    }
+}
+
+/// The distribution filters sit downstream of the softmax, which the greedy path
+/// never builds. Accepting them at temperature 0 records a nucleus or top-k
+/// setting against a cell that applied neither — the exact "silently no-opping
+/// into a greedy run wearing a sampled label" this validator exists to stop.
+#[test]
+fn distribution_filters_at_temperature_zero_are_refused() {
+    let mut nucleus = unrunnable_args(3);
+    nucleus.top_p = 0.9;
+    let msg = run_bench(nucleus)
+        .expect_err("--top-p at temperature 0 must be refused")
+        .to_string();
+    assert!(msg.contains("--top-p"), "wrong rejection: {msg}");
+
+    let mut topk = unrunnable_args(3);
+    topk.top_k = 20;
+    let msg = run_bench(topk)
+        .expect_err("--top-k at temperature 0 must be refused")
+        .to_string();
+    assert!(msg.contains("--top-k"), "wrong rejection: {msg}");
+
+    // ...and both clear the gate once the sampler actually runs.
+    let mut sampled = unrunnable_args(3);
+    sampled.temperature = 0.7;
+    sampled.top_p = 0.95;
+    sampled.top_k = 20;
+    let msg = run_bench(sampled)
+        .expect_err("the nonexistent model path must be what fails")
+        .to_string();
+    assert!(
+        !msg.contains("--top-p") && !msg.contains("--top-k"),
+        "filters are legitimate above temperature 0: {msg}"
+    );
 }
 
 /// A repetition penalty of zero divides positive logits by zero; a negative one
@@ -361,11 +420,19 @@ fn host_sampled_matches_the_decode_loop_gate() {
         "a penalty reads logits to host even at temperature 0"
     );
 
+    // top_p alone cannot reach this predicate at all: `validate_sampling`
+    // refuses the combination first. Were it ever accepted, the cell would be
+    // labelled greedy — which is what it would in fact be, since the filters run
+    // only inside the temperature path.
     let mut nucleus_only = unrunnable_args(3);
     nucleus_only.top_p = 0.9;
     assert!(
         !nucleus_only.host_sampled(),
-        "top_p alone does nothing at temperature 0 — the sampler never runs"
+        "the filters do not by themselves take the host path"
+    );
+    assert!(
+        nucleus_only.validate_sampling().is_err(),
+        "and the combination never reaches a run: it is refused up front"
     );
 }
 

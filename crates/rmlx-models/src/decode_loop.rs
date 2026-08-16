@@ -458,10 +458,14 @@ pub(crate) fn pipelined_decode(
         // computed above; the pre-drain may have called `constraint.advance()`,
         // which can flip `wants_mask`, so recomputing here would diverge.
         // Timed only on the host-selection path; a greedy step takes no clock
-        // readings it would not have taken before.
+        // readings it would not have taken before. The window spans every
+        // host-selection consumer of the logits row, not just `choose_token`:
+        // logprob capture performs its own full readback plus a log-softmax and a
+        // top-k over the whole vocabulary, and leaving it outside would report a
+        // near-zero cost for the one path whose selection is free (a lazy GPU
+        // argmax) and whose readback is the entire expense.
         let sample_t0 = drain_now.then(Instant::now);
         let next_y = choose_token(ctx, &logits_flat, mask_active)?;
-        let sample_dt = sample_t0.map_or(0, |t| t.elapsed().as_nanos());
         let _ = next_y.async_eval();
         // capture this step's logprobs from `logits_flat` + the chosen token.
         // Stashed in `pending_logprobs`; emitted with the matching ProbeStep next
@@ -469,6 +473,7 @@ pub(crate) fn pipelined_decode(
         if lp_k > 0 {
             pending_logprobs = capture_logprobs(&logits_flat, &next_y, lp_k);
         }
+        let sample_dt = sample_t0.map_or(0, |t| t.elapsed().as_nanos());
         let fwd_dt = fwd_t0.elapsed().as_nanos();
 
         // The actual GPU sync materializes here on the *previous* step's pending
@@ -609,6 +614,24 @@ pub(crate) fn pipelined_decode(
 /// forward. `sample_share_pct` is that cost as a fraction of the steps that
 /// actually paid it, not of every step in the run, so a request that engages a
 /// constraint engine part-way through is not diluted by its greedy prefix.
+///
+/// # What `sample` does and does not include
+///
+/// It covers every host-side consumer of the logits row — the readback, the
+/// mask fill, penalties, softmax, the filters, the draw, and logprob capture.
+///
+/// It does **not** cover GPU work that a selection path merely *schedules*. The
+/// constraint-mask-only path (`temperature == 0`, no penalties, no logprobs) is
+/// the one case that matters: `apply_mask_argmax` returns a lazy graph, so only
+/// its host-side bias fill is timed here and the GPU add + argmax execute at the
+/// next step's `eval`, where they are billed to `sync`. That path's figure is
+/// therefore a host-work floor, not its total cost. Every other path forces the
+/// row to the host inside the window and is fully accounted.
+///
+/// It is also a floor in a second, path-independent way: the host path forfeits
+/// the greedy path's software pipelining, and that loss lands in `step` rather
+/// than in `sample`. A decode-TPS comparison against a greedy control is the
+/// end-to-end figure; this is the component that is attributable to host work.
 fn emit_sampler_profile(
     ctx: &DecodeCtx<'_>,
     host_steps: u32,
