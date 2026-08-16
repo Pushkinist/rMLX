@@ -524,6 +524,20 @@ pub fn planar_flash_decode_sdpa(
     // Counter increment at the actual P1 enqueue point — after all validation
     // gates, immediately before the kernel `.apply()` call.
     PLANAR_FLASH_DECODE_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+    // Per-dispatch trace, matching every sibling KV kernel. The in-process
+    // counter above has no caller outside tests, so this event is the only
+    // way a shipped binary can answer "did this kernel run".
+    tracing::trace!(
+        b,
+        n_q_heads,
+        kv_h,
+        kv_seq,
+        head_dim,
+        heads_per_kv,
+        has_mask,
+        n_tiles,
+        "planar_flash_decode_sdpa: dispatch"
+    );
     let mut p1_outs = kern_p1.apply(inv_p1, device)?;
     if p1_outs.len() < 3 {
         return Err(Error::Mlx(

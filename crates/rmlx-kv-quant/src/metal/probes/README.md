@@ -76,8 +76,8 @@ fn refresh_snapshot_tmp() {
 Run `cargo test -p rmlx-kv-quant refresh_snapshot_tmp`, remove the temporary
 test, then re-run the guard to confirm it passes. `unwrap_used` is denied
 workspace-wide (tests included), hence the `#[allow]`. The parameter to pass is
-whichever variant the manifest line names — e.g. `iso_fused_qk_b3.hdr.metal` ←
-`build_iso_fused_qk_header(3)`.
+whichever variant the manifest line names — e.g. `rotor_fused_qk_b3.hdr.metal`
+← `build_rotor_fused_qk_header(3)`.
 
 Snapshots are representative: the probe checks that the kernel text parses and
 resolves, not that the constants are numerically current. Numerical correctness

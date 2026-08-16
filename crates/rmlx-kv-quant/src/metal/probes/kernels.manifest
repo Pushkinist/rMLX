@@ -30,8 +30,6 @@ iso_flash_decode_p1.metal | iso_flash_decode_p1_b4.hdr.metal | query:f,codes:u,s
 # instead of a bf16 mirror, hence v_codes/v_scales/v_norms in place of v_flat.
 iso_flash_decode_symv_p1.metal | iso_flash_decode_p1_b3.hdr.metal | query:f,k_codes:u,k_scales:f,k_norms:f,v_codes:u,v_scales:f,v_norms:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
 iso_flash_decode_symv_p1.metal | iso_flash_decode_p1_b4.hdr.metal | query:f,k_codes:u,k_scales:f,k_norms:f,v_codes:u,v_scales:f,v_norms:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
-iso_fused_qk_b3.metal | iso_fused_qk_b3.hdr.metal | query:f,codes:u,scales:f,norms:f,mask:f,scale_arr:f,dims:u,out:f
-iso_fused_qk_b4.metal | iso_fused_qk_b4.hdr.metal | query:f,codes:u,scales:f,norms:f,mask:f,scale_arr:f,dims:u,out:f
 isoquant_quantize_iso3.metal | isoquant_iso3.hdr.metal | inp:f,n_groups:u,codes_out:u,scales_out:f,norms_out:f
 isoquant_dequantize_iso3.metal | isoquant_iso3.hdr.metal | codes_in:u,scales_in:f,norms_in:f,n_groups:u,out:f
 k8vturbo3_quantize.metal | ../k8vturbo3_header.metal | inp:f,codes:u,scales:f

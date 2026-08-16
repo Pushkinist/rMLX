@@ -262,9 +262,7 @@ impl std::fmt::Display for PlanarFlashDecodeMode {
 ///   `RMLX_PLANAR_FLASH_DECODE` so a stale `=1` in the shell cannot latch
 ///   the `OnceLock` to true.
 /// - [`PlanarFlashDecodeMode::Auto`] → currently resolves to OFF on every
-///   host. Validation confirmed dispatch_delta > 0 on Bonsai+PlanarK and
-///   byte-identical decoded output
-///   vs the prior chain. The warm-TTFT bf16-K shortcut (see
+///   host. The warm-TTFT bf16-K shortcut (see
 ///   `docs/reports/planar-chunked-prefill-fix.md`) unblocked the NIAH
 ///   correctness anchor but as a side effect: when the prefill bf16 K seed is
 ///   live (the normal post-`exit_prefill` decode flow) the PlanarK fused-QK /
@@ -279,6 +277,16 @@ impl std::fmt::Display for PlanarFlashDecodeMode {
 ///   itself from `decode_fp16_k` (mirroring TurboFlash).
 ///   Pre-existing `RMLX_PLANAR_FLASH_DECODE=1` in the shell is honoured for
 ///   back-compat.
+///
+///   Flipping this flag on a normal generate flow changes nothing observable,
+///   and that is not evidence the two paths agree: neither arm dispatches the
+///   kernel, so the identical output is the warm-TTFT bypass in both. Where
+///   the kernel does run, it is **not** bit-exact with the split chain — the
+///   online per-tile softmax sums in a different order. At the dtype the
+///   dispatcher returns, that survives in 4 of 6 measured cells and vanishes
+///   in 2, so a one-cell check will confirm byte-identity about a third of the
+///   time. See `docs/KV_QUANT.md` § "Numerical relationship to the split
+///   chain" for the cell-by-cell table.
 ///
 /// Must be called before any inference (i.e. before the server starts
 /// accepting requests), ensuring the `OnceLock` is not yet initialised.
