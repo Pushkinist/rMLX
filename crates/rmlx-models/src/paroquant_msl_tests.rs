@@ -30,35 +30,93 @@ fn to_f32_vec(a: &Array) -> Vec<f32> {
         .collect()
 }
 
-/// Kernel construction: build the RPT=1 kernel without crashing.
-/// Verifies that the MSL source compiles on the live Metal device.
+/// Kernel registration: MLX accepts the source and hands back a handle.
+///
+/// This does NOT prove the MSL compiles — MLX compiles lazily on first
+/// `apply()`, so a syntax error surfaces there, not here. The two round-trip
+/// tests below are what force the compile (and one instantiation each of the
+/// `ROWS_PER_TILE` template int); `make check-metal-compiles` is what catches a
+/// syntax error without a GPU.
 #[test]
 #[ignore = "GPU Metal context — run in isolation: cargo test paroquant_msl -- --ignored --test-threads=1"]
 #[allow(
     clippy::expect_used,
     reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
 )]
-fn paro_kernel_construction_rpt1() {
-    kernel_rpt1().expect("RPT=1 kernel should compile");
+fn paro_kernel_registration() {
+    paro_rotate_kernel().expect("paro rotate kernel should register");
 }
 
-/// Kernel construction: build the RPT=4 kernel without crashing.
-#[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test paroquant_msl -- --ignored --test-threads=1"]
+/// The compile probe's `MAX_KROT` / `MAX_GROUP_SIZE` must equal the Rust consts
+/// the dispatch passes as template ints.
+///
+/// Those manifest values are hand-written, so they are a second source of the
+/// same numbers — the drift the `probes/*.hdr.metal` snapshots are pinned
+/// against, one field over. Production numerics cannot go wrong (the dispatch
+/// reads the consts directly), but the probe silently stops representing the
+/// shape production requests: raising `MAX_GROUP_SIZE` in Rust would leave the
+/// gate compiling a threadgroup allocation nothing ever asks for, and the real
+/// one would first be seen on a GPU dispatch. Equality here turns that into a
+/// hard failure.
 #[allow(
     clippy::expect_used,
     reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
 )]
-fn paro_kernel_construction_rpt4() {
-    kernel_rpt4().expect("RPT=4 kernel should compile");
+#[test]
+fn probe_manifest_defines_match_rust_consts() {
+    const MANIFEST: &str = include_str!("metal/probes/kernels.manifest");
+    const BODY: &str = "paroquant_rotate.metal";
+
+    let line = MANIFEST
+        .lines()
+        .find(|l| !l.trim_start().starts_with('#') && l.trim_start().starts_with(BODY))
+        .expect("manifest must carry a paroquant_rotate.metal line");
+    let defines = line
+        .split('|')
+        .nth(3)
+        .expect("paroquant_rotate.metal line must carry a defines field");
+
+    let lookup = |name: &str| -> Option<usize> {
+        defines.split(',').find_map(|d| {
+            let (k, v) = d.split_once('=')?;
+            (k.trim() == name).then(|| v.trim().parse::<usize>().ok())?
+        })
+    };
+
+    assert_eq!(
+        lookup("MAX_KROT"),
+        Some(MAX_KROT),
+        "stale probe: metal/probes/kernels.manifest sets MAX_KROT to something other than \
+         paroquant_msl.rs's MAX_KROT={MAX_KROT}"
+    );
+    assert_eq!(
+        lookup("MAX_GROUP_SIZE"),
+        Some(MAX_GROUP_SIZE),
+        "stale probe: metal/probes/kernels.manifest sets MAX_GROUP_SIZE to something other \
+         than paroquant_msl.rs's MAX_GROUP_SIZE={MAX_GROUP_SIZE}"
+    );
+}
+
+/// Round-trip identity at `batch = 1`, which selects `ROWS_PER_TILE = 1` — the
+/// decode-step template instantiation.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test paroquant_msl -- --ignored --test-threads=1"]
+fn paro_rotate_identity_roundtrip_rpt1() {
+    paro_rotate_identity_roundtrip(1);
+}
+
+/// Round-trip identity at `batch = 2`, which selects `ROWS_PER_TILE = 4` — the
+/// prefill / batch template instantiation.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test paroquant_msl -- --ignored --test-threads=1"]
+fn paro_rotate_identity_roundtrip_rpt4() {
+    paro_rotate_identity_roundtrip(2);
 }
 
 /// Round-trip identity test: zero rotation angles (cos=1.0, sin=0.0) and
 /// channel_scales=1.0 must produce output equal to input.
 ///
-/// hidden=4, group_size=4, krot=2, batch=2.
-#[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test paroquant_msl -- --ignored --test-threads=1"]
+/// hidden=4, group_size=4, krot=2.
 #[allow(
     clippy::expect_used,
     reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
@@ -67,14 +125,13 @@ fn paro_kernel_construction_rpt4() {
     clippy::indexing_slicing,
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
 )]
-fn paro_rotate_identity_roundtrip() {
+fn paro_rotate_identity_roundtrip(batch: usize) {
     let hidden: usize = 4;
     let group_size: usize = 4;
     let krot: usize = 2;
-    let batch: usize = 2;
     let half_hidden = hidden / 2;
 
-    let x_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+    let x_data: Vec<f32> = (0..batch * hidden).map(|i| i as f32 + 1.0).collect();
     let x = make_f32_array(&x_data, &[batch as i32, hidden as i32]);
 
     // packed_pairs: [krot=2, half_hidden=2] I32.

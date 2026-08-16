@@ -11,13 +11,25 @@
 # order mirror the `MetalKernel::new(.., input_names, output_names)` call sites;
 # dtypes mirror the arrays those sites pass / `add_output_shape` declares.
 #
-# Format:  <body.metal> | <header or -> | <name:type,...>
-#   type: u = uint buffer, f = float buffer
+# Format:  <body.metal> | <header or -> | <name:type,...> | [NAME=VALUE,...]
+#   type: u = uint buffer, i = int buffer, f = float buffer
+#
+# The optional fourth field emits `#define NAME VALUE` immediately ahead of the
+# body. It supplies the values MLX injects at dispatch that are neither buffers
+# nor part of a header: template dtypes (`OutT`), template ints, and scalar 0-D
+# inputs that appear in the body as a numeric literal. Values are
+# representative — the probe checks that the body parses and resolves, not that a
+# particular shape is the production one.
 #
 # Headers ending in `.hdr.metal` live in this directory and are snapshots of the
 # Rust-generated runtime headers (codebooks / rotation constants), captured for
 # the probe only — production still builds them at dispatch. Regenerate them if
 # a header builder changes; see README.md here.
+#
+# Every `.metal` file in the parent directory must appear here, as a body or as
+# a `../`-prefixed header. The gate fails on one that does not: a body missing
+# from this file is not checked by anything, which is the failure mode the gate
+# exists to prevent.
 
 # One flash-decode pass-1 body serves both iso bit widths — the unpack width
 # arrives via the header (IF_BITS / IF_MASK), so each header gets its own probe
@@ -32,8 +44,10 @@ iso_flash_decode_symv_p1.metal | iso_flash_decode_p1_b3.hdr.metal | query:f,k_co
 iso_flash_decode_symv_p1.metal | iso_flash_decode_p1_b4.hdr.metal | query:f,k_codes:u,k_scales:f,k_norms:f,v_codes:u,v_scales:f,v_norms:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
 isoquant_quantize_iso3.metal | isoquant_iso3.hdr.metal | inp:f,n_groups:u,codes_out:u,scales_out:f,norms_out:f
 isoquant_dequantize_iso3.metal | isoquant_iso3.hdr.metal | codes_in:u,scales_in:f,norms_in:f,n_groups:u,out:f
+isoquant_quantize_iso4.metal | isoquant_iso4.hdr.metal | inp:f,n_groups:u,codes_out:u,scales_out:f,norms_out:f
+isoquant_dequantize_iso4.metal | isoquant_iso4.hdr.metal | codes_in:u,scales_in:f,norms_in:f,n_groups:u,out:f
 k8vturbo3_quantize.metal | ../k8vturbo3_header.metal | inp:f,codes:u,scales:f
-k8vturbo3_dequantize.metal | ../k8vturbo3_header.metal | codes:u,scales:f,out:f
+k8vturbo3_dequantize.metal | ../k8vturbo3_header.metal | codes:u,scales:f,out:f | OutT=float
 planar_flash_decode_p1.metal | planar_flash_decode_p1.hdr.metal | query:f,k_codes:u,k_scales:f,k_rot32:u,v_flat:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
 # Codec-agnostic flash-decode pass-2 LSE merge; shared by the planar, rotor and
 # iso flash-decode dispatchers (each registers its own kernel name over this
@@ -47,7 +61,12 @@ planarquant_quantize_v3.metal | planarquant_v3.hdr.metal | inp:f,codes:u,scales:
 planarquant_dequantize_v3.metal | planarquant_v3.hdr.metal | codes:u,scales:f,rot32:u,out:f
 q8_fused_qk.metal | - | query:f,codes:u,scales:f,mask:f,scale_arr:f,dims:u,out:f
 q8_quantize.metal | - | inp:f,codes:u,scales:f
-q8_dequantize.metal | - | codes:u,scales:f,out:f
+q8_dequantize.metal | - | codes:u,scales:f,out:f | OutT=float
+# NOT a codec kernel: the positive control for the shader-validation gate. It
+# stores out of bounds on purpose, which the Metal compiler accepts — only the
+# runtime validator catches it — so probing it checks syntax exactly like any
+# other body.
+shader_validation_canary.metal | - | inp:f,out:f
 # No rot_k_fwht_quantize_d32: a 32-element row is shorter than the affine group size
 # (64), so the kernel's per-group SMEM would be a zero-length array — MSL that does not
 # compile. That shape is rejected in Rust (build_fwht_quantize_body returns Err) and the
@@ -86,15 +105,15 @@ rotorquant_dequantize_rotor4.metal | rotorquant_rotor4.hdr.metal | codes_in:u,sc
 sparse_v.metal | sparse_v.hdr.metal | probs:f,v_codes:u,v_scales:f,v_biases:f,params:u,out:f
 tcq_v_quantize.metal | ../tcq_v_header.metal | inp:f,codes:u,scales:f
 turbo2_v_quantize.metal | ../turbo2_v_header.metal | inp:f,codes:u,scales:f
-turbo2_v_dequantize.metal | ../turbo2_v_header.metal | codes:u,scales:f,out:f
+turbo2_v_dequantize.metal | ../turbo2_v_header.metal | codes:u,scales:f,out:f | OutT=float
 turbo_flash_p1.metal | ../turbo_flash_header.metal | q_flat:f,k_codes:u,k_scales:f,v_codes:u,v_scales:f,mask_flat:f,params_p1:u,partial_out:f,partial_ms:f
 turbo_flash_p2.metal | ../turbo_flash_header.metal | partial_out:f,partial_ms:f,params_p2:u,dst:f
 turbo_k3_fused_qk.metal | ../turbo_k3_fused_qk_header.metal | query:f,codes:u,scales:f,mask:f,scale_arr:f,dims:u,out:f
 turbo_k4_fused_qk.metal | ../turbo_k4_fused_qk_header.metal | query:f,codes:u,scales:f,mask:f,scale_arr:f,dims:u,out:f
 turboquant_quantize.metal | ../turboquant_header.metal | inp:f,codes:u,scales:f
-turboquant_dequantize.metal | ../turboquant_header.metal | codes:u,scales:f,out:f
+turboquant_dequantize.metal | ../turboquant_header.metal | codes:u,scales:f,out:f | OutT=float
 turboquant_quantize_cb_buf.metal | - | inp:f,cb:f,codes:u,scales:f
-turboquant_dequantize_cb_buf.metal | - | codes:u,scales:f,cb:f,out:f
+turboquant_dequantize_cb_buf.metal | - | codes:u,scales:f,cb:f,out:f | OutT=float
 sparse_attn_phase1_score.metal | sparse_attn_phase1_score.hdr.metal | query:f,k_codes:u,k_scales:f,k_rot32:u,scale_arr:f,dims:u,tile_top_scores:f,tile_top_indices:u,all_scores:f
 sparse_attn_phase2_attend.metal | sparse_attn_phase2_attend.hdr.metal | query:f,k_codes:u,k_scales:f,k_rot32:u,v_flat:f,all_scores:f,head_threshold:f,scale_arr:f,dims:u,partial_o:f,tile_lse:f
 sparse_attn_phase2_merge.metal | - | partial_o:f,tile_lse:f,dims_p2:u,dst:f

@@ -106,3 +106,23 @@ fn iso_v4_msl_matches_cpu_within_eps() {
         "iso4 CPU vs MSL",
     );
 }
+
+/// Probe header snapshot must equal what the builder emits.
+///
+/// `make check-metal-compiles` prepends this snapshot to the iso4 kernel
+/// bodies. A builder that changes a constant's value, or drops one, without the
+/// snapshot being refreshed leaves the probe compiling text production no
+/// longer emits — the gate would keep passing while checking the wrong thing.
+/// Equality here turns that drift into a hard failure.
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+#[test]
+fn hdr_probe_snapshot_matches_builder() {
+    assert_eq!(
+        kernel_header_iso4().expect("iso4 header builder"),
+        include_str!("metal/probes/isoquant_iso4.hdr.metal"),
+        "stale snapshot: refresh metal/probes/isoquant_iso4.hdr.metal"
+    );
+}
