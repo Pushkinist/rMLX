@@ -40,6 +40,16 @@
 #[cfg(test)]
 pub(crate) mod test_utils;
 
+/// Rotation-quality gates: incoherence reduction and outlier-fixture cosine for
+/// every codec family that applies an orthogonal transform.
+#[cfg(test)]
+mod rotation_fidelity_tests;
+
+/// Rate-distortion reference: SQNR of every scalar-codebook codec against the
+/// fixed-rate Lloyd-Max Gaussian anchor for its bit width.
+#[cfg(test)]
+mod rate_distortion_tests;
+
 pub(crate) mod bytes;
 pub mod clifford;
 pub(crate) mod flash_decode_common;
