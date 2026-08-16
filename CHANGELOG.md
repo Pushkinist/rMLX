@@ -76,7 +76,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kernel is deleted and the V side now always goes through `quantized_matmul`.
   Affected every `--kv-quant mixed_*` / `rot_k_*` cell on every architecture
   past 8 192 tokens, including the arch default on `Qwen3ForCausalLM`; below
-  that threshold nothing changes and temp=0 token digests are byte-identical.
+  that threshold this change alone moves nothing and temp=0 token digests are
+  byte-identical (the truncation entry below does move some short-context
+  digests, so the shipped build is not digest-identical at short context).
   At 16k the fix takes Ternary-Bonsai-8B from 75.2 to 10.0 ms per decode step
   (7.3× → 0.97× of `none`) and gemma-4-e2b from 18.4 to 8.2 ms (2.2× → 1.00×).
   A decode-path gate now checks `mixed_quantized_sdpa` against an oracle built
@@ -84,6 +86,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The kernel's own tests could not have caught this: one reimplemented the
   kernel's dequant formula as its "reference CPU", and the other used codes
   equal to the midpoint, where the offset is exactly zero.
+- **Attention probabilities below 1e-6 are no longer truncated to zero before
+  the V matmul.** The truncation existed to feed the sparse-V kernel above, on
+  the theory that a zeroed row costs nothing downstream. `quantized_matmul` is
+  opaque and reads every V row regardless, so it bought no bandwidth while
+  dropping attention mass it never renormalised. Against the untruncated oracle
+  it cost 28–73× the relative L2 error (6.5e-5–1.7e-4 with it, 1.1e-6–2.4e-6
+  without) across GQA, single-KV-head and MHA shapes. It is also a small decode
+  speedup (two fewer ops per layer per step): Ternary-Bonsai-8B at 16k goes
+  10.011 → 9.756 ms per step.
+
+  Unlike the kernel removal above, this changes the V-matmul input at *every*
+  context length, not only past 8 192. Whether that moves the sampled ids is
+  shape-dependent: measured changed on Ternary-Bonsai-8B at 3 833 and 15 692
+  context tokens and gemma-4-e2b at 4 180, and measured unchanged on
+  Ternary-Bonsai-8B at 7 802 and gemma-4-e2b at 17 211, and unchanged on the
+  32-token shape pinned by `bonsai_8b_mixed_k8g64_v4g64.golden.txt`.
 - **The fused-QK dispatch table listed eight codecs it could never serve, and
   a strict-mode test asserted four of them dispatch.** The head-major fused-QK
   shadow is seeded by re-encoding the bf16 K mirror, so a codec only reaches

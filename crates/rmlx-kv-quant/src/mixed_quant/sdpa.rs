@@ -10,23 +10,11 @@ use crate::rot_k_msl::rot_k_fwht_rotate_gpu;
 use rmlx_core::error::{Error, Result};
 use rmlx_core::DispatchPolicy;
 use rmlx_mlx::{
-    add, dequantize, expand_dims, greater_equal, multiply, quantized_matmul, scalar_f32,
-    scaled_dot_product_attention, softmax_precise, where_cond, Array, Device, Dtype,
+    add, dequantize, expand_dims, multiply, quantized_matmul, scalar_f32,
+    scaled_dot_product_attention, softmax_precise, Array, Device, Dtype,
 };
 
 use super::state::MixedTuple;
-
-// ── Sparse-V threshold ────────────────────────────────────────────────────────
-
-/// Threshold below which a softmax probability is treated as zero for V-row
-/// dequant (sparse-V cheap path).
-///
-/// Hardcoded `1e-6` (`RMLX_SPARSE_V_THRESHOLD` env var removed in PASS 3).
-/// Matches TheTom `experimental_decode_speed_tests` `TURBO_SPARSE_V` default.
-#[inline]
-fn sparse_v_threshold() -> f32 {
-    1e-6_f32
-}
 
 /// Byte-for-byte port of `mixed_quantized_scaled_dot_product_attention`
 /// (`mlx_lm/models/base.py:108-157`).
@@ -145,34 +133,13 @@ pub fn mixed_quantized_sdpa(
         None => scores,
     };
 
-    let probs_raw = softmax_precise(&scores_masked, -1, device)?;
-
-    // Sparse-V cheap path — zero out softmax probs below threshold before the
-    // V-row dequant. Rows with zero weight are skipped by `quantized_matmul`
-    // without altering any non-zero rows.
-    let probs = {
-        let threshold = sparse_v_threshold();
-        if threshold > 0.0 {
-            let t_arr = scalar_f32(threshold);
-            let t_arr = if probs_raw.dtype() == Dtype::F32 {
-                t_arr
-            } else {
-                t_arr.astype(probs_raw.dtype(), device)?
-            };
-            let zeros_arr = scalar_f32(0.0);
-            let zeros_arr = if probs_raw.dtype() == Dtype::F32 {
-                zeros_arr
-            } else {
-                zeros_arr.astype(probs_raw.dtype(), device)?
-            };
-            // mask = probs >= threshold (bool/U8)
-            let mask = greater_equal(&probs_raw, &t_arr, device)?;
-            // probs_sparse = where(mask, probs, 0)
-            where_cond(&mask, &probs_raw, &zeros_arr, device)?
-        } else {
-            probs_raw
-        }
-    };
+    // The full softmax distribution goes into the V matmul. An earlier revision
+    // truncated probabilities below 1e-6 to zero here, on the theory that a
+    // zeroed row costs nothing downstream; `quantized_matmul` is opaque and
+    // reads every V row regardless, so the truncation bought no bandwidth while
+    // dropping attention mass that it never renormalised — an error that grows
+    // with context, which is the regime the codec exists for.
+    let probs = softmax_precise(&scores_masked, -1, device)?;
 
     let out = quantized_matmul(
         &probs,
