@@ -34,10 +34,18 @@ known limitations for every architecture the server can load.
 
 ## Overview
 
-All architectures are identified by the `architectures[0]` field in
-`config.json`. The loader reads this field at startup (`arch.rs:KNOWN_ARCHS`)
-and dispatches to the matching backend. Unknown values are rejected with an
-error before any weight I/O occurs.
+Architecture **dispatch** keys on the `architectures[0]` field in `config.json`.
+The loader reads this field at startup (`arch.rs:KNOWN_ARCHS`) and picks the
+matching backend. Unknown values are rejected with an error before any weight
+I/O occurs.
+
+That field is a declaration, not a verified fact, and one arch string can cover
+several checkpoint shapes. Where a backend resolves the real shape from the
+weights (the Qwen3.5 dense-vs-MoE split), the authoritative identity is
+`Architecture::arch_class()` on the loaded model, not the declared string —
+`load_model` warns when the two differ. Anything that must be *correct* about
+the model rather than merely route to it (KV codec guards, per-arch caches,
+metrics identity) reads the resolved class.
 
 The generative architectures (`Qwen2`, `Qwen3`, `Qwen3_5Moe`, `Qwen3VlMoe`,
 `Gemma3`, `Gemma4`, `Laguna`) implement `Architecture::generate_greedy` and are
@@ -285,6 +293,15 @@ shard headers for the embedding witness, and selects each layer's MLP block
 (dense SwiGLU vs sparse MoE) by which tensors are present
 (`mlp.switch_mlp.*` → MoE; `mlp.{gate,up,down}_proj` → dense). `num_experts`
 defaults to 0 for dense configs that omit the MoE fields.
+
+**Declared vs resolved.** Because dispatch ignores the declaration, the two can
+disagree. `Architecture::arch_class()` reports the **resolved** class: for this
+variant it asks `has_sparse_moe_layers()` instead of echoing one fixed string,
+so a dense snapshot is labelled `Qwen3_5ForConditionalGeneration` in tracing,
+bench headers and metrics rows rather than being reported as MoE. `load_model`
+warns with `declared_arch` + `resolved_arch` when they differ. Safety
+predicates — the Qwen-MoE K-side codec guard above all — must use the resolved
+class; see `docs/KV_QUANT.md` § "What the guard keys off".
 
 ### Config schema
 
@@ -1445,6 +1462,9 @@ Run `rmlx info --list-cache-types` for all valid tags.
 ### Constraints
 
 - K-side bits < 8 rejected for `Qwen3_5MoeForConditionalGeneration` (PPL disaster).
+  Keyed on the **resolved** arch, so a checkpoint declaring the dense name while
+  shipping `switch_mlp` tensors is rejected too; a genuinely dense Qwen3.5 model
+  keeps these codecs.
 - 2-bit K rejected for all architectures (incoherent attention output).
 - `tq4` / `planar4` are V-side only codecs.
 - `rot_k` is a K-side only codec; requires power-of-two `head_dim`.

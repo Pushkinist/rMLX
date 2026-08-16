@@ -17,7 +17,7 @@ use rmlx_core::error::Result;
 use rmlx_mlx::{Array, Device, Dtype};
 
 use super::config::Qwen3_5MoeConfig;
-use super::decoder_layer::DecoderLayer;
+use super::decoder_layer::{DecoderLayer, MlpBlock};
 use super::layers::{Embedding, Linear, RmsNorm};
 use rmlx_kv_quant::{KvCache, LinearAttnCache};
 
@@ -80,6 +80,20 @@ pub struct Qwen3_5MoeText {
 }
 
 impl Qwen3_5MoeText {
+    /// Whether any decoder layer actually resolved to a sparse-MoE MLP block.
+    ///
+    /// This is the *built* truth, not a declaration: the loader selects
+    /// dense-vs-MoE per layer from the checkpoint's tensor witness
+    /// (`mlp.switch_mlp.gate_proj.weight`), so a config that names the wrong
+    /// architecture cannot change the answer. Both Qwen3.5 arch strings share
+    /// this one model struct, so callers that need to distinguish sparse MoE
+    /// from dense SwiGLU must ask here rather than read `architectures[0]`.
+    pub fn has_sparse_moe_layers(&self) -> bool {
+        self.layers
+            .iter()
+            .any(|l| matches!(l.mlp, MlpBlock::Moe(_)))
+    }
+
     /// Full-sequence forward pass (no KV cache).
     /// Returns logits for the last position, shape `[1, 1, vocab_size]`.
     pub fn forward_seq(&self, ids: &[u32], device: Device) -> Result<Array> {

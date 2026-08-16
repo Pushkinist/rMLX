@@ -216,6 +216,23 @@ pub fn load_model(model_dir: &Path, _device: Device, opts: &LoadOpts) -> Result<
     let dequant_ms = t_dequant_start.elapsed().as_millis() as u64;
     tracing::debug!(dequant_ms, "arch::load_model: dequant phase complete");
 
+    // The checkpoint declares an architecture; the loader resolves one from the
+    // tensors it actually found. When they disagree, every predicate still
+    // keyed on the declaration is reasoning about a model that was not built —
+    // say so loudly and name both, because the declaration is model-side data
+    // that nothing validates.
+    let resolved_arch = arch.arch_class();
+    if resolved_arch != arch_str {
+        tracing::warn!(
+            declared_arch = arch_str,
+            resolved_arch,
+            model_dir = %model_dir.display(),
+            "declared architecture does not match the one the loader resolved from the \
+             checkpoint tensors — the resolved value is authoritative; any check still \
+             keyed on the declared name is unreliable for this snapshot"
+        );
+    }
+
     // -- Phase 3: gpu_residency -----------------------------------------------
     // MLX dispatches lazily -- arrays are not pushed to GPU during load.
     // gpu_residency_ms is documented as 0 (see LoadPhases doc).

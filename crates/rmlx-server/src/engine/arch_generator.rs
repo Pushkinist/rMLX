@@ -419,7 +419,11 @@ impl ArchGenerator {
         // the spiller / hydrator are never installed and decode is
         // byte-identical to the RAM-only path. The arch name selects the right
         // per-arch PROMPT_CACHE; archs without a spill/hydrate impl are skipped.
-        let arch_name = cfg.architectures.first().map_or("", String::as_str);
+        // Resolved, not declared: the per-arch PROMPT_CACHE and the layout-key
+        // salt must describe the model that was built. A snapshot whose
+        // declaration disagrees would otherwise select the wrong cache (or
+        // none) while decode runs the other architecture's layout.
+        let arch_name = model.arch_class();
         // layout-key inputs come straight from the loaded model so the
         // SSD tier salts every row with `(arch, n_layers, n_kv_heads, head_dim,
         // kv_quant)`. `attach_at_load` is a no-op when the tier is OFF, so

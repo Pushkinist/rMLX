@@ -1470,6 +1470,11 @@ fn validate_resolved_non_moe_rotor_k_side_passes() {
     ] {
         validate_resolved("Gemma4ForConditionalGeneration", &kq).unwrap();
         validate_resolved("Qwen3ForCausalLM", &kq).unwrap();
+        // Dense Qwen3.5 shares a loader and an `Architecture` variant with the
+        // sparse-MoE path, so this string is a value `arch_class()` can now
+        // return. The measured PPL disaster is a sparse-MoE result; a dense
+        // model keeps these codecs.
+        validate_resolved("Qwen3_5ForConditionalGeneration", &kq).unwrap();
     }
 }
 

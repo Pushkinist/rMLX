@@ -3995,11 +3995,45 @@ inspected and confirmed to reject K-side ≤4-bit codecs on Qwen MoE arches:
 
 None of these K-side ≤4-bit codecs are selected by `resolve_default` for
 Qwen MoE — the `Qwen3_5MoeForConditionalGeneration` arm always returns
-`K8V8`. The guard is intact; no weakening detected during the codec adds.
+`K8V8`. The rejection table itself has not been weakened by the codec adds.
+
+#### What the guard keys off
+
+`validate_resolved` takes an architecture *string*, and which string it is
+handed decides whether the guard can fire at all.
+
+Both Qwen3.5 arch strings (`Qwen3_5MoeForConditionalGeneration` and the dense
+`Qwen3_5ForConditionalGeneration`) load through one loader into one
+`Architecture` variant. The loader does **not** believe the declaration: it
+selects dense-vs-sparse-MoE per layer from the tensor witness
+`mlp.switch_mlp.gate_proj.weight`. So `architectures[0]` and the model that
+actually gets built can disagree, and a checkpoint declaring the dense name
+while shipping MoE tensors used to run every codec in the list above to
+completion — no error, only wrong output.
+
+The enforcing check is therefore keyed on the **resolved** architecture:
+
+- `Architecture::arch_class()` reports what the loader built. For the Qwen3.5
+  variant it asks `has_sparse_moe_layers()` rather than echoing a fixed string.
+- `Architecture::validate_kv_quant()` re-runs the table against that resolved
+  class at the `generate_greedy` / `generate_image` seam — after load, before
+  any KV cache exists. A declaration cannot route around it, and a quant that
+  arrives after startup (a per-request `kv_quant` override, which the server's
+  resolver does not validate) is checked on the same terms as a launch flag.
+- `load_model` emits a `warn!` naming `declared_arch` and `resolved_arch` when
+  they differ, because that mismatch invalidates every predicate still keyed on
+  the declared name.
+
+The startup resolvers (`rmlx-cli` `resolve_kv_quant`, the server's
+`resolve_kv_quant_for_load`) still read `architectures[0]` — they run before
+the model is loaded, so it is the only value available. They stay as the
+fast-feedback path (`exit 78` at launch); they are no longer the only check.
 
 Empirical positive test: `validate_resolved_qwen_moe_low_k_bits_rejected_post_decompose`
 in `crates/rmlx-models/src/kv_cache/cache_type_tests.rs` verifies the
-runtime rejection path.
+runtime rejection path. The declared-vs-resolved bypass is covered by
+`crates/rmlx-models/tests/resolved_arch_class.rs`, which builds a snapshot
+that declares dense while shipping MoE tensors and asserts the guard fires.
 
 ---
 
