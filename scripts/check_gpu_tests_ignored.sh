@@ -52,7 +52,7 @@
 #   * A helper defined in a NON-scanned regular source file (e.g.
 #     `crates/rmlx-models/src/paroquant_msl.rs`) reached from its sibling
 #     `*_tests.rs` via `use super::*` is not traced — only the crate's SCANNED
-#     test roots are in the graph. (The present instance, `kernel_rpt1()`,
+#     test roots are in the graph. (The present instance, `paro_rotate_kernel()`,
 #     builds a `MetalKernel` and never names `Device::Gpu`, so no gate shape
 #     matches it regardless of reachability.)
 #   * An UNqualified cross-file call resolved through a glob import

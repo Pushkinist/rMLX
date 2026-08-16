@@ -42,11 +42,15 @@
 //!
 //! Output: `[batch, hidden]` rotated activations in the same dtype as input.
 //!
-//! # Template parameters (baked at kernel build time)
+//! # Template parameters (MLX template ints, supplied per dispatch)
 //!
 //! - `ROWS_PER_TILE`: rows processed per threadgroup tile (4 for batch > 1, 1 for decode).
 //! - `MAX_KROT`: maximum krot supported (must be >= actual krot; 16 is safe upper bound).
 //! - `MAX_GROUP_SIZE`: maximum group_size (must be >= actual group_size; 256 safe upper bound).
+//!
+//! MLX instantiates one kernel variant per distinct tuple, so all three are
+//! compile-time constants inside the body — which two of them must be, since
+//! they size arrays.
 //!
 //! # Single-process GPU claim
 //!
@@ -63,8 +67,9 @@ use rmlx_mlx::{Array, Device, Dtype};
 
 /// MSL kernel source for the pairwise Givens rotation.
 ///
-/// Template parameters substituted at build time:
-/// `{RPT}`, `{MK}`, `{MGS}`.
+/// The body lives in a `.metal` file so `make check-metal-compiles` and
+/// `make check-metal-format` see it; `include_str!` embeds it at compile time,
+/// so the binary still carries no runtime data files.
 ///
 /// Ported from `z-lab/paroquant/paroquant/kernels/metal/rotation.metal`.
 /// Changes from upstream:
@@ -74,74 +79,12 @@ use rmlx_mlx::{Array, Device, Dtype};
 ///   transcendental math.
 /// - `params` is a flat I32 array `[batch, hidden, krot, group_size]` (same as
 ///   upstream).
-/// - Template params are Rust `const` substituted strings (not Python .format).
-const KERNEL_SOURCE: &str = r"
-    constexpr int ROWS_PER_TILE  = {RPT};
-    constexpr int MAX_KROT       = {MK};
-    constexpr int MAX_GROUP_SIZE = {MGS};
-
-    const int batch_size  = params[0];
-    const int hidden_size = params[1];
-    const int krot        = params[2];
-    const int group_size  = params[3];
-
-    const int half_gs     = group_size / 2;
-    const int half_hidden = hidden_size / 2;
-
-    const int tile_idx  = threadgroup_position_in_grid.x;
-    const int group_idx = threadgroup_position_in_grid.y;
-    const int tid       = thread_index_in_threadgroup;
-
-    if (tid >= half_gs) return;
-
-    float cos_vals[MAX_KROT], sin_vals[MAX_KROT];
-    int   pair_vals[MAX_KROT];
-
-    for (int k = 0; k < krot; k++) {
-        int idx = k * half_hidden + group_idx * half_gs + tid;
-        cos_vals[k]  = float(cos_theta[idx]);
-        sin_vals[k]  = float(sin_theta[idx]);
-        pair_vals[k] = int(packed_pairs[idx]);
-    }
-
-    threadgroup float tile[MAX_GROUP_SIZE * ROWS_PER_TILE];
-
-    const int ch_lo = group_idx * group_size + tid;
-    const int ch_hi = ch_lo + half_gs;
-    float scale_lo = float(channel_scales[ch_lo]);
-    float scale_hi = float(channel_scales[ch_hi]);
-
-    for (int r = 0; r < ROWS_PER_TILE; r++) {
-        int row = tile_idx * ROWS_PER_TILE + r;
-        if (row < batch_size) {
-            tile[tid * ROWS_PER_TILE + r]             = float(x[row * hidden_size + ch_lo]) * scale_lo;
-            tile[(tid + half_gs) * ROWS_PER_TILE + r] = float(x[row * hidden_size + ch_hi]) * scale_hi;
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (int k = 0; k < krot; k++) {
-        int i_local = pair_vals[k] & 0xFFFF;
-        int j_local = pair_vals[k] >> 16;
-        float c = cos_vals[k], s = sin_vals[k];
-
-        for (int m = 0; m < ROWS_PER_TILE; m++) {
-            float a = tile[i_local * ROWS_PER_TILE + m];
-            float b = tile[j_local * ROWS_PER_TILE + m];
-            tile[i_local * ROWS_PER_TILE + m] = a * c + b * s;
-            tile[j_local * ROWS_PER_TILE + m] = b * c - a * s;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    for (int r = 0; r < ROWS_PER_TILE; r++) {
-        int row = tile_idx * ROWS_PER_TILE + r;
-        if (row < batch_size) {
-            out[row * hidden_size + ch_lo] = InT(tile[tid * ROWS_PER_TILE + r]);
-            out[row * hidden_size + ch_hi] = InT(tile[(tid + half_gs) * ROWS_PER_TILE + r]);
-        }
-    }
-";
+/// - `ROWS_PER_TILE` / `MAX_KROT` / `MAX_GROUP_SIZE` are MLX template ints
+///   supplied at dispatch, not text substituted into the source. MLX
+///   instantiates one variant per distinct tuple, so the emitted constants are
+///   the same as text substitution produced, and the Rust consts below stay the
+///   single source of truth for the bounds the validation checks use.
+const KERNEL_SOURCE: &str = include_str!("metal/paroquant_rotate.metal");
 
 // ── Template instantiation ────────────────────────────────────────────────────
 
@@ -152,51 +95,32 @@ const MAX_KROT: usize = 16;
 /// MAX_GROUP_SIZE is 256 — safe upper bound. Qwen3.5 uses group_size=128.
 const MAX_GROUP_SIZE: usize = 256;
 
-/// Build the MSL kernel source by substituting template parameters.
-fn build_kernel_source(rows_per_tile: usize) -> String {
-    KERNEL_SOURCE
-        .replace("{RPT}", &rows_per_tile.to_string())
-        .replace("{MK}", &MAX_KROT.to_string())
-        .replace("{MGS}", &MAX_GROUP_SIZE.to_string())
-}
+// ── Kernel singleton ──────────────────────────────────────────────────────────
 
-// ── Kernel singletons ─────────────────────────────────────────────────────────
+/// One registration; `ROWS_PER_TILE` selects the variant per dispatch (1 for a
+/// single-row decode step, 4 for batch / prefill).
+static PARO_ROTATE_KERNEL: OnceLock<Result<MetalKernel>> = OnceLock::new();
 
-/// ROWS_PER_TILE=1: used for single-row decode steps.
-static KERNEL_RPT1: OnceLock<Result<MetalKernel>> = OnceLock::new();
-/// ROWS_PER_TILE=4: used for batch or prefill steps (rows > 1).
-static KERNEL_RPT4: OnceLock<Result<MetalKernel>> = OnceLock::new();
-
-fn build_kernel(rpt: usize) -> Result<MetalKernel> {
-    let source = build_kernel_source(rpt);
-    MetalKernel::new(
-        &format!("rmlx_paro_rotate_r{rpt}"),
-        "",
-        &source,
-        &[
-            "x",
-            "packed_pairs",
-            "cos_theta",
-            "sin_theta",
-            "channel_scales",
-            "params",
-        ],
-        &["out"],
-    )
-}
-
-fn kernel_rpt1() -> Result<&'static MetalKernel> {
-    KERNEL_RPT1
-        .get_or_init(|| build_kernel(1))
+fn paro_rotate_kernel() -> Result<&'static MetalKernel> {
+    PARO_ROTATE_KERNEL
+        .get_or_init(|| {
+            MetalKernel::new(
+                "rmlx_paro_rotate",
+                "", // no header — constants arrive as template ints
+                KERNEL_SOURCE,
+                &[
+                    "x",
+                    "packed_pairs",
+                    "cos_theta",
+                    "sin_theta",
+                    "channel_scales",
+                    "params",
+                ],
+                &["out"],
+            )
+        })
         .as_ref()
-        .map_err(|e| Error::Mlx(format!("paro_rotate_r1 kernel init: {e}")))
-}
-
-fn kernel_rpt4() -> Result<&'static MetalKernel> {
-    KERNEL_RPT4
-        .get_or_init(|| build_kernel(4))
-        .as_ref()
-        .map_err(|e| Error::Mlx(format!("paro_rotate_r4 kernel init: {e}")))
+        .map_err(|e| Error::Mlx(format!("paro_rotate kernel init: {e}")))
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -336,11 +260,7 @@ pub fn paro_rotate_gpu(
 
     // Pick ROWS_PER_TILE: 1 for decode (batch=1), 4 for prefill.
     let rpt: usize = if batch <= 1 { 1 } else { 4 };
-    let kernel = if rpt == 1 {
-        kernel_rpt1()?
-    } else {
-        kernel_rpt4()?
-    };
+    let kernel = paro_rotate_kernel()?;
 
     // params: [batch, hidden, krot, group_size] I32.
     let params_data: [i32; 4] = [batch as i32, hidden as i32, krot as i32, group_size as i32];
@@ -368,6 +288,9 @@ pub fn paro_rotate_gpu(
     invoke.add_input(&params)?;
     invoke.add_output_shape(&out_shape, out_dtype)?;
     invoke.set_template_dtype("InT", out_dtype)?;
+    invoke.set_template_int("ROWS_PER_TILE", rpt as i32)?;
+    invoke.set_template_int("MAX_KROT", MAX_KROT as i32)?;
+    invoke.set_template_int("MAX_GROUP_SIZE", MAX_GROUP_SIZE as i32)?;
 
     // MLX metal_kernel uses dispatchThreads (total threads, not threadgroup counts).
     // Python: grid = (ceil(batch/rpt) * half_gs, num_groups, 1), threadgroup=(half_gs,1,1).
@@ -379,6 +302,14 @@ pub fn paro_rotate_gpu(
     invoke.set_thread_group(half_gs as i32, 1, 1)?;
 
     let mut outputs = kernel.apply(invoke, device)?;
+    tracing::trace!(
+        batch,
+        hidden,
+        krot,
+        group_size,
+        rows_per_tile = rpt,
+        "paro rotate dispatched"
+    );
     if outputs.is_empty() {
         return Err(Error::Mlx("paro_rotate_gpu: expected 1 output".to_owned()));
     }

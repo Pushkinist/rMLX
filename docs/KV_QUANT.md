@@ -1961,11 +1961,14 @@ measures mean = 0.998638, min = 0.998092 (group_size=4, 32 tokens × 128-dim,
 lower dynamic range than calibrated real KV (see iso3 note above).
 
 **MSL kernel.** `crates/rmlx-kv-quant/src/isoquant_msl_v4.rs`
-ships the sibling 4-bit kernel pair `iso_quantize_v4_gpu` /
+dispatches the sibling 4-bit kernel pair `iso_quantize_v4_gpu` /
 `iso_dequantize_v4_gpu`, with the per-(token, group) thread layout, atomic-OR
 pack via `(idx & 0xF) << shift`, and a dense 8-vals/u32 boundary table (15
-mid-points derived from `lloyd_gaussian_codebook(4)`). The encode side is
-wired into the three iso4 update paths (`update_iso4`,
+mid-points derived from `lloyd_gaussian_codebook(4)`). The bodies live in
+`src/metal/isoquant_quantize_iso4.metal` and
+`src/metal/isoquant_dequantize_iso4.metal`, gated by `make check-metal-compiles`
+against the captured header snapshot `src/metal/probes/isoquant_iso4.hdr.metal`.
+The encode side is wired into the three iso4 update paths (`update_iso4`,
 `update_iso4_sym`, `update_iso_k_only_4`) under
 `device == Device::Gpu`; the CPU codec remains the fallback.
 

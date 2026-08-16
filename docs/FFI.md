@@ -958,6 +958,24 @@ input/output `mlx_vector_array` handles, dispatches via
 `mlx_fast_metal_kernel_apply`, extracts output `Array` handles, and returns
 them.
 
+**MLX JIT language version.** MLX compiles custom kernel bodies at **Metal
+4.0**. Observed, not inferred: `rmlx_nax_probe_gpu`
+(`crates/rmlx-mlx/src/metal_kernel_tests.rs`, run by `make gpu-test`) reads
+`__METAL_VERSION__` from inside a JIT'd body and gets `400`, with
+`__HAVE_TENSOR__ == 1` and a `constexpr matmul2d_descriptor(8, 32, 128, …)`
+instantiating to `.m == 8`. The third value is the load-bearing one: it proves
+the `<MetalPerformancePrimitives/…>` include path survives MLX's source
+wrapping, not merely that the macro is defined.
+
+The consequence: `mpp::tensor_ops` **is** reachable from an rMLX kernel body, so
+a prefill GEMM with a custom epilogue is a legitimate design option rather than
+something gated on an MLX change. mlx-c exposes no compile-options surface (the
+kernel config is seven setters in `mlx/c/fast.h`), so this is observed, never
+forced — re-run the probe after an MLX bump rather than assuming it holds.
+
+The compile gate mirrors this: it compiles every body at `metal3.0` **and**
+`metal4.0`. See "MSL gates" below.
+
 **Lazy compile.** `MetalKernel::new` only *registers* the kernel
 with MLX; the MSL → Metal pipeline compiles on the **first `apply()`
 dispatch**, not at `new`. For KV codecs this means the shader cold-compile lands
@@ -1020,22 +1038,27 @@ non-zero, corrupting the result.
 
 ### Where MSL lives
 
-MSL source is split across two crates:
+Every MSL kernel body lives in a `.metal` file, never in a Rust string literal.
+Three directories hold them, one per crate that ships MSL:
 
-| Crate | Modules | Scope |
-|---|---|---|
-| `rmlx-kv-quant` | `src/*_msl.rs`, `src/sparse_attn/*_msl.rs` | Every KV-cache codec (q8, TurboQuant, PlanarQuant, IsoQuant, RotorQuant, rot-K, TCQ, TurboFlash, fused-QK, sparse-attn phases) |
-| `rmlx-models` | `paroquant_msl.rs`, `gated_delta_msl.rs` | Per-arch kernels — weight-side ParoQuant and GatedDeltaNet. Not KV codecs. |
+| Directory | Scope |
+|---|---|
+| `crates/rmlx-kv-quant/src/metal/` | Every KV-cache codec (q8, TurboQuant, PlanarQuant, IsoQuant, RotorQuant, rot-K, TCQ, TurboFlash, fused-QK, sparse-attn phases), dispatched from `src/*_msl.rs` and `src/sparse_attn/*_msl.rs` |
+| `crates/rmlx-models/src/metal/` | Per-arch kernels — weight-side ParoQuant and GatedDeltaNet, dispatched from `paroquant_msl.rs` / `gated_delta_msl.rs`. Not KV codecs. |
+| `crates/rmlx-mlx/src/metal/` | The MLX-JIT language-version probe. Not a production kernel. |
+
+The gates are scoped by **directory, not crate**: a `.metal` file is gated by
+where it lives, wherever its Rust dispatcher sits. That distinction is the one
+that matters — a kernel inside a gated crate but outside its `metal/` directory
+is not gated.
 
 Each module registers its kernels once as `OnceLock<MetalKernel>` singletons
 on first use, and its MSL body matches the CPU reference path in the
 corresponding `*quant.rs` file.
 
-### `.metal` files + `include_str!` (KV codecs)
+### `.metal` files + `include_str!`
 
-KV kernel bodies live in **`.metal` files** under
-`crates/rmlx-kv-quant/src/metal/`, not in Rust string literals. They are
-embedded at **compile time**:
+Bodies are embedded at **compile time**:
 
 ```rust
 const QUANTIZE_SOURCE: &str = include_str!("metal/q8_quantize.metal");
@@ -1056,30 +1079,76 @@ supplies the function signature and buffer declarations at dispatch. The
   are derived data, not source text. The kernel is assembled at registration as
   `MetalKernel::new(name, header, include_str!("<body>.metal"), ..)`.
 
-**Parameterised bodies.** Where a body varies by a codec parameter, each
-variant gets its own `.metal` file and the builder selects between them
-(`planar_fused_qk_b3.metal` / `_b4.metal`;
-`rot_k_fwht_quantize_d{32..512}.metal`).
-The body text stays literal — parameters are not templated back into it at
-runtime.
+An `#include` belongs in the header, never the body: MLX splices the body into
+the generated kernel *function*, so an include there lands at function scope.
+
+**Parameterised bodies.** Two mechanisms, and the choice is not stylistic:
+
+- **One `.metal` file per variant**, selected by the builder
+  (`planar_fused_qk_b3.metal` / `_b4.metal`;
+  `rot_k_fwht_quantize_d{32..512}.metal`). Use this when the variants differ in
+  *code*, not just in a constant.
+- **MLX template arguments** — `set_template_int` / `set_template_dtype`, which
+  MLX instantiates per distinct tuple. Use this when the variants differ only by
+  a compile-time constant, as `gated_delta_step.metal` does for
+  `Dk`/`Dv`/`Hk`/`Hv` and `paroquant_rotate.metal` does for
+  `ROWS_PER_TILE`/`MAX_KROT`/`MAX_GROUP_SIZE`. It keeps the bound's single source
+  of truth in the Rust const that the validation checks already use.
+
+The body text is never mutated at runtime. A `.replace("{PLACEHOLDER}", ..)` over
+a kernel source is what a template argument is for, and it makes the file
+uncompilable by the gate.
 
 Adding a KV codec means adding a `.metal` decode kernel and a native compile
 test; see CLAUDE.md hard rule 10.
 
 ### MSL gates (`make ci`, enforced in CI)
 
-Two gates run over `crates/rmlx-kv-quant/src/metal/*.metal`.
+Two gates run over the three kernel directories listed above. The list is
+single-sourced in `scripts/metal_dirs.sh`, sourced by both gates and referenced
+by the `check-metal-format` pre-commit hook's trigger pattern; a crate that
+starts shipping MSL must be added there, since nothing else discovers it.
 
 | Target | Tool | Checks |
 |---|---|---|
-| `make check-metal-compiles` | `xcrun -sdk macosx metal` (full Xcode, not just the Command Line Tools) | Every KV kernel compiles natively, so an MSL syntax error surfaces at CI instead of on first GPU dispatch. |
-| `make check-metal-format` | `clang-format` (on `PATH` or via `xcrun -f clang-format` — it is not on `PATH` by default) | Every KV kernel is clang-format clean. MSL is a C++14 dialect; style is pinned by `src/metal/.clang-format`. |
+| `make check-metal-compiles` | `xcrun -sdk macosx metal` (full Xcode, not just the Command Line Tools) | Every kernel compiles natively at `-std=metal3.0` **and** `-std=metal4.0`, so an MSL syntax error surfaces at CI instead of on first GPU dispatch. Also fails if a `.metal` file is missing from its directory's manifest. |
+| `make check-metal-format` | `clang-format` (on `PATH` or via `xcrun -f clang-format` — it is not on `PATH` by default) | Every kernel is clang-format clean. MSL is a C++14 dialect; style is pinned by the `.clang-format` in each kernel directory. |
+
+**Two language versions, for two different reasons.** `metal4.0` is what
+production compiles at (see "MLX JIT language version" above). `metal3.0` is the
+floor, kept so newer syntax cannot creep in unnoticed. The second pass is what
+makes a `#if __HAVE_TENSOR__` kernel checkable at all: that macro is undefined
+below 4.0, so at `metal3.0` such a body compiles to an empty translation unit
+and the gate goes green having validated nothing. Such a body is therefore never
+compiled without the guard — it is checked for real, or reported as `SKIP` and
+counted, never quietly passed.
+
+The capability is probed by asserting the guard and the cooperative-tensor
+includes, not by testing that the driver accepts the `-std` flag. A toolchain
+that takes the flag but leaves `__HAVE_TENSOR__` undefined would otherwise
+compile a guarded body through its `#else` arm at *both* passes — the same
+vacuous pass, reached another way.
+
+**One toolchain policy, not two.** "This box cannot do X" gets the same answer
+whether X is the Metal compiler itself or the Metal 4 pass: hard failure under
+`--strict` (CI, which must never report green while checking less), and a loud
+notice plus a reduced run otherwise. A contributor on an older Xcode keeps a
+working `make ci`; what could not be checked is named on stdout and counted in
+the summary line. Splitting that rule would break the dev loop for everyone
+whose Xcode predates Metal 4, over one diagnostic kernel that ships nothing.
+
+**Manifest coverage is enforced.** Every `.metal` file in a gated directory must
+be named by that directory's `probes/kernels.manifest`, as a body or as a
+`../`-prefixed header. An unlisted body is compiled by nothing, which is the
+same vacuous pass in a different disguise, so the gate hard-fails on it.
 
 **Where they actually run.** Both gates skip when their tool is missing, so a
 Command-Line-Tools-only box is not blocked — but a skipping gate protects
 nothing, so the skip is local-only. The `msl` job in
 `.github/workflows/ci.yml` runs both with `METAL_STRICT=--strict`, which turns
-a missing tool into a hard failure. The GitHub macOS runner ships full Xcode,
+a missing tool into a hard failure — and, for the compile gate, a toolchain that
+cannot do the `metal4.0` pass; for the format gate, an empty file set, so a
+renamed kernel directory cannot silently disable it while the job stays green. The GitHub macOS runner ships full Xcode,
 so the compile gate runs for real there; compiling MSL needs the toolchain,
 not a GPU, so it works on a runner with no usable Metal device. Install full
 Xcode (`xcode-select -s /Applications/Xcode.app`) to run the compile gate
@@ -1088,10 +1157,20 @@ locally too — on Xcode 16.3+ the compiler is a separate component
 
 `check-metal-compiles` cannot compile a `.metal` file directly — a body is a
 run of statements at file scope, not a translation unit. It assembles a probe
-per kernel (`stdlib preamble + header + kernel { buffer aliases + body }`) and
-compiles that. `src/metal/probes/kernels.manifest` supplies the header and
-buffer list per body; `probes/README.md` documents the layout and how to
-refresh the captured header snapshots.
+per kernel (`stdlib preamble + header + kernel { buffer aliases + defines +
+body }`) and compiles that. Each directory's `probes/kernels.manifest` supplies,
+per body: the header to prepend, the buffer names the body expects, and an
+optional fourth field of `#define NAME VALUE` pairs for the values MLX injects
+at dispatch that are neither buffers nor header constants — template dtypes
+(`OutT`, `InT`, `StT`), template ints (`Dk`, `ROWS_PER_TILE`, …) and scalar 0-D
+inputs (`T`), which the body sees as numeric literals. Buffer types are `u`
+(uint), `i` (int) and `f` (float), matching the dtype the dispatch site declares.
+Where such a `#define` duplicates a Rust const, pin it with an equality test as
+`probe_manifest_defines_match_rust_consts` does — a hand-copied bound drifts the
+same way a captured header snapshot does.
+`crates/rmlx-kv-quant/src/metal/probes/README.md` documents the layout and how
+to refresh the captured header snapshots; the other two directories follow the
+same convention and point back at it.
 
 Deliberately **not** wired: `clang-tidy` (wants a compilation database and is
 noisy on MSL) and MegaLinter (CI-heavy). The two gates above already cover
