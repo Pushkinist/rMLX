@@ -102,7 +102,6 @@ rotorquant_quantize_rotor3.metal | rotorquant_rotor3.hdr.metal | inp:f,rotors_in
 rotorquant_dequantize_rotor3.metal | rotorquant_rotor3.hdr.metal | codes_in:u,scales_in:f,norms_in:f,rotors_in:f,n_groups:u,head_dim:u,out:f
 rotorquant_quantize_rotor4.metal | rotorquant_rotor4.hdr.metal | inp:f,rotors_in:f,n_groups:u,head_dim:u,codes_out:u,scales_out:f,norms_out:f
 rotorquant_dequantize_rotor4.metal | rotorquant_rotor4.hdr.metal | codes_in:u,scales_in:f,norms_in:f,rotors_in:f,n_groups:u,head_dim:u,out:f
-sparse_v.metal | sparse_v.hdr.metal | probs:f,v_codes:u,v_scales:f,v_biases:f,params:u,out:f
 tcq_v_quantize.metal | ../tcq_v_header.metal | inp:f,codes:u,scales:f
 turbo2_v_quantize.metal | ../turbo2_v_header.metal | inp:f,codes:u,scales:f
 turbo2_v_dequantize.metal | ../turbo2_v_header.metal | codes:u,scales:f,out:f | OutT=float

@@ -53,7 +53,16 @@ SRC_DIR="${1:-$ROOT/crates/rmlx-kv-quant/src}"
 # scan must fail the gate, not silently shrink its coverage — so the expected
 # file count is pinned, not merely required to be non-zero. Raise it when a
 # dispatcher is added; a drop below it means coverage was lost.
-MIN_FILES="${2:-${CHECK_EVAL_MIN_FILES:-27}}"
+#
+# Lower it only against a dispatcher that is *gone from the tree*, never to
+# quiet a failure, and record which one here. An unexplained decrement is
+# indistinguishable from the broken glob this floor exists to catch, so the
+# reason is the load-bearing part of the change and the number is not.
+#
+# 27 -> 26: the sparse-V weighted-sum dispatcher was deleted, not relocated —
+# its kernel dequantized affine V data with a symmetric formula and was removed
+# outright rather than repaired. No other file entered or left the scanned set.
+MIN_FILES="${2:-${CHECK_EVAL_MIN_FILES:-26}}"
 
 if [ ! -d "$SRC_DIR" ]; then
     echo "check-no-kernel-input-eval: scan root does not exist: $SRC_DIR" >&2
