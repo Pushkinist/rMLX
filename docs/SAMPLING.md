@@ -392,17 +392,25 @@ context-invariant cost either.
 
 **Bonsai's collapse is a codec artifact, not attention.** Its `auto` codec
 (`mixed_k8g64_v4g64`) decodes at 13.2 tok/s at 16k and 3.6 at 64k — step times
-of 76 and 282 ms against the ~12 and ~26 ms the `--kv-quant none` anchors
-recorded above. The extra time is host-side work inside the forward
+of 76 and 282 ms, against 11.1 and 24.7 ms for the same model and contexts on
+`--kv-quant none` below. The extra time is host-side work inside the forward
 (`sync_per_step_ms` stays at 2.8 ms while the step runs 282 ms), so the share
-there is being divided by a separate defect. The `none` arm below is the one to
-read for that model.
+there is being divided by a separate defect rather than by attention. The `none`
+arm is the one to read for that model. The codec gap itself is worth its own
+look and is not this section's subject.
+
+Bonsai's "served default" row is not the expensive shape the other two models
+show, for a mundane reason: it ships no `generation_config.json`, so its served
+default is the hard-coded `temperature 1.0` with no filters — the same cost as
+the temperature cell. The filters are what make gemma-4's and Qwen3.6's served
+defaults three to four times dearer.
 
 #### The same models on a healthy codec (`--kv-quant none`)
 
-Re-run with `--kv-quant none`, whose long-context decode rates (95.6 / 41.4
-tok/s for Bonsai at 16k / 64k) sit next to the anchors recorded in
-`docs/PERF_BASELINE.md`, so the denominator is legitimate attention cost:
+Re-run with `--kv-quant none`. Its greedy control decodes Bonsai at 95.6 tok/s
+at 16k and 41.4 at 64k, against the ~83 and ~38 recorded for that model and
+codec in `docs/PERF_BASELINE.md` — the same regime, on a busier host, rather
+than the 13.2 / 3.6 above. The denominator is legitimate attention cost:
 
 | model | ctx | cell | `sample` ms/step | `step` ms/step | `share%` | decode_tps |
 |---|---:|---|---:|---:|---:|---:|

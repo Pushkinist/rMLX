@@ -20,9 +20,9 @@
 //! dispatched at all — there is nothing to overlap, and the loop runs strictly
 //! serial: wait for the forward, read the row back, pick a token, dispatch the
 //! next forward. That costs both the host work and the overlap the greedy path
-//! gets for free, which is why the `sampler_profile` event reports the host work
-//! as a *lower bound* on the difference and the honest end-to-end figure is a
-//! decode-TPS comparison against a greedy control. See `docs/SAMPLING.md`.
+//! gets for free, and the `sampler_profile` event only measures the first of the
+//! two — the honest end-to-end figure is a decode-TPS comparison against a
+//! greedy control. See `docs/SAMPLING.md`.
 //!
 //! The only per-arch hole is `forward_step` (an `impl FnMut`, monomorphized —
 //! never a `Box<dyn>` on the per-token hot path). Prompt-cache policy, cache
@@ -628,10 +628,15 @@ pub(crate) fn pipelined_decode(
 /// therefore a host-work floor, not its total cost. Every other path forces the
 /// row to the host inside the window and is fully accounted.
 ///
-/// It is also a floor in a second, path-independent way: the host path forfeits
-/// the greedy path's software pipelining, and that loss lands in `step` rather
-/// than in `sample`. A decode-TPS comparison against a greedy control is the
-/// end-to-end figure; this is the component that is attributable to host work.
+/// It also omits, on every path, the software pipelining the host path forfeits:
+/// that loss lands in `step` rather than in `sample`. A decode-TPS comparison
+/// against a greedy control is the end-to-end figure; this is the component
+/// attributable to host work.
+///
+/// Neither omission makes the ratio a bound, because a contended host pushes it
+/// the other way: `sample` is pure host CPU while `sync` is dominated by GPU
+/// execution, so CPU steal stretches the numerator alone. Read it on a quiet
+/// host, or read it knowing both errors are present with opposite signs.
 fn emit_sampler_profile(
     ctx: &DecodeCtx<'_>,
     host_steps: u32,
