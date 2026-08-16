@@ -28,10 +28,18 @@
 #                      interference. Set it to the actual names in use; a
 #                      hard-coded "rmlx" would let an arm named `rmlx.main` be
 #                      reported as a foreign process competing with itself.
+#   CPU_SNAPSHOT_MIN_ROWS  row floor below which the snapshot is refused
+#                      (default 20). Lower it only in a fixture.
 # The calling shell and `ps` itself are always omitted.
 
+# Returns non-zero when the snapshot could not be taken. A caller that ignores
+# that gets an empty file, and an empty file compares as "nothing was running"
+# -- which is how an interference gate silently stops gating. `ps` failing,
+# being blocked, or returning a fraction of the process table on a restricted
+# host are all real; `2>/dev/null` on the pipeline hides the first two, and the
+# pipeline's own status is awk's, which is always 0.
 cpu_snapshot() {
-	ps -Ao pid=,time=,comm= 2>/dev/null |
+	ps -Aww -o pid=,time=,comm= 2>/dev/null |
 		awk -v self="$$" -v skip="${CPU_SNAPSHOT_SKIP:-}" '
 	BEGIN { n = split(skip, s, " "); for (i = 1; i <= n; i++) drop[s[i]] = 1; drop["ps"] = 1 }
 	function tsec(str,   d, p, m, r, i) {
@@ -53,4 +61,12 @@ cpu_snapshot() {
 		if (base in drop) next
 		printf "%s %.2f %s\n", pid, tsec(t), comm
 	}' >"$1"
+
+	# A real process table has hundreds of rows. A handful means `ps` was
+	# blocked, sandboxed, or truncated, and comparing two such snapshots would
+	# report a quiet host on no evidence.
+	if [ "$(wc -l <"$1" | tr -d ' ')" -lt "${CPU_SNAPSHOT_MIN_ROWS:-20}" ]; then
+		return 1
+	fi
+	return 0
 }

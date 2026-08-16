@@ -645,6 +645,7 @@ fn peak_reading_headroom_excludes_bytes_already_live() {
         peak_bytes: 900,
         live_at_open_bytes: 500,
         live_at_close_bytes: 700,
+        reset_ok: true,
     };
     // 500 bytes were already resident when the bracket opened; the region is
     // charged only for the 400 it added on top.
@@ -662,6 +663,7 @@ fn peak_reading_saturates_when_region_allocated_nothing() {
         peak_bytes: 0,
         live_at_open_bytes: 500,
         live_at_close_bytes: 500,
+        reset_ok: true,
     };
     assert_eq!(r.headroom_bytes(), 0);
     assert_eq!(r.transient_bytes(), 0);
@@ -678,19 +680,70 @@ fn peak_reading_transient_is_zero_when_nothing_was_freed() {
         peak_bytes: 900,
         live_at_open_bytes: 500,
         live_at_close_bytes: 900,
+        reset_ok: true,
     };
     assert_eq!(r.headroom_bytes(), 400);
     assert_eq!(r.transient_bytes(), 0);
 }
 
-/// `PeakBracket::open` must survive a build with no Metal allocator: the C
-/// calls fail, every counter reads 0, and the derived quantities report
-/// "measured nothing" instead of a plausible-looking number.
+/// The anti-vacuous predicate must key off the region, not the process.
+///
+/// MLX updates the mark as `peak = max(peak, active)` on every allocation, and
+/// `active` is the whole live count. So after a reset, one allocation anywhere
+/// in the process lifts `peak_bytes` to at least the resident total — which in
+/// `rmlx baseline` is gigabytes of weights. A predicate of `peak_bytes > 0`
+/// would be true in every real process and would certify nothing.
 #[test]
-fn peak_bracket_round_trips_without_panicking() {
-    let reading = PeakBracket::open().close();
-    // Deltas are saturating, so this holds on every host regardless of what
-    // the allocator reported.
-    assert!(reading.headroom_bytes() <= reading.peak_bytes);
-    assert!(reading.transient_bytes() <= reading.peak_bytes);
+fn observed_allocation_is_about_the_region_not_the_process() {
+    // The peak never rose above what was already live: this region did not
+    // allocate, even though `peak_bytes` is a large non-zero number.
+    let untouched = PeakReading {
+        peak_bytes: 4_000_000_000,
+        live_at_open_bytes: 4_000_000_000,
+        live_at_close_bytes: 4_000_000_000,
+        reset_ok: true,
+    };
+    assert_eq!(untouched.headroom_bytes(), 0);
+    assert!(
+        !untouched.observed_allocation(),
+        "peak == live_at_open means the region added nothing; a `peak_bytes > 0` \
+         predicate would call this an observed allocation"
+    );
+
+    // One byte above the open live count is an observed allocation.
+    let touched = PeakReading {
+        peak_bytes: 4_000_000_001,
+        ..untouched
+    };
+    assert_eq!(touched.headroom_bytes(), 1);
+    assert!(touched.observed_allocation());
+}
+
+/// A reset that did not happen leaves the peak process-lifetime, so the deltas
+/// describe the process rather than the region. They must report nothing rather
+/// than a large, stable, plausible-looking number that a harness would diff.
+#[test]
+fn failed_reset_reports_nothing_rather_than_a_plausible_number() {
+    let r = PeakReading {
+        peak_bytes: 9_000_000_000,
+        live_at_open_bytes: 4_000_000_000,
+        live_at_close_bytes: 4_000_000_000,
+        reset_ok: false,
+    };
+    assert!(!r.measurable());
+    assert_eq!(
+        r.headroom_bytes(),
+        0,
+        "an unscoped peak must not surface as 5 GB of region headroom"
+    );
+    assert_eq!(r.transient_bytes(), 0);
+    assert!(!r.observed_allocation());
+
+    // The identical counters with a successful reset are a real measurement.
+    let ok = PeakReading {
+        reset_ok: true,
+        ..r
+    };
+    assert!(ok.measurable());
+    assert_eq!(ok.headroom_bytes(), 5_000_000_000);
 }

@@ -613,8 +613,24 @@ pub(crate) fn run_baseline(
     // needed on top of the resident weights. The second number is the one that
     // compares across two runs of the same model — the first still carries the
     // weights. Both read 0 on a build with no Metal allocator.
-    let metal_peak_mb = peak_reading.peak_bytes as f64 / 1_048_576.0;
-    let metal_gen_alloc_mb = peak_reading.headroom_bytes() as f64 / 1_048_576.0;
+    //
+    // When the bracket could not be scoped — no Metal allocator, or the peak
+    // reset failed while the live reading succeeded — both fields report 0
+    // rather than the process-lifetime peak. Printing the unscoped figure under
+    // a name that promises a scoped one is how a consumer ends up diffing two
+    // numbers that describe the process instead of the generation.
+    let (metal_peak_mb, metal_gen_alloc_mb) = if peak_reading.measurable() {
+        (
+            peak_reading.peak_bytes as f64 / 1_048_576.0,
+            peak_reading.headroom_bytes() as f64 / 1_048_576.0,
+        )
+    } else {
+        warn!(
+            "Metal peak bracket unavailable (allocator absent, or the peak reset failed); \
+             reporting metal_peak_mb=0 rather than an unscoped process-lifetime figure"
+        );
+        (0.0, 0.0)
+    };
     println!(
         "baseline: model={model_basename}  load={load_ms:.0}ms  ttft_ms={ttft_ms:.0}  \
          decode_tps={decode_tps:.3}  overall_tps={overall_tps:.3}  prefill_tps={prefill_tps:.1}  \

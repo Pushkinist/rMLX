@@ -18,12 +18,23 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 AB="$ROOT/scripts/perf_ab.sh"
 
+# Sourced up front, before any case calls it. A missing definition exits
+# non-zero exactly like a failing `ps`, so the cases below would pass for the
+# wrong reason if this arrived later in the file.
+# shellcheck source=scripts/lib/cpu_snapshot.sh
+. "$ROOT/scripts/lib/cpu_snapshot.sh"
+if ! type cpu_snapshot >/dev/null 2>&1; then
+	echo "selftest bug: cpu_snapshot is not defined" >&2
+	exit 1
+fi
+
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/rmlx_ab_selftest.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
 STATE="$WORK/state"
 MODEL="$WORK/model"
-mkdir -p "$STATE" "$MODEL"
+MODEL2="$WORK/model2"
+mkdir -p "$STATE" "$MODEL" "$MODEL2"
 
 TOKENS_MAIN="11,22,33,44,55"
 TOKENS_ALT="11,22,99,44,55"
@@ -41,14 +52,23 @@ make_stub() {
 #!/usr/bin/env bash
 # stub rmlx: $name
 set -eu
-# Imitate the real binary's metrics behaviour: without \`--metrics off\` the
-# EventRecorder opens \$RMLX_HOME/metrics/runs.db. That is what makes the
-# "no runs.db written" assertion at the end of the suite a real guard rather
-# than a statement about stubs not doing very much.
-case " \$* " in
-*" --metrics off "*) : ;;
-*) mkdir -p "\$RMLX_HOME/metrics" && : >"\$RMLX_HOME/metrics/runs.db" ;;
-esac
+# Imitate the real binary's metrics behaviour, including clap's last-occurrence
+# -wins resolution of a \`global = true\` flag: \`--metrics off ... --metrics full\`
+# records. Without that, the "no runs.db written" assertion at the end of the
+# suite would be a statement about stubs not doing very much, instead of a
+# guard on the one escape that reaches the real append-only store.
+mode=full
+prev=""
+for a in "\$@"; do
+  case "\$a" in
+  --metrics=*) mode="\${a#--metrics=}" ;;
+  *) [ "\$prev" = "--metrics" ] && mode="\$a" ;;
+  esac
+  prev="\$a"
+done
+if [ "\$mode" != "off" ]; then
+  mkdir -p "\$RMLX_HOME/metrics" && : >"\$RMLX_HOME/metrics/runs.db"
+fi
 TPS=($(echo "$tps" | tr ',' ' '))
 CNT="$STATE/$name.cnt"
 n=\$(cat "\$CNT" 2>/dev/null || echo 0)
@@ -61,10 +81,12 @@ tok="$tokens"
 # behaviour under test.
 sleep 0.25
 if [ -n "$drift" ] && [ "\$n" = "$drift" ]; then tok="$TOKENS_ALT"; fi
+peak=100.0
+if [ "$omit" = "zeropeak" ]; then peak=0.0; fi
 if [ "$omit" != "tps" ]; then
-  printf 'baseline: model=stub  load=1ms  ttft_ms=1  decode_tps=%s  overall_tps=%s  prefill_tps=1.0  prompt_tokens=4096  peak_rss=1.0MB  metal_peak_mb=100.0  metal_gen_alloc_mb=%s\n' "\$v" "\$v" "$mem"
+  printf 'baseline: model=stub  load=1ms  ttft_ms=1  decode_tps=%s  overall_tps=%s  prefill_tps=1.0  prompt_tokens=4096  peak_rss=1.0MB  metal_peak_mb=%s  metal_gen_alloc_mb=%s\n' "\$v" "\$v" "\$peak" "$mem"
 else
-  printf 'baseline: model=stub  load=1ms  ttft_ms=1  prompt_tokens=4096  metal_gen_alloc_mb=%s\n' "$mem"
+  printf 'baseline: model=stub  load=1ms  ttft_ms=1  prompt_tokens=4096  metal_peak_mb=%s  metal_gen_alloc_mb=%s\n' "\$peak" "$mem"
 fi
 if [ "$omit" != "ids" ]; then printf 'baseline: token_ids=%s\n' "\$tok"; fi
 STUB
@@ -82,28 +104,33 @@ FAILED=0
 check() {
 	local name="$1" want="$2" what="$3"
 	shift 3
-	local args=() greps=()
+	local args=() greps=() path_prefix=""
 	for a in "$@"; do
 		case "$a" in
 		GREP:*) greps+=("${a#GREP:}") ;;
 		NOGREP:*) greps+=("!${a#NOGREP:}") ;;
+		PATHPRE:*) path_prefix="${a#PATHPRE:}" ;;
 		*) args+=("$a") ;;
 		esac
 	done
 
 	reset_state
 	local out="$WORK/$name.log"
-	RMLX_HOME="$WORK/home" bash "$AB" "${args[@]}" >"$out" 2>&1
+	# bash 3.2 (the system bash here) treats "${arr[@]}" on an empty array as an
+	# unbound variable under `set -u` and dies. Every current call site supplies
+	# both, but the guard keeps a future one from failing as a harness crash.
+	RMLX_HOME="$WORK/home" PATH="${path_prefix:+$path_prefix:}$PATH" \
+		bash "$AB" ${args[@]+"${args[@]}"} >"$out" 2>&1
 	local got=$?
 
 	local ok=1
 	[[ "$got" -eq "$want" ]] || ok=0
 	local failed_pattern=""
-	for g in "${greps[@]}"; do
+	for g in ${greps[@]+"${greps[@]}"}; do
 		if [[ "$g" == !* ]]; then
-			grep -qE "${g#!}" "$out" && { ok=0; failed_pattern="unexpected: ${g#!}"; }
+			grep -qE -- "${g#!}" "$out" && { ok=0; failed_pattern="unexpected: ${g#!}"; }
 		else
-			grep -qE "$g" "$out" || { ok=0; failed_pattern="missing: $g"; }
+			grep -qE -- "$g" "$out" || { ok=0; failed_pattern="missing: $g"; }
 		fi
 	done
 
@@ -141,7 +168,9 @@ NO_IDS="$(make_stub no_ids "100.0" 40.0 "$TOKENS_MAIN" "" ids)"
 # Nothing on this host counts as busy unless a case says otherwise; the CPU
 # gate has its own cases below and must not make the others flaky.
 QUIET=(--busy-pct 100000)
-COMMON=(--model "$MODEL" --slots 12)
+# The stubs emit 5 token ids, so --max-tokens matches: the harness refuses a
+# slot whose generation is shorter than asked for.
+COMMON=(--model "$MODEL" --slots 12 --max-tokens 5)
 
 echo "perf_ab selftest: mutation checks"
 
@@ -220,28 +249,113 @@ check missing_tps 125 \
 check missing_token_ids 125 \
 	"an arm that emits no token_ids is refused rather than timed blind" \
 	--binary-a "$NO_IDS" --binary-b "$FAST" "${COMMON[@]}" "${QUIET[@]}" \
-	"GREP:produced no token_ids"
+	"GREP:emitted no token_ids line"
 
 check unbalanced_slots 125 \
 	"a slot count that cannot form whole ABBA blocks is refused" \
-	--binary-a "$SLOW" --binary-b "$FAST" --model "$MODEL" --slots 6 "${QUIET[@]}" \
+	--binary-a "$SLOW" --binary-b "$FAST" --model "$MODEL" --slots 6 --max-tokens 5 "${QUIET[@]}" \
 	"GREP:multiple of 4"
 
 check missing_model 125 \
 	"a model path that does not exist stops the run" \
-	--binary-a "$SLOW" --binary-b "$FAST" --model "$WORK/nope" --slots 4 "${QUIET[@]}" \
+	--binary-a "$SLOW" --binary-b "$FAST" --model "$WORK/nope" --slots 8 --max-tokens 5 "${QUIET[@]}" \
 	"GREP:model path not found"
+
+# The refusal is the central guard, so its end-to-end coverage must not depend
+# on what this machine happens to be doing. A `ps` shim reports a process whose
+# cumulative CPU time advances on every call, which is a busy host by
+# construction; the earlier form used `--busy-pct 0` and would have gone QUIET
+# on an idle CI runner, because `classify_window` short-circuits `idle` before
+# the threshold is applied.
+mkdir -p "$WORK/busybin"
+cat >"$WORK/busybin/ps" <<PSHOG
+#!/usr/bin/env bash
+n=\$(cat "$STATE/pshog.cnt" 2>/dev/null || echo 0)
+echo \$((n + 1)) >"$STATE/pshog.cnt"
+printf '%6d %12s %s\n' 4242 "0:\$((n * 100)).00" /usr/local/bin/hog
+for i in \$(seq 1 40); do printf '%6d %12s %s\n' \$((5000 + i)) "0:00.10" "/usr/sbin/idle\$i"; done
+PSHOG
+chmod +x "$WORK/busybin/ps"
 
 check busy_host_refused 125 \
 	"a host over the CPU threshold is refused before anything is measured" \
-	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" --busy-pct 0 \
-	"GREP:host is not quiescent"
+	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" \
+	"PATHPRE:$WORK/busybin" \
+	"GREP:host is not quiescent" \
+	"GREP:hog"
 
 check busy_host_taints 125 \
 	"--allow-busy-host prints the numbers but a tainted run is still not clean" \
-	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" --busy-pct 0 --allow-busy-host \
+	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" --allow-busy-host \
+	"PATHPRE:$WORK/busybin" \
 	"GREP:VERDICT: TAINTED" \
 	"NOGREP:VERDICT: SEPARATED"
+
+# ---- the runs.db escape ------------------------------------------------------
+#
+# `--metrics` is `global = true`, so an occurrence after the subcommand beats
+# the harness's leading `--metrics off` and the slot opens the real append-only
+# runs.db. Verified against the built binary, including on a failure path where
+# the model never loaded.
+
+check metrics_flag_in_arm_refused 125 \
+	"--metrics in an arm's arguments is refused before anything runs" \
+	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" "${QUIET[@]}" \
+	--arm-b "--metrics full" \
+	"GREP:--metrics may not appear in arm arguments" \
+	"GREP:append-only"
+
+check metrics_flag_equals_form_refused 125 \
+	"the --metrics=VALUE spelling is refused too" \
+	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" "${QUIET[@]}" \
+	--arm-a "--metrics=full" \
+	"GREP:--metrics may not appear in arm arguments"
+
+# ---- degenerate measurements -------------------------------------------------
+
+ZEROPEAK="$(make_stub zeropeak "100.0,100.5,101.0" 0.0 "$TOKENS_MAIN" "" zeropeak)"
+check vacuous_memory_refused 125 \
+	"a slot whose peak bracket measured nothing is refused, not averaged as 0" \
+	--binary-a "$ZEROPEAK" --binary-b "$FAST" "${COMMON[@]}" "${QUIET[@]}" \
+	"GREP:metal_peak_mb=0"
+
+SHORT="$(make_stub short "100.0,100.5,101.0" 40.0 "1,2")"
+check short_generation_refused 125 \
+	"a slot that generated fewer tokens than asked for is refused" \
+	--binary-a "$SHORT" --binary-b "$FAST" "${COMMON[@]}" "${QUIET[@]}" \
+	"GREP:emitted 2 token ids, expected 5"
+
+# ---- option validation -------------------------------------------------------
+
+check non_numeric_slots 125 \
+	"--slots abc exits 125, not the 1 reserved for token divergence" \
+	--binary-a "$SLOW" --binary-b "$FAST" --model "$MODEL" --slots abc "${QUIET[@]}" \
+	"GREP:--slots must be a number"
+
+check non_numeric_busy_pct 125 \
+	"a non-numeric --busy-pct is refused rather than silently disabling the gate" \
+	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" --busy-pct abc \
+	"GREP:--busy-pct must be a number"
+
+check slots_too_few_for_a_verdict 125 \
+	"--slots 4 is refused: SEPARATED would carry a 1-in-3 null probability" \
+	--binary-a "$SLOW" --binary-b "$FAST" --model "$MODEL" --slots 4 --max-tokens 5 "${QUIET[@]}" \
+	"GREP:null probability of 0\.33333"
+
+# ---- the reported statistics must be computed, not asserted ------------------
+
+check stddev_uncertainty_tracks_n 0 \
+	"the stddev's relative standard error is computed from n, not a fixed 30%" \
+	--binary-a "$SLOW" --binary-b "$FAST" --model "$MODEL" --slots 8 --max-tokens 5 "${QUIET[@]}" \
+	"GREP:over 4 values is ~1/sqrt\(2\(n-1\)\) = 41%" \
+	"NOGREP:= 32%"
+
+check family_size_is_stated 0 \
+	"the family-wise rate is stated for a run that makes two comparisons" \
+	--binary-a "$SLOW" --binary-b "$FAST" --model "$MODEL" --model "$MODEL2" \
+	--slots 12 --max-tokens 5 "${QUIET[@]}" \
+	"GREP:this run makes 2 independent comparisons" \
+	"GREP:1-\(1-0\.00216\)\^2 = 0\.00432"
 
 # ---- the interference detector itself ----------------------------------------
 #
@@ -252,10 +366,26 @@ check busy_host_taints 125 \
 
 BUSIEST="$ROOT/scripts/lib/busiest_between.awk"
 
+mkdir -p "$WORK/fakebin"
+cat >"$WORK/fakebin/ps" <<'FAKEPS'
+#!/usr/bin/env bash
+# Stand-in for `ps -Ao pid=,time=,comm=`, covering all three time renderings
+# macOS produces plus the two binaries an A/B run must not treat as foreign.
+cat <<'ROWS'
+  101      1:30.50 /usr/bin/some-other-tool
+  102   2:03:04.00 /Applications/Browser.app/Contents/MacOS/Browser
+  103  1-00:00:01.00 /usr/libexec/ancient
+  104      0:10.00 /tmp/build/rmlx.main
+  105      0:11.00 /tmp/build/rmlx
+ROWS
+FAKEPS
+chmod +x "$WORK/fakebin/ps"
+
 cpu_case() {
 	local name="$1" want="$2" what="$3" window="$4" before="$5" after="$6"
-	printf '%s\n' "$before" >"$WORK/cpu_before"
-	printf '%s\n' "$after" >"$WORK/cpu_after"
+	# An empty fixture must produce a genuinely empty file, not a blank line.
+	if [[ -n "$before" ]]; then printf '%s\n' "$before" >"$WORK/cpu_before"; else : >"$WORK/cpu_before"; fi
+	if [[ -n "$after" ]]; then printf '%s\n' "$after" >"$WORK/cpu_after"; else : >"$WORK/cpu_after"; fi
 	local got
 	got="$(awk -v window="$window" -f "$BUSIEST" "$WORK/cpu_before" "$WORK/cpu_after")"
 	if [[ "$got" == "$want" ]]; then
@@ -281,33 +411,65 @@ cpu_case cpu_new_pid_charged "busy-candidate 50.0 node" \
 	4 $'100 10.00 npm' $'100 10.00 npm\n900 2.00 node'
 
 cpu_case cpu_short_window_unmeasured "unmeasured - -" \
-	"a window too short to divide by reports unmeasured, never idle" \
-	0 $'100 10.00 npm' $'100 14.00 npm'
+	"a window below the CPU counter's resolution reports unmeasured, never idle" \
+	0.02 $'100 10.00 npm' $'100 14.00 npm'
 
 cpu_case cpu_picks_the_biggest "busy-candidate 60.0 npm" \
 	"the busiest process wins, not the first one seen" \
 	5 $'100 0.00 Finder\n200 0.00 npm' $'100 1.00 Finder\n200 3.00 npm'
 
-# `cpu_snapshot` is checked against a `ps` shim rather than against whatever
-# this machine happens to be running, so both the exclusion list and the
-# CPU-time parsing are pinned to exact expected output.
-# shellcheck source=scripts/lib/cpu_snapshot.sh
-. "$ROOT/scripts/lib/cpu_snapshot.sh"
+# An empty snapshot is a snapshot that was not taken -- `ps` failed, was
+# blocked, or was sandboxed. Reporting that as `idle` maps to `quiet` and
+# disables the entry refusal and the taint gate at once, and the run exits 0.
+cpu_case cpu_empty_before_is_unmeasured "unmeasured - -" \
+	"an empty BEFORE snapshot is unmeasured, not idle, even with a hog in AFTER" \
+	5 '' $'100 989.00 /usr/local/bin/hog'
 
-mkdir -p "$WORK/fakebin"
-cat >"$WORK/fakebin/ps" <<'FAKEPS'
-#!/usr/bin/env bash
-# Stand-in for `ps -Ao pid=,time=,comm=`, covering all three time renderings
-# macOS produces plus the two binaries an A/B run must not treat as foreign.
-cat <<'ROWS'
-  101      1:30.50 /usr/bin/some-other-tool
-  102   2:03:04.00 /Applications/Browser.app/Contents/MacOS/Browser
-  103  1-00:00:01.00 /usr/libexec/ancient
-  104      0:10.00 /tmp/build/rmlx.main
-  105      0:11.00 /tmp/build/rmlx
-ROWS
-FAKEPS
-chmod +x "$WORK/fakebin/ps"
+cpu_case cpu_empty_after_is_unmeasured "unmeasured - -" \
+	"an empty AFTER snapshot is unmeasured, not idle" \
+	5 $'100 0.00 /usr/local/bin/hog' ''
+
+cpu_case cpu_both_empty_is_unmeasured "unmeasured - -" \
+	"two empty snapshots answer nothing rather than answering 'quiet'" \
+	5 '' ''
+
+# `cpu_snapshot` must report failure rather than leave an empty file behind: the
+# pipeline's status is awk's, which is always 0, so a failing `ps` is invisible
+# to `set -e` and to every caller that does not check.
+mkdir -p "$WORK/failbin"
+printf '#!/bin/sh\nexit 1\n' >"$WORK/failbin/ps"
+chmod +x "$WORK/failbin/ps"
+if PATH="$WORK/failbin:$PATH" cpu_snapshot "$WORK/snap_fail" 2>/dev/null; then
+	FAILED=$((FAILED + 1))
+	printf '  FAIL %-26s        — cpu_snapshot returned success for a failing ps\n' "cpu_snapshot_reports_failure"
+else
+	PASSED=$((PASSED + 1))
+	printf '  ok   %-26s        — cpu_snapshot returns non-zero when ps fails\n' "cpu_snapshot_reports_failure"
+fi
+
+# A truncated process table is not hypothetical: a restricted host returns a
+# small fraction of it. Comparing two such snapshots would report a quiet host
+# on almost no evidence.
+if PATH="$WORK/fakebin:$PATH" cpu_snapshot "$WORK/snap_thin" 2>/dev/null; then
+	FAILED=$((FAILED + 1))
+	printf '  FAIL %-26s        — a 5-row process table passed the row floor\n' "cpu_snapshot_row_floor"
+elif CPU_SNAPSHOT_MIN_ROWS=3 PATH="$WORK/fakebin:$PATH" cpu_snapshot "$WORK/snap_thin" 2>/dev/null; then
+	PASSED=$((PASSED + 1))
+	printf '  ok   %-26s        — a thin process table is refused, and the floor is what refuses it\n' "cpu_snapshot_row_floor"
+else
+	FAILED=$((FAILED + 1))
+	printf '  FAIL %-26s        — the row floor rejects even when lowered below the row count\n' "cpu_snapshot_row_floor"
+fi
+
+# End to end: a failing `ps` must taint the run rather than let it report clean.
+check failing_ps_taints 125 \
+	"a slot whose interference could not be sampled taints the comparison" \
+	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" "${QUIET[@]}" \
+	"PATHPRE:$WORK/failbin" \
+	"GREP:VERDICT: TAINTED" \
+	"GREP:could not be sampled" \
+	"NOGREP:VERDICT: SEPARATED"
+
 
 CPU_SNAPSHOT_SKIP="rmlx.main rmlx" PATH="$WORK/fakebin:$PATH" cpu_snapshot "$WORK/snap_excl"
 

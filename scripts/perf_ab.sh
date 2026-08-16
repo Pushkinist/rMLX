@@ -16,8 +16,13 @@
 #   * Slots alternate in a balanced ABBA / BAAB / ABBA pattern, so a monotone
 #     drift across the run contributes equally to both arms.
 #   * Foreign CPU use is measured across every slot and across the comparison
-#     as a whole. A process that wakes up mid-run taints the result instead of
-#     tilting it.
+#     as a whole, from cumulative CPU time. Anything running at the start of a
+#     window, at its end, or throughout taints the result instead of tilting
+#     it. A process that both starts and exits inside one window is invisible
+#     to this — it appears in neither snapshot — so what is caught is sustained
+#     contention, which is the profile that actually skews a decode benchmark.
+#     A window that could not be sampled at all is reported as `unmeasured` and
+#     taints too; not knowing is never folded into "nothing was there".
 #   * The two arms must be provably distinguishable — same binary digest AND
 #     same arguments is refused, because "A vs B" where both are the same
 #     build is the failure mode that looks most like a real result.
@@ -37,8 +42,15 @@
 # NEVER WRITES TO runs.db. An A/B run is an experiment, not a recorded
 # baseline; the append-only metrics store must not accumulate rows from arms
 # that were built to be thrown away, and a wrong row there cannot be taken
-# back out. Every slot runs with `--metrics off`, which never opens the file.
-# Results land in `$RMLX_HOME/bench/perf_ab/<timestamp>.json`.
+# back out. Every slot runs with `--metrics off`, which never opens the file,
+# and `--metrics` is refused in arm arguments — it is a global flag, so an
+# occurrence after the subcommand would win and re-enable recording.
+#
+# It does write elsewhere: the result lands in
+# `$RMLX_HOME/bench/perf_ab/<timestamp>.json`, and every slot is a full `rmlx`
+# process that writes its own `$RMLX_HOME/logs/<run-id>.jsonl` and runs the log
+# size-cap rotation. A default run is 42 of those. Point RMLX_HOME at a scratch
+# directory when that matters.
 #
 # Exit codes:
 #   0   — ran cleanly; the verdict is on stdout
@@ -94,12 +106,20 @@ Arms (at least one of the two must differ):
 Protocol:
   --model PATH           model snapshot to compare on; repeatable.
                          Default: the three canary models.
-  --slots N              interleaved slots per model, multiple of 4 (default 12)
+  --slots N              interleaved slots per model (default 12). Must be a
+                         multiple of 4, and large enough that the SEPARATED
+                         verdict's null probability stays at or under 0.05 --
+                         so 8 or more. At 4 it would be 1 in 3.
   --invert               swap the arm roles in the pattern (cancels any residual
                          positional bias when paired with a non-inverted run)
   --prompt-tokens N      default 4096
-  --max-tokens N         default 100
+  --max-tokens N         default 100. Every slot must generate this many tokens;
+                         a short generation is refused, not averaged in.
   --max-ctx N            default 8192
+
+Arm arguments may not contain --metrics: it is a global flag, so an occurrence
+after the subcommand overrides the --metrics off every slot runs with, and the
+slot would write to the append-only runs.db.
 
 Escape hatches (each one weakens a guard; each is reported in the output):
   --allow-null-arms          permit two identical arms (the null calibration)
@@ -147,6 +167,27 @@ done
 BIN_A="${BIN_A:-$DEFAULT_BINARY}"
 BIN_B="${BIN_B:-$BIN_A}"
 
+# Numeric options are validated before anything uses them. Two ways an
+# unvalidated value goes wrong here, both silent: `$((SLOTS % 4))` on a
+# non-numeric string is a fatal `unbound variable` under `set -u`, which exits
+# 1 -- the code this script reserves for "the arms produced different tokens",
+# so a wrapper reads a typo as a correctness regression. And awk compares a
+# strnum against a non-numeric threshold lexically, so `--busy-pct abc` makes
+# `80.0 >= abc` false and the interference gate never fires again.
+require_number() {
+	case "$2" in
+	'' | *[!0-9.]* | *.*.*)
+		echo "ERROR: $1 must be a number, got '$2'" >&2
+		exit 125
+		;;
+	esac
+}
+require_number --slots "$SLOTS"
+require_number --busy-pct "$BUSY_PCT"
+require_number --prompt-tokens "$PROMPT_TOKENS"
+require_number --max-tokens "$MAX_TOKENS"
+require_number --max-ctx "$MAX_CTX"
+
 if [[ $((SLOTS % 4)) -ne 0 || $SLOTS -lt 4 ]]; then
 	echo "ERROR: --slots must be a multiple of 4 and at least 4 (got $SLOTS)" >&2
 	echo "  The pattern is built from ABBA/BAAB blocks; a partial block would" >&2
@@ -154,6 +195,47 @@ if [[ $((SLOTS % 4)) -ne 0 || $SLOTS -lt 4 ]]; then
 	echo "  confound this harness exists to remove." >&2
 	exit 125
 fi
+
+# The null probability of the SEPARATED verdict is 2/C(slots, slots/2). At 4
+# slots that is 1 in 3. The word printed for a one-in-three coin flip would be
+# the same word printed for a one-in-462 result, and the word is what ends up
+# pasted into a report.
+NULL_P="$(awk -v n="$SLOTS" -v k="$((SLOTS / 2))" 'BEGIN {
+	r = 1; for (i = 1; i <= k; i++) r = r * (n - k + i) / i; printf "%.5f", 2 / r }')"
+if awk -v p="$NULL_P" 'BEGIN { exit !(p > 0.05) }'; then
+	echo "ERROR: --slots $SLOTS gives the SEPARATED verdict a null probability of $NULL_P." >&2
+	echo "  Above 0.05 the verdict is not worth the word: it would carry the same" >&2
+	echo "  authority as the same word at --slots 12, where it means 0.00216." >&2
+	echo "  Use --slots 8 (0.02857) or more." >&2
+	exit 125
+fi
+
+# The relative standard error of a sample stddev is ~1/sqrt(2(n-1)) -- 71% at
+# n=2, 41% at n=4, 32% at n=6. Computed, not asserted: a hardcoded figure beside
+# an interpolated n is an instrument stating a false uncertainty as if derived.
+SD_RSE_PCT="$(awk -v n="$((SLOTS / 2))" 'BEGIN { printf "%.0f", 100 / sqrt(2 * (n - 1)) }')"
+
+# Family-wise false-SEPARATED rate: the null probability is per comparison, and
+# a run emits one independent verdict per model.
+FAMILY_P="$(awk -v p="$NULL_P" -v m="${#MODELS[@]}" 'BEGIN { printf "%.5f", 1 - (1 - p) ^ m }')"
+
+# `--metrics` may not appear in arm arguments. It is declared `global = true`,
+# so a subcommand-level occurrence overrides the harness's leading
+# `--metrics off` and the slot opens the real append-only runs.db -- verified,
+# including on a failure path where the model never loaded. This is refused
+# rather than overridden, because silently ignoring a flag the caller passed is
+# its own defect.
+case " $ARGS_A $ARGS_B " in
+*" --metrics "* | *" --metrics="*)
+	echo "ERROR: --metrics may not appear in arm arguments." >&2
+	echo "  It is a global flag, so an occurrence after the subcommand wins over" >&2
+	echo "  the --metrics off this harness passes, and the slot would write to the" >&2
+	echo "  append-only runs.db. A row from a discarded arm cannot be removed." >&2
+	echo "  arm A args: '$ARGS_A'" >&2
+	echo "  arm B args: '$ARGS_B'" >&2
+	exit 125
+	;;
+esac
 
 if [[ ${#MODELS[@]} -eq 0 ]]; then
 	: "${RMLX_O_MODELS_ROOT:?Set RMLX_O_MODELS_ROOT, or pass --model - see .env.example}"
@@ -174,7 +256,18 @@ for bin in "$BIN_A" "$BIN_B"; do
 	fi
 done
 
-digest() { shasum -a 256 "$1" | cut -c1-16; }
+# An empty digest is the one value this must not tolerate: two empty digests
+# compare equal, so a failing `shasum` would make the distinguishability guard
+# pass for any pair of arms and record "" as each arm's provenance.
+digest() {
+	local d
+	d="$(shasum -a 256 "$1" | cut -c1-16)"
+	if [[ -z "$d" ]]; then
+		echo "ERROR: could not digest $1 — arm provenance is unverifiable" >&2
+		exit 125
+	fi
+	printf '%s' "$d"
+}
 SHA_A="$(digest "$BIN_A")"
 SHA_B="$(digest "$BIN_B")"
 
@@ -234,15 +327,29 @@ load_averages() {
 	uptime | sed -e 's/.*load averages*: *//' -e 's/,/ /g' | awk '{printf "%s %s %s", $1, $2, $3}'
 }
 
+# Take a snapshot into $1, recording whether it succeeded. A snapshot that
+# could not be taken must never read back as an empty-but-valid one.
+snapshot_ok() {
+	if cpu_snapshot "$1"; then
+		return 0
+	fi
+	: >"$1.failed"
+	return 1
+}
+
 # "<state> <pct> <comm>" for the window between two snapshots $3 seconds apart.
 # state is one of busy | quiet | unmeasured.
 #
-# `unmeasured` stays distinct from `quiet` all the way into the report. A window
-# too short to divide by did not answer the question, and folding that into
-# "nothing was running" is how an interference gate quietly stops gating. A real
-# slot runs for seconds, so this only appears when something is already wrong.
+# `unmeasured` stays distinct from `quiet` all the way into the report, and it
+# covers three different ways of not knowing: the window was too short to divide
+# by, a snapshot was empty, or `ps` failed outright. Folding any of them into
+# "nothing was running" is how an interference gate quietly stops gating.
 classify_window() {
 	local raw pct
+	if [[ -e "$1.failed" || -e "$2.failed" ]]; then
+		echo "unmeasured - -"
+		return
+	fi
 	raw="$(awk -v window="$3" -f "$AWK_BUSIEST" "$1" "$2")"
 	case "${raw%% *}" in
 	unmeasured)
@@ -267,7 +374,10 @@ classify_window() {
 # them would emit a file that no reader can parse, and nothing downstream would
 # say so.
 json_str() {
-	printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g'
+	printf '%s' "$1" |
+		sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g' |
+		awk 'NR > 1 { printf "\\n" } { printf "%s", $0 } END { printf "\n" }' |
+		sed -e 's/\r/\\r/g'
 }
 
 # Render a "<state> <pct> <comm>" triple for a human.
@@ -285,9 +395,9 @@ probe_host() {
 	local a b
 	a="${WORK_DIR}/probe_a"
 	b="${WORK_DIR}/probe_b"
-	cpu_snapshot "$a"
+	snapshot_ok "$a" || true
 	sleep 1
-	cpu_snapshot "$b"
+	snapshot_ok "$b" || true
 	classify_window "$a" "$b" 1
 }
 
@@ -344,46 +454,83 @@ run_slot() {
 	local ids="${WORK_DIR}/${tag}.ids"
 	local snap_a="${WORK_DIR}/${tag}.cpu_a"
 	local snap_b="${WORK_DIR}/${tag}.cpu_b"
-	local t0 t1
+	local elapsed
 
-	cpu_snapshot "$snap_a"
-	t0="$(date +%s)"
+	snapshot_ok "$snap_a" || true
+	# The window is timed with bash's `time` builtin, not `date +%s`. BSD date
+	# has whole-second resolution, which rounds a short slot's window to 0 and
+	# makes the interference reading unmeasurable for reasons that have nothing
+	# to do with the host. TIMEFORMAT=%R gives milliseconds and forks nothing.
+	#
 	# `--metrics off` is not a preference. An A/B run exercises arms that were
 	# built to be thrown away, and `runs.db` is append-only: a row written from
 	# a discarded arm cannot be taken back out. `off` never opens the file.
+	TIMEFORMAT='%R'
 	# shellcheck disable=SC2086  # extra args are deliberately word-split
-	if ! RMLX_HOME="$RMLX_HOME" "$bin" --metrics off baseline \
-		--model "$model" \
-		--prompt-tokens "$PROMPT_TOKENS" \
-		--max-tokens "$MAX_TOKENS" \
-		--max-ctx "$MAX_CTX" \
-		--emit-token-ids \
-		$extra \
-		>"$raw" 2>"${raw}.err"; then
+	if ! elapsed="$( { time {
+		RMLX_HOME="$RMLX_HOME" "$bin" --metrics off baseline \
+			--model "$model" \
+			--prompt-tokens "$PROMPT_TOKENS" \
+			--max-tokens "$MAX_TOKENS" \
+			--max-ctx "$MAX_CTX" \
+			--emit-token-ids \
+			$extra \
+			>"$raw" 2>"${raw}.err"
+	}; } 2>&1 )"; then
 		echo "ERROR: slot $tag failed to run" >&2
 		echo "  cmd: $bin baseline --model $model ... $extra" >&2
 		sed 's/^/    | /' "${raw}.err" | tail -20 >&2
 		exit 125
 	fi
-	t1="$(date +%s)"
-	cpu_snapshot "$snap_b"
-	SLOT_HOST="$(classify_window "$snap_a" "$snap_b" "$((t1 - t0))")"
+	snapshot_ok "$snap_b" || true
+	SLOT_HOST="$(classify_window "$snap_a" "$snap_b" "$elapsed")"
+	# The model-level window is the sum of its slots, kept at the same
+	# millisecond resolution rather than re-derived from a whole-second clock.
+	MODEL_ELAPSED="$(awk -v a="$MODEL_ELAPSED" -v b="$elapsed" 'BEGIN { printf "%.3f", a + b }')"
 
 	SLOT_TPS="$(sed -n 's/.*decode_tps=\([0-9.]*\).*/\1/p' "$raw" | head -1)"
 	SLOT_MEM="$(sed -n 's/.*metal_gen_alloc_mb=\([0-9.]*\).*/\1/p' "$raw" | head -1)"
+	local slot_peak
+	slot_peak="$(sed -n 's/.*metal_peak_mb=\([0-9.]*\).*/\1/p' "$raw" | head -1)"
 	sed -n 's/^baseline: token_ids=//p' "$raw" | head -1 | tr ',' '\n' >"$ids"
 	SLOT_IDS_FILE="$ids"
+	local has_ids_line=0
+	grep -q '^baseline: token_ids=' "$raw" && has_ids_line=1
 
 	if [[ -z "$SLOT_TPS" ]]; then
 		echo "ERROR: slot $tag produced no decode_tps. Output: $raw" >&2
 		exit 125
 	fi
-	if [[ -z "$SLOT_MEM" ]]; then
-		echo "ERROR: slot $tag produced no metal_gen_alloc_mb. Output: $raw" >&2
+	if [[ -z "$SLOT_MEM" || -z "$slot_peak" ]]; then
+		echo "ERROR: slot $tag produced no Metal memory reading. Output: $raw" >&2
 		exit 125
 	fi
-	if [[ ! -s "$ids" ]]; then
-		echo "ERROR: slot $tag produced no token_ids. Output: $raw" >&2
+	# Presence is not the same as a measurement. `metal_peak_mb=0.0` is what the
+	# bracket emits when the allocator is absent, the reset failed, or nothing
+	# was materialised -- and it prints downstream as `A median=0.0 B median=0.0
+	# delta=+0.0 MB`, which reads exactly like "both arms allocate identically".
+	if awk -v v="$slot_peak" 'BEGIN { exit !(v + 0 <= 0) }'; then
+		echo "ERROR: slot $tag reported metal_peak_mb=0 — the peak bracket measured" >&2
+		echo "  nothing, so its memory column would be a zero that looks like a" >&2
+		echo "  result. Output: $raw" >&2
+		exit 125
+	fi
+
+	if [[ "$has_ids_line" -eq 0 ]]; then
+		echo "ERROR: slot $tag emitted no token_ids line at all — the correctness" >&2
+		echo "  comparison would have nothing to compare. Output: $raw" >&2
+		exit 125
+	fi
+
+	# A token list that is present but degenerate compares 'identical' for the
+	# wrong reason. An arm that early-stops at one token, or emits an empty
+	# list, would pass a bare presence check while its TPS means nothing.
+	local n_ids
+	n_ids="$(grep -c '^[0-9][0-9]*$' "$ids" || true)"
+	if [[ "${n_ids:-0}" -lt "$MAX_TOKENS" ]]; then
+		echo "ERROR: slot $tag emitted $n_ids token ids, expected $MAX_TOKENS." >&2
+		echo "  A short generation makes both the timing and the cross-arm token" >&2
+		echo "  comparison meaningless. Output: $raw" >&2
 		exit 125
 	fi
 }
@@ -427,20 +574,34 @@ CRITERION, declared before any measurement:
   disjoint -- every slot of one arm faster than every slot of the other.
   Under the null hypothesis that the arms are exchangeable (which the ABBA
   pattern is what makes plausible), the probability of that happening by
-  chance is exactly 2 / C($SLOTS, $((SLOTS / 2))) = $(awk -v n="$SLOTS" -v k="$((SLOTS / 2))" 'BEGIN {
-      r = 1; for (i = 1; i <= k; i++) r = r * (n - k + i) / i; printf "%.5f", 2 / r }').
+  chance is exactly 2 / C($SLOTS, $((SLOTS / 2))) = $NULL_P per comparison.
   Anything else is INCONCLUSIVE. An INCONCLUSIVE ratio is not a small effect;
   it is no measured effect.
 
-WHAT THE NUMBERS LICENSE:
-  n=$((SLOTS / 2)) per arm. The median is a point estimate. A sample stddev over
-  $((SLOTS / 2)) values carries roughly +/-30% of its own uncertainty, so it
-  describes this run's spread and nothing more. No confidence interval and no
-  p-value beyond the pre-declared rank test above are computed, and none should
-  be read into the ratio.
+  FAMILY SIZE: this run makes ${#MODELS[@]} independent comparisons, one per model.
+  The chance that AT LEAST ONE comes back SEPARATED under the null is
+  1-(1-$NULL_P)^${#MODELS[@]} = $FAMILY_P. Read a single SEPARATED against that number,
+  not against the per-comparison one. Pairing a run with --invert doubles the
+  family again.
 
-Every slot runs with --metrics off, so runs.db is never opened. The only file
-this run leaves behind is $RESULT_JSON.
+WHAT THE NUMBERS LICENSE:
+  n=$((SLOTS / 2)) per arm. The median is a point estimate. The relative standard error
+  of a sample stddev over $((SLOTS / 2)) values is ~1/sqrt(2(n-1)) = ${SD_RSE_PCT}%, so the
+  spread figures describe this run and nothing more. No confidence interval and
+  no p-value beyond the pre-declared rank test above are computed, and none
+  should be read into the ratio.
+
+INTERFERENCE GATE: a foreign process at or above ${BUSY_PCT}% of one core taints the
+  run.$( awk -v t="$BUSY_PCT" 'BEGIN { exit !(t > 25) }' && echo "  RAISED from the 25% default -- the gate is correspondingly weaker." )
+  It is measured from cumulative CPU time across each slot and across the
+  comparison, so it sees anything running at the start, the end, or throughout.
+  It does NOT see a process that both starts and exits inside one window.
+
+Every slot runs with --metrics off, so runs.db is never opened. This run writes
+its result to $RESULT_JSON. Each slot is a full rmlx process
+and still writes its own \$RMLX_HOME/logs/<run-id>.jsonl, and each launch runs
+the log size-cap rotation -- point RMLX_HOME at a scratch directory if that
+matters.
 ========================================================================
 HEADER
 
@@ -486,8 +647,8 @@ for model in "${MODELS[@]}"; do
 	# authoritative interference gate: the per-slot windows below are finer
 	# attribution, but a slot can be shorter than the clock's resolution
 	# whereas the comparison as a whole never is.
-	cpu_snapshot "${WORK_DIR}/model_cpu_a"
-	MODEL_T0="$(date +%s)"
+	snapshot_ok "${WORK_DIR}/model_cpu_a" || true
+	MODEL_ELAPSED=0
 
 	# Warmup: one untimed run per arm. It pays the page-cache and
 	# shader-compile costs that would otherwise land entirely on slot 1, and
@@ -525,6 +686,7 @@ for model in "${MODELS[@]}"; do
 	# host reads as clean the moment no individual slot happens to trip.
 	TAINTED=""
 	BUSY_SLOTS=0
+	UNMEASURED_SLOTS=0
 	WORST_SLOT=""
 	WORST_PCT=0
 	if [[ "${INITIAL_HOST%% *}" == "busy" ]]; then
@@ -560,14 +722,21 @@ for model in "${MODELS[@]}"; do
 			B_TPS+=("$SLOT_TPS"); B_MEM+=("$SLOT_MEM")
 		fi
 
-		if [[ "${SLOT_HOST%% *}" == "busy" ]]; then
+		case "${SLOT_HOST%% *}" in
+		busy)
 			BUSY_SLOTS=$((BUSY_SLOTS + 1))
 			slot_pct="$(echo "$SLOT_HOST" | awk '{print $2}')"
 			if awk -v a="$slot_pct" -v b="$WORST_PCT" 'BEGIN { exit !(a > b) }'; then
 				WORST_PCT="$slot_pct"
 				WORST_SLOT="$(host_detail "$SLOT_HOST")"
 			fi
-		fi
+			;;
+		unmeasured)
+			# Same rule at slot level as at model level: not knowing whether a
+			# slot was interfered with is not the same as knowing it was not.
+			UNMEASURED_SLOTS=$((UNMEASURED_SLOTS + 1))
+			;;
+		esac
 		printf "  slot %2d  %-14s decode_tps=%8s  metal_gen_alloc_mb=%7s  busiest_foreign=%s\n" \
 			"$i" "$name" "$SLOT_TPS" "$SLOT_MEM" "$(host_detail "$SLOT_HOST")"
 	done
@@ -575,10 +744,13 @@ for model in "${MODELS[@]}"; do
 	if [[ "$BUSY_SLOTS" -gt 0 ]]; then
 		TAINTED="${TAINTED}${BUSY_SLOTS} of ${SLOTS} slots ran alongside a foreign process (worst ${WORST_SLOT}); "
 	fi
+	if [[ "$UNMEASURED_SLOTS" -gt 0 ]]; then
+		TAINTED="${TAINTED}${UNMEASURED_SLOTS} of ${SLOTS} slots could not be sampled for interference; "
+	fi
 
-	cpu_snapshot "${WORK_DIR}/model_cpu_b"
+	snapshot_ok "${WORK_DIR}/model_cpu_b" || true
 	MODEL_HOST="$(classify_window "${WORK_DIR}/model_cpu_a" "${WORK_DIR}/model_cpu_b" \
-		"$(($(date +%s) - MODEL_T0))")"
+		"$MODEL_ELAPSED")"
 	case "${MODEL_HOST%% *}" in
 	busy)
 		TAINTED="${TAINTED}the comparison window as a whole ($(host_detail "$MODEL_HOST")); "
@@ -672,7 +844,8 @@ cat >"$RESULT_JSON" <<JSON
   "arm_a": {"label": "$(json_str "$LABEL_A")", "binary": "$(json_str "$BIN_A")", "sha256_16": "$SHA_A", "args": "$(json_str "$ARGS_A")"},
   "arm_b": {"label": "$(json_str "$LABEL_B")", "binary": "$(json_str "$BIN_B")", "sha256_16": "$SHA_B", "args": "$(json_str "$ARGS_B")"},
   "host": {"load_at_start": "$INITIAL_LOAD", "busiest_at_start": "$(json_str "$(host_detail "$INITIAL_HOST")")", "busiest_at_end": "$(json_str "$(host_detail "$FINAL_HOST")")", "busy_pct_threshold": $BUSY_PCT},
-  "waivers": {"null_arms": $ALLOW_NULL_ARMS, "busy_host": $ALLOW_BUSY_HOST, "token_divergence": $ALLOW_TOKEN_DIVERGENCE},
+  "statistics": {"null_p_per_comparison": $NULL_P, "comparisons": ${#MODELS[@]}, "null_p_family": $FAMILY_P, "stddev_rel_std_err_pct": $SD_RSE_PCT},
+  "waivers": {"null_arms": $ALLOW_NULL_ARMS, "busy_host": $ALLOW_BUSY_HOST, "token_divergence": $ALLOW_TOKEN_DIVERGENCE, "busy_pct_raised": $(awk -v t="$BUSY_PCT" 'BEGIN { print (t > 25) ? "true" : "false" }')},
   "results": [
 ${JSON_MODELS%,}
   ]

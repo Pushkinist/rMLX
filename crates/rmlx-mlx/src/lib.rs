@@ -1138,6 +1138,7 @@ pub fn mlx_reset_peak_memory() -> bool {
 #[derive(Debug, Clone, Copy)]
 pub struct PeakBracket {
     live_at_open: u64,
+    reset_ok: bool,
 }
 
 /// What a [`PeakBracket`] observed. All three raw fields are in bytes.
@@ -1155,19 +1156,31 @@ pub struct PeakReading {
     pub live_at_open_bytes: u64,
     /// Live bytes when the bracket closed.
     pub live_at_close_bytes: u64,
+    /// Whether the peak mark was successfully zeroed when the bracket opened.
+    ///
+    /// When this is `false` the peak reading is still process-lifetime, so no
+    /// delta computed from it is scoped to anything. Every derived accessor
+    /// reports "measured nothing" rather than a plausible number.
+    pub reset_ok: bool,
 }
 
 impl PeakBracket {
     /// Record the live byte count and zero the peak mark.
     ///
-    /// A failing C call is not an error here — it means the reading is
-    /// unavailable (CPU-only build), and the resulting [`PeakReading`] is all
-    /// zeroes, which every derived quantity treats as "measured nothing".
+    /// Neither C call is required to succeed — on a build with no Metal
+    /// allocator both fail. What matters is that the two failures are tracked
+    /// separately: if the *reset* fails while the live reading succeeds, the
+    /// peak stays process-lifetime and `peak - live_at_open` would be a large,
+    /// stable, entirely meaningless number. [`PeakReading::measurable`] is what
+    /// distinguishes that from a real measurement.
     #[must_use]
     pub fn open() -> Self {
         let live_at_open = mlx_active_memory_bytes().unwrap_or(0);
-        mlx_reset_peak_memory();
-        Self { live_at_open }
+        let reset_ok = mlx_reset_peak_memory();
+        Self {
+            live_at_open,
+            reset_ok,
+        }
     }
 
     /// Read the peak and live counts back.
@@ -1177,18 +1190,33 @@ impl PeakBracket {
             peak_bytes: mlx_peak_memory_bytes().unwrap_or(0),
             live_at_open_bytes: self.live_at_open,
             live_at_close_bytes: mlx_active_memory_bytes().unwrap_or(0),
+            reset_ok: self.reset_ok,
         }
     }
 }
 
 impl PeakReading {
+    /// Whether this reading is scoped to the bracket at all.
+    ///
+    /// `false` when the peak mark could not be zeroed at `open()`. The peak is
+    /// then still process-lifetime, so every delta derived from it describes
+    /// the process rather than the region, and all of them report zero instead.
+    #[must_use]
+    pub const fn measurable(&self) -> bool {
+        self.reset_ok
+    }
+
     /// Bytes the region needed *on top of* what was already live when it
     /// opened. This is the number an allocation gate should assert on: it is
     /// independent of the resident weights and of whatever ran before.
     ///
-    /// Saturating: a region that allocated nothing reports `0`.
+    /// Saturating: a region that allocated nothing reports `0`, and so does a
+    /// reading that is not [`measurable`](Self::measurable).
     #[must_use]
     pub const fn headroom_bytes(&self) -> u64 {
+        if !self.reset_ok {
+            return 0;
+        }
         self.peak_bytes.saturating_sub(self.live_at_open_bytes)
     }
 
@@ -1205,17 +1233,32 @@ impl PeakReading {
     /// can see, because the output bits are unchanged.
     #[must_use]
     pub const fn transient_bytes(&self) -> u64 {
+        if !self.reset_ok {
+            return 0;
+        }
         self.peak_bytes.saturating_sub(self.live_at_close_bytes)
     }
 
-    /// `true` when the bracket saw at least one allocation.
+    /// `true` when this region's live bytes rose above where they started.
     ///
     /// A gate that asserts an upper bound passes vacuously against a region
     /// that never allocated (or against a build with no Metal allocator at
     /// all); assert this first so the gate cannot pass by measuring nothing.
+    ///
+    /// This is `headroom_bytes() > 0`, **not** `peak_bytes > 0`. MLX updates
+    /// the mark as `peak = max(peak, active)` on every allocation, and `active`
+    /// is the whole live count — so after a reset a single one-byte allocation
+    /// anywhere in the process lifts `peak_bytes` to gigabytes wherever weights
+    /// are resident. `peak_bytes > 0` therefore means "something, somewhere,
+    /// allocated since the reset", which in any real process is always true.
+    ///
+    /// The residual limit: a region that frees before it allocates, and never
+    /// climbs back above where it opened, reads `false`. That is accurate —
+    /// nothing about this region's peak was observable — but it is not the same
+    /// as "no allocation call was made".
     #[must_use]
     pub const fn observed_allocation(&self) -> bool {
-        self.peak_bytes > 0
+        self.headroom_bytes() > 0
     }
 }
 

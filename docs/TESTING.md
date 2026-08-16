@@ -399,7 +399,11 @@ Three rules, each of which has a corresponding way to get it wrong:
 - **Assert `observed_allocation()` before any upper bound.** An upper bound
   holds trivially against a region that allocated nothing, which is exactly
   what happens if the `eval()` drifts outside the bracket — the reading comes
-  back `peak_bytes: 0` and the gate passes while measuring nothing.
+  back `peak_bytes: 0` and the gate passes while measuring nothing. The
+  predicate is `headroom_bytes() > 0`, i.e. this region's live bytes rose above
+  where they started; `peak_bytes > 0` would be true in every real process,
+  because MLX lifts the mark to the whole live count on the first allocation
+  after a reset.
 - **Bound a multiple of the workload's own size, never an absolute byte
   count.** MLX pools its buffers, so an absolute figure encodes what ran
   earlier in the test binary as much as what the region did.

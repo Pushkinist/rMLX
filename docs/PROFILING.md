@@ -615,7 +615,8 @@ let reading = bracket.close();
 | `peak_bytes` | Most bytes live at once inside the region. `0` if it allocated nothing. |
 | `headroom_bytes()` | `peak - live_at_open` — what the region needed *on top of* the resident weights. The number to compare across two runs. |
 | `transient_bytes()` | `peak - live_at_close` — allocated inside and released again. Catches a scratch buffer *larger* than the region's own steady state; a smaller one hides under the peak the surviving buffers reach anyway, and reads zero. Zero is not a no-scratch proof. |
-| `observed_allocation()` | The region allocated at all. Assert this first; an upper bound is free to hold against a region that measured nothing. |
+| `observed_allocation()` | `headroom_bytes() > 0` — this region's live bytes rose above where they started. Assert this first; an upper bound is free to hold against a region that measured nothing. **Not** `peak_bytes > 0`: MLX updates the mark as `peak = max(peak, active)` where `active` is the whole live count, so after a reset one allocation anywhere in the process lifts `peak_bytes` to the full resident total, and the predicate would be true in every real process. |
+| `measurable()` | The peak mark was actually zeroed at `open()`. When it is `false` the peak is still process-lifetime, so every accessor above returns 0 rather than a large, stable, plausible-looking delta. |
 
 Two rules the pooling allocator imposes:
 
