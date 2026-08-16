@@ -113,8 +113,11 @@ pub fn clip(a: &Array, a_min: &Array, a_max: &Array, device: Device) -> Result<A
 
 /// Element-wise `a >= b`. Returns a bool array (dtype = U8 in MLX).
 ///
-/// Used by the sparse-V cheap path to build a zero-prob mask:
-/// `greater_equal(probs, threshold_scalar)` → `0` or `1` per element.
+/// Used by the attention-mask builders in `rmlx_models::layers::mask` to turn a
+/// pair of position vectors into an allowed/blocked map:
+/// `greater_equal(q_pos, k_pos)` is the causal half, and
+/// `greater_equal(k_pos, oldest_allowed)` the sliding-window half, each `0` or
+/// `1` per element before `where_cond` turns it into an additive bias.
 pub fn greater_equal(a: &Array, b: &Array, device: Device) -> Result<Array> {
     install_error_handler();
     let mut res = unsafe { sys::mlx_array_new() };

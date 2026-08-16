@@ -1248,7 +1248,10 @@ The KV-quant auto-resolution is **identical** at both contexts:
 `Qwen3ForCausalLM` with `weight_bits=2` resolves to `Mixed{k8,v4,g64,g64}`
 regardless of ctx — `resolve_default` (`kv_cache/mod.rs:331`) has no ctx branch
 for this arch, and `kv_quant_for_ctx` is not consulted on the baseline path. So
-the 4k-vs-8k difference is not a KV-quant-by-ctx effect.
+the 4k-vs-8k difference is not a KV-quant-by-ctx effect. Both runs also go
+through the identical `rmlx baseline` path, which is what rules out a harness
+difference between the two rows — worth keeping in view now that the paragraph
+below asks for the pair to be re-measured.
 
 **The original attribution was wrong, and the size of the drop was the clue.**
 This section used to close with "no fix needed — this is correct behavior",
