@@ -761,7 +761,7 @@ impl KvCache {
             return Ok(out);
         }
 
-        // 2b. Head-major fused-QK shadow path (q8/turbo3/turbo4/iso/rotor).
+        // 2b. Head-major fused-QK shadow path (q8/turbo3/turbo4/rotor-asym).
         // Decode-only, gated by `RMLX_FUSED_QK=1`. Returns `None` to fall
         // through to the legacy bf16 SDPA path when any gate is off, when the
         // codec has no GPU encoder, or when the bf16 mirror is not yet seeded
@@ -1182,7 +1182,7 @@ impl KvCache {
             return Ok(Some((out, k_full, v_full)));
         }
 
-        // Head-major fused-QK shadow (q8/turbo3/turbo4/iso/rotor codecs).
+        // Head-major fused-QK shadow (q8/turbo3/turbo4/rotor-asym codecs).
         if let Some(out) =
             self.try_fused_qk_dispatch(queries, new_k, new_v, scale, additive_mask, device)?
         {

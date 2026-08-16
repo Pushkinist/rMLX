@@ -2502,7 +2502,7 @@ fn scrape_dispatch_paths(
 /// (plus PlanarK's `warm_ttft_bypass`). Their dispatch counters are
 /// process-internal atomics with NO HTTP/metrics surface, covered by the
 /// in-crate counter tests (`sparse_attn_dispatch.rs`,
-/// `iso_fused_qk_msl_tests.rs`) — see `docs/E2E_TEST_PLAN.md`.
+/// `rotor_fused_qk_dispatch.rs`) — see `docs/E2E_TEST_PLAN.md`.
 ///
 /// What THIS row proves externally: the attention-dispatch instrumentation
 /// FIRES (≥ 1 `update_and_sdpa` span with a resolved `path`) for the chosen

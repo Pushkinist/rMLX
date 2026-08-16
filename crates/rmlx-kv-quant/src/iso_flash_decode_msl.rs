@@ -108,8 +108,8 @@
 //!
 //! * [`crate::rotor_flash_decode_msl`] — the two-pass flash-decode shell this
 //!   is a sibling of (grid / tile / online-softmax broadcast / P2 merge).
-//! * [`crate::iso_fused_qk_msl`] — iso quaternion K-decode in MSL, and the
-//!   codebook / fixed-quaternion header-rendering pattern.
+//! * [`crate::iso_flash_decode_symv_msl`] — the quant-V sibling; same
+//!   quaternion K-decode and codebook header-rendering pattern.
 //! * [`crate::isoquant::iso_decode_fast`] — CPU reference (Rust).
 
 use std::fmt::Write as _;

@@ -23,12 +23,20 @@
 //!
 //! # Codec contract
 //!
-//! Target [`KvQuant`](crate::quant::KvQuant): `Rotor3Sym`, `RotorKOnly3`
-//! (BITS=3); `Rotor4Sym`, `RotorKOnly4` (BITS=4). K storage is
+//! Target [`KvQuant`](crate::quant::KvQuant): `RotorK3Asym` (BITS=3) and
+//! `RotorK4Asym` (BITS=4). K storage is
 //! [`crate::storage::QuantRotorK3`] / [`crate::storage::QuantRotorK4`] with
 //! `group_size = 3` (one rotor block per group of 3 head-dim slots, encoded
 //! into 8 Cl(3,0) multivector components). V side is irrelevant for the
 //! fused-QK score — the caller handles V separately.
+//!
+//! The rotor `Sym` and `KOnly` variants do **not** reach this kernel. They
+//! keep no bf16 K mirror (the fused-QK shadow is seeded by re-encoding one),
+//! and each has a dedicated flash-decode-over-quant kernel —
+//! [`crate::rotor_flash_decode_symv_msl`] and
+//! [`crate::rotor_flash_decode_msl`] — that reads the packed ring directly.
+//! The asym pair is the one rotor family member with no such arm, which makes
+//! this kernel its only GPU decode path.
 //!
 //! Bit-exact with [`crate::rotorquant::rotor3_decode`] /
 //! [`crate::rotorquant::rotor4_decode`]:
@@ -84,21 +92,20 @@
 //! The QJL residual correction lives on the **CPU dequant path** as a
 //! per-token K-side residual-add (mathematically equivalent to the Python
 //! `RotorQuantProd.inner_product` score-time term2 by linearity of `Q @ K`);
-//! see `crate::rotorquant::apply_qjl_correction`. This kernel is the GPU
-//! fused-QK shim and is reached only when the codec has a GPU encoder wired
-//! (`codec_has_gpu_encoder`, currently HOLD for rotor — see
-//! `docs/research/fused-qk-storage-design.md`). When this kernel does
-//! ship for rotor, it MUST replicate the same per-token correction in MSL
-//! before the score is emitted, or fall back to the CPU dequant path on
-//! sequences where the QJL sideband is active (`qjl_s_matrix.is_some()`).
+//! see `crate::rotorquant::apply_qjl_correction`. This kernel does not
+//! reproduce it, so `try_fused_qk_dispatch` refuses to dispatch while
+//! `rotor_qjl_enabled()` and the decode step falls back to the legacy bf16
+//! SDPA path. Adding QJL support here means replicating the per-token
+//! correction in MSL before the score is emitted — until then the gate is the
+//! contract, not an oversight.
 //!
 //! # A.y guard
 //!
-//! `Rotor3Sym` / `Rotor4Sym` are K-side ≤ 4-bit — the Qwen-MoE 218→8641 PPL
-//! disaster applies. The guard lives in
-//! `rmlx_models::kv_cache::cache_type::validate_resolved` and rejects
-//! `Qwen3_5MoeForConditionalGeneration + Rotor{3,4}Sym` at session start —
-//! the kernel does NOT re-check.
+//! `RotorK{3,4}Asym` are K-side ≤ 4-bit — the Qwen-MoE 218→8641 PPL disaster
+//! applies. The guard lives in
+//! `rmlx_models::kv_cache::cache_type::validate_resolved` and rejects every
+//! rotor K-side codec on `Qwen3_5MoeForConditionalGeneration` at session
+//! start — the kernel does NOT re-check.
 //!
 //! # Sandwich verification
 //!
@@ -113,7 +120,7 @@
 //!
 //! # Reference
 //!
-//! * [`crate::iso_fused_qk_msl`] — Exec E (parameterised BITS) dispatcher /
+//! * [`crate::turbo_k3_fused_qk_msl`] — sibling fused-QK dispatcher /
 //!   threadgroup layout / counter pattern.
 //! * [`crate::rotorquant::rotor3_decode`] / [`crate::rotorquant::rotor4_decode`]
 //!   — CPU reference (Rust).

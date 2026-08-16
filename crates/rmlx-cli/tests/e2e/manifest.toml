@@ -740,7 +740,7 @@ tags = ["run2b", "multi_model"]
 # DORMANT — warm-TTFT routes every decode step through the bf16-K seed
 # (every dispatch records path=legacy). Their dispatch counters are process-
 # internal atomics with no HTTP surface, covered by the in-crate counter tests
-# (sparse_attn_dispatch.rs, iso_fused_qk_msl_tests.rs) — see
+# (sparse_attn_dispatch.rs, rotor_fused_qk_dispatch.rs) — see
 # docs/E2E_TEST_PLAN.md. This row proves the attention-dispatch instrumentation
 # FIRES (>=1 update_and_sdpa span with a resolved path) AND output is coherent.
 # FAILS if no dispatch span appears or output is incoherent.
