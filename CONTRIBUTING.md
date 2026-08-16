@@ -25,11 +25,23 @@ make build          # cargo build --workspace --release
 make check          # fast cargo check
 make test           # workspace tests (needs a Metal GPU)
 make ci             # fmt-check + clippy + test + deny + audit  ← pre-PR gate
+make ci-perf        # test-perf + the GPU/Metal suite  ← also required, see below
 ```
 
 `make ci` must be green before you open a PR. The per-commit hook runs the fast
 checks; `cargo audit` / `cargo deny` are gated behind `make ci` (or
 `pre-commit run --hook-stage manual`).
+
+**`make ci` does not run the GPU tests.** Every test that reaches `Device::Gpu`
+carries `#[ignore]` (a shared Metal context driven from parallel `cargo test`
+threads aborts the whole binary), `make test` passes no `--ignored`, and the
+hosted CI has no Metal at all. `make ci-perf` is the gate that runs them,
+serialized and under Metal shader validation.
+
+Run it as well as `make ci` if your change touches **`crates/rmlx-kv-quant`, any
+`.metal` kernel, or a KV-cache / decode path**. It needs the GPU to itself —
+stop any `rmlx serve` first — and takes around 21 minutes. While iterating,
+`make gpu-test CRATE=… FILTER=…` runs a narrowed subset in seconds.
 
 Model-touching changes: see the regression-bench discipline in
 [`CLAUDE.md`](CLAUDE.md). At minimum the three test-target families (Gemma4,
@@ -42,7 +54,8 @@ of the recorded decode TPS.
 2. Keep changes surgical — match existing style, no drive-by refactors.
 3. Tests live in sibling `*_tests.rs` files (no inline `#[cfg(test)] mod`
    blocks — `make check-no-inline-tests` enforces this).
-4. `make ci` green locally.
+4. `make ci` green locally — plus `make ci-perf` for codec-layer / `.metal`
+   changes (see §Build & test).
 5. Open a PR into `main`. Fill in the PR template.
 
 `main` is protected: changes land via PR with CI green, not direct pushes.

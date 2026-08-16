@@ -166,8 +166,52 @@ build-debug:     ## cargo build --profile release-debug (opt-level=3 + full DWAR
 test-perf:       ## cargo test --profile release-perf (release-perf profile, panic=unwind forced by cargo for test harness)
 	cargo test --workspace --profile release-perf
 
-ci-perf:         ## pre-push gate under release-perf (separate from make ci; run before merging perf-sensitive changes)
+# ci-perf runs the GPU/Metal suite after `test-perf`, and it is the only shared
+# gate that does. `make ci` cannot: the GPU tests need the Metal context to
+# themselves (hard rule 8) and take minutes, which is the wrong price on every
+# commit. This is a real new cost for `ci-perf` and not a free one — the target
+# used to be a single `cargo test --workspace`, runnable next to a live
+# `rmlx serve`, and now it refuses to start unless the GPU is idle. It is simply
+# the cheapest place in the tree to pay it: `ci-perf` is already the long,
+# pre-merge-only target, and the preflight line below makes the new precondition
+# fail in milliseconds instead of after the release-perf half.
+#
+# Three lines, in this order, for two different reasons:
+#
+#   * `--preflight` FIRST because it is a precondition, not a test. It checks
+#     only the things that cost nothing to check — RMLX_SKIP_GPU unset, no
+#     competing MLX process, a non-empty classification — and those are the most
+#     likely way this gate fails in daily use. Discovering a live `rmlx serve`
+#     after `test-perf` has run throws away the ~16 min it took.
+#   * `test-perf` before the tests themselves because it covers the whole
+#     workspace, so a compile error anywhere shows up there, whereas the GPU run
+#     visits five crates and holds the GPU while it does. Fail on the broad,
+#     shareable step before spending exclusive-GPU minutes.
+#
+# The runner is invoked directly rather than through `$(MAKE) gpu-test`. Make
+# propagates command-line variables to sub-makes, so `make ci-perf CRATE=…` or
+# `VALIDATE=0` would silently reach the runner and narrow or disarm the gate:
+# `--crate` shrinks the classified population in lockstep with the executed one,
+# so the runner's own coverage check cannot tell that run from a complete one.
+# The knobs stay on `gpu-test`, where a human asking for a subset means it.
+#
+# The two halves run under different profiles on purpose. The GPU run builds
+# under `dev`, where debug assertions are live — 61 `debug_assert!` sites in
+# rmlx-kv-quant alone — and those are correctness guards on correctness tests.
+# `test-perf` is the one that must be release-perf, because that is the codegen a
+# perf-sensitive change ships under. The consequence is in hard rule 9: no gate
+# runs a GPU test with debug-assertions off, so a defect that only appears there
+# has to be reproduced by hand.
+#
+# Cost: the GPU half is ~4.5 min warm (318 tests, serialized, under Metal shader
+# validation). Whole target after a codec-layer edit, measured: ~21 min. The dev
+# profile is not shared with `test-perf` and is what `make target-gc` prunes
+# first, so a run after a GC pays a cold opt-level-0 build on top. See
+# docs/TESTING.md.
+ci-perf:         ## pre-push gate under release-perf + the serialized GPU/Metal suite (separate from make ci; run before merging perf-sensitive or codec-layer changes)
+	@bash scripts/run_gpu_tests.sh --preflight
 	$(MAKE) test-perf
+	@bash scripts/run_gpu_tests.sh
 	@echo "ci-perf ok"
 
 # gpu-test: the execution step for the tests `check-gpu-tests-ignored` mandates.
@@ -178,11 +222,11 @@ ci-perf:         ## pre-push gate under release-perf (separate from make ci; run
 # category, and tests in it have gone red on main and stayed red undetected.
 #
 # It is NOT part of `make ci`: it needs exclusive access to the Metal context and
-# is far too slow to block every commit. Run it before merging anything in the
-# codec layer. Folding it into `ci-perf` (the one target that already assumes
-# exclusive machine access) is the natural next step, but is blocked while any
-# GPU test is red on main — wiring a known-red step into a shared gate just
-# teaches people to skip the gate.
+# is far too slow to block every commit. `ci-perf` runs the same suite as its
+# third line — by calling the script directly, not this target, so that its
+# population cannot be narrowed from the command line (see the note there). This
+# target is the hand-driven entry point: narrow it with CRATE=/FILTER= while
+# iterating on the codec layer, rather than paying for the whole gate each time.
 #
 # Metal shader validation is ON here. An out-of-bounds device store is dropped
 # silently — command buffer completes, cb.error is nil, cargo exits 0, and the
