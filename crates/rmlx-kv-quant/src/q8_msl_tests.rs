@@ -1,5 +1,5 @@
 use super::*;
-use rmlx_mlx::{Array, Device, Dtype};
+use rmlx_mlx::{Array, Device, Dtype, PeakBracket};
 
 #[allow(
     clippy::expect_used,
@@ -117,5 +117,86 @@ fn q8_msl_matches_cpu_within_eps() {
     assert!(
         max_diff < 1.0e-4,
         "CPU vs GPU max abs diff {max_diff:.6} exceeds 1e-4"
+    );
+}
+
+/// Allocation gate for the q8 MSL round trip.
+///
+/// Numerics tests cannot see a change that leaves every output bit identical
+/// while allocating an extra scratch buffer per dispatch. This one can: it
+/// brackets the Metal allocator across quantize + dequantize and bounds the
+/// bytes the region needed on top of what was already live.
+///
+/// The bound is a multiple of the *input* size, never an absolute byte count —
+/// MLX pools its buffers, so an absolute figure would encode whatever ran
+/// before this test rather than what this region did. The outputs are
+/// materialised inside the bracket because MLX is lazy: without the `eval`
+/// the allocation would happen after `close()` and the gate would measure
+/// nothing.
+///
+/// Budget: codes are 1/4 of the input (i8 vs f32) and scales 1/128 of it, and
+/// the dequantized reconstruction is a full input-sized f32 buffer. That is
+/// ~1.26x live at the peak. 4x leaves room for one full-size scratch buffer
+/// on top and still fails a per-element temporary or a doubled reconstruction.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test q8_msl -- --ignored --test-threads=1"]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+fn q8_msl_roundtrip_allocation_stays_within_budget() {
+    let shape = [1i32, 4, 128, 128];
+    let n: usize = shape.iter().map(|&d| d as usize).product();
+    let input_bytes = (n * 4) as u64;
+    let data = lcg_data(n, 0x5EED_1234_u64);
+    let arr = make_f32_array(&data, &shape);
+    // Materialise the input before the bracket opens: its bytes are part of
+    // "already live", not part of what the round trip costs.
+    arr.eval().expect("eval input");
+
+    let bracket = PeakBracket::open();
+    let (codes, scales) = q8_quantize_gpu(&arr, Device::Gpu).expect("GPU quantize");
+    let recon =
+        q8_dequantize_gpu(&codes, &scales, &shape, Dtype::F32, Device::Gpu).expect("GPU dequant");
+    recon.eval().expect("eval recon");
+    let reading = bracket.close();
+
+    // Anti-vacuous: an upper bound is free to hold against a region that never
+    // allocated. Prove the bracket actually saw the round trip first.
+    assert!(
+        reading.observed_allocation(),
+        "peak bracket recorded no allocation across a q8 round trip — the bracket \
+         is not measuring the region ({reading:?})"
+    );
+
+    // Every byte the region peaked at is still live at close: the round trip
+    // allocates its codes, scales and reconstruction and holds all three.
+    //
+    // What this can see: a scratch buffer LARGER than the round trip's own
+    // steady state, allocated and released inside the region. That is the
+    // regression worth catching, and no numerics test can see it — the output
+    // bits do not change.
+    //
+    // What it cannot see: a transient smaller than the steady-state peak. It
+    // hides under the peak the surviving buffers reach anyway, and a
+    // peak-based measure has no way to distinguish it. `headroom_bytes` above
+    // does not see it either. Neither bound is a general no-scratch proof.
+    assert_eq!(
+        reading.transient_bytes(),
+        0,
+        "q8 round trip allocated {} bytes it then released before the bracket closed — \
+         a transient larger than the round trip's own working set appeared in a path \
+         that had none ({reading:?})",
+        reading.transient_bytes(),
+    );
+
+    let budget = 4 * input_bytes;
+    assert!(
+        reading.headroom_bytes() <= budget,
+        "q8 round trip needed {} bytes over the {} already live, budget is {budget} \
+         ({:.2}x the {input_bytes}-byte input) — {reading:?}",
+        reading.headroom_bytes(),
+        reading.live_at_open_bytes,
+        reading.headroom_bytes() as f64 / input_bytes as f64,
     );
 }

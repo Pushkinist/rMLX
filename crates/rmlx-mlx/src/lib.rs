@@ -1066,10 +1066,13 @@ pub use ops::*;
 ///
 /// Wraps `mlx_get_peak_memory` from mlx-c 0.6.0. Returns `None` if the C
 /// call reports an error (e.g. on non-Metal / CPU-only builds).
-/// The value is the process-lifetime maximum — it resets only if explicitly
-/// cleared via `mlx_clear_peak_memory` (which rMLX never calls).
 ///
-/// Used by the C7 `metal_peak_alloc_mb` metric emit in `engine.rs`.
+/// The value is the maximum of the allocator's *live* byte count observed
+/// since the process started, or since the last [`mlx_reset_peak_memory`].
+/// A bare reading is therefore a process-lifetime dashboard number; to scope
+/// it to one region use [`PeakBracket`].
+///
+/// Used by the `metal_peak_alloc_mb` metric emit in the server engine.
 pub fn mlx_peak_memory_bytes() -> Option<u64> {
     install_error_handler();
     let mut res: usize = 0;
@@ -1080,6 +1083,140 @@ pub fn mlx_peak_memory_bytes() -> Option<u64> {
         return None;
     }
     Some(res as u64)
+}
+
+/// Currently live (allocated and not yet freed) Metal allocator bytes.
+///
+/// Wraps `mlx_get_active_memory`. Returns `None` if the C call reports an
+/// error. Pooled-but-free buffers are *not* counted here — they sit in the
+/// allocator's cache, which `mlx_get_cache_memory` reports separately.
+pub fn mlx_active_memory_bytes() -> Option<u64> {
+    install_error_handler();
+    let mut res: usize = 0;
+    // SAFETY: writing to a stack `usize` we own; `mlx_get_active_memory` is
+    // thread-safe per mlx-c contract.
+    let status = unsafe { sys::mlx_get_active_memory(&raw mut res) };
+    if status != 0 {
+        return None;
+    }
+    Some(res as u64)
+}
+
+/// Zero the Metal allocator's peak-memory high-water mark.
+///
+/// Wraps `mlx_reset_peak_memory`. Returns `false` if the C call reports an
+/// error. After a successful reset [`mlx_peak_memory_bytes`] reads `0` until
+/// the next allocation, then tracks the live byte count from there — so the
+/// reading becomes "the most bytes that were live at once *since the reset*",
+/// which is what makes a scoped measurement possible.
+///
+/// The high-water mark is process-global. Two brackets running concurrently
+/// on different threads reset each other; scope one at a time.
+pub fn mlx_reset_peak_memory() -> bool {
+    install_error_handler();
+    // SAFETY: no arguments, no out-params; `mlx_reset_peak_memory` is
+    // thread-safe per mlx-c contract.
+    let status = unsafe { sys::mlx_reset_peak_memory() };
+    status == 0
+}
+
+/// A scoped Metal-allocator measurement: reset the peak, run a region, read it.
+///
+/// MLX pools its device buffers, so an absolute byte count says as much about
+/// what ran before as about the region under test. What is comparable is the
+/// *delta* across a bracket, which is what this type reports.
+///
+/// ```ignore
+/// let bracket = PeakBracket::open();
+/// // ... the region under test, materialised (lazy arrays must be eval'd here) ...
+/// let reading = bracket.close();
+/// assert!(reading.observed_allocation());       // or the bound below is vacuous
+/// assert!(reading.headroom_bytes() <= budget);  // budget scaled to the workload
+/// ```
+///
+/// The high-water mark is process-global — see [`mlx_reset_peak_memory`].
+#[derive(Debug, Clone, Copy)]
+pub struct PeakBracket {
+    live_at_open: u64,
+}
+
+/// What a [`PeakBracket`] observed. All three raw fields are in bytes.
+///
+/// Construct one only via [`PeakBracket::close`]; the derived accessors are
+/// the intended reading surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PeakReading {
+    /// Most bytes live at any one moment inside the bracket. `0` when the
+    /// region allocated nothing at all (the reset leaves the mark at zero and
+    /// only an allocation raises it).
+    pub peak_bytes: u64,
+    /// Live bytes when the bracket opened.
+    pub live_at_open_bytes: u64,
+    /// Live bytes when the bracket closed.
+    pub live_at_close_bytes: u64,
+}
+
+impl PeakBracket {
+    /// Record the live byte count and zero the peak mark.
+    ///
+    /// A failing C call is not an error here — it means the reading is
+    /// unavailable (CPU-only build), and the resulting [`PeakReading`] is all
+    /// zeroes, which every derived quantity treats as "measured nothing".
+    #[must_use]
+    pub fn open() -> Self {
+        let live_at_open = mlx_active_memory_bytes().unwrap_or(0);
+        mlx_reset_peak_memory();
+        Self { live_at_open }
+    }
+
+    /// Read the peak and live counts back.
+    #[must_use]
+    pub fn close(self) -> PeakReading {
+        PeakReading {
+            peak_bytes: mlx_peak_memory_bytes().unwrap_or(0),
+            live_at_open_bytes: self.live_at_open,
+            live_at_close_bytes: mlx_active_memory_bytes().unwrap_or(0),
+        }
+    }
+}
+
+impl PeakReading {
+    /// Bytes the region needed *on top of* what was already live when it
+    /// opened. This is the number an allocation gate should assert on: it is
+    /// independent of the resident weights and of whatever ran before.
+    ///
+    /// Saturating: a region that allocated nothing reports `0`.
+    #[must_use]
+    pub const fn headroom_bytes(&self) -> u64 {
+        self.peak_bytes.saturating_sub(self.live_at_open_bytes)
+    }
+
+    /// Bytes allocated inside the region and released again before it closed.
+    ///
+    /// Non-zero means the region peaked above what it was still holding at the
+    /// end — it allocated something and threw it away.
+    ///
+    /// **Zero does not mean no scratch buffer existed.** A transient smaller
+    /// than the region's own steady-state peak hides underneath it: the peak
+    /// is reached by the surviving buffers regardless, so this reads zero.
+    /// What it does catch is a transient *larger* than the steady state, which
+    /// is the allocation regression worth a gate — and one no numerics test
+    /// can see, because the output bits are unchanged.
+    #[must_use]
+    pub const fn transient_bytes(&self) -> u64 {
+        self.peak_bytes.saturating_sub(self.live_at_close_bytes)
+    }
+
+    /// `true` when the bracket saw at least one allocation.
+    ///
+    /// A gate that asserts an upper bound passes vacuously against a region
+    /// that never allocated (or against a build with no Metal allocator at
+    /// all); assert this first so the gate cannot pass by measuring nothing.
+    #[must_use]
+    pub const fn observed_allocation(&self) -> bool {
+        self.peak_bytes > 0
+    }
 }
 
 // ---------------------------------------------------------------------------

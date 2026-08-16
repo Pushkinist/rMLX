@@ -360,6 +360,97 @@ Each new codec: invoke `scripts/bench_codec_cell.sh --kv-quant <codec> --model <
 one release. Use `make canary-gate` (DB-backed) for new regression gates.
 `scripts/regression_gate.sh` (CSV-backed) is also preserved as a legacy fallback.
 
+**The canary tracks one build over time. It cannot compare two.** All of a
+model's measured runs happen together, so when it is pointed at two builds in
+turn, whichever ran second wears any drift — and on a contended host that drift
+is large. Calibration, 2026-08-16, gemma-4-e2b at 4 k on a desktop with
+WindowServer sustained around 50 % of a core: two arms that were *the same
+binary with the same flags* came out with medians 1.75 % apart (114.51 vs
+116.51 tok/s). Three blocked runs per arm would have called that a 1.75 % win.
+The interleaved harness reported no difference — the arms' per-slot ranges
+overlapped — and refused the run outright as `TAINTED`, naming the contending
+process. For any two-arm question, use `--ab`.
+
+## A/B comparison: `perf_canary.sh --ab` (`scripts/perf_ab.sh`)
+
+Interleaved comparison of two arms, where an arm is a (binary, extra
+`rmlx baseline` arguments) pair.
+
+```bash
+# two builds, same flags
+bash scripts/perf_canary.sh --ab \
+  --binary-a target/release-perf/rmlx.main \
+  --binary-b target/release-perf/rmlx \
+  --label-a main --label-b patch
+
+# one build, two flag settings, on one model
+bash scripts/perf_canary.sh --ab \
+  --model "$RMLX_O_MODELS_ROOT/mlx-community__gemma-4-e2b-it-mxfp8" \
+  --arm-a "--kv-quant k8v8" --arm-b "--kv-quant k8v4" \
+  --allow-token-divergence
+```
+
+**Protocol.** Per model: one untimed warmup per arm (which also records that
+arm's correctness reference), then `--slots` measured slots (default 12) in a
+balanced `ABBA BAAB ABBA` schedule. Both arms therefore occupy the same mean
+slot position, so a drift that is monotone across the run cancels. `--invert`
+complements the pattern; running once each way cancels any residual positional
+bias. `--slots` must be a multiple of 4 — a partial block would give the arms
+different mean positions and put the confound back.
+
+**Criterion, fixed before the run.** The arms are **SEPARATED** if and only if
+their per-slot `decode_tps` ranges are disjoint. Under the null that the arms
+are exchangeable, `P(disjoint) = 2 / C(slots, slots/2)` — `2/924 = 0.0022` at
+the default 12. Anything else is **INCONCLUSIVE**, which means *no measured
+effect*, not *a small one*. The reported ratio under INCONCLUSIVE is the gap
+between two point estimates drawn from overlapping spreads and is not evidence.
+
+**What the statistics license.** `n = slots/2` per arm — 6 by default. The
+median is a point estimate; a sample stddev over 6 values carries roughly ±30 %
+of its own uncertainty. No confidence interval and no p-value beyond the rank
+test above are computed, and none should be read into the ratio.
+
+**Guards.** Each refuses rather than producing a number that looks fine:
+
+| Guard | Behaviour | Waiver |
+|---|---|---|
+| Indistinguishable arms (same binary digest *and* same args) | exit 125 before measuring | `--allow-null-arms` |
+| Host not quiescent — any foreign process ≥ `--busy-pct` (default 25) of a core | exit 125 before measuring | `--allow-busy-host` (still exits 125 if the result is tainted) |
+| A foreign process ran during any slot or across the comparison | verdict `TAINTED`, exit 125 | none |
+| Arms generate different token ids | exit 1 | `--allow-token-divergence` |
+| A slot stops reproducing its own arm's warmup token ids | exit 1 | none |
+| `rmlx serve` holds the Metal context | exit 125 (reported, never killed) | none |
+| A slot emits no `decode_tps` / `metal_gen_alloc_mb` / `token_ids` | exit 125 | none |
+
+Interference is measured as the change in a process's cumulative CPU time
+across a known wall-clock window, per slot and across the whole comparison.
+`ps -o pcpu` is **not** usable for this on macOS: it is a stale decayed figure
+that does not move while a process pins a core.
+
+**Correctness is folded in.** Every slot emits `--emit-token-ids` and its exact
+`Vec<u32>` is compared against its arm's warmup reference, and the two arms'
+references against each other. An arm that is fast and wrong fails the
+invocation that made it look fast.
+
+**Never writes `runs.db`.** Every slot runs `--metrics off`, so the file is
+never opened. Results land in `$RMLX_HOME/bench/perf_ab/<timestamp>.json`
+alongside the recorded host conditions and the binary digests. An A/B run
+exercises arms built to be thrown away; a row in the append-only store cannot
+be taken back out.
+
+**Cost.** `2 + slots` process launches per model (14 at the default), against
+the canary's ~10. Each slot is a fresh process: alternating two *kernel
+dispatch paths* inside one process needs a threaded dispatch-policy value,
+which does not exist yet — the five kernel selections are latched in `OnceLock`
+at first read. Interleaving still removes the ordering and drift confounds,
+because they act at slot granularity. When the policy value lands, an
+in-process arm is just another `--arm-a` / `--arm-b` argument and the harness
+does not change.
+
+`bash scripts/perf_ab_selftest.sh` mutation-checks the harness against stub
+binaries with planted differences: it must report a planted ratio exactly, and
+must report nothing for two arms that are the same.
+
 **Canary protocol**:
 - Profile: `release-perf` (debug-assertions=false, overflow-checks=false, stripped)
 - Shape: `--prompt-tokens 4096 --max-tokens 100 --max-ctx 8192`, `kv_quant=auto`

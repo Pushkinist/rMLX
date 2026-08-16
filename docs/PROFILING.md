@@ -591,11 +591,50 @@ They are related but not equal; understanding the difference matters for OOM tun
 | `compressed_bytes` | `TASK_VM_INFO.compressed` | Pages handed to the macOS memory compressor ("soft swap" — still counts against `phys_footprint`). | Non-zero means the system is already under pressure. |
 | `external_bytes` | `TASK_VM_INFO.external` | File-backed pages — in rMLX this is primarily mmap'd safetensors weight files. | `external_bytes ≈ loaded-weight footprint`; grows with model size, shrinks on unload. |
 
-**Metal `peak_alloc_mb` (F3, not yet built)** is a separate counter from the Metal Performance
+**Metal `peak_alloc_mb`** is a separate counter from the Metal Performance
 HUD / `MTLDevice.currentAllocatedSize`.  It counts GPU-private VRAM allocations (weight
 tensors, KV-cache MTLBuffers) and is disjoint from the `task_info` counters above — they
 measure CPU/UMA host memory, not GPU-private usage.  On Unified Memory Macs the boundaries
 blur (all memory is the same physical chips) but the accounting domains are distinct.
+
+### 9.1 Scoping the Metal peak to a region
+
+`rmlx_mlx::mlx_peak_memory_bytes()` alone is a process-lifetime high-water mark:
+it carries the model load, every prior request, and anything else the process
+did. That makes it a dashboard number, not something an assertion can be built
+on. `rmlx_mlx::PeakBracket` scopes it:
+
+```rust
+let bracket = PeakBracket::open();   // record live bytes, zero the peak mark
+// ... region under test, MATERIALISED (MLX is lazy: eval inside the bracket) ...
+let reading = bracket.close();
+```
+
+| Accessor | Meaning |
+|---|---|
+| `peak_bytes` | Most bytes live at once inside the region. `0` if it allocated nothing. |
+| `headroom_bytes()` | `peak - live_at_open` — what the region needed *on top of* the resident weights. The number to compare across two runs. |
+| `transient_bytes()` | `peak - live_at_close` — allocated inside and released again. Catches a scratch buffer *larger* than the region's own steady state; a smaller one hides under the peak the surviving buffers reach anyway, and reads zero. Zero is not a no-scratch proof. |
+| `observed_allocation()` | The region allocated at all. Assert this first; an upper bound is free to hold against a region that measured nothing. |
+
+Two rules the pooling allocator imposes:
+
+- **Never assert on an absolute byte count.** MLX reuses pooled buffers, so an
+  absolute figure encodes what ran before as much as what ran now. Bound
+  `headroom_bytes()` by a multiple of the workload's own size instead — see
+  `q8_msl_roundtrip_allocation_stays_within_budget` in
+  `crates/rmlx-kv-quant/src/q8_msl_tests.rs`.
+- **Materialise inside the bracket.** MLX is lazy. An `eval()` after `close()`
+  allocates after the mark has been read, and the bracket reports
+  `peak_bytes: 0` — which `observed_allocation()` exists to catch.
+
+The peak mark is process-global, so two brackets on different threads reset
+each other. Scope one at a time.
+
+`rmlx baseline` uses this to report `metal_peak_mb` (peak during
+prefill+decode) and `metal_gen_alloc_mb` (that figure minus what was already
+live). Only the second is comparable between two runs of the same model; the
+first still carries the weights.
 
 **Typical relationship**: `rss_bytes ≤ phys_footprint_bytes ≤ rss_bytes + compressed_bytes`.
 `external_bytes` overlaps with `rss_bytes` (mmap'd weight pages that are currently resident).

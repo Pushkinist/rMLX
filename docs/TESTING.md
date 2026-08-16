@@ -377,6 +377,42 @@ stale, re-point the assertion at the new contract and then mutation-check it
 
 ---
 
+## Allocation gates (`PeakBracket`)
+
+A numerics test cannot see a change that leaves every output bit identical but
+allocates an extra scratch buffer per dispatch. `rmlx_mlx::PeakBracket` scopes
+the Metal allocator's high-water mark to a region so an allocation regression
+becomes a test failure — no GPU timing, no model, no tolerance.
+
+```rust
+let bracket = PeakBracket::open();
+let out = op_under_test(&input, Device::Gpu)?;
+out.eval()?;                       // MLX is lazy: materialise INSIDE
+let reading = bracket.close();
+
+assert!(reading.observed_allocation());               // anti-vacuous, first
+assert!(reading.headroom_bytes() <= 4 * input_bytes); // relative, never absolute
+```
+
+Three rules, each of which has a corresponding way to get it wrong:
+
+- **Assert `observed_allocation()` before any upper bound.** An upper bound
+  holds trivially against a region that allocated nothing, which is exactly
+  what happens if the `eval()` drifts outside the bracket — the reading comes
+  back `peak_bytes: 0` and the gate passes while measuring nothing.
+- **Bound a multiple of the workload's own size, never an absolute byte
+  count.** MLX pools its buffers, so an absolute figure encodes what ran
+  earlier in the test binary as much as what the region did.
+- **The peak mark is process-global.** These tests reach `Device::Gpu`, so
+  they carry `#[ignore]` and run under `--test-threads=1` like every other
+  GPU test here; two brackets on parallel threads would reset each other.
+
+Reference caller: `q8_msl_roundtrip_allocation_stays_within_budget` in
+`crates/rmlx-kv-quant/src/q8_msl_tests.rs`. Accessor semantics are tabulated in
+[`docs/PROFILING.md` §9.1](PROFILING.md).
+
+---
+
 ## Cosine-similarity gate
 
 Every KV-cache codec has a per-codec cosine-similarity quality gate in the

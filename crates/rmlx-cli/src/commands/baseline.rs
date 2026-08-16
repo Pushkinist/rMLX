@@ -328,9 +328,11 @@ fn tokenize_chat_fixture(
 /// 2. `arch::load_model` -- capture `load_ms`.
 /// 3. `arch.generate_greedy` -- per-token `step_fn` callback captures wall-clock
 /// so prefill (TTFT) and steady-state decode are timed SEPARATELY.
-/// 4. Compute decode-only TPS, measured TTFT, first-50-token preview, peak RSS.
+/// 4. Compute decode-only TPS, measured TTFT, first-50-token preview, peak RSS,
+///    and the Metal-allocator peak bracketed across prefill+decode.
 /// 5. Emit EventRecorder records and 1 baseline.csv row.
-/// 6. Print one-line summary to stdout.
+/// 6. Print one-line summary to stdout, plus the exact generated token-id
+///    sequence when `emit_token_ids` is set.
 #[tracing::instrument(skip_all, fields(
     model_dir = %model_path.display(),
     device = device_str,
@@ -350,6 +352,7 @@ pub(crate) fn run_baseline(
     cap_is_explicit: bool,
     allow_truncate: bool,
     yarn_override: Option<rmlx_models::qwen3::YarnOverride>,
+    emit_token_ids: bool,
     sink: &EventRecorder,
     record_args: Option<BaselineRecordArgs<'_>>,
 ) -> anyhow::Result<()> {
@@ -454,6 +457,12 @@ pub(crate) fn run_baseline(
         kv_quant = %kv_quant_str,
     );
     let _decode_span_guard = decode_span.enter();
+    // Scope the Metal allocator high-water mark to prefill+decode. A bare
+    // reading is process-lifetime and so carries the model load with it, which
+    // makes it useless for comparing two runs of the same model. Opened before
+    // the timer starts and closed after it stops so the reset/read cost cannot
+    // land inside a measured interval.
+    let peak_bracket = rmlx_mlx::PeakBracket::open();
     let ts_generate_start = Instant::now();
     // Per-token callback wall-clocks (elapsed seconds since generate-start).
     let mut first_cb_s: Option<f64> = None;
@@ -486,6 +495,7 @@ pub(crate) fn run_baseline(
         )
         .map_err(|e| anyhow::anyhow!("generate_greedy: {e}"))?;
     let generate_elapsed = ts_generate_start.elapsed();
+    let peak_reading = peak_bracket.close();
     // Read actual on-device KV-cache bytes from the arch-specific static that
     // `generate_greedy` writes via `store_kv_cache_bytes`.
     //
@@ -574,19 +584,17 @@ pub(crate) fn run_baseline(
     // validate_regex cannot match. `tokenizer.decode()` converts the token ids
     // back to human-readable text with proper spaces. Falls back to the raw
     // piece preview on decode failure (best-effort, non-fatal).
-    let decoded_text: String = {
-        // Emit ALL generated tokens so the smoke runner's validate_regex can
-        // match anywhere in the output (not just the first 50 tokens). Thinking
-        // models (Bonsai / Qwen3.6) spend tokens on <think> blocks before the
-        // actual answer; with a 50-token cap those models would fail instruction
-        // prompts whose answer begins after token 50. The full decode is written
-        // as a single tracing field; the runner's extract_decoded_from_trace
-        // strips ANSI and captures the quoted value.
-        let token_ids: Vec<u32> = steps.iter().map(|s| s.token_id).collect();
-        tokenizer
-            .decode(&token_ids, true)
-            .unwrap_or_else(|_| preview_full.clone())
-    };
+    // Emit ALL generated tokens so the smoke runner's validate_regex can
+    // match anywhere in the output (not just the first 50 tokens). Thinking
+    // models (Bonsai / Qwen3.6) spend tokens on <think> blocks before the
+    // actual answer; with a 50-token cap those models would fail instruction
+    // prompts whose answer begins after token 50. The full decode is written
+    // as a single tracing field; the runner's extract_decoded_from_trace
+    // strips ANSI and captures the quoted value.
+    let token_ids: Vec<u32> = steps.iter().map(|s| s.token_id).collect();
+    let decoded_text: String = tokenizer
+        .decode(&token_ids, true)
+        .unwrap_or_else(|_| preview_full.clone());
     info!(decoded = ?decoded_text, "baseline: decoded preview");
 
     // -- Model basename --------------------------------------------------------
@@ -598,11 +606,37 @@ pub(crate) fn run_baseline(
     // -- Stdout summary -------------------------------------------------------
     // `decode_tps` is steady-state (prefill excluded); `overall_tps` is the
     // combined prefill+decode number kept for cross-reference.
+    //
+    // `metal_peak_mb` is the most Metal-allocator bytes live at once during
+    // prefill+decode; `metal_gen_alloc_mb` is that figure minus what was
+    // already live when generation began, i.e. what the generation itself
+    // needed on top of the resident weights. The second number is the one that
+    // compares across two runs of the same model — the first still carries the
+    // weights. Both read 0 on a build with no Metal allocator.
+    let metal_peak_mb = peak_reading.peak_bytes as f64 / 1_048_576.0;
+    let metal_gen_alloc_mb = peak_reading.headroom_bytes() as f64 / 1_048_576.0;
     println!(
         "baseline: model={model_basename}  load={load_ms:.0}ms  ttft_ms={ttft_ms:.0}  \
          decode_tps={decode_tps:.3}  overall_tps={overall_tps:.3}  prefill_tps={prefill_tps:.1}  \
-         prompt_tokens={prompt_token_count}  peak_rss={rss_mb:.1}MB"
+         prompt_tokens={prompt_token_count}  peak_rss={rss_mb:.1}MB  \
+         metal_peak_mb={metal_peak_mb:.1}  metal_gen_alloc_mb={metal_gen_alloc_mb:.1}"
     );
+
+    // Exact generated token-id sequence, one line, opt-in.
+    //
+    // An A/B harness needs to prove two arms produced the *same* tokens, and
+    // the decoded text cannot do that: two different id sequences can decode to
+    // the same string. This is the same `Vec<u32>` identity the golden-token
+    // tests assert, emitted from the run that also measured the speed, so a
+    // change that is fast and wrong fails the invocation that made it look fast.
+    if emit_token_ids {
+        let ids_csv = token_ids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        println!("baseline: token_ids={ids_csv}");
+    }
 
     // -- EventRecorder records --------------------------------------------------
     let abs_path = model_path

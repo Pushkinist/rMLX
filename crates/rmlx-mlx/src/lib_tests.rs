@@ -632,3 +632,65 @@ fn cross_thread_eval_faults_documents_mlx_limit() {
         "expected a 'There is no Stream(...)' fault, got: {msg}"
     );
 }
+
+// ── peak-memory bracket ──────────────────────────────────────────────────
+
+/// The derived quantities are pure arithmetic over the three raw counters, so
+/// they are pinned here against hand-built readings — no allocator, no device.
+/// A GPU-side exercise of the real bracket lives in
+/// `crates/rmlx-kv-quant/src/q8_msl_tests.rs`.
+#[test]
+fn peak_reading_headroom_excludes_bytes_already_live() {
+    let r = PeakReading {
+        peak_bytes: 900,
+        live_at_open_bytes: 500,
+        live_at_close_bytes: 700,
+    };
+    // 500 bytes were already resident when the bracket opened; the region is
+    // charged only for the 400 it added on top.
+    assert_eq!(r.headroom_bytes(), 400);
+    // 200 of those 400 were released again before close.
+    assert_eq!(r.transient_bytes(), 200);
+    assert!(r.observed_allocation());
+}
+
+#[test]
+fn peak_reading_saturates_when_region_allocated_nothing() {
+    // Reset leaves the mark at 0 and nothing raised it, while 500 bytes stayed
+    // live throughout. Both deltas must floor at 0 rather than wrap.
+    let r = PeakReading {
+        peak_bytes: 0,
+        live_at_open_bytes: 500,
+        live_at_close_bytes: 500,
+    };
+    assert_eq!(r.headroom_bytes(), 0);
+    assert_eq!(r.transient_bytes(), 0);
+    assert!(
+        !r.observed_allocation(),
+        "a region that allocated nothing must not satisfy the anti-vacuous check"
+    );
+}
+
+#[test]
+fn peak_reading_transient_is_zero_when_nothing_was_freed() {
+    // Everything the region peaked at is still live at close.
+    let r = PeakReading {
+        peak_bytes: 900,
+        live_at_open_bytes: 500,
+        live_at_close_bytes: 900,
+    };
+    assert_eq!(r.headroom_bytes(), 400);
+    assert_eq!(r.transient_bytes(), 0);
+}
+
+/// `PeakBracket::open` must survive a build with no Metal allocator: the C
+/// calls fail, every counter reads 0, and the derived quantities report
+/// "measured nothing" instead of a plausible-looking number.
+#[test]
+fn peak_bracket_round_trips_without_panicking() {
+    let reading = PeakBracket::open().close();
+    // Deltas are saturating, so this holds on every host regardless of what
+    // the allocator reported.
+    assert!(reading.headroom_bytes() <= reading.peak_bytes);
+    assert!(reading.transient_bytes() <= reading.peak_bytes);
+}
