@@ -38,6 +38,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use rmlx_core::DispatchPolicy;
 use rmlx_metrics::events::{EventRecorder, SsdHydrateEvent};
 use rmlx_mlx::Device;
 
@@ -169,8 +170,9 @@ impl SsdHydrator {
         prompt_ids: &[u32],
         seed: u64,
         kv_quant: KvQuant,
+        policy: DispatchPolicy,
     ) -> rmlx_core::error::Result<Option<(HydratedBlock, Vec<u64>)>> {
-        let Some(block) = self.lookup(prompt_ids, seed, kv_quant)? else {
+        let Some(block) = self.lookup(prompt_ids, seed, kv_quant, policy)? else {
             return Ok(None);
         };
         let hashes = chained_block_hashes_seeded(&block.prompt_ids, seed);
@@ -181,8 +183,9 @@ impl SsdHydrator {
     /// `prompt_ids`. Returns `Ok(Some(_))` on an SSD hit, `Ok(None)` on a true
     /// miss **or** on corruption (after deleting the bad file + row + `warn!`).
     ///
-    /// `seed` is the requesting model's prompt-cache seed and `kv_quant` the
-    /// codec the request is running; both come from the caller, never from this
+    /// `seed` is the requesting model's prompt-cache seed, `kv_quant` the
+    /// codec the request is running, and `policy` the kernel paths its caches
+    /// dispatch through; all three come from the caller, never from this
     /// struct — see the type docs for why.
     ///
     /// Never panics. The arch `SsdHydrate<E>` impl calls this and wraps the
@@ -193,8 +196,9 @@ impl SsdHydrator {
         prompt_ids: &[u32],
         seed: u64,
         kv_quant: KvQuant,
+        policy: DispatchPolicy,
     ) -> rmlx_core::error::Result<Option<HydratedBlock>> {
-        self.lookup_inner(prompt_ids, seed, kv_quant, None)
+        self.lookup_inner(prompt_ids, seed, kv_quant, policy, None)
     }
 
     /// Test-only: like [`lookup`] but uses an explicit `EventRecorder` for
@@ -205,9 +209,10 @@ impl SsdHydrator {
         prompt_ids: &[u32],
         seed: u64,
         kv_quant: KvQuant,
+        policy: DispatchPolicy,
         recorder: &EventRecorder,
     ) -> rmlx_core::error::Result<Option<HydratedBlock>> {
-        self.lookup_inner(prompt_ids, seed, kv_quant, Some(recorder))
+        self.lookup_inner(prompt_ids, seed, kv_quant, policy, Some(recorder))
     }
 
     /// Core of [`lookup`]. `test_recorder` overrides the process-global when
@@ -232,6 +237,7 @@ impl SsdHydrator {
         prompt_ids: &[u32],
         seed: u64,
         kv_quant: KvQuant,
+        policy: DispatchPolicy,
         test_recorder: Option<&EventRecorder>,
     ) -> rmlx_core::error::Result<Option<HydratedBlock>> {
         // The caller's seed, used as given. It is the same `u64` the RAM query
@@ -264,7 +270,7 @@ impl SsdHydrator {
         // cannot produce a codec-B digest. Checking an attach-time codec here
         // instead would reject perfectly good rows written by a hot-swapped
         // request, and delete them as corrupt.
-        match read_caches_timed(&row.path, self.device, &self.model_id, kv_quant) {
+        match read_caches_timed(&row.path, self.device, &self.model_id, kv_quant, policy) {
             Ok(Some((
                 kv_caches,
                 lin_caches,

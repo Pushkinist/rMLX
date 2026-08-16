@@ -1632,7 +1632,14 @@ fn roundtrip_none_bf16_payload_via_spill_hydrate() {
     // must expose the restored bf16 K/V via `decode_fp16_kv`, with `offset`
     // set to the spilled seq length (32 tokens) so decode resumes at the right
     // position.
-    let (hydrated, _lin) = read_caches(&path, device, MODEL_ID, KvQuant::None).unwrap();
+    let (hydrated, _lin) = read_caches(
+        &path,
+        device,
+        MODEL_ID,
+        KvQuant::None,
+        DispatchPolicy::default(),
+    )
+    .unwrap();
     assert_eq!(hydrated.len(), 2, "bridge layer count");
     for layer in 0..2 {
         assert_eq!(
@@ -1647,6 +1654,76 @@ fn roundtrip_none_bf16_payload_via_spill_hydrate() {
         let v_got = to_vec(&v_hyd.astype(Dtype::F32, device).unwrap());
         assert_eq!(k_got, want[layer].0, "layer {layer} bridge K mismatch");
         assert_eq!(v_got, want[layer].1, "layer {layer} bridge V mismatch");
+    }
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The hydrate bridge must hand back the caller's `DispatchPolicy`, not the
+/// process default.
+///
+/// A hydrated cache replaces a live one, so it has to dispatch through the same
+/// kernel paths. The policy passed here is deliberately different from the
+/// process default in every field, and the process default is left untouched:
+/// if `read_caches` (or `KvCache::from_storage` beneath it) re-read the global,
+/// the reconstructed caches would come back with the default and this fails.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free; remaining unwrap is on values established by construction earlier in this fn"
+)]
+fn hydrate_carries_the_callers_dispatch_policy() {
+    let device = Device::Cpu;
+    let shape = [1i32, 2, 8, 128];
+    let n: usize = shape.iter().map(|&x| x as usize).product();
+
+    let requested = DispatchPolicy {
+        fused_qk: true,
+        fused_qk_min_kv_seq: 7,
+        sparse_attn: true,
+        turbo_flash: true,
+        turbo_flash_lock: true,
+        turbo_flash_min_kv_seq: 11,
+        planar_flash_decode: true,
+        rot_k_fused: true,
+    };
+    assert_ne!(
+        requested,
+        rmlx_core::dispatch_policy(),
+        "the fixture must differ from the process default, or the assert below is vacuous"
+    );
+
+    let mut kv_caches = Vec::new();
+    for layer in 0..2u64 {
+        let k = arr(&lcg(n, 0x5011 + layer), &shape)
+            .astype(Dtype::Bf16, device)
+            .unwrap();
+        let v = arr(&lcg(n, 0x6022 + layer), &shape)
+            .astype(Dtype::Bf16, device)
+            .unwrap();
+        kv_caches.push(
+            KvCache::from_storage(
+                KvStorage::None { max_seq: 4096 },
+                KvQuant::None,
+                shape[2],
+                layer as usize,
+                DispatchPolicy::default(),
+            )
+            .with_decode_fp16_seed(k, v),
+        );
+    }
+
+    let path = tmp_path("hydrate_policy");
+    write_caches(&path, device, MODEL_ID, KvQuant::None, &kv_caches, &[]).unwrap();
+    let (hydrated, _lin) = read_caches(&path, device, MODEL_ID, KvQuant::None, requested).unwrap();
+
+    assert_eq!(hydrated.len(), 2, "layer count");
+    for (layer, cache) in hydrated.iter().enumerate() {
+        assert_eq!(
+            cache.dispatch_policy(),
+            requested,
+            "layer {layer} must hydrate under the caller's policy"
+        );
     }
 
     let _ = std::fs::remove_file(&path);
@@ -1832,7 +1909,8 @@ fn c3_k8v4_hydrate_round_trip_no_panic() {
     let (rebuilt, _bf16, _) = reader.hydrate(MODEL_ID, KvQuant::K8V4, device).unwrap();
     let storage = rebuilt.into_iter().next().unwrap();
 
-    let mut cache = KvCache::from_storage(storage, KvQuant::K8V4, 300, 0);
+    let mut cache =
+        KvCache::from_storage(storage, KvQuant::K8V4, 300, 0, DispatchPolicy::default());
     // One decode step — must not OOB-panic.
     // n1 = B*kv_h*S*D = 1*2*1*128 = 256.
     let n1 = 256usize;
@@ -1879,7 +1957,8 @@ fn c2_planar_hydrate_round_trip_no_panic() {
     let (rebuilt, _bf16, _) = reader.hydrate(MODEL_ID, KvQuant::Planar, device).unwrap();
     let storage = rebuilt.into_iter().next().unwrap();
 
-    let mut cache = KvCache::from_storage(storage, KvQuant::Planar, 300, 0);
+    let mut cache =
+        KvCache::from_storage(storage, KvQuant::Planar, 300, 0, DispatchPolicy::default());
     // n1 = B*kv_h*S*D = 1*2*1*128 = 256.
     let n1 = 256usize;
     let one_k = arr(&lcg(n1, 0xEEFF), &[1, 2, 1, 128]);
@@ -2018,7 +2097,8 @@ fn h4_swa_prev_offset_exceeds_max_seq_reset_no_panic() {
     // Simulate a SWA layer hydrated with prev_offset=1023, max_seq=512.
     // The SWA ring buffer was not spilled; offset > max_seq triggers reset.
     let storage = KvStorage::None { max_seq: 512 };
-    let mut cache = KvCache::from_storage(storage, KvQuant::None, 1023, 0);
+    let mut cache =
+        KvCache::from_storage(storage, KvQuant::None, 1023, 0, DispatchPolicy::default());
 
     // n = B*kv_h*S*D = 1*2*1*128 = 256.
     let n = 256usize;
@@ -2732,7 +2812,13 @@ fn ssd_roundtrip_preserves_layer_idx_positional() {
     let mut caches: Vec<KvCache> = Vec::with_capacity(n_layers);
     for i in 0..n_layers {
         let (storage, _) = build_storage(KvQuant::Rotor3, shape, 0xA154_0000 ^ (i as u64), device);
-        caches.push(KvCache::from_storage(storage, KvQuant::Rotor3, 4, i));
+        caches.push(KvCache::from_storage(
+            storage,
+            KvQuant::Rotor3,
+            4,
+            i,
+            DispatchPolicy::default(),
+        ));
     }
 
     // Sanity: pre-spill layer_idx matches.
@@ -2743,7 +2829,14 @@ fn ssd_roundtrip_preserves_layer_idx_positional() {
     // Spill (layer-ordered) → hydrate → verify positional layer_idx restoration.
     let path = tmp_path("layer_idx_positional");
     write_caches(&path, device, MODEL_ID, KvQuant::Rotor3, &caches, &[]).unwrap();
-    let (hydrated, _lin) = read_caches(&path, device, MODEL_ID, KvQuant::Rotor3).unwrap();
+    let (hydrated, _lin) = read_caches(
+        &path,
+        device,
+        MODEL_ID,
+        KvQuant::Rotor3,
+        DispatchPolicy::default(),
+    )
+    .unwrap();
 
     assert_eq!(
         hydrated.len(),
@@ -2791,7 +2884,13 @@ fn seeded_rotor_k3_cache(kv_h: i32, head_dim: i32, max_seq: i32) -> KvCache {
         )),
         max_seq,
     };
-    KvCache::from_storage(storage, KvQuant::RotorKOnly3, 0, 0)
+    KvCache::from_storage(
+        storage,
+        KvQuant::RotorKOnly3,
+        0,
+        0,
+        DispatchPolicy::default(),
+    )
 }
 
 /// `(dequant, shape[2], cpu_block_tokens)` for a rotor3 K-only cache.
@@ -2934,7 +3033,14 @@ fn rotor_k_only_ring_only_tail_ssd_round_trip() {
     let path = tmp_path("rotor_k_ring_only_tail");
     write_caches(&path, device, MODEL_ID, KvQuant::RotorKOnly3, &[clone], &[])
         .expect("write_caches must persist the full materialised store");
-    let (hydrated, _lin) = read_caches(&path, device, MODEL_ID, KvQuant::RotorKOnly3).unwrap();
+    let (hydrated, _lin) = read_caches(
+        &path,
+        device,
+        MODEL_ID,
+        KvQuant::RotorKOnly3,
+        DispatchPolicy::default(),
+    )
+    .unwrap();
     let _ = std::fs::remove_file(&path);
 
     let (hy_dq, hy_seq, _) = rotor_k3_probe(&hydrated[0]);
@@ -2980,7 +3086,7 @@ fn seeded_rotor_sym3_cache(kv_h: i32, head_dim: i32, max_seq: i32) -> KvCache {
         )),
         max_seq,
     };
-    KvCache::from_storage(storage, KvQuant::Rotor3Sym, 0, 0)
+    KvCache::from_storage(storage, KvQuant::Rotor3Sym, 0, 0, DispatchPolicy::default())
 }
 
 /// `(k_dequant, v_dequant, shape[2], k_block_tokens, v_block_tokens)` for a
@@ -3135,7 +3241,14 @@ fn rotor_sym_ring_only_tail_ssd_round_trip() {
     let path = tmp_path("rotor_sym_ring_only_tail");
     write_caches(&path, device, MODEL_ID, KvQuant::Rotor3Sym, &[clone], &[])
         .expect("write_caches must persist the full materialised sym store");
-    let (hydrated, _lin) = read_caches(&path, device, MODEL_ID, KvQuant::Rotor3Sym).unwrap();
+    let (hydrated, _lin) = read_caches(
+        &path,
+        device,
+        MODEL_ID,
+        KvQuant::Rotor3Sym,
+        DispatchPolicy::default(),
+    )
+    .unwrap();
     let _ = std::fs::remove_file(&path);
 
     let (hy_k, hy_v, hy_seq, _, _) = rotor_sym3_probe(&hydrated[0]);
@@ -3171,7 +3284,7 @@ fn seeded_iso_sym3_cache(kv_h: i32, head_dim: i32, max_seq: i32) -> KvCache {
         )),
         max_seq,
     };
-    KvCache::from_storage(storage, KvQuant::Iso3Sym, 0, 0)
+    KvCache::from_storage(storage, KvQuant::Iso3Sym, 0, 0, DispatchPolicy::default())
 }
 
 /// `(k_dequant, v_dequant, shape[2], k_block_tokens, v_block_tokens)` for an
@@ -3404,7 +3517,13 @@ fn iso_sym_transition_across_ring_norms_floor() {
     const ISO_QUANT_TOL: f32 = 0.3;
 
     let mut iso = seeded_iso_sym3_cache(kv_h, head_dim, 512);
-    let mut bf16 = KvCache::from_storage(KvStorage::None { max_seq: 512 }, KvQuant::None, 0, 0);
+    let mut bf16 = KvCache::from_storage(
+        KvStorage::None { max_seq: 512 },
+        KvQuant::None,
+        0,
+        0,
+        DispatchPolicy::default(),
+    );
 
     // Identical one-token prefill on both caches, matching a realistic short
     // chat prompt: kv_seq == 1 before the first decode step.
@@ -3513,7 +3632,13 @@ fn rotor_sym_transition_across_ring_norms_floor() {
     const ROTOR_QUANT_TOL: f32 = 0.3;
 
     let mut rotor = seeded_rotor_sym3_cache(kv_h, head_dim, 512);
-    let mut bf16 = KvCache::from_storage(KvStorage::None { max_seq: 512 }, KvQuant::None, 0, 0);
+    let mut bf16 = KvCache::from_storage(
+        KvStorage::None { max_seq: 512 },
+        KvQuant::None,
+        0,
+        0,
+        DispatchPolicy::default(),
+    );
 
     let prefill = 1_i32;
     let k0 = arr(
@@ -3700,7 +3825,14 @@ fn iso_sym_ring_only_tail_ssd_round_trip() {
     let path = tmp_path("iso_sym_ring_only_tail");
     write_caches(&path, device, MODEL_ID, KvQuant::Iso3Sym, &[clone], &[])
         .expect("write_caches must persist the full materialised sym store");
-    let (hydrated, _lin) = read_caches(&path, device, MODEL_ID, KvQuant::Iso3Sym).unwrap();
+    let (hydrated, _lin) = read_caches(
+        &path,
+        device,
+        MODEL_ID,
+        KvQuant::Iso3Sym,
+        DispatchPolicy::default(),
+    )
+    .unwrap();
     let _ = std::fs::remove_file(&path);
 
     let (hy_k, hy_v, hy_seq, _, _) = iso_sym3_probe(&hydrated[0]);

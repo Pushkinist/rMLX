@@ -1,4 +1,5 @@
 use super::*;
+use rmlx_core::DispatchPolicy;
 
 #[test]
 fn test_turbo_flash_disabled_by_default() {

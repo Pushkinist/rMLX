@@ -24,6 +24,7 @@ use crate::rotor_flash_decode_msl::rotor_flash_decode_dispatch_count;
 use crate::rotorquant::n_groups_for;
 use crate::storage::{KvStorage, QuantRotorK3};
 use crate::test_utils::{lcg_data, skip_if_no_gpu_env};
+use rmlx_core::DispatchPolicy;
 use rmlx_mlx::{Array, Device, Dtype};
 
 const MAX_SEQ: i32 = 512;
@@ -51,7 +52,13 @@ fn seeded_cache() -> KvCache {
         )),
         max_seq: MAX_SEQ,
     };
-    KvCache::from_storage(storage, KvQuant::RotorKOnly3, 0, 0)
+    KvCache::from_storage(
+        storage,
+        KvQuant::RotorKOnly3,
+        0,
+        0,
+        DispatchPolicy::default(),
+    )
 }
 
 fn scale() -> f32 {

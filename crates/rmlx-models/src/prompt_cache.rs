@@ -52,6 +52,7 @@
 
 #![allow(clippy::struct_field_names)]
 use rmlx_core::error::Result;
+use rmlx_core::DispatchPolicy;
 
 use crate::prefix_index::{
     active_prefix_index_kind, build_active_index, PrefixIndex, PrefixIndexKind,
@@ -624,8 +625,10 @@ impl<E: PromptCacheEntry> PromptCache<E> {
     /// that value and recomputes the promoted entry's block hashes from it, so
     /// the retried `find_best_prefix` matches what was just hydrated. `kv_quant`
     /// is the request's codec, used to verify the block header and tag the
-    /// reconstructed entry — the source holds neither value itself, because it
-    /// is shared by every model of the arch and every hot-swapped codec.
+    /// reconstructed entry, and `dispatch_policy` is the kernel-path policy the
+    /// reconstructed caches must carry — the source holds none of the three
+    /// itself, because it is shared by every model of the arch and every
+    /// hot-swapped codec.
     ///
     /// Corruption (bad read / metadata mismatch / missing file) is handled
     /// inside the source impl (delete file + index row, `warn!`) and surfaces
@@ -637,6 +640,7 @@ impl<E: PromptCacheEntry> PromptCache<E> {
         prompt_ids: &[u32],
         seed: u64,
         kv_quant: KvQuant,
+        dispatch_policy: DispatchPolicy,
     ) -> Option<usize> {
         // A zero-slot cache can admit nothing, so hydrating would read a `.kvb`
         // off disk and reconstruct its K/V only for `push` to refuse it — once
@@ -649,7 +653,7 @@ impl<E: PromptCacheEntry> PromptCache<E> {
         // Take the source out so the `&self` borrow during `hydrate` does not
         // conflict with the `&mut self` `push` below; put it back after.
         let source = self.ssd.take()?;
-        let result = source.hydrate(prompt_ids, seed, kv_quant);
+        let result = source.hydrate(prompt_ids, seed, kv_quant, dispatch_policy);
         self.ssd = Some(source);
         match result {
             Ok(Some(entry)) => {
@@ -1312,9 +1316,24 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
         let seed = cache_seed(self.active_layout_key(), kv_quant, model_sig);
         let policy = self.policy;
         let arch = self.arch_name;
+        // Kernel-path policy for the caches a hydrate would reconstruct. The
+        // arches build their live caches from the same process default (see
+        // `KvCache::with_quant_max_seq`), so reading it here keeps a hydrated
+        // set and a freshly built one in agreement. This is the single seam a
+        // per-request policy would replace; everything below it already carries
+        // the value instead of re-reading a global.
+        let dispatch_policy = rmlx_core::dispatch_policy();
 
         self.with_inner_mut(|guard| match guard.as_mut() {
-            Some(cache) => Self::decide_locked(arch, policy, cache, prompt_ids, kv_quant, seed),
+            Some(cache) => Self::decide_locked(
+                arch,
+                policy,
+                cache,
+                prompt_ids,
+                kv_quant,
+                seed,
+                dispatch_policy,
+            ),
             None => Consumed::Miss,
         })
     }
@@ -1340,12 +1359,17 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
         prompt_ids: &[u32],
         kv_quant: KvQuant,
         seed: u64,
+        dispatch_policy: DispatchPolicy,
     ) -> Consumed<E> {
         // (3) RAM find, then SSD-hydrate retry. A hydrate hit promotes the
         // block into RAM; re-run find_best_prefix so the promoted slot is
         // matched + quant-checked by the path below.
         let mut raw_match = cache.find_best_prefix(prompt_ids, seed);
-        if raw_match.is_none() && cache.hydrate_from_ssd(prompt_ids, seed, kv_quant).is_some() {
+        if raw_match.is_none()
+            && cache
+                .hydrate_from_ssd(prompt_ids, seed, kv_quant, dispatch_policy)
+                .is_some()
+        {
             raw_match = cache.find_best_prefix(prompt_ids, seed);
         }
 

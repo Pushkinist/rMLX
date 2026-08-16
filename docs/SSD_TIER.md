@@ -403,13 +403,16 @@ thread** (the cold path that would otherwise pay a full re-prefill):
 Phase 1 — SQLite prefix lookup
     Given:   seed  — the caller's `cache_seed(...)`, the same u64 the RAM query ran
              kv_quant — the request's codec
+             policy   — the `DispatchPolicy` the request's caches dispatch under
     Compute: chained = chained_block_hashes_seeded(prompt_ids, seed)
     Call:    SsdKvIndex::lookup_longest_prefix(chained, layout_key)
     Result:  (block_count, KvBlockRow) or miss → return None
 
 Phase 2 — File read
-    block_io::read_caches(&row.path, device, &model_id, kv_quant)
-    Verifies model_id + kv_quant header before deserializing.
+    block_io::read_caches(&row.path, device, &model_id, kv_quant, policy)
+    Verifies model_id + kv_quant header before deserializing. Every
+    reconstructed KvCache carries the caller's `policy`, so a hydrated set
+    dispatches through the same kernel paths the live set did.
     On mismatch or I/O error: delete .kvb + delete index row + warn! + return None (graceful miss).
 
 Phase 3 — Dequant

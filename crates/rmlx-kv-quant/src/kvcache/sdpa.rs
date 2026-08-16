@@ -769,7 +769,7 @@ impl KvCache {
         }
 
         // 2b. Head-major fused-QK shadow path (q8/turbo3/turbo4/rotor-asym).
-        // Decode-only, gated by `RMLX_FUSED_QK=1`. Returns `None` to fall
+        // Decode-only, gated by `DispatchPolicy::fused_qk`. Returns `None` to fall
         // through to the legacy bf16 SDPA path when any gate is off, when the
         // codec has no GPU encoder, or when the bf16 mirror is not yet seeded
         // (cold-prefill window).

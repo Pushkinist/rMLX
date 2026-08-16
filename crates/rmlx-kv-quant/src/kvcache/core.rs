@@ -234,7 +234,19 @@ impl KvCache {
     /// `layer_idx` is the 0-based model-side layer index. Pass the same index
     /// used when the cache was originally constructed so that any re-quantize
     /// path that fires after hydration uses the correct rotor table seed.
-    pub fn from_storage(storage: KvStorage, quant: KvQuant, offset: i32, layer_idx: usize) -> Self {
+    ///
+    /// `policy` is threaded for the same reason `layer_idx` is: a hydrated
+    /// cache replaces a live one and must dispatch through the same kernel
+    /// paths it did. Reading the process default here instead would put the
+    /// SSD tier back on process-global behaviour for that one path — invisible
+    /// while every cache shares the default, wrong the moment two do not.
+    pub fn from_storage(
+        storage: KvStorage,
+        quant: KvQuant,
+        offset: i32,
+        layer_idx: usize,
+        policy: DispatchPolicy,
+    ) -> Self {
         Self {
             storage,
             offset,
@@ -259,7 +271,7 @@ impl KvCache {
             // not needed. Callers that want to re-attach a ceiling after hydration
             // can chain `.with_max_seq_ceiling(n)` explicitly.
             max_seq_ceiling: None,
-            policy: rmlx_core::dispatch_policy(),
+            policy,
         }
     }
 

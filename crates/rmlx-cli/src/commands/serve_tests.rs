@@ -199,6 +199,55 @@ fn thresholds_pass_through_from_the_environment_untouched() {
     }
 }
 
+/// One-hot on the **environment** side: exactly one variable set, so a crossed
+/// `auto` arm (`FusedQkMode::Auto => env.turbo_flash`) moves the wrong field
+/// and fails here. The all-set / all-clear fixtures above cannot catch that —
+/// under all-true every arm reads true whichever field it picked.
+#[test]
+fn each_auto_arm_reads_its_own_environment_variable() {
+    let base = resolve_defaults(env_clear());
+
+    for (name, set_one) in ONE_HOT_ENV {
+        let env = set_one(DispatchPolicy::default());
+        let resolved = resolve_defaults(env);
+        assert_eq!(
+            resolved, env,
+            "{name}: with only this variable set, `auto` must resolve exactly \
+             this gate on and leave every other at {base:?}"
+        );
+    }
+}
+
+/// `(field name, set exactly that field)` — the environment-side mirror of
+/// [`GATES`].
+type OneHot = (&'static str, fn(DispatchPolicy) -> DispatchPolicy);
+const ONE_HOT_ENV: &[OneHot] = &[
+    ("fused_qk", |p| DispatchPolicy {
+        fused_qk: true,
+        ..p
+    }),
+    ("sparse_attn", |p| DispatchPolicy {
+        sparse_attn: true,
+        ..p
+    }),
+    ("turbo_flash", |p| DispatchPolicy {
+        turbo_flash: true,
+        ..p
+    }),
+    ("turbo_flash_lock", |p| DispatchPolicy {
+        turbo_flash_lock: true,
+        ..p
+    }),
+    ("planar_flash_decode", |p| DispatchPolicy {
+        planar_flash_decode: true,
+        ..p
+    }),
+    ("rot_k_fused", |p| DispatchPolicy {
+        rot_k_fused: true,
+        ..p
+    }),
+];
+
 #[test]
 fn each_gate_is_wired_to_its_own_flag() {
     // Cross-talk guard: flipping one flag on must not move any other field.

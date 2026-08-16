@@ -275,6 +275,7 @@ fn qwen3_ssd_hydrate_promotes_entry_into_ram() {
             prompt_ids: &[u32],
             _seed: u64,
             _kv_quant: KvQuant,
+            _policy: DispatchPolicy,
         ) -> Result<Option<Qwen3Entry>> {
             self.calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -310,7 +311,12 @@ fn qwen3_ssd_hydrate_promotes_entry_into_ram() {
     assert!(before.is_none(), "RAM must be empty before hydrate");
 
     // Hydrate from mock SSD.
-    let promoted = cache.hydrate_from_ssd(&prompt_ids, FNV_OFFSET, KvQuant::K8V8);
+    let promoted = cache.hydrate_from_ssd(
+        &prompt_ids,
+        FNV_OFFSET,
+        KvQuant::K8V8,
+        DispatchPolicy::default(),
+    );
     assert!(
         promoted.is_some(),
         "mock SSD source must return a hit for a 2-block prompt"

@@ -96,10 +96,10 @@ use tracing::{info, warn};
 /// clearance, never a throughput one) all stand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub(crate) enum TurboFlashMode {
-    /// Force the TurboFlash MSL kernel on. Sets `RMLX_TURBO_FLASH=1`.
+    /// Force the TurboFlash MSL kernel on.
     On,
-    /// Force the TurboFlash MSL kernel off. Does NOT clear an existing
-    /// `RMLX_TURBO_FLASH=1` env-var — explicit env wins for back-compat.
+    /// Force the TurboFlash MSL kernel off. A hard override: an exported
+    /// `RMLX_TURBO_FLASH=1` does not survive it.
     Off,
     /// Resolves to OFF on every host: the kernel is a measured 2.0–4.25×
     /// decode loss on the one codec it serves, and it perturbs the generated
@@ -206,9 +206,9 @@ fn resolve_turbo_flash(
 }
 
 /// `--planar-flash-decode` tri-state. Default `Auto` resolves **OFF** on every
-/// host — a HOLD, not a hardware gate. It shares the env-var / `OnceLock`
-/// bridging pattern and the HOLD posture with [`TurboFlashMode`], but not any
-/// per-family policy: neither flag has one.
+/// host — a HOLD, not a hardware gate. It shares the resolution pattern and
+/// the HOLD posture with [`TurboFlashMode`], but not any per-family policy:
+/// neither flag has one.
 ///
 /// Added with the planar_flash_decode MSL kernel (2026-05). Defaults OFF;
 /// validation found no measurable speedup (-0.19% at 4k canary) and NIAH was
@@ -216,11 +216,10 @@ fn resolve_turbo_flash(
 /// current posture in full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub(crate) enum PlanarFlashDecodeMode {
-    /// Force the planar_flash_decode kernel on. Sets `RMLX_PLANAR_FLASH_DECODE=1`.
+    /// Force the planar_flash_decode kernel on.
     On,
-    /// Force the planar_flash_decode kernel off (hard override: removes
-    /// `RMLX_PLANAR_FLASH_DECODE` from env so a stale `=1` cannot latch
-    /// the `OnceLock` true on first read).
+    /// Force the planar_flash_decode kernel off. A hard override: an exported
+    /// `RMLX_PLANAR_FLASH_DECODE=1` does not survive it.
     Off,
     /// Resolves to OFF on every host. Validation complete: HOLD.
     #[default]
@@ -314,18 +313,17 @@ fn resolve_planar_flash_decode(mode: PlanarFlashDecodeMode, env: &DispatchPolicy
 /// (HOLD pattern — kernels ship as stubs; codec implementations fill in
 /// and flip `Auto` once the NIAH gate passes per codec).
 ///
-/// Mirrors [`PlanarFlashDecodeMode`] exactly — same env-var / OnceLock
-/// pattern, same Auto-HOLD rationale.
+/// Mirrors [`PlanarFlashDecodeMode`] exactly — same resolution pattern, same
+/// Auto-HOLD rationale.
 ///
 /// Added with the fused-QK kernel skeleton (2026-05).
 /// Auto stays OFF until all five codec kernels pass their NIAH gates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub(crate) enum FusedQkMode {
-    /// Force the fused-QK kernels on. Sets `RMLX_FUSED_QK=1`.
+    /// Force the fused-QK kernels on.
     On,
-    /// Force the fused-QK kernels off (hard override: removes
-    /// `RMLX_FUSED_QK` from env so a stale `=1` cannot latch
-    /// the `OnceLock` true on first read).
+    /// Force the fused-QK kernels off. A hard override: an exported
+    /// `RMLX_FUSED_QK=1` does not survive it.
     Off,
     /// Resolves to OFF on every host. HOLD: kernel stubs not yet
     /// dispatching. Auto flips once codec implementations land and NIAH
@@ -399,18 +397,16 @@ fn resolve_fused_qk(mode: FusedQkMode, env: &DispatchPolicy) -> bool {
 /// warm-TTFT cross-codec audit. Auto therefore stays OFF on every host —
 /// same posture as `PlanarFlashDecodeMode::Auto`.
 ///
-/// Mirrors [`FusedQkMode`] exactly — same env-var / `OnceLock` pattern.
+/// Mirrors [`FusedQkMode`] exactly — same resolution pattern.
 /// The dispatch counter aggregator (`sparse_attn_total_dispatch_count`),
 /// dormancy invariant tests, and the seedless dispatch test are in
 /// `crates/rmlx-kv-quant/src/sparse_attn*.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub(crate) enum SparseAttnMode {
-    /// Force the two-phase sparse-attention dispatch on. Sets
-    /// `RMLX_SPARSE_ATTN=1`.
+    /// Force the two-phase sparse-attention dispatch on.
     On,
-    /// Force the sparse-attention dispatch off (hard override: removes
-    /// `RMLX_SPARSE_ATTN` from env so a stale `=1` cannot latch the
-    /// `OnceLock` true on first read).
+    /// Force the sparse-attention dispatch off. A hard override: an exported
+    /// `RMLX_SPARSE_ATTN=1` does not survive it.
     Off,
     /// Resolves to OFF on every host. Sparse-attn is warm-TTFT dormant by
     /// design (Path C): the production `update_and_sdpa` path always
@@ -633,9 +629,9 @@ pub(crate) fn run_serve(
     sink: &EventRecorder,
 ) -> anyhow::Result<()> {
     // The TurboFlash / planar-flash-decode gates are resolved in `main`, before
-    // any subcommand dispatch, alongside `--fused-qk` and `--sparse-attn`. They
-    // are process-wide `OnceLock`s, so resolving them per-subcommand would let
-    // `serve` and the measurement commands disagree on the kernel set.
+    // any subcommand dispatch, alongside `--fused-qk`, `--sparse-attn` and
+    // `--rot-k-fused`. Resolving them per-subcommand would let `serve` and the
+    // measurement commands disagree on the kernel set.
 
     // load projects.toml and resolve caps via the precedence chain:
     // CLI flag > [project.<name>] > [global] > built-in default.

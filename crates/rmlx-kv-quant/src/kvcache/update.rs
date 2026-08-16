@@ -5386,10 +5386,11 @@ impl KvCache {
     ///
     /// # Fallback conditions
     ///
-    /// - `RMLX_TURBO_FLASH != "1"` (default).
+    /// - `DispatchPolicy::turbo_flash` unset (default).
     /// - Smoke-probe forced fallback (corruption detected).
     /// - q_seq != 1 (prefill path — only decode is supported).
-    /// - kv_seq <= `TURBO_FLASH_MIN_KV_SEQ` (below split-K crossover).
+    /// - `kv_seq <= DispatchPolicy::turbo_flash_min_kv_seq` (below the split-K
+    ///   crossover).
     /// - GPU buffers not yet populated (first call, before alloc).
     /// - head_dim ∉ {128, 256} (kernel register-array sizing constraint).
     ///
@@ -5400,7 +5401,7 @@ impl KvCache {
     /// `Buffer::raw_ptr()` in the kernel-output `to_bytes`) at 32k ctx on
     /// Qwen3.6-35B-A3B-8bit (head_dim=256) — worse than TheTom's
     /// garbage-token corruption (it crashes the server). Stays default-OFF.
-    /// Setting `RMLX_TURBO_FLASH=1` will crash on that cell. See
+    /// Setting `DispatchPolicy::turbo_flash` will crash on that cell. See
     /// `docs/reports/B1-turboflash-m5-validation.md`.
     #[allow(
         clippy::indexing_slicing,
@@ -5436,7 +5437,7 @@ impl KvCache {
 
     /// TurboFlash entry point for cross-layer-KV consumers (Gemma4). Identical
     /// behaviour to [`Self::update_and_sdpa_k8v4_flash`] except
-    /// `RMLX_TURBO_FLASH_LOCK=1` is ignored: the bf16 `decode_fp16_k/v`
+    /// `DispatchPolicy::turbo_flash_lock` is ignored: the bf16 `decode_fp16_k/v`
     /// mirror MUST stay current every decode step, because the caller
     /// (`update_and_sdpa_shared_source`) slices it to surface bf16 (K, V) for
     /// shared-KV consumer layers. Lock-on would freeze the mirror at the
@@ -5497,7 +5498,7 @@ impl KvCache {
         // cleanly on the fallback path).
         //
         // `kv_seq_after_update` is the offset the caller's `update()` would
-        // produce — used for the `kv_seq > TURBO_FLASH_MIN_KV_SEQ` gate.
+        // produce — used for the `kv_seq > turbo_flash_min_kv_seq` gate.
         let kv_seq_after_update = self.offset + new_seq;
         if !turbo_flash_should_run(&self.policy, q_seq, kv_seq_after_update) {
             return Ok(None);
@@ -5547,7 +5548,7 @@ impl KvCache {
 
         // ── Lock-on skip of `update_decode_fp16`
         //
-        // When `RMLX_TURBO_FLASH_LOCK=1` AND the persistent flash buffers are
+        // When `DispatchPolicy::turbo_flash_lock` is set AND the persistent flash buffers are
         // already seeded (`flash_k_codes.is_some()`), the bf16 mirror is no
         // longer read by anyone — the kernel reads `flash_*` directly and the
         // request has opted out of standard-SDPA fallback. Skipping the bf16
@@ -5727,7 +5728,7 @@ impl KvCache {
     /// buffer at the new capacity and copies the existing `[.., 0..old_max_seq, .]`
     /// content forward, matching the copy-prefix-forward contract every other
     /// grow path uses. It is codec-general (keyed off buffer shape, never an
-    /// arch) and lock-state agnostic — under `RMLX_TURBO_FLASH_LOCK` the flash
+    /// arch) and lock-state agnostic — under `turbo_flash_lock` the flash
     /// buffers are the sole K/V store, so copying them (rather than re-seeding
     /// from the frozen bf16 mirror) is what preserves the decode tail.
     #[allow(
@@ -5920,7 +5921,7 @@ impl KvCache {
     /// Quantise `new_k`/`new_v` directly into the persistent flash buffers at
     /// `[:, :, start:start+n, :]`, bypassing the bf16 `decode_fp16_k/v` mirror.
     ///
-    /// Used by the `RMLX_TURBO_FLASH_LOCK=1` path after the initial seed has
+    /// Used by the `DispatchPolicy::turbo_flash_lock` path after the initial seed has
     /// populated `flash_*`. Algorithmically equivalent to
     /// `append_flash_buffers_from_fp16` if the caller updated `decode_fp16_*`
     /// with the same `new_k`/`new_v` first — but we skip that update so the
@@ -6034,21 +6035,22 @@ impl KvCache {
     /// # Returns
     ///
     /// - `Ok(Some(output))` — TurboFlash ran; output is `[B, n_q_heads, 1, D]`.
-    /// - `Ok(None)` — not K8V4, env-var OFF, seq too short, or prefill step;
-    ///   caller falls through to standard `cache.update()` + SDPA.
+    /// - `Ok(None)` — not K8V4, the gate is off, seq too short, or a prefill
+    ///   step; caller falls through to standard `cache.update()` + SDPA.
     ///
     /// # Dispatch rule
     ///
     /// ```text
-    /// if RMLX_TURBO_FLASH=1 AND is_k8v4() AND kv_seq_after_update > 4096 {
+    /// if policy.turbo_flash AND is_k8v4()
+    ///    AND kv_seq_after_update > policy.turbo_flash_min_kv_seq {
     /// update_and_sdpa_k8v4_flash(...) // split-K FA, no dequant round-trip
     /// } else {
     /// None // caller does standard update() + scaled_dot_product_attention()
     /// }
     /// ```
     ///
-    /// The `kv_seq > 4096` threshold is checked inside `update_and_sdpa_k8v4_flash`
-    /// via `turbo_flash_should_run`; this wrapper delegates entirely to that
+    /// The threshold is checked inside `update_and_sdpa_k8v4_flash` via
+    /// `turbo_flash_should_run`; this wrapper delegates entirely to that
     /// function, keeping the check in one place.
     ///
     /// Callers that are NOT K8V4 pay only the `is_k8v4()` bool check and

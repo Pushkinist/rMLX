@@ -27,7 +27,7 @@
 //! | `RMLX_PLANAR_FLASH_DECODE` | `planar_flash_decode` | `1` |
 //! | `RMLX_ROT_K_FUSED` | `rot_k_fused` | `1` |
 
-use std::sync::{LazyLock, PoisonError, RwLock};
+use std::sync::{PoisonError, RwLock};
 
 /// Default minimum `kv_seq` for the generalized fused-QK kernels to dispatch.
 ///
@@ -46,9 +46,14 @@ pub const DEFAULT_TURBO_FLASH_MIN_KV_SEQ: i32 = 4096;
 /// Every boolean defaults to `false` — the generic path — and every threshold
 /// to its `DEFAULT_*` constant. [`DispatchPolicy::from_env`] is the only
 /// constructor that consults the environment.
+///
+/// Deliberately a plain struct with public fields: callers build it
+/// field-by-field (CLI resolution, benches, tests), and adding a field should
+/// be a review point at every construction site rather than something
+/// `..Default::default()` absorbs silently.
 #[allow(
     clippy::exhaustive_structs,
-    reason = "closed policy value — callers build it field-by-field (CLI resolution, benches, tests); adding a field is a deliberate review point at every construction site"
+    reason = "closed policy value — callers outside this crate build it field-by-field, which `#[non_exhaustive]` would forbid; a new field is meant to break those sites"
 )]
 #[allow(
     clippy::struct_excessive_bools,
@@ -157,19 +162,34 @@ fn env_threshold(name: &str, default: i32, clamp_negative: bool) -> i32 {
 /// Process-wide default, handed to every KV cache that is not given an
 /// explicit policy.
 ///
-/// Seeded from the environment on first read and replaceable at any point via
-/// [`set_dispatch_policy`] — it is a default, not a latch. A cache captures
+/// `None` until something asks for it or installs one: a read fills it from
+/// the environment, [`set_dispatch_policy`] overwrites it outright. The
+/// `Option` is what keeps `from_env` off the install path — seeding eagerly
+/// would parse the environment a second time, and warn a second time about a
+/// malformed threshold, on every CLI start.
+///
+/// Replaceable at any point — it is a default, not a latch. A cache captures
 /// the value at construction, so replacing it never disturbs caches that are
 /// already live.
-static PROCESS_DEFAULT: LazyLock<RwLock<DispatchPolicy>> =
-    LazyLock::new(|| RwLock::new(DispatchPolicy::from_env()));
+static PROCESS_DEFAULT: RwLock<Option<DispatchPolicy>> = RwLock::new(None);
 
-/// The current process-wide default policy.
+/// The current process-wide default policy, resolving from the environment on
+/// first use.
 #[must_use]
 pub fn dispatch_policy() -> DispatchPolicy {
-    *PROCESS_DEFAULT
+    if let Some(p) = *PROCESS_DEFAULT
         .read()
         .unwrap_or_else(PoisonError::into_inner)
+    {
+        return p;
+    }
+    let mut slot = PROCESS_DEFAULT
+        .write()
+        .unwrap_or_else(PoisonError::into_inner);
+    // Re-check: another thread may have filled or installed one between the
+    // read unlock and the write lock. `from_env` warns on a malformed
+    // threshold, so running it twice would double the warning.
+    *slot.get_or_insert_with(DispatchPolicy::from_env)
 }
 
 /// Replace the process-wide default policy.
@@ -178,10 +198,13 @@ pub fn dispatch_policy() -> DispatchPolicy {
 /// built. Benches and tests call it between arms to build the next arm's
 /// caches under a different policy; caches built earlier keep the policy they
 /// captured.
+///
+/// Installing does not read the environment — the caller already resolved
+/// whatever part of it applies.
 pub fn set_dispatch_policy(policy: DispatchPolicy) {
     *PROCESS_DEFAULT
         .write()
-        .unwrap_or_else(PoisonError::into_inner) = policy;
+        .unwrap_or_else(PoisonError::into_inner) = Some(policy);
 }
 
 #[cfg(test)]

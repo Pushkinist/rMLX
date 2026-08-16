@@ -40,7 +40,7 @@
 //! `rot_k_msl.rs` (same directory) implements the fused path: Fast Walsh-Hadamard
 //! Transform (FWHT) + affine 8-bit quantize in one Metal kernel pass. The FWHT
 //! is O(D log₂D) vs the matmul's O(D²), and eliminates the intermediate `K_rot`
-//! DRAM allocation. Opt-in via `RMLX_ROT_K_FUSED=1`; falls back to this
+//! DRAM allocation. Opt-in via `--rot-k-fused on`; falls back to this
 //! matmul path on unsupported D or error. The helper functions below
 //! (`hadamard_rotation`, `rotate_last_axis`) remain the v1 reference path
 //! and the fallback — they are not removed.

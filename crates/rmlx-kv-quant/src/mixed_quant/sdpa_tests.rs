@@ -1,6 +1,7 @@
 use super::super::state::MixedKvState;
 use super::*;
 use crate::test_utils::{cosine_similarity_per_row, lcg_data, TEST_SEED};
+use rmlx_core::DispatchPolicy;
 use rmlx_mlx::{dequantize, matmul};
 
 #[allow(

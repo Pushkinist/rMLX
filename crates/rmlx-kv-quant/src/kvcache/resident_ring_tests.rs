@@ -34,6 +34,7 @@ use crate::quant::KvQuant;
 use crate::rotorquant::n_groups_for;
 use crate::storage::{KvStorage, QuantIsoK3, QuantIsoK4, QuantRotorK3, QuantRotorK4};
 use crate::test_utils::{lcg_data, skip_if_no_gpu_env};
+use rmlx_core::DispatchPolicy;
 use rmlx_mlx::{Array, Device, Dtype};
 
 const MAX_SEQ: i32 = 1024;
@@ -92,7 +93,7 @@ fn ring_backed_cache(quant: KvQuant) -> KvCache {
         },
         _ => unreachable!("ring_backed_cache covers the K-only ring codecs only"),
     };
-    KvCache::from_storage(storage, quant, 0, 0)
+    KvCache::from_storage(storage, quant, 0, 0, DispatchPolicy::default())
 }
 
 /// Every ring-backed K-only codec, both bit widths of both families.

@@ -1,4 +1,5 @@
 use super::*;
+use rmlx_core::DispatchPolicy;
 use rmlx_mlx::{Array, Device, Dtype};
 
 /// Build a small dummy `SparseAttnInputs` for the gate-OFF unit tests.

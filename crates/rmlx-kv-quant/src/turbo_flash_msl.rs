@@ -169,7 +169,7 @@ pub fn smoke_probe_check(token_ids: &[u32]) -> bool {
                     "TurboFlash: corruption detected — {} consecutive identical tokens \
                      (token_id={}). Apple10/M5 corruption (TheTom `67f076f2e`). \
                      Falling back to mixed_quantized_sdpa for remainder of process. \
-                     Set RMLX_TURBO_FLASH=0 to suppress this probe.",
+                     Pass --turbo-flash off to suppress this probe.",
                     run,
                     token_ids[i]
                 );

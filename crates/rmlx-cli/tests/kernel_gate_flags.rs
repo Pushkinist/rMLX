@@ -28,6 +28,29 @@ struct RunResult {
     stderr: String,
 }
 
+impl RunResult {
+    /// The single `kernel gate resolved …` line for `flag`.
+    ///
+    /// Anchored to one line on purpose: `stderr.contains(flag)` plus
+    /// `stderr.contains("resolved ON")` is satisfied by *two different* gates'
+    /// lines, so a variable wired to the wrong field would still pass. One
+    /// line carries both the flag name and its verdict, so matching within it
+    /// is the assertion that actually holds.
+    fn gate_line(&self, flag: &str) -> String {
+        let needle = format!("\"{flag}\"");
+        self.stderr
+            .lines()
+            .find(|l| l.contains(&needle) && l.contains("kernel gate resolved"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no `kernel gate resolved` line for {flag}; stderr was:\n{}",
+                    self.stderr
+                )
+            })
+            .to_owned()
+    }
+}
+
 /// Run the built `rmlx` binary with an isolated `RMLX_HOME` and `RUST_LOG=info`
 /// so the gate-resolution `tracing::info!` lines are emitted.
 ///
@@ -81,8 +104,9 @@ fn kernel_gates_resolve_for_non_serve_subcommand() {
         r.stderr
     );
     assert!(
-        r.stderr.contains("--planar-flash-decode") && r.stderr.contains("resolved OFF"),
-        "planar-flash-decode gate was not resolved for `profile list`; stderr: {}",
+        r.gate_line("--planar-flash-decode")
+            .contains("resolved OFF"),
+        "planar-flash-decode gate was not resolved OFF for `profile list`; stderr: {}",
         r.stderr
     );
 }
@@ -98,11 +122,8 @@ fn kernel_gates_resolve_without_any_flag() {
         "TurboFlash `auto` was not resolved for `profile list`; stderr: {}",
         r.stderr
     );
-    assert!(
-        r.stderr.contains("--planar-flash-decode") && r.stderr.contains("kernel gate resolved"),
-        "planar-flash-decode `auto` was not resolved for `profile list`; stderr: {}",
-        r.stderr
-    );
+    // `gate_line` panics when the gate never resolved, which is the assertion.
+    let _ = r.gate_line("--planar-flash-decode");
 }
 
 /// `global = true` keeps the pre-existing `rmlx serve --turbo-flash …` spelling
@@ -190,22 +211,38 @@ fn turbo_flash_lock_is_global_and_opt_in() {
 fn rot_k_fused_gate_resolves_and_honours_its_env_opt_in() {
     let off = run(&["profile", "list"]);
     assert!(
-        off.stderr.contains("--rot-k-fused") && off.stderr.contains("resolved OFF"),
-        "rot-k-fused gate was not resolved for `profile list`; stderr: {}",
+        off.gate_line("--rot-k-fused").contains("resolved OFF"),
+        "rot-k-fused gate was not resolved OFF for `profile list`; stderr: {}",
         off.stderr
     );
+
+    // The end-to-end proof that `RMLX_ROT_K_FUSED` maps to `rot_k_fused` and
+    // to nothing else: the subprocess owns its environment, one variable is
+    // set, and the verdict is read off that gate's own line. Every other gate
+    // must stay OFF in the same run — a variable wired to the wrong field
+    // would flip one of them.
     let on = run_with_env(&["profile", "list"], &[("RMLX_ROT_K_FUSED", "1")]);
     assert!(
-        on.stderr.contains("--rot-k-fused") && on.stderr.contains("resolved ON"),
-        "RMLX_ROT_K_FUSED=1 must resolve the gate ON under `auto`; stderr: {}",
+        on.gate_line("--rot-k-fused").contains("resolved ON"),
+        "RMLX_ROT_K_FUSED=1 must resolve --rot-k-fused ON under `auto`; stderr: {}",
         on.stderr
     );
+    for other in ["--fused-qk", "--sparse-attn", "--planar-flash-decode"] {
+        assert!(
+            on.gate_line(other).contains("resolved OFF"),
+            "{other} must stay OFF when only RMLX_ROT_K_FUSED is set; stderr: {}",
+            on.stderr
+        );
+    }
+
     let forced_off = run_with_env(
         &["--rot-k-fused", "off", "profile", "list"],
         &[("RMLX_ROT_K_FUSED", "1")],
     );
     assert!(
-        forced_off.stderr.contains("--rot-k-fused") && forced_off.stderr.contains("resolved OFF"),
+        forced_off
+            .gate_line("--rot-k-fused")
+            .contains("resolved OFF"),
         "`--rot-k-fused off` must override the env opt-in; stderr: {}",
         forced_off.stderr
     );

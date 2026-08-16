@@ -29,6 +29,7 @@ use crate::rotor_flash_decode_msl::rotor_flash_decode_dispatch_count;
 use crate::rotorquant::n_groups_for;
 use crate::storage::{KvStorage, QuantRotorK3, QuantRotorK4};
 use crate::test_utils::{env_lock, lcg_data, skip_if_no_gpu_env};
+use rmlx_core::DispatchPolicy;
 use rmlx_mlx::{Array, Device, Dtype};
 
 const MAX_SEQ: i32 = 512;
@@ -71,7 +72,7 @@ fn seeded_qjl_off_cache(quant: KvQuant, kv_h: i32, head_dim: i32) -> KvCache {
             max_seq: MAX_SEQ,
         }
     };
-    KvCache::from_storage(storage, quant, 0, 0)
+    KvCache::from_storage(storage, quant, 0, 0, DispatchPolicy::default())
 }
 
 /// True once the cache's rotor K store has a live GPU ring — the witness that

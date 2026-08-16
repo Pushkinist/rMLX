@@ -24,7 +24,7 @@
 //
 // Wire-in: `KvCache::try_fused_qk_dispatch` (called from `sdpa.rs` just
 // before the legacy SDPA fallback). The dispatch is decode-only
-// (`q_seq == 1`) and gated by `RMLX_FUSED_QK=1`. Returns `None` (fall
+// (`q_seq == 1`) and gated by `DispatchPolicy::fused_qk`. Returns `None` (fall
 // through) on any codec without a populated encoder or when QJL is
 // enabled for rotor (the kernel does not consume the QJL residual).
 
@@ -129,7 +129,7 @@ impl KvCache {
     /// dispatches a fused-QK kernel and assembles the SDPA output;
     /// returns `None` to fall through to the legacy dequant + SDPA path.
     ///
-    /// Gates, in order: env-var (`RMLX_FUSED_QK=1`), GPU device, decode-only
+    /// Gates, in order: the cache's `DispatchPolicy::fused_qk`, GPU device, decode-only
     /// (`q_seq == 1`), `new_k` rank 4, `head_dim` in the kernel-supported set
     /// (128 or 256), `kv_seq` ≥ minimum threshold, codec is in the fused-QK
     /// table, codec has a GPU encoder available, (for rotor codecs) the QJL

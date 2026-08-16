@@ -235,10 +235,10 @@ struct Cli {
     /// K-packed caches.  Default `auto`.
     ///
     /// `auto` (default): HOLD — kernel stubs present but not dispatching.
-    /// Auto stays OFF until codec implementations land and NIAH gates pass.
-    /// `on`: force-set RMLX_FUSED_QK=1 before first inference.
-    /// `off`: HARD override — remove RMLX_FUSED_QK from env so a stale `=1`
-    /// in the shell cannot latch the OnceLock to true.
+    /// Auto stays OFF until codec implementations land and NIAH gates pass;
+    /// a pre-existing `RMLX_FUSED_QK=1` is still honoured.
+    /// `on`: resolve the gate on.
+    /// `off`: HARD override — resolves off even with `RMLX_FUSED_QK=1` set.
     #[arg(long, value_enum, global = true, default_value_t = FusedQkMode::Auto)]
     fused_qk: FusedQkMode,
     /// Two-phase sparse-attention dispatch (phase1_score +
@@ -246,10 +246,9 @@ struct Cli {
     ///
     /// `auto` (default): HOLD — warm-TTFT dormant by design on normal generate
     /// flows. Auto stays OFF until seedless workloads demonstrate measurable
-    /// speedup.
-    /// `on`: force-set `RMLX_SPARSE_ATTN=1` before first inference.
-    /// `off`: HARD override — remove `RMLX_SPARSE_ATTN` from env so a stale
-    /// `=1` in the shell cannot latch the `OnceLock` to true.
+    /// speedup; a pre-existing `RMLX_SPARSE_ATTN=1` is still honoured.
+    /// `on`: resolve the gate on.
+    /// `off`: HARD override — resolves off even with `RMLX_SPARSE_ATTN=1` set.
     #[arg(long, value_enum, global = true, default_value_t = SparseAttnMode::Auto)]
     sparse_attn: SparseAttnMode,
     /// TurboFlash MSL attention kernel. Default `auto`.
@@ -258,11 +257,12 @@ struct Cli {
     /// serves (K8V4, `kv_seq > 4096`) the kernel decodes 2.0–4.25× slower than
     /// the generic path — the loss grows with `kv_seq` — holds ~722 MB more
     /// resident KV, and is not bit-exact, so it perturbs the generated tokens
-    /// as well. HOLD until a decode re-measurement clears it.
-    /// `on`: force-set RMLX_TURBO_FLASH=1 before first inference (ablation, and
-    /// the escape hatch for that re-measurement).
-    /// `off`: hard override — removes RMLX_TURBO_FLASH from env so a stale
-    /// shell value cannot latch the OnceLock back to true.
+    /// as well. HOLD until a decode re-measurement clears it; a pre-existing
+    /// `RMLX_TURBO_FLASH=1` is still honoured, and logs a `warn!` naming the
+    /// cost because the kernel then runs while the flag reads `auto`.
+    /// `on`: resolve the gate on (ablation, and the escape hatch for that
+    /// re-measurement).
+    /// `off`: hard override — resolves off even with `RMLX_TURBO_FLASH=1` set.
     ///
     /// Global: every subcommand resolves this the same way, so `rmlx bench`
     /// and `rmlx baseline` measure the kernel configuration `rmlx serve` runs.
@@ -271,19 +271,21 @@ struct Cli {
     /// Enable the TurboFlash lock variant. Default OFF.
     ///
     /// Skips bf16 K/V buffer maintenance once the persistent flash buffers are seeded.
-    /// Has no effect unless --turbo-flash (or RMLX_TURBO_FLASH=1) is also active.
-    /// When absent, RMLX_TURBO_FLASH_LOCK=1 in the environment is still honoured
-    /// (back-compat). CLI flag takes precedence over env when set.
+    /// Has no effect unless `--turbo-flash` (or `RMLX_TURBO_FLASH=1`) is also active.
+    /// There is no `off` arm: passing the flag resolves lock-on, and when it is
+    /// absent `RMLX_TURBO_FLASH_LOCK=1` is still honoured (back-compat), so
+    /// clearing it means unsetting the variable.
     #[arg(long, global = true, default_value_t = false)]
     turbo_flash_lock: bool,
     /// PlanarQuant flash-decode MSL kernel. Default `auto`.
     ///
     /// `auto` (default): OFF on every host — the warm-TTFT bf16-K seed shadows
     /// the kernel on the normal generate flow, so there is no measurable TPS
-    /// win to flip Auto for.
-    /// `on`: force-set `RMLX_PLANAR_FLASH_DECODE=1` before first inference.
-    /// `off`: HARD override — remove `RMLX_PLANAR_FLASH_DECODE` from env
-    /// so a stale `=1` in the shell cannot latch the `OnceLock` to true.
+    /// win to flip Auto for; a pre-existing `RMLX_PLANAR_FLASH_DECODE=1` is
+    /// still honoured.
+    /// `on`: resolve the gate on.
+    /// `off`: HARD override — resolves off even with
+    /// `RMLX_PLANAR_FLASH_DECODE=1` set.
     ///
     /// Only takes effect for PlanarK-storage layers (i.e.
     /// `--kv-quant planar_k`); other KV variants fall through unchanged.
