@@ -7,27 +7,14 @@
 //! - [`rot_k_tq4v_sdpa`]: dequant-then-SDPA for RotKTq4V hybrid.
 
 use crate::rot_k_msl::rot_k_fwht_rotate_gpu;
-use crate::sparse_v_msl::{sparse_v_kernel_enabled, sparse_v_weighted_sum};
 use rmlx_core::error::{Error, Result};
 use rmlx_core::DispatchPolicy;
 use rmlx_mlx::{
-    add, dequantize, expand_dims, greater_equal, multiply, quantized_matmul, scalar_f32,
-    scaled_dot_product_attention, softmax_precise, where_cond, Array, Device, Dtype,
+    add, dequantize, expand_dims, multiply, quantized_matmul, scalar_f32,
+    scaled_dot_product_attention, softmax_precise, Array, Device, Dtype,
 };
 
 use super::state::MixedTuple;
-
-// ── Sparse-V threshold ────────────────────────────────────────────────────────
-
-/// Threshold below which a softmax probability is treated as zero for V-row
-/// dequant (sparse-V cheap path).
-///
-/// Hardcoded `1e-6` (`RMLX_SPARSE_V_THRESHOLD` env var removed in PASS 3).
-/// Matches TheTom `experimental_decode_speed_tests` `TURBO_SPARSE_V` default.
-#[inline]
-fn sparse_v_threshold() -> f32 {
-    1e-6_f32
-}
 
 /// Byte-for-byte port of `mixed_quantized_scaled_dot_product_attention`
 /// (`mlx_lm/models/base.py:108-157`).
@@ -146,77 +133,30 @@ pub fn mixed_quantized_sdpa(
         None => scores,
     };
 
-    let probs_raw = softmax_precise(&scores_masked, -1, device)?;
+    // The full softmax distribution goes into the V matmul. An earlier revision
+    // truncated probabilities below 1e-6 to zero here, on the theory that a
+    // zeroed row costs nothing downstream; `quantized_matmul` is opaque and
+    // reads every V row regardless, so the truncation bought no bandwidth while
+    // dropping attention mass that it never renormalised — an error that grows
+    // with context, which is the regime the codec exists for.
+    let probs = softmax_precise(&scores_masked, -1, device)?;
 
-    // Sparse-V cheap path — zero out softmax probs below threshold before the
-    // V-row dequant. Rows with zero weight are skipped by `quantized_matmul`
-    // without altering any non-zero rows.
-    let probs = {
-        let threshold = sparse_v_threshold();
-        if threshold > 0.0 {
-            let t_arr = scalar_f32(threshold);
-            let t_arr = if probs_raw.dtype() == Dtype::F32 {
-                t_arr
-            } else {
-                t_arr.astype(probs_raw.dtype(), device)?
-            };
-            let zeros_arr = scalar_f32(0.0);
-            let zeros_arr = if probs_raw.dtype() == Dtype::F32 {
-                zeros_arr
-            } else {
-                zeros_arr.astype(probs_raw.dtype(), device)?
-            };
-            // mask = probs >= threshold (bool/U8)
-            let mask = greater_equal(&probs_raw, &t_arr, device)?;
-            // probs_sparse = where(mask, probs, 0)
-            where_cond(&mask, &probs_raw, &zeros_arr, device)?
-        } else {
-            probs_raw
-        }
-    };
+    let out = quantized_matmul(
+        &probs,
+        &v_eff.codes,
+        &v_eff.scales,
+        Some(&v_eff.biases),
+        v_group_size,
+        v_bits,
+        "affine",
+        false,
+        device,
+    )?;
 
-    // Fused sparse-V MSL kernel — always ON (hardcoded default, PASS 3).
-    let t_seq = q_values.codes.shape()[2]; // actual context length
-    let use_t33 =
-        sparse_v_kernel_enabled() && l == 1 && (v_bits == 4 || v_bits == 8) && t_seq >= 8192;
-
-    if use_t33 {
-        let out_decoded = sparse_v_weighted_sum(
-            &probs,
-            &q_values.codes, // original non-expanded V
-            &q_values.scales,
-            &q_values.biases,
-            b,
-            n_kv_heads,
-            n_repeats,
-            t_seq,
-            d,
-            v_group_size,
-            v_bits,
-            probs.dtype(),
-            device,
-        )?;
-        // out_decoded shape: [B, n_kv_heads, n_repeats, 1, D].
-        // Reshape to [B, n_q_heads, 1, D] (matches quantized_matmul output).
-        out_decoded.reshape(&[b, n_q_heads, l, d], device)
+    if n_repeats > 1 {
+        out.reshape(&[b, n_q_heads, l, d], device)
     } else {
-        let out = quantized_matmul(
-            &probs,
-            &v_eff.codes,
-            &v_eff.scales,
-            Some(&v_eff.biases),
-            v_group_size,
-            v_bits,
-            "affine",
-            false,
-            device,
-        )?;
-
-        if n_repeats > 1 {
-            out.reshape(&[b, n_q_heads, l, d], device)
-        } else {
-            Ok(out)
-        }
+        Ok(out)
     }
 }
 

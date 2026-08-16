@@ -9,8 +9,8 @@
 //!   wrappers.
 //! * `rot_k`, `rot_k_msl`, `mixed_quant`, `k8vturbo3_append_msl` — rotation +
 //!   mixed-precision codec families.
-//! * `turbo_flash_msl`, `sparse_v_msl` — TurboFlash split-K and sparse-V MSL
-//!   kernels used inside the KV update + SDPA dispatch.
+//! * `turbo_flash_msl` — TurboFlash split-K MSL kernel used inside the KV
+//!   update + SDPA dispatch.
 //! * `storage` — `QuantK` / `QuantV` / `QuantPlanarV` / `KvStorage` enum.
 //! * `kvcache` — `KvCache`, the per-layer cache struct.
 //! * `linear_attn` — `LinearAttnCache`, recurrent state for GatedDeltaNet.
@@ -88,7 +88,6 @@ pub mod rotorquant_msl;
 #[cfg(feature = "shader-validation-canary")]
 pub mod shader_validation_canary;
 pub mod sparse_attn;
-pub mod sparse_v_msl;
 pub mod storage;
 pub mod tcq;
 pub mod tcq_v_msl;
