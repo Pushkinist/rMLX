@@ -166,8 +166,28 @@ build-debug:     ## cargo build --profile release-debug (opt-level=3 + full DWAR
 test-perf:       ## cargo test --profile release-perf (release-perf profile, panic=unwind forced by cargo for test harness)
 	cargo test --workspace --profile release-perf
 
-ci-perf:         ## pre-push gate under release-perf (separate from make ci; run before merging perf-sensitive changes)
+# ci-perf runs `gpu-test` after `test-perf`, and it is the only shared gate that
+# does. `make ci` cannot: the GPU tests need the Metal context to themselves
+# (hard rule 8) and take minutes, which is the wrong price on every commit.
+# `ci-perf` already assumes exclusive machine access, so the constraint costs it
+# nothing it was not already paying.
+#
+# `test-perf` first, deliberately: it covers the whole workspace and a compile
+# error anywhere shows up there, whereas `gpu-test` visits five crates and holds
+# the GPU while it does. Fail on the broad, shareable step before spending
+# exclusive-GPU minutes.
+#
+# The two steps run under different profiles on purpose. `gpu-test` builds under
+# `dev`, where debug assertions are live — they are correctness guards, and the
+# GPU tests are correctness tests. `test-perf` is the one that must be
+# release-perf, because that is the codegen a perf-sensitive change ships under.
+#
+# Cost: the GPU half is ~4.5 min warm (318 tests, serialized, under Metal shader
+# validation). Whole target after a codec-layer edit, measured: ~21 min. See
+# docs/TESTING.md.
+ci-perf:         ## pre-push gate under release-perf + the serialized GPU/Metal suite (separate from make ci; run before merging perf-sensitive or codec-layer changes)
 	$(MAKE) test-perf
+	$(MAKE) gpu-test
 	@echo "ci-perf ok"
 
 # gpu-test: the execution step for the tests `check-gpu-tests-ignored` mandates.
@@ -178,11 +198,9 @@ ci-perf:         ## pre-push gate under release-perf (separate from make ci; run
 # category, and tests in it have gone red on main and stayed red undetected.
 #
 # It is NOT part of `make ci`: it needs exclusive access to the Metal context and
-# is far too slow to block every commit. Run it before merging anything in the
-# codec layer. Folding it into `ci-perf` (the one target that already assumes
-# exclusive machine access) is the natural next step, but is blocked while any
-# GPU test is red on main — wiring a known-red step into a shared gate just
-# teaches people to skip the gate.
+# is far too slow to block every commit. It IS part of `ci-perf`, the one target
+# that already assumes exclusive machine access — see the note there. Run it
+# directly, narrowed with CRATE=/FILTER=, while iterating on the codec layer.
 #
 # Metal shader validation is ON here. An out-of-bounds device store is dropped
 # silently — command buffer completes, cb.error is nil, cargo exits 0, and the

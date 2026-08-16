@@ -196,9 +196,41 @@ It is fail-closed in three ways:
 * **Exclusive GPU.** It refuses to start while another MLX process holds the
   Metal context (CLAUDE.md hard rule 8).
 
-`make gpu-test` is not part of `make ci`: it needs the Metal context to itself
-and is too slow to block every commit. Run it before merging anything in the
-codec layer.
+There is no known-red baseline: the suite is green on `main`, so a failure is a
+real one and belongs to whoever is holding the tree.
+
+#### Where it runs: `make ci-perf`, not `make ci`
+
+`make ci-perf` runs `test-perf` and then `gpu-test`. That is the only shared
+gate that executes the GPU tests.
+
+It is deliberately **not** in `make ci`. Two costs rule that out: the suite needs
+the Metal context to itself (CLAUDE.md hard rule 8), so `make ci` could no longer
+be run alongside a live `rmlx serve`; and it adds minutes to a target that runs
+on every commit. `ci-perf` already assumes exclusive machine access, so the GPU
+constraint costs it nothing it was not already paying.
+
+`test-perf` runs first on purpose: it covers the whole workspace, so a compile
+error anywhere surfaces there, while `gpu-test` visits five crates and holds the
+GPU while it does. Fail on the broad, shareable step before spending
+exclusive-GPU minutes.
+
+The two steps build under different profiles, also on purpose. `gpu-test` uses
+`dev`, where debug assertions are live — they are correctness guards and these
+are correctness tests. `test-perf` must be `release-perf`, because that is the
+codegen a perf-sensitive change ships under.
+
+**What it costs.** Measured on this host. The `gpu-test` half alone, warm: 318
+GPU tests across 5 crates in **264 s** (~4.5 min) with shader validation on, of
+which the `rmlx-kv-quant` unit suite is 141 s. Whole `make ci-perf` after a
+codec-layer edit — the case that actually matters, since a `.metal` change
+invalidates `rmlx-kv-quant` and everything downstream of it: **~21 min**
+(1270 s green, 1358 s on the red run). Note that `ci-perf` otherwise touches
+only `release-perf`, so `gpu-test` brings a second, unshared `dev`-profile build
+of those five crates and their test binaries with it.
+
+While iterating on the codec layer, run `make gpu-test` directly and narrow it
+with `CRATE=` / `FILTER=` rather than paying for the whole gate each time.
 
 ### Metal shader validation (on by default here)
 
@@ -268,9 +300,9 @@ a **5.8× slowdown** (n=3 each). That is the reason this never goes near a perf
 cell.
 
 **Never draw a conclusion about model *output* from a validated run.** The unit
-suites are invariant — 234 passed and the same 4 known-red failures in every
-repetition of both modes, with zero invalid-access reports — but real inference
-is not. Ternary-Bonsai-8B (Qwen3 dense) intermittently degenerates under
+suites are invariant — the same pass/fail result in every repetition of both
+modes, with zero invalid-access reports — but real inference is not.
+Ternary-Bonsai-8B (Qwen3 dense) intermittently degenerates under
 validation: it emits a single token (id 0, `"!"`), reports `tps=0.064`, and
 exits 0 with no diagnostic on stderr and nothing in Unified Logging. Reproduced
 here 1 run in 3 at `--kv-quant k8v8` under `FAIL_MODE=allow`, and independently
@@ -286,17 +318,8 @@ ever reported. Whether it is a latent engine defect that instrumentation
 perturbs into visibility or a defect in the instrumentation itself is unresolved
 and tracked outside this document.
 
-Current state: the whole `rmlx-kv-quant` GPU suite (238 classified tests) runs
-clean under validation — zero invalid accesses.
-
-### Known-red baseline
-
-`make gpu-test` currently exits 1 on a clean tree. Four tests in the
-`rmlx-kv-quant` rotor fused-QK dispatch integration binary fail with
-`rotor fused-QK dispatch delta = 0` — the sym and K-only rotor codecs no longer
-reach the fused-QK kernel, while their K-asym siblings still do. This is tracked
-separately and is not a regression from any recent change; it is why the target
-is not yet wired into `ci-perf`. Anything failing **beyond** those four is yours.
+Current state: the whole GPU suite — all five crates, `rmlx-kv-quant` included —
+runs clean under validation, zero invalid accesses.
 
 ### `#[ignore]` is not a place to park a broken test
 

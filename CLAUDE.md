@@ -122,7 +122,7 @@ coverage grows.
    lies, call it out in code + docs.
 8. **Single MLX process per Mac**. Hold the claim file; unload competing MLX
    servers before claiming the GPU; never bypass the claim silently.
-9. **`make ci-perf` builds + tests under `release-perf` (panic=unwind, debug-assertions off).** A failure there that doesn't reproduce under `dev` → rebuild under `release-debug` (full DWARF) and re-run the failing case to capture symbols. Never rely on the `dev` profile to reproduce a release-mode bug — codegen and inlining differ.
+9. **`make ci-perf` builds + tests under `release-perf` (panic=unwind, debug-assertions off), then runs `make gpu-test`.** A failure in the `release-perf` half that doesn't reproduce under `dev` → rebuild under `release-debug` (full DWARF) and re-run the failing case to capture symbols. Never rely on the `dev` profile to reproduce a release-mode bug — codegen and inlining differ. The `gpu-test` half is the exception and builds under `dev` on purpose: debug assertions are correctness guards and those are correctness tests.
 10. **Every KV-cache codec ships an MSL (Metal) decode kernel.** A codec whose decode falls back to CPU dequant is not shippable — it strands the codec at single-digit TPS (GPU idle) and is a bug, not a valid mode. New KV codecs (and the decode path of existing ones) MUST decode on-GPU, reading the quant store directly (fused flash-decode-over-quant; see `docs/KV_QUANT.md`, `docs/FFI.md`, and #45). Each KV `.metal` kernel carries a **native-compilation test** (`xcrun -sdk macosx metal -c`, wired as `make check-metal-compiles` in `make ci`) so MSL syntax errors surface at CI, not on first GPU dispatch. Kernels stay **model-agnostic** — keyed off codec + shape (`head_dim`, `kv_heads`, `bits`), never an arch name.
 
 ## Coding style
@@ -203,9 +203,10 @@ Hard rules:
   serialized; `CRATE=` / `FILTER=` to narrow), or by hand as
   `cargo test -p <crate> --lib -- --ignored <filter> --test-threads=1`.
   `make gpu-test` is the only step that executes them — `make test` passes no
-  `--ignored` and the hosted CI has no Metal — so it is mandatory before merging
-  anything in the codec layer. It is deliberately not in `make ci` (needs the
-  Metal context to itself). A guard
+  `--ignored` and the hosted CI has no Metal. It runs as the second half of
+  **`make ci-perf`**, the one shared gate that already assumes exclusive machine
+  access; it is deliberately not in `make ci`, which would then need the Metal
+  context to itself on every commit. A guard
   that only exercises a check the dispatcher rejects **before** touching a
   device-parameterized op is not a GPU test: pass `Device::Cpu` and leave it
   un-ignored — ignoring a CPU test silently stops running it. The CI gate
@@ -251,7 +252,7 @@ hand — keeps the CI gate and the local gate identical.
 | `make build` | `cargo build --workspace --release`. |
 | `make check` | `cargo check --workspace --all-targets` (fast). |
 | `make test` | `cargo test --workspace` — **skips every `#[ignore]` GPU test**. |
-| `make gpu-test` | Run the GPU/Metal `#[ignore]` tests, `--test-threads=1` (`CRATE=` / `FILTER=` narrow). Needs exclusive machine access. Not in `make ci`. |
+| `make gpu-test` | Run the GPU/Metal `#[ignore]` tests, `--test-threads=1` (`CRATE=` / `FILTER=` narrow). Needs exclusive machine access. Part of `make ci-perf`, not `make ci`. |
 | `make fmt` / `make fmt-check` | Write / check `cargo fmt`. |
 | `make lint` | `cargo clippy -D warnings`. |
 | `make audit` | `cargo audit` with RustSec ignores from `deny.toml`. |

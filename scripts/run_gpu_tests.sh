@@ -417,8 +417,8 @@ if [ -n "${failed_crates}" ]; then
     echo >&2
     echo "Reproduce one crate with:" >&2
     echo "  cargo test --no-fail-fast -p <crate> --tests -- --ignored --test-threads=1 <filter>" >&2
-    echo "Known-red baseline (tracked separately): the four rotor fused-QK dispatch" >&2
-    echo "tests in rmlx-kv-quant reporting 'dispatch delta = 0'. See docs/TESTING.md." >&2
+    echo "There is no known-red baseline: this suite is green on main, so any" >&2
+    echo "failure above is a real one. See docs/TESTING.md." >&2
     echo "A crate reported as 'ran uninstrumented' usually failed to BUILD: no test" >&2
     echo "binary means no Metal device and therefore no validation banner." >&2
     exit 1
