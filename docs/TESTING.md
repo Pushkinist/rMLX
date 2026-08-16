@@ -186,10 +186,10 @@ It is fail-closed in three ways:
 * **Coverage.** Every classified test must actually run. If a crate executes
   fewer tests than were classified for it — a renamed fn, a target no longer
   built, a test compiled out behind a feature — that is an error. Checking only
-  for "executed zero" would let 237 of 238 run and still report green.
+  for "executed zero" would let 317 of 318 run and still report green.
 * **`RMLX_SKIP_GPU=1` is refused outright.** Every classified test opens with
   `if skip_if_no_gpu_env() { return; }`, so with it set the whole suite returns
-  before touching Metal and the gate would happily print `OK: 324 GPU tests
+  before touching Metal and the gate would happily print `OK: 318 GPU tests
   passed` having dispatched nothing. It is a documented setting for Metal-less
   environments, so a stale export in a dev shell would otherwise disarm the one
   step that proves the GPU path works.
@@ -201,33 +201,78 @@ real one and belongs to whoever is holding the tree.
 
 #### Where it runs: `make ci-perf`, not `make ci`
 
-`make ci-perf` runs `test-perf` and then `gpu-test`. That is the only shared
-gate that executes the GPU tests.
+`make ci-perf` is three lines, and it is the only shared gate that executes the
+GPU tests:
+
+```make
+ci-perf:
+	@bash scripts/run_gpu_tests.sh --preflight
+	$(MAKE) test-perf
+	@bash scripts/run_gpu_tests.sh
+```
 
 It is deliberately **not** in `make ci`. Two costs rule that out: the suite needs
 the Metal context to itself (CLAUDE.md hard rule 8), so `make ci` could no longer
 be run alongside a live `rmlx serve`; and it adds minutes to a target that runs
-on every commit. `ci-perf` already assumes exclusive machine access, so the GPU
-constraint costs it nothing it was not already paying.
+on every commit.
 
-`test-perf` runs first on purpose: it covers the whole workspace, so a compile
-error anywhere surfaces there, while `gpu-test` visits five crates and holds the
-GPU while it does. Fail on the broad, shareable step before spending
-exclusive-GPU minutes.
+**This is a real new cost for `ci-perf`, not a free one.** Before, `ci-perf` was
+exactly `cargo test --workspace --profile release-perf` — one invocation that
+runs no `#[ignore]` test and so needs no GPU to itself; it could be, and was, run
+next to a live server. It now refuses to start unless the GPU is idle. `ci-perf`
+is simply the cheapest place in the tree to pay that: it is already the long,
+pre-merge-only target, and the preflight line makes the new precondition fail in
+milliseconds rather than after the release-perf half.
 
-The two steps build under different profiles, also on purpose. `gpu-test` uses
-`dev`, where debug assertions are live — they are correctness guards and these
-are correctness tests. `test-perf` must be `release-perf`, because that is the
-codegen a perf-sensitive change ships under.
+That ordering is the point of splitting the runner across two lines.
+`--preflight` checks only the environment — `RMLX_SKIP_GPU` unset, no competing
+MLX process, a non-empty classification — and runs no tests. Those are the most
+likely way this gate fails in daily use, and finding out about a live `rmlx
+serve` after `test-perf` has finished throws away the ~16 min it took. The tests
+themselves go last, after `test-perf`, because `test-perf` covers the whole
+workspace: a compile error anywhere surfaces there, while the GPU run visits five
+crates and holds the GPU while it does.
 
-**What it costs.** Measured on this host. The `gpu-test` half alone, warm: 318
-GPU tests across 5 crates in **264 s** (~4.5 min) with shader validation on, of
-which the `rmlx-kv-quant` unit suite is 141 s. Whole `make ci-perf` after a
-codec-layer edit — the case that actually matters, since a `.metal` change
-invalidates `rmlx-kv-quant` and everything downstream of it: **~21 min**
-(1270 s green, 1358 s on the red run). Note that `ci-perf` otherwise touches
-only `release-perf`, so `gpu-test` brings a second, unshared `dev`-profile build
-of those five crates and their test binaries with it.
+`ci-perf` invokes the runner **directly** rather than through `make gpu-test`.
+Make propagates command-line variables into sub-makes, so `make ci-perf
+CRATE=rmlx-audio` would have run 7 of 318 tests and still printed `ci-perf ok`,
+and `make ci-perf VALIDATE=0` would have disarmed shader validation. Neither is
+catchable by the coverage check, because `--crate` narrows the classified
+population in lockstep with the executed one. The knobs stay on `make gpu-test`,
+where a human asking for a subset means it.
+
+The two halves build under different profiles, also on purpose. The GPU run uses
+`dev`, where debug assertions are live — 61 `debug_assert!` sites in
+`rmlx-kv-quant` alone — and those are correctness guards on correctness tests.
+`test-perf` must be `release-perf`, because that is the codegen a perf-sensitive
+change ships under. The consequence is recorded in CLAUDE.md hard rule 9: **no
+gate anywhere runs a `Device::Gpu` test with debug-assertions off**, so a GPU
+defect that only appears at that profile has to be reproduced by hand.
+
+**What it costs.** Measured on this host, both figures with a warm `target/`:
+
+| | |
+|---|---|
+| GPU suite alone | **264 s** (~4.5 min) — 318 tests over 5 crates, shader validation on, of which the `rmlx-kv-quant` unit suite is 141 s |
+| Whole `make ci-perf` after a codec-layer edit | **~21 min** (1270 s green, 1358 s on the red run) |
+
+The second is the number that matters, since a `.metal` change invalidates
+`rmlx-kv-quant` and everything downstream of it under `release-perf` too.
+
+**Neither figure includes a cold `dev` build, and that is the case to expect.**
+`ci-perf` otherwise touches only `release-perf`, so the GPU half brings a second,
+unshared `dev`-profile build of those five crates and their dependency trees with
+it — at `opt-level = 0`, and after `test-perf` has just built the same test
+binaries under `release-perf`. `target/debug` is also precisely what
+`scripts/target_gc.sh` prunes first: it protects `release-perf` and names
+`target/debug` as the dominant consumer. So the first `make ci-perf` after the
+`make target-gc` that `make ci` advertises pays a full cold `dev` build on top of
+the ~21 min.
+
+Sharing `release-perf` with `test-perf` would remove that, and is deliberately
+not done — it would run the GPU correctness suite with `debug_assert!` compiled
+out, which is the wrong trade for the layer with this repo's documented
+silent-corruption class.
 
 While iterating on the codec layer, run `make gpu-test` directly and narrow it
 with `CRATE=` / `FILTER=` rather than paying for the whole gate each time.

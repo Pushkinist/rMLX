@@ -122,7 +122,7 @@ coverage grows.
    lies, call it out in code + docs.
 8. **Single MLX process per Mac**. Hold the claim file; unload competing MLX
    servers before claiming the GPU; never bypass the claim silently.
-9. **`make ci-perf` builds + tests under `release-perf` (panic=unwind, debug-assertions off), then runs `make gpu-test`.** A failure in the `release-perf` half that doesn't reproduce under `dev` → rebuild under `release-debug` (full DWARF) and re-run the failing case to capture symbols. Never rely on the `dev` profile to reproduce a release-mode bug — codegen and inlining differ. The `gpu-test` half is the exception and builds under `dev` on purpose: debug assertions are correctness guards and those are correctness tests.
+9. **`make ci-perf` builds + tests under `release-perf` (panic=unwind, debug-assertions off), then runs the GPU/Metal suite.** A failure in the `release-perf` half that doesn't reproduce under `dev` → rebuild under `release-debug` (full DWARF) and re-run the failing case to capture symbols. Never rely on the `dev` profile to reproduce a release-mode bug — codegen and inlining differ. The GPU half is the exception and builds under `dev` on purpose: debug assertions are correctness guards and those are correctness tests. Its consequence: **no gate anywhere executes a `Device::Gpu` test under `release-perf`** — `make test` / `make ci` are `dev` with no `--ignored`, `test-perf` is `release-perf` with no `--ignored`, the GPU suite is `dev` with `--ignored`. A GPU-path defect that appears only with debug-assertions off is therefore out of every gate's scope and must be reproduced by hand at that profile.
 10. **Every KV-cache codec ships an MSL (Metal) decode kernel.** A codec whose decode falls back to CPU dequant is not shippable — it strands the codec at single-digit TPS (GPU idle) and is a bug, not a valid mode. New KV codecs (and the decode path of existing ones) MUST decode on-GPU, reading the quant store directly (fused flash-decode-over-quant; see `docs/KV_QUANT.md`, `docs/FFI.md`, and #45). Each KV `.metal` kernel carries a **native-compilation test** (`xcrun -sdk macosx metal -c`, wired as `make check-metal-compiles` in `make ci`) so MSL syntax errors surface at CI, not on first GPU dispatch. Kernels stay **model-agnostic** — keyed off codec + shape (`head_dim`, `kv_heads`, `bits`), never an arch name.
 
 ## Coding style
@@ -203,10 +203,11 @@ Hard rules:
   serialized; `CRATE=` / `FILTER=` to narrow), or by hand as
   `cargo test -p <crate> --lib -- --ignored <filter> --test-threads=1`.
   `make gpu-test` is the only step that executes them — `make test` passes no
-  `--ignored` and the hosted CI has no Metal. It runs as the second half of
-  **`make ci-perf`**, the one shared gate that already assumes exclusive machine
-  access; it is deliberately not in `make ci`, which would then need the Metal
-  context to itself on every commit. A guard
+  `--ignored` and the hosted CI has no Metal. The same suite runs as the last
+  step of **`make ci-perf`** (invoked directly, so `CRATE=`/`VALIDATE=` cannot
+  narrow or disarm the gate), which is why `ci-perf` now requires an idle GPU
+  when it previously did not. It is deliberately not in `make ci`, which would
+  then need the Metal context to itself on every commit. A guard
   that only exercises a check the dispatcher rejects **before** touching a
   device-parameterized op is not a GPU test: pass `Device::Cpu` and leave it
   un-ignored — ignoring a CPU test silently stops running it. The CI gate
@@ -260,6 +261,7 @@ hand — keeps the CI gate and the local gate identical.
 | `make precommit` | `pre-commit run --all-files`. |
 | `make hooks` | Install the git `pre-commit` hook. |
 | `make ci` | `fmt-check + lint + test + deny + audit` — pre-merge gate. |
+| `make ci-perf` | `test-perf` under `release-perf` + the serialized GPU/Metal suite. Requires an idle GPU. Run before merging perf-sensitive or codec-layer changes (~21 min). |
 | `make tag` | Create annotated `v<version>` tag from `[workspace.package].version` (single source). |
 | `make release-package` | Build + bundle `dist/rmlx-v<ver>-aarch64-apple-darwin.tar.gz` (+ `.sha256`). |
 | `make release-sha` | Print sha256 of the `v<ver>` GitHub source tarball (`--write` patches the formula). |
@@ -275,7 +277,9 @@ hand — keeps the CI gate and the local gate identical.
 
 `MODEL` and `PORT` override at the CLI: `make info MODEL=/path/to/snapshot`.
 
-Run `make ci` before push. The per-commit `pre-commit` hook only runs the
+Run `make ci` before push, plus `make ci-perf` when the change touches
+`rmlx-kv-quant`, a `.metal` kernel, or a KV/decode path — `make ci` runs no GPU
+test. The per-commit `pre-commit` hook only runs the
 fast checks (fmt, clippy, file hygiene) — `cargo audit` and `cargo deny`
 fetch the RustSec advisory DB over the network and were stalling on slow
 links, so they are gated behind the `manual` stage. Trigger them via:
@@ -390,7 +394,8 @@ committed baseline: Bonsai ~110, Gemma4-e4b ~74, Qwen3.6 ~97 TPS) live in
 `git bisect skip`, exit 1 = regression. Two `Cargo.toml` perf profiles are
 in play: `release-perf` (`debug-assertions=false`, `overflow-checks=false`,
 stripped debug, `panic=unwind` kept for `MetalClaim::Drop` RAII — see Hard
-rule 9) is the canary / bench / `make ci-perf` profile; `release-debug`
+rule 9) is the canary / bench profile and the profile of `make ci-perf`'s
+`test-perf` half — its GPU half runs under `dev`, see Hard rule 9; `release-debug`
 (full DWARF, `debug=true`) is the samply flamegraph profile. Build targets:
 `make build-perf`, `make build-debug`, `make test-perf`, `make ci-perf`.
 The build-by-failure rule is in §Hard rules rule 9 — do not duplicate it here.
