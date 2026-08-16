@@ -186,19 +186,96 @@ It is fail-closed in three ways:
 * **Coverage.** Every classified test must actually run. If a crate executes
   fewer tests than were classified for it — a renamed fn, a target no longer
   built, a test compiled out behind a feature — that is an error. Checking only
-  for "executed zero" would let 237 of 238 run and still report green.
+  for "executed zero" would let 317 of 318 run and still report green.
 * **`RMLX_SKIP_GPU=1` is refused outright.** Every classified test opens with
   `if skip_if_no_gpu_env() { return; }`, so with it set the whole suite returns
-  before touching Metal and the gate would happily print `OK: 324 GPU tests
+  before touching Metal and the gate would happily print `OK: 318 GPU tests
   passed` having dispatched nothing. It is a documented setting for Metal-less
   environments, so a stale export in a dev shell would otherwise disarm the one
   step that proves the GPU path works.
 * **Exclusive GPU.** It refuses to start while another MLX process holds the
   Metal context (CLAUDE.md hard rule 8).
 
-`make gpu-test` is not part of `make ci`: it needs the Metal context to itself
-and is too slow to block every commit. Run it before merging anything in the
-codec layer.
+There is no known-red baseline: the suite is green on `main`, so a failure is a
+real one and belongs to whoever is holding the tree.
+
+#### Where it runs: `make ci-perf`, not `make ci`
+
+`make ci-perf` is three lines, and it is the only shared gate that executes the
+GPU tests:
+
+```make
+ci-perf:
+	@bash scripts/run_gpu_tests.sh --preflight
+	$(MAKE) test-perf
+	@bash scripts/run_gpu_tests.sh
+```
+
+It is deliberately **not** in `make ci`. Two costs rule that out: the suite needs
+the Metal context to itself (CLAUDE.md hard rule 8), so `make ci` could no longer
+be run alongside a live `rmlx serve`; and it adds minutes to a target that runs
+on every commit.
+
+**This is a real new cost for `ci-perf`, not a free one.** Before, `ci-perf` was
+exactly `cargo test --workspace --profile release-perf` — one invocation that
+runs no `#[ignore]` test and so needs no GPU to itself; it could be, and was, run
+next to a live server. It now refuses to start unless the GPU is idle. `ci-perf`
+is simply the cheapest place in the tree to pay that: it is already the long,
+pre-merge-only target, and the preflight line makes the new precondition fail in
+milliseconds rather than after the release-perf half.
+
+That ordering is the point of splitting the runner across two lines.
+`--preflight` checks only the environment — `RMLX_SKIP_GPU` unset, no competing
+MLX process, a non-empty classification — and runs no tests. Those are the most
+likely way this gate fails in daily use, and finding out about a live `rmlx
+serve` after `test-perf` has finished throws away the ~16 min it took. The tests
+themselves go last, after `test-perf`, because `test-perf` covers the whole
+workspace: a compile error anywhere surfaces there, while the GPU run visits five
+crates and holds the GPU while it does.
+
+`ci-perf` invokes the runner **directly** rather than through `make gpu-test`.
+Make propagates command-line variables into sub-makes, so `make ci-perf
+CRATE=rmlx-audio` would have run 7 of 318 tests and still printed `ci-perf ok`,
+and `make ci-perf VALIDATE=0` would have disarmed shader validation. Neither is
+catchable by the coverage check, because `--crate` narrows the classified
+population in lockstep with the executed one. The knobs stay on `make gpu-test`,
+where a human asking for a subset means it.
+
+The two halves build under different profiles, also on purpose. The GPU run uses
+`dev`, where debug assertions are live — 61 `debug_assert!` sites in
+`rmlx-kv-quant` alone — and those are correctness guards on correctness tests.
+`test-perf` must be `release-perf`, because that is the codegen a perf-sensitive
+change ships under. The consequence is recorded in CLAUDE.md hard rule 9: **no
+gate anywhere runs a `Device::Gpu` test with debug-assertions off**, so a GPU
+defect that only appears at that profile has to be reproduced by hand.
+
+**What it costs.** Measured on this host, both figures with a warm `target/`:
+
+| | |
+|---|---|
+| GPU suite alone | **264 s** (~4.5 min) — 318 tests over 5 crates, shader validation on, of which the `rmlx-kv-quant` unit suite is 141 s |
+| Whole `make ci-perf` after a codec-layer edit | **~21 min** (1270 s green, 1358 s on the red run) |
+
+The second is the number that matters, since a `.metal` change invalidates
+`rmlx-kv-quant` and everything downstream of it under `release-perf` too.
+
+**Neither figure includes a cold `dev` build, and that is the case to expect.**
+`ci-perf` otherwise touches only `release-perf`, so the GPU half brings a second,
+unshared `dev`-profile build of those five crates and their dependency trees with
+it — at `opt-level = 0`, and after `test-perf` has just built the same test
+binaries under `release-perf`. `target/debug` is also precisely what
+`scripts/target_gc.sh` prunes first: it protects `release-perf` and names
+`target/debug` as the dominant consumer. So the first `make ci-perf` after the
+`make target-gc` that `make ci` advertises pays a full cold `dev` build on top of
+the ~21 min.
+
+Sharing `release-perf` with `test-perf` would remove that, and is deliberately
+not done — it would run the GPU correctness suite with `debug_assert!` compiled
+out, which is the wrong trade for the layer with this repo's documented
+silent-corruption class.
+
+While iterating on the codec layer, run `make gpu-test` directly and narrow it
+with `CRATE=` / `FILTER=` rather than paying for the whole gate each time.
 
 ### Metal shader validation (on by default here)
 
@@ -268,9 +345,9 @@ a **5.8× slowdown** (n=3 each). That is the reason this never goes near a perf
 cell.
 
 **Never draw a conclusion about model *output* from a validated run.** The unit
-suites are invariant — 234 passed and the same 4 known-red failures in every
-repetition of both modes, with zero invalid-access reports — but real inference
-is not. Ternary-Bonsai-8B (Qwen3 dense) intermittently degenerates under
+suites are invariant — the same pass/fail result in every repetition of both
+modes, with zero invalid-access reports — but real inference is not.
+Ternary-Bonsai-8B (Qwen3 dense) intermittently degenerates under
 validation: it emits a single token (id 0, `"!"`), reports `tps=0.064`, and
 exits 0 with no diagnostic on stderr and nothing in Unified Logging. Reproduced
 here 1 run in 3 at `--kv-quant k8v8` under `FAIL_MODE=allow`, and independently
@@ -286,17 +363,8 @@ ever reported. Whether it is a latent engine defect that instrumentation
 perturbs into visibility or a defect in the instrumentation itself is unresolved
 and tracked outside this document.
 
-Current state: the whole `rmlx-kv-quant` GPU suite (238 classified tests) runs
-clean under validation — zero invalid accesses.
-
-### Known-red baseline
-
-`make gpu-test` currently exits 1 on a clean tree. Four tests in the
-`rmlx-kv-quant` rotor fused-QK dispatch integration binary fail with
-`rotor fused-QK dispatch delta = 0` — the sym and K-only rotor codecs no longer
-reach the fused-QK kernel, while their K-asym siblings still do. This is tracked
-separately and is not a regression from any recent change; it is why the target
-is not yet wired into `ci-perf`. Anything failing **beyond** those four is yours.
+Current state: the whole GPU suite — all five crates, `rmlx-kv-quant` included —
+runs clean under validation, zero invalid accesses.
 
 ### `#[ignore]` is not a place to park a broken test
 

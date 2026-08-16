@@ -83,6 +83,13 @@
 #   bash scripts/run_gpu_tests.sh --crate rmlx-kv-quant
 #   bash scripts/run_gpu_tests.sh --crate rmlx-kv-quant --filter rotor_flash
 #   bash scripts/run_gpu_tests.sh --no-shader-validation
+#   bash scripts/run_gpu_tests.sh --preflight   # preconditions only, no tests
+#
+#   The narrowing options exist for iterating by hand. A gate must invoke this
+#   script with NO arguments — `--crate`/`--filter` narrow the classified
+#   population in lockstep with the executed one, so the coverage check below
+#   cannot tell a narrowed run from a complete one, and `--no-shader-validation`
+#   disarms the instrumentation entirely.
 #
 # Exit 0 = every selected GPU test passed. Exit 1 = a failure, a shader
 # validation diagnostic, or a run that executed nothing.
@@ -99,24 +106,30 @@ usage() {
     cat <<'USAGE'
 Usage: run_gpu_tests.sh [--crate <name>] [--filter <substring>]
                         [--shader-validation | --no-shader-validation]
+       run_gpu_tests.sh --preflight
 
   --crate <name>          restrict to one workspace member (e.g. rmlx-kv-quant)
   --filter <substring>    restrict to GPU test fns whose name contains <substring>
   --shader-validation     instrument every Metal pipeline and fail on an invalid
                           memory access (default)
   --no-shader-validation  run the tests uninstrumented
+  --preflight             check only the environment preconditions (no GPU
+                          variable set, no competing MLX process, a non-empty
+                          classification) and exit; runs no tests
 USAGE
 }
 
 ONLY_CRATE=""
 FILTER=""
 SHADER_VALIDATION=1
+PREFLIGHT=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --crate)  ONLY_CRATE="${2:?--crate needs a value}"; shift 2 ;;
         --filter) FILTER="${2:?--filter needs a value}"; shift 2 ;;
         --shader-validation)    SHADER_VALIDATION=1; shift ;;
         --no-shader-validation) SHADER_VALIDATION=0; shift ;;
+        --preflight) PREFLIGHT=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "ERROR: unknown argument '$1'" >&2; usage >&2; exit 1 ;;
     esac
@@ -206,6 +219,18 @@ listing="$(bash "${REPO_ROOT}/scripts/check_gpu_tests_ignored.sh" --list)"
 if [ -z "${listing}" ]; then
     echo "ERROR: check_gpu_tests_ignored.sh --list produced no GPU tests." >&2
     exit 1
+fi
+
+# Everything above this line is a precondition on the environment rather than a
+# test: the two refusals and a non-empty classification, all of them
+# milliseconds. `--preflight` stops here so a caller that is about to spend a
+# long time on something else can find out FIRST that this suite would refuse to
+# start. `make ci-perf` runs it before its release-perf half for exactly that
+# reason — discovering a live `rmlx serve` after the workspace suite has already
+# run wastes the whole of it.
+if [ "${PREFLIGHT}" = "1" ]; then
+    echo "preflight OK: GPU free, no skip variable, $(printf '%s\n' "${listing}" | grep -c '') tests classified."
+    exit 0
 fi
 
 # Apply the narrowing options, then group what is left by crate.
@@ -417,8 +442,8 @@ if [ -n "${failed_crates}" ]; then
     echo >&2
     echo "Reproduce one crate with:" >&2
     echo "  cargo test --no-fail-fast -p <crate> --tests -- --ignored --test-threads=1 <filter>" >&2
-    echo "Known-red baseline (tracked separately): the four rotor fused-QK dispatch" >&2
-    echo "tests in rmlx-kv-quant reporting 'dispatch delta = 0'. See docs/TESTING.md." >&2
+    echo "There is no known-red baseline: this suite is green on main, so any" >&2
+    echo "failure above is a real one. See docs/TESTING.md." >&2
     echo "A crate reported as 'ran uninstrumented' usually failed to BUILD: no test" >&2
     echo "binary means no Metal device and therefore no validation banner." >&2
     exit 1
