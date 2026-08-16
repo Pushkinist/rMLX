@@ -50,7 +50,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         metrics-champions metrics-champions-rmlx \
         build-perf build-debug test-perf ci-perf gpu-test model-check model-check-full \
         profile-samply profile-samply-debug profile-instruments bench asm perf-iter \
-        canary canary-gate \
+        canary canary-gate canary-ab canary-ab-selftest \
         mlx-preflight mlx-restore-pin target-gc target-size-report profile-gputrace \
         profile-mst \
         build-capture test-capture gputrace-preflight traces-gc \
@@ -344,13 +344,14 @@ check-metal-format: ## CI gate: every .metal kernel is clang-format clean (skips
 	@bash scripts/check_metal_format.sh $(METAL_STRICT)
 
 # ---- one-shot CI gate -------------------------------------------------
-ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gate: fmt + clippy + test + feature-gated capture tests + deny + audit + metrics-sanity + inline-test + MSL gates
+ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gate: fmt + clippy + test + feature-gated capture tests + deny + audit + metrics-sanity + inline-test + A/B-harness + MSL gates
 	@bash scripts/check_no_inline_tests.sh
 	@bash scripts/check_no_scalar_f32_leak.sh
 	@bash scripts/check_no_decode_swallow.sh
 	@bash scripts/check_gpu_tests_ignored.sh
 	@bash scripts/check_no_kernel_input_eval.sh
 	@bash scripts/check_no_kernel_input_eval_fixtures.sh
+	@bash scripts/perf_ab_selftest.sh
 	@bash scripts/check_metal_format.sh
 	@bash scripts/check_metal_compiles.sh
 	@bash scripts/file_size_report.sh || true
@@ -510,6 +511,18 @@ CANARY_THRESHOLD_PCT ?= 3
 canary: mlx-preflight build-perf  ## run 3-model TPS canary (records into runs.db + legacy CSV); requires release-perf binary
 	@pkill -f "rmlx serve" || true; pkill -f mlx_lm || true; sleep 1; rm -f /tmp/rmlx.*.claim
 	bash scripts/perf_canary.sh
+
+# The canary tracks ONE build over time. Comparing two builds (or two flag
+# settings) needs the interleaved harness, or ordering and thermal drift land
+# entirely on whichever arm ran second. See docs/PERF_BASELINE.md.
+#
+# Pass arms through ARGS, e.g.
+#   make canary-ab ARGS='--binary-a target/release-perf/rmlx.main --binary-b target/release-perf/rmlx'
+canary-ab: mlx-preflight build-perf  ## interleaved A/B of two arms (ARGS='--binary-a … --binary-b …'); see docs/PERF_BASELINE.md
+	bash scripts/perf_canary.sh --ab $(ARGS)
+
+canary-ab-selftest: ## mutation-check the A/B harness against stub binaries (no GPU, no model)
+	bash scripts/perf_ab_selftest.sh
 
 canary-gate:        ## gate TPS regressions via runs.db (SHA= required; e.g. make canary-gate SHA=3ba8aee)
 	@test -n "$(SHA)" || { echo "ERROR: SHA= required. Usage: make canary-gate SHA=<last-green-sha>"; exit 125; }

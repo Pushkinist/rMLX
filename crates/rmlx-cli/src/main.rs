@@ -1072,6 +1072,15 @@ enum Cmd {
         /// Env: `RMLX_YARN_ORIGINAL_MAX`.
         #[arg(long, env = "RMLX_YARN_ORIGINAL_MAX", value_name = "U32")]
         yarn_original_max: Option<u32>,
+        /// Print the exact generated token-id sequence as a
+        /// `baseline: token_ids=<comma-separated>` line after the summary.
+        ///
+        /// For A/B harnesses: two arms that produce different tokens are not
+        /// comparable on speed, and decoded text cannot prove they match
+        /// (different id sequences can decode to the same string). Off by
+        /// default — the line is long and of no use to a human reader.
+        #[arg(long, default_value_t = false)]
+        emit_token_ids: bool,
         /// Write a Metal GPU trace of a bounded window of steady-state decode
         /// to PATH (a `.gputrace` bundle, opened in Xcode). Debug builds only —
         /// this flag exists only when the binary is built with
@@ -2129,6 +2138,7 @@ fn main() -> Result<()> {
             prompts_dir,
             yarn_factor,
             yarn_original_max,
+            emit_token_ids,
             #[cfg(feature = "metal-capture")]
             gpu_capture,
             #[cfg(feature = "metal-capture")]
@@ -2262,6 +2272,7 @@ fn main() -> Result<()> {
                 cap_is_explicit,
                 allow_truncate,
                 yarn_override,
+                emit_token_ids,
                 &sink,
                 record_args,
             );

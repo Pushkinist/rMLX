@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 # perf_canary.sh — fast decode-TPS canary for the three standard test-target models.
 # Usage: bash scripts/perf_canary.sh [--include-26b]
+#        bash scripts/perf_canary.sh --ab [perf_ab.sh options]
 #
 # Runs 1 warmup + 3 measured baseline calls per model, prints median decode_tps
 # ± sample stddev, appends one CSV row per model to .rmlx/bench/perf_canary.csv,
 # and records the median run into runs.db via `rmlx baseline --record`.
+#
+# The default mode measures ONE build. All of its measured runs for a model
+# happen together, which is fine for tracking one build over time but not for
+# comparing two: whichever arm ran second wears any drift. `--ab` hands off to
+# `scripts/perf_ab.sh`, which interleaves the arms, gates on host quiescence and
+# compares generated token ids across arms. Use it for every two-arm question.
 #
 # Column order (CSV): ts_utc,git_sha,model,kv_quant,prompt_tokens,decode_tps,stddev,build_profile
 #
@@ -18,6 +25,17 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# `--ab` must be the first flag, and is dispatched before anything below runs.
+# Everything after it belongs to perf_ab.sh: re-parsing those options here would
+# create a second place for the two scripts to disagree about what they mean,
+# and resolving the canary model paths first would make `--ab --model <path>`
+# demand RMLX_O_MODELS_ROOT for models it is not going to touch.
+if [[ "${1:-}" == "--ab" ]]; then
+    shift
+    exec bash "${REPO_ROOT}/scripts/perf_ab.sh" "$@"
+fi
+
 BINARY="${REPO_ROOT}/target/release-perf/rmlx"
 RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
 CSV_DIR="${RMLX_HOME}/bench"
@@ -42,6 +60,7 @@ INCLUDE_26B=false
 for arg in "$@"; do
     case "$arg" in
         --include-26b) INCLUDE_26B=true ;;
+        --ab) echo "--ab must be the first argument" >&2; exit 1 ;;
         *) echo "unknown flag: $arg" >&2; exit 1 ;;
     esac
 done

@@ -346,6 +346,22 @@ rmlx baseline --model /path/to/snapshot --prompt-tokens 4096 --label "8k-bench"
 | `--label` | string | — | Free-form campaign label stamped into the metrics record's `notes` column. |
 | `--record` | bool flag | off | Emit a §8.5 `RunRecord` to the metrics buffer and ingest into `runs.db` in-process. |
 | `--git-sha` | string | — | Commit SHA to stamp on the emitted record's `git_sha` column (only meaningful with `--record`). Provenance the caller supplies — the binary does not and cannot determine the commit it was built from. Absent by default (`git_sha` is `NULL`). |
+| `--emit-token-ids` | bool flag | off | Print the exact generated token-id sequence as a second `baseline: token_ids=<comma-separated>` line. For A/B harnesses that must prove two arms produced the same tokens — decoded text cannot, since different id sequences can decode to the same string. |
+
+#### Summary line
+
+```
+baseline: model=<name>  load=<ms>  ttft_ms=<ms>  decode_tps=<n>  overall_tps=<n>
+          prefill_tps=<n>  prompt_tokens=<n>  peak_rss=<n>MB
+          metal_peak_mb=<n>  metal_gen_alloc_mb=<n>
+```
+
+`peak_rss` is host RSS from `ps`. The two `metal_*` fields come from a
+[`PeakBracket`](PROFILING.md) around prefill+decode: `metal_peak_mb` is the
+most Metal-allocator bytes live at once during generation (it includes the
+resident weights), and `metal_gen_alloc_mb` is that minus what was already live
+when generation started. **Only `metal_gen_alloc_mb` compares between two runs
+of the same model.** Both read `0` where no Metal allocator is present.
 
 #### GPU-capture flags (debug builds only)
 
