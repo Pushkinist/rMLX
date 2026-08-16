@@ -384,9 +384,15 @@ Every KV-cache codec has a per-codec cosine-similarity quality gate in the
 dequantize round-trip preserves the directional information in each row vector
 to within an empirically derived floor.
 
-All cosine gates use the **same LCG fixture** (seed `TEST_SEED =
+The gates below use the **LCG fixture** (seed `TEST_SEED =
 0x0000_00C0_FFEE_BEEF`, Knuth LCG) so they are deterministic and require no
 model snapshot or GPU.
+
+**What they do not measure.** The LCG fixture is i.i.d. uniform, which is
+already close to maximally incoherent, so a decorrelating rotation cannot
+improve it — an identity rotation passes every gate in the table below. That
+axis is covered separately by the incoherence gates; see "Rotation-quality
+gates".
 
 ### Thresholds
 
@@ -407,6 +413,10 @@ All helpers live in `crates/rmlx-kv-quant/src/test_utils.rs`:
 
 - `cosine_similarity_per_row` — f64-accumulator cosine per `head_dim`-sized row; returns `CosineStats { mean, min, n_rows }`.
 - `lcg_data(n, seed)` — deterministic LCG fixture data in `[-1.0, 1.0]` (upper 32 bits of state, symmetric; a `>> 33` bug that biased output to `[-1.0, ~0.0)` was fixed).
+- `gaussian_data(n, seed)` — standard normal from the same LCG via Box–Muller.
+- `outlier_channel_data(rows, head_dim, channels, ratio, seed)` — Gaussian base with persistent high-magnitude channels; `outlier_fixture()` is the canonical 256 x 128, 4 channels at 20x. The doc comment carries the citations for that shape.
+- `incoherence_per_row` — `mu = sqrt(d)·max|x_i|/||x||_2` per row; returns `IncoherenceStats { mean, p99, max, n_rows }`.
+- `sqnr_db` / `wasted_bits` / `lloyd_max_anchor_db` / `LLOYD_MAX_GAUSSIAN_SQNR_DB` / `DB_PER_BIT` — rate-distortion reference.
 - `fwht_normalize(buf, n)` — CPU Walsh-Hadamard transform (self-inverse when applied twice), used by the rot_k cosine test.
 - `TEST_SEED` — pinned seed constant (`0x0000_00C0_FFEE_BEEF`). Never replace with `thread_rng`.
 
@@ -415,6 +425,80 @@ All helpers live in `crates/rmlx-kv-quant/src/test_utils.rs`:
 ```bash
 cargo test -p rmlx-kv-quant cosine_gate
 ```
+
+---
+
+## Rotation-quality gates
+
+`crates/rmlx-kv-quant/src/rotation_fidelity_tests.rs`. CPU-only, no snapshot,
+inside `make model-check`.
+
+```bash
+cargo test -p rmlx-kv-quant --lib rotation_fidelity -- --nocapture
+```
+
+Measured on `outlier_fixture()` — i.i.d. Gaussian with 4 of 128 channels at
+20x, modelling the persistent per-channel Key outliers the KV-quantization
+literature reports. Numbers and their derivation live in `docs/KV_QUANT.md`
+§ "Codec fidelity — measured".
+
+| Gate | Asserts |
+|---|---|
+| `hadamard_incoherence_ratio_beats_every_block_local_rotation` | `rot_k` reduces mean `mu` ≥ 3x (measured 3.89x); every block-local family stays under its `sqrt(block)` ceiling and under `rot_k`. |
+| `non_full_dimension_rotations_fail_the_hadamard_incoherence_gate` | Mutation guard: the same FWHT truncated to block-4, plus the iso / rotor / planar transforms, all fail. Rejection is a theorem — `mu` reduction of `R` needs block ≥ `R²`, so 3.0 needs block ≥ 9. |
+| `identity_rotation_excluded_by_the_hadamard_incoherence_threshold` | Pins that the threshold excludes 1.00x. Named for what it is: the ratio is exact by construction, so this is a constant comparison, not a transform mutation. |
+| `iso_block_rotation_incoherence_gate`, `planar3_…`, `planar4_…` | Two-sided: under the `sqrt(block)` ceiling (a theorem) and over the pinned floor (the regression guard). |
+| `rotor_block_rotation_incoherence_gate` | Same, **swept over 8 `(layer, head)` draws** and pinned to the weakest (1.0815x of 1.0815–1.2089x). Only ~4 rotors of 43 touch outlier channels, so one draw is a four-sample estimate. |
+| `rot_k_hadamard_buys_bits_on_outlier_data_and_costs_them_on_iid_data` | The Hadamard buys ≥ 1.5 bits of SQNR over the same quantizer without it on outlier data (measured +1.81), and **loses** bits on i.i.d. data (−0.63). |
+| `non_full_dimension_rotations_fail_the_rot_k_gain_gate` | Mutation guard: block-4 truncated FWHT (+0.91) and the iso quaternion (+0.47). A block-`b` transform can buy at most `0.5·log2(b)` bits, so 1.5 demands block ≥ 8. |
+| `identity_rotation_excluded_by_the_rot_k_gain_threshold` | Pins that the threshold excludes 0.00 bits; exact by construction, as above. |
+| `<codec>_outlier_cosine_gate` (7) | Outlier-fixture cosine floors for `rot_k`, `iso3/4`, `rotor3/4`, `planar3/4`. |
+| `lossier_codecs_fail_the_outlier_cosine_floors` | Mutation guard for all seven floors: each is shown to reject a genuinely lossier real codec, judged by the same floor function the gates use. |
+| `wider_codebooks_score_higher_on_the_outlier_fixture` | iso4 > iso3 and rotor4 > rotor3 — catches a bit-width plumbing fault a per-codec floor cannot. |
+
+**Outlier cosine floors use an error-relative tolerance**, not the `measured −
+0.001` convention above: a codec may double `1 − cos` before the floor bites.
+The absolute convention cannot work here — `rot_k` scores 0.999989 and 0.999881
+with the Hadamard deleted outright, so a 0.001 slack is fifty times wider than
+the whole effect and the deletion passes. `lossier_codecs_fail_the_outlier_cosine_floors`
+checks all seven against a genuinely lossier real codec.
+
+---
+
+## Rate-distortion reference
+
+`crates/rmlx-kv-quant/src/rate_distortion_tests.rs`. CPU-only, no snapshot,
+inside `make model-check`.
+
+```bash
+cargo test -p rmlx-kv-quant --lib rate_distortion -- --nocapture
+```
+
+Every scalar-codebook codec at every shipped bit width, encoded and decoded on
+an i.i.d. Gaussian fixture, reported as SQNR against the fixed-rate Lloyd-Max
+Gaussian anchor for that width and converted to wasted bits. The full table is
+in `docs/KV_QUANT.md` § "Codec fidelity — measured".
+
+Two thresholds, both stated in bits:
+
+- **Absolute** — `MAX_WASTED_BITS = 1.0` against the anchor. The escalation
+  line: a codec past it gets a filed follow-up with the measured number.
+- **Per-cell pinned** — `measured + PIN_SLACK_BITS` (0.10 bits = 0.60 dB).
+  This is the gate that fires. The absolute line above cannot fire on its own —
+  every budget is ≤ +0.44, so crossing 1.0 implies crossing the budget too; it
+  labels *why* a failure matters rather than adding independent coverage. And
+  the absolute line alone would not be enough: codecs sit at very different
+  offsets from the anchor (`turbo4` is 0.23 bits *ahead*), so one that silently
+  loses a full bit can still land inside a 1-bit absolute budget.
+  `one_bit_short_codec_fails_the_rate_distortion_gate` demonstrates exactly
+  that at `bits = 4`. `pinned_budgets_sit_one_slack_above_the_measurement`
+  keeps the pins where they claim to be.
+
+Two measured facts are pinned as equalities so a fix turns them red rather than
+passing silently: `trellis_coded_quantization_claws_back_nothing` (TCQ = plain
+turbo, 0.000 dB) and `byte_identical_bit_widths_leave_one_width_dominated`
+(iso, rotor and planar cost the same bytes at 3 and 4 bits, so each family has
+a strictly dominated width).
 
 ---
 
