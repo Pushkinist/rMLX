@@ -21,6 +21,7 @@ use crate::iso_flash_decode_msl::iso_flash_decode_dispatch_count;
 use crate::quant::KvQuant;
 use crate::storage::{KvStorage, QuantIsoK3, QuantIsoK4};
 use crate::test_utils::{lcg_data, skip_if_no_gpu_env};
+use rmlx_core::DispatchPolicy;
 use rmlx_mlx::{Array, Device, Dtype};
 
 const MAX_SEQ: i32 = 512;
@@ -66,7 +67,7 @@ fn iso_cache_b(quant: KvQuant, b: i32, kv_h: i32, head_dim: i32) -> KvCache {
             max_seq: MAX_SEQ,
         }
     };
-    KvCache::from_storage(storage, quant, 0, 0)
+    KvCache::from_storage(storage, quant, 0, 0, DispatchPolicy::default())
 }
 
 /// Whether the cache's iso store currently holds a live GPU ring.

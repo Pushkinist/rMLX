@@ -21,6 +21,7 @@ use crate::rotor_flash_decode_msl::rotor_flash_decode_dispatch_count;
 use crate::rotorquant::{make_qjl_projection, n_groups_for};
 use crate::storage::{KvStorage, QuantRotorK3, QuantRotorK4};
 use crate::test_utils::{lcg_data, skip_if_no_gpu_env};
+use rmlx_core::DispatchPolicy;
 use rmlx_mlx::{Array, Device, Dtype};
 
 const MAX_SEQ: i32 = 512;
@@ -88,7 +89,7 @@ fn seeded_cache_b(quant: KvQuant, b: i32, kv_h: i32, head_dim: i32, use_qjl: boo
             max_seq: MAX_SEQ,
         }
     };
-    KvCache::from_storage(storage, quant, 0, 0)
+    KvCache::from_storage(storage, quant, 0, 0, DispatchPolicy::default())
 }
 
 /// Drive one prefill chunk + 4 decode steps through the production

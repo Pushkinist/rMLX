@@ -394,13 +394,13 @@ fn run_cell_kind(
     routing: FlashRouting,
     kind: FlashKind,
 ) {
-    // The mode label reflects the production OnceLock gate, not just the raw
-    // env var. The kernel gates read the env exactly once per process, so
-    // this is the same boolean the decode path observes — eliminating drift
-    // between the harness label and the gate.
+    // The mode label reads the same policy the decode path dispatches on —
+    // the process default, which is what a cache built by this harness
+    // captures — so the label cannot drift from the gate.
+    let policy = rmlx_core::dispatch_policy();
     let enabled = match kind {
-        FlashKind::Turbo => rmlx_kv_quant::turbo_flash_msl::turbo_flash_enabled(),
-        FlashKind::Pflash => rmlx_kv_quant::planar_flash_decode_msl::planar_flash_decode_enabled(),
+        FlashKind::Turbo => policy.turbo_flash,
+        FlashKind::Pflash => policy.planar_flash_decode,
     };
     let mode = if enabled { "ON" } else { "OFF" };
     let family = match kind {

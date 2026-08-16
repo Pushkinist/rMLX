@@ -42,6 +42,7 @@ use crate::rotorquant::n_groups_for;
 use crate::storage::{KvStorage, QuantRotorK3, QuantRotorK4};
 use crate::test_utils::{lcg_data, skip_if_no_gpu_env};
 use rmlx_core::error::Error;
+use rmlx_core::DispatchPolicy;
 use rmlx_mlx::{Array, Device, Dtype};
 
 const KV_H: i32 = 2;
@@ -100,7 +101,7 @@ fn seeded_cache(quant: KvQuant, max_seq: i32, ceiling: Option<i32>) -> KvCache {
             max_seq,
         }
     };
-    let cache = KvCache::from_storage(storage, quant, 0, 0);
+    let cache = KvCache::from_storage(storage, quant, 0, 0, DispatchPolicy::default());
     match ceiling {
         Some(c) => cache.with_max_seq_ceiling(c),
         None => cache,

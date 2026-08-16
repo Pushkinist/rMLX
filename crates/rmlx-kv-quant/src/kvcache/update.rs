@@ -17,7 +17,7 @@ use crate::storage::{
     QuantKTurbo3, QuantKTurbo4, QuantPlanarK, QuantPlanarV, QuantRotorV3, QuantRotorV4, QuantV,
     RotorBlocks, RotorKBlocks, ISO4_GROUP_SIZE, ISO_K3_BITS, ISO_K4_BITS,
 };
-use crate::turbo_flash_msl::{turbo_flash_lock_enabled, turbo_flash_sdpa, turbo_flash_should_run};
+use crate::turbo_flash_msl::{turbo_flash_sdpa, turbo_flash_should_run};
 use crate::KvQuant;
 
 use super::helpers::{array_to_f32_vec, arrays_to_f32, f32_vec_to_array, storage_variant_name};
@@ -2674,6 +2674,9 @@ impl KvCache {
     )]
     /// Finalize prefill: quantize the accumulated raw K/V into the storage buffers.
     pub fn exit_prefill(&mut self, device: Device) -> Result<()> {
+        // Snapshot before the storage borrows below; the bulk-quantize arms
+        // hand it to the K encoders.
+        let policy = self.policy;
         if self.rotating.is_some() {
             // No-op: rotating prefill writes go straight into the ring buffer.
             return Ok(());
@@ -2965,7 +2968,7 @@ impl KvCache {
                 state.reset();
                 // Directly quantize and store — no zero-buffer alloc, no
                 // write_at, no slice_seq_to. offset is set to total_seq.
-                state.bulk_init_from_fp16(&k_full, &v_full, device)?;
+                state.bulk_init_from_fp16(&k_full, &v_full, device, policy)?;
                 // The compact fp16 seed for warm-TTFT decode is the same buffer
                 // already materialised above (decode_fp16_pair).
             }
@@ -3004,7 +3007,7 @@ impl KvCache {
                 // with a dummy zero V (it quantizes V too but we replace V below).
                 // Instead, use rotate_k_and_quantize directly + store K.
                 let (k_codes, k_scales, k_biases) =
-                    k_state.bulk_init_k_from_fp16(&k_full, device)?;
+                    k_state.bulk_init_k_from_fp16(&k_full, device, policy)?;
                 k_state.keys = Some(crate::mixed_quant::MixedTuple {
                     codes: k_codes,
                     scales: k_scales,
@@ -3990,6 +3993,7 @@ impl KvCache {
             flash_max_seq: _,
             flash_filled: _,
             max_seq_ceiling: _,
+            policy: _,
         } = self;
 
         let offset = (*offset).max(0) as u64;
@@ -5382,10 +5386,11 @@ impl KvCache {
     ///
     /// # Fallback conditions
     ///
-    /// - `RMLX_TURBO_FLASH != "1"` (default).
+    /// - `DispatchPolicy::turbo_flash` unset (default).
     /// - Smoke-probe forced fallback (corruption detected).
     /// - q_seq != 1 (prefill path — only decode is supported).
-    /// - kv_seq <= `TURBO_FLASH_MIN_KV_SEQ` (below split-K crossover).
+    /// - `kv_seq <= DispatchPolicy::turbo_flash_min_kv_seq` (below the split-K
+    ///   crossover).
     /// - GPU buffers not yet populated (first call, before alloc).
     /// - head_dim ∉ {128, 256} (kernel register-array sizing constraint).
     ///
@@ -5396,7 +5401,7 @@ impl KvCache {
     /// `Buffer::raw_ptr()` in the kernel-output `to_bytes`) at 32k ctx on
     /// Qwen3.6-35B-A3B-8bit (head_dim=256) — worse than TheTom's
     /// garbage-token corruption (it crashes the server). Stays default-OFF.
-    /// Setting `RMLX_TURBO_FLASH=1` will crash on that cell. See
+    /// Setting `DispatchPolicy::turbo_flash` will crash on that cell. See
     /// `docs/reports/B1-turboflash-m5-validation.md`.
     #[allow(
         clippy::indexing_slicing,
@@ -5432,7 +5437,7 @@ impl KvCache {
 
     /// TurboFlash entry point for cross-layer-KV consumers (Gemma4). Identical
     /// behaviour to [`Self::update_and_sdpa_k8v4_flash`] except
-    /// `RMLX_TURBO_FLASH_LOCK=1` is ignored: the bf16 `decode_fp16_k/v`
+    /// `DispatchPolicy::turbo_flash_lock` is ignored: the bf16 `decode_fp16_k/v`
     /// mirror MUST stay current every decode step, because the caller
     /// (`update_and_sdpa_shared_source`) slices it to surface bf16 (K, V) for
     /// shared-KV consumer layers. Lock-on would freeze the mirror at the
@@ -5493,9 +5498,9 @@ impl KvCache {
         // cleanly on the fallback path).
         //
         // `kv_seq_after_update` is the offset the caller's `update()` would
-        // produce — used for the `kv_seq > TURBO_FLASH_MIN_KV_SEQ` gate.
+        // produce — used for the `kv_seq > turbo_flash_min_kv_seq` gate.
         let kv_seq_after_update = self.offset + new_seq;
-        if !turbo_flash_should_run(q_seq, kv_seq_after_update) {
+        if !turbo_flash_should_run(&self.policy, q_seq, kv_seq_after_update) {
             return Ok(None);
         }
         if head_dim != 128 && head_dim != 256 {
@@ -5543,7 +5548,7 @@ impl KvCache {
 
         // ── Lock-on skip of `update_decode_fp16`
         //
-        // When `RMLX_TURBO_FLASH_LOCK=1` AND the persistent flash buffers are
+        // When `DispatchPolicy::turbo_flash_lock` is set AND the persistent flash buffers are
         // already seeded (`flash_k_codes.is_some()`), the bf16 mirror is no
         // longer read by anyone — the kernel reads `flash_*` directly and the
         // request has opted out of standard-SDPA fallback. Skipping the bf16
@@ -5558,7 +5563,8 @@ impl KvCache {
         // back to the consumer. `force_lock_off` short-circuits the lock-on
         // optimisation in that case. Non-cross-layer-KV callers (the public
         // entry point) keep the optimisation.
-        let lock_on = !force_lock_off && turbo_flash_lock_enabled() && self.flash_k_codes.is_some();
+        let lock_on =
+            !force_lock_off && self.policy.turbo_flash_lock && self.flash_k_codes.is_some();
         if !lock_on {
             self.update_decode_fp16(new_k, new_v, max_seq, device)?;
         }
@@ -5722,7 +5728,7 @@ impl KvCache {
     /// buffer at the new capacity and copies the existing `[.., 0..old_max_seq, .]`
     /// content forward, matching the copy-prefix-forward contract every other
     /// grow path uses. It is codec-general (keyed off buffer shape, never an
-    /// arch) and lock-state agnostic — under `RMLX_TURBO_FLASH_LOCK` the flash
+    /// arch) and lock-state agnostic — under `turbo_flash_lock` the flash
     /// buffers are the sole K/V store, so copying them (rather than re-seeding
     /// from the frozen bf16 mirror) is what preserves the decode tail.
     #[allow(
@@ -5915,7 +5921,7 @@ impl KvCache {
     /// Quantise `new_k`/`new_v` directly into the persistent flash buffers at
     /// `[:, :, start:start+n, :]`, bypassing the bf16 `decode_fp16_k/v` mirror.
     ///
-    /// Used by the `RMLX_TURBO_FLASH_LOCK=1` path after the initial seed has
+    /// Used by the `DispatchPolicy::turbo_flash_lock` path after the initial seed has
     /// populated `flash_*`. Algorithmically equivalent to
     /// `append_flash_buffers_from_fp16` if the caller updated `decode_fp16_*`
     /// with the same `new_k`/`new_v` first — but we skip that update so the
@@ -6029,21 +6035,22 @@ impl KvCache {
     /// # Returns
     ///
     /// - `Ok(Some(output))` — TurboFlash ran; output is `[B, n_q_heads, 1, D]`.
-    /// - `Ok(None)` — not K8V4, env-var OFF, seq too short, or prefill step;
-    ///   caller falls through to standard `cache.update()` + SDPA.
+    /// - `Ok(None)` — not K8V4, the gate is off, seq too short, or a prefill
+    ///   step; caller falls through to standard `cache.update()` + SDPA.
     ///
     /// # Dispatch rule
     ///
     /// ```text
-    /// if RMLX_TURBO_FLASH=1 AND is_k8v4() AND kv_seq_after_update > 4096 {
+    /// if policy.turbo_flash AND is_k8v4()
+    ///    AND kv_seq_after_update > policy.turbo_flash_min_kv_seq {
     /// update_and_sdpa_k8v4_flash(...) // split-K FA, no dequant round-trip
     /// } else {
     /// None // caller does standard update() + scaled_dot_product_attention()
     /// }
     /// ```
     ///
-    /// The `kv_seq > 4096` threshold is checked inside `update_and_sdpa_k8v4_flash`
-    /// via `turbo_flash_should_run`; this wrapper delegates entirely to that
+    /// The threshold is checked inside `update_and_sdpa_k8v4_flash` via
+    /// `turbo_flash_should_run`; this wrapper delegates entirely to that
     /// function, keeping the check in one place.
     ///
     /// Callers that are NOT K8V4 pay only the `is_k8v4()` bool check and
@@ -6634,6 +6641,10 @@ impl KvCache {
             // Preserve the virtual ceiling across a branch clone so the cloned
             // cache enforces the same --max-ctx bound on further prefill.
             max_seq_ceiling: self.max_seq_ceiling,
+            // A branch clone continues the same request and must dispatch
+            // through the same kernel paths, so it inherits the policy rather
+            // than re-reading the process default.
+            policy: self.policy,
         })
     }
 

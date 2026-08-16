@@ -60,10 +60,12 @@ fn main() -> anyhow::Result<()> {
     println!("prompt: {prompt_text}");
     println!();
 
-    // -- Ensure RMLX_FUSED_QK is set (warn if not) --
-    let fused_qk_on = rmlx_kv_quant::fused_qk_enabled();
-    if !fused_qk_on {
-        eprintln!("WARN: RMLX_FUSED_QK is not set to 1 — dispatch counter will stay 0 for q8/turbo codecs");
+    // -- Warn when the resolved policy leaves the fused-QK kernels off --
+    if !rmlx_core::dispatch_policy().fused_qk {
+        eprintln!(
+            "WARN: fused-QK is off in the resolved policy — dispatch counter \
+             will stay 0 for q8/turbo codecs"
+        );
     }
 
     // -- Ensure CPU + GPU streams are registered on this thread --

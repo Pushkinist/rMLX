@@ -75,9 +75,11 @@ fn main() -> anyhow::Result<()> {
     println!("prompt: {prompt_text}");
     println!();
 
-    let tf_on = rmlx_kv_quant::turbo_flash_msl::turbo_flash_enabled();
-    let fqk_on = rmlx_kv_quant::fused_qk_enabled();
-    eprintln!("env: RMLX_TURBO_FLASH={tf_on} RMLX_FUSED_QK={fqk_on}");
+    let policy = rmlx_core::dispatch_policy();
+    eprintln!(
+        "policy: turbo_flash={} fused_qk={}",
+        policy.turbo_flash, policy.fused_qk
+    );
 
     rmlx_mlx::ensure_cpu_default_stream();
     rmlx_mlx::ensure_gpu_default_stream();

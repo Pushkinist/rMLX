@@ -571,7 +571,8 @@ The SSD tier adds two hooks to `PromptCache<E>`:
 - `SsdHydrate<E>` — called by `hydrate_from_ssd` on a RAM-cache miss. Queries
   the `SsdKvIndex` for the longest matching block-hash prefix, reads the `.kvb`
   file, verifies `model_id` and `kv_quant` metadata, and reconstructs the arch
-  entry. Corruption (bad read, metadata mismatch, missing file) is handled
+  entry under the caller's `DispatchPolicy` (per-request like `seed` and
+  `kv_quant`, never read off the source). Corruption (bad read, metadata mismatch, missing file) is handled
   internally (delete + `warn!`) and surfaces as `Ok(None)` — the caller falls
   through to full re-prefill.
 

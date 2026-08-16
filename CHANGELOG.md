@@ -144,6 +144,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The five `OnceLock` kernel gates are one threaded `DispatchPolicy` value.**
+  `fused_qk_enabled`, `sparse_attn_enabled`, `turbo_flash_enabled`,
+  `turbo_flash_lock_enabled`, `planar_flash_decode_enabled`,
+  `rot_k_fused_enabled` and the two `_MIN` thresholds each latched an
+  environment read on first call, so the first dispatch froze the kernel path
+  for the process lifetime and two arms could only be compared across two
+  processes — two model loads and two thermal states. They are replaced by
+  `rmlx_core::DispatchPolicy`, a `Copy` value resolved once from the existing
+  clap surface, captured by each `KvCache` at construction and read at the
+  dispatch sites. Two caches built under different policies now run side by
+  side in one process. Behaviour is unchanged: every flag keeps its precedence
+  (`on` → on, `off` → hard override, `auto` → the `RMLX_*` variable), the CLI
+  no longer mutates its own environment to communicate with the gates, and
+  temp=0 token digests are identical before and after on gemma-4-e2b and
+  Ternary-Bonsai-8B, in both the default and the `--turbo-flash on` arm.
+
+- **`--rot-k-fused {on|off|auto}`** — `RMLX_ROT_K_FUSED` had no flag and so did
+  not appear in `--help`. `auto` (the default) still reads the variable, so an
+  existing opt-in is unaffected.
+
+- **The SSD hydrate path carries the caller's `DispatchPolicy`.**
+  `KvCache::from_storage`, `block_io::read_caches{,_timed}`,
+  `SsdHydrator::lookup{,_seeded,_with_recorder}`, `SsdHydrate::hydrate` and
+  `PromptCache::hydrate_from_ssd` all take it. A hydrated cache replaces a live
+  one, so reconstructing it under the process default rather than the policy in
+  hand would put that one path back on process-global behaviour — invisible
+  while every cache shares the default, wrong the moment two do not. Same
+  per-request contract the trait already states for `seed` and `kv_quant`.
+
 - **Documented that no Gemma4 model can reach a fused-QK kernel.** Gemma4
   quantises only its full-attention layers, which use `global_head_dim = 512`,
   and the fused-QK shims are hard-gated on `head_dim ∈ {128, 256}`. A Gemma4

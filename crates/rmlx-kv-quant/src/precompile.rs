@@ -40,7 +40,7 @@ use crate::KvQuant;
 /// - codec does not carry MSL (`none`) → no-op.
 /// - CPU-hot-path codec (V-only iso / rotor, QJL-on rotor-K) → no-op (its
 ///   encode/dequant is CPU; the GPU fused-QK encoder, when present, is opt-in
-///   via `RMLX_FUSED_QK` and not on the default path).
+///   via `--fused-qk` and not on the default path).
 /// - K-only iso / rotor codec (`is_k_only_iso_rotor`) → no-op here (Metal on the
 ///   hot path, but its K kernel is the iso/rotor MSL kernel, not the shared q8_0
 ///   K kernel this module warms; it compiles lazily on first prefill).
