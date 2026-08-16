@@ -7,7 +7,7 @@
 // validation host was M5 Max, but the routing-extension tests it shipped drove
 // `head_dim = 128`, which is the linear-attention head size on the same
 // Qwen3.6 snapshot — the hazard scenario itself was never re-exercised after
-// the kernel landed. The `Auto` arm of `apply_turbo_flags` was therefore left
+// the kernel landed. The `Auto` arm of `--turbo-flash` was therefore left
 // as Apple ≥ 10 → OFF "pending an explicit M5 re-validation with the dispatch
 // counter and the historical `head_dim = 256` configuration".
 //
@@ -17,7 +17,7 @@
 //
 // Assertions (per scenario):
 //
-//   1. `RMLX_TURBO_FLASH=1` + `RMLX_TURBO_FLASH_MIN=0`:
+//   1. `DispatchPolicy { turbo_flash: true, turbo_flash_min_kv_seq: 0 }`:
 //      a. The test process survives every dispatch (no `SIGSEGV`, no abort).
 //      b. `turbo_flash_dispatch_count()` delta > 0 — the MSL kernel ran on
 //         the hazard configuration rather than silently falling back.
@@ -32,7 +32,9 @@
 //         is for Q·K^T only (K-dominated); this test does full SDPA
 //         (softmax @ V), where V turbo-4 dominates the residual.
 //
-//   2. `RMLX_TURBO_FLASH=0` (control): dispatch delta == 0.
+//   2. The same shape under a `turbo_flash: false` policy (control):
+//      dispatch delta == 0. Both arms run in this one binary, each cache
+//      carrying its own policy.
 //
 // `RMLX_APPLE10_STRICT=1` — strict mode (CI gate form):
 //   * delta == 0 in the ON case -> panic instead of soft-skip.
@@ -54,14 +56,33 @@
     clippy::print_stderr,
     clippy::unusual_byte_groupings,
     clippy::indexing_slicing,
-    unsafe_code,
     missing_docs
 )]
 //! head_dim=256 hazard re-validation.
 
+use rmlx_core::DispatchPolicy;
 use rmlx_kv_quant::turbo_flash_msl::turbo_flash_dispatch_count;
 use rmlx_kv_quant::{KvCache, KvQuant};
 use rmlx_mlx::{Array, Device, Dtype};
+
+/// TurboFlash on with a zero threshold, so the kernel fires on the short
+/// synthetic caches here.
+fn turbo_on() -> DispatchPolicy {
+    DispatchPolicy {
+        turbo_flash: true,
+        turbo_flash_min_kv_seq: 0,
+        ..DispatchPolicy::default()
+    }
+}
+
+/// The control arm: identical apart from the kernel gate, so a zero dispatch
+/// delta can only come from the gate and not from the threshold.
+fn turbo_off_same_threshold() -> DispatchPolicy {
+    DispatchPolicy {
+        turbo_flash: false,
+        ..turbo_on()
+    }
+}
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -188,21 +209,8 @@ fn turbo_flash_head_dim_256_smoke_dispatch_and_cosine() {
     let device = Device::Gpu;
     let scale = 1.0 / (HEAD_DIM as f32).sqrt();
 
-    // SAFETY: process-global env var; --test-threads=1 enforced by the
-    // ignore annotation's run instruction.
-    //
-    // LOW-1: `turbo_flash_enabled()` is OnceLock-latched on first read for the
-    // process lifetime. Setting RMLX_TURBO_FLASH here MUST happen before any
-    // other code path in this binary reads the gate; the assertion below
-    // (`turbo_flash_dispatch_count` strict-mode delta > 0) is the proof the
-    // latch sealed `true`. The TF=0 control lives in a sibling test binary
-    // (`apple10_head_dim_256_control.rs`) for the same reason.
-    unsafe {
-        std::env::set_var("RMLX_TURBO_FLASH", "1");
-        std::env::set_var("RMLX_TURBO_FLASH_MIN", "0");
-    }
-
-    let mut cache = KvCache::with_quant_max_seq(KvQuant::K8V4, MAX_SEQ);
+    let mut cache =
+        KvCache::with_quant_max_seq(KvQuant::K8V4, MAX_SEQ).with_dispatch_policy(turbo_on());
 
     // ── Prefill via `update` (matches the K8V4 fused-QK dispatch pattern). ────
     cache.enter_prefill();
@@ -333,18 +341,8 @@ fn turbo_flash_head_dim_256_long_decode_stress() {
     let device = Device::Gpu;
     let scale = 1.0 / (HEAD_DIM as f32).sqrt();
 
-    // SAFETY: process-global env var; --test-threads=1 enforced.
-    //
-    // LOW-1: `turbo_flash_enabled()` is OnceLock-latched on first read for the
-    // process lifetime. The smoke test above already sealed the gate to
-    // `true` in this binary's process; this set_var is idempotent in that
-    // case but kept for binaries where the stress test runs first.
-    unsafe {
-        std::env::set_var("RMLX_TURBO_FLASH", "1");
-        std::env::set_var("RMLX_TURBO_FLASH_MIN", "0");
-    }
-
-    let mut cache = KvCache::with_quant_max_seq(KvQuant::K8V4, MAX_SEQ);
+    let mut cache =
+        KvCache::with_quant_max_seq(KvQuant::K8V4, MAX_SEQ).with_dispatch_policy(turbo_on());
 
     cache.enter_prefill();
     let prefill_shape = [B, KV_H, SMOKE_PREFILL, HEAD_DIM];
@@ -471,10 +469,64 @@ fn turbo_flash_head_dim_256_long_decode_stress() {
     );
 }
 
-// ── Test 3: control lives in `apple10_head_dim_256_control.rs` ────────────
+// ── Test 3: control — the same shape with the kernel off ────────────────────
 //
-// The `OnceLock<bool>`-backed `turbo_flash_enabled()` gate latches on first
-// read. Co-locating the TF=0 control in this binary would seal the gate to
-// `false` before the ON-path tests get a chance, silently zero-ing every
-// dispatch assertion. The control is therefore split into its own test
-// binary — see `tests/apple10_head_dim_256_control.rs`.
+// The policy travels on the cache, so the OFF arm runs in this binary next to
+// the ON arms. Under the old process-global gate that was impossible: the
+// first read latched the value for the whole process, so the control needed a
+// test binary of its own.
+
+#[test]
+#[ignore = "GPU Metal context: cargo test -p rmlx-kv-quant --test apple10_head_dim_256 -- --ignored --test-threads=1"]
+fn turbo_flash_head_dim_256_control_dispatch_stays_dormant() {
+    if skip_if_no_gpu() {
+        return;
+    }
+
+    let device = Device::Gpu;
+    let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+
+    let mut cache = KvCache::with_quant_max_seq(KvQuant::K8V4, MAX_SEQ)
+        .with_dispatch_policy(turbo_off_same_threshold());
+    cache.enter_prefill();
+    let prefill_shape = [B, KV_H, SMOKE_PREFILL, HEAD_DIM];
+    let n_pref: usize = prefill_shape.iter().map(|&d| d as usize).product();
+    let prefill_k = make_f32_array(&lcg_data(n_pref, 0xE3C4F5A6_B7C8_0001), &prefill_shape)
+        .astype(Dtype::Bf16, device)
+        .expect("bf16 prefill_k");
+    let prefill_v = make_f32_array(&lcg_data(n_pref, 0xE3C4F5A6_B7C8_0002), &prefill_shape)
+        .astype(Dtype::Bf16, device)
+        .expect("bf16 prefill_v");
+    let _ = cache
+        .update(&prefill_k, &prefill_v, device)
+        .expect("control prefill update");
+    cache.exit_prefill(device).expect("control exit_prefill");
+
+    let dec_kv_shape = [B, KV_H, 1, HEAD_DIM];
+    let q_shape = [B, N_Q_HEADS, 1, HEAD_DIM];
+    let n_dec: usize = dec_kv_shape.iter().map(|&d| d as usize).product();
+    let n_q: usize = q_shape.iter().map(|&d| d as usize).product();
+    let new_k = make_f32_array(&lcg_data(n_dec, 0xE3C4F5A6_B7C8_0003), &dec_kv_shape)
+        .astype(Dtype::Bf16, device)
+        .expect("bf16 new_k");
+    let new_v = make_f32_array(&lcg_data(n_dec, 0xE3C4F5A6_B7C8_0004), &dec_kv_shape)
+        .astype(Dtype::Bf16, device)
+        .expect("bf16 new_v");
+    let q_arr = make_f32_array(&lcg_data(n_q, 0xE3C4F5A6_B7C8_0005), &q_shape)
+        .astype(Dtype::Bf16, device)
+        .expect("bf16 q");
+
+    let before = turbo_flash_dispatch_count();
+    let _ = cache
+        .update_and_sdpa(&q_arr, &new_k, &new_v, scale, "", None, device)
+        .expect("control decode");
+    let after = turbo_flash_dispatch_count();
+
+    let delta = after - before;
+    eprintln!("control head_dim=256 turbo_flash off: dispatch delta={delta}");
+    assert_eq!(
+        delta, 0,
+        "TurboFlash dispatch must stay dormant when the cache policy has \
+         turbo_flash off, at head_dim=256"
+    );
+}

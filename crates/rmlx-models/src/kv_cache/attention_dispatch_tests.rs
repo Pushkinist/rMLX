@@ -3,7 +3,7 @@ use rmlx_mlx::{Array, Device, Dtype};
 
 /// Build a small dummy `SparseAttnInputs` for the gate-OFF unit tests.
 ///
-/// The gate check (`!sparse_attn_enabled()`) fires before any input
+/// The gate check (`!policy.sparse_attn`) fires before any input
 /// validation or kernel dispatch — so these arrays only need to be
 /// constructible, not coherent.  We make them tiny f32 arrays sized for
 /// `b=1, kv_h=1, heads_per_kv=1, kv_seq=2, head_dim=64`.
@@ -65,15 +65,10 @@ fn make_dummy_sparse_inputs<'a>(
     }
 }
 
-// ── sparse_attn_dispatch_if_enabled stub tests ────────────────────────────────
+// ── sparse_attn_dispatch_if_enabled gate tests ────────────────────────────────
 //
-// All four cases return None in Exec A — the dispatch site is a placeholder
-// until Exec B wires in real phase-1 / phase-2 MSL kernels.
-//
-// OnceLock note: `sparse_attn_enabled()` latches its env read on first call.
-// In a fresh test process the env-var is unset → returns false → these
-// assertions are stable regardless of test ordering. The CLI env-setter
-// tests live in `rmlx-cli::commands::serve_tests` (no overlap).
+// The gate is a policy field the caller supplies, so each case names the
+// policy it exercises instead of depending on process state or test ordering.
 
 /// Build a `HeadBudgets` via JSON round-trip (the struct is
 /// `#[non_exhaustive]` so direct construction is banned outside
@@ -102,29 +97,33 @@ fn make_test_head_budgets() -> HeadBudgets {
 
 #[test]
 fn sparse_attn_dispatch_none_when_gate_off_and_budgets_absent() {
-    // Default state in a fresh test process: env-var unset, no budgets.
-    // The function must return None because the gate short-circuits before
-    // touching the inputs (Exec B: gate ON path runs the kernels).
     let (q, kc, ks, kr, v) = make_dummy_inputs();
     let inputs = make_dummy_sparse_inputs(&q, &kc, &ks, &kr, &v);
-    assert!(sparse_attn_dispatch_if_enabled(&inputs, None).is_none());
+    assert!(sparse_attn_dispatch_if_enabled(&inputs, None, DispatchPolicy::default()).is_none());
 }
 
 #[test]
 fn sparse_attn_dispatch_none_when_gate_off_with_budgets_present() {
-    // Even with budgets present, the gate is off (OnceLock latches OFF
-    // in this test process) → must return None.
+    // Budgets present but the policy selects the dense path → None.
     let budgets = make_test_head_budgets();
     let (q, kc, ks, kr, v) = make_dummy_inputs();
     let inputs = make_dummy_sparse_inputs(&q, &kc, &ks, &kr, &v);
-    assert!(sparse_attn_dispatch_if_enabled(&inputs, Some(&budgets)).is_none());
+    assert!(
+        sparse_attn_dispatch_if_enabled(&inputs, Some(&budgets), DispatchPolicy::default())
+            .is_none()
+    );
 }
 
 #[test]
 fn sparse_attn_dispatch_short_circuits_on_missing_budgets() {
-    // Even if a future test in the same process latched the OnceLock to
-    // true, missing budgets must still produce None (correctness invariant).
+    // Gate open, budgets missing: the budgets check must still produce None.
+    // Under the old process-global gate this case was unreachable from a
+    // test, because the gate latched OFF for the whole binary.
     let (q, kc, ks, kr, v) = make_dummy_inputs();
     let inputs = make_dummy_sparse_inputs(&q, &kc, &ks, &kr, &v);
-    assert!(sparse_attn_dispatch_if_enabled(&inputs, None).is_none());
+    let gate_open = DispatchPolicy {
+        sparse_attn: true,
+        ..DispatchPolicy::default()
+    };
+    assert!(sparse_attn_dispatch_if_enabled(&inputs, None, gate_open).is_none());
 }

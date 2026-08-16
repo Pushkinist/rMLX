@@ -397,7 +397,8 @@ kernel infrastructure pattern (`MetalKernel` singleton,
 The FWHT is a butterfly network operating on the full D-element row simultaneously,
 which is fundamentally different from the Givens 2×2 micro-rotation.
 
-Default-OFF. Enable via `RMLX_ROT_K_FUSED=1`. Supported D: {32, 64, 128, 256, 512}.
+Default-OFF. Enable via `--rot-k-fused on` (or `RMLX_ROT_K_FUSED=1`).
+Supported D: {32, 64, 128, 256, 512}.
 Falls back to v1 matmul on unsupported D or kernel error.
 
 Reference math: `crates/rmlx-models/src/kv_cache/rot_k.rs`; rotorquant README
@@ -435,7 +436,7 @@ Qwen3.5-MoE @ 256) via the `sdpa_dispatch` TurboFlash path.
 
 **Decode-time window growth (power-of-two boundary).** The TurboFlash path
 maintains its own head-major `[B, kv_h, max_seq, .]` code/scale buffers
-(`flash_*`), and only dispatches once `kv_seq > RMLX_TURBO_FLASH_MIN`. Because
+(`flash_*`), and only dispatches once `kv_seq > DispatchPolicy::turbo_flash_min_kv_seq`. Because
 that dispatch bypasses the legacy `KvCache::update`, it must apply the same
 decode-side capacity rule that path does: `update_and_sdpa_k8v4_flash_inner`
 calls `ensure_decode_capacity` before it appends, and `grow_flash_buffers`
@@ -967,8 +968,8 @@ A head-major K shadow (`KvCache::fused_qk_shadow`) sits on top of the
 per-codec storage, sized to `[B, kv_h, max_seq, codes_per_token]`
 (u32 codes) + `[B, kv_h, max_seq, combined_per_token]` (f32 scales).
 The shadow is the input contract the fused-QK MSL kernels expect, and
-is allocated **lazily on the first fused-QK decode dispatch when
-`RMLX_FUSED_QK=1`**.
+is allocated **lazily on the first fused-QK decode dispatch when the cache's
+`DispatchPolicy::fused_qk` is set**.
 
 **Scope** — q8 (`K8V4`, `K8V8`), `TurboSym3`, `TurboSym4`. The iso
 (`Iso3Sym`, `IsoKOnly3`, `Iso4Sym`, `IsoKOnly4`) and rotor (`Rotor3Sym`,

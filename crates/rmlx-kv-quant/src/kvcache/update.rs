@@ -17,7 +17,7 @@ use crate::storage::{
     QuantKTurbo3, QuantKTurbo4, QuantPlanarK, QuantPlanarV, QuantRotorV3, QuantRotorV4, QuantV,
     RotorBlocks, RotorKBlocks, ISO4_GROUP_SIZE, ISO_K3_BITS, ISO_K4_BITS,
 };
-use crate::turbo_flash_msl::{turbo_flash_lock_enabled, turbo_flash_sdpa, turbo_flash_should_run};
+use crate::turbo_flash_msl::{turbo_flash_sdpa, turbo_flash_should_run};
 use crate::KvQuant;
 
 use super::helpers::{array_to_f32_vec, arrays_to_f32, f32_vec_to_array, storage_variant_name};
@@ -2674,6 +2674,9 @@ impl KvCache {
     )]
     /// Finalize prefill: quantize the accumulated raw K/V into the storage buffers.
     pub fn exit_prefill(&mut self, device: Device) -> Result<()> {
+        // Snapshot before the storage borrows below; the bulk-quantize arms
+        // hand it to the K encoders.
+        let policy = self.policy;
         if self.rotating.is_some() {
             // No-op: rotating prefill writes go straight into the ring buffer.
             return Ok(());
@@ -2965,7 +2968,7 @@ impl KvCache {
                 state.reset();
                 // Directly quantize and store — no zero-buffer alloc, no
                 // write_at, no slice_seq_to. offset is set to total_seq.
-                state.bulk_init_from_fp16(&k_full, &v_full, device)?;
+                state.bulk_init_from_fp16(&k_full, &v_full, device, policy)?;
                 // The compact fp16 seed for warm-TTFT decode is the same buffer
                 // already materialised above (decode_fp16_pair).
             }
@@ -3004,7 +3007,7 @@ impl KvCache {
                 // with a dummy zero V (it quantizes V too but we replace V below).
                 // Instead, use rotate_k_and_quantize directly + store K.
                 let (k_codes, k_scales, k_biases) =
-                    k_state.bulk_init_k_from_fp16(&k_full, device)?;
+                    k_state.bulk_init_k_from_fp16(&k_full, device, policy)?;
                 k_state.keys = Some(crate::mixed_quant::MixedTuple {
                     codes: k_codes,
                     scales: k_scales,
@@ -3990,6 +3993,7 @@ impl KvCache {
             flash_max_seq: _,
             flash_filled: _,
             max_seq_ceiling: _,
+            policy: _,
         } = self;
 
         let offset = (*offset).max(0) as u64;
@@ -5495,7 +5499,7 @@ impl KvCache {
         // `kv_seq_after_update` is the offset the caller's `update()` would
         // produce — used for the `kv_seq > TURBO_FLASH_MIN_KV_SEQ` gate.
         let kv_seq_after_update = self.offset + new_seq;
-        if !turbo_flash_should_run(q_seq, kv_seq_after_update) {
+        if !turbo_flash_should_run(&self.policy, q_seq, kv_seq_after_update) {
             return Ok(None);
         }
         if head_dim != 128 && head_dim != 256 {
@@ -5558,7 +5562,8 @@ impl KvCache {
         // back to the consumer. `force_lock_off` short-circuits the lock-on
         // optimisation in that case. Non-cross-layer-KV callers (the public
         // entry point) keep the optimisation.
-        let lock_on = !force_lock_off && turbo_flash_lock_enabled() && self.flash_k_codes.is_some();
+        let lock_on =
+            !force_lock_off && self.policy.turbo_flash_lock && self.flash_k_codes.is_some();
         if !lock_on {
             self.update_decode_fp16(new_k, new_v, max_seq, device)?;
         }
@@ -6634,6 +6639,10 @@ impl KvCache {
             // Preserve the virtual ceiling across a branch clone so the cloned
             // cache enforces the same --max-ctx bound on further prefill.
             max_seq_ceiling: self.max_seq_ceiling,
+            // A branch clone continues the same request and must dispatch
+            // through the same kernel paths, so it inherits the policy rather
+            // than re-reading the process default.
+            policy: self.policy,
         })
     }
 

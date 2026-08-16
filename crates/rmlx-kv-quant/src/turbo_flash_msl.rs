@@ -15,18 +15,18 @@
 //! M5 Max: an `EXC_BAD_ACCESS (SIGSEGV) KERN_INVALID_ADDRESS at 0x0` the
 //! instant the K8V4 flash path dispatched at 32k context on
 //! Qwen3.6-35B-A3B-8bit (`head_dim = 256`). Null `Buffer::raw_ptr()` in
-//! `Array::to_bytes` reading back the kernel output. The `apply_turbo_flags`
+//! `Array::to_bytes` reading back the kernel output. The `--turbo-flash`
 //! `Auto` arm therefore landed with a `family ≥ 10 → OFF` clause.
 //!
 //! **Re-validation (2026-06)**: the hazard was re-driven on M5 Max via
 //! `crates/rmlx-kv-quant/tests/apple10_head_dim_256.rs` — a synthetic K8V4
 //! cache at `head_dim = 256` driven through the public
-//! `KvCache::update_and_sdpa` chain with `RMLX_TURBO_FLASH=1`, smoke +
-//! 16-step decode stress + TF=0 control. Result:
+//! `KvCache::update_and_sdpa` chain under a `turbo_flash: true` policy, smoke
+//! + 16-step decode stress + a `turbo_flash: false` control. Result:
 //!
 //! * smoke (1 dispatch, kv_seq=65): no SIGSEGV, cosine min 0.997 vs bf16.
 //! * stress (16 dispatches, kv_seq up to 80): no SIGSEGV, cosine min 0.997.
-//! * control (TF=0): dispatch dormant (delta=0).
+//! * control (kernel off): dispatch dormant (delta=0).
 //!
 //! The 0.997 SDPA cosine vs the K8V4 fused-QK 0.999998 floor is the
 //! **codec floor**, not a kernel issue. A CPU baseline test
@@ -88,12 +88,13 @@
 //! # Activation condition
 //!
 //! Only active for:
-//! - `RMLX_TURBO_FLASH=1` env var.
+//! - `DispatchPolicy::turbo_flash` set on the cache's policy.
 //! - Decode step (q_seq = 1).
 //! - K format: q8_0 (k_bits = 8 in KvQuant::K8V4).
 //! - V format: turbo4 (KvQuant::K8V4 — the only mode with turbo V).
-//! - kv_seq > 4096 (split-K wins when K-seq is long; below this threshold
-//!   the existing `mixed_quantized_sdpa` is faster due to launch overhead).
+//! - `kv_seq > DispatchPolicy::turbo_flash_min_kv_seq` (default 4096: split-K
+//!   wins when K-seq is long; below this threshold the existing
+//!   `mixed_quantized_sdpa` is faster due to launch overhead).
 //!
 //! # Reference
 //!
@@ -109,88 +110,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use rmlx_core::error::{Error, Result};
+use rmlx_core::DispatchPolicy;
 use rmlx_mlx::metal_kernel::{MetalKernel, MetalKernelInvoke};
 use rmlx_mlx::{Array, Device, Dtype};
-
-// ── Env-var gate ──────────────────────────────────────────────────────────────
-
-/// Returns true when the TurboFlash kernel is enabled by env var.
-///
-/// Default OFF at the env level, and the CLI leaves it that way:
-/// `--turbo-flash auto` (the default) resolves **OFF on every host** via
-/// `rmlx_cli::commands::serve::apply_turbo_flags` — a throughput HOLD, see
-/// `rmlx_cli::commands::serve::TurboFlashMode` for the cells. Only
-/// `--turbo-flash on`, or an explicit `RMLX_TURBO_FLASH=1` in the environment,
-/// turns the kernel on. The 2026-06 Apple10 re-validation in the module-level
-/// rustdoc still stands; it cleared the crash/fidelity hazard, not throughput.
-pub fn turbo_flash_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| matches!(std::env::var("RMLX_TURBO_FLASH").as_deref(), Ok("1")))
-}
-
-/// Returns true when "lock-on" mode is enabled via `RMLX_TURBO_FLASH_LOCK=1`.
-///
-/// In lock-on mode the K8V4 decode path skips `update_decode_fp16` (bf16
-/// K/V buffer maintenance) once the head-major persistent flash buffers
-/// have been seeded. New K/V tokens are quantised directly into
-/// `flash_k_codes` / `flash_v_codes` without ever touching the bf16 mirror.
-///
-/// **Trade-off**: lock-on disables the standard-SDPA fallback path for the
-/// remainder of the request, because the bf16 buffer stops growing past
-/// the seed point. Only enable when the TurboFlash kernel is known to be
-/// correct on this hardware (VG.2 NIAH PASS at the target context length).
-///
-/// Lock-on has no effect unless `RMLX_TURBO_FLASH=1` is also set.
-pub fn turbo_flash_lock_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| matches!(std::env::var("RMLX_TURBO_FLASH_LOCK").as_deref(), Ok("1")))
-}
-
-/// Default minimum KV sequence length for TurboFlash to activate.
-///
-/// Below this threshold the split-K dispatch overhead outweighs the
-/// parallelism benefit. 4096 is conservative; TheTom's benchmarks show
-/// the split-K crossover at ~4K tokens on M5 Max.
-///
-/// Override via `RMLX_TURBO_FLASH_MIN` env var. This is a perf gate, not a
-/// correctness gate — proof runs lower it to 0 so dispatch fires on
-/// short prompts. Production keeps the default.
-pub const TURBO_FLASH_MIN_KV_SEQ: i32 = 4096;
-
-/// Resolve the active TurboFlash min kv_seq threshold.
-///
-/// Reads `RMLX_TURBO_FLASH_MIN` once at first call; subsequent calls return
-/// the cached value (`OnceLock`).  Parse failure falls back to the default
-/// with a single `tracing::warn!`.
-pub fn turbo_flash_min_kv_seq() -> i32 {
-    use std::sync::OnceLock;
-    static V: OnceLock<i32> = OnceLock::new();
-    *V.get_or_init(|| match std::env::var("RMLX_TURBO_FLASH_MIN") {
-        Ok(s) => match s.parse::<i32>() {
-            Ok(n) => {
-                if n < 0 {
-                    tracing::warn!(
-                        value = n,
-                        "RMLX_TURBO_FLASH_MIN: negative value clamped to 0"
-                    );
-                    0
-                } else {
-                    n
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    value = %s,
-                    error = %e,
-                    default = TURBO_FLASH_MIN_KV_SEQ,
-                    "RMLX_TURBO_FLASH_MIN: parse failed, using default"
-                );
-                TURBO_FLASH_MIN_KV_SEQ
-            }
-        },
-        Err(_) => TURBO_FLASH_MIN_KV_SEQ,
-    })
-}
 
 // ── Smoke-probe state ─────────────────────────────────────────────────────────
 
@@ -264,16 +186,17 @@ pub fn smoke_probe_check(token_ids: &[u32]) -> bool {
 /// Returns true if TurboFlash should run for this decode step.
 ///
 /// Conditions:
-/// 1. `RMLX_TURBO_FLASH=1` env var.
+/// 1. `policy.turbo_flash` is set.
 /// 2. Smoke-probe has not forced fallback.
 /// 3. q_seq == 1 (decode step only).
-/// 4. kv_seq > turbo_flash_min_kv_seq() (default TURBO_FLASH_MIN_KV_SEQ=4096,
-///    override via RMLX_TURBO_FLASH_MIN env var; values < 0 clamped to 0).
-pub fn turbo_flash_should_run(q_seq: i32, kv_seq: i32) -> bool {
-    turbo_flash_enabled()
+/// 4. `kv_seq > policy.turbo_flash_min_kv_seq` (default 4096). This is a perf
+///    gate, not a correctness gate — proof runs lower it to 0 so dispatch
+///    fires on short prompts. Production keeps the default.
+pub fn turbo_flash_should_run(policy: &DispatchPolicy, q_seq: i32, kv_seq: i32) -> bool {
+    policy.turbo_flash
         && !turbo_flash_corrupted()
         && q_seq == 1
-        && kv_seq > turbo_flash_min_kv_seq()
+        && kv_seq > policy.turbo_flash_min_kv_seq
 }
 
 // ── MSL constants ─────────────────────────────────────────────────────────────
@@ -379,8 +302,9 @@ fn p2_kernel() -> Result<&'static MetalKernel> {
 
 /// 2-pass split-K FlashAttention for rMLX's native q8_0 K + turbo4 V format.
 ///
-/// Replaces `mixed_quantized_sdpa` when `RMLX_TURBO_FLASH=1` and
-/// `kv_seq > TURBO_FLASH_MIN_KV_SEQ` for the K8V4 decode path.
+/// Replaces `mixed_quantized_sdpa` when `DispatchPolicy::turbo_flash` is set
+/// and `kv_seq > DispatchPolicy::turbo_flash_min_kv_seq` for the K8V4 decode
+/// path.
 ///
 /// # Arguments
 ///

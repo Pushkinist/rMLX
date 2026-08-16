@@ -6,9 +6,10 @@
 //! - [`mixed_quantized_sdpa`]: fused quantized SDPA for K8/V4 mixed-precision.
 //! - [`rot_k_tq4v_sdpa`]: dequant-then-SDPA for RotKTq4V hybrid.
 
-use crate::rot_k_msl::{rot_k_fused_enabled, rot_k_fwht_rotate_gpu};
+use crate::rot_k_msl::rot_k_fwht_rotate_gpu;
 use crate::sparse_v_msl::{sparse_v_kernel_enabled, sparse_v_weighted_sum};
 use rmlx_core::error::{Error, Result};
+use rmlx_core::DispatchPolicy;
 use rmlx_mlx::{
     add, dequantize, expand_dims, greater_equal, multiply, quantized_matmul, scalar_f32,
     scaled_dot_product_attention, softmax_precise, where_cond, Array, Device, Dtype,
@@ -47,12 +48,13 @@ pub fn mixed_quantized_sdpa(
     v_bits: i32,
     k_rotation: Option<&Array>,
     device: Device,
+    policy: DispatchPolicy,
 ) -> Result<Array> {
     // pre-rotate Q by the same R the K cache was rotated with, so the
     // rotations cancel in the score matmul: (Q Rt)(K Rt)t = Q Kt. K is stored
     // (and quantized) in the rotated basis and is never inverse-rotated.
     //
-    // sub-item 1: when RMLX_ROT_K_FUSED=1 and D is in the supported FWHT
+    // When the policy selects the fused path and D is in the supported FWHT
     // set, use the fused FWHT rotate kernel (O(D log D) vs O(D^2) matmul).
     // Falls back to the v1 rotate_last_axis matmul on error or unsupported D.
     let queries_owned;
@@ -63,7 +65,7 @@ pub fn mixed_quantized_sdpa(
                 .last()
                 .ok_or_else(|| Error::Mlx("mixed_quantized_sdpa: empty Q shape".into()))?
                 as usize;
-            let try_fused = rot_k_fused_enabled() && crate::rot_k_msl::is_supported_d(d);
+            let try_fused = policy.rot_k_fused && crate::rot_k_msl::is_supported_d(d);
             queries_owned = if try_fused {
                 match rot_k_fwht_rotate_gpu(queries, device) {
                     Ok(q_rot) => q_rot,
@@ -243,6 +245,7 @@ pub fn rot_k_tq4v_sdpa(
     k_bits: i32,
     k_rotation: Option<&Array>,
     device: Device,
+    policy: DispatchPolicy,
 ) -> Result<Array> {
     // 1. Pre-rotate Q (same logic as mixed_quantized_sdpa).
     let queries_owned;
@@ -253,7 +256,7 @@ pub fn rot_k_tq4v_sdpa(
                 .last()
                 .ok_or_else(|| Error::Mlx("rot_k_tq4v_sdpa: empty Q shape".into()))?
                 as usize;
-            let try_fused = rot_k_fused_enabled() && crate::rot_k_msl::is_supported_d(d);
+            let try_fused = policy.rot_k_fused && crate::rot_k_msl::is_supported_d(d);
             queries_owned = if try_fused {
                 match rot_k_fwht_rotate_gpu(queries, device) {
                     Ok(q_rot) => q_rot,

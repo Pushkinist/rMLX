@@ -42,7 +42,6 @@
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{matmul, softmax_precise, Array, Device, Dtype};
 
-use crate::fused_qk_enabled;
 use crate::k8vturbo3_append_msl::turbo_quantize_v3_gpu;
 use crate::kvcache::fused_qk_shadow::FusedQkShadow;
 use crate::kvcache::KvCache;
@@ -55,31 +54,6 @@ use crate::turbo_k3_fused_qk_msl::turbo_k3_fused_qk_sdpa;
 use crate::turbo_k4_fused_qk_msl::turbo_k4_fused_qk_sdpa;
 use crate::turboquant_msl::turbo_quantize_v4_gpu;
 use crate::KvQuant;
-
-/// Production minimum kv_seq for fused-QK to be worthwhile. Below this,
-/// per-step encode overhead can dominate. Matches the
-/// `TURBO_FLASH_MIN_KV_SEQ` baseline. Override via `RMLX_FUSED_QK_MIN` env var.
-const DEFAULT_FUSED_QK_MIN_KV_SEQ: i32 = 512;
-
-fn min_kv_seq() -> i32 {
-    use std::sync::OnceLock;
-    static V: OnceLock<i32> = OnceLock::new();
-    *V.get_or_init(|| match std::env::var("RMLX_FUSED_QK_MIN") {
-        Ok(s) => match s.parse::<i32>() {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::warn!(
-                    value = %s,
-                    error = %e,
-                    default = DEFAULT_FUSED_QK_MIN_KV_SEQ,
-                    "RMLX_FUSED_QK_MIN: parse failed, using default"
-                );
-                DEFAULT_FUSED_QK_MIN_KV_SEQ
-            }
-        },
-        Err(_) => DEFAULT_FUSED_QK_MIN_KV_SEQ,
-    })
-}
 
 /// Canonical fused-QK kernel pointer type — mirror of
 /// `rmlx_models::kv_cache::attention_dispatch::FusedQkFn`.
@@ -180,7 +154,7 @@ impl KvCache {
         additive_mask: Option<&Array>,
         device: Device,
     ) -> Result<Option<Array>> {
-        if !fused_qk_enabled() {
+        if !self.policy.fused_qk {
             // The most common rejection by far — the CLI gate resolves OFF by
             // default, so this is what an operator asking "why doesn't the
             // kernel fire" is usually looking at. Tracing it is the difference
@@ -219,8 +193,8 @@ impl KvCache {
         }
         let new_seq = new_k.shape()[2];
         let kv_seq_after = self.offset + new_seq;
-        if kv_seq_after < min_kv_seq() {
-            self.trace_fused_qk_skip("kv_seq below RMLX_FUSED_QK_MIN");
+        if kv_seq_after < self.policy.fused_qk_min_kv_seq {
+            self.trace_fused_qk_skip("kv_seq below the fused-QK minimum");
             return Ok(None);
         }
         let codec = self.quant;

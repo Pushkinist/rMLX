@@ -102,7 +102,9 @@ impl From<PrefixIndexKindArg> for rmlx_models::prefix_index::PrefixIndexKind {
 }
 
 use commands::parse::KvPresetArg;
-use commands::serve::{FusedQkMode, PlanarFlashDecodeMode, SparseAttnMode, TurboFlashMode};
+use commands::serve::{
+    FusedQkMode, PlanarFlashDecodeMode, RotKFusedMode, SparseAttnMode, TurboFlashMode,
+};
 use commands::{
     acquire_claim_for_device, build_cache_type_spec, parse_device, parse_kv_bits_combo,
     parse_kv_bits_fractional, parse_kv_preset, parse_kv_quant, parse_max_ctx,
@@ -287,6 +289,18 @@ struct Cli {
     /// `--kv-quant planar_k`); other KV variants fall through unchanged.
     #[arg(long, value_enum, global = true, default_value_t = PlanarFlashDecodeMode::Auto)]
     planar_flash_decode: PlanarFlashDecodeMode,
+    /// Fused FWHT + affine-quantize MSL kernel for the rot_k codec families.
+    /// Default `auto`.
+    ///
+    /// `auto` (default): OFF — the rotate-by-matmul path is the validated one;
+    /// a pre-existing `RMLX_ROT_K_FUSED=1` is still honoured.
+    /// `on`: force the fused kernel (ablation / bench).
+    /// `off`: HARD override — ignores `RMLX_ROT_K_FUSED=1` in the shell.
+    ///
+    /// Only affects caches whose codec rotates K (`--kv-quant rot_k`,
+    /// `rot_k_tq4v`); every other codec ignores it.
+    #[arg(long, value_enum, global = true, default_value_t = RotKFusedMode::Auto)]
+    rot_k_fused: RotKFusedMode,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -1478,24 +1492,21 @@ fn main() -> Result<()> {
     // Process-wide one-shot OnceLock; default ON per spec.
     rmlx_kv_quant::planar_fused_qk::install_planar_fused_qk(cli.planar_fused_qk.enabled());
 
-    // Resolve the --fused-qk flag into the process environment before any
-    // inference starts, so the OnceLock in fused_qk_enabled() reads the
-    // resolved value on first call.
-    commands::serve::apply_fused_qk_flags(cli.fused_qk);
-
-    // Resolve the --sparse-attn flag into the process environment before any
-    // inference starts, so the OnceLock in sparse_attn_enabled() reads the
-    // resolved value on first call.
-    commands::serve::apply_sparse_attn_flags(cli.sparse_attn);
-
-    // Same contract for the two flash-decode kernel gates. These resolve here,
-    // not inside `run_serve`, so that every subcommand that runs inference —
-    // `bench`, `baseline`, `eval`, `chat`, `generate` — sees the same kernel
-    // configuration the server does. Resolving them only for `serve` made the
-    // measurement commands silently benchmark a different kernel set than the
-    // one production runs.
-    commands::serve::apply_turbo_flags(cli.turbo_flash, cli.turbo_flash_lock);
-    commands::serve::apply_planar_flash_decode_flags(cli.planar_flash_decode);
+    // Resolve every kernel gate into the process-default DispatchPolicy before
+    // any cache is built. This happens here, not inside `run_serve`, so that
+    // every subcommand that runs inference — `bench`, `baseline`, `eval`,
+    // `chat`, `generate` — sees the same kernel configuration the server does.
+    // Resolving them only for `serve` made the measurement commands silently
+    // benchmark a different kernel set than the one production runs.
+    rmlx_core::set_dispatch_policy(commands::serve::resolve_dispatch_policy(
+        cli.fused_qk,
+        cli.sparse_attn,
+        cli.turbo_flash,
+        cli.turbo_flash_lock,
+        cli.planar_flash_decode,
+        cli.rot_k_fused,
+        rmlx_core::DispatchPolicy::from_env(),
+    ));
 
     // Install the process-wide panic hook.
     // Emits tracing::error! with structured fields (payload, location, thread,

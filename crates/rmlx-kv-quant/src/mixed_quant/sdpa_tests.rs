@@ -137,7 +137,9 @@ fn rot_k_tq4v_k_dequant_same_tolerance_as_rot_k() {
     let q = from_vec(&q_data, &[b, kv_h, lq, d]);
 
     let mut k_state = MixedKvState::new_rotated(4, 64);
-    let (k_codes, k_scales, k_biases) = k_state.bulk_init_k_from_fp16(&k, device).unwrap();
+    let (k_codes, k_scales, k_biases) = k_state
+        .bulk_init_k_from_fp16(&k, device, DispatchPolicy::default())
+        .unwrap();
 
     let k_dq = dequantize(
         &k_codes,

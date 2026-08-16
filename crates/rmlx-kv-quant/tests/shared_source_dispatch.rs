@@ -3,15 +3,15 @@
 // Drives the public `KvCache::update_and_sdpa_shared_source` path (Gemma4's
 // entry point) with K8V4 storage, head_dim=128. Asserts:
 //
-//   1. `RMLX_TURBO_FLASH=1` + `RMLX_TURBO_FLASH_MIN=0` (zero threshold so
-//      TurboFlash fires on a short kv_seq):
+//   1. `DispatchPolicy { turbo_flash: true, turbo_flash_min_kv_seq: 0 }` (zero
+//      threshold so TurboFlash fires on a short kv_seq):
 //      a. `turbo_flash_dispatch_count()` delta > 0 after a decode step (the
 //         kernel actually fired on the shared-KV producer path, not just gated).
 //      b. The bf16 K surfaced to the consumer is byte-identical to slicing
 //         `decode_fp16_k` — proving the dispatch path surfaced the mirror
 //         rather than a flash-transformed K.
 //
-//   2. `RMLX_TURBO_FLASH=0` (control group):
+//   2. `DispatchPolicy { turbo_flash: false, .. }` (control group):
 //      Same prefill + decode; dispatch delta == 0 (gate correctly suppressed).
 //
 // `RMLX_SHARED_SOURCE_STRICT=1` — strict mode (used by CI):
@@ -31,10 +31,10 @@
     clippy::print_stderr,
     clippy::unusual_byte_groupings,
     clippy::indexing_slicing,
-    unsafe_code,
     missing_docs
 )]
 
+use rmlx_core::DispatchPolicy;
 use rmlx_kv_quant::turbo_flash_msl::turbo_flash_dispatch_count;
 use rmlx_kv_quant::{KvCache, KvQuant, SharedKv};
 use rmlx_mlx::{Array, Device, Dtype};
@@ -111,9 +111,11 @@ fn build_prefilled_cache(
     prefill_k: &Array,
     prefill_v: &Array,
     prefill_q: &Array,
+    policy: DispatchPolicy,
 ) -> KvCache {
     let scale = 1.0 / (HEAD_DIM as f32).sqrt();
-    let mut cache = KvCache::with_quant_max_seq(KvQuant::K8V4, MAX_SEQ);
+    let mut cache =
+        KvCache::with_quant_max_seq(KvQuant::K8V4, MAX_SEQ).with_dispatch_policy(policy);
     cache.enter_prefill();
     let _ = cache
         .update_and_sdpa_shared_source(
@@ -125,12 +127,12 @@ fn build_prefilled_cache(
     cache
 }
 
-// ── Test 1: RMLX_TURBO_FLASH=1 — dispatch fires, bf16 mirror surfaced ────────
+// ── Test 1: turbo_flash on — dispatch fires, bf16 mirror surfaced ───────────
 
 /// GPU: `update_and_sdpa_shared_source` with TurboFlash ON must dispatch and
 /// surface the bf16 mirror K unchanged.
 ///
-/// With `RMLX_TURBO_FLASH=1` + `RMLX_TURBO_FLASH_MIN=0`:
+/// With `turbo_flash: true` + `turbo_flash_min_kv_seq: 0`:
 ///   a. `turbo_flash_dispatch_count()` delta > 0 (kernel fired).
 ///   b. Surfaced K bytes == bf16 reference K bytes (mirror, not flash-transformed).
 ///
@@ -146,12 +148,12 @@ fn shared_source_turbo_flash_on_dispatch_fires_and_surfaces_bf16_mirror() {
     let device = Device::Gpu;
     let scale = 1.0 / (HEAD_DIM as f32).sqrt();
 
-    // SAFETY: process-global env var; test must run with --test-threads=1
-    // (enforced by the ignore annotation's run instruction).
-    unsafe {
-        std::env::set_var("RMLX_TURBO_FLASH", "1");
-        std::env::set_var("RMLX_TURBO_FLASH_MIN", "0");
-    }
+    // The policy travels on the cache, so this arm needs no process state.
+    let policy = DispatchPolicy {
+        turbo_flash: true,
+        turbo_flash_min_kv_seq: 0,
+        ..DispatchPolicy::default()
+    };
 
     let prefill_shape = [B, KV_H, PREFILL_SEQ, HEAD_DIM];
     let n_pref: usize = prefill_shape.iter().map(|&d| d as usize).product();
@@ -170,7 +172,7 @@ fn shared_source_turbo_flash_on_dispatch_fires_and_surfaces_bf16_mirror() {
         .astype(Dtype::Bf16, device)
         .expect("bf16 q_pref");
 
-    let mut cache = build_prefilled_cache(device, &prefill_k, &prefill_v, &q_pref);
+    let mut cache = build_prefilled_cache(device, &prefill_k, &prefill_v, &q_pref, policy);
 
     let dec_kv_shape = [B, KV_H, 1, HEAD_DIM];
     let n_dec: usize = dec_kv_shape.iter().map(|&d| d as usize).product();
@@ -221,7 +223,7 @@ fn shared_source_turbo_flash_on_dispatch_fires_and_surfaces_bf16_mirror() {
         assert!(
             !strict,
             "RMLX_SHARED_SOURCE_STRICT=1 — turbo_flash_dispatch_count did not increment; \
-             the kernel is expected to fire with RMLX_TURBO_FLASH=1 + RMLX_TURBO_FLASH_MIN=0 \
+             the kernel is expected to fire with turbo_flash on + a zero threshold \
              at head_dim=128 in strict mode"
         );
         return;
@@ -271,7 +273,7 @@ fn shared_source_turbo_flash_on_dispatch_fires_and_surfaces_bf16_mirror() {
     );
 }
 
-// ── Test 2: RMLX_TURBO_FLASH=0 — dispatch stays dormant ─────────────────────
+// ── Test 2: turbo_flash off — dispatch stays dormant ────────────────────────
 
 /// GPU: `update_and_sdpa_shared_source` with TurboFlash OFF — dispatch must
 /// stay dormant and the legacy fallback must surface correctly-shaped K/V.
@@ -285,11 +287,12 @@ fn shared_source_turbo_flash_off_dispatch_stays_dormant() {
     let device = Device::Gpu;
     let scale = 1.0 / (HEAD_DIM as f32).sqrt();
 
-    // SAFETY: process-global env var; --test-threads=1 required.
-    unsafe {
-        std::env::set_var("RMLX_TURBO_FLASH", "0");
-        std::env::set_var("RMLX_TURBO_FLASH_MIN", "0");
-    }
+    // Control arm: same threshold, kernel off.
+    let policy = DispatchPolicy {
+        turbo_flash: false,
+        turbo_flash_min_kv_seq: 0,
+        ..DispatchPolicy::default()
+    };
 
     let prefill_shape = [B, KV_H, PREFILL_SEQ, HEAD_DIM];
     let n_pref: usize = prefill_shape.iter().map(|&d| d as usize).product();
@@ -308,7 +311,7 @@ fn shared_source_turbo_flash_off_dispatch_stays_dormant() {
         .astype(Dtype::Bf16, device)
         .expect("bf16 q_pref");
 
-    let mut cache = build_prefilled_cache(device, &prefill_k, &prefill_v, &q_pref);
+    let mut cache = build_prefilled_cache(device, &prefill_k, &prefill_v, &q_pref, policy);
 
     let dec_kv_shape = [B, KV_H, 1, HEAD_DIM];
     let n_dec: usize = dec_kv_shape.iter().map(|&d| d as usize).product();
@@ -339,7 +342,7 @@ fn shared_source_turbo_flash_off_dispatch_stays_dormant() {
     eprintln!("TF=0: turbo_flash_dispatch_count before={tf_before} after={tf_after} delta={delta}");
     assert_eq!(
         delta, 0,
-        "TurboFlash dispatch must be dormant when RMLX_TURBO_FLASH=0; \
+        "TurboFlash dispatch must be dormant when turbo_flash is off; \
          got delta={delta}"
     );
 

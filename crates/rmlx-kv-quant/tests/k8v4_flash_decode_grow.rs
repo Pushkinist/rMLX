@@ -15,10 +15,6 @@
 // never an arch — so both real head_dim geometries (128 = Qwen3 family,
 // 256 = Gemma4 family) are exercised here directly.
 //
-// These live in a dedicated test binary because `turbo_flash_enabled()` /
-// `turbo_flash_min_kv_seq()` latch their env reads into a `OnceLock` on first
-// call: the env must be set before any other code path in the process reads
-// the gate. Same reasoning as `tests/apple10_head_dim_256.rs`.
 //
 // Run:
 //   cargo test -p rmlx-kv-quant --test k8v4_flash_decode_grow -- \
@@ -29,10 +25,10 @@
     clippy::panic,
     clippy::print_stderr,
     clippy::indexing_slicing,
-    unsafe_code,
     missing_docs
 )]
 
+use rmlx_core::DispatchPolicy;
 use rmlx_kv_quant::turbo_flash_msl::turbo_flash_dispatch_count;
 use rmlx_kv_quant::{KvCache, KvQuant};
 use rmlx_mlx::{Array, Device, Dtype};
@@ -163,12 +159,12 @@ fn boundary_run(head_dim: i32, label: &str) {
     let device = Device::Gpu;
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
 
-    // SAFETY: process-global env; --test-threads=1 is enforced by the ignore
-    // annotation. Must be set before any turbo_flash_* OnceLock read.
-    unsafe {
-        std::env::set_var("RMLX_TURBO_FLASH", "1");
-        std::env::set_var("RMLX_TURBO_FLASH_MIN", "0");
-    }
+    // Both caches below dispatch through TurboFlash with no kv_seq floor.
+    let policy = DispatchPolicy {
+        turbo_flash: true,
+        turbo_flash_min_kv_seq: 0,
+        ..DispatchPolicy::default()
+    };
 
     // `flash`: small window so decode crosses it cheaply. Prefill lands just
     // under the first boundary (120 < 128); decode then crosses 128 and 256.
@@ -180,8 +176,10 @@ fn boundary_run(head_dim: i32, label: &str) {
     let prefill_len = 120;
     let n_decode: u64 = 150; // reaches offset 270 → crosses 128 and 256
 
-    let mut flash = KvCache::with_quant_max_seq(KvQuant::K8V4, max_seq_init);
-    let mut reference = KvCache::with_quant_max_seq(KvQuant::K8V4, reference_window);
+    let mut flash =
+        KvCache::with_quant_max_seq(KvQuant::K8V4, max_seq_init).with_dispatch_policy(policy);
+    let mut reference =
+        KvCache::with_quant_max_seq(KvQuant::K8V4, reference_window).with_dispatch_policy(policy);
     prefill(&mut flash, head_dim, prefill_len, device);
     prefill(&mut reference, head_dim, prefill_len, device);
 

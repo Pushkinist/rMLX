@@ -1,7 +1,7 @@
 // Production fused-QK dispatch end-to-end smoke + parity test.
 //
 // Drives the public `KvCache::update_and_sdpa` path with K8V4 (q8 fused-QK),
-// with `RMLX_FUSED_QK=1`, on a synthetic prefill + 1 decode step. Asserts:
+// under a fused-QK policy, on a synthetic prefill + 1 decode step. Asserts:
 //
 //   1. The dispatch counter increments by exactly 1 (proving the kernel
 //      fired and the production path actually routed through it).
@@ -22,14 +22,25 @@
     clippy::print_stderr,
     clippy::unusual_byte_groupings,
     clippy::indexing_slicing,
-    unsafe_code,
     missing_docs
 )]
 //! Fused-QK dispatch integration test.
 
+use rmlx_core::DispatchPolicy;
 use rmlx_kv_quant::kvcache::fused_qk_total_dispatch_count;
 use rmlx_kv_quant::{KvCache, KvQuant};
 use rmlx_mlx::{Array, Device, Dtype};
+
+/// Fused-QK on, with a low enough threshold that the short synthetic caches
+/// in this file clear it. Each cache carries its own copy, so the arms here
+/// are independent of process state and of each other.
+fn fused_qk_policy() -> DispatchPolicy {
+    DispatchPolicy {
+        fused_qk: true,
+        fused_qk_min_kv_seq: 8,
+        ..DispatchPolicy::default()
+    }
+}
 
 fn make_f32_array(data: &[f32], shape: &[i32]) -> Array {
     let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
@@ -93,20 +104,13 @@ fn lcg_data(n: usize, seed: u64) -> Vec<f32> {
 }
 
 /// End-to-end: prefill bf16 tokens via `update`, then one decode step via
-/// `update_and_sdpa` with `RMLX_FUSED_QK=1`. Compare to bf16 reference,
+/// `update_and_sdpa` under a fused-QK policy. Compare to bf16 reference,
 /// assert dispatch counter delta > 0 and cosine close to 1.
 #[test]
 #[ignore = "GPU Metal context: cargo test -p rmlx-kv-quant --test fused_qk_dispatch -- --ignored --test-threads=1"]
 fn fused_qk_dispatch_routes_through_kernel_k8v4() {
     if skip_if_no_gpu() {
         return;
-    }
-    // SAFETY: process-global env var, single-threaded test enforced.
-    unsafe {
-        std::env::set_var("RMLX_FUSED_QK", "1");
-    }
-    unsafe {
-        std::env::set_var("RMLX_FUSED_QK_MIN", "8");
     }
 
     let device = Device::Gpu;
@@ -118,7 +122,8 @@ fn fused_qk_dispatch_routes_through_kernel_k8v4() {
     let prefill_seq: i32 = 64;
     let scale: f32 = 1.0 / (head_dim as f32).sqrt();
 
-    let mut cache = KvCache::with_quant_max_seq(KvQuant::K8V4, 4096);
+    let mut cache =
+        KvCache::with_quant_max_seq(KvQuant::K8V4, 4096).with_dispatch_policy(fused_qk_policy());
 
     cache.enter_prefill();
     let prefill_k_shape = [b, kv_h, prefill_seq, head_dim];
@@ -196,12 +201,6 @@ fn fused_qk_dispatch_routes_through_kernel_turbo_sym3() {
     if skip_if_no_gpu() {
         return;
     }
-    unsafe {
-        std::env::set_var("RMLX_FUSED_QK", "1");
-    }
-    unsafe {
-        std::env::set_var("RMLX_FUSED_QK_MIN", "8");
-    }
     run_parity_for_codec(KvQuant::TurboSym3, "TurboSym3", 0.95);
 }
 
@@ -211,12 +210,6 @@ fn fused_qk_dispatch_routes_through_kernel_turbo_sym3() {
 fn fused_qk_dispatch_routes_through_kernel_turbo_sym4() {
     if skip_if_no_gpu() {
         return;
-    }
-    unsafe {
-        std::env::set_var("RMLX_FUSED_QK", "1");
-    }
-    unsafe {
-        std::env::set_var("RMLX_FUSED_QK_MIN", "8");
     }
     run_parity_for_codec(KvQuant::TurboSym4, "TurboSym4", 0.99);
 }
@@ -231,7 +224,8 @@ fn run_parity_for_codec(codec: KvQuant, name: &str, cosine_floor: f32) {
     let prefill_seq: i32 = 64;
     let scale: f32 = 1.0 / (head_dim as f32).sqrt();
 
-    let mut cache = KvCache::with_quant_max_seq(codec, 4096);
+    let mut cache =
+        KvCache::with_quant_max_seq(codec, 4096).with_dispatch_policy(fused_qk_policy());
     cache.enter_prefill();
     let prefill_k_shape = [b, kv_h, prefill_seq, head_dim];
     let n_k: usize = prefill_k_shape.iter().map(|&d| d as usize).product();

@@ -9,6 +9,7 @@
 #![allow(unsafe_code)]
 #![allow(clippy::too_many_lines)]
 
+use rmlx_core::DispatchPolicy;
 use rmlx_mlx::{Array, Dtype};
 
 use crate::kvcache::fused_qk_shadow::FusedQkShadow;
@@ -132,6 +133,14 @@ pub struct KvCache {
     /// before any allocation, instead of paying the long-context working-set
     /// tax on every short request. Set via [`KvCache::with_max_seq_ceiling`].
     pub(super) max_seq_ceiling: Option<i32>,
+    /// Which optional kernel paths this cache dispatches through.
+    ///
+    /// Captured from the process default at construction (see
+    /// [`rmlx_core::dispatch_policy`]) and overridable per cache via
+    /// [`KvCache::with_dispatch_policy`]. Immutable afterwards, so changing
+    /// the process default never disturbs a cache that is already live — two
+    /// caches built under different policies run side by side in one process.
+    pub(super) policy: DispatchPolicy,
 }
 
 impl KvCache {
@@ -250,6 +259,7 @@ impl KvCache {
             // not needed. Callers that want to re-attach a ceiling after hydration
             // can chain `.with_max_seq_ceiling(n)` explicitly.
             max_seq_ceiling: None,
+            policy: rmlx_core::dispatch_policy(),
         }
     }
 
@@ -275,7 +285,24 @@ impl KvCache {
             flash_filled: 0,
             fused_qk_shadow: None,
             max_seq_ceiling: None,
+            policy: rmlx_core::dispatch_policy(),
         }
+    }
+
+    /// Select the optional kernel paths this cache dispatches through.
+    ///
+    /// Overrides the process default captured at construction. Two caches in
+    /// the same process can carry different policies, which is what lets an
+    /// interleaved A/B alternate kernel paths without reloading the model.
+    #[must_use]
+    pub fn with_dispatch_policy(mut self, policy: DispatchPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// The kernel-path policy this cache dispatches under.
+    pub fn dispatch_policy(&self) -> DispatchPolicy {
+        self.policy
     }
 
     /// Set the virtual ceiling on lazy prefill-ring growth (the resolved

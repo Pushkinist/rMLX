@@ -50,8 +50,9 @@
 //!
 //! # Activation
 //!
-//! Default-OFF. Enable via `RMLX_ROT_K_FUSED=1`. Fallback: `rot_k.rs`
-//! matmul path used unchanged on any unsupported `D` or when disabled.
+//! Default-OFF. Enable via `DispatchPolicy::rot_k_fused` (`--rot-k-fused on`,
+//! or `RMLX_ROT_K_FUSED=1`). Fallback: `rot_k.rs` matmul path used unchanged
+//! on any unsupported `D` or when disabled.
 //!
 //! Supported D values: powers of two in {32, 64, 128, 256, 512} -- common
 //! head_dim values. D=128 (Bonsai) is the primary target.
@@ -92,24 +93,6 @@ use std::sync::OnceLock;
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::metal_kernel::{MetalKernel, MetalKernelInvoke};
 use rmlx_mlx::{Array, Device, Dtype};
-
-// ---- Env-var gate -----------------------------------------------------------
-
-/// Returns `true` when the fused FWHT kernel is enabled by env var.
-///
-/// Default OFF. Enable via `RMLX_ROT_K_FUSED=1`.
-///
-/// When `false` (default), `mixed_quant.rs` uses the v1 matmul path (correct
-/// and coherent). The fused path is opt-in until perf numbers are confirmed
-/// stable across all rot_k model families.
-pub fn rot_k_fused_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("RMLX_ROT_K_FUSED")
-            .ok()
-            .is_some_and(|v| v == "1")
-    })
-}
 
 // ---- Supported head_dim values ----------------------------------------------
 

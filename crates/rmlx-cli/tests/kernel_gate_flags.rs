@@ -1,12 +1,12 @@
 //! The kernel-gate flags must resolve for **every** subcommand, not just `serve`.
 //!
-//! `--turbo-flash`, `--turbo-flash-lock` and `--planar-flash-decode` drive
-//! process-wide `OnceLock` gates in `rmlx-kv-quant`. When they were resolved
-//! inside `run_serve`, a measurement command (`bench`, `baseline`, `eval`) ran
-//! with the gates unresolved while `serve` on the same host resolved
-//! `--turbo-flash=auto` to ON — so the instrument benchmarked a different
-//! kernel set than production. These tests pin the flags to the top level
-//! (`global = true`, resolved in `main`) so that cannot drift back.
+//! `--turbo-flash`, `--turbo-flash-lock` and `--planar-flash-decode` fold into
+//! the process-default `DispatchPolicy` that every KV cache captures. When they
+//! were resolved inside `run_serve`, a measurement command (`bench`,
+//! `baseline`, `eval`) ran with the gates unresolved while `serve` on the same
+//! host resolved `--turbo-flash=auto` to ON — so the instrument benchmarked a
+//! different kernel set than production. These tests pin the flags to the top
+//! level (`global = true`, resolved in `main`) so that cannot drift back.
 //!
 //! `rmlx profile list` is the probe: it is a pure file-read admin command that
 //! short-circuits before any model load or Metal claim, yet it runs *after* the
@@ -44,10 +44,13 @@ fn run_with_env(args: &[&str], extra_env: &[(&str, &str)]) -> RunResult {
     let rmlx_home = tempfile::TempDir::new().expect("failed to create RMLX_HOME tempdir");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_rmlx"));
     cmd.env("RUST_LOG", "info")
-        // A stale shell value would latch the OnceLock and mask the flag.
+        // A stale shell value is the `auto` fallback and would mask the flag.
         .env_remove("RMLX_TURBO_FLASH")
         .env_remove("RMLX_TURBO_FLASH_LOCK")
         .env_remove("RMLX_PLANAR_FLASH_DECODE")
+        .env_remove("RMLX_FUSED_QK")
+        .env_remove("RMLX_SPARSE_ATTN")
+        .env_remove("RMLX_ROT_K_FUSED")
         .env("RMLX_HOME", rmlx_home.path())
         .args(args);
     for (k, v) in extra_env {
@@ -78,7 +81,7 @@ fn kernel_gates_resolve_for_non_serve_subcommand() {
         r.stderr
     );
     assert!(
-        r.stderr.contains("--planar-flash-decode resolved OFF"),
+        r.stderr.contains("--planar-flash-decode") && r.stderr.contains("resolved OFF"),
         "planar-flash-decode gate was not resolved for `profile list`; stderr: {}",
         r.stderr
     );
@@ -96,7 +99,7 @@ fn kernel_gates_resolve_without_any_flag() {
         r.stderr
     );
     assert!(
-        r.stderr.contains("--planar-flash-decode resolved"),
+        r.stderr.contains("--planar-flash-decode") && r.stderr.contains("kernel gate resolved"),
         "planar-flash-decode `auto` was not resolved for `profile list`; stderr: {}",
         r.stderr
     );
@@ -120,9 +123,13 @@ fn kernel_gate_flags_accepted_after_the_subcommand() {
 }
 
 /// `auto` honours a pre-existing `RMLX_TURBO_FLASH=1` for back-compat, which
-/// means the flag resolves OFF while the kernel actually runs. That combination
-/// is a known 2.0-4.25x decode loss, so it must be operator-visible rather than
-/// silent: the resolution logs at `warn!` and names the cost.
+/// means the flag resolves ON from the environment rather than the flag. That
+/// is a known 2.0-4.25x decode loss, so it must be operator-visible rather
+/// than silent: the resolution logs at `warn!` and names the cost.
+///
+/// This is also the end-to-end proof that `DispatchPolicy::from_env` reads the
+/// variable: the subprocess owns its environment, so nothing else can produce
+/// the ON resolution.
 #[test]
 fn turbo_flash_auto_warns_when_the_env_opt_in_is_set() {
     let r = run_with_env(&["profile", "list"], &[("RMLX_TURBO_FLASH", "1")]);
@@ -133,28 +140,22 @@ fn turbo_flash_auto_warns_when_the_env_opt_in_is_set() {
          still ON; stderr: {}",
         r.stderr
     );
-    // The plain "env untouched" info line is the *other* branch: it must not be
-    // what an opted-in operator sees. Match the flag name too — the sibling
-    // gates emit the same suffix on their own quiet branches.
     assert!(
-        !r.stderr
-            .contains("--turbo-flash resolved OFF; env untouched"),
-        "the quiet OFF line must not fire when RMLX_TURBO_FLASH=1 is set; \
-         stderr: {}",
+        r.stderr.contains("--turbo-flash resolved ON"),
+        "the env opt-in must resolve the gate ON under `auto`; stderr: {}",
         r.stderr
     );
 }
 
-/// With the env var absent, `auto` takes the quiet branch — no warn, no claim
-/// that anything is still on.
+/// With the env var absent, `auto` resolves OFF and says nothing about a
+/// kernel still being on.
 #[test]
 fn turbo_flash_auto_is_quiet_without_the_env_opt_in() {
     let r = run(&["profile", "list"]);
     assert_eq!(r.exit_code, 0, "expected exit 0; stderr was: {}", r.stderr);
     assert!(
-        r.stderr
-            .contains("--turbo-flash resolved OFF; env untouched"),
-        "auto with no env opt-in must log the quiet OFF line; stderr: {}",
+        r.stderr.contains("--turbo-flash resolved OFF"),
+        "auto with no env opt-in must resolve OFF; stderr: {}",
         r.stderr
     );
     assert!(
@@ -164,7 +165,7 @@ fn turbo_flash_auto_is_quiet_without_the_env_opt_in() {
     );
 }
 
-/// `--turbo-flash-lock` is a global toggle too, and only sets its env var when
+/// `--turbo-flash-lock` is a global toggle too, and only resolves on when
 /// passed.
 #[test]
 fn turbo_flash_lock_is_global_and_opt_in() {
@@ -180,5 +181,32 @@ fn turbo_flash_lock_is_global_and_opt_in() {
         on.stderr.contains("--turbo-flash-lock flag set"),
         "lock flag was not honoured on a non-serve subcommand; stderr: {}",
         on.stderr
+    );
+}
+
+/// The `--rot-k-fused` gate resolves for every subcommand too, and its `auto`
+/// arm reads `RMLX_ROT_K_FUSED` — the variable that had no flag before.
+#[test]
+fn rot_k_fused_gate_resolves_and_honours_its_env_opt_in() {
+    let off = run(&["profile", "list"]);
+    assert!(
+        off.stderr.contains("--rot-k-fused") && off.stderr.contains("resolved OFF"),
+        "rot-k-fused gate was not resolved for `profile list`; stderr: {}",
+        off.stderr
+    );
+    let on = run_with_env(&["profile", "list"], &[("RMLX_ROT_K_FUSED", "1")]);
+    assert!(
+        on.stderr.contains("--rot-k-fused") && on.stderr.contains("resolved ON"),
+        "RMLX_ROT_K_FUSED=1 must resolve the gate ON under `auto`; stderr: {}",
+        on.stderr
+    );
+    let forced_off = run_with_env(
+        &["--rot-k-fused", "off", "profile", "list"],
+        &[("RMLX_ROT_K_FUSED", "1")],
+    );
+    assert!(
+        forced_off.stderr.contains("--rot-k-fused") && forced_off.stderr.contains("resolved OFF"),
+        "`--rot-k-fused off` must override the env opt-in; stderr: {}",
+        forced_off.stderr
     );
 }

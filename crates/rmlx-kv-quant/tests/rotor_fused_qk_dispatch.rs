@@ -18,11 +18,10 @@
 // case asserts the expected family fired AND that the other two did not, so
 // both directions are caught.
 //
-// Every test here sets `RMLX_FUSED_QK=1`, because `fused_qk_enabled()` latches
-// a process-global `OnceLock` on first read: one binary cannot observe both
-// gate states. The gate-off behaviour (asym codecs reach no rotor kernel and
-// serve from the warm bf16 mirror) is the shipped default and is documented in
-// `docs/KV_QUANT.md`, not asserted here.
+// Every test here builds its caches under a fused-QK policy. The gate-off
+// behaviour (asym codecs reach no rotor kernel and serve from the warm bf16
+// mirror) is the shipped default and is documented in `docs/KV_QUANT.md`, not
+// asserted here.
 //
 // `#[ignore]`-gated because they need the GPU; run via:
 //   cargo test -p rmlx-kv-quant --test rotor_fused_qk_dispatch -- \
@@ -43,6 +42,7 @@
 )]
 //! Rotor decode routing-contract integration test.
 
+use rmlx_core::DispatchPolicy;
 use rmlx_kv_quant::rotor_flash_decode_msl::rotor_flash_decode_dispatch_count;
 use rmlx_kv_quant::rotor_flash_decode_symv_msl::rotor_symv_flash_decode_dispatch_count;
 use rmlx_kv_quant::rotor_fused_qk_msl::rotor_fused_qk_dispatch_count;
@@ -122,7 +122,8 @@ fn assert_routes_to(codec: KvQuant, name: &str, expect: Kernel) -> Vec<f32> {
     let prefill_seq: i32 = 64;
     let scale: f32 = 1.0 / (head_dim as f32).sqrt();
 
-    let mut cache = KvCache::with_quant_max_seq(codec, 4096);
+    let mut cache =
+        KvCache::with_quant_max_seq(codec, 4096).with_dispatch_policy(fused_qk_policy());
     cache.enter_prefill();
     let prefill_k_shape = [b, kv_h, prefill_seq, head_dim];
     let n_k: usize = prefill_k_shape.iter().map(|&d| d as usize).product();
@@ -211,18 +212,22 @@ fn assert_kernel(name: &str, kernel: &str, delta: u64, wanted: bool) {
     }
 }
 
-fn set_fused_qk_on() {
-    // SAFETY: process-global env var, single-threaded test enforced.
-    unsafe {
-        std::env::set_var("RMLX_FUSED_QK", "1");
+/// Fused-QK on, threshold low enough for the short synthetic caches here.
+fn fused_qk_policy() -> DispatchPolicy {
+    DispatchPolicy {
+        fused_qk: true,
+        fused_qk_min_kv_seq: 8,
+        ..DispatchPolicy::default()
     }
-    unsafe {
-        std::env::set_var("RMLX_FUSED_QK_MIN", "8");
-    }
+}
+
+fn set_rotor_qjl_off() {
     // Ensure rotor QJL is OFF — the fused-QK kernel does not consume the QJL
     // residual, and a QJL-carrying store also keeps the flash arms out. QJL is
     // off by default, but set `0` explicitly so a stray `RMLX_ROTOR_QJL=1` in
     // the environment cannot move every codec onto the legacy path.
+    //
+    // SAFETY: process-global env var, single-threaded test enforced.
     unsafe {
         std::env::set_var("RMLX_ROTOR_QJL", "0");
     }
@@ -234,7 +239,7 @@ fn rotor3_sym_routes_to_flash_decode_symv() {
     if skip_if_no_gpu() {
         return;
     }
-    set_fused_qk_on();
+    set_rotor_qjl_off();
     assert_routes_to(KvQuant::Rotor3Sym, "Rotor3Sym", Kernel::FlashSymV);
 }
 
@@ -244,7 +249,7 @@ fn rotor4_sym_routes_to_flash_decode_symv() {
     if skip_if_no_gpu() {
         return;
     }
-    set_fused_qk_on();
+    set_rotor_qjl_off();
     assert_routes_to(KvQuant::Rotor4Sym, "Rotor4Sym", Kernel::FlashSymV);
 }
 
@@ -254,7 +259,7 @@ fn rotor_k_only_3_routes_to_flash_decode() {
     if skip_if_no_gpu() {
         return;
     }
-    set_fused_qk_on();
+    set_rotor_qjl_off();
     assert_routes_to(KvQuant::RotorKOnly3, "RotorKOnly3", Kernel::FlashKOnly);
 }
 
@@ -264,7 +269,7 @@ fn rotor_k_only_4_routes_to_flash_decode() {
     if skip_if_no_gpu() {
         return;
     }
-    set_fused_qk_on();
+    set_rotor_qjl_off();
     assert_routes_to(KvQuant::RotorKOnly4, "RotorKOnly4", Kernel::FlashKOnly);
 }
 
@@ -274,7 +279,7 @@ fn rotor_k_asym_3_routes_to_fused_qk() {
     if skip_if_no_gpu() {
         return;
     }
-    set_fused_qk_on();
+    set_rotor_qjl_off();
     assert_routes_to(
         KvQuant::RotorK3Asym {
             v_bits: 4,
@@ -291,7 +296,7 @@ fn rotor_k_asym_4_routes_to_fused_qk() {
     if skip_if_no_gpu() {
         return;
     }
-    set_fused_qk_on();
+    set_rotor_qjl_off();
     assert_routes_to(
         KvQuant::RotorK4Asym {
             v_bits: 4,
@@ -320,20 +325,10 @@ fn rotor_qjl_on_falls_back_to_legacy_sdpa() {
     if skip_if_no_gpu() {
         return;
     }
-    // SAFETY: process-global env var, single-threaded test enforced.
-    unsafe {
-        std::env::set_var("RMLX_FUSED_QK", "1");
-    }
-    unsafe {
-        std::env::set_var("RMLX_FUSED_QK_MIN", "8");
-    }
-
     // Reference arm: QJL off, same codec and same inputs. `rotor_qjl_enabled()`
     // re-reads the env on every call (no `OnceLock`), and the store latches the
     // flag at its first append, so the two caches below are independent.
-    unsafe {
-        std::env::set_var("RMLX_ROTOR_QJL", "0");
-    }
+    set_rotor_qjl_off();
     let qjl_off = assert_routes_to(
         KvQuant::Rotor3Sym,
         "Rotor3Sym, QJL off (reference arm)",

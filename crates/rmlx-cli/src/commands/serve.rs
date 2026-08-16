@@ -12,8 +12,9 @@
 //! # Public API
 //!
 //! - [`run_serve`] — main entry point called from the CLI dispatch table.
-//! - [`apply_turbo_flags`] — bridge TurboFlash CLI booleans into the
-//!   `OnceLock`-backed global used by the decode kernel.
+//! - [`resolve_dispatch_policy`] — fold the kernel-gate flags and their
+//!   environment fallbacks into the [`DispatchPolicy`] every KV cache
+//!   captures at construction.
 //!
 //! # See also
 //!
@@ -32,6 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rmlx_core::runinfo::make_run_id;
+use rmlx_core::DispatchPolicy;
 use rmlx_loader::{discover_kv_calibration, load_config, load_head_budgets};
 use rmlx_metrics::events::EventRecorder;
 use rmlx_mlx::Device;
@@ -116,38 +118,33 @@ impl std::fmt::Display for TurboFlashMode {
     }
 }
 
-/// Bridge the CLI `--turbo-flash` / `--turbo-flash-lock` flags into the
-/// process environment so that the existing `OnceLock`-cached consumers in
-/// `turbo_flash_msl.rs` pick them up on first read.
+/// Resolve the CLI `--turbo-flash` / `--turbo-flash-lock` flags into the two
+/// [`DispatchPolicy`] fields the decode kernel reads.
 ///
 /// Semantics:
-/// - [`TurboFlashMode::On`] → force-set `RMLX_TURBO_FLASH=1`.
-/// - [`TurboFlashMode::Off`] → **hard override**: remove `RMLX_TURBO_FLASH`
-///   from the environment so a stale `RMLX_TURBO_FLASH=1` in the shell
-///   cannot latch the `OnceLock` to true after we've explicitly asked for
-///   OFF. Previously this arm was a no-op, which meant `--turbo-flash off`
-///   was silently a no-op whenever the shell had `RMLX_TURBO_FLASH=1` set.
+/// - [`TurboFlashMode::On`] → on.
+/// - [`TurboFlashMode::Off`] → off. A hard override: an
+///   `RMLX_TURBO_FLASH=1` exported in the shell does not survive an explicit
+///   `off`.
 /// - [`TurboFlashMode::Auto`] → resolves OFF on every host (see
-///   [`TurboFlashMode`] for the measurements). The Apple family is still probed
-///   and logged so an operator can see which host the HOLD applied to. `Auto`
-///   is the only mode that honours a pre-existing `RMLX_TURBO_FLASH=1` env
-///   (back-compat path) — it does not remove the var, so a shell that opts in
-///   still gets the kernel. That case logs at `warn!`, because the flag then
-///   reads OFF while the kernel is in fact ON and costing 2.0–4.25× decode.
+///   [`TurboFlashMode`] for the measurements). The Apple family is still
+///   probed and logged so an operator can see which host the HOLD applied to.
+///   `Auto` is the only mode that honours a pre-existing `RMLX_TURBO_FLASH=1`
+///   (back-compat path), so a shell that opts in still gets the kernel. That
+///   case logs at `warn!`, because the flag then reads OFF while the kernel is
+///   in fact ON and costing 2.0-4.25x decode.
 ///
-/// `turbo_flash_lock` is unchanged: `true` → force-set, `false` → leave env
-/// untouched.
+/// `turbo_flash_lock` is unchanged: the flag forces lock-on, and without it a
+/// pre-existing `RMLX_TURBO_FLASH_LOCK=1` is still honoured.
 ///
-/// Called from `main` before subcommand dispatch, so the `OnceLock` is not yet
-/// initialised and every command — server and measurement alike — sees the same
-/// resolution.
-pub(crate) fn apply_turbo_flags(turbo_flash: TurboFlashMode, turbo_flash_lock: bool) {
-    // Explicit Off is a hard override — remove the env var so a stale
-    // RMLX_TURBO_FLASH=1 in the shell cannot latch the OnceLock to true.
-    // SAFETY: same invariant as the `set_var` below.
-    if turbo_flash == TurboFlashMode::Off {
-        std::env::remove_var("RMLX_TURBO_FLASH");
-    }
+/// `env` carries the environment-derived fallbacks — pass the
+/// [`DispatchPolicy::from_env`] value so the `auto` arms see the same
+/// environment the thresholds were read from.
+fn resolve_turbo_flash(
+    turbo_flash: TurboFlashMode,
+    turbo_flash_lock: bool,
+    env: &DispatchPolicy,
+) -> (bool, bool) {
     let resolved_on = match turbo_flash {
         TurboFlashMode::On => true,
         TurboFlashMode::Off => false,
@@ -174,49 +171,38 @@ pub(crate) fn apply_turbo_flags(turbo_flash: TurboFlashMode, turbo_flash_lock: b
                      resolved OFF (conservative). Use --turbo-flash on to override."
                 );
             }
-            false
+            env.turbo_flash
         }
     };
     if resolved_on {
-        // SAFETY: `set_var` mutates process-global state. This runs from
-        // `main`, before subcommand dispatch and before the tokio runtime is
-        // built. The one thread already alive is the tracing-appender writer
-        // spawned by `init_tracing`, and it never reads the environment, so no
-        // concurrent `getenv` can race this `setenv`.
-        std::env::set_var("RMLX_TURBO_FLASH", "1");
-        tracing::info!(
-            mode = %turbo_flash,
-            "--turbo-flash resolved ON; RMLX_TURBO_FLASH=1 applied"
-        );
-    } else if turbo_flash == TurboFlashMode::Off {
+        tracing::info!(mode = %turbo_flash, "--turbo-flash resolved ON");
+    } else if turbo_flash == TurboFlashMode::Off && env.turbo_flash {
         tracing::info!(
             mode = %turbo_flash,
             "--turbo-flash resolved OFF (hard override); \
-             RMLX_TURBO_FLASH removed from env"
+             RMLX_TURBO_FLASH=1 in the environment ignored"
         );
-    } else if std::env::var("RMLX_TURBO_FLASH").as_deref() == Ok("1") {
+    } else {
+        tracing::info!(mode = %turbo_flash, "--turbo-flash resolved OFF");
+    }
+    if turbo_flash == TurboFlashMode::Auto && env.turbo_flash {
         // Auto does not clear an operator's opt-in, so the effective state
-        // here is ON even though the flag resolved OFF. Say so at warn level:
-        // a variable exported once in a shell, a CI job or a profile would
-        // otherwise carry a known decode regression silently, and the flag
-        // would read OFF while the kernel ran.
+        // here is ON even though the flag reads OFF. Say so at warn level: a
+        // variable exported once in a shell, a CI job or a profile would
+        // otherwise carry a known decode regression silently.
         tracing::warn!(
             mode = %turbo_flash,
-            "--turbo-flash resolved OFF but RMLX_TURBO_FLASH=1 is set in the \
+            "--turbo-flash is auto and RMLX_TURBO_FLASH=1 is set in the \
              environment — the kernel stays ON (auto honours an explicit \
              opt-in). That is a 2.0-4.25x decode loss on K8V4 at kv_seq > 4096. \
              Unset the variable or pass --turbo-flash off."
         );
-    } else {
-        tracing::info!(
-            mode = %turbo_flash,
-            "--turbo-flash resolved OFF; env untouched"
-        );
     }
+    let lock_on = turbo_flash_lock || env.turbo_flash_lock;
     if turbo_flash_lock {
-        std::env::set_var("RMLX_TURBO_FLASH_LOCK", "1");
-        tracing::info!("--turbo-flash-lock flag set; RMLX_TURBO_FLASH_LOCK=1 applied");
+        tracing::info!("--turbo-flash-lock flag set");
     }
+    (resolved_on, lock_on)
 }
 
 /// `--planar-flash-decode` tri-state. Default `Auto` resolves **OFF** on every
@@ -251,16 +237,13 @@ impl std::fmt::Display for PlanarFlashDecodeMode {
     }
 }
 
-/// Bridge the CLI `--planar-flash-decode` flag into the process environment
-/// so that `OnceLock`-cached consumers in
-/// `rmlx_kv_quant::planar_flash_decode_msl::planar_flash_decode_enabled`
-/// pick the resolved value up on first read.
+/// Resolve the CLI `--planar-flash-decode` flag into
+/// [`DispatchPolicy::planar_flash_decode`].
 ///
-/// Semantics (mirrors [`apply_turbo_flags`]):
-/// - [`PlanarFlashDecodeMode::On`] → force-set `RMLX_PLANAR_FLASH_DECODE=1`.
-/// - [`PlanarFlashDecodeMode::Off`] → **hard override**: remove
-///   `RMLX_PLANAR_FLASH_DECODE` so a stale `=1` in the shell cannot latch
-///   the `OnceLock` to true.
+/// Semantics (mirrors [`resolve_turbo_flash`]):
+/// - [`PlanarFlashDecodeMode::On`] → on.
+/// - [`PlanarFlashDecodeMode::Off`] → off; a hard override, an exported
+///   `RMLX_PLANAR_FLASH_DECODE=1` does not survive it.
 /// - [`PlanarFlashDecodeMode::Auto`] → currently resolves to OFF on every
 ///   host. The warm-TTFT bf16-K shortcut (see
 ///   `docs/reports/planar-chunked-prefill-fix.md`) unblocked the NIAH
@@ -287,15 +270,7 @@ impl std::fmt::Display for PlanarFlashDecodeMode {
 ///   in 2, so a one-cell check will confirm byte-identity about a third of the
 ///   time. See `docs/KV_QUANT.md` § "Numerical relationship to the split
 ///   chain" for the cell-by-cell table.
-///
-/// Must be called before any inference (i.e. before the server starts
-/// accepting requests), ensuring the `OnceLock` is not yet initialised.
-pub(crate) fn apply_planar_flash_decode_flags(mode: PlanarFlashDecodeMode) {
-    // Hard override on Off — remove the env var so a stale shell value
-    // cannot latch the OnceLock.
-    if mode == PlanarFlashDecodeMode::Off {
-        std::env::remove_var("RMLX_PLANAR_FLASH_DECODE");
-    }
+fn resolve_planar_flash_decode(mode: PlanarFlashDecodeMode, env: &DispatchPolicy) -> bool {
     let resolved_on = match mode {
         PlanarFlashDecodeMode::On => true,
         PlanarFlashDecodeMode::Off => false,
@@ -324,33 +299,15 @@ pub(crate) fn apply_planar_flash_decode_flags(mode: PlanarFlashDecodeMode) {
                     );
                 }
             }
-            false
+            env.planar_flash_decode
         }
     };
-    if resolved_on {
-        // SAFETY: called from `main` before subcommand dispatch and before the
-        // tokio runtime is built. The one thread already alive is the
-        // tracing-appender writer spawned by `init_tracing`, and it never reads
-        // the environment, so no concurrent `getenv` can race this `setenv`.
-        std::env::set_var("RMLX_PLANAR_FLASH_DECODE", "1");
-        tracing::info!(
-            mode = %mode,
-            "--planar-flash-decode resolved ON; RMLX_PLANAR_FLASH_DECODE=1 applied"
-        );
-    } else if mode == PlanarFlashDecodeMode::Off {
-        tracing::info!(
-            mode = %mode,
-            "--planar-flash-decode resolved OFF (hard override); \
-             RMLX_PLANAR_FLASH_DECODE removed from env"
-        );
-    } else {
-        tracing::info!(
-            mode = %mode,
-            "--planar-flash-decode resolved OFF; env untouched \
-             (pre-existing RMLX_PLANAR_FLASH_DECODE=1 still honoured for \
-             Auto back-compat)"
-        );
-    }
+    log_gate(
+        "--planar-flash-decode",
+        mode.to_string().as_str(),
+        resolved_on,
+    );
+    resolved_on
 }
 
 /// `--fused-qk` tri-state. Default `Auto` resolves OFF on every host
@@ -387,32 +344,21 @@ impl std::fmt::Display for FusedQkMode {
     }
 }
 
-/// Bridge the CLI `--fused-qk` flag into the process environment so that
-/// `OnceLock`-cached consumers in `rmlx_kv_quant::fused_qk_enabled`
-/// pick the resolved value up on first read.
+/// Resolve the CLI `--fused-qk` flag into [`DispatchPolicy::fused_qk`].
 ///
-/// Semantics (mirrors [`apply_planar_flash_decode_flags`]):
-/// - [`FusedQkMode::On`] → force-set `RMLX_FUSED_QK=1`.
-/// - [`FusedQkMode::Off`] → **hard override**: remove `RMLX_FUSED_QK` so a
-///   stale `=1` in the shell cannot latch the `OnceLock` to true.
+/// Semantics (mirrors [`resolve_planar_flash_decode`]):
+/// - [`FusedQkMode::On`] → on.
+/// - [`FusedQkMode::Off`] → off; a hard override, an exported
+///   `RMLX_FUSED_QK=1` does not survive it.
 /// - [`FusedQkMode::Auto`] → currently resolves to OFF on every host.
-///   Auto stays OFF until Executors B-F land and NIAH gates pass.
 ///   Pre-existing `RMLX_FUSED_QK=1` in the shell is honoured for back-compat.
-///
-/// Must be called before any inference (i.e. before the server starts
-/// accepting requests), ensuring the `OnceLock` is not yet initialised.
-pub(crate) fn apply_fused_qk_flags(mode: FusedQkMode) {
-    // Hard override on Off — remove the env var so a stale shell value
-    // cannot latch the OnceLock.
-    if mode == FusedQkMode::Off {
-        std::env::remove_var("RMLX_FUSED_QK");
-    }
+fn resolve_fused_qk(mode: FusedQkMode, env: &DispatchPolicy) -> bool {
     let resolved_on = match mode {
         FusedQkMode::On => true,
         FusedQkMode::Off => false,
         FusedQkMode::Auto => {
-            // HOLD — kernel stubs not yet dispatching. Auto stays OFF on
-            // every host until each codec passes its NIAH gate.
+            // HOLD — Auto stays OFF on every host until each codec passes its
+            // NIAH gate.
             match rmlx_core::apple_gpu::apple_silicon_generation() {
                 Some(family) => {
                     tracing::info!(
@@ -428,31 +374,11 @@ pub(crate) fn apply_fused_qk_flags(mode: FusedQkMode) {
                     );
                 }
             }
-            false
+            env.fused_qk
         }
     };
-    if resolved_on {
-        // SAFETY: called from `main` before subcommand dispatch and before the
-        // tokio runtime is built. The one thread already alive is the
-        // tracing-appender writer spawned by `init_tracing`, and it never reads
-        // the environment, so no concurrent `getenv` can race this `setenv`.
-        std::env::set_var("RMLX_FUSED_QK", "1");
-        tracing::info!(
-            mode = %mode,
-            "--fused-qk resolved ON; RMLX_FUSED_QK=1 applied"
-        );
-    } else if mode == FusedQkMode::Off {
-        tracing::info!(
-            mode = %mode,
-            "--fused-qk resolved OFF (hard override); RMLX_FUSED_QK removed from env"
-        );
-    } else {
-        tracing::info!(
-            mode = %mode,
-            "--fused-qk resolved OFF; env untouched \
-             (pre-existing RMLX_FUSED_QK=1 still honoured for Auto back-compat)"
-        );
-    }
+    log_gate("--fused-qk", mode.to_string().as_str(), resolved_on);
+    resolved_on
 }
 
 /// `--sparse-attn` tri-state. Default `Auto` resolves OFF on every host.
@@ -505,38 +431,26 @@ impl std::fmt::Display for SparseAttnMode {
     }
 }
 
-/// Bridge the CLI `--sparse-attn` flag into the process environment so that
-/// `OnceLock`-cached consumers in `rmlx_kv_quant::sparse_attn_enabled`
-/// pick the resolved value up on first read.
+/// Resolve the CLI `--sparse-attn` flag into [`DispatchPolicy::sparse_attn`].
 ///
-/// Semantics (mirrors [`apply_fused_qk_flags`]):
-/// - [`SparseAttnMode::On`] → force-set `RMLX_SPARSE_ATTN=1`.
-/// - [`SparseAttnMode::Off`] → **hard override**: remove `RMLX_SPARSE_ATTN`
-///   so a stale `=1` in the shell cannot latch the `OnceLock` to true.
+/// Semantics (mirrors [`resolve_fused_qk`]):
+/// - [`SparseAttnMode::On`] → on.
+/// - [`SparseAttnMode::Off`] → off; a hard override, an exported
+///   `RMLX_SPARSE_ATTN=1` does not survive it.
 /// - [`SparseAttnMode::Auto`] → currently resolves to OFF on every host.
-///   Auto stays OFF until Exec B/C land and the NIAH gate passes.
 ///   Pre-existing `RMLX_SPARSE_ATTN=1` in the shell is honoured for
 ///   back-compat.
-///
-/// Must be called before any inference (i.e. before the server starts
-/// accepting requests), ensuring the `OnceLock` is not yet initialised.
-pub(crate) fn apply_sparse_attn_flags(mode: SparseAttnMode) {
-    // Hard override on Off — remove the env var so a stale shell value
-    // cannot latch the OnceLock.
-    if mode == SparseAttnMode::Off {
-        std::env::remove_var("RMLX_SPARSE_ATTN");
-    }
+fn resolve_sparse_attn(mode: SparseAttnMode, env: &DispatchPolicy) -> bool {
     let resolved_on = match mode {
         SparseAttnMode::On => true,
         SparseAttnMode::Off => false,
         SparseAttnMode::Auto => {
-            // Sparse-attn is warm-TTFT dormant by design (Path C). The
-            // production decode path shortcuts through the bf16-K seed, so
-            // the two-phase kernels stay reserved for seedless workloads
-            // (PPL eval, future prompt-cache hits). Auto resolves OFF on
-            // every host — same posture as PlanarFlashDecodeMode::Auto.
-            // The On override still routes through `sparse_attn_enabled()`
-            // for callers that exercise the kernels directly (the
+            // Sparse-attn is warm-TTFT dormant by design. The production
+            // decode path shortcuts through the bf16-K seed, so the two-phase
+            // kernels stay reserved for seedless workloads (PPL eval, future
+            // prompt-cache hits). Auto resolves OFF on every host — same
+            // posture as PlanarFlashDecodeMode::Auto. The On override still
+            // reaches callers that exercise the kernels directly (the
             // calibration runner, seedless integration tests).
             match rmlx_core::apple_gpu::apple_silicon_generation() {
                 Some(family) => {
@@ -554,30 +468,95 @@ pub(crate) fn apply_sparse_attn_flags(mode: SparseAttnMode) {
                     );
                 }
             }
-            false
+            env.sparse_attn
         }
     };
+    log_gate("--sparse-attn", mode.to_string().as_str(), resolved_on);
+    resolved_on
+}
+
+/// `--rot-k-fused` tri-state. Default `Auto` resolves OFF on every host.
+///
+/// Selects the fused FWHT + affine-quantize Metal kernel over the
+/// rotate-by-matmul then `mx.quantize` pair on the rot_k codec families.
+/// Affects only caches whose codec rotates K (`RotK`, `RotKTq4V`); every
+/// other codec ignores it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub(crate) enum RotKFusedMode {
+    /// Force the fused FWHT kernel on.
+    On,
+    /// Force the fused FWHT kernel off; a hard override that also ignores
+    /// `RMLX_ROT_K_FUSED=1`.
+    Off,
+    /// Resolves OFF on every host — the matmul path is the validated one.
+    /// A pre-existing `RMLX_ROT_K_FUSED=1` is honoured for back-compat.
+    #[default]
+    Auto,
+}
+
+impl std::fmt::Display for RotKFusedMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RotKFusedMode::On => f.write_str("on"),
+            RotKFusedMode::Off => f.write_str("off"),
+            RotKFusedMode::Auto => f.write_str("auto"),
+        }
+    }
+}
+
+/// Resolve the CLI `--rot-k-fused` flag into [`DispatchPolicy::rot_k_fused`].
+fn resolve_rot_k_fused(mode: RotKFusedMode, env: &DispatchPolicy) -> bool {
+    let resolved_on = match mode {
+        RotKFusedMode::On => true,
+        RotKFusedMode::Off => false,
+        RotKFusedMode::Auto => env.rot_k_fused,
+    };
+    log_gate("--rot-k-fused", mode.to_string().as_str(), resolved_on);
+    resolved_on
+}
+
+/// One resolution line per kernel gate, so a run's log answers "which kernel
+/// paths was this?" without re-deriving the flag and environment.
+fn log_gate(flag: &str, mode: &str, resolved_on: bool) {
     if resolved_on {
-        // SAFETY: called from `main` before subcommand dispatch and before the
-        // tokio runtime is built. The one thread already alive is the
-        // tracing-appender writer spawned by `init_tracing`, and it never reads
-        // the environment, so no concurrent `getenv` can race this `setenv`.
-        std::env::set_var("RMLX_SPARSE_ATTN", "1");
-        tracing::info!(
-            mode = %mode,
-            "--sparse-attn resolved ON; RMLX_SPARSE_ATTN=1 applied"
-        );
-    } else if mode == SparseAttnMode::Off {
-        tracing::info!(
-            mode = %mode,
-            "--sparse-attn resolved OFF (hard override); RMLX_SPARSE_ATTN removed from env"
-        );
+        tracing::info!(flag, mode, "kernel gate resolved ON");
     } else {
-        tracing::info!(
-            mode = %mode,
-            "--sparse-attn resolved OFF; env untouched \
-             (pre-existing RMLX_SPARSE_ATTN=1 still honoured for Auto back-compat)"
-        );
+        tracing::info!(flag, mode, "kernel gate resolved OFF");
+    }
+}
+
+/// Fold the kernel-gate flags and the environment fallbacks in `env` into the
+/// [`DispatchPolicy`] every KV cache captures at construction.
+///
+/// The thresholds (`RMLX_FUSED_QK_MIN`, `RMLX_TURBO_FLASH_MIN`) have no flag
+/// and pass through from `env` unchanged; the six booleans are overridden by
+/// their flags, with `auto` deferring to the same `env` value. `main` calls
+/// this once with [`DispatchPolicy::from_env`], before any cache is built —
+/// taking `env` as an argument keeps the precedence matrix testable without
+/// mutating the process environment.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "DispatchPolicy is Copy; passing by value keeps the call site free of borrows"
+)]
+pub(crate) fn resolve_dispatch_policy(
+    fused_qk: FusedQkMode,
+    sparse_attn: SparseAttnMode,
+    turbo_flash: TurboFlashMode,
+    turbo_flash_lock: bool,
+    planar_flash_decode: PlanarFlashDecodeMode,
+    rot_k_fused: RotKFusedMode,
+    env: DispatchPolicy,
+) -> DispatchPolicy {
+    let (turbo_flash_on, turbo_flash_lock_on) =
+        resolve_turbo_flash(turbo_flash, turbo_flash_lock, &env);
+    DispatchPolicy {
+        fused_qk: resolve_fused_qk(fused_qk, &env),
+        sparse_attn: resolve_sparse_attn(sparse_attn, &env),
+        turbo_flash: turbo_flash_on,
+        turbo_flash_lock: turbo_flash_lock_on,
+        planar_flash_decode: resolve_planar_flash_decode(planar_flash_decode, &env),
+        rot_k_fused: resolve_rot_k_fused(rot_k_fused, &env),
+        ..env
     }
 }
 

@@ -62,28 +62,6 @@ use rmlx_core::error::{Error, Result};
 use rmlx_mlx::metal_kernel::{MetalKernel, MetalKernelInvoke};
 use rmlx_mlx::{Array, Device, Dtype};
 
-// ── Env-var gate (mirrors `turbo_flash_msl::turbo_flash_enabled`) ─────────────
-
-/// Returns true when the planar_flash_decode kernel is enabled via env.
-///
-/// Default OFF until the NIAH gate (Bonsai + Qwen3.6 with `--kv-quant planar_k`)
-/// has been run in the phase 4-5 follow-up executor.  The CLI flag
-/// `--planar-flash-decode {on|off|auto}` in `rmlx-cli::commands::serve` is the
-/// production switch; this env-var path mirrors the `RMLX_TURBO_FLASH` /
-/// `OnceLock` pattern so unit tests and benches can opt in without going
-/// through the CLI.
-///
-/// Precedence: env-var `RMLX_PLANAR_FLASH_DECODE=1` ⇒ ON; otherwise OFF.
-pub fn planar_flash_decode_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("RMLX_PLANAR_FLASH_DECODE").as_deref(),
-            Ok("1")
-        )
-    })
-}
-
 // ── Dispatch counter (mirrors `TURBO_FLASH_DISPATCHES`) ───────────────────────
 
 /// Incremented exactly once per `planar_flash_decode_sdpa` invocation that

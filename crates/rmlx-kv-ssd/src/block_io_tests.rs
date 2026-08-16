@@ -5,6 +5,7 @@
 use std::sync::Mutex;
 
 use super::*;
+use rmlx_core::DispatchPolicy;
 use rmlx_mlx::Device;
 
 const MODEL_ID: &str = "Qwen3ForCausalLM/test-snapshot";
@@ -143,7 +144,9 @@ fn build_storage(
             );
             let k = arr(&k_data, shape);
             let v = arr(&v_data, shape);
-            state.bulk_init_from_fp16(&k, &v, device).unwrap();
+            state
+                .bulk_init_from_fp16(&k, &v, device, DispatchPolicy::default())
+                .unwrap();
             KvStorage::Mixed {
                 state,
                 max_seq: 4096,
@@ -155,8 +158,9 @@ fn build_storage(
             use rmlx_kv_quant::turboquant::turbo_quantize_v;
             let mut k_state = MixedKvState::new_k_only_rotated();
             let k_arr = arr(&k_data, shape);
-            let (k_codes, k_scales, k_biases) =
-                k_state.bulk_init_k_from_fp16(&k_arr, device).unwrap();
+            let (k_codes, k_scales, k_biases) = k_state
+                .bulk_init_k_from_fp16(&k_arr, device, DispatchPolicy::default())
+                .unwrap();
             k_state.keys = Some(MixedTuple {
                 codes: k_codes,
                 scales: k_scales,

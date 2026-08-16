@@ -16,11 +16,11 @@
 //! `docs/KV_QUANT.md` § "Fused-QK head-major K storage".
 
 use rmlx_core::error::Result;
+use rmlx_core::DispatchPolicy;
 use rmlx_kv_quant::sparse_attn::phase1_score_msl::{phase1_score, TOP_PER_TILE};
 use rmlx_kv_quant::sparse_attn::phase2_sparse_attend_msl::{
     phase2_lse_merge, phase2_sparse_attend,
 };
-use rmlx_kv_quant::sparse_attn_enabled;
 use rmlx_loader::HeadBudgets;
 use rmlx_mlx::{Array, Device, Dtype};
 
@@ -65,7 +65,7 @@ pub struct SparseAttnInputs<'a> {
 /// Phase 1 + CPU threshold + Phase 2 + LSE merge.
 ///
 /// Inner dispatcher; [`sparse_attn_dispatch_if_enabled`] layers the
-/// `RMLX_SPARSE_ATTN` gate + `head_budgets` presence check on top.
+/// policy gate + `head_budgets` presence check on top.
 pub fn sparse_attn_dispatch(
     inputs: &SparseAttnInputs<'_>,
     head_budgets: &HeadBudgets,
@@ -125,10 +125,10 @@ pub fn sparse_attn_dispatch(
     )
 }
 
-/// Two-phase sparse-attention dispatch with env-var gate + budget check.
+/// Two-phase sparse-attention dispatch with policy gate + budget check.
 ///
 /// Returns `Some(Array)` when:
-/// 1. [`sparse_attn_enabled`] is `true` (env-var `RMLX_SPARSE_ATTN=1`),
+/// 1. `policy.sparse_attn` is set,
 /// 2. `head_budgets` is `Some`, and
 /// 3. [`sparse_attn_dispatch`] succeeds.
 ///
@@ -136,8 +136,9 @@ pub fn sparse_attn_dispatch(
 pub fn sparse_attn_dispatch_if_enabled(
     inputs: &SparseAttnInputs<'_>,
     head_budgets: Option<&HeadBudgets>,
+    policy: DispatchPolicy,
 ) -> Option<Array> {
-    if !sparse_attn_enabled() {
+    if !policy.sparse_attn {
         return None;
     }
     let budgets = head_budgets?;

@@ -25,6 +25,7 @@ pub mod apple_gpu;
 // `build.rs` uses. See `src/build_info.rs` for why this exists.
 #[cfg(test)]
 mod build_info;
+pub mod dispatch_policy;
 pub mod error;
 pub mod kvcache;
 pub mod mach_mem;
@@ -33,6 +34,7 @@ pub mod projects_config;
 pub mod runinfo;
 pub mod unified_memory;
 
+pub use dispatch_policy::{dispatch_policy, set_dispatch_policy, DispatchPolicy};
 pub use error::Error;
 pub use error::OomPhase;
 pub use error::Result;

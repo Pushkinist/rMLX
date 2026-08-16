@@ -20,10 +20,10 @@
     clippy::panic,
     clippy::print_stderr,
     clippy::indexing_slicing,
-    unsafe_code,
     missing_docs
 )]
 
+use rmlx_core::DispatchPolicy;
 use rmlx_kv_quant::kvcache::fused_qk_total_dispatch_count;
 use rmlx_kv_quant::planar_flash_decode_msl::planar_flash_decode_sdpa;
 use rmlx_kv_quant::planar_fused_qk_msl::planar_fused_qk_dispatch_count;
@@ -156,12 +156,13 @@ fn sparse_attn_dormant_on_warm_ttft_update_and_sdpa() {
     let n_q_heads = TEST_KV_H * TEST_HEADS_PER_KV;
     let scale: f32 = 1.0 / (TEST_HEAD_DIM as f32).sqrt();
 
-    // SAFETY: process-global env var, single-threaded test enforced.
-    unsafe {
-        std::env::set_var("RMLX_SPARSE_ATTN", "1");
-    }
-
-    let mut cache = KvCache::with_quant_max_seq(KvQuant::PlanarK, TEST_MAX_SEQ);
+    // Gate on: dormancy here is the warm-TTFT bf16-K shortcut, not the gate.
+    let policy = DispatchPolicy {
+        sparse_attn: true,
+        ..DispatchPolicy::default()
+    };
+    let mut cache =
+        KvCache::with_quant_max_seq(KvQuant::PlanarK, TEST_MAX_SEQ).with_dispatch_policy(policy);
     cache.enter_prefill();
 
     let prefill_shape = [b, TEST_KV_H, TEST_PREFILL_SEQ, TEST_HEAD_DIM];
