@@ -501,6 +501,15 @@ metrics DB.
 - Warmup 1 discarded, 3 measured runs; median decode_tps + sample stddev reported in CSV
 - DB record: one `rmlx baseline --record` call per model after the measured runs
 
+**The canary decodes greedily, and that is a scope limit, not a detail.**
+`rmlx baseline` has no sampler knobs, so every canary and A/B number in this
+file is the GPU-argmax path. The host-selection path — temperature, penalties,
+constraint masks, logprobs — reads the whole logits row back per token and costs
+9–14 % of decode throughput before top-p and a quarter of it with, on all three
+canary architectures. No canary run can observe that; use `rmlx bench
+--temperature / --top-p / --repetition-penalty` and the `sampler_profile` event.
+See § *Host-sampler cost* below and `docs/SAMPLING.md`.
+
 **Per-model kv_quant resolved by arch resolver (auto):**
 - Bonsai (Qwen3ForCausalLM, 2bit): `mixed_k8g64_v4g64`
 - Gemma4-e4b (mxfp8): `k8v8`
@@ -527,6 +536,53 @@ decode_tps (the bf16 q/k/v compute is cheaper than the prior f32 path); Gemma4
 and Qwen3.6 (separate arch files) are unchanged. On the `none` path the gain
 widens with context as KV bandwidth dominates: Bonsai `none` decode_tps
 ~101→~135 at 4 k, ~48→~83 at 16 k, ~19→~38 at 64 k.
+
+## Host-sampler cost (2026-08-16)
+
+First measurement of the sampling / penalty / mask / logprob path, which every
+other table in this file excludes.
+
+**Binary**: `target/release-perf/rmlx`.
+**Harness**: `rmlx bench --prompt-tokens 4096 --max-tokens 100 --max-ctx 8192
+--runs 3 --warmup 1`, `kv_quant=auto`, scratch `RMLX_HOME`, `--metrics off`.
+**Hardware**: M5 Max. **Host was NOT quiescent** — a VM held ~1.1 cores for the
+whole session, and `scripts/perf_ab.sh` refused to run on it (exit 125). These
+are single-arm medians on a contended host, not an interleaved A/B: read the
+column separations, not the third decimal.
+
+`share%` is `sampler_profile{sample_share_pct}` — host-side sampler wall-clock
+over step wall-clock, counting only steps that took the host path. It is a
+**lower bound** on what a GPU-side sampler would recover, because the host path
+also forfeits the greedy path's software pipelining (it cannot dispatch the next
+forward until the row is back and a token is chosen). The decode-TPS column is
+the end-to-end figure and is larger in every cell.
+
+| model | vocab | cell | sample ms/step | share% | decode_tps | vs greedy |
+|---|---:|---|---:|---:|---:|---:|
+| mlx-community__gemma-4-e2b-it-mxfp8 | 262144 | greedy | — | — | 129.22 | — |
+| mlx-community__gemma-4-e2b-it-mxfp8 | 262144 | rep-penalty 1.1 | 0.228 | 2.75 | 122.88 | −4.9 % |
+| mlx-community__gemma-4-e2b-it-mxfp8 | 262144 | temp 0.7 | 0.880 | 9.80 | 111.03 | −14.1 % |
+| mlx-community__gemma-4-e2b-it-mxfp8 | 262144 | temp 0.7 + rep 1.1 | 0.874 | 9.88 | 113.86 | −11.9 % |
+| mlx-community__gemma-4-e2b-it-mxfp8 | 262144 | temp 0.7 + top-p 0.95 | 2.525 | 22.89 | 90.62 | −29.9 % |
+| prism-ml__Ternary-Bonsai-8B-mlx-2bit | 151669 | greedy | — | — | 134.50 | — |
+| prism-ml__Ternary-Bonsai-8B-mlx-2bit | 151669 | rep-penalty 1.1 | 0.141 | 1.72 | 117.81 | −12.4 % |
+| prism-ml__Ternary-Bonsai-8B-mlx-2bit | 151669 | temp 0.7 | 0.487 | 5.82 | 116.36 | −13.5 % |
+| prism-ml__Ternary-Bonsai-8B-mlx-2bit | 151669 | temp 0.7 + rep 1.1 | 0.491 | 5.87 | 115.38 | −14.2 % |
+| prism-ml__Ternary-Bonsai-8B-mlx-2bit | 151669 | temp 0.7 + top-p 0.95 | 1.665 | 17.15 | 99.49 | −26.0 % |
+| mlx-community__Qwen3.6-35B-A3B-8bit | 248320 | greedy | — | — | 98.61 | — |
+| mlx-community__Qwen3.6-35B-A3B-8bit | 248320 | rep-penalty 1.1 | 0.218 | 2.04 | 93.42 | −5.3 % |
+| mlx-community__Qwen3.6-35B-A3B-8bit | 248320 | temp 0.7 | 0.790 | 7.09 | 89.50 | −9.2 % |
+| mlx-community__Qwen3.6-35B-A3B-8bit | 248320 | temp 0.7 + top-p 0.95 | 2.847 | 20.67 | 72.59 | −26.4 % |
+
+The rep-penalty cell was re-measured at `--runs 4 --warmup 2` on Qwen3.6 after
+the 3-run cell was refused for drift; every other cell settled at the default
+shape.
+
+Reading it: temperature alone is 5.8–9.8 % of step time, a repetition penalty
+alone is 1.7–2.8 % (its arithmetic touches ≤20 ids — the transfer and the host
+argmax are the whole cost), and **top-p triples the host work** to 17–23 %
+because it sorts the entire vocabulary. Within a stage the cost tracks vocabulary
+size: 0.880 ms/step at 262144 against 0.487 ms/step at 151669, temp 0.7.
 
 ## K8VTurbo3 promotion bench (2026-05-30)
 

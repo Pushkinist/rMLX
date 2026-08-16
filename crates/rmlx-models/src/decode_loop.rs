@@ -3,12 +3,26 @@
 //! Shared, model-agnostic pipelined decode loop.
 //!
 //! One copy of the autoregressive decode pipeline every pipelined arch (qwen3,
-//! qwen3_5_moe, gemma4, gemma3, qwen2) previously hand-copied. The pipeline
-//! ordering — `choose_token` → `async_eval(next_y)` → drain the *previous*
-//! step's pending token via `to_bytes()` → `try_clone`/feed — overlaps host
-//! sampling/penalty work with the in-flight GPU forward. Reordering (draining
-//! before dispatching the next forward) serializes CPU/GPU and is a measurable
-//! decode regression; do not.
+//! qwen3_5_moe, gemma4, gemma3, qwen2) previously hand-copied.
+//!
+//! # Two selection paths, and only one of them pipelines
+//!
+//! **Greedy** (`temperature == 0`, no penalties, no constraint mask, no
+//! logprobs). `choose_token` returns a *lazy* GPU argmax, so the ordering
+//! `choose_token` → `async_eval(next_y)` → drain the **previous** step's pending
+//! token via `to_bytes()` → `try_clone`/feed leaves the GPU running this step
+//! while the host waits on the last one and builds the next graph. Reordering
+//! (draining before dispatching the next forward) serializes CPU and GPU and is
+//! a measurable decode regression; do not.
+//!
+//! **Host selection** (anything else). The chosen token is a function of the
+//! logits row, so the row has to be on the host before the next forward can be
+//! dispatched at all — there is nothing to overlap, and the loop runs strictly
+//! serial: wait for the forward, read the row back, pick a token, dispatch the
+//! next forward. That costs both the host work and the overlap the greedy path
+//! gets for free, which is why the `sampler_profile` event reports the host work
+//! as a *lower bound* on the difference and the honest end-to-end figure is a
+//! decode-TPS comparison against a greedy control. See `docs/SAMPLING.md`.
 //!
 //! The only per-arch hole is `forward_step` (an `impl FnMut`, monomorphized —
 //! never a `Box<dyn>` on the per-token hot path). Prompt-cache policy, cache

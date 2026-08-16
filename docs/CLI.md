@@ -571,6 +571,33 @@ agree; see the drift refusal below.
 | `--allow-truncate` | bool flag | off | Opt into truncating an over-cap prompt on `--device gpu`. |
 | `--json` | bool flag | off | Emit one JSON object (per-metric spreads plus every individual run) instead of the table. |
 | `--prompts-dir` | path | (cwd walk) | Root to search for `longctx_<N>k.json`. Env: `RMLX_PROMPTS_DIR`. |
+| `--temperature` | f32 | `0.0` | `0` is greedy (GPU argmax, no logits row read back). Positive routes the cell through the host sampler. |
+| `--top-p` | f32 | `1.0` | Nucleus threshold, applied only when `--temperature` is positive. `1.0` disables it. |
+| `--repetition-penalty` | f32 | `1.0` | Sign-aware multiplicative penalty over the trailing 20-token window. `1.0` is the exact no-op. |
+
+#### Benching the host sampler
+
+Every other shape this binary measures is greedy, so without these three flags
+the sampling / penalty path is invisible to the bench harness — and to
+`scripts/perf_canary.sh`, which is greedy-only. It is not free: see
+`docs/SAMPLING.md` § *Cost of the host path* for the measured figures.
+
+```bash
+rmlx bench --model /path/to/snapshot --prompt-tokens 4096 --max-tokens 100 \
+  --temperature 0.7 --repetition-penalty 1.1
+```
+
+The seed is the fixed default and the RNG is fresh per run, so a sampled cell
+still produces one token stream across every run — the digest check applies
+unchanged. A cell that is not greedy is named on its own line in the table and
+under `sampling` in the JSON, so it cannot be read as a greedy one. Values
+outside their valid ranges (a NaN or negative temperature, a `--top-p` outside
+`(0, 1]`, a non-positive `--repetition-penalty`) are refused before the model
+loads rather than silently no-opping into a greedy run wearing a sampled label.
+
+Per-step host-sampler timings for the run land in the `sampler_profile` tracing
+event (`sync_per_step_ms`, `sample_per_step_ms`, `step_per_step_ms`,
+`sample_share_pct`), emitted only when a step took the host path.
 
 #### Refusals
 
@@ -603,9 +630,11 @@ is a hard error naming the cause, never a silent zero or a plausible default:
   run hit a stall rather than whether the cell settled. Its spread is still
   printed.
 - **Runs that decoded different tokens.** Every run in a cell feeds the same
-  prompt to the same model at temperature 0, so every run must emit a
-  byte-identical token stream. `bench` digests each run's token ids (FNV-1a-64,
-  warmup runs included) and aborts when they disagree. This is not only a
+  prompt to the same model with the same sampler settings and a fresh RNG at the
+  fixed default seed, so every run must emit a byte-identical token stream —
+  including a sampled cell, where the draw is reproducible. `bench` digests each
+  run's token ids (FNV-1a-64, warmup runs included) and aborts when they
+  disagree. This is not only a
   reproducibility check: a KV cache that silently stops being written decodes
   *faster* while producing wrong tokens, so a timing-only instrument is biased
   toward accepting exactly that defect.

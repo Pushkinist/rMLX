@@ -20,6 +20,9 @@ scaling, nucleus and top-k filtering, and an inverse-CDF draw.
 Both paths return the same shape (`[1] I32`) so all downstream call sites
 (materialise via `to_bytes` → `i32::from_le_bytes`) are unchanged.
 
+The two paths are not equally fast, and the gap is not small — see
+[Cost of the host path](#cost-of-the-host-path) for the measured figures.
+
 ---
 
 ## Pipeline
@@ -257,6 +260,93 @@ at their identity values (`rep_penalty == 1.0`, `presence_penalty == 0.0`,
 `frequency_penalty == 0.0`, `logit_bias.is_empty()`). The decode loop checks
 this once per step; if false and temperature is also 0, the entire host path
 is skipped and no GPU-to-host transfer occurs.
+
+---
+
+## Cost of the host path
+
+The host path is not a cheap variant of the greedy one. It costs a
+`vocab`-sized GPU-to-host transfer plus `O(vocab)` host arithmetic per token,
+and — because the next forward cannot be dispatched until the row has been read
+back and a token chosen — it also gives up the software pipelining the greedy
+path gets for free. Greedy returns a *lazy* GPU argmax and dispatches the next
+step while the GPU is still busy; the host path runs strictly serial.
+
+### The instrument
+
+The shared decode loop emits a `sampler_profile` event once per generation,
+covering only the steps that took the host path. A purely greedy run emits
+nothing and takes no extra clock readings.
+
+| Field | Meaning |
+|---|---|
+| `sync_per_step_ms` | Wait for the forward before the row can be read. GPU latency, not sampler cost. |
+| `sample_per_step_ms` | Readback plus all host arithmetic — mask, penalties, softmax, filters, draw. |
+| `step_per_step_ms` | Whole step, host-path steps only. |
+| `sample_share_pct` | `sample / step`. |
+
+`sample_share_pct` is a **lower bound** on what a GPU-side sampler could
+recover: it counts the host work but not the lost pipelining. The end-to-end
+figure is a decode-TPS comparison against a greedy control at the same shape,
+which is larger in every cell measured.
+
+Drive the path from the bench harness with `rmlx bench --temperature`,
+`--top-p` and `--repetition-penalty`. `scripts/perf_canary.sh` is greedy-only
+and cannot observe this class at all.
+
+### Measured, 2026-08-16, M5 Max
+
+`release-perf`, `rmlx bench --prompt-tokens 4096 --max-tokens 100 --max-ctx
+8192`, `kv_quant=auto`, 1 warmup + 3 measured runs, median. Host was not
+quiescent (a VM held ~1.1 cores throughout), which inflates host-side work
+relative to GPU wait — so these shares are upper-ish estimates of the host
+component, and the decode-TPS deltas are the conservative end-to-end figure.
+
+| Model | vocab | cell | `sample` ms/step | `share%` | decode TPS vs greedy |
+|---|---:|---|---:|---:|---:|
+| gemma-4-e2b-it-mxfp8 | 262144 | greedy | — | — | 129.22 (control) |
+| gemma-4-e2b-it-mxfp8 | 262144 | `--repetition-penalty 1.1` | 0.228 | 2.75 | −4.9 % |
+| gemma-4-e2b-it-mxfp8 | 262144 | `--temperature 0.7` | 0.880 | 9.80 | −14.1 % |
+| gemma-4-e2b-it-mxfp8 | 262144 | `--temperature 0.7 --top-p 0.95` | 2.525 | 22.89 | −29.9 % |
+| Ternary-Bonsai-8B-2bit | 151669 | greedy | — | — | 134.50 (control) |
+| Ternary-Bonsai-8B-2bit | 151669 | `--repetition-penalty 1.1` | 0.141 | 1.72 | −12.4 % |
+| Ternary-Bonsai-8B-2bit | 151669 | `--temperature 0.7` | 0.487 | 5.82 | −13.5 % |
+| Ternary-Bonsai-8B-2bit | 151669 | `--temperature 0.7 --top-p 0.95` | 1.665 | 17.15 | −26.0 % |
+| Qwen3.6-35B-A3B-8bit | 248320 | greedy | — | — | 98.61 (control) |
+| Qwen3.6-35B-A3B-8bit | 248320 | `--repetition-penalty 1.1` | 0.218 | 2.04 | −5.3 % |
+| Qwen3.6-35B-A3B-8bit | 248320 | `--temperature 0.7` | 0.790 | 7.09 | −9.2 % |
+| Qwen3.6-35B-A3B-8bit | 248320 | `--temperature 0.7 --top-p 0.95` | 2.847 | 20.67 | −26.4 % |
+
+Reading it:
+
+- **Temperature alone** costs 5.8–9.8 % of step time in host work and 9–14 % of
+  decode throughput. The work is the transfer plus a full-vocabulary softmax.
+- **A repetition penalty alone** is the cheapest host cell — 1.7–2.8 % — because
+  the penalty itself touches at most 20 ids; the transfer and the host argmax
+  are the whole cost. Its throughput hit is still 5–12 %, which is the lost
+  pipelining, not the arithmetic.
+- **Top-p is the dominant term.** Adding `--top-p 0.95` roughly triples the host
+  work, to 17–23 % of step time and a quarter of throughput, because it sorts
+  the entire vocabulary. Anyone optimising this path should start here and
+  should not assume the other stages behave the same way.
+- The cost tracks vocabulary size within a stage, as expected: at temperature
+  0.7 the 262144-token vocabulary pays 0.880 ms/step against 0.487 ms/step for
+  the 151669-token one.
+
+### Host selection is not bit-identical to the GPU argmax
+
+At `--temperature 0.0001` the host categorical sampler is arithmetically an
+argmax (every non-maximal logit underflows to exactly zero), so its token stream
+should match the greedy GPU `argmax` stream. On gemma-4-e2b it does, for all 100
+tokens. On Ternary-Bonsai-8B it agrees through 32 tokens and diverges by 64 —
+and the `--repetition-penalty 1.1` cell, which reaches the same host argmax by a
+different route, produces the *same* divergent stream. So the two host paths
+agree with each other and disagree with the GPU reduction, which is the
+signature of an exact tie in the logits row being broken differently rather than
+of a faulty readback.
+
+This is a property of the sampler itself, not of any one caller, and it matters
+to anything that treats the two paths as interchangeable oracles.
 
 ### Inverse-CDF sample
 
