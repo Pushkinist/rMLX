@@ -442,8 +442,14 @@ the standard affine INT4 dequant + matmul.
 ParoQuant checkpoints are produced by `z-lab/paroquant`. The `z-lab/`
 Open Models snapshots (e.g. `z-lab__Qwen3.6-27B-PARO`) use this format.
 
-Source: `crates/rmlx-models/src/paroquant_msl.rs`
+Dispatcher: `crates/rmlx-models/src/paroquant_msl.rs`
+MSL body: `crates/rmlx-models/src/metal/paroquant_rotate.metal`
 External reference: `z-lab/paroquant/paroquant/kernels/metal/rotation.metal`
+
+`ROWS_PER_TILE` (1 for a decode step, 4 for prefill / batch), `MAX_KROT` and
+`MAX_GROUP_SIZE` are MLX template ints supplied at dispatch, so one registration
+covers both variants and the bounds have a single source of truth in the Rust
+consts the validation checks use.
 
 ---
 

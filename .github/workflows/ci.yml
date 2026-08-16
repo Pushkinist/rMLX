@@ -61,16 +61,22 @@ jobs:
 
   msl:
     name: msl kernels (compile + format)
-    # macos-14 ships full Xcode, so the Metal compiler is available here (see the
-    # toolchain step) even though a Command-Line-Tools-only dev box has none.
+    # This runner ships full Xcode, so the Metal compiler is available here (see
+    # the toolchain step) even though a Command-Line-Tools-only dev box has none.
     # Compiling `.metal` needs the toolchain, not a GPU — so this gate runs for
     # real on a runner with no usable Metal device. This is the job that makes
     # MSL syntax errors surface at CI instead of on first GPU dispatch.
     #
+    # macos-26, not macos-14, for one specific reason: the compile gate makes a
+    # second pass at -std=metal4.0 — the language version MLX's JIT actually
+    # compiles custom kernel bodies at — and refuses to pass by checking less
+    # when the toolchain cannot reach it. macos-14 tops out at Xcode 16.2, which
+    # has no Metal 4. (macos-14 is also deprecated upstream.)
+    #
     # No Rust toolchain and no mlx-c: both gates are bash + xcrun over the
     # checked-in .metal files, so this job stays seconds-long and reports as its
     # own named check.
-    runs-on: macos-14 # Apple Silicon; full Xcode
+    runs-on: macos-26 # Apple Silicon; full Xcode with a Metal 4 toolchain
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Xcode 16.3+ unbundled the Metal compiler into a downloadable component,
@@ -89,11 +95,18 @@ jobs:
         run: |
           xcode-select -p
           xcrun -sdk macosx metal --version 2>&1 | head -2 || true
+          printf '#include <metal_stdlib>\n' > /tmp/std_probe.metal
+          if xcrun -sdk macosx metal -std=metal4.0 -c /tmp/std_probe.metal -o /tmp/std_probe.air; then
+            echo "Metal 4 language version available."
+          else
+            echo "::warning::-std=metal4.0 unavailable; the compile gate will fail (it refuses to check less)."
+          fi
           "$(xcrun -f clang-format)" --version
-      # METAL_STRICT=--strict makes a missing toolchain a hard failure. Without
-      # it both gates skip when their tool is absent, which is correct locally
-      # and wrong here: on this runner the tools exist, so a skip would mean the
-      # gate silently passed without checking anything.
+      # METAL_STRICT=--strict makes a missing toolchain — or one too old for the
+      # metal4.0 pass — a hard failure. Without it both gates skip when their
+      # tool is absent, which is correct locally and wrong here: on this runner
+      # the tools exist, so a skip would mean the gate silently passed without
+      # checking anything.
       - name: .metal clang-format clean (strict)
         run: make check-metal-format METAL_STRICT=--strict
       - name: .metal kernels compile natively (strict)

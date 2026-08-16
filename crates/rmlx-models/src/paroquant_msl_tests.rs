@@ -30,35 +30,42 @@ fn to_f32_vec(a: &Array) -> Vec<f32> {
         .collect()
 }
 
-/// Kernel construction: build the RPT=1 kernel without crashing.
+/// Kernel registration: build the kernel without crashing.
 /// Verifies that the MSL source compiles on the live Metal device.
+///
+/// One registration serves both `ROWS_PER_TILE` variants — the value is an MLX
+/// template int applied at dispatch, so the per-variant instantiations are
+/// covered by the two round-trip tests below rather than here.
 #[test]
 #[ignore = "GPU Metal context — run in isolation: cargo test paroquant_msl -- --ignored --test-threads=1"]
 #[allow(
     clippy::expect_used,
     reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
 )]
-fn paro_kernel_construction_rpt1() {
-    kernel_rpt1().expect("RPT=1 kernel should compile");
+fn paro_kernel_registration() {
+    paro_rotate_kernel().expect("paro rotate kernel should compile");
 }
 
-/// Kernel construction: build the RPT=4 kernel without crashing.
+/// Round-trip identity at `batch = 1`, which selects `ROWS_PER_TILE = 1` — the
+/// decode-step template instantiation.
 #[test]
 #[ignore = "GPU Metal context — run in isolation: cargo test paroquant_msl -- --ignored --test-threads=1"]
-#[allow(
-    clippy::expect_used,
-    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
-)]
-fn paro_kernel_construction_rpt4() {
-    kernel_rpt4().expect("RPT=4 kernel should compile");
+fn paro_rotate_identity_roundtrip_rpt1() {
+    paro_rotate_identity_roundtrip(1);
+}
+
+/// Round-trip identity at `batch = 2`, which selects `ROWS_PER_TILE = 4` — the
+/// prefill / batch template instantiation.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test paroquant_msl -- --ignored --test-threads=1"]
+fn paro_rotate_identity_roundtrip_rpt4() {
+    paro_rotate_identity_roundtrip(2);
 }
 
 /// Round-trip identity test: zero rotation angles (cos=1.0, sin=0.0) and
 /// channel_scales=1.0 must produce output equal to input.
 ///
-/// hidden=4, group_size=4, krot=2, batch=2.
-#[test]
-#[ignore = "GPU Metal context — run in isolation: cargo test paroquant_msl -- --ignored --test-threads=1"]
+/// hidden=4, group_size=4, krot=2.
 #[allow(
     clippy::expect_used,
     reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
@@ -67,14 +74,13 @@ fn paro_kernel_construction_rpt4() {
     clippy::indexing_slicing,
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
 )]
-fn paro_rotate_identity_roundtrip() {
+fn paro_rotate_identity_roundtrip(batch: usize) {
     let hidden: usize = 4;
     let group_size: usize = 4;
     let krot: usize = 2;
-    let batch: usize = 2;
     let half_hidden = hidden / 2;
 
-    let x_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+    let x_data: Vec<f32> = (0..batch * hidden).map(|i| i as f32 + 1.0).collect();
     let x = make_f32_array(&x_data, &[batch as i32, hidden as i32]);
 
     // packed_pairs: [krot=2, half_hidden=2] I32.

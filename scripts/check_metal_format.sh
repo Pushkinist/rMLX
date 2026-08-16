@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# scripts/check_metal_format.sh — CI gate: every KV `.metal` kernel file is
+# scripts/check_metal_format.sh — CI gate: every `.metal` kernel file is
 # clang-format clean.
 #
 # Metal Shading Language is a C++14 dialect, so clang-format's Cpp mode formats
-# it. Style is pinned by `crates/rmlx-kv-quant/src/metal/.clang-format`, which
+# it. Style is pinned by a `.clang-format` in each kernel directory, which
 # clang-format discovers by walking up from each file.
+#
+# Scope is the same directory list the compile gate uses — directory, not crate:
+# a `.metal` file is gated by where it lives, not by whose dispatcher reads it.
 #
 # clang-format is not on PATH on a stock macOS box — it ships inside the Xcode
 # Command Line Tools and is reachable via `xcrun -f clang-format`. Some machines
@@ -23,7 +26,13 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-METAL_DIR="${REPO_ROOT}/crates/rmlx-kv-quant/src/metal"
+
+# Keep in step with METAL_DIRS in scripts/check_metal_compiles.sh.
+METAL_DIRS=(
+    "${REPO_ROOT}/crates/rmlx-kv-quant/src/metal"
+    "${REPO_ROOT}/crates/rmlx-models/src/metal"
+    "${REPO_ROOT}/crates/rmlx-mlx/src/metal"
+)
 
 STRICT=0
 for arg in "$@"; do
@@ -54,11 +63,14 @@ if [ -z "${CLANG_FORMAT}" ]; then
 fi
 
 shopt -s nullglob
-files=("${METAL_DIR}"/*.metal)
+files=()
+for d in "${METAL_DIRS[@]}"; do
+    files+=("${d}"/*.metal)
+done
 shopt -u nullglob
 
 if [ ${#files[@]} -eq 0 ]; then
-    echo "SKIP: no .metal files under ${METAL_DIR}."
+    echo "SKIP: no .metal files under ${METAL_DIRS[*]}."
     exit 0
 fi
 
@@ -66,7 +78,9 @@ if ! "${CLANG_FORMAT}" --dry-run -Werror "${files[@]}" 2>&1; then
     echo >&2
     echo "ERROR: the .metal files above are not clang-format clean." >&2
     echo "Fix with:" >&2
-    echo "  xcrun clang-format -i crates/rmlx-kv-quant/src/metal/*.metal" >&2
+    for d in "${METAL_DIRS[@]}"; do
+        echo "  xcrun clang-format -i ${d#"${REPO_ROOT}/"}/*.metal" >&2
+    done
     exit 1
 fi
 

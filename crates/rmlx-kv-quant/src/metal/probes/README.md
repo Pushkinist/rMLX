@@ -5,6 +5,10 @@ Nothing here is compiled into the binary or read at runtime — production kerne
 come from `../*.metal` via `include_str!`, and production headers are built in
 Rust at dispatch.
 
+This is the reference copy of the convention. `crates/rmlx-models/src/metal/probes/`
+and `crates/rmlx-mlx/src/metal/probes/` carry their own manifests in the same
+format and point back here.
+
 ## Why this exists
 
 `../*.metal` files are kernel **bodies**. MLX generates the function signature
@@ -17,23 +21,34 @@ syntax-check one, the gate assembles:
 <codec header>
 kernel void rmlx_msl_compile_probe(...) {
     <buffer aliases: the names this body expects, at their dispatch dtype>
+    <#defines: the dispatch-time values that are neither buffers nor header constants>
     <body>
 }
 ```
 
 Buffers are injected as local aliases rather than kernel parameters, so no probe
-needs a per-kernel signature or buffer-index bookkeeping.
+needs a per-kernel signature or buffer-index bookkeeping. The `#define`s sit
+immediately ahead of the body so a common name (`T`) cannot collide with the
+header or the probe's own signature.
+
+Each body is compiled twice, at `-std=metal3.0` and `-std=metal4.0`. The second
+pass is what makes a `#if __HAVE_TENSOR__` body checkable: below Metal 4.0 that
+macro is undefined and such a body compiles to an empty translation unit.
 
 ## Files
 
 | File | Role |
 |---|---|
-| `kernels.manifest` | Per body: which header to prepend and which buffers to declare. Mirrors the `MetalKernel::new(..)` call sites. |
+| `kernels.manifest` | Per body: which header to prepend, which buffers to declare, and (optional 4th field) which `#define`s to emit. Mirrors the `MetalKernel::new(..)` / `set_template_*` call sites. |
 | `*.hdr.metal` | Snapshots of headers that Rust generates at dispatch (codebooks, rotation constants, quaternions). |
 
 Codecs whose header is already a static file (`../turboquant_header.metal`,
 `../turbo_flash_header.metal`, …) are referenced directly from the manifest with
 a `../` prefix and need no snapshot here.
+
+Every `.metal` file in `../` must be named by the manifest, as a body or as a
+`../`-prefixed header. The gate hard-fails otherwise: a body nothing lists is a
+body nothing compiles.
 
 ## Snapshots are pinned to their builders
 

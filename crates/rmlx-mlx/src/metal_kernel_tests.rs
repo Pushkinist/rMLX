@@ -71,6 +71,95 @@ fn new_rejects_nul_in_output_name() {
     assert!(r.is_err());
 }
 
+/// Helper: extract i32 values from an evaluated Array.
+fn array_to_i32(a: &Array) -> Vec<i32> {
+    a.eval().expect("eval");
+    let bytes = a.to_bytes().expect("to_bytes");
+    bytes
+        .chunks_exact(4)
+        .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+        .collect()
+}
+
+/// Which MSL language version does MLX's runtime JIT compile a custom kernel
+/// body at, and does the cooperative-tensor header survive MLX's source
+/// wrapping?
+///
+/// This is an observation, not an assertion about a desired value: the answer
+/// decides whether an rMLX kernel body may ever use `mpp::tensor_ops`, and
+/// nothing on our side can force it — mlx-c exposes no compile-options surface,
+/// so the language version is whatever MLX passes to the runtime compiler.
+///
+/// Reading the four outputs:
+///
+/// - `out[0]` — `__METAL_VERSION__` as MLX's JIT saw it. `400` is Metal 4.0.
+/// - `out[1]` — `1` if `__HAVE_TENSOR__` reached the body. That macro is only
+///   defined from `-std=metal4.0`, so it is a second, independent read of the
+///   same fact.
+/// - `out[2]` — the `.m` field of a `constexpr matmul2d_descriptor`, so `8`
+///   means the `MetalPerformancePrimitives` include actually resolved and a
+///   descriptor instantiated *inside* the JIT'd body. This is the only one of
+///   the three that proves the include path survives MLX's source wrapping;
+///   `-1` means the guard was inactive.
+/// - `out[3]` — `0`, a liveness marker: it distinguishes "the kernel ran and
+///   wrote every slot" from "the buffer was never written".
+///
+/// The assert is on `apply`, not `new`: MLX compiles lazily on first dispatch,
+/// so a compile failure surfaces there.
+///
+/// Recorded result: see docs/FFI.md, "MLX JIT language version".
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test metal_kernel -- --ignored --test-threads=1"]
+fn rmlx_nax_probe_gpu() {
+    let kernel = MetalKernel::new(
+        "rmlx_nax_probe",
+        include_str!("metal/nax_probe_header.metal"),
+        include_str!("metal/nax_probe.metal"),
+        &[],
+        &["out"],
+    )
+    .expect("kernel registration failed");
+
+    let mut invoke = MetalKernelInvoke::new();
+    invoke
+        .add_output_shape(&[4_i32], Dtype::I32)
+        .expect("add_output_shape");
+    invoke.set_grid(1, 1, 1).expect("set_grid");
+    invoke.set_thread_group(1, 1, 1).expect("set_thread_group");
+
+    let outputs = kernel
+        .apply(invoke, Device::Gpu)
+        .expect("MLX JIT refused the probe body");
+    assert_eq!(outputs.len(), 1, "expected 1 output");
+
+    let v = array_to_i32(&outputs[0]);
+    assert_eq!(v.len(), 4, "expected 4 int32 slots, got {v:?}");
+    println!(
+        "rmlx_nax_probe: __METAL_VERSION__={} __HAVE_TENSOR__={} matmul2d_descriptor.m={} live={}",
+        v[0], v[1], v[2], v[3]
+    );
+
+    // Liveness: without this a buffer MLX never wrote reads as all-zero and
+    // would be indistinguishable from "compiled below 4.0".
+    assert_eq!(v[3], 0, "probe did not run: {v:?}");
+    assert!(v[0] >= 300, "implausible __METAL_VERSION__: {v:?}");
+
+    // The two independent reads of the same fact must agree. They cannot
+    // disagree unless the toolchain's own `__HAVE_TENSOR__` / version coupling
+    // changed, which is exactly the thing worth failing on.
+    let have_tensor = v[0] >= 400;
+    assert_eq!(
+        v[1],
+        i32::from(have_tensor),
+        "__METAL_VERSION__ and __HAVE_TENSOR__ disagree: {v:?}"
+    );
+    assert_eq!(
+        v[2],
+        if have_tensor { 8 } else { -1 },
+        "matmul2d_descriptor did not instantiate as expected: {v:?}"
+    );
+}
+
 /// Kernel registration with bad source should not panic.
 ///
 /// MLX may defer compilation to first dispatch, so the error may surface

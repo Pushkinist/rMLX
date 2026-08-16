@@ -1,0 +1,24 @@
+# Compile-probe manifest — drives `make check-metal-compiles` for the per-arch
+# kernels in this crate. Same format and same gate as the KV-codec manifest at
+# crates/rmlx-kv-quant/src/metal/probes/kernels.manifest; see the README there
+# for the probe layout and how to refresh a captured header snapshot.
+#
+# Format:  <body.metal> | <header or -> | <name:type,...> | [NAME=VALUE,...]
+#   type: u = uint buffer, f = float buffer
+#
+# Neither kernel here has a header: both take their compile-time constants as
+# MLX template arguments, so the fourth field carries representative values for
+# them. `T` in the gated-delta body is a scalar 0-D input, which MLX declares as
+# `constant int&` — a numeric literal to the body, hence a define rather than a
+# buffer alias.
+#
+# Every `.metal` file in the parent directory must appear here, as a body or as
+# a `../`-prefixed header. The gate fails on one that does not.
+
+# Dk/Dv/Hk/Hv are Qwen3.6-35B-A3B's GatedDeltaNet shape; the probe only needs
+# Dk % 32 == 0 and Hv % Hk == 0 to hold.
+gated_delta_step.metal | - | q:f,k:f,v:f,g:f,beta:f,state_in:f,y:f,state_out:f | Dk=128,Dv=128,Hk=16,Hv=32,T=8,InT=float,StT=float
+# ROWS_PER_TILE=4 is the prefill variant; 1 is the decode variant. Only the
+# larger is probed — the two differ by the value of one template int, not by
+# what has to resolve.
+paroquant_rotate.metal | - | x:f,packed_pairs:u,cos_theta:f,sin_theta:f,channel_scales:f,params:u,out:f | ROWS_PER_TILE=4,MAX_KROT=16,MAX_GROUP_SIZE=256,InT=float
