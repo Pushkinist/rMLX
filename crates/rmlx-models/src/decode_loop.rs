@@ -3,12 +3,26 @@
 //! Shared, model-agnostic pipelined decode loop.
 //!
 //! One copy of the autoregressive decode pipeline every pipelined arch (qwen3,
-//! qwen3_5_moe, gemma4, gemma3, qwen2) previously hand-copied. The pipeline
-//! ordering — `choose_token` → `async_eval(next_y)` → drain the *previous*
-//! step's pending token via `to_bytes()` → `try_clone`/feed — overlaps host
-//! sampling/penalty work with the in-flight GPU forward. Reordering (draining
-//! before dispatching the next forward) serializes CPU/GPU and is a measurable
-//! decode regression; do not.
+//! qwen3_5_moe, gemma4, gemma3, qwen2) previously hand-copied.
+//!
+//! # Two selection paths, and only one of them pipelines
+//!
+//! **Greedy** (`temperature == 0`, no penalties, no constraint mask, no
+//! logprobs). `choose_token` returns a *lazy* GPU argmax, so the ordering
+//! `choose_token` → `async_eval(next_y)` → drain the **previous** step's pending
+//! token via `to_bytes()` → `try_clone`/feed leaves the GPU running this step
+//! while the host waits on the last one and builds the next graph. Reordering
+//! (draining before dispatching the next forward) serializes CPU and GPU and is
+//! a measurable decode regression; do not.
+//!
+//! **Host selection** (anything else). The chosen token is a function of the
+//! logits row, so the row has to be on the host before the next forward can be
+//! dispatched at all — there is nothing to overlap, and the loop runs strictly
+//! serial: wait for the forward, read the row back, pick a token, dispatch the
+//! next forward. That costs both the host work and the overlap the greedy path
+//! gets for free, and the `sampler_profile` event only measures the first of the
+//! two — the honest end-to-end figure is a decode-TPS comparison against a
+//! greedy control. See `docs/SAMPLING.md`.
 //!
 //! The only per-arch hole is `forward_step` (an `impl FnMut`, monomorphized —
 //! never a `Box<dyn>` on the per-token hot path). Prompt-cache policy, cache
@@ -311,6 +325,17 @@ pub(crate) fn pipelined_decode(
     let device = ctx.device;
     let vocab = ctx.vocab;
 
+    // Host-selection accounting. Only steps that read the logits row to the host
+    // (constraint mask, temperature, penalties, logprobs) contribute; a pure
+    // greedy run leaves `host_steps` at 0 and emits nothing. `sync` is the wait
+    // for the forward that must finish before any host work can start — GPU
+    // latency, not sampler cost — and is timed apart from `sample` so the two are
+    // never conflated.
+    let mut host_steps: u32 = 0;
+    let mut sync_total_ns: u128 = 0;
+    let mut sample_total_ns: u128 = 0;
+    let mut host_step_total_ns: u128 = 0;
+
     let _decode_span = info_span!("decode", n_tokens = ctx.n_tokens).entered();
 
     let mut y: Array = {
@@ -378,10 +403,23 @@ pub(crate) fn pipelined_decode(
         // logprob capture needs host logits per step → also drains here.
         let lp_k = ctx.sampler_cfg.top_logprobs_k as usize;
         let drain_now = mask_active || sampling_active || penalties_active || lp_k > 0;
-        // Force eager eval of logits on the masked path to prevent stale GPU data.
-        if mask_active {
+        // Every host-selection path needs the logits row materialized, so the
+        // forward has to have finished before any of them can start. Wait for it
+        // here, once: the masked path needs the eager eval anyway (otherwise the
+        // mask composes against stale GPU data), and the sampling / penalty /
+        // logprob paths would each block on the same graph a few lines later,
+        // inside the readback. Hoisting it keeps the wait out of the sampler
+        // timer, which would otherwise report forward latency as sampler cost.
+        // MLX evaluates one stream in order, so materializing this step's logits
+        // also completes the previous step's pending token — the total wait is
+        // unchanged, only its attribution.
+        let sync_dt = if drain_now {
+            let sync_t0 = Instant::now();
             logits_flat.eval()?;
-        }
+            sync_t0.elapsed().as_nanos()
+        } else {
+            0
+        };
         let pre_drain_eos = if drain_now {
             if let Some(p) = pending.take() {
                 let top_bytes = p.to_bytes()?;
@@ -419,6 +457,14 @@ pub(crate) fn pipelined_decode(
         // Reuse the SAME pre-advance `mask_active` the eval() gate and pre-drain
         // computed above; the pre-drain may have called `constraint.advance()`,
         // which can flip `wants_mask`, so recomputing here would diverge.
+        // Timed only on the host-selection path; a greedy step takes no clock
+        // readings it would not have taken before. The window spans every
+        // host-selection consumer of the logits row, not just `choose_token`:
+        // logprob capture performs its own full readback plus a log-softmax and a
+        // top-k over the whole vocabulary, and leaving it outside would report a
+        // near-zero cost for the one path whose selection is free (a lazy GPU
+        // argmax) and whose readback is the entire expense.
+        let sample_t0 = drain_now.then(Instant::now);
         let next_y = choose_token(ctx, &logits_flat, mask_active)?;
         let _ = next_y.async_eval();
         // capture this step's logprobs from `logits_flat` + the chosen token.
@@ -427,6 +473,7 @@ pub(crate) fn pipelined_decode(
         if lp_k > 0 {
             pending_logprobs = capture_logprobs(&logits_flat, &next_y, lp_k);
         }
+        let sample_dt = sample_t0.map_or(0, |t| t.elapsed().as_nanos());
         let fwd_dt = fwd_t0.elapsed().as_nanos();
 
         // The actual GPU sync materializes here on the *previous* step's pending
@@ -476,10 +523,17 @@ pub(crate) fn pipelined_decode(
         }
         let eval_dt = eval_t0.elapsed().as_nanos();
 
+        let step_dt = step_t0.elapsed().as_nanos();
         stats.forward_total_ns += fwd_dt;
         stats.eval_total_ns += eval_dt;
-        stats.step_total_ns += step_t0.elapsed().as_nanos();
+        stats.step_total_ns += step_dt;
         stats.decode_steps += 1;
+        if drain_now {
+            host_steps += 1;
+            sync_total_ns += sync_dt;
+            sample_total_ns += sample_dt;
+            host_step_total_ns += step_dt;
+        }
 
         if emitted_eos {
             early_stop = true;
@@ -537,10 +591,87 @@ pub(crate) fn pipelined_decode(
         }
     }
 
+    emit_sampler_profile(
+        ctx,
+        host_steps,
+        sync_total_ns,
+        sample_total_ns,
+        host_step_total_ns,
+    );
+
     // Final act of the decode phase: mint the post-decode witness. The caller
     // needs it to record `kv_cache_bytes`, so the metric can only be sampled
     // here — after the decode-time ring is resident.
     Ok((stats, PostDecode::seal()))
+}
+
+/// Emit the `sampler_profile` event for the host-selection steps of one decode
+/// call. Silent when no step took that path, so a greedy run — the shape
+/// `scripts/perf_canary.sh` measures — produces no event at all.
+///
+/// The event exists because the host-selection cost is otherwise unobservable:
+/// it is charged to whichever step it ran in and never separated from the
+/// forward. `sample_share_pct` is that cost as a fraction of the steps that
+/// actually paid it, not of every step in the run, so a request that engages a
+/// constraint engine part-way through is not diluted by its greedy prefix.
+///
+/// # What `sample` does and does not include
+///
+/// It covers every host-side consumer of the logits row — the readback, the
+/// mask fill, penalties, softmax, the filters, the draw, and logprob capture.
+///
+/// It does **not** cover GPU work that a selection path merely *schedules*. The
+/// constraint-mask-only path (`temperature == 0`, no penalties, no logprobs) is
+/// the one case that matters: `apply_mask_argmax` returns a lazy graph, so only
+/// its host-side bias fill is timed here and the GPU add + argmax execute at the
+/// next step's `eval`, where they are billed to `sync`. That path's figure is
+/// therefore a host-work floor, not its total cost. Every other path forces the
+/// row to the host inside the window and is fully accounted.
+///
+/// It also omits, on every path, the software pipelining the host path forfeits:
+/// that loss lands in `step` rather than in `sample`. A decode-TPS comparison
+/// against a greedy control is the end-to-end figure; this is the component
+/// attributable to host work.
+///
+/// Neither omission makes the ratio a bound, because a contended host pushes it
+/// the other way: `sample` is pure host CPU while `sync` is dominated by GPU
+/// execution, so CPU steal stretches the numerator alone. Read it on a quiet
+/// host, or read it knowing both errors are present with opposite signs.
+fn emit_sampler_profile(
+    ctx: &DecodeCtx<'_>,
+    host_steps: u32,
+    sync_total_ns: u128,
+    sample_total_ns: u128,
+    host_step_total_ns: u128,
+) {
+    if host_steps == 0 {
+        return;
+    }
+    let n = f64::from(host_steps);
+    let sync_ms = (sync_total_ns as f64) / 1.0e6;
+    let sample_ms = (sample_total_ns as f64) / 1.0e6;
+    let step_ms = (host_step_total_ns as f64) / 1.0e6;
+    tracing::info!(
+        target: "sampler_profile",
+        arch = ctx.arch,
+        vocab = ctx.vocab,
+        n_steps = host_steps,
+        temperature = ctx.sampler_cfg.temperature,
+        top_p = ctx.sampler_cfg.top_p,
+        top_k = ctx.sampler_cfg.top_k,
+        min_p = ctx.sampler_cfg.min_p,
+        rep_penalty = ctx.penalty_cfg.rep_penalty,
+        top_logprobs_k = ctx.sampler_cfg.top_logprobs_k,
+        sync_per_step_ms = sync_ms / n,
+        sample_per_step_ms = sample_ms / n,
+        step_per_step_ms = step_ms / n,
+        sample_share_pct = if step_ms > 0.0 {
+            100.0 * sample_ms / step_ms
+        } else {
+            0.0
+        },
+        "sampler_profile"
+    );
 }
 
 /// Resolve the per-token `piece`: `tokenizer.id_to_token` when `resolve_pieces`,

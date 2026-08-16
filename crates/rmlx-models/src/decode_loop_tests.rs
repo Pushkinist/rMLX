@@ -615,6 +615,74 @@ fn pipelined_decode_lp_k_captures() {
     );
 }
 
+/// The host-selection paths (temperature, penalties) hoist the logits eval out
+/// of the sampler so the GPU wait can be timed apart from the host work. That
+/// rearranges *when* the graph is materialised, which is exactly the kind of
+/// change that produces a stale or half-evaluated read — so pin the emitted
+/// stream. Both rows are sharply peaked, so at temperature 0.7 the softmax is
+/// one-hot to within f32 and the sampled id is the argmax regardless of the RNG
+/// draw; the assertion is on token identity, not on a distribution.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn pipelined_decode_host_path_emits_the_argmax_stream() {
+    let _g = mlx_guard();
+    let rows = vec![vec![0.0, 40.0, 0.0, 0.0], vec![0.0, 0.0, 0.0, 40.0]];
+    let eos = [3u32];
+
+    let ids_for = |cfg: &SamplerConfig, pen: &PenaltyConfig| -> Vec<u32> {
+        let tk = tiny_tokenizer(4);
+        let calls = Cell::new(0);
+        let mut rng = Pcg32::new(1);
+        let mut hist: Vec<u32> = vec![0];
+        let mut steps: Vec<ProbeStep> = vec![ProbeStep {
+            token_id: 0,
+            piece: "t0".to_string().into_boxed_str(),
+            max_abs_logit: 0.0,
+            nan_count: 0,
+            logprobs: None,
+        }];
+        let mut step_fn = |_: &ProbeStep| None;
+        let mut c = ctx(
+            &tk,
+            4,
+            32,
+            &eos,
+            &mut step_fn,
+            None,
+            cfg,
+            &mut rng,
+            pen,
+            &mut hist,
+            true,
+        );
+        pipelined_decode(&mut c, 0, &mut steps, scripted(&rows, &calls)).unwrap();
+        steps.iter().map(|s| s.token_id).collect()
+    };
+
+    let greedy = ids_for(&greedy_cfg(), &no_penalties());
+    assert_eq!(greedy, vec![0, 1, 3], "GPU argmax path");
+
+    let sampled = ids_for(
+        &SamplerConfig {
+            temperature: 0.7,
+            ..greedy_cfg()
+        },
+        &no_penalties(),
+    );
+    assert_eq!(greedy, sampled, "temperature path over a one-hot softmax");
+
+    // A repetition penalty at temperature 0 takes the host argmax path. The
+    // window holds ids 0 and 1, and 40.0 / 1.1 still dominates the zeros.
+    let penalised = ids_for(
+        &greedy_cfg(),
+        &PenaltyConfig {
+            rep_penalty: 1.1,
+            ..PenaltyConfig::default()
+        },
+    );
+    assert_eq!(greedy, penalised, "host argmax-with-penalties path");
+}
+
 /// A scripted forward that serves `rows` and then fails on call `fail_at`
 /// (0-based over calls into the loop), simulating a decode step that dies
 /// mid-stream — a store refusing an append, a Metal dispatch fault, etc.

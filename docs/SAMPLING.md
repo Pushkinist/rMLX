@@ -20,6 +20,9 @@ scaling, nucleus and top-k filtering, and an inverse-CDF draw.
 Both paths return the same shape (`[1] I32`) so all downstream call sites
 (materialise via `to_bytes` → `i32::from_le_bytes`) are unchanged.
 
+The two paths are not equally fast, and the gap is not small — see
+[Cost of the host path](#cost-of-the-host-path) for the measured figures.
+
 ---
 
 ## Pipeline
@@ -258,6 +261,8 @@ at their identity values (`rep_penalty == 1.0`, `presence_penalty == 0.0`,
 this once per step; if false and temperature is also 0, the entire host path
 is skipped and no GPU-to-host transfer occurs.
 
+---
+
 ### Inverse-CDF sample
 
 Given the filtered, renormalised probability vector, one `Pcg32` draw
@@ -290,6 +295,228 @@ model at temperature > 0. This is a documented contract; callers that want
 true stochasticity must supply a distinct seed per request.
 
 ---
+
+## Cost of the host path
+
+The host path is not a cheap variant of the greedy one. It costs a
+`vocab`-sized GPU-to-host transfer plus `O(vocab)` host arithmetic per token,
+and — because the next forward cannot be dispatched until the row has been read
+back and a token chosen — it also gives up the software pipelining the greedy
+path gets for free. Greedy returns a *lazy* GPU argmax and dispatches the next
+step while the GPU is still busy; the host path runs strictly serial.
+
+**It is the served default, not an opt-in.** `resolve_sampling_params` takes
+temperature from, in order: the request, `--default-temperature`,
+`generation_config.json`, then a hard-coded `1.0`. So a
+`/v1/chat/completions` request that omits sampling fields never lands on the
+greedy path unless an operator put it there. Worse for cost, the snapshots
+carry filters too — gemma-4 ships `temperature 1.0, top_p 0.95, top_k 64` and
+Qwen3.6 `1.0 / 0.95 / 20` — so the served default is the *most* expensive shape
+below, not the cheapest.
+
+### The instrument
+
+The shared decode loop emits a `sampler_profile` event once per generation,
+covering only the steps that took the host path. A purely greedy run emits
+nothing and takes no extra clock readings.
+
+| Field | Meaning |
+|---|---|
+| `sync_per_step_ms` | Wait for the forward before the row can be read. GPU latency, not sampler cost. |
+| `sample_per_step_ms` | Readback plus all host arithmetic — mask, penalties, softmax, filters, draw, and logprob capture. |
+| `step_per_step_ms` | Whole step, host-path steps only. |
+| `sample_share_pct` | `sample / step`. |
+
+Drive the path from the bench harness with `rmlx bench --temperature`,
+`--top-p`, `--top-k` and `--repetition-penalty`. `scripts/perf_canary.sh` is
+greedy-only and cannot observe this class at all.
+
+**`sample_share_pct` is not a bound in either direction.** Two errors act on
+it with opposite signs:
+
+- It *understates*, by omitting cost the host path causes but does not spend
+  inside the window: the forfeited pipelining, and — on the constraint-mask-only
+  path — the GPU add + argmax that `apply_mask_argmax` merely schedules, which
+  execute at the next step's `eval` and are billed to `sync`. Every other path
+  forces the row to the host inside the window and is fully accounted.
+- It *overstates* on a contended host, because `sample` is pure host CPU while
+  `sync` is dominated by GPU execution, so CPU steal stretches the numerator
+  only. Every figure below was taken under such contention.
+
+The end-to-end figure is a decode-TPS comparison against a greedy control at the
+same shape; the share is the component attributable to host work.
+
+### Measured, 2026-08-16, M5 Max — PROVISIONAL
+
+`release-perf`, `rmlx bench --max-tokens 100`, 1 warmup + 3 measured runs at 4k
+and 1 + 2 at 16k/64k. `share%` is the **median over the measured generations**
+(the warmup's event is discarded); it is a within-step ratio, so it survives a
+cell whose `decode_tps` the harness refused to median.
+
+**These are single-arm medians on a contended host, not an interleaved A/B.**
+`scripts/perf_ab.sh` refused the host (exit 125: a VM at 114 % of a core, later
+joined by an npm process at 131 %), and the threshold was not raised. Treat the
+column separations as the result and the third digit as noise. The dataset's own
+noise floor is about 2.5 points: at 4k, gemma-4-e2b's `temp 0.7 + rep 1.1` cell
+measured *faster* than its `temp 0.7` cell (113.86 vs 111.03 tok/s) despite
+doing strictly more work. No throughput delta below that is reported as an
+effect.
+
+#### Share versus context
+
+`sample` is `O(vocab)` and context-invariant; `step` grows with context. The
+share is therefore a falling curve, and a single short-context point is its
+maximum rather than its value. `kv_quant=auto`:
+
+| model | vocab | attention | cell | 4k | 16k | 64k |
+|---|---:|---|---|---:|---:|---:|
+| gemma-4-e2b | 262144 | sliding-window | `--temperature 0.7` | 10.00 % | 9.29 % | 8.30 % |
+| gemma-4-e2b | 262144 | sliding-window | `--repetition-penalty 1.1` | 2.76 % | 2.63 % | 2.24 % |
+| gemma-4-e2b | 262144 | sliding-window | served default | 24.82 % | 24.35 % | 22.30 % |
+| Qwen3.6-35B-A3B | 248320 | global | `--temperature 0.7` | 6.98 % | 6.56 % | 4.58 % |
+| Qwen3.6-35B-A3B | 248320 | global | `--repetition-penalty 1.1` | 2.04 % | 1.94 % | 1.41 % |
+| Qwen3.6-35B-A3B | 248320 | global | served default | 22.55 % | 21.15 % | (cell did not complete) |
+| Ternary-Bonsai-8B | 151669 | global | `--temperature 0.7` | 5.80 % | 0.65 % | 0.18 % |
+| Ternary-Bonsai-8B | 151669 | global | `--repetition-penalty 1.1` | 1.78 % | 0.19 % | 0.06 % |
+| Ternary-Bonsai-8B | 151669 | global | served default | 5.88 % | 0.65 % | 0.18 % |
+
+`sample` itself is flat across context, as predicted: gemma-4-e2b holds
+0.901 / 0.854 / 0.879 ms per step at temperature 0.7, Bonsai 0.498 / 0.499 /
+0.510, Qwen3.6 0.796 / 0.811 / 0.807. Everything the curve does, it does through
+the denominator.
+
+**Gemma-4 barely falls at all** — 10.0 % to 8.3 % over a 16× context increase —
+because its sliding-window attention keeps step time nearly context-independent
+(8.92 → 10.59 ms). An arch that does not pay for context does not dilute a
+context-invariant cost either.
+
+**Bonsai's collapse is a codec artifact, not attention.** Its `auto` codec
+(`mixed_k8g64_v4g64`) decodes at 13.2 tok/s at 16k and 3.6 at 64k — step times
+of 76 and 282 ms, against 11.1 and 24.7 ms for the same model and contexts on
+`--kv-quant none` below. The extra time is host-side work inside the forward
+(`sync_per_step_ms` stays at 2.8 ms while the step runs 282 ms), so the share
+there is being divided by a separate defect rather than by attention. The `none`
+arm is the one to read for that model. The codec gap itself is worth its own
+look and is not this section's subject.
+
+Bonsai's "served default" row is not the expensive shape the other two models
+show, for a mundane reason: it ships no `generation_config.json`, so its served
+default is the hard-coded `temperature 1.0` with no filters — the same cost as
+the temperature cell. The filters are what make gemma-4's and Qwen3.6's served
+defaults three to four times dearer.
+
+#### The same models on a healthy codec (`--kv-quant none`)
+
+Re-run with `--kv-quant none`. Its greedy control decodes Bonsai at 95.6 tok/s
+at 16k and 41.4 at 64k, against the ~83 and ~38 recorded for that model and
+codec in `docs/PERF_BASELINE.md` — the same regime, on a busier host, rather
+than the 13.2 / 3.6 above. The denominator is legitimate attention cost:
+
+| model | ctx | cell | `sample` ms/step | `step` ms/step | `share%` | decode_tps |
+|---|---:|---|---:|---:|---:|---:|
+| Ternary-Bonsai-8B | 16k | `--temperature 0.7` | 0.505 | 11.13 | 4.54 % | 87.8 |
+| Ternary-Bonsai-8B | 16k | `--repetition-penalty 1.1` | 0.150 | 10.55 | 1.42 % | 92.8 |
+| Ternary-Bonsai-8B | 64k | `--temperature 0.7` | 0.519 | 24.70 | 2.10 % | 39.5 |
+| Ternary-Bonsai-8B | 64k | `--repetition-penalty 1.1` | 0.143 | 23.76 | 0.60 % | 41.1 |
+| Qwen3.6-35B-A3B | 16k | `--temperature 0.7` | 0.828 | 12.39 | 6.68 % | 80.7 |
+| Qwen3.6-35B-A3B | 16k | `--repetition-penalty 1.1` | 0.239 | 11.30 | 2.12 % | 88.5 |
+| Qwen3.6-35B-A3B | 64k | `--temperature 0.7` | 0.838 | 16.00 | 5.25 % | (unsettled) |
+| Qwen3.6-35B-A3B | 64k | `--repetition-penalty 1.1` | 0.239 | 16.28 | 1.47 % | (unsettled) |
+
+The two Qwen3.6 64k cells had their `decode_tps` refused for not settling under
+host contention; their `share` is a within-step ratio and is unaffected.
+
+#### Per-context verdict against the issue's kill criterion
+
+The criterion — host share under 3 % for both temperature and repetition
+penalty — evaluated per context rather than once:
+
+| model | codec | 4k | 16k | 64k |
+|---|---|---|---|---|
+| gemma-4-e2b (sliding-window, vocab 262144) | auto | **NOT MET** 10.00 / 2.76 | **NOT MET** 9.29 / 2.63 | **NOT MET** 8.30 / 2.24 |
+| Qwen3.6-35B-A3B (global, 248320) | auto | **NOT MET** 6.98 / 2.04 | **NOT MET** 6.56 / 1.94 | **NOT MET** 4.58 / 1.41 |
+| Qwen3.6-35B-A3B | none | — | **NOT MET** 6.68 / 2.12 | **NOT MET** 5.25 / 1.47 |
+| Ternary-Bonsai-8B (global, 151669) | auto | **NOT MET** 5.80 / 1.78 | (MET 0.65 / 0.19 — collapsed denominator, see above) | (MET 0.18 / 0.06 — same) |
+| Ternary-Bonsai-8B | none | — | **NOT MET** 4.54 / 1.42 | **MET** 2.10 / 0.60 |
+
+(`temperature 0.7` / `repetition-penalty 1.1`, in that order.)
+
+**The criterion is not met.** It is met in exactly one of the nine legitimate
+(model, context, codec) cells — Ternary-Bonsai-8B at 64k on `none` — and missed
+everywhere else, including at 64k on both other architectures. The two Bonsai
+`auto` cells that clear it do so against a step time inflated by the codec, not
+by attention.
+
+What the sweep does narrow is the shape of the claim. The cost falls with
+context on globally-attending models, so it is worst at short context; and it
+falls hardly at all on sliding-window attention, where gemma-4-e2b still pays
+8.3 % at 64k. It also scales with vocabulary. "Sampling is expensive" is
+therefore too broad: it is expensive at large vocabularies, at short-to-medium
+context, and on architectures whose step time does not grow with context — and
+it is expensive at *every* context measured once the ordering filters the served
+defaults enable are switched on.
+
+#### Cost by knob, at 4k
+
+| Model | vocab | cell | `sample` ms/step | `share%` | decode TPS vs greedy |
+|---|---:|---|---:|---:|---:|
+| gemma-4-e2b | 262144 | greedy | — | — | 129.22 (control) |
+| gemma-4-e2b | 262144 | `--repetition-penalty 1.1` | 0.228 | 2.75 | −4.9 % |
+| gemma-4-e2b | 262144 | `--temperature 0.7` | 0.880 | 9.80 | −14.1 % |
+| gemma-4-e2b | 262144 | `--temperature 0.7 --repetition-penalty 1.1` | 0.874 | 9.88 | −11.9 % |
+| gemma-4-e2b | 262144 | `--temperature 0.7 --top-p 0.95` | 2.525 | 22.89 | −29.9 % |
+| Ternary-Bonsai-8B | 151669 | greedy | — | — | 134.50 (control) |
+| Ternary-Bonsai-8B | 151669 | `--repetition-penalty 1.1` | 0.141 | 1.72 | −12.4 % |
+| Ternary-Bonsai-8B | 151669 | `--temperature 0.7` | 0.487 | 5.82 | −13.5 % |
+| Ternary-Bonsai-8B | 151669 | `--temperature 0.7 --repetition-penalty 1.1` | 0.491 | 5.87 | −14.2 % |
+| Ternary-Bonsai-8B | 151669 | `--temperature 0.7 --top-p 0.95` | 1.665 | 17.15 | −26.0 % |
+| Qwen3.6-35B-A3B | 248320 | greedy | — | — | 98.61 (control) |
+| Qwen3.6-35B-A3B | 248320 | `--repetition-penalty 1.1` | 0.218 | 2.04 | −5.3 % |
+| Qwen3.6-35B-A3B | 248320 | `--temperature 0.7` | 0.790 | 7.09 | −9.2 % |
+| Qwen3.6-35B-A3B | 248320 | `--temperature 0.7 --top-p 0.95` | 2.847 | 20.67 | −26.4 % |
+
+Reading it:
+
+- **Temperature alone** is 5.8–9.8 % of step time in host work at 4k. The work
+  is the transfer plus a full-vocabulary softmax.
+- **A repetition penalty alone** is the cheapest host cell — 1.7–2.8 % — because
+  the penalty arithmetic touches at most 20 ids; the transfer and the host argmax
+  are the whole cost. Its throughput deltas (−4.9 / −12.4 / −5.3 %) are *not*
+  explained by `sample`: subtracting it from the greedy step leaves 0.17 ms
+  (gemma), 0.64 ms (Bonsai) and 0.35 ms (Qwen3.6) unaccounted, a spread too wide
+  for a structurally identical change. The forfeited pipelining is the obvious
+  candidate and it is untested — no measurement here isolates it.
+- **The ordering filters are the dominant term.** `--top-p 0.95` roughly triples
+  the host work, to 17–23 % of step time, because it sorts the entire
+  vocabulary; `--top-k` does the same. Anyone optimising this path should start
+  there and should not assume the other stages behave alike.
+- The cost tracks vocabulary size within a stage: at temperature 0.7 the
+  262144-token vocabulary pays 0.880 ms/step against 0.487 ms/step for the
+  151669-token one.
+
+### Host selection is not bit-identical to the GPU argmax
+
+At `--temperature 0.0001` the host categorical sampler is arithmetically an
+argmax (every non-maximal logit underflows to exactly zero), so its token stream
+should match the greedy GPU `argmax` stream. On gemma-4-e2b it does, for all 100
+tokens. On Ternary-Bonsai-8B it agrees through 32 tokens and diverges by 64. The
+divergence is reproducible and every run within a cell agrees, so it is a
+deterministic property of the two paths and not a race.
+
+**The mechanism is not established.** The candidate is tie-breaking: MLX's
+`argmax` returns the first maximal index and Rust's `Iterator::max_by` returns
+the last, so an exact tie in the logits row would select different tokens. But
+that does not predict what was observed. `--repetition-penalty 1.1` is a
+different objective, not another route to the same argmax — it divides positive
+logits of the trailing-20 ids by 1.1 — and its stream, which is selected by
+`max_by`, matched the temperature stream, which is selected by
+`sample_inverse_cdf` (the first index whose cumulative sum passes an RNG draw).
+Under a two-way tie those two agree only by chance. Confirming or discarding the
+hypothesis needs the top-2 logits at the first divergent step, which nothing here
+dumps.
+
+What *is* established: the two paths are not interchangeable oracles on every
+model, which matters to anything that treats one as a reference for the other.
 
 ## Special tokens
 

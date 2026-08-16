@@ -614,6 +614,88 @@ pub(crate) struct BenchArgs {
     pub allow_truncate: bool,
     /// Emit the summary as one JSON object instead of a table.
     pub json: bool,
+    /// Sampling temperature. `0.0` keeps the cell on the GPU argmax path.
+    pub temperature: f32,
+    /// Nucleus threshold; `1.0` disables it.
+    pub top_p: f32,
+    /// Top-k cutoff; `0` disables it.
+    pub top_k: u32,
+    /// Sign-aware multiplicative repetition penalty; `1.0` is the no-op.
+    pub repetition_penalty: f32,
+}
+
+/// Upper bound on `--temperature`, matching the one the HTTP surface and
+/// `--default-temperature` already enforce. Above it the distribution flattens
+/// toward uniform over the vocabulary, and at infinity it is exactly uniform —
+/// benchable, but not a cell any served request can reach.
+const MAX_TEMPERATURE: f32 = 2.0;
+
+impl BenchArgs {
+    /// `true` when the cell routes through the host sampler rather than the GPU
+    /// argmax. Mirrors the decode loop's own gate
+    /// (`sampling_active() || penalties_active()`); it exists here so the
+    /// summary can label a cell that is not the greedy shape everything else in
+    /// this file measures.
+    #[allow(
+        clippy::float_cmp,
+        reason = "exact identity comparison on purpose: it must agree with PenaltyConfig::penalties_active(), which is also exact. A tolerance here would label a cell greedy that the decode loop routes through the host sampler"
+    )]
+    fn host_sampled(&self) -> bool {
+        self.temperature > 0.0 || self.repetition_penalty != 1.0
+    }
+
+    /// Reject sampler knobs that cannot produce a meaningful cell, before the
+    /// model is loaded. A NaN temperature would silently fail the `> 0.0` gate
+    /// and bench greedy under a sampling label; a non-positive repetition
+    /// penalty divides positive logits by zero or flips their sign; and a
+    /// distribution filter at temperature 0 is never reached at all, so the cell
+    /// would be recorded carrying a setting it did not exercise.
+    #[allow(
+        clippy::float_cmp,
+        reason = "exact identity comparisons on purpose: these gates must agree with the sampler's own exact identity checks, and a tolerance would let a knob through that the sampler treats as set"
+    )]
+    fn validate_sampling(&self) -> anyhow::Result<()> {
+        if self.temperature.is_nan() || self.temperature < 0.0 {
+            return Err(anyhow::anyhow!(
+                "--temperature must be >= 0 (got {}); 0 is greedy",
+                self.temperature
+            ));
+        }
+        if self.temperature > MAX_TEMPERATURE {
+            return Err(anyhow::anyhow!(
+                "--temperature must be <= {MAX_TEMPERATURE} (got {}); that is the bound the HTTP \
+                 surface and --default-temperature enforce, so a higher value benches a cell no \
+                 served request can reach",
+                self.temperature
+            ));
+        }
+        if self.top_p.is_nan() || self.top_p <= 0.0 || self.top_p > 1.0 {
+            return Err(anyhow::anyhow!(
+                "--top-p must be in (0, 1] (got {}); 1 disables nucleus truncation",
+                self.top_p
+            ));
+        }
+        if self.repetition_penalty.is_nan() || self.repetition_penalty <= 0.0 {
+            return Err(anyhow::anyhow!(
+                "--repetition-penalty must be > 0 (got {}); 1 is the exact no-op",
+                self.repetition_penalty
+            ));
+        }
+        // The distribution filters live downstream of the softmax, which only the
+        // temperature path runs. At temperature 0 the cell is a GPU argmax and
+        // never reaches them, so accepting the flag would record a nucleus or
+        // top-k setting against a cell that applied neither.
+        if self.temperature == 0.0 && (self.top_p != 1.0 || self.top_k != 0) {
+            return Err(anyhow::anyhow!(
+                "--top-p / --top-k require --temperature > 0 (got top_p={}, top_k={} at \
+                 temperature 0): both filter the post-softmax distribution, which the greedy \
+                 path never builds, so the cell would carry a setting it did not exercise",
+                self.top_p,
+                self.top_k
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Run one generation and return its sample, or the reason there is none.
@@ -623,16 +705,22 @@ fn measure_one(
     prompt_ids: &[u32],
     args: &BenchArgs,
 ) -> anyhow::Result<RunSample> {
+    // Greedy by default. The seed is the fixed default, and the RNG is fresh per
+    // run, so a sampled cell still produces one token stream across every run —
+    // which is what the digest guard checks.
     let sampler_cfg = rmlx_models::SamplerConfig {
-        temperature: 0.0,
-        top_p: 1.0,
-        top_k: 0,
+        temperature: args.temperature,
+        top_p: args.top_p,
+        top_k: args.top_k,
         min_p: 0.0,
         seed: None,
         top_logprobs_k: 0,
     };
     let mut rng = rmlx_models::Pcg32::new(sampler_cfg.seed_or_default());
-    let penalty_cfg = rmlx_models::PenaltyConfig::default();
+    let penalty_cfg = rmlx_models::PenaltyConfig {
+        rep_penalty: args.repetition_penalty,
+        ..rmlx_models::PenaltyConfig::default()
+    };
     let mut token_history: Vec<u32> = Vec::new();
 
     // Empty the prompt cache so this generation is a guaranteed miss and runs a
@@ -1021,6 +1109,7 @@ pub(crate) fn run_bench(args: BenchArgs) -> anyhow::Result<()> {
              run-to-run spread, and this instrument does not report a central value without one"
         ));
     }
+    args.validate_sampling()?;
 
     let tokenizer = tokenizers::Tokenizer::from_file(args.model.join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("cannot load tokenizer.json: {e}"))?;
@@ -1116,6 +1205,13 @@ fn emit_json(ctx: &ReportCtx<'_>, s: &BenchSummary, samples: &[RunSample]) -> an
         "cpus": ctx.cpus,
         "contended": ctx.contended,
         "token_digest": format!("{:#018x}", s.token_digest),
+        "sampling": {
+            "host_sampled": ctx.args.host_sampled(),
+            "temperature": ctx.args.temperature,
+            "top_p": ctx.args.top_p,
+            "top_k": ctx.args.top_k,
+            "repetition_penalty": ctx.args.repetition_penalty,
+        },
         "metrics": {
             "ttft_ms": spread_json(&s.ttft_ms),
             "decode_tps": spread_json(&s.decode_tps),
@@ -1154,6 +1250,14 @@ fn emit_table(ctx: &ReportCtx<'_>, s: &BenchSummary) {
         ctx.args.warmup,
         ctx.load_ms
     );
+    // Named only when it is not the greedy default, so the common line stays as
+    // it was — but a sampled cell can never be mistaken for a greedy one.
+    if ctx.args.host_sampled() {
+        println!(
+            "sampling: host path — temperature={} top_p={} top_k={} repetition_penalty={}",
+            ctx.args.temperature, ctx.args.top_p, ctx.args.top_k, ctx.args.repetition_penalty
+        );
+    }
     println!(
         "{:<16} {:>14} {:>14} {:>14} {:>9}",
         "metric", "median", "min", "max", "range%"

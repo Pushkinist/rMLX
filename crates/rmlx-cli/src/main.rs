@@ -1226,6 +1226,30 @@ enum Cmd {
         /// (`longctx_<N>k.json`). Env: `RMLX_PROMPTS_DIR`.
         #[arg(long, env = "RMLX_PROMPTS_DIR", value_name = "PATH")]
         prompts_dir: Option<PathBuf>,
+        /// Sampling temperature. `0` (the default) is greedy: the GPU argmax
+        /// path, with no logits row read back to the host. Any positive value
+        /// routes the cell through the host sampler instead, which is the only
+        /// way to bench that path — every other shape this binary measures is
+        /// greedy. The seed is the fixed default, so runs stay comparable.
+        #[arg(long, default_value_t = 0.0, value_name = "FLOAT")]
+        temperature: f32,
+        /// Nucleus threshold. Requires `--temperature` > 0; `1.0` (the default)
+        /// disables it. Its cost is an ordering pass over the whole vocabulary,
+        /// so bench it separately from temperature alone.
+        #[arg(long, default_value_t = 1.0, value_name = "FLOAT")]
+        top_p: f32,
+        /// Top-k cutoff. Requires `--temperature` > 0; `0` (the default)
+        /// disables it. Also an ordering pass over the whole vocabulary. Needed
+        /// to reproduce the served default: several snapshots ship a `top_k` in
+        /// `generation_config.json`, so a request that omits sampling fields
+        /// gets one.
+        #[arg(long, default_value_t = 0, value_name = "N")]
+        top_k: u32,
+        /// Sign-aware multiplicative repetition penalty over the trailing
+        /// 20-token window. `1.0` (the default) is the exact no-op. A value
+        /// other than 1 reads the logits row to the host even at temperature 0.
+        #[arg(long, default_value_t = 1.0, value_name = "FLOAT")]
+        repetition_penalty: f32,
     },
     /// Manage named server profiles in `<RMLX_HOME>/profiles.toml`.
     Profile {
@@ -2317,6 +2341,10 @@ fn main() -> Result<()> {
             allow_truncate,
             json,
             prompts_dir,
+            temperature,
+            top_p,
+            top_k,
+            repetition_penalty,
         } => {
             let cap_is_explicit = max_prompt_tokens.is_some();
             let max_prompt_tokens = parse_max_prompt_tokens(
@@ -2366,6 +2394,10 @@ fn main() -> Result<()> {
                 cap_is_explicit,
                 allow_truncate,
                 json,
+                temperature,
+                top_p,
+                top_k,
+                repetition_penalty,
             })?;
         }
         Cmd::Eval { cmd } => match cmd {
