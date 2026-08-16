@@ -536,6 +536,16 @@ Date: 2026-05-21. Hardware: M5 Max.
 | mlx-community__Qwen3.6-35B-A3B-8bit | 848d4785 | k8v8 | 96.64 | 2.00 | release-perf | 2026-05-21 |
 | mlx-community__bitnet-b1.58-2B-4T | fa2ec73 | k8v8 | 31.61 | 0.17 | release | 2026-05-28 |
 
+**The canary is a short-context instrument, and that is a coverage limit.** The
+pinned shape tops out around 3 900 context tokens, so nothing keyed to a longer
+context is observable in these anchors — every one of them is a measurement of
+the model's short-context behaviour and says nothing about its long-context
+behaviour. A per-step defect on the Mixed V path that only engaged past 8 192
+tokens sat behind these numbers for months without moving them: it could not,
+because the canary never reaches the shape where it engages. Read a green canary
+as "no short-context regression", never as "no regression", and put long-context
+claims on a cell that actually runs long.
+
 **Qwen3-dense bf16-stream fix (2026-06-24).** Casting Qwen3 norm weights and
 quant scales/biases to bf16 at load (they ship fp16 on Bonsai) stops the
 residual stream — and the `--kv-quant none` KV cache — from widening to f32. The
@@ -1232,16 +1242,28 @@ Bonsai, 1 warmup discarded + 3 measured, `--max-tokens 100`, `--log info`:
 combined-TPS metric, the larger 8k prefill (TTFT ~4.4-4.9 s vs ~1.8 s at 4k) was
 amortized differently across the generation window, which could make the
 *combined* number look better at 8k for some token counts. Once prefill is
-excluded, 8k decode is unambiguously slower — expected, since each decode step
-attends over ~2x more KV (longer Mixed quantized_matmul over the cache).
+excluded, 8k decode is unambiguously slower.
 
 The KV-quant auto-resolution is **identical** at both contexts:
 `Qwen3ForCausalLM` with `weight_bits=2` resolves to `Mixed{k8,v4,g64,g64}`
 regardless of ctx — `resolve_default` (`kv_cache/mod.rs:331`) has no ctx branch
 for this arch, and `kv_quant_for_ctx` is not consulted on the baseline path. So
-the 4k-vs-8k difference is NOT a KV-quant-by-ctx effect; it is the pure
-KV-length scaling of the per-step attention. No fix needed — this is correct
-behavior, and both runs already go through the identical `rmlx baseline` path.
+the 4k-vs-8k difference is not a KV-quant-by-ctx effect.
+
+**The original attribution was wrong, and the size of the drop was the clue.**
+This section used to close with "no fix needed — this is correct behavior",
+reading the 2.8× as the ordinary cost of attending over 2× more KV. Ordinary
+KV-length scaling does not cost 2.8× for 2× the tokens. The 4k cell sits below
+8 192 context tokens and the 8k cell above it, and the Mixed/RotK V side used to
+divert to a separate MSL kernel at exactly that boundary — a kernel that
+dispatched one thread per output element with a threadgroup of 1 and applied
+symmetric dequant to affine data, so it was both very slow and numerically
+wrong. Removing it puts Mixed at 0.97–1.00× of `none` at 16k on Bonsai and
+gemma-4-e2b. Re-measure this pair before drawing scaling conclusions from it.
+
+The general lesson stands on its own: a step change in a per-step cost that is
+supposed to grow smoothly with context is a dispatch boundary, not a scaling
+curve. Sweep context finely enough to tell the two apart.
 
 ### H8 — Gemma4 + Mixed runtime_fail = cross-layer-KV-sharing contract — ACCEPT
 

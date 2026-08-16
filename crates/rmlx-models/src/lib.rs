@@ -59,10 +59,10 @@ pub mod speculative;
 pub mod ssd_tier;
 
 // The MSL wrapper re-exports (`rmlx_models::{q8_msl,
-// turboquant_msl, planarquant_msl, turbo_flash_msl, sparse_v_msl}`) were
+// turboquant_msl, planarquant_msl, turbo_flash_msl}`) were
 // dropped — there were zero callers in the workspace. Import directly from
-// `rmlx_kv_quant::{q8_msl,turboquant_msl,planarquant_msl,turbo_flash_msl,
-// sparse_v_msl}` if needed.
+// `rmlx_kv_quant::{q8_msl,turboquant_msl,planarquant_msl,turbo_flash_msl}`
+// if needed.
 
 pub use arch::{is_arch_supported, read_load_phases, LoadPhases};
 pub use constraint::{ConstraintEngine, NoOpConstraint};

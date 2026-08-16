@@ -42,7 +42,7 @@ dropped; callers import the items directly from `rmlx_kv_quant`:
 | `q8_quantize`, `q8_dequantize`, `Q8_GROUP_SIZE` | `rmlx_kv_quant::q8`                     |
 | `turboquant::{TurboBlocks, turbo_quantize_v, turbo_dequantize, GROUP_SIZE, …}` | `rmlx_kv_quant::turboquant` |
 | `planarquant::{PlanarBlocks, planar_quantize, planar_dequantize, …}`           | `rmlx_kv_quant::planarquant` |
-| MSL wrappers: `q8_msl::*`, `turboquant_msl::*`, `planarquant_msl::*`, `turbo_flash_msl::*`, `sparse_v_msl::*`, `rot_k_msl::*`, `k8vturbo3_append_msl::*` | `rmlx_kv_quant::*` |
+| MSL wrappers: `q8_msl::*`, `turboquant_msl::*`, `planarquant_msl::*`, `turbo_flash_msl::*`, `rot_k_msl::*`, `k8vturbo3_append_msl::*` | `rmlx_kv_quant::*` |
 | Rotation helpers: `rot_k::{hadamard_rotation, rotate_last_axis, …}` | `rmlx_kv_quant::rot_k` |
 | SWA ring buffer: `rotating::*` | `rmlx_kv_quant::rotating` |
 
@@ -72,7 +72,7 @@ use rmlx_kv_quant::mixed_quant::{MixedKvState, MixedTuple};
 use rmlx_kv_quant::paged::{PagedKStorage, PagedVStorage, PagedPlanarVStorage};
 use rmlx_kv_quant::turboquant::{TurboBlocks, turbo_quantize_v, turbo_dequantize, GROUP_SIZE};
 use rmlx_kv_quant::planarquant::{PlanarBlocks, planar_quantize, planar_dequantize};
-use rmlx_kv_quant::{q8_msl, turboquant_msl, planarquant_msl, turbo_flash_msl, sparse_v_msl};
+use rmlx_kv_quant::{q8_msl, turboquant_msl, planarquant_msl, turbo_flash_msl};
 
 // SSD-tier layer — rmlx-kv-ssd root + module re-exports:
 use rmlx_kv_ssd::{
