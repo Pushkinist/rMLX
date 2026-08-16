@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **Prefill attention masks are built on device, not scalar-filled on the
+  host.** `build_chunked_prefill_mask` and `build_swa_prefill_mask` allocated
+  three full-size buffers per call — an `f32` `Vec`, its upload, and the bf16
+  cast — for a mask that is O(`seq` × `kv_len`). A 68 898-token gemma-4-e2b
+  prefill spent 69.5% of its main-thread samples there and drove free memory to
+  zero, which made every repeated in-process generation slower than the last
+  (gen3/gen1 prefill 1.24–1.33). The builders now compose the mask from MLX
+  position vectors (`arange` → broadcast compare → `where`), so it is produced
+  where it is consumed and never crosses the host boundary. Shared by every
+  architecture that chunk-prefills, and bit-identical: temp=0 token digests are
+  unchanged on all three test-target families at every context measured.
+
+  Measured `rmlx bench --kv-quant none --warmup 0 --runs 3`, free memory
+  settled before each cell, before/after pairs run back-to-back at matched
+  host load. `prefill_ms` per generation, gen-1 first:
+
+  | cell | before | after | gen-1 Δ |
+  |---|---|---|---|
+  | gemma-4-e2b @4 096 | 254.9 / 213.8 / 219.4 ms | 226.1 / 184.9 / 185.5 ms | −11.3% |
+  | gemma-4-e2b @68 898 | 13 673–14 024 ms | 4 762–5 277 ms | −63% |
+  | Qwen3.6-35B-A3B @4 096 | 1 461.2 / 1 090.2 / 1 111.9 ms | 1 155.2 / 1 089.9 / 1 091.3 ms | −20.9% |
+  | Qwen3.6-35B-A3B @34k | 12 828.4 ms | 12 267.2 ms | −4.4% |
+  | Ternary-Bonsai-8B @4 096 | 1 347.8 / 1 358.3 ms | 1 364.7 ms | +0.9% |
+  | Ternary-Bonsai-8B @68 898 | 60 032.2 ms | 59 296.7 ms | −1.2% |
+
+  The small-shape case is the one a device-built mask could lose — it trades a
+  host upload for a handful of MLX dispatches — so the 4 096-token cells are
+  measured, not argued: both improve. Decode TPS, `kv_cache_bytes` and token
+  digests are unchanged on every cell.
+
+  The gemma-4-e2b @68 898 cell is where the repeated-generation drift lived. It
+  no longer crosses the host's free-memory line, so the drift is gone rather
+  than reduced:
+
+  | | before | after |
+  |---|---|---|
+  | gen3/gen1 prefill | 1.24–1.33 | 0.97–1.00 |
+  | free memory low-water | 0.07–0.10 GiB | 12.4–23.9 GiB |
+  | compressor growth | +14.0–15.2 GiB | +0.00 GiB |
+  | decompressions | 6.2–6.3 M | 0.002–0.003 M |
+  | `build_attn_mask` share of main-thread samples | 69.5% | 0.07% |
+
+  Ternary-Bonsai-8B's prefill time is unchanged (±3%, it is GPU-bound behind
+  MLX's fused `head_dim=128` kernel) but at 68 898 tokens its free memory now
+  bottoms out at 18.6 GiB instead of 0.1 GiB.
+
+  Sharing one prefill mask across a forward call's layers — which
+  `qwen3_5_moe` and `qwen3_vl_moe` do and continue to do — was measured on both
+  architectures that use it and is **not** uniformly good or bad: on gemma-4-e2b
+  @68 898 sharing costs 2× the prefill time, on Qwen3.6 @34k it wins by 1.6%
+  (inside run-to-run spread). No hoist was added or removed here. `mask.rs`
+  records both numbers and does not claim a mechanism for the gemma-4 one.
+
 ### Fixed
 
 - **The fused-QK dispatch table listed eight codecs it could never serve, and

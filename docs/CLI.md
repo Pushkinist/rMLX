@@ -510,9 +510,9 @@ none`, 4096-token prompt, 128 generated):
 
 | | gemma-4-e2b | Ternary-Bonsai-8B |
 |---|---|---|
-| `baseline` (median of 3 invocations) | 257 ms | 1272 ms |
-| `bench` generation 1 (`--warmup 0`) | 250 ms (**−2.6%**) | 1297 ms (**+2.0%**) |
-| `bench` median (`--warmup 1`) | 207 ms (−19%) | 1345 ms (+5.8%) |
+| `baseline` (median of 3 invocations) | 220 ms | 1354 ms |
+| `bench` generation 1 (`--warmup 0`) | 221 ms (**+0.5%**) | 1354 ms (**+0.0%**) |
+| `bench` median (`--warmup 1`) | 189 ms (−14%) | 1418 ms (+4.7%) |
 
 Generation 1 agrees with `baseline` on both architectures; the divergence is the
 warmup, not a disagreement about what a TTFT is. Compare `bench` TTFTs to other
@@ -520,8 +520,10 @@ warmup, not a disagreement about what a TTFT is. Compare `bench` TTFTs to other
 TTFTs. Decode TPS does not have this problem — it averages the steady-state
 gaps *within* a generation, so it is robust in both tools.
 
-At long context the movement is large enough that `bench` refuses to report a
-median at all until the cell settles — see the drift refusal below.
+A warm-up shape is itself a trend, so `bench` can refuse a cell whose only
+problem is that generation 1 was the slowest — the gemma-4-e2b column above was
+read out of exactly such a refusal. Raise `--warmup` until consecutive runs
+agree; see the drift refusal below.
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
