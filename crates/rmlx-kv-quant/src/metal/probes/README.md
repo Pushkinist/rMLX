@@ -33,7 +33,13 @@ header or the probe's own signature.
 
 Each body is compiled twice, at `-std=metal3.0` and `-std=metal4.0`. The second
 pass is what makes a `#if __HAVE_TENSOR__` body checkable: below Metal 4.0 that
-macro is undefined and such a body compiles to an empty translation unit.
+macro is undefined and such a body compiles to an empty translation unit. On a
+toolchain that cannot do the second pass, those bodies are reported as `SKIP` and
+counted rather than compiled without the guard; CI runs `--strict`, which refuses
+the reduced gate outright.
+
+Buffer types are `u` (uint), `i` (int) and `f` (float) — use the one the dispatch
+site declares.
 
 ## Files
 

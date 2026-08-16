@@ -30,12 +30,13 @@ fn to_f32_vec(a: &Array) -> Vec<f32> {
         .collect()
 }
 
-/// Kernel registration: build the kernel without crashing.
-/// Verifies that the MSL source compiles on the live Metal device.
+/// Kernel registration: MLX accepts the source and hands back a handle.
 ///
-/// One registration serves both `ROWS_PER_TILE` variants — the value is an MLX
-/// template int applied at dispatch, so the per-variant instantiations are
-/// covered by the two round-trip tests below rather than here.
+/// This does NOT prove the MSL compiles — MLX compiles lazily on first
+/// `apply()`, so a syntax error surfaces there, not here. The two round-trip
+/// tests below are what force the compile (and one instantiation each of the
+/// `ROWS_PER_TILE` template int); `make check-metal-compiles` is what catches a
+/// syntax error without a GPU.
 #[test]
 #[ignore = "GPU Metal context — run in isolation: cargo test paroquant_msl -- --ignored --test-threads=1"]
 #[allow(
@@ -43,7 +44,57 @@ fn to_f32_vec(a: &Array) -> Vec<f32> {
     reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
 )]
 fn paro_kernel_registration() {
-    paro_rotate_kernel().expect("paro rotate kernel should compile");
+    paro_rotate_kernel().expect("paro rotate kernel should register");
+}
+
+/// The compile probe's `MAX_KROT` / `MAX_GROUP_SIZE` must equal the Rust consts
+/// the dispatch passes as template ints.
+///
+/// Those manifest values are hand-written, so they are a second source of the
+/// same numbers — the drift the `probes/*.hdr.metal` snapshots are pinned
+/// against, one field over. Production numerics cannot go wrong (the dispatch
+/// reads the consts directly), but the probe silently stops representing the
+/// shape production requests: raising `MAX_GROUP_SIZE` in Rust would leave the
+/// gate compiling a threadgroup allocation nothing ever asks for, and the real
+/// one would first be seen on a GPU dispatch. Equality here turns that into a
+/// hard failure.
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+#[test]
+fn probe_manifest_defines_match_rust_consts() {
+    const MANIFEST: &str = include_str!("metal/probes/kernels.manifest");
+    const BODY: &str = "paroquant_rotate.metal";
+
+    let line = MANIFEST
+        .lines()
+        .find(|l| !l.trim_start().starts_with('#') && l.trim_start().starts_with(BODY))
+        .expect("manifest must carry a paroquant_rotate.metal line");
+    let defines = line
+        .split('|')
+        .nth(3)
+        .expect("paroquant_rotate.metal line must carry a defines field");
+
+    let lookup = |name: &str| -> Option<usize> {
+        defines.split(',').find_map(|d| {
+            let (k, v) = d.split_once('=')?;
+            (k.trim() == name).then(|| v.trim().parse::<usize>().ok())?
+        })
+    };
+
+    assert_eq!(
+        lookup("MAX_KROT"),
+        Some(MAX_KROT),
+        "stale probe: metal/probes/kernels.manifest sets MAX_KROT to something other than \
+         paroquant_msl.rs's MAX_KROT={MAX_KROT}"
+    );
+    assert_eq!(
+        lookup("MAX_GROUP_SIZE"),
+        Some(MAX_GROUP_SIZE),
+        "stale probe: metal/probes/kernels.manifest sets MAX_GROUP_SIZE to something other \
+         than paroquant_msl.rs's MAX_GROUP_SIZE={MAX_GROUP_SIZE}"
+    );
 }
 
 /// Round-trip identity at `batch = 1`, which selects `ROWS_PER_TILE = 1` — the

@@ -4,7 +4,7 @@
 # for the probe layout.
 #
 # Format:  <body.metal> | <header or -> | <name:type,...> | [NAME=VALUE,...]
-#   type: u = uint buffer, f = float buffer
+#   type: u = uint buffer, i = int buffer, f = float buffer
 #
 # Every `.metal` file in the parent directory must appear here, as a body or as
 # a `../`-prefixed header. The gate fails on one that does not.
@@ -12,5 +12,7 @@
 # The language-version probe. This is the one body in the tree guarded by
 # `#if __HAVE_TENSOR__`, so it is what gives the gate's metal4.0 pass something
 # real to check: at metal3.0 the guard is inactive and the body compiles to
-# nothing, at metal4.0 the descriptor must instantiate.
-nax_probe.metal | ../nax_probe_header.metal | out:f
+# nothing, at metal4.0 the descriptor must instantiate. `out` is `i` because the
+# dispatch site declares Dtype::I32 — probing it as float would type-check the
+# int stores as float conversions.
+nax_probe.metal | ../nax_probe_header.metal | out:i

@@ -1104,10 +1104,10 @@ test; see CLAUDE.md hard rule 10.
 
 ### MSL gates (`make ci`, enforced in CI)
 
-Two gates run over the three kernel directories listed above. The directory list
-lives in `scripts/check_metal_compiles.sh` (`METAL_DIRS`) and is mirrored in
-`scripts/check_metal_format.sh`; a crate that starts shipping MSL must be added
-there, since nothing else discovers it.
+Two gates run over the three kernel directories listed above. The list is
+single-sourced in `scripts/metal_dirs.sh`, sourced by both gates and referenced
+by the `check-metal-format` pre-commit hook's trigger pattern; a crate that
+starts shipping MSL must be added there, since nothing else discovers it.
 
 | Target | Tool | Checks |
 |---|---|---|
@@ -1119,9 +1119,23 @@ production compiles at (see "MLX JIT language version" above). `metal3.0` is the
 floor, kept so newer syntax cannot creep in unnoticed. The second pass is what
 makes a `#if __HAVE_TENSOR__` kernel checkable at all: that macro is undefined
 below 4.0, so at `metal3.0` such a body compiles to an empty translation unit
-and the gate goes green having validated nothing. A body naming that guard is
-therefore **rejected** — not skipped — when the toolchain cannot reach
-`metal4.0`.
+and the gate goes green having validated nothing. Such a body is therefore never
+compiled without the guard — it is checked for real, or reported as `SKIP` and
+counted, never quietly passed.
+
+The capability is probed by asserting the guard and the cooperative-tensor
+includes, not by testing that the driver accepts the `-std` flag. A toolchain
+that takes the flag but leaves `__HAVE_TENSOR__` undefined would otherwise
+compile a guarded body through its `#else` arm at *both* passes — the same
+vacuous pass, reached another way.
+
+**One toolchain policy, not two.** "This box cannot do X" gets the same answer
+whether X is the Metal compiler itself or the Metal 4 pass: hard failure under
+`--strict` (CI, which must never report green while checking less), and a loud
+notice plus a reduced run otherwise. A contributor on an older Xcode keeps a
+working `make ci`; what could not be checked is named on stdout and counted in
+the summary line. Splitting that rule would break the dev loop for everyone
+whose Xcode predates Metal 4, over one diagnostic kernel that ships nothing.
 
 **Manifest coverage is enforced.** Every `.metal` file in a gated directory must
 be named by that directory's `probes/kernels.manifest`, as a body or as a
@@ -1132,7 +1146,9 @@ same vacuous pass in a different disguise, so the gate hard-fails on it.
 Command-Line-Tools-only box is not blocked — but a skipping gate protects
 nothing, so the skip is local-only. The `msl` job in
 `.github/workflows/ci.yml` runs both with `METAL_STRICT=--strict`, which turns
-a missing tool into a hard failure. The GitHub macOS runner ships full Xcode,
+a missing tool into a hard failure — and, for the compile gate, a toolchain that
+cannot do the `metal4.0` pass; for the format gate, an empty file set, so a
+renamed kernel directory cannot silently disable it while the job stays green. The GitHub macOS runner ships full Xcode,
 so the compile gate runs for real there; compiling MSL needs the toolchain,
 not a GPU, so it works on a runner with no usable Metal device. Install full
 Xcode (`xcode-select -s /Applications/Xcode.app`) to run the compile gate
@@ -1147,7 +1163,11 @@ per body: the header to prepend, the buffer names the body expects, and an
 optional fourth field of `#define NAME VALUE` pairs for the values MLX injects
 at dispatch that are neither buffers nor header constants — template dtypes
 (`OutT`, `InT`, `StT`), template ints (`Dk`, `ROWS_PER_TILE`, …) and scalar 0-D
-inputs (`T`), which the body sees as numeric literals.
+inputs (`T`), which the body sees as numeric literals. Buffer types are `u`
+(uint), `i` (int) and `f` (float), matching the dtype the dispatch site declares.
+Where such a `#define` duplicates a Rust const, pin it with an equality test as
+`probe_manifest_defines_match_rust_consts` does — a hand-copied bound drifts the
+same way a captured header snapshot does.
 `crates/rmlx-kv-quant/src/metal/probes/README.md` documents the layout and how
 to refresh the captured header snapshots; the other two directories follow the
 same convention and point back at it.

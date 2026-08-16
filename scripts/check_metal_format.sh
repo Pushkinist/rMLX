@@ -15,24 +15,28 @@
 # are accepted; when neither is present the gate skips rather than fails, since
 # toolchain availability varies across dev machines.
 #
-# `--strict` turns a missing clang-format into a hard failure. CI passes it: the
-# runner has the toolchain, so a skip there would mean the gate silently
-# protected nothing. Detection and enforcement stay in one place so the two
-# cannot drift.
+# `--strict` turns a missing clang-format into a hard failure, and likewise an
+# empty file set: a renamed or moved kernel directory would otherwise disable the
+# whole gate while the CI job stayed green — protecting nothing is the one
+# outcome a gate must never report as success. CI passes it. Detection and
+# enforcement stay in one place so the two cannot drift.
 #
-# Exit 0 = clean (or skipped). Exit 1 = a file needs reformatting, or --strict
-# and clang-format is missing.
+# A missing directory is always an error, strict or not: `METAL_DIRS` names
+# directories that are supposed to exist, so one that does not is a stale list,
+# not a toolchain difference between dev boxes.
+#
+# Exit 0 = clean (or skipped for a missing clang-format). Exit 1 = a file needs
+# reformatting, a listed directory is missing, or --strict and clang-format is
+# missing or the file set is empty.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Keep in step with METAL_DIRS in scripts/check_metal_compiles.sh.
-METAL_DIRS=(
-    "${REPO_ROOT}/crates/rmlx-kv-quant/src/metal"
-    "${REPO_ROOT}/crates/rmlx-models/src/metal"
-    "${REPO_ROOT}/crates/rmlx-mlx/src/metal"
-)
+# Directories holding gated `.metal` kernels. Single-sourced with the compile
+# gate so the two cannot drift apart.
+# shellcheck source=scripts/metal_dirs.sh
+. "$(dirname "${BASH_SOURCE[0]}")/metal_dirs.sh"
 
 STRICT=0
 for arg in "$@"; do
@@ -62,14 +66,32 @@ if [ -z "${CLANG_FORMAT}" ]; then
     exit 0
 fi
 
+missing_dirs=()
 shopt -s nullglob
 files=()
 for d in "${METAL_DIRS[@]}"; do
+    if [ ! -d "${d}" ]; then
+        missing_dirs+=("${d#"${REPO_ROOT}/"}")
+        continue
+    fi
     files+=("${d}"/*.metal)
 done
 shopt -u nullglob
 
+if [ ${#missing_dirs[@]} -gt 0 ]; then
+    echo "ERROR: kernel director(ies) listed in scripts/metal_dirs.sh do not exist:" >&2
+    for d in "${missing_dirs[@]}"; do echo "  ${d}" >&2; done
+    echo "       A stale list silently shrinks this gate. Fix the list or restore the directory." >&2
+    exit 1
+fi
+
 if [ ${#files[@]} -eq 0 ]; then
+    if [ "${STRICT}" = 1 ]; then
+        echo "ERROR: --strict: no .metal files found under ${METAL_DIRS[*]}." >&2
+        echo "       An empty file set means this gate checked nothing." \
+             "Refusing to pass by skipping." >&2
+        exit 1
+    fi
     echo "SKIP: no .metal files under ${METAL_DIRS[*]}."
     exit 0
 fi

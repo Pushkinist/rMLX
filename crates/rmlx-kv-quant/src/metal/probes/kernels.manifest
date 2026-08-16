@@ -12,7 +12,7 @@
 # dtypes mirror the arrays those sites pass / `add_output_shape` declares.
 #
 # Format:  <body.metal> | <header or -> | <name:type,...> | [NAME=VALUE,...]
-#   type: u = uint buffer, f = float buffer
+#   type: u = uint buffer, i = int buffer, f = float buffer
 #
 # The optional fourth field emits `#define NAME VALUE` immediately ahead of the
 # body. It supplies the values MLX injects at dispatch that are neither buffers

@@ -42,15 +42,18 @@ repos:
         types: [rust]
         pass_filenames: false
 
-      # MSL style gate. Fast (clang-format --dry-run over the KV kernels) and
-      # skips itself when clang-format is unavailable. The companion
+      # MSL style gate. Fast (clang-format --dry-run over every gated kernel
+      # directory) and skips itself when clang-format is unavailable. The
+      # trigger must span all of `scripts/metal_dirs.sh`, not one crate: a
+      # pattern narrower than the gate's own scope means editing a kernel in
+      # another gated directory never fires the hook. The companion
       # `check-metal-compiles` gate is NOT run per-commit: it needs the full
-      # Xcode Metal toolchain and compiles ~50 probes. It runs in `make ci`.
+      # Xcode Metal toolchain and compiles ~60 probes. It runs in `make ci`.
       - id: check-metal-format
         name: clang-format check (.metal)
         entry: bash scripts/check_metal_format.sh
         language: system
-        files: ^crates/rmlx-kv-quant/src/metal/.*\.metal$
+        files: ^crates/.*/src/metal/.*\.metal$
         pass_filenames: false
 
       # cargo-deny and cargo-audit are NOT run per-commit — they fetch the

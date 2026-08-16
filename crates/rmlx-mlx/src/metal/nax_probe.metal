@@ -5,8 +5,10 @@
 // out[0] __METAL_VERSION__ as MLX's JIT saw it (400 = Metal 4.0)
 // out[1] 1 if __HAVE_TENSOR__ reached the body, else 0
 // out[2] .m of a constexpr matmul2d_descriptor, else -1
-// out[3] 0 — liveness marker, so "never written" is distinguishable from
-//        "written by a pre-4.0 compile"
+// out[3] 0x5A5A — liveness sentinel. It has to be a value the buffer cannot
+//        hold by accident: MLX hands out pooled buffers and this dispatch sets
+//        no init value, so a slot the kernel never wrote can read as anything,
+//        and 0 in particular is what a fresh allocation reads as.
 out[0] = __METAL_VERSION__;
 #if __HAVE_TENSOR__
 out[1] = 1;
@@ -17,4 +19,4 @@ out[2] = (int)desc.m;
 out[1] = 0;
 out[2] = -1;
 #endif
-out[3] = 0;
+out[3] = 0x5A5A;

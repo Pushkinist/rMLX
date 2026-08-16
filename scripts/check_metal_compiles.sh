@@ -53,9 +53,14 @@
 # The second pass is the one that matters for a kernel guarded by
 # `#if __HAVE_TENSOR__`: at metal3.0 that guard is inactive, the body compiles
 # to an empty translation unit, and the gate would go green having checked
-# nothing. A body naming that guard is therefore REJECTED outright when the
-# toolchain cannot compile at metal4.0 — refusing to pass by skipping, the same
-# rule `--strict` applies to a missing compiler.
+# nothing. Such a body is therefore never compiled without the guard — it is
+# either checked for real or reported as SKIPPED, never quietly passed.
+#
+# The capability is probed by asserting the guard and the cooperative-tensor
+# includes, not by testing that the driver accepts the `-std` flag. A toolchain
+# that accepts the flag but leaves the guard undefined would otherwise compile a
+# guarded body through its `#else` arm at both passes: the same vacuous pass,
+# reached another way.
 #
 # Manifest coverage
 # -----------------
@@ -64,33 +69,37 @@
 # by nothing, which is the exact failure mode this gate exists to prevent, so it
 # is a hard failure rather than a silent omission.
 #
-# The Metal compiler ships with full Xcode, not the Command Line Tools, so it is
-# absent on a Command-Line-Tools-only dev box. When it is missing the gate skips
-# rather than fails.
+# Toolchain policy — one rule, not two
+# -----------------------------------
+# "This box's toolchain cannot do X" gets the same answer whatever X is (the
+# Metal compiler is absent, or it is too old for the Metal 4 pass):
 #
-# `--strict` turns a missing compiler — or a compiler too old for the Metal 4
-# pass — into a hard failure. CI passes it: the runner ships a toolchain that can
-# do both passes, so degrading to one there would mean the gate silently checked
-# less than it claims. Compiling `.metal` needs the toolchain, not a GPU, so this
-# gate runs for real in CI even though the runner has no usable Metal device.
-# Detection and enforcement stay in one place so the two cannot drift.
+#   --strict      hard failure. CI passes it, and CI must never report green
+#                 while checking less than the gate claims to check.
+#   otherwise     loud notice, reduced run, exit 0. A contributor on an older
+#                 Xcode keeps a working `make ci`; the parts that can be checked
+#                 still are, and the parts that cannot are named on stdout.
 #
-# Exit 0 = all compiled (or skipped). Exit 1 = a kernel failed to compile, a
-# kernel is missing from its manifest, a `__HAVE_TENSOR__` body could not be
-# checked, or --strict and the Metal compiler is missing or pre-Metal-4.
+# Splitting that rule — skipping for a missing compiler but failing for an old
+# one — breaks the dev loop for everyone whose Xcode predates Metal 4, over a
+# diagnostic kernel that ships nothing.
+#
+# Compiling `.metal` needs the toolchain, not a GPU, so this gate runs for real
+# in CI even though the runner has no usable Metal device. Detection and
+# enforcement stay in one place so the two cannot drift.
+#
+# Exit 0 = everything checkable compiled (skips are reported and counted).
+# Exit 1 = a kernel failed to compile, a kernel is missing from its manifest, or
+# --strict and the toolchain is missing or cannot do the Metal 4 pass.
 
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Directories holding gated `.metal` kernels. Each needs a
-# `probes/kernels.manifest`. Add a directory here when a crate starts shipping
-# MSL — nothing else discovers it.
-METAL_DIRS=(
-    "${REPO_ROOT}/crates/rmlx-kv-quant/src/metal"
-    "${REPO_ROOT}/crates/rmlx-models/src/metal"
-    "${REPO_ROOT}/crates/rmlx-mlx/src/metal"
-)
+# Directories holding gated `.metal` kernels. Single-sourced with the format
+# gate so the two cannot drift apart.
+# shellcheck source=scripts/metal_dirs.sh
+. "$(dirname "${BASH_SOURCE[0]}")/metal_dirs.sh"
 
 # The floor, and the version MLX's JIT was observed to use.
 BASELINE_STD="metal3.0"
@@ -139,32 +148,76 @@ fi
 TMP="$(mktemp -d)"
 trap 'rm -rf "${TMP}"' EXIT
 
-# Can this toolchain compile at the Metal 4 language version? An older Xcode
-# cannot, which is not by itself a failure — but it does make every
-# `__HAVE_TENSOR__` body uncheckable, handled per body below.
+# Two capabilities, probed separately because they gate different things.
+#
+#   TENSOR_STD_OK    the driver accepts -std=<TENSOR_STD>. Gates the second pass
+#                    over EVERY body.
+#   TENSOR_GUARD_OK  at that version <TENSOR_GUARD> is actually defined AND the
+#                    cooperative-tensor headers resolve. Gates whether a body
+#                    guarded by it can be checked at all.
+#
+# Probing the flag alone is not enough for the second: a toolchain that accepts
+# `-std=metal4.0` but leaves the guard undefined would compile a guarded body
+# through its `#else` arm at both passes — green having validated an empty tensor
+# path, which is the same vacuous pass the second pass exists to close, reached
+# another way. So this probe asserts the guard and the include, not the flag.
 printf '#include <metal_stdlib>\n' > "${TMP}/std_probe.metal"
 if xcrun -sdk macosx metal "-std=${TENSOR_STD}" -c "${TMP}/std_probe.metal" \
         -o "${TMP}/std_probe.air" >/dev/null 2>&1; then
     TENSOR_STD_OK=1
     STDS=("${BASELINE_STD}" "${TENSOR_STD}")
-elif [ "${STRICT}" = 1 ]; then
-    echo "ERROR: --strict: this toolchain cannot compile at -std=${TENSOR_STD}," \
-         "which is the language version" >&2
-    echo "       MLX's JIT uses in production, so half the gate would not run." >&2
-    echo "       Refusing to pass by checking less. Select an Xcode with a Metal 4" >&2
-    echo "       toolchain (xcode-select -s), then: xcodebuild -downloadComponent MetalToolchain" >&2
-    exit 1
 else
     TENSOR_STD_OK=0
     STDS=("${BASELINE_STD}")
-    echo "NOTE: this toolchain cannot compile at -std=${TENSOR_STD};" \
-         "checking ${BASELINE_STD} only."
-    echo "      A kernel guarded by ${TENSOR_GUARD} will be reported as" \
-         "uncheckable rather than skipped."
+fi
+
+TENSOR_GUARD_OK=0
+if [ "${TENSOR_STD_OK}" = 1 ]; then
+    {
+        echo '#include <metal_stdlib>'
+        echo "#if !${TENSOR_GUARD}"
+        echo "#error \"${TENSOR_GUARD} is not defined at this language version\""
+        echo '#endif'
+        echo '#include <metal_tensor>'
+        echo '#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>'
+        echo 'using namespace mpp::tensor_ops;'
+    } > "${TMP}/guard_probe.metal"
+    if xcrun -sdk macosx metal "-std=${TENSOR_STD}" -c "${TMP}/guard_probe.metal" \
+            -o "${TMP}/guard_probe.air" >/dev/null 2>&1; then
+        TENSOR_GUARD_OK=1
+    fi
+fi
+
+# A toolchain that cannot do the second pass is the same class of problem as a
+# missing compiler, and gets the same policy: hard failure under --strict (CI,
+# where checking less while reporting green is the whole defect), a loud notice
+# and a reduced run otherwise. A contributor on an older Xcode still gets a
+# working `make ci`.
+if [ "${TENSOR_STD_OK}" = 0 ] || [ "${TENSOR_GUARD_OK}" = 0 ]; then
+    if [ "${TENSOR_STD_OK}" = 0 ]; then
+        reduced_reason="cannot compile at -std=${TENSOR_STD}"
+    else
+        reduced_reason="compiles at -std=${TENSOR_STD} but does not define ${TENSOR_GUARD} (or cannot resolve the cooperative-tensor headers)"
+    fi
+    if [ "${STRICT}" = 1 ]; then
+        echo "ERROR: --strict: this toolchain ${reduced_reason}." >&2
+        echo "       ${TENSOR_STD} is the language version MLX's JIT uses in production," \
+             "so part of the gate" >&2
+        echo "       would not run. Refusing to pass by checking less. Select an Xcode with" >&2
+        echo "       a Metal 4 toolchain (xcode-select -s), then:" \
+             "xcodebuild -downloadComponent MetalToolchain" >&2
+        exit 1
+    fi
+    echo "NOTE: this toolchain ${reduced_reason}."
+    echo "      Checking ${STDS[*]}; bodies guarded by ${TENSOR_GUARD} are SKIPPED," \
+         "not silently passed."
+    echo "      Install a Metal 4 toolchain to run the whole gate. CI runs it with" \
+         "--strict, which refuses this."
 fi
 
 failed=()
 checked=0
+skipped=0
 
 for METAL_DIR in "${METAL_DIRS[@]}"; do
     PROBE_DIR="${METAL_DIR}/probes"
@@ -204,17 +257,35 @@ for METAL_DIR in "${METAL_DIRS[@]}"; do
             continue
         fi
 
-        # A body behind the Metal 4 guard cannot be checked at the baseline
-        # version: the guard is inactive there and the body vanishes.
-        if [ "${TENSOR_STD_OK}" = 0 ] \
-                && grep -q -- "${TENSOR_GUARD}" "${METAL_DIR}/${body}"; then
-            echo "ERROR: ${rel_dir}/${body} is guarded by ${TENSOR_GUARD}," \
-                 "which is only defined at -std=${TENSOR_STD}." >&2
-            echo "       This toolchain cannot compile at that version, so the" \
-                 "body would be checked as an empty" >&2
-            echo "       translation unit. Refusing to pass by skipping;" \
-                 "install a Metal 4 toolchain." >&2
-            failed+=("${rel_dir}/${body} (${TENSOR_GUARD}, uncheckable)")
+        # Resolve the header path early: the guard can live in either half of a
+        # body/header pair, and a pair whose guard is entirely in the header
+        # would otherwise escape the check below.
+        hdr_path=""
+        if [ "${header}" != "-" ]; then
+            case "${header}" in
+                ../*) hdr_path="${METAL_DIR}/${header#../}" ;;
+                *)    hdr_path="${PROBE_DIR}/${header}" ;;
+            esac
+            if [ ! -f "${hdr_path}" ]; then
+                echo "ERROR: manifest references missing header: ${rel_dir}/probes -> ${header}" >&2
+                failed+=("${rel_dir}/${body} (missing header ${header})")
+                continue
+            fi
+        fi
+
+        # A body behind the Metal 4 guard cannot be checked without it: the
+        # guard is inactive, the guarded text vanishes, and compiling the
+        # remainder would validate nothing. `--strict` already refused above, so
+        # reaching here means a dev box — skip the body loudly rather than
+        # pretend it passed.
+        if [ "${TENSOR_GUARD_OK}" = 0 ] \
+                && grep -q -F -- "${TENSOR_GUARD}" "${METAL_DIR}/${body}" \
+                       ${hdr_path:+"${hdr_path}"}; then
+            echo "NOTE: SKIP ${rel_dir}/${body} — guarded by ${TENSOR_GUARD}," \
+                 "which this toolchain does not provide."
+            echo "      Compiling it here would check an empty tensor path." \
+                 "CI (--strict) checks it for real."
+            skipped=$((skipped + 1))
             continue
         fi
 
@@ -223,21 +294,14 @@ for METAL_DIR in "${METAL_DIRS[@]}"; do
             echo '#include <metal_stdlib>'
             echo 'using namespace metal;'
             echo
-            if [ "${header}" != "-" ]; then
-                case "${header}" in
-                    ../*) hdr_path="${METAL_DIR}/${header#../}" ;;
-                    *)    hdr_path="${PROBE_DIR}/${header}" ;;
-                esac
-                if [ ! -f "${hdr_path}" ]; then
-                    echo "ERROR: manifest references missing header: ${header}" >&2
-                    exit 1
-                fi
+            if [ -n "${hdr_path}" ]; then
                 cat "${hdr_path}"
             fi
             echo
             echo 'kernel void rmlx_msl_compile_probe('
             echo '    device uint*  probe_u [[buffer(0)]],'
             echo '    device float* probe_f [[buffer(1)]],'
+            echo '    device int*   probe_i [[buffer(2)]],'
             echo '    uint3 thread_position_in_grid          [[thread_position_in_grid]],'
             echo '    uint3 threadgroup_position_in_grid     [[threadgroup_position_in_grid]],'
             echo '    uint3 thread_position_in_threadgroup   [[thread_position_in_threadgroup]],'
@@ -250,11 +314,15 @@ for METAL_DIR in "${METAL_DIRS[@]}"; do
             for b in "${bufs[@]}"; do
                 name="${b%%:*}"
                 type="${b##*:}"
-                if [ "${type}" = "u" ]; then
-                    echo "    device uint* ${name} = probe_u; (void)${name};"
-                else
-                    echo "    device float* ${name} = probe_f; (void)${name};"
-                fi
+                case "${type}" in
+                    u) echo "    device uint* ${name} = probe_u; (void)${name};" ;;
+                    i) echo "    device int* ${name} = probe_i; (void)${name};" ;;
+                    f) echo "    device float* ${name} = probe_f; (void)${name};" ;;
+                    *)
+                        echo "ERROR: ${rel_dir}/${body}: unknown buffer type '${type}' for '${name}' (want u, i or f)" >&2
+                        exit 1
+                        ;;
+                esac
             done
             # Dispatch-time values MLX injects that are neither buffers nor
             # header constants. Emitted here, immediately ahead of the body, so
@@ -304,4 +372,9 @@ if [ ${#failed[@]} -gt 0 ]; then
     exit 1
 fi
 
-echo "OK: ${checked} .metal kernels compile clean at ${STDS[*]}."
+if [ "${skipped}" -gt 0 ]; then
+    echo "OK: ${checked} .metal kernels compile clean at ${STDS[*]};" \
+         "${skipped} skipped (see the ${TENSOR_GUARD} notes above)."
+else
+    echo "OK: ${checked} .metal kernels compile clean at ${STDS[*]}."
+fi

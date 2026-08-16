@@ -4,7 +4,7 @@
 # for the probe layout and how to refresh a captured header snapshot.
 #
 # Format:  <body.metal> | <header or -> | <name:type,...> | [NAME=VALUE,...]
-#   type: u = uint buffer, f = float buffer
+#   type: u = uint buffer, i = int buffer, f = float buffer
 #
 # Neither kernel here has a header: both take their compile-time constants as
 # MLX template arguments, so the fourth field carries representative values for

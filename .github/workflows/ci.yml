@@ -71,7 +71,7 @@ jobs:
     # second pass at -std=metal4.0 — the language version MLX's JIT actually
     # compiles custom kernel bodies at — and refuses to pass by checking less
     # when the toolchain cannot reach it. macos-14 tops out at Xcode 16.2, which
-    # has no Metal 4. (macos-14 is also deprecated upstream.)
+    # has no Metal 4.
     #
     # No Rust toolchain and no mlx-c: both gates are bash + xcrun over the
     # checked-in .metal files, so this job stays seconds-long and reports as its
