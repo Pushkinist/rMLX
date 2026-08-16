@@ -297,8 +297,8 @@ struct Cli {
     /// `on`: force the fused kernel (ablation / bench).
     /// `off`: HARD override — ignores `RMLX_ROT_K_FUSED=1` in the shell.
     ///
-    /// Only affects caches whose codec rotates K (`--kv-quant rot_k`,
-    /// `rot_k_tq4v`); every other codec ignores it.
+    /// Only affects caches whose codec rotates K (`--kv-quant
+    /// rot_k_v<bits>g<group>`, `rot_k_tq4v`); every other codec ignores it.
     #[arg(long, value_enum, global = true, default_value_t = RotKFusedMode::Auto)]
     rot_k_fused: RotKFusedMode,
     #[command(subcommand)]
