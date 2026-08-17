@@ -496,28 +496,40 @@ pub(crate) fn run_baseline(
         .map_err(|e| anyhow::anyhow!("generate_greedy: {e}"))?;
     let generate_elapsed = ts_generate_start.elapsed();
     let peak_reading = peak_bracket.close();
-    // Read actual on-device KV-cache bytes from the arch-specific static that
+    // Read actual on-device KV-cache bytes from the per-instance counter that
     // `generate_greedy` writes via `store_kv_cache_bytes`.
     //
-    // `--record` appends to the metrics store, where a wrong row is permanent,
-    // so the figure is attributed to *this* generation before it is kept: the
-    // store sequence must have advanced across the call. Anything else — an
-    // arch that does not maintain the static, a prefill that returned early —
-    // leaves an earlier generation's byte count readable, and recording that
-    // under this run's label is the failure the sequence exists to prevent.
-    // Both unusable verdicts collapse to `0`, which the downstream `> 0` gates
-    // already omit from the record; the `warn!` says which one happened.
+    // `Unreported` is a refusal, not a warning. Baseline runs exactly one
+    // generation per process with EOS-stop disabled, and every architecture
+    // stores through the same counter, so the sequence failing to advance means
+    // the generation left before its store — it ended early on a path that did
+    // not report the failure. Downgrading that to `warn!` + `0` produced a
+    // summary line and, under `--record`, a permanent row in the append-only
+    // store, from a run that never generated: the whole measurement is void, not
+    // just its KV column. `rmlx bench` already refuses the identical verdict.
+    //
+    // `ReportedZero` stays a warning: there the generation ran to completion and
+    // only its KV column is unusable, so omitting that one column — which the
+    // downstream `> 0` gates already do — keeps an otherwise valid timing
+    // measurement.
+    //
+    // Note this DIVERGES from `rmlx bench`, which refuses both verdicts. The two
+    // commands have different products: bench records `kv_cache_bytes` as a
+    // first-class result, so a broken byte count voids its output, while
+    // baseline's product is a timing row that survives a missing KV column
+    // intact. They agree on `Unreported` because that one is not a broken
+    // column — it means the generation never finished.
     let kv_cache_bytes: u64 =
         match rmlx_models::classify_kv_bytes(kv_before, model.kv_cache_bytes_sample()) {
             rmlx_models::KvBytesVerdict::Reported(n) => n,
             rmlx_models::KvBytesVerdict::Unreported => {
-                tracing::warn!(
-                    arch = model.arch_class(),
-                    "generation reported no KV-cache byte count (store sequence did not advance); \
-                 omitting kv_cache_bytes from this run rather than recording an earlier \
-                 generation's figure"
-                );
-                0
+                return Err(anyhow::anyhow!(
+                    "generation on arch {} reported no KV-cache byte count (the store sequence \
+                     did not advance), so it returned before its post-decode store. A run that \
+                     did not complete a decode loop is not a measurement — refusing to report or \
+                     record it",
+                    model.arch_class()
+                ));
             }
             rmlx_models::KvBytesVerdict::ReportedZero => {
                 tracing::warn!(

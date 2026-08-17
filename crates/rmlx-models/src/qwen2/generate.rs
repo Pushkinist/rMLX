@@ -18,6 +18,7 @@ use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{argmax, Array, Device, Dtype};
 
 use crate::constraint::ConstraintEngine;
+use crate::decode_loop::reject_nan_prefill;
 use crate::kv_cache::{kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N};
 use crate::prompt_cache::{chained_block_hashes_seeded, Consumed, ReusePolicy};
 use crate::sampler::apply_mask_argmax;
@@ -326,6 +327,13 @@ pub fn generate_greedy(
     let logit_bytes = logits_flat.to_bytes()?;
     let nan_count = count_nan_in_bytes(&logit_bytes, logits_flat.dtype());
     let max_abs_logit = max_abs_from_bytes(&logit_bytes, logits_flat.dtype());
+    reject_nan_prefill(
+        "Qwen2ForCausalLM",
+        logits_flat.dtype(),
+        nan_count,
+        max_abs_logit,
+        prompt_ids.len(),
+    )?;
 
     // A6.2 masked-argmax fork (first emit).
     // A7.2: temp<=0 keeps the exact greedy match below; temp>0 host-samples.
@@ -402,10 +410,6 @@ pub fn generate_greedy(
         logprobs: None,
     });
     step_fn(steps.last().unwrap());
-
-    if nan_count > 0 {
-        return Ok(steps);
-    }
 
     // Push this prefill snapshot to the prompt cache (Miss → store). Clone the
     // post-prefill KV caches (refcount bump, no data copy) before the decode

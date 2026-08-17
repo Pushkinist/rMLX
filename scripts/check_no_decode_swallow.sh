@@ -13,6 +13,11 @@
 #   the run completed successfully, reporting `ttft_ms=0 decode_tps=0.000
 #   prefill_tps=0.0` — a fabricated zero, emitted as a measurement, with exit 0.
 #
+#   NaN detection: a prefill whose logits contained NaN used to be detected,
+#   emit one junk token (greedy selection over an all-NaN row returns index 0
+#   whatever the model computed), and `return Ok` — logging nothing at any
+#   level. The run reported one token, `decode_tps` ~0.06, and exit 0.
+#
 #   Both shapes defeat the same thing. Every automated gate in this repo (bench
 #   harness, perf canary, regression gate, smoke probes) reads `finish_reason`,
 #   token counts, and throughput fields — never the log. A failure that reports
@@ -43,13 +48,17 @@
 #   2. DECODE (message-keyed): every `decode step failed` site must `return Err`.
 #   3. SWEEP (message-keyed): the shared chunked_prefill must CAPTURE its cause
 #      (`= Some(e)`), not `return Err` inline — see RULE 3 below.
+#   4. DETECT (shape-keyed, arch layer): a site that COUNTS NaN in a logit row
+#      must propagate the finding. RULE 1 cannot see this shape at all: it keys
+#      on `error = %e`, and a detection that logs nothing has no anchor.
 #
 # SCOPE (what this does NOT cover)
 #   RULE 1 scans crates/rmlx-models/src only — the arch generate/prefill paths
 #   where this class lives. Failure sites in other crates are not covered.
 #   RULE 1 keys on `error = %e`; a failure-log site that does not carry the
 #   error as a structured field is invisible to it (and is a traceability bug
-#   in its own right — see the tracing rules in CLAUDE.md).
+#   in its own right — see the tracing rules in CLAUDE.md). RULE 4 exists
+#   precisely because that anchor is missing from a detect-and-discard site.
 #
 # Exit 0 = clean. Exit 1 = violation found.
 
@@ -172,21 +181,145 @@ check_sweep() {
         | grep -v '_tests\.rs:' | cut -d: -f1,2 || true)
 }
 
+# ── RULE 4: a counted NaN must propagate, not be discarded ───────────────────
+#
+# Anchor: a call to `count_nan_in_bytes(` in the arch layer — the detector
+# itself, an API name rather than a log message, so it cannot be evaded by
+# rewording. (Definitions of the helper are skipped; only call sites count.)
+#
+# Verdict: within NAN_CONTEXT lines the finding must reach a propagating form —
+# `reject_nan_prefill(` (the shared prefill guard) or a literal `return Err`.
+# Neither present means the site computed the count and then dropped it, which
+# is what produced a one-token run reported as success.
+#
+# The window is deliberately narrow: it is one error construction, one
+# structured `error!`, and the return. "Somewhere later in the function" is not
+# what this pins — the guard belongs immediately after the detection, before the
+# offending token is selected and handed to `step_fn`.
+#
+# ORDERING. A `return Err` anywhere in the window is not enough: propagating
+# AFTER `step_fn` has already shipped the token is the original bug shape with
+# `Err` substituted for `Ok`. The caller has been handed a junk token either
+# way, and on the server that junk token is on the wire and in `delivered`,
+# which is exactly the configuration the Migratable classification in
+# docs/SERVER.md argues is safe *because* it cannot happen. So a `step_fn` call
+# appearing before the propagation inside the window is itself a violation.
+#
+# ANCHOR FLOORS. A grep gate that iterates whatever grep finds passes silently
+# when it finds nothing, so one rename or one wrapper extraction makes it
+# vacuous — which is how the shape this rule pins got past RULE 1 in the first
+# place. Both counts are pinned to exact values. They are expected to change
+# when an architecture is added or a path is refactored; the point is that the
+# change has to be a deliberate edit here, re-verified, rather than a silent
+# loss of coverage.
+#
+# KNOWN LIMIT, stated rather than papered over: these counts see call sites, not
+# reachability. An arch that adds a correctly-guarded wrapper and then never
+# calls it from its prefill path satisfies both the per-site check and the
+# floors. Wrapper call sites are counted below precisely to keep that surface
+# visible, but "every prefill path reaches a guard" is a review property, not a
+# grep property.
+NAN_CONTEXT=16
+
+# Call sites of the detector in the arch layer.
+EXPECTED_NAN_DETECT_SITES=11
+# Call sites of the guard, counting the two wrappers that fan out to several
+# prefill paths (qwen3_vl_moe text+image; the four speculative drivers).
+EXPECTED_GUARD_CALL_SITES=16
+GUARD_CALL_RE='reject_nan_prefill\(|guard_prefill_logits\(|guard_verifier_prefill_logits\('
+
+nan_detect_sites() {
+    grep -rn --include='*.rs' -F 'count_nan_in_bytes(' crates/rmlx-models/src/ \
+        | grep -v '_tests\.rs:' | grep -v 'fn count_nan_in_bytes(' | cut -d: -f1,2 || true
+}
+
+guard_call_sites() {
+    grep -rnE --include='*.rs' "${GUARD_CALL_RE}" crates/rmlx-models/src/ \
+        | grep -v '_tests\.rs:' | grep -vE 'fn (reject_nan_prefill|guard_prefill_logits|guard_verifier_prefill_logits)\(' \
+        | cut -d: -f1,2 || true
+}
+
+# Line offset of the first match of a pattern within the window, or empty.
+# "No match" is a normal answer here, not a failure — without the `|| true` the
+# script runs under `set -e`/`pipefail` and aborts silently with exit 1, which
+# would look exactly like a passing gate that printed nothing.
+first_offset() {
+    printf '%s\n' "$2" | grep -nE "$1" | head -1 | cut -d: -f1 || true
+}
+
+check_nan_detect() {
+    local site f ln win guard_at step_at n_detect n_guard
+    while IFS= read -r site; do
+        [ -z "${site}" ] && continue
+        f="${site%%:*}"
+        ln="${site##*:}"
+        win="$(sed -n "${ln},$((ln + NAN_CONTEXT))p" "${f}")"
+        guard_at="$(first_offset 'reject_nan_prefill\(|return Err' "${win}")"
+        if [ -z "${guard_at}" ]; then
+            echo "VIOLATION: ${f}:${ln} — NaN is counted here and never propagated."
+            echo "    Within ${NAN_CONTEXT} lines there is no 'reject_nan_prefill(' and no"
+            echo "    'return Err'. A NaN logit row makes greedy selection return a fixed"
+            echo "    junk token; returning that as Ok reports a fault as a measurement."
+            printf '%s\n' "${win}" | sed 's/^/    | /'
+            violations=$((violations + 1))
+            continue
+        fi
+        # `step_fn(` and `(ctx.step_fn)(` are calls; the bare `step_fn,` field
+        # init inside a DecodeCtx literal is not, and must not match.
+        step_at="$(first_offset 'step_fn\(|step_fn\)\(' "${win}")"
+        if [ -n "${step_at}" ] && [ "${step_at}" -lt "${guard_at}" ]; then
+            echo "VIOLATION: ${f}:${ln} — the token is emitted BEFORE the NaN is propagated."
+            echo "    'step_fn' is called at window line ${step_at}, the propagation at"
+            echo "    ${guard_at}. Erring after emitting is the original bug shape with Err"
+            echo "    in place of Ok: the caller still received the junk token, and on the"
+            echo "    server it is already on the wire and in the retry envelope's"
+            echo "    'delivered' prefix. Raise before the emit."
+            printf '%s\n' "${win}" | sed 's/^/    | /'
+            violations=$((violations + 1))
+        fi
+    done < <(nan_detect_sites)
+
+    n_detect="$(nan_detect_sites | grep -c . || true)"
+    n_guard="$(guard_call_sites | grep -c . || true)"
+    if [ "${n_detect}" -ne "${EXPECTED_NAN_DETECT_SITES}" ]; then
+        echo "VIOLATION: NaN detector call sites = ${n_detect}, expected ${EXPECTED_NAN_DETECT_SITES}."
+        echo "    This rule iterates whatever grep finds, so it goes vacuous the moment the"
+        echo "    anchors disappear. If the change is intended, re-verify every prefill path"
+        echo "    still reaches a guard and update EXPECTED_NAN_DETECT_SITES."
+        nan_detect_sites | sed 's/^/    | /'
+        violations=$((violations + 1))
+    fi
+    if [ "${n_guard}" -ne "${EXPECTED_GUARD_CALL_SITES}" ]; then
+        echo "VIOLATION: NaN guard call sites = ${n_guard}, expected ${EXPECTED_GUARD_CALL_SITES}."
+        echo "    A prefill path that stopped calling the guard does not remove a detector"
+        echo "    anchor, so only this count sees it. If the change is intended, re-verify"
+        echo "    coverage and update EXPECTED_GUARD_CALL_SITES."
+        guard_call_sites | sed 's/^/    | /'
+        violations=$((violations + 1))
+    fi
+}
+
 check_swallow
 check_decode
 for anchor in "${SWEEP_ANCHORS[@]}"; do
     check_sweep "${anchor}"
 done
+check_nan_detect
 
 if [ "${violations}" -gt 0 ]; then
     echo
-    echo "FAIL: ${violations} failure site(s) swallow the error or skip the prefill sweep."
+    echo "FAIL: ${violations} failure site(s) swallow the error, skip the prefill"
+    echo "sweep, or discard a detected NaN."
     echo "A decode step that fails must abort the request — returning the tokens"
     echo "produced so far is reported as finish_reason=\"length\", indistinguishable"
     echo "from a clean token-cap stop. A prefill chunk that fails must abort too —"
     echo "returning no logits without a cause completes the run and reports zeros"
-    echo "as a measurement. Every automated gate reads those fields, not the log."
+    echo "as a measurement. A NaN logit row is the same class one step earlier:"
+    echo "greedy selection over it returns a fixed junk token, and returning that"
+    echo "as Ok reports the fault as a one-token generation with exit 0."
+    echo "Every automated gate reads those fields, not the log."
     exit 1
 fi
 
-echo "OK: no swallow at any arch-layer failure-log site; decode + prefill propagate."
+echo "OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;"
+echo "    every counted NaN is propagated."

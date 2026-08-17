@@ -279,12 +279,17 @@ resident KV allocation exists, including the decode-time GPU ring of a
 ring-backed codec. It means the same thing in every row of the matrix,
 regardless of arch or of whether the prompt cache hit. "One lifecycle point"
 means **post-decode, and only when a decode actually ran**: a run that returns
-before the decode loop (immediate-EOS — the first sampled token is EOS — or a
-NaN-prefill abort) does **not** refresh `kv_cache_bytes` and leaves the prior
-value in place. That is uniform across every arch now (the exact-hit paths and
-gemma4 / gemma3 / qwen3.5-moe always behaved this way), and it loses no ring
-information: with zero decode steps no ring is ever allocated, so the value that
-is *not* written would equal the prefill snapshot.
+before the decode loop — immediate-EOS, i.e. the first sampled token is EOS —
+does **not** refresh `kv_cache_bytes` and leaves the prior value in place. That
+is uniform across every arch now (the exact-hit paths and gemma4 / gemma3 /
+qwen3.5-moe always behaved this way), and it loses no ring information: with
+zero decode steps no ring is ever allocated, so the value that is *not* written
+would equal the prefill snapshot.
+
+A NaN prefill is **not** in that category: it aborts the whole request with an
+error, so there is no run to attribute a byte count to at all. It used to return
+`Ok` with one junk token, which is what made the stale-value case reachable from
+a fault rather than only from an ordinary early stop.
 
 The store takes a `PostDecode` witness minted only by a completed decode loop
 (`pipelined_decode` and the per-arch `decode_loop` / `decode_from` helpers) and

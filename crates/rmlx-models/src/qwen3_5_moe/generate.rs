@@ -20,10 +20,12 @@ use std::time::Instant;
 
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device};
+use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
 
 use crate::constraint::ConstraintEngine;
 use crate::decode_loop::{
-    capture_logprobs, choose_token, chunked_prefill, pipelined_decode, DecodeCtx,
+    capture_logprobs, choose_token, chunked_prefill, pipelined_decode, reject_nan_prefill,
+    DecodeCtx,
 };
 use crate::kv_cache::{
     kv_max_seq_and_ceiling, kv_quant_for_layer, warn_if_kv_codec_net_negative, KvLayerShape,
@@ -328,6 +330,21 @@ pub fn generate_greedy<'a>(
         };
 
         let logits_flat = prefill_logits.reshape(&[1, vocab], device)?;
+        // Same prefill logit stats + NaN guard as the Miss path below: a tail
+        // forward off SSD-restored KV can produce a NaN row just as a fresh
+        // prefill can, and this path feeds the same decode loop.
+        logits_flat.eval()?;
+        let logit_bytes = logits_flat.to_bytes()?;
+        let nan_count = count_nan_in_bytes(&logit_bytes, logits_flat.dtype());
+        let max_abs_logit = max_abs_from_bytes(&logit_bytes, logits_flat.dtype());
+        reject_nan_prefill(
+            arch_label,
+            logits_flat.dtype(),
+            nan_count,
+            max_abs_logit,
+            prompt_ids.len(),
+        )?;
+
         let lp_k = sampler_cfg.top_logprobs_k as usize;
 
         // Build the shared decode context ONCE for the tail-prefill token
@@ -420,8 +437,8 @@ pub fn generate_greedy<'a>(
         (ctx.step_fn)(steps.push_mut(ProbeStep {
             token_id: last_id,
             piece: piece.into_boxed_str(),
-            max_abs_logit: 0.0,
-            nan_count: 0,
+            max_abs_logit,
+            nan_count,
             logprobs: prefill_logprobs,
         }));
         ctx.token_history.push(last_id);
@@ -516,6 +533,28 @@ pub fn generate_greedy<'a>(
     )?;
 
     let logits_flat = prefill_logits.reshape(&[1, vocab], device)?;
+    // Prefill logit stats, the same pair every other arch computes. One host
+    // readback of the vocab row per request — not per token — which is what
+    // keeps it off the decode hot path while still giving the NaN guard
+    // something to read. Without it a NaN prefill on this arch runs to full
+    // length and returns garbage with no guard at all.
+    //
+    // `max_abs_logit` is the only one of the two the emitted ProbeStep can carry
+    // a non-trivial value for: the guard returns Err a few lines below, so a
+    // step that reaches the classifier always has nan_count == 0 by
+    // construction. See SmokeVerdict::BrokenNan.
+    logits_flat.eval()?;
+    let logit_bytes = logits_flat.to_bytes()?;
+    let nan_count = count_nan_in_bytes(&logit_bytes, logits_flat.dtype());
+    let max_abs_logit = max_abs_from_bytes(&logit_bytes, logits_flat.dtype());
+    reject_nan_prefill(
+        arch_label,
+        logits_flat.dtype(),
+        nan_count,
+        max_abs_logit,
+        prompt_ids.len(),
+    )?;
+
     // top-k logprob capture (0 = disabled, hot-loop zero-overhead).
     let lp_k = sampler_cfg.top_logprobs_k as usize;
 
@@ -630,8 +669,8 @@ pub fn generate_greedy<'a>(
     (ctx.step_fn)(steps.push_mut(ProbeStep {
         token_id: last_id,
         piece: piece.into_boxed_str(),
-        max_abs_logit: 0.0,
-        nan_count: 0,
+        max_abs_logit,
+        nan_count,
         logprobs: prefill_logprobs,
     }));
     // prefill first token into history.

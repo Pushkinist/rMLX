@@ -41,7 +41,8 @@ use tracing::info_span;
 
 use crate::constraint::ConstraintEngine;
 use crate::decode_loop::{
-    capture_logprobs, choose_token, chunked_prefill, pipelined_decode, DecodeCtx,
+    capture_logprobs, choose_token, chunked_prefill, pipelined_decode, reject_nan_prefill,
+    DecodeCtx,
 };
 use crate::kv_cache::{
     kv_max_seq_and_ceiling, kv_quant_for_layer, warn_if_kv_codec_net_negative, KvLayerShape,
@@ -562,6 +563,13 @@ pub fn generate_greedy<'a>(
     let logit_bytes = logits_flat.to_bytes()?;
     let nan_count = count_nan_in_bytes(&logit_bytes, logits_flat.dtype());
     let max_abs_logit = max_abs_from_bytes(&logit_bytes, logits_flat.dtype());
+    reject_nan_prefill(
+        "Gemma4ForConditionalGeneration",
+        logits_flat.dtype(),
+        nan_count,
+        max_abs_logit,
+        prompt_ids.len(),
+    )?;
 
     // top-k logprob capture (0 = disabled, hot-loop zero-overhead).
     let lp_k = sampler_cfg.top_logprobs_k as usize;
@@ -694,10 +702,6 @@ pub fn generate_greedy<'a>(
     }));
     // A7.3: prefill first token into history.
     ctx.token_history.push(last_id);
-
-    if nan_count > 0 {
-        return Ok(steps);
-    }
 
     // EOS-stop. If prefill emitted an EOS already, no decode steps.
     if eos_ids.contains(&last_id) {

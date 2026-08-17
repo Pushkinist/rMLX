@@ -776,6 +776,7 @@ pub fn mtp_assistant_generate_greedy(
         verifier.forward_hidden_states_shared_kv(&[last_prompt], 1, &mut caches, device)?;
     let mut b = {
         let logits = verifier.logits_from_hidden(&hidden_raw, device)?;
+        super::guard_verifier_prefill_logits(verifier, &logits, prompt_ids.len())?;
         let am = argmax(&logits, -1, device)?;
         am.eval()?;
         u32::from_le_bytes(am.to_bytes()?[..4].try_into().unwrap())

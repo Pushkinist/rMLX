@@ -953,6 +953,51 @@ there, adding a variant fails the build until it is explicitly classified as
 transient or permanent — a new error can never silently default into a retry
 bucket.
 
+**Determinism is the axis, not severity.** The two live engine faults raised
+from an arch's `generate_greedy` sit on opposite sides of it:
+
+- **Empty prompt** → `Error::Model` → `Fatal`. Deterministic: the same request
+  reproduces it every time, so a replay is guaranteed waste. Pinned by
+  `chunked_prefill_rejects_empty_prompt`.
+- **NaN prefill** (`reject_nan_prefill`) → `Error::Other` → `Migratable`.
+  Intermittent — observed at a few percent on an otherwise clean host — so a
+  replay of the same prompt at `temperature = 0` has a real chance of
+  completing, which is the case this envelope exists for. A deterministic NaN
+  (corrupt weights) costs two extra attempts and then surfaces with the same
+  cause.
+
+The `Fatal` row above also lists `SmokeProbe (NaN logits)`. Note that
+`Error::SmokeProbe` currently has **no production constructor**: only the
+variant, its `is_migratable` arm, the two HTTP mappers and tests.
+`--require-smoke-probe` refuses to serve via a plain `String`, never this enum.
+It is classified, not reachable — do not read it as the live comparator for the
+NaN decision.
+
+**What makes the Migratable classification safe** is that the guard is raised
+before the *offending* token reaches `step_fn`. That has two different shapes,
+and only the first is the "empty prefix" one:
+
+- At the six **prefill** sites nothing has been delivered yet, so `delivered` is
+  empty, `skip_count` is 0, and the replay starts from a clean slate.
+- At the one **mid-decode** site (`laguna`) `steps.len()` tokens have already
+  been delivered. They are healthy — the guard fires on the step that produced
+  the NaN row, before its token is pushed — so at `temperature = 0` the replay
+  reproduces exactly that prefix, and `replay_stream`'s prefix-identity
+  assertion is what covers the case where it does not: on divergence it surfaces
+  `root_error`, the real cause, rather than a synthetic message.
+
+`make check-no-decode-swallow` RULE 4 pins the ordering — a `step_fn` call
+before the propagation at a NaN-detection site fails the build, because "errors
+after emitting" is the original bug shape with `Err` substituted for `Ok`.
+
+**Surface class, for alerting.** `Error::Other` has no dedicated HTTP mapping:
+it falls through to **503 `service_unavailable`** and
+`ApiErrorCategory::Upstream`, shared with `Error::Mlx`. So this fault reaches
+clients as an availability signal and never increments `internal_error`. An
+operator who wants to see it must alert on the structured log event — `error =
+%e` with `nan_count` / `max_abs_logit` / `prompt_len` — not on the HTTP error
+category.
+
 ### Skip conditions
 
 Token-replay retry is disabled when any of the following hold:

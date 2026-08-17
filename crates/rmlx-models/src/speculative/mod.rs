@@ -39,12 +39,50 @@ use std::time::Instant;
 
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{argmax, Array, Device, Dtype};
+use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
 
 use crate::arch::{load_model, Architecture, LoadOpts};
 use crate::decode_loop::ProbeStep;
 use crate::kv_cache::KvCacheBuilder;
 pub use draft_kind::DraftKind;
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache, KV_MAX_SEQ_DEFAULT};
+
+/// Guard the one verifier logit row a speculative driver selects from at
+/// prefill.
+///
+/// Every driver in this module family prefills the verifier, argmaxes exactly
+/// one logit row for the first bonus token, and emits it through `step_fn`.
+/// That is the same position the non-speculative arches guard and it carries
+/// the same failure: greedy selection over a NaN row returns index 0 whatever
+/// the model computed, so under `--draft-model` a NaN prefill used to produce a
+/// full-length garbage run with no guard, no verdict and exit 0.
+///
+/// Costs one host readback of the vocab row per request, at TTFT.
+///
+/// The **per-round** verify logits are deliberately not guarded. Those run
+/// `n_tokens / block_size` times per request, so a readback there is a
+/// throughput cost on the hot path — the same reason the shared decode loop
+/// computes no per-step count. Guarding the prefill row is what makes the
+/// speculative path match the ordinary path; per-step detection is a separate
+/// open question for both.
+pub(crate) fn guard_verifier_prefill_logits(
+    verifier: &Architecture,
+    logits: &Array,
+    prompt_len: usize,
+) -> Result<()> {
+    Array::eval(logits)?;
+    let bytes = logits.to_bytes()?;
+    let dtype = logits.dtype();
+    let nan_count = count_nan_in_bytes(&bytes, dtype);
+    let max_abs_logit = max_abs_from_bytes(&bytes, dtype);
+    crate::decode_loop::reject_nan_prefill(
+        verifier.arch_class(),
+        dtype,
+        nan_count,
+        max_abs_logit,
+        prompt_len,
+    )
+}
 
 /// Resident KV bytes held by a verifier's own caches.
 ///

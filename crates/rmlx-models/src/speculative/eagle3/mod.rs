@@ -930,6 +930,7 @@ pub fn eagle3_generate_greedy(
         device,
     )?;
     // `bonus_logits` is [1,1,vocab] — the last prompt position only.
+    super::guard_verifier_prefill_logits(verifier, &bonus_logits, prompt_ids.len())?;
     let am = argmax(&bonus_logits, -1, device)?;
     am.eval()?;
     let bonus = u32::from_le_bytes(am.to_bytes()?[..4].try_into().unwrap());

@@ -719,6 +719,7 @@ pub fn mtp_generate_greedy(
     )?;
     draft_pos += 1; // verifier consumed the carry token
                     // Conditioning hidden for the first draft round = the carry position hidden.
+    super::guard_verifier_prefill_logits(verifier, &r0_logits, prompt_ids.len())?;
     let mut h_cond = r0_hidden;
     let mut b = {
         let am = argmax(&r0_logits, -1, device)?;

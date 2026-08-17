@@ -14,6 +14,19 @@ const LOOP_K: usize = 6;
 
 /// Classify whether a sequence of `ProbeStep`s shows a broken-snapshot pattern.
 ///
+/// # `BrokenNan` is currently unreachable from a real generation
+///
+/// Every path that can observe a NaN logit row now aborts the request at the
+/// point of detection (`reject_nan_prefill`, and the laguna decode-step guard),
+/// so a `ProbeStep` that survives to reach this classifier has `nan_count == 0`
+/// by construction — no generate path builds one with a non-zero count any
+/// more. The arm is kept, still tested, and still wired through the exit-code /
+/// HTTP mappings because it is the landing site for a future **decode-side**
+/// detector: the shared pipelined loop deliberately computes no per-step count
+/// (that would be a host readback per token), so a NaN appearing mid-decode on
+/// a pipelined arch is still undetected. Do not read a green smoke probe as
+/// evidence that no NaN occurred — read the `error = %e` / `nan_count` event.
+///
 /// Heuristic (from CLAUDE.md "mxfp8 broken-snapshot hazard"; B5b widened):
 /// - `BrokenNan`: any step had `nan_count > 0`.
 /// - `BrokenPunctLoop` (variant name kept for stable exit-code / HTTP / test
