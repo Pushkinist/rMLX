@@ -53,7 +53,7 @@ variables above:
 | Variable | Used by | Purpose |
 |----------|---------|---------|
 | `RMLX_TEST_MODEL` | `rmlx-server/tests/ssd_cache_restart.rs` | Generic single-model override for the SSD-restart smoke test. |
-| `RMLX_KV_TEST_MODEL` | `gemma4_kv_cache_equivalence.rs`, `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs`, `projects_toml_e2e.rs`, `cli_flags_e2e.rs` | Model snapshot for KV-cache equivalence and drafter-alignment tests. Typically set to a Gemma4-e4b path. |
+| `RMLX_KV_TEST_MODEL` | `gemma4_kv_cache_equivalence.rs`, `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs`, `projects_toml_e2e.rs`, `cli_flags_e2e.rs`, and as the single-model override for the golden-token suites | Model snapshot for KV-cache equivalence and drafter-alignment tests. Typically set to a Gemma4-e4b path. |
 | `RMLX_DRAFT_TEST_MODEL` | `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs` | Draft model snapshot path. Used alongside `RMLX_KV_TEST_MODEL` for speculative-decode alignment tests. |
 | `RMLX_VL_TEST_MODEL` | `qwen3_vl_moe_text_parity.rs` | Vision-language model snapshot for VL text-parity tests. |
 | `RMLX_PROMPT_CACHE_TEST_MODEL_A` / `_B` | `rmlx-models/tests/prompt_cache_cross_model.rs` | **Two** snapshots of the same architecture with the same KV shape but different weights — the prompt cache is one static per arch, and this pair is what shows whether its key separates two resident models. `mlx-community__gemma-4-e2b-it-mxfp8` + `mlx-community__gemma-4-E2B-it-qat-4bit` fit (both `Gemma4ForConditionalGeneration`, 35 layers x 1 KV head x head_dim 256). Same-shape matters: a shape mismatch would fail for the wrong reason. Different weights matter: identical outputs make the comparison vacuous, and the test refuses rather than passing. |
@@ -123,9 +123,84 @@ python crates/rmlx-server/tests/chat_template_fixtures/gen_fixtures.py
 
 ## CI behaviour
 
-When env vars are unset, all snapshot-gated tests **skip** with an `[SKIP]` or
+When env vars are unset, snapshot-gated tests **skip** with an `[SKIP]` or
 `tracing::warn!` message and report success. The test suite is always green on
 machines without model snapshots (including CI).
+
+Absence is not the same as a wrong pointer. `RMLX_KV_TEST_MODEL` **naming** a
+directory which is not a snapshot — a typo, or a path a snapshot has since moved
+out of — is a hard failure in the golden-token suites (below), not a skip.
+Skipping there is how a stale export turns into a green run that asserted
+nothing.
+
+---
+
+## Golden-token suites: how their snapshot resolves
+
+`crates/rmlx-models/tests/{bonsai,gemma4,qwen3,bitnet,medgemma}_golden_tokens.rs`
+each pin a 32-token temp=0 decode of one architecture against a committed
+fixture under `tests/fixtures/`. Each covers ONE arch and names its own snapshot
+by slug. `tests/common/mod.rs` reads exactly **two** variables:
+
+1. `RMLX_KV_TEST_MODEL` — one model for a whole run. This is what
+   `make model-check-full MODEL=…` sets; the goldens for the other
+   architectures skip, which is the point of that target.
+2. the golden's snapshot **slug** under `RMLX_O_MODELS_ROOT`.
+
+Step 2 is what arms these gates by default, and **an operator normally sets
+neither**. Every `make` target exports `RMLX_O_MODELS_ROOT`, so on a machine
+holding the snapshots `make gpu-test` and `make ci-perf` run every golden whose
+model is on disk. Before it existed, a golden needed `RMLX_KV_TEST_MODEL` —
+which those targets do not set — so all of them returned before asserting and
+libtest reported `ok`. A committed fixture that nothing compares against is a
+fixture nobody maintains.
+
+Reach for `RMLX_KV_TEST_MODEL` in exactly two situations: recording a fixture
+(`RMLX_REGEN_GOLDENS=1`), and comparing one golden against a snapshot that is
+not the slug under your models root. Each golden is its own test binary, so
+`RMLX_KV_TEST_MODEL=<path> cargo test -p rmlx-models --test bonsai_golden_tokens
+-- --ignored` retargets that one deliberately and reaches no other golden.
+
+**The per-architecture `RMLX_TEST_MODEL_*` family is deliberately not consulted
+by the goldens.** Those variables mean "a snapshot of this family for the smoke,
+template and NIAH suites", and the workflow two sections above exports the three
+primary ones persistently for a whole `cargo test --workspace`. A golden is a
+byte-exact fixture over ONE checkpoint's weights, so letting a shell export steer
+it turns any same-family substitution — a QAT rebuild, a re-quantized sibling —
+into a token mismatch indistinguishable from a decode regression, and the
+architecture check below cannot separate the two because the substitute passes
+it. If a snapshot lives outside your models root, symlink it in under its slug:
+one action, and every other slug-addressed consumer (`make e2e`,
+`scripts/perf_canary.sh`, the bench scripts) picks it up too.
+
+The run / skip / fail rule:
+
+| configuration | outcome |
+|---|---|
+| snapshot resolves, arch matches | **run** the assertion |
+| nothing configured, or the models root does not hold this slug | **skip** — a developer without the weights cannot run the gate |
+| `RMLX_KV_TEST_MODEL` names a different architecture | **skip** — one model for a run of per-arch goldens |
+| `RMLX_KV_TEST_MODEL` names a path that is not a snapshot dir | **fail** |
+| the slug under the models root is a snapshot of the wrong arch | **fail** |
+
+`make ci` runs none of them either way: the goldens are `#[ignore]`d for the
+Metal context, and `make ci` passes no `--ignored`. `make gpu-test` /
+`make ci-perf` are where they execute — `scripts/check_gpu_tests_ignored.sh`
+classifies them as GPU tests through the cross-file `common::run_golden_test`
+helper, and `scripts/run_gpu_tests.sh` runs everything that classifier names.
+
+**Residual, stated rather than papered over:** libtest discards a passing test's
+output, so a golden that *skipped* prints its reason into a stream nothing shows.
+The gate cannot report "0 goldens checked" from inside a normal run. Add
+`--nocapture` when you need to see which ones stood down:
+
+```bash
+cargo test -p rmlx-models --test bonsai_golden_tokens -- --ignored --nocapture
+```
+
+Record a fixture with `RMLX_REGEN_GOLDENS=1` — the test writes the file instead
+of asserting. Only do that once the current output is known good; a golden
+updated to match whatever the tree produces today gates nothing.
 
 ---
 
@@ -507,6 +582,14 @@ defect that only appears at that profile has to be reproduced by hand.
 
 The second is the number that matters, since a `.metal` change invalidates
 `rmlx-kv-quant` and everything downstream of it under `release-perf` too.
+
+**Both figures were taken while the model-gated cells returned instantly.** The
+golden-token suites and the snapshot-loading `rmlx-models` cells were in that
+318 and contributed nothing to the 264 s, because nothing set the variable they
+resolved from (see the golden-token section above). Now that they resolve by
+slug under `RMLX_O_MODELS_ROOT`, a machine holding the snapshots pays their real
+cost — several model loads, one of them a 35B MoE — so re-measure rather than
+quote 264 s. On a machine with no models root, nothing changes.
 
 **Neither figure includes a cold `dev` build, and that is the case to expect.**
 `ci-perf` otherwise touches only `release-perf`, so the GPU half brings a second,

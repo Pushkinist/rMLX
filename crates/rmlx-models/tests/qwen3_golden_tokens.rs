@@ -8,11 +8,13 @@
 //! KV quant: K8V8 (the resolver default for Qwen3.5 MoE; K8V4 on the FA layers
 //! regressed decode).
 //!
+//! The snapshot resolves from `RMLX_O_MODELS_ROOT` by slug, so no per-run
+//! variable is needed on a machine holding it (see `tests/common/mod.rs`).
+//!
 //! Record once:
 //! RMLX_REGEN_GOLDENS=1 RMLX_KV_TEST_MODEL=/path/to/Qwen3.6-35B-A3B-8bit \
 //! cargo test -p rmlx-models --test qwen3_golden_tokens -- --ignored
 //! Then gate:
-//! RMLX_KV_TEST_MODEL=/path/to/Qwen3.6-35B-A3B-8bit \
 //! cargo test -p rmlx-models --test qwen3_golden_tokens -- --ignored
 
 #![allow(
@@ -38,22 +40,23 @@ mod common;
 
 use rmlx_kv_quant::KvQuant;
 
-/// Architectures this golden was recorded against. Any other arch is skipped.
-const EXPECTED_ARCHS: &[&str] = &[
-    "Qwen3_5MoeForCausalLM",
-    "Qwen3_5MoeForConditionalGeneration",
-];
+/// The snapshot these tests cover, and the architectures they were recorded
+/// against.
+const MODEL: common::GoldenModel = common::GoldenModel {
+    slug: "mlx-community__Qwen3.6-35B-A3B-8bit",
+    archs: &[
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+    ],
+};
 
 #[ignore]
 #[test]
 fn qwen3_moe_golden_tokens_k8v8() {
-    let Some(model_path) = common::model_path_from_env() else {
+    let Some(model_path) = common::model_for(&MODEL, "qwen3_moe_golden_tokens_k8v8") else {
         return;
     };
-    if common::skip_if_arch_mismatch(&model_path, "qwen3_moe_golden_tokens_k8v8", EXPECTED_ARCHS) {
-        return;
-    }
-    common::run_golden_test("qwen3_moe_35b_k8v8", KvQuant::K8V8);
+    common::run_golden_test("qwen3_moe_35b_k8v8", KvQuant::K8V8, &model_path);
 }
 
 /// thinking_budget forced injection on the Exact-hit decode path (Qwen3_5Moe).
@@ -67,7 +70,6 @@ fn qwen3_moe_golden_tokens_k8v8() {
 /// `N_THINKING = 4` is small enough to land comfortably within `N_TOKENS` decode steps.
 ///
 /// Run:
-/// RMLX_KV_TEST_MODEL=/path/to/Qwen3.6-35B-A3B-8bit \
 /// cargo test -p rmlx-models --test qwen3_golden_tokens \
 /// thinking_budget_exact_hit_qwen3_5_moe -- --ignored --nocapture
 #[ignore]
@@ -76,16 +78,10 @@ fn thinking_budget_exact_hit_qwen3_5_moe() {
     use rmlx_mlx::Device;
     use rmlx_models::{arch, Pcg32, PenaltyConfig, SamplerConfig};
 
-    let Some(model_path) = common::model_path_from_env() else {
+    let Some(model_path) = common::model_for(&MODEL, "thinking_budget_exact_hit_qwen3_5_moe")
+    else {
         return;
     };
-    if common::skip_if_arch_mismatch(
-        &model_path,
-        "thinking_budget_exact_hit_qwen3_5_moe",
-        EXPECTED_ARCHS,
-    ) {
-        return;
-    }
 
     const FORCED_ID: u32 = 151648; // </think> in Qwen3 vocabulary
     const N_THINKING: usize = 4; // fire forced injection after this many decode steps

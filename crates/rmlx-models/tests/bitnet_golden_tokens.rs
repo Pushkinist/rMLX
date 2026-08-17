@@ -9,11 +9,13 @@
 //! Model: `mlx-community__bitnet-b1.58-2B-4T` (BitNetForCausalLM).
 //! KV quant: K8V8 (the resolver default for this small dense backbone).
 //!
+//! The snapshot resolves from `RMLX_O_MODELS_ROOT` by slug, so no per-run
+//! variable is needed on a machine holding it (see `tests/common/mod.rs`).
+//!
 //! Record once:
 //! RMLX_REGEN_GOLDENS=1 RMLX_KV_TEST_MODEL=/path/to/bitnet-b1.58-2B-4T \
 //! cargo test -p rmlx-models --test bitnet_golden_tokens -- --ignored
 //! Then gate:
-//! RMLX_KV_TEST_MODEL=/path/to/bitnet-b1.58-2B-4T \
 //! cargo test -p rmlx-models --test bitnet_golden_tokens -- --ignored
 
 #![allow(
@@ -39,17 +41,18 @@ mod common;
 
 use rmlx_kv_quant::KvQuant;
 
-/// Architectures this golden was recorded against. Any other arch is skipped.
-const EXPECTED_ARCHS: &[&str] = &["BitNetForCausalLM"];
+/// The snapshot this golden covers, and the architectures it was recorded
+/// against.
+const MODEL: common::GoldenModel = common::GoldenModel {
+    slug: "mlx-community__bitnet-b1.58-2B-4T",
+    archs: &["BitNetForCausalLM"],
+};
 
 #[ignore]
 #[test]
 fn bitnet_golden_tokens_k8v8() {
-    let Some(model_path) = common::model_path_from_env() else {
+    let Some(model_path) = common::model_for(&MODEL, "bitnet_golden_tokens_k8v8") else {
         return;
     };
-    if common::skip_if_arch_mismatch(&model_path, "bitnet_golden_tokens_k8v8", EXPECTED_ARCHS) {
-        return;
-    }
-    common::run_golden_test("bitnet_2b_k8v8", KvQuant::K8V8);
+    common::run_golden_test("bitnet_2b_k8v8", KvQuant::K8V8, &model_path);
 }

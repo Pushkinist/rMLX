@@ -21,11 +21,13 @@
 //! gemma3 to `Planar` via `resolve_default`; this golden gates the weight-load
 //! + greedy-decode path (KV-codec-independent), not the Planar KV codec itself.
 //!
+//! The snapshot resolves from `RMLX_O_MODELS_ROOT` by slug, so no per-run
+//! variable is needed on a machine holding it (see `tests/common/mod.rs`).
+//!
 //! Record the golden once:
 //! RMLX_REGEN_GOLDENS=1 RMLX_KV_TEST_MODEL=/path/to/medgemma-1.5-4b-it-8bit \
 //! cargo test -p rmlx-models --test medgemma_golden_tokens -- --ignored
 //! Then gate (re-run without regen):
-//! RMLX_KV_TEST_MODEL=/path/to/medgemma-1.5-4b-it-8bit \
 //! cargo test -p rmlx-models --test medgemma_golden_tokens -- --ignored
 
 #![allow(
@@ -56,8 +58,12 @@ use rmlx_loader::{load_shard_index, ShardSet};
 use rmlx_mlx::Device;
 use rmlx_models::arch;
 
-/// Architectures this golden was recorded against. Any other arch is skipped.
-const EXPECTED_ARCHS: &[&str] = &["Gemma3ForConditionalGeneration"];
+/// The snapshot these tests cover, and the architectures they were recorded
+/// against.
+const MODEL: common::GoldenModel = common::GoldenModel {
+    slug: "mlx-community__medgemma-1.5-4b-it-8bit",
+    archs: &["Gemma3ForConditionalGeneration"],
+};
 
 /// KV quant pinned for the golden. K8V8 is the deprecated `for_arch_default`
 /// fallback the in-process harness uses; production `resolve_default` returns
@@ -68,13 +74,10 @@ const GOLDEN_KV_QUANT: KvQuant = KvQuant::K8V8;
 #[ignore]
 #[test]
 fn medgemma_golden_tokens_k8v8() {
-    let Some(model_path) = common::model_path_from_env() else {
+    let Some(model_path) = common::model_for(&MODEL, "medgemma_golden_tokens_k8v8") else {
         return;
     };
-    if common::skip_if_arch_mismatch(&model_path, "medgemma_golden_tokens_k8v8", EXPECTED_ARCHS) {
-        return;
-    }
-    common::run_golden_test("medgemma_4b_k8v8", GOLDEN_KV_QUANT);
+    common::run_golden_test("medgemma_4b_k8v8", GOLDEN_KV_QUANT, &model_path);
 }
 
 /// Loader sibling-parity invariant.
@@ -88,16 +91,9 @@ fn medgemma_golden_tokens_k8v8() {
 #[ignore]
 #[test]
 fn medgemma_loader_sibling_parity() {
-    let Some(model_path) = common::model_path_from_env() else {
+    let Some(model_path) = common::model_for(&MODEL, "medgemma_loader_sibling_parity") else {
         return;
     };
-    if common::skip_if_arch_mismatch(
-        &model_path,
-        "medgemma_loader_sibling_parity",
-        EXPECTED_ARCHS,
-    ) {
-        return;
-    }
 
     // --- Header truth: enumerate `.scales` / `.biases` from the shard headers.
     // Open every shard listed in the index, then read each shard's safetensors

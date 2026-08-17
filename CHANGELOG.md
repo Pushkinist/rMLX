@@ -260,6 +260,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   seed live, **neither** `--planar-flash-decode on` nor `off` dispatches the
   kernel (measured 0 and 0, 2418 warm-TTFT bypasses, identical digests) — an
   A/B whose arms both skip the kernel confirms any equivalence put to it.
+- **The golden-token decode gates had no configuration in which they ran.** All
+  five (`bonsai`, `gemma4`, `qwen3`, `bitnet`, `medgemma`) resolved their
+  snapshot from a single `RMLX_KV_TEST_MODEL`, so at most one of them could be
+  armed per invocation and none was armed by any shared gate: `make ci` passes
+  no `--ignored` and never runs them, and `make gpu-test` / `make ci-perf` —
+  which do run them, via the cross-file classifier reach into
+  `common::run_golden_test` — set no such variable, so every golden returned at
+  its first line and libtest reported `ok`. A committed fixture, a test that
+  reads it, and no configuration in which it runs is the shape of a gate that
+  cannot fail.
+
+  Each golden now names its own snapshot (architecture + slug) and resolves it
+  from exactly two variables: `RMLX_KV_TEST_MODEL`, then the slug under
+  `RMLX_O_MODELS_ROOT`. The second arms them by default — every `make` target
+  already exports that root, so a machine holding the snapshots runs every
+  golden whose model is on disk, and an operator sets nothing.
+  `make model-check-full MODEL=…` is unchanged: the single-model override still
+  outranks the slug, and the goldens for the other architectures still skip.
+
+  The per-architecture `RMLX_TEST_MODEL_*` family is deliberately **not** a
+  third source. Those variables mean "a snapshot of this family" for the smoke,
+  template and NIAH suites, and `docs/TESTING.md` tells operators to export the
+  three primary ones persistently for a whole `cargo test --workspace`. A golden
+  is a byte-exact fixture over ONE checkpoint's weights, so consulting them would
+  let a shell export retarget it to a same-family substitute — a QAT rebuild, a
+  re-quantized sibling — producing a token mismatch indistinguishable from a
+  decode regression, past an architecture check the substitute passes. Nothing
+  is lost: each golden is its own test binary, so
+  `RMLX_KV_TEST_MODEL=<path> cargo test --test <arch>_golden_tokens` retargets
+  one deliberately and per-invocation, and a snapshot living outside the root
+  can be symlinked in under its slug, which every other slug-addressed consumer
+  benefits from too.
+
+  Absence and misconfiguration are no longer the same outcome. Nothing
+  configured, or a models root that does not hold the slug, still **skips** — a
+  developer without the weights cannot run the gate, and the Makefile's
+  repo-local `models/` fallback need not exist. `RMLX_KV_TEST_MODEL` naming a
+  path that is not a snapshot directory, or a slug resolving to a snapshot of
+  the wrong architecture, now **fails**: skipping on a stale or typo'd export is
+  how a wrong pointer reports success without asserting anything.
+
+  `crates/rmlx-models/tests/common/snapshot_tests.rs` pins the whole table
+  weights-free (14 cases): both arms of the lookup order, the empty-variable
+  spelling of "unset", and every run / skip / fail verdict. Verified by
+  mutation — deleting the models-root arm, collapsing misconfiguration into
+  absence, collapsing a slug arch mismatch into a skip, and promoting
+  root-relative absence into a failure each turn only the cases that claim them
+  red.
+
+  `bonsai_8b_mixed_k8g64_v4g64.golden.txt` is **not** regenerated here. It has
+  not been touched since the 0.1.0 squash and is under suspicion of being stale;
+  updating a golden to match whatever the tree produces today would gate nothing
+  and would fold an unexplained numerics change into an unrelated commit.
 
 ### Added
 

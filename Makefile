@@ -252,14 +252,19 @@ model-check:     ## cargo test -p rmlx-{models,runtime,quant,kv-quant} (no serve
 	cargo test -p rmlx-models -p rmlx-runtime -p rmlx-quant -p rmlx-kv-quant
 
 # model-check-full: run the model-logic unit tests (same as model-check) PLUS the
-# per-arch golden-token integration tests gated by RMLX_KV_TEST_MODEL.
+# per-arch golden-token integration tests, pinned to ONE model.
 #
-# MODEL is forwarded as RMLX_KV_TEST_MODEL. Each golden test file (bonsai, gemma4,
-# qwen3, bitnet) reads <MODEL>/config.json, extracts the `architectures` field, and
-# skips gracefully (prints "SKIP <test>: model arch X != expected Y", returns green)
-# when the model does not match the arch the golden was recorded against. The matching
-# golden runs the full 32-token assertion; the others skip. The whole target is
-# GREEN for any single valid test-target model.
+# MODEL is forwarded as RMLX_KV_TEST_MODEL, which the golden harness treats as a
+# single-model override: it outranks the slug lookup under RMLX_O_MODELS_ROOT
+# (the only other source it reads). Each golden reads <MODEL>/config.json,
+# extracts the `architectures` field, and skips gracefully (prints "SKIP <test>: ...",
+# returns green) when the model does not match the arch it was recorded against. The
+# matching golden runs the full 32-token assertion; the others skip. The whole target
+# is GREEN for any single valid test-target model.
+#
+# To run EVERY golden whose snapshot is on disk instead of just one, leave
+# RMLX_KV_TEST_MODEL unset and use `make gpu-test` — the goldens resolve their own
+# snapshot by slug under the RMLX_O_MODELS_ROOT this Makefile already exports.
 #
 # Avoid --include-ignored here: the lib's own #[ignore] tests (kv-cache equivalence)
 # require a matching model + Metal context and segfault on arch mismatch. The four
