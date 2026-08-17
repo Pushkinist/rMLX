@@ -71,6 +71,21 @@ if [ -z "${TIMEOUT_BIN}" ]; then
     exit 1
 fi
 
+# Anti-vacuity. libtest exits 0 when a filter selects nothing — it prints
+# "0 passed; 0 failed; N filtered out" and is, to `$?`, indistinguishable from a
+# clean run. Output here goes to /dev/null and only the exit code is read, so a
+# rename, a move out of `lib_tests`, or a change to the `#[ignore]` status would
+# otherwise yield "OK: 60/60 clean" having run the reproducer zero times.
+selected="$("${BIN}" --exact "${TEST_NAME}" --ignored --list 2>/dev/null \
+    | grep -c ': test$' || true)"
+if [ "${selected}" != "1" ]; then
+    echo "eval-lock-stress: filter '${TEST_NAME}' selected ${selected} tests, expected exactly 1." >&2
+    echo "  The reproducer was renamed, moved, or is no longer #[ignore]d." >&2
+    echo "  Update TEST_NAME in this script — a filter that matches nothing" >&2
+    echo "  would make every run exit 0 without executing anything." >&2
+    exit 1
+fi
+
 echo "eval-lock-stress: ${BIN}"
 echo "eval-lock-stress: ${RUNS} fresh processes, ${TMO}s cap each"
 
@@ -78,7 +93,7 @@ ok=0; crash=0; hang=0; other=0
 for i in $(seq 1 "${RUNS}"); do
     set +e
     "${TIMEOUT_BIN}" -s KILL "${TMO}" "${BIN}" --exact "${TEST_NAME}" \
-        --test-threads=1 >/dev/null 2>&1
+        --ignored --test-threads=1 >/dev/null 2>&1
     rc=$?
     set -e
     case "${rc}" in

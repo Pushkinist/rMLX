@@ -90,7 +90,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         file-size-report check-no-inline-tests check-no-scalar-f32-leak \
         check-no-decode-swallow check-gpu-tests-ignored \
         check-gpu-tests-ignored-fixtures \
-        check-eval-lock eval-lock-stress \
+        check-eval-lock check-eval-lock-fixtures eval-lock-stress \
         check-no-kernel-input-eval check-no-kernel-input-eval-fixtures \
         check-metal-compiles check-metal-format
 
@@ -374,6 +374,9 @@ check-no-decode-swallow: ## CI gate: fail if a decode-step failure breaks instea
 check-eval-lock:  ## CI gate: fail if an MLX eval FFI call is made without the process-wide evaluation lock
 	@bash scripts/check_eval_lock.sh
 
+check-eval-lock-fixtures: ## CI gate: recall test for check-eval-lock (synthetic scan roots)
+	@bash scripts/check_eval_lock_fixtures.sh
+
 eval-lock-stress: ## run the evaluation-lock reproducer across RUNS fresh processes (default 60); not in `make ci`
 	@bash scripts/eval_lock_stress.sh $(RUNS)
 
@@ -406,6 +409,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_no_scalar_f32_leak.sh
 	@bash scripts/check_no_decode_swallow.sh
 	@bash scripts/check_eval_lock.sh
+	@bash scripts/check_eval_lock_fixtures.sh
 	@bash scripts/check_gpu_tests_ignored.sh
 	@bash scripts/check_gpu_tests_ignored_fixtures.sh
 	@bash scripts/check_no_kernel_input_eval.sh

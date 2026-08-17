@@ -43,7 +43,7 @@
 
 use rmlx_core::error::{Error, Result};
 
-use crate::{check_status, install_error_handler, sys, Array};
+use crate::{check_status, install_error_handler, sys, with_eval_lock, Array};
 
 // ---------------------------------------------------------------------------
 // Closure — RAII wrapper around mlx_closure
@@ -219,6 +219,21 @@ impl Closure {
     /// Apply this closure to a slice of input arrays.
     ///
     /// Returns the output arrays in a `Vec<Array>`.
+    ///
+    /// Serialised process-wide against every other evaluation — see
+    /// `EVAL_LOCK`. This one is not obvious: applying a closure looks like
+    /// pure graph construction, but building the fused `Compiled` primitive
+    /// bakes scalar constants into the kernel's library name, and that goes
+    /// `print_constant` → `array::item<T>()` → `array::eval()`
+    /// (`mlx/backend/common/compiled.cpp`). So a closure application can reach
+    /// the unsynchronised command-encoder map like any other evaluation.
+    ///
+    /// **Re-entrancy:** the closure body runs on the calling thread, inside
+    /// this FFI call, with the lock held — so a body that itself evaluates
+    /// would self-deadlock on the non-reentrant mutex. No body does today
+    /// (none of the `Closure::from_fn` sites evaluates, and no op wrapper or
+    /// `MetalKernel::apply` does either), and `make check-eval-lock` fails the
+    /// build if one starts to.
     pub fn apply(&self, inputs: &[&Array]) -> Result<Vec<Array>> {
         install_error_handler();
 
@@ -235,7 +250,9 @@ impl Closure {
         }
 
         let mut vec_out = unsafe { sys::mlx_vector_array_new() };
-        let status = unsafe { sys::mlx_closure_apply(&raw mut vec_out, self.inner, vec_in) };
+        let status = with_eval_lock(|| unsafe {
+            sys::mlx_closure_apply(&raw mut vec_out, self.inner, vec_in)
+        });
         unsafe { sys::mlx_vector_array_free(vec_in) };
         unsafe { check_status(status, "Closure::apply") }?;
 

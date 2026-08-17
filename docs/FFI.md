@@ -556,6 +556,8 @@ methods trigger execution:
 
 **Both are serialised process-wide by `EVAL_LOCK`** (`crates/rmlx-mlx/src/lib.rs`),
 via `with_eval_lock`, which holds the lock across the FFI call and nothing else.
+So is `Closure::apply` — see the reach-set table below for why a closure
+application evaluates.
 MLX evaluation is not safe to drive from two threads at once on the pinned
 0.31.x: the CPU command-encoder table described above is a process-global map
 filled without synchronisation, so two concurrent evaluations rehash it under
@@ -586,34 +588,62 @@ Three consequences worth knowing:
 
 ### Which C entry points need the lock
 
-Every mlx-c function that reaches `mlx::core::eval_impl`, not just the two this
-workspace calls today. From the generated bindings:
+**Twenty-four**, not the three this workspace happens to call. The set was
+derived by reverse reachability over the linked dylibs — `otool -tvV` on
+`libmlxc.dylib` and `libmlx.dylib`, transitive callers backwards from both
+`mlx::core::eval_impl` and the hazard symbol itself,
+`mlx::core::cpu::get_command_encoder(Stream)`, intersected with the exported
+`mlx_*` C ABI. Both directions agree. The exact procedure is recorded in
+`scripts/check_eval_lock.sh`; **re-run it when the mlx / mlx-c pin moves**
+rather than re-deriving it by eye.
 
-| Entry point | Count | Evaluates? | Called here |
+| Entry point | Count | Why it evaluates | Called here |
 |---|---|---|---|
-| `mlx_array_eval` | 1 | yes | yes, guarded |
-| `mlx_async_eval` | 1 | yes | yes, guarded |
-| `mlx_eval` | 1 | yes | no |
-| `mlx_array_item_*` | 14 | yes — via `array::item<T>()`, which calls `eval()` first (`mlx/array.h`) | no |
-| `mlx_array_data_*` | — | **no**, plain pointer accessors | yes, unguarded and correct |
+| `mlx_array_eval` | 1 | directly | yes, guarded |
+| `mlx_async_eval` | 1 | directly | yes, guarded |
+| `mlx_closure_apply` | 1 | **indirectly** — building the fused `Compiled` primitive bakes scalar constants into the kernel library name: `print_constant` → `array::item<T>()` → `array::eval()` (`mlx/backend/common/compiled.cpp`) | yes, guarded |
+| `mlx_eval` | 1 | directly | no |
+| `mlx_array_item_*` | 14 | `array::item<T>()` evaluates before reading (`mlx/array.h`) | no |
+| `mlx_array_tostring` | 1 | `operator<<(ostream&, array)` evaluates | no |
+| `mlx_save`, `mlx_save_writer`, `mlx_save_safetensors`, `mlx_save_safetensors_writer`, `mlx_save_gguf`, `mlx_load_gguf` | 6 | serialisation materialises before writing | no |
+| `mlx_array_data_*` | — | **does not evaluate** — plain pointer accessors | yes, unguarded and correct |
 
-The fifteen uncalled ones are the live risk: they sit in the bindings one call
-away and read as innocuous, `mlx_array_item_float32` most of all. Adding one
-unguarded reinstates this exact defect, with a signature — whole test binary
-dies, no test named — indistinguishable from the original bug.
+The twenty-one uncalled ones are the live risk. They sit in the bindings one
+call away and read as innocuous: `mlx_array_item_float32` looks like a scalar
+accessor, `mlx_array_tostring` is what an `impl Debug for Array` reaches for,
+and `mlx_save_safetensors` is the **write side of `rmlx convert`**, a named
+0.1.0 deliverable. Adding one unguarded reinstates this exact defect, with a
+signature — whole test binary dies, no test named — indistinguishable from the
+original bug.
 
-**`make check-eval-lock` enforces this**, because a doc sentence is not a gate:
-it fails on any call to `sys::mlx_eval` / `sys::mlx_array_item_*`, and on any
-call to the two guarded entry points that is not made under `with_eval_lock`.
-Re-derive the table above when the mlx / mlx-c pin moves — the gate's pattern
-list is hand-maintained and will not flag a newly-added evaluating entry point
-on its own. `scripts/check_eval_lock.sh` documents the rest of its blind spots.
+`mlx_closure_apply` is the one that is not obvious in either direction:
+applying a closure looks like pure graph construction, and the evaluation is
+reached through a `std::function` vtable, so it is invisible to a text scan of
+call sites. It is guarded, and because the Rust closure body runs *inside* that
+call with the lock held, a body that evaluated would self-deadlock on the
+non-reentrant mutex. No body does; RULE 3 of the gate keeps it that way.
 
-**`make eval-lock-stress`** drives the reproducer across N fresh processes
-(default 60) and fails on any non-zero exit. It exists because the in-suite
-reproducer, `concurrent_first_eval_reproducer`, only fails about 1 run in 12
-without the lock — fine as a demonstration, far too weak to gate on. Power
-comes from re-exec, not from looping in-process: the map only starts cold once.
+### The three things that hold this together
+
+| | Kind | Catches | Misses |
+|---|---|---|---|
+| `make check-eval-lock` | text gate, deterministic | an unguarded call to any of the 24; a guard dropped from a call site; a closure body that evaluates | a disarmed lock — the lexical structure is unchanged, so it stays green |
+| `with_eval_lock_serialises_concurrent_callers` | unit test, deterministic | a lock that does not actually exclude | anything about *which* calls take the lock |
+| `make eval-lock-stress` | reproducer driver, probabilistic | the real end-to-end crash | ~1 run in 12 per process, so it needs N≥60 to mean anything |
+
+The first two are in `make ci` and are complementary by construction — each is
+blind to exactly what the other catches; that was verified by mutation, not
+assumed. `make check-eval-lock-fixtures` is the recall test for the first, with
+thirteen synthetic scan roots pinning both its positives and its false-positive
+holes.
+
+The stress driver is **not** in `make ci`, and the reproducer it drives carries
+`#[ignore]`. Its measured 8% failure rate was taken the way the driver runs it —
+alone, against a cold encoder map. Inside a normal `cargo test` the map is
+already warm from other tests, so its detection chance there is lower still and
+was never measured, while its cost is exact: 412 threads peak against 4 without
+it, ~436 still resident at suite end, in a binary whose test order is
+nondeterministic. Measured cost plus unmeasured benefit is not a gate.
 
 **Never `eval()` a kernel's inputs before dispatching it.** `Array::eval()`
 blocks the calling thread until the GPU has produced the array, so an `eval()`

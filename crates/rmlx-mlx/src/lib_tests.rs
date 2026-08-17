@@ -637,16 +637,79 @@ fn cross_thread_eval_resolves_through_the_process_global_encoder_map() {
     assert_eq!(bytes_to_f32(&bytes), vec![4.0f32, 6.0]);
 }
 
-/// **A reproducer, not a gate.** Read the power figure below before treating a
-/// green run here as evidence of anything: without the lock this fails about
-/// **1 run in 12** (15 failures in 180 runs, measured), so eleven times out of
-/// twelve it would go green with the defect fully present. The gate for this
-/// defect is `make check-eval-lock`, which is deterministic. What this test
-/// adds is an executable demonstration of the mechanism, and a small standing
-/// chance of catching a *semantic* break that a text gate cannot see. To get
-/// real power out of it, run it across many fresh processes — see
-/// `make eval-lock-stress`; repeating the burst inside one process does not
-/// work, because the map only starts cold once.
+/// The deterministic half of the evaluation-lock gate: `with_eval_lock` really
+/// does exclude.
+///
+/// `make check-eval-lock` proves every evaluation FFI call is *written* inside
+/// a `with_eval_lock` closure — a lexical property. It cannot tell whether the
+/// lock actually locks; a `with_eval_lock` that took no lock would satisfy it
+/// completely. This closes that half, and unlike the burst reproducer it is
+/// deterministic: two threads, no MLX, no 400-thread cost, and it fails every
+/// time if mutual exclusion is lost rather than one run in twelve.
+///
+/// The oracle is independent of the lock's implementation — a flag raised and
+/// cleared *inside* the critical section, with each entrant asserting it found
+/// the section empty. It shares no arithmetic with the code under test.
+#[test]
+fn with_eval_lock_serialises_concurrent_callers() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    static OCCUPIED: AtomicBool = AtomicBool::new(false);
+    static OVERLAPS: AtomicUsize = AtomicUsize::new(0);
+
+    // Long enough that a lost lock overlaps essentially every iteration, short
+    // enough that the whole test stays well under a second.
+    const ITERS: usize = 200;
+    const HOLD: std::time::Duration = std::time::Duration::from_micros(50);
+
+    let worker = || {
+        for _ in 0..ITERS {
+            with_eval_lock(|| {
+                // Entering: the section must have been empty.
+                if OCCUPIED.swap(true, Ordering::SeqCst) {
+                    OVERLAPS.fetch_add(1, Ordering::SeqCst);
+                }
+                std::thread::sleep(HOLD);
+                // Leaving: and must still have been ours.
+                if !OCCUPIED.swap(false, Ordering::SeqCst) {
+                    OVERLAPS.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+        }
+    };
+
+    let a = std::thread::spawn(worker);
+    let b = std::thread::spawn(worker);
+    a.join().expect("thread a panicked");
+    b.join().expect("thread b panicked");
+
+    assert_eq!(
+        OVERLAPS.load(Ordering::SeqCst),
+        0,
+        "two threads were inside with_eval_lock at the same time — the evaluation \
+         lock is not excluding, so every MLX eval FFI call under it is unprotected"
+    );
+}
+
+/// **A reproducer, not a gate — and deliberately out of the default run.**
+/// Without the lock it fails about **1 run in 12** (15 in 180, measured), so
+/// eleven times in twelve it would go green with the defect fully present.
+/// Worse, that figure was measured the way `make eval-lock-stress` runs it:
+/// alone, against a genuinely cold encoder map. Inside a normal `cargo test`
+/// the map is already warm from every other MLX-touching test, so its real
+/// detection chance there is lower still and has never been measured — while
+/// its cost is exact and certain (412 threads peak against 4 without it, ~436
+/// still resident when the suite ends, in a binary whose test order is
+/// nondeterministic). A gate whose cost is measured and whose benefit is not
+/// does not belong in `make ci`.
+///
+/// The gates for this defect are `make check-eval-lock` (every eval FFI call
+/// is made under the lock) and
+/// `with_eval_lock_serialises_concurrent_callers` (the lock actually excludes),
+/// both deterministic. This test is the end-to-end demonstration that the two
+/// of them together prevent the real crash; run it with
+/// `make eval-lock-stress`, which drives it across fresh processes because the
+/// map only starts cold once per process.
 ///
 /// The linked MLX resolves a CPU stream's `CommandEncoder` through a
 /// process-global `std::unordered_map<int, CommandEncoder>` that it fills
@@ -674,6 +737,9 @@ fn cross_thread_eval_resolves_through_the_process_global_encoder_map() {
 /// exercised (those tests carry `#[ignore]` and run serialised), nor are races
 /// inside lazy graph *construction*, which never reaches `eval`.
 #[test]
+// Not a GPU test — CPU only. Ignored because it is probabilistic and costs
+// ~412 threads; `make eval-lock-stress` is its runner and passes `--ignored`.
+#[ignore = "probabilistic reproducer, ~412 threads — run via `make eval-lock-stress`"]
 #[allow(
     clippy::needless_collect,
     reason = "the collect is the concurrency: it spawns every thread before the first join, \

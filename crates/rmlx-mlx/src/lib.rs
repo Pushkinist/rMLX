@@ -101,15 +101,35 @@ thread_local! {
 // thread at a time by design, so the lock is a guard against a crash rather
 // than a throughput bottleneck.
 //
-// **Which C entry points need it.** Not just the two rMLX calls today: every
-// mlx-c function that reaches `mlx::core::eval_impl` touches the same map. In
-// the generated bindings that is `mlx_array_eval`, `mlx_async_eval`,
-// `mlx_eval`, and all 14 `mlx_array_item_*` (each goes through
-// `array::item<T>()`, which calls `eval()` — `mlx/array.h`). The data
-// accessors `mlx_array_data_*` do *not* evaluate and need no lock. Only the
-// first two are called here; the other 15 are one call away, and adding one
-// unguarded silently reinstates this defect. `make check-eval-lock` fails the
-// build on that, because a doc sentence is not a gate.
+// **Which C entry points need it.** Not just the eval-named ones: every mlx-c
+// function that reaches `mlx::core::eval_impl` touches the same map. Derived by
+// reverse reachability over the linked dylibs (see `scripts/check_eval_lock.sh`
+// for the exact procedure), the set is 24:
+//
+//   - `mlx_array_eval`, `mlx_async_eval`, `mlx_eval`
+//   - 14 × `mlx_array_item_*` — `array::item<T>()` calls `eval()` first
+//     (`mlx/array.h`)
+//   - `mlx_array_tostring` — `operator<<(ostream&, array)` evaluates
+//   - `mlx_save`, `mlx_save_writer`, `mlx_save_safetensors`,
+//     `mlx_save_safetensors_writer`, `mlx_save_gguf`, `mlx_load_gguf` — the
+//     serialisation paths materialise before writing
+//   - `mlx_closure_apply` — indirect: building the fused `Compiled` primitive
+//     bakes scalar constants into the kernel library name via
+//     `print_constant` → `array::item<T>()` → `array::eval()`
+//     (`mlx/backend/common/compiled.cpp`)
+//
+// The data accessors `mlx_array_data_*` do *not* evaluate and need no lock.
+// Three of these are called here and all three are guarded; the rest are one
+// call away, and adding one unguarded silently reinstates this defect —
+// `mlx_save_safetensors` is the write side of `rmlx convert`, and
+// `mlx_array_tostring` is what an `impl Debug for Array` would reach for.
+// `make check-eval-lock` fails the build on that, because a doc sentence is
+// not a gate.
+//
+// **Re-entrancy.** The mutex is not reentrant, so nothing running under it may
+// evaluate. That is only a live question for `mlx_closure_apply`, which invokes
+// a Rust closure body on the calling thread while the lock is held. No body
+// evaluates today and the gate enforces it; see `Closure::apply`.
 static EVAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Run `f` holding the process-wide evaluation lock.
@@ -122,11 +142,16 @@ static EVAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// and nothing else" a property of the API instead of a rule callers have to
 /// remember.
 ///
-/// The guarded region is a single FFI call with no Rust code that can panic, so
-/// the mutex cannot actually be poisoned; recovering from `PoisonError` rather
-/// than propagating it keeps a structurally-unreachable state from turning a
-/// later evaluation into a spurious failure.
-fn with_eval_lock<T>(f: impl FnOnce() -> T) -> T {
+/// Poisoning is unreachable here, though not because the guarded region is
+/// Rust-free — it is not. MLX calls back into the error handler installed by
+/// [`install_error_handler`] from *inside* `mlx_array_eval` / `mlx_async_eval`,
+/// and that handler allocates a `String` and writes a thread-local; a compiled
+/// closure body runs under the lock too. What rules poisoning out is that the
+/// callback is an `unsafe extern "C" fn`, and since Rust 1.81 a panic escaping
+/// one aborts the process rather than unwinding. Recovering from `PoisonError`
+/// rather than propagating it keeps that unreachable state from turning a later
+/// evaluation into a spurious failure.
+pub(crate) fn with_eval_lock<T>(f: impl FnOnce() -> T) -> T {
     let _guard = EVAL_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
