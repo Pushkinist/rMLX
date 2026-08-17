@@ -381,20 +381,37 @@ ML-semantic effect.
 
 ### Per-thread CPU stream context — `ensure_cpu_default_stream`
 
-The same thread-local-encoder problem exists on the CPU side, independently of
-the GPU one: MLX's CPU backend resolves a stream's `CommandEncoder` through a
-**thread-local** map first
-(`mlx/backend/cpu/encoder.cpp::get_command_encoder`), falling back to a
-process-global map and otherwise throwing `There is no Stream(cpu, N) in
-current thread.` A worker thread whose graph includes a CPU-scheduled op —
-e.g. the K8V8 `exit_prefill` quantization's scale reduction, which MLX places
-on the CPU stream even though the surrounding quantize dispatch runs on the
-GPU device — can fault the same way the GPU path did (issue #206).
+A worker thread whose graph includes a CPU-scheduled op — e.g. the K8V8
+`exit_prefill` quantization's scale reduction, which MLX places on the CPU
+stream even though the surrounding quantize dispatch runs on the GPU device —
+needs a CPU stream of its own, the same way the GPU path did.
+
+**How MLX resolves the CPU encoder is version-specific, and the two versions
+behave oppositely — do not reason from the wrong one:**
+
+| | 0.31.x (**the pinned version**) | 0.32.0 |
+|---|---|---|
+| `cpu::get_command_encoder` map | one **process-global** `unordered_map<int, CommandEncoder>` | `thread_local`, with a process-global fallback |
+| Populated | lazily, on first evaluation, **with no synchronisation** | at stream registration |
+| Unregistered stream | silently inserted | throws `There is no Stream(cpu, N) in current thread.` |
+| Cross-thread eval | succeeds | throws |
+
+Default CPU streams are per-thread either way (`mlx/stream.cpp`:
+`static thread_local ... default_streams`), so on the pinned version every
+thread that evaluates mints its own stream index and inserts into that one
+shared map. That unsynchronised insert is a genuine upstream defect — the
+neighbouring `Scheduler::threads_` map in `mlx/scheduler.h` *is* mutex-guarded —
+and it is what `EVAL_LOCK` (below) contains. MLX 0.32.0 fixes it by making the
+map thread-local; we do not pin that version because its bottle ships no NAX
+GEMM kernels.
 
 `rmlx_mlx::ensure_cpu_default_stream()` is the CPU analog of
 `ensure_gpu_default_stream()`: same mechanism (create a stream, register it as
 the calling thread's default, leak the handle in a thread-local for the
-thread's lifetime), same idempotency guarantee, zero ML-semantic effect.
+thread's lifetime), same idempotency guarantee, zero ML-semantic effect. On
+0.31.x it is not load-bearing for a thread that builds and evaluates its own
+graph — MLX self-registers there — but it pins the thread's stream identity
+explicitly and is what keeps the code correct if the pin moves to 0.32.0.
 
 **Contract:** every blocking-thread inference entry point calls
 `ensure_cpu_default_stream()` **unconditionally** (not gated on the resolved
@@ -423,8 +440,12 @@ unbounded over long serve uptime (which would otherwise eventually exhaust the
 process lifetime regardless.
 
 See `docs/KV_CACHE.md` §5.7.5 and `docs/KV_QUANT.md` for the `exit_prefill`
-mechanism this guards, including the guard's limitation (it registers the
-*worker's own* stream — it does not fix a genuinely cross-thread eval).
+mechanism this guards. Note the guard's scope: it registers the *worker's own*
+stream. On the pinned 0.31.x that is all anyone needs — a cross-thread eval
+resolves through the process-global map and succeeds
+(`cross_thread_eval_resolves_through_the_process_global_encoder_map` pins this).
+On 0.32.0 a cross-thread eval throws and the guard would not help, because it
+registers a different stream than the one the foreign array is bound to.
 
 ### Null sentinel for optional arguments
 
@@ -532,6 +553,29 @@ methods trigger execution:
   to pipeline the next decode step's forward pass on the GPU while the
   current step's argmax is still being read back to the CPU, mirroring
   mlx-lm's `mx.async_eval` pattern in `generate.py`.
+
+**Both are serialised process-wide by `EVAL_LOCK`** (`crates/rmlx-mlx/src/lib.rs`),
+a `Mutex<()>` held across the FFI call and nothing else. MLX evaluation is not
+safe to drive from two threads at once on the pinned 0.31.x: the CPU
+command-encoder table described above is a process-global map filled without
+synchronisation, so two concurrent evaluations rehash it under each other and
+the process takes SIGSEGV inside MLX — no Rust frame at fault, no failing test
+reported, nothing to catch. `cargo test` runs one OS thread per test, which is
+how this reached `make ci` as an intermittent crash of the whole test binary.
+
+Three consequences worth knowing:
+
+- **Cost is one uncontended atomic per evaluation.** rMLX runs inference on one
+  thread at a time by design (and the server has its own `gpu_gate` above that),
+  so the lock is a crash guard, not a throughput bottleneck.
+- **`async_eval` still pipelines.** Only the graph walk and dispatch happen
+  under the lock; the scheduled work completes after it is released.
+- **The lock is not a licence to evaluate concurrently.** It makes concurrent
+  callers correct, not parallel — they serialise.
+
+New FFI entry points that can reach `mlx::core::eval_impl` must take the same
+lock. Today that is exactly `mlx_array_eval` and `mlx_async_eval`; mlx-c's
+data accessors (`mlx_array_data_*`) do not evaluate.
 
 **Never `eval()` a kernel's inputs before dispatching it.** `Array::eval()`
 blocks the calling thread until the GPU has produced the array, so an `eval()`

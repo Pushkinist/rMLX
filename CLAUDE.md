@@ -199,7 +199,14 @@ Hard rules:
 - **Hard rule: a test that reaches `Device::Gpu` carries `#[ignore]`.** A shared
   Metal context driven from parallel `cargo test` threads aborts the whole test
   binary ("Rust cannot catch foreign exceptions"), taking every other test in
-  the crate with it. Run them with **`make gpu-test`** (every member crate,
+  the crate with it. **This rule is about Metal only — do not widen it to cover
+  MLX contact generally.** The CPU side has its own, unrelated hazard (MLX
+  0.31.x fills a process-global command-encoder map without synchronisation, so
+  parallel test threads used to SIGSEGV the binary with no failing test named);
+  that one is contained by `EVAL_LOCK` in `rmlx-mlx`, which serialises every
+  evaluation process-wide — not by ignoring CPU tests, which would only stop
+  running them. See `docs/FFI.md`.
+  Run GPU tests with **`make gpu-test`** (every member crate,
   serialized; `CRATE=` / `FILTER=` to narrow), or by hand as
   `cargo test -p <crate> --lib -- --ignored <filter> --test-threads=1`.
   `make gpu-test` is the only step that executes them — `make test` passes no
