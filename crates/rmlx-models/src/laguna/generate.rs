@@ -335,6 +335,7 @@ pub fn generate_greedy(
     let max_abs_logit = max_abs_from_bytes(&logit_bytes, logits_flat.dtype());
     reject_nan_prefill(
         "LagunaForCausalLM",
+        logits_flat.dtype(),
         nan_count,
         max_abs_logit,
         prompt_ids.len(),
@@ -601,10 +602,15 @@ fn decode_loop(
         // twenty lines above. Truncating instead — emitting the junk token this
         // row selects and breaking — hands back a short generation the server
         // reports as finish_reason="length", indistinguishable from a clean
-        // token-cap stop, with one fabricated token on the end. Raising before
-        // the token is pushed keeps everything already delivered genuinely
-        // healthy, so a temp=0 replay reproduces that prefix and continues past
-        // the fault point.
+        // token-cap stop, with one fabricated token on the end.
+        //
+        // Unlike the prefill sites, `steps.len()` tokens are already delivered
+        // here, so the "nothing has reached the wire" argument does not apply.
+        // What holds instead: the guard fires before THIS step's token is
+        // pushed, so the delivered prefix is entirely healthy, and at temp=0 a
+        // replay reproduces it and continues past the fault point. The retry
+        // envelope's prefix-identity assertion is what covers the case where it
+        // does not — see docs/SERVER.md § Retry Envelope.
         let logit_bytes = logits_flat.to_bytes()?;
         let nan_count = count_nan_in_bytes(&logit_bytes, logits_flat.dtype());
         let max_abs_logit = max_abs_from_bytes(&logit_bytes, logits_flat.dtype());

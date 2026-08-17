@@ -337,7 +337,13 @@ pub fn generate_greedy<'a>(
         let logit_bytes = logits_flat.to_bytes()?;
         let nan_count = count_nan_in_bytes(&logit_bytes, logits_flat.dtype());
         let max_abs_logit = max_abs_from_bytes(&logit_bytes, logits_flat.dtype());
-        reject_nan_prefill(arch_label, nan_count, max_abs_logit, prompt_ids.len())?;
+        reject_nan_prefill(
+            arch_label,
+            logits_flat.dtype(),
+            nan_count,
+            max_abs_logit,
+            prompt_ids.len(),
+        )?;
 
         let lp_k = sampler_cfg.top_logprobs_k as usize;
 
@@ -529,14 +535,25 @@ pub fn generate_greedy<'a>(
     let logits_flat = prefill_logits.reshape(&[1, vocab], device)?;
     // Prefill logit stats, the same pair every other arch computes. One host
     // readback of the vocab row per request — not per token — which is what
-    // keeps it off the decode hot path while still giving the NaN guard and the
-    // smoke classifier something to read. Without it a NaN prefill on this arch
-    // runs to full length and returns garbage with no guard and no verdict.
+    // keeps it off the decode hot path while still giving the NaN guard
+    // something to read. Without it a NaN prefill on this arch runs to full
+    // length and returns garbage with no guard at all.
+    //
+    // `max_abs_logit` is the only one of the two the emitted ProbeStep can carry
+    // a non-trivial value for: the guard returns Err a few lines below, so a
+    // step that reaches the classifier always has nan_count == 0 by
+    // construction. See SmokeVerdict::BrokenNan.
     logits_flat.eval()?;
     let logit_bytes = logits_flat.to_bytes()?;
     let nan_count = count_nan_in_bytes(&logit_bytes, logits_flat.dtype());
     let max_abs_logit = max_abs_from_bytes(&logit_bytes, logits_flat.dtype());
-    reject_nan_prefill(arch_label, nan_count, max_abs_logit, prompt_ids.len())?;
+    reject_nan_prefill(
+        arch_label,
+        logits_flat.dtype(),
+        nan_count,
+        max_abs_logit,
+        prompt_ids.len(),
+    )?;
 
     // top-k logprob capture (0 = disabled, hot-loop zero-overhead).
     let lp_k = sampler_cfg.top_logprobs_k as usize;

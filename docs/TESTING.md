@@ -367,11 +367,13 @@ cell.
 suites are invariant — the same pass/fail result in every repetition of both
 modes, with zero invalid-access reports — but real inference is not.
 Ternary-Bonsai-8B (Qwen3 dense) intermittently produces a NaN prefill on this
-host. The generation then aborts with an `error!` naming `nan_count`,
-`max_abs_logit` and `prompt_len`, and the process exits non-zero. It used to
-emit a single token (id 0, `"!"`), report `tps=0.064`, and exit 0 with nothing
-logged at any level — that silent shape is gone, but the underlying NaN is not
-fixed by making it loud.
+host. The generation now aborts with an `error!` naming `nan_count`,
+`max_abs_logit` and `prompt_len`. Under a one-shot command (`baseline`, `chat`,
+`info --probe-smoke`) that ends the process with a non-zero exit; under `serve`
+it is a failed request — HTTP 503 — and the process keeps running, so the log
+event is the only signal. It used to emit a single token (id 0, `"!"`), report
+`tps=0.064`, and exit 0 with nothing logged at any level — that silent shape is
+gone, but the underlying NaN is not fixed by making it loud.
 
 **What the trigger is not.** A 108-run campaign across four separately-built
 binaries put all three degenerate events inside one window where `prefill_tps`

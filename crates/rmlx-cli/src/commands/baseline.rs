@@ -512,6 +512,13 @@ pub(crate) fn run_baseline(
     // only its KV column is unusable, so omitting that one column — which the
     // downstream `> 0` gates already do — keeps an otherwise valid timing
     // measurement.
+    //
+    // Note this DIVERGES from `rmlx bench`, which refuses both verdicts. The two
+    // commands have different products: bench records `kv_cache_bytes` as a
+    // first-class result, so a broken byte count voids its output, while
+    // baseline's product is a timing row that survives a missing KV column
+    // intact. They agree on `Unreported` because that one is not a broken
+    // column — it means the generation never finished.
     let kv_cache_bytes: u64 =
         match rmlx_models::classify_kv_bytes(kv_before, model.kv_cache_bytes_sample()) {
             rmlx_models::KvBytesVerdict::Reported(n) => n,

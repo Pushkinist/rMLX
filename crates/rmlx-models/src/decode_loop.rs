@@ -192,7 +192,7 @@ impl PostDecode {
 /// fields, never the log, so a fault that reports as an ordinary outcome passes
 /// all of them.
 ///
-/// Called **before** the poisoned token is pushed and handed to `step_fn`, so
+/// Called **before** the offending token is pushed and handed to `step_fn`, so
 /// nothing reaches the wire: on the server the delivered prefix stays empty and
 /// the retry envelope can replay the request from a clean slate.
 ///
@@ -204,12 +204,46 @@ impl PostDecode {
 /// budget's usefulness on a fault that a retry usually clears. A genuinely
 /// deterministic NaN (corrupt weights) costs two extra attempts and then
 /// surfaces with this same message. See `docs/SERVER.md` § Retry Envelope.
+///
+/// # `dtype` is not decoration
+///
+/// `count_nan_in_bytes` reads F32 and Bf16 and returns `0` for every other
+/// dtype, which collapses two different answers: "this row has no NaN" and
+/// "this row was never examined". While the count only decorated a `ProbeStep`
+/// that was harmless. As the sole guard it **fails open** — and `Dtype::F16` is
+/// first-class loadable, so a fully-NaN fp16 logit row would report clean and
+/// this whole guard would be inert. The dtype therefore travels with the count
+/// and an unreadable row is refused in its own right, with a message saying the
+/// row was never checked rather than that it was clean.
 pub(crate) fn reject_nan_prefill(
     arch: &str,
+    dtype: Dtype,
     nan_count: usize,
     max_abs_logit: f32,
     prompt_len: usize,
 ) -> Result<()> {
+    // Exhaustive on purpose, no wildcard: a new float dtype must be classified
+    // here rather than defaulting into the "unreadable" bucket by accident — or,
+    // worse, into a silent pass if this were ever written the other way round.
+    let readable = match dtype {
+        Dtype::F32 | Dtype::Bf16 => true,
+        Dtype::F16 | Dtype::U8 | Dtype::U32 | Dtype::I32 => false,
+    };
+    if !readable {
+        let e = Error::Other(format!(
+            "{arch}: prefill logits are {dtype:?}, which the NaN scan cannot read, so the row \
+             was NEVER CHECKED (prompt_len = {prompt_len}) — refusing to generate from an \
+             unverified logit row rather than reporting it as clean"
+        ));
+        tracing::error!(
+            error = %e,
+            arch,
+            ?dtype,
+            prompt_len,
+            "prefill logit dtype is unreadable by the NaN scan, aborting generation"
+        );
+        return Err(e);
+    }
     if nan_count == 0 {
         return Ok(());
     }

@@ -759,6 +759,7 @@ pub fn dflash_generate_greedy(
     // FULL accumulated context each round — equivalent to the Python ref's
     // persistent draft KV cache (`cache.update_and_fetch`), which accumulates
     // context K/V derived deterministically from these same hiddens.
+    super::guard_verifier_prefill_logits(verifier, &r0_logits, prompt_ids.len())?;
     let mut h_ctx_raw = r0_hidden;
     let mut b = {
         let am = argmax(&r0_logits, -1, device)?;

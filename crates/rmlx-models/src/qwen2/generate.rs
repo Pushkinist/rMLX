@@ -329,6 +329,7 @@ pub fn generate_greedy(
     let max_abs_logit = max_abs_from_bytes(&logit_bytes, logits_flat.dtype());
     reject_nan_prefill(
         "Qwen2ForCausalLM",
+        logits_flat.dtype(),
         nan_count,
         max_abs_logit,
         prompt_ids.len(),

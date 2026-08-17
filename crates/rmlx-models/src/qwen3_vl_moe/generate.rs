@@ -123,6 +123,7 @@ fn guard_prefill_logits(logits: &Array, prompt_len: usize) -> Result<()> {
     let max_abs_logit = max_abs_from_bytes(&bytes, logits.dtype());
     reject_nan_prefill(
         "Qwen3VLMoeForConditionalGeneration",
+        logits.dtype(),
         nan_count,
         max_abs_logit,
         prompt_len,
