@@ -108,41 +108,67 @@ append block on those arches. Phase D is the caller that hits it on *every*
 partial accept; the prompt-cache trim hits it whenever the block granularity and
 the prefill chunk disagree.
 
-That matters for the block-accumulating packed stores — every rotor and iso K
-and V store keeps a `Vec` of per-append blocks, not a flat buffer. Dropping the
-whole trailing block would discard the accepted tokens along with the rejected
-ones and leave `blocks` covering fewer rows than `shape[2]`; the store's
-reconciliation guard then aborts the request with
-`"CPU blocks cover N tokens but shape[2] needs M"` rather than fabricate a
-zeroed gap. `storage::truncate_plan` therefore **splits** the trailing block,
-cutting every per-row buffer — codes, per-group scales, per-group quaternions,
-per-token norms, and the rotor QJL sideband — to the accepted row count. See
-`crates/rmlx-kv-quant/src/storage/mod.rs` and
-`storage/truncate_plan_tests.rs`.
+That matters for every store whose CPU payload accumulates independently of
+`shape[2]` — the rotor and iso K/V stores plus `QuantV` (`Vec<TurboBlocks>`),
+`QuantKTurbo3/4`, `QuantPlanarK` / `QuantPlanarV` (`Vec<PlanarBlocks>`), and
+`QuantK` (a flat append-only `codes`/`scales` pair). Lowering `shape[2]` alone
+rolls back none of them.
+
+Dropping the whole trailing block would discard the accepted tokens along with
+the rejected ones and leave the payload covering fewer rows than `shape[2]`; the
+store then aborts the request rather than fabricate a zeroed gap.
+`storage::truncate_plan` therefore **splits** the trailing block, cutting every
+per-row buffer — codes, per-group or per-pair scales, per-group quaternions,
+rotation indices, per-token norms, and the rotor QJL sideband — to the accepted
+row count. `QuantK` has no blocks and cuts its flat buffer to the leading `n`
+positions directly. See `crates/rmlx-kv-quant/src/storage/mod.rs`,
+`storage/truncate_plan_tests.rs` and `storage/cpu_block_truncate_tests.rs`.
 
 A live GPU ring can rebuild the gap, which is why this was survivable on the
 fused decode path. It is not survivable wherever the ring is absent: the CPU
 append path (a QJL-carrying rotor K store, or a `Device::Cpu` run), and the
 legacy `update_rotor{3,4}_sym` / asym appends, which clear the ring by design.
 Those are exactly the paths a `q_seq > 1` verifier forward takes, since the
-fused decode entry is gated on `q_seq == 1`.
+fused decode entry is gated on `q_seq == 1`. The turbo / planar / affine stores
+have no ring at all, so their CPU payload is the only copy — but for them the
+binding constraint is not the ring, it is the **bf16 decode seed**.
+`exit_prefill` materialises `decode_fp16_{k,v}` for every quant whose
+`feeds_bf16_k_at_decode()` is true (all of them), and each quantized
+`update_<codec>` then early-returns into `update_decode_fp16` on its first line —
+so post-prefill the codec store is frozen and not read at decode time at all. A
+plain GPU serve therefore cannot observe whether the cut happened, on any of
+these codecs, including the ones whose encode is forced to `Device::Cpu`
+(`K8VTurbo2/3`, both TCQ variants, `TurboSym3`) — that forced-CPU `append` sits
+*below* the same early return.
 
-**Scope (#382).** The split covers the rotor and iso block stores only, and only
-at `b == 1` (at `b > 1` the block concatenation is not readable by the decode
-path, so a mid-block cut stays a loud error instead of becoming a scrambled
-store). `QuantV` (`Vec<TurboBlocks>`) and `QuantPlanarV` / `QuantPlanarK`
-(`Vec<PlanarBlocks>`) accumulate CPU blocks the same way, but
-`KvStorage::truncate_to` only lowers `shape[2]` for `K8V4` / `K8V8` / `Planar` /
-`PlanarK` / `TurboSym3/4` / `K8VTurbo2/3` / `K8VTurbo3Tcq` / `K8VTurbo2Tcq` and
-for the V axis of `RotorKAsym3/4`, so their blocks **over**-cover the target and
-the next append stacks on top. `QuantV::dequantize_choice` then resizes the
-over-long concatenation down to `shape[2]`, silently keeping the rejected tokens
-and dropping the correction token — wrong attention, no error.
+Where it is observable: a **hydrated** cache (`KvCache::from_storage` leaves
+`decode_fp16_k: None`, so the codec arm runs every decode step and the blocks are
+the cache), a `Device::Cpu` run, and any cache that never bracketed a prefill.
+An uncut store is also still *written out* on the seeded path — the SSD spill
+serialises `blocks` against `shape[2]`, and the prompt-cache snapshot clones
+them — which is how the defect travels from a seeded serve into the hydrated
+cache that later reads it. See `rmlx-kv-ssd/src/hydrate_tests.rs` for the
+round-trip that pins this.
 
-`RotorKAsym3/4` are the awkward case: their rotor K axis is covered and their
-affine V axis is not, so one codec now truncates its two axes with different
-semantics. Unfixed; those stores are owned outside this change. See
-`docs/KV_QUANT.md` § "Scope — the class is NOT closed (#382)".
+**Scope.** `KvStorage::truncate_to` no longer contains a bare `shape[2] = n` in
+any arm — `K8V4`, `K8V8`, `Planar`, `PlanarK`, `TurboSym3/4`, `K8VTurbo2/3`, both
+TCQ variants, `IsoV3/4`, `RotorV3/4` and **both** axes of `RotorKAsym3/4`
+delegate to a store-level `truncate_to`, so no codec truncates its two axes with
+different semantics any more. `KvStorage::reset` had the identical defect and is
+rewired the same way. Truncation is also clamped to be monotone-decreasing on
+these six stores: a rollback into the decode window arrives with a target past
+the frozen store's fill, and raising `shape[2]` to meet it would invent coverage
+no payload backs.
+
+The split itself is still `b == 1` only, and that bound is unchanged: at `b > 1`
+the block concatenation is not readable by the decode path, so a mid-block cut
+stays a loud error rather than becoming a scrambled store. What changed is that
+"loud" is now true for the turbo / planar / affine stores too — every CPU dequant
+path checks that its payload decodes to exactly `prod(shape)` and errors with
+`"refusing to zero-pad / truncate"` otherwise. Previously the turbo stores
+zero-padded (`out.resize(total, 0.0)`) and the planar stores panicked on an
+out-of-range index. See `docs/KV_QUANT.md` § "Scope — every CPU-side store now
+cuts, and every one of them is loud".
 
 ## Per-drafter Deep Dive
 

@@ -94,6 +94,11 @@ mod quant_planar_k_tests;
 #[path = "truncate_plan_tests.rs"]
 mod truncate_plan_tests;
 
+// Mid-sequence truncation of the CPU-side turbo / planar / affine stores.
+#[cfg(test)]
+#[path = "cpu_block_truncate_tests.rs"]
+mod cpu_block_truncate_tests;
+
 // ── Paged KV growth ───────────────────────────────────────────────────────────
 //
 // GPU quantized buffers are allocated in multiples of PAGE_SIZE tokens instead
@@ -110,27 +115,33 @@ pub const KV_PAGE_SIZE: i32 = 256;
 
 // ── Shared truncate-to-sequence helper ───────────────────────────────────────
 //
-// Every rotor/iso K and V store accumulates per-append blocks whose `n_tokens`
-// field counts **rows** (`b * kv_h * seq_of_block`), not raw sequence
-// positions — see the dequant-time reconciliation guards (e.g.
-// `synced_rotor_v_blocks`, `synced_iso_v_blocks`) that sum `n_tokens` and
-// compare against `b * kv_h * shape[2]`. `truncate_to(n)` takes `n` as a
-// **sequence** target, so `n` must be converted to the same row units before
-// it is compared against the cumulative `n_tokens` — otherwise, at `kv_h > 1`
-// (or `b > 1`), each block's `n_tokens` is inflated by that factor and the
-// walk overshoots the target early, dropping blocks that should have been
-// kept. This was invisible at `b * kv_h == 1` (the row and sequence counts
-// coincide there), which is how the bug shipped.
+// Every CPU-side K and V store accumulates per-append payload blocks (the
+// rotor/iso stores, and the turbo / planar / affine ones) whose row count is
+// `b * kv_h * seq_of_block`, not raw sequence positions — see the dequant-time
+// reconciliation guards (e.g. `synced_rotor_v_blocks`, `synced_iso_v_blocks`)
+// that sum `n_tokens` and compare against `b * kv_h * shape[2]`.
+// `truncate_to(n)` takes `n` as a **sequence** target, so `n` must be converted
+// to the same row units before it is compared against the cumulative row count
+// — otherwise, at `kv_h > 1` (or `b > 1`), each block's row count is inflated
+// by that factor and the walk overshoots the target early, dropping blocks that
+// should have been kept. This was invisible at `b * kv_h == 1` (the row and
+// sequence counts coincide there), which is how the bug shipped.
 //
 // Blocks are also **not** an alignment the truncation target respects. A block
 // spans one whole append, and a speculative-decode partial accept cuts inside
 // the verifier's multi-token chunk: keeping only whole blocks would throw away
 // the accepted prefix along with the rejected tail, leaving `blocks` short of
 // `shape[2]`. That state is only recoverable when a GPU ring happens to hold
-// the same prefix; on the CPU append path (a QJL-carrying rotor K store, or
+// the same prefix; on the CPU append path (a QJL-carrying rotor K store, a
+// codec whose encode is forced to CPU such as the 2-/3-bit turbo V side, or
 // any `Device::Cpu` run) there is no ring and the next `dequant()` /
-// `try_deep_clone()` aborts the request rather than fabricate a zeroed gap.
-// So the trailing block is **split**, not dropped.
+// `dequantize_choice()` / `try_deep_clone()` aborts the request rather than
+// fabricate a zeroed gap. So the trailing block is **split**, not dropped.
+//
+// The flat-GPU-buffer half of the turbo / planar / affine stores needs no cut:
+// its dequant slices `[0, shape[2])` and the next `append` writes at
+// `prev_seq == shape[2]`, so lowering `shape[2]` alone already makes the
+// rejected region overwritable. Only the append-only CPU side has to be cut.
 //
 // The split is confined to `b == 1`, and that is a correctness bound, not a
 // simplification. Every store ends `dequant` with
@@ -239,9 +250,74 @@ pub(crate) fn truncate_plan(
     }
 }
 
+/// Clamp a truncation target to what the store already covers.
+///
+/// Truncation is monotone-decreasing by contract, and for the turbo / planar /
+/// affine stores that has to be enforced rather than assumed. `n > shape[2]` is
+/// reachable: post-`exit_prefill` the codec store is frozen at the prefill
+/// length while `KvCache::offset` keeps advancing on the bf16 decode mirror, so
+/// a speculative rollback to a position inside the decode window arrives with a
+/// target past the store's own fill. Raising `shape[2]` to meet it invents
+/// coverage that no payload backs — the CPU dequant then reads past the blocks
+/// and the SSD spill persists a store whose header claims more tokens than its
+/// bytes hold.
+///
+/// The rotor / iso stores deliberately do **not** clamp, and the reason is that
+/// they do not need to, not that clamping would cost them anything: a ring-only
+/// tail spans `[blocks_coverage, shape[2])`, strictly below `shape[2]`, so a
+/// `min(n, shape[2])` could never discard it. What makes the asymmetry safe is
+/// that those stores already **abort loudly** on an over-long target —
+/// `synced_rotor_v_blocks` / `synced_iso_v_blocks` size their ring readback from
+/// `shape[2]` and return `Err` when the ring cannot cover it. The clamp would buy
+/// them nothing. These stores have no ring and no such guard, so for them the
+/// clamp is the only reading that keeps `shape[2] == payload coverage` true.
+pub(crate) fn clamp_truncate_target(shape: &[i32], n: i32) -> i32 {
+    let covered = shape.get(2).copied().unwrap_or(0).max(0);
+    n.max(0).min(covered)
+}
+
+/// Rows a `[…, D]`-shaped codec block holds — one row per `head_dim`-wide
+/// vector, i.e. the product of the leading three axes.
+///
+/// [`TurboBlocks`] and [`PlanarBlocks`] carry no explicit row count (unlike the
+/// rotor / iso blocks' `n_tokens`), so it has to come from `original_shape` —
+/// and that field is **not** a reliable axis map. The CPU append paths record
+/// the sequence-major chunk shape `[B, S_block, kv_h, D]` while the SSD hydrate
+/// paths record the store's head-major `[B, kv_h, S, D]` over the same
+/// sequence-major bytes. Only the product is ever read back (`turbo_dequantize`
+/// / `planar_dequantize` use it purely as an element count) and the last axis is
+/// the row width in both, so "product of the first three axes" is the one
+/// reading both conventions agree on.
+///
+/// A shape that cannot be read this way (negative dimension, or overflow)
+/// yields 0. Such a block holds no decodable payload either — the dequant-side
+/// coverage check is what reports it.
+pub(crate) fn block_rows(original_shape: &[i32; 4]) -> usize {
+    let [d0, d1, d2, _] = *original_shape;
+    match (
+        usize::try_from(d0),
+        usize::try_from(d1),
+        usize::try_from(d2),
+    ) {
+        (Ok(a), Ok(b), Ok(c)) => a.saturating_mul(b).saturating_mul(c),
+        _ => 0,
+    }
+}
+
 /// A per-append payload block whose buffers hold one equal-stride row per
 /// `(sequence position, kv head)` pair.
 pub(crate) trait BlockRows {
+    /// Rows this block currently holds.
+    ///
+    /// The single way to ask the question — the rotor / iso blocks answer from
+    /// their `n_tokens` field, the turbo / planar blocks from
+    /// [`block_rows`] over `original_shape`. Keeping it on the trait is what
+    /// stops the two conventions being re-derived per codec: the nine
+    /// production `truncate_plan` call sites — eight rotor / iso `truncate_to`
+    /// bodies plus [`truncate_block_store`], which the five turbo / planar
+    /// stores share — all ask for the row count through here.
+    fn rows(&self) -> usize;
+
     /// Keep the first `rows` rows, dropping the rest.
     ///
     /// Returns `false` and leaves the block untouched when the cut is not
@@ -311,4 +387,108 @@ pub(crate) fn retain_rows_in<T>(buf: &mut Vec<T>, total_rows: usize, keep_rows: 
     }
     let stride = buf.len() / total_rows;
     buf.truncate(keep_rows.saturating_mul(stride));
+}
+
+/// Truncate a block-accumulating store to `n` sequence positions.
+///
+/// The whole cut sequence for the turbo / planar stores, in one place: clamp the
+/// target, plan the block walk, apply it, then lower `shape[2]`. Five stores
+/// share it (`QuantV`, `QuantKTurbo3`, `QuantKTurbo4`, `QuantPlanarK`,
+/// `QuantPlanarV`) and the order is load-bearing — the clamp has to run before
+/// the plan, and `shape[2]` has to move after it. Independent copies of that
+/// sequence are the same drift surface that let twelve `KvStorage` arms keep a
+/// bare `shape[2] = n` while the rest of the layer learned to cut.
+///
+/// Not used by the rotor / iso stores: they do not clamp (see
+/// [`clamp_truncate_target`]) and carry extra ring bookkeeping around the same
+/// three steps.
+pub(crate) fn truncate_block_store<B: BlockRows>(blocks: &mut Vec<B>, shape: &mut [i32], n: i32) {
+    let n = clamp_truncate_target(shape, n);
+    let plan = truncate_plan(blocks.iter().map(BlockRows::rows), shape, n);
+    apply_truncate_plan(blocks, &plan);
+    // `get_mut` rather than `shape[2]`: the store shape is rank-4 by
+    // construction, and this is the bounds proof rather than a claim.
+    if let Some(seq) = shape.get_mut(2) {
+        *seq = n;
+    }
+}
+
+// The two impls below live here rather than beside their structs: `TurboBlocks`
+// and `PlanarBlocks` are codec-layer types shared by five different storage
+// structs, and how they are cut is a storage-layer contract that belongs with
+// `truncate_plan` / `rows_split_ok` / `retain_rows_in`. The rotor / iso blocks
+// are declared inside `storage/` and keep their impls beside the struct.
+
+impl BlockRows for crate::turboquant::TurboBlocks {
+    fn rows(&self) -> usize {
+        block_rows(&self.original_shape)
+    }
+
+    /// The exhaustive destructure is the drift guard: a new payload field
+    /// cannot be added without this failing to compile, which is what stops a
+    /// buffer from surviving a mid-block truncation at its full length.
+    fn retain_rows(&mut self, rows: usize) -> bool {
+        let Self {
+            codes,
+            scales,
+            original_shape,
+            bits: _,
+        } = self;
+        let total_rows = block_rows(original_shape);
+        let [_, _, _, width] = *original_shape;
+        // Everything fallible resolves before the first buffer is touched —
+        // half-cutting a block is the silent corruption this is here to avoid.
+        let Ok(rows_i32) = i32::try_from(rows) else {
+            return false;
+        };
+        if !rows_split_ok(&[codes.len(), scales.len()], total_rows, rows) {
+            return false;
+        }
+        retain_rows_in(codes, total_rows, rows);
+        retain_rows_in(scales, total_rows, rows);
+        // Record the geometry the cut actually produced — `rows` rows of
+        // `width` elements — instead of guessing which axis of the caller's
+        // convention held the sequence. Both consumers read this as an element
+        // count only (see `block_rows`).
+        *original_shape = [1, 1, rows_i32, width];
+        true
+    }
+}
+
+impl BlockRows for crate::planarquant::PlanarBlocks {
+    fn rows(&self) -> usize {
+        block_rows(&self.original_shape)
+    }
+
+    /// The exhaustive destructure is the drift guard: a new payload field
+    /// cannot be added without this failing to compile, which is what stops a
+    /// buffer from surviving a mid-block truncation at its full length.
+    fn retain_rows(&mut self, rows: usize) -> bool {
+        let Self {
+            codes,
+            scales,
+            rotations,
+            original_shape,
+            bits: _,
+        } = self;
+        let total_rows = block_rows(original_shape);
+        let [_, _, _, width] = *original_shape;
+        let Ok(rows_i32) = i32::try_from(rows) else {
+            return false;
+        };
+        if !rows_split_ok(
+            &[codes.len(), scales.len(), rotations.len()],
+            total_rows,
+            rows,
+        ) {
+            return false;
+        }
+        retain_rows_in(codes, total_rows, rows);
+        retain_rows_in(scales, total_rows, rows);
+        retain_rows_in(rotations, total_rows, rows);
+        // See the TurboBlocks impl: the recorded shape is the cut geometry, not
+        // a claim about which axis the caller's convention held the sequence on.
+        *original_shape = [1, 1, rows_i32, width];
+        true
+    }
 }

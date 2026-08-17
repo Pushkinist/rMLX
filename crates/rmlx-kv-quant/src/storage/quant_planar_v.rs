@@ -443,11 +443,33 @@ impl QuantPlanarV {
             let slice = planar_dequantize(block)?;
             out.extend_from_slice(&slice);
         }
+        // Blocks must cover `shape[2]` exactly — see
+        // `super::QuantPlanarK::dequantize_choice` for what the silent
+        // over-run / shortfall used to do.
+        if out.len() != total {
+            return Err(rmlx_core::error::Error::Quant(format!(
+                "QuantPlanarV::dequantize_choice: CPU blocks decode to {} elems but shape \
+                 {:?} implies {total} — refusing to zero-pad / truncate",
+                out.len(),
+                self.shape,
+            )));
+        }
         let b = self.shape[0] as usize;
         let kv_h = self.shape[1] as usize;
         let s = self.shape[2] as usize;
         let d = self.shape[3] as usize;
         Ok((transpose_seq_heads(&out, b, s, kv_h, d), None))
+    }
+
+    /// Truncate the store to `n` sequence positions.
+    ///
+    /// Drops trailing CPU blocks past `n` and **splits** the block the cut lands
+    /// inside (see [`super::truncate_plan`]), then lowers `shape[2]` to `n`. The
+    /// GPU buffers need no cut — see [`super::QuantV::truncate_to`]. The target
+    /// is clamped to the store's current `shape[2]`
+    /// ([`super::clamp_truncate_target`]).
+    pub fn truncate_to(&mut self, n: i32) {
+        super::truncate_block_store(&mut self.blocks, &mut self.shape, n);
     }
 
     /// Reconstruct a CPU-path `QuantPlanarV` from serialized PlanarQuant blocks.
