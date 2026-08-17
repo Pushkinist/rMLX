@@ -1,3 +1,10 @@
+// LOC-exempt: the selection layer is one contract, not several. Greedy
+// (host + masked), the penalty processors, the three mlx-lm filters, the
+// speculative acceptance path and the logprob ranks all have to resolve a tie
+// the same way the device `argmax` does, and they share the rank-key helpers
+// that encode that rule. Splitting on the obvious seam — filters here,
+// selection there — would put the rule and its enforcement in different files
+// and is exactly how the host and device drifted apart in the first place.
 // unsafe_code: mlx-rs Array zero-copy view — slice::from_raw_parts byte-reinterpret for Array::from_bytes (seed state)
 #![allow(unsafe_code)]
 
@@ -745,14 +752,9 @@ fn key_id(key: u64) -> usize {
 /// Survivors keep their prob; the rest go to `0.0`. No-op unless
 /// `0 < top_p < 1` (mlx-lm `make_sampler` gate).
 ///
-/// Equal probabilities are ranked by **descending** token id. The walk is
-/// ascending and drops from the front, so the ids walked first are the ones
-/// zeroed — ordering a tied group highest-id-first is what leaves the **lowest
-/// ids** in the nucleus, the same lowest-id-wins rule `filter_top_k` and the
-/// device reduction use. Without it the survivor set is whatever pdqsort's
-/// pivot choice produced: on a row of 64 with one 0.4 and 63 identical tail
-/// values at `top_p = 0.5`, the unordered version keeps `{0, 29, 54..63}` —
-/// id 29 survives while ids 30..53 are zeroed from a bit-identical value.
+/// Among equal probabilities the **lowest ids** survive — the same
+/// lowest-id-wins rule [`filter_top_k`] and the device reduction use. That is
+/// the contract; the mechanism is under "Why this is not one sort" below.
 ///
 /// This filter is the one that matters most: `top_p` ships set in several
 /// `generation_config.json` snapshots, so unlike `top_k` it is on by default on
@@ -783,6 +785,10 @@ fn key_id(key: u64) -> usize {
 /// 3. Of the group sitting exactly at the cut value, drop the `m` **highest**
 ///    ids, keeping the lowest ones — the same lowest-id-wins rule
 ///    [`filter_top_k`] and the device reduction use.
+///
+/// Exactly one group can straddle the cut, because the drop set is a prefix of
+/// a sorted order, so `m` is always in `1..=tied.len()`. The range check on it
+/// is defensive and never false.
 ///
 /// Without step 3 the survivor set is whatever pdqsort's pivot choice produced:
 /// on a row of 64 with one 0.4 and 63 identical tail values at `top_p = 0.5`,

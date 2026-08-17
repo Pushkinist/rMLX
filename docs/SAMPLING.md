@@ -201,9 +201,22 @@ the index sorts these replace:
 | `top_p` (0.95) | tie-dense | 2.02–2.06 ms | 1.31–1.34 ms |
 | `top_p` (0.95) | all-distinct | 3.73–4.32 ms | 2.17–2.68 ms |
 
-So pinning the tie order is a net speedup on every fixture measured, not a cost
-to be justified. Details on `rank_key_desc` and `total_order_bits` in
-`sampler.rs`.
+So pinning the tie order is a net speedup on every *served* distribution
+measured, not a cost to be justified. Details on `rank_key_desc` and
+`total_order_bits` in `sampler.rs`.
+
+**Two shapes are marginally slower**, and neither is a distribution a model
+produces:
+
+| Shape | before | after |
+|---|---:|---:|
+| Perfectly uniform row (every probability identical) | 0.27 ms | 0.40 ms |
+| Heavily constraint-masked row (nearly all mass at `0.0`) | 0.419 ms | 0.474 ms |
+
+Both are cases where the sort it replaces gets a near-free equal-element
+partition over one or two distinct values. The uniform row is also the only
+shape where `filter_top_p`'s `tied` vector grows to the full vocabulary — on a
+realistic tie-dense row it holds 808 entries (6 KiB), and on the masked row one.
 
 The keys use the IEEE total-order flip rather than the raw bit pattern, so they
 order every `f32` including negatives and `-0.0`. The raw pattern is monotone

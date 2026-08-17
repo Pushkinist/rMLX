@@ -1738,6 +1738,17 @@ fn compute_top_logprobs_skips_nan_like_the_device() {
 /// wrong token, with no panic to notice. `release-perf` disables debug
 /// assertions, so a `debug_assert` on the sign would not catch it either;
 /// the key is made correct instead.
+///
+/// **This guards the key encoding, not a defect that existed on `main`.** The
+/// comparator `main` used happens to order `-0.0` correctly, so this test is
+/// green there; it is red only against a packed key built from the raw
+/// `to_bits()` pattern. Do not count it as regression evidence.
+///
+/// Both halves assert on **bit patterns**, not values. `-0.0 == 0.0` is true in
+/// IEEE, so `assert_eq!(asc[0], 0.0)` passes whether `-0.0` was dropped or left
+/// in place — it cannot see the defect it names. Verified: under the raw-bits
+/// key this row comes back `[-0.0, 0.0, 0.0, 0.6]` and a value comparison is
+/// satisfied by it.
 #[test]
 #[allow(
     clippy::indexing_slicing,
@@ -1752,14 +1763,19 @@ fn rank_keys_order_negative_zero_correctly() {
         "top_k=1 must keep the real maximum, not -0.0"
     );
 
-    // The same through the ascending key, where -0.0 must sort below +0.0.
+    // The same through the ascending order, where -0.0 must sort below +0.0.
     let mut asc = vec![-0.0f32, 0.0, 0.4, 0.6];
     filter_top_p(&mut asc, 0.5);
     assert!(
         asc[3] > 0.0,
         "the dominant id must survive the nucleus, got {asc:?}"
     );
-    assert_eq!(asc[0], 0.0, "-0.0 carries no mass and is dropped");
+    assert_eq!(
+        asc[0].to_bits(),
+        0.0f32.to_bits(),
+        "-0.0 carries no mass and must be zeroed; got bits {:#010x}",
+        asc[0].to_bits()
+    );
 }
 
 // ── Near-zero temperature is sampling, not greedy ────────────────────────
