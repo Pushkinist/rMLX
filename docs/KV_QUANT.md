@@ -1871,13 +1871,14 @@ does not carry a written exemption. An exemption is itself checked: a family
 listed as exempt must actually measure above the floor, so a fixed codec turns
 its own exemption red instead of silently keeping it.
 
-Completeness is a three-link chain with no hand-kept count on either side of any
-comparison: an exhaustive `arm_index` match (a new `KvQuant` variant does not
-**compile** until it takes an index), a by-index lookup into a fixed-size
-`AXES_BY_ARM` array (an index past the end **panics**, forcing the author to
-declare where the new codec's bytes go), and a coverage assertion of the
-measured representatives against that array's length (which the previous link
-has already forced to grow). Table at `head_dim = 128`:
+Completeness is partial and stated as such. The `KvQuant` → family map is an
+exhaustive `match`, so a new variant does not **compile** until someone writes
+down where its bytes go — that much is mechanical. The list of measured
+representatives is hand-maintained and nothing forces it to grow, so a variant
+that declares its families and never gets a representative is unmeasured and the
+gate stays green; catching that is review's job. Closing it mechanically needs
+enum iteration (a `strum`-style derive), which is a dependency decision.
+Table at `head_dim = 128`:
 
 | Family | Stored bits / value | Provenance | Verdict |
 |---|---|---|---|
@@ -3069,10 +3070,12 @@ sideband — to the accepted row count.
 ends `dequant` with `seq_layout::transpose_seq_heads` over the *concatenation*
 of its blocks, reading it as one `[B, S_total, kv_h, D]` run — but each block is
 only `[B, S_block, kv_h, D]`, so at `b > 1` the concatenation interleaves batch
-elements and any store holding more than one block decodes scrambled. Measured:
-a two-block `b = 2` store disagrees with a one-block store over the same tokens
-on 480 of 960 elements — exactly the batch-1 half — while the `b = 1` control
-matches to the last bit. Splitting at `b > 1` would manufacture that two-block
+elements and any store holding more than one block decodes scrambled. Measured
+on the shipped fixture (`b = 2`, `kv_h = 2`, `head_dim = 96`, 5 positions): a
+two-block store disagrees with a one-block store over the same tokens on **960
+of 1920 elements**, spread across 10 of the 20 rows and straddling both reader
+batch halves — while the `b = 1` control matches to the last bit. Splitting at
+`b > 1` would manufacture that two-block
 state and convert a **loud** blocks-short-of-`shape[2]` error into silently
 scrambled K/V, so the planner drops the block there and lets the reconciliation
 guard report the gap. `sdpa::rotor_flash_shape_ok` refuses `b != 1` for the same

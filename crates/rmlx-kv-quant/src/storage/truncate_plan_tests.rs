@@ -389,6 +389,37 @@ fn apply_plan_drops_an_unsplittable_block_and_leaves_a_named_gap() {
     );
 }
 
+/// A plan built from a different (or already-mutated) block list must not cut
+/// the wrong block.
+///
+/// [`truncate_plan`] takes an iterator of row counts, not the `Vec`, so nothing
+/// in the types ties a plan to the list it is applied to. `apply_truncate_plan`
+/// therefore addresses block `plan.keep` **by index**; reaching for the last
+/// element instead would, against a shorter list, silently cut a block that
+/// should have been kept whole.
+///
+/// Mutation check: swap `blocks.get_mut(plan.keep)` back to `blocks.last_mut()`
+/// and the surviving 46-row block is cut to 4 rows — RED.
+#[test]
+fn apply_plan_against_a_shorter_list_drops_rather_than_cuts_the_wrong_block() {
+    let shape = [1_i32, 1, 0, 8];
+    // Plan says: keep block 0 whole, cut 4 rows out of block 1.
+    let plan = truncate_plan([46_usize, 5].into_iter(), &shape, 50);
+    assert_eq!((plan.keep, plan.partial_rows), (1, Some(4)));
+
+    // Apply it to a list that no longer has a block 1.
+    let mut blocks = vec![FakeBlock::new(0, 46, 3)];
+    let before = blocks[0].payload.clone();
+    apply_truncate_plan(&mut blocks, &plan);
+
+    assert_eq!(
+        keep_counts(&blocks),
+        vec![46],
+        "the block the plan meant to keep whole must survive intact"
+    );
+    assert_eq!(blocks[0].payload, before, "and must not have been cut");
+}
+
 /// [`retain_rows_in`] leaves an empty buffer empty — an inactive sideband (the
 /// rotor QJL residual) must not be resized into existence.
 #[test]

@@ -252,13 +252,22 @@ pub(crate) trait BlockRows {
 }
 
 /// Apply a [`truncate_plan`] to a store's block list.
+///
+/// The plan must have been built from `blocks`. Nothing in the types enforces
+/// that — [`truncate_plan`] takes an iterator of row counts, not the list — so
+/// the split addresses block `plan.keep` **by index**. Reaching for the last
+/// element instead would, against a shorter or already-mutated list, silently
+/// cut a block that should have been kept whole; a missing index degrades to the
+/// documented drop-and-warn instead.
 pub(crate) fn apply_truncate_plan<B: BlockRows>(blocks: &mut Vec<B>, plan: &TruncatePlan) {
     let Some(rows) = plan.partial_rows else {
         blocks.truncate(plan.keep);
         return;
     };
     blocks.truncate(plan.keep.saturating_add(1));
-    let split_ok = blocks.last_mut().is_some_and(|last| last.retain_rows(rows));
+    let split_ok = blocks
+        .get_mut(plan.keep)
+        .is_some_and(|target| target.retain_rows(rows));
     if !split_ok {
         // Loud for the same reason as the planner's refusals: the caller lowers
         // `shape[2]` regardless, so dropping the block leaves `rows` uncovered

@@ -18,6 +18,7 @@ use super::KvCache;
 use crate::clifford::make_rotor_table;
 use crate::quant::KvQuant;
 use crate::rotor_flash_decode_msl::rotor_flash_decode_dispatch_count;
+use crate::rotor_flash_decode_symv_msl::rotor_symv_flash_decode_dispatch_count;
 use crate::rotorquant::{make_qjl_projection, n_groups_for};
 use crate::storage::{KvStorage, QuantRotorK3, QuantRotorK4, QuantRotorV3, QuantRotorV4};
 use crate::test_utils::{lcg_data, skip_if_no_gpu_env};
@@ -808,9 +809,14 @@ fn rotor_k_only_4_multi_token_append_after_fused_decode_takes_the_block_path() {
 /// this the feed the truncation fix matters most for — and, before this test,
 /// the one with no behavioural coverage at all.
 ///
-/// The three feeds are mutually exclusive here: `Skip` drops the ring and pushes
-/// a block, `Maintain` keeps the ring and pushes a block, `MaintainRingOnly`
-/// pushes no block. Both assertions together admit only `Skip`.
+/// The three feeds are mutually exclusive **given the preconditions asserted
+/// below**: `Skip` drops the ring and pushes a block, `Maintain` keeps the ring
+/// and pushes a block (at `b == 1` `rotor3_sym_sync_ring` always ends with a
+/// live ring via `gpu_append`), `MaintainRingOnly` pushes no block. Without the
+/// preconditions the pair is vacuous — if the fused sym decode never dispatched,
+/// the legacy append ran on every step, so `blocks_len > 0` is satisfied by the
+/// prefill blocks alone and `!ring_live` by a ring that was never allocated, and
+/// neither half of the transition was observed.
 #[allow(clippy::expect_used, reason = "test: invariants documented")]
 fn sym_multi_token_append_after_fused_decode_drops_the_ring(quant: KvQuant) {
     let device = Device::Gpu;
@@ -831,6 +837,9 @@ fn sym_multi_token_append_after_fused_decode_drops_the_ring(quant: KvQuant) {
         .expect("prefill update_and_sdpa");
     cache.exit_prefill(device).expect("exit_prefill");
 
+    // Count the symv dispatches so a fused-arm fall-through is reported as such
+    // rather than silently satisfying both assertions below.
+    let before = rotor_symv_flash_decode_dispatch_count();
     for step in 0..steps as u64 {
         let one = (kv_h * head_dim) as usize;
         let k1 = f32_array(&lcg_data(one, 810 + step), &[1, kv_h, 1, head_dim]);
@@ -845,6 +854,27 @@ fn sym_multi_token_append_after_fused_decode_drops_the_ring(quant: KvQuant) {
             .eval()
             .expect("decode out eval");
     }
+
+    // Preconditions. Without these the assertions after the transition pass
+    // whether or not the fused path ever ran.
+    let delta = rotor_symv_flash_decode_dispatch_count() - before;
+    assert!(
+        delta >= steps as u64,
+        "precondition: the fused symv kernel must have run for every decode step \
+         ({delta} dispatches for {steps} steps). A shortfall is a dispatcher fault, not \
+         a feed one — read sdpa.rs before this file"
+    );
+    let (pre_blocks, pre_ring) = sym_k_store_state(&cache);
+    assert_eq!(
+        pre_blocks, 0,
+        "precondition: the fused decode path drops the K-side CPU blocks once the ring \
+         is live"
+    );
+    assert!(
+        pre_ring,
+        "precondition: the fused decode path leaves the K-side ring live — it is the \
+         sole copy of the prefix going into the transition"
+    );
 
     // The transition under test: q_seq > 1 on the same cache, b == 1.
     let sec_n = (second * kv_h * head_dim) as usize;
