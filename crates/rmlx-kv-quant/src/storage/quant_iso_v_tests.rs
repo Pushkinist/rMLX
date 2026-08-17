@@ -924,13 +924,20 @@ fn ring_inputs(blk: &IsoBlocks) -> (Array, Array, Array) {
 /// the shape-declared one, and `dequant` reads the missing tail out of a ring
 /// that was never told about the new chunk.
 ///
-/// Runs entirely on `Device::Cpu` — the ring is device-parameterised, so the
-/// state machine reproduces without Metal.
+/// Runs entirely on `Device::Cpu`: the ring is device-parameterised and the one
+/// reader involved is called as `dequant_on(Device::Cpu)`, so nothing here
+/// selects a Metal stream. (`dequant()` defaults to `Device::Gpu`, which is
+/// right for production — the ring lives there — and would have made this a
+/// Metal dispatch running unserialised inside `make test`.)
 ///
-/// Mutation check: drop the `reconcile_ring` call from
-/// `QuantIsoV3::append_gpu`. The `absorb = false` arm below models exactly that,
-/// and it is what asserts the unfixed store is unreadable; if the fix is
-/// reverted, the `absorb = true` arm goes red for the same reason.
+/// Mutation check: this test targets the reconcile and the ring fill watermark,
+/// not the call site. Disabling `QuantKGpuRing::packed_view`'s
+/// `kv_seq > self.filled` refusal reddens the `absorb = false` arm (it returns
+/// `Ok` with a zeroed tail again); breaking `reconcile_ring` itself reddens the
+/// `absorb = true` arm. Deleting the `reconcile_ring` call from
+/// `QuantIsoV3::append_gpu` reddens **neither** — this test drives the state
+/// machine by hand and never invokes `append_gpu`. That deletion is pinned
+/// separately by `append_gpu_reconciles_the_ring_before_it_pushes`.
 #[test]
 fn iso_v3_block_append_over_a_live_ring_takes_the_prefix_back() {
     let (b, kv_h, head_dim) = (1_usize, 2_usize, 8_usize);
@@ -1339,4 +1346,81 @@ fn iso_v3_single_kv_head_head_dim_512_decodes_the_same_either_chunking() {
     assert_eq!(a.codes, c.codes, "GPU-reader codes at head_dim 512");
     assert_eq!(a.scales, c.scales, "GPU-reader scales at head_dim 512");
     assert_eq!(a.norms, c.norms, "GPU-reader norms at head_dim 512");
+}
+
+/// `append_gpu` must reconcile the ring before it pushes — the call site, not
+/// just the helper.
+///
+/// The reconcile itself is proven above; this pins that `append_gpu` performs
+/// it, which nothing on-commit did before. It needs no Metal: the reconcile is
+/// step 0 and the MSL encode is step 1, so a well-formed call on the CPU device
+/// runs the reconcile and then fails at the encode with
+/// `"[metal_kernel] Only supports the GPU"`. That failure is the *expected*
+/// outcome — the assertions are on the state step 0 left behind on the way
+/// there.
+///
+/// (Forcing the early exit with a malformed `head_dim` instead would not work:
+/// that check precedes the reconcile, so the assertions would hold vacuously.)
+///
+/// Mutation check: delete `self.reconcile_ring(device, RingDisposition::Drop)?`
+/// from `QuantIsoV3::append_gpu` and both assertions below go red — the ring is
+/// still live and `blocks` still hold nothing.
+#[test]
+fn append_gpu_reconciles_the_ring_before_it_pushes() {
+    let (b, kv_h, head_dim) = (1_usize, 2_usize, 8_usize);
+    let prefill = 4_usize;
+    let max_seq = 64_i32;
+    let shape = |n: usize| [b as i32, kv_h as i32, n as i32, head_dim as i32];
+    let init = || vec![b as i32, kv_h as i32, 0, head_dim as i32];
+    let chunk = |s0: usize, n: usize| crate::test_utils::batch_head_chunk(b, kv_h, s0, n, head_dim);
+
+    let mut vs = QuantIsoV3::new(init());
+    vs.append(&chunk(0, prefill), &shape(prefill))
+        .expect("prefill append");
+
+    // Fused decode step: ring-only append, then the blocks are dropped — the
+    // state the fused path leaves and the legacy fallback then appends onto.
+    let mut scratch = QuantIsoV3::new(init());
+    scratch
+        .append(&chunk(prefill, 1), &shape(1))
+        .expect("scratch append");
+    let (codes, scales, norms) = ring_inputs(&scratch.blocks[0]);
+    vs.gpu_append(
+        &codes,
+        &scales,
+        &norms,
+        kv_h as i32,
+        head_dim as i32,
+        prefill as i32,
+        1,
+        max_seq,
+        Device::Cpu,
+    )
+    .expect("ring append");
+    vs.shape[2] = prefill as i32 + 1;
+    vs.blocks.clear();
+    assert!(vs.gpu.is_allocated(), "the ring is the sole copy here");
+
+    let tail = chunk(prefill + 1, 1);
+    let bytes: Vec<u8> = tail.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let arr = Array::from_bytes(&bytes, &shape(1), Dtype::F32).expect("tail array");
+    let err = vs
+        .append_gpu(&arr, &shape(1), max_seq, Device::Cpu)
+        .expect_err("the MSL encode cannot run on the CPU device");
+    assert!(
+        err.to_string().contains("Only supports the GPU"),
+        "the append must reach the encode and fail there, not earlier — otherwise the \
+         assertions below would hold vacuously. Got: {err}"
+    );
+
+    assert!(
+        !vs.gpu.is_allocated(),
+        "append_gpu must drop the ring it reconciled"
+    );
+    let rows: usize = vs.blocks.iter().map(crate::storage::BlockRows::rows).sum();
+    assert_eq!(
+        rows,
+        b * kv_h * (prefill + 1),
+        "append_gpu must take the ring's prefix back into blocks before it pushes"
+    );
 }
