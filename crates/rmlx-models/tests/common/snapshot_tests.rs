@@ -70,14 +70,13 @@ fn as_str(p: &Path) -> &str {
     p.to_str().expect("temp paths are utf-8")
 }
 
-/// Build a directory from the harness's own required-file constants and assert
-/// every name the harness opens is present in it.
+/// Build the minimum directory the harness's own constants describe and assert
+/// every name the harness opens is present in it — including a real shard.
 ///
-/// This is the falsifiable direction the previous membership assertion could
-/// not reach: it fails when the constants UNDER-specify a snapshot, which is
-/// how the list was actually wrong — it omitted the weight entrypoints, so a
-/// download interrupted before its multi-GB shards arrived resolved as runnable
-/// and panicked inside `load_shard_index`.
+/// This is the falsifiable direction a membership assertion cannot reach: it
+/// fails when the constants UNDER-specify a snapshot, which is how the list has
+/// twice been wrong (first omitting the weight entrypoints, then accepting an
+/// index that names shards which are not there).
 #[test]
 fn a_dir_built_from_the_constants_satisfies_every_harness_call_site() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -86,28 +85,58 @@ fn a_dir_built_from_the_constants_satisfies_every_harness_call_site() {
     for f in super::REQUIRED_FILES {
         std::fs::write(dir.join(f), b"{}").expect("write required file");
     }
-    // The weight side is a disjunction in the loader, so one entrypoint is what
-    // a real snapshot carries; take the first the constants name.
-    let first_weight = super::WEIGHT_ENTRYPOINTS
-        .first()
-        .expect("at least one weight entrypoint");
-    std::fs::write(dir.join(first_weight), b"").expect("write weight entrypoint");
+    // The sharded shape, because it is the one every large snapshot uses: the
+    // index entrypoint plus the shard it names.
+    std::fs::write(dir.join("model.safetensors.index.json"), b"{}").expect("write index");
+    std::fs::write(dir.join("model-00001-of-00001.safetensors"), b"").expect("write shard");
 
     for opened in HARNESS_OPENS_ALL {
         assert!(
             dir.join(opened).exists(),
-            "the harness opens {opened} by name, but a directory built from \
-             REQUIRED_FILES/WEIGHT_ENTRYPOINTS does not contain it"
+            "the harness opens {opened} by name, but the minimum directory the \
+             constants describe does not contain it"
         );
     }
     assert!(
         HARNESS_OPENS_ANY.iter().any(|f| dir.join(f).exists()),
-        "load_shard_index needs one of {HARNESS_OPENS_ANY:?}, but a directory \
-         built from the constants contains neither"
+        "load_shard_index needs one of {HARNESS_OPENS_ANY:?}, but the minimum \
+         directory contains neither"
+    );
+    assert!(
+        super::has_any_shard(&dir),
+        "an entrypoint names weights that must exist; the minimum directory has none"
     );
     assert!(
         super::is_snapshot_dir(&dir),
-        "a directory built from the constants must satisfy the check that reads them"
+        "the minimum directory the constants describe must satisfy the check that reads them"
+    );
+}
+
+/// The majority half-written shape: JSONs and the index all present, shards
+/// still in flight. `load_shard_index` parses that index happily and the
+/// failure surfaces later inside `ShardSet::open`, so accepting it here puts a
+/// panic several frames from its cause.
+#[test]
+fn an_index_naming_shards_that_are_absent_is_not_runnable() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path().join(SLUG);
+    std::fs::create_dir_all(&dir).expect("create dir");
+    std::fs::write(
+        dir.join("config.json"),
+        format!(r#"{{"architectures":["{ARCH}"]}}"#),
+    )
+    .expect("write config.json");
+    std::fs::write(dir.join("tokenizer.json"), b"{}").expect("write tokenizer.json");
+    std::fs::write(dir.join("model.safetensors.index.json"), b"{}").expect("write index");
+
+    assert!(
+        !super::is_snapshot_dir(&dir),
+        "an index with no shard behind it is a download in flight, not a snapshot"
+    );
+    let got = slug_snapshot(Some(as_str(root.path())), SLUG);
+    assert!(
+        matches!(got, Snapshot::Absent(_)),
+        "got {got:?} for a sharded snapshot whose shards have not arrived"
     );
 }
 
@@ -204,12 +233,24 @@ fn a_half_written_snapshot_under_the_root_is_absent() {
     }
 }
 
-/// Either weight entrypoint completes a snapshot — sharded checkpoints ship the
-/// index, single-file ones ship the bare `model.safetensors`. Requiring a
-/// specific one would reject half the real snapshots.
+/// Both real layouts resolve: a single-file checkpoint whose `model.safetensors`
+/// is both entrypoint and shard, and a sharded one whose index names shards that
+/// are present. Requiring one specific layout would reject half the snapshots.
 #[test]
-fn either_weight_entrypoint_completes_a_snapshot() {
-    for weight in super::WEIGHT_ENTRYPOINTS {
+fn both_real_weight_layouts_complete_a_snapshot() {
+    // (extra files beyond the two JSONs, description)
+    let layouts: [(&[&str], &str); 2] = [
+        (&["model.safetensors"], "single-file"),
+        (
+            &[
+                "model.safetensors.index.json",
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors",
+            ],
+            "sharded",
+        ),
+    ];
+    for (files, what) in layouts {
         let root = tempfile::tempdir().expect("tempdir");
         let dir = root.path().join(SLUG);
         std::fs::create_dir_all(&dir).expect("create dir");
@@ -219,14 +260,16 @@ fn either_weight_entrypoint_completes_a_snapshot() {
         )
         .expect("write config.json");
         std::fs::write(dir.join("tokenizer.json"), b"{}").expect("write tokenizer.json");
-        std::fs::write(dir.join(weight), b"").expect("write weight entrypoint");
+        for f in files {
+            std::fs::write(dir.join(f), b"").expect("write weight file");
+        }
 
         assert!(
             matches!(
                 slug_snapshot(Some(as_str(root.path())), SLUG),
                 Snapshot::Found { .. }
             ),
-            "{weight} alone must complete a snapshot"
+            "the {what} layout must resolve"
         );
     }
 }
@@ -287,7 +330,15 @@ fn an_override_naming_anything_unrunnable_is_misconfigured() {
     std::fs::write(no_shards.join("config.json"), b"{}").expect("write config.json");
     std::fs::write(no_shards.join("tokenizer.json"), b"{}").expect("write tokenizer.json");
 
-    for dir in [&absent, &empty, &config_only, &no_shards] {
+    // The sharded variant of the same thing: index present, shards not yet.
+    let index_no_shards = tmp.path().join("index-but-no-shards");
+    std::fs::create_dir_all(&index_no_shards).expect("create dir");
+    std::fs::write(index_no_shards.join("config.json"), b"{}").expect("write config.json");
+    std::fs::write(index_no_shards.join("tokenizer.json"), b"{}").expect("write tokenizer.json");
+    std::fs::write(index_no_shards.join("model.safetensors.index.json"), b"{}")
+        .expect("write index");
+
+    for dir in [&absent, &empty, &config_only, &no_shards, &index_no_shards] {
         let got = override_snapshot(Some(as_str(dir)));
         assert!(
             matches!(got, Some(Snapshot::Misconfigured(_))),

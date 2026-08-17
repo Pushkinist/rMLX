@@ -238,9 +238,13 @@ float16. bf16 has 3 fewer mantissa bits than fp16, so rMLX decodes this
 checkpoint coarser than both the weights on disk and the reference. It is a
 deliberate trade for the numbers above — bf16 is what this engine's kernels and
 KV codecs are built around — and it has a measurable price: it flips tokens at
-near-tie logits. `bonsai_8b_mixed_k8g64_v4g64.golden.txt` was regenerated for
-exactly one such flip (an exact tie in rMLX where the reference sees a 0.0859
-margin). Do not restate this cast as matching mlx-lm.
+near-tie logits. `bonsai_8b_mixed_k8g64_v4g64.golden.txt` predates this cast and
+is **stale at index 18** because of exactly one such flip: the two candidates
+tie exactly in rMLX (both `-0.74530375`) where the reference sees a 0.0859
+margin. That fixture has **not** been regenerated — a mismatch at index 18 is
+the expected consequence of this cast, not a new regression, and the bisect that
+identified it is recorded in the issue history. Do not restate this cast as
+matching mlx-lm.
 
 ### Qwen3.6 MoE `--kv-quant none` KV is bf16 — audited clean AND hardened
 

@@ -145,6 +145,19 @@ pub fn regen_requested() -> bool {
 /// defensible when the model had no real preference at the step that moved.
 /// Above this the divergence is a decision the model made confidently, which is
 /// a behaviour change to explain, not a fixture to refresh.
+///
+/// **Where 0.10 comes from.** The top-2 *logprob* gap equals the top-2 *logit*
+/// gap — the log-sum-exp normaliser is common to both terms and cancels — and
+/// after the load-time bf16 cast those logits are bf16. bf16 carries 7 explicit
+/// mantissa bits, so the smallest representable gap is one ULP at the top
+/// logit's magnitude: ~0.0625 for |logit| in [8, 16), ~0.125 in [16, 32). 0.10
+/// therefore admits an exact tie at every magnitude and a one-ULP gap only in
+/// the lower octave.
+///
+/// Both real cases so far are exact ties, so nothing in the tree distinguishes
+/// 0.10 from 0.01. If a case ever lands between, **tighten rather than widen**:
+/// a genuine tie stays a tie under any smaller bound, while raising the bound
+/// buys nothing except the ability to absorb a real preference.
 pub const REGEN_MAX_TIE_MARGIN: f32 = 0.10;
 
 /// Index of the first differing token id. `None` when the sequences match.
@@ -219,22 +232,44 @@ pub fn regen_verdict(
 const REQUIRED_FILES: [&str; 2] = ["config.json", "tokenizer.json"];
 
 /// Weight entrypoints. `rmlx_loader::load_shard_index` tries these two in this
-/// order and errors if neither exists, so exactly one has to be present.
+/// order and errors if neither exists.
 ///
-/// Omitting them is not a theoretical gap: a download writes the small JSON
-/// files first and the multi-GB shards last, so config + tokenizer + no shards
-/// is the *modal* half-written snapshot. Accepting it turned the intended
-/// verdict for a partial download — skip, so a developer without the weights is
-/// not blocked — into a panic several frames later.
+/// The entrypoint alone is NOT enough to call a snapshot runnable. A download
+/// writes the small JSON files first and the multi-GB shards last, and
+/// `model.safetensors.index.json` is itself one of those small JSON files — so
+/// an interrupted **sharded** transfer leaves config + tokenizer + index and
+/// zero `model-0000N-of-*.safetensors`. `load_shard_index` parses that index
+/// happily and the failure surfaces later, when `ShardSet::open` cannot find
+/// the files it names. Every test-target snapshot above a few GB is sharded, so
+/// that is the majority shape, not an edge.
 const WEIGHT_ENTRYPOINTS: [&str; 2] = ["model.safetensors.index.json", "model.safetensors"];
 
+/// True when at least one `*.safetensors` file exists in `dir`.
+///
+/// `model.safetensors` satisfies this as itself; behind an index it is the
+/// shards. Deliberately *presence of any*, not *all the index names*: checking
+/// every entry means parsing the index and reimplementing the loader's own
+/// `weight_map` walk here, which would drift. This closes the zero-shard case —
+/// the one a download actually produces — and a partially-transferred shard set
+/// still reaches the loader, which reports the missing file by name.
+fn has_any_shard(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|e| {
+        e.path()
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("safetensors"))
+    })
+}
+
 /// A directory is a snapshot when every file the harness opens by name is
-/// there. The weight side mirrors `load_shard_index`'s own disjunction, and
-/// uses `exists()` for the same reason it does — this check must never be
-/// stricter than the loader it stands in front of.
+/// there: both JSONs, an entrypoint `load_shard_index` accepts, and at least
+/// one actual shard behind it.
 fn is_snapshot_dir(dir: &Path) -> bool {
     REQUIRED_FILES.iter().all(|f| dir.join(f).is_file())
         && WEIGHT_ENTRYPOINTS.iter().any(|f| dir.join(f).exists())
+        && has_any_shard(dir)
 }
 
 /// Name what is missing, so a diagnosis says what to look at rather than just
@@ -245,6 +280,10 @@ fn missing_file(dir: &Path) -> String {
     }
     if !WEIGHT_ENTRYPOINTS.iter().any(|f| dir.join(f).exists()) {
         return "model.safetensors[.index.json]".to_owned();
+    }
+    if !has_any_shard(dir) {
+        return "any *.safetensors shard (the index is present but names no file that exists)"
+            .to_owned();
     }
     "(nothing)".to_owned()
 }
@@ -585,8 +624,14 @@ pub fn run_golden_test(fixture_tag: &str, kv_quant: KvQuant, model_path: &Path) 
     if regen_requested() {
         let committed = read_golden(&fixture_path);
         // Only pay for the margin measurement when the ids actually moved.
+        // Decide the length case BEFORE measuring. `first_divergence` reports a
+        // pure length change at the shorter sequence's end, which is out of
+        // bounds for the shorter of the two — a raw index panic instead of the
+        // designed refusal. `regen_verdict` refuses a length change at any
+        // margin anyway, so measuring one is also a wasted GPU decode.
         let margin = committed
             .as_deref()
+            .filter(|c| c.len() == token_ids.len())
             .and_then(|c| first_divergence(&token_ids, c))
             .and_then(|i| {
                 measure_top2_margin(
@@ -597,7 +642,7 @@ pub fn run_golden_test(fixture_tag: &str, kv_quant: KvQuant, model_path: &Path) 
                     kv_quant,
                     &penalty_cfg,
                     i,
-                    token_ids[i],
+                    &token_ids,
                 )
             });
         match regen_verdict(
@@ -645,10 +690,15 @@ pub fn run_golden_test(fixture_tag: &str, kv_quant: KvQuant, model_path: &Path) 
 /// already moved.
 ///
 /// Returns `None` — which [`regen_verdict`] treats as a refusal — when the step
-/// is missing, carries no logprobs, has fewer than two candidates, or decodes a
-/// different id than the first run did. That last case is non-determinism, and
-/// adjudicating a tie across two disagreeing runs would be meaningless.
-#[allow(clippy::too_many_arguments)]
+/// is missing, carries no logprobs, has fewer than two candidates, or the probe
+/// run's ids differ from `first_run_ids` anywhere in `[..=index]`.
+///
+/// The prefix, not just `index`: a margin describes the distribution at a step
+/// **given everything decoded before it**, so a probe that diverged at step 5
+/// and happened to re-converge at step 18 measured a different continuation
+/// than the one being written. Comparing one index would accept exactly that.
+/// The prompt-cache exact hit makes the two runs agree in practice, which is
+/// what would make the flaw silent rather than visible.
 fn measure_top2_margin(
     model: &arch::Architecture,
     tokenizer: &tokenizers::Tokenizer,
@@ -657,7 +707,7 @@ fn measure_top2_margin(
     kv_quant: KvQuant,
     penalty_cfg: &PenaltyConfig,
     index: usize,
-    expected_id: u32,
+    first_run_ids: &[u32],
 ) -> Option<f32> {
     let sampler_cfg = SamplerConfig {
         temperature: 0.0,
@@ -688,15 +738,18 @@ fn measure_top2_margin(
         )
         .ok()?;
 
-    let step = steps.get(index)?;
-    if step.token_id != expected_id {
+    let probe_ids: Vec<u32> = steps.iter().map(|s| s.token_id).collect();
+    let prefix = first_run_ids.get(..=index)?;
+    if probe_ids.get(..=index) != Some(prefix) {
         eprintln!(
-            "  margin probe decoded {} at index {index}, first run decoded {expected_id} — \
-             non-deterministic, refusing to adjudicate",
-            step.token_id
+            "  margin probe diverged from the first run within [0..={index}] — \
+             non-deterministic, refusing to adjudicate\n    first = {prefix:?}\n    probe = {:?}",
+            probe_ids.get(..=index)
         );
         return None;
     }
+
+    let step = steps.get(index)?;
     let top = &step.logprobs.as_ref()?.top;
     let (_, best) = *top.first()?;
     let (_, second) = *top.get(1)?;

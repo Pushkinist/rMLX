@@ -116,9 +116,12 @@ fn classify_load_oom(e: Error) -> Error {
 /// That is a deliberate trade, not an oversight: bf16 is the dtype the rest of
 /// this engine's kernels and KV codecs are built around, and unifying on it
 /// measured decode +34 % / +73 % / +100 % at 4 k / 16 k / 64 k on that snapshot
-/// and halved KV residency. The cost is real too — it moves near-tie logits.
-/// `bonsai_8b_mixed_k8g64_v4g64.golden.txt` was regenerated because of it. Do
-/// not describe this cast as matching the reference.
+/// and halved KV residency. The cost is real too — it moves tokens at near-tie
+/// logits: `bonsai_8b_mixed_k8g64_v4g64.golden.txt` predates this cast and is
+/// **stale at index 18**, where the two candidates tie exactly in rMLX and the
+/// reference sees a 0.0859 margin. That fixture has NOT been regenerated, so a
+/// mismatch there is expected and is not a new regression. Do not describe this
+/// cast as matching the reference.
 pub(crate) fn bf16_param(a: Array) -> Result<Array> {
     if a.dtype() == Dtype::Bf16 {
         Ok(a)

@@ -46,10 +46,17 @@ endif
 # The fallback is the opposite case: nobody named it, so handing children a
 # repo-local `models/` that need not exist manufactures a configuration no one
 # chose, and readers cannot tell it from a deliberate one.
+#
+# Export the STRIPPED value. Make preserves trailing whitespace in a `.env`
+# assignment, so `RMLX_O_MODELS_ROOT=/path ` forwards a path with an invisible
+# trailing space: the child fails as Misconfigured with a message whose cause
+# cannot be seen. ($(strip) also collapses runs of internal whitespace, so a
+# root whose name contains two consecutive spaces is unsupported — a single
+# internal space is untouched.)
 ifneq ($(O_MODELS_ROOT_NAMED),)
-export RMLX_O_MODELS_ROOT := $(O_MODELS_ROOT)
+export RMLX_O_MODELS_ROOT := $(O_MODELS_ROOT_NAMED)
 else ifneq ($(wildcard $(O_MODELS_ROOT)/.),)
-export RMLX_O_MODELS_ROOT := $(O_MODELS_ROOT)
+export RMLX_O_MODELS_ROOT := $(strip $(O_MODELS_ROOT))
 endif
 
 # Primary test model. Override at the CLI: make info MODEL=/path/to/other-snapshot

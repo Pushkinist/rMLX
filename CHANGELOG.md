@@ -353,13 +353,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   override config fall through, and making the return mapping swallow `Fail`
   each turn only the cases that claim them red.
 
-  Three Makefile defects fed this and are fixed with it. `model-check-full`
+  Four Makefile defects fed this and are fixed with it. `model-check-full`
   guarded `MODEL` with `test -n`, which could never fire because `MODEL` has an
   unconditional default; on a machine lacking that snapshot the target
   fabricated a path and forwarded it as `RMLX_KV_TEST_MODEL`, which the harness
   correctly reads as an operator naming a snapshot. It now guards the path. It
   also ran four of the five goldens — `medgemma_golden_tokens` was missing from
-  the list.
+  the list — and passed `--ignored` without `--test-threads=1`, so with a Bonsai
+  `MODEL` it drove four `#[ignore]` GPU tests across one Metal context from
+  parallel libtest threads: the abort the `#[ignore]` rule exists to prevent, in
+  the target most likely to be pointed at Bonsai.
 
   And `RMLX_O_MODELS_ROOT` was exported unconditionally, including a repo-local
   `models/` fallback that need not exist, handing every child a root that was
@@ -372,10 +375,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   child would have reported "no snapshot configured" and skipped green at the
   one operator who did configure something.
 
+  **Overwriting a fixture is itself gated.** A regenerated golden with no
+  recorded reason is indistinguishable from a hidden regression, so
+  `RMLX_REGEN_GOLDENS=1` no longer writes unconditionally. When the ids differ
+  from the committed fixture the harness re-decodes once at `top_logprobs_k = 2`
+  and measures the top-2 gap at the first differing index
+  (`first_divergence`), writing only when that gap is at or below
+  `REGEN_MAX_TIE_MARGIN` (0.10) — otherwise it panics `REFUSED`, naming the
+  index, both ids and the margin. The written file's reason line carries the
+  margin, so the fixture records why it moved. A token-count change is refused
+  at any margin, and an unmeasurable margin — missing step, absent logprobs, or
+  a probe run whose ids differ from the first run anywhere in the prefix up to
+  that index — is refused too.
+
+  The 0.10 floor is derived, not chosen: the top-2 logprob gap equals the top-2
+  logit gap (the log-sum-exp normaliser cancels), those logits are bf16 after
+  the load-time cast, and one bf16 ULP is ~0.0625 for |logit| in [8, 16) and
+  ~0.125 in [16, 32). So it admits an exact tie at every magnitude and a
+  one-ULP gap only in the lower octave. Tighten rather than widen if a case ever
+  lands between.
+
   `bonsai_8b_mixed_k8g64_v4g64.golden.txt` is **not** regenerated here. It has
-  not been touched since the 0.1.0 squash and is under suspicion of being stale;
-  updating a golden to match whatever the tree produces today would gate nothing
-  and would fold an unexplained numerics change into an unrelated commit.
+  not been touched since the 0.1.0 squash and is stale at index 18 as a
+  consequence of the bf16 uniformity cast; regenerating it is a separate change
+  so the arming and the fixture stay independently revertable.
 
 ### Added
 
