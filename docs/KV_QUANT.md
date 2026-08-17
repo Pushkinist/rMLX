@@ -3075,12 +3075,11 @@ on the shipped fixture (`b = 2`, `kv_h = 2`, `head_dim = 96`, 5 positions): a
 two-block store disagrees with a one-block store over the same tokens on **960
 of 1920 elements**, spread across 10 of the 20 rows and straddling both reader
 batch halves — while the `b = 1` control matches to the last bit. Splitting at
-`b > 1` would manufacture that two-block
-state and convert a **loud** blocks-short-of-`shape[2]` error into silently
-scrambled K/V, so the planner drops the block there and lets the reconciliation
-guard report the gap. `sdpa::rotor_flash_shape_ok` refuses `b != 1` for the same
-underlying reason, which is also why a `b > 1` store never has a ring to rebuild
-from. Pinned by
+`b > 1` would manufacture that two-block state and convert a **loud**
+blocks-short-of-`shape[2]` error into silently scrambled K/V, so the planner
+drops the block there and lets the reconciliation guard report the gap.
+`sdpa::rotor_flash_shape_ok` refuses `b != 1` for the same underlying reason,
+which is also why a `b > 1` store never has a ring to rebuild from. Pinned by
 `quant_rotor_v3_tests::quant_rotor_v3_truncate_at_b_gt_1_stays_loud`, which
 asserts both halves: that the two-block store really is unreadable, and that a
 `b > 1` mid-block cut therefore returns `Err`.

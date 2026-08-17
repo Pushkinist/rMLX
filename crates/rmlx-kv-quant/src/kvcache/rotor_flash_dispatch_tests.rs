@@ -811,7 +811,8 @@ fn rotor_k_only_4_multi_token_append_after_fused_decode_takes_the_block_path() {
 ///
 /// The three feeds are mutually exclusive **given the preconditions asserted
 /// below**: `Skip` drops the ring and pushes a block, `Maintain` keeps the ring
-/// and pushes a block (at `b == 1` `rotor3_sym_sync_ring` always ends with a
+/// and pushes a block (at `b == 1` the K-side ring feeder — `rotor3_sync_ring`
+/// for `Rotor3Sym`, `rotor4_sync_ring` for `Rotor4Sym` — always ends with a
 /// live ring via `gpu_append`), `MaintainRingOnly` pushes no block. Without the
 /// preconditions the pair is vacuous — if the fused sym decode never dispatched,
 /// the legacy append ran on every step, so `blocks_len > 0` is satisfied by the

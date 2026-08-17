@@ -25,8 +25,12 @@
 //!
 //! [`every_kv_quant_variant_names_its_store_families`] matches exhaustively on
 //! [`KvQuant`], so a new variant does not compile until someone states which
-//! families its K and V axes store in. That is what makes "every KV codec" true
-//! rather than "every codec somebody remembered".
+//! families its K and V axes store in. That forces the **declaration** only.
+//! Measurement runs over a hand-maintained representative list, and nothing
+//! makes that list grow: a variant that declares a family and never gets a
+//! representative is unmeasured and this gate stays green. See that test's own
+//! doc — closing it mechanically needs enum iteration, which is a dependency
+//! decision, so until then it is review's job.
 
 use crate::isoquant::iso_encode_fast;
 use crate::planarquant::planar_quantize;
@@ -377,6 +381,8 @@ fn rotor_rate_splits_into_documented_code_scale_and_norm_bits() {
 /// **What is not guaranteed.** The `variants` list below is hand-maintained and
 /// nothing forces it to grow: a new variant that gets its `axes` arm but no
 /// representative is declared and never measured, and this test still passes.
+/// The same hole runs the other way — **deleting** a representative while its
+/// `axes` arm stays leaves that variant unmeasured just as quietly.
 /// Two earlier shapes here claimed otherwise and neither held — a
 /// `KV_QUANT_VARIANT_COUNT` compared against `variants.len()` (both sides
 /// hand-kept), then an arm-index lookup whose out-of-bounds panic was supposed
