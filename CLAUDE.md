@@ -214,7 +214,8 @@ Hard rules:
   `make check-gpu-tests-ignored` enforces this across **every workspace member
   crate** (from `Cargo.toml`), scanning `src/**/{*_tests.rs,tests.rs}` and
   `tests/*.rs`; it keys on shape (does the test reach `Device::Gpu`?), never on
-  the ignore reason's text. A pure device-*policy* test (passes `Device::Gpu`
+  the ignore reason's text. "Test" covers `#[test]` and `#[tokio::test]` (with
+  or without arguments). A pure device-*policy* test (passes `Device::Gpu`
   as a plain value, never dispatches Metal) opts out **per fn** with a
   line-leading `// gpu-test-gate: exempt` marker in its own attribute block —
   scoped to that one `#[test]`, not the whole file; **inside a `macro_rules!`

@@ -23,8 +23,14 @@
 #   scoped to `src/` alone would mirror exactly the blind spot it exists to
 #   catch.
 #
+# WHAT COUNTS AS A TEST
+#   `#[test]`, `#[tokio::test]`, and `#[tokio::test(flavor = ..)]`. An async
+#   test attribute is a test attribute; matching only the bare spelling left
+#   ~107 of them in this tree unclassified in BOTH directions — never flagged,
+#   never listed — which is the same hole macro-generated tests were in.
+#
 # WHAT COUNTS AS GPU-TOUCHING (shape, not message)
-#   A `#[test]` fn that reaches `Device::Gpu`, directly in its own body or
+#   A test fn that reaches `Device::Gpu`, directly in its own body or
 #   transitively through a helper it calls (including generic helpers called
 #   with a turbofish, and methods on an inherent impl). `Device::Gpu` bound to
 #   a module-scope `const NAME: Device = Device::Gpu;` counts too — a body that
@@ -175,14 +181,25 @@
 #   an unreadable body fails closed (`U`) instead of being skipped.
 #
 #   Two consequences are handled explicitly rather than assumed away:
-#     * An item whose braces BALANCE on its own line is self-contained, and
-#       latching the multi-line capture on it would wait for a close that never
-#       comes — swallowing every later item in the file into its body and
-#       silently ending classification. Such a line is captured whole and never
-#       latches.
+#     * An item that CLOSES on its own line is self-contained, and latching the
+#       multi-line capture on it would wait for a close that never comes —
+#       swallowing every later item in the file into its body and silently
+#       ending classification. Such a line is captured whole and never latches.
+#       "Closes on its own line" is decided from the line's LAST significant
+#       character (`}` ends an inline body, `;` ends a signature-only
+#       declaration), never from a brace COUNT: `{` / `}` inside a string, a
+#       char literal or a comment are not block delimiters, and counting them
+#       breaks the decision in both directions — a false "balanced" drops the
+#       item's body so a `Device::Gpu` in it is never seen, a false "open"
+#       swallows the rest of the file.
 #     * A capture that is still open at a file boundary means the parser lost
 #       the file, so it reports `U` rather than letting the remainder go
 #       unclassified.
+#
+#   The remaining known parse hazard: `bare()` finds the trailing comment with
+#   a quote-aware scan, so a `//` inside a string literal is not mistaken for
+#   one. It does not track raw-string hashes or block comments, so a `/*` … */`
+#   spanning an item's opening line is still read literally.
 #
 # Exit 0 = clean. Exit 1 = violation (or a scan that found nothing to check).
 
@@ -294,30 +311,31 @@ fi
 # warning. Kept in a variable so the per-crate loop invokes one identical
 # program over each crate's file list.
 read -r -d '' AWK_DETECT <<'AWK' || true
-    # Strip a trailing line comment and trailing blanks, so a closing brace
-    # carrying a comment (`} // end of macro`) still equals its marker. An
-    # exact compare would leave the item open and mis-attribute everything
-    # after it to the item that never closed.
-    function bare(s) {
-        sub(/[[:space:]]*\/\/.*$/, "", s)
+    # The line's significant text: trailing line comment and trailing blanks
+    # removed. Used both to compare a closing brace against its marker (`}
+    # // end of macro` must still close) and to read the line's LAST
+    # significant character, which is what decides whether an item is
+    # self-contained.
+    #
+    # The `//` scan is quote-aware. A `//` inside a string literal — a URL is
+    # the everyday case — is not a comment, and cutting there would end the
+    # line in mid-string and flip every decision that reads its last
+    # character. Only double quotes are tracked: `//` cannot occur inside a
+    # char literal, while `'` is ambiguous in Rust (lifetimes).
+    function bare(s,   i, n, q, c) {
+        n = length(s)
+        q = 0
+        for (i = 1; i <= n; i++) {
+            c = substr(s, i, 1)
+            if (c == "\\" && q) { i++; continue }
+            if (c == "\"") { q = !q; continue }
+            if (!q && c == "/" && substr(s, i + 1, 1) == "/") {
+                s = substr(s, 1, i - 1)
+                break
+            }
+        }
         sub(/[[:space:]]+$/, "", s)
         return s
-    }
-
-    # Braces opened minus braces closed on one line. Used to tell a fn (or a
-    # macro body) whose braces BALANCE on its own line — a self-contained
-    # one-liner, which must not latch the multi-line capture state — from one
-    # that genuinely continues onto later lines.
-    function brace_delta(s,   i, c, o, k) {
-        o = 0; k = 0
-        for (i = 1; i <= length(s); i++) {
-            c = substr(s, i, 1)
-            if (c == "{") { o++ }
-            else if (c == "}") { k++ }
-        }
-        opened = o
-        closed = k
-        return o - k
     }
 
     # Tear down a fn item whose closing brace was never found. The capture is
@@ -379,7 +397,7 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         attrs = attrs " " $0
         # Count `#[test]`s declared inside a macro body, so the END check can
         # compare them against the test items actually extracted from it.
-        if (in_macro && !in_fn && $0 ~ /#\[test\]/) { macro_test_n++ }
+        if (in_macro && !in_fn && $0 ~ /#\[(tokio::)?test[](]/) { macro_test_n++ }
         if ($0 !~ /\][[:space:]]*$/) { in_attr = 1 }
         next
     }
@@ -425,12 +443,11 @@ read -r -d '' AWK_DETECT <<'AWK' || true
             attrs = ""
             next
         }
-        brace_delta($0)
-        if (opened > 0 && opened == closed) {
+        if (bare($0) ~ /\}$/) {
             # The whole body is on this one line, so no `fn` line will ever
             # follow. If it declares a test, that test is unreadable — fail
             # closed. If it declares none, the line is simply not interesting.
-            if ($0 ~ /#\[test\]/) {
+            if ($0 ~ /#\[(tokio::)?test[](]/) {
                 printf "U  %s: %s! (one-line body declaring #[test])\n",
                     FILENAME, macro_name
             }
@@ -446,7 +463,7 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         macro_fn_n = 0
         # A `#[test]` sharing the opener line is never seen by the attribute
         # rule below (this rule consumes the line), so count it here.
-        macro_test_n = ($0 ~ /#\[test\]/) ? 1 : 0
+        macro_test_n = ($0 ~ /#\[(tokio::)?test[](]/) ? 1 : 0
         attrs = ""
         next
     }
@@ -490,17 +507,20 @@ read -r -d '' AWK_DETECT <<'AWK' || true
             gen_of[G] = ""
             label_of[G] = name
         }
-        if (in_macro && attrs ~ /#\[test\]/) { macro_fn_n++ }
+        if (in_macro && attrs ~ /#\[(tokio::)?test[](]/) { macro_fn_n++ }
         curid = G
-        # Latch the multi-line capture ONLY when this line leaves a brace
-        # open. A self-contained `fn f() { .. }` is already fully in body_of,
-        # and latching on it would mean waiting for a closing brace that never
-        # comes — every later item in the file would be swallowed into this
-        # fn's body and go unclassified. `opened > 0` is required: a fn with a
-        # multi-line signature has no brace at all on its `fn` line and must
-        # still latch.
-        brace_delta(line)
-        if (opened > 0 && opened == closed) {
+        # Self-contained iff the line's last significant character closes it:
+        # `}` ends an inline body, `;` ends a signature-only declaration (a
+        # trait method, an extern block). Anything else — `{`, or a `(` from a
+        # multi-line signature — continues onto later lines and must latch.
+        #
+        # A brace COUNT cannot make this call: `{` / `}` inside a string, a
+        # char literal or a trailing comment are not block delimiters, and
+        # counting them breaks the decision in BOTH directions. A false
+        # "balanced" drops the fn's body, so a `Device::Gpu` inside it never
+        # reaches body_of and the test is silently unclassified; a false "open"
+        # latches and swallows every later item in the file.
+        if (bare(line) ~ /(\}|;)$/) {
             in_fn = 0
             curid = 0
             close_marker = ""
@@ -592,9 +612,14 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         }
 
         # ── Report, in source order across the crate's files ────────────
+        # `#[tokio::test]` (with or without arguments) is a test attribute
+        # exactly as much as `#[test]` is, and this crate tree has ~107 of
+        # them. Matching only the bare spelling left every one of them
+        # unclassified in BOTH directions — never flagged, never listed — which
+        # is the same hole macro-generated tests were in.
         for (i = 1; i <= ord_n; i++) {
             g = order[i]
-            if (attrs_of[g] !~ /#\[test\]/) { continue }
+            if (attrs_of[g] !~ /#\[(tokio::)?test[](]/) { continue }
             has_ignore = (attrs_of[g] ~ /#\[ignore/)
             exempt = (attrs_of[g] ~ /GATE_EXEMPT/)
             if (gpu[g] && !has_ignore && !exempt) {

@@ -166,6 +166,35 @@ gates` job. It keys on the shape (does the test reach `Device::Gpu`, directly,
 through a same-file helper, or via a module-scope `const … = Device::Gpu`?),
 never on the ignore reason's wording, which varies across the tree.
 
+"Test" means `#[test]`, `#[tokio::test]`, and `#[tokio::test(flavor = …)]`. An
+async test attribute is a test attribute; matching only the bare spelling left
+~107 of them in `rmlx-server` unclassified in both directions.
+
+**Six ignored async tests surface as warnings, and are still run by nothing.**
+Classifying `#[tokio::test]` did not add anything to `--list`, because no
+`rmlx-server` test file names `Device::Gpu` at all — those tests boot a real
+server over HTTP and the device is chosen inside production code the gate does
+not scan. So they land in the non-fatal "claims a Metal context but no
+`Device::Gpu` is reachable" warning instead:
+
+| test | file |
+|---|---|
+| `valid_single_vector_200_shape` | `crates/rmlx-server/tests/embeddings_smoke.rs` |
+| `return_multivector_toggles_shape` | `crates/rmlx-server/tests/embeddings_smoke.rs` |
+| `invalid_dimensions_is_400` | `crates/rmlx-server/tests/embeddings_smoke.rs` |
+| `image_single_vector_200_shape` | `crates/rmlx-server/tests/embeddings_smoke.rs` |
+| `image_multivector_toggles_shape` | `crates/rmlx-server/tests/embeddings_smoke.rs` |
+| `ssd_cache_survives_server_restart` | `crates/rmlx-server/tests/ssd_cache_restart.rs` |
+
+They are `#[ignore]`d, so `make test` skips them; they are not GPU-classified,
+so `make gpu-test` never selects them. Both statements were true before this
+gate could see them — making them visible does not make them run. Closing that
+needs a decision the gate cannot make for itself: either they reach Metal and
+belong in the runner's population (which means giving the classifier a way to
+see through an HTTP boundary), or they are `#[ignore]`d for a reason other than
+Metal and the ignore text should say so. Until then the warning is the honest
+signal, not noise to be silenced.
+
 Two known edges: (1) a pure device-*policy* test — one that passes `Device::Gpu`
 to a non-mlx function as a plain selector value, never a Metal dispatch — opts
 out **per fn** with a line-leading `// gpu-test-gate: exempt` marker in its own
@@ -223,8 +252,28 @@ closing brace that never comes, so every later item in the file joins that one
 body and stops being classified — which loses violations the gate previously
 caught. `make fmt-check` does not keep the shape out: rustfmt refuses to
 reformat a `macro_rules!` body containing a `$(..)*` repetition (verified
-byte-identical after `rustfmt --edition 2021`). The classifier counts braces on
-the line and only latches when one is left open.
+byte-identical after `rustfmt --edition 2021`).
+
+The classifier decides this from the line's **last significant character** — `}`
+ends an inline body, `;` ends a signature-only declaration — and deliberately
+**not** from a brace count. Braces inside a string, a char literal or a trailing
+comment are not block delimiters, and counting them is wrong in both directions:
+
+* a `}` inside a string literal makes a self-contained line look open, so it
+  latches and swallows the rest of the file (measured: `exit 0`, `OK`, on a file
+  one character away from a compliant one);
+* a `}` inside a trailing comment makes an opening line look closed, so the
+  body is never captured and a `Device::Gpu` inside it is invisible — that
+  direction was a recall regression against `main`, not just a missed
+  extension;
+* a signature-only `fn` in a `trait` or `extern` block has no brace at all, and
+  a rule keyed on "no brace open" latches it forever and hard-fails the whole
+  run blaming a `macro_rules!` the file does not contain.
+
+The trailing-comment scan is quote-aware, so a URL in a one-line fn
+(`"http://…"`) is not mistaken for a comment. It does not track raw-string
+hashes or block comments — a `/* … */` spanning an item's opening line is still
+read literally.
 
 Still out of reach on the macro side: a `macro_rules!` with a **non-brace**
 delimiter (`macro_rules! m ( .. );`). Its name is captured so findings are
