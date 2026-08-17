@@ -797,10 +797,18 @@ the rate. Measured, not modelled — `kv_rate_tests.rs` reads the bytes
 - The perf win above is real and is **not** a memory win on the V axis; it buys
   TPS and quality with resident bytes.
 - `KvQuant::estimated_resident_bytes_per_layer` sizes planar through its generic
-  affine/turbo path (`bits/8` bytes per value plus one `f32` per 32 elements),
-  which comes out at 5.0 bits per value — a **4.4× under-count** of the real
-  store. The estimator's planar rows, and the resolve-time net-saving warn that
-  reads them, are wrong in the codec's favour. Not corrected here: the fix
+  affine/turbo path. Two distinct numbers, kept apart because conflating them is
+  the same defect this section exists to fix:
+  - Its **store sub-term** (`bits/8` bytes per value plus one `f32` per 32
+    elements) is 5.0 bits per value against a measured 22.0 — the store model is
+    off by 4.4×.
+  - Its **V-side output** is larger, because `Planar` has
+    `feeds_bf16_v_at_decode() == true` and the estimator adds a full
+    `elems * 2` bf16 seed: 5.0 + 16.0 = **21.0** bits per value, against an
+    actual 22.0 + 16.0 = **38.0**. So the number the resolve-time net-saving
+    warn reads is off by 1.8×, not 4.4×.
+
+  Either way it is wrong in the codec's favour. Not corrected here: the fix
   changes an operator-facing advisory and belongs with a decision about the
   scale cadence, not with a rate-accounting change.
 
@@ -1857,26 +1865,41 @@ generate paths call (the remaining arches do not call it yet).
 the codebook width) and counts the quaternion sideband, so its number is a
 conservative upper bound for the ring-resident members.
 
-**Crate-wide rate ceiling.** `crates/rmlx-kv-quant/src/kv_rate_tests.rs` measures
-every store family's bits per value from the bytes its own encoder produced and
-fails any family above bf16's 16.0 that does not carry a written exemption. An
-exemption is itself checked: a family listed as exempt must actually measure
-above the floor, so a fixed codec turns its own exemption red instead of
-silently keeping it. The `KvQuant` → family map is an exhaustive `match`, so a
-new codec does not compile until its rate is accounted for. Measured table at
-`head_dim = 128`:
+**Crate-wide rate ceiling.** `crates/rmlx-kv-quant/src/kv_rate_tests.rs` reports
+every store family's bits per value and fails any family above bf16's 16.0 that
+does not carry a written exemption. An exemption is itself checked: a family
+listed as exempt must actually measure above the floor, so a fixed codec turns
+its own exemption red instead of silently keeping it. The `KvQuant` → family map
+is an exhaustive `match`, and a constant ties the match's arm count to the array
+of measured representatives, so a new codec neither compiles nor passes until
+its rate is accounted for. Table at `head_dim = 128`:
 
-| Family | Stored bits / value | Verdict |
-|---|---|---|
-| turbo2 / tcq2 | 3.00 | under |
-| turbo3 / tcq3 | 4.00 | under |
-| turbo4 | 5.00 | under |
-| q8 (group 128) | 8.25 | under |
-| affine (widest shipped, 8-bit group 64) | 9.00 | under |
-| bf16 | 16.00 | the floor |
-| **rotor3 / rotor4** | **21.75** | exempt |
-| **planar3 / planar4** | **22.00** | exempt |
-| **iso3 / iso4** (`IsoBlocks`) | **48.25** | exempt |
+| Family | Stored bits / value | Provenance | Verdict |
+|---|---|---|---|
+| turbo2 / tcq2 | 3.00 | measured | under |
+| turbo3 / tcq3 | 4.00 | measured | under |
+| turbo4 | 5.00 | measured | under |
+| q8 (group 128) | 8.25 | measured | under |
+| affine (`CacheType::Q8G32`) | 10.00 | layout formula | under |
+| bf16 | 16.00 | by definition | the floor |
+| **rotor3 / rotor4** | **21.75** | measured | exempt |
+| **planar3 / planar4** | **22.00** | measured | exempt |
+| **iso3 / iso4** (`IsoBlocks`) | **48.25** | measured | exempt |
+
+"Measured" means the summed byte length of the buffers that family's own CPU
+encoder produced over a shared fixture. The two non-measured rows have no CPU
+encoder in this crate: bf16 is two bytes per value by definition, and MLX affine
+is `bits + 64/group` — code bits plus one `f32` scale and one `f32` bias per
+group.
+
+**The affine row is not a bound over every parseable config.** It covers the
+widest *enumerable* `CacheType` (`q8_g32`). The `mixed_k<b>g<g>_v<b>g<g>`
+grammar reads the group size as a bare `u16` with no whitelist and no floor, so
+`mixed_k8g4_v8g4` parses and stores `8 + 64/4 = 24` bits per value — above the
+floor and invisible to an enum-driven gate, because the rate is a property of a
+runtime field with an unbounded domain rather than of the variant. Pinned by
+`mixed_grammar_admits_affine_rates_above_the_floor` rather than fixed: adding a
+parser floor rejects configs that parse today, which is a CLI-surface decision.
 
 **`head_dim % 4 == 0` constraint.** iso3 operates in groups of 4. Any
 `head_dim` not divisible by 4 is rejected at encode/decode time with
@@ -3043,10 +3066,25 @@ All eight rotor/iso K and V codecs share one crate-internal planner,
 `truncate_plan` in `rmlx-kv-quant/src/storage/mod.rs`, plus a `BlockRows`
 implementation per block type, so the unit conversion and the split are defined
 once rather than re-derived per codec. Tests: `storage/truncate_plan_tests.rs`
-(planner + a payload-carrying fake block), and one store-level round trip per
+(planner + a payload-carrying fake block, including the `b > 1` multi-range
+gather and the suffix-drop fast path), and one store-level round trip per
 block type in `quant_rotor_k3_tests.rs` (`RotorKBlocks`, QJL sideband on),
 `quant_rotor_v3_tests.rs` (`RotorBlocks`) and `quant_iso_v_tests.rs`
 (`IsoBlocks`, quaternion sideband).
+
+**Scope — the class is NOT closed.** The split covers the **rotor and iso**
+block stores only. `QuantV` (`Vec<TurboBlocks>`), `QuantPlanarV` /
+`QuantPlanarK` (`Vec<PlanarBlocks>`) and `QuantKTurbo3/4` accumulate CPU blocks
+on the same `Device::Cpu` append path, but `KvStorage::truncate_to` does nothing
+more than `shape[2] = n` for `K8V4`, `K8V8`, `Planar`, `PlanarK`, `TurboSym3/4`,
+`K8VTurbo2/3`. Their blocks therefore **over**-cover `shape[2]` after a
+truncation, the next append stacks on top, and
+`QuantV::dequantize_choice`'s `out.resize(total, 0.0)` (and
+`QuantPlanarK::dequantize_choice` via `transpose_seq_heads`) silently keeps the
+**rejected** speculative tokens while discarding the correction token. That is
+wrong attention with no error — the opposite failure mode to the rotor/iso one,
+and it is unfixed. Those files are owned elsewhere; this section documents the
+divergence rather than claiming coverage it does not have.
 
 **Real-serve reachability audit (per #284).** `KvCache::truncate_to` has three
 production callers: prompt-cache partial-prefix trim
@@ -3054,13 +3092,27 @@ production callers: prompt-cache partial-prefix trim
 speculative-decode partial-accept rollback (MTP / DFlash / Eagle3 / the
 gemma4-assistant self-speculative path). Whether any of them can reach a
 `kv_h > 1` rotor/iso store depends on the arch:
-- **Bonsai (`Qwen3ForCausalLM`, `kv_h = 8`)** — no live trigger today.
-  Its prompt-cache `ReusePolicy` is `ExactOnly` (partial-prefix trim never
-  fires), and no speculative-decode drafter currently targets plain
-  `Qwen3ForCausalLM`.
-- **Gemma4 (e.g. e4b, `kv_h = 2`)** — reachable in principle: its
-  `ReusePolicy::Partial` performs exactly this trim on a real partial-prefix
-  cache hit, and gemma4-assistant self-speculative decode also rolls back via
+- **Bonsai (`Qwen3ForCausalLM`, `kv_h = 8`)** — **reachable.** Its prompt-cache
+  `ReusePolicy` is `ExactOnly`, so the partial-prefix trim never fires, but the
+  speculative path does. Two reasons, both arch-generic:
+  1. `SpeculativeGenerator::from_snapshots_with_id` takes a fourth,
+     drafter-agnostic branch — `SpeculativeDispatcher::load_speculative` — when
+     `draft_kind` is `None`, and `rmlx-cli`'s serve gate keys on
+     `draft_path.is_some()` alone. `draft_model` has a `projects.toml` profile
+     key while `draft_kind` does not, so `draft_model = Some, draft_kind = None`
+     is reachable and never trips clap's `requires = "draft_kind"` (that only
+     binds CLI-supplied flags). That branch calls plain `load_model` on both
+     sides and `spec_generate_greedy_cached` builds caches from
+     `num_hidden_layers()` with **no arch check**, rolling back through
+     `KvCache::truncate_to`.
+  2. No drafter gates the **verifier** arch at all. The
+     `"Qwen3_5MoeForConditionalGeneration"` strings in `speculative/mtp.rs` and
+     `speculative/dflash/mod.rs` are `KvCacheBuilder::resolve_default`
+     *arguments* — the KV-quant fallback when `kv_quant_override` is `None` —
+     not architecture guards, and an explicit `--kv-quant` makes them dead.
+- **Gemma4 (e.g. e4b, `kv_h = 2`)** — reachable twice over: its
+  `ReusePolicy::Partial` performs the trim on a real partial-prefix cache hit,
+  and gemma4-assistant self-speculative decode also rolls back via
   `truncate_to`.
 
 The fix is proven at the codec level (all eight `*_tests.rs` files, `kv_h`
@@ -3074,7 +3126,9 @@ exercise the identical code path — no arch-specific behavior exists to miss.
 The mid-block split has a **wider** reachability than the unit-conversion bug it
 sits next to: it fires at `kv_h == 1` too, since a cut inside a block is about
 block boundaries, not head counts. Any rotor or iso codec with speculative
-decoding on reaches it on the first partial accept.
+decoding on reaches it on the first partial accept — including the Bonsai cell
+above, where a `--kv-quant rotor3_sym` verifier takes the `Skip`-feed legacy
+append (no ring to rebuild from) on every `q_seq > 1` verifier forward.
 
 The forbidden state is `blocks` short of `shape[2]` with **no** ring to supply
 the tail: `dequant()` would zero-pad the gap (silently wrong attention) and an

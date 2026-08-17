@@ -177,6 +177,18 @@ pub(crate) fn truncate_plan(
         // layout is not understood would be silent corruption. (A zero-row block
         // divides cleanly and spans zero positions, so it is kept, not a stop.)
         if !rows.is_multiple_of(rows_per_seq) {
+            // Loud: the caller still lowers `shape[2]` to `n`, so the store is
+            // about to enter the blocks-short-of-shape state that aborts the
+            // next `dequant`. Without this the trail goes cold here.
+            tracing::warn!(
+                block_rows = rows,
+                rows_per_seq,
+                kept_seq = acc_seq,
+                target_seq,
+                "KV block truncate: block row count is not a whole number of sequence \
+                 positions — dropping it and every block after it, leaving the store short \
+                 of its truncation target"
+            );
             break;
         }
         let blk_seq = rows / rows_per_seq;
@@ -233,6 +245,15 @@ pub(crate) fn apply_truncate_plan<B: BlockRows>(blocks: &mut Vec<B>, plan: &Trun
         .last_mut()
         .is_some_and(|last| last.retain_rows(&plan.partial, plan.partial_rows));
     if !split_ok {
+        // Loud for the same reason as the planner's refusal: the caller lowers
+        // `shape[2]` regardless, so dropping the block leaves `plan.partial_rows`
+        // rows uncovered and the next `dequant` aborts a long way from here.
+        tracing::warn!(
+            kept_blocks = plan.keep,
+            uncovered_rows = plan.partial_rows,
+            "KV block truncate: trailing block could not be split — dropping it whole, \
+             leaving the store short of its truncation target"
+        );
         blocks.truncate(plan.keep);
     }
 }
@@ -259,6 +280,13 @@ pub(crate) fn rows_split_ok(
 ///
 /// Caller must have cleared the block through [`rows_split_ok`] first. An empty
 /// buffer — an inactive sideband such as the rotor QJL residual — stays empty.
+///
+/// The single-range-anchored-at-0 case is a plain suffix drop and takes
+/// `Vec::truncate`: no allocation, no copy. That is the **only** shape
+/// production reaches — `truncate_plan` emits one range per batch element, and
+/// the batch dim is fixed at 1 per request — and it sits on the speculative
+/// rollback path, which runs once per round per store per layer. The gather
+/// below exists for `b > 1`, where a sequence prefix is not a row prefix.
 pub(crate) fn retain_rows_in<T: Copy>(
     buf: &mut Vec<T>,
     total_rows: usize,
@@ -268,6 +296,12 @@ pub(crate) fn retain_rows_in<T: Copy>(
         return;
     }
     let stride = buf.len() / total_rows;
+    if let [only] = ranges {
+        if only.start == 0 {
+            buf.truncate(only.end * stride);
+            return;
+        }
+    }
     let kept: usize = ranges.iter().map(std::ops::Range::len).sum();
     let mut out = Vec::with_capacity(kept.saturating_mul(stride));
     for r in ranges {

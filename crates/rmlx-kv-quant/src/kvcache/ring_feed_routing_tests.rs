@@ -1,15 +1,26 @@
 //! Which append arm a packed-K chunk takes, and why the block arm is live.
 //!
-//! The packed rotor / iso K appends have two arms: a ring-only tail that skips
-//! the CPU block push, and a block path that pushes a CPU block and first
-//! reconciles any pre-existing ring-only tail (`materialize_*_ring_tail`). The
-//! block arm was documented as unreachable at `b == 1` — "a fused multi-token
-//! append transition does not occur" — which reads as "this code is dead" and
-//! invites removing the reconcile. It is not dead: the arm is selected by the
-//! caller's `RingFeed`, and the legacy `update_*` entries a `q_seq > 1` forward
-//! falls through to pass `Maintain` / `Skip`.
+//! The packed rotor K append has two arms: a ring-only tail that skips the CPU
+//! block push, and a block path that pushes a CPU block and first reconciles any
+//! pre-existing ring-only tail (`materialize_*_ring_tail`). The block arm was
+//! documented as unreachable at `b == 1` — "a fused multi-token append
+//! transition does not occur" — which reads as "this code is dead" and invites
+//! removing the reconcile.
+//!
+//! # What these tests can and cannot reach
+//!
+//! They assert the routing of the **named feed constants** the legacy rotor
+//! `update_*` entries pass ([`LEGACY_ROTOR_SYM_FEED`],
+//! [`LEGACY_ROTOR_K_ONLY_FEED`]). That is a CPU-only gate, so `make ci` runs it.
+//!
+//! It is **not** a proof that a given entry still passes those constants: the
+//! append path they feed runs an MSL encode kernel, so nothing below `make
+//! gpu-test` can observe the consequence. The observable-consequence pin lives
+//! in `rotor_flash_dispatch_tests::rotor_sym3_multi_token_append_drops_the_ring`
+//! and its K-only sibling, both `#[ignore]`. If a call site is changed to bypass
+//! the constant, this file stays green and those two go red.
 
-use super::{is_ring_only_append, RingFeed};
+use super::{is_ring_only_append, RingFeed, LEGACY_ROTOR_K_ONLY_FEED, LEGACY_ROTOR_SYM_FEED};
 
 /// The arm is chosen by `feed` and `b` only — never by chunk length.
 ///
@@ -43,25 +54,56 @@ fn ring_only_arm_is_selected_by_feed_and_batch_not_by_chunk_length() {
     }
 }
 
-/// The block arm at `b == 1` is live, which is the claim the old comment denied.
+/// Both legacy rotor feeds route a `b == 1` multi-token chunk to the block path.
 ///
-/// `update_rotor_k_only_{3,4}` passes `Maintain` and `update_rotor{3,4}_sym` /
-/// the asym entries pass `Skip`. Those are the entries the SDPA dispatcher falls
-/// through to whenever its fused gate (`q_seq == 1`) rejects the forward — a
-/// speculative verify chunk, or a continuation turn's prompt tokens against a
-/// warm cache. `b > 1` is a *second*, and today unreachable, way in; asserting
-/// only that one would leave the live way untested.
+/// This is the claim the old comment denied. The legacy entries are what the
+/// SDPA dispatcher falls through to whenever its fused gate (`q_seq == 1`)
+/// rejects the forward — a speculative verify chunk, or a continuation turn's
+/// prompt tokens against a warm cache. `b > 1` is a *second*, and today
+/// unreachable, way in; asserting only that one would leave the live way
+/// untested.
+///
+/// Asserting the constants rather than bare `RingFeed` values is what ties this
+/// to the call sites: changing what the legacy entries pass means changing a
+/// constant this test reads.
 #[test]
-fn block_path_is_reachable_at_batch_one() {
+fn both_legacy_rotor_feeds_reach_the_block_path_at_batch_one() {
     let batch_one = [1_i32, 2, 5, 128];
-    let batched = [2_i32, 2, 5, 128];
 
-    assert!(
-        !is_ring_only_append(RingFeed::Maintain, &batch_one),
-        "the block path must be reachable without a b > 1 chunk"
-    );
+    for (name, feed) in [
+        ("LEGACY_ROTOR_SYM_FEED", LEGACY_ROTOR_SYM_FEED),
+        ("LEGACY_ROTOR_K_ONLY_FEED", LEGACY_ROTOR_K_ONLY_FEED),
+    ] {
+        assert!(
+            !is_ring_only_append(feed, &batch_one),
+            "{name} must reach the block path without a b > 1 chunk"
+        );
+    }
+
+    let batched = [2_i32, 2, 5, 128];
     assert!(
         !is_ring_only_append(RingFeed::MaintainRingOnly, &batched),
         "b > 1 is the second way into the block path, not the only one"
+    );
+}
+
+/// The sym feed clears the ring; the K-only feed keeps it.
+///
+/// That difference is load-bearing for the truncation story: with the ring gone,
+/// the CPU blocks are the only copy of the prefix, so a mid-block cut that drops
+/// the trailing block is unrecoverable. The sym path is therefore where a
+/// speculative partial accept bites first.
+#[test]
+fn only_the_k_only_legacy_feed_keeps_the_ring() {
+    assert_eq!(
+        LEGACY_ROTOR_SYM_FEED,
+        RingFeed::Skip,
+        "the sym/asym legacy entries dequantize the whole prefix, so they drop the ring \
+         and make the CPU blocks the only copy"
+    );
+    assert_eq!(
+        LEGACY_ROTOR_K_ONLY_FEED,
+        RingFeed::Maintain,
+        "the K-only legacy entry keeps the ring, so a ring-only tail survives a fallback step"
     );
 }

@@ -142,16 +142,32 @@ fn run_decode_steps(
         );
     }
     let delta = rotor_flash_decode_dispatch_count() - before;
-    let gpu_ring_live = if let KvStorage::RotorKOnly3 { k: Some(ks), .. } = cache.storage() {
+    let gpu_ring_live = rotor_k_ring_live(&cache);
+    DecodeProbe {
+        delta,
+        gpu_ring_live,
+    }
+}
+
+/// Whether the active rotor K-only store holds a live GPU ring.
+fn rotor_k_ring_live(cache: &KvCache) -> bool {
+    if let KvStorage::RotorKOnly3 { k: Some(ks), .. } = cache.storage() {
         ks.gpu.is_allocated()
     } else if let KvStorage::RotorKOnly4 { k: Some(ks), .. } = cache.storage() {
         ks.gpu.is_allocated()
     } else {
         false
-    };
-    DecodeProbe {
-        delta,
-        gpu_ring_live,
+    }
+}
+
+/// CPU blocks the active rotor K-only store currently holds.
+fn rotor_k_blocks_len(cache: &KvCache) -> usize {
+    if let KvStorage::RotorKOnly3 { k: Some(ks), .. } = cache.storage() {
+        ks.blocks.len()
+    } else if let KvStorage::RotorKOnly4 { k: Some(ks), .. } = cache.storage() {
+        ks.blocks.len()
+    } else {
+        0
     }
 }
 
@@ -620,4 +636,104 @@ fn rotor_k_only_4_ring_only_tail_truncate_then_decode() {
         return;
     }
     ring_only_tail_truncate_then_decode(KvQuant::RotorKOnly4);
+}
+
+/// A multi-token append AFTER fused decode has run lands on the block path, and
+/// that path pushes a CPU block while keeping the ring.
+///
+/// This is the observable consequence `ring_feed_routing_tests` cannot reach:
+/// those tests assert how `LEGACY_ROTOR_K_ONLY_FEED` routes, not that
+/// `update_rotor_k_only_*` still passes it. Here the fused steps empty
+/// `blocks` (the ring becomes the sole copy), and the following `q_seq > 1`
+/// forward — a speculative verify chunk, or a continuation turn's prompt tokens
+/// against a warm cache — falls out of the fused gate (`q_seq == 1`) into the
+/// legacy entry. If that entry stopped passing `Maintain`, one of the two
+/// assertions below flips: `MaintainRingOnly` would push no block, `Skip` would
+/// drop the ring.
+///
+/// It also pins the reachability claim itself. The block arm was documented as
+/// unreachable at `b == 1`; every shape here has `b == 1`.
+#[allow(clippy::expect_used, reason = "test: invariants documented")]
+fn multi_token_append_after_fused_decode_takes_the_block_path(quant: KvQuant) {
+    let device = Device::Gpu;
+    let (kv_h, n_q_heads, head_dim, prefill, steps, second) =
+        (2_i32, 8_i32, 128_i32, 6_i32, 4_i32, 3_i32);
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    let mut cache = seeded_cache(quant, kv_h, head_dim, false);
+    let pf_n = (prefill * kv_h * head_dim) as usize;
+    let k = f32_array(&lcg_data(pf_n, 701), &[1, kv_h, prefill, head_dim]);
+    let v = f32_array(&lcg_data(pf_n, 702), &[1, kv_h, prefill, head_dim]);
+    let q = f32_array(
+        &lcg_data((prefill * n_q_heads * head_dim) as usize, 703),
+        &[1, n_q_heads, prefill, head_dim],
+    );
+    cache
+        .update_and_sdpa(&q, &k, &v, scale, "causal", None, device)
+        .expect("prefill update_and_sdpa");
+    cache.exit_prefill(device).expect("exit_prefill");
+
+    // Fused decode steps: these drop the CPU blocks once the ring is live.
+    for step in 0..steps as u64 {
+        let one = (kv_h * head_dim) as usize;
+        let k1 = f32_array(&lcg_data(one, 710 + step), &[1, kv_h, 1, head_dim]);
+        let v1 = f32_array(&lcg_data(one, 720 + step), &[1, kv_h, 1, head_dim]);
+        let q1 = f32_array(
+            &lcg_data((n_q_heads * head_dim) as usize, 730 + step),
+            &[1, n_q_heads, 1, head_dim],
+        );
+        cache
+            .update_and_sdpa(&q1, &k1, &v1, scale, "", None, device)
+            .expect("decode update_and_sdpa")
+            .eval()
+            .expect("decode out eval");
+    }
+    assert_eq!(
+        rotor_k_blocks_len(&cache),
+        0,
+        "precondition: the fused decode path drops the CPU blocks once the ring is live"
+    );
+
+    // The transition under test: q_seq > 1 on the same cache, b == 1.
+    let sec_n = (second * kv_h * head_dim) as usize;
+    let k2 = f32_array(&lcg_data(sec_n, 740), &[1, kv_h, second, head_dim]);
+    let v2 = f32_array(&lcg_data(sec_n, 741), &[1, kv_h, second, head_dim]);
+    let q2 = f32_array(
+        &lcg_data((second * n_q_heads * head_dim) as usize, 742),
+        &[1, n_q_heads, second, head_dim],
+    );
+    cache
+        .update_and_sdpa(&q2, &k2, &v2, scale, "causal", None, device)
+        .expect("multi-token append after fused decode")
+        .eval()
+        .expect("out eval");
+
+    assert!(
+        rotor_k_blocks_len(&cache) > 0,
+        "the legacy K-only entry must push a CPU block — a ring-only feed here would \
+         leave `blocks` empty and the block arm would be dead after all"
+    );
+    assert!(
+        rotor_k_ring_live(&cache),
+        "the legacy K-only entry must keep the ring — a Skip feed here would strand the \
+         prefix in the CPU blocks alone"
+    );
+}
+
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_dispatch -- --ignored --test-threads=1"]
+fn rotor_k_only_3_multi_token_append_after_fused_decode_takes_the_block_path() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    multi_token_append_after_fused_decode_takes_the_block_path(KvQuant::RotorKOnly3);
+}
+
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_dispatch -- --ignored --test-threads=1"]
+fn rotor_k_only_4_multi_token_append_after_fused_decode_takes_the_block_path() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    multi_token_append_after_fused_decode_takes_the_block_path(KvQuant::RotorKOnly4);
 }

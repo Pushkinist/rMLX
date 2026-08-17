@@ -144,10 +144,14 @@ const FAMILIES: &[Family] = &[
         verdict: Verdict::UnderBf16,
     },
     Family {
-        // The widest MLX-affine cadence the `KvQuant` grammar accepts is
-        // 8-bit at group 64 (`q8_g64`); every other shipped pair is cheaper.
+        // The widest cadence any **enumerable** affine cache type reaches:
+        // `CacheType::Q8G32` (8-bit, group 32) at 10.0 bits per value. This is
+        // NOT a bound over every parseable affine config — the `mixed_*`
+        // grammar takes an unvalidated group size, so rates above the floor are
+        // expressible and this gate cannot see them. See
+        // `mixed_grammar_admits_affine_rates_above_the_floor`.
         name: "affine",
-        rate: Rate::AffineLayout { bits: 8, group: 64 },
+        rate: Rate::AffineLayout { bits: 8, group: 32 },
         verdict: Verdict::UnderBf16,
     },
     Family {
@@ -363,12 +367,24 @@ fn rotor_rate_splits_into_documented_code_scale_and_norm_bits() {
     );
 }
 
-/// Every `KvQuant` variant states which store family each of its axes uses.
+/// Number of `KvQuant` variants the `axes` match below enumerates.
+///
+/// The match is exhaustive, so a new variant fails to compile until it names its
+/// store families — but naming a family is not the same as being *measured*.
+/// Only variants present in the `variants` array below have their rate
+/// evaluated, and that array is hand-written. This constant is the mechanical
+/// link between the two: adding an `axes` arm without adding a representative to
+/// `variants` fails the length assertion.
+const KV_QUANT_VARIANT_COUNT: usize = 29;
+
+/// Every `KvQuant` variant states which store family each of its axes uses, and
+/// every variant is actually measured.
 ///
 /// Exhaustive on purpose: a new variant fails to compile until its rate is
 /// accounted for. `Mixed` / `RotK` / the asym variants carry runtime bit and
-/// group fields, and map to the `affine` family whose entry is an upper bound
-/// over the whole shipped grid.
+/// group fields and map to the `affine` family — whose entry bounds the
+/// *enumerable* cache types only, not every parseable config (see
+/// [`mixed_grammar_admits_affine_rates_above_the_floor`]).
 #[test]
 fn every_kv_quant_variant_names_its_store_families() {
     let data = fixture();
@@ -460,6 +476,18 @@ fn every_kv_quant_variant_names_its_store_families() {
         },
     ];
 
+    // The compile-time half of the guarantee only forces a family NAME. Without
+    // this, a new variant plus a new `axes` arm compiles and runs green while
+    // never being measured, because nothing adds it to `variants`.
+    assert_eq!(
+        variants.len(),
+        KV_QUANT_VARIANT_COUNT,
+        "the `axes` match enumerates {KV_QUANT_VARIANT_COUNT} variants but only \
+         {} are measured — add a representative for the new variant and bump the \
+         constant together",
+        variants.len(),
+    );
+
     for q in &variants {
         for name in axes(q) {
             let f = family(name);
@@ -480,6 +508,52 @@ fn every_kv_quant_variant_names_its_store_families() {
             f.name
         );
     }
+}
+
+/// The `mixed_*` grammar accepts affine group sizes this gate cannot enumerate,
+/// and some of them store above the bf16 floor.
+///
+/// `parse_kv_side` reads the group size as a bare `u16` with no whitelist and no
+/// floor, so `mixed_k8g4_v8g4` is a valid `--kv-quant` argument whose store
+/// spends `8 + 64/4 = 24` bits per value on each axis. No enum-driven table can
+/// see that, because the rate is not a property of the variant — it is a
+/// property of a runtime field with an unbounded domain.
+///
+/// Pinned rather than fixed: adding a group-size floor to the parser rejects
+/// configs that parse today, which is a CLI-surface decision. The point here is
+/// that the ceiling gate's coverage claim stops at the enumerable cache types,
+/// and this test is what says so out loud.
+#[test]
+fn mixed_grammar_admits_affine_rates_above_the_floor() {
+    let q: KvQuant = "mixed_k8g4_v8g4".parse().expect(
+        "the mixed grammar accepts an unvalidated group size — if this now fails, the \
+         parser grew a floor and this test should assert that instead",
+    );
+    let KvQuant::Mixed {
+        k_bits,
+        v_bits,
+        k_group_size,
+        v_group_size,
+    } = q
+    else {
+        panic!("mixed_k8g4_v8g4 must parse to KvQuant::Mixed, got {q}");
+    };
+    assert_eq!((k_bits, k_group_size, v_bits, v_group_size), (8, 4, 8, 4));
+
+    let rate = f64::from(k_bits) + 64.0 / f64::from(k_group_size);
+    assert!(
+        rate > BF16_BITS_PER_VALUE,
+        "the point of this test is a parseable config above the floor; {rate:.2} is not"
+    );
+
+    // And the table's `affine` entry does NOT bound it — stated so nobody reads
+    // that entry as a guarantee over the whole affine grid.
+    let table = family_rate(family("affine"), &fixture());
+    assert!(
+        table < rate,
+        "the affine table entry ({table:.2}) is not an upper bound over the parseable \
+         grid ({rate:.2}); if it became one, say so in its comment"
+    );
 }
 
 /// The q8 group size the `q8` family entry measures is the one the codec ships.

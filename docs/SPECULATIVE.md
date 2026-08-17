@@ -96,9 +96,17 @@ proposals begin.
 
 ### Partial accept always cuts mid-block
 
-Phase D is the only place a KV store is truncated to a position that is not an
-append boundary. The verifier writes its whole `K + 1`-token chunk as **one**
-append, and `truncate_to(offset - v_drop)` then lands inside it.
+Phase D truncates a KV store to a position that is **never** an append boundary:
+the verifier writes its whole `K + 1`-token chunk as one append, and
+`truncate_to(offset - v_drop)` lands inside it by construction.
+
+It is not the only such caller. `PromptCacheEntry::truncate_kv_to_block`
+delegates to `truncate_kv_to(block_count * BLOCK_TOKENS)` with
+`BLOCK_TOKENS = 256`, while gemma4 prefills in 1024-token chunks and
+qwen3.5-MoE in 2048 — so a `ReusePolicy::Partial` trim also lands inside an
+append block on those arches. Phase D is the caller that hits it on *every*
+partial accept; the prompt-cache trim hits it whenever the block granularity and
+the prefill chunk disagree.
 
 That matters for the block-accumulating packed stores — every rotor and iso K
 and V store keeps a `Vec` of per-append blocks, not a flat buffer. Dropping the
@@ -118,6 +126,17 @@ append path (a QJL-carrying rotor K store, or a `Device::Cpu` run), and the
 legacy `update_rotor{3,4}_sym` / asym appends, which clear the ring by design.
 Those are exactly the paths a `q_seq > 1` verifier forward takes, since the
 fused decode entry is gated on `q_seq == 1`.
+
+**Scope.** The split covers the rotor and iso block stores only. `QuantV`
+(`Vec<TurboBlocks>`) and `QuantPlanarV` / `QuantPlanarK` (`Vec<PlanarBlocks>`)
+accumulate CPU blocks the same way, but `KvStorage::truncate_to` only lowers
+`shape[2]` for `K8V4` / `K8V8` / `Planar` / `PlanarK` / `TurboSym3/4` /
+`K8VTurbo2/3`, so their blocks **over**-cover the target and the next append
+stacks on top. `QuantV::dequantize_choice` then resizes the over-long
+concatenation down to `shape[2]`, silently keeping the rejected tokens and
+dropping the correction token — wrong attention, no error. Unfixed; those stores
+are owned outside this change. See `docs/KV_QUANT.md` § "Scope — the class is
+NOT closed."
 
 ## Per-drafter Deep Dive
 

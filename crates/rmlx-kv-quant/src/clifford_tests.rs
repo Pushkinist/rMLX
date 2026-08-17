@@ -189,9 +189,12 @@ fn sandwich_of_grade1_in_3d_stays_grade1() {
             v_mv[3] = v[2];
 
             let y = rotor_sandwich(r, &v_mv);
-            // Tolerance scales with the input magnitude: the leak bound is a
-            // relative round-off bound, not an absolute one.
-            let tol = 1e-5 * v_mv.iter().fold(1.0_f32, |acc, x| acc.max(x.abs()));
+            // Genuinely relative: seeded at 0 so a small input gets a small
+            // bound. Seeding the fold at 1.0 would turn this into an absolute
+            // 1e-5 floor, which for the 1e-3-scale vector below admits a 0.3%
+            // leak and costs that sweep entry all its power.
+            let max_abs = v_mv.iter().fold(0.0_f32, |acc, x| acc.max(x.abs()));
+            let tol = 1e-5 * max_abs;
             // Indices 0 (scalar), 4/5/6 (bivector) and 7 (pseudoscalar) — the
             // five slots the codec quantises and stores but decode discards.
             for idx in [0_usize, 4, 5, 6, 7] {
@@ -235,7 +238,9 @@ fn inverse_sandwich_of_non_grade1_leaks_nothing_into_grade1() {
         let noise = [0.83_f32, 0.0, 0.0, 0.0, -0.41, 1.27, -0.66, 0.19];
         // Decode's inverse rotation: `R̃ * x * R`.
         let back = rotor_sandwich(rotor_reverse(r), &noise);
-        let tol = 1e-5 * noise.iter().fold(1.0_f32, |acc, x| acc.max(x.abs()));
+        // Relative to the injected magnitude — see the sibling test's note on
+        // why the fold is seeded at 0 rather than 1.
+        let tol = 1e-5 * noise.iter().fold(0.0_f32, |acc, x| acc.max(x.abs()));
         for idx in [1_usize, 2, 3] {
             assert!(
                 back[idx].abs() < tol,

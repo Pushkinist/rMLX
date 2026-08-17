@@ -111,10 +111,16 @@ fn quant_rotor_k3_short_blocks_without_ring_is_loud_not_zero_padded() {
     );
 }
 
+/// Encode + decode run under whatever QJL setting is ambient.
+///
+/// The name used to say "default on", which is false — `crate::rotor_qjl`
+/// defaults **off** because the sideband has no MSL kernel and forces the whole
+/// rotor K path onto the CPU. The body never asserted a default either; the
+/// toggle itself is covered by the lift test below.
 #[test]
-fn quant_rotor_k3_qjl_default_on() {
+fn quant_rotor_k3_roundtrip_under_ambient_qjl_setting() {
     let _guard = crate::test_utils::env_lock();
-    // Default ON when no env override is set.
+    // No env override: whatever the process default resolves to.
     // SAFETY: env lock held — no concurrent env reader/writer in this binary.
     unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
 
@@ -310,22 +316,28 @@ fn quant_rotor_k3_reset_drops_the_gpu_ring() {
 
 /// `truncate_to()` must KEEP the GPU ring, not drop it.
 ///
-/// The ring is the only copy of a fused-decode ring-only tail (`blocks` can
-/// trail `shape[2]` on that path — see `synced_rotor_k_blocks`), and a whole
-/// CPU block that does not wholly fit the truncated target is dropped
-/// outright rather than split. Clearing the ring here (the pre-fix behaviour)
-/// would strand the kept prefix with nothing to rebuild it from, and
-/// `dequant()` / an SSD spill would hit the "blocks short of shape[2], no
-/// ring" guard and abort instead of returning the kept tokens.
+/// Reproduces the fused decode path's state exactly: the store carries a
+/// **ring-only tail** — `blocks` empty (dropped once the ring went live, the way
+/// `drop_blocks_when_ring_live_k3` does it) while the ring holds the whole
+/// prefix and `shape[2]` tracks it. The ring is then the only copy of every
+/// token. Clearing it in `truncate_to` (the pre-fix behaviour) strands the kept
+/// prefix with nothing to rebuild it from, and `dequant()` / an SSD spill hits
+/// the "blocks short of shape[2], no ring" guard and aborts instead of returning
+/// the kept tokens.
+///
+/// Note this is the ring-only regime, **not** the mid-block split: with `blocks`
+/// empty there is nothing to split, so `truncate_to` only lowers `shape[2]`. The
+/// split is covered on the CPU side by
+/// [`quant_rotor_k3_truncate_mid_block_splits_at_this_shape`] — which runs in
+/// `make ci`, unlike this one — and by
+/// `quant_rotor_k3_truncate_mid_block_splits_instead_of_dropping`.
 ///
 /// `kv_h = 1` keeps `RotorKBlocks::n_tokens` (`b * kv_h * seq`) directly
-/// comparable to the truncate target `n` (a raw sequence position), so which
-/// blocks `truncate_to` keeps is unambiguous here.
+/// comparable to the truncate target `n` (a raw sequence position).
 ///
 /// Mutation check: re-introduce `self.gpu.clear()` in `truncate_to`. The ring
-/// (the only remaining copy of the kept token, since the 2-token CPU block
-/// was dropped) is then gone, so `dequant()` hits the no-ring guard and
-/// returns `Err` instead of `Ok` — RED.
+/// (the only remaining copy of the kept token) is then gone, so `dequant()`
+/// hits the no-ring guard and returns `Err` instead of `Ok` — RED.
 #[test]
 #[ignore = "GPU Metal context — run in isolation: cargo test quant_rotor_k3 -- --ignored --test-threads=1"]
 fn quant_rotor_k3_truncate_to_keeps_the_gpu_ring() {
@@ -342,19 +354,20 @@ fn quant_rotor_k3_truncate_to_keeps_the_gpu_ring() {
     ks.append(&d1, &[1, kv_h, 2, head_dim]).expect("append");
     assert_eq!(ks.shape[2], 2);
 
-    // A live ring covering both tokens.
+    // A live ring covering both tokens, then drop the redundant CPU blocks —
+    // this is what the fused decode append does once the ring is allocated, and
+    // it is what makes the ring the sole copy.
     seed_ring_via_gpu_append(&mut ks, kv_h, head_dim, 2, RING_TEST_MAX_SEQ);
     assert!(ks.gpu.is_allocated());
+    ks.blocks.clear();
 
-    // Truncate to seq=1, mid-block: the sole 2-token CPU block does not wholly
-    // fit the target, so it is dropped entirely rather than split — the kept
-    // token must be rebuilt from the ring, not zero-padded or errored.
+    // Truncate to seq=1. Nothing to split (no blocks), so the kept token exists
+    // only in the ring and must be rebuilt from it — not zero-padded, not an error.
     ks.truncate_to(1);
     assert_eq!(ks.shape[2], 1);
     assert!(
         ks.blocks.is_empty(),
-        "precondition: the 2-token block doesn't wholly fit target seq=1, so it \
-         is dropped — the kept token must come from the ring"
+        "precondition: the ring-only regime has no CPU blocks to keep"
     );
     assert!(
         ks.gpu.is_allocated(),
@@ -567,4 +580,46 @@ fn quant_rotor_k3_truncate_mid_block_splits_instead_of_dropping() {
 
     // SAFETY: env lock held.
     unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
+}
+
+/// The same shape the ring test uses, on the CPU side, where `make ci` runs it.
+///
+/// `quant_rotor_k3_truncate_to_keeps_the_gpu_ring` needs a Metal context, so it
+/// carries `#[ignore]` and only `make gpu-test` / `make ci-perf` execute it. A
+/// truncation-semantics change is therefore invisible to the per-commit gate
+/// unless the same state transition is also asserted without a GPU. This is that
+/// assertion: one 2-token block, `truncate_to(1)`, no ring anywhere.
+///
+/// Mutation check: restore the whole-block drop and `blocks` is empty while
+/// `shape[2] == 1`, so `dequant()` returns the no-ring `Err` and the `expect`
+/// goes RED.
+#[test]
+fn quant_rotor_k3_truncate_mid_block_splits_at_this_shape() {
+    let (kv_h, head_dim) = (1_i32, 6_i32);
+    let mut ks = QuantRotorK3::new(vec![1, kv_h, 0, head_dim], 0);
+    ks.rotors = make_rotor_table(0, 0, n_groups_for(head_dim as usize));
+    let per_tok = (kv_h * head_dim) as usize;
+    let d1 = lcg_data(per_tok * 2, TEST_SEED);
+    ks.append(&d1, &[1, kv_h, 2, head_dim]).expect("append");
+
+    ks.truncate_to(1);
+
+    assert_eq!(ks.shape[2], 1);
+    let kept_rows: usize = ks.blocks.iter().map(|blk| blk.n_tokens).sum();
+    assert_eq!(
+        kept_rows, 1,
+        "the 2-token block must be split to 1 row, not dropped"
+    );
+    let decoded = ks.dequant().expect("dequant after a mid-block truncate");
+
+    let mut reference = QuantRotorK3::new(vec![1, kv_h, 0, head_dim], 0);
+    reference.rotors = make_rotor_table(0, 0, n_groups_for(head_dim as usize));
+    reference
+        .append(&d1[..per_tok], &[1, kv_h, 1, head_dim])
+        .expect("reference append");
+    let ref_decoded = reference.dequant().expect("reference dequant");
+    assert_eq!(
+        decoded, ref_decoded,
+        "the split block must reconstruct the retained token exactly"
+    );
 }

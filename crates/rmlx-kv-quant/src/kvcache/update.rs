@@ -867,6 +867,22 @@ enum RingFeed {
     Skip,
 }
 
+/// Feed the legacy rotor symmetric / asymmetric `update_*` entries pass.
+///
+/// These dequantize the whole prefix on the same step, so the CPU blocks must
+/// carry everything and the ring is dropped. Named rather than repeated at each
+/// call site because the "blocks are the only copy" property that follows from
+/// it is what makes a mid-block truncation unrecoverable there — see
+/// `crate::storage::truncate_plan`.
+const LEGACY_ROTOR_SYM_FEED: RingFeed = RingFeed::Skip;
+
+/// Feed the legacy rotor K-only `update_*` entries pass.
+///
+/// Unlike the sym path these keep the ring, so a ring-only tail survives a
+/// fallback step; the CPU block is pushed alongside because the same step
+/// dequantizes.
+const LEGACY_ROTOR_K_ONLY_FEED: RingFeed = RingFeed::Maintain;
+
 /// Keep the GPU ring consistent with the CPU blocks for one append.
 ///
 /// **Invariant: the ring either tracks `blocks` exactly, or it does not exist.**
@@ -7543,7 +7559,7 @@ impl KvCache {
                 new_k,
                 &new_shape,
                 device,
-                RingFeed::Skip,
+                LEGACY_ROTOR_SYM_FEED,
                 max_seq,
             )?;
         } else {
@@ -7639,7 +7655,7 @@ impl KvCache {
                 new_k,
                 &new_shape,
                 device,
-                RingFeed::Skip,
+                LEGACY_ROTOR_SYM_FEED,
                 max_seq,
             )?;
         } else {
@@ -7735,7 +7751,7 @@ impl KvCache {
                 new_k,
                 &new_shape,
                 device,
-                RingFeed::Maintain,
+                LEGACY_ROTOR_K_ONLY_FEED,
                 max_seq,
             )?;
         } else {
@@ -7803,7 +7819,7 @@ impl KvCache {
                 new_k,
                 &new_shape,
                 device,
-                RingFeed::Maintain,
+                LEGACY_ROTOR_K_ONLY_FEED,
                 max_seq,
             )?;
         } else {
@@ -7907,7 +7923,7 @@ impl KvCache {
                 new_k,
                 &new_shape,
                 device,
-                RingFeed::Skip,
+                LEGACY_ROTOR_SYM_FEED,
                 max_seq,
             )?;
         } else {
@@ -8006,7 +8022,7 @@ impl KvCache {
                 new_k,
                 &new_shape,
                 device,
-                RingFeed::Skip,
+                LEGACY_ROTOR_SYM_FEED,
                 max_seq,
             )?;
         } else {

@@ -289,15 +289,27 @@ fn out_of_range_plan_is_refused_not_partially_applied() {
 
 /// A block whose payload is not a whole number of rows cannot be split; the
 /// caller drops it rather than cut it into an inconsistent state.
+///
+/// Dropping it is safe but **not** free: the store's `truncate_to` lowers
+/// `shape[2]` to `n` regardless, so the result is the blocks-short-of-`shape[2]`
+/// state that aborts the next `dequant`. This test asserts the size of that gap
+/// rather than only the surviving block count, so the cost of the refusal is
+/// visible here instead of being discovered at a consumer boundary. The refusal
+/// also emits a `warn!` naming the same numbers.
 #[test]
-fn apply_plan_drops_an_unsplittable_block() {
+fn apply_plan_drops_an_unsplittable_block_and_leaves_a_named_gap() {
     let shape = [1_i32, 1, 0, 8];
+    let target = 6_usize;
     let mut blocks = vec![FakeBlock::new(0, 4, 3), FakeBlock::new(1, 5, 3)];
     // Corrupt the trailing block so its payload length is not a multiple of its
     // row count.
     blocks[1].payload.pop();
 
-    let plan = truncate_plan(blocks.iter().map(|b| b.rows), &shape, 6);
+    let plan = truncate_plan(blocks.iter().map(|b| b.rows), &shape, target as i32);
+    assert_eq!(
+        plan.partial_rows, 2,
+        "the plan wanted 2 rows out of the trailing block"
+    );
     apply_truncate_plan(&mut blocks, &plan);
 
     assert_eq!(
@@ -305,6 +317,83 @@ fn apply_plan_drops_an_unsplittable_block() {
         vec![4],
         "an unsplittable trailing block is dropped whole"
     );
+    let covered: usize = blocks.iter().map(|b| b.rows).sum();
+    assert_eq!(
+        target - covered,
+        plan.partial_rows,
+        "the refusal leaves exactly the wanted rows uncovered — the gap a consumer \
+         will abort on, and the number the warn! reports"
+    );
+}
+
+/// At `b > 1` a sequence prefix is not a row prefix, so the plan carries one
+/// range per batch element and the split must gather them.
+///
+/// Without this the multi-range arm of `retain_rows_in` is never executed by any
+/// test — an untestable branch. The oracle is the untouched payload indexed at
+/// the rows a batch-major layout says survive, which shares no arithmetic with
+/// either the planner or the gather.
+#[test]
+fn apply_plan_gathers_per_batch_ranges_at_b_gt_1() {
+    let (b, kv_h, blk_seq, stride) = (2_usize, 2_usize, 4_usize, 3_usize);
+    let shape = [b as i32, kv_h as i32, 0, 8];
+    // One block: b * blk_seq * kv_h = 16 rows, laid out batch-major then
+    // sequence then kv-head.
+    let mut blocks = vec![FakeBlock::new(0, b * blk_seq * kv_h, stride)];
+    let before = blocks[0].payload.clone();
+
+    let keep_seq = 3_usize;
+    let plan = truncate_plan(blocks.iter().map(|b| b.rows), &shape, keep_seq as i32);
+    assert_eq!(plan.partial, vec![0..6, 8..14]);
+    apply_truncate_plan(&mut blocks, &plan);
+
+    // Oracle: rows (bi, s, h) with s < keep_seq, in batch-major order.
+    let mut expected: Vec<u32> = Vec::new();
+    for bi in 0..b {
+        for s in 0..keep_seq {
+            for h in 0..kv_h {
+                let row = (bi * blk_seq + s) * kv_h + h;
+                expected.extend_from_slice(&before[row * stride..(row + 1) * stride]);
+            }
+        }
+    }
+    assert_eq!(blocks[0].rows, b * keep_seq * kv_h);
+    assert_eq!(
+        blocks[0].payload, expected,
+        "the gather must keep each batch element's own sequence prefix"
+    );
+}
+
+/// The `Vec::truncate` fast path and the general gather agree.
+///
+/// `retain_rows_in` short-circuits the single-range-anchored-at-0 case (the only
+/// shape production reaches) to avoid an allocation per payload buffer per
+/// split. A fast path that disagreed with the general path would corrupt exactly
+/// the case that ships.
+#[test]
+#[allow(
+    clippy::single_range_in_vec_init,
+    reason = "a one-element slice of row ranges is the batch-1 plan shape, not a range \
+              that was meant to be collected"
+)]
+fn suffix_drop_fast_path_matches_the_general_gather() {
+    let (rows, stride) = (7_usize, 3_usize);
+    for keep in 0..=rows {
+        let mut fast: Vec<u32> = (0..(rows * stride) as u32).collect();
+        retain_rows_in(&mut fast, rows, &[0..keep]);
+
+        // Same cut expressed as two adjacent ranges, which cannot take the fast
+        // path and therefore runs the gather.
+        let mut general: Vec<u32> = (0..(rows * stride) as u32).collect();
+        let split_at = keep / 2;
+        retain_rows_in(&mut general, rows, &[0..split_at, split_at..keep]);
+
+        assert_eq!(
+            fast, general,
+            "fast path diverged from the gather at keep={keep}"
+        );
+        assert_eq!(fast.len(), keep * stride);
+    }
 }
 
 /// [`retain_rows_in`] leaves an empty buffer empty — an inactive sideband (the
