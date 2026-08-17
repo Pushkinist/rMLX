@@ -291,9 +291,16 @@ The trailing-comment scan is string-aware, so neither a URL in a one-line fn
 (`"http://…"`) nor a char literal of any payload form (`b'"'`, `'\x1b'`,
 `'\u{FFFD}'`, `'é'` — 18 such literals occur in the scanned tree) derails it;
 either would otherwise leave the scanner stuck "inside a string" for the rest of
-the line. It does **not** handle raw strings (the `\` in `r"a\"` is not an
-escape, and `r#"…"#` hashes are not tracked) or block comments: a `/* … */`
-spanning an item's opening line is read literally.
+the line. A non-ASCII payload is one character but two-to-four *bytes*, so where
+awk indexes bytes it is stepped by locating the closing quote with `index()`
+inside a bounded window rather than by a byte class — `index`, `substr`,
+`length` and `RLENGTH` all count in the same units in every awk, so the offset
+lands correctly either way. The step additionally requires the payload to begin
+with a non-ASCII unit, which is what keeps a lifetime tick followed by a nearby
+quote (`<'a>'x'`) from being consumed as though it were a literal. It does
+**not** handle raw strings (the `\` in `r"a\"` is not an escape, and `r#"…"#`
+hashes are not tracked) or block comments: a `/* … */` spanning an item's
+opening line is read literally.
 
 Still out of reach on the macro side: a `macro_rules!` with a **non-brace**
 delimiter (`macro_rules! m ( .. );`). Its name is captured so findings are
@@ -322,6 +329,22 @@ case pass. Every case therefore pins the exit code, the violation-class marker,
 the specific label the gate must name, and optionally a string that must not
 appear; the harness also refuses to run a case whose fixture directory is
 missing.
+
+**Every case runs once per awk on the machine.** The gate is an awk program and
+awk implementations genuinely disagree, so checking one proves less than it
+looks like it does. A bracket range of octal escapes (`[\300-\337]`, the obvious
+way to match a UTF-8 continuation byte) is accepted by BSD awk and is a *hard
+syntax error* in gawk — a gate written that way is green on a Mac and does not
+execute at all on the Linux CI runner, which is worse than the blind spot it
+closes. Byte-vs-character indexing differs too: gawk indexes characters under a
+UTF-8 locale where BSD awk and mawk index bytes, and `[[:print:]]` calls a
+continuation byte printable in BSD awk and mawk under UTF-8 but not under C.
+The harness therefore shims `awk` on `PATH` and re-runs itself under each of
+`awk`, `gawk` and `mawk` that exists (deduped by inode, so Debian's
+`awk` → `mawk` symlink counts once). **When only one is installed it says so** —
+a run that quietly checked a single implementation is the same
+"gate that cannot fail" shape the reason-assertions above exist to prevent.
+Install the others locally with `brew install gawk mawk`.
 
 ### Running them: `make gpu-test`
 

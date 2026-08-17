@@ -28,13 +28,67 @@
 # both directions at once: never flagged however much Metal it dispatches, and
 # never listed for the runner either.
 #
-# Exit 0 = every fixture produced its expected outcome.
+# EVERY CASE RUNS ONCE PER AWK ON THE MACHINE
+#   The gate is an awk program, and awk implementations genuinely disagree. A
+#   bracket range of octal escapes (`[\300-\337]`, the obvious way to match a
+#   UTF-8 continuation byte) is accepted by BSD awk and is a hard syntax error
+#   in gawk — so a gate green on a developer's Mac can be hard-DOWN on the Linux
+#   CI runner, which is strictly worse than the blind spot it exists to close.
+#   Byte-vs-character indexing and the POSIX classes differ too: `[[:print:]]`
+#   calls a UTF-8 continuation byte printable in BSD awk and mawk under a UTF-8
+#   locale but not under C, and gawk indexes characters where the others index
+#   bytes. A suite that checks one implementation cannot see any of that, so it
+#   runs under each — and when only one is installed it SAYS so rather than
+#   reporting a clean run that proved less than it looks like it did.
+#
+# Exit 0 = every fixture produced its expected outcome, under every awk present.
 
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GATE="$ROOT/scripts/check_gpu_tests_ignored.sh"
 FIX="$ROOT/scripts/fixtures/gpu_tests_ignored"
+
+# Outer pass: discover the awks and re-run this suite under each, shimming
+# `awk` onto PATH (the gate invokes `awk`, not an absolute path). The inner
+# runs set GATE_AWK_SHIM and fall straight through to the cases below.
+if [ -z "${GATE_AWK_SHIM:-}" ]; then
+    awks=()
+    for cand in awk gawk mawk; do
+        found="$(command -v "$cand" 2>/dev/null)" || continue
+        [ -n "$found" ] || continue
+        dup=0
+        for seen in ${awks[@]+"${awks[@]}"}; do
+            # Same file under two names (Debian's `awk` -> `mawk`) is one
+            # implementation, not two.
+            if [ "$found" -ef "$seen" ]; then dup=1; break; fi
+        done
+        [ "$dup" -eq 0 ] && awks+=("$found")
+    done
+
+    if [ ${#awks[@]} -eq 0 ]; then
+        echo "ERROR: no awk found — the gate cannot run, so this suite proves nothing." >&2
+        exit 1
+    fi
+    if [ ${#awks[@]} -eq 1 ]; then
+        echo "NOTE: only one awk implementation here (${awks[0]}). This run does NOT"
+        echo "      cover the gate's awk portability: a construct BSD awk accepts and"
+        echo "      gawk rejects outright leaves this suite green and CI hard-down."
+        echo "      \`brew install gawk mawk\` (or apt) to check it here, not in CI."
+    fi
+
+    shim_root="$(mktemp -d)"
+    trap 'rm -rf "$shim_root"' EXIT
+    rc=0
+    for impl in "${awks[@]}"; do
+        shim="$shim_root/$(basename "$impl")"
+        mkdir -p "$shim"
+        ln -sf "$impl" "$shim/awk"
+        echo "== awk: $impl =="
+        GATE_AWK_SHIM=1 PATH="$shim:$PATH" bash "${BASH_SOURCE[0]}" || rc=1
+    done
+    exit "$rc"
+fi
 
 VIOLATION="ERROR: GPU-touching tests missing the #[ignore]"
 UNREADABLE="ERROR: a macro_rules! body declares #[test] items this gate cannot read"

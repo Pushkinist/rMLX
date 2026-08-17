@@ -217,6 +217,20 @@
 #   not tracked) and block comments — a `/* … */` spanning an item's opening
 #   line is read literally.
 #
+#   PORTABLE AWK ONLY — this runs on the developer's BSD awk and on whatever
+#   the Linux CI image provides. Two constructs are out of bounds because they
+#   do not mean the same thing everywhere, and getting them wrong takes the gate
+#   from "narrow" to "does not execute at all":
+#     * a bracket RANGE whose endpoints are escapes (`[\300-\337]`) — a hard
+#       syntax error in gawk, silently accepted by BSD awk and mawk;
+#     * the POSIX classes as a stand-in for "is this byte ASCII" — BSD awk and
+#       mawk call a UTF-8 continuation byte `[[:print:]]` under a UTF-8 locale
+#       and not under C, and gawk indexes characters where they index bytes.
+#   Prefer `index()` / `substr()` arithmetic, which counts in the same units as
+#   `length()` and `RLENGTH` in every implementation.
+#   `scripts/check_gpu_tests_ignored_fixtures.sh` re-runs its whole corpus under
+#   every awk installed, so a violation of this surfaces there.
+#
 # Exit 0 = clean. Exit 1 = violation (or a scan that found nothing to check).
 
 set -euo pipefail
@@ -337,7 +351,7 @@ read -r -d '' AWK_DETECT <<'AWK' || true
     # the everyday case — is not a comment, and cutting there would end the
     # line in mid-string and flip every decision that reads its last
     # character.
-    function bare(s,   i, n, q, c, rest) {
+    function bare(s,   i, n, q, c, rest, w, ascii) {
         n = length(s)
         q = 0
         for (i = 1; i <= n; i++) {
@@ -355,11 +369,30 @@ read -r -d '' AWK_DETECT <<'AWK' || true
                 if (match(rest, /^\\u\{[0-9a-fA-F][0-9a-fA-F]*\}'/) \
                  || match(rest, /^\\x[0-9a-fA-F][0-9a-fA-F]'/) \
                  || match(rest, /^\\.'/) \
-                 || match(rest, /^[\300-\337][\200-\277]'/) \
-                 || match(rest, /^[\340-\357][\200-\277][\200-\277]'/) \
-                 || match(rest, /^[\360-\367][\200-\277][\200-\277][\200-\277]'/) \
                  || match(rest, /^[^'\\]'/)) {
                     i += RLENGTH
+                    continue
+                }
+                # A non-ASCII payload (`'é'`) is ONE character but 2-4 bytes, so
+                # the one-unit shape above does not match it where substr walks
+                # bytes. Locate the closing quote by INDEX in a bounded window:
+                # index/substr/length/RLENGTH all count in the same units in
+                # every awk, so the offset lands correctly whether the
+                # implementation walks bytes or characters.
+                #
+                # Deliberately not a byte class. `[\300-\337]` is a hard syntax
+                # error in gawk (the gate then does not run AT ALL, which is
+                # worse than the blind spot it closes), and `[[:print:]]` is no
+                # better: BSD awk and mawk both classify a UTF-8 continuation
+                # byte as printable under a UTF-8 locale but not under C. An
+                # index() against a literal ASCII set is locale-independent, and
+                # it is also what stops a lifetime tick with a nearby quote
+                # (`<'a>'x'`) from being stepped as though it were a literal.
+                ascii = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+                w = index(substr(rest, 1, 5), "'")
+                if (w >= 3 && index(ascii, substr(rest, 1, 1)) == 0 \
+                 && index(substr(rest, 1, w - 1), "\\") == 0) {
+                    i += w
                 }
                 continue
             }
