@@ -105,7 +105,7 @@ mutually exclusive.
 | `--draft-block-size` | usize | 4 | Tokens proposed per speculative round. Env: `MLX_VLM_DRAFT_BLOCK_SIZE`. |
 | `--max-tokens-cap` | u32 | `u32::MAX` | Per-request `max_tokens` ceiling. Requests exceeding this receive HTTP 400. |
 | `--max-timeout-secs` | u64 | 600 | Server-startup wall-clock timeout cap per request in seconds. `0` disables. |
-| `--require-smoke-probe` | bool flag | off | Run 8-token smoke probe on every model load; reject `BrokenPunctLoop` / `BrokenNan` results with HTTP 503. |
+| `--require-smoke-probe` | bool flag | off | Run 8-token smoke probe on every model load; reject `BrokenPunctLoop` / `BrokenNan` results with HTTP 503. In practice only `BrokenPunctLoop` fires: every path that can see a NaN logit row now aborts the request where it is detected, so no `ProbeStep` reaching the classifier carries a non-zero `nan_count`. A NaN surfaces as a failed request with an `error = %e` / `nan_count` event, not as a smoke verdict. |
 | `--max-loaded-models` | usize | 1 | Maximum models held resident in GPU memory. LRU eviction when exceeded. Also bounds registry eager-preload: only the alphabetically-first `min(cap, N)` model ids are warmed at boot (anything beyond the cap would be evicted by the next load, so preloading it is pure waste). |
 | `--max-queue-depth` | usize | 64 | FIFO admission queue depth. Requests beyond this limit receive HTTP 429. `0` = unlimited. |
 | `--adaptive-admission` | bool flag | off | Enable the in-process adaptive admission controller. When set, the controller adjusts `max_queue_depth` dynamically based on SLA telemetry and rejects requests with HTTP 503 + `Retry-After: 5` when the end-to-end step estimate exceeds `2 × step-target-ms`. When absent, the static `--max-queue-depth` is used unchanged. |
@@ -305,7 +305,7 @@ rmlx info --model /path/to/snapshot --probe-smoke
 | `--model` | path | — | Path to the model snapshot directory. Required unless `--list-cache-types` is set. |
 | `--device` | `cpu \| gpu` | `gpu` | Device for probe passes (`--probe-forward`, `--probe-smoke`). |
 | `--probe-forward` | bool flag | off | Run a single-token forward pass and print the top-1 token + max logit. |
-| `--probe-smoke` | bool flag | off | Run the 8-token smoke probe and classify the snapshot. Exit codes: `0` = ok, `1` = broken (`BrokenPunctLoop`/`BrokenNan`), `3` = load-fail (supported arch failed to load), `4` = inconclusive (too few steps), `5` = unsupported arch. `2` is reserved by clap for argument errors. |
+| `--probe-smoke` | bool flag | off | Run the 8-token smoke probe and classify the snapshot. Exit codes: `0` = ok, `1` = broken (`BrokenPunctLoop`; `BrokenNan` is classified but no longer reachable — see `--require-smoke-probe` above), `3` = load-fail (supported arch failed to load), `4` = inconclusive (too few steps), `5` = unsupported arch. `2` is reserved by clap for argument errors. |
 | `--kv-quant` | string | `auto` | KV cache quantization preset. |
 | `--kv-preset` | string | — | Named KV-cache preset. Mutually exclusive with `--kv-quant`, `--cache-type-k`, `--cache-type-v`, `--kv-bits`. Values: `auto` (hardware-aware selector), `fp16`, `q8`, `speed`, `quality`, `planar`, `k_only_planar`. |
 | `--cache-type-k` / `--ctk` | string | — | Per-side K codec. Mutually exclusive with `--kv-quant`. |
@@ -373,6 +373,29 @@ most Metal-allocator bytes live at once during generation (it includes the
 resident weights), and `metal_gen_alloc_mb` is that minus what was already live
 when generation started. **Only `metal_gen_alloc_mb` compares between two runs
 of the same model.** Both read `0` where no Metal allocator is present.
+
+#### When there is no summary line
+
+`baseline` runs exactly one generation per process with EOS-stop disabled, and
+every architecture reports its KV-cache byte total through the same per-instance
+counter. If that counter's sequence has not advanced across the call, the
+generation left before its post-decode store — it ended early on a path that did
+not report a failure. That is **refused**, not warned: no summary line, no
+metrics record, non-zero exit. `rmlx bench` already refuses the identical
+verdict. Downgrading it to a warning printed a full summary and, under
+`--record`, wrote a permanent row in the append-only store from a run that never
+generated.
+
+A reported-but-zero byte count is different and stays a warning: there the
+generation completed and only its `kv_cache_bytes` column is unusable, so the
+column is omitted and the timing measurement stands.
+
+The two commands therefore **agree on `Unreported` and deliberately diverge on
+`ReportedZero`**, which `bench` also refuses. That is a difference in product,
+not an oversight: `bench` records `kv_cache_bytes` as a first-class result, so a
+broken byte count voids its output, whereas `baseline`'s product is a timing row
+that survives a missing KV column. `Unreported` is the case where the generation
+never finished at all, which voids both.
 
 #### GPU-capture flags (debug builds only)
 

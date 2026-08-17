@@ -863,3 +863,113 @@ fn chunked_prefill_rejects_empty_prompt() {
          fatal, or a doomed request is replayed; got: {err:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// reject_nan_prefill
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reject_nan_prefill_passes_a_clean_row_through() {
+    // Output neutrality: on every healthy prefill the guard must be invisible.
+    //
+    // This is the half of the mutation check that catches an ALWAYS-FIRE
+    // mutation (deleting the `nan_count == 0` early return, or making the guard
+    // unconditional); the Err test below catches a NEVER-FIRE one (deleting the
+    // guard body). Inverting the comparison turns BOTH red, which is why the
+    // pair is needed rather than either alone.
+    for dtype in [Dtype::F32, Dtype::Bf16] {
+        assert!(
+            reject_nan_prefill("TestArch", dtype, 0, 42.5, 4096).is_ok(),
+            "a NaN-free {dtype:?} prefill must pass through untouched"
+        );
+    }
+}
+
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: expect_err IS the assertion — an Ok here is the regression under test, and its panic names it"
+)]
+fn reject_nan_prefill_propagates_and_is_replayable() {
+    let err = reject_nan_prefill("TestArch", Dtype::F32, 7, 12.5, 3770)
+        .expect_err("a NaN prefill must surface as Err, not a one-token Ok run");
+    let msg = err.to_string();
+    // Assert the LABELLED substrings, not the bare numbers: `prompt_len = 3770`
+    // contains two 7s, so a bare `contains('7')` stays green after `{nan_count}`
+    // is deleted from the format string. All three fields the operator is
+    // promised are asserted.
+    assert!(
+        msg.contains("TestArch"),
+        "cause must name the arch, got: {msg}"
+    );
+    assert!(
+        msg.contains("contain 7 NaN cells"),
+        "cause must carry nan_count, got: {msg}"
+    );
+    assert!(
+        msg.contains("max|logit| = 12.5"),
+        "cause must carry max_abs_logit, got: {msg}"
+    );
+    assert!(
+        msg.contains("prompt_len = 3770"),
+        "cause must carry prompt_len, got: {msg}"
+    );
+    // This fault is intermittent, unlike the deterministic empty-prompt case
+    // above, so the retry envelope should be allowed to replay it. Raising it
+    // before the OFFENDING token reaches step_fn is what makes that safe. At the
+    // six prefill sites the delivered prefix is empty, so there is nothing to
+    // diverge from; at the one mid-decode site the already-delivered prefix is
+    // healthy and retry.rs's prefix-identity assertion covers it. `Error::Model`
+    // would classify Fatal and surface a 5xx for a fault a retry usually clears.
+    assert!(
+        err.is_migratable(),
+        "the NaN cause must be a variant the retry envelope may replay; got: {err:?}"
+    );
+}
+
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: expect_err IS the assertion — an Ok here is the regression under test, and its panic names it"
+)]
+fn reject_nan_prefill_refuses_a_dtype_the_scan_cannot_read() {
+    // `count_nan_in_bytes` returns 0 for every dtype outside {F32, Bf16}, which
+    // collapses "no NaN" with "never examined". F16 is first-class loadable, so
+    // without this refusal a fully-NaN fp16 logit row reports clean and the
+    // whole guard is inert — a fail-open, the same detect/parse conflation that
+    // produced a wrong permanent metrics row elsewhere in this repo.
+    //
+    // `nan_count = 0` on purpose: that is exactly what the scan reports for an
+    // unreadable row, so this test fails if the dtype check is removed.
+    let err = reject_nan_prefill("TestArch", Dtype::F16, 0, 0.0, 3770)
+        .expect_err("an unreadable logit dtype must be refused, not reported clean");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("NEVER CHECKED"),
+        "cause must say the row was not examined rather than that it was clean, got: {msg}"
+    );
+    assert!(msg.contains("F16"), "cause must name the dtype, got: {msg}");
+    assert!(
+        err.is_migratable(),
+        "same envelope class as the NaN refusal; got: {err:?}"
+    );
+}
+
+#[test]
+fn reject_nan_prefill_only_trusts_dtypes_the_scan_actually_reads() {
+    // Pins the readable set to exactly what `count_nan_in_bytes` implements.
+    // Adding a float dtype to `Dtype` without teaching the scan to read it must
+    // land in the refused bucket, not silently in the trusted one.
+    for dtype in [Dtype::F32, Dtype::Bf16] {
+        assert!(
+            reject_nan_prefill("TestArch", dtype, 0, 1.0, 8).is_ok(),
+            "{dtype:?} is readable by the scan and must be trusted"
+        );
+    }
+    for dtype in [Dtype::F16, Dtype::U8, Dtype::U32, Dtype::I32] {
+        assert!(
+            reject_nan_prefill("TestArch", dtype, 0, 1.0, 8).is_err(),
+            "{dtype:?} is not readable by the scan and must be refused, not trusted"
+        );
+    }
+}
