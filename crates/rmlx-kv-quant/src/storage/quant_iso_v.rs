@@ -79,7 +79,7 @@ impl super::BlockRows for IsoBlocks {
     /// The exhaustive destructure is the drift guard: a new payload field
     /// cannot be added without this failing to compile, which is what stops a
     /// buffer from surviving a mid-block truncation at its full length.
-    fn retain_rows(&mut self, ranges: &[std::ops::Range<usize>], rows: usize) -> bool {
+    fn retain_rows(&mut self, rows: usize) -> bool {
         let Self {
             codes,
             scales,
@@ -88,13 +88,13 @@ impl super::BlockRows for IsoBlocks {
             n_tokens,
         } = self;
         let lengths = [codes.len(), scales.len(), quaternions.len(), norms.len()];
-        if !super::rows_split_ok(&lengths, *n_tokens, ranges) {
+        if !super::rows_split_ok(&lengths, *n_tokens, rows) {
             return false;
         }
-        super::retain_rows_in(codes, *n_tokens, ranges);
-        super::retain_rows_in(scales, *n_tokens, ranges);
-        super::retain_rows_in(quaternions, *n_tokens, ranges);
-        super::retain_rows_in(norms, *n_tokens, ranges);
+        super::retain_rows_in(codes, *n_tokens, rows);
+        super::retain_rows_in(scales, *n_tokens, rows);
+        super::retain_rows_in(quaternions, *n_tokens, rows);
+        super::retain_rows_in(norms, *n_tokens, rows);
         *n_tokens = rows;
         true
     }
@@ -359,9 +359,9 @@ impl QuantIsoV3 {
         // Lower the GPU mirror offset; underlying buffer untouched (matches
         // `QuantV::truncate` semantics — the trailing tokens become logically
         // free and the next `append_gpu` overwrites them via `slice_update`).
-        let n_clamped = n.max(0);
-        if self.gpu_offset > n_clamped {
-            self.gpu_offset = n_clamped;
+        // `n` is already clamped at the top of this function.
+        if self.gpu_offset > n {
+            self.gpu_offset = n;
         }
     }
 

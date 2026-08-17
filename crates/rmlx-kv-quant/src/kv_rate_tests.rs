@@ -367,66 +367,111 @@ fn rotor_rate_splits_into_documented_code_scale_and_norm_bits() {
     );
 }
 
-/// Number of `KvQuant` variants the `axes` match below enumerates.
-///
-/// The match is exhaustive, so a new variant fails to compile until it names its
-/// store families — but naming a family is not the same as being *measured*.
-/// Only variants present in the `variants` array below have their rate
-/// evaluated, and that array is hand-written. This constant is the mechanical
-/// link between the two: adding an `axes` arm without adding a representative to
-/// `variants` fails the length assertion.
-const KV_QUANT_VARIANT_COUNT: usize = 29;
-
 /// Every `KvQuant` variant states which store family each of its axes uses, and
 /// every variant is actually measured.
 ///
-/// Exhaustive on purpose: a new variant fails to compile until its rate is
-/// accounted for. `Mixed` / `RotK` / the asym variants carry runtime bit and
-/// group fields and map to the `affine` family — whose entry bounds the
-/// *enumerable* cache types only, not every parseable config (see
+/// Three links carry the guarantee, and no side of any comparison is a
+/// hand-maintained count:
+///
+/// 1. `arm_index` is an exhaustive `match`, so a new `KvQuant` variant does not
+///    **compile** until it takes an index.
+/// 2. `axes` reads `AXES_BY_ARM` by that index, so a variant whose index is past
+///    the array **panics** rather than being skipped — the author has to extend
+///    the array and say where the new codec's bytes go.
+/// 3. The coverage assertion compares the representatives' indices against
+///    `AXES_BY_ARM.len()`, which link 2 has already forced to grow. So the new
+///    variant is still not measured until a representative reaches `variants`.
+///
+/// An earlier shape here compared a hand-written `KV_QUANT_VARIANT_COUNT`
+/// against `variants.len()`. Both sides were hand-maintained, so a variant that
+/// got its families named and nothing else passed green — exactly the case the
+/// doc claimed was impossible.
+///
+/// `Mixed` / `RotK` / the asym variants carry runtime bit and group fields and
+/// map to the `affine` family — whose entry bounds the *enumerable* cache types
+/// only, not every parseable config (see
 /// [`mixed_grammar_admits_affine_rates_above_the_floor`]).
 #[test]
 fn every_kv_quant_variant_names_its_store_families() {
+    // `[k_family, v_family]` per arm index, in the same order as `arm_index`.
+    // Deliberately an array and not a second match: an arm index past its end
+    // panics, and that panic is the link that forces a new variant to extend it.
+    const AXES_BY_ARM: [[&str; 2]; 29] = [
+        ["bf16", "bf16"],     // None
+        ["q8", "q8"],         // K8V8
+        ["q8", "turbo4"],     // K8V4
+        ["q8", "turbo4"],     // RotKTq4V
+        ["q8", "planar4"],    // Planar
+        ["q8", "planar3"],    // Planar3
+        ["planar4", "bf16"],  // PlanarK
+        ["affine", "affine"], // Mixed
+        ["affine", "affine"], // RotK
+        ["q8", "turbo3"],     // K8VTurbo3
+        ["q8", "tcq3"],       // K8VTurbo3Tcq
+        ["q8", "turbo2"],     // K8VTurbo2
+        ["q8", "tcq2"],       // K8VTurbo2Tcq
+        ["turbo3", "turbo3"], // TurboSym3
+        ["turbo4", "turbo4"], // TurboSym4
+        ["q8", "iso3"],       // Iso3
+        ["q8", "iso4"],       // Iso4
+        ["iso3", "iso3"],     // Iso3Sym
+        ["iso4", "iso4"],     // Iso4Sym
+        ["iso3", "bf16"],     // IsoKOnly3
+        ["iso4", "bf16"],     // IsoKOnly4
+        ["q8", "rotor3"],     // Rotor3
+        ["q8", "rotor4"],     // Rotor4
+        ["rotor3", "rotor3"], // Rotor3Sym
+        ["rotor4", "rotor4"], // Rotor4Sym
+        ["rotor3", "bf16"],   // RotorKOnly3
+        ["rotor4", "bf16"],   // RotorKOnly4
+        ["rotor3", "affine"], // RotorK3Asym
+        ["rotor4", "affine"], // RotorK4Asym
+    ];
+
     let data = fixture();
 
-    #[allow(
-        clippy::match_same_arms,
-        reason = "one arm per variant even when two share a family — merging them hides which \
-                  codecs were considered, and this match exists to be read variant by variant"
-    )]
-    let axes = |q: &KvQuant| -> [&'static str; 2] {
+    // Distinct index per variant. Exhaustive on purpose — see the doc above.
+    let arm_index = |q: &KvQuant| -> usize {
         match q {
-            KvQuant::None => ["bf16", "bf16"],
-            KvQuant::K8V8 => ["q8", "q8"],
-            KvQuant::K8V4 => ["q8", "turbo4"],
-            KvQuant::RotKTq4V => ["q8", "turbo4"],
-            KvQuant::Planar => ["q8", "planar4"],
-            KvQuant::Planar3 => ["q8", "planar3"],
-            KvQuant::PlanarK => ["planar4", "bf16"],
-            KvQuant::Mixed { .. } => ["affine", "affine"],
-            KvQuant::RotK { .. } => ["affine", "affine"],
-            KvQuant::K8VTurbo3 => ["q8", "turbo3"],
-            KvQuant::K8VTurbo3Tcq => ["q8", "tcq3"],
-            KvQuant::K8VTurbo2 => ["q8", "turbo2"],
-            KvQuant::K8VTurbo2Tcq => ["q8", "tcq2"],
-            KvQuant::TurboSym3 => ["turbo3", "turbo3"],
-            KvQuant::TurboSym4 => ["turbo4", "turbo4"],
-            KvQuant::Iso3 => ["q8", "iso3"],
-            KvQuant::Iso4 => ["q8", "iso4"],
-            KvQuant::Iso3Sym => ["iso3", "iso3"],
-            KvQuant::Iso4Sym => ["iso4", "iso4"],
-            KvQuant::IsoKOnly3 => ["iso3", "bf16"],
-            KvQuant::IsoKOnly4 => ["iso4", "bf16"],
-            KvQuant::Rotor3 => ["q8", "rotor3"],
-            KvQuant::Rotor4 => ["q8", "rotor4"],
-            KvQuant::Rotor3Sym => ["rotor3", "rotor3"],
-            KvQuant::Rotor4Sym => ["rotor4", "rotor4"],
-            KvQuant::RotorKOnly3 => ["rotor3", "bf16"],
-            KvQuant::RotorKOnly4 => ["rotor4", "bf16"],
-            KvQuant::RotorK3Asym { .. } => ["rotor3", "affine"],
-            KvQuant::RotorK4Asym { .. } => ["rotor4", "affine"],
+            KvQuant::None => 0,
+            KvQuant::K8V8 => 1,
+            KvQuant::K8V4 => 2,
+            KvQuant::RotKTq4V => 3,
+            KvQuant::Planar => 4,
+            KvQuant::Planar3 => 5,
+            KvQuant::PlanarK => 6,
+            KvQuant::Mixed { .. } => 7,
+            KvQuant::RotK { .. } => 8,
+            KvQuant::K8VTurbo3 => 9,
+            KvQuant::K8VTurbo3Tcq => 10,
+            KvQuant::K8VTurbo2 => 11,
+            KvQuant::K8VTurbo2Tcq => 12,
+            KvQuant::TurboSym3 => 13,
+            KvQuant::TurboSym4 => 14,
+            KvQuant::Iso3 => 15,
+            KvQuant::Iso4 => 16,
+            KvQuant::Iso3Sym => 17,
+            KvQuant::Iso4Sym => 18,
+            KvQuant::IsoKOnly3 => 19,
+            KvQuant::IsoKOnly4 => 20,
+            KvQuant::Rotor3 => 21,
+            KvQuant::Rotor4 => 22,
+            KvQuant::Rotor3Sym => 23,
+            KvQuant::Rotor4Sym => 24,
+            KvQuant::RotorKOnly3 => 25,
+            KvQuant::RotorKOnly4 => 26,
+            KvQuant::RotorK3Asym { .. } => 27,
+            KvQuant::RotorK4Asym { .. } => 28,
         }
     };
+
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "the panic is the mechanism: an arm index past AXES_BY_ARM means a new \
+                  variant took an index without declaring where its bytes go, and this test \
+                  must fail rather than skip it"
+    )]
+    let axes = |q: &KvQuant| -> [&'static str; 2] { AXES_BY_ARM[arm_index(q)] };
 
     // One representative per variant shape; the field values do not change which
     // family an axis stores in.
@@ -476,16 +521,22 @@ fn every_kv_quant_variant_names_its_store_families() {
         },
     ];
 
-    // The compile-time half of the guarantee only forces a family NAME. Without
-    // this, a new variant plus a new `axes` arm compiles and runs green while
-    // never being measured, because nothing adds it to `variants`.
+    // The compile-time link only forces a family NAME. This is the other half:
+    // the representatives must cover every arm index of `AXES_BY_ARM` with no
+    // gaps, so a new variant that named its families but got no representative
+    // fails here instead of passing unmeasured. Both sides are derived — the
+    // left from the exhaustive `arm_index`, the right from the array that
+    // `arm_index` forces to grow.
+    let mut seen: Vec<usize> = variants.iter().map(arm_index).collect();
+    seen.sort_unstable();
+    seen.dedup();
+    let expected: Vec<usize> = (0..AXES_BY_ARM.len()).collect();
     assert_eq!(
-        variants.len(),
-        KV_QUANT_VARIANT_COUNT,
-        "the `axes` match enumerates {KV_QUANT_VARIANT_COUNT} variants but only \
-         {} are measured — add a representative for the new variant and bump the \
-         constant together",
-        variants.len(),
+        seen, expected,
+        "the representative variants must cover every arm index of AXES_BY_ARM, with no \
+         gaps and no duplicates. A missing index means a variant declared its families \
+         but has no representative, so its rate is never evaluated — add one to \
+         `variants`. A duplicate means two representatives share an arm index"
     );
 
     for q in &variants {

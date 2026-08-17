@@ -19,7 +19,7 @@ use crate::clifford::make_rotor_table;
 use crate::quant::KvQuant;
 use crate::rotor_flash_decode_msl::rotor_flash_decode_dispatch_count;
 use crate::rotorquant::{make_qjl_projection, n_groups_for};
-use crate::storage::{KvStorage, QuantRotorK3, QuantRotorK4};
+use crate::storage::{KvStorage, QuantRotorK3, QuantRotorK4, QuantRotorV3, QuantRotorV4};
 use crate::test_utils::{lcg_data, skip_if_no_gpu_env};
 use rmlx_core::DispatchPolicy;
 use rmlx_mlx::{Array, Device, Dtype};
@@ -157,6 +157,54 @@ fn rotor_k_ring_live(cache: &KvCache) -> bool {
         ks.gpu.is_allocated()
     } else {
         false
+    }
+}
+
+/// Build a symmetric rotor cache with QJL pinned off, the same way
+/// [`seeded_cache`] pins it for the K-only variants: a pre-seeded rotor table
+/// means neither append path re-enters its `rotors.is_empty()` lazy-init, so
+/// `qjl_s_matrix` stays `None` whatever the process-global toggle says.
+fn seeded_sym_cache(quant: KvQuant, kv_h: i32, head_dim: i32) -> KvCache {
+    let n_groups = n_groups_for(head_dim as usize);
+    let rotors = make_rotor_table(0, 0, n_groups);
+    let shape = vec![1, kv_h, 0, head_dim];
+
+    let storage = if quant == KvQuant::Rotor4Sym {
+        KvStorage::RotorSym4 {
+            k: Some(QuantRotorK4::from_cpu_blocks(
+                rotors,
+                None,
+                Vec::new(),
+                shape.clone(),
+                0,
+            )),
+            v: Some(QuantRotorV4::new(shape, MAX_SEQ, 0)),
+            max_seq: MAX_SEQ,
+        }
+    } else {
+        KvStorage::RotorSym3 {
+            k: Some(QuantRotorK3::from_cpu_blocks(
+                rotors,
+                None,
+                Vec::new(),
+                shape.clone(),
+                0,
+            )),
+            v: Some(QuantRotorV3::new(shape, MAX_SEQ, 0)),
+            max_seq: MAX_SEQ,
+        }
+    };
+    KvCache::from_storage(storage, quant, 0, 0, DispatchPolicy::default())
+}
+
+/// `(cpu blocks, ring live)` for the K axis of the active symmetric rotor store.
+fn sym_k_store_state(cache: &KvCache) -> (usize, bool) {
+    if let KvStorage::RotorSym3 { k: Some(ks), .. } = cache.storage() {
+        (ks.blocks.len(), ks.gpu.is_allocated())
+    } else if let KvStorage::RotorSym4 { k: Some(ks), .. } = cache.storage() {
+        (ks.blocks.len(), ks.gpu.is_allocated())
+    } else {
+        (0, false)
     }
 }
 
@@ -656,8 +704,10 @@ fn rotor_k_only_4_ring_only_tail_truncate_then_decode() {
 #[allow(clippy::expect_used, reason = "test: invariants documented")]
 fn multi_token_append_after_fused_decode_takes_the_block_path(quant: KvQuant) {
     let device = Device::Gpu;
+    // `prefill = 24` matches every other dispatch test in this file; the value
+    // is not load-bearing here but a lone outlier invites the question.
     let (kv_h, n_q_heads, head_dim, prefill, steps, second) =
-        (2_i32, 8_i32, 128_i32, 6_i32, 4_i32, 3_i32);
+        (2_i32, 8_i32, 128_i32, 24_i32, 4_i32, 3_i32);
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
 
     let mut cache = seeded_cache(quant, kv_h, head_dim, false);
@@ -674,6 +724,10 @@ fn multi_token_append_after_fused_decode_takes_the_block_path(quant: KvQuant) {
     cache.exit_prefill(device).expect("exit_prefill");
 
     // Fused decode steps: these drop the CPU blocks once the ring is live.
+    // Count the dispatches so a fused-arm fall-through is reported as such —
+    // otherwise the `blocks_len == 0` precondition below fails and blames
+    // `drop_blocks_when_ring_live_*` for a fault in the SDPA dispatcher.
+    let before = rotor_flash_decode_dispatch_count();
     for step in 0..steps as u64 {
         let one = (kv_h * head_dim) as usize;
         let k1 = f32_array(&lcg_data(one, 710 + step), &[1, kv_h, 1, head_dim]);
@@ -688,6 +742,13 @@ fn multi_token_append_after_fused_decode_takes_the_block_path(quant: KvQuant) {
             .eval()
             .expect("decode out eval");
     }
+    let delta = rotor_flash_decode_dispatch_count() - before;
+    assert!(
+        delta >= steps as u64,
+        "precondition: the fused flash kernel must have run for every decode step \
+         ({delta} dispatches for {steps} steps). A shortfall is a dispatcher fault, \
+         not a truncation one — read sdpa.rs before this file"
+    );
     assert_eq!(
         rotor_k_blocks_len(&cache),
         0,
@@ -736,4 +797,97 @@ fn rotor_k_only_4_multi_token_append_after_fused_decode_takes_the_block_path() {
         return;
     }
     multi_token_append_after_fused_decode_takes_the_block_path(KvQuant::RotorKOnly4);
+}
+
+/// Sym sibling of [`multi_token_append_after_fused_decode_takes_the_block_path`],
+/// pinning the **other** legacy feed.
+///
+/// `LEGACY_ROTOR_SYM_FEED` is `Skip`, so the block-path append drops the ring
+/// and leaves the CPU blocks as the only copy of the prefix. That is the state
+/// in which a mid-block speculative truncation is unrecoverable, which makes
+/// this the feed the truncation fix matters most for — and, before this test,
+/// the one with no behavioural coverage at all.
+///
+/// The three feeds are mutually exclusive here: `Skip` drops the ring and pushes
+/// a block, `Maintain` keeps the ring and pushes a block, `MaintainRingOnly`
+/// pushes no block. Both assertions together admit only `Skip`.
+#[allow(clippy::expect_used, reason = "test: invariants documented")]
+fn sym_multi_token_append_after_fused_decode_drops_the_ring(quant: KvQuant) {
+    let device = Device::Gpu;
+    let (kv_h, n_q_heads, head_dim, prefill, steps, second) =
+        (2_i32, 8_i32, 128_i32, 24_i32, 4_i32, 3_i32);
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    let mut cache = seeded_sym_cache(quant, kv_h, head_dim);
+    let pf_n = (prefill * kv_h * head_dim) as usize;
+    let k = f32_array(&lcg_data(pf_n, 801), &[1, kv_h, prefill, head_dim]);
+    let v = f32_array(&lcg_data(pf_n, 802), &[1, kv_h, prefill, head_dim]);
+    let q = f32_array(
+        &lcg_data((prefill * n_q_heads * head_dim) as usize, 803),
+        &[1, n_q_heads, prefill, head_dim],
+    );
+    cache
+        .update_and_sdpa(&q, &k, &v, scale, "causal", None, device)
+        .expect("prefill update_and_sdpa");
+    cache.exit_prefill(device).expect("exit_prefill");
+
+    for step in 0..steps as u64 {
+        let one = (kv_h * head_dim) as usize;
+        let k1 = f32_array(&lcg_data(one, 810 + step), &[1, kv_h, 1, head_dim]);
+        let v1 = f32_array(&lcg_data(one, 820 + step), &[1, kv_h, 1, head_dim]);
+        let q1 = f32_array(
+            &lcg_data((n_q_heads * head_dim) as usize, 830 + step),
+            &[1, n_q_heads, 1, head_dim],
+        );
+        cache
+            .update_and_sdpa(&q1, &k1, &v1, scale, "", None, device)
+            .expect("decode update_and_sdpa")
+            .eval()
+            .expect("decode out eval");
+    }
+
+    // The transition under test: q_seq > 1 on the same cache, b == 1.
+    let sec_n = (second * kv_h * head_dim) as usize;
+    let k2 = f32_array(&lcg_data(sec_n, 840), &[1, kv_h, second, head_dim]);
+    let v2 = f32_array(&lcg_data(sec_n, 841), &[1, kv_h, second, head_dim]);
+    let q2 = f32_array(
+        &lcg_data((second * n_q_heads * head_dim) as usize, 842),
+        &[1, n_q_heads, second, head_dim],
+    );
+    cache
+        .update_and_sdpa(&q2, &k2, &v2, scale, "causal", None, device)
+        .expect("multi-token append after fused decode")
+        .eval()
+        .expect("out eval");
+
+    let (blocks_len, ring_live) = sym_k_store_state(&cache);
+    assert!(
+        blocks_len > 0,
+        "the legacy sym entry must push a CPU block — a ring-only feed would leave \
+         `blocks` empty and the store with no copy at all once the ring is dropped"
+    );
+    assert!(
+        !ring_live,
+        "the legacy sym entry must drop the ring — if it kept one, the CPU blocks \
+         would no longer be the sole copy and the mid-block truncation hazard this \
+         feed defines would not apply"
+    );
+}
+
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_dispatch -- --ignored --test-threads=1"]
+fn rotor_sym3_multi_token_append_after_fused_decode_drops_the_ring() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    sym_multi_token_append_after_fused_decode_drops_the_ring(KvQuant::Rotor3Sym);
+}
+
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test rotor_flash_dispatch -- --ignored --test-threads=1"]
+fn rotor_sym4_multi_token_append_after_fused_decode_drops_the_ring() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    sym_multi_token_append_after_fused_decode_drops_the_ring(KvQuant::Rotor4Sym);
 }

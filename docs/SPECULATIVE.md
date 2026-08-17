@@ -127,16 +127,22 @@ legacy `update_rotor{3,4}_sym` / asym appends, which clear the ring by design.
 Those are exactly the paths a `q_seq > 1` verifier forward takes, since the
 fused decode entry is gated on `q_seq == 1`.
 
-**Scope.** The split covers the rotor and iso block stores only. `QuantV`
-(`Vec<TurboBlocks>`) and `QuantPlanarV` / `QuantPlanarK` (`Vec<PlanarBlocks>`)
-accumulate CPU blocks the same way, but `KvStorage::truncate_to` only lowers
-`shape[2]` for `K8V4` / `K8V8` / `Planar` / `PlanarK` / `TurboSym3/4` /
-`K8VTurbo2/3`, so their blocks **over**-cover the target and the next append
-stacks on top. `QuantV::dequantize_choice` then resizes the over-long
-concatenation down to `shape[2]`, silently keeping the rejected tokens and
-dropping the correction token — wrong attention, no error. Unfixed; those stores
-are owned outside this change. See `docs/KV_QUANT.md` § "Scope — the class is
-NOT closed."
+**Scope (#382).** The split covers the rotor and iso block stores only, and only
+at `b == 1` (at `b > 1` the block concatenation is not readable by the decode
+path, so a mid-block cut stays a loud error instead of becoming a scrambled
+store). `QuantV` (`Vec<TurboBlocks>`) and `QuantPlanarV` / `QuantPlanarK`
+(`Vec<PlanarBlocks>`) accumulate CPU blocks the same way, but
+`KvStorage::truncate_to` only lowers `shape[2]` for `K8V4` / `K8V8` / `Planar` /
+`PlanarK` / `TurboSym3/4` / `K8VTurbo2/3` / `K8VTurbo3Tcq` / `K8VTurbo2Tcq` and
+for the V axis of `RotorKAsym3/4`, so their blocks **over**-cover the target and
+the next append stacks on top. `QuantV::dequantize_choice` then resizes the
+over-long concatenation down to `shape[2]`, silently keeping the rejected tokens
+and dropping the correction token — wrong attention, no error.
+
+`RotorKAsym3/4` are the awkward case: their rotor K axis is covered and their
+affine V axis is not, so one codec now truncates its two axes with different
+semantics. Unfixed; those stores are owned outside this change. See
+`docs/KV_QUANT.md` § "Scope — the class is NOT closed (#382)".
 
 ## Per-drafter Deep Dive
 

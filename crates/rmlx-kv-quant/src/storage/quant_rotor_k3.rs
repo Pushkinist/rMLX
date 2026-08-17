@@ -84,7 +84,7 @@ impl super::BlockRows for RotorKBlocks {
     /// The exhaustive destructure is the drift guard: a new payload field
     /// cannot be added without this failing to compile, which is what stops a
     /// sideband from surviving a mid-block truncation at its full length.
-    fn retain_rows(&mut self, ranges: &[std::ops::Range<usize>], rows: usize) -> bool {
+    fn retain_rows(&mut self, rows: usize) -> bool {
         let Self {
             codes,
             scales,
@@ -100,14 +100,14 @@ impl super::BlockRows for RotorKBlocks {
             qjl_codes.len(),
             qjl_norms.len(),
         ];
-        if !super::rows_split_ok(&lengths, *n_tokens, ranges) {
+        if !super::rows_split_ok(&lengths, *n_tokens, rows) {
             return false;
         }
-        super::retain_rows_in(codes, *n_tokens, ranges);
-        super::retain_rows_in(scales, *n_tokens, ranges);
-        super::retain_rows_in(norms, *n_tokens, ranges);
-        super::retain_rows_in(qjl_codes, *n_tokens, ranges);
-        super::retain_rows_in(qjl_norms, *n_tokens, ranges);
+        super::retain_rows_in(codes, *n_tokens, rows);
+        super::retain_rows_in(scales, *n_tokens, rows);
+        super::retain_rows_in(norms, *n_tokens, rows);
+        super::retain_rows_in(qjl_codes, *n_tokens, rows);
+        super::retain_rows_in(qjl_norms, *n_tokens, rows);
         *n_tokens = rows;
         true
     }

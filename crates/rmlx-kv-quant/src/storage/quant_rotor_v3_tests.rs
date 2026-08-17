@@ -340,3 +340,91 @@ fn quant_rotor_v3_truncate_mid_block_splits_instead_of_dropping() {
         );
     }
 }
+
+/// At `b > 1` a mid-block cut must stay **loud**, not become silently wrong.
+///
+/// The decode path is the constraint. Every rotor/iso store ends `dequant` with
+/// `transpose_seq_heads` over the *concatenation* of its blocks, reading it as
+/// one `[B, S_total, kv_h, D]` run — but each block is only
+/// `[B, S_block, kv_h, D]`, so at `b > 1` the concatenation interleaves batch
+/// elements and any store holding more than one block decodes scrambled. The
+/// first assertion below measures that: a two-block `b = 2` store already
+/// disagrees with a one-block store over the same tokens, on every element
+/// belonging to batch 1.
+///
+/// So splitting the trailing block at `b > 1` would produce exactly that
+/// two-block state, converting a `blocks`-short-of-`shape[2]` **error** into
+/// scrambled output with no error at all. The planner refuses, and this test
+/// pins the resulting contract: `dequant()` returns `Err`.
+///
+/// Mutation check: drop the `b != 1` arm in `truncate_plan` and the store splits,
+/// `blocks_tokens == full_tokens`, `synced_rotor_v_blocks` takes its
+/// `Cow::Borrowed` fast return, and `dequant()` returns `Ok` with scrambled
+/// values — the `expect_err` goes RED.
+#[test]
+fn quant_rotor_v3_truncate_at_b_gt_1_stays_loud() {
+    let (b, kv_h, head_dim) = (2_usize, 2_usize, 96_usize);
+    let val = |bi: usize, s: usize, d: usize| {
+        (bi as f32) * 1000.0 + (s as f32) * 10.0 + (d as f32) * 0.5 + 1.0
+    };
+    // Head-major `[b, kv_h, n, d]` for sequence positions `[s0, s0 + n)`.
+    let chunk = |s0: usize, n: usize| -> Vec<f32> {
+        let mut out = vec![0.0_f32; b * kv_h * n * head_dim];
+        for bi in 0..b {
+            for h in 0..kv_h {
+                for s in 0..n {
+                    for d in 0..head_dim {
+                        out[((bi * kv_h + h) * n + s) * head_dim + d] = val(bi, s0 + s, d);
+                    }
+                }
+            }
+        }
+        out
+    };
+    let shape = |n: usize| [b as i32, kv_h as i32, n as i32, head_dim as i32];
+
+    // First: establish that multi-block `b > 1` decode really is unreadable, so
+    // the refusal below is a bound and not superstition.
+    let mut one_block = QuantRotorV3::new(vec![b as i32, kv_h as i32, 0, head_dim as i32], 64, 5);
+    one_block.append(&chunk(0, 5), &shape(5)).unwrap();
+    let dq_one = one_block.dequant().unwrap();
+
+    let mut two_blocks = QuantRotorV3::new(vec![b as i32, kv_h as i32, 0, head_dim as i32], 64, 5);
+    two_blocks.append(&chunk(0, 2), &shape(2)).unwrap();
+    two_blocks.append(&chunk(2, 3), &shape(3)).unwrap();
+    let dq_two = two_blocks.dequant().unwrap();
+
+    let scrambled = dq_one
+        .iter()
+        .zip(dq_two.iter())
+        .filter(|(a, c)| (*a - *c).abs() > 1e-3)
+        .count();
+    assert!(
+        scrambled > 0,
+        "premise: a two-block b > 1 store is supposed to decode differently from a \
+         one-block store over the same tokens. If this is now 0 the concatenation \
+         reading was fixed and the b > 1 split may be re-enabled — re-point this test \
+         rather than deleting it"
+    );
+
+    // Now the contract: a mid-block cut drops the block and stays loud.
+    let mut store = QuantRotorV3::new(vec![b as i32, kv_h as i32, 0, head_dim as i32], 64, 5);
+    store.append(&chunk(0, 2), &shape(2)).unwrap();
+    store.append(&chunk(2, 3), &shape(3)).unwrap();
+    store.truncate_to(3); // mid-block: 3 lands inside the second (3-position) block
+
+    let kept_rows: usize = store.blocks.iter().map(|blk| blk.n_tokens).sum();
+    assert_eq!(
+        kept_rows,
+        2 * b * kv_h,
+        "the trailing block is dropped whole at b > 1, leaving only the 2-position block"
+    );
+    let err = store
+        .dequant()
+        .expect_err("a b > 1 mid-block cut must abort, not return scrambled values");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("CPU blocks cover"),
+        "the abort must be the blocks-vs-shape reconciliation error, got: {msg}"
+    );
+}

@@ -1,30 +1,38 @@
 //! Unit tests for [`crate::storage::truncate_plan`] — the shared block-cut
 //! planner behind every rotor/iso K and V store's `truncate_to`.
 //!
-//! Two separate hazards live here.
+//! Three separate hazards live here.
 //!
 //! **Row/sequence units.** Each per-append block's `n_tokens` counts **rows**
 //! (`b * kv_h * seq_of_block`), not raw sequence positions. `truncate_to(n)`
 //! takes `n` as a **sequence** target, so `n` must be scaled to `n * b * kv_h`
 //! before it is compared against the cumulative `n_tokens`. At `b * kv_h == 1`
 //! the two units coincide, which is how that bug shipped unnoticed — every
-//! `kv_h > 1` store silently undercounted.
+//! `kv_h > 1` store silently undercounted. The fixtures below use `kv_h > 1`
+//! wherever the assertion would otherwise hide behind that degeneracy.
 //!
 //! **Mid-block cuts.** A block spans one whole append, and a speculative-decode
 //! partial accept cuts inside the verifier's multi-token chunk. Dropping the
 //! whole block throws the accepted prefix away with the rejected tail, leaving
 //! `blocks` short of `shape[2]` — a state only a live GPU ring can repair. The
 //! planner therefore splits the trailing block instead.
+//!
+//! **`b > 1` must NOT split.** Every store decodes the concatenation of its
+//! blocks as one `[B, S_total, kv_h, D]` run, which is only a valid reading at
+//! `b == 1` or with a single block. Splitting at `b > 1` would replace a loud
+//! blocks-short-of-`shape[2]` error with a silently scrambled two-block store,
+//! so the planner drops the block there and lets the guard report the gap. The
+//! store-level proof of the scrambling is
+//! `quant_rotor_v3_tests::quant_rotor_v3_truncate_at_b_gt_1_stays_loud`.
 
 use crate::storage::{apply_truncate_plan, retain_rows_in, truncate_plan, BlockRows};
 
 /// A minimal [`BlockRows`] stand-in: one payload buffer at `stride` values per
-/// row, filled with consecutive integers so a mis-sliced range is visible.
+/// row, filled with consecutive integers so a mis-sliced cut is visible.
 #[derive(Debug, PartialEq, Eq)]
 struct FakeBlock {
     payload: Vec<u32>,
     rows: usize,
-    stride: usize,
 }
 
 impl FakeBlock {
@@ -32,20 +40,16 @@ impl FakeBlock {
         let payload = (0..rows * stride)
             .map(|i| first_row * 1000 + i as u32)
             .collect();
-        Self {
-            payload,
-            rows,
-            stride,
-        }
+        Self { payload, rows }
     }
 }
 
 impl BlockRows for FakeBlock {
-    fn retain_rows(&mut self, ranges: &[std::ops::Range<usize>], rows: usize) -> bool {
-        if !crate::storage::rows_split_ok(&[self.payload.len()], self.rows, ranges) {
+    fn retain_rows(&mut self, rows: usize) -> bool {
+        if !crate::storage::rows_split_ok(&[self.payload.len()], self.rows, rows) {
             return false;
         }
-        retain_rows_in(&mut self.payload, self.rows, ranges);
+        retain_rows_in(&mut self.payload, self.rows, rows);
         self.rows = rows;
         true
     }
@@ -124,7 +128,7 @@ fn plan_zero_factor_keeps_nothing() {
     let blocks = [4_usize, 4];
     let plan = truncate_plan(blocks.iter().copied(), &shape, 2);
     assert_eq!(plan.keep, 0);
-    assert!(plan.partial.is_empty());
+    assert_eq!(plan.partial_rows, None);
 }
 
 /// Multi-batch (`b > 1`) also inflates `n_tokens` and must be converted the
@@ -150,43 +154,27 @@ fn plan_splits_the_trailing_block_at_a_mid_block_cut() {
     let plan = truncate_plan(blocks.iter().copied(), &shape, 50);
     assert_eq!(plan.keep, 1, "the 46-row prefill block stays whole");
     assert_eq!(
-        plan.partial,
-        vec![0..4],
+        plan.partial_rows,
+        Some(4),
         "4 of the verifier chunk's 5 rows are retained"
     );
-    assert_eq!(plan.partial_rows, 4);
 }
 
-/// The same cut at `kv_h > 1`: the retained run is `keep_seq * kv_h` rows, not
+/// The same cut at `kv_h > 1`: the retained count is `keep_seq * kv_h` rows, not
 /// `keep_seq` rows.
 #[test]
-fn plan_partial_range_is_in_row_units_at_kv_h_gt_1() {
+fn plan_partial_rows_are_in_row_units_at_kv_h_gt_1() {
     let kv_h = 4_usize;
     let shape = [1_i32, kv_h as i32, 0, 8];
     // One 10-position block (40 rows) then one 5-position block (20 rows).
     let blocks = [40_usize, 20];
     let plan = truncate_plan(blocks.iter().copied(), &shape, 13);
     assert_eq!(plan.keep, 1);
-    assert_eq!(plan.partial, vec![0..12], "3 sequence positions x kv_h = 4");
-    assert_eq!(plan.partial_rows, 12);
-}
-
-/// At `b > 1` a sequence prefix is **not** a row prefix: rows run batch-major,
-/// so each batch element contributes its own contiguous run.
-#[test]
-fn plan_partial_ranges_are_per_batch_at_b_gt_1() {
-    let (b, kv_h) = (2_usize, 2_usize);
-    let shape = [b as i32, kv_h as i32, 0, 8];
-    // One 4-position block: b * seq * kv_h = 2 * 4 * 2 = 16 rows.
-    let blocks = [16_usize];
-    let plan = truncate_plan(blocks.iter().copied(), &shape, 3);
-    assert_eq!(plan.keep, 0);
     assert_eq!(
-        plan.partial,
-        vec![0..6, 8..14],
-        "each batch element keeps 3 positions x kv_h = 2 rows from its own run"
+        plan.partial_rows,
+        Some(12),
+        "3 sequence positions x kv_h = 4"
     );
-    assert_eq!(plan.partial_rows, 12);
 }
 
 /// A cut exactly on a block boundary produces no partial — the historical
@@ -197,7 +185,7 @@ fn plan_boundary_cut_has_no_partial() {
     let blocks = [46_usize, 5];
     let plan = truncate_plan(blocks.iter().copied(), &shape, 46);
     assert_eq!(plan.keep, 1);
-    assert!(plan.partial.is_empty());
+    assert_eq!(plan.partial_rows, None);
 }
 
 /// The plan applied to real blocks keeps exactly the retained rows' payload,
@@ -261,24 +249,91 @@ fn whole_block_drop_leaves_the_store_short_of_the_target() {
         .copied()
         .take(plan.keep)
         .sum::<usize>()
-        .saturating_add(plan.partial_rows);
+        .saturating_add(plan.partial_rows.unwrap_or(0));
     assert_eq!(covered, target, "the planner covers the target exactly");
 }
 
-/// A range past the block's own row count is refused before any buffer is
+// ── Refusals ─────────────────────────────────────────────────────────────────
+
+/// `b > 1` never splits, however cleanly the cut would divide.
+///
+/// Not a limitation of the planner — a correctness bound imposed by the decode
+/// path. Every store reads its block concatenation as one `[B, S_total, kv_h,
+/// D]` run, which interleaves batch elements once more than one block survives.
+/// Splitting here would replace the loud blocks-short-of-`shape[2]` error with a
+/// silently scrambled store; dropping keeps the error.
+#[test]
+fn plan_never_splits_at_batch_gt_1() {
+    let (b, kv_h) = (2_usize, 2_usize);
+    let shape = [b as i32, kv_h as i32, 0, 8];
+    // One 4-position block: b * seq * kv_h = 16 rows. A cut at 3 positions is
+    // mid-block and divides cleanly in row units — the split is refused anyway.
+    let blocks = [16_usize];
+    let plan = truncate_plan(blocks.iter().copied(), &shape, 3);
+    assert_eq!(plan.keep, 0, "the block is dropped, not kept whole");
+    assert_eq!(
+        plan.partial_rows, None,
+        "no split at b > 1 — the decode path cannot read a multi-block batched store"
+    );
+
+    // The same shape at b == 1 does split, so the refusal is keyed on `b` and
+    // not on some other property of this fixture.
+    let shape_b1 = [1_i32, kv_h as i32, 0, 8];
+    let blocks_b1 = [8_usize]; // 4 positions x kv_h = 2
+    let plan_b1 = truncate_plan(blocks_b1.iter().copied(), &shape_b1, 3);
+    assert_eq!(plan_b1.partial_rows, Some(6));
+}
+
+/// A block whose row count is not a whole number of sequence positions stops the
+/// walk at the last clean boundary.
+///
+/// Unreachable in practice — every `append` pushes `b * kv_h * seq` rows — but
+/// the branch exists so a malformed block is dropped rather than cut on a
+/// guessed layout, and its `break` semantics differ from the old helper's (which
+/// would have kept such a block if it fit under the row target). Pinned so that
+/// difference is deliberate.
+#[test]
+fn plan_stops_at_a_block_whose_rows_are_not_whole_positions() {
+    let kv_h = 4_usize;
+    let shape = [1_i32, kv_h as i32, 0, 8];
+    // 8 rows = 2 positions, then 6 rows = 1.5 positions (malformed), then 4.
+    let blocks = [8_usize, 6, 4];
+    let plan = truncate_plan(blocks.iter().copied(), &shape, 4);
+    assert_eq!(
+        plan.keep, 1,
+        "the walk stops at the malformed block, keeping only the clean prefix"
+    );
+    assert_eq!(plan.partial_rows, None);
+
+    // The old helper's behaviour on the same input, for contrast: 8 + 6 = 14
+    // rows fits under the 16-row target, so it kept the malformed block — and
+    // its 1.5 positions then silently shifted every sequence index after it.
+    let n_rows = 4 * kv_h;
+    let mut acc = 0_usize;
+    let mut keep_old = 0_usize;
+    for (i, rows) in blocks.iter().copied().enumerate() {
+        if acc + rows <= n_rows {
+            acc += rows;
+            keep_old = i + 1;
+        } else {
+            break;
+        }
+    }
+    assert_eq!(
+        keep_old, 2,
+        "the old whole-block helper kept the malformed block; the planner stops before it"
+    );
+}
+
+/// A cut past the block's own row count is refused before any buffer is
 /// touched — the block is dropped whole, never half-cut.
 #[test]
-#[allow(
-    clippy::single_range_in_vec_init,
-    reason = "a one-element slice of row ranges is the batch-1 plan shape, not a range \
-              that was meant to be collected"
-)]
-fn out_of_range_plan_is_refused_not_partially_applied() {
+fn out_of_range_cut_is_refused_not_partially_applied() {
     let mut block = FakeBlock::new(0, 4, 3);
     let before = block.payload.clone();
     assert!(
-        !block.retain_rows(&[0..5], 5),
-        "a range past the block's 4 rows must be refused"
+        !block.retain_rows(5),
+        "a cut past the block's 4 rows must be refused"
     );
     assert_eq!(block.payload, before, "a refused split must not mutate");
     assert_eq!(
@@ -296,19 +351,26 @@ fn out_of_range_plan_is_refused_not_partially_applied() {
 /// rather than only the surviving block count, so the cost of the refusal is
 /// visible here instead of being discovered at a consumer boundary. The refusal
 /// also emits a `warn!` naming the same numbers.
+///
+/// `kv_h = 2` on purpose: the gap arithmetic below is in **row** units, and a
+/// `b * kv_h == 1` fixture would let a sequence-vs-row unit slip pass.
 #[test]
 fn apply_plan_drops_an_unsplittable_block_and_leaves_a_named_gap() {
-    let shape = [1_i32, 1, 0, 8];
-    let target = 6_usize;
-    let mut blocks = vec![FakeBlock::new(0, 4, 3), FakeBlock::new(1, 5, 3)];
+    let kv_h = 2_usize;
+    let shape = [1_i32, kv_h as i32, 0, 8];
+    let target_seq = 3_usize;
+    let rows_per_seq = kv_h;
+    // 2 positions (4 rows) then 3 positions (6 rows); cut at 3 positions.
+    let mut blocks = vec![FakeBlock::new(0, 4, 3), FakeBlock::new(1, 6, 3)];
     // Corrupt the trailing block so its payload length is not a multiple of its
     // row count.
     blocks[1].payload.pop();
 
-    let plan = truncate_plan(blocks.iter().map(|b| b.rows), &shape, target as i32);
+    let plan = truncate_plan(blocks.iter().map(|b| b.rows), &shape, target_seq as i32);
     assert_eq!(
-        plan.partial_rows, 2,
-        "the plan wanted 2 rows out of the trailing block"
+        plan.partial_rows,
+        Some(rows_per_seq),
+        "the plan wanted 1 position x kv_h rows out of the trailing block"
     );
     apply_truncate_plan(&mut blocks, &plan);
 
@@ -319,93 +381,31 @@ fn apply_plan_drops_an_unsplittable_block_and_leaves_a_named_gap() {
     );
     let covered: usize = blocks.iter().map(|b| b.rows).sum();
     assert_eq!(
-        target - covered,
-        plan.partial_rows,
+        target_seq * rows_per_seq - covered,
+        plan.partial_rows.unwrap_or(0),
         "the refusal leaves exactly the wanted rows uncovered — the gap a consumer \
-         will abort on, and the number the warn! reports"
+         will abort on, and the number the warn! reports. Both sides are row counts; \
+         the target is scaled by b * kv_h to get there"
     );
-}
-
-/// At `b > 1` a sequence prefix is not a row prefix, so the plan carries one
-/// range per batch element and the split must gather them.
-///
-/// Without this the multi-range arm of `retain_rows_in` is never executed by any
-/// test — an untestable branch. The oracle is the untouched payload indexed at
-/// the rows a batch-major layout says survive, which shares no arithmetic with
-/// either the planner or the gather.
-#[test]
-fn apply_plan_gathers_per_batch_ranges_at_b_gt_1() {
-    let (b, kv_h, blk_seq, stride) = (2_usize, 2_usize, 4_usize, 3_usize);
-    let shape = [b as i32, kv_h as i32, 0, 8];
-    // One block: b * blk_seq * kv_h = 16 rows, laid out batch-major then
-    // sequence then kv-head.
-    let mut blocks = vec![FakeBlock::new(0, b * blk_seq * kv_h, stride)];
-    let before = blocks[0].payload.clone();
-
-    let keep_seq = 3_usize;
-    let plan = truncate_plan(blocks.iter().map(|b| b.rows), &shape, keep_seq as i32);
-    assert_eq!(plan.partial, vec![0..6, 8..14]);
-    apply_truncate_plan(&mut blocks, &plan);
-
-    // Oracle: rows (bi, s, h) with s < keep_seq, in batch-major order.
-    let mut expected: Vec<u32> = Vec::new();
-    for bi in 0..b {
-        for s in 0..keep_seq {
-            for h in 0..kv_h {
-                let row = (bi * blk_seq + s) * kv_h + h;
-                expected.extend_from_slice(&before[row * stride..(row + 1) * stride]);
-            }
-        }
-    }
-    assert_eq!(blocks[0].rows, b * keep_seq * kv_h);
-    assert_eq!(
-        blocks[0].payload, expected,
-        "the gather must keep each batch element's own sequence prefix"
-    );
-}
-
-/// The `Vec::truncate` fast path and the general gather agree.
-///
-/// `retain_rows_in` short-circuits the single-range-anchored-at-0 case (the only
-/// shape production reaches) to avoid an allocation per payload buffer per
-/// split. A fast path that disagreed with the general path would corrupt exactly
-/// the case that ships.
-#[test]
-#[allow(
-    clippy::single_range_in_vec_init,
-    reason = "a one-element slice of row ranges is the batch-1 plan shape, not a range \
-              that was meant to be collected"
-)]
-fn suffix_drop_fast_path_matches_the_general_gather() {
-    let (rows, stride) = (7_usize, 3_usize);
-    for keep in 0..=rows {
-        let mut fast: Vec<u32> = (0..(rows * stride) as u32).collect();
-        retain_rows_in(&mut fast, rows, &[0..keep]);
-
-        // Same cut expressed as two adjacent ranges, which cannot take the fast
-        // path and therefore runs the gather.
-        let mut general: Vec<u32> = (0..(rows * stride) as u32).collect();
-        let split_at = keep / 2;
-        retain_rows_in(&mut general, rows, &[0..split_at, split_at..keep]);
-
-        assert_eq!(
-            fast, general,
-            "fast path diverged from the gather at keep={keep}"
-        );
-        assert_eq!(fast.len(), keep * stride);
-    }
 }
 
 /// [`retain_rows_in`] leaves an empty buffer empty — an inactive sideband (the
 /// rotor QJL residual) must not be resized into existence.
 #[test]
-#[allow(
-    clippy::single_range_in_vec_init,
-    reason = "a one-element slice of row ranges is the batch-1 plan shape, not a range \
-              that was meant to be collected"
-)]
 fn retain_rows_in_leaves_an_empty_sideband_empty() {
     let mut empty: Vec<f32> = Vec::new();
-    retain_rows_in(&mut empty, 5, &[0..4]);
+    retain_rows_in(&mut empty, 5, 4);
     assert!(empty.is_empty());
+}
+
+/// [`retain_rows_in`] keeps a row prefix at every count, at a stride > 1.
+#[test]
+fn retain_rows_in_keeps_a_row_prefix_at_every_count() {
+    let (rows, stride) = (7_usize, 3_usize);
+    for keep in 0..=rows {
+        let mut buf: Vec<u32> = (0..(rows * stride) as u32).collect();
+        retain_rows_in(&mut buf, rows, keep);
+        let expected: Vec<u32> = (0..(keep * stride) as u32).collect();
+        assert_eq!(buf, expected, "row prefix wrong at keep={keep}");
+    }
 }

@@ -274,9 +274,18 @@ fn seed_ring_via_gpu_append(
     let n_groups = n_groups_for(head_dim as usize) as i32;
     let cps = (kv_h * n_groups * n_tokens) as usize;
     let nps = (kv_h * n_tokens) as usize;
+    // Scales and norms start at 1, not 0. `rotor3_decode` multiplies the
+    // reconstruction by both, so a zero in either makes the decoded token
+    // identically zero — and a value oracle built from the same zeros then
+    // compares zeros to zeros and cannot tell a correct ring readback from a
+    // zero-padded gap, which is the exact failure these tests exist to catch.
     let codes_b: Vec<u8> = (0..cps).flat_map(|i| (i as u32).to_le_bytes()).collect();
-    let scales_b: Vec<u8> = (0..cps).flat_map(|i| (i as f32).to_le_bytes()).collect();
-    let norms_b: Vec<u8> = (0..nps).flat_map(|i| (i as f32).to_le_bytes()).collect();
+    let scales_b: Vec<u8> = (0..cps)
+        .flat_map(|i| ((i + 1) as f32).to_le_bytes())
+        .collect();
+    let norms_b: Vec<u8> = (0..nps)
+        .flat_map(|i| ((i + 1) as f32).to_le_bytes())
+        .collect();
     let codes = Array::from_bytes(&codes_b, &[cps as i32], Dtype::U32).expect("codes");
     let scales = Array::from_bytes(&scales_b, &[cps as i32], Dtype::F32).expect("scales");
     let norms = Array::from_bytes(&norms_b, &[nps as i32], Dtype::F32).expect("norms");
@@ -366,10 +375,6 @@ fn quant_rotor_k3_truncate_to_keeps_the_gpu_ring() {
     ks.truncate_to(1);
     assert_eq!(ks.shape[2], 1);
     assert!(
-        ks.blocks.is_empty(),
-        "precondition: the ring-only regime has no CPU blocks to keep"
-    );
-    assert!(
         ks.gpu.is_allocated(),
         "truncate_to() must KEEP the ring — it is the source of truth for a \
          ring-only decode tail; dropping it here would strand the only copy \
@@ -383,8 +388,8 @@ fn quant_rotor_k3_truncate_to_keeps_the_gpu_ring() {
         .expect("dequant after truncate must read the kept token from the ring");
     let n_groups = n_groups_for(head_dim as usize);
     let ref_codes: Vec<u32> = (0..n_groups as u32).collect();
-    let ref_scales: Vec<f32> = (0..n_groups).map(|i| i as f32).collect();
-    let ref_norms = vec![0.0_f32];
+    let ref_scales: Vec<f32> = (0..n_groups).map(|i| (i + 1) as f32).collect();
+    let ref_norms = vec![1.0_f32];
     let reference = rotor3_decode(
         &ref_codes,
         &ref_scales,
@@ -393,6 +398,15 @@ fn quant_rotor_k3_truncate_to_keeps_the_gpu_ring() {
         head_dim as usize,
     )
     .expect("reference decode of the seeded ring token");
+    // The oracle only discriminates if it is not all zeros — `rotor3_decode`
+    // scales by both the per-group scale and the per-token norm, so a zero in
+    // either would make this comparison zeros-vs-zeros and unable to tell a
+    // correct readback from a zero-padded gap.
+    assert!(
+        reference.iter().any(|v| v.abs() > 1e-6),
+        "the reference token decoded to all zeros — the seeded scales/norms went back \
+         to starting at 0 and this assertion is vacuous"
+    );
     assert_eq!(
         dq, reference,
         "dequant() after truncate must return the ring's actual content for the \

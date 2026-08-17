@@ -131,6 +131,19 @@ pub const KV_PAGE_SIZE: i32 = 256;
 // any `Device::Cpu` run) there is no ring and the next `dequant()` /
 // `try_deep_clone()` aborts the request rather than fabricate a zeroed gap.
 // So the trailing block is **split**, not dropped.
+//
+// The split is confined to `b == 1`, and that is a correctness bound, not a
+// simplification. Every store ends `dequant` with
+// `seq_layout::transpose_seq_heads` over the *concatenation* of its blocks,
+// which reads the buffer as one `[B, S_total, kv_h, D]` run. Each block is
+// only `[B, S_block, kv_h, D]`, so at `b > 1` the concatenation interleaves
+// batch elements and the reading is wrong for any store holding more than one
+// block. Splitting at `b > 1` would turn a mid-block cut from
+// blocks-short-of-`shape[2]` — which the reconciliation guards reject loudly —
+// into a two-block store that decodes silently scrambled. So `b > 1` keeps the
+// whole-block drop and the loud error. `sdpa::rotor_flash_shape_ok` refuses
+// `b != 1` for the same underlying reason, which is also why no `b > 1` store
+// ever has a ring to rebuild the gap from.
 
 /// How a block-accumulating KV store must cut its blocks to reach `n`
 /// sequence positions.
@@ -138,13 +151,10 @@ pub const KV_PAGE_SIZE: i32 = 256;
 pub(crate) struct TruncatePlan {
     /// Number of leading blocks kept whole.
     pub keep: usize,
-    /// Row ranges to retain from block index `keep`, in that block's own row
-    /// units. Empty when the cut lands on a block boundary, in which case
-    /// block `keep` and everything after it is dropped.
-    pub partial: Vec<std::ops::Range<usize>>,
-    /// Rows block `keep` holds after the partial cut. `0` when `partial` is
-    /// empty.
-    pub partial_rows: usize,
+    /// Rows to retain from block index `keep`. `None` when the cut lands on a
+    /// block boundary, or when the split was refused — in both cases block
+    /// `keep` and everything after it is dropped.
+    pub partial_rows: Option<usize>,
 }
 
 /// Plan the block cut that truncates a store's accumulated sequence to `n`.
@@ -155,7 +165,7 @@ pub(crate) struct TruncatePlan {
 /// A degenerate `b * kv_h == 0` shape (nothing appended yet) keeps no blocks.
 /// A block whose row count is not a whole multiple of `b * kv_h` cannot be
 /// mapped onto sequence positions, so the walk stops at the last clean
-/// boundary rather than guess.
+/// boundary rather than guess. `b > 1` never splits — see the module note.
 pub(crate) fn truncate_plan(
     block_tokens: impl Iterator<Item = usize>,
     shape: &[i32],
@@ -201,56 +211,61 @@ pub(crate) fn truncate_plan(
         if keep_seq == 0 {
             break;
         }
-        // Rows within a block run batch-major, then sequence, then kv-head
-        // (the seq-major reorder every packed store applies before encoding),
-        // so a sequence prefix is one contiguous run per batch element.
-        let partial = (0..b)
-            .map(|bi| {
-                let base = bi * blk_seq * kv_h;
-                base..base + keep_seq * kv_h
-            })
-            .collect();
+        if b != 1 {
+            // Rows run batch-major, so a sequence prefix is not a row prefix and
+            // the resulting two-block store would decode scrambled rather than
+            // error. Drop the block and let the reconciliation guard report the
+            // gap. See the module note.
+            tracing::warn!(
+                b,
+                kv_h,
+                kept_seq = acc_seq,
+                target_seq,
+                "KV block truncate: refusing to split a block at b > 1 — the decode path \
+                 reads the block concatenation as one sequence run, so a split store would \
+                 be silently scrambled; dropping the block instead, which leaves the store \
+                 short of its truncation target"
+            );
+            break;
+        }
         return TruncatePlan {
             keep,
-            partial,
-            partial_rows: keep_seq * kv_h * b,
+            partial_rows: Some(keep_seq * kv_h),
         };
     }
     TruncatePlan {
         keep,
-        partial: Vec::new(),
-        partial_rows: 0,
+        partial_rows: None,
     }
 }
 
 /// A per-append payload block whose buffers hold one equal-stride row per
-/// `(batch, sequence position, kv head)` triple.
+/// `(sequence position, kv head)` pair.
 pub(crate) trait BlockRows {
-    /// Keep only `ranges` (row indices), leaving `rows` rows behind.
+    /// Keep the first `rows` rows, dropping the rest.
     ///
-    /// Returns `false` and leaves the block untouched when any payload buffer's
-    /// length is not a whole number of rows — an unsplittable block, which the
-    /// caller drops rather than cut into an inconsistent state.
-    fn retain_rows(&mut self, ranges: &[std::ops::Range<usize>], rows: usize) -> bool;
+    /// Returns `false` and leaves the block untouched when the cut is not
+    /// expressible — any payload buffer whose length is not a whole number of
+    /// rows, or a `rows` past the block's own row count. The caller drops such
+    /// a block rather than cut it into an inconsistent state.
+    fn retain_rows(&mut self, rows: usize) -> bool;
 }
 
 /// Apply a [`truncate_plan`] to a store's block list.
 pub(crate) fn apply_truncate_plan<B: BlockRows>(blocks: &mut Vec<B>, plan: &TruncatePlan) {
-    if plan.partial.is_empty() {
+    let Some(rows) = plan.partial_rows else {
         blocks.truncate(plan.keep);
         return;
-    }
+    };
     blocks.truncate(plan.keep.saturating_add(1));
-    let split_ok = blocks
-        .last_mut()
-        .is_some_and(|last| last.retain_rows(&plan.partial, plan.partial_rows));
+    let split_ok = blocks.last_mut().is_some_and(|last| last.retain_rows(rows));
     if !split_ok {
-        // Loud for the same reason as the planner's refusal: the caller lowers
-        // `shape[2]` regardless, so dropping the block leaves `plan.partial_rows`
-        // rows uncovered and the next `dequant` aborts a long way from here.
+        // Loud for the same reason as the planner's refusals: the caller lowers
+        // `shape[2]` regardless, so dropping the block leaves `rows` uncovered
+        // and the next `dequant` aborts a long way from here.
         tracing::warn!(
             kept_blocks = plan.keep,
-            uncovered_rows = plan.partial_rows,
+            uncovered_rows = rows,
             "KV block truncate: trailing block could not be split — dropping it whole, \
              leaving the store short of its truncation target"
         );
@@ -258,56 +273,33 @@ pub(crate) fn apply_truncate_plan<B: BlockRows>(blocks: &mut Vec<B>, plan: &Trun
     }
 }
 
-/// Whether a block can be split as asked: every buffer divides cleanly into
-/// `rows` equal strides, and every range lies inside those rows.
+/// Whether a block can be cut to `keep_rows`: every buffer divides cleanly into
+/// `total_rows` equal strides, and the target is inside them.
 ///
 /// Checked **once, before any buffer is touched**. A per-buffer check would let
-/// an out-of-range plan cut some buffers and not others, leaving a block whose
-/// codes, scales and norms disagree about how many rows it holds — silent
+/// an out-of-range cut shorten some buffers and not others, leaving a block
+/// whose codes, scales and norms disagree about how many rows it holds — silent
 /// corruption rather than a refused split.
-pub(crate) fn rows_split_ok(
-    lengths: &[usize],
-    rows: usize,
-    ranges: &[std::ops::Range<usize>],
-) -> bool {
-    rows != 0
-        && lengths.iter().all(|len| len.is_multiple_of(rows))
-        && ranges.iter().all(|r| r.start <= r.end && r.end <= rows)
+pub(crate) fn rows_split_ok(lengths: &[usize], total_rows: usize, keep_rows: usize) -> bool {
+    total_rows != 0
+        && keep_rows <= total_rows
+        && lengths.iter().all(|len| len.is_multiple_of(total_rows))
 }
 
-/// Retain `ranges` (row indices) of a payload buffer holding `total_rows`
+/// Keep the first `keep_rows` rows of a payload buffer holding `total_rows`
 /// equal-stride rows.
 ///
 /// Caller must have cleared the block through [`rows_split_ok`] first. An empty
 /// buffer — an inactive sideband such as the rotor QJL residual — stays empty.
 ///
-/// The single-range-anchored-at-0 case is a plain suffix drop and takes
-/// `Vec::truncate`: no allocation, no copy. That is the **only** shape
-/// production reaches — `truncate_plan` emits one range per batch element, and
-/// the batch dim is fixed at 1 per request — and it sits on the speculative
-/// rollback path, which runs once per round per store per layer. The gather
-/// below exists for `b > 1`, where a sequence prefix is not a row prefix.
-pub(crate) fn retain_rows_in<T: Copy>(
-    buf: &mut Vec<T>,
-    total_rows: usize,
-    ranges: &[std::ops::Range<usize>],
-) {
+/// A row prefix is a byte prefix (the split is `b == 1` only, see the module
+/// note), so this is `Vec::truncate`: no allocation, no copy. That matters
+/// because it sits on the speculative rollback path, which runs once per round
+/// per store per layer.
+pub(crate) fn retain_rows_in<T>(buf: &mut Vec<T>, total_rows: usize, keep_rows: usize) {
     if buf.is_empty() || total_rows == 0 {
         return;
     }
     let stride = buf.len() / total_rows;
-    if let [only] = ranges {
-        if only.start == 0 {
-            buf.truncate(only.end * stride);
-            return;
-        }
-    }
-    let kept: usize = ranges.iter().map(std::ops::Range::len).sum();
-    let mut out = Vec::with_capacity(kept.saturating_mul(stride));
-    for r in ranges {
-        if let Some(slice) = buf.get(r.start * stride..r.end * stride) {
-            out.extend_from_slice(slice);
-        }
-    }
-    *buf = out;
+    buf.truncate(keep_rows.saturating_mul(stride));
 }

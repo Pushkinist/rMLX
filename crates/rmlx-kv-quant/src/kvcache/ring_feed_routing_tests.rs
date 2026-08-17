@@ -15,10 +15,16 @@
 //!
 //! It is **not** a proof that a given entry still passes those constants: the
 //! append path they feed runs an MSL encode kernel, so nothing below `make
-//! gpu-test` can observe the consequence. The observable-consequence pin lives
-//! in `rotor_flash_dispatch_tests::rotor_sym3_multi_token_append_drops_the_ring`
-//! and its K-only sibling, both `#[ignore]`. If a call site is changed to bypass
-//! the constant, this file stays green and those two go red.
+//! gpu-test` can observe the consequence. Those pins are four `#[ignore]` tests
+//! in `rotor_flash_dispatch_tests`:
+//!
+//! * `rotor_k_only_{3,4}_multi_token_append_after_fused_decode_takes_the_block_path`
+//!   — block pushed **and** ring kept, which admits only `Maintain`.
+//! * `rotor_sym{3,4}_multi_token_append_after_fused_decode_drops_the_ring` —
+//!   block pushed **and** ring dropped, which admits only `Skip`.
+//!
+//! If a call site is changed to bypass its constant, this file stays green and
+//! the matching pair goes red.
 
 use super::{is_ring_only_append, RingFeed, LEGACY_ROTOR_K_ONLY_FEED, LEGACY_ROTOR_SYM_FEED};
 

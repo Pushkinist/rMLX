@@ -1869,10 +1869,15 @@ conservative upper bound for the ring-resident members.
 every store family's bits per value and fails any family above bf16's 16.0 that
 does not carry a written exemption. An exemption is itself checked: a family
 listed as exempt must actually measure above the floor, so a fixed codec turns
-its own exemption red instead of silently keeping it. The `KvQuant` → family map
-is an exhaustive `match`, and a constant ties the match's arm count to the array
-of measured representatives, so a new codec neither compiles nor passes until
-its rate is accounted for. Table at `head_dim = 128`:
+its own exemption red instead of silently keeping it.
+
+Completeness is a three-link chain with no hand-kept count on either side of any
+comparison: an exhaustive `arm_index` match (a new `KvQuant` variant does not
+**compile** until it takes an index), a by-index lookup into a fixed-size
+`AXES_BY_ARM` array (an index past the end **panics**, forcing the author to
+declare where the new codec's bytes go), and a coverage assertion of the
+measured representatives against that array's length (which the previous link
+has already forced to grow). Table at `head_dim = 128`:
 
 | Family | Stored bits / value | Provenance | Verdict |
 |---|---|---|---|
@@ -3058,33 +3063,59 @@ then aborts the request with
 `"rotor K store: CPU blocks cover N tokens but shape[2] needs M"`. The planner
 therefore **splits** the trailing block, cutting every per-row buffer — codes,
 per-group scales, per-group quaternions, per-token norms, and the rotor QJL
-sideband — to the accepted row count. At `b > 1` a sequence prefix is not a row
-prefix (rows run batch-major), so the cut is one contiguous run per batch
-element.
+sideband — to the accepted row count.
+
+**The split is `b == 1` only, and that is a correctness bound.** Every store
+ends `dequant` with `seq_layout::transpose_seq_heads` over the *concatenation*
+of its blocks, reading it as one `[B, S_total, kv_h, D]` run — but each block is
+only `[B, S_block, kv_h, D]`, so at `b > 1` the concatenation interleaves batch
+elements and any store holding more than one block decodes scrambled. Measured:
+a two-block `b = 2` store disagrees with a one-block store over the same tokens
+on 480 of 960 elements — exactly the batch-1 half — while the `b = 1` control
+matches to the last bit. Splitting at `b > 1` would manufacture that two-block
+state and convert a **loud** blocks-short-of-`shape[2]` error into silently
+scrambled K/V, so the planner drops the block there and lets the reconciliation
+guard report the gap. `sdpa::rotor_flash_shape_ok` refuses `b != 1` for the same
+underlying reason, which is also why a `b > 1` store never has a ring to rebuild
+from. Pinned by
+`quant_rotor_v3_tests::quant_rotor_v3_truncate_at_b_gt_1_stays_loud`, which
+asserts both halves: that the two-block store really is unreadable, and that a
+`b > 1` mid-block cut therefore returns `Err`.
+
+The multi-block `b > 1` decode is broken independently of truncation and is not
+fixed here; the bound above only keeps this change from making it silent.
 
 All eight rotor/iso K and V codecs share one crate-internal planner,
 `truncate_plan` in `rmlx-kv-quant/src/storage/mod.rs`, plus a `BlockRows`
 implementation per block type, so the unit conversion and the split are defined
 once rather than re-derived per codec. Tests: `storage/truncate_plan_tests.rs`
-(planner + a payload-carrying fake block, including the `b > 1` multi-range
-gather and the suffix-drop fast path), and one store-level round trip per
-block type in `quant_rotor_k3_tests.rs` (`RotorKBlocks`, QJL sideband on),
+(planner + a payload-carrying fake block, including the `b > 1` refusal and the
+non-row-divisible refusal), and one store-level round trip per block type in
+`quant_rotor_k3_tests.rs` (`RotorKBlocks`, QJL sideband on),
 `quant_rotor_v3_tests.rs` (`RotorBlocks`) and `quant_iso_v_tests.rs`
 (`IsoBlocks`, quaternion sideband).
 
-**Scope — the class is NOT closed.** The split covers the **rotor and iso**
-block stores only. `QuantV` (`Vec<TurboBlocks>`), `QuantPlanarV` /
+**Scope — the class is NOT closed (#382).** The split covers the **rotor and
+iso** block stores only. `QuantV` (`Vec<TurboBlocks>`), `QuantPlanarV` /
 `QuantPlanarK` (`Vec<PlanarBlocks>`) and `QuantKTurbo3/4` accumulate CPU blocks
 on the same `Device::Cpu` append path, but `KvStorage::truncate_to` does nothing
 more than `shape[2] = n` for `K8V4`, `K8V8`, `Planar`, `PlanarK`, `TurboSym3/4`,
-`K8VTurbo2/3`. Their blocks therefore **over**-cover `shape[2]` after a
+`K8VTurbo2/3`, **`K8VTurbo3Tcq`, `K8VTurbo2Tcq`**, and the V axis of
+**`RotorKAsym3/4`**. Their blocks therefore **over**-cover `shape[2]` after a
 truncation, the next append stacks on top, and
 `QuantV::dequantize_choice`'s `out.resize(total, 0.0)` (and
 `QuantPlanarK::dequantize_choice` via `transpose_seq_heads`) silently keeps the
 **rejected** speculative tokens while discarding the correction token. That is
 wrong attention with no error — the opposite failure mode to the rotor/iso one,
-and it is unfixed. Those files are owned elsewhere; this section documents the
-divergence rather than claiming coverage it does not have.
+and it is unfixed.
+
+Note what that means **inside** a single codec: `RotorKAsym3/4` now truncate
+their two axes with different semantics. The rotor K axis takes the block plan
+above and stays consistent; the affine `QuantV` V axis is shape-truncated only
+and carries the #382 defect. So "the rotor and iso block stores are covered"
+must not be read as "the rotor asym codecs are covered" — only their K side is.
+Those files are owned elsewhere; this section documents the divergence rather
+than claiming coverage it does not have.
 
 **Real-serve reachability audit (per #284).** `KvCache::truncate_to` has three
 production callers: prompt-cache partial-prefix trim
