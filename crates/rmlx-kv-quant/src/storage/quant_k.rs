@@ -453,14 +453,19 @@ impl QuantK {
                 // chunks written at `prev_seq * words_per_step`, and
                 // `words_per_step` folds `b` in. Reading the prefix as one
                 // `[B, S_total, kv_h, D]` run therefore interleaves batch
-                // elements once `B > 1` and more than one sequence position
-                // landed (`S <= 1` is the same order either way, and an emptied
-                // store must still decode to nothing). Refuse
+                // elements once `B > 1`. Unlike the CPU half this arm has no
+                // payload-vs-shape coverage check — the slice is sized *from*
+                // `shape[2]` — so `S == 1` is not evidence that the prefix is a
+                // single `[B, 1, kv_h, D]` chunk: a mid-chunk truncate at
+                // `b > 1` lowers `shape[2]` without touching this buffer. Only
+                // the empty store is exempt, because `truncate_to(0)` (which
+                // `KvStorage::reset` routes through) must still decode to
+                // nothing. Refuse
                 // rather than return a scrambled tensor — the CPU half of this
                 // reader handles every `B` via
                 // `seq_layout::transpose_chunked_seq_heads`, which is what the
                 // block list makes possible and this buffer does not.
-                if self.shape[0] != 1 && self.shape[2] > 1 {
+                if self.shape[0] != 1 && self.shape[2] != 0 {
                     return Err(rmlx_core::error::Error::Quant(format!(
                         "QuantK::dequantize_choice: the flat GPU buffer is b == 1 only \
                          (its per-step stride does not interleave batch), got shape {:?}",
@@ -522,11 +527,13 @@ impl QuantK {
         // fused gate refuses `b != 1`) and a silent scramble here is worth more
         // than the case it costs. Lifting it needs a recorded per-append
         // sequence length on the store.
-        // `s <= 1` needs no boundary: with at most one sequence position the
-        // concatenation order and the head-major order coincide at every `b`,
-        // and an emptied store (`truncate_to(0)`, which `reset` routes through)
+        // Only the empty store is exempt. `s == 1` is not evidence of a single
+        // chunk here either: `truncate_to` lowers `shape[2]` and
+        // `retain_cpu_prefix` refuses to cut the codes at `b != 1`, so a
+        // truncated store can declare one position over a multi-position
+        // payload. `truncate_to(0)` (which `KvStorage::reset` routes through)
         // must still decode to nothing.
-        if b != 1 && s > 1 {
+        if b != 1 && s != 0 {
             return Err(rmlx_core::error::Error::Quant(format!(
                 "QuantK::dequantize_choice: the CPU codes carry no per-append chunk boundary, \
                  so a b > 1 store cannot be reordered to head-major; got shape {:?}",

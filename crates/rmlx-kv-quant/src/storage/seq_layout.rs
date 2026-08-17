@@ -32,8 +32,12 @@
 //! onto batch-1 sequence slots — head/batch-scrambled K/V, with no error.
 //! [`transpose_chunked_seq_heads`] is the reorder that knows where the chunks
 //! end; [`transpose_seq_heads`] stays correct only for a buffer that really is
-//! one `[B, S_total, kv_h, D]` run (a single chunk, or a flat store written at
-//! sequence offsets).
+//! one `[B, S_total, kv_h, D]` run — a single chunk at any `B`, or any number of
+//! chunks at `B == 1`. A **flat** store written at sequence offsets is not one
+//! run at `B > 1`: its per-step stride folds `b` in, so the prefix is a run of
+//! `[B, S_chunk, kv_h, D]` chunks with no recorded boundary to partition on.
+//! Those readers refuse `b != 1` rather than reorder — see the
+//! `dequantize_choice` GPU arms and `QuantK`'s CPU arm.
 
 use rmlx_core::error::{Error, Result};
 

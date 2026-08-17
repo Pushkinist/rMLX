@@ -422,14 +422,19 @@ impl QuantPlanarV {
                 // chunks written at `prev_seq * words_per_step`, and
                 // `words_per_step` folds `b` in. Reading the prefix as one
                 // `[B, S_total, kv_h, D]` run therefore interleaves batch
-                // elements once `B > 1` and more than one sequence position
-                // landed (`S <= 1` is the same order either way, and an emptied
-                // store must still decode to nothing). Refuse
+                // elements once `B > 1`. Unlike the CPU half this arm has no
+                // payload-vs-shape coverage check — the slice is sized *from*
+                // `shape[2]` — so `S == 1` is not evidence that the prefix is a
+                // single `[B, 1, kv_h, D]` chunk: a mid-chunk truncate at
+                // `b > 1` lowers `shape[2]` without touching this buffer. Only
+                // the empty store is exempt, because `truncate_to(0)` (which
+                // `KvStorage::reset` routes through) must still decode to
+                // nothing. Refuse
                 // rather than return a scrambled tensor — the CPU half of this
                 // reader handles every `B` via
                 // `seq_layout::transpose_chunked_seq_heads`, which is what the
                 // block list makes possible and this buffer does not.
-                if self.shape[0] != 1 && self.shape[2] > 1 {
+                if self.shape[0] != 1 && self.shape[2] != 0 {
                     return Err(rmlx_core::error::Error::Quant(format!(
                         "QuantPlanarV::dequantize_choice: the flat GPU buffer is b == 1 only \
                          (its per-step stride does not interleave batch), got shape {:?}",

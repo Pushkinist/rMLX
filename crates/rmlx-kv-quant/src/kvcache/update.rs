@@ -106,7 +106,7 @@ fn iso4_gpu_append_into_k_blocks(
         bump_rotor_k_shape(&mut ks.shape, new_shape);
         return Ok(());
     }
-    materialize_iso_k4_ring_tail(ks, device)?;
+    ks.reconcile_ring(device, crate::storage::RingDisposition::Keep)?;
     let block_feed = if feed == RingFeed::Skip {
         RingFeed::Skip
     } else {
@@ -193,7 +193,7 @@ fn iso3_gpu_append_into_k_blocks(
     // legacy sym fallback (Skip). A ring-only feed that reaches here is a `b > 1`
     // chunk — normalise it to Maintain so the shared ring feeder clears the ring
     // for the un-representable batch and the CPU block carries the data.
-    materialize_iso_k3_ring_tail(ks, device)?;
+    ks.reconcile_ring(device, crate::storage::RingDisposition::Keep)?;
     let block_feed = if feed == RingFeed::Skip {
         RingFeed::Skip
     } else {
@@ -1521,66 +1521,6 @@ fn iso_gpu_encode_ring_only(
     })
 }
 
-/// Reconcile a pre-existing ring-only decode tail into `ks.blocks` before a
-/// block-path append — iso mirror of [`materialize_rotor_k3_ring_tail`]. No-op
-/// when `blocks` already cover `shape[2]` (reads no GPU).
-fn materialize_iso_k3_ring_tail(ks: &mut QuantIsoK3, device: Device) -> Result<()> {
-    if !ks.gpu.is_allocated() {
-        return Ok(());
-    }
-    let rebuilt = match crate::storage::synced_iso_v_blocks(&ks.blocks, &ks.shape, &ks.gpu, device)?
-    {
-        std::borrow::Cow::Owned(full) => Some(full),
-        std::borrow::Cow::Borrowed(_) => None,
-    };
-    if let Some(full) = rebuilt {
-        ks.blocks = full;
-    }
-    Ok(())
-}
-
-/// Mirror of [`materialize_iso_k3_ring_tail`] for [`QuantIsoK4`].
-fn materialize_iso_k4_ring_tail(ks: &mut QuantIsoK4, device: Device) -> Result<()> {
-    if !ks.gpu.is_allocated() {
-        return Ok(());
-    }
-    let rebuilt = match crate::storage::synced_iso_v_blocks(&ks.blocks, &ks.shape, &ks.gpu, device)?
-    {
-        std::borrow::Cow::Owned(full) => Some(full),
-        std::borrow::Cow::Borrowed(_) => None,
-    };
-    if let Some(full) = rebuilt {
-        ks.blocks = full;
-    }
-    Ok(())
-}
-
-/// Mirror of [`materialize_iso_k3_ring_tail`] for [`QuantIsoV3`].
-fn materialize_iso_v3_ring_tail(vs: &mut QuantIsoV3, device: Device) -> Result<()> {
-    // One body for the reconcile: the store owns it, because the store is what
-    // has to keep `blocks` and the ring in step. This caller keeps the ring —
-    // its `sync_ring` decides the ring's fate a few lines later — while
-    // `QuantIsoV3::append_gpu` drops it, and that difference is the whole
-    // contract, so it is a parameter rather than two copies that can drift.
-    vs.reconcile_ring(device, crate::storage::RingDisposition::Keep)
-}
-
-/// Mirror of [`materialize_iso_v3_ring_tail`] for [`QuantIsoV4`].
-fn materialize_iso_v4_ring_tail(vs: &mut QuantIsoV4, device: Device) -> Result<()> {
-    if !vs.gpu.is_allocated() {
-        return Ok(());
-    }
-    let rebuilt = match crate::storage::synced_iso_v_blocks(&vs.blocks, &vs.shape, &vs.gpu, device)?
-    {
-        std::borrow::Cow::Owned(full) => Some(full),
-        std::borrow::Cow::Borrowed(_) => None,
-    };
-    if let Some(full) = rebuilt {
-        vs.blocks = full;
-    }
-    Ok(())
-}
-
 /// Append `new_k` into a live `IsoKOnly3` store's GPU ring (+ CPU blocks),
 /// lazily creating the store on first use. No dequant — this is the entry point
 /// the iso flash-decode SDPA path uses.
@@ -1852,7 +1792,7 @@ fn iso3_gpu_append_into_v_blocks(
         bump_rotor_k_shape(&mut vs.shape, new_shape);
         return Ok(());
     }
-    materialize_iso_v3_ring_tail(vs, device)?;
+    vs.reconcile_ring(device, crate::storage::RingDisposition::Keep)?;
     let block_feed = if feed == RingFeed::Skip {
         RingFeed::Skip
     } else {
@@ -1906,7 +1846,7 @@ fn iso4_gpu_append_into_v_blocks(
         bump_rotor_k_shape(&mut vs.shape, new_shape);
         return Ok(());
     }
-    materialize_iso_v4_ring_tail(vs, device)?;
+    vs.reconcile_ring(device, crate::storage::RingDisposition::Keep)?;
     let block_feed = if feed == RingFeed::Skip {
         RingFeed::Skip
     } else {
@@ -6738,7 +6678,7 @@ impl KvCache {
             arr
         } else {
             let t_deq = std::time::Instant::now();
-            let v_recon_f32 = vs.dequant()?;
+            let v_recon_f32 = vs.dequant_on(device)?;
             tracing::trace!(
                 phase = "iso3_dequant_cpu",
                 ms = t_deq.elapsed().as_secs_f64() * 1e3,
@@ -6922,7 +6862,7 @@ impl KvCache {
         let k_full = if device == Device::Gpu {
             ks.dequant_gpu(device)?
         } else {
-            let k_recon_f32 = ks.dequant()?;
+            let k_recon_f32 = ks.dequant_on(device)?;
             f32_vec_to_array(&k_recon_f32, &k_shape)?
         };
 
@@ -6969,7 +6909,7 @@ impl KvCache {
             arr
         } else {
             let t_deq = std::time::Instant::now();
-            let v_recon_f32 = vs.dequant()?;
+            let v_recon_f32 = vs.dequant_on(device)?;
             tracing::trace!(
                 phase = "iso3_dequant_cpu",
                 ms = t_deq.elapsed().as_secs_f64() * 1e3,

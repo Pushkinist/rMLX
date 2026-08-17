@@ -846,7 +846,8 @@ fn write_layer(
         }
         // IsoV4 SSD spill — K side identical to IsoV3 (q8_0); V side uses the
         // same flat IsoBlocks layout. Differentiated only by the geometry tag
-        // (ISOV4_LAYOUT_TAG = "iso_v_4") so the reader picks the 4-bit codec /
+        // (`ISOV4_LAYOUT_TAG`, currently "iso_v_4_v2" — bumped when the GPU
+        // append's byte orientation was fixed) so the reader picks the 4-bit codec /
         // pack on hydrate.
         KvStorage::IsoV4 { k, v, max_seq } => {
             let seq = write_quant_k(idx, "k", k.as_ref(), device, out)?;

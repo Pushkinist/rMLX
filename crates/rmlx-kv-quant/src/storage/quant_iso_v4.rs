@@ -298,6 +298,34 @@ impl QuantIsoV4 {
         blocks.iter().map(IsoBlocks::byte_size).sum::<u64>() + gpu.byte_size()
     }
 
+    /// Rebuild any ring-only prefix into the CPU blocks so `blocks` alone cover
+    /// `shape[2]` again, and either keep or drop the ring.
+    ///
+    /// Sibling of [`super::QuantIsoV3::reconcile_ring`] — see it for why the
+    /// disposition is a parameter rather than two copies of this body.
+    ///
+    /// # Errors
+    ///
+    /// Forwards a [`synced_iso_v_blocks`] reconciliation error.
+    pub(crate) fn reconcile_ring(
+        &mut self,
+        device: Device,
+        disposition: super::RingDisposition,
+    ) -> Result<()> {
+        if !self.gpu.is_allocated() {
+            return Ok(());
+        }
+        if let std::borrow::Cow::Owned(full) =
+            synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, device)?
+        {
+            self.blocks = full;
+        }
+        if disposition == super::RingDisposition::Drop {
+            self.gpu.clear();
+        }
+        Ok(())
+    }
+
     /// Dequantize all accumulated V slices into one flat f32 vector of length
     /// `prod(shape)`.
     ///

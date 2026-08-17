@@ -64,7 +64,6 @@ pub use quant_iso_k::{
     ISO_QUAT_BLOCK_SIZE,
 };
 pub use quant_iso_k4::{QuantIsoK4, ISO_K4_BITS, ISO_K4_GROUP_SIZE};
-pub(crate) use quant_iso_v::synced_iso_v_blocks;
 pub use quant_iso_v::{IsoBlocks, QuantIsoV3, ISO3_BITS, ISO3_GROUP_SIZE};
 pub use quant_iso_v4::{QuantIsoV4, ISO4_BITS, ISO4_GROUP_SIZE};
 pub use quant_k::QuantK;

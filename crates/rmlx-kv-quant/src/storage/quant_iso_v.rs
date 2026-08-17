@@ -1159,7 +1159,7 @@ impl QuantIsoV3 {
             // as one `[B, S, kv_h, D]` run below interleaves batch elements once
             // `B > 1` and more than one chunk landed. Refuse rather than return a
             // scrambled tensor — the block path handles every `B`.
-            if self.shape[0] != 1 && self.shape[2] > 1 {
+            if self.shape[0] != 1 && self.shape[2] != 0 {
                 return Err(Error::Quant(format!(
                     "QuantIsoV3::dequant_gpu: the GPU mirror is b == 1 only (its per-step \
                      stride does not interleave batch), got shape {:?}",
@@ -1231,13 +1231,16 @@ impl QuantIsoV3 {
         // WORDS_PER_GROUP = 1 for ISO3_GROUP_SIZE = 4.
         let codes_arr = Array::from_bytes(&inputs.codes, &[n], Dtype::U32)?;
         let scales_arr = Array::from_bytes(&inputs.scales, &[n], Dtype::F32)?;
-        let quats_arr = Array::from_bytes(&inputs.quaternions, &[n * 4], Dtype::F32)?;
         let norms_arr = Array::from_bytes(&inputs.norms, &[n], Dtype::F32)?;
 
+        // The kernel's quaternion parameter is `_quaternions` and is never bound
+        // as a kernel input (see `iso_dequantize_v3_gpu`); every group uses the
+        // constant `FIXED_QUAT`. Pass `codes_arr` rather than uploading a buffer
+        // the kernel discards — the same reuse the GPU mirror arm above makes.
         let flat = crate::isoquant_msl::iso_dequantize_v3_gpu(
             &codes_arr,
             &scales_arr,
-            &quats_arr,
+            &codes_arr,
             &norms_arr,
             head_dim,
             Dtype::F32,
@@ -1254,16 +1257,22 @@ const ISO_SLOT_BYTES: usize = 4;
 /// Flat kernel inputs for an iso store, with token rows in head-major order.
 ///
 /// Field lengths, in `(token, group)` slots: `codes` and `scales` carry one
-/// entry per slot, `quaternions` four, `norms` one (the per-token norm expanded
-/// to per-group, which is what the kernel indexes).
+/// entry per slot, `norms` one (the per-token norm expanded to per-group, which
+/// is what the kernel indexes).
+///
+/// There is deliberately no quaternion buffer. The dequant kernel takes a
+/// quaternion slot it never dereferences — every group uses the constant
+/// `FIXED_QUAT` — so building one costs `total_groups * 4` f32 of allocation,
+/// memcpy and upload per call for data that is discarded. At the geometry #392
+/// reports (`head_dim = 512`, 128 groups) that is four times the codes buffer,
+/// on a per-decode-step path. The readers pass `codes_arr` for that slot, which
+/// is what the GPU mirror arm in `dequant_gpu` already did.
 #[derive(Debug)]
 pub(crate) struct IsoKernelInputs {
     /// Packed codes, little-endian `u32`.
     pub codes: Vec<u8>,
     /// Per-group scales, little-endian `f32`.
     pub scales: Vec<u8>,
-    /// Per-group quaternions (4 components), little-endian `f32`.
-    pub quaternions: Vec<u8>,
     /// Per-group norms, little-endian `f32`.
     pub norms: Vec<u8>,
     /// `(token, group)` slot count — the kernel's flat length.
@@ -1339,7 +1348,6 @@ pub(crate) fn iso_kernel_inputs_head_major(
     let mut out = IsoKernelInputs {
         codes: vec![0_u8; total_groups * ISO_SLOT_BYTES],
         scales: vec![0_u8; total_groups * ISO_SLOT_BYTES],
-        quaternions: vec![0_u8; total_groups * 4 * ISO_SLOT_BYTES],
         norms: vec![0_u8; total_groups * ISO_SLOT_BYTES],
         total_groups,
     };
@@ -1348,7 +1356,10 @@ pub(crate) fn iso_kernel_inputs_head_major(
     for blk in blocks {
         let rows = super::BlockRows::rows(blk);
         // The scatter below indexes each payload by row; a length that is not a
-        // whole number of rows would silently read across a row boundary.
+        // whole number of rows would silently read across a row boundary. The
+        // quaternion table is checked too even though it is not scattered — a
+        // block whose table disagrees with its row count is malformed whoever
+        // reads it, and the CPU `dequant` does read it.
         let want_codes = rows * n_groups;
         if blk.codes.len() != want_codes
             || blk.scales.len() != want_codes
@@ -1385,12 +1396,6 @@ pub(crate) fn iso_kernel_inputs_head_major(
                 &blk.scales[r * n_groups..(r + 1) * n_groups],
                 f32::to_le_bytes,
             );
-            copy_f32_slots(
-                &mut out.quaternions,
-                dst_token * n_groups * 4,
-                &blk.quaternions[r * n_groups * 4..(r + 1) * n_groups * 4],
-                f32::to_le_bytes,
-            );
             // Per-token → per-group expand: the kernel reads `norms[gid]` with
             // `gid = token * n_groups + grp`, and every group in a token shares
             // the token's norm.
@@ -1407,12 +1412,14 @@ pub(crate) fn iso_kernel_inputs_head_major(
 }
 
 /// Write `src` into `dst` as little-endian 4-byte slots starting at slot
-/// `slot_offset`. Shared by the code / scale / quaternion scatters above.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "dst is sized total_groups slots and slot_offset + src.len() is bounded by the \
-              permutation's range, which head_major_token_order pins to that same count"
-)]
+/// `slot_offset`. Shared by the code and scale scatters above.
+///
+/// `dst` is sized `total_groups` slots and `slot_offset + src.len()` is bounded
+/// by the permutation's range, which `head_major_token_order` pins to that same
+/// count — so the indexing below is in bounds by construction. (Stated as prose
+/// rather than an `#[allow(clippy::indexing_slicing)]`: the module already
+/// allows that lint at the top of the file, so a per-site allow here would read
+/// as an enforced justification while enforcing nothing.)
 fn copy_f32_slots<T: Copy>(dst: &mut [u8], slot_offset: usize, src: &[T], to_le: fn(T) -> [u8; 4]) {
     for (i, &v) in src.iter().enumerate() {
         let at = (slot_offset + i) * 4;
