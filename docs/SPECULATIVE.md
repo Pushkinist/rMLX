@@ -130,19 +130,35 @@ append path (a QJL-carrying rotor K store, or a `Device::Cpu` run), and the
 legacy `update_rotor{3,4}_sym` / asym appends, which clear the ring by design.
 Those are exactly the paths a `q_seq > 1` verifier forward takes, since the
 fused decode entry is gated on `q_seq == 1`. The turbo / planar / affine stores
-have no ring at all, so their CPU payload is the only copy — but they also have a
-flat GPU mirror that carries the whole store under `Device::Gpu`, which bounds
-where their CPU payload is load-bearing: the V side of `K8VTurbo2/3`, both TCQ
-variants and `TurboSym3` (whose encode is forced to CPU even on GPU), plus any
-`Device::Cpu` run and any post-SSD-hydrate store. `Planar` / `PlanarK` do **not**
-accumulate CPU blocks on a normal GPU serve despite being the Gemma3 /
-Gemma4-dense arch default.
+have no ring at all, so their CPU payload is the only copy — but for them the
+binding constraint is not the ring, it is the **bf16 decode seed**.
+`exit_prefill` materialises `decode_fp16_{k,v}` for every quant whose
+`feeds_bf16_k_at_decode()` is true (all of them), and each quantized
+`update_<codec>` then early-returns into `update_decode_fp16` on its first line —
+so post-prefill the codec store is frozen and not read at decode time at all. A
+plain GPU serve therefore cannot observe whether the cut happened, on any of
+these codecs, including the ones whose encode is forced to `Device::Cpu`
+(`K8VTurbo2/3`, both TCQ variants, `TurboSym3`) — that forced-CPU `append` sits
+*below* the same early return.
+
+Where it is observable: a **hydrated** cache (`KvCache::from_storage` leaves
+`decode_fp16_k: None`, so the codec arm runs every decode step and the blocks are
+the cache), a `Device::Cpu` run, and any cache that never bracketed a prefill.
+An uncut store is also still *written out* on the seeded path — the SSD spill
+serialises `blocks` against `shape[2]`, and the prompt-cache snapshot clones
+them — which is how the defect travels from a seeded serve into the hydrated
+cache that later reads it. See `rmlx-kv-ssd/src/hydrate_tests.rs` for the
+round-trip that pins this.
 
 **Scope.** `KvStorage::truncate_to` no longer contains a bare `shape[2] = n` in
 any arm — `K8V4`, `K8V8`, `Planar`, `PlanarK`, `TurboSym3/4`, `K8VTurbo2/3`, both
 TCQ variants, `IsoV3/4`, `RotorV3/4` and **both** axes of `RotorKAsym3/4`
 delegate to a store-level `truncate_to`, so no codec truncates its two axes with
-different semantics any more.
+different semantics any more. `KvStorage::reset` had the identical defect and is
+rewired the same way. Truncation is also clamped to be monotone-decreasing on
+these six stores: a rollback into the decode window arrives with a target past
+the frozen store's fill, and raising `shape[2]` to meet it would invent coverage
+no payload backs.
 
 The split itself is still `b == 1` only, and that bound is unchanged: at `b > 1`
 the block concatenation is not readable by the decode path, so a mid-block cut

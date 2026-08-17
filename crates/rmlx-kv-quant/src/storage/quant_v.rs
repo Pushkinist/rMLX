@@ -618,8 +618,12 @@ impl QuantV {
     /// The CPU blocks are append-only, so without the cut the next `append`
     /// stacks on top of the rejected tokens and the dequant reads the rejected
     /// prefix back.
+    ///
+    /// The target is clamped to the store's current `shape[2]` — see
+    /// [`super::clamp_truncate_target`] for why that is not defensive padding
+    /// but the only correct reading for a ring-less store.
     pub fn truncate_to(&mut self, n: i32) {
-        let n = n.max(0);
+        let n = super::clamp_truncate_target(&self.shape, n);
         let plan = super::truncate_plan(
             self.blocks
                 .iter()

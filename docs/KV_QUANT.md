@@ -3128,20 +3128,51 @@ check, a refusal on the turbo stores would have zero-padded and on the planar
 stores would have panicked with an out-of-range index inside
 `seq_layout::transpose_seq_heads`.
 
-The **GPU** half of these stores needs no cut and gets none: its dequant slices
-`[0, shape[2])` and its next `append` writes at `prev_seq == shape[2]`, so
-lowering `shape[2]` already makes the rejected region overwritable. That bounds
-the blast radius, and the bound is worth stating because it is easy to get
-backwards: the defect was **CPU-payload-only**, so `Planar` and `PlanarK` — the
-arch defaults on Gemma3 and Gemma4-dense, and the auto-by-context pick above 32K
-— do **not** reach it on a normal `Device::Gpu` serve. `QuantPlanarK` /
-`QuantPlanarV` / `QuantK` append into the flat GPU buffers there and their block
-lists stay empty. What is live under `Device::Gpu` is the V side of the codecs
-whose encode is forced to CPU — `K8VTurbo2`, `K8VTurbo3`, `K8VTurbo2Tcq`,
-`K8VTurbo3Tcq` and `TurboSym3` (`update.rs` passes `Device::Cpu` to those
-`QuantV::append` calls unconditionally, and `exit_prefill` does the same for
-their bulk-quantize path). Everything else reaches it on a `Device::Cpu` run or
-after an SSD hydrate.
+**Where this is actually observable — the bf16 decode seed gates it.** Two
+independent things have to be true for the cut to change an answer, and getting
+only the first one right leads to the wrong conclusion.
+
+*First*, the store's CPU payload has to be live rather than its flat GPU mirror.
+The GPU half needs no cut and gets none: its dequant slices `[0, shape[2])` and
+its next `append` writes at `prev_seq == shape[2]`, so lowering `shape[2]`
+already makes the rejected region overwritable.
+
+*Second — and this is the binding constraint — the codec store has to be **read**
+after the truncate.* On a normal serve it is not. `exit_prefill` materialises the
+bf16 `decode_fp16_{k,v}` seed for every quant whose `feeds_bf16_k_at_decode()` is
+true (`quant.rs`), which covers `K8V4`, `K8V8`, `Planar`, `Planar3`, `PlanarK`,
+`K8VTurbo2/3`, both TCQ variants and `TurboSym3/4` — i.e. every store this
+section is about. From then on each quantized `update_<codec>` early-returns into
+`update_decode_fp16` at its first line, and `update.rs` states the consequence as
+the architectural contract: *"the codec storage buffer is frozen at the prefill
+length and is not consulted at decode-read time."* The CPU block list is written
+once by `exit_prefill` and never read again on that path, so a plain GPU serve
+**cannot distinguish a correct cut from a no-op cut** — including with
+`--kv-quant k8vturbo3`, whose forced-CPU `QuantV::append` sits below that same
+early return.
+
+So the live paths are the ones with **no** bf16 seed:
+
+- **A hydrated cache.** `KvCache::from_storage` leaves `decode_fp16_k: None`, so
+  the codec arm runs on every decode step — the store's blocks *are* the cache.
+  The hydrated prefix arrives as a single block, so any trim inside it is a
+  mid-block cut. This is the path the round-trip tests in
+  `rmlx-kv-ssd/src/hydrate_tests.rs` drive.
+- **A `Device::Cpu` run**, where there is no GPU mirror at all.
+- **Any cache that never bracketed a prefill**, and so never reached
+  `exit_prefill` to be seeded.
+
+The store is also still read *without* a decode step in two places that matter
+even on the seeded path: the SSD spill (`write_quant_k` / `write_quant_v`
+serialise `blocks` and report `shape[2]`) and the prompt-cache snapshot
+(`try_deep_clone`). An uncut store spills a header claiming more tokens than its
+bytes hold, which is how the defect propagates from a seeded serve into the
+hydrated cache that later reads it.
+
+An earlier revision of this section named `--kv-quant k8vturbo3` on a plain serve
+as the cheapest observable cell. That was wrong for the reason above — device
+routing is not the same question as whether the store is read — and is corrected
+here rather than left for a reader to re-derive.
 
 `TurboBlocks` and `PlanarBlocks` carry no `n_tokens`, so their row count comes
 from `original_shape` — and that field's axis order is **not** consistent across
@@ -3154,11 +3185,43 @@ naming one, and a split records the geometry it actually produced —
 `[1, 1, rows, width]` — instead of guessing which axis the caller meant. Pinned
 by `cpu_block_truncate_tests::quant_v_truncate_reads_rows_from_the_shape_product`.
 
+**Truncation is monotone-decreasing.** All six clamp the target to the store's
+current `shape[2]` (`storage::clamp_truncate_target`). `n > shape[2]` is
+reachable, not hypothetical: post-`exit_prefill` the codec store is frozen at the
+prefill length while `KvCache::offset` keeps advancing on the bf16 mirror, so a
+speculative rollback into the decode window arrives with a target past the
+store's own fill. Raising `shape[2]` to meet it invents coverage no payload
+backs — the dequant reads past the blocks and the SSD spill persists a header
+claiming more tokens than its bytes hold. The rotor / iso stores deliberately do
+**not** clamp, and that asymmetry is load-bearing: their blocks may legitimately
+trail `shape[2]` because a live GPU ring holds the decode tail and
+`synced_rotor_v_blocks` / `synced_iso_v_blocks` rebuild from it. These stores
+have no ring, so for them a shortfall is never recoverable.
+
+`KvStorage::reset` carried the same defect one screen above `truncate_to` — a
+bare `shape[2] = 0` on exactly these six store types, leaving the payload
+covering the sequence just discarded. Every arm now delegates to the store's own
+`truncate_to(0)` / `reset()`; the GPU buffers are still kept for reuse.
+
 Tests: `storage/cpu_block_truncate_tests.rs` — the partial-accept round trip per
 store (`QuantV`, `QuantKTurbo3`, `QuantKTurbo4`, `QuantPlanarK`, `QuantPlanarV`,
-`QuantK`) at `kv_h` 1 and 3, the `b > 1` and q8-group refusals, and the
-`KvStorage::truncate_to` dispatch. Every oracle is a reference store built from
-only the retained tokens, sharing no arithmetic with the truncation logic.
+`QuantK`) at `kv_h` 1 and 3; the `b > 1` and q8-group refusals; the zero,
+exact-length and past-the-end targets; `KvStorage::reset`; the `RotKTq4V`
+zero-reset; and a five-arm `KvStorage::truncate_to` dispatch case (`K8V4`,
+`TurboSym3`, `TurboSym4`, `Planar`, `PlanarK`) that decodes both axes and
+compares against reference stores, so reverting any single arm to
+`shape[2] = n` turns exactly that case red. Every oracle is a reference store
+built from only the retained tokens, sharing no arithmetic with the truncation
+logic — deliberately not a recomputation of the cut via `block_rows`, which
+would pass any mutation scaling the cut and the reading together.
+
+End-to-end on the live path: `rmlx-kv-ssd/src/hydrate_tests.rs` spills a
+256-token cache, hydrates it, truncates to 200 (mid-block), appends a 2-token
+correction and checks the decoded V — for `K8VTurbo3` and `Planar`, at `kv_h` 1
+and 2. It asserts as a **premise** that the hydrated cache carries no bf16 decode
+seed, so it cannot pass vacuously on the frozen-store path. The retained prefix
+is compared against a decode of the same store taken before the cut; the
+correction against its own raw f32 source.
 
 **Real-serve reachability audit (per #284).** `KvCache::truncate_to` has three
 production callers: prompt-cache partial-prefix trim

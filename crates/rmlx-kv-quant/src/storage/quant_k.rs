@@ -107,8 +107,12 @@ impl QuantK {
     /// the dequant reads the rejected prefix back instead — wrong attention
     /// with no error, which is exactly what the coverage check in
     /// `dequantize_choice` now refuses to produce.
+    ///
+    /// The target is clamped to the store's current `shape[2]` — see
+    /// [`super::clamp_truncate_target`] for why that is not defensive padding
+    /// but the only correct reading for a ring-less store.
     pub fn truncate_to(&mut self, n: i32) {
-        let n = n.max(0);
+        let n = super::clamp_truncate_target(&self.shape, n);
         self.retain_cpu_prefix(n);
         // `get_mut` rather than `shape[2]`: the store shape is rank-4 by
         // construction, and this is the bounds proof rather than a claim.

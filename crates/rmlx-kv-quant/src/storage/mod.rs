@@ -250,6 +250,29 @@ pub(crate) fn truncate_plan(
     }
 }
 
+/// Clamp a truncation target to what the store already covers.
+///
+/// Truncation is monotone-decreasing by contract, and for the turbo / planar /
+/// affine stores that has to be enforced rather than assumed. `n > shape[2]` is
+/// reachable: post-`exit_prefill` the codec store is frozen at the prefill
+/// length while `KvCache::offset` keeps advancing on the bf16 decode mirror, so
+/// a speculative rollback to a position inside the decode window arrives with a
+/// target past the store's own fill. Raising `shape[2]` to meet it invents
+/// coverage that no payload backs — the CPU dequant then reads past the blocks
+/// and the SSD spill persists a store whose header claims more tokens than its
+/// bytes hold.
+///
+/// The rotor / iso stores deliberately do **not** clamp, and that asymmetry is
+/// load-bearing: their blocks may legitimately trail `shape[2]` because a live
+/// GPU ring holds the decode tail, and `synced_rotor_v_blocks` /
+/// `synced_iso_v_blocks` rebuild the missing prefix from it. Clamping there
+/// would throw that tail away. These stores have no ring, so for them a
+/// shortfall is never recoverable and the clamp is the only correct reading.
+pub(crate) fn clamp_truncate_target(shape: &[i32], n: i32) -> i32 {
+    let covered = shape.get(2).copied().unwrap_or(0).max(0);
+    n.max(0).min(covered)
+}
+
 /// Rows a `[…, D]`-shaped codec block holds — one row per `head_dim`-wide
 /// vector, i.e. the product of the leading three axes.
 ///

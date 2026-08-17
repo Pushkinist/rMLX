@@ -755,33 +755,40 @@ impl KvStorage {
         clippy::cognitive_complexity,
         reason = "long match enumerates all KvStorage variants; splitting would obscure the 1-to-1 mapping"
     )]
+    /// Clear the accumulated sequence, keeping the allocations.
+    ///
+    /// Every arm goes through the store's own `truncate_to(0)` / `reset()`, for
+    /// the same reason `truncate_to` does: zeroing `shape[2]` alone leaves the
+    /// CPU-side payload — a block list, or `QuantK`'s flat `codes`/`scales` —
+    /// covering the sequence that was just discarded, so the next `append`
+    /// stacks on top of it and the dequant reads the discarded tokens back.
+    /// `truncate_to(0)` cuts that payload as well. The GPU buffers are still
+    /// kept in place so the next request reuses the same allocation; the next
+    /// `append` overwrites their prefix from offset 0.
     pub fn reset(&mut self) {
         match self {
-            // Quant paths: zero the accumulated shape but keep the GPU buffers
-            // so the next request reuses the same allocation. Each Quant struct's
-            // own append() will overwrite the prefix from offset=0.
             Self::K8V4 { k, v, .. } => {
                 if let Some(ks) = k.as_mut() {
-                    ks.shape[2] = 0;
+                    ks.truncate_to(0);
                 }
                 if let Some(vs) = v.as_mut() {
-                    vs.shape[2] = 0;
+                    vs.truncate_to(0);
                 }
             }
             Self::K8V8 { k, v, .. } => {
                 if let Some(ks) = k.as_mut() {
-                    ks.shape[2] = 0;
+                    ks.truncate_to(0);
                 }
                 if let Some(vs) = v.as_mut() {
-                    vs.shape[2] = 0;
+                    vs.truncate_to(0);
                 }
             }
             Self::Planar { k, v, .. } => {
                 if let Some(ks) = k.as_mut() {
-                    ks.shape[2] = 0;
+                    ks.truncate_to(0);
                 }
                 if let Some(vs) = v.as_mut() {
-                    vs.shape[2] = 0;
+                    vs.truncate_to(0);
                 }
             }
             // None: no quant state — the bf16 buffers live on KvCache and are
@@ -804,56 +811,56 @@ impl KvStorage {
             Self::RotKTq4V { k_state, v, .. } => {
                 k_state.reset();
                 if let Some(qv) = v.as_mut() {
-                    qv.shape[2] = 0;
+                    qv.truncate_to(0);
                 }
             }
             // K8VTurbo3 resets like K8V4.
             Self::K8VTurbo3 { k, v, .. } => {
                 if let Some(ks) = k.as_mut() {
-                    ks.shape[2] = 0;
+                    ks.truncate_to(0);
                 }
                 if let Some(vs) = v.as_mut() {
-                    vs.shape[2] = 0;
+                    vs.truncate_to(0);
                 }
             }
             // TurboSym3 — symmetric reset (K3 + V3 shape-zeroing).
             Self::TurboSym3 { k, v, .. } => {
                 if let Some(ks) = k.as_mut() {
-                    ks.shape[2] = 0;
+                    ks.truncate_to(0);
                 }
                 if let Some(vs) = v.as_mut() {
-                    vs.shape[2] = 0;
+                    vs.truncate_to(0);
                 }
             }
             // TurboSym4 — symmetric reset (same shape-zeroing).
             Self::TurboSym4 { k, v, .. } => {
                 if let Some(ks) = k.as_mut() {
-                    ks.shape[2] = 0;
+                    ks.truncate_to(0);
                 }
                 if let Some(vs) = v.as_mut() {
-                    vs.shape[2] = 0;
+                    vs.truncate_to(0);
                 }
             }
             // PlanarK — K only; V (bf16) lives on parent KvCache.
             Self::PlanarK { k, .. } => {
                 if let Some(ks) = k.as_mut() {
-                    ks.shape[2] = 0;
+                    ks.truncate_to(0);
                 }
             }
             // K8VTurbo2 resets like K8V4.
             Self::K8VTurbo2 { k, v, .. } => {
                 if let Some(ks) = k.as_mut() {
-                    ks.shape[2] = 0;
+                    ks.truncate_to(0);
                 }
                 if let Some(vs) = v.as_mut() {
-                    vs.shape[2] = 0;
+                    vs.truncate_to(0);
                 }
             }
             // IsoV3 — K is q8_0; V holds CPU IsoBlocks (reset clears them so
             // the next request starts fresh).
             Self::IsoV3 { k, v, .. } => {
                 if let Some(ks) = k.as_mut() {
-                    ks.shape[2] = 0;
+                    ks.truncate_to(0);
                 }
                 if let Some(vs) = v.as_mut() {
                     vs.reset();
@@ -862,7 +869,7 @@ impl KvStorage {
             // IsoV4 — same shape semantics as IsoV3.
             Self::IsoV4 { k, v, .. } => {
                 if let Some(ks) = k.as_mut() {
-                    ks.shape[2] = 0;
+                    ks.truncate_to(0);
                 }
                 if let Some(vs) = v.as_mut() {
                     vs.reset();
@@ -872,7 +879,7 @@ impl KvStorage {
             // static rotor table.
             Self::RotorV3 { k, v, .. } => {
                 if let Some(ks) = k.as_mut() {
-                    ks.shape[2] = 0;
+                    ks.truncate_to(0);
                 }
                 if let Some(vs) = v.as_mut() {
                     vs.reset();
@@ -881,7 +888,7 @@ impl KvStorage {
             // RotorV4 — same semantics as RotorV3.
             Self::RotorV4 { k, v, .. } => {
                 if let Some(ks) = k.as_mut() {
-                    ks.shape[2] = 0;
+                    ks.truncate_to(0);
                 }
                 if let Some(vs) = v.as_mut() {
                     vs.reset();
@@ -890,19 +897,19 @@ impl KvStorage {
             // K8VTurbo3Tcq resets like K8VTurbo3 / K8V4.
             Self::K8VTurbo3Tcq { k, v, .. } => {
                 if let Some(ks) = k.as_mut() {
-                    ks.shape[2] = 0;
+                    ks.truncate_to(0);
                 }
                 if let Some(vs) = v.as_mut() {
-                    vs.shape[2] = 0;
+                    vs.truncate_to(0);
                 }
             }
             // K8VTurbo2Tcq resets like K8VTurbo2 / K8VTurbo3Tcq.
             Self::K8VTurbo2Tcq { k, v, .. } => {
                 if let Some(ks) = k.as_mut() {
-                    ks.shape[2] = 0;
+                    ks.truncate_to(0);
                 }
                 if let Some(vs) = v.as_mut() {
-                    vs.shape[2] = 0;
+                    vs.truncate_to(0);
                 }
             }
             // IsoSym3/IsoSym4 reset both K + V iso buffers.
@@ -970,7 +977,7 @@ impl KvStorage {
                     ks.reset();
                 }
                 if let Some(vs) = v.as_mut() {
-                    vs.shape[2] = 0;
+                    vs.truncate_to(0);
                 }
             }
             Self::RotorKAsym4 { k, v, .. } => {
@@ -978,7 +985,7 @@ impl KvStorage {
                     ks.reset();
                 }
                 if let Some(vs) = v.as_mut() {
-                    vs.shape[2] = 0;
+                    vs.truncate_to(0);
                 }
             }
         }

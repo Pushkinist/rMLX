@@ -110,9 +110,11 @@ impl QuantKTurbo4 {
     ///
     /// Drops trailing CPU blocks past `n` and **splits** the block the cut lands
     /// inside (see [`super::truncate_plan`]), then lowers `shape[2]` to `n`. The
-    /// GPU buffers need no cut — see [`super::QuantV::truncate_to`].
+    /// GPU buffers need no cut — see [`super::QuantV::truncate_to`]. The target
+    /// is clamped to the store's current `shape[2]`
+    /// ([`super::clamp_truncate_target`]).
     pub fn truncate_to(&mut self, n: i32) {
-        let n = n.max(0);
+        let n = super::clamp_truncate_target(&self.shape, n);
         let plan = super::truncate_plan(
             self.blocks
                 .iter()
