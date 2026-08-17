@@ -47,7 +47,8 @@ use crate::planarquant::{planar_dequantize, planar_quantize};
 use crate::rotorquant::{n_groups_for, rotor3_decode, rotor3_encode, rotor4_decode, rotor4_encode};
 use crate::tcq::{tcq_quantize_v2, tcq_quantize_v3};
 use crate::test_utils::{
-    gaussian_data, lloyd_max_anchor_db, sqnr_db, wasted_bits, DB_PER_BIT, TEST_SEED,
+    gaussian_data, lloyd_max_anchor_db, sqnr_db, stored_bits_per_value, wasted_bits, DB_PER_BIT,
+    TEST_SEED,
 };
 use crate::turboquant::{
     lloyd_gaussian_codebook, turbo_dequantize, turbo_dequantize_with_codebook, turbo_quantize_v,
@@ -67,8 +68,13 @@ fn gaussian_fixture() -> Vec<f32> {
 }
 
 /// Bits per value implied by a heap footprint over [`RD_VALUES`] values.
+///
+/// Thin binding of the shared [`stored_bits_per_value`] accounting to this
+/// module's fixture size — the same helper `kv_rate_tests.rs` measures every
+/// codec's ceiling with, so the rate column here and the ceiling gate there
+/// cannot drift apart.
 fn bits_per_value(bytes: u64) -> f64 {
-    (bytes * 8) as f64 / RD_VALUES as f64
+    stored_bits_per_value(bytes, RD_VALUES)
 }
 
 // ── Codec cells ──────────────────────────────────────────────────────────────

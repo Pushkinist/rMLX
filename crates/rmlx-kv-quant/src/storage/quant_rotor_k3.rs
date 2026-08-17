@@ -80,6 +80,39 @@ impl RotorKBlocks {
     }
 }
 
+impl super::BlockRows for RotorKBlocks {
+    /// The exhaustive destructure is the drift guard: a new payload field
+    /// cannot be added without this failing to compile, which is what stops a
+    /// sideband from surviving a mid-block truncation at its full length.
+    fn retain_rows(&mut self, rows: usize) -> bool {
+        let Self {
+            codes,
+            scales,
+            norms,
+            qjl_codes,
+            qjl_norms,
+            n_tokens,
+        } = self;
+        let lengths = [
+            codes.len(),
+            scales.len(),
+            norms.len(),
+            qjl_codes.len(),
+            qjl_norms.len(),
+        ];
+        if !super::rows_split_ok(&lengths, *n_tokens, rows) {
+            return false;
+        }
+        super::retain_rows_in(codes, *n_tokens, rows);
+        super::retain_rows_in(scales, *n_tokens, rows);
+        super::retain_rows_in(norms, *n_tokens, rows);
+        super::retain_rows_in(qjl_codes, *n_tokens, rows);
+        super::retain_rows_in(qjl_norms, *n_tokens, rows);
+        *n_tokens = rows;
+        true
+    }
+}
+
 /// Accumulated rotor3 K cache.
 ///
 /// Holds:
@@ -373,25 +406,29 @@ impl QuantRotorK3 {
 
     /// Truncate the accumulated sequence to `n` positions.
     ///
+    /// A cut that lands inside a block **splits** that block (see
+    /// [`super::truncate_plan`]) rather than dropping it. A speculative-decode
+    /// partial accept always cuts mid-block — the verifier appends its whole
+    /// multi-token chunk as one block and then keeps only the accepted prefix —
+    /// so dropping the block would discard the accepted tokens along with the
+    /// rejected ones and leave `blocks` short of `shape[2]`. On the CPU append
+    /// path (a QJL-carrying store, or a CPU-device run) no GPU ring exists to
+    /// rebuild that gap, and the next `dequant` / `try_deep_clone` aborts the
+    /// request rather than fabricate a zeroed prefix.
+    ///
     /// The GPU ring is **kept**, not cleared: this mirrors how the flat GPU-buffer
     /// codecs truncate (`QuantK` / K8V4 etc. just lower `shape[2]` and overwrite
     /// on the next append). Lowering `shape[2]` to `n` makes the ring's logical
     /// fill `n`; the stale `[n, prev)` capacity is overwritten by the next append
-    /// and never read (`packed_view` always slices to `shape[2]`). This preserves
-    /// any ring-only decode tail up to `n`, so `dequant` / an SSD spill can still
-    /// rebuild it. Clearing the ring here — the previous behaviour — discarded
-    /// the tail (the only copy of `[frozen_prefix, n)`), leaving `blocks` short
-    /// of `shape[2]` with no ring: the divergent state the codec rejects loudly,
-    /// which would abort generation on the speculative-decode rollback path.
+    /// and never read (`packed_view` always slices to `shape[2]`).
     #[allow(
         clippy::indexing_slicing,
         reason = "shape.len() >= 4 checked immediately before indexing shape[2]"
     )]
     pub fn truncate_to(&mut self, n: i32) {
         let n = n.max(0);
-        let keep =
-            super::truncate_keep_count(self.blocks.iter().map(|blk| blk.n_tokens), &self.shape, n);
-        self.blocks.truncate(keep);
+        let plan = super::truncate_plan(self.blocks.iter().map(|blk| blk.n_tokens), &self.shape, n);
+        super::apply_truncate_plan(&mut self.blocks, &plan);
         // NB: no `self.gpu.clear()` — the ring is the source of truth for a
         // ring-only decode tail; see the doc comment above.
         if self.shape.len() >= 4 {

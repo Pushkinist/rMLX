@@ -111,10 +111,16 @@ fn quant_rotor_k3_short_blocks_without_ring_is_loud_not_zero_padded() {
     );
 }
 
+/// Encode + decode run under whatever QJL setting is ambient.
+///
+/// The name used to say "default on", which is false — `crate::rotor_qjl`
+/// defaults **off** because the sideband has no MSL kernel and forces the whole
+/// rotor K path onto the CPU. The body never asserted a default either; the
+/// toggle itself is covered by the lift test below.
 #[test]
-fn quant_rotor_k3_qjl_default_on() {
+fn quant_rotor_k3_roundtrip_under_ambient_qjl_setting() {
     let _guard = crate::test_utils::env_lock();
-    // Default ON when no env override is set.
+    // No env override: whatever the process default resolves to.
     // SAFETY: env lock held — no concurrent env reader/writer in this binary.
     unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
 
@@ -268,9 +274,18 @@ fn seed_ring_via_gpu_append(
     let n_groups = n_groups_for(head_dim as usize) as i32;
     let cps = (kv_h * n_groups * n_tokens) as usize;
     let nps = (kv_h * n_tokens) as usize;
+    // Scales and norms start at 1, not 0. `rotor3_decode` multiplies the
+    // reconstruction by both, so a zero in either makes the decoded token
+    // identically zero — and a value oracle built from the same zeros then
+    // compares zeros to zeros and cannot tell a correct ring readback from a
+    // zero-padded gap, which is the exact failure these tests exist to catch.
     let codes_b: Vec<u8> = (0..cps).flat_map(|i| (i as u32).to_le_bytes()).collect();
-    let scales_b: Vec<u8> = (0..cps).flat_map(|i| (i as f32).to_le_bytes()).collect();
-    let norms_b: Vec<u8> = (0..nps).flat_map(|i| (i as f32).to_le_bytes()).collect();
+    let scales_b: Vec<u8> = (0..cps)
+        .flat_map(|i| ((i + 1) as f32).to_le_bytes())
+        .collect();
+    let norms_b: Vec<u8> = (0..nps)
+        .flat_map(|i| ((i + 1) as f32).to_le_bytes())
+        .collect();
     let codes = Array::from_bytes(&codes_b, &[cps as i32], Dtype::U32).expect("codes");
     let scales = Array::from_bytes(&scales_b, &[cps as i32], Dtype::F32).expect("scales");
     let norms = Array::from_bytes(&norms_b, &[nps as i32], Dtype::F32).expect("norms");
@@ -310,22 +325,28 @@ fn quant_rotor_k3_reset_drops_the_gpu_ring() {
 
 /// `truncate_to()` must KEEP the GPU ring, not drop it.
 ///
-/// The ring is the only copy of a fused-decode ring-only tail (`blocks` can
-/// trail `shape[2]` on that path — see `synced_rotor_k_blocks`), and a whole
-/// CPU block that does not wholly fit the truncated target is dropped
-/// outright rather than split. Clearing the ring here (the pre-fix behaviour)
-/// would strand the kept prefix with nothing to rebuild it from, and
-/// `dequant()` / an SSD spill would hit the "blocks short of shape[2], no
-/// ring" guard and abort instead of returning the kept tokens.
+/// Reproduces the fused decode path's state exactly: the store carries a
+/// **ring-only tail** — `blocks` empty (dropped once the ring went live, the way
+/// `drop_blocks_when_ring_live_k3` does it) while the ring holds the whole
+/// prefix and `shape[2]` tracks it. The ring is then the only copy of every
+/// token. Clearing it in `truncate_to` (the pre-fix behaviour) strands the kept
+/// prefix with nothing to rebuild it from, and `dequant()` / an SSD spill hits
+/// the "blocks short of shape[2], no ring" guard and aborts instead of returning
+/// the kept tokens.
+///
+/// Note this is the ring-only regime, **not** the mid-block split: with `blocks`
+/// empty there is nothing to split, so `truncate_to` only lowers `shape[2]`. The
+/// split is covered on the CPU side by
+/// [`quant_rotor_k3_truncate_mid_block_splits_at_this_shape`] — which runs in
+/// `make ci`, unlike this one — and by
+/// `quant_rotor_k3_truncate_mid_block_splits_instead_of_dropping`.
 ///
 /// `kv_h = 1` keeps `RotorKBlocks::n_tokens` (`b * kv_h * seq`) directly
-/// comparable to the truncate target `n` (a raw sequence position), so which
-/// blocks `truncate_to` keeps is unambiguous here.
+/// comparable to the truncate target `n` (a raw sequence position).
 ///
 /// Mutation check: re-introduce `self.gpu.clear()` in `truncate_to`. The ring
-/// (the only remaining copy of the kept token, since the 2-token CPU block
-/// was dropped) is then gone, so `dequant()` hits the no-ring guard and
-/// returns `Err` instead of `Ok` — RED.
+/// (the only remaining copy of the kept token) is then gone, so `dequant()`
+/// hits the no-ring guard and returns `Err` instead of `Ok` — RED.
 #[test]
 #[ignore = "GPU Metal context — run in isolation: cargo test quant_rotor_k3 -- --ignored --test-threads=1"]
 fn quant_rotor_k3_truncate_to_keeps_the_gpu_ring() {
@@ -342,20 +363,17 @@ fn quant_rotor_k3_truncate_to_keeps_the_gpu_ring() {
     ks.append(&d1, &[1, kv_h, 2, head_dim]).expect("append");
     assert_eq!(ks.shape[2], 2);
 
-    // A live ring covering both tokens.
+    // A live ring covering both tokens, then drop the redundant CPU blocks —
+    // this is what the fused decode append does once the ring is allocated, and
+    // it is what makes the ring the sole copy.
     seed_ring_via_gpu_append(&mut ks, kv_h, head_dim, 2, RING_TEST_MAX_SEQ);
     assert!(ks.gpu.is_allocated());
+    ks.blocks.clear();
 
-    // Truncate to seq=1, mid-block: the sole 2-token CPU block does not wholly
-    // fit the target, so it is dropped entirely rather than split — the kept
-    // token must be rebuilt from the ring, not zero-padded or errored.
+    // Truncate to seq=1. Nothing to split (no blocks), so the kept token exists
+    // only in the ring and must be rebuilt from it — not zero-padded, not an error.
     ks.truncate_to(1);
     assert_eq!(ks.shape[2], 1);
-    assert!(
-        ks.blocks.is_empty(),
-        "precondition: the 2-token block doesn't wholly fit target seq=1, so it \
-         is dropped — the kept token must come from the ring"
-    );
     assert!(
         ks.gpu.is_allocated(),
         "truncate_to() must KEEP the ring — it is the source of truth for a \
@@ -370,8 +388,8 @@ fn quant_rotor_k3_truncate_to_keeps_the_gpu_ring() {
         .expect("dequant after truncate must read the kept token from the ring");
     let n_groups = n_groups_for(head_dim as usize);
     let ref_codes: Vec<u32> = (0..n_groups as u32).collect();
-    let ref_scales: Vec<f32> = (0..n_groups).map(|i| i as f32).collect();
-    let ref_norms = vec![0.0_f32];
+    let ref_scales: Vec<f32> = (0..n_groups).map(|i| (i + 1) as f32).collect();
+    let ref_norms = vec![1.0_f32];
     let reference = rotor3_decode(
         &ref_codes,
         &ref_scales,
@@ -380,6 +398,15 @@ fn quant_rotor_k3_truncate_to_keeps_the_gpu_ring() {
         head_dim as usize,
     )
     .expect("reference decode of the seeded ring token");
+    // The oracle only discriminates if it is not all zeros — `rotor3_decode`
+    // scales by both the per-group scale and the per-token norm, so a zero in
+    // either would make this comparison zeros-vs-zeros and unable to tell a
+    // correct readback from a zero-padded gap.
+    assert!(
+        reference.iter().any(|v| v.abs() > 1e-6),
+        "the reference token decoded to all zeros — the seeded scales/norms went back \
+         to starting at 0 and this assertion is vacuous"
+    );
     assert_eq!(
         dq, reference,
         "dequant() after truncate must return the ring's actual content for the \
@@ -476,4 +503,137 @@ fn quant_rotor_k3_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
 
     // SAFETY: env lock still held.
     unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
+}
+
+/// A speculative partial accept truncates the K store **inside** the verifier's
+/// append block; the block must be split, not dropped.
+///
+/// The verifier appends its whole multi-token chunk as one block, then the
+/// round keeps only the accepted prefix. Dropping the block discards the
+/// accepted tokens with the rejected ones, leaving `blocks` covering fewer rows
+/// than `shape[2]`. With no GPU ring live — the CPU append path, which is what
+/// a QJL-carrying store and every `--kv-quant rotor*_sym` legacy append use —
+/// `synced_rotor_k_blocks` has nothing to rebuild the gap from and aborts the
+/// request with "CPU blocks cover N tokens but shape[2] needs M".
+///
+/// Covers the QJL sideband explicitly: `qjl_codes` / `qjl_norms` are per-token
+/// buffers with a different stride from `codes` / `scales`, so a split that only
+/// handled the main payload would leave them over-long.
+///
+/// The oracle is a reference store built from only the retained tokens — same
+/// shape, same layer index (so the same static rotor table and QJL projection),
+/// deterministic encode. It shares no arithmetic with the truncation logic,
+/// which never reads a payload value.
+///
+/// Mutation check: restore the whole-block drop and `dequant()` returns `Err`
+/// with that message, so the `expect` below goes RED.
+#[test]
+fn quant_rotor_k3_truncate_mid_block_splits_instead_of_dropping() {
+    let _guard = crate::test_utils::env_lock();
+    if crate::rotor_qjl::rotor_qjl_cli_is_set() {
+        return;
+    }
+    // SAFETY: env lock held — no concurrent env reader/writer in this binary.
+    unsafe { std::env::set_var("RMLX_ROTOR_QJL", "1") };
+
+    let head_dim = 12_usize; // n_groups = 4, exact
+    let kv_h = 2_usize;
+    let chunk = |first_tok: usize, n_tok: usize| -> Vec<f32> {
+        let mut out = vec![0.0_f32; kv_h * n_tok * head_dim];
+        for h in 0..kv_h {
+            for t in 0..n_tok {
+                for d in 0..head_dim {
+                    out[(h * n_tok + t) * head_dim + d] =
+                        (h as f32) * 100.0 + (first_tok + t) as f32 * 10.0 + (d as f32) * 0.25;
+                }
+            }
+        }
+        out
+    };
+
+    // 46 prefill positions, then a 5-position verifier chunk; 4 accepted.
+    let mut store = QuantRotorK3::new(vec![1_i32, kv_h as i32, 0, head_dim as i32], 0);
+    store
+        .append(&chunk(0, 46), &[1, kv_h as i32, 46, head_dim as i32])
+        .expect("prefill append");
+    store
+        .append(&chunk(46, 5), &[1, kv_h as i32, 5, head_dim as i32])
+        .expect("verifier append");
+    assert!(store.use_qjl(), "QJL sideband active for this store");
+    assert_eq!(store.shape[2], 51);
+
+    store.truncate_to(50);
+
+    let decoded = store
+        .dequant()
+        .expect("dequant must succeed after a mid-block speculative rollback");
+
+    assert_eq!(store.shape[2], 50);
+    let kept_rows: usize = store.blocks.iter().map(|blk| blk.n_tokens).sum();
+    assert_eq!(kept_rows, 50 * kv_h, "blocks must cover shape[2] exactly");
+    let qjl_rows: usize = store.blocks.iter().map(|blk| blk.qjl_norms.len()).sum();
+    assert_eq!(
+        qjl_rows,
+        50 * kv_h,
+        "the QJL sideband must be cut to the same row count as the main payload"
+    );
+
+    let mut reference = QuantRotorK3::new(vec![1_i32, kv_h as i32, 0, head_dim as i32], 0);
+    reference
+        .append(&chunk(0, 46), &[1, kv_h as i32, 46, head_dim as i32])
+        .expect("prefill append");
+    reference
+        .append(&chunk(46, 4), &[1, kv_h as i32, 4, head_dim as i32])
+        .expect("accepted-prefix append");
+    let ref_decoded = reference.dequant().expect("reference dequant");
+
+    assert_eq!(
+        decoded, ref_decoded,
+        "the split block must reconstruct the retained prefix exactly"
+    );
+
+    // SAFETY: env lock held.
+    unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
+}
+
+/// The same shape the ring test uses, on the CPU side, where `make ci` runs it.
+///
+/// `quant_rotor_k3_truncate_to_keeps_the_gpu_ring` needs a Metal context, so it
+/// carries `#[ignore]` and only `make gpu-test` / `make ci-perf` execute it. A
+/// truncation-semantics change is therefore invisible to the per-commit gate
+/// unless the same state transition is also asserted without a GPU. This is that
+/// assertion: one 2-token block, `truncate_to(1)`, no ring anywhere.
+///
+/// Mutation check: restore the whole-block drop and `blocks` is empty while
+/// `shape[2] == 1`, so `dequant()` returns the no-ring `Err` and the `expect`
+/// goes RED.
+#[test]
+fn quant_rotor_k3_truncate_mid_block_splits_at_this_shape() {
+    let (kv_h, head_dim) = (1_i32, 6_i32);
+    let mut ks = QuantRotorK3::new(vec![1, kv_h, 0, head_dim], 0);
+    ks.rotors = make_rotor_table(0, 0, n_groups_for(head_dim as usize));
+    let per_tok = (kv_h * head_dim) as usize;
+    let d1 = lcg_data(per_tok * 2, TEST_SEED);
+    ks.append(&d1, &[1, kv_h, 2, head_dim]).expect("append");
+
+    ks.truncate_to(1);
+
+    assert_eq!(ks.shape[2], 1);
+    let kept_rows: usize = ks.blocks.iter().map(|blk| blk.n_tokens).sum();
+    assert_eq!(
+        kept_rows, 1,
+        "the 2-token block must be split to 1 row, not dropped"
+    );
+    let decoded = ks.dequant().expect("dequant after a mid-block truncate");
+
+    let mut reference = QuantRotorK3::new(vec![1, kv_h, 0, head_dim], 0);
+    reference.rotors = make_rotor_table(0, 0, n_groups_for(head_dim as usize));
+    reference
+        .append(&d1[..per_tok], &[1, kv_h, 1, head_dim])
+        .expect("reference append");
+    let ref_decoded = reference.dequant().expect("reference dequant");
+    assert_eq!(
+        decoded, ref_decoded,
+        "the split block must reconstruct the retained token exactly"
+    );
 }

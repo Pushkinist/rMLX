@@ -67,14 +67,36 @@
 //! gated on the follow-up (deferred).
 //!
 //! **"Pre-scale" is doing a lot of work in that number, and the delivered
-//! figure is what matters.** The 24 code bits occupy a whole `u32`, and the
-//! per-group `f32` scale sits beside it, so the store spends **8 B per 3
-//! values** — 21.33 bits per value — plus 4 B per token for the norm:
-//! **21.75 bits per value at `head_dim = 128`, against bf16's 16.0.** rotor4
-//! fills all 32 code bits instead of 24 and therefore occupies *byte-identical*
-//! storage. No rotor codec is smaller than bf16 at any `head_dim`; see
-//! `docs/KV_QUANT.md` § "Memory truth" and the
-//! `iso_and_rotor_k_codecs_are_never_a_memory_win` guard.
+//! figure is what matters.** At `head_dim = 128` there are
+//! `ceil(128 / 3) = 43` groups per row, and the store spends, per input value:
+//!
+//! | Component | Layout | Bits / value |
+//! |---|---|---|
+//! | codes | 43 `u32` per 128 values | **10.75** |
+//! | scales | 43 `f32` per 128 values | **10.75** |
+//! | norm | 1 `f32` per 128 values | **0.25** |
+//! | **total** | | **21.75** (bf16 is 16.0) |
+//!
+//! Two independent overruns, with different fixes:
+//!
+//! 1. **Dead components.** Only 3 of the 8 quantised components carry
+//!    information. A rotor sandwich is grade-preserving, so for the grade-1
+//!    input this codec embeds, the scalar, bivector and pseudoscalar slots are
+//!    algebraically zero on encode, and on decode the inverse sandwich keeps
+//!    every non-grade-1 part out of the reconstructed vector. 15 of the 24
+//!    code bits per group are therefore dead budget, not distortion — pinned by
+//!    `clifford_tests::sandwich_of_grade1_in_3d_stays_grade1` and
+//!    `clifford_tests::inverse_sandwich_of_non_grade1_leaks_nothing_into_grade1`.
+//! 2. **Scale cadence.** One whole `f32` per 3 values is 10.75 bits per value on
+//!    its own — half the total, and the dominant term once (1) is fixed. A group
+//!    of 3 sharing a full `f32` scale is not a viable rate point at any code
+//!    width.
+//!
+//! rotor4 fills all 32 code bits instead of 24 and therefore occupies
+//! *byte-identical* storage. No rotor codec is smaller than bf16 at any
+//! `head_dim`; see `docs/KV_QUANT.md` § "Memory truth", the
+//! `iso_and_rotor_k_codecs_are_never_a_memory_win` guard, and the crate-wide
+//! stored-rate ceiling in `kv_rate_tests.rs`.
 //!
 //! # No QJL residual
 //!

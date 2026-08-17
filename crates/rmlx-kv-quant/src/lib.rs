@@ -50,6 +50,11 @@ mod rotation_fidelity_tests;
 #[cfg(test)]
 mod rate_distortion_tests;
 
+/// Stored-rate ceiling: bits per value every KV store family actually spends,
+/// measured from real encoder output, against the bf16 floor.
+#[cfg(test)]
+mod kv_rate_tests;
+
 pub(crate) mod bytes;
 pub mod clifford;
 pub(crate) mod flash_decode_common;
