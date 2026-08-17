@@ -3,8 +3,14 @@
 /// Whether the rendered prompt leaves the assistant turn *inside* an open
 /// thinking block — i.e. the first token the model generates is reasoning.
 ///
-/// This is the ground truth for [`ThinkSplitter`]'s initial channel, and the
-/// only reliable one. Whether a checkpoint's chat template prefills an open
+/// **`rendered` must be the assistant-turn suffix the template appended, not
+/// the whole prompt.** Message content is client-controlled and may contain a
+/// literal delimiter; scanning the whole prompt lets a user message decide the
+/// channel. Callers obtain the suffix by re-rendering with
+/// `add_generation_prompt: false` and taking the delta.
+///
+/// This drives [`ThinkSplitter`]'s initial channel. Whether a checkpoint's
+/// chat template prefills an open
 /// `<think>`, prefills a *closed* `<think></think>`, or prefills nothing and
 /// lets the model open the block itself is a property of that template, not of
 /// the architecture — checkpoints of the same arch disagree, and a template is

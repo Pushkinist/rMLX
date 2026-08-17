@@ -393,13 +393,41 @@ pub(crate) async fn messages(
                     }
                 };
 
-                // Read the initial think channel off the prompt the model will
-                // actually see. The Anthropic surface has no per-request
-                // delimiter override, so the defaults apply.
+                // Read the initial think channel off the assistant-turn suffix
+                // ONLY. Message content is client-controlled and can contain a
+                // literal `<think>`; the suffix is emitted by the template
+                // alone. Re-render without the generation prompt and take the
+                // delta (a Jinja render, no tokenizer work). The Anthropic
+                // surface has no per-request delimiter override, so the
+                // defaults apply.
+                let no_gen_opts = RenderOpts {
+                    add_generation_prompt: false,
+                    ..opts
+                };
+                let gen_suffix: &str = match tpl.render(&tpl_msgs, &no_gen_opts) {
+                    Ok(base)
+                        if rendered.text.len() >= base.text.len()
+                            && rendered.text.starts_with(&base.text) =>
+                    {
+                        &rendered.text[base.text.len()..]
+                    }
+                    // Template does not simply append for the generation prompt
+                    // (or the render failed). Fall back to the whole prompt and
+                    // say so — the fallback is defeatable by message content,
+                    // so it must not be silent.
+                    other => {
+                        tracing::warn!(
+                            model_id = %req.model,
+                            render_ok = other.is_ok(),
+                            "chat template is not append-only for \
+                             add_generation_prompt; think-channel detection \
+                             falls back to scanning the whole prompt"
+                        );
+                        rendered.text.as_str()
+                    }
+                };
                 let think_open = crate::engine::think::prompt_leaves_think_open(
-                    &rendered.text,
-                    "<think>",
-                    "</think>",
+                    gen_suffix, "<think>", "</think>",
                 );
 
                 let token_count = ids.len();
