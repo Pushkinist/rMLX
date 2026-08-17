@@ -201,6 +201,15 @@ impl ArchGenerator {
             },
         )?;
 
+        // Fail fast on a codec the resolved architecture refuses, before the
+        // codec is warmed and an SSD tier is keyed on it. The startup resolvers
+        // ran against the declared arch and cannot see a mismatch; without this
+        // the refusal would land on every request instead, after a startup that
+        // reported success.
+        if let Some(kq) = kv_quant_resolved {
+            model.validate_kv_quant(kq)?;
+        }
+
         // Deterministically warm the resolved KV codec's MSL kernels during
         // this load (preload) window so the first user request does not pay a
         // shader cold-compile. General per-codec (keyed off
@@ -419,7 +428,11 @@ impl ArchGenerator {
         // the spiller / hydrator are never installed and decode is
         // byte-identical to the RAM-only path. The arch name selects the right
         // per-arch PROMPT_CACHE; archs without a spill/hydrate impl are skipped.
-        let arch_name = cfg.architectures.first().map_or("", String::as_str);
+        // Resolved, not declared: the per-arch PROMPT_CACHE and the layout-key
+        // salt must describe the model that was built. A snapshot whose
+        // declaration disagrees would otherwise select the wrong cache (or
+        // none) while decode runs the other architecture's layout.
+        let arch_name = model.arch_class();
         // layout-key inputs come straight from the loaded model so the
         // SSD tier salts every row with `(arch, n_layers, n_kv_heads, head_dim,
         // kv_quant)`. `attach_at_load` is a no-op when the tier is OFF, so

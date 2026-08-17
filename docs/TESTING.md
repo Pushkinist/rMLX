@@ -18,13 +18,32 @@ The model directory must contain at minimum `config.json` and `tokenizer_config.
 | `RMLX_TEST_MODEL_GEMMA4_PARO` | `z-lab__gemma-4-31B-it-PARO` | `Gemma4ForConditionalGeneration` |
 | `RMLX_TEST_MODEL_MEDGEMMA` | `mlx-community__medgemma-1.5-4b-it-8bit` | `Gemma3ForConditionalGeneration` |
 | `RMLX_TEST_MODEL_QWEN36` | `mlx-community__Qwen3.6-35B-A3B-8bit` | `Qwen3_5MoeForConditionalGeneration` |
-| `RMLX_TEST_MODEL_QWEN36_PARO` | `z-lab__Qwen3.6-27B-PARO` | `Qwen3_5MoeForConditionalGeneration` |
+| `RMLX_TEST_MODEL_QWEN36_PARO` | `z-lab__Qwen3.6-27B-PARO` | `Qwen3_5ForConditionalGeneration` (dense PARO) |
+| `RMLX_TEST_MODEL_ORNITH_9B` | `sahilchachra__ornith-1.0-9b-mxfp8-mlx` | `Qwen3_5ForConditionalGeneration` (dense) |
 | `RMLX_TEST_MODEL_BONSAI` | `prism-ml__Ternary-Bonsai-8B-mlx-2bit` | `Qwen3ForCausalLM` |
 | `RMLX_TEST_MODEL_DR_VENUS` | `z-lab__DR-Venus-*` | `Qwen3ForCausalLM` |
 | `RMLX_TEST_MODEL_JINA_V4` | `jinaai__jina-embeddings-v4` | `JinaVLForEmbedding` |
 | `RMLX_TEST_MODEL_LAGUNA` | `z-lab__Laguna-*` | `LagunaForCausalLM` |
 | `RMLX_TEST_MODEL_READERLM_V2` | `mlx-community__jinaai-ReaderLM-v2` | `Qwen2ForCausalLM` |
 | `RMLX_TEST_MODEL_QWEN3_VL_30B` | `mlx-community__Qwen3-VL-30B-Instruct-*` | `Qwen3VLForConditionalGeneration` |
+
+The `Arch` column is the **resolved** class (`Architecture::arch_class()`), which
+for the Qwen3.5 family follows the checkpoint's tensors rather than its
+`architectures[0]`. `tests/resolved_arch_class.rs` pins that distinction and
+builds a deliberately mislabelled snapshot (dense declaration, MoE tensors) to
+prove the Qwen-MoE K-side codec guard still fires. It symlinks the weights, so
+the fixture costs no disk; it is `#[ignore]`d only because it loads real
+snapshots.
+
+> **Known coverage gap.** The *invariant table* is covered weights-free
+> (`cache_type_tests.rs`, including
+> `validate_resolved_qwen3_5_dense_and_moe_strings_diverge`, which pins that the
+> two Qwen3.5 strings give opposite verdicts). Whether the enforcing call sites
+> actually consult it — `Architecture::generate_greedy` / `generate_image`, the
+> `ArchGenerator` and `SpeculativeGenerator` constructors, and the speculative
+> per-request seam — is exercised **only** by snapshot-gated tests. Deleting one
+> of those calls leaves `cargo test --workspace` and `make ci` green. Run the
+> `--ignored` suites above before trusting a change to those seams.
 
 ## Specialised test-model variables
 

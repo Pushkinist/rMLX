@@ -40,3 +40,27 @@ pub const KNOWN_ARCHS: &[&str] = &[
 pub fn is_arch_supported(arch: &str) -> bool {
     KNOWN_ARCHS.contains(&arch)
 }
+
+/// Declared arch strings that rMLX deliberately reports under a different,
+/// canonical class — an alias, not a mismatch.
+///
+/// `Architecture::arch_class()` reports the resolved class, so for these pairs
+/// the declared and resolved names differ on every load of a perfectly
+/// well-formed snapshot. Their consumers all carry an explicit arm for the
+/// alias, so nothing is keyed on a name it does not handle. Callers that
+/// report a declared-vs-resolved divergence must stay quiet for these, or the
+/// signal is noise on a supported model and gets ignored where it matters.
+///
+/// This is NOT the Qwen3.5 dense/MoE pair: those two names describe genuinely
+/// different models, and a snapshot declaring one while building the other is
+/// the mismatch worth reporting.
+#[inline]
+pub(crate) fn is_declared_arch_alias(declared: &str, resolved: &str) -> bool {
+    matches!(
+        (declared, resolved),
+        (
+            "Gemma4UnifiedForConditionalGeneration",
+            "Gemma4ForConditionalGeneration"
+        )
+    )
+}

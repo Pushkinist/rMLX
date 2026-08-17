@@ -763,6 +763,28 @@ impl Architecture {
 
     /// Architecture class name as a static string, matching the canonical
     /// `model_type` identifiers used throughout rMLX (tracing fields, metrics).
+    ///
+    /// Prefer this over the `architectures[0]` string a checkpoint declares:
+    /// the two can disagree, and where they do this one is the truth. Safety
+    /// predicates keyed on the architecture (the Qwen-MoE K-side codec guard in
+    /// particular) must use this, because a declaration is model-side data that
+    /// nothing validates.
+    ///
+    /// **Resolved for the Qwen3.5 family.** Both Qwen3.5 arch strings share a
+    /// single loader and model struct, so the sparse-MoE vs dense-SwiGLU
+    /// distinction is recovered from the built layers. Every other arm returns
+    /// the variant's canonical name.
+    ///
+    /// Known exception: `Qwen3VlMoe` also picks dense-vs-MoE per layer
+    /// (`mlp_only_layers` / `num_experts` / `decoder_sparse_step`), but there is
+    /// no registered dense Qwen3-VL arch string to report, so an all-dense
+    /// Qwen3-VL checkpoint is still labelled MoE and still refused K-side
+    /// codecs. Closing that needs a second registered class and arms for it in
+    /// every consumer, not just an accessor here.
+    ///
+    /// `Gemma4UnifiedForConditionalGeneration` is a deliberate alias: it
+    /// resolves to `Gemma4ForConditionalGeneration`, and every consumer carries
+    /// an explicit arm for the declared form (see `registry::is_declared_arch_alias`).
     pub fn arch_class(&self) -> &'static str {
         match self {
             Architecture::Gemma4(_) => "Gemma4ForConditionalGeneration",
@@ -770,10 +792,32 @@ impl Architecture {
             Architecture::Qwen2(_) => "Qwen2ForCausalLM",
             Architecture::Qwen3(_) => "Qwen3ForCausalLM",
             Architecture::Laguna(_) => "LagunaForCausalLM",
-            Architecture::Qwen3_5Moe(_) => "Qwen3_5MoeForConditionalGeneration",
+            Architecture::Qwen3_5Moe(m) => m.arch_class(),
             Architecture::Qwen3VlMoe(_) => "Qwen3VLMoeForConditionalGeneration",
             Architecture::BitNet(_) => "BitNetForCausalLM",
         }
+    }
+
+    /// Re-check the arch invariants for `kv_quant` against the **resolved**
+    /// architecture, immediately before it is used to build KV caches.
+    ///
+    /// The startup resolvers validate against the checkpoint's declared
+    /// `architectures[0]`, which is model-side data: a snapshot whose
+    /// declaration disagrees with what the loader built passes those checks
+    /// while running the guarded code path. This is the enforcing copy — it
+    /// asks the loaded model, so no declaration can route around it, and it
+    /// also covers quants that enter after startup (a per-request override).
+    ///
+    /// Arch-agnostic: it delegates to the one shared invariant table, so a
+    /// codec that is legal on this architecture costs a single enum match.
+    pub fn validate_kv_quant(&self, kv_quant: rmlx_kv_quant::KvQuant) -> Result<()> {
+        crate::kv_cache::validate_resolved_kv_quant(self.arch_class(), &kv_quant).map_err(|e| {
+            Error::Config(format!(
+                "KV codec rejected for the architecture this snapshot actually resolves to \
+                 ({}): {e}",
+                self.arch_class()
+            ))
+        })
     }
 
     /// One-line summary string for diagnostics and tracing.
@@ -874,16 +918,7 @@ impl Architecture {
         use crate::kv_cache::KvCacheBuilder;
         use rmlx_kv_quant::KvQuant;
         // Resolve the effective quant: explicit override wins; otherwise ask the builder.
-        let arch_name = match self {
-            Architecture::Gemma4(_) => "Gemma4ForConditionalGeneration",
-            Architecture::Gemma3(_) => "Gemma3ForConditionalGeneration",
-            Architecture::Qwen2(_) => "Qwen2ForCausalLM",
-            Architecture::Qwen3(_) => "Qwen3ForCausalLM",
-            Architecture::Laguna(_) => "LagunaForCausalLM",
-            Architecture::Qwen3_5Moe(_) => "Qwen3_5MoeForConditionalGeneration",
-            Architecture::Qwen3VlMoe(_) => "Qwen3VLMoeForConditionalGeneration",
-            Architecture::BitNet(_) => "BitNetForCausalLM",
-        };
+        let arch_name = self.arch_class();
         // `for_arch_default` is deprecated; callers with a full ModelConfig
         // should use `resolve_default`. This arch-dispatch site has no ModelConfig
         // available (the arch-level generate_greedy gets signals separately); the
@@ -894,6 +929,13 @@ impl Architecture {
         )]
         let kv_quant: KvQuant =
             kv_quant_override.unwrap_or_else(|| KvCacheBuilder::for_arch_default(arch_name));
+
+        // Enforce the arch invariants against the resolved architecture before
+        // a single KV cache is built. The startup resolvers key off the
+        // declared `architectures[0]`; this one asks the loaded model, so a
+        // mismatched declaration cannot route around the guard, and a quant
+        // supplied per-request is checked on the same terms as a launch flag.
+        self.validate_kv_quant(kv_quant)?;
 
         // Register the thread-local CPU + GPU streams + CommandEncoders once per
         // thread entry point. tokio blocking-pool threads start with no MLX stream
@@ -1098,6 +1140,15 @@ impl Architecture {
     ) -> Result<Vec<crate::decode_loop::ProbeStep>> {
         use crate::kv_cache::KvCacheBuilder;
         use rmlx_kv_quant::KvQuant;
+
+        // Same enforcement as the text entry, and in the same position: reject
+        // before touching MLX thread state, so a refused codec costs nothing.
+        // The `None` fallback below is `for_arch_default`, a no-op returning
+        // K8V8 — K stays 8-bit, so it satisfies every arch invariant by
+        // construction and needs no separate check.
+        if let Some(kq) = kv_quant_override {
+            self.validate_kv_quant(kq)?;
+        }
 
         // Register the thread-local CPU + GPU streams + CommandEncoders once per
         // thread entry point (mirrors the text `generate_greedy` entry). The CPU

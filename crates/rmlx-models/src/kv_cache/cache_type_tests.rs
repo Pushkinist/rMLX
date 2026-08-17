@@ -1470,6 +1470,55 @@ fn validate_resolved_non_moe_rotor_k_side_passes() {
     ] {
         validate_resolved("Gemma4ForConditionalGeneration", &kq).unwrap();
         validate_resolved("Qwen3ForCausalLM", &kq).unwrap();
+        // Dense Qwen3.5 shares a loader and an `Architecture` variant with the
+        // sparse-MoE path, so this string is a value `arch_class()` can now
+        // return. The measured PPL disaster is a sparse-MoE result; a dense
+        // model keeps these codecs.
+        validate_resolved("Qwen3_5ForConditionalGeneration", &kq).unwrap();
+    }
+}
+
+/// The two Qwen3.5 arch strings produce OPPOSITE verdicts for every codec the
+/// guard exists to reject.
+///
+/// Weights-free proof that which string reaches `validate_resolved` decides
+/// whether the guard fires at all — so `Architecture::arch_class()` returning
+/// the declared name instead of the resolved one is a correctness bug, not a
+/// labelling nit. The seam that feeds the resolved name in
+/// (`Architecture::generate_greedy`) can only be exercised with a real
+/// snapshot; see `tests/resolved_arch_class.rs` and docs/TESTING.md.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test asserts the dense arm passes — unwrap surfaces an over-broad refusal"
+)]
+fn validate_resolved_qwen3_5_dense_and_moe_strings_diverge() {
+    for kq in [
+        KvQuant::Rotor3Sym,
+        KvQuant::Rotor4Sym,
+        KvQuant::RotorKOnly3,
+        KvQuant::RotorKOnly4,
+        KvQuant::RotorK3Asym {
+            v_bits: 4,
+            v_group_size: 128,
+        },
+        KvQuant::RotorK4Asym {
+            v_bits: 4,
+            v_group_size: 128,
+        },
+        KvQuant::Iso3Sym,
+        KvQuant::Iso4Sym,
+        KvQuant::IsoKOnly3,
+        KvQuant::IsoKOnly4,
+        KvQuant::PlanarK,
+        KvQuant::TurboSym3,
+        KvQuant::TurboSym4,
+    ] {
+        assert!(
+            validate_resolved("Qwen3_5MoeForConditionalGeneration", &kq).is_err(),
+            "{kq} must be rejected on sparse Qwen3.5 MoE"
+        );
+        validate_resolved("Qwen3_5ForConditionalGeneration", &kq).unwrap();
     }
 }
 
