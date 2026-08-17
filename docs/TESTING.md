@@ -166,6 +166,35 @@ gates` job. It keys on the shape (does the test reach `Device::Gpu`, directly,
 through a same-file helper, or via a module-scope `const … = Device::Gpu`?),
 never on the ignore reason's wording, which varies across the tree.
 
+"Test" means `#[test]`, `#[tokio::test]`, and `#[tokio::test(flavor = …)]`. An
+async test attribute is a test attribute; matching only the bare spelling left
+~107 of them in `rmlx-server` unclassified in both directions.
+
+**Six ignored async tests surface as warnings, and are still run by nothing.**
+Classifying `#[tokio::test]` did not add anything to `--list`, because no
+`rmlx-server` test file names `Device::Gpu` at all — those tests boot a real
+server over HTTP and the device is chosen inside production code the gate does
+not scan. So they land in the non-fatal "claims a Metal context but no
+`Device::Gpu` is reachable" warning instead:
+
+| test | file |
+|---|---|
+| `valid_single_vector_200_shape` | `crates/rmlx-server/tests/embeddings_smoke.rs` |
+| `return_multivector_toggles_shape` | `crates/rmlx-server/tests/embeddings_smoke.rs` |
+| `invalid_dimensions_is_400` | `crates/rmlx-server/tests/embeddings_smoke.rs` |
+| `image_single_vector_200_shape` | `crates/rmlx-server/tests/embeddings_smoke.rs` |
+| `image_multivector_toggles_shape` | `crates/rmlx-server/tests/embeddings_smoke.rs` |
+| `ssd_cache_survives_server_restart` | `crates/rmlx-server/tests/ssd_cache_restart.rs` |
+
+They are `#[ignore]`d, so `make test` skips them; they are not GPU-classified,
+so `make gpu-test` never selects them. Both statements were true before this
+gate could see them — making them visible does not make them run. Closing that
+needs a decision the gate cannot make for itself: either they reach Metal and
+belong in the runner's population (which means giving the classifier a way to
+see through an HTTP boundary), or they are `#[ignore]`d for a reason other than
+Metal and the ignore text should say so. Until then the warning is the honest
+signal, not noise to be silenced.
+
 Two known edges: (1) a pure device-*policy* test — one that passes `Device::Gpu`
 to a non-mlx function as a plain selector value, never a Metal dispatch — opts
 out **per fn** with a line-leading `// gpu-test-gate: exempt` marker in its own
@@ -174,6 +203,148 @@ the same file still trips the gate; a copy of the marker inside a fn body does
 not exempt); (2) the reachability seed is file-local, so a test that reaches
 Metal only through a helper defined in another module can draw a non-fatal
 false-positive warning — verify before acting on it.
+
+**Inside a `macro_rules!` body the exemption's blast radius is every cell.** The
+body is one synthetic test, so a single marker line exempts every test that
+macro generates — around thirty cells from one comment, at the shape in this
+tree. "Scoped to that one `#[test]`" stays literally true and badly understates
+it: review a marker inside a macro body against every invocation, not one.
+
+#### Macro-generated tests
+
+A `macro_rules!` body that emits `#[test] fn $name() { .. }` names no readable
+fn at its definition site and emits no `fn` line at its invocation sites. A
+scanner that only accepts `fn <ident>` therefore misses such a test in **both**
+directions at once — never flagged however much Metal it dispatches, and never
+listed for the runner either — so the rule holds by author discipline and a
+deleted `#[ignore]` is caught by nothing.
+
+The gate classifies the macro **body** as one synthetic test. That is where the
+attribute under enforcement lives, and one body governs every cell it generates,
+so a `#[ignore]` deleted there fails the gate regardless of how many invocations
+exist. Reachability is traced from the body like any other fn's, so a body that
+reaches Metal one call deep (the shape in the tree today) counts.
+
+Three things are fail-closed rather than skipped, because a shape the parser
+cannot read looks exactly like a compliant one:
+
+* A `macro_rules!` body that declares more `#[test]` than the gate could read
+  back as items — the name is assembled rather than written (`paste!` /
+  `concat_idents!`), or a `#[test]` shares its `fn`'s line.
+* A `macro_rules!` written entirely on **one line** whose body declares
+  `#[test]` — no `fn` line ever follows, so nothing is classifiable.
+* An item whose closing brace is never found, which means the parser lost the
+  file at that point and everything after it went unclassified.
+
+Write the generated fn as `fn $name()` on its own line with its attributes above
+it, or extend the classifier.
+
+The first counter is also what stops the original blindness from returning
+quietly. A future edit that narrows the fn-name recognition again does not make
+macro cells invisible — it makes the declared-vs-readable counts disagree, and
+the gate goes red naming the macro. Verified by mutation: reverting the fn
+pattern to identifiers-only turns `check-gpu-tests-ignored` red on
+`niah_long_context.rs`.
+
+**A self-contained `fn` line must not latch the multi-line capture.** A macro
+body may write `fn $name() { .. }` whole on one line. Latching there waits for a
+closing brace that never comes, so every later item in the file joins that one
+body and stops being classified — which loses violations the gate previously
+caught. `make fmt-check` does not keep the shape out: rustfmt refuses to
+reformat a `macro_rules!` body containing a `$(..)*` repetition (verified
+byte-identical after `rustfmt --edition 2021`).
+
+The classifier decides this from the line's **last significant character** — `}`
+ends an inline body, `;` ends a signature-only declaration — and deliberately
+**not** from a brace count. Braces inside a string, a char literal or a trailing
+comment are not block delimiters, and counting them is wrong in both directions:
+
+* a `}` inside a string literal makes a self-contained line look open, so it
+  latches and swallows the rest of the file (measured: `exit 0`, `OK`, on a file
+  one character away from a compliant one);
+* a `}` inside a trailing comment makes an opening line look closed, so the
+  body is never captured and a `Device::Gpu` inside it is invisible — that
+  direction was a recall regression against `main`, not just a missed
+  extension;
+* a signature-only `fn` in a `trait` or `extern` block has no brace at all, and
+  a rule keyed on "no brace open" latches it forever and hard-fails the whole
+  run blaming a `macro_rules!` the file does not contain.
+
+**Known OPEN blind spot — a `where`-split signature.** The `;` alternative
+covers a signature that fits on **one line**. A `where` clause pushes the `;`
+onto a later line, so that declaration latches — and the latch is closed by the
+first later line that bares to the fn's indent, which in a Rust test file is
+`    }`, the close of any nested block. When it closes that way **no error is
+emitted**: the swallowed `#[test]` was never registered, so nothing looks
+unterminated, and the gate reports `OK` at exit 0 over an un-ignored
+`Device::Gpu` test.
+
+This is **fail-open**, not fail-closed — the one place in this gate that is. It
+is unreachable in the tree today (no scanned file has a where-split signature),
+and the class is tracked in #386 for reconciliation against the compiled `cargo
+test -- --list`, which is what actually closes it. Two fixtures bracket it:
+`trait_where_signature` pins the sub-case where nothing closes the latch (loud),
+and `trait_where_signature_open_hole` pins the open answer so the hole is
+visible in the corpus rather than only in prose.
+
+The trailing-comment scan is string-aware, so neither a URL in a one-line fn
+(`"http://…"`) nor a char literal of any payload form (`b'"'`, `'\x1b'`,
+`'\u{FFFD}'`, `'é'` — 18 such literals occur in the scanned tree) derails it;
+either would otherwise leave the scanner stuck "inside a string" for the rest of
+the line. A non-ASCII payload is one character but two-to-four *bytes*, so where
+awk indexes bytes it is stepped by locating the closing quote with `index()`
+inside a bounded window rather than by a byte class — `index`, `substr`,
+`length` and `RLENGTH` all count in the same units in every awk, so the offset
+lands correctly either way. The step additionally requires the payload to begin
+with a non-ASCII unit, which is what keeps a lifetime tick followed by a nearby
+quote (`<'a>'x'`) from being consumed as though it were a literal. It does
+**not** handle raw strings (the `\` in `r"a\"` is not an escape, and `r#"…"#`
+hashes are not tracked) or block comments: a `/* … */` spanning an item's
+opening line is read literally.
+
+Still out of reach on the macro side: a `macro_rules!` with a **non-brace**
+delimiter (`macro_rules! m ( .. );`). Its name is captured so findings are
+greppable and its items are still classified — a `$metavar` fn is
+macro-generated by its own shape — but its body extent is not tracked, so the
+readability counters above do not cover it.
+
+Still out of reach, and deliberately stated rather than assumed away: a test
+generated by a **proc macro** (`#[rstest]`, `#[test_case]`), and a
+`macro_rules!` defined in a non-scanned source file and invoked in a scanned
+one. Nothing in the tree has either shape; adding one needs the classifier
+extended, not a review note.
+
+`make check-gpu-tests-ignored-fixtures` pins all of this. Each fixture under
+`scripts/fixtures/gpu_tests_ignored/` is a synthetic workspace driven through the
+gate's `--root` option. Half are violations it must catch and half are legitimate
+shapes it must leave alone — a gate that fails everything is as useless as one
+that fails nothing, and only the pair pins it.
+
+**Each case asserts the reason, not just the exit code.** The gate has six
+fail-closed paths that also exit 1 (missing `--root` directory, zero parsed
+members, members fewer than crate dirs, a member whose `src/` is gone, an
+unreadable package name, zero matched test files), so a case checking only
+`exit == 1` is satisfied by all of them — deleting a fixture would make its own
+case pass. Every case therefore pins the exit code, the violation-class marker,
+the specific label the gate must name, and optionally a string that must not
+appear; the harness also refuses to run a case whose fixture directory is
+missing.
+
+**Every case runs once per awk on the machine.** The gate is an awk program and
+awk implementations genuinely disagree, so checking one proves less than it
+looks like it does. A bracket range of octal escapes (`[\300-\337]`, the obvious
+way to match a UTF-8 continuation byte) is accepted by BSD awk and is a *hard
+syntax error* in gawk — a gate written that way is green on a Mac and does not
+execute at all on the Linux CI runner, which is worse than the blind spot it
+closes. Byte-vs-character indexing differs too: gawk indexes characters under a
+UTF-8 locale where BSD awk and mawk index bytes, and `[[:print:]]` calls a
+continuation byte printable in BSD awk and mawk under UTF-8 but not under C.
+The harness therefore shims `awk` on `PATH` and re-runs itself under each of
+`awk`, `gawk` and `mawk` that exists (deduped by inode, so Debian's
+`awk` → `mawk` symlink counts once). **When only one is installed it says so** —
+a run that quietly checked a single implementation is the same
+"gate that cannot fail" shape the reason-assertions above exist to prevent.
+Install the others locally with `brew install gawk mawk`.
 
 ### Running them: `make gpu-test`
 
@@ -189,7 +360,7 @@ make gpu-test CRATE=rmlx-kv-quant FILTER=rotor_flash
 make gpu-test VALIDATE=0                        # without shader validation
 ```
 
-It runs exactly the set `check_gpu_tests_ignored.sh --list` classifies — the
+It runs exactly the set `check_gpu_tests_ignored.sh --list` emits — the named
 `#[test]` fns that reach `Device::Gpu` **and** carry `#[ignore]`. Deriving the
 population from the enforcing gate's own classifier is the point: a separate
 hand-maintained list would drift, and the rule would end up mandating `#[ignore]`
@@ -199,6 +370,15 @@ It deliberately does **not** run every `#[ignore]` test. Many are ignored for
 reasons unrelated to Metal — live network access, a missing cargo feature,
 `ignore`-marked doc-comment pseudo-code — and sweeping those in would keep this
 gate permanently red for things it cannot speak to.
+
+**One documented divergence: macro-generated tests are enforced but not listed.**
+`--list` feeds this runner, which turns each name into a libtest substring
+filter — and a macro cell has no name until the compiler expands it, so listing
+`niah_cell!{$name}` would emit a filter matching nothing and trip the runner's
+own "executed fewer than classified" check. The enforcing run prints the
+excluded set on every invocation, so the divergence is stated rather than
+inferred from source comments. The one population it applies to is the NIAH
+long-context cells; the reasoning is in the NIAH section below.
 
 It is fail-closed in three ways:
 
@@ -694,6 +874,28 @@ CLAUDE.md hard rule 8 (single MLX process). Per-pass logs land in
 
 Required env vars: `RMLX_TEST_MODEL_GEMMA4_E4B`,
 `RMLX_TEST_MODEL_QWEN36`, `RMLX_TEST_MODEL_BONSAI`. Unset → skip.
+
+### Why NIAH is not in `make gpu-test`
+
+The cells are macro-generated, so until the classifier learned to read
+`macro_rules!` bodies they were absent from `make gpu-test` for no reason anyone
+had decided — the detector simply could not see them. The split now in force is
+deliberate:
+
+* **Enforced.** The `#[ignore]` rule applies to the `niah_cell!` /
+  `niah_pflash_cell!` bodies, and `make check-gpu-tests-ignored` fails if either
+  loses the attribute. That is the half that was genuinely unguarded.
+* **Not executed by `make gpu-test`.** These cells load a real snapshot and run
+  an 8k–32k-token prefill each; ~60 of them would turn the pre-merge GPU suite
+  from ~21 minutes into hours and make it depend on model snapshots being
+  present. They already have a purpose-built driver — the shell wrapper above,
+  plus `make smoke-codec-matrix` — which is where the long-context correctness
+  claim is actually made.
+
+So the runner never visits them and the gate never mandates an attribute on a
+test the runner visits: those are two different populations here, on purpose.
+Move them into `make gpu-test` only alongside a decision to accept model-gated
+hours in the pre-merge gate.
 
 ---
 

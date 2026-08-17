@@ -26,6 +26,12 @@ repos:
 
   # Local hooks call the host toolchain (rustfmt, clippy, deny, audit).
   # Pre-installed via brew; no per-language env spinup.
+  #
+  # `scripts/fixtures/**` is excluded from both cargo hooks. Those .rs files are
+  # synthetic scan roots for the source gates — deliberately uncompilable
+  # snippets belonging to no cargo target, so neither `cargo fmt --all` nor
+  # `cargo clippy --workspace` ever reads them. Without the exclude, editing one
+  # fixture triggers a full workspace clippy that cannot say anything about it.
   - repo: local
     hooks:
       - id: cargo-fmt
@@ -33,6 +39,7 @@ repos:
         entry: cargo fmt --all -- --check
         language: system
         types: [rust]
+        exclude: ^scripts/fixtures/
         pass_filenames: false
 
       - id: cargo-clippy
@@ -40,6 +47,7 @@ repos:
         entry: cargo clippy --workspace --all-targets --all-features -- -D warnings
         language: system
         types: [rust]
+        exclude: ^scripts/fixtures/
         pass_filenames: false
 
       # MSL style gate. Fast (clang-format --dry-run over every gated kernel
