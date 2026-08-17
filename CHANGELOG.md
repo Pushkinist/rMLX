@@ -260,6 +260,145 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   seed live, **neither** `--planar-flash-decode on` nor `off` dispatches the
   kernel (measured 0 and 0, 2418 warm-TTFT bypasses, identical digests) — an
   A/B whose arms both skip the kernel confirms any equivalence put to it.
+- **The golden-token decode gates had no configuration in which they ran.** All
+  five (`bonsai`, `gemma4`, `qwen3`, `bitnet`, `medgemma`) resolved their
+  snapshot from a single `RMLX_KV_TEST_MODEL`, so at most one of them could be
+  armed per invocation and none was armed by any shared gate: `make ci` passes
+  no `--ignored` and never runs them, and `make gpu-test` / `make ci-perf` —
+  which do run them, via the cross-file classifier reach into
+  `common::run_golden_test` — set no such variable, so every golden returned at
+  its first line and libtest reported `ok`. A committed fixture, a test that
+  reads it, and no configuration in which it runs is the shape of a gate that
+  cannot fail.
+
+  Each golden now names its own snapshot (architecture + slug) and resolves it
+  from exactly two variables: `RMLX_KV_TEST_MODEL`, then the slug under
+  `RMLX_O_MODELS_ROOT`. The second arms them by default — every `make` target
+  exports that root when it resolves, so a machine holding the snapshots runs
+  every golden whose model is on disk, and an operator sets nothing.
+
+  The override applies **only to the golden whose architecture it serves**;
+  pointed elsewhere, resolution falls through to the slug instead of standing
+  the golden down. `RMLX_KV_TEST_MODEL` is not a golden-only variable —
+  `gemma4_kv_cache_equivalence.rs`, `cli_flags_e2e.rs` and `projects_toml_e2e.rs`
+  all require it, typically at a Gemma4 path — so a plain override-wins rule
+  would have left four of the five goldens silently disarmed for any developer
+  with it exported, which is the original defect surviving for exactly the
+  developer who most needs these gates. Ranking the slug first instead would
+  break the other direction: `RMLX_REGEN_GOLDENS=1 RMLX_KV_TEST_MODEL=<path>`
+  would record the fixture from the slug snapshot and ignore the named one.
+  `make model-check-full MODEL=…` therefore covers at least the named model,
+  and more on a machine with a populated root.
+
+  The per-architecture `RMLX_TEST_MODEL_*` family is deliberately **not** a
+  third source. Those variables mean "a snapshot of this family" for the smoke,
+  template and NIAH suites, and `docs/TESTING.md` tells operators to export the
+  three primary ones persistently for a whole `cargo test --workspace`. A golden
+  is a byte-exact fixture over ONE checkpoint's weights, so consulting them would
+  let a shell export retarget it to a same-family substitute — a QAT rebuild, a
+  re-quantized sibling — producing a token mismatch indistinguishable from a
+  decode regression, past an architecture check the substitute passes. Nothing
+  is lost: each golden is its own test binary, so
+  `RMLX_KV_TEST_MODEL=<path> cargo test --test <arch>_golden_tokens` retargets
+  one deliberately and per-invocation, and a snapshot living outside the root
+  can be symlinked in under its slug, which every other slug-addressed consumer
+  benefits from too.
+
+  Absence and misconfiguration are no longer the same outcome. Nothing
+  configured, an existing models root that does not hold the slug, or a
+  half-written snapshot under it still **skips** — a developer without the
+  weights cannot run the gate, and an interrupted download is an absence rather
+  than a wrong pointer. `RMLX_KV_TEST_MODEL` naming a path that is not a
+  runnable snapshot, `RMLX_O_MODELS_ROOT` set to something that is not an
+  existing directory, and a slug resolving to a snapshot of the wrong
+  architecture all now **fail**: skipping on a stale or typo'd export is how a
+  wrong pointer reports success without asserting anything, and a mistyped root
+  disarms all five gates at once.
+
+  "Runnable" means every file the harness opens by name: `config.json`,
+  `tokenizer.json`, and one of `model.safetensors.index.json` /
+  `model.safetensors` — the same disjunction `rmlx_loader::load_shard_index`
+  tries, mirrored so the check cannot drift from the loader it stands in front
+  of. Checking only the JSONs missed the *modal* half-written snapshot, because
+  a download writes the small files first and the multi-GB shards last; that
+  shape resolved as runnable and panicked inside `load_shard_index`, inverting
+  the intended asymmetry in which a fully missing directory is a benign skip and
+  a half-present one was fatal.
+
+  Recording is stricter than checking. With `RMLX_REGEN_GOLDENS` set, an
+  override pointed at another architecture is a hard failure rather than a
+  fall-through: writing a committed fixture from a snapshot the operator did not
+  name, while discarding the one they did, gives that golden untraceable
+  provenance, and regenerating the whole set under one override would give each
+  fixture a different origin silently. On the read path the fall-through is now
+  announced (`NOTE <test>: … using <path> instead`) instead of being dropped.
+  An override whose `config.json` is present but unparseable fails rather than
+  falling through — only a legible, *different* architecture is a statement
+  about another golden, and the slug branch already treated the same empty
+  string as fatal.
+
+  `crates/rmlx-models/tests/common/snapshot_tests.rs` pins the whole table
+  weights-free (26 cases): both probes, every arm of the choice including the
+  arch fall-through and its regen-time refusal, the empty-variable spelling of
+  "unset", each partial-snapshot shape, both weight entrypoints, and the
+  decision-to-return mapping with a `#[should_panic]` case over the `Fail` edge.
+  One case builds a directory from the harness's own required-file constants and
+  asserts every path the harness opens *by name* — transcribed from the call
+  sites in `rmlx-loader` and `run_golden_test`, not from the constants — is
+  present, so an under-specified constant fails there instead of being ratified.
+  Verified by mutation: ranking the slug first, deleting the fall-through,
+  accepting a config-only directory, dropping the weight requirement, emptying
+  the weight-entrypoint list, demoting a bad root to absence, removing the
+  regen-time refusal, dropping the stood-down note, letting an unreadable
+  override config fall through, and making the return mapping swallow `Fail`
+  each turn only the cases that claim them red.
+
+  Four Makefile defects fed this and are fixed with it. `model-check-full`
+  guarded `MODEL` with `test -n`, which could never fire because `MODEL` has an
+  unconditional default; on a machine lacking that snapshot the target
+  fabricated a path and forwarded it as `RMLX_KV_TEST_MODEL`, which the harness
+  correctly reads as an operator naming a snapshot. It now guards the path. It
+  also ran four of the five goldens — `medgemma_golden_tokens` was missing from
+  the list — and passed `--ignored` without `--test-threads=1`, so with a Bonsai
+  `MODEL` it drove four `#[ignore]` GPU tests across one Metal context from
+  parallel libtest threads: the abort the `#[ignore]` rule exists to prevent, in
+  the target most likely to be pointed at Bonsai.
+
+  And `RMLX_O_MODELS_ROOT` was exported unconditionally, including a repo-local
+  `models/` fallback that need not exist, handing every child a root that was
+  never there. It is now exported when an operator **named** one — through
+  `.env`, a shell export or the command line — and, for the invented fallback
+  only, when that directory exists. The distinction matters because `.env` is
+  `-include`d: its values are make variables, not environment ones, so they
+  reach a child only through this `export`. Gating the export on the path
+  existing would have suppressed it exactly when the path was wrong, and the
+  child would have reported "no snapshot configured" and skipped green at the
+  one operator who did configure something.
+
+  **Overwriting a fixture is itself gated.** A regenerated golden with no
+  recorded reason is indistinguishable from a hidden regression, so
+  `RMLX_REGEN_GOLDENS=1` no longer writes unconditionally. When the ids differ
+  from the committed fixture the harness re-decodes once at `top_logprobs_k = 2`
+  and measures the top-2 gap at the first differing index
+  (`first_divergence`), writing only when that gap is at or below
+  `REGEN_MAX_TIE_MARGIN` (0.10) — otherwise it panics `REFUSED`, naming the
+  index, both ids and the margin. The written file's reason line carries the
+  margin, so the fixture records why it moved. A token-count change is refused
+  at any margin, and an unmeasurable margin — missing step, absent logprobs, or
+  a probe run whose ids differ from the first run anywhere in the prefix up to
+  that index — is refused too.
+
+  The 0.10 floor is derived, not chosen: the top-2 logprob gap equals the top-2
+  logit gap (the log-sum-exp normaliser cancels), those logits are bf16 after
+  the load-time cast, and one bf16 ULP is ~0.0625 for |logit| in [8, 16) and
+  ~0.125 in [16, 32). So it admits an exact tie at every magnitude and a
+  one-ULP gap only in the lower octave. Tighten rather than widen if a case ever
+  lands between.
+
+  `bonsai_8b_mixed_k8g64_v4g64.golden.txt` is **not** regenerated here. It has
+  not been touched since the 0.1.0 squash and is stale at index 18 as a
+  consequence of the bf16 uniformity cast; regenerating it is a separate change
+  so the arming and the fixture stay independently revertable.
 
 ### Added
 

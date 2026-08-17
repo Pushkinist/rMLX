@@ -53,7 +53,7 @@ variables above:
 | Variable | Used by | Purpose |
 |----------|---------|---------|
 | `RMLX_TEST_MODEL` | `rmlx-server/tests/ssd_cache_restart.rs` | Generic single-model override for the SSD-restart smoke test. |
-| `RMLX_KV_TEST_MODEL` | `gemma4_kv_cache_equivalence.rs`, `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs`, `projects_toml_e2e.rs`, `cli_flags_e2e.rs` | Model snapshot for KV-cache equivalence and drafter-alignment tests. Typically set to a Gemma4-e4b path. |
+| `RMLX_KV_TEST_MODEL` | `gemma4_kv_cache_equivalence.rs`, `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs`, `projects_toml_e2e.rs`, `cli_flags_e2e.rs`, and as the single-model override for the golden-token suites | Model snapshot for KV-cache equivalence and drafter-alignment tests. Typically set to a Gemma4-e4b path. |
 | `RMLX_DRAFT_TEST_MODEL` | `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs` | Draft model snapshot path. Used alongside `RMLX_KV_TEST_MODEL` for speculative-decode alignment tests. |
 | `RMLX_VL_TEST_MODEL` | `qwen3_vl_moe_text_parity.rs` | Vision-language model snapshot for VL text-parity tests. |
 | `RMLX_PROMPT_CACHE_TEST_MODEL_A` / `_B` | `rmlx-models/tests/prompt_cache_cross_model.rs` | **Two** snapshots of the same architecture with the same KV shape but different weights — the prompt cache is one static per arch, and this pair is what shows whether its key separates two resident models. `mlx-community__gemma-4-e2b-it-mxfp8` + `mlx-community__gemma-4-E2B-it-qat-4bit` fit (both `Gemma4ForConditionalGeneration`, 35 layers x 1 KV head x head_dim 256). Same-shape matters: a shape mismatch would fail for the wrong reason. Different weights matter: identical outputs make the comparison vacuous, and the test refuses rather than passing. |
@@ -123,9 +123,189 @@ python crates/rmlx-server/tests/chat_template_fixtures/gen_fixtures.py
 
 ## CI behaviour
 
-When env vars are unset, all snapshot-gated tests **skip** with an `[SKIP]` or
+When env vars are unset, snapshot-gated tests **skip** with an `[SKIP]` or
 `tracing::warn!` message and report success. The test suite is always green on
 machines without model snapshots (including CI).
+
+Absence is not the same as a wrong pointer. `RMLX_KV_TEST_MODEL` **naming** a
+directory which is not a snapshot — a typo, or a path a snapshot has since moved
+out of — is a hard failure in the golden-token suites (below), not a skip.
+Skipping there is how a stale export turns into a green run that asserted
+nothing.
+
+---
+
+## Golden-token suites: how their snapshot resolves
+
+`crates/rmlx-models/tests/{bonsai,gemma4,qwen3,bitnet,medgemma}_golden_tokens.rs`
+each pin a 32-token temp=0 decode of one architecture against a committed
+fixture under `tests/fixtures/`. Each covers ONE arch and names its own snapshot
+by slug. `tests/common/mod.rs` reads exactly **two** variables:
+
+1. `RMLX_KV_TEST_MODEL`, **for the one golden whose architecture it serves**.
+   Pointed at another architecture it is not a statement about this golden, and
+   resolution falls through to step 2 rather than standing the golden down.
+2. the golden's snapshot **slug** under `RMLX_O_MODELS_ROOT`.
+
+Step 2 is what arms these gates by default, and **an operator normally sets
+neither**. Every `make` target exports `RMLX_O_MODELS_ROOT` when it resolves, so
+on a machine holding the snapshots `make gpu-test` and `make ci-perf` run every
+golden whose model is on disk. Before it existed, a golden needed
+`RMLX_KV_TEST_MODEL` — which those targets do not set — so all of them returned
+before asserting and libtest reported `ok`. A committed fixture that nothing
+compares against is a fixture nobody maintains.
+
+The fall-through in step 1 is not a nicety. `RMLX_KV_TEST_MODEL` is not a
+golden-only variable: `gemma4_kv_cache_equivalence.rs`, `cli_flags_e2e.rs` and
+`projects_toml_e2e.rs` all require it, typically at a Gemma4-e4b path. Were the
+override to make non-matching goldens skip, a developer with it exported would
+disarm four of the five on every run — the original defect, surviving for
+exactly the developer who most needs these gates. Ranking the slug *first*
+instead would break the other direction: `RMLX_REGEN_GOLDENS=1
+RMLX_KV_TEST_MODEL=<path>` would record the fixture from the slug snapshot and
+silently ignore the named one.
+
+Reach for `RMLX_KV_TEST_MODEL` in exactly two situations: recording a fixture
+(`RMLX_REGEN_GOLDENS=1`), and comparing one golden against a snapshot that is
+not the slug under your models root. Each golden is its own test binary, so
+`RMLX_KV_TEST_MODEL=<path> cargo test -p rmlx-models --test bonsai_golden_tokens
+-- --ignored` retargets that one deliberately and reaches no other golden.
+
+**The per-architecture `RMLX_TEST_MODEL_*` family is deliberately not consulted
+by the goldens.** Those variables mean "a snapshot of this family for the smoke,
+template and NIAH suites", and the workflow two sections above exports the three
+primary ones persistently for a whole `cargo test --workspace`. A golden is a
+byte-exact fixture over ONE checkpoint's weights, so letting a shell export steer
+it turns any same-family substitution — a QAT rebuild, a re-quantized sibling —
+into a token mismatch indistinguishable from a decode regression, and the
+architecture check below cannot separate the two because the substitute passes
+it. If a snapshot lives outside your models root, symlink it in under its slug:
+one action, and every other slug-addressed consumer (`make e2e`,
+`scripts/perf_canary.sh`, the bench scripts) picks it up too.
+
+The run / skip / fail rule:
+
+| configuration | outcome |
+|---|---|
+| snapshot resolves, arch matches | **run** the assertion |
+| `RMLX_KV_TEST_MODEL` names a different architecture | **fall through** to the slug, and say so |
+| ...the same, while `RMLX_REGEN_GOLDENS` is set | **fail** — see below |
+| nothing configured, or an existing models root that does not hold this slug | **skip** — a developer without the weights cannot run the gate |
+| the models root holds a half-written slug directory | **skip** — an interrupted download is an absence, not a wrong pointer |
+| `RMLX_KV_TEST_MODEL` names a path that is not a runnable snapshot | **fail** |
+| `RMLX_KV_TEST_MODEL` names a snapshot whose `config.json` is unreadable | **fail** — a named directory with a broken config is a broken pointer, not another architecture |
+| `RMLX_O_MODELS_ROOT` is set but is not an existing directory | **fail** — one keystroke disarms all five gates |
+| the slug under the models root is a snapshot of the wrong arch | **fail** |
+
+"Runnable" means the directory holds every file the harness opens **by name**:
+
+| file | opened by |
+|---|---|
+| `config.json` | `model_arch`, `arch::load_model` |
+| `tokenizer.json` | `run_golden_test`'s `Tokenizer::from_file` |
+| `model.safetensors.index.json` **or** `model.safetensors` | `rmlx_loader::load_shard_index`, which tries them in that order and errors if neither exists |
+
+The weight entrypoints are not padding. A download writes the small JSON files
+first and the multi-GB shards last, so `config.json` + `tokenizer.json` + no
+shards is the *modal* half-written snapshot — and accepting it converted the
+intended verdict for a partial download (skip, so a developer without the
+weights is not blocked) into a panic several frames deeper.
+
+**Recording is stricter than checking.** With `RMLX_REGEN_GOLDENS` set, an
+override pointed at another architecture is a hard failure rather than a
+fall-through: writing a committed fixture from a snapshot you did not name,
+while the one you did name is discarded, gives that golden untraceable
+provenance — and regenerating the whole set under one override would give each
+fixture a different origin with nothing said about it. When the override does
+serve the golden, recording proceeds normally. On the read path the fall-through
+is announced on stderr (`NOTE <test>: … using <path> instead`) rather than
+happening silently.
+
+`make ci` runs none of them either way: the goldens are `#[ignore]`d for the
+Metal context, and `make ci` passes no `--ignored`. `make gpu-test` /
+`make ci-perf` are where they execute — `scripts/check_gpu_tests_ignored.sh`
+classifies them as GPU tests through the cross-file `common::run_golden_test`
+helper, and `scripts/run_gpu_tests.sh` runs everything that classifier names.
+
+**Residual, stated rather than papered over:** libtest discards a passing test's
+output, so a golden that *skipped* prints its reason into a stream nothing shows.
+The gate cannot report "0 goldens checked" from inside a normal run. Add
+`--nocapture` when you need to see which ones stood down:
+
+```bash
+cargo test -p rmlx-models --test bonsai_golden_tokens -- --ignored --nocapture
+```
+
+### Recording a fixture, and the gate on overwriting one
+
+`RMLX_REGEN_GOLDENS=1` makes the test write the fixture instead of asserting it.
+A golden updated to match whatever the tree produces today gates nothing, so
+**overwriting a fixture whose ids changed is itself gated**:
+
+1. The harness decodes as usual and reads the committed fixture.
+2. If the ids are unchanged, or there is no committed fixture, it writes.
+3. If they changed, it re-decodes once with `top_logprobs_k = 2` and measures
+   the top-2 logprob gap at the first differing index.
+4. It writes only when that gap is `<= REGEN_MAX_TIE_MARGIN` (0.10) — a step the
+   model had no real preference at. Otherwise it **panics with `REFUSED`**,
+   naming the index, both ids and the measured margin.
+
+Refusals are deliberate dead ends, not obstacles to route around: a token count
+change is refused at any margin, and a margin that cannot be measured — a
+missing step, absent logprobs, or a probe run that decodes a different id, i.e.
+non-determinism — is refused too. A gate that waves through what it could not
+check is the shape this harness exists to remove.
+
+The written fixture's reason line carries the margin, so a regenerated golden
+records *why* it moved. That matters because a regenerated golden with no stated
+reason is indistinguishable from a hidden regression.
+
+**This gate does not tell you the new output is correct** — only that the flip
+sat at a tie the engine's dtype could not resolve. Deciding a fixture is stale
+rather than regressed still needs evidence from outside the harness: a bisect to
+the commit that moved it, a reference comparison, and coherent decoded text.
+
+### Why this is not the only snapshot resolver
+
+Three other suites resolve snapshots their own way, and the difference is
+deliberate rather than drift. What a suite asserts decides what it may accept:
+
+| suite | resolves from | on a set-but-wrong value |
+|---|---|---|
+| golden-token (`tests/common/mod.rs`) | `RMLX_KV_TEST_MODEL` + slug | **fails** |
+| `tests/niah_long_context.rs` | `RMLX_TEST_MODEL_*` only | skips |
+| `tests/resolved_arch_class.rs` | `RMLX_TEST_MODEL_*`, then slug | skips |
+| `rmlx-cli/src/commands/kv_calibrate_tests.rs` | `RMLX_TEST_MODEL_*`, then slug | falls through to the slug |
+
+The goldens are the strict case because they are the only ones pinning **exact
+bytes from one checkpoint**. The other three make semantic assertions — a needle
+is retrieved, an architecture resolves to the expected class, prompts clear a
+token floor — which any snapshot of the right family satisfies. That is also why
+they may read the per-architecture `RMLX_TEST_MODEL_*` variables and the goldens
+may not: a same-family substitute is fine for a semantic assertion and fatal for
+a byte-exact one.
+
+Two consequences worth knowing rather than discovering:
+
+* A typo'd `RMLX_TEST_MODEL_BONSAI` panics in `rmlx-models` (if it also breaks a
+  golden's root) but only skips in `rmlx-cli`. The suites disagree because their
+  assertions do.
+* **`niah_long_context.rs` has no slug fallback, so every NIAH cell stands down
+  unless its variable is set.** That is the same silent-skip shape the goldens
+  just left, and it is deliberately not fixed here: arming the resolution would
+  change nothing that runs.
+
+  The NIAH cells are macro-generated, and the two populations they belong to are
+  now split on purpose (see *Why NIAH is not in `make gpu-test`*). The
+  `#[ignore]` rule is **enforced** on the `niah_cell!` / `niah_pflash_cell!`
+  bodies, but the cells are **not listed** for execution — a macro cell has no
+  name until expansion, so `run_gpu_tests.sh` cannot build a libtest filter for
+  one, and ~60 cells each running an 8k–32k-token prefill would turn the
+  pre-merge GPU suite into hours. So `run_gpu_tests.sh` never selects NIAH, and
+  a resolver that resolved perfectly would still be exercised by nothing.
+
+  Arm it only alongside a decision to move those cells into a gate that executes
+  them — the same condition that section records.
 
 ---
 
@@ -502,11 +682,18 @@ defect that only appears at that profile has to be reproduced by hand.
 
 | | |
 |---|---|
-| GPU suite alone | **264 s** (~4.5 min) — 318 tests over 5 crates, shader validation on, of which the `rmlx-kv-quant` unit suite is 141 s |
-| Whole `make ci-perf` after a codec-layer edit | **~21 min** (1270 s green, 1358 s on the red run) |
+| GPU suite alone | **re-measure** — the last figure (264 s, 318 tests over 5 crates) was taken while every model-gated cell returned instantly, and they no longer do |
+| Whole `make ci-perf` after a codec-layer edit | **~21 min** (1270 s green, 1358 s on the red run), plus whatever the model-gated cells now cost |
 
 The second is the number that matters, since a `.metal` change invalidates
 `rmlx-kv-quant` and everything downstream of it under `release-perf` too.
+
+The golden-token suites and the snapshot-loading `rmlx-models` cells were always
+in that 318, but contributed nothing to the runtime because nothing set the
+variable they resolved from (see the golden-token section above). They now
+resolve by slug under `RMLX_O_MODELS_ROOT`, so a machine holding the snapshots
+pays their real cost — several model loads, one of them a 35B MoE. On a machine
+with no models root, nothing changes.
 
 **Neither figure includes a cold `dev` build, and that is the case to expect.**
 `ci-perf` otherwise touches only `release-perf`, so the GPU half brings a second,

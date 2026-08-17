@@ -13,10 +13,10 @@
 //!
 //! Model: `mlx-community__Qwen3.6-35B-A3B-8bit`.
 //!
-//! RMLX_KV_TEST_MODEL=/path/to/Qwen3.6-35B-A3B-8bit \
 //! cargo test -p rmlx-models --test qwen3_5_moe_forward_seq_last_k -- --ignored
 //!
-//! Gated behind `RMLX_KV_TEST_MODEL` + `#[ignore]` (large model load).
+//! `#[ignore]`d for the large model load. The snapshot resolves from
+//! `RMLX_O_MODELS_ROOT` by slug (see `tests/common/mod.rs`).
 
 #![allow(
     clippy::unwrap_used,
@@ -43,10 +43,14 @@ use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 use rmlx_mlx::Device;
 use rmlx_models::qwen3_5_moe;
 
-const EXPECTED_ARCHS: &[&str] = &[
-    "Qwen3_5MoeForCausalLM",
-    "Qwen3_5MoeForConditionalGeneration",
-];
+/// The snapshot this test covers, and the architectures it was written against.
+const MODEL: common::GoldenModel = common::GoldenModel {
+    slug: "mlx-community__Qwen3.6-35B-A3B-8bit",
+    archs: &[
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+    ],
+};
 
 /// Read all logit rows of a `[1, n, vocab]` Array into a flat `Vec<f32>`.
 /// Logits come back in the model dtype (bf16/fp16), so cast to F32 first.
@@ -76,16 +80,11 @@ fn argmax_row(row: &[f32]) -> usize {
 #[ignore]
 #[test]
 fn qwen3_5_moe_forward_seq_last_k_equals_reference() {
-    let Some(model_path) = common::model_path_from_env() else {
+    let Some(model_path) =
+        common::model_for(&MODEL, "qwen3_5_moe_forward_seq_last_k_equals_reference")
+    else {
         return;
     };
-    if common::skip_if_arch_mismatch(
-        &model_path,
-        "qwen3_5_moe_forward_seq_last_k_equals_reference",
-        EXPECTED_ARCHS,
-    ) {
-        return;
-    }
 
     let device = Device::Gpu;
     let model = qwen3_5_moe::load_from_path(&model_path).expect("load MoE model");

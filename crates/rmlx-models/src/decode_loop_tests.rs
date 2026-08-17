@@ -615,6 +615,57 @@ fn pipelined_decode_lp_k_captures() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Fleet-wide logprob wiring
+// ---------------------------------------------------------------------------
+
+/// Every architecture's generate path, paired with its source text.
+///
+/// An arch that drives its own decode loop instead of [`pipelined_decode`] does
+/// not inherit logprob capture from it, and the omission is invisible at
+/// runtime: the payload is `Option`, so a path that never fills it looks exactly
+/// like a request that never asked for it. One such arch shipped with the field
+/// hardcoded `None`, which left every logprobs consumer — including the
+/// golden-token gate's tie-margin probe — unable to distinguish "no preference
+/// recorded" from "this arch cannot record one".
+const ARCH_GENERATE_SOURCES: &[(&str, &str)] = &[
+    ("bitnet", include_str!("bitnet/generate.rs")),
+    ("gemma3", include_str!("gemma3/generate.rs")),
+    ("gemma4", include_str!("gemma4/generate/mod.rs")),
+    ("qwen3", include_str!("qwen3.rs")),
+    ("qwen3_5_moe", include_str!("qwen3_5_moe/generate.rs")),
+];
+
+/// Every arch generate path reads `top_logprobs_k` and fills the payload with
+/// the shared [`capture_logprobs`] helper.
+///
+/// **What this proves:** no arch can silently reintroduce a hardcoded
+/// `logprobs: None` decode path, and none of them hand-rolls the log-softmax —
+/// a second implementation would drift from the one `compute_top_logprobs`
+/// pins.
+///
+/// **What it does not prove:** that the captured values are correct, or that
+/// every emitted step carries one. Those need a live decode;
+/// `pipelined_decode_lp_k_captures` above covers the shared loop on CPU, and an
+/// arch driving its own loop is only covered against this structural floor.
+/// Exact-cache-hit replays legitimately emit `None` — the hit skips the prefill
+/// that would have produced the logits.
+#[test]
+fn every_arch_generate_path_honours_top_logprobs_k() {
+    for (arch, src) in ARCH_GENERATE_SOURCES {
+        assert!(
+            src.contains("top_logprobs_k"),
+            "{arch}: generate path never reads sampler_cfg.top_logprobs_k, so a request \
+             asking for logprobs is silently answered without them"
+        );
+        assert!(
+            src.contains("capture_logprobs"),
+            "{arch}: generate path never calls capture_logprobs, so ProbeStep.logprobs \
+             stays None however large top_logprobs_k is"
+        );
+    }
+}
+
 /// The host-selection paths (temperature, penalties) hoist the logits eval out
 /// of the sampler so the GPU wait can be timed apart from the host work. That
 /// rearranges *when* the graph is materialised, which is exactly the kind of

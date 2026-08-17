@@ -2309,11 +2309,14 @@ pub fn load_from_path(model_dir: &Path, yarn_override: Option<&YarnOverride>) ->
                 // some snapshots (e.g. Bonsai). `quantized_matmul` promotes its
                 // BF16 activation against an FP16 scale to an F32 result, which
                 // then carries F32 through Q/K/V, attention, and the `--kv-quant
-                // none` KV cache — doubling residency. mlx-lm casts every float
-                // weight to a single model dtype at load; force the scale/bias to
-                // BF16 here to match, so the projection output stays BF16. Only
-                // float scales are cast: mxfp8/mxfp4 ship uint8 E8M0 scales the
-                // dequant kernel requires verbatim (`bf16_scales` gates on dtype).
+                // none` KV cache — doubling residency. Forcing the scale/bias to
+                // BF16 keeps the projection output BF16. Only float scales are
+                // cast: mxfp8/mxfp4 ship uint8 E8M0 scales the dequant kernel
+                // requires verbatim (`bf16_scales` gates on dtype).
+                //
+                // This is one-dtype uniformity, NOT reference parity: on an fp16
+                // checkpoint mlx-lm unifies on fp16, so bf16 here is coarser than
+                // both the weights and the reference. See `bf16_param`.
                 scales: bf16_scales(scales)?,
                 biases: biases.map(bf16_param).transpose()?,
                 group_size,
