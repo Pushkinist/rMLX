@@ -3065,8 +3065,12 @@ place.** Two holes in that used to be reachable and are now closed. The iso-V
 GPU-encode append (`QuantIsoV3::append_gpu`, the V side of the legacy
 `update_iso3` / `update_iso3_sym` entries) pushed a CPU block without touching a
 live ring, leaving the ring stale *and* the blocks short — it now calls
-`QuantIsoV3::absorb_ring_into_blocks`, which takes the ring's prefix back and
-then drops the ring, matching what the CPU `append` does by clearing. The iso4 V
+`QuantIsoV3::reconcile_ring(device, RingDisposition::Drop)`, which takes the
+ring's prefix back and then drops the ring, matching what the CPU `append` does
+by clearing. That is one body, shared with `materialize_iso_v3_ring_tail`, which
+passes `RingDisposition::Keep` because its caller's `sync_ring` decides the
+ring's fate immediately after — the disposition is a parameter precisely because
+it is the only thing the two callers disagree on. The iso4 V
 side had the same hole in a separate ring-unaware helper; both of its callers now
 go through the ring-aware `iso4_gpu_append_into_v_blocks` with a `Skip` feed, and
 the helper is gone (it also stored its block head-major, unlike every other iso
