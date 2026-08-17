@@ -81,6 +81,20 @@ pub trait ConstraintEngine: Send + Sync + std::fmt::Debug {
     fn wants_mask(&self) -> bool {
         true
     }
+
+    /// True when the engine is actually enforcing its grammar.
+    ///
+    /// Engines with a warm-up phase stay `false` until the model emits
+    /// something the grammar can latch onto. A generation that *ends* with
+    /// this still `false` was never constrained at all — its output is
+    /// unchecked, and byte-for-byte indistinguishable from output the
+    /// grammar inspected and permitted. The decode loop reports that case so
+    /// silent non-enforcement leaves a trace.
+    ///
+    /// Default `true`: an engine with no warm-up enforces from step one.
+    fn engaged(&self) -> bool {
+        true
+    }
 }
 
 /// Engine-specific extension trait — opt-in. Decode loops won't call this

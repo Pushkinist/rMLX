@@ -650,6 +650,9 @@ impl Generator for ArchGenerator {
         if constraint.is_some() {
             tracing::debug!(model_id = %req.model_id, "generate: constraint engine active (A6.2)");
         }
+        // Caller-supplied request identity, echoed on the never-engaged warn
+        // below so the operator can tie it back to a request.
+        let session_id_for_log = req.session_id.clone();
         // A7.2: mirror the resolved sampling knobs into the rmlx-models
         // `SamplerConfig` (rmlx-models must not depend on rmlx-server). The
         // per-request `Pcg32` is created ONCE here and threaded through every
@@ -708,12 +711,11 @@ impl Generator for ArchGenerator {
         // falls back to "<think>"/"</think>").
         let thinking_start_token = req.thinking_start_token.clone();
         let thinking_end_token = req.thinking_end_token.clone();
-        // / PART 2: prefills a CLOSED `<think></think>` when the
-        // request set `enable_thinking == Some(false)`, so the model answers
-        // directly. `splitter_open` reflects that: thinking enabled (the
-        // default) → start open (model reasons until the end delimiter); thinking
-        // disabled → start closed (route output straight to `content`).
-        let splitter_open = req.enable_thinking != Some(false);
+        // Initial think-channel, read off the rendered prompt by the route
+        // (`prompt_leaves_think_open`): `true` when the prompt left a `<think>`
+        // open and the model resumes reasoning, `false` when it closed one (or
+        // never opened one) and the model answers directly.
+        let splitter_open = req.prompt_think_open;
         // A3: build the thinking-block splitter for reasoning-capable archs.
         // Non-reasoning archs get `None` here and bypass the matcher in step_fn.
         let supports_thinking = self.model.supports_thinking();
@@ -727,21 +729,18 @@ impl Generator for ArchGenerator {
         } else {
             None
         };
-        // A6.5: for reasoning models whose chat template prefills an open
-        // `<think>` block into the assistant turn, the constraint's
-        // `is_thinking` handle must start as `true` so that `EngagePolicy::
-        // Immediate` waits for `</think>` before engaging. Without this,
-        // the very first `step_mask` fires with `is_thinking=false`, the
-        // scalar constraint engages immediately, and all emitted tokens
-        // (the forced `"medium"` etc.) are still inside the prefilled
-        // `<think>` block from the engine's perspective — the ThinkSplitter
-        // routes them to `reasoning_text` instead of `text`, producing an
-        // empty `content` field in the response.
+        // Seed the constraint's `is_thinking` handle from the same prompt-derived
+        // channel the splitter starts in, so the two agree on step one.
         //
-        // / PART 2: when disabled thinking the splitter starts
-        // closed, so the handle must start `false` to match — otherwise the
-        // constraint would defer engagement waiting for a `</think>` that
-        // never comes.
+        // Prompt left a `<think>` open → the handle starts `true` and
+        // `EngagePolicy::Immediate` waits for `</think>` before engaging;
+        // engaging earlier would force the schema value while the splitter is
+        // still routing to `reasoning_text`, leaving `content` empty.
+        //
+        // Prompt closed the block (or never opened one) → the handle starts
+        // `false`. It must, or the constraint defers engagement waiting for a
+        // `</think>` the model has no reason to emit, and the request returns
+        // HTTP 200 with the grammar never applied to a single logit.
         if supports_thinking {
             if let Some(h) = is_thinking_handle.as_ref() {
                 h.store(splitter_open, std::sync::atomic::Ordering::Release);
@@ -1455,6 +1454,23 @@ impl Generator for ArchGenerator {
                             );
                         }
                     }
+                }
+            }
+
+            // A constraint that never engaged never masked a single logit:
+            // the response is unchecked, yet byte-for-byte indistinguishable
+            // from one the grammar inspected and permitted. Say so — a caller
+            // who asked for `response_format` and got HTTP 200 has no other
+            // way to learn enforcement never happened.
+            if let Some(c) = constraint.as_ref() {
+                if !c.engaged() {
+                    tracing::warn!(
+                        model_id = %model_id_for_log,
+                        session_id = ?session_id_for_log,
+                        "constraint never engaged — this response was NOT checked against the \
+                         requested response_format. The model never left its reasoning channel, \
+                         or never emitted a byte that starts a value this grammar accepts."
+                    );
                 }
             }
 

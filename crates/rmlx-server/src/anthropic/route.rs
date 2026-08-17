@@ -333,7 +333,8 @@ pub(crate) async fn messages(
     }
 
     // ── Prompt pipeline (S1.7) ────────────────────────────────────────────────
-    let prompt_tokens: Vec<u32> = match state.registry.get(&req.model) {
+    let (prompt_tokens, prompt_think_open): (Vec<u32>, bool) = match state.registry.get(&req.model)
+    {
         None => {
             state.error_counts.increment(ApiErrorCategory::NotFound);
             return error_response(
@@ -392,11 +393,21 @@ pub(crate) async fn messages(
                     }
                 };
 
+                // Read the initial think channel off the prompt the model will
+                // actually see. The Anthropic surface has no per-request
+                // delimiter override, so the defaults apply.
+                let think_open = crate::engine::think::prompt_leaves_think_open(
+                    &rendered.text,
+                    "<think>",
+                    "</think>",
+                );
+
                 let token_count = ids.len();
                 tracing::debug!(
                     model_id = %req.model,
                     prompt_token_count = token_count,
                     template_used = true,
+                    prompt_think_open = think_open,
                     "prompt pipeline complete"
                 );
                 record_metric(
@@ -408,7 +419,7 @@ pub(crate) async fn messages(
                     &entry.abs_path_str,
                 );
 
-                ids
+                (ids, think_open)
             } else {
                 tracing::debug!(
                     model_id = %req.model,
@@ -549,10 +560,8 @@ pub(crate) async fn messages(
         // Anthropic route has no thinking-budget field — never caps.
         thinking_budget: None,
         thinking_end_token_id: None,
-        // / PART 2: Anthropic has no per-request enable_thinking; the
-        // splitter follows the server-startup default so a no-think default
-        // routes output to `content`.
-        enable_thinking: state.default_enable_thinking,
+        // ThinkSplitter init channel, read off the rendered prompt above.
+        prompt_think_open,
         // A5.6: reconstruct tool-protocol special-token markers into the
         // decoded stream only when a tool-call parser is active (Gemma
         // markers are suppressed by `skip_special`).

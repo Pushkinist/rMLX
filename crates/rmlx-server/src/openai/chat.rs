@@ -503,7 +503,16 @@ pub(crate) async fn chat_completions(
     // Best-effort: if the entry or pipeline is missing, fall through with
     // empty prompt_tokens and emit a metric + 503 note (generator is still
     // NotReadyGenerator anyway).
-    let prompt_tokens: Vec<u32> = match state.registry.get(&req.model) {
+    // Delimiters the think-splitter will use for this request, needed at render
+    // time to read the initial think channel off the rendered prompt.
+    let think_start_delim = thinking_start_token
+        .clone()
+        .unwrap_or_else(|| "<think>".to_owned());
+    let think_end_delim = thinking_end_token
+        .clone()
+        .unwrap_or_else(|| "</think>".to_owned());
+    let (prompt_tokens, prompt_think_open): (Vec<u32>, bool) = match state.registry.get(&req.model)
+    {
         None => {
             // Unknown model — 404 before reaching the generator.
             state.error_counts.increment(ApiErrorCategory::NotFound);
@@ -540,6 +549,8 @@ pub(crate) async fn chat_completions(
                 // server default > absent (= enabled / undefined). Only
                 // Some(false) changes template behaviour; Some(true) and None
                 // both leave enable_thinking undefined in the Jinja context.
+                let start_delim = think_start_delim.clone();
+                let end_delim = think_end_delim.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     let tpl_msgs: Vec<ChatMessageTpl<'_>> =
                         messages_owned.iter().map(OwnedTplMessage::as_tpl).collect();
@@ -553,8 +564,16 @@ pub(crate) async fn chat_completions(
                     let rendered = tpl
                         .render(&tpl_msgs, &opts)
                         .map_err(|e| format!("chat template render failed: {e}"))?;
-                    tokenizer_io::encode(&tk, &rendered.text)
-                        .map_err(|e| format!("tokenizer encode failed: {e}"))
+                    // Read the initial think channel off the prompt the model
+                    // will actually see, before the text is dropped.
+                    let think_open = crate::engine::think::prompt_leaves_think_open(
+                        &rendered.text,
+                        &start_delim,
+                        &end_delim,
+                    );
+                    let ids = tokenizer_io::encode(&tk, &rendered.text)
+                        .map_err(|e| format!("tokenizer encode failed: {e}"))?;
+                    Ok::<(Vec<u32>, bool), String>((ids, think_open))
                 })
                 .await;
 
@@ -569,12 +588,13 @@ pub(crate) async fn chat_completions(
                         state.error_counts.increment(ApiErrorCategory::Upstream);
                         return service_unavailable(&e);
                     }
-                    Ok(Ok(ids)) => {
+                    Ok(Ok((ids, think_open))) => {
                         let token_count = ids.len();
                         tracing::debug!(
                             model_id = %model_id_log,
                             prompt_token_count = token_count,
                             template_used = true,
+                            prompt_think_open = think_open,
                             "prompt pipeline complete"
                         );
                         record_metric(
@@ -585,7 +605,7 @@ pub(crate) async fn chat_completions(
                             &model_id_log,
                             &entry.abs_path_str,
                         );
-                        ids
+                        (ids, think_open)
                     }
                 }
             } else {
@@ -975,8 +995,8 @@ pub(crate) async fn chat_completions(
         // per-request thinking budget + pre-resolved thinking-end-token id.
         thinking_budget,
         thinking_end_token_id,
-        // / PART 2: effective enable_thinking → ThinkSplitter init channel.
-        enable_thinking: effective_enable_thinking,
+        // ThinkSplitter init channel, read off the rendered prompt above.
+        prompt_think_open,
         // A5.6: reconstruct tool-protocol special-token markers into the
         // decoded stream only when a tool-call parser is active for this
         // request (Gemma markers are suppressed by `skip_special`).

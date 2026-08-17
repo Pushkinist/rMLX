@@ -391,6 +391,10 @@ impl ConstraintEngine for SchemaConstraint {
         self.engaged && self.grammar.is_done()
     }
 
+    fn engaged(&self) -> bool {
+        self.engaged
+    }
+
     /// Always returns `true` so the pipelined generate loop uses the masked
     /// branch from the very first token. During warm-up, `step_mask` returns
     /// an all-true mask (every token allowed); this is identical in outcome

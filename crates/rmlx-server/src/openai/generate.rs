@@ -376,10 +376,9 @@ pub(super) async fn generate_blocking(
                 }
                 // A5.4 / A5.6: feed the parser regardless of think state.
                 //
-                // Some reasoning models (e.g. `Ternary-Bonsai`,
-                // `Qwen3ForCausalLM` with a prefilled `<think>`) emit the
-                // tool call WITHOUT first closing `</think>` — every piece
-                // is `is_thinking == true`. Routing thinking pieces straight
+                // A reasoning model whose prompt left a `<think>` open can
+                // emit the tool call WITHOUT first closing `</think>` — every
+                // piece is then `is_thinking == true`. Routing thinking pieces straight
                 // to `reasoning_text` (the old behaviour) meant the parser
                 // never saw the `<tool_call>` block and no `tool_calls` were
                 // produced. Feeding the parser in both states extracts the
@@ -405,12 +404,12 @@ pub(super) async fn generate_blocking(
                         }
                     }
                     None => {
-                        // bare_json_tool_call_mode — constrained output
-                        // goes to `text` regardless of is_thinking. For thinking
-                        // models (Bonsai/Qwen3) whose chat template starts inside
-                        // <think>, the JSON the constraint forced is emitted while
-                        // is_thinking == true. We need it in `text` so the
-                        // post-processor can extract it via bare_json_to_tool_call.
+                        // bare_json_tool_call_mode — constrained output goes to
+                        // `text` regardless of is_thinking. When the prompt left
+                        // a `<think>` open, the JSON the constraint forced is
+                        // emitted while is_thinking == true. We need it in `text`
+                        // so the post-processor can extract it via
+                        // bare_json_to_tool_call.
                         if tok.is_thinking && !bare_json_tool_call_mode {
                             reasoning_text.push_str(&tok.piece);
                         } else {

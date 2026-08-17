@@ -84,6 +84,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         profile-mst \
         build-capture test-capture gputrace-preflight traces-gc \
         ssd-canary ssd-canary-gate \
+        schema-constraint-canary \
         bench-codec-cell \
         smoke-codec-matrix \
         e2e \
@@ -664,6 +665,26 @@ ssd-canary: build-perf  ## run SSD canary (POPULATE/REVISIT/EVICT) against VERIF
 	@pkill -f "rmlx serve" || true; pkill -f mlx_lm || true; sleep 1; rm -f /tmp/rmlx.*.claim
 	@echo "==> ssd-canary: populate + revisit + evict"
 	bash scripts/ssd_canary.sh --tag ssd-canary --ssd-gb $${SSD_GB:-100}
+
+# ---- json_schema constraint canary ---------------------------------------
+#
+# `make schema-constraint-canary` — proves, on Bonsai (Qwen3ForCausalLM) and
+#                     gemma-4-e2b (Gemma4ForConditionalGeneration), that a strict
+#                     `json_schema` request cannot return HTTP 200 on a degenerate
+#                     whitespace run and cannot be answered by a constraint that
+#                     never engaged. Decision rule R1..R5 is stated at the top of
+#                     scripts/schema_constraint_canary.sh; artifacts land under
+#                     .rmlx/proofs/schema-constraint/. Hermetic RMLX_HOME and
+#                     `--metrics off` — never touches the real metrics DB.
+#
+# `EXPECT=baseline` inverts the exit code: the run then REQUIRES the documented
+#                     defect, so a harness too weak to see it also fails.
+#
+# Required env: RMLX_O_MODELS_ROOT (resolve via LOCAL.md), or explicit
+#               BONSAI_MODEL / GEMMA_E2B_MODEL. Needs an idle GPU.
+
+schema-constraint-canary: build-perf  ## prove json_schema enforcement on Bonsai + gemma-4-e2b (EXPECT=fixed|baseline)
+	bash scripts/schema_constraint_canary.sh --expect $${EXPECT:-fixed}
 
 ssd-canary-gate:   ## gate SSD-tier regressions; SHA= required, THRESHOLD_PCT=3 default
 	@test -n "$(SHA)" || { echo "ERROR: SHA= required. Usage: make ssd-canary-gate SHA=<last-green-sha>"; exit 125; }

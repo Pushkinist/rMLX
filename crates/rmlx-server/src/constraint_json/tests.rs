@@ -641,3 +641,85 @@ fn probe_step_mask_clone_vs_scratch() {
     }
     println!();
 }
+
+// ── insignificant-whitespace bound (json_object engine) ─────────────────────
+
+/// Same rule as the schema engine: an unbounded run of insignificant
+/// whitespace is a cycle a greedy decoder never leaves, so the run is capped.
+#[test]
+fn json_object_insignificant_whitespace_run_is_bounded() {
+    let mut g = JsonGrammar::new();
+    feed_chars(&mut g, "{").expect("object opens");
+
+    let cap = MAX_INSIGNIFICANT_WS_RUN as usize;
+    let probe = cap * 8 + 64;
+    let mut accepted = 0usize;
+    while accepted < probe && g.step(b' ').is_ok() {
+        accepted += 1;
+    }
+    assert_eq!(
+        accepted, cap,
+        "grammar must refuse the whitespace byte after {cap} in a row; it accepted {accepted}"
+    );
+    // Real progress resets the run — a pretty-printed document still parses.
+    feed_chars(&mut g, "\"a\": 1,\n  \"b\": 2\n}").expect("document completes");
+    assert!(g.is_done());
+}
+
+/// Raw C0 control bytes are illegal inside a JSON string. Accepting them both
+/// mis-parses the string and hands a greedy decoder an unbounded run of raw
+/// whitespace *inside* a value, which no whitespace bound outside strings can
+/// stop.
+#[test]
+fn json_object_raw_control_byte_inside_a_string_is_rejected() {
+    for ctrl in *b"\n\t\r\x01" {
+        let mut g = JsonGrammar::new();
+        feed_chars(&mut g, "{\"a\":\"x").expect("string value opens");
+        assert!(
+            g.step(ctrl).is_err(),
+            "raw control byte {ctrl:#04x} must be illegal inside a JSON string"
+        );
+    }
+}
+
+/// The decode-loop reproduction for the json_object engine: a decoder that
+/// always prefers whitespace must run out, and EOS must stay masked while the
+/// object is incomplete.
+#[test]
+fn json_object_mask_stops_offering_whitespace_once_the_run_is_capped() {
+    // ids: 0=`{`  1=`\n`  2=`  `  3=`"`  4=EOS
+    let bm = synthetic_bytes_map(&[b"{", b"\n", b"  ", b"\"", b""]);
+    let mut c = JsonObjectConstraint::from_bytes_map(bm, vec![4]);
+
+    let _ = c.step_mask(5);
+    c.advance(0);
+
+    let budget = MAX_INSIGNIFICANT_WS_RUN as usize * 8 + 64;
+    let mut ws_tokens = 0usize;
+    let mut last = (false, false);
+    while ws_tokens < budget {
+        let m = c.step_mask(5);
+        last = (m[1], m[2]);
+        let pick = if last.0 {
+            1
+        } else if last.1 {
+            2
+        } else {
+            break;
+        };
+        c.advance(pick);
+        ws_tokens += 1;
+    }
+    assert!(
+        ws_tokens < budget,
+        "greedy whitespace decoder never ran out: emitted {ws_tokens} whitespace tokens"
+    );
+    assert_eq!(
+        last,
+        (false, false),
+        "mask must stop offering both whitespace pieces"
+    );
+    let m = c.step_mask(5);
+    assert!(m[3], "the key opener must still be allowed");
+    assert!(!m[4], "EOS must stay masked — the object is not complete");
+}

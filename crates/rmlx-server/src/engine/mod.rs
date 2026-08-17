@@ -69,4 +69,4 @@ pub(crate) use std::sync::Arc;
 #[cfg(test)]
 pub(crate) use std::time::Instant;
 #[cfg(test)]
-pub(crate) use think::ThinkSplitter;
+pub(crate) use think::{prompt_leaves_think_open, ThinkSplitter};

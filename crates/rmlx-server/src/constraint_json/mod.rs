@@ -93,6 +93,26 @@ pub use schema::{EngagePolicy, SchemaConstraint, SchemaError, SchemaNode};
 /// Whitespace bytes allowed outside strings.
 const WS: [u8; 4] = *b" \t\n\r";
 
+/// Longest run of consecutive *insignificant* whitespace bytes either JSON
+/// engine accepts between two structural tokens.
+///
+/// JSON itself puts no bound on that run, and an unbounded one is not a
+/// harmless permissiveness: a greedy (temp=0) decoder whose highest-scoring
+/// continuation is a whitespace piece will re-pick it forever, because the
+/// mask keeps offering whitespace and keeps withholding EOS (the value is not
+/// complete, so EOS is illegal). The request then runs to `max_tokens` and
+/// returns HTTP 200 carrying nothing but indentation.
+///
+/// Bounding the run removes the cycle without removing any *value*: once the
+/// bound is hit the mask stops offering whitespace and the model must emit
+/// the next structural byte, so every JSON document is still reachable — only
+/// its indentation is clipped. This mirrors the bounded `space` rule llama.cpp
+/// generates from a JSON schema for the same reason.
+///
+/// The bound is per structural position: any content or structural byte
+/// resets the counter, so a pretty-printed document pays it once per newline.
+pub(crate) const MAX_INSIGNIFICANT_WS_RUN: u32 = 16;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JsonState {
     /// Top-level — expecting any JSON value to start.
@@ -152,6 +172,10 @@ enum Frame {
 pub struct JsonGrammar {
     state: JsonState,
     stack: Vec<Frame>,
+    /// Consecutive insignificant-whitespace bytes accepted since the last
+    /// content or structural byte. Capped at [`MAX_INSIGNIFICANT_WS_RUN`] so a
+    /// greedy decoder cannot sit in the whitespace no-op forever.
+    ws_run: u32,
 }
 
 impl Default for JsonGrammar {
@@ -166,6 +190,7 @@ impl JsonGrammar {
         Self {
             state: JsonState::Start,
             stack: Vec::new(),
+            ws_run: 0,
         }
     }
 
@@ -234,8 +259,9 @@ impl JsonGrammar {
                 }
             }
             JsonState::InString { .. } => {
-                // Any non-zero byte; `"` and `\` are state transitions.
-                for b in 1u16..=255 {
+                // Any non-control byte; `"` and `\` are state transitions.
+                // C0 control bytes must be escaped, so `step` rejects them.
+                for b in 0x20u16..=255 {
                     out[b as usize] = true;
                 }
             }
@@ -312,6 +338,13 @@ impl JsonGrammar {
                 add_ws(&mut out);
             }
         }
+        // Keep the allow-set in step with what `step` will accept: past the
+        // run cap, insignificant whitespace is no longer legal.
+        if self.ws_run >= MAX_INSIGNIFICANT_WS_RUN {
+            for &b in &WS {
+                out[b as usize] = false;
+            }
+        }
         out
     }
 
@@ -323,16 +356,23 @@ impl JsonGrammar {
     )]
     pub fn step(&mut self, byte: u8) -> Result<(), ()> {
         // Whitespace outside strings is a no-op for state, and a closer for
-        // open InNumber.
+        // open InNumber. The run is capped: an unbounded no-op is a cycle a
+        // greedy decoder never leaves — see `MAX_INSIGNIFICANT_WS_RUN`.
         let in_string = matches!(self.state, JsonState::InString { .. })
             || matches!(self.state, JsonState::InStringEscape { .. })
             || matches!(self.state, JsonState::InStringUnicode { .. });
         if !in_string && WS.contains(&byte) {
+            if self.ws_run >= MAX_INSIGNIFICANT_WS_RUN {
+                return Err(());
+            }
+            self.ws_run += 1;
             if self.state == JsonState::InNumber {
                 self.close_number();
             }
             return Ok(());
         }
+        // A content or structural byte ends the whitespace run.
+        self.ws_run = 0;
 
         match self.state {
             JsonState::Start => self.enter_value(byte, /*as_object_key=*/ false),
@@ -358,7 +398,11 @@ impl JsonGrammar {
                     self.state = JsonState::InStringEscape { is_key };
                     Ok(())
                 }
-                0 => Err(()),
+                // Raw C0 control bytes (incl. tab / newline / CR) are illegal
+                // inside a JSON string — they must be escaped. Rejecting them
+                // also stops a greedy decoder from looping on raw whitespace
+                // inside a string value.
+                0..=0x1f => Err(()),
                 _ => Ok(()),
             },
             JsonState::InStringEscape { is_key } => {
@@ -631,6 +675,7 @@ impl ProbeGrammar for JsonGrammar {
         // `state` is `Copy`; `Frame` is `Copy`, so refilling the stack is a
         // memcpy into the reused buffer — no per-token allocation.
         self.state = src.state;
+        self.ws_run = src.ws_run;
         self.stack.clear();
         self.stack.extend_from_slice(&src.stack);
     }
@@ -923,6 +968,10 @@ impl ConstraintEngine for JsonObjectConstraint {
 
     fn finished(&self) -> bool {
         self.engaged && self.grammar.is_done()
+    }
+
+    fn engaged(&self) -> bool {
+        self.engaged
     }
 
     /// Always returns `true` so the pipelined generate loop uses the masked

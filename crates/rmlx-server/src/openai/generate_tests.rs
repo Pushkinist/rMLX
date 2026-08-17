@@ -94,7 +94,7 @@ fn minimal_request(model_id: &str) -> GenerationRequest {
         is_thinking_handle: None,
         thinking_budget: None,
         thinking_end_token_id: None,
-        enable_thinking: None,
+        prompt_think_open: false,
         emit_tool_markers: false,
         thinking_start_token: None,
         thinking_end_token: None,
