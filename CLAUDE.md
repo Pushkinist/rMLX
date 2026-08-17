@@ -220,7 +220,21 @@ Hard rules:
   line-leading `// gpu-test-gate: exempt` marker in its own attribute block —
   scoped to that one `#[test]`, not the whole file; **inside a `macro_rules!`
   body that one `#[test]` is every cell the macro generates**, so audit such a
-  marker against all its invocations. A **macro-generated** test is enforced at
+  marker against all its invocations. The **converse is fatal**: an `#[ignore]`
+  whose reason claims a Metal context on a test the classifier can reach no
+  `Device::Gpu` from runs under no gate at all — ignored by `make test`,
+  unclassified by `make gpu-test` — so it fails until one of three dispositions
+  is recorded: declare the route with a line-leading
+  `// gpu-test-gate: metal-unscanned` marker (the exact inverse of `exempt` —
+  dispatches Metal but never names the device: an in-process HTTP handler, or a
+  child process), drop the `#[ignore]` and pass `Device::Cpu`, or reword the
+  `#[ignore]` so it does not claim Metal. A declared test is enforced but
+  deliberately **not** in `--list` — `run_gpu_tests.sh` asserts a Metal
+  validation banner per crate and every declared test is snapshot-gated or drives
+  a child, so listing one would fail the suite over a missing model. This one
+  check keys on the ignore *text*, which is why a Metal-driving test whose reason
+  never says "Metal" or "GPU" stays outside it. A **macro-generated** test is
+  enforced at
   its `macro_rules!` body (one body governs every cell it emits), and a body the
   scanner cannot read back — an assembled fn name, a whole macro on one line, an
   item whose brace never closes, an attribute whose bracket never closes — is a

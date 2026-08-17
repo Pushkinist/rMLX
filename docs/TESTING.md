@@ -344,45 +344,132 @@ roots — `src/**/*_tests.rs` *and* bare `src/**/tests.rs` — and the integrati
 binaries under `tests/*.rs`. It runs in `make ci` and in the hosted `source
 gates` job. It keys on the shape (does the test reach `Device::Gpu`, directly,
 through a same-file helper, or via a module-scope `const … = Device::Gpu`?),
-never on the ignore reason's wording, which varies across the tree.
+never on the ignore reason's wording, which varies across the tree. The one
+deliberate exception is the converse check below, which has no shape to key on.
 
 "Test" means `#[test]`, `#[tokio::test]`, and `#[tokio::test(flavor = …)]`. An
 async test attribute is a test attribute; matching only the bare spelling left
 ~107 of them in `rmlx-server` unclassified in both directions.
 
-**Six ignored async tests surface as warnings, and are still run by nothing.**
-Classifying `#[tokio::test]` did not add anything to `--list`, because no
-`rmlx-server` test file names `Device::Gpu` at all — those tests boot a real
-server over HTTP and the device is chosen inside production code the gate does
-not scan. So they land in the non-fatal "claims a Metal context but no
-`Device::Gpu` is reachable" warning instead:
+#### Exempting a device-as-value test
 
-| test | file |
-|---|---|
-| `valid_single_vector_200_shape` | `crates/rmlx-server/tests/embeddings_smoke.rs` |
-| `return_multivector_toggles_shape` | `crates/rmlx-server/tests/embeddings_smoke.rs` |
-| `invalid_dimensions_is_400` | `crates/rmlx-server/tests/embeddings_smoke.rs` |
-| `image_single_vector_200_shape` | `crates/rmlx-server/tests/embeddings_smoke.rs` |
-| `image_multivector_toggles_shape` | `crates/rmlx-server/tests/embeddings_smoke.rs` |
-| `ssd_cache_survives_server_restart` | `crates/rmlx-server/tests/ssd_cache_restart.rs` |
+A pure device-*policy* test — one that passes `Device::Gpu` to a non-mlx function
+as a plain selector value and never dispatches Metal — opts out **per fn** with a
+line-leading `// gpu-test-gate: exempt` marker in its own attribute block. The
+exemption is scoped to that one `#[test]`, not the file, so a Metal-driving test
+added beside it still trips the gate; a copy of the marker inside a fn body
+exempts nothing. A reviewer audits each one.
 
-They are `#[ignore]`d, so `make test` skips them; they are not GPU-classified,
-so `make gpu-test` never selects them. Both statements were true before this
-gate could see them — making them visible does not make them run. Closing that
-needs a decision the gate cannot make for itself: either they reach Metal and
-belong in the runner's population (which means giving the classifier a way to
-see through an HTTP boundary), or they are `#[ignore]`d for a reason other than
-Metal and the ignore text should say so. Until then the warning is the honest
-signal, not noise to be silenced.
+#### An `#[ignore]` that claims Metal and cannot prove it is fatal
 
-Two known edges: (1) a pure device-*policy* test — one that passes `Device::Gpu`
-to a non-mlx function as a plain selector value, never a Metal dispatch — opts
-out **per fn** with a line-leading `// gpu-test-gate: exempt` marker in its own
-attribute block (scoped to that one `#[test]`, so a Metal-driving test added to
-the same file still trips the gate; a copy of the marker inside a fn body does
-not exempt); (2) the reachability seed is file-local, so a test that reaches
-Metal only through a helper defined in another module can draw a non-fatal
-false-positive warning — verify before acting on it.
+An `#[ignore]` whose reason names a Metal context, on a test from which the
+classifier can reach no `Device::Gpu`, runs under **no gate at all**: `make test`
+skips it because it is ignored, and `make gpu-test` skips it because it is not
+classified. It reads as covered at both.
+
+This was a non-fatal warning, on the reasoning that some ignores are legitimately
+non-GPU and that a helper in a non-scanned source file makes a real Metal test
+look GPU-free to a source scanner. Both are true, and neither is a reason to
+leave the finding advisory. An advisory channel with two valid outcomes and no
+way to record which one applies is a channel nothing ever closes; seven tests
+accumulated in it. It is now a hard failure with three dispositions:
+
+1. **It drives Metal by a route the scanner cannot follow** — declare it (below).
+2. **It does not touch the GPU** — drop the `#[ignore]` and pass `Device::Cpu`,
+   so it runs in the default gate again.
+3. **It is ignored for some other reason** — say *that* reason in the `#[ignore]`
+   text instead of claiming Metal.
+
+(3) is a genuine escape hatch and is stated rather than hidden. This one check
+keys on the ignore reason's **wording** — it has to, the absence of a shape to
+key on being the whole problem — so a Metal-driving test whose ignore text never
+says "Metal" or "GPU" is invisible to it. Nothing else in the gate works that
+way.
+
+#### Declaring a Metal route the scanner cannot follow
+
+```rust
+// gpu-test-gate: metal-unscanned  <why the scanner cannot see it>
+#[ignore = "GPU Metal: …"]
+#[tokio::test]
+async fn drives_metal_over_http() { … }
+```
+
+Line-leading, in the fn's own attribute block, scoped to that one `#[test]` —
+the same rules as `// gpu-test-gate: exempt`, of which it is the exact inverse:
+`exempt` says *this names the device but never dispatches*, `metal-unscanned`
+says *this dispatches but never names the device*.
+
+Effect: the test counts as GPU-touching, so the `#[ignore]` rule bites on it —
+deleting the attribute is now a violation, which before the marker it was not.
+It is **not** emitted to `--list`; see the population table below.
+
+Two shapes fail closed rather than being resolved in the author's favour: a
+marker on a test the reachability pass *can* see through (stale — its claim is
+checkable, and keeping it would hold a listable test out of the runner forever),
+and a marker paired with `exempt` (the test both does and does not drive Metal).
+
+#### The seven declared routes, and what actually covers them
+
+Two boundaries defeat a source scanner here, and no extension of it would help:
+an HTTP request resolves through a routing table rather than a call graph, and a
+child process has its own Metal context.
+
+| test | file | route | covered by |
+|---|---|---|---|
+| `valid_single_vector_200_shape` | `crates/rmlx-server/tests/embeddings_smoke.rs` | HTTP → `embeddings()` → `Device::Gpu` | nothing; run by hand |
+| `return_multivector_toggles_shape` | `crates/rmlx-server/tests/embeddings_smoke.rs` | as above | nothing; run by hand |
+| `invalid_dimensions_is_400` | `crates/rmlx-server/tests/embeddings_smoke.rs` | as above | nothing; run by hand |
+| `image_single_vector_200_shape` | `crates/rmlx-server/tests/embeddings_smoke.rs` | as above | nothing; run by hand |
+| `image_multivector_toggles_shape` | `crates/rmlx-server/tests/embeddings_smoke.rs` | as above | nothing; run by hand |
+| `ssd_cache_survives_server_restart` | `crates/rmlx-server/tests/ssd_cache_restart.rs` | spawned `rmlx serve` child | `make e2e` phase 2a covers the same spill → restart → hydrate chain |
+| `paro_kernel_registration` | `crates/rmlx-models/src/paroquant_msl_tests.rs` | `paro_rotate_kernel()` in a non-scanned source file | nothing; the two `paro_rotate_identity_roundtrip_*` cells in `make gpu-test` compile and dispatch the same kernel |
+
+All seven genuinely need Metal — audited against the code, not against their own
+`#[ignore]` text. The five embeddings cells post to `/v1/embeddings`, whose
+handler loads the jina encoder and runs the forward under `Device::Gpu` on a
+`spawn_blocking` worker of the same process. `invalid_dimensions_is_400` looks
+like the file's other request-validation 400s and is not one: the handler defers
+`dimensions` to the model's matryoshka set, so the rejection comes out of
+`pooling::single_vector` *after* a full GPU forward.
+
+**They are enforced but not executed, and that is a runner property, not a
+classifier one.** `run_gpu_tests.sh` asserts per crate that Metal's
+shader-validation banner appeared — a crate that created no Metal device proved
+nothing. Every declared test is snapshot-gated (`RMLX_TEST_MODEL_JINA_V4`,
+`RMLX_TEST_MODEL`) or drives a child, so on a machine without that snapshot the
+runner would execute a handful of early returns, see no banner for the crate, and
+fail the suite over a missing model rather than a defect. `ssd_cache_restart`
+could not be listed on any machine: its Metal is in the child, so the in-process
+instrumentation covers nothing, and it additionally needs `cargo build -p
+rmlx-cli` first (`cargo test --tests` does not build that binary), `pkill`s every
+MLX process, and spends two 180 s readiness waits.
+
+Run the embeddings cells by hand:
+
+```sh
+RMLX_TEST_MODEL_JINA_V4=/abs/path/to/jinaai__jina-embeddings-v4 \
+  cargo test -p rmlx-server --test embeddings_smoke -- --ignored --test-threads=1
+```
+
+`paro_kernel_registration` is the one entry that could be listed as-is —
+`rmlx-models` is already in the runner's population and already produces a
+banner. It is left declared-but-unlisted because moving it needs a GPU run to
+confirm, which is a separate change.
+
+**Three populations, not one.** `--list` (what `make gpu-test` executes) is a
+strict subset of what the gate enforces, and every run prints the difference:
+
+| population | `#[ignore]` enforced | in `--list` | why |
+|---|---|---|---|
+| `Device::Gpu` reachable | yes | yes | the ordinary case |
+| macro-generated | yes, at the `macro_rules!` body | no | cell names exist only after expansion, so no libtest filter selects them |
+| `metal-unscanned` | yes | no | the runner's per-crate banner assertion; see above |
+
+The other known edge: the reachability seed is file-local for unqualified calls,
+so a test that reaches Metal only through a same-named helper in another module
+can draw the fatal converse as a false positive. The marker is the disposition
+for that too — verify the route before adding it.
 
 **Inside a `macro_rules!` body the exemption's blast radius is every cell.** The
 body is one synthetic test, so a single marker line exempts every test that
