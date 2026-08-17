@@ -342,15 +342,35 @@ pub fn argmax_with_penalties(
         &penalty_cfg.logit_bias,
     );
 
-    // Host argmax.
-    let chosen = logits
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Less))
-        .map_or(0, |(i, _)| i) as i32;
+    // Host argmax, under the same tie rule as the device reduction.
+    let chosen = host_argmax(&logits) as i32;
 
     Array::from_bytes(&chosen.to_le_bytes(), &[1], Dtype::I32)
         .map_err(|e| Error::Other(format!("argmax_with_penalties: id array build failed: {e}")))
+}
+
+/// Index of the maximum of `logits`, resolving ties to the **lowest** index.
+///
+/// This is the host mirror of the MLX `argmax` reduction that every greedy
+/// decode path dispatches on the device. It accumulates with a strict `>` from
+/// a `-inf` seed, which gives three properties the device reduction also has:
+/// equal values never displace the earlier index, a `NaN` never displaces a
+/// real maximum, and a fully constraint-masked (all `-inf`) row yields `0`.
+///
+/// Greedy selection must not depend on which side of the FFI boundary it runs,
+/// so host greedy goes through here rather than `Iterator::max_by` — which
+/// returns the *last* maximum, and which lets a `NaN` reset the running best
+/// because `partial_cmp` is `None` on it.
+fn host_argmax(logits: &[f32]) -> usize {
+    let mut best_idx = 0usize;
+    let mut best_val = f32::NEG_INFINITY;
+    for (i, &l) in logits.iter().enumerate() {
+        if l > best_val {
+            best_val = l;
+            best_idx = i;
+        }
+    }
+    best_idx
 }
 
 // ===========================================================================
@@ -545,6 +565,14 @@ fn softmax_scaled(logits: &[f32], inv_temp: f32) -> Vec<f32> {
 
 /// mlx-lm `apply_top_k` (sample_utils.py L130-151): keep the `k` highest
 /// probabilities, zero the rest. `k == 0` or `k >= len` ⇒ no-op.
+///
+/// Equal probabilities are ranked by ascending token id, so when the cut falls
+/// inside a tied group the **lowest ids** survive. That is what makes `k == 1`
+/// the argmax on every row and not only on rows with a unique maximum — the
+/// same lowest-id-wins rule the device reduction uses. mlx-lm's `argpartition`
+/// leaves the tied order unspecified; leaving it to the sort's internals here
+/// would make which of two equally-likely tokens survives an artefact of
+/// pdqsort's pivot choice.
 #[allow(
     clippy::indexing_slicing,
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
@@ -554,14 +582,14 @@ fn filter_top_k(probs: &mut [f32], k: usize) {
     if k == 0 || k >= n {
         return;
     }
-    // Find the k-th largest value via select. Build an index array sorted by
-    // prob descending; the value at rank k-1 is the cutoff. Ties: mlx-lm uses
-    // argpartition (keeps exactly k), so we keep exactly k by index rank.
+    // Build an index array sorted by prob descending, ties by ascending id;
+    // everything from rank k on is zeroed.
     let mut idx: Vec<usize> = (0..n).collect();
     idx.sort_unstable_by(|&a, &b| {
         probs[b]
             .partial_cmp(&probs[a])
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
     });
     for &i in &idx[k..] {
         probs[i] = 0.0;

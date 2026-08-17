@@ -64,6 +64,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Greedy decoding picked a different token on the host than on the device
+  whenever the top logits tied.** MLX `argmax` resolves a tie to the lowest
+  token id; the host greedy path (`argmax_with_penalties`, taken whenever a
+  repetition/presence/frequency penalty or a `logit_bias` is set at
+  `temperature == 0`) used `Iterator::max_by`, which returns the *last*
+  maximum — and which also let a `NaN` reset the running best, since
+  `partial_cmp` is `None` against one. So adding a penalty to an otherwise
+  greedy request could change the token on a tied row, and an all-`-inf`
+  (fully constraint-masked) row returned the last id instead of id 0. Host
+  greedy now mirrors the device reduction exactly: strict `>` from a `-inf`
+  seed. Ties are not exotic — BF16 logits carry 8 mantissa bits, so at
+  magnitude 16 any two candidates within 0.125 collapse to the same value.
+  `top_k` gained the same rule (equal probabilities rank by ascending id), so
+  `top_k = 1` is the argmax on tied rows and not only on rows with a unique
+  maximum; previously which of the tied ids survived was decided by pdqsort's
+  pivot choice. The pre-existing tests could not reach this: every one of them
+  used a row with a unique maximum.
 - **Mixed / RotK decode produced wrong output above 8 192 context tokens.** The
   V side of `mixed_quantized_sdpa` diverted to a separate MSL kernel
   (`sparse_v_weighted_sum`) once the cache held 8 192 tokens or more. That

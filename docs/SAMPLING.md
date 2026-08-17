@@ -127,13 +127,45 @@ Three sub-cases refine the greedy path:
 |---|---|
 | No constraint, no penalties | Pure GPU `argmax` |
 | Constraint mask, no penalties | `apply_mask_argmax` — additive `-inf` bias on GPU, then `argmax` |
-| No constraint, penalties active | `argmax_with_penalties` — GPU→host, penalties, host argmax |
+| Penalties active, with or without a constraint | `argmax_with_penalties` — GPU→host, mask, penalties, host argmax |
 
 `apply_mask_argmax` builds a F32 bias buffer on the host (0.0 for allowed,
 `-inf` for forbidden), wraps it as a `[1, vocab]` MLX array, adds it to the
 logits (GPU op, promotes BF16 to F32 automatically), then calls `argmax`.
 Overhead versus unconstrained: approximately 0.05 ms host-side bias fill for
 a 262K-token vocabulary.
+
+#### Tie-break contract
+
+**Greedy resolves an exact tie to the lowest token id, on the host and on the
+device alike.** MLX's `argmax` accumulates with a strict `>` from a `-inf`
+seed, so an equal value never displaces the earlier index; the host scan in
+`argmax_with_penalties` (`host_argmax`) is written to mirror it exactly. Three
+consequences follow from the same rule and are pinned by tests:
+
+- equal logits → lowest id,
+- a `NaN` never displaces a real maximum,
+- an all-`-inf` row (every token forbidden) yields id 0.
+
+The rule matters because the three greedy sub-cases above must be
+interchangeable: which one a request lands in is decided by whether a
+constraint or a penalty happens to be set, and that must never change the
+token on a row where the top logits tie. `Iterator::max_by` returns the *last*
+maximum and so cannot be used here.
+
+Ties are not exotic. Logits are BF16 on most snapshots, which carries 8 bits
+of mantissa — at a logit magnitude of 16 the spacing is 0.125, so any two
+candidates within that of each other collapse to the same value.
+
+The same lowest-id rule extends to `top_k`: when the cut falls inside a group
+of equal probabilities the lowest ids survive, which is what makes `top_k = 1`
+the argmax on *every* row rather than only on rows with a unique maximum.
+
+There is one shape where no host rule can match the device, because MLX does
+not match itself: MLX seeds its CPU reduction with element 0 and its Metal
+reduction with `-inf`, so a `NaN` at index 0 returns 0 on CPU and the first
+real maximum on Metal. `host_argmax` follows Metal, which is the production
+stream.
 
 ### Temperature scaling and softmax
 
@@ -192,9 +224,15 @@ the threshold so no special floor-of-1 case is needed. No-op when
 Applied after min-p. Mirrors mlx-lm `apply_top_k` (`sample_utils.py`
 L130–151).
 
-Keep exactly the `k` highest-probability tokens; set the rest to 0.0. Ties
-are broken by index rank (descending probability sort, argpartition
-semantics). No-op when `k == 0` or `k >= vocab`.
+Keep exactly the `k` highest-probability tokens; set the rest to 0.0. No-op
+when `k == 0` or `k >= vocab`.
+
+Equal probabilities are ranked by **ascending token id**, so a cut that falls
+inside a tied group keeps the lowest ids — the same rule the device `argmax`
+uses, which is what makes `top_k = 1` reduce to greedy on a tied row as well
+as on an untied one. mlx-lm's `argpartition` leaves the tied order
+unspecified; rMLX pins it rather than inheriting whatever the sort's pivot
+choice produces.
 
 ### Renormalisation
 
@@ -494,29 +532,41 @@ Reading it:
   262144-token vocabulary pays 0.880 ms/step against 0.487 ms/step for the
   151669-token one.
 
-### Host selection is not bit-identical to the GPU argmax
+### A near-zero temperature is still sampling, not greedy
 
-At `--temperature 0.0001` the host categorical sampler is arithmetically an
-argmax (every non-maximal logit underflows to exactly zero), so its token stream
-should match the greedy GPU `argmax` stream. On gemma-4-e2b it does, for all 100
-tokens. On Ternary-Bonsai-8B it agrees through 32 tokens and diverges by 64. The
-divergence is reproducible and every run within a cell agrees, so it is a
-deterministic property of the two paths and not a race.
+`--temperature 0.0001` is often used as a stand-in for greedy on the assumption
+that every non-maximal logit underflows to zero probability. That holds only
+away from a tie, and the boundary is computable: `exp` in f32 returns exactly
+zero below about `-104`, so a logit survives the scaling iff it is within
+`104 * temperature` of the maximum — 0.0104 at `temperature = 1e-4`. Outside
+that band the distribution really is one-hot and the draw really is the argmax.
 
-**The mechanism is not established.** The candidate is tie-breaking: MLX's
-`argmax` returns the first maximal index and Rust's `Iterator::max_by` returns
-the last, so an exact tie in the logits row would select different tokens. But
-that does not predict what was observed. `--repetition-penalty 1.1` is a
-different objective, not another route to the same argmax — it divides positive
-logits of the trailing-20 ids by 1.1 — and its stream, which is selected by
-`max_by`, matched the temperature stream, which is selected by
-`sample_inverse_cdf` (the first index whose cumulative sum passes an RNG draw).
-Under a two-way tie those two agree only by chance. Confirming or discarding the
-hypothesis needs the top-2 logits at the first divergent step, which nothing here
-dumps.
+**Inside it, and at an exact tie, it is not.** On an exactly tied top the
+post-softmax distribution is uniform over the tied ids, and the inverse-CDF
+draw picks among them by the RNG — matching the device `argmax`, which takes
+the lowest tied id, only about `1/k` of the time. That is the categorical
+sampler behaving correctly. A near-zero temperature is therefore **not** a
+valid oracle for the greedy path and must not be used as one; the argument
+"temperature ~0 should match greedy, so a mismatch is a bug" is unsound.
 
-What *is* established: the two paths are not interchangeable oracles on every
-model, which matters to anything that treats one as a reference for the other.
+Ties reach this band routinely on BF16 logits, whose 8-bit mantissa spaces
+values 0.125 apart at magnitude 16. A temperature-`1e-4` stream that tracks
+greedy for 32 tokens and then departs is the expected shape: one tied step is
+enough, and every token after it is conditioned on a different prefix.
+
+The path that *does* owe the device an exact match is greedy — including the
+host greedy variant `argmax_with_penalties`. See the tie-break contract under
+[Greedy](#greedy-temperature--0); it is pinned by tests that compare the host
+scan against MLX's own reduction on tied, `NaN`, and all-`-inf` rows.
+
+**Consequence for a future fused GPU sampler.** The merge gate for one cannot
+be "the token stream matches a near-zero-temperature CPU run", and it cannot be
+"the streams match" for any `temperature > 0` unless the RNG matches too. The
+gate that survives is two-part: on the greedy path, exact token identity
+against the device `argmax` including the lowest-id tie rule; on the stochastic
+path, exact token identity against the CPU path **given the same `Pcg32` draw
+sequence** — a GPU RNG must reproduce `Pcg32` bit-for-bit, or the kernel ships
+behind a dispatch policy with the CPU path retained as the oracle.
 
 ## Special tokens
 
@@ -669,7 +719,11 @@ The captured `TokenLogprobs` struct carries:
 
 **Greedy (`temperature == 0`).** Byte-identical across runs. No RNG is
 consulted. Given fixed weights, a fixed prompt, and the same KV cache state,
-the token sequence is fully determined.
+the token sequence is fully determined — and it is the same sequence in all
+three greedy sub-cases, because they share one tie rule (lowest id wins; see
+[Greedy](#greedy-temperature--0)). Adding a constraint or a penalty moves a
+request between sub-cases, and that move must not change the token on a tied
+row.
 
 **Stochastic (`temperature > 0`).** Deterministic when the seed is fixed.
 The PCG32 RNG is seeded from `SamplerConfig::seed_or_default()`:
