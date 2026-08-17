@@ -217,7 +217,14 @@ Hard rules:
   the ignore reason's text. A pure device-*policy* test (passes `Device::Gpu`
   as a plain value, never dispatches Metal) opts out **per fn** with a
   line-leading `// gpu-test-gate: exempt` marker in its own attribute block —
-  scoped to that one `#[test]`, not the whole file. See `docs/TESTING.md`.
+  scoped to that one `#[test]`, not the whole file. A **macro-generated** test
+  is enforced at its `macro_rules!` body (one body governs every cell it emits),
+  and a body declaring a `#[test]` the scanner cannot read back is a hard
+  failure rather than a clean scan; those cells are deliberately excluded from
+  `--list` / `make gpu-test`, which the enforcing run prints every time. A proc-
+  macro-generated test is still invisible — none exists in the tree.
+  `make check-gpu-tests-ignored-fixtures` pins the gate's recall in both
+  directions. See `docs/TESTING.md`.
 - **Advisory: `make file-size-report`** prints files >1000 LOC. Non-failing.
   Also runs at the end of `make ci` (advisory, non-blocking).
 - **Advisory: `make target-size-report`** prints `target/` size and, past a

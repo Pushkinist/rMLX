@@ -48,6 +48,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: GPU-touching tests carry the Metal-context #[ignore]
         run: make check-gpu-tests-ignored
+      # ...and that gate is a source scanner, so a shape it cannot parse is
+      # indistinguishable from compliance. A macro_rules! body declaring
+      # `#[test] fn $name()` was exactly that shape. Fixture workspaces pin the
+      # recall in both directions — violations caught, legitimate shapes left be.
+      - name: the #[ignore] gate still catches what it is for
+        run: make check-gpu-tests-ignored-fixtures
       # A Metal-kernel dispatcher that blocks on Array::eval() produces exactly
       # the right tokens, so no test can see it — it only shows up as a decode
       # rate several times below what the codec should reach. Static gate.

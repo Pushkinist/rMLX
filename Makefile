@@ -60,6 +60,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         e2e \
         file-size-report check-no-inline-tests check-no-scalar-f32-leak \
         check-no-decode-swallow check-gpu-tests-ignored \
+        check-gpu-tests-ignored-fixtures \
         check-no-kernel-input-eval check-no-kernel-input-eval-fixtures \
         check-metal-compiles check-metal-format
 
@@ -326,6 +327,9 @@ check-no-decode-swallow: ## CI gate: fail if a decode-step failure breaks instea
 check-gpu-tests-ignored: ## CI gate: fail if a GPU-touching test in ANY workspace member lacks #[ignore] (would abort the whole test binary under parallel cargo test)
 	@bash scripts/check_gpu_tests_ignored.sh
 
+check-gpu-tests-ignored-fixtures: ## CI gate: the #[ignore] gate still fires on macro-generated and helper-reached GPU tests
+	@bash scripts/check_gpu_tests_ignored_fixtures.sh
+
 check-no-kernel-input-eval: ## CI gate: fail if a Metal-kernel dispatcher blocks on Array::eval() (serialises host vs GPU once per layer per decode step)
 	@bash scripts/check_no_kernel_input_eval.sh
 
@@ -349,6 +353,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_no_scalar_f32_leak.sh
 	@bash scripts/check_no_decode_swallow.sh
 	@bash scripts/check_gpu_tests_ignored.sh
+	@bash scripts/check_gpu_tests_ignored_fixtures.sh
 	@bash scripts/check_no_kernel_input_eval.sh
 	@bash scripts/check_no_kernel_input_eval_fixtures.sh
 	@bash scripts/perf_ab_selftest.sh
