@@ -236,9 +236,34 @@ The gate cannot report "0 goldens checked" from inside a normal run. Add
 cargo test -p rmlx-models --test bonsai_golden_tokens -- --ignored --nocapture
 ```
 
-Record a fixture with `RMLX_REGEN_GOLDENS=1` — the test writes the file instead
-of asserting. Only do that once the current output is known good; a golden
-updated to match whatever the tree produces today gates nothing.
+### Recording a fixture, and the gate on overwriting one
+
+`RMLX_REGEN_GOLDENS=1` makes the test write the fixture instead of asserting it.
+A golden updated to match whatever the tree produces today gates nothing, so
+**overwriting a fixture whose ids changed is itself gated**:
+
+1. The harness decodes as usual and reads the committed fixture.
+2. If the ids are unchanged, or there is no committed fixture, it writes.
+3. If they changed, it re-decodes once with `top_logprobs_k = 2` and measures
+   the top-2 logprob gap at the first differing index.
+4. It writes only when that gap is `<= REGEN_MAX_TIE_MARGIN` (0.10) — a step the
+   model had no real preference at. Otherwise it **panics with `REFUSED`**,
+   naming the index, both ids and the measured margin.
+
+Refusals are deliberate dead ends, not obstacles to route around: a token count
+change is refused at any margin, and a margin that cannot be measured — a
+missing step, absent logprobs, or a probe run that decodes a different id, i.e.
+non-determinism — is refused too. A gate that waves through what it could not
+check is the shape this harness exists to remove.
+
+The written fixture's reason line carries the margin, so a regenerated golden
+records *why* it moved. That matters because a regenerated golden with no stated
+reason is indistinguishable from a hidden regression.
+
+**This gate does not tell you the new output is correct** — only that the flip
+sat at a tie the engine's dtype could not resolve. Deciding a fixture is stale
+rather than regressed still needs evidence from outside the harness: a bisect to
+the commit that moved it, a reference comparison, and coherent decoded text.
 
 ### Why this is not the only snapshot resolver
 

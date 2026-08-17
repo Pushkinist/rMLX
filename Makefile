@@ -290,6 +290,12 @@ model-check:     ## cargo test -p rmlx-{models,runtime,quant,kv-quant} (no serve
 # require a matching model + Metal context and segfault on arch mismatch. The five
 # golden tests are integration test binaries (tests/*.rs) named explicitly below.
 #
+# --test-threads=1 is mandatory, not tidiness. The bonsai binary alone holds four
+# #[ignore] GPU tests, and libtest runs a binary's tests on parallel threads: a
+# shared Metal context driven from several of them aborts the whole binary
+# ("Rust cannot catch foreign exceptions"), which is the hazard the #[ignore]
+# rule exists for. Every other runner of these tests already serializes them.
+#
 # The guard checks the PATH, not the variable. MODEL has an unconditional default
 # (see its definition above), so a `-n` test could never fire, and the default
 # names a snapshot the machine need not have. That fabricated path is then
@@ -309,7 +315,7 @@ model-check-full: ## run model-logic crates + golden-token integration tests (MO
 	  --test qwen3_golden_tokens \
 	  --test bitnet_golden_tokens \
 	  --test medgemma_golden_tokens \
-	  -- --ignored
+	  -- --ignored --test-threads=1
 
 # e2e: the feature-proof harness — drives the REAL rmlx binary per manifest case
 # (CLI subprocess or `rmlx serve` + HTTP), asserts on real output, writes the

@@ -137,6 +137,82 @@ pub fn regen_requested() -> bool {
     std::env::var(REGEN_VAR).is_ok()
 }
 
+/// Largest top-2 logprob margin at a diverging step that still counts as a tie
+/// this engine's float dtype cannot resolve.
+///
+/// A regenerated golden with no recorded reason is indistinguishable from a
+/// hidden regression, so overwriting a fixture whose ids changed is only
+/// defensible when the model had no real preference at the step that moved.
+/// Above this the divergence is a decision the model made confidently, which is
+/// a behaviour change to explain, not a fixture to refresh.
+pub const REGEN_MAX_TIE_MARGIN: f32 = 0.10;
+
+/// Index of the first differing token id. `None` when the sequences match.
+/// A length change is reported at the first index the shorter one lacks.
+pub fn first_divergence(new_ids: &[u32], committed: &[u32]) -> Option<usize> {
+    if let Some(i) = new_ids.iter().zip(committed).position(|(a, b)| a != b) {
+        return Some(i);
+    }
+    if new_ids.len() == committed.len() {
+        None
+    } else {
+        Some(new_ids.len().min(committed.len()))
+    }
+}
+
+/// Whether a regeneration may overwrite the committed fixture.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Regen {
+    Write(String),
+    Refuse(String),
+}
+
+/// Adjudicate a regeneration.
+///
+/// `margin` is the top-2 logprob gap at [`first_divergence`], and is required
+/// whenever the ids changed — an unmeasurable margin refuses, because a gate
+/// that waves through what it could not check is the shape this whole harness
+/// exists to remove.
+pub fn regen_verdict(
+    new_ids: &[u32],
+    committed: Option<&[u32]>,
+    margin: Option<f32>,
+    max_margin: f32,
+) -> Regen {
+    let Some(committed) = committed else {
+        return Regen::Write("no committed fixture — recording for the first time".to_owned());
+    };
+    let Some(i) = first_divergence(new_ids, committed) else {
+        return Regen::Write("ids unchanged".to_owned());
+    };
+    if new_ids.len() != committed.len() {
+        return Regen::Refuse(format!(
+            "token count changed ({} -> {}); a length change is not a tie",
+            committed.len(),
+            new_ids.len()
+        ));
+    }
+    let Some(margin) = margin else {
+        return Regen::Refuse(format!(
+            "ids diverge at index {i} but the top-2 margin there could not be measured"
+        ));
+    };
+    if margin <= max_margin {
+        Regen::Write(format!(
+            "divergence at index {i} ({} -> {}) sits at a top-2 margin of {margin:.8}, \
+             at or below the {max_margin} tie floor",
+            committed[i], new_ids[i]
+        ))
+    } else {
+        Regen::Refuse(format!(
+            "ids diverge at index {i} ({} -> {}) at a top-2 margin of {margin:.8}, above the \
+             {max_margin} tie floor — the model chose this token confidently, so something \
+             other than a near-tie moved. Investigate before regenerating.",
+            committed[i], new_ids[i]
+        ))
+    }
+}
+
 /// Files every snapshot must carry. Both are opened BY NAME: `config.json` by
 /// [`model_arch`] and `arch::load_model`, `tokenizer.json` by
 /// [`run_golden_test`]'s `Tokenizer::from_file`.
@@ -507,12 +583,42 @@ pub fn run_golden_test(fixture_tag: &str, kv_quant: KvQuant, model_path: &Path) 
     let fixture_path = fixtures_dir().join(format!("{fixture_tag}.golden.txt"));
 
     if regen_requested() {
-        write_golden(&fixture_path, fixture_tag, &kv_quant, &token_ids, &decoded);
-        eprintln!(
-            "[{fixture_tag}] WROTE golden ({} ids, kv={kv_quant}) -> {}\n  decoded: {decoded:?}",
-            token_ids.len(),
-            fixture_path.display()
-        );
+        let committed = read_golden(&fixture_path);
+        // Only pay for the margin measurement when the ids actually moved.
+        let margin = committed
+            .as_deref()
+            .and_then(|c| first_divergence(&token_ids, c))
+            .and_then(|i| {
+                measure_top2_margin(
+                    &model,
+                    &tokenizer,
+                    &prompt_ids,
+                    device,
+                    kv_quant,
+                    &penalty_cfg,
+                    i,
+                    token_ids[i],
+                )
+            });
+        match regen_verdict(
+            &token_ids,
+            committed.as_deref(),
+            margin,
+            REGEN_MAX_TIE_MARGIN,
+        ) {
+            Regen::Write(why) => {
+                write_golden(&fixture_path, fixture_tag, &kv_quant, &token_ids, &decoded);
+                eprintln!(
+                    "[{fixture_tag}] WROTE golden ({} ids, kv={kv_quant}) -> {}\n  reason: {why}\n  decoded: {decoded:?}",
+                    token_ids.len(),
+                    fixture_path.display()
+                );
+            }
+            Regen::Refuse(why) => panic!(
+                "[{fixture_tag}] REFUSED to regenerate: {why}\n  got    = {token_ids:?}\n  \
+                 decoded(got) = {decoded:?}"
+            ),
+        }
         return;
     }
 
@@ -528,6 +634,73 @@ pub fn run_golden_test(fixture_tag: &str, kv_quant: KvQuant, model_path: &Path) 
         "[{fixture_tag}] golden-token mismatch (kv={kv_quant}) — decode regression.\n  \
          got    = {token_ids:?}\n  golden = {golden:?}\n  decoded(got) = {decoded:?}"
     );
+}
+
+/// Re-decode the same prompt asking for top-2 logprobs, and return the gap
+/// between the two best candidates at step `index`.
+///
+/// A second decode rather than raising `top_logprobs_k` on the first: the ids a
+/// golden pins must come from the same sampler configuration they were recorded
+/// under, and this path only runs while regenerating a fixture whose ids
+/// already moved.
+///
+/// Returns `None` — which [`regen_verdict`] treats as a refusal — when the step
+/// is missing, carries no logprobs, has fewer than two candidates, or decodes a
+/// different id than the first run did. That last case is non-determinism, and
+/// adjudicating a tie across two disagreeing runs would be meaningless.
+#[allow(clippy::too_many_arguments)]
+fn measure_top2_margin(
+    model: &arch::Architecture,
+    tokenizer: &tokenizers::Tokenizer,
+    prompt_ids: &[u32],
+    device: Device,
+    kv_quant: KvQuant,
+    penalty_cfg: &PenaltyConfig,
+    index: usize,
+    expected_id: u32,
+) -> Option<f32> {
+    let sampler_cfg = SamplerConfig {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        min_p: 0.0,
+        seed: Some(0),
+        top_logprobs_k: 2,
+    };
+    let mut rng = Pcg32::new(sampler_cfg.seed_or_default());
+    let mut token_history: Vec<u32> = Vec::new();
+    let steps = model
+        .generate_greedy(
+            tokenizer,
+            prompt_ids,
+            N_GOLDEN_TOKENS,
+            device,
+            Some(kv_quant),
+            None,
+            1,
+            &[],
+            &mut |_| None,
+            None,
+            &sampler_cfg,
+            &mut rng,
+            penalty_cfg,
+            &mut token_history,
+        )
+        .ok()?;
+
+    let step = steps.get(index)?;
+    if step.token_id != expected_id {
+        eprintln!(
+            "  margin probe decoded {} at index {index}, first run decoded {expected_id} — \
+             non-deterministic, refusing to adjudicate",
+            step.token_id
+        );
+        return None;
+    }
+    let top = &step.logprobs.as_ref()?.top;
+    let (_, best) = *top.first()?;
+    let (_, second) = *top.get(1)?;
+    Some(best - second)
 }
 
 /// Absolute path to the checked-in fixtures directory.

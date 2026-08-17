@@ -216,9 +216,9 @@ at f32 (4 B/elem) — roughly **2× the bf16 expectation**. (The YARN mscale sca
 is *not* the cause: q/k/v arrive at the YARN branch already f32 from the
 projection.)
 
-Fix, matching mlx-lm's "uniform model dtype" discipline (`w.astype(model_dtype)`
-at load): every float model parameter — norm weights, quant scales/biases, and
-embedding scales/biases — adopts the bf16 activation dtype at load. The
+Fix — one float dtype for the whole model, adopted at load: every float model
+parameter — norm weights, quant scales/biases, and embedding scales/biases —
+takes the bf16 activation dtype. The
 projection and norm outputs then stay bf16, so K and V store as bf16. The YARN
 mscale scalar is also stored as bf16 at load (defense-in-depth; the scalar was
 never the root cause, but prebuilding it as bf16 is cheaper than a per-step
@@ -229,6 +229,18 @@ Measured (Bonsai-8B-2bit, `--kv-quant none`): decode-time K/V resident dtype
 flips f32→bf16 (4→2 B/elem), halving KV residency. Decode TPS gains widen with
 context as KV bandwidth dominates: ~+34 % at 4 k, ~+73 % at 16 k, ~+100 % at
 64 k — recovering the prior loss vs the mlx-lm champion on this model.
+
+**The chosen dtype is bf16, and that is not what the reference does.** mlx-lm
+applies the same one-dtype rule but takes it from the checkpoint: measured with
+mlx-lm 0.31.2 on `prism-ml__Ternary-Bonsai-8B-mlx-2bit`, all 653 float params
+load as **float16**, the forward returns float16 logits, and the KV cache is
+float16. bf16 has 3 fewer mantissa bits than fp16, so rMLX decodes this
+checkpoint coarser than both the weights on disk and the reference. It is a
+deliberate trade for the numbers above — bf16 is what this engine's kernels and
+KV codecs are built around — and it has a measurable price: it flips tokens at
+near-tie logits. `bonsai_8b_mixed_k8g64_v4g64.golden.txt` was regenerated for
+exactly one such flip (an exact tie in rMLX where the reference sees a 0.0859
+margin). Do not restate this cast as matching mlx-lm.
 
 ### Qwen3.6 MoE `--kv-quant none` KV is bf16 — audited clean AND hardened
 

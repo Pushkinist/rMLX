@@ -552,3 +552,105 @@ fn apply_returns_none_on_skip() {
 fn apply_panics_on_fail() {
     apply(Gate::Fail("bad pointer".to_owned()), "t");
 }
+
+// ── regeneration gate ────────────────────────────────────────────────────
+
+use super::{first_divergence, regen_verdict, Regen, REGEN_MAX_TIE_MARGIN};
+
+const FLOOR: f32 = REGEN_MAX_TIE_MARGIN;
+
+fn wrote(r: &Regen) -> bool {
+    matches!(r, Regen::Write(_))
+}
+
+#[test]
+fn first_divergence_finds_the_first_differing_index() {
+    assert_eq!(first_divergence(&[1, 2, 3], &[1, 2, 3]), None);
+    assert_eq!(first_divergence(&[1, 9, 3], &[1, 2, 3]), Some(1));
+    assert_eq!(first_divergence(&[9, 2, 3], &[1, 2, 3]), Some(0));
+    // A pure length change diverges where the shorter sequence ends.
+    assert_eq!(first_divergence(&[1, 2, 3, 4], &[1, 2, 3]), Some(3));
+    assert_eq!(first_divergence(&[1, 2], &[1, 2, 3]), Some(2));
+}
+
+/// First recording: there is nothing to adjudicate against.
+#[test]
+fn a_missing_fixture_is_recorded_without_a_margin() {
+    assert!(wrote(&regen_verdict(&[1, 2, 3], None, None, FLOOR)));
+}
+
+/// Re-recording identical ids needs no margin either — nothing moved.
+#[test]
+fn unchanged_ids_are_rewritten_without_a_margin() {
+    assert!(wrote(&regen_verdict(
+        &[1, 2, 3],
+        Some(&[1, 2, 3]),
+        None,
+        FLOOR
+    )));
+}
+
+/// The case both stale fixtures are: a single flip at a step the model could
+/// not resolve. An exact tie is the extreme of it.
+#[test]
+fn a_divergence_at_a_tie_is_allowed() {
+    for margin in [0.0, 0.0001, FLOOR] {
+        let got = regen_verdict(&[1, 9, 3], Some(&[1, 2, 3]), Some(margin), FLOOR);
+        assert!(wrote(&got), "margin {margin} must be writable, got {got:?}");
+    }
+}
+
+/// Above the floor the model chose confidently, so something other than a
+/// near-tie moved. That is a behaviour change to explain, not a fixture to
+/// refresh — this is the check that stops a regression being laundered into a
+/// golden.
+#[test]
+fn a_divergence_the_model_was_confident_about_is_refused() {
+    for margin in [0.1001, 0.5, 4.0] {
+        let got = regen_verdict(&[1, 9, 3], Some(&[1, 2, 3]), Some(margin), FLOOR);
+        assert!(
+            matches!(got, Regen::Refuse(_)),
+            "margin {margin} must be refused, got {got:?}"
+        );
+    }
+}
+
+/// An unmeasurable margin refuses. A gate that waves through what it could not
+/// check is the exact shape this harness exists to remove.
+#[test]
+fn a_divergence_with_no_measurable_margin_is_refused() {
+    assert!(matches!(
+        regen_verdict(&[1, 9, 3], Some(&[1, 2, 3]), None, FLOOR),
+        Regen::Refuse(_)
+    ));
+}
+
+/// A token-count change is not a tie at any margin — the decode went somewhere
+/// structurally different.
+#[test]
+fn a_length_change_is_refused_even_at_a_perfect_tie() {
+    assert!(matches!(
+        regen_verdict(&[1, 2, 3, 4], Some(&[1, 2, 3]), Some(0.0), FLOOR),
+        Regen::Refuse(_)
+    ));
+    assert!(matches!(
+        regen_verdict(&[1, 2], Some(&[1, 2, 3]), Some(0.0), FLOOR),
+        Regen::Refuse(_)
+    ));
+}
+
+/// The refusal has to say which index moved and to what, or the operator
+/// cannot tell a stale fixture from a regression without re-deriving it.
+#[test]
+fn the_verdict_names_the_index_and_both_ids() {
+    let Regen::Refuse(why) = regen_verdict(&[1, 9, 3], Some(&[1, 2, 3]), Some(4.0), FLOOR) else {
+        panic!("expected a refusal");
+    };
+    assert!(why.contains("index 1"), "{why}");
+    assert!(why.contains('2') && why.contains('9'), "{why}");
+
+    let Regen::Write(why) = regen_verdict(&[1, 9, 3], Some(&[1, 2, 3]), Some(0.0), FLOOR) else {
+        panic!("expected a write");
+    };
+    assert!(why.contains("index 1"), "{why}");
+}
