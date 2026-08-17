@@ -119,18 +119,39 @@
 #   * It says nothing about concurrent *graph construction*, which never
 #     reaches `eval_impl`.
 #
-# AWK PORTABILITY — measured, not reasoned about
-#   This gate and its 26-fixture corpus give identical verdicts under gawk
-#   5.4.1, mawk 1.3.4 and BSD awk 20200816, each under both LC_ALL=C and
+# INTERPRETER PORTABILITY — measured, not reasoned about
+#   Two external interpreters decide this gate's verdict: `awk` (three scan
+#   helpers below) and `grep` (four call sites below, one more in the fixture
+#   runner). Hosted CI runs GNU builds of both on Linux; this machine's
+#   defaults are neither. So both were measured rather than argued about.
+#
+#   awk — this gate and its 26-fixture corpus give identical verdicts under
+#   gawk 5.4.1, mawk 1.3.4 and BSD awk 20200816, each under both LC_ALL=C and
 #   LC_ALL=en_US.UTF-8, with all 17 gate mutations killed in all six
 #   combinations. The awk below is POSIX-only on purpose: no `gensub`, no `\s`,
 #   no `{n,m}` intervals (mawk's support is version-dependent) and no octal
 #   escapes in bracket expressions (BSD awk accepts `[\300-\337]`, Linux awk
 #   rejects it outright). `length`/`substr` do go character-based rather than
 #   byte-based under a UTF-8 locale, but `strip()` only ever reconstructs by
-#   concatenation, so its output is byte-identical either way. The scripts call
-#   bare `awk`, so re-checking this means putting a shim named `awk` first on
-#   PATH — there is no AWK= override to reach for.
+#   concatenation, so its output is byte-identical either way.
+#
+#   grep — the same two artefacts give byte-identical output and exit code
+#   under BSD grep 2.6.0-FreeBSD and GNU grep 3.12, each under both LC_ALL=C
+#   and LC_ALL=en_US.UTF-8: 4 combinations, plus all 17 mutations killed in
+#   every one of the resulting 68 cells. `BANNED_RE`, `GUARDED_RE` and the
+#   RULE 3 pattern are plain POSIX ERE — no `\s`, no `\d`, no `\b`/`\<` word
+#   boundaries, no `{n,m}` intervals, and no octal escapes in bracket
+#   expressions, which is the same trap the awk paragraph names. `-r` and
+#   `--include` are the only non-POSIX flags used and both engines have them.
+#   The `[A-Za-z0-9_]` ranges are the one locale-collation-sensitive construct
+#   left; the `banned_item` and `banned_save*` fixtures exercise them in both
+#   locales.
+#
+#   Both scripts call bare `awk` and bare `grep`, so re-checking any of this
+#   means putting a shim of that name first on PATH — there is no AWK= or
+#   GREP= override to reach for. Make the shim log which binary it exec'd and
+#   assert on that log: a matrix that silently ran the host default in every
+#   cell proves nothing and looks exactly like one that did not.
 
 set -euo pipefail
 
