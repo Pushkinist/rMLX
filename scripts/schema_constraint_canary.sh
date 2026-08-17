@@ -1,56 +1,77 @@
 #!/usr/bin/env bash
 # schema_constraint_canary.sh — real-model proof for the `json_schema` constraint path.
 #
-# Answers two questions, on two architectures, with the verdict fixed before
-# the run:
+# Two probes on two architectures, verdict fixed before the run.
 #
-#   1. Can a `json_schema` request return success on a non-terminating run of
-#      grammar-permitted whitespace?           (must be: no)
-#   2. Can a `SchemaConstraint` be built and then never engage, with the caller
-#      told nothing?                           (must be: no)
+#   Probe A — "plain key". Object root, one required enum property named `unit`.
+#             The shape the issue was filed with. Kept as a no-regression check.
+#   Probe B — "spaced key". Same, but the property is named `unit label`.
+#             The space is key CONTENT. A grammar that treats whitespace inside
+#             a key string as an insignificant separator parks the key trie on
+#             the space it is still expecting; every candidate token carrying
+#             the rest of the name is then rejected at its second byte, while a
+#             whitespace-only token is accepted as a no-op. The mask offers
+#             whitespace and nothing else, forever, and withholds EOS because
+#             the value is incomplete. That is forced by the mask, so unlike
+#             Probe A it does not depend on the model preferring whitespace.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # DECISION RULE — read this before running, not after.
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# Per model, the probe PASSES iff ALL FIVE hold:
+# Per (model, probe) cell, the probe PASSES iff ALL FIVE hold:
 #
 #   R1  HTTP status is 200.
 #   R2  finish_reason == "stop".  A degenerate run cannot stop on EOS — the
 #       mask withholds EOS until the value is complete — so it always ends at
 #       max_tokens with "length".
 #   R3  The payload (content, else reasoning_content) parses as JSON after
-#       stripping an optional ```json fence, and VALIDATES against the probe
-#       schema: object, exactly the key "unit", value in {"celsius",
-#       "fahrenheit"}, no other keys.
+#       stripping an optional ```json fence, and VALIDATES against that probe's
+#       schema: object, exactly the one expected key, value in the enum.
 #   R4  The emitted token-id stream is not degenerate. Degenerate := the tail
 #       is periodic with period <= 4 for >= 16 tokens (a constant stream is the
-#       period-1 case). Ids come from the run's own log.
+#       period-1 case). Ids come from the run's own log, filtered to this
+#       probe's `X-Request-Id`.
+#         * Fewer than 16 emitted tokens -> reported "n/a", counts as PASS: a
+#           stream that short cannot be degenerate, and R2 already catches the
+#           long-run case. It is printed as n/a so nobody reads it as evidence.
+#         * Log records present but no parsable token_id, or no step_fn records
+#           at all -> HARNESS ERROR, counts as FAIL. A rule that cannot fire
+#           must never report PASS.
 #   R5  The run log contains a `building SchemaConstraint` line AND a
 #       `SchemaConstraint: ... engaging` line, and does NOT contain
-#       `constraint never engaged`.
-#
-# The probe FAILS if any of R1..R5 is false. There is no partial credit and no
-# "looks fine" branch.
+#       `constraint never engaged` — all filtered to this probe's request id.
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# WHAT THE BASELINE (origin/main, before the fix) MUST PRODUCE
+# WHAT THE BASELINE MUST PRODUCE  (`--expect baseline`)
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# Run with `--expect baseline` and the exit code inverts: the script then
-# REQUIRES the documented defect and fails if it does not reproduce. A fix that
-# changes nothing is caught by `--expect fixed` failing; a proof harness too
-# weak to see the defect is caught by `--expect baseline` failing.
+# Not "everything fails". The expectation is per cell, and is what was actually
+# observed at the pre-fix commit — a cell expected to PASS on the baseline is
+# recorded here so that a harness which starts failing it says so.
 #
-#   gemma-4-e2b   R2 false (finish_reason "length"), R3 false (payload is
-#                 ```json\n{\n  " plus an endless \n / two-space alternation),
-#                 R4 false (ids 107,138,107,138,… — period 2). R5 true: the
-#                 constraint DID engage on token 236782 (`{`).
-#   Bonsai-8B     R3 false (payload is a different object, e.g. an "error" key
-#                 the schema forbids). R5 false: the log has
-#                 `building SchemaConstraint` and NO engaging line. `constraint
-#                 never engaged` is also absent — on origin/main that warn does
-#                 not exist, which is the second half of the defect.
+#   bonsai / A   MUST FAIL — the template prefills a CLOSED think block, the
+#                splitter starts open, `is_thinking` latches, and the engage
+#                gate never fires. Observed: R3 (`unit='Celsius'`, outside the
+#                enum) and R5 (`engaging_line=False`).
+#   bonsai / B   MUST FAIL — same gate, and the key-string defect underneath it.
+#   gemma / A    MUST PASS — **the reported whitespace loop does not reproduce
+#                on this probe.** Observed at the pre-fix commit: byte-identical
+#                to the fixed arm, `{\n  "unit": "celsius"\n}`, finish_reason
+#                stop, 16 tokens, R4 clean. gemma is not thinking-capable so the
+#                engage gate is not involved, and with a single-word key the
+#                grammar never corners the decoder. Whether it loops on Probe A
+#                is then a matter of which token the model prefers at a
+#                structural position, which this model does not.
+#   gemma / B    MUST FAIL — the mask corners the decoder regardless of
+#                preference.
+#
+#   `--expect fixed`: all four cells MUST PASS.
+#
+# A fix that does nothing fails `--expect fixed`. A harness too weak to see the
+# defect fails `--expect baseline`. A defect that starts reproducing where it
+# did not, or stops where it did, also fails `--expect baseline` — the table is
+# a claim about the world, not a fudge factor.
 #
 # Note R4 is deliberately not "N consecutive identical ids": a 2-periodic
 # stream has a maximum consecutive-identical run of 1 and sails through that
@@ -72,13 +93,13 @@
 #   - Exclusive GPU: one MLX process per Mac. The script preflights strays.
 #
 # Writes nothing to the real metrics DB: hermetic RMLX_HOME under
-# .rmlx/proofs/schema-constraint, `--metrics off` on every server.
+# .rmlx/proofs/schema-constraint, `--metrics off` on every server. One server
+# per model serves both probes; they are separated in the log by the
+# `X-Request-Id` each request carries.
 #
-# Artifacts (per model, under that hermetic root):
-#   response.json   raw HTTP body
-#   serve.log       server stdout/stderr
-#   logs/*.jsonl    structured run log (the R4/R5 evidence)
-#   verdict.txt     R1..R5 with the observed value of each
+# Artifacts per (model, probe), under that hermetic root:
+#   <probe>.request.json / .response.json / .status.txt / .verdict.txt
+#   serve.log, logs/*.jsonl   (shared per model)
 
 set -uo pipefail
 
@@ -99,7 +120,7 @@ while [[ $# -gt 0 ]]; do
         --expect) EXPECT="$2"; shift 2 ;;
         --model)  ONLY_MODEL="$2"; shift 2 ;;
         --port)   PORT="$2"; shift 2 ;;
-        -h|--help) sed -n '1,84p' "$0"; exit 0 ;;
+        -h|--help) sed -n '1,105p' "$0"; exit 0 ;;
         *) echo "unknown flag: $1" >&2; exit 2 ;;
     esac
 done
@@ -108,44 +129,68 @@ case "${EXPECT}" in
     *) echo "--expect must be 'fixed' or 'baseline'" >&2; exit 2 ;;
 esac
 
-# ── The probe request ─────────────────────────────────────────────────────────
-# Object root (so the engage policy is ValueStarter — the shape that failed),
-# one required enum property, additionalProperties:false, strict, temperature 0.
-# max_tokens is generous on purpose: a bounded grammar must stop well short of
-# it, and an unbounded one must be given room to prove it does not.
-read -r -d '' PROBE_BODY_TMPL <<'JSON' || true
-{
-  "model": "MODEL_ID",
-  "messages": [
-    {"role": "user", "content": "What unit is 25 degrees Celsius measured in? Answer with the JSON object only."}
-  ],
-  "temperature": 0,
-  "seed": 0,
-  "max_tokens": 256,
-  "response_format": {
-    "type": "json_schema",
-    "json_schema": {
-      "name": "unit_answer",
-      "strict": true,
-      "schema": {
-        "type": "object",
-        "properties": {"unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}},
-        "required": ["unit"],
-        "additionalProperties": false
-      }
-    }
-  }
+# ── Baseline expectation table (see the header) ──────────────────────────────
+# Cells listed here are expected to PASS even on the baseline arm.
+baseline_expects_pass() {
+    [[ "$1" == "gemma4-e2b" && "$2" == "A" ]]
 }
-JSON
 
-# ── Preflight ─────────────────────────────────────────────────────────────────
+# ── The probe requests ───────────────────────────────────────────────────────
+# Object root (engage policy = ValueStarter, the shape that failed), one
+# required enum property, additionalProperties:false, strict, temperature 0.
+# max_tokens is generous on purpose: a bounded grammar must stop well short of
+# it, and an unbounded one must be given room to prove that it does not.
+
+probe_key() {
+    case "$1" in
+        A) printf 'unit' ;;
+        B) printf 'unit label' ;;
+    esac
+}
+
+probe_body() {
+    # $1 = probe id, $2 = model id
+    local key
+    key="$(probe_key "$1")"
+    python3 - "$key" "$2" <<'PY'
+import json, sys
+key, model = sys.argv[1], sys.argv[2]
+print(json.dumps({
+    "model": model,
+    "messages": [{
+        "role": "user",
+        "content": "What unit is 25 degrees Celsius measured in? "
+                   "Answer with the JSON object only.",
+    }],
+    "temperature": 0,
+    "seed": 0,
+    "max_tokens": 256,
+    "response_format": {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "unit_answer",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {key: {"type": "string",
+                                     "enum": ["celsius", "fahrenheit"]}},
+                "required": [key],
+                "additionalProperties": False,
+            },
+        },
+    },
+}, indent=2))
+PY
+}
+
+# ── Preflight ────────────────────────────────────────────────────────────────
 
 preflight() {
-    pkill -f "rmlx serve"   2>/dev/null || true
+    pkill -f "rmlx serve"      2>/dev/null || true
     pkill -f "rmlx_main serve" 2>/dev/null || true
-    pkill -f mlx_lm         2>/dev/null || true
-    pkill -f paroquant      2>/dev/null || true
-    pkill -f omlx           2>/dev/null || true
+    pkill -f mlx_lm            2>/dev/null || true
+    pkill -f paroquant         2>/dev/null || true
+    pkill -f omlx              2>/dev/null || true
     sleep 3
     rm -f /tmp/rmlx.*.claim 2>/dev/null || true
 }
@@ -167,89 +212,98 @@ wait_for_server() {
     return 1
 }
 
-# ── Verdict evaluation (python: JSON + the periodicity rule) ──────────────────
+# ── Verdict evaluation ───────────────────────────────────────────────────────
 
 evaluate() {
-    # $1 = artifact dir
-    python3 - "$1" <<'PY'
+    # $1 = artifact dir, $2 = probe id, $3 = expected key, $4 = request id
+    python3 - "$1" "$2" "$3" "$4" <<'PY'
 import json, os, re, sys, glob
 
-d = sys.argv[1]
+d, probe, want_key, rid = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+
 def read(p):
     try:
         with open(p) as f: return f.read()
     except OSError:
         return ""
 
-body_raw = read(os.path.join(d, "response.json"))
-status = read(os.path.join(d, "status.txt")).strip()
+body_raw = read(os.path.join(d, f"{probe}.response.json"))
+status = read(os.path.join(d, f"{probe}.status.txt")).strip()
 
-results = {}
+results = []   # (name, state, detail)  state in {PASS, FAIL, N/A}
 
 # R1 — HTTP 200
-results["R1_http_200"] = (status == "200", f"status={status or 'none'}")
-
-# Parse the response envelope.
 try:
     body = json.loads(body_raw)
+    results.append(("R1_http_200", "PASS" if status == "200" else "FAIL",
+                    f"status={status or 'none'}"))
 except Exception as e:
     body = None
-    results["R1_http_200"] = (False, f"status={status} body_unparseable: {e}")
+    results.append(("R1_http_200", "FAIL",
+                    f"status={status or 'none'} body_unparseable: {e}"))
 
-msg = {}
-finish = None
+msg, finish = {}, None
 if isinstance(body, dict):
     ch = (body.get("choices") or [{}])[0]
     msg = ch.get("message") or {}
     finish = ch.get("finish_reason")
 
 # R2 — finish_reason
-results["R2_finish_stop"] = (finish == "stop", f"finish_reason={finish!r}")
+results.append(("R2_finish_stop", "PASS" if finish == "stop" else "FAIL",
+                f"finish_reason={finish!r}"))
 
-# R3 — payload validates against the probe schema
+# R3 — payload validates against this probe's schema
 payload = msg.get("content") or msg.get("reasoning_content") or ""
-stripped = payload.strip()
-stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
-stripped = re.sub(r"\s*```$", "", stripped)
-ok_r3, why_r3 = False, ""
+stripped = re.sub(r"\s*```$", "", re.sub(r"^```(?:json)?\s*", "", payload.strip()))
+ok, why = False, ""
 try:
     v = json.loads(stripped)
     if not isinstance(v, dict):
-        why_r3 = f"payload is {type(v).__name__}, not an object"
-    elif set(v.keys()) != {"unit"}:
-        why_r3 = f"keys={sorted(v.keys())} (schema allows exactly ['unit'])"
-    elif v["unit"] not in ("celsius", "fahrenheit"):
-        why_r3 = f"unit={v['unit']!r} not in enum"
+        why = f"payload is {type(v).__name__}, not an object"
+    elif set(v.keys()) != {want_key}:
+        why = f"keys={sorted(v.keys())} (schema allows exactly [{want_key!r}])"
+    elif v[want_key] not in ("celsius", "fahrenheit"):
+        why = f"{want_key}={v[want_key]!r} not in enum"
     else:
-        ok_r3, why_r3 = True, f"payload={v}"
+        ok, why = True, f"payload={v}"
 except Exception as e:
-    why_r3 = f"not JSON: {e}; payload[:120]={stripped[:120]!r}"
-results["R3_schema_valid"] = (ok_r3, why_r3)
+    why = f"not JSON: {e}; payload[:120]={stripped[:120]!r}"
+results.append(("R3_schema_valid", "PASS" if ok else "FAIL", why))
 
-# ── R4 — degeneracy over emitted token ids ───────────────────────────────────
-# Degenerate := the TAIL of the id sequence is periodic with period p <= 4 for
-# >= 16 tokens. A constant stream is the p == 1 case.
-ids = []
+# ── Log slice for THIS request ───────────────────────────────────────────────
+# The route's `request_id` span is carried across `spawn_blocking`, so every
+# decode-thread record for this probe carries the id we sent. A raw substring
+# match keeps the filter independent of the JSON layout.
+lines, records_seen = [], 0
 for lf in sorted(glob.glob(os.path.join(d, "logs", "*.jsonl"))):
     with open(lf) as f:
         for line in f:
-            if "step_fn sending token" not in line:
-                continue
-            try:
-                rec = json.loads(line)
-            except Exception:
-                continue
-            fields = rec.get("fields", rec)
-            tid = fields.get("token_id")
-            if tid is not None:
-                ids.append(int(tid))
+            if rid in line:
+                lines.append(line)
+
+# R4 — degeneracy over emitted token ids
+ids, step_records = [], 0
+unparsable = 0
+for line in lines:
+    if "step_fn sending token" not in line:
+        continue
+    step_records += 1
+    try:
+        rec = json.loads(line)
+    except Exception:
+        unparsable += 1
+        continue
+    tid = (rec.get("fields") or rec).get("token_id")
+    if tid is None:
+        unparsable += 1
+    else:
+        ids.append(int(tid))
 
 def degenerate_tail(seq, max_period=4, min_len=16):
     if len(seq) < min_len:
         return None
     for p in range(1, max_period + 1):
-        n = 0
-        i = len(seq) - 1
+        n, i = 0, len(seq) - 1
         while i - p >= 0 and seq[i] == seq[i - p]:
             n += 1
             i -= 1
@@ -257,47 +311,48 @@ def degenerate_tail(seq, max_period=4, min_len=16):
             return (p, n + p)
     return None
 
-if not ids:
-    results["R4_not_degenerate"] = (
-        False,
-        "no token_id records in the run log — rerun the server with `--log verbose`",
-    )
+if step_records == 0:
+    results.append(("R4_not_degenerate", "FAIL",
+                    "HARNESS ERROR: no `step_fn sending token` records for this "
+                    "request id — rerun the server with `--log verbose`"))
+elif not ids:
+    results.append(("R4_not_degenerate", "FAIL",
+                    f"HARNESS ERROR: {step_records} step_fn records found but "
+                    f"none carried a parsable token_id ({unparsable} unparsable) "
+                    "— the log's JSON shape does not match this extractor"))
 else:
     deg = degenerate_tail(ids)
     if deg:
         p, ln = deg
-        results["R4_not_degenerate"] = (
-            False, f"tail is {p}-periodic for {ln} tokens; last12={ids[-12:]}")
+        results.append(("R4_not_degenerate", "FAIL",
+                        f"tail is {p}-periodic for {ln} tokens; last12={ids[-12:]}"))
+    elif len(ids) < 16:
+        results.append(("R4_not_degenerate", "N/A",
+                        f"only {len(ids)} tokens — too short for the rule to "
+                        f"fire; ids={ids}"))
     else:
-        results["R4_not_degenerate"] = (True, f"{len(ids)} tokens, last12={ids[-12:]}")
+        results.append(("R4_not_degenerate", "PASS",
+                        f"{len(ids)} tokens, last12={ids[-12:]}"))
 
-# ── R5 — the constraint was built AND engaged, with no non-enforcement warn ──
-log_text = ""
-for lf in sorted(glob.glob(os.path.join(d, "logs", "*.jsonl"))):
-    log_text += read(lf)
-built    = "building SchemaConstraint" in log_text
-engaged  = re.search(r"SchemaConstraint:[^\"]*engaging", log_text) is not None
-warned   = "constraint never engaged" in log_text
-results["R5_engaged"] = (
-    built and engaged and not warned,
-    f"built={built} engaging_line={engaged} never_engaged_warn={warned}",
-)
+# R5 — constraint built AND engaged, no non-enforcement warn
+blob = "".join(lines)
+built = "building SchemaConstraint" in blob
+engaged = re.search(r"SchemaConstraint:[^\"]*engaging", blob) is not None
+warned = "constraint never engaged" in blob
+results.append(("R5_engaged", "PASS" if (built and engaged and not warned) else "FAIL",
+                f"built={built} engaging_line={engaged} never_engaged_warn={warned}"))
 
-lines = []
-allpass = True
-for k in ("R1_http_200", "R2_finish_stop", "R3_schema_valid", "R4_not_degenerate", "R5_engaged"):
-    ok, why = results[k]
-    allpass &= ok
-    lines.append(f"{'PASS' if ok else 'FAIL'}  {k:<20} {why}")
-out = "\n".join(lines)
+out = "\n".join(f"{st:<4}  {name:<20} {why}" for name, st, why in results)
 print(out)
-with open(os.path.join(d, "verdict.txt"), "w") as f:
+with open(os.path.join(d, f"{probe}.verdict.txt"), "w") as f:
     f.write(out + "\n")
-sys.exit(0 if allpass else 1)
+sys.exit(0 if all(st != "FAIL" for _, st, _ in results) else 1)
 PY
 }
 
-# ── Per-model run ─────────────────────────────────────────────────────────────
+# ── Per-model run: one server, both probes ───────────────────────────────────
+
+declare -a CELL_NAMES=() CELL_RESULTS=()
 
 run_model() {
     local label="$1" model_path="$2"
@@ -305,6 +360,10 @@ run_model() {
 
     if [[ -z "${model_path}" || ! -d "${model_path}" ]]; then
         echo "SKIP ${label}: snapshot not found (${model_path:-unset}); set RMLX_O_MODELS_ROOT" >&2
+        for probe in A B; do
+            CELL_NAMES+=("${label}/${probe}")
+            CELL_RESULTS+=("skipped")
+        done
         return 2
     fi
 
@@ -329,6 +388,10 @@ run_model() {
 
     if ! wait_for_server "${pid}"; then
         tail -40 "${art}/serve.log" >&2
+        for probe in A B; do
+            CELL_NAMES+=("${label}/${probe}")
+            CELL_RESULTS+=("probe-fail")
+        done
         return 1
     fi
 
@@ -340,29 +403,47 @@ run_model() {
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])' 2>/dev/null)"
     if [[ -z "${model_id}" ]]; then
         echo "ERROR: could not read a model id from /v1/models" >&2
+        for probe in A B; do
+            CELL_NAMES+=("${label}/${probe}")
+            CELL_RESULTS+=("probe-fail")
+        done
         return 1
     fi
     echo "==> ${label}: registry model id = ${model_id}" >&2
-    local body="${PROBE_BODY_TMPL/MODEL_ID/${model_id}}"
-    printf '%s\n' "${body}" > "${art}/request.json"
 
-    echo "==> ${label}: POST /v1/chat/completions" >&2
-    curl -s -o "${art}/response.json" -w '%{http_code}' \
-        --max-time 600 \
-        -H 'Content-Type: application/json' \
-        -X POST "http://127.0.0.1:${PORT}/v1/chat/completions" \
-        -d "${body}" > "${art}/status.txt" || true
+    for probe in A B; do
+        local rid="canary-${label}-${probe}-$$"
+        local body
+        body="$(probe_body "${probe}" "${model_id}")"
+        printf '%s\n' "${body}" > "${art}/${probe}.request.json"
+
+        echo "==> ${label}/${probe}: POST /v1/chat/completions (key=$(probe_key "${probe}"))" >&2
+        curl -s -o "${art}/${probe}.response.json" -w '%{http_code}' \
+            --max-time 600 \
+            -H 'Content-Type: application/json' \
+            -H "X-Request-Id: ${rid}" \
+            -X POST "http://127.0.0.1:${PORT}/v1/chat/completions" \
+            -d "${body}" > "${art}/${probe}.status.txt" || true
+
+        # Let the appender flush this request's records before reading them.
+        sleep 1
+        echo "--- ${label}/${probe} ---"
+        if evaluate "${art}" "${probe}" "$(probe_key "${probe}")" "${rid}"; then
+            CELL_NAMES+=("${label}/${probe}")
+            CELL_RESULTS+=("probe-pass")
+        else
+            CELL_NAMES+=("${label}/${probe}")
+            CELL_RESULTS+=("probe-fail")
+        fi
+    done
 
     kill "${pid}" 2>/dev/null || true
     wait "${pid}" 2>/dev/null || true
     sleep 2
-
-    echo "--- ${label} ---"
-    evaluate "${art}"
-    return $?
+    return 0
 }
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 if [[ ! -x "${BINARY}" ]]; then
     echo "ERROR: ${BINARY} not found — run: make build-perf" >&2
@@ -370,38 +451,47 @@ if [[ ! -x "${BINARY}" ]]; then
 fi
 
 mkdir -p "${ROOT_DIR}"
-declare -a NAMES=() VERDICTS=()
 overall=0
 
 for spec in "bonsai:${BONSAI_MODEL}" "gemma4-e2b:${GEMMA_E2B_MODEL}"; do
     label="${spec%%:*}"
     path="${spec#*:}"
     [[ "${ONLY_MODEL}" == "all" || "${ONLY_MODEL}" == "${label}" ]] || continue
-
     run_model "${label}" "${path}"
-    rc=$?
-    NAMES+=("${label}")
-    case "${rc}" in
-        0) VERDICTS+=("probe-pass") ;;
-        1) VERDICTS+=("probe-fail") ;;
-        *) VERDICTS+=("skipped");   overall=2 ;;
-    esac
 done
 
 echo
 echo "════════ verdict (--expect ${EXPECT}) ════════"
-for i in "${!NAMES[@]}"; do
-    n="${NAMES[$i]}"; v="${VERDICTS[$i]}"
-    case "${EXPECT}:${v}" in
-        fixed:probe-pass)    echo "  ${n}: PASS  (constraint enforced, stream not degenerate)" ;;
-        fixed:probe-fail)    echo "  ${n}: FAIL  (see ${ROOT_DIR}/${n}/verdict.txt)"; overall=1 ;;
-        baseline:probe-fail) echo "  ${n}: PASS  (defect reproduced, as the baseline must)" ;;
-        baseline:probe-pass) echo "  ${n}: FAIL  (baseline did NOT reproduce the defect — this harness cannot see it)"; overall=1 ;;
-        *:skipped)           echo "  ${n}: SKIPPED (snapshot absent)" ;;
+for i in "${!CELL_NAMES[@]}"; do
+    cell="${CELL_NAMES[$i]}"
+    result="${CELL_RESULTS[$i]}"
+    model="${cell%%/*}"
+    probe="${cell##*/}"
+
+    if [[ "${result}" == "skipped" ]]; then
+        echo "  ${cell}: SKIPPED (snapshot absent)"
+        overall=2
+        continue
+    fi
+
+    want="fail"
+    if [[ "${EXPECT}" == "fixed" ]] || baseline_expects_pass "${model}" "${probe}"; then
+        want="pass"
+    fi
+
+    case "${want}:${result}" in
+        pass:probe-pass) echo "  ${cell}: PASS  (expected pass, got pass)" ;;
+        fail:probe-fail) echo "  ${cell}: PASS  (expected defect, reproduced)" ;;
+        pass:probe-fail)
+            echo "  ${cell}: FAIL  (expected pass, got fail — see ${ROOT_DIR}/${model}/${probe}.verdict.txt)"
+            overall=1 ;;
+        fail:probe-pass)
+            echo "  ${cell}: FAIL  (expected the defect to reproduce, it did not — the table in this script is now wrong, or the harness cannot see it)"
+            overall=1 ;;
     esac
 done
 
-if (( ${#NAMES[@]} == 0 )); then
+if (( ${#CELL_NAMES[@]} == 0 )); then
     echo "  no models ran"
     overall=2
 fi

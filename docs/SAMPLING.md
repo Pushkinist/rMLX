@@ -934,9 +934,29 @@ whitespace before the *root* value, where it can only be a no-op; the
 schema-less `json_object` engine still accepts it there, bounded by the same cap.
 
 `make schema-constraint-canary` (`scripts/schema_constraint_canary.sh`) is the
-real-model proof for both properties, on Bonsai and gemma-4-e2b. Its PASS/FAIL
-rule is fixed at the top of the script, and `EXPECT=baseline` inverts the exit
-code so a harness too weak to see the defect fails as loudly as a broken fix.
+real-model proof, on Bonsai and gemma-4-e2b, with two probes each. Its PASS/FAIL
+rule is fixed at the top of the script, and `EXPECT=baseline` asserts a per-cell
+expectation table so a harness too weak to see a defect fails as loudly as a
+broken fix.
+
+**What reproduced and what did not.** The whitespace bound is justified by unit
+tests plus one real-model reproduction, not by the originally reported one.
+
+- On a schema whose property name contains a **space**, the defect is forced by
+  the mask and reproduces on both models: the key trie parks on the space it is
+  expecting, every token carrying the rest of the name is rejected at its second
+  byte, and a whitespace-only token is accepted as a no-op — so whitespace is
+  the only legal continuation while EOS stays withheld. That is a property of
+  the grammar, independent of the model's preferences.
+- On a **single-word** property name, gemma-4-e2b does **not** loop. Measured at
+  the pre-fix commit, its answer is byte-identical to the fixed build. With no
+  space in the key the grammar never corners the decoder, so whether it sits in
+  the whitespace no-op comes down to which token the model happens to prefer at
+  a structural position — and this one prefers the content token. The
+  originally-reported `107,138,107,138…` stream is a real hazard of the
+  unbounded rule but is not reproducible on demand at that shape, so the
+  single-word cell is recorded in the table as *expected to pass on the
+  baseline*: it is a no-regression check, not a reproduction.
 
 ### Non-enforcement is reported
 

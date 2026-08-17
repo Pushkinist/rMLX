@@ -672,13 +672,17 @@ ssd-canary: build-perf  ## run SSD canary (POPULATE/REVISIT/EVICT) against VERIF
 #                     gemma-4-e2b (Gemma4ForConditionalGeneration), that a strict
 #                     `json_schema` request cannot return HTTP 200 on a degenerate
 #                     whitespace run and cannot be answered by a constraint that
-#                     never engaged. Decision rule R1..R5 is stated at the top of
+#                     never engaged. Two probes per model (plain key / spaced
+#                     key); decision rule R1..R5 and the per-cell baseline
+#                     expectation table are stated at the top of
 #                     scripts/schema_constraint_canary.sh; artifacts land under
 #                     .rmlx/proofs/schema-constraint/. Hermetic RMLX_HOME and
 #                     `--metrics off` — never touches the real metrics DB.
 #
-# `EXPECT=baseline` inverts the exit code: the run then REQUIRES the documented
-#                     defect, so a harness too weak to see it also fails.
+# `EXPECT=baseline` asserts that table instead: each cell must reproduce the
+#                     defect, or pass where the table records that it does not.
+#                     A harness too weak to see a defect fails; so does a table
+#                     that has gone stale.
 #
 # Required env: RMLX_O_MODELS_ROOT (resolve via LOCAL.md), or explicit
 #               BONSAI_MODEL / GEMMA_E2B_MODEL. Needs an idle GPU.
