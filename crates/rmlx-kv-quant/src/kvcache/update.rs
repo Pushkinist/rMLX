@@ -15,7 +15,7 @@ use rmlx_mlx::{zeros, Array, Device, Dtype};
 use crate::storage::{
     iso_n_groups_for, IsoBlocks, KvStorage, QuantIsoK3, QuantIsoK4, QuantIsoV3, QuantIsoV4, QuantK,
     QuantKTurbo3, QuantKTurbo4, QuantPlanarK, QuantPlanarV, QuantRotorV3, QuantRotorV4, QuantV,
-    RotorBlocks, RotorKBlocks, ISO4_GROUP_SIZE, ISO_K3_BITS, ISO_K4_BITS,
+    RotorBlocks, RotorKBlocks, ISO_K3_BITS, ISO_K4_BITS,
 };
 use crate::turbo_flash_msl::{turbo_flash_sdpa, turbo_flash_should_run};
 use crate::KvQuant;
@@ -64,86 +64,6 @@ fn cast_store_bf16(arr: &Array, device: Device) -> Result<Option<Array>> {
     }
 }
 
-/// Encode a KV chunk (`new_kv`, shape `[B, kv_h, S, D]`) via the iso4
-/// MSL kernel and return the resulting CPU [`IsoBlocks`].
-///
-/// Mirrors the CPU codec ([`crate::isoquant::iso_encode_fast`] with
-/// `bits = 4`): the returned block's `n_tokens` equals `B * kv_h * S`, codes
-/// are bit-packed identically (8 vals/u32, dense), and the per-token L2 norm
-/// is preserved (deduplicated from the per-group GPU norm slot).
-///
-/// The kernel is axis-agnostic, so the same helper drives both the V-side
-/// ([`QuantIsoV4`]) and K-side ([`QuantIsoK4`]) appenders.
-///
-/// # Errors
-///
-/// Forwards Metal kernel / shape errors as `Error::Mlx` / `Error::Quant`.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "shape rank guarded to 4 immediately above each indexing site; new_shape[0..=3] are always in-bounds"
-)]
-fn iso4_gpu_encode_block(new_kv: &Array, new_shape: &[i32]) -> Result<IsoBlocks> {
-    if new_shape.len() != 4 {
-        return Err(Error::Mlx(format!(
-            "iso4_gpu_encode_block: expected 4D new_shape, got {new_shape:?}"
-        )));
-    }
-    let b = new_shape[0] as usize;
-    let kv_h = new_shape[1] as usize;
-    let s = new_shape[2] as usize;
-    let head_dim = new_shape[3] as usize;
-    let n_tokens_total = b * kv_h * s;
-    if !head_dim.is_multiple_of(ISO4_GROUP_SIZE) {
-        return Err(Error::Quant(format!(
-            "iso4_gpu_encode_block: head_dim={head_dim} must be a positive multiple of \
-             ISO4_GROUP_SIZE={ISO4_GROUP_SIZE}"
-        )));
-    }
-    let n_groups = head_dim / ISO4_GROUP_SIZE;
-
-    tracing::debug!(
-        target: "rmlx::kv_quant::iso4",
-        n_tokens = n_tokens_total,
-        n_groups,
-        head_dim,
-        "iso4 GPU encode block"
-    );
-
-    let (codes_arr, scales_arr, quats_arr, norms_arr) =
-        crate::isoquant_msl_v4::iso_quantize_v4_gpu(new_kv, head_dim, Device::Gpu)?;
-    let (codes, scales, quaternions, norms) = crate::isoquant_msl_v4::iso4_gpu_outputs_to_cpu(
-        &codes_arr,
-        &scales_arr,
-        &quats_arr,
-        &norms_arr,
-        n_tokens_total,
-        n_groups,
-    )?;
-
-    Ok(IsoBlocks {
-        codes,
-        scales,
-        quaternions,
-        norms,
-        n_tokens: n_tokens_total,
-    })
-}
-
-/// Push a pre-built [`IsoBlocks`] onto a [`QuantIsoV4`] buffer and update
-/// `vs.shape` the same way [`QuantIsoV4::append`] does.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "vs.shape rank-4 guard above each indexing site; new_shape rank validated by upstream encoder helper"
-)]
-fn push_iso4_v_block(vs: &mut QuantIsoV4, block: IsoBlocks, new_shape: &[i32]) {
-    vs.blocks.push(block);
-    if vs.shape.len() != 4 || vs.shape[0] == 0 {
-        vs.shape = new_shape.to_vec();
-    } else {
-        vs.shape[2] += new_shape[2];
-    }
-}
-
 /// Push a pre-built [`IsoBlocks`] onto a [`QuantIsoK4`] buffer and update
 /// `ks.shape` the same way [`QuantIsoK4::append`] does.
 #[allow(
@@ -157,19 +77,6 @@ fn push_iso4_k_block(ks: &mut QuantIsoK4, block: IsoBlocks, new_shape: &[i32]) {
     } else {
         ks.shape[2] += new_shape[2];
     }
-}
-
-/// Convenience wrapper — encode `new_v` via GPU iso4 kernel and append
-/// the resulting block to `vs`. Shared by [`KvCache::update_iso4`] and
-/// [`KvCache::update_iso4_sym`].
-fn iso4_gpu_append_into_blocks(
-    vs: &mut QuantIsoV4,
-    new_v: &Array,
-    new_shape: &[i32],
-) -> Result<()> {
-    let block = iso4_gpu_encode_block(new_v, new_shape)?;
-    push_iso4_v_block(vs, block, new_shape);
-    Ok(())
 }
 
 /// Mirror of [`iso3_gpu_append_into_k_blocks`] for the iso4 codec — see it for
@@ -6916,7 +6823,7 @@ impl KvCache {
         }
         let vs = v.as_mut().unwrap();
         if device == Device::Gpu {
-            iso4_gpu_append_into_blocks(vs, new_v, &new_shape)?;
+            iso4_gpu_append_into_v_blocks(vs, new_v, &new_shape, device, RingFeed::Skip, max_seq)?;
         } else {
             vs.append(&v_f32, &new_shape)?;
         }
@@ -7123,7 +7030,7 @@ impl KvCache {
             return Err(Error::Mlx("IsoSym4 V buffer absent after init".into()));
         };
         if device == Device::Gpu {
-            iso4_gpu_append_into_blocks(vs, new_v, &new_shape)?;
+            iso4_gpu_append_into_v_blocks(vs, new_v, &new_shape, device, RingFeed::Skip, max_seq)?;
         } else {
             vs.append(&v_f32, &new_shape)?;
         }

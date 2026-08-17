@@ -502,6 +502,33 @@ impl QuantIsoV3 {
         )
     }
 
+    /// Rebuild any ring-only prefix into the CPU blocks and drop the ring, so
+    /// `blocks` alone cover `shape[2]` again.
+    ///
+    /// No-op when the ring was never allocated. Called by every path that
+    /// pushes a CPU block onto a store whose ring may be live: without it the
+    /// pushed block is the *only* block, `blocks` no longer cover `shape[2]`,
+    /// and the ring left behind is stale — the next ring append would write past
+    /// its filled region and `dequant` would read a zeroed gap where the new
+    /// chunk should be. Mirrors what the CPU [`Self::append`] does by clearing.
+    ///
+    /// # Errors
+    ///
+    /// Forwards a [`synced_iso_v_blocks`] reconciliation error — a ring that
+    /// cannot supply the missing prefix is reported, never zero-padded.
+    pub(crate) fn absorb_ring_into_blocks(&mut self, device: Device) -> Result<()> {
+        if !self.gpu.is_allocated() {
+            return Ok(());
+        }
+        if let std::borrow::Cow::Owned(full) =
+            synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, device)?
+        {
+            self.blocks = full;
+        }
+        self.gpu.clear();
+        Ok(())
+    }
+
     /// GPU packed view of the first `kv_seq` positions, or `None` when the ring
     /// is not live (CPU path — caller falls back to `dequant`).
     ///
@@ -688,6 +715,19 @@ impl QuantIsoV3 {
             .ok_or_else(|| {
                 Error::Quant("QuantIsoV3::append_gpu: n_tokens_total overflow".to_owned())
             })?;
+
+        // ── 0. Take the ring's prefix back, then drop the ring. ────────────
+        // This append pushes a CPU block, which makes `blocks` the authoritative
+        // copy of everything accumulated so far. A live ring holds a prefix
+        // `blocks` may no longer carry — the fused decode path drops the blocks
+        // once the ring is live — so the prefix has to come back before the push
+        // or `dequant` / `dequant_gpu` see a store whose blocks cover only this
+        // chunk. Dropping the ring afterwards is the same contract the CPU
+        // `append` states: a ring left behind while `blocks` grow is the
+        // dangerous state, because the next ring append would write past its
+        // filled region and `dequant` would read a zeroed gap. The next
+        // `gpu_append` re-seeds it from `blocks`.
+        self.absorb_ring_into_blocks(device)?;
 
         // ── 1. Dispatch the MSL encode kernel. ─────────────────────────────
         // The codec is per-token-row positional; the GPU mirror accumulates
@@ -1112,6 +1152,15 @@ impl QuantIsoV3 {
             return out.transpose(&[0, 2, 1, 3], device)?.contiguous(device);
         }
 
+        // Reconcile the CPU blocks with the GPU ring first, exactly as
+        // `dequant` does. Both element counts below — the one derived from the
+        // blocks and the one declared by `shape` — must come from the same
+        // source, or a store whose decode tail lives only in the ring is
+        // reported as a shape disagreement instead of being read. `blocks` that
+        // already cover `shape[2]` are borrowed, so the common path pays
+        // nothing.
+        let blocks = synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, device)?;
+
         // Concatenate all block buffers. CPU codes/scales/quats are already in
         // GPU-kernel layout; per-token norms must be expanded to per-group.
         let mut codes_bytes: Vec<u8> = Vec::new();
@@ -1120,7 +1169,7 @@ impl QuantIsoV3 {
         let mut norms_bytes: Vec<u8> = Vec::new();
         let mut total_groups: usize = 0;
 
-        for blk in &self.blocks {
+        for blk in blocks.iter() {
             for &c in &blk.codes {
                 codes_bytes.extend_from_slice(&c.to_le_bytes());
             }

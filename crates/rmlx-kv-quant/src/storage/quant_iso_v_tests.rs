@@ -1,7 +1,7 @@
 //! Unit tests for [`QuantIsoV3`] (includes GPU-mirror path).
 
 use crate::isoquant::{iso_decode_fast, iso_encode_fast};
-use crate::storage::quant_iso_v::{QuantIsoV3, ISO3_BITS, ISO3_GROUP_SIZE};
+use crate::storage::quant_iso_v::{IsoBlocks, QuantIsoV3, ISO3_BITS, ISO3_GROUP_SIZE};
 use crate::test_utils::{cosine_similarity_per_row, lcg_data, skip_if_no_gpu_env, TEST_SEED};
 use rmlx_mlx::{Array, Device, Dtype};
 
@@ -891,4 +891,220 @@ fn quant_iso_v3_two_block_decode_matches_one_block_at_b_gt_1() {
             "two-block decode must equal the one-block oracle at b={b}"
         );
     }
+}
+
+// ── Block append over a live GPU ring ─────────────────────────────────────────
+
+/// Build the ring's `(codes, scales, norms)` inputs from one CPU-encoded block.
+///
+/// The ring carries per-token norms in exactly the form `iso_encode_fast`
+/// emits, and drops the per-group quaternion table (every group holds the same
+/// `FIXED_QUAT` constant), so this is a straight re-upload.
+fn ring_inputs(blk: &IsoBlocks) -> (Array, Array, Array) {
+    let codes_b: Vec<u8> = blk.codes.iter().flat_map(|c| c.to_le_bytes()).collect();
+    let scales_b: Vec<u8> = blk.scales.iter().flat_map(|s| s.to_le_bytes()).collect();
+    let norms_b: Vec<u8> = blk.norms.iter().flat_map(|n| n.to_le_bytes()).collect();
+    (
+        Array::from_bytes(&codes_b, &[blk.codes.len() as i32], Dtype::U32).expect("codes"),
+        Array::from_bytes(&scales_b, &[blk.scales.len() as i32], Dtype::F32).expect("scales"),
+        Array::from_bytes(&norms_b, &[blk.norms.len() as i32], Dtype::F32).expect("norms"),
+    )
+}
+
+/// A CPU-block append onto a store whose GPU ring is live must take the ring's
+/// prefix back and then drop the ring.
+///
+/// This reproduces the state the fused iso-symmetric decode path leaves behind:
+/// the ring holds every token and the CPU blocks were dropped, because the ring
+/// is the sole resident copy there. The legacy (non-fused) decode fallback then
+/// appends through `QuantIsoV3::append_gpu`, which pushes a CPU block. Without
+/// the reconcile that block is the *only* block — `blocks` cover one chunk while
+/// `shape[2]` counts the whole prefix — and the store is unreadable in both
+/// directions: `dequant_gpu` reports the blocks-derived element count against
+/// the shape-declared one, and `dequant` reads the missing tail out of a ring
+/// that was never told about the new chunk.
+///
+/// Runs entirely on `Device::Cpu` — the ring is device-parameterised, so the
+/// state machine reproduces without Metal.
+///
+/// Mutation check: drop the `absorb_ring_into_blocks` call from
+/// `QuantIsoV3::append_gpu`. The `absorb = false` arm below models exactly that,
+/// and it is what asserts the unfixed store is unreadable; if the fix is
+/// reverted, the `absorb = true` arm goes red for the same reason.
+#[test]
+fn iso_v3_block_append_over_a_live_ring_takes_the_prefix_back() {
+    let (b, kv_h, head_dim) = (1_usize, 2_usize, 8_usize);
+    let prefill = 4_usize;
+    let max_seq = 64_i32;
+    let shape = |n: usize| [b as i32, kv_h as i32, n as i32, head_dim as i32];
+    let init = || vec![b as i32, kv_h as i32, 0, head_dim as i32];
+    let chunk = |s0: usize, n: usize| crate::test_utils::batch_head_chunk(b, kv_h, s0, n, head_dim);
+
+    // One CPU-encoded block for a chunk, via the store's own `append`.
+    let make_block = |data: &[f32], n: usize| -> IsoBlocks {
+        let mut scratch = QuantIsoV3::new(init());
+        scratch.append(data, &shape(n)).expect("scratch append");
+        scratch.blocks.remove(0)
+    };
+
+    // Oracle: every chunk appended on the CPU path, where the ring is cleared
+    // at each append and the blocks are always the whole story.
+    let mut oracle_store = QuantIsoV3::new(init());
+    oracle_store
+        .append(&chunk(0, prefill), &shape(prefill))
+        .expect("oracle prefill");
+    oracle_store
+        .append(&chunk(prefill, 1), &shape(1))
+        .expect("oracle fused step");
+    oracle_store
+        .append(&chunk(prefill + 1, 1), &shape(1))
+        .expect("oracle fallback step");
+    let oracle = oracle_store.dequant().expect("oracle dequant");
+
+    for absorb in [false, true] {
+        let mut vs = QuantIsoV3::new(init());
+        vs.append(&chunk(0, prefill), &shape(prefill))
+            .expect("prefill append");
+
+        // Fused decode step: ring-only append, then the blocks are dropped.
+        let step = make_block(&chunk(prefill, 1), 1);
+        let (codes, scales, norms) = ring_inputs(&step);
+        vs.gpu_append(
+            &codes,
+            &scales,
+            &norms,
+            kv_h as i32,
+            head_dim as i32,
+            prefill as i32,
+            1,
+            max_seq,
+            Device::Cpu,
+        )
+        .expect("ring append");
+        vs.shape[2] = prefill as i32 + 1;
+        vs.blocks.clear();
+        assert!(vs.gpu.is_allocated(), "the ring is the sole copy here");
+
+        // Legacy fallback step: `append_gpu`'s reconcile, then its block push.
+        if absorb {
+            vs.absorb_ring_into_blocks(Device::Cpu)
+                .expect("absorb the ring prefix");
+            assert!(
+                !vs.gpu.is_allocated(),
+                "a store whose blocks are authoritative must not keep a ring"
+            );
+        }
+        vs.blocks.push(make_block(&chunk(prefill + 1, 1), 1));
+        vs.shape[2] += 1;
+
+        let got = vs.dequant();
+        if absorb {
+            assert_eq!(
+                got.expect("dequant after the reconcile"),
+                oracle,
+                "the reconciled store must decode exactly like the all-CPU oracle"
+            );
+        } else {
+            let unfixed = got.expect("stale-ring dequant returns a plausible tensor");
+            assert_ne!(
+                unfixed, oracle,
+                "premise: without the reconcile the store decodes the stale ring instead \
+                 of the appended chunk. Equality here means this test no longer proves \
+                 the reconcile is load-bearing"
+            );
+        }
+    }
+}
+
+/// The same reconcile, driven through the real `append_gpu` on Metal, plus the
+/// `dequant_gpu` half: after a block append over a live ring, **both** readers
+/// must return the all-CPU oracle.
+///
+/// `dequant_gpu` derives its element accounting from the same reconciled block
+/// list `dequant` uses. Before that it counted `self.blocks` directly, so a
+/// store carrying a ring-only tail was rejected with a blocks-vs-shape
+/// disagreement (`actual_total != declared_total`) even though the data was all
+/// there — which is how `iso3_sym` failed to serve a model whose decode took the
+/// non-fused fallback after the fused path had gone live.
+///
+/// Mutation check: drop `absorb_ring_into_blocks` from `append_gpu` and the
+/// `dequant` assertion goes red; revert `dequant_gpu` to iterate `self.blocks`
+/// and the `dequant_gpu` assertion goes red.
+#[test]
+#[ignore = "GPU Metal context — run via `make gpu-test CRATE=rmlx-kv-quant FILTER=iso_v3_append_gpu_over_a_live_ring`"]
+fn iso_v3_append_gpu_over_a_live_ring_is_readable_both_ways() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    let (b, kv_h, head_dim) = (1_usize, 2_usize, 8_usize);
+    let prefill = 4_usize;
+    let max_seq = 64_i32;
+    let shape = |n: usize| [b as i32, kv_h as i32, n as i32, head_dim as i32];
+    let init = || vec![b as i32, kv_h as i32, 0, head_dim as i32];
+    let chunk = |s0: usize, n: usize| crate::test_utils::batch_head_chunk(b, kv_h, s0, n, head_dim);
+
+    let mut oracle_store = QuantIsoV3::new(init());
+    oracle_store
+        .append(&chunk(0, prefill), &shape(prefill))
+        .expect("oracle prefill");
+    oracle_store
+        .append(&chunk(prefill, 1), &shape(1))
+        .expect("oracle fused step");
+    oracle_store
+        .append(&chunk(prefill + 1, 1), &shape(1))
+        .expect("oracle fallback step");
+    let oracle = oracle_store.dequant().expect("oracle dequant");
+
+    let mut vs = QuantIsoV3::new(init());
+    vs.append(&chunk(0, prefill), &shape(prefill))
+        .expect("prefill append");
+
+    // Fused decode step: ring-only append, CPU blocks dropped.
+    let mut scratch = QuantIsoV3::new(init());
+    scratch
+        .append(&chunk(prefill, 1), &shape(1))
+        .expect("scratch append");
+    let step = scratch.blocks.remove(0);
+    let (codes, scales, norms) = ring_inputs(&step);
+    vs.gpu_append(
+        &codes,
+        &scales,
+        &norms,
+        kv_h as i32,
+        head_dim as i32,
+        prefill as i32,
+        1,
+        max_seq,
+        Device::Gpu,
+    )
+    .expect("ring append");
+    vs.shape[2] = prefill as i32 + 1;
+    vs.blocks.clear();
+
+    // Legacy fallback step: the real GPU-encode block append.
+    let tail = chunk(prefill + 1, 1);
+    let tail_bytes: Vec<u8> = tail.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let tail_arr = Array::from_bytes(&tail_bytes, &shape(1), Dtype::F32).expect("tail array");
+    vs.append_gpu(&tail_arr, &shape(1), max_seq, Device::Gpu)
+        .expect("append_gpu over a live ring");
+
+    let cpu = vs.dequant().expect("dequant after append_gpu");
+    let max_abs = cpu
+        .iter()
+        .zip(oracle.iter())
+        .fold(0.0_f32, |m, (a, c)| m.max((a - c).abs()));
+    assert!(
+        max_abs < 1e-5,
+        "dequant after a block append over a live ring: max abs error {max_abs} vs the \
+         all-CPU oracle — the ring prefix was not taken back"
+    );
+
+    let gpu_arr = vs
+        .dequant_gpu(Device::Gpu)
+        .expect("dequant_gpu must read the reconciled store, not reject it");
+    assert_eq!(
+        gpu_arr.shape(),
+        shape(prefill + 2).to_vec(),
+        "dequant_gpu returns the declared [B, kv_h, S, D]"
+    );
 }

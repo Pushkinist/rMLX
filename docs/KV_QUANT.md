@@ -3060,6 +3060,23 @@ cache — falls through to the legacy `update_*` entries, which pass
 site dequantizes the whole prefix on the same step, so `dequant` would take the
 identical readback if `blocks` were left short.
 
+**Every block push reconciles, and every reader derives its count from the same
+place.** Two holes in that used to be reachable and are now closed. The iso-V
+GPU-encode append (`QuantIsoV3::append_gpu`, the V side of the legacy
+`update_iso3` / `update_iso3_sym` entries) pushed a CPU block without touching a
+live ring, leaving the ring stale *and* the blocks short — it now calls
+`QuantIsoV3::absorb_ring_into_blocks`, which takes the ring's prefix back and
+then drops the ring, matching what the CPU `append` does by clearing. The iso4 V
+side had the same hole in a separate ring-unaware helper; both of its callers now
+go through the ring-aware `iso4_gpu_append_into_v_blocks` with a `Skip` feed, and
+the helper is gone (it also stored its block head-major, unlike every other iso
+append). On the read side `QuantIsoK3::dequant_gpu` and
+`QuantIsoV3::dequant_gpu` counted `self.blocks` directly while their CPU siblings
+counted the ring-reconciled list, so a legitimate ring-only tail was rejected as
+a blocks-vs-shape disagreement (`dequant_gpu: actual_total=... !=
+declared_total=...`); both now start from `synced_iso_v_blocks`, which borrows
+(costs nothing) whenever the blocks already cover `shape[2]`.
+
 **Row vs. sequence units.** Every rotor/iso K and V store's per-append
 `RotorBlocks` / `IsoBlocks` carries `n_tokens` counting **rows**
 (`b * kv_h * seq_of_block`), not sequence positions, but `truncate_to(n)`

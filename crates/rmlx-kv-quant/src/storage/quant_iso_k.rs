@@ -487,13 +487,18 @@ impl QuantIsoK3 {
         }
         let n_groups = head_dim / ISO_K3_GROUP_SIZE;
 
+        // Reconcile the CPU blocks with the GPU ring first — see
+        // [`super::QuantIsoV3::dequant_gpu`] for why both element counts must
+        // come from the same source.
+        let blocks = synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, device)?;
+
         let mut codes_bytes: Vec<u8> = Vec::new();
         let mut scales_bytes: Vec<u8> = Vec::new();
         let mut quats_bytes: Vec<u8> = Vec::new();
         let mut norms_bytes: Vec<u8> = Vec::new();
         let mut total_groups: usize = 0;
 
-        for blk in &self.blocks {
+        for blk in blocks.iter() {
             for &c in &blk.codes {
                 codes_bytes.extend_from_slice(&c.to_le_bytes());
             }

@@ -8,7 +8,7 @@
 use crate::isoquant::{iso_decode_fast, iso_encode_fast};
 use crate::storage::quant_iso_k::{QuantIsoK3, ISO_K3_BITS, ISO_K3_GROUP_SIZE};
 use crate::test_utils::{cosine_similarity_per_row, lcg_data, skip_if_no_gpu_env, TEST_SEED};
-use rmlx_mlx::Device;
+use rmlx_mlx::{Array, Device, Dtype};
 
 #[test]
 fn quant_iso_k3_new_shapes_correct() {
@@ -376,4 +376,85 @@ fn quant_iso_k3_two_block_decode_matches_one_block_at_b_gt_1() {
             "two-block decode must equal the one-block oracle at b={b}"
         );
     }
+}
+
+// ── Ring-only tail is readable by both dequant paths ──────────────────────────
+
+/// `dequant_gpu` must read a store whose decode tail lives only in the GPU ring,
+/// exactly as `dequant` does.
+///
+/// The fused iso-symmetric decode path drops the CPU blocks once the ring is
+/// live, so `blocks` legitimately trail `shape[2]`. `dequant_gpu` used to derive
+/// its element accounting straight from `self.blocks` while `dequant` derived it
+/// from the ring-reconciled list, so the two disagreed on the same store and the
+/// GPU reader rejected it with a blocks-vs-shape mismatch. Both now go through
+/// the one reconciliation.
+///
+/// Mutation check: revert `QuantIsoK3::dequant_gpu` to iterate `self.blocks` and
+/// this fails with `actual_total != declared_total`.
+#[test]
+#[ignore = "GPU Metal context — run via `make gpu-test CRATE=rmlx-kv-quant FILTER=iso_k3_dequant_gpu_reads_a_ring_only_tail`"]
+fn iso_k3_dequant_gpu_reads_a_ring_only_tail() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    let (b, kv_h, head_dim) = (1_usize, 2_usize, 8_usize);
+    let n_tokens = 4_usize;
+    let max_seq = 64_i32;
+    let shape = |n: usize| [b as i32, kv_h as i32, n as i32, head_dim as i32];
+    let init = || vec![b as i32, kv_h as i32, 0, head_dim as i32];
+    let data = crate::test_utils::batch_head_chunk(b, kv_h, 0, n_tokens, head_dim);
+
+    let mut oracle_store = QuantIsoK3::new(init(), max_seq);
+    oracle_store
+        .append(&data, &shape(n_tokens))
+        .expect("oracle append");
+    let oracle = oracle_store.dequant().expect("oracle dequant");
+
+    // Ring-only tail: seed the ring from the blocks, then drop the blocks the
+    // way the fused path does.
+    let mut ks = QuantIsoK3::new(init(), max_seq);
+    ks.append(&data, &shape(n_tokens)).expect("cpu append");
+    let last = ks.blocks[0].clone();
+    let codes_b: Vec<u8> = last.codes.iter().flat_map(|c| c.to_le_bytes()).collect();
+    let scales_b: Vec<u8> = last.scales.iter().flat_map(|s| s.to_le_bytes()).collect();
+    let norms_b: Vec<u8> = last.norms.iter().flat_map(|n| n.to_le_bytes()).collect();
+    let codes = Array::from_bytes(&codes_b, &[last.codes.len() as i32], Dtype::U32).expect("codes");
+    let scales =
+        Array::from_bytes(&scales_b, &[last.scales.len() as i32], Dtype::F32).expect("scales");
+    let norms = Array::from_bytes(&norms_b, &[last.norms.len() as i32], Dtype::F32).expect("norms");
+    // `prev_seq = 0`: the ring takes the whole prefix in one append, so nothing
+    // is seeded from the blocks and dropping them leaves the ring as sole copy.
+    ks.gpu_append(
+        &codes,
+        &scales,
+        &norms,
+        kv_h as i32,
+        head_dim as i32,
+        0,
+        n_tokens as i32,
+        max_seq,
+        Device::Gpu,
+    )
+    .expect("ring append");
+    ks.blocks.clear();
+
+    let cpu = ks.dequant().expect("dequant over a ring-only tail");
+    let max_abs = cpu
+        .iter()
+        .zip(oracle.iter())
+        .fold(0.0_f32, |m, (a, c)| m.max((a - c).abs()));
+    assert!(
+        max_abs < 1e-5,
+        "dequant over a ring-only tail: max abs error {max_abs} vs the all-CPU oracle"
+    );
+
+    let gpu_arr = ks
+        .dequant_gpu(Device::Gpu)
+        .expect("dequant_gpu must read the ring-only tail, not reject it");
+    assert_eq!(
+        gpu_arr.shape(),
+        shape(n_tokens).to_vec(),
+        "dequant_gpu returns the declared [B, kv_h, S, D]"
+    );
 }
