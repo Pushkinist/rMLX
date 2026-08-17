@@ -4016,13 +4016,29 @@ The enforcing check is therefore keyed on the **resolved** architecture:
 - `Architecture::arch_class()` reports what the loader built. For the Qwen3.5
   variant it asks `has_sparse_moe_layers()` rather than echoing a fixed string.
 - `Architecture::validate_kv_quant()` re-runs the table against that resolved
-  class at the `generate_greedy` / `generate_image` seam — after load, before
-  any KV cache exists. A declaration cannot route around it, and a quant that
-  arrives after startup (a per-request `kv_quant` override, which the server's
-  resolver does not validate) is checked on the same terms as a launch flag.
+  class, after load and before any KV cache exists.
 - `load_model` emits a `warn!` naming `declared_arch` and `resolved_arch` when
   they differ, because that mismatch invalidates every predicate still keyed on
-  the declared name.
+  the declared name. Deliberate aliases (`registry::is_declared_arch_alias` —
+  today only Gemma4-unified) are exempt and log at `debug!`, so the warning
+  stays meaningful.
+
+The enforcement has to sit on **every path that builds a KV cache**, not on the
+one that reads the architecture. There are two such families, and they do not
+share a call graph:
+
+| Path | Cache built by | Enforced at |
+|---|---|---|
+| Non-speculative | per-arch `generate_greedy` (`gemma4`, `gemma3`, `qwen2`, `qwen3`, `qwen3_5_moe`, `qwen3_vl_moe`, `laguna`, `bitnet`), reached only from `Architecture::generate_greedy` / `generate_image` | those two methods, plus `ArchGenerator::new` at startup |
+| Speculative | `speculative::{mtp,dflash,eagle3,gemma4_assistant,mod}` build the verifier's caches directly — they never call `Architecture::generate_greedy` | `SpeculativeGenerator::new` at startup, and the per-request seam in its `generate` |
+
+Drafter-side caches are constructed with a hardcoded `KvQuant::None`, which
+passes every arch invariant by construction and needs no check.
+
+Startup checks are the fast-feedback copy (`exit 78` / a failed load rather than
+a per-request failure after a successful launch); the per-request checks are the
+enforcing copy, because a `kv_quant` field on a request arrives after startup and
+the server's resolver does not validate it.
 
 The startup resolvers (`rmlx-cli` `resolve_kv_quant`, the server's
 `resolve_kv_quant_for_load`) still read `architectures[0]` — they run before

@@ -764,14 +764,27 @@ impl Architecture {
     /// Architecture class name as a static string, matching the canonical
     /// `model_type` identifiers used throughout rMLX (tracing fields, metrics).
     ///
-    /// This is the **resolved** class — what the loader actually built — not
-    /// the `architectures[0]` string the checkpoint declares. The two can
-    /// disagree, and where they do this one is the truth: both Qwen3.5 arch
-    /// strings share a single loader and model struct, so the sparse-MoE vs
-    /// dense-SwiGLU distinction is recovered from the built layers rather than
-    /// from the declaration. Safety predicates keyed on the architecture (the
-    /// Qwen-MoE K-side codec guard in particular) must use this, because a
-    /// checkpoint's self-declaration is model-side data that nothing validates.
+    /// Prefer this over the `architectures[0]` string a checkpoint declares:
+    /// the two can disagree, and where they do this one is the truth. Safety
+    /// predicates keyed on the architecture (the Qwen-MoE K-side codec guard in
+    /// particular) must use this, because a declaration is model-side data that
+    /// nothing validates.
+    ///
+    /// **Resolved for the Qwen3.5 family.** Both Qwen3.5 arch strings share a
+    /// single loader and model struct, so the sparse-MoE vs dense-SwiGLU
+    /// distinction is recovered from the built layers. Every other arm returns
+    /// the variant's canonical name.
+    ///
+    /// Known exception: `Qwen3VlMoe` also picks dense-vs-MoE per layer
+    /// (`mlp_only_layers` / `num_experts` / `decoder_sparse_step`), but there is
+    /// no registered dense Qwen3-VL arch string to report, so an all-dense
+    /// Qwen3-VL checkpoint is still labelled MoE and still refused K-side
+    /// codecs. Closing that needs a second registered class and arms for it in
+    /// every consumer, not just an accessor here.
+    ///
+    /// `Gemma4UnifiedForConditionalGeneration` is a deliberate alias: it
+    /// resolves to `Gemma4ForConditionalGeneration`, and every consumer carries
+    /// an explicit arm for the declared form (see `registry::is_declared_arch_alias`).
     pub fn arch_class(&self) -> &'static str {
         match self {
             Architecture::Gemma4(_) => "Gemma4ForConditionalGeneration",
@@ -779,13 +792,7 @@ impl Architecture {
             Architecture::Qwen2(_) => "Qwen2ForCausalLM",
             Architecture::Qwen3(_) => "Qwen3ForCausalLM",
             Architecture::Laguna(_) => "LagunaForCausalLM",
-            Architecture::Qwen3_5Moe(m) => {
-                if m.has_sparse_moe_layers() {
-                    "Qwen3_5MoeForConditionalGeneration"
-                } else {
-                    "Qwen3_5ForConditionalGeneration"
-                }
-            }
+            Architecture::Qwen3_5Moe(m) => m.arch_class(),
             Architecture::Qwen3VlMoe(_) => "Qwen3VLMoeForConditionalGeneration",
             Architecture::BitNet(_) => "BitNetForCausalLM",
         }
@@ -1134,6 +1141,15 @@ impl Architecture {
         use crate::kv_cache::KvCacheBuilder;
         use rmlx_kv_quant::KvQuant;
 
+        // Same enforcement as the text entry, and in the same position: reject
+        // before touching MLX thread state, so a refused codec costs nothing.
+        // The `None` fallback below is `for_arch_default`, a no-op returning
+        // K8V8 — K stays 8-bit, so it satisfies every arch invariant by
+        // construction and needs no separate check.
+        if let Some(kq) = kv_quant_override {
+            self.validate_kv_quant(kq)?;
+        }
+
         // Register the thread-local CPU + GPU streams + CommandEncoders once per
         // thread entry point (mirrors the text `generate_greedy` entry). The CPU
         // stream is registered unconditionally because K8V8 `exit_prefill` schedules
@@ -1143,15 +1159,6 @@ impl Architecture {
         rmlx_mlx::ensure_cpu_default_stream();
         if device == Device::Gpu {
             rmlx_mlx::ensure_gpu_default_stream();
-        }
-
-        // Same enforcement as the text entry: check the operator-supplied quant
-        // against the resolved architecture before any KV cache exists. The
-        // `None` fallback below is `for_arch_default`, which is a no-op
-        // returning K8V8 — K stays 8-bit, so it satisfies every arch invariant
-        // by construction and needs no separate check.
-        if let Some(kq) = kv_quant_override {
-            self.validate_kv_quant(kq)?;
         }
 
         match self {

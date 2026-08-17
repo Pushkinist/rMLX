@@ -35,6 +35,16 @@ prove the Qwen-MoE K-side codec guard still fires. It symlinks the weights, so
 the fixture costs no disk; it is `#[ignore]`d only because it loads real
 snapshots.
 
+> **Known coverage gap.** The *invariant table* is covered weights-free
+> (`cache_type_tests.rs`, including
+> `validate_resolved_qwen3_5_dense_and_moe_strings_diverge`, which pins that the
+> two Qwen3.5 strings give opposite verdicts). Whether the enforcing call sites
+> actually consult it — `Architecture::generate_greedy` / `generate_image`, the
+> `ArchGenerator` and `SpeculativeGenerator` constructors, and the speculative
+> per-request seam — is exercised **only** by snapshot-gated tests. Deleting one
+> of those calls leaves `cargo test --workspace` and `make ci` green. Run the
+> `--ignored` suites above before trusting a change to those seams.
+
 ## Specialised test-model variables
 
 Some integration tests use dedicated snapshot variables instead of the family

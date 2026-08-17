@@ -78,8 +78,13 @@ pub fn generate_greedy<'a>(
 ) -> Result<Vec<crate::decode_loop::ProbeStep>> {
     use crate::decode_loop::ProbeStep;
 
+    // One resolved label for the whole call. This module serves both Qwen3.5
+    // shapes, so a hardcoded string made a dense run emit two different `arch`
+    // values in one run's log — splitting exact-field search on it.
+    let arch_label = model.arch_class();
+
     tracing::info!(
-        arch = "Qwen3_5MoeForConditionalGeneration",
+        arch = arch_label,
         ?kv_quant,
         ?max_ctx_override,
         "generate_greedy: selected KV cache quant"
@@ -214,7 +219,7 @@ pub fn generate_greedy<'a>(
                 rng,
                 penalty_cfg,
                 token_history,
-                arch: "Qwen3_5MoeForConditionalGeneration",
+                arch: arch_label,
                 resolve_pieces: false,
             };
             pipelined_decode(&mut ctx, last_id, &mut steps, |y| {
@@ -259,7 +264,7 @@ pub fn generate_greedy<'a>(
     if let Some((mut kv_caches, mut lin_caches, prefix_len)) = hydrated_tail {
         let tail_len = prompt_ids.len() - prefix_len;
         tracing::info!(
-            arch = "Qwen3_5MoeForConditionalGeneration",
+            arch = arch_label,
             prefix_len,
             tail_len,
             "qwen3_5moe: hydrated-tail hit — forwarding tail from SSD-restored KV"
@@ -342,7 +347,7 @@ pub fn generate_greedy<'a>(
             rng,
             penalty_cfg,
             token_history,
-            arch: "Qwen3_5MoeForConditionalGeneration",
+            arch: arch_label,
             resolve_pieces: false,
         };
 
@@ -506,7 +511,7 @@ pub fn generate_greedy<'a>(
         prompt_ids,
         prefill_chunk,
         device,
-        "Qwen3_5MoeForConditionalGeneration",
+        arch_label,
         |chunk, kv| model.forward_seq_with_cache(chunk, Some(kv), Some(&mut lin_caches), device),
     )?;
 
@@ -531,7 +536,7 @@ pub fn generate_greedy<'a>(
         rng,
         penalty_cfg,
         token_history,
-        arch: "Qwen3_5MoeForConditionalGeneration",
+        arch: arch_label,
         resolve_pieces: false,
     };
 
@@ -637,7 +642,7 @@ pub fn generate_greedy<'a>(
         let prefill_ms = (prefill_total_ns as f64) / 1.0e6;
         tracing::info!(
             target: "decode_profile",
-            arch = "Qwen3_5MoeForConditionalGeneration",
+            arch = arch_label,
             n_steps = 0,
             prefill_ms,
             "decode_profile (prefill-EOS)"
@@ -660,7 +665,7 @@ pub fn generate_greedy<'a>(
     let n = f64::from(stats.decode_steps.max(1));
     tracing::info!(
         target: "decode_profile",
-        arch = "Qwen3_5MoeForConditionalGeneration",
+        arch = arch_label,
         n_steps = stats.decode_steps,
         prefill_ms,
         forward_total_ms = forward_ms,

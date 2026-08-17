@@ -201,6 +201,15 @@ impl ArchGenerator {
             },
         )?;
 
+        // Fail fast on a codec the resolved architecture refuses, before the
+        // codec is warmed and an SSD tier is keyed on it. The startup resolvers
+        // ran against the declared arch and cannot see a mismatch; without this
+        // the refusal would land on every request instead, after a startup that
+        // reported success.
+        if let Some(kq) = kv_quant_resolved {
+            model.validate_kv_quant(kq)?;
+        }
+
         // Deterministically warm the resolved KV codec's MSL kernels during
         // this load (preload) window so the first user request does not pay a
         // shader cold-compile. General per-codec (keyed off

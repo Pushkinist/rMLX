@@ -94,6 +94,20 @@ impl Qwen3_5MoeText {
             .any(|l| matches!(l.mlp, MlpBlock::Moe(_)))
     }
 
+    /// The arch class this instance actually resolved to.
+    ///
+    /// Single source of the dense-vs-MoE name for this family:
+    /// `Architecture::arch_class()` delegates here, and the generate path uses
+    /// it for its `arch` tracing field so one run cannot emit two different
+    /// values for the same model.
+    pub fn arch_class(&self) -> &'static str {
+        if self.has_sparse_moe_layers() {
+            "Qwen3_5MoeForConditionalGeneration"
+        } else {
+            "Qwen3_5ForConditionalGeneration"
+        }
+    }
+
     /// Full-sequence forward pass (no KV cache).
     /// Returns logits for the last position, shape `[1, 1, vocab_size]`.
     pub fn forward_seq(&self, ids: &[u32], device: Device) -> Result<Array> {

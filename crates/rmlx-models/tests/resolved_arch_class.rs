@@ -101,6 +101,16 @@ fn k_side_disaster_codecs() -> Vec<KvQuant> {
         KvQuant::Rotor4Sym,
         KvQuant::RotorKOnly3,
         KvQuant::RotorKOnly4,
+        // The payload-bearing rotor variants — the only rotor codecs that
+        // reach the fused-QK kernel, so the reachable half of the family.
+        KvQuant::RotorK3Asym {
+            v_bits: 4,
+            v_group_size: 128,
+        },
+        KvQuant::RotorK4Asym {
+            v_bits: 4,
+            v_group_size: 128,
+        },
         KvQuant::Iso3Sym,
         KvQuant::Iso4Sym,
         KvQuant::IsoKOnly3,

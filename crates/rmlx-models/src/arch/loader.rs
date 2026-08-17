@@ -222,7 +222,15 @@ pub fn load_model(model_dir: &Path, _device: Device, opts: &LoadOpts) -> Result<
     // say so loudly and name both, because the declaration is model-side data
     // that nothing validates.
     let resolved_arch = arch.arch_class();
-    if resolved_arch != arch_str {
+    if resolved_arch != arch_str && super::registry::is_declared_arch_alias(arch_str, resolved_arch)
+    {
+        tracing::debug!(
+            declared_arch = arch_str,
+            resolved_arch,
+            "declared architecture is a known alias of the resolved class — expected, \
+             every consumer carries an explicit arm for it"
+        );
+    } else if resolved_arch != arch_str {
         tracing::warn!(
             declared_arch = arch_str,
             resolved_arch,

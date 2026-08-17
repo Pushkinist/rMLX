@@ -445,6 +445,16 @@ impl SpeculativeGenerator {
             _ => mpe.min(4096),
         };
 
+        // Fail fast on a codec the verifier's resolved architecture refuses.
+        // The round loop builds the verifier's KV caches itself rather than
+        // going through `Architecture::generate_greedy`, so without this the
+        // only enforcing check would run per request — every request failing
+        // after a fully successful startup. The verifier is the model whose
+        // caches carry the codec, so it is the one to ask.
+        if let Some(kq) = kv_quant_resolved {
+            dispatcher.verifier.validate_kv_quant(kq)?;
+        }
+
         tracing::info!(
             model_id = %model_id,
             k,
@@ -599,6 +609,16 @@ impl Generator for SpeculativeGenerator {
             );
             Some(ctx_quant)
         };
+        // The round loop below builds the verifier's KV caches directly, so
+        // this is the enforcing check for the speculative path — the seam in
+        // `Architecture::generate_greedy` is never reached from here. It covers
+        // the per-request override, which arrives after startup and is
+        // otherwise unvalidated.
+        if let Some(kq) = kv_quant_override {
+            if let Err(e) = self.dispatcher.verifier.validate_kv_quant(kq) {
+                return Box::pin(stream::once(async move { Err(e) }));
+            }
+        }
         // Issue #26: per-request max-ctx ceiling override (#25 lazy-grow path).
         let max_ctx_override = req.max_ctx_override.or(self.max_ctx_override);
         // F2: capture effective_max_ctx for drainer MetricEvent.ctx_max field.

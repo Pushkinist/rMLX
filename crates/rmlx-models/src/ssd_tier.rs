@@ -21,6 +21,12 @@ use rmlx_mlx::Device;
 /// `(n_layers, n_kv_heads, head_dim)` are taken from the loaded model's
 /// config and folded into the `layout_key` that the spiller/hydrator carry.
 ///
+/// `arch` must be the **resolved** class (`Architecture::arch_class()`), not
+/// the checkpoint's declared `architectures[0]`: it both selects the per-arch
+/// `PROMPT_CACHE` and salts the `layout_key`, so a declared name that does not
+/// describe the model that was built would pick the wrong cache (or none). The
+/// arms below still tolerate a declared alias for any caller that passes one.
+///
 /// No model identity is threaded here on purpose. The per-arch attach slot
 /// holds one set of parameters and the last load wins, so a per-model value
 /// recorded at attach would be wrong for every other resident model of the
@@ -64,7 +70,10 @@ pub fn attach_at_load(
                 info.device,
             );
         }
-        "Qwen3_5MoeForConditionalGeneration" => {
+        // Both Qwen3.5 shapes share one loader, one model struct and one
+        // PROMPT_CACHE static, so the dense class gets the tier too. Listing
+        // only the MoE name left every dense Qwen3.5 snapshot silently RAM-only.
+        "Qwen3_5MoeForConditionalGeneration" | "Qwen3_5ForConditionalGeneration" => {
             crate::qwen3_5_moe::prompt_cache::PROMPT_CACHE.attach_ssd_tier(
                 &info.namespace,
                 info.kv_quant,
