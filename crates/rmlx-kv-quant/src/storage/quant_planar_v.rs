@@ -418,6 +418,24 @@ impl QuantPlanarV {
                 // for raw byte-readers (SSD spill / hydrate); this is the
                 // post-hydrate / chunked-prefill dequant path, off the decode hot
                 // path, so the copy is acceptable.
+                // The flat GPU buffer is a run of `[B, S_chunk, kv_h, D]`
+                // chunks written at `prev_seq * words_per_step`, and
+                // `words_per_step` folds `b` in. Reading the prefix as one
+                // `[B, S_total, kv_h, D]` run therefore interleaves batch
+                // elements once `B > 1` and more than one sequence position
+                // landed (`S <= 1` is the same order either way, and an emptied
+                // store must still decode to nothing). Refuse
+                // rather than return a scrambled tensor — the CPU half of this
+                // reader handles every `B` via
+                // `seq_layout::transpose_chunked_seq_heads`, which is what the
+                // block list makes possible and this buffer does not.
+                if self.shape[0] != 1 && self.shape[2] > 1 {
+                    return Err(rmlx_core::error::Error::Quant(format!(
+                        "QuantPlanarV::dequantize_choice: the flat GPU buffer is b == 1 only \
+                         (its per-step stride does not interleave batch), got shape {:?}",
+                        self.shape
+                    )));
+                }
                 let seq_major_shape = [self.shape[0], s, self.shape[1], self.shape[3]];
                 let out = if self.bits == 3 {
                     planar_dequantize_v3_gpu(&codes, &scales, &rotations, &seq_major_shape, device)?
@@ -527,3 +545,7 @@ impl QuantPlanarV {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "quant_planar_v_tests.rs"]
+mod quant_planar_v_tests;

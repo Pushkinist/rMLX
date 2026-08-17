@@ -255,10 +255,17 @@ fn quant_rotor_k4_two_block_decode_matches_one_block_at_b_gt_1() {
     // different settings. Hold the lock and pin both settings explicitly — the
     // per-token sideband has to reorder with its token rows either way.
     let _guard = crate::test_utils::env_lock();
-    for (b, qjl) in [(1_usize, "0"), (2, "0"), (1, "1"), (2, "1")] {
+    for (b, kv_h, qjl) in [
+        (1_usize, 1_usize, "0"),
+        (1, 2, "0"),
+        (2, 1, "0"),
+        (2, 2, "0"),
+        (1, 2, "1"),
+        (2, 2, "1"),
+    ] {
         // SAFETY: env lock held — no concurrent env reader/writer in this binary.
         unsafe { std::env::set_var("RMLX_ROTOR_QJL", qjl) };
-        let (kv_h, head_dim) = (2_usize, 128_usize);
+        let head_dim = 128_usize;
         let (n0, n1) = (2_usize, 3_usize);
         let shape = |n: usize| [b as i32, kv_h as i32, n as i32, head_dim as i32];
 
@@ -285,7 +292,7 @@ fn quant_rotor_k4_two_block_decode_matches_one_block_at_b_gt_1() {
 
         assert_eq!(
             got, oracle,
-            "two-block decode must equal the one-block oracle at b={b}, qjl={qjl}"
+            "two-block decode must equal the one-block oracle at b={b} kv_h={kv_h}, qjl={qjl}"
         );
     }
 }

@@ -1402,12 +1402,15 @@ fn iso_gpu_encode_block_retaining(
     let head_dim = head_dim_from_shape(new_shape, "iso_gpu_encode_block_retaining")?;
     let (b, kv_h, s) = b_kv_h_new_seq(new_shape)?;
     let n_tokens_total = (b as usize) * (kv_h as usize) * (s as usize);
-    let n_groups = iso_n_groups_for(head_dim);
-    if n_groups == 0 {
-        return Err(Error::Quant(format!(
-            "iso_gpu_encode_block_retaining: head_dim={head_dim} yields no quaternion groups"
-        )));
-    }
+    // Strict form: `iso_n_groups_for` truncates, so a `head_dim` that is not a
+    // whole number of quaternion blocks would silently drop the trailing partial
+    // group. The helper the deleted iso4 encoder used rejected that; keep the
+    // rejection now that this is the shared path.
+    let n_groups = usize::try_from(crate::storage::iso_n_groups_i32(
+        head_dim as i32,
+        "iso_gpu_encode_block_retaining",
+    )?)
+    .map_err(|_| Error::Quant("iso_gpu_encode_block_retaining: n_groups negative".to_owned()))?;
 
     let (codes_arr, scales_arr, quats_arr, norms_arr) = match bits {
         ISO_K3_BITS => crate::isoquant_msl::iso_quantize_v3_gpu(new_k, head_dim, Device::Gpu)?,
@@ -1554,18 +1557,12 @@ fn materialize_iso_k4_ring_tail(ks: &mut QuantIsoK4, device: Device) -> Result<(
 
 /// Mirror of [`materialize_iso_k3_ring_tail`] for [`QuantIsoV3`].
 fn materialize_iso_v3_ring_tail(vs: &mut QuantIsoV3, device: Device) -> Result<()> {
-    if !vs.gpu.is_allocated() {
-        return Ok(());
-    }
-    let rebuilt = match crate::storage::synced_iso_v_blocks(&vs.blocks, &vs.shape, &vs.gpu, device)?
-    {
-        std::borrow::Cow::Owned(full) => Some(full),
-        std::borrow::Cow::Borrowed(_) => None,
-    };
-    if let Some(full) = rebuilt {
-        vs.blocks = full;
-    }
-    Ok(())
+    // One body for the reconcile: the store owns it, because the store is what
+    // has to keep `blocks` and the ring in step. This caller keeps the ring —
+    // its `sync_ring` decides the ring's fate a few lines later — while
+    // `QuantIsoV3::append_gpu` drops it, and that difference is the whole
+    // contract, so it is a parameter rather than two copies that can drift.
+    vs.reconcile_ring(device, crate::storage::RingDisposition::Keep)
 }
 
 /// Mirror of [`materialize_iso_v3_ring_tail`] for [`QuantIsoV4`].

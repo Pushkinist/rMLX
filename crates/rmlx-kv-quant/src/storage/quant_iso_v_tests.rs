@@ -860,8 +860,8 @@ fn quant_iso_v3_truncate_mid_block_splits_instead_of_dropping() {
 /// invisible.
 #[test]
 fn quant_iso_v3_two_block_decode_matches_one_block_at_b_gt_1() {
-    for b in [1_usize, 2] {
-        let (kv_h, head_dim) = (2_usize, 8_usize);
+    for (b, kv_h) in [(1_usize, 1_usize), (1, 2), (2, 1), (2, 2)] {
+        let head_dim = 8_usize;
         let (n0, n1) = (2_usize, 3_usize);
         let shape = |n: usize| [b as i32, kv_h as i32, n as i32, head_dim as i32];
 
@@ -888,7 +888,7 @@ fn quant_iso_v3_two_block_decode_matches_one_block_at_b_gt_1() {
 
         assert_eq!(
             got, oracle,
-            "two-block decode must equal the one-block oracle at b={b}"
+            "two-block decode must equal the one-block oracle at b={b} kv_h={kv_h}"
         );
     }
 }
@@ -927,7 +927,7 @@ fn ring_inputs(blk: &IsoBlocks) -> (Array, Array, Array) {
 /// Runs entirely on `Device::Cpu` — the ring is device-parameterised, so the
 /// state machine reproduces without Metal.
 ///
-/// Mutation check: drop the `absorb_ring_into_blocks` call from
+/// Mutation check: drop the `reconcile_ring` call from
 /// `QuantIsoV3::append_gpu`. The `absorb = false` arm below models exactly that,
 /// and it is what asserts the unfixed store is unreadable; if the fix is
 /// reverted, the `absorb = true` arm goes red for the same reason.
@@ -989,7 +989,7 @@ fn iso_v3_block_append_over_a_live_ring_takes_the_prefix_back() {
 
         // Legacy fallback step: `append_gpu`'s reconcile, then its block push.
         if absorb {
-            vs.absorb_ring_into_blocks(Device::Cpu)
+            vs.reconcile_ring(Device::Cpu, crate::storage::RingDisposition::Drop)
                 .expect("absorb the ring prefix");
             assert!(
                 !vs.gpu.is_allocated(),
@@ -1037,7 +1037,7 @@ fn iso_v3_block_append_over_a_live_ring_takes_the_prefix_back() {
 /// there — which is how `iso3_sym` failed to serve a model whose decode took the
 /// non-fused fallback after the fused path had gone live.
 ///
-/// Mutation check: drop `absorb_ring_into_blocks` from `append_gpu` and the
+/// Mutation check: drop `reconcile_ring` from `append_gpu` and the
 /// `dequant` assertion goes red; revert `dequant_gpu` to iterate `self.blocks`
 /// and the `dequant_gpu` assertion goes red.
 #[test]
@@ -1285,4 +1285,58 @@ fn iso_v3_dequant_gpu_matches_dequant_at_b_gt_1() {
              batch/head scramble in the GPU reader"
         );
     }
+}
+
+/// The geometry the codec actually failed on: a single KV head with a wide
+/// `head_dim`.
+///
+/// gemma-4-e2b's global attention layers are `kv_h = 1, head_dim = 512`
+/// (`num_key_value_heads: 1`, `global_head_dim: 512`), and no unit test
+/// constructed that shape for this codec — every other iso fixture here uses
+/// `kv_h = 2, head_dim = 8`, which is two quaternion groups per token and hides
+/// anything that scales with `n_groups`. 512 is 128 groups.
+///
+/// Both readers are checked at that shape: the CPU `dequant` against a
+/// single-append oracle, and the GPU reader's kernel inputs against the same
+/// chunking-independence property the wider test asserts. (The kernel dispatch
+/// itself needs Metal; the inputs are what carry the layout.)
+#[test]
+fn iso_v3_single_kv_head_head_dim_512_decodes_the_same_either_chunking() {
+    let (b, kv_h, head_dim) = (1_usize, 1_usize, 512_usize);
+    let n_groups = head_dim / ISO3_GROUP_SIZE;
+    let (n0, n1) = (2_usize, 3_usize);
+    let shape = |n: usize| [b as i32, kv_h as i32, n as i32, head_dim as i32];
+    let init = || vec![b as i32, kv_h as i32, 0, head_dim as i32];
+    let chunk = |s0: usize, n: usize| crate::test_utils::batch_head_chunk(b, kv_h, s0, n, head_dim);
+
+    let mut one = QuantIsoV3::new(init());
+    one.append(&chunk(0, n0 + n1), &shape(n0 + n1))
+        .expect("single append");
+    let oracle = one.dequant().expect("one-block dequant");
+
+    let mut two = QuantIsoV3::new(init());
+    two.append(&chunk(0, n0), &shape(n0)).expect("chunk 0");
+    two.append(&chunk(n0, n1), &shape(n1)).expect("chunk 1");
+    let got = two.dequant().expect("two-block dequant");
+    assert_eq!(
+        got, oracle,
+        "kv_h = 1, head_dim = 512: two-block decode must equal the one-block oracle"
+    );
+
+    let build = |blocks: &[IsoBlocks], sh: &[i32]| {
+        crate::storage::quant_iso_v::iso_kernel_inputs_head_major(
+            blocks,
+            sh,
+            n_groups,
+            ISO3_GROUP_SIZE,
+            "test",
+        )
+        .expect("well-formed store")
+    };
+    let a = build(&one.blocks, &one.shape);
+    let c = build(&two.blocks, &two.shape);
+    assert_eq!(a.total_groups, c.total_groups, "slot count at head_dim 512");
+    assert_eq!(a.codes, c.codes, "GPU-reader codes at head_dim 512");
+    assert_eq!(a.scales, c.scales, "GPU-reader scales at head_dim 512");
+    assert_eq!(a.norms, c.norms, "GPU-reader norms at head_dim 512");
 }

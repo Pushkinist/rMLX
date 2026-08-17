@@ -66,7 +66,7 @@ pub fn iso_n_groups_for(head_dim: usize) -> usize {
 ///
 /// Returns [`Error::Quant`] when `head_dim` is not a positive multiple of
 /// [`ISO_QUAT_BLOCK_SIZE`].
-pub(crate) fn iso_n_groups_i32(head_dim: i32, what: &str) -> Result<i32> {
+pub fn iso_n_groups_i32(head_dim: i32, what: &str) -> Result<i32> {
     let hd = usize::try_from(head_dim)
         .map_err(|_| Error::Quant(format!("{what}: head_dim={head_dim} must be positive")))?;
     if hd == 0 || !hd.is_multiple_of(ISO_QUAT_BLOCK_SIZE) {

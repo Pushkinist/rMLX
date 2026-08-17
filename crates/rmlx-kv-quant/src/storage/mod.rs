@@ -60,7 +60,8 @@ pub use kv_storage::{
     TURBOSYM3_LAYOUT_TAG, TURBOSYM4_LAYOUT_TAG,
 };
 pub use quant_iso_k::{
-    iso_n_groups_for, QuantIsoK3, ISO_K3_BITS, ISO_K3_GROUP_SIZE, ISO_QUAT_BLOCK_SIZE,
+    iso_n_groups_for, iso_n_groups_i32, QuantIsoK3, ISO_K3_BITS, ISO_K3_GROUP_SIZE,
+    ISO_QUAT_BLOCK_SIZE,
 };
 pub use quant_iso_k4::{QuantIsoK4, ISO_K4_BITS, ISO_K4_GROUP_SIZE};
 pub(crate) use quant_iso_v::synced_iso_v_blocks;
@@ -162,6 +163,21 @@ pub const KV_PAGE_SIZE: i32 = 256;
 // the intra-block cut above still refuses. `sdpa::rotor_flash_shape_ok` still
 // refuses `b != 1` because the GPU ring's per-step stride does not interleave
 // batch, which is why no `b > 1` store ever has a ring to rebuild a gap from.
+
+/// What a reconcile does with the GPU ring once the CPU blocks are whole again.
+///
+/// The two callers of [`QuantIsoV3::reconcile_ring`] differ only here, and that
+/// difference is the ring/blocks contract itself: a caller that is about to feed
+/// the ring keeps it, a caller that is not must drop it, because a live ring
+/// that `blocks` have outgrown is the state where the next append writes past
+/// the ring's filled region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RingDisposition {
+    /// Leave the ring allocated — the caller feeds or clears it itself.
+    Keep,
+    /// Drop the ring; the CPU blocks are the authoritative copy from here.
+    Drop,
+}
 
 /// How a block-accumulating KV store must cut its blocks to reach `n`
 /// sequence positions.

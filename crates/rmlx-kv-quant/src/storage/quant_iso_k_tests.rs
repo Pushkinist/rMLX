@@ -345,8 +345,8 @@ fn quant_iso_k3_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
 /// invisible.
 #[test]
 fn quant_iso_k3_two_block_decode_matches_one_block_at_b_gt_1() {
-    for b in [1_usize, 2] {
-        let (kv_h, head_dim) = (2_usize, 8_usize);
+    for (b, kv_h) in [(1_usize, 1_usize), (1, 2), (2, 1), (2, 2)] {
+        let head_dim = 8_usize;
         let (n0, n1) = (2_usize, 3_usize);
         let shape = |n: usize| [b as i32, kv_h as i32, n as i32, head_dim as i32];
 
@@ -373,7 +373,7 @@ fn quant_iso_k3_two_block_decode_matches_one_block_at_b_gt_1() {
 
         assert_eq!(
             got, oracle,
-            "two-block decode must equal the one-block oracle at b={b}"
+            "two-block decode must equal the one-block oracle at b={b} kv_h={kv_h}"
         );
     }
 }
@@ -457,4 +457,58 @@ fn iso_k3_dequant_gpu_reads_a_ring_only_tail() {
         shape(n_tokens).to_vec(),
         "dequant_gpu returns the declared [B, kv_h, S, D]"
     );
+}
+
+/// The geometry the codec actually failed on: a single KV head with a wide
+/// `head_dim`.
+///
+/// gemma-4-e2b's global attention layers are `kv_h = 1, head_dim = 512`
+/// (`num_key_value_heads: 1`, `global_head_dim: 512`), and no unit test
+/// constructed that shape for this codec — every other iso fixture here uses
+/// `kv_h = 2, head_dim = 8`, which is two quaternion groups per token and hides
+/// anything that scales with `n_groups`. 512 is 128 groups.
+///
+/// Both readers are checked at that shape: the CPU `dequant` against a
+/// single-append oracle, and the GPU reader's kernel inputs against the same
+/// chunking-independence property the wider test asserts. (The kernel dispatch
+/// itself needs Metal; the inputs are what carry the layout.)
+#[test]
+fn iso_k3_single_kv_head_head_dim_512_decodes_the_same_either_chunking() {
+    let (b, kv_h, head_dim) = (1_usize, 1_usize, 512_usize);
+    let n_groups = head_dim / ISO_K3_GROUP_SIZE;
+    let (n0, n1) = (2_usize, 3_usize);
+    let shape = |n: usize| [b as i32, kv_h as i32, n as i32, head_dim as i32];
+    let init = || vec![b as i32, kv_h as i32, 0, head_dim as i32];
+    let chunk = |s0: usize, n: usize| crate::test_utils::batch_head_chunk(b, kv_h, s0, n, head_dim);
+
+    let mut one = QuantIsoK3::new(init(), 512);
+    one.append(&chunk(0, n0 + n1), &shape(n0 + n1))
+        .expect("single append");
+    let oracle = one.dequant().expect("one-block dequant");
+
+    let mut two = QuantIsoK3::new(init(), 512);
+    two.append(&chunk(0, n0), &shape(n0)).expect("chunk 0");
+    two.append(&chunk(n0, n1), &shape(n1)).expect("chunk 1");
+    let got = two.dequant().expect("two-block dequant");
+    assert_eq!(
+        got, oracle,
+        "kv_h = 1, head_dim = 512: two-block decode must equal the one-block oracle"
+    );
+
+    let build = |blocks: &[crate::storage::IsoBlocks], sh: &[i32]| {
+        crate::storage::quant_iso_v::iso_kernel_inputs_head_major(
+            blocks,
+            sh,
+            n_groups,
+            ISO_K3_GROUP_SIZE,
+            "test",
+        )
+        .expect("well-formed store")
+    };
+    let a = build(&one.blocks, &one.shape);
+    let c = build(&two.blocks, &two.shape);
+    assert_eq!(a.total_groups, c.total_groups, "slot count at head_dim 512");
+    assert_eq!(a.codes, c.codes, "GPU-reader codes at head_dim 512");
+    assert_eq!(a.scales, c.scales, "GPU-reader scales at head_dim 512");
+    assert_eq!(a.norms, c.norms, "GPU-reader norms at head_dim 512");
 }

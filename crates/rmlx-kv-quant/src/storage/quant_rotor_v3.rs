@@ -581,7 +581,7 @@ pub(crate) fn synced_rotor_v_blocks<'a>(
     let full_seq = shape.get(2).copied().unwrap_or(0).max(0) as usize;
     let head_dim = shape.get(3).copied().unwrap_or(0).max(0) as usize;
     let full_tokens = b * kv_h * full_seq;
-    let blocks_tokens: usize = blocks.iter().map(|blk| blk.n_tokens).sum();
+    let blocks_tokens: usize = blocks.iter().map(super::BlockRows::rows).sum();
 
     if blocks_tokens == full_tokens {
         return Ok(std::borrow::Cow::Borrowed(blocks));

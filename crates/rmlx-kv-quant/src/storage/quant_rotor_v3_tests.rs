@@ -449,8 +449,8 @@ fn quant_rotor_v3_truncate_at_b_gt_1_stays_loud() {
 /// invisible.
 #[test]
 fn quant_rotor_v3_two_block_decode_matches_one_block_at_b_gt_1() {
-    for b in [1_usize, 2] {
-        let (kv_h, head_dim) = (2_usize, 96_usize);
+    for (b, kv_h) in [(1_usize, 1_usize), (1, 2), (2, 1), (2, 2)] {
+        let head_dim = 96_usize;
         let (n0, n1) = (2_usize, 3_usize);
         let shape = |n: usize| [b as i32, kv_h as i32, n as i32, head_dim as i32];
 
@@ -477,7 +477,7 @@ fn quant_rotor_v3_two_block_decode_matches_one_block_at_b_gt_1() {
 
         assert_eq!(
             got, oracle,
-            "two-block decode must equal the one-block oracle at b={b}"
+            "two-block decode must equal the one-block oracle at b={b} kv_h={kv_h}"
         );
     }
 }

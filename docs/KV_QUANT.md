@@ -3125,8 +3125,35 @@ one-block store, while the `b = 1` control matched to the last bit). Every
 block-accumulating CPU store now calls
 `seq_layout::transpose_chunked_seq_heads`, which reorders each block at its own
 sequence offset and is exactly the old whole-buffer reorder when `B == 1`. The
-per-store proof is `*_two_block_decode_matches_one_block_at_b_gt_1` (one per
-store), with the index-math oracle in `seq_layout_tests`.
+per-store proof is `*_two_block_decode_matches_one_block_at_b_gt_1` — one per
+store, all thirteen, each over `(b, kv_h) ∈ {1,2} × {1,2}` — with the index-math
+oracle in `seq_layout_tests`.
+
+The **GPU** readers took the same reorder on the way in rather than the way out.
+`QuantIsoV3::dequant_gpu` / `QuantIsoK3::dequant_gpu` had the identical defect
+(they reshaped the kernel's flat output as one `[B, S, kv_h, D]` run), and it is
+the multi-block case that reaches them: every `*_sync_ring` clears the ring at
+`b != 1`, so `synced_iso_v_blocks` returns a borrowed multi-block list there.
+Both now build their kernel inputs through `iso_kernel_inputs_head_major`, which
+places each token row at its head-major position via
+`seq_layout::head_major_token_order`; the iso dequant kernel is per-token
+positional, so the flat result is already `[B, kv_h, S, D]` and the trailing
+reshape/transpose is gone.
+
+**Where the bound still stands.** Two readers refuse `b != 1` (with `S > 1`)
+rather than reorder:
+
+* The **flat GPU buffers** of the turbo / planar / affine stores (`QuantV`,
+  `QuantKTurbo3/4`, `QuantPlanarK/V`, `QuantK`) and the gated `QuantIsoV3` GPU
+  mirror. Each is a run of `[B, S_chunk, kv_h, D]` chunks written at
+  `prev_seq * words_per_step` with `b` folded into the stride, so the prefix
+  carries no chunk boundary to partition on.
+* `QuantK`'s **CPU** `codes` / `scales`, which are one flat append-only pair with
+  no per-append boundary recorded. The refusal is deliberately wider than the
+  defect — a single-append `b > 1` store would read correctly and is refused
+  anyway — because `b > 1` reaches no production path today and the boundaries
+  are not recoverable after the fact. Lifting it needs a recorded per-append
+  sequence length on the store.
 
 All eight rotor/iso K and V codecs share one crate-internal planner,
 `truncate_plan` in `rmlx-kv-quant/src/storage/mod.rs`, plus a `BlockRows`

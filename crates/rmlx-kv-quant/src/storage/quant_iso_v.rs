@@ -502,21 +502,32 @@ impl QuantIsoV3 {
         )
     }
 
-    /// Rebuild any ring-only prefix into the CPU blocks and drop the ring, so
-    /// `blocks` alone cover `shape[2]` again.
+    /// Rebuild any ring-only prefix into the CPU blocks so `blocks` alone cover
+    /// `shape[2]` again, and either keep or drop the ring.
     ///
-    /// No-op when the ring was never allocated. Called by every path that
-    /// pushes a CPU block onto a store whose ring may be live: without it the
-    /// pushed block is the *only* block, `blocks` no longer cover `shape[2]`,
-    /// and the ring left behind is stale — the next ring append would write past
-    /// its filled region and `dequant` would read a zeroed gap where the new
-    /// chunk should be. Mirrors what the CPU [`Self::append`] does by clearing.
+    /// No-op when the ring was never allocated. Every path that pushes a CPU
+    /// block onto a store whose ring may be live goes through here: without it
+    /// the pushed block is the *only* block, `blocks` no longer cover
+    /// `shape[2]`, and the ring left behind is stale — the next ring append
+    /// would write past its filled region and `dequant` would read a gap the
+    /// ring's fill watermark then refuses.
+    ///
+    /// `disposition` is a parameter because it is the one thing the two callers
+    /// disagree on, and having them disagree by carrying separate copies of this
+    /// body is how the two drift apart. [`Self::append_gpu`] drops the ring — it
+    /// does not feed it, so leaving it live is the dangerous state the CPU
+    /// [`Self::append`] avoids by clearing. The append helpers in `kvcache`
+    /// keep it, because their `sync_ring` decides its fate immediately after.
     ///
     /// # Errors
     ///
     /// Forwards a [`synced_iso_v_blocks`] reconciliation error — a ring that
     /// cannot supply the missing prefix is reported, never zero-padded.
-    pub(crate) fn absorb_ring_into_blocks(&mut self, device: Device) -> Result<()> {
+    pub(crate) fn reconcile_ring(
+        &mut self,
+        device: Device,
+        disposition: super::RingDisposition,
+    ) -> Result<()> {
         if !self.gpu.is_allocated() {
             return Ok(());
         }
@@ -525,7 +536,9 @@ impl QuantIsoV3 {
         {
             self.blocks = full;
         }
-        self.gpu.clear();
+        if disposition == super::RingDisposition::Drop {
+            self.gpu.clear();
+        }
         Ok(())
     }
 
@@ -745,7 +758,7 @@ impl QuantIsoV3 {
         // dangerous state, because the next ring append would write past its
         // filled region and `dequant` would read a zeroed gap. The next
         // `gpu_append` re-seeds it from `blocks`.
-        self.absorb_ring_into_blocks(device)?;
+        self.reconcile_ring(device, super::RingDisposition::Drop)?;
 
         // ── 1. Dispatch the MSL encode kernel. ─────────────────────────────
         // The codec is per-token-row positional; the GPU mirror accumulates
@@ -1143,7 +1156,7 @@ impl QuantIsoV3 {
             // as one `[B, S, kv_h, D]` run below interleaves batch elements once
             // `B > 1` and more than one chunk landed. Refuse rather than return a
             // scrambled tensor — the block path handles every `B`.
-            if self.shape[0] != 1 {
+            if self.shape[0] != 1 && self.shape[2] > 1 {
                 return Err(Error::Quant(format!(
                     "QuantIsoV3::dequant_gpu: the GPU mirror is b == 1 only (its per-step \
                      stride does not interleave batch), got shape {:?}",

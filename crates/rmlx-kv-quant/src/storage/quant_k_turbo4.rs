@@ -360,6 +360,24 @@ impl QuantKTurbo4 {
                 // `[B, S, kv_h, D]`, then reorder heads↔seq back to the logical
                 // `[B, kv_h, S, D]`. `contiguous` after the output transpose so
                 // raw byte-readers (SSD spill) see the permuted bytes.
+                // The flat GPU buffer is a run of `[B, S_chunk, kv_h, D]`
+                // chunks written at `prev_seq * words_per_step`, and
+                // `words_per_step` folds `b` in. Reading the prefix as one
+                // `[B, S_total, kv_h, D]` run therefore interleaves batch
+                // elements once `B > 1` and more than one sequence position
+                // landed (`S <= 1` is the same order either way, and an emptied
+                // store must still decode to nothing). Refuse
+                // rather than return a scrambled tensor — the CPU half of this
+                // reader handles every `B` via
+                // `seq_layout::transpose_chunked_seq_heads`, which is what the
+                // block list makes possible and this buffer does not.
+                if self.shape[0] != 1 && self.shape[2] > 1 {
+                    return Err(rmlx_core::error::Error::Quant(format!(
+                        "QuantKTurbo4::dequantize_choice: the flat GPU buffer is b == 1 only \
+                         (its per-step stride does not interleave batch), got shape {:?}",
+                        self.shape
+                    )));
+                }
                 let seq_major_shape = [self.shape[0], self.shape[2], self.shape[1], self.shape[3]];
                 let out =
                     turbo_dequantize_v4_gpu(&codes, &scales, &seq_major_shape, out_dtype, device)?;

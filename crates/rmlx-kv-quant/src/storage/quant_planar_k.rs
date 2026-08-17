@@ -412,6 +412,24 @@ impl QuantPlanarK {
                 // `[B, kv_h, S, D]` buffer, so force contiguity. This is the
                 // post-hydrate dequant path, off the steady-state decode hot
                 // path, so the copy is acceptable.
+                // The flat GPU buffer is a run of `[B, S_chunk, kv_h, D]`
+                // chunks written at `prev_seq * words_per_step`, and
+                // `words_per_step` folds `b` in. Reading the prefix as one
+                // `[B, S_total, kv_h, D]` run therefore interleaves batch
+                // elements once `B > 1` and more than one sequence position
+                // landed (`S <= 1` is the same order either way, and an emptied
+                // store must still decode to nothing). Refuse
+                // rather than return a scrambled tensor — the CPU half of this
+                // reader handles every `B` via
+                // `seq_layout::transpose_chunked_seq_heads`, which is what the
+                // block list makes possible and this buffer does not.
+                if self.shape[0] != 1 && self.shape[2] > 1 {
+                    return Err(rmlx_core::error::Error::Quant(format!(
+                        "QuantPlanarK::dequantize_choice: the flat GPU buffer is b == 1 only \
+                         (its per-step stride does not interleave batch), got shape {:?}",
+                        self.shape
+                    )));
+                }
                 let seq_major_shape = [self.shape[0], s, self.shape[1], self.shape[3]];
                 let out = planar_dequantize_v4_gpu(
                     &codes,
@@ -439,11 +457,14 @@ impl QuantPlanarK {
             let slice = planar_dequantize(block)?;
             out.extend_from_slice(&slice);
         }
-        // Blocks must cover `shape[2]` exactly. `transpose_seq_heads` reads only
-        // the first `b * s * kv_h * d` elements, so an over-run used to be
-        // silently cut back — after a mid-block truncate that kept the
-        // *rejected* speculative prefix and dropped the appended correction,
-        // with no error anywhere. A shortfall panicked on an out-of-range index.
+        // Blocks must cover `shape[2]` exactly. `transpose_chunked_seq_heads`
+        // rejects a buffer whose length disagrees with the declared shape in
+        // either direction, but the check is kept here so the error names this
+        // store and its block list rather than the reorder helper. Before both,
+        // an over-run was silently cut back — after a mid-block truncate that
+        // kept the *rejected* speculative prefix and dropped the appended
+        // correction, with no error anywhere — and a shortfall panicked out of
+        // range.
         // `truncate_to` now cuts the blocks; when it cannot (see
         // `super::truncate_plan`) it drops the trailing block whole and leaves
         // the store short on purpose, and that must abort the request here.
