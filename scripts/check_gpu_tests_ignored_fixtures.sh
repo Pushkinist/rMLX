@@ -49,11 +49,13 @@ CASES=(
     "macro_inline_body|1|${VIOLATION}|later_plain_gpu_no_ignore||a one-line generated fn does not swallow the rest of the file"
     "macro_inline_string_brace|1|${VIOLATION}|second_cell!{\$name}||a } inside a string literal does not make the line look unbalanced"
     "fn_url_in_string|1|${VIOLATION}|later_plain_gpu_no_ignore||a // inside a string literal is not a comment"
+    "fn_char_literal_quote|1|${VIOLATION}|later_plain_gpu_no_ignore||a \" inside a char literal does not desynchronise the string scan"
     "fn_comment_brace|1|${VIOLATION}|plain_gpu_no_ignore||a } inside a trailing comment does not make the line look self-contained"
-    "trait_signature_fns|1|${VIOLATION}|after_trait_gpu_no_ignore||signature-only fns neither latch nor hard-fail the run"
+    "trait_signature_fns|1|${VIOLATION}|after_trait_gpu_no_ignore||one-line signature-only fns neither latch nor hard-fail the run"
+    "trait_where_signature|1|${UNREADABLE}|fn never closed||a signature split by a where clause fails closed and loud, not silently"
     "fn_never_closes|1|${UNREADABLE}|fn never closed||a capture that cannot terminate is reported, not skipped"
-    "exempt_in_body|1|${VIOLATION}|gpu_marker_inside_body||the exemption marker does not work from inside a fn body"
-    "exempt_in_body|1|${VIOLATION}|gpu_after_marker_in_body||a marker in one body does not leak onto the next fn"
+    "exempt_in_body|1|${VIOLATION}|gpu_marker_inside_body||a marker among a fn's statements exempts nothing"
+    "exempt_in_body|1|${VIOLATION}|gpu_after_marker_in_body||and does not carry to the next fn"
     "macro_one_line_no_test|1|${VIOLATION}|gpu_cell!{\$name}||a one-line macro declaring no test is stepped over, not latched"
     "tokio_test_gpu|1|${VIOLATION}|tokio_gpu_no_ignore||#[tokio::test] classifies like #[test]"
     "tokio_test_gpu|1|${VIOLATION}|tokio_flavored_gpu_no_ignore||the parameterised #[tokio::test(..)] spelling classifies too"
@@ -154,6 +156,21 @@ case "$list_err" in
         printf '%s\n' "$list_err" | sed 's/^/       | /'
         ;;
 esac
+
+# The inverse of the missing-directory check above: a fixture tree that no case
+# names is never executed and never noticed. Lining up N directories against N
+# case entries by hand-count is exactly the sort of bookkeeping that silently
+# drifts, and an unreferenced fixture is a test someone wrote and nothing runs.
+for dir in "$FIX"/*/; do
+    name="$(basename "$dir")"
+    referenced=0
+    for case in "${CASES[@]}"; do
+        [ "${case%%|*}" = "$name" ] && referenced=1 && break
+    done
+    if [ "$referenced" -eq 0 ]; then
+        fail "$name" "fixture directory is not referenced by any CASES entry"
+    fi
+done
 
 if [ "$FAILED" -ne 0 ]; then
     echo "check-gpu-tests-ignored fixtures: FAIL ($FAILED of $((PASSED + FAILED)))" >&2

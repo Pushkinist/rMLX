@@ -270,10 +270,18 @@ comment are not block delimiters, and counting them is wrong in both directions:
   a rule keyed on "no brace open" latches it forever and hard-fails the whole
   run blaming a `macro_rules!` the file does not contain.
 
-The trailing-comment scan is quote-aware, so a URL in a one-line fn
-(`"http://…"`) is not mistaken for a comment. It does not track raw-string
-hashes or block comments — a `/* … */` spanning an item's opening line is still
-read literally.
+The `;` alternative covers a signature that fits on **one line**. A `where`
+clause pushes the `;` onto a later line, so that declaration still latches and
+its capture never terminates — reported as the fail-closed "cannot read" error.
+That is the right side to fail on, and `trait_where_signature` pins it as loud;
+the diagnostic's `macro_rules!` wording on a file that has none is a known debt.
+
+The trailing-comment scan is string-aware, so neither a URL in a one-line fn
+(`"http://…"`) nor a quote inside a char literal (`b'"'`, which occurs eight
+times in the scanned tree) derails it — the latter would otherwise leave the
+scanner stuck "inside a string" for the rest of the line. It does not track
+raw-string hashes or block comments: a `/* … */` spanning an item's opening line
+is still read literally.
 
 Still out of reach on the macro side: a `macro_rules!` with a **non-brace**
 delimiter (`macro_rules! m ( .. );`). Its name is captured so findings are

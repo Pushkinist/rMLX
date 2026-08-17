@@ -2,12 +2,16 @@
 // ATTRIBUTE block; a copy inside the body must not, or any test could opt
 // itself out by dropping one comment line among its statements.
 //
-// BOTH fns below must be flagged, and the second one is the load-bearing
-// half. The first is protected by the attribute snapshot regardless of the
-// marker rule's guard — its attributes were already captured before the body
-// was read. What the guard actually prevents is the marker LEAKING out of one
-// body into the pending attribute block of the next fn, silently exempting a
-// test that never mentioned it.
+// BOTH fns below must be flagged. Neither is protected by the marker rule's
+// `!in_fn` guard: the first fn's attributes were already snapshotted before
+// its body was read, and the marker cannot carry to the second because the
+// fn-close rule clears the pending attribute block. Deleting that guard was
+// measured to change no output on any input — it is defence in depth, not the
+// mechanism.
+//
+// So what this fixture pins is the BEHAVIOUR, not the guard: a marker sitting
+// among a fn's statements exempts nothing, and does not reach the next fn. If
+// the mechanism is ever reworked, this is the property that must survive.
 
 #[test]
 fn gpu_marker_inside_body() {

@@ -192,14 +192,19 @@
 #       breaks the decision in both directions — a false "balanced" drops the
 #       item's body so a `Device::Gpu` in it is never seen, a false "open"
 #       swallows the rest of the file.
+#
+#       The `;` arm covers a signature that fits on ONE line. A `where` clause
+#       pushes the `;` onto a later line, so such a declaration DOES latch and
+#       its capture never terminates — which surfaces as `U` below. Loud and
+#       fail-closed, but the diagnostic still talks about `macro_rules!`.
 #     * A capture that is still open at a file boundary means the parser lost
 #       the file, so it reports `U` rather than letting the remainder go
 #       unclassified.
 #
-#   The remaining known parse hazard: `bare()` finds the trailing comment with
-#   a quote-aware scan, so a `//` inside a string literal is not mistaken for
-#   one. It does not track raw-string hashes or block comments, so a `/*` … */`
-#   spanning an item's opening line is still read literally.
+#   `bare()` finds the trailing comment with a string-aware scan, so neither a
+#   `//` inside a string literal nor a `"` inside a char literal (`b'"'`)
+#   derails it. Remaining known parse hazards: raw-string hashes, and block
+#   comments — a `/* … */` spanning an item's opening line is read literally.
 #
 # Exit 0 = clean. Exit 1 = violation (or a scan that found nothing to check).
 
@@ -317,11 +322,10 @@ read -r -d '' AWK_DETECT <<'AWK' || true
     # significant character, which is what decides whether an item is
     # self-contained.
     #
-    # The `//` scan is quote-aware. A `//` inside a string literal — a URL is
+    # The `//` scan is string-aware. A `//` inside a string literal — a URL is
     # the everyday case — is not a comment, and cutting there would end the
     # line in mid-string and flip every decision that reads its last
-    # character. Only double quotes are tracked: `//` cannot occur inside a
-    # char literal, while `'` is ambiguous in Rust (lifetimes).
+    # character.
     function bare(s,   i, n, q, c) {
         n = length(s)
         q = 0
@@ -329,6 +333,21 @@ read -r -d '' AWK_DETECT <<'AWK' || true
             c = substr(s, i, 1)
             if (c == "\\" && q) { i++; continue }
             if (c == "\"") { q = !q; continue }
+            if (!q && c == "'") {
+                # A char literal is opaque. The `"` in `'"'` / `b'"'` is not a
+                # string delimiter, and letting it flip the state leaves the
+                # rest of the line "inside a string" — the trailing comment is
+                # then not stripped and every decision that reads the last
+                # significant character flips. Only the exact char-literal
+                # shape is stepped over, so a lifetime (`'a`, `'static`), which
+                # has no closing quote two characters later, is unaffected.
+                if (substr(s, i + 1, 1) == "\\" && substr(s, i + 3, 1) == "'") {
+                    i += 3
+                } else if (substr(s, i + 2, 1) == "'") {
+                    i += 2
+                }
+                continue
+            }
             if (!q && c == "/" && substr(s, i + 1, 1) == "/") {
                 s = substr(s, 1, i - 1)
                 break
