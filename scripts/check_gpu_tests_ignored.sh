@@ -132,12 +132,55 @@
 #     pass `Device::Cpu`, and leave it un-ignored so it keeps running in the
 #     default gate.
 #
-# Also emits a non-fatal WARNING for the converse — a test whose `#[ignore]`
-# claims a Metal context but which never reaches `Device::Gpu`. That is a test
-# that has silently stopped running. It is a warning, not a failure: some
-# ignores are legitimately non-GPU (e.g. "requires mlx runtime"), and a helper
-# in a non-scanned source file (see RESIDUAL) is a legitimate reason a
-# Metal-driving test looks GPU-free to this gate.
+# THE CONVERSE IS FATAL TOO — an `#[ignore]` whose reason claims a Metal
+# context on a test from which no `Device::Gpu` is reachable. Every such test is
+# skipped by `make test` (it is ignored) AND skipped by `make gpu-test` (it is
+# not classified), so it runs nowhere while reading, at both gates, exactly like
+# a test that is covered.
+#
+# It was a non-fatal warning, on the reasoning that some ignores are legitimately
+# non-GPU and that a helper in a non-scanned source file makes a real Metal test
+# look GPU-free here. Both are true and neither is a reason to leave the finding
+# advisory: an advisory channel with two valid outcomes and no way to record
+# which one applies is a channel nothing ever closes. It sat open over six such
+# tests. So the finding now demands a disposition, and there are three:
+#
+#   * the test drives Metal by a route this scanner cannot follow -> declare it
+#     with the `metal-unscanned` marker below;
+#   * the test does not touch the GPU -> drop the `#[ignore]` (and pass
+#     `Device::Cpu`), so it runs in the default gate again;
+#   * the test is ignored for some other reason -> say that reason in the
+#     `#[ignore]` text instead of claiming Metal.
+#
+# The third is a real escape hatch and is stated rather than hidden: this check
+# keys on the ignore reason's WORDING, which is the one place in this gate that
+# does. It has to — there is no shape to key on, that being the whole problem —
+# and the consequence is that a Metal-driving test whose ignore text never says
+# "Metal" or "GPU" is invisible to it.
+#
+# DECLARED METAL ROUTE (`// gpu-test-gate: metal-unscanned`)
+#   The inverse of the exemption below: a line-leading marker in the fn's own
+#   attribute block declaring that the test DOES drive Metal, by a route no
+#   shape in the scanned sources can express. Two such routes exist here:
+#
+#     * an HTTP boundary — the test drives an in-process axum router and the
+#       device is chosen inside `crates/rmlx-server/src/embeddings.rs`, which is
+#       not a scanned file and could not be linked to the test even if it were
+#       (the call goes through a routing table, not a call graph);
+#     * a process boundary — the test spawns `rmlx serve` and the Metal context
+#       belongs to the child.
+#
+#   Effect: the test counts as GPU-touching, so the `#[ignore]` rule bites on it
+#   — deleting the attribute is a violation, which before the marker it was not.
+#   It is NOT emitted to `--list`; see LIST vs ENFORCE. A marker on a test the
+#   scanner CAN see through, and a marker paired with the exemption, are both
+#   hard failures: the first is stale, the second says the test does and does not
+#   drive Metal, and guessing which half to believe is how a marker rots.
+#
+#   Like the exemption, it is opt-in — but not opt-in the way that word usually
+#   means "and therefore forgettable". The fatal rule above is what asks for it:
+#   an `#[ignore]` claiming Metal with nothing to back it fails the gate until
+#   one of the three dispositions is recorded.
 #
 # PER-TEST EXEMPTION (device-as-value false positives)
 #   Detection is by shape: naming `Device::Gpu`. In compute crates that always
@@ -169,6 +212,16 @@
 #   runner's "executed fewer than classified" check. Macro-generated tests are
 #   therefore ENFORCED here and excluded from `--list`; the enforcing run prints
 #   the excluded set so the divergence is stated rather than silent.
+#
+#   A `metal-unscanned` test is excluded for a different reason, and it is a
+#   property of the RUNNER, not of the classifier. `run_gpu_tests.sh` asserts,
+#   per crate, that Metal's shader-validation banner appeared — a crate that
+#   created no Metal device proved nothing and is reported as having run
+#   uninstrumented. Every `metal-unscanned` test in this tree is snapshot-gated
+#   or drives a child process, so a machine without that snapshot would execute
+#   them, watch them all return early, produce no banner, and fail the suite for
+#   a missing model rather than a defect. They are enforced here and listed
+#   nowhere; the excluded set is printed every run alongside the macro one.
 #
 #   That divergence is a real cost and is accepted deliberately for the one
 #   population that has it today, the NIAH long-context cells: they are
@@ -554,6 +607,15 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         attrs = attrs " GATE_EXEMPT"
         next
     }
+    # ── Declared Metal route the scanner cannot follow ──────────────────
+    # The inverse marker: the test DOES drive Metal, across an HTTP or a
+    # process boundary no source shape here can express. Folds into the
+    # pending attribute block on the same terms as the exemption — attaches
+    # to the NEXT fn only, and a copy inside a body declares nothing.
+    !in_fn && /^[[:space:]]*\/\/[[:space:]]*gpu-test-gate:[[:space:]]*metal-unscanned([[:space:]]|$)/ {
+        attrs = attrs " GATE_UNSCANNED"
+        next
+    }
     # ── Comments / doc comments keep the pending attribute block ────────
     /^[[:space:]]*\/\// { next }
 
@@ -769,7 +831,29 @@ read -r -d '' AWK_DETECT <<'AWK' || true
             if (attrs_of[g] !~ /#\[(tokio::)?test[](]/) { continue }
             has_ignore = (attrs_of[g] ~ /#\[ignore/)
             exempt = (attrs_of[g] ~ /GATE_EXEMPT/)
-            if (gpu[g] && !has_ignore && !exempt) {
+            declared = (attrs_of[g] ~ /GATE_UNSCANNED/)
+
+            # Two marker states have no right answer, so both fail closed
+            # rather than this picking one. A marker on a test the reachability
+            # pass CAN see through is stale — its claim is now checkable and
+            # keeping it would hold the test out of `--list` forever. A marker
+            # beside the exemption asserts that the test both does and does not
+            # drive Metal.
+            if (declared && exempt) {
+                printf "U  %s: %s (marked metal-unscanned AND exempt — pick one)\n",
+                    file_of[g], label_of[g]
+                continue
+            }
+            if (declared && gpu[g]) {
+                printf "U  %s: %s (marked metal-unscanned, but Device::Gpu is reachable here)\n",
+                    file_of[g], label_of[g]
+                continue
+            }
+
+            # A declared route counts as GPU-touching for the attribute rule:
+            # deleting the `#[ignore]` from such a test is a violation, which
+            # before the marker existed it was not.
+            if ((gpu[g] || declared) && !has_ignore && !exempt) {
                 printf "V  %s: %s\n", file_of[g], label_of[g]
             }
             # The compliant set: GPU-touching AND ignored. This is exactly the
@@ -788,10 +872,20 @@ read -r -d '' AWK_DETECT <<'AWK' || true
                     printf "T  %s: %s\n", file_of[g], name_of[g]
                 }
             }
+            # A declared route is enforced above but never listed: the runner
+            # asserts a per-crate Metal validation banner, and every test with
+            # this marker is snapshot-gated or drives a child process, so
+            # listing it would fail that assertion on any machine without the
+            # snapshot. Reported, not dropped.
+            if (declared && has_ignore) {
+                printf "N  %s: %s\n", file_of[g], label_of[g]
+            }
             # Converse: an ignore claiming a Metal context on a test that
-            # never reaches one. Warn — the test may have stopped running
-            # (or reaches Metal only via a non-scanned source-file helper).
-            if (!gpu[g] && has_ignore && attrs_of[g] ~ /#\[ignore[^]]*([Mm]etal|GPU)/) {
+            # never reaches one and never declared why. It is skipped by the
+            # default gate (it is ignored) and by the GPU gate (it is not
+            # classified), so it runs nowhere while looking covered at both.
+            if (!gpu[g] && !declared && has_ignore \
+             && attrs_of[g] ~ /#\[ignore[^]]*([Mm]etal|GPU)/) {
                 printf "W  %s: %s\n", file_of[g], label_of[g]
             }
         }
@@ -808,6 +902,7 @@ warnings=""
 gpu_tests=""
 unreadable=""
 macro_generated=""
+declared_unscanned=""
 
 for crate in "${members[@]}"; do
     crate_dir="${REPO_ROOT}/${crate}"
@@ -863,6 +958,7 @@ for crate in "${members[@]}"; do
             "W  "*) warnings="${warnings}  ${line#W  }"$'\n' ;;
             "U  "*) unreadable="${unreadable}  ${line#U  }"$'\n' ;;
             "S  "*) macro_generated="${macro_generated}  ${line#S  }"$'\n' ;;
+            "N  "*) declared_unscanned="${declared_unscanned}  ${line#N  }"$'\n' ;;
             "T  "*) gpu_tests="${gpu_tests}${pkg_name}"$'\t'"${line##*: }"$'\n' ;;
         esac
     done <<< "$out"
@@ -901,6 +997,36 @@ if [ -n "$unreadable" ]; then
     exit 1
 fi
 
+# An `#[ignore]` claiming a Metal context with no reachable `Device::Gpu` and no
+# declared route fails BOTH modes, for the same reason the unreadable case does:
+# such a test is skipped by `make test` because it is ignored and skipped by
+# `make gpu-test` because it is not classified, so it runs nowhere while reading
+# as covered at both gates. This was advisory for a long time and six tests sat
+# in it; an advisory channel with two valid outcomes and no way to record which
+# one applies is a channel nothing ever closes.
+if [ -n "$warnings" ]; then
+    echo "ERROR: #[ignore] claims a Metal context but no Device::Gpu is reachable" >&2
+    echo "       in the scanned roots, and no route was declared:" >&2
+    printf '%s' "$warnings" >&2
+    echo >&2
+    echo "Each of these runs under NO gate: \`make test\` skips it (it is ignored)" >&2
+    echo "and \`make gpu-test\` skips it (it is not classified). Pick the true one:" >&2
+    echo >&2
+    echo "  * it drives Metal through a route this scanner cannot follow — an HTTP" >&2
+    echo "    handler in production source, or a child process — then declare it" >&2
+    echo "    with a line-leading marker in the fn's own attribute block:" >&2
+    echo "      // gpu-test-gate: metal-unscanned  <why the scanner cannot see it>" >&2
+    echo "    It then counts as GPU-touching (the #[ignore] rule bites on it) and" >&2
+    echo "    is deliberately NOT listed for scripts/run_gpu_tests.sh." >&2
+    echo "  * it does not touch the GPU — drop the #[ignore] and pass Device::Cpu," >&2
+    echo "    so it runs in the default gate again." >&2
+    echo "  * it is ignored for some other reason — say THAT reason in the #[ignore]" >&2
+    echo "    text instead of claiming Metal." >&2
+    echo >&2
+    echo "See docs/TESTING.md." >&2
+    exit 1
+fi
+
 # Macro-generated tests are enforced above but excluded from `--list`, so state
 # the divergence every run rather than letting it be a property only the source
 # comments record. Printed BEFORE the `--list` early exit and on stderr: the one
@@ -917,6 +1043,19 @@ if [ -n "$macro_generated" ]; then
     echo >&2
 fi
 
+# The other enforced-but-unlisted population, stated on the same terms and for
+# the same reason: `make gpu-test` calls only `--list`, so an operator reading
+# that run must be told what it does not cover.
+if [ -n "$declared_unscanned" ]; then
+    echo "NOTE: declared-route GPU tests — the #[ignore] rule is ENFORCED on them, but" >&2
+    echo "they are not listed for scripts/run_gpu_tests.sh (that runner asserts a Metal" >&2
+    echo "validation banner per crate, and these are snapshot-gated or drive a child" >&2
+    echo "process, so listing them would fail the suite for a missing model):" >&2
+    printf '%s' "$declared_unscanned" >&2
+    echo "  -> No gate executes these. See docs/TESTING.md for each one's coverage." >&2
+    echo >&2
+fi
+
 if [ "${LIST_MODE}" -eq 1 ]; then
     if [ -z "${gpu_tests}" ]; then
         echo "ERROR: classified 0 GPU-touching #[ignore] tests across ${total_files} files." >&2
@@ -925,18 +1064,6 @@ if [ "${LIST_MODE}" -eq 1 ]; then
     fi
     printf '%s' "${gpu_tests}"
     exit 0
-fi
-
-if [ -n "$warnings" ]; then
-    echo "WARNING (non-fatal): #[ignore] claims a Metal context but no Device::Gpu is reachable in the scanned roots:" >&2
-    printf '%s' "$warnings" >&2
-    echo "  -> If the test truly does not touch the GPU, drop the #[ignore] (and pass" >&2
-    echo "     Device::Cpu) — an ignored CPU test is a test that silently stopped running." >&2
-    echo "  -> But reachability covers only the crate's scanned test roots: a test that" >&2
-    echo "     reaches Metal ONLY through a helper in a non-scanned source file (e.g. a" >&2
-    echo "     kernel-builder in the parent module) is a false positive here and the" >&2
-    echo "     #[ignore] is correct. Verify before removing it." >&2
-    echo >&2
 fi
 
 if [ -n "$violations" ]; then

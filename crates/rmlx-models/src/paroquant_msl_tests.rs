@@ -37,6 +37,12 @@ fn to_f32_vec(a: &Array) -> Vec<f32> {
 /// tests below are what force the compile (and one instantiation each of the
 /// `ROWS_PER_TILE` template int); `make check-metal-compiles` is what catches a
 /// syntax error without a GPU.
+///
+/// `paro_rotate_kernel()` lives in the parent module, a regular source file the
+/// `#[ignore]` gate does not scan, and it names no device — it hands MLX a
+/// source string and takes back a handle. So nothing reachable from this body
+/// spells `Device::Gpu` and the gate is told rather than shown.
+// gpu-test-gate: metal-unscanned  registers an MSL kernel via a non-scanned helper.
 #[test]
 #[ignore = "GPU Metal context — run in isolation: cargo test paroquant_msl -- --ignored --test-threads=1"]
 #[allow(
