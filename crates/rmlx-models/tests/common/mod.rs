@@ -101,10 +101,15 @@ pub struct GoldenModel {
     pub archs: &'static [&'static str],
 }
 
-/// Outcome of probing one source.
+/// Outcome of probing one source. A `Found` carries the architecture read from
+/// the snapshot's `config.json`, so the decision below is a pure function of
+/// data rather than of two loose parallel strings a caller could transpose.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Snapshot {
-    Found(PathBuf),
+    Found {
+        path: PathBuf,
+        arch: String,
+    },
     /// Nothing on this machine points at the snapshot.
     Absent(String),
     /// Configuration is present and wrong.
@@ -114,30 +119,58 @@ pub enum Snapshot {
 /// What the caller must do with a resolution.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Gate {
-    Run(PathBuf),
+    /// `note` carries anything the operator should know about HOW this path was
+    /// reached — chiefly that an override they named was stood down.
+    Run {
+        path: PathBuf,
+        note: Option<String>,
+    },
     Skip(String),
     Fail(String),
 }
 
-/// The files [`run_golden_test`] opens by name. "Found" has to mean "runnable",
-/// or a half-written snapshot resolves and then panics several frames later at
-/// an `expect`. `config.json` alone is not enough: it is the first file a
-/// download writes, so an interrupted one leaves exactly that shape on disk.
-const SNAPSHOT_FILES: [&str; 2] = ["config.json", "tokenizer.json"];
+/// `RMLX_REGEN_GOLDENS` — writes the fixture instead of asserting it.
+pub const REGEN_VAR: &str = "RMLX_REGEN_GOLDENS";
 
-/// A directory is a snapshot when it carries every file the harness consumes.
-fn is_snapshot_dir(dir: &Path) -> bool {
-    SNAPSHOT_FILES.iter().all(|f| dir.join(f).is_file())
+/// True when the harness is recording fixtures rather than checking them.
+pub fn regen_requested() -> bool {
+    std::env::var(REGEN_VAR).is_ok()
 }
 
-/// Name the first required file that is missing, for a diagnosis that says what
-/// to look at rather than just "not a snapshot".
-fn missing_file(dir: &Path) -> &'static str {
-    SNAPSHOT_FILES
-        .iter()
-        .find(|f| !dir.join(f).is_file())
-        .copied()
-        .unwrap_or("(nothing)")
+/// Files every snapshot must carry. Both are opened BY NAME: `config.json` by
+/// [`model_arch`] and `arch::load_model`, `tokenizer.json` by
+/// [`run_golden_test`]'s `Tokenizer::from_file`.
+const REQUIRED_FILES: [&str; 2] = ["config.json", "tokenizer.json"];
+
+/// Weight entrypoints. `rmlx_loader::load_shard_index` tries these two in this
+/// order and errors if neither exists, so exactly one has to be present.
+///
+/// Omitting them is not a theoretical gap: a download writes the small JSON
+/// files first and the multi-GB shards last, so config + tokenizer + no shards
+/// is the *modal* half-written snapshot. Accepting it turned the intended
+/// verdict for a partial download — skip, so a developer without the weights is
+/// not blocked — into a panic several frames later.
+const WEIGHT_ENTRYPOINTS: [&str; 2] = ["model.safetensors.index.json", "model.safetensors"];
+
+/// A directory is a snapshot when every file the harness opens by name is
+/// there. The weight side mirrors `load_shard_index`'s own disjunction, and
+/// uses `exists()` for the same reason it does — this check must never be
+/// stricter than the loader it stands in front of.
+fn is_snapshot_dir(dir: &Path) -> bool {
+    REQUIRED_FILES.iter().all(|f| dir.join(f).is_file())
+        && WEIGHT_ENTRYPOINTS.iter().any(|f| dir.join(f).exists())
+}
+
+/// Name what is missing, so a diagnosis says what to look at rather than just
+/// "not a snapshot".
+fn missing_file(dir: &Path) -> String {
+    if let Some(f) = REQUIRED_FILES.iter().find(|f| !dir.join(f).is_file()) {
+        return (*f).to_owned();
+    }
+    if !WEIGHT_ENTRYPOINTS.iter().any(|f| dir.join(f).exists()) {
+        return "model.safetensors[.index.json]".to_owned();
+    }
+    "(nothing)".to_owned()
 }
 
 /// Probe `RMLX_KV_TEST_MODEL`. `None` when it is unset — an exported-but-empty
@@ -151,7 +184,8 @@ pub fn override_snapshot(single_model: Option<&str>) -> Option<Snapshot> {
     let p = single_model.filter(|p| !p.is_empty())?;
     let path = PathBuf::from(p);
     if is_snapshot_dir(&path) {
-        return Some(Snapshot::Found(path));
+        let arch = model_arch(&path);
+        return Some(Snapshot::Found { path, arch });
     }
     Some(Snapshot::Misconfigured(format!(
         "{SINGLE_MODEL_VAR}={p} is not a runnable snapshot directory (no {} in it)",
@@ -180,7 +214,8 @@ pub fn slug_snapshot(models_root: Option<&str>, slug: &str) -> Snapshot {
     }
     let path = root_path.join(slug);
     if is_snapshot_dir(&path) {
-        return Snapshot::Found(path);
+        let arch = model_arch(&path);
+        return Snapshot::Found { path, arch };
     }
     Snapshot::Absent(format!(
         "{MODELS_ROOT_VAR}={root} does not hold a runnable {slug} (no {} in it); put the \
@@ -189,9 +224,8 @@ pub fn slug_snapshot(models_root: Option<&str>, slug: &str) -> Snapshot {
     ))
 }
 
-/// Decide from both probes and the architecture read off each resolved path.
-/// `over_arch` / `slug_arch` are only consulted for the matching
-/// [`Snapshot::Found`]; pass anything for the others.
+/// Decide from both probes. `regen` is whether the harness is about to WRITE a
+/// fixture rather than check one, which makes the override rules stricter.
 ///
 /// The override wins **only for the golden it can serve**. Pointed at another
 /// architecture it is not a statement about this golden, so resolution falls
@@ -202,24 +236,46 @@ pub fn slug_snapshot(models_root: Option<&str>, slug: &str) -> Snapshot {
 /// developer who most needs these gates.
 ///
 /// Ranking the slug first instead would be wrong in the other direction: it
-/// makes `RMLX_REGEN_GOLDENS=1 RMLX_KV_TEST_MODEL=<path>` record the fixture
-/// from the slug snapshot while silently ignoring the named one.
-pub fn choose(
-    over: Option<Snapshot>,
-    over_arch: &str,
-    slug: Snapshot,
-    slug_arch: &str,
-    model: &GoldenModel,
-) -> Gate {
+/// would make an override the operator DID name lose to the slug even when it
+/// serves this golden.
+///
+/// Two rules keep the fall-through from becoming its own silent hazard:
+///
+/// * Under `regen` a stood-down override is a hard failure. Writing a committed
+///   fixture from a snapshot the operator did not name, while the one they did
+///   name is discarded, is how a golden acquires untraceable provenance — and
+///   running the whole set with one override would give each fixture a
+///   different origin with nothing said about it.
+/// * An override whose `config.json` is present but unreadable (empty `arch`)
+///   fails rather than falling through. Only a *legible, different*
+///   architecture is a statement about another golden; an unparseable config in
+///   a directory the operator named is a broken pointer, and the slug branch
+///   already treats the same empty string that way.
+pub fn choose(over: Option<Snapshot>, slug: Snapshot, model: &GoldenModel, regen: bool) -> Gate {
     let expected = model.archs;
     let mut stood_down = None;
     match over {
-        Some(Snapshot::Found(path)) => {
-            if expected.contains(&over_arch) {
-                return Gate::Run(path);
+        Some(Snapshot::Found { path, arch }) => {
+            if expected.contains(&arch.as_str()) {
+                return Gate::Run { path, note: None };
+            }
+            if arch.is_empty() {
+                return Gate::Fail(format!(
+                    "{SINGLE_MODEL_VAR}={} has no readable architectures[0] in its config.json",
+                    path.display()
+                ));
+            }
+            if regen {
+                return Gate::Fail(format!(
+                    "{SINGLE_MODEL_VAR}={} is arch \"{arch}\", which this golden does not cover, \
+                     and {REGEN_VAR} is set. Refusing to write the {} fixture from a snapshot you \
+                     did not name — re-run the regen against the golden this model serves.",
+                    path.display(),
+                    model.slug
+                ));
             }
             stood_down = Some(format!(
-                "{SINGLE_MODEL_VAR} names arch \"{over_arch}\", which this golden does not cover"
+                "{SINGLE_MODEL_VAR} names arch \"{arch}\", which this golden does not cover"
             ));
         }
         // `override_snapshot` reports unset as `None`, so either other outcome
@@ -229,12 +285,15 @@ pub fn choose(
     }
 
     match slug {
-        Snapshot::Found(path) => {
-            if expected.contains(&slug_arch) {
-                return Gate::Run(path);
+        Snapshot::Found { path, arch } => {
+            if expected.contains(&arch.as_str()) {
+                return Gate::Run {
+                    path,
+                    note: stood_down,
+                };
             }
             Gate::Fail(format!(
-                "{} (slug {}) has arch \"{slug_arch}\", not one of {expected:?}",
+                "{} (slug {}) has arch \"{arch}\", not one of {expected:?}",
                 path.display(),
                 model.slug
             ))
@@ -252,7 +311,14 @@ pub fn choose(
 /// invocation: it is the step that makes a wrong pointer visible at all.
 pub fn apply(gate: Gate, test_name: &str) -> Option<PathBuf> {
     match gate {
-        Gate::Run(path) => Some(path),
+        Gate::Run { path, note } => {
+            // A resolution that quietly ignored something the operator named is
+            // exactly what must not pass in silence.
+            if let Some(note) = note {
+                eprintln!("NOTE {test_name}: {note}; using {} instead", path.display());
+            }
+            Some(path)
+        }
         Gate::Skip(why) => {
             eprintln!("SKIP {test_name}: {why}");
             None
@@ -310,17 +376,9 @@ pub fn skip_if_arch_mismatch(model_dir: &Path, test_name: &str, expected: &[&str
 pub fn model_for(model: &GoldenModel, test_name: &str) -> Option<PathBuf> {
     let single = std::env::var(SINGLE_MODEL_VAR).ok();
     let root = std::env::var(MODELS_ROOT_VAR).ok();
-
     let over = override_snapshot(single.as_deref());
     let slug = slug_snapshot(root.as_deref(), model.slug);
-    let arch_of = |s: &Snapshot| match s {
-        Snapshot::Found(path) => model_arch(path),
-        _ => String::new(),
-    };
-    let over_arch = over.as_ref().map(&arch_of).unwrap_or_default();
-    let slug_arch = arch_of(&slug);
-
-    apply(choose(over, &over_arch, slug, &slug_arch, model), test_name)
+    apply(choose(over, slug, model, regen_requested()), test_name)
 }
 
 /// Number of decode tokens to compare. 32 is enough to catch a divergence
@@ -448,7 +506,7 @@ pub fn run_golden_test(fixture_tag: &str, kv_quant: KvQuant, model_path: &Path) 
 
     let fixture_path = fixtures_dir().join(format!("{fixture_tag}.golden.txt"));
 
-    if std::env::var("RMLX_REGEN_GOLDENS").is_ok() {
+    if regen_requested() {
         write_golden(&fixture_path, fixture_tag, &kv_quant, &token_ids, &decoded);
         eprintln!(
             "[{fixture_tag}] WROTE golden ({} ids, kv={kv_quant}) -> {}\n  decoded: {decoded:?}",

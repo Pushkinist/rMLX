@@ -315,31 +315,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wrong pointer reports success without asserting anything, and a mistyped root
   disarms all five gates at once.
 
-  "Runnable" means every file the harness opens by name — `config.json` **and**
-  `tokenizer.json`. `config.json` alone is the first file a download writes, so
-  accepting it let an interrupted transfer resolve and then panic several frames
-  later at an `expect`, which also inverted the intended asymmetry: a fully
-  missing directory was a benign skip while a half-present one was fatal.
+  "Runnable" means every file the harness opens by name: `config.json`,
+  `tokenizer.json`, and one of `model.safetensors.index.json` /
+  `model.safetensors` — the same disjunction `rmlx_loader::load_shard_index`
+  tries, mirrored so the check cannot drift from the loader it stands in front
+  of. Checking only the JSONs missed the *modal* half-written snapshot, because
+  a download writes the small files first and the multi-GB shards last; that
+  shape resolved as runnable and panicked inside `load_shard_index`, inverting
+  the intended asymmetry in which a fully missing directory is a benign skip and
+  a half-present one was fatal.
+
+  Recording is stricter than checking. With `RMLX_REGEN_GOLDENS` set, an
+  override pointed at another architecture is a hard failure rather than a
+  fall-through: writing a committed fixture from a snapshot the operator did not
+  name, while discarding the one they did, gives that golden untraceable
+  provenance, and regenerating the whole set under one override would give each
+  fixture a different origin silently. On the read path the fall-through is now
+  announced (`NOTE <test>: … using <path> instead`) instead of being dropped.
+  An override whose `config.json` is present but unparseable fails rather than
+  falling through — only a legible, *different* architecture is a statement
+  about another golden, and the slug branch already treated the same empty
+  string as fatal.
 
   `crates/rmlx-models/tests/common/snapshot_tests.rs` pins the whole table
-  weights-free (21 cases): both probes, every arm of the choice including the
-  arch fall-through, the empty-variable spelling of "unset", the three
-  partial-snapshot shapes, and the decision-to-return mapping with a
-  `#[should_panic]` case over the `Fail` edge. Verified by mutation — ranking the
-  slug first, deleting the fall-through, accepting a config-only directory,
-  demoting a bad root to absence, and making the return mapping swallow `Fail`
+  weights-free (26 cases): both probes, every arm of the choice including the
+  arch fall-through and its regen-time refusal, the empty-variable spelling of
+  "unset", each partial-snapshot shape, both weight entrypoints, and the
+  decision-to-return mapping with a `#[should_panic]` case over the `Fail` edge.
+  One case builds a directory from the harness's own required-file constants and
+  asserts every path the harness opens *by name* — transcribed from the call
+  sites in `rmlx-loader` and `run_golden_test`, not from the constants — is
+  present, so an under-specified constant fails there instead of being ratified.
+  Verified by mutation: ranking the slug first, deleting the fall-through,
+  accepting a config-only directory, dropping the weight requirement, emptying
+  the weight-entrypoint list, demoting a bad root to absence, removing the
+  regen-time refusal, dropping the stood-down note, letting an unreadable
+  override config fall through, and making the return mapping swallow `Fail`
   each turn only the cases that claim them red.
 
-  Two Makefile defects fed this and are fixed with it. `model-check-full`
+  Three Makefile defects fed this and are fixed with it. `model-check-full`
   guarded `MODEL` with `test -n`, which could never fire because `MODEL` has an
   unconditional default; on a machine lacking that snapshot the target
   fabricated a path and forwarded it as `RMLX_KV_TEST_MODEL`, which the harness
-  correctly reads as an operator naming a snapshot. It now guards the path. And
-  `RMLX_O_MODELS_ROOT` was exported unconditionally, including a repo-local
+  correctly reads as an operator naming a snapshot. It now guards the path. It
+  also ran four of the five goldens — `medgemma_golden_tokens` was missing from
+  the list.
+
+  And `RMLX_O_MODELS_ROOT` was exported unconditionally, including a repo-local
   `models/` fallback that need not exist, handing every child a root that was
-  never there; it is now exported only when it resolves. `model-check-full` also
-  ran four of the five goldens — `medgemma_golden_tokens` was missing from the
-  list.
+  never there. It is now exported when an operator **named** one — through
+  `.env`, a shell export or the command line — and, for the invented fallback
+  only, when that directory exists. The distinction matters because `.env` is
+  `-include`d: its values are make variables, not environment ones, so they
+  reach a child only through this `export`. Gating the export on the path
+  existing would have suppressed it exactly when the path was wrong, and the
+  child would have reported "no snapshot configured" and skipped green at the
+  one operator who did configure something.
 
   `bonsai_8b_mixed_k8g64_v4g64.golden.txt` is **not** regenerated here. It has
   not been touched since the 0.1.0 squash and is under suspicion of being stale;

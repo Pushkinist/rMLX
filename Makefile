@@ -25,16 +25,30 @@ REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 # Fallback is a repo-local ./models dir (gitignored) — drop snapshots there to
 # run with zero config. No machine-specific path is baked in.
 O_MODELS_ROOT ?= $(RMLX_O_MODELS_ROOT)
-ifeq ($(strip $(O_MODELS_ROOT)),)
+# Did an operator NAME a root — via .env, a shell export, or the command line —
+# or are we about to invent one? Captured before the fallback overwrites it.
+O_MODELS_ROOT_NAMED := $(strip $(O_MODELS_ROOT))
+ifeq ($(O_MODELS_ROOT_NAMED),)
 O_MODELS_ROOT := $(REPO_ROOT)/models
 endif
-# Export only a root that exists. Exporting the fallback unconditionally handed
-# every child a path that was never there, which readers cannot distinguish from
-# a root the operator meant — the golden-token harness treats a set-but-absent
-# root as a misconfiguration, and a fabricated one would fail every golden on a
-# machine that simply has no models. An operator's own export still reaches the
-# children untouched, so a genuinely wrong value is still reported as wrong.
-ifneq ($(wildcard $(O_MODELS_ROOT)/.),)
+
+# A named root is forwarded VERBATIM, wrong or not, and only the invented
+# fallback is gated on existing.
+#
+# The distinction is load-bearing because `.env` is `-include`d: values from it
+# are make variables, NOT environment variables, so they reach a child only
+# through this `export`. Gating the export on the path existing would therefore
+# suppress it precisely when the path is wrong — the child would see nothing
+# set, report "no snapshot configured", and skip green at the one operator who
+# did configure something. Forwarding it keeps a typo reaching the readers that
+# can call it a typo.
+#
+# The fallback is the opposite case: nobody named it, so handing children a
+# repo-local `models/` that need not exist manufactures a configuration no one
+# chose, and readers cannot tell it from a deliberate one.
+ifneq ($(O_MODELS_ROOT_NAMED),)
+export RMLX_O_MODELS_ROOT := $(O_MODELS_ROOT)
+else ifneq ($(wildcard $(O_MODELS_ROOT)/.),)
 export RMLX_O_MODELS_ROOT := $(O_MODELS_ROOT)
 endif
 
