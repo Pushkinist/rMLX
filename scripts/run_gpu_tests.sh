@@ -18,11 +18,18 @@
 #   against cannot happen.
 #
 # WHICH TESTS
-#   Exactly the compliant set from `check_gpu_tests_ignored.sh --list` —
-#   `#[test]` fns that reach `Device::Gpu` AND carry `#[ignore]`. Deriving the
-#   population from the enforcing gate's own classifier is the point: a second,
-#   hand-maintained list would drift, and the rule would end up mandating
-#   `#[ignore]` on tests this runner never visits.
+#   Exactly the compliant set from `check_gpu_tests_ignored.sh --list` — the
+#   NAMED `#[test]` fns that reach `Device::Gpu` AND carry `#[ignore]`. Deriving
+#   the population from the enforcing gate's own classifier is the point: a
+#   second, hand-maintained list would drift, and the rule would end up
+#   mandating `#[ignore]` on tests this runner never visits.
+#
+#   "Named" is the one exclusion, and it is structural: a macro-generated test
+#   has no fn name until the compiler expands it, so no substring filter can
+#   select it and the coverage check below would read the whole crate as
+#   under-matched. Those tests are still ENFORCED by the classifier, at their
+#   `macro_rules!` body; the enforcing run prints the excluded set. See
+#   docs/TESTING.md.
 #
 #   It deliberately does NOT run every `#[ignore]` test. Plenty are ignored for
 #   reasons that have nothing to do with Metal — live network access, a missing

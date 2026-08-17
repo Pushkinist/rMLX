@@ -214,10 +214,22 @@ Hard rules:
   `make check-gpu-tests-ignored` enforces this across **every workspace member
   crate** (from `Cargo.toml`), scanning `src/**/{*_tests.rs,tests.rs}` and
   `tests/*.rs`; it keys on shape (does the test reach `Device::Gpu`?), never on
-  the ignore reason's text. A pure device-*policy* test (passes `Device::Gpu`
+  the ignore reason's text. "Test" covers `#[test]` and `#[tokio::test]` (with
+  or without arguments). A pure device-*policy* test (passes `Device::Gpu`
   as a plain value, never dispatches Metal) opts out **per fn** with a
   line-leading `// gpu-test-gate: exempt` marker in its own attribute block —
-  scoped to that one `#[test]`, not the whole file. See `docs/TESTING.md`.
+  scoped to that one `#[test]`, not the whole file; **inside a `macro_rules!`
+  body that one `#[test]` is every cell the macro generates**, so audit such a
+  marker against all its invocations. A **macro-generated** test is enforced at
+  its `macro_rules!` body (one body governs every cell it emits), and a body the
+  scanner cannot read back — an assembled fn name, a whole macro on one line, an
+  item whose brace never closes — is a hard failure rather than a clean scan;
+  those cells are deliberately excluded from `--list` / `make gpu-test`, which
+  every run prints. A proc-macro-generated test, and a `macro_rules!` with a
+  non-brace delimiter, remain outside the fail-closed net — neither exists in
+  the tree. `make check-gpu-tests-ignored-fixtures` pins the gate's recall in
+  both directions, asserting each case's failure *reason* and not just its exit
+  code. See `docs/TESTING.md`.
 - **Advisory: `make file-size-report`** prints files >1000 LOC. Non-failing.
   Also runs at the end of `make ci` (advisory, non-blocking).
 - **Advisory: `make target-size-report`** prints `target/` size and, past a
