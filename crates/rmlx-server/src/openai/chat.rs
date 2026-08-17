@@ -849,6 +849,7 @@ pub(crate) async fn chat_completions(
                     .unwrap_or_default();
                 tracing::info!(
                     model_id = %req.model,
+                    request_id = %rid,
                     tool_choice = ?norm_tool_choice,
                     vocab_size = tk.get_vocab_size(true),
                     eos_ids = ?eos_ids,
@@ -909,6 +910,7 @@ pub(crate) async fn chat_completions(
                     {
                         tracing::info!(
                             model_id = %req.model,
+                            request_id = %rid,
                             schema_name = %name,
                             strict,
                             vocab_size = tk.get_vocab_size(true),
@@ -951,6 +953,7 @@ pub(crate) async fn chat_completions(
                         // A6.3: schema-less json_object syntax constraint.
                         tracing::info!(
                             model_id = %req.model,
+                            request_id = %rid,
                             vocab_size = tk.get_vocab_size(true),
                             eos_ids = ?eos_ids,
                             "A6.3: building JsonObjectConstraint (TokenBytesMap precompute)"
