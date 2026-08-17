@@ -64,6 +64,99 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Token selection resolved ties differently on the host than on the device,
+  and `top_p` / `top_k` resolved them differently on every call.** MLX `argmax`
+  resolves a tie to the lowest token id. The host greedy path
+  (`argmax_with_penalties`, taken whenever a repetition/presence/frequency
+  penalty or a `logit_bias` is set at `temperature == 0`) used
+  `Iterator::max_by`, which returns the *last* maximum — and which also let a
+  `NaN` reset the running best, since `partial_cmp` is `None` against one. So
+  adding a penalty to an otherwise greedy request could change the token on a
+  tied row, and an all-`-inf` (fully constraint-masked) row returned the last id
+  instead of id 0. `filter_top_k`, `filter_top_p` and `compute_top_logprobs`
+  each left their tied order to a sort's pivot choice or to a selection's swaps.
+  All four now use one rule — equal values rank by lowest token id — so
+  `top_k = 1` is the argmax on a tied row, the `top_p` nucleus is the lowest
+  tied ids rather than a non-contiguous scatter (a 64-wide row with one 0.4 and
+  63 identical tail values at `top_p 0.5` kept `{0, 29, 54..63}`), and logprob
+  rank 0 agrees with the device argmax. `top_p` matters most: it ships set in
+  several `generation_config.json` snapshots, so it is on by default on the
+  served path.
+
+  Ties are not exotic. On a realistic 262144-wide BF16-derived softmax row,
+  259416 of the 262143 adjacent pairs are exactly equal — 8 mantissa bits give
+  0.125 spacing at logit magnitude 16.
+
+  Neither filter uses a comparator any more, which also removes a pre-existing
+  crash: **a `NaN` probability could abort the decode step.** Folding an
+  unordered pair to `Equal` makes a `NaN` compare equal to everything, which is
+  intransitive, and `sort_unstable_by` panics with "user-provided comparison
+  function does not correctly implement a total order" — reproduced on the
+  shipped comparator. Both filters now order integers under the standard `Ord`,
+  so no comparator exists to be intransitive.
+
+  They do it differently because they have different jobs, and this is also a
+  **speedup on both**. `filter_top_k` partitions (`select_nth_unstable`) over
+  packed `u64` keys — it needs a set, not an order, which is what mlx-lm's
+  `argpartition` says too. `filter_top_p` needs the full ascending order for its
+  cumulative sum, so it sorts the *values alone* and applies the id rule once,
+  to the single tied group the cut lands in; packing the id into that sort key
+  would make every key distinct and destroy the equal-element partition a
+  tie-dense row hands the sort, which measured *slower* than no tie rule at all.
+  At a 262144-token vocabulary, best-of-9 across three runs:
+
+  | Filter | fixture | before | after |
+  |---|---|---:|---:|
+  | `top_k` (k=64) | tie-dense | 2.02–2.13 ms | 0.30–0.33 ms |
+  | `top_k` (k=64) | all-distinct | 3.67–4.31 ms | 0.32–0.41 ms |
+  | `top_p` (0.95) | tie-dense | 2.02–2.06 ms | 1.31–1.34 ms |
+  | `top_p` (0.95) | all-distinct | 3.73–4.32 ms | 2.17–2.68 ms |
+
+  The rank keys use the IEEE total-order flip rather than the raw bit pattern,
+  so they order every `f32`. The raw pattern is monotone only over non-negative
+  values; `probs` are non-negative today, but the failure mode if that stopped
+  holding is a silently wrong token — `-0.0` outranks every positive, so
+  `top_k = 1` on `[-0.0, 0.5, 0.25]` would zero the real maximum and keep
+  `-0.0` — and `release-perf` disables debug assertions, so an assert would not
+  catch it.
+
+  The pre-existing tests could not reach any of this: every row they used had a
+  unique maximum.
+- **The sampler emitted a constant token, silently, on a `NaN` logits row.**
+  `softmax_scaled` propagated the `NaN` into `probs`; `renormalise` then no-oped
+  (`total > 0.0` is false on `NaN`), `sample_inverse_cdf`'s `total <= 0.0` guard
+  was also false, its `cum > target` never fired, and it returned `last_nonzero`
+  — the same id on every step, **independent of the RNG**, with the request
+  reporting success. Measured on a 16-wide row with one `NaN`: a constant token
+  for every seed tried, against a varied healthy control; with `top_k = 1` the
+  `NaN` took the only surviving slot and the stream collapsed to id 0.
+
+  `softmax_scaled` now returns `Err` when the exponentials do not sum to a
+  finite value, which happens exactly when a logit is `NaN` or `+inf`. This is
+  the decode-step half of the rule the prefill guard already enforces, and it
+  has to live here because that guard is a *prefill* guard: on every
+  test-target architecture it runs once before the loop and never again, so
+  nothing downstream reported a `NaN` arriving at decode step 300. The check is
+  free — `sum` is already computed. Greedy deliberately does **not** refuse such
+  a row: it mirrors the device reduction, which skips `NaN` and returns the
+  largest real logit, and erroring there would re-create the host/device split
+  the tie contract exists to close.
+- **An all-`false` constraint mask would produce a stuck stream instead of an
+  error.** No token satisfies the grammar, so every token the selection could
+  return violates it — and because the engine state that produced the empty mask
+  persists, the same arbitrary token would be emitted for the rest of the
+  generation while the request reported success. All three mask-accepting entry
+  points (`apply_mask_argmax`, `argmax_with_penalties`, `sampling_distribution`)
+  now return `Err`. Logging instead would not have worked: the check sits on the
+  per-token decode path, so a `warn!` fires once per emitted token and, at a few
+  hundred bytes a line, evicts the whole log directory under `RMLX_LOG_CAP_MB`
+  within hours — deleting the evidence it exists to provide. This guard is
+  **unit-tested only and has no demonstrated production trigger**: the
+  all-`false` state was not reachable through the HTTP surface (`{"enum": []}`
+  is rejected at schema parse with HTTP 400 before a mask exists, and byte-level
+  BPE means exotic `const` / single-`enum` values never starve the mask). The
+  constraint engine does engage, so the path is live; the empty-mask state is a
+  future constraint-engine defect being pre-empted, not an observed one.
 - **Mixed / RotK decode produced wrong output above 8 192 context tokens.** The
   V side of `mixed_quantized_sdpa` diverted to a separate MSL kernel
   (`sparse_v_weighted_sum`) once the cache held 8 192 tokens or more. That

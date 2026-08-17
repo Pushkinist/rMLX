@@ -127,13 +127,187 @@ Three sub-cases refine the greedy path:
 |---|---|
 | No constraint, no penalties | Pure GPU `argmax` |
 | Constraint mask, no penalties | `apply_mask_argmax` — additive `-inf` bias on GPU, then `argmax` |
-| No constraint, penalties active | `argmax_with_penalties` — GPU→host, penalties, host argmax |
+| Penalties active, with or without a constraint | `argmax_with_penalties` — GPU→host, mask, penalties, host argmax |
 
 `apply_mask_argmax` builds a F32 bias buffer on the host (0.0 for allowed,
 `-inf` for forbidden), wraps it as a `[1, vocab]` MLX array, adds it to the
 logits (GPU op, promotes BF16 to F32 automatically), then calls `argmax`.
 Overhead versus unconstrained: approximately 0.05 ms host-side bias fill for
 a 262K-token vocabulary.
+
+#### Tie-break contract
+
+**Selection and filtering resolve an exact tie to the lowest token id, on the
+host and on the device alike.** MLX's `argmax` reduces with a strict `>`, so an
+equal value never displaces the earlier index; the host scan in
+`argmax_with_penalties` (`host_argmax`) is written to mirror it. Three
+consequences follow from the same rule and are pinned by tests:
+
+- equal logits → lowest id,
+- a `NaN` never displaces a real maximum,
+- an all-`-inf` row (every token forbidden) yields id 0.
+
+The rule matters because the three greedy sub-cases above must be
+interchangeable: which one a request lands in is decided by whether a
+constraint or a penalty happens to be set, and that must never change the
+token on a row where the top logits tie. `Iterator::max_by` returns the *last*
+maximum and so cannot be used here.
+
+Ties are not exotic — see the measurement under
+[Host selection is not bit-identical to the GPU argmax](#host-selection-is-not-bit-identical-to-the-gpu-argmax):
+on a realistic 262144-wide BF16-derived softmax row, 259416 of 262143 adjacent
+pairs are exactly equal.
+
+**The primary evidence for the device half of the rule is the GPU test
+`mlx_argmax_breaks_ties_to_lowest_index_gpu`**, which is mutation-verified: it
+goes red when the rule is inverted, so it is a gate that can actually fail.
+
+A census of real streams **corroborates** it. Two pure-GPU greedy 512-token
+generations contained exact top-2 ties at 2 of 275 steps on Ternary-Bonsai-8B
+(steps 70, 253) and at 4 of 200 on gemma-4-e2b (steps 29, 69, 108, 132). The
+device emitted the **lower** tied id in every one — **6 of 6**, zero exceptions.
+Step 132 of the gemma run is the divergence analysed under
+[Host selection is not bit-identical to the GPU argmax](#host-selection-is-not-bit-identical-to-the-gpu-argmax).
+
+Read that as corroboration, not as the basis of the contract. Six tied steps
+from two runs on a single prompt is a small sample, and every tie in it comes
+from the same pair of greedy streams. What it adds is that the rule holds on
+real logits, which a fixture cannot show; it does not carry the contract alone.
+
+**Scope.** The rule covers everything that selects or filters a token:
+
+| Site | Rule |
+|---|---|
+| `argmax` / `apply_mask_argmax` (device) | equal logits → lowest id (MLX's own reduction) |
+| `argmax_with_penalties` (host greedy) | mirrors it via `host_argmax` |
+| `filter_top_k` | equal probabilities → lowest ids survive the cut, so `top_k = 1` is the argmax on tied rows too |
+| `filter_top_p` | equal probabilities → lowest ids survive the nucleus |
+| `compute_top_logprobs` | equal logits → ascending id, so rank 0 is the token `argmax` would pick |
+
+It does **not** cover the inverse-CDF draw: a categorical sample from a tied
+distribution is supposed to be random, and forcing it to the lowest id would
+make `temperature > 0` biased.
+
+Neither filter uses a comparator. Folding an unordered `NaN` pair to `Equal`
+makes a `NaN` compare equal to everything, which is intransitive, and
+`sort_unstable_by` may detect that and panic with "user-provided comparison
+function does not correctly implement a total order" — mid-decode, aborting the
+step. Adding an id tiebreak on top widens the window rather than closing it.
+Both filters order integers under the standard `Ord` instead, so no comparator
+exists to be intransitive.
+
+They do it differently, because the two have different jobs:
+
+- `filter_top_k` **partitions** `select_nth_unstable` over packed `u64` keys
+  (inverted total-order bits above the token id). It needs a set, not an order,
+  which is what mlx-lm's `argpartition` says too.
+- `filter_top_p` needs the full ascending order for the cumulative sum, so it
+  sorts the **values alone** and applies the id rule once, to the single tied
+  group the cut lands in. Packing the id into the sort key would make every key
+  distinct and destroy the equal-element partition that a tie-dense row hands
+  the sort — that formulation is *slower* than no tie rule at all.
+
+Measured at a 262144-token vocabulary (best-of-9, three process runs), against
+the index sorts these replace:
+
+| Filter | fixture | previous | now |
+|---|---|---:|---:|
+| `top_k` (k=64) | tie-dense (1233 distinct) | 2.02–2.13 ms | 0.30–0.33 ms |
+| `top_k` (k=64) | all-distinct | 3.67–4.31 ms | 0.32–0.41 ms |
+| `top_p` (0.95) | tie-dense | 2.02–2.06 ms | 1.31–1.34 ms |
+| `top_p` (0.95) | all-distinct | 3.73–4.32 ms | 2.17–2.68 ms |
+
+So pinning the tie order is a net speedup on every *served* distribution
+measured, not a cost to be justified. Details on `rank_key_desc` and
+`total_order_bits` in `sampler.rs`.
+
+**Two shapes are marginally slower**, and neither is a distribution a model
+produces:
+
+| Shape | before | after |
+|---|---:|---:|
+| Perfectly uniform row (every probability identical) | 0.27 ms | 0.40 ms |
+| Heavily constraint-masked row (nearly all mass at `0.0`) | 0.419 ms | 0.474 ms |
+
+Both are cases where the sort it replaces gets a near-free equal-element
+partition over one or two distinct values. The uniform row is also the only
+shape where `filter_top_p`'s `tied` vector grows to the full vocabulary — on a
+realistic tie-dense row it holds 808 entries (6 KiB), and on the masked row one.
+
+The keys use the IEEE total-order flip rather than the raw bit pattern, so they
+order every `f32` including negatives and `-0.0`. The raw pattern is monotone
+only over non-negative values, and `probs` are non-negative today — but the
+failure mode if that stopped holding is a silently wrong token (`-0.0` outranks
+every positive, so `top_k = 1` would keep it and zero the real maximum), and
+`release-perf` disables debug assertions, so an assert would not catch it.
+
+**Where MLX does not match itself.** MLX seeds its CPU reduction with element 0
+and its Metal reduction with `-inf`, so a `NaN` at index 0 returns 0 on CPU and
+the first real maximum on Metal. No host rule can match both. `host_argmax`
+follows Metal, which is the production stream; the CPU-stream unit tests avoid
+that one shape. Everywhere else the two MLX backends agree with each other and
+with `host_argmax`.
+
+That seeding difference is also why the CPU tests are not sufficient. Three
+`#[ignore]`d `Device::Gpu` mirrors re-run the contract on Metal, one per claim:
+equal-logits-lowest-id, `NaN`-never-displaces, and the all-`-inf` row. The last
+carries the most weight — it is the only shape where the `-inf` seed is never
+displaced, so the answer is a property of the reduction's *seeding* rather than
+of its comparisons, and its CPU test **cannot fail** (MLX's CPU backend returns
+0 by construction whatever Metal does). Until that mirror has run, "an all-`-inf`
+row yields id 0" is a claim about Metal taken from reading MLX's kernel, not a
+measured one. It is no longer reachable through a constraint mask — that case
+errors — but `host_argmax` still has to answer.
+
+### Rows the sampler refuses
+
+Two inputs are defects rather than modes, and both now return `Err` on the
+channel the decode loop already propagates.
+
+**An all-`false` constraint mask.** No token satisfies the grammar, so every
+token the selection could return violates it. Returning one anyway is the worst
+option: the engine state that produced the empty mask is persistent, so the
+stream would emit the same arbitrary token (id 0) for the rest of the generation
+while the request reports success. Logging instead is no better — the check sits
+on the per-token decode path, so a `warn!` would fire once per emitted token
+and, at a few hundred bytes a line, evict the whole log directory under
+`RMLX_LOG_CAP_MB` within hours, deleting the evidence it exists to provide. All
+three mask-accepting entry points (`apply_mask_argmax`,
+`argmax_with_penalties`, `sampling_distribution`) refuse it.
+
+**That guard is unit-tested only; it has no demonstrated production trigger.**
+An attempt to construct an all-forbidden mask through the HTTP surface did not
+find one. `{"enum": []}` is rejected at schema parse with HTTP 400, before any
+mask is built; and because the tokenizer is byte-level BPE, exotic `const` or
+single-`enum` values still leave a byte that continues them, so they never
+starve the mask either. The constraint engine itself does engage on these
+requests, so the guarded path is live — but the all-`false` state was not
+reachable from outside. Read the guard as a defence against a future
+constraint-engine defect, proven by construction in tests and by argument from
+the code path, not as a reproduction of an observed served failure.
+
+**A non-finite logits row, on the sampling path.** `softmax_scaled` errors when
+the exponentials do not sum to a finite value, which happens exactly when a
+logit is `NaN` or `+inf`. This is the decode-step half of the rule the prefill
+guard already enforces, and it has to live here because that guard is a
+*prefill* guard: on every test-target architecture it runs once before the loop
+and never again, so nothing downstream reports a `NaN` arriving at decode step
+300. The check is free — `sum` is already computed.
+
+Sampling such a row is silent, not degraded: the `NaN` reaches `probs`,
+`renormalise` no-ops (`total > 0.0` is false on `NaN`), `sample_inverse_cdf`'s
+`total <= 0.0` guard is also false, its `cum > target` never fires, and it
+returns `last_nonzero` — the same id every step, **independent of the RNG**.
+Measured on a 16-wide row with one `NaN`: a constant token for every seed tried,
+against a varied healthy control.
+
+**Greedy deliberately does not refuse a `NaN` row.** It mirrors the device
+reduction, which skips `NaN` and returns the largest real logit; erroring there
+would re-create the host/device split this contract exists to close, since the
+pure-GPU `argmax` cannot refuse anything without an extra per-token reduction.
+The asymmetry is pinned by a test. The sampling path refuses because its failure
+mode is a constant stream; the greedy path does not because its answer is the
+device's.
 
 ### Temperature scaling and softmax
 
@@ -171,6 +345,22 @@ Tokens below the threshold go to 0.0. No-op unless `0 < top_p < 1`.
 The ascending-sort + inclusive-cumsum direction is exact mlx-lm parity and
 is not interchangeable with descending order.
 
+Among equal probabilities the **lowest ids** survive the cut — the same
+lowest-id-wins rule the device `argmax` and `top_k` use. Unlike `top_k`, this
+filter is on by default on the served path: several `generation_config.json`
+snapshots ship a `top_p`. Without the rule the survivor set is an artefact of
+the sort's pivot choice — on a row of 64 with one 0.4 and 63 identical tail
+values at `top_p = 0.5`, the unordered version keeps `{0, 29, 54..63}`, id 29
+surviving while ids 30..53 are zeroed from a bit-identical value.
+
+The *number* of survivors is unaffected by the rule: probabilities are
+non-negative, so the drop set is a prefix of the ascending order, and every
+member of a tied group contributes the same value to the cumulative sum. Only
+*which* members are dropped depends on the order within a group. That is what
+lets the implementation sort the values alone — keeping the equal-element
+partition a tie-dense row hands the sort — and then split just the one tied
+group the cut lands in, dropping its highest ids.
+
 ### Min-p truncation
 
 Applied after top-p. Mirrors mlx-lm `apply_min_p` (`sample_utils.py`
@@ -192,9 +382,15 @@ the threshold so no special floor-of-1 case is needed. No-op when
 Applied after min-p. Mirrors mlx-lm `apply_top_k` (`sample_utils.py`
 L130–151).
 
-Keep exactly the `k` highest-probability tokens; set the rest to 0.0. Ties
-are broken by index rank (descending probability sort, argpartition
-semantics). No-op when `k == 0` or `k >= vocab`.
+Keep exactly the `k` highest-probability tokens; set the rest to 0.0. No-op
+when `k == 0` or `k >= vocab`.
+
+Equal probabilities are ranked by **ascending token id**, so a cut that falls
+inside a tied group keeps the lowest ids — the same rule the device `argmax`
+uses, which is what makes `top_k = 1` reduce to greedy on a tied row as well
+as on an untied one. mlx-lm's `argpartition` leaves the tied order
+unspecified; rMLX pins it rather than inheriting whatever the sort's pivot
+choice produces.
 
 ### Renormalisation
 
@@ -496,27 +692,98 @@ Reading it:
 
 ### Host selection is not bit-identical to the GPU argmax
 
-At `--temperature 0.0001` the host categorical sampler is arithmetically an
-argmax (every non-maximal logit underflows to exactly zero), so its token stream
-should match the greedy GPU `argmax` stream. On gemma-4-e2b it does, for all 100
-tokens. On Ternary-Bonsai-8B it agrees through 32 tokens and diverges by 64. The
-divergence is reproducible and every run within a cell agrees, so it is a
-deterministic property of the two paths and not a race.
+At `--temperature 0.0001` the host categorical sampler is *close to* an argmax,
+so its token stream might be expected to match the greedy GPU `argmax` stream.
+It does not. The divergence is reproducible and every run within a cell agrees,
+so it is a deterministic property of the two paths and not a race.
 
-**The mechanism is not established.** The candidate is tie-breaking: MLX's
-`argmax` returns the first maximal index and Rust's `Iterator::max_by` returns
-the last, so an exact tie in the logits row would select different tokens. But
-that does not predict what was observed. `--repetition-penalty 1.1` is a
-different objective, not another route to the same argmax — it divides positive
-logits of the trailing-20 ids by 1.1 — and its stream, which is selected by
-`max_by`, matched the temperature stream, which is selected by
-`sample_inverse_cdf` (the first index whose cumulative sum passes an RNG draw).
-Under a two-way tie those two agree only by chance. Confirming or discarding the
-hypothesis needs the top-2 logits at the first divergent step, which nothing here
-dumps.
+**Which architecture exhibits it is a property of the prompt and the window
+length, not of the architecture, and must not be used to scope the defect.**
+The original filing saw gemma-4-e2b agree with greedy for all 100 tokens while
+Ternary-Bonsai-8B agreed through 32 and diverged by 64. A later run at 512 max
+tokens on a different prompt (`--kv-quant none --max-ctx 4096`, `release-perf`)
+inverted that exactly: Ternary-Bonsai-8B was identical to greedy for all 275
+tokens it emitted, and gemma-4-e2b diverged at step 132. Both observations are
+real and neither is a fact about the model. A window that ends before the first
+tied row shows agreement and nothing more, so an arm that matches is evidence of
+a short window, not of an unaffected architecture.
 
-What *is* established: the two paths are not interchangeable oracles on every
-model, which matters to anything that treats one as a reference for the other.
+#### What is proven
+
+**A near-zero temperature is not an argmax, and is not a valid oracle for
+greedy.** Two separate reasons, both pinned by unit tests:
+
+- The underflow window is computable. `exp` in f32 returns exactly zero below
+  about `-104`, so a logit keeps non-zero probability iff it is within
+  `104 * temperature` of the maximum — 0.0104 at `temperature = 1e-4`. Inside
+  that window the distribution is genuinely mixed and the draw is genuinely
+  random.
+- At an **exact** tie the post-softmax distribution is uniform over the tied
+  ids, and the inverse-CDF draw picks among them by the RNG. It matches the
+  device `argmax` — which takes the lowest tied id — only about `1/k` of the
+  time. That is a categorical sampler behaving correctly.
+
+So the argument "temperature ~0 should match greedy, therefore a mismatch is a
+bug" does not hold, and neither does the reverse inference: a mismatch there is
+not evidence of a defect in either path.
+
+**Exact ties are common, not exotic.** Logits are BF16 on most snapshots — 8
+mantissa bits, so 0.125 spacing at magnitude 16. Measured on a 262144-wide
+BF16-derived softmax row, 259416 of the 262143 adjacent pairs are exactly
+equal. Tie behaviour is the common case in this code, which is why the rank
+rules below are pinned rather than left to a sort's internals.
+
+**Host greedy was resolving ties the opposite way from the device.**
+`argmax_with_penalties` selected with `Iterator::max_by` (last maximum wins)
+against MLX `argmax`'s first-maximum-wins, let a `NaN` reset the running best,
+and returned the last id rather than 0 on a fully masked row. Fixed, and pinned
+by tests that use MLX's own reduction as the oracle. See the tie-break contract
+under [Greedy](#greedy-temperature--0).
+
+#### The mechanism, established
+
+**The divergence is the exact-tie mechanism. The residual is closed.** The
+closure condition this section set for itself was the gap between the top two
+logits at the first divergent step, read via `logprobs: true` with
+`top_logprobs: 2` (which reports `logit - lse` per rank): a gap of `0` or below
+`104 * temperature` confirms the tie/near-tie mechanism, a gap well above it
+kills the tie explanation. That was run, on the gemma-4-e2b divergence above.
+
+At step 132 the greedy stream emits 16939 (`▁featured`) and the
+temperature-`1e-4` stream emits 22420 (`▁incorporated`). Both ranks report the
+same logprob, `-1.0606343`, bit for bit — a gap of **exactly `0.0`**. That is an
+exact tie, not a near-tie: the post-softmax distribution over the two ids is
+uniform, the inverse-CDF draw takes whichever the RNG lands on, and the device
+`argmax` takes the lower id. Both paths are correct and there is no third
+mechanism left to look for. The near-tie candidate (a gap inside the 0.0104
+window, same symptom without an exact tie) did not need to be invoked, and
+"something outside the sampler" is excluded by a gap that is identically zero.
+
+One control makes this a measurement rather than a coincidence: the
+temperature-`1e-4` streams are **byte-identical across the two arms** of this
+change. That confirms on real output what the code path already implies — the
+temperature path never enters `argmax_with_penalties`, so the greedy tie fix
+neither introduced this divergence nor masked it.
+
+The original filing also offered `--repetition-penalty 1.1` producing the same
+divergent stream as corroboration. It is not: that flag divides positive logits
+of the trailing-20 ids by 1.1, which is a different objective, not another
+route to the same argmax. Its agreement with the temperature stream is evidence
+for nothing either way.
+
+What this does **not** license is treating a near-zero temperature as an oracle
+for greedy. The mechanism is understood; the two streams still legitimately
+differ, for the reasons under [What is proven](#what-is-proven) above.
+
+#### Consequence for a future fused GPU sampler
+
+The merge gate cannot be "the token stream matches a near-zero-temperature CPU
+run", and it cannot be "the streams match" at any `temperature > 0` unless the
+RNG matches too. The gate that survives is two-part: on the greedy path, exact
+token identity against the device `argmax` including the lowest-id tie rule; on
+the stochastic path, exact token identity against the CPU path **given the same
+`Pcg32` draw sequence** — a GPU RNG must reproduce `Pcg32` bit-for-bit, or the
+kernel ships behind a dispatch policy with the CPU path retained as the oracle.
 
 ## Special tokens
 
@@ -663,13 +930,24 @@ The captured `TokenLogprobs` struct carries:
 - `top` — the `k` highest-probability `(token_id, logprob)` pairs,
   descending by logprob. May or may not include the chosen token.
 
+Equal logits rank by **ascending token id**, so rank 0 is the token the device
+`argmax` would select and ranks `1..k` are reproducible rather than an artefact
+of the selection's swaps. That makes `top_logprobs: 2` usable as the tie probe
+described under
+[Host selection is not bit-identical to the GPU argmax](#host-selection-is-not-bit-identical-to-the-gpu-argmax):
+`top[0].logprob - top[1].logprob` is the top-2 gap at that step.
+
 ---
 
 ## Determinism
 
 **Greedy (`temperature == 0`).** Byte-identical across runs. No RNG is
 consulted. Given fixed weights, a fixed prompt, and the same KV cache state,
-the token sequence is fully determined.
+the token sequence is fully determined — and it is the same sequence in all
+three greedy sub-cases, because they share one tie rule (lowest id wins; see
+[Greedy](#greedy-temperature--0)). Adding a constraint or a penalty moves a
+request between sub-cases, and that move must not change the token on a tied
+row.
 
 **Stochastic (`temperature > 0`).** Deterministic when the seed is fixed.
 The PCG32 RNG is seeded from `SamplerConfig::seed_or_default()`:
