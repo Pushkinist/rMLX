@@ -154,10 +154,12 @@ pub fn regen_requested() -> bool {
 /// therefore admits an exact tie at every magnitude and a one-ULP gap only in
 /// the lower octave.
 ///
-/// Both real cases so far are exact ties, so nothing in the tree distinguishes
-/// 0.10 from 0.01. If a case ever lands between, **tighten rather than widen**:
-/// a genuine tie stays a tie under any smaller bound, while raising the bound
-/// buys nothing except the ability to absorb a real preference.
+/// **One** measured case exists — bonsai, index 18, margin exactly 0.00000000 —
+/// so nothing in the tree distinguishes 0.10 from 0.01. A single exact tie is
+/// no evidence for any particular bound above zero. If a case ever lands
+/// between, **tighten rather than widen**: a genuine tie stays a tie under any
+/// smaller bound, while raising the bound buys nothing except the ability to
+/// absorb a real preference.
 pub const REGEN_MAX_TIE_MARGIN: f32 = 0.10;
 
 /// Index of the first differing token id. `None` when the sequences match.
