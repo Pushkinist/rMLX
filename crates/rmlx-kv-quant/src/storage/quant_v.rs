@@ -607,10 +607,44 @@ impl QuantV {
         Ok(())
     }
 
+    /// Truncate the store to `n` sequence positions.
+    ///
+    /// Drops trailing CPU blocks past `n` and **splits** the block the cut lands
+    /// inside (see [`super::truncate_plan`]), then lowers `shape[2]` to `n`.
+    ///
+    /// The GPU buffers are deliberately left alone: `dequantize_choice` slices
+    /// `[0, shape[2])` and the next `append` writes at `prev_seq == shape[2]`,
+    /// so lowering `shape[2]` already makes the rejected region overwritable.
+    /// The CPU blocks are append-only, so without the cut the next `append`
+    /// stacks on top of the rejected tokens and the dequant reads the rejected
+    /// prefix back.
+    pub fn truncate_to(&mut self, n: i32) {
+        let n = n.max(0);
+        let plan = super::truncate_plan(
+            self.blocks
+                .iter()
+                .map(|blk| super::block_rows(&blk.original_shape)),
+            &self.shape,
+            n,
+        );
+        super::apply_truncate_plan(&mut self.blocks, &plan);
+        // `get_mut` rather than `shape[2]`: the store shape is rank-4 by
+        // construction, and this is the bounds proof rather than a claim.
+        if let Some(seq) = self.shape.get_mut(2) {
+            *seq = n;
+        }
+    }
+
     /// Dequantize all accumulated V slices to a flat f32 vec (CPU path) or
     /// directly return the MLX Array (GPU path).
     ///
     /// Returns `(flat_f32, None)` for CPU or `(empty, Some(Array))` for GPU.
+    ///
+    /// # Errors
+    ///
+    /// On the CPU path, returns `Error::Quant` when the accumulated blocks do
+    /// not decode to exactly `prod(shape)` elements — see the coverage check
+    /// in the body.
     #[allow(
         clippy::indexing_slicing,
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
@@ -713,10 +747,23 @@ impl QuantV {
             };
             out.extend_from_slice(&slice);
         }
-        // The reorder requires the full `[B, S, kv_h, D]` buffer; pad/truncate
-        // to the declared element count first (blocks always sum to `shape[2]`
-        // in normal operation, so this is a defensive backstop).
-        out.resize(total, 0.0);
+        // The reorder requires exactly the `[B, S, kv_h, D]` buffer the shape
+        // declares. Blocks that over-run it used to be silently cut back here,
+        // which after a mid-block truncate kept the *rejected* speculative
+        // prefix and threw away the appended correction — wrong attention with
+        // no error anywhere. Blocks that fall short used to be zero-padded,
+        // which fabricates a gap. `truncate_to` now cuts the blocks; when it
+        // cannot (see `super::truncate_plan`) it drops the trailing block whole
+        // and leaves the store short on purpose, and that must abort the
+        // request here rather than decode a plausible-looking wrong tensor.
+        if out.len() != total {
+            return Err(rmlx_core::error::Error::Quant(format!(
+                "QuantV::dequantize_choice: CPU blocks decode to {} elems but shape {:?} \
+                 implies {total} — refusing to zero-pad / truncate",
+                out.len(),
+                self.shape,
+            )));
+        }
         let b = self.shape[0] as usize;
         let kv_h = self.shape[1] as usize;
         let s = self.shape[2] as usize;

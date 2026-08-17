@@ -3097,27 +3097,68 @@ non-row-divisible refusal), and one store-level round trip per block type in
 `quant_rotor_v3_tests.rs` (`RotorBlocks`) and `quant_iso_v_tests.rs`
 (`IsoBlocks`, quaternion sideband).
 
-**Scope — the class is NOT closed (#382).** The split covers the **rotor and
-iso** block stores only. `QuantV` (`Vec<TurboBlocks>`), `QuantPlanarV` /
-`QuantPlanarK` (`Vec<PlanarBlocks>`) and `QuantKTurbo3/4` accumulate CPU blocks
-on the same `Device::Cpu` append path, but `KvStorage::truncate_to` does nothing
-more than `shape[2] = n` for `K8V4`, `K8V8`, `Planar`, `PlanarK`, `TurboSym3/4`,
-`K8VTurbo2/3`, **`K8VTurbo3Tcq`, `K8VTurbo2Tcq`**, and the V axis of
-**`RotorKAsym3/4`**. Their blocks therefore **over**-cover `shape[2]` after a
-truncation, the next append stacks on top, and
-`QuantV::dequantize_choice`'s `out.resize(total, 0.0)` (and
-`QuantPlanarK::dequantize_choice` via `transpose_seq_heads`) silently keeps the
-**rejected** speculative tokens while discarding the correction token. That is
-wrong attention with no error — the opposite failure mode to the rotor/iso one,
-and it is unfixed.
+**Scope — every CPU-side store now cuts, and every one of them is loud.** The
+same planner drives the turbo, planar and affine stores. `TurboBlocks` and
+`PlanarBlocks` gained `BlockRows` implementations, `QuantV`, `QuantKTurbo3/4`,
+`QuantPlanarK` and `QuantPlanarV` gained `truncate_to`, and `QuantK` — whose CPU
+payload is one flat append-only `codes`/`scales` pair, not a block list — cuts
+that buffer to the leading `n` sequence positions. `KvStorage::truncate_to` no
+longer contains a bare `shape[2] = n` in any arm: `K8V4`, `K8V8`, `Planar`,
+`PlanarK`, `TurboSym3/4`, `K8VTurbo2/3`, `K8VTurbo3Tcq`, `K8VTurbo2Tcq`,
+`IsoV3/4`, `RotorV3/4` and both axes of `RotorKAsym3/4` all delegate to a
+store-level `truncate_to`, so a codec no longer truncates its two axes with
+different semantics.
 
-Note what that means **inside** a single codec: `RotorKAsym3/4` now truncate
-their two axes with different semantics. The rotor K axis takes the block plan
-above and stays consistent; the affine `QuantV` V axis is shape-truncated only
-and carries the #382 defect. So "the rotor and iso block stores are covered"
-must not be read as "the rotor asym codecs are covered" — only their K side is.
-Those files are owned elsewhere; this section documents the divergence rather
-than claiming coverage it does not have.
+Before that, those stores' blocks **over**-covered `shape[2]` after a
+truncation, the next append stacked on top, and
+`QuantV::dequantize_choice`'s `out.resize(total, 0.0)` (and
+`QuantPlanarK::dequantize_choice` via `transpose_seq_heads`, which reads only the
+first `b * s * kv_h * d` elements) silently kept the **rejected** speculative
+tokens while discarding the correction — wrong attention, no error.
+
+Those silent fix-ups are gone. Every CPU dequant path now compares what its
+blocks decoded to against `prod(shape)` and returns
+`"CPU blocks decode to N elems but shape [...] implies M — refusing to zero-pad /
+truncate"` on any mismatch, in **both** directions. That was not optional: the
+planner deliberately refuses some cuts (`b > 1`, a block whose row count is not a
+whole number of sequence positions, and for `QuantK` a target landing inside a
+128-element q8 group, where one scale covers the whole group and the f32 source is
+gone), and each refusal leaves the store deliberately inconsistent. Without the
+check, a refusal on the turbo stores would have zero-padded and on the planar
+stores would have panicked with an out-of-range index inside
+`seq_layout::transpose_seq_heads`.
+
+The **GPU** half of these stores needs no cut and gets none: its dequant slices
+`[0, shape[2])` and its next `append` writes at `prev_seq == shape[2]`, so
+lowering `shape[2]` already makes the rejected region overwritable. That bounds
+the blast radius, and the bound is worth stating because it is easy to get
+backwards: the defect was **CPU-payload-only**, so `Planar` and `PlanarK` — the
+arch defaults on Gemma3 and Gemma4-dense, and the auto-by-context pick above 32K
+— do **not** reach it on a normal `Device::Gpu` serve. `QuantPlanarK` /
+`QuantPlanarV` / `QuantK` append into the flat GPU buffers there and their block
+lists stay empty. What is live under `Device::Gpu` is the V side of the codecs
+whose encode is forced to CPU — `K8VTurbo2`, `K8VTurbo3`, `K8VTurbo2Tcq`,
+`K8VTurbo3Tcq` and `TurboSym3` (`update.rs` passes `Device::Cpu` to those
+`QuantV::append` calls unconditionally, and `exit_prefill` does the same for
+their bulk-quantize path). Everything else reaches it on a `Device::Cpu` run or
+after an SSD hydrate.
+
+`TurboBlocks` and `PlanarBlocks` carry no `n_tokens`, so their row count comes
+from `original_shape` — and that field's axis order is **not** consistent across
+producers: the CPU append paths record the sequence-major chunk shape
+`[B, S_block, kv_h, D]` while the SSD hydrate paths record the store's head-major
+`[B, kv_h, S, D]` over the same sequence-major bytes. Only the product is ever
+read back (`turbo_dequantize` / `planar_dequantize` use it purely as an element
+count), so `storage::block_rows` multiplies the leading three axes rather than
+naming one, and a split records the geometry it actually produced —
+`[1, 1, rows, width]` — instead of guessing which axis the caller meant. Pinned
+by `cpu_block_truncate_tests::quant_v_truncate_reads_rows_from_the_shape_product`.
+
+Tests: `storage/cpu_block_truncate_tests.rs` — the partial-accept round trip per
+store (`QuantV`, `QuantKTurbo3`, `QuantKTurbo4`, `QuantPlanarK`, `QuantPlanarV`,
+`QuantK`) at `kv_h` 1 and 3, the `b > 1` and q8-group refusals, and the
+`KvStorage::truncate_to` dispatch. Every oracle is a reference store built from
+only the retained tokens, sharing no arithmetic with the truncation logic.
 
 **Real-serve reachability audit (per #284).** `KvCache::truncate_to` has three
 production callers: prompt-cache partial-prefix trim

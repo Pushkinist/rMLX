@@ -160,6 +160,28 @@ impl QuantKTurbo3 {
             + crate::bytes::opt_array_bytes(gpu_scales_buf.as_ref())
     }
 
+    /// Truncate the store to `n` sequence positions.
+    ///
+    /// Drops trailing CPU blocks past `n` and **splits** the block the cut lands
+    /// inside (see [`super::truncate_plan`]), then lowers `shape[2]` to `n`. The
+    /// GPU buffers need no cut — see [`super::QuantV::truncate_to`].
+    pub fn truncate_to(&mut self, n: i32) {
+        let n = n.max(0);
+        let plan = super::truncate_plan(
+            self.blocks
+                .iter()
+                .map(|blk| super::block_rows(&blk.original_shape)),
+            &self.shape,
+            n,
+        );
+        super::apply_truncate_plan(&mut self.blocks, &plan);
+        // `get_mut` rather than `shape[2]`: the store shape is rank-4 by
+        // construction, and this is the bounds proof rather than a claim.
+        if let Some(seq) = self.shape.get_mut(2) {
+            *seq = n;
+        }
+    }
+
     /// Dequantize all accumulated K slices to a flat f32 vec (CPU path).
     ///
     /// For the GPU path use [`QuantKTurbo3::dequantize_choice`] with
@@ -167,7 +189,8 @@ impl QuantKTurbo3 {
     ///
     /// # Errors
     ///
-    /// Forwards any error from [`crate::turboquant::turbo_dequantize`].
+    /// Forwards any error from [`crate::turboquant::turbo_dequantize`], and the
+    /// block-coverage error from [`QuantKTurbo3::dequantize_choice`].
     pub fn dequant(&self) -> Result<Vec<f32>> {
         let (out, _gpu_arr) = self.dequantize_choice(Device::Cpu, Dtype::F32)?;
         Ok(out)
@@ -425,7 +448,18 @@ impl QuantKTurbo3 {
             let slice = turbo_dequantize(block)?;
             out.extend_from_slice(&slice);
         }
-        out.resize(total, 0.0);
+        // Blocks must cover `shape[2]` exactly. Silently cutting an over-run
+        // back kept the rejected prefix of a speculative partial accept and
+        // dropped the appended correction; silently zero-padding a shortfall
+        // fabricates a gap. See `super::QuantV::dequantize_choice`.
+        if out.len() != total {
+            return Err(rmlx_core::error::Error::Quant(format!(
+                "QuantKTurbo3::dequantize_choice: CPU blocks decode to {} elems but shape \
+                 {:?} implies {total} — refusing to zero-pad / truncate",
+                out.len(),
+                self.shape,
+            )));
+        }
         let b = self.shape[0] as usize;
         let kv_h = self.shape[1] as usize;
         let s = self.shape[2] as usize;

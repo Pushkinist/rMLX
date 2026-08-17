@@ -986,10 +986,12 @@ impl KvStorage {
 
     /// Truncate the sequence dimension to `n` tokens.
     ///
-    /// Sets `shape[2] = n` so the next `append` call overwrites positions
-    /// `[n..]`. The GPU buffers are kept in place (no reallocation) because
-    /// `append` uses `slice_update` with a position offset derived from
-    /// `shape[2]`.
+    /// Every arm delegates to the store's own `truncate_to`, which lowers
+    /// `shape[2]` to `n` **and** cuts whatever CPU-side state accumulates
+    /// independently of it. The GPU buffers are kept in place (no reallocation)
+    /// because `append` uses `slice_update` with a position offset derived from
+    /// `shape[2]`; the CPU-side blocks / codes are append-only and have to be
+    /// cut, or the next `append` stacks on top of the rejected tokens.
     #[allow(
         clippy::indexing_slicing,
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
@@ -999,35 +1001,34 @@ impl KvStorage {
         reason = "long match enumerates all KvStorage variants; splitting would obscure the 1-to-1 mapping"
     )]
     pub fn truncate_to(&mut self, n: i32) {
-        // Clamp once, here. Several variants mix a bare `shape[2] = n` on one
-        // axis with a `truncate_to(n)` on the other; the latter clamps
-        // internally, so a negative `n` would leave the two axes of one codec
-        // disagreeing about their length — harder to diagnose than both going
-        // negative together.
+        // Clamp once, here. Every store's `truncate_to` clamps internally too,
+        // but keeping it at the dispatch point means a negative `n` cannot leave
+        // the two axes of one codec disagreeing about their length if an arm is
+        // ever written to compute from `n` before delegating.
         let n = n.max(0);
         match self {
             Self::K8V4 { k, v, .. } => {
                 if let Some(ks) = k.as_mut() {
-                    ks.shape[2] = n;
+                    ks.truncate_to(n);
                 }
                 if let Some(vs) = v.as_mut() {
-                    vs.shape[2] = n;
+                    vs.truncate_to(n);
                 }
             }
             Self::K8V8 { k, v, .. } => {
                 if let Some(ks) = k.as_mut() {
-                    ks.shape[2] = n;
+                    ks.truncate_to(n);
                 }
                 if let Some(vs) = v.as_mut() {
-                    vs.shape[2] = n;
+                    vs.truncate_to(n);
                 }
             }
             Self::Planar { k, v, .. } => {
                 if let Some(ks) = k.as_mut() {
-                    ks.shape[2] = n;
+                    ks.truncate_to(n);
                 }
                 if let Some(vs) = v.as_mut() {
-                    vs.shape[2] = n;
+                    vs.truncate_to(n);
                 }
             }
             // None: bf16 buffers are sliced lazily on next read; nothing to
@@ -1049,60 +1050,62 @@ impl KvStorage {
                     pv.truncate_to(n);
                 }
             }
-            // RotKTq4V: same as Mixed — reset state on truncate.
+            // RotKTq4V: same as Mixed — reset state on truncate. The V store is
+            // reset to zero positions rather than to `n`, so its blocks go with
+            // it (leaving them would over-cover an empty shape).
             Self::RotKTq4V { k_state, v, .. } => {
                 k_state.reset();
                 if let Some(qv) = v.as_mut() {
-                    qv.shape[2] = 0;
+                    qv.truncate_to(0);
                 }
             }
             // K8VTurbo3 truncates like K8V4.
             Self::K8VTurbo3 { k, v, .. } => {
                 if let Some(ks) = k.as_mut() {
-                    ks.shape[2] = n;
+                    ks.truncate_to(n);
                 }
                 if let Some(vs) = v.as_mut() {
-                    vs.shape[2] = n;
+                    vs.truncate_to(n);
                 }
             }
             // TurboSym3 — symmetric truncate (K3 + V3 shape).
             Self::TurboSym3 { k, v, .. } => {
                 if let Some(ks) = k.as_mut() {
-                    ks.shape[2] = n;
+                    ks.truncate_to(n);
                 }
                 if let Some(vs) = v.as_mut() {
-                    vs.shape[2] = n;
+                    vs.truncate_to(n);
                 }
             }
             // TurboSym4 — symmetric truncate (same shape semantics).
             Self::TurboSym4 { k, v, .. } => {
                 if let Some(ks) = k.as_mut() {
-                    ks.shape[2] = n;
+                    ks.truncate_to(n);
                 }
                 if let Some(vs) = v.as_mut() {
-                    vs.shape[2] = n;
+                    vs.truncate_to(n);
                 }
             }
             // PlanarK — truncate K only; V (bf16) sliced lazily.
             Self::PlanarK { k, .. } => {
                 if let Some(ks) = k.as_mut() {
-                    ks.shape[2] = n;
+                    ks.truncate_to(n);
                 }
             }
             // K8VTurbo2 truncates like K8V4.
             Self::K8VTurbo2 { k, v, .. } => {
                 if let Some(ks) = k.as_mut() {
-                    ks.shape[2] = n;
+                    ks.truncate_to(n);
                 }
                 if let Some(vs) = v.as_mut() {
-                    vs.shape[2] = n;
+                    vs.truncate_to(n);
                 }
             }
             // IsoV3 — K shape truncates; V codec is per-token so dropping
             // trailing blocks is delegated to QuantIsoV3.
             Self::IsoV3 { k, v, .. } => {
                 if let Some(ks) = k.as_mut() {
-                    ks.shape[2] = n;
+                    ks.truncate_to(n);
                 }
                 if let Some(vs) = v.as_mut() {
                     vs.truncate_to(n);
@@ -1111,7 +1114,7 @@ impl KvStorage {
             // IsoV4 — same shape semantics as IsoV3.
             Self::IsoV4 { k, v, .. } => {
                 if let Some(ks) = k.as_mut() {
-                    ks.shape[2] = n;
+                    ks.truncate_to(n);
                 }
                 if let Some(vs) = v.as_mut() {
                     vs.truncate_to(n);
@@ -1121,7 +1124,7 @@ impl KvStorage {
             // (rotor table kept).
             Self::RotorV3 { k, v, .. } => {
                 if let Some(ks) = k.as_mut() {
-                    ks.shape[2] = n;
+                    ks.truncate_to(n);
                 }
                 if let Some(vs) = v.as_mut() {
                     vs.truncate_to(n);
@@ -1130,7 +1133,7 @@ impl KvStorage {
             // RotorV4 — same semantics as RotorV3.
             Self::RotorV4 { k, v, .. } => {
                 if let Some(ks) = k.as_mut() {
-                    ks.shape[2] = n;
+                    ks.truncate_to(n);
                 }
                 if let Some(vs) = v.as_mut() {
                     vs.truncate_to(n);
@@ -1139,19 +1142,19 @@ impl KvStorage {
             // K8VTurbo3Tcq truncates like K8VTurbo3 / K8V4.
             Self::K8VTurbo3Tcq { k, v, .. } => {
                 if let Some(ks) = k.as_mut() {
-                    ks.shape[2] = n;
+                    ks.truncate_to(n);
                 }
                 if let Some(vs) = v.as_mut() {
-                    vs.shape[2] = n;
+                    vs.truncate_to(n);
                 }
             }
             // K8VTurbo2Tcq truncates like K8VTurbo2 / K8VTurbo3Tcq.
             Self::K8VTurbo2Tcq { k, v, .. } => {
                 if let Some(ks) = k.as_mut() {
-                    ks.shape[2] = n;
+                    ks.truncate_to(n);
                 }
                 if let Some(vs) = v.as_mut() {
-                    vs.shape[2] = n;
+                    vs.truncate_to(n);
                 }
             }
             // IsoSym3 / IsoSym4 — both axes are per-token block codecs;
@@ -1219,7 +1222,7 @@ impl KvStorage {
                     ks.truncate_to(n);
                 }
                 if let Some(vs) = v.as_mut() {
-                    vs.shape[2] = n;
+                    vs.truncate_to(n);
                 }
             }
             Self::RotorKAsym4 { k, v, .. } => {
@@ -1227,7 +1230,7 @@ impl KvStorage {
                     ks.truncate_to(n);
                 }
                 if let Some(vs) = v.as_mut() {
-                    vs.shape[2] = n;
+                    vs.truncate_to(n);
                 }
             }
         }

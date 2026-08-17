@@ -96,6 +96,91 @@ impl QuantK {
             + crate::bytes::opt_array_bytes(gpu_scales_buf.as_ref())
     }
 
+    /// Truncate the store to `n` sequence positions.
+    ///
+    /// Cuts the CPU-side `codes` / `scales` back to the leading `n` positions
+    /// and lowers `shape[2]` to `n`. The GPU buffers need no cut:
+    /// `dequantize_choice` slices `[0, shape[2])` and the next `append` writes
+    /// at `prev_seq == shape[2]`, so lowering `shape[2]` already makes the
+    /// rejected region overwritable. The CPU buffers are append-only, so
+    /// without this the next `append` stacks on top of the rejected tokens and
+    /// the dequant reads the rejected prefix back instead — wrong attention
+    /// with no error, which is exactly what the coverage check in
+    /// `dequantize_choice` now refuses to produce.
+    pub fn truncate_to(&mut self, n: i32) {
+        let n = n.max(0);
+        self.retain_cpu_prefix(n);
+        // `get_mut` rather than `shape[2]`: the store shape is rank-4 by
+        // construction, and this is the bounds proof rather than a claim.
+        if let Some(seq) = self.shape.get_mut(2) {
+            *seq = n;
+        }
+    }
+
+    /// Keep the leading `n` sequence positions of the CPU `codes` / `scales`.
+    ///
+    /// The buffers are sequence-major (`[B, S, kv_h, D]`, see [`Self::append`]),
+    /// so at `b == 1` a sequence prefix is a byte prefix and this is a plain
+    /// `Vec::truncate` — no allocation, no copy, which matters because it sits
+    /// on the speculative rollback path.
+    ///
+    /// Two cuts are refused, and both leave the store deliberately over-covering
+    /// so `dequantize_choice` aborts rather than return a plausible-looking
+    /// wrong tensor:
+    ///
+    /// * `b > 1` — rows run batch-major, so a sequence prefix is not a
+    ///   contiguous prefix and cutting anyway would scramble the store silently.
+    /// * a target that lands inside a q8 group — one scale covers
+    ///   `Q8_GROUP_SIZE` elements, so a cut that is not a whole number of groups
+    ///   cannot be expressed without re-quantizing, and the f32 source is gone
+    ///   by now.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "shape rank is checked to be >= 4 before any element is read"
+    )]
+    fn retain_cpu_prefix(&mut self, n: i32) {
+        if self.codes.is_empty() || self.shape.len() < 4 {
+            return;
+        }
+        let b = self.shape[0].max(0) as usize;
+        let kv_h = self.shape[1].max(0) as usize;
+        let d = self.shape[3].max(0) as usize;
+        let keep_elems = (n.max(0) as usize)
+            .saturating_mul(b)
+            .saturating_mul(kv_h)
+            .saturating_mul(d);
+        if keep_elems >= self.codes.len() {
+            // Nothing accumulated past the target — includes the whole-store
+            // and hydrated-prefix cases, so neither warns.
+            return;
+        }
+        if b != 1 {
+            tracing::warn!(
+                b,
+                kv_h,
+                target_seq = n,
+                "QuantK truncate: refusing to cut CPU codes at b > 1 — the buffer runs \
+                 batch-major, so a sequence prefix is not a contiguous prefix and the cut \
+                 would be silently scrambled; leaving the store over-covering, which the \
+                 next dequant rejects"
+            );
+            return;
+        }
+        if !keep_elems.is_multiple_of(Q8_GROUP_SIZE) {
+            tracing::warn!(
+                keep_elems,
+                group_size = Q8_GROUP_SIZE,
+                target_seq = n,
+                "QuantK truncate: refusing to cut CPU codes inside a q8 group — one scale \
+                 covers the whole group and the f32 source is gone; leaving the store \
+                 over-covering, which the next dequant rejects"
+            );
+            return;
+        }
+        self.codes.truncate(keep_elems);
+        self.scales.truncate(keep_elems / Q8_GROUP_SIZE);
+    }
+
     /// Append a new K slice. Picks CPU or GPU path from `device`.
     #[allow(
         clippy::indexing_slicing,
@@ -369,6 +454,23 @@ impl QuantK {
         // caller reshapes the returned flat vector to the logical
         // `[B, kv_h, S, D]`, so reorder heads↔seq back to head-major first.
         let flat = q8_dequantize(&self.codes, &self.scales);
+        // The codes must cover `shape[2]` exactly. `transpose_seq_heads` reads
+        // only the first `b * s * kv_h * d` elements, so an over-run was
+        // silently cut back — after a mid-sequence truncate that returned the
+        // *rejected* speculative prefix and dropped the appended correction,
+        // with no error anywhere — and a shortfall panicked on an out-of-range
+        // index. `truncate_to` now cuts the codes; when it cannot (see
+        // `Self::retain_cpu_prefix`) it leaves the store over-covering on
+        // purpose, and that must abort the request here.
+        let total: usize = self.shape.iter().map(|&d| d.max(0) as usize).product();
+        if flat.len() != total {
+            return Err(rmlx_core::error::Error::Quant(format!(
+                "QuantK::dequantize_choice: CPU codes decode to {} elems but shape {:?} \
+                 implies {total} — refusing to zero-pad / truncate",
+                flat.len(),
+                self.shape,
+            )));
+        }
         let b = self.shape[0] as usize;
         let kv_h = self.shape[1] as usize;
         let s = self.shape[2] as usize;
