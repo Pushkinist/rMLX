@@ -1108,3 +1108,171 @@ fn iso_v3_append_gpu_over_a_live_ring_is_readable_both_ways() {
         "dequant_gpu returns the declared [B, kv_h, S, D]"
     );
 }
+
+// ── GPU-reader kernel inputs ─────────────────────────────────────────────────
+
+/// Read an f32 `Array` back to a host vector for comparison.
+fn array_to_f32(a: &Array) -> Vec<f32> {
+    let bytes = a.to_bytes().expect("array to bytes");
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// The iso dequant kernel's inputs must not depend on how the sequence was
+/// chunked into blocks.
+///
+/// `dequant_gpu` builds them via `iso_kernel_inputs_head_major`, which places
+/// every token row at its head-major `[B, kv_h, S, D]` position. That order is a
+/// function of `(bi, h, s)` alone, so a store built by one append and the same
+/// store built by two must produce **byte-identical** buffers. Reading the
+/// concatenation as one `[B, S, kv_h, D]` run instead — what `dequant_gpu` used
+/// to do with a whole-buffer reshape — is only valid at `B == 1`, so this is the
+/// GPU reader's half of the same bound `dequant` closes.
+///
+/// This is the on-commit gate for that reader: the MSL dispatch itself is
+/// shape-preserving and per-token positional, so if the inputs are right the
+/// output is. `iso_v3_dequant_gpu_matches_dequant_at_b_gt_1` re-proves it
+/// end-to-end on Metal.
+///
+/// What this pins, precisely: that the inputs are **chunking-independent**.
+/// Measured mutation — replace the `perm` lookup in
+/// `iso_kernel_inputs_head_major` with the identity (block-concatenation order,
+/// which is what the whole-buffer reshape assumed) and this goes red at
+/// `b = 2, kv_h = 1` and stays green at both `b = 1` cases, because
+/// concatenation preserves row order across chunk boundaries only when there is
+/// one batch element. It does **not** by itself prove the placement is
+/// head-major — the identity passes it at `b = 1`. That half is pinned by
+/// `seq_layout_tests::head_major_token_order_matches_the_output_reorder` (against
+/// an index-math reference) and `..._is_a_bijection`, and end-to-end on Metal by
+/// `iso_v3_dequant_gpu_matches_dequant_at_b_gt_1`.
+#[test]
+fn iso_v3_kernel_inputs_do_not_depend_on_chunking() {
+    for (b, kv_h) in [(1_usize, 1_usize), (1, 2), (2, 1), (2, 2)] {
+        let head_dim = 8_usize;
+        let n_groups = head_dim / ISO3_GROUP_SIZE;
+        let (n0, n1) = (2_usize, 3_usize);
+        let shape = |n: usize| [b as i32, kv_h as i32, n as i32, head_dim as i32];
+        let init = || vec![b as i32, kv_h as i32, 0, head_dim as i32];
+        let chunk =
+            |s0: usize, n: usize| crate::test_utils::batch_head_chunk(b, kv_h, s0, n, head_dim);
+
+        let mut one = QuantIsoV3::new(init());
+        one.append(&chunk(0, n0 + n1), &shape(n0 + n1))
+            .expect("single append");
+        let mut two = QuantIsoV3::new(init());
+        two.append(&chunk(0, n0), &shape(n0)).expect("chunk 0");
+        two.append(&chunk(n0, n1), &shape(n1)).expect("chunk 1");
+        assert_eq!(
+            two.blocks.len(),
+            2,
+            "the two-append store really holds 2 blocks"
+        );
+
+        let build = |store: &QuantIsoV3| {
+            crate::storage::quant_iso_v::iso_kernel_inputs_head_major(
+                &store.blocks,
+                &store.shape,
+                n_groups,
+                ISO3_GROUP_SIZE,
+                "test",
+            )
+            .expect("well-formed store")
+        };
+        let a = build(&one);
+        let c = build(&two);
+
+        assert_eq!(
+            a.total_groups, c.total_groups,
+            "slot count at b={b} kv_h={kv_h}"
+        );
+        assert_eq!(a.codes, c.codes, "codes at b={b} kv_h={kv_h}");
+        assert_eq!(a.scales, c.scales, "scales at b={b} kv_h={kv_h}");
+        assert_eq!(
+            a.quaternions, c.quaternions,
+            "quaternions at b={b} kv_h={kv_h}"
+        );
+        assert_eq!(a.norms, c.norms, "norms at b={b} kv_h={kv_h}");
+    }
+}
+
+/// The shared builder's accounting is the one `dequant_gpu` relies on: a block
+/// list that does not cover `prod(shape)` must be refused, not reshaped.
+#[test]
+fn iso_v3_kernel_inputs_refuse_a_blocks_vs_shape_mismatch() {
+    let (b, kv_h, head_dim) = (1_usize, 2_usize, 8_usize);
+    let n_groups = head_dim / ISO3_GROUP_SIZE;
+    let shape = |n: usize| [b as i32, kv_h as i32, n as i32, head_dim as i32];
+    let mut vs = QuantIsoV3::new(vec![b as i32, kv_h as i32, 0, head_dim as i32]);
+    vs.append(
+        &crate::test_utils::batch_head_chunk(b, kv_h, 0, 3, head_dim),
+        &shape(3),
+    )
+    .expect("append");
+    // Claim one more position than the blocks carry.
+    vs.shape[2] = 4;
+    let err = crate::storage::quant_iso_v::iso_kernel_inputs_head_major(
+        &vs.blocks,
+        &vs.shape,
+        n_groups,
+        ISO3_GROUP_SIZE,
+        "QuantIsoV3::dequant_gpu",
+    )
+    .expect_err("blocks short of shape[2] must be refused");
+    assert!(
+        err.to_string().contains("actual_total") && err.to_string().contains("declared_total"),
+        "expected the accounting error, got: {err}"
+    );
+}
+
+/// End-to-end on Metal: `dequant_gpu` must equal `dequant` for a `b > 1` store
+/// holding two blocks.
+///
+/// `dequant_gpu` used to reshape the concatenated kernel output as one
+/// `[B, S, kv_h, D]` run, which interleaves batch elements once more than one
+/// block exists — the same defect `dequant` closed. `synced_iso_v_blocks` hands
+/// this reader a multi-block `Cow::Borrowed` precisely at `b > 1`, because every
+/// ring feed clears the ring when `b != 1`, so the blocks are always
+/// authoritative there.
+///
+/// Mutation check: restore the whole-buffer
+/// `reshape([B, S, kv_h, D]) + transpose(0, 2, 1, 3)` at the end of
+/// `QuantIsoV3::dequant_gpu` and this goes red; the `b = 1` half stays green.
+#[test]
+#[ignore = "GPU Metal context — run via `make gpu-test CRATE=rmlx-kv-quant FILTER=iso_v3_dequant_gpu_matches_dequant_at_b_gt_1`"]
+fn iso_v3_dequant_gpu_matches_dequant_at_b_gt_1() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    for (b, kv_h) in [(1_usize, 2_usize), (2, 1), (2, 2)] {
+        let head_dim = 8_usize;
+        let (n0, n1) = (2_usize, 3_usize);
+        let shape = |n: usize| [b as i32, kv_h as i32, n as i32, head_dim as i32];
+        let chunk =
+            |s0: usize, n: usize| crate::test_utils::batch_head_chunk(b, kv_h, s0, n, head_dim);
+
+        let mut vs = QuantIsoV3::new(vec![b as i32, kv_h as i32, 0, head_dim as i32]);
+        vs.append(&chunk(0, n0), &shape(n0)).expect("chunk 0");
+        vs.append(&chunk(n0, n1), &shape(n1)).expect("chunk 1");
+        assert_eq!(vs.blocks.len(), 2, "two blocks is the case under test");
+
+        let cpu = vs.dequant().expect("cpu dequant");
+        let gpu = vs.dequant_gpu(Device::Gpu).expect("gpu dequant");
+        assert_eq!(
+            gpu.shape(),
+            shape(n0 + n1).to_vec(),
+            "dequant_gpu returns the declared [B, kv_h, S, D] at b={b} kv_h={kv_h}"
+        );
+        let gpu_vals = array_to_f32(&gpu);
+        let max_abs = cpu
+            .iter()
+            .zip(gpu_vals.iter())
+            .fold(0.0_f32, |m, (a, c)| m.max((a - c).abs()));
+        assert!(
+            max_abs < 1e-5,
+            "dequant_gpu vs dequant max abs error {max_abs} at b={b} kv_h={kv_h} — \
+             batch/head scramble in the GPU reader"
+        );
+    }
+}

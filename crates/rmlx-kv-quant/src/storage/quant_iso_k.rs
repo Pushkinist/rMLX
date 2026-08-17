@@ -492,59 +492,26 @@ impl QuantIsoK3 {
         // come from the same source.
         let blocks = synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, device)?;
 
-        let mut codes_bytes: Vec<u8> = Vec::new();
-        let mut scales_bytes: Vec<u8> = Vec::new();
-        let mut quats_bytes: Vec<u8> = Vec::new();
-        let mut norms_bytes: Vec<u8> = Vec::new();
-        let mut total_groups: usize = 0;
+        // Head-major kernel inputs — see [`super::QuantIsoV3::dequant_gpu`] for
+        // why the row order is fixed on the way in rather than reshaped on the
+        // way out.
+        let inputs = super::quant_iso_v::iso_kernel_inputs_head_major(
+            &blocks,
+            &self.shape,
+            n_groups,
+            ISO_K3_GROUP_SIZE,
+            "QuantIsoK3::dequant_gpu",
+        )?;
 
-        for blk in blocks.iter() {
-            for &c in &blk.codes {
-                codes_bytes.extend_from_slice(&c.to_le_bytes());
-            }
-            for &s in &blk.scales {
-                scales_bytes.extend_from_slice(&s.to_le_bytes());
-            }
-            for &q in &blk.quaternions {
-                quats_bytes.extend_from_slice(&q.to_le_bytes());
-            }
-            for &n in &blk.norms {
-                let n_bytes = n.to_le_bytes();
-                for _ in 0..n_groups {
-                    norms_bytes.extend_from_slice(&n_bytes);
-                }
-            }
-            // Checked arithmetic — see V-side mirror.
-            let blk_groups = blk.n_tokens.checked_mul(n_groups).ok_or_else(|| {
-                Error::Quant("dequant_gpu: blk.n_tokens * n_groups overflow".to_owned())
-            })?;
-            total_groups = total_groups
-                .checked_add(blk_groups)
-                .ok_or_else(|| Error::Quant("dequant_gpu: total_groups overflow".to_owned()))?;
-        }
-
-        // Guard against silent shape divergence — see V-side mirror.
-        let declared_total: usize = self.shape.iter().map(|&d| d as usize).product();
-        let actual_total: usize = total_groups.checked_mul(ISO_K3_GROUP_SIZE).ok_or_else(|| {
-            Error::Quant("dequant_gpu: total_groups * ISO_K3_GROUP_SIZE overflow".to_owned())
-        })?;
-        if actual_total != declared_total {
-            return Err(Error::Quant(format!(
-                "dequant_gpu: actual_total={actual_total} (blocks×groups×group_size) != \
-                 declared_total={declared_total} (prod(shape)={:?}); refusing to silently \
-                 truncate/pad",
-                self.shape
-            )));
-        }
-
-        if total_groups == 0 {
+        if inputs.total_groups == 0 {
             return Array::from_bytes(&[][..], &self.shape, Dtype::F32);
         }
 
-        let codes_arr = Array::from_bytes(&codes_bytes, &[total_groups as i32], Dtype::U32)?;
-        let scales_arr = Array::from_bytes(&scales_bytes, &[total_groups as i32], Dtype::F32)?;
-        let quats_arr = Array::from_bytes(&quats_bytes, &[(total_groups * 4) as i32], Dtype::F32)?;
-        let norms_arr = Array::from_bytes(&norms_bytes, &[total_groups as i32], Dtype::F32)?;
+        let n = inputs.total_groups as i32;
+        let codes_arr = Array::from_bytes(&inputs.codes, &[n], Dtype::U32)?;
+        let scales_arr = Array::from_bytes(&inputs.scales, &[n], Dtype::F32)?;
+        let quats_arr = Array::from_bytes(&inputs.quaternions, &[n * 4], Dtype::F32)?;
+        let norms_arr = Array::from_bytes(&inputs.norms, &[n], Dtype::F32)?;
 
         let flat = crate::isoquant_msl::iso_dequantize_v3_gpu(
             &codes_arr,
@@ -555,12 +522,7 @@ impl QuantIsoK3 {
             Dtype::F32,
             device,
         )?;
-
-        // CPU blocks are sequence-major (see `append`): reshape to
-        // `[B, S, kv_h, D]`, then reorder heads↔seq back to `[B, kv_h, S, D]`.
-        let seq_major_shape = [self.shape[0], self.shape[2], self.shape[1], self.shape[3]];
-        let out = flat.reshape(&seq_major_shape, device)?;
-        out.transpose(&[0, 2, 1, 3], device)?.contiguous(device)
+        flat.reshape(&self.shape, device)
     }
 }
 

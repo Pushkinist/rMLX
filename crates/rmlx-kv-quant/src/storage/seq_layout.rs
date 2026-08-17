@@ -91,6 +91,102 @@ pub(super) fn transpose_seq_heads(
     out
 }
 
+/// `b * kv_h * s_total * d`, or [`Error::Quant`] when the product overflows.
+///
+/// Callers derive these from `i32` shape fields with a plain `as usize`, so a
+/// malformed shape can reach here as an absurd count. Every other guard in this
+/// module is a typed error; wrapping (or panicking under debug-assertions) on
+/// the size computation alone would be the odd one out.
+fn checked_elems(b: usize, kv_h: usize, s_total: usize, d: usize, what: &str) -> Result<usize> {
+    b.checked_mul(kv_h)
+        .and_then(|v| v.checked_mul(s_total))
+        .and_then(|v| v.checked_mul(d))
+        .ok_or_else(|| {
+            Error::Quant(format!(
+                "{what}: element count overflows usize at \
+                 [B={b}, kv_h={kv_h}, S={s_total}, D={d}]"
+            ))
+        })
+}
+
+/// Head-major `[B, kv_h, S_total, D]` destination index of every **token row**
+/// of a chunked sequence-major block list.
+///
+/// The block stores hold one `[B, S_chunk, kv_h, D]` payload per `append`, so
+/// row `i` of the concatenation identifies `(bi, si, h)` *within its own chunk*.
+/// A reader that wants head-major output has two ways to get there: reorder the
+/// decoded values ([`transpose_chunked_seq_heads`]), or place the payload rows
+/// in head-major order **before** decoding. This returns the permutation for the
+/// second — `perm[i]` is the head-major token index of concatenated row `i`.
+///
+/// The GPU readers take the second route: the iso dequant kernel is per-token
+/// positional (token `t`'s output depends only on token `t`'s codes / scales /
+/// norm), so permuting its input permutes its output identically. Feeding it
+/// head-major rows means the flat result is already `[B, kv_h, S, D]` and needs
+/// no reshape-plus-transpose at all — one less device kernel than reordering
+/// afterwards, and correct at every `B`, which the whole-buffer reshape is not.
+///
+/// # Errors
+///
+/// Returns [`Error::Quant`] when the chunks do not partition
+/// `[B, S_total, kv_h]` — a ragged chunk, or a chunk list that over- or
+/// under-runs `s_total`.
+pub(super) fn head_major_token_order(
+    b: usize,
+    s_total: usize,
+    kv_h: usize,
+    chunk_rows: impl IntoIterator<Item = usize>,
+) -> Result<Vec<usize>> {
+    let total_rows = checked_elems(b, kv_h, s_total, 1, "head_major_token_order")?;
+    let mut perm = vec![0usize; total_rows];
+    let rows_per_seq = b * kv_h;
+    if rows_per_seq == 0 {
+        return Ok(perm);
+    }
+    let mut s_off = 0usize;
+    let mut row = 0usize;
+    for rows in chunk_rows {
+        if !rows.is_multiple_of(rows_per_seq) {
+            return Err(Error::Quant(format!(
+                "head_major_token_order: chunk holds {rows} rows, not a whole number of \
+                 sequence positions at B={b}, kv_h={kv_h}"
+            )));
+        }
+        let s_chunk = rows / rows_per_seq;
+        if s_off + s_chunk > s_total {
+            return Err(Error::Quant(format!(
+                "head_major_token_order: chunks over-run S={s_total} at sequence offset \
+                 {s_off} (+{s_chunk})"
+            )));
+        }
+        for bi in 0..b {
+            for si in 0..s_chunk {
+                for h in 0..kv_h {
+                    // Source row order inside the chunk is `[B, S_chunk, kv_h]`;
+                    // `row` walks it, so no index arithmetic is needed on the
+                    // source side.
+                    let dst = (bi * kv_h + h) * s_total + s_off + si;
+                    let Some(slot) = perm.get_mut(row) else {
+                        return Err(Error::Quant(format!(
+                            "head_major_token_order: chunk rows exceed the {total_rows} rows \
+                             [B={b}, kv_h={kv_h}, S={s_total}] declares"
+                        )));
+                    };
+                    *slot = dst;
+                    row += 1;
+                }
+            }
+        }
+        s_off += s_chunk;
+    }
+    if s_off != s_total {
+        return Err(Error::Quant(format!(
+            "head_major_token_order: chunks cover {s_off} sequence positions but S={s_total}"
+        )));
+    }
+    Ok(perm)
+}
+
 /// Reorder a **chunked** sequence-major buffer back to head-major
 /// `[B, kv_h, S_total, D]`.
 ///
@@ -122,7 +218,7 @@ pub(super) fn transpose_chunked_seq_heads(
     d: usize,
     chunk_rows: impl IntoIterator<Item = usize>,
 ) -> Result<Vec<f32>> {
-    let total = b * kv_h * s_total * d;
+    let total = checked_elems(b, kv_h, s_total, d, "transpose_chunked_seq_heads")?;
     if src.len() != total {
         return Err(Error::Quant(format!(
             "transpose_chunked_seq_heads: buffer holds {} elems but \

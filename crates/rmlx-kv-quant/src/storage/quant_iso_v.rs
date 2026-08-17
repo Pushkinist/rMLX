@@ -1119,6 +1119,19 @@ impl QuantIsoV3 {
             if s_active == 0 {
                 return Array::from_bytes(&[][..], &self.shape, Dtype::F32);
             }
+            // The mirror is one flat buffer written per chunk at
+            // `prev_seq * words_per_step`, and `words_per_step` folds `b` in, so
+            // the prefix is a run of `[B, S_chunk, kv_h, D]` chunks. Reading it
+            // as one `[B, S, kv_h, D]` run below interleaves batch elements once
+            // `B > 1` and more than one chunk landed. Refuse rather than return a
+            // scrambled tensor — the block path handles every `B`.
+            if self.shape[0] != 1 {
+                return Err(Error::Quant(format!(
+                    "QuantIsoV3::dequant_gpu: the GPU mirror is b == 1 only (its per-step \
+                     stride does not interleave batch), got shape {:?}",
+                    self.shape
+                )));
+            }
             let codes_active = s_active
                 .checked_mul(self.gpu_words_per_step)
                 .ok_or_else(|| Error::Quant("dequant_gpu: codes_active overflow".to_owned()))?;
@@ -1161,78 +1174,31 @@ impl QuantIsoV3 {
         // nothing.
         let blocks = synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, device)?;
 
-        // Concatenate all block buffers. CPU codes/scales/quats are already in
-        // GPU-kernel layout; per-token norms must be expanded to per-group.
-        let mut codes_bytes: Vec<u8> = Vec::new();
-        let mut scales_bytes: Vec<u8> = Vec::new();
-        let mut quats_bytes: Vec<u8> = Vec::new();
-        let mut norms_bytes: Vec<u8> = Vec::new();
-        let mut total_groups: usize = 0;
+        // Build the kernel inputs with the token rows already in head-major
+        // order, so the flat result *is* `[B, kv_h, S, D]` and needs no
+        // reshape-plus-transpose. Reshaping the whole concatenated decode as one
+        // `[B, S, kv_h, D]` run — what this used to do — is only a valid reading
+        // at `B == 1`, because each block covers only `[B, S_block, kv_h, D]`.
+        let inputs = iso_kernel_inputs_head_major(
+            &blocks,
+            &self.shape,
+            n_groups,
+            ISO3_GROUP_SIZE,
+            "QuantIsoV3::dequant_gpu",
+        )?;
 
-        for blk in blocks.iter() {
-            for &c in &blk.codes {
-                codes_bytes.extend_from_slice(&c.to_le_bytes());
-            }
-            for &s in &blk.scales {
-                scales_bytes.extend_from_slice(&s.to_le_bytes());
-            }
-            for &q in &blk.quaternions {
-                quats_bytes.extend_from_slice(&q.to_le_bytes());
-            }
-            // Per-token → per-group expand (kernel reads norms_in[gid] where
-            // gid = token * n_groups + grp; all groups in a token share the
-            // same norm value).
-            for &n in &blk.norms {
-                let n_bytes = n.to_le_bytes();
-                for _ in 0..n_groups {
-                    norms_bytes.extend_from_slice(&n_bytes);
-                }
-            }
-            // Loudly fail on overflow rather than silently saturating; the
-            // resulting buffer-vs-shape mismatch would otherwise surface as a
-            // confusing kernel-dispatch error downstream.
-            let blk_groups = blk.n_tokens.checked_mul(n_groups).ok_or_else(|| {
-                Error::Quant("dequant_gpu: blk.n_tokens * n_groups overflow".to_owned())
-            })?;
-            total_groups = total_groups
-                .checked_add(blk_groups)
-                .ok_or_else(|| Error::Quant("dequant_gpu: total_groups overflow".to_owned()))?;
-        }
-
-        // Guard against silent shape divergence between `dequant_gpu`
-        // (derives total from concatenated blocks) and `dequant` (pads/truncates
-        // to `prod(shape)`). After `truncate_to` / `reset` / post-hydrate edge
-        // cases the two totals can diverge — refuse to silently reshape rather
-        // than producing a garbage Array.
-        let declared_total: usize = self.shape.iter().map(|&d| d as usize).product();
-        let actual_total: usize = total_groups.checked_mul(ISO3_GROUP_SIZE).ok_or_else(|| {
-            Error::Quant("dequant_gpu: total_groups * ISO3_GROUP_SIZE overflow".to_owned())
-        })?;
-        if actual_total != declared_total {
-            return Err(Error::Quant(format!(
-                "dequant_gpu: actual_total={actual_total} (blocks×groups×group_size) != \
-                 declared_total={declared_total} (prod(shape)={:?}); refusing to silently \
-                 truncate/pad",
-                self.shape
-            )));
-        }
-
-        if total_groups == 0 {
-            // Empty cache — return a zero-length array of the correct rank-4 shape.
-            // (Matches the `dequant()` empty-output behaviour with shape[2] = 0.)
-            // The MEDIUM-1 guard above ensures `prod(shape) == 0` here, so the
-            // empty `from_bytes` call is well-formed.
+        if inputs.total_groups == 0 {
+            // Empty cache — the accounting above already proved `prod(shape)`
+            // is 0, so the empty `from_bytes` is well-formed.
             return Array::from_bytes(&[][..], &self.shape, Dtype::F32);
         }
 
-        let codes_arr = Array::from_bytes(
-            &codes_bytes,
-            &[total_groups as i32], // WORDS_PER_GROUP=1 for ISO3_GS=4
-            Dtype::U32,
-        )?;
-        let scales_arr = Array::from_bytes(&scales_bytes, &[total_groups as i32], Dtype::F32)?;
-        let quats_arr = Array::from_bytes(&quats_bytes, &[(total_groups * 4) as i32], Dtype::F32)?;
-        let norms_arr = Array::from_bytes(&norms_bytes, &[total_groups as i32], Dtype::F32)?;
+        let n = inputs.total_groups as i32;
+        // WORDS_PER_GROUP = 1 for ISO3_GROUP_SIZE = 4.
+        let codes_arr = Array::from_bytes(&inputs.codes, &[n], Dtype::U32)?;
+        let scales_arr = Array::from_bytes(&inputs.scales, &[n], Dtype::F32)?;
+        let quats_arr = Array::from_bytes(&inputs.quaternions, &[n * 4], Dtype::F32)?;
+        let norms_arr = Array::from_bytes(&inputs.norms, &[n], Dtype::F32)?;
 
         let flat = crate::isoquant_msl::iso_dequantize_v3_gpu(
             &codes_arr,
@@ -1243,12 +1209,180 @@ impl QuantIsoV3 {
             Dtype::F32,
             device,
         )?;
+        flat.reshape(&self.shape, device)
+    }
+}
 
-        // CPU blocks are sequence-major (see `append` / `append_gpu`): reshape
-        // to `[B, S, kv_h, D]`, then reorder heads↔seq back to `[B, kv_h, S, D]`.
-        let seq_major_shape = [self.shape[0], self.shape[2], self.shape[1], self.shape[3]];
-        let out = flat.reshape(&seq_major_shape, device)?;
-        out.transpose(&[0, 2, 1, 3], device)?.contiguous(device)
+/// Bytes per little-endian payload slot — every iso payload is 4-byte (`u32`
+/// codes, `f32` scales / quaternions / norms).
+const ISO_SLOT_BYTES: usize = 4;
+
+/// Flat kernel inputs for an iso store, with token rows in head-major order.
+///
+/// Field lengths, in `(token, group)` slots: `codes` and `scales` carry one
+/// entry per slot, `quaternions` four, `norms` one (the per-token norm expanded
+/// to per-group, which is what the kernel indexes).
+#[derive(Debug)]
+pub(crate) struct IsoKernelInputs {
+    /// Packed codes, little-endian `u32`.
+    pub codes: Vec<u8>,
+    /// Per-group scales, little-endian `f32`.
+    pub scales: Vec<u8>,
+    /// Per-group quaternions (4 components), little-endian `f32`.
+    pub quaternions: Vec<u8>,
+    /// Per-group norms, little-endian `f32`.
+    pub norms: Vec<u8>,
+    /// `(token, group)` slot count — the kernel's flat length.
+    pub total_groups: usize,
+}
+
+/// Build the iso dequant kernel's flat inputs from a block list, placing every
+/// token row at its **head-major** `[B, kv_h, S, D]` position.
+///
+/// One derivation for both bit widths and both readers. Two things used to be
+/// written out per store and drifted apart:
+///
+/// * The declared-vs-actual element accounting. `prod(shape)` against
+///   `blocks × groups × group_size` was copied per reader, so the same store
+///   could be accepted by one and rejected by the other.
+/// * The row order. Concatenating the blocks and reshaping the kernel's flat
+///   output as one `[B, S, kv_h, D]` run is only a valid reading at `B == 1`:
+///   each block is `[B, S_block, kv_h, D]`, so at `B > 1` the blocks interleave
+///   and the reshape maps a later block's batch-0 rows onto batch-1 slots.
+///   Permuting the *input* rows instead is exact at every `B` and costs nothing
+///   — the payload is being copied either way, the kernel is per-token
+///   positional, and the result needs no reshape-plus-transpose afterwards.
+///
+/// # Errors
+///
+/// Returns [`Error::Quant`] on a malformed shape, a block whose payload length
+/// disagrees with its row count, chunks that do not partition `shape[2]`, or a
+/// blocks-vs-shape element-count disagreement.
+pub(crate) fn iso_kernel_inputs_head_major(
+    blocks: &[IsoBlocks],
+    shape: &[i32],
+    n_groups: usize,
+    group_size: usize,
+    what: &str,
+) -> Result<IsoKernelInputs> {
+    if shape.len() != 4 {
+        return Err(Error::Quant(format!("{what}: malformed shape {shape:?}")));
+    }
+    let dim = |i: usize| -> usize { shape.get(i).copied().unwrap_or(0).max(0) as usize };
+    let (b, kv_h, s_total) = (dim(0), dim(1), dim(2));
+
+    // Accounting, derived once. `declared` is what the shape claims; `actual` is
+    // what the blocks carry. A disagreement is refused rather than reshaped.
+    let declared: usize = shape.iter().map(|&d| d.max(0) as usize).product();
+    let mut total_groups: usize = 0;
+    for blk in blocks {
+        let blk_groups = super::BlockRows::rows(blk)
+            .checked_mul(n_groups)
+            .ok_or_else(|| Error::Quant(format!("{what}: rows * n_groups overflow")))?;
+        total_groups = total_groups
+            .checked_add(blk_groups)
+            .ok_or_else(|| Error::Quant(format!("{what}: total_groups overflow")))?;
+    }
+    let actual = total_groups
+        .checked_mul(group_size)
+        .ok_or_else(|| Error::Quant(format!("{what}: total_groups * group_size overflow")))?;
+    if actual != declared {
+        return Err(Error::Quant(format!(
+            "{what}: actual_total={actual} (blocks×groups×group_size) != \
+             declared_total={declared} (prod(shape)={shape:?}); refusing to silently \
+             truncate/pad"
+        )));
+    }
+
+    let perm = super::seq_layout::head_major_token_order(
+        b,
+        s_total,
+        kv_h,
+        blocks.iter().map(super::BlockRows::rows),
+    )
+    .map_err(|e| Error::Quant(format!("{what}: {e}")))?;
+
+    let mut out = IsoKernelInputs {
+        codes: vec![0_u8; total_groups * ISO_SLOT_BYTES],
+        scales: vec![0_u8; total_groups * ISO_SLOT_BYTES],
+        quaternions: vec![0_u8; total_groups * 4 * ISO_SLOT_BYTES],
+        norms: vec![0_u8; total_groups * ISO_SLOT_BYTES],
+        total_groups,
+    };
+
+    let mut row = 0usize;
+    for blk in blocks {
+        let rows = super::BlockRows::rows(blk);
+        // The scatter below indexes each payload by row; a length that is not a
+        // whole number of rows would silently read across a row boundary.
+        let want_codes = rows * n_groups;
+        if blk.codes.len() != want_codes
+            || blk.scales.len() != want_codes
+            || blk.quaternions.len() != want_codes * 4
+            || blk.norms.len() != rows
+        {
+            return Err(Error::Quant(format!(
+                "{what}: block payload disagrees with its {rows} rows at n_groups={n_groups} \
+                 (codes {} scales {} quaternions {} norms {}; want {want_codes} {want_codes} {} \
+                 {rows})",
+                blk.codes.len(),
+                blk.scales.len(),
+                blk.quaternions.len(),
+                blk.norms.len(),
+                want_codes * 4,
+            )));
+        }
+        for r in 0..rows {
+            let Some(&dst_token) = perm.get(row + r) else {
+                return Err(Error::Quant(format!(
+                    "{what}: block rows exceed the permutation length {}",
+                    perm.len()
+                )));
+            };
+            copy_f32_slots(
+                &mut out.codes,
+                dst_token * n_groups,
+                &blk.codes[r * n_groups..(r + 1) * n_groups],
+                u32::to_le_bytes,
+            );
+            copy_f32_slots(
+                &mut out.scales,
+                dst_token * n_groups,
+                &blk.scales[r * n_groups..(r + 1) * n_groups],
+                f32::to_le_bytes,
+            );
+            copy_f32_slots(
+                &mut out.quaternions,
+                dst_token * n_groups * 4,
+                &blk.quaternions[r * n_groups * 4..(r + 1) * n_groups * 4],
+                f32::to_le_bytes,
+            );
+            // Per-token → per-group expand: the kernel reads `norms[gid]` with
+            // `gid = token * n_groups + grp`, and every group in a token shares
+            // the token's norm.
+            let n_bytes = blk.norms[r].to_le_bytes();
+            let base = dst_token * n_groups * ISO_SLOT_BYTES;
+            for g in 0..n_groups {
+                let at = base + g * ISO_SLOT_BYTES;
+                out.norms[at..at + ISO_SLOT_BYTES].copy_from_slice(&n_bytes);
+            }
+        }
+        row += rows;
+    }
+    Ok(out)
+}
+
+/// Write `src` into `dst` as little-endian 4-byte slots starting at slot
+/// `slot_offset`. Shared by the code / scale / quaternion scatters above.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "dst is sized total_groups slots and slot_offset + src.len() is bounded by the \
+              permutation's range, which head_major_token_order pins to that same count"
+)]
+fn copy_f32_slots<T: Copy>(dst: &mut [u8], slot_offset: usize, src: &[T], to_le: fn(T) -> [u8; 4]) {
+    for (i, &v) in src.iter().enumerate() {
+        let at = (slot_offset + i) * 4;
+        dst[at..at + 4].copy_from_slice(&to_le(v));
     }
 }
 

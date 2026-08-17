@@ -7,7 +7,9 @@
 //! corrupts a multi-append, multi-head cache, while the sequence-major reorder
 //! round-trips exactly for every append pattern.
 
-use super::{transpose_chunked_seq_heads, transpose_heads_seq, transpose_seq_heads};
+use super::{
+    head_major_token_order, transpose_chunked_seq_heads, transpose_heads_seq, transpose_seq_heads,
+};
 
 const B: usize = 1;
 
@@ -274,4 +276,91 @@ fn reorder_round_trips_identity() {
     let seq = transpose_heads_seq(&src, B, kv_h, s, d);
     let back = transpose_seq_heads(&seq, B, s, kv_h, d);
     assert_eq!(src, back, "reorder round-trip must be identity");
+}
+
+// ── Head-major token permutation ─────────────────────────────────────────────
+
+/// `head_major_token_order` must agree with `transpose_chunked_seq_heads`: both
+/// are the same reorder, one applied to the payload rows on the way in and one
+/// to the decoded values on the way out. Permuting rows by `perm` and reading
+/// the result as head-major must equal reordering the sequence-major decode.
+///
+/// Mutation check: drop the `s_off` term from the destination index in
+/// `head_major_token_order` and this goes red at every multi-chunk case.
+#[test]
+fn head_major_token_order_matches_the_output_reorder() {
+    for &(b, kv_h, appends, d) in &[
+        (1usize, 1usize, &[3usize][..], 4usize),
+        (1, 4, &[2, 1][..], 8),
+        (2, 1, &[2, 3][..], 4),
+        (2, 2, &[2, 3][..], 4),
+        (3, 4, &[1, 1, 1, 2][..], 8),
+    ] {
+        let s_total: usize = appends.iter().sum();
+        let seq_major = chunked_seq_major_buffer(b, kv_h, appends, d);
+        let rows = appends.iter().map(|&n| b * kv_h * n);
+        let perm = head_major_token_order(b, s_total, kv_h, rows.clone())
+            .expect("well-formed chunk partition");
+
+        // Route A: reorder the decoded values.
+        let via_output = transpose_chunked_seq_heads(&seq_major, b, s_total, kv_h, d, rows)
+            .expect("well-formed chunk partition");
+        // Route B: place each source row at `perm[row]` and read straight off.
+        let mut via_input = vec![0.0_f32; b * kv_h * s_total * d];
+        for (row, &dst) in perm.iter().enumerate() {
+            via_input[dst * d..(dst + 1) * d].copy_from_slice(&seq_major[row * d..(row + 1) * d]);
+        }
+
+        assert_eq!(
+            via_input, via_output,
+            "input permutation and output reorder must agree for b={b} kv_h={kv_h} \
+             appends={appends:?} d={d}"
+        );
+        assert_eq!(
+            via_input,
+            head_major_reference(b, kv_h, s_total, d),
+            "and both must equal the index-math reference"
+        );
+    }
+}
+
+/// The permutation is a bijection onto `[0, B * kv_h * S)` — a duplicate or a
+/// gap would leave one token slot written twice and another holding the
+/// allocation's zeros, which is the silent-corruption shape this whole reorder
+/// exists to avoid.
+#[test]
+fn head_major_token_order_is_a_bijection() {
+    for &(b, kv_h, appends) in &[
+        (2usize, 2usize, &[2usize, 3][..]),
+        (3, 1, &[1, 1, 4][..]),
+        (1, 5, &[7][..]),
+    ] {
+        let s_total: usize = appends.iter().sum();
+        let perm = head_major_token_order(b, s_total, kv_h, appends.iter().map(|&n| b * kv_h * n))
+            .expect("well-formed chunk partition");
+        let mut seen = vec![false; b * kv_h * s_total];
+        assert_eq!(perm.len(), seen.len(), "one entry per token row");
+        for &dst in &perm {
+            assert!(!seen[dst], "destination {dst} written twice");
+            seen[dst] = true;
+        }
+        assert!(seen.iter().all(|&s| s), "every destination slot is written");
+    }
+}
+
+#[test]
+fn head_major_token_order_rejects_a_partition_that_does_not_add_up() {
+    let err = head_major_token_order(2, 5, 2, [8usize, 8])
+        .expect_err("under-running chunks must be rejected");
+    assert!(
+        err.to_string().contains("cover 4 sequence positions"),
+        "expected the coverage error, got: {err}"
+    );
+    let err = head_major_token_order(2, 5, 2, [8usize, 11, 1])
+        .expect_err("a ragged chunk must be rejected");
+    assert!(
+        err.to_string()
+            .contains("not a whole number of sequence positions"),
+        "expected the ragged-chunk error, got: {err}"
+    );
 }
