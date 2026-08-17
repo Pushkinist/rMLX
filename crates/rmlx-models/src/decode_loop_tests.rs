@@ -863,3 +863,50 @@ fn chunked_prefill_rejects_empty_prompt() {
          fatal, or a doomed request is replayed; got: {err:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// reject_nan_prefill
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reject_nan_prefill_passes_a_clean_row_through() {
+    // Output neutrality: on every healthy prefill the guard must be invisible.
+    // Paired with the Err case below, this is the mutation check — inverting the
+    // condition turns exactly one of the two red.
+    assert!(
+        reject_nan_prefill("TestArch", 0, 42.5, 4096).is_ok(),
+        "a NaN-free prefill must pass through untouched"
+    );
+}
+
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: expect_err IS the assertion — an Ok here is the regression under test, and its panic names it"
+)]
+fn reject_nan_prefill_propagates_and_is_replayable() {
+    let err = reject_nan_prefill("TestArch", 7, f32::NAN, 3770)
+        .expect_err("a NaN prefill must surface as Err, not a one-token Ok run");
+    let msg = err.to_string();
+    // The cause has to carry what a reader needs to act on it: which arch, how
+    // many NaN cells, and how long the prompt was.
+    assert!(
+        msg.contains("TestArch"),
+        "cause must name the arch, got: {msg}"
+    );
+    assert!(msg.contains('7'), "cause must carry nan_count, got: {msg}");
+    assert!(
+        msg.contains("3770"),
+        "cause must carry prompt_len, got: {msg}"
+    );
+    // This fault is intermittent, unlike the deterministic empty-prompt case
+    // above, so the retry envelope should be allowed to replay it. Raising it
+    // before the poisoned token reaches step_fn is what makes that safe: the
+    // delivered prefix is empty, so there is nothing for the replay to diverge
+    // from. `Error::Model` would classify Fatal and surface a 5xx for a fault a
+    // retry usually clears.
+    assert!(
+        err.is_migratable(),
+        "the NaN cause must be a variant the retry envelope may replay; got: {err:?}"
+    );
+}

@@ -19,6 +19,7 @@ use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{argmax, Array, Device, Dtype};
 
 use crate::constraint::ConstraintEngine;
+use crate::decode_loop::reject_nan_prefill;
 use crate::kv_cache::{kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N};
 use crate::prompt_cache::{chained_block_hashes_seeded, Consumed, ReusePolicy};
 use crate::sampler::apply_mask_argmax;
@@ -332,6 +333,12 @@ pub fn generate_greedy(
     let logit_bytes = logits_flat.to_bytes()?;
     let nan_count = count_nan_in_bytes(&logit_bytes, logits_flat.dtype());
     let max_abs_logit = max_abs_from_bytes(&logit_bytes, logits_flat.dtype());
+    reject_nan_prefill(
+        "LagunaForCausalLM",
+        nan_count,
+        max_abs_logit,
+        prompt_ids.len(),
+    )?;
 
     // A6.2 masked-argmax fork (first emit).
     let mask_active = constraint.as_ref().is_some_and(|c| c.wants_mask());
@@ -411,10 +418,6 @@ pub fn generate_greedy(
         logprobs: None,
     });
     step_fn(steps.last().unwrap());
-
-    if nan_count > 0 {
-        return Ok(steps);
-    }
 
     // Push this prefill snapshot to the prompt cache (Miss → store). Clone the
     // post-prefill KV caches (refcount bump, no data copy) before the decode
@@ -594,9 +597,32 @@ fn decode_loop(
         let logits_flat = decode_logits.reshape(&[1, vocab], device)?;
         logits_flat.eval()?;
 
+        // NaN mid-decode aborts the request, exactly as a failed forward does
+        // twenty lines above. Truncating instead — emitting the junk token this
+        // row selects and breaking — hands back a short generation the server
+        // reports as finish_reason="length", indistinguishable from a clean
+        // token-cap stop, with one fabricated token on the end. Raising before
+        // the token is pushed keeps everything already delivered genuinely
+        // healthy, so a temp=0 replay reproduces that prefix and continues past
+        // the fault point.
         let logit_bytes = logits_flat.to_bytes()?;
         let nan_count = count_nan_in_bytes(&logit_bytes, logits_flat.dtype());
         let max_abs_logit = max_abs_from_bytes(&logit_bytes, logits_flat.dtype());
+        if nan_count > 0 {
+            let e = Error::Other(format!(
+                "laguna generate_greedy: decode logits contain {nan_count} NaN cells at step \
+                 {step_idx} (max|logit| = {max_abs_logit}), aborting generation"
+            ));
+            tracing::error!(
+                error = %e,
+                step = step_idx,
+                emitted = steps.len(),
+                nan_count,
+                max_abs_logit,
+                "laguna generate_greedy: NaN in decode logits, aborting generation"
+            );
+            return Err(e);
+        }
 
         // A6.3: only apply mask when engine is engaged (wants_mask).
         let mask_active = constraint.as_ref().is_some_and(|c| c.wants_mask());
@@ -679,10 +705,6 @@ fn decode_loop(
             logprobs: None,
         });
         step_fn(steps.last().unwrap());
-
-        if nan_count > 0 {
-            break;
-        }
 
         // EOS-stop in the decode loop.
         if eos_ids.contains(&next_id) {

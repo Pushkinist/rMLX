@@ -366,21 +366,34 @@ cell.
 **Never draw a conclusion about model *output* from a validated run.** The unit
 suites are invariant — the same pass/fail result in every repetition of both
 modes, with zero invalid-access reports — but real inference is not.
-Ternary-Bonsai-8B (Qwen3 dense) intermittently degenerates under
-validation: it emits a single token (id 0, `"!"`), reports `tps=0.064`, and
-exits 0 with no diagnostic on stderr and nothing in Unified Logging. Reproduced
-here 1 run in 3 at `--kv-quant k8v8` under `FAIL_MODE=allow`, and independently
-6 in 12 at `k8v8` and 2 in 4 at `none`, against 0 of 13 unvalidated runs.
-gemma-4-e2b is clean throughout, so it is architecture-specific on this host.
+Ternary-Bonsai-8B (Qwen3 dense) intermittently produces a NaN prefill on this
+host. The generation then aborts with an `error!` naming `nan_count`,
+`max_abs_logit` and `prompt_len`, and the process exits non-zero. It used to
+emit a single token (id 0, `"!"`), report `tps=0.064`, and exit 0 with nothing
+logged at any level — that silent shape is gone, but the underlying NaN is not
+fixed by making it loud.
+
+**What the trigger is not.** A 108-run campaign across four separately-built
+binaries put all three degenerate events inside one window where `prefill_tps`
+was depressed ~7% (0 of 60 runs at ~266 tok/s; 3 of 10 at ~247), and ruled out
+`--log debug`, CPU contention, and prompt length with numbers. Architecture
+specificity is **not** established: gemma-4-e2b has been clean, but no
+gemma-4-e2b run has been shown to sample that depressed band, and a campaign
+that never enters it has not sampled the failure regime. Do not pool runs across
+a >5% `prefill_tps` shift, and record the band on every run.
 
 `MTL_SHADER_VALIDATION_FAIL_MODE` was tried as a discriminator, on the theory
-that `zerofill` silently dropping a KV store would explain it. It does not:
-`allow` permits the write and is where the degeneration reproduced, while
-`zerofill` — the setting this gate uses — was clean 3 of 3. So this is **not**
-evidence of an out-of-bounds write in the Qwen3 path, and no invalid access is
-ever reported. Whether it is a latent engine defect that instrumentation
-perturbs into visibility or a defect in the instrumentation itself is unresolved
-and tracked outside this document.
+that `zerofill` silently dropping a KV store would explain it. **That
+experiment settles nothing**: n=3 per arm, Fisher p = 1.0, no power at any
+effect size — and its direction was read backwards. `allow` reproducing while
+`zerofill` is clean is what a genuine out-of-bounds *access* predicts; the
+assignment is inverted only for a different hypothesis ("validation drops a
+write the engine needs"). No invalid access is ever reported, and that negative
+*is* load-bearing: the detector was mutation-checked by running the OOB canary
+under both fail modes, and it reported in both. An out-of-bounds access would
+have been caught and was not — which points at an in-bounds read of stale or
+never-written device memory rather than at an OOB write. That is a hypothesis
+under test, not a conclusion; it is tracked outside this document.
 
 Current state: the whole GPU suite — all five crates, `rmlx-kv-quant` included —
 runs clean under validation, zero invalid accesses.

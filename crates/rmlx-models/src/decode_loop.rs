@@ -181,6 +181,54 @@ impl PostDecode {
     }
 }
 
+/// Abort a generation whose prefill logits contain NaN.
+///
+/// A logit row with NaN in it is not a degraded answer, it is no answer: greedy
+/// selection over an all-NaN row returns index 0 whatever the model computed, so
+/// the run emits one fixed junk token and stops. Handing that back as `Ok` gives
+/// the caller a plausible-looking token, a zero exit status, and — through
+/// `rmlx baseline` / the OpenAI routes — a recorded measurement or an HTTP 200.
+/// Every automated surface in this repo reads token counts and throughput
+/// fields, never the log, so a fault that reports as an ordinary outcome passes
+/// all of them.
+///
+/// Called **before** the poisoned token is pushed and handed to `step_fn`, so
+/// nothing reaches the wire: on the server the delivered prefix stays empty and
+/// the retry envelope can replay the request from a clean slate.
+///
+/// [`Error::Other`] on purpose. The envelope classifies it `Migratable`, which
+/// is what this fault wants: it is intermittent, so a replay of the same prompt
+/// at `temperature = 0` has a real chance of completing, and that is exactly the
+/// case the envelope exists for. [`Error::Model`] — used for the *deterministic*
+/// empty-prompt case specifically to suppress replay — would burn the retry
+/// budget's usefulness on a fault that a retry usually clears. A genuinely
+/// deterministic NaN (corrupt weights) costs two extra attempts and then
+/// surfaces with this same message. See `docs/SERVER.md` § Retry Envelope.
+pub(crate) fn reject_nan_prefill(
+    arch: &str,
+    nan_count: usize,
+    max_abs_logit: f32,
+    prompt_len: usize,
+) -> Result<()> {
+    if nan_count == 0 {
+        return Ok(());
+    }
+    let e = Error::Other(format!(
+        "{arch}: prefill logits contain {nan_count} NaN cells (max|logit| = {max_abs_logit}, \
+         prompt_len = {prompt_len}) — greedy selection over a NaN row is meaningless, \
+         aborting generation"
+    ));
+    tracing::error!(
+        error = %e,
+        arch,
+        nan_count,
+        max_abs_logit,
+        prompt_len,
+        "prefill logits contain NaN, aborting generation"
+    );
+    Err(e)
+}
+
 /// Decode-loop timing accumulators, returned for arch-side `decode_profile`
 /// emission. Nanoseconds; the arch converts to the milliseconds field shapes
 /// `scripts/aggregate_decode_profile.py` parses.

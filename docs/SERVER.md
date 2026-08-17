@@ -953,6 +953,21 @@ there, adding a variant fails the build until it is explicitly classified as
 transient or permanent — a new error can never silently default into a retry
 bucket.
 
+**Two NaN-shaped failures, deliberately on opposite sides of the line.**
+`SmokeProbe` is a load-time verdict on a snapshot — deterministic by
+construction (fixed probe, `temperature = 0`), so a replay reproduces it and it
+is `Fatal`. A **NaN prefill** raised from an arch's `generate_greedy`
+(`reject_nan_prefill`) is the opposite shape: intermittent, observed at a few
+percent on an otherwise clean host, so a replay of the same prompt at
+`temperature = 0` has a real chance of completing. It is therefore raised as
+`Other`, which classifies `Migratable`. That is only safe because the guard
+fires **before** the poisoned token reaches `step_fn`: `delivered` is still
+empty, `skip_count` is 0, and the replay starts from a clean slate instead of
+diverging from a junk prefix on its first token. A deterministic NaN (corrupt
+weights) costs two extra attempts and then surfaces with the same cause. The
+empty-prompt case keeps `Model` for the mirror-image reason — it is
+deterministic, and replaying it is guaranteed waste.
+
 ### Skip conditions
 
 Token-replay retry is disabled when any of the following hold:

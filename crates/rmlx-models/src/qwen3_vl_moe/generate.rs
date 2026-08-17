@@ -29,9 +29,10 @@
 
 use rmlx_core::error::Result;
 use rmlx_mlx::{Array, Device, Dtype};
+use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
 
 use crate::constraint::ConstraintEngine;
-use crate::decode_loop::ProbeStep;
+use crate::decode_loop::{reject_nan_prefill, ProbeStep};
 use crate::kv_cache::kv_max_seq_and_ceiling;
 use crate::prompt_cache::{chained_block_hashes_seeded, Consumed, ReusePolicy};
 use crate::sampler::{apply_mask_argmax, sample_token_array, Pcg32, PenaltyConfig, SamplerConfig};
@@ -106,6 +107,26 @@ fn piece_for(token_id: u32, tokenizer: &tokenizers::Tokenizer) -> String {
         .id_to_token(token_id)
         .unwrap_or_default()
         .replace('\u{2581}', " ")
+}
+
+/// Abort the request when the prefill logit row carries NaN.
+///
+/// Called by both prefill paths (text and image), which feed the same decode
+/// loop and select through the same argmax. One host readback of the vocab row
+/// per request — not per token, so the decode hot path is untouched. Without it
+/// a NaN prefill on this arch runs to full length and returns garbage with no
+/// guard and no verdict.
+fn guard_prefill_logits(logits: &Array, prompt_len: usize) -> Result<()> {
+    Array::eval(logits)?;
+    let bytes = logits.to_bytes()?;
+    let nan_count = count_nan_in_bytes(&bytes, logits.dtype());
+    let max_abs_logit = max_abs_from_bytes(&bytes, logits.dtype());
+    reject_nan_prefill(
+        "Qwen3VLMoeForConditionalGeneration",
+        nan_count,
+        max_abs_logit,
+        prompt_len,
+    )
 }
 
 /// Emit one decode step (token id + piece). Logit stats are left at defaults —
@@ -257,6 +278,7 @@ pub fn generate_greedy(
         "Qwen3VLMoeForConditionalGeneration",
         |chunk, kv| model.forward_seq_with_cache(chunk, Some(kv), device),
     )?;
+    guard_prefill_logits(&logits, prompt_ids.len())?;
     let first = pick_token(
         &logits,
         vocab,
@@ -524,6 +546,8 @@ pub fn generate_image(
     for c in &mut kv {
         c.exit_prefill(device)?;
     }
+
+    guard_prefill_logits(&logits, aug_ids.len())?;
 
     let mut steps = Vec::with_capacity(n_tokens);
     let first = pick_token(

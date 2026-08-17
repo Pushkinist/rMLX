@@ -374,6 +374,22 @@ resident weights), and `metal_gen_alloc_mb` is that minus what was already live
 when generation started. **Only `metal_gen_alloc_mb` compares between two runs
 of the same model.** Both read `0` where no Metal allocator is present.
 
+#### When there is no summary line
+
+`baseline` runs exactly one generation per process with EOS-stop disabled, and
+every architecture reports its KV-cache byte total through the same per-instance
+counter. If that counter's sequence has not advanced across the call, the
+generation left before its post-decode store — it ended early on a path that did
+not report a failure. That is **refused**, not warned: no summary line, no
+metrics record, non-zero exit. `rmlx bench` already refuses the identical
+verdict. Downgrading it to a warning printed a full summary and, under
+`--record`, wrote a permanent row in the append-only store from a run that never
+generated.
+
+A reported-but-zero byte count is different and stays a warning: there the
+generation completed and only its `kv_cache_bytes` column is unusable, so the
+column is omitted and the timing measurement stands.
+
 #### GPU-capture flags (debug builds only)
 
 Three further flags exist **only** when the binary is built with

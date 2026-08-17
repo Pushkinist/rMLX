@@ -13,6 +13,11 @@
 #   the run completed successfully, reporting `ttft_ms=0 decode_tps=0.000
 #   prefill_tps=0.0` — a fabricated zero, emitted as a measurement, with exit 0.
 #
+#   NaN detection: a prefill whose logits contained NaN used to be detected,
+#   emit one junk token (greedy selection over an all-NaN row returns index 0
+#   whatever the model computed), and `return Ok` — logging nothing at any
+#   level. The run reported one token, `decode_tps` ~0.06, and exit 0.
+#
 #   Both shapes defeat the same thing. Every automated gate in this repo (bench
 #   harness, perf canary, regression gate, smoke probes) reads `finish_reason`,
 #   token counts, and throughput fields — never the log. A failure that reports
@@ -43,13 +48,17 @@
 #   2. DECODE (message-keyed): every `decode step failed` site must `return Err`.
 #   3. SWEEP (message-keyed): the shared chunked_prefill must CAPTURE its cause
 #      (`= Some(e)`), not `return Err` inline — see RULE 3 below.
+#   4. DETECT (shape-keyed, arch layer): a site that COUNTS NaN in a logit row
+#      must propagate the finding. RULE 1 cannot see this shape at all: it keys
+#      on `error = %e`, and a detection that logs nothing has no anchor.
 #
 # SCOPE (what this does NOT cover)
 #   RULE 1 scans crates/rmlx-models/src only — the arch generate/prefill paths
 #   where this class lives. Failure sites in other crates are not covered.
 #   RULE 1 keys on `error = %e`; a failure-log site that does not carry the
 #   error as a structured field is invisible to it (and is a traceability bug
-#   in its own right — see the tracing rules in CLAUDE.md).
+#   in its own right — see the tracing rules in CLAUDE.md). RULE 4 exists
+#   precisely because that anchor is missing from a detect-and-discard site.
 #
 # Exit 0 = clean. Exit 1 = violation found.
 
@@ -172,21 +181,63 @@ check_sweep() {
         | grep -v '_tests\.rs:' | cut -d: -f1,2 || true)
 }
 
+# ── RULE 4: a counted NaN must propagate, not be discarded ───────────────────
+#
+# Anchor: a call to `count_nan_in_bytes(` in the arch layer — the detector
+# itself, an API name rather than a log message, so it cannot be evaded by
+# rewording. (Definitions of the helper are skipped; only call sites count.)
+#
+# Verdict: within NAN_CONTEXT lines the finding must reach a propagating form —
+# `reject_nan_prefill(` (the shared prefill guard) or a literal `return Err`.
+# Neither present means the site computed the count and then dropped it, which
+# is what produced a one-token run reported as success.
+#
+# The window is deliberately narrow: it is one error construction, one
+# structured `error!`, and the return. "Somewhere later in the function" is not
+# what this pins — the guard belongs immediately after the detection, before the
+# poisoned token is selected and handed to `step_fn`.
+NAN_CONTEXT=16
+
+check_nan_detect() {
+    local site f ln win
+    while IFS= read -r site; do
+        [ -z "${site}" ] && continue
+        f="${site%%:*}"
+        ln="${site##*:}"
+        win="$(sed -n "${ln},$((ln + NAN_CONTEXT))p" "${f}")"
+        if ! printf '%s' "${win}" | grep -q 'reject_nan_prefill(\|return Err'; then
+            echo "VIOLATION: ${f}:${ln} — NaN is counted here and never propagated."
+            echo "    Within ${NAN_CONTEXT} lines there is no 'reject_nan_prefill(' and no"
+            echo "    'return Err'. A NaN logit row makes greedy selection return a fixed"
+            echo "    junk token; returning that as Ok reports a fault as a measurement."
+            printf '%s\n' "${win}" | sed 's/^/    | /'
+            violations=$((violations + 1))
+        fi
+    done < <(grep -rn --include='*.rs' -F 'count_nan_in_bytes(' crates/rmlx-models/src/ \
+        | grep -v '_tests\.rs:' | grep -v 'fn count_nan_in_bytes(' | cut -d: -f1,2 || true)
+}
+
 check_swallow
 check_decode
 for anchor in "${SWEEP_ANCHORS[@]}"; do
     check_sweep "${anchor}"
 done
+check_nan_detect
 
 if [ "${violations}" -gt 0 ]; then
     echo
-    echo "FAIL: ${violations} failure site(s) swallow the error or skip the prefill sweep."
+    echo "FAIL: ${violations} failure site(s) swallow the error, skip the prefill"
+    echo "sweep, or discard a detected NaN."
     echo "A decode step that fails must abort the request — returning the tokens"
     echo "produced so far is reported as finish_reason=\"length\", indistinguishable"
     echo "from a clean token-cap stop. A prefill chunk that fails must abort too —"
     echo "returning no logits without a cause completes the run and reports zeros"
-    echo "as a measurement. Every automated gate reads those fields, not the log."
+    echo "as a measurement. A NaN logit row is the same class one step earlier:"
+    echo "greedy selection over it returns a fixed junk token, and returning that"
+    echo "as Ok reports the fault as a one-token generation with exit 0."
+    echo "Every automated gate reads those fields, not the log."
     exit 1
 fi
 
-echo "OK: no swallow at any arch-layer failure-log site; decode + prefill propagate."
+echo "OK: no swallow at any arch-layer failure-log site; decode + prefill propagate;"
+echo "    every counted NaN is propagated."

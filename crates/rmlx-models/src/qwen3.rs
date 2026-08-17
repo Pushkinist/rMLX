@@ -67,7 +67,8 @@ use tracing::{debug, info};
 use crate::calibration_sink::CalibrationSink;
 use crate::constraint::ConstraintEngine;
 use crate::decode_loop::{
-    capture_logprobs, choose_token, chunked_prefill, pipelined_decode, DecodeCtx,
+    capture_logprobs, choose_token, chunked_prefill, pipelined_decode, reject_nan_prefill,
+    DecodeCtx,
 };
 use crate::kv_cache::{
     kv_max_seq_and_ceiling, kv_quant_for_layer, warn_if_kv_codec_net_negative, KvLayerShape,
@@ -2057,6 +2058,12 @@ pub fn generate_greedy<'a>(
     let logit_bytes = logits_flat.to_bytes()?;
     let nan_count = count_nan_in_bytes(&logit_bytes, logits_flat.dtype());
     let max_abs_logit = max_abs_from_bytes(&logit_bytes, logits_flat.dtype());
+    reject_nan_prefill(
+        "Qwen3ForCausalLM",
+        nan_count,
+        max_abs_logit,
+        prompt_ids.len(),
+    )?;
 
     // top-k logprob capture (0 = disabled, hot-loop zero-overhead).
     let lp_k = sampler_cfg.top_logprobs_k as usize;
@@ -2128,10 +2135,6 @@ pub fn generate_greedy<'a>(
         logprobs: prefill_logprobs,
     });
     (ctx.step_fn)(steps.last().unwrap());
-
-    if nan_count > 0 {
-        return Ok(steps);
-    }
 
     // Push this prefill snapshot to the prompt cache (Miss → store).
     // We clone the post-prefill KV caches (refcount bump, no data copy) before
