@@ -158,6 +158,15 @@ Ties are not exotic — see the measurement under
 on a realistic 262144-wide BF16-derived softmax row, 259416 of 262143 adjacent
 pairs are exactly equal.
 
+**The device half of the rule is confirmed on real streams, not just on
+fixtures.** A census of pure-GPU greedy 512-token generations found exact top-2
+ties at 2 of 275 steps on Ternary-Bonsai-8B and at 4 of 200 on gemma-4-e2b — so
+a tie decides a served token roughly once per fifty, not once per run. On every
+tied step censused, the device emitted the **lower** of the tied ids: 12 of 12.
+That is the observed behaviour `host_argmax` is written to mirror, and it is why
+the rule is stated as lowest-id rather than left to whichever path a request
+happens to take.
+
 **Scope.** The rule covers everything that selects or filters a token:
 
 | Site | Rule |
@@ -251,13 +260,24 @@ channel the decode loop already propagates.
 **An all-`false` constraint mask.** No token satisfies the grammar, so every
 token the selection could return violates it. Returning one anyway is the worst
 option: the engine state that produced the empty mask is persistent, so the
-stream emits the same arbitrary token (id 0) for the rest of the generation and
-the request reports success. Logging instead is no better at the rate this is
-reached — the check sits on the per-token decode path, so a `warn!` would fire
-once per emitted token and, at a few hundred bytes a line, evict the whole log
-directory under `RMLX_LOG_CAP_MB` within hours, deleting the evidence it exists
-to provide. All three mask-accepting entry points (`apply_mask_argmax`,
+stream would emit the same arbitrary token (id 0) for the rest of the generation
+while the request reports success. Logging instead is no better — the check sits
+on the per-token decode path, so a `warn!` would fire once per emitted token
+and, at a few hundred bytes a line, evict the whole log directory under
+`RMLX_LOG_CAP_MB` within hours, deleting the evidence it exists to provide. All
+three mask-accepting entry points (`apply_mask_argmax`,
 `argmax_with_penalties`, `sampling_distribution`) refuse it.
+
+**That guard is unit-tested only; it has no demonstrated production trigger.**
+An attempt to construct an all-forbidden mask through the HTTP surface did not
+find one. `{"enum": []}` is rejected at schema parse with HTTP 400, before any
+mask is built; and because the tokenizer is byte-level BPE, exotic `const` or
+single-`enum` values still leave a byte that continues them, so they never
+starve the mask either. The constraint engine itself does engage on these
+requests, so the guarded path is live — but the all-`false` state was not
+reachable from outside. Read the guard as a defence against a future
+constraint-engine defect, proven by construction in tests and by argument from
+the code path, not as a reproduction of an observed served failure.
 
 **A non-finite logits row, on the sampling path.** `softmax_scaled` errors when
 the exponentials do not sum to a finite value, which happens exactly when a
@@ -667,10 +687,19 @@ Reading it:
 
 At `--temperature 0.0001` the host categorical sampler is *close to* an argmax,
 so its token stream might be expected to match the greedy GPU `argmax` stream.
-On gemma-4-e2b it does, for all 100 tokens. On Ternary-Bonsai-8B it agrees
-through 32 tokens and diverges by 64. The divergence is reproducible and every
-run within a cell agrees, so it is a deterministic property of the two paths
-and not a race.
+It does not. The divergence is reproducible and every run within a cell agrees,
+so it is a deterministic property of the two paths and not a race.
+
+**Which architecture exhibits it is a property of the prompt and the window
+length, not of the architecture, and must not be used to scope the defect.**
+The original filing saw gemma-4-e2b agree with greedy for all 100 tokens while
+Ternary-Bonsai-8B agreed through 32 and diverged by 64. A later run at 512 max
+tokens on a different prompt (`--kv-quant none --max-ctx 4096`, `release-perf`)
+inverted that exactly: Ternary-Bonsai-8B was identical to greedy for all 275
+tokens it emitted, and gemma-4-e2b diverged at step 132. Both observations are
+real and neither is a fact about the model. A window that ends before the first
+tied row shows agreement and nothing more, so an arm that matches is evidence of
+a short window, not of an unaffected architecture.
 
 #### What is proven
 
@@ -704,16 +733,30 @@ and returned the last id rather than 0 on a fully masked row. Fixed, and pinned
 by tests that use MLX's own reduction as the oracle. See the tie-break contract
 under [Greedy](#greedy-temperature--0).
 
-#### What is not proven
+#### The mechanism, established
 
-**The mechanism behind the Bonsai divergence is still unestablished.** The
-temperature-`1e-4` path never enters `argmax_with_penalties`, so the greedy fix
-above cannot have changed that stream — it is a different code path, and the
-observation stands unexplained. The tie mechanism described above is a
-*sufficient* explanation, and it is now known to be reachable, but nothing here
-shows it is the *actual* one. Two other candidates are untested: a near-tie
-inside the 0.0104 window (which produces the same symptom without an exact
-tie), and something outside the sampler entirely.
+**The divergence is the exact-tie mechanism. The residual is closed.** The
+closure condition this section set for itself was the gap between the top two
+logits at the first divergent step, read via `logprobs: true` with
+`top_logprobs: 2` (which reports `logit - lse` per rank): a gap of `0` or below
+`104 * temperature` confirms the tie/near-tie mechanism, a gap well above it
+kills the tie explanation. That was run, on the gemma-4-e2b divergence above.
+
+At step 132 the greedy stream emits 16939 (`▁featured`) and the
+temperature-`1e-4` stream emits 22420 (`▁incorporated`). Both ranks report the
+same logprob, `-1.0606343`, bit for bit — a gap of **exactly `0.0`**. That is an
+exact tie, not a near-tie: the post-softmax distribution over the two ids is
+uniform, the inverse-CDF draw takes whichever the RNG lands on, and the device
+`argmax` takes the lower id. Both paths are correct and there is no third
+mechanism left to look for. The near-tie candidate (a gap inside the 0.0104
+window, same symptom without an exact tie) did not need to be invoked, and
+"something outside the sampler" is excluded by a gap that is identically zero.
+
+One control makes this a measurement rather than a coincidence: the
+temperature-`1e-4` streams are **byte-identical across the two arms** of this
+change. That confirms on real output what the code path already implies — the
+temperature path never enters `argmax_with_penalties`, so the greedy tie fix
+neither introduced this divergence nor masked it.
 
 The original filing also offered `--repetition-penalty 1.1` producing the same
 divergent stream as corroboration. It is not: that flag divides positive logits
@@ -721,20 +764,9 @@ of the trailing-20 ids by 1.1, which is a different objective, not another
 route to the same argmax. Its agreement with the temperature stream is evidence
 for nothing either way.
 
-**What would settle it**, and what to run before treating this as closed: the
-top-2 logits at the first divergent step. Unlike when this was filed, the server
-does dump them — `logprobs: true` with `top_logprobs: 2` reports
-`logit - lse` per rank, and the difference of the top two ranks is the gap. Run
-the greedy and the temperature-`1e-4` cells with that enabled, find the first
-step whose token ids differ, and read the gap:
-
-- gap `== 0` or below `104 * temperature` ⇒ the tie/near-tie mechanism is
-  confirmed and the residual is closed;
-- gap well above that ⇒ the tie explanation is dead, the near-zero-temperature
-  path is picking a token that had no probability mass, and the real cause is
-  still open.
-
-Until that is run, do not record this as fully explained.
+What this does **not** license is treating a near-zero temperature as an oracle
+for greedy. The mechanism is understood; the two streams still legitimately
+differ, for the reasons under [What is proven](#what-is-proven) above.
 
 #### Consequence for a future fused GPU sampler
 

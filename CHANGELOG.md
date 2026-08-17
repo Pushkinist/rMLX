@@ -141,16 +141,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a row: it mirrors the device reduction, which skips `NaN` and returns the
   largest real logit, and erroring there would re-create the host/device split
   the tie contract exists to close.
-- **An all-`false` constraint mask produced a stuck stream instead of an
+- **An all-`false` constraint mask would produce a stuck stream instead of an
   error.** No token satisfies the grammar, so every token the selection could
   return violates it — and because the engine state that produced the empty mask
-  persists, the same arbitrary token was emitted for the rest of the generation
-  while the request reported success. All three mask-accepting entry points
-  (`apply_mask_argmax`, `argmax_with_penalties`, `sampling_distribution`) now
-  return `Err`. Logging instead would not have worked: the check sits on the
+  persists, the same arbitrary token would be emitted for the rest of the
+  generation while the request reported success. All three mask-accepting entry
+  points (`apply_mask_argmax`, `argmax_with_penalties`, `sampling_distribution`)
+  now return `Err`. Logging instead would not have worked: the check sits on the
   per-token decode path, so a `warn!` fires once per emitted token and, at a few
   hundred bytes a line, evicts the whole log directory under `RMLX_LOG_CAP_MB`
-  within hours — deleting the evidence it exists to provide.
+  within hours — deleting the evidence it exists to provide. This guard is
+  **unit-tested only and has no demonstrated production trigger**: the
+  all-`false` state was not reachable through the HTTP surface (`{"enum": []}`
+  is rejected at schema parse with HTTP 400 before a mask exists, and byte-level
+  BPE means exotic `const` / single-`enum` values never starve the mask). The
+  constraint engine does engage, so the path is live; the empty-mask state is a
+  future constraint-engine defect being pre-empted, not an observed one.
 - **Mixed / RotK decode produced wrong output above 8 192 context tokens.** The
   V side of `mixed_quantized_sdpa` diverted to a separate MSL kernel
   (`sparse_v_weighted_sum`) once the cache held 8 192 tokens or more. That

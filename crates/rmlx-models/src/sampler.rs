@@ -368,14 +368,21 @@ pub fn argmax_with_penalties(
 /// token — id 0, under the device's `-inf`-seeded reduction — and because the
 /// engine state that produced the empty mask is persistent, it emits that same
 /// token for the rest of the generation. The request "succeeds" with a constant
-/// stream. Logging instead of returning is no better at the rate this is
-/// reached: the check sits on the per-token decode path, so a `warn!` fires
-/// once per emitted token and, at a few hundred bytes a line, evicts the whole
-/// log directory under its size cap within hours — deleting the evidence it
-/// exists to provide.
+/// stream. Logging instead of returning is no better: the check sits on the
+/// per-token decode path, so a `warn!` fires once per emitted token and, at a
+/// few hundred bytes a line, evicts the whole log directory under its size cap
+/// within hours — deleting the evidence it exists to provide.
 ///
 /// So it errors. One line per request, on the channel the decode loop already
 /// propagates, and the generation stops instead of pretending.
+///
+/// This guard is exercised by unit tests only; no request shape has been shown
+/// to reach it through the served API. An empty `enum` is rejected at schema
+/// parse before a mask is built, and byte-level BPE leaves a continuing byte
+/// for even exotic single-value constraints, so the mask does not starve. The
+/// constraint engine does run on those requests, so the path is live — treat
+/// this as pre-empting a future constraint-engine defect, not as a reproduction
+/// of an observed one.
 fn reject_all_forbidden(any_allowed: bool, site: &'static str, vocab: usize) -> Result<()> {
     if any_allowed {
         return Ok(());
