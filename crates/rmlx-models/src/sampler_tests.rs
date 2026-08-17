@@ -17,6 +17,18 @@ fn materialise(a: &Array) {
     a.eval().expect("materialise: array eval failed");
 }
 
+/// `softmax_scaled` over a row the caller knows is finite. `softmax_scaled`
+/// refuses a `NaN`/`+inf` row, which the tests that use this never build; the
+/// ones that do (`sampling_distribution_refuses_a_nan_logit`) assert on the
+/// error instead of going through here.
+#[allow(
+    clippy::expect_used,
+    reason = "fixture rows in these tests are finite literals; a refusal here is a bug in the fixture and should abort the test"
+)]
+fn softmax_ok(logits: &[f32], inv_temp: f32) -> Vec<f32> {
+    softmax_scaled(logits, inv_temp).expect("softmax_ok: fixture row must be finite")
+}
+
 #[test]
 #[allow(
     clippy::indexing_slicing,
@@ -296,7 +308,7 @@ fn sample_inverse_cdf_all_zero_is_safe() {
 fn softmax_scaled_forbidden_positions_are_zero() {
     // logits with one -inf (constraint-masked) position.
     let logits = vec![1.0f32, f32::NEG_INFINITY, 3.0];
-    let probs = softmax_scaled(&logits, 1.0);
+    let probs = softmax_ok(&logits, 1.0);
     assert_eq!(probs[1], 0.0, "-inf logit ⇒ exactly 0 prob");
     let sum: f32 = probs.iter().sum();
     assert!((sum - 1.0).abs() < 1e-5, "softmax normalised, sum={sum}");
@@ -308,7 +320,7 @@ fn end_to_end_top_k_one_equals_argmax_index() {
     // Combined path: softmax → filters with top_k=1 → inverse-CDF must
     // always return the argmax index for any rng draw.
     let logits = vec![0.2f32, 5.0, 1.0, 4.9, -2.0];
-    let mut probs = softmax_scaled(&logits, 1.0 / 0.8); // temp=0.8
+    let mut probs = softmax_ok(&logits, 1.0 / 0.8); // temp=0.8
     filter_top_p(&mut probs, 1.0); // disabled
     filter_min_p(&mut probs, 0.0); // disabled
     filter_top_k(&mut probs, 1);
@@ -880,7 +892,7 @@ fn top_k_one_collapses_to_greedy() {
 
     // Run with temp=0.8 and top_k=1 — 100 seeds.
     for seed in 0u64..100 {
-        let mut probs = softmax_scaled(&logits, 1.0 / 0.8);
+        let mut probs = softmax_ok(&logits, 1.0 / 0.8);
         filter_top_p(&mut probs, 1.0); // disabled
         filter_min_p(&mut probs, 0.0); // disabled
         filter_top_k(&mut probs, 1);
@@ -893,7 +905,7 @@ fn top_k_one_collapses_to_greedy() {
     }
 
     // Also confirm a different temperature (1.5) gives the same token.
-    let mut probs_hi = softmax_scaled(&logits, 1.0 / 1.5);
+    let mut probs_hi = softmax_ok(&logits, 1.0 / 1.5);
     filter_top_k(&mut probs_hi, 1);
     let mut rng2 = Pcg32::new(0xA7A7);
     let chosen_hi = sample_inverse_cdf(&probs_hi, rng2.next_f32());
@@ -1221,27 +1233,55 @@ fn host_greedy_skips_nan_like_the_device() {
     );
 }
 
-/// A fully constraint-masked row must agree with the device, and must say so
-/// in the run log rather than silently emitting id 0. The row is built by
-/// passing an all-`false` mask (the shape a broken constraint engine actually
-/// produces), not by handing in a pre-built `-inf` row.
+/// An all-`false` constraint mask must be **refused**, on every path that
+/// accepts a mask.
+///
+/// Emitting a token from it is worse than failing: no token satisfies the
+/// grammar, the engine state that produced the empty mask persists, so the
+/// stream would emit that same arbitrary token for the rest of the generation
+/// and the request would report success. The mask is passed as a mask — the
+/// shape a broken constraint engine actually produces — not as a pre-built
+/// `-inf` row.
 #[test]
-#[allow(
-    clippy::unwrap_used,
-    reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] I32 result, and sampler calls on inputs built in the same fn — all infallible by construction"
-)]
-fn host_greedy_matches_device_argmax_on_an_all_forbidden_mask() {
+fn every_mask_path_refuses_an_all_forbidden_mask() {
     let logits = f32_row(&[0.5, 4.0, 2.0, 9.0, 1.0]);
     let mask = vec![false; 5];
     let cfg = PenaltyConfig::default();
-    let host_id =
-        token_id(&argmax_with_penalties(&logits, Some(&mask), &cfg, &[], Device::Cpu).unwrap());
+    let sp = SamplerConfig {
+        temperature: 0.7,
+        top_p: 1.0,
+        top_k: 0,
+        min_p: 0.0,
+        seed: Some(1),
+        top_logprobs_k: 0,
+    };
+    let mut rng = Pcg32::new(1);
 
-    let device_id = device_argmax(&f32_row(&[f32::NEG_INFINITY; 5]), Device::Cpu);
-    assert_eq!(device_id, 0, "device yields id 0 on an all -inf row");
-    assert_eq!(
-        host_id, device_id,
-        "all-forbidden mask: host greedy picked {host_id}, device argmax picked {device_id}"
+    assert!(
+        argmax_with_penalties(&logits, Some(&mask), &cfg, &[], Device::Cpu).is_err(),
+        "host greedy must refuse an all-forbidden mask"
+    );
+    assert!(
+        apply_mask_argmax(&logits, &mask, Device::Cpu).is_err(),
+        "device greedy must refuse an all-forbidden mask"
+    );
+    assert!(
+        sampling_distribution(&logits, &sp, Some(&mask), &cfg, &[]).is_err(),
+        "the sampling distribution must refuse an all-forbidden mask"
+    );
+    assert!(
+        sample_token_array(&logits, &sp, Some(&mask), &cfg, &[], &mut rng, Device::Cpu).is_err(),
+        "the sampler must refuse an all-forbidden mask"
+    );
+
+    // A mask allowing a single token is not the same shape and must still work.
+    let mut one = vec![false; 5];
+    if let Some(slot) = one.get_mut(2) {
+        *slot = true;
+    }
+    assert!(
+        argmax_with_penalties(&logits, Some(&one), &cfg, &[], Device::Cpu).is_ok(),
+        "a mask with one allowed token must be accepted"
     );
 }
 
@@ -1322,21 +1362,22 @@ fn filter_top_p_breaks_ties_to_lowest_id() {
     );
 }
 
-/// Neither filter may panic when the probability vector holds a `NaN`.
+/// Neither filter may depend on an ordering that is not total, `NaN` included.
 ///
-/// Collapsing an unordered `partial_cmp` to `Equal` and then breaking that
-/// "tie" by id builds a comparator with a cycle, and `sort_unstable_by`
-/// detects it and panics — which would abort a decode step rather than let the
-/// upstream `NaN` guard report it. `NaN` reaches here whenever a `NaN` logit
-/// does: `softmax_scaled` propagates it and skips its renormalise. Lengths
-/// span the point where the sort stops being an insertion sort.
-///
-/// The shipped filters sort packed `u64` keys and so have no user comparator
-/// at all, which makes the panic structurally unreachable rather than merely
-/// absent. This guards the regression back to a comparator form.
+/// A comparator that folds an unordered `partial_cmp` to `Equal` is
+/// intransitive, and `sort_unstable_by` may detect that and panic mid-decode.
+/// But the panic is a *heuristic* detector, so "did it panic?" is a weak
+/// oracle: on the shipped comparator only one of six (filter, length) cells
+/// actually fires. So this asserts the property structurally instead — the
+/// survivor set must equal what the documented rank rule prescribes — which has
+/// power at every length whether the detector fires or not.
 #[test]
-fn filters_do_not_panic_on_nan_probabilities() {
-    for n in [64usize, 512, 4096] {
+#[allow(
+    clippy::indexing_slicing,
+    reason = "probs and the reference order both have length n, and every index used is < n"
+)]
+fn filters_hold_a_total_order_with_nan_present() {
+    for n in [8usize, 64, 512, 4096] {
         let probs: Vec<f32> = (0..n)
             .map(|i| {
                 if i % 7 == 3 {
@@ -1347,15 +1388,47 @@ fn filters_do_not_panic_on_nan_probabilities() {
             })
             .collect();
 
-        let mut k = probs.clone();
-        filter_top_k(&mut k, n / 4);
-        let mut p = probs.clone();
-        filter_top_p(&mut p, 0.95);
-        // Reaching here without a panic is the assertion; keep the results
-        // observable so the calls cannot be optimised away.
-        assert_eq!(k.len(), n, "n={n}: top_k must not resize");
-        assert_eq!(p.len(), n, "n={n}: top_p must not resize");
+        let k = (n / 4).max(1);
+        let mut got_k = probs.clone();
+        filter_top_k(&mut got_k, k);
+        let mut expect_k = probs.clone();
+        for &i in &reference_rank_order(&probs, true)[k..] {
+            expect_k[i] = 0.0;
+        }
+        assert_eq!(
+            survivor_ids(&got_k),
+            survivor_ids(&expect_k),
+            "n={n}: top_k survivors must follow the rank rule with a NaN present"
+        );
+
+        let mut got_p = probs.clone();
+        filter_top_p(&mut got_p, 0.95);
+        let mut expect_p = probs.clone();
+        let mut cum = 0.0f32;
+        for &i in &reference_rank_order(&probs, false) {
+            cum += probs[i];
+            if cum <= 1.0 - 0.95 {
+                expect_p[i] = 0.0;
+            }
+        }
+        assert_eq!(
+            survivor_ids(&got_p),
+            survivor_ids(&expect_p),
+            "n={n}: top_p survivors must follow the rank rule with a NaN present"
+        );
     }
+}
+
+/// Ids whose probability survived a filter. `NaN > 0.0` is false, so a `NaN`
+/// counts as dropped on both sides of a comparison — which is what makes this
+/// a fair oracle rather than one that hides the interesting case.
+fn survivor_ids(probs: &[f32]) -> Vec<usize> {
+    probs
+        .iter()
+        .enumerate()
+        .filter(|&(_, &p)| p > 0.0)
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// A tie-dense row of the shape the filters actually receive: a BF16-quantised
@@ -1378,7 +1451,7 @@ fn tie_dense_probs(n: usize, seed: u64) -> Vec<f32> {
             f32::from_bits(bits.wrapping_add(0x7fff + lsb) & 0xffff_0000)
         })
         .collect();
-    softmax_scaled(&logits, 1.0 / 0.7)
+    softmax_ok(&logits, 1.0 / 0.7)
 }
 
 /// Reference statement of the documented rank rule, written as a plain
@@ -1469,21 +1542,18 @@ fn filter_top_p_matches_the_reference_rank_rule() {
     }
 }
 
-/// A `NaN` logit must also not panic the whole pipeline, which is the path the
-/// filters are actually reached through.
+/// A non-finite logits row must be **refused**, not sampled.
+///
+/// Sampling one is not a degraded result, it is a silent one. The `NaN` reaches
+/// `probs`, `renormalise` no-ops (`total > 0.0` is false on `NaN`),
+/// `sample_inverse_cdf`'s `total <= 0.0` guard is also false, its `cum > target`
+/// never fires, and it returns `last_nonzero` — the same id every step,
+/// independent of the RNG. The request reports success and streams a constant
+/// token. This asserts refusal on every entry point, and asserts that the
+/// matching finite row is still accepted so the guard is not a blanket reject.
 #[test]
-fn sampling_distribution_survives_a_nan_logit() {
-    let n = 512usize;
-    let data: Vec<f32> = (0..n)
-        .map(|i| {
-            if i == 100 {
-                f32::NAN
-            } else {
-                (i % 13) as f32 * 0.1
-            }
-        })
-        .collect();
-    let logits = f32_row(&data);
+fn a_non_finite_logits_row_is_refused_not_sampled() {
+    let n = 64usize;
     let sp = SamplerConfig {
         temperature: 0.7,
         top_p: 0.95,
@@ -1493,8 +1563,70 @@ fn sampling_distribution_survives_a_nan_logit() {
         top_logprobs_k: 0,
     };
     let nop = PenaltyConfig::default();
-    let probs = sampling_distribution(&logits, &sp, None, &nop, &[]);
-    assert!(probs.is_ok(), "a NaN logit must not abort the sampler");
+
+    let finite: Vec<f32> = (0..n).map(|i| (i % 13) as f32 * 0.1).collect();
+    assert!(
+        sampling_distribution(&f32_row(&finite), &sp, None, &nop, &[]).is_ok(),
+        "the finite control row must still be accepted"
+    );
+
+    for (label, bad) in [("NaN", f32::NAN), ("+inf", f32::INFINITY)] {
+        let mut data = finite.clone();
+        if let Some(slot) = data.get_mut(7) {
+            *slot = bad;
+        }
+        let logits = f32_row(&data);
+        assert!(
+            sampling_distribution(&logits, &sp, None, &nop, &[]).is_err(),
+            "{label} logit: the distribution must be refused"
+        );
+        let mut rng = Pcg32::new(5);
+        assert!(
+            sample_token_array(&logits, &sp, None, &nop, &[], &mut rng, Device::Cpu).is_err(),
+            "{label} logit: the sampler must be refused"
+        );
+    }
+
+    // An all-`-inf` row is a different shape: its softmax sum is a finite 0,
+    // and it must NOT be swept up by the non-finite guard.
+    let masked = vec![f32::NEG_INFINITY; n];
+    assert!(
+        softmax_scaled(&masked, 1.0 / 0.7).is_ok(),
+        "an all -inf row sums to a finite zero and must not be refused here"
+    );
+}
+
+/// The greedy paths deliberately do **not** refuse a `NaN` row: they mirror the
+/// device reduction, which skips `NaN` and returns the largest real logit, and
+/// diverging from it would re-create the host/device split this contract
+/// exists to close. Pinned so the asymmetry is a decision rather than an
+/// oversight — the sampling path refuses because its failure is a constant
+/// stream, the greedy path does not because its answer is the device's.
+#[test]
+fn greedy_does_not_refuse_a_nan_row_but_the_sampler_does() {
+    let logits = f32_row(&[1.0, 3.0, f32::NAN, 2.0]);
+    let nop = PenaltyConfig::default();
+    let sp = SamplerConfig {
+        temperature: 0.7,
+        top_p: 1.0,
+        top_k: 0,
+        min_p: 0.0,
+        seed: Some(2),
+        top_logprobs_k: 0,
+    };
+    assert!(
+        argmax_with_penalties(&logits, None, &nop, &[], Device::Cpu).is_ok(),
+        "host greedy keeps device parity on a NaN row"
+    );
+    assert_eq!(
+        host_greedy(&logits, Device::Cpu),
+        device_argmax(&logits, Device::Cpu),
+        "and agrees with the device on which token that is"
+    );
+    assert!(
+        sampling_distribution(&logits, &sp, None, &nop, &[]).is_err(),
+        "the sampling path refuses the same row"
+    );
 }
 
 /// End-to-end restatement of the same contract on the full host pipeline:
@@ -1567,6 +1699,69 @@ fn compute_top_logprobs_breaks_ties_to_lowest_id() {
     );
 }
 
+/// `top_logprobs` is reported alongside the emitted token, computed from the
+/// same raw logits row the greedy path reduces, so rank 0 must be the token the
+/// device would emit on a `NaN` row too. Seeding the selection from a candidate
+/// rather than from `-inf` breaks exactly this: a `NaN` at the seed position
+/// wins the rank, because every later `>` and `==` against it is false.
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "top is built with exactly k = 2 entries immediately above"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] I32 result, and sampler calls on inputs built in the same fn — all infallible by construction"
+)]
+fn compute_top_logprobs_skips_nan_like_the_device() {
+    // NaN at index 0 — the seed position of the first selection round.
+    let logits = f32_row(&[f32::NAN, 1.0, 5.0, 2.0]);
+    let out = compute_top_logprobs(&logits, 2, 2).unwrap();
+    let ids: Vec<u32> = out.top.iter().map(|&(id, _)| id).collect();
+    assert_eq!(
+        ids,
+        vec![2, 3],
+        "a NaN must not take a rank ahead of a real logit"
+    );
+    assert_eq!(
+        ids[0],
+        host_greedy(&logits, Device::Cpu),
+        "rank 0 must be the token the greedy path emits"
+    );
+}
+
+/// The rank keys must order every `f32`, not only the non-negative ones the
+/// sampler happens to produce today.
+///
+/// Under a raw bit pattern `-0.0` (`0x8000_0000`) outranks every positive
+/// value, so `top_k(1)` keeps `-0.0` and zeroes the real maximum — a silently
+/// wrong token, with no panic to notice. `release-perf` disables debug
+/// assertions, so a `debug_assert` on the sign would not catch it either;
+/// the key is made correct instead.
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "probs is a 3-element literal and every index used is < 3"
+)]
+fn rank_keys_order_negative_zero_correctly() {
+    let mut probs = vec![-0.0f32, 0.5, 0.25];
+    filter_top_k(&mut probs, 1);
+    assert_eq!(
+        survivor_ids(&probs),
+        vec![1],
+        "top_k=1 must keep the real maximum, not -0.0"
+    );
+
+    // The same through the ascending key, where -0.0 must sort below +0.0.
+    let mut asc = vec![-0.0f32, 0.0, 0.4, 0.6];
+    filter_top_p(&mut asc, 0.5);
+    assert!(
+        asc[3] > 0.0,
+        "the dominant id must survive the nucleus, got {asc:?}"
+    );
+    assert_eq!(asc[0], 0.0, "-0.0 carries no mass and is dropped");
+}
+
 // ── Near-zero temperature is sampling, not greedy ────────────────────────
 //
 // These two pin the boundary of the "temperature ~0 behaves like an argmax"
@@ -1585,7 +1780,7 @@ fn compute_top_logprobs_breaks_ties_to_lowest_id() {
 fn near_zero_temperature_underflow_boundary() {
     // Gaps of 0.02 (well past the boundary) and 0.005 (well inside it).
     let logits = vec![10.0f32, 9.98, 9.995];
-    let probs = softmax_scaled(&logits, 1.0 / 1e-4);
+    let probs = softmax_ok(&logits, 1.0 / 1e-4);
     assert_eq!(probs[1], 0.0, "gap 0.02 must underflow to exactly zero");
     assert!(
         probs[2] > 0.0,
@@ -1704,6 +1899,55 @@ fn host_greedy_matches_device_argmax_on_a_bf16_tie_gpu() {
         host_id, device_id,
         "BF16 tie: host greedy picked {host_id}, Metal argmax picked {device_id}"
     );
+}
+
+/// `host_argmax` claims a `NaN` never displaces a real maximum *on the device*.
+/// The CPU test of that claim is weak — MLX's CPU backend seeds its reduction
+/// with `in[0]`, so it skips a mid-row `NaN` for a reason Metal does not share.
+/// This is the mirror that actually checks Metal.
+#[test]
+#[ignore = "reaches Device::Gpu; run via make gpu-test"]
+fn host_greedy_skips_nan_like_the_device_gpu() {
+    let logits = f32_row(&[1.0, 3.0, f32::NAN, 2.0]);
+    let device_id = device_argmax(&logits, Device::Gpu);
+    let host_id = host_greedy(&logits, Device::Gpu);
+    assert_eq!(
+        host_id, device_id,
+        "NaN row: host greedy picked {host_id}, Metal argmax picked {device_id}"
+    );
+    assert_eq!(
+        device_id, 1,
+        "Metal must skip the NaN and take the real max"
+    );
+}
+
+/// The all-`-inf` row is the one shape where the `-inf` seed is never
+/// displaced, so what a multi-threadgroup Metal arg-reduce returns is a
+/// property of its seeding rather than of its comparisons — and the CPU test
+/// **cannot fail**, because MLX's CPU backend seeds with `in[0]` and so returns
+/// 0 by construction whatever Metal does. This is the only check with power
+/// over `host_argmax`'s third documented bullet.
+///
+/// The row is deliberately wide enough to cross the single- to
+/// multi-threadgroup boundary. If this fails, that bullet is wrong and needs
+/// correcting rather than the test.
+#[test]
+#[ignore = "reaches Device::Gpu; run via make gpu-test"]
+fn all_neg_inf_row_agrees_with_metal_gpu() {
+    for width in [8usize, WIDE_VOCAB] {
+        let row = vec![f32::NEG_INFINITY; width];
+        let logits = f32_row(&row);
+        let device_id = device_argmax(&logits, Device::Gpu);
+        let host_id = host_greedy(&logits, Device::Gpu);
+        assert_eq!(
+            host_id, device_id,
+            "width {width}: host greedy picked {host_id}, Metal argmax picked {device_id}"
+        );
+        assert_eq!(
+            device_id, 0,
+            "width {width}: host_argmax documents id 0 for an all -inf row"
+        );
+    }
 }
 
 /// BF16 is the high half-word of the F32 pattern:

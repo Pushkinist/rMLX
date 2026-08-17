@@ -172,35 +172,102 @@ It does **not** cover the inverse-CDF draw: a categorical sample from a tied
 distribution is supposed to be random, and forcing it to the lowest id would
 make `temperature > 0` biased.
 
-`filter_top_k` and `filter_top_p` implement the rule by sorting packed `u64`
-keys — inverted IEEE bits in the high half-word, token id in the low one —
-rather than by sorting indices under a comparator. Two reasons, both measured:
+Neither filter uses a comparator. Folding an unordered `NaN` pair to `Equal`
+makes a `NaN` compare equal to everything, which is intransitive, and
+`sort_unstable_by` may detect that and panic with "user-provided comparison
+function does not correctly implement a total order" — mid-decode, aborting the
+step. Adding an id tiebreak on top widens the window rather than closing it.
+Both filters order integers under the standard `Ord` instead, so no comparator
+exists to be intransitive.
 
-- **No comparator can be used safely here.** Folding an unordered `NaN` pair to
-  `Equal` makes a `NaN` compare equal to everything, which is intransitive, and
-  `sort_unstable_by` panics with "user-provided comparison function does not
-  correctly implement a total order" — mid-decode, aborting the step. Adding an
-  id tiebreak on top widens the window rather than closing it. A `NaN` logit
-  does reach these filters: the softmax propagates it and skips its
-  renormalise. Sorting `u64` is total by construction.
-- **It is cheaper.** At 262144 wide: 2.4 ms for the packed sort, 2.6 ms for the
-  index sort it replaces, 5.9 ms for that index sort under a tie-breaking
-  comparator. Pinning the tie order costs nothing.
+They do it differently, because the two have different jobs:
 
-Details on `rank_key_desc` in `sampler.rs`.
+- `filter_top_k` **partitions** `select_nth_unstable` over packed `u64` keys
+  (inverted total-order bits above the token id). It needs a set, not an order,
+  which is what mlx-lm's `argpartition` says too.
+- `filter_top_p` needs the full ascending order for the cumulative sum, so it
+  sorts the **values alone** and applies the id rule once, to the single tied
+  group the cut lands in. Packing the id into the sort key would make every key
+  distinct and destroy the equal-element partition that a tie-dense row hands
+  the sort — that formulation is *slower* than no tie rule at all.
+
+Measured at a 262144-token vocabulary (best-of-9, three process runs), against
+the index sorts these replace:
+
+| Filter | fixture | previous | now |
+|---|---|---:|---:|
+| `top_k` (k=64) | tie-dense (1233 distinct) | 2.02–2.13 ms | 0.30–0.33 ms |
+| `top_k` (k=64) | all-distinct | 3.67–4.31 ms | 0.32–0.41 ms |
+| `top_p` (0.95) | tie-dense | 2.02–2.06 ms | 1.31–1.34 ms |
+| `top_p` (0.95) | all-distinct | 3.73–4.32 ms | 2.17–2.68 ms |
+
+So pinning the tie order is a net speedup on every fixture measured, not a cost
+to be justified. Details on `rank_key_desc` and `total_order_bits` in
+`sampler.rs`.
+
+The keys use the IEEE total-order flip rather than the raw bit pattern, so they
+order every `f32` including negatives and `-0.0`. The raw pattern is monotone
+only over non-negative values, and `probs` are non-negative today — but the
+failure mode if that stopped holding is a silently wrong token (`-0.0` outranks
+every positive, so `top_k = 1` would keep it and zero the real maximum), and
+`release-perf` disables debug assertions, so an assert would not catch it.
 
 **Where MLX does not match itself.** MLX seeds its CPU reduction with element 0
 and its Metal reduction with `-inf`, so a `NaN` at index 0 returns 0 on CPU and
 the first real maximum on Metal. No host rule can match both. `host_argmax`
 follows Metal, which is the production stream; the CPU-stream unit tests avoid
-that one shape, and `#[ignore]`d `Device::Gpu` mirrors re-run the tie cases on
-Metal so the Metal property is checked rather than assumed. Everywhere else the
-two MLX backends agree with each other and with `host_argmax`.
+that one shape. Everywhere else the two MLX backends agree with each other and
+with `host_argmax`.
 
-**An all-forbidden mask is a constraint-engine defect, not a mode.** Falling
-through to id 0 keeps host and device parity, but every mask-applying site now
-emits a `tracing::warn!` when no token is allowed, so the condition appears in
-the run log instead of the stream silently emitting token 0 forever.
+That seeding difference is also why the CPU tests are not sufficient. Three
+`#[ignore]`d `Device::Gpu` mirrors re-run the contract on Metal, one per claim:
+equal-logits-lowest-id, `NaN`-never-displaces, and the all-`-inf` row. The last
+carries the most weight — it is the only shape where the `-inf` seed is never
+displaced, so the answer is a property of the reduction's *seeding* rather than
+of its comparisons, and its CPU test **cannot fail** (MLX's CPU backend returns
+0 by construction whatever Metal does). Until that mirror has run, "an all-`-inf`
+row yields id 0" is a claim about Metal taken from reading MLX's kernel, not a
+measured one. It is no longer reachable through a constraint mask — that case
+errors — but `host_argmax` still has to answer.
+
+### Rows the sampler refuses
+
+Two inputs are defects rather than modes, and both now return `Err` on the
+channel the decode loop already propagates.
+
+**An all-`false` constraint mask.** No token satisfies the grammar, so every
+token the selection could return violates it. Returning one anyway is the worst
+option: the engine state that produced the empty mask is persistent, so the
+stream emits the same arbitrary token (id 0) for the rest of the generation and
+the request reports success. Logging instead is no better at the rate this is
+reached — the check sits on the per-token decode path, so a `warn!` would fire
+once per emitted token and, at a few hundred bytes a line, evict the whole log
+directory under `RMLX_LOG_CAP_MB` within hours, deleting the evidence it exists
+to provide. All three mask-accepting entry points (`apply_mask_argmax`,
+`argmax_with_penalties`, `sampling_distribution`) refuse it.
+
+**A non-finite logits row, on the sampling path.** `softmax_scaled` errors when
+the exponentials do not sum to a finite value, which happens exactly when a
+logit is `NaN` or `+inf`. This is the decode-step half of the rule the prefill
+guard already enforces, and it has to live here because that guard is a
+*prefill* guard: on every test-target architecture it runs once before the loop
+and never again, so nothing downstream reports a `NaN` arriving at decode step
+300. The check is free — `sum` is already computed.
+
+Sampling such a row is silent, not degraded: the `NaN` reaches `probs`,
+`renormalise` no-ops (`total > 0.0` is false on `NaN`), `sample_inverse_cdf`'s
+`total <= 0.0` guard is also false, its `cum > target` never fires, and it
+returns `last_nonzero` — the same id every step, **independent of the RNG**.
+Measured on a 16-wide row with one `NaN`: a constant token for every seed tried,
+against a varied healthy control.
+
+**Greedy deliberately does not refuse a `NaN` row.** It mirrors the device
+reduction, which skips `NaN` and returns the largest real logit; erroring there
+would re-create the host/device split this contract exists to close, since the
+pure-GPU `argmax` cannot refuse anything without an extra per-token reduction.
+The asymmetry is pinned by a test. The sampling path refuses because its failure
+mode is a constant stream; the greedy path does not because its answer is the
+device's.
 
 ### Temperature scaling and softmax
 
@@ -238,17 +305,21 @@ Tokens below the threshold go to 0.0. No-op unless `0 < top_p < 1`.
 The ascending-sort + inclusive-cumsum direction is exact mlx-lm parity and
 is not interchangeable with descending order.
 
-Equal probabilities are ranked by **descending token id**. The walk drops from
-the front, so a tied group has to be ordered highest-id-first for its lowest
-ids to survive the cut — the same lowest-id-wins rule the device `argmax` and
-`top_k` use. Unlike `top_k`, this filter is on by default on the served path:
-several `generation_config.json` snapshots ship a `top_p`. Without the rule the
-survivor set is an artefact of the sort's pivot choice — on a row of 64 with
-one 0.4 and 63 identical tail values at `top_p = 0.5`, the unordered version
-keeps `{0, 29, 54..63}`, id 29 surviving while ids 30..53 are zeroed from a
-bit-identical value. The *number* of survivors is unaffected: probabilities are
-non-negative so the drop set is a prefix, and every member of a tied group
-contributes the same value to the cumulative sum.
+Among equal probabilities the **lowest ids** survive the cut — the same
+lowest-id-wins rule the device `argmax` and `top_k` use. Unlike `top_k`, this
+filter is on by default on the served path: several `generation_config.json`
+snapshots ship a `top_p`. Without the rule the survivor set is an artefact of
+the sort's pivot choice — on a row of 64 with one 0.4 and 63 identical tail
+values at `top_p = 0.5`, the unordered version keeps `{0, 29, 54..63}`, id 29
+surviving while ids 30..53 are zeroed from a bit-identical value.
+
+The *number* of survivors is unaffected by the rule: probabilities are
+non-negative, so the drop set is a prefix of the ascending order, and every
+member of a tied group contributes the same value to the cumulative sum. Only
+*which* members are dropped depends on the order within a group. That is what
+lets the implementation sort the values alone — keeping the equal-element
+partition a tie-dense row hands the sort — and then split just the one tied
+group the cut lands in, dropping its highest ids.
 
 ### Min-p truncation
 

@@ -333,7 +333,7 @@ pub fn argmax_with_penalties(
                 logits[i] = f32::NEG_INFINITY;
             }
         }
-        warn_all_forbidden(any_allowed, "argmax_with_penalties", vocab);
+        reject_all_forbidden(any_allowed, "argmax_with_penalties", vocab)?;
     }
 
     // Apply penalties.
@@ -353,20 +353,30 @@ pub fn argmax_with_penalties(
         .map_err(|e| Error::Other(format!("argmax_with_penalties: id array build failed: {e}")))
 }
 
-/// An all-forbidden constraint mask is a constraint-engine defect: no token
-/// satisfies the grammar, so whatever the reduction returns is arbitrary. The
-/// selection still has to return *something* to keep the decode loop's error
-/// channel meaningful, so it falls through to the device-parity answer (id 0),
-/// but the condition is logged rather than swallowed — otherwise the stream
-/// emits token 0 forever with nothing in the run log to explain it.
-fn warn_all_forbidden(any_allowed: bool, site: &'static str, vocab: usize) {
-    if !any_allowed {
-        tracing::warn!(
-            site,
-            vocab,
-            "constraint mask forbids every token; selection falls back to id 0"
-        );
+/// An all-forbidden constraint mask is a constraint-engine defect, not a mode:
+/// no token satisfies the grammar, so every token the selection could return
+/// violates it.
+///
+/// Returning one anyway is the worst option available. It emits an arbitrary
+/// token — id 0, under the device's `-inf`-seeded reduction — and because the
+/// engine state that produced the empty mask is persistent, it emits that same
+/// token for the rest of the generation. The request "succeeds" with a constant
+/// stream. Logging instead of returning is no better at the rate this is
+/// reached: the check sits on the per-token decode path, so a `warn!` fires
+/// once per emitted token and, at a few hundred bytes a line, evicts the whole
+/// log directory under its size cap within hours — deleting the evidence it
+/// exists to provide.
+///
+/// So it errors. One line per request, on the channel the decode loop already
+/// propagates, and the generation stops instead of pretending.
+fn reject_all_forbidden(any_allowed: bool, site: &'static str, vocab: usize) -> Result<()> {
+    if any_allowed {
+        return Ok(());
     }
+    Err(Error::Other(format!(
+        "{site}: constraint mask forbids every one of {vocab} tokens; \
+         no token can satisfy the grammar at this step"
+    )))
 }
 
 /// Index of the maximum of `logits`, resolving ties to the **lowest** index.
@@ -375,12 +385,21 @@ fn warn_all_forbidden(any_allowed: bool, site: &'static str, vocab: usize) {
 /// decode path dispatches on the device. It accumulates with a strict `>` from
 /// a `-inf` seed, which gives three properties the device reduction also has:
 /// equal values never displace the earlier index, a `NaN` never displaces a
-/// real maximum, and a fully constraint-masked (all `-inf`) row yields `0`.
+/// real maximum, and an all-`-inf` row yields `0`.
 ///
 /// The `-inf` seed is the **Metal** reduction's seed, which is the production
 /// stream. MLX's CPU backend seeds with element 0 instead, so the two disagree
 /// on exactly one shape — a `NaN` at index 0 — and no host rule can match both.
 /// Everywhere else the two MLX backends agree with each other and with this.
+///
+/// The all-`-inf` bullet is the weakest of the three, and the `#[ignore]`d
+/// `Device::Gpu` mirror is what checks it: it is the only row where the `-inf`
+/// seed is never displaced, so what a multi-threadgroup Metal arg-reduce
+/// returns is a property of the reduction's seeding rather than of its
+/// comparisons, and the CPU-stream test cannot fail it (MLX's CPU backend
+/// seeds with `in[0]`, so it returns 0 by construction whatever Metal does).
+/// The row is no longer reachable through a constraint mask — that case now
+/// errors — but it stays documented because the function still has to answer.
 ///
 /// Greedy selection must not depend on which side of the FFI boundary it runs,
 /// so host greedy goes through here rather than `Iterator::max_by` — which
@@ -553,7 +572,29 @@ fn logits_to_host_f32(logits_flat: &Array, vocab: usize) -> Result<Vec<f32>> {
 /// Numerically-stable softmax of temperature-scaled logits, in place into a
 /// fresh `Vec<f32>`. `inv_temp = 1.0 / temperature`. Forbidden positions
 /// (already `-inf` from the constraint mask) softmax to exactly `0.0`.
-fn softmax_scaled(logits: &[f32], inv_temp: f32) -> Vec<f32> {
+///
+/// # Refusing an unusable row
+///
+/// Errors when the exponentials do not sum to a finite value, which happens
+/// exactly when a logit is `NaN` or `+inf`. This is the decode-step half of the
+/// rule the prefill guard already enforces — a non-finite logits row must abort
+/// the request, not produce a token — and it has to be enforced here because
+/// the prefill guard is a *prefill* guard: on every test-target architecture it
+/// runs once before the loop and never again, so nothing downstream reports a
+/// `NaN` that appears at decode step 300.
+///
+/// Sampling such a row is not a degraded result, it is a silent one. A `NaN`
+/// propagates to `probs`, then `renormalise` no-ops (its `total > 0.0` guard is
+/// false on `NaN`), then `sample_inverse_cdf`'s `total <= 0.0` guard is also
+/// false, its `cum > target` comparison never fires, and it returns
+/// `last_nonzero` — the same index on every step, **independent of the RNG**.
+/// Measured on a 16-wide row with one `NaN`: the stream is a constant token for
+/// every seed tried, against a healthy varied control.
+///
+/// The check is free: `sum` is already computed, and `NaN`/`+inf` both
+/// propagate into it (`+inf` because the all-`-inf` guard below rewrites `max`
+/// to `0.0`, so an infinite `scaled` stays infinite through the subtraction).
+fn softmax_scaled(logits: &[f32], inv_temp: f32) -> Result<Vec<f32>> {
     let mut max = f32::NEG_INFINITY;
     for &l in logits {
         let s = l * inv_temp;
@@ -579,13 +620,19 @@ fn softmax_scaled(logits: &[f32], inv_temp: f32) -> Vec<f32> {
             e
         })
         .collect();
+    if !sum.is_finite() {
+        return Err(Error::Other(format!(
+            "sampler: logits row is not finite (softmax sum = {sum}); \
+             a NaN or infinite logit cannot be sampled"
+        )));
+    }
     if sum > 0.0 {
         let inv = 1.0 / sum;
         for p in &mut probs {
             *p *= inv;
         }
     }
-    probs
+    Ok(probs)
 }
 
 /// mlx-lm `apply_top_k` (sample_utils.py L130-151): keep the `k` highest
@@ -599,12 +646,15 @@ fn softmax_scaled(logits: &[f32], inv_temp: f32) -> Vec<f32> {
 /// would make which of two equally-likely tokens survives an artefact of
 /// pdqsort's pivot choice.
 ///
-/// The rank order is produced by sorting **packed `u64` keys** rather than by
-/// sorting indices under a custom comparator. See [`rank_key_desc`] for why —
-/// briefly, a comparator that folds an unordered `NaN` pair to `Equal` and then
-/// breaks that "tie" by id is not a total order, and `sort_unstable_by` panics
-/// on it; and at a 262144-token vocabulary the packed sort is measurably
-/// cheaper than an index sort under any comparator.
+/// The `k` survivors are found by **partitioning**, not by sorting: `top_k`
+/// needs a set, not an order, which is what mlx-lm's `argpartition` says too.
+/// Every rank a sort computes past the cut is discarded. Measured at a
+/// 262144-token vocabulary, best-of-9 over three process runs: 2.02–2.37 ms for
+/// the index sort this replaces, 0.30–0.35 ms here.
+///
+/// The partition runs over [`rank_key_desc`] keys, which carry the tie rule, so
+/// the surviving *set* is uniquely determined (all keys are distinct) and does
+/// not depend on the pivot choice.
 #[allow(
     clippy::indexing_slicing,
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
@@ -621,75 +671,70 @@ fn filter_top_k(probs: &mut [f32], k: usize) {
         .enumerate()
         .map(|(i, &p)| rank_key_desc(p, i))
         .collect();
-    keys.sort_unstable();
+    keys.select_nth_unstable(k);
     for &key in &keys[k..] {
         probs[key_id(key)] = 0.0;
     }
 }
 
+/// Map an `f32` to a `u32` whose unsigned order is IEEE **total order** —
+/// `-NaN < -inf < .. < -0.0 < +0.0 < .. < +inf < +NaN`.
+///
+/// The standard sign-flip: a non-negative value gets its sign bit set, a
+/// negative value is inverted whole. Three ALU ops, applied once per element
+/// rather than once per comparison.
+///
+/// This is what lets the rank keys carry *every* `f32` instead of resting on a
+/// precondition. The raw bit pattern is only monotone over non-negative values,
+/// and while `probs` are non-negative today, the failure mode if that ever
+/// stopped holding is a silently wrong token rather than a crash: `-0.0`
+/// (pattern `0x8000_0000`) would outrank every positive probability, so
+/// `top_k(1)` on `[-0.0, 0.5, 0.25]` would zero the real maximum and leave
+/// `-0.0` as the sole survivor. A `debug_assert` would not catch it either —
+/// `release-perf` builds with `debug-assertions = false`. Making the key
+/// correct for all inputs costs less than documenting why it is not.
+#[inline]
+fn total_order_bits(p: f32) -> u32 {
+    let b = p.to_bits();
+    b ^ ((((b as i32) >> 31) as u32) | 0x8000_0000)
+}
+
+/// Inverse of [`total_order_bits`].
+#[inline]
+fn from_total_order_bits(o: u32) -> f32 {
+    f32::from_bits(o ^ ((((!o) as i32) >> 31) as u32 | 0x8000_0000))
+}
+
 /// Sort key placing `probs` in **descending** order with ties resolved to the
-/// **lowest** id: the inverted IEEE bit pattern in the high half-word, the
+/// **lowest** id: the inverted total-order bits in the high half-word, the
 /// token id in the low half-word.
 ///
 /// # Why a packed key and not a comparator
 ///
-/// Two independent reasons, both load-bearing.
-///
-/// **It cannot panic.** Sorting `u64` uses the standard `Ord`, so the order is
-/// total by construction. Every `partial_cmp` form is not: folding an unordered
-/// pair to `Equal` makes a `NaN` compare equal to everything, which is already
+/// Sorting or partitioning `u64` uses the standard `Ord`, so the order is total
+/// by construction. Every `partial_cmp` form is not: folding an unordered pair
+/// to `Equal` makes a `NaN` compare equal to everything, which is already
 /// intransitive (`a == NaN`, `NaN == b`, but `a < b`), and adding an id
 /// tiebreak on top turns that into an outright cycle (`i < j`, `j < k`,
-/// `k < i`). `sort_unstable_by` detects either and aborts the decode step —
-/// measured on both shapes at 512 and 4096 elements. `NaN` reaches these
-/// filters whenever a `NaN` logit does: `softmax_scaled` propagates it and
-/// skips its renormalise, whose `sum > 0.0` guard is false on `NaN`.
+/// `k < i`). `sort_unstable_by` detects either and aborts the decode step.
 ///
-/// **It is cheaper.** An index sort dereferences `probs` twice per comparison
-/// at random offsets; sorting the keys is contiguous and compares one integer.
-/// Measured over a 262144-wide BF16-derived softmax row (a realistic served
-/// shape, in which 259416 of the 262143 adjacent pairs are exactly equal, so
-/// the tie path is the common path): 2.58 ms for the untied index sort that
-/// preceded this, 5.92 ms for the same sort under a tie-breaking comparator,
-/// 2.43 ms here.
+/// `NaN` no longer reaches here — `softmax_scaled` refuses a non-finite row —
+/// but the guarantee is kept rather than leaned on, because these two filters
+/// are also reachable directly and a total order costs nothing to hold.
 ///
-/// # Preconditions
+/// # Precondition
 ///
-/// `probs` are non-negative — every element is an `exp` result or a literal
-/// `0.0`, so the IEEE bit pattern is monotone in the value and `-0.0` (whose
-/// pattern would sort above every positive) cannot occur. `id` fits in 32 bits:
-/// it indexes a vocabulary that reaches this crate as an MLX `i32` shape.
-///
-/// A `NaN` sorts above `+inf` because its bit patterns are the largest. That
-/// is a determinism guarantee, not a claim that the rank is meaningful — a
-/// `NaN` logit is a defect the decode loop reports upstream; this only ensures
-/// the sampler survives to let it.
+/// `id` fits in 32 bits: it indexes a vocabulary that reaches this crate as an
+/// MLX `i32` shape, so it cannot exceed `i32::MAX`.
 #[inline]
 fn rank_key_desc(p: f32, id: usize) -> u64 {
-    (u64::from(!p.to_bits()) << 32) | id as u64
-}
-
-/// Sort key placing `probs` in **ascending** order with ties resolved to the
-/// **highest** id. Counterpart to [`rank_key_desc`]; same preconditions.
-///
-/// The inverted id is what makes the *lowest* ids survive a `top_p` cut: that
-/// walk is ascending and drops from the front, so a tied group has to be
-/// ordered highest-id-first for its low ids to outlast the threshold.
-#[inline]
-fn rank_key_asc(p: f32, id: usize) -> u64 {
-    (u64::from(p.to_bits()) << 32) | u64::from(!(id as u32))
+    (u64::from(!total_order_bits(p)) << 32) | u64::from(id as u32)
 }
 
 /// Recover the token id from a [`rank_key_desc`] key.
 #[inline]
 fn key_id(key: u64) -> usize {
     (key & 0xffff_ffff) as usize
-}
-
-/// Recover the token id from a [`rank_key_asc`] key.
-#[inline]
-fn key_id_inverted(key: u64) -> usize {
-    !(key as u32) as usize
 }
 
 /// mlx-lm `apply_top_p` (sample_utils.py L205-237).
@@ -709,18 +754,43 @@ fn key_id_inverted(key: u64) -> usize {
 /// values at `top_p = 0.5`, the unordered version keeps `{0, 29, 54..63}` —
 /// id 29 survives while ids 30..53 are zeroed from a bit-identical value.
 ///
-/// The order comes from sorting packed `u64` keys ([`rank_key_asc`]) rather
-/// than sorting indices under a comparator — both for the total-order
-/// guarantee and for the cost, spelled out on [`rank_key_desc`]. This filter is
-/// the one most exposed to both: `top_p` ships set in several
+/// This filter is the one that matters most: `top_p` ships set in several
 /// `generation_config.json` snapshots, so unlike `top_k` it is on by default on
 /// the served path.
 ///
-/// The drop set is a prefix of the ascending order (probabilities are
-/// non-negative, so `cum` never decreases), and every member of a tied group
-/// contributes the same value, so *how many* elements are dropped does not
-/// depend on the order within a group — only *which ones* does, which is what
-/// the id rule pins.
+/// # Why this is not one sort over (probability, id)
+///
+/// Because that is the slowest of the three options at a real vocabulary, and
+/// it is slow for a reason specific to this data. Served rows are tie-dense —
+/// on a 262144-wide BF16-derived softmax only ~1200 of the 262144 values are
+/// distinct — and a sort over values alone gets to use its equal-element
+/// partition, which is most of its work. Appending the id to break ties makes
+/// every key unique and throws that away, which is a **regression**, not a win:
+/// measured at 262144, best-of-9, 2.02–2.06 ms for the untied index sort this
+/// replaces against 2.26–2.39 ms for a packed (value, id) sort. Splitting the
+/// two concerns gets 1.31–1.42 ms.
+///
+/// So the order is taken over **values only**, and the id rule is applied once,
+/// to the single tied group the cut lands in:
+///
+/// 1. Sort the [`total_order_bits`] of the probabilities. Ties stay ties, so
+///    the equal-partition path survives.
+/// 2. Walk that ascending and find `d`, the number of elements dropped. The
+///    drop set is a *prefix*: probabilities are non-negative, so `cum` never
+///    decreases. And `d` does not depend on the order within a tied group,
+///    because every member contributes the same value to `cum` — only *which*
+///    members are dropped depends on it.
+/// 3. Of the group sitting exactly at the cut value, drop the `m` **highest**
+///    ids, keeping the lowest ones — the same lowest-id-wins rule
+///    [`filter_top_k`] and the device reduction use.
+///
+/// Without step 3 the survivor set is whatever pdqsort's pivot choice produced:
+/// on a row of 64 with one 0.4 and 63 identical tail values at `top_p = 0.5`,
+/// the unordered version keeps `{0, 29, 54..63}` — id 29 survives while ids
+/// 30..53 are zeroed from a bit-identical value.
+///
+/// Every sort and selection here is over integers under the standard `Ord`, so
+/// no comparator exists to be intransitive (see [`rank_key_desc`]).
 #[allow(
     clippy::indexing_slicing,
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
@@ -729,21 +799,54 @@ fn filter_top_p(probs: &mut [f32], top_p: f32) {
     if !(top_p > 0.0 && top_p < 1.0) {
         return;
     }
-    // Ascending by probability, ties by descending id.
-    let mut keys: Vec<u64> = probs
-        .iter()
-        .enumerate()
-        .map(|(i, &p)| rank_key_asc(p, i))
-        .collect();
-    keys.sort_unstable();
+    let n = probs.len();
+    let mut ordered: Vec<u32> = probs.iter().map(|&p| total_order_bits(p)).collect();
+    ordered.sort_unstable();
+
+    // Walk ascending; cumulative is inclusive of the current element. Drop
+    // where cum <= threshold (mlx-lm: `mx.where(cumprob > 1 - top_p, ...)`).
     let threshold = 1.0 - top_p;
     let mut cum = 0.0f32;
-    // Walk ascending; cumulative is inclusive of the current element. Keep
-    // where cum > threshold (mlx-lm: `mx.where(cumprob > 1 - top_p, ...)`).
-    for &key in &keys {
-        let i = key_id_inverted(key);
-        cum += probs[i];
+    let mut dropped = 0usize;
+    for (rank, &o) in ordered.iter().enumerate() {
+        cum += from_total_order_bits(o);
         if cum <= threshold {
+            dropped = rank + 1;
+        } else {
+            break;
+        }
+    }
+    if dropped == 0 {
+        return;
+    }
+    if dropped >= n {
+        for p in probs.iter_mut() {
+            *p = 0.0;
+        }
+        return;
+    }
+
+    // Everything below the cut value goes; the group *at* it is split by id.
+    let cut = ordered[dropped - 1];
+    let below = ordered.partition_point(|&o| o < cut);
+    let at_cut_dropped = dropped - below;
+
+    // `tied` comes out of a forward scan, so it is already ascending by id —
+    // no sort or selection is needed to find its highest members, they are its
+    // tail.
+    let mut tied: Vec<usize> = Vec::new();
+    for (i, p) in probs.iter_mut().enumerate() {
+        let o = total_order_bits(*p);
+        if o < cut {
+            *p = 0.0;
+        } else if o == cut {
+            tied.push(i);
+        }
+    }
+    if at_cut_dropped > 0 && at_cut_dropped <= tied.len() {
+        // Keep the lowest ids: drop the highest `at_cut_dropped` of the group.
+        let keep = tied.len() - at_cut_dropped;
+        for &i in &tied[keep..] {
             probs[i] = 0.0;
         }
     }
@@ -925,7 +1028,7 @@ pub fn sampling_distribution(
                 logits[i] = f32::NEG_INFINITY;
             }
         }
-        warn_all_forbidden(any_allowed, "sampling_distribution", vocab);
+        reject_all_forbidden(any_allowed, "sampling_distribution", vocab)?;
     }
 
     if penalty_cfg.penalties_active() {
@@ -941,7 +1044,7 @@ pub fn sampling_distribution(
 
     // temperature > 0 guaranteed by the caller's stochastic branch.
     let inv_temp = 1.0 / sp.temperature;
-    let mut probs = softmax_scaled(&logits, inv_temp);
+    let mut probs = softmax_scaled(&logits, inv_temp)?;
     filter_top_p(&mut probs, sp.top_p);
     filter_min_p(&mut probs, sp.min_p);
     filter_top_k(&mut probs, sp.top_k as usize);
@@ -1095,7 +1198,9 @@ pub struct TokenLogprobs {
 /// an artefact of the selection's swaps. The selection compares on
 /// `(logit, lowest id)`, which is a total order on the remaining candidates —
 /// it therefore does not care that `idx.swap` leaves the unscanned suffix in an
-/// arbitrary order, which a positional tiebreak would.
+/// arbitrary order, which a positional tiebreak would. It is seeded from
+/// outside the candidate set for the same reason [`host_argmax`] is, so a
+/// `NaN` never takes a rank ahead of a real logit.
 #[allow(
     clippy::indexing_slicing,
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
@@ -1144,14 +1249,23 @@ pub fn compute_top_logprobs(
     let mut idx: Vec<usize> = (0..vocab).collect();
     let mut top: Vec<(u32, f32)> = Vec::with_capacity(k);
     for slot in 0..k {
-        let mut best = slot;
-        for j in (slot + 1)..vocab {
-            let (lj, lb) = (logits[idx[j]], logits[idx[best]]);
-            if lj > lb || (lj == lb && idx[j] < idx[best]) {
-                best = j;
+        // Seeded from OUTSIDE the candidate set, exactly as `host_argmax` is:
+        // `-inf` for the value, `usize::MAX` for the id. Seeding from the
+        // candidate at `slot` would let a `NaN` sitting there win the rank —
+        // every later `>` and `==` against it is false — and rank 0 would then
+        // disagree with the device `argmax`, which skips `NaN` entirely.
+        let mut best_pos = slot;
+        let mut best_val = f32::NEG_INFINITY;
+        let mut best_id = usize::MAX;
+        for j in slot..vocab {
+            let (lj, id) = (logits[idx[j]], idx[j]);
+            if lj > best_val || (lj == best_val && id < best_id) {
+                best_val = lj;
+                best_id = id;
+                best_pos = j;
             }
         }
-        idx.swap(slot, best);
+        idx.swap(slot, best_pos);
         let id = idx[slot];
         top.push((id as u32, logprob_of(id)));
     }
@@ -1183,9 +1297,9 @@ const NEG_INF_F32_BITS: u32 = 0xFF80_0000u32;
 /// `logits_flat`: `[1, vocab]` array of F32 or BF16. Other dtypes return Err.
 ///
 /// `mask`: `vocab`-length boolean slice. `mask[i] == true` means token `i`
-/// is allowed. At least one entry must be `true`; if all are `false`, the
-/// argmax will return an arbitrary forbidden token (callers must not produce
-/// all-false masks).
+/// is allowed. At least one entry must be `true`; an all-`false` mask returns
+/// `Err` rather than an arbitrary forbidden token — see
+/// [`reject_all_forbidden`].
 ///
 /// The `device` parameter selects the MLX stream for the GPU ops.
 #[inline(never)]
@@ -1211,7 +1325,7 @@ pub fn apply_mask_argmax(logits_flat: &Array, mask: &[bool], device: Device) -> 
             bias_bytes[off..off + 4].copy_from_slice(&neg_inf_bytes);
         }
     }
-    warn_all_forbidden(any_allowed, "apply_mask_argmax", vocab);
+    reject_all_forbidden(any_allowed, "apply_mask_argmax", vocab)?;
     // Allowed entries are already 0.0 (zero_bytes) from vec initialisation.
     let _ = zero_bytes; // suppress unused warning
 
