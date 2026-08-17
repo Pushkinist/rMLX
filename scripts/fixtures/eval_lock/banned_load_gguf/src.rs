@@ -1,5 +1,5 @@
-pub fn write_snapshot(path: &CStr, arr: &Array) -> Result<()> {
-    let status = unsafe { sys::mlx_save_safetensors(path.as_ptr(), map, meta) };
+pub fn read_gguf(path: &CStr) -> Result<()> {
+    let status = unsafe { sys::mlx_load_gguf(&raw mut a, &raw mut b, path.as_ptr()) };
     Ok(())
 }
 

@@ -588,14 +588,27 @@ Three consequences worth knowing:
 
 ### Which C entry points need the lock
 
-**Twenty-four**, not the three this workspace happens to call. The set was
-derived by reverse reachability over the linked dylibs — `otool -tvV` on
-`libmlxc.dylib` and `libmlx.dylib`, transitive callers backwards from both
-`mlx::core::eval_impl` and the hazard symbol itself,
-`mlx::core::cpu::get_command_encoder(Stream)`, intersected with the exported
-`mlx_*` C ABI. Both directions agree. The exact procedure is recorded in
-`scripts/check_eval_lock.sh`; **re-run it when the mlx / mlx-c pin moves**
-rather than re-deriving it by eye.
+**Twenty-five**, not the three this workspace happens to call — and they come
+from *two* passes, because one of them is structurally blind to a quarter of
+the problem.
+
+**Pass 1 — automated, direct calls (24 symbols).** Reverse reachability over
+the linked dylibs: `otool -tvV` on `libmlxc.dylib` and `libmlx.dylib`,
+transitive callers backwards from both `mlx::core::eval_impl` and the hazard
+symbol itself `mlx::core::cpu::get_command_encoder(Stream)`, intersected with
+the exported `mlx_*` C ABI. Both directions agree.
+
+**Pass 2 — by hand, indirect dispatch (1 more).** `mlx_closure_apply` reaches
+evaluation through a `std::function` — a `blr` on a vtable slot — which reverse
+reachability over a disassembly does not traverse. It does **not** appear in
+pass 1's output and never will.
+
+> **Re-running pass 1 at a pin bump gives 24, with `mlx_closure_apply` absent.
+> That is the automated pass's blind spot, not a stale entry — do not "correct"
+> the gate by deleting the closure guard.**
+
+The exact procedure, and the other closure-taking entry points to re-audit at a
+pin bump, are recorded in `scripts/check_eval_lock.sh`.
 
 | Entry point | Count | Why it evaluates | Called here |
 |---|---|---|---|
@@ -608,7 +621,7 @@ rather than re-deriving it by eye.
 | `mlx_save`, `mlx_save_writer`, `mlx_save_safetensors`, `mlx_save_safetensors_writer`, `mlx_save_gguf`, `mlx_load_gguf` | 6 | serialisation materialises before writing | no |
 | `mlx_array_data_*` | — | **does not evaluate** — plain pointer accessors | yes, unguarded and correct |
 
-The twenty-one uncalled ones are the live risk. They sit in the bindings one
+The twenty-two uncalled ones are the live risk. They sit in the bindings one
 call away and read as innocuous: `mlx_array_item_float32` looks like a scalar
 accessor, `mlx_array_tostring` is what an `impl Debug for Array` reaches for,
 and `mlx_save_safetensors` is the **write side of `rmlx convert`**, a named
@@ -618,24 +631,36 @@ original bug.
 
 `mlx_closure_apply` is the one that is not obvious in either direction:
 applying a closure looks like pure graph construction, and the evaluation is
-reached through a `std::function` vtable, so it is invisible to a text scan of
-call sites. It is guarded, and because the Rust closure body runs *inside* that
-call with the lock held, a body that evaluated would self-deadlock on the
-non-reentrant mutex. No body does; RULE 3 of the gate keeps it that way.
+reached through a `std::function` vtable, so it is invisible both to a text
+scan of call sites and to pass 1 above. It is guarded, and because the Rust
+closure body runs *inside* that call with the lock held, a body that **takes
+the lock again** self-deadlocks on the non-reentrant mutex. Note that ban is
+broader than "must not evaluate" — `Closure::apply` takes the lock, so a body
+applying another compiled closure deadlocks without calling `eval` anywhere,
+which is the first shape a "fuse two fused kernels" refactor produces. No body
+does either today; RULE 3 of the gate keeps it that way.
 
 ### The three things that hold this together
 
 | | Kind | Catches | Misses |
 |---|---|---|---|
-| `make check-eval-lock` | text gate, deterministic | an unguarded call to any of the 24; a guard dropped from a call site; a closure body that evaluates | a disarmed lock — the lexical structure is unchanged, so it stays green |
+| `make check-eval-lock` | text gate, deterministic | an unguarded call to any of the 25; a guard dropped from a call site; a closure body that takes the lock again | a disarmed lock — the lexical structure is unchanged, so it stays green |
 | `with_eval_lock_serialises_concurrent_callers` | unit test, deterministic | a lock that does not actually exclude | anything about *which* calls take the lock |
 | `make eval-lock-stress` | reproducer driver, probabilistic | the real end-to-end crash | ~1 run in 12 per process, so it needs N≥60 to mean anything |
 
-The first two are in `make ci` and are complementary by construction — each is
-blind to exactly what the other catches; that was verified by mutation, not
-assumed. `make check-eval-lock-fixtures` is the recall test for the first, with
-thirteen synthetic scan roots pinning both its positives and its false-positive
-holes.
+The first two are in `make ci` **and in the hosted `source gates` job**, and are
+complementary by construction — each is blind to exactly what the other
+catches; that was verified by mutation, not assumed.
+
+`make check-eval-lock-fixtures` is the recall test for the first: 26 synthetic
+scan roots, each asserting an exit code **and which rule fired**. Asserting the
+rule is the point — an earlier corpus checked exit codes only, and because every
+must-fail fixture happened to contain no guarded call site, each one tripped
+RULE 2's anti-vacuity branch and exited 1 regardless of the rule under test.
+Deleting RULE 1 or RULE 3 outright left that corpus green. Every RULE 1 / RULE 3
+fixture now ends with a correctly-guarded `guarded_anchor` so the failure is
+attributable. The corpus is itself mutation-tested: 17 mutations of the gate,
+17 killed, 0 survivors.
 
 The stress driver is **not** in `make ci`, and the reproducer it drives carries
 `#[ignore]`. Its measured 8% failure rate was taken the way the driver runs it —

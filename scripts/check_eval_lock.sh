@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/check_eval_lock.sh — CI gate: every FFI call that can reach
 # `mlx::core::eval_impl` must be made under the process-wide evaluation lock,
-# and nothing that runs under that lock may evaluate.
+# and nothing that runs under that lock may take it again.
 #
 # THE BUG THIS PINS
 #   The linked MLX (0.31.x) resolves a CPU stream's `CommandEncoder` through a
@@ -26,40 +26,56 @@
 # WHY A GREP GATE AND NOT A TEST
 #   The reproducer for this (`concurrent_first_eval_reproducer`) is
 #   probabilistic — roughly one failure in twelve runs without the lock. Far
-#   too weak to gate on: eleven times in twelve, deleting the lock would go
-#   green. The *structural* regressions are the ones a text gate catches
-#   deterministically, and they are the realistic ones:
+#   too weak to gate on. The *structural* regressions are the ones a text gate
+#   catches deterministically, and they are the realistic ones:
 #
 #     1. Someone drops the lock from a guarded call site.
 #     2. Someone adds a call to one of the many other C entry points that
-#        evaluate. This is the live risk — only three of the twenty-four are
+#        evaluate. This is the live risk — only three of the twenty-five are
 #        called today, and most of the rest look completely innocuous.
 #        `mlx_array_item_float32` reads as a scalar accessor;
 #        `mlx_save_safetensors` is the write side of `rmlx convert`;
 #        `mlx_array_tostring` is what an `impl Debug for Array` reaches for.
-#     3. Someone makes a compiled-closure body evaluate, which self-deadlocks
-#        against the non-reentrant mutex (RULE 3).
+#     3. Someone makes a compiled-closure body take the lock again, which
+#        self-deadlocks against the non-reentrant mutex (RULE 3).
+#
+#   What it does NOT catch is a `with_eval_lock` that stopped locking: the
+#   lexical structure is unchanged, so this gate stays green. That half is
+#   covered by the unit test
+#   `with_eval_lock_serialises_concurrent_callers`. The two are complementary
+#   by construction, verified by mutation — neither alone covers this defect.
 #
 # HOW THE REACH-SET WAS DERIVED — re-run this when the mlx / mlx-c pin moves
-#   It is not guesswork and must not become guesswork. Reverse reachability
-#   over the linked dylibs, computed twice and cross-checked:
+#   It is not guesswork and must not become guesswork. TWO passes, because one
+#   of them is structurally blind to a quarter of the problem.
 #
+#   Pass 1 — automated, direct calls (yields 24 symbols):
 #     otool -tvV "$(brew --prefix mlx-c)/lib/libmlxc.dylib" > /tmp/mlxc.s
 #     otool -tvV "$(brew --prefix mlx)/lib/libmlx.dylib"    > /tmp/mlx.s
-#
 #   Take the transitive closure of callers backwards from BOTH
 #   `mlx::core::eval_impl` and the hazard symbol itself,
 #   `mlx::core::cpu::get_command_encoder(Stream)`, then intersect with the
-#   exported `mlx_*` C ABI. Both directions gave the same 24 below.
+#   exported `mlx_*` C ABI.
 #
-#   Two of the paths are non-obvious and worth restating, because a reader who
-#   only greps for "eval" will miss them:
-#     * `mlx_array_item_*` -> `array::item<T>()` -> `array::eval()`
-#       (visible in `mlx/array.h` — `item()` evaluates before reading).
-#     * `mlx_closure_apply` -> compiled closure body -> `compile_fuse` ->
-#       `Compiled::Compiled` -> `print_constant` -> `array::item<T>()` ->
-#       `array::eval()`. `print_constant` bakes scalar constants into the
-#       kernel library name; see `mlx/backend/common/compiled.cpp`.
+#   Pass 2 — by hand, INDIRECT dispatch (adds 1, for 25 total):
+#   Pass 1 CANNOT see a call made through a `std::function` — the jump is a
+#   `blr` on a vtable slot, so reverse reachability over a disassembly does not
+#   traverse it. `mlx_closure_apply` is exactly that shape and does NOT appear
+#   in pass 1's output. It reaches evaluation anyway:
+#     mlx_closure_apply -> compiled closure body -> compile_fuse ->
+#     Compiled::Compiled -> print_constant -> array::item<T>() -> array::eval()
+#   `print_constant` bakes scalar constants into the kernel library name; see
+#   `mlx/backend/common/compiled.cpp`.
+#
+#   ** If you re-run pass 1 at a pin bump you will get 24 and `mlx_closure_apply`
+#   will be missing. That is the automated pass's blind spot, not a stale
+#   entry — do NOT "correct" the gate by deleting the closure guard. **
+#
+#   Other closure-taking entry points to re-audit the same way at a pin bump,
+#   none called today: `mlx_export_function`, `mlx_imported_function_apply`,
+#   `mlx_vjp`, `mlx_jvp`, `mlx_value_and_grad`, `mlx_custom_function`,
+#   `mlx_checkpoint`. (`mlx_compile` does not invoke the closure;
+#   `mlx_fast_metal_kernel_apply` is lazy.)
 #
 # THE RULES
 #   RULE 1  No call to an evaluating entry point that has no guarded wrapper.
@@ -68,10 +84,15 @@
 #   RULE 2  Every call to a guarded entry point must be lexically inside a
 #           `with_eval_lock` closure: either on the call line itself, or inside
 #           an enclosing block whose opening line calls it.
-#   RULE 3  No `Closure::from_fn` body may evaluate. Those bodies run on the
-#           calling thread *inside* `mlx_closure_apply`, with the lock already
-#           held, so an evaluation there self-deadlocks on a non-reentrant
-#           mutex — a hang, which is one of this defect's own symptoms.
+#   RULE 3  No `Closure::from_fn` body may take the evaluation lock. Those
+#           bodies run on the calling thread *inside* `mlx_closure_apply`, with
+#           the lock already held, so taking it again self-deadlocks on a
+#           non-reentrant mutex — a hang, which is one of this defect's own
+#           symptoms. The ban is on *taking the lock*, which is broader than
+#           "evaluating": `Closure::apply` itself takes it, so a body that
+#           applies another compiled closure deadlocks too. That is not a
+#           hypothetical shape — it is the first thing a "fuse two fused
+#           kernels" refactor produces.
 #
 # WHAT THIS GATE CANNOT REACH — know the boundary before trusting it
 #   * It is a text scan. A call reached through an alias (`use ... as f; f()`),
@@ -80,16 +101,21 @@
 #     while `mod ffi` was `pub(crate)` — was closed in the code instead of the
 #     regex: `crates/rmlx-mlx/src/sys.rs` now declares `mod ffi` privately, so
 #     `sys::mlx_*` is the only way to name these functions.
-#   * RULE 3 is one level deep. It sees `.eval()` written directly in a closure
-#     body, not an evaluation reached through a helper the body calls. No op
-#     wrapper or `MetalKernel::apply` evaluates today, which is what makes one
-#     level sufficient; that is an assumption, not a proof.
-#   * The reach-set is a snapshot of the current pin. A newly-added evaluating
-#     entry point will not be flagged until someone re-runs the derivation
-#     above and extends RULE 1.
-#   * It proves lexical structure, not runtime behaviour. A `with_eval_lock`
-#     that took no lock would satisfy it. The mutual-exclusion unit test
-#     (`with_eval_lock_serialises_concurrent_callers`) covers that.
+#   * RULE 3 only sees bodies written INLINE at the `Closure::from_fn` call.
+#     `Closure::from_fn(named_fn)` moves the body out of reach entirely, and
+#     that is a natural refactor of a one-line delegation like
+#     `gated_delta_msl.rs`'s. It is also one level deep: it sees a lock-taking
+#     call written in the body, not one reached through a helper the body
+#     calls. No op wrapper or `MetalKernel::apply` takes the lock today, which
+#     is what makes one level sufficient — an assumption, not a proof.
+#   * Line comments and double-quoted strings are stripped before matching, so
+#     braces and lock names inside them are inert. Rust RAW strings
+#     (`r#"..."#`), char literals (`'{'`) and block comments (`/* */`) are NOT
+#     handled; an unbalanced brace in one of those would end RULE 3's body scan
+#     early and leave the remainder unscanned.
+#   * The reach-set is a snapshot of the current pin, and pass 1 is blind to
+#     indirect dispatch (see above).
+#   * It proves lexical structure, not runtime behaviour.
 #   * It says nothing about concurrent *graph construction*, which never
 #     reaches `eval_impl`.
 
@@ -116,11 +142,51 @@ fi
 BANNED_RE='sys::(ffi::)?(mlx_eval|mlx_array_item_[A-Za-z0-9_]*|mlx_array_tostring|mlx_save[A-Za-z0-9_]*|mlx_load_gguf)[[:space:]]*\('
 GUARDED_RE='sys::(ffi::)?(mlx_array_eval|mlx_async_eval|mlx_closure_apply)[[:space:]]*\('
 
+# Shared awk helper: drop `//` comments and double-quoted string bodies, so
+# neither a laundering comment nor a brace in a literal can steer the scans.
+STRIP_FN='
+function strip(line,   i, n, c, out, instr, esc) {
+    n = length(line); out = ""; instr = 0; esc = 0
+    for (i = 1; i <= n; i++) {
+        c = substr(line, i, 1)
+        if (instr) {
+            if (esc) { esc = 0; continue }
+            if (c == "\\") { esc = 1; continue }
+            if (c == "\"") { instr = 0 }
+            continue
+        }
+        if (c == "\"") { instr = 1; continue }
+        if (c == "/" && substr(line, i + 1, 1) == "/") break
+        out = out c
+    }
+    return out
+}'
+
+# Drop hits whose match survives only inside a comment or a string literal.
+# All three rules go through this, so "is this a real call site?" is answered
+# the same way everywhere — an inconsistency here is what let a doc comment
+# naming `sys::mlx_eval(v)` fail RULE 1 while the same text was inert to
+# RULE 2 and RULE 3.
+filter_real_calls() {
+    local re="$1" hit file line text stripped
+    while IFS= read -r hit; do
+        [ -z "${hit}" ] && continue
+        file="${hit%%:*}"
+        text="${hit#*:}"
+        line="${text%%:*}"
+        stripped="$(sed -n "${line}p" "${file}" | awk "${STRIP_FN}"'{ print strip($0) }')"
+        if printf '%s\n' "${stripped}" | grep -qE "${re}"; then
+            printf '%s:%s:%s\n' "${file}" "${line}" "${stripped}"
+        fi
+    done
+}
+
 fail=0
 
 # ---- RULE 1: entry points with no guarded wrapper must not be called -------
 
-banned_hits="$(grep -rnE "${BANNED_RE}" --include='*.rs' "${SCAN_DIR}" || true)"
+banned_hits="$(grep -rnE "${BANNED_RE}" --include='*.rs' "${SCAN_DIR}" \
+    | filter_real_calls "${BANNED_RE}" || true)"
 
 if [ -n "${banned_hits}" ]; then
     fail=1
@@ -136,7 +202,8 @@ fi
 
 # ---- RULE 2: guarded entry points must be called under the lock ------------
 
-guarded_hits="$(grep -rnE "${GUARDED_RE}" --include='*.rs' "${SCAN_DIR}" || true)"
+guarded_hits="$(grep -rnE "${GUARDED_RE}" --include='*.rs' "${SCAN_DIR}" \
+    | filter_real_calls "${GUARDED_RE}" || true)"
 
 if [ -z "${guarded_hits}" ]; then
     fail=1
@@ -149,13 +216,15 @@ fi
 # For a hit at line L, pass if `with_eval_lock` appears on L itself or on the
 # opening line of any block enclosing L. Walking *openers* — successively lower
 # indentation — rather than a fixed line window is what makes this immune to
-# both a long comment inside the closure (the window bug this replaced) and to
-# a guarded sibling call earlier in the same function (a sibling is not an
-# enclosing opener, so it never launders a later unguarded call).
+# both a long comment inside the closure and to a guarded sibling call earlier
+# in the same function (a sibling is not an enclosing opener, so it never
+# launders a later unguarded call). Comments are stripped first, so neither a
+# trailing `// with_eval_lock: ...` nor a column-0 comment inside the closure
+# can launder or sever the chain.
 check_guarded() {
-    awk -v target="$1" '
+    awk -v target="$1" "${STRIP_FN}"'
         NR <= target {
-            line = $0
+            line = strip($0)
             match(line, /^[ \t]*/)
             ind[NR] = RLENGTH
             txt[NR] = line
@@ -187,21 +256,25 @@ while IFS= read -r hit; do
         fail=1
         echo "check_eval_lock: RULE 2 — evaluation FFI call not under the evaluation lock:" >&2
         echo "  ${file}:${line}" >&2
-        echo "  Wrap it: with_eval_lock(|| unsafe { sys::... })" >&2
+        echo "  Wrap the call itself in with_eval_lock(|| ...). A comment saying" >&2
+        echo "  the caller already holds the lock does not satisfy this gate and" >&2
+        echo "  is not a substitute for holding it." >&2
         echo >&2
     fi
 done <<< "${guarded_hits}"
 
-# ---- RULE 3: nothing that runs under the lock may evaluate ----------------
+# ---- RULE 3: nothing running under the lock may take it again -------------
 
 closure_hits="$(grep -rnE 'Closure::from_fn[[:space:]]*\(' --include='*.rs' "${SCAN_DIR}" || true)"
 
-# Brace-match the closure body and look for a direct evaluation inside it.
+# Brace-match the closure body (over comment- and string-stripped text) and
+# look for anything that would take the evaluation lock: a direct evaluation,
+# or an application of another compiled closure, which takes it internally.
 check_closure_body() {
-    awk -v start="$1" '
+    awk -v start="$1" "${STRIP_FN}"'
         NR < start { next }
         {
-            line = $0
+            line = strip($0)
             if (!started) {
                 p = index(line, "{")
                 if (p == 0) next
@@ -210,7 +283,8 @@ check_closure_body() {
             } else {
                 rest = line
             }
-            if (rest ~ /\.(eval|async_eval|to_bytes)[[:space:]]*\(/) bad = 1
+            if (rest ~ /(\.|Array::)(eval|async_eval|to_bytes)[[:space:]]*\(/) bad = 1
+            if (rest ~ /\.apply[[:space:]]*\([[:space:]]*&\[/) bad = 1
             n = length(rest)
             for (i = 1; i <= n; i++) {
                 c = substr(rest, i, 1)
@@ -241,11 +315,12 @@ while IFS= read -r hit; do
 
     if [ "$(check_closure_body "${line}" "${file}")" != "ok" ]; then
         fail=1
-        echo "check_eval_lock: RULE 3 — a Closure::from_fn body evaluates:" >&2
+        echo "check_eval_lock: RULE 3 — a Closure::from_fn body takes the evaluation lock:" >&2
         echo "  ${file}:${line}" >&2
-        echo "  That body runs inside mlx_closure_apply with the evaluation lock" >&2
-        echo "  already held, so evaluating there self-deadlocks on a" >&2
-        echo "  non-reentrant mutex. Move the evaluation outside the closure." >&2
+        echo "  That body runs inside mlx_closure_apply with the lock already" >&2
+        echo "  held, so evaluating — or applying another compiled closure," >&2
+        echo "  which takes the lock internally — self-deadlocks on a" >&2
+        echo "  non-reentrant mutex. Move it outside the closure." >&2
         echo >&2
     fi
 done <<< "${closure_hits}"
@@ -255,4 +330,4 @@ if [ "${fail}" -ne 0 ]; then
     exit 1
 fi
 
-echo "OK: every MLX evaluation FFI call is made under the evaluation lock (24-symbol reach-set)."
+echo "OK: every MLX evaluation FFI call is made under the evaluation lock (25-symbol reach-set)."

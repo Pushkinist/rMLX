@@ -1,7 +1,7 @@
 impl Array {
-    pub fn eval_alt(&self) -> Result<()> {
-        let status = unsafe { sys::ffi::mlx_array_item_float32(&raw mut o, self.inner) };
-        Ok(())
+    pub fn async_eval(&self) -> Result<()> {
+        let status = unsafe { sys::mlx_async_eval(vec) };
+        unsafe { check_status(status, "Array::async_eval") }
     }
 }
 

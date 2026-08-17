@@ -229,11 +229,15 @@ impl Closure {
     /// the unsynchronised command-encoder map like any other evaluation.
     ///
     /// **Re-entrancy:** the closure body runs on the calling thread, inside
-    /// this FFI call, with the lock held — so a body that itself evaluates
-    /// would self-deadlock on the non-reentrant mutex. No body does today
-    /// (none of the `Closure::from_fn` sites evaluates, and no op wrapper or
-    /// `MetalKernel::apply` does either), and `make check-eval-lock` fails the
-    /// build if one starts to.
+    /// this FFI call, with the lock held — so a body that *takes the lock
+    /// again* self-deadlocks on the non-reentrant mutex. That ban is broader
+    /// than "must not evaluate": this method takes the lock, so a body which
+    /// applies another compiled closure deadlocks without calling `eval`
+    /// anywhere, and that is the first shape a "fuse two fused kernels"
+    /// refactor produces. No body does either today (no `Closure::from_fn`
+    /// site evaluates or re-applies, and no op wrapper or
+    /// `MetalKernel::apply` takes the lock), and `make check-eval-lock`
+    /// RULE 3 fails the build if one starts to.
     pub fn apply(&self, inputs: &[&Array]) -> Result<Vec<Array>> {
         install_error_handler();
 

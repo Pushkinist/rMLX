@@ -64,6 +64,18 @@ jobs:
       # call deep in a shared scaffold. Fixture trees pin that recall.
       - name: the lazy-inputs gate still catches what it is for
         run: make check-no-kernel-input-eval-fixtures
+      # MLX 0.31.x fills a process-global CPU command-encoder map with no
+      # synchronisation, so two threads evaluating at once corrupt it and the
+      # process dies inside MLX with no failing test named. Serialising every
+      # evaluation is the fix; this gate is what keeps a new FFI call from
+      # quietly stepping outside it. Static — the local reproducer is
+      # probabilistic and deliberately not run here.
+      - name: MLX eval FFI calls are made under the evaluation lock
+        run: make check-eval-lock
+      # ...and the gate above is one regex edit from matching nothing and
+      # passing forever. Fixture trees pin its recall, per rule.
+      - name: the eval-lock gate still catches what it is for
+        run: make check-eval-lock-fixtures
 
   msl:
     name: msl kernels (compile + format)

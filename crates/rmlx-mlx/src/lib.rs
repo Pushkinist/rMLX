@@ -102,9 +102,13 @@ thread_local! {
 // than a throughput bottleneck.
 //
 // **Which C entry points need it.** Not just the eval-named ones: every mlx-c
-// function that reaches `mlx::core::eval_impl` touches the same map. Derived by
-// reverse reachability over the linked dylibs (see `scripts/check_eval_lock.sh`
-// for the exact procedure), the set is 24:
+// function that reaches `mlx::core::eval_impl` touches the same map. The set is
+// **25** — 24 found by reverse reachability over the linked dylibs, plus
+// `mlx_closure_apply`, which that automated pass structurally cannot see
+// because the call goes through a `std::function` vtable. Re-running the
+// procedure at a pin bump yields 24 and no closure entry; that is the pass's
+// blind spot, not a stale guard. `scripts/check_eval_lock.sh` records both
+// passes.
 //
 //   - `mlx_array_eval`, `mlx_async_eval`, `mlx_eval`
 //   - 14 × `mlx_array_item_*` — `array::item<T>()` calls `eval()` first
@@ -119,17 +123,20 @@ thread_local! {
 //     (`mlx/backend/common/compiled.cpp`)
 //
 // The data accessors `mlx_array_data_*` do *not* evaluate and need no lock.
-// Three of these are called here and all three are guarded; the rest are one
-// call away, and adding one unguarded silently reinstates this defect —
+// Three of the 25 are called here and all three are guarded; the other 22 are
+// one call away, and adding one unguarded silently reinstates this defect —
 // `mlx_save_safetensors` is the write side of `rmlx convert`, and
 // `mlx_array_tostring` is what an `impl Debug for Array` would reach for.
 // `make check-eval-lock` fails the build on that, because a doc sentence is
 // not a gate.
 //
 // **Re-entrancy.** The mutex is not reentrant, so nothing running under it may
-// evaluate. That is only a live question for `mlx_closure_apply`, which invokes
-// a Rust closure body on the calling thread while the lock is held. No body
-// evaluates today and the gate enforces it; see `Closure::apply`.
+// *take the lock again* — a broader ban than "must not evaluate", because
+// `Closure::apply` takes it too, so applying one compiled closure from inside
+// another's body deadlocks without calling `eval` anywhere. That is only a live
+// question for `mlx_closure_apply`, which invokes a Rust closure body on the
+// calling thread while the lock is held. No body does it today and the gate's
+// RULE 3 enforces it; see `Closure::apply`.
 static EVAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Run `f` holding the process-wide evaluation lock.
@@ -143,14 +150,20 @@ static EVAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// remember.
 ///
 /// Poisoning is unreachable here, though not because the guarded region is
-/// Rust-free — it is not. MLX calls back into the error handler installed by
-/// [`install_error_handler`] from *inside* `mlx_array_eval` / `mlx_async_eval`,
-/// and that handler allocates a `String` and writes a thread-local; a compiled
-/// closure body runs under the lock too. What rules poisoning out is that the
-/// callback is an `unsafe extern "C" fn`, and since Rust 1.81 a panic escaping
-/// one aborts the process rather than unwinding. Recovering from `PoisonError`
-/// rather than propagating it keeps that unreachable state from turning a later
-/// evaluation into a spurious failure.
+/// Rust-free — it is not. Two different bits of Rust run under this lock, and
+/// each is contained by a different mechanism:
+///
+/// - The error handler installed by [`install_error_handler`], which MLX calls
+///   from *inside* `mlx_array_eval` / `mlx_async_eval`, allocating a `String`
+///   and writing a thread-local. It is an `unsafe extern "C" fn`, and since
+///   Rust 1.81 a panic escaping one aborts the process rather than unwinding.
+/// - A compiled closure body, run from inside `mlx_closure_apply`. The abort
+///   rule does *not* apply to it, because `rust_closure_callback` wraps the
+///   call in `catch_unwind` and converts a panic into a non-zero return — so
+///   no unwind ever crosses the `MutexGuard` from that direction either.
+///
+/// Recovering from `PoisonError` rather than propagating it keeps that
+/// unreachable state from turning a later evaluation into a spurious failure.
 pub(crate) fn with_eval_lock<T>(f: impl FnOnce() -> T) -> T {
     let _guard = EVAL_LOCK
         .lock()

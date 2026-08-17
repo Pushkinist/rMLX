@@ -5,3 +5,8 @@ impl std::fmt::Debug for Array {
         write!(f, "Array")
     }
 }
+
+fn guarded_anchor(a: &Array) -> Result<()> {
+    let s = with_eval_lock(|| unsafe { sys::mlx_array_eval(a.inner) });
+    unsafe { check_status(s, "anchor") }
+}
