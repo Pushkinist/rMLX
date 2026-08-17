@@ -94,6 +94,56 @@ tokens, but the draft cache stopped one step short. The next draft seed
 prepends the last draft token so the draft cache re-aligns before the new
 proposals begin.
 
+### Partial accept always cuts mid-block
+
+Phase D truncates a KV store to a position that is **never** an append boundary:
+the verifier writes its whole `K + 1`-token chunk as one append, and
+`truncate_to(offset - v_drop)` lands inside it by construction.
+
+It is not the only such caller. `PromptCacheEntry::truncate_kv_to_block`
+delegates to `truncate_kv_to(block_count * BLOCK_TOKENS)` with
+`BLOCK_TOKENS = 256`, while gemma4 prefills in 1024-token chunks and
+qwen3.5-MoE in 2048 — so a `ReusePolicy::Partial` trim also lands inside an
+append block on those arches. Phase D is the caller that hits it on *every*
+partial accept; the prompt-cache trim hits it whenever the block granularity and
+the prefill chunk disagree.
+
+That matters for the block-accumulating packed stores — every rotor and iso K
+and V store keeps a `Vec` of per-append blocks, not a flat buffer. Dropping the
+whole trailing block would discard the accepted tokens along with the rejected
+ones and leave `blocks` covering fewer rows than `shape[2]`; the store's
+reconciliation guard then aborts the request with
+`"CPU blocks cover N tokens but shape[2] needs M"` rather than fabricate a
+zeroed gap. `storage::truncate_plan` therefore **splits** the trailing block,
+cutting every per-row buffer — codes, per-group scales, per-group quaternions,
+per-token norms, and the rotor QJL sideband — to the accepted row count. See
+`crates/rmlx-kv-quant/src/storage/mod.rs` and
+`storage/truncate_plan_tests.rs`.
+
+A live GPU ring can rebuild the gap, which is why this was survivable on the
+fused decode path. It is not survivable wherever the ring is absent: the CPU
+append path (a QJL-carrying rotor K store, or a `Device::Cpu` run), and the
+legacy `update_rotor{3,4}_sym` / asym appends, which clear the ring by design.
+Those are exactly the paths a `q_seq > 1` verifier forward takes, since the
+fused decode entry is gated on `q_seq == 1`.
+
+**Scope (#382).** The split covers the rotor and iso block stores only, and only
+at `b == 1` (at `b > 1` the block concatenation is not readable by the decode
+path, so a mid-block cut stays a loud error instead of becoming a scrambled
+store). `QuantV` (`Vec<TurboBlocks>`) and `QuantPlanarV` / `QuantPlanarK`
+(`Vec<PlanarBlocks>`) accumulate CPU blocks the same way, but
+`KvStorage::truncate_to` only lowers `shape[2]` for `K8V4` / `K8V8` / `Planar` /
+`PlanarK` / `TurboSym3/4` / `K8VTurbo2/3` / `K8VTurbo3Tcq` / `K8VTurbo2Tcq` and
+for the V axis of `RotorKAsym3/4`, so their blocks **over**-cover the target and
+the next append stacks on top. `QuantV::dequantize_choice` then resizes the
+over-long concatenation down to `shape[2]`, silently keeping the rejected tokens
+and dropping the correction token — wrong attention, no error.
+
+`RotorKAsym3/4` are the awkward case: their rotor K axis is covered and their
+affine V axis is not, so one codec now truncates its two axes with different
+semantics. Unfixed; those stores are owned outside this change. See
+`docs/KV_QUANT.md` § "Scope — the class is NOT closed (#382)".
+
 ## Per-drafter Deep Dive
 
 ### MTP — Multi-Token Prediction (Qwen3.5 sidecar)

@@ -572,6 +572,37 @@ pub(crate) fn incoherence_per_row(x: &[f32], head_dim: usize) -> IncoherenceStat
     }
 }
 
+// ── Stored-rate accounting ───────────────────────────────────────────────────
+
+/// Bits a bf16 KV buffer spends per stored value.
+///
+/// The floor every KV codec is measured against. A codec whose store lands
+/// above this is not compressing — it is paying a codebook's *nominal* width in
+/// docs while spending more than the uncompressed baseline in memory, which is
+/// the failure mode the rotor and iso families shipped with.
+pub(crate) const BF16_BITS_PER_VALUE: f64 = 16.0;
+
+/// Stored bits per input value, from an encoder's **actual** output buffers.
+///
+/// `stored_bytes` is the summed heap size of everything the encode call
+/// produced — codes, per-group scales, per-group rotations, per-token norms,
+/// any sideband — and `n_values` the number of input values those buffers
+/// describe. Deriving the rate this way rather than from a codec's advertised
+/// bit width is the point: rotor3 advertises
+/// [`crate::rotorquant::ROTOR3_BITS`] = 3 and stores 21.75 — a factor of
+/// **7.25** — because the nominal width counts only the codes, and only the 3
+/// of 8 codes per group that carry information.
+///
+/// Returns `f64::INFINITY` for `n_values == 0` — a store with no values has no
+/// meaningful rate, and an infinite one fails every ceiling rather than passing
+/// them all.
+pub(crate) fn stored_bits_per_value(stored_bytes: u64, n_values: usize) -> f64 {
+    if n_values == 0 {
+        return f64::INFINITY;
+    }
+    (stored_bytes * 8) as f64 / n_values as f64
+}
+
 // ── Rate-distortion reference ────────────────────────────────────────────────
 
 /// dB per bit for a scalar quantizer: `20 · log10(2)`.

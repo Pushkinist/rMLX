@@ -326,8 +326,9 @@ pub enum KvQuant {
     /// Symmetric rotor3 — K = rotor3, V = rotor3 (Cl(3,0)
     /// Clifford rotor sandwich + 3-bit Lloyd-Max codebook on both axes).
     /// K-side carries an optional 1-bit QJL residual sideband when
-    /// [`crate::rotor_qjl::rotor_qjl_enabled`] is `true` at first append
-    /// (default ON).
+    /// [`crate::rotor_qjl::rotor_qjl_enabled`] is `true` at first append —
+    /// **off by default**, because the sideband has no MSL kernel and forces the
+    /// whole rotor K path onto the CPU (see [`crate::rotor_qjl`]).
     ///
     /// **Arch guard (Contract A.y — mandatory)**: K-side ≤4-bit on Qwen MoE
     /// is the PPL-disaster zone (218→8641 on Q4_K_M baseline; 7:1 GQA

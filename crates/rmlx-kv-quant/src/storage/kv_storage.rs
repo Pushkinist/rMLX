@@ -999,6 +999,12 @@ impl KvStorage {
         reason = "long match enumerates all KvStorage variants; splitting would obscure the 1-to-1 mapping"
     )]
     pub fn truncate_to(&mut self, n: i32) {
+        // Clamp once, here. Several variants mix a bare `shape[2] = n` on one
+        // axis with a `truncate_to(n)` on the other; the latter clamps
+        // internally, so a negative `n` would leave the two axes of one codec
+        // disagreeing about their length — harder to diagnose than both going
+        // negative together.
+        let n = n.max(0);
         match self {
             Self::K8V4 { k, v, .. } => {
                 if let Some(ks) = k.as_mut() {

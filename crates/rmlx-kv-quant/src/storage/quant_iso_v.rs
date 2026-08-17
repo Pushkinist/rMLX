@@ -75,6 +75,31 @@ impl IsoBlocks {
     }
 }
 
+impl super::BlockRows for IsoBlocks {
+    /// The exhaustive destructure is the drift guard: a new payload field
+    /// cannot be added without this failing to compile, which is what stops a
+    /// buffer from surviving a mid-block truncation at its full length.
+    fn retain_rows(&mut self, rows: usize) -> bool {
+        let Self {
+            codes,
+            scales,
+            quaternions,
+            norms,
+            n_tokens,
+        } = self;
+        let lengths = [codes.len(), scales.len(), quaternions.len(), norms.len()];
+        if !super::rows_split_ok(&lengths, *n_tokens, rows) {
+            return false;
+        }
+        super::retain_rows_in(codes, *n_tokens, rows);
+        super::retain_rows_in(scales, *n_tokens, rows);
+        super::retain_rows_in(quaternions, *n_tokens, rows);
+        super::retain_rows_in(norms, *n_tokens, rows);
+        *n_tokens = rows;
+        true
+    }
+}
+
 /// Accumulated IsoQuant V cache (3-bit, quaternion SO(4) fast mode).
 ///
 /// Storage parallels [`crate::storage::QuantPlanarV`] but the per-group
@@ -308,9 +333,9 @@ impl QuantIsoV3 {
 
     /// Truncate the accumulated sequence to `n` tokens.
     ///
-    /// Drops trailing blocks until the cumulative `n_tokens` count is `<= n *
-    /// b * kv_h` (block `n_tokens` counts rows, not sequence positions — see
-    /// [`super::truncate_keep_count`]) and lowers `shape[2]` to `n`.
+    /// Drops trailing blocks past `n` and **splits** the block the cut lands
+    /// inside (block `n_tokens` counts rows, not sequence positions — see
+    /// [`super::truncate_plan`]), then lowers `shape[2]` to `n`.
     ///
     /// The GPU ring is **kept**, not cleared — mirror of the rotor V store's
     /// `truncate_to`. Lowering `shape[2]` to `n` makes the ring's logical fill
@@ -323,9 +348,9 @@ impl QuantIsoV3 {
     /// loudly, which would abort generation on the speculative-decode rollback
     /// path.
     pub fn truncate_to(&mut self, n: i32) {
-        let keep =
-            super::truncate_keep_count(self.blocks.iter().map(|blk| blk.n_tokens), &self.shape, n);
-        self.blocks.truncate(keep);
+        let n = n.max(0);
+        let plan = super::truncate_plan(self.blocks.iter().map(|blk| blk.n_tokens), &self.shape, n);
+        super::apply_truncate_plan(&mut self.blocks, &plan);
         // NB: no `self.gpu.clear()` — the ring is the source of truth for a
         // ring-only decode tail; see the doc comment above.
         if self.shape.len() >= 4 {
@@ -334,9 +359,9 @@ impl QuantIsoV3 {
         // Lower the GPU mirror offset; underlying buffer untouched (matches
         // `QuantV::truncate` semantics — the trailing tokens become logically
         // free and the next `append_gpu` overwrites them via `slice_update`).
-        let n_clamped = n.max(0);
-        if self.gpu_offset > n_clamped {
-            self.gpu_offset = n_clamped;
+        // `n` is already clamped at the top of this function.
+        if self.gpu_offset > n {
+            self.gpu_offset = n;
         }
     }
 
