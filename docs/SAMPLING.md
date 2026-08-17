@@ -927,9 +927,11 @@ structural byte resets the counter. No JSON document becomes unreachable —
 only indentation deeper than the cap is clipped. This is the same reasoning
 behind the bounded `space` rule llama.cpp generates from a JSON schema.
 
-Two positions are *not* insignificant whitespace and reject it outright: raw
-C0 control bytes inside any JSON string, including an object **key** string
-(RFC 8259 requires them escaped), and whitespace before the root value.
+Two positions are *not* insignificant whitespace and reject it outright in both
+engines: raw C0 control bytes inside any JSON string, including an object **key**
+string (RFC 8259 requires them escaped). The schema engine additionally rejects
+whitespace before the *root* value, where it can only be a no-op; the
+schema-less `json_object` engine still accepts it there, bounded by the same cap.
 
 `make schema-constraint-canary` (`scripts/schema_constraint_canary.sh`) is the
 real-model proof for both properties, on Bonsai and gemma-4-e2b. Its PASS/FAIL
@@ -941,14 +943,26 @@ code so a harness too weak to see the defect fails as loudly as a broken fix.
 Both JSON engines have a warm-up phase and only start masking once the model
 emits something the grammar can latch onto — a value-starter byte for a
 container root, the first post-reasoning token for a scalar root.
-`ConstraintEngine::engaged()` exposes whether that ever happened. A
-generation that ends with it still `false` was never constrained, and its
-output is byte-for-byte indistinguishable from output the grammar inspected
-and permitted, so the decode loop emits a `warn!` naming the model and
-session. The response itself is still returned with HTTP 200: the tokens have
-already been streamed by the time the engine's terminal state is known, so
-there is no honest way to refuse mid-flight. Callers that must not accept an
-unenforced result should validate the response body against their schema.
+`ConstraintEngine::engaged()` exposes whether that ever happened, and
+`engaged_handle()` gives the route a clone that outlives the move of the engine
+into the decode thread. A generation that ends with it still `false` was never
+constrained, and its output is byte-for-byte indistinguishable from output the
+grammar inspected and permitted.
+
+- **Non-streaming refuses.** `generate_blocking` accumulates the whole stream
+  before building a response, so no byte has reached the client. A request that
+  asked for `response_format` and whose grammar never engaged returns HTTP 502
+  `constraint_not_engaged` rather than a 200 the caller cannot tell apart from
+  an enforced one.
+- **Streaming cannot.** The deltas are already on the wire by the time the
+  engine's terminal state is known. It emits the warn and completes.
+- The scope is `response_format` only. `tool_choice=required/named` also builds
+  a constraint, but it has a text-parsing fallback, so a non-engaged constraint
+  there is not a broken contract.
+
+Either way the decode loop emits a `warn!` carrying the route's `request_id`
+(the span is carried explicitly across `spawn_blocking`, which does not
+propagate it).
 
 ---
 

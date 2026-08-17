@@ -1,4 +1,6 @@
-//! HTTP-surface tests for the prompt-derived reasoning channel.
+//! HTTP-surface tests for `json_schema` enforcement and the prompt-derived
+//! reasoning channel — one surface, because the channel decides whether the
+//! constraint ever engages.
 //!
 //! The value under test is `GenerationRequest::prompt_think_open`: the route
 //! renders the chat template, reads off whether the assistant turn was left
@@ -359,4 +361,79 @@ async fn anthropic_route_reads_the_generation_suffix_too() {
             "template={template:?} content={content:?}: expected prompt_think_open={want}"
         );
     }
+}
+
+// ── A constraint that never engaged must not answer 200 ─────────────────────
+//
+// The recording generator ignores the constraint entirely, which is exactly the
+// shape under test: the engine was built, moved into the decode path, and never
+// applied to a single logit.
+
+fn schema_request(stream: bool) -> String {
+    serde_json::json!({
+        "model": "recording",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 4,
+        "stream": stream,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "unit_answer",
+                "strict": true,
+                "schema": {
+                    "type": "object",
+                    "properties": {"unit": {"type": "string", "enum": ["celsius"]}},
+                    "required": ["unit"],
+                    "additionalProperties": false
+                }
+            }
+        }
+    })
+    .to_string()
+}
+
+/// Non-streaming: the whole stream is accumulated before any byte reaches the
+/// client, so an unchecked body can still be refused. Returning it with HTTP
+/// 200 would be indistinguishable from an enforced result.
+#[tokio::test]
+async fn nonstreaming_json_schema_that_never_engaged_is_refused() {
+    let (port, _seen, _tmp) = start_server(TPL_NO_PREFILL).await;
+    let (status, b) = http(port, "/v1/chat/completions", &schema_request(false)).await;
+    assert_eq!(
+        status, 502,
+        "an unenforced response_format response must be refused, got {status}: {b}"
+    );
+    assert!(
+        b.contains("constraint_not_engaged"),
+        "the refusal must name its reason: {b}"
+    );
+}
+
+/// Streaming cannot refuse: by the time the engine's terminal state is known,
+/// the deltas are already on the wire. Pinned so the asymmetry is a decision on
+/// record rather than an oversight — and so that a future buffering change has
+/// to update this test deliberately.
+#[tokio::test]
+async fn streaming_json_schema_that_never_engaged_still_returns_200() {
+    let (port, _seen, _tmp) = start_server(TPL_NO_PREFILL).await;
+    let (status, _b) = http(port, "/v1/chat/completions", &schema_request(true)).await;
+    assert_eq!(
+        status, 200,
+        "streaming has already emitted bytes; it cannot retract them"
+    );
+}
+
+/// The refusal is scoped to `response_format`. A plain request through the same
+/// generator — no constraint built at all — must be unaffected.
+#[tokio::test]
+async fn a_request_without_response_format_is_unaffected() {
+    let (port, _seen, _tmp) = start_server(TPL_NO_PREFILL).await;
+    let body = serde_json::json!({
+        "model": "recording",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 4
+    })
+    .to_string();
+    let (status, b) = http(port, "/v1/chat/completions", &body).await;
+    assert_eq!(status, 200, "body: {b}");
 }

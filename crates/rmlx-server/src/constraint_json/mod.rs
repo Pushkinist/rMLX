@@ -109,9 +109,13 @@ const WS: [u8; 4] = *b" \t\n\r";
 /// its indentation is clipped. This mirrors the bounded `space` rule llama.cpp
 /// generates from a JSON schema for the same reason.
 ///
-/// The bound is per structural position: any content or structural byte
-/// resets the counter, so a pretty-printed document pays it once per newline.
-pub(crate) const MAX_INSIGNIFICANT_WS_RUN: u32 = 16;
+/// The bound is per structural position: any content or structural byte resets
+/// the counter, so a pretty-printed document pays it once per newline. The run
+/// at a structural position is `1 + indent_width * depth`, so 64 clips 4-space
+/// indentation only past depth 15 and 2-space past depth 31 — deep enough that
+/// no realistic document is reformatted, and still finite, which is all
+/// termination needs.
+pub(crate) const MAX_INSIGNIFICANT_WS_RUN: u32 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JsonState {
@@ -753,6 +757,10 @@ pub struct JsonObjectConstraint {
     mask: Vec<bool>,
     /// Pre-engagement state — see the doc comment above.
     engaged: bool,
+    /// Mirror of `engaged` the route keeps a clone of. The engine itself is
+    /// moved into the decode thread, so this is the only way the route can
+    /// learn — after the stream drains — whether the grammar was ever applied.
+    engaged_flag: Arc<AtomicBool>,
     /// Text accumulated from tokens seen before engagement. Used to detect
     /// and suppress a leading markdown-fence (` ```json\n `) wrapper.
     /// Cleared when engagement fires.
@@ -792,6 +800,7 @@ impl JsonObjectConstraint {
             eos_ids,
             mask: Vec::new(),
             engaged: false,
+            engaged_flag: Arc::new(AtomicBool::new(false)),
             pre_engage_buf: String::new(),
             is_thinking: Arc::new(AtomicBool::new(false)),
         }
@@ -806,6 +815,7 @@ impl JsonObjectConstraint {
             eos_ids,
             mask: Vec::new(),
             engaged: false,
+            engaged_flag: Arc::new(AtomicBool::new(false)),
             pre_engage_buf: String::new(),
             is_thinking: Arc::new(AtomicBool::new(false)),
         }
@@ -814,7 +824,21 @@ impl JsonObjectConstraint {
     /// Force-engage the constraint, bypassing warm-up. Used by tests
     /// that drive the mask directly via [`feed_bytes`].
     pub fn force_engage(&mut self) {
+        self.mark_engaged();
+    }
+
+    /// The one place `engaged` flips, so the route-visible mirror can never
+    /// drift from the field the mask logic reads.
+    fn mark_engaged(&mut self) {
         self.engaged = true;
+        self.engaged_flag.store(true, Ordering::Release);
+    }
+
+    /// Shared handle the route reads after generation to learn whether the
+    /// engine ever engaged. `false` at end of stream means the response was
+    /// never checked against the requested grammar.
+    pub fn engaged_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.engaged_flag)
     }
 
     /// Handle to the shared `is_thinking` flag. The route's step_fn
@@ -950,7 +974,7 @@ impl ConstraintEngine for JsonObjectConstraint {
             // which is still valid JSON; the grammar accepts top-level
             // arrays.
             if let Some(idx) = bytes.iter().position(|&b| b == b'{' || b == b'[') {
-                self.engaged = true;
+                self.mark_engaged();
                 tracing::info!(
                     token_id,
                     engage_byte = bytes[idx],
@@ -972,6 +996,10 @@ impl ConstraintEngine for JsonObjectConstraint {
 
     fn engaged(&self) -> bool {
         self.engaged
+    }
+
+    fn engaged_handle(&self) -> Option<Arc<AtomicBool>> {
+        Some(Arc::clone(&self.engaged_flag))
     }
 
     /// Always returns `true` so the pipelined generate loop uses the masked

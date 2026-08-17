@@ -538,31 +538,30 @@ fn splitter_no_budget_never_force_closes() {
     }
 }
 
-/// PART 2: a splitter built with `enable_thinking=false` (prefilled a
-/// CLOSED `<think></think>`) must start in answer-mode, so the first piece
-/// routes to the CONTENT channel (`is_thinking=false`), not reasoning.
+/// A prompt whose generation suffix CLOSED the think block must start the
+/// splitter in answer-mode, so the first piece routes to the CONTENT channel
+/// (`is_thinking=false`), not reasoning.
 #[test]
-fn splitter_enable_thinking_false_starts_on_content() {
+fn splitter_closed_prompt_starts_on_content() {
     let mut sm = ThinkSplitter::new_for_request(false, None, None, None);
     let (text, is_thinking) = sm.step("Hello");
     assert_eq!(text, "Hello");
     assert!(
         !is_thinking,
-        "enable_thinking=false must route the first piece to content"
+        "a closed prompt must route the first piece to content"
     );
 }
 
-/// The default (thinking enabled) path is unchanged: a splitter built with
-/// `enable_thinking=true` starts on the thinking channel, exactly like the
-/// canonical `new_qwen3_prefilled`.
+/// A prompt whose generation suffix LEFT the block open starts on the thinking
+/// channel, exactly like the canonical `new_qwen3_prefilled`.
 #[test]
-fn splitter_enable_thinking_true_starts_on_thinking() {
+fn splitter_open_prompt_starts_on_thinking() {
     let mut sm = ThinkSplitter::new_for_request(true, None, None, None);
     let (text, is_thinking) = sm.step("reason");
     assert_eq!(text, "reason");
     assert!(
         is_thinking,
-        "enable_thinking=true must start on thinking channel"
+        "an open prompt must start on the thinking channel"
     );
 }
 

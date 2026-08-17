@@ -568,8 +568,6 @@ pub(crate) async fn chat_completions(
                 // server default > absent (= enabled / undefined). Only
                 // Some(false) changes template behaviour; Some(true) and None
                 // both leave enable_thinking undefined in the Jinja context.
-                let start_delim = think_start_delim.clone();
-                let end_delim = think_end_delim.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     let tpl_msgs: Vec<ChatMessageTpl<'_>> =
                         messages_owned.iter().map(OwnedTplMessage::as_tpl).collect();
@@ -615,8 +613,8 @@ pub(crate) async fn chat_completions(
                     };
                     let think_open = crate::engine::think::prompt_leaves_think_open(
                         gen_suffix,
-                        &start_delim,
-                        &end_delim,
+                        &think_start_delim,
+                        &think_end_delim,
                     );
                     let ids = tokenizer_io::encode(&tk, &rendered.text)
                         .map_err(|e| format!("tokenizer encode failed: {e}"))?;
@@ -977,6 +975,19 @@ pub(crate) async fn chat_completions(
         },
     };
 
+    // Clone of the engine's engaged mirror, taken before the box is moved into
+    // the generator. The non-streaming path reads it once the stream drains: a
+    // `response_format` request whose grammar never engaged was never checked,
+    // and nothing has reached the client yet, so it can still be refused.
+    // Scoped to `response_format` — `tool_choice` has its own text-parsing
+    // fallback and a non-engaged constraint there is not a failed contract.
+    let response_format_engaged: Option<Arc<std::sync::atomic::AtomicBool>> =
+        if bare_json_tool_call_mode {
+            None
+        } else {
+            constraint.as_ref().and_then(|c| c.engaged_handle())
+        };
+
     // extract image_url / input_audio content parts from user messages.
     // Collected across all user messages in order; will pass them to the
     // vision/audio towers. Text-only requests produce empty Vecs — zero cost.
@@ -1321,6 +1332,7 @@ pub(crate) async fn chat_completions(
             parser_format,
             json_object_mode,
             bare_json_tool_call_mode,
+            response_format_engaged,
             request_start,
             state.metrics_drainer.as_ref(),
             ctx_max_for_metrics,

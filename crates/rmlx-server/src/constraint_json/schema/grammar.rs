@@ -564,9 +564,18 @@ impl SchemaGrammar {
     }
 
     /// Drop the insignificant-whitespace bytes from an allow-set once the run
-    /// cap is reached, so `allowed_bytes` agrees with what `step` will accept.
-    /// A whitespace byte that is string *content* (mid-key) was never added by
-    /// the phase arms, so this only ever removes separators.
+    /// cap is reached.
+    ///
+    /// Safe against key-string *content* only because of an invariant `step`
+    /// maintains: while the innermost frame is mid-key (`in_object_key`), every
+    /// byte — whitespace included — is content and takes the `ws_run = 0` reset
+    /// path, so `ws_run` is 0 for the whole key and this returns early. If that
+    /// ever changes, this would strip a space the key trie legitimately allows.
+    ///
+    /// This does NOT make `allowed_bytes` agree with `step` in general — root
+    /// whitespace and pre-digit `InNum` whitespace still diverge — and it does
+    /// not affect the per-token mask, which is built by feeding bytes through
+    /// `step` (see `fill_allow_mask`), not from this set.
     #[allow(
         clippy::indexing_slicing,
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or validated before call"

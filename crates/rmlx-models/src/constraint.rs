@@ -95,6 +95,17 @@ pub trait ConstraintEngine: Send + Sync + std::fmt::Debug {
     fn engaged(&self) -> bool {
         true
     }
+
+    /// A shared mirror of [`engaged`](Self::engaged) that outlives the borrow.
+    ///
+    /// [`engaged`](Self::engaged) answers the owner, which is the decode loop —
+    /// the engine is moved into its blocking closure and dropped there. A route
+    /// that wants the same answer *after* the token stream drains has to hold a
+    /// clone of this from before the move. `None` for engines with no warm-up:
+    /// there is nothing to report.
+    fn engaged_handle(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        None
+    }
 }
 
 /// Engine-specific extension trait — opt-in. Decode loops won't call this

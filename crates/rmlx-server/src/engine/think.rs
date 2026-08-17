@@ -107,10 +107,10 @@ impl ThinkSplitter {
     /// is already in the prefilled prompt and the model emits reasoning
     /// text directly until it produces `</think>`. Initial state: open.
     ///
-    /// production now constructs the splitter via `new_for_request`
-    /// (which threads the per-request `enable_thinking` + budget); this
-    /// constructor remains for the unit tests that exercise the open-state
-    /// machine directly.
+    /// production constructs the splitter via `new_for_request`, which threads
+    /// the prompt-derived initial channel plus the budget; this constructor
+    /// remains for the unit tests that exercise the open-state machine
+    /// directly.
     #[allow(dead_code)]
     pub(crate) fn new_qwen3_prefilled() -> Self {
         Self {

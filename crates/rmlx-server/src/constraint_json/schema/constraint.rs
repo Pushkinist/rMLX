@@ -43,6 +43,10 @@ pub struct SchemaConstraint {
     eos_ids: Vec<u32>,
     mask: Vec<bool>,
     pub(super) engaged: bool,
+    /// Mirror of `engaged` the route keeps a clone of. The engine itself is
+    /// moved into the decode thread, so this is the only way the route can
+    /// learn — after the stream drains — whether the grammar was ever applied.
+    engaged_flag: Arc<AtomicBool>,
     engage_policy: EngagePolicy,
     /// Text accumulated from tokens seen before engagement. Used to detect
     /// and suppress a leading markdown-fence (```` ```json\n ````). Cleared
@@ -97,6 +101,7 @@ impl SchemaConstraint {
             eos_ids,
             mask: Vec::new(),
             engaged: false,
+            engaged_flag: Arc::new(AtomicBool::new(false)),
             engage_policy: policy,
             pre_engage_buf: String::new(),
             is_thinking: Arc::new(AtomicBool::new(false)),
@@ -125,6 +130,7 @@ impl SchemaConstraint {
             eos_ids,
             mask: Vec::new(),
             engaged: false,
+            engaged_flag: Arc::new(AtomicBool::new(false)),
             engage_policy: policy,
             pre_engage_buf: String::new(),
             is_thinking: Arc::new(AtomicBool::new(false)),
@@ -133,7 +139,21 @@ impl SchemaConstraint {
 
     /// Force the constraint into the engaged state immediately, bypassing the engage policy.
     pub fn force_engage(&mut self) {
+        self.mark_engaged();
+    }
+
+    /// The one place `engaged` flips, so the route-visible mirror can never
+    /// drift from the field the mask logic reads.
+    fn mark_engaged(&mut self) {
         self.engaged = true;
+        self.engaged_flag.store(true, Ordering::Release);
+    }
+
+    /// Shared handle the route reads after generation to learn whether the
+    /// engine ever engaged. `false` at end of stream means the response was
+    /// never checked against the requested schema.
+    pub fn engaged_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.engaged_flag)
     }
 
     /// Return a shared handle to the `is_thinking` flag for external budget enforcement.
@@ -209,7 +229,7 @@ impl ConstraintEngine for SchemaConstraint {
                     policy = "immediate",
                     "SchemaConstraint: proactively engaging at first step_mask (scalar root)"
                 );
-                self.engaged = true;
+                self.mark_engaged();
             // Fall through to the filtered mask path below.
             } else {
                 self.mask.fill(true);
@@ -316,7 +336,7 @@ impl ConstraintEngine for SchemaConstraint {
                     // feed it so we don't throw away a correctly formatted
                     // token that arrived on the engagement step.
                     if !bytes.is_empty() {
-                        self.engaged = true;
+                        self.mark_engaged();
                         let starters = self.grammar.allowed_bytes();
                         // Skip leading whitespace, then check first non-WS byte.
                         let first_json_idx = bytes
@@ -347,14 +367,18 @@ impl ConstraintEngine for SchemaConstraint {
                                 );
                             }
                         } else {
-                            // Token is all-whitespace — feed it (whitespace is
-                            // legal at Start state and keeps grammar open).
+                            // Token is all-whitespace. Do NOT feed it: the
+                            // grammar rejects whitespace before the root value
+                            // (it is a pure no-op there), and `feed_bytes`
+                            // clamps to done on rejection, which would answer
+                            // the request with an empty value. Engage and let
+                            // the next mask force a real value-starter.
                             tracing::info!(
                                 token_id,
                                 policy = "immediate",
-                                "SchemaConstraint: engaging (scalar root, whitespace token)"
+                                "SchemaConstraint: engaging (scalar root, \
+                                 whitespace token discarded, mask will correct)"
                             );
-                            self.feed_bytes(&bytes);
                         }
                     }
                 }
@@ -369,7 +393,7 @@ impl ConstraintEngine for SchemaConstraint {
                     if let Some(idx) = bytes.iter().position(|&b| {
                         b != b' ' && b != b'\t' && b != b'\n' && b != b'\r' && starters[b as usize]
                     }) {
-                        self.engaged = true;
+                        self.mark_engaged();
                         tracing::info!(
                             token_id,
                             engage_byte = bytes[idx],
@@ -393,6 +417,10 @@ impl ConstraintEngine for SchemaConstraint {
 
     fn engaged(&self) -> bool {
         self.engaged
+    }
+
+    fn engaged_handle(&self) -> Option<Arc<AtomicBool>> {
+        Some(Arc::clone(&self.engaged_flag))
     }
 
     /// Always returns `true` so the pipelined generate loop uses the masked
