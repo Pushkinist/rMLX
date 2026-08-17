@@ -259,3 +259,84 @@ fn quant_rotor_v3_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
         );
     }
 }
+
+/// A truncation target that lands **inside** an append block must split the
+/// block, not drop it.
+///
+/// A speculative-decode verifier appends its whole multi-token chunk as one
+/// block and then keeps only the accepted prefix, so every partial accept cuts
+/// mid-block. Dropping the block discards the accepted tokens with the rejected
+/// ones and leaves `blocks` short of `shape[2]` — the state `synced_rotor_v_blocks`
+/// aborts on when no GPU ring is live to supply the gap.
+///
+/// The oracle is a reference store built from only the retained tokens: same
+/// shape, same layer (so the same static rotor table), deterministic encode. It
+/// shares no arithmetic with the truncation logic, which never touches payload
+/// values.
+///
+/// Mutation check: restore the whole-block drop (`blocks.truncate(keep)` with
+/// `keep` counting only blocks that fit entirely) and `blocks` cover 1 token
+/// against `shape[2] == 3`, so `dequant()` returns `Err` and this goes RED.
+#[test]
+fn quant_rotor_v3_truncate_mid_block_splits_instead_of_dropping() {
+    let head_dim = 96_usize;
+    let val = |h: usize, tok: usize, d: usize| {
+        (h as f32) * 100.0 + (tok as f32) * 10.0 + (d as f32) * 0.5
+    };
+
+    for kv_h in [1_usize, 4_usize] {
+        let chunk = |first_tok: usize, n_tok: usize| -> Vec<f32> {
+            // Sequence-major over the chunk: [seq][kv_h][head_dim] is what the
+            // caller hands `append` as [b, kv_h, seq, d] head-major, so build
+            // head-major here and let `append` reorder.
+            let mut out = vec![0.0_f32; kv_h * n_tok * head_dim];
+            for h in 0..kv_h {
+                for t in 0..n_tok {
+                    for d in 0..head_dim {
+                        out[(h * n_tok + t) * head_dim + d] = val(h, first_tok + t, d);
+                    }
+                }
+            }
+            out
+        };
+
+        // One 1-token block, then one 4-token block; keep 3 of the 5 positions
+        // so the cut lands two tokens inside the second block.
+        let mut store = QuantRotorV3::new(vec![1_i32, kv_h as i32, 0, head_dim as i32], 64, 5);
+        store
+            .append(&chunk(0, 1), &[1, kv_h as i32, 1, head_dim as i32])
+            .unwrap();
+        store
+            .append(&chunk(1, 4), &[1, kv_h as i32, 4, head_dim as i32])
+            .unwrap();
+        assert_eq!(store.shape[2], 5);
+
+        store.truncate_to(3);
+
+        assert_eq!(store.shape[2], 3, "shape[2] lowered (kv_h={kv_h})");
+        let kept_rows: usize = store.blocks.iter().map(|blk| blk.n_tokens).sum();
+        assert_eq!(
+            kept_rows,
+            3 * kv_h,
+            "blocks must cover shape[2] exactly after a mid-block cut (kv_h={kv_h})"
+        );
+
+        let decoded = store
+            .dequant()
+            .expect("dequant must succeed after a mid-block truncate");
+
+        let mut reference = QuantRotorV3::new(vec![1_i32, kv_h as i32, 0, head_dim as i32], 64, 5);
+        reference
+            .append(&chunk(0, 1), &[1, kv_h as i32, 1, head_dim as i32])
+            .unwrap();
+        reference
+            .append(&chunk(1, 2), &[1, kv_h as i32, 2, head_dim as i32])
+            .unwrap();
+        let ref_decoded = reference.dequant().unwrap();
+
+        assert_eq!(
+            decoded, ref_decoded,
+            "the split block must reconstruct the retained prefix exactly (kv_h={kv_h})"
+        );
+    }
+}

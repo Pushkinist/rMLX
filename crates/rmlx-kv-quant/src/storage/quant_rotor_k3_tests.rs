@@ -477,3 +477,94 @@ fn quant_rotor_k3_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
     // SAFETY: env lock still held.
     unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
 }
+
+/// A speculative partial accept truncates the K store **inside** the verifier's
+/// append block; the block must be split, not dropped.
+///
+/// The verifier appends its whole multi-token chunk as one block, then the
+/// round keeps only the accepted prefix. Dropping the block discards the
+/// accepted tokens with the rejected ones, leaving `blocks` covering fewer rows
+/// than `shape[2]`. With no GPU ring live — the CPU append path, which is what
+/// a QJL-carrying store and every `--kv-quant rotor*_sym` legacy append use —
+/// `synced_rotor_k_blocks` has nothing to rebuild the gap from and aborts the
+/// request with "CPU blocks cover N tokens but shape[2] needs M".
+///
+/// Covers the QJL sideband explicitly: `qjl_codes` / `qjl_norms` are per-token
+/// buffers with a different stride from `codes` / `scales`, so a split that only
+/// handled the main payload would leave them over-long.
+///
+/// The oracle is a reference store built from only the retained tokens — same
+/// shape, same layer index (so the same static rotor table and QJL projection),
+/// deterministic encode. It shares no arithmetic with the truncation logic,
+/// which never reads a payload value.
+///
+/// Mutation check: restore the whole-block drop and `dequant()` returns `Err`
+/// with that message, so the `expect` below goes RED.
+#[test]
+fn quant_rotor_k3_truncate_mid_block_splits_instead_of_dropping() {
+    let _guard = crate::test_utils::env_lock();
+    if crate::rotor_qjl::rotor_qjl_cli_is_set() {
+        return;
+    }
+    // SAFETY: env lock held — no concurrent env reader/writer in this binary.
+    unsafe { std::env::set_var("RMLX_ROTOR_QJL", "1") };
+
+    let head_dim = 12_usize; // n_groups = 4, exact
+    let kv_h = 2_usize;
+    let chunk = |first_tok: usize, n_tok: usize| -> Vec<f32> {
+        let mut out = vec![0.0_f32; kv_h * n_tok * head_dim];
+        for h in 0..kv_h {
+            for t in 0..n_tok {
+                for d in 0..head_dim {
+                    out[(h * n_tok + t) * head_dim + d] =
+                        (h as f32) * 100.0 + (first_tok + t) as f32 * 10.0 + (d as f32) * 0.25;
+                }
+            }
+        }
+        out
+    };
+
+    // 46 prefill positions, then a 5-position verifier chunk; 4 accepted.
+    let mut store = QuantRotorK3::new(vec![1_i32, kv_h as i32, 0, head_dim as i32], 0);
+    store
+        .append(&chunk(0, 46), &[1, kv_h as i32, 46, head_dim as i32])
+        .expect("prefill append");
+    store
+        .append(&chunk(46, 5), &[1, kv_h as i32, 5, head_dim as i32])
+        .expect("verifier append");
+    assert!(store.use_qjl(), "QJL sideband active for this store");
+    assert_eq!(store.shape[2], 51);
+
+    store.truncate_to(50);
+
+    let decoded = store
+        .dequant()
+        .expect("dequant must succeed after a mid-block speculative rollback");
+
+    assert_eq!(store.shape[2], 50);
+    let kept_rows: usize = store.blocks.iter().map(|blk| blk.n_tokens).sum();
+    assert_eq!(kept_rows, 50 * kv_h, "blocks must cover shape[2] exactly");
+    let qjl_rows: usize = store.blocks.iter().map(|blk| blk.qjl_norms.len()).sum();
+    assert_eq!(
+        qjl_rows,
+        50 * kv_h,
+        "the QJL sideband must be cut to the same row count as the main payload"
+    );
+
+    let mut reference = QuantRotorK3::new(vec![1_i32, kv_h as i32, 0, head_dim as i32], 0);
+    reference
+        .append(&chunk(0, 46), &[1, kv_h as i32, 46, head_dim as i32])
+        .expect("prefill append");
+    reference
+        .append(&chunk(46, 4), &[1, kv_h as i32, 4, head_dim as i32])
+        .expect("accepted-prefix append");
+    let ref_decoded = reference.dequant().expect("reference dequant");
+
+    assert_eq!(
+        decoded, ref_decoded,
+        "the split block must reconstruct the retained prefix exactly"
+    );
+
+    // SAFETY: env lock held.
+    unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
+}

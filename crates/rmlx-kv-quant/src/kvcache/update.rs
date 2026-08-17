@@ -1016,10 +1016,22 @@ fn rotor3_gpu_append_into_k_blocks(
 /// (the tail lives there), and this block-path append materialises the tail
 /// into `blocks` so a later push does not leave a non-contiguous
 /// prefix-then-gap-then-tail. No-op when `blocks` already cover `shape[2]` (the
-/// common prefill / asym case — reads no GPU). Not reachable today (batch dim is
-/// fixed per request, so a fused→multi-token-append transition does not occur),
-/// but closing it keeps the "blocks are always a contiguous prefix" invariant
-/// true at every mutator.
+/// common prefill / asym case — reads no GPU).
+///
+/// **Reachability.** This is a live path, not defensive scaffolding. The fused
+/// decode entry is gated on `q_seq == 1`, so any multi-token append on a cache
+/// that has already run a fused decode step — a speculative verify chunk, or a
+/// continuation turn appending prompt tokens against a warm cache — falls
+/// through to the legacy `update()` entry and lands here with `blocks` empty
+/// (the fused path drops them once the ring is live). The `b > 1` normalisation
+/// below reaches it too, but that shape does not occur while the batch dim is
+/// fixed per request.
+///
+/// **Cost.** The rebuild is a full-prefix host readback. It is not additive:
+/// every block-path call site dequantizes the whole prefix on the same step, and
+/// `dequant` would take exactly this readback itself if `blocks` were left
+/// short. Doing it here instead repairs `blocks` once, so the following chunks
+/// of the same multi-chunk append pay nothing.
 fn materialize_rotor_k3_ring_tail(
     ks: &mut crate::storage::QuantRotorK3,
     device: Device,
@@ -1394,6 +1406,13 @@ fn accumulated_seq(shape: &[i32]) -> i32 {
 /// handles batch and keeps the CPU blocks the source of truth. (Per request the
 /// batch dim is fixed, so a `b > 1` cache never builds a ring-only tail to
 /// lose.)
+///
+/// `new_seq` is deliberately **not** consulted: a ring-only feed carries a
+/// multi-token chunk as happily as a single decode step. What routes a
+/// multi-token append to the block path is the `feed` its caller chose — the
+/// legacy `update_*` entries pass `Maintain` / `Skip`, and they are where a
+/// `q_seq > 1` forward lands once the fused decode gate (`q_seq == 1`) rejects
+/// it.
 fn is_ring_only_append(feed: RingFeed, new_shape: &[i32]) -> bool {
     feed == RingFeed::MaintainRingOnly && matches!(b_kv_h_new_seq(new_shape), Ok((1, _, _)))
 }
@@ -8159,3 +8178,7 @@ fn set_storage_max_seq(storage: &mut KvStorage, new_max_seq: i32) {
         KvStorage::RotorKAsym4 { max_seq, .. } => *max_seq = new_max_seq,
     }
 }
+
+#[cfg(test)]
+#[path = "ring_feed_routing_tests.rs"]
+mod ring_feed_routing_tests;

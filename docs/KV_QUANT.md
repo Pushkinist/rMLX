@@ -785,6 +785,25 @@ token per kv\_head: codes 64 B + 16 scales/group × 4 B × 4 groups = 256 B +
 rotations 32 B). The quality gain from finer scales and per-pair rotation
 justifies this for dense full-attention archs at long context.
 
+**Memory truth — the planar V side is larger than bf16.** Those 352 B carry 128
+values, so the store spends **22.00 bits per value against bf16's 16.0**, at
+every `head_dim` and at both bit widths (planar3 and planar4 occupy
+byte-identical storage). The split is codes 4.0 + **per-pair scales 16.0** +
+rotation indices 2.0: one `f32` per 2 elements is a whole bf16 value's worth of
+sideband before a single code bit is spent, so the code width is not what sets
+the rate. Measured, not modelled — `kv_rate_tests.rs` reads the bytes
+`planar_quantize` actually produced. Two consequences:
+
+- The perf win above is real and is **not** a memory win on the V axis; it buys
+  TPS and quality with resident bytes.
+- `KvQuant::estimated_resident_bytes_per_layer` sizes planar through its generic
+  affine/turbo path (`bits/8` bytes per value plus one `f32` per 32 elements),
+  which comes out at 5.0 bits per value — a **4.4× under-count** of the real
+  store. The estimator's planar rows, and the resolve-time net-saving warn that
+  reads them, are wrong in the codec's favour. Not corrected here: the fix
+  changes an operator-facing advisory and belongs with a decision about the
+  scale cadence, not with a rate-accounting change.
+
 **Arch defaults**: `Gemma3ForConditionalGeneration`;
 `Gemma4ForConditionalGeneration` (dense, hidden_size ≥ 5376); auto-by-ctx at
 >32K tokens.
@@ -1838,6 +1857,27 @@ generate paths call (the remaining arches do not call it yet).
 the codebook width) and counts the quaternion sideband, so its number is a
 conservative upper bound for the ring-resident members.
 
+**Crate-wide rate ceiling.** `crates/rmlx-kv-quant/src/kv_rate_tests.rs` measures
+every store family's bits per value from the bytes its own encoder produced and
+fails any family above bf16's 16.0 that does not carry a written exemption. An
+exemption is itself checked: a family listed as exempt must actually measure
+above the floor, so a fixed codec turns its own exemption red instead of
+silently keeping it. The `KvQuant` → family map is an exhaustive `match`, so a
+new codec does not compile until its rate is accounted for. Measured table at
+`head_dim = 128`:
+
+| Family | Stored bits / value | Verdict |
+|---|---|---|
+| turbo2 / tcq2 | 3.00 | under |
+| turbo3 / tcq3 | 4.00 | under |
+| turbo4 | 5.00 | under |
+| q8 (group 128) | 8.25 | under |
+| affine (widest shipped, 8-bit group 64) | 9.00 | under |
+| bf16 | 16.00 | the floor |
+| **rotor3 / rotor4** | **21.75** | exempt |
+| **planar3 / planar4** | **22.00** | exempt |
+| **iso3 / iso4** (`IsoBlocks`) | **48.25** | exempt |
+
 **`head_dim % 4 == 0` constraint.** iso3 operates in groups of 4. Any
 `head_dim` not divisible by 4 is rejected at encode/decode time with
 `IsoQuantError::HeadDimNotMultipleOf4`.
@@ -2034,7 +2074,8 @@ amortises across every token in the layer.
 
 | Property | rotor3 |
 |---|---|
-| Delivered bits / element | **21.75** at head\_dim=128 (348 B/token/kv\_head vs bf16's 256 B, **1.36× bf16**). The store spends one whole `u32` code word **and** one `f32` scale per group of 3 real grade-1 elements — 8 B for 3 values — plus one `f32` norm per token. The codes alone are ~8 bpe; the `f32` scale more than doubles that, and rotor3 and rotor4 therefore occupy byte-identical storage. The 3.25 bpe target reported by the Python `rotorquant` reference is gated on the grade-aware codebook follow-up (deferred — see below). **No rotor codec is a memory win at any head\_dim** — see the iso3 "Memory truth" note and `iso_and_rotor_k_codecs_are_never_a_memory_win`. |
+| Delivered bits / element | **21.75** at head\_dim=128 (348 B/token/kv\_head vs bf16's 256 B, **1.36× bf16**), split **10.75 codes + 10.75 scales + 0.25 norm**. 43 groups cover a 128-element row, and each spends one whole `u32` code word **and** one `f32` scale for 3 real grade-1 elements. rotor3 and rotor4 therefore occupy byte-identical storage. The 3.25 bpe target reported by the Python `rotorquant` reference is gated on the grade-aware codebook follow-up (deferred — see below). **No rotor codec is a memory win at any head\_dim** — see the iso3 "Memory truth" note, `iso_and_rotor_k_codecs_are_never_a_memory_win`, and the crate-wide rate ceiling in `kv_rate_tests.rs`. |
+| Dead code budget | **5 of the 8 codes per group carry no information.** A rotor sandwich is grade-preserving, so embedding 3 values as the grade-1 part leaves the scalar, three bivector and pseudoscalar slots algebraically zero on encode; on decode the inverse sandwich keeps every non-grade-1 part out of the reconstructed vector, so quantising those slots injects no error either. 15 of the 24 code bits per group are pure waste. Pinned by `clifford_tests::sandwich_of_grade1_in_3d_stays_grade1` (encode side) and `clifford_tests::inverse_sandwich_of_non_grade1_leaks_nothing_into_grade1` (decode side). Removing them is a format + MSL-kernel change and is not scheduled; the 10.75 bits/value of `f32` scale would still dominate afterwards. |
 | Codebook | `lloyd_gaussian_codebook(3)` (8 centroids), shared across all 8 mv components (single-codebook simplification) |
 | Pack density (per u32) | 10 vals (planar3 / iso3 convention; 8 codes ≤ 30 bits per group, 1 u32 per group) |
 | Rotation | Static per-(layer, head) rotor table `[n_groups, 4]` in `[s, b12, b13, b23]` form, seeded from `ROTORQUANT_GLOBAL_SEED ^ (layer << 32) ^ (head << 16) + group` (see [`crate::clifford`]) |
@@ -2962,7 +3003,14 @@ speculative-decode partial-accept rollback; clearing it there would discard the
 tail (the only copy of `[frozen_prefix, n)`) and abort the next `dequant`. Both
 mutators reconcile: the block-path append (`materialize_*_ring_tail`)
 materialises any pre-existing ring-only tail into `blocks` before pushing, so
-`blocks` stay a contiguous prefix.
+`blocks` stay a contiguous prefix. That block path is **live at `b == 1`**, not
+just a `b > 1` fallback: the fused decode entry is gated on `q_seq == 1`, so any
+multi-token append on a cache that has already run a fused decode step — a
+speculative verify chunk, or a continuation turn's prompt tokens against a warm
+cache — falls through to the legacy `update_*` entries, which pass
+`Maintain` / `Skip`. The readback it pays is not additive: every block-path call
+site dequantizes the whole prefix on the same step, so `dequant` would take the
+identical readback if `blocks` were left short.
 
 **Row vs. sequence units.** Every rotor/iso K and V store's per-append
 `RotorBlocks` / `IsoBlocks` carries `n_tokens` counting **rows**
@@ -2973,10 +3021,32 @@ therefore compare cumulative `n_tokens` against `n * b * kv_h`, not against
 drops blocks that should have been kept, landing the store in exactly the
 forbidden gap described below. This was invisible at `b * kv_h == 1` (rows and
 sequence positions coincide), which is how the bug shipped and how it stayed
-latent until a `kv_h > 1` truncation path was exercised (#284). All eight
-rotor/iso K and V codecs share one crate-internal conversion helper,
-`truncate_keep_count` in `rmlx-kv-quant/src/storage/mod.rs`, so the unit
-conversion is defined once rather than re-derived per codec.
+latent until a `kv_h > 1` truncation path was exercised (#284).
+
+**Blocks are not a truncation alignment.** A block spans one whole append, and a
+speculative partial accept cuts *inside* the verifier's `K + 1`-token chunk.
+Keeping only the blocks that fit whole throws the accepted prefix away with the
+rejected tail and leaves `blocks` covering fewer rows than `shape[2]` — the
+forbidden gap below, recoverable only when a ring happens to hold the same
+prefix. It is not recoverable on the CPU append path (a QJL-carrying rotor K
+store, or a `Device::Cpu` run) nor after a `Skip` feed cleared the ring, which is
+what `update_rotor{3,4}_sym` and the asym entries do on every append; the store
+then aborts the request with
+`"rotor K store: CPU blocks cover N tokens but shape[2] needs M"`. The planner
+therefore **splits** the trailing block, cutting every per-row buffer — codes,
+per-group scales, per-group quaternions, per-token norms, and the rotor QJL
+sideband — to the accepted row count. At `b > 1` a sequence prefix is not a row
+prefix (rows run batch-major), so the cut is one contiguous run per batch
+element.
+
+All eight rotor/iso K and V codecs share one crate-internal planner,
+`truncate_plan` in `rmlx-kv-quant/src/storage/mod.rs`, plus a `BlockRows`
+implementation per block type, so the unit conversion and the split are defined
+once rather than re-derived per codec. Tests: `storage/truncate_plan_tests.rs`
+(planner + a payload-carrying fake block), and one store-level round trip per
+block type in `quant_rotor_k3_tests.rs` (`RotorKBlocks`, QJL sideband on),
+`quant_rotor_v3_tests.rs` (`RotorBlocks`) and `quant_iso_v_tests.rs`
+(`IsoBlocks`, quaternion sideband).
 
 **Real-serve reachability audit (per #284).** `KvCache::truncate_to` has three
 production callers: prompt-cache partial-prefix trim
@@ -2997,9 +3067,14 @@ The fix is proven at the codec level (all eight `*_tests.rs` files, `kv_h`
 values 1 and 4) and at the full `KvCache::update` / `KvCache::truncate_to`
 dispatch level (`kv_cache_truncate_iso3_kv_h_gt_1_path` in
 `rmlx-models/src/kv_cache/tests.rs`, `kv_h = 4`) rather than via a live HTTP
-trigger. `truncate_keep_count` reads `shape[1]` directly with no per-arch or
+trigger. `truncate_plan` reads `shape[1]` directly with no per-arch or
 hardcoded head-count branch, so `kv_h = 4` and Bonsai's real `kv_h = 8`
 exercise the identical code path — no arch-specific behavior exists to miss.
+
+The mid-block split has a **wider** reachability than the unit-conversion bug it
+sits next to: it fires at `kv_h == 1` too, since a cut inside a block is about
+block boundaries, not head counts. Any rotor or iso codec with speculative
+decoding on reaches it on the first partial accept.
 
 The forbidden state is `blocks` short of `shape[2]` with **no** ring to supply
 the tail: `dequant()` would zero-pad the gap (silently wrong attention) and an

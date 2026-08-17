@@ -94,6 +94,31 @@ tokens, but the draft cache stopped one step short. The next draft seed
 prepends the last draft token so the draft cache re-aligns before the new
 proposals begin.
 
+### Partial accept always cuts mid-block
+
+Phase D is the only place a KV store is truncated to a position that is not an
+append boundary. The verifier writes its whole `K + 1`-token chunk as **one**
+append, and `truncate_to(offset - v_drop)` then lands inside it.
+
+That matters for the block-accumulating packed stores — every rotor and iso K
+and V store keeps a `Vec` of per-append blocks, not a flat buffer. Dropping the
+whole trailing block would discard the accepted tokens along with the rejected
+ones and leave `blocks` covering fewer rows than `shape[2]`; the store's
+reconciliation guard then aborts the request with
+`"CPU blocks cover N tokens but shape[2] needs M"` rather than fabricate a
+zeroed gap. `storage::truncate_plan` therefore **splits** the trailing block,
+cutting every per-row buffer — codes, per-group scales, per-group quaternions,
+per-token norms, and the rotor QJL sideband — to the accepted row count. See
+`crates/rmlx-kv-quant/src/storage/mod.rs` and
+`storage/truncate_plan_tests.rs`.
+
+A live GPU ring can rebuild the gap, which is why this was survivable on the
+fused decode path. It is not survivable wherever the ring is absent: the CPU
+append path (a QJL-carrying rotor K store, or a `Device::Cpu` run), and the
+legacy `update_rotor{3,4}_sym` / asym appends, which clear the ring by design.
+Those are exactly the paths a `q_seq > 1` verifier forward takes, since the
+fused decode entry is gated on `q_seq == 1`.
+
 ## Per-drafter Deep Dive
 
 ### MTP — Multi-Token Prediction (Qwen3.5 sidecar)

@@ -5,6 +5,8 @@
 //!   * Sandwich identity: `R * x * R̃` preserves vector norm for unit rotors.
 //!   * Sparse vs dense GP equivalence (`gp_rotor_mv` == `geometric_product`).
 //!   * Random rotor is unit: `||R||² ≈ 1`.
+//!   * Grade preservation in both directions — the algebraic fact that makes
+//!     five of the rotor codec's eight stored codes dead budget.
 
 use crate::clifford::{
     geometric_product, gp_rotor_mv, make_random_rotor, make_rotor_table, reverse, rotor_reverse,
@@ -155,30 +157,94 @@ fn unit_rotor_times_reverse_is_one() {
 /// In 3D, a unit-rotor sandwich on a pure grade-1 input produces a pure
 /// grade-1 output (no grade-3 contamination beyond f32 roundoff).
 ///
-/// This is the property the encode/decode roundtrip relies on — quantising
-/// the grade-1 and grade-3 slots and then inverse-sandwiching reconstructs
-/// the original vector accurately because the grade-3 quantisation noise
-/// gets cancelled by the inverse rotation back into grade-1.
+/// This is the algebraic fact the rotor codec's storage layout rests on. The
+/// codec embeds three real values as the grade-1 part and then quantises **all
+/// eight** multivector components, so five of the eight stored codes describe
+/// slots this test pins at zero. They are dead code budget, not reconstruction
+/// error — see [`inverse_sandwich_of_non_grade1_leaks_nothing_into_grade1`] for
+/// the decode-side half, and `crate::rotorquant` § "Effective bpe" for what the
+/// waste costs.
 #[test]
 fn sandwich_of_grade1_in_3d_stays_grade1() {
-    let r = make_random_rotor(0x9999_AAAA_BBBB_CCCC);
-    let mut v_mv = [0.0_f32; MV_DIM];
-    v_mv[1] = 0.6;
-    v_mv[2] = -0.7;
-    v_mv[3] = 0.4;
+    // Sweep rotors and grade-1 directions: a single (rotor, vector) pair could
+    // land on a coincidence, and the storage claim is about every group of every
+    // token of every layer.
+    for seed in [
+        0x9999_AAAA_BBBB_CCCC_u64,
+        0x0000_0000_0000_0001,
+        0xFFFF_FFFF_FFFF_FFFF,
+        0x1234_5678_9ABC_DEF0,
+        ROTORQUANT_GLOBAL_SEED,
+    ] {
+        let r = make_random_rotor(seed);
+        for v in [
+            [0.6_f32, -0.7, 0.4],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, -3.25],
+            [-0.001, 0.002, 0.003],
+        ] {
+            let mut v_mv = [0.0_f32; MV_DIM];
+            v_mv[1] = v[0];
+            v_mv[2] = v[1];
+            v_mv[3] = v[2];
 
-    let y = rotor_sandwich(r, &v_mv);
-    // Grade-3 component must be ~0 (within f32 roundoff for the table-driven
-    // GP — typical magnitude < 1e-6 here).
-    assert!(
-        y[7].abs() < 1e-5,
-        "grade-3 contamination y[7] = {} should be ~0 for grade-1 input",
-        y[7]
-    );
-    // Grades 0, 2 (bivector) must also be ~0.
-    assert!(y[0].abs() < 1e-5, "scalar leakage y[0] = {}", y[0]);
-    for (i, &v) in y.iter().enumerate().take(7).skip(4) {
-        assert!(v.abs() < 1e-5, "bivector leakage y[{i}] = {v}");
+            let y = rotor_sandwich(r, &v_mv);
+            // Tolerance scales with the input magnitude: the leak bound is a
+            // relative round-off bound, not an absolute one.
+            let tol = 1e-5 * v_mv.iter().fold(1.0_f32, |acc, x| acc.max(x.abs()));
+            // Indices 0 (scalar), 4/5/6 (bivector) and 7 (pseudoscalar) — the
+            // five slots the codec quantises and stores but decode discards.
+            for idx in [0_usize, 4, 5, 6, 7] {
+                assert!(
+                    y[idx].abs() < tol,
+                    "seed={seed:#x} v={v:?}: non-grade-1 leakage y[{idx}] = {} exceeds {tol}",
+                    y[idx],
+                );
+            }
+        }
+    }
+}
+
+/// The decode-side half: quantisation noise parked in the five non-grade-1
+/// slots contributes **nothing** to the reconstructed vector.
+///
+/// The codec quantises all eight components against one codebook, and no
+/// Lloyd-Max centroid is exactly zero, so the five algebraically-zero slots
+/// decode to non-zero values. Decode then applies the inverse sandwich
+/// `R̃ * x * R` and reads indices 1, 2, 3. This test feeds the inverse sandwich a
+/// multivector that is *only* those five slots and requires the grade-1 output
+/// to be zero — i.e. the noise is discarded, not "cancelled back into grade-1".
+///
+/// Together with [`sandwich_of_grade1_in_3d_stays_grade1`] this is the whole
+/// justification for calling those five codes dead budget: nothing goes in and
+/// nothing comes out, so the 15 of 24 code bits they occupy at
+/// `ROTOR3_BITS = 3` carry no information.
+///
+/// Mutation check: replace the inverse sandwich with any grade-mixing map (drop
+/// the reverse on one side, say) and the grade-1 slots pick up the injected
+/// values — RED.
+#[test]
+fn inverse_sandwich_of_non_grade1_leaks_nothing_into_grade1() {
+    for seed in [
+        0x9999_AAAA_BBBB_CCCC_u64,
+        0x0BAD_C0DE_0BAD_C0DE,
+        ROTORQUANT_GLOBAL_SEED,
+    ] {
+        let r = make_random_rotor(seed);
+        // Only the slots the codec wastes: scalar, three bivectors, pseudoscalar.
+        let noise = [0.83_f32, 0.0, 0.0, 0.0, -0.41, 1.27, -0.66, 0.19];
+        // Decode's inverse rotation: `R̃ * x * R`.
+        let back = rotor_sandwich(rotor_reverse(r), &noise);
+        let tol = 1e-5 * noise.iter().fold(1.0_f32, |acc, x| acc.max(x.abs()));
+        for idx in [1_usize, 2, 3] {
+            assert!(
+                back[idx].abs() < tol,
+                "seed={seed:#x}: non-grade-1 noise reached the reconstructed vector at \
+                 index {idx} ({}) — the five wasted code slots would then be carrying \
+                 signal after all",
+                back[idx],
+            );
+        }
     }
 }
 

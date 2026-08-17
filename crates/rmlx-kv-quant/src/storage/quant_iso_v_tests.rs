@@ -769,3 +769,76 @@ fn quant_iso_v_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
         );
     }
 }
+
+/// The mid-block split covers the iso block layout too — a third per-row
+/// buffer (`quaternions`) at yet another stride.
+///
+/// Same defect class as the rotor stores: a truncation target that lands inside
+/// an append block used to drop the whole block, leaving `blocks` short of
+/// `shape[2]` and `dequant()` aborting the request.
+///
+/// The oracle is a reference store built from only the retained tokens; it
+/// shares no arithmetic with the truncation logic, which never reads a payload
+/// value.
+///
+/// Mutation check: restore the whole-block drop and `dequant()` returns
+/// `Err("iso V store: CPU blocks cover ...")`, so the `expect` goes RED.
+#[test]
+fn quant_iso_v3_truncate_mid_block_splits_instead_of_dropping() {
+    let head_dim = 16_usize; // n_groups = 4, exact
+    let kv_h = 2_usize;
+    let chunk = |first_tok: usize, n_tok: usize| -> Vec<f32> {
+        let mut out = vec![0.0_f32; kv_h * n_tok * head_dim];
+        for h in 0..kv_h {
+            for t in 0..n_tok {
+                for d in 0..head_dim {
+                    out[(h * n_tok + t) * head_dim + d] =
+                        (h as f32) * 100.0 + (first_tok + t) as f32 * 10.0 + (d as f32) * 0.25;
+                }
+            }
+        }
+        out
+    };
+
+    let mut store = QuantIsoV3::new(vec![1_i32, kv_h as i32, 0, head_dim as i32]);
+    store
+        .append(&chunk(0, 3), &[1, kv_h as i32, 3, head_dim as i32])
+        .expect("first append");
+    store
+        .append(&chunk(3, 4), &[1, kv_h as i32, 4, head_dim as i32])
+        .expect("second append");
+    assert_eq!(store.shape[2], 7);
+
+    store.truncate_to(5);
+
+    let decoded = store
+        .dequant()
+        .expect("dequant must succeed after a mid-block truncate");
+
+    let kept_rows: usize = store.blocks.iter().map(|blk| blk.n_tokens).sum();
+    assert_eq!(kept_rows, 5 * kv_h, "blocks must cover shape[2] exactly");
+    let quat_rows: usize = store
+        .blocks
+        .iter()
+        .map(|blk| blk.quaternions.len() / (head_dim / ISO3_GROUP_SIZE * 4))
+        .sum();
+    assert_eq!(
+        quat_rows,
+        5 * kv_h,
+        "the per-group quaternion buffer must be cut to the same row count"
+    );
+
+    let mut reference = QuantIsoV3::new(vec![1_i32, kv_h as i32, 0, head_dim as i32]);
+    reference
+        .append(&chunk(0, 3), &[1, kv_h as i32, 3, head_dim as i32])
+        .expect("first append");
+    reference
+        .append(&chunk(3, 2), &[1, kv_h as i32, 2, head_dim as i32])
+        .expect("retained-prefix append");
+    let ref_decoded = reference.dequant().expect("reference dequant");
+
+    assert_eq!(
+        decoded, ref_decoded,
+        "the split block must reconstruct the retained prefix exactly"
+    );
+}

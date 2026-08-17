@@ -168,9 +168,8 @@ impl QuantIsoV4 {
     /// not cleared, so a ring-only decode tail up to `n` survives and `dequant` /
     /// an SSD spill can rebuild it via [`synced_iso_v_blocks`].
     pub fn truncate_to(&mut self, n: i32) {
-        let keep =
-            super::truncate_keep_count(self.blocks.iter().map(|blk| blk.n_tokens), &self.shape, n);
-        self.blocks.truncate(keep);
+        let plan = super::truncate_plan(self.blocks.iter().map(|blk| blk.n_tokens), &self.shape, n);
+        super::apply_truncate_plan(&mut self.blocks, &plan);
         // NB: no `self.gpu.clear()` — the ring is the source of truth for a
         // ring-only decode tail; see [`super::QuantIsoV3::truncate_to`].
         if self.shape.len() >= 4 {

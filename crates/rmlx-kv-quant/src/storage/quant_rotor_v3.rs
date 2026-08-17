@@ -66,6 +66,29 @@ impl RotorBlocks {
     }
 }
 
+impl super::BlockRows for RotorBlocks {
+    /// The exhaustive destructure is the drift guard: a new payload field
+    /// cannot be added without this failing to compile, which is what stops a
+    /// buffer from surviving a mid-block truncation at its full length.
+    fn retain_rows(&mut self, ranges: &[std::ops::Range<usize>], rows: usize) -> bool {
+        let Self {
+            codes,
+            scales,
+            norms,
+            n_tokens,
+        } = self;
+        let lengths = [codes.len(), scales.len(), norms.len()];
+        if !super::rows_split_ok(&lengths, *n_tokens, ranges) {
+            return false;
+        }
+        super::retain_rows_in(codes, *n_tokens, ranges);
+        super::retain_rows_in(scales, *n_tokens, ranges);
+        super::retain_rows_in(norms, *n_tokens, ranges);
+        *n_tokens = rows;
+        true
+    }
+}
+
 /// Accumulated rotor3 V cache.
 ///
 /// Holds:
@@ -263,10 +286,10 @@ impl QuantRotorV3 {
 
     /// Truncate the accumulated sequence to `n` tokens.
     ///
-    /// Drops trailing blocks until the cumulative `n_tokens` count is
-    /// `<= n * b * kv_h` (block `n_tokens` counts rows, not sequence positions —
-    /// see [`super::truncate_keep_count`]) and lowers `shape[2]` to `n`. Does
-    /// **not** touch the rotor table.
+    /// Drops trailing blocks past `n` and **splits** the block the cut lands
+    /// inside (block `n_tokens` counts rows, not sequence positions — see
+    /// [`super::truncate_plan`]), then lowers `shape[2]` to `n`. Does **not**
+    /// touch the rotor table.
     ///
     /// The GPU ring is **kept**, not cleared — mirror of the K store's
     /// `truncate_to`. Lowering `shape[2]` to `n` makes the ring's logical fill
@@ -279,9 +302,8 @@ impl QuantRotorV3 {
     /// loudly, which would abort generation on the speculative-decode rollback
     /// path.
     pub fn truncate_to(&mut self, n: i32) {
-        let keep =
-            super::truncate_keep_count(self.blocks.iter().map(|blk| blk.n_tokens), &self.shape, n);
-        self.blocks.truncate(keep);
+        let plan = super::truncate_plan(self.blocks.iter().map(|blk| blk.n_tokens), &self.shape, n);
+        super::apply_truncate_plan(&mut self.blocks, &plan);
         // NB: no `self.gpu.clear()` — the ring is the source of truth for a
         // ring-only decode tail; see the doc comment above.
         if self.shape.len() >= 4 {
