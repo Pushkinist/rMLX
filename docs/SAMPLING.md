@@ -158,14 +158,21 @@ Ties are not exotic — see the measurement under
 on a realistic 262144-wide BF16-derived softmax row, 259416 of 262143 adjacent
 pairs are exactly equal.
 
-**The device half of the rule is confirmed on real streams, not just on
-fixtures.** A census of pure-GPU greedy 512-token generations found exact top-2
-ties at 2 of 275 steps on Ternary-Bonsai-8B and at 4 of 200 on gemma-4-e2b — so
-a tie decides a served token roughly once per fifty, not once per run. On every
-tied step censused, the device emitted the **lower** of the tied ids: 12 of 12.
-That is the observed behaviour `host_argmax` is written to mirror, and it is why
-the rule is stated as lowest-id rather than left to whichever path a request
-happens to take.
+**The primary evidence for the device half of the rule is the GPU test
+`mlx_argmax_breaks_ties_to_lowest_index_gpu`**, which is mutation-verified: it
+goes red when the rule is inverted, so it is a gate that can actually fail.
+
+A census of real streams **corroborates** it. Two pure-GPU greedy 512-token
+generations contained exact top-2 ties at 2 of 275 steps on Ternary-Bonsai-8B
+(steps 70, 253) and at 4 of 200 on gemma-4-e2b (steps 29, 69, 108, 132). The
+device emitted the **lower** tied id in every one — **6 of 6**, zero exceptions.
+Step 132 of the gemma run is the divergence analysed under
+[Host selection is not bit-identical to the GPU argmax](#host-selection-is-not-bit-identical-to-the-gpu-argmax).
+
+Read that as corroboration, not as the basis of the contract. Six tied steps
+from two runs on a single prompt is a small sample, and every tie in it comes
+from the same pair of greedy streams. What it adds is that the rule holds on
+real logits, which a fixture cannot show; it does not carry the contract alone.
 
 **Scope.** The rule covers everything that selects or filters a token:
 
