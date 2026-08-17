@@ -164,7 +164,11 @@ impl QuantIsoK4 {
     /// treatment). Clearing it would discard a ring-only decode tail.
     pub fn truncate_to(&mut self, n: i32) {
         let n = n.max(0);
-        let plan = super::truncate_plan(self.blocks.iter().map(|blk| blk.n_tokens), &self.shape, n);
+        let plan = super::truncate_plan(
+            self.blocks.iter().map(super::BlockRows::rows),
+            &self.shape,
+            n,
+        );
         super::apply_truncate_plan(&mut self.blocks, &plan);
         // NB: no `self.gpu.clear()` — the ring is the source of truth for a
         // ring-only decode tail; see the doc comment above.

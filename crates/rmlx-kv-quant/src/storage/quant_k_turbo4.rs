@@ -106,6 +106,17 @@ impl QuantKTurbo4 {
             + crate::bytes::opt_array_bytes(gpu_scales_buf.as_ref())
     }
 
+    /// Truncate the store to `n` sequence positions.
+    ///
+    /// Drops trailing CPU blocks past `n` and **splits** the block the cut lands
+    /// inside (see [`super::truncate_plan`]), then lowers `shape[2]` to `n`. The
+    /// GPU buffers need no cut — see [`super::QuantV::truncate_to`]. The target
+    /// is clamped to the store's current `shape[2]`
+    /// ([`super::clamp_truncate_target`]).
+    pub fn truncate_to(&mut self, n: i32) {
+        super::truncate_block_store(&mut self.blocks, &mut self.shape, n);
+    }
+
     /// Append a new K slice. CPU path uses scalar Rust; GPU path uses MSL kernel
     /// + pre-allocated 1D buffer with `slice_update`.
     #[allow(
@@ -365,7 +376,18 @@ impl QuantKTurbo4 {
             let slice = turbo_dequantize(block)?;
             out.extend_from_slice(&slice);
         }
-        out.resize(total, 0.0);
+        // Blocks must cover `shape[2]` exactly. Silently cutting an over-run
+        // back kept the rejected prefix of a speculative partial accept and
+        // dropped the appended correction; silently zero-padding a shortfall
+        // fabricates a gap. See `super::QuantV::dequantize_choice`.
+        if out.len() != total {
+            return Err(rmlx_core::error::Error::Quant(format!(
+                "QuantKTurbo4::dequantize_choice: CPU blocks decode to {} elems but shape \
+                 {:?} implies {total} — refusing to zero-pad / truncate",
+                out.len(),
+                self.shape,
+            )));
+        }
         let b = self.shape[0] as usize;
         let kv_h = self.shape[1] as usize;
         let s = self.shape[2] as usize;

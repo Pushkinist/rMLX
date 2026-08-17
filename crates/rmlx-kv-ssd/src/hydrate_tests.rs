@@ -1127,17 +1127,29 @@ fn hash_to_hex_local(d: u64) -> String {
     format!("{d:016x}")
 }
 
-// Dequant the K side of a reconstructed/built K8V8 cache to flat f32.
+// Dequant the K side of a cache to flat f32. Called on `K8V8` here and on
+// `K8VTurbo3` / `Planar` from the `truncate` child module; all three carry a
+// `QuantK` K side.
 #[allow(
     clippy::unwrap_used,
     reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
 )]
 #[allow(
     clippy::expect_used,
-    reason = "structural invariant: test only calls probe_k on K8V8 caches that always have a q8 K buffer; None return is a structural bug in the test"
+    reason = "structural invariant: every quant these tests drive has a CPU-dequantizable K store; both None and Err are bugs in the test or the code under test, and the two messages say which"
 )]
 fn probe_k(c: &KvCache, device: Device) -> Vec<f32> {
     c.eval_gpu_state().unwrap();
+    // The two failure modes stay apart: a missing K store is a fixture bug, a
+    // refusing dequant is the codes-vs-`shape[2]` coverage check firing — which
+    // is the failure a broken cut produces, so it must not be reported as
+    // "no K buffer".
     c.probe_k_dequant(device)
         .expect("probe_k: cache storage has no q8 K buffer (Paged/Mixed/None variants unsupported)")
+        .expect("probe_k: K dequant refused — codes do not cover shape[2]")
 }
+
+// Post-hydrate truncate round trips — see the module doc there for why the
+// hydrated cache is the path on which the CPU block payload is load-bearing.
+#[path = "hydrate_truncate_tests.rs"]
+mod truncate;

@@ -103,6 +103,17 @@ impl QuantPlanarK {
         }
     }
 
+    /// Truncate the store to `n` sequence positions.
+    ///
+    /// Drops trailing CPU blocks past `n` and **splits** the block the cut lands
+    /// inside (see [`super::truncate_plan`]), then lowers `shape[2]` to `n`. The
+    /// GPU buffers need no cut — see [`super::QuantV::truncate_to`]. The target
+    /// is clamped to the store's current `shape[2]`
+    /// ([`super::clamp_truncate_target`]).
+    pub fn truncate_to(&mut self, n: i32) {
+        super::truncate_block_store(&mut self.blocks, &mut self.shape, n);
+    }
+
     /// Append a new K slice. CPU path uses scalar Rust; GPU path uses the
     /// shared MSL kernel + pre-allocated 1D buffers with `slice_update`.
     #[allow(
@@ -427,6 +438,22 @@ impl QuantPlanarK {
         for block in &self.blocks {
             let slice = planar_dequantize(block)?;
             out.extend_from_slice(&slice);
+        }
+        // Blocks must cover `shape[2]` exactly. `transpose_seq_heads` reads only
+        // the first `b * s * kv_h * d` elements, so an over-run used to be
+        // silently cut back — after a mid-block truncate that kept the
+        // *rejected* speculative prefix and dropped the appended correction,
+        // with no error anywhere. A shortfall panicked on an out-of-range index.
+        // `truncate_to` now cuts the blocks; when it cannot (see
+        // `super::truncate_plan`) it drops the trailing block whole and leaves
+        // the store short on purpose, and that must abort the request here.
+        if out.len() != total {
+            return Err(rmlx_core::error::Error::Quant(format!(
+                "QuantPlanarK::dequantize_choice: CPU blocks decode to {} elems but shape \
+                 {:?} implies {total} — refusing to zero-pad / truncate",
+                out.len(),
+                self.shape,
+            )));
         }
         let b = self.shape[0] as usize;
         let kv_h = self.shape[1] as usize;
