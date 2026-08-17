@@ -16,6 +16,12 @@
 //!   through the safe wrappers in [`super::ops`] and [`super::fast_ops`].
 //! - The `ffi` mod suppresses every clippy and rustdoc lint; that is
 //!   intentional — the generated file is not under our control.
+//! - **`mod ffi` is private, deliberately.** `pub(crate) use ffi::*` below
+//!   re-exports every symbol as `sys::mlx_*`, so that is the single spelling
+//!   for an mlx-c call anywhere in the crate. Making the module itself
+//!   `pub(crate)` would also admit `sys::ffi::mlx_*`, a second spelling of the
+//!   same function that the `check-eval-lock` gate's `sys::mlx_*` anchor does
+//!   not match — an unguarded evaluation could then pass the gate.
 #[allow(
     non_upper_case_globals,
     non_camel_case_types,
@@ -26,7 +32,7 @@
     clippy::all,
     clippy::pedantic
 )]
-pub(crate) mod ffi {
+mod ffi {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
 

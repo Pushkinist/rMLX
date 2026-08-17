@@ -90,6 +90,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         file-size-report check-no-inline-tests check-no-scalar-f32-leak \
         check-no-decode-swallow check-gpu-tests-ignored \
         check-gpu-tests-ignored-fixtures \
+        check-eval-lock check-eval-lock-fixtures eval-lock-stress \
         check-no-kernel-input-eval check-no-kernel-input-eval-fixtures \
         check-metal-compiles check-metal-format
 
@@ -370,6 +371,15 @@ check-no-scalar-f32-leak: ## CI gate: fail if arch-layer code has unguarded scal
 check-no-decode-swallow: ## CI gate: fail if a decode-step failure breaks instead of propagating (would report as finish_reason="length")
 	@bash scripts/check_no_decode_swallow.sh
 
+check-eval-lock:  ## CI gate: fail if an MLX eval FFI call is made without the process-wide evaluation lock
+	@bash scripts/check_eval_lock.sh
+
+check-eval-lock-fixtures: ## CI gate: recall test for check-eval-lock (synthetic scan roots)
+	@bash scripts/check_eval_lock_fixtures.sh
+
+eval-lock-stress: ## run the evaluation-lock reproducer across RUNS fresh processes (default 60); not in `make ci`
+	@bash scripts/eval_lock_stress.sh $(RUNS)
+
 check-gpu-tests-ignored: ## CI gate: fail if a GPU-touching test in ANY workspace member lacks #[ignore] (would abort the whole test binary under parallel cargo test)
 	@bash scripts/check_gpu_tests_ignored.sh
 
@@ -398,6 +408,8 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_no_inline_tests.sh
 	@bash scripts/check_no_scalar_f32_leak.sh
 	@bash scripts/check_no_decode_swallow.sh
+	@bash scripts/check_eval_lock.sh
+	@bash scripts/check_eval_lock_fixtures.sh
 	@bash scripts/check_gpu_tests_ignored.sh
 	@bash scripts/check_gpu_tests_ignored_fixtures.sh
 	@bash scripts/check_no_kernel_input_eval.sh

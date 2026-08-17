@@ -74,6 +74,103 @@ thread_local! {
     pub(crate) static LAST_ERROR: Cell<Option<String>> = const { Cell::new(None) };
 }
 
+// ---------------------------------------------------------------------------
+// Evaluation serialisation
+// ---------------------------------------------------------------------------
+//
+// MLX evaluation is not safe to drive from two threads at once, so this crate
+// funnels it through one process-wide lock.
+//
+// The concrete hazard in MLX 0.31.x: a CPU stream's `CommandEncoder` lives in a
+// **process-global** `std::unordered_map<int, CommandEncoder>` that
+// `mlx/backend/cpu/encoder.cpp::get_command_encoder` fills lazily, on the
+// evaluating thread, with **no synchronisation** — while the neighbouring
+// `Scheduler::threads_` map in `mlx/scheduler.h` is mutex-guarded, so the
+// omission is an oversight rather than a contract. Default CPU streams are
+// per-thread (`mlx/stream.cpp::default_stream_storage`), so every thread that
+// evaluates mints its own stream index and performs its own insert into that
+// one shared map. Two inserts in flight together rehash it under a third
+// thread's bucket walk and the process takes SIGSEGV inside MLX, with no Rust
+// frame at fault and nothing to catch. MLX 0.32.0 fixes this by making the map
+// `thread_local`; we do not pin that version (it ships no NAX GEMM kernels),
+// and the lock is harmless there in any case.
+//
+// Cost is one uncontended mutex acquire + release per evaluation — a CAS and a
+// release store, tens of nanoseconds — against an FFI call that walks a graph
+// and dispatches work in microseconds or more. rMLX runs inference on one
+// thread at a time by design, so the lock is a guard against a crash rather
+// than a throughput bottleneck.
+//
+// **Which C entry points need it.** Not just the eval-named ones: every mlx-c
+// function that reaches `mlx::core::eval_impl` touches the same map. The set is
+// **25** — 24 found by reverse reachability over the linked dylibs, plus
+// `mlx_closure_apply`, which that automated pass structurally cannot see
+// because the call goes through a `std::function` vtable. Re-running the
+// procedure at a pin bump yields 24 and no closure entry; that is the pass's
+// blind spot, not a stale guard. `scripts/check_eval_lock.sh` records both
+// passes.
+//
+//   - `mlx_array_eval`, `mlx_async_eval`, `mlx_eval`
+//   - 14 × `mlx_array_item_*` — `array::item<T>()` calls `eval()` first
+//     (`mlx/array.h`)
+//   - `mlx_array_tostring` — `operator<<(ostream&, array)` evaluates
+//   - `mlx_save`, `mlx_save_writer`, `mlx_save_safetensors`,
+//     `mlx_save_safetensors_writer`, `mlx_save_gguf`, `mlx_load_gguf` — the
+//     serialisation paths materialise before writing
+//   - `mlx_closure_apply` — indirect: building the fused `Compiled` primitive
+//     bakes scalar constants into the kernel library name via
+//     `print_constant` → `array::item<T>()` → `array::eval()`
+//     (`mlx/backend/common/compiled.cpp`)
+//
+// The data accessors `mlx_array_data_*` do *not* evaluate and need no lock.
+// Three of the 25 are called here and all three are guarded; the other 22 are
+// one call away, and adding one unguarded silently reinstates this defect —
+// `mlx_save_safetensors` is the write side of `rmlx convert`, and
+// `mlx_array_tostring` is what an `impl Debug for Array` would reach for.
+// `make check-eval-lock` fails the build on that, because a doc sentence is
+// not a gate.
+//
+// **Re-entrancy.** The mutex is not reentrant, so nothing running under it may
+// *take the lock again* — a broader ban than "must not evaluate", because
+// `Closure::apply` takes it too, so applying one compiled closure from inside
+// another's body deadlocks without calling `eval` anywhere. That is only a live
+// question for `mlx_closure_apply`, which invokes a Rust closure body on the
+// calling thread while the lock is held. No body does it today and the gate's
+// RULE 3 enforces it; see `Closure::apply`.
+static EVAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Run `f` holding the process-wide evaluation lock.
+///
+/// Takes a closure rather than returning the guard on purpose: a
+/// `MutexGuard`-returning helper is only correct if every caller binds it to a
+/// named local, and `let _ = acquire();` — which drops the guard *before* the
+/// FFI call and restores the crash — compiles silently, because `#[must_use]`
+/// does not fire on `let _ =`. This signature makes "held across the FFI call
+/// and nothing else" a property of the API instead of a rule callers have to
+/// remember.
+///
+/// Poisoning is unreachable here, though not because the guarded region is
+/// Rust-free — it is not. Two different bits of Rust run under this lock, and
+/// each is contained by a different mechanism:
+///
+/// - The error handler installed by [`install_error_handler`], which MLX calls
+///   from *inside* `mlx_array_eval` / `mlx_async_eval`, allocating a `String`
+///   and writing a thread-local. It is an `unsafe extern "C" fn`, and since
+///   Rust 1.81 a panic escaping one aborts the process rather than unwinding.
+/// - A compiled closure body, run from inside `mlx_closure_apply`. The abort
+///   rule does *not* apply to it, because `rust_closure_callback` wraps the
+///   call in `catch_unwind` and converts a panic into a non-zero return — so
+///   no unwind ever crosses the `MutexGuard` from that direction either.
+///
+/// Recovering from `PoisonError` rather than propagating it keeps that
+/// unreachable state from turning a later evaluation into a spurious failure.
+pub(crate) fn with_eval_lock<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = EVAL_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    f()
+}
+
 /// Install the thread-local error handler. Called once per process, lazily.
 ///
 /// # Safety
@@ -229,8 +326,8 @@ pub(crate) unsafe fn check_status(status: i32, context: &str) -> Result<()> {
 // on every op invocation. Each call to `mlx_stream_new_device` spawns a new
 // OS worker thread inside MLX. A single Gemma4 forward pass invokes ~42
 // layers × several ops per layer — hundreds of `with_stream` calls per step.
-// After 3–6 decode steps the per-process thread limit (~2 048 on macOS) is
-// exhausted and `pthread_create` returns EAGAIN, manifesting as:
+// After 3–6 decode steps the per-process thread limit is exhausted and
+// `pthread_create` returns EAGAIN, manifesting as:
 //
 // mlx: Array::eval: thread constructor failed: Resource temporarily unavailable
 //
@@ -238,6 +335,15 @@ pub(crate) unsafe fn check_status(status: i32, context: &str) -> Result<()> {
 // return a *reference-counted handle to the already-running default stream*
 // (no new thread). Freeing the handle with `mlx_stream_free` decrements the
 // ref-count — it does NOT tear down the stream or its thread.
+//
+// The ceiling in force at the time of that incident was not recorded; an
+// earlier revision of this comment asserted ~2 048, which is not what this
+// machine reports. Measure before relying on a number:
+// `sysctl kern.num_taskthreads` is the per-task ceiling (16384 here) and
+// `ulimit -u` the per-user process cap. What has not changed is the shape of
+// the bug — MLX never reclaims a stream or the OS thread behind it, so any
+// per-call or per-thread stream creation grows monotonically until it hits
+// whatever the ceiling is.
 
 /// Borrow the process-global default stream for `device`, call `f(stream)`,
 /// release the handle, and return the result.
@@ -345,34 +451,51 @@ pub fn ensure_gpu_default_stream() {
 /// thread**, so any `Array::eval()` that schedules work on the CPU stream from
 /// this thread finds a registered command encoder.
 ///
-/// This is the CPU analog of [`ensure_gpu_default_stream`]. Since MLX 0.31/0.32
-/// the default CPU/GPU streams are **thread-local** (`mlx/stream.cpp`:
-/// `static thread_local ... default_streams`) and the CPU backend resolves a
-/// stream's `CommandEncoder` through a **thread-local** map first
-/// (`mlx/backend/cpu/encoder.cpp::get_command_encoder`), falling back to a
-/// process-global map and otherwise throwing
-/// "There is no Stream(cpu, N) in current thread." A tokio blocking-pool worker
-/// that never called `mlx::core::new_stream` for the CPU device therefore
-/// faults the first time an op is scheduled on the CPU stream — e.g. the K8V8
+/// This is the CPU analog of [`ensure_gpu_default_stream`]. Since MLX 0.31 the
+/// default CPU/GPU streams are **thread-local** (`mlx/stream.cpp`:
+/// `static thread_local ... default_streams`), so a thread that never
+/// established one — a tokio blocking-pool worker, say — has no CPU stream when
+/// an op is first scheduled on it. That happens on paths like the K8V8
 /// `exit_prefill` quantization, whose reduction MLX evaluates lazily on the CPU
 /// stream even when the model forward runs on the GPU device.
 ///
-/// The mechanism mirrors the GPU guard exactly:
+/// **How the encoder is resolved differs by MLX version, and the two are not
+/// interchangeable:**
+///   - **0.31.x (what we link):** `mlx/backend/cpu/encoder.cpp` keeps one
+///     **process-global** `unordered_map<int, CommandEncoder>` and fills it
+///     lazily on first evaluation with **no synchronisation**. Nothing throws,
+///     and no guard call is needed for correctness — `default_stream(cpu)`
+///     self-registers. What the unsynchronised insert *does* cost is a crash
+///     when two threads evaluate at once; that is contained by `EVAL_LOCK`,
+///     not by this function.
+///   - **0.32.0:** the map became `thread_local` with a process-global
+///     fallback, and an unregistered stream throws
+///     "There is no Stream(cpu, N) in current thread."
+///
+/// So on the linked version this guard is not load-bearing for a thread that
+/// builds and evaluates its own graph; it pins the thread's default CPU stream
+/// so that identity is stable and explicit, and it is what keeps the code
+/// correct if the MLX pin moves to 0.32.0.
+///
+/// The mechanism mirrors the GPU guard:
 ///   1. Create a fresh CPU stream via `mlx_stream_new_device` — which calls
-///      `mlx::core::new_stream` → `cpu::new_stream`, registering a
-///      `CommandEncoder` for this stream index in the calling thread's
-///      thread-local encoder map.
+///      `mlx::core::new_stream`, allocating a new stream index.
 ///   2. Set it as the calling thread's default CPU stream so every subsequent
 ///      `default_stream(cpu)` / `with_stream(Device::Cpu, …)` on this thread
-///      resolves to a stream whose encoder is registered here.
+///      resolves to it.
 ///   3. Store the handle in a thread-local for the thread's lifetime (do NOT
-///      free — that would drop the encoder entry).
+///      free — that would drop the stream and its encoder entry).
 ///
 /// Idempotent — subsequent calls from the same thread are no-ops.
+///
+/// Note the cost this shares with MLX's own lazy path: a stream index is
+/// per-thread and never reclaimed, and MLX backs each one with an OS thread of
+/// its own, so both grow with the number of distinct threads that ever
+/// evaluate.
 pub fn ensure_cpu_default_stream() {
     // Thread-local storage: init flag + stream handle. The handle is held for
-    // the thread's lifetime so the CommandEncoder entry in the thread-local
-    // encoder map stays alive — intentionally leaked on thread exit, same
+    // the thread's lifetime so the stream, and the encoder-map entry keyed on
+    // it, stay alive — intentionally leaked on thread exit, same
     // tradeoff and same bound as `ensure_gpu_default_stream` above: this is
     // only safe because the tokio blocking pool this guards is capped
     // (`max_blocking_threads`) and kept warm (`thread_keep_alive`) by
@@ -816,11 +939,16 @@ impl Array {
     }
 
     /// Force evaluation (MLX is lazy — ops are deferred until materialized).
+    ///
+    /// Serialised process-wide against every other evaluation — see
+    /// `EVAL_LOCK`.
     pub fn eval(&self) -> Result<()> {
         install_error_handler();
         // SAFETY: inner is a valid mlx_array.
-        let status = unsafe { sys::mlx_array_eval(self.inner) };
-        // SAFETY: called immediately after the C function on the same thread.
+        let status = with_eval_lock(|| unsafe { sys::mlx_array_eval(self.inner) });
+        // SAFETY: called immediately after the C function on the same thread;
+        // the error slot it reads is thread-local, so releasing the evaluation
+        // lock first cannot lose or cross-wire a message.
         unsafe { check_status(status, "Array::eval") }
     }
 
@@ -831,11 +959,16 @@ impl Array {
     /// Used to pipeline the next decode step's forward pass on the GPU
     /// while the current step's argmax is still being read out (mirrors
     /// mlx-lm's `mx.async_eval` pattern in `generate.py`).
+    ///
+    /// Serialised process-wide against every other evaluation — see
+    /// `EVAL_LOCK`. Only the graph walk and dispatch run under the lock; the
+    /// scheduled work still completes asynchronously after it is released, so
+    /// the pipelining this exists for is preserved.
     pub fn async_eval(&self) -> Result<()> {
         install_error_handler();
         // mlx_async_eval takes a vector_array; build a single-element vec.
         let vec = unsafe { sys::mlx_vector_array_new_value(self.inner) };
-        let status = unsafe { sys::mlx_async_eval(vec) };
+        let status = with_eval_lock(|| unsafe { sys::mlx_async_eval(vec) });
         unsafe { sys::mlx_vector_array_free(vec) };
         unsafe { check_status(status, "Array::async_eval") }
     }

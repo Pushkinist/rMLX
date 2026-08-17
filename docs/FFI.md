@@ -381,20 +381,37 @@ ML-semantic effect.
 
 ### Per-thread CPU stream context — `ensure_cpu_default_stream`
 
-The same thread-local-encoder problem exists on the CPU side, independently of
-the GPU one: MLX's CPU backend resolves a stream's `CommandEncoder` through a
-**thread-local** map first
-(`mlx/backend/cpu/encoder.cpp::get_command_encoder`), falling back to a
-process-global map and otherwise throwing `There is no Stream(cpu, N) in
-current thread.` A worker thread whose graph includes a CPU-scheduled op —
-e.g. the K8V8 `exit_prefill` quantization's scale reduction, which MLX places
-on the CPU stream even though the surrounding quantize dispatch runs on the
-GPU device — can fault the same way the GPU path did (issue #206).
+A worker thread whose graph includes a CPU-scheduled op — e.g. the K8V8
+`exit_prefill` quantization's scale reduction, which MLX places on the CPU
+stream even though the surrounding quantize dispatch runs on the GPU device —
+needs a CPU stream of its own, the same way the GPU path did.
+
+**How MLX resolves the CPU encoder is version-specific, and the two versions
+behave oppositely — do not reason from the wrong one:**
+
+| | 0.31.x (**the pinned version**) | 0.32.0 |
+|---|---|---|
+| `cpu::get_command_encoder` map | one **process-global** `unordered_map<int, CommandEncoder>` | `thread_local`, with a process-global fallback |
+| Populated | lazily, on first evaluation, **with no synchronisation** | at stream registration |
+| Unregistered stream | silently inserted | throws `There is no Stream(cpu, N) in current thread.` |
+| Cross-thread eval | succeeds | throws |
+
+Default CPU streams are per-thread either way (`mlx/stream.cpp`:
+`static thread_local ... default_streams`), so on the pinned version every
+thread that evaluates mints its own stream index and inserts into that one
+shared map. That unsynchronised insert is a genuine upstream defect — the
+neighbouring `Scheduler::threads_` map in `mlx/scheduler.h` *is* mutex-guarded —
+and it is what `EVAL_LOCK` (below) contains. MLX 0.32.0 fixes it by making the
+map thread-local; we do not pin that version because its bottle ships no NAX
+GEMM kernels.
 
 `rmlx_mlx::ensure_cpu_default_stream()` is the CPU analog of
 `ensure_gpu_default_stream()`: same mechanism (create a stream, register it as
 the calling thread's default, leak the handle in a thread-local for the
-thread's lifetime), same idempotency guarantee, zero ML-semantic effect.
+thread's lifetime), same idempotency guarantee, zero ML-semantic effect. On
+0.31.x it is not load-bearing for a thread that builds and evaluates its own
+graph — MLX self-registers there — but it pins the thread's stream identity
+explicitly and is what keeps the code correct if the pin moves to 0.32.0.
 
 **Contract:** every blocking-thread inference entry point calls
 `ensure_cpu_default_stream()` **unconditionally** (not gated on the resolved
@@ -423,8 +440,12 @@ unbounded over long serve uptime (which would otherwise eventually exhaust the
 process lifetime regardless.
 
 See `docs/KV_CACHE.md` §5.7.5 and `docs/KV_QUANT.md` for the `exit_prefill`
-mechanism this guards, including the guard's limitation (it registers the
-*worker's own* stream — it does not fix a genuinely cross-thread eval).
+mechanism this guards. Note the guard's scope: it registers the *worker's own*
+stream. On the pinned 0.31.x that is all anyone needs — a cross-thread eval
+resolves through the process-global map and succeeds
+(`cross_thread_eval_resolves_through_the_process_global_encoder_map` pins this).
+On 0.32.0 a cross-thread eval throws and the guard would not help, because it
+registers a different stream than the one the foreign array is bound to.
 
 ### Null sentinel for optional arguments
 
@@ -532,6 +553,122 @@ methods trigger execution:
   to pipeline the next decode step's forward pass on the GPU while the
   current step's argmax is still being read back to the CPU, mirroring
   mlx-lm's `mx.async_eval` pattern in `generate.py`.
+
+**Both are serialised process-wide by `EVAL_LOCK`** (`crates/rmlx-mlx/src/lib.rs`),
+via `with_eval_lock`, which holds the lock across the FFI call and nothing else.
+So is `Closure::apply` — see the reach-set table below for why a closure
+application evaluates.
+MLX evaluation is not safe to drive from two threads at once on the pinned
+0.31.x: the CPU command-encoder table described above is a process-global map
+filled without synchronisation, so two concurrent evaluations rehash it under
+each other. The process then dies inside MLX with no Rust frame at fault and
+nothing to catch — observed as SIGSEGV, as SIGTRAP, and as an infinite spin on
+a bucket chain that became circular. libtest names no failing test, because
+none failed. `cargo test` runs one OS thread per test, which is how this
+reached `make ci` as an intermittent crash of a whole test binary.
+
+`with_eval_lock` takes a closure rather than returning a guard on purpose: with
+a guard-returning helper, `let _ = acquire();` would drop the guard before the
+FFI call and silently restore the crash, and `MutexGuard`'s `#[must_use]` does
+not fire on `let _ =`.
+
+Three consequences worth knowing:
+
+- **Cost is one uncontended mutex acquire + release per evaluation** — a CAS
+  and a release store, tens of nanoseconds, against an FFI call that walks a
+  graph and dispatches work in microseconds or more. (Order-of-magnitude
+  reasoning, not a measurement; it has not been isolated on a decode bench.)
+  Under contention it would be a futex syscall, but rMLX runs inference on one
+  thread at a time by design and the server holds a 1-permit `gpu_queue` and
+  `gpu_gate` above that, so contention is not the steady state.
+- **`async_eval` still pipelines.** Only the graph walk and dispatch happen
+  under the lock; the scheduled work completes after it is released.
+- **The lock is not a licence to evaluate concurrently.** It makes concurrent
+  callers correct, not parallel — they serialise.
+
+### Which C entry points need the lock
+
+**Twenty-five**, not the three this workspace happens to call — and they come
+from *two* passes, because one of them is structurally blind to a quarter of
+the problem.
+
+**Pass 1 — automated, direct calls (24 symbols).** Reverse reachability over
+the linked dylibs: `otool -tvV` on `libmlxc.dylib` and `libmlx.dylib`,
+transitive callers backwards from both `mlx::core::eval_impl` and the hazard
+symbol itself `mlx::core::cpu::get_command_encoder(Stream)`, intersected with
+the exported `mlx_*` C ABI. Both directions agree.
+
+**Pass 2 — by hand, indirect dispatch (1 more).** `mlx_closure_apply` reaches
+evaluation through a `std::function` — a `blr` on a vtable slot — which reverse
+reachability over a disassembly does not traverse. It does **not** appear in
+pass 1's output and never will.
+
+> **Re-running pass 1 at a pin bump gives 24, with `mlx_closure_apply` absent.
+> That is the automated pass's blind spot, not a stale entry — do not "correct"
+> the gate by deleting the closure guard.**
+
+The exact procedure, and the other closure-taking entry points to re-audit at a
+pin bump, are recorded in `scripts/check_eval_lock.sh`.
+
+| Entry point | Count | Why it evaluates | Called here |
+|---|---|---|---|
+| `mlx_array_eval` | 1 | directly | yes, guarded |
+| `mlx_async_eval` | 1 | directly | yes, guarded |
+| `mlx_closure_apply` | 1 | **indirectly** — building the fused `Compiled` primitive bakes scalar constants into the kernel library name: `print_constant` → `array::item<T>()` → `array::eval()` (`mlx/backend/common/compiled.cpp`) | yes, guarded |
+| `mlx_eval` | 1 | directly | no |
+| `mlx_array_item_*` | 14 | `array::item<T>()` evaluates before reading (`mlx/array.h`) | no |
+| `mlx_array_tostring` | 1 | `operator<<(ostream&, array)` evaluates | no |
+| `mlx_save`, `mlx_save_writer`, `mlx_save_safetensors`, `mlx_save_safetensors_writer`, `mlx_save_gguf`, `mlx_load_gguf` | 6 | serialisation materialises before writing | no |
+| `mlx_array_data_*` | — | **does not evaluate** — plain pointer accessors | yes, unguarded and correct |
+
+The twenty-two uncalled ones are the live risk. They sit in the bindings one
+call away and read as innocuous: `mlx_array_item_float32` looks like a scalar
+accessor, `mlx_array_tostring` is what an `impl Debug for Array` reaches for,
+and `mlx_save_safetensors` is the **write side of `rmlx convert`**, a named
+0.1.0 deliverable. Adding one unguarded reinstates this exact defect, with a
+signature — whole test binary dies, no test named — indistinguishable from the
+original bug.
+
+`mlx_closure_apply` is the one that is not obvious in either direction:
+applying a closure looks like pure graph construction, and the evaluation is
+reached through a `std::function` vtable, so it is invisible both to a text
+scan of call sites and to pass 1 above. It is guarded, and because the Rust
+closure body runs *inside* that call with the lock held, a body that **takes
+the lock again** self-deadlocks on the non-reentrant mutex. Note that ban is
+broader than "must not evaluate" — `Closure::apply` takes the lock, so a body
+applying another compiled closure deadlocks without calling `eval` anywhere,
+which is the first shape a "fuse two fused kernels" refactor produces. No body
+does either today; RULE 3 of the gate keeps it that way.
+
+### The three things that hold this together
+
+| | Kind | Catches | Misses |
+|---|---|---|---|
+| `make check-eval-lock` | text gate, deterministic | an unguarded call to any of the 25; a guard dropped from a call site; a closure body that takes the lock again | a disarmed lock — the lexical structure is unchanged, so it stays green |
+| `with_eval_lock_serialises_concurrent_callers` | unit test, deterministic | a lock that does not actually exclude | anything about *which* calls take the lock |
+| `make eval-lock-stress` | reproducer driver, probabilistic | the real end-to-end crash | ~1 run in 12 per process, so it needs N≥60 to mean anything |
+
+The first two are in `make ci` **and in the hosted `source gates` job**, and are
+complementary by construction — each is blind to exactly what the other
+catches; that was verified by mutation, not assumed.
+
+`make check-eval-lock-fixtures` is the recall test for the first: 26 synthetic
+scan roots, each asserting an exit code **and which rule fired**. Asserting the
+rule is the point — an earlier corpus checked exit codes only, and because every
+must-fail fixture happened to contain no guarded call site, each one tripped
+RULE 2's anti-vacuity branch and exited 1 regardless of the rule under test.
+Deleting RULE 1 or RULE 3 outright left that corpus green. Every RULE 1 / RULE 3
+fixture now ends with a correctly-guarded `guarded_anchor` so the failure is
+attributable. The corpus is itself mutation-tested: 17 mutations of the gate,
+17 killed, 0 survivors.
+
+The stress driver is **not** in `make ci`, and the reproducer it drives carries
+`#[ignore]`. Its measured 8% failure rate was taken the way the driver runs it —
+alone, against a cold encoder map. Inside a normal `cargo test` the map is
+already warm from other tests, so its detection chance there is lower still and
+was never measured, while its cost is exact: 412 threads peak against 4 without
+it, ~436 still resident at suite end, in a binary whose test order is
+nondeterministic. Measured cost plus unmeasured benefit is not a gate.
 
 **Never `eval()` a kernel's inputs before dispatching it.** `Array::eval()`
 blocks the calling thread until the GPU has produced the array, so an `eval()`
