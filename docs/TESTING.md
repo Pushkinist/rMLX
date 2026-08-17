@@ -270,18 +270,30 @@ comment are not block delimiters, and counting them is wrong in both directions:
   a rule keyed on "no brace open" latches it forever and hard-fails the whole
   run blaming a `macro_rules!` the file does not contain.
 
-The `;` alternative covers a signature that fits on **one line**. A `where`
-clause pushes the `;` onto a later line, so that declaration still latches and
-its capture never terminates — reported as the fail-closed "cannot read" error.
-That is the right side to fail on, and `trait_where_signature` pins it as loud;
-the diagnostic's `macro_rules!` wording on a file that has none is a known debt.
+**Known OPEN blind spot — a `where`-split signature.** The `;` alternative
+covers a signature that fits on **one line**. A `where` clause pushes the `;`
+onto a later line, so that declaration latches — and the latch is closed by the
+first later line that bares to the fn's indent, which in a Rust test file is
+`    }`, the close of any nested block. When it closes that way **no error is
+emitted**: the swallowed `#[test]` was never registered, so nothing looks
+unterminated, and the gate reports `OK` at exit 0 over an un-ignored
+`Device::Gpu` test.
+
+This is **fail-open**, not fail-closed — the one place in this gate that is. It
+is unreachable in the tree today (no scanned file has a where-split signature),
+and the class is tracked in #386 for reconciliation against the compiled `cargo
+test -- --list`, which is what actually closes it. Two fixtures bracket it:
+`trait_where_signature` pins the sub-case where nothing closes the latch (loud),
+and `trait_where_signature_open_hole` pins the open answer so the hole is
+visible in the corpus rather than only in prose.
 
 The trailing-comment scan is string-aware, so neither a URL in a one-line fn
-(`"http://…"`) nor a quote inside a char literal (`b'"'`, which occurs eight
-times in the scanned tree) derails it — the latter would otherwise leave the
-scanner stuck "inside a string" for the rest of the line. It does not track
-raw-string hashes or block comments: a `/* … */` spanning an item's opening line
-is still read literally.
+(`"http://…"`) nor a char literal of any payload form (`b'"'`, `'\x1b'`,
+`'\u{FFFD}'`, `'é'` — 18 such literals occur in the scanned tree) derails it;
+either would otherwise leave the scanner stuck "inside a string" for the rest of
+the line. It does **not** handle raw strings (the `\` in `r"a\"` is not an
+escape, and `r#"…"#` hashes are not tracked) or block comments: a `/* … */`
+spanning an item's opening line is read literally.
 
 Still out of reach on the macro side: a `macro_rules!` with a **non-brace**
 delimiter (`macro_rules! m ( .. );`). Its name is captured so findings are

@@ -6,8 +6,9 @@
 // `!in_fn` guard: the first fn's attributes were already snapshotted before
 // its body was read, and the marker cannot carry to the second because the
 // fn-close rule clears the pending attribute block. Deleting that guard was
-// measured to change no output on any input — it is defence in depth, not the
-// mechanism.
+// measured to change no output on the fixture set or the real tree — the two
+// mechanisms are mutually redundant, which is why no SINGLE mutation kills
+// this fixture (deleting the guard AND the fn-close reset does).
 //
 // So what this fixture pins is the BEHAVIOUR, not the guard: a marker sitting
 // among a fn's statements exempts nothing, and does not reach the next fn. If

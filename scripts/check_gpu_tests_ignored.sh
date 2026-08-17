@@ -193,18 +193,29 @@
 #       item's body so a `Device::Gpu` in it is never seen, a false "open"
 #       swallows the rest of the file.
 #
-#       The `;` arm covers a signature that fits on ONE line. A `where` clause
-#       pushes the `;` onto a later line, so such a declaration DOES latch and
-#       its capture never terminates — which surfaces as `U` below. Loud and
-#       fail-closed, but the diagnostic still talks about `macro_rules!`.
+#       KNOWN OPEN BLIND SPOT. The `;` arm covers a signature that fits on ONE
+#       line. A `where` clause pushes the `;` onto a later line, so such a
+#       declaration latches — and the latch is then closed by the first later
+#       line that bares to the fn's indent, which in a Rust test file is `    }`,
+#       the close of any nested block. When it closes that way NO `U` is
+#       emitted: the swallowed `#[test]` was never registered, so nothing looks
+#       unterminated, and the gate reports OK at exit 0 over an un-ignored
+#       `Device::Gpu` test. This is fail-OPEN, not fail-closed. It is
+#       unreachable in the tree today (no scanned file has a where-split
+#       signature) and the class is tracked for reconciliation against the
+#       compiled `cargo test -- --list`. The `trait_where_signature` fixture
+#       pins only the sub-case where nothing closes the latch;
+#       `trait_where_signature_open_hole` pins the open answer.
 #     * A capture that is still open at a file boundary means the parser lost
 #       the file, so it reports `U` rather than letting the remainder go
 #       unclassified.
 #
 #   `bare()` finds the trailing comment with a string-aware scan, so neither a
-#   `//` inside a string literal nor a `"` inside a char literal (`b'"'`)
-#   derails it. Remaining known parse hazards: raw-string hashes, and block
-#   comments — a `/* … */` spanning an item's opening line is read literally.
+#   `//` inside a string literal nor a char literal of any payload form (`b'"'`,
+#   `'\x1b'`, `'\u{FFFD}'`, `'é'`) derails it. Remaining known parse hazards:
+#   raw strings (the `\` in `r"a\"` is not an escape, and `r#"…"#` hashes are
+#   not tracked) and block comments — a `/* … */` spanning an item's opening
+#   line is read literally.
 #
 # Exit 0 = clean. Exit 1 = violation (or a scan that found nothing to check).
 
@@ -326,7 +337,7 @@ read -r -d '' AWK_DETECT <<'AWK' || true
     # the everyday case — is not a comment, and cutting there would end the
     # line in mid-string and flip every decision that reads its last
     # character.
-    function bare(s,   i, n, q, c) {
+    function bare(s,   i, n, q, c, rest) {
         n = length(s)
         q = 0
         for (i = 1; i <= n; i++) {
@@ -334,17 +345,21 @@ read -r -d '' AWK_DETECT <<'AWK' || true
             if (c == "\\" && q) { i++; continue }
             if (c == "\"") { q = !q; continue }
             if (!q && c == "'") {
-                # A char literal is opaque. The `"` in `'"'` / `b'"'` is not a
-                # string delimiter, and letting it flip the state leaves the
-                # rest of the line "inside a string" — the trailing comment is
-                # then not stripped and every decision that reads the last
-                # significant character flips. Only the exact char-literal
-                # shape is stepped over, so a lifetime (`'a`, `'static`), which
-                # has no closing quote two characters later, is unaffected.
-                if (substr(s, i + 1, 1) == "\\" && substr(s, i + 3, 1) == "'") {
-                    i += 3
-                } else if (substr(s, i + 2, 1) == "'") {
-                    i += 2
+                # Step over the WHOLE char literal. A partially-stepped one
+                # leaves its closing quote to be re-read as an opener, and that
+                # stray `'` matches the one-char shape below and swallows a real
+                # `"` — putting the scan back inside a string for the rest of
+                # the line. A lifetime (`'a`, `'static`) matches no shape here
+                # and is left alone.
+                rest = substr(s, i + 1)
+                if (match(rest, /^\\u\{[0-9a-fA-F][0-9a-fA-F]*\}'/) \
+                 || match(rest, /^\\x[0-9a-fA-F][0-9a-fA-F]'/) \
+                 || match(rest, /^\\.'/) \
+                 || match(rest, /^[\300-\337][\200-\277]'/) \
+                 || match(rest, /^[\340-\357][\200-\277][\200-\277]'/) \
+                 || match(rest, /^[\360-\367][\200-\277][\200-\277][\200-\277]'/) \
+                 || match(rest, /^[^'\\]'/)) {
+                    i += RLENGTH
                 }
                 continue
             }
