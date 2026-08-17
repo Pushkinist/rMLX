@@ -650,8 +650,9 @@ impl Generator for ArchGenerator {
         if constraint.is_some() {
             tracing::debug!(model_id = %req.model_id, "generate: constraint engine active (A6.2)");
         }
-        // Caller-supplied request identity, echoed on the never-engaged warn
-        // below so the operator can tie it back to a request.
+        // Optional `X-Session-Id` header; `None` for most clients — the request
+        // correlation id comes from the inherited `request` span, not from here.
+        // Echoed on the never-engaged warn as a secondary key when present.
         let session_id_for_log = req.session_id.clone();
         // A7.2: mirror the resolved sampling knobs into the rmlx-models
         // `SamplerConfig` (rmlx-models must not depend on rmlx-server). The
@@ -776,7 +777,13 @@ impl Generator for ArchGenerator {
         // model id is the stable identity; same id ⇒ same sig ⇒ cache still
         // hits for repeat same-model requests.
         let model_sig = rmlx_models::multimodal_cache::model_sig(&self.model_id);
+        // The decode runs on a blocking-pool thread. `spawn_blocking` does not
+        // propagate the caller's tracing span, so every event emitted below —
+        // including the never-engaged report — would otherwise lose the route's
+        // `request_id`. Carry the span across explicitly.
+        let decode_span = tracing::Span::current();
         tokio::task::spawn_blocking(move || {
+            let _decode_span_guard = decode_span.enter();
             // Acquire the serialisation lock.
             let _guard = {
                 let try_result = lock.try_lock();

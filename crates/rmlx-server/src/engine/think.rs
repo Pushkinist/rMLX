@@ -19,6 +19,13 @@
 /// thinking-end delimiter. Assumes neither delimiter is a substring of the
 /// other, which holds for `<think>` / `</think>` and for any sane override.
 pub(crate) fn prompt_leaves_think_open(rendered: &str, start: &str, end: &str) -> bool {
+    // An empty delimiter matches at every offset — `rfind("")` returns the end
+    // of the haystack, which would make every prompt look like it left the
+    // block open. The request boundary rejects that input; this keeps the
+    // function total for any other caller.
+    if start.is_empty() || end.is_empty() {
+        return false;
+    }
     match (rendered.rfind(start), rendered.rfind(end)) {
         (Some(s), Some(e)) => s > e,
         (Some(_), None) => true,
@@ -125,6 +132,13 @@ impl ThinkSplitter {
     /// `thinking_start_token` / `thinking_end_token` let callers
     /// redirect the splitter to non-default delimiter strings. `None`
     /// defaults to `"<think>"` / `"</think>"` to preserve existing behavior.
+    ///
+    /// An **empty** delimiter is treated as absent. `step`'s scanner advances
+    /// by the length of the tag it matched, and an empty tag matches at offset
+    /// 0 of every remainder — the loop would never shorten `rest` and would
+    /// spin forever on a blocking-pool thread. The OpenAI route rejects the
+    /// empty override at the boundary; this keeps the type total for every
+    /// caller rather than relying on that one guard.
     pub(crate) fn new_for_request(
         prompt_think_open: bool,
         thinking_budget: Option<u32>,
@@ -133,8 +147,12 @@ impl ThinkSplitter {
     ) -> Self {
         Self {
             open: prompt_think_open,
-            thinking_start_token: thinking_start_token.unwrap_or_else(|| "<think>".to_owned()),
-            thinking_end_token: thinking_end_token.unwrap_or_else(|| "</think>".to_owned()),
+            thinking_start_token: thinking_start_token
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "<think>".to_owned()),
+            thinking_end_token: thinking_end_token
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "</think>".to_owned()),
             thinking_token_count: 0,
             thinking_budget,
             budget_exceeded: false,

@@ -505,6 +505,25 @@ pub(crate) async fn chat_completions(
     // NotReadyGenerator anyway).
     // Delimiters the think-splitter will use for this request, needed at render
     // time to read the initial think channel off the rendered prompt.
+    //
+    // An empty (or whitespace-only) override is not a usable delimiter: it
+    // matches at every offset, so the prompt scan would report the block open
+    // for any prompt and the splitter's own scanner would never advance past
+    // it. Reject at the boundary rather than letting either consumer inherit
+    // the degenerate value.
+    for (field, value) in [
+        ("thinking_start_token", thinking_start_token.as_deref()),
+        ("thinking_end_token", thinking_end_token.as_deref()),
+    ] {
+        if let Some(v) = value {
+            if v.trim().is_empty() {
+                state.error_counts.increment(ApiErrorCategory::BadRequest);
+                return bad_request(&format!(
+                    "`{field}` must be a non-empty, non-whitespace delimiter string"
+                ));
+            }
+        }
+    }
     let think_start_delim = thinking_start_token
         .clone()
         .unwrap_or_else(|| "<think>".to_owned());

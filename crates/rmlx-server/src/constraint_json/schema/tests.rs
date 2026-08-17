@@ -1416,3 +1416,132 @@ fn a_latched_thinking_flag_leaves_the_constraint_inert_for_the_whole_request() {
         "the engage scan is skipped for every token while is_thinking is latched"
     );
 }
+
+/// A property name containing a space, driven through the *mask* rather than
+/// through `step` — the shape a real decoder sees.
+///
+/// Treating whitespace as an insignificant separator inside the key string is
+/// not merely a mis-parse: it makes the key **unreachable**, and it does so by
+/// leaving whitespace as the only legal continuation. Once the key trie is
+/// parked on the space it is still expecting, every candidate token that
+/// carries the rest of the name is rejected at its second byte, while a
+/// whitespace-only token is accepted as a no-op that makes no progress. The
+/// mask therefore offers whitespace and nothing else, forever, and withholds
+/// EOS because the value is incomplete — a forced degenerate stream that owes
+/// nothing to the model's preferences.
+#[test]
+fn a_spaced_key_leaves_a_reachable_continuation_in_the_mask() {
+    let n = node(
+        &json!({
+            "type": "object",
+            "properties": {"unit label": {"type": "string", "enum": ["celsius"]}},
+            "required": ["unit label"],
+            "additionalProperties": false
+        }),
+        true,
+    );
+    // ids: 0=`{` 1=`"` 2=`unit` 3=` label"` 4=`\n` 5=`  ` 6=EOS
+    let bm = synthetic_bm(&[b"{", b"\"", b"unit", b" label\"", b"\n", b"  ", b""]);
+    let mut c = SchemaConstraint::from_parts(bm, vec![6], n, None);
+
+    let _ = c.step_mask(7);
+    for id in [0u32, 1, 2] {
+        c.advance(id);
+    }
+
+    // Parked mid-key, immediately before the space in `"unit label"`.
+    let m = c.step_mask(7);
+    assert!(
+        m[3],
+        "the token carrying the rest of the key must be reachable; \
+         allowed ids = {:?}",
+        (0..7).filter(|&i| m[i]).collect::<Vec<_>>()
+    );
+    assert!(
+        !m[4] && !m[5],
+        "whitespace is key CONTENT here, not a separator — it must not be offered"
+    );
+    assert!(!m[6], "EOS must stay masked mid-key");
+
+    // And the document completes.
+    c.advance(3);
+    let m = c.step_mask(7);
+    assert!(
+        !m.iter().take(6).all(|&b| !b) || m[6],
+        "grammar must still admit a continuation after the key closes"
+    );
+}
+
+/// The same shape end to end: a decoder that always takes the first allowed
+/// non-whitespace token must be able to finish the document. When whitespace
+/// is the only thing on offer it cannot, and the request burns `max_tokens`.
+#[test]
+fn a_spaced_key_document_is_emittable_token_by_token() {
+    let n = node(
+        &json!({
+            "type": "object",
+            "properties": {"unit label": {"type": "string", "enum": ["celsius"]}},
+            "required": ["unit label"],
+            "additionalProperties": false
+        }),
+        true,
+    );
+    // ids: 0=`{` 1=`"` 2=`unit` 3=` label"` 4=`:` 5=`"celsius"` 6=`}` 7=`\n` 8=`  ` 9=EOS
+    let bm = synthetic_bm(&[
+        b"{",
+        b"\"",
+        b"unit",
+        b" label\"",
+        b":",
+        b"\"celsius\"",
+        b"}",
+        b"\n",
+        b"  ",
+        b"",
+    ]);
+    let mut c = SchemaConstraint::from_parts(bm, vec![9], n, None);
+
+    // The model opens the object; that is the token the engage policy fires on.
+    // Everything after it is the constrained stretch under test.
+    let _ = c.step_mask(10);
+    c.advance(0);
+    assert!(c.engaged, "`{{` engages a container-root schema");
+
+    // Longest-match over the content tokens, the way a BPE tokenizer segments.
+    // A first-allowed policy would pick the bare `"` over `"celsius"` and dead-end
+    // on a vocabulary this small, which says nothing about the grammar.
+    let content_by_len: [u32; 6] = [5, 3, 2, 1, 4, 6];
+
+    let mut emitted: Vec<u32> = Vec::new();
+    let mut ws_only_steps = 0usize;
+    for _ in 0..64 {
+        let pick = {
+            let m = c.step_mask(10);
+            let content = content_by_len.iter().copied().find(|&i| m[i as usize]);
+            if let Some(i) = content {
+                i
+            } else if m[9] {
+                break; // EOS offered — grammar is satisfied.
+            } else {
+                ws_only_steps += 1;
+                assert!(m[7] || m[8], "mask offered nothing at all");
+                if m[7] {
+                    7
+                } else {
+                    8
+                }
+            }
+        };
+        c.advance(pick);
+        emitted.push(pick);
+        if c.finished() {
+            break;
+        }
+    }
+
+    assert_eq!(
+        ws_only_steps, 0,
+        "the decoder was cornered into whitespace {ws_only_steps} times; emitted={emitted:?}"
+    );
+    assert!(c.finished(), "document must complete; emitted={emitted:?}");
+}
