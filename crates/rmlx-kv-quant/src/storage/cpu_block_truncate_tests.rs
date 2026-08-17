@@ -663,7 +663,7 @@ fn assert_same_decode(subject: (&[f32], &[f32]), reference: (&[f32], &[f32]), la
 /// arm. Reverting any of `K8V8`, `K8VTurbo2`, `K8VTurbo3Tcq`, `K8VTurbo2Tcq`,
 /// the K axis of `IsoV3` / `IsoV4` / `RotorV3` / `RotorV4`, or the V axis of
 /// `RotorKAsym3` / `RotorKAsym4` to a bare `shape[2] = n` leaves this suite
-/// green. Those eight are unpinned by construction: nothing in the workspace
+/// green. Those ten are unpinned by construction: nothing in the workspace
 /// drives `KvStorage::truncate_to` on them.
 #[test]
 #[allow(
@@ -860,7 +860,8 @@ fn kv_storage_truncate_routes_every_arm_through_the_store_cut() {
 /// the store decodes 5 positions against a declared 1, so `dequantize_choice`
 /// returns `Err` and the `expect` panics.
 ///
-/// Coverage: the `K8V4` arm only. `reset` has twenty-two other arms and nothing
+/// Coverage: the `K8V4` arm only. `reset` has twenty-seven other arms (28 in
+/// total, one per `KvStorage` variant) and nothing
 /// drives them, so reverting any of those is not caught here.
 #[test]
 #[allow(

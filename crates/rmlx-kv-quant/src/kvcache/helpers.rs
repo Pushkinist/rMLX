@@ -9,24 +9,27 @@ use crate::storage::KvStorage;
 
 // ── Test-only probes ──────────────────────────────────────────────────────────
 //
-// `probe_k_dequant` is called from `rmlx-models` `hydrate_tests.rs` across
-// the crate boundary. A cross-crate `#[cfg(test)]` gate is not possible
-// (each crate compiles its cfg(test) independently), so the function stays
-// `pub`. The wildcard arm now returns `None` instead of panicking so no
-// panic path is reachable from production callers.
+// The `probe_*_dequant` pair is called from the SSD round-trip tests in
+// `rmlx-kv-ssd` across the crate boundary. A cross-crate `#[cfg(test)]` gate is
+// not possible (each crate compiles its cfg(test) independently), so they stay
+// `pub`. Both enumerate every variant explicitly, so no panic path is reachable
+// from production callers.
+//
+// Both return `Option<Result<..>>`, and the two layers mean different things:
+// `None` is "this variant has no CPU-dequantizable buffer on that axis",
+// `Some(Err(..))` is "the store exists and its dequant refused". Collapsing the
+// second into the first reports a missing buffer for the blocks-vs-`shape[2]`
+// coverage failure, which is the one thing these probes are used to detect.
 
 impl KvCache {
     /// Dequant the K side of the cache to flat f32 (CPU paths only).
     ///
     /// Returns `None` for storage variants that have no q8 K buffer
-    /// (`Paged`, `Mixed`, `RotKTq4V`, `None`). Used by the hydrate round-trip
-    /// test to compare a reconstructed cache's K against the pre-spill K
-    /// within the fp tolerance.
-    #[allow(
-        clippy::unwrap_used,
-        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
-    )]
-    pub fn probe_k_dequant(&self, device: Device) -> Option<Vec<f32>> {
+    /// (`Paged`, `Mixed`, `RotKTq4V`, `None`), and `Some(Err(..))` when the K
+    /// store exists but its dequant refused — see the module note above for why
+    /// those stay distinct. Used by the hydrate round-trip tests to compare a
+    /// reconstructed cache's K against the pre-spill K within the fp tolerance.
+    pub fn probe_k_dequant(&self, device: Device) -> Option<Result<Vec<f32>>> {
         match &self.storage {
             KvStorage::K8V4 { k, .. }
             | KvStorage::K8V8 { k, .. }
@@ -39,44 +42,56 @@ impl KvCache {
             | KvStorage::IsoV4 { k, .. }
             | KvStorage::RotorV3 { k, .. }
             | KvStorage::RotorV4 { k, .. } => {
-                let (flat, _) = k.as_ref()?.dequantize_choice(device, Dtype::F32).ok()?;
-                Some(flat)
+                let k = k.as_ref()?;
+                Some(
+                    k.dequantize_choice(device, Dtype::F32)
+                        .map(|(flat, _)| flat),
+                )
             }
             // TurboSym3 — K is `QuantKTurbo3`, independent type from
             // `QuantK` and `QuantKTurbo4`. Same dequantize_choice API, dispatched
             // separately so the type checker stays happy.
             KvStorage::TurboSym3 { k, .. } => {
-                let (flat, _) = k.as_ref()?.dequantize_choice(device, Dtype::F32).ok()?;
-                Some(flat)
+                let k = k.as_ref()?;
+                Some(
+                    k.dequantize_choice(device, Dtype::F32)
+                        .map(|(flat, _)| flat),
+                )
             }
             // TurboSym4 — K is a `QuantKTurbo4`, independent type
             // from `QuantK`. Same dequantize_choice signature, dispatched
             // separately so the type checker stays happy.
             KvStorage::TurboSym4 { k, .. } => {
-                let (flat, _) = k.as_ref()?.dequantize_choice(device, Dtype::F32).ok()?;
-                Some(flat)
+                let k = k.as_ref()?;
+                Some(
+                    k.dequantize_choice(device, Dtype::F32)
+                        .map(|(flat, _)| flat),
+                )
             }
             // PlanarK — K is a `QuantPlanarK`. Same API as QuantPlanarV.
             KvStorage::PlanarK { k, .. } => {
-                let (flat, _) = k.as_ref()?.dequantize_choice(device, Dtype::F32).ok()?;
-                Some(flat)
+                let k = k.as_ref()?;
+                Some(
+                    k.dequantize_choice(device, Dtype::F32)
+                        .map(|(flat, _)| flat),
+                )
             }
             // Iso symmetric / K-only — K is QuantIsoK3 / QuantIsoK4
             // (CPU-only). Dequant via the codec's `dequant()` method.
             KvStorage::IsoSym3 { k, .. } | KvStorage::IsoKOnly3 { k, .. } => {
-                Some(k.as_ref()?.dequant().ok()?)
+                Some(k.as_ref()?.dequant())
             }
             KvStorage::IsoSym4 { k, .. } | KvStorage::IsoKOnly4 { k, .. } => {
-                Some(k.as_ref()?.dequant().ok()?)
+                Some(k.as_ref()?.dequant())
             }
             // Rotor symmetric / K-only — K is QuantRotorK3 / QuantRotorK4.
             // RotorKAsym3 / RotorKAsym4 — same K codec types.
             KvStorage::RotorSym3 { k, .. }
             | KvStorage::RotorKOnly3 { k, .. }
-            | KvStorage::RotorKAsym3 { k, .. } => Some(k.as_ref()?.dequant().ok()?),
+            | KvStorage::RotorKAsym3 { k, .. } => Some(k.as_ref()?.dequant()),
             KvStorage::RotorSym4 { k, .. }
             | KvStorage::RotorKOnly4 { k, .. }
-            | KvStorage::RotorKAsym4 { k, .. } => Some(k.as_ref()?.dequant().ok()?),
+            | KvStorage::RotorKAsym4 { k, .. } => Some(k.as_ref()?.dequant()),
             KvStorage::None { .. }
             | KvStorage::Mixed { .. }
             | KvStorage::Paged { .. }

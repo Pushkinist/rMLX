@@ -3226,11 +3226,11 @@ compares against reference stores.
 
 Enum-arm coverage is **partial and stated as such**. Those five arms cover all
 six *store types*, so a regression in any store's `truncate_to` is caught — but
-eight arms are unpinned because nothing in the workspace drives
+ten arms are unpinned because nothing in the workspace drives
 `KvStorage::truncate_to` on them: `K8V8`, `K8VTurbo2`, `K8VTurbo3Tcq`,
 `K8VTurbo2Tcq`, the K axis of `IsoV3` / `IsoV4` / `RotorV3` / `RotorV4`, and the
 V axis of `RotorKAsym3` / `RotorKAsym4`. `reset` is thinner still: only its
-`K8V4` arm is pinned. Reverting any of the rest to a bare `shape[2] = n` leaves
+`K8V4` arm is pinned, out of 28 (one per `KvStorage` variant). Reverting any of the rest to a bare `shape[2] = n` leaves
 the suite green; catching that is review's job, not the suite's.
 
 Every oracle is a reference store

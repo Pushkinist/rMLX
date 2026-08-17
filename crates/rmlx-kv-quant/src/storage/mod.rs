@@ -312,8 +312,10 @@ pub(crate) trait BlockRows {
     /// The single way to ask the question — the rotor / iso blocks answer from
     /// their `n_tokens` field, the turbo / planar blocks from
     /// [`block_rows`] over `original_shape`. Keeping it on the trait is what
-    /// stops the two conventions being re-derived at each of the thirteen
-    /// `truncate_plan` call sites.
+    /// stops the two conventions being re-derived per codec: the nine
+    /// production `truncate_plan` call sites — eight rotor / iso `truncate_to`
+    /// bodies plus [`truncate_block_store`], which the five turbo / planar
+    /// stores share — all ask for the row count through here.
     fn rows(&self) -> usize;
 
     /// Keep the first `rows` rows, dropping the rest.
@@ -387,12 +389,6 @@ pub(crate) fn retain_rows_in<T>(buf: &mut Vec<T>, total_rows: usize, keep_rows: 
     buf.truncate(keep_rows.saturating_mul(stride));
 }
 
-// The two impls below live here rather than beside their structs: `TurboBlocks`
-// and `PlanarBlocks` are codec-layer types shared by five different storage
-// structs, and how they are cut is a storage-layer contract that belongs with
-// `truncate_plan` / `rows_split_ok` / `retain_rows_in`. The rotor / iso blocks
-// are declared inside `storage/` and keep their impls beside the struct.
-
 /// Truncate a block-accumulating store to `n` sequence positions.
 ///
 /// The whole cut sequence for the turbo / planar stores, in one place: clamp the
@@ -416,6 +412,12 @@ pub(crate) fn truncate_block_store<B: BlockRows>(blocks: &mut Vec<B>, shape: &mu
         *seq = n;
     }
 }
+
+// The two impls below live here rather than beside their structs: `TurboBlocks`
+// and `PlanarBlocks` are codec-layer types shared by five different storage
+// structs, and how they are cut is a storage-layer contract that belongs with
+// `truncate_plan` / `rows_split_ok` / `retain_rows_in`. The rotor / iso blocks
+// are declared inside `storage/` and keep their impls beside the struct.
 
 impl BlockRows for crate::turboquant::TurboBlocks {
     fn rows(&self) -> usize {
