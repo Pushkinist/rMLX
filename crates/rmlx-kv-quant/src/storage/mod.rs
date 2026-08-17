@@ -262,12 +262,15 @@ pub(crate) fn truncate_plan(
 /// and the SSD spill persists a store whose header claims more tokens than its
 /// bytes hold.
 ///
-/// The rotor / iso stores deliberately do **not** clamp, and that asymmetry is
-/// load-bearing: their blocks may legitimately trail `shape[2]` because a live
-/// GPU ring holds the decode tail, and `synced_rotor_v_blocks` /
-/// `synced_iso_v_blocks` rebuild the missing prefix from it. Clamping there
-/// would throw that tail away. These stores have no ring, so for them a
-/// shortfall is never recoverable and the clamp is the only correct reading.
+/// The rotor / iso stores deliberately do **not** clamp, and the reason is that
+/// they do not need to, not that clamping would cost them anything: a ring-only
+/// tail spans `[blocks_coverage, shape[2])`, strictly below `shape[2]`, so a
+/// `min(n, shape[2])` could never discard it. What makes the asymmetry safe is
+/// that those stores already **abort loudly** on an over-long target —
+/// `synced_rotor_v_blocks` / `synced_iso_v_blocks` size their ring readback from
+/// `shape[2]` and return `Err` when the ring cannot cover it. The clamp would buy
+/// them nothing. These stores have no ring and no such guard, so for them the
+/// clamp is the only reading that keeps `shape[2] == payload coverage` true.
 pub(crate) fn clamp_truncate_target(shape: &[i32], n: i32) -> i32 {
     let covered = shape.get(2).copied().unwrap_or(0).max(0);
     n.max(0).min(covered)
@@ -304,6 +307,15 @@ pub(crate) fn block_rows(original_shape: &[i32; 4]) -> usize {
 /// A per-append payload block whose buffers hold one equal-stride row per
 /// `(sequence position, kv head)` pair.
 pub(crate) trait BlockRows {
+    /// Rows this block currently holds.
+    ///
+    /// The single way to ask the question — the rotor / iso blocks answer from
+    /// their `n_tokens` field, the turbo / planar blocks from
+    /// [`block_rows`] over `original_shape`. Keeping it on the trait is what
+    /// stops the two conventions being re-derived at each of the thirteen
+    /// `truncate_plan` call sites.
+    fn rows(&self) -> usize;
+
     /// Keep the first `rows` rows, dropping the rest.
     ///
     /// Returns `false` and leaves the block untouched when the cut is not
@@ -381,7 +393,35 @@ pub(crate) fn retain_rows_in<T>(buf: &mut Vec<T>, total_rows: usize, keep_rows: 
 // `truncate_plan` / `rows_split_ok` / `retain_rows_in`. The rotor / iso blocks
 // are declared inside `storage/` and keep their impls beside the struct.
 
+/// Truncate a block-accumulating store to `n` sequence positions.
+///
+/// The whole cut sequence for the turbo / planar stores, in one place: clamp the
+/// target, plan the block walk, apply it, then lower `shape[2]`. Five stores
+/// share it (`QuantV`, `QuantKTurbo3`, `QuantKTurbo4`, `QuantPlanarK`,
+/// `QuantPlanarV`) and the order is load-bearing — the clamp has to run before
+/// the plan, and `shape[2]` has to move after it. Independent copies of that
+/// sequence are the same drift surface that let twelve `KvStorage` arms keep a
+/// bare `shape[2] = n` while the rest of the layer learned to cut.
+///
+/// Not used by the rotor / iso stores: they do not clamp (see
+/// [`clamp_truncate_target`]) and carry extra ring bookkeeping around the same
+/// three steps.
+pub(crate) fn truncate_block_store<B: BlockRows>(blocks: &mut Vec<B>, shape: &mut [i32], n: i32) {
+    let n = clamp_truncate_target(shape, n);
+    let plan = truncate_plan(blocks.iter().map(BlockRows::rows), shape, n);
+    apply_truncate_plan(blocks, &plan);
+    // `get_mut` rather than `shape[2]`: the store shape is rank-4 by
+    // construction, and this is the bounds proof rather than a claim.
+    if let Some(seq) = shape.get_mut(2) {
+        *seq = n;
+    }
+}
+
 impl BlockRows for crate::turboquant::TurboBlocks {
+    fn rows(&self) -> usize {
+        block_rows(&self.original_shape)
+    }
+
     /// The exhaustive destructure is the drift guard: a new payload field
     /// cannot be added without this failing to compile, which is what stops a
     /// buffer from surviving a mid-block truncation at its full length.
@@ -414,6 +454,10 @@ impl BlockRows for crate::turboquant::TurboBlocks {
 }
 
 impl BlockRows for crate::planarquant::PlanarBlocks {
+    fn rows(&self) -> usize {
+        block_rows(&self.original_shape)
+    }
+
     /// The exhaustive destructure is the drift guard: a new payload field
     /// cannot be added without this failing to compile, which is what stops a
     /// buffer from surviving a mid-block truncation at its full length.

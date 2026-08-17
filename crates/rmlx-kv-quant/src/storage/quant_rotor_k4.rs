@@ -280,7 +280,11 @@ impl QuantRotorK4 {
     )]
     pub fn truncate_to(&mut self, n: i32) {
         let n = n.max(0);
-        let plan = super::truncate_plan(self.blocks.iter().map(|blk| blk.n_tokens), &self.shape, n);
+        let plan = super::truncate_plan(
+            self.blocks.iter().map(super::BlockRows::rows),
+            &self.shape,
+            n,
+        );
         super::apply_truncate_plan(&mut self.blocks, &plan);
         // NB: no `self.gpu.clear()` — the ring holds the ring-only decode tail.
         if self.shape.len() >= 4 {

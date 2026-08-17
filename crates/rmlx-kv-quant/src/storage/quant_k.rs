@@ -138,12 +138,24 @@ impl QuantK {
     ///   `Q8_GROUP_SIZE` elements, so a cut that is not a whole number of groups
     ///   cannot be expressed without re-quantizing, and the f32 source is gone
     ///   by now.
+    ///
+    /// Neither refusal applies to `n == 0`, which is handled first. A clear has
+    /// nothing to preserve, so there is no prefix to get wrong and no shape a
+    /// refusal could be protecting — and `KvStorage::reset` routes every store
+    /// through `truncate_to(0)`, where refusing would leave `codes` populated
+    /// under `shape[2] == 0`: permanently un-decodable, and asymmetric with the
+    /// block stores, whose planner drops every block regardless of `b`.
     #[allow(
         clippy::indexing_slicing,
         reason = "shape rank is checked to be >= 4 before any element is read"
     )]
     fn retain_cpu_prefix(&mut self, n: i32) {
         if self.codes.is_empty() || self.shape.len() < 4 {
+            return;
+        }
+        if n <= 0 {
+            self.codes.clear();
+            self.scales.clear();
             return;
         }
         let b = self.shape[0].max(0) as usize;

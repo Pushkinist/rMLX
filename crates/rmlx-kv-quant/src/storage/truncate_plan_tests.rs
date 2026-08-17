@@ -45,6 +45,10 @@ impl FakeBlock {
 }
 
 impl BlockRows for FakeBlock {
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
     fn retain_rows(&mut self, rows: usize) -> bool {
         if !crate::storage::rows_split_ok(&[self.payload.len()], self.rows, rows) {
             return false;

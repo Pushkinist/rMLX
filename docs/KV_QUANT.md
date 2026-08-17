@@ -3192,11 +3192,24 @@ prefill length while `KvCache::offset` keeps advancing on the bf16 mirror, so a
 speculative rollback into the decode window arrives with a target past the
 store's own fill. Raising `shape[2]` to meet it invents coverage no payload
 backs — the dequant reads past the blocks and the SSD spill persists a header
-claiming more tokens than its bytes hold. The rotor / iso stores deliberately do
-**not** clamp, and that asymmetry is load-bearing: their blocks may legitimately
-trail `shape[2]` because a live GPU ring holds the decode tail and
-`synced_rotor_v_blocks` / `synced_iso_v_blocks` rebuild from it. These stores
-have no ring, so for them a shortfall is never recoverable.
+claiming more tokens than its bytes hold.
+
+The rotor / iso stores deliberately do **not** clamp, and the reason is that they
+do not need to, not that clamping would cost them anything: a ring-only tail
+spans `[blocks_coverage, shape[2])`, strictly below `shape[2]`, so a
+`min(n, shape[2])` could never discard it. What makes the asymmetry safe is that
+those stores already abort loudly on an over-long target —
+`synced_rotor_v_blocks` / `synced_iso_v_blocks` size their ring readback from
+`shape[2]` and return `Err` when the ring cannot cover it. These six have no ring
+and no such guard, so the clamp is the only reading that keeps
+`shape[2] == payload coverage` true.
+
+One consequence, named rather than hidden: for `n > shape[2]` the mixed arms now
+leave the two axes of one codec at different lengths — `IsoV3`, `IsoV4`,
+`RotorV3`, `RotorV4` (affine K clamps, codec V does not) and `RotorKAsym3/4`
+(rotor K does not, affine V does). It surfaces on spill, where the layer geometry
+comes from the K shape while the V payload is written raw; the reconciliation
+guard on the unclamped side is what reports it.
 
 `KvStorage::reset` carried the same defect one screen above `truncate_to` — a
 bare `shape[2] = 0` on exactly these six store types, leaving the payload
@@ -3209,8 +3222,18 @@ store (`QuantV`, `QuantKTurbo3`, `QuantKTurbo4`, `QuantPlanarK`, `QuantPlanarV`,
 exact-length and past-the-end targets; `KvStorage::reset`; the `RotKTq4V`
 zero-reset; and a five-arm `KvStorage::truncate_to` dispatch case (`K8V4`,
 `TurboSym3`, `TurboSym4`, `Planar`, `PlanarK`) that decodes both axes and
-compares against reference stores, so reverting any single arm to
-`shape[2] = n` turns exactly that case red. Every oracle is a reference store
+compares against reference stores.
+
+Enum-arm coverage is **partial and stated as such**. Those five arms cover all
+six *store types*, so a regression in any store's `truncate_to` is caught — but
+eight arms are unpinned because nothing in the workspace drives
+`KvStorage::truncate_to` on them: `K8V8`, `K8VTurbo2`, `K8VTurbo3Tcq`,
+`K8VTurbo2Tcq`, the K axis of `IsoV3` / `IsoV4` / `RotorV3` / `RotorV4`, and the
+V axis of `RotorKAsym3` / `RotorKAsym4`. `reset` is thinner still: only its
+`K8V4` arm is pinned. Reverting any of the rest to a bare `shape[2] = n` leaves
+the suite green; catching that is review's job, not the suite's.
+
+Every oracle is a reference store
 built from only the retained tokens, sharing no arithmetic with the truncation
 logic — deliberately not a recomputation of the cut via `block_rows`, which
 would pass any mutation scaling the cut and the reading together.

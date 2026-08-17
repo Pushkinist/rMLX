@@ -639,10 +639,6 @@ fn truncate_to_zero_and_to_the_exact_length_are_both_clean() {
 /// The oracle is the reference store, never a recomputation of the cut — an
 /// assertion on block row counts would share `block_rows` with the code under
 /// test and pass any mutation that scales the cut and the reading together.
-#[allow(
-    clippy::expect_used,
-    reason = "test: dequant of fixed in-bounds fixtures cannot fail; expect documents that"
-)]
 fn assert_same_decode(subject: (&[f32], &[f32]), reference: (&[f32], &[f32]), label: &str) {
     assert!(
         !subject.0.is_empty() && !subject.1.is_empty(),
@@ -652,18 +648,23 @@ fn assert_same_decode(subject: (&[f32], &[f32]), reference: (&[f32], &[f32]), la
     assert_eq!(subject.1, reference.1, "{label}: V axis");
 }
 
-/// `KvStorage::truncate_to` must route **every** arm through the store-level
-/// cut, not just the one an earlier version of this test covered.
+/// `KvStorage::truncate_to` routes its arms through the store-level cut.
 ///
 /// Before the fix twelve arms set `shape[2]` directly and never touched the CPU
 /// payload. Each case below drives the same partial accept through the enum —
 /// append, `storage.truncate_to`, append the correction — and compares the
 /// decoded K and V against reference stores fed only the retained tokens.
-/// Reverting any one arm to `shape[2] = n` turns its case red.
 ///
-/// Five arms, chosen to cover all six store types: `K8V4` (`QuantK` + `QuantV`),
-/// `TurboSym3` (`QuantKTurbo3` + 3-bit `QuantV`), `TurboSym4` (`QuantKTurbo4`),
-/// `Planar` (`QuantPlanarV`) and `PlanarK` (`QuantPlanarK`, a K-only arm shape).
+/// **Coverage, stated honestly.** Five arms are exercised: `K8V4` (`QuantK` +
+/// `QuantV`), `TurboSym3` (`QuantKTurbo3` + 3-bit `QuantV`), `TurboSym4`
+/// (`QuantKTurbo4`), `Planar` (`QuantPlanarV`) and `PlanarK` (`QuantPlanarK`,
+/// a K-only arm shape). That covers all six **store types**, so a regression in
+/// any store's `truncate_to` is caught — but it does **not** cover every enum
+/// arm. Reverting any of `K8V8`, `K8VTurbo2`, `K8VTurbo3Tcq`, `K8VTurbo2Tcq`,
+/// the K axis of `IsoV3` / `IsoV4` / `RotorV3` / `RotorV4`, or the V axis of
+/// `RotorKAsym3` / `RotorKAsym4` to a bare `shape[2] = n` leaves this suite
+/// green. Those eight are unpinned by construction: nothing in the workspace
+/// drives `KvStorage::truncate_to` on them.
 #[test]
 #[allow(
     clippy::expect_used,
@@ -858,6 +859,9 @@ fn kv_storage_truncate_routes_every_arm_through_the_store_cut() {
 /// Mutation check: put `vs.shape[2] = 0;` back in the `K8V4` arm of `reset` and
 /// the store decodes 5 positions against a declared 1, so `dequantize_choice`
 /// returns `Err` and the `expect` panics.
+///
+/// Coverage: the `K8V4` arm only. `reset` has twenty-two other arms and nothing
+/// drives them, so reverting any of those is not caught here.
 #[test]
 #[allow(
     clippy::expect_used,
@@ -910,6 +914,42 @@ fn kv_storage_reset_clears_the_cpu_payload() {
         .dequantize_choice(Device::Cpu, Dtype::F32)
         .expect("ref V dequant");
     assert_same_decode((&kd, &vd), (&rkd, &rvd), "reset");
+}
+
+/// A clear must clear, even at `b > 1` where every ordinary cut is refused.
+///
+/// `QuantK`'s refusals exist to stop a wrong prefix being kept. A zero target
+/// keeps no prefix, so no refusal can be correct there — and since
+/// `KvStorage::reset` routes through `truncate_to(0)`, refusing would leave
+/// `codes` populated under `shape[2] == 0`: permanently un-decodable, and
+/// asymmetric with the block stores, whose planner drops every block regardless
+/// of `b`.
+///
+/// Mutation check: move the `n <= 0` clear in `retain_cpu_prefix` below the
+/// `b != 1` refusal and the K codes survive at full length while the V blocks
+/// are gone, so the `is_empty` assertion fails and the dequant returns `Err`.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test: append/dequant of fixed in-bounds fixtures cannot fail; expect documents that"
+)]
+fn truncate_to_zero_clears_even_where_a_cut_would_be_refused() {
+    let (b, kv_h, d) = (2_usize, 2_usize, 64_usize);
+    let mut k = QuantK::from_cpu_parts(Vec::new(), Vec::new(), init_shape(b, kv_h, d));
+    let mut v = QuantV::new_affine_decode(init_shape(b, kv_h, d), 4, MAX_SEQ);
+    append_cpu!(k, b, kv_h, d, 0, 4, 0);
+    append_cpu!(v, b, kv_h, d, 0, 4, 0);
+
+    k.truncate_to(0);
+    v.truncate_to(0);
+
+    assert!(k.codes.is_empty(), "K codes cleared at b > 1");
+    assert!(k.scales.is_empty(), "K scales cleared at b > 1");
+    assert!(v.blocks.is_empty(), "V blocks cleared at b > 1");
+    k.dequantize_choice(Device::Cpu, Dtype::F32)
+        .expect("an emptied K store decodes to nothing");
+    v.dequantize_choice(Device::Cpu, Dtype::F32)
+        .expect("an emptied V store decodes to nothing");
 }
 
 /// `RotKTq4V` resets its V store to zero positions rather than to `n`, and now

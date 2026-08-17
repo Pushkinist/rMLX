@@ -111,20 +111,7 @@ impl QuantPlanarK {
     /// is clamped to the store's current `shape[2]`
     /// ([`super::clamp_truncate_target`]).
     pub fn truncate_to(&mut self, n: i32) {
-        let n = super::clamp_truncate_target(&self.shape, n);
-        let plan = super::truncate_plan(
-            self.blocks
-                .iter()
-                .map(|blk| super::block_rows(&blk.original_shape)),
-            &self.shape,
-            n,
-        );
-        super::apply_truncate_plan(&mut self.blocks, &plan);
-        // `get_mut` rather than `shape[2]`: the store shape is rank-4 by
-        // construction, and this is the bounds proof rather than a claim.
-        if let Some(seq) = self.shape.get_mut(2) {
-            *seq = n;
-        }
+        super::truncate_block_store(&mut self.blocks, &mut self.shape, n);
     }
 
     /// Append a new K slice. CPU path uses scalar Rust; GPU path uses the

@@ -1008,10 +1008,20 @@ impl KvStorage {
         reason = "long match enumerates all KvStorage variants; splitting would obscure the 1-to-1 mapping"
     )]
     pub fn truncate_to(&mut self, n: i32) {
-        // Clamp once, here. Every store's `truncate_to` clamps internally too,
-        // but keeping it at the dispatch point means a negative `n` cannot leave
-        // the two axes of one codec disagreeing about their length if an arm is
-        // ever written to compute from `n` before delegating.
+        // Clamp the negative case once, here, so no arm can compute from a
+        // negative `n` before delegating.
+        //
+        // The upper clamp is NOT uniform, and the divergence is worth naming
+        // rather than papering over. The turbo / planar / affine stores clamp
+        // `n` down to their own `shape[2]` (`storage::clamp_truncate_target`);
+        // the rotor / iso stores deliberately do not, because they abort loudly
+        // on an over-long target instead. So for `n > shape[2]` the mixed arms
+        // leave the two axes of one codec at different lengths: `IsoV3`,
+        // `IsoV4`, `RotorV3`, `RotorV4` (affine K clamps, codec V does not) and
+        // `RotorKAsym3` / `RotorKAsym4` (rotor K does not, affine V does). That
+        // matters on spill, where the layer geometry is derived from the K shape
+        // while the V payload is written raw — the reconciliation guard on the
+        // unclamped side is what surfaces it.
         let n = n.max(0);
         match self {
             Self::K8V4 { k, v, .. } => {

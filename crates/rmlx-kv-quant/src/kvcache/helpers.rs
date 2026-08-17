@@ -88,22 +88,27 @@ impl KvCache {
 impl KvCache {
     /// Dequant the V side of the cache to flat f32 (CPU paths only).
     ///
-    /// Companion of [`Self::probe_k_dequant`], and `pub` for the same reason:
-    /// the SSD round-trip tests live in `rmlx-kv-ssd` and a `#[cfg(test)]` gate
-    /// does not cross a crate boundary. It exists because the K probe alone
-    /// cannot see the V-side codecs — `QuantV`, `QuantPlanarV` and the iso /
-    /// rotor V stores — which is where the block-accumulating payload lives for
-    /// most quants.
+    /// Companion of [`Self::probe_k_dequant`], and `pub` for the same reason
+    /// that one is: it centralises the per-variant V dispatch so the SSD
+    /// round-trip tests in `rmlx-kv-ssd` — and any future codec added to them —
+    /// do not each re-derive which field holds V. (A caller *could* match on
+    /// `KvCache::storage()` locally, which is already `pub`; that is not the
+    /// justification. The justification is one dispatch, not four.) The K probe
+    /// alone cannot see the V-side codecs — `QuantV`, `QuantPlanarV` and the
+    /// iso / rotor V stores — which is where the block-accumulating payload
+    /// lives for most quants.
     ///
-    /// Returns `None` for variants whose V axis has no CPU dequant of its own:
-    /// the K-only families (`PlanarK`, `IsoKOnly*`, `RotorKOnly*`) keep V as
-    /// bf16 on the parent cache, and `None` / `Mixed` / `Paged` hold no
-    /// per-axis quant store.
-    #[allow(
-        clippy::unwrap_used,
-        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
-    )]
-    pub fn probe_v_dequant(&self, device: Device) -> Option<Vec<f32>> {
+    /// The two failure modes are kept apart on purpose:
+    ///
+    /// * `None` — this variant has no CPU-dequantizable V store at all. The
+    ///   K-only families (`PlanarK`, `IsoKOnly*`, `RotorKOnly*`) keep V as bf16
+    ///   on the parent cache; `None` / `Mixed` / `Paged` hold no per-axis quant
+    ///   store; and an un-initialised axis is `v: None`.
+    /// * `Some(Err(..))` — the store exists and its dequant refused, which is
+    ///   what the blocks-vs-`shape[2]` coverage check returns. Collapsing that
+    ///   into `None` would report "no V buffer" for the one failure mode the
+    ///   truncation work actually introduces.
+    pub fn probe_v_dequant(&self, device: Device) -> Option<Result<Vec<f32>>> {
         match &self.storage {
             // V is a `QuantV` (TurboQuant, any bit width).
             KvStorage::K8V4 { v, .. }
@@ -116,32 +121,41 @@ impl KvCache {
             | KvStorage::RotKTq4V { v, .. }
             | KvStorage::RotorKAsym3 { v, .. }
             | KvStorage::RotorKAsym4 { v, .. } => {
-                let (flat, _) = v.as_ref()?.dequantize_choice(device, Dtype::F32).ok()?;
-                Some(flat)
+                let v = v.as_ref()?;
+                Some(
+                    v.dequantize_choice(device, Dtype::F32)
+                        .map(|(flat, _)| flat),
+                )
             }
             // V is a second `QuantK` (affine q8_0 on both axes).
             KvStorage::K8V8 { v, .. } => {
-                let (flat, _) = v.as_ref()?.dequantize_choice(device, Dtype::F32).ok()?;
-                Some(flat)
+                let v = v.as_ref()?;
+                Some(
+                    v.dequantize_choice(device, Dtype::F32)
+                        .map(|(flat, _)| flat),
+                )
             }
             // V is a `QuantPlanarV`.
             KvStorage::Planar { v, .. } => {
-                let (flat, _) = v.as_ref()?.dequantize_choice(device, Dtype::F32).ok()?;
-                Some(flat)
+                let v = v.as_ref()?;
+                Some(
+                    v.dequantize_choice(device, Dtype::F32)
+                        .map(|(flat, _)| flat),
+                )
             }
             // Iso / rotor V stores expose `dequant()` rather than the
             // device-choosing pair.
             KvStorage::IsoV3 { v, .. } | KvStorage::IsoSym3 { v, .. } => {
-                Some(v.as_ref()?.dequant().ok()?)
+                Some(v.as_ref()?.dequant())
             }
             KvStorage::IsoV4 { v, .. } | KvStorage::IsoSym4 { v, .. } => {
-                Some(v.as_ref()?.dequant().ok()?)
+                Some(v.as_ref()?.dequant())
             }
             KvStorage::RotorV3 { v, .. } | KvStorage::RotorSym3 { v, .. } => {
-                Some(v.as_ref()?.dequant().ok()?)
+                Some(v.as_ref()?.dequant())
             }
             KvStorage::RotorV4 { v, .. } | KvStorage::RotorSym4 { v, .. } => {
-                Some(v.as_ref()?.dequant().ok()?)
+                Some(v.as_ref()?.dequant())
             }
             // V is bf16 on the parent cache, or there is no per-axis store.
             KvStorage::PlanarK { .. }
