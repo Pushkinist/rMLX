@@ -508,9 +508,12 @@ impl QuantIsoV3 {
     /// No-op when the ring was never allocated. Every path that pushes a CPU
     /// block onto a store whose ring may be live goes through here: without it
     /// the pushed block is the *only* block, `blocks` no longer cover
-    /// `shape[2]`, and the ring left behind is stale — the next ring append
-    /// would write past its filled region and `dequant` would read a gap the
-    /// ring's fill watermark then refuses.
+    /// `shape[2]`, and the ring left behind is stale. A *read* of that state is
+    /// refused by the ring's fill watermark; an *append* onto it is refused by
+    /// [`QuantKGpuRing::append_encoded`]'s `prev_seq > filled` guard, because
+    /// the write would otherwise zero `[filled, prev_seq)` and then commit a
+    /// watermark that covers it. Both directions have to refuse, or the state
+    /// is only unreachable by convention.
     ///
     /// `disposition` is a parameter because it is the one thing the two callers
     /// disagree on, and having them disagree by carrying separate copies of this

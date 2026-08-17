@@ -174,6 +174,27 @@ impl QuantKGpuRing {
             )));
         }
 
+        // The watermark is a contiguous prefix, not a set. Appending at
+        // `prev_seq` when the ring only holds `filled` positions leaves
+        // `[filled, prev_seq)` as the allocation's zeros, and the
+        // `self.filled = needed` below would then advertise that gap as written
+        // — after which no reader can tell the difference, so the flash-decode
+        // kernel attends a zeroed K/V hole with no error. Enforcing the
+        // watermark on reads alone leaves exactly that state reachable one
+        // append later. A caller whose blocks outgrew the ring must `clear()`
+        // (which every `*_sync_ring` does) or reseed first. Checked before the
+        // alloc/grow below so a rejected append allocates nothing.
+        if self.is_allocated() && prev_seq > self.filled {
+            return Err(Error::Quant(format!(
+                "QuantKGpuRing::append_encoded: prev_seq={prev_seq} exceeds filled={filled} \
+                 (capacity={capacity}) — the ring is stale, so this append would leave \
+                 [{filled}, {prev_seq}) zeroed and then mark it written; clear() the ring \
+                 or reseed it from the CPU blocks first",
+                filled = self.filled,
+                capacity = self.capacity
+            )));
+        }
+
         if !self.is_allocated() {
             // Allocating here and writing only `[prev_seq, needed)` would leave
             // `[0, prev_seq)` zeroed — attention over a zeroed prefix, silently
@@ -437,13 +458,13 @@ fn page_round(needed: i32, max_seq: i32) -> i32 {
 fn regrow(
     old: Option<Array>,
     new_len: i32,
-    filled: i32,
+    copy_seq: i32,
     dtype: Dtype,
     what: &str,
     device: Device,
 ) -> Result<Array> {
     let fresh = zeros(&[new_len], dtype, device)?;
-    if filled <= 0 {
+    if copy_seq <= 0 {
         return Ok(fresh);
     }
     let old = old.ok_or_else(|| {
@@ -451,8 +472,8 @@ fn regrow(
             "QuantKGpuRing::grow: {what} buffer vanished mid-grow (internal invariant)"
         ))
     })?;
-    let prefix = old.slice(&[0], &[filled], &[1], device)?;
-    fresh.slice_update(&prefix, &[0], &[filled], &[1], device)
+    let prefix = old.slice(&[0], &[copy_seq], &[1], device)?;
+    fresh.slice_update(&prefix, &[0], &[copy_seq], &[1], device)
 }
 
 /// `slice_update` `src` into `buf[start..stop]`.
