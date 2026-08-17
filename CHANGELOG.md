@@ -274,10 +274,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Each golden now names its own snapshot (architecture + slug) and resolves it
   from exactly two variables: `RMLX_KV_TEST_MODEL`, then the slug under
   `RMLX_O_MODELS_ROOT`. The second arms them by default — every `make` target
-  already exports that root, so a machine holding the snapshots runs every
-  golden whose model is on disk, and an operator sets nothing.
-  `make model-check-full MODEL=…` is unchanged: the single-model override still
-  outranks the slug, and the goldens for the other architectures still skip.
+  exports that root when it resolves, so a machine holding the snapshots runs
+  every golden whose model is on disk, and an operator sets nothing.
+
+  The override applies **only to the golden whose architecture it serves**;
+  pointed elsewhere, resolution falls through to the slug instead of standing
+  the golden down. `RMLX_KV_TEST_MODEL` is not a golden-only variable —
+  `gemma4_kv_cache_equivalence.rs`, `cli_flags_e2e.rs` and `projects_toml_e2e.rs`
+  all require it, typically at a Gemma4 path — so a plain override-wins rule
+  would have left four of the five goldens silently disarmed for any developer
+  with it exported, which is the original defect surviving for exactly the
+  developer who most needs these gates. Ranking the slug first instead would
+  break the other direction: `RMLX_REGEN_GOLDENS=1 RMLX_KV_TEST_MODEL=<path>`
+  would record the fixture from the slug snapshot and ignore the named one.
+  `make model-check-full MODEL=…` therefore covers at least the named model,
+  and more on a machine with a populated root.
 
   The per-architecture `RMLX_TEST_MODEL_*` family is deliberately **not** a
   third source. Those variables mean "a snapshot of this family" for the smoke,
@@ -294,20 +305,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   benefits from too.
 
   Absence and misconfiguration are no longer the same outcome. Nothing
-  configured, or a models root that does not hold the slug, still **skips** — a
-  developer without the weights cannot run the gate, and the Makefile's
-  repo-local `models/` fallback need not exist. `RMLX_KV_TEST_MODEL` naming a
-  path that is not a snapshot directory, or a slug resolving to a snapshot of
-  the wrong architecture, now **fails**: skipping on a stale or typo'd export is
-  how a wrong pointer reports success without asserting anything.
+  configured, an existing models root that does not hold the slug, or a
+  half-written snapshot under it still **skips** — a developer without the
+  weights cannot run the gate, and an interrupted download is an absence rather
+  than a wrong pointer. `RMLX_KV_TEST_MODEL` naming a path that is not a
+  runnable snapshot, `RMLX_O_MODELS_ROOT` set to something that is not an
+  existing directory, and a slug resolving to a snapshot of the wrong
+  architecture all now **fail**: skipping on a stale or typo'd export is how a
+  wrong pointer reports success without asserting anything, and a mistyped root
+  disarms all five gates at once.
+
+  "Runnable" means every file the harness opens by name — `config.json` **and**
+  `tokenizer.json`. `config.json` alone is the first file a download writes, so
+  accepting it let an interrupted transfer resolve and then panic several frames
+  later at an `expect`, which also inverted the intended asymmetry: a fully
+  missing directory was a benign skip while a half-present one was fatal.
 
   `crates/rmlx-models/tests/common/snapshot_tests.rs` pins the whole table
-  weights-free (14 cases): both arms of the lookup order, the empty-variable
-  spelling of "unset", and every run / skip / fail verdict. Verified by
-  mutation — deleting the models-root arm, collapsing misconfiguration into
-  absence, collapsing a slug arch mismatch into a skip, and promoting
-  root-relative absence into a failure each turn only the cases that claim them
-  red.
+  weights-free (21 cases): both probes, every arm of the choice including the
+  arch fall-through, the empty-variable spelling of "unset", the three
+  partial-snapshot shapes, and the decision-to-return mapping with a
+  `#[should_panic]` case over the `Fail` edge. Verified by mutation — ranking the
+  slug first, deleting the fall-through, accepting a config-only directory,
+  demoting a bad root to absence, and making the return mapping swallow `Fail`
+  each turn only the cases that claim them red.
+
+  Two Makefile defects fed this and are fixed with it. `model-check-full`
+  guarded `MODEL` with `test -n`, which could never fire because `MODEL` has an
+  unconditional default; on a machine lacking that snapshot the target
+  fabricated a path and forwarded it as `RMLX_KV_TEST_MODEL`, which the harness
+  correctly reads as an operator naming a snapshot. It now guards the path. And
+  `RMLX_O_MODELS_ROOT` was exported unconditionally, including a repo-local
+  `models/` fallback that need not exist, handing every child a root that was
+  never there; it is now exported only when it resolves. `model-check-full` also
+  ran four of the five goldens — `medgemma_golden_tokens` was missing from the
+  list.
 
   `bonsai_8b_mixed_k8g64_v4g64.golden.txt` is **not** regenerated here. It has
   not been touched since the 0.1.0 squash and is under suspicion of being stale;

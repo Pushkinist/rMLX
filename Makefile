@@ -28,7 +28,15 @@ O_MODELS_ROOT ?= $(RMLX_O_MODELS_ROOT)
 ifeq ($(strip $(O_MODELS_ROOT)),)
 O_MODELS_ROOT := $(REPO_ROOT)/models
 endif
+# Export only a root that exists. Exporting the fallback unconditionally handed
+# every child a path that was never there, which readers cannot distinguish from
+# a root the operator meant — the golden-token harness treats a set-but-absent
+# root as a misconfiguration, and a fabricated one would fail every golden on a
+# machine that simply has no models. An operator's own export still reaches the
+# children untouched, so a genuinely wrong value is still reported as wrong.
+ifneq ($(wildcard $(O_MODELS_ROOT)/.),)
 export RMLX_O_MODELS_ROOT := $(O_MODELS_ROOT)
+endif
 
 # Primary test model. Override at the CLI: make info MODEL=/path/to/other-snapshot
 MODEL ?= $(O_MODELS_ROOT)/mlx-community__gemma-4-e4b-it-mxfp8
@@ -254,33 +262,39 @@ model-check:     ## cargo test -p rmlx-{models,runtime,quant,kv-quant} (no serve
 # model-check-full: run the model-logic unit tests (same as model-check) PLUS the
 # per-arch golden-token integration tests, pinned to ONE model.
 #
-# MODEL is forwarded as RMLX_KV_TEST_MODEL, which the golden harness treats as a
-# single-model override: it outranks the slug lookup under RMLX_O_MODELS_ROOT
-# (the only other source it reads). Each golden reads <MODEL>/config.json,
-# extracts the `architectures` field, and skips gracefully (prints "SKIP <test>: ...",
-# returns green) when the model does not match the arch it was recorded against. The
-# matching golden runs the full 32-token assertion; the others skip. The whole target
-# is GREEN for any single valid test-target model.
+# MODEL is forwarded as RMLX_KV_TEST_MODEL, the golden harness's single-model
+# override. It applies to the ONE golden whose architecture it serves: that golden
+# runs the full 32-token assertion against <MODEL>. The others do not stand down —
+# each falls through to its own slug under RMLX_O_MODELS_ROOT and runs if that
+# snapshot is present, or skips if it is not. So this target covers at least the
+# named model, and more on a machine with a populated models root.
 #
-# To run EVERY golden whose snapshot is on disk instead of just one, leave
-# RMLX_KV_TEST_MODEL unset and use `make gpu-test` — the goldens resolve their own
-# snapshot by slug under the RMLX_O_MODELS_ROOT this Makefile already exports.
+# To run the goldens with no model pinned at all, use `make gpu-test`, which runs
+# every #[ignore] GPU test including these.
 #
 # Avoid --include-ignored here: the lib's own #[ignore] tests (kv-cache equivalence)
-# require a matching model + Metal context and segfault on arch mismatch. The four
+# require a matching model + Metal context and segfault on arch mismatch. The five
 # golden tests are integration test binaries (tests/*.rs) named explicitly below.
+#
+# The guard checks the PATH, not the variable. MODEL has an unconditional default
+# (see its definition above), so a `-n` test could never fire, and the default
+# names a snapshot the machine need not have. That fabricated path is then
+# forwarded as RMLX_KV_TEST_MODEL, which the golden harness reads as an operator
+# naming a snapshot — a misconfiguration, failing every golden — when nobody named
+# anything. Refusing up front, with the path in the message, is the honest form.
 #
 # Examples:
 #   make model-check-full MODEL=/path/to/prism-ml__Ternary-Bonsai-8B-mlx-2bit
 #   make model-check-full MODEL=/path/to/mlx-community__gemma-4-e4b-it-mxfp8
-model-check-full: ## run model-logic crates + golden-token integration tests (MODEL= required; matching arch runs+passes, others skip — target is green for any single test-target model)
-	@test -n "$(MODEL)" || { echo "MODEL is required: make model-check-full MODEL=/path/to/snapshot"; exit 1; }
+model-check-full: ## run model-logic crates + golden-token integration tests (MODEL= must name an existing snapshot; matching arch runs+passes, others fall through to their own slug or skip)
+	@test -d "$(MODEL)" || { echo "model-check-full: MODEL must name an existing snapshot directory."; echo "  got: $(MODEL)"; echo "  usage: make model-check-full MODEL=/path/to/snapshot"; exit 1; }
 	cargo test -p rmlx-models -p rmlx-runtime -p rmlx-quant
 	RMLX_KV_TEST_MODEL="$(MODEL)" cargo test -p rmlx-models \
 	  --test bonsai_golden_tokens \
 	  --test gemma4_golden_tokens \
 	  --test qwen3_golden_tokens \
 	  --test bitnet_golden_tokens \
+	  --test medgemma_golden_tokens \
 	  -- --ignored
 
 # e2e: the feature-proof harness — drives the REAL rmlx binary per manifest case

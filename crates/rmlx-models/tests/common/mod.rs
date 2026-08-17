@@ -37,16 +37,25 @@
 //! ## Snapshot resolution
 //!
 //! Each golden covers ONE architecture and names its own snapshot by slug.
-//! Two sources, in order:
+//! Two sources:
 //!
-//! 1. `RMLX_KV_TEST_MODEL` — one model for a whole run. Goldens for the other
-//!    architectures skip, which is what makes it usable at all.
+//! 1. `RMLX_KV_TEST_MODEL`, **but only for the golden whose architecture it
+//!    serves**. Pointed at another architecture it is not a statement about
+//!    this golden, and resolution falls through to the slug rather than
+//!    standing the golden down.
 //! 2. the golden's snapshot slug under `RMLX_O_MODELS_ROOT`.
 //!
 //! Step 2 is what arms these gates by default: every `make` target exports
-//! `RMLX_O_MODELS_ROOT`, so a machine holding the snapshots runs every golden
-//! whose model is on disk, instead of at most the one `RMLX_KV_TEST_MODEL`
-//! happens to name.
+//! `RMLX_O_MODELS_ROOT` when it resolves, so a machine holding the snapshots
+//! runs every golden whose model is on disk, instead of at most the one
+//! `RMLX_KV_TEST_MODEL` happens to name.
+//!
+//! The fall-through in step 1 matters because `RMLX_KV_TEST_MODEL` is not a
+//! golden-only variable: `gemma4_kv_cache_equivalence.rs`, `cli_flags_e2e.rs`
+//! and `projects_toml_e2e.rs` all require it. A developer who exports it for
+//! those — typically at a Gemma4 path — would otherwise disarm four of the five
+//! goldens on every run, which is the original defect surviving for exactly the
+//! developer who most needs these gates.
 //!
 //! The per-architecture `RMLX_TEST_MODEL_*` family is deliberately NOT consulted
 //! here, even though several of these snapshots have one. Those variables mean
@@ -92,30 +101,17 @@ pub struct GoldenModel {
     pub archs: &'static [&'static str],
 }
 
-/// Which configuration produced a snapshot path. This decides whether an arch
-/// mismatch is benign: `SINGLE_MODEL_VAR` names one model for a run of
-/// per-arch goldens, so most of them are expected not to match it. The slug
-/// names THIS golden's snapshot, so a mismatch there is a wrong pointer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Source {
-    SingleModelOverride,
-    ModelsRoot,
-}
-
-/// Outcome of the snapshot lookup.
+/// Outcome of probing one source.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Snapshot {
-    Found {
-        path: PathBuf,
-        from: Source,
-    },
+    Found(PathBuf),
     /// Nothing on this machine points at the snapshot.
     Absent(String),
-    /// A variable names a directory that is not a snapshot.
+    /// Configuration is present and wrong.
     Misconfigured(String),
 }
 
-/// What the caller must do with a lookup result.
+/// What the caller must do with a resolution.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Gate {
     Run(PathBuf),
@@ -123,85 +119,158 @@ pub enum Gate {
     Fail(String),
 }
 
-/// A directory is a snapshot when it carries the config every loader reads.
+/// The files [`run_golden_test`] opens by name. "Found" has to mean "runnable",
+/// or a half-written snapshot resolves and then panics several frames later at
+/// an `expect`. `config.json` alone is not enough: it is the first file a
+/// download writes, so an interrupted one leaves exactly that shape on disk.
+const SNAPSHOT_FILES: [&str; 2] = ["config.json", "tokenizer.json"];
+
+/// A directory is a snapshot when it carries every file the harness consumes.
 fn is_snapshot_dir(dir: &Path) -> bool {
-    dir.join("config.json").is_file()
+    SNAPSHOT_FILES.iter().all(|f| dir.join(f).is_file())
 }
 
-/// Resolve one golden's snapshot from the two configuration values, without
-/// reading the environment — the caller passes them in so this stays a pure
-/// function over a directory tree.
-pub fn pick_snapshot(
-    single_model: Option<&str>,
-    models_root: Option<&str>,
-    slug: &str,
-) -> Snapshot {
-    // An exported-but-empty variable is how a shell spells "unset"; treating it
-    // as a path yields a nonsense lookup at the filesystem root.
-    if let Some(p) = single_model.filter(|p| !p.is_empty()) {
-        let path = PathBuf::from(p);
-        if is_snapshot_dir(&path) {
-            return Snapshot::Found {
-                path,
-                from: Source::SingleModelOverride,
-            };
-        }
-        return Snapshot::Misconfigured(format!(
-            "{SINGLE_MODEL_VAR}={p} does not name a snapshot directory (no config.json in it)"
-        ));
-    }
+/// Name the first required file that is missing, for a diagnosis that says what
+/// to look at rather than just "not a snapshot".
+fn missing_file(dir: &Path) -> &'static str {
+    SNAPSHOT_FILES
+        .iter()
+        .find(|f| !dir.join(f).is_file())
+        .copied()
+        .unwrap_or("(nothing)")
+}
 
-    if let Some(root) = models_root.filter(|r| !r.is_empty()) {
-        let path = PathBuf::from(root).join(slug);
-        if is_snapshot_dir(&path) {
-            return Snapshot::Found {
-                path,
-                from: Source::ModelsRoot,
-            };
-        }
-        // A models root is a bulk convenience — nobody holds every snapshot,
-        // and the Makefile points it at a repo-local `models/` dir that need
-        // not exist. Absence under it is not a misconfiguration.
+/// Probe `RMLX_KV_TEST_MODEL`. `None` when it is unset — an exported-but-empty
+/// variable is how a shell spells that, and treating it as a path yields a
+/// nonsense lookup at the filesystem root.
+///
+/// A value that does not name a runnable snapshot is [`Snapshot::Misconfigured`]:
+/// the operator named this path, so a typo or a moved snapshot must break the
+/// run rather than skip it.
+pub fn override_snapshot(single_model: Option<&str>) -> Option<Snapshot> {
+    let p = single_model.filter(|p| !p.is_empty())?;
+    let path = PathBuf::from(p);
+    if is_snapshot_dir(&path) {
+        return Some(Snapshot::Found(path));
+    }
+    Some(Snapshot::Misconfigured(format!(
+        "{SINGLE_MODEL_VAR}={p} is not a runnable snapshot directory (no {} in it)",
+        missing_file(&path)
+    )))
+}
+
+/// Probe `<RMLX_O_MODELS_ROOT>/<slug>`.
+///
+/// A root that is set but is not an existing directory is
+/// [`Snapshot::Misconfigured`] — one keystroke there disarms every golden at
+/// once, which is the widest blast radius in this harness and the last thing
+/// that should report success by skipping. An existing root that simply does
+/// not hold this slug is [`Snapshot::Absent`]: nobody holds every snapshot.
+pub fn slug_snapshot(models_root: Option<&str>, slug: &str) -> Snapshot {
+    let Some(root) = models_root.filter(|r| !r.is_empty()) else {
         return Snapshot::Absent(format!(
-            "{slug} is not under {MODELS_ROOT_VAR}={root}; put the snapshot (or a \
-             symlink to it) there, or name it with {SINGLE_MODEL_VAR} for a single run"
+            "no snapshot configured — set {MODELS_ROOT_VAR} (holding {slug}) or {SINGLE_MODEL_VAR}"
+        ));
+    };
+    let root_path = Path::new(root);
+    if !root_path.is_dir() {
+        return Snapshot::Misconfigured(format!(
+            "{MODELS_ROOT_VAR}={root} is not an existing directory"
         ));
     }
-
+    let path = root_path.join(slug);
+    if is_snapshot_dir(&path) {
+        return Snapshot::Found(path);
+    }
     Snapshot::Absent(format!(
-        "no snapshot configured — set {MODELS_ROOT_VAR} (holding {slug}) or {SINGLE_MODEL_VAR}"
+        "{MODELS_ROOT_VAR}={root} does not hold a runnable {slug} (no {} in it); put the \
+         snapshot, or a symlink to it, there",
+        missing_file(&path)
     ))
 }
 
-/// Turn a lookup result plus the resolved snapshot's `architectures[0]` into a
-/// run / skip / fail decision. `arch` is only consulted for [`Snapshot::Found`].
-pub fn gate(snapshot: Snapshot, arch: &str, model: &GoldenModel) -> Gate {
-    match snapshot {
-        Snapshot::Found { path, from } => {
-            if model.archs.contains(&arch) {
+/// Decide from both probes and the architecture read off each resolved path.
+/// `over_arch` / `slug_arch` are only consulted for the matching
+/// [`Snapshot::Found`]; pass anything for the others.
+///
+/// The override wins **only for the golden it can serve**. Pointed at another
+/// architecture it is not a statement about this golden, so resolution falls
+/// through to the slug instead of standing down: `RMLX_KV_TEST_MODEL` is
+/// required by the KV-equivalence, CLI-flag and projects-toml suites, and a
+/// developer with it exported would otherwise silently disarm every golden but
+/// one — reinstating the defect this harness exists to close, for exactly the
+/// developer who most needs these gates.
+///
+/// Ranking the slug first instead would be wrong in the other direction: it
+/// makes `RMLX_REGEN_GOLDENS=1 RMLX_KV_TEST_MODEL=<path>` record the fixture
+/// from the slug snapshot while silently ignoring the named one.
+pub fn choose(
+    over: Option<Snapshot>,
+    over_arch: &str,
+    slug: Snapshot,
+    slug_arch: &str,
+    model: &GoldenModel,
+) -> Gate {
+    let expected = model.archs;
+    let mut stood_down = None;
+    match over {
+        Some(Snapshot::Found(path)) => {
+            if expected.contains(&over_arch) {
                 return Gate::Run(path);
             }
-            let expected = model.archs;
-            let shown = path.display();
-            match from {
-                // One model for a whole run of per-arch goldens: the goldens
-                // for the other architectures are meant to stand down.
-                Source::SingleModelOverride => Gate::Skip(format!(
-                    "{SINGLE_MODEL_VAR} names arch \"{arch}\", this golden covers {expected:?}"
-                )),
-                Source::ModelsRoot => Gate::Fail(format!(
-                    "{shown} (slug {}) has arch \"{arch}\", not one of {expected:?}",
-                    model.slug
-                )),
-            }
+            stood_down = Some(format!(
+                "{SINGLE_MODEL_VAR} names arch \"{over_arch}\", which this golden does not cover"
+            ));
         }
-        Snapshot::Absent(why) => Gate::Skip(why),
+        // `override_snapshot` reports unset as `None`, so either other outcome
+        // means the operator named something the harness cannot run.
+        Some(Snapshot::Misconfigured(why) | Snapshot::Absent(why)) => return Gate::Fail(why),
+        None => {}
+    }
+
+    match slug {
+        Snapshot::Found(path) => {
+            if expected.contains(&slug_arch) {
+                return Gate::Run(path);
+            }
+            Gate::Fail(format!(
+                "{} (slug {}) has arch \"{slug_arch}\", not one of {expected:?}",
+                path.display(),
+                model.slug
+            ))
+        }
         Snapshot::Misconfigured(why) => Gate::Fail(why),
+        Snapshot::Absent(why) => Gate::Skip(match stood_down {
+            Some(note) => format!("{why}; {note}"),
+            None => why,
+        }),
+    }
+}
+
+/// Turn a decision into what [`model_for`] returns. Split out so the
+/// `Fail` → `panic!` edge is covered by a test rather than only by a hand-run
+/// invocation: it is the step that makes a wrong pointer visible at all.
+pub fn apply(gate: Gate, test_name: &str) -> Option<PathBuf> {
+    match gate {
+        Gate::Run(path) => Some(path),
+        Gate::Skip(why) => {
+            eprintln!("SKIP {test_name}: {why}");
+            None
+        }
+        Gate::Fail(why) => panic!("{test_name}: {why}"),
     }
 }
 
 /// Read the first entry of the `architectures` array from `<model_dir>/config.json`.
-/// Returns an empty string on any parse failure so callers can treat it as a mismatch.
+///
+/// Returns an empty string when the file is missing or unparseable, which no
+/// golden's expected-arch list contains, so callers read it as a mismatch. The
+/// two callers then diverge on purpose, and the split is worth knowing:
+/// [`choose`] turns a mismatch on a path THIS golden named into a hard failure,
+/// while [`skip_if_arch_mismatch`] — used by suites that resolve their own
+/// per-architecture path — reports a skip. A golden pins one checkpoint's bytes
+/// and an unreadable config there means its own snapshot is broken; those suites
+/// are handed a path chosen for another architecture as a matter of course.
 pub fn model_arch(model_dir: &Path) -> String {
     let cfg_path = model_dir.join("config.json");
     let Ok(data) = std::fs::read(&cfg_path) else {
@@ -241,19 +310,17 @@ pub fn skip_if_arch_mismatch(model_dir: &Path, test_name: &str, expected: &[&str
 pub fn model_for(model: &GoldenModel, test_name: &str) -> Option<PathBuf> {
     let single = std::env::var(SINGLE_MODEL_VAR).ok();
     let root = std::env::var(MODELS_ROOT_VAR).ok();
-    let snapshot = pick_snapshot(single.as_deref(), root.as_deref(), model.slug);
-    let arch = match &snapshot {
-        Snapshot::Found { path, .. } => model_arch(path),
+
+    let over = override_snapshot(single.as_deref());
+    let slug = slug_snapshot(root.as_deref(), model.slug);
+    let arch_of = |s: &Snapshot| match s {
+        Snapshot::Found(path) => model_arch(path),
         _ => String::new(),
     };
-    match gate(snapshot, &arch, model) {
-        Gate::Run(path) => Some(path),
-        Gate::Skip(why) => {
-            eprintln!("SKIP {test_name}: {why}");
-            None
-        }
-        Gate::Fail(why) => panic!("{test_name}: {why}"),
-    }
+    let over_arch = over.as_ref().map(&arch_of).unwrap_or_default();
+    let slug_arch = arch_of(&slug);
+
+    apply(choose(over, &over_arch, slug, &slug_arch, model), test_name)
 }
 
 /// Number of decode tokens to compare. 32 is enough to catch a divergence
