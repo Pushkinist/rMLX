@@ -637,7 +637,16 @@ fn cross_thread_eval_resolves_through_the_process_global_encoder_map() {
     assert_eq!(bytes_to_f32(&bytes), vec![4.0f32, 6.0]);
 }
 
-/// Regression gate for the process-global CPU command-encoder map race.
+/// **A reproducer, not a gate.** Read the power figure below before treating a
+/// green run here as evidence of anything: without the lock this fails about
+/// **1 run in 12** (15 failures in 180 runs, measured), so eleven times out of
+/// twelve it would go green with the defect fully present. The gate for this
+/// defect is `make check-eval-lock`, which is deterministic. What this test
+/// adds is an executable demonstration of the mechanism, and a small standing
+/// chance of catching a *semantic* break that a text gate cannot see. To get
+/// real power out of it, run it across many fresh processes — see
+/// `make eval-lock-stress`; repeating the burst inside one process does not
+/// work, because the map only starts cold once.
 ///
 /// The linked MLX resolves a CPU stream's `CommandEncoder` through a
 /// process-global `std::unordered_map<int, CommandEncoder>` that it fills
@@ -656,29 +665,36 @@ fn cross_thread_eval_resolves_through_the_process_global_encoder_map() {
 /// count it grows through, and starting from empty is what puts *all* of those
 /// rehashes inside a single window with hundreds of inserts in flight.
 ///
-/// It passes only because `Array::eval` / `Array::async_eval` hold
-/// `EVAL_LOCK` across the FFI call. Drop that and it crashes the binary.
+/// It passes only because `Array::eval` / `Array::async_eval` evaluate under
+/// `with_eval_lock`. Drop that and it fails as SIGSEGV, SIGTRAP, or an
+/// infinite spin on a bucket chain that became circular — all three were
+/// observed.
 ///
-/// Two honest limits on this as a gate. It is **probabilistic** — measured at
-/// roughly one crash in twenty runs without the lock, so a single green run is
-/// weak evidence and a regression would surface as a rare `make ci` SIGSEGV
-/// rather than a reliable failure. And it covers the **CPU** evaluation path
-/// only: concurrent *GPU* evaluation is not exercised (those tests carry
-/// `#[ignore]` and run serialised), nor are races inside lazy graph
-/// *construction*, which never reaches `eval`.
+/// Scope: the **CPU** evaluation path only. Concurrent *GPU* evaluation is not
+/// exercised (those tests carry `#[ignore]` and run serialised), nor are races
+/// inside lazy graph *construction*, which never reaches `eval`.
 #[test]
 #[allow(
     clippy::needless_collect,
     reason = "the collect is the concurrency: it spawns every thread before the first join, \
               whereas a lazy iterator would spawn and join one at a time and never overlap them"
 )]
-fn concurrent_first_eval_across_threads_does_not_corrupt_encoder_map() {
+fn concurrent_first_eval_reproducer() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
 
-    // Each thread mints one MLX CPU stream and MLX backs every stream with an
-    // OS thread of its own, so this is charged twice against the process thread
-    // limit — still two orders of magnitude below it.
+    // Cost of this number, measured rather than estimated: the binary peaks at
+    // 412 threads running this test versus 4 without it, and MLX 0.31.2 has no
+    // stream-reclaim path, so the streams minted here — and the OS threads
+    // behind them — persist for the life of the test binary. The whole crate
+    // suite peaks at 446 and is still holding ~436 when it finishes, i.e. every
+    // later test in this binary runs in a 400-thread process.
+    //
+    // Headroom against `sysctl kern.num_taskthreads` (16384 on this machine) is
+    // ~40x. That is the real ceiling; the ~2 048 figure this crate used to cite
+    // is unverified, and against it the margin would be only ~5x. Both are
+    // survivable, neither is "two orders of magnitude" — an earlier revision of
+    // this comment claimed that and was wrong in the unsafe direction.
     const THREADS: usize = 400;
 
     // A barrier alone leaves the threads spread over the condvar wake-up. Park

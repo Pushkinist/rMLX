@@ -95,24 +95,42 @@ thread_local! {
 // `thread_local`; we do not pin that version (it ships no NAX GEMM kernels),
 // and the lock is harmless there in any case.
 //
-// The lock is held only across the FFI call itself, never across
-// `check_status` — error capture is thread-local, so it needs no protection.
-// Cost is one uncontended mutex acquire per evaluation, against an FFI call
-// that walks a graph and dispatches work; rMLX runs inference on one thread at
-// a time by design, so the lock is a guard against a crash rather than a
-// throughput bottleneck.
+// Cost is one uncontended mutex acquire + release per evaluation — a CAS and a
+// release store, tens of nanoseconds — against an FFI call that walks a graph
+// and dispatches work in microseconds or more. rMLX runs inference on one
+// thread at a time by design, so the lock is a guard against a crash rather
+// than a throughput bottleneck.
+//
+// **Which C entry points need it.** Not just the two rMLX calls today: every
+// mlx-c function that reaches `mlx::core::eval_impl` touches the same map. In
+// the generated bindings that is `mlx_array_eval`, `mlx_async_eval`,
+// `mlx_eval`, and all 14 `mlx_array_item_*` (each goes through
+// `array::item<T>()`, which calls `eval()` — `mlx/array.h`). The data
+// accessors `mlx_array_data_*` do *not* evaluate and need no lock. Only the
+// first two are called here; the other 15 are one call away, and adding one
+// unguarded silently reinstates this defect. `make check-eval-lock` fails the
+// build on that, because a doc sentence is not a gate.
 static EVAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Acquire the process-wide evaluation lock.
+/// Run `f` holding the process-wide evaluation lock.
+///
+/// Takes a closure rather than returning the guard on purpose: a
+/// `MutexGuard`-returning helper is only correct if every caller binds it to a
+/// named local, and `let _ = acquire();` — which drops the guard *before* the
+/// FFI call and restores the crash — compiles silently, because `#[must_use]`
+/// does not fire on `let _ =`. This signature makes "held across the FFI call
+/// and nothing else" a property of the API instead of a rule callers have to
+/// remember.
 ///
 /// The guarded region is a single FFI call with no Rust code that can panic, so
 /// the mutex cannot actually be poisoned; recovering from `PoisonError` rather
 /// than propagating it keeps a structurally-unreachable state from turning a
 /// later evaluation into a spurious failure.
-fn eval_guard() -> std::sync::MutexGuard<'static, ()> {
-    EVAL_LOCK
+fn with_eval_lock<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = EVAL_LOCK
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    f()
 }
 
 /// Install the thread-local error handler. Called once per process, lazily.
@@ -270,8 +288,8 @@ pub(crate) unsafe fn check_status(status: i32, context: &str) -> Result<()> {
 // on every op invocation. Each call to `mlx_stream_new_device` spawns a new
 // OS worker thread inside MLX. A single Gemma4 forward pass invokes ~42
 // layers × several ops per layer — hundreds of `with_stream` calls per step.
-// After 3–6 decode steps the per-process thread limit (~2 048 on macOS) is
-// exhausted and `pthread_create` returns EAGAIN, manifesting as:
+// After 3–6 decode steps the per-process thread limit is exhausted and
+// `pthread_create` returns EAGAIN, manifesting as:
 //
 // mlx: Array::eval: thread constructor failed: Resource temporarily unavailable
 //
@@ -279,6 +297,15 @@ pub(crate) unsafe fn check_status(status: i32, context: &str) -> Result<()> {
 // return a *reference-counted handle to the already-running default stream*
 // (no new thread). Freeing the handle with `mlx_stream_free` decrements the
 // ref-count — it does NOT tear down the stream or its thread.
+//
+// The ceiling in force at the time of that incident was not recorded; an
+// earlier revision of this comment asserted ~2 048, which is not what this
+// machine reports. Measure before relying on a number:
+// `sysctl kern.num_taskthreads` is the per-task ceiling (16384 here) and
+// `ulimit -u` the per-user process cap. What has not changed is the shape of
+// the bug — MLX never reclaims a stream or the OS thread behind it, so any
+// per-call or per-thread stream creation grows monotonically until it hits
+// whatever the ceiling is.
 
 /// Borrow the process-global default stream for `device`, call `f(stream)`,
 /// release the handle, and return the result.
@@ -879,11 +906,8 @@ impl Array {
     /// `EVAL_LOCK`.
     pub fn eval(&self) -> Result<()> {
         install_error_handler();
-        let status = {
-            let _guard = eval_guard();
-            // SAFETY: inner is a valid mlx_array.
-            unsafe { sys::mlx_array_eval(self.inner) }
-        };
+        // SAFETY: inner is a valid mlx_array.
+        let status = with_eval_lock(|| unsafe { sys::mlx_array_eval(self.inner) });
         // SAFETY: called immediately after the C function on the same thread;
         // the error slot it reads is thread-local, so releasing the evaluation
         // lock first cannot lose or cross-wire a message.
@@ -906,10 +930,7 @@ impl Array {
         install_error_handler();
         // mlx_async_eval takes a vector_array; build a single-element vec.
         let vec = unsafe { sys::mlx_vector_array_new_value(self.inner) };
-        let status = {
-            let _guard = eval_guard();
-            unsafe { sys::mlx_async_eval(vec) }
-        };
+        let status = with_eval_lock(|| unsafe { sys::mlx_async_eval(vec) });
         unsafe { sys::mlx_vector_array_free(vec) };
         unsafe { check_status(status, "Array::async_eval") }
     }

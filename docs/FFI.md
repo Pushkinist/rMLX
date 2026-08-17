@@ -555,27 +555,65 @@ methods trigger execution:
   mlx-lm's `mx.async_eval` pattern in `generate.py`.
 
 **Both are serialised process-wide by `EVAL_LOCK`** (`crates/rmlx-mlx/src/lib.rs`),
-a `Mutex<()>` held across the FFI call and nothing else. MLX evaluation is not
-safe to drive from two threads at once on the pinned 0.31.x: the CPU
-command-encoder table described above is a process-global map filled without
-synchronisation, so two concurrent evaluations rehash it under each other and
-the process takes SIGSEGV inside MLX — no Rust frame at fault, no failing test
-reported, nothing to catch. `cargo test` runs one OS thread per test, which is
-how this reached `make ci` as an intermittent crash of the whole test binary.
+via `with_eval_lock`, which holds the lock across the FFI call and nothing else.
+MLX evaluation is not safe to drive from two threads at once on the pinned
+0.31.x: the CPU command-encoder table described above is a process-global map
+filled without synchronisation, so two concurrent evaluations rehash it under
+each other. The process then dies inside MLX with no Rust frame at fault and
+nothing to catch — observed as SIGSEGV, as SIGTRAP, and as an infinite spin on
+a bucket chain that became circular. libtest names no failing test, because
+none failed. `cargo test` runs one OS thread per test, which is how this
+reached `make ci` as an intermittent crash of a whole test binary.
+
+`with_eval_lock` takes a closure rather than returning a guard on purpose: with
+a guard-returning helper, `let _ = acquire();` would drop the guard before the
+FFI call and silently restore the crash, and `MutexGuard`'s `#[must_use]` does
+not fire on `let _ =`.
 
 Three consequences worth knowing:
 
-- **Cost is one uncontended atomic per evaluation.** rMLX runs inference on one
-  thread at a time by design (and the server has its own `gpu_gate` above that),
-  so the lock is a crash guard, not a throughput bottleneck.
+- **Cost is one uncontended mutex acquire + release per evaluation** — a CAS
+  and a release store, tens of nanoseconds, against an FFI call that walks a
+  graph and dispatches work in microseconds or more. (Order-of-magnitude
+  reasoning, not a measurement; it has not been isolated on a decode bench.)
+  Under contention it would be a futex syscall, but rMLX runs inference on one
+  thread at a time by design and the server holds a 1-permit `gpu_queue` and
+  `gpu_gate` above that, so contention is not the steady state.
 - **`async_eval` still pipelines.** Only the graph walk and dispatch happen
   under the lock; the scheduled work completes after it is released.
 - **The lock is not a licence to evaluate concurrently.** It makes concurrent
   callers correct, not parallel — they serialise.
 
-New FFI entry points that can reach `mlx::core::eval_impl` must take the same
-lock. Today that is exactly `mlx_array_eval` and `mlx_async_eval`; mlx-c's
-data accessors (`mlx_array_data_*`) do not evaluate.
+### Which C entry points need the lock
+
+Every mlx-c function that reaches `mlx::core::eval_impl`, not just the two this
+workspace calls today. From the generated bindings:
+
+| Entry point | Count | Evaluates? | Called here |
+|---|---|---|---|
+| `mlx_array_eval` | 1 | yes | yes, guarded |
+| `mlx_async_eval` | 1 | yes | yes, guarded |
+| `mlx_eval` | 1 | yes | no |
+| `mlx_array_item_*` | 14 | yes — via `array::item<T>()`, which calls `eval()` first (`mlx/array.h`) | no |
+| `mlx_array_data_*` | — | **no**, plain pointer accessors | yes, unguarded and correct |
+
+The fifteen uncalled ones are the live risk: they sit in the bindings one call
+away and read as innocuous, `mlx_array_item_float32` most of all. Adding one
+unguarded reinstates this exact defect, with a signature — whole test binary
+dies, no test named — indistinguishable from the original bug.
+
+**`make check-eval-lock` enforces this**, because a doc sentence is not a gate:
+it fails on any call to `sys::mlx_eval` / `sys::mlx_array_item_*`, and on any
+call to the two guarded entry points that is not made under `with_eval_lock`.
+Re-derive the table above when the mlx / mlx-c pin moves — the gate's pattern
+list is hand-maintained and will not flag a newly-added evaluating entry point
+on its own. `scripts/check_eval_lock.sh` documents the rest of its blind spots.
+
+**`make eval-lock-stress`** drives the reproducer across N fresh processes
+(default 60) and fails on any non-zero exit. It exists because the in-suite
+reproducer, `concurrent_first_eval_reproducer`, only fails about 1 run in 12
+without the lock — fine as a demonstration, far too weak to gate on. Power
+comes from re-exec, not from looping in-process: the map only starts cold once.
 
 **Never `eval()` a kernel's inputs before dispatching it.** `Array::eval()`
 blocks the calling thread until the GPU has produced the array, so an `eval()`
