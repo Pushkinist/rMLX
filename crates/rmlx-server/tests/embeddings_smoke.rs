@@ -182,8 +182,26 @@ async fn non_embedding_model_is_400() {
 }
 
 // ── GPU shape tests (ignored — single-MLX-process; run in isolation) ──────────
+//
+// Each of these posts to `/v1/embeddings`, and the handler loads the jina
+// encoder and runs the forward under `rmlx_mlx::Device::Gpu` — in THIS process,
+// on a `spawn_blocking` worker, but on the far side of an axum routing table.
+// No source shape in this file names the device and no call graph links the
+// `post(port, "/v1/embeddings", ..)` here to `embeddings()` there, so the
+// `#[ignore]` gate cannot infer the Metal context and each carries the
+// `metal-unscanned` marker instead. See docs/TESTING.md.
+//
+// The marker deliberately does NOT put them in `scripts/run_gpu_tests.sh`:
+// every one is gated on `RMLX_TEST_MODEL_JINA_V4` and returns early without it,
+// so on a machine with no jina snapshot the runner would execute five no-ops,
+// see no Metal validation banner for rmlx-server, and fail the suite over a
+// missing model. They run by hand:
+//
+//   RMLX_TEST_MODEL_JINA_V4=/abs/path/to/jinaai__jina-embeddings-v4 \
+//     cargo test -p rmlx-server --test embeddings_smoke -- --ignored --test-threads=1
 
 /// Valid single-vector request → 200 + OpenAI embeddings shape.
+// gpu-test-gate: metal-unscanned  Metal is entered inside the handler.
 #[tokio::test]
 #[ignore = "GPU Metal: cargo test --test embeddings_smoke valid_single_vector -- --ignored --test-threads=1"]
 async fn valid_single_vector_200_shape() {
@@ -206,6 +224,7 @@ async fn valid_single_vector_200_shape() {
 }
 
 /// `return_multivector:true` toggles the embedding to `[[f32;128];seq]`.
+// gpu-test-gate: metal-unscanned  Metal is entered inside the handler.
 #[tokio::test]
 #[ignore = "GPU Metal: cargo test --test embeddings_smoke return_multivector -- --ignored --test-threads=1"]
 async fn return_multivector_toggles_shape() {
@@ -226,6 +245,13 @@ async fn return_multivector_toggles_shape() {
 }
 
 /// Invalid matryoshka `dimensions` (not in {128,256,512,1024,2048}) → 400.
+///
+/// Unlike the other 400s in this file, this one is NOT a request-validation
+/// rejection: the handler defers `dimensions` to the model's matryoshka set, so
+/// the check runs in `pooling::single_vector` — after the encoder is loaded and
+/// after a full `Device::Gpu` forward. The 400 is the tail of a GPU round trip,
+/// which is why it needs the snapshot and the Metal context.
+// gpu-test-gate: metal-unscanned  Metal is entered inside the handler.
 #[tokio::test]
 #[ignore = "GPU Metal: cargo test --test embeddings_smoke invalid_dimensions -- --ignored --test-threads=1"]
 async fn invalid_dimensions_is_400() {
@@ -248,6 +274,7 @@ const TEST_IMG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAEAAAAAwCAIAAAAuKetIAAAA5UlE
 /// Image input (single-vector): `{"input":{"image":"data:...;base64,..."}}`
 /// → 200 + 2048-d float vector. End-to-end exercise of the M-RoPE + merge +
 /// image-span pooling path (GPU; single-MLX-process).
+// gpu-test-gate: metal-unscanned  Metal is entered inside the handler.
 #[tokio::test]
 #[ignore = "GPU Metal: cargo test --test embeddings_smoke image_single_vector -- --ignored --test-threads=1"]
 async fn image_single_vector_200_shape() {
@@ -271,6 +298,7 @@ async fn image_single_vector_200_shape() {
 
 /// Image input with `return_multivector:true` → `[[f32;128];seq]` (one row
 /// per token of the expanded image sequence).
+// gpu-test-gate: metal-unscanned  Metal is entered inside the handler.
 #[tokio::test]
 #[ignore = "GPU Metal: cargo test --test embeddings_smoke image_multivector -- --ignored --test-threads=1"]
 async fn image_multivector_toggles_shape() {

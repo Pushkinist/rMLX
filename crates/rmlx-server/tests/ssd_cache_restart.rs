@@ -316,6 +316,17 @@ fn ssd_disk_state(rmlx_home: &Path) -> (usize, usize) {
 
 // ── The test ─────────────────────────────────────────────────────────────────
 
+// The Metal context this test needs belongs to the `rmlx serve` CHILD, not to
+// the test binary — this process only speaks HTTP to it — so no source shape
+// here can express the device and the `#[ignore]` gate is told rather than
+// shown. It stays out of `scripts/run_gpu_tests.sh` on top of that: that runner
+// instruments the test process, which dispatches no Metal at all; the test also
+// needs `cargo build -p rmlx-cli` first (`cargo test --tests` does not build the
+// binary), `pkill`s every MLX process on the machine, and spends two 180 s
+// readiness waits. The same spill -> restart -> hydrate chain, over the same two
+// prompts, is covered by `make e2e` phase 2a
+// (`crates/rmlx-cli/tests/e2e/runner.rs`).
+// gpu-test-gate: metal-unscanned  Metal belongs to the spawned serve process.
 #[ignore = "integration: requires RMLX_TEST_MODEL + a real rmlx serve process (Metal)"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ssd_cache_survives_server_restart() {
