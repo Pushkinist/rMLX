@@ -281,6 +281,21 @@ supposed to describe the layout, and a declaration is not evidence of one.
 > declared string here would re-introduce the dependence on an unvalidated,
 > model-side name that keying off the resolved class exists to remove.
 
+> **One-time invalidation (iso4 V).** `layout_key` is derived from
+> `(arch, n_layers, n_kv_heads, head_dim, kv_quant)` and the per-layer block
+> header carries only `{tag, max_seq, shape}`. Neither moves when the byte
+> *orientation* inside a block changes, so a layout change of that kind has to
+> move the **layer tag** or it is invisible on disk. The iso4 V GPU append stored
+> its block head-major while `QuantIsoV4::dequant` reads sequence-major; fixing
+> the append changed the bytes, so `ISOV4_LAYOUT_TAG` and
+> `ISO_SYM_4_LAYOUT_TAG` became `iso_v_4_v2` / `iso_sym_4_v2`. A `.kvb` written
+> before that matches no read arm and fails its hydrate with
+> `unknown layer tag` rather than being decoded with the new orientation —
+> loud, and one cold pass for `--kv-quant iso4` / `iso4_sym` users. Pinned by
+> `block_io_tests::iso4_layout_tags_are_versioned_past_the_head_major_payload`.
+> The iso3 tags are deliberately **not** bumped: that append always reordered
+> heads↔seq, so its bytes are unchanged.
+
 The key is one of the three terms of the block-hash seed, built at the call site
 by `rmlx_kv_ssd::hashing::cache_seed`:
 

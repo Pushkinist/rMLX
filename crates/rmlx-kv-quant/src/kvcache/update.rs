@@ -783,6 +783,16 @@ enum RingFeed {
 /// `crate::storage::truncate_plan`.
 const LEGACY_ROTOR_SYM_FEED: RingFeed = RingFeed::Skip;
 
+/// Feed the legacy iso V `update_iso4` / `update_iso4_sym` entries pass.
+///
+/// Named for the same reason as the rotor constants: these entries dequantize
+/// the whole prefix on the same step, so the CPU blocks must carry everything
+/// and the ring is dropped. Passing it also routes the append through
+/// [`iso4_gpu_append_into_v_blocks`], which reconciles a pre-existing ring-only
+/// tail **and** stores the chunk sequence-major — the orientation the CPU
+/// `QuantIsoV4::append` and `QuantIsoV4::dequant` both assume.
+const LEGACY_ISO4_V_FEED: RingFeed = RingFeed::Skip;
+
 /// Feed the legacy rotor K-only `update_*` entries pass.
 ///
 /// Unlike the sym path these keep the ring, so a ring-only tail survives a
@@ -1856,6 +1866,22 @@ fn iso3_gpu_append_into_v_blocks(
     vs.blocks.push(block);
     bump_rotor_k_shape(&mut vs.shape, new_shape);
     Ok(())
+}
+
+/// Test seam onto the iso4 V append the legacy entries use.
+///
+/// The appender is private to this module; the orientation test lives with the
+/// other iso dispatch tests, one module up. Exposing the call rather than
+/// duplicating it is what keeps the test pinned to the production path.
+#[cfg(test)]
+pub(super) fn iso4_v_gpu_append_for_test(
+    vs: &mut QuantIsoV4,
+    new_v: &Array,
+    new_shape: &[i32],
+    device: Device,
+    max_seq: i32,
+) -> Result<()> {
+    iso4_gpu_append_into_v_blocks(vs, new_v, new_shape, device, LEGACY_ISO4_V_FEED, max_seq)
 }
 
 /// Mirror of [`iso3_gpu_append_into_v_blocks`] for [`QuantIsoV4`].
@@ -6823,7 +6849,14 @@ impl KvCache {
         }
         let vs = v.as_mut().unwrap();
         if device == Device::Gpu {
-            iso4_gpu_append_into_v_blocks(vs, new_v, &new_shape, device, RingFeed::Skip, max_seq)?;
+            iso4_gpu_append_into_v_blocks(
+                vs,
+                new_v,
+                &new_shape,
+                device,
+                LEGACY_ISO4_V_FEED,
+                max_seq,
+            )?;
         } else {
             vs.append(&v_f32, &new_shape)?;
         }
@@ -7030,7 +7063,14 @@ impl KvCache {
             return Err(Error::Mlx("IsoSym4 V buffer absent after init".into()));
         };
         if device == Device::Gpu {
-            iso4_gpu_append_into_v_blocks(vs, new_v, &new_shape, device, RingFeed::Skip, max_seq)?;
+            iso4_gpu_append_into_v_blocks(
+                vs,
+                new_v,
+                &new_shape,
+                device,
+                LEGACY_ISO4_V_FEED,
+                max_seq,
+            )?;
         } else {
             vs.append(&v_f32, &new_shape)?;
         }

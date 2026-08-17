@@ -52,7 +52,17 @@ pub const ISOV3_LAYOUT_TAG: &str = "iso_v_3";
 /// Layout tag for V-axis IsoQuant 4-bit.
 ///
 /// Single source of truth for the SSD geometry tag.
-pub const ISOV4_LAYOUT_TAG: &str = "iso_v_4";
+// v2: the iso4 V GPU-encode append stored its block head-major while `dequant`
+// reads sequence-major, so a multi-token `kv_h > 1` chunk spilled head-scrambled
+// bytes. The append is fixed, and the tag is bumped because nothing else on disk
+// tells the two layouts apart: the block header carries only
+// `{tag, max_seq, shape}`, and the SSD index key
+// (`FNV_OFFSET ^ layout_key ^ cache_key_salt ^ model_sig`) is derived from the
+// arch, geometry and codec name — none of which move when the orientation of the
+// bytes inside a block does. With the bump a pre-fix entry hits no read arm and
+// fails its hydrate loudly ("unknown layer tag"); without it, it is read back
+// with the new orientation and no error. One cold pass after upgrading.
+pub const ISOV4_LAYOUT_TAG: &str = "iso_v_4_v2";
 
 /// Layout tag for V-axis rotor3 (Cl(3,0) Clifford sandwich).
 ///
@@ -73,7 +83,9 @@ pub const ROTORV4_LAYOUT_TAG: &str = "rotor_v_4";
 pub const ISO_SYM_3_LAYOUT_TAG: &str = "iso_sym_3";
 
 /// Layout tag for symmetric IsoQuant 4-bit K+V.
-pub const ISO_SYM_4_LAYOUT_TAG: &str = "iso_sym_4";
+// v2 for the same reason as `ISOV4_LAYOUT_TAG` — the V half of this storage
+// takes the same append.
+pub const ISO_SYM_4_LAYOUT_TAG: &str = "iso_sym_4_v2";
 
 /// Layout tag for K-only IsoQuant 3-bit (V stays bf16).
 ///
