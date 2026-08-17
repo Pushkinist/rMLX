@@ -223,7 +223,8 @@ Hard rules:
   marker against all its invocations. A **macro-generated** test is enforced at
   its `macro_rules!` body (one body governs every cell it emits), and a body the
   scanner cannot read back — an assembled fn name, a whole macro on one line, an
-  item whose brace never closes — is a hard failure rather than a clean scan;
+  item whose brace never closes, an attribute whose bracket never closes — is a
+  hard failure rather than a clean scan;
   those cells are deliberately excluded from `--list` / `make gpu-test`, which
   every run prints. A proc-macro-generated test, and a `macro_rules!` with a
   non-brace delimiter, remain outside the fail-closed net — neither exists in
