@@ -4035,3 +4035,55 @@ fn rotor_sym_truncate_keeps_ring_tail() {
         }
     }
 }
+
+// ── Layout-tag versioning ────────────────────────────────────────────────────
+
+/// A stored byte layout change must move the tag, because the tag is the only
+/// thing that distinguishes two layouts on disk.
+///
+/// The SSD key is `FNV_OFFSET ^ layout_key ^ cache_key_salt ^ model_sig`, and
+/// `layout_key` is the tag plus geometry (`{"tag":..,"max_seq":..,"shape":[..]}`).
+/// Neither the geometry nor the codec salt changes when the *orientation* of the
+/// bytes inside a block changes, so an entry written under the old layout
+/// hash-matches and is hydrated with the new reader — silently.
+///
+/// The iso4 V append stored head-major blocks while `QuantIsoV4::dequant` reads
+/// sequence-major; fixing the append changed the bytes, so both tags carrying
+/// that payload moved to `_v2`. This pins that they stay moved: reverting either
+/// to its v1 spelling makes pre-fix entries readable again, which is the silent
+/// case.
+///
+/// Deliberately spelled out rather than derived — a test that recomputed the
+/// name from the constant would pass whatever the constant says.
+#[test]
+fn iso4_layout_tags_are_versioned_past_the_head_major_payload() {
+    assert_eq!(
+        ISOV4_LAYOUT_TAG, "iso_v_4_v2",
+        "iso4 V-only entries written before the sequence-major append fix must miss"
+    );
+    assert_eq!(
+        ISO_SYM_4_LAYOUT_TAG, "iso_sym_4_v2",
+        "the V half of iso4-sym takes the same append, so its tag moves with it"
+    );
+    // The iso3 payload orientation never changed — its append always reordered
+    // heads↔seq — so bumping those tags would only throw away valid entries.
+    assert_eq!(ISOV3_LAYOUT_TAG, "iso_v_3", "iso3 V bytes are unchanged");
+    assert_eq!(
+        ISO_SYM_3_LAYOUT_TAG, "iso_sym_3",
+        "iso3-sym bytes are unchanged"
+    );
+    // Every tag stays distinct, or two codecs share a hydrate key.
+    let tags = [
+        ISOV3_LAYOUT_TAG,
+        ISOV4_LAYOUT_TAG,
+        ISO_SYM_3_LAYOUT_TAG,
+        ISO_SYM_4_LAYOUT_TAG,
+        ISO_K_ONLY_3_LAYOUT_TAG,
+        ISO_K_ONLY_4_LAYOUT_TAG,
+    ];
+    for (i, a) in tags.iter().enumerate() {
+        for b in tags.iter().skip(i + 1) {
+            assert_ne!(a, b, "layout tags must be pairwise distinct");
+        }
+    }
+}

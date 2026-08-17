@@ -26,7 +26,10 @@
 //! If a call site is changed to bypass its constant, this file stays green and
 //! the matching pair goes red.
 
-use super::{is_ring_only_append, RingFeed, LEGACY_ROTOR_K_ONLY_FEED, LEGACY_ROTOR_SYM_FEED};
+use super::{
+    is_ring_only_append, RingFeed, LEGACY_ISO4_V_FEED, LEGACY_ROTOR_K_ONLY_FEED,
+    LEGACY_ROTOR_SYM_FEED,
+};
 
 /// The arm is chosen by `feed` and `b` only — never by chunk length.
 ///
@@ -112,4 +115,35 @@ fn only_the_k_only_legacy_feed_keeps_the_ring() {
         RingFeed::Maintain,
         "the K-only legacy entry keeps the ring, so a ring-only tail survives a fallback step"
     );
+}
+
+/// The legacy iso4 V entries drop the ring, which is also what routes them
+/// through the sequence-major append.
+///
+/// `update_iso4` / `update_iso4_sym` used to call a bespoke helper that encoded
+/// the chunk **head-major** and touched the ring not at all. `QuantIsoV4::append`
+/// and `QuantIsoV4::dequant` are both sequence-major, so a multi-token chunk at
+/// `kv_h > 1` was stored transposed and decoded scrambled — and a live ring was
+/// left stale underneath it. Both entries now pass this constant to the shared
+/// ring-aware appender, which reconciles the ring, drops it, and stores the
+/// chunk sequence-major like every other iso append.
+///
+/// Same coverage boundary as the rotor pins above: this is a CPU gate on the
+/// constant, not on the encode. The consequence needs Metal and is pinned by
+/// `iso4_v_gpu_append_matches_cpu_append_at_kv_h_gt_1`.
+#[test]
+fn the_legacy_iso4_v_feed_drops_the_ring_and_takes_the_block_path() {
+    assert_eq!(
+        LEGACY_ISO4_V_FEED,
+        RingFeed::Skip,
+        "the legacy iso4 V entries dequantize the whole prefix on the same step, so the CPU \
+         blocks must be the only copy and the ring is dropped"
+    );
+    for shape in [[1_i32, 2, 1, 128], [1, 2, 5, 128], [2, 2, 5, 128]] {
+        assert!(
+            !is_ring_only_append(LEGACY_ISO4_V_FEED, &shape),
+            "the legacy iso4 V feed must reach the block path at shape {shape:?} — that arm \
+             is what reconciles the ring and stores the chunk sequence-major"
+        );
+    }
 }

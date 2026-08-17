@@ -21,6 +21,25 @@
 //! the GPU side additionally materializes the transposed view with
 //! `Array::contiguous` before any custom MSL kernel, because such kernels read
 //! their input by raw linear index and ignore MLX lazy-transpose strides.
+//!
+//! # Chunk boundaries matter once `B > 1`
+//!
+//! A store that accumulates one buffer per `append` decodes by concatenating
+//! them. That concatenation is a single `[B, S_total, kv_h, D]` run **only when
+//! `B == 1`**: every chunk is itself `[B, S_chunk, kv_h, D]`, so with more than
+//! one batch element each chunk restarts at batch 0 and the chunks interleave.
+//! Reading the concatenation as one run then maps a later chunk's batch-0 rows
+//! onto batch-1 sequence slots — head/batch-scrambled K/V, with no error.
+//! [`transpose_chunked_seq_heads`] is the reorder that knows where the chunks
+//! end; [`transpose_seq_heads`] stays correct only for a buffer that really is
+//! one `[B, S_total, kv_h, D]` run — a single chunk at any `B`, or any number of
+//! chunks at `B == 1`. A **flat** store written at sequence offsets is not one
+//! run at `B > 1`: its per-step stride folds `b` in, so the prefix is a run of
+//! `[B, S_chunk, kv_h, D]` chunks with no recorded boundary to partition on.
+//! Those readers refuse `b != 1` rather than reorder — see the
+//! `dequantize_choice` GPU arms and `QuantK`'s CPU arm.
+
+use rmlx_core::error::{Error, Result};
 
 /// Reorder a flat head-major `[B, kv_h, S, D]` buffer to sequence-major
 /// `[B, S, kv_h, D]`. Used by the CPU `append` paths to mirror the GPU
@@ -74,6 +93,183 @@ pub(super) fn transpose_seq_heads(
         }
     }
     out
+}
+
+/// `b * kv_h * s_total * d`, or [`Error::Quant`] when the product overflows.
+///
+/// Callers derive these from `i32` shape fields with a plain `as usize`, so a
+/// malformed shape can reach here as an absurd count. Every other guard in this
+/// module is a typed error; wrapping (or panicking under debug-assertions) on
+/// the size computation alone would be the odd one out.
+fn checked_elems(b: usize, kv_h: usize, s_total: usize, d: usize, what: &str) -> Result<usize> {
+    b.checked_mul(kv_h)
+        .and_then(|v| v.checked_mul(s_total))
+        .and_then(|v| v.checked_mul(d))
+        .ok_or_else(|| {
+            Error::Quant(format!(
+                "{what}: element count overflows usize at \
+                 [B={b}, kv_h={kv_h}, S={s_total}, D={d}]"
+            ))
+        })
+}
+
+/// Head-major `[B, kv_h, S_total, D]` destination index of every **token row**
+/// of a chunked sequence-major block list.
+///
+/// The block stores hold one `[B, S_chunk, kv_h, D]` payload per `append`, so
+/// row `i` of the concatenation identifies `(bi, si, h)` *within its own chunk*.
+/// A reader that wants head-major output has two ways to get there: reorder the
+/// decoded values ([`transpose_chunked_seq_heads`]), or place the payload rows
+/// in head-major order **before** decoding. This returns the permutation for the
+/// second — `perm[i]` is the head-major token index of concatenated row `i`.
+///
+/// The GPU readers take the second route: the iso dequant kernel is per-token
+/// positional (token `t`'s output depends only on token `t`'s codes / scales /
+/// norm), so permuting its input permutes its output identically. Feeding it
+/// head-major rows means the flat result is already `[B, kv_h, S, D]` and needs
+/// no reshape-plus-transpose at all — one less device kernel than reordering
+/// afterwards, and correct at every `B`, which the whole-buffer reshape is not.
+///
+/// # Errors
+///
+/// Returns [`Error::Quant`] when the chunks do not partition
+/// `[B, S_total, kv_h]` — a ragged chunk, or a chunk list that over- or
+/// under-runs `s_total`.
+pub(super) fn head_major_token_order(
+    b: usize,
+    s_total: usize,
+    kv_h: usize,
+    chunk_rows: impl IntoIterator<Item = usize>,
+) -> Result<Vec<usize>> {
+    let total_rows = checked_elems(b, kv_h, s_total, 1, "head_major_token_order")?;
+    let mut perm = vec![0usize; total_rows];
+    let rows_per_seq = b * kv_h;
+    if rows_per_seq == 0 {
+        return Ok(perm);
+    }
+    let mut s_off = 0usize;
+    let mut row = 0usize;
+    for rows in chunk_rows {
+        if !rows.is_multiple_of(rows_per_seq) {
+            return Err(Error::Quant(format!(
+                "head_major_token_order: chunk holds {rows} rows, not a whole number of \
+                 sequence positions at B={b}, kv_h={kv_h}"
+            )));
+        }
+        let s_chunk = rows / rows_per_seq;
+        if s_off + s_chunk > s_total {
+            return Err(Error::Quant(format!(
+                "head_major_token_order: chunks over-run S={s_total} at sequence offset \
+                 {s_off} (+{s_chunk})"
+            )));
+        }
+        for bi in 0..b {
+            for si in 0..s_chunk {
+                for h in 0..kv_h {
+                    // Source row order inside the chunk is `[B, S_chunk, kv_h]`;
+                    // `row` walks it, so no index arithmetic is needed on the
+                    // source side.
+                    let dst = (bi * kv_h + h) * s_total + s_off + si;
+                    let Some(slot) = perm.get_mut(row) else {
+                        return Err(Error::Quant(format!(
+                            "head_major_token_order: chunk rows exceed the {total_rows} rows \
+                             [B={b}, kv_h={kv_h}, S={s_total}] declares"
+                        )));
+                    };
+                    *slot = dst;
+                    row += 1;
+                }
+            }
+        }
+        s_off += s_chunk;
+    }
+    if s_off != s_total {
+        return Err(Error::Quant(format!(
+            "head_major_token_order: chunks cover {s_off} sequence positions but S={s_total}"
+        )));
+    }
+    Ok(perm)
+}
+
+/// Reorder a **chunked** sequence-major buffer back to head-major
+/// `[B, kv_h, S_total, D]`.
+///
+/// `src` is the concatenation of one `[B, S_chunk, kv_h, D]` buffer per
+/// `append`, in append order; `chunk_rows` is each chunk's row count
+/// (`B * kv_h * S_chunk`) in the same order. Every chunk is reordered at its own
+/// sequence offset, which is what [`transpose_seq_heads`] over the whole
+/// concatenation cannot do once `B > 1` (see the module note).
+///
+/// At `B == 1` this is exactly [`transpose_seq_heads`] over the concatenation —
+/// the sequence axis is then the outermost axis of every chunk, so the chunk
+/// boundaries carry no information.
+///
+/// # Errors
+///
+/// Returns [`Error::Quant`] when the chunks do not partition
+/// `[B, S_total, kv_h, D]`: a wrong total length, a chunk whose row count is not
+/// a whole number of sequence positions, or a chunk list that over- or
+/// under-runs `s_total`.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "every (bi,si,h) base + d is bounded by the length and partition checks above"
+)]
+pub(super) fn transpose_chunked_seq_heads(
+    src: &[f32],
+    b: usize,
+    s_total: usize,
+    kv_h: usize,
+    d: usize,
+    chunk_rows: impl IntoIterator<Item = usize>,
+) -> Result<Vec<f32>> {
+    let total = checked_elems(b, kv_h, s_total, d, "transpose_chunked_seq_heads")?;
+    if src.len() != total {
+        return Err(Error::Quant(format!(
+            "transpose_chunked_seq_heads: buffer holds {} elems but \
+             [B={b}, kv_h={kv_h}, S={s_total}, D={d}] implies {total}",
+            src.len()
+        )));
+    }
+    let mut out = vec![0.0_f32; total];
+    let rows_per_seq = b * kv_h;
+    if rows_per_seq == 0 || d == 0 {
+        // Nothing to place: `total` is 0, so the empty output is already right.
+        return Ok(out);
+    }
+    let mut s_off = 0usize;
+    let mut src_off = 0usize;
+    for rows in chunk_rows {
+        if !rows.is_multiple_of(rows_per_seq) {
+            return Err(Error::Quant(format!(
+                "transpose_chunked_seq_heads: chunk holds {rows} rows, not a whole number of \
+                 sequence positions at B={b}, kv_h={kv_h}"
+            )));
+        }
+        let s_chunk = rows / rows_per_seq;
+        if s_off + s_chunk > s_total {
+            return Err(Error::Quant(format!(
+                "transpose_chunked_seq_heads: chunks over-run S={s_total} at sequence offset \
+                 {s_off} (+{s_chunk})"
+            )));
+        }
+        for bi in 0..b {
+            for si in 0..s_chunk {
+                for h in 0..kv_h {
+                    let src_base = src_off + ((bi * s_chunk + si) * kv_h + h) * d;
+                    let dst_base = ((bi * kv_h + h) * s_total + s_off + si) * d;
+                    out[dst_base..dst_base + d].copy_from_slice(&src[src_base..src_base + d]);
+                }
+            }
+        }
+        s_off += s_chunk;
+        src_off += rows * d;
+    }
+    if s_off != s_total {
+        return Err(Error::Quant(format!(
+            "transpose_chunked_seq_heads: chunks cover {s_off} sequence positions but S={s_total}"
+        )));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

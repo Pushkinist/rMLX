@@ -66,7 +66,7 @@ pub fn iso_n_groups_for(head_dim: usize) -> usize {
 ///
 /// Returns [`Error::Quant`] when `head_dim` is not a positive multiple of
 /// [`ISO_QUAT_BLOCK_SIZE`].
-pub(crate) fn iso_n_groups_i32(head_dim: i32, what: &str) -> Result<i32> {
+pub fn iso_n_groups_i32(head_dim: i32, what: &str) -> Result<i32> {
     let hd = usize::try_from(head_dim)
         .map_err(|_| Error::Quant(format!("{what}: head_dim={head_dim} must be positive")))?;
     if hd == 0 || !hd.is_multiple_of(ISO_QUAT_BLOCK_SIZE) {
@@ -381,12 +381,58 @@ impl QuantIsoK3 {
         blocks.iter().map(IsoBlocks::byte_size).sum::<u64>() + gpu.byte_size()
     }
 
+    /// Rebuild any ring-only prefix into the CPU blocks so `blocks` alone cover
+    /// `shape[2]` again, and either keep or drop the ring.
+    ///
+    /// Sibling of [`super::QuantIsoV3::reconcile_ring`] — see it for why the
+    /// disposition is a parameter rather than two copies of this body.
+    ///
+    /// # Errors
+    ///
+    /// Forwards a [`synced_iso_v_blocks`] reconciliation error.
+    pub(crate) fn reconcile_ring(
+        &mut self,
+        device: Device,
+        disposition: super::RingDisposition,
+    ) -> Result<()> {
+        if !self.gpu.is_allocated() {
+            return Ok(());
+        }
+        if let std::borrow::Cow::Owned(full) =
+            synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, device)?
+        {
+            self.blocks = full;
+        }
+        if disposition == super::RingDisposition::Drop {
+            self.gpu.clear();
+        }
+        Ok(())
+    }
+
     /// Dequantize all accumulated K slices into one flat f32 vector of length
     /// `prod(shape)`.
     ///
     /// # Errors
     /// Returns an `Error::Mlx` if the underlying [`iso_decode_fast`] fails.
     pub fn dequant(&self) -> Result<Vec<f32>> {
+        // The ring lives on the GPU whenever it is live at all, so that is the
+        // stream its readback belongs on. `dequant_on` exists so a caller that
+        // knows better — a `Device::Cpu` run, or a test that must not touch a
+        // shared Metal context — can say so instead of having this constant
+        // imposed on it.
+        self.dequant_on(Device::Gpu)
+    }
+
+    /// [`Self::dequant`] on an explicit device.
+    ///
+    /// The device selects the stream for the ring readback that reconciles a
+    /// ring-only decode tail; it has no effect on a store whose CPU blocks
+    /// already cover `shape[2]`, which is every store on the CPU append path.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::dequant`].
+    pub fn dequant_on(&self, device: Device) -> Result<Vec<f32>> {
         if self.shape.len() != 4 {
             return Err(Error::Mlx(format!(
                 "QuantIsoK3::dequant: malformed shape {:?}",
@@ -402,7 +448,7 @@ impl QuantIsoK3 {
         // (`blocks` trail `shape[2]`), and this rebuilds it on demand rather than
         // decoding a short prefix and zero-padding the gap. Loud on any
         // unrecoverable disagreement.
-        let blocks = synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, Device::Gpu)?;
+        let blocks = synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, device)?;
 
         if blocks.is_empty() {
             // Loud on a lost decode tail — see [`super::QuantIsoV3::dequant`].
@@ -442,12 +488,21 @@ impl QuantIsoK3 {
                 self.shape
             )));
         }
-        // Blocks are sequence-major (see `append`); reorder back to the logical
-        // head-major `[B, kv_h, S, D]`.
+        // Blocks are sequence-major (see `append`), one per append; reorder each
+        // at its own sequence offset back to the logical head-major
+        // `[B, kv_h, S, D]`. Reading the concatenation as a single run would
+        // interleave batch elements once `B > 1`.
         let b = self.shape[0] as usize;
         let kv_h = self.shape[1] as usize;
         let s = self.shape[2] as usize;
-        let out = super::seq_layout::transpose_seq_heads(&out, b, s, kv_h, head_dim);
+        let out = super::seq_layout::transpose_chunked_seq_heads(
+            &out,
+            b,
+            s,
+            kv_h,
+            head_dim,
+            blocks.iter().map(super::BlockRows::rows),
+        )?;
         Ok(out)
     }
 
@@ -478,75 +533,42 @@ impl QuantIsoK3 {
         }
         let n_groups = head_dim / ISO_K3_GROUP_SIZE;
 
-        let mut codes_bytes: Vec<u8> = Vec::new();
-        let mut scales_bytes: Vec<u8> = Vec::new();
-        let mut quats_bytes: Vec<u8> = Vec::new();
-        let mut norms_bytes: Vec<u8> = Vec::new();
-        let mut total_groups: usize = 0;
+        // Reconcile the CPU blocks with the GPU ring first — see
+        // [`super::QuantIsoV3::dequant_gpu`] for why both element counts must
+        // come from the same source.
+        let blocks = synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, device)?;
 
-        for blk in &self.blocks {
-            for &c in &blk.codes {
-                codes_bytes.extend_from_slice(&c.to_le_bytes());
-            }
-            for &s in &blk.scales {
-                scales_bytes.extend_from_slice(&s.to_le_bytes());
-            }
-            for &q in &blk.quaternions {
-                quats_bytes.extend_from_slice(&q.to_le_bytes());
-            }
-            for &n in &blk.norms {
-                let n_bytes = n.to_le_bytes();
-                for _ in 0..n_groups {
-                    norms_bytes.extend_from_slice(&n_bytes);
-                }
-            }
-            // Checked arithmetic — see V-side mirror.
-            let blk_groups = blk.n_tokens.checked_mul(n_groups).ok_or_else(|| {
-                Error::Quant("dequant_gpu: blk.n_tokens * n_groups overflow".to_owned())
-            })?;
-            total_groups = total_groups
-                .checked_add(blk_groups)
-                .ok_or_else(|| Error::Quant("dequant_gpu: total_groups overflow".to_owned()))?;
-        }
+        // Head-major kernel inputs — see [`super::QuantIsoV3::dequant_gpu`] for
+        // why the row order is fixed on the way in rather than reshaped on the
+        // way out.
+        let inputs = super::quant_iso_v::iso_kernel_inputs_head_major(
+            &blocks,
+            &self.shape,
+            n_groups,
+            ISO_K3_GROUP_SIZE,
+            "QuantIsoK3::dequant_gpu",
+        )?;
 
-        // Guard against silent shape divergence — see V-side mirror.
-        let declared_total: usize = self.shape.iter().map(|&d| d as usize).product();
-        let actual_total: usize = total_groups.checked_mul(ISO_K3_GROUP_SIZE).ok_or_else(|| {
-            Error::Quant("dequant_gpu: total_groups * ISO_K3_GROUP_SIZE overflow".to_owned())
-        })?;
-        if actual_total != declared_total {
-            return Err(Error::Quant(format!(
-                "dequant_gpu: actual_total={actual_total} (blocks×groups×group_size) != \
-                 declared_total={declared_total} (prod(shape)={:?}); refusing to silently \
-                 truncate/pad",
-                self.shape
-            )));
-        }
-
-        if total_groups == 0 {
+        if inputs.total_groups == 0 {
             return Array::from_bytes(&[][..], &self.shape, Dtype::F32);
         }
 
-        let codes_arr = Array::from_bytes(&codes_bytes, &[total_groups as i32], Dtype::U32)?;
-        let scales_arr = Array::from_bytes(&scales_bytes, &[total_groups as i32], Dtype::F32)?;
-        let quats_arr = Array::from_bytes(&quats_bytes, &[(total_groups * 4) as i32], Dtype::F32)?;
-        let norms_arr = Array::from_bytes(&norms_bytes, &[total_groups as i32], Dtype::F32)?;
+        let n = inputs.total_groups as i32;
+        let codes_arr = Array::from_bytes(&inputs.codes, &[n], Dtype::U32)?;
+        let scales_arr = Array::from_bytes(&inputs.scales, &[n], Dtype::F32)?;
+        let norms_arr = Array::from_bytes(&inputs.norms, &[n], Dtype::F32)?;
 
+        // Quaternion slot reuse — see [`super::QuantIsoV3::dequant_gpu`].
         let flat = crate::isoquant_msl::iso_dequantize_v3_gpu(
             &codes_arr,
             &scales_arr,
-            &quats_arr,
+            &codes_arr,
             &norms_arr,
             head_dim,
             Dtype::F32,
             device,
         )?;
-
-        // CPU blocks are sequence-major (see `append`): reshape to
-        // `[B, S, kv_h, D]`, then reorder heads↔seq back to `[B, kv_h, S, D]`.
-        let seq_major_shape = [self.shape[0], self.shape[2], self.shape[1], self.shape[3]];
-        let out = flat.reshape(&seq_major_shape, device)?;
-        out.transpose(&[0, 2, 1, 3], device)?.contiguous(device)
+        flat.reshape(&self.shape, device)
     }
 }
 

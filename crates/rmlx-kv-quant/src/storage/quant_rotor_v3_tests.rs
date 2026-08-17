@@ -343,24 +343,28 @@ fn quant_rotor_v3_truncate_mid_block_splits_instead_of_dropping() {
 
 /// At `b > 1` a mid-block cut must stay **loud**, not become silently wrong.
 ///
-/// The decode path is the constraint. Every rotor/iso store ends `dequant` with
-/// `transpose_seq_heads` over the *concatenation* of its blocks, reading it as
-/// one `[B, S_total, kv_h, D]` run — but each block is only
-/// `[B, S_block, kv_h, D]`, so at `b > 1` the concatenation interleaves batch
-/// elements and any store holding more than one block decodes scrambled. The
-/// first assertion below measures that: a two-block `b = 2` store already
-/// disagrees with a one-block store over the same tokens, on every element
-/// belonging to batch 1.
+/// The constraint is *inside* one block. A block's rows run
+/// `[B, S_block, kv_h, D]`, so batch element 1's rows all sit after batch
+/// element 0's, and `BlockRows::retain_rows` keeps a **row prefix**. At `b > 1`
+/// a row prefix is not a sequence prefix: cutting to `keep_seq` positions would
+/// keep every one of batch 0's rows and none of batch 1's, silently dropping one
+/// batch element's tail instead of cutting both at the same position. The
+/// planner refuses, drops the block whole, and this test pins the resulting
+/// contract: `dequant()` returns `Err`.
 ///
-/// So splitting the trailing block at `b > 1` would produce exactly that
-/// two-block state, converting a `blocks`-short-of-`shape[2]` **error** into
-/// scrambled output with no error at all. The planner refuses, and this test
-/// pins the resulting contract: `dequant()` returns `Err`.
+/// The block *concatenation* used to be a second, independent bound — the
+/// decode read it as one `[B, S_total, kv_h, D]` run, which scrambles at
+/// `b > 1`. That is fixed (`seq_layout::transpose_chunked_seq_heads` reorders
+/// each block at its own sequence offset), and the first assertion below now
+/// pins the *new* premise: a two-block `b = 2` store decodes identically to a
+/// one-block store over the same tokens. Lifting the split refusal therefore
+/// needs a batch-aware `retain_rows`, not a decode change.
 ///
 /// Mutation check: drop the `b != 1` arm in `truncate_plan` and the store splits,
 /// `blocks_tokens == full_tokens`, `synced_rotor_v_blocks` takes its
-/// `Cow::Borrowed` fast return, and `dequant()` returns `Ok` with scrambled
-/// values — the `expect_err` goes RED.
+/// `Cow::Borrowed` fast return, and `dequant()` returns `Ok` — the `expect_err`
+/// goes RED. Re-point `transpose_chunked_seq_heads` in `QuantRotorV3::dequant`
+/// back to `transpose_seq_heads` and the premise assertion goes RED.
 #[test]
 fn quant_rotor_v3_truncate_at_b_gt_1_stays_loud() {
     let (b, kv_h, head_dim) = (2_usize, 2_usize, 96_usize);
@@ -383,8 +387,8 @@ fn quant_rotor_v3_truncate_at_b_gt_1_stays_loud() {
     };
     let shape = |n: usize| [b as i32, kv_h as i32, n as i32, head_dim as i32];
 
-    // First: establish that multi-block `b > 1` decode really is unreadable, so
-    // the refusal below is a bound and not superstition.
+    // First: establish that multi-block `b > 1` decode is readable, so the
+    // refusal below is pinned to the intra-block row layout and nothing else.
     let mut one_block = QuantRotorV3::new(vec![b as i32, kv_h as i32, 0, head_dim as i32], 64, 5);
     one_block.append(&chunk(0, 5), &shape(5)).unwrap();
     let dq_one = one_block.dequant().unwrap();
@@ -399,12 +403,11 @@ fn quant_rotor_v3_truncate_at_b_gt_1_stays_loud() {
         .zip(dq_two.iter())
         .filter(|(a, c)| (*a - *c).abs() > 1e-3)
         .count();
-    assert!(
-        scrambled > 0,
-        "premise: a two-block b > 1 store is supposed to decode differently from a \
-         one-block store over the same tokens. If this is now 0 the concatenation \
-         reading was fixed and the b > 1 split may be re-enabled — re-point this test \
-         rather than deleting it"
+    assert_eq!(
+        scrambled, 0,
+        "premise: a two-block b > 1 store decodes identically to a one-block store over \
+         the same tokens. A non-zero count means the per-block reorder regressed — fix \
+         `dequant`, do not weaken this assertion"
     );
 
     // Now the contract: a mid-block cut drops the block and stays loud.
@@ -427,4 +430,54 @@ fn quant_rotor_v3_truncate_at_b_gt_1_stays_loud() {
         msg.contains("CPU blocks cover"),
         "the abort must be the blocks-vs-shape reconciliation error, got: {msg}"
     );
+}
+
+// ── Batch-axis block-boundary parity ──────────────────────────────────
+
+/// Two appends must decode exactly like one append of the same tokens, at
+/// `B > 1` as well as `B == 1`.
+///
+/// Each block covers `[B, S_block, kv_h, D]`, so the concatenation of two
+/// blocks is not one `[B, S_total, kv_h, D]` run — reading it as one maps the
+/// second block's batch-0 rows onto batch-1 sequence slots. The single-append
+/// store holds exactly one block and therefore concatenates nothing, which is
+/// what makes it the oracle here.
+///
+/// Mutation check: put `seq_layout::transpose_seq_heads` over the whole
+/// concatenation back in `QuantRotorV3::dequant` and this goes red at
+/// `b = 2` while staying green at `b = 1` — which is how the defect stayed
+/// invisible.
+#[test]
+fn quant_rotor_v3_two_block_decode_matches_one_block_at_b_gt_1() {
+    for (b, kv_h) in [(1_usize, 1_usize), (1, 2), (2, 1), (2, 2)] {
+        let head_dim = 96_usize;
+        let (n0, n1) = (2_usize, 3_usize);
+        let shape = |n: usize| [b as i32, kv_h as i32, n as i32, head_dim as i32];
+
+        let mut one = QuantRotorV3::new(vec![b as i32, kv_h as i32, 0, head_dim as i32], 512, 5);
+        one.append(
+            &crate::test_utils::batch_head_chunk(b, kv_h, 0, n0 + n1, head_dim),
+            &shape(n0 + n1),
+        )
+        .expect("single append");
+        let oracle = one.dequant().expect("one-block dequant");
+
+        let mut two = QuantRotorV3::new(vec![b as i32, kv_h as i32, 0, head_dim as i32], 512, 5);
+        two.append(
+            &crate::test_utils::batch_head_chunk(b, kv_h, 0, n0, head_dim),
+            &shape(n0),
+        )
+        .expect("append chunk 0");
+        two.append(
+            &crate::test_utils::batch_head_chunk(b, kv_h, n0, n1, head_dim),
+            &shape(n1),
+        )
+        .expect("append chunk 1");
+        let got = two.dequant().expect("two-block dequant");
+
+        assert_eq!(
+            got, oracle,
+            "two-block decode must equal the one-block oracle at b={b} kv_h={kv_h}"
+        );
+    }
 }

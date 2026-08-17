@@ -449,6 +449,29 @@ impl QuantK {
                 // a debugger comparing decode logits against the base commit will
                 // see q8-noise-level deltas, not zero. Pass out_dtype directly:
                 // kernel writes bf16/f16/f32 — no follow-up astype.
+                // The flat GPU buffer is a run of `[B, S_chunk, kv_h, D]`
+                // chunks written at `prev_seq * words_per_step`, and
+                // `words_per_step` folds `b` in. Reading the prefix as one
+                // `[B, S_total, kv_h, D]` run therefore interleaves batch
+                // elements once `B > 1`. Unlike the CPU half this arm has no
+                // payload-vs-shape coverage check — the slice is sized *from*
+                // `shape[2]` — so `S == 1` is not evidence that the prefix is a
+                // single `[B, 1, kv_h, D]` chunk: a mid-chunk truncate at
+                // `b > 1` lowers `shape[2]` without touching this buffer. Only
+                // the empty store is exempt, because `truncate_to(0)` (which
+                // `KvStorage::reset` routes through) must still decode to
+                // nothing. Refuse
+                // rather than return a scrambled tensor — the CPU half of this
+                // reader handles every `B` via
+                // `seq_layout::transpose_chunked_seq_heads`, which is what the
+                // block list makes possible and this buffer does not.
+                if self.shape[0] != 1 && self.shape[2] != 0 {
+                    return Err(rmlx_core::error::Error::Quant(format!(
+                        "QuantK::dequantize_choice: the flat GPU buffer is b == 1 only \
+                         (its per-step stride does not interleave batch), got shape {:?}",
+                        self.shape
+                    )));
+                }
                 let seq_major_shape = [self.shape[0], s, self.shape[1], self.shape[3]];
                 let out = q8_dequantize_gpu(&codes, &scales, &seq_major_shape, out_dtype, device)?;
                 // Materialize the heads↔seq transpose into a row-major buffer.
@@ -491,6 +514,32 @@ impl QuantK {
         let kv_h = self.shape[1] as usize;
         let s = self.shape[2] as usize;
         let d = self.shape[3] as usize;
+        // `QuantK`'s CPU payload is one flat append-only `codes` / `scales` pair
+        // with no per-append boundary recorded, so the chunked reorder the block
+        // stores use (`seq_layout::transpose_chunked_seq_heads`) has nothing to
+        // partition on. The whole-buffer reorder below is exact for a single
+        // append at any `b`, and for any number of appends at `b == 1`; a
+        // multi-append `b > 1` store reads batch-interleaved and would return
+        // `Ok`. The boundaries are not recoverable after the fact, so this
+        // refuses `b != 1` outright rather than guessing which stores are
+        // single-append — deliberately wider than the defect, because `b > 1`
+        // reaches no production path today (one `KvCache` per request, and every
+        // fused gate refuses `b != 1`) and a silent scramble here is worth more
+        // than the case it costs. Lifting it needs a recorded per-append
+        // sequence length on the store.
+        // Only the empty store is exempt. `s == 1` is not evidence of a single
+        // chunk here either: `truncate_to` lowers `shape[2]` and
+        // `retain_cpu_prefix` refuses to cut the codes at `b != 1`, so a
+        // truncated store can declare one position over a multi-position
+        // payload. `truncate_to(0)` (which `KvStorage::reset` routes through)
+        // must still decode to nothing.
+        if b != 1 && s != 0 {
+            return Err(rmlx_core::error::Error::Quant(format!(
+                "QuantK::dequantize_choice: the CPU codes carry no per-append chunk boundary, \
+                 so a b > 1 store cannot be reordered to head-major; got shape {:?}",
+                self.shape,
+            )));
+        }
         Ok((transpose_seq_heads(&flat, b, s, kv_h, d), None))
     }
 

@@ -17,13 +17,15 @@
 //! `blocks` short of `shape[2]` — a state only a live GPU ring can repair. The
 //! planner therefore splits the trailing block instead.
 //!
-//! **`b > 1` must NOT split.** Every store decodes the concatenation of its
-//! blocks as one `[B, S_total, kv_h, D]` run, which is only a valid reading at
-//! `b == 1` or with a single block. Splitting at `b > 1` would replace a loud
-//! blocks-short-of-`shape[2]` error with a silently scrambled two-block store,
-//! so the planner drops the block there and lets the guard report the gap. The
-//! store-level proof of the scrambling is
-//! `quant_rotor_v3_tests::quant_rotor_v3_truncate_at_b_gt_1_stays_loud`.
+//! **`b > 1` must NOT split.** A block's rows run `[B, S_block, kv_h, D]`, so
+//! batch element 1's rows sit after batch element 0's and `retain_rows` keeps a
+//! row prefix. At `b > 1` a row prefix is not a sequence prefix — the cut would
+//! keep all of batch 0 and none of batch 1 — so the planner drops the block
+//! there and lets the reconciliation guard report the gap. The store-level proof
+//! is `quant_rotor_v3_tests::quant_rotor_v3_truncate_at_b_gt_1_stays_loud`,
+//! which also pins that reading the *concatenation* is no longer a second bound
+//! (`seq_layout::transpose_chunked_seq_heads` reorders each block at its own
+//! sequence offset).
 
 use crate::storage::{apply_truncate_plan, retain_rows_in, truncate_plan, BlockRows};
 
@@ -261,11 +263,11 @@ fn whole_block_drop_leaves_the_store_short_of_the_target() {
 
 /// `b > 1` never splits, however cleanly the cut would divide.
 ///
-/// Not a limitation of the planner — a correctness bound imposed by the decode
-/// path. Every store reads its block concatenation as one `[B, S_total, kv_h,
-/// D]` run, which interleaves batch elements once more than one block survives.
-/// Splitting here would replace the loud blocks-short-of-`shape[2]` error with a
-/// silently scrambled store; dropping keeps the error.
+/// Not a limitation of the planner — a correctness bound imposed by the block
+/// layout. A block's rows run `[B, S_block, kv_h, D]`, so `retain_rows`, which
+/// keeps a row prefix, would keep all of batch 0 and none of batch 1 rather than
+/// cutting both at the same sequence position. Dropping the block keeps the loud
+/// blocks-short-of-`shape[2]` error instead.
 #[test]
 fn plan_never_splits_at_batch_gt_1() {
     let (b, kv_h) = (2_usize, 2_usize);
@@ -277,7 +279,7 @@ fn plan_never_splits_at_batch_gt_1() {
     assert_eq!(plan.keep, 0, "the block is dropped, not kept whole");
     assert_eq!(
         plan.partial_rows, None,
-        "no split at b > 1 — the decode path cannot read a multi-block batched store"
+        "no split at b > 1 — a row prefix is not a sequence prefix there"
     );
 
     // The same shape at b == 1 does split, so the refusal is keyed on `b` and

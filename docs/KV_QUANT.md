@@ -2008,8 +2008,11 @@ the caller reshapes the concatenation head-major `[B, kv_h, S, D]`, a head-major
 per-block store transposes per-head values across a multi-append GQA cache
 (`kv_h > 1`, e.g. the post-SSD-hydrate decode-append path) — the same head
 scramble fixed for `QuantK` / `QuantV`. Each `append` now reorders the
-head-major chunk heads↔seq (`[B, new_seq, kv_h, D]`) before encoding and
-`dequant` reorders back; single-chunk cold prefill is the identity. The codec is
+head-major chunk heads↔seq (`[B, new_seq, kv_h, D]`) before encoding, and
+`dequant` reorders **each block back at its own sequence offset**
+(`seq_layout::transpose_chunked_seq_heads`) — reordering the whole concatenation
+in one pass is only equivalent at `B == 1`; see the `b > 1` note under the
+truncation planner. Single-chunk cold prefill is the identity. The codec is
 per-token-row positional, so the sidebands stay correctly associated: Iso
 per-(token, group) scale/norm and the constant `FIXED_QUAT` quaternion permute
 with the rows; the Rotor static rotor table and QJL projection are
@@ -3057,6 +3060,42 @@ cache — falls through to the legacy `update_*` entries, which pass
 site dequantizes the whole prefix on the same step, so `dequant` would take the
 identical readback if `blocks` were left short.
 
+**How reachable is the divergence?** Narrowly, and it is worth knowing why
+before writing a repro. The state needs a cache whose ring is live *and* whose
+CPU blocks were dropped — which only the fused decode path creates — followed by
+a decode-mode `update()` with `q_seq > 1` on **that same cache**. A warm
+prompt-cache continuation looks like it should qualify (gemma4's `is_prefix`
+flush appends the tail through decode-mode `update` with no enter/exit
+brackets), but it does not: that tail runs against a prompt-cache *clone*, and
+`try_deep_clone` materialises any ring-only tail into blocks and hands back a
+store with no ring at all, so there is nothing to diverge. What does qualify is a
+speculative verify chunk — a multi-token decode step on a live cache. So the
+codec can serve a normal single-request generate loop indefinitely without
+meeting it, which is why it surfaced from a truncation proof matrix rather than
+from serving, and why the guards above are the gate rather than a serve-time
+smoke test.
+
+**Every block push reconciles, and every reader derives its count from the same
+place.** Two holes in that used to be reachable and are now closed. The iso-V
+GPU-encode append (`QuantIsoV3::append_gpu`, the V side of the legacy
+`update_iso3` / `update_iso3_sym` entries) pushed a CPU block without touching a
+live ring, leaving the ring stale *and* the blocks short — it now calls
+`QuantIsoV3::reconcile_ring(device, RingDisposition::Drop)`, which takes the
+ring's prefix back and then drops the ring, matching what the CPU `append` does
+by clearing. That is one body, shared with `materialize_iso_v3_ring_tail`, which
+passes `RingDisposition::Keep` because its caller's `sync_ring` decides the
+ring's fate immediately after — the disposition is a parameter precisely because
+it is the only thing the two callers disagree on. The iso4 V
+side had the same hole in a separate ring-unaware helper; both of its callers now
+go through the ring-aware `iso4_gpu_append_into_v_blocks` with a `Skip` feed, and
+the helper is gone (it also stored its block head-major, unlike every other iso
+append). On the read side `QuantIsoK3::dequant_gpu` and
+`QuantIsoV3::dequant_gpu` counted `self.blocks` directly while their CPU siblings
+counted the ring-reconciled list, so a legitimate ring-only tail was rejected as
+a blocks-vs-shape disagreement (`dequant_gpu: actual_total=... !=
+declared_total=...`); both now start from `synced_iso_v_blocks`, which borrows
+(costs nothing) whenever the blocks already cover `shape[2]`.
+
 **Row vs. sequence units.** Every rotor/iso K and V store's per-append
 `RotorBlocks` / `IsoBlocks` carries `n_tokens` counting **rows**
 (`b * kv_h * seq_of_block`), not sequence positions, but `truncate_to(n)`
@@ -3082,26 +3121,58 @@ therefore **splits** the trailing block, cutting every per-row buffer — codes,
 per-group scales, per-group quaternions, per-token norms, and the rotor QJL
 sideband — to the accepted row count.
 
-**The split is `b == 1` only, and that is a correctness bound.** Every store
-ends `dequant` with `seq_layout::transpose_seq_heads` over the *concatenation*
-of its blocks, reading it as one `[B, S_total, kv_h, D]` run — but each block is
-only `[B, S_block, kv_h, D]`, so at `b > 1` the concatenation interleaves batch
-elements and any store holding more than one block decodes scrambled. Measured
-on the shipped fixture (`b = 2`, `kv_h = 2`, `head_dim = 96`, 5 positions): a
-two-block store disagrees with a one-block store over the same tokens on **960
-of 1920 elements**, spread across 10 of the 20 rows and straddling both reader
-batch halves — while the `b = 1` control matches to the last bit. Splitting at
-`b > 1` would manufacture that two-block state and convert a **loud**
-blocks-short-of-`shape[2]` error into silently scrambled K/V, so the planner
-drops the block there and lets the reconciliation guard report the gap.
-`sdpa::rotor_flash_shape_ok` refuses `b != 1` for the same underlying reason,
-which is also why a `b > 1` store never has a ring to rebuild from. Pinned by
-`quant_rotor_v3_tests::quant_rotor_v3_truncate_at_b_gt_1_stays_loud`, which
-asserts both halves: that the two-block store really is unreadable, and that a
-`b > 1` mid-block cut therefore returns `Err`.
+**The split is `b == 1` only, and that is a correctness bound.** The bound is
+*inside* one block. A block's rows run `[B, S_block, kv_h, D]`, so batch element
+1's rows all sit after batch element 0's, and `BlockRows::retain_rows` keeps a
+**row prefix**. At `b > 1` a row prefix is not a sequence prefix: a cut to
+`keep_seq` positions would keep every one of batch 0's rows and none of batch
+1's, silently dropping one batch element's tail instead of cutting both at the
+same position. So the planner drops the block there and lets the reconciliation
+guard report the gap. `sdpa::rotor_flash_shape_ok` refuses `b != 1` separately,
+because the GPU ring's per-step stride does not interleave batch — which is also
+why a `b > 1` store never has a ring to rebuild from. Pinned by
+`quant_rotor_v3_tests::quant_rotor_v3_truncate_at_b_gt_1_stays_loud`.
 
-The multi-block `b > 1` decode is broken independently of truncation and is not
-fixed here; the bound above only keeps this change from making it silent.
+Reading the *concatenation* of the blocks used to be a second, independent bound
+and is no longer one. Every store ended `dequant` with
+`seq_layout::transpose_seq_heads` over the concatenation, reading it as one
+`[B, S_total, kv_h, D]` run — but each block is only `[B, S_block, kv_h, D]`, so
+at `b > 1` the concatenation interleaves batch elements and any store holding
+more than one block decoded scrambled (measured on the `b = 2`, `kv_h = 2`,
+`head_dim = 96`, 5-position fixture: **960 of 1920 elements** disagreed with a
+one-block store, while the `b = 1` control matched to the last bit). Every
+block-accumulating CPU store now calls
+`seq_layout::transpose_chunked_seq_heads`, which reorders each block at its own
+sequence offset and is exactly the old whole-buffer reorder when `B == 1`. The
+per-store proof is `*_two_block_decode_matches_one_block_at_b_gt_1` — one per
+store, all thirteen, each over `(b, kv_h) ∈ {1,2} × {1,2}` — with the index-math
+oracle in `seq_layout_tests`.
+
+The **GPU** readers took the same reorder on the way in rather than the way out.
+`QuantIsoV3::dequant_gpu` / `QuantIsoK3::dequant_gpu` had the identical defect
+(they reshaped the kernel's flat output as one `[B, S, kv_h, D]` run), and it is
+the multi-block case that reaches them: every `*_sync_ring` clears the ring at
+`b != 1`, so `synced_iso_v_blocks` returns a borrowed multi-block list there.
+Both now build their kernel inputs through `iso_kernel_inputs_head_major`, which
+places each token row at its head-major position via
+`seq_layout::head_major_token_order`; the iso dequant kernel is per-token
+positional, so the flat result is already `[B, kv_h, S, D]` and the trailing
+reshape/transpose is gone.
+
+**Where the bound still stands.** Two readers refuse `b != 1` (with `S > 1`)
+rather than reorder:
+
+* The **flat GPU buffers** of the turbo / planar / affine stores (`QuantV`,
+  `QuantKTurbo3/4`, `QuantPlanarK/V`, `QuantK`) and the gated `QuantIsoV3` GPU
+  mirror. Each is a run of `[B, S_chunk, kv_h, D]` chunks written at
+  `prev_seq * words_per_step` with `b` folded into the stride, so the prefix
+  carries no chunk boundary to partition on.
+* `QuantK`'s **CPU** `codes` / `scales`, which are one flat append-only pair with
+  no per-append boundary recorded. The refusal is deliberately wider than the
+  defect — a single-append `b > 1` store would read correctly and is refused
+  anyway — because `b > 1` reaches no production path today and the boundaries
+  are not recoverable after the fact. Lifting it needs a recorded per-append
+  sequence length on the store.
 
 All eight rotor/iso K and V codecs share one crate-internal planner,
 `truncate_plan` in `rmlx-kv-quant/src/storage/mod.rs`, plus a `BlockRows`

@@ -24,7 +24,7 @@ use crate::planarquant_msl::{
 use crate::planarquant::{planar_dequantize, planar_quantize, PlanarBlocks};
 use crate::turboquant::GROUP_SIZE;
 
-use super::seq_layout::{transpose_heads_seq, transpose_seq_heads};
+use super::seq_layout::{transpose_chunked_seq_heads, transpose_heads_seq};
 use super::KV_PAGE_SIZE;
 
 // ── PlanarQuant V storage ─────────────────────────────────────────────────────
@@ -418,6 +418,29 @@ impl QuantPlanarV {
                 // for raw byte-readers (SSD spill / hydrate); this is the
                 // post-hydrate / chunked-prefill dequant path, off the decode hot
                 // path, so the copy is acceptable.
+                // The flat GPU buffer is a run of `[B, S_chunk, kv_h, D]`
+                // chunks written at `prev_seq * words_per_step`, and
+                // `words_per_step` folds `b` in. Reading the prefix as one
+                // `[B, S_total, kv_h, D]` run therefore interleaves batch
+                // elements once `B > 1`. Unlike the CPU half this arm has no
+                // payload-vs-shape coverage check — the slice is sized *from*
+                // `shape[2]` — so `S == 1` is not evidence that the prefix is a
+                // single `[B, 1, kv_h, D]` chunk: a mid-chunk truncate at
+                // `b > 1` lowers `shape[2]` without touching this buffer. Only
+                // the empty store is exempt, because `truncate_to(0)` (which
+                // `KvStorage::reset` routes through) must still decode to
+                // nothing. Refuse
+                // rather than return a scrambled tensor — the CPU half of this
+                // reader handles every `B` via
+                // `seq_layout::transpose_chunked_seq_heads`, which is what the
+                // block list makes possible and this buffer does not.
+                if self.shape[0] != 1 && self.shape[2] != 0 {
+                    return Err(rmlx_core::error::Error::Quant(format!(
+                        "QuantPlanarV::dequantize_choice: the flat GPU buffer is b == 1 only \
+                         (its per-step stride does not interleave batch), got shape {:?}",
+                        self.shape
+                    )));
+                }
                 let seq_major_shape = [self.shape[0], s, self.shape[1], self.shape[3]];
                 let out = if self.bits == 3 {
                     planar_dequantize_v3_gpu(&codes, &scales, &rotations, &seq_major_shape, device)?
@@ -458,7 +481,19 @@ impl QuantPlanarV {
         let kv_h = self.shape[1] as usize;
         let s = self.shape[2] as usize;
         let d = self.shape[3] as usize;
-        Ok((transpose_seq_heads(&out, b, s, kv_h, d), None))
+        // Blocks are sequence-major (see `append`), one per append; reorder each
+        // at its own sequence offset back to head-major `[B, kv_h, S, D]`.
+        // Reading the concatenation as a single run would interleave batch
+        // elements once `B > 1`.
+        let out = transpose_chunked_seq_heads(
+            &out,
+            b,
+            s,
+            kv_h,
+            d,
+            self.blocks.iter().map(super::BlockRows::rows),
+        )?;
+        Ok((out, None))
     }
 
     /// Truncate the store to `n` sequence positions.
@@ -515,3 +550,7 @@ impl QuantPlanarV {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "quant_planar_v_tests.rs"]
+mod quant_planar_v_tests;

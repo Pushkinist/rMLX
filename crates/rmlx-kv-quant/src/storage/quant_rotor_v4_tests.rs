@@ -246,3 +246,53 @@ fn quant_rotor_v4_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
         );
     }
 }
+
+// ── Batch-axis block-boundary parity ──────────────────────────────────
+
+/// Two appends must decode exactly like one append of the same tokens, at
+/// `B > 1` as well as `B == 1`.
+///
+/// Each block covers `[B, S_block, kv_h, D]`, so the concatenation of two
+/// blocks is not one `[B, S_total, kv_h, D]` run — reading it as one maps the
+/// second block's batch-0 rows onto batch-1 sequence slots. The single-append
+/// store holds exactly one block and therefore concatenates nothing, which is
+/// what makes it the oracle here.
+///
+/// Mutation check: put `seq_layout::transpose_seq_heads` over the whole
+/// concatenation back in `QuantRotorV4::dequant` and this goes red at
+/// `b = 2` while staying green at `b = 1` — which is how the defect stayed
+/// invisible.
+#[test]
+fn quant_rotor_v4_two_block_decode_matches_one_block_at_b_gt_1() {
+    for (b, kv_h) in [(1_usize, 1_usize), (1, 2), (2, 1), (2, 2)] {
+        let head_dim = 96_usize;
+        let (n0, n1) = (2_usize, 3_usize);
+        let shape = |n: usize| [b as i32, kv_h as i32, n as i32, head_dim as i32];
+
+        let mut one = QuantRotorV4::new(vec![b as i32, kv_h as i32, 0, head_dim as i32], 512, 5);
+        one.append(
+            &crate::test_utils::batch_head_chunk(b, kv_h, 0, n0 + n1, head_dim),
+            &shape(n0 + n1),
+        )
+        .expect("single append");
+        let oracle = one.dequant().expect("one-block dequant");
+
+        let mut two = QuantRotorV4::new(vec![b as i32, kv_h as i32, 0, head_dim as i32], 512, 5);
+        two.append(
+            &crate::test_utils::batch_head_chunk(b, kv_h, 0, n0, head_dim),
+            &shape(n0),
+        )
+        .expect("append chunk 0");
+        two.append(
+            &crate::test_utils::batch_head_chunk(b, kv_h, n0, n1, head_dim),
+            &shape(n1),
+        )
+        .expect("append chunk 1");
+        let got = two.dequant().expect("two-block dequant");
+
+        assert_eq!(
+            got, oracle,
+            "two-block decode must equal the one-block oracle at b={b} kv_h={kv_h}"
+        );
+    }
+}
