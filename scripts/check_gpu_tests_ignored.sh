@@ -122,6 +122,12 @@
 #   * The test really drives the GPU -> add the attribute:
 #       #[ignore = "GPU Metal context — run in isolation: \
 #                   cargo test <filter> -- --ignored --test-threads=1"]
+#     Wrapping the reason across lines with a trailing `\` is safe: the
+#     attribute capture below closes on the line whose last SIGNIFICANT
+#     character is `]`, which is the `"]` such a continuation ends in. It was
+#     not always so — a close-test keyed on the wrapped-`#[cfg(..)]` shape `)]`
+#     alone left this exact spelling latched for the rest of the file, so the
+#     documented way to comply was the way to blind the gate.
 #   * The test only exercises a guard that returns before any GPU work ->
 #     pass `Device::Cpu`, and leave it un-ignored so it keeps running in the
 #     default gate.
@@ -208,14 +214,40 @@
 #       `trait_where_signature_open_hole` pins the open answer.
 #     * A capture that is still open at a file boundary means the parser lost
 #       the file, so it reports `U` rather than letting the remainder go
-#       unclassified.
+#       unclassified. This holds for all THREE captures — fn item, macro body
+#       and attribute block.
+#
+#   ATTRIBUTES ARE A THIRD CAPTURE, with the same latch hazard. An attribute
+#   that does not close on its own line latches until one does, and while
+#   latched it consumes every line — including every `fn` — so a latch that
+#   never ends silently unclassifies the rest of the file. The close-test is
+#   therefore the same "last SIGNIFICANT character" rule the fn arm uses, not a
+#   match against one wrapped spelling: reading only `)]` (how a wrapped
+#   `#[cfg(..)]` ends) missed the wrapped STRING form `"]`, and reading the raw
+#   line missed any attribute with a trailing comment. The string state is
+#   carried across the line break (`bare()`'s `q0` / `bare_q`), so a `//` in the
+#   continued payload of a wrapped string is not mistaken for a comment.
 #
 #   `bare()` finds the trailing comment with a string-aware scan, so neither a
 #   `//` inside a string literal nor a char literal of any payload form (`b'"'`,
-#   `'\x1b'`, `'\u{FFFD}'`, `'é'`) derails it. Remaining known parse hazards:
+#   `'\x1b'`, `'\u{FFFD}'`, `'é'`) derails it. Remaining known parse hazards,
+#   which apply to the attribute close-test exactly as they do to the fn one:
 #   raw strings (the `\` in `r"a\"` is not an escape, and `r#"…"#` hashes are
 #   not tracked) and block comments — a `/* … */` spanning an item's opening
-#   line is read literally.
+#   line is read literally. An attribute whose closing `]` is hidden behind one
+#   of those latches, and what happens next splits two ways — state both rather
+#   than claim the good one:
+#     * nothing later in the file bares to `]` -> the file boundary reports `U`.
+#       Fail-closed.
+#     * something later does — a subsequent `#[test]` is exactly that shape ->
+#       the latch ends there, classification resumes correctly, and the items
+#       swallowed in between are gone with NO report. Fail-OPEN, the same shape
+#       as the `where`-split hole above, and not detectable from here;
+#       reconciliation against the compiled `cargo test -- --list` is what would
+#       catch it.
+#   What the close-test buys is not immunity but reachability: getting into that
+#   state now requires one of the two `bare()` hazards, where before it needed
+#   only the ordinary wrapped-string spelling.
 #
 #   PORTABLE AWK ONLY — this runs on the developer's BSD awk and on whatever
 #   the Linux CI image provides. Two constructs are out of bounds because they
@@ -351,9 +383,16 @@ read -r -d '' AWK_DETECT <<'AWK' || true
     # the everyday case — is not a comment, and cutting there would end the
     # line in mid-string and flip every decision that reads its last
     # character.
-    function bare(s,   i, n, q, c, rest, w, ascii) {
+    #
+    # `q0` seeds that string state, and `bare_q` reports where the scan ended,
+    # so a caller walking a MULTI-LINE construct can carry the state across the
+    # line break. A string continued with a trailing `\` is still open on the
+    # next line; scanning that line from q=0 would read its payload as code and
+    # cut at the first `//` in it. Callers that read one self-contained line
+    # pass neither and get the old q=0 behaviour exactly.
+    function bare(s, q0,   i, n, q, c, rest, w, ascii) {
         n = length(s)
-        q = 0
+        q = q0 + 0
         for (i = 1; i <= n; i++) {
             c = substr(s, i, 1)
             if (c == "\\" && q) { i++; continue }
@@ -401,6 +440,7 @@ read -r -d '' AWK_DETECT <<'AWK' || true
                 break
             }
         }
+        bare_q = q
         sub(/[[:space:]]+$/, "", s)
         return s
     }
@@ -436,13 +476,32 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         macro_fn_n = 0
     }
 
+    # Tear down an attribute capture whose closing `]` was never found. The
+    # capture is greedy — every later line, including every `fn`, joins the
+    # attribute block — so silence here means the rest of the file was never
+    # classified while the gate reported a clean scan. That is fail-OPEN and it
+    # is the one direction this gate must never take, so an attribute the
+    # close-test could not read is a hard failure, exactly like an unterminated
+    # fn or macro body.
+    function flush_attr() {
+        if (in_attr) {
+            printf "U  %s: %s (attribute never closed — parser lost the file from here)\n",
+                attr_file, attr_label
+        }
+        in_attr = 0
+        attr_q = 0
+        attr_file = ""
+        attr_label = ""
+    }
+
     # New file: reset the per-file parse state and derive this file's module
     # name (directory name for a mod.rs, otherwise the file stem). The module
     # name is how a QUALIFIED cross-file call `module::helper(..)` binds.
     FNR == 1 {
         flush_fn()
         flush_macro()
-        in_attr = 0; attrs = ""; last_macro_name = ""
+        flush_attr()
+        attrs = ""; last_macro_name = ""
         nseg = split(FILENAME, seg, "/")
         base = seg[nseg]
         if (base == "mod.rs" && nseg >= 2) {
@@ -454,9 +513,19 @@ read -r -d '' AWK_DETECT <<'AWK' || true
     }
 
     # ── Multi-line attribute continuation ────────────────────────────────
+    # Closed by the line's SIGNIFICANT text ending in `]`, carrying the string
+    # state across the line break. Keying this on the wrapped-`#[cfg(..)]`
+    # shape `)]` alone reads only one of the two ways an attribute wraps: a
+    # wrapped string argument ends `"]`, never `)]`, so such an attribute never
+    # closed and the capture swallowed the rest of the FILE — every later item
+    # unclassified, and a clean OK printed over them. The `)]` arm is kept
+    # ahead of the general one: it needs no string scan, so it still closes a
+    # wrapped list whose last line the scan below would misread.
     in_attr {
         attrs = attrs " " $0
-        if ($0 ~ /^[[:space:]]*\)\]/) { in_attr = 0 }
+        sig = bare($0, attr_q)
+        attr_q = bare_q
+        if ($0 ~ /^[[:space:]]*\)\]/ || sig ~ /\]$/) { in_attr = 0 }
         next
     }
     # ── Attribute (any indent) ──────────────────────────────────────────
@@ -465,7 +534,17 @@ read -r -d '' AWK_DETECT <<'AWK' || true
         # Count `#[test]`s declared inside a macro body, so the END check can
         # compare them against the test items actually extracted from it.
         if (in_macro && !in_fn && $0 ~ /#\[(tokio::)?test[](]/) { macro_test_n++ }
-        if ($0 !~ /\][[:space:]]*$/) { in_attr = 1 }
+        # Self-contained iff the SIGNIFICANT text closes it. Read from the raw
+        # line, a trailing comment (`#[test] // why`) hides the closing `]` and
+        # latches the capture over the rest of the file — the same fail-open as
+        # the continuation rule above, reached by an easier-to-write shape.
+        if (bare($0) !~ /\]$/) {
+            in_attr = 1
+            attr_q = bare_q
+            attr_file = FILENAME
+            attr_label = $0
+            sub(/^[[:space:]]+/, "", attr_label)
+        }
         next
     }
     # ── Per-test exemption marker (line-leading, in the attr block) ─────
@@ -618,9 +697,10 @@ read -r -d '' AWK_DETECT <<'AWK' || true
 
     END {
         # An item left open by the last file still gets its check — otherwise
-        # an unterminated fn or macro body is a free pass.
+        # an unterminated fn, macro body or attribute is a free pass.
         flush_fn()
         flush_macro()
+        flush_attr()
 
         # ── Seed: fns naming Device::Gpu (literal) or a file-scoped
         #    `const … = Device::Gpu` alias in their own body. Seeds feed a
@@ -799,8 +879,9 @@ fi
 # an unchecked test, and listing over it hands the runner a population that is
 # missing one. This is the same fail-closed rule as "scanned 0 files".
 if [ -n "$unreadable" ]; then
-    echo "ERROR: a macro_rules! body declares #[test] items this gate cannot read" >&2
-    echo "       (or an item never closed, ending classification mid-file):" >&2
+    echo "ERROR: this gate could not classify part of a scanned file" >&2
+    echo "       (an unreadable macro_rules! body, or an item or attribute that" >&2
+    echo "        never closed, ending classification mid-file):" >&2
     printf '%s' "$unreadable" >&2
     echo >&2
     echo "The gate classifies a test-generating macro from its body: it needs an" >&2
@@ -809,13 +890,14 @@ if [ -n "$unreadable" ]; then
     echo "its fn's line, and a whole macro_rules! on one line are all invisible —" >&2
     echo "and an invisible GPU test is exactly what this gate exists to prevent." >&2
     echo >&2
-    echo "A 'fn never closed' finding means the parser lost the file at that item," >&2
-    echo "so everything after it went unclassified. Both are reported rather than" >&2
-    echo "skipped, because a shape this gate cannot read looks exactly like a" >&2
-    echo "compliant one." >&2
+    echo "A 'fn never closed' or 'attribute never closed' finding means the parser" >&2
+    echo "lost the file at that point, so everything after it went unclassified. All" >&2
+    echo "are reported rather than skipped, because a shape this gate cannot read" >&2
+    echo "looks exactly like a compliant one." >&2
     echo >&2
     echo "Write the generated fn as \`fn \$name()\` on its own line with its" >&2
-    echo "attributes above it, or extend the classifier to read the new shape." >&2
+    echo "attributes above it, close the attribute on a line whose last significant" >&2
+    echo "character is \`]\`, or extend the classifier to read the new shape." >&2
     exit 1
 fi
 

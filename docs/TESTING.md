@@ -225,7 +225,7 @@ so a `#[ignore]` deleted there fails the gate regardless of how many invocations
 exist. Reachability is traced from the body like any other fn's, so a body that
 reaches Metal one call deep (the shape in the tree today) counts.
 
-Three things are fail-closed rather than skipped, because a shape the parser
+Four things are fail-closed rather than skipped, because a shape the parser
 cannot read looks exactly like a compliant one:
 
 * A `macro_rules!` body that declares more `#[test]` than the gate could read
@@ -235,9 +235,12 @@ cannot read looks exactly like a compliant one:
   `#[test]` — no `fn` line ever follows, so nothing is classifiable.
 * An item whose closing brace is never found, which means the parser lost the
   file at that point and everything after it went unclassified.
+* An **attribute** whose closing `]` is never found, for the same reason: while
+  an attribute capture is latched it consumes every line, `fn` lines included.
 
 Write the generated fn as `fn $name()` on its own line with its attributes above
-it, or extend the classifier.
+it, close the attribute on a line whose last significant character is `]`, or
+extend the classifier.
 
 The first counter is also what stops the original blindness from returning
 quietly. A future edit that narrows the fn-name recognition again does not make
@@ -279,13 +282,59 @@ emitted**: the swallowed `#[test]` was never registered, so nothing looks
 unterminated, and the gate reports `OK` at exit 0 over an un-ignored
 `Device::Gpu` test.
 
-This is **fail-open**, not fail-closed — the one place in this gate that is. It
-is unreachable in the tree today (no scanned file has a where-split signature),
-and the class is tracked in #386 for reconciliation against the compiled `cargo
-test -- --list`, which is what actually closes it. Two fixtures bracket it:
-`trait_where_signature` pins the sub-case where nothing closes the latch (loud),
-and `trait_where_signature_open_hole` pins the open answer so the hole is
-visible in the corpus rather than only in prose.
+This is **fail-open**, not fail-closed. It is unreachable in the tree today (no
+scanned file has a where-split signature), and the class is tracked in #386 for
+reconciliation against the compiled `cargo test -- --list`, which is what
+actually closes it. Two fixtures bracket it: `trait_where_signature` pins the
+sub-case where nothing closes the latch (loud), and
+`trait_where_signature_open_hole` pins the open answer so the hole is visible in
+the corpus rather than only in prose.
+
+It is the only fail-open hole reachable by a shape the parser reads correctly.
+The attribute capture below has a second, narrower one that needs a parse hazard
+first — see the end of that section.
+
+#### The attribute capture
+
+Attributes are the third latching capture, alongside the fn item and the
+`macro_rules!` body, and they carry the same hazard: an attribute that does not
+close on its own line latches, and while latched it consumes every following
+line — `fn` lines included — so a latch that never ends silently unclassifies
+the rest of the file.
+
+The close-test is the same **last significant character** rule the fn arm uses.
+Two narrower spellings of it were each wrong on their own:
+
+* keyed on `)]`, the shape a wrapped `#[cfg(..)]` ends in, it never matched the
+  wrapped **string** form `"]` — which is how `#[ignore = "GPU Metal context: \`
+  wraps, i.e. exactly the remediation this gate's own error message recommends.
+  The documented way to comply was the way to blind it;
+* read from the **raw** line, a trailing comment (`#[test] // why`) hides the
+  closing `]` and latches just as thoroughly.
+
+String state is carried across the line break, so a `//` inside the continued
+payload of a wrapped string is not mistaken for a comment.
+
+Neither recognition rule can be complete, so an attribute still open at a file
+boundary is reported (`U`) rather than passed over.
+
+**What remains open here**, stated rather than papered over: that backstop only
+covers a latch that reaches the end of the file. If any *later, unrelated* line
+bares to `]` — a subsequent `#[test]` is exactly that shape — the latch ends
+there instead. Classification resumes correctly, but the items swallowed in
+between are gone with **no report**. That is fail-open, the same shape as the
+`where`-split hole above, and this parser cannot see it; reconciliation against
+the compiled `cargo test -- --list` is what would.
+
+So the close-test does not buy immunity, it buys reachability. Getting into that
+state now requires one of the two `bare()` hazards below (a raw string, a block
+comment); before, the ordinary wrapped-string spelling was enough — and that
+spelling is the one the gate's own error message recommends.
+
+Three fixtures pin the section: `attr_multiline_ignore` (the wrapped-string
+form closes, and is read as one block rather than merely un-latched),
+`attr_trailing_comment` (a comment after the closing `]` does not latch), and
+`attr_never_closes` (an unterminated attribute is reported, not swallowed).
 
 The trailing-comment scan is string-aware, so neither a URL in a one-line fn
 (`"http://…"`) nor a char literal of any payload form (`b'"'`, `'\x1b'`,
@@ -300,7 +349,8 @@ with a non-ASCII unit, which is what keeps a lifetime tick followed by a nearby
 quote (`<'a>'x'`) from being consumed as though it were a literal. It does
 **not** handle raw strings (the `\` in `r"a\"` is not an escape, and `r#"…"#`
 hashes are not tracked) or block comments: a `/* … */` spanning an item's
-opening line is read literally.
+opening line is read literally. The same scan decides the attribute close-test,
+so those two hazards bound that rule exactly as they bound this one.
 
 Still out of reach on the macro side: a `macro_rules!` with a **non-brace**
 delimiter (`macro_rules! m ( .. );`). Its name is captured so findings are

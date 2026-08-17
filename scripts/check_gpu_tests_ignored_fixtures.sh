@@ -91,7 +91,7 @@ if [ -z "${GATE_AWK_SHIM:-}" ]; then
 fi
 
 VIOLATION="ERROR: GPU-touching tests missing the #[ignore]"
-UNREADABLE="ERROR: a macro_rules! body declares #[test] items this gate cannot read"
+UNREADABLE="ERROR: this gate could not classify part of a scanned file"
 # Pins the file count too, so a fixture that lost its source file cannot pass by
 # scanning nothing.
 CLEAN="OK: every GPU-touching test carries #[ignore] (1 files"
@@ -109,6 +109,9 @@ CASES=(
     "trait_where_signature|1|${UNREADABLE}|fn never closed||a where-split signature latches, and is loud ONLY when nothing closes the latch"
     "trait_where_signature_open_hole|0|${CLEAN}||ERROR|KNOWN OPEN HOLE: one nested block closes the latch and the swallowed GPU test is reported clean"
     "fn_never_closes|1|${UNREADABLE}|fn never closed||a capture that cannot terminate is reported, not skipped"
+    "attr_multiline_ignore|1|${VIOLATION}|later_plain_gpu_no_ignore|probe|a wrapped #[ignore = \"..\" ] closes, and is read rather than merely un-latched"
+    "attr_trailing_comment|1|${VIOLATION}|gpu_after_comment_attr||a comment after an attribute's closing ] does not latch the capture"
+    "attr_never_closes|1|${UNREADABLE}|attribute never closed||an attribute capture that cannot terminate is reported, not swallowed"
     "exempt_in_body|1|${VIOLATION}|gpu_marker_inside_body||a marker among a fn's statements exempts nothing"
     "exempt_in_body|1|${VIOLATION}|gpu_after_marker_in_body||and does not carry to the next fn"
     "macro_one_line_no_test|1|${VIOLATION}|gpu_cell!{\$name}||a one-line macro declaring no test is stepped over, not latched"
