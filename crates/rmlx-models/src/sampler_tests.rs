@@ -982,35 +982,108 @@ fn repetition_penalty_breaks_single_token_loop() {
 // The oracle in this section is MLX's own `argmax`, called through the same
 // FFI the decode loop uses. It shares no arithmetic with the host scan under
 // test: one is a C++/Metal reduction over the array, the other a Rust loop
-// over a host copy. `Device::Cpu` is used only so the tests run in the
-// ordinary (non-`#[ignore]`) suite; MLX's CPU and Metal argmax implement the
-// same tie rule, which the first test pins explicitly.
+// over a host copy.
+//
+// Most of these run on `Device::Cpu` so they land in the ordinary
+// (non-`#[ignore]`) suite. `host_argmax` is written against the **Metal**
+// reduction's seed, so the Metal backend is checked rather than assumed by the
+// `#[ignore]`d `Device::Gpu` mirrors at the end of this section — a CPU-only
+// oracle cannot establish a Metal property.
 
-/// Oracle characterisation: MLX `argmax` resolves an exact tie to the
-/// **lowest** index. Every other test in this section is written against that
-/// fact, so it is pinned here on its own — if a future MLX bump changes the
-/// rule this fails first and names the cause.
-#[test]
+/// Decode the `[1] I32` selection Array into a token id.
 #[allow(
     clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] I32 result, and sampler calls on inputs built in the same fn — all infallible by construction"
 )]
 #[allow(
     clippy::unwrap_used,
-    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] I32 result, and sampler calls on inputs built in the same fn — all infallible by construction"
 )]
+fn token_id(a: &Array) -> u32 {
+    materialise(a);
+    let b = a.to_bytes().unwrap();
+    i32::from_le_bytes(b[..4].try_into().unwrap()) as u32
+}
+
+/// Device `argmax` over a `[1, vocab]` row, on the given stream.
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] I32 result, and sampler calls on inputs built in the same fn — all infallible by construction"
+)]
+fn device_argmax(logits: &Array, device: Device) -> u32 {
+    token_id(&argmax(logits, -1, device).unwrap())
+}
+
+/// Host greedy over the same row, with no mask and no penalties.
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] I32 result, and sampler calls on inputs built in the same fn — all infallible by construction"
+)]
+fn host_greedy(logits: &Array, device: Device) -> u32 {
+    let nop = PenaltyConfig::default();
+    token_id(&argmax_with_penalties(logits, None, &nop, &[], device).unwrap())
+}
+
+/// Wrap an f32 row as a `[1, n]` F32 Array.
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] I32 result, and sampler calls on inputs built in the same fn — all infallible by construction"
+)]
+fn f32_row(data: &[f32]) -> Array {
+    Array::from_bytes(f32_as_bytes(data), &[1, data.len() as i32], Dtype::F32).unwrap()
+}
+
+/// Width of the wide tie fixtures — a real gemma-4 vocabulary.
+const WIDE_VOCAB: usize = 262_144;
+
+/// A `WIDE_VOCAB`-wide row of `0.5` with `12.0` at each of `peaks`.
+fn wide_row_with_peaks(peaks: &[usize]) -> Vec<f32> {
+    let mut row = vec![0.5f32; WIDE_VOCAB];
+    for &p in peaks {
+        if let Some(slot) = row.get_mut(p) {
+            *slot = 12.0;
+        }
+    }
+    row
+}
+
+/// The tied-row shapes the contract has to cover, as `(name, row, expected
+/// lowest-id max)`. Shared by the CPU tests and their `Device::Gpu` mirrors so
+/// the two cannot drift apart.
+///
+/// The wide rows exist because MLX's arg-reduce switches between a single- and
+/// a multi-threadgroup strategy with size, and a tie split across that boundary
+/// is where a parallel reduction's tie rule can break. An 8-wide row cannot
+/// reach that shape.
+fn tie_shapes() -> Vec<(&'static str, Vec<f32>, u32)> {
+    vec![
+        ("narrow", vec![1.0f32, 9.0, 3.0, 2.0, 9.0, 0.0, 9.0, 4.0], 1),
+        (
+            "wide-spread",
+            wide_row_with_peaks(&[7, WIDE_VOCAB / 2, WIDE_VOCAB - 1]),
+            7,
+        ),
+        (
+            "wide-tail-adjacent",
+            wide_row_with_peaks(&[WIDE_VOCAB - 2, WIDE_VOCAB - 1]),
+            (WIDE_VOCAB - 2) as u32,
+        ),
+    ]
+}
+
+/// Oracle characterisation: MLX `argmax` resolves an exact tie to the
+/// **lowest** index, at every width the sampler sees. Every other test in this
+/// section is written against that fact, so it is pinned on its own — if a
+/// future MLX bump changes the rule this fails first and names the cause.
+#[test]
 fn mlx_argmax_breaks_ties_to_lowest_index() {
-    // Three exactly-equal maxima at 1, 4 and 6.
-    let data: [f32; 8] = [1.0, 9.0, 3.0, 2.0, 9.0, 0.0, 9.0, 4.0];
-    let logits = Array::from_bytes(f32_as_bytes(&data), &[1, 8], Dtype::F32).unwrap();
-    let idx = argmax(&logits, -1, Device::Cpu).unwrap();
-    materialise(&idx);
-    let b = idx.to_bytes().unwrap();
-    let v = i32::from_le_bytes(b[..4].try_into().unwrap());
-    assert_eq!(
-        v, 1,
-        "MLX argmax must return the first of three tied maxima"
-    );
+    for (name, row, expect) in tie_shapes() {
+        let got = device_argmax(&f32_row(&row), Device::Cpu);
+        assert_eq!(
+            got, expect,
+            "{name}: MLX argmax must return the first of the tied maxima"
+        );
+    }
 }
 
 /// The host greedy path (`temperature == 0` with penalties) must return the
@@ -1018,72 +1091,115 @@ fn mlx_argmax_breaks_ties_to_lowest_index() {
 /// only input where the two reductions can differ, so it is the only input
 /// that tests the contract.
 #[test]
-#[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-)]
-#[allow(
-    clippy::unwrap_used,
-    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
-)]
 fn host_greedy_matches_device_argmax_on_a_tie() {
-    let data: [f32; 8] = [1.0, 9.0, 3.0, 2.0, 9.0, 0.0, 9.0, 4.0];
-    let logits = Array::from_bytes(f32_as_bytes(&data), &[1, 8], Dtype::F32).unwrap();
-
-    let device_idx = argmax(&logits, -1, Device::Cpu).unwrap();
-    materialise(&device_idx);
-    let db = device_idx.to_bytes().unwrap();
-    let device_id = i32::from_le_bytes(db[..4].try_into().unwrap());
-
-    let nop = PenaltyConfig::default();
-    let host = argmax_with_penalties(&logits, None, &nop, &[], Device::Cpu).unwrap();
-    materialise(&host);
-    let hb = host.to_bytes().unwrap();
-    let host_id = i32::from_le_bytes(hb[..4].try_into().unwrap());
-
-    assert_eq!(
-        host_id, device_id,
-        "host greedy picked {host_id}, device argmax picked {device_id} on the same row"
-    );
+    for (name, row, _) in tie_shapes() {
+        let logits = f32_row(&row);
+        let device_id = device_argmax(&logits, Device::Cpu);
+        let host_id = host_greedy(&logits, Device::Cpu);
+        assert_eq!(
+            host_id, device_id,
+            "{name}: host greedy picked {host_id}, device argmax picked {device_id}"
+        );
+    }
 }
 
-/// Same contract, but the tie is *created* by a penalty rather than present in
-/// the raw row — the shape a served request actually reaches, since the host
-/// greedy path only runs when a penalty or a logit bias is active.
+/// Same contract, but the tie is *created* by a `logit_bias` rather than
+/// present in the raw row — one of the two shapes a served request actually
+/// reaches, since the host greedy path only runs when a penalty or a bias is
+/// active.
 #[test]
 #[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-)]
-#[allow(
     clippy::unwrap_used,
-    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] I32 result, and sampler calls on inputs built in the same fn — all infallible by construction"
 )]
 fn host_greedy_matches_device_argmax_when_a_bias_creates_the_tie() {
     // Raw row has a unique max at 0. A +2.0 bias on id 3 lifts it to exactly
     // 5.0 — an exact tie with id 0, no rounding involved.
-    let data: [f32; 6] = [5.0, 1.0, 2.0, 3.0, 0.5, 4.0];
-    let logits = Array::from_bytes(f32_as_bytes(&data), &[1, 6], Dtype::F32).unwrap();
+    let logits = f32_row(&[5.0, 1.0, 2.0, 3.0, 0.5, 4.0]);
     let cfg = PenaltyConfig {
         logit_bias: vec![(3, 2.0)],
         ..PenaltyConfig::default()
     };
-    let host = argmax_with_penalties(&logits, None, &cfg, &[], Device::Cpu).unwrap();
-    materialise(&host);
-    let hb = host.to_bytes().unwrap();
-    let host_id = i32::from_le_bytes(hb[..4].try_into().unwrap());
+    let host_id = token_id(&argmax_with_penalties(&logits, None, &cfg, &[], Device::Cpu).unwrap());
 
     // Oracle: apply the same bias on the device and reduce there.
-    let biased: [f32; 6] = [5.0, 1.0, 2.0, 5.0, 0.5, 4.0];
-    let biased_arr = Array::from_bytes(f32_as_bytes(&biased), &[1, 6], Dtype::F32).unwrap();
-    let device_idx = argmax(&biased_arr, -1, Device::Cpu).unwrap();
-    materialise(&device_idx);
-    let db = device_idx.to_bytes().unwrap();
-    let device_id = i32::from_le_bytes(db[..4].try_into().unwrap());
+    let device_id = device_argmax(&f32_row(&[5.0, 1.0, 2.0, 5.0, 0.5, 4.0]), Device::Cpu);
 
     assert_eq!(
         host_id, device_id,
         "bias-induced tie: host greedy picked {host_id}, device argmax picked {device_id}"
+    );
+}
+
+/// The other route: the **repetition penalty**, which is the one the field
+/// report names. `rep_penalty` divides a positive logit by the penalty, and
+/// that division maps distinct f32 values onto equal ones — `1.1f32 / 1.1f32`
+/// is exactly `1.0f32`, so a row holding both `1.1` and `1.0` ties after the
+/// penalty is applied to the first.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] I32 result, and sampler calls on inputs built in the same fn — all infallible by construction"
+)]
+fn host_greedy_matches_device_argmax_when_rep_penalty_creates_the_tie() {
+    // id 3 = 1.1 is the unique max. With id 3 in the penalty window and
+    // rep_penalty 1.1, it becomes exactly 1.0 — tied with id 1.
+    let logits = f32_row(&[0.25, 1.0, 0.5, 1.1, 0.75]);
+    let cfg = PenaltyConfig {
+        rep_penalty: 1.1,
+        ..PenaltyConfig::default()
+    };
+    let host_id = token_id(&argmax_with_penalties(&logits, None, &cfg, &[3], Device::Cpu).unwrap());
+
+    // Oracle: the post-penalty row, reduced on the device. Built from the
+    // literal 1.0 rather than by recomputing 1.1 / 1.1, so it shares no
+    // arithmetic with the penalty under test.
+    let device_id = device_argmax(&f32_row(&[0.25, 1.0, 0.5, 1.0, 0.75]), Device::Cpu);
+    assert_eq!(device_id, 1, "post-penalty row ties at ids 1 and 3");
+
+    assert_eq!(
+        host_id, device_id,
+        "rep-penalty tie: host greedy picked {host_id}, device argmax picked {device_id}"
+    );
+}
+
+/// The documented "penalties active, with or without a constraint" sub-case:
+/// a mask and a penalty together, with the tie among the *allowed* ids.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] I32 result, and sampler calls on inputs built in the same fn — all infallible by construction"
+)]
+fn host_greedy_matches_device_argmax_with_mask_and_penalties() {
+    // Raw max is id 5. The mask forbids it, leaving ids {1, 2, 4}; a +3.0 bias
+    // on id 4 lifts it from 1.0 to exactly 4.0, tying with the allowed id 1.
+    let logits = f32_row(&[0.5, 4.0, 2.0, 9.0, 1.0, 12.0]);
+    let mask = vec![false, true, true, false, true, false];
+    let cfg = PenaltyConfig {
+        logit_bias: vec![(4, 3.0)],
+        ..PenaltyConfig::default()
+    };
+    let host_id =
+        token_id(&argmax_with_penalties(&logits, Some(&mask), &cfg, &[], Device::Cpu).unwrap());
+
+    // Oracle: the same row with the mask and bias folded in by hand, reduced
+    // on the device.
+    let device_id = device_argmax(
+        &f32_row(&[
+            f32::NEG_INFINITY,
+            4.0,
+            2.0,
+            f32::NEG_INFINITY,
+            4.0,
+            f32::NEG_INFINITY,
+        ]),
+        Device::Cpu,
+    );
+    assert_eq!(device_id, 1, "masked+biased row ties at ids 1 and 4");
+
+    assert_eq!(
+        host_id, device_id,
+        "mask+penalty tie: host greedy picked {host_id}, device argmax picked {device_id}"
     );
 }
 
@@ -1094,112 +1210,38 @@ fn host_greedy_matches_device_argmax_when_a_bias_creates_the_tie() {
 /// its Metal reduction with `-inf`, so a leading `NaN` is the one shape where
 /// MLX's own two backends disagree and no host rule can match both.
 #[test]
-#[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-)]
-#[allow(
-    clippy::unwrap_used,
-    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
-)]
 fn host_greedy_skips_nan_like_the_device() {
-    let data: [f32; 4] = [1.0, 3.0, f32::NAN, 2.0];
-    let logits = Array::from_bytes(f32_as_bytes(&data), &[1, 4], Dtype::F32).unwrap();
-
-    let device_idx = argmax(&logits, -1, Device::Cpu).unwrap();
-    materialise(&device_idx);
-    let db = device_idx.to_bytes().unwrap();
-    let device_id = i32::from_le_bytes(db[..4].try_into().unwrap());
+    let logits = f32_row(&[1.0, 3.0, f32::NAN, 2.0]);
+    let device_id = device_argmax(&logits, Device::Cpu);
     assert_eq!(device_id, 1, "device reduction must skip the NaN");
-
-    let nop = PenaltyConfig::default();
-    let host = argmax_with_penalties(&logits, None, &nop, &[], Device::Cpu).unwrap();
-    materialise(&host);
-    let hb = host.to_bytes().unwrap();
-    let host_id = i32::from_le_bytes(hb[..4].try_into().unwrap());
+    let host_id = host_greedy(&logits, Device::Cpu);
     assert_eq!(
         host_id, device_id,
         "NaN row: host greedy picked {host_id}, device argmax picked {device_id}"
     );
 }
 
-/// A fully constraint-masked row (every logit `-inf`) must still agree.
+/// A fully constraint-masked row must agree with the device, and must say so
+/// in the run log rather than silently emitting id 0. The row is built by
+/// passing an all-`false` mask (the shape a broken constraint engine actually
+/// produces), not by handing in a pre-built `-inf` row.
 #[test]
 #[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-)]
-#[allow(
     clippy::unwrap_used,
-    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] I32 result, and sampler calls on inputs built in the same fn — all infallible by construction"
 )]
-fn host_greedy_matches_device_argmax_on_an_all_neg_inf_row() {
-    let data = [f32::NEG_INFINITY; 5];
-    let logits = Array::from_bytes(f32_as_bytes(&data), &[1, 5], Dtype::F32).unwrap();
+fn host_greedy_matches_device_argmax_on_an_all_forbidden_mask() {
+    let logits = f32_row(&[0.5, 4.0, 2.0, 9.0, 1.0]);
+    let mask = vec![false; 5];
+    let cfg = PenaltyConfig::default();
+    let host_id =
+        token_id(&argmax_with_penalties(&logits, Some(&mask), &cfg, &[], Device::Cpu).unwrap());
 
-    let device_idx = argmax(&logits, -1, Device::Cpu).unwrap();
-    materialise(&device_idx);
-    let db = device_idx.to_bytes().unwrap();
-    let device_id = i32::from_le_bytes(db[..4].try_into().unwrap());
-
-    let nop = PenaltyConfig::default();
-    let host = argmax_with_penalties(&logits, None, &nop, &[], Device::Cpu).unwrap();
-    materialise(&host);
-    let hb = host.to_bytes().unwrap();
-    let host_id = i32::from_le_bytes(hb[..4].try_into().unwrap());
-
+    let device_id = device_argmax(&f32_row(&[f32::NEG_INFINITY; 5]), Device::Cpu);
+    assert_eq!(device_id, 0, "device yields id 0 on an all -inf row");
     assert_eq!(
         host_id, device_id,
-        "all -inf row must agree with the device"
-    );
-}
-
-/// The same contract on a **BF16** row, which is the dtype most snapshots
-/// produce and the dtype the device actually reduces over.
-///
-/// This also settles a standing question about whether the host readback could
-/// itself be the source of a disagreement: `logits_to_host_f32` widens BF16 to
-/// F32 by shifting the pattern into the high half-word, which is exact and
-/// injective, so it can neither create a tie nor break one. A BF16 tie is
-/// still a tie after the readback, and the two paths must agree on it.
-#[test]
-#[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-)]
-#[allow(
-    clippy::unwrap_used,
-    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
-)]
-fn host_greedy_matches_device_argmax_on_a_bf16_tie() {
-    // BF16 is the high half-word of the F32 pattern:
-    // 0x3F80 = 1.0, 0x4000 = 2.0, 0x4020 = 2.5, 0x4080 = 4.0.
-    // Tied maxima at index 1 and index 3.
-    let patterns: [u16; 5] = [0x4020, 0x4080, 0x3F80, 0x4080, 0x4000];
-    let mut bytes = Vec::with_capacity(patterns.len() * 2);
-    for p in patterns {
-        bytes.extend_from_slice(&p.to_le_bytes());
-    }
-    let logits = Array::from_bytes(&bytes, &[1, 5], Dtype::Bf16).unwrap();
-
-    let device_idx = argmax(&logits, -1, Device::Cpu).unwrap();
-    materialise(&device_idx);
-    let db = device_idx.to_bytes().unwrap();
-    let device_id = i32::from_le_bytes(db[..4].try_into().unwrap());
-    assert_eq!(
-        device_id, 1,
-        "device takes the first of the two BF16 maxima"
-    );
-
-    let nop = PenaltyConfig::default();
-    let host = argmax_with_penalties(&logits, None, &nop, &[], Device::Cpu).unwrap();
-    materialise(&host);
-    let hb = host.to_bytes().unwrap();
-    let host_id = i32::from_le_bytes(hb[..4].try_into().unwrap());
-
-    assert_eq!(
-        host_id, device_id,
-        "BF16 tie: host greedy picked {host_id}, device argmax picked {device_id}"
+        "all-forbidden mask: host greedy picked {host_id}, device argmax picked {device_id}"
     );
 }
 
@@ -1212,7 +1254,7 @@ fn host_greedy_matches_device_argmax_on_a_bf16_tie() {
 #[test]
 #[allow(
     clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    reason = "probs is built with length n immediately above and every index used is < n"
 )]
 fn filter_top_k_breaks_ties_to_lowest_id() {
     let n = 64usize;
@@ -1241,31 +1283,239 @@ fn filter_top_k_breaks_ties_to_lowest_id() {
     );
 }
 
+/// The same rule on `top_p`, which unlike `top_k` is ON by default on the
+/// served path (several `generation_config.json` snapshots ship `top_p`).
+/// `filter_top_p` walks ascending and drops from the front, so a tied group has
+/// to be ordered highest-id-first for the lowest ids to survive the cut.
+///
+/// Shape: one dominant probability plus a long run of bit-identical tail
+/// values, with `top_p` placed so the cut lands inside that run. Without an id
+/// rule the survivor set is a non-contiguous artefact of pdqsort's pivot
+/// choice — `{0, 29, 54..63}`, id 29 surviving while ids 30..53 are zeroed from
+/// the same value. `n = 64` is above the length where `sort_unstable_by`
+/// degenerates to a stable insertion sort and the shape becomes unreachable.
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "probs is built with length n immediately above and every index used is < n"
+)]
+fn filter_top_p_breaks_ties_to_lowest_id() {
+    let n = 64usize;
+    let tail = 0.6f32 / 63.0;
+    let mut probs: Vec<f32> = (0..n).map(|i| if i == 0 { 0.4 } else { tail }).collect();
+    filter_top_p(&mut probs, 0.5);
+
+    let survivors: Vec<usize> = (0..n).filter(|&i| probs[i] > 0.0).collect();
+    assert!(
+        survivors.len() > 2,
+        "fixture must put the cut inside the tied run, got {} survivors",
+        survivors.len()
+    );
+    assert_eq!(survivors[0], 0, "the dominant id always survives");
+    // Every survivor drawn from the tied run must be a prefix of it: no gap,
+    // and never a higher id kept while a lower one is dropped.
+    let tied: Vec<usize> = survivors[1..].to_vec();
+    let expected: Vec<usize> = (1..=tied.len()).collect();
+    assert_eq!(
+        tied, expected,
+        "tied survivors must be the lowest ids of the run, contiguously"
+    );
+}
+
+/// Neither filter may panic when the probability vector holds a `NaN`.
+///
+/// Collapsing an unordered `partial_cmp` to `Equal` and then breaking that
+/// "tie" by id builds a comparator with a cycle, and `sort_unstable_by`
+/// detects it and panics — which would abort a decode step rather than let the
+/// upstream `NaN` guard report it. `NaN` reaches here whenever a `NaN` logit
+/// does: `softmax_scaled` propagates it and skips its renormalise. Lengths
+/// span the point where the sort stops being an insertion sort.
+///
+/// The shipped filters sort packed `u64` keys and so have no user comparator
+/// at all, which makes the panic structurally unreachable rather than merely
+/// absent. This guards the regression back to a comparator form.
+#[test]
+fn filters_do_not_panic_on_nan_probabilities() {
+    for n in [64usize, 512, 4096] {
+        let probs: Vec<f32> = (0..n)
+            .map(|i| {
+                if i % 7 == 3 {
+                    f32::NAN
+                } else {
+                    ((i.wrapping_mul(2_654_435_761_usize)) % 1000) as f32 / 1000.0
+                }
+            })
+            .collect();
+
+        let mut k = probs.clone();
+        filter_top_k(&mut k, n / 4);
+        let mut p = probs.clone();
+        filter_top_p(&mut p, 0.95);
+        // Reaching here without a panic is the assertion; keep the results
+        // observable so the calls cannot be optimised away.
+        assert_eq!(k.len(), n, "n={n}: top_k must not resize");
+        assert_eq!(p.len(), n, "n={n}: top_p must not resize");
+    }
+}
+
+/// A tie-dense row of the shape the filters actually receive: a BF16-quantised
+/// logit row, softmaxed. Almost every adjacent pair is exactly equal, so the
+/// tie path is the common path rather than a corner.
+fn tie_dense_probs(n: usize, seed: u64) -> Vec<f32> {
+    let mut s = seed | 1;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let logits: Vec<f32> = (0..n)
+        .map(|_| {
+            let l = ((next() % 4000) as f32) / 100.0 - 20.0;
+            // Round to BF16: keep 8 mantissa bits, round-to-nearest-even.
+            let bits = l.to_bits();
+            let lsb = (bits >> 16) & 1;
+            f32::from_bits(bits.wrapping_add(0x7fff + lsb) & 0xffff_0000)
+        })
+        .collect();
+    softmax_scaled(&logits, 1.0 / 0.7)
+}
+
+/// Reference statement of the documented rank rule, written as a plain
+/// comparator over `(probability, id)` pairs.
+///
+/// This is an oracle for the *rule*, deliberately not for the implementation:
+/// the filters sort packed `u64` keys, this sorts tuples with an explicit
+/// comparison. If the bit-packing is wrong in any way — the inversion, the
+/// half-word split, the id width — the two orders diverge.
+fn reference_rank_order(probs: &[f32], descending: bool) -> Vec<usize> {
+    // Sort (probability, id) pairs directly; no indexing back into `probs`.
+    let mut pairs: Vec<(f32, usize)> = probs.iter().copied().zip(0..probs.len()).collect();
+    pairs.sort_by(|&(pa, a), &(pb, b)| {
+        if descending {
+            // Highest probability first; equal probabilities by lowest id.
+            pb.total_cmp(&pa).then(a.cmp(&b))
+        } else {
+            // Lowest probability first; equal probabilities by highest id.
+            pa.total_cmp(&pb).then(b.cmp(&a))
+        }
+    });
+    pairs.into_iter().map(|(_, id)| id).collect()
+}
+
+/// `filter_top_k`'s survivor set must be the first `k` of the reference
+/// descending order, on a row where nearly every value is tied.
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "probs and the reference order both have length n, and every index used is < n"
+)]
+fn filter_top_k_matches_the_reference_rank_rule() {
+    let n = 4096usize;
+    for k in [1usize, 7, 64, 1000, 4095] {
+        let probs = tie_dense_probs(n, 0x51ED_1234);
+        let mut expect = reference_rank_order(&probs, true)[..k].to_vec();
+        expect.sort_unstable();
+
+        let mut got_probs = probs.clone();
+        filter_top_k(&mut got_probs, k);
+        let got: Vec<usize> = (0..n).filter(|&i| got_probs[i] > 0.0).collect();
+
+        // Zero-probability survivors are indistinguishable from drops, so
+        // compare only over the ids the reference keeps that carry mass.
+        let expect_nonzero: Vec<usize> = expect.into_iter().filter(|&i| probs[i] > 0.0).collect();
+        assert_eq!(
+            got, expect_nonzero,
+            "k={k}: survivor set must match the rule"
+        );
+    }
+}
+
+/// `filter_top_p`'s survivor set must be the suffix of the reference ascending
+/// order that the cumulative-sum walk keeps.
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "probs and the reference order both have length n, and every index used is < n"
+)]
+fn filter_top_p_matches_the_reference_rank_rule() {
+    let n = 4096usize;
+    for top_p in [0.1f32, 0.5, 0.9, 0.95, 0.99] {
+        let probs = tie_dense_probs(n, 0x7A11_9999);
+
+        // Reference: walk the reference ascending order and drop the prefix
+        // whose inclusive cumulative sum stays at or below the threshold.
+        let order = reference_rank_order(&probs, false);
+        let threshold = 1.0 - top_p;
+        let mut cum = 0.0f32;
+        let mut expect: Vec<usize> = Vec::new();
+        for &i in &order {
+            cum += probs[i];
+            if cum > threshold {
+                expect.push(i);
+            }
+        }
+        expect.sort_unstable();
+        let expect_nonzero: Vec<usize> = expect.into_iter().filter(|&i| probs[i] > 0.0).collect();
+
+        let mut got_probs = probs.clone();
+        filter_top_p(&mut got_probs, top_p);
+        let got: Vec<usize> = (0..n).filter(|&i| got_probs[i] > 0.0).collect();
+
+        assert_eq!(
+            got, expect_nonzero,
+            "top_p={top_p}: survivor set must match the rule"
+        );
+    }
+}
+
+/// A `NaN` logit must also not panic the whole pipeline, which is the path the
+/// filters are actually reached through.
+#[test]
+fn sampling_distribution_survives_a_nan_logit() {
+    let n = 512usize;
+    let data: Vec<f32> = (0..n)
+        .map(|i| {
+            if i == 100 {
+                f32::NAN
+            } else {
+                (i % 13) as f32 * 0.1
+            }
+        })
+        .collect();
+    let logits = f32_row(&data);
+    let sp = SamplerConfig {
+        temperature: 0.7,
+        top_p: 0.95,
+        top_k: 20,
+        min_p: 0.0,
+        seed: Some(5),
+        top_logprobs_k: 0,
+    };
+    let nop = PenaltyConfig::default();
+    let probs = sampling_distribution(&logits, &sp, None, &nop, &[]);
+    assert!(probs.is_ok(), "a NaN logit must not abort the sampler");
+}
+
 /// End-to-end restatement of the same contract on the full host pipeline:
 /// `top_k = 1` must reproduce the device argmax for every RNG draw, including
 /// on a row whose maximum is tied. The existing `top_k_one_collapses_to_greedy`
 /// covers only rows with a unique maximum, which is the case that cannot fail.
 #[test]
 #[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-)]
-#[allow(
     clippy::unwrap_used,
-    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] I32 result, and sampler calls on inputs built in the same fn — all infallible by construction"
 )]
 fn top_k_one_equals_device_argmax_under_a_tie() {
     let n = 64usize;
     let mut data = vec![1.0f32; n];
     for &i in &[5usize, 30, 63] {
-        data[i] = 8.0;
+        if let Some(slot) = data.get_mut(i) {
+            *slot = 8.0;
+        }
     }
-    let logits = Array::from_bytes(f32_as_bytes(&data), &[1, n as i32], Dtype::F32).unwrap();
-
-    let device_idx = argmax(&logits, -1, Device::Cpu).unwrap();
-    materialise(&device_idx);
-    let db = device_idx.to_bytes().unwrap();
-    let device_id = i32::from_le_bytes(db[..4].try_into().unwrap()) as u32;
+    let logits = f32_row(&data);
+    let device_id = device_argmax(&logits, Device::Cpu);
 
     let sp = SamplerConfig {
         temperature: 0.8,
@@ -1279,9 +1529,7 @@ fn top_k_one_equals_device_argmax_under_a_tie() {
     let mut rng = Pcg32::new(sp.seed_or_default());
     for draw in 0..64 {
         let out = sample_token_array(&logits, &sp, None, &nop, &[], &mut rng, Device::Cpu).unwrap();
-        materialise(&out);
-        let b = out.to_bytes().unwrap();
-        let id = i32::from_le_bytes(b[..4].try_into().unwrap()) as u32;
+        let id = token_id(&out);
         assert_eq!(
             id, device_id,
             "top_k=1 draw {draw}: sampled {id}, device argmax {device_id}"
@@ -1289,10 +1537,41 @@ fn top_k_one_equals_device_argmax_under_a_tie() {
     }
 }
 
+/// `top_logprobs` reports ranks, not a selection, but it must still order
+/// equal logits by ascending id — otherwise rank 0 can disagree with the token
+/// the device argmax chose, and ranks 1..k are an artefact of the selection's
+/// swaps rather than a reproducible answer.
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "top is built with exactly k = 3 entries immediately above"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] I32 result, and sampler calls on inputs built in the same fn — all infallible by construction"
+)]
+fn compute_top_logprobs_breaks_ties_to_lowest_id() {
+    // Two exactly-equal logits at ids 0 and 2, under a unique max at 3.
+    let logits = f32_row(&[5.0, 7.0, 5.0, 9.0]);
+    let out = compute_top_logprobs(&logits, 3, 3).unwrap();
+    let ids: Vec<u32> = out.top.iter().map(|&(id, _)| id).collect();
+    assert_eq!(
+        ids,
+        vec![3, 1, 0],
+        "equal logits must rank by ascending id (id 0 before id 2)"
+    );
+    assert_eq!(
+        ids[0],
+        device_argmax(&logits, Device::Cpu),
+        "rank 0 must be the token the device argmax would choose"
+    );
+}
+
 // ── Near-zero temperature is sampling, not greedy ────────────────────────
 //
 // These two pin the boundary of the "temperature ~0 behaves like an argmax"
-// shortcut so it cannot be read as a guarantee.
+// shortcut so it cannot be read as a guarantee. They characterise existing
+// behaviour; neither is changed by the tie-break work above.
 
 /// At `temperature = 1e-4` every logit below the maximum by more than about
 /// 0.0104 underflows to exactly zero probability, and every logit closer than
@@ -1301,7 +1580,7 @@ fn top_k_one_equals_device_argmax_under_a_tie() {
 #[test]
 #[allow(
     clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    reason = "probs has the same length as the 3-element logits literal above it"
 )]
 fn near_zero_temperature_underflow_boundary() {
     // Gaps of 0.02 (well past the boundary) and 0.005 (well inside it).
@@ -1320,29 +1599,23 @@ fn near_zero_temperature_underflow_boundary() {
     );
 }
 
-/// The reported symptom, reproduced without a model: on an **exactly tied**
-/// row the near-zero-temperature host sampler is a uniform draw over the tied
-/// ids, so it disagrees with the device argmax roughly half the time. This is
-/// the sampler behaving correctly — a categorical draw from a two-point
-/// distribution — not a defect, and the host greedy path (which this test does
-/// not touch) is the one that must match the device.
+/// A *sufficient* mechanism for a near-zero-temperature stream to leave the
+/// greedy stream, reproduced without a model: on an **exactly tied** row the
+/// host sampler is a uniform draw over the tied ids, so it disagrees with the
+/// device argmax roughly half the time. This is the sampler behaving correctly
+/// — a categorical draw from a two-point distribution — and it is why a
+/// near-zero temperature is not a valid oracle for the greedy path.
+///
+/// It does **not** establish that this is what happened in any particular
+/// field report; that needs the top-2 logits at the first divergent step.
 #[test]
 #[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-)]
-#[allow(
     clippy::unwrap_used,
-    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] I32 result, and sampler calls on inputs built in the same fn — all infallible by construction"
 )]
 fn near_zero_temperature_is_a_uniform_draw_over_an_exact_tie() {
-    let data: [f32; 3] = [4.0, 4.0, 1.0];
-    let logits = Array::from_bytes(f32_as_bytes(&data), &[1, 3], Dtype::F32).unwrap();
-
-    let device_idx = argmax(&logits, -1, Device::Cpu).unwrap();
-    materialise(&device_idx);
-    let db = device_idx.to_bytes().unwrap();
-    let device_id = i32::from_le_bytes(db[..4].try_into().unwrap()) as u32;
+    let logits = f32_row(&[4.0, 4.0, 1.0]);
+    let device_id = device_argmax(&logits, Device::Cpu);
     assert_eq!(device_id, 0, "device argmax takes the lowest tied id");
 
     let sp = SamplerConfig {
@@ -1359,9 +1632,7 @@ fn near_zero_temperature_is_a_uniform_draw_over_an_exact_tie() {
     let mut hits_device = 0usize;
     for _ in 0..64 {
         let out = sample_token_array(&logits, &sp, None, &nop, &[], &mut rng, Device::Cpu).unwrap();
-        materialise(&out);
-        let b = out.to_bytes().unwrap();
-        let id = i32::from_le_bytes(b[..4].try_into().unwrap()) as u32;
+        let id = token_id(&out);
         assert!(id < 2, "never the untied low logit, got {id}");
         if id == device_id {
             hits_device += 1;
@@ -1372,5 +1643,98 @@ fn near_zero_temperature_is_a_uniform_draw_over_an_exact_tie() {
     assert!(
         hits_other > 0 && hits_device > 0,
         "an exact tie at temp 1e-4 must split between the tied ids, got {hits_device}/{hits_other}"
+    );
+}
+
+// ── Device::Gpu mirrors ───────────────────────────────────────────────────
+//
+// `host_argmax` mirrors the **Metal** reduction, and the CPU tests above
+// cannot establish a Metal property — MLX's two backends are separate
+// implementations that are already known to differ on one shape (the `-inf`
+// vs `in[0]` seed). These re-run the tie contract on the real stream.
+//
+// `#[ignore]`d per the workspace rule for tests that reach `Device::Gpu`; run
+// via `make gpu-test CRATE=rmlx-models FILTER=tie`.
+
+/// Metal's `argmax` must break ties to the lowest index at every width,
+/// including a width that crosses its multi-threadgroup reduction strategy.
+#[test]
+#[ignore = "reaches Device::Gpu; run via make gpu-test"]
+fn mlx_argmax_breaks_ties_to_lowest_index_gpu() {
+    for (name, row, expect) in tie_shapes() {
+        let got = device_argmax(&f32_row(&row), Device::Gpu);
+        assert_eq!(
+            got, expect,
+            "{name}: Metal argmax must return the first of the tied maxima"
+        );
+    }
+}
+
+/// Host greedy must agree with the Metal reduction on the same tied rows.
+#[test]
+#[ignore = "reaches Device::Gpu; run via make gpu-test"]
+fn host_greedy_matches_device_argmax_on_a_tie_gpu() {
+    for (name, row, _) in tie_shapes() {
+        let logits = f32_row(&row);
+        let device_id = device_argmax(&logits, Device::Gpu);
+        let host_id = host_greedy(&logits, Device::Gpu);
+        assert_eq!(
+            host_id, device_id,
+            "{name}: host greedy picked {host_id}, Metal argmax picked {device_id}"
+        );
+    }
+}
+
+/// The BF16 row, on the dtype and the stream production actually uses.
+/// `logits_to_host_f32` widens BF16 by shifting the pattern into the high
+/// half-word, which is exact and injective, so it can neither create a tie nor
+/// break one — a BF16 tie is still a tie after the readback.
+#[test]
+#[ignore = "reaches Device::Gpu; run via make gpu-test"]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] I32 result, and sampler calls on inputs built in the same fn — all infallible by construction"
+)]
+fn host_greedy_matches_device_argmax_on_a_bf16_tie_gpu() {
+    let logits = bf16_tie_row();
+    let device_id = device_argmax(&logits, Device::Gpu);
+    assert_eq!(device_id, 1, "Metal takes the first of the two BF16 maxima");
+    let host_id = host_greedy(&logits, Device::Gpu);
+    assert_eq!(
+        host_id, device_id,
+        "BF16 tie: host greedy picked {host_id}, Metal argmax picked {device_id}"
+    );
+}
+
+/// BF16 is the high half-word of the F32 pattern:
+/// `0x3F80` = 1.0, `0x4000` = 2.0, `0x4020` = 2.5, `0x4080` = 4.0.
+/// Tied maxima at index 1 and index 3.
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: from_bytes with a literal shape, to_bytes/try_into over the fixed 4 bytes of a [1] I32 result, and sampler calls on inputs built in the same fn — all infallible by construction"
+)]
+fn bf16_tie_row() -> Array {
+    let patterns: [u16; 5] = [0x4020, 0x4080, 0x3F80, 0x4080, 0x4000];
+    let mut bytes = Vec::with_capacity(patterns.len() * 2);
+    for p in patterns {
+        bytes.extend_from_slice(&p.to_le_bytes());
+    }
+    Array::from_bytes(&bytes, &[1, 5], Dtype::Bf16).unwrap()
+}
+
+/// The same BF16 contract on the CPU stream, so the ordinary suite still
+/// covers the dtype even though the Metal mirror is `#[ignore]`d.
+#[test]
+fn host_greedy_matches_device_argmax_on_a_bf16_tie() {
+    let logits = bf16_tie_row();
+    let device_id = device_argmax(&logits, Device::Cpu);
+    assert_eq!(
+        device_id, 1,
+        "device takes the first of the two BF16 maxima"
+    );
+    let host_id = host_greedy(&logits, Device::Cpu);
+    assert_eq!(
+        host_id, device_id,
+        "BF16 tie: host greedy picked {host_id}, device argmax picked {device_id}"
     );
 }

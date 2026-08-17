@@ -64,23 +64,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Greedy decoding picked a different token on the host than on the device
-  whenever the top logits tied.** MLX `argmax` resolves a tie to the lowest
-  token id; the host greedy path (`argmax_with_penalties`, taken whenever a
-  repetition/presence/frequency penalty or a `logit_bias` is set at
-  `temperature == 0`) used `Iterator::max_by`, which returns the *last*
-  maximum — and which also let a `NaN` reset the running best, since
-  `partial_cmp` is `None` against one. So adding a penalty to an otherwise
-  greedy request could change the token on a tied row, and an all-`-inf`
-  (fully constraint-masked) row returned the last id instead of id 0. Host
-  greedy now mirrors the device reduction exactly: strict `>` from a `-inf`
-  seed. Ties are not exotic — BF16 logits carry 8 mantissa bits, so at
-  magnitude 16 any two candidates within 0.125 collapse to the same value.
-  `top_k` gained the same rule (equal probabilities rank by ascending id), so
-  `top_k = 1` is the argmax on tied rows and not only on rows with a unique
-  maximum; previously which of the tied ids survived was decided by pdqsort's
-  pivot choice. The pre-existing tests could not reach this: every one of them
-  used a row with a unique maximum.
+- **Token selection resolved ties differently on the host than on the device,
+  and `top_p` / `top_k` resolved them differently on every call.** MLX `argmax`
+  resolves a tie to the lowest token id. The host greedy path
+  (`argmax_with_penalties`, taken whenever a repetition/presence/frequency
+  penalty or a `logit_bias` is set at `temperature == 0`) used
+  `Iterator::max_by`, which returns the *last* maximum — and which also let a
+  `NaN` reset the running best, since `partial_cmp` is `None` against one. So
+  adding a penalty to an otherwise greedy request could change the token on a
+  tied row, and an all-`-inf` (fully constraint-masked) row returned the last id
+  instead of id 0. `filter_top_k`, `filter_top_p` and `compute_top_logprobs`
+  each left their tied order to a sort's pivot choice or to a selection's swaps.
+  All four now use one rule — equal values rank by lowest token id — so
+  `top_k = 1` is the argmax on a tied row, the `top_p` nucleus is the lowest
+  tied ids rather than a non-contiguous scatter (a 64-wide row with one 0.4 and
+  63 identical tail values at `top_p 0.5` kept `{0, 29, 54..63}`), and logprob
+  rank 0 agrees with the device argmax. `top_p` matters most: it ships set in
+  several `generation_config.json` snapshots, so it is on by default on the
+  served path.
+
+  Ties are not exotic. On a realistic 262144-wide BF16-derived softmax row,
+  259416 of the 262143 adjacent pairs are exactly equal — 8 mantissa bits give
+  0.125 spacing at logit magnitude 16.
+
+  `filter_top_k` / `filter_top_p` implement the rule by sorting packed `u64`
+  keys (inverted IEEE bits above the token id) rather than by sorting indices
+  under a tie-breaking comparator, which fixes a second, pre-existing defect:
+  **a `NaN` probability aborted the decode step.** Folding an unordered pair to
+  `Equal` makes a `NaN` compare equal to everything, which is intransitive, and
+  `sort_unstable_by` panics with "user-provided comparison function does not
+  correctly implement a total order" — reproduced on the shipped comparator at
+  512 and 4096 elements. A `NaN` logit does reach these filters: the softmax
+  propagates it and skips its renormalise. Sorting `u64` makes the order total
+  by construction, so the class is gone rather than narrowed. It is also
+  cheaper: at 262144 wide the packed sort is 2.4 ms against 2.6 ms for the
+  index sort it replaces (and 5.9 ms for the index sort under a tie-breaking
+  comparator), so pinning the tie order costs nothing.
+
+  An all-forbidden constraint mask still falls through to id 0 for device
+  parity, but now emits a `tracing::warn!` at every mask-applying site instead
+  of silently emitting token 0 forever.
+
+  The pre-existing tests could not reach any of this: every row they used had a
+  unique maximum.
 - **Mixed / RotK decode produced wrong output above 8 192 context tokens.** The
   V side of `mixed_quantized_sdpa` diverted to a separate MSL kernel
   (`sparse_v_weighted_sum`) once the cache held 8 192 tokens or more. That
