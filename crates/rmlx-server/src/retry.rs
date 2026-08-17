@@ -216,8 +216,9 @@ pub struct RequestPlan {
     pub thinking_budget: Option<u32>,
     /// Token id of the thinking-block close delimiter for budget enforcement.
     pub thinking_end_token_id: Option<u32>,
-    /// Per-request thinking mode; `Some(false)` disables `<think>` for Qwen3-family.
-    pub enable_thinking: Option<bool>,
+    /// Whether the rendered prompt left the assistant turn inside an open
+    /// `<think>` block (drives the `ThinkSplitter`'s initial channel).
+    pub prompt_think_open: bool,
     /// Whether to emit raw `<tool_call>` / `</tool_call>` markers in the stream.
     pub emit_tool_markers: bool,
     /// Override for the thinking-block open delimiter; `None` uses `"<think>"`.
@@ -262,7 +263,7 @@ impl RequestPlan {
             is_thinking_handle: req.is_thinking_handle.clone(),
             thinking_budget: req.thinking_budget,
             thinking_end_token_id: req.thinking_end_token_id,
-            enable_thinking: req.enable_thinking,
+            prompt_think_open: req.prompt_think_open,
             emit_tool_markers: req.emit_tool_markers,
             thinking_start_token: req.thinking_start_token.clone(),
             thinking_end_token: req.thinking_end_token.clone(),
@@ -309,7 +310,7 @@ impl RequestPlan {
             is_thinking_handle: self.is_thinking_handle.clone(),
             thinking_budget: self.thinking_budget,
             thinking_end_token_id: self.thinking_end_token_id,
-            enable_thinking: self.enable_thinking,
+            prompt_think_open: self.prompt_think_open,
             emit_tool_markers: self.emit_tool_markers,
             thinking_start_token: self.thinking_start_token.clone(),
             thinking_end_token: self.thinking_end_token.clone(),

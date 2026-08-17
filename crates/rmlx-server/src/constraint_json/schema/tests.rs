@@ -1213,3 +1213,335 @@ fn probe_schema_step_mask_cost() {
     }
     println!();
 }
+
+// ── insignificant-whitespace bound ──────────────────────────────────────────
+
+/// Object schema with one required string property, strict.
+fn one_string_prop_obj() -> SchemaNode {
+    node(
+        &json!({
+            "type": "object",
+            "properties": {"v": {"type": "string"}},
+            "required": ["v"],
+            "additionalProperties": false
+        }),
+        true,
+    )
+}
+
+/// Between two structural tokens the grammar must refuse an unbounded run of
+/// insignificant whitespace. Unbounded, it is a cycle a greedy decoder never
+/// leaves: the mask keeps offering whitespace and keeps withholding EOS, so
+/// the request runs to `max_tokens` and returns success carrying indentation.
+#[test]
+fn insignificant_whitespace_run_between_structural_tokens_is_bounded() {
+    let mut g = SchemaGrammar::new(one_string_prop_obj());
+    feed(&mut g, "{").expect("object opens");
+
+    let cap = MAX_INSIGNIFICANT_WS_RUN as usize;
+    let mut accepted = 0usize;
+    let probe = cap * 8 + 64;
+    while accepted < probe && g.step(b'\n').is_ok() {
+        accepted += 1;
+    }
+    assert_eq!(
+        accepted, cap,
+        "grammar must refuse the whitespace byte after {cap} in a row; it accepted {accepted}"
+    );
+
+    // The bound is per structural position, not per document: real progress
+    // (the key opener) resets it, so a pretty-printed document is unaffected.
+    g.step(b'"')
+        .expect("key opener still allowed once whitespace is refused");
+    feed(&mut g, "v\": ").expect("key closes, colon, one separator space");
+    feed(&mut g, "\"x\"}").expect("value and close still reachable");
+    assert!(
+        g.is_done(),
+        "document completes after a capped whitespace run"
+    );
+}
+
+/// A whitespace byte inside an object *key string* is string content, not an
+/// insignificant separator. Raw C0 control bytes are illegal in a JSON string
+/// and must be rejected — silently swallowing them both mis-parses the key and
+/// re-opens the greedy whitespace cycle inside the key.
+#[test]
+fn raw_control_byte_inside_an_object_key_is_rejected() {
+    for ctrl in *b"\n\t\r" {
+        let mut g = SchemaGrammar::new(one_string_prop_obj());
+        feed(&mut g, "{\"").expect("key string opens");
+        assert!(
+            g.step(ctrl).is_err(),
+            "raw control byte {ctrl:#04x} must be illegal inside a key string"
+        );
+    }
+}
+
+/// Same rule for a free-form (`additionalProperties`) key.
+#[test]
+fn raw_control_byte_inside_a_free_object_key_is_rejected() {
+    let n = node(
+        &json!({"type": "object", "properties": {}, "additionalProperties": true}),
+        false,
+    );
+    let mut g = SchemaGrammar::new(n);
+    feed(&mut g, "{\"ab").expect("free key opens");
+    assert!(
+        g.step(b'\n').is_err(),
+        "raw newline must be illegal inside a free-form key string"
+    );
+}
+
+/// A schema property name containing a space must stay reachable: the space is
+/// key content and has to reach the key trie. Treating it as an insignificant
+/// separator skips it, the trie stalls on the space it is still expecting, and
+/// the very next byte of the property name is rejected — the property becomes
+/// impossible to emit.
+#[test]
+fn object_key_containing_a_space_is_reachable() {
+    let n = node(
+        &json!({
+            "type": "object",
+            "properties": {"unit label": {"type": "string"}},
+            "required": ["unit label"],
+            "additionalProperties": false
+        }),
+        true,
+    );
+    let mut g = SchemaGrammar::new(n);
+    feed(&mut g, "{\"unit label\":\"cm\"}").expect("property name with a space must be emittable");
+    assert!(g.is_done());
+}
+
+/// The decode-loop reproduction. Vocabulary mirrors the pieces a real greedy
+/// run alternated forever (`\n`, two spaces) plus the structural tokens it
+/// should have chosen instead. A decoder that always prefers whitespace must
+/// run out of whitespace and be left with the key opener — and EOS must stay
+/// masked, because the object is not complete.
+#[test]
+fn mask_stops_offering_whitespace_once_the_run_is_capped() {
+    // ids: 0=`{`  1=`\n`  2=`  `  3=`"`  4=EOS
+    let bm = synthetic_bm(&[b"{", b"\n", b"  ", b"\"", b""]);
+    let mut c = SchemaConstraint::from_parts(bm, vec![4], one_string_prop_obj(), None);
+
+    let _ = c.step_mask(5);
+    c.advance(0);
+    assert!(c.engaged, "`{{` engages a container-root schema");
+
+    let budget = MAX_INSIGNIFICANT_WS_RUN as usize * 8 + 64;
+    let mut ws_tokens = 0usize;
+    let mut last = (false, false);
+    while ws_tokens < budget {
+        let m = c.step_mask(5);
+        last = (m[1], m[2]);
+        let pick = if last.0 {
+            1
+        } else if last.1 {
+            2
+        } else {
+            break;
+        };
+        c.advance(pick);
+        ws_tokens += 1;
+    }
+    assert!(
+        ws_tokens < budget,
+        "greedy whitespace decoder never ran out: emitted {ws_tokens} whitespace tokens"
+    );
+    assert_eq!(
+        last,
+        (false, false),
+        "mask must stop offering both whitespace pieces"
+    );
+
+    let m = c.step_mask(5);
+    assert!(m[3], "the key opener must still be allowed");
+    assert!(
+        !m[4],
+        "EOS must stay masked — the object has no properties yet"
+    );
+}
+
+// ── engagement visibility ───────────────────────────────────────────────────
+
+/// `engaged()` is the signal the decode loop uses to report a request whose
+/// grammar never applied to a single logit. It must stay `false` for exactly
+/// as long as the engine is inert.
+#[test]
+fn engaged_is_false_until_the_engage_policy_fires() {
+    // ids: 0=prose 1=`{` 2=EOS
+    let bm = synthetic_bm(&[b"Sure, here you go:", b"{", b""]);
+    let mut c = SchemaConstraint::from_parts(bm, vec![2], one_string_prop_obj(), None);
+
+    assert!(
+        !ConstraintEngine::engaged(&c),
+        "a freshly built container-root constraint is inert"
+    );
+    let _ = c.step_mask(3);
+    c.advance(0);
+    assert!(
+        !ConstraintEngine::engaged(&c),
+        "prose carries no value-starter — still inert"
+    );
+    c.advance(1);
+    assert!(
+        ConstraintEngine::engaged(&c),
+        "`{{` is a value-starter — the policy fires"
+    );
+}
+
+/// The shape the engage gate cannot reach on its own: while the route holds
+/// `is_thinking` true the engine refuses to engage, and if that flag never
+/// clears the whole generation is unconstrained — the mask stays all-true and
+/// `engaged()` stays `false`. That is what the decode loop's warn reports, and
+/// what deriving the initial think-channel from the rendered prompt prevents.
+#[test]
+fn a_latched_thinking_flag_leaves_the_constraint_inert_for_the_whole_request() {
+    // ids: 0=`{` 1=`"` 2=EOS
+    let bm = synthetic_bm(&[b"{", b"\"", b""]);
+    let mut c = SchemaConstraint::from_parts(bm, vec![2], one_string_prop_obj(), None);
+    let thinking = c.is_thinking_handle();
+    thinking.store(true, std::sync::atomic::Ordering::Release);
+
+    for _ in 0..32 {
+        let m = c.step_mask(3);
+        assert!(
+            m.iter().all(|&b| b),
+            "an inert engine must not mask anything"
+        );
+        c.advance(0);
+    }
+    assert!(
+        !ConstraintEngine::engaged(&c),
+        "the engage scan is skipped for every token while is_thinking is latched"
+    );
+}
+
+/// A property name containing a space, driven through the *mask* rather than
+/// through `step` — the shape a real decoder sees.
+///
+/// Treating whitespace as an insignificant separator inside the key string is
+/// not merely a mis-parse: it makes the key **unreachable**, and it does so by
+/// leaving whitespace as the only legal continuation. Once the key trie is
+/// parked on the space it is still expecting, every candidate token that
+/// carries the rest of the name is rejected at its second byte, while a
+/// whitespace-only token is accepted as a no-op that makes no progress. The
+/// mask therefore offers whitespace and nothing else, forever, and withholds
+/// EOS because the value is incomplete — a forced degenerate stream that owes
+/// nothing to the model's preferences.
+#[test]
+fn a_spaced_key_leaves_a_reachable_continuation_in_the_mask() {
+    let n = node(
+        &json!({
+            "type": "object",
+            "properties": {"unit label": {"type": "string", "enum": ["celsius"]}},
+            "required": ["unit label"],
+            "additionalProperties": false
+        }),
+        true,
+    );
+    // ids: 0=`{` 1=`"` 2=`unit` 3=` label"` 4=`\n` 5=`  ` 6=EOS
+    let bm = synthetic_bm(&[b"{", b"\"", b"unit", b" label\"", b"\n", b"  ", b""]);
+    let mut c = SchemaConstraint::from_parts(bm, vec![6], n, None);
+
+    let _ = c.step_mask(7);
+    for id in [0u32, 1, 2] {
+        c.advance(id);
+    }
+
+    // Parked mid-key, immediately before the space in `"unit label"`.
+    let m = c.step_mask(7);
+    assert!(
+        m[3],
+        "the token carrying the rest of the key must be reachable; \
+         allowed ids = {:?}",
+        (0..7).filter(|&i| m[i]).collect::<Vec<_>>()
+    );
+    assert!(
+        !m[4] && !m[5],
+        "whitespace is key CONTENT here, not a separator — it must not be offered"
+    );
+    assert!(!m[6], "EOS must stay masked mid-key");
+
+    // And the document completes.
+    c.advance(3);
+    let m = c.step_mask(7);
+    assert!(
+        !m.iter().take(6).all(|&b| !b) || m[6],
+        "grammar must still admit a continuation after the key closes"
+    );
+}
+
+/// The same shape end to end: a decoder that always takes the first allowed
+/// non-whitespace token must be able to finish the document. When whitespace
+/// is the only thing on offer it cannot, and the request burns `max_tokens`.
+#[test]
+fn a_spaced_key_document_is_emittable_token_by_token() {
+    let n = node(
+        &json!({
+            "type": "object",
+            "properties": {"unit label": {"type": "string", "enum": ["celsius"]}},
+            "required": ["unit label"],
+            "additionalProperties": false
+        }),
+        true,
+    );
+    // ids: 0=`{` 1=`"` 2=`unit` 3=` label"` 4=`:` 5=`"celsius"` 6=`}` 7=`\n` 8=`  ` 9=EOS
+    let bm = synthetic_bm(&[
+        b"{",
+        b"\"",
+        b"unit",
+        b" label\"",
+        b":",
+        b"\"celsius\"",
+        b"}",
+        b"\n",
+        b"  ",
+        b"",
+    ]);
+    let mut c = SchemaConstraint::from_parts(bm, vec![9], n, None);
+
+    // The model opens the object; that is the token the engage policy fires on.
+    // Everything after it is the constrained stretch under test.
+    let _ = c.step_mask(10);
+    c.advance(0);
+    assert!(c.engaged, "`{{` engages a container-root schema");
+
+    // Longest-match over the content tokens, the way a BPE tokenizer segments.
+    // A first-allowed policy would pick the bare `"` over `"celsius"` and dead-end
+    // on a vocabulary this small, which says nothing about the grammar.
+    let content_by_len: [u32; 6] = [5, 3, 2, 1, 4, 6];
+
+    let mut emitted: Vec<u32> = Vec::new();
+    let mut ws_only_steps = 0usize;
+    for _ in 0..64 {
+        let pick = {
+            let m = c.step_mask(10);
+            let content = content_by_len.iter().copied().find(|&i| m[i as usize]);
+            if let Some(i) = content {
+                i
+            } else if m[9] {
+                break; // EOS offered — grammar is satisfied.
+            } else {
+                ws_only_steps += 1;
+                assert!(m[7] || m[8], "mask offered nothing at all");
+                if m[7] {
+                    7
+                } else {
+                    8
+                }
+            }
+        };
+        c.advance(pick);
+        emitted.push(pick);
+        if c.finished() {
+            break;
+        }
+    }
+
+    assert_eq!(
+        ws_only_steps, 0,
+        "the decoder was cornered into whitespace {ws_only_steps} times; emitted={emitted:?}"
+    );
+    assert!(c.finished(), "document must complete; emitted={emitted:?}");
+}

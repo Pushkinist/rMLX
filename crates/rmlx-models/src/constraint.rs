@@ -81,6 +81,31 @@ pub trait ConstraintEngine: Send + Sync + std::fmt::Debug {
     fn wants_mask(&self) -> bool {
         true
     }
+
+    /// True when the engine is actually enforcing its grammar.
+    ///
+    /// Engines with a warm-up phase stay `false` until the model emits
+    /// something the grammar can latch onto. A generation that *ends* with
+    /// this still `false` was never constrained at all — its output is
+    /// unchecked, and byte-for-byte indistinguishable from output the
+    /// grammar inspected and permitted. The decode loop reports that case so
+    /// silent non-enforcement leaves a trace.
+    ///
+    /// Default `true`: an engine with no warm-up enforces from step one.
+    fn engaged(&self) -> bool {
+        true
+    }
+
+    /// A shared mirror of [`engaged`](Self::engaged) that outlives the borrow.
+    ///
+    /// [`engaged`](Self::engaged) answers the owner, which is the decode loop —
+    /// the engine is moved into its blocking closure and dropped there. A route
+    /// that wants the same answer *after* the token stream drains has to hold a
+    /// clone of this from before the move. `None` for engines with no warm-up:
+    /// there is nothing to report.
+    fn engaged_handle(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        None
+    }
 }
 
 /// Engine-specific extension trait — opt-in. Decode loops won't call this

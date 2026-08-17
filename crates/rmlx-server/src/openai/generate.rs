@@ -21,7 +21,8 @@ use rmlx_metrics::events::EventRecorder;
 
 use crate::engine::{GenerationRequest, GenerationToken, Generator};
 use crate::metrics_drainer::DrainerHandle;
-use crate::openai::errors::engine_error_category;
+use crate::openai::errors::{engine_error_category, error_response};
+use crate::openai::state::ApiErrorCategory;
 use crate::tool_parser::{ParsedToolCall, ToolCallFormat, ToolCallStreamParser};
 
 use super::chat::bare_json_to_tool_call;
@@ -251,6 +252,11 @@ pub(super) async fn generate_blocking(
     // True when tool_choice=required/named drives the constraint; the
     // text output (bare JSON) must be converted to a tool_calls envelope.
     bare_json_tool_call_mode: bool,
+    // Mirror of the `response_format` constraint's engaged state, cloned by the
+    // route before the engine was moved into the generator. `Some(false)` after
+    // the stream drains means the grammar was never applied to a single logit.
+    // `None` when the request asked for no `response_format` constraint.
+    response_format_engaged: Option<Arc<std::sync::atomic::AtomicBool>>,
     // F1: drainer handle + ctx_max for TTFT/token-count DB emission.
     request_start: Instant,
     metrics_drainer: Option<&DrainerHandle>,
@@ -376,10 +382,9 @@ pub(super) async fn generate_blocking(
                 }
                 // A5.4 / A5.6: feed the parser regardless of think state.
                 //
-                // Some reasoning models (e.g. `Ternary-Bonsai`,
-                // `Qwen3ForCausalLM` with a prefilled `<think>`) emit the
-                // tool call WITHOUT first closing `</think>` — every piece
-                // is `is_thinking == true`. Routing thinking pieces straight
+                // A reasoning model whose prompt left a `<think>` open can
+                // emit the tool call WITHOUT first closing `</think>` — every
+                // piece is then `is_thinking == true`. Routing thinking pieces straight
                 // to `reasoning_text` (the old behaviour) meant the parser
                 // never saw the `<tool_call>` block and no `tool_calls` were
                 // produced. Feeding the parser in both states extracts the
@@ -405,12 +410,12 @@ pub(super) async fn generate_blocking(
                         }
                     }
                     None => {
-                        // bare_json_tool_call_mode — constrained output
-                        // goes to `text` regardless of is_thinking. For thinking
-                        // models (Bonsai/Qwen3) whose chat template starts inside
-                        // <think>, the JSON the constraint forced is emitted while
-                        // is_thinking == true. We need it in `text` so the
-                        // post-processor can extract it via bare_json_to_tool_call.
+                        // bare_json_tool_call_mode — constrained output goes to
+                        // `text` regardless of is_thinking. When the prompt left
+                        // a `<think>` open, the JSON the constraint forced is
+                        // emitted while is_thinking == true. We need it in `text`
+                        // so the post-processor can extract it via
+                        // bare_json_to_tool_call.
                         if tok.is_thinking && !bare_json_tool_call_mode {
                             reasoning_text.push_str(&tok.piece);
                         } else {
@@ -438,6 +443,33 @@ pub(super) async fn generate_blocking(
             p.passthrough_text.clear();
         }
         tool_calls_accum.extend(p.take_parsed());
+    }
+
+    // A `response_format` constraint that never engaged never masked a logit:
+    // this body is unchecked, and byte-for-byte indistinguishable from one the
+    // grammar inspected and permitted. Nothing has reached the client yet on
+    // this path — the whole stream was accumulated above — so refuse rather
+    // than return a 200 the caller has no way to tell apart from an enforced
+    // one. The streaming path cannot do this; its bytes are already out.
+    if response_format_engaged
+        .as_ref()
+        .is_some_and(|f| !f.load(std::sync::atomic::Ordering::Acquire))
+    {
+        tracing::warn!(
+            model_id,
+            request_id,
+            "refusing: response_format constraint never engaged, so the response \
+             was never checked against the requested schema"
+        );
+        error_counts.increment(ApiErrorCategory::Upstream);
+        requests_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            "constraint_not_engaged",
+            "the model never emitted a value the requested `response_format` \
+             grammar could enforce, so the response is unchecked and was not \
+             returned. Retry, or drop `response_format`.",
+        );
     }
 
     // Truncate the accumulated content at the first stop-sequence

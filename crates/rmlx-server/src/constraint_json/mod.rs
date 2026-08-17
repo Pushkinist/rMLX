@@ -93,6 +93,30 @@ pub use schema::{EngagePolicy, SchemaConstraint, SchemaError, SchemaNode};
 /// Whitespace bytes allowed outside strings.
 const WS: [u8; 4] = *b" \t\n\r";
 
+/// Longest run of consecutive *insignificant* whitespace bytes either JSON
+/// engine accepts between two structural tokens.
+///
+/// JSON itself puts no bound on that run, and an unbounded one is not a
+/// harmless permissiveness: a greedy (temp=0) decoder whose highest-scoring
+/// continuation is a whitespace piece will re-pick it forever, because the
+/// mask keeps offering whitespace and keeps withholding EOS (the value is not
+/// complete, so EOS is illegal). The request then runs to `max_tokens` and
+/// returns HTTP 200 carrying nothing but indentation.
+///
+/// Bounding the run removes the cycle without removing any *value*: once the
+/// bound is hit the mask stops offering whitespace and the model must emit
+/// the next structural byte, so every JSON document is still reachable — only
+/// its indentation is clipped. This mirrors the bounded `space` rule llama.cpp
+/// generates from a JSON schema for the same reason.
+///
+/// The bound is per structural position: any content or structural byte resets
+/// the counter, so a pretty-printed document pays it once per newline. The run
+/// at a structural position is `1 + indent_width * depth`, so 64 clips 4-space
+/// indentation only past depth 15 and 2-space past depth 31 — deep enough that
+/// no realistic document is reformatted, and still finite, which is all
+/// termination needs.
+pub(crate) const MAX_INSIGNIFICANT_WS_RUN: u32 = 64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JsonState {
     /// Top-level — expecting any JSON value to start.
@@ -152,6 +176,10 @@ enum Frame {
 pub struct JsonGrammar {
     state: JsonState,
     stack: Vec<Frame>,
+    /// Consecutive insignificant-whitespace bytes accepted since the last
+    /// content or structural byte. Capped at [`MAX_INSIGNIFICANT_WS_RUN`] so a
+    /// greedy decoder cannot sit in the whitespace no-op forever.
+    ws_run: u32,
 }
 
 impl Default for JsonGrammar {
@@ -166,6 +194,7 @@ impl JsonGrammar {
         Self {
             state: JsonState::Start,
             stack: Vec::new(),
+            ws_run: 0,
         }
     }
 
@@ -234,8 +263,9 @@ impl JsonGrammar {
                 }
             }
             JsonState::InString { .. } => {
-                // Any non-zero byte; `"` and `\` are state transitions.
-                for b in 1u16..=255 {
+                // Any non-control byte; `"` and `\` are state transitions.
+                // C0 control bytes must be escaped, so `step` rejects them.
+                for b in 0x20u16..=255 {
                     out[b as usize] = true;
                 }
             }
@@ -312,6 +342,13 @@ impl JsonGrammar {
                 add_ws(&mut out);
             }
         }
+        // Keep the allow-set in step with what `step` will accept: past the
+        // run cap, insignificant whitespace is no longer legal.
+        if self.ws_run >= MAX_INSIGNIFICANT_WS_RUN {
+            for &b in &WS {
+                out[b as usize] = false;
+            }
+        }
         out
     }
 
@@ -323,16 +360,23 @@ impl JsonGrammar {
     )]
     pub fn step(&mut self, byte: u8) -> Result<(), ()> {
         // Whitespace outside strings is a no-op for state, and a closer for
-        // open InNumber.
+        // open InNumber. The run is capped: an unbounded no-op is a cycle a
+        // greedy decoder never leaves — see `MAX_INSIGNIFICANT_WS_RUN`.
         let in_string = matches!(self.state, JsonState::InString { .. })
             || matches!(self.state, JsonState::InStringEscape { .. })
             || matches!(self.state, JsonState::InStringUnicode { .. });
         if !in_string && WS.contains(&byte) {
+            if self.ws_run >= MAX_INSIGNIFICANT_WS_RUN {
+                return Err(());
+            }
+            self.ws_run += 1;
             if self.state == JsonState::InNumber {
                 self.close_number();
             }
             return Ok(());
         }
+        // A content or structural byte ends the whitespace run.
+        self.ws_run = 0;
 
         match self.state {
             JsonState::Start => self.enter_value(byte, /*as_object_key=*/ false),
@@ -358,7 +402,11 @@ impl JsonGrammar {
                     self.state = JsonState::InStringEscape { is_key };
                     Ok(())
                 }
-                0 => Err(()),
+                // Raw C0 control bytes (incl. tab / newline / CR) are illegal
+                // inside a JSON string — they must be escaped. Rejecting them
+                // also stops a greedy decoder from looping on raw whitespace
+                // inside a string value.
+                0..=0x1f => Err(()),
                 _ => Ok(()),
             },
             JsonState::InStringEscape { is_key } => {
@@ -631,6 +679,7 @@ impl ProbeGrammar for JsonGrammar {
         // `state` is `Copy`; `Frame` is `Copy`, so refilling the stack is a
         // memcpy into the reused buffer — no per-token allocation.
         self.state = src.state;
+        self.ws_run = src.ws_run;
         self.stack.clear();
         self.stack.extend_from_slice(&src.stack);
     }
@@ -708,6 +757,10 @@ pub struct JsonObjectConstraint {
     mask: Vec<bool>,
     /// Pre-engagement state — see the doc comment above.
     engaged: bool,
+    /// Mirror of `engaged` the route keeps a clone of. The engine itself is
+    /// moved into the decode thread, so this is the only way the route can
+    /// learn — after the stream drains — whether the grammar was ever applied.
+    engaged_flag: Arc<AtomicBool>,
     /// Text accumulated from tokens seen before engagement. Used to detect
     /// and suppress a leading markdown-fence (` ```json\n `) wrapper.
     /// Cleared when engagement fires.
@@ -747,6 +800,7 @@ impl JsonObjectConstraint {
             eos_ids,
             mask: Vec::new(),
             engaged: false,
+            engaged_flag: Arc::new(AtomicBool::new(false)),
             pre_engage_buf: String::new(),
             is_thinking: Arc::new(AtomicBool::new(false)),
         }
@@ -761,6 +815,7 @@ impl JsonObjectConstraint {
             eos_ids,
             mask: Vec::new(),
             engaged: false,
+            engaged_flag: Arc::new(AtomicBool::new(false)),
             pre_engage_buf: String::new(),
             is_thinking: Arc::new(AtomicBool::new(false)),
         }
@@ -769,7 +824,21 @@ impl JsonObjectConstraint {
     /// Force-engage the constraint, bypassing warm-up. Used by tests
     /// that drive the mask directly via [`feed_bytes`].
     pub fn force_engage(&mut self) {
+        self.mark_engaged();
+    }
+
+    /// The one place `engaged` flips, so the route-visible mirror can never
+    /// drift from the field the mask logic reads.
+    fn mark_engaged(&mut self) {
         self.engaged = true;
+        self.engaged_flag.store(true, Ordering::Release);
+    }
+
+    /// Shared handle the route reads after generation to learn whether the
+    /// engine ever engaged. `false` at end of stream means the response was
+    /// never checked against the requested grammar.
+    pub fn engaged_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.engaged_flag)
     }
 
     /// Handle to the shared `is_thinking` flag. The route's step_fn
@@ -905,7 +974,7 @@ impl ConstraintEngine for JsonObjectConstraint {
             // which is still valid JSON; the grammar accepts top-level
             // arrays.
             if let Some(idx) = bytes.iter().position(|&b| b == b'{' || b == b'[') {
-                self.engaged = true;
+                self.mark_engaged();
                 tracing::info!(
                     token_id,
                     engage_byte = bytes[idx],
@@ -923,6 +992,14 @@ impl ConstraintEngine for JsonObjectConstraint {
 
     fn finished(&self) -> bool {
         self.engaged && self.grammar.is_done()
+    }
+
+    fn engaged(&self) -> bool {
+        self.engaged
+    }
+
+    fn engaged_handle(&self) -> Option<Arc<AtomicBool>> {
+        Some(Arc::clone(&self.engaged_flag))
     }
 
     /// Always returns `true` so the pipelined generate loop uses the masked

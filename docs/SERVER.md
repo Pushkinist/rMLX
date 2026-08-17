@@ -831,8 +831,7 @@ specs are byte-identical to HuggingFace output.
   triggering the template's no-think branch (emits a closed `<think></think>`
   block).
 - `None` or `Some(true)` — leaves the variable undefined; the template falls
-  through to its default (open `<think>\n` block, byte-identical to HuggingFace
-  output).
+  through to its default, byte-identical to HuggingFace output.
 
 The variable is never defined as `true` — defining it would not change
 behavior relative to `None`, since the template tests `enable_thinking is
@@ -841,6 +840,14 @@ defined and enable_thinking is false`.
 Per-request `enable_thinking` takes precedence over `AppState::default_enable_thinking`
 (`--enable-thinking` startup flag), which in turn takes precedence over the
 template default.
+
+**A template is free to ignore the flag, and some do.** Ternary-Bonsai's
+template prefills a closed `<think>\n\n</think>\n\n` on every request
+regardless of `enable_thinking`. The server therefore never infers the
+reasoning channel from the flag: after rendering it reads the prompt with
+`engine::think::prompt_leaves_think_open` and threads the answer as
+`GenerationRequest::prompt_think_open`. See `docs/SAMPLING.md`
+§Thinking-budget enforcement.
 
 ### Detokenizer and UTF-8 healing
 

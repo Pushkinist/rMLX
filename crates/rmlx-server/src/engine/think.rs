@@ -1,18 +1,57 @@
 //! `<think>...</think>` stripping state machine for reasoning models (A3).
 
+/// Whether the rendered prompt leaves the assistant turn *inside* an open
+/// thinking block — i.e. the first token the model generates is reasoning.
+///
+/// **`rendered` must be the assistant-turn suffix the template appended, not
+/// the whole prompt.** Message content is client-controlled and may contain a
+/// literal delimiter; scanning the whole prompt lets a user message decide the
+/// channel. Callers obtain the suffix by re-rendering with
+/// `add_generation_prompt: false` and taking the delta.
+///
+/// This drives [`ThinkSplitter`]'s initial channel. Whether a checkpoint's
+/// chat template prefills an open
+/// `<think>`, prefills a *closed* `<think></think>`, or prefills nothing and
+/// lets the model open the block itself is a property of that template, not of
+/// the architecture — checkpoints of the same arch disagree, and a template is
+/// free to ignore `enable_thinking` entirely. Guessing from either source
+/// mis-classifies the disagreeing checkpoint, and the mistake does not
+/// self-correct: a splitter that starts open when the prompt already closed the
+/// block never sees the `</think>` that would close it, so every piece is
+/// routed to `reasoning_content` and every consumer of the "model is thinking"
+/// signal stays latched for the whole request.
+///
+/// Open iff the last thinking-start delimiter appears after the last
+/// thinking-end delimiter. Assumes neither delimiter is a substring of the
+/// other, which holds for `<think>` / `</think>` and for any sane override.
+pub(crate) fn prompt_leaves_think_open(rendered: &str, start: &str, end: &str) -> bool {
+    // An empty delimiter matches at every offset — `rfind("")` returns the end
+    // of the haystack, which would make every prompt look like it left the
+    // block open. The request boundary rejects that input; this keeps the
+    // function total for any other caller.
+    if start.is_empty() || end.is_empty() {
+        return false;
+    }
+    match (rendered.rfind(start), rendered.rfind(end)) {
+        (Some(s), Some(e)) => s > e,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
 // ── A3: <think>/</think> stripping state machine ─────────────────────────────
 
 /// Tracks `<think>...</think>` boundaries across token pieces and routes
 /// the visible text on either the normal content channel or the reasoning
 /// channel (`is_thinking == true`).
 ///
-/// Qwen3's chat template prefills the assistant turn with an open
-/// `<think>\n` block before the first generated token. So when the
-/// caller knows the model is Qwen3-family, it constructs the state
-/// machine with `new_qwen3_prefilled()` (initial `open == true`) and the
-/// state machine emits `</think>` as the only transition the model
-/// produces in practice. The `<think>` opener path is still implemented
-/// for correctness in case some future template prefills nothing.
+/// The initial channel comes from [`prompt_leaves_think_open`] applied to the
+/// rendered prompt — templates in the wild do all three of "prefill an open
+/// `<think>`", "prefill a closed `<think></think>`" and "prefill nothing",
+/// sometimes within one architecture, so it must be read off the prompt rather
+/// than assumed. Both transitions (`<think>` opener and `</think>` closer) are
+/// implemented because which one the model produces depends on that same
+/// prefill.
 #[derive(Debug, Clone)]
 pub(crate) struct ThinkSplitter {
     open: bool,
@@ -68,10 +107,10 @@ impl ThinkSplitter {
     /// is already in the prefilled prompt and the model emits reasoning
     /// text directly until it produces `</think>`. Initial state: open.
     ///
-    /// production now constructs the splitter via `new_for_request`
-    /// (which threads the per-request `enable_thinking` + budget); this
-    /// constructor remains for the unit tests that exercise the open-state
-    /// machine directly.
+    /// production constructs the splitter via `new_for_request`, which threads
+    /// the prompt-derived initial channel plus the budget; this constructor
+    /// remains for the unit tests that exercise the open-state machine
+    /// directly.
     #[allow(dead_code)]
     pub(crate) fn new_qwen3_prefilled() -> Self {
         Self {
@@ -85,13 +124,13 @@ impl ThinkSplitter {
         }
     }
 
-    /// / PART 2: build the splitter honouring the request's effective
-    /// `enable_thinking`. Thinking-capable archs prefill an open `<think>`
-    /// block, so the default (thinking enabled) starts `open == true`. When
-    /// the request set `enable_thinking == Some(false)`, prefills a
-    /// CLOSED `<think></think>` and the model answers directly — so the
-    /// splitter must start in answer-mode (`open == false`) to route output
-    /// to `content` instead of `reasoning_content`.
+    /// Build the splitter for one request.
+    ///
+    /// `prompt_think_open` is [`prompt_leaves_think_open`] evaluated against
+    /// the rendered prompt: `true` starts in the reasoning channel (the prompt
+    /// left a `<think>` open), `false` starts in answer-mode so output routes
+    /// to `content`. It already reflects `enable_thinking`, because the
+    /// template rendered with that flag is what produced the prompt.
     ///
     /// `thinking_budget` is the optional per-request reasoning cap; `None`
     /// disables budget enforcement (zero-overhead default).
@@ -99,16 +138,27 @@ impl ThinkSplitter {
     /// `thinking_start_token` / `thinking_end_token` let callers
     /// redirect the splitter to non-default delimiter strings. `None`
     /// defaults to `"<think>"` / `"</think>"` to preserve existing behavior.
+    ///
+    /// An **empty** delimiter is treated as absent. `step`'s scanner advances
+    /// by the length of the tag it matched, and an empty tag matches at offset
+    /// 0 of every remainder — the loop would never shorten `rest` and would
+    /// spin forever on a blocking-pool thread. The OpenAI route rejects the
+    /// empty override at the boundary; this keeps the type total for every
+    /// caller rather than relying on that one guard.
     pub(crate) fn new_for_request(
-        enable_thinking: bool,
+        prompt_think_open: bool,
         thinking_budget: Option<u32>,
         thinking_start_token: Option<String>,
         thinking_end_token: Option<String>,
     ) -> Self {
         Self {
-            open: enable_thinking,
-            thinking_start_token: thinking_start_token.unwrap_or_else(|| "<think>".to_owned()),
-            thinking_end_token: thinking_end_token.unwrap_or_else(|| "</think>".to_owned()),
+            open: prompt_think_open,
+            thinking_start_token: thinking_start_token
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "<think>".to_owned()),
+            thinking_end_token: thinking_end_token
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "</think>".to_owned()),
             thinking_token_count: 0,
             thinking_budget,
             budget_exceeded: false,

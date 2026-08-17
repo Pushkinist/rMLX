@@ -698,13 +698,13 @@ impl Generator for SpeculativeGenerator {
         // verifier is Gemma4 in all production paths (Qwen3 speculative
         // is unimplemented per L36 N48), so this is always `None`, but
         // the wiring keeps the code symmetric for when L36 lands.
-        // thread budget + thinking-end id + effective enable_thinking
-        // through the same `new_for_request` constructor as the standard
-        // path, so the symmetry holds if a thinking verifier ever lands.
-        // also thread per-request delimiter overrides.
+        // thread budget + thinking-end id + the prompt-derived initial think
+        // channel through the same `new_for_request` constructor as the
+        // standard path, so the symmetry holds if a thinking verifier ever
+        // lands. also thread per-request delimiter overrides.
         let thinking_budget = req.thinking_budget;
         let thinking_end_token_id = req.thinking_end_token_id;
-        let splitter_open = req.enable_thinking != Some(false);
+        let splitter_open = req.prompt_think_open;
         let think_splitter: Option<ThinkSplitter> = if self.dispatcher.verifier.supports_thinking()
         {
             Some(ThinkSplitter::new_for_request(

@@ -22,7 +22,7 @@ fn sample_req() -> GenerationRequest {
         is_thinking_handle: None,
         thinking_budget: None,
         thinking_end_token_id: None,
-        enable_thinking: None,
+        prompt_think_open: false,
         emit_tool_markers: false,
         thinking_start_token: None,
         thinking_end_token: None,
@@ -538,31 +538,30 @@ fn splitter_no_budget_never_force_closes() {
     }
 }
 
-/// PART 2: a splitter built with `enable_thinking=false` (prefilled a
-/// CLOSED `<think></think>`) must start in answer-mode, so the first piece
-/// routes to the CONTENT channel (`is_thinking=false`), not reasoning.
+/// A prompt whose generation suffix CLOSED the think block must start the
+/// splitter in answer-mode, so the first piece routes to the CONTENT channel
+/// (`is_thinking=false`), not reasoning.
 #[test]
-fn splitter_enable_thinking_false_starts_on_content() {
+fn splitter_closed_prompt_starts_on_content() {
     let mut sm = ThinkSplitter::new_for_request(false, None, None, None);
     let (text, is_thinking) = sm.step("Hello");
     assert_eq!(text, "Hello");
     assert!(
         !is_thinking,
-        "enable_thinking=false must route the first piece to content"
+        "a closed prompt must route the first piece to content"
     );
 }
 
-/// The default (thinking enabled) path is unchanged: a splitter built with
-/// `enable_thinking=true` starts on the thinking channel, exactly like the
-/// canonical `new_qwen3_prefilled`.
+/// A prompt whose generation suffix LEFT the block open starts on the thinking
+/// channel, exactly like the canonical `new_qwen3_prefilled`.
 #[test]
-fn splitter_enable_thinking_true_starts_on_thinking() {
+fn splitter_open_prompt_starts_on_thinking() {
     let mut sm = ThinkSplitter::new_for_request(true, None, None, None);
     let (text, is_thinking) = sm.step("reason");
     assert_eq!(text, "reason");
     assert!(
         is_thinking,
-        "enable_thinking=true must start on thinking channel"
+        "an open prompt must start on the thinking channel"
     );
 }
 
@@ -797,4 +796,125 @@ fn generation_request_carries_overrides() {
     req.max_ctx_override = Some(8192);
     assert_eq!(req.kv_quant_override, Some(rmlx_kv_quant::KvQuant::K8V4));
     assert_eq!(req.max_ctx_override, Some(8192));
+}
+
+// ── initial think-channel is read off the rendered prompt ───────────────────
+
+/// Assistant-turn tails the three test-target chat templates actually render.
+/// The point of the table is that they disagree *within* the set of
+/// thinking-capable architectures, which is why the channel cannot be derived
+/// from the architecture or from `enable_thinking`.
+const TAIL_CLOSED_PREFILL: &str = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+const TAIL_OPEN_PREFILL: &str = "<|im_start|>assistant\n<think>\n";
+const TAIL_NO_PREFILL: &str = "<|turn>model\n";
+
+#[test]
+fn prompt_think_open_reads_the_rendered_prefill() {
+    let cases: &[(&str, bool, &str)] = &[
+        (
+            TAIL_CLOSED_PREFILL,
+            false,
+            "template prefills a CLOSED think block — the model answers directly",
+        ),
+        (
+            TAIL_OPEN_PREFILL,
+            true,
+            "template prefills an OPEN think block — the model resumes reasoning",
+        ),
+        (
+            TAIL_NO_PREFILL,
+            false,
+            "template prefills nothing — the model opens its own block if it wants one",
+        ),
+        (
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\nwhy\n</think>\n\nbecause<|im_end|>\n<|im_start|>assistant\n<think>\n",
+            true,
+            "closed history blocks must not mask the final open one",
+        ),
+        (
+            "<|im_start|>assistant\n<think>\na\n</think>\n\nb<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+            false,
+            "last delimiter wins across a multi-turn transcript",
+        ),
+    ];
+    for (rendered, want, why) in cases {
+        assert_eq!(
+            prompt_leaves_think_open(rendered, "<think>", "</think>"),
+            *want,
+            "{why}"
+        );
+    }
+}
+
+#[test]
+fn prompt_think_open_honours_delimiter_overrides() {
+    assert!(prompt_leaves_think_open(
+        "…<|reason|>",
+        "<|reason|>",
+        "<|/reason|>"
+    ));
+    assert!(!prompt_leaves_think_open(
+        "…<|reason|><|/reason|>",
+        "<|reason|>",
+        "<|/reason|>"
+    ));
+    // Default delimiters must not fire on a custom-delimiter transcript.
+    assert!(!prompt_leaves_think_open(
+        "…<|reason|>",
+        "<think>",
+        "</think>"
+    ));
+}
+
+/// The defect this replaces: a splitter that starts open on a prompt whose
+/// template already CLOSED the think block never sees a `</think>`, so every
+/// piece is reported as reasoning for the whole request. Downstream that
+/// latches the constraint engine's `is_thinking` gate and the schema is never
+/// enforced. Driving the initial channel from the prompt closes it.
+#[test]
+fn closed_prefill_starts_the_splitter_in_answer_mode() {
+    let pieces = ["{", "\"v\"", ":", "\"x\"", "}"];
+
+    let open = prompt_leaves_think_open(TAIL_CLOSED_PREFILL, "<think>", "</think>");
+    assert!(!open, "a closed prefill leaves no open think block");
+    let out = run_splitter(
+        ThinkSplitter::new_for_request(open, None, None, None),
+        &pieces,
+    );
+    assert!(
+        out.iter().all(|(_, thinking)| !*thinking),
+        "every piece must be reported on the content channel: {out:?}"
+    );
+
+    // Contrast: assuming "open" — the pre-fix derivation for any
+    // thinking-capable arch — latches the reasoning channel forever.
+    let latched = run_splitter(
+        ThinkSplitter::new_for_request(true, None, None, None),
+        &pieces,
+    );
+    assert!(
+        latched.iter().all(|(_, thinking)| *thinking),
+        "assumed-open splitter reports the whole answer as reasoning: {latched:?}"
+    );
+}
+
+/// An open prefill must still start in the reasoning channel and flip on the
+/// model's own `</think>` — the prompt-derived channel must not regress the
+/// architecture it already worked for.
+#[test]
+fn open_prefill_still_starts_the_splitter_in_reasoning_mode() {
+    let open = prompt_leaves_think_open(TAIL_OPEN_PREFILL, "<think>", "</think>");
+    assert!(open, "an open prefill leaves the think block open");
+    let out = run_splitter(
+        ThinkSplitter::new_for_request(open, None, None, None),
+        &["reasoning", "</think>", "answer"],
+    );
+    assert_eq!(
+        out,
+        vec![
+            ("reasoning".to_owned(), true),
+            (String::new(), false),
+            ("answer".to_owned(), false),
+        ]
+    );
 }
