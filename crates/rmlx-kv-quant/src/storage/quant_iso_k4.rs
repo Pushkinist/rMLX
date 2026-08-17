@@ -338,12 +338,19 @@ impl QuantIsoK4 {
                 self.shape
             )));
         }
-        // Blocks are sequence-major (see `append`); reorder back to head-major
-        // `[B, kv_h, S, D]`.
+        // Per-block reorder back to head-major `[B, kv_h, S, D]` — see
+        // [`crate::storage::QuantIsoK3::dequant`].
         let b = self.shape[0] as usize;
         let kv_h = self.shape[1] as usize;
         let s = self.shape[2] as usize;
-        let out = super::seq_layout::transpose_seq_heads(&out, b, s, kv_h, head_dim);
+        let out = super::seq_layout::transpose_chunked_seq_heads(
+            &out,
+            b,
+            s,
+            kv_h,
+            head_dim,
+            blocks.iter().map(super::BlockRows::rows),
+        )?;
         Ok(out)
     }
 }

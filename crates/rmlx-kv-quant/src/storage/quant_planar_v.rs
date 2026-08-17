@@ -24,7 +24,7 @@ use crate::planarquant_msl::{
 use crate::planarquant::{planar_dequantize, planar_quantize, PlanarBlocks};
 use crate::turboquant::GROUP_SIZE;
 
-use super::seq_layout::{transpose_heads_seq, transpose_seq_heads};
+use super::seq_layout::{transpose_chunked_seq_heads, transpose_heads_seq};
 use super::KV_PAGE_SIZE;
 
 // ── PlanarQuant V storage ─────────────────────────────────────────────────────
@@ -458,7 +458,19 @@ impl QuantPlanarV {
         let kv_h = self.shape[1] as usize;
         let s = self.shape[2] as usize;
         let d = self.shape[3] as usize;
-        Ok((transpose_seq_heads(&out, b, s, kv_h, d), None))
+        // Blocks are sequence-major (see `append`), one per append; reorder each
+        // at its own sequence offset back to head-major `[B, kv_h, S, D]`.
+        // Reading the concatenation as a single run would interleave batch
+        // elements once `B > 1`.
+        let out = transpose_chunked_seq_heads(
+            &out,
+            b,
+            s,
+            kv_h,
+            d,
+            self.blocks.iter().map(super::BlockRows::rows),
+        )?;
+        Ok((out, None))
     }
 
     /// Truncate the store to `n` sequence positions.

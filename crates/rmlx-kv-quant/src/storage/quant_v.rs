@@ -759,7 +759,18 @@ impl QuantV {
         let kv_h = self.shape[1] as usize;
         let s = self.shape[2] as usize;
         let d = self.shape[3] as usize;
-        let out = super::seq_layout::transpose_seq_heads(&out, b, s, kv_h, d);
+        // Blocks are sequence-major (see `append`), one per append; reorder each
+        // at its own sequence offset back to head-major `[B, kv_h, S, D]`.
+        // Reading the concatenation as a single run would interleave batch
+        // elements once `B > 1`.
+        let out = super::seq_layout::transpose_chunked_seq_heads(
+            &out,
+            b,
+            s,
+            kv_h,
+            d,
+            self.blocks.iter().map(super::BlockRows::rows),
+        )?;
         Ok((out, None))
     }
 

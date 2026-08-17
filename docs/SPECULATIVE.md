@@ -160,9 +160,10 @@ these six stores: a rollback into the decode window arrives with a target past
 the frozen store's fill, and raising `shape[2]` to meet it would invent coverage
 no payload backs.
 
-The split itself is still `b == 1` only, and that bound is unchanged: at `b > 1`
-the block concatenation is not readable by the decode path, so a mid-block cut
-stays a loud error rather than becoming a scrambled store. What changed is that
+The split itself is still `b == 1` only, and that bound is unchanged: a block's
+rows run `[B, S_block, kv_h, D]`, so keeping a row prefix at `b > 1` would cut
+one batch element and leave the other whole. A mid-block cut therefore stays a
+loud error rather than becoming a half-cut store. What changed is that
 "loud" is now true for the turbo / planar / affine stores too — every CPU dequant
 path checks that its payload decodes to exactly `prod(shape)` and errors with
 `"refusing to zero-pad / truncate"` otherwise. Previously the turbo stores

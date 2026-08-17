@@ -570,12 +570,21 @@ impl QuantRotorK3 {
                 self.shape
             )));
         }
-        // Blocks are sequence-major (see `append`); reorder back to head-major
-        // `[B, kv_h, S, D]`.
+        // Blocks are sequence-major (see `append`), one per append; reorder each
+        // at its own sequence offset back to head-major `[B, kv_h, S, D]`.
+        // Reading the concatenation as a single run would interleave batch
+        // elements once `B > 1`.
         let b = self.shape[0] as usize;
         let kv_h = self.shape[1] as usize;
         let s = self.shape[2] as usize;
-        let out = super::seq_layout::transpose_seq_heads(&out, b, s, kv_h, head_dim);
+        let out = super::seq_layout::transpose_chunked_seq_heads(
+            &out,
+            b,
+            s,
+            kv_h,
+            head_dim,
+            blocks.iter().map(super::BlockRows::rows),
+        )?;
         Ok(out)
     }
 }

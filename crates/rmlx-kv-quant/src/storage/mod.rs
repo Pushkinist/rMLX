@@ -144,17 +144,24 @@ pub const KV_PAGE_SIZE: i32 = 256;
 // rejected region overwritable. Only the append-only CPU side has to be cut.
 //
 // The split is confined to `b == 1`, and that is a correctness bound, not a
-// simplification. Every store ends `dequant` with
-// `seq_layout::transpose_seq_heads` over the *concatenation* of its blocks,
-// which reads the buffer as one `[B, S_total, kv_h, D]` run. Each block is
-// only `[B, S_block, kv_h, D]`, so at `b > 1` the concatenation interleaves
-// batch elements and the reading is wrong for any store holding more than one
-// block. Splitting at `b > 1` would turn a mid-block cut from
-// blocks-short-of-`shape[2]` — which the reconciliation guards reject loudly —
-// into a two-block store that decodes silently scrambled. So `b > 1` keeps the
-// whole-block drop and the loud error. `sdpa::rotor_flash_shape_ok` refuses
-// `b != 1` for the same underlying reason, which is also why no `b > 1` store
-// ever has a ring to rebuild the gap from.
+// simplification. The bound is *inside* one block: a block's rows run
+// `[B, S_block, kv_h, D]`, so batch element 1's rows sit after all of batch
+// element 0's. `BlockRows::retain_rows` keeps a **row prefix**, and at `b > 1`
+// a row prefix is not a sequence prefix — it would keep all of batch 0 and
+// none of batch 1. Splitting there would silently drop one batch element's
+// tail instead of cutting every element at the same sequence position, so
+// `b > 1` keeps the whole-block drop, which leaves `blocks` short of
+// `shape[2]` and lets the reconciliation guards abort the request loudly.
+//
+// Reading the *concatenation* of the blocks used to be a second, independent
+// bound: every store ended `dequant` with `seq_layout::transpose_seq_heads`
+// over the concatenation, reading it as one `[B, S_total, kv_h, D]` run, which
+// is wrong at `b > 1` for any store holding more than one block. That is fixed
+// — `seq_layout::transpose_chunked_seq_heads` reorders each block at its own
+// sequence offset — so a multi-block `b > 1` store now decodes correctly; only
+// the intra-block cut above still refuses. `sdpa::rotor_flash_shape_ok` still
+// refuses `b != 1` because the GPU ring's per-step stride does not interleave
+// batch, which is why no `b > 1` store ever has a ring to rebuild a gap from.
 
 /// How a block-accumulating KV store must cut its blocks to reach `n`
 /// sequence positions.
@@ -223,19 +230,20 @@ pub(crate) fn truncate_plan(
             break;
         }
         if b != 1 {
-            // Rows run batch-major, so a sequence prefix is not a row prefix and
-            // the resulting two-block store would decode scrambled rather than
-            // error. Drop the block and let the reconciliation guard report the
-            // gap. See the module note.
+            // A block's rows run batch-major, so a sequence prefix is not a row
+            // prefix: `retain_rows` would keep all of batch 0 and none of batch
+            // 1 instead of cutting every batch element at `keep_seq`. Drop the
+            // block and let the reconciliation guard report the gap. See the
+            // module note.
             tracing::warn!(
                 b,
                 kv_h,
                 kept_seq = acc_seq,
                 target_seq,
-                "KV block truncate: refusing to split a block at b > 1 — the decode path \
-                 reads the block concatenation as one sequence run, so a split store would \
-                 be silently scrambled; dropping the block instead, which leaves the store \
-                 short of its truncation target"
+                "KV block truncate: refusing to split a block at b > 1 — a block's rows run \
+                 batch-major, so keeping a row prefix would cut one batch element and not \
+                 the other; dropping the block instead, which leaves the store short of its \
+                 truncation target"
             );
             break;
         }

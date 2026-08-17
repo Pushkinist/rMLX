@@ -7,7 +7,7 @@
 //! corrupts a multi-append, multi-head cache, while the sequence-major reorder
 //! round-trips exactly for every append pattern.
 
-use super::{transpose_heads_seq, transpose_seq_heads};
+use super::{transpose_chunked_seq_heads, transpose_heads_seq, transpose_seq_heads};
 
 const B: usize = 1;
 
@@ -122,6 +122,145 @@ fn seq_major_reorder_is_exact_for_all_append_patterns() {
             "fixed path exact for appends={appends:?} kv_h={kv_h} d={d}, got {m}"
         );
     }
+}
+
+// ── Chunked reorder (`B` > 1) ────────────────────────────────────────────────
+
+/// Distinct value per `(batch, head, token, dim)` — the batch axis the
+/// single-`B` helpers above do not exercise.
+fn bval(bi: usize, h: usize, s: usize, d: usize) -> f32 {
+    (bi * 10_000_000 + h * 100_000 + s * 100 + d) as f32
+}
+
+/// Head-major `[B, kv_h, S, D]` reference, built straight from index math — no
+/// reorder helper involved, so it is an independent oracle.
+fn head_major_reference(b: usize, kv_h: usize, s_total: usize, d: usize) -> Vec<f32> {
+    let mut out = vec![0.0_f32; b * kv_h * s_total * d];
+    for bi in 0..b {
+        for h in 0..kv_h {
+            for s in 0..s_total {
+                for dd in 0..d {
+                    out[((bi * kv_h + h) * s_total + s) * d + dd] = bval(bi, h, s, dd);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The buffer a block-accumulating store decodes to: one sequence-major
+/// `[B, S_chunk, kv_h, D]` chunk per append, concatenated in append order.
+fn chunked_seq_major_buffer(b: usize, kv_h: usize, appends: &[usize], d: usize) -> Vec<f32> {
+    let mut buf = Vec::new();
+    let mut s0 = 0usize;
+    for &n in appends {
+        for bi in 0..b {
+            for s in 0..n {
+                for h in 0..kv_h {
+                    for dd in 0..d {
+                        buf.push(bval(bi, h, s0 + s, dd));
+                    }
+                }
+            }
+        }
+        s0 += n;
+    }
+    buf
+}
+
+#[test]
+fn chunked_reorder_is_exact_at_every_batch_and_split() {
+    for &(b, kv_h, appends, d) in &[
+        (1usize, 1usize, &[3usize][..], 4usize), // degenerate
+        (1, 4, &[2, 1][..], 8),                  // B = 1 multi-chunk (unchanged behaviour)
+        (2, 1, &[5][..], 4),                     // B > 1, single chunk
+        (2, 1, &[2, 3][..], 4),                  // B > 1, two chunks — the defect
+        (2, 2, &[2, 3][..], 4),                  // B > 1, GQA
+        (3, 4, &[1, 1, 1, 2][..], 8),            // per-token decode after a chunk
+    ] {
+        let s_total: usize = appends.iter().sum();
+        let buf = chunked_seq_major_buffer(b, kv_h, appends, d);
+        let got = transpose_chunked_seq_heads(
+            &buf,
+            b,
+            s_total,
+            kv_h,
+            d,
+            appends.iter().map(|&n| b * kv_h * n),
+        )
+        .expect("well-formed chunk partition");
+        assert_eq!(
+            got,
+            head_major_reference(b, kv_h, s_total, d),
+            "chunked reorder must be exact for b={b} kv_h={kv_h} appends={appends:?} d={d}"
+        );
+    }
+}
+
+/// The whole-buffer reorder is what the block stores used to call. It agrees
+/// with the chunked one at `B == 1` and disagrees the moment `B > 1` meets more
+/// than one chunk — this is what makes the chunked helper load-bearing rather
+/// than a rename.
+#[test]
+fn whole_buffer_reorder_only_matches_at_b_1_or_one_chunk() {
+    let d = 4;
+    let agree = |b: usize, kv_h: usize, appends: &[usize]| -> bool {
+        let s_total: usize = appends.iter().sum();
+        let buf = chunked_seq_major_buffer(b, kv_h, appends, d);
+        let whole = transpose_seq_heads(&buf, b, s_total, kv_h, d);
+        let chunked = transpose_chunked_seq_heads(
+            &buf,
+            b,
+            s_total,
+            kv_h,
+            d,
+            appends.iter().map(|&n| b * kv_h * n),
+        )
+        .expect("well-formed chunk partition");
+        whole == chunked
+    };
+    assert!(agree(1, 2, &[2, 3]), "B = 1 multi-chunk: the two agree");
+    assert!(agree(2, 2, &[5]), "single chunk: the two agree at any B");
+    assert!(
+        !agree(2, 1, &[2, 3]),
+        "B > 1 with two chunks: the whole-buffer reorder must disagree — if it does not, \
+         this test no longer proves the chunked helper is needed"
+    );
+    assert!(
+        !agree(3, 2, &[1, 1, 1]),
+        "B > 1 per-token decode: disagrees"
+    );
+}
+
+#[test]
+fn chunked_reorder_rejects_a_partition_that_does_not_add_up() {
+    let (b, kv_h, d) = (2usize, 2usize, 4usize);
+    let buf = chunked_seq_major_buffer(b, kv_h, &[2, 3], d);
+
+    // Chunks cover fewer sequence positions than `s_total` declares.
+    let err = transpose_chunked_seq_heads(&buf, b, 5, kv_h, d, [b * kv_h * 2, b * kv_h * 2])
+        .expect_err("under-running chunks must be rejected");
+    assert!(
+        err.to_string().contains("cover 4 sequence positions"),
+        "expected the coverage error, got: {err}"
+    );
+
+    // A chunk whose row count is not a whole number of sequence positions.
+    let err = transpose_chunked_seq_heads(&buf, b, 5, kv_h, d, [b * kv_h * 2, b * kv_h * 3 - 1, 1])
+        .expect_err("a ragged chunk must be rejected");
+    assert!(
+        err.to_string()
+            .contains("not a whole number of sequence positions"),
+        "expected the ragged-chunk error, got: {err}"
+    );
+
+    // Buffer length disagrees with the declared shape.
+    let err = transpose_chunked_seq_heads(&buf[..buf.len() - d], b, 5, kv_h, d, [b * kv_h * 5])
+        .expect_err("a short buffer must be rejected");
+    assert!(
+        err.to_string().contains("implies"),
+        "expected the length error, got: {err}"
+    );
 }
 
 #[test]

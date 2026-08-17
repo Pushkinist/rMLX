@@ -2008,8 +2008,11 @@ the caller reshapes the concatenation head-major `[B, kv_h, S, D]`, a head-major
 per-block store transposes per-head values across a multi-append GQA cache
 (`kv_h > 1`, e.g. the post-SSD-hydrate decode-append path) — the same head
 scramble fixed for `QuantK` / `QuantV`. Each `append` now reorders the
-head-major chunk heads↔seq (`[B, new_seq, kv_h, D]`) before encoding and
-`dequant` reorders back; single-chunk cold prefill is the identity. The codec is
+head-major chunk heads↔seq (`[B, new_seq, kv_h, D]`) before encoding, and
+`dequant` reorders **each block back at its own sequence offset**
+(`seq_layout::transpose_chunked_seq_heads`) — reordering the whole concatenation
+in one pass is only equivalent at `B == 1`; see the `b > 1` note under the
+truncation planner. Single-chunk cold prefill is the identity. The codec is
 per-token-row positional, so the sidebands stay correctly associated: Iso
 per-(token, group) scale/norm and the constant `FIXED_QUAT` quaternion permute
 with the rows; the Rotor static rotor table and QJL projection are
@@ -3082,26 +3085,31 @@ therefore **splits** the trailing block, cutting every per-row buffer — codes,
 per-group scales, per-group quaternions, per-token norms, and the rotor QJL
 sideband — to the accepted row count.
 
-**The split is `b == 1` only, and that is a correctness bound.** Every store
-ends `dequant` with `seq_layout::transpose_seq_heads` over the *concatenation*
-of its blocks, reading it as one `[B, S_total, kv_h, D]` run — but each block is
-only `[B, S_block, kv_h, D]`, so at `b > 1` the concatenation interleaves batch
-elements and any store holding more than one block decodes scrambled. Measured
-on the shipped fixture (`b = 2`, `kv_h = 2`, `head_dim = 96`, 5 positions): a
-two-block store disagrees with a one-block store over the same tokens on **960
-of 1920 elements**, spread across 10 of the 20 rows and straddling both reader
-batch halves — while the `b = 1` control matches to the last bit. Splitting at
-`b > 1` would manufacture that two-block state and convert a **loud**
-blocks-short-of-`shape[2]` error into silently scrambled K/V, so the planner
-drops the block there and lets the reconciliation guard report the gap.
-`sdpa::rotor_flash_shape_ok` refuses `b != 1` for the same underlying reason,
-which is also why a `b > 1` store never has a ring to rebuild from. Pinned by
-`quant_rotor_v3_tests::quant_rotor_v3_truncate_at_b_gt_1_stays_loud`, which
-asserts both halves: that the two-block store really is unreadable, and that a
-`b > 1` mid-block cut therefore returns `Err`.
+**The split is `b == 1` only, and that is a correctness bound.** The bound is
+*inside* one block. A block's rows run `[B, S_block, kv_h, D]`, so batch element
+1's rows all sit after batch element 0's, and `BlockRows::retain_rows` keeps a
+**row prefix**. At `b > 1` a row prefix is not a sequence prefix: a cut to
+`keep_seq` positions would keep every one of batch 0's rows and none of batch
+1's, silently dropping one batch element's tail instead of cutting both at the
+same position. So the planner drops the block there and lets the reconciliation
+guard report the gap. `sdpa::rotor_flash_shape_ok` refuses `b != 1` separately,
+because the GPU ring's per-step stride does not interleave batch — which is also
+why a `b > 1` store never has a ring to rebuild from. Pinned by
+`quant_rotor_v3_tests::quant_rotor_v3_truncate_at_b_gt_1_stays_loud`.
 
-The multi-block `b > 1` decode is broken independently of truncation and is not
-fixed here; the bound above only keeps this change from making it silent.
+Reading the *concatenation* of the blocks used to be a second, independent bound
+and is no longer one. Every store ended `dequant` with
+`seq_layout::transpose_seq_heads` over the concatenation, reading it as one
+`[B, S_total, kv_h, D]` run — but each block is only `[B, S_block, kv_h, D]`, so
+at `b > 1` the concatenation interleaves batch elements and any store holding
+more than one block decoded scrambled (measured on the `b = 2`, `kv_h = 2`,
+`head_dim = 96`, 5-position fixture: **960 of 1920 elements** disagreed with a
+one-block store, while the `b = 1` control matched to the last bit). Every
+block-accumulating CPU store now calls
+`seq_layout::transpose_chunked_seq_heads`, which reorders each block at its own
+sequence offset and is exactly the old whole-buffer reorder when `B == 1`. The
+per-store proof is `*_two_block_decode_matches_one_block_at_b_gt_1` (one per
+store), with the index-math oracle in `seq_layout_tests`.
 
 All eight rotor/iso K and V codecs share one crate-internal planner,
 `truncate_plan` in `rmlx-kv-quant/src/storage/mod.rs`, plus a `BlockRows`

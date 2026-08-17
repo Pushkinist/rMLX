@@ -444,3 +444,70 @@ fn planar_v4_cpu_roundtrip_8k_bonsai_shape() {
         stats.mean,
     );
 }
+
+// ── Batch-axis block-boundary parity ──────────────────────────────────
+
+/// Two appends must decode exactly like one append of the same tokens, at
+/// `B > 1` as well as `B == 1`.
+///
+/// Each block covers `[B, S_block, kv_h, D]`, so the concatenation of two
+/// blocks is not one `[B, S_total, kv_h, D]` run — reading it as one maps the
+/// second block's batch-0 rows onto batch-1 sequence slots. The single-append
+/// store holds exactly one block and therefore concatenates nothing, which is
+/// what makes it the oracle here.
+///
+/// Mutation check: put `seq_layout::transpose_seq_heads` over the whole
+/// concatenation back in `QuantPlanarK::dequantize_choice` and this goes red at
+/// `b = 2` while staying green at `b = 1` — which is how the defect stayed
+/// invisible.
+#[test]
+fn quant_planar_k_two_block_decode_matches_one_block_at_b_gt_1() {
+    for b in [1_usize, 2] {
+        let (kv_h, head_dim) = (2_usize, 32_usize);
+        let (n0, n1) = (2_usize, 3_usize);
+        let max_seq = 512_i32;
+        let shape = |n: usize| [b as i32, kv_h as i32, n as i32, head_dim as i32];
+        let dummy =
+            |n: usize| rmlx_mlx::zeros(&shape(n), Dtype::F32, Device::Cpu).expect("dummy array");
+        let cpu_dequant = |st: &QuantPlanarK| {
+            st.dequantize_choice(Device::Cpu, Dtype::F32)
+                .expect("cpu dequant")
+                .0
+        };
+
+        let mut one = QuantPlanarK::new(vec![b as i32, kv_h as i32, 0, head_dim as i32], max_seq);
+        one.append(
+            &crate::test_utils::batch_head_chunk(b, kv_h, 0, n0 + n1, head_dim),
+            &shape(n0 + n1),
+            &dummy(n0 + n1),
+            Device::Cpu,
+            max_seq,
+        )
+        .expect("single append");
+        let oracle = cpu_dequant(&one);
+
+        let mut two = QuantPlanarK::new(vec![b as i32, kv_h as i32, 0, head_dim as i32], max_seq);
+        two.append(
+            &crate::test_utils::batch_head_chunk(b, kv_h, 0, n0, head_dim),
+            &shape(n0),
+            &dummy(n0),
+            Device::Cpu,
+            max_seq,
+        )
+        .expect("append chunk 0");
+        two.append(
+            &crate::test_utils::batch_head_chunk(b, kv_h, n0, n1, head_dim),
+            &shape(n1),
+            &dummy(n1),
+            Device::Cpu,
+            max_seq,
+        )
+        .expect("append chunk 1");
+        let got = cpu_dequant(&two);
+
+        assert_eq!(
+            got, oracle,
+            "two-block decode must equal the one-block oracle at b={b}"
+        );
+    }
+}
