@@ -3060,6 +3060,21 @@ cache — falls through to the legacy `update_*` entries, which pass
 site dequantizes the whole prefix on the same step, so `dequant` would take the
 identical readback if `blocks` were left short.
 
+**How reachable is the divergence?** Narrowly, and it is worth knowing why
+before writing a repro. The state needs a cache whose ring is live *and* whose
+CPU blocks were dropped — which only the fused decode path creates — followed by
+a decode-mode `update()` with `q_seq > 1` on **that same cache**. A warm
+prompt-cache continuation looks like it should qualify (gemma4's `is_prefix`
+flush appends the tail through decode-mode `update` with no enter/exit
+brackets), but it does not: that tail runs against a prompt-cache *clone*, and
+`try_deep_clone` materialises any ring-only tail into blocks and hands back a
+store with no ring at all, so there is nothing to diverge. What does qualify is a
+speculative verify chunk — a multi-token decode step on a live cache. So the
+codec can serve a normal single-request generate loop indefinitely without
+meeting it, which is why it surfaced from a truncation proof matrix rather than
+from serving, and why the guards above are the gate rather than a serve-time
+smoke test.
+
 **Every block push reconciles, and every reader derives its count from the same
 place.** Two holes in that used to be reachable and are now closed. The iso-V
 GPU-encode append (`QuantIsoV3::append_gpu`, the V side of the legacy
