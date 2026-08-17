@@ -1,0 +1,6 @@
+# Synthetic workspace for scripts/check_gpu_tests_ignored_fixtures.sh.
+# Never built — the gate reads only the member list and the package name.
+[workspace]
+members = [
+    "crates/fx",
+]

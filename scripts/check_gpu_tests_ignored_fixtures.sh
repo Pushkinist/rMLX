@@ -92,6 +92,8 @@ fi
 
 VIOLATION="ERROR: GPU-touching tests missing the #[ignore]"
 UNREADABLE="ERROR: this gate could not classify part of a scanned file"
+UNDECLARED="ERROR: #[ignore] claims a Metal context"
+DECLARED_NOTE="NOTE: declared-route GPU tests"
 # Pins the file count too, so a fixture that lost its source file cannot pass by
 # scanning nothing.
 CLEAN="OK: every GPU-touching test carries #[ignore] (1 files"
@@ -125,6 +127,14 @@ CASES=(
     "macro_cpu_no_ignore|0|${CLEAN}||NOTE:|a macro body that never reaches the GPU stays un-ignored"
     "macro_gpu_exempt|0|${CLEAN}||NOTE:|the per-test exemption marker works inside a macro body"
     "plain_gpu_ignored|0|${CLEAN}||NOTE:|the compliant non-macro shape stays green"
+    "ignore_metal_undeclared|1|${UNDECLARED}|orphaned_metal_test||an #[ignore] claiming Metal with no reachable device and no declared route is fatal"
+    "unscanned_in_body|1|${UNDECLARED}|marker_inside_body||a declared-route marker among a fn's statements declares nothing"
+    "unscanned_in_body|1|${UNDECLARED}|test_after_body_marker||and does not carry to the next fn"
+    "metal_unscanned_no_ignore|1|${VIOLATION}|declared_without_ignore||a declared route makes the missing #[ignore] a violation"
+    "metal_unscanned_and_exempt|1|${UNREADABLE}|metal-unscanned AND exempt||declaring and exempting the same test fails closed"
+    "metal_unscanned_stale|1|${UNREADABLE}|Device::Gpu is reachable here||a marker the scanner can check for itself is stale, not redundant"
+    "metal_unscanned_declared|0|${CLEAN}||ERROR|a declared route closes the fatal converse"
+    "metal_unscanned_declared|0|${DECLARED_NOTE}|declared_metal_test||and the enforced-but-unlisted test is announced"
 )
 
 FAILED=0
@@ -212,6 +222,45 @@ case "$list_err" in
     *)
         fail "macro_gpu_ignored" "--list did not announce the excluded macro cells on stderr"
         printf '%s\n' "$list_err" | sed 's/^/       | /'
+        ;;
+esac
+
+# The same split for the declared-route marker, and for the same reason: the
+# runner turns a listed name into a libtest filter and executes it, and every
+# declared test is snapshot-gated or drives a child process, so listing one
+# would have the runner execute a no-op, see no Metal validation banner for that
+# crate, and fail the suite over a missing model. Asserting the exact stdout is
+# what stops "declared tests are enforced but unlisted" from quietly becoming
+# either "declared tests are listed" or "plain tests were dropped too".
+want_list=$'fx\tplain_gpu_test'
+got_list=$(bash "$GATE" --list --root "$FIX/metal_unscanned_declared" 2>/dev/null)
+if [ "$got_list" = "$want_list" ]; then
+    PASSED=$((PASSED + 1))
+    printf '  ok   %-22s --list — declared test enforced but not listed; plain test listed\n' \
+        "metal_unscanned_declared"
+else
+    fail "metal_unscanned_declared" "$(printf -- '--list got %q, want %q' "$got_list" "$want_list")"
+fi
+
+# `--list` must refuse an undeclared Metal-claiming #[ignore] exactly as the
+# enforcing path does. `make gpu-test` calls only `--list`, so a check that
+# fires in one mode and not the other leaves the whole GPU suite running over a
+# tree the gate has already judged incomplete.
+#
+# The exit code alone would not assert it: with the check removed the fixture
+# classifies no GPU test at all, so `--list` still exits 1 on its own
+# refuse-to-emit-an-empty-list path. The REASON is what pins this.
+list_rc=0
+list_out=$(bash "$GATE" --list --root "$FIX/ignore_metal_undeclared" 2>&1) || list_rc=$?
+case "${list_rc}:${list_out}" in
+    "1:"*"${UNDECLARED}"*)
+        PASSED=$((PASSED + 1))
+        printf '  ok   %-22s --list — refuses an undeclared Metal-claiming #[ignore] too\n' \
+            "ignore_metal_undeclared"
+        ;;
+    *)
+        fail "ignore_metal_undeclared" "--list exit=$list_rc, and not for the undeclared reason"
+        printf '%s\n' "$list_out" | sed 's/^/       | /'
         ;;
 esac
 
