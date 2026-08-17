@@ -623,9 +623,37 @@ assignment is inverted only for a different hypothesis ("validation drops a
 write the engine needs"). No invalid access is ever reported, and that negative
 *is* load-bearing: the detector was mutation-checked by running the OOB canary
 under both fail modes, and it reported in both. An out-of-bounds access would
-have been caught and was not — which points at an in-bounds read of stale or
-never-written device memory rather than at an OOB write. That is a hypothesis
-under test, not a conclusion; it is tracked outside this document.
+have been caught and was not, which leaves an in-bounds read of stale or
+never-written device memory as the next candidate — but not in a buffer this
+repo owns:
+
+* **The KV ring's never-written tail is not it.** `update_prefill_raw`
+  allocates the ring with `zeros()` on both the lazy-alloc and the grow branch,
+  and hands attention `[.., 0..offset, ..]`. The slots past `offset` hold 0.0
+  and are not part of any SDPA input at any prompt length. Pinned by
+  `prefill_ring_tail_is_zeroed_and_never_returned` (`rmlx-kv-quant`,
+  CPU) — including against a NaN payload, which a max-of-abs fold would have
+  missed.
+* **No rMLX Metal kernel runs before that logit row on this architecture.**
+  While `in_prefill` is set, `KvCache::update` routes every non-rotating cache
+  to `update_prefill_raw`, which is MLX ops only; the codec dispatch sits behind
+  that branch and the fused-QK paths are gated on `q_seq == 1`. Qwen3-dense has
+  no rotating/SWA layers, and neither `.metal` kernel in `rmlx-models`
+  (`gated_delta_step`, `paroquant_rotate`) is on this arch. Every kernel body
+  rMLX dispatches in such a request comes from `exit_prefill`, which runs after
+  the logit graph is already built. The prefill logit row is produced by MLX
+  ops end to end.
+* **"Reproduces at both `k8v8` and `none`" carries no codec information.**
+  Those two cells execute the same appends over the same bf16 buffer during
+  prefill — pinned by `prefill_append_is_codec_independent` — so the pair
+  discriminates nothing. It is consistent with a fault in the shared path and
+  says nothing more.
+
+What remains is an MLX-level mechanism: an MLX op, or the Metal runtime
+underneath it (MLX allocates with `MTLHazardTrackingModeUntracked` and its
+command encoder models read-after-write hazards only — see ml-explore/mlx#3630
+and ml-explore/mlx#3461). Still a hypothesis, and tracked outside this
+document.
 
 Current state: the whole GPU suite — all five crates, `rmlx-kv-quant` included —
 runs clean under validation, zero invalid accesses.
