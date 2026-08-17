@@ -29,10 +29,18 @@ The tier is **off by default**. It activates when `--kv-ssd-cache-gb > 0` is
 passed at startup. When off, the spill and hydrate hooks are never installed and
 decode is byte-identical to the RAM-only path.
 
-Supported architectures (spill + hydrate wired):
-- `Gemma4ForConditionalGeneration`
+Supported architectures (spill + hydrate wired). These are **resolved** classes
+(`Architecture::arch_class()`), not the checkpoint's declared `architectures[0]`:
+- `Gemma4ForConditionalGeneration` (also serves the 12B unified snapshot, which
+  declares `Gemma4UnifiedForConditionalGeneration` and resolves to this class)
+- `Gemma3ForConditionalGeneration`
+- `Qwen2ForCausalLM`
 - `Qwen3ForCausalLM`
 - `Qwen3_5MoeForConditionalGeneration`
+- `Qwen3_5ForConditionalGeneration` (dense Qwen3.5 — same loader, model struct
+  and `PROMPT_CACHE` static as the sparse-MoE class)
+- `Qwen3VLMoeForConditionalGeneration`
+- `BitNetForCausalLM`
 
 Other architectures silently remain RAM-only when the tier is enabled; the SSD
 flag itself is not an error.
@@ -256,6 +264,22 @@ The key is deterministic across runs and distinct with overwhelming probability
 for every distinct input tuple. It is **not** weight-dependent: reloading the
 same architecture at the same `kv_quant` from a different snapshot yields the
 same `layout_key` and shares the cache, which is correct.
+
+`arch` is the **resolved** class. It was previously the declared
+`architectures[0]`, which could name a model that was not built — the salt is
+supposed to describe the layout, and a declaration is not evidence of one.
+
+> **One-time invalidation.** The 12B unified Gemma4 snapshot declares
+> `Gemma4UnifiedForConditionalGeneration` and resolves to
+> `Gemma4ForConditionalGeneration`, so its `layout_key` changes. Blocks spilled
+> by an earlier version become unreachable and keep counting against the
+> namespace budget until LRU evicts them: expect **one cold pass** for that
+> snapshot after upgrading, then steady state. No error, no action required,
+> and only when the tier is enabled (it is off by default). The alias was not
+> preserved in the salt on purpose — two snapshots that resolve to the same
+> architecture with the same geometry have the same layout, and keeping the
+> declared string here would re-introduce the dependence on an unvalidated,
+> model-side name that keying off the resolved class exists to remove.
 
 The key is one of the three terms of the block-hash seed, built at the call site
 by `rmlx_kv_ssd::hashing::cache_seed`:
