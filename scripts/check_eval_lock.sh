@@ -118,6 +118,19 @@
 #   * It proves lexical structure, not runtime behaviour.
 #   * It says nothing about concurrent *graph construction*, which never
 #     reaches `eval_impl`.
+#
+# AWK PORTABILITY — measured, not reasoned about
+#   This gate and its 26-fixture corpus give identical verdicts under gawk
+#   5.4.1, mawk 1.3.4 and BSD awk 20200816, each under both LC_ALL=C and
+#   LC_ALL=en_US.UTF-8, with all 17 gate mutations killed in all six
+#   combinations. The awk below is POSIX-only on purpose: no `gensub`, no `\s`,
+#   no `{n,m}` intervals (mawk's support is version-dependent) and no octal
+#   escapes in bracket expressions (BSD awk accepts `[\300-\337]`, Linux awk
+#   rejects it outright). `length`/`substr` do go character-based rather than
+#   byte-based under a UTF-8 locale, but `strip()` only ever reconstructs by
+#   concatenation, so its output is byte-identical either way. The scripts call
+#   bare `awk`, so re-checking this means putting a shim named `awk` first on
+#   PATH — there is no AWK= override to reach for.
 
 set -euo pipefail
 
