@@ -199,7 +199,20 @@ Hard rules:
 - **Hard rule: a test that reaches `Device::Gpu` carries `#[ignore]`.** A shared
   Metal context driven from parallel `cargo test` threads aborts the whole test
   binary ("Rust cannot catch foreign exceptions"), taking every other test in
-  the crate with it. Run them with **`make gpu-test`** (every member crate,
+  the crate with it. **This rule is about Metal only — do not widen it to cover
+  MLX contact generally.** The CPU side has its own, unrelated hazard (MLX
+  0.31.x fills a process-global command-encoder map without synchronisation, so
+  parallel test threads used to SIGSEGV the binary with no failing test named);
+  that one is contained by `EVAL_LOCK` / `with_eval_lock` in `rmlx-mlx`, which
+  serialises every evaluation process-wide — not by ignoring CPU tests, which
+  would only stop running them. Two deterministic gates hold it, and they are
+  complementary by construction: `make check-eval-lock` fails the build on any
+  MLX eval FFI call made outside the lock (25-symbol reach-set, derived from the
+  linked dylibs — **not** just the eval-named ones) but is blind to a lock that
+  stopped locking, which `with_eval_lock_serialises_concurrent_callers` catches.
+  `make eval-lock-stress` is the probabilistic reproducer, deliberately out of
+  `make ci`. See `docs/FFI.md`.
+  Run GPU tests with **`make gpu-test`** (every member crate,
   serialized; `CRATE=` / `FILTER=` to narrow), or by hand as
   `cargo test -p <crate> --lib -- --ignored <filter> --test-threads=1`.
   `make gpu-test` is the only step that executes them — `make test` passes no
@@ -289,6 +302,9 @@ hand — keeps the CI gate and the local gate identical.
 | `make hooks` | Install the git `pre-commit` hook. |
 | `make ci` | `fmt-check + lint + test + deny + audit` — pre-merge gate. |
 | `make ci-perf` | `test-perf` under `release-perf` + the serialized GPU/Metal suite. Requires an idle GPU. Run before merging perf-sensitive or codec-layer changes (~21 min). |
+| `make check-eval-lock` | CI gate (in `make ci`): every MLX eval FFI call is made under the process-wide evaluation lock (25-symbol reach-set). |
+| `make check-eval-lock-fixtures` | CI gate (in `make ci`): recall test for the above, 26 synthetic scan roots, each asserting which rule fired. |
+| `make eval-lock-stress` | Drive the evaluation-lock reproducer across `RUNS` fresh processes (default 60). Not in `make ci` — probabilistic (~8%/run) and costs ~412 threads. |
 | `make tag` | Create annotated `v<version>` tag from `[workspace.package].version` (single source). |
 | `make release-package` | Build + bundle `dist/rmlx-v<ver>-aarch64-apple-darwin.tar.gz` (+ `.sha256`). |
 | `make release-sha` | Print sha256 of the `v<ver>` GitHub source tarball (`--write` patches the formula). |
