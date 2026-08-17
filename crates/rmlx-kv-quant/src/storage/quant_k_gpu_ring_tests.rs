@@ -455,3 +455,97 @@ fn page_round_covers_needed_and_caps_at_max() {
     // Capped at max_seq, but never below what the caller needs.
     assert_eq!(page_round(300, 300), 300);
 }
+
+// ── The watermark is a prefix, enforced in both directions ───────────────────
+
+/// Appending past `filled` must be refused, not written and then advertised.
+///
+/// `filled` is a contiguous prefix. Writing `[prev_seq, needed)` on a ring that
+/// only holds `filled` positions leaves `[filled, prev_seq)` as the
+/// allocation's zeros, and the `self.filled = needed` at the end of
+/// `append_encoded` would then cover that gap — after which `packed_view`
+/// cannot tell it from written data and the flash-decode kernel attends a
+/// zeroed K/V hole with no error. Enforcing the watermark on reads alone leaves
+/// exactly the state this branch exists to remove reachable one append later.
+///
+/// Runs on `Device::Cpu`: the ring is device-parameterised, and the guard is
+/// checked before any allocation, so nothing here selects a Metal stream.
+///
+/// Mutation check: delete the `prev_seq > self.filled` refusal from
+/// `append_encoded` and the `expect_err` below returns `Ok` instead — the ring
+/// then reports `filled == 5` while positions 2 and 3 hold zeros, and the
+/// `packed_view` assertion that follows stops being reachable at all.
+#[test]
+fn appending_past_the_fill_watermark_is_refused() {
+    let codes: Vec<u32> = (0..CODES_PER_STEP as u32 * 2).collect();
+    let scales: Vec<f32> = vec![0.5; CODES_PER_STEP * 2];
+    let norms: Vec<f32> = vec![7.0; NORMS_PER_STEP * 2];
+
+    let mut ring = QuantKGpuRing::default();
+    ring.append_encoded(
+        &u32_arr(&codes),
+        &f32_arr(&scales),
+        &f32_arr(&norms),
+        KV_H,
+        N_GROUPS,
+        0,
+        2,
+        64,
+        Device::Cpu,
+    )
+    .expect("seed the first two positions");
+    assert_eq!(ring.filled, 2, "two positions written");
+
+    // A stale caller: its blocks reached position 4 while the ring stopped at 2.
+    let one_codes: Vec<u32> = (0..CODES_PER_STEP as u32).collect();
+    let one_scales: Vec<f32> = vec![1.5; CODES_PER_STEP];
+    let one_norms: Vec<f32> = vec![9.0; NORMS_PER_STEP];
+    let err = ring
+        .append_encoded(
+            &u32_arr(&one_codes),
+            &f32_arr(&one_scales),
+            &f32_arr(&one_norms),
+            KV_H,
+            N_GROUPS,
+            4,
+            1,
+            64,
+            Device::Cpu,
+        )
+        .expect_err("appending at prev_seq=4 onto a ring filled to 2 must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("prev_seq=4") && msg.contains("filled=2"),
+        "the refusal must name both positions, got: {msg}"
+    );
+    assert_eq!(
+        ring.filled, 2,
+        "a rejected append commits nothing — the watermark must not move"
+    );
+
+    // And the read side still refuses the same gap, so neither direction can
+    // hand back the allocation's zeros.
+    let err = ring
+        .packed_view(4, Device::Cpu)
+        .expect_err("reading past filled must be refused too");
+    assert!(
+        err.to_string().contains("exceeds filled="),
+        "expected the read-side watermark guard, got: {err}"
+    );
+
+    // The in-step append still works: the guard keys on the gap, not on being
+    // strict about equality.
+    ring.append_encoded(
+        &u32_arr(&one_codes),
+        &f32_arr(&one_scales),
+        &f32_arr(&one_norms),
+        KV_H,
+        N_GROUPS,
+        2,
+        1,
+        64,
+        Device::Cpu,
+    )
+    .expect("an append that starts exactly at `filled` is the healthy case");
+    assert_eq!(ring.filled, 3, "the healthy append advances the watermark");
+}

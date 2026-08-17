@@ -298,6 +298,34 @@ impl QuantIsoV4 {
         blocks.iter().map(IsoBlocks::byte_size).sum::<u64>() + gpu.byte_size()
     }
 
+    /// Rebuild any ring-only prefix into the CPU blocks so `blocks` alone cover
+    /// `shape[2]` again, and either keep or drop the ring.
+    ///
+    /// Sibling of [`super::QuantIsoV3::reconcile_ring`] — see it for why the
+    /// disposition is a parameter rather than two copies of this body.
+    ///
+    /// # Errors
+    ///
+    /// Forwards a [`synced_iso_v_blocks`] reconciliation error.
+    pub(crate) fn reconcile_ring(
+        &mut self,
+        device: Device,
+        disposition: super::RingDisposition,
+    ) -> Result<()> {
+        if !self.gpu.is_allocated() {
+            return Ok(());
+        }
+        if let std::borrow::Cow::Owned(full) =
+            synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, device)?
+        {
+            self.blocks = full;
+        }
+        if disposition == super::RingDisposition::Drop {
+            self.gpu.clear();
+        }
+        Ok(())
+    }
+
     /// Dequantize all accumulated V slices into one flat f32 vector of length
     /// `prod(shape)`.
     ///
@@ -352,12 +380,19 @@ impl QuantIsoV4 {
                 self.shape
             )));
         }
-        // Blocks are sequence-major (see `append`); reorder back to head-major
-        // `[B, kv_h, S, D]`.
+        // Per-block reorder back to head-major `[B, kv_h, S, D]` — see
+        // [`super::QuantIsoV3::dequant`].
         let b = self.shape[0] as usize;
         let kv_h = self.shape[1] as usize;
         let s = self.shape[2] as usize;
-        let out = super::seq_layout::transpose_seq_heads(&out, b, s, kv_h, head_dim);
+        let out = super::seq_layout::transpose_chunked_seq_heads(
+            &out,
+            b,
+            s,
+            kv_h,
+            head_dim,
+            blocks.iter().map(super::BlockRows::rows),
+        )?;
         Ok(out)
     }
 }

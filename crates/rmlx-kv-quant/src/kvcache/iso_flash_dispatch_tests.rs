@@ -330,3 +330,61 @@ fn iso4_cpu_append_drops_a_live_gpu_ring() {
     }
     cpu_append_drops_a_live_ring(KvQuant::IsoKOnly4, "iso4");
 }
+
+// ── iso4 V append orientation ────────────────────────────────────────────────
+
+/// The iso4 V **GPU** append must store the chunk the same way the CPU append
+/// does: sequence-major.
+///
+/// `update_iso4` / `update_iso4_sym` used to encode `new_v` head-major, straight
+/// off the model's `[B, kv_h, S, D]` tensor, while `QuantIsoV4::append` reorders
+/// heads↔seq first and `QuantIsoV4::dequant` reorders back. At `kv_h == 1` or
+/// `S == 1` the two coincide, which is why it survived; a multi-token chunk at
+/// `kv_h > 1` — a speculative verify chunk, or a continuation turn's prompt
+/// tokens against a warm cache — was stored transposed and decoded scrambled,
+/// and spilled that way to SSD. Both entries now go through the shared
+/// ring-aware appender, which reorders like every other iso append.
+///
+/// The CPU-appended store is the oracle: it is the one orientation `dequant`
+/// documents and the SSD reader assumes.
+///
+/// Mutation check: encode `new_v` instead of `packed_k_chunk_seq_major(new_v)`
+/// in `iso_gpu_encode_block_retaining`'s caller and this goes red at
+/// `kv_h = 2, S = 3` while staying green at `S = 1`.
+#[test]
+#[ignore = "GPU Metal context — run via `make gpu-test CRATE=rmlx-kv-quant FILTER=iso4_v_gpu_append_matches_cpu_append`"]
+fn iso4_v_gpu_append_matches_cpu_append_at_kv_h_gt_1() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    for (kv_h, seq) in [(1_usize, 3_usize), (2, 1), (2, 3), (3, 4)] {
+        let (b, head_dim) = (1_usize, 8_usize);
+        let shape = [b as i32, kv_h as i32, seq as i32, head_dim as i32];
+        let init = vec![b as i32, kv_h as i32, 0, head_dim as i32];
+        let data = crate::test_utils::batch_head_chunk(b, kv_h, 0, seq, head_dim);
+
+        let mut cpu = crate::storage::QuantIsoV4::new(init.clone(), MAX_SEQ);
+        cpu.append(&data, &shape).expect("cpu append");
+        let oracle = cpu.dequant().expect("cpu dequant");
+
+        // The GPU appender is private to `update`; drive it through the storage
+        // append it now shares, then compare the decoded values.
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let arr = Array::from_bytes(&bytes, &shape, Dtype::F32).expect("chunk array");
+        let mut gpu = crate::storage::QuantIsoV4::new(init, MAX_SEQ);
+        super::update::iso4_v_gpu_append_for_test(&mut gpu, &arr, &shape, Device::Gpu, MAX_SEQ)
+            .expect("gpu append");
+        let got = gpu.dequant().expect("gpu-appended dequant");
+
+        assert_eq!(got.len(), oracle.len(), "length at kv_h={kv_h} seq={seq}");
+        let max_abs = got
+            .iter()
+            .zip(oracle.iter())
+            .fold(0.0_f32, |m, (a, c)| m.max((a - c).abs()));
+        assert!(
+            max_abs < 1e-5,
+            "GPU-appended iso4 V vs CPU-appended oracle: max abs error {max_abs} at \
+             kv_h={kv_h} seq={seq} — head↔seq orientation mismatch in the GPU append"
+        );
+    }
+}

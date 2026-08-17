@@ -66,6 +66,13 @@ pub struct QuantKGpuRing {
     pub norms_per_step: i32,
     /// Sequence positions the buffers are currently sized for.
     pub capacity: i32,
+    /// Sequence positions actually **written**.
+    ///
+    /// Distinct from `capacity`, which is page-rounded up to `KV_PAGE_SIZE` and
+    /// allocated with `zeros`: reading `[filled, capacity)` hands back the
+    /// allocation's zeros, which decode to a plausible-looking K/V tail rather
+    /// than an error. Every reader bounds on this, not on `capacity`.
+    pub filled: i32,
 }
 
 impl QuantKGpuRing {
@@ -83,6 +90,7 @@ impl QuantKGpuRing {
         self.scales = None;
         self.norms = None;
         self.capacity = 0;
+        self.filled = 0;
     }
 
     /// Resident byte footprint of the ring's GPU buffers.
@@ -104,6 +112,7 @@ impl QuantKGpuRing {
             codes_per_step: _,
             norms_per_step: _,
             capacity: _,
+            filled: _,
         } = self;
         crate::bytes::opt_array_bytes(codes.as_ref())
             + crate::bytes::opt_array_bytes(scales.as_ref())
@@ -165,6 +174,27 @@ impl QuantKGpuRing {
             )));
         }
 
+        // The watermark is a contiguous prefix, not a set. Appending at
+        // `prev_seq` when the ring only holds `filled` positions leaves
+        // `[filled, prev_seq)` as the allocation's zeros, and the
+        // `self.filled = needed` below would then advertise that gap as written
+        // — after which no reader can tell the difference, so the flash-decode
+        // kernel attends a zeroed K/V hole with no error. Enforcing the
+        // watermark on reads alone leaves exactly that state reachable one
+        // append later. A caller whose blocks outgrew the ring must `clear()`
+        // (which every `*_sync_ring` does) or reseed first. Checked before the
+        // alloc/grow below so a rejected append allocates nothing.
+        if self.is_allocated() && prev_seq > self.filled {
+            return Err(Error::Quant(format!(
+                "QuantKGpuRing::append_encoded: prev_seq={prev_seq} exceeds filled={filled} \
+                 (capacity={capacity}) — the ring is stale, so this append would leave \
+                 [{filled}, {prev_seq}) zeroed and then mark it written; clear() the ring \
+                 or reseed it from the CPU blocks first",
+                filled = self.filled,
+                capacity = self.capacity
+            )));
+        }
+
         if !self.is_allocated() {
             // Allocating here and writing only `[prev_seq, needed)` would leave
             // `[0, prev_seq)` zeroed — attention over a zeroed prefix, silently
@@ -196,6 +226,9 @@ impl QuantKGpuRing {
             device,
         )?;
         write_range(&mut self.norms, norms, prev_seq * nps, needed * nps, device)?;
+        // Commit the watermark only after every write landed: a partial append
+        // that raised it would advertise a region the buffers do not hold.
+        self.filled = needed;
         Ok(())
     }
 
@@ -271,6 +304,7 @@ impl QuantKGpuRing {
         write_range(&mut self.codes, &codes_arr, 0, filled_seq * cps, device)?;
         write_range(&mut self.scales, &scales_arr, 0, filled_seq * cps, device)?;
         write_range(&mut self.norms, &norms_arr, 0, filled_seq * nps, device)?;
+        self.filled = filled_seq;
         tracing::debug!(
             filled_seq,
             cap,
@@ -303,6 +337,18 @@ impl QuantKGpuRing {
             return Err(Error::Quant(format!(
                 "QuantKGpuRing::packed_view: kv_seq={kv_seq} exceeds capacity={}",
                 self.capacity
+            )));
+        }
+        // `capacity` is page-rounded and zero-initialised, so a read that stops
+        // inside `[filled, capacity)` is length-correct and silently wrong —
+        // the caller gets a zeroed K/V tail and no error. Bound on what was
+        // actually written. This check precedes every slice, so a rejected read
+        // dispatches nothing.
+        if kv_seq > self.filled {
+            return Err(Error::Quant(format!(
+                "QuantKGpuRing::packed_view: kv_seq={kv_seq} exceeds filled={} \
+                 (capacity={}) — refusing to read the allocation's zeros as K/V",
+                self.filled, self.capacity
             )));
         }
         let cps = self.codes_per_step;
@@ -386,10 +432,15 @@ impl QuantKGpuRing {
             device,
         )?);
         self.capacity = cap;
+        // `regrow` copies exactly `prev_seq` positions, so anything written past
+        // that is gone. Clamp rather than carry a watermark the new buffers do
+        // not back.
+        self.filled = self.filled.min(prev_seq);
         tracing::debug!(
             old_capacity,
             new_capacity = cap,
             prev_seq,
+            filled = self.filled,
             "QuantKGpuRing: ring grown"
         );
         Ok(())
@@ -407,13 +458,13 @@ fn page_round(needed: i32, max_seq: i32) -> i32 {
 fn regrow(
     old: Option<Array>,
     new_len: i32,
-    filled: i32,
+    copy_seq: i32,
     dtype: Dtype,
     what: &str,
     device: Device,
 ) -> Result<Array> {
     let fresh = zeros(&[new_len], dtype, device)?;
-    if filled <= 0 {
+    if copy_seq <= 0 {
         return Ok(fresh);
     }
     let old = old.ok_or_else(|| {
@@ -421,8 +472,8 @@ fn regrow(
             "QuantKGpuRing::grow: {what} buffer vanished mid-grow (internal invariant)"
         ))
     })?;
-    let prefix = old.slice(&[0], &[filled], &[1], device)?;
-    fresh.slice_update(&prefix, &[0], &[filled], &[1], device)
+    let prefix = old.slice(&[0], &[copy_seq], &[1], device)?;
+    fresh.slice_update(&prefix, &[0], &[copy_seq], &[1], device)
 }
 
 /// `slice_update` `src` into `buf[start..stop]`.

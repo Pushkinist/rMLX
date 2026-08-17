@@ -15,7 +15,7 @@ use rmlx_mlx::{zeros, Array, Device, Dtype};
 use crate::storage::{
     iso_n_groups_for, IsoBlocks, KvStorage, QuantIsoK3, QuantIsoK4, QuantIsoV3, QuantIsoV4, QuantK,
     QuantKTurbo3, QuantKTurbo4, QuantPlanarK, QuantPlanarV, QuantRotorV3, QuantRotorV4, QuantV,
-    RotorBlocks, RotorKBlocks, ISO4_GROUP_SIZE, ISO_K3_BITS, ISO_K4_BITS,
+    RotorBlocks, RotorKBlocks, ISO_K3_BITS, ISO_K4_BITS,
 };
 use crate::turbo_flash_msl::{turbo_flash_sdpa, turbo_flash_should_run};
 use crate::KvQuant;
@@ -64,86 +64,6 @@ fn cast_store_bf16(arr: &Array, device: Device) -> Result<Option<Array>> {
     }
 }
 
-/// Encode a KV chunk (`new_kv`, shape `[B, kv_h, S, D]`) via the iso4
-/// MSL kernel and return the resulting CPU [`IsoBlocks`].
-///
-/// Mirrors the CPU codec ([`crate::isoquant::iso_encode_fast`] with
-/// `bits = 4`): the returned block's `n_tokens` equals `B * kv_h * S`, codes
-/// are bit-packed identically (8 vals/u32, dense), and the per-token L2 norm
-/// is preserved (deduplicated from the per-group GPU norm slot).
-///
-/// The kernel is axis-agnostic, so the same helper drives both the V-side
-/// ([`QuantIsoV4`]) and K-side ([`QuantIsoK4`]) appenders.
-///
-/// # Errors
-///
-/// Forwards Metal kernel / shape errors as `Error::Mlx` / `Error::Quant`.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "shape rank guarded to 4 immediately above each indexing site; new_shape[0..=3] are always in-bounds"
-)]
-fn iso4_gpu_encode_block(new_kv: &Array, new_shape: &[i32]) -> Result<IsoBlocks> {
-    if new_shape.len() != 4 {
-        return Err(Error::Mlx(format!(
-            "iso4_gpu_encode_block: expected 4D new_shape, got {new_shape:?}"
-        )));
-    }
-    let b = new_shape[0] as usize;
-    let kv_h = new_shape[1] as usize;
-    let s = new_shape[2] as usize;
-    let head_dim = new_shape[3] as usize;
-    let n_tokens_total = b * kv_h * s;
-    if !head_dim.is_multiple_of(ISO4_GROUP_SIZE) {
-        return Err(Error::Quant(format!(
-            "iso4_gpu_encode_block: head_dim={head_dim} must be a positive multiple of \
-             ISO4_GROUP_SIZE={ISO4_GROUP_SIZE}"
-        )));
-    }
-    let n_groups = head_dim / ISO4_GROUP_SIZE;
-
-    tracing::debug!(
-        target: "rmlx::kv_quant::iso4",
-        n_tokens = n_tokens_total,
-        n_groups,
-        head_dim,
-        "iso4 GPU encode block"
-    );
-
-    let (codes_arr, scales_arr, quats_arr, norms_arr) =
-        crate::isoquant_msl_v4::iso_quantize_v4_gpu(new_kv, head_dim, Device::Gpu)?;
-    let (codes, scales, quaternions, norms) = crate::isoquant_msl_v4::iso4_gpu_outputs_to_cpu(
-        &codes_arr,
-        &scales_arr,
-        &quats_arr,
-        &norms_arr,
-        n_tokens_total,
-        n_groups,
-    )?;
-
-    Ok(IsoBlocks {
-        codes,
-        scales,
-        quaternions,
-        norms,
-        n_tokens: n_tokens_total,
-    })
-}
-
-/// Push a pre-built [`IsoBlocks`] onto a [`QuantIsoV4`] buffer and update
-/// `vs.shape` the same way [`QuantIsoV4::append`] does.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "vs.shape rank-4 guard above each indexing site; new_shape rank validated by upstream encoder helper"
-)]
-fn push_iso4_v_block(vs: &mut QuantIsoV4, block: IsoBlocks, new_shape: &[i32]) {
-    vs.blocks.push(block);
-    if vs.shape.len() != 4 || vs.shape[0] == 0 {
-        vs.shape = new_shape.to_vec();
-    } else {
-        vs.shape[2] += new_shape[2];
-    }
-}
-
 /// Push a pre-built [`IsoBlocks`] onto a [`QuantIsoK4`] buffer and update
 /// `ks.shape` the same way [`QuantIsoK4::append`] does.
 #[allow(
@@ -157,19 +77,6 @@ fn push_iso4_k_block(ks: &mut QuantIsoK4, block: IsoBlocks, new_shape: &[i32]) {
     } else {
         ks.shape[2] += new_shape[2];
     }
-}
-
-/// Convenience wrapper — encode `new_v` via GPU iso4 kernel and append
-/// the resulting block to `vs`. Shared by [`KvCache::update_iso4`] and
-/// [`KvCache::update_iso4_sym`].
-fn iso4_gpu_append_into_blocks(
-    vs: &mut QuantIsoV4,
-    new_v: &Array,
-    new_shape: &[i32],
-) -> Result<()> {
-    let block = iso4_gpu_encode_block(new_v, new_shape)?;
-    push_iso4_v_block(vs, block, new_shape);
-    Ok(())
 }
 
 /// Mirror of [`iso3_gpu_append_into_k_blocks`] for the iso4 codec — see it for
@@ -199,7 +106,7 @@ fn iso4_gpu_append_into_k_blocks(
         bump_rotor_k_shape(&mut ks.shape, new_shape);
         return Ok(());
     }
-    materialize_iso_k4_ring_tail(ks, device)?;
+    ks.reconcile_ring(device, crate::storage::RingDisposition::Keep)?;
     let block_feed = if feed == RingFeed::Skip {
         RingFeed::Skip
     } else {
@@ -286,7 +193,7 @@ fn iso3_gpu_append_into_k_blocks(
     // legacy sym fallback (Skip). A ring-only feed that reaches here is a `b > 1`
     // chunk — normalise it to Maintain so the shared ring feeder clears the ring
     // for the un-representable batch and the CPU block carries the data.
-    materialize_iso_k3_ring_tail(ks, device)?;
+    ks.reconcile_ring(device, crate::storage::RingDisposition::Keep)?;
     let block_feed = if feed == RingFeed::Skip {
         RingFeed::Skip
     } else {
@@ -875,6 +782,16 @@ enum RingFeed {
 /// it is what makes a mid-block truncation unrecoverable there — see
 /// `crate::storage::truncate_plan`.
 const LEGACY_ROTOR_SYM_FEED: RingFeed = RingFeed::Skip;
+
+/// Feed the legacy iso V `update_iso4` / `update_iso4_sym` entries pass.
+///
+/// Named for the same reason as the rotor constants: these entries dequantize
+/// the whole prefix on the same step, so the CPU blocks must carry everything
+/// and the ring is dropped. Passing it also routes the append through
+/// [`iso4_gpu_append_into_v_blocks`], which reconciles a pre-existing ring-only
+/// tail **and** stores the chunk sequence-major — the orientation the CPU
+/// `QuantIsoV4::append` and `QuantIsoV4::dequant` both assume.
+const LEGACY_ISO4_V_FEED: RingFeed = RingFeed::Skip;
 
 /// Feed the legacy rotor K-only `update_*` entries pass.
 ///
@@ -1485,12 +1402,15 @@ fn iso_gpu_encode_block_retaining(
     let head_dim = head_dim_from_shape(new_shape, "iso_gpu_encode_block_retaining")?;
     let (b, kv_h, s) = b_kv_h_new_seq(new_shape)?;
     let n_tokens_total = (b as usize) * (kv_h as usize) * (s as usize);
-    let n_groups = iso_n_groups_for(head_dim);
-    if n_groups == 0 {
-        return Err(Error::Quant(format!(
-            "iso_gpu_encode_block_retaining: head_dim={head_dim} yields no quaternion groups"
-        )));
-    }
+    // Strict form: `iso_n_groups_for` truncates, so a `head_dim` that is not a
+    // whole number of quaternion blocks would silently drop the trailing partial
+    // group. The helper the deleted iso4 encoder used rejected that; keep the
+    // rejection now that this is the shared path.
+    let n_groups = usize::try_from(crate::storage::iso_n_groups_i32(
+        head_dim as i32,
+        "iso_gpu_encode_block_retaining",
+    )?)
+    .map_err(|_| Error::Quant("iso_gpu_encode_block_retaining: n_groups negative".to_owned()))?;
 
     let (codes_arr, scales_arr, quats_arr, norms_arr) = match bits {
         ISO_K3_BITS => crate::isoquant_msl::iso_quantize_v3_gpu(new_k, head_dim, Device::Gpu)?,
@@ -1599,72 +1519,6 @@ fn iso_gpu_encode_ring_only(
         scales: scales_arr,
         norms: norms_per_token,
     })
-}
-
-/// Reconcile a pre-existing ring-only decode tail into `ks.blocks` before a
-/// block-path append — iso mirror of [`materialize_rotor_k3_ring_tail`]. No-op
-/// when `blocks` already cover `shape[2]` (reads no GPU).
-fn materialize_iso_k3_ring_tail(ks: &mut QuantIsoK3, device: Device) -> Result<()> {
-    if !ks.gpu.is_allocated() {
-        return Ok(());
-    }
-    let rebuilt = match crate::storage::synced_iso_v_blocks(&ks.blocks, &ks.shape, &ks.gpu, device)?
-    {
-        std::borrow::Cow::Owned(full) => Some(full),
-        std::borrow::Cow::Borrowed(_) => None,
-    };
-    if let Some(full) = rebuilt {
-        ks.blocks = full;
-    }
-    Ok(())
-}
-
-/// Mirror of [`materialize_iso_k3_ring_tail`] for [`QuantIsoK4`].
-fn materialize_iso_k4_ring_tail(ks: &mut QuantIsoK4, device: Device) -> Result<()> {
-    if !ks.gpu.is_allocated() {
-        return Ok(());
-    }
-    let rebuilt = match crate::storage::synced_iso_v_blocks(&ks.blocks, &ks.shape, &ks.gpu, device)?
-    {
-        std::borrow::Cow::Owned(full) => Some(full),
-        std::borrow::Cow::Borrowed(_) => None,
-    };
-    if let Some(full) = rebuilt {
-        ks.blocks = full;
-    }
-    Ok(())
-}
-
-/// Mirror of [`materialize_iso_k3_ring_tail`] for [`QuantIsoV3`].
-fn materialize_iso_v3_ring_tail(vs: &mut QuantIsoV3, device: Device) -> Result<()> {
-    if !vs.gpu.is_allocated() {
-        return Ok(());
-    }
-    let rebuilt = match crate::storage::synced_iso_v_blocks(&vs.blocks, &vs.shape, &vs.gpu, device)?
-    {
-        std::borrow::Cow::Owned(full) => Some(full),
-        std::borrow::Cow::Borrowed(_) => None,
-    };
-    if let Some(full) = rebuilt {
-        vs.blocks = full;
-    }
-    Ok(())
-}
-
-/// Mirror of [`materialize_iso_v3_ring_tail`] for [`QuantIsoV4`].
-fn materialize_iso_v4_ring_tail(vs: &mut QuantIsoV4, device: Device) -> Result<()> {
-    if !vs.gpu.is_allocated() {
-        return Ok(());
-    }
-    let rebuilt = match crate::storage::synced_iso_v_blocks(&vs.blocks, &vs.shape, &vs.gpu, device)?
-    {
-        std::borrow::Cow::Owned(full) => Some(full),
-        std::borrow::Cow::Borrowed(_) => None,
-    };
-    if let Some(full) = rebuilt {
-        vs.blocks = full;
-    }
-    Ok(())
 }
 
 /// Append `new_k` into a live `IsoKOnly3` store's GPU ring (+ CPU blocks),
@@ -1938,7 +1792,7 @@ fn iso3_gpu_append_into_v_blocks(
         bump_rotor_k_shape(&mut vs.shape, new_shape);
         return Ok(());
     }
-    materialize_iso_v3_ring_tail(vs, device)?;
+    vs.reconcile_ring(device, crate::storage::RingDisposition::Keep)?;
     let block_feed = if feed == RingFeed::Skip {
         RingFeed::Skip
     } else {
@@ -1949,6 +1803,22 @@ fn iso3_gpu_append_into_v_blocks(
     vs.blocks.push(block);
     bump_rotor_k_shape(&mut vs.shape, new_shape);
     Ok(())
+}
+
+/// Test seam onto the iso4 V append the legacy entries use.
+///
+/// The appender is private to this module; the orientation test lives with the
+/// other iso dispatch tests, one module up. Exposing the call rather than
+/// duplicating it is what keeps the test pinned to the production path.
+#[cfg(test)]
+pub(super) fn iso4_v_gpu_append_for_test(
+    vs: &mut QuantIsoV4,
+    new_v: &Array,
+    new_shape: &[i32],
+    device: Device,
+    max_seq: i32,
+) -> Result<()> {
+    iso4_gpu_append_into_v_blocks(vs, new_v, new_shape, device, LEGACY_ISO4_V_FEED, max_seq)
 }
 
 /// Mirror of [`iso3_gpu_append_into_v_blocks`] for [`QuantIsoV4`].
@@ -1976,7 +1846,7 @@ fn iso4_gpu_append_into_v_blocks(
         bump_rotor_k_shape(&mut vs.shape, new_shape);
         return Ok(());
     }
-    materialize_iso_v4_ring_tail(vs, device)?;
+    vs.reconcile_ring(device, crate::storage::RingDisposition::Keep)?;
     let block_feed = if feed == RingFeed::Skip {
         RingFeed::Skip
     } else {
@@ -6808,7 +6678,7 @@ impl KvCache {
             arr
         } else {
             let t_deq = std::time::Instant::now();
-            let v_recon_f32 = vs.dequant()?;
+            let v_recon_f32 = vs.dequant_on(device)?;
             tracing::trace!(
                 phase = "iso3_dequant_cpu",
                 ms = t_deq.elapsed().as_secs_f64() * 1e3,
@@ -6916,7 +6786,14 @@ impl KvCache {
         }
         let vs = v.as_mut().unwrap();
         if device == Device::Gpu {
-            iso4_gpu_append_into_blocks(vs, new_v, &new_shape)?;
+            iso4_gpu_append_into_v_blocks(
+                vs,
+                new_v,
+                &new_shape,
+                device,
+                LEGACY_ISO4_V_FEED,
+                max_seq,
+            )?;
         } else {
             vs.append(&v_f32, &new_shape)?;
         }
@@ -6985,7 +6862,7 @@ impl KvCache {
         let k_full = if device == Device::Gpu {
             ks.dequant_gpu(device)?
         } else {
-            let k_recon_f32 = ks.dequant()?;
+            let k_recon_f32 = ks.dequant_on(device)?;
             f32_vec_to_array(&k_recon_f32, &k_shape)?
         };
 
@@ -7032,7 +6909,7 @@ impl KvCache {
             arr
         } else {
             let t_deq = std::time::Instant::now();
-            let v_recon_f32 = vs.dequant()?;
+            let v_recon_f32 = vs.dequant_on(device)?;
             tracing::trace!(
                 phase = "iso3_dequant_cpu",
                 ms = t_deq.elapsed().as_secs_f64() * 1e3,
@@ -7123,7 +7000,14 @@ impl KvCache {
             return Err(Error::Mlx("IsoSym4 V buffer absent after init".into()));
         };
         if device == Device::Gpu {
-            iso4_gpu_append_into_blocks(vs, new_v, &new_shape)?;
+            iso4_gpu_append_into_v_blocks(
+                vs,
+                new_v,
+                &new_shape,
+                device,
+                LEGACY_ISO4_V_FEED,
+                max_seq,
+            )?;
         } else {
             vs.append(&v_f32, &new_shape)?;
         }

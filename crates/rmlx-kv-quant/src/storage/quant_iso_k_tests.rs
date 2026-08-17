@@ -8,7 +8,7 @@
 use crate::isoquant::{iso_decode_fast, iso_encode_fast};
 use crate::storage::quant_iso_k::{QuantIsoK3, ISO_K3_BITS, ISO_K3_GROUP_SIZE};
 use crate::test_utils::{cosine_similarity_per_row, lcg_data, skip_if_no_gpu_env, TEST_SEED};
-use rmlx_mlx::Device;
+use rmlx_mlx::{Array, Device, Dtype};
 
 #[test]
 fn quant_iso_k3_new_shapes_correct() {
@@ -324,6 +324,212 @@ fn quant_iso_k3_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
             decoded, ref_decoded,
             "truncated store must exactly match a store built from only the \
              first keep_tokens (kv_h={kv_h})"
+        );
+    }
+}
+
+// ── Batch-axis block-boundary parity ──────────────────────────────────
+
+/// Two appends must decode exactly like one append of the same tokens, at
+/// `B > 1` as well as `B == 1`.
+///
+/// Each block covers `[B, S_block, kv_h, D]`, so the concatenation of two
+/// blocks is not one `[B, S_total, kv_h, D]` run — reading it as one maps the
+/// second block's batch-0 rows onto batch-1 sequence slots. The single-append
+/// store holds exactly one block and therefore concatenates nothing, which is
+/// what makes it the oracle here.
+///
+/// Mutation check: put `seq_layout::transpose_seq_heads` over the whole
+/// concatenation back in `QuantIsoK3::dequant` and this goes red at
+/// `b = 2` while staying green at `b = 1` — which is how the defect stayed
+/// invisible.
+#[test]
+fn quant_iso_k3_two_block_decode_matches_one_block_at_b_gt_1() {
+    for (b, kv_h) in [(1_usize, 1_usize), (1, 2), (2, 1), (2, 2)] {
+        let head_dim = 8_usize;
+        let (n0, n1) = (2_usize, 3_usize);
+        let shape = |n: usize| [b as i32, kv_h as i32, n as i32, head_dim as i32];
+
+        let mut one = QuantIsoK3::new(vec![b as i32, kv_h as i32, 0, head_dim as i32], 512);
+        one.append(
+            &crate::test_utils::batch_head_chunk(b, kv_h, 0, n0 + n1, head_dim),
+            &shape(n0 + n1),
+        )
+        .expect("single append");
+        let oracle = one.dequant().expect("one-block dequant");
+
+        let mut two = QuantIsoK3::new(vec![b as i32, kv_h as i32, 0, head_dim as i32], 512);
+        two.append(
+            &crate::test_utils::batch_head_chunk(b, kv_h, 0, n0, head_dim),
+            &shape(n0),
+        )
+        .expect("append chunk 0");
+        two.append(
+            &crate::test_utils::batch_head_chunk(b, kv_h, n0, n1, head_dim),
+            &shape(n1),
+        )
+        .expect("append chunk 1");
+        let got = two.dequant().expect("two-block dequant");
+
+        assert_eq!(
+            got, oracle,
+            "two-block decode must equal the one-block oracle at b={b} kv_h={kv_h}"
+        );
+    }
+}
+
+// ── Ring-only tail is readable by both dequant paths ──────────────────────────
+
+/// `dequant_gpu` must read a store whose decode tail lives only in the GPU ring,
+/// exactly as `dequant` does.
+///
+/// The fused iso-symmetric decode path drops the CPU blocks once the ring is
+/// live, so `blocks` legitimately trail `shape[2]`. `dequant_gpu` used to derive
+/// its element accounting straight from `self.blocks` while `dequant` derived it
+/// from the ring-reconciled list, so the two disagreed on the same store and the
+/// GPU reader rejected it with a blocks-vs-shape mismatch. Both now go through
+/// the one reconciliation.
+///
+/// Mutation check: revert `QuantIsoK3::dequant_gpu` to iterate `self.blocks` and
+/// this fails with `actual_total != declared_total`.
+#[test]
+#[ignore = "GPU Metal context — run via `make gpu-test CRATE=rmlx-kv-quant FILTER=iso_k3_dequant_gpu_reads_a_ring_only_tail`"]
+fn iso_k3_dequant_gpu_reads_a_ring_only_tail() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    let (b, kv_h, head_dim) = (1_usize, 2_usize, 8_usize);
+    let n_tokens = 4_usize;
+    let max_seq = 64_i32;
+    let shape = |n: usize| [b as i32, kv_h as i32, n as i32, head_dim as i32];
+    let init = || vec![b as i32, kv_h as i32, 0, head_dim as i32];
+    let data = crate::test_utils::batch_head_chunk(b, kv_h, 0, n_tokens, head_dim);
+
+    let mut oracle_store = QuantIsoK3::new(init(), max_seq);
+    oracle_store
+        .append(&data, &shape(n_tokens))
+        .expect("oracle append");
+    let oracle = oracle_store.dequant().expect("oracle dequant");
+
+    // Ring-only tail: seed the ring from the blocks, then drop the blocks the
+    // way the fused path does.
+    let mut ks = QuantIsoK3::new(init(), max_seq);
+    ks.append(&data, &shape(n_tokens)).expect("cpu append");
+    let last = ks.blocks[0].clone();
+    let codes_b: Vec<u8> = last.codes.iter().flat_map(|c| c.to_le_bytes()).collect();
+    let scales_b: Vec<u8> = last.scales.iter().flat_map(|s| s.to_le_bytes()).collect();
+    let norms_b: Vec<u8> = last.norms.iter().flat_map(|n| n.to_le_bytes()).collect();
+    let codes = Array::from_bytes(&codes_b, &[last.codes.len() as i32], Dtype::U32).expect("codes");
+    let scales =
+        Array::from_bytes(&scales_b, &[last.scales.len() as i32], Dtype::F32).expect("scales");
+    let norms = Array::from_bytes(&norms_b, &[last.norms.len() as i32], Dtype::F32).expect("norms");
+    // `prev_seq = 0`: the ring takes the whole prefix in one append, so nothing
+    // is seeded from the blocks and dropping them leaves the ring as sole copy.
+    ks.gpu_append(
+        &codes,
+        &scales,
+        &norms,
+        kv_h as i32,
+        head_dim as i32,
+        0,
+        n_tokens as i32,
+        max_seq,
+        Device::Gpu,
+    )
+    .expect("ring append");
+    ks.blocks.clear();
+
+    let cpu = ks.dequant().expect("dequant over a ring-only tail");
+    let max_abs = cpu
+        .iter()
+        .zip(oracle.iter())
+        .fold(0.0_f32, |m, (a, c)| m.max((a - c).abs()));
+    assert!(
+        max_abs < 1e-5,
+        "dequant over a ring-only tail: max abs error {max_abs} vs the all-CPU oracle"
+    );
+
+    let gpu_arr = ks
+        .dequant_gpu(Device::Gpu)
+        .expect("dequant_gpu must read the ring-only tail, not reject it");
+    assert_eq!(
+        gpu_arr.shape(),
+        shape(n_tokens).to_vec(),
+        "dequant_gpu returns the declared [B, kv_h, S, D]"
+    );
+}
+
+/// The geometry the codec actually failed on: a single KV head with a wide
+/// `head_dim`.
+///
+/// gemma-4-e2b's global attention layers are `kv_h = 1, head_dim = 512`
+/// (`num_key_value_heads: 1`, `global_head_dim: 512`), and no unit test
+/// constructed that shape for this codec — every other iso fixture here uses
+/// `kv_h = 2, head_dim = 8`, which is two quaternion groups per token and hides
+/// anything that scales with `n_groups`. 512 is 128 groups.
+///
+/// What this pins: that a 128-group store decodes at all, and that the shared
+/// builder's declared-vs-actual accounting agrees on it — the arithmetic that
+/// scales with `n_groups`. At `b = kv_h = 1` it does **not** pin the row
+/// permutation: `head_major_token_order` is the identity there, and so is the
+/// block-concatenation order the branch replaced. Neither does `(1, 2)` —
+/// measured: at `b == 1` concatenation preserves row order across chunk
+/// boundaries for any `kv_h`, so the identity passes both. The `b = 2`
+/// iterations below are what carry the layout at this width. The permutation in
+/// general is pinned by `*_two_block_decode_matches_one_block_at_b_gt_1` and
+/// `seq_layout_tests::head_major_token_order_matches_the_output_reorder`.
+#[test]
+fn iso_k3_single_kv_head_head_dim_512_decodes_the_same_either_chunking() {
+    for (b, kv_h) in [(1_usize, 1_usize), (1, 2), (2, 1), (2, 2)] {
+        let head_dim = 512_usize;
+        let n_groups = head_dim / ISO_K3_GROUP_SIZE;
+        let (n0, n1) = (2_usize, 3_usize);
+        let shape = |n: usize| [b as i32, kv_h as i32, n as i32, head_dim as i32];
+        let init = || vec![b as i32, kv_h as i32, 0, head_dim as i32];
+        let chunk =
+            |s0: usize, n: usize| crate::test_utils::batch_head_chunk(b, kv_h, s0, n, head_dim);
+
+        let mut one = QuantIsoK3::new(init(), 512);
+        one.append(&chunk(0, n0 + n1), &shape(n0 + n1))
+            .expect("single append");
+        let oracle = one.dequant().expect("one-block dequant");
+
+        let mut two = QuantIsoK3::new(init(), 512);
+        two.append(&chunk(0, n0), &shape(n0)).expect("chunk 0");
+        two.append(&chunk(n0, n1), &shape(n1)).expect("chunk 1");
+        let got = two.dequant().expect("two-block dequant");
+        assert_eq!(
+            got, oracle,
+            "head_dim = 512, kv_h={kv_h}: two-block decode must equal the one-block oracle"
+        );
+
+        let build = |blocks: &[crate::storage::IsoBlocks], sh: &[i32]| {
+            crate::storage::quant_iso_v::iso_kernel_inputs_head_major(
+                blocks,
+                sh,
+                n_groups,
+                ISO_K3_GROUP_SIZE,
+                "test",
+            )
+            .expect("well-formed store")
+        };
+        let a = build(&one.blocks, &one.shape);
+        let c = build(&two.blocks, &two.shape);
+        assert_eq!(
+            a.total_groups, c.total_groups,
+            "slot count at head_dim 512, kv_h={kv_h}"
+        );
+        assert_eq!(
+            a.codes, c.codes,
+            "GPU-reader codes at head_dim 512, kv_h={kv_h}"
+        );
+        assert_eq!(
+            a.scales, c.scales,
+            "GPU-reader scales at head_dim 512, kv_h={kv_h}"
+        );
+        assert_eq!(
+            a.norms, c.norms,
+            "GPU-reader norms at head_dim 512, kv_h={kv_h}"
         );
     }
 }

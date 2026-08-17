@@ -570,12 +570,21 @@ impl QuantRotorK3 {
                 self.shape
             )));
         }
-        // Blocks are sequence-major (see `append`); reorder back to head-major
-        // `[B, kv_h, S, D]`.
+        // Blocks are sequence-major (see `append`), one per append; reorder each
+        // at its own sequence offset back to head-major `[B, kv_h, S, D]`.
+        // Reading the concatenation as a single run would interleave batch
+        // elements once `B > 1`.
         let b = self.shape[0] as usize;
         let kv_h = self.shape[1] as usize;
         let s = self.shape[2] as usize;
-        let out = super::seq_layout::transpose_seq_heads(&out, b, s, kv_h, head_dim);
+        let out = super::seq_layout::transpose_chunked_seq_heads(
+            &out,
+            b,
+            s,
+            kv_h,
+            head_dim,
+            blocks.iter().map(super::BlockRows::rows),
+        )?;
         Ok(out)
     }
 }
@@ -620,7 +629,7 @@ pub(crate) fn synced_rotor_k_blocks<'a>(
     let full_seq = shape.get(2).copied().unwrap_or(0).max(0) as usize;
     let head_dim = shape.get(3).copied().unwrap_or(0).max(0) as usize;
     let full_tokens = b * kv_h * full_seq;
-    let blocks_tokens: usize = blocks.iter().map(|blk| blk.n_tokens).sum();
+    let blocks_tokens: usize = blocks.iter().map(super::BlockRows::rows).sum();
 
     if blocks_tokens == full_tokens {
         return Ok(Cow::Borrowed(blocks));

@@ -502,6 +502,49 @@ impl QuantIsoV3 {
         )
     }
 
+    /// Rebuild any ring-only prefix into the CPU blocks so `blocks` alone cover
+    /// `shape[2]` again, and either keep or drop the ring.
+    ///
+    /// No-op when the ring was never allocated. Every path that pushes a CPU
+    /// block onto a store whose ring may be live goes through here: without it
+    /// the pushed block is the *only* block, `blocks` no longer cover
+    /// `shape[2]`, and the ring left behind is stale. A *read* of that state is
+    /// refused by the ring's fill watermark; an *append* onto it is refused by
+    /// [`QuantKGpuRing::append_encoded`]'s `prev_seq > filled` guard, because
+    /// the write would otherwise zero `[filled, prev_seq)` and then commit a
+    /// watermark that covers it. Both directions have to refuse, or the state
+    /// is only unreachable by convention.
+    ///
+    /// `disposition` is a parameter because it is the one thing the two callers
+    /// disagree on, and having them disagree by carrying separate copies of this
+    /// body is how the two drift apart. [`Self::append_gpu`] drops the ring — it
+    /// does not feed it, so leaving it live is the dangerous state the CPU
+    /// [`Self::append`] avoids by clearing. The append helpers in `kvcache`
+    /// keep it, because their `sync_ring` decides its fate immediately after.
+    ///
+    /// # Errors
+    ///
+    /// Forwards a [`synced_iso_v_blocks`] reconciliation error — a ring that
+    /// cannot supply the missing prefix is reported, never zero-padded.
+    pub(crate) fn reconcile_ring(
+        &mut self,
+        device: Device,
+        disposition: super::RingDisposition,
+    ) -> Result<()> {
+        if !self.gpu.is_allocated() {
+            return Ok(());
+        }
+        if let std::borrow::Cow::Owned(full) =
+            synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, device)?
+        {
+            self.blocks = full;
+        }
+        if disposition == super::RingDisposition::Drop {
+            self.gpu.clear();
+        }
+        Ok(())
+    }
+
     /// GPU packed view of the first `kv_seq` positions, or `None` when the ring
     /// is not live (CPU path — caller falls back to `dequant`).
     ///
@@ -558,6 +601,24 @@ impl QuantIsoV3 {
     /// Returns an `Error::Mlx` if the underlying [`iso_decode_fast`] fails for
     /// any block.
     pub fn dequant(&self) -> Result<Vec<f32>> {
+        // The ring lives on the GPU whenever it is live at all, so that is the
+        // stream its readback belongs on. `dequant_on` exists so a caller that
+        // knows better — a `Device::Cpu` run, or a test that must not touch a
+        // shared Metal context — can say so instead of having this constant
+        // imposed on it.
+        self.dequant_on(Device::Gpu)
+    }
+
+    /// [`Self::dequant`] on an explicit device.
+    ///
+    /// The device selects the stream for the ring readback that reconciles a
+    /// ring-only decode tail; it has no effect on a store whose CPU blocks
+    /// already cover `shape[2]`, which is every store on the CPU append path.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::dequant`].
+    pub fn dequant_on(&self, device: Device) -> Result<Vec<f32>> {
         if self.shape.len() != 4 {
             return Err(Error::Mlx(format!(
                 "QuantIsoV3::dequant: malformed shape {:?}",
@@ -573,7 +634,7 @@ impl QuantIsoV3 {
         // `shape[2]`), and this rebuilds it on demand rather than decoding a
         // short prefix and zero-padding the gap. Loud on any unrecoverable
         // disagreement.
-        let blocks = synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, Device::Gpu)?;
+        let blocks = synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, device)?;
 
         if blocks.is_empty() {
             // Empty blocks are valid only when the store genuinely holds no
@@ -615,12 +676,21 @@ impl QuantIsoV3 {
                 self.shape
             )));
         }
-        // Blocks are sequence-major (see `append`); reorder the concatenated
-        // decode back to the logical head-major `[B, kv_h, S, D]`.
+        // Blocks are sequence-major (see `append`), one per append; reorder each
+        // at its own sequence offset back to the logical head-major
+        // `[B, kv_h, S, D]`. Reading the concatenation as a single run would
+        // interleave batch elements once `B > 1`.
         let b = self.shape[0] as usize;
         let kv_h = self.shape[1] as usize;
         let s = self.shape[2] as usize;
-        let out = super::seq_layout::transpose_seq_heads(&out, b, s, kv_h, head_dim);
+        let out = super::seq_layout::transpose_chunked_seq_heads(
+            &out,
+            b,
+            s,
+            kv_h,
+            head_dim,
+            blocks.iter().map(super::BlockRows::rows),
+        )?;
         Ok(out)
     }
 
@@ -679,6 +749,19 @@ impl QuantIsoV3 {
             .ok_or_else(|| {
                 Error::Quant("QuantIsoV3::append_gpu: n_tokens_total overflow".to_owned())
             })?;
+
+        // ── 0. Take the ring's prefix back, then drop the ring. ────────────
+        // This append pushes a CPU block, which makes `blocks` the authoritative
+        // copy of everything accumulated so far. A live ring holds a prefix
+        // `blocks` may no longer carry — the fused decode path drops the blocks
+        // once the ring is live — so the prefix has to come back before the push
+        // or `dequant` / `dequant_gpu` see a store whose blocks cover only this
+        // chunk. Dropping the ring afterwards is the same contract the CPU
+        // `append` states: a ring left behind while `blocks` grow is the
+        // dangerous state, because the next ring append would write past its
+        // filled region and `dequant` would read a zeroed gap. The next
+        // `gpu_append` re-seeds it from `blocks`.
+        self.reconcile_ring(device, super::RingDisposition::Drop)?;
 
         // ── 1. Dispatch the MSL encode kernel. ─────────────────────────────
         // The codec is per-token-row positional; the GPU mirror accumulates
@@ -1070,6 +1153,19 @@ impl QuantIsoV3 {
             if s_active == 0 {
                 return Array::from_bytes(&[][..], &self.shape, Dtype::F32);
             }
+            // The mirror is one flat buffer written per chunk at
+            // `prev_seq * words_per_step`, and `words_per_step` folds `b` in, so
+            // the prefix is a run of `[B, S_chunk, kv_h, D]` chunks. Reading it
+            // as one `[B, S, kv_h, D]` run below interleaves batch elements once
+            // `B > 1` and more than one chunk landed. Refuse rather than return a
+            // scrambled tensor — the block path handles every `B`.
+            if self.shape[0] != 1 && self.shape[2] != 0 {
+                return Err(Error::Quant(format!(
+                    "QuantIsoV3::dequant_gpu: the GPU mirror is b == 1 only (its per-step \
+                     stride does not interleave batch), got shape {:?}",
+                    self.shape
+                )));
+            }
             let codes_active = s_active
                 .checked_mul(self.gpu_words_per_step)
                 .ok_or_else(|| Error::Quant("dequant_gpu: codes_active overflow".to_owned()))?;
@@ -1103,94 +1199,231 @@ impl QuantIsoV3 {
             return out.transpose(&[0, 2, 1, 3], device)?.contiguous(device);
         }
 
-        // Concatenate all block buffers. CPU codes/scales/quats are already in
-        // GPU-kernel layout; per-token norms must be expanded to per-group.
-        let mut codes_bytes: Vec<u8> = Vec::new();
-        let mut scales_bytes: Vec<u8> = Vec::new();
-        let mut quats_bytes: Vec<u8> = Vec::new();
-        let mut norms_bytes: Vec<u8> = Vec::new();
-        let mut total_groups: usize = 0;
+        // Reconcile the CPU blocks with the GPU ring first, exactly as
+        // `dequant` does. Both element counts below — the one derived from the
+        // blocks and the one declared by `shape` — must come from the same
+        // source, or a store whose decode tail lives only in the ring is
+        // reported as a shape disagreement instead of being read. `blocks` that
+        // already cover `shape[2]` are borrowed, so the common path pays
+        // nothing.
+        let blocks = synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, device)?;
 
-        for blk in &self.blocks {
-            for &c in &blk.codes {
-                codes_bytes.extend_from_slice(&c.to_le_bytes());
-            }
-            for &s in &blk.scales {
-                scales_bytes.extend_from_slice(&s.to_le_bytes());
-            }
-            for &q in &blk.quaternions {
-                quats_bytes.extend_from_slice(&q.to_le_bytes());
-            }
-            // Per-token → per-group expand (kernel reads norms_in[gid] where
-            // gid = token * n_groups + grp; all groups in a token share the
-            // same norm value).
-            for &n in &blk.norms {
-                let n_bytes = n.to_le_bytes();
-                for _ in 0..n_groups {
-                    norms_bytes.extend_from_slice(&n_bytes);
-                }
-            }
-            // Loudly fail on overflow rather than silently saturating; the
-            // resulting buffer-vs-shape mismatch would otherwise surface as a
-            // confusing kernel-dispatch error downstream.
-            let blk_groups = blk.n_tokens.checked_mul(n_groups).ok_or_else(|| {
-                Error::Quant("dequant_gpu: blk.n_tokens * n_groups overflow".to_owned())
-            })?;
-            total_groups = total_groups
-                .checked_add(blk_groups)
-                .ok_or_else(|| Error::Quant("dequant_gpu: total_groups overflow".to_owned()))?;
-        }
+        // Build the kernel inputs with the token rows already in head-major
+        // order, so the flat result *is* `[B, kv_h, S, D]` and needs no
+        // reshape-plus-transpose. Reshaping the whole concatenated decode as one
+        // `[B, S, kv_h, D]` run — what this used to do — is only a valid reading
+        // at `B == 1`, because each block covers only `[B, S_block, kv_h, D]`.
+        let inputs = iso_kernel_inputs_head_major(
+            &blocks,
+            &self.shape,
+            n_groups,
+            ISO3_GROUP_SIZE,
+            "QuantIsoV3::dequant_gpu",
+        )?;
 
-        // Guard against silent shape divergence between `dequant_gpu`
-        // (derives total from concatenated blocks) and `dequant` (pads/truncates
-        // to `prod(shape)`). After `truncate_to` / `reset` / post-hydrate edge
-        // cases the two totals can diverge — refuse to silently reshape rather
-        // than producing a garbage Array.
-        let declared_total: usize = self.shape.iter().map(|&d| d as usize).product();
-        let actual_total: usize = total_groups.checked_mul(ISO3_GROUP_SIZE).ok_or_else(|| {
-            Error::Quant("dequant_gpu: total_groups * ISO3_GROUP_SIZE overflow".to_owned())
-        })?;
-        if actual_total != declared_total {
-            return Err(Error::Quant(format!(
-                "dequant_gpu: actual_total={actual_total} (blocks×groups×group_size) != \
-                 declared_total={declared_total} (prod(shape)={:?}); refusing to silently \
-                 truncate/pad",
-                self.shape
-            )));
-        }
-
-        if total_groups == 0 {
-            // Empty cache — return a zero-length array of the correct rank-4 shape.
-            // (Matches the `dequant()` empty-output behaviour with shape[2] = 0.)
-            // The MEDIUM-1 guard above ensures `prod(shape) == 0` here, so the
-            // empty `from_bytes` call is well-formed.
+        if inputs.total_groups == 0 {
+            // Empty cache — the accounting above already proved `prod(shape)`
+            // is 0, so the empty `from_bytes` is well-formed.
             return Array::from_bytes(&[][..], &self.shape, Dtype::F32);
         }
 
-        let codes_arr = Array::from_bytes(
-            &codes_bytes,
-            &[total_groups as i32], // WORDS_PER_GROUP=1 for ISO3_GS=4
-            Dtype::U32,
-        )?;
-        let scales_arr = Array::from_bytes(&scales_bytes, &[total_groups as i32], Dtype::F32)?;
-        let quats_arr = Array::from_bytes(&quats_bytes, &[(total_groups * 4) as i32], Dtype::F32)?;
-        let norms_arr = Array::from_bytes(&norms_bytes, &[total_groups as i32], Dtype::F32)?;
+        let n = inputs.total_groups as i32;
+        // WORDS_PER_GROUP = 1 for ISO3_GROUP_SIZE = 4.
+        let codes_arr = Array::from_bytes(&inputs.codes, &[n], Dtype::U32)?;
+        let scales_arr = Array::from_bytes(&inputs.scales, &[n], Dtype::F32)?;
+        let norms_arr = Array::from_bytes(&inputs.norms, &[n], Dtype::F32)?;
 
+        // The kernel's quaternion parameter is `_quaternions` and is never bound
+        // as a kernel input (see `iso_dequantize_v3_gpu`); every group uses the
+        // constant `FIXED_QUAT`. Pass `codes_arr` rather than uploading a buffer
+        // the kernel discards — the same reuse the GPU mirror arm above makes.
         let flat = crate::isoquant_msl::iso_dequantize_v3_gpu(
             &codes_arr,
             &scales_arr,
-            &quats_arr,
+            &codes_arr,
             &norms_arr,
             head_dim,
             Dtype::F32,
             device,
         )?;
+        flat.reshape(&self.shape, device)
+    }
+}
 
-        // CPU blocks are sequence-major (see `append` / `append_gpu`): reshape
-        // to `[B, S, kv_h, D]`, then reorder heads↔seq back to `[B, kv_h, S, D]`.
-        let seq_major_shape = [self.shape[0], self.shape[2], self.shape[1], self.shape[3]];
-        let out = flat.reshape(&seq_major_shape, device)?;
-        out.transpose(&[0, 2, 1, 3], device)?.contiguous(device)
+/// Bytes per little-endian payload slot — every iso payload is 4-byte (`u32`
+/// codes, `f32` scales / quaternions / norms).
+const ISO_SLOT_BYTES: usize = 4;
+
+/// Flat kernel inputs for an iso store, with token rows in head-major order.
+///
+/// Field lengths, in `(token, group)` slots: `codes` and `scales` carry one
+/// entry per slot, `norms` one (the per-token norm expanded to per-group, which
+/// is what the kernel indexes).
+///
+/// There is deliberately no quaternion buffer. The dequant kernel takes a
+/// quaternion slot it never dereferences — every group uses the constant
+/// `FIXED_QUAT` — so building one costs `total_groups * 4` f32 of allocation,
+/// memcpy and upload per call for data that is discarded. At the geometry #392
+/// reports (`head_dim = 512`, 128 groups) that is four times the codes buffer,
+/// on a per-decode-step path. The readers pass `codes_arr` for that slot, which
+/// is what the GPU mirror arm in `dequant_gpu` already did.
+#[derive(Debug)]
+pub(crate) struct IsoKernelInputs {
+    /// Packed codes, little-endian `u32`.
+    pub codes: Vec<u8>,
+    /// Per-group scales, little-endian `f32`.
+    pub scales: Vec<u8>,
+    /// Per-group norms, little-endian `f32`.
+    pub norms: Vec<u8>,
+    /// `(token, group)` slot count — the kernel's flat length.
+    pub total_groups: usize,
+}
+
+/// Build the iso dequant kernel's flat inputs from a block list, placing every
+/// token row at its **head-major** `[B, kv_h, S, D]` position.
+///
+/// One derivation for both bit widths and both readers. Two things used to be
+/// written out per store and drifted apart:
+///
+/// * The declared-vs-actual element accounting. `prod(shape)` against
+///   `blocks × groups × group_size` was copied per reader, so the same store
+///   could be accepted by one and rejected by the other.
+/// * The row order. Concatenating the blocks and reshaping the kernel's flat
+///   output as one `[B, S, kv_h, D]` run is only a valid reading at `B == 1`:
+///   each block is `[B, S_block, kv_h, D]`, so at `B > 1` the blocks interleave
+///   and the reshape maps a later block's batch-0 rows onto batch-1 slots.
+///   Permuting the *input* rows instead is exact at every `B` and costs nothing
+///   — the payload is being copied either way, the kernel is per-token
+///   positional, and the result needs no reshape-plus-transpose afterwards.
+///
+/// # Errors
+///
+/// Returns [`Error::Quant`] on a malformed shape, a block whose payload length
+/// disagrees with its row count, chunks that do not partition `shape[2]`, or a
+/// blocks-vs-shape element-count disagreement.
+pub(crate) fn iso_kernel_inputs_head_major(
+    blocks: &[IsoBlocks],
+    shape: &[i32],
+    n_groups: usize,
+    group_size: usize,
+    what: &str,
+) -> Result<IsoKernelInputs> {
+    if shape.len() != 4 {
+        return Err(Error::Quant(format!("{what}: malformed shape {shape:?}")));
+    }
+    let dim = |i: usize| -> usize { shape.get(i).copied().unwrap_or(0).max(0) as usize };
+    let (b, kv_h, s_total) = (dim(0), dim(1), dim(2));
+
+    // Accounting, derived once. `declared` is what the shape claims; `actual` is
+    // what the blocks carry. A disagreement is refused rather than reshaped.
+    let declared: usize = shape.iter().map(|&d| d.max(0) as usize).product();
+    let mut total_groups: usize = 0;
+    for blk in blocks {
+        let blk_groups = super::BlockRows::rows(blk)
+            .checked_mul(n_groups)
+            .ok_or_else(|| Error::Quant(format!("{what}: rows * n_groups overflow")))?;
+        total_groups = total_groups
+            .checked_add(blk_groups)
+            .ok_or_else(|| Error::Quant(format!("{what}: total_groups overflow")))?;
+    }
+    let actual = total_groups
+        .checked_mul(group_size)
+        .ok_or_else(|| Error::Quant(format!("{what}: total_groups * group_size overflow")))?;
+    if actual != declared {
+        return Err(Error::Quant(format!(
+            "{what}: actual_total={actual} (blocks×groups×group_size) != \
+             declared_total={declared} (prod(shape)={shape:?}); refusing to silently \
+             truncate/pad"
+        )));
+    }
+
+    let perm = super::seq_layout::head_major_token_order(
+        b,
+        s_total,
+        kv_h,
+        blocks.iter().map(super::BlockRows::rows),
+    )
+    .map_err(|e| Error::Quant(format!("{what}: {e}")))?;
+
+    let mut out = IsoKernelInputs {
+        codes: vec![0_u8; total_groups * ISO_SLOT_BYTES],
+        scales: vec![0_u8; total_groups * ISO_SLOT_BYTES],
+        norms: vec![0_u8; total_groups * ISO_SLOT_BYTES],
+        total_groups,
+    };
+
+    let mut row = 0usize;
+    for blk in blocks {
+        let rows = super::BlockRows::rows(blk);
+        // The scatter below indexes each payload by row; a length that is not a
+        // whole number of rows would silently read across a row boundary. The
+        // quaternion table is checked too even though it is not scattered — a
+        // block whose table disagrees with its row count is malformed whoever
+        // reads it, and the CPU `dequant` does read it.
+        let want_codes = rows * n_groups;
+        if blk.codes.len() != want_codes
+            || blk.scales.len() != want_codes
+            || blk.quaternions.len() != want_codes * 4
+            || blk.norms.len() != rows
+        {
+            return Err(Error::Quant(format!(
+                "{what}: block payload disagrees with its {rows} rows at n_groups={n_groups} \
+                 (codes {} scales {} quaternions {} norms {}; want {want_codes} {want_codes} {} \
+                 {rows})",
+                blk.codes.len(),
+                blk.scales.len(),
+                blk.quaternions.len(),
+                blk.norms.len(),
+                want_codes * 4,
+            )));
+        }
+        for r in 0..rows {
+            let Some(&dst_token) = perm.get(row + r) else {
+                return Err(Error::Quant(format!(
+                    "{what}: block rows exceed the permutation length {}",
+                    perm.len()
+                )));
+            };
+            copy_f32_slots(
+                &mut out.codes,
+                dst_token * n_groups,
+                &blk.codes[r * n_groups..(r + 1) * n_groups],
+                u32::to_le_bytes,
+            );
+            copy_f32_slots(
+                &mut out.scales,
+                dst_token * n_groups,
+                &blk.scales[r * n_groups..(r + 1) * n_groups],
+                f32::to_le_bytes,
+            );
+            // Per-token → per-group expand: the kernel reads `norms[gid]` with
+            // `gid = token * n_groups + grp`, and every group in a token shares
+            // the token's norm.
+            let n_bytes = blk.norms[r].to_le_bytes();
+            let base = dst_token * n_groups * ISO_SLOT_BYTES;
+            for g in 0..n_groups {
+                let at = base + g * ISO_SLOT_BYTES;
+                out.norms[at..at + ISO_SLOT_BYTES].copy_from_slice(&n_bytes);
+            }
+        }
+        row += rows;
+    }
+    Ok(out)
+}
+
+/// Write `src` into `dst` as little-endian 4-byte slots starting at slot
+/// `slot_offset`. Shared by the code and scale scatters above.
+///
+/// `dst` is sized `total_groups` slots and `slot_offset + src.len()` is bounded
+/// by the permutation's range, which `head_major_token_order` pins to that same
+/// count — so the indexing below is in bounds by construction. (Stated as prose
+/// rather than an `#[allow(clippy::indexing_slicing)]`: the module already
+/// allows that lint at the top of the file, so a per-site allow here would read
+/// as an enforced justification while enforcing nothing.)
+fn copy_f32_slots<T: Copy>(dst: &mut [u8], slot_offset: usize, src: &[T], to_le: fn(T) -> [u8; 4]) {
+    for (i, &v) in src.iter().enumerate() {
+        let at = (slot_offset + i) * 4;
+        dst[at..at + 4].copy_from_slice(&to_le(v));
     }
 }
 
@@ -1213,7 +1446,18 @@ impl QuantIsoV3 {
 /// **Invariant (enforced loudly, never zero-padded):** `blocks` track the ring
 /// exactly, or the ring exists and supplies the tail. Any state where the CPU
 /// blocks fall short of `shape[2]` and the ring cannot make up the difference is
-/// an `Error` — the caller must not fabricate a zeroed gap.
+/// an `Error` — the caller must not fabricate a zeroed gap. The enforcement is
+/// [`QuantKGpuRing`]'s fill watermark: the readback is sized from `shape[2]` and
+/// refused when that runs past what the ring actually wrote. Without it the
+/// ring's page-rounded `capacity` accepted the read and the caller got the
+/// allocation's zeros as a K/V tail — length-correct and silently wrong.
+///
+/// **What it does not cover:** when `blocks` fall short the ring supplies the
+/// *whole* prefix and the existing `blocks` are discarded, not merged. That is
+/// right for the state this exists for — on the fused decode path the ring is a
+/// superset of the blocks — but a caller holding a block the ring never saw
+/// would lose it with no error. No such caller exists today: every block push on
+/// these stores either feeds the ring or drops it first.
 ///
 /// Shared by [`QuantIsoV3`] / [`super::QuantIsoV4`] and the iso K stores
 /// ([`super::QuantIsoK3`] / [`super::QuantIsoK4`]) — the `IsoBlocks` payload and
@@ -1242,7 +1486,7 @@ pub(crate) fn synced_iso_v_blocks<'a>(
     let full_seq = shape.get(2).copied().unwrap_or(0).max(0) as usize;
     let head_dim = shape.get(3).copied().unwrap_or(0).max(0) as usize;
     let full_tokens = b * kv_h * full_seq;
-    let blocks_tokens: usize = blocks.iter().map(|blk| blk.n_tokens).sum();
+    let blocks_tokens: usize = blocks.iter().map(super::BlockRows::rows).sum();
 
     if blocks_tokens == full_tokens {
         return Ok(std::borrow::Cow::Borrowed(blocks));

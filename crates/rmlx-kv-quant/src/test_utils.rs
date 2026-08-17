@@ -314,6 +314,36 @@ pub(crate) fn lcg_data(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
+/// Head-major `[b, kv_h, n, head_dim]` chunk covering sequence positions
+/// `[s0, s0 + n)`, with a distinct pseudo-random row per `(batch, head, token)`.
+///
+/// The fixture exists for one question: does a block-accumulating store decode
+/// the same values whether the sequence arrived as one append or several? Rows
+/// are drawn from [`lcg_data`] with a seed derived from `(batch, head, token)`,
+/// so no two rows repeat and any batch/head/sequence transposition swaps whole
+/// rows rather than perturbing them. Row magnitudes stay in `[-1, 1]` across
+/// every batch element, so no codec sees a batch-dependent dynamic range.
+pub(crate) fn batch_head_chunk(
+    b: usize,
+    kv_h: usize,
+    s0: usize,
+    n: usize,
+    head_dim: usize,
+) -> Vec<f32> {
+    let mut out = vec![0.0_f32; b * kv_h * n * head_dim];
+    for bi in 0..b {
+        for h in 0..kv_h {
+            for si in 0..n {
+                let seed = ((bi as u64 * 977 + h as u64) * 4099 + (s0 + si) as u64) * 65_537 + 1;
+                let row = lcg_data(head_dim, seed);
+                let base = ((bi * kv_h + h) * n + si) * head_dim;
+                out[base..base + head_dim].copy_from_slice(&row);
+            }
+        }
+    }
+    out
+}
+
 /// Generate `n` standard-normal f32 values from the same pinned Knuth LCG as
 /// [`lcg_data`], via Box–Muller.
 ///

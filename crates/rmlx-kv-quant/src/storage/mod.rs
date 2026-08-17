@@ -60,10 +60,10 @@ pub use kv_storage::{
     TURBOSYM3_LAYOUT_TAG, TURBOSYM4_LAYOUT_TAG,
 };
 pub use quant_iso_k::{
-    iso_n_groups_for, QuantIsoK3, ISO_K3_BITS, ISO_K3_GROUP_SIZE, ISO_QUAT_BLOCK_SIZE,
+    iso_n_groups_for, iso_n_groups_i32, QuantIsoK3, ISO_K3_BITS, ISO_K3_GROUP_SIZE,
+    ISO_QUAT_BLOCK_SIZE,
 };
 pub use quant_iso_k4::{QuantIsoK4, ISO_K4_BITS, ISO_K4_GROUP_SIZE};
-pub(crate) use quant_iso_v::synced_iso_v_blocks;
 pub use quant_iso_v::{IsoBlocks, QuantIsoV3, ISO3_BITS, ISO3_GROUP_SIZE};
 pub use quant_iso_v4::{QuantIsoV4, ISO4_BITS, ISO4_GROUP_SIZE};
 pub use quant_k::QuantK;
@@ -144,17 +144,39 @@ pub const KV_PAGE_SIZE: i32 = 256;
 // rejected region overwritable. Only the append-only CPU side has to be cut.
 //
 // The split is confined to `b == 1`, and that is a correctness bound, not a
-// simplification. Every store ends `dequant` with
-// `seq_layout::transpose_seq_heads` over the *concatenation* of its blocks,
-// which reads the buffer as one `[B, S_total, kv_h, D]` run. Each block is
-// only `[B, S_block, kv_h, D]`, so at `b > 1` the concatenation interleaves
-// batch elements and the reading is wrong for any store holding more than one
-// block. Splitting at `b > 1` would turn a mid-block cut from
-// blocks-short-of-`shape[2]` — which the reconciliation guards reject loudly —
-// into a two-block store that decodes silently scrambled. So `b > 1` keeps the
-// whole-block drop and the loud error. `sdpa::rotor_flash_shape_ok` refuses
-// `b != 1` for the same underlying reason, which is also why no `b > 1` store
-// ever has a ring to rebuild the gap from.
+// simplification. The bound is *inside* one block: a block's rows run
+// `[B, S_block, kv_h, D]`, so batch element 1's rows sit after all of batch
+// element 0's. `BlockRows::retain_rows` keeps a **row prefix**, and at `b > 1`
+// a row prefix is not a sequence prefix — it would keep all of batch 0 and
+// none of batch 1. Splitting there would silently drop one batch element's
+// tail instead of cutting every element at the same sequence position, so
+// `b > 1` keeps the whole-block drop, which leaves `blocks` short of
+// `shape[2]` and lets the reconciliation guards abort the request loudly.
+//
+// Reading the *concatenation* of the blocks used to be a second, independent
+// bound: every store ended `dequant` with `seq_layout::transpose_seq_heads`
+// over the concatenation, reading it as one `[B, S_total, kv_h, D]` run, which
+// is wrong at `b > 1` for any store holding more than one block. That is fixed
+// — `seq_layout::transpose_chunked_seq_heads` reorders each block at its own
+// sequence offset — so a multi-block `b > 1` store now decodes correctly; only
+// the intra-block cut above still refuses. `sdpa::rotor_flash_shape_ok` still
+// refuses `b != 1` because the GPU ring's per-step stride does not interleave
+// batch, which is why no `b > 1` store ever has a ring to rebuild a gap from.
+
+/// What a reconcile does with the GPU ring once the CPU blocks are whole again.
+///
+/// The two callers of [`QuantIsoV3::reconcile_ring`] differ only here, and that
+/// difference is the ring/blocks contract itself: a caller that is about to feed
+/// the ring keeps it, a caller that is not must drop it, because a live ring
+/// that `blocks` have outgrown is the state where the next append writes past
+/// the ring's filled region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RingDisposition {
+    /// Leave the ring allocated — the caller feeds or clears it itself.
+    Keep,
+    /// Drop the ring; the CPU blocks are the authoritative copy from here.
+    Drop,
+}
 
 /// How a block-accumulating KV store must cut its blocks to reach `n`
 /// sequence positions.
@@ -223,19 +245,20 @@ pub(crate) fn truncate_plan(
             break;
         }
         if b != 1 {
-            // Rows run batch-major, so a sequence prefix is not a row prefix and
-            // the resulting two-block store would decode scrambled rather than
-            // error. Drop the block and let the reconciliation guard report the
-            // gap. See the module note.
+            // A block's rows run batch-major, so a sequence prefix is not a row
+            // prefix: `retain_rows` would keep all of batch 0 and none of batch
+            // 1 instead of cutting every batch element at `keep_seq`. Drop the
+            // block and let the reconciliation guard report the gap. See the
+            // module note.
             tracing::warn!(
                 b,
                 kv_h,
                 kept_seq = acc_seq,
                 target_seq,
-                "KV block truncate: refusing to split a block at b > 1 — the decode path \
-                 reads the block concatenation as one sequence run, so a split store would \
-                 be silently scrambled; dropping the block instead, which leaves the store \
-                 short of its truncation target"
+                "KV block truncate: refusing to split a block at b > 1 — a block's rows run \
+                 batch-major, so keeping a row prefix would cut one batch element and not \
+                 the other; dropping the block instead, which leaves the store short of its \
+                 truncation target"
             );
             break;
         }
@@ -268,8 +291,11 @@ pub(crate) fn truncate_plan(
 /// `min(n, shape[2])` could never discard it. What makes the asymmetry safe is
 /// that those stores already **abort loudly** on an over-long target —
 /// `synced_rotor_v_blocks` / `synced_iso_v_blocks` size their ring readback from
-/// `shape[2]` and return `Err` when the ring cannot cover it. The clamp would buy
-/// them nothing. These stores have no ring and no such guard, so for them the
+/// `shape[2]`, and `QuantKGpuRing::packed_view` returns `Err` when that runs past
+/// the ring's fill watermark. (The watermark is what makes this true: `capacity`
+/// is page-rounded and zero-initialised, so bounding on capacity alone accepted a
+/// read into the allocation's zeros and returned a length-correct, silently wrong
+/// tail.) The clamp would buy them nothing. These stores have no ring and no such guard, so for them the
 /// clamp is the only reading that keeps `shape[2] == payload coverage` true.
 pub(crate) fn clamp_truncate_target(shape: &[i32], n: i32) -> i32 {
     let covered = shape.get(2).copied().unwrap_or(0).max(0);
