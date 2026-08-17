@@ -34,6 +34,20 @@ fn f32_arr(data: &[f32], shape: &[i32]) -> Array {
     Array::from_bytes(bytes, shape, Dtype::F32).expect("Array::from_bytes")
 }
 
+/// Read an array back as `f32`, whatever its stored dtype.
+///
+/// The prefill ring is stored bf16 (`cast_store_bf16` at the append boundary),
+/// so a byte-level read needs the widening cast first.
+fn read_f32(a: &Array, device: Device) -> Vec<f32> {
+    let f = a.astype(Dtype::F32, device).expect("astype f32");
+    f.eval().expect("eval");
+    f.to_bytes()
+        .expect("to_bytes")
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().expect("chunks_exact(4) yields 4 bytes")))
+        .collect()
+}
+
 const TEST_KV_H: i32 = 2;
 const TEST_HEAD_DIM: i32 = 64;
 // Use a tiny starting max_seq so we can exceed it cheaply in a unit test.
@@ -267,6 +281,132 @@ fn non_positive_ceiling_means_unbounded() {
     assert_eq!(cache.storage_max_seq_for_test(), 512);
 
     cache.exit_prefill(device).expect("exit_prefill");
+}
+
+/// The slots of the prefill ring no chunk ever writes hold zero, and attention
+/// never sees them.
+///
+/// A prompt whose length is not a power of two leaves `max_seq - offset` slots
+/// unwritten for the whole request. Two properties keep those slots out of the
+/// numerics, and both are pinned here, because violating either one feeds
+/// whatever the allocator last left in that page into SDPA — and a single NaN
+/// or Inf reaching a softmax numerator turns the entire logit row into NaN:
+///
+/// 1. the buffer is allocated with `zeros()`, so an unwritten slot reads 0.0
+///    rather than recycled device memory; and
+/// 2. `update_prefill_raw` hands back `[.., 0..offset, ..]`, so the tail is not
+///    part of the K/V the attention call receives at any prompt length.
+///
+/// Property 2 alone would be enough for correctness; property 1 is what makes
+/// an accidental over-slice benign instead of non-deterministic, so losing
+/// either is worth a failing test.
+#[test]
+fn prefill_ring_tail_is_zeroed_and_never_returned() {
+    let device = Device::Cpu;
+    // 100 tokens into a 128-slot ring: 28 slots stay unwritten.
+    let filled = 100_i32;
+    let max_seq = TEST_INITIAL_MAX_SEQ;
+    let mut cache = KvCache::with_quant_max_seq(KvQuant::None, max_seq);
+    cache.enter_prefill();
+
+    let chunk_shape = [1_i32, TEST_KV_H, filled, TEST_HEAD_DIM];
+    let n_chunk: usize = chunk_shape.iter().map(|&d| d as usize).product();
+    // 1.5 / 2.5 are exact in bf16, so the store's cast is lossless and
+    // "written" vs "never written" stays a bit-exact distinction.
+    let k = f32_arr(&vec![1.5_f32; n_chunk], &chunk_shape);
+    let v = f32_arr(&vec![2.5_f32; n_chunk], &chunk_shape);
+
+    let (k_full, v_full) = cache.update(&k, &v, device).expect("prefill chunk");
+
+    // Property 2 — the attention input is the filled prefix, not the ring.
+    assert_eq!(
+        k_full.shape()[2],
+        filled,
+        "K handed to attention must span the filled prefix, not the ring capacity",
+    );
+    assert_eq!(
+        v_full.shape()[2],
+        filled,
+        "V handed to attention must span the filled prefix, not the ring capacity",
+    );
+    assert!(
+        read_f32(&k_full, device).iter().all(|&x| x == 1.5),
+        "every returned K element is a written one",
+    );
+    assert!(
+        read_f32(&v_full, device).iter().all(|&x| x == 2.5),
+        "every returned V element is a written one",
+    );
+
+    // Property 1 — the unwritten remainder of the ring is zero.
+    let ring = cache
+        .prefill_raw_k
+        .as_ref()
+        .expect("prefill ring allocated on first append");
+    assert_eq!(
+        ring.shape()[2],
+        max_seq,
+        "precondition: the ring is larger than the filled prefix",
+    );
+    let vals = read_f32(ring, device);
+    let row = TEST_HEAD_DIM as usize;
+    let cap = max_seq as usize;
+    let mut tail_dirty = 0_usize;
+    for h in 0..TEST_KV_H as usize {
+        for t in (filled as usize)..cap {
+            let base = (h * cap + t) * row;
+            let slot = vals
+                .get(base..base + row)
+                .expect("ring slot inside the readback");
+            // `!= 0.0` and not a max-of-abs fold: `f32::max` propagates the
+            // *other* operand past a NaN, so a fold would report a clean tail
+            // for exactly the payload this test exists to catch.
+            tail_dirty += slot.iter().filter(|&&x| x != 0.0).count();
+        }
+    }
+    assert_eq!(
+        tail_dirty, 0,
+        "the never-written ring tail must be zero, not recycled device memory",
+    );
+}
+
+/// Prefill append is codec-independent: the K/V attention receives is the same
+/// under `KvQuant::None` and `KvQuant::K8V8`.
+///
+/// While `in_prefill` is set, `KvCache::update` routes every non-rotating cache
+/// to `update_prefill_raw`; the codec dispatch sits behind that branch and no
+/// quantisation happens until `exit_prefill`. So a fault observed *during*
+/// prefill reproducing "at both k8v8 and none" says nothing about the codec —
+/// the two cells execute the same appends over the same bf16 buffer. Pinned so
+/// that a change which started quantising per chunk cannot silently make that
+/// inference valid again while every other test stays green.
+#[test]
+fn prefill_append_is_codec_independent() {
+    let device = Device::Cpu;
+    let chunk_shape = [1_i32, TEST_KV_H, TEST_CHUNK, TEST_HEAD_DIM];
+    let n_chunk: usize = chunk_shape.iter().map(|&d| d as usize).product();
+    // A varied pattern, every value exact in bf16 (quarter steps in [-2, 2)):
+    // a codec running here would round it and the comparison would separate.
+    let pattern: Vec<f32> = (0..n_chunk).map(|i| (i % 16) as f32 * 0.25 - 2.0).collect();
+    let k = f32_arr(&pattern, &chunk_shape);
+    let v = f32_arr(&pattern, &chunk_shape);
+
+    let mut out = Vec::new();
+    for quant in [KvQuant::None, KvQuant::K8V8] {
+        let mut cache = KvCache::with_quant_max_seq(quant, TEST_INITIAL_MAX_SEQ);
+        cache.enter_prefill();
+        let (k_full, v_full) = cache.update(&k, &v, device).expect("prefill chunk");
+        out.push((read_f32(&k_full, device), read_f32(&v_full, device)));
+    }
+
+    let (none_k, none_v) = out.first().expect("None arm recorded");
+    let (k8v8_k, k8v8_v) = out.get(1).expect("K8V8 arm recorded");
+    assert_eq!(none_k, k8v8_k, "prefill K must not depend on the KV codec");
+    assert_eq!(none_v, k8v8_v, "prefill V must not depend on the KV codec");
+    assert_eq!(
+        none_k, &pattern,
+        "prefill K must be the unquantised input (bf16-exact pattern)",
+    );
 }
 
 /// `next_pow2_seq` rounds correctly for a representative spread.
