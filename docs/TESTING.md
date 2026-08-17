@@ -614,6 +614,13 @@ gemma-4-e2b run has been shown to sample that depressed band, and a campaign
 that never enters it has not sampled the failure regime. Do not pool runs across
 a >5% `prefill_tps` shift, and record the band on every run.
 
+Nor are the two arches equally exposed per run. `enter_prefill` returns early on
+a rotating cache, so gemma-4's sliding-window layers never touch the shared
+`prefill_raw` append at all and only its `full_attention` layers do — where
+every Qwen3-dense layer does. Same number of runs is not the same number of
+draws, and comparing the two by run count overstates what a clean gemma-4-e2b
+record rules out.
+
 `MTL_SHADER_VALIDATION_FAIL_MODE` was tried as a discriminator, on the theory
 that `zerofill` silently dropping a KV store would explain it. **That
 experiment settles nothing**: n=3 per arm, Fisher p = 1.0, no power at any
