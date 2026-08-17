@@ -16,10 +16,26 @@
 #             Probe A it does not depend on the model preferring whitespace.
 #
 # ─────────────────────────────────────────────────────────────────────────────
+# ONE SERVER PER PROBE — why this costs four model loads on purpose
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# An earlier revision ran one server per model and separated the two probes by
+# the `X-Request-Id` each request carried. That premise — that the route's
+# `request_id` span reaches the decode thread — is itself one of the fixes under
+# test. It holds on the fixed arm and not on the baseline, so the filter matched
+# every decode record on one arm and none on the other, and the harness reported
+# product verdicts for measurements it had not made.
+#
+# A comparison harness may not depend on the behaviour it is comparing. Each
+# probe therefore gets its own server process and its own `RMLX_HOME`, so its
+# log contains its records and nothing else, and no filtering is needed on
+# either arm. The request id is still sent, for a human reading the log.
+#
+# ─────────────────────────────────────────────────────────────────────────────
 # DECISION RULE — read this before running, not after.
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# Per (model, probe) cell, the probe PASSES iff ALL FIVE hold:
+# Each rule reports PASS, FAIL, N/A, or HARNESS.
 #
 #   R1  HTTP status is 200.
 #   R2  finish_reason == "stop".  A degenerate run cannot stop on EOS — the
@@ -30,17 +46,27 @@
 #       schema: object, exactly the one expected key, value in the enum.
 #   R4  The emitted token-id stream is not degenerate. Degenerate := the tail
 #       is periodic with period <= 4 for >= 16 tokens (a constant stream is the
-#       period-1 case). Ids come from the run's own log, filtered to this
-#       probe's `X-Request-Id`.
-#         * Fewer than 16 emitted tokens -> reported "n/a", counts as PASS: a
+#       period-1 case).
+#         * Fewer than 16 emitted tokens -> N/A, with the count printed. A
 #           stream that short cannot be degenerate, and R2 already catches the
-#           long-run case. It is printed as n/a so nobody reads it as evidence.
-#         * Log records present but no parsable token_id, or no step_fn records
-#           at all -> HARNESS ERROR, counts as FAIL. A rule that cannot fire
-#           must never report PASS.
-#   R5  The run log contains a `building SchemaConstraint` line AND a
-#       `SchemaConstraint: ... engaging` line, and does NOT contain
-#       `constraint never engaged` — all filtered to this probe's request id.
+#           long-run case; it is not reported as PASS because the rule did not
+#           get to fire.
+#         * No `step_fn` records, or records with no parsable `token_id`
+#           -> HARNESS.
+#   R5  The log shows the constraint was built AND engaged, and carries no
+#       `constraint never engaged` warn.
+#         * No `building SchemaConstraint` record at all -> HARNESS. Every probe
+#           requests `response_format`, so a server that never built one is not
+#           a product defect, it is a run that measured nothing.
+#         * Built but never engaged -> FAIL. That is the product defect.
+#
+# Cell verdict: any HARNESS -> harness-error. Else any FAIL -> probe-fail. Else
+# probe-pass.
+#
+# **A harness-error fails the run in BOTH arms.** It must never be mistaken for
+# the defect `--expect baseline` is looking for — a check that silently matched
+# zero records is the same class of defect as the vacuous gates this proof
+# exists to eliminate.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # WHAT THE BASELINE MUST PRODUCE  (`--expect baseline`)
@@ -53,18 +79,19 @@
 #   bonsai / A   MUST FAIL — the template prefills a CLOSED think block, the
 #                splitter starts open, `is_thinking` latches, and the engage
 #                gate never fires. Observed: R3 (`unit='Celsius'`, outside the
-#                enum) and R5 (`engaging_line=False`).
+#                enum) and R5 (no engaging record).
 #   bonsai / B   MUST FAIL — same gate, and the key-string defect underneath it.
 #   gemma / A    MUST PASS — **the reported whitespace loop does not reproduce
 #                on this probe.** Observed at the pre-fix commit: byte-identical
 #                to the fixed arm, `{\n  "unit": "celsius"\n}`, finish_reason
-#                stop, 16 tokens, R4 clean. gemma is not thinking-capable so the
-#                engage gate is not involved, and with a single-word key the
-#                grammar never corners the decoder. Whether it loops on Probe A
-#                is then a matter of which token the model prefers at a
+#                stop, 16 tokens, no periodic tail. gemma is not thinking-capable
+#                so the engage gate is not involved, and with a single-word key
+#                the grammar never corners the decoder. Whether it loops on
+#                Probe A is then a matter of which token the model prefers at a
 #                structural position, which this model does not.
 #   gemma / B    MUST FAIL — the mask corners the decoder regardless of
-#                preference.
+#                preference. Observed at the pre-fix commit: 256 tokens,
+#                finish_reason `length`, payload truncated at `{\n  "unit`.
 #
 #   `--expect fixed`: all four cells MUST PASS.
 #
@@ -92,14 +119,12 @@
 #     or explicit BONSAI_MODEL / GEMMA_E2B_MODEL paths.
 #   - Exclusive GPU: one MLX process per Mac. The script preflights strays.
 #
-# Writes nothing to the real metrics DB: hermetic RMLX_HOME under
-# .rmlx/proofs/schema-constraint, `--metrics off` on every server. One server
-# per model serves both probes; they are separated in the log by the
-# `X-Request-Id` each request carries.
+# Writes nothing to the real metrics DB: hermetic RMLX_HOME per probe under
+# .rmlx/proofs/schema-constraint, `--metrics off` on every server.
 #
 # Artifacts per (model, probe), under that hermetic root:
-#   <probe>.request.json / .response.json / .status.txt / .verdict.txt
-#   serve.log, logs/*.jsonl   (shared per model)
+#   <model>/<probe>/{request,response}.json, status.txt, verdict.txt,
+#                   serve.log, logs/*.jsonl
 
 set -uo pipefail
 
@@ -120,7 +145,7 @@ while [[ $# -gt 0 ]]; do
         --expect) EXPECT="$2"; shift 2 ;;
         --model)  ONLY_MODEL="$2"; shift 2 ;;
         --port)   PORT="$2"; shift 2 ;;
-        -h|--help) sed -n '1,105p' "$0"; exit 0 ;;
+        -h|--help) sed -n '1,125p' "$0"; exit 0 ;;
         *) echo "unknown flag: $1" >&2; exit 2 ;;
     esac
 done
@@ -213,13 +238,14 @@ wait_for_server() {
 }
 
 # ── Verdict evaluation ───────────────────────────────────────────────────────
+# Exit 0 = probe-pass, 1 = probe-fail, 3 = harness-error.
 
 evaluate() {
-    # $1 = artifact dir, $2 = probe id, $3 = expected key, $4 = request id
-    python3 - "$1" "$2" "$3" "$4" <<'PY'
+    # $1 = probe artifact dir, $2 = expected key
+    python3 - "$1" "$2" <<'PY'
 import json, os, re, sys, glob
 
-d, probe, want_key, rid = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+d, want_key = sys.argv[1], sys.argv[2]
 
 def read(p):
     try:
@@ -227,10 +253,10 @@ def read(p):
     except OSError:
         return ""
 
-body_raw = read(os.path.join(d, f"{probe}.response.json"))
-status = read(os.path.join(d, f"{probe}.status.txt")).strip()
+body_raw = read(os.path.join(d, "response.json"))
+status = read(os.path.join(d, "status.txt")).strip()
 
-results = []   # (name, state, detail)  state in {PASS, FAIL, N/A}
+results = []   # (name, state, detail); state in {PASS, FAIL, N/A, HARNESS}
 
 # R1 — HTTP 200
 try:
@@ -270,20 +296,17 @@ except Exception as e:
     why = f"not JSON: {e}; payload[:120]={stripped[:120]!r}"
 results.append(("R3_schema_valid", "PASS" if ok else "FAIL", why))
 
-# ── Log slice for THIS request ───────────────────────────────────────────────
-# The route's `request_id` span is carried across `spawn_blocking`, so every
-# decode-thread record for this probe carries the id we sent. A raw substring
-# match keeps the filter independent of the JSON layout.
-lines, records_seen = [], 0
+# ── This probe's log ─────────────────────────────────────────────────────────
+# One server per probe, so every record in this RMLX_HOME belongs to this
+# request. No filtering — a filter whose premise is one of the fixes under test
+# cannot be used to compare the two arms.
+lines = []
 for lf in sorted(glob.glob(os.path.join(d, "logs", "*.jsonl"))):
     with open(lf) as f:
-        for line in f:
-            if rid in line:
-                lines.append(line)
+        lines.extend(f.readlines())
 
 # R4 — degeneracy over emitted token ids
-ids, step_records = [], 0
-unparsable = 0
+ids, step_records, unparsable = [], 0, 0
 for line in lines:
     if "step_fn sending token" not in line:
         continue
@@ -312,14 +335,14 @@ def degenerate_tail(seq, max_period=4, min_len=16):
     return None
 
 if step_records == 0:
-    results.append(("R4_not_degenerate", "FAIL",
-                    "HARNESS ERROR: no `step_fn sending token` records for this "
-                    "request id — rerun the server with `--log verbose`"))
+    results.append(("R4_not_degenerate", "HARNESS",
+                    "no `step_fn sending token` records in this probe's log — "
+                    "rerun the server with `--log verbose`"))
 elif not ids:
-    results.append(("R4_not_degenerate", "FAIL",
-                    f"HARNESS ERROR: {step_records} step_fn records found but "
-                    f"none carried a parsable token_id ({unparsable} unparsable) "
-                    "— the log's JSON shape does not match this extractor"))
+    results.append(("R4_not_degenerate", "HARNESS",
+                    f"{step_records} step_fn records found but none carried a "
+                    f"parsable token_id ({unparsable} unparsable) — the log's "
+                    "JSON shape does not match this extractor"))
 else:
     deg = degenerate_tail(ids)
     if deg:
@@ -334,44 +357,54 @@ else:
         results.append(("R4_not_degenerate", "PASS",
                         f"{len(ids)} tokens, last12={ids[-12:]}"))
 
-# R5 — constraint built AND engaged, no non-enforcement warn
+# R5 — constraint built AND engaged, no non-enforcement warn.
+# Every probe asks for `response_format`, so "never built" is a run that
+# measured nothing, not a product verdict. "Built but never engaged" is the
+# product defect this proof exists for.
 blob = "".join(lines)
 built = "building SchemaConstraint" in blob
 engaged = re.search(r"SchemaConstraint:[^\"]*engaging", blob) is not None
 warned = "constraint never engaged" in blob
-results.append(("R5_engaged", "PASS" if (built and engaged and not warned) else "FAIL",
-                f"built={built} engaging_line={engaged} never_engaged_warn={warned}"))
+if not built:
+    results.append(("R5_engaged", "HARNESS",
+                    "no `building SchemaConstraint` record — every probe requests "
+                    "response_format, so the constraint path was never reached "
+                    "and this cell measured nothing"))
+else:
+    results.append(("R5_engaged", "PASS" if (engaged and not warned) else "FAIL",
+                    f"built=True engaging_line={engaged} never_engaged_warn={warned}"))
 
-out = "\n".join(f"{st:<4}  {name:<20} {why}" for name, st, why in results)
+out = "\n".join(f"{st:<7}  {name:<20} {why}" for name, st, why in results)
 print(out)
-with open(os.path.join(d, f"{probe}.verdict.txt"), "w") as f:
+with open(os.path.join(d, "verdict.txt"), "w") as f:
     f.write(out + "\n")
-sys.exit(0 if all(st != "FAIL" for _, st, _ in results) else 1)
+
+states = [st for _, st, _ in results]
+if "HARNESS" in states:
+    sys.exit(3)
+sys.exit(1 if "FAIL" in states else 0)
 PY
 }
 
-# ── Per-model run: one server, both probes ───────────────────────────────────
+# ── Per-probe run: its own server, its own RMLX_HOME, its own log ────────────
 
 declare -a CELL_NAMES=() CELL_RESULTS=()
 
-run_model() {
-    local label="$1" model_path="$2"
-    local art="${ROOT_DIR}/${label}"
+record_cell() {
+    CELL_NAMES+=("$1")
+    CELL_RESULTS+=("$2")
+}
 
-    if [[ -z "${model_path}" || ! -d "${model_path}" ]]; then
-        echo "SKIP ${label}: snapshot not found (${model_path:-unset}); set RMLX_O_MODELS_ROOT" >&2
-        for probe in A B; do
-            CELL_NAMES+=("${label}/${probe}")
-            CELL_RESULTS+=("skipped")
-        done
-        return 2
-    fi
+run_probe() {
+    local label="$1" model_path="$2" probe="$3"
+    local cell="${label}/${probe}"
+    local art="${ROOT_DIR}/${label}/${probe}"
 
     rm -rf "${art}"
     mkdir -p "${art}"
     preflight
 
-    echo "==> ${label}: starting server (kv-quant none, max-ctx 4096, metrics off)" >&2
+    echo "==> ${cell}: starting server (kv-quant none, max-ctx 4096, metrics off)" >&2
     RMLX_HOME="${art}" \
         "${BINARY}" \
             --log verbose \
@@ -383,16 +416,12 @@ run_model() {
             --max-ctx 4096 \
         > "${art}/serve.log" 2>&1 &
     local pid=$!
-    # shellcheck disable=SC2064
-    trap "kill ${pid} 2>/dev/null || true" RETURN
 
     if ! wait_for_server "${pid}"; then
         tail -40 "${art}/serve.log" >&2
-        for probe in A B; do
-            CELL_NAMES+=("${label}/${probe}")
-            CELL_RESULTS+=("probe-fail")
-        done
-        return 1
+        kill "${pid}" 2>/dev/null || true
+        record_cell "${cell}" "harness-error"
+        return
     fi
 
     # Resolve the registry id from the server rather than guessing it from the
@@ -403,44 +432,35 @@ run_model() {
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])' 2>/dev/null)"
     if [[ -z "${model_id}" ]]; then
         echo "ERROR: could not read a model id from /v1/models" >&2
-        for probe in A B; do
-            CELL_NAMES+=("${label}/${probe}")
-            CELL_RESULTS+=("probe-fail")
-        done
-        return 1
+        kill "${pid}" 2>/dev/null || true
+        record_cell "${cell}" "harness-error"
+        return
     fi
-    echo "==> ${label}: registry model id = ${model_id}" >&2
 
-    for probe in A B; do
-        local rid="canary-${label}-${probe}-$$"
-        local body
-        body="$(probe_body "${probe}" "${model_id}")"
-        printf '%s\n' "${body}" > "${art}/${probe}.request.json"
+    local body
+    body="$(probe_body "${probe}" "${model_id}")"
+    printf '%s\n' "${body}" > "${art}/request.json"
 
-        echo "==> ${label}/${probe}: POST /v1/chat/completions (key=$(probe_key "${probe}"))" >&2
-        curl -s -o "${art}/${probe}.response.json" -w '%{http_code}' \
-            --max-time 600 \
-            -H 'Content-Type: application/json' \
-            -H "X-Request-Id: ${rid}" \
-            -X POST "http://127.0.0.1:${PORT}/v1/chat/completions" \
-            -d "${body}" > "${art}/${probe}.status.txt" || true
+    echo "==> ${cell}: POST /v1/chat/completions (model=${model_id} key=$(probe_key "${probe}"))" >&2
+    curl -s -o "${art}/response.json" -w '%{http_code}' \
+        --max-time 600 \
+        -H 'Content-Type: application/json' \
+        -H "X-Request-Id: canary-${label}-${probe}" \
+        -X POST "http://127.0.0.1:${PORT}/v1/chat/completions" \
+        -d "${body}" > "${art}/status.txt" || true
 
-        # Let the appender flush this request's records before reading them.
-        sleep 1
-        echo "--- ${label}/${probe} ---"
-        if evaluate "${art}" "${probe}" "$(probe_key "${probe}")" "${rid}"; then
-            CELL_NAMES+=("${label}/${probe}")
-            CELL_RESULTS+=("probe-pass")
-        else
-            CELL_NAMES+=("${label}/${probe}")
-            CELL_RESULTS+=("probe-fail")
-        fi
-    done
-
+    # Stop the server before reading its log so the appender has flushed.
     kill "${pid}" 2>/dev/null || true
     wait "${pid}" 2>/dev/null || true
     sleep 2
-    return 0
+
+    echo "--- ${cell} ---"
+    evaluate "${art}" "$(probe_key "${probe}")"
+    case $? in
+        0) record_cell "${cell}" "probe-pass" ;;
+        1) record_cell "${cell}" "probe-fail" ;;
+        *) record_cell "${cell}" "harness-error" ;;
+    esac
 }
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -457,7 +477,16 @@ for spec in "bonsai:${BONSAI_MODEL}" "gemma4-e2b:${GEMMA_E2B_MODEL}"; do
     label="${spec%%:*}"
     path="${spec#*:}"
     [[ "${ONLY_MODEL}" == "all" || "${ONLY_MODEL}" == "${label}" ]] || continue
-    run_model "${label}" "${path}"
+
+    if [[ -z "${path}" || ! -d "${path}" ]]; then
+        echo "SKIP ${label}: snapshot not found (${path:-unset}); set RMLX_O_MODELS_ROOT" >&2
+        record_cell "${label}/A" "skipped"
+        record_cell "${label}/B" "skipped"
+        continue
+    fi
+    for probe in A B; do
+        run_probe "${label}" "${path}" "${probe}"
+    done
 done
 
 echo
@@ -468,11 +497,17 @@ for i in "${!CELL_NAMES[@]}"; do
     model="${cell%%/*}"
     probe="${cell##*/}"
 
-    if [[ "${result}" == "skipped" ]]; then
-        echo "  ${cell}: SKIPPED (snapshot absent)"
-        overall=2
-        continue
-    fi
+    case "${result}" in
+        skipped)
+            echo "  ${cell}: SKIPPED (snapshot absent)"
+            overall=2
+            continue ;;
+        harness-error)
+            # Never a product verdict, in either arm: this cell measured nothing.
+            echo "  ${cell}: HARNESS ERROR — measured nothing (see ${ROOT_DIR}/${model}/${probe}/verdict.txt)"
+            overall=1
+            continue ;;
+    esac
 
     want="fail"
     if [[ "${EXPECT}" == "fixed" ]] || baseline_expects_pass "${model}" "${probe}"; then
@@ -483,7 +518,7 @@ for i in "${!CELL_NAMES[@]}"; do
         pass:probe-pass) echo "  ${cell}: PASS  (expected pass, got pass)" ;;
         fail:probe-fail) echo "  ${cell}: PASS  (expected defect, reproduced)" ;;
         pass:probe-fail)
-            echo "  ${cell}: FAIL  (expected pass, got fail — see ${ROOT_DIR}/${model}/${probe}.verdict.txt)"
+            echo "  ${cell}: FAIL  (expected pass, got fail — see ${ROOT_DIR}/${model}/${probe}/verdict.txt)"
             overall=1 ;;
         fail:probe-pass)
             echo "  ${cell}: FAIL  (expected the defect to reproduce, it did not — the table in this script is now wrong, or the harness cannot see it)"

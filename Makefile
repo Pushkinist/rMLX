@@ -676,13 +676,21 @@ ssd-canary: build-perf  ## run SSD canary (POPULATE/REVISIT/EVICT) against VERIF
 #                     key); decision rule R1..R5 and the per-cell baseline
 #                     expectation table are stated at the top of
 #                     scripts/schema_constraint_canary.sh; artifacts land under
-#                     .rmlx/proofs/schema-constraint/. Hermetic RMLX_HOME and
-#                     `--metrics off` — never touches the real metrics DB.
+#                     .rmlx/proofs/schema-constraint/. One server process per
+#                     probe (four model loads) so no cell's log needs filtering
+#                     — a filter keyed on request-id propagation would depend on
+#                     one of the fixes under test and could only work on one arm.
+#                     Hermetic RMLX_HOME per probe and `--metrics off` — never
+#                     touches the real metrics DB.
 #
 # `EXPECT=baseline` asserts that table instead: each cell must reproduce the
 #                     defect, or pass where the table records that it does not.
 #                     A harness too weak to see a defect fails; so does a table
 #                     that has gone stale.
+#
+# A cell whose evidence is missing (no token records, no `building
+# SchemaConstraint`) reports HARNESS ERROR and fails BOTH arms. It must never
+# be counted as the defect `EXPECT=baseline` is looking for.
 #
 # Required env: RMLX_O_MODELS_ROOT (resolve via LOCAL.md), or explicit
 #               BONSAI_MODEL / GEMMA_E2B_MODEL. Needs an idle GPU.

@@ -937,7 +937,13 @@ schema-less `json_object` engine still accepts it there, bounded by the same cap
 real-model proof, on Bonsai and gemma-4-e2b, with two probes each. Its PASS/FAIL
 rule is fixed at the top of the script, and `EXPECT=baseline` asserts a per-cell
 expectation table so a harness too weak to see a defect fails as loudly as a
-broken fix.
+broken fix. Each probe gets its own server process: an earlier revision shared
+one server per model and separated the probes by request id, but that premise —
+that the route's span reaches the decode thread — is itself one of the fixes
+under test, so the filter worked on one arm and matched nothing on the other. A
+comparison harness may not depend on the behaviour it is comparing. A cell whose
+evidence is missing now reports HARNESS ERROR and fails both arms rather than
+being counted as the defect the baseline arm is looking for.
 
 **What reproduced and what did not.** The whitespace bound is justified by unit
 tests plus one real-model reproduction, not by the originally reported one.
