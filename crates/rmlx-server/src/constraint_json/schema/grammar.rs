@@ -32,6 +32,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use super::super::MAX_INSIGNIFICANT_WS_RUN;
 use super::types::SchemaNode;
 
 /// Whitespace bytes allowed outside strings (mirrors `super::super::WS`).
@@ -220,7 +221,10 @@ fn free_key_step(byte: u8, escape: bool, unicode: u8) -> Result<FreeKeyNext, ()>
             escape: true,
             unicode: 0,
         }),
-        0 => Err(()),
+        // Raw C0 control bytes (incl. tab / newline / CR) are illegal inside a
+        // JSON string — they must be escaped. Same rule as `step_instr`; a key
+        // string is a string.
+        0..=0x1f => Err(()),
         _ => Ok(FreeKeyNext::Continue {
             escape: false,
             unicode: 0,
@@ -414,6 +418,10 @@ pub struct SchemaGrammar {
     stack: Vec<Frame>,
     leaf: Option<Leaf>,
     pub(super) done: bool,
+    /// Consecutive insignificant-whitespace bytes accepted since the last
+    /// content or structural byte. Capped at [`MAX_INSIGNIFICANT_WS_RUN`] so a
+    /// greedy decoder cannot sit in the whitespace no-op forever.
+    ws_run: u32,
 }
 
 impl super::super::ProbeGrammar for SchemaGrammar {
@@ -432,6 +440,7 @@ impl super::super::ProbeGrammar for SchemaGrammar {
         // reallocated. The derived `clone_from` would instead reassign each
         // frame wholesale, dropping and re-growing those vectors every token.
         self.done = src.done;
+        self.ws_run = src.ws_run;
         reset_stack(&mut self.stack, &src.stack);
         // Reuse a literal-trie's `viable` buffer when both leaves are the same
         // trie-bearing variant; otherwise fall back to a plain clone.
@@ -467,6 +476,7 @@ impl SchemaGrammar {
             stack: Vec::new(),
             leaf: Some(Leaf::Start(Arc::new(root))),
             done: false,
+            ws_run: 0,
         }
     }
 
@@ -511,10 +521,12 @@ impl SchemaGrammar {
             for &b in &WS {
                 out[b as usize] = true;
             }
+            self.clamp_ws(&mut out);
             return out;
         }
         if let Some(leaf) = &self.leaf {
             self.leaf_allowed(leaf, &mut out);
+            self.clamp_ws(&mut out);
             return out;
         }
         // No active leaf ⇒ we are between structural tokens inside a frame.
@@ -547,7 +559,34 @@ impl SchemaGrammar {
                 }
             }
         }
+        self.clamp_ws(&mut out);
         out
+    }
+
+    /// Drop the insignificant-whitespace bytes from an allow-set once the run
+    /// cap is reached.
+    ///
+    /// Safe against key-string *content* only because of an invariant `step`
+    /// maintains: while the innermost frame is mid-key (`in_object_key`), every
+    /// byte — whitespace included — is content and takes the `ws_run = 0` reset
+    /// path, so `ws_run` is 0 for the whole key and this returns early. If that
+    /// ever changes, this would strip a space the key trie legitimately allows.
+    ///
+    /// This does NOT make `allowed_bytes` agree with `step` in general — root
+    /// whitespace and pre-digit `InNum` whitespace still diverge — and it does
+    /// not affect the per-token mask, which is built by feeding bytes through
+    /// `step` (see `fill_allow_mask`), not from this set.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or validated before call"
+    )]
+    fn clamp_ws(&self, out: &mut [bool; 256]) {
+        if self.ws_run < MAX_INSIGNIFICANT_WS_RUN {
+            return;
+        }
+        for &b in &WS {
+            out[b as usize] = false;
+        }
     }
 
     #[allow(
@@ -575,7 +614,9 @@ impl SchemaGrammar {
                         out[b as usize] = true;
                     }
                 } else {
-                    for b in 1u16..=255 {
+                    // C0 control bytes must be escaped inside a JSON string —
+                    // `step_instr` rejects them, so they are not allowed here.
+                    for b in 0x20u16..=255 {
                         out[b as usize] = true;
                     }
                 }
@@ -685,8 +726,14 @@ impl SchemaGrammar {
         phase: &ObjPhase,
         out: &mut [bool; 256],
     ) {
-        for &b in &WS {
-            out[b as usize] = true;
+        // Whitespace is an insignificant separator only between structural
+        // tokens. `InKey` / `InFreeKey` are inside a key *string*, where a
+        // whitespace byte is content the key sub-machine judges — the trie
+        // and the free-key arm below add it themselves when it is legal.
+        if !matches!(phase, ObjPhase::InKey { .. } | ObjPhase::InFreeKey { .. }) {
+            for &b in &WS {
+                out[b as usize] = true;
+            }
         }
         let missing_required = required.iter().any(|r| !emitted.contains(r));
         let more_props = node_props.iter().any(|(k, _)| !emitted.contains(k));
@@ -716,7 +763,9 @@ impl SchemaGrammar {
                         out[b as usize] = true;
                     }
                 } else {
-                    for b in 1u16..=255 {
+                    // C0 control bytes must be escaped inside a JSON string —
+                    // `free_key_step` rejects them, so they are not allowed here.
+                    for b in 0x20u16..=255 {
                         out[b as usize] = true;
                     }
                 }
@@ -773,12 +822,39 @@ impl SchemaGrammar {
         }
     }
 
+    /// `true` when the innermost frame is an object that is mid-key — the one
+    /// place inside a container where a whitespace byte is string content
+    /// rather than an insignificant separator.
+    fn in_object_key(&self) -> bool {
+        matches!(
+            self.stack.last(),
+            Some(Frame::Object {
+                phase: ObjPhase::InKey { .. } | ObjPhase::InFreeKey { .. },
+                ..
+            })
+        )
+    }
+
+    /// Accept one insignificant-whitespace byte, refusing once the run reaches
+    /// [`MAX_INSIGNIFICANT_WS_RUN`]. Refusing is what makes the whitespace
+    /// no-op terminating: the per-token mask probe feeds candidate tokens
+    /// through this same `step`, so a rejected byte drops every
+    /// whitespace-only token out of the mask and the decoder must emit the
+    /// next structural byte.
+    fn accept_insignificant_ws(&mut self) -> Result<(), ()> {
+        if self.ws_run >= MAX_INSIGNIFICANT_WS_RUN {
+            return Err(());
+        }
+        self.ws_run += 1;
+        Ok(())
+    }
+
     /// Consume one byte. `Err(())` if illegal at the current position.
     #[allow(clippy::result_unit_err)]
     pub fn step(&mut self, byte: u8) -> Result<(), ()> {
         if self.done {
             if WS.contains(&byte) {
-                return Ok(());
+                return self.accept_insignificant_ws();
             }
             return Err(());
         }
@@ -800,9 +876,14 @@ impl SchemaGrammar {
             // valid JSON (`: <ws> value`), but before the *root* value it is a
             // pointless no-op a greedy decoder loops on, so reject it there.
             Some(Leaf::Start(_)) => !self.stack.is_empty(),
-            // Inside a number, trailing whitespace closes it (below); structural
-            // whitespace between tokens inside a container is insignificant.
-            Some(Leaf::InNum { .. }) | None => true,
+            // Inside a number, trailing whitespace closes it (below).
+            Some(Leaf::InNum { .. }) => true,
+            // No active leaf ⇒ inside a container frame. Whitespace there is an
+            // insignificant separator only *between* structural tokens. Inside
+            // an object key string it is string content and must reach the key
+            // sub-machine, which decides whether it is legal (a space is; a raw
+            // control byte is not) and advances the key trie.
+            None => !self.in_object_key(),
         };
         if ws_noop && WS.contains(&byte) {
             if let Some(Leaf::InNum { seen_digit, .. }) = &self.leaf {
@@ -810,8 +891,10 @@ impl SchemaGrammar {
                     self.close_leaf();
                 }
             }
-            return Ok(());
+            return self.accept_insignificant_ws();
         }
+        // A content or structural byte ends the whitespace run.
+        self.ws_run = 0;
 
         if self.leaf.is_some() {
             return self.step_leaf(byte);

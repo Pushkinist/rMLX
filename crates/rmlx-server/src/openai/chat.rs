@@ -503,7 +503,35 @@ pub(crate) async fn chat_completions(
     // Best-effort: if the entry or pipeline is missing, fall through with
     // empty prompt_tokens and emit a metric + 503 note (generator is still
     // NotReadyGenerator anyway).
-    let prompt_tokens: Vec<u32> = match state.registry.get(&req.model) {
+    // Delimiters the think-splitter will use for this request, needed at render
+    // time to read the initial think channel off the rendered prompt.
+    //
+    // An empty (or whitespace-only) override is not a usable delimiter: it
+    // matches at every offset, so the prompt scan would report the block open
+    // for any prompt and the splitter's own scanner would never advance past
+    // it. Reject at the boundary rather than letting either consumer inherit
+    // the degenerate value.
+    for (field, value) in [
+        ("thinking_start_token", thinking_start_token.as_deref()),
+        ("thinking_end_token", thinking_end_token.as_deref()),
+    ] {
+        if let Some(v) = value {
+            if v.trim().is_empty() {
+                state.error_counts.increment(ApiErrorCategory::BadRequest);
+                return bad_request(&format!(
+                    "`{field}` must be a non-empty, non-whitespace delimiter string"
+                ));
+            }
+        }
+    }
+    let think_start_delim = thinking_start_token
+        .clone()
+        .unwrap_or_else(|| "<think>".to_owned());
+    let think_end_delim = thinking_end_token
+        .clone()
+        .unwrap_or_else(|| "</think>".to_owned());
+    let (prompt_tokens, prompt_think_open): (Vec<u32>, bool) = match state.registry.get(&req.model)
+    {
         None => {
             // Unknown model — 404 before reaching the generator.
             state.error_counts.increment(ApiErrorCategory::NotFound);
@@ -553,8 +581,44 @@ pub(crate) async fn chat_completions(
                     let rendered = tpl
                         .render(&tpl_msgs, &opts)
                         .map_err(|e| format!("chat template render failed: {e}"))?;
-                    tokenizer_io::encode(&tk, &rendered.text)
-                        .map_err(|e| format!("tokenizer encode failed: {e}"))
+                    // Read the initial think channel off the assistant-turn
+                    // suffix ONLY. Message content is client-controlled and can
+                    // contain a literal `<think>`; the suffix is emitted by the
+                    // template alone. Re-render without the generation prompt
+                    // and take the delta (a Jinja render, no tokenizer work).
+                    let no_gen_opts = RenderOpts {
+                        add_generation_prompt: false,
+                        ..opts
+                    };
+                    let gen_suffix: &str = match tpl.render(&tpl_msgs, &no_gen_opts) {
+                        Ok(base)
+                            if rendered.text.len() >= base.text.len()
+                                && rendered.text.starts_with(&base.text) =>
+                        {
+                            &rendered.text[base.text.len()..]
+                        }
+                        // Template does not simply append for the generation
+                        // prompt (or the render failed). Fall back to the whole
+                        // prompt and say so — the fallback is defeatable by
+                        // message content, so it must not be silent.
+                        other => {
+                            tracing::warn!(
+                                render_ok = other.is_ok(),
+                                "chat template is not append-only for \
+                                 add_generation_prompt; think-channel detection \
+                                 falls back to scanning the whole prompt"
+                            );
+                            rendered.text.as_str()
+                        }
+                    };
+                    let think_open = crate::engine::think::prompt_leaves_think_open(
+                        gen_suffix,
+                        &think_start_delim,
+                        &think_end_delim,
+                    );
+                    let ids = tokenizer_io::encode(&tk, &rendered.text)
+                        .map_err(|e| format!("tokenizer encode failed: {e}"))?;
+                    Ok::<(Vec<u32>, bool), String>((ids, think_open))
                 })
                 .await;
 
@@ -569,12 +633,13 @@ pub(crate) async fn chat_completions(
                         state.error_counts.increment(ApiErrorCategory::Upstream);
                         return service_unavailable(&e);
                     }
-                    Ok(Ok(ids)) => {
+                    Ok(Ok((ids, think_open))) => {
                         let token_count = ids.len();
                         tracing::debug!(
                             model_id = %model_id_log,
                             prompt_token_count = token_count,
                             template_used = true,
+                            prompt_think_open = think_open,
                             "prompt pipeline complete"
                         );
                         record_metric(
@@ -585,7 +650,7 @@ pub(crate) async fn chat_completions(
                             &model_id_log,
                             &entry.abs_path_str,
                         );
-                        ids
+                        (ids, think_open)
                     }
                 }
             } else {
@@ -784,6 +849,7 @@ pub(crate) async fn chat_completions(
                     .unwrap_or_default();
                 tracing::info!(
                     model_id = %req.model,
+                    request_id = %rid,
                     tool_choice = ?norm_tool_choice,
                     vocab_size = tk.get_vocab_size(true),
                     eos_ids = ?eos_ids,
@@ -844,6 +910,7 @@ pub(crate) async fn chat_completions(
                     {
                         tracing::info!(
                             model_id = %req.model,
+                            request_id = %rid,
                             schema_name = %name,
                             strict,
                             vocab_size = tk.get_vocab_size(true),
@@ -886,6 +953,7 @@ pub(crate) async fn chat_completions(
                         // A6.3: schema-less json_object syntax constraint.
                         tracing::info!(
                             model_id = %req.model,
+                            request_id = %rid,
                             vocab_size = tk.get_vocab_size(true),
                             eos_ids = ?eos_ids,
                             "A6.3: building JsonObjectConstraint (TokenBytesMap precompute)"
@@ -909,6 +977,19 @@ pub(crate) async fn chat_completions(
             _ => (None, None),
         },
     };
+
+    // Clone of the engine's engaged mirror, taken before the box is moved into
+    // the generator. The non-streaming path reads it once the stream drains: a
+    // `response_format` request whose grammar never engaged was never checked,
+    // and nothing has reached the client yet, so it can still be refused.
+    // Scoped to `response_format` — `tool_choice` has its own text-parsing
+    // fallback and a non-engaged constraint there is not a failed contract.
+    let response_format_engaged: Option<Arc<std::sync::atomic::AtomicBool>> =
+        if bare_json_tool_call_mode {
+            None
+        } else {
+            constraint.as_ref().and_then(|c| c.engaged_handle())
+        };
 
     // extract image_url / input_audio content parts from user messages.
     // Collected across all user messages in order; will pass them to the
@@ -975,8 +1056,8 @@ pub(crate) async fn chat_completions(
         // per-request thinking budget + pre-resolved thinking-end-token id.
         thinking_budget,
         thinking_end_token_id,
-        // / PART 2: effective enable_thinking → ThinkSplitter init channel.
-        enable_thinking: effective_enable_thinking,
+        // ThinkSplitter init channel, read off the rendered prompt above.
+        prompt_think_open,
         // A5.6: reconstruct tool-protocol special-token markers into the
         // decoded stream only when a tool-call parser is active for this
         // request (Gemma markers are suppressed by `skip_special`).
@@ -1254,6 +1335,7 @@ pub(crate) async fn chat_completions(
             parser_format,
             json_object_mode,
             bare_json_tool_call_mode,
+            response_format_engaged,
             request_start,
             state.metrics_drainer.as_ref(),
             ctx_max_for_metrics,

@@ -359,12 +359,13 @@ pub struct GenerationRequest {
     /// soft no-op — reasoning runs to `max_tokens`).
     pub thinking_end_token_id: Option<u32>,
 
-    /// / PART 2: effective `enable_thinking` for this request after
-    /// precedence resolution. `Some(false)` means prefilled a
-    /// CLOSED `<think></think>` block, so the `ThinkSplitter` must start in
-    /// answer-mode to route output to `content`. `Some(true)` / `None`
-    /// keep the default (thinking enabled, splitter starts open).
-    pub enable_thinking: Option<bool>,
+    /// Whether the rendered prompt leaves the assistant turn inside an open
+    /// `<think>` block — read off the prompt text by
+    /// `engine::think::prompt_leaves_think_open`, not inferred from the
+    /// architecture or from `enable_thinking` (a chat template is free to
+    /// ignore that flag, and some do). Drives the `ThinkSplitter`'s initial
+    /// channel and, through it, the constraint engine's `is_thinking` gate.
+    pub prompt_think_open: bool,
 
     /// A5.6: reconstruct tool-protocol special-token markers into the
     /// decoded piece stream so the response tool-call parser can see them.

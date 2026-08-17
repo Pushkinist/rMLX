@@ -643,13 +643,15 @@ impl Architecture {
     /// Whether this architecture emits `<think>...</think>` reasoning tokens
     /// that the server should surface on a separate output channel (A3).
     ///
-    /// `true` only for the Qwen3 family (Qwen3 dense + Qwen3.5 MoE). Their
-    /// chat templates prefill the assistant turn with an open `<think>\n`
-    /// block, then the model produces reasoning text and emits the literal
-    /// `</think>` once it switches to its final answer. All other
-    /// architectures (including BitNet) emit plain assistant text — the state
-    /// machine in the server's decode loop is skipped entirely when this
-    /// returns `false`.
+    /// `true` only for the Qwen3 family (Qwen3 dense + Qwen3.5 MoE). It says
+    /// the architecture *can* produce `<think>...</think>` — nothing more.
+    /// Whether a given checkpoint's chat template prefills an open `<think>`,
+    /// prefills a closed `<think></think>` so the model answers directly, or
+    /// prefills nothing varies **per checkpoint** inside this same family, so
+    /// the server reads the initial reasoning channel off the rendered prompt
+    /// rather than off this flag. All other architectures (including BitNet)
+    /// emit plain assistant text — the state machine in the server's decode
+    /// loop is skipped entirely when this returns `false`.
     pub fn supports_thinking(&self) -> bool {
         matches!(self, Architecture::Qwen3(_) | Architecture::Qwen3_5Moe(_))
     }

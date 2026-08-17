@@ -84,6 +84,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         profile-mst \
         build-capture test-capture gputrace-preflight traces-gc \
         ssd-canary ssd-canary-gate \
+        schema-constraint-canary \
         bench-codec-cell \
         smoke-codec-matrix \
         e2e \
@@ -676,6 +677,38 @@ ssd-canary: build-perf  ## run SSD canary (POPULATE/REVISIT/EVICT) against VERIF
 	@pkill -f "rmlx serve" || true; pkill -f mlx_lm || true; sleep 1; rm -f /tmp/rmlx.*.claim
 	@echo "==> ssd-canary: populate + revisit + evict"
 	bash scripts/ssd_canary.sh --tag ssd-canary --ssd-gb $${SSD_GB:-100}
+
+# ---- json_schema constraint canary ---------------------------------------
+#
+# `make schema-constraint-canary` — proves, on Bonsai (Qwen3ForCausalLM) and
+#                     gemma-4-e2b (Gemma4ForConditionalGeneration), that a strict
+#                     `json_schema` request cannot return HTTP 200 on a degenerate
+#                     whitespace run and cannot be answered by a constraint that
+#                     never engaged. Two probes per model (plain key / spaced
+#                     key); decision rule R1..R5 and the per-cell baseline
+#                     expectation table are stated at the top of
+#                     scripts/schema_constraint_canary.sh; artifacts land under
+#                     .rmlx/proofs/schema-constraint/. One server process per
+#                     probe (four model loads) so no cell's log needs filtering
+#                     — a filter keyed on request-id propagation would depend on
+#                     one of the fixes under test and could only work on one arm.
+#                     Hermetic RMLX_HOME per probe and `--metrics off` — never
+#                     touches the real metrics DB.
+#
+# `EXPECT=baseline` asserts that table instead: each cell must reproduce the
+#                     defect, or pass where the table records that it does not.
+#                     A harness too weak to see a defect fails; so does a table
+#                     that has gone stale.
+#
+# A cell whose evidence is missing (no token records, no `building
+# SchemaConstraint`) reports HARNESS ERROR and fails BOTH arms. It must never
+# be counted as the defect `EXPECT=baseline` is looking for.
+#
+# Required env: RMLX_O_MODELS_ROOT (resolve via LOCAL.md), or explicit
+#               BONSAI_MODEL / GEMMA_E2B_MODEL. Needs an idle GPU.
+
+schema-constraint-canary: build-perf  ## prove json_schema enforcement on Bonsai + gemma-4-e2b (EXPECT=fixed|baseline)
+	bash scripts/schema_constraint_canary.sh --expect $${EXPECT:-fixed}
 
 ssd-canary-gate:   ## gate SSD-tier regressions; SHA= required, THRESHOLD_PCT=3 default
 	@test -n "$(SHA)" || { echo "ERROR: SHA= required. Usage: make ssd-canary-gate SHA=<last-green-sha>"; exit 125; }

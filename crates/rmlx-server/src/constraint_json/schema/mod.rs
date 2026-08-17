@@ -22,7 +22,7 @@ pub use types::{EngagePolicy, SchemaError, SchemaNode};
 // ── Test-visible re-exports ───────────────────────────────────────────────────
 
 #[cfg(test)]
-pub(crate) use super::TokenBytesMap;
+pub(crate) use super::{TokenBytesMap, MAX_INSIGNIFICANT_WS_RUN};
 #[cfg(test)]
 pub(crate) use rmlx_models::ConstraintEngine;
 #[cfg(test)]
