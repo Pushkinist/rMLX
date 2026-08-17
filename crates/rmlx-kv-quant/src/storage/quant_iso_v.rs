@@ -585,6 +585,24 @@ impl QuantIsoV3 {
     /// Returns an `Error::Mlx` if the underlying [`iso_decode_fast`] fails for
     /// any block.
     pub fn dequant(&self) -> Result<Vec<f32>> {
+        // The ring lives on the GPU whenever it is live at all, so that is the
+        // stream its readback belongs on. `dequant_on` exists so a caller that
+        // knows better — a `Device::Cpu` run, or a test that must not touch a
+        // shared Metal context — can say so instead of having this constant
+        // imposed on it.
+        self.dequant_on(Device::Gpu)
+    }
+
+    /// [`Self::dequant`] on an explicit device.
+    ///
+    /// The device selects the stream for the ring readback that reconciles a
+    /// ring-only decode tail; it has no effect on a store whose CPU blocks
+    /// already cover `shape[2]`, which is every store on the CPU append path.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::dequant`].
+    pub fn dequant_on(&self, device: Device) -> Result<Vec<f32>> {
         if self.shape.len() != 4 {
             return Err(Error::Mlx(format!(
                 "QuantIsoV3::dequant: malformed shape {:?}",
@@ -600,7 +618,7 @@ impl QuantIsoV3 {
         // `shape[2]`), and this rebuilds it on demand rather than decoding a
         // short prefix and zero-padding the gap. Loud on any unrecoverable
         // disagreement.
-        let blocks = synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, Device::Gpu)?;
+        let blocks = synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, device)?;
 
         if blocks.is_empty() {
             // Empty blocks are valid only when the store genuinely holds no
@@ -1405,7 +1423,18 @@ fn copy_f32_slots<T: Copy>(dst: &mut [u8], slot_offset: usize, src: &[T], to_le:
 /// **Invariant (enforced loudly, never zero-padded):** `blocks` track the ring
 /// exactly, or the ring exists and supplies the tail. Any state where the CPU
 /// blocks fall short of `shape[2]` and the ring cannot make up the difference is
-/// an `Error` — the caller must not fabricate a zeroed gap.
+/// an `Error` — the caller must not fabricate a zeroed gap. The enforcement is
+/// [`QuantKGpuRing`]'s fill watermark: the readback is sized from `shape[2]` and
+/// refused when that runs past what the ring actually wrote. Without it the
+/// ring's page-rounded `capacity` accepted the read and the caller got the
+/// allocation's zeros as a K/V tail — length-correct and silently wrong.
+///
+/// **What it does not cover:** when `blocks` fall short the ring supplies the
+/// *whole* prefix and the existing `blocks` are discarded, not merged. That is
+/// right for the state this exists for — on the fused decode path the ring is a
+/// superset of the blocks — but a caller holding a block the ring never saw
+/// would lose it with no error. No such caller exists today: every block push on
+/// these stores either feeds the ring or drops it first.
 ///
 /// Shared by [`QuantIsoV3`] / [`super::QuantIsoV4`] and the iso K stores
 /// ([`super::QuantIsoK3`] / [`super::QuantIsoK4`]) — the `IsoBlocks` payload and

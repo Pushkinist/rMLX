@@ -387,6 +387,24 @@ impl QuantIsoK3 {
     /// # Errors
     /// Returns an `Error::Mlx` if the underlying [`iso_decode_fast`] fails.
     pub fn dequant(&self) -> Result<Vec<f32>> {
+        // The ring lives on the GPU whenever it is live at all, so that is the
+        // stream its readback belongs on. `dequant_on` exists so a caller that
+        // knows better — a `Device::Cpu` run, or a test that must not touch a
+        // shared Metal context — can say so instead of having this constant
+        // imposed on it.
+        self.dequant_on(Device::Gpu)
+    }
+
+    /// [`Self::dequant`] on an explicit device.
+    ///
+    /// The device selects the stream for the ring readback that reconciles a
+    /// ring-only decode tail; it has no effect on a store whose CPU blocks
+    /// already cover `shape[2]`, which is every store on the CPU append path.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::dequant`].
+    pub fn dequant_on(&self, device: Device) -> Result<Vec<f32>> {
         if self.shape.len() != 4 {
             return Err(Error::Mlx(format!(
                 "QuantIsoK3::dequant: malformed shape {:?}",
@@ -402,7 +420,7 @@ impl QuantIsoK3 {
         // (`blocks` trail `shape[2]`), and this rebuilds it on demand rather than
         // decoding a short prefix and zero-padding the gap. Loud on any
         // unrecoverable disagreement.
-        let blocks = synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, Device::Gpu)?;
+        let blocks = synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, device)?;
 
         if blocks.is_empty() {
             // Loud on a lost decode tail — see [`super::QuantIsoV3::dequant`].

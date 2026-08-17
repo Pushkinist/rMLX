@@ -276,8 +276,11 @@ pub(crate) fn truncate_plan(
 /// `min(n, shape[2])` could never discard it. What makes the asymmetry safe is
 /// that those stores already **abort loudly** on an over-long target —
 /// `synced_rotor_v_blocks` / `synced_iso_v_blocks` size their ring readback from
-/// `shape[2]` and return `Err` when the ring cannot cover it. The clamp would buy
-/// them nothing. These stores have no ring and no such guard, so for them the
+/// `shape[2]`, and `QuantKGpuRing::packed_view` returns `Err` when that runs past
+/// the ring's fill watermark. (The watermark is what makes this true: `capacity`
+/// is page-rounded and zero-initialised, so bounding on capacity alone accepted a
+/// read into the allocation's zeros and returned a length-correct, silently wrong
+/// tail.) The clamp would buy them nothing. These stores have no ring and no such guard, so for them the
 /// clamp is the only reading that keeps `shape[2] == payload coverage` true.
 pub(crate) fn clamp_truncate_target(shape: &[i32], n: i32) -> i32 {
     let covered = shape.get(2).copied().unwrap_or(0).max(0);

@@ -959,7 +959,9 @@ fn iso_v3_block_append_over_a_live_ring_takes_the_prefix_back() {
     oracle_store
         .append(&chunk(prefill + 1, 1), &shape(1))
         .expect("oracle fallback step");
-    let oracle = oracle_store.dequant().expect("oracle dequant");
+    let oracle = oracle_store
+        .dequant_on(Device::Cpu)
+        .expect("oracle dequant");
 
     for absorb in [false, true] {
         let mut vs = QuantIsoV3::new(init());
@@ -997,7 +999,7 @@ fn iso_v3_block_append_over_a_live_ring_takes_the_prefix_back() {
         vs.blocks.push(make_block(&chunk(prefill + 1, 1), 1));
         vs.shape[2] += 1;
 
-        let got = vs.dequant();
+        let got = vs.dequant_on(Device::Cpu);
         if absorb {
             assert_eq!(
                 got.expect("dequant after the reconcile"),
@@ -1005,12 +1007,20 @@ fn iso_v3_block_append_over_a_live_ring_takes_the_prefix_back() {
                 "the reconciled store must decode exactly like the all-CPU oracle"
             );
         } else {
-            let unfixed = got.expect("stale-ring dequant returns a plausible tensor");
-            assert_ne!(
-                unfixed, oracle,
-                "premise: without the reconcile the store decodes the stale ring instead \
-                 of the appended chunk. Equality here means this test no longer proves \
-                 the reconcile is load-bearing"
+            // Premise: without the reconcile the store is unreadable, and says
+            // so. The ring holds `prefill + 1` positions while `shape[2]` now
+            // claims `prefill + 2`, so the readback stops inside the ring's
+            // page-rounded zero tail — which the fill watermark refuses rather
+            // than decoding as K/V. (Before that watermark this returned `Ok`
+            // with a zeroed tail: length-correct, silently wrong.)
+            let err = got.expect_err(
+                "premise: a store whose block push skipped the reconcile must be refused. \
+                 An `Ok` here means this test no longer proves the reconcile is load-bearing",
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("exceeds filled="),
+                "the refusal must be the ring fill-watermark guard, got: {msg}"
             );
         }
     }
