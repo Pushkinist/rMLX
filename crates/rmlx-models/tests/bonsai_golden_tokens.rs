@@ -8,11 +8,13 @@
 //! KV quant: Mixed{ K=8, V=4, group=64 } — the resolver default for Qwen3
 //! dense 2-bit, feeding the quantized 3-tuple straight into SDPA.
 //!
+//! The snapshot resolves from `RMLX_O_MODELS_ROOT` by slug, so no per-run
+//! variable is needed on a machine holding it (see `tests/common/mod.rs`).
+//!
 //! Record once:
 //! RMLX_REGEN_GOLDENS=1 RMLX_KV_TEST_MODEL=/path/to/Ternary-Bonsai-8B-mlx-2bit \
 //! cargo test -p rmlx-models --test bonsai_golden_tokens -- --ignored
 //! Then gate:
-//! RMLX_KV_TEST_MODEL=/path/to/Ternary-Bonsai-8B-mlx-2bit \
 //! cargo test -p rmlx-models --test bonsai_golden_tokens -- --ignored
 
 #![allow(
@@ -38,18 +40,19 @@ mod common;
 
 use rmlx_kv_quant::KvQuant;
 
-/// Architectures this golden was recorded against. Any other arch is skipped.
-const EXPECTED_ARCHS: &[&str] = &["Qwen3ForCausalLM"];
+/// The snapshot these tests cover, and the architectures they were recorded
+/// against.
+const MODEL: common::GoldenModel = common::GoldenModel {
+    slug: "prism-ml__Ternary-Bonsai-8B-mlx-2bit",
+    archs: &["Qwen3ForCausalLM"],
+};
 
 #[ignore]
 #[test]
 fn bonsai_golden_tokens_mixed() {
-    let Some(model_path) = common::model_path_from_env() else {
+    let Some(model_path) = common::model_for(&MODEL, "bonsai_golden_tokens_mixed") else {
         return;
     };
-    if common::skip_if_arch_mismatch(&model_path, "bonsai_golden_tokens_mixed", EXPECTED_ARCHS) {
-        return;
-    }
     common::run_golden_test(
         "bonsai_8b_mixed_k8g64_v4g64",
         KvQuant::Mixed {
@@ -58,6 +61,7 @@ fn bonsai_golden_tokens_mixed() {
             k_group_size: 64,
             v_group_size: 64,
         },
+        &model_path,
     );
 }
 
@@ -72,7 +76,6 @@ fn bonsai_golden_tokens_mixed() {
 /// `N_THINKING = 4` is small enough to land comfortably within `N_TOKENS` decode steps.
 ///
 /// Run:
-/// RMLX_KV_TEST_MODEL=/path/to/Ternary-Bonsai-8B-mlx-2bit \
 /// cargo test -p rmlx-models --test bonsai_golden_tokens \
 /// thinking_budget_exact_hit_qwen3 -- --ignored --nocapture
 #[ignore]
@@ -81,16 +84,9 @@ fn thinking_budget_exact_hit_qwen3() {
     use rmlx_mlx::Device;
     use rmlx_models::{arch, Pcg32, PenaltyConfig, SamplerConfig};
 
-    let Some(model_path) = common::model_path_from_env() else {
+    let Some(model_path) = common::model_for(&MODEL, "thinking_budget_exact_hit_qwen3") else {
         return;
     };
-    if common::skip_if_arch_mismatch(
-        &model_path,
-        "thinking_budget_exact_hit_qwen3",
-        EXPECTED_ARCHS,
-    ) {
-        return;
-    }
 
     const FORCED_ID: u32 = 151648; // </think> in Qwen3 vocabulary
     const N_THINKING: usize = 4; // fire forced injection after this many decode steps
@@ -209,7 +205,6 @@ fn thinking_budget_exact_hit_qwen3() {
 /// concurrently sampled (and discarded) `next_y` candidate.
 ///
 /// Run:
-/// RMLX_KV_TEST_MODEL=/path/to/Ternary-Bonsai-8B-mlx-2bit \
 /// cargo test -p rmlx-models --test bonsai_golden_tokens \
 /// thinking_budget_forced_token_no_logprobs -- --ignored --nocapture
 #[ignore]
@@ -218,16 +213,10 @@ fn thinking_budget_forced_token_no_logprobs() {
     use rmlx_mlx::Device;
     use rmlx_models::{arch, Pcg32, PenaltyConfig, SamplerConfig};
 
-    let Some(model_path) = common::model_path_from_env() else {
+    let Some(model_path) = common::model_for(&MODEL, "thinking_budget_forced_token_no_logprobs")
+    else {
         return;
     };
-    if common::skip_if_arch_mismatch(
-        &model_path,
-        "thinking_budget_forced_token_no_logprobs",
-        EXPECTED_ARCHS,
-    ) {
-        return;
-    }
 
     const FORCED_ID: u32 = 151648; // </think> in Qwen3 vocabulary
     const N_THINKING: usize = 4;
@@ -354,7 +343,6 @@ fn thinking_budget_forced_token_no_logprobs() {
 /// (step 0 included) is a real, logprob-bearing token.
 ///
 /// Run:
-/// RMLX_KV_TEST_MODEL=/path/to/Ternary-Bonsai-8B-mlx-2bit \
 /// cargo test -p rmlx-models --test bonsai_golden_tokens \
 /// cache_hit_first_token_logprob_parity -- --ignored --nocapture
 #[ignore]
@@ -363,16 +351,9 @@ fn cache_hit_first_token_logprob_parity() {
     use rmlx_mlx::Device;
     use rmlx_models::{arch, Pcg32, PenaltyConfig, SamplerConfig};
 
-    let Some(model_path) = common::model_path_from_env() else {
+    let Some(model_path) = common::model_for(&MODEL, "cache_hit_first_token_logprob_parity") else {
         return;
     };
-    if common::skip_if_arch_mismatch(
-        &model_path,
-        "cache_hit_first_token_logprob_parity",
-        EXPECTED_ARCHS,
-    ) {
-        return;
-    }
 
     const N_TOKENS: usize = 16;
     const LP_K: u32 = 5;

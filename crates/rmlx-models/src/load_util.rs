@@ -99,12 +99,29 @@ fn classify_load_oom(e: Error) -> Error {
 
 /// Cast a float model parameter to BF16 at load time.
 ///
-/// Follows mlx-lm's "uniform model dtype" discipline: if the snapshot ships
-/// an fp16 (or other float) tensor where bf16 is expected, the narrower dtype
-/// forces MLX's promotion rules to lift the entire compute stream to f32,
-/// polluting downstream activations and the `--kv-quant none` KV cache.
-/// Casting at load is zero per-token cost and keeps every activation bf16.
-/// Already-BF16 tensors are returned unchanged (early-return, no copy).
+/// **Why:** a snapshot that ships an fp16 tensor where the activation stream is
+/// bf16 makes MLX's promotion rules lift the whole compute stream to f32 —
+/// polluting downstream activations and the `--kv-quant none` KV cache, which
+/// then stores K and V at 4 B/elem. Adopting ONE float dtype at load costs
+/// nothing per token and keeps every activation at that dtype. Already-BF16
+/// tensors are returned unchanged (early-return, no copy).
+///
+/// **What this is not:** it is not parity with mlx-lm. mlx-lm applies the same
+/// *one-dtype* discipline, but on an fp16 checkpoint it picks **fp16** — measured
+/// with mlx-lm 0.31.2 on `prism-ml__Ternary-Bonsai-8B-mlx-2bit`, all 653 float
+/// params load as float16, the forward returns float16 logits, and the KV cache
+/// is float16. rMLX picks bf16 instead, which is 3 mantissa bits coarser than
+/// both the checkpoint and the reference.
+///
+/// That is a deliberate trade, not an oversight: bf16 is the dtype the rest of
+/// this engine's kernels and KV codecs are built around, and unifying on it
+/// measured decode +34 % / +73 % / +100 % at 4 k / 16 k / 64 k on that snapshot
+/// and halved KV residency. The cost is real too — it moves tokens at near-tie
+/// logits: `bonsai_8b_mixed_k8g64_v4g64.golden.txt` predates this cast and is
+/// **stale at index 18**, where the two candidates tie exactly in rMLX and the
+/// reference sees a 0.0859 margin. That fixture has NOT been regenerated, so a
+/// mismatch there is expected and is not a new regression. Do not describe this
+/// cast as matching the reference.
 pub(crate) fn bf16_param(a: Array) -> Result<Array> {
     if a.dtype() == Dtype::Bf16 {
         Ok(a)

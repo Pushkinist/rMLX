@@ -25,10 +25,39 @@ REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 # Fallback is a repo-local ./models dir (gitignored) — drop snapshots there to
 # run with zero config. No machine-specific path is baked in.
 O_MODELS_ROOT ?= $(RMLX_O_MODELS_ROOT)
-ifeq ($(strip $(O_MODELS_ROOT)),)
+# Did an operator NAME a root — via .env, a shell export, or the command line —
+# or are we about to invent one? Captured before the fallback overwrites it.
+O_MODELS_ROOT_NAMED := $(strip $(O_MODELS_ROOT))
+ifeq ($(O_MODELS_ROOT_NAMED),)
 O_MODELS_ROOT := $(REPO_ROOT)/models
 endif
-export RMLX_O_MODELS_ROOT := $(O_MODELS_ROOT)
+
+# A named root is forwarded VERBATIM, wrong or not, and only the invented
+# fallback is gated on existing.
+#
+# The distinction is load-bearing because `.env` is `-include`d: values from it
+# are make variables, NOT environment variables, so they reach a child only
+# through this `export`. Gating the export on the path existing would therefore
+# suppress it precisely when the path is wrong — the child would see nothing
+# set, report "no snapshot configured", and skip green at the one operator who
+# did configure something. Forwarding it keeps a typo reaching the readers that
+# can call it a typo.
+#
+# The fallback is the opposite case: nobody named it, so handing children a
+# repo-local `models/` that need not exist manufactures a configuration no one
+# chose, and readers cannot tell it from a deliberate one.
+#
+# Export the STRIPPED value. Make preserves trailing whitespace in a `.env`
+# assignment, so `RMLX_O_MODELS_ROOT=/path ` forwards a path with an invisible
+# trailing space: the child fails as Misconfigured with a message whose cause
+# cannot be seen. ($(strip) also collapses runs of internal whitespace, so a
+# root whose name contains two consecutive spaces is unsupported — a single
+# internal space is untouched.)
+ifneq ($(O_MODELS_ROOT_NAMED),)
+export RMLX_O_MODELS_ROOT := $(O_MODELS_ROOT_NAMED)
+else ifneq ($(wildcard $(O_MODELS_ROOT)/.),)
+export RMLX_O_MODELS_ROOT := $(strip $(O_MODELS_ROOT))
+endif
 
 # Primary test model. Override at the CLI: make info MODEL=/path/to/other-snapshot
 MODEL ?= $(O_MODELS_ROOT)/mlx-community__gemma-4-e4b-it-mxfp8
@@ -252,31 +281,48 @@ model-check:     ## cargo test -p rmlx-{models,runtime,quant,kv-quant} (no serve
 	cargo test -p rmlx-models -p rmlx-runtime -p rmlx-quant -p rmlx-kv-quant
 
 # model-check-full: run the model-logic unit tests (same as model-check) PLUS the
-# per-arch golden-token integration tests gated by RMLX_KV_TEST_MODEL.
+# per-arch golden-token integration tests, pinned to ONE model.
 #
-# MODEL is forwarded as RMLX_KV_TEST_MODEL. Each golden test file (bonsai, gemma4,
-# qwen3, bitnet) reads <MODEL>/config.json, extracts the `architectures` field, and
-# skips gracefully (prints "SKIP <test>: model arch X != expected Y", returns green)
-# when the model does not match the arch the golden was recorded against. The matching
-# golden runs the full 32-token assertion; the others skip. The whole target is
-# GREEN for any single valid test-target model.
+# MODEL is forwarded as RMLX_KV_TEST_MODEL, the golden harness's single-model
+# override. It applies to the ONE golden whose architecture it serves: that golden
+# runs the full 32-token assertion against <MODEL>. The others do not stand down —
+# each falls through to its own slug under RMLX_O_MODELS_ROOT and runs if that
+# snapshot is present, or skips if it is not. So this target covers at least the
+# named model, and more on a machine with a populated models root.
+#
+# To run the goldens with no model pinned at all, use `make gpu-test`, which runs
+# every #[ignore] GPU test including these.
 #
 # Avoid --include-ignored here: the lib's own #[ignore] tests (kv-cache equivalence)
-# require a matching model + Metal context and segfault on arch mismatch. The four
+# require a matching model + Metal context and segfault on arch mismatch. The five
 # golden tests are integration test binaries (tests/*.rs) named explicitly below.
+#
+# --test-threads=1 is mandatory, not tidiness. The bonsai binary alone holds four
+# #[ignore] GPU tests, and libtest runs a binary's tests on parallel threads: a
+# shared Metal context driven from several of them aborts the whole binary
+# ("Rust cannot catch foreign exceptions"), which is the hazard the #[ignore]
+# rule exists for. Every other runner of these tests already serializes them.
+#
+# The guard checks the PATH, not the variable. MODEL has an unconditional default
+# (see its definition above), so a `-n` test could never fire, and the default
+# names a snapshot the machine need not have. That fabricated path is then
+# forwarded as RMLX_KV_TEST_MODEL, which the golden harness reads as an operator
+# naming a snapshot — a misconfiguration, failing every golden — when nobody named
+# anything. Refusing up front, with the path in the message, is the honest form.
 #
 # Examples:
 #   make model-check-full MODEL=/path/to/prism-ml__Ternary-Bonsai-8B-mlx-2bit
 #   make model-check-full MODEL=/path/to/mlx-community__gemma-4-e4b-it-mxfp8
-model-check-full: ## run model-logic crates + golden-token integration tests (MODEL= required; matching arch runs+passes, others skip — target is green for any single test-target model)
-	@test -n "$(MODEL)" || { echo "MODEL is required: make model-check-full MODEL=/path/to/snapshot"; exit 1; }
+model-check-full: ## run model-logic crates + golden-token integration tests (MODEL= must name an existing snapshot; matching arch runs+passes, others fall through to their own slug or skip)
+	@test -d "$(MODEL)" || { echo "model-check-full: MODEL must name an existing snapshot directory."; echo "  got: $(MODEL)"; echo "  usage: make model-check-full MODEL=/path/to/snapshot"; exit 1; }
 	cargo test -p rmlx-models -p rmlx-runtime -p rmlx-quant
 	RMLX_KV_TEST_MODEL="$(MODEL)" cargo test -p rmlx-models \
 	  --test bonsai_golden_tokens \
 	  --test gemma4_golden_tokens \
 	  --test qwen3_golden_tokens \
 	  --test bitnet_golden_tokens \
-	  -- --ignored
+	  --test medgemma_golden_tokens \
+	  -- --ignored --test-threads=1
 
 # e2e: the feature-proof harness — drives the REAL rmlx binary per manifest case
 # (CLI subprocess or `rmlx serve` + HTTP), asserts on real output, writes the

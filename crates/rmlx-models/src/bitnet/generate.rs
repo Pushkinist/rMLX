@@ -17,7 +17,7 @@ use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
 use tracing::info;
 
 use crate::constraint::ConstraintEngine;
-use crate::decode_loop::reject_nan_prefill;
+use crate::decode_loop::{capture_logprobs, reject_nan_prefill};
 use crate::kv_cache::{kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N};
 use crate::prompt_cache::{chained_block_hashes_seeded, Consumed, ReusePolicy};
 use crate::sampler::apply_mask_argmax;
@@ -124,6 +124,10 @@ pub fn generate_greedy(
             token_id = last_id,
             "bitnet generate_greedy: prompt cache EXACT HIT"
         );
+        // No logprobs on the replayed token: the exact hit skips the prefill that
+        // produced its logits, and the cache entry stores the id and piece only.
+        // Decode steps below still carry them. Same shape as the other
+        // exact-hit paths that do not persist a logprob payload.
         steps.push(ProbeStep {
             token_id: last_id,
             piece: piece.into_boxed_str(),
@@ -320,6 +324,16 @@ pub fn generate_greedy(
     let last_id =
         i32::from_le_bytes([top_bytes[0], top_bytes[1], top_bytes[2], top_bytes[3]]) as u32;
 
+    // Top-k logprobs for the prefill token, behind the `k > 0` guard that keeps
+    // the default path free of log-softmax and top-k. `logits_flat` is already
+    // materialized above, so this adds no GPU sync.
+    let lp_k = sampler_cfg.top_logprobs_k as usize;
+    let prefill_logprobs = if lp_k > 0 {
+        capture_logprobs(&logits_flat, &top, lp_k)
+    } else {
+        None
+    };
+
     if let Some(c) = constraint.as_mut() {
         c.advance(last_id);
     }
@@ -345,7 +359,7 @@ pub fn generate_greedy(
         piece: piece.clone().into_boxed_str(),
         max_abs_logit,
         nan_count,
-        logprobs: None,
+        logprobs: prefill_logprobs,
     });
     step_fn(steps.last().unwrap());
 
@@ -520,8 +534,12 @@ fn decode_loop(
         let mask_active = constraint.as_ref().is_some_and(|c| c.wants_mask());
         let sampling_active = sampler_cfg.sampling_active();
         let penalties_active = penalty_cfg.penalties_active();
+        // Logprob capture reads the logits row on the host, so it needs the row
+        // materialized for the same reason the mask does. `k == 0` leaves the
+        // eval schedule exactly as it was.
+        let lp_k = sampler_cfg.top_logprobs_k as usize;
 
-        if mask_active {
+        if mask_active || lp_k > 0 {
             logits_flat.eval()?;
         }
 
@@ -578,6 +596,12 @@ fn decode_loop(
         next_y.eval()?;
         *decode_steps_count += 1;
 
+        let step_logprobs = if lp_k > 0 {
+            capture_logprobs(&logits_flat, &next_y, lp_k)
+        } else {
+            None
+        };
+
         let top_bytes = next_y.to_bytes()?;
         let next_id =
             i32::from_le_bytes([top_bytes[0], top_bytes[1], top_bytes[2], top_bytes[3]]) as u32;
@@ -603,7 +627,7 @@ fn decode_loop(
             piece: piece.into_boxed_str(),
             max_abs_logit: 0.0,
             nan_count: 0,
-            logprobs: None,
+            logprobs: step_logprobs,
         });
         step_fn(steps.last().unwrap());
 
