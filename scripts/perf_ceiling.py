@@ -152,6 +152,10 @@ _READS_PACKED = {"Mixed", "RotK"}
 # uint8 scales this term is 2x too large. Verify before quoting a tight ratio.
 _AFFINE_SIDEBAND_BITS = 32
 
+# Store group sizes, from source: q8.rs:33 and turboquant.rs:70.
+Q8_GROUP_SIZE = 128
+TURBO_GROUP_SIZE = 32
+
 
 def _affine_side_bytes(bits: int, group: int, elems: int) -> int:
     """Packed affine bytes for one axis: codes plus the per-group scale+bias."""
@@ -239,7 +243,23 @@ def _side_bytes(c: Codec, bits: int, elems: int, n_tokens: int, head_dim: int,
         stored = groups * (4 + 4) + n_tokens * 4
     else:
         codes = elems * bits // 8
-        scales = (elems // 32) * 4  # one f32 per 32-element group
+        # Sideband cadence is per-store, not a single constant. quant.rs:1029
+        # charges one f32 per 32 elements for all three, which its own comment
+        # at :1006-1007 calls "conservative"; measured against the stores:
+        #   q8_0 K   -- Q8_GROUP_SIZE = 128 (q8.rs:33)        -> /32 is 4x high
+        #   TurboQuant V -- GROUP_SIZE = 32 (turboquant.rs:70) -> /32 is EXACT
+        #   Mixed/RotK affine -- group from the codec name, and the store is an
+        #     mx.quantize 3-tuple, so the sideband is scale AND bias in the
+        #     input dtype (mixed_quant/state.rs:29-34), not one f32
+        #     -> /32 is 2x high AND structurally the wrong shape.
+        # Footprint figures only: decode_read_bytes_per_layer never reaches here.
+        if c.kind in _READS_PACKED:
+            group = (c.k_group if bits == c.k_bits else c.v_group) or 64
+            scales = int(elems / group) * 2 * BF16
+        elif bits == 8:
+            scales = (elems // Q8_GROUP_SIZE) * 4
+        else:
+            scales = (elems // TURBO_GROUP_SIZE) * 4
         stored = codes + scales
     return stored + (elems * BF16 if retains_seed else 0)
 
