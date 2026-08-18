@@ -101,6 +101,8 @@ class Codec:
     kind: str          # variant tag matching the Rust enum name
     k_bits: int
     v_bits: int
+    k_group: int = 0   # affine group size; 0 = not an affine-grouped codec
+    v_group: int = 0
 
 
 _SIMPLE = {
@@ -134,8 +136,40 @@ _SIMPLE = {
     "k_rotor4": ("RotorKOnly4", 4, 16),
 }
 
-# quant.rs:515 / :575 -- codecs whose decode reads the bf16 warm-TTFT mirror
-# instead of the packed store. Everything not listed here reads the mirror.
+# Codecs whose decode dispatches quantized_matmul over the packed affine store
+# (`uses_mixed_path`, quant.rs:458-460 -> `mixed_quantized_sdpa`).
+#
+# PROVEN BY GPU CAPTURE, not by the feeds_bf16_* predicate: a decode window under
+# `mixed_k8g64_v4g64` references `affine_qmv_quad_*_gs_64_b_8` (QK over packed K)
+# and `affine_qvm_split_k_*_gs_64_b_4` (PV over packed V) on both a kv_h==8 and a
+# kv_h==1 arch, while `k8v8` references a kernel set identical to `none`'s.
+# The group size in the kernel name (gs_64) distinguishes the KV codec from the
+# weight quantiser, which is gs_128/gs_32 on these snapshots.
+_READS_PACKED = {"Mixed", "RotK"}
+
+# Affine scale+bias sideband, bits per group. Inferred from the fp16 signature on
+# the captured kernel names, NOT from a dumped tuple -- if the store ever carries
+# uint8 scales this term is 2x too large. Verify before quoting a tight ratio.
+_AFFINE_SIDEBAND_BITS = 32
+
+
+def _affine_side_bytes(bits: int, group: int, elems: int) -> int:
+    """Packed affine bytes for one axis: codes plus the per-group scale+bias."""
+    if group <= 0:
+        group = 64
+    return int(elems * (bits + _AFFINE_SIDEBAND_BITS / group) / 8)
+
+
+# quant.rs:515 / :575 -- feeds_bf16_k/v_at_decode.
+#
+# CAUTION: this predicate is a SEED-ALLOCATION gate, not a decode-read flag. Its
+# only behavioural caller is `need_k_seed`/`need_v_seed` (kvcache/update.rs:2658)
+# -- "must exit_prefill materialise this buffer for SOME consumer?" -- and Mixed
+# keeps the seed for the shared-KV handoff, the fused-QK shadow, SSD hydrate and
+# speculative decode while its own decode reads packed. The doc comment at
+# quant.rs:494/:561 states the narrow reading and this script previously acted on
+# it. Membership below is therefore necessary but NOT sufficient for reads-mirror;
+# _READS_PACKED overrides it.
 _NO_BF16_K = {"IsoKOnly3", "IsoKOnly4", "RotorKOnly3", "RotorKOnly4",
               "Iso3Sym", "Iso4Sym", "Rotor3Sym", "Rotor4Sym"}
 _NO_BF16_V = {"Iso3Sym", "Iso4Sym", "Rotor3Sym", "Rotor4Sym"}
@@ -171,12 +205,12 @@ def parse_codec(s: str) -> Codec:
         return Codec(canonical, kind, kb, vb)
     m = _MIXED_RE.match(s)
     if m:
-        kb, _kg, vb, _vg = (int(x) for x in m.groups())
-        return Codec(s, "Mixed", kb, vb)
+        kb, kg, vb, vg = (int(x) for x in m.groups())
+        return Codec(s, "Mixed", kb, vb, kg, vg)
     m = _ROTK_RE.match(s)
     if m:
-        vb, _vg = (int(x) for x in m.groups())
-        return Codec(s, "RotK", 8, vb)
+        vb, vg = (int(x) for x in m.groups())
+        return Codec(s, "RotK", 8, vb, 64, vg)
     m = _ROTOR_ASYM_RE.match(s)
     if m:
         kb, vb, _vg = (int(x) for x in m.groups())
@@ -228,11 +262,31 @@ def decode_read_bytes_per_layer(c: Codec, seq: int, head_dim: int,
                                 kv_heads: int) -> int:
     """Bytes of KV a single decode step streams for one layer.
 
-    This is NOT the resident figure. A codec that keeps a warm-TTFT bf16 mirror
-    reads that mirror at decode and never touches its packed store on the hot
-    path (quant.rs:515 / :575; corroborated by docs/PERF_BASELINE.md:1003
-    "every mode reads bf16 K+V"). Only the fused symmetric codecs
-    (iso*_sym / rotor*_sym) decode straight off the packed rings.
+    This is NOT the resident figure.
+
+    Three decode-read behaviours, established by GPU capture:
+
+      * reads-packed via quantized_matmul -- Mixed / RotK (_READS_PACKED).
+      * reads-packed via a fused flash kernel -- the *_sym and K-only families
+        (the genuine feeds_bf16_* == false arms).
+      * reads-mirror -- everything else, streaming the full bf16 warm-TTFT seed.
+
+    Do NOT infer the bucket from feeds_bf16_* alone; see the caution above it.
+    docs/PERF_BASELINE.md:1003 ("every mode reads bf16 K+V") generalises a
+    three-cell table into a universal and is false for Mixed / RotK.
+
+    KNOWN GAPS, both of which make this an optimistic lower bound on divergence:
+
+      1. Gate state is not modelled. k8v4 / planar* / tsym* are classified
+         reads-mirror only because --turbo-flash, --fused-qk and
+         --planar-flash-decode all resolve OFF on this host. `--fused-qk on`
+         flips K8V8 to reads-packed and this function will not notice.
+      2. Shared-KV topology is not modelled. On those archs the producing layer
+         reads packed while consumers attend over the surfaced bf16 prefix.
+
+    rot_k_tq4v is left in the reads-mirror bucket deliberately: it reads packed
+    and then materialises full bf16 K+V per step (mixed_quant/sdpa.rs:6-7), so
+    its streamed bytes are at least the mirror figure. Its true cost is higher.
 
     The iso/rotor stored terms use the ring layout (codes/scales/norms), which
     is what a decode kernel actually streams -- see quant.rs:862-878.
@@ -241,6 +295,9 @@ def decode_read_bytes_per_layer(c: Codec, seq: int, head_dim: int,
     if c.kind == "None":
         return elems * BF16 * 2
     n_tokens = seq * kv_heads
+    if c.kind in _READS_PACKED:
+        return (_affine_side_bytes(c.k_bits, c.k_group, elems)
+                + _affine_side_bytes(c.v_bits, c.v_group, elems))
     if c.kind not in _NO_BF16_K:
         k = elems * BF16
     else:
