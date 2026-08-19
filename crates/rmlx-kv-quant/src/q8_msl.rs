@@ -101,6 +101,12 @@ fn dequant_kernel() -> Result<&'static MetalKernel> {
 /// callers already pass row-contiguous head-major `[B, kv_h, n, D]` chunks; the
 /// transposed-view materialization lives at the one site that needs it
 /// (`QuantK::append`).
+// f32-out-ok: `codes` is u32; `scales` is f32 and is read back only by MSL
+// kernels that declare it `device const float*` — `q8_dequantize_gpu` (whose
+// own output dtype is templated on the caller's), `q8_fused_qk`, and the
+// TurboFlash P1 kernel, which takes it as the K-side scale buffer. No MLX
+// op would take its operand width from them, the way `quantized_matmul` and
+// `dequantize` take theirs from an `mx.quantize` 3-tuple.
 pub fn q8_quantize_gpu(x: &Array, device: Device) -> Result<(Array, Array)> {
     let total_elems: usize = x.shape().iter().map(|&d| d as usize).product();
     if !total_elems.is_multiple_of(Q8_GROUP_SIZE) {

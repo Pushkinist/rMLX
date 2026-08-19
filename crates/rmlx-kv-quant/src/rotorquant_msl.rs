@@ -534,6 +534,13 @@ pub fn rotor_dequantize_v4_gpu(
     )
 }
 
+// f32-out-ok: `scales` and the per-group `norms` are f32, read back only by
+// the MSL kernels that declare them `device const float*`
+// (`rotor_dequantize_v{3,4}_gpu`, `rotor_flash_decode` and its symv variant,
+// `rotor_fused_qk`) and by the host readback `rotor_gpu_outputs_to_cpu`, which
+// copies their bytes into `Vec<f32>`. No MLX
+// op would take its operand width from them, the way `quantized_matmul` and
+// `dequantize` take theirs from an `mx.quantize` 3-tuple.
 fn rotor_quantize_gpu_impl(
     v_full: &Array,
     rotors: &Array,

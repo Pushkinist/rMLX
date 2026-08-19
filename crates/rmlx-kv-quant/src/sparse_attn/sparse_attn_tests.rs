@@ -249,6 +249,7 @@ fn run_parity(
         n_q_heads,
         head_dim,
         p1.n_tiles,
+        q_arr.dtype(),
         Device::Gpu,
     )
     .expect("phase2_lse_merge");

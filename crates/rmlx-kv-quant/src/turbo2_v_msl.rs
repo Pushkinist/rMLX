@@ -176,6 +176,11 @@ fn v2_dequant_kernel() -> Result<&'static MetalKernel> {
 ///   group of 32 elements, LSB-first across a 64-bit per-group stream.
 /// - `scales`: `f32` array of shape `[total_elems / 32]` — one scale per
 ///   group.
+// f32-out-ok: `codes` is u32; the f32 `scales` are read back only by
+// `turbo_dequantize_v2_gpu`, an MSL kernel that declares them
+// `device const float*` and writes its own output at the caller's dtype. No MLX
+// op would take its operand width from them, the way `quantized_matmul` and
+// `dequantize` take theirs from an `mx.quantize` 3-tuple.
 pub fn turbo_quantize_v2_gpu(x: &Array, device: Device) -> Result<(Array, Array)> {
     let shape = x.shape();
     let total_elems: usize = shape.iter().map(|&d| d as usize).product();

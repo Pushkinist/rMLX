@@ -94,6 +94,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         check-gpu-tests-ignored-fixtures \
         check-eval-lock check-eval-lock-fixtures eval-lock-stress \
         check-no-kernel-input-eval check-no-kernel-input-eval-fixtures \
+        check-kernel-dtype-contract check-kernel-dtype-contract-fixtures \
         check-metal-compiles check-metal-format
 
 help:
@@ -397,6 +398,12 @@ check-no-kernel-input-eval: ## CI gate: fail if a Metal-kernel dispatcher blocks
 check-no-kernel-input-eval-fixtures: ## CI gate: the eval gate still fires on renamed/relocated/differently-spelled evals
 	@bash scripts/check_no_kernel_input_eval_fixtures.sh
 
+check-kernel-dtype-contract: ## CI gate: fail if a Metal-kernel dispatcher returns its declared-f32 output without restoring a caller dtype (promotes the whole decode graph)
+	@bash scripts/check_kernel_dtype_contract.sh
+
+check-kernel-dtype-contract-fixtures: ## CI gate: the dtype-contract gate still fires on tuple-returned scales, false guards and marker leaks
+	@bash scripts/check_kernel_dtype_contract_fixtures.sh
+
 # METAL_STRICT=--strict turns a missing toolchain into a hard failure instead of
 # a skip. CI sets it (the macOS runner ships the toolchain, so a skip there would
 # mean the gate protected nothing); local runs leave it empty and skip.
@@ -420,6 +427,8 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_gpu_tests_ignored_fixtures.sh
 	@bash scripts/check_no_kernel_input_eval.sh
 	@bash scripts/check_no_kernel_input_eval_fixtures.sh
+	@bash scripts/check_kernel_dtype_contract.sh
+	@bash scripts/check_kernel_dtype_contract_fixtures.sh
 	@bash scripts/perf_ab_selftest.sh
 	@bash scripts/check_metal_format.sh
 	@bash scripts/check_metal_compiles.sh

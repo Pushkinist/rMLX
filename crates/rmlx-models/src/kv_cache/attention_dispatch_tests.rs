@@ -128,3 +128,89 @@ fn sparse_attn_dispatch_short_circuits_on_missing_budgets() {
     };
     assert!(sparse_attn_dispatch_if_enabled(&inputs, None, gate_open).is_none());
 }
+
+// ── dtype contract at the call site ──────────────────────────────────────────
+
+/// `sparse_attn_dispatch` must hand back the query's dtype.
+///
+/// The phase-2 merge takes its output dtype from this call site
+/// (`inputs.query.dtype()`), and nothing else checks it: the source gate scans
+/// dispatchers rather than call sites, so a `Dtype::F32` written here would
+/// pass it, and the cache-level sweep cannot reach this path at all — sparse
+/// attention is driven from this crate with a `HeadBudgets`, which no
+/// `KvCache` sweep supplies. An f32 attention output promotes the residual
+/// stream and every downstream op in the layer.
+#[test]
+#[ignore = "GPU Metal context: cargo test -p rmlx-models --lib sparse_attn_dispatch_returns -- --ignored --test-threads=1"]
+#[allow(
+    clippy::expect_used,
+    reason = "test fixture: a panic on Array build is the correct failure"
+)]
+fn sparse_attn_dispatch_returns_the_query_dtype() {
+    use rmlx_kv_quant::planarquant_msl::planar_quantize_v4_gpu;
+
+    let device = Device::Gpu;
+    let (b, kv_h, heads_per_kv, kv_seq, head_dim) = (1_i32, 1_i32, 2_i32, 128_i32, 64_i32);
+    let n_q_heads = kv_h * heads_per_kv;
+
+    // Deterministic fixture data; the numbers do not matter, the dtype does.
+    let lcg = |n: usize, mut st: u64| -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                st = st
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((st >> 32) as u32 as f32 / u32::MAX as f32) * 2.0 - 1.0
+            })
+            .collect()
+    };
+    let f32_arr = |data: &[f32], shape: &[i32]| {
+        let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+        Array::from_bytes(&bytes, shape, Dtype::F32).expect("from_bytes")
+    };
+
+    let kv_n = (b * kv_h * kv_seq * head_dim) as usize;
+    let k_arr = f32_arr(&lcg(kv_n, 0x5A5A_0001), &[b, kv_h, kv_seq, head_dim]);
+    let k_seq = k_arr
+        .transpose(&[0, 2, 1, 3], device)
+        .expect("k seq-major")
+        .contiguous(device)
+        .expect("k contiguous");
+    let (k_codes, k_scales, k_rot32) = planar_quantize_v4_gpu(&k_seq, device).expect("quantize K");
+    let v = f32_arr(&lcg(kv_n, 0x5A5A_0002), &[b, kv_h, kv_seq, head_dim])
+        .astype(Dtype::Bf16, device)
+        .expect("V bf16");
+    let query = f32_arr(
+        &lcg((b * n_q_heads * head_dim) as usize, 0x5A5A_0003),
+        &[b, n_q_heads, 1, head_dim],
+    )
+    .astype(Dtype::Bf16, device)
+    .expect("Q bf16");
+
+    let inputs = SparseAttnInputs {
+        query: &query,
+        k_codes: &k_codes,
+        k_scales: &k_scales,
+        k_rot32: &k_rot32,
+        v: &v,
+        b,
+        kv_h,
+        kv_seq,
+        head_dim,
+        heads_per_kv,
+        layer_idx: 0,
+        scale: 1.0 / (head_dim as f32).sqrt(),
+        device,
+    };
+    let budgets = make_test_head_budgets();
+
+    let out = sparse_attn_dispatch(&inputs, &budgets).expect("sparse_attn_dispatch");
+    assert_eq!(
+        out.dtype(),
+        query.dtype(),
+        "sparse attention returned {:?} for a {:?} query — an f32 attention output \
+         promotes the residual stream and the whole layer behind it",
+        out.dtype(),
+        query.dtype()
+    );
+}

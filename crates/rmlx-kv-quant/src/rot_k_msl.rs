@@ -302,9 +302,17 @@ fn rotate_kernel_for_d(d: usize) -> Result<&'static MetalKernel> {
 /// Fused FWHT + 8-bit affine quantize of K.
 ///
 /// Input `k` is `[..., D]` (any leading shape; flattened to `[N, D]` rows).
-/// Output: `(codes, scales, biases)` shaped to match what
+/// Output: `(codes, scales, biases)` shaped **and typed** to match what
 /// `mx.quantize(k_rotated, group_size=64, bits=8, mode="affine")` would
-/// produce after `rotate_last_axis(k, R)`.
+/// produce after `rotate_last_axis(k, R)` — codes `u32`, scales and biases in
+/// `k`'s own dtype.
+///
+/// The kernel computes in f32 (the FWHT butterfly needs it) and declares f32
+/// scale/bias outputs; they are cast back before returning. Leaving them f32
+/// is not a numerical detail: `mx.quantized_matmul` and `mx.dequantize` take
+/// their operand width from the scales, so f32 scales silently promote the
+/// whole decode graph of a bf16 model — the fallback path below, which is the
+/// same codec, would not.
 ///
 /// Returns `Err` if D is not in `SUPPORTED_D` -- caller must fall back to
 /// the v1 `rotate_last_axis + mx.quantize` path.
@@ -386,8 +394,12 @@ pub fn rot_k_fwht_quantize_gpu(k: &Array, device: Device) -> Result<(Array, Arra
         .collect();
 
     let codes_r = codes.reshape(&codes_shape, device)?;
-    let scales_r = scales.reshape(&sg_shape, device)?;
-    let biases_r = biases.reshape(&sg_shape, device)?;
+    // Scales and biases go back at K's dtype — `mx.quantize` produces them
+    // that way, and every consumer (`quantized_matmul`, `dequantize`) reads
+    // its operand width from them.
+    let k_dtype = k.dtype();
+    let scales_r = scales.reshape(&sg_shape, device)?.astype(k_dtype, device)?;
+    let biases_r = biases.reshape(&sg_shape, device)?.astype(k_dtype, device)?;
     Ok((codes_r, scales_r, biases_r))
 }
 

@@ -31,28 +31,41 @@ static GELU_ONE: OnceLock<Array> = OnceLock::new(); // 1.0
 static GELU_HALF: OnceLock<Array> = OnceLock::new(); // 0.5
 static GELU_INV_SQRT2: OnceLock<Array> = OnceLock::new(); // 1/sqrt(2) ≈ 0.7071067811865475
 
+/// The five cached GELU constants below are f32 arrays.
+///
+/// That is deliberate and it is contained: `gelu` and `gelu_tanh` cast their
+/// result back to the caller's dtype, so the f32 stays inside the activation.
+/// mlx-lm's reference computes the whole activation at the activation's own
+/// width (weak-typed Python floats), so f32 intermediates plus that cast is
+/// strictly closer to the exact value at the same output width.
+/// `activations_return_the_input_dtype` is what holds it.
 #[inline]
 fn gelu_coeff() -> &'static Array {
+    // f32-ok: see the note above the accessor group; the activation casts back.
     GELU_COEFF.get_or_init(|| scalar_f32(0.035_677_4_f32))
 }
 
 #[inline]
 fn gelu_alpha() -> &'static Array {
+    // f32-ok: see the note above the accessor group; the activation casts back.
     GELU_ALPHA.get_or_init(|| scalar_f32(0.797_884_6_f32))
 }
 
 #[inline]
 fn gelu_one() -> &'static Array {
+    // f32-ok: see the note above the accessor group; the activation casts back.
     GELU_ONE.get_or_init(|| scalar_f32(1.0_f32))
 }
 
 #[inline]
 fn gelu_half() -> &'static Array {
+    // f32-ok: see the note above the accessor group; the activation casts back.
     GELU_HALF.get_or_init(|| scalar_f32(0.5_f32))
 }
 
 #[inline]
 fn gelu_inv_sqrt2() -> &'static Array {
+    // f32-ok: see the note above the accessor group; the activation casts back.
     GELU_INV_SQRT2.get_or_init(|| scalar_f32(std::f32::consts::FRAC_1_SQRT_2))
 }
 
@@ -97,7 +110,15 @@ pub fn gelu_tanh(x: &Array, device: Device) -> Result<Array> {
     // Step 7: x * (1 + tanh(...))
     let x_times = multiply(x, &one_plus_tanh, device)?;
     // Step 8: 0.5 * x * (1 + tanh(...)) (cached constant)
-    multiply(gelu_half(), &x_times, device)
+    let out = multiply(gelu_half(), &x_times, device)?;
+    // Step 9: hand back the dtype the caller passed in. The cached constants
+    // above are f32 arrays, so every step from 2 on runs — and returns — at f32
+    // for a bf16 `x`. Returning that promotes the FFN's `multiply` by `up`, the
+    // down-projection's GEMV, the residual add and the rest of the layer.
+    // mlx-lm's reference uses weak-typed Python floats, which keep the
+    // activation dtype throughout; f32 intermediates plus this cast is strictly
+    // closer to the exact value than that, at the same width.
+    out.astype(x.dtype(), device)
 }
 
 /// Exact GELU: `0.5 * x * (1 + erf(x / sqrt(2)))`.
@@ -133,7 +154,11 @@ pub fn gelu(x: &Array, device: Device) -> Result<Array> {
     // Step 4: x * (1 + erf(...))
     let x_times = multiply(x, &one_plus_erf, device)?;
     // Step 5: 0.5 * x * (1 + erf(...)) (cached constant)
-    multiply(gelu_half(), &x_times, device)
+    let out = multiply(gelu_half(), &x_times, device)?;
+    // Step 6: same contract as `gelu_tanh` — the cached constants are f32, so
+    // without this a bf16 caller gets f32 back and promotes everything the
+    // activation feeds.
+    out.astype(x.dtype(), device)
 }
 
 /// SiLU activation: `x * sigmoid(x)`.

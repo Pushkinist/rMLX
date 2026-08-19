@@ -583,8 +583,12 @@ pub fn rotor_flash_decode_symv_sdpa<const BITS: u8>(
     }
     let dst_flat = p2_outs.remove(0);
 
-    // Reshape to canonical SDPA output.
-    dst_flat.reshape(&[b, n_q_heads, 1, head_dim], device)
+    // Reshape to canonical SDPA output, and restore the dtype the caller
+    // handed in: the kernels declare f32 outputs for the online-softmax
+    // accumulation, and f32 out of an attention op promotes the residual
+    // stream (and every downstream op in the layer) to f32.
+    let dst = dst_flat.reshape(&[b, n_q_heads, 1, head_dim], device)?;
+    dst.astype(query.dtype(), device)
 }
 
 #[cfg(test)]

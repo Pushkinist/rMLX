@@ -262,6 +262,13 @@ fn iso4_dequant_kernel() -> Result<&'static MetalKernel> {
 ///
 /// Returns `Error::Quant` for invalid `head_dim`.
 /// Returns `Error::Mlx` if Metal kernel compilation fails.
+// f32-out-ok: `scales` and the per-group `norms` are f32, read back only by
+// the MSL kernels that declare them `device const float*`
+// (`iso_dequantize_v4_gpu`, `iso_flash_decode` P1 and its symv variant) and by
+// the host readback `iso4_gpu_outputs_to_cpu`, which copies their bytes into
+// `Vec<f32>`. No MLX
+// op would take its operand width from them, the way `quantized_matmul` and
+// `dequantize` take theirs from an `mx.quantize` 3-tuple.
 pub fn iso_quantize_v4_gpu(
     v_full: &Array,
     head_dim: usize,

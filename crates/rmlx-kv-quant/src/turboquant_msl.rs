@@ -310,6 +310,12 @@ fn dequant_cb_buf_kernel() -> Result<&'static MetalKernel> {
 ///
 /// Returns `Error::Mlx` if the kernel fails to compile or dispatch, or
 /// `Error::Quant` if `total_elems` is not a multiple of `GROUP_SIZE`.
+// f32-out-ok: `codes` is u32; the f32 `scales` are read back only by MSL
+// kernels that declare them `device const float*` — `turbo_dequantize_v4_gpu`,
+// the `turbo_k4` fused-QK kernel, and TurboFlash P1 as its V-side scale
+// buffer. No MLX
+// op would take its operand width from them, the way `quantized_matmul` and
+// `dequantize` take theirs from an `mx.quantize` 3-tuple.
 pub fn turbo_quantize_v4_gpu(x: &Array, device: Device) -> Result<(Array, Array)> {
     // Validate total elements.
     let shape = x.shape();
@@ -387,6 +393,12 @@ pub fn turbo_quantize_v4_gpu(x: &Array, device: Device) -> Result<(Array, Array)
 /// Returns `Error::Quant` if `total_elems` is not a multiple of `GROUP_SIZE`
 /// or if the codebook GPU Array shape is not `[16]` (4-bit fixed). Returns
 /// `Error::Mlx` if the kernel fails to compile or dispatch.
+// f32-out-ok: same two buffers as `turbo_quantize_v4_gpu` (u32 `codes`, f32
+// `scales`) with the Lloyd-Max codebook supplied as an input buffer rather
+// than baked into the source; the readers are the same MSL kernels, which
+// declare the scales `device const float*`. No MLX
+// op would take its operand width from them, the way `quantized_matmul` and
+// `dequantize` take theirs from an `mx.quantize` 3-tuple.
 pub fn turbo_quantize_v4_codebook_buf_gpu(
     x: &Array,
     codebook_gpu: &Array,

@@ -90,7 +90,7 @@ fn planar_v4_msl_roundtrip_8k_bonsai_shape() {
     let arr = make_f32_array(&data, &shape);
 
     let (codes, scales, rot32) = planar_quantize_v4_gpu(&arr, Device::Gpu).expect("GPU quantize");
-    let recon = planar_dequantize_v4_gpu(&codes, &scales, &rot32, &shape, Device::Gpu)
+    let recon = planar_dequantize_v4_gpu(&codes, &scales, &rot32, &shape, Dtype::F32, Device::Gpu)
         .expect("GPU dequantize");
 
     let recon_vec = array_to_f32(&recon);

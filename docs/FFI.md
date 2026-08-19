@@ -707,6 +707,54 @@ fixture tree per evasion (UFCS `Array::eval(&x)`, an eval moved into a shared
 `_common.rs` helper, a dispatcher relocated into a sub-directory, a marker
 leaking onto a following loop) pinned to the exit code the gate must produce.
 
+### A kernel returns the dtype it was given
+
+An MSL dispatcher declares its output dtype explicitly
+(`invoke.add_output_shape(&[n], Dtype::F32)`). f32 is usually right *inside*
+the kernel — online softmax, FWHT butterflies and log-sum-exp merges all
+accumulate there. Returning it is not: MLX promotes any binary op between that
+f32 result and a bf16 tensor, and an attention output feeds the residual add,
+so the promotion propagates through the next layer's RMSNorm, its weight GEMV,
+its elementwise ops and the sampler. The activations double in width and the
+quantized weights' scales are converted alongside them. Nothing errors.
+Measured on Bonsai-8B `k8v4` at 8k with one `.astype(queries.dtype(), …)` as
+the only difference, the GPU capture's kernel list loses nine entries:
+`affine_qmv_fast_float_*` and `affine_qmv_float_*` (weight GEMV), `rmsfloat32`,
+`vv_Addfloat32`, `vs_Multiplyfloat32`, `argmax_float32`,
+`sdpa_vector_2pass_2_float_128`, `vn_copybfloat16float32`, and the f32
+instantiation of the fused elementwise JIT kernel — each replaced by its bf16
+twin.
+
+The same applies to quantization *parameters*. `mx.quantized_matmul` and
+`mx.dequantize` take their operand width from the scales and biases they are
+handed, so a fused quantize kernel returning f32 scales where `mx.quantize`
+would have returned bf16 ones promotes the decode graph just as effectively,
+with no array that looks like "the output". `rot_k_fwht_quantize_gpu` did
+exactly that, which also made the fused and non-fused arms of one codec differ
+in dtype.
+
+Two checks hold the rule, and neither subsumes the other:
+
+* `make check-kernel-dtype-contract` (in `make ci`) scans every file
+  constructing a `MetalKernelInvoke` under the three crates that own `.metal`
+  kernels (`scripts/metal_dirs.sh`) — not one crate, which is half of why the
+  `scalar_f32` gate beside it could not see this — and requires each function
+  that declares an `add_output_shape(..., Dtype::F32)`
+  either to cast to a *derived* dtype (`.astype(x.dtype(), …)`,
+  `.astype(out_dtype, …)` — a literal `Dtype::F32` / `Dtype::Bf16` target is
+  not a guard) or to carry a `// f32-out-ok: <reason>` marker naming the
+  consumer that cannot promote. Codec buffers read back only by our own MSL
+  kernels are the legitimate case; anything reaching an MLX op is not.
+  `make check-kernel-dtype-contract-fixtures` is its recall test, asserting the
+  function each failing fixture must name, not just the exit code.
+* `crates/rmlx-kv-quant/tests/kv_decode_dtype_contract.rs` (GPU, `#[ignore]`)
+  sweeps every `ALL_KV_QUANTS` codec through a real decode step under the
+  default policy and with every fused kernel on, and asserts the attention
+  output comes back in the query's dtype. It catches the promotion wherever it
+  happens — including through a tuple of scales, which no source-shape gate can
+  see — and asserts a non-zero dispatch delta per kernel family so a codec that
+  quietly fell back to its bf16 path cannot pass vacuously.
+
 ### Data readback
 
 `Array::to_bytes()` forces evaluation (`eval()`) before reading, then calls

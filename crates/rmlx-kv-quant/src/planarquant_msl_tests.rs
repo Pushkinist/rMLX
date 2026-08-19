@@ -54,7 +54,7 @@ fn planar_v4_msl_roundtrip_within_tolerance() {
     let (codes, scales, rot32) =
         planar_quantize_v4_gpu(&arr, Device::Gpu).expect("GPU quantize failed");
 
-    let recon = planar_dequantize_v4_gpu(&codes, &scales, &rot32, &shape, Device::Gpu)
+    let recon = planar_dequantize_v4_gpu(&codes, &scales, &rot32, &shape, Dtype::F32, Device::Gpu)
         .expect("GPU dequantize failed");
 
     let recon_vec = array_to_f32(&recon);
@@ -93,7 +93,7 @@ fn planar_v3_msl_roundtrip_within_tolerance() {
     let (codes, scales, rot32) =
         planar_quantize_v3_gpu(&arr, Device::Gpu).expect("V3 GPU quantize failed");
 
-    let recon = planar_dequantize_v3_gpu(&codes, &scales, &rot32, &shape, Device::Gpu)
+    let recon = planar_dequantize_v3_gpu(&codes, &scales, &rot32, &shape, Dtype::F32, Device::Gpu)
         .expect("V3 GPU dequantize failed");
 
     let recon_vec = array_to_f32(&recon);
@@ -135,8 +135,9 @@ fn planar_v3_msl_matches_cpu_within_eps() {
             let arr = make_f32_array(input, &shape);
             let (codes, scales, rot32) =
                 planar_quantize_v3_gpu(&arr, Device::Gpu).expect("V3 GPU quantize failed");
-            let gpu_arr = planar_dequantize_v3_gpu(&codes, &scales, &rot32, &shape, Device::Gpu)
-                .expect("V3 GPU dequantize failed");
+            let gpu_arr =
+                planar_dequantize_v3_gpu(&codes, &scales, &rot32, &shape, Dtype::F32, Device::Gpu)
+                    .expect("V3 GPU dequantize failed");
             array_to_f32(&gpu_arr)
         },
         &data,
@@ -169,8 +170,9 @@ fn planar_v4_msl_matches_cpu_within_eps() {
             let arr = make_f32_array(input, &shape);
             let (codes, scales, rot32) =
                 planar_quantize_v4_gpu(&arr, Device::Gpu).expect("GPU quantize failed");
-            let gpu_arr = planar_dequantize_v4_gpu(&codes, &scales, &rot32, &shape, Device::Gpu)
-                .expect("GPU dequantize failed");
+            let gpu_arr =
+                planar_dequantize_v4_gpu(&codes, &scales, &rot32, &shape, Dtype::F32, Device::Gpu)
+                    .expect("GPU dequantize failed");
             array_to_f32(&gpu_arr)
         },
         &data,
