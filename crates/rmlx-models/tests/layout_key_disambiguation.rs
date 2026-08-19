@@ -93,6 +93,90 @@ fn two_layout_keys_share_namespace_without_collision() {
     assert_ne!(row_a.byte_size, row_b.byte_size);
 }
 
+/// A block spilled under the **previous** boundary-promotion policy must not
+/// hydrate into a request running the current one.
+///
+/// `--kv-quant none` used to be built as a bf16/K8V8 mixture: the first 2 and
+/// last 8 layers were promoted to a packed q8_0 store. It is uniform bf16 now.
+/// Both are "none" as far as the requested codec goes, so the base codec alone
+/// cannot tell the two layouts apart — the layout key has to fold the per-layer
+/// vector, which is what this test pins against a real on-disk index.
+///
+/// Vacuity guard: the same lookup under the request's own key must hit, so a
+/// lookup that missed for any other reason (wrong hash, empty table) fails the
+/// test rather than passing it.
+#[test]
+fn a_block_written_under_the_old_mixture_does_not_hydrate_into_a_none_request() {
+    use rmlx_kv_quant::KvQuant;
+    use rmlx_kv_ssd::compute_layout_key;
+    use rmlx_models::kv_cache::{kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N};
+
+    let n_layers = 36usize; // Ternary-Bonsai-8B: every layer full-attention.
+    let (arch, kv_heads, head_dim) = ("Qwen3ForCausalLM", 8usize, 128usize);
+
+    // What a `--kv-quant none` request builds today.
+    let current: Vec<KvQuant> = (0..n_layers)
+        .map(|i| {
+            kv_quant_for_layer(
+                i,
+                n_layers,
+                KvQuant::None,
+                LAYER_ADAPTIVE_TAIL_N,
+                LAYER_ADAPTIVE_HEAD_N,
+            )
+        })
+        .collect();
+    // What it used to build: boundary layers promoted to K8V8.
+    let legacy: Vec<KvQuant> = (0..n_layers)
+        .map(|i| {
+            if i < LAYER_ADAPTIVE_HEAD_N || i >= n_layers - LAYER_ADAPTIVE_TAIL_N {
+                KvQuant::K8V8
+            } else {
+                KvQuant::None
+            }
+        })
+        .collect();
+    assert_ne!(
+        current, legacy,
+        "fixture is vacuous: the current policy still produces the legacy mixture"
+    );
+
+    let key_current = compute_layout_key(arch, &current, kv_heads, head_dim, KvQuant::None);
+    let key_legacy = compute_layout_key(arch, &legacy, kv_heads, head_dim, KvQuant::None);
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let idx = SsdKvIndex::open_at(&tmp.path().join("index.db")).unwrap();
+    let hash = "fedcba9876543210".to_string();
+    idx.record(
+        &hash,
+        key_legacy,
+        &tmp.path().join("legacy.kvb"),
+        "Qwen3ForCausalLM/bonsai-8b",
+        "none",
+        4096,
+    )
+    .unwrap();
+
+    assert!(
+        idx.lookup(&hash, key_current).unwrap().is_none(),
+        "a block spilled under the old bf16/K8V8 mixture must be a MISS for a \
+         request whose layers are uniform bf16"
+    );
+    idx.record(
+        &hash,
+        key_current,
+        &tmp.path().join("current.kvb"),
+        "Qwen3ForCausalLM/bonsai-8b",
+        "none",
+        4096,
+    )
+    .unwrap();
+    assert!(
+        idx.lookup(&hash, key_current).unwrap().is_some(),
+        "the request must still hit its OWN block — otherwise the miss above proves nothing"
+    );
+}
+
 /// End-to-end variant — gated by `RMLX_KV_TEST_MODEL` AND `--ignored`. Lives
 /// here so the test binary is identifiable in `cargo test --test` output.
 ///

@@ -248,11 +248,14 @@ all, is never touched.
 
 ## layout_key Salt
 
-`compute_layout_key` produces a stable `u64` from the five-tuple
-`(arch, n_layers, n_kv_heads, head_dim, kv_quant)`:
+`compute_layout_key` produces a stable `u64` from
+`(arch, layer_quants, n_kv_heads, head_dim, kv_quant)`, where `layer_quants` is
+the **effective per-layer codec vector** — one entry per decoder layer, exactly
+what the caller builds its `KvCache`s from — and `n_layers` is its length:
 
 ```text
 input  = arch.as_bytes() + ":<n_layers>:<n_kv_heads>:<head_dim>:<kv_quant>"
+                         + ":<layer_quants[0]>" + … + ":<layer_quants[n-1]>"
 h      = FNV_OFFSET  (0xcbf29ce484222325)
 for each byte b in input:
     h ^= u64(b)
@@ -260,10 +263,32 @@ for each byte b in input:
 layout_key = h
 ```
 
+The vector is folded, and not just the requested `kv_quant`, because the
+per-layer assignment is a **policy** decision — `kv_quant_for_layer` promotes
+boundary layers of a quantizing base codec to `K8V8` — and that policy can
+change between builds at an unchanged base codec and unchanged geometry. With
+only the base folded, a block spilled under one mixture hydrates into a request
+running another: each layer deserializes from its own storage tag, so nothing
+errors, and the request silently runs per-layer codecs it did not ask for. The
+vector makes such a block a miss. `rmlx-kv-ssd` does not compute the mixture
+(the policy lives above it, in `rmlx_models::kv_cache`); the caller supplies it
+in `rmlx_models::ssd_tier::attach_at_load`, from the same `kv_quant_for_layer`
+call its cache construction uses. `prepare_attach` refuses to attach on an
+empty vector rather than key a zero-length layout.
+
 The key is deterministic across runs and distinct with overwhelming probability
 for every distinct input tuple. It is **not** weight-dependent: reloading the
-same architecture at the same `kv_quant` from a different snapshot yields the
-same `layout_key` and shares the cache, which is correct.
+same architecture at the same layout from a different snapshot yields the same
+`layout_key` and shares the cache, which is correct.
+
+> **One-time invalidation (the `none` boundary-promotion exemption).**
+> `--kv-quant none` used to be built as a bf16/K8V8 mixture and is uniform bf16
+> now, so its vector — and therefore its `layout_key` — moved. Blocks spilled
+> under the old mixture become unreachable and age out through LRU: one cold
+> pass for `none` users with the tier enabled, no error and no action. This is
+> the invalidation the fold exists to produce; before it, those blocks would
+> have been served to a `none` request and quietly restored the promotion for
+> it.
 
 `arch` is the **resolved** class. It was previously the declared
 `architectures[0]`, which could name a model that was not built — the salt is
@@ -282,7 +307,7 @@ supposed to describe the layout, and a declaration is not evidence of one.
 > model-side name that keying off the resolved class exists to remove.
 
 > **One-time invalidation (iso4 V).** `layout_key` is derived from
-> `(arch, n_layers, n_kv_heads, head_dim, kv_quant)` and the per-layer block
+> `(arch, layer_quants, n_kv_heads, head_dim, kv_quant)` and the per-layer block
 > header carries only `{tag, max_seq, shape}`. Neither moves when the byte
 > *orientation* inside a block changes, so a layout change of that kind has to
 > move the **layer tag** or it is invisible on disk. The iso4 V GPU append stored

@@ -14,12 +14,21 @@
 use rmlx_kv_quant::KvQuant;
 use rmlx_mlx::Device;
 
+use crate::kv_cache::{kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N};
+
 /// At model-load, run startup maintenance (prune + evict-to-budget) for the
 /// namespace and attach the spiller + hydrator onto the right per-arch
 /// `PROMPT_CACHE`. No-op when the tier is OFF.
 ///
-/// `(n_layers, n_kv_heads, head_dim)` are taken from the loaded model's
-/// config and folded into the `layout_key` that the spiller/hydrator carry.
+/// `(n_layers, n_kv_heads, head_dim)` are taken from the loaded model's config.
+/// `n_layers` is expanded here into the **effective per-layer codec vector**
+/// via [`kv_quant_for_layer`] — the same call every arch's cache construction
+/// makes, with the same `LAYER_ADAPTIVE_*` constants — and that vector, not the
+/// base codec alone, is what [`rmlx_kv_ssd::prepare_attach`] folds into the
+/// `layout_key` the spiller/hydrator carry. The boundary-layer promotion is a
+/// policy that can change between builds; a block written under one mixture
+/// must not hydrate into a request running another, and the key is the only
+/// thing standing between them.
 ///
 /// `arch` must be the **resolved** class (`Architecture::arch_class()`), not
 /// the checkpoint's declared `architectures[0]`: it both selects the per-arch
@@ -47,10 +56,32 @@ pub fn attach_at_load(
     head_dim: usize,
     device: Device,
 ) {
+    let layer_quants: Vec<KvQuant> = kv_quant
+        .map(|base| {
+            (0..n_layers)
+                .map(|i| {
+                    kv_quant_for_layer(
+                        i,
+                        n_layers,
+                        base,
+                        LAYER_ADAPTIVE_TAIL_N,
+                        LAYER_ADAPTIVE_HEAD_N,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let Some(info) = rmlx_kv_ssd::prepare_attach(
-        arch, model_id, kv_quant, n_layers, n_kv_heads, head_dim, device,
+        arch,
+        model_id,
+        kv_quant,
+        &layer_quants,
+        n_kv_heads,
+        head_dim,
+        device,
     ) else {
-        return; // tier OFF or kv_quant unresolved — already logged inside prepare_attach
+        return; // tier OFF, kv_quant unresolved, or empty layout — logged inside prepare_attach
     };
 
     match arch {

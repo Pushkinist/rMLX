@@ -19,7 +19,8 @@
 //! ## : layout-key disambiguation
 //!
 //! Each loaded model derives a stable `layout_key` over
-//! `(arch, n_layers, n_kv_heads, head_dim, kv_quant)`. The key is propagated
+//! `(arch, per-layer codec vector, n_kv_heads, head_dim, kv_quant)`. The key is
+//! propagated
 //! into the per-arch prompt cache, the spiller (`SpillJob::layout_key` →
 //! `kv_blocks.layout_key`), and the hydrator (salts the chained-hash
 //! digest stream and pins the composite `(hash, layout_key)` PK lookup). Two
@@ -203,25 +204,47 @@ fn namespace_for<'a>(cfg: &'a SsdTierConfig, model_id: &'a str) -> Cow<'a, str> 
 }
 
 /// u64 FNV-1a over the concatenated bytes of
-/// `arch.as_str() + format!(":{n_layers}:{n_kv_heads}:{head_dim}:{kv_quant}")`.
+/// `arch.as_str() + format!(":{n_layers}:{n_kv_heads}:{head_dim}:{kv_quant}")`
+/// followed by `format!(":{q}")` for **every entry of `layer_quants`**.
+///
+/// `layer_quants` is the effective per-layer codec vector — what the caller
+/// will actually build its `KvCache`s from, one entry per decoder layer — and
+/// `n_layers` above is its length. Folding the whole vector rather than the
+/// requested base codec alone is what makes the key describe the bytes on
+/// disk: the per-layer assignment is a **policy** decision (the boundary-layer
+/// promotion in `kv_quant_for_layer`), and two builds of the same binary
+/// version at the same base codec can lay a namespace out differently if that
+/// policy changes between them. A key that folded only the base would let a
+/// block written under the old mixture hydrate into a request running the new
+/// one — self-consistent on read, because each layer's storage tag is
+/// authoritative, but it silently reinstates the old per-layer codecs for that
+/// request. Folding the vector makes such a block a miss instead.
 ///
 /// The exact formula is committed to in the documented form: every distinct
-/// `(arch, n_layers, n_kv_heads, head_dim, kv_quant)` tuple yields a distinct
-/// u64 with overwhelming probability, and the function is deterministic across
-/// runs (FNV with the standard offset basis + prime). `kv_quant.to_string()`
-/// is taken from the existing stable Display impl on [`KvQuant`].
+/// `(arch, layer_quants, n_kv_heads, head_dim, kv_quant)` tuple yields a
+/// distinct u64 with overwhelming probability, and the function is
+/// deterministic across runs (FNV with the standard offset basis + prime).
+/// `kv_quant.to_string()` is taken from the existing stable Display impl on
+/// [`KvQuant`].
 pub fn compute_layout_key(
     arch: &str,
-    n_layers: usize,
+    layer_quants: &[KvQuant],
     n_kv_heads: usize,
     head_dim: usize,
     kv_quant: KvQuant,
 ) -> u64 {
-    let suffix = format!(":{n_layers}:{n_kv_heads}:{head_dim}:{kv_quant}");
+    let n_layers = layer_quants.len();
     let mut h: u64 = FNV_OFFSET;
-    for byte in arch.as_bytes().iter().chain(suffix.as_bytes().iter()) {
+    let head = format!(":{n_layers}:{n_kv_heads}:{head_dim}:{kv_quant}");
+    for byte in arch.as_bytes().iter().chain(head.as_bytes().iter()) {
         h ^= u64::from(*byte);
         h = h.wrapping_mul(FNV_PRIME);
+    }
+    for q in layer_quants {
+        for byte in format!(":{q}").as_bytes() {
+            h ^= u64::from(*byte);
+            h = h.wrapping_mul(FNV_PRIME);
+        }
     }
     h
 }
@@ -239,7 +262,8 @@ pub fn compute_layout_key(
 pub struct AttachInfo {
     /// Resolved namespace under `<RMLX_HOME>/cache/kv/<namespace>/`.
     pub namespace: String,
-    /// Stable u64 over `(arch, n_layers, n_kv_heads, head_dim, kv_quant)`.
+    /// Stable u64 over
+    /// `(arch, per-layer codec vector, n_kv_heads, head_dim, kv_quant)`.
     pub layout_key: u64,
     /// KV quant in effect for this snapshot.
     pub kv_quant: KvQuant,
@@ -250,13 +274,20 @@ pub struct AttachInfo {
 /// Run startup maintenance for `model_id` under the active SSD-tier config and
 /// return the [`AttachInfo`] the per-arch `attach_ssd_tier` call needs.
 ///
-/// `(n_layers, n_kv_heads, head_dim)` are taken from the loaded model's
-/// config and folded into the `layout_key`.
+/// `(layer_quants, n_kv_heads, head_dim)` describe the layout the caller is
+/// about to build — the per-layer codec vector plus the shape from the loaded
+/// model's config — and are folded into the `layout_key` by
+/// [`compute_layout_key`]. `layer_quants` must be the vector the caller's own
+/// cache construction uses (`kv_quant_for_layer` over the resolved base
+/// codec), one entry per decoder layer; the per-layer *policy* lives above
+/// this crate, so it is supplied rather than recomputed here.
 ///
 /// Returns:
 /// - `None` when the SSD tier is OFF (no config installed, or both budgets
-///   zero) or when `kv_quant` is `None` (unresolved at the call site — logged
-///   as a `warn!`).
+///   zero), when `kv_quant` is `None` (unresolved at the call site — logged as
+///   a `warn!`), or when `layer_quants` is empty while a codec *was* resolved
+///   (a caller that dropped the vector — folding a zero-length layout would
+///   make distinct layouts share a key, which is the whole point of the fold).
 /// - `Some(info)` otherwise; the caller then dispatches to the per-arch
 ///   `attach_ssd_tier` with the contained `(namespace, kv_quant, layout_key,
 ///   device)`.
@@ -268,32 +299,26 @@ pub fn prepare_attach(
     arch: &str,
     model_id: &str,
     kv_quant: Option<KvQuant>,
-    n_layers: usize,
+    layer_quants: &[KvQuant],
     n_kv_heads: usize,
     head_dim: usize,
     device: Device,
 ) -> Option<AttachInfo> {
     let cfg = active()?; // tier OFF — true no-op, spill/hydrate hooks never installed
-    let Some(kv_quant) = kv_quant else {
-        tracing::warn!(
-            arch,
-            model_id,
-            "SSD tier requested but kv_quant unresolved; skipping attach"
-        );
-        return None;
-    };
+    let kv_quant = keyable_layout(arch, model_id, kv_quant, layer_quants)?;
     let namespace = namespace_for(&cfg, model_id);
 
     // derive + log layout key BEFORE opening the index so the operator
     // can correlate per-namespace rows with the active layout in the same run.
-    let layout_key = compute_layout_key(arch, n_layers, n_kv_heads, head_dim, kv_quant);
+    let layout_key = compute_layout_key(arch, layer_quants, n_kv_heads, head_dim, kv_quant);
     tracing::info!(
         event = "ssd_layout_key_resolved",
         arch,
-        n_layers,
+        n_layers = layer_quants.len(),
         n_kv_heads,
         head_dim,
         kv_quant = %kv_quant,
+        promoted_layers = layer_quants.iter().filter(|&&q| q != kv_quant).count(),
         layout_key = format!("{:016x}", layout_key),
         "layout_key resolved for SSD tier"
     );
@@ -322,6 +347,43 @@ pub fn prepare_attach(
         kv_quant,
         device,
     })
+}
+
+/// The resolved base codec, when the caller described a layout that can be
+/// keyed — otherwise `None` plus one `warn!` naming which half was missing.
+///
+/// Two ways an attach arrives unkeyable, and both must refuse rather than
+/// proceed with a degenerate key:
+/// - **No resolved codec.** Nothing to record on the rows or to check a block
+///   header against.
+/// - **No per-layer vector.** [`compute_layout_key`] folds that vector; a
+///   zero-length one collapses distinct layouts onto the same u64, which is
+///   what the fold exists to prevent.
+fn keyable_layout(
+    arch: &str,
+    model_id: &str,
+    kv_quant: Option<KvQuant>,
+    layer_quants: &[KvQuant],
+) -> Option<KvQuant> {
+    let Some(kv_quant) = kv_quant else {
+        tracing::warn!(
+            arch,
+            model_id,
+            "SSD tier requested but kv_quant unresolved; skipping attach"
+        );
+        return None;
+    };
+    if layer_quants.is_empty() {
+        tracing::warn!(
+            arch,
+            model_id,
+            kv_quant = %kv_quant,
+            "SSD tier requested with an empty per-layer codec vector; skipping attach \
+             (a zero-length layout cannot be told apart from any other)"
+        );
+        return None;
+    }
+    Some(kv_quant)
 }
 
 /// Prune missing blocks from an already-opened namespace index, then evict LRU
