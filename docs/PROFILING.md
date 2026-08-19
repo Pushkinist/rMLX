@@ -683,3 +683,80 @@ Notes:
 | Ad-hoc branch counts | `eprintln!` + `counts` crate |
 | Process memory snapshot | `rmlx_core::mach_mem::read_proc_mem()` — see §9 |
 | Prefill-chunk override | `RMLX_PREFILL_CHUNK_<ARCH>=<n>` — see §10 |
+
+---
+
+## Xcode GPU counter replay — the only per-kernel counter path on this host
+
+**This step needs a human.** It is a GUI workflow: Xcode's Metal Debugger cannot
+be driven headlessly here, the `xcode` MCP bridge never answers `tools/list`, and
+accessibility automation can select a navigator row but cannot make Xcode load
+its editor. An agent can capture the bundle, open it, and read the exported CSV —
+a person has to click Profile. **Ask the user; do not report the counters as
+unavailable.**
+
+Headless Metal System Trace is *not* a substitute: it exports zero rows for
+`rmlx` on this host, and per-dispatch counter sampling is unsupported on M5 Max.
+This GUI path is what remains.
+
+### Capture
+
+```bash
+bash scripts/gputrace_preflight.sh          # Xcode selected, developer mode, get-task-allow
+bash scripts/gpu_capture.sh --kv-quant <codec> --model <snapshot> \
+     --prompt-tokens 8192 --skip 32 --steps 8 --keep-all
+```
+
+Keep `--steps >= 8`: a shorter window's kernel set is a strict subset of an
+8-step one. Pass `--keep-all` when a sibling bundle must survive — the default
+prune is oldest-first and has already deleted a comparison arm once. Bundles run
+7-14 GB each.
+
+### Replay (the human step)
+
+1. `open -a Xcode <bundle>` — a `.gputrace` opens as **Debugging GPU Workload**,
+   not a project. If no window appears, check the other displays and Spaces:
+   `osascript -e 'tell application "System Events" to tell process "Xcode" to get position of every window'`.
+2. Navigator: **Performance** (4th row). It reads *"Performance data not
+   available"* with a **Profile...** button.
+3. In the Profile sheet set **Performance State: Maximum** and **GPU Execution
+   Mode: Serial**, then Profile.
+   * *Maximum* because the roofline (614 GB/s on M5 Max) and every recorded slope
+     assume full clocks; a reduced P-state deflates the bandwidth fraction and can
+     make an issue-bound kernel look memory-bound.
+   * *Serial* because per-dispatch attribution is the goal. Xcode warns *"Adds
+     precision to the data report, but it doesn't represent runtime
+     performance"* — that is the intended trade.
+4. **Both arms of a comparison must use identical settings**, or the comparison
+   is void.
+
+### Read
+
+* **Shaders** tab — cost %, `# SIMD Groups`, `# Allocated Registers`,
+  `Spilled Bytes` per pipeline. Kernel dtype is visible in the name suffix
+  (`_float_` / `float32` vs `_bfloat16_t` / `bfloat16`), which is how a dtype
+  promotion shows up.
+* **Counters** tab — export CSV (one row per encoder, ~600 rows, 22 limiter
+  columns). The decisive columns:
+
+| column | reads |
+|---|---|
+| `Integer and Conditional Limiter` | integer/address/control issue pressure |
+| `Last Level Cache Limiter` | memory-bound |
+| `Instruction Throughput Limiter` | issue-bound |
+| `Kernel Occupancy` | resident threadgroups; falls as allocated registers rise |
+| `Device Memory Bandwidth` | achieved GB/s — against 614 on M5 Max |
+
+Group encoders by their own top limiter; dispatch counts identify the kernel
+(e.g. 26 codec layers x 8 steps = 208 encoders). Store exports under
+`.rmlx/analysis/<probe>/xcode/`.
+
+### What is trustworthy under Serial
+
+Limiters, occupancy, register counts, SIMD-group counts, kernel identity and
+dtype are the precise half. Absolute wall-clock and absolute bandwidth are **not**
+production numbers; the ON/OFF *ratio* is what carries. Never compare a profiled
+millisecond against a `perf_ab.sh` millisecond.
+
+Xcode may report `Sampled Cores 12 / 40`. Relative shares hold; absolute
+extrapolation carries that uncertainty.
