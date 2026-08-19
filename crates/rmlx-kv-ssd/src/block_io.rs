@@ -318,26 +318,55 @@ pub fn write_caches(
     )
 }
 
-/// Collect the live bf16 K/V buffers of every [`KvStorage::None`] layer, so the
-/// spill writer can persist the unquantised prefix that lives off the storage
-/// buffer (on `KvCache::decode_fp16_{k,v}`). Element `i` is `Some` only for a
-/// `None`-storage layer that actually holds a filled bf16 pair; all other
-/// layers (quantised storage, or an unfilled / SWA-hydrated `None`) are `None`
-/// and spill via their existing geometry-only path.
+/// Collect the live bf16 K/V mirror of every layer that spills geometry-only,
+/// so the writer can persist the unquantised prefix that lives off the storage
+/// buffer (on `KvCache::decode_fp16_{k,v}`).
+///
+/// Element `i` is `Some` only for a layer whose storage holds no packed payload
+/// ([`KvStorage::geometry_only_max_seq`]) and that actually holds a filled bf16
+/// pair. That covers `KvQuant::None`, whose K/V has always lived there, and the
+/// bf16-mirror codecs, whose `exit_prefill` builds no packed store at all —
+/// without this the tier would spill those layers as empty geometry and the
+/// hydrate would come back holding nothing. Layers with a real packed payload,
+/// and rotating (SWA) windows with no mirror to give, are `None` here and spill
+/// through their own path.
+///
+/// # Why this does no tensor work
+///
+/// It runs on the spill **drain** thread, which has no Metal stream: every
+/// array it hands on must already be materialised, in row-major order, at
+/// exactly the length it should be persisted at. `exit_prefill` guarantees the
+/// first two (it stores the seed through `Array::contiguous`). The third is
+/// checked rather than fixed: the writer reads the layer's `seq_len` off the
+/// buffer's own `shape[2]`, so a mirror the decode loop has grown to the
+/// `max_seq` ceiling would persist its zeroed tail as live KV and hydrate a
+/// cache whose offset sits past its real content. Slicing it here would need a
+/// device. Such a layer is refused instead — it spills as geometry-only and
+/// re-prefills on reuse, which is lossy but never wrong.
 fn none_bf16_payloads(kv_caches: &[KvCache]) -> Result<Vec<NoneBf16Seed>> {
     kv_caches
         .iter()
         .map(|c| {
-            if matches!(c.storage(), KvStorage::None { .. }) {
-                match c.decode_fp16_kv() {
-                    // Ref-count clone only (mlx-c is COW); host materialisation
-                    // happens later in `OwnedTensor::from_array`.
-                    Some((k, v)) => Ok(Some((k.try_clone()?, v.try_clone()?))),
-                    None => Ok(None),
-                }
-            } else {
-                Ok(None)
+            if c.storage().geometry_only_max_seq().is_none() {
+                return Ok(None);
             }
+            let Some((k, v)) = c.decode_fp16_kv() else {
+                return Ok(None);
+            };
+            let buf_seq = k.shape().get(2).copied().unwrap_or(0);
+            if c.offset() > 0 && c.offset() < buf_seq {
+                tracing::warn!(
+                    layer = c.layer_idx(),
+                    offset = c.offset(),
+                    buf_seq,
+                    "kv-spill: bf16 mirror is longer than its filled length — spilling \
+                     this layer as geometry-only rather than persisting its zeroed tail"
+                );
+                return Ok(None);
+            }
+            // Ref-count clone only (mlx-c is COW); host materialisation happens
+            // later in `OwnedTensor::from_array`.
+            Ok(Some((k.try_clone()?, v.try_clone()?)))
         })
         .collect()
 }
@@ -585,107 +614,36 @@ fn write_layer(
     device: Device,
     out: &mut Vec<(String, OwnedTensor)>,
 ) -> Result<(String, i32)> {
-    // A K8V4/K8V8/Planar layer whose `k` side has no consolidated quantized
-    // payload (`k: None`) is a rotating SWA layer: its KV lives in the bf16 ring
-    // buffer off-`storage`, not in the quantized `QuantK`. Per the design
-    // (see `KvCache::from_storage` docs) such layers "are not spilled" and are
-    // recorded as geometry-only `None` — the writer would otherwise stamp a
-    // `k8v8` geom with no codes/scales tensors, which the reader then demands
-    // and fails on (`missing tensor 'lN.k.codes'`). Round-trips to a `None`
-    // storage on hydrate; the SWA window is re-established on reuse.
-    if let KvStorage::K8V4 { k, max_seq, .. }
-    | KvStorage::K8V8 { k, max_seq, .. }
-    | KvStorage::Planar { k, max_seq, .. }
-    | KvStorage::K8VTurbo3 { k, max_seq, .. }
-    | KvStorage::K8VTurbo3Tcq { k, max_seq, .. }
-    | KvStorage::K8VTurbo2Tcq { k, max_seq, .. }
-    | KvStorage::K8VTurbo2 { k, max_seq, .. }
-    | KvStorage::IsoV3 { k, max_seq, .. }
-    | KvStorage::IsoV4 { k, max_seq, .. }
-    | KvStorage::RotorV3 { k, max_seq, .. }
-    | KvStorage::RotorV4 { k, max_seq, .. } = storage
-    {
-        if k.is_none() {
+    // A layer with no packed payload has only its geometry to persist. Three
+    // cases arrive here and the treatment is the same for all of them: a
+    // rotating SWA layer (its KV lives in the bf16 ring, which is not
+    // serialisable), a codec whose decode reads only the bf16 mirror so
+    // `exit_prefill` built no store, and `KvStorage::None`, which never had
+    // one. Stamping a codec geometry with no codes/scales tensors behind it
+    // would make the reader fail on `missing tensor 'lN.k.codes'`.
+    //
+    // When the cache handed us its live bf16 mirror, that mirror IS the layer's
+    // KV, so persist it under `l{idx}.{k,v}.bf16` and tag the layer
+    // "none_bf16"; hydrate re-seeds the decode buffers from it and the
+    // reconstructed cache decodes off exactly the bytes the spilling one did.
+    // With no mirror (a rotating window, an unfilled cache) the layer falls
+    // back to geometry-only "none" and the window is re-established on reuse.
+    if let Some(max_seq) = storage.geometry_only_max_seq() {
+        let Some((k, v)) = none_bf16 else {
             return Ok((format!("{{\"tag\":\"none\",\"max_seq\":{max_seq}}}"), 0));
-        }
-    }
-    // TurboSym3 — K is `QuantKTurbo3` (different type from `QuantK` and
-    // `QuantKTurbo4`). Same SWA round-trip semantics: when k is None, the layer is
-    // a rotating SWA window — record as geometry-only None.
-    if let KvStorage::TurboSym3 { k, max_seq, .. } = storage {
-        if k.is_none() {
-            return Ok((format!("{{\"tag\":\"none\",\"max_seq\":{max_seq}}}"), 0));
-        }
-    }
-    // TurboSym4 — K is `QuantKTurbo4` (different type from `QuantK`) so it
-    // cannot share the or-pattern above. Same SWA round-trip semantics.
-    if let KvStorage::TurboSym4 { k, max_seq, .. } = storage {
-        if k.is_none() {
-            return Ok((format!("{{\"tag\":\"none\",\"max_seq\":{max_seq}}}"), 0));
-        }
-    }
-    // PlanarK — K-only payload; "geometry-only None" when k is None
-    // (rotating ring-buffer SWA layer never initialised).
-    if let KvStorage::PlanarK { k, max_seq } = storage {
-        if k.is_none() {
-            return Ok((format!("{{\"tag\":\"none\",\"max_seq\":{max_seq}}}"), 0));
-        }
-    }
-    // Iso symmetric / K-only — SWA round-trip semantics: when the K-side iso
-    // buffer is None, the layer is a rotating SWA window that does not survive
-    // spill. Record as geometry-only None per the K8V4 precedent.
-    if let KvStorage::IsoSym3 { k, max_seq, .. } = storage {
-        if k.is_none() {
-            return Ok((format!("{{\"tag\":\"none\",\"max_seq\":{max_seq}}}"), 0));
-        }
-    }
-    if let KvStorage::IsoSym4 { k, max_seq, .. } = storage {
-        if k.is_none() {
-            return Ok((format!("{{\"tag\":\"none\",\"max_seq\":{max_seq}}}"), 0));
-        }
-    }
-    if let KvStorage::IsoKOnly3 { k, max_seq } = storage {
-        if k.is_none() {
-            return Ok((format!("{{\"tag\":\"none\",\"max_seq\":{max_seq}}}"), 0));
-        }
-    }
-    if let KvStorage::IsoKOnly4 { k, max_seq } = storage {
-        if k.is_none() {
-            return Ok((format!("{{\"tag\":\"none\",\"max_seq\":{max_seq}}}"), 0));
-        }
-    }
-    // Rotor symmetric / K-only — same SWA-None precheck.
-    if let KvStorage::RotorSym3 { k, max_seq, .. } = storage {
-        if k.is_none() {
-            return Ok((format!("{{\"tag\":\"none\",\"max_seq\":{max_seq}}}"), 0));
-        }
-    }
-    if let KvStorage::RotorSym4 { k, max_seq, .. } = storage {
-        if k.is_none() {
-            return Ok((format!("{{\"tag\":\"none\",\"max_seq\":{max_seq}}}"), 0));
-        }
-    }
-    if let KvStorage::RotorKOnly3 { k, max_seq } = storage {
-        if k.is_none() {
-            return Ok((format!("{{\"tag\":\"none\",\"max_seq\":{max_seq}}}"), 0));
-        }
-    }
-    if let KvStorage::RotorKOnly4 { k, max_seq } = storage {
-        if k.is_none() {
-            return Ok((format!("{{\"tag\":\"none\",\"max_seq\":{max_seq}}}"), 0));
-        }
-    }
-    // RotorKAsym3 / RotorKAsym4 — same SWA-None precheck (K-side is the
-    // load-bearing indicator; V-side QuantV is initialized in lockstep).
-    if let KvStorage::RotorKAsym3 { k, max_seq, .. } = storage {
-        if k.is_none() {
-            return Ok((format!("{{\"tag\":\"none\",\"max_seq\":{max_seq}}}"), 0));
-        }
-    }
-    if let KvStorage::RotorKAsym4 { k, max_seq, .. } = storage {
-        if k.is_none() {
-            return Ok((format!("{{\"tag\":\"none\",\"max_seq\":{max_seq}}}"), 0));
-        }
+        };
+        // `seq` is taken as the buffer's filled length, so the caller must hand
+        // over a mirror compacted to `offset` — `none_bf16_payloads` slices it.
+        // A decode-expanded buffer grown to the `max_seq` ceiling with a zeroed
+        // tail must never reach here, or that tail would be persisted as live
+        // KV and the reconstructed offset would be wrong.
+        let seq = k.shape().get(2).copied().unwrap_or(0);
+        out.push((format!("l{idx}.k.bf16"), OwnedTensor::from_array(k)?));
+        out.push((format!("l{idx}.v.bf16"), OwnedTensor::from_array(v)?));
+        return Ok((
+            format!("{{\"tag\":\"none_bf16\",\"max_seq\":{max_seq}}}"),
+            seq,
+        ));
     }
     match storage {
         KvStorage::K8V4 { k, v, max_seq } => {
@@ -711,32 +669,10 @@ fn write_layer(
             let tag = if *bits == 3 { "planar3" } else { "planar" };
             Ok((geom_kv(tag, *max_seq, k_shape(k.as_ref())), seq))
         }
+        // `KvStorage::None` never reaches here — it has no packed payload and
+        // is served by the geometry-only branch above.
         KvStorage::None { max_seq } => {
-            // KvQuant::None keeps its live K/V as bf16 on the parent KvCache
-            // (`decode_fp16_{k,v}`), not in the storage buffer. When the spill
-            // path supplies that pair, persist it under `l{idx}.{k,v}.bf16` and
-            // tag the layer "none_bf16" so hydrate re-seeds the decode buffers
-            // (bf16 round-trips exactly). With no pair (a never-filled cache, or
-            // a hydrated SWA layer whose rotating ring was never serialised) this
-            // falls back to geometry-only "none" — those layers hold no payload.
-            if let Some((k, v)) = none_bf16 {
-                // `seq` is taken as the buffer's filled length. The spill
-                // contract requires the None-path `decode_fp16_k` to be
-                // compacted to `offset` (the state `exit_prefill` leaves it in:
-                // sliced to `[B, kv_h, offset, D]`). A decode-expanded buffer
-                // grown to the `max_seq` ceiling with a zeroed tail must never
-                // reach here, or that tail would be persisted as live KV and the
-                // reconstructed offset would be wrong.
-                let seq = k.shape().get(2).copied().unwrap_or(0);
-                out.push((format!("l{idx}.k.bf16"), OwnedTensor::from_array(k)?));
-                out.push((format!("l{idx}.v.bf16"), OwnedTensor::from_array(v)?));
-                Ok((
-                    format!("{{\"tag\":\"none_bf16\",\"max_seq\":{max_seq}}}"),
-                    seq,
-                ))
-            } else {
-                Ok((format!("{{\"tag\":\"none\",\"max_seq\":{max_seq}}}"), 0))
-            }
+            Ok((format!("{{\"tag\":\"none\",\"max_seq\":{max_seq}}}"), 0))
         }
         KvStorage::Mixed { state, max_seq } => write_mixed(idx, state, *max_seq, out),
         KvStorage::Paged {

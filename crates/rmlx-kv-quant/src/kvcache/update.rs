@@ -2605,8 +2605,15 @@ impl KvCache {
                 let sl_start = vec![0i32; 4];
                 let sl_stop: Vec<i32> = [b, kv_h, total_seq, head_dim].into();
                 let sl_strides = vec![1i32; 4];
-                let k_buf = raw_k.slice(&sl_start, &sl_stop, &sl_strides, device)?;
-                let v_buf = raw_v.slice(&sl_start, &sl_stop, &sl_strides, device)?;
+                // `contiguous`: a bare slice stays a strided view over the raw
+                // prefill buffer, which pins the parent and mis-serialises. See
+                // the seed materialisation in the main path below.
+                let k_buf = raw_k
+                    .slice(&sl_start, &sl_stop, &sl_strides, device)?
+                    .contiguous(device)?;
+                let v_buf = raw_v
+                    .slice(&sl_start, &sl_stop, &sl_strides, device)?
+                    .contiguous(device)?;
                 k_buf.eval()?;
                 v_buf.eval()?;
                 self.decode_fp16_k = Some(k_buf);
@@ -2654,18 +2661,31 @@ impl KvCache {
         // a flash kernel over both packed rings. An unread seed is not a small
         // waste: it is `total_seq * B * kv_h * head_dim * 2` bytes per layer per
         // axis, the dominant residency term at long context.
+        //
+        // `contiguous` and not `try_clone`: `k_full` is a slice of the raw
+        // prefill buffer along the sequence axis, and MLX keeps that as a
+        // strided view over the parent allocation — `eval` does not flatten it.
+        // Two things follow that the seed's own contract denies. It is not
+        // compact: the whole `max_seq` parent stays resident behind it until the
+        // first decode step expands the mirror. And anything that reads the
+        // buffer by raw linear offset rather than by stride — `Array::to_bytes`,
+        // which is how the SSD tier serialises it — sees the parent's leading
+        // bytes under the slice's shape, i.e. head 0's whole row window in place
+        // of every head. Materialising row-major here, on the inference thread
+        // that owns the Metal stream, is what makes the seed mean what its shape
+        // says for every later reader.
         let is_bf16_storage = matches!(self.storage, KvStorage::None { .. });
         let need_k_seed = is_bf16_storage || self.quant.feeds_bf16_k_at_decode();
         let need_v_seed = is_bf16_storage || self.quant.feeds_bf16_v_at_decode();
         let k_buf = if need_k_seed {
-            let k = k_full.try_clone()?;
+            let k = k_full.contiguous(device)?;
             k.eval()?;
             Some(k)
         } else {
             None
         };
         let v_buf = if need_v_seed {
-            let v = v_full.try_clone()?;
+            let v = v_full.contiguous(device)?;
             v.eval()?;
             Some(v)
         } else {
@@ -2691,6 +2711,29 @@ impl KvCache {
             if let Some((k_seed, v_seed)) = decode_fp16_pair {
                 // `is_bf16_storage` is true on this path, so both clones above
                 // were materialised — these buffers *are* this codec's storage.
+                self.decode_fp16_k = k_seed;
+                self.decode_fp16_v = v_seed;
+            }
+            return Ok(());
+        }
+
+        // Bulk encode only what something will read. A codec that feeds both
+        // axes from the bf16 mirror and has no decode path over its packed
+        // store would write that store once here and then never touch it again
+        // — a second full copy of the context, per layer, live for the whole
+        // decode window, on top of a mirror that is already bf16-sized. The
+        // classification is the codec's own
+        // (`KvQuant::decode_reads_packed_store`), so this closes the class
+        // rather than a codec at a time; the store is still built for the
+        // families whose decode reads it, and a hydrated cache (which has no
+        // mirror) still gets its store from the SSD block it was read from.
+        if !self.quant.materialises_packed_store() {
+            tracing::debug!(
+                kv_quant = %self.quant,
+                total_seq,
+                "exit_prefill: packed store skipped — decode reads the bf16 mirror only"
+            );
+            if let Some((k_seed, v_seed)) = decode_fp16_pair {
                 self.decode_fp16_k = k_seed;
                 self.decode_fp16_v = v_seed;
             }
@@ -4340,11 +4383,13 @@ impl KvCache {
     /// This is the universal decode shortcut: every quantized `update_<codec>`
     /// (K8V*, Mixed, Planar*, Turbo*, Iso*Sym, Rotor*Sym, RotorK*Asym, …)
     /// early-returns here when `self.decode_fp16_k.is_some()` (always, post
-    /// `exit_prefill`). The per-codec quantizer runs once at `exit_prefill`
-    /// and is then quiescent for the whole decode window — decode-phase K/V
-    /// are bf16. The codec storage buffer is frozen at the prefill length and
-    /// is **not** consulted at decode-read time. See the architectural
-    /// contract + per-codec audit table in `docs/KV_CACHE.md` §9.6.
+    /// `exit_prefill`). Decode-phase K/V are bf16 and the packed store is not
+    /// consulted at decode-read time — which is why, for a codec that reads no
+    /// store at all ([`KvQuant::materialises_packed_store`] is `false`),
+    /// `exit_prefill` does not build one and these mirrors are the cache's
+    /// entire residency. The codecs that *do* read their store never reach
+    /// here for the axes they read. See the architectural contract + per-codec
+    /// audit table in `docs/KV_CACHE.md` §9.6.
     ///
     /// Exceptions: the K-only family (`IsoKOnly*`, `RotorKOnly*`) does NOT
     /// route here for K — it quantizes K every decode step and uses

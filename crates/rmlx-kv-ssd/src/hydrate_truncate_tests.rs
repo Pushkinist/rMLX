@@ -11,8 +11,10 @@ use super::*;
 // On a normal serve these codecs never read their CPU block list at decode time:
 // `exit_prefill` materialises the bf16 `decode_fp16_{k,v}` seed for every quant
 // whose `feeds_bf16_k_at_decode()` is true, and every quantized `update_<codec>`
-// early-returns into `update_decode_fp16` from then on. The codec store is
-// written once and then frozen at the prefill length.
+// early-returns into `update_decode_fp16` from then on — which is why
+// `exit_prefill` does not build the store for them at all
+// (`KvQuant::materialises_packed_store`). The fixtures below drive the codec
+// body directly, without a prefill bracket, so the store exists to be cut.
 //
 // A hydrated cache is the exception, and it is what makes the block cut
 // observable. `KvCache::from_storage` leaves `decode_fp16_k: None`, so the codec
@@ -37,9 +39,12 @@ fn build_kvcache_quant(quant: KvQuant, kv_h: i32, seq: i32, seed: u64) -> KvCach
     let n: usize = shape.iter().map(|&x| x as usize).product();
     let k = arr(&lcg(n, seed), &shape);
     let v = arr(&lcg(n, seed ^ 0xABCD), &shape);
-    c.enter_prefill();
+    // Deliberately NOT bracketed by `enter_prefill`/`exit_prefill`: a prefilled
+    // cache of these codecs decodes off the bf16 mirror, so `exit_prefill`
+    // builds no packed store and there would be nothing to spill as blocks.
+    // The unbracketed append drives the codec body directly, which is the state
+    // a hydrated cache is in and the one these fixtures exist to exercise.
     c.update(&k, &v, device).unwrap();
-    c.exit_prefill(device).unwrap();
     c
 }
 

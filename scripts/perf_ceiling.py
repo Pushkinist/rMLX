@@ -25,6 +25,9 @@ KV byte accounting mirrors the engine, not a re-invention:
     crates/rmlx-kv-quant/src/quant.rs:888  KvQuant::approx_code_bits
     crates/rmlx-kv-quant/src/quant.rs:515  KvQuant::feeds_bf16_k_at_decode
     crates/rmlx-kv-quant/src/quant.rs:575  KvQuant::feeds_bf16_v_at_decode
+    crates/rmlx-kv-quant/src/quant.rs      KvQuant::decode_reads_packed_store /
+        materialises_packed_store -- a codec that reads no store gets none
+        built, so its resident KV is the two bf16 mirrors and nothing more.
     crates/rmlx-models/src/kv_cache/mod.rs:229  kv_codec_net_saving_total
         (per-layer loop: windowed layers clamp seq to the window and are
         always bf16; global layers take the codec formula)
@@ -264,11 +267,30 @@ def _side_bytes(c: Codec, bits: int, elems: int, n_tokens: int, head_dim: int,
     return stored + (elems * BF16 if retains_seed else 0)
 
 
+def materialises_packed_store(kind: str) -> bool:
+    """Mirror of `KvQuant::materialises_packed_store`.
+
+    A codec that feeds both axes from the bf16 mirror and has no decode path
+    over its packed store never gets one built: `exit_prefill` skips the bulk
+    encode, so its resident KV is the two mirrors and nothing else. The three
+    membership sets below reproduce `decode_reads_packed_store()` exactly --
+    quantized-SDPA over the affine tuples, K re-quantised per step, and flash
+    decode off both packed rings.
+    """
+    return (kind in _READS_PACKED
+            or kind == "RotKTq4V"
+            or kind in _NO_BF16_K
+            or kind in _NO_BF16_V)
+
+
 def resident_bytes_per_layer(c: Codec, seq: int, head_dim: int, kv_heads: int,
                              iso_ring: bool = False) -> int:
     """Mirror of `KvQuant::estimated_resident_bytes_per_layer` (quant.rs:966)."""
     elems = seq * head_dim * kv_heads
     if c.kind == "None":
+        return elems * BF16 * 2
+    if not materialises_packed_store(c.kind):
+        # Both mirrors, no store -- byte-identical to `none` at this shape.
         return elems * BF16 * 2
     n_tokens = seq * kv_heads
     k = _side_bytes(c, c.k_bits, elems, n_tokens, head_dim,

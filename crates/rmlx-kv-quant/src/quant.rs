@@ -608,6 +608,107 @@ impl KvQuant {
         }
     }
 
+    /// True when some decode-time read path of this codec consults the packed
+    /// [`crate::storage::KvStorage`] payload.
+    ///
+    /// This is the complement of the two `feeds_bf16_*` predicates, and the
+    /// three together classify what `exit_prefill` has to materialise: a codec
+    /// that feeds both axes from the bf16 mirror **and** never reads its packed
+    /// store at decode gets no packed store at all, because it would be written
+    /// once and then held, unread, for the whole decode window — `O(context)`
+    /// per layer of pure overhead on top of a mirror that is already the same
+    /// size as plain bf16.
+    ///
+    /// `false` does **not** mean "the store is useless": it is still the
+    /// authority for a cache that has no mirror — one reconstructed by
+    /// [`crate::KvCache::from_storage`] (SSD hydrate), or one that never
+    /// bracketed a prefill. It means only that a *seeded* cache never reads it,
+    /// which is exactly the condition under which allocating it is waste.
+    ///
+    /// Which codecs read their store, and where:
+    ///
+    /// * `Mixed` / `RotK` — `update_and_sdpa_mixed` appends to and reads the
+    ///   MLX affine 3-tuples every decode step (`mixed_quantized_sdpa`).
+    /// * `RotKTq4V` — same shape via `update_and_sdpa_rot_k_tq4v`.
+    /// * The K-only re-quantise family (`IsoKOnly3/4`, `RotorKOnly3/4`) —
+    ///   K is appended to the packed store per step and the flash-decode arm
+    ///   reads it back.
+    /// * The fused symmetric family (`Iso3Sym`, `Iso4Sym`, `Rotor3Sym`,
+    ///   `Rotor4Sym`) — decode is a flash kernel over both packed rings.
+    ///
+    /// Everything else decodes off the bf16 mirror alone. That includes the
+    /// codecs whose *other* GPU fast paths look like store reads but are not:
+    /// TurboFlash (`K8V4`) and fused-QK (`K8V4`/`K8V8`/`TurboSym3/4`/
+    /// `RotorK{3,4}Asym`) each maintain their **own** head-major buffer
+    /// re-encoded from the mirror, and `PlanarK`'s fused-QK / flash-decode arm
+    /// is gated on the mirror being *absent*. None of them touches the packed
+    /// store, so no `DispatchPolicy` gate can turn a `false` here into a
+    /// `true` — the classification is a property of the codec alone.
+    ///
+    /// A codec that grows a decode kernel over its own packed store must flip
+    /// its arm here in the same change, or `exit_prefill` will not have built
+    /// the buffer the kernel wants to read.
+    ///
+    /// Exhaustive on purpose, same reasoning as the two `feeds_bf16_*`
+    /// predicates: a new variant must be classified rather than silently
+    /// inherit a value.
+    pub fn decode_reads_packed_store(&self) -> bool {
+        match self {
+            // Quantized-SDPA over the affine 3-tuples, appended per step.
+            KvQuant::Mixed { .. }
+            | KvQuant::RotK { .. }
+            | KvQuant::RotKTq4V
+            // K re-quantised into the packed store every decode step.
+            | KvQuant::IsoKOnly3
+            | KvQuant::IsoKOnly4
+            | KvQuant::RotorKOnly3
+            | KvQuant::RotorKOnly4
+            // Flash decode straight off both packed rings.
+            | KvQuant::Iso3Sym
+            | KvQuant::Iso4Sym
+            | KvQuant::Rotor3Sym
+            | KvQuant::Rotor4Sym => true,
+            // `None` has no packed store to read; the rest are the bf16-mirror
+            // family, whose store is written once at `exit_prefill` and never
+            // read again on a seeded cache.
+            KvQuant::None
+            | KvQuant::K8V4
+            | KvQuant::K8V8
+            | KvQuant::Planar
+            | KvQuant::Planar3
+            | KvQuant::PlanarK
+            | KvQuant::K8VTurbo3
+            | KvQuant::K8VTurbo3Tcq
+            | KvQuant::K8VTurbo2
+            | KvQuant::K8VTurbo2Tcq
+            | KvQuant::TurboSym3
+            | KvQuant::TurboSym4
+            | KvQuant::Iso3
+            | KvQuant::Iso4
+            | KvQuant::Rotor3
+            | KvQuant::Rotor4
+            | KvQuant::RotorK3Asym { .. }
+            | KvQuant::RotorK4Asym { .. } => false,
+        }
+    }
+
+    /// True when `exit_prefill` materialises this codec's packed store.
+    ///
+    /// The store is built when decode reads it ([`Self::decode_reads_packed_store`])
+    /// **or** when either axis decodes without a bf16 mirror to fall back on —
+    /// the second disjunct is what keeps a half-mirrored codec (K quantised, V
+    /// bf16, or the reverse) from losing the side that has no mirror.
+    ///
+    /// This is the predicate the byte estimate and the spill path read; the
+    /// allocation itself is gated on the same three predicates inside
+    /// `exit_prefill`.
+    #[must_use]
+    pub fn materialises_packed_store(&self) -> bool {
+        self.decode_reads_packed_store()
+            || !self.feeds_bf16_k_at_decode()
+            || !self.feeds_bf16_v_at_decode()
+    }
+
     /// True when this codec dispatches at least one custom Metal
     /// (MSL) kernel on its production hot path, so its shaders pay a one-time
     /// cold-compile on first dispatch.
@@ -954,9 +1055,13 @@ impl KvQuant {
     /// - **bf16 decode seed**: a codec keeps a full `seq * head_dim * 2` bf16
     ///   mirror of each axis whose decode reads it —
     ///   [`Self::feeds_bf16_k_at_decode`] for K, [`Self::feeds_bf16_v_at_decode`]
-    ///   for V. This is the warm-TTFT shortcut buffer and is the dominant term
-    ///   that can make a quantized global layer *larger* than bf16. Codecs with
-    ///   a fused decode over both packed axes keep neither.
+    ///   for V. This is the warm-TTFT shortcut buffer. Codecs with a fused
+    ///   decode over both packed axes keep neither.
+    /// - **no packed store**: a codec that mirrors both axes and has no decode
+    ///   path over its store ([`Self::materialises_packed_store`] is `false`)
+    ///   allocates no codes and no scales at all, so its estimate is exactly
+    ///   the two bf16 mirrors — the same bytes as `None`. The codes + scales
+    ///   term applies only to codecs that keep a store something reads.
     ///
     /// `None` (bf16) returns just the two bf16 buffers and no seed.
     ///
@@ -1011,8 +1116,19 @@ impl KvQuant {
                 | KvQuant::RotorK3Asym { .. }
                 | KvQuant::RotorK4Asym { .. }
         );
+        // A codec whose decode never reads its packed store does not allocate
+        // one (`exit_prefill` skips the bulk encode), so the codes + scales
+        // term is zero for it and its resident cost is exactly the mirror.
+        let packs_a_store = self.materialises_packed_store();
         let side_bytes = |bits: u32, retains_seed: bool, side_uses_family: bool| -> u64 {
             if bits >= 16 {
+                return elems.saturating_mul(2);
+            }
+            if !packs_a_store {
+                debug_assert!(
+                    retains_seed,
+                    "a codec with no packed store must read a mirror on every side"
+                );
                 return elems.saturating_mul(2);
             }
             let stored = if side_uses_family && is_iso {

@@ -57,9 +57,12 @@ fn build_kvcache(seq: i32, seed: u64) -> KvCache {
     let n: usize = shape.iter().map(|&x| x as usize).product();
     let k = arr(&lcg(n, seed), &shape);
     let v = arr(&lcg(n, seed ^ 0xABCD), &shape);
-    c.enter_prefill();
+    // Deliberately NOT bracketed by `enter_prefill`/`exit_prefill`: a prefilled
+    // cache of these codecs decodes off the bf16 mirror, so `exit_prefill`
+    // builds no packed store and there would be nothing to spill as blocks.
+    // The unbracketed append drives the codec body directly, which is the state
+    // a hydrated cache is in and the one these fixtures exist to exercise.
     c.update(&k, &v, device).unwrap();
-    c.exit_prefill(device).unwrap();
     c
 }
 

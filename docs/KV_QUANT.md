@@ -129,18 +129,28 @@ layers and can never make them larger — the "skip quant on tiny windowed
 layers" condition is therefore already satisfied by the rotating-ring
 exemption, not by an extra gate.
 
-The residual net-negative is on the **global** layers. A quantized global
-layer keeps a warm-TTFT bf16 decode seed (`decode_fp16_k` / `decode_fp16_v`,
-gated by [`KvQuant::feeds_bf16_k_at_decode`]) *alongside* its packed codes and
-per-group scales. At small effective context the codes + scales are pure
-overhead on top of a buffer the same size as bf16, so the codec is strictly
-larger than `--kv-quant none`. Measured on Gemma4 e2b (7 global + 28 windowed
-layers, head_dim 256, 1 KV head) at a 4096-token prompt: `k8v4` ≈ 125.0 MB vs
-`none` ≈ 113.2 MB (`kv_cache_bytes`) — `k8v4` is +11.7 MB on the global layers,
-zero delta on the windowed layers. (These figures predate the global-`none`
-bf16 fix below, where the global `none` K/V were resident as f32; the +11.7 MB
-codec-vs-`none` delta is the same conclusion — the codec adds scales + seed on
-top of the global buffer — and the warn math is unaffected.)
+The residual net-negative is on the **global** layers, and only for the codecs
+that keep a packed store *and* a bf16 mirror. A quantized global layer keeps a
+warm-TTFT bf16 decode seed (`decode_fp16_k` / `decode_fp16_v`, gated by
+[`KvQuant::feeds_bf16_k_at_decode`]); when the codec also builds a packed store,
+the codes + scales are pure overhead on top of a buffer the same size as bf16
+and the codec is strictly larger than `--kv-quant none`.
+
+For the **bf16-mirror family** (`K8V4`, `K8V8`, `Planar*`, `PlanarK`,
+`K8VTurbo*`, `TurboSym*`, `Iso3/4`, `Rotor3/4`, `RotorK*Asym`) that overhead is
+gone: no decode path reads their store, so `exit_prefill` does not build one
+(`KvQuant::materialises_packed_store()`, see `docs/KV_CACHE.md` §9.6 F3). Their
+resident KV is exactly the two bf16 mirrors — the same bytes as
+`--kv-quant none`, at every context and every geometry — and the warn never
+fires for them. It still fires for `Mixed` / `RotK` / `RotKTq4V`, which read
+their packed 3-tuples at decode and keep both mirrors as well, and for the
+K-only re-quantise families' sideband-heavy K store.
+
+Historical note: before that change, measured on Gemma4 e2b (7 global + 28
+windowed layers, head_dim 256, 1 KV head) at a 4096-token prompt, `k8v4` ≈
+125.0 MB vs `none` ≈ 113.2 MB (`kv_cache_bytes`) — `k8v4` was +11.7 MB on the
+global layers, zero delta on the windowed layers. Those two numbers are equal
+now.
 
 rMLX emits one structured `warn!` at request build time when the resolved codec
 is estimated to increase resident KV vs bf16 on the active layer mix:
@@ -150,21 +160,22 @@ WARN KV codec increases resident KV vs bf16 on this layer mix — the
 per-global-layer warm-TTFT bf16 seed plus codec scales exceed the bytes saved
 at this context; windowed layers already run bf16 and are unaffected. Consider
 --kv-quant none if memory is the goal.
-  kv_quant=k8v4 eff_seq=8192 n_global=7 n_windowed=28 est_extra_bytes=51380224
+  kv_quant=mixed_k8g64_v8g64 eff_seq=8192 n_global=7 n_windowed=28 est_extra_bytes=51380224
 ```
 
 The estimate is model-agnostic — keyed only on layer geometry (`head_dim`,
-`kv_heads`, `window`) and codec attributes (`KvQuant::approx_code_bits`,
-the per-group scale cadence, and whether the codec retains a bf16 seed). The
-decision lives in:
+`kv_heads`, `window`) and codec attributes (`KvQuant::approx_code_bits`, the
+per-group scale cadence, whether the codec retains a bf16 seed, and whether it
+materialises a packed store at all). The decision lives in:
 
 - `rmlx_kv_quant::KvQuant::estimated_resident_bytes_per_layer` /
   `estimated_net_saving_per_layer` (codec layer — the per-side byte model;
   windowed layers return saving 0).
 - `rmlx_models::kv_cache::kv_codec_net_saving_total` /
   `warn_if_kv_codec_net_negative` (policy layer — sums the layer mix and emits
-  the warn). Wired into the Gemma4 `generate` path; any arch interleaving
-  windowed + global attention can call it with its own `KvLayerShape` vector.
+  the warn). Wired into the Gemma4, Qwen3 and Qwen3.5-MoE `generate` paths; any
+  arch interleaving windowed + global attention can call it with its own
+  `KvLayerShape` vector.
 
 The warn is **advisory only** — the codec is not changed. Keeping the resolved
 codec is the operator's explicit choice (and forcing bf16 globally would change
@@ -812,21 +823,15 @@ the rate. Measured, not modelled — `kv_rate_tests.rs` reads the bytes
 
 - The perf win above is real and is **not** a memory win on the V axis; it buys
   TPS and quality with resident bytes.
-- `KvQuant::estimated_resident_bytes_per_layer` sizes planar through its generic
-  affine/turbo path. Two distinct numbers, kept apart because conflating them is
-  the same defect this section exists to fix:
-  - Its **store sub-term** (`bits/8` bytes per value plus one `f32` per 32
-    elements) is 5.0 bits per value against a measured 22.0 — the store model is
-    off by 4.4×.
-  - Its **V-side output** is larger, because `Planar` has
-    `feeds_bf16_v_at_decode() == true` and the estimator adds a full
-    `elems * 2` bf16 seed: 5.0 + 16.0 = **21.0** bits per value, against an
-    actual 22.0 + 16.0 = **38.0**. So the number the resolve-time net-saving
-    warn reads is off by 1.8×, not 4.4×.
-
-  Either way it is wrong in the codec's favour. Not corrected here: the fix
-  changes an operator-facing advisory and belongs with a decision about the
-  scale cadence, not with a rate-accounting change.
+- The rate above is the **store's** rate, and on a seeded cache `Planar` no
+  longer keeps a store: nothing reads it at decode, so `exit_prefill` does not
+  build it (`docs/KV_CACHE.md` §9.6 F3) and the layer's resident V is the bf16
+  mirror at 16.0 bits per value. `KvQuant::estimated_resident_bytes_per_layer`
+  reports that directly and its old store sub-term — 5.0 bits per value against
+  a measured 22.0, off by 4.4× and wrong in the codec's favour — no longer
+  enters the figure for this codec. The 22.0-bit rate still governs a
+  store-backed planar cache: an SSD block written by a `Device::Cpu` or seedless
+  run, and the resident bytes of any future decode path that reads the store.
 
 **Arch defaults**: `Gemma3ForConditionalGeneration`;
 `Gemma4ForConditionalGeneration` (dense, hidden_size ≥ 5376); auto-by-ctx at
@@ -3255,19 +3260,19 @@ The GPU half needs no cut and gets none: its dequant slices `[0, shape[2])` and
 its next `append` writes at `prev_seq == shape[2]`, so lowering `shape[2]`
 already makes the rejected region overwritable.
 
-*Second — and this is the binding constraint — the codec store has to be **read**
-after the truncate.* On a normal serve it is not. `exit_prefill` materialises the
-bf16 `decode_fp16_{k,v}` seed for every quant whose `feeds_bf16_k_at_decode()` is
-true (`quant.rs`), which covers `K8V4`, `K8V8`, `Planar`, `Planar3`, `PlanarK`,
-`K8VTurbo2/3`, both TCQ variants and `TurboSym3/4` — i.e. every store this
-section is about. From then on each quantized `update_<codec>` early-returns into
-`update_decode_fp16` at its first line, and `update.rs` states the consequence as
-the architectural contract: *"the codec storage buffer is frozen at the prefill
-length and is not consulted at decode-read time."* The CPU block list is written
-once by `exit_prefill` and never read again on that path, so a plain GPU serve
-**cannot distinguish a correct cut from a no-op cut** — including with
-`--kv-quant k8vturbo3`, whose forced-CPU `QuantV::append` sits below that same
-early return.
+*Second — and this is the binding constraint — the codec store has to **exist and
+be read** after the truncate.* On a normal serve it does neither. `exit_prefill`
+materialises the bf16 `decode_fp16_{k,v}` seed for every quant whose
+`feeds_bf16_k_at_decode()` is true (`quant.rs`), which covers `K8V4`, `K8V8`,
+`Planar`, `Planar3`, `PlanarK`, `K8VTurbo2/3`, both TCQ variants and
+`TurboSym3/4` — i.e. every store this section is about. From then on each
+quantized `update_<codec>` early-returns into `update_decode_fp16` at its first
+line, so the store is not consulted at decode-read time; and because it is not,
+`exit_prefill` no longer builds it at all for those codecs
+(`KvQuant::materialises_packed_store()`, `docs/KV_CACHE.md` §9.6 F3). A plain
+GPU serve therefore **cannot distinguish a correct cut from a no-op cut** —
+there is nothing there to cut — including with `--kv-quant k8vturbo3`, whose
+forced-CPU `QuantV::append` sits below that same early return.
 
 So the live paths are the ones with **no** bf16 seed:
 
@@ -3280,12 +3285,15 @@ So the live paths are the ones with **no** bf16 seed:
 - **Any cache that never bracketed a prefill**, and so never reached
   `exit_prefill` to be seeded.
 
-The store is also still read *without* a decode step in two places that matter
-even on the seeded path: the SSD spill (`write_quant_k` / `write_quant_v`
-serialise `blocks` and report `shape[2]`) and the prompt-cache snapshot
-(`try_deep_clone`). An uncut store spills a header claiming more tokens than its
-bytes hold, which is how the defect propagates from a seeded serve into the
-hydrated cache that later reads it.
+The store is also still read *without* a decode step in two places, and they
+matter for the codecs that still have one — the K-only and fused-symmetric
+families, `Mixed` / `RotK` / `RotKTq4V`, and any hydrated store-backed cache: the
+SSD spill (`write_quant_k` / `write_quant_v` serialise `blocks` and report
+`shape[2]`) and the prompt-cache snapshot (`try_deep_clone`). An uncut store
+spills a header claiming more tokens than its bytes hold, which is how the defect
+propagates from a serve into the hydrated cache that later reads it. For the
+bf16-mirror family that route is closed at the source: there is no store on the
+seeded path to spill.
 
 An earlier revision of this section named `--kv-quant k8vturbo3` on a plain serve
 as the cheapest observable cell. That was wrong for the reason above — device
@@ -3305,10 +3313,10 @@ by `cpu_block_truncate_tests::quant_v_truncate_reads_rows_from_the_shape_product
 
 **Truncation is monotone-decreasing.** All six clamp the target to the store's
 current `shape[2]` (`storage::clamp_truncate_target`). `n > shape[2]` is
-reachable, not hypothetical: post-`exit_prefill` the codec store is frozen at the
-prefill length while `KvCache::offset` keeps advancing on the bf16 mirror, so a
-speculative rollback into the decode window arrives with a target past the
-store's own fill. Raising `shape[2]` to meet it invents coverage no payload
+reachable, not hypothetical: a store-backed cache whose codec also keeps a bf16
+mirror (`Mixed` and the K-only families) advances `KvCache::offset` on paths the
+store does not follow, so a speculative rollback into the decode window arrives
+with a target past the store's own fill. Raising `shape[2]` to meet it invents coverage no payload
 backs — the dequant reads past the blocks and the SSD spill persists a header
 claiming more tokens than its bytes hold.
 

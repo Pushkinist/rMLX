@@ -1759,6 +1759,66 @@ impl KvStorage {
             }
         }
     }
+
+    /// `Some(max_seq)` when this layer holds **no packed payload**, so the only
+    /// thing there is to persist about it is its geometry.
+    ///
+    /// Three situations reach it, and the SSD spill writer treats them alike:
+    ///
+    /// * a rotating (SWA) layer — its KV lives in the bf16 ring off `storage`,
+    ///   which is not serialisable, so the window is re-established on reuse;
+    /// * a codec whose decode reads only the bf16 mirror
+    ///   ([`crate::KvQuant::materialises_packed_store`] is `false`), so
+    ///   `exit_prefill` built no store to write;
+    /// * [`KvStorage::None`], which never had one.
+    ///
+    /// The K-side slot is the indicator throughout: every two-sided variant
+    /// populates both slots in the same `exit_prefill` statement, so a `None`
+    /// on K means the whole layer is empty. The three variants whose payload is
+    /// not an `Option` — `Mixed`, `RotKTq4V`, `Paged` — always answer `None`
+    /// here: their writers serialise their own empty state, and diverting them
+    /// would change what an unfilled layer of theirs round-trips as.
+    ///
+    /// Exhaustive on purpose: a new variant must be classified, or the writer
+    /// would stamp a codec geometry with no tensors behind it and the reader
+    /// would fail on the first missing tensor.
+    #[must_use]
+    pub fn geometry_only_max_seq(&self) -> Option<i32> {
+        // `k.is_none()` is the test in every arm; a `Some` K means the layer
+        // carries a real payload and belongs to its codec's writer.
+        fn empty<T>(k: Option<&T>, max_seq: i32) -> Option<i32> {
+            k.is_none().then_some(max_seq)
+        }
+        match self {
+            KvStorage::None { max_seq } => Some(*max_seq),
+            KvStorage::K8V4 { k, max_seq, .. }
+            | KvStorage::K8V8 { k, max_seq, .. }
+            | KvStorage::Planar { k, max_seq, .. }
+            | KvStorage::K8VTurbo3 { k, max_seq, .. }
+            | KvStorage::K8VTurbo3Tcq { k, max_seq, .. }
+            | KvStorage::K8VTurbo2 { k, max_seq, .. }
+            | KvStorage::K8VTurbo2Tcq { k, max_seq, .. }
+            | KvStorage::IsoV3 { k, max_seq, .. }
+            | KvStorage::IsoV4 { k, max_seq, .. }
+            | KvStorage::RotorV3 { k, max_seq, .. }
+            | KvStorage::RotorV4 { k, max_seq, .. } => empty(k.as_ref(), *max_seq),
+            KvStorage::TurboSym3 { k, max_seq, .. } => empty(k.as_ref(), *max_seq),
+            KvStorage::TurboSym4 { k, max_seq, .. } => empty(k.as_ref(), *max_seq),
+            KvStorage::PlanarK { k, max_seq } => empty(k.as_ref(), *max_seq),
+            KvStorage::IsoSym3 { k, max_seq, .. } => empty(k.as_ref(), *max_seq),
+            KvStorage::IsoSym4 { k, max_seq, .. } => empty(k.as_ref(), *max_seq),
+            KvStorage::IsoKOnly3 { k, max_seq } => empty(k.as_ref(), *max_seq),
+            KvStorage::IsoKOnly4 { k, max_seq } => empty(k.as_ref(), *max_seq),
+            KvStorage::RotorSym3 { k, max_seq, .. } => empty(k.as_ref(), *max_seq),
+            KvStorage::RotorSym4 { k, max_seq, .. } => empty(k.as_ref(), *max_seq),
+            KvStorage::RotorKOnly3 { k, max_seq } => empty(k.as_ref(), *max_seq),
+            KvStorage::RotorKOnly4 { k, max_seq } => empty(k.as_ref(), *max_seq),
+            KvStorage::RotorKAsym3 { k, max_seq, .. } => empty(k.as_ref(), *max_seq),
+            KvStorage::RotorKAsym4 { k, max_seq, .. } => empty(k.as_ref(), *max_seq),
+            // Payload is not an Option — their own writers handle emptiness.
+            KvStorage::Mixed { .. } | KvStorage::RotKTq4V { .. } | KvStorage::Paged { .. } => None,
+        }
+    }
 }
 
 /// Bytes of an optional store slot; an unpopulated slot (`None`) holds nothing.

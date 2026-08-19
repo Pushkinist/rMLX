@@ -277,10 +277,10 @@ pub(crate) fn truncate_plan(
 ///
 /// Truncation is monotone-decreasing by contract, and for the turbo / planar /
 /// affine stores that has to be enforced rather than assumed. `n > shape[2]` is
-/// reachable: post-`exit_prefill` the codec store is frozen at the prefill
-/// length while `KvCache::offset` keeps advancing on the bf16 decode mirror, so
-/// a speculative rollback to a position inside the decode window arrives with a
-/// target past the store's own fill. Raising `shape[2]` to meet it invents
+/// reachable: a store-backed cache whose codec also keeps a bf16 mirror advances
+/// `KvCache::offset` on paths the store does not follow, so a speculative
+/// rollback to a position inside the decode window arrives with a target past
+/// the store's own fill. Raising `shape[2]` to meet it invents
 /// coverage that no payload backs — the CPU dequant then reads past the blocks
 /// and the SSD spill persists a store whose header claims more tokens than its
 /// bytes hold.

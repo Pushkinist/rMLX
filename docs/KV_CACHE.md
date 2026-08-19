@@ -1037,58 +1037,78 @@ collapses that to one `slice_update`. At long context this dominates.
 
 ### Mechanism
 
-* `exit_prefill` quantizes the prefill K/V into the codec storage buffer
-  **and** unconditionally stores a compact bf16 seed on
-  `decode_fp16_k`/`decode_fp16_v` (the generic seed tail after the
-  per-`KvQuant` match, `update.rs:2200`).
+* `exit_prefill` stores a compact bf16 seed on `decode_fp16_k` /
+  `decode_fp16_v` for each axis whose decode reads one
+  (`KvQuant::feeds_bf16_{k,v}_at_decode`).
+* It bulk-encodes the prefill K/V into the codec storage buffer **only when
+  something reads that buffer** — `KvQuant::materialises_packed_store()`,
+  which is `decode_reads_packed_store() || !feeds_bf16_k || !feeds_bf16_v`.
+  For the bf16-mirror family both mirrors serve decode and no decode path
+  touches the store, so no store is built: it would be a second full copy of
+  the context, per layer, held unread for the whole decode window, on top of a
+  mirror that is already exactly bf16-sized. Those codecs' resident KV is
+  therefore identical to `--kv-quant none`, not larger than it.
 * Each `update_<codec>` begins with
   `if self.decode_fp16_k.is_some() { return self.update_decode_fp16(...); }`.
   Once the seed is live (always, post-prefill), the codec is bypassed and
   the decode step appends bf16 K **and** V via one `slice_update`.
-* Consequence: tokens **generated during decode** are never quantized in
-  the codec buffer for the shortcut family — they live only in the bf16
-  mirror. The codec buffer is frozen at the prefill length. This is
-  correct: the codec buffer is not consulted at decode-read time.
+* Consequence: for the mirror family the codec buffer does not exist during
+  the decode window, and tokens generated during decode live only in the bf16
+  mirror. That mirror is the layer, which is also what the SSD tier persists
+  for it (tag `none_bf16`) — so a prompt-cache hit served from disk decodes
+  off the same bytes as one served from RAM.
+
+`decode_reads_packed_store()` is the single place the classification lives. A
+codec that grows a decode kernel over its own packed store flips its arm there
+and `exit_prefill` starts building the buffer again in the same change; that is
+the seam #353 (`planar_flash_decode` dormant behind the live K mirror) has to
+go through.
 
 ### Per-codec audit table
 
 `decode-K` / `decode-V` = the dtype actually fed to SDPA per decode step.
-`codec-at-decode` = does the per-codec quantizer run on each generated
-token? "frozen" = no (bf16 shortcut); "K-only" = K codec runs, V bf16.
+`store` = does `exit_prefill` materialise the packed buffer, i.e. does any
+decode path read it (`KvQuant::decode_reads_packed_store`)?
 
-| Codec (`KvQuant`)        | shortcut? | decode-K | decode-V | codec-at-decode | intentional |
-|--------------------------|-----------|----------|----------|-----------------|-------------|
-| `None` (bf16)            | n/a       | bf16     | bf16     | none            | yes         |
-| `K8V8`                   | yes       | bf16     | bf16     | frozen          | yes         |
-| `K8V4`                   | yes       | bf16     | bf16     | frozen          | yes         |
-| `Mixed{k,v}`             | yes¹      | bf16     | bf16     | frozen          | yes         |
-| `Planar` / `Planar3`     | yes       | bf16     | bf16     | frozen          | yes         |
-| `PlanarK`                | yes²      | bf16     | bf16     | frozen          | yes         |
-| `K8VTurbo2/3` (+`Tcq`)   | yes       | bf16     | bf16     | frozen          | yes         |
-| `TurboSym3` / `TurboSym4`| yes       | bf16     | bf16     | frozen          | yes         |
-| `Iso3` / `Iso4`          | yes       | bf16     | bf16     | frozen          | yes         |
-| `Iso3Sym` / `Iso4Sym`    | yes       | bf16     | bf16     | frozen          | yes         |
-| `Rotor3` / `Rotor4`      | yes       | bf16     | bf16     | frozen          | yes         |
-| `Rotor3Sym` / `Rotor4Sym`| yes       | bf16     | bf16     | frozen          | yes         |
-| `RotorK{3,4}Asym`        | yes       | bf16     | bf16     | frozen          | yes         |
-| `IsoKOnly3` / `IsoKOnly4`| **no**    | **quant**| bf16     | **K-only**      | yes³        |
-| `RotorKOnly3`/`KOnly4`   | **no**    | **quant**| bf16     | **K-only**      | yes³        |
+| Codec (`KvQuant`)        | shortcut? | decode-K | decode-V | store | intentional |
+|--------------------------|-----------|----------|----------|-------|-------------|
+| `None` (bf16)            | n/a       | bf16     | bf16     | n/a   | yes         |
+| `K8V8`                   | yes       | bf16     | bf16     | **no**| yes         |
+| `K8V4`                   | yes       | bf16     | bf16     | **no**| yes¹        |
+| `Mixed{k,v}` / `RotK`    | no²       | quant    | quant    | yes   | yes         |
+| `RotKTq4V`               | no²       | quant    | quant    | yes   | yes         |
+| `Planar` / `Planar3`     | yes       | bf16     | bf16     | **no**| yes         |
+| `PlanarK`                | yes       | bf16     | bf16     | **no**| yes³        |
+| `K8VTurbo2/3` (+`Tcq`)   | yes       | bf16     | bf16     | **no**| yes         |
+| `TurboSym3` / `TurboSym4`| yes       | bf16     | bf16     | **no**| yes¹        |
+| `Iso3` / `Iso4`          | yes       | bf16     | bf16     | **no**| yes         |
+| `Iso3Sym` / `Iso4Sym`    | no        | quant    | quant    | yes   | yes         |
+| `Rotor3` / `Rotor4`      | yes       | bf16     | bf16     | **no**| yes         |
+| `Rotor3Sym` / `Rotor4Sym`| no        | quant    | quant    | yes   | yes         |
+| `RotorK{3,4}Asym`        | yes       | bf16     | bf16     | **no**| yes¹        |
+| `IsoKOnly3` / `IsoKOnly4`| **no**    | **quant**| bf16     | yes   | yes⁴        |
+| `RotorKOnly3`/`KOnly4`   | **no**    | **quant**| bf16     | yes   | yes⁴        |
 
-1. `Mixed`/`RotKTq4V` are driven through `update_and_sdpa` (the direct
-   `update()` arm errors); the bf16 mirror is surfaced to cross-layer-KV
-   consumers via `update_and_sdpa_shared_source` (see §10.2 Mixed note).
-2. PlanarK was the **sole** codec missing the shortcut; it re-encoded K
-   through lossy Lloyd-Max + Givens every decode step, which broke
-   `niah_pflash_bonsai_8k_d50` retrieval. The fix (`b1d9dca`) restored the
-   shortcut to match its siblings. Regression-locked by
-   `warm_ttft_tests.rs`.
-3. The K-only family deliberately keeps K quantized at decode (the K codec
+1. TurboFlash (`K8V4`) and fused-QK (`K8V4`/`K8V8`/`TurboSym3/4`/
+   `RotorK{3,4}Asym`) each maintain their **own** head-major buffer, re-encoded
+   from the bf16 mirror. Neither reads the packed store, so neither
+   `--turbo-flash on` nor `--fused-qk on` puts a store back.
+2. `Mixed`/`RotK`/`RotKTq4V` are driven through `update_and_sdpa` (the direct
+   `update()` arm errors) and read their packed 3-tuples every decode step.
+   The bf16 mirror they *also* keep is surfaced to cross-layer-KV consumers via
+   `update_and_sdpa_shared_source` (see §10.2 Mixed note); on an arch with no
+   such consumer it is unread, which is a residency cost this section does not
+   yet remove.
+3. PlanarK's fused-QK / flash-decode arm is gated on the bf16 K mirror being
+   *absent*, and post-`exit_prefill` it never is — so on a seeded cache PlanarK
+   reads no store either.
+4. The K-only family deliberately keeps K quantized at decode (the K codec
    has no bf16 shortcut in its body) so that the K-side reduction it exists
    to provide is actually realized. V rides the bf16 mirror via
    `update_decode_fp16_v_only` (which must NOT touch `decode_fp16_k`, or it
    would silently re-arm the shortcut and drop K back to bf16). Because the
-   K-only decode body never reads `decode_fp16_k`, `exit_prefill` no longer
-   materialises the bf16 K seed for these variants (gated on
+   K-only decode body never reads `decode_fp16_k`, `exit_prefill` does not
+   materialise the bf16 K seed for these variants (gated on
    `feeds_bf16_k_at_decode()`); only the bf16 V seed is kept. See the F2
    reclaim note below.
 
@@ -1098,7 +1118,7 @@ reads it. For `IsoKOnly*` / `RotorKOnly*` the bf16 K seed was allocated at
 prefill-end and then held, unused, for the entire decode window — wasted RAM
 equal to one bf16 K buffer per K-only layer.
 
-**Fix.** `exit_prefill` now gates the K-seed materialisation (clone + eval **and**
+**Fix.** `exit_prefill` gates the K-seed materialisation (clone + eval **and**
 store) on the predicate [`KvQuant::feeds_bf16_k_at_decode()`], which is `false`
 for the K-only family (`IsoKOnly3/4`, `RotorKOnly3/4`) and `true` for every
 shortcut codec. The `KvStorage::None` bf16-fallback path always forces the K seed
@@ -1114,6 +1134,38 @@ independently and so reflects the dropped buffer. Residency reclaimed for Bonsai
 seed is **absent** and that the reported total is the K store plus the surviving
 V seed and nothing else. `resident_bytes` is the **only** byte diagnostic: it
 reads actual buffer sizes rather than re-deriving from shape fields.
+
+**F3 (packed-store reclaim).** The mirror's counterpart. `exit_prefill` used to
+bulk-encode the packed store for **every** codec, including the whole
+bf16-mirror family whose decode never reads it. The store was written once and
+then held for the entire decode window next to a mirror pair the same size as
+plain bf16, which is why a quantized codec measured **larger** than
+`--kv-quant none` — up to +60% resident KV on `planar`, and monotonically worse
+with context, the opposite of what an operator selects a KV codec for.
+
+**Fix.** The bulk encode is gated on `KvQuant::materialises_packed_store()`
+(above). Decode behaviour and output are unchanged — decode already read only
+the mirror — so this is again pure reclaim, and it makes the mirror family's
+resident KV *equal* to bf16 rather than a multiple of it. It does not make it
+*less* than bf16: that needs the packed store to be readable at decode, which is
+per-codec kernel work (#45, #353) and is what flipping
+`decode_reads_packed_store()` would then unlock. Two consumers of the store had
+to stay live and did:
+
+* **A cache with no mirror** — one reconstructed by `KvCache::from_storage`, a
+  `Device::Cpu` run, or any cache that never bracketed a prefill — still builds
+  and reads its store through the codec body. Nothing about those paths changed.
+* **The SSD tier**, which serialises the store. A mirror-family layer now spills
+  its bf16 mirror under the existing `none_bf16` tag instead (see
+  `docs/SSD_TIER.md`); hydrate re-seeds the mirror, so a hydrated cache decodes
+  off exactly the bytes the spilling one held. That costs ~2× the bytes on disk
+  versus a q8 block and removes a numerical asymmetry: before, a prompt-cache
+  hit served from disk decoded from quantized K/V while the same hit served from
+  RAM decoded from bf16.
+
+The resolve-time net-negative `warn!` follows the same predicate through
+`KvQuant::estimated_resident_bytes_per_layer`, so it no longer fires for the
+mirror family — the condition it warned about is gone rather than silenced.
 
 ### Decision: keep warm-TTFT universal
 
@@ -1153,7 +1205,9 @@ decode-firing path where `decode_fp16_k` is `None`:
 * Speculative / draft-model decode and PPL-eval fixtures that drive
   `update()` without an `exit_prefill` seed.
 * Prompt-cache hydration paths that restore codec state without re-seeding
-  the bf16 mirror.
+  the bf16 mirror. Note this no longer covers the bf16-mirror family: those
+  codecs spill and hydrate as bf16 (`none_bf16`), so a hydrated cache of one
+  comes back seeded, not store-backed.
 
 This is why `--sparse-attn` and `--fused-qk` resolve OFF ("warm-TTFT dormant")
 under Auto: in the normal generate flow the seed is always live, so those
@@ -1167,8 +1221,10 @@ Settled by code + `warm_ttft_cross_codec_tests`: `update_iso3` and
 `update_iso3_sym` (the codecs where the GPU-resident `QuantIsoV3` mirror's
 `append_gpu`/`dequant_gpu` live) both begin with the
 `decode_fp16_k.is_some()` shortcut. In normal generate the seed is live, so
-their per-step `append_gpu`/`dequant_gpu` **never runs** — the iso3 V encode
-fires only once at `exit_prefill` (a single bulk slice) or on a seedless
+their per-step `append_gpu`/`dequant_gpu` **never runs** — and for `Iso3`,
+which reads no store at decode, the bulk `exit_prefill` encode does not run
+either; only `Iso3Sym` (whose flash decode reads both packed rings) still
+encodes at prefill. Otherwise the iso3 V encode fires only on a seedless
 cache. A GPU-resident V mirror therefore **cannot** yield a ≥10% per-token
 TTFT win on iso3 V in the warm-TTFT decode loop; its only beneficiaries are
 the one-shot exit_prefill encode and seedless decode. **Result: NO gain**

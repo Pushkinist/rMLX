@@ -127,7 +127,15 @@ fn drive_one_decode(cache: &mut KvCache, device: Device) -> DecodeOutcome {
 }
 
 /// Shortcut-codec contract: after one decode step the bf16 K mirror is live
-/// (proves `update_decode_fp16` ran) and the quant codec did NOT advance.
+/// (proves `update_decode_fp16` ran) and the packed store was never built.
+///
+/// The store is what the contract is really about. A codec that mirrors both
+/// axes has no decode path over its packed buffer, so `exit_prefill` building
+/// one would put a second full copy of the context next to a mirror that is
+/// already bf16-sized — and hold it, unread, until the request ends. The three
+/// assertions below are one statement each of that: the store is empty before
+/// decode, still empty after (nothing re-arms it mid-window), and the cache's
+/// whole residency is the two mirrors' filled prefixes and nothing else.
 fn assert_shortcut_codec(quant: KvQuant, codec_seq_after: impl Fn(&KvCache) -> i32) {
     let device = Device::Cpu;
     let mut cache = KvCache::with_quant_max_seq(quant, TEST_MAX_SEQ);
@@ -143,9 +151,15 @@ fn assert_shortcut_codec(quant: KvQuant, codec_seq_after: impl Fn(&KvCache) -> i
 
     let codec_seq_pre_decode = codec_seq_after(&cache);
     assert_eq!(
-        codec_seq_pre_decode, TEST_PREFILL_SEQ,
-        "{quant:?}: exit_prefill should bulk-encode the prefill K to {TEST_PREFILL_SEQ}, \
-         got {codec_seq_pre_decode}"
+        codec_seq_pre_decode, 0,
+        "{quant:?}: exit_prefill must not bulk-encode a packed store that no decode \
+         path reads — got a store of {codec_seq_pre_decode} positions alongside the \
+         bf16 mirror"
+    );
+    assert_eq!(
+        cache.storage().resident_bytes(),
+        0,
+        "{quant:?}: the packed store must hold no bytes at all after exit_prefill"
     );
 
     let step_shape = [1i32, TEST_KV_H, 1, TEST_HEAD_DIM];
@@ -162,15 +176,33 @@ fn assert_shortcut_codec(quant: KvQuant, codec_seq_after: impl Fn(&KvCache) -> i
     );
     let codec_seq_post_decode = codec_seq_after(&cache);
     assert_eq!(
-        codec_seq_post_decode, codec_seq_pre_decode,
-        "{quant:?}: warm-TTFT shortcut violation — quant K codec advanced from \
-         {codec_seq_pre_decode} to {codec_seq_post_decode} on a decode step while \
-         decode_fp16_k was live (the codec must stay frozen; decode reads bf16)"
+        codec_seq_post_decode, 0,
+        "{quant:?}: warm-TTFT shortcut violation — the quant K codec allocated and \
+         advanced to {codec_seq_post_decode} on a decode step while decode_fp16_k was \
+         live (the codec must stay quiescent; decode reads bf16)"
     );
     assert_eq!(
         cache.offset(),
         TEST_PREFILL_SEQ + 1,
         "{quant:?}: offset after one decode step"
+    );
+
+    // Residency is the sharpest form of the claim: the cache holds the two
+    // mirrors' filled prefixes and nothing else. Fails if a store is built, if
+    // a mirror is dropped, or if either is double-counted.
+    let k_seed = cache
+        .decode_fp16_k_for_test()
+        .expect("K mirror is live (asserted above)");
+    let v_seed = cache
+        .decode_fp16_v_for_test()
+        .expect("V mirror is live: this family reads bf16 on both axes");
+    let expected =
+        filled_mirror_bytes(k_seed, cache.offset()) + filled_mirror_bytes(v_seed, cache.offset());
+    assert_eq!(
+        cache.resident_bytes(),
+        expected,
+        "{quant:?}: resident_bytes must equal the two bf16 mirrors' filled prefixes \
+         and nothing else"
     );
 }
 

@@ -210,17 +210,19 @@ fn rotor3_multi_layer_builder_populates_distinct_tables() {
     let k_data = vec![0.1_f32; n];
     let v_data = vec![0.2_f32; n];
 
-    // Build n_layers caches via the arch-builder pattern, run prefill+exit so
-    // the rotor table is generated on first append.
+    // Build n_layers caches via the arch-builder pattern and append once so the
+    // rotor table is generated. The append is deliberately NOT bracketed by
+    // `enter_prefill`/`exit_prefill`: a prefilled Rotor3 cache decodes off the
+    // bf16 mirror, so `exit_prefill` builds no packed store and there would be
+    // no rotor table to read. The unbracketed append is the same path a
+    // hydrated cache takes, which is where the store is load-bearing.
     let mut caches: Vec<KvCache> = (0..n_layers)
         .map(|i| KvCache::with_quant_max_seq(KvQuant::Rotor3, 1024).with_layer_idx(i))
         .collect();
     for cache in &mut caches {
-        cache.enter_prefill();
         let k = f32_arr(&k_data, &shape);
         let v = f32_arr(&v_data, &shape);
-        cache.update(&k, &v, device).expect("prefill update");
-        cache.exit_prefill(device).expect("exit_prefill");
+        cache.update(&k, &v, device).expect("codec append");
     }
 
     // Read the first rotor (4 floats) from each layer's live storage.

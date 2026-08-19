@@ -245,14 +245,21 @@ fn windowed_layer_net_saving_is_zero_for_any_codec() {
     }
 }
 
-/// On a **global** layer at small context the scratch-heavy codec is
-/// net-NEGATIVE: it keeps a full bf16 decode seed (warm-TTFT) plus packed codes
-/// and per-group scales, so it is strictly larger than plain bf16. K8V4 on the
-/// Gemma4 e2b global geometry must report a negative saving.
+/// On a **global** layer a codec that keeps a packed store **and** both bf16
+/// mirrors is net-NEGATIVE: the codes and per-group scales are pure addition on
+/// top of a mirror pair that is already exactly bf16-sized. `Mixed` is that
+/// shape — its decode reads the packed 3-tuples, so the store is real, and it
+/// still hands both mirrors to a cross-layer-KV consumer.
 #[test]
-fn global_layer_scratch_heavy_codec_is_net_negative_at_small_ctx() {
+fn global_layer_store_plus_mirror_codec_is_net_negative() {
+    let mixed = KvQuant::Mixed {
+        k_bits: 8,
+        v_bits: 8,
+        k_group_size: 64,
+        v_group_size: 64,
+    };
     // e2b global layer: global_head_dim=256, num_global_key_value_heads=1.
-    let saving = KvQuant::K8V4.estimated_net_saving_per_layer(
+    let saving = mixed.estimated_net_saving_per_layer(
         4096,  // seq
         256,   // head_dim
         1,     // kv_heads
@@ -260,15 +267,48 @@ fn global_layer_scratch_heavy_codec_is_net_negative_at_small_ctx() {
     );
     assert!(
         saving < 0,
-        "K8V4 global layer must be net-negative (bf16 seed + scales > bytes saved); got {saving}"
+        "a store + both-mirror codec must be net-negative (codes + scales on top of \
+         bf16-sized mirrors); got {saving}"
     );
-    // Bonsai-like geometry (head_dim=128, 8 kv heads) is also net-negative for
-    // any K8V* codec that retains the bf16 seed.
-    let saving_bonsai = KvQuant::K8V8.estimated_net_saving_per_layer(2048, 128, 8, false);
+    // Bonsai-like geometry (head_dim=128, 8 kv heads) reports the same sign.
+    let saving_bonsai = mixed.estimated_net_saving_per_layer(2048, 128, 8, false);
     assert!(
         saving_bonsai < 0,
-        "K8V8 global layer with retained bf16 seed must be net-negative; got {saving_bonsai}"
+        "store + both-mirror codec must be net-negative on the dense geometry too; \
+         got {saving_bonsai}"
     );
+}
+
+/// A codec whose decode reads only the bf16 mirrors builds no packed store, so
+/// its estimate is exactly the two mirrors — the same bytes as `None`, at every
+/// context and every geometry. Break-even, never negative: this is the estimate
+/// side of the `exit_prefill` skip, and it would go negative again the moment a
+/// store is materialised for a codec that reads none.
+#[test]
+fn mirror_only_codec_is_exactly_break_even_with_bf16() {
+    for q in [
+        KvQuant::K8V4,
+        KvQuant::K8V8,
+        KvQuant::Planar,
+        KvQuant::Planar3,
+        KvQuant::PlanarK,
+        KvQuant::TurboSym4,
+        KvQuant::Rotor3,
+    ] {
+        assert!(
+            !q.materialises_packed_store(),
+            "{q:?} is expected to be a mirror-only codec"
+        );
+        for (seq, head_dim, kv_heads) in [(512u64, 256u64, 1u64), (8192, 128, 8), (131_072, 128, 8)]
+        {
+            let saving = q.estimated_net_saving_per_layer(seq, head_dim, kv_heads, false);
+            assert_eq!(
+                saving, 0,
+                "{q:?} at seq={seq} head_dim={head_dim} kv_heads={kv_heads}: a mirror-only \
+                 codec holds exactly the bf16 bytes, so the saving is 0"
+            );
+        }
+    }
 }
 
 /// A seed-free K-only codec that carries a sideband-heavy family codec on K
@@ -293,22 +333,28 @@ fn k_only_iso_codec_is_net_negative_from_sidebands() {
     );
 }
 
-/// A both-seed-retaining codec (K8V4 keeps the bf16 K *and* V decode seed on
-/// top of its codes) has a constant per-element overhead, so its net saving is
-/// negative and scales **more** negative with context — there is no crossover
-/// while both seeds are retained. This is the core issue #34 finding: the warm
-/// seed is the dominant term, not the window size.
+/// A codec that keeps both bf16 mirrors **and** a packed store has a constant
+/// per-element overhead, so its net saving is negative and scales **more**
+/// negative with context — there is no crossover while both are retained. The
+/// warm mirror is the dominant term, not the window size.
 #[test]
-fn both_seed_codec_gets_more_negative_with_context() {
-    let small = KvQuant::K8V4.estimated_net_saving_per_layer(512, 256, 1, false);
-    let large = KvQuant::K8V4.estimated_net_saving_per_layer(8192, 256, 1, false);
+fn store_plus_mirror_codec_gets_more_negative_with_context() {
+    let mixed = KvQuant::Mixed {
+        k_bits: 8,
+        v_bits: 8,
+        k_group_size: 64,
+        v_group_size: 64,
+    };
+    let small = mixed.estimated_net_saving_per_layer(512, 256, 1, false);
+    let large = mixed.estimated_net_saving_per_layer(8192, 256, 1, false);
     assert!(
         small < 0 && large < 0,
         "both must be net-negative: small={small} large={large}"
     );
     assert!(
         large < small,
-        "K8V4 retains both bf16 seeds → overhead scales with context (more negative): small={small} large={large}"
+        "retaining both mirrors alongside the store → overhead scales with context \
+         (more negative): small={small} large={large}"
     );
 }
 
