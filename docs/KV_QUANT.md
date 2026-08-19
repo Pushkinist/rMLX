@@ -702,14 +702,19 @@ ring 4× recovers part of the gap but not the bulk, so this is not a
 resident KV at 16k — the persistent head-major flash buffers sit *on top of*
 the bf16 mirror and the packed store rather than replacing either.
 
-**The output is not identical.** An earlier revision of this section claimed a
-byte-identical token digest in both arms; that held on one cell and was
-generalised from it. The kernel is not bit-exact — SDPA cosine against the
-bf16 reference is ≈0.997, the V turbo-4 codec floor — and at temp=0 that flips
-greedy argmax ties prompt-dependently. Two of the four cells that fire at the
-production threshold (8k and 32k) return a different digest, deterministically
-and stably across every run of each arm; 16k and Bonsai-27B@16k happen to
-match. Reproduce it on Bonsai-8B at 8k with `rmlx bench --kv-quant k8v4
+**The output is not identical, and the reason changed once.** An earlier
+revision of this section claimed a byte-identical token digest in both arms;
+that held on one cell and was generalised from it. It is not byte-identical:
+the kernel is not bit-exact — SDPA cosine against the bf16 reference is ≈0.997,
+the V turbo-4 codec floor — and at temp=0 that flips greedy argmax ties
+prompt-dependently. When these cells were measured, 8k and 32k both diverged
+while 16k and Bonsai-27B@16k matched, and the divergence was attributed to that
+codec floor. **Half of that attribution was wrong**: the 32k divergence was the
+f32 promotion described below, and it is gone with the dtype fix — see the
+digest table further down, where 32k now reproduces the bf16 reference exactly.
+The 8k divergence is real and is the codec floor. The rows below are the
+pre-fix measurement, kept because the TPS and residency figures still come from
+it. Reproduce it on Bonsai-8B at 8k with `rmlx bench --kv-quant k8v4
 --max-ctx 16384 --prompt-tokens 8192 --max-tokens 64 --runs 2 --warmup 1`:
 
 | arm | decode TPS | token digest | `kv_cache_bytes` |
@@ -1011,9 +1016,17 @@ intermediate DRAM allocation for `K_rot`. For D=128 (Bonsai): 896 arithmetic
 ops vs 16 384 for the matmul (~18×). Output *format* matches
 `mx.quantize(mode="affine", bits=8, group_size=64)` — same shapes, same dtypes
 — so it feeds directly into `mixed_quantized_sdpa` unchanged. It is not
-bit-exact with it: the kernel computes the group min/max in f32 from f32 data
-where `mx.quantize` works at the input's own width, so the two arms of this
-codec can round a group differently.
+bit-exact with it, and not for a width reason — MLX's `affine_quantize` also
+loads into `float` and reduces in `float`, casting only at the store
+(`mlx/backend/metal/kernels/quantized.h:2460-2489` in 0.31.2). The difference
+is the affine parameterisation. MLX initialises `w_max = 0` (so an all-negative
+group still spans up to zero), takes `scale = max((w_max - w_min)/n_bins, eps)`,
+flips its sign to whichever end is larger in magnitude, then snaps the
+zero-point: `q0 = round(edge/scale)`, `scale = edge/q0`, `bias = at_zero ? 0 :
+edge`. `metal/rot_k_fwht_quantize_d128.metal:58-59` uses the plain unsigned
+form, `scale = (gmax - gmin)/255` with `bias = gmin`. Same width, different
+grid: a value can land one level apart between the two arms before the
+FWHT-versus-matmul rotation difference enters at all.
 
 That dtype match is load-bearing and was missing until 2026-08: the kernel
 returned its scales and biases as the f32 it computed them in, while
@@ -1023,11 +1036,22 @@ model decoded the whole layer stack in f32 — attention output, residual add,
 next layer's norm and weight GEMV — for as long as the flag was set, and the
 fused and non-fused arms of one codec silently ran at different widths.
 Narrowing the scales moves the reconstruction by at most 0.0156 against the
-`mx.quantize` reference (`fwht_quantize_types_scales_like_mx_quantize`, well
-inside the 0.10 tolerance the f32-input parity test uses), and it does move
-greedy output: on Bonsai-8B at 8k the fused arm's token digest changes from
-matching the non-fused arm to differing from it — the arms differ by the
-quantizer's own rounding, which the wider graph had been masking.
+`mx.quantize` reference — measured and gated at that value, not merely printed
+(`fwht_quantize_types_scales_like_mx_quantize`) — and it does move greedy
+output: on Bonsai-8B at 8k the fused arm's token digest changes from matching
+the non-fused arm to differing from it.
+
+Fidelity was measured rather than assumed: against the unquantized rotated K,
+`mx.quantize` reconstructs at cosine 0.999969 and the fused arm at 0.999965 —
+4e-6 apart, both gated in the same test. Narrowing the scales did not move the
+codec's accuracy in either direction to any degree this shape can resolve.
+
+What the digest A/B does **not** establish is why it moved. The pre-fix arm had f32 scales
+*and* an f32 decode graph, and the post-fix arm has neither, so the two
+variables moved together; "the wider graph was masking the quantizer's own
+rounding" is a plausible reading of it and not a measured one. Isolating it
+would need a third arm — bf16 scales with the promotion forced back on — which
+nothing needs today.
 
 A matching `rot_k_fwht_rotate_gpu` kernel applies the same FWHT to Q,
 replacing the `rotate_last_axis` matmul when the fused path is active.

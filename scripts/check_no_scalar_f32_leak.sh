@@ -11,8 +11,19 @@
 #
 # WHAT THIS GATE CHECKS
 # ---------------------
-# Every non-test .rs file under crates/rmlx-models/src/ is scanned (excluding
-# out-of-scope arch directories: laguna/, dr_venus/) for lines that:
+# Every non-test .rs file under the crates that own `.metal` kernels — the
+# roots derived from `scripts/metal_dirs.sh`, so this gate and
+# `check_kernel_dtype_contract.sh` cannot drift apart — minus `rmlx-mlx` (see
+# the exclusion beside the list, which is a recorded finding, not a preference).
+# Scanned (excluding out-of-scope arch directories: laguna/, dr_venus/) for
+# lines that:
+#
+# The scope was `crates/rmlx-models/src` alone until 2026-08. That was one of
+# three reasons this gate could not see the TurboFlash promotion: the leak sat
+# in `rmlx-kv-quant`, outside the scan root entirely. Widening it does not make
+# this gate sufficient for that class — it keys on `scalar_f32(`, and that leak
+# had none — but the KV codec layer runs on the same promotion path and carries
+# live `scalar_f32(` call sites in the decode hot path, so it belongs in scope.
 #   (a) contain scalar_f32( (as actual code, not a pure line comment), AND
 #   (b) are NOT followed by a non-F32 .astype( on the SAME LINE, AND
 #   (c) are NOT followed by a non-F32 .astype( within the immediately following
@@ -61,9 +72,29 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Arch-layer scope: all .rs files under crates/rmlx-models/src/.
-# Excludes test files, and out-of-scope arch directories.
-SCAN_DIR="${REPO_ROOT}/crates/rmlx-models/src"
+# Scope: the crate `src/` directories that own `.metal` kernels, single-sourced
+# from `scripts/metal_dirs.sh` (which names each crate's `metal/` directory;
+# the Rust sits one level up). Excludes test files and out-of-scope arch
+# directories.
+# shellcheck source=scripts/metal_dirs.sh
+. "$(dirname "${BASH_SOURCE[0]}")/metal_dirs.sh"
+SCAN_DIRS=()
+for d in "${METAL_DIRS[@]}"; do
+    root="${d%/metal}"
+    # `rmlx-mlx` is deliberately excluded, and the reason is a finding rather
+    # than a preference: it DEFINES `scalar_f32`, and its cached GELU constants
+    # (`ops/activation.rs`) are f32 arrays multiplied straight into a bf16 `x`
+    # with no cast back — `gelu`/`gelu_tanh` return f32 for a bf16 input today.
+    # That is a live instance of this gate's own class, on the MLP path of every
+    # arch that calls them. Bringing the crate in scope now would force either a
+    # marker on that suspect (laundering a real finding into an allowlist entry)
+    # or a numerics change across every gelu arch inside an unrelated fix.
+    # Widen this list when that is settled on its own branch.
+    case "${root}" in
+    *"/crates/rmlx-mlx/src") continue ;;
+    esac
+    SCAN_DIRS+=("${root}")
+done
 
 violations=()
 
@@ -208,7 +239,7 @@ while IFS= read -r -d '' f; do
         }
     ' "$f" 2>/dev/null && violations+=("$f")
 done < <(
-    find "${SCAN_DIR}" -name "*.rs" \
+    find "${SCAN_DIRS[@]}" -name "*.rs" \
         -not -path "*/target/*" \
         -not -path "*/tests/*" \
         -not -name "*_tests.rs" \

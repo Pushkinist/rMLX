@@ -247,11 +247,12 @@ fn dequant_kernel() -> Result<&'static MetalKernel> {
 /// # Errors
 ///
 /// Returns `Error::Quant` if total elements not a multiple of `GROUP_SIZE`.
-// f32-out-ok: codec buffers, not activations — codes are u32 and the scale /
-// rotation buffers are read back only by this codec's own MSL kernels, which
-// declare them `device const float*`. They never become an operand of an MLX
-// op, so nothing takes its width from them (an `mx.quantize` 3-tuple does:
-// `quantized_matmul` and `dequantize` promote to the scales' dtype).
+// f32-out-ok: of the three buffers only `scales` is f32 (`codes` and `rot32`
+// are u32), and it is read back solely by MSL kernels that declare it
+// `device const float*`: `planar_dequantize_v4_gpu`, `planar_fused_qk`,
+// `planar_flash_decode` P1, and the sparse phase-1 / phase-2 pair. No MLX
+// op would take its operand width from them, the way `quantized_matmul` and
+// `dequantize` take theirs from an `mx.quantize` 3-tuple.
 pub fn planar_quantize_v4_gpu(x: &Array, device: Device) -> Result<(Array, Array, Array)> {
     let total_elems: usize = x.shape().iter().map(|&d| d as usize).product();
     if !total_elems.is_multiple_of(GROUP_SIZE) {
@@ -545,11 +546,11 @@ fn dequant_kernel_v3() -> Result<&'static MetalKernel> {
 /// # Errors
 ///
 /// Returns `Error::Quant` if total elements not a multiple of `GROUP_SIZE`.
-// f32-out-ok: codec buffers, not activations — codes are u32 and the scale /
-// rotation buffers are read back only by this codec's own MSL kernels, which
-// declare them `device const float*`. They never become an operand of an MLX
-// op, so nothing takes its width from them (an `mx.quantize` 3-tuple does:
-// `quantized_matmul` and `dequantize` promote to the scales' dtype).
+// f32-out-ok: only `scales` is f32 here (`codes` and `rot32` are u32), and its
+// one reader is `planar_dequantize_v3_gpu`, an MSL kernel that declares it
+// `device const float*` — the 3-bit codec has no fused-QK arm. No MLX
+// op would take its operand width from them, the way `quantized_matmul` and
+// `dequantize` take theirs from an `mx.quantize` 3-tuple.
 pub fn planar_quantize_v3_gpu(x: &Array, device: Device) -> Result<(Array, Array, Array)> {
     let total_elems: usize = x.shape().iter().map(|&d| d as usize).product();
     if !total_elems.is_multiple_of(GROUP_SIZE) {

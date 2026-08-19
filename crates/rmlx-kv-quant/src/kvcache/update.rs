@@ -5625,12 +5625,12 @@ impl KvCache {
         // Scale the queries (turbo_flash_sdpa expects pre-scaled Q).
         let q_scaled = {
             use rmlx_mlx::{multiply, scalar_f32};
-            let sc = scalar_f32(scale);
-            let sc = if queries.dtype() == Dtype::F32 {
-                sc
-            } else {
-                sc.astype(queries.dtype(), device)?
-            };
+            // Canonical guarded form: `astype` to the same dtype is a no-op in
+            // MLX, so this is identical to branching on it, and the guard sits
+            // on the same statement where `check-no-scalar-f32-leak` can see
+            // it. An f32 scalar multiplied into bf16 queries promotes Q, and
+            // the kernel's whole output behind it.
+            let sc = scalar_f32(scale).astype(queries.dtype(), device)?;
             multiply(queries, &sc, device)?
         };
 

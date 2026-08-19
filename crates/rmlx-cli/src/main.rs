@@ -257,9 +257,12 @@ struct Cli {
     /// serves (K8V4, `kv_seq > 4096`) the kernel decodes 2.0–4.25× slower than
     /// the generic path — the loss grows with `kv_seq` — holds ~722 MB more
     /// resident KV, and is not bit-exact, so it perturbs the generated tokens
-    /// as well. That ratio was measured before the dispatcher stopped promoting
-    /// the decode graph to f32, so it is an upper bound on the kernel's own
-    /// cost; the direction, and this default, are unchanged. HOLD until a decode re-measurement clears it; a pre-existing
+    /// as well.
+    ///
+    /// That ratio predates the dtype fix: the dispatcher used to return its f32
+    /// kernel output uncast, which promoted the whole decode graph while the
+    /// gate was on. Read it as an upper bound on the kernel's own cost. The
+    /// direction, and this default, are unchanged. HOLD until a decode re-measurement clears it; a pre-existing
     /// `RMLX_TURBO_FLASH=1` is still honoured, and logs a `warn!` naming the
     /// cost because the kernel then runs while the flag reads `auto`.
     /// `on`: resolve the gate on (ablation, and the escape hatch for that

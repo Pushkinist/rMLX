@@ -397,10 +397,45 @@ fn fwht_quantize_types_scales_like_mx_quantize() {
         .zip(&fused_vals)
         .map(|(a, b)| (a - b).abs())
         .fold(0.0_f32, f32::max);
+    // Gate the measured value, not a tolerance six times looser than it: a
+    // documented figure whose assertion allows 6x drift is a figure nothing
+    // holds. 0.0156 measured on this fixture; 0.02 leaves headroom for a
+    // codebook or reduction-order change without letting a regression through.
     eprintln!("[rot_k bf16 scales] max |fused - reference| = {max_err:.4}");
     assert!(
-        max_err < 0.10,
-        "bf16 scales moved the reconstruction outside the tolerance the f32-input \
-         parity test uses ({max_err} >= 0.10)"
+        max_err < 0.02,
+        "bf16 scales moved the reconstruction to {max_err} (measured 0.0156 when \
+         this was written); the documented figure in docs/KV_QUANT.md is stale or \
+         the codec changed"
+    );
+
+    // Which arm sits closer to the unquantized K? Narrowing the scales is
+    // required either way — f32 scales promote every consumer of this 3-tuple —
+    // but "required" is not "harmless", and the direction was unmeasured until
+    // this assertion existed.
+    let k_ref = to_vec_f32(&k_rot.astype(Dtype::F32, device).unwrap());
+    let cos = |a: &[f32], b: &[f32]| -> f64 {
+        let (mut dot, mut na, mut nb) = (0.0_f64, 0.0_f64, 0.0_f64);
+        for (x, y) in a.iter().zip(b.iter()) {
+            dot += f64::from(*x) * f64::from(*y);
+            na += f64::from(*x).powi(2);
+            nb += f64::from(*y).powi(2);
+        }
+        if na == 0.0 || nb == 0.0 {
+            1.0
+        } else {
+            dot / (na.sqrt() * nb.sqrt())
+        }
+    };
+    let cos_ref = cos(&k_ref, &ref_vals);
+    let cos_fused = cos(&k_ref, &fused_vals);
+    eprintln!(
+        "[rot_k bf16 scales] cosine vs unquantized K_rot: mx.quantize={cos_ref:.6} \
+         fused={cos_fused:.6}"
+    );
+    assert!(
+        cos_fused > 0.999,
+        "the fused arm's reconstruction cosine against the unquantized K dropped to \
+         {cos_fused} — narrowing the scales cost real fidelity, not just a digest"
     );
 }

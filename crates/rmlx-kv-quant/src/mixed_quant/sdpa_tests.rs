@@ -2,6 +2,7 @@ use super::super::state::MixedKvState;
 use super::*;
 use crate::test_utils::{cosine_similarity_per_row, gaussian_data, lcg_data, TEST_SEED};
 use rmlx_core::DispatchPolicy;
+use rmlx_mlx::Dtype;
 use rmlx_mlx::{dequantize, matmul, scaled_dot_product_attention};
 
 #[allow(

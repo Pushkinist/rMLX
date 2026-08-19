@@ -38,12 +38,25 @@
 //! Decode-path dtype contract sweep.
 
 use rmlx_core::DispatchPolicy;
-use rmlx_kv_quant::iso_flash_decode_msl::iso_flash_decode_dispatch_count;
-use rmlx_kv_quant::iso_flash_decode_symv_msl::iso_symv_flash_decode_dispatch_count;
-use rmlx_kv_quant::kvcache::fused_qk_total_dispatch_count;
-use rmlx_kv_quant::rotor_flash_decode_msl::rotor_flash_decode_dispatch_count;
-use rmlx_kv_quant::rotor_flash_decode_symv_msl::rotor_symv_flash_decode_dispatch_count;
+use rmlx_kv_quant::iso_flash_decode_msl::{
+    iso3_flash_decode_dispatch_count, iso4_flash_decode_dispatch_count,
+};
+use rmlx_kv_quant::iso_flash_decode_symv_msl::{
+    iso3_symv_flash_decode_dispatch_count, iso4_symv_flash_decode_dispatch_count,
+};
+use rmlx_kv_quant::q8_fused_qk_msl::q8_fused_qk_dispatch_count;
+use rmlx_kv_quant::rotor_flash_decode_msl::{
+    rotor3_flash_decode_dispatch_count, rotor4_flash_decode_dispatch_count,
+};
+use rmlx_kv_quant::rotor_flash_decode_symv_msl::{
+    rotor3_symv_flash_decode_dispatch_count, rotor4_symv_flash_decode_dispatch_count,
+};
+use rmlx_kv_quant::rotor_fused_qk_msl::{
+    rotor3_fused_qk_dispatch_count, rotor4_fused_qk_dispatch_count,
+};
 use rmlx_kv_quant::turbo_flash_msl::turbo_flash_dispatch_count;
+use rmlx_kv_quant::turbo_k3_fused_qk_msl::turbo_k3_fused_qk_dispatch_count;
+use rmlx_kv_quant::turbo_k4_fused_qk_msl::turbo_k4_fused_qk_dispatch_count;
 use rmlx_kv_quant::{KvCache, KvQuant, ALL_KV_QUANTS};
 use rmlx_mlx::{Array, Device, Dtype};
 
@@ -89,10 +102,17 @@ fn bf16_tensor(shape: &[i32], seed: u64, device: Device) -> Array {
         .expect("astype activation dtype")
 }
 
-/// Every optional fused kernel on, with the size thresholds dropped so the
-/// kernels fire on the short synthetic cache here. This is the arm that
+/// Every fused kernel a `KvCache` can dispatch, on, with the size thresholds
+/// dropped so they fire on the short synthetic cache here. This is the arm that
 /// exercises the MSL dispatchers; the default-policy arm covers the generic
 /// paths those dispatchers replace.
+///
+/// `sparse_attn` is the one gate left off, and it is structural rather than an
+/// omission: that path is not dispatched by `KvCache` at all. It is driven from
+/// `rmlx-models` with a `HeadBudgets` table no cache-level sweep supplies, so
+/// turning the flag on here would change nothing. Its dtype contract is pinned
+/// where it is reachable — `rmlx_models::kv_cache::attention_dispatch`'s
+/// `sparse_attn_dispatch_returns_the_query_dtype`.
 fn policy_all_kernels_on() -> DispatchPolicy {
     DispatchPolicy {
         fused_qk: true,
@@ -136,6 +156,36 @@ fn decode_output_dtype(quant: KvQuant, policy: DispatchPolicy, device: Device) -
     out.dtype()
 }
 
+/// One reading per MSL kernel the sweep is expected to reach.
+///
+/// Per kernel, not per family: the aggregate counters (`fused_qk_total`,
+/// `iso_flash_decode`, `rotor_flash_decode`, …) each sum two to five
+/// independent kernels, and a `> 0` on a sum is satisfied by one of them.
+fn read_counters() -> Vec<(&'static str, u64)> {
+    vec![
+        ("turbo_flash", turbo_flash_dispatch_count()),
+        ("q8_fused_qk", q8_fused_qk_dispatch_count()),
+        ("turbo_k3_fused_qk", turbo_k3_fused_qk_dispatch_count()),
+        ("turbo_k4_fused_qk", turbo_k4_fused_qk_dispatch_count()),
+        ("rotor3_fused_qk", rotor3_fused_qk_dispatch_count()),
+        ("rotor4_fused_qk", rotor4_fused_qk_dispatch_count()),
+        ("iso3_flash", iso3_flash_decode_dispatch_count()),
+        ("iso4_flash", iso4_flash_decode_dispatch_count()),
+        ("iso3_symv_flash", iso3_symv_flash_decode_dispatch_count()),
+        ("iso4_symv_flash", iso4_symv_flash_decode_dispatch_count()),
+        ("rotor3_flash", rotor3_flash_decode_dispatch_count()),
+        ("rotor4_flash", rotor4_flash_decode_dispatch_count()),
+        (
+            "rotor3_symv_flash",
+            rotor3_symv_flash_decode_dispatch_count(),
+        ),
+        (
+            "rotor4_symv_flash",
+            rotor4_symv_flash_decode_dispatch_count(),
+        ),
+    ]
+}
+
 /// Run the whole codec sweep under one policy and report every violation at
 /// once — one failing codec must not hide the others.
 fn sweep(policy: DispatchPolicy, arm: &str) -> Vec<String> {
@@ -167,55 +217,44 @@ fn decode_output_keeps_query_dtype_under_default_policy() {
 #[test]
 #[ignore = "GPU Metal context: cargo test -p rmlx-kv-quant --test kv_decode_dtype_contract -- --ignored --test-threads=1"]
 fn decode_output_keeps_query_dtype_with_every_kernel_on() {
-    let turbo_before = turbo_flash_dispatch_count();
-    let fused_before = fused_qk_total_dispatch_count();
-    let iso_before = iso_flash_decode_dispatch_count();
-    let iso_symv_before = iso_symv_flash_decode_dispatch_count();
-    let rotor_before = rotor_flash_decode_dispatch_count();
-    let rotor_symv_before = rotor_symv_flash_decode_dispatch_count();
+    // One reading per kernel, never a family total: `fused_qk_total` sums five
+    // independent kernels, so a `> 0` on it is satisfied when only q8 fires and
+    // every other codec silently took its bf16 fallback — the exact vacuity
+    // this sweep exists to prevent.
+    let before = read_counters();
 
     let violations = sweep(policy_all_kernels_on(), "all-kernels-on");
 
-    let deltas = [
-        ("turbo_flash", turbo_flash_dispatch_count() - turbo_before),
-        ("fused_qk", fused_qk_total_dispatch_count() - fused_before),
-        ("iso_flash", iso_flash_decode_dispatch_count() - iso_before),
-        (
-            "iso_symv_flash",
-            iso_symv_flash_decode_dispatch_count() - iso_symv_before,
-        ),
-        (
-            "rotor_flash",
-            rotor_flash_decode_dispatch_count() - rotor_before,
-        ),
-        (
-            "rotor_symv_flash",
-            rotor_symv_flash_decode_dispatch_count() - rotor_symv_before,
-        ),
-    ];
-    for (name, delta) in deltas {
-        eprintln!("all-kernels-on: {name} dispatches={delta}");
-    }
+    let after = read_counters();
 
     assert!(
         violations.is_empty(),
         "decode promoted the activation dtype with the fused kernels on:\n  {}",
         violations.join("\n  ")
     );
-    // Non-vacuity: every codec falls back to a bf16 path when its kernel does
-    // not fire, and a bf16 path returns bf16 for free. A dispatch delta of zero
-    // means the sweep measured the fallback, not the kernel.
+    // Non-vacuity, per kernel. Every codec falls back to a bf16 path when its
+    // kernel does not fire, and a bf16 path returns bf16 for free, so a zero
+    // delta means the sweep measured the fallback rather than the kernel.
     //
-    // PlanarK is deliberately absent from this list: its flash-decode kernel
-    // stays dormant while the bf16 K seed is live (warm-TTFT), which is the
-    // state every post-prefill decode is in, so no cache-level sweep can reach
-    // it. It is covered at dispatcher level by
-    // `planar_flash_decode_returns_query_dtype`.
-    for (name, delta) in deltas {
-        assert!(
-            delta > 0,
-            "{name} never dispatched — the sweep exercised its bf16 fallback, so \
-             the dtype pass above says nothing about that kernel"
-        );
+    // Two kernels are deliberately absent from `read_counters`, both for
+    // structural reasons rather than convenience:
+    //
+    // * `planar_flash_decode` — dormant while the bf16 K seed is live
+    //   (warm-TTFT), which is the state every post-prefill decode is in, so no
+    //   cache-level sweep can reach it. Pinned instead at dispatcher level by
+    //   `planar_flash_decode_returns_query_dtype`.
+    // * `planar_fused_qk` — same seed gate, same dispatcher.
+    let mut silent = Vec::new();
+    for ((name, b), (_, a)) in before.iter().zip(after.iter()) {
+        let delta = a - b;
+        eprintln!("all-kernels-on: {name} dispatches={delta}");
+        if delta == 0 {
+            silent.push(*name);
+        }
     }
+    assert!(
+        silent.is_empty(),
+        "these kernels never dispatched, so the dtype pass above says nothing \
+         about them — the sweep exercised their bf16 fallbacks: {silent:?}"
+    );
 }

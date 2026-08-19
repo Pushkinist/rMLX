@@ -555,6 +555,19 @@ fn flash_vs_split_chain(
         .expect("out reshape");
 
     // ── f32 accumulator: the kernels' own arithmetic, pre-cast ────────────
+    // The comparison below is only a null control while arm A really is the
+    // raw accumulator. This exact control went silently unfalsifiable once the
+    // dispatcher started casting its output — it compared bf16 against f32 and
+    // stayed green — so the invariant it rests on is asserted rather than
+    // assumed.
+    assert_eq!(
+        flash.dtype(),
+        Dtype::F32,
+        "the flash arm came back as {:?}, not the f32 accumulator this comparison \
+         reads: dispatching at f32 no longer yields f32, and `any_f32_diff` below \
+         has become a dtype-rounding measurement that cannot fail",
+        flash.dtype()
+    );
     let a = array_to_f32(&flash.astype(Dtype::F32, device).expect("flash f32"));
     let s = array_to_f32(&split.astype(Dtype::F32, device).expect("split f32"));
     assert_eq!(a.len(), s.len(), "arm output lengths differ");
