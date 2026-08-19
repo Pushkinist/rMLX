@@ -692,13 +692,18 @@ or `BlockIoError::KvQuantMismatch` — never a silently-wrong cache.
 
 ### Tensor layout per KV variant
 
+What a layer writes is decided by what it **holds**, not by the codec name.
+`KvStorage::geometry_only_max_seq()` answers that in one place: a layer with no
+packed payload takes the bf16 / geometry-only route below, everything else its
+codec's tensors.
+
 | `KvStorage` variant | Tensors written |
 |---|---|
 | `K8V4` | `l{i}.k.codes` `l{i}.k.scales` `l{i}.v.codes` `l{i}.v.scales` |
 | `K8V8` | same as K8V4 (V is also q8_0) |
 | `Planar` | K8V4 tensors plus `l{i}.v.rotations` |
-| `None` (filled bf16) | `l{i}.k.bf16` `l{i}.v.bf16` — the off-storage bf16 prefix; geom tag `none_bf16` |
-| `None` (no payload) | geometry only, geom tag `none` — see note below |
+| any variant with **no** packed payload, bf16 mirror live | `l{i}.k.bf16` `l{i}.v.bf16` — the off-storage bf16 prefix; geom tag `none_bf16` |
+| any variant with no packed payload and no mirror | geometry only, geom tag `none` — see note below |
 | `Mixed` | `l{i}.k.codes` `l{i}.k.scales` `l{i}.k.biases` + V equivalents |
 | `Paged` | gathered contiguous codes/scales/rotations + page geometry metadata |
 | `LinearAttn` | `l{i}.conv_state` + `l{i}.delta_state` (recurrent state, whole, never truncated) |
@@ -706,22 +711,72 @@ or `BlockIoError::KvQuantMismatch` — never a silently-wrong cache.
 The round trip is byte-exact on codes. GDN state has no sequence axis and is
 serialized in full.
 
-#### `None` payload spill (bf16)
+#### bf16 payload spill (`none_bf16`)
 
-`KvStorage::None` (the `--kv-quant none` path) does **not** hold its live K/V in
-the storage buffer — the bf16 K/V live on the parent `KvCache`
-(`decode_fp16_{k,v}`, the same buffers `exit_prefill` seeds). The spill bridge
-(`write_caches`) reads those buffers and, when present, persists them under
-`l{i}.k.bf16` / `l{i}.v.bf16` with the geometry tag `none_bf16`. On hydrate the
-reader restores the pair and re-seeds the reconstructed cache via
-`KvCache::with_decode_fp16_seed`, so an exact-hit SSD replay reads the real K/V.
-bf16 round-trips bit-for-bit, so the restored prefix equals the pre-spill value.
+Two kinds of layer hold their live K/V on the parent `KvCache`
+(`decode_fp16_{k,v}`, the buffers `exit_prefill` seeds) rather than in a packed
+store, and both spill the same way:
 
-A `None` layer with **no** bf16 pair (a never-filled cache, or a hydrated SWA
-layer whose rotating ring was never serialised) falls back to the geometry-only
-`none` tag and re-prefills its prefix on reuse — it carries no spillable payload.
-This is the distinguishing signal: presence of `decode_fp16_{k,v}` means real KV
-exists and must travel; absence means there is nothing to persist.
+* `KvStorage::None` — the `--kv-quant none` path, where those buffers **are**
+  the cache;
+* every **bf16-mirror codec** (`K8V4`, `K8V8`, `Planar*`, `PlanarK`,
+  `K8VTurbo*`, `TurboSym*`, `Iso3/4`, `Rotor3/4`, `RotorK*Asym`), whose decode
+  reads only the mirror and whose `exit_prefill` therefore builds no store at
+  all (`docs/KV_CACHE.md` §9.6 F3).
+
+The exception is the same codec *with* codes: a K8V4/K8V8/Planar layer that
+really carries a payload — a hydrated store-backed cache, or one that never
+bracketed a prefill — takes its own row in the table above and spills codes.
+The device does not decide this; a `Device::Cpu` run that brackets a prefill
+gets the same absent store as a GPU one.
+
+The spill bridge (`write_caches`) reads the mirror and persists it under
+`l{i}.k.bf16` / `l{i}.v.bf16` with the geometry tag `none_bf16`. It **refuses**
+any mirror longer than the cache's `offset`, failing the whole block rather than
+writing that layer: a decode-expanded buffer is grown to the `max_seq` ceiling
+and its tail is zeros, the writer takes the buffer's own `shape[2]` as the
+layer's `seq_len`, and compacting it would need a device the drain thread does
+not have. The mirror is already row-major — `exit_prefill` stores it through
+`Array::contiguous` — which is what makes the persisted bytes mean what the
+shape says. On hydrate the reader restores
+the pair and re-seeds the reconstructed cache via
+`KvCache::with_decode_fp16_seed`, so an exact-hit SSD replay reads the real K/V
+and decodes off exactly the bytes the spilling cache held — the disk-served
+prompt-cache hit and the RAM-served one produce the same tokens. bf16
+round-trips bit-for-bit.
+
+The row-major step is load-bearing, not hygiene: a live mirror is normally a
+**slice view** over the larger prefill/decode buffer, and the serialiser reads
+the raw allocation by linear offset (`Array::to_bytes` ignores strides).
+Persisting the view directly writes the parent buffer's leading bytes under the
+slice's shape, which for `kv_h > 1` is head 0's whole row window in place of
+every head — it reads back as one head of real KV and zeros for the rest, with
+no error anywhere. Pinned by
+`block_io_tests::roundtrip_mirror_codec_spills_and_hydrates_as_bf16`, which
+drives the mirror through a real prefill (a fixture that installs an
+already-compact array cannot see this failure), and by
+`decode_expanded_mirror_is_refused_rather_than_spilled_with_its_tail` and
+`expanded_mirror_in_one_layer_fails_the_whole_block` for the refusal.
+
+Cost: a bf16 block is ~2× the bytes of the q8 block the mirror codecs used to
+write, against the `--kv-ssd-cache-gb` budget. That is the price of the block
+meaning the same thing as the RAM cache it came from.
+
+A layer with **no** payload and **no** bf16 pair (a never-filled cache, or a
+hydrated SWA layer whose rotating ring was never serialised) falls back to the
+geometry-only `none` tag and re-prefills its prefix on reuse. This is the
+distinguishing signal: presence of `decode_fp16_{k,v}` means real KV exists and
+must travel; absence means there is nothing to persist.
+
+Blocks written before the mirror codecs moved to `none_bf16` are **not** served.
+The layer tag is authoritative on read, so such a block would hydrate happily as
+a store-backed cache and decode through the codec body — dequantised numbers for
+a request whose RAM-served twin decodes bf16, with nothing to signal it. The
+`(hash, layout_key)` key did not change, so the block would hit. What keeps it
+out is `SsdKvIndex::SCHEMA_VERSION`, bumped to 4 for exactly this transition:
+every pre-change namespace is reclaimed by the `wipe_stale_schema_namespaces`
+pass at model load. Pinned by
+`ssd_tier_tests::wipe_removes_the_pre_none_bf16_block_format_namespace`.
 
 #### SWA layers are not spilled — hydrated entries degrade to re-prefill
 

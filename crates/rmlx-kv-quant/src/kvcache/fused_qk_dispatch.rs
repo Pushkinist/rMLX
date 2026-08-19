@@ -267,16 +267,17 @@ impl KvCache {
             // Seed the rotor table sideband (if applicable) before any
             // encode-chunk runs.
             if codec_is_rotor(codec) {
-                // `seed_rotor_table` hardcodes `head_idx = 0` in its call
-                // to `make_rotor_table`. Assert the active storage's
-                // `head_idx` agrees so future multi-head-KV work cannot
-                // silently desync the shadow's table from the CPU-storage
-                // path's table.
-                debug_assert_eq!(
-                    self.active_storage_rotor_head_idx().unwrap_or(0),
-                    0,
-                    "seed_rotor_table assumes head_idx=0; multi-head KV needs threading head_idx through FusedQkShadow"
-                );
+                // `seed_rotor_table` hardcodes `head_idx = 0` in its call to
+                // `make_rotor_table`. There used to be a `debug_assert_eq!`
+                // here comparing that against the active rotor storage's
+                // `head_idx`. It cannot fire any more and is gone rather than
+                // left to look like cover: `RotorK{3,4}Asym` build no packed
+                // store on a seeded cache, so the storage's `k` is always
+                // `None` on the only path that reaches this — the lookup
+                // returned `None`, `unwrap_or(0)` made it 0, and the assertion
+                // compared 0 against 0. Threading `head_idx` through
+                // `FusedQkShadow` is what multi-head-KV rotor work needs; an
+                // assertion over a buffer that no longer exists is not.
                 seed_rotor_table(
                     self.fused_qk_shadow.as_mut().ok_or_else(|| {
                         Error::Mlx("fused_qk: shadow vanished post-allocate".into())
@@ -461,23 +462,6 @@ impl KvCache {
             reason,
             "fused_qk: skipped"
         );
-    }
-
-    /// Return the rotor K-storage `head_idx` for the active storage variant,
-    /// or `None` when the active storage is not rotor-asym / has no allocated
-    /// K storage. Used by the dispatch path's `debug_assert!` to confirm
-    /// `seed_rotor_table`'s `head_idx=0` hardcode matches reality.
-    ///
-    /// Only the asym variants are listed: the rotor `Sym` / `KOnly` codecs are
-    /// rejected by the kernel-table gate several steps earlier, so this is
-    /// never called with their storage.
-    fn active_storage_rotor_head_idx(&self) -> Option<u32> {
-        use crate::storage::KvStorage;
-        match &self.storage {
-            KvStorage::RotorKAsym3 { k: Some(k), .. } => Some(k.head_idx),
-            KvStorage::RotorKAsym4 { k: Some(k), .. } => Some(k.head_idx),
-            _ => None,
-        }
     }
 
     /// Look up the `max_seq` the shadow should be sized to, taken from the

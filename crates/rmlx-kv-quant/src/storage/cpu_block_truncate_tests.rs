@@ -548,10 +548,10 @@ fn quant_k_truncate_at_b_gt_1_stays_loud() {
 
 /// A target past what the store covers must not raise `shape[2]`.
 ///
-/// It is reachable, not hypothetical: post-`exit_prefill` the codec store is
-/// frozen at the prefill length while `KvCache::offset` keeps advancing on the
-/// bf16 decode mirror, so a speculative rollback to a position inside the decode
-/// window arrives with `n > shape[2]`. Raising the shape to meet it invents
+/// It is reachable, not hypothetical: a store-backed cache whose codec also
+/// keeps a bf16 mirror advances `KvCache::offset` on paths the store does not
+/// follow, so a speculative rollback to a position inside the decode window
+/// arrives with `n > shape[2]`. Raising the shape to meet it invents
 /// coverage no payload backs — the dequant then reads past the blocks and an SSD
 /// spill persists a header claiming more tokens than its bytes hold.
 ///

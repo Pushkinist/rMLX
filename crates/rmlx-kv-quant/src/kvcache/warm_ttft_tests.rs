@@ -74,12 +74,17 @@ fn planar_k_warm_ttft_shortcut_quiescent_codec() {
 
     cache.exit_prefill(device).expect("exit_prefill");
 
-    // After exit_prefill the bf16 K seed must be live, AND PlanarK encoder
-    // must have been bulk-loaded with the prefill K codes.
+    // After exit_prefill the bf16 K seed must be live, and the planar K store
+    // must be **unallocated**: decode reads the mirror, so a store built here
+    // would be written once and then held unread for the whole decode window.
+    assert!(
+        cache.decode_fp16_k_for_test().is_some(),
+        "exit_prefill must materialise the bf16 K mirror for PlanarK"
+    );
     let pre_decode_codec_seq = planar_k_codec_seq(&cache);
     assert_eq!(
-        pre_decode_codec_seq, TEST_PREFILL_SEQ,
-        "exit_prefill should bulk-encode prefill K to {TEST_PREFILL_SEQ}, got {pre_decode_codec_seq}"
+        pre_decode_codec_seq, 0,
+        "exit_prefill must not bulk-encode a store no decode path reads, got {pre_decode_codec_seq}"
     );
 
     // Decode step 1.

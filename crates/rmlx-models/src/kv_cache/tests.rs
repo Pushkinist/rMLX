@@ -664,42 +664,56 @@ mod tests {
         );
     }
 
-    /// `KvQuant::K8V8` residency is the q8_0 store plus **both** warm-TTFT bf16
-    /// seeds — and the store's real cost (codes *and* per-group scales) exceeds
-    /// the 8-bits-per-element the codec is named for.
+    /// `KvQuant::K8V8` residency after a prefill is **exactly** the two
+    /// warm-TTFT bf16 mirrors — the same bytes a `KvQuant::None` cache of the
+    /// same shape holds — because its decode reads those mirrors and nothing
+    /// reads a packed store, so `exit_prefill` builds none.
+    ///
+    /// The `None` cache is the oracle rather than a byte formula: it shares no
+    /// arithmetic with the accounting under test, and a store built anyway
+    /// (codes *and* per-group scales) shows up immediately as the two totals
+    /// diverging.
     #[test]
     #[allow(
         clippy::expect_used,
         reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
     )]
-    fn resident_bytes_k8v8_counts_store_plus_both_seeds() {
+    fn resident_bytes_k8v8_is_the_two_bf16_mirrors_and_no_store() {
         let device = Device::Cpu;
-        let mut cache = KvCache::with_quant_max_seq(KvQuant::K8V8, 4096);
-        cache.enter_prefill();
-        let k = make_lcg_array(&[1, 4, 256, 128], 0xBEEF).0;
-        let v = make_lcg_array(&[1, 4, 256, 128], 0xCAFE).0;
-        cache.update(&k, &v, device).expect("update must not fail");
-        cache
-            .exit_prefill(device)
-            .expect("exit_prefill must not fail");
+        let shape = [1, 4, 256, 128];
+        let prefilled = |quant| {
+            let mut cache = KvCache::with_quant_max_seq(quant, 4096);
+            cache.enter_prefill();
+            let k = make_lcg_array(&shape, 0xBEEF).0;
+            let v = make_lcg_array(&shape, 0xCAFE).0;
+            cache.update(&k, &v, device).expect("update must not fail");
+            cache
+                .exit_prefill(device)
+                .expect("exit_prefill must not fail");
+            cache
+        };
+        let quantized = prefilled(KvQuant::K8V8);
+        let bf16 = prefilled(KvQuant::None);
 
+        assert_eq!(
+            quantized.storage().resident_bytes(),
+            0,
+            "K8V8 must hold no packed store after prefill — nothing reads it at decode"
+        );
+        assert_eq!(
+            quantized.resident_bytes(),
+            bf16.resident_bytes(),
+            "K8V8 residency must equal plain bf16 at the same shape: both hold two \
+             bf16 mirrors and nothing else"
+        );
+        // And the figure is the mirrors, not zero — a cache that reported
+        // nothing at all would pass the equality above vacuously.
         let seq: u64 = 256;
         let bhd: u64 = 4 * 128; // kv_h=4, head_dim=128 (B=1 implicit)
-        let store = cache.storage().resident_bytes();
-        // Both seeds are live on K8V8 and both are bf16 at the filled length.
-        let seeds = seq * bhd * 2 * 2;
         assert_eq!(
-            cache.resident_bytes(),
-            store + seeds,
-            "K8V8 must report its q8_0 store plus both bf16 seeds"
-        );
-        // The store is the codes *and* their per-group scales: strictly more
-        // than the codec's nominal 8 bits per element for K and V.
-        assert!(
-            store > seq * bhd * 2,
-            "q8_0 store ({store} B) must exceed the nominal 8-bit-per-element figure \
-             ({} B) — the per-group scales are real memory too",
-            seq * bhd * 2
+            quantized.resident_bytes(),
+            seq * bhd * 2 * 2,
+            "the reported bytes must be the two bf16 mirrors at the filled length"
         );
     }
 
@@ -2066,20 +2080,47 @@ mod tests {
         v
     }
 
-    /// A scratch-heavy codec (K8V4) on the windowed+global mix is net-negative:
-    /// the global-layer bf16 seed + scales exceed the bytes saved. The warn
+    /// A codec that keeps a packed store **and** both bf16 mirrors on the
+    /// windowed+global mix is net-negative: the global-layer codes + scales are
+    /// pure addition on top of mirrors that are already bf16-sized. The warn
     /// must fire (total saving < 0) and the windowed layers must contribute 0.
     #[test]
-    fn net_negative_warn_fires_on_scratch_heavy_codec_swa_mix() {
+    fn net_negative_warn_fires_on_store_plus_mirror_codec_swa_mix() {
         let layers = e2b_layer_mix();
         let n_windowed = layers.iter().filter(|l| l.window.is_some()).count();
-        let (saving, n_global, n_win) = kv_codec_net_saving_total(KvQuant::K8V4, &layers, 4096);
+        let mixed = KvQuant::Mixed {
+            k_bits: 8,
+            v_bits: 8,
+            k_group_size: 64,
+            v_group_size: 64,
+        };
+        let (saving, n_global, n_win) = kv_codec_net_saving_total(mixed, &layers, 4096);
         assert_eq!(n_win, n_windowed);
         assert_eq!(n_global, 35 - n_windowed);
         assert!(
             saving < 0,
-            "K8V4 on the SWA+global mix at 4096 ctx must be net-negative (warn fires); got {saving}"
+            "a store + both-mirror codec on the SWA+global mix at 4096 ctx must be \
+             net-negative (warn fires); got {saving}"
         );
+    }
+
+    /// A mirror-only codec never warns on any layer mix or context: it builds no
+    /// packed store, so it holds exactly the bf16 bytes and the saving is 0.
+    /// The advisory used to fire on every one of these runs, which is what the
+    /// operator was being told to work around.
+    #[test]
+    fn net_negative_warn_silent_for_mirror_only_codec() {
+        let layers = e2b_layer_mix();
+        for quant in [KvQuant::K8V4, KvQuant::K8V8, KvQuant::Planar] {
+            for eff_seq in [512, 4096, 131_072] {
+                let (saving, _, _) = kv_codec_net_saving_total(quant, &layers, eff_seq);
+                assert_eq!(
+                    saving, 0,
+                    "{quant:?} at eff_seq={eff_seq} holds exactly the bf16 bytes — the \
+                     net-negative advisory must stay silent"
+                );
+            }
+        }
     }
 
     /// bf16 (`None`) never warns — saving is exactly 0 against its own baseline.
