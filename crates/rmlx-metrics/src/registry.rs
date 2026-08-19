@@ -122,7 +122,7 @@ impl Bounds {
         format!("{column} {floor} 0.0 AND {column} <= {:?}", self.max)
     }
 
-    /// One-line human description, e.g. `"(0, 100000]"`.
+    /// One-line human description, e.g. `"(0, 100000.0]"`.
     pub fn describe(self) -> String {
         let open = if self.zero_is_measurement { '[' } else { '(' };
         format!("{open}0, {:?}]", self.max)
@@ -162,11 +162,14 @@ pub const METRICS: &[(&str, &str, Direction, Bounds)] = &[
         Direction::HigherBetter,
         Bounds::positive(1e5),
     ),
+    // Same ceiling as `decode_tps_warm`, and not a looser one: `overall_tps`
+    // divides the same token count by a wall clock that also contains prefill,
+    // so it is bounded above by the decode rate by construction.
     (
         "overall_tps",
         "tps",
         Direction::HigherBetter,
-        Bounds::positive(1e5),
+        Bounds::positive(1e4),
     ),
     (
         "ttft_warm_ms",

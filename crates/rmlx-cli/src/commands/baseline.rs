@@ -166,8 +166,11 @@ pub(crate) fn compute_phase_timing(
     n_generated: usize,
     prompt_tokens: usize,
 ) -> PhaseTiming {
-    // No callback ever fired: nothing was timed, so nothing is reported.
-    let ttft_ms = (n_generated > 0).then_some(first_cb_s * 1000.0);
+    // No callback ever fired, or it landed at t=0: nothing was timed, so
+    // nothing is reported. Same condition as `prefill_tps` below, which is
+    // derived from this same first-callback timestamp — a state one field
+    // calls unmeasured cannot be a measurement in the other.
+    let ttft_ms = (n_generated > 0 && first_cb_s > 0.0).then_some(first_cb_s * 1000.0);
 
     // Decode window: tokens 2..N over (last_cb - first_cb). Needs >= 2 tokens
     // and a positive window; otherwise fall back to the combined number.
@@ -663,12 +666,13 @@ pub(crate) fn run_baseline(
     println!(
         "baseline: model={model_basename}  load={load_ms:.0}ms  ttft_ms={ttft}  \
          decode_tps={decode}  overall_tps={overall}  prefill_tps={prefill}  \
-         prompt_tokens={prompt_token_count}  peak_rss={rss_mb:.1}MB  \
+         prompt_tokens={prompt_token_count}  peak_rss={rss}MB  \
          metal_peak_mb={metal_peak_mb:.1}  metal_gen_alloc_mb={metal_gen_alloc_mb:.1}",
         ttft = fmt_measurement(ttft_ms, 0, "n/a"),
         decode = fmt_measurement(decode_tps, 3, "n/a"),
         overall = fmt_measurement(overall_tps, 3, "n/a"),
         prefill = fmt_measurement(prefill_tps, 1, "n/a"),
+        rss = fmt_measurement(rss_mb_measured, 1, "n/a"),
     );
 
     // Exact generated token-id sequence, one line, opt-in.
@@ -797,7 +801,7 @@ pub(crate) fn run_baseline(
         }
 
         let row = format!(
-            "{},{},rMLX,{},{},{},{},{},{},{:.0},{},{},{:.1},{}\n",
+            "{},{},rMLX,{},{},{},{},{},{},{:.0},{},{},{},{}\n",
             baseline_csv_escape(run_id),
             ts_utc,
             baseline_csv_escape(model_basename),
@@ -809,7 +813,7 @@ pub(crate) fn run_baseline(
             load_ms,
             fmt_measurement(ttft_ms, 0, ""),
             fmt_measurement(tps, 3, ""),
-            rss_mb,
+            fmt_measurement(rss_mb_measured, 1, ""),
             output_cell,
         );
         csv_file

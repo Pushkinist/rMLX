@@ -121,6 +121,10 @@ fn phase_timing_reports_nothing_when_no_token_was_generated() {
 fn phase_timing_reports_no_prefill_rate_without_a_first_callback() {
     let t = compute_phase_timing(0.0, 0.4, 0.4, 8, 4096);
     assert_eq!(t.prefill_tps, None);
+    assert_eq!(
+        t.ttft_ms, None,
+        "ttft_ms fabricated from the same first-callback state prefill_tps calls unmeasured"
+    );
     assert!(t.decode_tps.is_some(), "decode is still measurable here");
 }
 

@@ -86,6 +86,11 @@ pub struct MigrateReport {
     /// bounds cannot read as a measurement (a `0.0` in a column the exporting
     /// tool never measured). Counted, not silent.
     pub metrics_dropped_implausible: usize,
+
+    /// Rows skipped because *every* one of their metrics was such a
+    /// placeholder. A subset of the per-source `rows_skipped` counters, which
+    /// otherwise cannot tell this apart from an idempotent re-run skip.
+    pub rows_skipped_all_metrics_implausible: usize,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -374,6 +379,10 @@ fn ingest_jsonl_row(
     // Same placeholder convention as the CSV pass — see the note there.
     report.metrics_dropped_implausible += run.drop_implausible_metrics();
     if run.metrics.is_empty() {
+        // The caller reads `Ok(false)` as "already present, skipped". Count
+        // this case separately so a row that was all placeholders is not
+        // silently filed under idempotency.
+        report.rows_skipped_all_metrics_implausible += 1;
         return Ok(false);
     }
 
@@ -598,7 +607,12 @@ fn migrate_cbb_csv(
                 stddev: None,
             });
         }
-        if let Some(v) = parse_f64(ci_task_pass) {
+        // CBB writes `0.0` in this column when it ran no quality probe at all.
+        // The number alone cannot tell that apart from a graded run that scored
+        // zero — both are a legitimate `task_pass_at_1` value, so the §4.1
+        // bounds cannot drop it and must not. The column convention is only
+        // known here, at the parse site, so the decision stays here.
+        if let Some(v) = parse_f64(ci_task_pass).filter(|v| *v != 0.0) {
             metrics.push(MetricEntry {
                 name: "task_pass_at_1".into(),
                 value: Some(v),
@@ -641,13 +655,14 @@ fn migrate_cbb_csv(
             metrics,
         };
 
-        // The exporter writes `0.0` in a column it did not measure — that is
-        // what the old `task_pass_at_1 == 0.0` special case was reacting to.
-        // The §4 bounds say which metrics can read zero, so the placeholder is
-        // dropped for all of them, not just the one that was noticed first.
+        // The exporter also writes `0.0` in rate columns it never measured.
+        // Those the §4.1 bounds *can* identify — a rate of zero is not a
+        // measurement of anything — so they are dropped generically here,
+        // unlike `task_pass_at_1` above whose zero is a real score.
         report.metrics_dropped_implausible += run.drop_implausible_metrics();
         if run.metrics.is_empty() {
             report.cbb_csv_rows_skipped += 1;
+            report.rows_skipped_all_metrics_implausible += 1;
             continue;
         }
 

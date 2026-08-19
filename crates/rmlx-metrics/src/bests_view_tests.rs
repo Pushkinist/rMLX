@@ -185,3 +185,26 @@ fn generated_predicate_covers_every_registry_metric() {
         );
     }
 }
+
+/// The rendered branch is what SQLite enforces — pin the text, not just the
+/// presence of the metric's name.
+#[test]
+fn generated_predicate_renders_the_registry_bound() {
+    let sql = super::plausible_sql("value");
+    assert!(
+        sql.contains("WHEN 'prefill_tps' THEN (value > 0.0 AND value <= 100000.0)"),
+        "prefill_tps branch is not the registry's bound:\n{sql}"
+    );
+    assert!(
+        sql.contains("WHEN 'prompt_cache_hits' THEN (value >= 0.0 AND value <= 1000000000000.0)"),
+        "a counter's inclusive floor did not render:\n{sql}"
+    );
+    assert!(sql.trim_end().ends_with("ELSE 1\n            END"));
+}
+
+/// The predicate a read command applies must be the one the view was built
+/// with — that identity is the whole reason it is generated in one place.
+#[test]
+fn read_side_predicate_is_the_view_predicate() {
+    assert!(super::create_sql().contains(&super::plausible_sql("value")));
+}

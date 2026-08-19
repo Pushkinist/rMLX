@@ -193,10 +193,19 @@ SELECT * FROM ranked WHERE rn = 1;
 ```
 
 The `WHERE` is **generated from the §4 registry**, not written by hand:
-`rmlx_metrics::bests_view::create_sql` renders one branch per metric from the
-same `Bounds` the ingest validator enforces, and `migrate::run_pending`
-recreates the view whenever the stored definition and the registry disagree.
-Retyping the bound in SQL is how the view and the gate would drift apart.
+`rmlx_metrics::bests_view::plausible_sql` renders one branch per metric from
+the same `Bounds` the ingest validator enforces. Retyping the bound in SQL is
+how the view and the gate would drift apart, so every consumer that ranks or
+aggregates `observations` in its own SQL — `query::deltas` (the
+`--exit-code` CI gate), `query::regress`, `query::timeseries` — `AND`s in the
+same generated predicate rather than carrying its own copy.
+
+Who installs it: `migrate::run_pending` (i.e. every *writer*) recreates the
+view whenever the stored definition and the registry disagree, and
+`rmlx metrics doctor --fix` does so explicitly. A **read** command never
+rebuilds it — `schema::open_checked` refuses to run against a DB whose view
+was built from a different registry and names the repair. A query must not
+change what the champion table publishes as a side effect of being run.
 
 Rows outside the bound are **excluded, not re-ranked**: the cell falls to the
 best plausible runner-up, and disappears from `bests` when there is none. That
@@ -480,6 +489,12 @@ Ceilings are deliberately loose — several × the best value ever recorded — 
 they reject fabrications, not fast machines. NaN and infinities are outside
 every window.
 
+**What a bound can and cannot catch.** It rejects a value orders of magnitude
+out of range; it cannot detect a wrong value that lands inside the range. The
+fabricated `(prompt_tokens - 242) * 1000` form below stays under the
+`prefill_tps` ceiling for any prompt shorter than ~342 tokens. Bounds are
+defence in depth behind a correct producer, never a substitute for one.
+
 Three places enforce the same bounds, from the same table:
 
 1. **Ingest** — `RunRecord::validate` rejects the whole record with
@@ -492,6 +507,13 @@ Three places enforce the same bounds, from the same table:
    rows cannot be deleted or corrected, and failing on them would make every
    `make ci` run permanently red — a stuck light, not a gate. The gate that
    fails is (1); 6b reports what it would now refuse.
+
+**Where bounds cannot decide.** A placeholder that is indistinguishable from a
+real measurement *as a number* has to be dropped where the convention is known,
+not here. CBB's `summary.csv` writes `task_pass_at_1 = 0.0` when it ran no
+quality probe, and `0.0` pass@1 is also a legitimate score for a model that
+failed every task — so `migrate::legacy` drops that column's zero at the parse
+site, and the §4.1 bound for `task_pass_at_1` deliberately admits `0.0`.
 
 **Archive converters are the one exception.** `rmlx metrics migrate` replays
 another tool's CSV/JSONL exports, which write `0.0` in a column they never
@@ -516,8 +538,12 @@ append-only and nothing is deleted. Two known populations, both excluded from
   upper-only bound would have *promoted* them; the bound has to be two-sided.
 
 Anything anchoring on a recorded rate — a roofline, a champion table, a
-`rmlx metrics rank` — should read `bests`, which already excludes both, rather
-than re-implementing the predicate against `observations`.
+`rmlx metrics rank` — should read `bests`, or one of the `query::*` functions,
+all of which apply the bound already. A consumer that genuinely needs the raw
+distribution (a *median* over a cell's measurements, say, which the one-row-per-cell
+view cannot give) has to carry the predicate itself; it must then be pinned to
+this section by name and reviewed with it. `scripts/perf_ceiling.py`'s
+`prefill_anchor` is the one such consumer in the tree.
 
 **Backend coverage matrix** (which backend can emit which metric — sparse is fine, see §3.3):
 
@@ -1386,10 +1412,11 @@ Runs in this order, exits non-zero on any failure:
 4. Whitelist sweep — `SELECT DISTINCT backend FROM bests EXCEPT VALUES ('rmlx'),('mlx_lm'),(…)` etc. for `backend`, `model_namespace`, `weight_quant`, `kv_quant`, `metric`. Any row outside whitelist = error with PK printed.
 5. Direction sanity — every `metric` value must have correct `direction` per §4 registry. Mismatch = error.
 6. Unit sanity — every `metric` value must have correct `unit` per registry. Mismatch = error.
+3b. `bests` view vs the §4 registry — the view is generated, not pinned to a schema version, so a DB at the latest `user_version` can still carry a definition built from an older registry. Warns; rebuilds only under `--fix`.
 6b. Value plausibility — every `value` must be inside its §4.1 bounds. Unit sanity checks the *label*; this checks the *number*. Reported per metric with a count and the first offending id. **Warning**, never auto-fixed: these rows predate the ingest gate, `observations` is append-only, and the true value is not recoverable — only re-measurable.
 7. Stale-prompt check — prompts referenced from `bests` whose body sha256 doesn't match any `prompts/*.json` file. Warn (not error — a removed prompt file might still have valid history).
 
-`rmlx metrics doctor --fix` attempts safe auto-repairs (re-derives `unit`/`direction` from registry; fixes none of the others, including 6b).
+`rmlx metrics doctor --fix` attempts safe auto-repairs (re-derives `unit`/`direction` from registry, rebuilds the `bests` view from the registry; fixes none of the others, including 6b).
 
 ### 10.5 Concurrency
 

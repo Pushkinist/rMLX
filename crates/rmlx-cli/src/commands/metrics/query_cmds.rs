@@ -48,7 +48,7 @@ pub(super) fn cmd_best(
     prompt_name: Option<&str>,
     metric: &str,
 ) -> anyhow::Result<()> {
-    let conn = schema::open_migrated(db_path)
+    let conn = schema::open_checked(db_path)
         .with_context(|| format!("open DB at {}", db_path.display()))?;
     let pid = resolve_prompt_id(&conn, prompt_id, prompt_name)?;
     let cell = query::Cell {
@@ -83,7 +83,7 @@ pub(super) fn cmd_rank(
     backend: Option<&str>,
     limit: usize,
 ) -> anyhow::Result<()> {
-    let conn = schema::open_migrated(db_path)
+    let conn = schema::open_checked(db_path)
         .with_context(|| format!("open DB at {}", db_path.display()))?;
     let rows = query::rank(&conn, metric, backend, limit).map_err(|e| anyhow::anyhow!("{e}"))?;
     for r in &rows {
@@ -107,7 +107,7 @@ pub(super) fn cmd_compare(
     _kv_quant: Option<&str>,
 ) -> anyhow::Result<()> {
     let backends: Vec<&str> = backends_csv.split(',').map(str::trim).collect();
-    let conn = schema::open_migrated(db_path)
+    let conn = schema::open_checked(db_path)
         .with_context(|| format!("open DB at {}", db_path.display()))?;
     let rows = query::compare(&conn, &backends, metric).map_err(|e| anyhow::anyhow!("{e}"))?;
     for r in &rows {
@@ -134,7 +134,7 @@ pub(super) fn cmd_history(
     metric: Option<&str>,
     since: Option<&str>,
 ) -> anyhow::Result<()> {
-    let conn = schema::open_migrated(db_path)
+    let conn = schema::open_checked(db_path)
         .with_context(|| format!("open DB at {}", db_path.display()))?;
     let pid = resolve_prompt_id(&conn, prompt_id, prompt_name)?;
     let cell = query::Cell {
@@ -172,7 +172,7 @@ pub(super) fn cmd_timeseries(
     since: Option<&str>,
     bucket_str: &str,
 ) -> anyhow::Result<()> {
-    let conn = schema::open_migrated(db_path)
+    let conn = schema::open_checked(db_path)
         .with_context(|| format!("open DB at {}", db_path.display()))?;
     let pid = resolve_prompt_id(&conn, prompt_id, prompt_name)?;
     let cell = query::Cell {
@@ -207,7 +207,7 @@ pub(super) fn cmd_regress(
     kv: Option<&str>,
     threshold_pct: f64,
 ) -> anyhow::Result<()> {
-    let conn = schema::open_migrated(db_path)
+    let conn = schema::open_checked(db_path)
         .with_context(|| format!("open DB at {}", db_path.display()))?;
 
     let result = query::regress(&conn, model, metric, kv, threshold_pct)
@@ -240,7 +240,7 @@ pub(super) fn cmd_deltas(
     threshold_pct: f64,
     exit_code: bool,
 ) -> anyhow::Result<()> {
-    let conn = schema::open_migrated(db_path)
+    let conn = schema::open_checked(db_path)
         .with_context(|| format!("open DB at {}", db_path.display()))?;
     let rows =
         query::deltas(&conn, since_sha, Some(threshold_pct)).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -287,7 +287,7 @@ pub(super) fn cmd_describe(
         anyhow::bail!("either --observation-id or --run-id is required");
     }
 
-    let conn = schema::open_migrated(db_path)
+    let conn = schema::open_checked(db_path)
         .with_context(|| format!("open DB at {}", db_path.display()))?;
 
     let updated = if let Some(oid) = observation_id {
@@ -323,7 +323,7 @@ pub(super) fn cmd_query(db_path: &Path, sql: &str) -> anyhow::Result<()> {
         );
     }
 
-    let conn = schema::open_migrated(db_path)
+    let conn = schema::open_checked(db_path)
         .with_context(|| format!("open DB at {}", db_path.display()))?;
     let mut stmt = conn.prepare(sql).context("prepare SQL")?;
 

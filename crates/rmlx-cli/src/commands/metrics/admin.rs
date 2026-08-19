@@ -101,9 +101,23 @@ pub(super) fn cmd_doctor(db_path: &Path, fix: bool) -> anyhow::Result<()> {
     // number, so a DB already at the latest schema version can still carry a
     // definition built from an older registry — including one with no
     // plausibility filter at all. Checking `user_version` cannot see that.
+    //
+    // Rebuilding is a repair, so it is gated on `--fix` like every other one:
+    // it changes what `bests`, and therefore `BENCHMARK_CHAMPIONS.md`,
+    // publishes. Without `--fix` the drift is reported and left alone.
     {
-        if bests_view::ensure(&conn).context("ensure bests view")? {
-            println!("[fix] bests view: rebuilt from the §4 metric registry");
+        if fix {
+            if bests_view::ensure(&conn).context("rebuild bests view")? {
+                println!("[fix] bests view: rebuilt from the §4 metric registry");
+            } else {
+                println!("[ok] bests view: definition matches the §4 metric registry");
+            }
+        } else if bests_view::is_stale(&conn).context("check bests view")? {
+            eprintln!(
+                "[WARN] bests view: built from a different metric registry than this binary's — \
+                 champion reads do not match §4.1 until `rmlx metrics doctor --fix` rebuilds it"
+            );
+            warnings += 1;
         } else {
             println!("[ok] bests view: definition matches the §4 metric registry");
         }
@@ -305,9 +319,12 @@ pub(super) fn cmd_doctor(db_path: &Path, fix: bool) -> anyhow::Result<()> {
     // deleted or corrected — the true value is not recoverable from the row,
     // only re-measurable. An error here would make every `make ci` on a
     // machine with history permanently red, which is not a gate but a stuck
-    // light. The gate that can actually fail is `RunRecord::validate`, which
-    // refuses such a value at the door; this check is the report of what it
-    // would now refuse, and the `bests` view already excludes the rows.
+    // light. `RunRecord::validate` is what fails at the door, and its reach is
+    // limited in the same way this check's is: bounds reject a value orders of
+    // magnitude out of range, not a wrong value that lands inside it. The
+    // fabricated `(prompt_tokens - 242) * 1000` form, for instance, stays
+    // under the `prefill_tps` ceiling for any prompt below ~342 tokens. The
+    // producer fix is what closes that; this is defence in depth.
     {
         let mut plausibility_warnings: u32 = 0;
         for (metric, _, _, bounds) in registry::METRICS {

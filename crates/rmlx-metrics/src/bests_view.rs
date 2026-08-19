@@ -25,22 +25,34 @@ use rusqlite::Connection;
 use crate::error::Result;
 use crate::registry;
 
-/// Renders the `CREATE VIEW` statement for `bests` from the §4 registry.
+/// Renders the §4.1 plausibility predicate as a SQLite boolean expression over
+/// `column`, keyed on the row's `metric`.
+///
+/// Every consumer that ranks or aggregates `observations` must `AND` this in.
+/// `bests` does it once, but `deltas`, `regress` and `timeseries` each run
+/// their own SQL over the base table — and a gate that ranks the rows the
+/// champion view refuses is the drift this predicate exists to prevent.
 ///
 /// No parameterization: every fragment comes from the compile-time registry.
-pub fn create_sql() -> String {
-    let mut plausible = String::from("CASE metric\n");
+pub fn plausible_sql(column: &str) -> String {
+    let mut sql = String::from("CASE metric\n");
     for (name, _, _, bounds) in registry::METRICS {
         // write! to a String is infallible — the unit Ok is discarded.
         let _ = writeln!(
-            plausible,
+            sql,
             "                WHEN '{name}' THEN ({})",
-            bounds.sql("value")
+            bounds.sql(column)
         );
     }
     // A metric with no registry entry cannot be bounded, only reported —
     // `rmlx metrics doctor` fails on it under the metric-whitelist check.
-    plausible.push_str("                ELSE 1\n            END");
+    sql.push_str("                ELSE 1\n            END");
+    sql
+}
+
+/// Renders the `CREATE VIEW` statement for `bests` from the §4 registry.
+pub fn create_sql() -> String {
+    let plausible = plausible_sql("value");
 
     format!(
         "CREATE VIEW bests AS
@@ -62,6 +74,30 @@ SELECT * FROM ranked WHERE rn = 1"
     )
 }
 
+/// Reads the stored `CREATE VIEW` text for `bests`, if the view exists.
+///
+/// `None` means *absent*, and nothing else: a locked, damaged or unreadable DB
+/// propagates its error rather than being reported as "stale" and then dropped.
+fn stored_sql(conn: &Connection) -> Result<Option<String>> {
+    match conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'view' AND name = 'bests'",
+        [],
+        |r| r.get::<_, String>(0),
+    ) {
+        Ok(sql) => Ok(Some(sql)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Whether the stored `bests` definition differs from the registry's.
+///
+/// A read command calls this instead of [`ensure`]: it must know the view is
+/// current, and must not be the thing that changes it.
+pub fn is_stale(conn: &Connection) -> Result<bool> {
+    Ok(stored_sql(conn)?.as_deref() != Some(create_sql().as_str()))
+}
+
 /// Recreates `bests` when the stored definition does not match [`create_sql`].
 ///
 /// Returns `true` when the view was rebuilt. A view holds no data, so dropping
@@ -70,15 +106,7 @@ SELECT * FROM ranked WHERE rn = 1"
 pub fn ensure(conn: &Connection) -> Result<bool> {
     let want = create_sql();
 
-    let stored: Option<String> = conn
-        .query_row(
-            "SELECT sql FROM sqlite_master WHERE type = 'view' AND name = 'bests'",
-            [],
-            |r| r.get(0),
-        )
-        .ok();
-
-    if stored.as_deref() == Some(want.as_str()) {
+    if stored_sql(conn)?.as_deref() == Some(want.as_str()) {
         return Ok(false);
     }
 

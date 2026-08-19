@@ -564,3 +564,59 @@ fn null_value_is_the_way_to_say_not_measured() {
     });
     r.validate().unwrap();
 }
+
+// ── archive-only placeholder drop ─────────────────────────────────────────
+
+#[test]
+fn drop_implausible_metrics_removes_only_the_placeholders() {
+    let mut r = valid_record();
+    r.metrics = vec![
+        MetricEntry {
+            name: "decode_tps_warm".to_string(),
+            value: Some(0.0), // a rate of zero: not a measurement
+            stddev: None,
+        },
+        MetricEntry {
+            name: "prefill_tps".to_string(),
+            value: Some(130_810_000.0), // out of range
+            stddev: None,
+        },
+        MetricEntry {
+            name: "peak_rss_mb".to_string(),
+            value: Some(35_392.0), // real
+            stddev: None,
+        },
+        MetricEntry {
+            name: "prompt_cache_hits".to_string(),
+            value: Some(0.0), // a counter's zero IS a measurement
+            stddev: None,
+        },
+        MetricEntry {
+            name: "ttft_warm_ms".to_string(),
+            value: None, // already "not measured"
+            stddev: None,
+        },
+    ];
+
+    assert_eq!(r.drop_implausible_metrics(), 2);
+    let kept: Vec<&str> = r.metrics.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(
+        kept,
+        vec!["peak_rss_mb", "prompt_cache_hits", "ttft_warm_ms"],
+        "wrong entries survived the archive drop"
+    );
+    // What survives must then pass the gate.
+    r.validate().unwrap();
+}
+
+#[test]
+fn drop_implausible_metrics_leaves_an_unregistered_name_for_validate() {
+    let mut r = valid_record();
+    r.metrics[0].name = "not_a_metric".to_string();
+    assert_eq!(
+        r.drop_implausible_metrics(),
+        0,
+        "an unknown name is validate's to reject, not this function's to hide"
+    );
+    assert!(matches!(r.validate().unwrap_err(), Error::UnknownMetric(_)));
+}

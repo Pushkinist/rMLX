@@ -24,7 +24,7 @@ pub(super) fn cmd_prompts(db_path: &Path, action: PromptsAction) -> anyhow::Resu
 }
 
 fn cmd_prompts_list(db_path: &Path) -> anyhow::Result<()> {
-    let conn = schema::open_migrated(db_path)
+    let conn = schema::open_checked(db_path)
         .with_context(|| format!("open DB at {}", db_path.display()))?;
     let store = prompts::PromptStore::new(&conn);
     let rows = store.list().map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -55,7 +55,7 @@ fn cmd_prompts_list(db_path: &Path) -> anyhow::Result<()> {
 }
 
 fn cmd_prompts_get(db_path: &Path, name: &str) -> anyhow::Result<()> {
-    let conn = schema::open_migrated(db_path)
+    let conn = schema::open_checked(db_path)
         .with_context(|| format!("open DB at {}", db_path.display()))?;
     let store = prompts::PromptStore::new(&conn);
     let row = store

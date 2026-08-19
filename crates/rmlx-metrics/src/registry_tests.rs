@@ -150,3 +150,56 @@ fn coverage_matrix_includes_all_5_backends() {
         );
     }
 }
+
+// ── Bounds ────────────────────────────────────────────────────────────────
+
+#[test]
+fn bounds_reject_negatives_whatever_the_floor() {
+    assert!(!Bounds::non_negative(10.0).contains(-1.0));
+    assert!(!Bounds::positive(10.0).contains(-1.0));
+    assert!(!Bounds::non_negative(10.0).contains(-0.000_001));
+}
+
+#[test]
+fn bounds_ceiling_is_inclusive() {
+    assert!(Bounds::positive(10.0).contains(10.0));
+    assert!(!Bounds::positive(10.0).contains(10.1));
+    assert!(Bounds::non_negative(10.0).contains(10.0));
+    assert!(!Bounds::non_negative(10.0).contains(f64::MAX));
+}
+
+#[test]
+fn bounds_floor_differs_by_constructor() {
+    assert!(!Bounds::positive(10.0).contains(0.0));
+    assert!(Bounds::positive(10.0).contains(f64::MIN_POSITIVE));
+    assert!(Bounds::non_negative(10.0).contains(0.0));
+}
+
+#[test]
+fn bounds_reject_non_finite() {
+    for b in [Bounds::positive(10.0), Bounds::non_negative(10.0)] {
+        assert!(!b.contains(f64::NAN));
+        assert!(!b.contains(f64::INFINITY));
+        assert!(!b.contains(f64::NEG_INFINITY));
+    }
+}
+
+/// The SQL rendering is what the `bests` view and the `deltas`/`timeseries`
+/// queries actually enforce, so pin the string, not just its shape.
+#[test]
+fn bounds_render_the_floor_they_declare() {
+    assert_eq!(
+        Bounds::positive(1e5).sql("value"),
+        "value > 0.0 AND value <= 100000.0"
+    );
+    assert_eq!(
+        Bounds::non_negative(1e12).sql("value"),
+        "value >= 0.0 AND value <= 1000000000000.0"
+    );
+}
+
+#[test]
+fn bounds_describe_shows_the_open_end() {
+    assert_eq!(Bounds::positive(1e5).describe(), "(0, 100000.0]");
+    assert_eq!(Bounds::non_negative(1.0).describe(), "[0, 1.0]");
+}

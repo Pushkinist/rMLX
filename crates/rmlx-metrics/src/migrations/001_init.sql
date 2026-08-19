@@ -71,25 +71,10 @@ CREATE INDEX IF NOT EXISTS obs_run_id_idx    ON observations(run_id);
 CREATE INDEX IF NOT EXISTS obs_backend_idx   ON observations(backend);
 CREATE INDEX IF NOT EXISTS obs_inserted_idx  ON observations(inserted_utc);
 
--- §3.3 bests VIEW — champion per cell via ROW_NUMBER, tie-break newer ts_utc wins
+-- §3.3 bests VIEW — champion per cell.
+-- Not created here: the definition is generated from the §4 metric registry
+-- (it carries the §4.1 plausibility filter, which this file cannot know), and
+-- `migrate::run_pending` installs it via `bests_view::ensure` after the last
+-- migration. Edit `bests_view::create_sql`.
 -- Must remain a VIEW; do NOT convert to a base table (§3.3 note).
 -- No triggers (§3.5).
--- This is the initial definition only. `migrate::run_pending` finishes by
--- calling `bests_view::ensure`, which replaces it with the definition
--- generated from the §4 metric registry (adds the §4.1 plausibility filter).
--- Edit `bests_view::create_sql`, not this statement.
-CREATE VIEW IF NOT EXISTS bests AS
-WITH ranked AS (
-    SELECT
-        o.*,
-        ROW_NUMBER() OVER (
-            PARTITION BY backend, model_namespace, model, weight_quant, kv_quant,
-                         ctx_max, prompt_id, metric
-            ORDER BY
-                CASE WHEN direction = 'higher_better' THEN  value END DESC,
-                CASE WHEN direction = 'lower_better'  THEN -value END DESC,
-                ts_utc DESC
-        ) AS rn
-    FROM observations o
-)
-SELECT * FROM ranked WHERE rn = 1;
