@@ -1526,19 +1526,18 @@ Golden-file fixtures: a tiny corpus of legacy JSONL/CSV in `crates/rmlx-metrics/
 
 ### 12.1 Pre-push gate (`make ci`)
 
-`make ci` already runs `fmt-check + lint + test + deny + audit`. Add:
+`make ci` runs `ci-metrics`, which is `rmlx metrics doctor` against
+`<RMLX_HOME>/metrics/runs.db`, skipped when that file is absent. CI never RUNS
+benches (slow, hardware-bound); it validates the DB's structure, identity
+whitelists, unit/direction registry agreement and §4.1 value plausibility.
 
-```makefile
-ci-metrics: ## verify metrics DB sanity (no regressions vs current bests)
-	rmlx metrics doctor
-	rmlx metrics export --markdown > /tmp/RECORDS.md
-	diff -u BENCHMARK_CHAMPIONS.md /tmp/RECORDS.md || \
-		(echo "BENCHMARK_CHAMPIONS.md out of sync — run: rmlx metrics export --markdown > BENCHMARK_CHAMPIONS.md" && exit 1)
-
-ci: fmt-check lint test deny audit ci-metrics
-```
-
-CI never RUNS benches (slow, hardware-bound). It only validates that the committed `BENCHMARK_CHAMPIONS.md` matches what the DB would produce. Stops drift between hand-edits and DB-truth.
+It does **not** diff `BENCHMARK_CHAMPIONS.md`. An earlier draft of this section
+proposed that, and it cannot work: the champions table is a pure function of a
+machine-local, gitignored DB, so the file is gitignored too
+(`.gitignore`, and `make metrics-export` says so on its help line). There is no
+committed copy for CI to compare against, and a per-machine one would differ on
+every host. Regenerate it locally with `make metrics-export` after any change
+that alters what `bests` publishes — for example a §4.1 bounds change.
 
 ### 12.2 Bench-records sweep automation
 
