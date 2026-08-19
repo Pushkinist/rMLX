@@ -11,8 +11,10 @@ use super::*;
 // On a normal serve these codecs never read their CPU block list at decode time:
 // `exit_prefill` materialises the bf16 `decode_fp16_{k,v}` seed for every quant
 // whose `feeds_bf16_k_at_decode()` is true, and every quantized `update_<codec>`
-// early-returns into `update_decode_fp16` from then on. The codec store is
-// written once and then frozen at the prefill length.
+// early-returns into `update_decode_fp16` from then on — which is why
+// `exit_prefill` does not build the store for them at all
+// (`KvQuant::materialises_packed_store`). The fixtures below drive the codec
+// body directly, without a prefill bracket, so the store exists to be cut.
 //
 // A hydrated cache is the exception, and it is what makes the block cut
 // observable. `KvCache::from_storage` leaves `decode_fp16_k: None`, so the codec
@@ -37,10 +39,59 @@ fn build_kvcache_quant(quant: KvQuant, kv_h: i32, seq: i32, seed: u64) -> KvCach
     let n: usize = shape.iter().map(|&x| x as usize).product();
     let k = arr(&lcg(n, seed), &shape);
     let v = arr(&lcg(n, seed ^ 0xABCD), &shape);
-    c.enter_prefill();
+    // Deliberately NOT bracketed by `enter_prefill`/`exit_prefill`: a prefilled
+    // cache of these codecs decodes off the bf16 mirror, so `exit_prefill`
+    // builds no packed store and there would be nothing to spill as blocks.
+    // The unbracketed append drives the codec body directly, which is the state
+    // a hydrated cache is in and the one these fixtures exist to exercise.
     c.update(&k, &v, device).unwrap();
-    c.exit_prefill(device).unwrap();
     c
+}
+
+/// Bracketed counterpart to `build_kvcache_quant`: on the production prefill
+/// path there is no block list to cut, and a truncate is a no-op on it.
+///
+/// The fixtures here drive the codec body directly so a block list exists to
+/// cut. That is the hydrated shape, and it is the right subject — but it leaves
+/// the serve path unasserted in this file. Stated once here: a prefilled cache
+/// of one of these codecs carries no store, so the cut this file is about
+/// cannot mis-fire on it, and the truncate lands on the mirror's offset only.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn a_prefilled_cache_has_no_block_list_to_cut() {
+    let device = Device::Cpu;
+    let shape = [1i32, 2, 64, 128];
+    let n: usize = shape.iter().map(|&x| x as usize).product();
+
+    for quant in [KvQuant::K8V4, KvQuant::K8V8, KvQuant::Planar] {
+        let mut c = KvCache::with_quant_max_seq(quant, 4096);
+        c.enter_prefill();
+        c.update(
+            &arr(&lcg(n, 0x5150), &shape),
+            &arr(&lcg(n, 0x0515), &shape),
+            device,
+        )
+        .unwrap();
+        c.exit_prefill(device).unwrap();
+
+        assert_eq!(
+            c.storage().resident_bytes(),
+            0,
+            "{quant:?}: a prefilled cache carries no packed store, so the block \
+             cut this file exercises has nothing to act on"
+        );
+
+        c.truncate_to(16);
+        assert_eq!(c.offset(), 16, "{quant:?}: truncate moves the cache offset");
+        assert_eq!(
+            c.storage().resident_bytes(),
+            0,
+            "{quant:?}: and still no store afterwards"
+        );
+    }
 }
 
 /// Dequant the V side of a cache to flat head-major `[1, kv_h, S, D]` f32.

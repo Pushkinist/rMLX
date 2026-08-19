@@ -105,7 +105,9 @@ pub mod turboquant_msl;
 
 pub use kvcache::{KvCache, SharedKv};
 pub use linear_attn::LinearAttnCache;
-pub use quant::{validate_rotor_k_asym_v, KvQuant, KvQuantParseError, KV_MAX_SEQ_DEFAULT};
+pub use quant::{
+    validate_rotor_k_asym_v, KvQuant, KvQuantParseError, ALL_KV_QUANTS, KV_MAX_SEQ_DEFAULT,
+};
 
 // ── Kernel-path selection ────────────────────────────────────────────────────
 //

@@ -200,6 +200,50 @@ fn rotor3_multi_layer_all_distinct() {
 /// pairwise distinct. This catches the layer-threading defect class at the
 /// integration layer: if the builder fails to thread `layer_idx`, every
 /// layer's table collapses to the `layer_idx=0` seed and these assertions fire.
+/// Bracketed counterpart: the same builder, driven through the **production**
+/// prefill path.
+///
+/// The unbracketed test below drives the codec body so a rotor table exists to
+/// compare. That leaves the path a real serve takes untested, which is exactly
+/// the path this change moved — so it is asserted here instead: a prefilled
+/// `Rotor3` cache builds no store at all, and its `layer_idx` still threads
+/// through the builder (the field the table is derived from).
+#[test]
+fn rotor3_multi_layer_prefill_builds_no_store_and_keeps_layer_idx() {
+    let n_layers = 4usize;
+    let device = Device::Cpu;
+    let head_dim = 64i32;
+    let shape = [1i32, 1, 2, head_dim];
+    let n: usize = shape.iter().map(|&x| x as usize).product();
+    let k_data = vec![0.1_f32; n];
+    let v_data = vec![0.2_f32; n];
+
+    for i in 0..n_layers {
+        let mut cache = KvCache::with_quant_max_seq(KvQuant::Rotor3, 1024).with_layer_idx(i);
+        cache.enter_prefill();
+        cache
+            .update(&f32_arr(&k_data, &shape), &f32_arr(&v_data, &shape), device)
+            .expect("prefill update");
+        cache.exit_prefill(device).expect("exit_prefill");
+
+        assert_eq!(
+            cache.layer_idx(),
+            i,
+            "builder must thread layer_idx through the prefill path too"
+        );
+        assert_eq!(
+            cache.storage().resident_bytes(),
+            0,
+            "layer {i}: Rotor3 decodes off the bf16 mirror, so a prefilled cache \
+             must hold no packed store — and therefore no rotor table"
+        );
+        assert!(
+            cache.decode_fp16_kv().is_some(),
+            "layer {i}: the mirror is what decode reads, so it must be live"
+        );
+    }
+}
+
 #[test]
 fn rotor3_multi_layer_builder_populates_distinct_tables() {
     let n_layers = 4usize;
@@ -210,17 +254,19 @@ fn rotor3_multi_layer_builder_populates_distinct_tables() {
     let k_data = vec![0.1_f32; n];
     let v_data = vec![0.2_f32; n];
 
-    // Build n_layers caches via the arch-builder pattern, run prefill+exit so
-    // the rotor table is generated on first append.
+    // Build n_layers caches via the arch-builder pattern and append once so the
+    // rotor table is generated. The append is deliberately NOT bracketed by
+    // `enter_prefill`/`exit_prefill`: a prefilled Rotor3 cache decodes off the
+    // bf16 mirror, so `exit_prefill` builds no packed store and there would be
+    // no rotor table to read. The unbracketed append is the same path a
+    // hydrated cache takes, which is where the store is load-bearing.
     let mut caches: Vec<KvCache> = (0..n_layers)
         .map(|i| KvCache::with_quant_max_seq(KvQuant::Rotor3, 1024).with_layer_idx(i))
         .collect();
     for cache in &mut caches {
-        cache.enter_prefill();
         let k = f32_arr(&k_data, &shape);
         let v = f32_arr(&v_data, &shape);
-        cache.update(&k, &v, device).expect("prefill update");
-        cache.exit_prefill(device).expect("exit_prefill");
+        cache.update(&k, &v, device).expect("codec append");
     }
 
     // Read the first rotor (4 floats) from each layer's live storage.

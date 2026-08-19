@@ -250,13 +250,16 @@ pub struct KvLayerShape {
 /// **increase** resident KV versus plain bf16 on the active layer mix
 /// (issue #34).
 ///
-/// Why this can happen, generally: a quantized codec keeps a warm-TTFT bf16
-/// decode seed (`decode_fp16_k/v`) alongside its packed codes + per-group
+/// Why this can happen, generally: a quantized codec can keep a warm-TTFT bf16
+/// decode seed (`decode_fp16_k/v`) alongside its packed codes and per-group
 /// scales on every **global** layer (see
-/// [`rmlx_kv_quant::KvQuant::feeds_bf16_k_at_decode`]). At small effective
-/// context the codes + scales are pure overhead on top of a buffer the same
-/// size as bf16, so the codec is net-negative. **Windowed layers always run
-/// the bf16 rotating ring regardless of the flag**
+/// [`rmlx_kv_quant::KvQuant::feeds_bf16_k_at_decode`]). Where it does, those
+/// codes and scales are pure overhead on top of a buffer the same size as bf16
+/// and the codec is net-negative. A codec whose decode reads only the mirror
+/// builds no store at all
+/// ([`rmlx_kv_quant::KvQuant::materialises_packed_store`]), so it holds exactly
+/// the bf16 bytes and never reaches this warn.
+/// **Windowed layers always run the bf16 rotating ring regardless of the flag**
 /// (`RotatingKVCache.to_quantized` raises `NotImplementedError` in mlx-lm;
 /// rMLX matches it), so they are a no-op for the codec and contribute zero to
 /// the delta — the net-negative is a property of the global layers only.

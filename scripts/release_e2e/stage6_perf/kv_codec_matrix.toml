@@ -128,7 +128,7 @@ context_length = 32768
 expected_retrieval_pct = 1.0000
 smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
 skip_reason = ""
-cli_args = "--cache-type-k planar_k4"
+cli_args = "--cache-type-k planar_k4 --cache-type-v bf16"
 niah_filter = "niah_bonsai_32k"
 
 [[entries]]
@@ -256,7 +256,7 @@ context_length = 32768
 expected_retrieval_pct = 1.0000
 smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
 skip_reason = ""
-cli_args = "--cache-type-k planar_k4"
+cli_args = "--cache-type-k planar_k4 --cache-type-v bf16"
 niah_filter = "niah_gemma4_32k"
 
 [[entries]]
@@ -384,8 +384,8 @@ model = "qwen3.6-moe-8bit"
 context_length = 32768
 expected_retrieval_pct = 1.0000
 smoke_probe_prompts = ["coherence", "instruction", "multi_turn"]
-skip_reason = ""
-cli_args = "--cache-type-k planar_k4"
+skip_reason = "planar-k-qwen-moe-arch-guard: K-side 4-bit is rejected for Qwen3.5/3.6 MoE by cache_type::validate_resolved (PPL disaster); the row can never run"
+cli_args = "--cache-type-k planar_k4 --cache-type-v bf16"
 niah_filter = "niah_qwen36_32k"
 
 [[entries]]

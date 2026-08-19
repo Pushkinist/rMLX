@@ -135,20 +135,24 @@ binding constraint is not the ring, it is the **bf16 decode seed**.
 `exit_prefill` materialises `decode_fp16_{k,v}` for every quant whose
 `feeds_bf16_k_at_decode()` is true (all of them), and each quantized
 `update_<codec>` then early-returns into `update_decode_fp16` on its first line —
-so post-prefill the codec store is frozen and not read at decode time at all. A
-plain GPU serve therefore cannot observe whether the cut happened, on any of
-these codecs, including the ones whose encode is forced to `Device::Cpu`
-(`K8VTurbo2/3`, both TCQ variants, `TurboSym3`) — that forced-CPU `append` sits
-*below* the same early return.
+so the codec store is not read at decode time at all, and because it is not,
+`exit_prefill` does not build it either (`KvQuant::materialises_packed_store()`;
+see `docs/KV_CACHE.md` §9.6 F3). A plain GPU serve therefore cannot observe
+whether the cut happened, on any of these codecs — there is no store to cut —
+including the ones whose encode is forced to `Device::Cpu` (`K8VTurbo2/3`, both
+TCQ variants, `TurboSym3`) — that forced-CPU `append` sits *below* the same early
+return.
 
 Where it is observable: a **hydrated** cache (`KvCache::from_storage` leaves
 `decode_fp16_k: None`, so the codec arm runs every decode step and the blocks are
 the cache), a `Device::Cpu` run, and any cache that never bracketed a prefill.
-An uncut store is also still *written out* on the seeded path — the SSD spill
+An uncut store is also still *written out* wherever one exists — the SSD spill
 serialises `blocks` against `shape[2]`, and the prompt-cache snapshot clones
-them — which is how the defect travels from a seeded serve into the hydrated
-cache that later reads it. See `rmlx-kv-ssd/src/hydrate_tests.rs` for the
-round-trip that pins this.
+them — which is how the defect travels into the hydrated cache that later reads
+it. That route now applies only to the codecs that keep a store (the K-only and
+fused-symmetric families, `Mixed` / `RotK` / `RotKTq4V`) and to already-hydrated
+store-backed caches; a seeded bf16-mirror cache spills its mirror instead. See
+`rmlx-kv-ssd/src/hydrate_tests.rs` for the round-trip that pins this.
 
 **Scope.** `KvStorage::truncate_to` no longer contains a bare `shape[2] = n` in
 any arm — `K8V4`, `K8V8`, `Planar`, `PlanarK`, `TurboSym3/4`, `K8VTurbo2/3`, both

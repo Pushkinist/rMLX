@@ -110,6 +110,16 @@ type Result<T> = std::result::Result<T, SsdKvIndexError>;
 ///   type and the table shape are unchanged; only the stored unit moved, so
 ///   v2 rows must not be left to sit beside v3 rows three orders of magnitude
 ///   away.
+/// - v3 → v4: the **block payload** changed for every bf16-mirror codec
+///   (`K8V4`, `K8V8`, `Planar*`, `PlanarK`, `K8VTurbo*`, `TurboSym*`,
+///   `Iso3/4`, `Rotor3/4`, `RotorK*Asym`). Those layers used to spill codes +
+///   scales under their codec tag and now spill the bf16 mirror under
+///   `none_bf16`, because `exit_prefill` no longer builds a store nothing
+///   reads. Neither the index shape nor the `(hash, layout_key)` key changed,
+///   so a v3 block would still *hit* — and hydrate store-backed, with no bf16
+///   mirror, so the request would decode off dequantised numbers while the
+///   same hit served from RAM decodes bf16. The version is what routes those
+///   namespaces through the wipe instead.
 ///
 /// v2 rows are **convertible** — `UPDATE kv_blocks SET last_used = last_used *
 /// 1000000` is the whole migration. They are wiped anyway, and that is a
@@ -117,7 +127,7 @@ type Result<T> = std::result::Result<T, SsdKvIndexError>;
 /// whose worst loss is one re-prefill per block, and carrying migration code
 /// (plus the branch in the wipe pass that has to let a v2 DB through so it can
 /// be converted) buys nothing a warm cache does not rebuild in minutes.
-pub(crate) const SCHEMA_VERSION: i64 = 3;
+pub(crate) const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA_PRAGMAS: &str = "
 PRAGMA journal_mode = WAL;
