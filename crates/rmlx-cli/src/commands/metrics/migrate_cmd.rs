@@ -51,6 +51,7 @@ pub(super) fn cmd_migrate(
         "cbb_csv_rows_skipped": report.cbb_csv_rows_skipped,
         "cbb_csv_parse_failures": report.cbb_csv_parse_failures.len(),
         "records_md_cells_added": report.records_md_cells_added,
+        "metrics_dropped_implausible": report.metrics_dropped_implausible,
     });
     println!("{}", serde_json::to_string(&summary)?);
     Ok(())

@@ -714,7 +714,7 @@ pub fn champions(conn: &Connection, backend_filter: Option<&str>) -> Result<Vec<
     for (ns, model, wq, kq) in &distinct_cells {
         let mut metrics_map = std::collections::BTreeMap::new();
 
-        for (metric_name, _, _) in crate::registry::METRICS {
+        for (metric_name, _, _, _) in crate::registry::METRICS {
             let champion: Option<ChampionCell> = if let Some(b) = backend_filter {
                 stmt_with_backend
                     .query_row(rusqlite::params![ns, model, wq, kq, metric_name, b], |r| {

@@ -48,6 +48,20 @@ pub fn open(path: &std::path::Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Open (or create) the DB at `path` read-write with the schema brought up to
+/// date, including the registry-generated `bests` view.
+///
+/// This is what a command that *reads* should use. `open` alone leaves the
+/// caller reading whatever schema the last writer happened to leave behind —
+/// a query command run against a DB older than the binary silently reads a
+/// stale `bests` definition, which is how a champion view keeps publishing
+/// rows the current registry rejects.
+pub fn open_migrated(path: &std::path::Path) -> Result<Connection> {
+    let mut conn = open(path)?;
+    crate::migrate::run_pending(&mut conn)?;
+    Ok(conn)
+}
+
 /// Open an in-memory DB for tests.
 ///
 /// `:memory:` does not persist WAL to disk (journal_mode stays `memory`),

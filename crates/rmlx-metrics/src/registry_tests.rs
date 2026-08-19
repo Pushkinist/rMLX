@@ -69,7 +69,7 @@ fn every_spec_metric_present() {
     ];
     for name in spec_names {
         assert!(
-            METRICS.iter().any(|(n, _, _)| *n == name),
+            METRICS.iter().any(|(n, _, _, _)| *n == name),
             "metric '{name}' missing from METRICS"
         );
     }
@@ -121,7 +121,7 @@ fn every_metric_has_valid_unit() {
     let valid_units = [
         "tps", "ms", "mb", "bytes", "ratio", "count", "mb/s", "ppl", "nat",
     ];
-    for (name, unit, _) in METRICS {
+    for (name, unit, _, _) in METRICS {
         assert!(
             valid_units.contains(unit),
             "metric '{name}' has unknown unit '{unit}'"

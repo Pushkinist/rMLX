@@ -177,14 +177,33 @@ WITH ranked AS (
         ROW_NUMBER() OVER (
             PARTITION BY backend, model_namespace, model, weight_quant, kv_quant, ctx_max, prompt_id, metric
             ORDER BY
-                CASE WHEN direction = 'higher_better' THEN value END DESC,
-                CASE WHEN direction = 'lower_better'  THEN value END ASC,
+                CASE WHEN direction = 'higher_better' THEN  value END DESC,
+                CASE WHEN direction = 'lower_better'  THEN -value END DESC,
                 ts_utc DESC                           -- tie-breaker: newer wins
         ) AS rn
     FROM observations o
+    WHERE CASE metric                                 -- §4.1 plausible-value bounds
+              WHEN 'decode_tps_warm' THEN (value > 0.0 AND value <= 10000.0)
+              WHEN 'prompt_cache_hits' THEN (value >= 0.0 AND value <= 1e12)
+              -- … one branch per §4 metric, generated from the registry …
+              ELSE 1
+          END
 )
 SELECT * FROM ranked WHERE rn = 1;
 ```
+
+The `WHERE` is **generated from the §4 registry**, not written by hand:
+`rmlx_metrics::bests_view::create_sql` renders one branch per metric from the
+same `Bounds` the ingest validator enforces, and `migrate::run_pending`
+recreates the view whenever the stored definition and the registry disagree.
+Retyping the bound in SQL is how the view and the gate would drift apart.
+
+Rows outside the bound are **excluded, not re-ranked**: the cell falls to the
+best plausible runner-up, and disappears from `bests` when there is none. That
+is the intended outcome — an absent anchor is honest, an implausible one is
+not. The ranking has no plausibility floor of its own, so without this filter
+the largest number in a partition wins by construction, which is how
+`prefill_tps = (prompt_tokens - 242) * 1000` rows published as champions.
 
 Every column from `observations` is preserved on the champion row, so callers see the full run context that set the record (git_sha, description, etc.).
 
@@ -437,6 +456,68 @@ Source of truth for `observations.metric`, `.unit`, `.direction`. Add to this ta
 | `tpot_p99_ms`                    | `ms`    | `lower_better`  | TPOT 99th percentile over decode-only intervals. Mirrors `itl_p99_ms` in v1. Phase=`Decode`. rmlx-only. |
 
 **Dropped metrics** (vs first draft): `model_disk_gb` (not a perf metric, derivable from `du -sh <model_path>` on demand) and `tps_per_gb_disk` (depends on disk_gb).
+
+### 4.1 Plausible-value bounds
+
+Every registry entry also carries a `Bounds` — the window of values that can be
+a *measurement* of that metric. Per-metric values live in
+`crates/rmlx-metrics/src/registry.rs` (`METRICS`); this section is the policy
+they follow.
+
+Each metric counts, times or rates a physical quantity, so the floor is always
+`0.0` and a negative value is never a measurement. What differs is whether the
+floor is itself a measurement:
+
+| Family | Floor | Ceiling | Why |
+|---|---|---|---|
+| Rates (`tps`, `mb/s`, `tps_per_gb_ram`) | `0` **excluded** | 1e4–1e6 | `tokens / seconds` is zero only when no token was produced — nothing was measured. |
+| Durations (`ms`) | `0` included | 3.6e6 (1 h) | Millisecond resolution rounds a sub-ms span to zero. A single span past an hour is a hung run. |
+| Counters (`count`) | `0` included | 1e12 | Zero cache hits is a real observation. |
+| Gauges (`mb`, `bytes`) | `0` included, except `peak_rss_mb` | 1e9 MB / 1e13 B | A live process always has RSS; a run can genuinely allocate no Metal. |
+| Ratios (`ratio`) | `0` included | 1.0 (or 1e3 for `accepted_per_step`) | Rates of acceptance are honestly zero. |
+
+Ceilings are deliberately loose — several × the best value ever recorded — so
+they reject fabrications, not fast machines. NaN and infinities are outside
+every window.
+
+Three places enforce the same bounds, from the same table:
+
+1. **Ingest** — `RunRecord::validate` rejects the whole record with
+   `ImplausibleValue`. An emitter with no measurement must send `null`; the
+   recorder writes no row for a null and that is the supported way to say
+   "not measured". A placeholder number is not.
+2. **`bests`** — the view does not rank rows outside the bound (§3.3).
+3. **`rmlx metrics doctor`** — check 6b reports rows already in the DB
+   (§10.4). A *warning*, not an error: `observations` is append-only, so those
+   rows cannot be deleted or corrected, and failing on them would make every
+   `make ci` run permanently red — a stuck light, not a gate. The gate that
+   fails is (1); 6b reports what it would now refuse.
+
+**Archive converters are the one exception.** `rmlx metrics migrate` replays
+another tool's CSV/JSONL exports, which write `0.0` in a column they never
+measured. Those entries are dropped rather than failing the whole historical
+run, and counted in the migrate report as `metrics_dropped_implausible`.
+
+#### Known-bad rows already in the DB
+
+Rows written before these gates existed are still there — `observations` is
+append-only and nothing is deleted. Two known populations, both excluded from
+`bests` by the bound and reported by `doctor`:
+
+- **`prefill_tps` ≥ 1e5** — 20 rows from a legacy buffer replay storing
+  `(prompt_tokens - 242) * 1000` under `unit='tps'`. The producing script
+  derived `prefill_s` from `elapsed_s - n_comp / (n_comp / elapsed_s)`, which
+  is identically zero, so it always hit a `0.001 s` floor and reported
+  `prompt_tokens × 1000` as a rate. `value >= 1e5` identifies them; the
+  `notes` string they carry does not, since the emitting code no longer writes
+  it.
+- **rate metrics `= 0.0`** — an early-stopped run recording a fabricated zero
+  instead of nothing. These win any cell whose rows are all zeros, so an
+  upper-only bound would have *promoted* them; the bound has to be two-sided.
+
+Anything anchoring on a recorded rate — a roofline, a champion table, a
+`rmlx metrics rank` — should read `bests`, which already excludes both, rather
+than re-implementing the predicate against `observations`.
 
 **Backend coverage matrix** (which backend can emit which metric — sparse is fine, see §3.3):
 
@@ -1145,7 +1226,7 @@ def record_run(row: dict) -> None:
 | `omlx`      | yes                   | maybe            | yes            |
 | `ollama`    | no                    | no               | yes (HTTP)     |
 
-Each row in the `metrics: []` array with `value: null` is silently skipped. No backend needs to lie about a metric it can't measure.
+Each row in the `metrics: []` array with `value: null` is silently skipped. No backend needs to lie about a metric it can't measure — and it must not: a placeholder `0.0` in place of a `null` is rejected at ingest by the §4.1 bounds, because once stored it ranks and publishes exactly like a measured zero.
 
 ### 8.7 Prompt ownership — rMLX is the source-of-truth
 
@@ -1305,9 +1386,10 @@ Runs in this order, exits non-zero on any failure:
 4. Whitelist sweep — `SELECT DISTINCT backend FROM bests EXCEPT VALUES ('rmlx'),('mlx_lm'),(…)` etc. for `backend`, `model_namespace`, `weight_quant`, `kv_quant`, `metric`. Any row outside whitelist = error with PK printed.
 5. Direction sanity — every `metric` value must have correct `direction` per §4 registry. Mismatch = error.
 6. Unit sanity — every `metric` value must have correct `unit` per registry. Mismatch = error.
+6b. Value plausibility — every `value` must be inside its §4.1 bounds. Unit sanity checks the *label*; this checks the *number*. Reported per metric with a count and the first offending id. **Warning**, never auto-fixed: these rows predate the ingest gate, `observations` is append-only, and the true value is not recoverable — only re-measurable.
 7. Stale-prompt check — prompts referenced from `bests` whose body sha256 doesn't match any `prompts/*.json` file. Warn (not error — a removed prompt file might still have valid history).
 
-`rmlx metrics doctor --fix` attempts safe auto-repairs (re-derives `unit`/`direction` from registry; fixes none of the others).
+`rmlx metrics doctor --fix` attempts safe auto-repairs (re-derives `unit`/`direction` from registry; fixes none of the others, including 6b).
 
 ### 10.5 Concurrency
 
@@ -1472,7 +1554,7 @@ For any future Claude session that touches metrics:
 17. **Prompts owned by rMLX repo** — `rMLX/prompts/*.json` is canonical. CBB symlinks. Content-addressed by sha256, so editing a file = new prompt id; old runs still reference old id. Bench runners include full body in ingest record; recorder hashes + dedups.
 18. **JSON buffer per run** (§8.4) — bench writes `metrics/buffer/pending/<ts>-<uuid>.json`, calls recorder, deletes on success or moves to `failed/` on rejection. Crash recovery via `--replay-pending`.
 19. **`inserted_by` audit field** — every row carries `<tool>@<semver>`. Never NULL. Triage rows by tool when anomalies appear.
-20. **`rmlx metrics doctor`** — run after migrations or before suspect-state operations. Validates schema version, FKs, whitelists, unit/direction sanity.
+20. **`rmlx metrics doctor`** — run after migrations or before suspect-state operations. Validates schema version, FKs, whitelists, unit/direction sanity, and §4.1 value plausibility.
 21. **No parallel writers.** Single MLX process rule already prevents this. PID-flock available as belt-and-braces.
 22. **Atomicity per run** — one `record` invocation = one transaction = all observations from that run land or none do.
 23. **DB is also a Grafana datasource** — the `observations` table is a time-series. Schema choices privilege read-time derivation over write-time pruning specifically to keep history queryable. Never delete observations to "clean up" — that breaks the dashboards.

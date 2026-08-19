@@ -24,8 +24,8 @@ pub(super) fn cmd_prompts(db_path: &Path, action: PromptsAction) -> anyhow::Resu
 }
 
 fn cmd_prompts_list(db_path: &Path) -> anyhow::Result<()> {
-    let conn =
-        schema::open(db_path).with_context(|| format!("open DB at {}", db_path.display()))?;
+    let conn = schema::open_migrated(db_path)
+        .with_context(|| format!("open DB at {}", db_path.display()))?;
     let store = prompts::PromptStore::new(&conn);
     let rows = store.list().map_err(|e| anyhow::anyhow!("{e}"))?;
     if rows.is_empty() {
@@ -55,8 +55,8 @@ fn cmd_prompts_list(db_path: &Path) -> anyhow::Result<()> {
 }
 
 fn cmd_prompts_get(db_path: &Path, name: &str) -> anyhow::Result<()> {
-    let conn =
-        schema::open(db_path).with_context(|| format!("open DB at {}", db_path.display()))?;
+    let conn = schema::open_migrated(db_path)
+        .with_context(|| format!("open DB at {}", db_path.display()))?;
     let store = prompts::PromptStore::new(&conn);
     let row = store
         .find_latest_by_name(name)
@@ -83,8 +83,8 @@ fn cmd_prompts_add(
         pf.notes = Some(notes.to_owned());
     }
 
-    let conn =
-        schema::open(db_path).with_context(|| format!("open DB at {}", db_path.display()))?;
+    let conn = schema::open_migrated(db_path)
+        .with_context(|| format!("open DB at {}", db_path.display()))?;
     let store = prompts::PromptStore::new(&conn);
     let id = store
         .get_or_insert(&pf.name, &pf.body, pf.tokens_approx, pf.notes.as_deref())
@@ -96,8 +96,8 @@ fn cmd_prompts_add(
 fn cmd_prompts_sync(db_path: &Path) -> anyhow::Result<()> {
     let root = repo_root();
     let prompts_dir = root.join("prompts");
-    let conn =
-        schema::open(db_path).with_context(|| format!("open DB at {}", db_path.display()))?;
+    let conn = schema::open_migrated(db_path)
+        .with_context(|| format!("open DB at {}", db_path.display()))?;
     let (inserted, total) =
         prompts::sync_dir(&conn, &prompts_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
     println!("sync: inserted={inserted}, total={total}");
@@ -113,8 +113,8 @@ pub(super) fn cmd_champions(
     backend_filter: Option<&str>,
     jsonl: bool,
 ) -> anyhow::Result<()> {
-    let conn =
-        schema::open(db_path).with_context(|| format!("open DB at {}", db_path.display()))?;
+    let conn = schema::open_migrated(db_path)
+        .with_context(|| format!("open DB at {}", db_path.display()))?;
     let rows = query::champions(&conn, backend_filter).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if jsonl {

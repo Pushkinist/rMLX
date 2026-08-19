@@ -29,8 +29,8 @@ pub(super) fn cmd_export(
         anyhow::bail!("--scope only applies to --markdown");
     }
 
-    let conn =
-        schema::open(db_path).with_context(|| format!("open DB at {}", db_path.display()))?;
+    let conn = schema::open_migrated(db_path)
+        .with_context(|| format!("open DB at {}", db_path.display()))?;
 
     let scope = match scope_path {
         Some(p) => Some(

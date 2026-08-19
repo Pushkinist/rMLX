@@ -127,7 +127,15 @@ fn migrate_one_jsonl_row_inserts_two_metrics() {
     let prompt = load_prompt_file(&prompt_dir.path().join("longctx_4k.json")).unwrap();
     let mut conn = test_conn();
 
-    let inserted = ingest_jsonl_row(&mut conn, &jsonl_row_str(), false, &prompt, &opts).unwrap();
+    let inserted = ingest_jsonl_row(
+        &mut conn,
+        &jsonl_row_str(),
+        false,
+        &prompt,
+        &opts,
+        &mut MigrateReport::default(),
+    )
+    .unwrap();
     assert!(inserted, "first insert must succeed");
 
     let count: i64 = conn
@@ -144,10 +152,26 @@ fn migrate_jsonl_idempotent() {
     let mut conn = test_conn();
     let line = jsonl_row_str();
 
-    let first = ingest_jsonl_row(&mut conn, &line, false, &prompt, &opts).unwrap();
+    let first = ingest_jsonl_row(
+        &mut conn,
+        &line,
+        false,
+        &prompt,
+        &opts,
+        &mut MigrateReport::default(),
+    )
+    .unwrap();
     assert!(first);
 
-    let second = ingest_jsonl_row(&mut conn, &line, false, &prompt, &opts).unwrap();
+    let second = ingest_jsonl_row(
+        &mut conn,
+        &line,
+        false,
+        &prompt,
+        &opts,
+        &mut MigrateReport::default(),
+    )
+    .unwrap();
     assert!(!second, "second insert must be skipped");
 
     let count: i64 = conn
@@ -236,7 +260,14 @@ fn migrate_unknown_namespace_logs_and_skips_row() {
     })
     .to_string();
 
-    let result = ingest_jsonl_row(&mut conn, &line, false, &prompt, &opts);
+    let result = ingest_jsonl_row(
+        &mut conn,
+        &line,
+        false,
+        &prompt,
+        &opts,
+        &mut MigrateReport::default(),
+    );
     assert!(result.is_err(), "unknown namespace must return Err");
 
     let count: i64 = conn

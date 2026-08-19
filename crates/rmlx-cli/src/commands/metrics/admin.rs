@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-use rmlx_metrics::{identity, migrate, registry, schema};
+use rmlx_metrics::{bests_view, identity, migrate, registry, schema};
 use rusqlite::params;
 
 // ---------------------------------------------------------------------------
@@ -95,6 +95,20 @@ pub(super) fn cmd_doctor(db_path: &Path, fix: bool) -> anyhow::Result<()> {
         }
     }
 
+    // ── Check 3b: bests view matches the registry ─────────────────────────────
+    //
+    // The view is generated from the §4 registry, not pinned to a migration
+    // number, so a DB already at the latest schema version can still carry a
+    // definition built from an older registry — including one with no
+    // plausibility filter at all. Checking `user_version` cannot see that.
+    {
+        if bests_view::ensure(&conn).context("ensure bests view")? {
+            println!("[fix] bests view: rebuilt from the §4 metric registry");
+        } else {
+            println!("[ok] bests view: definition matches the §4 metric registry");
+        }
+    }
+
     // ── Check 4: whitelist sweep ──────────────────────────────────────────────
     {
         let checks: &[(&str, &str, &[&str])] = &[
@@ -171,7 +185,7 @@ pub(super) fn cmd_doctor(db_path: &Path, fix: bool) -> anyhow::Result<()> {
 
         // Metric column whitelist check
         {
-            let metric_names: Vec<&str> = registry::METRICS.iter().map(|(n, _, _)| *n).collect();
+            let metric_names: Vec<&str> = registry::METRICS.iter().map(|(n, _, _, _)| *n).collect();
             let placeholders = metric_names
                 .iter()
                 .map(|v| format!("'{v}'"))
@@ -275,6 +289,64 @@ pub(super) fn cmd_doctor(db_path: &Path, fix: bool) -> anyhow::Result<()> {
             println!("[ok] unit sanity: all units match registry");
         } else {
             errors += unit_errors;
+        }
+    }
+
+    // ── Check 6b: value plausibility ──────────────────────────────────────────
+    //
+    // Unit sanity above compares the unit *label* against the registry; it
+    // cannot see a number that is not in that unit at all. This check compares
+    // the number against the registry's plausible window: a rate of exactly
+    // 0.0 (a missing field ingested as a measurement) or a value orders of
+    // magnitude past the hardware (an arithmetic accident) is reported here.
+    //
+    // A warning, not an error, and deliberately so. `observations` is
+    // append-only: the rows this finds predate the ingest gate and cannot be
+    // deleted or corrected — the true value is not recoverable from the row,
+    // only re-measurable. An error here would make every `make ci` on a
+    // machine with history permanently red, which is not a gate but a stuck
+    // light. The gate that can actually fail is `RunRecord::validate`, which
+    // refuses such a value at the door; this check is the report of what it
+    // would now refuse, and the `bests` view already excludes the rows.
+    {
+        let mut plausibility_warnings: u32 = 0;
+        for (metric, _, _, bounds) in registry::METRICS {
+            let (bad, min_bad, max_bad, first_id): (i64, Option<f64>, Option<f64>, Option<i64>) =
+                conn.query_row(
+                    &format!(
+                        "SELECT COUNT(*), MIN(value), MAX(value), MIN(id)
+                           FROM observations
+                          WHERE metric = ?1 AND NOT ({})",
+                        bounds.sql("value")
+                    ),
+                    params![metric],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .with_context(|| format!("value-plausibility query for metric '{metric}'"))?;
+
+            if bad > 0 {
+                let (lo, hi, id) = (
+                    min_bad.unwrap_or(f64::NAN),
+                    max_bad.unwrap_or(f64::NAN),
+                    first_id.unwrap_or(-1),
+                );
+                eprintln!(
+                    "[WARN] value plausibility: metric '{metric}' has {bad} row(s) outside {} \
+                     (range {lo} .. {hi}, first observation id={id})",
+                    bounds.describe()
+                );
+                plausibility_warnings += 1;
+            }
+        }
+        if plausibility_warnings == 0 {
+            println!("[ok] value plausibility: all values inside registry bounds");
+        } else {
+            println!(
+                "[warn] {plausibility_warnings} metric(s) carry implausible values — historical \
+                 rows, excluded from the `bests` view, refused by ingest today; re-measure, \
+                 do not repair"
+            );
+            warnings += plausibility_warnings;
         }
     }
 

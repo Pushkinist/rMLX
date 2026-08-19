@@ -81,6 +81,11 @@ pub struct MigrateReport {
 
     /// Number of `BENCHMARK_RECORDS.md` table cells successfully ingested.
     pub records_md_cells_added: usize,
+
+    /// Metric entries dropped because the archive carried a placeholder the §4
+    /// bounds cannot read as a measurement (a `0.0` in a column the exporting
+    /// tool never measured). Counted, not silent.
+    pub metrics_dropped_implausible: usize,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -236,7 +241,7 @@ fn migrate_jsonl_files(
             }
             report.rmlx_jsonl_rows_total += 1;
 
-            match ingest_jsonl_row(conn, line, is_dirty_file, prompt, opts) {
+            match ingest_jsonl_row(conn, line, is_dirty_file, prompt, opts, report) {
                 Ok(inserted) => {
                     if inserted {
                         report.rmlx_jsonl_rows_inserted += 1;
@@ -271,6 +276,7 @@ fn ingest_jsonl_row(
     is_dirty_file: bool,
     prompt: &LoadedPrompt,
     opts: &MigrateOptions,
+    report: &mut MigrateReport,
 ) -> Result<bool> {
     let row: RmlxJsonlRow =
         serde_json::from_str(line).map_err(|e| Error::Schema(format!("JSONL parse error: {e}")))?;
@@ -334,7 +340,7 @@ fn ingest_jsonl_row(
         });
     }
 
-    let run = RunRecord {
+    let mut run = RunRecord {
         schema_version: RECORD_SCHEMA_VERSION,
         backend: "rmlx".to_string(),
         backend_version: None,
@@ -364,6 +370,12 @@ fn ingest_jsonl_row(
         description: None,
         metrics,
     };
+
+    // Same placeholder convention as the CSV pass — see the note there.
+    report.metrics_dropped_implausible += run.drop_implausible_metrics();
+    if run.metrics.is_empty() {
+        return Ok(false);
+    }
 
     let mut rec = Recorder::legacy_archive(conn, &opts.inserted_by);
     rec.record_run(&run)?;
@@ -594,15 +606,6 @@ fn migrate_cbb_csv(
             });
         }
 
-        // Filter out zero-value task_pass_at_1 that CBB emits when not measured.
-        let metrics: Vec<MetricEntry> = metrics
-            .into_iter()
-            .filter(|m| {
-                m.value
-                    .is_some_and(|v| v != 0.0 || m.name != "task_pass_at_1")
-            })
-            .collect();
-
         if metrics.is_empty() {
             report.cbb_csv_rows_skipped += 1;
             continue;
@@ -612,7 +615,7 @@ fn migrate_cbb_csv(
             "legacy_run_key={legacy_key}; migrated from CBB summary.csv"
         ));
 
-        let run = RunRecord {
+        let mut run = RunRecord {
             schema_version: RECORD_SCHEMA_VERSION,
             backend,
             backend_version,
@@ -637,6 +640,16 @@ fn migrate_cbb_csv(
             description: None,
             metrics,
         };
+
+        // The exporter writes `0.0` in a column it did not measure — that is
+        // what the old `task_pass_at_1 == 0.0` special case was reacting to.
+        // The §4 bounds say which metrics can read zero, so the placeholder is
+        // dropped for all of them, not just the one that was noticed first.
+        report.metrics_dropped_implausible += run.drop_implausible_metrics();
+        if run.metrics.is_empty() {
+            report.cbb_csv_rows_skipped += 1;
+            continue;
+        }
 
         match Recorder::legacy_archive(conn, &opts.inserted_by).record_run(&run) {
             Ok(_) => report.cbb_csv_rows_inserted += 1,

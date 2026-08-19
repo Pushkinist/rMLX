@@ -74,6 +74,10 @@ CREATE INDEX IF NOT EXISTS obs_inserted_idx  ON observations(inserted_utc);
 -- §3.3 bests VIEW — champion per cell via ROW_NUMBER, tie-break newer ts_utc wins
 -- Must remain a VIEW; do NOT convert to a base table (§3.3 note).
 -- No triggers (§3.5).
+-- This is the initial definition only. `migrate::run_pending` finishes by
+-- calling `bests_view::ensure`, which replaces it with the definition
+-- generated from the §4 metric registry (adds the §4.1 plausibility filter).
+-- Edit `bests_view::create_sql`, not this statement.
 CREATE VIEW IF NOT EXISTS bests AS
 WITH ranked AS (
     SELECT

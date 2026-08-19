@@ -932,7 +932,10 @@ Create the schema and seed `schema_meta`. Refuses if the file already exists.
 
 #### `metrics doctor`
 
-Verify schema version, integrity, FKs, whitelists, units, and directions.
+Verify schema version, integrity, FKs, whitelists, units, directions, and
+value plausibility (every `value` inside its `METRICS_DB.md` §4.1 bounds).
+`--fix` does not touch an implausible value: it is not recoverable from the
+row, only re-measurable.
 
 | Flag | Default | Description |
 |---|---|---|

@@ -38,6 +38,26 @@ pub enum Error {
     #[error("unknown metric: '{0}' (not in registry; see docs/METRICS_DB.md §4)")]
     UnknownMetric(String),
 
+    /// The value cannot be a measurement of the metric it is filed under.
+    ///
+    /// A rate of exactly `0.0`, or a value orders of magnitude past what the
+    /// hardware can produce, is a missing or miscomputed field, not a record —
+    /// and once stored it wins the `bests` view and publishes as a champion.
+    /// Emitters must send `null` for a measurement they do not have.
+    #[error(
+        "ingest: {value} is not a plausible '{metric}' — the registry bounds are {bounds} \
+         (see docs/METRICS_DB.md §4). Send null, not a placeholder, for a metric \
+         this run did not measure."
+    )]
+    ImplausibleValue {
+        /// Registry name of the metric the value was filed under.
+        metric: String,
+        /// The value that was rejected.
+        value: f64,
+        /// Human-readable rendering of the plausible window, e.g. `(0, 100000]`.
+        bounds: String,
+    },
+
     /// The direction string is not `"higher_better"` or `"lower_better"`.
     #[error("unknown direction: '{0}' (must be 'higher_better' or 'lower_better')")]
     UnknownDirection(String),

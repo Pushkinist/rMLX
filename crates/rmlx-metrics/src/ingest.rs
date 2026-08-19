@@ -268,6 +268,29 @@ pub(crate) enum IdentityPolicy {
 // ── RunRecord impl ────────────────────────────────────────────────────────────
 
 impl RunRecord {
+    /// Drops metric entries the §4 registry cannot read as a measurement,
+    /// returning how many were dropped.
+    ///
+    /// For the *archive* converters only (`migrate::legacy`). Those tools'
+    /// CSV/JSONL exports write `0.0` in a column they did not measure, and a
+    /// whole historical run should not be lost because one column carries
+    /// that placeholder. Live ingest gets no such courtesy: [`Self::validate`]
+    /// rejects the record so the emitter is fixed rather than the number
+    /// quietly dropped.
+    pub(crate) fn drop_implausible_metrics(&mut self) -> usize {
+        let before = self.metrics.len();
+        self.metrics.retain(|entry| match entry.value {
+            Some(value) => match registry::bounds(&entry.name) {
+                Ok(bounds) => bounds.contains(value),
+                // An unregistered name is not this function's business — keep
+                // it so `validate` still rejects it by name.
+                Err(_) => true,
+            },
+            None => true,
+        });
+        before - self.metrics.len()
+    }
+
     /// Validates per §8.5 required fields + §4 metric registry + §5
     /// whitelists (`backend`, `weight_quant`), enforcing the run-identity
     /// contract ([`IdentityPolicy::Enforce`]). `model_namespace`, `model`,
@@ -401,9 +424,23 @@ impl RunRecord {
             return Err(Error::NoMeasurements);
         }
 
-        // every metric name in registry
+        // every metric name in registry, and every value a possible
+        // measurement of it. A null value is a deliberate "not measured" and
+        // is skipped by the recorder; a fabricated stand-in (a zero rate, an
+        // arithmetic accident orders of magnitude out of range) is not, and it
+        // outranks every real row in `bests` the moment it lands.
         for entry in &self.metrics {
             registry::lookup(&entry.name)?;
+            if let Some(value) = entry.value {
+                let bounds = registry::bounds(&entry.name)?;
+                if !bounds.contains(value) {
+                    return Err(Error::ImplausibleValue {
+                        metric: entry.name.clone(),
+                        value,
+                        bounds: bounds.describe(),
+                    });
+                }
+            }
         }
 
         Ok(())
