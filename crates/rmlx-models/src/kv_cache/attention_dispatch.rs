@@ -121,6 +121,7 @@ pub fn sparse_attn_dispatch(
         n_q_heads,
         inputs.head_dim,
         p1.n_tiles,
+        inputs.query.dtype(),
         inputs.device,
     )
 }

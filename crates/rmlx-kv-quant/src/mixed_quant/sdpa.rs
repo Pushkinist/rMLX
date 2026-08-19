@@ -11,7 +11,7 @@ use rmlx_core::error::{Error, Result};
 use rmlx_core::DispatchPolicy;
 use rmlx_mlx::{
     add, dequantize, expand_dims, multiply, quantized_matmul, scalar_f32,
-    scaled_dot_product_attention, softmax_precise, Array, Device, Dtype,
+    scaled_dot_product_attention, softmax_precise, Array, Device,
 };
 
 use super::state::MixedTuple;
@@ -81,13 +81,10 @@ pub fn mixed_quantized_sdpa(
     let n_kv_heads = q_keys.codes.shape()[1];
     let n_repeats = n_q_heads / n_kv_heads;
 
-    // queries *= scale
-    let scale_arr_f32 = scalar_f32(scale);
-    let scale_arr = if queries.dtype() == Dtype::F32 {
-        scale_arr_f32
-    } else {
-        scale_arr_f32.astype(queries.dtype(), device)?
-    };
+    // queries *= scale. Canonical guarded form: `astype` to the same dtype is
+    // a no-op in MLX, so this is identical to branching on it, and the guard is
+    // on the statement `check-no-scalar-f32-leak` reads.
+    let scale_arr = scalar_f32(scale).astype(queries.dtype(), device)?;
     let queries_scaled = multiply(queries, &scale_arr, device)?;
 
     // GQA expansion: reshape queries to [B, n_kv_heads, n_repeats, L, D] and

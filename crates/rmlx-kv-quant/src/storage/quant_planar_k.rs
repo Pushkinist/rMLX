@@ -441,14 +441,10 @@ impl QuantPlanarK {
                     &scales,
                     &rotations,
                     &seq_major_shape,
+                    out_dtype,
                     device,
                 )?;
                 let out = out.transpose(&[0, 2, 1, 3], device)?.contiguous(device)?;
-                let out = if out_dtype == Dtype::F32 {
-                    out
-                } else {
-                    out.astype(out_dtype, device)?
-                };
                 return Ok((Vec::new(), Some(out)));
             }
             return Ok((Vec::new(), None));

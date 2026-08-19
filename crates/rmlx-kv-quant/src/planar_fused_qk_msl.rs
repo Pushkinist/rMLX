@@ -274,6 +274,11 @@ fn qk_kernel(bits: u8) -> Result<&'static MetalKernel> {
 ///
 /// Returns `Error::Mlx` for kernel build / dispatch failure, or `Error::Quant`
 /// for shape contract violations.
+// f32-out-ok: pre-softmax scores, not the attention output — the caller
+// softmaxes them and restores the query dtype on the SV result
+// (`KvCache::try_fused_qk_dispatch`), so nothing f32 reaches the residual
+// stream. The scores do carry their width into that intervening matmul; that
+// is a cost inside the attention op, not a promotion of the graph behind it.
 #[allow(clippy::too_many_arguments)]
 pub fn planar_fused_qk(
     query: &Array,

@@ -480,7 +480,10 @@ Ranked by impact:
    codec floor), and at temp=0 that flips greedy argmax ties prompt-dependently.
    Of the four cells that fire at the production threshold, 16k and
    Bonsai-27B@16k match while **8k and 32k diverge**, stably across every run of
-   each arm. Reproduced here at 8k (`rmlx bench --kv-quant k8v4 --max-ctx 16384
+   each arm. The 32k divergence was later shown to be the f32 promotion the
+   TurboFlash dispatcher leaked rather than the codec, and it is gone with that
+   fix (32k ON now reproduces the bf16 digest); 8k still diverges and is the
+   codec floor. See `docs/KV_QUANT.md` § TurboFlash. Reproduced here at 8k (`rmlx bench --kv-quant k8v4 --max-ctx 16384
    --prompt-tokens 8192 --max-tokens 64 --runs 2 --warmup 1`): gate OFF gives
    110.80 TPS / digest `0xb0273cf32cb9b715` / 1 668 005 888 B KV, gate ON gives
    42.05 TPS / digest `0x75a6992e38913e64` / 2 029 240 320 B. The kernel is a

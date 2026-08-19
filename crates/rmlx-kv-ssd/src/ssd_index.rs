@@ -120,6 +120,15 @@ type Result<T> = std::result::Result<T, SsdKvIndexError>;
 ///   mirror, so the request would decode off dequantised numbers while the
 ///   same hit served from RAM decodes bf16. The version is what routes those
 ///   namespaces through the wipe instead.
+/// - v4 → v5: the **dtype** of a persisted quantization parameter changed. The
+///   fused `rot_k` quantize kernel used to hand back f32 scales and biases
+///   where `mx.quantize` returns them at K's width; a `RotK` / `RotKTq4V` block
+///   spilled by such a binary carries them as f32 bytes, and safetensors
+///   preserves dtype on read. The shape and the `(hash, layout_key)` key are
+///   unchanged, so the block still *hits* — and `quantized_matmul` then takes
+///   its operand width from those scales, re-imposing the whole-graph f32
+///   promotion the codec was fixed to stop, for every request served off that
+///   block. Storage width is the payload here, not bookkeeping.
 ///
 /// v2 rows are **convertible** — `UPDATE kv_blocks SET last_used = last_used *
 /// 1000000` is the whole migration. They are wiped anyway, and that is a
@@ -127,7 +136,7 @@ type Result<T> = std::result::Result<T, SsdKvIndexError>;
 /// whose worst loss is one re-prefill per block, and carrying migration code
 /// (plus the branch in the wipe pass that has to let a v2 DB through so it can
 /// be converted) buys nothing a warm cache does not rebuild in minutes.
-pub(crate) const SCHEMA_VERSION: i64 = 4;
+pub(crate) const SCHEMA_VERSION: i64 = 5;
 
 const SCHEMA_PRAGMAS: &str = "
 PRAGMA journal_mode = WAL;

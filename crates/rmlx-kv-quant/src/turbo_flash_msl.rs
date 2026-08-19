@@ -48,6 +48,13 @@
 //! `rmlx_cli::commands::serve::TurboFlashMode` for the measured cells).
 //! Enabling it is an explicit opt-in.
 //!
+//! Those cells were measured while this dispatcher returned its f32 kernel
+//! output uncast, which promoted the whole decode graph — residual stream,
+//! norms, weight GEMV, sampler — to f32 for as long as the gate was on. Part
+//! of the recorded ratio was that promotion rather than the kernel, so read the
+//! range as an upper bound until the cells are re-measured on a quiet host. The
+//! direction is unchanged: the ON arm is still the slower one.
+//!
 //! The smoke-probe trip-wire below is retained as armour against any future
 //! drift in the kernel that might revive the `!!!!!!`-style garbage-token
 //! signature — it is cheap (≥4 consecutive identical token IDs check) and
@@ -324,7 +331,11 @@ fn p2_kernel() -> Result<&'static MetalKernel> {
 ///
 /// # Returns
 ///
-/// f32 array of shape `[B, n_q_heads, 1, head_dim]`.
+/// Array of shape `[B, n_q_heads, 1, head_dim]` in **`queries`' dtype**. The
+/// two kernels accumulate in f32 (online softmax needs it), but the result is
+/// cast back before it is handed to the caller: an f32 attention output enters
+/// the residual stream and MLX then promotes the whole downstream graph —
+/// norm, weight GEMV, every elementwise op — to f32 for the rest of the layer.
 ///
 /// # Errors
 ///
@@ -497,8 +508,11 @@ pub fn turbo_flash_sdpa(
     }
     let dst_flat = p2_outs.remove(0);
 
-    // Reshape to [B, n_q_heads, 1, head_dim].
-    dst_flat.reshape(&[b, n_q_heads, 1, head_dim], device)
+    // Reshape to [B, n_q_heads, 1, head_dim], and restore the query dtype the
+    // caller handed in — the kernels declare f32 outputs for the accumulation,
+    // but f32 out of an attention op promotes the residual stream.
+    let dst = dst_flat.reshape(&[b, n_q_heads, 1, head_dim], device)?;
+    dst.astype(queries.dtype(), device)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

@@ -11,8 +11,17 @@
 #
 # WHAT THIS GATE CHECKS
 # ---------------------
-# Every non-test .rs file under crates/rmlx-models/src/ is scanned (excluding
+# Every non-test .rs file under each crate that owns `.metal` kernels — the
+# roots derived from `scripts/metal_dirs.sh`, so this gate and
+# `check_kernel_dtype_contract.sh` cannot drift apart — is scanned (excluding
 # out-of-scope arch directories: laguna/, dr_venus/) for lines that:
+#
+# The scope was `crates/rmlx-models/src` alone until 2026-08. That was one of
+# three reasons this gate could not see the TurboFlash promotion: the leak sat
+# in `rmlx-kv-quant`, outside the scan root entirely. Widening it does not make
+# this gate sufficient for that class — it keys on `scalar_f32(`, and that leak
+# had none — but the KV codec layer runs on the same promotion path and carries
+# live `scalar_f32(` call sites in the decode hot path, so it belongs in scope.
 #   (a) contain scalar_f32( (as actual code, not a pure line comment), AND
 #   (b) are NOT followed by a non-F32 .astype( on the SAME LINE, AND
 #   (c) are NOT followed by a non-F32 .astype( within the immediately following
@@ -61,9 +70,16 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Arch-layer scope: all .rs files under crates/rmlx-models/src/.
-# Excludes test files, and out-of-scope arch directories.
-SCAN_DIR="${REPO_ROOT}/crates/rmlx-models/src"
+# Scope: the crate `src/` directories that own `.metal` kernels, single-sourced
+# from `scripts/metal_dirs.sh` (which names each crate's `metal/` directory;
+# the Rust sits one level up). Excludes test files and out-of-scope arch
+# directories.
+# shellcheck source=scripts/metal_dirs.sh
+. "$(dirname "${BASH_SOURCE[0]}")/metal_dirs.sh"
+SCAN_DIRS=()
+for d in "${METAL_DIRS[@]}"; do
+    SCAN_DIRS+=("${d%/metal}")
+done
 
 violations=()
 
@@ -208,10 +224,11 @@ while IFS= read -r -d '' f; do
         }
     ' "$f" 2>/dev/null && violations+=("$f")
 done < <(
-    find "${SCAN_DIR}" -name "*.rs" \
+    find "${SCAN_DIRS[@]}" -name "*.rs" \
         -not -path "*/target/*" \
         -not -path "*/tests/*" \
         -not -name "*_tests.rs" \
+        -not -name "tests.rs" \
         -not -path "*/laguna/*" \
         -not -path "*/dr_venus/*" \
         -print0

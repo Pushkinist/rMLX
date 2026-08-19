@@ -5625,12 +5625,12 @@ impl KvCache {
         // Scale the queries (turbo_flash_sdpa expects pre-scaled Q).
         let q_scaled = {
             use rmlx_mlx::{multiply, scalar_f32};
-            let sc = scalar_f32(scale);
-            let sc = if queries.dtype() == Dtype::F32 {
-                sc
-            } else {
-                sc.astype(queries.dtype(), device)?
-            };
+            // Canonical guarded form: `astype` to the same dtype is a no-op in
+            // MLX, so this is identical to branching on it, and the guard sits
+            // on the same statement where `check-no-scalar-f32-leak` can see
+            // it. An f32 scalar multiplied into bf16 queries promotes Q, and
+            // the kernel's whole output behind it.
+            let sc = scalar_f32(scale).astype(queries.dtype(), device)?;
             multiply(queries, &sc, device)?
         };
 
@@ -6517,20 +6517,16 @@ impl KvCache {
                 let v_sm_shape = [v_shape[0], v_shape[2], v_shape[1], v_shape[3]];
                 let (gathered_codes_v, gathered_scales_v, gathered_rotations_v) =
                     pv.gather(device)?;
-                let out = planar_dequantize_v4_gpu(
+                planar_dequantize_v4_gpu(
                     &gathered_codes_v,
                     &gathered_scales_v,
                     &gathered_rotations_v,
                     &v_sm_shape,
+                    new_v.dtype(),
                     device,
                 )?
                 .transpose(&[0, 2, 1, 3], device)?
-                .contiguous(device)?;
-                if out.dtype() == new_v.dtype() {
-                    out
-                } else {
-                    out.astype(new_v.dtype(), device)?
-                }
+                .contiguous(device)?
             }
             _ => {
                 return Err(Error::Mlx(

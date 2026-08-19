@@ -582,6 +582,56 @@ fn schema_mismatch_on_unknown_version() {
     }
 }
 
+/// A v4 index must be refused, not adopted.
+///
+/// v4 and v5 have the same table shape and the same `(hash, layout_key)` key,
+/// so a v4 block still *hits*. What changed is the dtype of a persisted
+/// quantization parameter: the fused `rot_k` quantize kernel used to spill f32
+/// scales where `mx.quantize` produces them at K's width, and safetensors hands
+/// them back as f32. `quantized_matmul` then takes its operand width from those
+/// scales and re-imposes the whole-graph f32 promotion for every request served
+/// off that block. Nothing about the shape can catch that — only the version.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn schema_mismatch_on_v4_f32_scale_payload() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("index.db");
+
+    {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(SCHEMA_PRAGMAS).unwrap();
+        conn.execute_batch(SCHEMA_TABLES).unwrap();
+        conn.execute("INSERT INTO schema_version (version) VALUES (4)", [])
+            .unwrap();
+    }
+
+    match SsdKvIndex::open_at(&db) {
+        Err(SsdKvIndexError::SchemaMismatch { found, expected }) => {
+            assert_eq!(found, 4, "a v4 index must be reported as v4");
+            assert_eq!(
+                expected, SCHEMA_VERSION,
+                "the bump is what routes v4 namespaces through the wipe"
+            );
+            // Compile-time: lowering the version back to 4 would make this
+            // test adopt the very blocks it exists to refuse, and the failure
+            // should land at build time rather than as a confusing runtime
+            // mismatch.
+            const {
+                assert!(
+                    SCHEMA_VERSION > 4,
+                    "SCHEMA_VERSION was lowered back to 4: pre-fix blocks carrying \
+                     f32 rot_k scales would be adopted again and re-impose the \
+                     promotion"
+                );
+            }
+        }
+        other => panic!("expected SchemaMismatch for a v4 index, got {other:?}"),
+    }
+}
+
 /// A DB whose `kv_blocks` table exists but has NO `schema_version` table
 /// is the pre-release v1 layout. `install_config` was supposed to wipe
 /// such namespaces; if `open_at` is asked to consume one directly it must
