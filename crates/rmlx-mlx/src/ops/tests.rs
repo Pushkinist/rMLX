@@ -118,3 +118,48 @@ fn gelu_exact_differs_from_gelu_tanh() {
          exact erf path may not be exercised"
     );
 }
+
+/// Activations return the dtype they were given.
+///
+/// `gelu` and `gelu_tanh` are composed from cached **f32** scalar constants, so
+/// every step after the first runs at f32 for a bf16 input. Returning that f32
+/// promotes whatever the activation feeds — in an FFN that is the `multiply` by
+/// `up`, the down-projection's GEMV, the residual add, and the rest of the
+/// layer. Nothing errors; the graph just doubles in width.
+///
+/// `silu`, `tanh`, `softmax_precise` and `pad` are checked alongside them as
+/// controls: they route through single MLX ops that preserve dtype already, and
+/// naming them here records which ops this was actually verified for rather
+/// than implying a blanket property.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "fixture construction on values built in this fn; a panic here is a test bug"
+)]
+fn activations_return_the_input_dtype() {
+    let device = Device::Cpu;
+    let x = Array::from_bytes(&[0u8; 16], &[4], Dtype::F32)
+        .unwrap()
+        .astype(Dtype::Bf16, device)
+        .unwrap();
+    assert_eq!(x.dtype(), Dtype::Bf16, "fixture must start at bf16");
+
+    for (name, got) in [
+        ("gelu_tanh", gelu_tanh(&x, device).unwrap().dtype()),
+        ("gelu", gelu(&x, device).unwrap().dtype()),
+        ("silu", silu(&x, device).unwrap().dtype()),
+        ("tanh", tanh(&x, device).unwrap().dtype()),
+        (
+            "softmax_precise",
+            softmax_precise(&x, -1, device).unwrap().dtype(),
+        ),
+        ("pad", pad(&x, &[0], &[1], &[1], device).unwrap().dtype()),
+    ] {
+        assert_eq!(
+            got,
+            Dtype::Bf16,
+            "{name} returned {got:?} for a bf16 input — an activation that widens \
+             its output promotes every op it feeds"
+        );
+    }
+}

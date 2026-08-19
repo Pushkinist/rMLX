@@ -79,20 +79,13 @@ fn geglu_get_or_compile(key: GegluKey, device: Device) -> Result<std::sync::Arc<
         let mut iter = inputs.into_iter();
         let gate = iter.next().expect("gate");
         let up = iter.next().expect("up");
-        // gelu_tanh's internal arithmetic constants are f32, so the activation
-        // promotes a bf16 gate to f32 (mlx-lm uses weak-typed Python floats and
-        // keeps the activation dtype). Restore the gate dtype on the fused
-        // output so the FFN — and the residual stream / global KV cache it feeds
-        // — stays at the model dtype instead of silently widening to f32. The
-        // cast folds into this compiled program, adding no separate launch.
-        let in_dtype = gate.dtype();
+        // `gelu_tanh` returns the gate's dtype (its f32 constants stay internal
+        // to it), so this GeGLU is bf16 in, bf16 through the multiply, bf16
+        // out. It used to need a cast here because the activation handed back
+        // f32 and widened the FFN, the residual stream and the KV cache behind
+        // it; that contract now lives in the activation itself.
         let g = gelu_tanh(&gate, device)?;
         let out = multiply(&g, &up, device)?;
-        let out = if out.dtype() == in_dtype {
-            out
-        } else {
-            out.astype(in_dtype, device)?
-        };
         Ok(vec![out])
     });
     let compiled =
@@ -183,17 +176,10 @@ fn pli_gelu_get_or_compile(key: PliGeluKey, device: Device) -> Result<std::sync:
         let mut iter = inputs.into_iter();
         let gate = iter.next().expect("gate");
         let per_layer = iter.next().expect("per_layer");
-        // See geglu_fused: gelu_tanh promotes a bf16 gate to f32 via its f32
-        // constants. Restore the gate dtype so the per-layer-input gating does
-        // not widen the residual stream (and thus the global KV cache) to f32.
-        let in_dtype = gate.dtype();
+        // See geglu_fused: `gelu_tanh` hands back the gate's dtype, so the
+        // per-layer-input gating stays at the model dtype without a cast here.
         let g = gelu_tanh(&gate, device)?;
         let out = multiply(&g, &per_layer, device)?;
-        let out = if out.dtype() == in_dtype {
-            out
-        } else {
-            out.astype(in_dtype, device)?
-        };
         Ok(vec![out])
     });
     let compiled = compile_shapeless(raw)

@@ -11,12 +11,10 @@
 #
 # WHAT THIS GATE CHECKS
 # ---------------------
-# Every non-test .rs file under the crates that own `.metal` kernels — the
+# Every non-test .rs file under each crate that owns `.metal` kernels — the
 # roots derived from `scripts/metal_dirs.sh`, so this gate and
-# `check_kernel_dtype_contract.sh` cannot drift apart — minus `rmlx-mlx` (see
-# the exclusion beside the list, which is a recorded finding, not a preference).
-# Scanned (excluding out-of-scope arch directories: laguna/, dr_venus/) for
-# lines that:
+# `check_kernel_dtype_contract.sh` cannot drift apart — is scanned (excluding
+# out-of-scope arch directories: laguna/, dr_venus/) for lines that:
 #
 # The scope was `crates/rmlx-models/src` alone until 2026-08. That was one of
 # three reasons this gate could not see the TurboFlash promotion: the leak sat
@@ -80,20 +78,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$(dirname "${BASH_SOURCE[0]}")/metal_dirs.sh"
 SCAN_DIRS=()
 for d in "${METAL_DIRS[@]}"; do
-    root="${d%/metal}"
-    # `rmlx-mlx` is deliberately excluded, and the reason is a finding rather
-    # than a preference: it DEFINES `scalar_f32`, and its cached GELU constants
-    # (`ops/activation.rs`) are f32 arrays multiplied straight into a bf16 `x`
-    # with no cast back — `gelu`/`gelu_tanh` return f32 for a bf16 input today.
-    # That is a live instance of this gate's own class, on the MLP path of every
-    # arch that calls them. Bringing the crate in scope now would force either a
-    # marker on that suspect (laundering a real finding into an allowlist entry)
-    # or a numerics change across every gelu arch inside an unrelated fix.
-    # Widen this list when that is settled on its own branch.
-    case "${root}" in
-    *"/crates/rmlx-mlx/src") continue ;;
-    esac
-    SCAN_DIRS+=("${root}")
+    SCAN_DIRS+=("${d%/metal}")
 done
 
 violations=()
@@ -243,6 +228,7 @@ done < <(
         -not -path "*/target/*" \
         -not -path "*/tests/*" \
         -not -name "*_tests.rs" \
+        -not -name "tests.rs" \
         -not -path "*/laguna/*" \
         -not -path "*/dr_venus/*" \
         -print0

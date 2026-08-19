@@ -51,6 +51,9 @@ pub fn conv2d(
 /// (constant mode, pad value 0). `low`/`high` line up with `axes` by index.
 pub fn pad(a: &Array, axes: &[i32], low: &[i32], high: &[i32], device: Device) -> Result<Array> {
     install_error_handler();
+    // f32-ok: MLX casts the pad value to the array's dtype inside `mlx_pad`;
+    // `pad` returns bf16 for a bf16 input, pinned by
+    // `activations_return_the_input_dtype` in ops/tests.rs.
     let zero = scalar_f32(0.0);
     let mode = crate::mode_to_cstr("constant", "pad")?;
     let mut res = unsafe { sys::mlx_array_new() };

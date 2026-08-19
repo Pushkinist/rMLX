@@ -11,6 +11,8 @@ use crate::{check_status, install_error_handler, sys, with_stream, Array, Device
 // ---------------------------------------------------------------------------
 
 /// Create a scalar Array from an f32. The resulting array has shape `[]` and dtype F32.
+// f32-ok: this IS the constructor the gate looks for — the one site where an
+// f32 scalar is supposed to be created. Callers are what must narrow it.
 pub fn scalar_f32(v: f32) -> Array {
     install_error_handler();
     // SAFETY: mlx_array_new_float creates a valid scalar array.
