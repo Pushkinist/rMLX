@@ -1526,9 +1526,21 @@ already bf16, but their K is 3–4-bit and has loss the boundary layers want bac
 Until this exemption landed the promotion fired under `None` too, which made
 `--kv-quant none` a bf16/K8V8 mixture on every arch whose boundary layers hold
 a real token-indexed cache. The promoted layer's packed store was written once
-at `exit_prefill` and never read — decode attends the bf16 mirror on a `K8V8`
-layer (§"Warm-TTFT decode contract") — so it could not change an output bit and
-was pure resident cost.
+at `exit_prefill` and **never read on the RAM path** — decode attends the bf16
+mirror on a `K8V8` layer (§"Warm-TTFT decode contract") — so within a process it
+could not change an output bit and was pure resident cost.
+
+**On an SSD hydrate it was not output-neutral**, which makes this a latent
+correctness bug and not only a memory one. Only a `KvStorage::None` layer
+persists its off-storage bf16 prefix (`none_bf16_payloads`,
+`crates/rmlx-kv-ssd/src/block_io.rs`), and only a layer that persisted one gets
+`with_decode_fp16_seed` back on read. A promoted `K8V8` layer therefore came
+back from disk with **no** mirror, `update_k8v8`'s `decode_fp16_k.is_some()`
+fast path did not fire, and decode dequantized from the packed q8_0 store — on
+2 to 10 layers of a run the operator had asked to keep in bf16. That is the one
+path where the promotion under `none` changed output, and it required the SSD
+tier to be enabled (it is off by default), which is why it never showed up in a
+RAM-only A/B.
 
 Measured with `rmlx --metrics off --log debug baseline --prompt-tokens <N>
 --max-tokens 32 --device gpu`, reading the per-generation `kv_bytes` event;

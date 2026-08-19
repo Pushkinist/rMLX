@@ -163,6 +163,42 @@ pub fn kv_quant_for_layer(
     }
 }
 
+/// The **nominal** per-layer codec vector for a model of `n_layers` layers at
+/// base codec `base` — one entry per decoder layer, `kv_quant_for_layer` at the
+/// standard [`LAYER_ADAPTIVE_TAIL_N`] / [`LAYER_ADAPTIVE_HEAD_N`] constants.
+///
+/// This is the **one** producer of that vector. Every consumer calls it rather
+/// than re-running the loop: each arch's cache-construction loop
+/// (`caches[i]` is built at `quants[i]`), the SSD attach that folds the vector
+/// into the layout key, and the per-request prompt-cache seed. Two of those
+/// three describe what the third builds, so a second copy of the loop is not a
+/// duplication of style — it is a way for the description to stop matching the
+/// thing described, silently, the next time the constants or the rule move.
+/// `scripts/check_kv_layer_quants.sh` (in `make ci`) keeps it that way by
+/// failing on a direct [`kv_quant_for_layer`] call outside this module.
+///
+/// **Nominal, not effective.** Two per-arch filters can make an entry a no-op
+/// on the built cache and are deliberately *not* folded in here, because they
+/// are properties of the layer's geometry rather than of the codec policy: a
+/// windowed layer runs the bf16 rotating ring whatever codec it is handed, and
+/// a shared-KV layer (Gemma4 `num_kv_shared_layers`) owns no cache at all. A
+/// consumer that needs the effective codec of a *built* cache must read the
+/// cache, not this vector.
+#[must_use]
+pub fn kv_layer_quants(n_layers: usize, base: KvQuant) -> Vec<KvQuant> {
+    (0..n_layers)
+        .map(|i| {
+            kv_quant_for_layer(
+                i,
+                n_layers,
+                base,
+                LAYER_ADAPTIVE_TAIL_N,
+                LAYER_ADAPTIVE_HEAD_N,
+            )
+        })
+        .collect()
+}
+
 /// Code width [`KvQuant::approx_code_bits`] reports for a side that is kept at
 /// model dtype (bf16) instead of quantized.
 const MODEL_DTYPE_CODE_BITS: u32 = 16;

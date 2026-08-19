@@ -509,57 +509,54 @@ fn every_kv_quant_variant_names_its_store_families() {
     }
 }
 
-/// The `mixed_*` grammar accepts affine group sizes this gate cannot enumerate,
-/// and some of them store above the bf16 floor.
+/// The `mixed_*` grammar no longer admits affine rates above the bf16 floor.
 ///
-/// `parse_kv_side` reads the group size as a bare `u16` with no whitelist and no
-/// floor, so `mixed_k8g4_v8g4` is a valid `--kv-quant` argument whose store
-/// spends `8 + 64/4 = 24` bits per value on each axis. No enum-driven table can
-/// see that, because the rate is not a property of the variant — it is a
-/// property of a runtime field with an unbounded domain.
+/// This test used to pin the opposite, and said so: `parse_kv_side` read the
+/// group size as a bare `u16` with no whitelist, so `mixed_k8g4_v8g4` parsed
+/// and stored `8 + 64/4 = 24` bits per value on each axis — a rate no
+/// enum-driven table can see, because it is a property of a runtime field with
+/// an unbounded domain rather than of the variant. Its own failure message
+/// named the disposition: *"if this now fails, the parser grew a floor and this
+/// test should assert that instead"*. It did, so this does.
 ///
-/// Pinned rather than fixed: adding a group-size floor to the parser rejects
-/// configs that parse today, which is a CLI-surface decision. The point here is
-/// that the ceiling gate's coverage claim stops at the enumerable cache types,
-/// and this test is what says so out loud.
+/// The parser now validates both sides against MLX's affine grid
+/// (`validate_mixed_side`), which bounds the domain to widths the codec can
+/// actually store. The ceiling gate's coverage claim therefore extends over the
+/// whole `mixed_*` grammar: every parseable spelling has a rate the table
+/// enumerates.
 #[test]
-fn mixed_grammar_admits_affine_rates_above_the_floor() {
-    let q: KvQuant = "mixed_k8g4_v8g4".parse().expect(
-        "the mixed grammar accepts an unvalidated group size — if this now fails, the \
-         parser grew a floor and this test should assert that instead",
-    );
-    let KvQuant::Mixed {
-        k_bits,
-        v_bits,
-        k_group_size,
-        v_group_size,
-    } = q
-    else {
-        panic!("mixed_k8g4_v8g4 must parse to KvQuant::Mixed, got {q}");
-    };
-    assert_eq!((k_bits, k_group_size, v_bits, v_group_size), (8, 4, 8, 4));
-
-    let rate = f64::from(k_bits) + 64.0 / f64::from(k_group_size);
+fn mixed_grammar_no_longer_admits_unbounded_affine_rates() {
+    // The former witness: parses no more.
+    let unbounded = "mixed_k8g4_v8g4".parse::<KvQuant>();
     assert!(
-        rate > BF16_BITS_PER_VALUE,
-        "the point of this test is a parseable config above the floor; {rate:.2} is not"
+        unbounded.is_err(),
+        "a group size outside the affine grid must be a parse error, got {unbounded:?}"
     );
 
-    // And the table's `affine` entry does NOT bound it — stated so nobody reads
-    // that entry as a guarantee over the whole affine grid.
-    let table = family_rate(family("affine"), &fixture());
+    // The accepted grid is finite, so its worst rate is a number this test can
+    // state: 8 bits at group 32 = 8 + 64/32 = 10.00 bits per value per axis.
+    // Before the floor, the grid had no worst case at all.
+    let mut worst = 0.0_f64;
+    for group in [32u16, 64, 128] {
+        for bits in [2u8, 3, 4, 5, 6, 8] {
+            let spec = format!("mixed_k{bits}g{group}_v{bits}g{group}");
+            let parsed = spec.parse::<KvQuant>();
+            assert!(parsed.is_ok(), "{spec} must parse, got {parsed:?}");
+            worst = worst.max(f64::from(bits) + 64.0 / f64::from(group));
+        }
+    }
     assert!(
-        table < rate,
-        "the affine table entry ({table:.2}) is not an upper bound over the parseable \
-         grid ({rate:.2}); if it became one, say so in its comment"
+        (worst - 10.0).abs() < 1e-9,
+        "worst parseable mixed rate is {worst:.2} bits per value, expected 10.00 — \
+         the accepted grid moved, so the ceiling gate's coverage claim moved with it"
+    );
+    assert!(
+        worst < BF16_BITS_PER_VALUE,
+        "the whole point of the floor is that no parseable mixed spec stores above bf16 \
+         ({BF16_BITS_PER_VALUE:.2}); {worst:.2} does"
     );
 }
 
-/// The q8 group size the `q8` family entry measures is the one the codec ships.
-///
-/// The measured rate is `8 + 32 / Q8_GROUP_SIZE` bits per value; that identity is
-/// stated here so the entry cannot silently become a measurement of a different
-/// cadence than the store uses.
 #[test]
 fn q8_family_rate_matches_its_shipped_group_size() {
     let data = fixture();

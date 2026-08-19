@@ -27,6 +27,16 @@
 //!   decode continues from `max(prompt positions) + 1`, incrementing in all
 //!   three dims (mirroring `language.py` trailing-text positions).
 
+// kv-layer-quants: uniform — this arch builds every layer at the requested
+// codec and does not apply the boundary promotion, unlike the seven arches
+// that do. Pre-existing and left alone deliberately: changing it would move
+// this arch's KV mixture (memory and, on a quantizing codec, output), which is
+// a behaviour change that needs its own proof. Consequence to know: the SSD
+// `layout_key` folds the NOMINAL vector, so for this arch it over-describes
+// what is built. That is safe in the direction that matters — the key still
+// moves whenever the policy or the shape moves — but it will invalidate this
+// arch's blocks on a policy change that cannot affect them.
+
 use rmlx_core::error::Result;
 use rmlx_mlx::{Array, Device, Dtype};
 use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
@@ -208,7 +218,7 @@ pub fn generate_greedy(
     // The text path never carries image ids (images route to generate_image), so
     // has_image is always false here; the engine's bypass is belt-and-suspenders.
     let has_image = false;
-    let consumed = PROMPT_CACHE.consume(prompt_ids, kv_quant, has_image, model.model_sig);
+    let consumed = PROMPT_CACHE.consume(prompt_ids, kv_quant, n_layers, has_image, model.model_sig);
 
     // Path A: exact cache hit — skip re-prefill, replay the stored first token,
     // then run the shared decode loop on the cloned caches.
@@ -312,10 +322,13 @@ pub fn generate_greedy(
                     // never cross-serves. Identical to the consume() seed, so
                     // find_best_prefix matches what is stored here.
                     let lk = active_layout_key();
-                    let block_hashes = chained_block_hashes_seeded(
-                        prompt_ids,
-                        crate::prompt_cache::cache_seed(lk, kv_quant, model.model_sig),
+                    let seed = crate::prompt_cache::request_cache_seed(
+                        lk,
+                        kv_quant,
+                        n_layers,
+                        model.model_sig,
                     );
+                    let block_hashes = chained_block_hashes_seeded(prompt_ids, seed);
                     let first_piece = piece_for(first, tokenizer);
                     let entry = Qwen3VlMoeEntry {
                         prompt_token_ids: prompt_ids.to_vec(),

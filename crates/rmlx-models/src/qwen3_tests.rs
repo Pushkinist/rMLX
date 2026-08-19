@@ -483,18 +483,11 @@ fn qwen3_hydrated_exact_no_tail_not_placeholder() {
 
     // ── Step 2: Build a real KV snapshot for the full block-aligned prompt ──
     let full_kv_caches = {
-        use crate::kv_cache::{kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N};
-        let mut kv_caches: Vec<KvCache> = (0..n_layers)
-            .map(|i| {
-                let q = kv_quant_for_layer(
-                    i,
-                    n_layers,
-                    kv_quant,
-                    LAYER_ADAPTIVE_TAIL_N,
-                    LAYER_ADAPTIVE_HEAD_N,
-                );
-                KvCache::with_quant_max_seq(q, max_seq).with_layer_idx(i)
-            })
+        use crate::kv_cache::kv_layer_quants;
+        let mut kv_caches: Vec<KvCache> = kv_layer_quants(n_layers, kv_quant)
+            .into_iter()
+            .enumerate()
+            .map(|(i, q)| KvCache::with_quant_max_seq(q, max_seq).with_layer_idx(i))
             .collect();
         for c in &mut kv_caches {
             c.enter_prefill();
@@ -531,7 +524,12 @@ fn qwen3_hydrated_exact_no_tail_not_placeholder() {
             cache.clear();
             let block_hashes = chained_block_hashes_seeded(
                 &prompt_ids,
-                crate::prompt_cache::cache_seed(0, kv_quant, model.model_sig),
+                crate::prompt_cache::request_cache_seed(
+                    0,
+                    kv_quant,
+                    model.cfg.num_hidden_layers,
+                    model.model_sig,
+                ),
             );
             let kv_snap: Result<Vec<_>> =
                 full_kv_caches.iter().map(KvCache::try_deep_clone).collect();
@@ -785,18 +783,11 @@ fn qwen3_consume_engine_migration_golden() {
     // engine's `!is_ssd_hydrated` Exact exclusion + the reuse hook declining the
     // equal-length case must drop it to Miss → WARM == COLD (never replay 0). ──
     let full_kv_caches = {
-        use crate::kv_cache::{kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N};
-        let mut kv_caches: Vec<KvCache> = (0..n_layers)
-            .map(|i| {
-                let q = kv_quant_for_layer(
-                    i,
-                    n_layers,
-                    kv_quant,
-                    LAYER_ADAPTIVE_TAIL_N,
-                    LAYER_ADAPTIVE_HEAD_N,
-                );
-                KvCache::with_quant_max_seq(q, max_seq).with_layer_idx(i)
-            })
+        use crate::kv_cache::kv_layer_quants;
+        let mut kv_caches: Vec<KvCache> = kv_layer_quants(n_layers, kv_quant)
+            .into_iter()
+            .enumerate()
+            .map(|(i, q)| KvCache::with_quant_max_seq(q, max_seq).with_layer_idx(i))
             .collect();
         for c in &mut kv_caches {
             c.enter_prefill();
@@ -830,7 +821,12 @@ fn qwen3_consume_engine_migration_golden() {
         if let Some(cache) = guard.as_mut() {
             let block_hashes = chained_block_hashes_seeded(
                 &prompt_ids,
-                crate::prompt_cache::cache_seed(0, kv_quant, model.model_sig),
+                crate::prompt_cache::request_cache_seed(
+                    0,
+                    kv_quant,
+                    model.cfg.num_hidden_layers,
+                    model.model_sig,
+                ),
             );
             let kv_snap: Result<Vec<_>> =
                 full_kv_caches.iter().map(KvCache::try_deep_clone).collect();

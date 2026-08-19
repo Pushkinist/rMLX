@@ -281,14 +281,28 @@ for every distinct input tuple. It is **not** weight-dependent: reloading the
 same architecture at the same layout from a different snapshot yields the same
 `layout_key` and shares the cache, which is correct.
 
-> **One-time invalidation (the `none` boundary-promotion exemption).**
-> `--kv-quant none` used to be built as a bf16/K8V8 mixture and is uniform bf16
-> now, so its vector — and therefore its `layout_key` — moved. Blocks spilled
-> under the old mixture become unreachable and age out through LRU: one cold
-> pass for `none` users with the tier enabled, no error and no action. This is
-> the invalidation the fold exists to produce; before it, those blocks would
-> have been served to a `none` request and quietly restored the promotion for
-> it.
+> **One-time invalidation — every namespace, every codec.** The *formula*
+> changed, not just one codec's vector: the key now appends a term per layer, so
+> `k8v8`, `k8v4`, `planar`, `mixed_*` and `none` alike hash to new values, and
+> the per-request seed below changed for the same reason. Every previously
+> spilled `.kvb` is unreachable after upgrading, on every namespace. Expect one
+> cold pass — full re-prefill — per prompt, then steady state; no error and no
+> action needed.
+>
+> **Unreachable blocks still occupy the namespace budget.** Nothing prunes them
+> proactively: `startup_maintenance` removes rows whose file vanished, not rows
+> whose layout no longer matches, so they sit in `--kv-ssd-cache-gb` until
+> eviction reaches them. They are never `touch`ed, so LRU picks them first —
+> but only once the namespace is at its budget and something has to go. Until
+> then the effective cache is smaller by whatever the stale set occupies. A
+> namespace well under budget can hold them indefinitely; `rm -rf` of the
+> namespace directory is the operator's fast path if that matters.
+>
+> For the `none` codec specifically the invalidation is also *load-bearing*
+> rather than incidental: `--kv-quant none` used to be built as a bf16/K8V8
+> mixture and is uniform bf16 now, so without the key moving, a stale block
+> would have been served to a `none` request and quietly restored the promotion
+> for it.
 
 `arch` is the **resolved** class. It was previously the declared
 `architectures[0]`, which could name a model that was not built — the salt is
@@ -321,17 +335,31 @@ supposed to describe the layout, and a declaration is not evidence of one.
 > The iso3 tags are deliberately **not** bumped: that append always reordered
 > heads↔seq, so its bytes are unchanged.
 
-The key is one of the three terms of the block-hash seed, built at the call site
+The key is one of the four terms of the block-hash seed, built at the call site
 by `rmlx_kv_ssd::hashing::cache_seed`:
 
 ```text
 seed    = FNV_OFFSET ^ layout_key ^ kv_quant.cache_key_salt() ^ model_sig
+          then, per layer: seed ^= layer_quant.cache_key_salt(); seed *= FNV_PRIME
 digests = chained_block_hashes_seeded(ids, seed)
 ```
 
 XOR mixing keeps the existing FNV avalanche behaviour intact. Different layouts
 produce disjoint digest streams for the same token sequence, so a block cached
 under one KV layout cannot collide with the same block cached under another.
+
+**Why the per-layer term is here and not only in `layout_key`.** The layout key
+is computed once, at attach, from the *launch* codec. A request need not run
+that codec: `kv_quant_for_ctx` picks one by prompt length in auto mode, and the
+OpenAI route accepts a per-request `kv_quant` override. For those requests the
+attach-time vector describes a layout they are not running, so a guarantee
+resting on the key alone ("a per-layer policy change invalidates stored
+blocks") would hold only for requests that happened to run the launch default.
+The seed is where the request's own codec already enters, so it is where the
+request's own mixture belongs. `rmlx-models` supplies it through
+`prompt_cache::request_cache_seed(layout_key, kv_quant, n_layers, model_sig)`,
+which expands `n_layers` with `kv_layer_quants` — the same single producer the
+arch cache-construction loops use — because the policy lives above this crate.
 
 `cache_seed` is a single function, in `rmlx-kv-ssd` — below both the RAM prompt
 cache in `rmlx-models` and the SSD hydrate probe in `rmlx-kv-ssd` — so neither

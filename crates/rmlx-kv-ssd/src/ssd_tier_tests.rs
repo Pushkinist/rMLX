@@ -582,3 +582,34 @@ fn install_config_double_call_returns_err() {
         other => panic!("expected Err(SsdTierAlreadyInstalled), got {other:?}"),
     }
 }
+
+// ── keyable_layout ────────────────────────────────────────────────
+
+/// Both refusals in the attach guard, and the accept between them.
+///
+/// The empty-vector arm is not decoration: `compute_layout_key` folds the
+/// per-layer vector, so keying a zero-length one would hash every layout of
+/// that shape to the same u64 and undo the separation the fold exists for. It
+/// is reachable whenever a caller resolves a codec but reports no layers
+/// (`n_layers == 0`), which is what a config-parse failure upstream looks like
+/// from here.
+#[test]
+fn keyable_layout_refuses_a_missing_codec_or_an_empty_layer_vector() {
+    let arch = "Qwen3ForCausalLM";
+    let model = "some-model";
+    assert_eq!(
+        keyable_layout(arch, model, None, &[KvQuant::K8V8]),
+        None,
+        "no resolved codec: nothing to record on the rows or check a header against"
+    );
+    assert_eq!(
+        keyable_layout(arch, model, Some(KvQuant::K8V8), &[]),
+        None,
+        "empty per-layer vector: a zero-length layout cannot be told apart from any other"
+    );
+    assert_eq!(
+        keyable_layout(arch, model, Some(KvQuant::K8V8), &[KvQuant::K8V8; 36]),
+        Some(KvQuant::K8V8),
+        "a resolved codec with a per-layer vector is keyable"
+    );
+}

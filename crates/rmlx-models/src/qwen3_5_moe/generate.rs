@@ -28,8 +28,7 @@ use crate::decode_loop::{
     DecodeCtx,
 };
 use crate::kv_cache::{
-    kv_max_seq_and_ceiling, kv_quant_for_layer, warn_if_kv_codec_net_negative, KvLayerShape,
-    LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
+    kv_layer_quants, kv_max_seq_and_ceiling, warn_if_kv_codec_net_negative, KvLayerShape,
 };
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
@@ -137,7 +136,13 @@ pub fn generate_greedy<'a>(
 
     // image prompts never reach this arch (text path only), so `has_image` is
     // always false here; the engine bypass is belt-and-suspenders.
-    let consumed = PROMPT_CACHE.consume(prompt_ids, kv_quant, false, model.model_sig);
+    let consumed = PROMPT_CACHE.consume(
+        prompt_ids,
+        kv_quant,
+        model.cfg.num_hidden_layers,
+        false,
+        model.model_sig,
+    );
 
     // `exact_hit` carries the Path-A locals; `hydrated_tail` carries the Path-B
     // tail-re-prefill locals. `Consumed::Miss` leaves both `None` and falls
@@ -403,7 +408,12 @@ pub fn generate_greedy<'a>(
                                     prompt_token_ids: prompt_ids.to_vec(),
                                     block_hashes: crate::prompt_cache::chained_block_hashes_seeded(
                                     prompt_ids,
-                                    crate::prompt_cache::cache_seed(lk, kv_quant, model.model_sig),
+                                    crate::prompt_cache::request_cache_seed(
+                            lk,
+                            kv_quant,
+                            model.cfg.num_hidden_layers,
+                            model.model_sig,
+                        ),
                                 ),
                                     kv_caches: kvs,
                                     lin_caches: lins,
@@ -481,15 +491,10 @@ pub fn generate_greedy<'a>(
     let n_layers = model.cfg.num_hidden_layers;
     // Force K8V8 for boundary layers (first head_n + last tail_n)
     // to protect output quality with aggressive V compression (planar/k8v4).
-    let mut kv_caches: Vec<KvCache> = (0..n_layers)
-        .map(|i| {
-            let q = kv_quant_for_layer(
-                i,
-                n_layers,
-                kv_quant,
-                LAYER_ADAPTIVE_TAIL_N,
-                LAYER_ADAPTIVE_HEAD_N,
-            );
+    let mut kv_caches: Vec<KvCache> = kv_layer_quants(n_layers, kv_quant)
+        .into_iter()
+        .enumerate()
+        .map(|(i, q)| {
             KvCache::with_quant_max_seq(q, initial_max_seq)
                 .with_max_seq_ceiling(max_seq_ceiling)
                 .with_layer_idx(i)
@@ -633,7 +638,12 @@ pub fn generate_greedy<'a>(
                                 prompt_token_ids: prompt_ids.to_vec(),
                                 block_hashes: crate::prompt_cache::chained_block_hashes_seeded(
                                     prompt_ids,
-                                    crate::prompt_cache::cache_seed(lk, kv_quant, model.model_sig),
+                                    crate::prompt_cache::request_cache_seed(
+                                        lk,
+                                        kv_quant,
+                                        model.cfg.num_hidden_layers,
+                                        model.model_sig,
+                                    ),
                                 ),
                                 kv_caches: kvs,
                                 lin_caches: lins,

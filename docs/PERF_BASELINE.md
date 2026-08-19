@@ -332,7 +332,9 @@ Read e2b's ratio-to-`none` with care: only its global layers grow, so the
 ms/1k across models instead. Counted from the per-dispatch `trace!` under
 `--log verbose`, the flash-decode kernel fires once per full-attention layer
 per decode step and is handed the full prefix — 26 of 36 layers on Bonsai (the
-first 2 and last 8 are promoted to K8V8), 7 of 35 on e2b. Those 7 e2b
+first 2 and last 8 **were** promoted to K8V8 when this was recorded; the codec
+here is a quantizing one, so that promotion still applies today — it is only
+`none` that is now exempt), 7 of 35 on e2b. Those 7 e2b
 dispatches read only **3** distinct caches. `num_kv_shared_layers = 20` leaves
 layers 15+ without a cache of their own, and `build_previous_kvs`
 (`gemma4/loader.rs`) points each of them at the **last** non-shared layer of

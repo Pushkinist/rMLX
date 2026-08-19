@@ -112,8 +112,12 @@ The three terms:
   (e.g. `k8v8` vs `k8v4`, or the same base codec under two different
   boundary-promotion policies) cannot share cache blocks. It is a *shape* key and carries no model
   identity, which is why `model_sig` is a separate term.
-- **`kv_quant`** — the codec the stored K/V is packed under. See "Codec
-  namespacing" below.
+- **`kv_quant`** — the codec the stored K/V is packed under, plus the per-layer
+  mixture that codec resolves to under the current layer policy
+  (`prompt_cache::request_cache_seed` expands `n_layers` through
+  `kv_layer_quants`). The mixture is folded here, per request, rather than only
+  into `layout_key`, because the key is fixed at attach from the launch codec
+  while a request may run a different one. See "Codec namespacing" below.
 
 The seeded variant is `chained_block_hashes_seeded(ids, seed)`. The un-seeded
 convenience wrapper `chained_block_hashes(ids)` calls it with the bare

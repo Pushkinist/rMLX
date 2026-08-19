@@ -233,15 +233,22 @@ pub fn compute_layout_key(
     head_dim: usize,
     kv_quant: KvQuant,
 ) -> u64 {
+    use std::fmt::Write as _;
+
     let n_layers = layer_quants.len();
     let mut h: u64 = FNV_OFFSET;
-    let head = format!(":{n_layers}:{n_kv_heads}:{head_dim}:{kv_quant}");
-    for byte in arch.as_bytes().iter().chain(head.as_bytes().iter()) {
+    // One reused buffer for the whole walk: this runs once per model load, but
+    // a `String` per decoder layer is free to avoid.
+    let mut buf = String::with_capacity(32);
+    let _ = write!(buf, ":{n_layers}:{n_kv_heads}:{head_dim}:{kv_quant}");
+    for byte in arch.as_bytes().iter().chain(buf.as_bytes().iter()) {
         h ^= u64::from(*byte);
         h = h.wrapping_mul(FNV_PRIME);
     }
     for q in layer_quants {
-        for byte in format!(":{q}").as_bytes() {
+        buf.clear();
+        let _ = write!(buf, ":{q}");
+        for byte in buf.as_bytes() {
             h ^= u64::from(*byte);
             h = h.wrapping_mul(FNV_PRIME);
         }

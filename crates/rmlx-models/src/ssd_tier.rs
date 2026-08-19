@@ -14,21 +14,32 @@
 use rmlx_kv_quant::KvQuant;
 use rmlx_mlx::Device;
 
-use crate::kv_cache::{kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N};
+use crate::kv_cache::kv_layer_quants;
 
 /// At model-load, run startup maintenance (prune + evict-to-budget) for the
 /// namespace and attach the spiller + hydrator onto the right per-arch
 /// `PROMPT_CACHE`. No-op when the tier is OFF.
 ///
 /// `(n_layers, n_kv_heads, head_dim)` are taken from the loaded model's config.
-/// `n_layers` is expanded here into the **effective per-layer codec vector**
-/// via [`kv_quant_for_layer`] — the same call every arch's cache construction
-/// makes, with the same `LAYER_ADAPTIVE_*` constants — and that vector, not the
-/// base codec alone, is what [`rmlx_kv_ssd::prepare_attach`] folds into the
-/// `layout_key` the spiller/hydrator carry. The boundary-layer promotion is a
-/// policy that can change between builds; a block written under one mixture
-/// must not hydrate into a request running another, and the key is the only
-/// thing standing between them.
+/// `n_layers` is expanded here into the **nominal per-layer codec vector** by
+/// [`kv_layer_quants`] — the one producer every arch's cache-construction loop
+/// also consumes — and that vector, not the base codec alone, is what
+/// [`rmlx_kv_ssd::prepare_attach`] folds into the `layout_key` the
+/// spiller/hydrator carry. The boundary-layer promotion is a policy that can
+/// change between builds; a block written under one mixture must not hydrate
+/// into a request running another.
+///
+/// Two scoping facts the caller should know, both stated where the key is
+/// documented (`docs/SSD_TIER.md` §layout_key):
+/// - **Nominal, not effective.** A windowed layer runs the bf16 rotating ring
+///   whatever codec it is handed, and a shared-KV layer owns no cache; those
+///   filters are geometry, and folding them would make the key depend on
+///   per-layer types the namespace does not otherwise carry.
+/// - **Attach-time, not per-request.** This is the launch codec's mixture. A
+///   request may resolve a different codec (auto-by-context, or a per-request
+///   override); the identity that separates *those* is the per-request
+///   prompt-cache seed, which folds the mixture of the codec the request
+///   actually runs.
 ///
 /// `arch` must be the **resolved** class (`Architecture::arch_class()`), not
 /// the checkpoint's declared `architectures[0]`: it both selects the per-arch
@@ -56,21 +67,8 @@ pub fn attach_at_load(
     head_dim: usize,
     device: Device,
 ) {
-    let layer_quants: Vec<KvQuant> = kv_quant
-        .map(|base| {
-            (0..n_layers)
-                .map(|i| {
-                    kv_quant_for_layer(
-                        i,
-                        n_layers,
-                        base,
-                        LAYER_ADAPTIVE_TAIL_N,
-                        LAYER_ADAPTIVE_HEAD_N,
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let layer_quants: Vec<KvQuant> =
+        kv_quant.map_or_else(Vec::new, |base| kv_layer_quants(n_layers, base));
 
     let Some(info) = rmlx_kv_ssd::prepare_attach(
         arch,

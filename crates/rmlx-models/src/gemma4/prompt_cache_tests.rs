@@ -541,7 +541,12 @@ fn gemma4_consume_engine_migration_golden() {
     // Read back the RAM snapshot store-back left by the most recent cold run of
     // `ids`, deep-cloning its KV caches (the cache keeps ownership).
     let read_back_kv = |ids: &[u32]| -> Vec<KvCache> {
-        let seed = crate::prompt_cache::cache_seed(active_layout_key(), kv_quant, model.model_sig);
+        let seed = crate::prompt_cache::request_cache_seed(
+            active_layout_key(),
+            kv_quant,
+            model.cfg.num_hidden_layers,
+            model.model_sig,
+        );
         PROMPT_CACHE.with_inner_mut(|guard| {
             let cache = guard.as_mut().expect("cache present");
             let (slot_idx, _) = cache
@@ -564,7 +569,12 @@ fn gemma4_consume_engine_migration_golden() {
             let cache = guard.as_mut().expect("cache present");
             let block_hashes = crate::prompt_cache::chained_block_hashes_seeded(
                 key_ids,
-                crate::prompt_cache::cache_seed(active_layout_key(), kv_quant, model.model_sig),
+                crate::prompt_cache::request_cache_seed(
+                    active_layout_key(),
+                    kv_quant,
+                    model.cfg.num_hidden_layers,
+                    model.model_sig,
+                ),
             );
             cache.push(Gemma4Entry {
                 prompt_token_ids: key_ids.to_vec(),

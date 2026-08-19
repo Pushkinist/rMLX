@@ -89,6 +89,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         smoke-codec-matrix \
         e2e \
         file-size-report check-no-inline-tests check-no-scalar-f32-leak \
+        check-kv-layer-quants \
         check-no-decode-swallow check-gpu-tests-ignored \
         check-gpu-tests-ignored-fixtures \
         check-eval-lock check-eval-lock-fixtures eval-lock-stress \
@@ -369,6 +370,9 @@ check-no-inline-tests: ## CI gate: fail if any non-test.rs file has inline #[cfg
 check-no-scalar-f32-leak: ## CI gate: fail if arch-layer code has unguarded scalar_f32( not followed by .astype(
 	@bash scripts/check_no_scalar_f32_leak.sh
 
+check-kv-layer-quants: ## CI gate: fail if kv_quant_for_layer is called outside kv_cache/ (one producer: kv_layer_quants)
+	@bash scripts/check_kv_layer_quants.sh
+
 check-no-decode-swallow: ## CI gate: fail if a decode-step failure breaks instead of propagating (would report as finish_reason="length")
 	@bash scripts/check_no_decode_swallow.sh
 
@@ -408,6 +412,7 @@ check-metal-format: ## CI gate: every .metal kernel is clang-format clean (skips
 ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gate: fmt + clippy + test + feature-gated capture tests + deny + audit + metrics-sanity + inline-test + A/B-harness + MSL gates
 	@bash scripts/check_no_inline_tests.sh
 	@bash scripts/check_no_scalar_f32_leak.sh
+	@bash scripts/check_kv_layer_quants.sh
 	@bash scripts/check_no_decode_swallow.sh
 	@bash scripts/check_eval_lock.sh
 	@bash scripts/check_eval_lock_fixtures.sh

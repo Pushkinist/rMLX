@@ -1,32 +1,18 @@
-//! End-to-end SSD layout-key disambiguation gate.
+//! SSD layout-key disambiguation tests.
 //!
-//! Loads the Bonsai-2bit Qwen3 model, runs the same 256-token prompt under
-//! two different `kv_quant` configurations within the SAME `--project`
-//! namespace, and asserts:
+//! The `layout_key` is what stops two different KV layouts from sharing cached
+//! blocks in one namespace. Two properties are pinned here against a real
+//! on-disk SQLite index:
 //!
-//! 1. The second invocation under kv_quant **A** is an SSD hit (the chained
-//!    digest reconstructed from `prompt_ids` under `layout_key_A` matches the
-//!    row written by the first invocation).
-//! 2. Switching to kv_quant **B** produces a MISS (different `layout_key` ⇒
-//!    different chained-hash stream ⇒ a fresh prefill is run).
-//! 3. After both runs the SQLite index holds two rows under the same prompt's
-//!    last block digest with distinct `layout_key` values, and both `.kvb`
-//!    files are present on disk.
+//! 1. Two layout keys coexist under the same prompt digest — the composite
+//!    `(hash, layout_key)` PK does not let one overwrite the other.
+//! 2. A block spilled under the previous per-layer codec policy is a MISS for a
+//!    request built under the current one.
 //!
-//! Gated on `RMLX_KV_TEST_MODEL` (same convention as the other goldens).
-//! When the env var is absent the test is a silent skip — it can ship green on
-//! CI without the operator copying a model into the runner. The single MLX
-//! claim file is honoured: the test acquires it via the standard pattern.
-//!
-//! Run (after wiping prior caches under the chosen project):
-//!
-//! ```text
-//! RMLX_KV_TEST_MODEL=/path/to/Ternary-Bonsai-8B-mlx-2bit \
-//! cargo test -p rmlx-models --test layout_key_disambiguation \
-//! -- --ignored --nocapture
-//! ```
-//!
-//! Marked `#[ignore]` so it never gates `make ci` / `make model-check`.
+//! Both run in `make ci`: they need no model, only a temp dir. The end-to-end
+//! variant that drove a live `generate_greedy` was a `panic!("deferred")` stub
+//! that no gate ever executed, and was deleted rather than left reading as
+//! coverage.
 
 #![allow(
     clippy::unwrap_used,
@@ -109,24 +95,17 @@ fn two_layout_keys_share_namespace_without_collision() {
 fn a_block_written_under_the_old_mixture_does_not_hydrate_into_a_none_request() {
     use rmlx_kv_quant::KvQuant;
     use rmlx_kv_ssd::compute_layout_key;
-    use rmlx_models::kv_cache::{kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N};
+    use rmlx_models::kv_cache::{kv_layer_quants, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N};
 
     let n_layers = 36usize; // Ternary-Bonsai-8B: every layer full-attention.
     let (arch, kv_heads, head_dim) = ("Qwen3ForCausalLM", 8usize, 128usize);
 
-    // What a `--kv-quant none` request builds today.
-    let current: Vec<KvQuant> = (0..n_layers)
-        .map(|i| {
-            kv_quant_for_layer(
-                i,
-                n_layers,
-                KvQuant::None,
-                LAYER_ADAPTIVE_TAIL_N,
-                LAYER_ADAPTIVE_HEAD_N,
-            )
-        })
-        .collect();
-    // What it used to build: boundary layers promoted to K8V8.
+    // What a `--kv-quant none` request builds today — from the single producer
+    // the arch loops build their caches from, not a second copy of it.
+    let current: Vec<KvQuant> = kv_layer_quants(n_layers, KvQuant::None);
+    // What it used to build: boundary layers promoted to K8V8. Spelled out on
+    // purpose — this arm is a frozen historical layout, so deriving it from the
+    // live policy would make the comparison below vacuous by construction.
     let legacy: Vec<KvQuant> = (0..n_layers)
         .map(|i| {
             if i < LAYER_ADAPTIVE_HEAD_N || i >= n_layers - LAYER_ADAPTIVE_TAIL_N {
@@ -175,20 +154,4 @@ fn a_block_written_under_the_old_mixture_does_not_hydrate_into_a_none_request() 
         idx.lookup(&hash, key_current).unwrap().is_some(),
         "the request must still hit its OWN block — otherwise the miss above proves nothing"
     );
-}
-
-/// End-to-end variant — gated by `RMLX_KV_TEST_MODEL` AND `--ignored`. Lives
-/// here so the test binary is identifiable in `cargo test --test` output.
-///
-/// The full implementation is intentionally a compile-only skeleton today: it
-/// loads the Bonsai snapshot, verifies the arch matches, then early-returns.
-/// Wiring the bench-style prompt-cache assertion through the real
-/// `generate_greedy` path is more invasive than 's scope (it touches the
-/// server + claim-file plumbing). The unit suite (`crates/rmlx-models/src/...`)
-/// covers every invariant on synthetic fixtures; this slot is reserved
-/// for a follow-up that wires the assertion through the live decode loop.
-#[ignore]
-#[test]
-fn ssd_layout_key_disambiguation() {
-    panic!("E2E wiring deferred; see ticket follow-up");
 }
