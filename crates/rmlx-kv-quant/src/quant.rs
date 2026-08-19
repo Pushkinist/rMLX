@@ -849,9 +849,11 @@ impl KvQuant {
     /// model this codec, model-agnostically.
     ///
     /// A codebook width, not a delivered density and not a quality claim.
-    /// `None` (bf16) reports 16/16 — for that codec the two coincide. K-only
-    /// codecs report a bf16 (16-bit) V; V-only codecs (PlanarK) report a bf16
-    /// (16-bit) K.
+    /// **A side kept at model dtype instead of quantized reports 16**, which is
+    /// the one property callers other than the byte estimator may key off:
+    /// `None` (bf16) reports 16/16 and is the only codec that quantizes
+    /// neither side, while the K-only families (`PlanarK`, `IsoKOnly*`,
+    /// `RotorKOnly*`) report a quantized K and a 16-bit V.
     ///
     /// **The iso and rotor families do not store at their codebook width.**
     /// Their stores spend one whole `u32` code word *and* one `f32` scale per
@@ -1170,6 +1172,28 @@ pub fn validate_rotor_k_asym_v(v_bits: u8, v_group_size: u16) -> Result<(), Stri
     }
 }
 
+/// Validate one side of a `mixed_k<kb>g<kg>_v<vb>g<vg>` spec.
+///
+/// The Mixed path hands `(bits, group_size)` straight to MLX's affine
+/// `quantize`, which implements a fixed set of widths. Without this check the
+/// parser accepted any `u8`: `mixed_k16g64_v16g64` parsed, reported
+/// `approx_code_bits() == (16, 16)` — the value that means "kept at model
+/// dtype" — and so read as a codec that quantizes nothing, which silently
+/// opted it out of every check keyed on that property (the boundary-layer
+/// quality floor among them) while still packing 16-bit affine codes at
+/// runtime. A width the codec cannot store is a parse error, not a mode.
+///
+/// The sibling parametric family validates the same way
+/// ([`validate_rotor_k_asym_v`]); this is the missing half of that pair.
+pub fn validate_mixed_side(side: char, bits: u8, group_size: u16) -> Result<(), String> {
+    match (bits, group_size) {
+        (2 | 3 | 4 | 5 | 6 | 8, 32 | 64 | 128) => Ok(()),
+        _ => Err(format!(
+            "unsupported ({side}_bits={bits}, {side}_group_size={group_size}) for Mixed;              valid bits: 2, 3, 4, 5, 6, 8 (MLX affine quantize),              valid group sizes: 32, 64, 128.              For an unquantized side use --kv-quant none (bf16 K and V)."
+        )),
+    }
+}
+
 impl std::fmt::Display for KvQuant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1315,6 +1339,18 @@ impl std::str::FromStr for KvQuant {
                     input: s.to_string(),
                     reason,
                 })?;
+            validate_mixed_side('k', k_bits, k_group_size).map_err(|reason| {
+                KvQuantParseError::InvalidMixed {
+                    input: s.to_string(),
+                    reason,
+                }
+            })?;
+            validate_mixed_side('v', v_bits, v_group_size).map_err(|reason| {
+                KvQuantParseError::InvalidMixed {
+                    input: s.to_string(),
+                    reason,
+                }
+            })?;
 
             return Ok(KvQuant::Mixed {
                 k_bits,

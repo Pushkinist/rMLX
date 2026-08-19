@@ -433,10 +433,13 @@ impl ArchGenerator {
         // declaration disagrees would otherwise select the wrong cache (or
         // none) while decode runs the other architecture's layout.
         let arch_name = model.arch_class();
-        // layout-key inputs come straight from the loaded model so the
-        // SSD tier salts every row with `(arch, n_layers, n_kv_heads, head_dim,
-        // kv_quant)`. `attach_at_load` is a no-op when the tier is OFF, so
-        // these reads are cheap on the RAM-only fast path.
+        // layout-key inputs come straight from the loaded model so the SSD tier
+        // salts every row with `(arch, per-layer codec vector, n_kv_heads,
+        // head_dim, kv_quant)`. `n_layers` is not folded as a number:
+        // `attach_at_load` expands it into the per-layer vector (the boundary
+        // promotion is a policy that can change between builds, and the key has
+        // to move with it). `attach_at_load` is a no-op when the tier is OFF,
+        // so these reads are cheap on the RAM-only fast path.
         let n_layers = model.num_hidden_layers();
         let n_kv_heads = model.num_key_value_heads();
         let head_dim = model.head_dim();

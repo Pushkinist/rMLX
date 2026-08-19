@@ -29,7 +29,7 @@ use crate::decode_loop::{
     capture_logprobs, choose_token, chunked_prefill, pipelined_decode, reject_nan_prefill,
     DecodeCtx,
 };
-use crate::kv_cache::{kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N};
+use crate::kv_cache::kv_layer_quants;
 use crate::prompt_cache::{chained_block_hashes_seeded, Consumed, ReusePolicy};
 use rmlx_kv_quant::{KvCache, KV_MAX_SEQ_DEFAULT};
 
@@ -200,9 +200,13 @@ pub fn generate_greedy<'a>(
     // returns Miss without touching the cache (mirrored by the `!has_image`
     // store gate below).
     if !has_image {
-        if let Consumed::Exact(cloned) =
-            PROMPT_CACHE.consume(prompt_ids, kv_quant, false, model.model_sig)
-        {
+        if let Consumed::Exact(cloned) = PROMPT_CACHE.consume(
+            prompt_ids,
+            kv_quant,
+            model.cfg.num_hidden_layers,
+            false,
+            model.model_sig,
+        ) {
             return exact_hit_decode(
                 model,
                 tokenizer,
@@ -235,19 +239,14 @@ pub fn generate_greedy<'a>(
     let sliding_window_i32 = model.cfg.sliding_window as i32;
     let n_layers = model.cfg.num_hidden_layers;
     // Force K8V8 for boundary layers (first head_n + last tail_n).
-    let mut caches: Vec<KvCache> = (0..n_layers)
-        .map(|i| {
+    let mut caches: Vec<KvCache> = kv_layer_quants(n_layers, kv_quant)
+        .into_iter()
+        .enumerate()
+        .map(|(i, q)| {
             let window = match model.cfg.layer_types[i] {
                 LayerType::SlidingAttention => Some(sliding_window_i32),
                 LayerType::FullAttention => None,
             };
-            let q = kv_quant_for_layer(
-                i,
-                n_layers,
-                kv_quant,
-                LAYER_ADAPTIVE_TAIL_N,
-                LAYER_ADAPTIVE_HEAD_N,
-            );
             KvCache::with_quant_max_seq_window(q, max_seq, window).with_layer_idx(i)
         })
         .collect();
@@ -398,7 +397,12 @@ pub fn generate_greedy<'a>(
                     let lk = active_layout_key();
                     let block_hashes = chained_block_hashes_seeded(
                         prompt_ids,
-                        crate::prompt_cache::cache_seed(lk, kv_quant, model.model_sig),
+                        crate::prompt_cache::request_cache_seed(
+                            lk,
+                            kv_quant,
+                            model.cfg.num_hidden_layers,
+                            model.model_sig,
+                        ),
                     );
                     let entry = Gemma3Entry {
                         prompt_token_ids: prompt_ids.to_vec(),

@@ -54,6 +54,7 @@
 use rmlx_core::error::Result;
 use rmlx_core::DispatchPolicy;
 
+use crate::kv_cache::kv_layer_quants;
 use crate::prefix_index::{
     active_prefix_index_kind, build_active_index, PrefixIndex, PrefixIndexKind,
 };
@@ -90,12 +91,46 @@ pub(crate) fn model_cache_sig(model_dir: &std::path::Path) -> u64 {
     crate::multimodal_cache::model_sig(&id)
 }
 
-// The seed itself is defined in `rmlx-kv-ssd` next to the FNV walk it feeds,
-// because the SSD hydrate probe has to produce the same digest stream as this
-// RAM cache and cannot see `rmlx-models`. Re-exported so in-crate call sites
-// keep the `crate::prompt_cache::cache_seed` path. Do NOT reintroduce a local
-// copy of the formula here — see `rmlx_kv_ssd::hashing::cache_seed`.
-pub(crate) use rmlx_kv_ssd::cache_seed;
+// The seed formula itself is defined in `rmlx-kv-ssd` next to the FNV walk it
+// feeds, because the SSD hydrate probe has to produce the same digest stream as
+// this RAM cache and cannot see `rmlx-models`. Do NOT reintroduce a copy of the
+// formula here — see `rmlx_kv_ssd::hashing::cache_seed`.
+use rmlx_kv_ssd::cache_seed;
+
+/// The prompt-cache / SSD digest seed for **one request**.
+///
+/// Wraps [`rmlx_kv_ssd::cache_seed`] with the one argument that crate cannot
+/// produce: the per-layer codec vector `kv_quant` resolves to under this
+/// build's layer policy. That policy lives in [`crate::kv_cache`], above the
+/// SSD crate, so the vector is supplied from here — from the same
+/// [`kv_layer_quants`] every arch builds its caches from.
+///
+/// Take `n_layers` rather than the vector so there is exactly one place in this
+/// crate that expands it. A caller that built the vector for its caches and a
+/// caller that only knows `n_layers` then cannot seed differently, which is the
+/// failure that matters here: a push seeded differently from the query does not
+/// return a wrong answer, it returns a cache that silently never hits.
+///
+/// Why per request, when `layout_key` already folds a vector: the layout key is
+/// fixed at attach from the launch codec, and a request may resolve a different
+/// one (`kv_quant_for_ctx` in auto mode, or an explicit per-request override).
+/// For those requests the attach-time vector describes a layout they are not
+/// running, so the guarantee "a layer-policy change invalidates stored blocks"
+/// would hold only for requests on the launch default. Seeding from the
+/// request's own mixture makes it hold for every request.
+pub(crate) fn request_cache_seed(
+    layout_key: u64,
+    kv_quant: KvQuant,
+    n_layers: usize,
+    model_sig: u64,
+) -> u64 {
+    cache_seed(
+        layout_key,
+        kv_quant,
+        &kv_layer_quants(n_layers, kv_quant),
+        model_sig,
+    )
+}
 
 /// Default RAM cap for the prompt cache (2 GiB).
 pub(crate) const DEFAULT_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -1265,10 +1300,11 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
     ///    find, no evict side-effect). The cached K/V is keyed by token ids
     ///    only; an image prompt's K/V depends on scattered vision features, so
     ///    it must never be served from or stored under a token-id key.
-    /// 2. Compute the partitioned seed via [`cache_seed`] from
-    ///    `active_layout_key()` + the KV codec + `model_sig`, so a slot stored
-    ///    by a different model, under a different codec, or for a different
-    ///    cache layout never cross-serves.
+    /// 2. Compute the partitioned seed via [`request_cache_seed`] from
+    ///    `active_layout_key()` + the KV codec + the per-layer mixture that
+    ///    codec resolves to + `model_sig`, so a slot stored by a different
+    ///    model, under a different codec, under a different per-layer policy,
+    ///    or for a different cache layout never cross-serves.
     /// 3. `find_best_prefix` (capturing `block_count`) + the hydrate-from-SSD
     ///    retry (no-op when the tier is OFF).
     /// 4. Quant-mismatch guard: a stored `KvQuant` that differs from the runtime
@@ -1288,6 +1324,10 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
     /// decision is reconstructable from a single run's log — the cached arches
     /// previously had silent degrade arms.
     ///
+    /// `n_layers` is the asking model's decoder-layer count — it sizes the
+    /// per-layer mixture folded into the seed, so it must be the same count the
+    /// caller builds its `KvCache` vector at.
+    ///
     /// `model_sig` identifies the model asking. It is not decoration: this
     /// cache is one static per *architecture*, so it is shared by every model
     /// of that arch the process has resident, and the token-id equality the
@@ -1296,6 +1336,7 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
         &self,
         prompt_ids: &[u32],
         kv_quant: KvQuant,
+        n_layers: usize,
         has_image: bool,
         model_sig: u64,
     ) -> Consumed<E> {
@@ -1313,7 +1354,7 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
         // (2) Partitioned seed: identical to the per-arch push seed, so a slot
         // stored by a different model, or under a different KV codec / layout,
         // never matches.
-        let seed = cache_seed(self.active_layout_key(), kv_quant, model_sig);
+        let seed = request_cache_seed(self.active_layout_key(), kv_quant, n_layers, model_sig);
         let policy = self.policy;
         let arch = self.arch_name;
         // Kernel-path policy for the caches a hydrate would reconstruct. The

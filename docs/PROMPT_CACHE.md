@@ -105,13 +105,19 @@ The three terms:
   collapses several models onto one namespace directory, so the directory is not
   a per-model partition either.
 - **`layout_key`** — a stable FNV-1a-64 hash over
-  `(arch, n_layers, n_kv_heads, head_dim, kv_quant)` from
-  `ssd_tier::compute_layout_key`, or `0` when the SSD tier is off. It ensures
-  two snapshots of the same prompt at different KV layouts (e.g. `k8v8` vs
-  `k8v4`) cannot share cache blocks. It is a *shape* key and carries no model
+  `(arch, layer_quants, n_kv_heads, head_dim, kv_quant)` from
+  `ssd_tier::compute_layout_key`, or `0` when the SSD tier is off, where
+  `layer_quants` is the effective per-layer codec vector the caches are built
+  from. It ensures two snapshots of the same prompt at different KV layouts
+  (e.g. `k8v8` vs `k8v4`, or the same base codec under two different
+  boundary-promotion policies) cannot share cache blocks. It is a *shape* key and carries no model
   identity, which is why `model_sig` is a separate term.
-- **`kv_quant`** — the codec the stored K/V is packed under. See "Codec
-  namespacing" below.
+- **`kv_quant`** — the codec the stored K/V is packed under, plus the per-layer
+  mixture that codec resolves to under the current layer policy
+  (`prompt_cache::request_cache_seed` expands `n_layers` through
+  `kv_layer_quants`). The mixture is folded here, per request, rather than only
+  into `layout_key`, because the key is fixed at attach from the launch codec
+  while a request may run a different one. See "Codec namespacing" below.
 
 The seeded variant is `chained_block_hashes_seeded(ids, seed)`. The un-seeded
 convenience wrapper `chained_block_hashes(ids)` calls it with the bare

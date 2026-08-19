@@ -61,6 +61,12 @@
 //! kv_offset`), mirroring `draft_block`'s single-position multi-token generator.
 
 #![allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+// kv-layer-quants: uniform — speculative scratch stack. The drafter/verifier
+// caches a round builds live for that round only: they are never pushed to the
+// prompt cache, never spilled, and never keyed by `layout_key`, so no on-disk
+// description has to match them. Applying the boundary promotion here would
+// change the codec of a stack whose only reader is the round that built it.
+
 use std::path::Path;
 
 use rmlx_core::error::{Error, Result};

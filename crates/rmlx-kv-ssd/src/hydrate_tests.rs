@@ -91,7 +91,7 @@ fn ssd_hit_reconstructs_block_within_tolerance() {
     let prompt_ids: Vec<u32> = (0..BLOCK_TOKENS as u32).collect();
     let chained = chained_block_hashes_seeded(
         &prompt_ids,
-        cache_seed(TEST_LAYOUT_KEY, QUANT, TEST_MODEL_SIG),
+        cache_seed(TEST_LAYOUT_KEY, QUANT, &[QUANT], TEST_MODEL_SIG),
     );
     assert_eq!(chained.len(), 1);
     let key = hash_to_hex_local(chained[0]);
@@ -118,7 +118,7 @@ fn ssd_hit_reconstructs_block_within_tolerance() {
     let block = hydrator
         .lookup(
             &prompt_ids,
-            cache_seed(TEST_LAYOUT_KEY, QUANT, TEST_MODEL_SIG),
+            cache_seed(TEST_LAYOUT_KEY, QUANT, &[QUANT], TEST_MODEL_SIG),
             QUANT,
             DispatchPolicy::default(),
         )
@@ -176,7 +176,8 @@ fn salted_keyed_block_is_found_by_probe() {
     let prompt_ids: Vec<u32> = (0..BLOCK_TOKENS as u32).collect();
 
     // Production-truth seed: the shared `cache_seed`, all three terms live.
-    let salted = chained_block_hashes_seeded(&prompt_ids, cache_seed(LK, QUANT, TEST_MODEL_SIG));
+    let salted =
+        chained_block_hashes_seeded(&prompt_ids, cache_seed(LK, QUANT, &[QUANT], TEST_MODEL_SIG));
     assert_eq!(salted.len(), 1);
     let key = hash_to_hex_local(salted[0]);
 
@@ -196,7 +197,7 @@ fn salted_keyed_block_is_found_by_probe() {
     let block = hydrator
         .lookup(
             &prompt_ids,
-            cache_seed(LK, QUANT, TEST_MODEL_SIG),
+            cache_seed(LK, QUANT, &[QUANT], TEST_MODEL_SIG),
             QUANT,
             DispatchPolicy::default(),
         )
@@ -220,7 +221,7 @@ fn salted_keyed_block_is_found_by_probe() {
 /// instance, because either alone is satisfiable by a broken probe:
 ///
 /// 1. **The owning model hits.** The row is keyed exactly as the RAM push side
-///    keys a slot — `cache_seed(layout_key, kv_quant, model_sig)`, all three
+///    keys a slot — `cache_seed(layout_key, kv_quant, &[kv_quant], model_sig)`, all three
 ///    terms non-trivial. A probe that drops a term computes a different digest
 ///    stream, finds nothing, and the tier 0-hits in silence: no error, just a
 ///    full re-prefill on every repeat.
@@ -251,8 +252,8 @@ fn probe_finds_own_models_block_and_not_another_models() {
     const OTHER_MODEL_SIG: u64 = 0x0123_4567_89ab_cdef;
 
     assert_ne!(
-        cache_seed(LK, QUANT, TEST_MODEL_SIG),
-        cache_seed(LK, QUANT, OTHER_MODEL_SIG),
+        cache_seed(LK, QUANT, &[QUANT], TEST_MODEL_SIG),
+        cache_seed(LK, QUANT, &[QUANT], OTHER_MODEL_SIG),
         "the two fixtures must differ only in a term the seed actually uses"
     );
 
@@ -265,7 +266,8 @@ fn probe_finds_own_models_block_and_not_another_models() {
     // One full block, keyed the way the RAM push side keys the slot the spiller
     // later persists: through the shared seed, model term included.
     let prompt_ids: Vec<u32> = (0..BLOCK_TOKENS as u32).collect();
-    let chained = chained_block_hashes_seeded(&prompt_ids, cache_seed(LK, QUANT, TEST_MODEL_SIG));
+    let chained =
+        chained_block_hashes_seeded(&prompt_ids, cache_seed(LK, QUANT, &[QUANT], TEST_MODEL_SIG));
     assert_eq!(chained.len(), 1);
     let key = hash_to_hex_local(chained[0]);
 
@@ -285,7 +287,7 @@ fn probe_finds_own_models_block_and_not_another_models() {
     let block = shared
         .lookup(
             &prompt_ids,
-            cache_seed(LK, QUANT, TEST_MODEL_SIG),
+            cache_seed(LK, QUANT, &[QUANT], TEST_MODEL_SIG),
             QUANT,
             DispatchPolicy::default(),
         )
@@ -299,7 +301,7 @@ fn probe_finds_own_models_block_and_not_another_models() {
         shared
             .lookup(
                 &prompt_ids,
-                cache_seed(LK, QUANT, OTHER_MODEL_SIG),
+                cache_seed(LK, QUANT, &[QUANT], OTHER_MODEL_SIG),
                 QUANT,
                 DispatchPolicy::default()
             )
@@ -314,7 +316,7 @@ fn probe_finds_own_models_block_and_not_another_models() {
         shared
             .lookup(
                 &prompt_ids,
-                cache_seed(LK, QUANT, TEST_MODEL_SIG),
+                cache_seed(LK, QUANT, &[QUANT], TEST_MODEL_SIG),
                 QUANT,
                 DispatchPolicy::default()
             )
@@ -335,7 +337,7 @@ fn index2(db: &std::path::Path) -> SsdKvIndex {
 }
 
 /// `lookup_seeded` returns a `Vec<u64>` equal to the canonical seed recompute:
-/// `chained_block_hashes_seeded(&block.prompt_ids, cache_seed(layout_key, QUANT, model_sig))`.
+/// `chained_block_hashes_seeded(&block.prompt_ids, cache_seed(layout_key, QUANT, &[QUANT], model_sig))`.
 /// A non-zero layout key, the real codec salt and a non-zero model signature
 /// exercise all three components of the seed.
 ///
@@ -375,8 +377,10 @@ fn lookup_seeded_matches_arch_recompute() {
     // chained hash is prefix-dependent, so the first digest of the 2-block input
     // equals the digest of the lone first block — the probe inside lookup finds
     // it after the (unindexed) 2-block digest misses.
-    let salted =
-        chained_block_hashes_seeded(first_block_ids, cache_seed(LK, QUANT, TEST_MODEL_SIG));
+    let salted = chained_block_hashes_seeded(
+        first_block_ids,
+        cache_seed(LK, QUANT, &[QUANT], TEST_MODEL_SIG),
+    );
     assert_eq!(salted.len(), 1);
     let key = hash_to_hex_local(salted[0]);
 
@@ -393,7 +397,7 @@ fn lookup_seeded_matches_arch_recompute() {
     let (block, hashes) = hydrator
         .lookup_seeded(
             &input_ids,
-            cache_seed(LK, QUANT, TEST_MODEL_SIG),
+            cache_seed(LK, QUANT, &[QUANT], TEST_MODEL_SIG),
             QUANT,
             DispatchPolicy::default(),
         )
@@ -417,8 +421,10 @@ fn lookup_seeded_matches_arch_recompute() {
         1,
         "lookup_seeded recomputes over the matched prefix, not the full input"
     );
-    let expected =
-        chained_block_hashes_seeded(&block.prompt_ids, cache_seed(LK, QUANT, TEST_MODEL_SIG));
+    let expected = chained_block_hashes_seeded(
+        &block.prompt_ids,
+        cache_seed(LK, QUANT, &[QUANT], TEST_MODEL_SIG),
+    );
     assert_eq!(
         hashes, expected,
         "lookup_seeded block_hashes must equal the canonical seed recompute"
@@ -448,7 +454,7 @@ fn corrupt_block_deletes_file_and_row_returns_miss() {
     let prompt_ids: Vec<u32> = (0..BLOCK_TOKENS as u32).collect();
     let chained = chained_block_hashes_seeded(
         &prompt_ids,
-        cache_seed(TEST_LAYOUT_KEY, QUANT, TEST_MODEL_SIG),
+        cache_seed(TEST_LAYOUT_KEY, QUANT, &[QUANT], TEST_MODEL_SIG),
     );
     let key = hash_to_hex_local(chained[0]);
     let path = dir.join(format!("{key}.kvb"));
@@ -469,7 +475,7 @@ fn corrupt_block_deletes_file_and_row_returns_miss() {
     let res = hydrator
         .lookup(
             &prompt_ids,
-            cache_seed(TEST_LAYOUT_KEY, QUANT, TEST_MODEL_SIG),
+            cache_seed(TEST_LAYOUT_KEY, QUANT, &[QUANT], TEST_MODEL_SIG),
             QUANT,
             DispatchPolicy::default(),
         )
@@ -509,7 +515,12 @@ fn metadata_mismatch_treated_as_corrupt() {
     let key = hash_to_hex_local(
         chained_block_hashes_seeded(
             &prompt_ids,
-            cache_seed(TEST_LAYOUT_KEY, KvQuant::K8V4, TEST_MODEL_SIG),
+            cache_seed(
+                TEST_LAYOUT_KEY,
+                KvQuant::K8V4,
+                &[KvQuant::K8V4],
+                TEST_MODEL_SIG,
+            ),
         )[0],
     );
     // Write a valid block at K8V8 ...
@@ -528,7 +539,12 @@ fn metadata_mismatch_treated_as_corrupt() {
     assert!(hydrator
         .lookup(
             &prompt_ids,
-            cache_seed(TEST_LAYOUT_KEY, KvQuant::K8V4, TEST_MODEL_SIG),
+            cache_seed(
+                TEST_LAYOUT_KEY,
+                KvQuant::K8V4,
+                &[KvQuant::K8V4],
+                TEST_MODEL_SIG
+            ),
             KvQuant::K8V4,
             DispatchPolicy::default(),
         )
@@ -565,7 +581,7 @@ fn no_indexed_prefix_is_miss() {
     assert!(hydrator
         .lookup(
             &prompt_ids,
-            cache_seed(TEST_LAYOUT_KEY, QUANT, TEST_MODEL_SIG),
+            cache_seed(TEST_LAYOUT_KEY, QUANT, &[QUANT], TEST_MODEL_SIG),
             QUANT,
             DispatchPolicy::default(),
         )
@@ -594,7 +610,7 @@ fn short_prompt_never_queried() {
     assert!(hydrator
         .lookup(
             &short,
-            cache_seed(TEST_LAYOUT_KEY, QUANT, TEST_MODEL_SIG),
+            cache_seed(TEST_LAYOUT_KEY, QUANT, &[QUANT], TEST_MODEL_SIG),
             QUANT,
             DispatchPolicy::default(),
         )
@@ -636,7 +652,7 @@ fn ssd_hit_lookup_emits_hydrate_event() {
     let prompt_ids: Vec<u32> = (0..BLOCK_TOKENS as u32).collect();
     let chained = chained_block_hashes_seeded(
         &prompt_ids,
-        cache_seed(TEST_LAYOUT_KEY, QUANT, TEST_MODEL_SIG),
+        cache_seed(TEST_LAYOUT_KEY, QUANT, &[QUANT], TEST_MODEL_SIG),
     );
     let key = hash_to_hex_local(chained[0]);
     let path = dir.join(format!("{key}.kvb"));
@@ -664,7 +680,7 @@ fn ssd_hit_lookup_emits_hydrate_event() {
     let block = hydrator
         .lookup_with_recorder(
             &prompt_ids,
-            cache_seed(TEST_LAYOUT_KEY, QUANT, TEST_MODEL_SIG),
+            cache_seed(TEST_LAYOUT_KEY, QUANT, &[QUANT], TEST_MODEL_SIG),
             QUANT,
             DispatchPolicy::default(),
             &rec,
@@ -794,7 +810,7 @@ fn budget_enforcement_racing_hydrates_never_serves_a_foreign_block() {
             let block = hydrator
                 .lookup(
                     &fx.prompts[i],
-                    cache_seed(RACE_LK, QUANT, TEST_MODEL_SIG),
+                    cache_seed(RACE_LK, QUANT, &[QUANT], TEST_MODEL_SIG),
                     QUANT,
                     DispatchPolicy::default(),
                 )
@@ -874,7 +890,7 @@ fn budget_enforcement_racing_hydrates_never_serves_a_foreign_block() {
                 for i in 0..RACE_PROMPTS {
                     match hydrator.lookup(
                         &fx.prompts[i],
-                        cache_seed(RACE_LK, QUANT, TEST_MODEL_SIG),
+                        cache_seed(RACE_LK, QUANT, &[QUANT], TEST_MODEL_SIG),
                         QUANT,
                         DispatchPolicy::default(),
                     ) {
@@ -977,7 +993,8 @@ fn seed_race_fixture(dir: &std::path::Path, db: &std::path::Path, device: Device
     let mut expected_k = Vec::with_capacity(RACE_PROMPTS);
     let mut kvb_bytes = Vec::with_capacity(RACE_PROMPTS);
     for (i, ids) in prompts.iter().enumerate() {
-        let chained = chained_block_hashes_seeded(ids, cache_seed(RACE_LK, QUANT, TEST_MODEL_SIG));
+        let chained =
+            chained_block_hashes_seeded(ids, cache_seed(RACE_LK, QUANT, &[QUANT], TEST_MODEL_SIG));
         assert_eq!(chained.len(), 1);
         let key = hash_to_hex_local(chained[0]);
         let cache = build_kvcache(BLOCK_TOKENS as i32, 0x9E11 + i as u64 * 977);
@@ -1062,7 +1079,8 @@ fn hydrate_of_a_row_whose_file_vanished_is_a_miss_and_leaves_the_tier_usable() {
     let index = SsdKvIndex::open_at(&db).unwrap();
 
     let prompt_ids: Vec<u32> = (0..BLOCK_TOKENS as u32).collect();
-    let chained = chained_block_hashes_seeded(&prompt_ids, cache_seed(LK, QUANT, TEST_MODEL_SIG));
+    let chained =
+        chained_block_hashes_seeded(&prompt_ids, cache_seed(LK, QUANT, &[QUANT], TEST_MODEL_SIG));
     assert_eq!(chained.len(), 1);
     let key = hash_to_hex_local(chained[0]);
     let path = dir.join(format!("{key}.kvb"));
@@ -1085,7 +1103,7 @@ fn hydrate_of_a_row_whose_file_vanished_is_a_miss_and_leaves_the_tier_usable() {
         hydrator
             .lookup(
                 &prompt_ids,
-                cache_seed(LK, QUANT, TEST_MODEL_SIG),
+                cache_seed(LK, QUANT, &[QUANT], TEST_MODEL_SIG),
                 QUANT,
                 DispatchPolicy::default()
             )
@@ -1106,7 +1124,7 @@ fn hydrate_of_a_row_whose_file_vanished_is_a_miss_and_leaves_the_tier_usable() {
     let block = hydrator
         .lookup(
             &prompt_ids,
-            cache_seed(LK, QUANT, TEST_MODEL_SIG),
+            cache_seed(LK, QUANT, &[QUANT], TEST_MODEL_SIG),
             QUANT,
             DispatchPolicy::default(),
         )
