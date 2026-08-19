@@ -18,7 +18,7 @@ use tracing::info;
 
 use crate::constraint::ConstraintEngine;
 use crate::decode_loop::{capture_logprobs, reject_nan_prefill};
-use crate::kv_cache::{kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N};
+use crate::kv_cache::kv_layer_quants;
 use crate::prompt_cache::{chained_block_hashes_seeded, Consumed, ReusePolicy};
 use crate::sampler::apply_mask_argmax;
 use rmlx_kv_quant::{KvCache, KV_MAX_SEQ_DEFAULT};
@@ -108,7 +108,13 @@ pub fn generate_greedy(
     );
     // BitNet is text-only (no vision tower), so there is never an image prompt;
     // the engine's has_image bypass is belt-and-suspenders.
-    let consumed = PROMPT_CACHE.consume(prompt_ids, kv_quant, false, model.model_sig);
+    let consumed = PROMPT_CACHE.consume(
+        prompt_ids,
+        kv_quant,
+        model.cfg.num_hidden_layers,
+        false,
+        model.model_sig,
+    );
 
     // Path A: exact cache hit — skip re-prefill, replay the stored first token,
     // then run the shared decode loop on the cloned caches.
@@ -185,17 +191,10 @@ pub fn generate_greedy(
     let max_seq = max_ctx_override.unwrap_or(KV_MAX_SEQ_DEFAULT);
 
     let n_layers = model.cfg.num_hidden_layers;
-    let mut caches: Vec<KvCache> = (0..n_layers)
-        .map(|i| {
-            let q = kv_quant_for_layer(
-                i,
-                n_layers,
-                kv_quant,
-                LAYER_ADAPTIVE_TAIL_N,
-                LAYER_ADAPTIVE_HEAD_N,
-            );
-            KvCache::with_quant_max_seq_window(q, max_seq, None).with_layer_idx(i)
-        })
+    let mut caches: Vec<KvCache> = kv_layer_quants(n_layers, kv_quant)
+        .into_iter()
+        .enumerate()
+        .map(|(i, q)| KvCache::with_quant_max_seq_window(q, max_seq, None).with_layer_idx(i))
         .collect();
 
     // Prefill in chunks.
@@ -383,7 +382,12 @@ pub fn generate_greedy(
                     let lk = active_layout_key();
                     let block_hashes = chained_block_hashes_seeded(
                         prompt_ids,
-                        crate::prompt_cache::cache_seed(lk, kv_quant, model.model_sig),
+                        crate::prompt_cache::request_cache_seed(
+                            lk,
+                            kv_quant,
+                            model.cfg.num_hidden_layers,
+                            model.model_sig,
+                        ),
                     );
                     let entry = BitNetEntry {
                         prompt_token_ids: prompt_ids.to_vec(),

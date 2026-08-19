@@ -28,11 +28,13 @@
 //! large `--max-ctx` is an eager allocation there. Auto-resolver default is
 //! unchanged (still K8V8).
 //!
-//! `none` is **not** a pure-bf16 control: [`kv_quant_for_layer`] promotes the
-//! boundary layers to `K8V8` under every base mode, `None` included, so on an
-//! arch whose boundary layers hold a real cache the run is a mixture. See the
-//! per-arch counts and measured ratios in `docs/KV_QUANT.md`
-//! §Layer-adaptive overrides before reading any "vs `none`" number.
+//! `none` is a pure-bf16 control on every arch: [`kv_quant_for_layer`]'s
+//! boundary promotion applies only to a base mode that quantizes, so no layer
+//! of a `none` run holds a packed store. This was not always true — the
+//! promotion used to fire under `None` too, which made `none` a bf16/K8V8
+//! mixture measuring up to 1.16× true bf16 (gemma-4-26b at 32k). Historical
+//! "vs `none`" numbers recorded before that fix carry a per-arch correction
+//! factor; see `docs/KV_QUANT.md` §Layer-adaptive overrides.
 //!
 //! `KvQuant::K8V4` is a CLAUDE.md-mandated baseline for Qwen MoE PPL recovery:
 //! - K uses affine q8_0 (symmetric 8-bit, `group_size=128`).
@@ -93,11 +95,12 @@ pub const LAYER_ADAPTIVE_HEAD_N: usize = 2;
 
 /// Layer-adaptive KV quantization.
 ///
-/// Returns `KvQuant::K8V8` for:
+/// Returns `KvQuant::K8V8` for a **quantizing** `base_quant` on:
 /// - the **first** `head_n` layers (by absolute layer index); and
 /// - the **last** `tail_n` layers (by absolute layer index).
 ///
-/// Returns `base_quant` for all other layers.
+/// Returns `base_quant` for all other layers, and for every layer when
+/// `base_quant` quantizes neither side.
 ///
 /// Rationale:
 /// - **Tail**: last-layer K/V vectors carry the highest per-token information.
@@ -128,15 +131,20 @@ pub const LAYER_ADAPTIVE_HEAD_N: usize = 2;
 /// override is by layer index, not by model name or KV mode — no hardcoded
 /// model branches.
 ///
-/// `KvQuant::K8V8` is the only base mode for which this is a no-op. **Every**
-/// other base mode is promoted on the boundary layers — `KvQuant::None`
-/// included, so `--kv-quant none` allocates a bf16/K8V8 *mixture* rather than
-/// a bf16 control wherever those layers hold a real token-indexed cache. Two
-/// per-arch filters can still cancel the promotion in practice: a windowed
-/// layer runs the bf16 rotating ring regardless of the flag, and a shared-KV
-/// layer (Gemma4 `num_kv_shared_layers`) owns no cache to promote. Per-arch
-/// counts and the measured byte ratios are in `docs/KV_QUANT.md`
-/// §Layer-adaptive overrides.
+/// The promotion is a **quality floor for a codec that quantizes**: it buys
+/// back loss the base codec introduced on the layers where that loss costs
+/// most. A base mode that quantizes *neither* axis has no such loss, so the
+/// promotion is skipped for it — see [`base_is_unquantized`]. That leaves it a
+/// no-op for `KvQuant::K8V8` (already the target) and for `KvQuant::None`
+/// (bf16 both sides), and in force for every quantizing base mode, including
+/// the K-only families whose V side is bf16 but whose K side is below the
+/// floor.
+///
+/// Two per-arch filters can cancel the promotion independently of this
+/// function: a windowed layer runs the bf16 rotating ring regardless of the
+/// flag, and a shared-KV layer (Gemma4 `num_kv_shared_layers`) owns no cache
+/// to promote. Per-arch counts and the measured byte ratios are in
+/// `docs/KV_QUANT.md` §Layer-adaptive overrides.
 ///
 /// When `head_n == 0` and `tail_n == 0`, `base_quant` is always returned.
 pub fn kv_quant_for_layer(
@@ -148,11 +156,76 @@ pub fn kv_quant_for_layer(
 ) -> KvQuant {
     let is_tail = tail_n > 0 && layer_idx >= n_layers.saturating_sub(tail_n);
     let is_head = head_n > 0 && layer_idx < head_n;
-    if is_tail || is_head {
+    if (is_tail || is_head) && !base_is_unquantized(base_quant) {
         KvQuant::K8V8
     } else {
         base_quant
     }
+}
+
+/// The **nominal** per-layer codec vector for a model of `n_layers` layers at
+/// base codec `base` — one entry per decoder layer, `kv_quant_for_layer` at the
+/// standard [`LAYER_ADAPTIVE_TAIL_N`] / [`LAYER_ADAPTIVE_HEAD_N`] constants.
+///
+/// This is the **one** producer of that vector. Every consumer calls it rather
+/// than re-running the loop: each arch's cache-construction loop
+/// (`caches[i]` is built at `quants[i]`), the SSD attach that folds the vector
+/// into the layout key, and the per-request prompt-cache seed. Two of those
+/// three describe what the third builds, so a second copy of the loop is not a
+/// duplication of style — it is a way for the description to stop matching the
+/// thing described, silently, the next time the constants or the rule move.
+/// `scripts/check_kv_layer_quants.sh` (in `make ci`) keeps it that way by
+/// failing on a direct [`kv_quant_for_layer`] call outside this module.
+///
+/// **Nominal, not effective.** Two per-arch filters can make an entry a no-op
+/// on the built cache and are deliberately *not* folded in here, because they
+/// are properties of the layer's geometry rather than of the codec policy: a
+/// windowed layer runs the bf16 rotating ring whatever codec it is handed, and
+/// a shared-KV layer (Gemma4 `num_kv_shared_layers`) owns no cache at all. A
+/// consumer that needs the effective codec of a *built* cache must read the
+/// cache, not this vector.
+#[must_use]
+pub fn kv_layer_quants(n_layers: usize, base: KvQuant) -> Vec<KvQuant> {
+    (0..n_layers)
+        .map(|i| {
+            kv_quant_for_layer(
+                i,
+                n_layers,
+                base,
+                LAYER_ADAPTIVE_TAIL_N,
+                LAYER_ADAPTIVE_HEAD_N,
+            )
+        })
+        .collect()
+}
+
+/// Code width [`KvQuant::approx_code_bits`] reports for a side that is kept at
+/// model dtype (bf16) instead of quantized.
+const MODEL_DTYPE_CODE_BITS: u32 = 16;
+
+/// Does `base_quant` keep **both** K and V at model dtype?
+///
+/// Keyed off the codec's own code widths, never off a codec name or an arch:
+/// any mode that quantizes nothing reports `MODEL_DTYPE_CODE_BITS` on both
+/// sides ([`KvQuant::None`] today) and any mode that quantizes at least one
+/// side reports that side below it — including the K-only families
+/// (`PlanarK`, `IsoKOnly*`, `RotorKOnly*`), which keep a bf16 V but a 3-/4-bit
+/// K and therefore still have K-side loss for the boundary promotion to
+/// recover.
+///
+/// Used by [`kv_quant_for_layer`] to decide whether the boundary promotion has
+/// anything to buy. Promoting an unquantized base allocates a packed q8_0 K+V
+/// store on top of the model-dtype buffers the layer already holds and can
+/// only *lower* its precision — the inverse of what the override exists for.
+///
+/// The test is deliberately "quantizes nothing", not "at least as wide as the
+/// K8V8 floor on both axes": the second would also divert equal-width bases of
+/// a different family (`mixed_k8g64_v8g64`, `rot_k_v8g64`) out of the
+/// promotion, which is a separate question about codecs that genuinely read
+/// their packed store and is not decided here.
+fn base_is_unquantized(base_quant: KvQuant) -> bool {
+    let (k_bits, v_bits) = base_quant.approx_code_bits();
+    k_bits >= MODEL_DTYPE_CODE_BITS && v_bits >= MODEL_DTYPE_CODE_BITS
 }
 
 /// Per-layer attributes for the resolve-time net-benefit check.
@@ -676,8 +749,11 @@ impl KvCacheBuilder {
 /// For Qwen MoE architectures, `K8V4` is safe (asymmetric; K stays 8-bit).
 /// `None` (bf16) is also safe — just large. `K8V8` and `Planar` are both
 /// validated on Qwen3.6-35B-A3B-8bit. No arch-specific special-casing is
-/// needed here because `kv_quant_for_layer` still forces the last 8
-/// layers to K8V8 regardless of the base mode returned by this function.
+/// needed here: every mode this function can return keeps K at 8 bits or
+/// better, which is the property the Qwen MoE guard is about. The
+/// `kv_quant_for_layer` boundary promotion is not part of that argument —
+/// it only ever raises a K width that is already ≥ 8 here, and it does not
+/// fire at all under the `None` arm.
 pub fn kv_quant_for_ctx(prompt_len: usize) -> KvQuant {
     if prompt_len <= 8_192 {
         KvQuant::K8V4

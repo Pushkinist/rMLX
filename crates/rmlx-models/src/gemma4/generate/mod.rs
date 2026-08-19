@@ -45,8 +45,7 @@ use crate::decode_loop::{
     DecodeCtx,
 };
 use crate::kv_cache::{
-    kv_max_seq_and_ceiling, kv_quant_for_layer, warn_if_kv_codec_net_negative, KvLayerShape,
-    LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
+    kv_layer_quants, kv_max_seq_and_ceiling, warn_if_kv_codec_net_negative, KvLayerShape,
 };
 use crate::prompt_cache::{Consumed, ReuseKind, ReusePolicy, BLOCK_TOKENS};
 use rmlx_kv_quant::{KvCache, KvQuant};
@@ -181,7 +180,13 @@ pub fn generate_greedy<'a>(
     // falls through to Path C (full re-prefill).
     let mut exact_hit: Option<(Vec<KvCache>, u32, String)> = None;
     let mut prefix_hit: Option<(Vec<KvCache>, usize)> = None;
-    match PROMPT_CACHE.consume(prompt_ids, kv_quant, has_image, model.model_sig) {
+    match PROMPT_CACHE.consume(
+        prompt_ids,
+        kv_quant,
+        model.cfg.num_hidden_layers,
+        has_image,
+        model.model_sig,
+    ) {
         Consumed::Exact(cloned) => {
             tracing::debug!(
                 prompt_len = prompt_ids.len(),
@@ -392,19 +397,14 @@ pub fn generate_greedy<'a>(
             // protect output quality when base_quant uses aggressive V
             // compression. SWA layers keep their window regardless of the
             // quant override.
-            let fresh: Vec<KvCache> = (0..n_layers)
-                .map(|i| {
+            let fresh: Vec<KvCache> = kv_layer_quants(n_layers, kv_quant)
+                .into_iter()
+                .enumerate()
+                .map(|(i, q)| {
                     let window = match model.cfg.layer_types[i] {
                         LayerType::SlidingAttention => Some(sliding_window_i32),
                         LayerType::FullAttention => None,
                     };
-                    let q = kv_quant_for_layer(
-                        i,
-                        n_layers,
-                        kv_quant,
-                        LAYER_ADAPTIVE_TAIL_N,
-                        LAYER_ADAPTIVE_HEAD_N,
-                    );
                     KvCache::with_quant_max_seq_window(q, initial_max_seq, window)
                         .with_max_seq_ceiling(max_seq_ceiling)
                         .with_layer_idx(i)
@@ -660,7 +660,12 @@ pub fn generate_greedy<'a>(
                                 prompt_token_ids: prompt_ids.to_vec(),
                                 block_hashes: crate::prompt_cache::chained_block_hashes_seeded(
                                     prompt_ids,
-                                    crate::prompt_cache::cache_seed(lk, kv_quant, model.model_sig),
+                                    crate::prompt_cache::request_cache_seed(
+                                        lk,
+                                        kv_quant,
+                                        model.cfg.num_hidden_layers,
+                                        model.model_sig,
+                                    ),
                                 ),
                                 kv_caches: kvs,
                                 first_id: last_id,

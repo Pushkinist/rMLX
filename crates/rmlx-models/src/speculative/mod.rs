@@ -34,6 +34,12 @@ pub mod mtp;
 
 pub(crate) mod draft_kind;
 
+// kv-layer-quants: uniform — speculative scratch stack. The drafter/verifier
+// caches a round builds live for that round only: they are never pushed to the
+// prompt cache, never spilled, and never keyed by `layout_key`, so no on-disk
+// description has to match them. Applying the boundary promotion here would
+// change the codec of a stack whose only reader is the round that built it.
+
 use std::path::Path;
 use std::time::Instant;
 

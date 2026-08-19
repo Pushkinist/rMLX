@@ -71,8 +71,7 @@ use crate::decode_loop::{
     DecodeCtx,
 };
 use crate::kv_cache::{
-    kv_max_seq_and_ceiling, kv_quant_for_layer, warn_if_kv_codec_net_negative, KvLayerShape,
-    LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
+    kv_layer_quants, kv_max_seq_and_ceiling, warn_if_kv_codec_net_negative, KvLayerShape,
 };
 use crate::layers::{resolve_quant, QuantParams};
 use crate::load_util::{bf16_param, bf16_scales, Weights};
@@ -1897,7 +1896,13 @@ pub fn generate_greedy<'a>(
         "Qwen3 prompt cache must be ExactOnly — pure-attention with no GDN recurrent state \
          cannot safely reuse a partial prefix whose residual state is not stored",
     );
-    let consumed = QWEN3_PROMPT_CACHE.consume(prompt_ids, kv_quant, false, model.model_sig);
+    let consumed = QWEN3_PROMPT_CACHE.consume(
+        prompt_ids,
+        kv_quant,
+        model.cfg.num_hidden_layers,
+        false,
+        model.model_sig,
+    );
 
     // Path A: exact cache hit — skip re-prefill, jump straight to decode.
     if let Consumed::Exact(cloned) = consumed {
@@ -2001,15 +2006,10 @@ pub fn generate_greedy<'a>(
     // Allocate one KvCache per decoder layer using the selected quant mode.
     // Force K8V8 for boundary layers (first head_n + last tail_n).
     let n_layers = model.cfg.num_hidden_layers;
-    let mut caches: Vec<KvCache> = (0..n_layers)
-        .map(|i| {
-            let q = kv_quant_for_layer(
-                i,
-                n_layers,
-                kv_quant,
-                LAYER_ADAPTIVE_TAIL_N,
-                LAYER_ADAPTIVE_HEAD_N,
-            );
+    let mut caches: Vec<KvCache> = kv_layer_quants(n_layers, kv_quant)
+        .into_iter()
+        .enumerate()
+        .map(|(i, q)| {
             KvCache::with_quant_max_seq(q, initial_max_seq)
                 .with_max_seq_ceiling(max_seq_ceiling)
                 .with_layer_idx(i)
@@ -2166,7 +2166,12 @@ pub fn generate_greedy<'a>(
                     let lk = qwen3_active_layout_key();
                     let block_hashes = chained_block_hashes_seeded(
                         prompt_ids,
-                        crate::prompt_cache::cache_seed(lk, kv_quant, model.model_sig),
+                        crate::prompt_cache::request_cache_seed(
+                            lk,
+                            kv_quant,
+                            model.cfg.num_hidden_layers,
+                            model.model_sig,
+                        ),
                     );
                     // Capture the first-token logprobs at the OpenAI ceiling so
                     // a later exact-hit replays a true logprob (truncated to its own

@@ -143,15 +143,15 @@ mutually exclusive.
 > Qwen3 and Qwen3.5-MoE generate paths (the remaining arches do not call it
 > yet). Layout detail in `docs/KV_QUANT.md` § "Memory truth".
 
-> **`--kv-quant none` is not a pure-bf16 control.** `kv_quant_for_layer`
-> promotes the first 2 and last 8 layers to `K8V8` under *every* base mode,
-> `none` included. Wherever those layers hold a real token-indexed cache the
-> run is a bf16/K8V8 mixture — measured 1.145× true bf16 on Ternary-Bonsai-8B,
-> 1.109× on Qwen3.6-35B-A3B and 1.000× on gemma-4-e2b. gemma-4-e4b is 1.000×
-> by the same layer-structure argument rather than by measurement: its
-> promoted head layers are sliding and its promoted tail is entirely shared-KV,
-> so nothing the promotion touches owns a quantizable cache. Per-arch counts
-> and the byte math: `docs/KV_QUANT.md` § "Layer-adaptive overrides".
+> **`--kv-quant none` is a pure-bf16 control.** `kv_quant_for_layer` promotes
+> the first 2 and last 8 layers to `K8V8`, but only under a base mode that
+> quantizes something — `none` is exempt, so no layer of a `none` run holds a
+> packed store. This is a behaviour change: before it, `none` was a bf16/K8V8
+> mixture measuring 1.145× true bf16 on Ternary-Bonsai-8B, 1.160× on
+> gemma-4-26b at 32k and 1.000× on gemma-4-e2b (whose promoted layers own no
+> quantizable cache either way). A "vs `none`" ratio recorded before the change
+> needs that per-arch factor to be read against true bf16; the table is in
+> `docs/KV_QUANT.md` § "Layer-adaptive overrides".
 
 > **Per-request override (issue #26).** `--kv-quant` and `--max-ctx` set the
 > **launch defaults**. On a running server, the OpenAI route accepts per-request

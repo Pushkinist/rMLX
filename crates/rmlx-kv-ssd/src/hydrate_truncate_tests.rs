@@ -93,7 +93,7 @@ fn hydrated_truncate_keeps_prefix_and_correction(quant: KvQuant, kv_h: i32) {
     let prompt_ids: Vec<u32> = (0..prefill as u32).collect();
     let chained = chained_block_hashes_seeded(
         &prompt_ids,
-        cache_seed(TEST_LAYOUT_KEY, quant, TEST_MODEL_SIG),
+        cache_seed(TEST_LAYOUT_KEY, quant, &[quant], TEST_MODEL_SIG),
     );
     let key = hash_to_hex_local(chained[0]);
     let path = dir.join(format!("{key}.kvb"));
@@ -116,7 +116,7 @@ fn hydrated_truncate_keeps_prefix_and_correction(quant: KvQuant, kv_h: i32) {
     let mut block = hydrator
         .lookup(
             &prompt_ids,
-            cache_seed(TEST_LAYOUT_KEY, quant, TEST_MODEL_SIG),
+            cache_seed(TEST_LAYOUT_KEY, quant, &[quant], TEST_MODEL_SIG),
             quant,
             DispatchPolicy::default(),
         )

@@ -32,9 +32,9 @@ KV byte accounting mirrors the engine, not a re-invention:
         ("uses the RotatingKvCache code path ... regardless of the `quant`
         flag") -- an SWA layer is bf16 at `sliding_window` tokens, always.
     crates/rmlx-kv-quant/src/rotating.rs:7  ring is `[B, kv_h, max_size, D]`
-    crates/rmlx-models/src/kv_cache/mod.rs:143  kv_quant_for_layer
+    crates/rmlx-models/src/kv_cache/mod.rs  kv_quant_for_layer
         (first HEAD_N=2 and last TAIL_N=8 layers are forced to K8V8 for every
-        base codec, `none` included)
+        base codec that quantizes a side; `none` is exempt)
     crates/rmlx-kv-quant/src/kvcache/update.rs:7982  next_pow2_seq
         (ring capacity = min(next_pow2(needed), --max-ctx ceiling))
 
@@ -332,9 +332,13 @@ def decode_read_bytes_per_layer(c: Codec, seq: int, head_dim: int,
 
 
 def kv_quant_for_layer(idx: int, n_layers: int, base: Codec) -> Codec:
-    """Mirror of `kv_quant_for_layer` (kv_cache/mod.rs:143). The first
-    HEAD_N and last TAIL_N layers are forced to K8V8 for EVERY base codec,
-    `none` included."""
+    """Mirror of `kv_quant_for_layer` (kv_cache/mod.rs). The first HEAD_N and
+    last TAIL_N layers are forced to K8V8 for every base codec that quantizes
+    at least one side. A base that keeps both sides at model dtype (16 bits —
+    `none`) is exempt: the promotion recovers quantization loss, and there is
+    none to recover."""
+    if base.k_bits >= 16 and base.v_bits >= 16:
+        return base
     is_tail = LAYER_ADAPTIVE_TAIL_N > 0 and idx >= n_layers - LAYER_ADAPTIVE_TAIL_N
     is_head = LAYER_ADAPTIVE_HEAD_N > 0 and idx < LAYER_ADAPTIVE_HEAD_N
     return parse_codec("k8v8") if (is_tail or is_head) else base

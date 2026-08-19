@@ -449,8 +449,11 @@ if [ -n "${failed_crates}" ]; then
     echo >&2
     echo "Reproduce one crate with:" >&2
     echo "  cargo test --no-fail-fast -p <crate> --tests -- --ignored --test-threads=1 <filter>" >&2
-    echo "There is no known-red baseline: this suite is green on main, so any" >&2
-    echo "failure above is a real one. See docs/TESTING.md." >&2
+    echo "This suite is NOT known to be green on main, and this runner tracks no" >&2
+    echo "known-red list. Before attributing a failure above to your change, re-run" >&2
+    echo "the same crate and filter on a clean checkout of your base commit and" >&2
+    echo "compare: that is the only thing that separates a regression you caused" >&2
+    echo "from one you inherited, and it is cheap. See docs/TESTING.md." >&2
     echo "A crate reported as 'ran uninstrumented' usually failed to BUILD: no test" >&2
     echo "binary means no Metal device and therefore no validation banner." >&2
     exit 1

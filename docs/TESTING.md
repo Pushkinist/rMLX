@@ -712,8 +712,22 @@ It is fail-closed in three ways:
 * **Exclusive GPU.** It refuses to start while another MLX process holds the
   Metal context (CLAUDE.md hard rule 8).
 
-There is no known-red baseline: the suite is green on `main`, so a failure is a
-real one and belongs to whoever is holding the tree.
+**The suite is not known to be green on `main`, and this runner tracks no
+known-red list.** It used to claim the opposite, in the failure banner and here.
+That claim is what turns an inherited failure into a waved-through one — either
+direction: a real regression read as "the known one", or hours spent on a red
+that predates the branch. A failure is attributable only after the same crate
+and filter are re-run on a clean checkout of the base commit and the two
+outputs are compared; that takes minutes and is the only evidence that
+separates the two cases. A list of currently-known failures is deliberately not
+kept here — it would rot into exactly the false assurance it replaced, and a
+comparison against the base commit is always current.
+
+Note that a failure of this runner is not only a failing test: the Metal
+shader-validation aggregate fails it too, on a crate whose tests all passed. An
+out-of-bounds device store is dropped rather than raised, so the tests can pass
+while the GPU reads or writes memory it does not own — which is precisely a
+result no test result can be read for.
 
 #### Where it runs: `make ci-perf`, not `make ci`
 

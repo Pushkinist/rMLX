@@ -15,6 +15,10 @@
 
 use rmlx_kv_quant::KvQuant;
 
+#[cfg(test)]
+#[path = "hashing_tests.rs"]
+mod hashing_tests;
+
 /// Prefix-match block size, in tokens (oMLX-parity).
 ///
 /// Prefix matching is block-aligned: only whole 256-token blocks are matched,
@@ -44,17 +48,42 @@ pub const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 ///   it for the same reason and one more: `--project` collapses every loaded
 ///   model onto one namespace, so the on-disk directory is not a per-model
 ///   partition either.
-/// - `layout_key` — the SSD tier's `(arch, n_layers, n_kv_heads, head_dim,
-///   kv_quant)` shape key, or `0` when the tier is OFF. It is a *shape*
-///   identity and carries no model identity, which is why `model_sig` is a
-///   separate term rather than something to fold into it.
+/// - `layout_key` — the SSD tier's attach-time shape key, or `0` when the tier
+///   is OFF. It is a *shape* identity and carries no model identity, which is
+///   why `model_sig` is a separate term rather than something to fold into it.
 /// - `kv_quant` — the codec the stored K/V is packed under.
+/// - `layer_quants` — the per-layer codec vector **that codec resolves to
+///   under the caller's current layer policy**, one entry per decoder layer.
+///
+/// The last term is why this takes a vector rather than the codec alone. Which
+/// codec each layer gets is a policy decision, not a property of the requested
+/// codec: the boundary-layer promotion rewrites some entries, and it can change
+/// between builds. `layout_key` folds a vector too, but it is fixed at attach
+/// from the *launch* codec, and a request may resolve a different one
+/// (auto-by-context, or a per-request override) — for those requests the
+/// attach-time vector describes a layout they are not running. The seed is
+/// where the request's own codec already enters, so it is where the request's
+/// own mixture belongs: fold it here and a policy change invalidates every
+/// stored block for every codec, not only for requests that happened to run the
+/// launch default.
 ///
 /// One function, in the crate below every caller, so no side can compute the
 /// seed on its own: a push seeded differently from the query is not a bug that
 /// surfaces as a wrong answer, it surfaces as a cache that silently never hits.
-pub fn cache_seed(layout_key: u64, kv_quant: KvQuant, model_sig: u64) -> u64 {
-    FNV_OFFSET ^ layout_key ^ kv_quant.cache_key_salt() ^ model_sig
+/// `rmlx-models` wraps it as `prompt_cache::request_cache_seed` to supply
+/// `layer_quants` from the single producer, because the policy lives up there.
+pub fn cache_seed(
+    layout_key: u64,
+    kv_quant: KvQuant,
+    layer_quants: &[KvQuant],
+    model_sig: u64,
+) -> u64 {
+    let mut h = FNV_OFFSET ^ layout_key ^ kv_quant.cache_key_salt() ^ model_sig;
+    for q in layer_quants {
+        h ^= q.cache_key_salt();
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
 }
 
 /// Chained FNV-1a-64 block digests over the full 256-token blocks of `ids`.

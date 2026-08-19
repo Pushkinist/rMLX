@@ -29,13 +29,55 @@ fn namespace_falls_back_to_model_id() {
 /// unit test #1: deterministic across calls for a fixed tuple.
 #[test]
 fn compute_layout_key_is_deterministic() {
-    let a = compute_layout_key("Qwen3ForCausalLM", 32, 4, 128, KvQuant::K8V8);
-    let b = compute_layout_key("Qwen3ForCausalLM", 32, 4, 128, KvQuant::K8V8);
+    let layers = vec![KvQuant::K8V8; 32];
+    let a = compute_layout_key("Qwen3ForCausalLM", &layers, 4, 128, KvQuant::K8V8);
+    let b = compute_layout_key("Qwen3ForCausalLM", &layers, 4, 128, KvQuant::K8V8);
     assert_eq!(a, b, "layout_key must be deterministic for a fixed tuple");
 }
 
+/// Two layouts that differ **only** in their per-layer codec mixture must not
+/// share a key.
+///
+/// The requested base codec is identical in both arms (`none`); what differs is
+/// the boundary-layer promotion policy that produced the mixture. Mixture B is
+/// what the promotion used to build under `none` — the first 2 and last 8
+/// layers on `K8V8`, the rest bf16 — and mixture A is what it builds now. A key
+/// that folded the base alone would return the same u64 for both, and a block
+/// spilled under B would be handed to a request running A: every layer would
+/// deserialize from its own storage tag, so nothing would error, and 10 layers
+/// of that request would quietly run the codec the operator asked to switch
+/// off.
+#[test]
+fn compute_layout_key_separates_two_mixtures_of_the_same_base() {
+    let n = 36usize;
+    let uniform_bf16 = vec![KvQuant::None; n];
+    let promoted_boundaries: Vec<KvQuant> = (0..n)
+        .map(|i| {
+            if i < 2 || i >= n - 8 {
+                KvQuant::K8V8
+            } else {
+                KvQuant::None
+            }
+        })
+        .collect();
+
+    let a = compute_layout_key("Qwen3ForCausalLM", &uniform_bf16, 8, 128, KvQuant::None);
+    let b = compute_layout_key(
+        "Qwen3ForCausalLM",
+        &promoted_boundaries,
+        8,
+        128,
+        KvQuant::None,
+    );
+    assert_ne!(
+        a, b,
+        "a per-layer mixture change must move the layout_key — \
+         otherwise a block written under the old mixture hydrates into a run of the new one"
+    );
+}
+
 /// unit test #1 (property): every distinct
-/// `(arch, n_layers, n_kv_heads, head_dim, kv_quant)` tuple yields a
+/// `(arch, layer_quants, n_kv_heads, head_dim, kv_quant)` tuple yields a
 /// distinct u64. Enumerate a 2×2×2×2×3 product and assert no collisions.
 #[test]
 fn compute_layout_key_is_distinct_across_tuples() {
@@ -51,7 +93,7 @@ fn compute_layout_key_is_distinct_across_tuples() {
             for &nk in &kv_heads {
                 for &hd in &head_dims {
                     for &q in &kv_quants {
-                        let k = compute_layout_key(arch, nl, nk, hd, q);
+                        let k = compute_layout_key(arch, &vec![q; nl], nk, hd, q);
                         assert!(
                             seen.insert(k),
                             "duplicate layout_key {k:016x} for ({arch}, {nl}, {nk}, {hd}, {q})"
@@ -539,4 +581,35 @@ fn install_config_double_call_returns_err() {
         Err(Error::SsdTierAlreadyInstalled) => {}
         other => panic!("expected Err(SsdTierAlreadyInstalled), got {other:?}"),
     }
+}
+
+// ── keyable_layout ────────────────────────────────────────────────
+
+/// Both refusals in the attach guard, and the accept between them.
+///
+/// The empty-vector arm is not decoration: `compute_layout_key` folds the
+/// per-layer vector, so keying a zero-length one would hash every layout of
+/// that shape to the same u64 and undo the separation the fold exists for. It
+/// is reachable whenever a caller resolves a codec but reports no layers
+/// (`n_layers == 0`), which is what a config-parse failure upstream looks like
+/// from here.
+#[test]
+fn keyable_layout_refuses_a_missing_codec_or_an_empty_layer_vector() {
+    let arch = "Qwen3ForCausalLM";
+    let model = "some-model";
+    assert_eq!(
+        keyable_layout(arch, model, None, &[KvQuant::K8V8]),
+        None,
+        "no resolved codec: nothing to record on the rows or check a header against"
+    );
+    assert_eq!(
+        keyable_layout(arch, model, Some(KvQuant::K8V8), &[]),
+        None,
+        "empty per-layer vector: a zero-length layout cannot be told apart from any other"
+    );
+    assert_eq!(
+        keyable_layout(arch, model, Some(KvQuant::K8V8), &[KvQuant::K8V8; 36]),
+        Some(KvQuant::K8V8),
+        "a resolved codec with a per-layer vector is keyable"
+    );
 }

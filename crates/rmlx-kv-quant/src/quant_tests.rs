@@ -471,3 +471,52 @@ fn iso_and_rotor_k_codecs_are_never_a_memory_win() {
         }
     }
 }
+
+/// A `mixed_*` spec whose widths the codec cannot store is a parse error.
+///
+/// `mixed_k16g64_v16g64` used to parse. Its `approx_code_bits()` is then
+/// `(16, 16)` — the value that means "this side is kept at model dtype" — so
+/// every check keyed on that property read it as a codec that quantizes
+/// nothing, while at runtime it still packed affine codes. The width set is
+/// MLX's affine `quantize` set; anything else is rejected with the valid
+/// widths named.
+#[test]
+fn mixed_rejects_widths_the_codec_cannot_store() {
+    for spec in [
+        "mixed_k16g64_v16g64",
+        "mixed_k8g64_v16g64",
+        "mixed_k16g64_v4g64",
+        "mixed_k0g64_v4g64",
+        "mixed_k8g64_v7g64",
+        "mixed_k8g100_v4g64",
+    ] {
+        let parsed = KvQuant::from_str(spec);
+        assert!(
+            parsed.is_err(),
+            "{spec} must not parse — it names a width the Mixed codec cannot store, got {parsed:?}"
+        );
+    }
+}
+
+/// Every `mixed_*` spec that DOES parse quantizes at least one side.
+///
+/// This is the invariant the boundary-layer quality floor keys on: a codec is
+/// exempt from the promotion only when it keeps both sides at model dtype, and
+/// no parametric spelling of `Mixed` may reach that state.
+#[test]
+fn every_parseable_mixed_quantizes_a_side() {
+    for bits in 0u8..=17 {
+        for group in [32u16, 64, 128] {
+            let spec = format!("mixed_k{bits}g{group}_v{bits}g{group}");
+            let Ok(q) = KvQuant::from_str(&spec) else {
+                continue;
+            };
+            let (k, v) = q.approx_code_bits();
+            assert!(
+                k < 16 || v < 16,
+                "{spec} parsed but reports model-dtype width on both sides ({k}, {v}) — \
+                 it would read as a codec that quantizes nothing"
+            );
+        }
+    }
+}

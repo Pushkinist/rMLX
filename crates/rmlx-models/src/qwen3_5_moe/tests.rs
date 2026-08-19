@@ -2079,21 +2079,14 @@ fn hydrated_tail_produces_identical_output() {
     // Run a manual prefill of `prompt_ids[..prefix_len]` using the same KV
     // stack as Path C in generate_greedy, so the snapshot is physically correct.
     let (prefix_kv_caches, prefix_lin_caches) = {
-        let mut kv_caches: Vec<rmlx_kv_quant::KvCache> = (0..n_layers)
-            .map(|i| {
-                use crate::kv_cache::{
-                    kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
-                };
-                let q = kv_quant_for_layer(
-                    i,
-                    n_layers,
-                    kv_quant,
-                    LAYER_ADAPTIVE_TAIL_N,
-                    LAYER_ADAPTIVE_HEAD_N,
-                );
-                rmlx_kv_quant::KvCache::with_quant_max_seq(q, max_seq).with_layer_idx(i)
-            })
-            .collect();
+        let mut kv_caches: Vec<rmlx_kv_quant::KvCache> =
+            crate::kv_cache::kv_layer_quants(n_layers, kv_quant)
+                .into_iter()
+                .enumerate()
+                .map(|(i, q)| {
+                    rmlx_kv_quant::KvCache::with_quant_max_seq(q, max_seq).with_layer_idx(i)
+                })
+                .collect();
         let mut lin_caches: Vec<rmlx_kv_quant::LinearAttnCache> = (0..n_layers)
             .map(|_| rmlx_kv_quant::LinearAttnCache::new())
             .collect();
@@ -2454,21 +2447,14 @@ fn hydrated_exact_block_no_tail_not_placeholder() {
 
     // ── Step 2: Build a real KV/lin snapshot for the full block-aligned prompt ──
     let (full_kv_caches, full_lin_caches) = {
-        let mut kv_caches: Vec<rmlx_kv_quant::KvCache> = (0..n_layers)
-            .map(|i| {
-                use crate::kv_cache::{
-                    kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
-                };
-                let q = kv_quant_for_layer(
-                    i,
-                    n_layers,
-                    kv_quant,
-                    LAYER_ADAPTIVE_TAIL_N,
-                    LAYER_ADAPTIVE_HEAD_N,
-                );
-                rmlx_kv_quant::KvCache::with_quant_max_seq(q, max_seq).with_layer_idx(i)
-            })
-            .collect();
+        let mut kv_caches: Vec<rmlx_kv_quant::KvCache> =
+            crate::kv_cache::kv_layer_quants(n_layers, kv_quant)
+                .into_iter()
+                .enumerate()
+                .map(|(i, q)| {
+                    rmlx_kv_quant::KvCache::with_quant_max_seq(q, max_seq).with_layer_idx(i)
+                })
+                .collect();
         let mut lin_caches: Vec<rmlx_kv_quant::LinearAttnCache> = (0..n_layers)
             .map(|_| rmlx_kv_quant::LinearAttnCache::new())
             .collect();
@@ -2725,21 +2711,14 @@ fn hydrated_tail_k8v8_equivalence() {
 
     // ── Step 2: Build real KV/lin snapshot for the block-aligned prefix at K8V8 ─
     let (prefix_kv_caches, prefix_lin_caches) = {
-        let mut kv_caches: Vec<rmlx_kv_quant::KvCache> = (0..n_layers)
-            .map(|i| {
-                use crate::kv_cache::{
-                    kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
-                };
-                let q = kv_quant_for_layer(
-                    i,
-                    n_layers,
-                    kv_quant,
-                    LAYER_ADAPTIVE_TAIL_N,
-                    LAYER_ADAPTIVE_HEAD_N,
-                );
-                rmlx_kv_quant::KvCache::with_quant_max_seq(q, max_seq).with_layer_idx(i)
-            })
-            .collect();
+        let mut kv_caches: Vec<rmlx_kv_quant::KvCache> =
+            crate::kv_cache::kv_layer_quants(n_layers, kv_quant)
+                .into_iter()
+                .enumerate()
+                .map(|(i, q)| {
+                    rmlx_kv_quant::KvCache::with_quant_max_seq(q, max_seq).with_layer_idx(i)
+                })
+                .collect();
         let mut lin_caches: Vec<rmlx_kv_quant::LinearAttnCache> = (0..n_layers)
             .map(|_| rmlx_kv_quant::LinearAttnCache::new())
             .collect();
@@ -3005,21 +2984,14 @@ fn qwen3_5_moe_consume_engine_migration_golden() {
         Vec<rmlx_kv_quant::KvCache>,
         Vec<rmlx_kv_quant::LinearAttnCache>,
     ) {
-        let mut kv_caches: Vec<rmlx_kv_quant::KvCache> = (0..n_layers)
-            .map(|i| {
-                use crate::kv_cache::{
-                    kv_quant_for_layer, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
-                };
-                let q = kv_quant_for_layer(
-                    i,
-                    n_layers,
-                    kv_quant,
-                    LAYER_ADAPTIVE_TAIL_N,
-                    LAYER_ADAPTIVE_HEAD_N,
-                );
-                rmlx_kv_quant::KvCache::with_quant_max_seq(q, max_seq).with_layer_idx(i)
-            })
-            .collect();
+        let mut kv_caches: Vec<rmlx_kv_quant::KvCache> =
+            crate::kv_cache::kv_layer_quants(n_layers, kv_quant)
+                .into_iter()
+                .enumerate()
+                .map(|(i, q)| {
+                    rmlx_kv_quant::KvCache::with_quant_max_seq(q, max_seq).with_layer_idx(i)
+                })
+                .collect();
         let mut lin_caches: Vec<rmlx_kv_quant::LinearAttnCache> = (0..n_layers)
             .map(|_| rmlx_kv_quant::LinearAttnCache::new())
             .collect();
@@ -3066,9 +3038,10 @@ fn qwen3_5_moe_consume_engine_migration_golden() {
             if let Some(cache) = guard.as_mut() {
                 let block_hashes = crate::prompt_cache::chained_block_hashes_seeded(
                     key_ids,
-                    crate::prompt_cache::cache_seed(
+                    crate::prompt_cache::request_cache_seed(
                         prompt_cache::active_layout_key(),
                         kv_quant,
+                        model.cfg.num_hidden_layers,
                         model.model_sig,
                     ),
                 );
