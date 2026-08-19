@@ -849,9 +849,11 @@ impl KvQuant {
     /// model this codec, model-agnostically.
     ///
     /// A codebook width, not a delivered density and not a quality claim.
-    /// `None` (bf16) reports 16/16 — for that codec the two coincide. K-only
-    /// codecs report a bf16 (16-bit) V; V-only codecs (PlanarK) report a bf16
-    /// (16-bit) K.
+    /// **A side kept at model dtype instead of quantized reports 16**, which is
+    /// the one property callers other than the byte estimator may key off:
+    /// `None` (bf16) reports 16/16 and is the only codec that quantizes
+    /// neither side, while the K-only families (`PlanarK`, `IsoKOnly*`,
+    /// `RotorKOnly*`) report a quantized K and a 16-bit V.
     ///
     /// **The iso and rotor families do not store at their codebook width.**
     /// Their stores spend one whole `u32` code word *and* one `f32` scale per

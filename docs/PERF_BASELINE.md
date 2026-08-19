@@ -282,12 +282,15 @@ throughput: `k_iso3/4` measures **1.003–1.006×** `none` and `k_rotor3/4`
 bandwidth prize to collect, so parity is the ceiling, not a milestone on the
 way past it.
 
-**`none` is not bf16 on Bonsai — read the ratios accordingly.**
-`kv_quant_for_layer` promotes the first 2 and last 8 layers to `K8V8` under
-every base mode, `KvQuant::None` included, so the `none` control on a 36-layer
-dense arch is a 26-bf16 / 10-K8V8 mixture. See `docs/KV_QUANT.md`
-§Layer-adaptive overrides for the mechanism and the measured per-arch ratios.
-The table below restates this one against true bf16. That denominator is
+**`none` was not bf16 on Bonsai when these rows were recorded — read the ratios
+accordingly.** `kv_quant_for_layer` then promoted the first 2 and last 8 layers
+to `K8V8` under every base mode, `KvQuant::None` included, so the `none`
+control on a 36-layer dense arch was a 26-bf16 / 10-K8V8 mixture. `None` is
+exempt from the promotion now, so a `none` row re-measured today is true bf16
+and needs no restatement; every row on this page predates that change. See
+`docs/KV_QUANT.md` §Layer-adaptive overrides for the mechanism and the
+measured per-arch factors. The table below restates this one against true
+bf16. That denominator is
 derived, not separately measured, but it is checkable: at
 `S = 31 553 + 128 − 1 = 31 680`
 (the fixture length above, `rmlx bench --max-tokens` default 128) the

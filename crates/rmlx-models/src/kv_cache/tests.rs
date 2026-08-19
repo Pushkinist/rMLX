@@ -881,18 +881,16 @@ mod tests {
         }
     }
 
-    /// `KvQuant::None` is **not** exempt from the boundary promotion.
+    /// `KvQuant::None` is exempt from the boundary promotion on every layer.
     ///
-    /// This is what makes `--kv-quant none` a bf16/K8V8 mixture rather than a
-    /// bf16 control on any architecture whose boundary layers hold a real
-    /// token-indexed cache — and every published "vs `none`" ratio is read
-    /// against that mixture. `K8V8` is the only base mode the override leaves
-    /// alone; adding a second exemption here would silently change what a
-    /// recorded control measured.
+    /// The promotion recovers quantization loss; an unquantized base has none,
+    /// so promoting it would allocate a packed q8_0 K+V store on top of the
+    /// bf16 buffers the layer already holds and could only lower its
+    /// precision. Pinned at Ternary-Bonsai-8B's shape (36 layers, all
+    /// full-attention), the arch where the promotion used to bite hardest —
+    /// +14.3% resident KV under `--kv-quant none` for zero numerical effect.
     #[test]
-    fn kv_quant_for_layer_promotes_none_base_at_boundaries() {
-        // 36 layers, every one full-attention: Ternary-Bonsai-8B's shape, the
-        // arch where the promotion is fully in effect.
+    fn kv_quant_for_layer_leaves_none_base_alone() {
         let n = 36;
         let base = KvQuant::None;
         let promoted: Vec<usize> = (0..n)
@@ -900,18 +898,140 @@ mod tests {
                 kv_quant_for_layer(i, n, base, LAYER_ADAPTIVE_TAIL_N, LAYER_ADAPTIVE_HEAD_N) != base
             })
             .collect();
-        assert_eq!(
-            promoted,
-            vec![0, 1, 28, 29, 30, 31, 32, 33, 34, 35],
-            "`none` must be promoted on the first 2 + last 8 layers, not passed through"
+        assert!(
+            promoted.is_empty(),
+            "`none` must be passed through on every layer, promoted on {promoted:?}"
         );
-        for &i in &promoted {
+    }
+
+    /// The exemption is keyed on "quantizes neither side", not on a codec name.
+    ///
+    /// Every quantizing base — including the K-only families, whose V side is
+    /// already bf16, and the equal-width-but-different-family parametric bases
+    /// (`mixed_k8g64_v8g64`, `rot_k_v8g64`) — must still be promoted at the
+    /// boundaries. Only a base whose `approx_code_bits` is model-dtype on both
+    /// sides is passed through.
+    #[test]
+    fn kv_quant_for_layer_promotes_every_quantizing_base() {
+        let quantizing: &[KvQuant] = &[
+            KvQuant::K8V4,
+            KvQuant::K8V8,
+            KvQuant::Planar,
+            KvQuant::Planar3,
+            KvQuant::PlanarK,
+            KvQuant::K8VTurbo3,
+            KvQuant::K8VTurbo3Tcq,
+            KvQuant::K8VTurbo2,
+            KvQuant::K8VTurbo2Tcq,
+            KvQuant::TurboSym3,
+            KvQuant::TurboSym4,
+            KvQuant::Iso3,
+            KvQuant::Iso4,
+            KvQuant::Iso3Sym,
+            KvQuant::Iso4Sym,
+            KvQuant::IsoKOnly3,
+            KvQuant::IsoKOnly4,
+            KvQuant::Rotor3,
+            KvQuant::Rotor4,
+            KvQuant::Rotor3Sym,
+            KvQuant::Rotor4Sym,
+            KvQuant::RotorKOnly3,
+            KvQuant::RotorKOnly4,
+            KvQuant::RotKTq4V,
+            KvQuant::Mixed {
+                k_bits: 8,
+                v_bits: 4,
+                k_group_size: 64,
+                v_group_size: 64,
+            },
+            KvQuant::Mixed {
+                k_bits: 8,
+                v_bits: 8,
+                k_group_size: 64,
+                v_group_size: 64,
+            },
+            KvQuant::RotK {
+                v_bits: 4,
+                v_group_size: 64,
+            },
+            KvQuant::RotK {
+                v_bits: 8,
+                v_group_size: 64,
+            },
+            KvQuant::RotorK3Asym {
+                v_bits: 4,
+                v_group_size: 64,
+            },
+            KvQuant::RotorK4Asym {
+                v_bits: 4,
+                v_group_size: 64,
+            },
+        ];
+        let n = 36;
+        for &base in quantizing {
+            for i in [0, 1, 28, 35] {
+                assert_eq!(
+                    kv_quant_for_layer(i, n, base, LAYER_ADAPTIVE_TAIL_N, LAYER_ADAPTIVE_HEAD_N),
+                    KvQuant::K8V8,
+                    "boundary layer {i} of quantizing base {base} must be promoted"
+                );
+            }
             assert_eq!(
-                kv_quant_for_layer(i, n, base, LAYER_ADAPTIVE_TAIL_N, LAYER_ADAPTIVE_HEAD_N),
-                KvQuant::K8V8,
-                "promoted layer {i} must land on K8V8"
+                kv_quant_for_layer(10, n, base, LAYER_ADAPTIVE_TAIL_N, LAYER_ADAPTIVE_HEAD_N),
+                base,
+                "middle layer of {base} must stay on the base codec"
             );
         }
+    }
+
+    /// The byte consequence of the exemption, measured on a real cache vector.
+    ///
+    /// A `--kv-quant none` layer stack must hold **only** its two bf16 mirrors
+    /// on every layer. A promoted boundary layer would add a packed q8_0 K+V
+    /// store on top of those same mirrors (decode reads the mirrors either
+    /// way), so the total is the sharp discriminator: the bf16 identity, or
+    /// the identity plus 10 stores.
+    #[test]
+    #[allow(
+        clippy::expect_used,
+        reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+    )]
+    fn none_layer_stack_resident_bytes_is_the_bf16_identity() {
+        let device = Device::Cpu;
+        // Ternary-Bonsai-8B's layer count at a small test shape.
+        let n_layers = 36_usize;
+        let (seq, kv_h, head_dim) = (256_u64, 4_u64, 128_u64);
+
+        let mut total: u64 = 0;
+        for i in 0..n_layers {
+            let q = kv_quant_for_layer(
+                i,
+                n_layers,
+                KvQuant::None,
+                LAYER_ADAPTIVE_TAIL_N,
+                LAYER_ADAPTIVE_HEAD_N,
+            );
+            let mut cache = KvCache::with_quant_max_seq(q, 4096);
+            cache.enter_prefill();
+            let shape = [1, kv_h as i32, seq as i32, head_dim as i32];
+            let k = make_lcg_array(&shape, 0x5EED + i as u64).0;
+            let v = make_lcg_array(&shape, 0xD00D + i as u64).0;
+            cache.update(&k, &v, device).expect("update must not fail");
+            cache
+                .exit_prefill(device)
+                .expect("exit_prefill must not fail");
+            total += cache.resident_bytes();
+        }
+
+        let bf16_identity =
+            u64::try_from(n_layers).expect("layer count fits u64") * 2 * seq * kv_h * head_dim * 2;
+        assert_eq!(
+            total,
+            bf16_identity,
+            "`none` must hold the bf16 identity and nothing else — \
+             an excess of {} B is a packed store on the boundary layers",
+            total.saturating_sub(bf16_identity)
+        );
     }
 
     #[test]
