@@ -390,6 +390,114 @@ fn deltas_no_change_returns_zero_delta() {
     );
 }
 
+/// Clone an existing observation with a new value and timestamp, bypassing the
+/// ingest validator — the rows these gates have to survive were written before
+/// any value gate existed and cannot be re-created through it.
+fn clone_row_with(conn: &Connection, metric: &str, value: f64, ts_utc: &str, git_sha: &str) {
+    conn.execute(
+        "INSERT INTO observations (
+             backend, model_namespace, model, weight_quant, kv_quant, ctx_max, prompt_id,
+             metric, value, unit, direction, run_id, ts_utc, git_sha, hardware_tag,
+             inserted_utc, inserted_by
+         )
+         SELECT backend, model_namespace, model, weight_quant, kv_quant, ctx_max, prompt_id,
+                metric, ?1, unit, direction, run_id, ?2, ?3, hardware_tag,
+                inserted_utc, inserted_by
+           FROM observations WHERE metric = ?4 LIMIT 1",
+        rusqlite::params![value, ts_utc, git_sha, metric],
+    )
+    .unwrap();
+}
+
+/// `deltas --exit-code` is a CI gate that ranks `observations` directly, in its
+/// own SQL. It must refuse the same rows `bests` refuses, or the gate reports a
+/// 998x "improvement" against a real baseline.
+#[test]
+fn deltas_do_not_rank_an_implausible_row() {
+    let mut conn = test_conn();
+    {
+        let mut rec = Recorder::new(&mut conn, "test@0.0.1");
+        rec.record_run(&make_run(
+            "rmlx",
+            "Qwen3.6-35B",
+            "prefill_tps",
+            494.7,
+            "2026-05-01T10:00:00Z",
+            Some("sha_base"),
+        ))
+        .unwrap();
+        rec.record_run(&make_run(
+            "rmlx",
+            "Qwen3.6-35B",
+            "prefill_tps",
+            497.0,
+            "2026-05-05T10:00:00Z",
+            Some("sha_after"),
+        ))
+        .unwrap();
+    }
+    // (prompt_tokens - 242) * 1000, landing after the baseline.
+    clone_row_with(
+        &conn,
+        "prefill_tps",
+        130_810_000.0,
+        "2026-05-06T10:00:00Z",
+        "sha_after",
+    );
+
+    let rows = deltas(&conn, "sha_base", Some(5.0)).unwrap();
+    let row = rows
+        .iter()
+        .find(|r| r.metric == "prefill_tps" && r.cell.model == "Qwen3.6-35B");
+    assert!(
+        row.is_none(),
+        "deltas ranked the implausible row: {:?}",
+        row.map(|r| r.current_value)
+    );
+}
+
+/// A mean is as corruptible as a ranking.
+#[test]
+fn timeseries_mean_excludes_an_implausible_row() {
+    let mut conn = test_conn();
+    {
+        let mut rec = Recorder::new(&mut conn, "test@0.0.1");
+        rec.record_run(&make_run(
+            "rmlx",
+            "Qwen3.6-35B",
+            "prefill_tps",
+            500.0,
+            "2026-05-01T10:00:00Z",
+            None,
+        ))
+        .unwrap();
+    }
+    clone_row_with(
+        &conn,
+        "prefill_tps",
+        130_810_000.0,
+        "2026-05-01T11:00:00Z",
+        "sha_x",
+    );
+
+    let cell = Cell {
+        backend: "rmlx".into(),
+        model_namespace: "mlx-community".into(),
+        model: "Qwen3.6-35B".into(),
+        weight_quant: "mxfp8".into(),
+        kv_quant: "k8v8".into(),
+        ctx_max: 8192,
+        prompt_id: 1,
+    };
+    let points = timeseries(&conn, &cell, "prefill_tps", None, Bucket::Day).unwrap();
+    assert_eq!(points.len(), 1, "expected one day bucket: {points:?}");
+    assert!(
+        (points[0].mean_value - 500.0).abs() < 1e-9,
+        "implausible row entered the mean: {}",
+        points[0].mean_value
+    );
+}
+
 // ── champions ─────────────────────────────────────────────────────────────
 
 /// Seed a minimal two-backend scenario for champion tests:

@@ -6,7 +6,7 @@
 
 use rusqlite::Connection;
 
-use crate::{error::Result, schema::MIGRATIONS, time_util::now_iso8601};
+use crate::{bests_view, error::Result, schema::MIGRATIONS, time_util::now_iso8601};
 
 /// Apply all pending migrations from [`MIGRATIONS`] to `conn`.
 ///
@@ -14,6 +14,10 @@ use crate::{error::Result, schema::MIGRATIONS, time_util::now_iso8601};
 /// every migration whose target version exceeds it, in order. Each migration
 /// executes inside its own transaction. After migration 001 is applied, the
 /// `schema_meta` seed rows are inserted (idempotent via `INSERT OR IGNORE`).
+///
+/// Finally, [`bests_view::ensure`] brings the `bests` view in line with the §4
+/// registry — see that module for why the view is generated rather than
+/// pinned to a migration.
 ///
 /// Returns the number of migrations applied (0 when already up to date).
 pub fn run_pending(conn: &mut Connection) -> Result<u32> {
@@ -40,6 +44,11 @@ pub fn run_pending(conn: &mut Connection) -> Result<u32> {
 
         applied += 1;
     }
+
+    // The `bests` view is generated from the §4 registry, not pinned to a
+    // migration number: a bounds change has to reach existing DBs too, and a
+    // view carries no data to migrate. Cheap no-op when already current.
+    bests_view::ensure(conn)?;
 
     Ok(applied)
 }

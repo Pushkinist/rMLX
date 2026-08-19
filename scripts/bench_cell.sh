@@ -378,7 +378,7 @@ import json, os, sys
 with open(os.environ["PROMPT_FILE"], "r") as f:
     body = json.load(f)
 rec = {
-    **json.loads(os.environ['RMLX_IDENTITY_JSON']),
+    **json.loads(os.environ["RMLX_IDENTITY_JSON"]),
   # "unknown" is a fallback, never provenance — a checkout without .git
   # must not stamp git_sha at all.
   **({"git_sha": os.environ["GIT_SHA_VAL"]} if not os.environ["GIT_SHA_VAL"].startswith("unknown") else {}),
@@ -396,8 +396,11 @@ rec = {
   "n_measure": int(os.environ["N_MEAS_VAL"]),
   "notes": os.environ["NOTES_VAL"],
   "description": os.environ["DESC_VAL"],
+  # A run that failed its throughput threshold measured no throughput. `null`
+  # records the attempt (notes carry status=runtime_fail and the observed tps)
+  # without filing a fabricated 0.0 that would rank as a measurement.
   "metrics": [
-    {"name": "decode_tps_warm", "value": 0.0, "stddev": 0.0},
+    {"name": "decode_tps_warm", "value": None, "stddev": None},
   ],
 }
 json.dump(rec, sys.stdout, indent=2)
@@ -440,10 +443,16 @@ json.dump(rec, sys.stdout, indent=2)
   GIT_SHA_VAL="$GIT_SHA" \
   python3 -c '
 import json, os, sys
+
+def _num(raw):
+    """An empty scrape is a missing measurement, not a zero."""
+    raw = (raw or "").strip()
+    return float(raw) if raw else None
+
 with open(os.environ["PROMPT_FILE"], "r") as f:
     body = json.load(f)
 rec = {
-    **json.loads(os.environ['RMLX_IDENTITY_JSON']),
+    **json.loads(os.environ["RMLX_IDENTITY_JSON"]),
   # "unknown" is a fallback, never provenance — a checkout without .git
   # must not stamp git_sha at all.
   **({"git_sha": os.environ["GIT_SHA_VAL"]} if not os.environ["GIT_SHA_VAL"].startswith("unknown") else {}),
@@ -461,12 +470,15 @@ rec = {
   "n_measure": int(os.environ["N_MEAS_VAL"]),
   "notes": os.environ["NOTES_VAL"],
   "description": os.environ["DESC_VAL"],
+  # `or 0` coerced a scrape that came back empty into a measurement of zero.
+  # A missed RSS scrape is not a 0 MB process, and a zero rate is not a rate:
+  # send null and let the recorder write no row for that metric.
   "metrics": [
-    {"name": "decode_tps_warm", "value": float(os.environ["TPS_VAL"]),
-     "stddev": float(os.environ["STDDEV_VAL"])},
-    {"name": "ttft_warm_ms",    "value": float(os.environ["TTFT_VAL"] or 0)},
-    {"name": "model_load_ms",   "value": float(os.environ["LOAD_VAL"] or 0)},
-    {"name": "peak_rss_mb",     "value": float(os.environ["RSS_VAL"] or 0)},
+    {"name": "decode_tps_warm", "value": _num(os.environ["TPS_VAL"]),
+     "stddev": _num(os.environ["STDDEV_VAL"])},
+    {"name": "ttft_warm_ms",    "value": _num(os.environ["TTFT_VAL"])},
+    {"name": "model_load_ms",   "value": _num(os.environ["LOAD_VAL"])},
+    {"name": "peak_rss_mb",     "value": _num(os.environ["RSS_VAL"])},
   ],
 }
 json.dump(rec, sys.stdout, indent=2)

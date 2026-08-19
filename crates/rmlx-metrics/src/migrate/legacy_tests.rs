@@ -127,7 +127,15 @@ fn migrate_one_jsonl_row_inserts_two_metrics() {
     let prompt = load_prompt_file(&prompt_dir.path().join("longctx_4k.json")).unwrap();
     let mut conn = test_conn();
 
-    let inserted = ingest_jsonl_row(&mut conn, &jsonl_row_str(), false, &prompt, &opts).unwrap();
+    let inserted = ingest_jsonl_row(
+        &mut conn,
+        &jsonl_row_str(),
+        false,
+        &prompt,
+        &opts,
+        &mut MigrateReport::default(),
+    )
+    .unwrap();
     assert!(inserted, "first insert must succeed");
 
     let count: i64 = conn
@@ -144,10 +152,26 @@ fn migrate_jsonl_idempotent() {
     let mut conn = test_conn();
     let line = jsonl_row_str();
 
-    let first = ingest_jsonl_row(&mut conn, &line, false, &prompt, &opts).unwrap();
+    let first = ingest_jsonl_row(
+        &mut conn,
+        &line,
+        false,
+        &prompt,
+        &opts,
+        &mut MigrateReport::default(),
+    )
+    .unwrap();
     assert!(first);
 
-    let second = ingest_jsonl_row(&mut conn, &line, false, &prompt, &opts).unwrap();
+    let second = ingest_jsonl_row(
+        &mut conn,
+        &line,
+        false,
+        &prompt,
+        &opts,
+        &mut MigrateReport::default(),
+    )
+    .unwrap();
     assert!(!second, "second insert must be skipped");
 
     let count: i64 = conn
@@ -184,13 +208,99 @@ fn migrate_one_csv_row_inserts_multiple_metrics() {
     migrate_cbb_csv(&mut conn, tmp.path(), &prompt, &opts, &mut report).unwrap();
 
     assert_eq!(report.cbb_csv_rows_inserted, 1);
-    // Expect: decode_tps_warm, overall_tps, ttft_warm_ms, itl_p50_ms, itl_p95_ms, peak_rss_mb = 6
-    // (task_pass_at_1=0.0 filtered out, peak_rss_mb=0.0 also filtered for zero)
-    // Actually peak_rss_mb = 0.0 is not filtered by default — check exact count.
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM observations", [], |r| r.get(0))
+
+    // The row carries 7 parseable metric columns. Two of them are CBB's
+    // "not measured" placeholders and neither may become an observation:
+    // `task_pass_at_1=0.0` (dropped at the parse site — the value alone is a
+    // valid score, only the column convention says otherwise) and
+    // `peak_rss_mb=0.0` (dropped by the §4.1 bounds — a live process has RSS).
+    // Exact counts, not `>=`: a `>=` here passes whether 0 or 3 entries were
+    // dropped, which is the whole thing under test.
+    let names: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT metric FROM observations ORDER BY metric")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap()
+    };
+    assert_eq!(
+        names,
+        vec![
+            "decode_tps_warm",
+            "itl_p50_ms",
+            "itl_p95_ms",
+            "overall_tps",
+            "ttft_warm_ms"
+        ],
+        "unexpected metric set ingested from the CBB CSV row"
+    );
+    assert_eq!(
+        report.metrics_dropped_implausible, 1,
+        "only peak_rss_mb is a bounds drop; task_pass_at_1 never reaches the record"
+    );
+}
+
+/// CBB writes `0.0` in `task_pass_at_1` when it ran no quality probe. The §4.1
+/// bounds cannot catch it — `0.0` pass@1 is a legitimate score for a model that
+/// failed every task — so the parse site must, or the placeholder wins every
+/// all-zero partition in `bests` exactly like the rate zeros do.
+#[test]
+fn csv_zero_task_pass_is_never_ingested() {
+    let prompt_dir = make_prompt_dir();
+    let opts = default_opts_with_prompt_dir(prompt_dir.path());
+    let mut conn = test_conn();
+
+    let tmp = NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), minimal_csv()).unwrap();
+
+    let prompt = load_prompt_file(&prompt_dir.path().join("longctx_4k.json")).unwrap();
+    let mut report = MigrateReport::default();
+    migrate_cbb_csv(&mut conn, tmp.path(), &prompt, &opts, &mut report).unwrap();
+
+    let zero_scores: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM observations WHERE metric = 'task_pass_at_1'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
-    assert!(count >= 4, "expected ≥4 metric rows, got {count}");
+    assert_eq!(
+        zero_scores, 0,
+        "CBB's unmeasured-probe placeholder was ingested as a pass@1 score"
+    );
+}
+
+/// A graded run that genuinely scored zero is a different thing from an
+/// unmeasured one only in the exporter's convention — but a *non-zero* score
+/// must still ingest. Guards the parse-site filter against over-reach.
+#[test]
+fn csv_nonzero_task_pass_still_ingests() {
+    let prompt_dir = make_prompt_dir();
+    let opts = default_opts_with_prompt_dir(prompt_dir.path());
+    let mut conn = test_conn();
+
+    let tmp = NamedTempFile::new().unwrap();
+    // Same row, with a graded (non-zero) score in the task_pass_at_1 column.
+    let graded = minimal_csv().replace("0.0,37.0,0.0,0.0,True", "0.0,37.0,0.0,0.75,True");
+    std::fs::write(tmp.path(), graded).unwrap();
+
+    let prompt = load_prompt_file(&prompt_dir.path().join("longctx_4k.json")).unwrap();
+    let mut report = MigrateReport::default();
+    migrate_cbb_csv(&mut conn, tmp.path(), &prompt, &opts, &mut report).unwrap();
+
+    let score: f64 = conn
+        .query_row(
+            "SELECT value FROM observations WHERE metric = 'task_pass_at_1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        (score - 0.75).abs() < 1e-9,
+        "graded score {score} was dropped"
+    );
 }
 
 #[test]
@@ -236,7 +346,14 @@ fn migrate_unknown_namespace_logs_and_skips_row() {
     })
     .to_string();
 
-    let result = ingest_jsonl_row(&mut conn, &line, false, &prompt, &opts);
+    let result = ingest_jsonl_row(
+        &mut conn,
+        &line,
+        false,
+        &prompt,
+        &opts,
+        &mut MigrateReport::default(),
+    );
     assert!(result.is_err(), "unknown namespace must return Err");
 
     let count: i64 = conn

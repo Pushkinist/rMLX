@@ -488,3 +488,135 @@ fn record_with_model_id_alias_ingests() {
     assert_eq!(r.model, "Ternary-Bonsai-8B-mlx-2bit");
     r.validate().unwrap();
 }
+
+// ── §4 value plausibility ─────────────────────────────────────────────────
+
+#[test]
+fn zero_rate_rejected() {
+    // A run that generated no tokens has no rate to report — the recorder
+    // skips a `null` entry, so an emitter has no reason to send `0.0`.
+    let mut r = valid_record();
+    r.metrics[0].value = Some(0.0);
+    let err = r.validate().unwrap_err();
+    assert!(
+        matches!(err, Error::ImplausibleValue { ref metric, value, .. }
+                 if metric == "decode_tps_warm" && value == 0.0),
+        "expected ImplausibleValue, got {err}"
+    );
+}
+
+#[test]
+fn out_of_range_rate_rejected() {
+    // `(prompt_tokens - 242) * 1000` for a 131k-token prompt: the closed-form
+    // non-rate that this gate exists to stop at the door.
+    let mut r = valid_record();
+    r.metrics[0].name = "prefill_tps".to_string();
+    r.metrics[0].value = Some(130_810_000.0);
+    let err = r.validate().unwrap_err();
+    assert!(
+        matches!(err, Error::ImplausibleValue { ref metric, .. } if metric == "prefill_tps"),
+        "expected ImplausibleValue, got {err}"
+    );
+}
+
+#[test]
+fn non_finite_value_rejected() {
+    let mut r = valid_record();
+    r.metrics[0].value = Some(f64::NAN);
+    assert!(matches!(
+        r.validate().unwrap_err(),
+        Error::ImplausibleValue { .. }
+    ));
+    r.metrics[0].value = Some(f64::INFINITY);
+    assert!(matches!(
+        r.validate().unwrap_err(),
+        Error::ImplausibleValue { .. }
+    ));
+}
+
+#[test]
+fn zero_counter_accepted() {
+    // The floor is per metric: zero cache hits is a measurement, and
+    // rejecting it would drop a valid record.
+    let mut r = valid_record();
+    r.metrics[0].name = "prompt_cache_hits".to_string();
+    r.metrics[0].value = Some(0.0);
+    r.validate().unwrap();
+}
+
+#[test]
+fn zero_duration_accepted() {
+    // Millisecond resolution rounds a sub-millisecond span to zero; that is
+    // a coarse measurement, not a missing one.
+    let mut r = valid_record();
+    r.metrics[0].name = "ttft_warm_ms".to_string();
+    r.metrics[0].value = Some(0.0);
+    r.validate().unwrap();
+}
+
+#[test]
+fn null_value_is_the_way_to_say_not_measured() {
+    let mut r = valid_record();
+    r.metrics.push(MetricEntry {
+        name: "prefill_tps".to_string(),
+        value: None,
+        stddev: None,
+    });
+    r.validate().unwrap();
+}
+
+// ── archive-only placeholder drop ─────────────────────────────────────────
+
+#[test]
+fn drop_implausible_metrics_removes_only_the_placeholders() {
+    let mut r = valid_record();
+    r.metrics = vec![
+        MetricEntry {
+            name: "decode_tps_warm".to_string(),
+            value: Some(0.0), // a rate of zero: not a measurement
+            stddev: None,
+        },
+        MetricEntry {
+            name: "prefill_tps".to_string(),
+            value: Some(130_810_000.0), // out of range
+            stddev: None,
+        },
+        MetricEntry {
+            name: "peak_rss_mb".to_string(),
+            value: Some(35_392.0), // real
+            stddev: None,
+        },
+        MetricEntry {
+            name: "prompt_cache_hits".to_string(),
+            value: Some(0.0), // a counter's zero IS a measurement
+            stddev: None,
+        },
+        MetricEntry {
+            name: "ttft_warm_ms".to_string(),
+            value: None, // already "not measured"
+            stddev: None,
+        },
+    ];
+
+    assert_eq!(r.drop_implausible_metrics(), 2);
+    let kept: Vec<&str> = r.metrics.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(
+        kept,
+        vec!["peak_rss_mb", "prompt_cache_hits", "ttft_warm_ms"],
+        "wrong entries survived the archive drop"
+    );
+    // What survives must then pass the gate.
+    r.validate().unwrap();
+}
+
+#[test]
+fn drop_implausible_metrics_leaves_an_unregistered_name_for_validate() {
+    let mut r = valid_record();
+    r.metrics[0].name = "not_a_metric".to_string();
+    assert_eq!(
+        r.drop_implausible_metrics(),
+        0,
+        "an unknown name is validate's to reject, not this function's to hide"
+    );
+    assert!(matches!(r.validate().unwrap_err(), Error::UnknownMetric(_)));
+}

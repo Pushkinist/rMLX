@@ -633,10 +633,16 @@ def prefill_flops_per_token(spec: ModelSpec, ctx: int) -> float:
 def prefill_anchor(db: Path, model_basename: str) -> dict | None:
     """Median measured prefill_tps for this model from runs.db, read-only.
 
-    Filters: backend=rmlx, value in (0, 1e5) -- the DB carries legacy rows
-    whose `prefill_tps` value is ~prompt_tokens*1000 and is plainly not a rate
-    (notes: 'ingested from legacy N74 buffer (schema pre-8.5)') -- and
-    ts_utc >= PREFILL_ANCHOR_MIN_TS. Picks the cell with the most rows.
+    Reads `observations`, not `bests`: the anchor is the MEDIAN of a cell's
+    measurements, and the view carries one champion row per cell, which would
+    make the roofline anchor on a best-ever value instead of a typical one.
+    That means this query has to carry the plausibility bound itself, so it is
+    kept identical to METRICS_DB.md §4.1 for `prefill_tps` -- `Bounds::positive(1e5)`,
+    i.e. `value > 0 AND value <= 1e5`. Do not "tighten" it here; change §4.1 and
+    the registry, then mirror it.
+
+    Also filters backend=rmlx and ts_utc >= PREFILL_ANCHOR_MIN_TS. Picks the
+    cell with the most rows.
     """
     if not db.exists():
         return None
@@ -648,7 +654,7 @@ def prefill_anchor(db: Path, model_basename: str) -> dict | None:
         rows = con.execute(
             "SELECT prompt_tokens, value, hardware_tag FROM observations "
             "WHERE metric='prefill_tps' AND backend='rmlx' AND model=? "
-            "AND value>0 AND value<1e5 AND ts_utc>=?",
+            "AND value>0 AND value<=1e5 AND ts_utc>=?",  # §4.1 Bounds::positive(1e5)
             (model_basename, PREFILL_ANCHOR_MIN_TS),
         ).fetchall()
     except sqlite3.Error:

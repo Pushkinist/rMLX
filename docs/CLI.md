@@ -932,7 +932,17 @@ Create the schema and seed `schema_meta`. Refuses if the file already exists.
 
 #### `metrics doctor`
 
-Verify schema version, integrity, FKs, whitelists, units, and directions.
+Verify schema version, integrity, FKs, whitelists, units, directions, and
+value plausibility (every `value` inside its `METRICS_DB.md` §4.1 bounds).
+`--fix` does not touch an implausible value: it is not recoverable from the
+row, only re-measurable. It does rebuild the `bests` view when that view was
+generated from an older metric registry — reported as a warning otherwise,
+since the rebuild changes what the champion table publishes.
+
+Read commands (`query`, `best`, `rank`, `history`, `timeseries`, `champions`,
+`export`, `prompts list|get`) never migrate or rebuild anything: they refuse a
+DB that does not exist, and refuse one whose `bests` view is stale, naming
+`doctor --fix` as the repair.
 
 | Flag | Default | Description |
 |---|---|---|

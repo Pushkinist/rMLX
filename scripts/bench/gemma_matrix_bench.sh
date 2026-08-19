@@ -266,12 +266,14 @@ bench_cell() {
 
     # Prefill TPS from cold TTFT: prefill_tps = prompt_tokens / (cold_ttft_ms / 1000)
     local prefill_tps
+    # Empty, never 0.0, when there is no TTFT to divide by: an unmeasured rate
+    # is recorded as null, and null writes no row.
     prefill_tps="$(python3 -c "
 pt = ${PROMPT_TOKENS}
 ttft_s = ${cold_ttft_ms} / 1000.0
-print(f'{pt/ttft_s:.1f}' if ttft_s > 0 else '0.0')
-" 2>/dev/null || echo "0.0")"
-    log "  Prefill TPS (from cold TTFT): ${prefill_tps}"
+print(f'{pt/ttft_s:.1f}' if ttft_s > 0 and pt > 0 else '')
+" 2>/dev/null || echo "")"
+    log "  Prefill TPS (from cold TTFT): ${prefill_tps:-n/a}"
 
     # Decode warmup
     log "  Decode warmup..."
@@ -297,23 +299,16 @@ print(f'{pt/ttft_s:.1f}' if ttft_s > 0 else '0.0')
         # Decode TPS: total_elapsed - cold_ttft (prefill) = decode time
         local decode_tps
         decode_tps="$(python3 -c "
-elapsed_ms = ${r_elapsed}
+elapsed_s = ${r_elapsed} / 1000.0
 n_comp = ${r_completion}
-cold_ttft_ms = ${cold_ttft_ms}
-elapsed_s = elapsed_ms / 1000.0
-# For decode measure runs, prompt cache is warm (hit), so minimal prefill overhead.
-# Use warm ttft (cache hit time) as the prefill subtraction.
-warm_ttft_ms = ${ttft_ms}
-prefill_s = warm_ttft_ms / 1000.0
-decode_s = max(elapsed_s - prefill_s, 0.001)
-if n_comp > 0 and decode_s > 0:
-    tps = n_comp / decode_s
-else:
-    tps = 0.0
-print(f'{tps:.2f}')
-" 2>/dev/null || echo "0.00")"
+# For decode measure runs the prompt cache is warm (hit), so the warm TTFT is
+# the prefill share to subtract. No floor on the denominator: clamping it to
+# 0.001s is what turned an unmeasurable window into a fabricated rate.
+decode_s = elapsed_s - ${ttft_ms} / 1000.0
+print(f'{n_comp / decode_s:.2f}' if n_comp > 0 and decode_s > 0 else '')
+" 2>/dev/null || echo "")"
         decode_tps_vals+=("${decode_tps}")
-        log "    decode_tps=${decode_tps} (elapsed=${r_elapsed}ms comp=${r_completion} ttft_sub=${ttft_ms}ms)"
+        log "    decode_tps=${decode_tps:-n/a} (elapsed=${r_elapsed}ms comp=${r_completion} ttft_sub=${ttft_ms}ms)"
     done
 
     local decode_mean decode_stddev
@@ -323,12 +318,12 @@ dvals = [float(x) for x in '${decode_tps_vals[*]}'.split()]
 if dvals:
     dmean = sum(dvals)/len(dvals)
     dstd = math.sqrt(sum((v-dmean)**2 for v in dvals)/(len(dvals)-1)) if len(dvals)>1 else 0.0
+    print(f'{dmean:.2f} {dstd:.2f}')
 else:
-    dmean, dstd = 0.0, 0.0
-print(f'{dmean:.2f} {dstd:.2f}')
-" 2>/dev/null || echo "0.00 0.00")"
+    print('  ')
+" 2>/dev/null || echo "  ")"
 
-    log "  Cell ${idx} result: decode=${decode_mean}±${decode_stddev} prefill=${prefill_tps} ttft_cold=${cold_ttft_ms}ms ttft_warm=${ttft_ms}ms"
+    log "  Cell ${idx} result: decode=${decode_mean:-n/a}±${decode_stddev:-n/a} prefill=${prefill_tps:-n/a} ttft_cold=${cold_ttft_ms}ms ttft_warm=${ttft_ms}ms"
 
     write_cell_json "${idx}" "${MODEL_ID}" "${kv_quant}" "${ctx_label}" "${max_ctx}" \
         "${decode_mean}" "${decode_stddev}" "${prefill_tps}" "${cold_ttft_ms}" "ok" "ttft_warm=${ttft_ms}"
@@ -343,6 +338,12 @@ print(f'{dmean:.2f} {dstd:.2f}')
 
     python3 -c "
 import json, os
+
+def num(s):
+    # An unmeasured rate is null in the record; the recorder writes no row for
+    # it. A 0.0 would be stored and ranked as a measurement.
+    s = s.strip()
+    return float(s) if s else None
 with open('${prompt_file}') as f:
     pf = json.load(f)
 prompt_body = pf.get('messages', pf.get('body', str(pf)))
@@ -369,9 +370,9 @@ rec = {
     'notes':           'gemma-matrix-bench',
     'description':     None,
     'metrics': [
-        {'name': 'decode_tps_warm', 'value': float('${decode_mean}'),  'stddev': float('${decode_stddev}')},
-        {'name': 'prefill_tps',     'value': float('${prefill_tps}'),  'stddev': None},
-        {'name': 'ttft_warm_ms',    'value': float('${ttft_ms}'),      'stddev': None},
+        {'name': 'decode_tps_warm', 'value': num('${decode_mean}'),  'stddev': num('${decode_stddev}')},
+        {'name': 'prefill_tps',     'value': num('${prefill_tps}'),  'stddev': None},
+        {'name': 'ttft_warm_ms',    'value': num('${ttft_ms}'),      'stddev': None},
     ],
 }
 with open('${record_path}', 'w') as f:
@@ -391,6 +392,12 @@ print(f'buffer: ${record_path}')
 
     python3 -c "
 import json, os
+
+def num(s):
+    # An unmeasured rate is null in the record; the recorder writes no row for
+    # it. A 0.0 would be stored and ranked as a measurement.
+    s = s.strip()
+    return float(s) if s else None
 rec = {
     **json.loads(os.environ['RMLX_IDENTITY_JSON']),
     'run_id': '${run_id}',
@@ -399,10 +406,10 @@ rec = {
     'kv_quant': '${kv_quant}',
     'max_ctx': int('${max_ctx}'),
     'ctx_label': '${ctx_label}',
-    'decode_tps_mean': float('${decode_mean}'),
-    'decode_tps_stddev': float('${decode_stddev}'),
-    'prefill_tps': float('${prefill_tps}'),
-    'ttft_ms': float('${ttft_ms}'),
+    'decode_tps_mean': num('${decode_mean}'),
+    'decode_tps_stddev': num('${decode_stddev}'),
+    'prefill_tps': num('${prefill_tps}'),
+    'ttft_ms': num('${ttft_ms}'),
     ${GIT_SHA_KV}
     'notes': 'gemma-matrix-bench',
 }

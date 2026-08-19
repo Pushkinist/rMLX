@@ -292,9 +292,23 @@ bench_cell() {
         "TIMEOUT" "TIMEOUT" "TIMEOUT" "TIMEOUT" "TIMEOUT" "cell_timeout"; return 0; }
     local ttft_result
     ttft_result="$(completion_request "${TTFT_TOKENS}" "${PROMPT_FILE}" "${MODEL_ID}")" || ttft_result="elapsed_ms=0 completion_tokens=0 prompt_tokens=0 total_tokens=0"
-    local ttft_ms
+    local ttft_ms ttft_prompt_tokens
     ttft_ms="$(echo "${ttft_result}" | grep -oE 'elapsed_ms=[0-9]+' | cut -d= -f2 || echo 0)"
+    ttft_prompt_tokens="$(echo "${ttft_result}" | grep -oE 'prompt_tokens=[0-9]+' | cut -d= -f2 || echo 0)"
     log "  TTFT warm: ${ttft_ms}ms"
+
+    # Prefill rate = prompt tokens / time to the first token, measured by the
+    # max_tokens=1 request above. That request IS the prefill measurement;
+    # there is no way to separate prefill from decode inside a multi-token
+    # request that only reports total elapsed time. Empty when the probe
+    # returned nothing to divide by — an unmeasured rate is recorded as null,
+    # never as a number.
+    local prefill_tps
+    prefill_tps="$(python3 -c "
+ttft_s = ${ttft_ms} / 1000.0
+n_prom = ${ttft_prompt_tokens}
+print(f'{n_prom / ttft_s:.1f}' if ttft_s > 0 and n_prom > 0 else '')
+" 2>/dev/null || echo "")"
 
     # Decode warmup
     log "  Decode warmup..."
@@ -304,7 +318,6 @@ bench_cell() {
 
     # Decode measure runs
     declare -a decode_tps_vals=()
-    declare -a prefill_tps_vals=()
     local run_i
     for run_i in $(seq 1 "${MEASURE_RUNS}"); do
         check_timeout || { write_cell_json "${idx}" "${MODEL_ID}" "${kv_quant}" "${max_ctx}" "${ctx_label}" \
@@ -318,66 +331,40 @@ bench_cell() {
         r_completion="$(echo "${res}" | grep -oE 'completion_tokens=[0-9]+' | cut -d= -f2 || echo 0)"
         r_prompt="$(echo "${res}" | grep -oE 'prompt_tokens=[0-9]+' | cut -d= -f2 || echo 0)"
 
-        # decode TPS = completion_tokens / (elapsed_s - prefill_s)
-        # prefill TPS = prompt_tokens / prefill_s
-        # derive prefill_s by assuming decode rate ~ decode_tps from prior runs,
-        # but for first run estimate prefill_s = elapsed_s - completion_tokens/estimate_decode_tps
-        # Simpler approach: total_s = elapsed_s/1000; decode_s = completion_tokens/decode_tps
-        # We use: prefill_s = elapsed_s - decode_s
-        # decode_tps approximation (iterate): first pass assume decode dominates short responses
-        local tps_raw
-        tps_raw="$(python3 -c "
-elapsed_ms = ${r_elapsed}
+        # Decode rate excludes prefill by subtracting the separately measured
+        # TTFT from the wall clock. The earlier form derived `prefill_s` from
+        # `elapsed_s - n_comp/(n_comp/elapsed_s)`, which is identically zero,
+        # so it always hit the 0.001s floor and reported n_prom*1000 as a rate.
+        local r_decode
+        r_decode="$(python3 -c "
+elapsed_s = ${r_elapsed} / 1000.0
+ttft_s = ${ttft_ms} / 1000.0
 n_comp = ${r_completion}
-n_prom = ${r_prompt}
-# Simple TPS: completion_tokens / elapsed_s (overestimates decode TPS slightly since includes prefill)
-# For 30-token responses vs large prompt, prefill is significant.
-# We compute decode_tps = n_comp / (elapsed_s) as proxy (conservative), and
-# prefill_tps = n_prom / (elapsed_s - n_comp/decode_tps) iteratively.
-elapsed_s = elapsed_ms / 1000.0
-if n_comp > 0 and elapsed_s > 0:
-    # Estimate decode_tps assuming fast decode
-    # Use 2-step: rough decode_tps from total, then refine prefill
-    rough_decode = n_comp / elapsed_s  # over-estimate (includes prefill in denominator)
-    # Use rough decode to estimate prefill time
-    decode_s = n_comp / rough_decode if rough_decode > 0 else 0
-    prefill_s = max(elapsed_s - decode_s, 0.001)
-    prefill_tps = n_prom / prefill_s if prefill_s > 0 else 0
-    # refined decode_tps
-    actual_decode_s = elapsed_s - prefill_s
-    decode_tps = n_comp / actual_decode_s if actual_decode_s > 0.001 else n_comp / elapsed_s
-else:
-    decode_tps = 0.0
-    prefill_tps = 0.0
-print(f'{decode_tps:.2f} {prefill_tps:.1f}')
-" 2>/dev/null || echo "0.00 0.0")"
-        local r_decode r_prefill
-        r_decode="$(echo "${tps_raw}" | awk '{print $1}')"
-        r_prefill="$(echo "${tps_raw}" | awk '{print $2}')"
+decode_s = elapsed_s - ttft_s
+print(f'{(n_comp - 1) / decode_s:.2f}' if n_comp >= 2 and decode_s > 0 else '')
+" 2>/dev/null || echo "")"
         decode_tps_vals+=("${r_decode}")
-        prefill_tps_vals+=("${r_prefill}")
-        log "    decode_tps=${r_decode} prefill_tps=${r_prefill} (elapsed=${r_elapsed}ms comp=${r_completion} prompt=${r_prompt})"
+        log "    decode_tps=${r_decode:-n/a} (elapsed=${r_elapsed}ms comp=${r_completion} prompt=${r_prompt})"
     done
 
-    # Compute mean/stddev
-    local decode_mean decode_stddev prefill_mean
-    read -r decode_mean decode_stddev prefill_mean <<< "$(python3 -c "
+    # Compute mean/stddev over the runs that produced a rate. Runs that did
+    # not are absent, not zero — averaging a zero in would drag the mean.
+    local decode_mean decode_stddev
+    read -r decode_mean decode_stddev <<< "$(python3 -c "
 import math
 dvals = [float(x) for x in '${decode_tps_vals[*]}'.split()]
-pvals = [float(x) for x in '${prefill_tps_vals[*]}'.split()]
 if dvals:
     dmean = sum(dvals)/len(dvals)
     dstd = math.sqrt(sum((v-dmean)**2 for v in dvals)/(len(dvals)-1)) if len(dvals)>1 else 0.0
+    print(f'{dmean:.2f} {dstd:.2f}')
 else:
-    dmean, dstd = 0.0, 0.0
-pmean = sum(pvals)/len(pvals) if pvals else 0.0
-print(f'{dmean:.2f} {dstd:.2f} {pmean:.1f}')
-" 2>/dev/null || echo "0.00 0.00 0.0")"
+    print('  ')
+" 2>/dev/null || echo "  ")"
 
-    log "  Cell ${idx} result: decode=${decode_mean}±${decode_stddev} prefill=${prefill_mean} ttft=${ttft_ms}ms"
+    log "  Cell ${idx} result: decode=${decode_mean:-n/a}±${decode_stddev:-n/a} prefill=${prefill_tps:-n/a} ttft=${ttft_ms}ms"
 
     write_cell_json "${idx}" "${MODEL_ID}" "${kv_quant}" "${max_ctx}" "${ctx_label}" \
-        "${decode_mean}" "${decode_stddev}" "${prefill_mean}" "${ttft_ms}" "ok" ""
+        "${decode_mean}" "${decode_stddev}" "${prefill_tps}" "${ttft_ms}" "ok" ""
 
     # DB ingest buffer record
     local model_dir
@@ -407,6 +394,13 @@ print(f'{dmean:.2f} {dstd:.2f} {pmean:.1f}')
 
     python3 -c "
 import json, os
+
+def num(s):
+    # An unmeasured rate is null in the \u00a78.5 record; the recorder writes no
+    # row for it. A 0.0 here would be stored and ranked as a measurement.
+    s = s.strip()
+    return float(s) if s else None
+
 with open('${PROMPT_FILE}') as f:
     pf = json.load(f)
 prompt_body = pf.get('messages', pf.get('body', str(pf)))
@@ -433,9 +427,9 @@ rec = {
     'notes':           'final-matrix',
     'description':     None,
     'metrics': [
-        {'name': 'decode_tps_warm', 'value': float('${decode_mean}'),  'stddev': float('${decode_stddev}')},
-        {'name': 'prefill_tps',     'value': float('${prefill_mean}'), 'stddev': None},
-        {'name': 'ttft_warm_ms',    'value': float('${ttft_ms}'),      'stddev': None},
+        {'name': 'decode_tps_warm', 'value': num('${decode_mean}'),  'stddev': num('${decode_stddev}')},
+        {'name': 'prefill_tps',     'value': num('${prefill_tps}'),  'stddev': None},
+        {'name': 'ttft_warm_ms',    'value': num('${ttft_ms}'),      'stddev': None},
     ],
 }
 with open('${record_path}', 'w') as f:
@@ -456,6 +450,11 @@ print(f'buffer: ${record_path}')
     # Legacy JSONL
     python3 -c "
 import json, os
+
+def num(s):
+    s = s.strip()
+    return float(s) if s else None
+
 rec = {
     **json.loads(os.environ['RMLX_IDENTITY_JSON']),
     'run_id': '${run_id}',
@@ -463,10 +462,10 @@ rec = {
     'model_path': '${model_path}',
     'kv_quant': '${kv_quant}',
     'max_ctx': int('${max_ctx}'),
-    'decode_tps_mean': float('${decode_mean}'),
-    'decode_tps_stddev': float('${decode_stddev}'),
-    'prefill_tps': float('${prefill_mean}'),
-    'ttft_ms': float('${ttft_ms}'),
+    'decode_tps_mean': num('${decode_mean}'),
+    'decode_tps_stddev': num('${decode_stddev}'),
+    'prefill_tps': num('${prefill_tps}'),
+    'ttft_ms': num('${ttft_ms}'),
     ${GIT_SHA_KV}
     'notes': 'final-matrix',
 }
@@ -528,6 +527,8 @@ def model_short(m):
     return m[:7]
 
 def fmt_val(v, fmt='.1f'):
+    if v is None or str(v).strip() == '':
+        return 'n/a'   # not measured, as opposed to measured-as-zero
     try:
         f = float(v)
         if f == 0.0:
