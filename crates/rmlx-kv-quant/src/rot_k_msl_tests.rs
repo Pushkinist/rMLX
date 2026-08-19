@@ -313,3 +313,94 @@ fn hdr_probe_snapshot_matches_builder() {
         "stale snapshot: refresh metal/probes/rot_k.hdr.metal"
     );
 }
+
+/// The fused quantize must type its scales and biases like `mx.quantize`
+/// does — in K's dtype, not the kernel's f32 accumulator.
+///
+/// `mx.quantized_matmul` and `mx.dequantize` take their operand width from the
+/// scales they are handed, so f32 scales on a bf16 model promote the score
+/// matmul, its output, the residual add behind it and every downstream op in
+/// the layer. The fallback path (`rotate_last_axis` + `mx.quantize`, taken
+/// whenever the policy flag is off) types them bf16, so the leak also makes
+/// the two arms of the same codec numerically different.
+#[test]
+#[ignore = "GPU Metal context -- run: cargo test -p rmlx-kv-quant --lib rot_k_msl -- --ignored --test-threads=1"]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "fixture construction on values established in this fn; a failure here is a test bug, not a codec result"
+)]
+fn fwht_quantize_types_scales_like_mx_quantize() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    let device = Device::Gpu;
+    let d = 128usize;
+    let n_rows = 4i32;
+
+    let data = lcg_data(n_rows as usize * d, 0x5CA1_E500_u64);
+    let k = from_vec_f32(&data, &[n_rows, d as i32])
+        .astype(Dtype::Bf16, device)
+        .unwrap();
+
+    // What the non-fused arm of the same codec produces.
+    let r = hadamard_rotation(d, Dtype::Bf16, device).unwrap();
+    let k_rot = rotate_last_axis(&k, &r, device).unwrap();
+    let (_, ref_scales, ref_biases) =
+        quantize(&k_rot, FWHT_QUANT_GROUP_SIZE as i32, 8, device).unwrap();
+
+    let (_, scales, biases) =
+        rot_k_fwht_quantize_gpu(&k, device).expect("fused FWHT quantize should succeed");
+
+    assert_eq!(
+        scales.dtype(),
+        ref_scales.dtype(),
+        "fused scales dtype must match mx.quantize's ({:?})",
+        ref_scales.dtype()
+    );
+    assert_eq!(
+        biases.dtype(),
+        ref_biases.dtype(),
+        "fused biases dtype must match mx.quantize's ({:?})",
+        ref_biases.dtype()
+    );
+    assert_eq!(
+        scales.dtype(),
+        Dtype::Bf16,
+        "a bf16 K must not come back with f32 quantization parameters"
+    );
+
+    // Narrowing the scales is only correct if the reconstruction stays where
+    // the non-fused arm's does. Dequantize both 3-tuples and compare.
+    let deq = |c: &Array, sc: &Array, bi: &Array| {
+        to_vec_f32(
+            &dequantize(
+                c,
+                sc,
+                Some(bi),
+                FWHT_QUANT_GROUP_SIZE as i32,
+                8,
+                "affine",
+                device,
+            )
+            .unwrap()
+            .astype(Dtype::F32, device)
+            .unwrap(),
+        )
+    };
+    let (ref_codes, _, _) = quantize(&k_rot, FWHT_QUANT_GROUP_SIZE as i32, 8, device).unwrap();
+    let (fused_codes, _, _) = rot_k_fwht_quantize_gpu(&k, device).unwrap();
+    let ref_vals = deq(&ref_codes, &ref_scales, &ref_biases);
+    let fused_vals = deq(&fused_codes, &scales, &biases);
+    let max_err = ref_vals
+        .iter()
+        .zip(&fused_vals)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+    eprintln!("[rot_k bf16 scales] max |fused - reference| = {max_err:.4}");
+    assert!(
+        max_err < 0.10,
+        "bf16 scales moved the reconstruction outside the tolerance the f32-input \
+         parity test uses ({max_err} >= 0.10)"
+    );
+}

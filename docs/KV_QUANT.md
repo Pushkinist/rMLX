@@ -718,7 +718,38 @@ match. Reproduce it on Bonsai-8B at 8k with `rmlx bench --kv-quant k8v4
 | gate ON (`--turbo-flash on`) | 42.05 | `0x75a6992e38913e64` | 2 029 240 320 |
 
 TurboFlash is therefore a decode loss *and* an output perturbation, not pure
-cost. That 8k cell also pins the extra resident KV to 361 234 432 B — exactly
+cost.
+
+**Every cell in the two tables above was measured while the kernel promoted the
+decode graph to f32.** `turbo_flash_sdpa` declared f32 kernel outputs and
+returned them without restoring the query dtype, so with the gate ON the
+residual stream, the next layer's RMSNorm, its weight GEMV, its elementwise ops
+and the sampler all re-instantiated at f32 — visible in a GPU capture as
+`affine_qmv_fast_float_*` replacing `affine_qmv_fast_bfloat16_t_*`, plus
+`rmsfloat32`, `vv_Addfloat32`, `vs_Multiplyfloat32` and `argmax_float32`. The
+dispatcher now casts back (`turbo_flash_msl.rs`), and those f32 instantiations
+are gone from the capture. Read the ratios above as an **upper bound on the
+kernel's own cost**: part of what they measured was the promotion, not the
+kernel. The gate posture is unchanged — the ON arm is still slower than the
+generic path in the same direction on both cells re-run after the fix — and the
+cells are due a re-measurement on a quiescent host before the numbers are
+restated.
+
+The digest picture changes too, and only at one of three contexts. Bonsai-8B
+`k8v4`, temp=0, 32 generated tokens, `RMLX_TURBO_FLASH_MIN=0`, one process per
+cell, digest over the emitted token ids:
+
+| prompt | gate OFF | gate ON, before the dtype fix | gate ON, after |
+|---|---|---|---|
+| 4k | `587c5a59` | `587c5a59` | `587c5a59` |
+| 8k | `a098059c` | `10323b3d` | `10323b3d` |
+| 32k | `3466374f` | `163882de` | `3466374f` |
+
+At 32k the ON arm now reproduces the bf16 reference exactly — that divergence
+was the promoted graph, not the codec. At 8k it does not, and that one survives
+the fix: it is the tq4-V codec floor the section above describes. Which is the
+point of removing the confound — a digest difference is now attributable to the
+codec, because both arms finally run at the same dtype. That 8k cell also pins the extra resident KV to 361 234 432 B — exactly
 half the 16k figure, so the flash buffers scale linearly with the ring.
 
 **gemma-4-e2b is a null control, not a second architecture.** On that
@@ -977,9 +1008,26 @@ matrix. Correct and coherent; O(D²) arithmetic per step.
 Fast Walsh-Hadamard Transform in Metal threadgroup shared memory, fused with
 affine-8-bit quantize in a single kernel pass. O(D log₂ D) arithmetic and no
 intermediate DRAM allocation for `K_rot`. For D=128 (Bonsai): 896 arithmetic
-ops vs 16 384 for the matmul (~18×). Output format is bit-exact with
-`mx.quantize(mode="affine", bits=8, group_size=64)` so it feeds directly into
-`mixed_quantized_sdpa` unchanged.
+ops vs 16 384 for the matmul (~18×). Output *format* matches
+`mx.quantize(mode="affine", bits=8, group_size=64)` — same shapes, same dtypes
+— so it feeds directly into `mixed_quantized_sdpa` unchanged. It is not
+bit-exact with it: the kernel computes the group min/max in f32 from f32 data
+where `mx.quantize` works at the input's own width, so the two arms of this
+codec can round a group differently.
+
+That dtype match is load-bearing and was missing until 2026-08: the kernel
+returned its scales and biases as the f32 it computed them in, while
+`mx.quantize` returns them at K's dtype. `quantized_matmul` and `dequantize`
+take their operand width from the scales, so with `--rot-k-fused on` a bf16
+model decoded the whole layer stack in f32 — attention output, residual add,
+next layer's norm and weight GEMV — for as long as the flag was set, and the
+fused and non-fused arms of one codec silently ran at different widths.
+Narrowing the scales moves the reconstruction by at most 0.0156 against the
+`mx.quantize` reference (`fwht_quantize_types_scales_like_mx_quantize`, well
+inside the 0.10 tolerance the f32-input parity test uses), and it does move
+greedy output: on Bonsai-8B at 8k the fused arm's token digest changes from
+matching the non-fused arm to differing from it — the arms differ by the
+quantizer's own rounding, which the wider graph had been masking.
 
 A matching `rot_k_fwht_rotate_gpu` kernel applies the same FWHT to Q,
 replacing the `rotate_last_axis` matmul when the fused path is active.

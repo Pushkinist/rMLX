@@ -285,6 +285,11 @@ fn iso3_dequant_kernel() -> Result<&'static MetalKernel> {
 ///
 /// Returns `Error::Quant` for invalid `head_dim`.
 /// Returns `Error::Mlx` if Metal kernel compilation fails.
+// f32-out-ok: codec buffers, not activations — codes are u32 and the scale /
+// rotation buffers are read back only by this codec's own MSL kernels, which
+// declare them `device const float*`. They never become an operand of an MLX
+// op, so nothing takes its width from them (an `mx.quantize` 3-tuple does:
+// `quantized_matmul` and `dequantize` promote to the scales' dtype).
 pub fn iso_quantize_v3_gpu(
     v_full: &Array,
     head_dim: usize,

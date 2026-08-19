@@ -443,16 +443,25 @@ impl QuantPlanarV {
                 }
                 let seq_major_shape = [self.shape[0], s, self.shape[1], self.shape[3]];
                 let out = if self.bits == 3 {
-                    planar_dequantize_v3_gpu(&codes, &scales, &rotations, &seq_major_shape, device)?
+                    planar_dequantize_v3_gpu(
+                        &codes,
+                        &scales,
+                        &rotations,
+                        &seq_major_shape,
+                        out_dtype,
+                        device,
+                    )?
                 } else {
-                    planar_dequantize_v4_gpu(&codes, &scales, &rotations, &seq_major_shape, device)?
+                    planar_dequantize_v4_gpu(
+                        &codes,
+                        &scales,
+                        &rotations,
+                        &seq_major_shape,
+                        out_dtype,
+                        device,
+                    )?
                 };
                 let out = out.transpose(&[0, 2, 1, 3], device)?.contiguous(device)?;
-                let out = if out_dtype == Dtype::F32 {
-                    out
-                } else {
-                    out.astype(out_dtype, device)?
-                };
                 return Ok((Vec::new(), Some(out)));
             }
             return Ok((Vec::new(), None));

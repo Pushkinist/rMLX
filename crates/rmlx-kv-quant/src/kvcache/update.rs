@@ -6517,20 +6517,16 @@ impl KvCache {
                 let v_sm_shape = [v_shape[0], v_shape[2], v_shape[1], v_shape[3]];
                 let (gathered_codes_v, gathered_scales_v, gathered_rotations_v) =
                     pv.gather(device)?;
-                let out = planar_dequantize_v4_gpu(
+                planar_dequantize_v4_gpu(
                     &gathered_codes_v,
                     &gathered_scales_v,
                     &gathered_rotations_v,
                     &v_sm_shape,
+                    new_v.dtype(),
                     device,
                 )?
                 .transpose(&[0, 2, 1, 3], device)?
-                .contiguous(device)?;
-                if out.dtype() == new_v.dtype() {
-                    out
-                } else {
-                    out.astype(new_v.dtype(), device)?
-                }
+                .contiguous(device)?
             }
             _ => {
                 return Err(Error::Mlx(

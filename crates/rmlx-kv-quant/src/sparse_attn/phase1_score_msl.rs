@@ -210,6 +210,10 @@ pub struct Phase1Out {
 }
 
 /// Run the Phase-1 score kernel: PlanarQuant K decode + QK + per-tile top-4.
+// f32-out-ok: per-tile score state, not an activation — read back on the host
+// for the budget threshold and re-bound as an input to the phase-2 MSL kernel,
+// which declares its own buffer types. The attention output is produced by
+// `phase2_lse_merge`, which takes the query dtype and casts to it.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn phase1_score(
     query: &Array,

@@ -105,6 +105,11 @@ fn tcq_quant_kernel() -> Result<&'static MetalKernel> {
 ///
 /// Returns `Error::Quant` if `total_elems` is not a multiple of
 /// [`GROUP_SIZE`] = 32.
+// f32-out-ok: codec buffers, not activations — codes are u32 and the scale /
+// rotation buffers are read back only by this codec's own MSL kernels, which
+// declare them `device const float*`. They never become an operand of an MLX
+// op, so nothing takes its width from them (an `mx.quantize` 3-tuple does:
+// `quantized_matmul` and `dequantize` promote to the scales' dtype).
 pub fn tcq_quantize_v3_gpu(x: &Array, device: Device) -> Result<(Array, Array)> {
     let shape = x.shape();
     let total_elems: usize = shape.iter().map(|&d| d as usize).product();

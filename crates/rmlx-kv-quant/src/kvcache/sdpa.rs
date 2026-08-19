@@ -1816,11 +1816,8 @@ impl KvCache {
                 scale,
                 device,
             )?;
-            return if flash_out.dtype() == queries.dtype() {
-                Ok(flash_out)
-            } else {
-                flash_out.astype(queries.dtype(), device)
-            };
+            // The dispatcher restores the query dtype itself.
+            return Ok(flash_out);
         }
 
         // Pre-softmax scores via fused QK kernel — bits=4 (K-side PlanarK is
@@ -2085,11 +2082,8 @@ impl KvCache {
                 )))
             }
         };
-        if flash_out.dtype() == queries.dtype() {
-            Ok(flash_out)
-        } else {
-            flash_out.astype(queries.dtype(), device)
-        }
+        // The dispatcher restores the query dtype itself.
+        Ok(flash_out)
     }
 
     /// Shape gates for the rotor flash-decode kernel, evaluated before any
@@ -2361,11 +2355,8 @@ impl KvCache {
                 )))
             }
         };
-        if flash_out.dtype() == queries.dtype() {
-            Ok(flash_out)
-        } else {
-            flash_out.astype(queries.dtype(), device)
-        }
+        // The dispatcher restores the query dtype itself.
+        Ok(flash_out)
     }
 
     /// GPU-append `new_k` / `new_v` into whichever rotor symmetric store is
@@ -2647,11 +2638,8 @@ impl KvCache {
                 )))
             }
         };
-        if flash_out.dtype() == queries.dtype() {
-            Ok(flash_out)
-        } else {
-            flash_out.astype(queries.dtype(), device)
-        }
+        // The dispatcher restores the query dtype itself.
+        Ok(flash_out)
     }
 
     /// Shape gates for the iso flash-decode kernel, evaluated before any cache
@@ -2892,11 +2880,8 @@ impl KvCache {
                 )))
             }
         };
-        if flash_out.dtype() == queries.dtype() {
-            Ok(flash_out)
-        } else {
-            flash_out.astype(queries.dtype(), device)
-        }
+        // The dispatcher restores the query dtype itself.
+        Ok(flash_out)
     }
 
     /// GPU-append `new_k` / `new_v` into whichever iso symmetric store is active.

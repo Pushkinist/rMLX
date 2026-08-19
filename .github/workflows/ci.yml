@@ -64,6 +64,17 @@ jobs:
       # call deep in a shared scaffold. Fixture trees pin that recall.
       - name: the lazy-inputs gate still catches what it is for
         run: make check-no-kernel-input-eval-fixtures
+      # A dispatcher that declares an f32 kernel output and returns it without
+      # restoring the caller's dtype promotes the whole decode graph to f32 —
+      # residual stream, norms, weight GEMV, sampler. It produces plausible
+      # output at roughly half the width's throughput and nothing warns.
+      - name: kernel dispatchers return the dtype they were given
+        run: make check-kernel-dtype-contract
+      # ...and that gate is a source-shape scan, so its recall is the part that
+      # can rot. Fixture trees pin which function it must name, not just its
+      # exit code.
+      - name: the dtype-contract gate still catches what it is for
+        run: make check-kernel-dtype-contract-fixtures
       # MLX 0.31.x fills a process-global CPU command-encoder map with no
       # synchronisation, so two threads evaluating at once corrupt it and the
       # process dies inside MLX with no failing test named. Serialising every

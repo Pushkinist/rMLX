@@ -247,6 +247,11 @@ fn dequant_kernel() -> Result<&'static MetalKernel> {
 /// # Errors
 ///
 /// Returns `Error::Quant` if total elements not a multiple of `GROUP_SIZE`.
+// f32-out-ok: codec buffers, not activations — codes are u32 and the scale /
+// rotation buffers are read back only by this codec's own MSL kernels, which
+// declare them `device const float*`. They never become an operand of an MLX
+// op, so nothing takes its width from them (an `mx.quantize` 3-tuple does:
+// `quantized_matmul` and `dequantize` promote to the scales' dtype).
 pub fn planar_quantize_v4_gpu(x: &Array, device: Device) -> Result<(Array, Array, Array)> {
     let total_elems: usize = x.shape().iter().map(|&d| d as usize).product();
     if !total_elems.is_multiple_of(GROUP_SIZE) {
@@ -303,8 +308,8 @@ pub fn planar_quantize_v4_gpu(x: &Array, device: Device) -> Result<(Array, Array
 
 /// GPU PlanarQuant V4 dequantize.
 ///
-/// Reconstruct f32 tensor from `(codes, scales, rot32)` produced by
-/// [`planar_quantize_v4_gpu`].
+/// Reconstruct the tensor from `(codes, scales, rot32)` produced by
+/// [`planar_quantize_v4_gpu`], in `out_dtype`.
 #[allow(
     clippy::indexing_slicing,
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
@@ -314,6 +319,7 @@ pub fn planar_dequantize_v4_gpu(
     scales: &Array,
     rot32: &Array,
     original_shape: &[i32],
+    out_dtype: Dtype,
     device: Device,
 ) -> Result<Array> {
     let n_pairs: usize = scales.shape().iter().map(|&d| d as usize).product();
@@ -348,6 +354,10 @@ pub fn planar_dequantize_v4_gpu(
         ));
     }
     let out_flat = outputs.remove(0);
+    // The kernel reconstructs in f32; hand the caller its own dtype back.
+    // Dequantized K/V flows straight into SDPA, and an f32 operand there
+    // promotes the whole attention op — and the residual stream behind it.
+    let out_flat = out_flat.astype(out_dtype, device)?;
 
     if original_shape.len() == 1 && original_shape[0] == total_elems as i32 {
         return Ok(out_flat);
@@ -535,6 +545,11 @@ fn dequant_kernel_v3() -> Result<&'static MetalKernel> {
 /// # Errors
 ///
 /// Returns `Error::Quant` if total elements not a multiple of `GROUP_SIZE`.
+// f32-out-ok: codec buffers, not activations — codes are u32 and the scale /
+// rotation buffers are read back only by this codec's own MSL kernels, which
+// declare them `device const float*`. They never become an operand of an MLX
+// op, so nothing takes its width from them (an `mx.quantize` 3-tuple does:
+// `quantized_matmul` and `dequantize` promote to the scales' dtype).
 pub fn planar_quantize_v3_gpu(x: &Array, device: Device) -> Result<(Array, Array, Array)> {
     let total_elems: usize = x.shape().iter().map(|&d| d as usize).product();
     if !total_elems.is_multiple_of(GROUP_SIZE) {
@@ -589,8 +604,8 @@ pub fn planar_quantize_v3_gpu(x: &Array, device: Device) -> Result<(Array, Array
 
 /// GPU PlanarQuant V3 dequantize.
 ///
-/// Reconstruct f32 tensor from `(codes, scales, rot32)` produced by
-/// [`planar_quantize_v3_gpu`].
+/// Reconstruct the tensor from `(codes, scales, rot32)` produced by
+/// [`planar_quantize_v3_gpu`], in `out_dtype`.
 #[allow(
     clippy::indexing_slicing,
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
@@ -600,6 +615,7 @@ pub fn planar_dequantize_v3_gpu(
     scales: &Array,
     rot32: &Array,
     original_shape: &[i32],
+    out_dtype: Dtype,
     device: Device,
 ) -> Result<Array> {
     let n_pairs: usize = scales.shape().iter().map(|&d| d as usize).product();
@@ -634,6 +650,10 @@ pub fn planar_dequantize_v3_gpu(
         ));
     }
     let out_flat = outputs.remove(0);
+    // The kernel reconstructs in f32; hand the caller its own dtype back.
+    // Dequantized K/V flows straight into SDPA, and an f32 operand there
+    // promotes the whole attention op — and the residual stream behind it.
+    let out_flat = out_flat.astype(out_dtype, device)?;
 
     if original_shape.len() == 1 && original_shape[0] == total_elems as i32 {
         return Ok(out_flat);

@@ -534,6 +534,11 @@ pub fn rotor_dequantize_v4_gpu(
     )
 }
 
+// f32-out-ok: codec buffers, not activations — codes are u32 and the scale /
+// rotation buffers are read back only by this codec's own MSL kernels, which
+// declare them `device const float*`. They never become an operand of an MLX
+// op, so nothing takes its width from them (an `mx.quantize` 3-tuple does:
+// `quantized_matmul` and `dequantize` promote to the scales' dtype).
 fn rotor_quantize_gpu_impl(
     v_full: &Array,
     rotors: &Array,

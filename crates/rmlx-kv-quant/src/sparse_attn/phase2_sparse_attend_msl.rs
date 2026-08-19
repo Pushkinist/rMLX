@@ -231,6 +231,9 @@ pub struct Phase2Out {
 
 /// Phase-2 sparse-attend kernel: re-decode K/V on survivors, online softmax,
 /// emit per-tile partial outputs + LSE state.
+// f32-out-ok: per-tile partials and LSE state, not an attention output — both
+// are consumed by the `phase2_lse_merge` MSL kernel, which declares its buffers
+// f32 and returns in the caller's `out_dtype`.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn phase2_sparse_attend(
     query: &Array,
@@ -398,6 +401,11 @@ pub fn phase2_sparse_attend(
 /// Mirror of `planar_flash_decode_msl`'s P2 kernel — collapses
 /// `(n_tiles, n_bh, head_dim)` × `(n_tiles, n_bh, 2)` into
 /// `(B, n_q_heads, 1, head_dim)` via log-sum-exp.
+///
+/// The merge accumulates in f32 (log-sum-exp needs it) and returns in
+/// `out_dtype` — pass the query dtype. An f32 attention output promotes the
+/// residual stream and every downstream op in the layer.
+#[allow(clippy::too_many_arguments)]
 pub fn phase2_lse_merge(
     partial_o: &Array,
     tile_lse: &Array,
@@ -405,6 +413,7 @@ pub fn phase2_lse_merge(
     n_q_heads: i32,
     head_dim: i32,
     n_tiles: i32,
+    out_dtype: Dtype,
     device: Device,
 ) -> Result<Array> {
     let n_bh = b * n_q_heads;
@@ -452,5 +461,6 @@ pub fn phase2_lse_merge(
         return Err(Error::Mlx("phase2_lse_merge: expected 1 output".into()));
     }
     let dst_flat = outs.remove(0);
-    dst_flat.reshape(&[b, n_q_heads, 1, head_dim], device)
+    let dst = dst_flat.reshape(&[b, n_q_heads, 1, head_dim], device)?;
+    dst.astype(out_dtype, device)
 }

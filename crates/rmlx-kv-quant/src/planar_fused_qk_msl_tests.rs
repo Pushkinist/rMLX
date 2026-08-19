@@ -45,8 +45,9 @@ fn pack_v4_seq_major(k_arr: &Array, k_shape: &[i32]) -> (Array, Array, Array, Ve
     let (codes, scales, rot32) =
         planar_quantize_v4_gpu(&k_seq, Device::Gpu).expect("v4 quantize seq-major");
     // Dequant in seq-major shape, transpose back to head-major for the ref.
-    let dq_seq = planar_dequantize_v4_gpu(&codes, &scales, &rot32, &seq_shape, Device::Gpu)
-        .expect("v4 dequant seq-major");
+    let dq_seq =
+        planar_dequantize_v4_gpu(&codes, &scales, &rot32, &seq_shape, Dtype::F32, Device::Gpu)
+            .expect("v4 dequant seq-major");
     let dq_hm = dq_seq
         .transpose(&[0, 2, 1, 3], Device::Gpu)
         .expect("transpose back")
@@ -66,8 +67,9 @@ fn pack_v3_seq_major(k_arr: &Array, k_shape: &[i32]) -> (Array, Array, Array, Ve
         .expect("contiguous");
     let (codes, scales, rot32) =
         planar_quantize_v3_gpu(&k_seq, Device::Gpu).expect("v3 quantize seq-major");
-    let dq_seq = planar_dequantize_v3_gpu(&codes, &scales, &rot32, &seq_shape, Device::Gpu)
-        .expect("v3 dequant seq-major");
+    let dq_seq =
+        planar_dequantize_v3_gpu(&codes, &scales, &rot32, &seq_shape, Dtype::F32, Device::Gpu)
+            .expect("v3 dequant seq-major");
     let dq_hm = dq_seq
         .transpose(&[0, 2, 1, 3], Device::Gpu)
         .expect("transpose back")

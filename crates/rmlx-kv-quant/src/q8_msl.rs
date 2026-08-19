@@ -101,6 +101,11 @@ fn dequant_kernel() -> Result<&'static MetalKernel> {
 /// callers already pass row-contiguous head-major `[B, kv_h, n, D]` chunks; the
 /// transposed-view materialization lives at the one site that needs it
 /// (`QuantK::append`).
+// f32-out-ok: codec buffers, not activations — codes are u32 and the scale /
+// rotation buffers are read back only by this codec's own MSL kernels, which
+// declare them `device const float*`. They never become an operand of an MLX
+// op, so nothing takes its width from them (an `mx.quantize` 3-tuple does:
+// `quantized_matmul` and `dequantize` promote to the scales' dtype).
 pub fn q8_quantize_gpu(x: &Array, device: Device) -> Result<(Array, Array)> {
     let total_elems: usize = x.shape().iter().map(|&d| d as usize).product();
     if !total_elems.is_multiple_of(Q8_GROUP_SIZE) {

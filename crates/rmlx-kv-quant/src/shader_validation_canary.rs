@@ -58,6 +58,8 @@ pub fn shader_validation_enabled() -> bool {
 /// itself does **not** produce an error: the command buffer completes, its
 /// `error` is nil and the process exits 0. That is the whole point — the signal
 /// is a diagnostic in the output, not a status code.
+// f32-out-ok: deliberately-invalid canary dispatch; the output buffer exists
+// only to give the out-of-bounds store somewhere to aim and is never returned.
 pub fn dispatch_out_of_bounds_store(device: Device) -> Result<()> {
     let n = 256_i32;
     let input = Array::from_f32_slice(&vec![1.0_f32; n as usize], &[n])?;

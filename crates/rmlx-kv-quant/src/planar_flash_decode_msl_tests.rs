@@ -453,11 +453,18 @@ struct ArmDiff {
 /// Run both `planar_k_flash_over_store` arms over one packed K.
 ///
 /// Mirrors the production chain step for step: bf16 Q as the model streams it,
-/// the f32 softmax, the GQA reshape/matmul, **and** the closing
-/// `astype(queries.dtype())` that the dispatcher applies to both returns. The
-/// output cast matters: it is the last thing that happens to either arm before
-/// the value reaches the model, and dropping it measures an intermediate no
-/// caller sees.
+/// the f32 softmax, the GQA reshape/matmul, **and** the closing cast to the
+/// query dtype. The output cast matters: it is the last thing that happens to
+/// either arm before the value reaches the model, and dropping it measures an
+/// intermediate no caller sees.
+///
+/// `planar_flash_decode_sdpa` returns in its query's dtype, so the flash arm is
+/// dispatched with the f32 *view* of the same bf16 Q — bf16→f32 is exact, so
+/// the kernel sees identical values, and what comes back is the raw f32
+/// accumulator. Casting that to bf16 here reproduces exactly what the
+/// dispatcher hands a bf16 caller. Passing bf16 Q instead would round the flash
+/// arm before the comparison and quietly turn the f32 null control below into a
+/// bf16-vs-f32 rounding measurement, which cannot fail.
 #[allow(clippy::expect_used, reason = "test helper: invariants documented")]
 fn flash_vs_split_chain(
     b: i32,
@@ -498,9 +505,11 @@ fn flash_vs_split_chain(
     let (codes, scales, rot32) =
         planar_quantize_v4_gpu(&k_seq, device).expect("planar_quantize_v4_gpu");
 
-    // Arm A — single-pass flash kernel.
+    // Arm A — single-pass flash kernel, dispatched at f32 so the comparison
+    // below sees the accumulator rather than its rounded form.
+    let q_arr_f32 = q_arr.astype(Dtype::F32, device).expect("Q f32 view");
     let flash = planar_flash_decode_sdpa(
-        &q_arr,
+        &q_arr_f32,
         &codes,
         &scales,
         &rot32,
@@ -561,10 +570,11 @@ fn flash_vs_split_chain(
         }
     }
 
-    // ── bf16 output: what the dispatcher hands back ───────────────────────
-    // Both arms end with `astype(queries.dtype())`. Reading the cast results
-    // back as f32 is lossless (every bf16 is exactly representable), so a
-    // bitwise f32 comparison here is a bitwise bf16 comparison.
+    // ── bf16 output: what the dispatcher hands a bf16 caller ──────────────
+    // Both arms end at `queries.dtype()` — the dispatcher does it for the flash
+    // arm, the caller for the split chain. Reading the cast results back as f32
+    // is lossless (every bf16 is exactly representable), so a bitwise f32
+    // comparison here is a bitwise bf16 comparison.
     let flash_out = flash
         .astype(q_arr.dtype(), device)
         .expect("flash -> q dtype");
@@ -683,5 +693,69 @@ fn hdr_probe_snapshot_matches_builder() {
         p1_header_v4().expect("planar flash P1 header"),
         include_str!("metal/probes/planar_flash_decode_p1.hdr.metal"),
         "stale snapshot: refresh metal/probes/planar_flash_decode_p1.hdr.metal"
+    );
+}
+
+/// Dtype in, dtype out.
+///
+/// The cache-level sweep (`tests/kv_decode_dtype_contract.rs`) cannot reach
+/// this kernel: PlanarK's dispatcher keeps it dormant whenever the bf16 K seed
+/// is live, which is every post-prefill decode step. So the contract is pinned
+/// here, at the dispatcher. An f32 attention output promotes the residual
+/// stream and every downstream op in the layer, silently.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test planar_flash_decode -- --include-ignored --test-threads=1"]
+#[allow(
+    clippy::expect_used,
+    reason = "fixture construction; a failure here is a test bug"
+)]
+fn planar_flash_decode_returns_query_dtype() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    let device = Device::Gpu;
+    let (b, kv_h, heads_per_kv, kv_seq, head_dim) = (1_i32, 2_i32, 4_i32, 128_i32, 128_i32);
+    let n_q_heads = kv_h * heads_per_kv;
+
+    let k_n = (b * kv_h * kv_seq * head_dim) as usize;
+    let k_arr = make_f32_array(&lcg_data(k_n, 0x9111_0001), &[b, kv_h, kv_seq, head_dim]);
+    let k_seq = k_arr
+        .transpose(&[0, 2, 1, 3], device)
+        .expect("transpose k seq-major")
+        .contiguous(device)
+        .expect("contiguous k seq-major");
+    let (codes, scales, rot32) = planar_quantize_v4_gpu(&k_seq, device).expect("quantize");
+    let v_arr = make_f32_array(&lcg_data(k_n, 0x9111_0002), &[b, kv_h, kv_seq, head_dim])
+        .astype(Dtype::Bf16, device)
+        .expect("V bf16");
+    let q_arr = make_f32_array(
+        &lcg_data((b * n_q_heads * head_dim) as usize, 0x9111_0003),
+        &[b, n_q_heads, 1, head_dim],
+    )
+    .astype(Dtype::Bf16, device)
+    .expect("Q bf16");
+
+    let out = planar_flash_decode_sdpa(
+        &q_arr,
+        &codes,
+        &scales,
+        &rot32,
+        &v_arr,
+        None,
+        b,
+        kv_h,
+        kv_seq,
+        head_dim,
+        heads_per_kv,
+        4,
+        1.0 / (head_dim as f32).sqrt(),
+        device,
+    )
+    .expect("planar_flash_decode_sdpa");
+
+    assert_eq!(
+        out.dtype(),
+        q_arr.dtype(),
+        "planar flash decode must return the query dtype, not its f32 accumulator"
     );
 }
