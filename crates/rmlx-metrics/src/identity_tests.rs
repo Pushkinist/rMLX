@@ -68,6 +68,7 @@ fn split_model_path_unknown_namespace_errors() {
         | Error::Schema(_)
         | Error::IdentityModelPath(_)
         | Error::UnknownMetric(_)
+        | Error::ImplausibleValue { .. }
         | Error::UnknownDirection(_)
         | Error::InvalidTimestamp(_)
         | Error::InvalidPrompt(_)
@@ -101,6 +102,7 @@ fn canonicalize_backend_unknown() {
         | Error::Schema(_)
         | Error::IdentityModelPath(_)
         | Error::UnknownMetric(_)
+        | Error::ImplausibleValue { .. }
         | Error::UnknownDirection(_)
         | Error::InvalidTimestamp(_)
         | Error::InvalidPrompt(_)
@@ -148,6 +150,7 @@ fn alias_normalization_non_backend_field_untouched() {
         | Error::Schema(_)
         | Error::IdentityModelPath(_)
         | Error::UnknownMetric(_)
+        | Error::ImplausibleValue { .. }
         | Error::UnknownDirection(_)
         | Error::InvalidTimestamp(_)
         | Error::InvalidPrompt(_)

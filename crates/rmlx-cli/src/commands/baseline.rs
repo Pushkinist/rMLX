@@ -113,6 +113,17 @@ pub(crate) fn peak_rss_mb() -> f64 {
     }
 }
 
+/// Render an optional measurement, substituting `missing` when a run measured
+/// nothing.
+///
+/// A printed `0.0` reads as a measured zero — to a human, to the scripts that
+/// grep the summary line, and to anything that averages the CSV column. The
+/// substitute is `n/a` on the console and an empty field in CSV, both of which
+/// fail a numeric parse instead of quietly weighting a mean.
+fn fmt_measurement(value: Option<f64>, decimals: usize, missing: &str) -> String {
+    value.map_or_else(|| missing.to_string(), |v| format!("{v:.decimals$}"))
+}
+
 /// Per-phase timing computed from the per-token `step_fn` callback wall-clocks.
 ///
 /// `generate_greedy` invokes `step_fn` once per produced token. The FIRST call
@@ -125,12 +136,17 @@ pub(crate) fn peak_rss_mb() -> f64 {
 /// - `overall_tps` = `n_generated / total_elapsed` — the historical combined
 ///   number (prefill + decode), kept for the `overall_tps` metric.
 /// - `prefill_tps` = `prompt_tokens / ttft_s` — prefill throughput.
+///
+/// Every field is `Option`: a run that produced no token measured no rate, and
+/// `0.0` in that slot is a fabricated measurement — it prints, averages and
+/// (once recorded) wins a `bests` cell exactly like a real throughput of zero.
+/// `None` is the only honest answer, and the recorder writes no row for it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct PhaseTiming {
-    pub ttft_ms: f64,
-    pub decode_tps: f64,
-    pub overall_tps: f64,
-    pub prefill_tps: f64,
+    pub ttft_ms: Option<f64>,
+    pub decode_tps: Option<f64>,
+    pub overall_tps: Option<f64>,
+    pub prefill_tps: Option<f64>,
 }
 
 /// Compute phase timings from raw inputs.
@@ -150,26 +166,23 @@ pub(crate) fn compute_phase_timing(
     n_generated: usize,
     prompt_tokens: usize,
 ) -> PhaseTiming {
-    let ttft_ms = first_cb_s * 1000.0;
+    // No callback ever fired, or it landed at t=0: nothing was timed, so
+    // nothing is reported. Same condition as `prefill_tps` below, which is
+    // derived from this same first-callback timestamp — a state one field
+    // calls unmeasured cannot be a measurement in the other.
+    let ttft_ms = (n_generated > 0 && first_cb_s > 0.0).then_some(first_cb_s * 1000.0);
 
     // Decode window: tokens 2..N over (last_cb - first_cb). Needs >= 2 tokens
     // and a positive window; otherwise fall back to the combined number.
     let decode_window_s = last_cb_s - first_cb_s;
-    let overall_tps = if total_s > 0.0 && n_generated > 0 {
-        n_generated as f64 / total_s
-    } else {
-        0.0
-    };
+    let overall_tps = (total_s > 0.0 && n_generated > 0).then(|| n_generated as f64 / total_s);
     let decode_tps = if n_generated >= 2 && decode_window_s > 0.0 {
-        (n_generated as f64 - 1.0) / decode_window_s
+        Some((n_generated as f64 - 1.0) / decode_window_s)
     } else {
         overall_tps
     };
-    let prefill_tps = if first_cb_s > 0.0 && prompt_tokens > 0 {
-        prompt_tokens as f64 / first_cb_s
-    } else {
-        0.0
-    };
+    let prefill_tps =
+        (first_cb_s > 0.0 && prompt_tokens > 0).then(|| prompt_tokens as f64 / first_cb_s);
 
     PhaseTiming {
         ttft_ms,
@@ -562,16 +575,23 @@ pub(crate) fn run_baseline(
     // Invariant: removing the fixed prefill cost from the denominator can only
     // raise TPS. decode_tps must be >= the combined overall_tps for the run.
     debug_assert!(
-        n_generated < 2 || decode_tps + 1e-9 >= overall_tps,
-        "decode_tps ({decode_tps}) must be >= overall_tps ({overall_tps})"
+        n_generated < 2
+            || match (decode_tps, overall_tps) {
+                (Some(d), Some(o)) => d + 1e-9 >= o,
+                _ => true,
+            },
+        "decode_tps ({decode_tps:?}) must be >= overall_tps ({overall_tps:?})"
     );
 
     // `tps` retains the decode-only number for downstream summary + the
     // `decode_tps_warm` metric column (the corrected, prefill-excluded value).
-    let tps: f64 = decode_tps;
+    let tps: Option<f64> = decode_tps;
 
     // -- Peak RSS (after model + generation memory is committed) ---------------
+    // `peak_rss_mb` returns 0.0 when the platform probe fails. A live process
+    // always occupies memory, so that zero is a failed read, not a reading.
     let rss_mb = peak_rss_mb();
+    let rss_mb_measured = (rss_mb > 0.0).then_some(rss_mb);
 
     // -- First-50-token preview ------------------------------------------------
     let preview: String = steps
@@ -644,10 +664,15 @@ pub(crate) fn run_baseline(
         (0.0, 0.0)
     };
     println!(
-        "baseline: model={model_basename}  load={load_ms:.0}ms  ttft_ms={ttft_ms:.0}  \
-         decode_tps={decode_tps:.3}  overall_tps={overall_tps:.3}  prefill_tps={prefill_tps:.1}  \
-         prompt_tokens={prompt_token_count}  peak_rss={rss_mb:.1}MB  \
-         metal_peak_mb={metal_peak_mb:.1}  metal_gen_alloc_mb={metal_gen_alloc_mb:.1}"
+        "baseline: model={model_basename}  load={load_ms:.0}ms  ttft_ms={ttft}  \
+         decode_tps={decode}  overall_tps={overall}  prefill_tps={prefill}  \
+         prompt_tokens={prompt_token_count}  peak_rss={rss}MB  \
+         metal_peak_mb={metal_peak_mb:.1}  metal_gen_alloc_mb={metal_gen_alloc_mb:.1}",
+        ttft = fmt_measurement(ttft_ms, 0, "n/a"),
+        decode = fmt_measurement(decode_tps, 3, "n/a"),
+        overall = fmt_measurement(overall_tps, 3, "n/a"),
+        prefill = fmt_measurement(prefill_tps, 1, "n/a"),
+        rss = fmt_measurement(rss_mb_measured, 1, "n/a"),
     );
 
     // Exact generated token-id sequence, one line, opt-in.
@@ -693,24 +718,31 @@ pub(crate) fn run_baseline(
         .and_then(|tc| tc.max_position_embeddings)
         .unwrap_or(0);
 
-    let metrics_data: &[(&str, &str, f64)] = &[
-        ("baseline_load_ms", "ms", load_ms),
+    // A phase this run did not measure records nothing — an event row reading
+    // `0` tok/s is indistinguishable from a measured stall.
+    let metrics_data: &[(&str, &str, Option<f64>)] = &[
+        ("baseline_load_ms", "ms", Some(load_ms)),
         ("baseline_ttft_ms", "ms", ttft_ms),
         ("baseline_tps", "tok/s", decode_tps),
         ("baseline_overall_tps", "tok/s", overall_tps),
         ("baseline_prefill_tps", "tok/s", prefill_tps),
-        ("baseline_prompt_tokens", "count", prompt_token_count as f64),
-        ("baseline_peak_rss_mb", "MB", rss_mb),
+        (
+            "baseline_prompt_tokens",
+            "count",
+            Some(prompt_token_count as f64),
+        ),
+        ("baseline_peak_rss_mb", "MB", rss_mb_measured),
     ];
 
-    for (op, unit, value) in metrics_data {
+    for (op, unit, measured) in metrics_data {
+        let Some(value) = *measured else { continue };
         sink.record(&rmlx_metrics::events::Measurement {
             model_path: &abs_path_str,
             quant_mode: &quant_mode,
             stage: "baseline",
             op,
             value_unit: unit,
-            value: *value,
+            value,
             notes: &notes_truncated,
         })
         .map_err(|e| anyhow::anyhow!("metrics record {op}: {e}"))?;
@@ -769,7 +801,7 @@ pub(crate) fn run_baseline(
         }
 
         let row = format!(
-            "{},{},rMLX,{},{},{},{},{},{},{:.0},{:.0},{:.3},{:.1},{}\n",
+            "{},{},rMLX,{},{},{},{},{},{},{:.0},{},{},{},{}\n",
             baseline_csv_escape(run_id),
             ts_utc,
             baseline_csv_escape(model_basename),
@@ -779,9 +811,9 @@ pub(crate) fn run_baseline(
             baseline_csv_escape(device_str),
             prompt_token_count,
             load_ms,
-            ttft_ms,
-            tps,
-            rss_mb,
+            fmt_measurement(ttft_ms, 0, ""),
+            fmt_measurement(tps, 3, ""),
+            fmt_measurement(rss_mb_measured, 1, ""),
             output_cell,
         );
         csv_file
@@ -842,7 +874,7 @@ pub(crate) fn run_baseline(
             decode_tps,
             overall_tps,
             prefill_tps,
-            rss_mb,
+            rss_mb_measured,
             n_generated,
             &preview_64,
             kv_cache_bytes,
@@ -973,11 +1005,11 @@ fn build_run_record(
     prompt_tokens: i64,
     max_tokens: i64,
     load_ms: f64,
-    ttft_ms: f64,
-    decode_tps: f64,
-    overall_tps: f64,
-    prefill_tps: f64,
-    rss_mb: f64,
+    ttft_ms: Option<f64>,
+    decode_tps: Option<f64>,
+    overall_tps: Option<f64>,
+    prefill_tps: Option<f64>,
+    rss_mb: Option<f64>,
     n_generated: usize,
     preview_first_64: &str,
     kv_cache_bytes: u64,
@@ -1021,8 +1053,10 @@ fn build_run_record(
 
     // `decode_tps_warm` now carries the prefill-EXCLUDED steady-state number;
     // `overall_tps` keeps the combined prefill+decode value; `prefill_tps` is
-    // prompt throughput.  `kv_cache_bytes` is omitted when 0 (arch not yet
-    // wired) so the RunRecord schema stays backward-compatible.
+    // prompt throughput.  An unmeasured phase serializes to `null` and the
+    // recorder writes no row for it — the §8.5 way of saying "not measured".
+    // `kv_cache_bytes` is omitted when 0 (arch not yet wired) so the RunRecord
+    // schema stays backward-compatible.
     let mut metrics = vec![
         serde_json::json!({ "name": "decode_tps_warm", "value": decode_tps }),
         serde_json::json!({ "name": "overall_tps",     "value": overall_tps }),

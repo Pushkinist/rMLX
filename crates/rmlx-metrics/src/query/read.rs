@@ -284,6 +284,10 @@ pub fn timeseries(
         }
     };
 
+    // A mean is as corruptible as a ranking: one implausible row drags the
+    // bucket it lands in. Same §4.1 predicate as `bests`.
+    let plausible = crate::bests_view::plausible_sql("value");
+
     let mut sql = format!(
         "SELECT {bucket_expr} AS bucket_start,
                 AVG(value)              AS mean_value,
@@ -296,7 +300,8 @@ pub fn timeseries(
            AND kv_quant        = ?5
            AND ctx_max         = ?6
            AND prompt_id       = ?7
-           AND metric          = ?8"
+           AND metric          = ?8
+           AND ({plausible})"
     );
 
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
@@ -392,7 +397,16 @@ pub fn deltas(
     // if a backend was performing better BEFORE the sha than it is in observations
     // recorded AFTER the sha, that signals a regression. When no post-baseline
     // observations exist, we use the all-time current best as "current".
-    let best_in_window_sql = "
+    //
+    // These two rank `observations` directly rather than reading `bests`,
+    // because they rank *within a time window* the view does not know about.
+    // They must therefore carry the same §4.1 plausibility predicate the view
+    // does — `deltas --exit-code` is a CI gate, and a gate that ranks rows the
+    // champion view refuses is worse than no gate.
+    let plausible = crate::bests_view::plausible_sql("value");
+
+    let best_in_window_sql = format!(
+        "
         SELECT value FROM (
             SELECT value,
                 ROW_NUMBER() OVER (
@@ -411,9 +425,12 @@ pub fn deltas(
               AND prompt_id       = ?7
               AND metric          = ?8
               AND ts_utc          <= ?9
-        ) WHERE rn = 1";
+              AND ({plausible})
+        ) WHERE rn = 1"
+    );
 
-    let best_after_sql = "
+    let best_after_sql = format!(
+        "
         SELECT value FROM (
             SELECT value,
                 ROW_NUMBER() OVER (
@@ -432,10 +449,12 @@ pub fn deltas(
               AND prompt_id       = ?7
               AND metric          = ?8
               AND ts_utc          > ?9
-        ) WHERE rn = 1";
+              AND ({plausible})
+        ) WHERE rn = 1"
+    );
 
-    let mut baseline_stmt = conn.prepare(best_in_window_sql)?;
-    let mut after_stmt = conn.prepare(best_after_sql)?;
+    let mut baseline_stmt = conn.prepare(&best_in_window_sql)?;
+    let mut after_stmt = conn.prepare(&best_after_sql)?;
 
     let mut result = Vec::new();
 
@@ -580,25 +599,34 @@ pub fn regress(
     };
 
     // Step 2: find the most-recent observation for this (model, metric).
+    // "Latest" means latest *measurement*: an implausible row here reads as a
+    // 100% regression against the champion and fails the gate on nothing.
+    let plausible = crate::bests_view::plausible_sql("value");
     let latest_value: Option<f64> = if let Some(kv) = kv_quant {
         conn.query_row(
-            "SELECT value FROM observations
-              WHERE instr(model, ?1) > 0
-                AND metric   = ?2
-                AND kv_quant = ?3
-              ORDER BY ts_utc DESC
-              LIMIT 1",
+            &format!(
+                "SELECT value FROM observations
+                  WHERE instr(model, ?1) > 0
+                    AND metric   = ?2
+                    AND kv_quant = ?3
+                    AND ({plausible})
+                  ORDER BY ts_utc DESC
+                  LIMIT 1"
+            ),
             rusqlite::params![model, metric, kv],
             |r| r.get(0),
         )
         .optional()?
     } else {
         conn.query_row(
-            "SELECT value FROM observations
-              WHERE instr(model, ?1) > 0
-                AND metric = ?2
-              ORDER BY ts_utc DESC
-              LIMIT 1",
+            &format!(
+                "SELECT value FROM observations
+                  WHERE instr(model, ?1) > 0
+                    AND metric = ?2
+                    AND ({plausible})
+                  ORDER BY ts_utc DESC
+                  LIMIT 1"
+            ),
             rusqlite::params![model, metric],
             |r| r.get(0),
         )
@@ -714,7 +742,7 @@ pub fn champions(conn: &Connection, backend_filter: Option<&str>) -> Result<Vec<
     for (ns, model, wq, kq) in &distinct_cells {
         let mut metrics_map = std::collections::BTreeMap::new();
 
-        for (metric_name, _, _) in crate::registry::METRICS {
+        for (metric_name, _, _, _) in crate::registry::METRICS {
             let champion: Option<ChampionCell> = if let Some(b) = backend_filter {
                 stmt_with_backend
                     .query_row(rusqlite::params![ns, model, wq, kq, metric_name, b], |r| {

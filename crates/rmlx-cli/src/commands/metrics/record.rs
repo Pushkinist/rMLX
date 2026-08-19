@@ -154,8 +154,8 @@ pub(super) fn ingest_one(
         return Ok(None);
     }
 
-    let mut conn =
-        schema::open(db_path).with_context(|| format!("open DB at {}", db_path.display()))?;
+    let mut conn = schema::open_migrated(db_path)
+        .with_context(|| format!("open DB at {}", db_path.display()))?;
 
     let inserted_by = RunIdentity::get().inserted_by("rmlx-cli");
     let mut rec = Recorder::new(&mut conn, inserted_by);

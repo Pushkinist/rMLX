@@ -72,29 +72,60 @@ fn csv_escape_empty_string() {
 
 // -- compute_phase_timing -------------------------------------------------
 
+/// Unwrap a measured phase, failing the test if it reads as unmeasured.
+fn measured(v: Option<f64>, what: &str) -> f64 {
+    v.unwrap_or_else(|| panic!("{what} should be measured, got None"))
+}
+
 #[test]
 fn phase_timing_decode_excludes_prefill() {
     // 100 tokens. First callback (TTFT) at 1.0s; last at 2.0s. Total 2.0s.
     // Decode window = 1.0s over 99 tokens => 99 tps.
     // Overall = 100 / 2.0 = 50 tps.
     let t = compute_phase_timing(1.0, 2.0, 2.0, 100, 4096);
-    assert!((t.ttft_ms - 1000.0).abs() < 1e-6, "ttft {}", t.ttft_ms);
-    assert!(
-        (t.decode_tps - 99.0).abs() < 1e-6,
-        "decode {}",
-        t.decode_tps
-    );
-    assert!(
-        (t.overall_tps - 50.0).abs() < 1e-6,
-        "overall {}",
-        t.overall_tps
-    );
+    let ttft = measured(t.ttft_ms, "ttft_ms");
+    let decode = measured(t.decode_tps, "decode_tps");
+    let overall = measured(t.overall_tps, "overall_tps");
+    let prefill = measured(t.prefill_tps, "prefill_tps");
+    assert!((ttft - 1000.0).abs() < 1e-6, "ttft {ttft}");
+    assert!((decode - 99.0).abs() < 1e-6, "decode {decode}");
+    assert!((overall - 50.0).abs() < 1e-6, "overall {overall}");
     // prefill_tps = 4096 / 1.0
-    assert!(
-        (t.prefill_tps - 4096.0).abs() < 1e-6,
-        "prefill {}",
-        t.prefill_tps
+    assert!((prefill - 4096.0).abs() < 1e-6, "prefill {prefill}");
+}
+
+/// A run that produced no token measured no rate. Reporting `0.0` there is
+/// what put fabricated zero-throughput rows into `observations`, where they
+/// win any cell whose only other rows are also zeros.
+#[test]
+fn phase_timing_reports_nothing_when_no_token_was_generated() {
+    let t = compute_phase_timing(0.0, 0.0, 1.5, 0, 4096);
+    assert_eq!(t.ttft_ms, None, "ttft_ms fabricated on a zero-token run");
+    assert_eq!(
+        t.decode_tps, None,
+        "decode_tps fabricated on a zero-token run"
     );
+    assert_eq!(
+        t.overall_tps, None,
+        "overall_tps fabricated on a zero-token run"
+    );
+    assert_eq!(
+        t.prefill_tps, None,
+        "prefill_tps fabricated on a zero-token run"
+    );
+}
+
+/// The prefill rate needs a first-callback timestamp; without one there is no
+/// denominator, so there is no rate — not a rate of zero.
+#[test]
+fn phase_timing_reports_no_prefill_rate_without_a_first_callback() {
+    let t = compute_phase_timing(0.0, 0.4, 0.4, 8, 4096);
+    assert_eq!(t.prefill_tps, None);
+    assert_eq!(
+        t.ttft_ms, None,
+        "ttft_ms fabricated from the same first-callback state prefill_tps calls unmeasured"
+    );
+    assert!(t.decode_tps.is_some(), "decode is still measurable here");
 }
 
 #[test]
@@ -108,11 +139,12 @@ fn phase_timing_decode_gte_overall_invariant() {
         (2.0, 2.01, 2.01, 100), // prefill-dominated: decode still >= overall
     ] {
         let t = compute_phase_timing(first, last, total, n, 4096);
+        let decode = measured(t.decode_tps, "decode_tps");
+        let overall = measured(t.overall_tps, "overall_tps");
         assert!(
-            t.decode_tps + 1e-9 >= t.overall_tps,
-            "decode_tps {} must be >= overall_tps {} (first={first} last={last} total={total} n={n})",
-            t.decode_tps,
-            t.overall_tps
+            decode + 1e-9 >= overall,
+            "decode_tps {decode} must be >= overall_tps {overall} \
+             (first={first} last={last} total={total} n={n})"
         );
     }
 }
@@ -121,7 +153,9 @@ fn phase_timing_decode_gte_overall_invariant() {
 fn phase_timing_single_token_falls_back_to_overall() {
     // With n_generated < 2 there is no decode window; decode_tps == overall.
     let t = compute_phase_timing(0.5, 0.5, 0.5, 1, 4096);
-    assert!((t.decode_tps - t.overall_tps).abs() < 1e-9);
+    let decode = measured(t.decode_tps, "decode_tps");
+    let overall = measured(t.overall_tps, "overall_tps");
+    assert!((decode - overall).abs() < 1e-9);
 }
 
 // -- build_run_record: git_sha provenance -----------------------------------
@@ -156,11 +190,11 @@ fn build_record_git_sha_survives_stamp_json() {
         16,
         8,
         0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
+        Some(120.0),
+        Some(40.0),
+        Some(35.0),
+        Some(500.0),
+        Some(1024.0),
         8,
         "",
         0,
@@ -200,11 +234,11 @@ fn build_record_git_sha_absent_is_null() {
         16,
         8,
         0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
+        Some(120.0),
+        Some(40.0),
+        Some(35.0),
+        Some(500.0),
+        Some(1024.0),
         8,
         "",
         0,
@@ -241,11 +275,11 @@ fn build_record_git_sha_blank_string_is_null() {
         16,
         8,
         0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
+        Some(120.0),
+        Some(40.0),
+        Some(35.0),
+        Some(500.0),
+        Some(1024.0),
         8,
         "",
         0,
