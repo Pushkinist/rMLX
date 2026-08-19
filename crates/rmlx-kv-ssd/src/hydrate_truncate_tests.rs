@@ -48,6 +48,52 @@ fn build_kvcache_quant(quant: KvQuant, kv_h: i32, seq: i32, seed: u64) -> KvCach
     c
 }
 
+/// Bracketed counterpart to `build_kvcache_quant`: on the production prefill
+/// path there is no block list to cut, and a truncate is a no-op on it.
+///
+/// The fixtures here drive the codec body directly so a block list exists to
+/// cut. That is the hydrated shape, and it is the right subject — but it leaves
+/// the serve path unasserted in this file. Stated once here: a prefilled cache
+/// of one of these codecs carries no store, so the cut this file is about
+/// cannot mis-fire on it, and the truncate lands on the mirror's offset only.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn a_prefilled_cache_has_no_block_list_to_cut() {
+    let device = Device::Cpu;
+    let shape = [1i32, 2, 64, 128];
+    let n: usize = shape.iter().map(|&x| x as usize).product();
+
+    for quant in [KvQuant::K8V4, KvQuant::K8V8, KvQuant::Planar] {
+        let mut c = KvCache::with_quant_max_seq(quant, 4096);
+        c.enter_prefill();
+        c.update(
+            &arr(&lcg(n, 0x5150), &shape),
+            &arr(&lcg(n, 0x0515), &shape),
+            device,
+        )
+        .unwrap();
+        c.exit_prefill(device).unwrap();
+
+        assert_eq!(
+            c.storage().resident_bytes(),
+            0,
+            "{quant:?}: a prefilled cache carries no packed store, so the block \
+             cut this file exercises has nothing to act on"
+        );
+
+        c.truncate_to(16);
+        assert_eq!(c.offset(), 16, "{quant:?}: truncate moves the cache offset");
+        assert_eq!(
+            c.storage().resident_bytes(),
+            0,
+            "{quant:?}: and still no store afterwards"
+        );
+    }
+}
+
 /// Dequant the V side of a cache to flat head-major `[1, kv_h, S, D]` f32.
 #[allow(
     clippy::expect_used,

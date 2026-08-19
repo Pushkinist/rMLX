@@ -259,6 +259,45 @@ fn wipe_removes_superseded_schema_namespace() {
     );
 }
 
+/// The v3 → v4 transition specifically: a namespace written before the
+/// bf16-mirror codecs moved their block payload must be reclaimed.
+///
+/// This is not covered by `wipe_removes_superseded_schema_namespace`, which
+/// seeds v2 and would keep passing at any later version. It pins the one
+/// transition whose stakes are not merely stranded bytes: a v3 block for
+/// `K8V8` (or any other mirror-family codec) holds codes + scales under its
+/// codec tag, and the `(hash, layout_key)` key did not change — so left in
+/// place it is a live *hit* that hydrates store-backed with no bf16 mirror.
+/// The request then decodes off dequantised numbers while the same prompt
+/// served from RAM decodes bf16, and nothing errors or logs. The version bump
+/// is the only thing standing between that block and a reader.
+///
+/// Mutation check: put `SCHEMA_VERSION` back to 3 and the seeded namespace is
+/// `found == SCHEMA_VERSION`, so the pass skips it and the directory survives.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "fixture setup under a temp dir this test owns; a failure is a broken fixture, not a condition under test"
+)]
+fn wipe_removes_the_pre_none_bf16_block_format_namespace() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let kv_root = tmp.path().to_path_buf();
+    let pre_change = seed_namespace_at_version(&kv_root, "wipe-v3", 3);
+    let current = seed_current_schema_namespace(&kv_root, "keep-current");
+
+    wipe_stale_schema_namespaces(&kv_root);
+
+    assert!(
+        !pre_change.exists(),
+        "a namespace at the pre-`none_bf16` block format must be removed, not \
+         served: its blocks hit under an unchanged key and hydrate store-backed"
+    );
+    assert!(
+        current.exists(),
+        "current-schema namespace must survive the same pass"
+    );
+}
+
 /// A namespace written by a **newer** binary must survive. Two rMLX builds on
 /// one machine at different schema versions is the ordinary case here (a
 /// tap-installed release beside a dev build), and wiping forward means the

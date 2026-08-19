@@ -1595,9 +1595,20 @@ fn roundtrip_none_bf16_payload_via_spill_hydrate() {
         let v_ref = to_vec(&v_bf16.astype(Dtype::F32, device).unwrap());
         want.push((k_ref, v_ref));
 
-        let cache = KvCache::with_quant_max_seq(KvQuant::None, 4096)
-            .with_layer_idx(layer as usize)
-            .with_decode_fp16_seed(k_bf16, v_bf16);
+        // Built the way `read_caches` builds a hydrated layer: `from_storage`
+        // carries the offset, `with_decode_fp16_seed` attaches the mirror. The
+        // offset matters — the spill writer records one `seq_len` for the whole
+        // block, so it refuses a cache whose mirror and offset disagree, and a
+        // fixture that leaves the offset at 0 is describing a cache that cannot
+        // arise.
+        let cache = KvCache::from_storage(
+            KvStorage::None { max_seq: 4096 },
+            KvQuant::None,
+            shape[2],
+            layer as usize,
+            DispatchPolicy::default(),
+        )
+        .with_decode_fp16_seed(k_bf16, v_bf16);
         kv_caches.push(cache);
     }
 
@@ -1735,15 +1746,122 @@ fn roundtrip_mirror_codec_spills_and_hydrates_as_bf16() {
     }
 }
 
-/// A mirror grown past its filled length is refused, not persisted with its tail.
+/// A second prefill on a cache that arrived carrying a packed store must not
+/// leave that store behind, or the tier spills a block shorter than the prompt
+/// it is keyed by.
+///
+/// The reachable shape: an SSD-hydrated entry comes back store-backed (that is
+/// what a block written before the mirror codecs moved to `none_bf16` looks
+/// like), the prompt cache deep-clones it, and the request extends the prompt.
+/// `enter_prefill` does not clear `storage`, and every `exit_prefill` arm that
+/// builds a store *replaces* the payload — so a codec that now skips the build
+/// has to clear it instead, or the store survives at the OLD length beside a
+/// mirror at the new one. The spill writer prefers the store whenever it is
+/// populated (`geometry_only_max_seq` is `None` while `k.is_some()`), so the
+/// block would be written under the extended prompt's hash while holding only
+/// the prefix, and `META_SEQ_LEN` is a max across layers, so hydrate hands that
+/// back as the whole cache's offset with no error.
+///
+/// The assertion is on the length the block claims, not on its content: the
+/// re-prefill's own mirror semantics are a separate question, and pinning them
+/// here would make this test fail for a reason it is not about.
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn tail_extended_store_backed_cache_does_not_spill_a_short_block() {
+    let device = Device::Cpu;
+    let prefix_shape = [1i32, 2, 32, 128];
+    let n: usize = prefix_shape.iter().map(|&x| x as usize).product();
+
+    // (1) A store-backed cache, the shape `KvCache::from_storage` produces on a
+    // hydrate: payload present, no bf16 mirror. Built by driving the codec body
+    // directly (no prefill bracket), which is the same path a hydrated cache
+    // decodes on.
+    let mut hydrated = KvCache::with_quant_max_seq(KvQuant::K8V8, 4096);
+    hydrated
+        .update(
+            &arr(&lcg(n, 0x1111), &prefix_shape),
+            &arr(&lcg(n, 0x2222), &prefix_shape),
+            device,
+        )
+        .unwrap();
+    let prefix_len = hydrated.offset();
+    assert_eq!(prefix_len, prefix_shape[2], "prefix length");
+    assert!(
+        hydrated.storage().geometry_only_max_seq().is_none(),
+        "precondition: the fixture must actually carry a packed store, or this \
+         test cannot observe it surviving"
+    );
+
+    // (2) The prompt cache deep-clones the entry, and (3) the request extends
+    // the prompt: a second prefill on the clone.
+    let mut reused = hydrated.try_deep_clone().unwrap();
+    let tail_shape = [1i32, 2, 16, 128];
+    let n_tail: usize = tail_shape.iter().map(|&x| x as usize).product();
+    reused.enter_prefill();
+    reused
+        .update(
+            &arr(&lcg(n_tail, 0x3333), &tail_shape),
+            &arr(&lcg(n_tail, 0x4444), &tail_shape),
+            device,
+        )
+        .unwrap();
+    reused.exit_prefill(device).unwrap();
+
+    let extended_len = prefix_shape[2] + tail_shape[2];
+    assert_eq!(reused.offset(), extended_len, "offset after the extension");
+
+    // (4) Spill. The symptom first: the block must describe the cache it came
+    // from. A surviving store makes this the stale prefix length.
+    let path = tmp_path("tail_extended_store");
+    let stale_storage = reused.storage().geometry_only_max_seq().is_none();
+    write_caches(&path, device, MODEL_ID, KvQuant::K8V8, &[reused], &[]).unwrap();
+    let (rebuilt, _lin) = read_caches(
+        &path,
+        device,
+        MODEL_ID,
+        KvQuant::K8V8,
+        DispatchPolicy::default(),
+    )
+    .unwrap();
+    let hydrated_len = rebuilt[0].offset();
+    let mirror_restored = rebuilt[0].decode_fp16_kv().is_some();
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(
+        hydrated_len, extended_len,
+        "the spilled block must hold the whole extended prompt ({extended_len} \
+         tokens), not the stale store's prefix"
+    );
+    assert!(
+        mirror_restored,
+        "the extended cache spills its mirror, so hydrate must re-seed it"
+    );
+    // And the root cause, so a fix that papers over the symptom in the writer
+    // instead of clearing at the source does not satisfy this test.
+    assert!(
+        !stale_storage,
+        "a codec that builds no store must not leave a stale one behind: the \
+         storage still claimed a payload after the second prefill"
+    );
+}
+
+/// A mirror grown past its filled length fails the spill, it is not persisted
+/// with its tail.
 ///
 /// The first decode step expands the mirror from the compact prefill seed to
-/// the `max_seq` ceiling, so from then on the buffer's `shape[2]` is the ceiling
-/// and everything past `offset` is zeros. The writer reads the layer's `seq_len`
-/// off that shape, so persisting the buffer as-is would record the ceiling as
+/// the `max_seq` ceiling, so from then on the buffer's `shape[2]` is the
+/// ceiling and everything past `offset` is zeros. The writer reads the layer's
+/// `seq_len` off that shape, so persisting it as-is would record the ceiling as
 /// live KV and hydrate a cache whose offset sits thousands of tokens past its
-/// real content. Compacting it would need a device the drain thread does not
-/// have, so the layer spills as geometry-only instead: lossy, never wrong.
+/// real content. Compacting it needs a device the drain thread does not have,
+/// so the spill is refused.
 #[test]
 #[allow(
     clippy::indexing_slicing,
@@ -1760,10 +1878,109 @@ fn roundtrip_mirror_codec_spills_and_hydrates_as_bf16() {
 fn decode_expanded_mirror_is_refused_rather_than_spilled_with_its_tail() {
     let device = Device::Cpu;
     const MAX_SEQ: i32 = 4096;
+
+    let cache = expanded_mirror_cache(device, MAX_SEQ);
+    let filled = cache.offset();
+    let (k_live, _) = cache.decode_fp16_kv().expect("mirror is live");
+    assert_eq!(
+        k_live.shape()[2],
+        MAX_SEQ,
+        "precondition: the decode step must have expanded the mirror to the ceiling — \
+         without that this test cannot observe the refusal"
+    );
+    assert_ne!(filled, MAX_SEQ, "precondition: offset is below the ceiling");
+
+    let path = tmp_path("expanded_mirror");
+    let err = write_caches(&path, device, MODEL_ID, KvQuant::K8V8, &[cache], &[])
+        .expect_err("an expanded mirror must not be spilled");
+    assert!(
+        format!("{err}").contains("Refusing the block"),
+        "the refusal must name itself; got: {err}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// One expanded layer fails the block, it does not quietly drop that layer.
+///
+/// This is the shape the per-layer refusal was dangerous in and the
+/// single-layer test cannot see: `META_SEQ_LEN` is a max across layers and
+/// hydrate applies that one offset to EVERY reconstructed layer, so a block
+/// written with layer 0 compact at `S` and layer 1 dropped would hand layer 1
+/// back claiming `S` tokens while holding nothing at all. Today the arches move
+/// their non-rotating layers in lockstep, so the mixed shape does not arise on
+/// a serve — which is exactly why it has to be pinned here rather than left to
+/// the first caller that breaks the lockstep.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+#[allow(
+    clippy::expect_used,
+    reason = "test assertion: the refusal is the behaviour under test, so a panic with the diagnostic message is the intended outcome"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+fn expanded_mirror_in_one_layer_fails_the_whole_block() {
+    let device = Device::Cpu;
+    const MAX_SEQ: i32 = 4096;
     let shape = [1i32, 2, 32, 128];
     let n: usize = shape.iter().map(|&x| x as usize).product();
 
-    let mut cache = KvCache::with_quant_max_seq(KvQuant::K8V8, MAX_SEQ);
+    // Layer 0: compact — a perfectly spillable mirror.
+    let mut compact = KvCache::with_quant_max_seq(KvQuant::K8V8, MAX_SEQ).with_layer_idx(0);
+    compact.enter_prefill();
+    compact
+        .update(
+            &arr(&lcg(n, 0x1234), &shape),
+            &arr(&lcg(n, 0x5678), &shape),
+            device,
+        )
+        .unwrap();
+    compact.exit_prefill(device).unwrap();
+    assert_eq!(
+        compact.decode_fp16_kv().expect("mirror").0.shape()[2],
+        shape[2],
+        "precondition: layer 0's mirror is compact"
+    );
+
+    // Layer 1: decode-expanded — the one the writer cannot represent.
+    let expanded = expanded_mirror_cache(device, MAX_SEQ).with_layer_idx(1);
+
+    let path = tmp_path("mixed_expanded");
+    let err = write_caches(
+        &path,
+        device,
+        MODEL_ID,
+        KvQuant::K8V8,
+        &[compact, expanded],
+        &[],
+    )
+    .expect_err("one unrepresentable layer must fail the whole block");
+    assert!(
+        format!("{err}").contains("Refusing the block"),
+        "the refusal must name itself; got: {err}"
+    );
+    assert!(
+        !path.exists(),
+        "a refused block must leave no file for the index to point at"
+    );
+}
+
+/// A `K8V8` cache driven through prefill plus one decode step, so its bf16
+/// mirror has been expanded to `max_seq` while `offset` sits below it.
+#[allow(
+    clippy::unwrap_used,
+    reason = "fixture setup under a temp dir this test owns; a failure is a broken fixture, not a condition under test"
+)]
+fn expanded_mirror_cache(device: Device, max_seq: i32) -> KvCache {
+    let shape = [1i32, 2, 32, 128];
+    let n: usize = shape.iter().map(|&x| x as usize).product();
+
+    let mut cache = KvCache::with_quant_max_seq(KvQuant::K8V8, max_seq);
     cache.enter_prefill();
     cache
         .update(
@@ -1784,39 +2001,7 @@ fn decode_expanded_mirror_is_refused_rather_than_spilled_with_its_tail() {
             device,
         )
         .unwrap();
-
-    let filled = cache.offset();
-    assert_eq!(filled, shape[2] + 1, "offset after one decode step");
-    let (k_live, _) = cache.decode_fp16_kv().expect("mirror is live");
-    assert_eq!(
-        k_live.shape()[2],
-        MAX_SEQ,
-        "precondition: the decode step must have expanded the mirror to the ceiling — \
-         without that this test cannot observe the refusal"
-    );
-
-    let path = tmp_path("expanded_mirror");
-    write_caches(&path, device, MODEL_ID, KvQuant::K8V8, &[cache], &[]).unwrap();
-    let (hydrated, _lin) = read_caches(
-        &path,
-        device,
-        MODEL_ID,
-        KvQuant::K8V8,
-        DispatchPolicy::default(),
-    )
-    .unwrap();
-    assert_eq!(
-        hydrated[0].offset(),
-        0,
-        "an expanded mirror must spill as geometry-only (seq_len 0), never with the \
-         ceiling recorded as its filled length"
-    );
-    assert!(
-        hydrated[0].decode_fp16_kv().is_none(),
-        "geometry-only means no payload came back"
-    );
-
-    let _ = std::fs::remove_file(&path);
+    cache
 }
 
 /// The hydrate bridge must hand back the caller's `DispatchPolicy`, not the
@@ -2147,6 +2332,82 @@ fn c2_planar_hydrate_round_trip_no_panic() {
 ///    the raw GPU-word bytes as a CPU `PlanarBlocks` and the CPU
 ///    `planar_dequantize` decodes them.
 ///
+/// Bracketed GPU counterpart: a **prefilled** Planar3 cache on the GPU spills
+/// through the bf16 route, and the round trip is exact.
+///
+/// The cross-path test below drives the codec body unbracketed so there are
+/// GPU-encoded codes to cross to the CPU dequant. That is the right subject for
+/// the byte-convention question, but it means the GPU spill/hydrate of a
+/// PREFILLED cache — the shape this change actually moved — would otherwise be
+/// exercised by no gate at all.
+///
+/// Requires Metal / Apple-Silicon GPU.
+#[test]
+#[ignore = "GPU Metal context — run: cargo test -p rmlx-kv-ssd planar3 -- --ignored --test-threads=1"]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+#[allow(
+    clippy::expect_used,
+    reason = "test assertion: a missing bf16 mirror is exactly the failure this test must surface, so a panic with the diagnostic message is the intended outcome"
+)]
+fn planar3_prefilled_gpu_spill_hydrate_is_bf16_and_exact() {
+    let device = Device::Gpu;
+    let shape = [1i32, 2, 128, 128];
+    let n: usize = shape.iter().map(|&x| x as usize).product();
+
+    let mut c = KvCache::with_quant_max_seq(KvQuant::Planar3, 4096);
+    c.enter_prefill();
+    c.update(
+        &arr(&lcg(n, 0xB0B0_1234), &shape),
+        &arr(&lcg(n, 0xB0B0_1234 ^ 0x5EED), &shape),
+        device,
+    )
+    .unwrap();
+    c.exit_prefill(device).unwrap();
+
+    assert_eq!(
+        c.storage().resident_bytes(),
+        0,
+        "a prefilled Planar3 cache decodes off the mirror, so it holds no store"
+    );
+    let (k_live, v_live) = c.decode_fp16_kv().expect("mirror is live after prefill");
+    let want_k = to_vec(&k_live.astype(Dtype::F32, device).unwrap());
+    let want_v = to_vec(&v_live.astype(Dtype::F32, device).unwrap());
+
+    let path = tmp_path("planar3_prefilled");
+    write_caches(&path, device, MODEL_ID, KvQuant::Planar3, &[c], &[]).unwrap();
+    let (rebuilt, _lin) = read_caches(
+        &path,
+        device,
+        MODEL_ID,
+        KvQuant::Planar3,
+        DispatchPolicy::default(),
+    )
+    .unwrap();
+    assert_eq!(rebuilt[0].offset(), shape[2], "spilled length");
+    let (k_hyd, v_hyd) = rebuilt[0]
+        .decode_fp16_kv()
+        .expect("hydrate must re-seed the mirror");
+    assert_eq!(
+        to_vec(&k_hyd.astype(Dtype::F32, device).unwrap()),
+        want_k,
+        "K must round-trip bit-exact through the tier"
+    );
+    assert_eq!(
+        to_vec(&v_hyd.astype(Dtype::F32, device).unwrap()),
+        want_v,
+        "V must round-trip bit-exact through the tier"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
 /// Reference is the GPU's own dequant of the same codes (the GPU codec is
 /// path-fixed — it was correct before and after the fix). The CPU-hydrated V is
 /// compared against it.

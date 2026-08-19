@@ -28,6 +28,9 @@ KV byte accounting mirrors the engine, not a re-invention:
     crates/rmlx-kv-quant/src/quant.rs      KvQuant::decode_reads_packed_store /
         materialises_packed_store -- a codec that reads no store gets none
         built, so its resident KV is the two bf16 mirrors and nothing more.
+        `_DECODE_READS_PACKED_STORE` below is that match transcribed arm for
+        arm; it is a second producer with no gate keeping it in sync, so diff
+        it against the Rust when either moves.
     crates/rmlx-models/src/kv_cache/mod.rs:229  kv_codec_net_saving_total
         (per-layer loop: windowed layers clamp seq to the window and are
         always bf16; global layers take the codec formula)
@@ -267,18 +270,40 @@ def _side_bytes(c: Codec, bits: int, elems: int, n_tokens: int, head_dim: int,
     return stored + (elems * BF16 if retains_seed else 0)
 
 
-def materialises_packed_store(kind: str) -> bool:
-    """Mirror of `KvQuant::materialises_packed_store`.
+# quant.rs -- KvQuant::decode_reads_packed_store. Transcribed ARM FOR ARM from
+# the Rust match so the two can be diffed by eye; do not derive it from the
+# _NO_BF16_* sets, which happen to overlap it today and would silently
+# misclassify the first codec that reads its store AND keeps both mirrors --
+# precisely the case the Rust predicate exists to express.
+_DECODE_READS_PACKED_STORE = {
+    # quantized-SDPA over the affine 3-tuples, appended per step
+    "Mixed", "RotK", "RotKTq4V",
+    # K re-quantised into the packed store every decode step
+    "IsoKOnly3", "IsoKOnly4", "RotorKOnly3", "RotorKOnly4",
+    # flash decode straight off both packed rings
+    "Iso3Sym", "Iso4Sym", "Rotor3Sym", "Rotor4Sym",
+}
 
-    A codec that feeds both axes from the bf16 mirror and has no decode path
-    over its packed store never gets one built: `exit_prefill` skips the bulk
-    encode, so its resident KV is the two mirrors and nothing else. The three
-    membership sets below reproduce `decode_reads_packed_store()` exactly --
-    quantized-SDPA over the affine tuples, K re-quantised per step, and flash
-    decode off both packed rings.
+
+def decode_reads_packed_store(kind: str) -> bool:
+    """Mirror of `KvQuant::decode_reads_packed_store` (quant.rs)."""
+    return kind in _DECODE_READS_PACKED_STORE
+
+
+def materialises_packed_store(kind: str) -> bool:
+    """Mirror of `KvQuant::materialises_packed_store` (quant.rs).
+
+    Rust: `decode_reads_packed_store() || !feeds_bf16_k || !feeds_bf16_v`. A
+    codec that feeds both axes from the bf16 mirror and has no decode path over
+    its packed store never gets one built -- `exit_prefill` skips the bulk
+    encode, so its resident KV is the two mirrors and nothing else.
+
+    This is a SECOND producer of a classification whose first producer is the
+    Rust enum, and nothing gates them against each other. When a codec is added
+    or reclassified, both move together or this roofline is off by a full store
+    per layer, silently, in a direction that flatters the codec.
     """
-    return (kind in _READS_PACKED
-            or kind == "RotKTq4V"
+    return (decode_reads_packed_store(kind)
             or kind in _NO_BF16_K
             or kind in _NO_BF16_V)
 

@@ -66,6 +66,63 @@ fn build_kvcache(seq: i32, seed: u64) -> KvCache {
     c
 }
 
+/// Bracketed counterpart to `build_kvcache`: the production prefill path.
+///
+/// `build_kvcache` deliberately skips the prefill bracket so the fixtures below
+/// have a packed store to round-trip. That leaves the path a real serve takes
+/// uncovered in this file, so it is asserted here: a prefilled `K8V8` cache
+/// spills through the bf16 route instead, and the round trip is exact.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn prefilled_cache_spills_through_the_bf16_route_not_the_store() {
+    let device = Device::Cpu;
+    let tmp = TempDir::new().unwrap();
+    let shape = [1i32, 2, 64, 128];
+    let n: usize = shape.iter().map(|&x| x as usize).product();
+
+    let mut cache = KvCache::with_quant_max_seq(QUANT, 4096);
+    cache.enter_prefill();
+    cache
+        .update(
+            &arr(&lcg(n, 0x2468), &shape),
+            &arr(&lcg(n, 0x1357), &shape),
+            device,
+        )
+        .unwrap();
+    cache.exit_prefill(device).unwrap();
+    assert_eq!(
+        cache.storage().resident_bytes(),
+        0,
+        "a prefilled K8V8 cache holds no packed store"
+    );
+
+    let path = tmp.path().join("prefilled.kvb");
+    write_caches(&path, device, MODEL_ID, QUANT, &[cache], &[]).unwrap();
+    let (rebuilt, _lin) =
+        crate::block_io::read_caches(&path, device, MODEL_ID, QUANT, DispatchPolicy::default())
+            .unwrap();
+    assert_eq!(
+        rebuilt[0].offset(),
+        shape[2],
+        "the spilled block must carry the prefill's full length"
+    );
+    assert!(
+        rebuilt[0].decode_fp16_kv().is_some(),
+        "hydrate must re-seed the mirror the block carried"
+    );
+}
+
 /// (a): a block written by `write_caches` + recorded in the index is read
 /// back by `SsdHydrator::lookup`, reconstructing a KV cache whose K dequant
 /// matches the spilled one within the fp tolerance.

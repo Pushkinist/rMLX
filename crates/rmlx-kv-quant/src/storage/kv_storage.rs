@@ -1760,6 +1760,110 @@ impl KvStorage {
         }
     }
 
+    /// Drop every packed payload this variant holds, leaving its geometry
+    /// (`max_seq`, bit widths, group sizes) intact.
+    ///
+    /// `exit_prefill` calls this on the path where it decides **not** to build
+    /// a store, and that is not housekeeping: `enter_prefill` does not clear
+    /// `storage`, so a cache that already carries a payload — an SSD-hydrated
+    /// entry that was deep-cloned and tail-extended — would otherwise come out
+    /// of the second prefill holding a store of the *old* length beside a
+    /// mirror of the new one. The spill writer prefers the store whenever it is
+    /// populated, so that block would be written under the full prompt's hash
+    /// while holding only the prefix, and hydrate would hand it back with a
+    /// shorter `offset` and no error anywhere. Clearing at the source removes
+    /// the divergence instead of teaching each reader to detect it.
+    ///
+    /// Exhaustive on purpose: a new payload slot on any variant must be
+    /// classified here, or a stale copy of it survives the skip.
+    pub fn clear_payload(&mut self) {
+        match self {
+            KvStorage::None { .. } => {}
+            KvStorage::K8V4 { k, v, .. }
+            | KvStorage::K8VTurbo3 { k, v, .. }
+            | KvStorage::K8VTurbo3Tcq { k, v, .. }
+            | KvStorage::K8VTurbo2 { k, v, .. }
+            | KvStorage::K8VTurbo2Tcq { k, v, .. } => {
+                *k = None;
+                *v = None;
+            }
+            KvStorage::K8V8 { k, v, .. } => {
+                *k = None;
+                *v = None;
+            }
+            KvStorage::Planar { k, v, .. } => {
+                *k = None;
+                *v = None;
+            }
+            KvStorage::PlanarK { k, .. } => *k = None,
+            KvStorage::TurboSym3 { k, v, .. } => {
+                *k = None;
+                *v = None;
+            }
+            KvStorage::TurboSym4 { k, v, .. } => {
+                *k = None;
+                *v = None;
+            }
+            KvStorage::IsoV3 { k, v, .. } => {
+                *k = None;
+                *v = None;
+            }
+            KvStorage::IsoV4 { k, v, .. } => {
+                *k = None;
+                *v = None;
+            }
+            KvStorage::IsoSym3 { k, v, .. } => {
+                *k = None;
+                *v = None;
+            }
+            KvStorage::IsoSym4 { k, v, .. } => {
+                *k = None;
+                *v = None;
+            }
+            KvStorage::IsoKOnly3 { k, .. } => *k = None,
+            KvStorage::IsoKOnly4 { k, .. } => *k = None,
+            KvStorage::RotorV3 { k, v, .. } => {
+                *k = None;
+                *v = None;
+            }
+            KvStorage::RotorV4 { k, v, .. } => {
+                *k = None;
+                *v = None;
+            }
+            KvStorage::RotorSym3 { k, v, .. } => {
+                *k = None;
+                *v = None;
+            }
+            KvStorage::RotorSym4 { k, v, .. } => {
+                *k = None;
+                *v = None;
+            }
+            KvStorage::RotorKOnly3 { k, .. } => *k = None,
+            KvStorage::RotorKOnly4 { k, .. } => *k = None,
+            KvStorage::RotorKAsym3 { k, v, .. } => {
+                *k = None;
+                *v = None;
+            }
+            KvStorage::RotorKAsym4 { k, v, .. } => {
+                *k = None;
+                *v = None;
+            }
+            // Payload is not an `Option`; each owns a `reset`.
+            KvStorage::Mixed { state, .. } => state.reset(),
+            KvStorage::RotKTq4V { k_state, v, .. } => {
+                k_state.reset();
+                *v = None;
+            }
+            KvStorage::Paged {
+                k, v_k8, v_planar, ..
+            } => {
+                *k = None;
+                *v_k8 = None;
+                *v_planar = None;
+            }
+        }
+    }
+
     /// `Some(max_seq)` when this layer holds **no packed payload**, so the only
     /// thing there is to persist about it is its geometry.
     ///

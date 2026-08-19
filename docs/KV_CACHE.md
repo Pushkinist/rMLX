@@ -1152,9 +1152,12 @@ per-codec kernel work (#45, #353) and is what flipping
 `decode_reads_packed_store()` would then unlock. Two consumers of the store had
 to stay live and did:
 
-* **A cache with no mirror** — one reconstructed by `KvCache::from_storage`, a
-  `Device::Cpu` run, or any cache that never bracketed a prefill — still builds
-  and reads its store through the codec body. Nothing about those paths changed.
+* **A cache with no mirror** — one reconstructed by `KvCache::from_storage`, or
+  any cache that never bracketed a prefill — still builds and reads its store
+  through the codec body. Nothing about those paths changed. The device is not
+  part of this: the gate in `exit_prefill` has none, and neither do the
+  `feeds_bf16_*` predicates, so a `Device::Cpu` run that brackets a prefill gets
+  the same mirrors and the same absent store as a GPU one.
 * **The SSD tier**, which serialises the store. A mirror-family layer now spills
   its bf16 mirror under the existing `none_bf16` tag instead (see
   `docs/SSD_TIER.md`); hydrate re-seeds the mirror, so a hydrated cache decodes

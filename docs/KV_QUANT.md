@@ -830,8 +830,9 @@ the rate. Measured, not modelled — `kv_rate_tests.rs` reads the bytes
   reports that directly and its old store sub-term — 5.0 bits per value against
   a measured 22.0, off by 4.4× and wrong in the codec's favour — no longer
   enters the figure for this codec. The 22.0-bit rate still governs a
-  store-backed planar cache: an SSD block written by a `Device::Cpu` or seedless
-  run, and the resident bytes of any future decode path that reads the store.
+  store-backed planar cache: a seedless one (hydrated, or never through a
+  prefill bracket), and the resident bytes of any future decode path that reads
+  the store.
 
 **Arch defaults**: `Gemma3ForConditionalGeneration`;
 `Gemma4ForConditionalGeneration` (dense, hidden_size ≥ 5376); auto-by-ctx at
@@ -3281,9 +3282,15 @@ So the live paths are the ones with **no** bf16 seed:
   The hydrated prefix arrives as a single block, so any trim inside it is a
   mid-block cut. This is the path the round-trip tests in
   `rmlx-kv-ssd/src/hydrate_tests.rs` drive.
-- **A `Device::Cpu` run**, where there is no GPU mirror at all.
 - **Any cache that never bracketed a prefill**, and so never reached
   `exit_prefill` to be seeded.
+
+The device is not one of them. The `exit_prefill` gate has no device arm and
+neither do the `feeds_bf16_*` predicates, so a `Device::Cpu` run that brackets a
+prefill lands on the same mirrors and the same absent store as a GPU one — which
+is what the CPU-device sweep in
+`warm_ttft_cross_codec_tests::exit_prefill_builds_a_store_exactly_when_the_predicate_says_so`
+asserts over every codec.
 
 The store is also still read *without* a decode step in two places, and they
 matter for the codecs that still have one — the K-only and fused-symmetric

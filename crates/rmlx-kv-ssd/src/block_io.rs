@@ -337,12 +337,18 @@ pub fn write_caches(
 /// array it hands on must already be materialised, in row-major order, at
 /// exactly the length it should be persisted at. `exit_prefill` guarantees the
 /// first two (it stores the seed through `Array::contiguous`). The third is
-/// checked rather than fixed: the writer reads the layer's `seq_len` off the
-/// buffer's own `shape[2]`, so a mirror the decode loop has grown to the
-/// `max_seq` ceiling would persist its zeroed tail as live KV and hydrate a
-/// cache whose offset sits past its real content. Slicing it here would need a
-/// device. Such a layer is refused instead — it spills as geometry-only and
-/// re-prefills on reuse, which is lossy but never wrong.
+/// checked rather than fixed, and the check **fails the whole block** rather
+/// than dropping the layer: the writer reads each layer's `seq_len` off its own
+/// buffer, but `META_SEQ_LEN` is a single max across layers that hydrate then
+/// applies to every reconstructed layer. Dropping one layer's payload would
+/// therefore hand that layer back claiming the block's full offset while
+/// holding nothing — a frozen cache with zero content and no error. Refusing
+/// the block costs one re-prefill; refusing the layer costs correctness.
+/// Compacting the mirror instead would need a device this thread does not have.
+///
+/// The comparison is `!=`, not `<`: a cache whose `offset` runs *past* its
+/// mirror is equally inconsistent, and spilling the short buffer under the
+/// longer claim is the same defect in the other direction.
 fn none_bf16_payloads(kv_caches: &[KvCache]) -> Result<Vec<NoneBf16Seed>> {
     kv_caches
         .iter()
@@ -354,15 +360,15 @@ fn none_bf16_payloads(kv_caches: &[KvCache]) -> Result<Vec<NoneBf16Seed>> {
                 return Ok(None);
             };
             let buf_seq = k.shape().get(2).copied().unwrap_or(0);
-            if c.offset() > 0 && c.offset() < buf_seq {
-                tracing::warn!(
-                    layer = c.layer_idx(),
-                    offset = c.offset(),
-                    buf_seq,
-                    "kv-spill: bf16 mirror is longer than its filled length — spilling \
-                     this layer as geometry-only rather than persisting its zeroed tail"
-                );
-                return Ok(None);
+            if c.offset() != buf_seq {
+                return Err(Error::Mlx(format!(
+                    "kv-spill: layer {} bf16 mirror is {buf_seq} tokens against an \
+                     offset of {}; the block records one seq_len for every layer, so \
+                     spilling this one would hydrate a layer holding nothing at the \
+                     block's length. Refusing the block.",
+                    c.layer_idx(),
+                    c.offset(),
+                )));
             }
             // Ref-count clone only (mlx-c is COW); host materialisation happens
             // later in `OwnedTensor::from_array`.
@@ -632,11 +638,13 @@ fn write_layer(
         let Some((k, v)) = none_bf16 else {
             return Ok((format!("{{\"tag\":\"none\",\"max_seq\":{max_seq}}}"), 0));
         };
-        // `seq` is taken as the buffer's filled length, so the caller must hand
-        // over a mirror compacted to `offset` — `none_bf16_payloads` slices it.
-        // A decode-expanded buffer grown to the `max_seq` ceiling with a zeroed
-        // tail must never reach here, or that tail would be persisted as live
-        // KV and the reconstructed offset would be wrong.
+        // `seq` is the buffer's own length, and the block records one `seq_len`
+        // for every layer — so the mirror handed over must already equal the
+        // cache's `offset`. `none_bf16_payloads` enforces that by REFUSING the
+        // block when it does not (it cannot compact: no device on this thread).
+        // A decode-expanded buffer grown to the `max_seq` ceiling therefore
+        // never reaches here; if it did, its zeroed tail would be persisted as
+        // live KV.
         let seq = k.shape().get(2).copied().unwrap_or(0);
         out.push((format!("l{idx}.k.bf16"), OwnedTensor::from_array(k)?));
         out.push((format!("l{idx}.v.bf16"), OwnedTensor::from_array(v)?));

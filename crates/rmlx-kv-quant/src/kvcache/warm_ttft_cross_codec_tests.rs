@@ -259,6 +259,108 @@ fn rotor_k_only3_k_codec_seq(cache: &KvCache) -> i32 {
     }
 }
 
+/// Every codec, swept: `exit_prefill` builds a packed store if and only if
+/// `materialises_packed_store()` says so, and the cache's residency matches.
+///
+/// The three hand-written cases below observe `K8V4`, `K8V8` and `PlanarK` in
+/// detail — the codec-specific accessors make them worth keeping. But
+/// `exit_prefill`'s behaviour changed for **18** codecs, and a missed reader in
+/// any of the other 15 is silent by construction: nothing errors, the decode
+/// still works off the mirror, and only the residency moves. So the property is
+/// stated once over `ALL_KV_QUANTS`, with the expectation **derived from the
+/// predicate** rather than listed, which is what makes it exhaustive as new
+/// codecs land.
+///
+/// The residency oracle is a same-shape `KvQuant::None` cache, which shares no
+/// arithmetic with the code under test: a store-free codec must report exactly
+/// what plain bf16 reports.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+fn exit_prefill_builds_a_store_exactly_when_the_predicate_says_so() {
+    let device = Device::Cpu;
+
+    let prefill = |quant: KvQuant| -> KvCache {
+        let mut cache = KvCache::with_quant_max_seq(quant, TEST_MAX_SEQ);
+        cache.enter_prefill();
+        let shape = [1i32, TEST_KV_H, TEST_PREFILL_SEQ, TEST_HEAD_DIM];
+        let n: usize = shape.iter().map(|&d| d as usize).product();
+        cache
+            .update(
+                &f32_arr(&vec![0.123f32; n], &shape),
+                &f32_arr(&vec![0.456f32; n], &shape),
+                device,
+            )
+            .expect("prefill chunk");
+        cache.exit_prefill(device).expect("exit_prefill");
+        cache
+    };
+
+    // One decode step on top, because that is where a *missed reader* shows up:
+    // every codec body lazily allocates an empty store and appends to it when
+    // it is reached (`if k.is_none() { *k = Some(..) }`), so a decode path that
+    // still routes into the codec leaves bytes behind even though the prefill
+    // gate built nothing.
+    let decode_once = |cache: &mut KvCache| {
+        let step = [1i32, TEST_KV_H, 1, TEST_HEAD_DIM];
+        let n: usize = step.iter().map(|&d| d as usize).product();
+        cache
+            .update(
+                &f32_arr(&vec![0.789f32; n], &step),
+                &f32_arr(&vec![0.321f32; n], &step),
+                device,
+            )
+            .expect("decode step");
+    };
+
+    let mut bf16_cache = prefill(KvQuant::None);
+    decode_once(&mut bf16_cache);
+    let bf16_bytes = bf16_cache.resident_bytes();
+
+    for &quant in crate::ALL_KV_QUANTS {
+        // `KvQuant::None` takes the else branch and belongs there: it builds no
+        // store and its residency IS the bf16 baseline. Paged storage is a
+        // separate lifecycle selected by a CLI flag, not by the codec, and is
+        // off here.
+        let mut cache = prefill(quant);
+        let store_after_prefill = cache.storage().resident_bytes();
+
+        if quant.materialises_packed_store() {
+            // No decode step here: `Mixed` / `RotK` / `RotKTq4V` refuse
+            // `update()` by contract (they must go through `update_and_sdpa`),
+            // and the property under test on this branch is only that the store
+            // was built.
+            assert!(
+                store_after_prefill > 0,
+                "{quant:?} must build its packed store at exit_prefill — decode \
+                 reads it, or one of its axes has no mirror to read"
+            );
+        } else {
+            decode_once(&mut cache);
+            let store_bytes = cache.storage().resident_bytes();
+            assert_eq!(
+                store_after_prefill, 0,
+                "{quant:?} reads no packed store at decode, so exit_prefill must \
+                 build none — it built {store_after_prefill} bytes"
+            );
+            assert_eq!(
+                store_bytes, 0,
+                "{quant:?} allocated a packed store during decode — some decode \
+                 path still routes into the codec body, so the store it reads is \
+                 the one exit_prefill was told not to build"
+            );
+            assert_eq!(
+                cache.resident_bytes(),
+                bf16_bytes,
+                "{quant:?} holds only its two bf16 mirrors, so its residency must \
+                 equal plain bf16 at the same shape"
+            );
+        }
+    }
+}
+
 #[test]
 fn k8v4_warm_ttft_freezes_codec() {
     assert_shortcut_codec(KvQuant::K8V4, k8_codec_seq);

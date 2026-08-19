@@ -9,7 +9,7 @@
 
 use std::str::FromStr;
 
-use super::KvQuant;
+use super::{KvQuant, ALL_KV_QUANTS};
 
 /// Construct one representative instance of every `KvQuant` variant and assert
 /// `KvQuant::from_str(&q.to_string()) == Ok(q)`.
@@ -564,5 +564,83 @@ fn every_parseable_mixed_quantizes_a_side() {
                  it would read as a codec that quantizes nothing"
             );
         }
+    }
+}
+
+// ── The codec surface is swept exhaustively, by construction ─────────────────
+
+/// [`ALL_KV_QUANTS`] names every variant exactly once.
+///
+/// The oracle is `variant_index`, whose `match` the compiler checks: a variant
+/// added to the enum and not to the list leaves a hole in the index set here,
+/// and a variant added to neither fails to compile in `quant.rs`. Every sweep
+/// test below inherits its exhaustiveness from this one.
+#[test]
+fn all_kv_quants_names_every_variant_once() {
+    let mut seen: Vec<usize> = ALL_KV_QUANTS.iter().map(KvQuant::variant_index).collect();
+    seen.sort_unstable();
+    let n = seen.len();
+    seen.dedup();
+    assert_eq!(
+        seen.len(),
+        n,
+        "ALL_KV_QUANTS lists a variant twice: {ALL_KV_QUANTS:?}"
+    );
+    assert_eq!(
+        seen,
+        (0..n).collect::<Vec<_>>(),
+        "ALL_KV_QUANTS must cover every discriminant `variant_index` can return \
+         — a gap means a variant was added to the enum but not to the list"
+    );
+}
+
+/// A codec that builds no packed store must have a storage variant that can
+/// **report** that it holds none.
+///
+/// The two predicates live on different enums and nothing else couples them.
+/// `KvQuant::materialises_packed_store` decides whether `exit_prefill` builds a
+/// payload; `KvStorage::geometry_only_max_seq` is what the spill writer asks
+/// before it stamps a codec geometry. A codec classified `false` whose storage
+/// sits in the "payload is not an `Option`" arm (`Mixed | RotKTq4V | Paged`)
+/// compiles cleanly and makes the writer emit a codec tag with no tensors
+/// behind it — the reader then fails on `missing tensor 'lN.k.codes'`.
+///
+/// The storage is built through the same `KvStorage::new` the cache uses, so
+/// this is the real pairing and not a restatement of either predicate.
+#[test]
+fn a_storeless_codec_always_has_a_geometry_only_storage() {
+    for &q in ALL_KV_QUANTS {
+        if q.materialises_packed_store() {
+            continue;
+        }
+        let storage = crate::storage::KvStorage::new(q, 4096);
+        assert!(
+            storage.geometry_only_max_seq().is_some(),
+            "{q:?} builds no packed store, but its storage cannot report itself \
+             geometry-only — the spill writer would stamp a codec geometry with \
+             no tensors behind it"
+        );
+    }
+}
+
+/// A codec with no packed store reads a bf16 mirror on **both** axes.
+///
+/// `materialises_packed_store` is defined as
+/// `decode_reads_packed_store() || !feeds_bf16_k || !feeds_bf16_v`, so `false`
+/// implies both mirrors — which is what makes the byte estimate's
+/// "return the two mirrors" branch total. Stated over every variant here
+/// instead of as a `debug_assert` inside that branch, where it is both
+/// unreachable and compiled out under `release-perf`.
+#[test]
+fn a_storeless_codec_mirrors_both_axes() {
+    for &q in ALL_KV_QUANTS {
+        if q.materialises_packed_store() {
+            continue;
+        }
+        assert!(
+            q.feeds_bf16_k_at_decode() && q.feeds_bf16_v_at_decode(),
+            "{q:?} has no packed store and no mirror on one axis — that axis has \
+             nowhere to decode from"
+        );
     }
 }

@@ -200,6 +200,50 @@ fn rotor3_multi_layer_all_distinct() {
 /// pairwise distinct. This catches the layer-threading defect class at the
 /// integration layer: if the builder fails to thread `layer_idx`, every
 /// layer's table collapses to the `layer_idx=0` seed and these assertions fire.
+/// Bracketed counterpart: the same builder, driven through the **production**
+/// prefill path.
+///
+/// The unbracketed test below drives the codec body so a rotor table exists to
+/// compare. That leaves the path a real serve takes untested, which is exactly
+/// the path this change moved — so it is asserted here instead: a prefilled
+/// `Rotor3` cache builds no store at all, and its `layer_idx` still threads
+/// through the builder (the field the table is derived from).
+#[test]
+fn rotor3_multi_layer_prefill_builds_no_store_and_keeps_layer_idx() {
+    let n_layers = 4usize;
+    let device = Device::Cpu;
+    let head_dim = 64i32;
+    let shape = [1i32, 1, 2, head_dim];
+    let n: usize = shape.iter().map(|&x| x as usize).product();
+    let k_data = vec![0.1_f32; n];
+    let v_data = vec![0.2_f32; n];
+
+    for i in 0..n_layers {
+        let mut cache = KvCache::with_quant_max_seq(KvQuant::Rotor3, 1024).with_layer_idx(i);
+        cache.enter_prefill();
+        cache
+            .update(&f32_arr(&k_data, &shape), &f32_arr(&v_data, &shape), device)
+            .expect("prefill update");
+        cache.exit_prefill(device).expect("exit_prefill");
+
+        assert_eq!(
+            cache.layer_idx(),
+            i,
+            "builder must thread layer_idx through the prefill path too"
+        );
+        assert_eq!(
+            cache.storage().resident_bytes(),
+            0,
+            "layer {i}: Rotor3 decodes off the bf16 mirror, so a prefilled cache \
+             must hold no packed store — and therefore no rotor table"
+        );
+        assert!(
+            cache.decode_fp16_kv().is_some(),
+            "layer {i}: the mirror is what decode reads, so it must be live"
+        );
+    }
+}
+
 #[test]
 fn rotor3_multi_layer_builder_populates_distinct_tables() {
     let n_layers = 4usize;

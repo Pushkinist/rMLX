@@ -2733,6 +2733,16 @@ impl KvCache {
                 total_seq,
                 "exit_prefill: packed store skipped — decode reads the bf16 mirror only"
             );
+            // Not just "build nothing" — drop anything already there. Every
+            // arm below *replaces* the payload, so before this gate a second
+            // prefill on a cache that arrived carrying one (an SSD-hydrated
+            // entry, deep-cloned and tail-extended; `enter_prefill` does not
+            // clear `storage`) overwrote it. Returning early without clearing
+            // would leave a store of the old length beside a mirror of the new
+            // one, and the spill writer prefers the store — so the block would
+            // be written under the full prompt's hash while holding only the
+            // prefix.
+            self.storage.clear_payload();
             if let Some((k_seed, v_seed)) = decode_fp16_pair {
                 self.decode_fp16_k = k_seed;
                 self.decode_fp16_v = v_seed;
@@ -2740,7 +2750,29 @@ impl KvCache {
             return Ok(());
         }
 
+        // REACHABILITY, as of the gate above: only the arms for codecs whose
+        // `materialises_packed_store()` is true run. That is `Mixed`, `RotK`,
+        // `RotKTq4V`, `IsoKOnly3/4`, `RotorKOnly3/4`, `Iso3Sym`, `Iso4Sym`,
+        // `Rotor3Sym`, `Rotor4Sym` — nine of the arms below. The rest are the
+        // bf16-mirror family and the gate returns before them.
+        //
+        // They are kept, not deleted, because they ARE the re-enable path: a
+        // codec that grows a decode kernel over its own packed store flips one
+        // arm in `decode_reads_packed_store` and this bulk encode is what then
+        // fills the buffer that kernel reads (see `docs/KV_CACHE.md` §9.6 —
+        // `planar_flash_decode` and the fused quant-decode work are both
+        // waiting on exactly that flip). The hazard that creates is real: a
+        // flipped predicate re-arms code that has had no execution since. The
+        // pairing guard is
+        // `warm_ttft_cross_codec_tests::exit_prefill_builds_a_store_exactly_when_the_predicate_says_so`,
+        // which sweeps every variant and fails the moment a codec's arm and its
+        // classification disagree.
         match self.quant {
+            // ── mirror-family group: NOT reachable today ────────────────────
+            // The arms from here down that belong to the bf16-mirror family
+            // (`K8V8`, `K8V4`, `Planar*`, `PlanarK`, `K8VTurbo*`, `TurboSym*`,
+            // `Iso3/4`, `Rotor3/4`, `RotorK*Asym`) are behind the gate above.
+            // The nine listed there are the ones that still run.
             KvQuant::K8V8 => {
                 let max_seq = match &self.storage {
                     KvStorage::K8V8 { max_seq, .. } => *max_seq,
