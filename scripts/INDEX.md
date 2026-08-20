@@ -53,7 +53,7 @@ Conventions:
 
 | Script | Via | What it does |
 |---|---|---|
-| `perf_ab.sh` | `perf_canary.sh --ab` | **ABBA-interleaved A/B of two `rmlx baseline` arms.** Host-quiescence gate, arm-distinguishability guard, token-id comparison. |
+| `perf_ab.sh` | `perf_canary.sh --ab` | **ABBA-interleaved A/B of two `rmlx baseline` arms.** Host-quiescence gate, arm-distinguishability guard, token-id comparison, per-arm `metal_gen_alloc_mb` + resident `kv_cache_bytes`. Never writes `runs.db` — promote a result with `ingest/perf_ab_ingest.py`. |
 | `perf_ab_selftest.sh` | `make canary-ab-selftest` | Mutation check for `perf_ab.sh` — every guard must fail when broken. |
 | `bench_llama_ab_selftest.sh` | `make llama-ab-selftest` | Mutation check for `bench_llama_ab.sh` against a stub `llama-server` — 13 cases, one per guard. In `make ci`. |
 | `bench_llama_ab.sh` | — | **ABBA-interleaved A/B of two `llama-server` arms** (fork vs upstream, codec vs codec). Same quiescence discipline as `perf_ab.sh`, reported over the server's own `timings` plus KV-buffer and peak-RSS columns. Never writes `runs.db`. |
@@ -88,6 +88,7 @@ Conventions:
 |---|---|
 | `ingest/llama_bench_ingest.py` | Convert `llama-bench -o json` rows into the §8.5 universal RunRecord and ingest them. |
 | `ingest/llama_ab_ingest.py` | Promote one accepted `bench_llama_ab.sh` result into two §8.5 RunRecords (one per arm). Refuses a TAINTED run unless told otherwise. |
+| `ingest/perf_ab_ingest.py` | Promote one accepted `perf_ab.sh` result into two §8.5 RunRecords (one per arm), carrying `decode_tps_warm` + `kv_cache_bytes`. Identity comes from the measured binary; refuses a TAINTED run unless told otherwise. |
 | `lib/identity.sh` | Shared §8.5 run-identity (`rmlx metrics identity --json`) for bench scripts. **Source it.** |
 | `lib/prefill_ms.py` | Read `decode_profile{prefill_ms}` back out of an rmlx run log. |
 

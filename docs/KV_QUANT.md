@@ -3258,15 +3258,82 @@ first; judge a store repack on its memory merits, not on an expected decode win.
 `k8v4` and `tsym3` still produce a token digest **bit-identical to `none`** at
 4k / 16k / 32k on both architectures. A q8/q4/turbo3 store cannot reproduce bf16
 output bit-exactly over 64 greedy steps at 32k, so this is direct evidence that
-their quant store is not on the decode read path — the mirror is. They pay for
-the store in resident bytes (+26% and +16% at 32k on Bonsai) and in prefill
-(`tsym3` TTFT 23.1 s vs `none` 19.2 s at 32k) and get nothing back at decode.
+their quant store is not on the decode read path — the mirror is.
+
+**The resident-bytes half of that charge no longer applies.** It used to read
+"+26% and +16% at 32k on Bonsai", from a tree where `exit_prefill` built a
+packed store for every codec. It no longer builds one for a codec that reads
+only the mirror (`KvQuant::materialises_packed_store`), so `k8v4`, `tsym3` and
+`planar` now hold two bf16 mirrors and nothing else — resident KV **exactly
+equal to `none`**, byte for byte, at every context. Measured, not derived: at a
+3 770-token prompt `none`, `k8v8`, `k8v4`, `planar` and `tsym3` all report the
+identical `kv_cache_bytes` — **556 941 312** on Ternary-Bonsai-8B (`kv_h = 8`)
+and **31 629 312** on gemma-4-e2b (`kv_h = 1`, shared-KV), 5 codecs × 2
+architectures, no digit apart. What survives is the prefill cost of encoding a store nobody
+reads (`tsym3` TTFT 23.1 s vs `none` 19.2 s at 32k) and the decode-time cost of
+carrying a quantized layer type at all (≈0.041 ms/layer/step — see
+"`--kv-quant none` is a bf16 control").
 
 That remains a real defect. What the table above rules out is the *specific*
 remedy of pointing a hand-written flash-decode kernel at those stores: it has
 been built twice — TurboFlash for `k8v4`, the iso/rotor flash-decode pair for the
 eight `_sym` / K-only codecs — and both lose, for a reason that is structural and
 now quantified.
+
+### `kv_frac` bounds a codec claim — and is not a statement about context
+
+`kv_frac` is the KV share of a decode step's byte stream,
+`kv_bytes_step / (weight_bytes_step + kv_bytes_step)`. It is the ceiling on how
+much of decode any KV-codec change can possibly touch, and
+`scripts/perf_ceiling.py` prints it in the last column of every row.
+
+**It is a property of the (model, context) pair, not of the context.** At a
+4096-token prompt it spans 22× across the release set:
+
+| model | 4 096 | 8 192 | 32 768 | 131 072 |
+|---|---:|---:|---:|---:|
+| Qwen3.8-27B-mxfp8 (26.4 GB/step of weights) | 0.010 | 0.020 | 0.075 | 0.245 |
+| Qwen3.6-35B-A3B-8bit (MoE, 3.1 GB/step) | 0.026 | 0.051 | 0.177 | 0.462 |
+| gemma-4-e2b-mxfp8 (SWA on most layers) | 0.030 | 0.053 | 0.170 | 0.445 |
+| Ternary-Bonsai-8B-2bit (2.1 GB/step) | **0.221** | **0.362** | **0.694** | 0.901 |
+
+So "measured at 4k" and "measured where the codec axis is near-zero" are not
+the same qualifier, and a claim scoped by the first is not scoped by the
+second. A 2-bit 8B model at a 4k prompt already puts 22% of its decode bytes on
+the codec axis; a dense 27B at 131k puts 25%.
+
+**A large `kv_frac` is necessary, not sufficient.** Measured on this tree,
+`none` vs `mixed_k8g64_v4g64` ABBA-paired (`scripts/perf_ab.sh`, n=4/arm,
+TAINTED host — see docs/PERF_BASELINE.md for the cells and the taint):
+
+| model | prompt tok | `kv_frac` | predicted ceiling B/A | measured decode B/A | measured resident B/A |
+|---|---:|---:|---:|---|---:|
+| Ternary-Bonsai-8B | 3 770 | 0.211 | 1.099 | 0.949 INCONCLUSIVE | 1.287 |
+| Ternary-Bonsai-8B | 31 553 | **0.687** | **1.419** | 1.003 INCONCLUSIVE | 1.293 |
+| Qwen3.8-27B | 3 892 | 0.010 | 1.004 | 1.005 INCONCLUSIVE | 1.219 |
+| Qwen3.8-27B | 130 848 | 0.245 | 1.149 | **0.728 ranges disjoint** | 1.349 |
+
+Two rows carry the argument. The Bonsai **31 553** row is the high-`kv_frac`
+end: at 0.687 — the largest any release-set model reaches — a codec that cuts
+the decode KV stream to 0.571× and is predicted +42% moves decode by +0.3%,
+inside the noise, while costing +29% resident KV. The Qwen3.8 **130 848** row
+is the long-context end: `kv_frac` 0.245, predicted +14.9%, measured **−27.2%
+with the arms' per-slot ranges disjoint in the losing direction**, and +35%
+resident.
+
+The byte model is not what is wrong. At those offsets `perf_ceiling.py` puts
+arm A's resident KV at 4 667.3 MB against 4 667.3 MB measured on Bonsai, and on
+Qwen3.8 it is exact once the codec-independent GDN recurrent state that arch
+carries (a flat ~152–154 MB, identical on both arms at both contexts) is added
+back. What fails is the conversion of bytes into time — the ε of the section
+above, ≈0.04–0.135 on every path measured — and at the Qwen3.8 long cell the
+packed path does not merely fail to convert: it spends 48.8 ms/step of
+non-bandwidth work against `none`'s 14.7 ms, so halving the byte stream still
+loses.
+
+Read together with the ε table: **`kv_frac` bounds the prize, ε decides how much
+of it is collectable, and ε is the binding term.** State `kv_frac` next to a
+codec cell so a reader can see the bound; do not infer an effect from it.
 
 ---
 

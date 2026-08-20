@@ -39,14 +39,17 @@ mkdir -p "$STATE" "$MODEL" "$MODEL2"
 TOKENS_MAIN="11,22,33,44,55"
 TOKENS_ALT="11,22,99,44,55"
 
-# make_stub <name> <tps-csv> <gen_alloc_mb> <tokens> [drift_at_call] [omit]
+# make_stub <name> <tps-csv> <gen_alloc_mb> <tokens> [drift_at_call] [omit] [kv_bytes]
 #
 # The stub cycles through <tps-csv> across successive calls, so a run sees a
 # spread rather than a constant and the disjoint-range criterion is exercised
 # on real (if synthetic) variation. `drift_at_call` makes the Nth call emit
 # TOKENS_ALT instead. `omit` drops a required field from the output.
+# `kv_bytes` is the resident-KV column: a byte count, the literal `n/a` (the
+# baseline command's own refusal), or empty to drop the field entirely, which
+# is what an older binary looks like to this harness.
 make_stub() {
-	local name="$1" tps="$2" mem="$3" tokens="$4" drift="${5:-}" omit="${6:-}"
+	local name="$1" tps="$2" mem="$3" tokens="$4" drift="${5:-}" omit="${6:-}" kv="${7:-}"
 	local path="$WORK/$name"
 	cat >"$path" <<STUB
 #!/usr/bin/env bash
@@ -83,10 +86,12 @@ sleep 0.25
 if [ -n "$drift" ] && [ "\$n" = "$drift" ]; then tok="$TOKENS_ALT"; fi
 peak=100.0
 if [ "$omit" = "zeropeak" ]; then peak=0.0; fi
+kvcol=""
+if [ -n "$kv" ]; then kvcol="  kv_cache_bytes=$kv"; fi
 if [ "$omit" != "tps" ]; then
-  printf 'baseline: model=stub  load=1ms  ttft_ms=1  decode_tps=%s  overall_tps=%s  prefill_tps=1.0  prompt_tokens=4096  peak_rss=1.0MB  metal_peak_mb=%s  metal_gen_alloc_mb=%s\n' "\$v" "\$v" "\$peak" "$mem"
+  printf 'baseline: model=stub  load=1ms  ttft_ms=1  decode_tps=%s  overall_tps=%s  prefill_tps=1.0  prompt_tokens=4096  peak_rss=1.0MB  metal_peak_mb=%s  metal_gen_alloc_mb=%s%s\n' "\$v" "\$v" "\$peak" "$mem" "\$kvcol"
 else
-  printf 'baseline: model=stub  load=1ms  ttft_ms=1  prompt_tokens=4096  metal_peak_mb=%s  metal_gen_alloc_mb=%s\n' "\$peak" "$mem"
+  printf 'baseline: model=stub  load=1ms  ttft_ms=1  prompt_tokens=4096  metal_peak_mb=%s  metal_gen_alloc_mb=%s%s\n' "\$peak" "$mem" "\$kvcol"
 fi
 if [ "$omit" != "ids" ]; then printf 'baseline: token_ids=%s\n' "\$tok"; fi
 STUB
@@ -164,6 +169,13 @@ WRONG="$(make_stub wrong "100.0,100.5,101.0" 40.0 "$TOKENS_ALT")"
 DRIFTER="$(make_stub drifter "100.0,100.5,101.0" 40.0 "$TOKENS_MAIN" 3)"
 NO_TPS="$(make_stub no_tps "100.0" 40.0 "$TOKENS_MAIN" "" tps)"
 NO_IDS="$(make_stub no_ids "100.0" 40.0 "$TOKENS_MAIN" "" ids)"
+# Resident-KV column. KV_SMALL/KV_BIG carry byte counts a factor 2 apart;
+# KV_NA emits the baseline command's own `n/a` refusal; KV_ABSENT drops the
+# field, which is what a binary predating the column looks like.
+KV_SMALL="$(make_stub kv_small "100.0,100.5,101.0" 40.0 "$TOKENS_MAIN" "" "" 1000000123)"
+KV_BIG="$(make_stub kv_big "100.0,100.5,101.0" 40.0 "$TOKENS_MAIN" "" "" 2000000000)"
+KV_NA="$(make_stub kv_na "100.0,100.5,101.0" 40.0 "$TOKENS_MAIN" "" "" "n/a")"
+KV_ABSENT="$(make_stub kv_absent "100.0,100.5,101.0" 40.0 "$TOKENS_MAIN")"
 
 # Nothing on this host counts as busy unless a case says otherwise; the CPU
 # gate has its own cases below and must not make the others flaky.
@@ -196,6 +208,42 @@ check planted_memory 0 \
 	--binary-a "$SLOW" --binary-b "$HUNGRY" --allow-null-arms "${COMMON[@]}" "${QUIET[@]}" \
 	"GREP:A median=40\.0000  B median=55\.0000  delta=\+15\.0 MB" \
 	"GREP:ratio B/A = 1\.0000"
+
+check planted_kv_residency 0 \
+	"a 2x resident-KV arm is reported as ratio 2.0000, in MB" \
+	--binary-a "$KV_SMALL" --binary-b "$KV_BIG" --allow-null-arms "${COMMON[@]}" "${QUIET[@]}" \
+	"GREP:kv_cache_bytes      A median=1000\.0 MB  B median=2000\.0 MB  ratio B/A=2\.0000" \
+	"GREP:result: "
+
+# The printed table rounds to 0.1 MB. The result file is what gets promoted into
+# the append-only metrics store, so it has to carry the byte count the slot
+# actually reported: KV_SMALL's 1 000 000 123 B prints as 1000.0 MB either way,
+# and only the JSON can tell an exact reading from a round-tripped one.
+JSON_KV="$(sed -n 's/^result: //p' "$WORK/planted_kv_residency.log" | tail -1)"
+KV_A="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['results'][0]['arm_a']['median_kv_cache_bytes'])" "$JSON_KV" 2>/dev/null || echo unreadable)"
+if [[ "$KV_A" == "1000000123" ]]; then
+	PASSED=$((PASSED + 1))
+	printf '  ok   %-26s        — result file carries exact bytes (%s), not the rounded MB\n' \
+		"kv_residency_json_exact" "$KV_A"
+else
+	FAILED=$((FAILED + 1))
+	printf '  FAIL %-26s        — arm A median_kv_cache_bytes is %s, want 1000000123\n' \
+		"kv_residency_json_exact" "$KV_A"
+fi
+
+# The two ways this column can be absent must both read as "not measured".
+# A 0 here would divide into a residency ratio as a cache of no bytes, which
+# is the shape of every silent-fallback defect this repo has had to unpick.
+check kv_residency_refusal_is_not_zero 0 \
+	"a slot whose KV accounting refused reports n/a, never 0" \
+	--binary-a "$KV_NA" --binary-b "$KV_BIG" --allow-null-arms "${COMMON[@]}" "${QUIET[@]}" \
+	"GREP:kv_cache_bytes      A median=n/a MB  B median=2000\.0 MB  ratio B/A=n/a" \
+	"NOGREP:A median=0\.0 MB"
+
+check kv_residency_absent_column_is_not_zero 0 \
+	"a binary that emits no KV column reports n/a, never 0" \
+	--binary-a "$KV_ABSENT" --binary-b "$KV_BIG" --allow-null-arms "${COMMON[@]}" "${QUIET[@]}" \
+	"GREP:kv_cache_bytes      A median=n/a MB  B median=2000\.0 MB  ratio B/A=n/a"
 
 # ---- does it stay quiet when there is nothing there? -------------------------
 

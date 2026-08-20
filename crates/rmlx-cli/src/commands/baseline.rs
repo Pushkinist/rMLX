@@ -667,12 +667,22 @@ pub(crate) fn run_baseline(
         "baseline: model={model_basename}  load={load_ms:.0}ms  ttft_ms={ttft}  \
          decode_tps={decode}  overall_tps={overall}  prefill_tps={prefill}  \
          prompt_tokens={prompt_token_count}  peak_rss={rss}MB  \
-         metal_peak_mb={metal_peak_mb:.1}  metal_gen_alloc_mb={metal_gen_alloc_mb:.1}",
+         metal_peak_mb={metal_peak_mb:.1}  metal_gen_alloc_mb={metal_gen_alloc_mb:.1}  \
+         kv_cache_bytes={kv_bytes}",
         ttft = fmt_measurement(ttft_ms, 0, "n/a"),
         decode = fmt_measurement(decode_tps, 3, "n/a"),
         overall = fmt_measurement(overall_tps, 3, "n/a"),
         prefill = fmt_measurement(prefill_tps, 1, "n/a"),
         rss = fmt_measurement(rss_mb_measured, 1, "n/a"),
+        // `ReportedZero` above already decided this column is unusable for this
+        // run; printing the literal `0` would read as "this codec's cache is
+        // empty" and average into a residency comparison as a real reading.
+        // `n/a` is the same refusal the rate columns use.
+        kv_bytes = if kv_cache_bytes > 0 {
+            kv_cache_bytes.to_string()
+        } else {
+            "n/a".to_string()
+        },
     );
 
     // Exact generated token-id sequence, one line, opt-in.

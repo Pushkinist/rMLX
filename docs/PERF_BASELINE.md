@@ -474,10 +474,29 @@ sampled at all (empty or failed `ps`, or a window below the CPU counter's
 references against each other. An arm that is fast and wrong fails the
 invocation that made it look fast.
 
+**Residency is reported next to throughput.** Decode TPS alone cannot express a
+KV-codec question: a codec that costs memory and buys no speed reads as a null
+result if throughput is the only column. Each slot therefore contributes two
+memory figures, and they answer different questions.
+`metal_gen_alloc_mb` is the generation-scoped allocator peak — the prefill
+working set, not the cache, can be what sets it, and then a real KV delta shows
+there as `+0.0 MB`. Measured both ways in the cells below: at a 4 096-token
+prompt it reads `+0.0 MB` on Ternary-Bonsai-8B and on Qwen3.8-27B against
+cache deltas of +28.7 % and +21.9 %, while the same Bonsai pair at 32 768 does
+resolve it (+2 500 MB). Whether the cache is the allocator peak is an
+arch-and-shape question, not a property of the instrument.
+`kv_cache_bytes` is `KvCache::resident_bytes` off the
+`baseline` summary line and is the cache itself. Where a slot's KV accounting
+refused, the column reads `n/a` for that whole arm — never `0`, which would
+divide into a residency ratio as a cache of no bytes.
+
 **Never writes `runs.db`.** Every slot runs `--metrics off`, so the file is
 never opened, and `--metrics` is refused in arm arguments so it cannot be
 turned back on. An A/B run exercises arms built to be thrown away; a row in the
-append-only store cannot be taken back out.
+append-only store cannot be taken back out. Promoting an accepted comparison is
+a separate, explicit step: `scripts/ingest/perf_ab_ingest.py` turns one result
+file into two §8.5 RunRecords (`decode_tps_warm`, `kv_cache_bytes`), refuses a
+TAINTED run unless told otherwise, and carries the taint text into `notes`.
 
 It does write elsewhere. The result lands in
 `$RMLX_HOME/bench/perf_ab/<timestamp>.json` alongside the recorded host
@@ -565,6 +584,122 @@ decode_tps (the bf16 q/k/v compute is cheaper than the prior f32 path); Gemma4
 and Qwen3.6 (separate arch files) are unchanged. On the `none` path the gain
 widens with context as KV bandwidth dominates: Bonsai `none` decode_tps
 ~101→~135 at 4 k, ~48→~83 at 16 k, ~19→~38 at 64 k.
+
+## Codec cells across context — `none` vs `mixed_k8g64_v4g64` (TAINTED host, 2026-08-20)
+
+**Every cell in this section is TAINTED and none of it is a clean measurement.**
+`perf_ab.sh`'s quiescence gate never cleared on this host: a virtual-machine
+helper sat at 113–384 % of a core throughout, WindowServer at 30–56 %, and all
+8 of 8 slots in every run are marked contended. The runs are ABBA-interleaved,
+so a *within-run* ratio still cancels a drift that is monotone across the run,
+and the pre-declared disjoint-range criterion still decides SEPARATED vs
+INCONCLUSIVE. Nothing here may be quoted as an absolute TPS anchor, and no
+number here may be compared against a number from a different run.
+
+Why the section exists: every earlier codec cell in this file and in
+`docs/KV_QUANT.md` was taken at 4 096–32 768 tokens, and the standing objection
+to that basis is that `kv_frac` — the KV share of a decode step's byte stream —
+rises steeply with context, so a short cell cannot see a codec difference "even
+in principle". `kv_frac` is stated next to every row below so that bound is
+visible rather than assumed. It is a **(model, context)** quantity, not a
+context one; see docs/KV_QUANT.md, "`kv_frac` bounds a codec claim".
+
+Shape: `rmlx baseline`, `release-perf` build `sha256:c26e0d8a3ac43996`,
+`--max-tokens 100`, 1 untimed warmup + 8 slots per model (n=4 per arm),
+`--allow-busy-host --allow-token-divergence`. Arm A is `--kv-quant none` (true
+bf16 on every layer), arm B `--kv-quant mixed_k8g64_v4g64` (affine 8-bit K /
+4-bit V, and one of the two codec families whose decode genuinely reads its
+packed store). `kv_frac` and the predicted ceilings are
+`scripts/perf_ceiling.py` on the same snapshot.
+
+`kv_frac` and the predicted ceilings are evaluated at the **measured** cache
+offset (`prompt_tokens + max_tokens - 1`), not at the fixture's nominal size.
+
+| model | prompt tok | `kv_frac` (A) | predicted ceiling B/A | decode B/A (median) | A range | B range | verdict | resident KV A → B | resident B/A |
+|---|---:|---:|---:|---:|---|---|---|---|---:|
+| Ternary-Bonsai-8B-2bit | 3 770 | 0.211 | 1.099 | 0.949 | 125.72–134.86 | 125.21–127.53 | INCONCLUSIVE | 570.5 → 734.1 MB | 1.287 |
+| Ternary-Bonsai-8B-2bit | 31 553 | **0.687** | **1.419** | 1.003 | 65.07–67.82 | 65.03–68.06 | INCONCLUSIVE | 4 667.3 → 6 032.9 MB | 1.293 |
+| Qwen3.8-27B-mxfp8 | 3 892 | 0.010 | 1.004 | 1.005 | 17.73–17.97 | 17.58–18.04 | INCONCLUSIVE | 415.5 → 506.5 MB | 1.219 |
+| Qwen3.8-27B-mxfp8 | 130 848 | 0.245 | 1.149 | **0.728** | 13.94–14.12 | 9.45–10.70 | **ranges disjoint** | 8 735.7 → 11 784.2 MB | 1.349 |
+
+**What the 130 848-token Qwen3.8 row settles.** This is the cell that a
+long-context codec claim was supposed to be decided on: `kv_frac` 0.245, a
+predicted **+14.9 %** ceiling for arm B, and 20× the paired noise floor between
+the arms. Measured, arm B is **27.2 % slower**, with the two arms' per-slot
+ranges disjoint in the losing direction (every `none` slot faster than every
+`mixed` slot), and it holds **35 % more** resident KV and 6 034 MB more
+generation-scoped allocation. Both halves of the pre-declared long-context
+falsifier fire: resident above 0.60× and decode below 0.95×. The
+"measure it at 128 k and the codec will pay" hypothesis is not merely
+unsupported here — the sign is wrong.
+
+This cell is also the least contended of the four: the entry gate refused at
+114 %, but only 4 of 8 slots were flagged (worst 35.8 % WindowServer) and the
+comparison window as a whole read 22.8 %, *under* the 25 % threshold. It is
+still reported as TAINTED, and still may not be read as an absolute anchor.
+
+**Why `none` losing is not a roofline story.** Arm A's non-bandwidth per-step
+term is essentially flat across a 33× context change — 12.65 ms at 3 892 tokens,
+14.70 ms at 130 848 — so `none` decode really is bandwidth-dominated at 131 k
+(1.26× its 57.02 ms floor). Arm B halves the KV byte stream and still loses,
+because its own per-step cost is not flat: 98.55 ms measured against a 49.76 ms
+floor, 1.98×, i.e. 48.79 ms of non-bandwidth work against arm A's 14.70. The
+packed path does not fail to convert bytes into time; at this shape it spends
+more time than the bytes were worth.
+
+**What the 31 553-token Bonsai row settles.** 0.687 is the largest `kv_frac`
+any model in the release set reaches at a context this tree can serve. Arm B
+cuts the decode KV stream to 0.571× of arm A's and the roofline predicts +42 %.
+Measured: **+0.3 %, ranges fully overlapping** — no measured effect — while
+resident KV goes *up* 29 %. So the short-context basis was not what made the
+earlier codec cells come back null: the null survives at the high-`kv_frac` end
+of the same axis.
+
+**The byte model is not what fails; it is exact where it is complete.** At the
+measured offsets `perf_ceiling.py` puts arm A's resident KV at 570.5 MB and
+4 667.3 MB on Bonsai — the measured figures, to the digit — and arm B within
+0.5 % and 0.06 %. What does not hold is the conversion of saved bytes into
+saved time: the ε of docs/KV_QUANT.md, "Fused flash-decode over a quant store",
+measured at 0.041–0.135 on every path tried so far.
+
+**The Qwen3.8 resident ratio is diluted, not smaller.** That arch is hybrid:
+48 of its 64 layers hold a fixed-size GDN recurrent state the codec never
+touches, and `kv_cache_bytes` sums it. `perf_ceiling.py` deliberately excludes
+it, and the gap between its prediction and the measurement is that state — the
+*same constant* at both contexts and on both arms:
+
+| prompt tok | arm | predicted (attention KV) | measured | gap |
+|---:|---|---:|---:|---:|
+| 3 892 | `none` | 261.6 MB | 415.5 MB | +153.9 |
+| 3 892 | `mixed` | 354.5 MB | 506.5 MB | +152.0 |
+| 130 848 | `none` | 8 581.7 MB | 8 735.7 MB | +154.0 |
+| 130 848 | `mixed` | 11 632.3 MB | 11 784.2 MB | +151.9 |
+
+Read the whole-cache ratio on a hybrid arch as a lower bound on the
+attention-KV ratio (1.219 measured against 1.355 attention-only at 3 892; 1.349
+against 1.355 at 130 848), the same way the `--kv-quant none` section reads
+Qwen3.6-35B's 1.060× against its 1.109× attention-only figure.
+
+**Decode moves away from the roofline as context grows.** Same runs, arm A,
+against `perf_ceiling.py`'s bandwidth-bound floor for the same cell:
+
+| model | prompt tok | measured ms/step | roofline ms/step | ratio | non-bandwidth ms/step |
+|---|---:|---:|---:|---:|---:|
+| Ternary-Bonsai-8B-2bit | 3 770 | 7.55 | 4.40 | 1.72× | 3.15 |
+| Ternary-Bonsai-8B-2bit | 31 553 | 15.01 | 11.07 | 1.36× | 3.94 |
+| Qwen3.8-27B-mxfp8 | 3 892 | 56.11 | 43.47 | 1.29× | 12.65 |
+| Qwen3.8-27B-mxfp8 | 130 848 | 71.72 | 57.02 | 1.26× | 14.70 |
+
+Compare the last column, not the ratio: ratio-vs-roofline is
+`1 + overhead/ideal_ms` and is therefore *not* scale-free, so it cannot be
+compared across models of different size — the same fixed per-step cost reads
+large on a small model and small on a large one. Within one model the
+comparison is valid, and within each model the non-bandwidth term is roughly
+flat — Bonsai 3.15 → 3.94 ms across an 8× context change, Qwen3.8 12.65 →
+14.70 ms across 33×. Both models' `none` decode really is bandwidth-dominated
+at their long cell. That is what makes the null load-bearing: the regime where
+a byte cut *should* convert is the regime measured, on two architectures, and
+it did not convert on either.
 
 ## Host-sampler cost — PROVISIONAL, NOT AN ANCHOR (2026-08-16)
 
