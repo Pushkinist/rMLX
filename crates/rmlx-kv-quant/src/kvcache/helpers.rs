@@ -25,7 +25,7 @@ impl KvCache {
     /// Dequant the K side of the cache to flat f32 (CPU paths only).
     ///
     /// Returns `None` for storage variants that have no q8 K buffer
-    /// (`Paged`, `Mixed`, `RotKTq4V`, `None`), and `Some(Err(..))` when the K
+    /// (`Paged`, `Mixed`, `None`), and `Some(Err(..))` when the K
     /// store exists but its dequant refused — see the module note above for why
     /// those stay distinct. Used by the hydrate round-trip tests to compare a
     /// reconstructed cache's K against the pre-spill K within the fp tolerance.
@@ -92,10 +92,7 @@ impl KvCache {
             KvStorage::RotorSym4 { k, .. }
             | KvStorage::RotorKOnly4 { k, .. }
             | KvStorage::RotorKAsym4 { k, .. } => Some(k.as_ref()?.dequant()),
-            KvStorage::None { .. }
-            | KvStorage::Mixed { .. }
-            | KvStorage::Paged { .. }
-            | KvStorage::RotKTq4V { .. } => None,
+            KvStorage::None { .. } | KvStorage::Mixed { .. } | KvStorage::Paged { .. } => None,
         }
     }
 }
@@ -133,7 +130,6 @@ impl KvCache {
             | KvStorage::K8VTurbo2Tcq { v, .. }
             | KvStorage::TurboSym3 { v, .. }
             | KvStorage::TurboSym4 { v, .. }
-            | KvStorage::RotKTq4V { v, .. }
             | KvStorage::RotorKAsym3 { v, .. }
             | KvStorage::RotorKAsym4 { v, .. } => {
                 let v = v.as_ref()?;
@@ -232,7 +228,6 @@ pub(super) fn storage_variant_name(s: &KvStorage) -> &'static str {
         KvStorage::None { .. } => "None",
         KvStorage::Mixed { .. } => "Mixed",
         KvStorage::Paged { .. } => "Paged",
-        KvStorage::RotKTq4V { .. } => "RotKTq4V",
         KvStorage::K8VTurbo3 { .. } => "K8VTurbo3",
         KvStorage::TurboSym3 { .. } => "TurboSym3",
         KvStorage::TurboSym4 { .. } => "TurboSym4",

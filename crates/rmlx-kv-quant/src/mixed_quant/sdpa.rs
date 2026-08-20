@@ -1,17 +1,15 @@
 // unsafe_code: mlx-rs Array zero-copy view
 #![allow(unsafe_code)]
 
-//! SDPA helpers for Mixed and RotKTq4V KV modes.
+//! SDPA helper for the Mixed / RotK KV modes.
 //!
 //! - [`mixed_quantized_sdpa`]: fused quantized SDPA for K8/V4 mixed-precision.
-//! - [`rot_k_tq4v_sdpa`]: dequant-then-SDPA for RotKTq4V hybrid.
 
 use crate::rot_k_msl::rot_k_fwht_rotate_gpu;
 use rmlx_core::error::{Error, Result};
 use rmlx_core::DispatchPolicy;
 use rmlx_mlx::{
-    add, dequantize, expand_dims, multiply, quantized_matmul, scalar_f32,
-    scaled_dot_product_attention, softmax_precise, Array, Device,
+    add, expand_dims, multiply, quantized_matmul, scalar_f32, softmax_precise, Array, Device,
 };
 
 use super::state::MixedTuple;
@@ -155,97 +153,6 @@ pub fn mixed_quantized_sdpa(
     } else {
         Ok(out)
     }
-}
-
-/// SDPA for the RotKTq4V hybrid variant.
-///
-/// K is stored as an MLX affine 3-tuple `(codes, scales, biases)` in the rotated
-/// basis (same as `KvQuant::RotK`). V is stored as TurboFlash tq4 (rMLX MSL
-/// symmetric 4-bit, `QuantV`).
-///
-/// Steps:
-/// 1. Pre-rotate Q by the same `R` used for K (so scores cancel: `Q Kt`).
-/// 2. Dequantize K from its affine 3-tuple back to bf16 (`mx.dequantize`).
-/// 3. Dequantize V from TurboFlash to bf16 (`QuantV::dequantize_choice`).
-/// 4. Run standard `scaled_dot_product_attention` on the bf16 K/V.
-///
-/// `k_rotation` must be `Some(&R)` (always, for RotKTq4V); pass `None` only
-/// to disable Q rotation for testing purposes.
-#[allow(clippy::too_many_arguments)]
-pub fn rot_k_tq4v_sdpa(
-    queries: &Array,
-    k_tuple: &MixedTuple,
-    v_bf16: &Array,
-    scale: f32,
-    additive_mask: Option<&Array>,
-    k_group_size: i32,
-    k_bits: i32,
-    k_rotation: Option<&Array>,
-    device: Device,
-    policy: DispatchPolicy,
-) -> Result<Array> {
-    // 1. Pre-rotate Q (same logic as mixed_quantized_sdpa).
-    let queries_owned;
-    let queries: &Array = match k_rotation {
-        Some(r) => {
-            let d = *queries
-                .shape()
-                .last()
-                .ok_or_else(|| Error::Mlx("rot_k_tq4v_sdpa: empty Q shape".into()))?
-                as usize;
-            let try_fused = policy.rot_k_fused && crate::rot_k_msl::is_supported_d(d);
-            queries_owned = if try_fused {
-                match rot_k_fwht_rotate_gpu(queries, device) {
-                    Ok(q_rot) => q_rot,
-                    Err(e) => {
-                        tracing::warn!(
-                            reason = %e,
-                            "rot_k_fwht_rotate_gpu failed in rot_k_tq4v_sdpa; \
-                             falling back to v1 matmul Q rotation"
-                        );
-                        super::super::rot_k::rotate_last_axis(queries, r, device)?
-                    }
-                }
-            } else {
-                super::super::rot_k::rotate_last_axis(queries, r, device)?
-            };
-            &queries_owned
-        }
-        None => queries,
-    };
-
-    // 2. Dequantize K from its affine 3-tuple back to bf16.
-    // K was stored in the rotated basis (rotate_k_and_quantize); dequantizing
-    // gives K_rot in bf16. Q is also rotated (step 1), so the score matmul
-    // Q_rot * K_rot^T = Q * K^T (rotations cancel).
-    let k_bf16 = dequantize(
-        &k_tuple.codes,
-        &k_tuple.scales,
-        Some(&k_tuple.biases),
-        k_group_size,
-        k_bits,
-        "affine",
-        device,
-    )?;
-
-    // 3. V is already dequantized by the caller (QuantV::dequantize_choice).
-    // `v_bf16` is [B, kv_h, T_seq, D].
-
-    // 4. Standard scaled dot-product attention.
-    let mask_mode = if additive_mask.is_some() {
-        "array"
-    } else {
-        "causal"
-    };
-    scaled_dot_product_attention(
-        queries,
-        &k_bf16,
-        v_bf16,
-        scale,
-        mask_mode,
-        additive_mask,
-        device,
-    )
 }
 
 #[cfg(test)]

@@ -134,8 +134,8 @@ pub fn precompile_kv_codec_msl(
         }
     };
 
-    // K-side q8_0: shared by every MSL-carrying KV codec (K8V*/Planar*/Turbo*/
-    // RotKTq4V all quantize K with q8_0, group=128). Warm both directions.
+    // K-side q8_0: shared by every MSL-carrying KV codec (K8V*/Planar*/Turbo*
+    // all quantize K with q8_0, group=128). Warm both directions.
     if let Err(e) = warm_q8(&warm, device) {
         tracing::warn!(error = %e, kv_quant = %kq, "precompile_kv_codec_msl: q8 K-side warm failed (non-fatal)");
     }
@@ -205,8 +205,8 @@ fn warm_v_side(kq: KvQuant, warm: &Array, device: Device) -> Result<()> {
         return Ok(());
     }
     match kq {
-        // tq4 V — K8V4 and RotKTq4V both encode V with TurboQuant 4-bit on GPU.
-        KvQuant::K8V4 | KvQuant::RotKTq4V => {
+        // tq4 V — K8V4 encodes V with TurboQuant 4-bit on GPU.
+        KvQuant::K8V4 => {
             let (codes, scales) = crate::turboquant_msl::turbo_quantize_v4_gpu(warm, device)?;
             codes.eval()?;
             scales.eval()?;

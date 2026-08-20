@@ -328,7 +328,7 @@ fn exit_prefill_builds_a_store_exactly_when_the_predicate_says_so() {
         let store_after_prefill = cache.storage().resident_bytes();
 
         if quant.materialises_packed_store() {
-            // No decode step here: `Mixed` / `RotK` / `RotKTq4V` refuse
+            // No decode step here: `Mixed` / `RotK` refuse
             // `update()` by contract (they must go through `update_and_sdpa`),
             // and the property under test on this branch is only that the store
             // was built.

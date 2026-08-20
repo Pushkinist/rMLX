@@ -256,7 +256,7 @@ reduced-token probe (`max_tokens 8–64`, n=1), not a steady-state 256-token rat
 | k_iso4 *(capped)* | 3.6·16.1s·758 | 1.9·33.7s·1388 | 1.0·71.5s·2649 | 0.5·151.2s·5163 | 0.2·344.5s·10207 | 0.1·886.4s·20293 |
 | k_rotor3 *(capped)* | 0.8·22.4s·577 | 0.4·46.7s·1022 | 0.2·100.3s·1910 | 0.1·209.1s·3687 | 0.05·456.4s·7241 | —·—·— |
 | k_rotor4 *(capped)* | 0.8·22.6s·577 | 0.4·47.5s·1022 | —·101.4s·1480 | —·209.8s·2821 | —·462.3s·5503 | —·—·— |
-| rot_k_tq4v | 48.0·14.9s·531 | 42.3·32.5s·916 | 33.8·70.5s·1685 | 26.8·144.9s·3225 | 19.0·322.6s·6303 | 11.7·788.1s·12456 |
+| rot_k_tq4v *(retired, see `docs/KV_QUANT.md`)* | 48.0·14.9s·531 | 42.3·32.5s·916 | 33.8·70.5s·1685 | 26.8·144.9s·3225 | 19.0·322.6s·6303 | 11.7·788.1s·12456 |
 
 **Best decode per size** (bold above): 4k `k8vturbo3tcq` (52.57 — a near-tie with
 `iso3_sym` 52.55 / `iso4` 52.49; the whole 4k column is 52.5–52.6, i.e. noise);
@@ -289,7 +289,7 @@ Ratios below are at **128k**.
 | tsym4 | 11101 | 1.25× |
 | k8vturbo2 / k8vturbo2tcq | 11380 | 1.28× |
 | k8vturbo3 / k8vturbo3tcq | 11604 | 1.31× |
-| rot_k_tq4v | 12456 | 1.41× |
+| rot_k_tq4v *(retired, see `docs/KV_QUANT.md`)* | 12456 | 1.41× |
 | k8v8 | 12555 | 1.42× |
 | planar_k | 14453 | 1.63× |
 | k8v4 | 14795 | 1.67× |

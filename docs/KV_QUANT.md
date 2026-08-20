@@ -142,7 +142,7 @@ gone: no decode path reads their store, so `exit_prefill` does not build one
 (`KvQuant::materialises_packed_store()`, see `docs/KV_CACHE.md` §9.6 F3). Their
 resident KV is exactly the two bf16 mirrors — the same bytes as
 `--kv-quant none`, at every context and every geometry — and the warn never
-fires for them. It still fires for `Mixed` / `RotK` / `RotKTq4V`, which read
+fires for them. It still fires for `Mixed` / `RotK`, which read
 their packed 3-tuples at decode and keep both mirrors as well, and for the
 K-only re-quantise families' sideband-heavy K store.
 
@@ -366,7 +366,6 @@ block-hash seed alongside the SSD `layout_key`. See `docs/PROMPT_CACHE.md`
 | `Planar` (bits=4) | rMLX MSL q8_0 | 128 | PlanarQuant 4-bit | 32 | `QuantK` + `QuantPlanarV` | 0.9942 |
 | `Planar` (bits=3) | rMLX MSL q8_0 | 128 | PlanarQuant 3-bit | 32 | `QuantK` + `QuantPlanarV` | 0.9989 |
 | `Mixed` | MLX affine `k_bits` | `k_group` | MLX affine `v_bits` | `v_group` | `MixedKvState` | 0.9937 (V4); 0.9990 (V8); 0.9000 (V2) |
-| `RotKTq4V` | MLX affine 8-bit (rotated) | 64 | TurboQuant 4-bit | 32 | `MixedKvState` (K) + `QuantV` (V) | 0.9937 (V) |
 | `Paged` | q8_0 per page | 128 | tq4 / q8_0 / planar per page | 32/128/32 | `PagedKStorage` + paged V | — |
 | `TurboSym3` | TurboQuant 3-bit | 32 | TurboQuant 3-bit | 32 | `QuantKTurbo3` + `QuantV{bits:3}` | 0.9807 (K empirical floor) |
 
@@ -429,7 +428,7 @@ be classified or the build fails.
 |---|---|---|
 | `none` | bf16, no kernel | nothing to compile |
 | `k8v4` / `k8v8` / `planar` / `planar3` / `planar_k` | **Metal** | q8_0 K + tq4 / planar V GPU kernels |
-| `mixed_*` / `rot_k_v*` / `rot_k_tq4v` | **Metal** | MLX-affine `mx.quantize` K + tq4/affine V (compiled Metal ops) |
+| `mixed_*` / `rot_k_v*` | **Metal** | MLX-affine `mx.quantize` K + affine V (compiled Metal ops) |
 | `k8vturbo3` / `k8vturbo2` / `*tcq` / `tsym3` / `tsym4` | **Metal K**, CPU V (bounded) | K=q8_0 GPU; V CPU-forced by the −1 %/−2 % TPS gate, cost small |
 | `iso3` / `iso4` | **CPU** | bf16 decode seed shadows the GPU iso branch; prefill V-encode on host |
 | `iso3_sym` / `iso4_sym` | **fully Metal** | both axes iso-quantized; decode is `iso_flash_decode_symv` over both packed rings (no bf16 mirror). Ring-as-sole-store. `cpu_hot_path_reason() == None` |
@@ -450,7 +449,7 @@ families (nothing to warm), and for the K-only iso/rotor families
 the iso/rotor MSL kernel, **not** the shared q8_0 K kernel this warm compiles, so
 warming q8 for them would compile the wrong shader; their K kernel compiles
 lazily on first prefill. It warms the shared q8_0 K-side kernels for every q8-K
-MSL codec, plus the tq4 / planar V kernel for `k8v4` / `rot_k_tq4v` / `planar`.
+MSL codec, plus the tq4 / planar V kernel for `k8v4` / `planar`.
 Best-effort — a warm failure logs
 `warn!` and proceeds (the kernel then compiles lazily on first use, the
 previous lazy-compile behaviour). Wired into `ArchGenerator::from_snapshot_with_id` (the
@@ -678,8 +677,10 @@ kernel reads these buffers directly — no dequantize round-trip. Enabled by
 `{on, off, auto}` with `auto` as the default, and `auto` resolves **OFF on
 every host**. The kernel passes its crash and fidelity gates and fails its
 throughput one: everywhere it fires it decodes several times slower than the
-generic K8V4 path, and because it is not bit-exact it also perturbs the
-generated tokens.
+generic K8V4 path. It also changes the generated tokens — because it is the
+only `k8v4` configuration in which the 4-bit V codec runs at decode at all, not
+because the kernel is wrong; see "What the digest difference is, and is not"
+below.
 
 Measured with `rmlx bench` (n=3 + warmup, one process per cell, medians,
 settle gate enforced) on a quiet host — same binary, temp=0, `--turbo-flash`
@@ -702,19 +703,58 @@ ring 4× recovers part of the gap but not the bulk, so this is not a
 resident KV at 16k — the persistent head-major flash buffers sit *on top of*
 the bf16 mirror and the packed store rather than replacing either.
 
-**The output is not identical, and the reason changed once.** An earlier
-revision of this section claimed a byte-identical token digest in both arms;
-that held on one cell and was generalised from it. It is not byte-identical:
-the kernel is not bit-exact — SDPA cosine against the bf16 reference is ≈0.997,
-the V turbo-4 codec floor — and at temp=0 that flips greedy argmax ties
-prompt-dependently. When these cells were measured, 8k and 32k both diverged
-while 16k and Bonsai-27B@16k matched, and the divergence was attributed to that
-codec floor. **Half of that attribution was wrong**: the 32k divergence was the
-f32 promotion described below, and it is gone with the dtype fix — see the
-digest table further down, where 32k now reproduces the bf16 reference exactly.
-The 8k divergence is real and is the codec floor. The rows below are the
-pre-fix measurement, kept because the TPS and residency figures still come from
-it. Reproduce it on Bonsai-8B at 8k with `rmlx bench --kv-quant k8v4
+**What the digest difference is, and is not.** An earlier revision of this
+section claimed a byte-identical token digest in both arms; that held on one
+cell and was generalised from it. It is not byte-identical — but the reason has
+been wrong twice, in two different ways, and both are now measured.
+
+First: *the comparison baseline is not a reference.* Turning the gate off does
+not turn the codec off. With `--turbo-flash off`, `k8v4` decode shortcuts to the
+bf16 mirror and the 4-bit V store is never read — `decode_reads_packed_store` is
+`false` for `K8V4`, and a GPU capture of the OFF arm contains no
+`custom_kernel_rmlx_*` at all, only `sdpa_vector_2pass_2_bfloat16_t_128`. The
+ON arm is the **only** `k8v4` configuration in which the codec participates in
+decode. So "the kernel is not bit-exact" was measured against a bf16 attention,
+which **any** correct tq4-V kernel must also differ from, and the kernel's own
+error had never been tested.
+
+Second: *half the observed divergence was a dtype promotion.* When these cells
+were measured, 8k and 32k both diverged while 16k and Bonsai-27B@16k matched.
+The 32k divergence was the f32 promotion described below and is gone with the
+dtype fix — see the digest table further down, where 32k now reproduces the
+bf16 reference exactly. The 8k divergence survives.
+
+**The kernel's own numerics, measured.** `turbo_flash_reference_sdpa`
+(`turbo_flash_msl.rs`) is a dequantize-then-SDPA arm over the *identical*
+`flash_k_codes` / `flash_k_scales` / `flash_v_codes` / `flash_v_scales`
+buffers, unpacked with the same two codecs the kernel unpacks inline. Every
+quantization error is common to both arms and cancels; what is left is the
+kernel's block tiling, its online softmax and its two-pass rescale. Measured at
+the attention geometry of each architecture the kernel actually dispatches on,
+on a ring whose stride is wider than its fill and whose last block is partial:
+
+| geometry | `head_dim` | `kv_h` × heads/kv | cosine vs reference | max elementwise diff |
+|---|---:|---:|---:|---:|
+| Ternary-Bonsai-8B-2bit | 128 | 8 × 4 | 0.9999956 | 1.4 bf16 ULP |
+| Qwen3.6-35B-A3B-8bit | 256 | 2 × 8 | 0.9999962 | 1.7 bf16 ULP |
+
+The kernel is therefore accurate **for its codec**, and the ≈0.997 SDPA cosine
+against bf16 is the tq4-V codec's own floor — which at temp=0 flips greedy
+argmax ties prompt-dependently. Guards:
+`turbo_flash_matches_its_codec_reference_at_{bonsai_8b,qwen36_35b}_geometry`
+(`#[ignore]`, GPU).
+Mutation-checked: feeding the kernel `t_active` where `t_stride` belongs drops
+the cosine to 0.718 / 0.159, and dropping a single tail KV token drops it to
+0.9964 — *below* the 0.997 codec floor, which is why a bf16-referenced gate at
+that floor would have passed that bug and a codec-referenced one does not. The
+reference arm is also asserted not to move the dispatch counter, so it cannot
+quietly become a second call into the thing it is checking.
+
+**Consequence for the HOLD.** The correctness half is discharged: it asked for
+something no bf16 baseline could ever supply, and the reference arm supplies it.
+What remains is throughput (see #340 for the P1 grid's per-query-head KV
+re-read). The rows below are the pre-fix measurement, kept because the TPS and
+residency figures still come from it. Reproduce it on Bonsai-8B at 8k with `rmlx bench --kv-quant k8v4
 --max-ctx 16384 --prompt-tokens 8192 --max-tokens 64 --runs 2 --warmup 1`:
 
 | arm | decode TPS | token digest | `kv_cache_bytes` |
@@ -722,8 +762,8 @@ it. Reproduce it on Bonsai-8B at 8k with `rmlx bench --kv-quant k8v4
 | gate OFF | 110.80 | `0xb0273cf32cb9b715` | 1 668 005 888 |
 | gate ON (`--turbo-flash on`) | 42.05 | `0x75a6992e38913e64` | 2 029 240 320 |
 
-TurboFlash is therefore a decode loss *and* an output perturbation, not pure
-cost.
+TurboFlash is therefore a decode loss that also applies a codec the generic
+path skips — not pure cost, and not a kernel-accuracy problem.
 
 **Every cell in the two tables above was measured while the kernel promoted the
 decode graph to f32.** `turbo_flash_sdpa` declared f32 kernel outputs and
@@ -754,8 +794,29 @@ At 32k the ON arm now reproduces the bf16 reference exactly — that divergence
 was the promoted graph, not the codec. At 8k it does not, and that one survives
 the fix: it is the tq4-V codec floor the section above describes. Which is the
 point of removing the confound — a digest difference is now attributable to the
-codec, because both arms finally run at the same dtype. That 8k cell also pins the extra resident KV to 361 234 432 B — exactly
-half the 16k figure, so the flash buffers scale linearly with the ring.
+codec, because both arms finally run at the same dtype. That 8k cell also pins
+the extra resident KV to 361 234 432 B — exactly half the 16k figure, so the
+flash buffers scale linearly with the ring.
+
+Re-confirmed at the **production** threshold (no `RMLX_TURBO_FLASH_MIN`
+override), temp=0, 32 tokens, `kv_bytes` as the dispatch witness:
+
+| arch | prompt | `kv_bytes` OFF → ON | digest |
+|---|---:|---|---|
+| Ternary-Bonsai-8B-2bit | 8192 | 1 145 733 120 → 1 506 967 552 | **differs** |
+| Ternary-Bonsai-8B-2bit | 32768 | 4 657 250 304 → 6 102 188 032 | identical |
+| Qwen3.6-35B-A3B-8bit | 8192 | 227 840 000 → 283 414 528 | identical |
+| gemma-4-e2b-mxfp8 | 8192 | 58 601 472 → 58 601 472 (0 B) | identical — did not fire |
+
+Two things follow. **Qwen3.6-35B-A3B is a second *firing* architecture whose
+digest does not move** (`head_dim` 256, MoE): a kernel that computed the wrong
+thing would not be selective by prompt. And the 8k Bonsai ON digest is
+**byte-identical** to the digest the retired `rot_k_tq4v` codec produced at the
+same shape — a completely different decode path (dequant-then-SDPA, and a
+*different* K codec) whose only thing in common with this one is that it applies
+TurboQuant-4 V at decode. Two independent implementations of the same V codec
+landing on the same 32 token ids is what a codec floor looks like; it is not
+what a kernel defect looks like.
 
 **gemma-4-e2b is a null control, not a second architecture.** On that
 shared-KV / windowed arch (`kv_h=1`, `head_dim=256`, SWA 512) the ±0.3% A/B at
@@ -1056,7 +1117,7 @@ nothing needs today.
 A matching `rot_k_fwht_rotate_gpu` kernel applies the same FWHT to Q,
 replacing the `rotate_last_axis` matmul when the fused path is active.
 
-**Storage**: `KvStorage::Mixed` (or `KvStorage::RotKTq4V` for the hybrid).
+**Storage**: `KvStorage::Mixed`.
 `MixedKvState` carries a `k_rotation: Option<Array>` field with the
 precomputed `R` matrix.
 
@@ -1076,34 +1137,58 @@ and `hadamard_incoherence_ratio_beats_every_block_local_rotation` in
 
 ---
 
-### `KvStorage::RotKTq4V` — rotated K + TurboQuant 4-bit V
+### Retired: `rot_k_tq4v` (rotated K + TurboQuant 4-bit V)
 
-A hybrid: K uses the rotated affine 8-bit codec (same as `RotK`), V uses
-TurboQuant 4-bit (same V codec as `K8V4`).
+Withdrawn. `--kv-quant rot_k_tq4v` and `--ctk rot_k --ctv tq4` are both rejected
+at parse; the error names `rot_k_v4g64`, which is the same rotated affine 8-bit
+K with an MLX-affine 4-bit V. Recorded here so the design is not re-derived.
 
-Storage is split between two sub-structs:
-- `k_state: MixedKvState` with `rotate_k=true` — holds the K-side affine
-  3-tuple and the `R` matrix.
-- `v: Option<QuantV>` — holds TurboQuant 4-bit V codes and scales.
+It was a dequant-then-SDPA path: every decode step appended to its packed store
+and then rebuilt a **full bf16 K and a full bf16 V of the whole prefix** before
+running an ordinary `scaled_dot_product_attention` over them. `mx.quantized_matmul`
+cannot consume a Lloyd-Max codebook, so the affine-V pairing's fused route was
+never available to it, and the one kernel in tree that reads TurboQuant-4 V at
+decode (`turbo_flash`) is `auto`-OFF on every host and measured slower than the
+generic path. There was no third option.
 
-SDPA path (`rot_k_tq4v_sdpa`):
-1. `k_state.update_k_and_fetch` — rotate K, quantize, `slice_update`, return
-   the full prefix 3-tuple.
-2. `QuantV::append_uncapped` — TurboQuant-encode the new V token.
-3. `QuantV::dequantize_choice` — dequantize full V prefix to bf16.
-4. Dequantize K from its affine 3-tuple to bf16 via `mx.dequantize`.
-5. Pre-rotate Q by `R` (`rotate_last_axis` or fused FWHT kernel).
-6. `scaled_dot_product_attention` on the recovered bf16 arrays.
+Measured against its affine-V sibling `rot_k_v4g64` at the same shape
+(`kv_bytes` from the `kv cache bytes` debug event; digests over 32 greedy token
+ids at temp=0; TPS sequential n=1 on a host that could not pass its quiescence
+gate, so read the ratios as direction and the residency and digests as exact):
 
-This is a dequant-then-SDPA path (not fused `quantized_matmul`). The V-side
-still benefits from the full 4× memory reduction of tq4 versus bf16.
+| arch | ctx | resident KV vs `rot_k_v4g64` | resident KV vs `none` | decode TPS vs `rot_k_v4g64` | digest |
+|---|---:|---:|---:|---:|---|
+| Ternary-Bonsai-8B-2bit | 4096 | +0.49% | +31.4% | ×0.75 | matches |
+| Ternary-Bonsai-8B-2bit | 8192 | +0.83% | +31.1% | ×0.63 | **differs** |
+| Ternary-Bonsai-8B-2bit | 32768 | +0.86% | +30.6% | ×0.42 | matches |
+| gemma-4-e2b-mxfp8 | 4096 | +0.46% | +44.9% | ×0.97 | **differs** |
+| gemma-4-e2b-mxfp8 | 8192 | +0.74% | +43.6% | ×0.97 | **differs** |
+| gemma-4-e2b-mxfp8 | 32768 | +1.0% | +42.6% | ×0.94 | **differs** |
 
-**Requirements**: power-of-two `head_dim` (Hadamard); `head_dim ∈ {128, 256}`
-(TurboQuant kernel constraint).
+Two things in that table are worth keeping.
 
-**K group_size**: fixed at 64 (matches RotK). V group_size: 32 (TurboQuant).
+**The memory claim was true and misattributed.** The codec did hold 27–45% more
+resident KV than `--kv-quant none`, exactly as reported — but so does its affine
+sibling, to within one percent. That excess is the whole `Mixed` / `RotK`
+family's: those codecs read their packed store at decode *and* `exit_prefill`
+still materialises both bf16 mirrors for them. `tq4` V versus affine-4 V is the
+0.5–1% column, not the 30–45% one. Retiring `rot_k_tq4v` therefore does not put
+any codec below `none`; that is a separate, family-wide defect.
 
-**CLI**: `--ctk rot_k --ctv tq4`.
+**The decode loss was real and was the tq4 V.** On the dense `kv_h > 1` arch the
+loss grows monotonically with context (×0.75 → ×0.63 → ×0.42 against the affine
+sibling at 4k/8k/32k) — the signature of a per-step cost proportional to prefix
+length, which is the double materialisation. On gemma-4-e2b it is small because
+28 of 35 layers are SWA and leave `update_and_sdpa` on the bf16 rotating ring
+before any codec branch is reached.
+
+Fidelity was worse too: at temp=0 it is the only codec of the four measured that
+never reproduces its affine sibling's token ids on the shared-KV arch, and the
+e2e manifest already carried it as DEGRADED on Bonsai-2bit.
+
+A correctness reference for TurboQuant-4 V at decode still exists in tree —
+`turbo_flash_reference_sdpa`, in the TurboFlash section above — so retiring the
+codec does not retire the ability to check that codec's numerics.
 
 ---
 
@@ -1517,7 +1602,7 @@ Page size must be a multiple of the quantizer group size (32 for TurboQuant,
 128 for q8_0 K) to avoid straddled groups at page boundaries.
 
 **Restrictions**: `--paged-kv` is rejected for `KvQuant::None` (bf16 paged
-is not implemented) and for `RotK` / `RotKTq4V` (rotation codecs are not
+is not implemented) and for `RotK` (rotation codecs are not
 paged-compatible).
 
 **CLI**: `--paged-kv [--kv-quant <k8v4|k8v8|planar>]`.
@@ -1535,7 +1620,6 @@ match &self.storage {
     KvStorage::K8V4 { .. }      => update_k8v4 / update_and_sdpa_k8v4_flash
     KvStorage::Planar { .. }    => update_planar
     KvStorage::Mixed { state }  => update_and_sdpa_mixed (MixedKvState)
-    KvStorage::RotKTq4V { .. }  => update_and_sdpa_rot_k_tq4v
     KvStorage::Paged { .. }     => update_paged
 }
 ```
@@ -1743,7 +1827,6 @@ take precedence and bypass `kv_quant_for_ctx`.
 | `k8vturbo3tcq` | `KvQuant::K8VTurbo3Tcq` (Viterbi trellis 3-bit V; reuses turbo3 codebook) |
 | `tsym4` | `KvQuant::TurboSym4` (symmetric WHT-4 K + tq4 V; rejected on Qwen MoE) |
 | `k8vturbo2` | `KvQuant::K8VTurbo2` |
-| `rot_k_tq4v` | `KvQuant::RotKTq4V` |
 | `mixed_k<kb>g<kg>_v<vb>g<vg>` | `KvQuant::Mixed { .. }` |
 
 Examples: `--kv-quant mixed_k8g64_v4g64`, `--kv-quant k8v4`.
@@ -1916,7 +1999,7 @@ Notes:
   operates on the key tensor via the pre-rotate-Q trick.
 - SWA layers always use bf16 regardless of `--ctk` / `--ctv`. This matches
   mlx-lm semantics.
-- `--paged-kv` is incompatible with `rot_k` / `rot_k_tq4v`.
+- `--paged-kv` is incompatible with `rot_k`.
 
 ### Canonical combo examples
 
@@ -1925,7 +2008,6 @@ rmlx serve --model <path> --kv-quant k8v8
 rmlx serve --model <path> --kv-quant k8v4
 rmlx serve --model <path> --kv-quant planar
 rmlx serve --model <path> --ctk q8_g128 --ctv tq4      # equivalent to k8v4
-rmlx serve --model <path> --ctk rot_k   --ctv tq4      # RotKTq4V hybrid
 rmlx serve --model <path> --ctk rot_k   --ctv q4_g64   # RotK affine V
 rmlx serve --model <path> --kv-quant mixed_k8g64_v4g64
 rmlx serve --model <path> --paged-kv --kv-quant k8v4
@@ -3366,7 +3448,7 @@ asserts over every codec.
 
 The store is also still read *without* a decode step in two places, and they
 matter for the codecs that still have one — the K-only and fused-symmetric
-families, `Mixed` / `RotK` / `RotKTq4V`, and any hydrated store-backed cache: the
+families, `Mixed` / `RotK`, and any hydrated store-backed cache: the
 SSD spill (`write_quant_k` / `write_quant_v` serialise `blocks` and report
 `shape[2]`) and the prompt-cache snapshot (`try_deep_clone`). An uncut store
 spills a header claiming more tokens than its bytes hold, which is how the defect
@@ -3424,8 +3506,8 @@ covering the sequence just discarded. Every arm now delegates to the store's own
 Tests: `storage/cpu_block_truncate_tests.rs` — the partial-accept round trip per
 store (`QuantV`, `QuantKTurbo3`, `QuantKTurbo4`, `QuantPlanarK`, `QuantPlanarV`,
 `QuantK`) at `kv_h` 1 and 3; the `b > 1` and q8-group refusals; the zero,
-exact-length and past-the-end targets; `KvStorage::reset`; the `RotKTq4V`
-zero-reset; and a five-arm `KvStorage::truncate_to` dispatch case (`K8V4`,
+exact-length and past-the-end targets; `KvStorage::reset`; and a five-arm
+`KvStorage::truncate_to` dispatch case (`K8V4`,
 `TurboSym3`, `TurboSym4`, `Planar`, `PlanarK`) that decodes both axes and
 compares against reference stores.
 

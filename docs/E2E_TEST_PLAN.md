@@ -75,10 +75,10 @@ the suite. A `PASS` on an `xfail` case means the gap was fixed → drop the tag.
    list omits it). RotK is reachable only via the compose form
    `--ctk rot_k --ctv q4_g64`, which works correctly. Display ↔ FromStr
    asymmetry.
-3. **rot_k_tq4v degraded on Bonsai-2bit**: drops the answer token at temp=0
-   ("The capital of France." — no "Paris") and is incoherent at 8k NIAH.
-   Reclassified to short-coherence-only (`degraded` tag), like the K-only
-   family.
+3. **rot_k_tq4v degraded on Bonsai-2bit**: dropped the answer token at temp=0
+   ("The capital of France." — no "Paris") and was incoherent at 8k NIAH.
+   That codec has since been retired (see `docs/KV_QUANT.md`
+   § "Retired: `rot_k_tq4v`"); its case is gone from the manifest.
 4. **Prompt-cache hit omitted first token from logprobs — RESOLVED**: previously,
    on the exact cache-hit path the cached `first_id` token was replayed without
    live logits (`qwen3.rs` Path A), so it was OMITTED from the OpenAI
@@ -133,7 +133,7 @@ note. This is a documented limitation, not a harness gap.
 Full codecs (coherent + NIAH@8k + cosine≥0.99):
 `k8v8`, `k8v4`, `k8vturbo3`, `k8vturbo2`, `k8vturbo3tcq`, `k8vturbo2tcq`,
 `planar`, `planar3`, `iso3`, `iso4`, `rotor3`, `rotor4`,
-`mixed_k8g64_v4g64`, `rot_k_v4g64` (RotK), `rot_k_tq4v`, `planar_k`.
+`mixed_k8g64_v4g64`, `rot_k_v4g64` (RotK), `planar_k`.
 
 K-only / symmetric (short-ctx coherence only, see K-only codec caveat above):
 `k_iso3`, `k_iso4`, `k_rotor3`, `k_rotor4`, `iso3_sym`, `iso4_sym`,

@@ -99,7 +99,7 @@ pub struct QuantV {
     pub value_codebook: Option<Vec<f32>>,
     // ── Per-layer codebook GPU upload cache ──────────────────────────────────
     /// Lazy-uploaded GPU copy of [`Self::value_codebook`]. `None` until the
-    /// first GPU `append_inner` call observes `value_codebook.is_some()`,
+    /// first GPU `append` call observes `value_codebook.is_some()`,
     /// at which point a `[16]` f32 Array is built once and reused across
     /// every subsequent encode + dequant on that layer.
     ///
@@ -119,7 +119,7 @@ pub struct QuantV {
     /// Set by `KvStorage::K8VTurbo3Tcq` (bits=3) and
     /// `KvStorage::K8VTurbo2Tcq` (bits=2) construction sites.
     /// Ignored on any other `bits` value. When `true` and `Device::Gpu`
-    /// is requested, the encode path falls back to CPU (`QuantV::append_inner`).
+    /// is requested, the encode path falls back to CPU (`QuantV::append`).
     pub use_tcq: bool,
 }
 
@@ -192,36 +192,9 @@ impl QuantV {
     /// Append a new V slice. CPU path uses scalar Rust; GPU path uses MSL kernel
     /// + pre-allocated 1D buffer with `slice_update`.
     ///
-    /// The GPU grow path caps at `max_seq` tokens (defensive backstop for K8V4
-    /// and similar callers). RotKTq4V must use [`Self::append_uncapped`] instead
-    /// because its decode appends tokens past max_seq after a full-prefill
-    /// bulk-init that already fills the buffer (/ -review HIGH 1).
-    pub fn append(
-        &mut self,
-        f32_data: &[f32],
-        new_shape: &[i32],
-        v_arr: &Array,
-        device: Device,
-        max_seq: i32,
-    ) -> Result<()> {
-        self.append_inner(f32_data, new_shape, v_arr, device, Some(max_seq))
-    }
-
-    /// Append a new V slice without a max-seq cap on the grow path.
-    ///
-    /// Used exclusively by RotKTq4V decode, where tokens accumulate beyond the
-    /// initial max_seq allocation (/ -review HIGH 1). All other
-    /// callers must use [`Self::append`] which retains the defensive cap.
-    pub fn append_uncapped(
-        &mut self,
-        f32_data: &[f32],
-        new_shape: &[i32],
-        v_arr: &Array,
-        device: Device,
-    ) -> Result<()> {
-        self.append_inner(f32_data, new_shape, v_arr, device, None)
-    }
-
+    /// The GPU grow path caps at `max_seq_cap` tokens: a decode step never needs
+    /// a V ring wider than the window the caller provisioned, and growing past
+    /// it would silently outlive the K side.
     #[allow(
         clippy::indexing_slicing,
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
@@ -234,13 +207,13 @@ impl QuantV {
         clippy::cognitive_complexity,
         reason = "adding the TCQ encode + GPU→CPU fallback bumped this fn over the lint threshold; further extraction would push state across boundaries with no readability gain"
     )]
-    fn append_inner(
+    pub fn append(
         &mut self,
         f32_data: &[f32],
         new_shape: &[i32],
         v_arr: &Array,
         device: Device,
-        max_seq_cap: Option<i32>,
+        max_seq_cap: i32,
     ) -> Result<()> {
         let prev_seq = self.shape[2];
         self.shape[2] += new_shape[2];
@@ -323,7 +296,7 @@ impl QuantV {
                 let scales_per_step = b * kv_h * d / GROUP_SIZE;
                 self.gpu_words_per_step = words_per_step as i32;
                 self.gpu_scales_per_step = scales_per_step as i32;
-                self.max_seq = max_seq_cap.unwrap_or(i32::MAX);
+                self.max_seq = max_seq_cap;
                 // Paged growth: start with one page, not max_seq.
                 // Hydration note: if prev_seq > 0, allocate enough for the
                 // existing data plus the new chunk so the grow path copies from
@@ -333,15 +306,9 @@ impl QuantV {
                     let needed = prev_seq + new_shape[2];
                     let pages = (needed + KV_PAGE_SIZE - 1) / KV_PAGE_SIZE;
                     let uncapped = pages * KV_PAGE_SIZE;
-                    match max_seq_cap {
-                        Some(ms) => uncapped.min(ms),
-                        None => uncapped,
-                    }
+                    uncapped.min(max_seq_cap)
                 } else {
-                    match max_seq_cap {
-                        Some(ms) => KV_PAGE_SIZE.min(ms),
-                        None => KV_PAGE_SIZE,
-                    }
+                    KV_PAGE_SIZE.min(max_seq_cap)
                 };
                 self.gpu_capacity = init_cap;
                 let codes_buf = zeros(
@@ -421,12 +388,7 @@ impl QuantV {
                 let new_cap = {
                     let pages = (needed + KV_PAGE_SIZE - 1) / KV_PAGE_SIZE;
                     let uncapped = pages * KV_PAGE_SIZE;
-                    // Cap at max_seq when the caller provided one (K8V4 and
-                    // similar paths); uncapped callers (RotKTq4V) may grow past.
-                    match max_seq_cap {
-                        Some(ms) => uncapped.min(ms),
-                        None => uncapped,
-                    }
+                    uncapped.min(max_seq_cap)
                 };
                 let words_per_step = self.gpu_words_per_step as usize;
                 let scales_per_step = self.gpu_scales_per_step as usize;

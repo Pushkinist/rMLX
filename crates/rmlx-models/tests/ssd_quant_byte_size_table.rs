@@ -18,7 +18,7 @@
 //! |---|---|---|
 //! | mirror-only | derived: `!materialises_packed_store()` | every one must spill the same bf16 payload |
 //! | store-keeping | derived: `materialises_packed_store()` | must spill codes, not the bf16 payload and not an empty stub |
-//! | `Mixed` / `RotK` / `RotKTq4V` | `UNDRIVABLE` | needs `pub(crate)` `MixedKvState`; refuses `update()` by contract |
+//! | `Mixed` / `RotK` | `UNDRIVABLE` | needs `pub(crate)` `MixedKvState`; refuses `update()` by contract |
 //! | `None` (bf16) | the oracle | what the mirror-only group must match |
 //!
 //! Two things keep this from being a gate that cannot fail. The groups are
@@ -73,7 +73,7 @@ const SEED_V: u64 = SEED_K ^ 0xABCD_1234;
 
 /// Codecs this integration test cannot drive, with the reason.
 ///
-/// `Mixed`, `RotK` and `RotKTq4V` need `pub(crate)` internal state
+/// `Mixed` and `RotK` need `pub(crate)` internal state
 /// (`MixedKvState`, the Hadamard rotation) that the public
 /// `KvCache::enter_prefill` → `update` → `exit_prefill` API cannot populate;
 /// they also refuse `update()` by contract.
@@ -84,7 +84,6 @@ const SEED_V: u64 = SEED_K ^ 0xABCD_1234;
 const UNDRIVABLE: &[(&str, &str)] = &[
     ("mixed_k8g64_v4g64", "requires pub(crate) MixedKvState"),
     ("rot_k_v8g64", "requires pub(crate) Hadamard rotation state"),
-    ("rot_k_tq4v", "same as rot_k"),
 ];
 
 fn is_undrivable(q: KvQuant) -> bool {

@@ -254,7 +254,6 @@ pub(crate) fn kv_quant_label(kv: Option<rmlx_kv_quant::KvQuant>) -> String {
         Some(rmlx_kv_quant::KvQuant::None) => "none",
         Some(rmlx_kv_quant::KvQuant::Mixed { .. }) => "mixed",
         Some(rmlx_kv_quant::KvQuant::RotK { .. }) => "rot_k",
-        Some(rmlx_kv_quant::KvQuant::RotKTq4V) => "rot_k_tq4v",
         Some(rmlx_kv_quant::KvQuant::K8VTurbo3) => "k8vturbo3",
         Some(rmlx_kv_quant::KvQuant::TurboSym4) => "tsym4",
         Some(rmlx_kv_quant::KvQuant::PlanarK) => "planar_k",

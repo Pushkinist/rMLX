@@ -226,26 +226,6 @@ impl MixedKvState {
         }
     }
 
-    /// construct a K-only rotated state for RotKTq4V.
-    ///
-    /// RotKTq4V stores V separately as `QuantV` (TurboFlash tq4), so the V
-    /// fields of `MixedKvState` are never used. This constructor omits V params
-    /// (`v_bits` / `v_group_size`) to signal intent clearly; the fields default
-    /// to 0 and are never read on the RotKTq4V code path.
-    pub fn new_k_only_rotated() -> Self {
-        Self {
-            k_bits: 8,
-            v_bits: 0,
-            k_group_size: 64,
-            v_group_size: 0,
-            offset: 0,
-            keys: None,
-            values: None,
-            rotate_k: true,
-            k_rotation: None,
-        }
-    }
-
     /// Rotate K by the stored rotation when RotK is active; identity otherwise.
     /// Builds the `[D, D]` Hadamard matrix on first use (`D = keys.head_dim`).
     #[allow(

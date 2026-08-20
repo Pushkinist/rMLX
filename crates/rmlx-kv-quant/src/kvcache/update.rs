@@ -2035,8 +2035,8 @@ impl KvCache {
             KvStorage::Planar { .. } => self.update_planar(new_k, new_v, device),
             KvStorage::None { .. } => self.update_none(new_k, new_v, device),
             KvStorage::Paged { .. } => self.update_paged(new_k, new_v, device),
-            KvStorage::Mixed { .. } | KvStorage::RotKTq4V { .. } => Err(Error::Mlx(
-                "Contract violation: KvCache::update called on a Mixed/RotKTq4V cache. \
+            KvStorage::Mixed { .. } => Err(Error::Mlx(
+                "Contract violation: KvCache::update called on a Mixed cache. \
                      These caches MUST be driven through KvCache::update_and_sdpa (universal \
                      wrapper). Direct update() bypasses the quantized SDPA and leaves the cache \
                      in an inconsistent state."
@@ -2297,7 +2297,6 @@ impl KvCache {
             KvStorage::Paged {
                 k, v_k8, v_planar, ..
             } => k.is_some() || v_k8.is_some() || v_planar.is_some(),
-            KvStorage::RotKTq4V { k_state, v, .. } => k_state.offset > 0 || v.is_some(),
             KvStorage::K8VTurbo3 { k, v, .. } => k.is_some() || v.is_some(),
             KvStorage::TurboSym3 { k, v, .. } => k.is_some() || v.is_some(),
             KvStorage::TurboSym4 { k, v, .. } => k.is_some() || v.is_some(),
@@ -2752,8 +2751,8 @@ impl KvCache {
 
         // REACHABILITY, as of the gate above: only the arms for codecs whose
         // `materialises_packed_store()` is true run. That is `Mixed`, `RotK`,
-        // `RotKTq4V`, `IsoKOnly3/4`, `RotorKOnly3/4`, `Iso3Sym`, `Iso4Sym`,
-        // `Rotor3Sym`, `Rotor4Sym` — nine of the arms below. The rest are the
+        // `IsoKOnly3/4`, `RotorKOnly3/4`, `Iso3Sym`, `Iso4Sym`,
+        // `Rotor3Sym`, `Rotor4Sym` — eight of the arms below. The rest are the
         // bf16-mirror family and the gate returns before them.
         //
         // They are kept, not deleted, because they ARE the re-enable path: a
@@ -2951,70 +2950,6 @@ impl KvCache {
                 state.bulk_init_from_fp16(&k_full, &v_full, device, policy)?;
                 // The compact fp16 seed for warm-TTFT decode is the same buffer
                 // already materialised above (decode_fp16_pair).
-            }
-            // RotKTq4V — bulk-quantize K into the rotated MixedKvState,
-            // and V into TurboFlash QuantV, from the accumulated fp16 prefix.
-            KvQuant::RotKTq4V => {
-                tracing::debug!(
-                    total_seq,
-                    "exit_prefill RotKTq4V: bulk-quantizing rotated K + tq4 V"
-                );
-                let new_shape = k_full.shape();
-                // _k_f32 unused: bulk_init_k_from_fp16 takes the Array directly.
-                // v_f32 is for QuantV::append CPU path.
-                let (_k_f32, v_f32) = if device == Device::Gpu {
-                    (Vec::new(), Vec::new())
-                } else {
-                    arrays_to_f32(&k_full, &v_full, device)?
-                };
-                let KvStorage::RotKTq4V {
-                    k_state,
-                    v,
-                    max_seq,
-                } = &mut self.storage
-                else {
-                    // -review HIGH 2: typed error instead of unreachable!() panic.
-                    let variant = storage_variant_name(&self.storage);
-                    return Err(Error::Mlx(format!(
-                        "RotKTq4V dispatch: storage variant mismatch (quant=RotKTq4V, \
-                         storage={variant}); cache may have been hydrated from incompatible spill"
-                    )));
-                };
-                let max_seq = *max_seq;
-                // K-side: use MixedKvState bulk init (rotate + affine-quantize K).
-                k_state.reset();
-                // For bulk K init we only need the K side — call bulk_init_from_fp16
-                // with a dummy zero V (it quantizes V too but we replace V below).
-                // Instead, use rotate_k_and_quantize directly + store K.
-                let (k_codes, k_scales, k_biases) =
-                    k_state.bulk_init_k_from_fp16(&k_full, device, policy)?;
-                k_state.keys = Some(crate::mixed_quant::MixedTuple {
-                    codes: k_codes,
-                    scales: k_scales,
-                    biases: k_biases,
-                });
-                k_state.offset = new_shape[2];
-
-                // V-side: quantize into TurboFlash QuantV.
-                let mut init_shape = new_shape.clone();
-                init_shape[2] = 0;
-                let mut qv = QuantV {
-                    blocks: Vec::new(),
-                    gpu_codes_buf: None,
-                    gpu_scales_buf: None,
-                    gpu_words_per_step: 0,
-                    gpu_scales_per_step: 0,
-                    gpu_capacity: 0,
-                    shape: init_shape,
-                    bits: 4,
-                    max_seq,
-                    high_precision_indices: None,
-                    value_codebook: None,
-                    value_codebook_gpu: None,
-                    use_tcq: false,
-                };
-                qv.append(&v_f32, &new_shape, &v_full, device, max_seq)?;
-                *v = Some(qv);
             }
             // K8VTurbo3 — bulk-quantize K (affine q8_0) + V (TurboQuant 3-bit).
             // CPU dequant only: no GPU path for 3-bit V (no MSL kernel this pass).
@@ -4186,20 +4121,6 @@ impl KvCache {
             // They are already async_eval'd by the slice_update chain inside write_page.
             // No additional flush needed here beyond the decode_fp16 trailing block.
             KvStorage::Paged { .. } => {}
-            // RotKTq4V — flush the MixedKvState (affine K) and the QuantV.
-            // -review MEDIUM 1: flush codes/scales independently so a mid-
-            // allocation window (one Some, one None) still flushes the available buf.
-            KvStorage::RotKTq4V { k_state, v, .. } => {
-                k_state.eval_gpu_state()?;
-                if let Some(qv) = v {
-                    if let Some(codes) = &qv.gpu_codes_buf {
-                        codes.eval()?;
-                    }
-                    if let Some(scales) = &qv.gpu_scales_buf {
-                        scales.eval()?;
-                    }
-                }
-            }
             // K8VTurbo3 — flush K (QuantK) and V (QuantV, bits=3, CPU-dequant only).
             KvStorage::K8VTurbo3 { k, v, .. } => {
                 if let Some(qk) = k {
@@ -8077,7 +7998,6 @@ pub(super) fn storage_max_seq(storage: &KvStorage) -> i32 {
         KvStorage::None { max_seq } => *max_seq,
         KvStorage::Mixed { max_seq, .. } => *max_seq,
         KvStorage::Paged { max_seq, .. } => *max_seq,
-        KvStorage::RotKTq4V { max_seq, .. } => *max_seq,
         KvStorage::K8VTurbo3 { max_seq, .. } => *max_seq,
         KvStorage::TurboSym3 { max_seq, .. } => *max_seq,
         KvStorage::TurboSym4 { max_seq, .. } => *max_seq,
@@ -8127,7 +8047,6 @@ fn set_storage_max_seq(storage: &mut KvStorage, new_max_seq: i32) {
         KvStorage::None { max_seq } => *max_seq = new_max_seq,
         KvStorage::Mixed { max_seq, .. } => *max_seq = new_max_seq,
         KvStorage::Paged { max_seq, .. } => *max_seq = new_max_seq,
-        KvStorage::RotKTq4V { max_seq, .. } => *max_seq = new_max_seq,
         KvStorage::K8VTurbo3 { max_seq, .. } => *max_seq = new_max_seq,
         KvStorage::TurboSym3 { max_seq, .. } => *max_seq = new_max_seq,
         KvStorage::TurboSym4 { max_seq, .. } => *max_seq = new_max_seq,

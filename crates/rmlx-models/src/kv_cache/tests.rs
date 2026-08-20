@@ -951,7 +951,6 @@ mod tests {
             KvQuant::Rotor4Sym,
             KvQuant::RotorKOnly3,
             KvQuant::RotorKOnly4,
-            KvQuant::RotKTq4V,
             KvQuant::Mixed {
                 k_bits: 8,
                 v_bits: 4,

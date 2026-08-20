@@ -632,6 +632,49 @@ fn schema_mismatch_on_v4_f32_scale_payload() {
     }
 }
 
+/// A v5 index must be refused, not adopted.
+///
+/// v5 and v6 have the same table shape and the same `(hash, layout_key)` key.
+/// What changed is the set of layer storage tags a block may carry: `rot_k_tq4v`
+/// was withdrawn, and its blocks now fail the tag match on read. They are
+/// unreachable by layout key too, but that guarantee lives in a formula in
+/// another crate — the version is the local one.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn schema_mismatch_on_v5_retired_codec_tag() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("index.db");
+
+    {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(SCHEMA_PRAGMAS).unwrap();
+        conn.execute_batch(SCHEMA_TABLES).unwrap();
+        conn.execute("INSERT INTO schema_version (version) VALUES (5)", [])
+            .unwrap();
+    }
+
+    match SsdKvIndex::open_at(&db) {
+        Err(SsdKvIndexError::SchemaMismatch { found, expected }) => {
+            assert_eq!(found, 5, "a v5 index must be reported as v5");
+            assert_eq!(
+                expected, SCHEMA_VERSION,
+                "the bump is what routes v5 namespaces through the wipe"
+            );
+            const {
+                assert!(
+                    SCHEMA_VERSION > 5,
+                    "SCHEMA_VERSION was lowered back to 5: blocks tagged with a \
+                     retired codec would be adopted again and fail on read"
+                );
+            }
+        }
+        other => panic!("expected SchemaMismatch for a v5 index, got {other:?}"),
+    }
+}
+
 /// A DB whose `kv_blocks` table exists but has NO `schema_version` table
 /// is the pre-release v1 layout. `install_config` was supposed to wipe
 /// such namespaces; if `open_at` is asked to consume one directly it must
