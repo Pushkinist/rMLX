@@ -418,7 +418,7 @@ fn rot_k_on_v_side_rejected() {
 #[test]
 #[allow(
     clippy::unwrap_used,
-    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    reason = "the assertion IS that resolve refuses: unwrap_err panicking would mean the pairing resolved, which is the regression this test exists to catch"
 )]
 fn rot_k_tq4_is_refused_at_every_supported_head_dim() {
     // Both head_dims the retired hybrid used to accept (128 = Bonsai/Qwen3

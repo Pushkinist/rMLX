@@ -115,7 +115,9 @@ discarded. Bar (§3): WIN / TIE-on-noise / LOSS.
   seven of them (`planar`, `planar3`, `planar_k`, `k8vturbo3`, `k8vturbo3tcq`,
   `tsym3`, `tsym4`). Only `iso3/4` and `rotor3/4` are CPU-hot-path, and only at
   **prefill**. The declared-unaffected set (`none`, `k8v8`, `k8vturbo2`,
-  `k8v4`, `rot_k_tq4v`) is classifier-identical to the declared-affected set,
+  `k8v4`, `rot_k_tq4v` — retired since, see `docs/KV_QUANT.md`; every mention
+  of it on this page is a historical measurement) is classifier-identical to
+  the declared-affected set,
   so the grouping never had a mechanism behind it. (b) The per-cell magnitudes
   were harness artefacts: two runs of the **same binary** disagreed by 29% at
   `none`@32k (61.5 vs 47.76) and reversed the codec ordering. Under `rmlx bench`

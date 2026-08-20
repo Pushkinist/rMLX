@@ -140,7 +140,7 @@ fn rot_k_k_dequant_score_error_stays_inside_the_rot_k_tolerance() {
 
     let mut k_state = MixedKvState::new_rotated(4, 64);
     let (k_codes, k_scales, k_biases) = k_state
-        .bulk_init_k_from_fp16(&k, device, DispatchPolicy::default())
+        .rotate_k_and_quantize(&k, device, DispatchPolicy::default())
         .unwrap();
 
     let k_dq = dequantize(

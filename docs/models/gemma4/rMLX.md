@@ -279,7 +279,9 @@ more than the low-accept drafter saves). _(64k baseline is n=2 — soft.)_
 size** — `none` **77/72/68/59/47** beats champ 75/71/66/58/46 by +1…+3 % (§3). KV
 is again a decode no-op (all mainstream ≈ `none`) and memory-inflating (`none`
 @1044 MB @64k is smallest; iso_sym 4120 = 3.9×). Two prefill landmines surface in
-TTFT only: `rotor*_sym` (102 s @64k cold, QJL prefill) and `rot_k_tq4v` (decode
+TTFT only: `rotor*_sym` (102 s @64k cold, QJL prefill) and `rot_k_tq4v`
+(retired since, see `docs/KV_QUANT.md`; every mention of it on this page is a
+historical measurement) (decode
 *also* degrades −15…−20 % at long ctx, the K-kernel cost scaling with hidden dim).
 MTP pays big at 8k (93 vs 72, +29 %, accept 0.47) and 16k (78 vs 68, accept 0.48),
 but craters at 4k (51 vs 77, accept 0.08) and loses at 32k/64k (accept 0.17/0.23).

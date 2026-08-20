@@ -2771,7 +2771,7 @@ impl KvCache {
             // The arms from here down that belong to the bf16-mirror family
             // (`K8V8`, `K8V4`, `Planar*`, `PlanarK`, `K8VTurbo*`, `TurboSym*`,
             // `Iso3/4`, `Rotor3/4`, `RotorK*Asym`) are behind the gate above.
-            // The nine listed there are the ones that still run.
+            // The eight listed there are the ones that still run.
             KvQuant::K8V8 => {
                 let max_seq = match &self.storage {
                     KvStorage::K8V8 { max_seq, .. } => *max_seq,

@@ -725,30 +725,59 @@ dtype fix — see the digest table further down, where 32k now reproduces the
 bf16 reference exactly. The 8k divergence survives.
 
 **The kernel's own numerics, measured.** `turbo_flash_reference_sdpa`
-(`turbo_flash_msl.rs`) is a dequantize-then-SDPA arm over the *identical*
-`flash_k_codes` / `flash_k_scales` / `flash_v_codes` / `flash_v_scales`
-buffers, unpacked with the same two codecs the kernel unpacks inline. Every
+(`turbo_flash_msl.rs`, `#[cfg(test)]`) is a dequantize-then-SDPA arm over the
+*identical* `flash_k_codes` / `flash_k_scales` / `flash_v_codes` /
+`flash_v_scales` buffers, unpacked with the same two codecs the kernel unpacks
+inline and computed at the kernel's own f32 working precision. Every
 quantization error is common to both arms and cancels; what is left is the
 kernel's block tiling, its online softmax and its two-pass rescale. Measured at
 the attention geometry of each architecture the kernel actually dispatches on,
-on a ring whose stride is wider than its fill and whose last block is partial:
+plus a masked cell, on a ring whose stride is wider than its fill and whose
+last block is partial:
 
-| geometry | `head_dim` | `kv_h` × heads/kv | cosine vs reference | max elementwise diff |
+| cell | `head_dim` | `kv_h` × heads/kv | cosine | worst per-row diff |
 |---|---:|---:|---:|---:|
-| Ternary-Bonsai-8B-2bit | 128 | 8 × 4 | 0.9999956 | 1.4 bf16 ULP |
-| Qwen3.6-35B-A3B-8bit | 256 | 2 × 8 | 0.9999962 | 1.7 bf16 ULP |
+| Ternary-Bonsai-8B-2bit | 128 | 8 × 4 | 1.0 | 0.056 bf16 ULP |
+| Qwen3.6-35B-A3B-8bit | 256 | 2 × 8 | 1.0 | **bit-identical** |
+| Bonsai-8B + additive mask | 128 | 8 × 4 | 1.0 | **bit-identical** |
+
+The gate is cosine ≥ 0.999999 and ≤ 0.5 bf16 ULP per row — the bound quoted
+here is the gate's, not the measurement's, so a drift toward it cannot leave
+this page true and CI green at the same time.
 
 The kernel is therefore accurate **for its codec**, and the ≈0.997 SDPA cosine
 against bf16 is the tq4-V codec's own floor — which at temp=0 flips greedy
 argmax ties prompt-dependently. Guards:
 `turbo_flash_matches_its_codec_reference_at_{bonsai_8b,qwen36_35b}_geometry`
-(`#[ignore]`, GPU).
+and `..._with_an_additive_mask` (`#[ignore]`, GPU).
 Mutation-checked: feeding the kernel `t_active` where `t_stride` belongs drops
-the cosine to 0.718 / 0.159, and dropping a single tail KV token drops it to
-0.9964 — *below* the 0.997 codec floor, which is why a bf16-referenced gate at
-that floor would have passed that bug and a codec-referenced one does not. The
-reference arm is also asserted not to move the dispatch counter, so it cannot
-quietly become a second call into the thing it is checking.
+the cosine to −0.04 / 0.65, and dropping a single tail KV token drops it to
+0.995 (19–28 ULP) — the latter is *below* the 0.997 codec floor, which is why a
+bf16-referenced gate at that floor would have passed that bug and a
+codec-referenced one does not. The reference arm is also asserted not to move
+the dispatch counter, so it cannot quietly become a second call into the thing
+it is checking.
+
+**Two things the reference had to be taught, both found by cells that did not
+exist at first.** It validated `n_q_heads % n_kv_heads` when the *kernel* did
+not — see "GQA divisibility" below — and it handed the kernel's f32 mask
+straight to MLX SDPA, which refuses a mask that does not promote to the bf16
+output. A reference is only a reference where it accepts and refuses exactly
+what it references.
+
+### GQA divisibility — a kernel-entry gap the reference exposed
+
+`turbo_flash_sdpa` computed `n_repeats = n_q_heads / n_kv_heads` in integer
+arithmetic with no divisibility check, and the MSL maps
+`kv_head = q_head / n_repeats`. For `(n_q_heads, n_kv_heads) = (3, 2)` that
+truncates to `n_repeats = 1`, so `q_head = 2` reads `kv_head = 2` against a
+two-head store — past that batch's KV base, silently, with a plausible-looking
+answer. `n_kv_heads == 0` divided by zero. The rule now lives in
+`validate_flash_shapes`, which both arms call, and is covered by the GQA cells
+in `reference_and_kernel_refuse_the_same_shapes_for_the_same_reason`. No
+in-tree caller passes a non-multiple — `update_and_sdpa_k8v4_flash_inner`
+derives both counts from the cache's own shapes — so this is entry-validation
+hardening, not a live-path fix.
 
 **Consequence for the HOLD.** The correctness half is discharged: it asked for
 something no bf16 baseline could ever supply, and the reference arm supplies it.
@@ -811,8 +840,9 @@ override), temp=0, 32 tokens, `kv_bytes` as the dispatch witness:
 Two things follow. **Qwen3.6-35B-A3B is a second *firing* architecture whose
 digest does not move** (`head_dim` 256, MoE): a kernel that computed the wrong
 thing would not be selective by prompt. And the 8k Bonsai ON digest is
-**byte-identical** to the digest the retired `rot_k_tq4v` codec produced at the
-same shape — a completely different decode path (dequant-then-SDPA, and a
+**byte-identical** to the digest the `rot_k_tq4v` codec produced at the
+same shape (measured before that codec was retired in this same change, so it
+is not reproducible on this tree) — a completely different decode path (dequant-then-SDPA, and a
 *different* K codec) whose only thing in common with this one is that it applies
 TurboQuant-4 V at decode. Two independent implementations of the same V codec
 landing on the same 32 token ids is what a codec floor looks like; it is not
@@ -1018,7 +1048,7 @@ rMLX MSL q8_0 with symmetric `scale = max(|x|)/127` and no bias.
 **`KvQuant::RotK`**: reuses `KvStorage::Mixed` with `rotate_k=true` on
 `MixedKvState`. K bits are fixed at 8, group_size fixed at 64. The storage
 and SDPA machinery is identical to plain Mixed; the only difference is that
-`MixedKvState::update_k_and_fetch` applies a Hadamard rotation to K before
+`MixedKvState::update_and_fetch` applies a Hadamard rotation to K before
 quantization, and `mixed_quantized_sdpa` applies the same rotation to Q
 before the score matmul so the rotations cancel. See rot_k below.
 
@@ -1139,9 +1169,10 @@ and `hadamard_incoherence_ratio_beats_every_block_local_rotation` in
 
 ### Retired: `rot_k_tq4v` (rotated K + TurboQuant 4-bit V)
 
-Withdrawn. `--kv-quant rot_k_tq4v` and `--ctk rot_k --ctv tq4` are both rejected
-at parse; the error names `rot_k_v4g64`, which is the same rotated affine 8-bit
-K with an MLX-affine 4-bit V. Recorded here so the design is not re-derived.
+Withdrawn. `--kv-quant rot_k_tq4v` is rejected at parse and
+`--ctk rot_k --ctv tq4` at resolve (`combo_to_kv_quant`); each error names
+`rot_k_v4g64`, which is the same rotated affine 8-bit K with an MLX-affine
+4-bit V. Recorded here so the design is not re-derived.
 
 It was a dequant-then-SDPA path: every decode step appended to its packed store
 and then rebuilt a **full bf16 K and a full bf16 V of the whole prefix** before

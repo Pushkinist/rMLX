@@ -79,9 +79,12 @@ use tracing::{info, warn};
 ///
 /// Measured against a reference that *does* run the codec —
 /// `turbo_flash_reference_sdpa`, a dequantize-then-SDPA over the identical
-/// `flash_*` buffers — the kernel agrees to **≤1.7 bf16 ULP** (cosine
-/// 0.9999956 at the Bonsai-8B geometry, 0.9999962 at Qwen3.6-35B-A3B's), on a
-/// ring whose stride is wider than its fill and whose last block is partial. The kernel is
+/// `flash_*` buffers at the kernel's own f32 working precision — the kernel is
+/// gated at **cosine ≥ 0.999999 and ≤ 0.5 bf16 ULP per row** and measures 0.056
+/// ULP at worst, two of three cells bit-identical. The cells are the two
+/// dispatching geometries plus an additive-mask cell, on a ring whose stride is
+/// wider than its fill and whose last block is partial — i.e. decode as
+/// production drives it, at `q_seq = 1`. The kernel is
 /// therefore accurate *for its codec*; the ≈0.997 SDPA cosine against bf16 is
 /// the tq4-V codec floor, and at temp=0 that floor flips greedy argmax ties
 /// prompt-dependently. So this is a decode loss plus a codec-fidelity cost —
@@ -111,9 +114,10 @@ pub(crate) enum TurboFlashMode {
     /// `RMLX_TURBO_FLASH=1` does not survive it.
     Off,
     /// Resolves to OFF on every host: the kernel is a measured 2.0–4.25×
-    /// decode loss on the one codec it serves. Its numerics are cleared —
-    /// it matches a dequant-then-SDPA reference over its own packed buffers to
-    /// ≤2 bf16 ULP — so throughput is the whole of the remaining HOLD.
+    /// decode loss on the one codec it serves. Its numerics are cleared for
+    /// decode as production drives it — it matches a dequant-then-SDPA
+    /// reference over its own packed buffers within a 0.5 bf16 ULP gate — so
+    /// throughput is the whole of the remaining HOLD.
     #[default]
     Auto,
 }
@@ -164,7 +168,8 @@ fn resolve_turbo_flash(
         // privilege. It also changes the generated tokens, because it is the
         // only K8V4 configuration in which the 4-bit V codec participates in
         // decode at all — that is the codec's error, not the kernel's, which
-        // matches a reference over its own packed buffers to <=2 bf16 ULP.
+        // matches a reference over its own packed buffers inside a 0.5 bf16 ULP
+        // gate.
         // Defaulting a measured decode loss ON is worse than shipping no kernel
         // at all, so Auto stays OFF until a throughput re-measurement clears
         // it. See `TurboFlashMode` for the cells. The family is still probed so

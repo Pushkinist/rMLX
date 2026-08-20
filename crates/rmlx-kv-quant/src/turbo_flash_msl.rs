@@ -41,8 +41,9 @@
 //! kernel's own error being *small*. [`turbo_flash_reference_sdpa`] closes
 //! that: it unpacks the same packed buffers and runs an ordinary SDPA, so the
 //! codec cancels between the arms and only the kernel's arithmetic is left.
-//! Measured <=1.7 bf16 ULP at both dispatching geometries (cosine 0.9999956 at
-//! Bonsai-8B's, 0.9999962 at Qwen3.6-35B-A3B's). Any comparison against a
+//! Gated at cosine >= 0.999999 and <= 0.5 bf16 ULP per row over three cells —
+//! the two dispatching geometries and an additive-mask cell — and measuring
+//! 0.056 ULP at worst, two of the three bit-identical. Any comparison against a
 //! `--turbo-flash off` run is a
 //! comparison against a bf16 attention — that arm does not run the codec at
 //! all — and cannot answer this question in either direction.
@@ -321,8 +322,24 @@ fn p2_kernel() -> Result<&'static MetalKernel> {
 /// Shape preconditions shared by the kernel and its reference arm.
 ///
 /// Both must refuse the same inputs, or a reference that silently accepted a
-/// shape the kernel rejects would compare a computed answer against nothing.
-fn validate_flash_shapes(caller: &str, head_dim: i32, t_active: i32, t_stride: i32) -> Result<()> {
+/// shape the kernel rejects would compare a computed answer against nothing —
+/// and, the other way round, a reference that refuses *more* than the kernel
+/// hides whatever the kernel does with the inputs it still takes.
+///
+/// The GQA rule is here for the second reason. `n_repeats` is
+/// `n_q_heads / n_kv_heads` in integer arithmetic and the MSL maps
+/// `kv_head = q_head / n_repeats`, so a non-multiple truncates: (3, 2) yields
+/// `n_repeats = 1` and a `kv_head` of 2 against a 2-head store, which indexes
+/// past that batch's KV base with no error anywhere. `n_kv_heads == 0` would
+/// divide by zero. Both are refused before either arm touches a buffer.
+fn validate_flash_shapes(
+    caller: &str,
+    n_q_heads: i32,
+    n_kv_heads: i32,
+    head_dim: i32,
+    t_active: i32,
+    t_stride: i32,
+) -> Result<()> {
     if head_dim % 32 != 0 {
         return Err(Error::Quant(format!(
             "{caller}: head_dim={head_dim} not divisible by 32"
@@ -337,6 +354,12 @@ fn validate_flash_shapes(caller: &str, head_dim: i32, t_active: i32, t_stride: i
     if t_stride < t_active {
         return Err(Error::Quant(format!(
             "{caller}: t_stride={t_stride} < t_active={t_active}"
+        )));
+    }
+    if n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0 {
+        return Err(Error::Quant(format!(
+            "{caller}: n_q_heads={n_q_heads} is not a multiple of \
+             n_kv_heads={n_kv_heads}"
         )));
     }
     Ok(())
@@ -360,14 +383,26 @@ fn validate_flash_shapes(caller: &str, head_dim: i32, t_active: i32, t_stride: i
 /// remains is the kernel's own arithmetic — its block tiling, its online
 /// softmax and its two-pass rescale.
 ///
-/// Correctness only. It materialises a full bf16 K and V of the whole window
-/// per call, which is exactly the cost the kernel exists to avoid; nothing on
-/// a decode path may call it.
+/// The dequant is to **f32**, not to the query dtype, and the SDPA runs there
+/// too. That is not a detail: the kernel dequantizes into f32 registers and
+/// accumulates in f32, so a bf16 reference would re-round every dequantized K
+/// and V element in a way the kernel never does, and that asymmetry — not the
+/// kernel — was the whole of the 1.3-1.7 bf16 ULP floor this arm first
+/// measured. Matching the kernel's working precision drops it to <=0.06 ULP,
+/// with two of three cells bit-identical. The result is cast back to the query
+/// dtype at the end so both arms return the same type.
+///
+/// Correctness only, and `#[cfg(test)]` so that is enforced by the compiler
+/// rather than by this sentence: it materialises a full f32 K and V of the
+/// whole window per call, which is exactly the cost the kernel exists to
+/// avoid. It is not merely un-called on a decode path — it is not present in
+/// one. The sibling test module is a child of this one, so it still sees it.
 ///
 /// Arguments, dtypes and layout are [`turbo_flash_sdpa`]'s, unchanged —
 /// including `queries` being **pre-scaled**, so no scale is applied here.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-pub fn turbo_flash_reference_sdpa(
+pub(crate) fn turbo_flash_reference_sdpa(
     queries: &Array,
     k_codes_flat: &Array,
     k_scales_flat: &Array,
@@ -382,19 +417,20 @@ pub fn turbo_flash_reference_sdpa(
     head_dim: i32,
     device: Device,
 ) -> Result<Array> {
-    validate_flash_shapes("turbo_flash_reference_sdpa", head_dim, t_active, t_stride)?;
-    if n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0 {
-        return Err(Error::Quant(format!(
-            "turbo_flash_reference_sdpa: n_q_heads={n_q_heads} is not a multiple \
-             of n_kv_heads={n_kv_heads}"
-        )));
-    }
+    validate_flash_shapes(
+        "turbo_flash_reference_sdpa",
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        t_active,
+        t_stride,
+    )?;
 
     // Unpack the whole provisioned window, then keep the active prefix. The
     // kernel iterates `t < t_active` over a buffer of row stride `t_stride`, so
     // slicing after the dequant is what reproduces its view of the same bytes.
     let full_shape = [b, n_kv_heads, t_stride, head_dim];
-    let out_dtype = queries.dtype();
+    let out_dtype = Dtype::F32;
     let k_full = crate::q8_msl::q8_dequantize_gpu(
         k_codes_flat,
         k_scales_flat,
@@ -416,10 +452,26 @@ pub fn turbo_flash_reference_sdpa(
     let k = k_full.slice(&start, &stop, &strides, device)?;
     let v = v_full.slice(&start, &stop, &strides, device)?;
 
-    // `queries` arrives pre-scaled, same as the kernel's contract, so the
-    // SDPA scale is 1.0 and the only difference between the arms is arithmetic.
-    let mask_mode = if additive_mask.is_some() { "array" } else { "" };
-    rmlx_mlx::scaled_dot_product_attention(queries, &k, &v, 1.0, mask_mode, additive_mask, device)
+    // The mask arrives f32 by this function's contract (it is the kernel's),
+    // and MLX SDPA requires a mask that promotes to the *output* dtype — an
+    // f32 mask against a bf16 output is refused outright. The kernel casts the
+    // mask the other way, to f32, because it accumulates there. Cast to the
+    // query dtype here for the same reason K and V were dequantized to it: the
+    // reference must present the same additive mask in the arithmetic it runs.
+    let mask_owned = match additive_mask {
+        Some(m) if m.dtype() != out_dtype => Some(m.astype(out_dtype, device)?),
+        _ => None,
+    };
+    let mask = mask_owned.as_ref().or(additive_mask);
+
+    let q_f32 = if queries.dtype() == Dtype::F32 {
+        queries.try_clone()?
+    } else {
+        queries.astype(Dtype::F32, device)?
+    };
+    let mask_mode = if mask.is_some() { "array" } else { "" };
+    let out = rmlx_mlx::scaled_dot_product_attention(&q_f32, &k, &v, 1.0, mask_mode, mask, device)?;
+    out.astype(queries.dtype(), device)
 }
 
 /// 2-pass split-K FlashAttention for rMLX's native q8_0 K + turbo4 V format.
@@ -474,7 +526,14 @@ pub fn turbo_flash_sdpa(
     head_dim: i32,
     device: Device,
 ) -> Result<Array> {
-    validate_flash_shapes("turbo_flash_sdpa", head_dim, t_active, t_stride)?;
+    validate_flash_shapes(
+        "turbo_flash_sdpa",
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        t_active,
+        t_stride,
+    )?;
 
     let n_repeats = n_q_heads / n_kv_heads;
     let n_blocks = (t_active + BLOCK_SIZE - 1) / BLOCK_SIZE;

@@ -642,7 +642,7 @@ fn schema_mismatch_on_v4_f32_scale_payload() {
 #[test]
 #[allow(
     clippy::unwrap_used,
-    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    reason = "fixture setup on a fresh TempDir: the directory exists and the DB is created by this fn, so open/execute cannot fail without the test being meaningless anyway"
 )]
 fn schema_mismatch_on_v5_retired_codec_tag() {
     let tmp = TempDir::new().unwrap();

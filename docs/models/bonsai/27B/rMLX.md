@@ -120,7 +120,9 @@ directly. KV-MB from serve events `op='kv_cache_bytes'` high-water (the `baselin
   *below* the KV boundary gives **50.4 / 15.5 / 5.0** TPS at 4k/32k/128k vs a
   same-machine `k8v8` control **45.1 / 37.3 / 21.4** (a genuine, context-growing
   tq4-V cost: `k8v4` ties `k8v8` at 4k, is 2.4× slower at 32k, 4.3× slower at
-  128k). `rot_k_tq4v` (48→…→11.7) shares it; `k8v8` (8-bit V) tracks `none`. But
+  128k). `rot_k_tq4v` (48→…→11.7) shares it — that codec has since been
+  retired (see `docs/KV_QUANT.md`); every mention of it on this page is a
+  historical measurement. `k8v8` (8-bit V) tracks `none`. But
   `k8v4` decode *also* **crashes at the next power-of-two KV boundary** (still
   live), so it cannot generate across a `2^k` boundary. **Avoid 4-bit V here.**
 
