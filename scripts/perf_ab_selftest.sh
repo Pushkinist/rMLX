@@ -39,14 +39,17 @@ mkdir -p "$STATE" "$MODEL" "$MODEL2"
 TOKENS_MAIN="11,22,33,44,55"
 TOKENS_ALT="11,22,99,44,55"
 
-# make_stub <name> <tps-csv> <gen_alloc_mb> <tokens> [drift_at_call] [omit]
+# make_stub <name> <tps-csv> <gen_alloc_mb> <tokens> [drift_at_call] [omit] [kv_bytes]
 #
 # The stub cycles through <tps-csv> across successive calls, so a run sees a
 # spread rather than a constant and the disjoint-range criterion is exercised
 # on real (if synthetic) variation. `drift_at_call` makes the Nth call emit
 # TOKENS_ALT instead. `omit` drops a required field from the output.
+# `kv_bytes` is the resident-KV column: a byte count, the literal `n/a` (the
+# baseline command's own refusal), or empty to drop the field entirely, which
+# is what an older binary looks like to this harness.
 make_stub() {
-	local name="$1" tps="$2" mem="$3" tokens="$4" drift="${5:-}" omit="${6:-}"
+	local name="$1" tps="$2" mem="$3" tokens="$4" drift="${5:-}" omit="${6:-}" kv="${7:-}"
 	local path="$WORK/$name"
 	cat >"$path" <<STUB
 #!/usr/bin/env bash
@@ -83,10 +86,19 @@ sleep 0.25
 if [ -n "$drift" ] && [ "\$n" = "$drift" ]; then tok="$TOKENS_ALT"; fi
 peak=100.0
 if [ "$omit" = "zeropeak" ]; then peak=0.0; fi
+kvcol=""
+kvval="$kv"
+# "partial" is the any-vs-all case: this slot refuses on odd-numbered calls and
+# reports on even ones, so an arm ends up with a mixture. (No backticks: this
+# heredoc is unquoted, so they would run as command substitution right here.)
+if [ "$kv" = "partial" ]; then
+  if [ \$((n % 2)) -eq 1 ]; then kvval="n/a"; else kvval=1000000123; fi
+fi
+if [ -n "$kv" ]; then kvcol="  kv_cache_bytes=\$kvval"; fi
 if [ "$omit" != "tps" ]; then
-  printf 'baseline: model=stub  load=1ms  ttft_ms=1  decode_tps=%s  overall_tps=%s  prefill_tps=1.0  prompt_tokens=4096  peak_rss=1.0MB  metal_peak_mb=%s  metal_gen_alloc_mb=%s\n' "\$v" "\$v" "\$peak" "$mem"
+  printf 'baseline: model=stub  load=1ms  ttft_ms=1  decode_tps=%s  overall_tps=%s  prefill_tps=1.0  prompt_tokens=4096  peak_rss=1.0MB  metal_peak_mb=%s  metal_gen_alloc_mb=%s%s\n' "\$v" "\$v" "\$peak" "$mem" "\$kvcol"
 else
-  printf 'baseline: model=stub  load=1ms  ttft_ms=1  prompt_tokens=4096  metal_peak_mb=%s  metal_gen_alloc_mb=%s\n' "\$peak" "$mem"
+  printf 'baseline: model=stub  load=1ms  ttft_ms=1  prompt_tokens=4096  metal_peak_mb=%s  metal_gen_alloc_mb=%s%s\n' "\$peak" "$mem" "\$kvcol"
 fi
 if [ "$omit" != "ids" ]; then printf 'baseline: token_ids=%s\n' "\$tok"; fi
 STUB
@@ -101,6 +113,18 @@ FAILED=0
 
 # check <name> <expected-exit> <what-it-proves> -- <perf_ab.sh args...>
 # Optional trailing `GREP:<pattern>` entries assert on the captured output.
+#
+# <expected-exit> may be the sentinel RC_REPORT instead of a number. Use it for
+# any case whose subject is what the harness REPORTED, rather than a refusal it
+# chose. For a run that reaches its report the exit code is 0 on a quiet host
+# and 125 on a tainted one, so a literal `0` there is an assertion about the
+# machine: it holds until the interference sampler happens to fire and then
+# fails while the behaviour under test is still correct. RC_REPORT asserts
+# instead that the code agrees with the harness's OWN verdict line -- `VERDICT:
+# TAINTED` means 125, anything else means 0 -- which still catches a harness
+# that stops signalling taint, without importing the host into the expectation.
+#
+# A refusal case keeps its literal number: there the code is the behaviour.
 check() {
 	local name="$1" want="$2" what="$3"
 	shift 3
@@ -122,6 +146,12 @@ check() {
 	RMLX_HOME="$WORK/home" PATH="${path_prefix:+$path_prefix:}$PATH" \
 		bash "$AB" ${args[@]+"${args[@]}"} >"$out" 2>&1
 	local got=$?
+
+	# RC_REPORT: the expected code is whatever the harness's own verdict line
+	# implies, resolved after the run rather than assumed before it.
+	if [[ "$want" == "RC_REPORT" ]]; then
+		if grep -q '^  TAINTED:' "$out"; then want=125; else want=0; fi
+	fi
 
 	local ok=1
 	[[ "$got" -eq "$want" ]] || ok=0
@@ -164,6 +194,18 @@ WRONG="$(make_stub wrong "100.0,100.5,101.0" 40.0 "$TOKENS_ALT")"
 DRIFTER="$(make_stub drifter "100.0,100.5,101.0" 40.0 "$TOKENS_MAIN" 3)"
 NO_TPS="$(make_stub no_tps "100.0" 40.0 "$TOKENS_MAIN" "" tps)"
 NO_IDS="$(make_stub no_ids "100.0" 40.0 "$TOKENS_MAIN" "" ids)"
+# Resident-KV column. KV_SMALL/KV_BIG carry byte counts a factor 2 apart;
+# KV_NA emits the baseline command's own `n/a` refusal; KV_ABSENT drops the
+# field, which is what a binary predating the column looks like.
+KV_SMALL="$(make_stub kv_small "100.0,100.5,101.0" 40.0 "$TOKENS_MAIN" "" "" 1000000123)"
+KV_BIG="$(make_stub kv_big "100.0,100.5,101.0" 40.0 "$TOKENS_MAIN" "" "" 2000000000)"
+KV_NA="$(make_stub kv_na "100.0,100.5,101.0" 40.0 "$TOKENS_MAIN" "" "" "n/a")"
+# Reports on some calls and refuses on others -- the case the "ANY slot refused"
+# invariant is actually about.
+KV_PARTIAL="$(make_stub kv_partial "100.0,100.5,101.0" 40.0 "$TOKENS_MAIN" "" "" "partial")"
+# Neither a byte count nor the `n/a` refusal.
+KV_NAN="$(make_stub kv_nan "100.0,100.5,101.0" 40.0 "$TOKENS_MAIN" "" "" "nan")"
+KV_ABSENT="$(make_stub kv_absent "100.0,100.5,101.0" 40.0 "$TOKENS_MAIN")"
 
 # Nothing on this host counts as busy unless a case says otherwise; the CPU
 # gate has its own cases below and must not make the others flaky.
@@ -176,7 +218,7 @@ echo "perf_ab selftest: mutation checks"
 
 # ---- can it see a difference that is there? ----------------------------------
 
-check planted_10pct 0 \
+check planted_10pct RC_REPORT \
 	"a planted +9.95% arm is reported as +9.95% and SEPARATED" \
 	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" "${QUIET[@]}" \
 	"GREP:ratio B/A = 1\.0995" \
@@ -184,29 +226,81 @@ check planted_10pct 0 \
 	"GREP:median= *110\.5000" \
 	"GREP:VERDICT: SEPARATED"
 
-check planted_inverted 0 \
+check planted_inverted RC_REPORT \
 	"--invert swaps the pattern and still reports the same ratio" \
 	--binary-a "$SLOW" --binary-b "$FAST" --invert "${COMMON[@]}" "${QUIET[@]}" \
 	"GREP:ratio B/A = 1\.0995" \
 	"GREP:VERDICT: SEPARATED" \
 	"GREP:pattern: BAAB ABBA BAAB"
 
-check planted_memory 0 \
+check planted_memory RC_REPORT \
 	"a planted +15 MB allocation shows up in the peak-memory column" \
 	--binary-a "$SLOW" --binary-b "$HUNGRY" --allow-null-arms "${COMMON[@]}" "${QUIET[@]}" \
 	"GREP:A median=40\.0000  B median=55\.0000  delta=\+15\.0 MB" \
 	"GREP:ratio B/A = 1\.0000"
 
+check planted_kv_residency RC_REPORT \
+	"a 2x resident-KV arm is reported as ratio 2.0000, in MB" \
+	--binary-a "$KV_SMALL" --binary-b "$KV_BIG" "${COMMON[@]}" "${QUIET[@]}" \
+	"GREP:kv_cache_bytes      A median=1000\.0 MB  B median=2000\.0 MB  ratio B/A=2\.0000" \
+	"GREP:result: "
+
+# The printed table rounds to 0.1 MB. The result file is what gets promoted into
+# the append-only metrics store, so it has to carry the byte count the slot
+# actually reported: KV_SMALL's 1 000 000 123 B prints as 1000.0 MB either way,
+# and only the JSON can tell an exact reading from a round-tripped one.
+JSON_KV="$(sed -n 's/^result: //p' "$WORK/planted_kv_residency.log" | tail -1)"
+KV_A="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['results'][0]['arm_a']['median_kv_cache_bytes'])" "$JSON_KV" 2>/dev/null || echo unreadable)"
+if [[ "$KV_A" == "1000000123" ]]; then
+	PASSED=$((PASSED + 1))
+	printf '  ok   %-26s        — result file carries exact bytes (%s), not the rounded MB\n' \
+		"kv_residency_json_exact" "$KV_A"
+else
+	FAILED=$((FAILED + 1))
+	printf '  FAIL %-26s        — arm A median_kv_cache_bytes is %s, want 1000000123\n' \
+		"kv_residency_json_exact" "$KV_A"
+fi
+
+# The two ways this column can be absent must both read as "not measured".
+# A 0 here would divide into a residency ratio as a cache of no bytes, which
+# is the shape of every silent-fallback defect this repo has had to unpick.
+check kv_residency_refusal_is_not_zero RC_REPORT \
+	"a slot whose KV accounting refused reports n/a, never 0" \
+	--binary-a "$KV_NA" --binary-b "$KV_BIG" "${COMMON[@]}" "${QUIET[@]}" \
+	"GREP:kv_cache_bytes      A median=n/a MB  B median=2000\.0 MB  ratio B/A=n/a" \
+	"NOGREP:A median=0\.0 MB"
+
+check kv_residency_absent_column_is_not_zero RC_REPORT \
+	"a binary that emits no KV column reports n/a, never 0" \
+	--binary-a "$KV_ABSENT" --binary-b "$KV_BIG" "${COMMON[@]}" "${QUIET[@]}" \
+	"GREP:kv_cache_bytes      A median=n/a MB  B median=2000\.0 MB  ratio B/A=n/a"
+
+# The invariant is "n/a if ANY slot refused", and an all-refuse stub cannot tell
+# that apart from "n/a if EVERY slot refused" -- both rules agree on it. Only a
+# mixture separates them.
+check kv_residency_any_refusal_taints_the_arm RC_REPORT \
+	"one refusing slot makes the whole arm n/a, not a median of the rest" \
+	--binary-a "$KV_PARTIAL" --binary-b "$KV_BIG" "${COMMON[@]}" "${QUIET[@]}" \
+	"GREP:kv_cache_bytes      A median=n/a MB  B median=2000\.0 MB  ratio B/A=n/a" \
+	"NOGREP:A median=1000\.0 MB"
+
+# awk reads a non-numeric token as 0, so an unrecognised spelling would become a
+# median of 0 bytes and record as the smallest cache ever measured.
+check kv_residency_non_numeric_refused 125 \
+	"a kv_cache_bytes token that is neither a number nor n/a is refused" \
+	--binary-a "$KV_NAN" --binary-b "$KV_BIG" "${COMMON[@]}" "${QUIET[@]}" \
+	"GREP:reported kv_cache_bytes=nan"
+
 # ---- does it stay quiet when there is nothing there? -------------------------
 
-check null_arms 0 \
+check null_arms RC_REPORT \
 	"two arms with identical numbers report ratio 1.0000 and INCONCLUSIVE" \
 	--binary-a "$SLOW" --binary-b "$SLOW_TWIN" "${COMMON[@]}" "${QUIET[@]}" \
 	"GREP:ratio B/A = 1\.0000" \
 	"GREP:VERDICT: INCONCLUSIVE" \
 	"NOGREP:VERDICT: SEPARATED"
 
-check overlapping_ranges 0 \
+check overlapping_ranges RC_REPORT \
 	"a 1% median gap whose ranges overlap is INCONCLUSIVE, not a result" \
 	--binary-a "$SLOW" --binary-b "$OVERLAP" "${COMMON[@]}" "${QUIET[@]}" \
 	"GREP:ratio B/A = 1\.0149" \
@@ -220,7 +314,7 @@ check same_binary_refused 125 \
 	--binary-a "$SLOW" --binary-b "$SLOW" "${COMMON[@]}" "${QUIET[@]}" \
 	"GREP:indistinguishable"
 
-check same_binary_waived 0 \
+check same_binary_waived RC_REPORT \
 	"--allow-null-arms permits it deliberately and says so" \
 	--binary-a "$SLOW" --binary-b "$SLOW" --allow-null-arms "${COMMON[@]}" "${QUIET[@]}" \
 	"GREP:null calibration" \
@@ -231,7 +325,7 @@ check token_divergence 1 \
 	--binary-a "$SLOW" --binary-b "$WRONG" "${COMMON[@]}" "${QUIET[@]}" \
 	"GREP:the arms generate different tokens"
 
-check token_divergence_waived 0 \
+check token_divergence_waived RC_REPORT \
 	"--allow-token-divergence permits it and labels the ratio" \
 	--binary-a "$SLOW" --binary-b "$WRONG" --allow-token-divergence "${COMMON[@]}" "${QUIET[@]}" \
 	"GREP:DIVERGED between arms"
@@ -284,12 +378,15 @@ check busy_host_refused 125 \
 	"GREP:host is not quiescent" \
 	"GREP:hog"
 
+# These two assert that taint is REPORTED and that it does not erase the rank
+# test's answer. They used to assert the answer was absent, which pinned the
+# old format (taint replacing the verdict) rather than the behaviour.
 check busy_host_taints 125 \
 	"--allow-busy-host prints the numbers but a tainted run is still not clean" \
 	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" --allow-busy-host \
 	"PATHPRE:$WORK/busybin" \
-	"GREP:VERDICT: TAINTED" \
-	"NOGREP:VERDICT: SEPARATED"
+	"GREP:^  TAINTED:" \
+	"GREP:VERDICT: SEPARATED"
 
 # ---- the runs.db escape ------------------------------------------------------
 #
@@ -344,13 +441,13 @@ check slots_too_few_for_a_verdict 125 \
 
 # ---- the reported statistics must be computed, not asserted ------------------
 
-check stddev_uncertainty_tracks_n 0 \
+check stddev_uncertainty_tracks_n RC_REPORT \
 	"the stddev's relative standard error is computed from n, not a fixed 30%" \
 	--binary-a "$SLOW" --binary-b "$FAST" --model "$MODEL" --slots 8 --max-tokens 5 "${QUIET[@]}" \
 	"GREP:over 4 values is ~1/sqrt\(2\(n-1\)\) = 41%" \
 	"NOGREP:= 32%"
 
-check family_size_is_stated 0 \
+check family_size_is_stated RC_REPORT \
 	"the family-wise rate is stated for a run that makes two comparisons" \
 	--binary-a "$SLOW" --binary-b "$FAST" --model "$MODEL" --model "$MODEL2" \
 	--slots 12 --max-tokens 5 "${QUIET[@]}" \
@@ -466,9 +563,9 @@ check failing_ps_taints 125 \
 	"a slot whose interference could not be sampled taints the comparison" \
 	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" "${QUIET[@]}" \
 	"PATHPRE:$WORK/failbin" \
-	"GREP:VERDICT: TAINTED" \
+	"GREP:^  TAINTED:" \
 	"GREP:could not be sampled" \
-	"NOGREP:VERDICT: SEPARATED"
+	"GREP:VERDICT: SEPARATED"
 
 
 CPU_SNAPSHOT_SKIP="rmlx.main rmlx" PATH="$WORK/fakebin:$PATH" cpu_snapshot "$WORK/snap_excl"
@@ -492,7 +589,7 @@ fi
 
 # ---- the pattern itself ------------------------------------------------------
 
-check pattern_is_balanced 0 \
+check pattern_is_balanced RC_REPORT \
 	"the default 12-slot pattern is the balanced ABBA BAAB ABBA schedule" \
 	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" "${QUIET[@]}" \
 	"GREP:pattern: ABBA BAAB ABBA" \
@@ -523,7 +620,7 @@ fi
 # file verbatim. A quote in any of them would emit JSON that no reader can
 # parse, and nothing downstream would say so.
 
-check json_result_parses 0 \
+check json_result_parses RC_REPORT \
 	"the result file is valid JSON even with quotes and backslashes in a label" \
 	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" "${QUIET[@]}" \
 	--label-a 'he said "fast"' --label-b 'back\slash' \

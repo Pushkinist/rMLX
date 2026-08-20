@@ -364,7 +364,7 @@ rmlx baseline --model /path/to/snapshot --prompt-tokens 4096 --label "8k-bench"
 ```
 baseline: model=<name>  load=<ms>  ttft_ms=<ms>  decode_tps=<n>  overall_tps=<n>
           prefill_tps=<n>  prompt_tokens=<n>  peak_rss=<n>MB
-          metal_peak_mb=<n>  metal_gen_alloc_mb=<n>
+          metal_peak_mb=<n>  metal_gen_alloc_mb=<n>  kv_cache_bytes=<n>
 ```
 
 `peak_rss` is host RSS from `ps`. The two `metal_*` fields come from a
@@ -373,6 +373,17 @@ most Metal-allocator bytes live at once during generation (it includes the
 resident weights), and `metal_gen_alloc_mb` is that minus what was already live
 when generation started. **Only `metal_gen_alloc_mb` compares between two runs
 of the same model.** Both read `0` where no Metal allocator is present.
+
+`kv_cache_bytes` is the resident KV figure from `KvCache::resident_bytes`
+(defined in docs/METRICS_DB.md §4) — the *filled* prefix of the cache, not an
+allocator peak. It answers a different question from `metal_gen_alloc_mb`, and
+neither substitutes for the other: on some architectures the prefill working
+set, not the cache, is what sets the allocator peak, so a real KV delta can
+show as `+0.0 MB` there. Emitted on stdout so an A/B harness can read residency
+per slot without `--metrics` (which would write to the append-only store);
+`scripts/perf_ab.sh` parses it. It prints `n/a`, never `0`, when the byte
+accounting reported zero — the same refusal the rate columns use, because a
+literal `0` averages into a residency comparison as a cache of no bytes.
 
 #### When there is no summary line
 

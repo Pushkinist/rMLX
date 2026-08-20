@@ -110,8 +110,16 @@ SERVE
 
 KV_OK='llama_kv_cache:       MTL0 KV buffer size =   512.00 MiB'
 
+# FORCE_UNMEASURED_ROWS drives the harness down its TAINTED path on demand and
+# without an interferer. `cpu_snapshot` refuses a process table shorter than
+# CPU_SNAPSHOT_MIN_ROWS, a refused snapshot classifies its window `unmeasured`,
+# and an unmeasured window taints — so an absurd floor taints every run,
+# deterministically, on the quietest possible host. Waiting for a real foreign
+# process to show up is how a gate ends up asserting the weather.
 run_ab() { # <extra args...> -> stdout+stderr in $OUT, code in $CODE
-	OUT="$(RMLX_HOME="$WORK/home" bash "$AB" \
+	OUT="$(RMLX_HOME="$WORK/home" \
+		CPU_SNAPSHOT_MIN_ROWS="${FORCE_UNMEASURED_ROWS:-20}" \
+		bash "$AB" \
 		--model "$MODEL" --prompt-file "$PROMPT" \
 		--port "$PORT" --n-predict 4 --n-ctx 64 \
 		--out-dir "$WORK/home/bench" --ready-timeout 25 \
@@ -120,6 +128,46 @@ run_ab() { # <extra args...> -> stdout+stderr in $OUT, code in $CODE
 }
 
 # check <label> <expected-code> <expected-substring>
+# check_verdict <label> <verdict-text>
+#
+# For a comparison that RAN TO COMPLETION the process exit code is 0 on a quiet
+# host and 125 on a tainted one. An assertion on that number is therefore an
+# assertion about the machine, not about the harness: it passes while the host
+# is busy and fails the moment it goes quiet, which is the exact inverse of what
+# a gate should do. The three verdict cases below asserted exactly that, and
+# were observed passing 13/13, 13/13 and 12/13 on one unchanged tree.
+#
+# So two things are asserted instead, and neither depends on the host:
+#
+#   1. the verdict the harness printed is the expected one -- the behaviour
+#      these cases exist to guard;
+#   2. the exit code agrees with the harness's OWN taint report: `TAINTED`
+#      printed means 125, absent means 0. That still catches a harness that
+#      stops exiting 125 on a tainted run (which would make every contaminated
+#      comparison read clean) without importing the host into the expectation.
+#
+# The guard cases keep asserting 125 directly, and correctly: there the 125 is
+# a refusal the harness chose, emitted before any comparison exists.
+check_verdict() {
+	local label="$1" needle="$2"
+	local saw_taint=0 want=0
+	printf '%s' "$OUT" | grep -q '^TAINTED' && { saw_taint=1; want=125; }
+	local verdict_ok=0
+	printf '%s' "$OUT" | grep -q "^verdict    $needle" && verdict_ok=1
+	if [ "$verdict_ok" -eq 1 ] && [ "$CODE" -eq "$want" ]; then
+		echo "  PASS  $label (verdict matched; host $( [ "$saw_taint" -eq 1 ] && echo tainted || echo quiet ), exit $CODE)"
+		PASS=$((PASS + 1))
+	else
+		if [ "$verdict_ok" -ne 1 ]; then
+			echo "  FAIL  $label (wrong verdict; wanted: $needle)"
+		else
+			echo "  FAIL  $label (verdict correct, but exit $CODE contradicts the harness's own taint report; wanted $want)"
+		fi
+		printf '%s\n' "$OUT" | sed 's/^/        /' | tail -12
+		FAIL=$((FAIL + 1))
+	fi
+}
+
 check() {
 	local label="$1" want="$2" needle="$3"
 	if [ "$CODE" -eq "$want" ] && printf '%s' "$OUT" | grep -q -- "$needle"; then
@@ -199,15 +247,37 @@ check "a server serving another model fails the slot" 125 "wrong-server"
 # inert and every one of this campaign's verdicts is worthless.
 STUB_C="$(make_stub c "50,52" "$KV_OK" "hello world")"
 run_ab --bin-a "$STUB_A" --bin-b "$STUB_C" --pairs 2 --allow-busy-host
-check "identical timings read INCONCLUSIVE" 125 "INCONCLUSIVE ranges-overlap"
+check_verdict "identical timings read INCONCLUSIVE" "INCONCLUSIVE ranges-overlap"
 
 # --- behaviour: disjoint ranges at n=2 must be flagged weak ------------------
 run_ab --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 2 --allow-busy-host
-check "disjoint ranges at n=2 read SEPARATED-WEAK" 125 "SEPARATED-WEAK n=2-per-arm"
+check_verdict "disjoint ranges at n=2 read SEPARATED-WEAK" "SEPARATED-WEAK n=2-per-arm"
 
 # --- behaviour: disjoint ranges at n=3 read SEPARATED ------------------------
 run_ab --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 3 --allow-busy-host
-check "disjoint ranges at n=3 read SEPARATED" 125 "SEPARATED 0."
+check_verdict "disjoint ranges at n=3 read SEPARATED" "SEPARATED 0."
+
+# --- the same three verdicts, with the taint path forced --------------------
+#
+# The point of the three cases above is that the verdict is a property of the
+# measurements, not of the machine. Asserting that on whatever host happens to
+# be running proves only that today's host produced it. These re-run the same
+# comparisons with every interference window forced `unmeasured`, so the
+# harness takes its TAINTED branch and exits 125, and require the verdict to be
+# character-for-character the same.
+FORCE_UNMEASURED_ROWS=999999
+
+run_ab --bin-a "$STUB_A" --bin-b "$STUB_C" --pairs 2 --allow-busy-host
+check_verdict "INCONCLUSIVE survives a tainted host" "INCONCLUSIVE ranges-overlap"
+check "...and a forced taint really did taint" 125 "TAINTED"
+
+run_ab --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 2 --allow-busy-host
+check_verdict "SEPARATED-WEAK survives a tainted host" "SEPARATED-WEAK n=2-per-arm"
+
+run_ab --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 3 --allow-busy-host
+check_verdict "SEPARATED survives a tainted host" "SEPARATED 0."
+
+unset FORCE_UNMEASURED_ROWS
 
 # --- the harness must never write runs.db ------------------------------------
 if find "$WORK/home" -name 'runs.db*' -print -quit 2>/dev/null | grep -q .; then
