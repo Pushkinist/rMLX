@@ -159,7 +159,7 @@ fn run_rotor(data: &[f32], bits: u8) -> (Vec<f32>, f64) {
 /// can reach.
 ///
 /// * `turbo` 2 / 3 / 4 — `K8VTurbo2`, `K8VTurbo3` + `TurboSym3`, `K8V4` +
-///   `TurboSym4` + `RotKTq4V`.
+///   `TurboSym4`.
 /// * `tcq` 2 / 3 — `K8VTurbo2Tcq`, `K8VTurbo3Tcq`.
 /// * `planar` 3 / 4 — `Planar3`, `Planar` + `PlanarK`.
 /// * `iso` 3 / 4 — `Iso3` family, `Iso4` family.

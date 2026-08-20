@@ -115,7 +115,9 @@ discarded. Bar (§3): WIN / TIE-on-noise / LOSS.
   seven of them (`planar`, `planar3`, `planar_k`, `k8vturbo3`, `k8vturbo3tcq`,
   `tsym3`, `tsym4`). Only `iso3/4` and `rotor3/4` are CPU-hot-path, and only at
   **prefill**. The declared-unaffected set (`none`, `k8v8`, `k8vturbo2`,
-  `k8v4`, `rot_k_tq4v`) is classifier-identical to the declared-affected set,
+  `k8v4`, `rot_k_tq4v` — retired since, see `docs/KV_QUANT.md`; every mention
+  of it on this page is a historical measurement) is classifier-identical to
+  the declared-affected set,
   so the grouping never had a mechanism behind it. (b) The per-cell magnitudes
   were harness artefacts: two runs of the **same binary** disagreed by 29% at
   `none`@32k (61.5 vs 47.76) and reversed the codec ordering. Under `rmlx bench`
@@ -192,7 +194,7 @@ sweep.
 | rotor4_sym | 16.9·4.4s·808 | 14.1·9.0s·1614 | 9.8·19.4s·3374 | 6.3·43.5s·6659 | 1.7·106.3s·12928 |
 | k_rotor3 | 23.9·2.4s·1015 | 15.5·5.1s·2023 | 12.6·13.2s·4217 | 8.4·31.4s·8354 | 4.5·87.5s·16255 |
 | k_rotor4 | 21.0·2.9s·1015 | 18.5·5.8s·2023 | 13.3·13.6s·4217 | 8.8·31.9s·8354 | 4.3·83.0s·16255 |
-| rot_k_tq4v | 98.3·1.2s·841 | 69.5·2.9s·1667 | 42.4·8.8s·3461 | 24.4·22.9s·6859 | 12.6·67.9s·13351 |
+| rot_k_tq4v *(retired, see `docs/KV_QUANT.md`)* | 98.3·1.2s·841 | 69.5·2.9s·1667 | 42.4·8.8s·3461 | 24.4·22.9s·6859 | 12.6·67.9s·13351 |
 
 **Best decode per size:** 4k=k8vturbo3tcq(135.7), 8k=k8vturbo3(116.3),
 16k/32k/64k=**none** (89.4/61.5/37.2). The 4k/8k "wins" over `none` are
@@ -219,7 +221,7 @@ pass is the K-only / sym-iso family's memory footprint:
 | k8vturbo2/3 | 12876–13084 | 1.22–1.24× | 1.22–1.24× | | planar/planar3 | 16828 | 1.60× | 1.60× |
 | k8vturbo2/3tcq | 12876–13084 | 1.22–1.24× | 1.22–1.24× | | planar_k | 15112 | 1.43× | 1.43× |
 | k8v4 | 13292 | 1.26× | 1.26× | | k8v8 | 13968 | 1.33× | 1.33× |
-| rot_k_tq4v | 13351 | 1.27× | 1.27× | | k_rotor3/4 | **11898**† | **1.115×**† | 1.14× (broken) |
+| rot_k_tq4v *(retired, see `docs/KV_QUANT.md`)* | 13351 | 1.27× | 1.27× | | k_rotor3/4 | **11898**† | **1.115×**† | 1.14× (broken) |
 
 † `k_rotor3/4` is the one cell re-measured after the CPU-block defect below was
 fixed: 11,897,787,872 B at 64k against that run's own `none` of 10,671,734,784 B.
@@ -330,7 +332,7 @@ marginal cost between two replicated adjacent cells rather than a global fit.
 | planar | 5.66 | 0.472 | — (generic path) |
 | rotor4 | 4.30 | 0.529 | — (generic path, bf16-decode-seed) |
 | iso3 | 2.34 | 0.823 | — (generic path, bf16-decode-seed) |
-| rot_k_tq4v | 4.79 | 1.160 | — (generic path) |
+| rot_k_tq4v *(retired, see `docs/KV_QUANT.md`)* | 4.79 | 1.160 | — (generic path) |
 | iso4 | −7.38 | 1.414 | — (generic path, bf16-decode-seed) |
 | k8v4 | 6.69 | 2.226 | — (generic path) |
 | **k_iso3** | 38.77 | **2.248** | `iso_flash_decode_sdpa` |

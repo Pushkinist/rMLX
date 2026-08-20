@@ -699,17 +699,6 @@ fn write_layer(
             device,
             out,
         ),
-        // -review CRITICAL 2 + MEDIUM 3: full RotKTq4V serialization.
-        // Stores the K-side MixedKvState 3-tuple (codes/scales/biases) and the
-        // V-side QuantV (codes/scales) under a dedicated "rot_k_tq4v" tag.
-        // The previous stub that wrote `"none"` was incorrect — unlike KvQuant::None
-        // (bf16 K/V on the parent KvCache), RotKTq4V has quantized K/V that must
-        // survive the spill/hydrate cycle.
-        KvStorage::RotKTq4V {
-            k_state,
-            v,
-            max_seq,
-        } => write_rot_k_tq4v(idx, k_state, v.as_ref(), *max_seq, device, out),
         // K8VTurbo3 — same layout as K8V4 but tagged "k8vturbo3".
         // V uses QuantV bits=3; codes/scales packing is the same format.
         KvStorage::K8VTurbo3 { k, v, max_seq } => {
@@ -1843,48 +1832,6 @@ fn write_mixed(
     Ok((geom, state.offset))
 }
 
-// ── RotKTq4V ──────────────────────────────────────────────────────────────────
-
-/// -review CRITICAL 2: serialize a RotKTq4V layer.
-///
-/// K side: `MixedKvState` 3-tuple (codes/scales/biases) — same layout as
-/// `write_mixed` K side, always `rotate_k=true`.
-/// V side: `QuantV` (codes/scales) — same layout as `write_quant_v` in K8V4.
-/// Geometry carries `k_bits=8`, `k_group_size=64`, `offset`, `max_seq`.
-fn write_rot_k_tq4v(
-    idx: usize,
-    k_state: &MixedKvState,
-    v: Option<&QuantV>,
-    max_seq: i32,
-    device: Device,
-    out: &mut Vec<(String, OwnedTensor)>,
-) -> Result<(String, i32)> {
-    // K-side: same structure as write_mixed K tuple.
-    if let Some(t) = &k_state.keys {
-        out.push((
-            format!("l{idx}.k.codes"),
-            OwnedTensor::from_array(&t.codes)?,
-        ));
-        out.push((
-            format!("l{idx}.k.scales"),
-            OwnedTensor::from_array(&t.scales)?,
-        ));
-        out.push((
-            format!("l{idx}.k.biases"),
-            OwnedTensor::from_array(&t.biases)?,
-        ));
-    }
-    // V-side: same structure as write_quant_v (with C3 trim).
-    write_quant_v(idx, v, device, out)?;
-
-    let geom = format!(
-        "{{\"tag\":\"rot_k_tq4v\",\"max_seq\":{max_seq},\"k_bits\":{},\
-         \"k_group_size\":{},\"offset\":{}}}",
-        k_state.k_bits, k_state.k_group_size, k_state.offset,
-    );
-    Ok((geom, k_state.offset))
-}
-
 // ── Paged ──────────────────────────────────────────────────────────────────────
 
 /// Serialize a Paged layer. The page table + per-page slabs are flattened by
@@ -2223,8 +2170,6 @@ fn read_layer(st: &SafeTensors<'_>, idx: usize, geom: &str, device: Device) -> R
         }),
         "mixed" => read_mixed(st, idx, geom),
         "paged" => read_paged(st, idx, geom, device),
-        // -review CRITICAL 2: hydrate RotKTq4V from its "rot_k_tq4v" tag.
-        "rot_k_tq4v" => read_rot_k_tq4v(st, idx, geom),
         // K8VTurbo3 — same structure as K8V4 but bits=3 on V.
         "k8vturbo3" => {
             let max_seq = geom_i32(geom, "max_seq")?;
@@ -2866,62 +2811,6 @@ fn read_mixed_tuple(st: &SafeTensors<'_>, idx: usize, side: &str) -> Result<Opti
         scales,
         biases,
     }))
-}
-
-/// -review CRITICAL 2: reconstruct a `KvStorage::RotKTq4V` from a
-/// "rot_k_tq4v"-tagged geometry.
-///
-/// K-side is rebuilt via `MixedKvState::from_parts` (same path as `read_mixed`,
-/// but V fields are zeroed since RotKTq4V stores V separately).
-/// V-side is rebuilt from CPU TurboBlocks via `read_quant_v`.
-///
-/// `k_rotation` is left `None` — it is rebuilt lazily on the next K encode
-/// (K is already stored in the rotated, quantized basis).
-fn read_rot_k_tq4v(st: &SafeTensors<'_>, idx: usize, geom: &str) -> Result<KvStorage> {
-    let max_seq = geom_i32(geom, "max_seq")?;
-    let k_bits = geom_i32(geom, "k_bits")?;
-    let k_group_size = geom_i32(geom, "k_group_size")?;
-    let offset = geom_i32(geom, "offset")?;
-
-    let keys = read_mixed_tuple(st, idx, "k")?;
-
-    // V is stored as a flat codes+scales pair (same layout as K8V4 V-side).
-    // Shape is reconstructed from the codes tensor — shape[2] = offset.
-    let v = if let Some(codes) = tensor_opt(st, &format!("l{idx}.v.codes"))? {
-        let scales = tensor_req(st, &format!("l{idx}.v.scales"))?;
-        codes.eval()?;
-        scales.eval()?;
-        // Reconstruct a minimal shape: [1, 1, offset, 1] — the caller owns the
-        // real shape from the QuantV.shape field but we store codes/scales flat.
-        // Use a 1-D shape placeholder; dequantize uses shape from QuantV.shape.
-        let block = TurboBlocks {
-            codes: codes.to_bytes()?,
-            scales: bytes_to_f32(&scales.to_bytes()?),
-            original_shape: [1, 1, offset, 1],
-            bits: 4,
-        };
-        let shape = vec![1i32, 1, offset, 1];
-        Some(QuantV::from_cpu_blocks(vec![block], shape, 4))
-    } else {
-        None
-    };
-
-    let k_state = MixedKvState::from_parts(
-        k_bits,
-        0, // v_bits unused for RotKTq4V
-        k_group_size,
-        0, // v_group_size unused for RotKTq4V
-        offset,
-        keys,
-        None, // values unused — V lives in QuantV above
-        true, // rotate_k always true for RotKTq4V
-    );
-
-    Ok(KvStorage::RotKTq4V {
-        k_state,
-        v,
-        max_seq,
-    })
 }
 
 fn read_paged(st: &SafeTensors<'_>, idx: usize, geom: &str, device: Device) -> Result<KvStorage> {

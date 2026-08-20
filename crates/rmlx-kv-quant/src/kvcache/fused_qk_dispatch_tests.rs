@@ -121,7 +121,6 @@ const ALL_KV_QUANTS: &[KvQuant] = &[
         v_bits: 4,
         v_group_size: 64,
     },
-    KvQuant::RotKTq4V,
     KvQuant::K8VTurbo3,
     KvQuant::TurboSym3,
     KvQuant::TurboSym4,
@@ -164,7 +163,6 @@ fn assert_kv_quant_exhaustive(q: KvQuant) {
         | KvQuant::None
         | KvQuant::Mixed { .. }
         | KvQuant::RotK { .. }
-        | KvQuant::RotKTq4V
         | KvQuant::K8VTurbo3
         | KvQuant::TurboSym3
         | KvQuant::TurboSym4
@@ -197,7 +195,7 @@ fn all_kv_quants_list_covers_every_variant() {
     // forget the list.
     assert_eq!(
         ALL_KV_QUANTS.len(),
-        29,
+        28,
         "ALL_KV_QUANTS must list every KvQuant variant — update it (and this count) \
          when a variant is added or removed"
     );

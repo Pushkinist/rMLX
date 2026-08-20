@@ -91,7 +91,7 @@ no skips (planar/planar3 ARE MoE-allowed):
 | k8v4 | 95.50 [94.88–95.66] | 13 567 | |
 | k8v8 | 95.23 [94.92–95.87] | 13 519 | |
 | none (bf16) | 94.28 [89.01–94.93] | 13 847 | unquantized KV |
-| rot_k_tq4v | 89.60 [89.20–90.26] | 13 398 | ~7% slower (tq4 V cost) |
+| rot_k_tq4v *(retired, see `docs/KV_QUANT.md`)* | 89.60 [89.20–90.26] | 13 398 | ~7% slower (tq4 V cost) |
 | rot_k_v4g64 | 58.21 [58.02–58.34] | 13 475 | V-side dequant decode cost |
 | mixed_k8g128_v4g64 | 57.44 [57.30–57.69] | 13 471 | " |
 | mixed_k8g128_v8g128 | 56.50 [56.26–56.51] | 13 449 | " |

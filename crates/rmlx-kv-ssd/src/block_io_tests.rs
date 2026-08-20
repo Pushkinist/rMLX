@@ -152,30 +152,6 @@ fn build_storage(
                 max_seq: 4096,
             }
         }
-        KvQuant::RotKTq4V => {
-            // K: build via MixedKvState K-only bulk init (rotate + affine-quantize).
-            // V: build via QuantV CPU path (TurboQuant scalar).
-            use rmlx_kv_quant::turboquant::turbo_quantize_v;
-            let mut k_state = MixedKvState::new_k_only_rotated();
-            let k_arr = arr(&k_data, shape);
-            let (k_codes, k_scales, k_biases) = k_state
-                .bulk_init_k_from_fp16(&k_arr, device, DispatchPolicy::default())
-                .unwrap();
-            k_state.keys = Some(MixedTuple {
-                codes: k_codes,
-                scales: k_scales,
-                biases: k_biases,
-            });
-            k_state.offset = shape[2];
-
-            let vblk = turbo_quantize_v(&v_data, 4, shape).unwrap();
-            let qv = QuantV::from_cpu_blocks(vec![vblk], shape.to_vec(), 4);
-            KvStorage::RotKTq4V {
-                k_state,
-                v: Some(qv),
-                max_seq: 4096,
-            }
-        }
         // TurboSym3 — symmetric WHT-3 K + turbo3 V (CPU-only build).
         KvQuant::TurboSym3 => {
             use rmlx_kv_quant::storage::QuantKTurbo3;
@@ -649,21 +625,6 @@ fn dequant_k(storage: &KvStorage, device: Device) -> Vec<f32> {
             rmlx_kv_quant::q8::q8_dequantize(&codes_v, &scales_v)
         }
         KvStorage::None { .. } => Vec::new(),
-        // RotKTq4V — K is stored in the MixedKvState (same as Mixed/RotK).
-        KvStorage::RotKTq4V { k_state, .. } => {
-            let t = k_state.keys.as_ref().unwrap();
-            let out = rmlx_mlx::dequantize(
-                &t.codes,
-                &t.scales,
-                Some(&t.biases),
-                k_state.k_group_size,
-                k_state.k_bits,
-                "affine",
-                device,
-            )
-            .unwrap();
-            to_vec(&out)
-        }
         // K8VTurbo3 — K is QuantK (same as K8V4).
         KvStorage::K8VTurbo3 { k, .. } => {
             let (flat, _) = k
@@ -1009,66 +970,6 @@ fn roundtrip_mixed() {
             v_group_size: 64,
         },
     );
-}
-
-/// RotKTq4V write → read → dequant K must be bit-identical (codes stored
-/// exactly). Also verifies the V-side block count round-trips (the CPU QuantV
-/// has one TurboBlock after build).
-#[test]
-#[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-)]
-#[allow(
-    clippy::unwrap_used,
-    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
-)]
-#[allow(
-    clippy::wildcard_enum_match_arm,
-    reason = "wildcard arm is the correct fallthrough for unsupported arch/quant variants; exhaustive expansion would require updating on every new variant"
-)]
-fn roundtrip_rot_k_tq4v() {
-    let device = Device::Cpu;
-    let shape = &[1i32, 2, 4, 128];
-    let (storage, k_recon_before) = build_storage(KvQuant::RotKTq4V, shape, 0xDEAD_BEEF, device);
-
-    // Capture the V codes before serialization for comparison.
-    let v_codes_before = match &storage {
-        KvStorage::RotKTq4V { v: Some(qv), .. } => qv.blocks[0].codes.clone(),
-        _ => panic!("expected RotKTq4V storage"),
-    };
-
-    let layers = vec![storage];
-    let path = tmp_path("rot_k_tq4v");
-    KvBlockWriter::new(MODEL_ID, KvQuant::RotKTq4V, &layers, &[])
-        .write(&path, device)
-        .unwrap();
-
-    let reader = KvBlockReader::open(&path).unwrap();
-    let (rebuilt, _bf16, _lin) = reader.hydrate(MODEL_ID, KvQuant::RotKTq4V, device).unwrap();
-    assert_eq!(rebuilt.len(), 1, "layer count");
-
-    // K codes round-trip: dequant must be bit-identical.
-    let k_recon_after = dequant_k(&rebuilt[0], device);
-    assert_eq!(k_recon_before.len(), k_recon_after.len(), "K length");
-    let max_err = k_recon_before
-        .iter()
-        .zip(&k_recon_after)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
-    assert!(
-        max_err < 1e-3,
-        "rot_k_tq4v: K dequant round-trip error {max_err}"
-    );
-
-    // V codes round-trip: CPU blocks must be byte-identical.
-    let v_codes_after = match &rebuilt[0] {
-        KvStorage::RotKTq4V { v: Some(qv), .. } => qv.blocks[0].codes.clone(),
-        _ => panic!("expected RotKTq4V after hydrate"),
-    };
-    assert_eq!(v_codes_before, v_codes_after, "V codes round-trip");
-
-    let _ = std::fs::remove_file(&path);
 }
 
 /// IsoV3 SSD round-trip: all four V-side buffers (codes_packed, scales,

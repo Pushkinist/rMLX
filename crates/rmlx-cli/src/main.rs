@@ -255,14 +255,21 @@ struct Cli {
     ///
     /// `auto` (default): resolves OFF on every host. On the one storage it
     /// serves (K8V4, `kv_seq > 4096`) the kernel decodes 2.0–4.25× slower than
-    /// the generic path — the loss grows with `kv_seq` — holds ~722 MB more
-    /// resident KV, and is not bit-exact, so it perturbs the generated tokens
-    /// as well.
+    /// the generic path — the loss grows with `kv_seq` — and holds ~722 MB more
+    /// resident KV.
+    ///
+    /// It also changes the generated tokens, for a reason that is not a kernel
+    /// defect: it is the only K8V4 configuration in which the 4-bit V codec
+    /// runs at decode at all (the generic path reads the bf16 mirror), so the
+    /// difference is that codec's ≈0.997 fidelity floor. Against a
+    /// dequant-then-SDPA reference over its *own* packed buffers the kernel
+    /// agrees to ≤2 bf16 ULP.
     ///
     /// That ratio predates the dtype fix: the dispatcher used to return its f32
     /// kernel output uncast, which promoted the whole decode graph while the
     /// gate was on. Read it as an upper bound on the kernel's own cost. The
-    /// direction, and this default, are unchanged. HOLD until a decode re-measurement clears it; a pre-existing
+    /// direction, and this default, are unchanged. HOLD until a decode
+    /// re-measurement clears it; a pre-existing
     /// `RMLX_TURBO_FLASH=1` is still honoured, and logs a `warn!` naming the
     /// cost because the kernel then runs while the flag reads `auto`.
     /// `on`: resolve the gate on (ablation, and the escape hatch for that
@@ -305,7 +312,7 @@ struct Cli {
     /// `off`: HARD override — ignores `RMLX_ROT_K_FUSED=1` in the shell.
     ///
     /// Only affects caches whose codec rotates K (`--kv-quant
-    /// rot_k_v<bits>g<group>`, `rot_k_tq4v`); every other codec ignores it.
+    /// rot_k_v<bits>g<group>`); every other codec ignores it.
     #[arg(long, value_enum, global = true, default_value_t = RotKFusedMode::Auto)]
     rot_k_fused: RotKFusedMode,
     #[command(subcommand)]
@@ -599,7 +606,7 @@ enum Cmd {
         /// Restrictions enforced at CLI parse time:
         /// - `--paged-kv` + `--kv-quant bf16` (or `--kv-quant none`) is rejected
         ///   (the paged path supports K8V4 / K8V8 / Planar only).
-        /// - `--paged-kv` + `--cache-type-k rot_k*` is rejected (RotK / RotKTq4V
+        /// - `--paged-kv` + `--cache-type-k rot_k*` is rejected (RotK
         ///   are not paged-compatible — they ride the Mixed quantized-SDPA path).
         ///
         #[arg(long, default_value_t = false)]

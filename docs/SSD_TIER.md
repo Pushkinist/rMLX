@@ -827,8 +827,8 @@ All flags are on the `rmlx serve` subcommand.
 - When `--kv-ssd-cache-gb > --kv-ssd-global-gb > 0`, the per-namespace ceiling
   is clamped to the global budget at startup and a `warn!` is emitted.
 - `--paged-kv` with `--kv-quant bf16` or `--kv-quant none` is rejected.
-- `--paged-kv` with `--cache-type-k rot_k*` is rejected (RotK / RotKTq4V are
-  not paged-compatible).
+- `--paged-kv` with `--cache-type-k rot_k*` is rejected (RotK is not
+  paged-compatible).
 
 ### --prefix-index
 
@@ -1013,7 +1013,7 @@ Adding a new codec MUST:
 ## See also
 
 - `docs/KV_CACHE.md` — KV quantization variants and storage types (K8V4, K8V8,
-  Planar, Mixed, RotK, RotKTq4V, Paged).
+  Planar, Mixed, RotK, Paged).
 - `docs/KV_QUANT.md` — per-quant codec details and byte sizes.
 - `docs/PROJECTS_CONFIG.md` — `projects.toml` reference (per-project budget
   overrides, precedence chain).

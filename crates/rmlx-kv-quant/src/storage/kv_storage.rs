@@ -232,21 +232,6 @@ pub enum KvStorage {
         v_planar: Option<Box<PagedPlanarVStorage>>,
         max_seq: i32,
     },
-    /// RotK K (MLX affine 8-bit, rotated basis) + TurboQuant 4-bit V.
-    ///
-    /// K-side: [`MixedKvState`](crate::mixed_quant::MixedKvState) with `rotate_k=true`
-    /// (same as [`Mixed`](KvStorage::Mixed) / [`KvQuant::RotK`](KvQuant::RotK)).
-    /// V-side: [`QuantV`] (TurboFlash MSL tq4, same as [`K8V4`](KvStorage::K8V4) V).
-    ///
-    /// SDPA: K is dequantized from its affine 3-tuple (codes, scales, biases) to
-    /// bf16, Q is pre-rotated, V is dequantized from TurboFlash to bf16, then
-    /// standard `scaled_dot_product_attention` runs. This is a dequant-then-SDPA
-    /// path rather than the fused `quantized_matmul` path of plain Mixed / RotK.
-    RotKTq4V {
-        k_state: crate::mixed_quant::MixedKvState,
-        v: Option<QuantV>,
-        max_seq: i32,
-    },
     /// bench prototype: K = affine q8_0 (group_size=128),
     /// V = TurboQuant 3-bit Lloyd-Max N(0,1) codebook (group=32).
     ///
@@ -593,14 +578,6 @@ impl KvStorage {
                 ),
                 max_seq,
             },
-            // RotKTq4V — rotated K (MLX affine 8-bit) + TurboQuant 4-bit V.
-            // -review MEDIUM 2: use new_k_only_rotated() — V is stored
-            // separately as QuantV; the v_bits/v_group_size params were dead.
-            KvQuant::RotKTq4V => Self::RotKTq4V {
-                k_state: crate::mixed_quant::MixedKvState::new_k_only_rotated(),
-                v: None,
-                max_seq,
-            },
             // K8VTurbo3 — same layout as K8V4 but QuantV bits=3.
             KvQuant::K8VTurbo3 => Self::K8VTurbo3 {
                 k: None,
@@ -818,12 +795,6 @@ impl KvStorage {
                 }
                 if let Some(pv) = v_planar.as_mut() {
                     pv.reset();
-                }
-            }
-            Self::RotKTq4V { k_state, v, .. } => {
-                k_state.reset();
-                if let Some(qv) = v.as_mut() {
-                    qv.truncate_to(0);
                 }
             }
             // K8VTurbo3 resets like K8V4.
@@ -1079,15 +1050,6 @@ impl KvStorage {
                     pv.truncate_to(n);
                 }
             }
-            // RotKTq4V: same as Mixed — reset state on truncate. The V store is
-            // reset to zero positions rather than to `n`, so its blocks go with
-            // it (leaving them would over-cover an empty shape).
-            Self::RotKTq4V { k_state, v, .. } => {
-                k_state.reset();
-                if let Some(qv) = v.as_mut() {
-                    qv.truncate_to(0);
-                }
-            }
             // K8VTurbo3 truncates like K8V4.
             Self::K8VTurbo3 { k, v, .. } => {
                 if let Some(ks) = k.as_mut() {
@@ -1326,18 +1288,6 @@ impl KvStorage {
                 k: None,
                 v_k8: None,
                 v_planar: None,
-                max_seq: *max_seq,
-            },
-            Self::RotKTq4V {
-                k_state,
-                v,
-                max_seq,
-            } => Self::RotKTq4V {
-                k_state: k_state.try_deep_clone()?,
-                v: match v {
-                    Some(qv) => Some(qv.try_deep_clone()?),
-                    None => None,
-                },
                 max_seq: *max_seq,
             },
             // K8VTurbo3 deep-clones like K8V4.
@@ -1652,13 +1602,6 @@ impl KvStorage {
             // ── Mixed (MLX mx.quantize 3-tuples, opt. RotK) ───────────────────
             KvStorage::Mixed { state, max_seq: _ } => state.byte_size(),
 
-            // ── RotKTq4V (rotated-K 3-tuple + TurboQuant V4) ─────────────────
-            KvStorage::RotKTq4V {
-                k_state,
-                v,
-                max_seq: _,
-            } => k_state.byte_size() + opt_bytes(v.as_ref(), QuantV::byte_size),
-
             // ── Symmetric Turbo (K=TurboK3/4, V=TurboV) ─────────────────────
             KvStorage::TurboSym3 { k, v, max_seq: _ } => {
                 opt_bytes(k.as_ref(), QuantKTurbo3::byte_size)
@@ -1850,10 +1793,6 @@ impl KvStorage {
             }
             // Payload is not an `Option`; each owns a `reset`.
             KvStorage::Mixed { state, .. } => state.reset(),
-            KvStorage::RotKTq4V { k_state, v, .. } => {
-                k_state.reset();
-                *v = None;
-            }
             KvStorage::Paged {
                 k, v_k8, v_planar, ..
             } => {
@@ -1878,8 +1817,8 @@ impl KvStorage {
     ///
     /// The K-side slot is the indicator throughout: every two-sided variant
     /// populates both slots in the same `exit_prefill` statement, so a `None`
-    /// on K means the whole layer is empty. The three variants whose payload is
-    /// not an `Option` — `Mixed`, `RotKTq4V`, `Paged` — always answer `None`
+    /// on K means the whole layer is empty. The two variants whose payload is
+    /// not an `Option` — `Mixed` and `Paged` — always answer `None`
     /// here: their writers serialise their own empty state, and diverting them
     /// would change what an unfilled layer of theirs round-trips as.
     ///
@@ -1920,7 +1859,7 @@ impl KvStorage {
             KvStorage::RotorKAsym3 { k, max_seq, .. } => empty(k.as_ref(), *max_seq),
             KvStorage::RotorKAsym4 { k, max_seq, .. } => empty(k.as_ref(), *max_seq),
             // Payload is not an Option — their own writers handle emptiness.
-            KvStorage::Mixed { .. } | KvStorage::RotKTq4V { .. } | KvStorage::Paged { .. } => None,
+            KvStorage::Mixed { .. } | KvStorage::Paged { .. } => None,
         }
     }
 }
