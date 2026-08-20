@@ -545,39 +545,48 @@ view cannot give) has to carry the predicate itself; it must then be pinned to
 this section by name and reviewed with it. `scripts/perf_ceiling.py`'s
 `prefill_anchor` is the one such consumer in the tree.
 
-**Backend coverage matrix** (which backend can emit which metric — sparse is fine, see §3.3):
+**Backend coverage matrix** (which backend can emit which metric — sparse is fine, see §3.3).
 
-| Metric                | rmlx | mlx_lm | paroquant | omlx | ollama |
-|-----------------------|:----:|:------:|:---------:|:----:|:------:|
-| `decode_tps_warm`     | yes  | yes    | yes       | yes  | yes    |
-| `decode_tps_cold`     | yes  | yes    | yes       | yes  | yes    |
-| `prefill_tps`         | yes  | yes    | yes       | yes  | yes    |
-| `overall_tps`         | yes  | yes    | yes       | yes  | yes    |
-| `ttft_warm_ms`        | yes  | yes    | yes       | yes  | yes    |
-| `ttft_cold_ms`        | yes  | yes    | yes       | yes  | yes    |
-| `itl_p50_ms`          | yes  | yes    | yes       | yes  | yes    |
-| `itl_p95_ms`          | yes  | yes    | yes       | yes  | yes    |
-| `step_ms_mean`        | yes  | yes    | yes       | yes  | yes    |
-| `model_load_ms`       | yes  | yes    | yes       | yes  | yes    |
-| `peak_rss_mb`         | yes  | yes    | yes       | yes  | yes    |
-| `metal_peak_alloc_mb` | yes  | yes    | yes       | yes  | no     |
-| `kv_cache_bytes`      | yes  | no     | no        | maybe| no     |
-| `tps_per_gb_ram`      | yes  | yes    | yes       | yes  | yes    |
-| `task_pass_at_1`      | no   | no     | no        | no   | no     |
-| `prompt_cache_block_hits`         | yes | no | no | no | no |
-| `prompt_cache_block_misses`       | yes | no | no | no | no |
-| `prompt_cache_partial_hits`       | yes | no | no | no | no |
-| `queue_wait_ms`                   | yes | no | no | no | no |
-| `queue_depth`                     | yes | no | no | no | no |
-| `prompt_tokens_live`              | yes | no | no | no | no |
-| `completion_tokens_live`          | yes | no | no | no | no |
-| `itl_p99_ms`                      | yes | no | no | no | no |
-| `itl_spikes`                      | yes | no | no | no | no |
-| `accept_rate`                     | yes | no | no | no | no |
-| `draft_tokens_total`              | yes | no | no | no | no |
-| `accept_tokens_total`             | yes | no | no | no | no |
-| `draft_rounds_total`              | yes | no | no | no | no |
-| `accepted_per_step`               | yes | no | no | no | no |
+This table mirrors `rmlx_metrics::registry::COVERAGE_MATRIX`; the columns are
+`identity::BACKEND_WHITELIST` minus the entries declared in
+`BACKENDS_WITHOUT_COVERAGE`. **Adding a backend means adding a column here and a
+block there in the same change** — `coverage()` falls back to `No` for a pair it
+cannot find, so a half-wired backend answers "cannot emit" for everything and
+nothing says otherwise. `mlx_lm_tq`, `llama_cpp` and `llama_cpp_tq` all reached
+the whitelist without coverage rows before the test was driven off the whitelist
+itself.
+
+| Metric                | rmlx | mlx_lm | mlx_lm_tq | paroquant | omlx | ollama | llama_cpp | llama_cpp_tq |
+|-----------------------|:----:|:------:|:---------:|:---------:|:----:|:------:|:---------:|:------------:|
+| `decode_tps_warm`     | yes | yes | yes | yes | yes | yes | yes | yes |
+| `decode_tps_cold`     | yes | yes | yes | yes | yes | yes | yes | yes |
+| `prefill_tps`         | yes | yes | yes | yes | yes | yes | yes | yes |
+| `overall_tps`         | yes | yes | yes | yes | yes | yes | no | no |
+| `ttft_warm_ms`        | yes | yes | yes | yes | yes | yes | no | no |
+| `ttft_cold_ms`        | yes | yes | yes | yes | yes | yes | no | no |
+| `itl_p50_ms`          | yes | yes | yes | yes | yes | yes | no | no |
+| `itl_p95_ms`          | yes | yes | yes | yes | yes | yes | no | no |
+| `step_ms_mean`        | yes | yes | yes | yes | yes | yes | yes | yes |
+| `model_load_ms`       | yes | yes | yes | yes | yes | yes | yes | yes |
+| `peak_rss_mb`         | yes | yes | yes | yes | yes | yes | yes | yes |
+| `metal_peak_alloc_mb` | yes | yes | yes | yes | yes | no | no | no |
+| `kv_cache_bytes`      | yes | no | no | no | maybe | no | yes | yes |
+| `tps_per_gb_ram`      | yes | yes | yes | yes | yes | yes | yes | yes |
+| `task_pass_at_1`      | no | no | no | no | no | no | no | no |
+| `prompt_cache_block_hits`         | yes | no | no | no | no | no | no | no |
+| `prompt_cache_block_misses`       | yes | no | no | no | no | no | no | no |
+| `prompt_cache_partial_hits`       | yes | no | no | no | no | no | no | no |
+| `queue_wait_ms`                   | yes | no | no | no | no | no | no | no |
+| `queue_depth`                     | yes | no | no | no | no | no | no | no |
+| `prompt_tokens_live`              | yes | no | no | no | no | no | no | no |
+| `completion_tokens_live`          | yes | no | no | no | no | no | no | no |
+| `itl_p99_ms`                      | yes | no | no | no | no | no | no | no |
+| `itl_spikes`                      | yes | no | no | no | no | no | no | no |
+| `accept_rate`                     | yes | no | no | no | no | no | no | no |
+| `draft_tokens_total`              | yes | no | no | no | no | no | no | no |
+| `accept_tokens_total`             | yes | no | no | no | no | no | no | no |
+| `draft_rounds_total`              | yes | no | no | no | no | no | no | no |
+| `accepted_per_step`               | yes | no | no | no | no | no | no | no |
 
 `no` = backend genuinely can't measure. `maybe` = backend exposes it but recording path not wired. rMLX TTFT/ITL/kv_cache_bytes are wired via the EventRecorder → `events` table; cold/warm TTFT is distinguished by a first-load flag. Metal peak alloc is also wired.
 

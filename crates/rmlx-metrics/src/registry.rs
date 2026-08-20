@@ -563,8 +563,49 @@ pub enum Coverage {
     Maybe,
 }
 
+/// The per-backend metric spec: the metrics every wired backend must declare a
+/// [`Coverage`] for, whether `Yes` or `No`.
+///
+/// `coverage()` falls back to `No` for a pair it cannot find, so an omitted row
+/// and a measured "this backend cannot emit that" are the same answer. Naming
+/// the set here is what lets a test tell them apart.
+pub const BACKEND_METRIC_SPEC: &[&str] = &[
+    "decode_tps_warm",
+    "decode_tps_cold",
+    "prefill_tps",
+    "overall_tps",
+    "ttft_warm_ms",
+    "ttft_cold_ms",
+    "itl_p50_ms",
+    "itl_p95_ms",
+    "step_ms_mean",
+    "model_load_ms",
+    "peak_rss_mb",
+    "metal_peak_alloc_mb",
+    "kv_cache_bytes",
+    "tps_per_gb_ram",
+    "task_pass_at_1",
+];
+
+/// Backends in [`crate::identity::BACKEND_WHITELIST`] that deliberately have no
+/// rows in [`COVERAGE_MATRIX`] yet.
+///
+/// This list exists so that adding a backend is a *visible* act. Without it,
+/// a new whitelist entry with no matrix rows makes `coverage()` answer `No` for
+/// every metric — indistinguishable from "measured and genuinely unsupported" —
+/// and nothing fails. Anything added here must be a backend nothing has
+/// recorded yet; the moment it produces a row, wire its metrics instead.
+pub const BACKENDS_WITHOUT_COVERAGE: &[&str] = &[
+    // Declared "(future)" in docs/METRICS_DB.md §5.4; no runner, no rows.
+    "vllm",
+];
+
 /// (backend, metric, coverage). Listed in spec §4 backend coverage matrix.
 /// Used by `rmlx metrics doctor` to flag suspicious gaps.
+///
+/// Every backend in [`crate::identity::BACKEND_WHITELIST`] must appear here for
+/// each metric in [`BACKEND_METRIC_SPEC`], unless it is declared in
+/// [`BACKENDS_WITHOUT_COVERAGE`].
 pub const COVERAGE_MATRIX: &[(&str, &str, Coverage)] = &[
     // ── rmlx ──────────────────────────────────────────────────────────────────
     ("rmlx", "decode_tps_warm", Coverage::Yes),
@@ -653,6 +694,29 @@ pub const COVERAGE_MATRIX: &[(&str, &str, Coverage)] = &[
     ("mlx_lm", "kv_cache_bytes", Coverage::No),
     ("mlx_lm", "tps_per_gb_ram", Coverage::Yes),
     ("mlx_lm", "task_pass_at_1", Coverage::No),
+    // ── mlx_lm_tq (the mlx-lm TurboQuant fork) ────────────────────────────────
+    // Whitelisted and recording since the cross-backend campaigns, but it had no
+    // COVERAGE_MATRIX rows at all until the sweep below was driven off
+    // BACKEND_WHITELIST — so `coverage()` answered No for every metric on the
+    // second-most-recorded backend in the store. Same CBB runner and same
+    // OpenAI-compatible surface as `mlx_lm`, hence the same coverage, except
+    // that its whole reason to exist is a quantised KV cache it does not report
+    // the size of.
+    ("mlx_lm_tq", "decode_tps_warm", Coverage::Yes),
+    ("mlx_lm_tq", "decode_tps_cold", Coverage::Yes),
+    ("mlx_lm_tq", "prefill_tps", Coverage::Yes),
+    ("mlx_lm_tq", "overall_tps", Coverage::Yes),
+    ("mlx_lm_tq", "ttft_warm_ms", Coverage::Yes),
+    ("mlx_lm_tq", "ttft_cold_ms", Coverage::Yes),
+    ("mlx_lm_tq", "itl_p50_ms", Coverage::Yes),
+    ("mlx_lm_tq", "itl_p95_ms", Coverage::Yes),
+    ("mlx_lm_tq", "step_ms_mean", Coverage::Yes),
+    ("mlx_lm_tq", "model_load_ms", Coverage::Yes),
+    ("mlx_lm_tq", "peak_rss_mb", Coverage::Yes),
+    ("mlx_lm_tq", "metal_peak_alloc_mb", Coverage::Yes),
+    ("mlx_lm_tq", "kv_cache_bytes", Coverage::No),
+    ("mlx_lm_tq", "tps_per_gb_ram", Coverage::Yes),
+    ("mlx_lm_tq", "task_pass_at_1", Coverage::No),
     // ── paroquant ─────────────────────────────────────────────────────────────
     ("paroquant", "decode_tps_warm", Coverage::Yes),
     ("paroquant", "decode_tps_cold", Coverage::Yes),
@@ -686,10 +750,13 @@ pub const COVERAGE_MATRIX: &[(&str, &str, Coverage)] = &[
     ("omlx", "tps_per_gb_ram", Coverage::Yes),
     ("omlx", "task_pass_at_1", Coverage::No),
     // ── llama_cpp ─────────────────────────────────────────────────────────────
-    // llama-bench -o json exposes pp (prefill TPS) and tg (decode TPS) natively.
-    // Metal / CPU load time measurable via wall clock around model load.
+    // Two producers feed this backend and they cover different metrics:
+    // `llama_bench_ingest.py` reads `llama-bench -o json` (pp = prefill TPS,
+    // tg = decode TPS, nothing else), and `llama_ab_ingest.py` reads a
+    // `bench_llama_ab.sh` result, which carries the server's own `timings`
+    // plus the KV-buffer total parsed from the server log and sampled peak RSS.
+    // A cell is Yes when EITHER producer can supply it.
     // metal_peak_alloc_mb: no MLX Metal allocator; llama.cpp uses its own pool.
-    // kv_cache_bytes: not directly exposed by llama-bench JSON output.
     // task_pass_at_1: quality probe, not a bench metric.
     ("llama_cpp", "decode_tps_warm", Coverage::Yes),
     ("llama_cpp", "decode_tps_cold", Coverage::Yes),
@@ -703,9 +770,30 @@ pub const COVERAGE_MATRIX: &[(&str, &str, Coverage)] = &[
     ("llama_cpp", "model_load_ms", Coverage::Yes),
     ("llama_cpp", "peak_rss_mb", Coverage::Yes),
     ("llama_cpp", "metal_peak_alloc_mb", Coverage::No),
-    ("llama_cpp", "kv_cache_bytes", Coverage::No),
+    // Yes since the A/B harness landed: `llama_kv_cache: ... KV buffer size`
+    // is on the server's own startup log and is summed per slot. It is not in
+    // `llama-bench` JSON, which is why this cell used to read No.
+    ("llama_cpp", "kv_cache_bytes", Coverage::Yes),
     ("llama_cpp", "tps_per_gb_ram", Coverage::Yes),
     ("llama_cpp", "task_pass_at_1", Coverage::No),
+    // ── llama_cpp_tq (the llama-cpp-turboquant fork) ──────────────────────────
+    // Same server, same log surface, same producer — it differs from upstream
+    // only in the KV codecs it can load, so its coverage is identical.
+    ("llama_cpp_tq", "decode_tps_warm", Coverage::Yes),
+    ("llama_cpp_tq", "decode_tps_cold", Coverage::Yes),
+    ("llama_cpp_tq", "prefill_tps", Coverage::Yes),
+    ("llama_cpp_tq", "overall_tps", Coverage::No),
+    ("llama_cpp_tq", "ttft_warm_ms", Coverage::No),
+    ("llama_cpp_tq", "ttft_cold_ms", Coverage::No),
+    ("llama_cpp_tq", "itl_p50_ms", Coverage::No),
+    ("llama_cpp_tq", "itl_p95_ms", Coverage::No),
+    ("llama_cpp_tq", "step_ms_mean", Coverage::Yes),
+    ("llama_cpp_tq", "model_load_ms", Coverage::Yes),
+    ("llama_cpp_tq", "peak_rss_mb", Coverage::Yes),
+    ("llama_cpp_tq", "metal_peak_alloc_mb", Coverage::No),
+    ("llama_cpp_tq", "kv_cache_bytes", Coverage::Yes),
+    ("llama_cpp_tq", "tps_per_gb_ram", Coverage::Yes),
+    ("llama_cpp_tq", "task_pass_at_1", Coverage::No),
     // ── ollama ────────────────────────────────────────────────────────────────
     ("ollama", "decode_tps_warm", Coverage::Yes),
     ("ollama", "decode_tps_cold", Coverage::Yes),

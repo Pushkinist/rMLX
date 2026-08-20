@@ -564,6 +564,20 @@ case "$BACKEND" in
   mlx-lm)
     # Bare Apple stock mlx-lm: no --kv-cache-quantization, so this arm is the
     # unquantised same-framework reference for rMLX, not another codec.
+    #
+    # Because the launcher below cannot express a codec, a quantised KV_QUANT
+    # would be REPORTED and RECORDED while an unquantised run actually happened
+    # -- a row labelled `k8v4` produced with no quantisation at all. Refuse it;
+    # `mlx-lm-turboquant` is the arm that takes a codec.
+    case "$KV_QUANT" in
+      none|auto|bf16|f16) ;;
+      *)
+        echo "[$(date +%T)] CELL FAIL kv-quant-unsupported tag=$TAG backend=mlx-lm kv=$KV_QUANT" >&2
+        echo "  bare mlx-lm serves unquantised KV only; use backend 'mlx-lm-turboquant' for a codec." >&2
+        echo "[$TS_HMS] $TAG | $BACKEND | $KV_QUANT | success=false | coh=false | KV_QUANT_UNSUPPORTED" >>"$PROGRESS"
+        exit 6
+        ;;
+    esac
     "${MLX_LM_ROOT:-../mlx-lm}/.venv/bin/mlx_lm.server" \
         --model "$MODEL_PATH" \
         --port "$PORT" \
@@ -611,8 +625,20 @@ case "$BACKEND" in
     BASE_URL="http://127.0.0.1:$PORT"
     API_KEY=""
     # llama-server serves whatever model it was started with and ignores the
-    # `model` field, so the basename is a label, not a lookup key.
-    HARNESS_MODEL="$(basename "$MODEL_PATH")"
+    # `model` field, so this is a label, not a lookup key. Strip the `.gguf`
+    # extension: the CBB harness derives the recorded `model` column from it,
+    # and `Qwen3-8B-Q8_0.gguf` would become a second champion for the cell that
+    # `scripts/ingest/llama_ab_ingest.py` already records as `Qwen3-8B-Q8_0`.
+    HARNESS_MODEL="$(basename "$MODEL_PATH" .gguf)"
+    # The measured binary's own commit, not the literal "head" the other arms
+    # pass. A version column that says "head" for every run of every build
+    # cannot distinguish two builds, which is the whole point of recording it.
+    BACKEND_VERSION_OVERRIDE="$(git -C "$(dirname "$_LCPP_BIN")/../.." rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    # NOTE: the CBB legacy path still derives `model_namespace` itself, from the
+    # `--model-path` basename, so these cells land under `local` while the A/B
+    # ingest path records them under `hf`. That split lives in the sibling
+    # harness, not here. `bench_llama_ab.sh` + `llama_ab_ingest.py` is the
+    # canonical recorder for GGUF cells; this arm is a smoke/coverage path.
     ;;
   *)
     echo "unknown backend $BACKEND" >&2
@@ -673,7 +699,7 @@ fi
 cd "$CBB"
 HARNESS_ARGS=(
   --backend "$BACKEND"
-  --backend-version "head"
+  --backend-version "${BACKEND_VERSION_OVERRIDE:-head}"
   --base-url "$BASE_URL"
   --model "$HARNESS_MODEL"
   --model-path "$MODEL_PATH"
@@ -710,11 +736,16 @@ if [ -n "$WARM_LINE" ]; then
   WARM_MS=$(echo "$WARM_LINE" | grep -oE "ttft=[0-9.]+ms" | head -1 | sed -E 's/ttft=([0-9.]+)ms/\1/')
   DECODE_TPS=$(echo "$WARM_LINE" | grep -oE "decode=[0-9.]+tps" | head -1 | sed -E 's/decode=([0-9.]+)tps/\1/')
 fi
-# Compute prefill tps = 8192 / (warm_ms/1000) = 8192*1000/warm_ms.
-PREFILL_TPS=0
-if [ -n "$WARM_MS" ] && [ "$(echo "$WARM_MS" | grep -c '^[0-9.]\+$')" -eq 1 ]; then
-  PREFILL_TPS=$(awk -v t="$WARM_MS" 'BEGIN { if (t>0) printf "%.2f", 8192000.0/t; else print "0" }')
-fi
+# Prefill TPS is deliberately NOT computed here. The formula this line used to
+# carry -- 8192000 / warm_ttft_ms -- was fabricated twice over: the 8192 was
+# hard-coded regardless of the real prompt length, and `warm_ttft_ms` is a
+# prompt-cache HIT, so the quotient described a prefill that never ran. It
+# produced ~109 000 and ~88 000 tok/s on the llama.cpp arms. A backend's own
+# `timings.prompt_per_second` is the real figure and is what
+# `scripts/bench_llama_ab.sh` records; nothing downstream of this progress line
+# needs a number here.
+PREFILL_TPS="n/a"
+
 # Success check per harness output.
 if echo "$LINES" | grep -q "success=False"; then SUCCESS=false; fi
 if echo "$LINES" | grep -q "err=other"; then SUCCESS=false; fi

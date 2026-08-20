@@ -116,7 +116,15 @@ done
 for f in "$BIN_A" "$BIN_B" "$MODEL" "$PROMPT_FILE"; do
 	[ -e "$f" ] || { echo "not found: $f" >&2; exit 125; }
 done
-[ "$PAIRS" -ge 1 ] || { echo "--pairs must be >= 1" >&2; exit 125; }
+# `--pairs 1` gives one slot per arm, so both "ranges" are single points and the
+# overlap test below cannot fire unless the two floats are exactly equal: the
+# verdict would read SEPARATED at the least evidence the harness can collect.
+# Two pairs is the minimum at which a range exists on both sides.
+if [ "$PAIRS" -lt 2 ]; then
+	echo "--pairs must be >= 2: at 1 slot per arm each range is a single point," >&2
+	echo "  so the overlap test cannot fire and every run reads SEPARATED." >&2
+	exit 125
+fi
 
 # ---- arm distinguishability --------------------------------------------------
 # Two arms that are the same build with the same flags produce a difference of
@@ -130,10 +138,49 @@ if [ "$SHA_A" = "$SHA_B" ] && [ "$ARGS_A" = "$ARGS_B" ] && [ "$ENV_A" = "$ENV_B"
 	exit 125
 fi
 
+# ---- arm args must not move what the harness pins -----------------------------
+# `$extra` is appended after the fixed flags, so a later occurrence wins in
+# llama-server's parser. `--args-b "-c 2048"` would run arm B at another context
+# while the report, the result JSON's `n_ctx` and every ingested row still claim
+# `$N_CTX` -- two arms silently become a different experiment, and a wrong
+# `ctx_max` lands in an append-only table. `perf_ab.sh` refuses `--metrics` in
+# arm arguments for exactly this reason.
+PINNED_FLAGS="--model -m --port --host -c --ctx-size -np --parallel -fa --flash-attn -ngl --n-gpu-layers -t --threads"
+refuse_pinned() { # <label> <args>
+	local label="$1" tok
+	for tok in $2; do
+		case " $PINNED_FLAGS " in
+		*" $tok "*)
+			echo "$label sets '$tok', which this harness pins for both arms." >&2
+			echo "  Arm args are appended last, so it would silently win and the" >&2
+			echo "  reported n_ctx / model / dispatch would describe a run that did" >&2
+			echo "  not happen. Use the harness flag instead." >&2
+			exit 125
+			;;
+		esac
+	done
+}
+refuse_pinned --args-a "$ARGS_A"
+refuse_pinned --args-b "$ARGS_B"
+
 CPU_SNAPSHOT_SKIP="$(basename "$BIN_A") $(basename "$BIN_B") llama-server"
 export CPU_SNAPSHOT_SKIP
 # shellcheck source=scripts/lib/cpu_snapshot.sh
 . "${REPO_ROOT}/scripts/lib/cpu_snapshot.sh"
+
+# ---- finding: a stranger already on the port ---------------------------------
+# `llama-server` binds only after it has loaded the model, so a foreign or
+# leftover server on $PORT answers /health immediately while our process is
+# still loading. The measured request would go to the stranger, our process
+# would die on the bind, and BOTH arms would silently measure the same third
+# binary. Refuse the port up front rather than discovering it in the numbers.
+if curl -fsS -m 3 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+	echo "port ${PORT} already answers /health -- something is listening there." >&2
+	echo "  llama-server binds after loading, so this run would measure that" >&2
+	echo "  process instead of its own, on both arms. Free the port or pass" >&2
+	echo "  --port." >&2
+	exit 125
+fi
 
 TMP="$(mktemp -d)"
 cleanup() {
@@ -204,6 +251,17 @@ run_slot() { # <bin> <args> <env> <slotdir>
 		return 1
 	fi
 
+	# Readiness alone does not say WHOSE server answered. Confirm the process
+	# that responds is serving the model this slot launched.
+	local served
+	served="$(curl -fsS -m 5 "http://127.0.0.1:${PORT}/props" 2>/dev/null |
+		python3 -c 'import json,sys; print(json.load(sys.stdin).get("model_path",""))' 2>/dev/null || true)"
+	if [ "$served" != "$MODEL" ]; then
+		kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+		echo "SLOT_FAIL wrong-server: /props reports model '$served', expected '$MODEL'" >&2
+		return 1
+	fi
+
 	# Warmup: a short generation over the same prompt, discarded. It pays the
 	# first-dispatch pipeline compile and the prompt-cache fill so the measured
 	# request times steady-state decode, not Metal's first-use costs.
@@ -232,18 +290,53 @@ run_slot() { # <bin> <args> <env> <slotdir>
 	# The backend's own KV figure. `llama.cpp` prints one line per KV buffer;
 	# summing them is the whole cache, and a codec arm that does not move this
 	# number has not changed what it stores.
-	local kv_mib
-	kv_mib="$(awk '/KV buffer size/ { for (i = 1; i <= NF; i++) if ($i == "MiB") s += $(i-1) } END { printf "%.2f", s+0 }' "$dir/server.log")"
+	# `kv_mib` is half the verdict this harness exists to produce, so a log this
+	# parser cannot read must FAIL the slot. Emitting `0.00` on no match -- a
+	# build that logs GiB, or `2048.00MiB` without the space -- would put a
+	# fabricated zero in the report, the result JSON and `kv_cache_bytes`, where
+	# the §4.1 plausible-value bounds admit 0 as a real gauge reading.
+	local kv_mib kv_hits
+	kv_hits="$(grep -c "KV buffer size" "$dir/server.log" || true)"
+	kv_mib="$(awk '/KV buffer size/ { for (i = 1; i <= NF; i++) if ($i == "MiB") s += $(i-1); n++ } END { if (n == 0 || s <= 0) exit 1; printf "%.2f", s }' "$dir/server.log")" || {
+		echo "SLOT_FAIL kv-buffer-unparsed: ${kv_hits} 'KV buffer size' line(s), no MiB total" >&2
+		return 1
+	}
+
+	# Same rule for resident memory: `ps` returning nothing for every sample
+	# leaves rss_peak at its 0 initialiser, which is not a measurement.
+	if [ "$rss_peak" -le 0 ]; then
+		echo "SLOT_FAIL rss-unsampled: no ps reading for pid $pid during the measured window" >&2
+		return 1
+	fi
 
 	# The generated text goes into the report too. Cross-build output is not
 	# expected to be bit-identical, but a codec that has silently corrupted the
 	# cache produces visible garbage, and a throughput table alone hides it.
-	python3 - "$dir/measure.json" "$kv_mib" "$rss_peak" "$dir/first64" <<'PY'
+	python3 - "$dir/measure.json" "$kv_mib" "$rss_peak" "$dir/first64" "$N_PREDICT" <<'PY'
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
     t = d["timings"]
-    open(sys.argv[4], "w").write((d.get("content") or "")[:64])
+    want = int(sys.argv[5])
+    # An early EOS or a truncated generation still parses, and its
+    # `predicted_per_second` still enters the median and moves it. A decode
+    # budget that was not spent is not the cell that was asked for.
+    if t["predicted_n"] != want:
+        raise ValueError("decode budget not spent: predicted_n=%s, wanted %d"
+                         % (t["predicted_n"], want))
+    # Zero tokens per second is `tokens / seconds` with a zero numerator --
+    # nothing was measured. It is outside the §4.1 rate window for the same
+    # reason and must not reach the median.
+    if not t["predicted_per_second"] > 0:
+        raise ValueError("predicted_per_second=%s is not a measurement"
+                         % t["predicted_per_second"])
+    text = (d.get("content") or "")[:64]
+    # An empty capture cannot be told apart from "the model emitted only
+    # characters the report strips", and a coherence claim must not rest on
+    # a field that silently reads empty.
+    if not text.strip():
+        raise ValueError("empty generation capture")
+    open(sys.argv[4], "w").write(text)
     print("%.4f %d %d %.4f %s %.1f" % (
         t["predicted_per_second"], t["prompt_n"], t["predicted_n"],
         t["prompt_per_second"], sys.argv[2], float(sys.argv[3]) / 1024.0))
@@ -294,7 +387,13 @@ for arm in $ORDER; do
 	set -- $out
 	tps="$1"; pn="$2"; dn="$3"; ptps="$4"; kv="$5"; rss="$6"
 	win="$(cat "$dir/window")"
+	# The python above refuses to write this file unless the capture was
+	# non-empty, so a missing or blank one here means the contract broke.
 	first64="$(tr -d '|\n' <"$dir/first64" 2>/dev/null || true)"
+	if [ -z "$first64" ]; then
+		echo "slot $SLOT ($label): generation capture is empty" >&2
+		exit 125
+	fi
 	[ "${win%% *}" = "quiet" ] || note_taint "slot $SLOT ($label): $win"
 	echo "  decode ${tps} tok/s | prompt_n ${pn} | predicted ${dn} | kv ${kv} MiB | peak_rss ${rss} MB | host ${win}" >&2
 	echo "  out: ${first64}" >&2
@@ -319,11 +418,18 @@ VERDICT="$(python3 -c '
 import sys
 amin, amed, amax, _ = (float(x) for x in sys.argv[1].split())
 bmin, bmed, bmax, _ = (float(x) for x in sys.argv[2].split())
+n = int(sys.argv[3])
+ratio = bmed / amed
 if amax >= bmin and bmax >= amin:
-    print("INCONCLUSIVE ranges-overlap %.4f" % (bmed / amed))
+    print("INCONCLUSIVE ranges-overlap %.4f" % ratio)
+elif n < 3:
+    # Disjoint ranges built from two points each are disjoint on very little.
+    # Say so rather than letting the strongest word in the vocabulary rest on
+    # the weakest evidence the harness will accept.
+    print("SEPARATED-WEAK n=%d-per-arm %.4f" % (n, ratio))
 else:
-    print("SEPARATED %.4f" % (bmed / amed))
-' "$SA" "$SB")"
+    print("SEPARATED %.4f" % ratio)
+' "$SA" "$SB" "$PAIRS")"
 
 export ROWS
 mkdir -p "$OUT_DIR"

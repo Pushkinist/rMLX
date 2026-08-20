@@ -54,7 +54,8 @@ Conventions:
 | Script | Via | What it does |
 |---|---|---|
 | `perf_ab.sh` | `perf_canary.sh --ab` | **ABBA-interleaved A/B of two `rmlx baseline` arms.** Host-quiescence gate, arm-distinguishability guard, token-id comparison. |
-| `perf_ab_selftest.sh` | `make perf-ab-selftest` | Mutation check for `perf_ab.sh` — every guard must fail when broken. |
+| `perf_ab_selftest.sh` | `make canary-ab-selftest` | Mutation check for `perf_ab.sh` — every guard must fail when broken. |
+| `bench_llama_ab_selftest.sh` | `make llama-ab-selftest` | Mutation check for `bench_llama_ab.sh` against a stub `llama-server` — 13 cases, one per guard. In `make ci`. |
 | `bench_llama_ab.sh` | — | **ABBA-interleaved A/B of two `llama-server` arms** (fork vs upstream, codec vs codec). Same quiescence discipline as `perf_ab.sh`, reported over the server's own `timings` plus KV-buffer and peak-RSS columns. Never writes `runs.db`. |
 | `perf_canary.sh` | `make perf-canary` | Fast decode-TPS canary over the three standard test-target models. |
 | `regression_gate.sh` | — | Compare a committed baseline against the latest canary row. Exit 125 = `git bisect skip`, 1 = regression. |

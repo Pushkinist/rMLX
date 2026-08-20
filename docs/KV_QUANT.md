@@ -3093,7 +3093,7 @@ bytes and within noise on TPS; dropping the gate at the *same* prompt moves
 resident KV by +180 MB and decode 129.8 → 65.9 TPS. The 16k/32k byte deltas
 (+722 MB / +1445 MB, exactly linear in `kv_seq`) are the kernel engaging.
 
-### Cross-backend calibration — ε is a platform number, not an rMLX number
+### Cross-backend calibration — ε is a platform number, not an rMLX number (TAINTED host)
 
 The three rows above are all rMLX kernels, so on their own they cannot separate
 "fused decode over a quant store is hard on this GPU" from "our kernels are
@@ -3103,28 +3103,58 @@ bad". A second, independent implementation now answers that.
 hand-written Metal: TurboQuant K/V blocks read directly inside
 `flash_attn_ext_vec_kturbo*_vturbo*_dk{128,256}_dv{128,256}`, with the WHT
 applied to `q` once per query as a graph op. It was measured against **its own
-upstream merge-base** (`7fc1c4ef7`) at f16 KV — same GGUF, same graph, same
-build flags, so the only variable is the codec and its kernels. ABBA, n=4/arm,
-two models, both `n_q_heads/n_kv_heads = 32/8` → `heads_per_kv = 4`, the same
-ratio as Bonsai-8B:
+upstream merge-base** (`7fc1c4ef7`) at f16 KV — same GGUF file, same graph, same
+build flags, so within one cell the only variable is the codec and its kernels.
+Both models are `n_q_heads/n_kv_heads = 32/8` → `heads_per_kv = 4`, the same
+ratio as Bonsai-8B.
 
-| model | prompt tok | fork turbo3 / upstream f16 decode | ms/step ratio | KV MiB f16 → turbo3 |
-|---|---:|---:|---:|---|
-| Qwen3-8B-Q8_0 | 3 753 | 0.733x | 1.364 | 648.00 → 126.69 |
-| Qwen3-8B-Q8_0 | 7 722 | 0.705x | 1.419 | 2 304.00 → 450.13 |
-| Qwen3-8B-Q8_0 | 31 536 | 0.690x | 1.449 | 5 760.00 → 1 125.13 |
-| Llama-3.1-8B-Instruct-Q8_0 | 61 709 | 0.653x | 1.532 | 8 192.00 → 1 600.13 |
+**Measurement conditions.** Every cell ran `--allow-busy-host` and came back
+**TAINTED** — entry gate 25.6–55.0% of one core, measured windows 29–56%
+(`WindowServer`; `syspolicyd` steady at 32.2–32.5%), and two slots of the 7 722
+run with a `node` process at 139.9%/159.8%. ABBA cancels a *steady* load and the
+arm ranges below are disjoint by far more than the interference, so the
+**separation verdicts survive**; the **absolute TPS does not** and is not quoted
+across runs. Per-slot windows are in each result JSON.
+
+| model | prompt tok | n/arm | fork turbo3 / upstream f16 decode | ms/step ratio | KV MiB f16 → turbo3 | peak RSS B/A |
+|---|---:|---:|---:|---:|---|---:|
+| Qwen3-8B-Q8_0 | 3 753 | 4 | 0.733x | 1.364 | 648.00 → 126.69 | 0.945x |
+| Qwen3-8B-Q8_0 | 7 722 | 4 | 0.705x | 1.419 | 2 304.00 → 450.13 | 0.830x |
+| Qwen3-8B-Q8_0 | 31 536 | 4 | 0.690x | 1.449 | 5 760.00 → 1 125.13 | 0.677x |
+| Llama-3.1-8B-Instruct-Q8_0 | 61 709 | **2** | 0.653x | 1.532 | 8 192.00 → 1 600.13 | 0.607x |
+
+Arm ranges are disjoint in all four cells. **The 61 709 row is n=2/arm**
+(`--pairs 2`), not 4 — it is simultaneously the most extreme ratio, the only
+second-architecture point, and the least-replicated cell. Nothing below is
+derived from it alone. Its stored result JSON records the verdict as
+`SEPARATED`; the harness now labels a disjoint pair at n=2 `SEPARATED-WEAK`, and
+refuses `--pairs 1` outright, because two single-point "ranges" cannot overlap.
 
 `ρ` is exact here and needs no inference: llama.cpp keeps no bf16 mirror, so the
-reported KV buffer *is* what the kernel reads — **ρ = 0.195**, identical to three
-decimal places at every context and on both models. The ms/step ratio is still
-climbing at 62k, so the marginal slope ratio is at least 1.532, giving
-**ε ≤ 0.127**.
+reported KV buffer *is* what the kernel reads. Across all four cells and both
+models **ρ = 0.1953 ± 0.0002** (0.195509 / 0.195369 / 0.195335 / 0.195328) — a
+1.8e-4 spread, which is the codec's block layout reproducing itself exactly.
+
+**ε is derived from the Qwen3-8B series alone.** The `ms/step = a + b·x`
+monotonicity argument is only valid within one `(a, b)` pair, i.e. within one
+model; extending it across the model boundary to the Llama-3.1 row would not be
+a bound at all. Two derivations, both same-model:
+
+* **Drift-free upper bound.** The within-run ms/step ratios rise 1.364 → 1.419 →
+  1.449 and are still climbing, so the marginal slope ratio is at least 1.449 and
+  **ε ≤ 0.135**. This uses only within-run ratios, so host drift cancels.
+* **Two-endpoint slope regression.** Fitting `b` per arm from the 3 753 and
+  31 536 cells gives `b = 0.330`, `b' = 0.536`, slope ratio **1.63** and
+  **ε ≈ 0.120**. This one reads absolute ms across two runs, so it carries the
+  drift caveat.
+
+So ε ∈ **[0.120, 0.135]** for the fork's kernel, and the upper bound is *exactly*
+rMLX's own best measured shell:
 
 | kernel | `heads_per_kv` | geometric ceiling | ε | % of ceiling |
 |---|---|---|---|---|
 | rMLX `iso_flash_decode_symv`, Bonsai-8B | 4 | 0.250 | 0.135 | 54% |
-| `llama-cpp-turboquant` vec-turbo FA, Qwen3-8B / Llama-3.1-8B | 4 | 0.250 | ≤0.127 | ~51% |
+| `llama-cpp-turboquant` vec-turbo FA, Qwen3-8B | 4 | 0.250 | 0.120–0.135 | 48–54% |
 
 **Two independently written Metal kernels, two frameworks, land on the same ε at
 the same `heads_per_kv`.** And for the same structural reason: the fork's vec
@@ -3135,25 +3165,46 @@ The ceiling in the next section is not an rMLX artifact.
 
 Consequences, and they are the load-bearing part of this whole section:
 
-* **ρ = 0.195 > ε ≈ 0.13, so the fork loses too** — by 1.45x–1.53x on ms/step,
-  which is the 0.69x / 0.65x decode ratio measured. rMLX's `turbo_flash` being slower than its
-  generic path is a *degree* of the same result, not a different kind of result.
-  Its ε = 0.041 says our TurboFlash *shell* is ~3x off what is achievable; even
-  a perfect fix of that shell reaches ε ≈ 0.13 and still loses at ρ = 0.195.
-* **The trend runs the wrong way.** 0.733 → 0.705 → 0.690 → 0.653 as context
-  grows 16x across two architectures.
-  A codec whose store is 5x smaller should gain as KV's share of bytes/step
-  rises; it does not, because the per-step dequant work scales with the same
-  `t_seq`. "Measure it at longer context and it will pay" is falsified on the
-  reference implementation, not only on ours.
-* **What the fork does deliver is the memory axis**, cleanly and with coherent
-  output: 0.195x KV and 0.68x–0.83x peak process memory. That is the trade
-  actually on the table — real capacity for ~30% decode — and it is a
-  capacity feature, not a throughput one.
+* **ρ = 0.1953 > ε ≤ 0.135, so the fork loses too** — by 1.45x on ms/step at
+  31 536, which is the 0.690x decode ratio measured. rMLX's `turbo_flash` being
+  slower than its generic path is a *degree* of the same result, not a different
+  kind of result. Its ε = 0.041 says our TurboFlash *shell* is ~3x off what is
+  achievable; even a perfect fix of that shell reaches ε ≈ 0.135 and still loses
+  at ρ = 0.1953.
+* **The trend runs the wrong way**, and this is established on the three
+  **same-model** Qwen3-8B points alone: 0.733 → 0.705 → 0.690 as context grows
+  8.4x. A codec whose store is 5x smaller should gain as KV's share of
+  bytes/step rises; it does not, because the per-step dequant work scales with
+  the same `t_seq`. "Measure it at longer context and it will pay" is falsified
+  on the reference implementation, not only on ours. The Llama-3.1 point at
+  0.653x is *consistent* with the trend but cannot extend it — it changes model
+  and context simultaneously, and there is no short-context Llama-3.1 cell to
+  separate "ratio falls with context" from "Llama-3.1 is worse for this codec".
+* **What the fork does deliver is the memory axis**, and it is monotone with
+  context rather than flat: peak process memory **0.945x / 0.830x / 0.677x /
+  0.607x** at 3 753 / 7 722 / 31 536 / 61 709, against a flat 0.1953x KV buffer.
+  The campaign declared a `≤0.85x` peak-memory criterion in advance; **at 3 753
+  tokens the fork does not clear it** (0.945x), because the KV saving is small
+  beside 8.3 GB of weights until context grows. The trade is real from ~8k up and
+  absent below it.
+* **Coherence was observed only where it was captured, and no quality axis was
+  measured.** Output capture was added to the harness after the 7 722 and 31 536
+  runs, so every slot of those two carries `output_first_64: null`. Where
+  captured (3 753, 61 709, and the confound control) both arms produce fluent,
+  on-topic English. At 61 709 the two arms visibly disagree on extracted facts,
+  which is expected of a lossy KV codec and is *not* evidence either way about
+  quality — no perplexity or task score was run.
 * Its own deepest fusion (`TurboFlash`, a two-pass fused kernel) is **disabled by
   default because it emits garbage on Apple10**, reproduced here on this host.
   Two independent projects disabling their deepest Metal fusion on this GPU
   family is a platform signal.
+
+**Scope of the confound control.** "The only variable is the codec" is licensed
+by a `fork @ f16` vs `merge-base @ f16` cell that returned INCONCLUSIVE with
+fully overlapping ranges (1.013x, n=4/arm) — but that control ran at **one
+context (7 722) on one model (Qwen3-8B)**. The 61 709 Llama-3.1 cell has no
+control of its own, so a long-context-specific or Llama-specific regression among
+the fork's 211 non-upstream commits is unmeasured there.
 
 Method, raw slots and the fork-side detail: `scripts/bench_llama_ab.sh`,
 `scripts/ingest/llama_ab_ingest.py`, results under `$RMLX_HOME/bench/llama_ab/`.
