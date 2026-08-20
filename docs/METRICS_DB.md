@@ -635,7 +635,10 @@ Earlier revisions of this document described `kv_quant` as validated against a f
 
 ### 5.4 `backend` whitelist
 
-Only these strings allowed (extend whitelist by editing this section):
+Only these strings allowed. The list here mirrors
+`rmlx_metrics::identity::BACKEND_WHITELIST` — extend **both**, in the same
+change, or the doc says one thing and the validator does another:
+
 - `rmlx`
 - `mlx_lm` (Apple stock + sampler-fast)
 - `mlx_lm_tq` (TurboQuant fork)
@@ -643,6 +646,19 @@ Only these strings allowed (extend whitelist by editing this section):
 - `omlx`
 - `ollama`
 - `vllm` (future)
+- `llama_cpp` (upstream `ggml-org/llama.cpp`)
+- `llama_cpp_tq` (the `llama-cpp-turboquant` fork)
+
+`canonicalize` normalizes a few spellings before the lookup: `llama.cpp` /
+`llama-cpp` / `llamacpp` → `llama_cpp`, and `llama-cpp-turboquant` /
+`llama.cpp-turboquant` / `llama_cpp_turboquant` → `llama_cpp_tq`.
+
+**A fork is its own backend id, never a `kv_quant` value on the upstream id.**
+`llama_cpp_tq` exists for the same reason `mlx_lm_tq` does: it is a different
+build carrying codecs (`turbo2` / `turbo3` / `turbo4`) that upstream cannot
+load at all. Recording a turbo cell under `llama_cpp` would attribute a
+measurement to a binary that cannot produce it, and `bests` would then rank the
+two builds inside one backend column.
 
 ### 5.5 `hardware_tag`
 

@@ -54,7 +54,8 @@ set -uo pipefail
 
 TAG="$1"            # e2b/e4b/26b/31b/31b-paro
 MODEL_PATH="$2"     # abs path to snapshot
-BACKEND="$3"        # rmlx | mlx-lm-turboquant | omlx | paroquant
+BACKEND="$3"        # rmlx | mlx-lm | mlx-lm-turboquant | omlx | paroquant
+                    #   | llama.cpp | llama-cpp-turboquant
 KV_QUANT="$4"       # k8v4|k8v8|planar|mixed | turboquant | native
 BUDGET_MIN="$5"     # int minutes
 MODEL_DISK_GB="$6"  # for harness tps-per-gb
@@ -142,6 +143,7 @@ pkill -f "rmlx serve" 2>/dev/null
 pkill -f mlx_lm 2>/dev/null
 pkill -f paroquant 2>/dev/null
 pkill -f omlx 2>/dev/null
+pkill -f llama-server 2>/dev/null
 sleep 5
 rm -f /tmp/rmlx.*.claim 2>/dev/null
 
@@ -559,6 +561,59 @@ case "$BACKEND" in
     API_KEY=""
     HARNESS_MODEL="$MODEL_PATH"
     ;;
+  mlx-lm)
+    # Bare Apple stock mlx-lm: no --kv-cache-quantization, so this arm is the
+    # unquantised same-framework reference for rMLX, not another codec.
+    "${MLX_LM_ROOT:-../mlx-lm}/.venv/bin/mlx_lm.server" \
+        --model "$MODEL_PATH" \
+        --port "$PORT" \
+        --max-tokens 8192 \
+        --log-level WARNING >"$LOG" 2>&1 &
+    SERVER_PID=$!
+    BASE_URL="http://127.0.0.1:$PORT"
+    API_KEY=""
+    HARNESS_MODEL="$MODEL_PATH"
+    ;;
+  llama.cpp|llama-cpp-turboquant)
+    # GGUF arms. MODEL_PATH is a .gguf file here, not an MLX snapshot dir --
+    # no file exists that both families can load, so a cell against an MLX
+    # backend rests on a stated quant-equivalence assumption (see
+    # docs/PERF_BASELINE.md H2 addendum). The fork-vs-upstream pair does not.
+    #
+    # KV_QUANT is the ggml cache type for both sides; `none` means f16, which
+    # is what upstream calls unquantised KV. `turbo2|turbo3|turbo4` exist only
+    # in the fork, so upstream refuses them at startup rather than silently
+    # running something else.
+    if [ "$BACKEND" = "llama.cpp" ]; then
+      _LCPP_BIN="${LLAMA_CPP_ROOT:-../llama.cpp}/build/bin/llama-server"
+    else
+      _LCPP_BIN="${LLAMA_CPP_TURBOQUANT_ROOT:-../llama-cpp-turboquant}/build/bin/llama-server"
+    fi
+    if [ ! -x "$_LCPP_BIN" ]; then
+      echo "[$(date +%T)] CELL FAIL no-llama-server tag=$TAG backend=$BACKEND path=$_LCPP_BIN" >&2
+      echo "[$TS_HMS] $TAG | $BACKEND | $KV_QUANT | success=false | coh=false | NO_LLAMA_SERVER" >>"$PROGRESS"
+      exit 5
+    fi
+    case "$KV_QUANT" in
+      none|auto) _LCPP_CT="f16" ;;
+      *)         _LCPP_CT="$KV_QUANT" ;;
+    esac
+    "$_LCPP_BIN" \
+        --model "$MODEL_PATH" \
+        --port "$PORT" \
+        --host 127.0.0.1 \
+        -c "$CBB_CTX_MAX" \
+        -np 1 \
+        -fa on \
+        --no-webui \
+        -ctk "$_LCPP_CT" -ctv "$_LCPP_CT" >"$LOG" 2>&1 &
+    SERVER_PID=$!
+    BASE_URL="http://127.0.0.1:$PORT"
+    API_KEY=""
+    # llama-server serves whatever model it was started with and ignores the
+    # `model` field, so the basename is a label, not a lookup key.
+    HARNESS_MODEL="$(basename "$MODEL_PATH")"
+    ;;
   *)
     echo "unknown backend $BACKEND" >&2
     echo "[$TS_HMS] $TAG | $BACKEND | $KV_QUANT | success=false | coh=false | UNKNOWN_BACKEND" >>"$PROGRESS"
@@ -586,7 +641,7 @@ if [ "$READY" -ne 1 ]; then
   echo "[$(date +%T)] CELL FAIL server-not-ready tag=$TAG backend=$BACKEND kv=$KV_QUANT" >&2
   echo "[$(date +%T)] $TAG | $BACKEND | $KV_QUANT | success=false | coh=false | SERVER_NOT_READY" >>"$PROGRESS"
   kill "$SERVER_PID" 2>/dev/null
-  pkill -f "rmlx serve" 2>/dev/null; pkill -f mlx_lm 2>/dev/null; pkill -f omlx 2>/dev/null; pkill -f paroquant 2>/dev/null
+  pkill -f "rmlx serve" 2>/dev/null; pkill -f mlx_lm 2>/dev/null; pkill -f omlx 2>/dev/null; pkill -f paroquant 2>/dev/null; pkill -f llama-server 2>/dev/null
   rm -f /tmp/rmlx.*.claim
   exit 2
 fi
@@ -610,7 +665,7 @@ if [ "$REMAINING" -lt 60 ]; then
   echo "[$(date +%T)] CELL FAIL pre-bench-out-of-budget tag=$TAG" >&2
   echo "[$(date +%T)] $TAG | $BACKEND | $KV_QUANT | success=false | coh=false | OUT_OF_BUDGET" >>"$PROGRESS"
   kill "$SERVER_PID" 2>/dev/null
-  pkill -f "rmlx serve" 2>/dev/null; pkill -f mlx_lm 2>/dev/null; pkill -f omlx 2>/dev/null; pkill -f paroquant 2>/dev/null
+  pkill -f "rmlx serve" 2>/dev/null; pkill -f mlx_lm 2>/dev/null; pkill -f omlx 2>/dev/null; pkill -f paroquant 2>/dev/null; pkill -f llama-server 2>/dev/null
   rm -f /tmp/rmlx.*.claim
   exit 3
 fi
@@ -686,6 +741,7 @@ pkill -f "rmlx serve" 2>/dev/null
 pkill -f mlx_lm 2>/dev/null
 pkill -f omlx 2>/dev/null
 pkill -f paroquant 2>/dev/null
+pkill -f llama-server 2>/dev/null
 sleep 3
 rm -f /tmp/rmlx.*.claim
 

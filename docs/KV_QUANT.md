@@ -3093,6 +3093,71 @@ bytes and within noise on TPS; dropping the gate at the *same* prompt moves
 resident KV by +180 MB and decode 129.8 → 65.9 TPS. The 16k/32k byte deltas
 (+722 MB / +1445 MB, exactly linear in `kv_seq`) are the kernel engaging.
 
+### Cross-backend calibration — ε is a platform number, not an rMLX number
+
+The three rows above are all rMLX kernels, so on their own they cannot separate
+"fused decode over a quant store is hard on this GPU" from "our kernels are
+bad". A second, independent implementation now answers that.
+
+`llama-cpp-turboquant` implements the same idea in a different framework with
+hand-written Metal: TurboQuant K/V blocks read directly inside
+`flash_attn_ext_vec_kturbo*_vturbo*_dk{128,256}_dv{128,256}`, with the WHT
+applied to `q` once per query as a graph op. It was measured against **its own
+upstream merge-base** (`7fc1c4ef7`) at f16 KV — same GGUF, same graph, same
+build flags, so the only variable is the codec and its kernels. ABBA, n=4/arm,
+two models, both `n_q_heads/n_kv_heads = 32/8` → `heads_per_kv = 4`, the same
+ratio as Bonsai-8B:
+
+| model | prompt tok | fork turbo3 / upstream f16 decode | ms/step ratio | KV MiB f16 → turbo3 |
+|---|---:|---:|---:|---|
+| Qwen3-8B-Q8_0 | 3 753 | 0.733x | 1.364 | 648.00 → 126.69 |
+| Qwen3-8B-Q8_0 | 7 722 | 0.705x | 1.419 | 2 304.00 → 450.13 |
+| Qwen3-8B-Q8_0 | 31 536 | 0.690x | 1.449 | 5 760.00 → 1 125.13 |
+| Llama-3.1-8B-Instruct-Q8_0 | 61 709 | 0.653x | 1.532 | 8 192.00 → 1 600.13 |
+
+`ρ` is exact here and needs no inference: llama.cpp keeps no bf16 mirror, so the
+reported KV buffer *is* what the kernel reads — **ρ = 0.195**, identical to three
+decimal places at every context and on both models. The ms/step ratio is still
+climbing at 62k, so the marginal slope ratio is at least 1.532, giving
+**ε ≤ 0.127**.
+
+| kernel | `heads_per_kv` | geometric ceiling | ε | % of ceiling |
+|---|---|---|---|---|
+| rMLX `iso_flash_decode_symv`, Bonsai-8B | 4 | 0.250 | 0.135 | 54% |
+| `llama-cpp-turboquant` vec-turbo FA, Qwen3-8B / Llama-3.1-8B | 4 | 0.250 | ≤0.127 | ~51% |
+
+**Two independently written Metal kernels, two frameworks, land on the same ε at
+the same `heads_per_kv`.** And for the same structural reason: the fork's vec
+dispatch is `dispatch_threadgroups(…, (ne01 + nqptg - 1)/nqptg, ne02, ne03, …)`
+with `ne02` the **query**-head count (`ggml-metal-ops.cpp`), so its
+`heads_per_kv` threadgroups re-read the identical KV bytes exactly as ours do.
+The ceiling in the next section is not an rMLX artifact.
+
+Consequences, and they are the load-bearing part of this whole section:
+
+* **ρ = 0.195 > ε ≈ 0.13, so the fork loses too** — by 1.45x–1.53x on ms/step,
+  which is the 0.69x / 0.65x decode ratio measured. rMLX's `turbo_flash` being slower than its
+  generic path is a *degree* of the same result, not a different kind of result.
+  Its ε = 0.041 says our TurboFlash *shell* is ~3x off what is achievable; even
+  a perfect fix of that shell reaches ε ≈ 0.13 and still loses at ρ = 0.195.
+* **The trend runs the wrong way.** 0.733 → 0.705 → 0.690 → 0.653 as context
+  grows 16x across two architectures.
+  A codec whose store is 5x smaller should gain as KV's share of bytes/step
+  rises; it does not, because the per-step dequant work scales with the same
+  `t_seq`. "Measure it at longer context and it will pay" is falsified on the
+  reference implementation, not only on ours.
+* **What the fork does deliver is the memory axis**, cleanly and with coherent
+  output: 0.195x KV and 0.68x–0.83x peak process memory. That is the trade
+  actually on the table — real capacity for ~30% decode — and it is a
+  capacity feature, not a throughput one.
+* Its own deepest fusion (`TurboFlash`, a two-pass fused kernel) is **disabled by
+  default because it emits garbage on Apple10**, reproduced here on this host.
+  Two independent projects disabling their deepest Metal fusion on this GPU
+  family is a platform signal.
+
+Method, raw slots and the fork-side detail: `scripts/bench_llama_ab.sh`,
+`scripts/ingest/llama_ab_ingest.py`, results under `$RMLX_HOME/bench/llama_ab/`.
+
 ### Why ε is small — grid geometry
 
 Every P1 kernel here indexes its grid by **query** head (`n_bh = b · n_q_heads`)
