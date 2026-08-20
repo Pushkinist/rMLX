@@ -409,6 +409,13 @@ complements the pattern; running once each way cancels any residual positional
 bias. `--slots` must be a multiple of 4 — a partial block would give the arms
 different mean positions and put the confound back.
 
+**The verdict and the taint are separate lines, and separate facts.** `VERDICT:`
+always carries the rank test's answer — `SEPARATED` or `INCONCLUSIVE` — and a
+contaminated run adds a `TAINTED:` line beside it and exits 125. Taint used to
+*replace* the verdict, which discarded the one thing the run had computed for
+precisely the runs a reader most needs to re-read, and made any gate on the
+verdict silently a gate on host quiescence.
+
 **Criterion, fixed before the run.** The arms are **SEPARATED** if and only if
 their per-slot `decode_tps` ranges are disjoint. Under the null that the arms
 are exchangeable, `P(disjoint) = 2 / C(slots, slots/2)` — `2/924 = 0.00216` at
@@ -442,8 +449,8 @@ above are computed, and none should be read into the ratio.
 | A non-numeric `--slots` / `--busy-pct` / shape option | exit 125 before measuring | none |
 | `--slots` whose null probability exceeds 0.05 | exit 125 before measuring | none |
 | Host not quiescent — any foreign process ≥ `--busy-pct` (default 25) of a core | exit 125 before measuring | `--allow-busy-host` (still exits 125 if the result is tainted) |
-| A foreign process ran during any slot or across the comparison | verdict `TAINTED`, exit 125 | none |
-| A slot or the comparison could not be sampled for interference | verdict `TAINTED`, exit 125 | none |
+| A foreign process ran during any slot or across the comparison | `TAINTED:` line, exit 125 | none |
+| A slot or the comparison could not be sampled for interference | `TAINTED:` line, exit 125 | none |
 | Arms generate different token ids | exit 1 | `--allow-token-divergence` |
 | A slot stops reproducing its own arm's warmup token ids | exit 1 | none |
 | `rmlx serve` holds the Metal context | exit 125 (reported, never killed) | none |

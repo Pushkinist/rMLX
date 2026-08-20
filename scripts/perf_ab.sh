@@ -897,8 +897,19 @@ for model in "${MODELS[@]}"; do
 
 	printf "  host during the comparison: %s\n" "$(host_detail "$MODEL_HOST")"
 
+	# The rank test's answer is always printed, tainted or not. It used to be
+	# replaced by the word TAINTED, which threw away the one number the run had
+	# computed and made "what did the harness conclude?" unanswerable for
+	# exactly the runs that most needed re-reading. Taint is reported on its own
+	# line beside it: the two are different facts and either can be true alone.
+	printf "  VERDICT: %s\n" "$VERDICT"
+	if [[ "$VERDICT" == "INCONCLUSIVE" ]]; then
+		echo "           The arms' slot ranges overlap. The ${DELTA_PCT}% above is the"
+		echo "           difference between two point estimates drawn from overlapping"
+		echo "           spreads; it is not evidence that the arms differ."
+	fi
 	if [[ -n "$TAINTED" ]]; then
-		echo "  VERDICT: TAINTED — ${TAINTED%; }"
+		echo "  TAINTED: ${TAINTED%; }"
 		echo "           The interference did not fall evenly on the arms, so the ratio"
 		echo "           above is not usable. Re-run on a quiet host."
 		# A tainted run exits non-zero even under --allow-busy-host. That flag
@@ -906,13 +917,6 @@ for model in "${MODELS[@]}"; do
 		# contaminated comparison count as a clean one, which is the exact
 		# mistake this harness exists to stop.
 		OVERALL_EXIT=125
-	else
-		printf "  VERDICT: %s\n" "$VERDICT"
-		if [[ "$VERDICT" == "INCONCLUSIVE" ]]; then
-			echo "           The arms' slot ranges overlap. The ${DELTA_PCT}% above is the"
-			echo "           difference between two point estimates drawn from overlapping"
-			echo "           spreads; it is not evidence that the arms differ."
-		fi
 	fi
 
 	JSON_MODELS="${JSON_MODELS}$(
@@ -929,7 +933,7 @@ for model in "${MODELS[@]}"; do
 		)]},
      "ratio_b_over_a": $RATIO,
      "kv_cache_ratio_b_over_a": $(json_num "$KV_RATIO"),
-     "verdict": "$( [[ -n "$TAINTED" ]] && echo "TAINTED" || echo "$VERDICT" )",
+     "verdict": "$VERDICT",
      "tokens": "$( [[ "$TOKENS_VERDICT" == identical ]] && echo identical || echo diverged )",
      "tokens_per_run": $REF_TOKENS,
      "taint": "$(json_str "${TAINTED%; }")"},
