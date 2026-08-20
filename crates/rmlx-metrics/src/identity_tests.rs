@@ -139,6 +139,34 @@ fn canonicalize_backend_llamacpp_alias() {
 }
 
 #[test]
+fn canonicalize_backend_llama_cpp_tq_canonical() {
+    let result = canonicalize("backend", "llama_cpp_tq", BACKEND_WHITELIST).unwrap();
+    assert_eq!(result, "llama_cpp_tq");
+}
+
+#[test]
+fn canonicalize_backend_llama_cpp_turboquant_aliases() {
+    for spelling in [
+        "llama-cpp-turboquant",
+        "llama.cpp-turboquant",
+        "llama_cpp_turboquant",
+    ] {
+        let result = canonicalize("backend", spelling, BACKEND_WHITELIST).unwrap();
+        assert_eq!(result, "llama_cpp_tq", "spelling: {spelling}");
+    }
+}
+
+#[test]
+fn canonicalize_backend_turboquant_fork_is_not_upstream() {
+    // The fork ships codecs upstream does not have. Recording its rows under
+    // `llama_cpp` would attribute a turbo KV cell to a build that cannot
+    // produce one, so the two ids must stay distinct.
+    let fork = canonicalize("backend", "llama-cpp-turboquant", BACKEND_WHITELIST).unwrap();
+    let upstream = canonicalize("backend", "llama.cpp", BACKEND_WHITELIST).unwrap();
+    assert_ne!(fork, upstream);
+}
+
+#[test]
 fn alias_normalization_non_backend_field_untouched() {
     // "llama.cpp" is NOT a valid weight_quant — alias only fires for backend field.
     let err = canonicalize("weight_quant", "llama.cpp", WEIGHT_QUANT_WHITELIST).unwrap_err();
