@@ -196,12 +196,11 @@ fn nax_missing_kernel_lines(
             "MLX at {mlx_prefix} (mlx {mlx_version}, mlx-c {mlx_c_version}) ships no {kernel} \
              kernels in lib/mlx.metallib."
         ),
-        format!(
-            "  Those are the Neural-Accelerator GEMM path, and this is Neural-Accelerator-class \
-             hardware: without them GPU matmul throughput measured ~3.8x lower and prefill \
-             2.2-3.7x slower. Decode is bandwidth-bound and looks normal, so the symptom mimics \
-             a model-code defect."
-        ),
+        "  Those are the Neural-Accelerator GEMM path, and this is Neural-Accelerator-class \
+         hardware: without them GPU matmul throughput measured ~3.8x lower and prefill \
+         2.2-3.7x slower. Decode is bandwidth-bound and looks normal, so the symptom mimics \
+         a model-code defect."
+            .to_string(),
         format!(
             "  rMLX validates against mlx {} + mlx-c {}: on the bottle that pair was checked \
              against, the kernels were present, but bottle contents vary by build runner — the \
