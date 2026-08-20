@@ -213,6 +213,16 @@ suboptimal_flops         = "allow"
 # branch. Allowed here so a floating-`stable` toolchain bump does not turn the
 # gate red all at once; do it as its own change and delete this entry.
 chunks_exact_to_as_chunks = "allow"
+# clippy 1.98 also adds `manual_midpoint`. Its 10 workspace sites are all f32
+# codebook-boundary midpoints in the rotation-KV codecs (iso, planar, rotor,
+# turbo): `(w[0] + w[1]) * 0.5` deciding a quantization threshold. `f32::midpoint`
+# reduces to exactly `(a + b) / 2.` whenever both operands are <= f32::MAX/2 —
+# true of every codebook entry here — so the two forms are bit-identical in range
+# and the lint is about the out-of-range case, which cannot arise. Rewriting
+# threshold arithmetic in codecs held bit-exact against their Python/MLX
+# references is not something to do as a rider on an unrelated branch; same
+# reasoning as `suboptimal_flops` above. Migrate both together, then delete this.
+manual_midpoint          = "allow"
 needless_collect         = "warn"
 implicit_clone           = "warn"
 needless_pass_by_value   = "warn"

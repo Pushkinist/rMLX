@@ -570,8 +570,7 @@ fn load_assistant(
     let has_centroids = shards.iter().any(|(_, handle)| {
         handle
             .safetensors()
-            .ok()
-            .is_some_and(|st| st.tensor("masked_embedding.centroids.weight").is_ok())
+            .is_ok_and(|st| st.tensor("masked_embedding.centroids.weight").is_ok())
     });
 
     let centroids = if has_centroids {
