@@ -45,7 +45,6 @@ fn all_variants_display_fromstr_roundtrip() {
         KvQuant::Rotor4Sym,
         KvQuant::RotorKOnly3,
         KvQuant::RotorKOnly4,
-        KvQuant::RotKTq4V,
         // ── Mixed — multiple param sets ──────────────────────────────────────
         KvQuant::Mixed {
             k_bits: 8,
@@ -601,7 +600,7 @@ fn all_kv_quants_names_every_variant_once() {
 /// `KvQuant::materialises_packed_store` decides whether `exit_prefill` builds a
 /// payload; `KvStorage::geometry_only_max_seq` is what the spill writer asks
 /// before it stamps a codec geometry. A codec classified `false` whose storage
-/// sits in the "payload is not an `Option`" arm (`Mixed | RotKTq4V | Paged`)
+/// sits in the "payload is not an `Option`" arm (`Mixed | Paged`)
 /// compiles cleanly and makes the writer emit a codec tag with no tensors
 /// behind it — the reader then fails on `missing tensor 'lN.k.codes'`.
 ///

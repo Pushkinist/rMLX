@@ -122,13 +122,22 @@ type Result<T> = std::result::Result<T, SsdKvIndexError>;
 ///   namespaces through the wipe instead.
 /// - v4 → v5: the **dtype** of a persisted quantization parameter changed. The
 ///   fused `rot_k` quantize kernel used to hand back f32 scales and biases
-///   where `mx.quantize` returns them at K's width; a `RotK` / `RotKTq4V` block
-///   spilled by such a binary carries them as f32 bytes, and safetensors
+///   where `mx.quantize` returns them at K's width; a `RotK` block (or one of
+///   the since-retired `rot_k_tq4v`) spilled by such a binary carries them as
+///   f32 bytes, and safetensors
 ///   preserves dtype on read. The shape and the `(hash, layout_key)` key are
 ///   unchanged, so the block still *hits* — and `quantized_matmul` then takes
 ///   its operand width from those scales, re-imposing the whole-graph f32
 ///   promotion the codec was fixed to stop, for every request served off that
 ///   block. Storage width is the payload here, not bookkeeping.
+/// - v5 → v6: a persisted **storage tag** was withdrawn. Blocks spilled under
+///   the retired `rot_k_tq4v` codec carry `"tag":"rot_k_tq4v"` in their layer
+///   geometry and no reader accepts it any more. Those blocks are already
+///   unreachable — `compute_layout_key` folds the codec's `Display` string, so
+///   no request can key them — but "unreachable" is a property of a formula
+///   two crates away, and a tag the reader would now fail on is exactly the
+///   kind of thing a version exists to retire. The bump wipes them instead of
+///   leaving files no request can ever claim.
 ///
 /// v2 rows are **convertible** — `UPDATE kv_blocks SET last_used = last_used *
 /// 1000000` is the whole migration. They are wiped anyway, and that is a
@@ -136,7 +145,7 @@ type Result<T> = std::result::Result<T, SsdKvIndexError>;
 /// whose worst loss is one re-prefill per block, and carrying migration code
 /// (plus the branch in the wipe pass that has to let a v2 DB through so it can
 /// be converted) buys nothing a warm cache does not rebuild in minutes.
-pub(crate) const SCHEMA_VERSION: i64 = 5;
+pub(crate) const SCHEMA_VERSION: i64 = 6;
 
 const SCHEMA_PRAGMAS: &str = "
 PRAGMA journal_mode = WAL;

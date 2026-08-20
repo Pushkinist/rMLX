@@ -12,13 +12,7 @@ use rmlx_mlx::Device;
 #[test]
 fn precompile_is_noop_on_cpu_device() {
     // Device::Cpu → always a no-op, regardless of codec.
-    for kq in [
-        KvQuant::None,
-        KvQuant::K8V4,
-        KvQuant::Rotor3,
-        KvQuant::Iso3,
-        KvQuant::RotKTq4V,
-    ] {
+    for kq in [KvQuant::None, KvQuant::K8V4, KvQuant::Rotor3, KvQuant::Iso3] {
         assert!(
             precompile_kv_codec_msl(kq, 256, 1, Device::Cpu).is_ok(),
             "precompile on CPU device must be a no-op Ok for {kq}"
@@ -42,7 +36,6 @@ fn metal_codecs_carry_msl_and_are_not_cpu_fallback() {
         KvQuant::K8V4,
         KvQuant::K8V8,
         KvQuant::Planar,
-        KvQuant::RotKTq4V,
         KvQuant::TurboSym4,
     ] {
         assert!(kq.carries_msl(), "{kq} must carry MSL");

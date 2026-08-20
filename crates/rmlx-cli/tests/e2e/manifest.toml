@@ -505,21 +505,6 @@ request = "niah"
 assert = { kind = "niah_retrieval" }
 tags = ["run1", "quant"]
 
-# --- rot_k_tq4v ---
-# FINDING (E2E run-1): rot_k_tq4v is DEGRADED on Bonsai-2bit — at temp=0 it drops
-# the answer token ("The capital of France." with no "Paris") and produces
-# incoherent output at 8k NIAH. Treated like the K-only family: assert SHORT-ctx
-# coherence only, no NIAH. This is a real codec-quality signal, captured here.
-[[case]]
-id = "quant_rotktq4v_short"
-feature = "quant_matrix_konly"
-subfeature = "rot_k_tq4v / short-coherent (DEGRADED — see note)"
-model = "BONSAI"
-kv_quant = "rot_k_tq4v"
-request = "chat_basic"
-assert = { kind = "coherent" }
-tags = ["run1", "quant", "degraded"]
-
 # --- planar_k (K-axis planar 4-bit, V bf16) ---
 [[case]]
 id = "quant_planark_coherent"

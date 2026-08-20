@@ -899,8 +899,6 @@ pub fn decompose_auto(kq: KvQuant) -> (CacheType, CacheType) {
             CacheType::RotK,
             affine_to_cache_type(v_bits, v_group_size as usize),
         ),
-        // RotKTq4V is never an auto base; decompose to (rot_k, tq4).
-        KvQuant::RotKTq4V => (CacheType::RotK, CacheType::Tq4),
         // K8VTurbo3 — auto default for Gemma4 small.
         // Decomposes to (Q8G128, Tq3). No dedicated CacheType::Tq3 variant exists yet;
         // per-side --ctk/--ctv overrides that hit this arm fall back to the Mixed{v_bits:3}
@@ -1334,19 +1332,18 @@ pub fn combo_to_kv_quant(k: CacheType, v: CacheType) -> Result<KvQuant, ResolveE
         )));
     }
 
-    // / : K-side rotation codec.
-    // - V=tq4: resolves to RotKTq4V (rotated affine K + TurboFlash 4-bit V).
+    // K-side rotation codec.
     // - V=affine: resolves to RotK (rotated affine K + affine V via mx.quantize).
-    // - V=planar4 or V=bf16: unsupported (no rot_k pairing defined for these).
+    // - V=tq4, planar4, bf16: unsupported. The rot_k + tq4 pairing used to
+    //   resolve to a dedicated hybrid whose decode rebuilt a full bf16 K *and*
+    //   V from the packed store every step; it was retired in favour of the
+    //   affine-V pairing, which `mixed_quantized_sdpa` consumes directly.
     if k == CacheType::RotK {
-        // rot_k + tq4 → new RotKTq4V hybrid variant.
-        if v == CacheType::Tq4 {
-            return Ok(KvQuant::RotKTq4V);
-        }
         let (Some(vb), Some(vg)) = (v.bits(), v.group_size()) else {
             return Err(ResolveError::UnsupportedCombo(format!(
-                "K='rot_k' requires an affine V codec (q*_g*) or V='tq4'; \
-                 got V='{}'. Try '--ctv q4_g64', '--ctv q8_g64', or '--ctv tq4'.",
+                "K='rot_k' requires an affine V codec (q*_g*); got V='{}'. \
+                 Try '--ctv q4_g64' or '--ctv q8_g64'. V='tq4' with K='rot_k' \
+                 was retired — '--ctv q4_g64' is its replacement.",
                 v.tag()
             )));
         };
@@ -1632,7 +1629,7 @@ pub fn validate_resolved(arch_class: &str, kq: &KvQuant) -> Result<(), ResolveEr
             "KV codec runs its encode + dequant on CPU on the default hot path — \
              expect a slow first forward and decode that slows as KV grows. \
              This is NOT a Metal kernel. \
-             Pick a Metal codec (k8v4 / k8v8 / planar / rot_k_tq4v) to avoid this."
+             Pick a Metal codec (k8v4 / k8v8 / planar / rot_k_v4g64) to avoid this."
         );
     }
 

@@ -121,7 +121,6 @@ _SIMPLE = {
     "planar": ("Planar", 8, 4),
     "planar3": ("Planar3", 8, 3),
     "planar_k": ("PlanarK", 4, 16),
-    "rot_k_tq4v": ("RotKTq4V", 8, 4),
     "k8vturbo3": ("K8VTurbo3", 8, 3),
     "k8vturbo3tcq": ("K8VTurbo3Tcq", 8, 3),
     "k8vturbo2": ("K8VTurbo2", 8, 2),
@@ -203,7 +202,7 @@ VALID_CODECS = (
     "k8vturbo2tcq, tsym3, tsym4, k8vturbo2, iso3, iso4, iso3_sym, iso4_sym, "
     "k_iso3, k_iso4, rotor3, rotor4, rotor3_sym, rotor4_sym, k_rotor3, "
     "k_rotor4, rotor_k_3_asym_v<vb>_g<vg>, rotor_k_4_asym_v<vb>_g<vg>, "
-    "rot_k_tq4v, rot_k_v<vb>g<vg>, mixed_k<kb>g<kg>_v<vb>g<vg>"
+    "rot_k_v<vb>g<vg>, mixed_k<kb>g<kg>_v<vb>g<vg>"
 )
 
 
@@ -277,7 +276,7 @@ def _side_bytes(c: Codec, bits: int, elems: int, n_tokens: int, head_dim: int,
 # precisely the case the Rust predicate exists to express.
 _DECODE_READS_PACKED_STORE = {
     # quantized-SDPA over the affine 3-tuples, appended per step
-    "Mixed", "RotK", "RotKTq4V",
+    "Mixed", "RotK",
     # K re-quantised into the packed store every decode step
     "IsoKOnly3", "IsoKOnly4", "RotorKOnly3", "RotorKOnly4",
     # flash decode straight off both packed rings
@@ -350,10 +349,6 @@ def decode_read_bytes_per_layer(c: Codec, seq: int, head_dim: int,
          flips K8V8 to reads-packed and this function will not notice.
       2. Shared-KV topology is not modelled. On those archs the producing layer
          reads packed while consumers attend over the surfaced bf16 prefix.
-
-    rot_k_tq4v is left in the reads-mirror bucket deliberately: it reads packed
-    and then materialises full bf16 K+V per step (mixed_quant/sdpa.rs:6-7), so
-    its streamed bytes are at least the mirror figure. Its true cost is higher.
 
     The iso/rotor stored terms use the ring layout (codes/scales/norms), which
     is what a decode kernel actually streams -- see quant.rs:862-878.

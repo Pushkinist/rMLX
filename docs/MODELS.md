@@ -146,7 +146,7 @@ affine).
 All `KvQuant` variants supported. Default: `K8V8`.
 
 The Qwen2 KV cache is a standard full-attention layout (no SWA). All KV quant
-modes (`K8V4`, `K8V8`, `Planar`, `Mixed`, `RotK`, `RotKTq4V`) are accepted via
+modes (`K8V4`, `K8V8`, `Planar`, `Mixed`, `RotK`) are accepted via
 `--kv-quant` or `--cache-type-k/v`.
 
 ### Modalities
@@ -1430,7 +1430,6 @@ See `docs/SPECULATIVE.md` for algorithm details.
 | `Planar` | rMLX MSL q8_0 affine | 128 | PlanarQuant 4-bit + per-pair Hadamard | 32 |
 | `Mixed{k,v}` | MLX affine (k_bits) | k_group | MLX affine (v_bits) | v_group |
 | `RotK{v}` | Rotated affine 8-bit (FWHT basis) | 64 | MLX affine (v_bits) | v_group |
-| `RotKTq4V` | Rotated affine 8-bit (FWHT basis) | 64 | TurboFlash 4-bit | 32 |
 | `K8VTurbo3` | rMLX MSL q8_0 affine | 128 | TurboQuant 3-bit | 32 |
 
 The K-side `q8_0` codec (K8V4, K8V8, Planar) is the rMLX MSL symmetric affine

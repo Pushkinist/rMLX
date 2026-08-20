@@ -413,38 +413,32 @@ fn rot_k_on_v_side_rejected() {
     assert_eq!(err, ResolveError::RotKVSide);
 }
 
-// rot_k + tq4 → RotKTq4V resolver tests.
+// rot_k + tq4 was retired: the pairing must now be refused, not resolved.
 
 #[test]
 #[allow(
-    clippy::expect_used,
-    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+    clippy::unwrap_used,
+    reason = "the assertion IS that resolve refuses: unwrap_err panicking would mean the pairing resolved, which is the regression this test exists to catch"
 )]
-fn rot_k_tq4_resolves_to_rot_k_tq4v() {
-    // DoD: --ctk rot_k --ctv tq4 on Bonsai (head_dim=128, pow2, tq4-eligible).
-    let kq = resolve(
-        spec(CacheType::RotK, CacheType::Tq4),
-        ctx("Qwen3ForCausalLM", Some(128)),
-        KvQuant::K8V8,
-    )
-    .expect("rot_k + tq4 must resolve at head_dim=128");
-    assert_eq!(kq, KvQuant::RotKTq4V, "must map to RotKTq4V");
-}
-
-#[test]
-#[allow(
-    clippy::expect_used,
-    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
-)]
-fn rot_k_tq4_head_dim_256_resolves() {
-    // tq4 also supported at head_dim=256 (Gemma4 global head_dim).
-    let kq = resolve(
-        spec(CacheType::RotK, CacheType::Tq4),
-        ctx("Qwen3ForCausalLM", Some(256)),
-        KvQuant::K8V8,
-    )
-    .expect("rot_k + tq4 must resolve at head_dim=256");
-    assert_eq!(kq, KvQuant::RotKTq4V);
+fn rot_k_tq4_is_refused_at_every_supported_head_dim() {
+    // Both head_dims the retired hybrid used to accept (128 = Bonsai/Qwen3
+    // dense, 256 = Gemma4 global) must now fail, and the message must name the
+    // affine-V pairing that replaces it — an operator with the old flag pair
+    // needs one edit, not a search.
+    for head_dim in [128, 256] {
+        let err = resolve(
+            spec(CacheType::RotK, CacheType::Tq4),
+            ctx("Qwen3ForCausalLM", Some(head_dim)),
+            KvQuant::K8V8,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("q4_g64"),
+            "rot_k + tq4 rejection at head_dim={head_dim} must name its \
+             replacement, got: {msg}"
+        );
+    }
 }
 
 #[test]
@@ -453,7 +447,7 @@ fn rot_k_tq4_head_dim_256_resolves() {
     reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
 )]
 fn rot_k_tq4_non_pow2_head_dim_rejected() {
-    // pow2 constraint still fires before tq4 head_dim check.
+    // pow2 constraint still fires ahead of the V-side check.
     let err = resolve(
         spec(CacheType::RotK, CacheType::Tq4),
         ctx("Qwen3ForCausalLM", Some(192)),
@@ -469,7 +463,8 @@ fn rot_k_tq4_non_pow2_head_dim_rejected() {
     reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
 )]
 fn rot_k_tq4_unsupported_head_dim_64_rejected() {
-    // 64 is pow2 but not in tq4's {128, 256} set.
+    // 64 is pow2 but not in tq4's {128, 256} set, so the codec-specific guard
+    // still fires before the pairing is even considered.
     let err = resolve(
         spec(CacheType::RotK, CacheType::Tq4),
         ctx("Qwen3ForCausalLM", Some(64)),
@@ -480,25 +475,22 @@ fn rot_k_tq4_unsupported_head_dim_64_rejected() {
 }
 
 #[test]
-fn rot_k_tq4v_decompose_round_trips() {
-    // decompose_auto(RotKTq4V) must return (RotK, Tq4).
-    assert_eq!(
-        decompose_auto(KvQuant::RotKTq4V),
-        (CacheType::RotK, CacheType::Tq4)
-    );
-}
-
-#[test]
 #[allow(
     clippy::expect_used,
-    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+    reason = "structural invariant: the parse must fail; .expect_err() message documents that invariant"
 )]
-fn rot_k_tq4v_display_and_parse() {
-    // KvQuant::RotKTq4V must round-trip through Display + FromStr.
-    let s = KvQuant::RotKTq4V.to_string();
-    assert_eq!(s, "rot_k_tq4v");
-    let parsed: KvQuant = s.parse().expect("rot_k_tq4v must parse");
-    assert_eq!(parsed, KvQuant::RotKTq4V);
+fn retired_codec_name_is_rejected_and_names_its_replacement() {
+    // The retired spelling must keep failing at parse. Aliasing it to its
+    // replacement would let a recorded bench cell or a saved CLI line keep
+    // running under a codec it does not name.
+    let err = "rot_k_tq4v"
+        .parse::<KvQuant>()
+        .expect_err("rot_k_tq4v must not parse");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("retired") && msg.contains("rot_k_v4g64"),
+        "retired-codec parse error must name the replacement, got: {msg}"
+    );
 }
 
 #[test]
@@ -1290,7 +1282,7 @@ fn validate_resolved_cpu_codec_classification() {
     }
 
     // Metal codecs resolve Ok.
-    for kq in [KvQuant::K8V4, KvQuant::Planar, KvQuant::RotKTq4V] {
+    for kq in [KvQuant::K8V4, KvQuant::Planar, KvQuant::K8V8] {
         validate_resolved("Gemma4ForConditionalGeneration", &kq)
             .unwrap_or_else(|e| panic!("Metal codec must resolve Ok for {kq}: {e}"));
     }

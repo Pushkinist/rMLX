@@ -1,4 +1,4 @@
-//! SDPA dispatch paths: Mixed, RotKTq4V, standard, and K8V4 flash.
+//! SDPA dispatch paths: Mixed, standard, and K8V4 flash.
 #![allow(
     clippy::cognitive_complexity,
     clippy::items_after_statements,
@@ -8,13 +8,11 @@
 )]
 
 use rmlx_core::error::{Error, Result};
-use rmlx_mlx::{
-    add, dequantize, matmul, scaled_dot_product_attention, softmax_precise, Array, Device, Dtype,
-};
+use rmlx_mlx::{add, matmul, scaled_dot_product_attention, softmax_precise, Array, Device, Dtype};
 
 use crate::iso_flash_decode_msl::{iso_flash_decode_sdpa, ISO_FLASH_HEAD_DIM_MAX};
 use crate::iso_flash_decode_symv_msl::{iso_flash_decode_symv_sdpa, IsoFlashShape, IsoPackedAxis};
-use crate::mixed_quant::{mixed_quantized_sdpa, rot_k_tq4v_sdpa};
+use crate::mixed_quant::mixed_quantized_sdpa;
 use crate::planar_flash_decode_msl::planar_flash_decode_sdpa;
 use crate::planar_fused_qk::planar_fused_qk_enabled;
 use crate::planar_fused_qk_msl::planar_fused_qk;
@@ -208,292 +206,6 @@ impl KvCache {
         Ok((out, kv))
     }
 
-    /// RotKTq4V hybrid — one-shot K update (rotated affine) + V update (tq4) + SDPA.
-    ///
-    /// During **prefill** the same `update_prefill_raw` → `exit_prefill` path as
-    /// other quantized modes is used; this method is only called at **decode** time
-    /// (offset > 0, `in_prefill` false).
-    ///
-    /// Steps:
-    /// 1. Bump `self.offset += new_seq`.
-    /// 2. During prefill: accumulate via `update_prefill_raw` + fp16 SDPA.
-    /// 3. At decode: append K via `MixedKvState::update_k_and_fetch`, append V via `update_v`.
-    #[allow(clippy::too_many_arguments)]
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-    )]
-    fn update_and_sdpa_rot_k_tq4v(
-        &mut self,
-        queries: &Array,
-        new_k: &Array,
-        new_v: &Array,
-        scale: f32,
-        additive_mask: Option<&Array>,
-        device: Device,
-    ) -> Result<Array> {
-        let policy = self.policy;
-        let new_seq = new_k.shape()[2];
-        let prev_offset = self.offset;
-        self.offset = prev_offset + new_seq;
-
-        // Prefill: accumulate raw fp16 and run fast SDPA (same as Mixed Part-B).
-        // Bulk quantize into RotKTq4V storage happens in exit_prefill.
-        if self.in_prefill {
-            let (k_full, v_full) = self.update_prefill_raw(new_k, new_v, device)?;
-            let mask_mode = if additive_mask.is_some() {
-                "array"
-            } else if new_seq > 1 {
-                "causal"
-            } else {
-                ""
-            };
-            return scaled_dot_product_attention(
-                queries,
-                &k_full,
-                &v_full,
-                scale,
-                mask_mode,
-                additive_mask,
-                device,
-            );
-        }
-
-        // Decode: append K to MixedKvState, append V to QuantV, then SDPA.
-        let KvStorage::RotKTq4V { k_state, v, .. } = &mut self.storage else {
-            // -review HIGH 2: typed error instead of unreachable!() panic.
-            let variant = storage_variant_name(&self.storage);
-            return Err(Error::Mlx(format!(
-                "RotKTq4V dispatch: storage variant mismatch (quant=RotKTq4V, \
-                 storage={variant}); cache may have been hydrated from incompatible spill"
-            )));
-        };
-
-        // Append and fetch K (rotated + affine quantized 3-tuple).
-        let k_tuple = k_state.update_k_and_fetch(new_k, device, policy)?;
-
-        // Borrow k_rotation for Q pre-rotation (after mutable borrow of k_state ends).
-        let k_rotation = k_state
-            .k_rotation
-            .as_ref()
-            .map(Array::try_clone)
-            .transpose()?;
-
-        // Append V token to QuantV and dequantize the full prefix to bf16.
-        let v_shape = new_v.shape();
-        // For GPU path QuantV::append uses the Array directly (v_f32 is unused).
-        let v_f32: Vec<f32> = if device == Device::Gpu {
-            Vec::new()
-        } else {
-            // CPU path: convert bf16 → f32 for scalar turboquant encoder.
-            let bytes = new_v.to_bytes()?;
-            bytes
-                .chunks_exact(2)
-                .map(|b| {
-                    let bits = u16::from_le_bytes([b[0], b[1]]);
-                    f32::from_bits(u32::from(bits) << 16)
-                })
-                .collect()
-        };
-
-        let qv = v.as_mut().ok_or_else(|| {
-            Error::Mlx("RotKTq4V: V buffer not initialised (exit_prefill not called?)".into())
-        })?;
-        // -review HIGH 1: use append_uncapped — RotKTq4V decode tokens
-        // accumulate past max_seq after a full-prefill bulk-init.
-        qv.append_uncapped(&v_f32, &v_shape, new_v, device)?;
-
-        // Dequantize the full V prefix.
-        let v_bf16 = {
-            let (v_cpu, v_gpu) = qv.dequantize_choice(device, new_v.dtype())?;
-            if let Some(arr) = v_gpu {
-                arr
-            } else {
-                // CPU path: rebuild bf16 from f32 vec and shape.
-                let bytes: Vec<u8> = v_cpu
-                    .iter()
-                    .flat_map(|&f| {
-                        let bits = (f.to_bits() >> 16) as u16;
-                        bits.to_le_bytes()
-                    })
-                    .collect();
-                Array::from_bytes(&bytes, &qv.shape, Dtype::Bf16)
-                    .map_err(|e| Error::Mlx(e.to_string()))?
-            }
-        };
-
-        rot_k_tq4v_sdpa(
-            queries,
-            &k_tuple,
-            &v_bf16,
-            scale,
-            additive_mask,
-            64, // k_group_size fixed for RotKTq4V
-            8,  // k_bits fixed for RotKTq4V
-            k_rotation.as_ref(),
-            device,
-            policy,
-        )
-    }
-
-    /// -review CRITICAL 1: `update_and_sdpa_shared_source` variant for
-    /// RotKTq4V. Runs the same K/V update and SDPA as
-    /// `update_and_sdpa_rot_k_tq4v` but additionally surfaces the dequantized
-    /// bf16 `(K, V)` so Gemma4 shared-KV consumer layers can receive them.
-    ///
-    /// During prefill: returns the raw fp16 accumulator K/V (same as the Mixed
-    /// path) — no quantize/dequantize round-trip on the prefill chunk.
-    /// During decode: dequantizes K from the `MixedKvState` 3-tuple and V from
-    /// `QuantV`, then runs SDPA.
-    #[allow(clippy::too_many_arguments)]
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-    )]
-    fn update_and_sdpa_rot_k_tq4v_shared_source(
-        &mut self,
-        queries: &Array,
-        new_k: &Array,
-        new_v: &Array,
-        scale: f32,
-        mask_mode: &str,
-        additive_mask: Option<&Array>,
-        device: Device,
-    ) -> Result<(Array, Array, Array)> {
-        let policy = self.policy;
-        let new_seq = new_k.shape()[2];
-        let prev_offset = self.offset;
-        self.offset = prev_offset + new_seq;
-
-        // Prefill: accumulate raw fp16 and run fast SDPA — identical to the
-        // `update_and_sdpa_rot_k_tq4v` prefill path. The caller receives the
-        // raw fp16 K/V (no quant round-trip on prefill chunks).
-        if self.in_prefill {
-            let (k_full, v_full) = self.update_prefill_raw(new_k, new_v, device)?;
-            let out = scaled_dot_product_attention(
-                queries,
-                &k_full,
-                &v_full,
-                scale,
-                mask_mode,
-                additive_mask,
-                device,
-            )?;
-            return Ok((out, k_full, v_full));
-        }
-
-        // Decode: append K to MixedKvState, append V to QuantV, run SDPA,
-        // and also return the dequantized bf16 K/V for shared-KV consumers.
-        let KvStorage::RotKTq4V { k_state, v, .. } = &mut self.storage else {
-            let variant = storage_variant_name(&self.storage);
-            return Err(Error::Mlx(format!(
-                "RotKTq4V dispatch: storage variant mismatch (quant=RotKTq4V, \
-                 storage={variant}); cache may have been hydrated from incompatible spill"
-            )));
-        };
-
-        // Append and fetch K 3-tuple.
-        let k_tuple = k_state.update_k_and_fetch(new_k, device, policy)?;
-        let k_rotation = k_state
-            .k_rotation
-            .as_ref()
-            .map(Array::try_clone)
-            .transpose()?;
-        let k_group_size = k_state.k_group_size;
-        let k_bits = k_state.k_bits;
-
-        // Append V and dequantize the full prefix.
-        let v_shape = new_v.shape();
-        let v_f32: Vec<f32> = if device == Device::Gpu {
-            Vec::new()
-        } else {
-            let bytes = new_v.to_bytes()?;
-            bytes
-                .chunks_exact(2)
-                .map(|b| {
-                    let bits = u16::from_le_bytes([b[0], b[1]]);
-                    f32::from_bits(u32::from(bits) << 16)
-                })
-                .collect()
-        };
-        let qv = v.as_mut().ok_or_else(|| {
-            Error::Mlx("RotKTq4V: V buffer not initialised (exit_prefill not called?)".into())
-        })?;
-        qv.append_uncapped(&v_f32, &v_shape, new_v, device)?;
-
-        let v_bf16 = {
-            let (v_cpu, v_gpu) = qv.dequantize_choice(device, new_v.dtype())?;
-            if let Some(arr) = v_gpu {
-                arr
-            } else {
-                let bytes: Vec<u8> = v_cpu
-                    .iter()
-                    .flat_map(|&f| {
-                        let bits = (f.to_bits() >> 16) as u16;
-                        bits.to_le_bytes()
-                    })
-                    .collect();
-                Array::from_bytes(&bytes, &qv.shape, Dtype::Bf16)
-                    .map_err(|e| Error::Mlx(e.to_string()))?
-            }
-        };
-
-        // Dequantize K from the affine 3-tuple (K was stored rotated).
-        let k_bf16 = dequantize(
-            &k_tuple.codes,
-            &k_tuple.scales,
-            Some(&k_tuple.biases),
-            k_group_size,
-            k_bits,
-            "affine",
-            device,
-        )?;
-
-        // Run SDPA with pre-rotated Q (same as rot_k_tq4v_sdpa step 1-4,
-        // but K is already dequantized above so we call SDPA directly).
-        let queries_owned;
-        let q_ref: &Array = match k_rotation.as_ref() {
-            Some(r) => {
-                let d = *queries.shape().last().unwrap_or(&0) as usize;
-                let try_fused = policy.rot_k_fused && crate::rot_k_msl::is_supported_d(d);
-                queries_owned = if try_fused {
-                    match crate::rot_k_msl::rot_k_fwht_rotate_gpu(queries, device) {
-                        Ok(q_rot) => q_rot,
-                        Err(e) => {
-                            tracing::warn!(
-                                reason = %e,
-                                "rot_k_fwht_rotate_gpu failed on the shared-KV producer path; \
-                                 falling back to v1 matmul Q rotation"
-                            );
-                            crate::rot_k::rotate_last_axis(queries, r, device)?
-                        }
-                    }
-                } else {
-                    crate::rot_k::rotate_last_axis(queries, r, device)?
-                };
-                &queries_owned
-            }
-            None => queries,
-        };
-
-        let attn_mask_mode = if additive_mask.is_some() {
-            "array"
-        } else {
-            "causal"
-        };
-        let out = scaled_dot_product_attention(
-            q_ref,
-            &k_bf16,
-            &v_bf16,
-            scale,
-            attn_mask_mode,
-            additive_mask,
-            device,
-        )?;
-
-        Ok((out, k_bf16, v_bf16))
-    }
-
     /// Universal dispatch wrapper. Replaces the three call patterns used today
     /// by attention layers (Mixed → `update_and_sdpa_mixed`; K8V4 TurboFlash →
     /// `sdpa_dispatch`; legacy → `update` + `scaled_dot_product_attention`).
@@ -549,20 +261,6 @@ impl KvCache {
                 &v_full,
                 scale,
                 mask_mode,
-                additive_mask,
-                device,
-            )?;
-            return Ok(out);
-        }
-
-        // 1a. : RotKTq4V hybrid path (rotated K affine + tq4 V).
-        if self.quant.uses_rot_k_tq4v_path() {
-            tracing::Span::current().record("path", "rot_k_tq4v");
-            let out = self.update_and_sdpa_rot_k_tq4v(
-                queries,
-                new_k,
-                new_v,
-                scale,
                 additive_mask,
                 device,
             )?;
@@ -899,25 +597,6 @@ impl KvCache {
                         .into(),
                 )
             })?;
-            return Ok((out, SharedKv::Bf16(k_full, v_full)));
-        }
-
-        // RotKTq4V must be explicitly routed here before the `update()`
-        // fallthrough. `update()` returns an error for RotKTq4V ("Contract
-        // violation"), crashing shared-KV layers that call this method. Mirror
-        // the Mixed branch: run the hybrid SDPA and surface the dequantized
-        // bf16 K/V for downstream shared-KV consumers.
-        if self.quant.uses_rot_k_tq4v_path() {
-            tracing::Span::current().record("path", "rot_k_tq4v");
-            let (out, k_full, v_full) = self.update_and_sdpa_rot_k_tq4v_shared_source(
-                queries,
-                new_k,
-                new_v,
-                scale,
-                mask_mode,
-                additive_mask,
-                device,
-            )?;
             return Ok((out, SharedKv::Bf16(k_full, v_full)));
         }
 
@@ -1682,10 +1361,9 @@ impl KvCache {
         // at `[offset-1, offset)` — overwriting the LAST written position
         // instead of appending — and the V accumulator ends up permanently
         // one-step lagged.  All other `update_and_sdpa_*` variants
-        // (`update_and_sdpa_mixed_inner` line 99-100,
-        // `update_and_sdpa_rot_k_tq4v` line 223-224) advance offset before
-        // calling the bf16 helpers; `KvCache::update` itself advances offset
-        // at line 48 before dispatching variant updates.  The original
+        // (`update_and_sdpa_mixed_inner`) advance offset before calling the
+        // bf16 helpers; `KvCache::update` itself advances offset before
+        // dispatching variant updates.  The original
         // fused-QK landing missed this step.
         let new_seq = new_k.shape()[2];
         self.offset += new_seq;

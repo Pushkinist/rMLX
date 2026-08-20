@@ -445,10 +445,7 @@ whenever the storage window has grown past `flash_max_seq`. Without both, the
 window froze at the prefill length and the append walked off the end at the
 next power-of-two boundary — a `reshape … size 0` mid-decode. The `--max-ctx`
 ceiling / hard cap still bound the growth: a request that genuinely cannot fit
-is rejected loudly, never truncated. The `rot_k_tq4v` codec shares the tq4 V
-*format* but not this path — it decodes through `update_and_sdpa_rot_k_tq4v`
-with an uncapped `QuantV` V append and a growing `MixedKvState` K, so it grows
-at decode without the head-major buffers.
+is rejected loudly, never truncated.
 
 ### 5.6 `planar4` requires `head_dim % 32 == 0`
 
@@ -801,7 +798,7 @@ the corresponding negative-skip test at that time.
 **Codecs NOT routed through Paged** (auto-fall-through to their contiguous
 storage variants regardless of `--paged-kv`):
 
-- `K8VTurbo3`, `K8VTurbo2`, `TurboSym4`, `PlanarK`, `RotKTq4V` — each owns a
+- `K8VTurbo3`, `K8VTurbo2`, `TurboSym4`, `PlanarK` — each owns a
   CPU- or hybrid-path V codec that does not fit either `PagedVStorage`
   (q8 / tq4-only) or `PagedPlanarVStorage` (PlanarQuant-only).
 - `Iso3`, `Iso4` — quaternion-quantized V; per-token quaternion + scale +
@@ -1076,7 +1073,6 @@ decode path read it (`KvQuant::decode_reads_packed_store`)?
 | `K8V8`                   | yes       | bf16     | bf16     | **no**| yes         |
 | `K8V4`                   | yes       | bf16     | bf16     | **no**| yes¹        |
 | `Mixed{k,v}` / `RotK`    | no²       | quant    | quant    | yes   | yes         |
-| `RotKTq4V`               | no²       | quant    | quant    | yes   | yes         |
 | `Planar` / `Planar3`     | yes       | bf16     | bf16     | **no**| yes         |
 | `PlanarK`                | yes       | bf16     | bf16     | **no**| yes³        |
 | `K8VTurbo2/3` (+`Tcq`)   | yes       | bf16     | bf16     | **no**| yes         |
@@ -1093,7 +1089,7 @@ decode path read it (`KvQuant::decode_reads_packed_store`)?
    `RotorK{3,4}Asym`) each maintain their **own** head-major buffer, re-encoded
    from the bf16 mirror. Neither reads the packed store, so neither
    `--turbo-flash on` nor `--fused-qk on` puts a store back.
-2. `Mixed`/`RotK`/`RotKTq4V` are driven through `update_and_sdpa` (the direct
+2. `Mixed`/`RotK` are driven through `update_and_sdpa` (the direct
    `update()` arm errors) and read their packed 3-tuples every decode step.
    The bf16 mirror they *also* keep is surfaced to cross-layer-KV consumers via
    `update_and_sdpa_shared_source` (see §10.2 Mixed note); on an arch with no

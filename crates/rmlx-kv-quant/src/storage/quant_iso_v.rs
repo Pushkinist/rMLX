@@ -717,7 +717,7 @@ impl QuantIsoV3 {
         reason = "the lazy-init / grow / per-chunk-update branches share local state \
                   (per-step sizes, prev_seq, capacity) and pulling any one out into a \
                   helper costs >2 round-trip params without improving readability. \
-                  Matches `QuantV::append_inner` which carries the same lint allow for \
+                  Matches `QuantV::append` which carries the same lint allow for \
                   the same reason."
     )]
     pub fn append_gpu(

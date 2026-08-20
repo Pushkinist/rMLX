@@ -150,7 +150,7 @@ An uncut store is also still *written out* wherever one exists — the SSD spill
 serialises `blocks` against `shape[2]`, and the prompt-cache snapshot clones
 them — which is how the defect travels into the hydrated cache that later reads
 it. That route now applies only to the codecs that keep a store (the K-only and
-fused-symmetric families, `Mixed` / `RotK` / `RotKTq4V`) and to already-hydrated
+fused-symmetric families, `Mixed` / `RotK`) and to already-hydrated
 store-backed caches; a seeded bf16-mirror cache spills its mirror instead. See
 `rmlx-kv-ssd/src/hydrate_tests.rs` for the round-trip that pins this.
 

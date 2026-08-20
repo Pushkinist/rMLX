@@ -69,14 +69,26 @@ use tracing::{info, warn};
 /// replacing either. Tightening the ring 4× recovers part of the gap but not
 /// the bulk, so it is not a `--max-ctx` sizing artefact.
 ///
-/// **The output is not identical.** An earlier revision of this doc claimed a
-/// byte-identical token digest in both arms; that held on one cell and was
-/// generalised. The kernel is not bit-exact — SDPA cosine against the bf16
-/// reference is ≈0.997, the V turbo-4 codec floor — and at temp=0 that flips
-/// greedy argmax ties prompt-dependently. Two of the four cells that fire at
-/// the production threshold produce a different digest, deterministically and
-/// stably across all three runs per arm. So this is a decode loss *and* an
-/// output perturbation, not pure cost.
+/// **The output is not identical, and that is the codec, not the kernel.**
+/// Turning the gate off does not turn the codec off: on `K8V4` the generic
+/// decode path reads the bf16 mirror and never touches the 4-bit V store
+/// (`KvQuant::decode_reads_packed_store` is `false` for it), so the OFF arm is
+/// a bf16 attention and **any** correct tq4-V kernel must differ from it by the
+/// codec's own quantization error. Measuring the kernel against that arm
+/// charges it for the codec.
+///
+/// Measured against a reference that *does* run the codec —
+/// `turbo_flash_reference_sdpa`, a dequantize-then-SDPA over the identical
+/// `flash_*` buffers at the kernel's own f32 working precision — the kernel is
+/// gated at **cosine ≥ 0.999999 and ≤ 0.5 bf16 ULP per row** and measures 0.056
+/// ULP at worst, two of three cells bit-identical. The cells are the two
+/// dispatching geometries plus an additive-mask cell, on a ring whose stride is
+/// wider than its fill and whose last block is partial — i.e. decode as
+/// production drives it, at `q_seq = 1`. The kernel is
+/// therefore accurate *for its codec*; the ≈0.997 SDPA cosine against bf16 is
+/// the tq4-V codec floor, and at temp=0 that floor flips greedy argmax ties
+/// prompt-dependently. So this is a decode loss plus a codec-fidelity cost —
+/// not a kernel defect.
 ///
 /// `gemma-4-e2b` (`kv_h=1`, `head_dim=256`, SWA 512) is a **null control**,
 /// not a second architecture: at 4k its `kv_cache_bytes` is bit-identical
@@ -102,8 +114,10 @@ pub(crate) enum TurboFlashMode {
     /// `RMLX_TURBO_FLASH=1` does not survive it.
     Off,
     /// Resolves to OFF on every host: the kernel is a measured 2.0–4.25×
-    /// decode loss on the one codec it serves, and it perturbs the generated
-    /// tokens. HOLD until a re-measurement clears it.
+    /// decode loss on the one codec it serves. Its numerics are cleared for
+    /// decode as production drives it — it matches a dequant-then-SDPA
+    /// reference over its own packed buffers within a 0.5 bf16 ULP gate — so
+    /// throughput is the whole of the remaining HOLD.
     #[default]
     Auto,
 }
@@ -150,19 +164,24 @@ fn resolve_turbo_flash(
         TurboFlashMode::Off => false,
         // Auto is a HOLD on every host. On the one storage it serves (K8V4,
         // kv_seq > 4096) the kernel decodes 2.0-4.25x slower than the path it
-        // replaces, carries several hundred MB of extra resident KV for the
-        // privilege, and — not being bit-exact — perturbs the generated tokens
-        // on top of that. Defaulting a measured decode loss ON is worse than
-        // shipping no kernel at all, so Auto stays OFF until a re-measurement
-        // clears it. See `TurboFlashMode` for the cells. The family is still
-        // probed so the log names the host the HOLD applied to.
+        // replaces and carries several hundred MB of extra resident KV for the
+        // privilege. It also changes the generated tokens, because it is the
+        // only K8V4 configuration in which the 4-bit V codec participates in
+        // decode at all — that is the codec's error, not the kernel's, which
+        // matches a reference over its own packed buffers inside a 0.5 bf16 ULP
+        // gate.
+        // Defaulting a measured decode loss ON is worse than shipping no kernel
+        // at all, so Auto stays OFF until a throughput re-measurement clears
+        // it. See `TurboFlashMode` for the cells. The family is still probed so
+        // the log names the host the HOLD applied to.
         TurboFlashMode::Auto => {
             if let Some(family) = rmlx_core::apple_gpu::apple_silicon_generation() {
                 tracing::info!(
                     family,
                     "--turbo-flash=auto on Apple{family} — resolved OFF (HOLD: the \
                      kernel decodes 2.0-4.25x slower than the generic K8V4 path \
-                     at kv_seq > 4096 and perturbs the output). Use \
+                     at kv_seq > 4096; it also applies the 4-bit V codec the \
+                     generic path skips, which changes the output). Use \
                      --turbo-flash on to override."
                 );
             } else {
@@ -475,7 +494,7 @@ fn resolve_sparse_attn(mode: SparseAttnMode, env: &DispatchPolicy) -> bool {
 ///
 /// Selects the fused FWHT + affine-quantize Metal kernel over the
 /// rotate-by-matmul then `mx.quantize` pair on the rot_k codec families.
-/// Affects only caches whose codec rotates K (`RotK`, `RotKTq4V`); every
+/// Affects only caches whose codec rotates K (`RotK`); every
 /// other codec ignores it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub(crate) enum RotKFusedMode {

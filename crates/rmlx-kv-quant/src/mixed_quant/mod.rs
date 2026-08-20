@@ -16,5 +16,5 @@
 mod sdpa;
 mod state;
 
-pub use sdpa::{mixed_quantized_sdpa, rot_k_tq4v_sdpa};
+pub use sdpa::mixed_quantized_sdpa;
 pub use state::{MixedKvState, MixedTuple};

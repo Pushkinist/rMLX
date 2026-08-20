@@ -97,22 +97,6 @@ pub enum KvQuant {
         /// V affine group size.
         v_group_size: u16,
     },
-    /// K-side rotation + TurboQuant V: K is the same rotated-affine 8-bit
-    /// codec as [`RotK`](KvQuant::RotK), but V is stored as **TurboQuant 4-bit**
-    /// (Lloyd-Max N(0,1) codebook, group=32) instead of MLX affine.
-    ///
-    /// Storage: K-side uses [`MixedKvState`](crate::mixed_quant::MixedKvState)
-    /// with `rotate_k=true` (same as RotK). V-side uses
-    /// [`QuantV`](crate::storage::QuantV) (same as K8V4).
-    ///
-    /// SDPA: dequantize K from its MLX affine 3-tuple to bf16, pre-rotate Q,
-    /// dequantize V from TurboFlash to bf16, run standard scaled_dot_product_attention.
-    /// This is a dequant-then-SDPA path (not fused `quantized_matmul`) but gives the
-    /// full memory savings of tq4 V (4-bit vs 16-bit).
-    ///
-    /// Requires power-of-two `head_dim` (Hadamard) and `head_dim ∈ {128, 256}` (tq4).
-    /// Opt-in only via `--ctk rot_k --ctv tq4`; never an auto default.
-    RotKTq4V,
     /// K = affine q8_0 (group_size=128),
     /// V = TurboQuant **3-bit** Lloyd-Max N(0,1) codebook (group=32).
     ///
@@ -444,7 +428,6 @@ pub const ALL_KV_QUANTS: &[KvQuant] = &[
         v_bits: 8,
         v_group_size: 64,
     },
-    KvQuant::RotKTq4V,
     KvQuant::K8VTurbo3,
     KvQuant::K8VTurbo3Tcq,
     KvQuant::K8VTurbo2,
@@ -489,27 +472,26 @@ impl KvQuant {
             KvQuant::PlanarK => 5,
             KvQuant::Mixed { .. } => 6,
             KvQuant::RotK { .. } => 7,
-            KvQuant::RotKTq4V => 8,
-            KvQuant::K8VTurbo3 => 9,
-            KvQuant::K8VTurbo3Tcq => 10,
-            KvQuant::K8VTurbo2 => 11,
-            KvQuant::K8VTurbo2Tcq => 12,
-            KvQuant::TurboSym3 => 13,
-            KvQuant::TurboSym4 => 14,
-            KvQuant::Iso3 => 15,
-            KvQuant::Iso4 => 16,
-            KvQuant::Iso3Sym => 17,
-            KvQuant::Iso4Sym => 18,
-            KvQuant::IsoKOnly3 => 19,
-            KvQuant::IsoKOnly4 => 20,
-            KvQuant::Rotor3 => 21,
-            KvQuant::Rotor4 => 22,
-            KvQuant::Rotor3Sym => 23,
-            KvQuant::Rotor4Sym => 24,
-            KvQuant::RotorKOnly3 => 25,
-            KvQuant::RotorKOnly4 => 26,
-            KvQuant::RotorK3Asym { .. } => 27,
-            KvQuant::RotorK4Asym { .. } => 28,
+            KvQuant::K8VTurbo3 => 8,
+            KvQuant::K8VTurbo3Tcq => 9,
+            KvQuant::K8VTurbo2 => 10,
+            KvQuant::K8VTurbo2Tcq => 11,
+            KvQuant::TurboSym3 => 12,
+            KvQuant::TurboSym4 => 13,
+            KvQuant::Iso3 => 14,
+            KvQuant::Iso4 => 15,
+            KvQuant::Iso3Sym => 16,
+            KvQuant::Iso4Sym => 17,
+            KvQuant::IsoKOnly3 => 18,
+            KvQuant::IsoKOnly4 => 19,
+            KvQuant::Rotor3 => 20,
+            KvQuant::Rotor4 => 21,
+            KvQuant::Rotor3Sym => 22,
+            KvQuant::Rotor4Sym => 23,
+            KvQuant::RotorKOnly3 => 24,
+            KvQuant::RotorKOnly4 => 25,
+            KvQuant::RotorK3Asym { .. } => 26,
+            KvQuant::RotorK4Asym { .. } => 27,
         }
     }
 }
@@ -555,12 +537,6 @@ impl KvQuant {
     /// through `mx.quantize` 3-tuples + `mixed_quantized_sdpa`.
     pub fn uses_mixed_path(&self) -> bool {
         matches!(self, KvQuant::Mixed { .. } | KvQuant::RotK { .. })
-    }
-
-    /// True for the RotKTq4V hybrid path: rotated K (affine 8-bit) + tq4 V.
-    /// Dispatches through `rot_k_tq4v_sdpa` (dequant-then-SDPA, not fused matmul).
-    pub fn uses_rot_k_tq4v_path(&self) -> bool {
-        matches!(self, KvQuant::RotKTq4V)
     }
 
     /// True for KV codecs that store K below 8 bits. Sub-8-bit K is
@@ -637,7 +613,6 @@ impl KvQuant {
             | KvQuant::PlanarK
             | KvQuant::Mixed { .. }
             | KvQuant::RotK { .. }
-            | KvQuant::RotKTq4V
             | KvQuant::K8VTurbo3
             | KvQuant::K8VTurbo3Tcq
             | KvQuant::K8VTurbo2
@@ -686,7 +661,6 @@ impl KvQuant {
             | KvQuant::PlanarK
             | KvQuant::Mixed { .. }
             | KvQuant::RotK { .. }
-            | KvQuant::RotKTq4V
             | KvQuant::K8VTurbo3
             | KvQuant::K8VTurbo3Tcq
             | KvQuant::K8VTurbo2
@@ -727,7 +701,6 @@ impl KvQuant {
     ///
     /// * `Mixed` / `RotK` — `update_and_sdpa_mixed` appends to and reads the
     ///   MLX affine 3-tuples every decode step (`mixed_quantized_sdpa`).
-    /// * `RotKTq4V` — same shape via `update_and_sdpa_rot_k_tq4v`.
     /// * The K-only re-quantise family (`IsoKOnly3/4`, `RotorKOnly3/4`) —
     ///   K is appended to the packed store per step and the flash-decode arm
     ///   reads it back.
@@ -756,7 +729,6 @@ impl KvQuant {
             // Quantized-SDPA over the affine 3-tuples, appended per step.
             KvQuant::Mixed { .. }
             | KvQuant::RotK { .. }
-            | KvQuant::RotKTq4V
             // K re-quantised into the packed store every decode step.
             | KvQuant::IsoKOnly3
             | KvQuant::IsoKOnly4
@@ -844,7 +816,6 @@ impl KvQuant {
             | KvQuant::PlanarK
             | KvQuant::Mixed { .. }
             | KvQuant::RotK { .. }
-            | KvQuant::RotKTq4V
             | KvQuant::K8VTurbo3
             | KvQuant::K8VTurbo3Tcq
             | KvQuant::K8VTurbo2
@@ -995,7 +966,6 @@ impl KvQuant {
             | KvQuant::PlanarK
             | KvQuant::Mixed { .. }
             | KvQuant::RotK { .. }
-            | KvQuant::RotKTq4V
             | KvQuant::K8VTurbo3
             | KvQuant::K8VTurbo3Tcq
             | KvQuant::K8VTurbo2
@@ -1101,7 +1071,6 @@ impl KvQuant {
             KvQuant::PlanarK => (4, 16),
             KvQuant::Mixed { k_bits, v_bits, .. } => (u32::from(*k_bits), u32::from(*v_bits)),
             KvQuant::RotK { v_bits, .. } => (8, u32::from(*v_bits)),
-            KvQuant::RotKTq4V => (8, 4),
             KvQuant::K8VTurbo3 | KvQuant::K8VTurbo3Tcq => (8, 3),
             KvQuant::K8VTurbo2 | KvQuant::K8VTurbo2Tcq => (8, 2),
             KvQuant::TurboSym3 => (3, 3),
@@ -1342,7 +1311,7 @@ impl KvQuant {
 pub enum KvQuantParseError {
     /// The whole input does not match any canonical KvQuant form.
     #[error(
-        "unknown KvQuant '{0}' — valid: none, k8v4, k8v8, planar, planar3, planar_k, k8vturbo3, k8vturbo3tcq, k8vturbo2tcq, tsym3, tsym4, k8vturbo2, iso3, iso4, iso3_sym, iso4_sym, k_iso3, k_iso4, rotor3, rotor4, rotor3_sym, rotor4_sym, k_rotor3, k_rotor4, rotor_k_3_asym_v<vb>_g<vg>, rotor_k_4_asym_v<vb>_g<vg>, rot_k_tq4v, rot_k_v<vb>g<vg>, mixed_k<kb>g<kg>_v<vb>g<vg>"
+        "unknown KvQuant '{0}' — valid: none, k8v4, k8v8, planar, planar3, planar_k, k8vturbo3, k8vturbo3tcq, k8vturbo2tcq, tsym3, tsym4, k8vturbo2, iso3, iso4, iso3_sym, iso4_sym, k_iso3, k_iso4, rotor3, rotor4, rotor3_sym, rotor4_sym, k_rotor3, k_rotor4, rotor_k_3_asym_v<vb>_g<vg>, rotor_k_4_asym_v<vb>_g<vg>, rot_k_v<vb>g<vg>, mixed_k<kb>g<kg>_v<vb>g<vg>"
     )]
     Unknown(String),
     /// The `mixed_*` shape matched but a numeric component failed to parse.
@@ -1352,6 +1321,18 @@ pub enum KvQuantParseError {
         input: String,
         /// Why the numeric component failed to parse.
         reason: String,
+    },
+    /// The name is a codec that was withdrawn from the enum. Carries the
+    /// codec that supersedes it so the operator has one edit to make, not a
+    /// search. A retired name must keep failing loudly: silently aliasing it
+    /// to its replacement would let a recorded bench cell, a spilled SSD
+    /// block tag or a saved CLI line keep naming a codec that no longer runs.
+    #[error("KvQuant '{input}' was retired — use '{replacement}' instead")]
+    Retired {
+        /// The retired name the caller passed.
+        input: String,
+        /// The canonical name of the codec that supersedes it.
+        replacement: &'static str,
     },
     /// The `rotor_k_{3,4}_asym_v*_g*` shape matched but the numeric component
     /// failed to parse or the (`v_bits`, `v_group_size`) tuple is not one of
@@ -1435,7 +1416,6 @@ impl std::fmt::Display for KvQuant {
                 v_bits,
                 v_group_size,
             } => write!(f, "rot_k_v{v_bits}g{v_group_size}"),
-            KvQuant::RotKTq4V => f.write_str("rot_k_tq4v"),
             KvQuant::K8VTurbo3 => f.write_str("k8vturbo3"),
             KvQuant::TurboSym3 => f.write_str("tsym3"),
             KvQuant::TurboSym4 => f.write_str("tsym4"),
@@ -1503,8 +1483,19 @@ impl std::str::FromStr for KvQuant {
             _ => {}
         }
 
+        // Withdrawn codecs: reject by name, and name the successor. Not an
+        // alias — a retired name has to keep failing, or a recorded bench cell
+        // or a saved CLI line would keep running under a codec it does not
+        // name. `rot_k_tq4v` (rotated affine-8 K + TurboQuant-4 V) rebuilt a
+        // full bf16 K *and* V from its packed store on every decode step and
+        // then ran ordinary bf16 SDPA; `rot_k_v4g64` is the same rotated 8-bit
+        // K with an MLX-affine 4-bit V that `mixed_quantized_sdpa` consumes
+        // without materialising either axis.
         if s == "rot_k_tq4v" {
-            return Ok(KvQuant::RotKTq4V);
+            return Err(KvQuantParseError::Retired {
+                input: s.to_string(),
+                replacement: "rot_k_v4g64",
+            });
         }
 
         // "rot_k_v<vb>g<vg>" — RotK Display form round-trip.

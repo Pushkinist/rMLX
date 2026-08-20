@@ -116,7 +116,7 @@ fn plain_mixed_does_not_rotate() {
     clippy::unwrap_used,
     reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
 )]
-fn rot_k_tq4v_k_dequant_same_tolerance_as_rot_k() {
+fn rot_k_k_dequant_score_error_stays_inside_the_rot_k_tolerance() {
     use rmlx_mlx::dequantize;
 
     let device = Device::Cpu;
@@ -140,7 +140,7 @@ fn rot_k_tq4v_k_dequant_same_tolerance_as_rot_k() {
 
     let mut k_state = MixedKvState::new_rotated(4, 64);
     let (k_codes, k_scales, k_biases) = k_state
-        .bulk_init_k_from_fp16(&k, device, DispatchPolicy::default())
+        .rotate_k_and_quantize(&k, device, DispatchPolicy::default())
         .unwrap();
 
     let k_dq = dequantize(
@@ -174,8 +174,8 @@ fn rot_k_tq4v_k_dequant_same_tolerance_as_rot_k() {
 
     assert!(
         max_err < 0.02 * max_abs_ref.max(1.0),
-        "RotKTq4V K-dequant score error {max_err} too large vs \
-         |scores|={max_abs_ref} (must match RotK tolerance)"
+        "rot_k K-dequant score error {max_err} too large vs \
+         |scores|={max_abs_ref}"
     );
 }
 

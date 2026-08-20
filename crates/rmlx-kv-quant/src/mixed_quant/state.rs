@@ -226,26 +226,6 @@ impl MixedKvState {
         }
     }
 
-    /// construct a K-only rotated state for RotKTq4V.
-    ///
-    /// RotKTq4V stores V separately as `QuantV` (TurboFlash tq4), so the V
-    /// fields of `MixedKvState` are never used. This constructor omits V params
-    /// (`v_bits` / `v_group_size`) to signal intent clearly; the fields default
-    /// to 0 and are never read on the RotKTq4V code path.
-    pub fn new_k_only_rotated() -> Self {
-        Self {
-            k_bits: 8,
-            v_bits: 0,
-            k_group_size: 64,
-            v_group_size: 0,
-            offset: 0,
-            keys: None,
-            values: None,
-            rotate_k: true,
-            k_rotation: None,
-        }
-    }
-
     /// Rotate K by the stored rotation when RotK is active; identity otherwise.
     /// Builds the `[D, D]` Hadamard matrix on first use (`D = keys.head_dim`).
     #[allow(
@@ -462,81 +442,6 @@ impl MixedKvState {
         });
         self.offset = num_steps;
         Ok(())
-    }
-
-    pub fn bulk_init_k_from_fp16(
-        &mut self,
-        keys: &Array,
-        device: Device,
-        policy: DispatchPolicy,
-    ) -> Result<(Array, Array, Array)> {
-        self.rotate_k_and_quantize(keys, device, policy)
-    }
-
-    #[allow(
-        clippy::expect_used,
-        reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
-    )]
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-    )]
-    pub fn update_k_and_fetch(
-        &mut self,
-        new_k: &Array,
-        device: Device,
-        policy: DispatchPolicy,
-    ) -> Result<MixedTuple> {
-        let prev = self.offset;
-        let k_shape = new_k.shape();
-        let b = k_shape[0];
-        let n_kv_heads = k_shape[1];
-        let num_steps = k_shape[2];
-        let k_dim = k_shape[3];
-        let scales_dtype = new_k.dtype();
-
-        let need_alloc = match &self.keys {
-            None => true,
-            Some(k) => prev + num_steps > k.codes.shape()[2],
-        };
-        if need_alloc {
-            let n_increment = ((STEP + num_steps - 1) / STEP) * STEP;
-            if let Some(k) = self.keys.take() {
-                let cur_seq = k.codes.shape()[2];
-                let k_trim = if prev % STEP != 0 && prev < cur_seq {
-                    k.slice_seq_to(prev, device)?
-                } else {
-                    k
-                };
-                self.keys = Some(expand_quant(&k_trim, b, n_kv_heads, n_increment, device)?);
-            } else {
-                self.keys = Some(Self::init_quant(
-                    b,
-                    n_kv_heads,
-                    n_increment,
-                    k_dim,
-                    self.k_group_size,
-                    self.k_bits,
-                    scales_dtype,
-                    device,
-                )?);
-            }
-        }
-
-        self.offset = prev + num_steps;
-        let off = self.offset;
-
-        let (k_codes, k_scales, k_biases) = self.rotate_k_and_quantize(new_k, device, policy)?;
-        let k_new = MixedTuple {
-            codes: k_codes,
-            scales: k_scales,
-            biases: k_biases,
-        };
-
-        let k_buf = self.keys.as_mut().expect("keys initialised above");
-        k_buf.write_at(&k_new, prev, off, device)?;
-
-        k_buf.slice_seq_to(off, device)
     }
 
     #[allow(
