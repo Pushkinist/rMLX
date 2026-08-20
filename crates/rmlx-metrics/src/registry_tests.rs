@@ -139,15 +139,47 @@ fn coverage_lookup_unknown_pair_is_no() {
     assert_eq!(coverage("xyz", "decode_tps_warm"), Coverage::No);
 }
 
-/// COVERAGE_MATRIX must have at least one row for each of the 5 spec backends.
+/// Every whitelisted backend must be wired into `COVERAGE_MATRIX`, or declared
+/// in `BACKENDS_WITHOUT_COVERAGE`.
+///
+/// The previous version of this test hard-coded "the 5 spec backends", so a
+/// backend added to the whitelist afterwards landed half-wired and silently:
+/// `coverage()` falls back to `No` for an unknown pair, which is
+/// indistinguishable from a measured "this backend cannot emit that metric".
+/// `llama_cpp` and `llama_cpp_tq` both reached the whitelist that way. Driving
+/// the sweep off the whitelist itself is what makes the next one impossible.
 #[test]
-fn coverage_matrix_includes_all_5_backends() {
-    let required = ["rmlx", "mlx_lm", "paroquant", "omlx", "ollama"];
-    for backend in required {
+fn coverage_matrix_covers_every_whitelisted_backend() {
+    for backend in crate::identity::BACKEND_WHITELIST {
+        let has_rows = COVERAGE_MATRIX.iter().any(|(b, _, _)| b == backend);
+        let declared = BACKENDS_WITHOUT_COVERAGE.contains(backend);
         assert!(
-            COVERAGE_MATRIX.iter().any(|(b, _, _)| *b == backend),
-            "backend '{backend}' has no rows in COVERAGE_MATRIX"
+            has_rows != declared,
+            "backend '{backend}': has_rows={has_rows}, declared_uncovered={declared} \
+             — it must be exactly one. Add its COVERAGE_MATRIX rows, or add it to \
+             BACKENDS_WITHOUT_COVERAGE with the reason."
         );
+    }
+}
+
+/// A backend that is wired must be wired for the *whole* metric spec, not a
+/// convenient subset — otherwise a missing cell reads as `No` by fallback.
+#[test]
+fn wired_backends_declare_every_spec_metric() {
+    for backend in crate::identity::BACKEND_WHITELIST {
+        if BACKENDS_WITHOUT_COVERAGE.contains(backend) {
+            continue;
+        }
+        for metric in BACKEND_METRIC_SPEC {
+            assert!(
+                COVERAGE_MATRIX
+                    .iter()
+                    .any(|(b, m, _)| b == backend && m == metric),
+                "backend '{backend}' has no COVERAGE_MATRIX row for spec metric \
+                 '{metric}'; `coverage()` would answer No by fallback, which is \
+                 not the same as a measured No."
+            );
+        }
     }
 }
 

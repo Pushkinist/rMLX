@@ -298,6 +298,7 @@ pub const BACKEND_WHITELIST: &[&str] = &[
     "ollama",
     "vllm",
     "llama_cpp",
+    "llama_cpp_tq",
 ];
 
 /// Allowed values for the `model_namespace` identity column (see docs/METRICS_DB.md §5.1).
@@ -357,9 +358,16 @@ pub fn canonicalize_kv_quant(value: &str) -> Result<String> {
 ///
 /// Handles common variant spellings that bench tools emit:
 /// - `llama.cpp`, `llama-cpp`, `llamacpp` → `llama_cpp`
+/// - `llama-cpp-turboquant`, `llama.cpp-turboquant` → `llama_cpp_tq`
+///
+/// The TurboQuant fork is a **separate backend id**, not a `kv_quant` value on
+/// `llama_cpp`, for the same reason `mlx_lm_tq` is separate from `mlx_lm`: it
+/// is a different build with codecs upstream does not have, and folding it into
+/// the upstream id would put a row under a backend that cannot produce it.
 fn normalize_backend_alias(lower: &str) -> &str {
     match lower {
         "llama.cpp" | "llama-cpp" | "llamacpp" => "llama_cpp",
+        "llama-cpp-turboquant" | "llama.cpp-turboquant" | "llama_cpp_turboquant" => "llama_cpp_tq",
         other => other,
     }
 }

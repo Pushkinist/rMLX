@@ -127,10 +127,16 @@ is excluded:
 - **Bonsai 8B 2bit**: 15.88 → **115.21**. Ratio ~19x → **2.66x**.
 - **Gemma4-e4b dense**: 27.50 → **72.92**. Ratio ~5.6x → **2.11x**.
 
-All four now sit in the **1.8x–2.7x** band — at or near the healthy
-1.5-2x ceiling-vs-realized envelope llama.cpp / mlx-lm hit on dense models.
-The dramatic "MoE is 40-50x slow" signal was a **bench-harness measurement
-artifact** (prefill in the TPS denominator), not an inference-path defect.
+All four now sit in the **1.8x–2.7x** band. The dramatic "MoE is 40-50x slow"
+signal was a **bench-harness measurement artifact** (prefill in the TPS
+denominator), not an inference-path defect.
+
+That band was previously described here as "at or near the healthy 1.5-2x
+ceiling-vs-realized envelope llama.cpp / mlx-lm hit on dense models". **Do not
+use ratio-vs-ceiling to compare runtimes across models of different size** —
+`ratio = 1 + overhead/ideal_ms`, so the same fixed per-step cost reads larger on
+a smaller model. Measured locally, llama.cpp's absolute per-step overhead
+overlaps rMLX's; the ratio gap is dominated by bytes/step. See the H2 addendum.
 The residual ~2x is plausibly real bandwidth/dispatch overhead; flamegraph
 profiling can still characterize it, but the alarm that motivated the 16-48x
 framing is resolved.
@@ -1170,13 +1176,111 @@ Active-param bytes/step vs the 614 GB/s ceiling, compared to decode-only TPS
 | Gemma4-26b MoE | ~3.5 GB active | ~175 TPS | 72.19 | **2.42x** |
 | Qwen3.6-35B-A3B MoE | ~3.5 GB active | ~175 TPS | 94.96 | **1.84x** |
 
-All four sit in a **1.8x–2.7x** band — at/near the healthy 1.5-2x
-ceiling-vs-realized envelope llama.cpp / mlx-lm hit on dense batch-1 decode.
-**ACCEPT** — decode is bandwidth-bound and healthy. This is the headline answer
-to the question "why is decode so low?": it was *not* low — the matrix numbers
-were prefill-contaminated (see the decode-only re-baseline section). The residual ~2x is normal MLX batch-1
-overhead (dispatch + dequant + the gap between realized and peak bandwidth),
-not a defect.
+All four sit in a **1.8x–2.7x** band. **ACCEPT** — decode is bandwidth-bound.
+This is the headline answer to the question "why is decode so low?": it was
+*not* low in the sense first suspected — the matrix numbers were
+prefill-contaminated (see the decode-only re-baseline section). The residual
+~2x is MLX batch-1 overhead (dispatch + dequant + the gap between realized and
+peak bandwidth).
+
+#### H2 addendum — the comparison envelope, measured locally (TAINTED host)
+
+This section used to close by calling the 1.8x–2.7x band *"at/near the healthy
+1.5-2x ceiling-vs-realized envelope llama.cpp / mlx-lm hit on dense batch-1
+decode"*. **That envelope was taken from the literature, not measured here.** The
+first local measurement is below. It does not vindicate the sentence, and it
+does not support the opposite claim either — read on before quoting either.
+
+**Measurement conditions.** Every cell below ran with `bench_llama_ab.sh
+--allow-busy-host` and came back **TAINTED**: the entry gate read 25.6–55.0% of
+one core and individual measured windows 29–56% (`WindowServer`, and
+`syspolicyd` at a steady 32.2–32.5%); two slots of the 7 722 run saw a `node`
+process at 139.9% and 159.8%. ABBA interleaving cancels a *steady* load, so the
+**within-run A/B ratios survive**; the **absolute TPS does not**, and neither
+does anything derived from a single absolute number. Per-slot windows are
+recorded in each result JSON.
+
+`llama.cpp` at its own roofline on this host — same 614 GB/s constant, same
+bytes/step arithmetic, `Qwen3-8B-Q8_0` GGUF, Metal, batch 1, decode-only TPS
+from the server's own `timings`:
+
+| prompt tokens | bytes/step (weights + f16 KV) | ceiling @614 GB/s | measured decode_tps | ratio vs ceiling |
+|---:|---:|---:|---:|---:|
+| 3 753 | 9.26 GB | 66.3 TPS | 52.05 | **1.27x** |
+| 7 722 | 9.85 GB | 62.3 TPS | 54.89 / 49.27 | **1.14x / 1.26x** |
+| 31 536 | 13.36 GB | 46.0 TPS | 35.25 | **1.30x** |
+
+The 7 722 row carries **two** observations of the same cell, same binary, same
+flags, ~30 min apart. Publishing only the faster one would put an endpoint in
+the band that this very section documents as unreproducible, so both are shown.
+The reproducible band is **1.26x–1.30x**.
+
+##### Ratio-vs-ceiling is not comparable across models of different size
+
+It is tempting to set 1.26x–1.30x against rMLX's 1.8x–2.7x and conclude
+llama.cpp is the more efficient runtime. **That inference is invalid**, and the
+reason generalises well beyond this page.
+
+The ratio is not a scale-free efficiency. By construction
+
+```
+ratio = measured_ms / ideal_ms = 1 + fixed_overhead_ms / ideal_ms
+```
+
+so *the same* fixed per-step cost produces a large ratio on a small model and a
+small ratio on a large one. The two tables are not close in scale: llama.cpp's
+cells move **9.3–13.4 GB/step**, rMLX's H2 rows **2.0–4.0 GB/step** — 2.3x to
+6.7x apart. That difference alone moves the ratio in exactly the observed
+direction, before any question of runtime quality.
+
+The scale-free quantity is the **absolute per-step overhead**,
+`1000/measured_tps − 1000·bytes/614`:
+
+| runtime | cell | bytes/step | ideal ms | measured ms | **overhead ms** | ratio |
+|---|---|---:|---:|---:|---:|---:|
+| llama.cpp | Qwen3-8B-Q8_0 @3 753 | 9.26 GB | 15.09 | 19.21 | **4.12** | 1.27x |
+| llama.cpp | Qwen3-8B-Q8_0 @7 722 | 9.85 GB | 16.04 | 18.22 / 20.30 | **2.18 / 4.26** | 1.14x / 1.26x |
+| llama.cpp | Qwen3-8B-Q8_0 @31 536 | 13.36 GB | 21.76 | 28.37 | **6.61** | 1.30x |
+| rMLX | Qwen3.6-35B-A3B MoE | 3.5 GB | 5.70 | 10.53 | **4.83** | 1.85x |
+| rMLX | Bonsai 8B 2bit | 2.0 GB | 3.26 | 8.68 | **5.42** | 2.66x |
+| rMLX | Gemma4-e4b mxfp8 | 4.0 GB | 6.51 | 13.71 | **7.20** | 2.11x |
+| rMLX | Gemma4-26b MoE | 3.5 GB | 5.70 | 13.85 | **8.15** | 2.43x |
+
+llama.cpp 2.18–6.61 ms against rMLX 4.83–8.15 ms. **The ranges overlap**, so by
+the same rule this repo applies to its own A/B arms the comparison is
+**INCONCLUSIVE**: the medians differ (~4.3 ms vs ~6.3 ms) but no separation is
+demonstrated at n=3 vs n=4, across two frameworks, two weight formats and two
+measurement sessions on a tainted host.
+
+What the data *does* establish:
+
+* The **band difference is dominated by bytes/step, not by runtime efficiency.**
+  A 1.26x-vs-2.4x gap in ratios coexists with overlapping absolute overheads.
+* E2's original sentence is still unsupported — it cited an envelope nobody had
+  measured — but it is **not falsified**, and an earlier revision of this
+  addendum that claimed rMLX was "roughly 1.5x looser" was **wrong**: it compared
+  the non-scale-free quantity across a 2.3–6.7x span in model size.
+* Settling it needs a like-for-like cell — llama.cpp on a model with
+  rMLX-comparable bytes/step, or rMLX on an ~9 GB/step model — on a quiescent
+  host. That has not been run.
+
+**Equivalence caveat, and it is load-bearing.** No file both runtimes can load
+exists: rMLX reads MLX safetensors, llama.cpp reads GGUF. The tables set a
+`q8_0` (block 32, one fp16 scale) model against rMLX's `mxfp8`/affine rows —
+near-equivalent, not identical. The rMLX bytes/step figures are themselves the
+rounded estimates this section already published (and `#403` tightens that
+census), so the overhead column inherits their uncertainty. Treat a cross-family
+gap under ~10% as unresolved by this method.
+
+**Cross-run absolute TPS on this host is not comparable.** The 7 722 cell above
+is the demonstration: 54.89 and 49.27, an 11% drift driven by foreground desktop
+load. Both are published for that reason. Every *ratio* quoted elsewhere in this
+campaign is between two arms *inside one ABBA run*; the roofline tables here are
+the one place absolute numbers appear, and they are why the verdict above is
+INCONCLUSIVE rather than a measurement.
+
+Method and raw slots: `scripts/bench_llama_ab.sh`, results under
+`$RMLX_HOME/bench/llama_ab/`.
 
 ### H3 — MoE routing math — characterized (negligible)
 

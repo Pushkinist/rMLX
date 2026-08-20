@@ -430,6 +430,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_kernel_dtype_contract.sh
 	@bash scripts/check_kernel_dtype_contract_fixtures.sh
 	@bash scripts/perf_ab_selftest.sh
+	@bash scripts/bench_llama_ab_selftest.sh
 	@bash scripts/check_metal_format.sh
 	@bash scripts/check_metal_compiles.sh
 	@bash scripts/file_size_report.sh || true
@@ -601,6 +602,9 @@ canary-ab: mlx-preflight build-perf  ## interleaved A/B of two arms (ARGS='--bin
 
 canary-ab-selftest: ## mutation-check the A/B harness against stub binaries (no GPU, no model)
 	bash scripts/perf_ab_selftest.sh
+
+llama-ab-selftest: ## mutation-check the llama-server A/B harness against a stub server (no GPU, no GGUF)
+	bash scripts/bench_llama_ab_selftest.sh
 
 canary-gate:        ## gate TPS regressions via runs.db (SHA= required; e.g. make canary-gate SHA=3ba8aee)
 	@test -n "$(SHA)" || { echo "ERROR: SHA= required. Usage: make canary-gate SHA=<last-green-sha>"; exit 125; }
