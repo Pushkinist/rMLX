@@ -37,6 +37,7 @@ key.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -62,17 +63,22 @@ _KV_FLAG = re.compile(r"--kv-quant[= ]+(\S+)")
 
 
 def _kv_quant_of(arm_args: str, declared: str, arm: str) -> str:
-    """Check the declared codec against the arm's recorded arguments."""
-    m = _KV_FLAG.search(arm_args or "")
+    """Check the declared codec against the arm's recorded arguments.
+
+    The LAST occurrence wins, because that is how clap resolves a repeated
+    flag: taking the first would confirm a codec the slot did not run.
+    """
+    matches = _KV_FLAG.findall(arm_args or "")
+    m = matches[-1] if matches else None
     if not m:
         raise SystemExit(
             f"arm {arm} recorded no --kv-quant in its arguments ({arm_args!r}), so "
             f"the declared '{declared}' cannot be confirmed. Both arms of a codec "
             "comparison must name their codec explicitly."
         )
-    if m.group(1) != declared:
+    if m != declared:
         raise SystemExit(
-            f"arm {arm} ran --kv-quant {m.group(1)} but --arm-{arm.lower()}-kv-quant "
+            f"arm {arm} ran --kv-quant {m} but --arm-{arm.lower()}-kv-quant "
             f"says '{declared}'. The cell key would not describe the measurement."
         )
     return declared
@@ -81,10 +87,12 @@ def _kv_quant_of(arm_args: str, declared: str, arm: str) -> str:
 def _kv_bytes(stats: dict[str, Any]) -> tuple[int | None, str]:
     """Resident KV for one arm, in bytes, plus a provenance note.
 
-    `perf_ab.sh` carries the exact byte count. Results written before it did
-    carry only the report table's 0.1 MB display field; those are still
-    ingestable, but the row says where its precision came from rather than
-    presenting a rounded number as an exact one.
+    `perf_ab.sh` carries the exact byte count. A handful of result files on this
+    machine carry only the report table's 0.1 MB display field, because they
+    were produced by an intermediate revision of the harness that was never
+    committed — no released or committed version of `perf_ab.sh` emits that
+    shape. They are still ingestable, and the row then states where its
+    precision came from rather than presenting a rounded number as an exact one.
     """
     exact = stats.get("median_kv_cache_bytes")
     if exact is not None:
@@ -98,6 +106,31 @@ def _kv_bytes(stats: dict[str, Any]) -> tuple[int | None, str]:
         "field (this result predates median_kv_cache_bytes), so it is exact to "
         "+/-50 kB, not to the byte",
     )
+
+
+def _verify_binary(binary: str, sha256_16: str, arm: str) -> None:
+    """Refuse when the binary on disk is not the one the run measured.
+
+    `_identity` asks a PATH who it is, and the run recorded a digest. Between
+    the run and the ingest that path can be rebuilt, and then `backend_version`
+    / `build_profile` describe one binary while the row's notes assert another
+    — permanently, in an append-only table. The digest is the only thing that
+    ties the two together, so it is checked rather than pasted.
+    """
+    path = Path(binary)
+    if not path.is_file():
+        raise SystemExit(
+            f"arm {arm}'s binary {binary} no longer exists, so its identity "
+            f"(recorded digest sha256:{sha256_16}) cannot be confirmed."
+        )
+    actual = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+    if actual != sha256_16:
+        raise SystemExit(
+            f"arm {arm}'s binary {binary} now hashes sha256:{actual}, but the run "
+            f"recorded sha256:{sha256_16}. It was rebuilt after the measurement, so "
+            "its version and build profile no longer describe the numbers in this "
+            "result. Rebuild at the measured commit, or re-run the comparison."
+        )
 
 
 def _identity(binary: str) -> dict[str, Any]:
@@ -143,6 +176,9 @@ def _arm_record(
     )
     if tainted:
         notes += f"; TAINTED: {tainted}"
+    waived = sorted(k for k, v in (result.get("waivers") or {}).items() if v)
+    if waived:
+        notes += f"; guards waived: {', '.join(waived)}"
 
     metrics: list[dict[str, Any]] = [
         {
@@ -157,6 +193,7 @@ def _arm_record(
     if kv_note:
         notes += f"; {kv_note}"
 
+    _verify_binary(top["binary"], top["sha256_16"], arm)
     return {
         **_identity(top["binary"]),
         "schema_version": 1,
@@ -206,8 +243,9 @@ def main() -> int:
         "--prompt-tokens",
         type=int,
         default=None,
-        help="tokenized prompt length. Read from the result when the harness "
-        "recorded one; required otherwise, because the fixture's NAME "
+        help="tokenized prompt length. The harness measures it and this becomes a "
+        "cross-check that errors on mismatch; it is only required for a result "
+        "written before the harness recorded one. Note the fixture's NAME "
         "(--prompt-tokens 131072) is not its token count.",
     )
     p.add_argument("--prompt-name", default=None)
@@ -249,6 +287,22 @@ def main() -> int:
         )
         return 2
 
+    # A raised --busy-pct does not taint: it removes the gate that would have
+    # tainted. The result then looks clean for the one reason a result must
+    # never look clean, and the taint check above cannot see it.
+    waivers = result.get("waivers") or {}
+    if waivers.get("busy_pct_raised") and not args.accept_tainted:
+        print(
+            "refusing: the run raised --busy-pct above the default, so the "
+            "interference\n"
+            "  gate was weakened and an empty taint means the gate did not fire, "
+            "not that\n"
+            "  the host was quiet. Re-run at the default threshold, or pass "
+            "--accept-tainted.",
+            file=sys.stderr,
+        )
+        return 2
+
     # Prompt: the harness names a canonical fixture by requested size, and the
     # fixture's rendered token count is a different number.
     requested = result["shape"]["prompt_tokens"]
@@ -262,14 +316,26 @@ def main() -> int:
         raise SystemExit(f"no prompt body at {prompt_path} (pass --prompt-file)")
     prompt_body = prompt_path.read_text(encoding="utf-8")
 
-    prompt_tokens = cell.get("prompt_tokens", args.prompt_tokens)
-    if prompt_tokens is None:
-        raise SystemExit(
-            "this result carries no measured prompt_tokens (it predates the "
-            "harness recording one). Pass --prompt-tokens with the count the "
-            "run's `baseline: ... prompt_tokens=` line reported; the fixture's "
-            "requested size is not it."
-        )
+    measured = cell.get("prompt_tokens")
+    if measured is None:
+        if args.prompt_tokens is None:
+            raise SystemExit(
+                "this result carries no measured prompt_tokens (it predates the "
+                "harness recording one). Pass --prompt-tokens with the count the "
+                "run's `baseline: ... prompt_tokens=` line reported; the fixture's "
+                "requested size is not it."
+            )
+        prompt_tokens = args.prompt_tokens
+    else:
+        # The harness measured it. A supplied value is then a cross-check, never
+        # an override: the cell key must be what ran, not what was expected.
+        if args.prompt_tokens is not None and args.prompt_tokens != measured:
+            raise SystemExit(
+                f"--prompt-tokens {args.prompt_tokens} disagrees with the "
+                f"{measured} the run tokenized. The recorded cell key would not "
+                "describe the measurement."
+            )
+        prompt_tokens = measured
 
     records = [
         _arm_record(result, cell, arm, args, prompt_body, prompt_tokens, prompt_name)

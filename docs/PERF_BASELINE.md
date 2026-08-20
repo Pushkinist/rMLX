@@ -585,82 +585,97 @@ and Qwen3.6 (separate arch files) are unchanged. On the `none` path the gain
 widens with context as KV bandwidth dominates: Bonsai `none` decode_tps
 ~101→~135 at 4 k, ~48→~83 at 16 k, ~19→~38 at 64 k.
 
-## Codec cells across context — `none` vs `mixed_k8g64_v4g64` (TAINTED host, 2026-08-20)
+## Codec cells across context — `none` vs `mixed_k8g64_v4g64` (2026-08-21)
 
-**Every cell in this section is TAINTED and none of it is a clean measurement.**
-`perf_ab.sh`'s quiescence gate never cleared on this host: a virtual-machine
-helper sat at 113–384 % of a core throughout, WindowServer at 30–56 %, and all
-8 of 8 slots in every run are marked contended. The runs are ABBA-interleaved,
-so a *within-run* ratio still cancels a drift that is monotone across the run,
-and the pre-declared disjoint-range criterion still decides SEPARATED vs
-INCONCLUSIVE. Nothing here may be quoted as an absolute TPS anchor, and no
-number here may be compared against a number from a different run.
-
-Why the section exists: every earlier codec cell in this file and in
+Why this section exists: every earlier codec cell in this file and in
 `docs/KV_QUANT.md` was taken at 4 096–32 768 tokens, and the standing objection
 to that basis is that `kv_frac` — the KV share of a decode step's byte stream —
 rises steeply with context, so a short cell cannot see a codec difference "even
-in principle". `kv_frac` is stated next to every row below so that bound is
-visible rather than assumed. It is a **(model, context)** quantity, not a
-context one; see docs/KV_QUANT.md, "`kv_frac` bounds a codec claim".
+in principle". `kv_frac` is stated next to every row so that bound is visible
+rather than assumed. It is a **(model, context)** quantity, not a context one;
+see docs/KV_QUANT.md, "`kv_frac` bounds a codec claim".
+
+**Host conditions, per cell.** The two Qwen3.8 cells ran with the busiest
+foreign process at **7.0–7.3 % of a core** for their whole comparison and are
+**not tainted**. The two Bonsai cells are marked TAINTED for a single, named,
+non-physical reason: a monitoring `grep` polling for run completion landed
+inside the harness's 1-second entry sample and read 102 %. Their comparison
+windows read 7.1 %. Earlier runs of these same four cells, on the same binary,
+were tainted for a real reason — a container runtime's virtual-machine helper at
+113–384 % of a core, which is not ours to stop on this machine — and those
+numbers are superseded here; only the residency figures were unaffected, and
+they came back bit-identical across both campaigns.
 
 Shape: `rmlx baseline`, `release-perf` build `sha256:c26e0d8a3ac43996`,
 `--max-tokens 100`, 1 untimed warmup + 8 slots per model (n=4 per arm),
 `--allow-busy-host --allow-token-divergence`. Arm A is `--kv-quant none` (true
 bf16 on every layer), arm B `--kv-quant mixed_k8g64_v4g64` (affine 8-bit K /
-4-bit V, and one of the two codec families whose decode genuinely reads its
-packed store). `kv_frac` and the predicted ceilings are
-`scripts/perf_ceiling.py` on the same snapshot.
+4-bit V, one of the two codec families whose decode genuinely reads its packed
+store). `kv_frac` and the predicted ceilings are `scripts/perf_ceiling.py` at
+the **measured** cache offset (`prompt_tokens + max_tokens - 1`), not at the
+fixture's nominal size.
 
-`kv_frac` and the predicted ceilings are evaluated at the **measured** cache
-offset (`prompt_tokens + max_tokens - 1`), not at the fixture's nominal size.
+**Family size.** Each result file states `null_p 0.02857` for its own single
+comparison, which is the number the harness prints. This table is **four**
+independent comparisons, so the chance that at least one comes back with
+disjoint ranges under the null is `1-(1-0.02857)^4 =` **0.109**. Two came back
+separated, and the larger of the two is a 23.7 % effect against a 0.9 % arm
+spread, which is not a coin flip — but read a single separated row against
+0.109, not 0.029. No `--invert` counterpart was run, so residual positional bias
+is uncancelled: the ABBA schedule already equalises the arms' mean slot
+position, but the pairing that would confirm it was not done.
 
-| model | prompt tok | `kv_frac` (A) | predicted ceiling B/A | decode B/A (median) | A range | B range | verdict | resident KV A → B | resident B/A |
+| model | prompt tok | `kv_frac` | predicted B/A | decode B/A | A range (CoV) | B range (CoV) | verdict | resident KV A → B | resident B/A |
 |---|---:|---:|---:|---:|---|---|---|---|---:|
-| Ternary-Bonsai-8B-2bit | 3 770 | 0.211 | 1.099 | 0.949 | 125.72–134.86 | 125.21–127.53 | INCONCLUSIVE | 570.5 → 734.1 MB | 1.287 |
-| Ternary-Bonsai-8B-2bit | 31 553 | **0.687** | **1.419** | 1.003 | 65.07–67.82 | 65.03–68.06 | INCONCLUSIVE | 4 667.3 → 6 032.9 MB | 1.293 |
-| Qwen3.8-27B-mxfp8 | 3 892 | 0.010 | 1.004 | 1.005 | 17.73–17.97 | 17.58–18.04 | INCONCLUSIVE | 415.5 → 506.5 MB | 1.219 |
-| Qwen3.8-27B-mxfp8 | 130 848 | 0.245 | 1.149 | **0.728** | 13.94–14.12 | 9.45–10.70 | **ranges disjoint** | 8 735.7 → 11 784.2 MB | 1.349 |
+| Ternary-Bonsai-8B-2bit | 3 770 | 0.211 | 1.099 | 0.975 | 141.45–143.03 (0.52 %) | 137.32–139.28 (0.66 %) | ranges disjoint | 570.5 → 734.1 MB | 1.287 |
+| Ternary-Bonsai-8B-2bit | 31 553 | **0.687** | **1.419** | 1.002 | 68.60–68.67 (0.04 %) | 68.56–68.77 (0.15 %) | INCONCLUSIVE | 4 667.3 → 6 032.9 MB | 1.293 |
+| Qwen3.8-27B-mxfp8 | 3 892 | 0.010 | 1.004 | 0.977 | 18.49–18.64 (0.37 %) | 18.06–18.13 (0.21 %) | SEPARATED | 415.5 → 506.5 MB | 1.219 |
+| Qwen3.8-27B-mxfp8 | 130 848 | 0.245 | 1.149 | **0.763** | 13.74–14.02 (0.89 %) | 10.61–10.72 (0.49 %) | SEPARATED | 8 735.7 → 11 784.2 MB | 1.349 |
 
-**What the 130 848-token Qwen3.8 row settles.** This is the cell that a
-long-context codec claim was supposed to be decided on: `kv_frac` 0.245, a
-predicted **+14.9 %** ceiling for arm B, and 20× the paired noise floor between
-the arms. Measured, arm B is **27.2 % slower**, with the two arms' per-slot
-ranges disjoint in the losing direction (every `none` slot faster than every
-`mixed` slot), and it holds **35 % more** resident KV and 6 034 MB more
-generation-scoped allocation. Both halves of the pre-declared long-context
-falsifier fire: resident above 0.60× and decode below 0.95×. The
-"measure it at 128 k and the codec will pay" hypothesis is not merely
-unsupported here — the sign is wrong.
+**What the 130 848-token Qwen3.8 row settles, and what it does not.** This is
+the cell a long-context codec claim was meant to turn on: `kv_frac` 0.245 and a
+predicted **+14.9 %** ceiling for arm B. Measured on a quiet host, arm B is
+**23.7 % slower**, every `none` slot faster than every `mixed` slot, while
+holding **35 % more** resident KV and 6 034 MB more generation-scoped
+allocation.
 
-This cell is also the least contended of the four: the entry gate refused at
-114 %, but only 4 of 8 slots were flagged (worst 35.8 % WindowServer) and the
-comparison window as a whole read 22.8 %, *under* the 25 % threshold. It is
-still reported as TAINTED, and still may not be read as an absolute anchor.
+**Scope, because the two halves are not equally load-bearing.** Arm B is
+`mixed_k8g64_v4g64` **as it stands on this tree**, which still materialises a
+packed store *and* retains both bf16 seeds: the change that stopped building a
+store for a mirror-fed codec deliberately excluded the Mixed / RotK family,
+whose decode really does read its store, so `materialises_packed_store()` is
+still true for it (`crates/rmlx-kv-quant/src/quant.rs`). The seed is exactly
+what a seed-elision projection removes.
 
-**Why `none` losing is not a roofline story.** Arm A's non-bandwidth per-step
-term is essentially flat across a 33× context change — 12.65 ms at 3 892 tokens,
-14.70 ms at 130 848 — so `none` decode really is bandwidth-dominated at 131 k
-(1.26× its 57.02 ms floor). Arm B halves the KV byte stream and still loses,
-because its own per-step cost is not flat: 98.55 ms measured against a 49.76 ms
-floor, 1.98×, i.e. 48.79 ms of non-bandwidth work against arm A's 14.70. The
-packed path does not fail to convert bytes into time; at this shape it spends
-more time than the bytes were worth.
+* The **resident** figure is therefore the *pre-elision* number and settles
+  nothing about a post-elision codec. It reproduces what the byte model already
+  predicts for today's `Mixed` (1.349 measured whole-cache; 1.355 attention-only
+  from `perf_ceiling.py`) — a confirmation, not a refutation.
+* The **decode** figure needs no post-elision arm and is the new evidence.
+  Returning an unread bf16 seed frees memory; it does not make a
+  quantized-matmul decode path faster, and arm B already reads its packed store.
+  So −23.7 % with disjoint ranges stands against any seed-elision variant of
+  this codec.
+
+Read as: *at 131 k, on this arch, the packed-store path costs decode
+throughput, and the memory question is still open pending the seed elision.*
+Nothing here shows the elision would not save the projected bytes. It is also
+consistent with the standing position that the byte ceiling is unreachable
+without the packed-path throughput work, which is open.
 
 **What the 31 553-token Bonsai row settles.** 0.687 is the largest `kv_frac`
-any model in the release set reaches at a context this tree can serve. Arm B
-cuts the decode KV stream to 0.571× of arm A's and the roofline predicts +42 %.
-Measured: **+0.3 %, ranges fully overlapping** — no measured effect — while
-resident KV goes *up* 29 %. So the short-context basis was not what made the
-earlier codec cells come back null: the null survives at the high-`kv_frac` end
-of the same axis.
+any release-set model reaches at a context this tree can serve. Arm B cuts the
+decode KV stream to 0.571× of arm A's and the roofline predicts +42 %.
+Measured: **+0.2 %, ranges overlapping** — no measured effect — while resident
+KV goes *up* 29 %. The arm spreads here are 0.04 % and 0.15 %, so this is a null
+with the power to have seen a 1 % effect. The short-context basis was not what
+made the earlier codec cells come back null: the null survives at the
+high-`kv_frac` end of the same axis.
 
 **The byte model is not what fails; it is exact where it is complete.** At the
 measured offsets `perf_ceiling.py` puts arm A's resident KV at 570.5 MB and
 4 667.3 MB on Bonsai — the measured figures, to the digit — and arm B within
-0.5 % and 0.06 %. What does not hold is the conversion of saved bytes into
-saved time: the ε of docs/KV_QUANT.md, "Fused flash-decode over a quant store",
-measured at 0.041–0.135 on every path tried so far.
+0.5 % and 0.06 %.
 
 **The Qwen3.8 resident ratio is diluted, not smaller.** That arch is hybrid:
 48 of its 64 layers hold a fixed-size GDN recurrent state the codec never
@@ -680,26 +695,46 @@ attention-KV ratio (1.219 measured against 1.355 attention-only at 3 892; 1.349
 against 1.355 at 130 848), the same way the `--kv-quant none` section reads
 Qwen3.6-35B's 1.060× against its 1.109× attention-only figure.
 
-**Decode moves away from the roofline as context grows.** Same runs, arm A,
-against `perf_ceiling.py`'s bandwidth-bound floor for the same cell:
+**`none`'s non-bandwidth overhead is flat across context; arm B's is not.**
+Same runs, against `perf_ceiling.py`'s bandwidth-bound floor for the same cell.
+The last column is the scale-free one:
 
-| model | prompt tok | measured ms/step | roofline ms/step | ratio | non-bandwidth ms/step |
-|---|---:|---:|---:|---:|---:|
-| Ternary-Bonsai-8B-2bit | 3 770 | 7.55 | 4.40 | 1.72× | 3.15 |
-| Ternary-Bonsai-8B-2bit | 31 553 | 15.01 | 11.07 | 1.36× | 3.94 |
-| Qwen3.8-27B-mxfp8 | 3 892 | 56.11 | 43.47 | 1.29× | 12.65 |
-| Qwen3.8-27B-mxfp8 | 130 848 | 71.72 | 57.02 | 1.26× | 14.70 |
+| model | prompt tok | arm | measured ms/step | roofline ms/step | ratio | non-bandwidth ms/step |
+|---|---:|---|---:|---:|---:|---:|
+| Ternary-Bonsai-8B-2bit | 3 770 | `none` | 7.01 | 4.40 | 1.59× | 2.61 |
+| Ternary-Bonsai-8B-2bit | 31 553 | `none` | 14.57 | 11.07 | 1.32× | 3.50 |
+| Qwen3.8-27B-mxfp8 | 3 892 | `none` | 53.99 | 43.47 | 1.24× | 10.52 |
+| Qwen3.8-27B-mxfp8 | 130 848 | `none` | 71.75 | 57.02 | 1.26× | 14.74 |
+| Qwen3.8-27B-mxfp8 | 3 892 | `mixed` | 55.24 | 43.25 | 1.28× | 11.99 |
+| Qwen3.8-27B-mxfp8 | 130 848 | `mixed` | 94.00 | 49.76 | 1.89× | **44.24** |
 
 Compare the last column, not the ratio: ratio-vs-roofline is
 `1 + overhead/ideal_ms` and is therefore *not* scale-free, so it cannot be
 compared across models of different size — the same fixed per-step cost reads
-large on a small model and small on a large one. Within one model the
-comparison is valid, and within each model the non-bandwidth term is roughly
-flat — Bonsai 3.15 → 3.94 ms across an 8× context change, Qwen3.8 12.65 →
-14.70 ms across 33×. Both models' `none` decode really is bandwidth-dominated
-at their long cell. That is what makes the null load-bearing: the regime where
-a byte cut *should* convert is the regime measured, on two architectures, and
-it did not convert on either.
+large on a small model and small on a large one. Within one model it is valid.
+`none`'s overhead is roughly flat (Bonsai 2.61 → 3.50 ms over an 8× context
+change, Qwen3.8 10.52 → 14.74 over 33×), so `none` decode really is
+bandwidth-dominated at the long cell — the regime where a byte cut *should*
+convert. Arm B's is not flat: 11.99 → 44.24 ms over the same span. It halves the
+KV byte stream and spends the saving three times over. That, not `kv_frac`, is
+what decides the cell.
+
+**Group A still costs nothing, at both contexts and both architectures.**
+Separately from the A/B cells, `none`, `k8v8`, `k8v4`, `planar` and `tsym3`
+were each run once per (model, context) and recorded through
+`rmlx baseline --record`. Within every cell all five report **byte-identical**
+`kv_cache_bytes`:
+
+| model | prompt tok | `kv_cache_bytes`, all 5 codecs |
+|---|---:|---:|
+| Ternary-Bonsai-8B-2bit (`kv_h` 8) | 3 770 | 560 480 256 |
+| Ternary-Bonsai-8B-2bit | 31 553 | 4 657 250 304 |
+| gemma-4-e2b-mxfp8 (`kv_h` 1, shared-KV) | 4 117 | 31 776 768 |
+| gemma-4-e2b-mxfp8 | 34 355 | 217 559 040 |
+
+20 rows in `runs.db`. These are byte counts, which are deterministic for a given
+(model, offset, codec), so one run per cell is the whole measurement — unlike a
+throughput figure, which is why these are not ABBA-paired.
 
 ## Host-sampler cost — PROVISIONAL, NOT AN ANCHOR (2026-08-16)
 

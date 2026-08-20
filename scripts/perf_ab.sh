@@ -456,6 +456,7 @@ PATTERN="$(build_pattern "$SLOTS" "$INVERT")"
 SLOT_TPS=""
 SLOT_MEM=""
 SLOT_KV=""
+SLOT_PTOK=""
 SLOT_IDS_FILE=""
 SLOT_HOST=""
 
@@ -500,6 +501,11 @@ run_slot() {
 	MODEL_ELAPSED="$(awk -v a="$MODEL_ELAPSED" -v b="$elapsed" 'BEGIN { printf "%.3f", a + b }')"
 
 	SLOT_TPS="$(sed -n 's/.*decode_tps=\([0-9.]*\).*/\1/p' "$raw" | head -1)"
+	# The TOKENIZED prompt length, which is not `--prompt-tokens`: that names a
+	# canonical fixture by requested size and the rendered chat template lands
+	# somewhere else (131072 -> 130848 on one snapshot here). It is the cell key
+	# for every recorded row, so it is measured rather than restated.
+	SLOT_PTOK="$(sed -n 's/.*[^_]prompt_tokens=\([0-9]*\).*/\1/p' "$raw" | head -1)"
 	SLOT_MEM="$(sed -n 's/.*metal_gen_alloc_mb=\([0-9.]*\).*/\1/p' "$raw" | head -1)"
 	local slot_peak
 	slot_peak="$(sed -n 's/.*metal_peak_mb=\([0-9.]*\).*/\1/p' "$raw" | head -1)"
@@ -513,8 +519,24 @@ run_slot() {
 	# did not report; it is carried through as `n/a` rather than parsed to 0,
 	# because a zero here would average into a residency ratio as a real cache
 	# of no bytes. An arm with any `n/a` slot reports no residency figure.
-	SLOT_KV="$(sed -n 's/.*kv_cache_bytes=\([0-9a-z/]*\).*/\1/p' "$raw" | head -1)"
+	#
+	# Two accepted spellings and nothing else. The capture class is deliberately
+	# wide so that a THIRD spelling is seen and refused here rather than parsed:
+	# awk reads any non-numeric token as 0, so `nan`, a truncated field or an
+	# error word would become a median of 0 bytes -- a number that survives every
+	# downstream check and records as the smallest cache ever measured.
+	SLOT_KV="$(sed -n 's/.*kv_cache_bytes=\([^ ]*\).*/\1/p' "$raw" | head -1)"
 	[[ -z "$SLOT_KV" ]] && SLOT_KV="n/a"
+	case "$SLOT_KV" in
+	n/a | *[!0-9]*)
+		if [[ "$SLOT_KV" != "n/a" ]]; then
+			echo "ERROR: slot $tag reported kv_cache_bytes=$SLOT_KV, which is neither a" >&2
+			echo "  byte count nor the 'n/a' refusal. A non-numeric token parses to 0 and" >&2
+			echo "  would be recorded as a cache of no bytes. Output: $raw" >&2
+			exit 125
+		fi
+		;;
+	esac
 	sed -n 's/^baseline: token_ids=//p' "$raw" | head -1 | tr ',' '\n' >"$ids"
 	SLOT_IDS_FILE="$ids"
 	local has_ids_line=0
@@ -522,6 +544,12 @@ run_slot() {
 
 	if [[ -z "$SLOT_TPS" ]]; then
 		echo "ERROR: slot $tag produced no decode_tps. Output: $raw" >&2
+		exit 125
+	fi
+	if [[ -z "$SLOT_PTOK" ]]; then
+		echo "ERROR: slot $tag produced no prompt_tokens. That is the cell key every" >&2
+		echo "  recorded row is filed under; a run that did not report it cannot be" >&2
+		echo "  attributed to a context. Output: $raw" >&2
 		exit 125
 	fi
 	if [[ -z "$SLOT_MEM" || -z "$slot_peak" ]]; then
@@ -731,7 +759,7 @@ for model in "${MODELS[@]}"; do
 		echo "        compares two different computations." >&2
 	fi
 
-	A_TPS=(); B_TPS=(); A_MEM=(); B_MEM=(); A_KV=(); B_KV=()
+	A_TPS=(); B_TPS=(); A_MEM=(); B_MEM=(); A_KV=(); B_KV=(); MODEL_PTOK=""
 	# A run that had to be waived past the entry gate carries that fact into
 	# every verdict it produces. Otherwise a comparison that started on a busy
 	# host reads as clean the moment no individual slot happens to trip.
@@ -771,6 +799,18 @@ for model in "${MODELS[@]}"; do
 			A_TPS+=("$SLOT_TPS"); A_MEM+=("$SLOT_MEM"); A_KV+=("$SLOT_KV")
 		else
 			B_TPS+=("$SLOT_TPS"); B_MEM+=("$SLOT_MEM"); B_KV+=("$SLOT_KV")
+		fi
+		# One tokenized prompt per comparison, across BOTH arms: the arms differ
+		# by codec, never by input. A disagreement means the cell was not one
+		# cell, and a single value would then describe whichever slot ran first.
+		if [[ -z "$MODEL_PTOK" ]]; then
+			MODEL_PTOK="$SLOT_PTOK"
+		elif [[ "$SLOT_PTOK" != "$MODEL_PTOK" ]]; then
+			echo "" >&2
+			echo "ERROR: slot $i tokenized $SLOT_PTOK prompt tokens; an earlier slot" >&2
+			echo "  tokenized $MODEL_PTOK. The arms were not run on one prompt, so the" >&2
+			echo "  comparison has two contexts in it and no cell key describes both." >&2
+			exit 125
 		fi
 
 		case "${SLOT_HOST%% *}" in
@@ -878,6 +918,7 @@ for model in "${MODELS[@]}"; do
 	JSON_MODELS="${JSON_MODELS}$(
 		cat <<JSON
     {"model": "$(json_str "$short")",
+     "prompt_tokens": $MODEL_PTOK,
      "arm_a": {"label": "$(json_str "$LABEL_A")", "median_tps": $A_MED, "sd_tps": $A_SD, "min_tps": $A_MIN, "max_tps": $A_MAX, "n": $A_N, "median_gen_alloc_mb": $AM_MED, "median_kv_cache_bytes": $(json_num "$AK_MED"), "tps": [$(
 			IFS=,
 			echo "${A_TPS[*]}"

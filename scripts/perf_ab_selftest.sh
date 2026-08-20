@@ -87,7 +87,14 @@ if [ -n "$drift" ] && [ "\$n" = "$drift" ]; then tok="$TOKENS_ALT"; fi
 peak=100.0
 if [ "$omit" = "zeropeak" ]; then peak=0.0; fi
 kvcol=""
-if [ -n "$kv" ]; then kvcol="  kv_cache_bytes=$kv"; fi
+kvval="$kv"
+# "partial" is the any-vs-all case: this slot refuses on odd-numbered calls and
+# reports on even ones, so an arm ends up with a mixture. (No backticks: this
+# heredoc is unquoted, so they would run as command substitution right here.)
+if [ "$kv" = "partial" ]; then
+  if [ \$((n % 2)) -eq 1 ]; then kvval="n/a"; else kvval=1000000123; fi
+fi
+if [ -n "$kv" ]; then kvcol="  kv_cache_bytes=\$kvval"; fi
 if [ "$omit" != "tps" ]; then
   printf 'baseline: model=stub  load=1ms  ttft_ms=1  decode_tps=%s  overall_tps=%s  prefill_tps=1.0  prompt_tokens=4096  peak_rss=1.0MB  metal_peak_mb=%s  metal_gen_alloc_mb=%s%s\n' "\$v" "\$v" "\$peak" "$mem" "\$kvcol"
 else
@@ -175,6 +182,11 @@ NO_IDS="$(make_stub no_ids "100.0" 40.0 "$TOKENS_MAIN" "" ids)"
 KV_SMALL="$(make_stub kv_small "100.0,100.5,101.0" 40.0 "$TOKENS_MAIN" "" "" 1000000123)"
 KV_BIG="$(make_stub kv_big "100.0,100.5,101.0" 40.0 "$TOKENS_MAIN" "" "" 2000000000)"
 KV_NA="$(make_stub kv_na "100.0,100.5,101.0" 40.0 "$TOKENS_MAIN" "" "" "n/a")"
+# Reports on some calls and refuses on others -- the case the "ANY slot refused"
+# invariant is actually about.
+KV_PARTIAL="$(make_stub kv_partial "100.0,100.5,101.0" 40.0 "$TOKENS_MAIN" "" "" "partial")"
+# Neither a byte count nor the `n/a` refusal.
+KV_NAN="$(make_stub kv_nan "100.0,100.5,101.0" 40.0 "$TOKENS_MAIN" "" "" "nan")"
 KV_ABSENT="$(make_stub kv_absent "100.0,100.5,101.0" 40.0 "$TOKENS_MAIN")"
 
 # Nothing on this host counts as busy unless a case says otherwise; the CPU
@@ -211,7 +223,7 @@ check planted_memory 0 \
 
 check planted_kv_residency 0 \
 	"a 2x resident-KV arm is reported as ratio 2.0000, in MB" \
-	--binary-a "$KV_SMALL" --binary-b "$KV_BIG" --allow-null-arms "${COMMON[@]}" "${QUIET[@]}" \
+	--binary-a "$KV_SMALL" --binary-b "$KV_BIG" "${COMMON[@]}" "${QUIET[@]}" \
 	"GREP:kv_cache_bytes      A median=1000\.0 MB  B median=2000\.0 MB  ratio B/A=2\.0000" \
 	"GREP:result: "
 
@@ -236,14 +248,30 @@ fi
 # is the shape of every silent-fallback defect this repo has had to unpick.
 check kv_residency_refusal_is_not_zero 0 \
 	"a slot whose KV accounting refused reports n/a, never 0" \
-	--binary-a "$KV_NA" --binary-b "$KV_BIG" --allow-null-arms "${COMMON[@]}" "${QUIET[@]}" \
+	--binary-a "$KV_NA" --binary-b "$KV_BIG" "${COMMON[@]}" "${QUIET[@]}" \
 	"GREP:kv_cache_bytes      A median=n/a MB  B median=2000\.0 MB  ratio B/A=n/a" \
 	"NOGREP:A median=0\.0 MB"
 
 check kv_residency_absent_column_is_not_zero 0 \
 	"a binary that emits no KV column reports n/a, never 0" \
-	--binary-a "$KV_ABSENT" --binary-b "$KV_BIG" --allow-null-arms "${COMMON[@]}" "${QUIET[@]}" \
+	--binary-a "$KV_ABSENT" --binary-b "$KV_BIG" "${COMMON[@]}" "${QUIET[@]}" \
 	"GREP:kv_cache_bytes      A median=n/a MB  B median=2000\.0 MB  ratio B/A=n/a"
+
+# The invariant is "n/a if ANY slot refused", and an all-refuse stub cannot tell
+# that apart from "n/a if EVERY slot refused" -- both rules agree on it. Only a
+# mixture separates them.
+check kv_residency_any_refusal_taints_the_arm 0 \
+	"one refusing slot makes the whole arm n/a, not a median of the rest" \
+	--binary-a "$KV_PARTIAL" --binary-b "$KV_BIG" "${COMMON[@]}" "${QUIET[@]}" \
+	"GREP:kv_cache_bytes      A median=n/a MB  B median=2000\.0 MB  ratio B/A=n/a" \
+	"NOGREP:A median=1000\.0 MB"
+
+# awk reads a non-numeric token as 0, so an unrecognised spelling would become a
+# median of 0 bytes and record as the smallest cache ever measured.
+check kv_residency_non_numeric_refused 125 \
+	"a kv_cache_bytes token that is neither a number nor n/a is refused" \
+	--binary-a "$KV_NAN" --binary-b "$KV_BIG" "${COMMON[@]}" "${QUIET[@]}" \
+	"GREP:reported kv_cache_bytes=nan"
 
 # ---- does it stay quiet when there is nothing there? -------------------------
 

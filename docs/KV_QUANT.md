@@ -3265,11 +3265,22 @@ their quant store is not on the decode read path — the mirror is.
 packed store for every codec. It no longer builds one for a codec that reads
 only the mirror (`KvQuant::materialises_packed_store`), so `k8v4`, `tsym3` and
 `planar` now hold two bf16 mirrors and nothing else — resident KV **exactly
-equal to `none`**, byte for byte, at every context. Measured, not derived: at a
-3 770-token prompt `none`, `k8v8`, `k8v4`, `planar` and `tsym3` all report the
-identical `kv_cache_bytes` — **556 941 312** on Ternary-Bonsai-8B (`kv_h = 8`)
-and **31 629 312** on gemma-4-e2b (`kv_h = 1`, shared-KV), 5 codecs × 2
-architectures, no digit apart. What survives is the prefill cost of encoding a store nobody
+equal to `none`**, byte for byte. Measured — 5 codecs × 2 architectures × 2
+contexts, one `rmlx baseline --record` run per cell, 20 rows in `runs.db`.
+Within every cell `none`, `k8v8`, `k8v4`, `planar` and `tsym3` report the
+identical `kv_cache_bytes`:
+
+| model | prompt tok | `kv_cache_bytes`, all 5 codecs |
+|---|---:|---:|
+| Ternary-Bonsai-8B (`kv_h` 8) | 3 770 | 560 480 256 |
+| Ternary-Bonsai-8B | 31 553 | 4 657 250 304 |
+| gemma-4-e2b (`kv_h` 1, shared-KV) | 4 117 | 31 776 768 |
+| gemma-4-e2b | 34 355 | 217 559 040 |
+
+Two contexts is not "every context" — the derivation says it holds at all of
+them because a codec that builds no store has nothing that can scale — but the
+two that were measured are 8× apart and span both `kv_h` regimes. What survives
+is the prefill cost of encoding a store nobody
 reads (`tsym3` TTFT 23.1 s vs `none` 19.2 s at 32k) and the decode-time cost of
 carrying a quantized layer type at all (≈0.041 ms/layer/step — see
 "`--kv-quant none` is a bf16 control").
@@ -3288,7 +3299,9 @@ much of decode any KV-codec change can possibly touch, and
 `scripts/perf_ceiling.py` prints it in the last column of every row.
 
 **It is a property of the (model, context) pair, not of the context.** At a
-4096-token prompt it spans 22× across the release set:
+4096-token prompt it spans 22× across the release set. This table is a **static
+prediction** — `perf_ceiling.py` over `config.json` plus the safetensors index,
+no model launched — unlike the measured cells below it:
 
 | model | 4 096 | 8 192 | 32 768 | 131 072 |
 |---|---:|---:|---:|---:|
@@ -3303,23 +3316,39 @@ second. A 2-bit 8B model at a 4k prompt already puts 22% of its decode bytes on
 the codec axis; a dense 27B at 131k puts 25%.
 
 **A large `kv_frac` is necessary, not sufficient.** Measured on this tree,
-`none` vs `mixed_k8g64_v4g64` ABBA-paired (`scripts/perf_ab.sh`, n=4/arm,
-TAINTED host — see docs/PERF_BASELINE.md for the cells and the taint):
+`none` vs `mixed_k8g64_v4g64` ABBA-paired (`scripts/perf_ab.sh`, n=4/arm; the
+two Qwen3.8 cells untainted at 7.0–7.3 % foreign CPU, the two Bonsai cells
+tainted only by a monitoring process at their entry gate — see
+docs/PERF_BASELINE.md for per-cell conditions and spreads):
 
 | model | prompt tok | `kv_frac` | predicted ceiling B/A | measured decode B/A | measured resident B/A |
 |---|---:|---:|---:|---|---:|
-| Ternary-Bonsai-8B | 3 770 | 0.211 | 1.099 | 0.949 INCONCLUSIVE | 1.287 |
-| Ternary-Bonsai-8B | 31 553 | **0.687** | **1.419** | 1.003 INCONCLUSIVE | 1.293 |
-| Qwen3.8-27B | 3 892 | 0.010 | 1.004 | 1.005 INCONCLUSIVE | 1.219 |
-| Qwen3.8-27B | 130 848 | 0.245 | 1.149 | **0.728 ranges disjoint** | 1.349 |
+| Ternary-Bonsai-8B | 3 770 | 0.211 | 1.099 | 0.975 ranges disjoint | 1.287 |
+| Ternary-Bonsai-8B | 31 553 | **0.687** | **1.419** | 1.002 INCONCLUSIVE | 1.293 |
+| Qwen3.8-27B | 3 892 | 0.010 | 1.004 | 0.977 SEPARATED | 1.219 |
+| Qwen3.8-27B | 130 848 | 0.245 | 1.149 | **0.763 SEPARATED** | 1.349 |
 
 Two rows carry the argument. The Bonsai **31 553** row is the high-`kv_frac`
-end: at 0.687 — the largest any release-set model reaches — a codec that cuts
-the decode KV stream to 0.571× and is predicted +42% moves decode by +0.3%,
-inside the noise, while costing +29% resident KV. The Qwen3.8 **130 848** row
-is the long-context end: `kv_frac` 0.245, predicted +14.9%, measured **−27.2%
-with the arms' per-slot ranges disjoint in the losing direction**, and +35%
-resident.
+end: at 0.687 — the largest any release-set model reaches *at a context this
+tree can serve*; the static table above projects 0.901 for the same model at
+131 072, which no measured cell reaches — a codec that cuts the decode KV
+stream to 0.571× and is predicted +42% moves decode by +0.3%, inside the noise,
+while costing +29% resident KV — a null with the power to have seen a 1%
+effect, since the arm spreads there are 0.04% and 0.15%. The Qwen3.8
+**130 848** row is the long-context
+end: `kv_frac` 0.245, predicted +14.9%, measured **−23.7% with the arms'
+per-slot ranges disjoint in the losing direction**, and +35% resident
+whole-cache — which on that hybrid arch understates the attention-KV ratio,
+1.355 excluding its codec-independent GDN state.
+
+**Scope on arm B.** It is `mixed_k8g64_v4g64` as it stands here: still
+materialising a packed store *and* retaining both bf16 seeds, because the change
+that stopped building a store for a mirror-fed codec excluded the Mixed / RotK
+family (whose decode does read its store). Its **resident** figures are
+therefore pre-seed-elision and say nothing about a seed-elided variant. Its
+**decode** figures need no such variant — returning an unread seed frees memory,
+it does not speed a quantized-matmul decode — so the throughput result stands
+for the family either way.
 
 The byte model is not what is wrong. At those offsets `perf_ceiling.py` puts
 arm A's resident KV at 4 667.3 MB against 4 667.3 MB measured on Bonsai, and on
@@ -3327,9 +3356,9 @@ Qwen3.8 it is exact once the codec-independent GDN recurrent state that arch
 carries (a flat ~152–154 MB, identical on both arms at both contexts) is added
 back. What fails is the conversion of bytes into time — the ε of the section
 above, ≈0.04–0.135 on every path measured — and at the Qwen3.8 long cell the
-packed path does not merely fail to convert: it spends 48.8 ms/step of
-non-bandwidth work against `none`'s 14.7 ms, so halving the byte stream still
-loses.
+packed path does not merely fail to convert: its non-bandwidth per-step cost
+grows 12.0 → 44.2 ms between 3 892 and 130 848 tokens while `none`'s stays flat
+at 10.5 → 14.7, so halving the byte stream still loses.
 
 Read together with the ε table: **`kv_frac` bounds the prize, ε decides how much
 of it is collectable, and ε is the binding term.** State `kv_frac` next to a
