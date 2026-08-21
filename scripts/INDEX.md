@@ -90,6 +90,7 @@ Conventions:
 | `ingest/llama_bench_ingest.py` | Convert `llama-bench -o json` rows into the §8.5 universal RunRecord and ingest them. |
 | `ingest/llama_ab_ingest.py` | Promote one accepted `bench_llama_ab.sh` result into two §8.5 RunRecords (one per arm). Refuses a TAINTED run unless told otherwise. |
 | `ingest/perf_ab_ingest.py` | Promote one accepted `perf_ab.sh` result into two §8.5 RunRecords (one per arm), carrying `decode_tps_warm` + `kv_cache_bytes`. Identity comes from the measured binary and is digest-checked against the run; refuses a TAINTED run, a weakened interference gate, or a cell key that disagrees with the measurement. |
+| `ingest/codec_inertness_ingest.py` | Promote `bench/codec_inertness_probe.sh` cells into §8.5 RunRecords. Records `kv_cache_bytes` only — the probe's unpaired throughput columns are not comparable and are deliberately dropped; the token-id digest travels in `notes`. |
 | `lib/identity.sh` | Shared §8.5 run-identity (`rmlx metrics identity --json`) for bench scripts. **Source it.** |
 | `lib/prefill_ms.py` | Read `decode_profile{prefill_ms}` back out of an rmlx run log. |
 
@@ -136,7 +137,8 @@ Conventions:
 | `bench/run_upstream_ppl.py` | Run `mlx_lm.evaluate` wikitext-PPL across the in-scope model set. |
 | `bench/build_ppl_drift_table.py` | Render the PPL × TPS × similarity-drift table. |
 | `bench/extract_outputs.py` | Extract per-(model, backend, quant) greedy-output tuples from CBB `summary.csv`. |
-| `bench/auto_resolution_smoke.py` | 5-model auto-resolution + regression smoke. Asserts every arch resolves `--kv-quant auto` to the one engine default, and that serving has not collapsed. |
+| `bench/auto_resolution_smoke.py` | 5-model auto-resolution + regression smoke. Asserts every arch resolves **both** `--kv-quant auto` and `--kv-preset auto` to the one engine default, and that serving has not collapsed. |
+| `bench/codec_inertness_probe.sh` | Per-codec `kv_cache_bytes` + greedy token-id digest + "packed store skipped" for one (model, prompt length). Separates a codec that changes something from one that is another spelling of `none`. |
 
 ## One-off assets
 

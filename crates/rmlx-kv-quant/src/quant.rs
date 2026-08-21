@@ -410,8 +410,9 @@ pub enum KvQuant {
 /// stops covering the newest codec, which is the shape of gate this repo has
 /// shipped before.
 ///
-/// `variants_are_exhaustive` pins the count against a `match` the compiler
-/// checks, so a variant added to the enum and not added here fails there.
+/// `all_kv_quants_names_every_variant_once` pins this list against
+/// [`KvQuant::variant_index`], a `match` the compiler checks for exhaustiveness,
+/// so a variant added to the enum and not added here fails there.
 pub const ALL_KV_QUANTS: &[KvQuant] = &[
     KvQuant::None,
     KvQuant::K8V4,

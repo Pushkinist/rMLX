@@ -833,8 +833,10 @@ store-reading codec it selected (`Mixed` on 2-bit Qwen3 dense) is bf16 plus a
 store - larger, lossy, and no faster. `docs/KV_QUANT.md` "The auto default"
 carries the measurement and the operator-visible consequences.
 
-Every codec stays selectable by name. `--kv-preset auto`, a separate
-hardware-aware selector the operator opts into explicitly, is unchanged.
+Every codec stays selectable by name. `--kv-preset auto` resolves to the same
+`DEFAULT_KV_QUANT`: the separate hardware-aware selector it used to run is
+removed, because every preset it could return holds resident KV byte-identical
+to bf16 - see `docs/KV_QUANT.md` "Codec disposition".
 
 
 ---

@@ -209,6 +209,35 @@
 use rmlx_kv_quant::KvQuant;
 use thiserror::Error;
 
+/// Emit `f` the first time this `(arch, codec)` pair is seen in the process.
+///
+/// The two honesty warnings below classify a *resolved codec*, and
+/// [`validate_resolved`] runs on every request — including each speculative
+/// scratch stack — so an operator serving under one of them would otherwise get
+/// the same paragraph per request for the process lifetime. The fact is about
+/// the configuration, not the request, so it is worth saying once and then
+/// being quiet. A codec the operator switches to mid-process is a new pair and
+/// warns again.
+///
+/// Deliberately not a knob: there is nothing to tune, and a suppressed-count
+/// tally would be a second thing to keep true.
+fn warn_once_per_codec(arch_class: &str, kq: &KvQuant, f: impl FnOnce()) {
+    use std::collections::BTreeSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    let key = format!("{arch_class}\u{1}{kq}");
+    let seen = SEEN.get_or_init(|| Mutex::new(BTreeSet::new()));
+    // A poisoned lock must not silence the warning or abort a resolve: fall
+    // back to warning again rather than to warning never.
+    let first = match seen.lock() {
+        Ok(mut g) => g.insert(key),
+        Err(_) => true,
+    };
+    if first {
+        f();
+    }
+}
+
 // ── ParseError ────────────────────────────────────────────────────────────────
 
 /// Error returned by [`parse`].
@@ -1629,16 +1658,48 @@ pub fn validate_resolved(arch_class: &str, kq: &KvQuant) -> Result<(), ResolveEr
     // families) are honestly surfaced here with a loud structured warn so the
     // 30–60× cost is never silent. These codecs still produce correct output
     // and are not rejected — only flagged.
+    //
+    // The suggestion is deliberately a codec that reads its own packed store:
+    // naming one of the mirror-fed codecs here would be advice to swap a slow
+    // no-op for a fast one, which is not what the operator asked for.
     if let Some(reason) = kq.cpu_hot_path_reason() {
-        tracing::warn!(
-            arch = arch_class,
-            kv_quant = %kq,
-            reason,
-            "KV codec runs its encode + dequant on CPU on the default hot path — \
-             expect a slow first forward and decode that slows as KV grows. \
-             This is NOT a Metal kernel. \
-             Pick a Metal codec (k8v4 / k8v8 / planar / rot_k_v4g64) to avoid this."
-        );
+        warn_once_per_codec(arch_class, kq, || {
+            tracing::warn!(
+                arch = arch_class,
+                kv_quant = %kq,
+                reason,
+                "KV codec runs its encode + dequant on CPU on the default hot path — \
+                 expect a slow first forward and decode that slows as KV grows. \
+                 This is NOT a Metal kernel. \
+                 Pick a Metal codec that reads its own store \
+                 (mixed_k8g64_v4g64 / rot_k_v4g64 / k_iso4) to avoid this."
+            );
+        });
+    }
+
+    // Arch-agnostic honesty check, same warn-and-proceed posture as the one
+    // above: a codec whose decode reads the bf16 mirror never has its packed
+    // store built (`exit_prefill` skips it), so naming it changes neither the
+    // resident KV nor a single generated token. Measured on two architectures
+    // and two contexts: identical `kv_cache_bytes` and identical greedy token
+    // ids against `none`, for every codec in this class.
+    //
+    // Not an error. The names stay selectable — they appear in recorded bench
+    // rows, and each is the entry point its codec's decode kernel will be wired
+    // to. But an operator who passes one is entitled to know it did nothing,
+    // rather than reading a resolved-codec log line and inferring that it did.
+    if *kq != KvQuant::None && !kq.materialises_packed_store() {
+        warn_once_per_codec(arch_class, kq, || {
+            tracing::warn!(
+                arch = arch_class,
+                kv_quant = %kq,
+                "KV codec is inert on this build — decode reads the bf16 mirror, so its \
+                 packed store is never built. Resident KV and generated tokens measure \
+                 identical to `--kv-quant none`, and decode throughput against it is \
+                 INCONCLUSIVE. Selecting it is not known to cost anything either — it \
+                 simply does not do what the name says."
+            );
+        });
     }
 
     Ok(())

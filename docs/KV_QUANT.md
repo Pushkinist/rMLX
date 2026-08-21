@@ -1861,18 +1861,27 @@ resolution needed at runtime.
 `--cache-type-k`, `--cache-type-v`, and `--kv-bits`. Passing any combination
 is a clap hard error (caught before the subcommand body runs).
 
-#### Starter preset table
+#### Preset table
 
 | Name | `KvQuant` | Notes |
 |---|---|---|
 | `fp16` | `KvQuant::None` | bf16 unquantized both sides (`KvQuant` variant named `None`, not `Option::None`) |
 | `q8` | `KvQuant::K8V8` | symmetric 8-bit K+V |
-| `speed` | `KvQuant::K8VTurbo3` | rMLX Lloyd-Max 3-bit V; matches mtq `turbo3` spirit |
+| `speed` | `KvQuant::TurboSym3` | symmetric WHT-3 K+V, matches mtq `speed`; rejected on Qwen MoE |
 | `quality` | `KvQuant::TurboSym4` | symmetric WHT-4 K + tq4 V, matches mtq `quality` byte-for-byte; rejected on Qwen MoE arch guard |
 | `planar` | `KvQuant::Planar` | PlanarQuant V-side |
+| `planar3` | `KvQuant::Planar3` | PlanarQuant 3-bit V-side |
+| `k_only_planar` | `KvQuant::PlanarK` | PlanarQuant K-side, V bf16; rejected on Qwen MoE |
 
-Future presets include: `balanced`, `max_compression`, `k_only_iso`,
-`agents_8x16k`, `rot_k_quality`.
+**None of the six non-`fp16` rows changes resident KV or output.** Each resolves
+to a codec in the inert class (§"Codec disposition"): decode reads the bf16
+mirror, so `exit_prefill` never builds the packed store, and the served request
+holds the same bytes and emits the same token ids as `fp16`. A preset is a
+codec name, not a memory setting. `no_preset_is_a_memory_lever` pins that claim
+and fails the moment a preset's codec starts reading its own store.
+
+No preset is planned. A new row is worth adding only once its codec's decode
+reads its own packed store; before that it is another spelling of `fp16`.
 
 #### Preset semantics — divergence from mtq
 
@@ -1892,90 +1901,37 @@ rmlx serve --model <path> --kv-preset fp16
 rmlx serve --model <path> --kv-preset q8
 rmlx baseline --model <path> --kv-preset speed
 rmlx info --model <path> --kv-preset planar
-rmlx baseline --model <path> --kv-preset auto    # hardware-aware auto-selector
+rmlx baseline --model <path> --kv-preset auto    # == --kv-quant auto
 ```
 
-### Auto-selector — `--kv-preset auto`
+### `--kv-preset auto`
 
-`--kv-preset auto` runs the hardware-aware preset recommender at startup,
-before any model is loaded. It avoids choosing a preset that requires more
-VRAM than the system has.
+`--kv-preset auto` resolves to `rmlx_models::kv_cache::DEFAULT_KV_QUANT` — the
+same constant `--kv-quant auto` resolves to, read from the same place. It does
+not consult the preset table and does not look at the hardware.
 
-#### Decision tree
-
-```
-model_bytes   = model_size_b × 2e9          (bf16 weights, SI bytes)
-kv_bf16_bytes = model_size_b × ctx_tokens × 1e6   (rough KV-cache at bf16)
-total_bf16    = model_bytes + kv_bf16_bytes
-vram_budget   = available_vram_gb × 1e9 × 0.70  (70% safe utilisation cap)
-
-if total_bf16        < budget → "fp16"           (unquantised)
-if model + kv/2      < budget → "q8"             (8-bit K+V)
-if model + kv/4      < budget → preferred_4bit() (quality → q8)
-if model + kv/8      < budget → preferred_2bit() (max_compression → balanced → quality → q8)
-else                           → preferred_2bit() (least-bad; warns in log)
-```
-
-The factor `1e6` in `kv_bf16_bytes` is a per-token KV footprint constant
-calibrated for 7–70 B transformer layers at bf16.  The 70% utilisation cap
-leaves headroom for activations, Metal command buffers, and the OS.
-
-#### Fallback table
-
-`preferred_4bit()` and `preferred_2bit()` walk the available preset table
-at runtime so that as future presets land, the auto-selector automatically uses
-them without code changes.
-
-| Preference tier | Tries in order |
-|---|---|
-| 4-bit (preferred_4bit) | `quality`, `q8` |
-| 2-bit (preferred_2bit) | `max_compression`, `balanced`, `quality`, `q8` |
-
-Under the current starter preset set (no `max_compression`/`balanced` yet),
-`preferred_2bit` falls through to `quality`.
-
-#### Hardware query
-
-Unified DRAM is queried via `sysctl hw.memsize` — the same value shown in
-"About This Mac". On Apple Silicon, CPU and GPU share the same DRAM pool.
-If the sysctl call fails (returns `None`), the auto-selector falls back to
-a conservative 8 GB.
-
-#### Model-size estimation
-
-Model parameter count is estimated from `config.json` using the transformer
-heuristic `hidden_size² × num_hidden_layers × 12 / 1e9 B`. Resolution order:
-1. `text_config.hidden_size` + `text_config.num_hidden_layers` (Gemma4/multimodal).
-2. Top-level `hidden_size` + `num_hidden_layers` (Qwen3/Bonsai flat layout).
-
-If neither field is available, the selector falls back to 7.0 B.
-
-#### Log pattern
-
-Startup logs include:
+It used to. Until the disposition below was measured, `auto` ran a decision tree
+over `sysctl hw.memsize` and an estimated parameter count, and returned a
+"compressing" preset when the model plus its bf16 KV would not fit:
 
 ```
-INFO auto-selector chose preset model_size_b=7.2 context_tokens=4096 vram_gb=137.4 preset="fp16"
-INFO --kv-preset resolved kv_quant=None
+if total_bf16   < budget → "fp16"
+if model + kv/2 < budget → "q8"
+if model + kv/4 < budget → "quality"
+...
 ```
 
-When the wanted preset is absent (future preset not yet landed), the selector
-falls back and emits:
+Every branch of that tree returns a preset that holds **byte-identical** resident
+KV to `fp16`. It answered a memory question with a codec that has no memory
+effect, and it did so silently — the operator saw `auto-selector chose preset
+q8` and had no way to learn that the choice changed nothing. Its own KV estimate
+was, by its docstring, 10–30× off, so it could not have been repurposed into a
+warning either. Both the tree and the two hardware queries that fed it
+(`unified_memory_gb`, `estimate_params_billions`) are gone.
 
-```
-WARN auto-selector wanted max_compression, fell back to q8 (preset max_compression not yet landed)
-```
-
-#### Context tokens
-
-The `context_tokens` input to the decision tree comes from (in order):
-1. `--max-ctx` override (if provided).
-2. `config.json` `max_position_embeddings` (model's native context window).
-3. Default 4096 when neither is available.
-
-Models with large native context windows (e.g. 131072) will appear to need
-more VRAM for their KV cache; passing `--max-ctx 4096 --kv-preset auto`
-caps the estimate to the actual deployment context.
+Two `auto` surfaces that resolve independently are two defaults that can
+disagree. `preset_auto_is_the_same_default_as_kv_quant_auto` pins that they no
+longer can.
 
 ### Per-side primitive interface
 
@@ -2861,10 +2817,10 @@ ninth and the only one that moves.
 
 Every codec remains selectable by name — `--kv-quant`, `--cache-type-k` /
 `--cache-type-v`, `--kv-bits`, `--kv-preset`. Nothing is deprecated or removed
-by this; only what `auto` resolves to is fixed. `--kv-preset auto` is a
-*different* thing and is unchanged: it is an explicit hardware-aware selector
-the operator opts into (§"Auto-selector — `--kv-preset auto`"), not the
-no-flag default.
+by this; only what `auto` resolves to is fixed. `--kv-preset auto` resolves to
+the same constant (§"`--kv-preset auto`"); the hardware-aware selector it used
+to run has since been removed, because every preset it could return holds
+resident KV byte-identical to bf16.
 
 `DEFAULT_KV_QUANT` is where a future answer changes. When fused decode over a
 quantised store becomes profitable, that constant moves — on a fresh
@@ -3355,43 +3311,205 @@ of these codecs to stop costing memory, but it is not sufficient to make a fused
 decode win, and on `kv_h == 1` it is not even close. Order kernel-shell work
 first; judge a store repack on its memory merits, not on an expected decode win.
 
-### The honest read on the mirror-fed codecs
+### Codec disposition — what every codec in the tree is for
 
-`k8v4` and `tsym3` still produce a token digest **bit-identical to `none`** at
-4k / 16k / 32k on both architectures. A q8/q4/turbo3 store cannot reproduce bf16
-output bit-exactly over 64 greedy steps at 32k, so this is direct evidence that
-their quant store is not on the decode read path — the mirror is.
+The KV enum spells **28 codecs**. This section gives each one an explicit
+disposition and the evidence behind it. "Nobody selects it" is not a
+disposition; the classes below are.
 
-**The resident-bytes half of that charge no longer applies.** It used to read
-"+26% and +16% at 32k on Bonsai", from a tree where `exit_prefill` built a
-packed store for every codec. It no longer builds one for a codec that reads
-only the mirror (`KvQuant::materialises_packed_store`), so `k8v4`, `tsym3` and
-`planar` now hold two bf16 mirrors and nothing else — resident KV **exactly
-equal to `none`**, byte for byte. Measured — 5 codecs × 2 architectures × 2
-contexts, one `rmlx baseline --record` run per cell, 20 rows in `runs.db`.
-Within every cell `none`, `k8v8`, `k8v4`, `planar` and `tsym3` report the
-identical `kv_cache_bytes`:
+The classification is not prose. `KvQuant::materialises_packed_store` is the
+predicate the runtime dispatches on, `quant_tests.rs::DISPOSITIONS` names all
+28 by hand, and `every_codec_carries_a_disposition` fails when the two
+disagree. A variant added to the enum cannot reach `ALL_KV_QUANTS` without
+being classified.
 
-| model | prompt tok | `kv_cache_bytes`, all 5 codecs |
-|---|---:|---:|
-| Ternary-Bonsai-8B (`kv_h` 8) | 3 770 | 560 480 256 |
-| Ternary-Bonsai-8B | 31 553 | 4 657 250 304 |
-| gemma-4-e2b (`kv_h` 1, shared-KV) | 4 117 | 31 776 768 |
-| gemma-4-e2b | 34 355 | 217 559 040 |
+#### The measurement
 
-Two contexts is not "every context" — the derivation says it holds at all of
-them because a codec that builds no store has nothing that can scale — but the
-two that were measured are 8× apart and span both `kv_h` regimes. What survives
-is the prefill cost of encoding a store nobody
-reads (`tsym3` TTFT 23.1 s vs `none` 19.2 s at 32k) and the decode-time cost of
-carrying a quantized layer type at all (≈0.041 ms/layer/step — see
-"`--kv-quant none` is a bf16 control").
+`scripts/bench/codec_inertness_probe.sh`, one `rmlx baseline` per codec at
+temperature 0, `--max-tokens 100`: 27 codec spellings × 2 architectures × 2
+contexts, 108 runs, all exit 0. Two architectures on purpose — gemma-4-e2b is
+`kv_h == 1` with shared-KV and sliding-window layers, Ternary-Bonsai-8B is
+`kv_h == 8` dense — because a KV result at one shape is not a result at the
+other.
 
-That remains a real defect. What the table above rules out is the *specific*
-remedy of pointing a hand-written flash-decode kernel at those stores: it has
-been built twice — TurboFlash for `k8v4`, the iso/rotor flash-decode pair for the
-eight `_sym` / K-only codecs — and both lose, for a reason that is structural and
-now quantified.
+27 spellings, not 28 variants: the four parameterised families are driven at
+one representative parameter set each, and `rotor_k_3_asym_v*_g*` is left to
+`disposition_is_a_property_of_the_family_not_its_parameters`, which pins that
+the classification cannot move with the parameters. Every unit-variant codec
+was served.
+
+Both reported quantities are load-independent: `kv_cache_bytes` is a byte
+count and the digest is over token **ids**, not text. No throughput claim is
+made here; the probe's `decode_tps` column is single unpaired runs on a shared
+host and is not comparable row to row (see `docs/PERF_BASELINE.md` for the
+conditions on this machine).
+
+| | gemma-4-e2b 4k | gemma-4-e2b 32k | Bonsai-8B 4k | Bonsai-8B 32k |
+|---|---:|---:|---:|---:|
+| `none` resident KV (B) | 32 194 560 | 217 976 832 | 570 507 264 | 4 667 277 312 |
+| codec spellings byte-identical **and** id-identical to `none` (incl. `none`) | 17 | 17 | 17 | 17 |
+| codec spellings larger than `none` | 10 | 10 | 10 | 10 |
+| codec spellings **smaller** than `none` | **0** | **0** | **0** | **0** |
+
+**No codec in the tree reduces resident KV, on either architecture, at either
+context.** That is the finding the dispositions follow from.
+
+#### Class 1 — the baseline (1 codec)
+
+`none`. bf16 both sides, the resolved `auto` default, the smallest resident KV
+measured, and the reference every other row is compared against.
+
+**Disposition: keep.** Nothing else is in this class, and
+`exactly_one_codec_is_the_baseline` keeps it that way.
+
+#### Class 2 — inert, mirror-fed (17 codecs)
+
+`k8v4`, `k8v8`, `planar`, `planar3`, `planar_k`, `k8vturbo3`, `k8vturbo3tcq`,
+`k8vturbo2`, `k8vturbo2tcq`, `tsym3`, `tsym4`, `iso3`, `iso4`, `rotor3`,
+`rotor4`, `rotor_k_3_asym_v*_g*`, `rotor_k_4_asym_v*_g*`.
+
+Decode reads the bf16 mirror on both axes, so `exit_prefill` skips the packed
+store and prefill never encodes one either — the codec math does not execute at
+all on a prefill-bracketed flow. That is a property of
+`KvQuant::decode_reads_packed_store`, checked by
+`exit_prefill_builds_a_store_exactly_when_the_predicate_says_so`. In all four
+cells every one of these reports the identical `kv_cache_bytes` and the
+identical 100-token id digest as `none`.
+
+The probe's `store_skipped` column corroborates and does **not** classify: it
+is set when *any* layer-cache in the run logged the skip, and the layer-adaptive
+head/tail promotion types some layers `K8V8`, so a store-*reading* codec sets it
+too — `mixed_k8g64_v4g64` does, on Ternary-Bonsai-8B, where 10 of 36 layers are
+promoted. Bytes and the id digest are the deciding columns.
+
+**These are equivalent to `none`, and unselected — not dominated.** The first
+draft of this section said "dominated, strictly better on one axis (it does not
+carry a quantised layer type through dispatch)". That axis does not survive
+measurement: the ~0.041 ms/layer/step figure it rests on was re-measured after
+the packed-store elision and is **INCONCLUSIVE at all five ABBA cells** — see
+"`--kv-quant none` is a bf16 control", which states in the same words that with
+the store gone "a `K8V8` layer is a `None` layer under another name". Nothing in
+this class costs anything a measurement here can see, and nothing in it buys
+anything either.
+
+So the honest reading, axis by axis: resident KV identical (4 cells, exact
+bytes); output token ids identical (4 cells); decode throughput INCONCLUSIVE
+(5 ABBA cells); TTFT INCONCLUSIVE (the mirror family's own spread at Bonsai-8B
+32 768 is 18 320–20 582 ms, wider than any gap inside it). An operator who
+passes `--kv-quant iso3` gets bf16 KV under another name — no better, no worse,
+just not what the name says — which is why `validate_resolved` says so at
+`warn!` and why no `--kv-preset` row is described as a memory setting any more.
+
+**What this does to the dominated-vs-unused split.** The word belongs to
+Class 3, not here. On the axes anything is measured on, `none` is strictly
+smaller than every Class 3 codec (4 cells, 1.003×–1.541×) and not slower, so
+Class 3 *is* dominated by the baseline; Class 2 merely ties it. The two classes
+are still kept for different reasons — see each disposition — but the reason is
+not that one is beaten and the other is not.
+
+**Disposition: keep parseable and selectable; stop advertising.** Not deleted,
+for three reasons, in descending order of force:
+
+1. **The store is the re-enable path.** `exit_prefill` keeps a bulk-encode arm
+   for each of them behind the predicate. A codec that grows a decode kernel
+   over its own store flips one arm in `decode_reads_packed_store` and the arm
+   fills the buffer that kernel reads. Deleting the codec deletes the landing
+   site, and the algorithm is not what failed — see "the tension", below.
+2. **Recorded rows must stay readable.** `observations` is append-only and
+   metrics labels are free-form; a name that has been recorded has to keep
+   parsing after it stops being recommended.
+3. **The widest-matrix goal.** CLAUDE.md names the rotation KV families as a
+   differentiator. Removing them would narrow the matrix without making
+   anything true.
+
+Two pairs inside this class are *exact duplicates* of each other rather than
+merely equivalent to `none`: the decoder of `k8vturbo3tcq` is bit-for-bit the
+plain `k8vturbo3` decoder and only the encode-time assignment differs, so while
+the encode never runs the two names are one behaviour; likewise `k8vturbo2tcq`
+and `k8vturbo2`. They are fold candidates the day a turbo decode kernel lands,
+and indistinguishable today.
+
+#### Class 3 — reads its own packed store (10 codecs)
+
+`mixed_k<kb>g<kg>_v<vb>g<vg>`, `rot_k_v<vb>g<vg>`, `iso3_sym`, `iso4_sym`,
+`k_iso3`, `k_iso4`, `rotor3_sym`, `rotor4_sym`, `k_rotor3`, `k_rotor4`.
+
+These are the only codecs whose quantization a served request touches. Every
+one of them is **larger** than bf16, in all four cells:
+
+| codec | e2b 4k | e2b 32k | Bonsai 4k | Bonsai 32k |
+|---|---:|---:|---:|---:|
+| `k_iso3` / `k_iso4` | 1.015× | 1.003× | 1.027× | 1.007× |
+| `iso3_sym` / `iso4_sym` | 1.029× | 1.007× | 1.054× | 1.013× |
+| `k_rotor3` / `k_rotor4` | 1.154× | 1.167× | 1.159× | 1.131× |
+| `rotor3_sym` / `rotor4_sym` | 1.309× | 1.334× | 1.317× | 1.262× |
+| `mixed_k8g64_v4g64` | 1.339× | 1.396× | 1.287× | 1.293× |
+| `rot_k_v8g64` | 1.541× | 1.533× | 1.384× | 1.384× |
+
+The iso / rotor rows are the ring-layout result restated on real serving: a
+per-group `f32` scale beside each packed word puts 16.25–21.75 bits on the
+store per value against bf16's 16.0, so the family cannot win on bytes at any
+finite head dim. The `mixed` / `rot_k` rows still carry both bf16 seeds beside
+their store, which is a separate, unlanded elision; their decode result does
+not depend on it (returning an unread seed frees memory, it does not speed a
+quantized-matmul decode) and is measured at 0.763× of `none` at 130 848 tokens
+with the arms' ranges disjoint.
+
+**Disposition: keep, unchanged, and do not treat as memory levers.** These
+*are* dominated by `none` on the measured axes — strictly larger resident KV in
+all four cells, and for `mixed` also slower (0.763× at 130 848 tokens, ranges
+disjoint). They are kept anyway, and the reason is not that they are competitive:
+they are the only codecs in the tree that decode over a packed store at all, so
+they are the substrate any fused-decode work has to stand on, and a dominated
+codec with a function is not the same object as a beaten one with none.
+
+Being dominated today is a statement about the ring layout and about ε (the
+byte-to-time conversion efficiency, ≈0.04–0.135 on every path measured, and
+shared with a non-MLX runtime on the same hardware), not about the codecs.
+
+Four **within-family** dominations are measured here, and they are exact:
+`iso3_sym` and `iso4_sym` are byte-identical in all four cells, as are
+`k_iso3`/`k_iso4`, `rotor3_sym`/`rotor4_sym` and `k_rotor3`/`k_rotor4`. The
+3-bit member of each pair therefore buys nothing over the 4-bit member and
+carries measurably worse distortion. They are the tree's only strictly
+dominated-by-a-sibling codecs and the first fold candidates, tracked
+separately; the pairing is recorded here because the probe shows it at four
+cells rather than at a fixture.
+
+#### The tension with the widest-matrix goal
+
+CLAUDE.md sets out to ship "the widest weight × KV quantization matrix MLX can
+express, including rotation-based KV families no other MLX server ships". A
+disposition that retired codecs would be in direct tension with that, and the
+tension is not resolved by preferring one side.
+
+What the evidence indicts is **the ring layout and the byte-to-time
+conversion**, not the algorithms. The scale-beside-the-word layout is what puts
+iso/rotor above 16 bits per value; a layout that packs scales separately is
+unbuilt and open. ε is a platform property — an independent runtime's fused
+decode over a quantised KV store loses ~30% on the same hardware, and its
+efficiency is statistically the same as this tree's best kernel — so "our codec
+implementation is bad" is not what the numbers say. Deleting a codec would
+remove a differentiator on evidence that convicts something else.
+
+So the matrix stays whole, and what changes is the **claim**: rMLX ships 28 KV
+codecs, 17 of which are presently inert and 10 of which are presently larger
+than bf16, and it says so in `--help`, in a resolve-time `warn!`, and here.
+That is the honest form of the same capability. A codec matrix nobody can be
+misled by is worth more than one name fewer.
+
+#### What this disposition does not decide
+
+* **Whether any codec should eventually be deleted.** That turns on whether the
+  re-enable path can be made to pay. It is decided by a fused decode kernel over
+  a packed store that beats bf16 at a context this tree can serve — not by
+  another residency measurement, which is now saturated at "no codec is
+  smaller".
+* **Whether a better ring layout clears 16 bits/value for iso/rotor.** Nothing
+  measured here touches it; the layout, not the algorithm, is what fails.
+* **Which member of a byte-identical 3-bit/4-bit pair survives a fold.** The
+  bytes are settled (identical); the distortion comparison that would pick a
+  survivor is a fidelity question, not a residency one.
 
 ### `kv_frac` bounds a codec claim — and is not a statement about context
 
