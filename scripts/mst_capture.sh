@@ -311,7 +311,7 @@ fi
 # its exit code is load-bearing here.
 if [ $rc -ne 0 ]; then
 	echo "ERROR: summarising $xml failed (exit $rc)" >&2
-	echo "  Read WHICH refusal it printed — they mean opposite things:" >&2
+	echo "  Read WHICH refusal it printed — they mean different things:" >&2
 	echo "  * 'contains no rows'  -> the recording captured nothing from any" >&2
 	echo "    process. The recording failed; the workload is not implicated." >&2
 	echo "  * 'holds N rows but none for a process matching ...' -> the" >&2
@@ -319,6 +319,10 @@ if [ $rc -ne 0 ]; then
 	echo "    processes it did see. Re-run the workload directly to check it" >&2
 	echo "    reaches the GPU at all:" >&2
 	echo "      ${run_cmd[*]}" >&2
+	echo "  * 'the N ms skip removed every one of the M rows ...' -> the" >&2
+	echo "    process IS in the recording and --skip-ms cut past its work." >&2
+	echo "    Lower --skip-ms or raise --time-limit; do not re-run to debug" >&2
+	echo "    the workload." >&2
 	exit $rc
 fi
 

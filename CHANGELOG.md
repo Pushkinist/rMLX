@@ -447,9 +447,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the tied `lm_head` (all four models set `tie_word_embeddings`), the per-arch
   auxiliaries — and KV traffic entirely, while being divided into a decode rate
   measured at a 4 096-token prompt. Replaced with a tensor census from
-  `scripts/perf_ceiling.py` (`config.json` + safetensors headers, KV term from
-  the engine's own accounting), with the invocation recorded so the row is
-  re-checkable without a device. The correction is not a constant bias: three
+  `scripts/perf_ceiling.py` (`config.json` + safetensors headers), with the
+  invocation recorded so the row is re-checkable without a device. The KV term
+  is a **second producer** — the script transcribes
+  `decode_reads_packed_store`, `feeds_bf16_{k,v}_at_decode` and
+  `kv_quant_for_layer` into Python by hand and nothing gates the two copies
+  against each other, which the doc now states rather than calling the term
+  "the engine's own accounting". The correction is not a constant bias: three
   ceilings fall and Qwen3.6-35B's rises 9%, because 30 of its 40 layers are GDN
   and hold no attention projections. The band tightens from 1.84x–2.66x to
   1.69x–2.15x, dissolving the reading that Bonsai is a factor-of-1.4 outlier
@@ -513,12 +517,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   then annotated with "the run itself failed", sending the reader to re-run a
   workload that is fine. `XctraceError::NoRowsForProcess` is the second case
   and carries the row count and the process census the recording *did* see, on
-  both the plain and the `--skip-ms` entry branch. This is the diagnostic that
-  would have identified the four zero-row recordings above as failed
-  recordings.
+  both the plain and the `--skip-ms` entry branch. A third state,
+  `SkipRemovedEveryRow`, covers the case those two cannot describe honestly: the
+  process IS in the recording and `--skip-ms` cut past its work.
+  `SkipExceedsSpan` does not subsume it — that guard fires on
+  `origin >= max(start + duration)`, so one long submission straddling the
+  origin keeps it silent while every row's `start` is below the floor, and the
+  refusal would otherwise claim the process was absent while printing its own
+  row count in the census. This is the diagnostic that would have identified the
+  four zero-row recordings above as failed recordings.
 
 - **`--kv-preset auto` resolves to `DEFAULT_KV_QUANT`, the same constant
-  `--kv-quant auto` resolves to.** It previously ran its own resolver — a
   `--kv-quant auto` resolves to.** It previously ran its own resolver — a
   decision tree over `sysctl hw.memsize` and a `config.json` parameter estimate
   that returned a "compressing" preset when the model plus its bf16 KV would not

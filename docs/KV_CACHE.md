@@ -1462,7 +1462,11 @@ prompt registry, `bests` view, query API).
 
 - llama.cpp 4-bit KV cache discussion: <https://github.com/ggml-org/llama.cpp/pull/5932>
 - MLX `mx.quantize` API reference: <https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.quantize.html>
-- ParoQuant (z-lab): <https://github.com/z-lab/paroquant>
-- IsoQuant (ParaMind2025): <https://github.com/ParaMind2025/isoquant>
+- ParoQuant (z-lab): <https://github.com/z-lab/paroquant> — a **weight**
+  quantizer (pairwise-rotation INT4). Listed here for the rotation math, not as
+  a KV reference: its upstream repo has no KV-cache surface at all.
+- IsoQuant (ParaMind2025): <https://github.com/ParaMind2025/isoquant> — SO(4)
+  isoclinic rotation, stage-1 quantize/dequantize only. No cache and no decode
+  path upstream, so rMLX's `iso*` KV codecs have no counterpart to port.
 - Metrics database operating rules: `docs/METRICS_DB.md`
 - Profiling runbook (samply, Instruments, dhat): `docs/PROFILING.md`

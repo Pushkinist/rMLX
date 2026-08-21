@@ -143,7 +143,8 @@ affine).
 
 ### KV quantization
 
-All `KvQuant` variants supported. Default: `K8V8`.
+All `KvQuant` variants supported. `auto` resolves to `DEFAULT_KV_QUANT`
+(unquantised bf16) here as on every arch; `K8V8` is opt-in.
 
 The Qwen2 KV cache is a standard full-attention layout (no SWA). All KV quant
 modes (`K8V4`, `K8V8`, `Planar`, `Mixed`, `RotK`) are accepted via
@@ -536,9 +537,11 @@ Full coverage. Known snapshot: `mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit`
 
 ### KV quantization
 
-Default: `bf16` (unquantized). K8V8 measurably degrades decode quality on this
-architecture at 4-bit weight quant — incoherent text and image output. Bf16 KV
-reproduces the mlx-vlm reference exactly.
+`auto` resolves to `DEFAULT_KV_QUANT` (unquantised bf16), which on this
+architecture is load-bearing rather than merely uniform: K8V8 measurably
+degrades decode quality at 4-bit weight quant — incoherent text and image
+output — while bf16 KV reproduces the mlx-vlm reference exactly. Do not
+override it here.
 
 All other `KvQuant` modes are mechanically available via CLI override, but are
 not validated as producing correct output.
@@ -668,10 +671,11 @@ vision + text).
 
 ### KV quantization
 
-Default: `Planar` (q8_g128 K + PlanarQuant 4-bit V with per-pair Hadamard
-rotation). The rotating SWA ring-buffer is active for sliding-attention layers;
-quantized modes fall back to the standard full-size cache for those layers
-(`with_quant_max_seq_window` semantics).
+`auto` resolves to `DEFAULT_KV_QUANT` (unquantised bf16) here as on every
+arch. The rotating SWA ring-buffer is active for sliding-attention layers
+**under every codec** — `with_quant_max_seq_window` branches on `window > 0`
+alone — so a quantized mode does not put those layers on a full-size path; only
+the full-attention layers are quantized.
 
 All `KvQuant` variants accepted.
 
@@ -1108,7 +1112,8 @@ tensor overrides are parsed from the inline `quantization` dict.
 
 ### KV quantization
 
-Default: `K8V8`. All `KvQuant` modes accepted.
+`auto` resolves to `DEFAULT_KV_QUANT` (unquantised bf16) here as on every
+arch; `K8V8` is opt-in. All `KvQuant` modes accepted.
 
 Note: per CLAUDE.md, Laguna is **out of scope for benchmarks and optimization
 work**. It is present for correctness coverage.
@@ -1201,7 +1206,8 @@ See [WEIGHT_QUANTS.md § Ternary / BitLinear](WEIGHT_QUANTS.md#ternary--bitlinea
 
 ### KV cache
 
-Default: `K8V8`. Effective max context: 4 096 tokens (from `max_position_embeddings`
+`auto` resolves to `DEFAULT_KV_QUANT` (unquantised bf16) here as on every
+arch; `K8V8` is opt-in. Effective max context: 4 096 tokens (from `max_position_embeddings`
 in config; capped at 4 096 by the loader).
 
 ### Limitations
@@ -1223,7 +1229,11 @@ Green. Validated against `mlx-community__bitnet-b1.58-2B-4T` (2026-05-28):
 - `/v1/completions` (legacy text-completion endpoint): not implemented server-side.
   Use `/v1/chat/completions` with an appropriate system prompt.
 
-**Performance note**: decode TPS is ~0.25× of the 127 TPS bandwidth ceiling. The
+**Performance note**: decode TPS is ~0.25× of the 127 TPS bandwidth ceiling — a
+nameplate figure, not a tensor census; `scripts/perf_ceiling.py` cannot produce
+one for this arch because the loader dequantizes ternary weights to BF16 while
+the safetensors headers it reads are packed `u8` (see `docs/PERF_BASELINE.md`).
+The
 gap is not bandwidth on LM-head/projections — it is Metal kernel dispatch overhead
 (~211 kernel launches per decode step). A Metal GEMV kernel would not close this
 gap; kernel fusion across per-layer projections would be required but is out of

@@ -187,7 +187,7 @@ pub enum XctraceError {
     /// a second pass the caller has to know to make.
     #[error(
         "'{schema}' holds {rows_total} rows but none for a process matching \
-         {filter:?}{after_skip} — the recording ran; this process was not in it. \
+         {filter:?} — the recording ran; this process was not in it. \
          Processes seen: {processes}"
     )]
     NoRowsForProcess {
@@ -199,8 +199,37 @@ pub enum XctraceError {
         filter: String,
         /// Process display names seen, with row counts, busiest first.
         processes: String,
-        /// `" after the requested skip"` when a skip was in force, else empty.
-        after_skip: String,
+    },
+
+    /// Rows for the requested scope exist, and the `skip_ms` floor removed all
+    /// of them.
+    ///
+    /// A third state, not a decoration on the other two. Reporting it as
+    /// [`Self::NoRowsForProcess`] is self-contradictory — the message would
+    /// claim the process is absent while printing that process's own row count
+    /// in the census — and reporting it as [`Self::NoRows`] loses the skip
+    /// entirely.
+    ///
+    /// [`Self::SkipExceedsSpan`] does **not** subsume it. That guard fires on
+    /// `origin_ns >= latest` where `latest` is `max(start + duration)`, so a
+    /// single long submission straddling the origin keeps it silent while every
+    /// row's `start` is below the floor.
+    #[error(
+        "the {skip_ms} ms skip removed every one of the {matched} rows recorded \
+         for {scope} in '{schema}' ({rows_total} rows total) — that work all \
+         starts before the skip origin; lower the skip or record for longer"
+    )]
+    SkipRemovedEveryRow {
+        /// Name of the parsed schema.
+        schema: String,
+        /// Rows in the table before any filter.
+        rows_total: u64,
+        /// Rows the scope matched before the skip floor was applied.
+        matched: u64,
+        /// The skip that was asked for, milliseconds.
+        skip_ms: u64,
+        /// What the rows were scoped to — a process filter, or the whole table.
+        scope: String,
     },
 
     /// The requested skip covers everything the matched process did.

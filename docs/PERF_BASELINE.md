@@ -1107,7 +1107,7 @@ k8vturbo3' (K=8-bit, V=turbo3).
 **Binary**: `target/release/rmlx` (debug-assertions on; ship-quality builds use release-perf — these numbers are the ceiling, not the floor).
 **Shape**: 2-token prompt ("Hello world") + `--max-tokens 100`. Single-MLX preflight between each run. Hardware: M5 Max.
 **Protocol**: 3 measured runs per (variant, model). Mean decode TPS reported. No warmup run (short prompt; first run included).
-**QJL flag**: default `on` (env not overridden). The K-only rotor variants (`k_rotor3`, `k_rotor4`) pay a per-token CPU encode + QJL sign computation cost; the symmetric variants (`rotor3_sym`, `rotor4_sym`) also pay for V-side rotor3/4 CPU dequant.
+**QJL flag**: `on` — the default at the time of this run, opt-in since (env not overridden). The K-only rotor variants (`k_rotor3`, `k_rotor4`) pay a per-token CPU encode + QJL sign computation cost; the symmetric variants (`rotor3_sym`, `rotor4_sym`) also pay for V-side rotor3/4 CPU dequant.
 
 Smoke gate: all four variants on Bonsai + Gemma4 ran end-to-end and produced coherent output (n_steps=63 for 64-token limit). Qwen3.6 errored with the A.y guard as expected (positive guard test) — quoted diagnostic:
 
@@ -1133,7 +1133,7 @@ Identical diagnostic for all four variants with variant name substituted. The co
 **Notes**:
 - Symmetric variants (`rotor3_sym` / `rotor4_sym`) match the corresponding V-only rotor anchors closely (~80–82 Gemma4, ~143–145 Bonsai), confirming the additional K-side rotor encode cost is amortised by the CPU decode path bottleneck.
 - K-only variants (`k_rotor3` / `k_rotor4`) are bottlenecked by the CPU-only rotor K-side decode + optional QJL projection. Bonsai shows wide cross-run variance (run 1 ~40 TPS, run 3 ~49 TPS) due to Metal graph JIT warm-up; Gemma4 is stable (~63–65 TPS). First run should not be treated as a regression floor.
-- **`k_rotor3/4` decode is now a fused MSL flash-decode** over the packed rotor store when `--rotor-qjl off` (`rotor_flash_decode`, see `docs/KV_QUANT.md`); the per-step full-prefix CPU dequant is gone. The anchors above are **not** superseded — they are 2-token short-prompt runs (§ below), where the prefix is empty and the dequant that this kernel removes costs nothing, so they measure a different thing. The kernel's effect scales with prefix length. Measured at a 4k prompt, `--rotor-qjl off`, medians of 3+ runs, before → after: Bonsai-8B `k_rotor3` 1.34 → **17.0**, `k_rotor4` 1.36 → **15.9**; medgemma-4B `k_rotor3` 7.37 → **51.8**, `k_rotor4` 7.34 → **52.1**. The default `--rotor-qjl on` path is unchanged (kernel dormant), as is Gemma4 (`update_and_sdpa_shared_source` never reaches the kernel).
+- **`k_rotor3/4` decode is now a fused MSL flash-decode** over the packed rotor store when `--rotor-qjl off` (`rotor_flash_decode`, see `docs/KV_QUANT.md`); the per-step full-prefix CPU dequant is gone. The anchors above are **not** superseded — they are 2-token short-prompt runs (§ below), where the prefix is empty and the dequant that this kernel removes costs nothing, so they measure a different thing. The kernel's effect scales with prefix length. Measured at a 4k prompt, `--rotor-qjl off`, medians of 3+ runs, before → after: Bonsai-8B `k_rotor3` 1.34 → **17.0**, `k_rotor4` 1.36 → **15.9**; medgemma-4B `k_rotor3` 7.37 → **51.8**, `k_rotor4` 7.34 → **52.1**. The `--rotor-qjl on` path is unchanged (kernel dormant) — it was the default when this was recorded and is opt-in now (§ line 206) — as is Gemma4 (`update_and_sdpa_shared_source` never reaches the kernel).
 - QJL toggle effect on Gemma4 `k_rotor3`: QJL ON = 66.5 TPS, QJL OFF = 73.2 TPS (encode cost). The QJL sideband is correctly stored / round-tripped; cosine lift on reconstructed K is deferred to a follow-up that applies QJL correction at score-time on the SDPA path.
 - All four variants are opt-in only — never an auto baseline.
 - Bonsai long-prompt (10867 tokens) fails with all quant variants (pre-existing SWA-layer zero-chunk bug). Use short prompt for this smoke.
@@ -1284,6 +1284,19 @@ section below).
 ### Profiling decision — Metal GEMV kernel
 
 BitNet at 31.6 TPS is at **0.25×** of its bandwidth ceiling (127 TPS at 614 GB/s).
+
+> **Ceiling provenance — nameplate, and the census cannot replace it here.**
+> The 127 TPS is the same nameplate arithmetic H2 replaced (≈2B params × bf16 ÷
+> 614 GB/s). `scripts/perf_ceiling.py` is **not applicable to this cell**: it
+> sizes weights from the safetensors headers, which for this checkpoint are
+> packed ternary `u8`, while `bitnet/loader.rs` dequantizes every weight to BF16
+> once at load (`dequant_trit_u8` → `Dtype::Bf16`). Run anyway it reports 1.179
+> GB/step and a 516 TPS ceiling — an ~8× undercount of what decode streams, in
+> the direction that would flatter the runtime. The nameplate figure is the
+> closer of the two *because* this model's runtime dtype is bf16 regardless of
+> its storage dtype. Neither number is a census; the decision below rests on the
+> dispatch count, not on the ratio.
+
 Root-cause analysis:
 
 - 211 Metal kernel launches per decode step (30 layers × 7 matmuls/layer + 1 LM head).
@@ -1440,9 +1453,8 @@ while the quotient was taken against a measurement made at a 4096-token prompt.
 
 The column above is a census instead: `config.json` plus the safetensors
 headers (dtype + shape per tensor, no tensor data read, no model launched, no
-GPU), with the KV term taken from the engine's own accounting rather than
-re-derived. It is produced by `scripts/perf_ceiling.py`, one invocation per
-row, and is re-checkable without a device:
+GPU). It is produced by `scripts/perf_ceiling.py`, one invocation per row, and
+is re-checkable without a device:
 
 ```sh
 scripts/perf_ceiling.py --model "$RMLX_O_MODELS_ROOT/<snapshot>" \
@@ -1468,14 +1480,27 @@ factor-of-1.4 outlier with arch-specific decode overhead worth hunting: most of
 its apparent excess was the missing KV term, 13.9% of its stream at this shape
 against under 7% for the other three.
 
-Three caveats the number carries. It counts bytes a decode step **must**
-stream, not bytes moved — cache residency, dequant scratch, MoE gather
-inefficiency and the gap between realized and peak bandwidth are all in the
-residual, which is what the ratio is for. 614 GB/s is this document's own host
-constant, carried over unverified. And the KV term inherits any error in
-`KvQuant::estimated_resident_bytes_per_layer` / `decode_read_bytes_per_layer`;
-it is a consistency win over an omitted term, not an independent measurement.
-`measured decode_tps` is unchanged — this revision moved only the denominator.
+**The KV term is a second producer, and nothing gates it against the first.**
+It is *not* read from the engine — `scripts/perf_ceiling.py` transcribes the
+Rust predicates into Python by hand:
+`KvQuant::decode_reads_packed_store`, `KvQuant::feeds_bf16_{k,v}_at_decode` and
+the per-layer promotion in `kv_quant_for_layer`, mirrored as
+`_DECODE_READS_PACKED_STORE`, `_NO_BF16_{K,V}` and `kv_quant_for_layer` in the
+script. The script says so itself and names the failure mode: when a codec is
+added or reclassified, both copies move together or this column is off "by a
+full store per layer, silently, in a direction that flatters the codec". That
+is the same shape as the cache-seed formula that drifted once a consumer crate
+could not depend on it. Diff the two whenever either moves; a divergence is
+invisible here and changes the ceiling, not just a caveat on it.
+
+Three further caveats. It counts bytes a decode step **must** stream, not bytes
+moved — cache residency, dequant scratch, MoE gather inefficiency and the gap
+between realized and peak bandwidth are all in the residual, which is what the
+ratio is for. 614 GB/s is this document's own host constant, carried over
+unverified. And even with the transcription correct, the column inherits any
+error in the Rust it mirrors; it is a consistency win over an omitted term, not
+an independent measurement. `measured decode_tps` is unchanged — this revision
+moved only the denominator.
 
 #### H2 addendum — the comparison envelope, measured locally (TAINTED host)
 

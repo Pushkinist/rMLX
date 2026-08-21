@@ -393,31 +393,23 @@ fn a_channel_with_no_latency_sample_reports_empty_not_zero() {
 }
 
 #[test]
-fn a_process_filter_matching_nothing_is_an_error_not_an_empty_summary() {
+fn a_table_with_rows_for_other_processes_says_so_and_names_them() {
     let err = summarise_gpu_intervals(&doc(ROWS_HAPPY), only("no-such-process"))
         .expect_err("a filter that selects nothing must be refused");
     assert!(
         matches!(err, XctraceError::NoRowsForProcess { .. }),
         "got {err}"
     );
-}
-
-/// A recording that captured nothing and a recording that captured other
-/// processes are different states with different remedies, and reporting both
-/// as "no rows" sends the reader to re-run a command that works. The table
-/// knows which one it is: `rows_total` and the process census are both in
-/// hand at the point of refusal.
-#[test]
-fn a_table_with_rows_for_other_processes_says_so_and_names_them() {
-    let err = summarise_gpu_intervals(&doc(ROWS_HAPPY), only("no-such-process"))
-        .expect_err("a filter that selects nothing must be refused");
     let text = err.to_string();
     assert!(
         text.contains("rmlx (99)"),
         "the refusal must name the processes the recording did see; got {text}"
     );
+    // `contains('2')` would pass on the census suffix "rmlx (99) (2 rows)"
+    // whatever `rows_total` is — the count has to be asserted where it is
+    // printed, not anywhere in the string.
     assert!(
-        text.contains('2'),
+        text.contains("holds 2 rows"),
         "the refusal must say how many rows the table held; got {text}"
     );
     // The empty-table wording would send the reader to re-run the workload.
@@ -427,9 +419,12 @@ fn a_table_with_rows_for_other_processes_says_so_and_names_them() {
     );
 }
 
-/// The `skip_ms > 0` entry takes its own pre-pass over the table, so the
-/// distinction has to hold on both branches or a `--skip-ms` run reports the
-/// wrong one.
+/// The `skip_ms > 0` entry takes its own pre-pass over the table, so an absent
+/// process has to be named as absent there too. This also pins the *ordering*
+/// the third state depends on: the pre-pass refuses a filter that matches
+/// nothing before any floor is applied, which is why `summarise_from` may read
+/// a non-zero floor as "the scope had rows". Let the pre-pass stop refusing and
+/// this test goes red with `SkipRemovedEveryRow`.
 #[test]
 fn the_skip_branch_reports_the_same_distinction() {
     let err = summarise_gpu_intervals(
@@ -445,6 +440,76 @@ fn the_skip_branch_reports_the_same_distinction() {
         "got {err}"
     );
     assert!(err.to_string().contains("rmlx (99)"), "got {err}");
+}
+
+/// One long submission straddling the skip origin keeps `SkipExceedsSpan`
+/// silent — it fires on `origin_ns >= latest`, and `latest` is
+/// `max(start + duration)` — while every row's `start` is below the origin, so
+/// the summary matches nothing. The process IS in the recording; only the skip
+/// removed its rows. Refusing that with "this process was not in it" while
+/// printing its own name in the census is a message that contradicts itself.
+const ROWS_LONG_STRADDLING_SUBMISSION: &str = "\
+<row>\
+<start-time id=\"1\" fmt=\"00:00.000\">0</start-time>\
+<duration id=\"2\" fmt=\"50.00 ms\">50000000</duration>\
+<duration id=\"3\" fmt=\"5.00 µs\">5000</duration>\
+<gpu-channel-name id=\"4\" fmt=\"Compute\">Compute</gpu-channel-name>\
+<process id=\"5\" fmt=\"rmlx (99)\"><pid id=\"6\" fmt=\"99\">99</pid></process>\
+</row>\
+<row>\
+<start-time id=\"7\" fmt=\"00:00.001\">1000000</start-time>\
+<duration id=\"8\" fmt=\"10.00 µs\">10000</duration>\
+<duration ref=\"3\"/>\
+<gpu-channel-name ref=\"4\"/>\
+<process ref=\"5\"/>\
+</row>";
+
+#[test]
+fn a_skip_that_removes_every_row_is_not_reported_as_an_absent_process() {
+    // origin = earliest(0) + 10 ms; both starts (0 and 1 ms) are below it, and
+    // latest = 0 + 50 ms > origin, so SkipExceedsSpan does not fire.
+    let err = summarise_gpu_intervals(
+        &doc(ROWS_LONG_STRADDLING_SUBMISSION),
+        SummaryFilter {
+            process: Some("rmlx"),
+            skip_ms: 10,
+        },
+    )
+    .expect_err("a skip that removes every matched row must be refused");
+    assert!(
+        matches!(err, XctraceError::SkipRemovedEveryRow { .. }),
+        "the process is present; only the skip emptied the window — got {err}"
+    );
+    let text = err.to_string();
+    assert!(
+        !text.contains("was not in it"),
+        "must not claim the process is absent while its rows exist; got {text}"
+    );
+    assert!(
+        text.contains("10 ms"),
+        "must name the skip it applied; got {text}"
+    );
+}
+
+/// The `process_filter == None` shape must still say a skip was in force. The
+/// pre-split code appended "after the requested skip" to the schema name and
+/// the first refactor dropped it, which is a regression in message truth that
+/// no assertion covered.
+#[test]
+fn an_unfiltered_summary_emptied_by_the_skip_still_names_the_skip() {
+    let err = summarise_gpu_intervals(
+        &doc(ROWS_LONG_STRADDLING_SUBMISSION),
+        SummaryFilter {
+            process: None,
+            skip_ms: 10,
+        },
+    )
+    .expect_err("a skip that removes every row must be refused with no filter too");
+    assert!(
+        matches!(err, XctraceError::SkipRemovedEveryRow { .. }),
+        "got {err}"
+    );
+    assert!(err.to_string().contains("10 ms"), "got {err}");
 }
 
 /// An empty table keeps the empty-table wording: there the recording really

@@ -1053,7 +1053,8 @@ impl KvQuant {
     /// at 24 B per 4-value group against the 8 B it actually holds. The sign of
     /// the net-benefit decision is unaffected — 8 B per 4 values already exceeds
     /// bf16's 8 B before the per-token norm — but the magnitude reported in the
-    /// advisory's `est_extra_bytes` is high for `k_iso*` / `iso*_sym`.
+    /// advisory's byte field is high for `k_iso*` / `iso*_sym`, which is why
+    /// that field is named `est_extra_bytes_upper_bound`.
     /// `estimator_matches_actual_iso_rotor_encode_bytes` anchors the estimate to
     /// the CPU-encode bytes deliberately.
     ///

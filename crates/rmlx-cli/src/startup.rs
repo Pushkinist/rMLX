@@ -293,16 +293,23 @@ pub(crate) fn print_cache_type_table() {
     // the store spends. The iso and rotor tags decode from a shared GPU ring
     // that costs one whole u32 code word plus one f32 scale per group whatever
     // the codebook width, so a 3-bit and a 4-bit member of the same family
-    // occupy byte-identical space and both land above bf16. Said here because
-    // this listing is where the tags are chosen.
+    // occupy byte-identical space; planar spends an f32 per PAIR and is wider
+    // still. None of the three is a compression format at this layout. Said
+    // here because this listing is where the tags are chosen.
     println!();
-    println!("note: the bit width in an iso_*/rotor_* name is its codebook, not what");
-    println!("      it stores. Their shared ring spends one u32 code word and one f32");
-    println!("      scale per group whatever that width, so a store built from it holds");
-    println!("      16 + 32/head_dim bits per value (iso) or (64*ceil(head_dim/3)+32)");
-    println!("      /head_dim (rotor) — 16.25 and 21.75 at head_dim 128, against bf16's");
-    println!("      16.00, and the 3-bit and 4-bit members are byte-identical. These are");
-    println!("      the widest cells on this menu, not the narrowest. Derived from the");
-    println!("      ring allocation; for which pairings actually build that store see");
-    println!("      docs/KV_QUANT.md \"Codec disposition\".");
+    println!("note: the bit width in an iso_*/rotor_*/planar* name is its codebook, not");
+    println!("      what it stores. None of the three is a compression format at the");
+    println!("      layout it ships: each spends a whole u32 code word and an f32 scale");
+    println!("      per group (planar, per PAIR), so all land ABOVE bf16's 16.00 bits");
+    println!("      per value. At head_dim 128:");
+    println!("        iso_k_3/4, iso_v_3/4         16.25   (16 + 32/head_dim)");
+    println!("        rotor_k_3/4, rotor_v_3/4     21.75   ((64*ceil(D/3)+32)/D)");
+    println!("        planar3, planar4, planar_k4  22.00   (at every head_dim)");
+    println!("      so planar is the widest cell on this menu, not iso or rotor. Each");
+    println!("      pair is byte-identical across its 3-bit and 4-bit member. The");
+    println!("      iso/rotor rates are derived from the ring allocation; the rotor and");
+    println!("      planar figures are also measured by the crate rate gate");
+    println!("      (kv_rate_tests), which measures iso in its wider CPU-block form.");
+    println!("      For which pairings actually build such a store see docs/KV_QUANT.md");
+    println!("      \"Codec disposition\".");
 }

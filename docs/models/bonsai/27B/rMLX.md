@@ -106,8 +106,9 @@ directly. KV-MB from serve events `op='kv_cache_bytes'` high-water (the `baselin
     > CPU dequant that produced these numbers is gone. Re-measured at 4k: Bonsai-8B
     > 1.34 → 17.0 TPS, medgemma-4B 7.37 → 51.8 TPS. The numbers in this table are a
     > pre-kernel snapshot and were **not** re-run on the 27B. Two caveats stand:
-    > the default `--rotor-qjl on` still takes the CPU path (the kernel cannot
-    > reproduce the QJL residual), and `k_iso3/4` is untouched — it keeps its own
+    > `--rotor-qjl on` still takes the CPU path (the kernel cannot reproduce the
+    > QJL residual) — it was the default when this was recorded and is opt-in
+    > now, so the shipped path is the kernel — and `k_iso3/4` is untouched: it keeps its own
     > per-step host restaging.
 - **No long-ctx collapse (unlike the 8B).** On the 8B, `iso*`/`*_sym` cratered to
   ~6–13 TPS at 64k; on the 27B they hold **30–36 TPS at 64k**. GDN's shallow KV

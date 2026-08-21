@@ -128,17 +128,36 @@ pub struct SummaryFilter<'a> {
 /// branches say the same thing.
 ///
 /// Only reachable on a table that *has* rows: `for_each_row` refuses an empty
-/// export itself, before either caller gets here. So a filter being present is
-/// the whole decision — when one is, the rows exist and belong to somebody
-/// else, and naming who is what separates "the recording failed" from "this
-/// process was not in it".
+/// export itself, before either caller gets here. Three outcomes, and they are
+/// separate states rather than one message with adjectives:
+///
+/// * `skip_emptied` — the scope's rows exist and the `skip_ms` floor removed
+///   all of them. Checked first, because it is the only case where the census
+///   would otherwise print the very process the message claims is absent.
+/// * a filter is set and matched nothing — the recording ran without this
+///   process in it, and the census is the evidence.
+/// * no filter — the whole table is empty, which `for_each_row` already
+///   refuses, so this arm exists for completeness.
 fn no_rows_error(
     schema: String,
     rows_total: u64,
     process_filter: Option<&str>,
     processes: &[(String, u64)],
-    after_skip: bool,
+    skip_emptied: Option<(u64, u64)>,
 ) -> XctraceError {
+    let scope = process_filter.map_or_else(
+        || "the whole table".to_owned(),
+        |f| format!("a process matching {f:?}"),
+    );
+    if let Some((matched, skip_ms)) = skip_emptied {
+        return XctraceError::SkipRemovedEveryRow {
+            schema,
+            rows_total,
+            matched,
+            skip_ms,
+            scope,
+        };
+    }
     let Some(want) = process_filter else {
         return XctraceError::NoRows { schema };
     };
@@ -158,11 +177,6 @@ fn no_rows_error(
         } else {
             seen
         },
-        after_skip: if after_skip {
-            " after the requested skip".to_owned()
-        } else {
-            String::new()
-        },
     }
 }
 
@@ -175,7 +189,8 @@ fn no_rows_error(
 /// nothing, and reporting zeros for it is how a profiling harness lies. Which
 /// refusal says which: [`XctraceError::NoRows`] when the table itself is empty,
 /// [`XctraceError::NoRowsForProcess`] when it holds other processes' work and
-/// none of this one's.
+/// none of this one's, and [`XctraceError::SkipRemovedEveryRow`] when this
+/// scope's rows exist and `skip_ms` removed all of them.
 pub fn summarise_gpu_intervals(xml: &str, filter: SummaryFilter<'_>) -> Result<GpuIntervalSummary> {
     // Checked up front, from the header alone, so the wrong table refuses
     // identically whatever the options say. Left inside the row walk it would
@@ -190,7 +205,7 @@ pub fn summarise_gpu_intervals(xml: &str, filter: SummaryFilter<'_>) -> Result<G
         });
     }
     if filter.skip_ms == 0 {
-        return summarise_from(xml, filter.process, 0);
+        return summarise_from(xml, filter.process, 0, 0);
     }
     // The origin is not known until the table has been read once. Rows are
     // cheap to revisit; buffering them all is the memory this parser streams to
@@ -199,19 +214,23 @@ pub fn summarise_gpu_intervals(xml: &str, filter: SummaryFilter<'_>) -> Result<G
     let mut latest = 0u64;
     // Counted on the way past so the refusal below can name what the recording
     // did hold; a second pass purely to answer that would be a second reader of
-    // the same table.
+    // the same table. Only built when a filter is set: without one the census
+    // is guaranteed unused (the refusal is `NoRows`, which carries no census),
+    // and reading the `process` column would newly make an unfiltered summary
+    // fail on a column this branch never used to touch — on exports of 36k-120k
+    // rows.
     let mut rows_total = 0u64;
     let mut processes: HashMap<String, u64> = HashMap::new();
     for_each_row(xml, |row| {
         rows_total += 1;
-        let seen = row.fmt("process")?.unwrap_or("<unattributed>");
-        match processes.get_mut(seen) {
-            Some(n) => *n += 1,
-            None => {
-                processes.insert(seen.to_owned(), 1);
-            }
-        }
         if let Some(want) = filter.process {
+            let seen = row.fmt("process")?.unwrap_or("<unattributed>");
+            match processes.get_mut(seen) {
+                Some(n) => *n += 1,
+                None => {
+                    processes.insert(seen.to_owned(), 1);
+                }
+            }
             if !seen.contains(want) {
                 return Ok(());
             }
@@ -226,12 +245,16 @@ pub fn summarise_gpu_intervals(xml: &str, filter: SummaryFilter<'_>) -> Result<G
         Ok(())
     })?;
     if earliest == u64::MAX {
+        // The floor is not applied in this pass, so reaching here means the
+        // *filter* matched nothing — the skip cannot be the cause and `None` is
+        // correct by construction, not by assumption. A skip that empties a
+        // non-empty match is caught inside `summarise_from`.
         return Err(no_rows_error(
             GPU_INTERVALS_SCHEMA.to_owned(),
             rows_total,
             filter.process,
             &sorted_processes(processes),
-            false,
+            None,
         ));
     }
     let origin_ns = earliest.saturating_add(filter.skip_ms.saturating_mul(1_000_000));
@@ -243,18 +266,23 @@ pub fn summarise_gpu_intervals(xml: &str, filter: SummaryFilter<'_>) -> Result<G
             span_ms: latest.saturating_sub(earliest) / 1_000_000,
         });
     }
-    summarise_from(xml, filter.process, origin_ns)
+    summarise_from(xml, filter.process, origin_ns, filter.skip_ms)
 }
 
 fn summarise_from(
     xml: &str,
     process_filter: Option<&str>,
     start_floor_ns: u64,
+    skip_ms: u64,
 ) -> Result<GpuIntervalSummary> {
     let mut summary = GpuIntervalSummary::default();
     let mut channels: HashMap<String, ChannelStats> = HashMap::new();
     let mut processes: HashMap<String, u64> = HashMap::new();
     let mut first_start = u64::MAX;
+    // Rows the scope matched *before* the skip floor. This is what tells "the
+    // process is not in this recording" apart from "it is, and the skip removed
+    // its window" — the two states the one refusal used to fuse.
+    let mut matched_before_floor = 0u64;
 
     let schema = for_each_row(xml, |row| {
         summary.rows_total += 1;
@@ -272,6 +300,7 @@ fn summarise_from(
         if !keep {
             return Ok(());
         }
+        matched_before_floor += 1;
         // See the note in summarise_gpu_intervals: a NULL here is an absence,
         // and read as 0 it would set first_start to 0 and inflate span_ns.
         let start = row.u64_required("start")?;
@@ -302,12 +331,21 @@ fn summarise_from(
     })?;
 
     if summary.rows_matched == 0 {
+        // A floor in force here always means the scope HAD rows: the only
+        // caller that passes a non-zero floor is the skip branch, which
+        // refuses first when the filter matches nothing. `matched_before_floor`
+        // is therefore the count to report, not a second condition to test —
+        // adding it as one would be a conjunct no input can falsify. The
+        // caller ordering that makes this true is pinned by
+        // `the_skip_branch_reports_the_same_distinction`, which goes red if a
+        // filter that matches nothing ever reaches here with a floor set.
+        let skip_emptied = (start_floor_ns > 0).then_some((matched_before_floor, skip_ms));
         return Err(no_rows_error(
             schema.name,
             summary.rows_total,
             process_filter,
             &sorted_processes(processes),
-            start_floor_ns > 0,
+            skip_emptied,
         ));
     }
 
