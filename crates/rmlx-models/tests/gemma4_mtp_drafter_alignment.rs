@@ -174,11 +174,11 @@ fn assert_round0_first_token_aligns(
 ) {
     use rmlx_kv_quant::KvCache;
     use rmlx_mlx::argmax;
-    use rmlx_models::kv_cache::KvCacheBuilder;
+    use rmlx_models::kv_cache::DEFAULT_KV_QUANT;
 
-    // for_arch_default is deprecated; still returns K8V8. Suppress warning.
-    #[allow(deprecated)]
-    let kv_quant = KvCacheBuilder::for_arch_default("Gemma4ForConditionalGeneration");
+    // Mirror production: the verifier caches are built at the codec the
+    // drafter path resolves when no override is given.
+    let kv_quant = DEFAULT_KV_QUANT;
     let mut caches: Vec<KvCache> = (0..verifier.num_hidden_layers())
         .map(|i| {
             KvCache::with_quant_max_seq_window(kv_quant, 4096, verifier.layer_sliding_window(i))

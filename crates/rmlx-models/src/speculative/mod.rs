@@ -49,7 +49,6 @@ use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
 
 use crate::arch::{load_model, Architecture, LoadOpts};
 use crate::decode_loop::ProbeStep;
-use crate::kv_cache::KvCacheBuilder;
 pub use draft_kind::DraftKind;
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache, KV_MAX_SEQ_DEFAULT};
 
@@ -605,16 +604,10 @@ impl SpeculativeDispatcher {
         let mut draft_ns: u128 = 0;
         let mut verifier_ns: u128 = 0;
 
-        // Resolve KV quant — same value for verifier and draft (typical
-        // spec pair has same arch family).
-        // Migrated from deprecated for_arch_default to resolve_default.
-        // Signals::default() → hidden_size=None → falls to K8V8 in the Gemma4 arm.
-        let kv_quant = kv_quant_override.unwrap_or_else(|| {
-            KvCacheBuilder::resolve_default(
-                "Gemma4ForConditionalGeneration",
-                crate::kv_cache::ResolverSignals::default(),
-            )
-        });
+        // Resolve KV quant — same value for verifier and draft. The drafter
+        // stack resolves its own default, so it must read the same constant the
+        // verifier does or a spec pair runs two different caches.
+        let kv_quant = kv_quant_override.unwrap_or(crate::kv_cache::DEFAULT_KV_QUANT);
         // Derive max_seq from override, else KV_MAX_SEQ_DEFAULT (the
         // verifier's max_position_embeddings is the safer bound, but for
         // the spec test target they match).
@@ -1066,14 +1059,9 @@ impl SpeculativeDispatcher {
         let mut draft_ns: u128 = 0;
         let mut verifier_ns: u128 = 0;
 
-        // Migrated from deprecated for_arch_default to resolve_default.
-        // Signals::default() → hidden_size=None → falls to K8V8 in the Gemma4 arm.
-        let kv_quant = kv_quant_override.unwrap_or_else(|| {
-            KvCacheBuilder::resolve_default(
-                "Gemma4ForConditionalGeneration",
-                crate::kv_cache::ResolverSignals::default(),
-            )
-        });
+        // Same constant the verifier resolves — a spec pair must not run two
+        // different caches.
+        let kv_quant = kv_quant_override.unwrap_or(crate::kv_cache::DEFAULT_KV_QUANT);
         let max_seq = max_ctx_override.unwrap_or_else(|| {
             let v_mpe = self.verifier.max_position_embeddings();
             if v_mpe <= 0 || v_mpe > KV_MAX_SEQ_DEFAULT {

@@ -67,12 +67,12 @@ pub struct ArchGenerator {
     /// generation is unsafe regardless of whether a request runs on GPU or CPU.
     /// Wrapped in `Arc` so a clone of the handle can be moved into `spawn_blocking`.
     _lock: Arc<Mutex<()>>,
-    /// Server-startup-time KV quantization override. `None` = arch default.
+    /// Server-startup-time KV quantization override. `None` = engine default.
     kv_quant_override: Option<rmlx_kv_quant::KvQuant>,
     /// True when `--kv-quant <explicit>` was given at startup (not "auto").
     ///
     /// When `false` (auto mode), each request selects its KV mode via
-    /// `kv_quant_for_ctx(prompt_len)`. When `true`, the
+    /// the per-request override. When `true`, the
     /// user-specified quant in `kv_quant_override` is used for every request
     /// regardless of context length.
     kv_quant_user_explicit: bool,
@@ -177,8 +177,8 @@ impl ArchGenerator {
             .map_err(|e| Error::Other(format!("load_config: {e}")))?;
 
         // Single shared resolver. Explicit override wins;
-        // `None` (auto) falls through to the per-arch default table, with
-        // `user_explicit=false` so per-request `kv_quant_for_ctx` can override.
+        // `None` (auto) falls through to the engine default, with
+        // `user_explicit=false` marks the codec as auto-resolved.
         let (kv_quant_resolved, kv_quant_user_explicit) =
             resolve_kv_quant_for_load(&cfg, load_cfg.kv_quant, &model_id);
 
@@ -581,48 +581,31 @@ impl Generator for ArchGenerator {
         let req_audio = req.audio_b64.clone();
         let audio = self.audio.clone();
         let mm_cache = self.mm_cache.clone();
-        // Issue #26: a per-request `kv_quant` override hot-swaps the KV codec on
-        // the resident model. When present it takes precedence over the launch
-        // `--kv-quant` (explicit or auto) and over the per-ctx auto policy —
-        // exactly like a startup-explicit flag, but scoped to this one request.
-        // The prefix/prompt cache key is namespaced by codec downstream, so a
-        // codec switch never serves mismatched cached KV.
+        // A per-request `kv_quant` override hot-swaps the KV codec on the
+        // resident model. When present it takes precedence over the launch
+        // `--kv-quant`, explicit or auto — exactly like a startup-explicit flag,
+        // but scoped to this one request. The prefix/prompt cache key is
+        // namespaced by codec downstream, so a codec switch never serves
+        // mismatched cached KV.
         let req_kv_quant_override = req.kv_quant_override;
         let kv_quant_user_explicit = self.kv_quant_user_explicit || req_kv_quant_override.is_some();
         let lock = Arc::clone(&self._lock);
-        // Per-request ctx-based KV mode selection in auto mode.
-        // When the user gave an explicit `--kv-quant <mode>` flag at startup,
-        // honour it for every request. In auto mode, override the arch-resolved
-        // default with `kv_quant_for_ctx(prompt_len)` so long-ctx requests
-        // automatically use a quant mode suited to that context length.
-        let kv_quant_override = if let Some(rq) = req_kv_quant_override {
-            tracing::info!(
-                ?rq,
-                "generate: per-request KV-quant override active (issue #26)"
-            );
-            Some(rq)
-        } else if self.kv_quant_user_explicit {
-            self.kv_quant_override
-        } else if let Some(pin) = self.model.preferred_auto_kv() {
-            tracing::info!(?pin, "generate: arch pinned auto-KV default");
-            Some(pin)
-        } else {
-            let ctx_quant = rmlx_models::kv_cache::kv_quant_for_ctx(prompt_tokens.len());
-            tracing::info!(
-                prompt_len = prompt_tokens.len(),
-                ?ctx_quant,
-                "generate: auto-KV-by-ctx selected quant"
-            );
-            Some(ctx_quant)
-        };
-        // Issue #26: a per-request `max_ctx` re-sizes the KV-ring virtual
-        // ceiling for this request only (#25 lazy-grow path); `None` keeps the
-        // launch `--max-ctx`. No weight touch — a ring realloc only.
+        let kv_quant_override =
+            super::helpers::kv_quant_for_request(req_kv_quant_override, self.kv_quant_override);
+        tracing::info!(
+            prompt_len = prompt_tokens.len(),
+            per_request = req_kv_quant_override.is_some(),
+            ?kv_quant_override,
+            "generate: KV codec for this request"
+        );
+        // A per-request `max_ctx` re-sizes the KV-ring virtual ceiling for this
+        // request only (the lazy-grow path); `None` keeps the launch
+        // `--max-ctx`. No weight touch — a ring realloc only.
         let max_ctx_override = req.max_ctx_override.or(self.max_ctx_override);
         if req.max_ctx_override.is_some() {
             tracing::info!(
                 max_ctx = ?req.max_ctx_override,
-                "generate: per-request max-ctx override active (issue #26)"
+                "generate: per-request max-ctx override active"
             );
         }
         // F2: capture effective_max_ctx for drainer MetricEvent.ctx_max field.
@@ -772,7 +755,7 @@ impl Generator for ArchGenerator {
         // the SSE consumer so GPU work overlaps HTTP serialise+flush.
         //
         // kv_quant_override and max_ctx_override are set at server-startup time via
-        // from_snapshot and passed here; None means use arch default.
+        // from_snapshot and passed here; None means use the engine default.
         let model_id_for_log = self.model_id.clone();
         // Per-loaded-model signature folded into every multimodal-cache key so
         // a shared (multi-model `--registry`) encoder-output cache never serves

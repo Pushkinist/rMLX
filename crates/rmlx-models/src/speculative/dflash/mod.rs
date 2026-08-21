@@ -680,7 +680,6 @@ pub fn dflash_generate_greedy(
     step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
     device: Device,
 ) -> Result<Vec<ProbeStep>> {
-    use crate::kv_cache::KvCacheBuilder;
     use std::time::Instant;
 
     if prompt_ids.len() < 2 {
@@ -700,14 +699,9 @@ pub fn dflash_generate_greedy(
     let hidden = drafter.cfg.hidden_size as i32;
     let block_total = requested_block_total.min(drafter.cfg.block_size).max(2);
 
-    // Migrated from deprecated for_arch_default to resolve_default.
-    // Signals::default() → K8V8 for Qwen3_5MoeForConditionalGeneration (no change).
-    let kv_quant = kv_quant_override.unwrap_or_else(|| {
-        KvCacheBuilder::resolve_default(
-            "Qwen3_5MoeForConditionalGeneration",
-            crate::kv_cache::ResolverSignals::default(),
-        )
-    });
+    // Same constant the verifier resolves — a spec pair must not run two
+    // different caches.
+    let kv_quant = kv_quant_override.unwrap_or(crate::kv_cache::DEFAULT_KV_QUANT);
     let max_seq = max_ctx_override.unwrap_or_else(|| {
         let v_mpe = verifier.max_position_embeddings();
         if v_mpe <= 0 || v_mpe > KV_MAX_SEQ_DEFAULT {

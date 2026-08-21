@@ -54,7 +54,7 @@ fn kv_cache_k8v4_prefill_decode_sane() {
 
     use rmlx_kv_quant::{KvCache, KvQuant};
     use rmlx_mlx::Device;
-    use rmlx_models::{gemma4, kv_cache::KvCacheBuilder};
+    use rmlx_models::gemma4;
 
     let device = Device::Cpu;
     let model = gemma4::load_from_path(&model_path).expect("load model");
@@ -89,13 +89,8 @@ fn kv_cache_k8v4_prefill_decode_sane() {
     // the Qwen MoE PPL check lands in S2.5 baseline.
     let full_max = full_last.iter().copied().fold(f32::NEG_INFINITY, f32::max);
 
-    // K8V4 prefill+decode.
-    // K8V8 is the per-arch default; we force K8V4 here to exercise
-    // the asymmetric K/V quantized path with the primary test model.
-    // for_arch_default is deprecated; this call verifies arch=K8V8 by construction.
-    // The actual cache below forces K8V4 to exercise the asymmetric K/V path.
-    #[allow(deprecated)]
-    let _ = KvCacheBuilder::for_arch_default("Gemma4ForConditionalGeneration"); // K8V8
+    // K8V4 prefill+decode. K8V4 is not the engine default; it is forced here
+    // to exercise the asymmetric K/V quantized path with the primary test model.
     let mut caches: Vec<KvCache> = (0..n_layers)
         .map(|_| KvCache::with_quant(KvQuant::K8V4))
         .collect();

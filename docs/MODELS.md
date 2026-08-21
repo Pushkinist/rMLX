@@ -366,7 +366,7 @@ per-block exponent); the loader keeps those verbatim and only applies the bf16
 uniformity cast to float (affine) scales — gated on `scales.dtype()`, not on the
 arch or global quant mode, so a mixed checkpoint loads both codecs correctly. The
 PARO variant (`Qwen3_5ForConditionalGeneration`) uses a paroquant layout detected
-by the `is_paroquant` signal in `KvCacheBuilder::resolve_default`.
+by `ModelConfig::is_paroquant`.
 
 Affine `bits` is gated at load to `{2,3,4,5,6,8}` (`docs/WEIGHT_QUANTS.md`
 §4.4) — e.g. `prism-ml/Bonsai-27B-mlx-1bit` (structurally identical to the

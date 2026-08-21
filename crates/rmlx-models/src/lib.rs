@@ -70,7 +70,7 @@ pub use decode_loop::{ProbeStep, SmokeVerdict};
 // The flat `rmlx_models::{KvCache, KvQuant, LinearAttnCache,
 // write_caches, set_ssd_*}` re-exports were dropped. Codec types live at
 // `rmlx_kv_quant::*`, SSD-tier hooks + `write_caches` at `rmlx_kv_ssd::*`.
-// Policy items (`KvCacheBuilder`, `ResolverSignals`, `kv_quant_for_ctx`,
+// Policy items (`KvCacheBuilder`, `DEFAULT_KV_QUANT`,
 // `kv_quant_for_layer`, `LAYER_ADAPTIVE_*`) stay in `rmlx_models::kv_cache`
 // — import via `rmlx_models::kv_cache::*`.
 // The SSD KV tier lives in `rmlx-kv-ssd`. The top-level

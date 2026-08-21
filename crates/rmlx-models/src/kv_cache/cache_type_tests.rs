@@ -358,27 +358,38 @@ fn rot_k_on_k_resolves_to_rotk_with_affine_v() {
     clippy::expect_used,
     reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
 )]
-fn rot_k_auto_v_on_bonsai_resolves() {
-    // --ctk rot_k --ctv auto on Bonsai: auto base Mixed{k8,v4,g64} → V=q4_g64.
-    let auto = KvQuant::Mixed {
-        k_bits: 8,
-        v_bits: 4,
-        k_group_size: 64,
-        v_group_size: 64,
-    };
-    let kq = resolve(
-        spec(CacheType::RotK, CacheType::Auto),
-        ctx("Qwen3ForCausalLM", Some(128)),
-        auto,
-    )
-    .expect("rot_k + auto-V must resolve");
-    assert_eq!(
-        kq,
-        KvQuant::RotK {
+fn rot_k_auto_v_takes_the_canonical_partner_not_the_base() {
+    // `--ctk rot_k --ctv auto`: K is quantised, so the `auto` V becomes the
+    // canonical q8_g128 partner. The `auto` base is NOT consulted for a side
+    // whose partner is quantised — proven by passing two different bases and
+    // getting the same answer. Before the per-arch table was retired this side
+    // came from the base, which is why the base is varied here rather than
+    // assumed.
+    let bases = [
+        DEFAULT_KV_QUANT,
+        KvQuant::Mixed {
+            k_bits: 8,
             v_bits: 4,
+            k_group_size: 64,
             v_group_size: 64,
-        }
-    );
+        },
+    ];
+    for auto in bases {
+        let kq = resolve(
+            spec(CacheType::RotK, CacheType::Auto),
+            ctx("Qwen3ForCausalLM", Some(128)),
+            auto,
+        )
+        .expect("rot_k + auto-V must resolve");
+        assert_eq!(
+            kq,
+            KvQuant::RotK {
+                v_bits: 8,
+                v_group_size: 128,
+            },
+            "base {auto:?} leaked into the auto V side"
+        );
+    }
 }
 
 #[test]
@@ -740,20 +751,21 @@ fn tq4_gemma4_full_attention_head_dim_512_rejected() {
     clippy::wildcard_enum_match_arm,
     reason = "wildcard arm is the correct fallthrough for unsupported arch/quant variants; exhaustive expansion would require updating on every new variant"
 )]
-fn bonsai_asymmetric_auto_tq4_rejected_no_silent_coercion() {
-    // Bonsai's auto is Mixed{8,4,64,64} → decompose gives (Q8G64, Q4G64).
-    // User asks --ctk auto --ctv tq4 → K stays Q8G64, V becomes Tq4.
-    // combo_to_kv_quant must NOT silently promote Q8G64→Q8G128; it must reject.
-    let auto = KvQuant::Mixed {
-        k_bits: 8,
-        v_bits: 4,
-        k_group_size: 64,
-        v_group_size: 64,
-    };
+fn named_q8_g64_k_with_tq4_v_rejected_no_silent_coercion() {
+    // A side the operator NAMED is never rewritten. `--ctk q8_g64 --ctv tq4`
+    // must reject rather than silently promote q8_g64 → q8_g128 to make the
+    // K8V4 combo fit: the operator asked for a 64-wide K group and would
+    // otherwise get a 128-wide one without being told.
+    //
+    // Only an `Auto` side is filled by the resolver, and it is filled with the
+    // canonical partner (see `a_lone_quantised_v_pairs_with_q8_g128_k`). This
+    // test previously reached the same rejection through `--ctk auto` and a
+    // per-arch `Mixed` base; that base no longer exists, so the case is now
+    // written the way an operator would actually hit it.
     let err = resolve(
-        spec(CacheType::Auto, CacheType::Tq4),
+        spec(CacheType::Q8G64, CacheType::Tq4),
         ctx("Qwen3ForCausalLM", Some(128)),
-        auto,
+        DEFAULT_KV_QUANT,
     )
     .unwrap_err();
     match err {
@@ -807,7 +819,7 @@ fn qwen_moe_all_auto_k8v8_accepted() {
 )]
 fn qwen_moe_low_k_bits_rejected_post_decompose() {
     // Hypothetical auto: Mixed{k_bits:4, v_bits:4, group=64}. This proves
-    // the post-decompose §D6.4 re-check fires even if resolve_default
+    // the post-decompose §D6.4 re-check fires even if the auto default
     // ever returned a bad value.
     let bad_auto = KvQuant::Mixed {
         k_bits: 4,
@@ -1988,4 +2000,73 @@ fn decompose_auto_rotor_k_asym_round_trip() {
     assert_eq!(k, CacheType::RotorK4);
     assert_eq!(v, CacheType::Q4G64);
     assert_eq!(combo_to_kv_quant(k, v).unwrap(), original);
+}
+
+use crate::kv_cache::DEFAULT_KV_QUANT;
+
+// ── single-sided --cache-type-k / --cache-type-v against the auto base ───────
+//
+// The per-side flags let an operator name one axis and leave the other `auto`.
+// That unspecified side must become the named side's canonical partner, not the
+// engine default: `--kv-quant auto` is bf16, and a bf16/quantised pair has no
+// `KvQuant` at all, so decomposing the unspecified side from the engine default
+// would turn every single-sided invocation into a startup refusal.
+
+/// Every quantised V codec `combo_to_kv_quant` accepts, named on its own with
+/// K left `auto`.
+#[test]
+fn a_lone_quantised_v_pairs_with_q8_g128_k() {
+    let c = ctx("Qwen3ForCausalLM", Some(128));
+    let cases = [
+        (CacheType::Tq4, KvQuant::K8V4),
+        (CacheType::Q8G128, KvQuant::K8V8),
+        (CacheType::Planar4, KvQuant::Planar),
+        (CacheType::Planar3, KvQuant::Planar3),
+    ];
+    for (v, want) in cases {
+        let got = resolve(spec(CacheType::Auto, v), c, DEFAULT_KV_QUANT);
+        assert_eq!(
+            got.as_ref(),
+            Ok(&want),
+            "--cache-type-v {} alone resolved to {got:?}",
+            v.tag()
+        );
+    }
+}
+
+/// The K side named on its own; V left `auto` must not stay bf16.
+#[test]
+fn a_lone_quantised_k_pairs_with_q8_g128_v() {
+    let c = ctx("Qwen3ForCausalLM", Some(128));
+    let got = resolve(
+        spec(CacheType::Q8G128, CacheType::Auto),
+        c,
+        DEFAULT_KV_QUANT,
+    );
+    assert_eq!(
+        got.as_ref(),
+        Ok(&KvQuant::K8V8),
+        "--cache-type-k q8_g128 alone resolved to {got:?}"
+    );
+}
+
+/// `auto` on both sides is the engine default, and an explicit `bf16` on one
+/// side keeps the other bf16 — the pairing rule must not quantise those.
+#[test]
+fn an_unquantised_side_keeps_the_auto_side_unquantised() {
+    let c = ctx("Qwen3ForCausalLM", Some(128));
+    for s in [
+        spec(CacheType::Auto, CacheType::Auto),
+        spec(CacheType::Bf16, CacheType::Auto),
+        spec(CacheType::Auto, CacheType::Bf16),
+    ] {
+        let got = resolve(s, c, DEFAULT_KV_QUANT);
+        assert_eq!(
+            got.as_ref(),
+            Ok(&KvQuant::None),
+            "spec {:?}/{:?} resolved to {got:?}",
+            s.k.tag(),
+            s.v.tag()
+        );
+    }
 }

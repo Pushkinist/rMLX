@@ -350,11 +350,11 @@ under one KV layout cannot collide with the same block cached under another.
 
 **Why the per-layer term is here and not only in `layout_key`.** The layout key
 is computed once, at attach, from the *launch* codec. A request need not run
-that codec: `kv_quant_for_ctx` picks one by prompt length in auto mode, and the
-OpenAI route accepts a per-request `kv_quant` override. For those requests the
+that codec: the OpenAI route accepts a per-request `kv_quant` override. For
+those requests the
 attach-time vector describes a layout they are not running, so a guarantee
 resting on the key alone ("a per-layer policy change invalidates stored
-blocks") would hold only for requests that happened to run the launch default.
+blocks") would hold only for requests that happened to run the launch codec.
 The seed is where the request's own codec already enters, so it is where the
 request's own mixture belongs. `rmlx-models` supplies it through
 `prompt_cache::request_cache_seed(layout_key, kv_quant, n_layers, model_sig)`,
@@ -814,7 +814,7 @@ All flags are on the `rmlx serve` subcommand.
 | `--project <NAME>` | `String` | none | Namespace name. Requires `--kv-ssd-cache-gb > 0`. Absent → namespace defaults to model id. |
 | `--kv-ssd-global-gb <GIB>` | `f64` | `0.0` | Cross-namespace pool ceiling in GiB. `0` = no global cap. |
 | `--prompt-cache-ram-gb <GIB>` | `f64` | none | RAM cap for the in-process prompt cache. Tier 1 ceiling. |
-| `--paged-kv` | flag | false | Route K8V4 / K8V8 / Planar caches through the paged block-table allocator. |
+| `--paged-kv` | flag | false | Route K8V4 / K8V8 / Planar caches through the paged block-table allocator. Requires an explicit `--kv-quant`; see the rejection note below. |
 | `--paged-kv-page-tokens <N>` | `i32` | 32 | Page size in tokens. Requires `--paged-kv`. |
 | `--prefix-index <KIND>` | `linear\|radix` | `linear` | Prompt-cache prefix lookup strategy. See below. |
 
@@ -827,6 +827,14 @@ All flags are on the `rmlx serve` subcommand.
 - When `--kv-ssd-cache-gb > --kv-ssd-global-gb > 0`, the per-namespace ceiling
   is clamped to the global budget at startup and a `warn!` is emitted.
 - `--paged-kv` with `--kv-quant bf16` or `--kv-quant none` is rejected.
+- `--paged-kv` **with no `--kv-quant` at all is likewise rejected**, because
+  `auto` resolves to unquantised bf16 on every architecture
+  (`docs/KV_QUANT.md` "The auto default"). Before that change `--paged-kv`
+  alone inherited whichever quantised codec the per-arch table gave the model
+  and started; now it exits 1 with a message naming a codec to pass. It is not
+  auto-promoted: choosing a KV codec because a *storage-layout* flag was given
+  would be a second codec resolver invisible in `--kv-quant`'s own surface,
+  which is the pattern the auto default was collapsed to remove.
 - `--paged-kv` with `--cache-type-k rot_k*` is rejected (RotK is not
   paged-compatible).
 

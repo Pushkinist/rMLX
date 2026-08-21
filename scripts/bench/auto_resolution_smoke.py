@@ -37,13 +37,22 @@ RMLX = str(ROOT / "target" / "release" / "rmlx")
 PORT = 62265
 HOST = "127.0.0.1"
 
+# What `--kv-quant auto` must resolve to, on every architecture. It is a single
+# constant on purpose: a per-model column here is what let this smoke carry a
+# wrong expectation for Bonsai (recorded K8V8, actually Mixed) unnoticed.
+EXPECTED_KV = "None"
+
+# TPS anchors below were recorded while `auto` still resolved through the
+# retired per-arch table, i.e. at a different codec for four of the five rows.
+# They are kept as a coarse "did serving collapse" floor (the check is
+# >= 0.95x), not as a codec-comparable baseline.
 MODELS = [
-    # (path_basename, expected_kv, baseline_tps, baseline_label)
-    ("mlx-community__Qwen3.6-35B-A3B-8bit",   "K8V8",   94.88, "Qwen3.5MoE 8b"),
-    ("z-lab__Qwen3.6-27B-PARO",               "K8V4",   26.66, "Qwen3.5MoE PARO"),
-    ("prism-ml__Ternary-Bonsai-8B-mlx-2bit",  "K8V8",   96.50, "Qwen3 dense 2bit"),
-    ("mlx-community__gemma-4-e2b-it-mxfp8",   "K8V8",  103.04, "Gemma4 small mxfp8"),
-    ("mlx-community__medgemma-1.5-4b-it-8bit","Planar", 72.89, "Gemma3 affine8"),
+    # (path_basename, baseline_tps, baseline_label)
+    ("mlx-community__Qwen3.6-35B-A3B-8bit",    94.88, "Qwen3.5MoE 8b"),
+    ("z-lab__Qwen3.6-27B-PARO",                26.66, "Qwen3.5MoE PARO"),
+    ("prism-ml__Ternary-Bonsai-8B-mlx-2bit",   96.50, "Qwen3 dense 2bit"),
+    ("mlx-community__gemma-4-e2b-it-mxfp8",   103.04, "Gemma4 small mxfp8"),
+    ("mlx-community__medgemma-1.5-4b-it-8bit", 72.89, "Gemma3 affine8"),
 ]
 
 PROMPT = (
@@ -225,7 +234,8 @@ def stop_proc(proc: subprocess.Popen):
 def main():
     print("model,expected_kv,resolved_kv,baseline_tps,observed_tps,delta_pct,ok")
     all_ok = True
-    for basename, expected_kv, baseline_tps, label in MODELS:
+    for basename, baseline_tps, label in MODELS:
+        expected_kv = EXPECTED_KV
         path = str(O_MODELS / basename)
         if not os.path.isdir(path):
             print(f"{basename},{expected_kv},MISSING,{baseline_tps},0.0,nan,FAIL")
@@ -234,7 +244,7 @@ def main():
 
         proc, log_path = serve_one(path)
         ok = False
-        resolved = "NONE"
+        resolved = "NO_LOG_MATCH"
         observed_tps = 0.0
         try:
             if not wait_ready(timeout_s=300):
@@ -256,7 +266,10 @@ def main():
             stop_proc(proc)
             time.sleep(2)  # let the claim file release
 
-        resolved = grep_resolved_kv(log_path) or "NONE"
+        # The sentinel must NOT be spellable as a real codec: `auto` now
+        # resolves to `None`, so a "NONE" fallback would make a failed log grep
+        # compare equal to the expectation and pass this check vacuously.
+        resolved = grep_resolved_kv(log_path) or "NO_LOG_MATCH"
         delta_pct = ((observed_tps - baseline_tps) / baseline_tps * 100.0) if baseline_tps else 0.0
         kv_match = (resolved.lower() == expected_kv.lower())
         tps_ok = observed_tps >= baseline_tps * 0.95

@@ -123,9 +123,6 @@ pub struct SpeculativeGenerator {
     model_id: String,
     _lock: Arc<Mutex<()>>,
     kv_quant_override: Option<rmlx_kv_quant::KvQuant>,
-    /// True when `--kv-quant <explicit>` was given (not "auto").
-    /// When `false`, per-request `kv_quant_for_ctx` applies.
-    kv_quant_user_explicit: bool,
     max_ctx_override: Option<i32>,
     prompt_cache_slots: usize,
     eos_ids: Arc<Vec<u32>>,
@@ -251,10 +248,11 @@ impl SpeculativeGenerator {
         );
 
         // Resolve kv_quant from verifier's config when --kv-quant=auto.
-        // Single shared resolver (user-explicit tracking included).
+        // Single shared resolver. The user-explicit flag it also returns is
+        // only consumed by the image branch, which this generator has none of.
         let cfg = rmlx_loader::load_config(verifier_dir)
             .map_err(|e| Error::Other(format!("load_config (verifier): {e}")))?;
-        let (kv_quant_resolved, kv_quant_user_explicit) =
+        let (kv_quant_resolved, _kv_quant_user_explicit) =
             resolve_kv_quant_for_load(&cfg, load_cfg.kv_quant, &model_id);
 
         let eos_ids = cfg.eos_token_ids();
@@ -474,7 +472,6 @@ impl SpeculativeGenerator {
             // C4: shared process-wide GPU gate (see ArchGenerator above).
             _lock: gpu_gate,
             kv_quant_override: kv_quant_resolved,
-            kv_quant_user_explicit,
             max_ctx_override,
             prompt_cache_slots,
             eos_ids: Arc::new(eos_ids),
@@ -589,26 +586,17 @@ impl Generator for SpeculativeGenerator {
         let prompt_tokens = req.prompt_tokens.clone();
         let n_tokens = req.max_tokens as usize;
         let lock = Arc::clone(&self._lock);
-        // Issue #26: per-request `kv_quant` override wins over the launch
-        // default (explicit or per-ctx auto), scoped to this request only.
-        // Same ctx-based auto selection as ArchGenerator.
-        let kv_quant_override = if let Some(rq) = req.kv_quant_override {
-            tracing::info!(
-                ?rq,
-                "speculative generate: per-request KV-quant override active (issue #26)"
-            );
-            Some(rq)
-        } else if self.kv_quant_user_explicit {
-            self.kv_quant_override
-        } else {
-            let ctx_quant = rmlx_models::kv_cache::kv_quant_for_ctx(prompt_tokens.len());
-            tracing::info!(
-                prompt_len = prompt_tokens.len(),
-                ?ctx_quant,
-                "speculative generate: auto-KV-by-ctx selected quant"
-            );
-            Some(ctx_quant)
-        };
+        // A per-request `kv_quant` override wins over the launch codec,
+        // explicit or auto, scoped to this request only. Same resolution as
+        // ArchGenerator, from the same producer.
+        let kv_quant_override =
+            super::helpers::kv_quant_for_request(req.kv_quant_override, self.kv_quant_override);
+        tracing::info!(
+            prompt_len = prompt_tokens.len(),
+            per_request = req.kv_quant_override.is_some(),
+            ?kv_quant_override,
+            "speculative generate: KV codec for this request"
+        );
         // The round loop below builds the verifier's KV caches directly, so
         // this is the enforcing check for the speculative path — the seam in
         // `Architecture::generate_greedy` is never reached from here. It covers
@@ -619,7 +607,7 @@ impl Generator for SpeculativeGenerator {
                 return Box::pin(stream::once(async move { Err(e) }));
             }
         }
-        // Issue #26: per-request max-ctx ceiling override (#25 lazy-grow path).
+        // Per-request max-ctx ceiling override (the lazy-grow path).
         let max_ctx_override = req.max_ctx_override.or(self.max_ctx_override);
         // F2: capture effective_max_ctx for drainer MetricEvent.ctx_max field.
         let effective_max_ctx_val = self.effective_max_ctx as i64;

@@ -740,10 +740,10 @@ fn registry_exposes_new_ops() {
     }
 }
 
-// ── Issue #26: per-request KV-config override parsing ──────────────────────────
+// ── Per-request KV-config override parsing ────────────────────────────────────
 
 /// `parse_request_kv_quant` mirrors the `--kv-quant` CLI grammar: `"auto"` →
-/// `None` (fall through to the generator's per-arch/per-ctx default), canonical
+/// `None` (the request names no codec and runs the launch-resolved one), canonical
 /// codec strings → the matching `KvQuant`, `"mixed"` → the canonical short
 /// alias, and a malformed string → `Err` (the route maps this to HTTP 400).
 #[test]

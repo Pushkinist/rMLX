@@ -36,7 +36,7 @@ use tracing::{info, warn};
 ///
 /// `device` is used for forward and smoke probes when enabled.
 /// `kv_quant_override` is forwarded to `generate_greedy` when `probe_smoke` is true.
-/// `None` = auto (arch default from `KvCacheBuilder`); `Some(q)` = explicit override.
+/// `None` = auto (`DEFAULT_KV_QUANT`); `Some(q)` = explicit override.
 /// Exit-code outcome for `--probe-smoke`.
 ///
 /// The variant maps 1:1 to the process exit code the caller passes to
