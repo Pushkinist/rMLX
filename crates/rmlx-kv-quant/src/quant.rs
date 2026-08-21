@@ -6,7 +6,7 @@
 //! `mixed_quant`) carries `KvQuant` as a tag.
 //!
 //! Policy wrappers (`KvCacheBuilder`, `kv_quant_for_layer`,
-//! `kv_quant_for_ctx`, `ResolverSignals`) remain in `rmlx-models::kv_cache`
+//! `DEFAULT_KV_QUANT`) remain in `rmlx-models::kv_cache`
 //! and are re-exported there alongside `pub use rmlx_kv_quant::KvQuant`.
 
 /// Default maximum sequence length for the pre-allocated KV buffer.
@@ -29,11 +29,12 @@ pub const KV_MAX_SEQ_DEFAULT: i32 = 4096;
 pub enum KvQuant {
     /// Asymmetric: K = affine q8_0 (group_size=128), V = TurboQuant 4-bit.
     ///
-    /// CLAUDE.md mandates this for Qwen MoE — symmetric Q4 on K is the
-    /// PPL-218→8641 disaster. Per-axis split is real — K and V are quantized
+    /// The recorded safe choice for Qwen MoE when a quantised cache is wanted —
+    /// symmetric Q4 on K is the PPL-218->8641 disaster. Opt-in, not automatic.
+    /// Per-axis split is real (CLAUDE.md hard rule 5) — K and V are quantized
     /// independently, not by layer index like the Python fork's fake `8,4` flag.
     K8V4,
-    /// K = q8_0, V = q8_0 (symmetric 8-bit). Per-arch default.
+    /// K = q8_0, V = q8_0 (symmetric 8-bit). Opt-in; `auto` is bf16.
     K8V8,
     /// K = affine q8_0 (group_size=128), V = PlanarQuant 4-bit.
     ///
@@ -66,9 +67,9 @@ pub enum KvQuant {
     /// Eliminates the per-step full dequantize that dominates the rMLX k8v4
     /// hot path (decode-step audit).
     ///
-    /// The codec is arch-agnostic; the auto policy currently selects it only
-    /// for `Qwen3ForCausalLM` (Bonsai-2bit) via `KvCacheBuilder::resolve_default`
-    /// as an example consumer — other archs keep their existing per-arch defaults.
+    /// The codec is arch-agnostic. It is opt-in on every arch — `auto` resolves
+    /// to bf16 and never selects it. It was the auto default for
+    /// `Qwen3ForCausalLM` (Bonsai-2bit) until the per-arch table was retired.
     Mixed {
         /// K quantization bit-width.
         k_bits: u8,
@@ -118,7 +119,7 @@ pub enum KvQuant {
     /// **Arch guard (Contract A.y — mandatory)**: must NEVER run on Qwen MoE
     /// (`Qwen3_5MoeForConditionalGeneration`). Symmetric 3-bit K is the
     /// PPL-disaster path on Qwen MoE (7:1 GQA amplifies K-head error through
-    /// softmax; see 218→8641 baseline in CLAUDE.md). `KvCacheBuilder::resolve_default`
+    /// softmax; see the 218->8641 baseline in `docs/KV_QUANT.md`). The auto default
     /// never returns `TurboSym3` for Qwen MoE; explicit `--kv-quant tsym3` on
     /// Qwen MoE is rejected at resolve-time via `QwenMoeTurboKRejected`.
     ///
@@ -163,7 +164,7 @@ pub enum KvQuant {
     ///
     /// **Arch guard (Contract A.y — mandatory)**: K-side 4-bit on Qwen MoE is
     /// the PPL-disaster (218→8641; 7:1 GQA amplifies K-head error through
-    /// softmax). `KvCacheBuilder::resolve_default` never returns `PlanarK` for
+    /// softmax). The auto default never returns `PlanarK` for
     /// `Qwen3_5MoeForConditionalGeneration` / `Qwen3VLMoeForConditionalGeneration`,
     /// and `cache_type::validate_resolved` rejects it. Opt-in only via
     /// `--kv-quant planar_k`. Requires `head_dim % 32 == 0`. MSL kernel is
@@ -222,7 +223,7 @@ pub enum KvQuant {
     ///
     /// **Arch guard (Contract A.y — mandatory)**: K-side ≤4-bit on Qwen MoE
     /// is the PPL-disaster zone (218→8641 on Q4_K_M baseline; 7:1 GQA
-    /// amplifies K-head error through softmax). `KvCacheBuilder::resolve_default`
+    /// amplifies K-head error through softmax). The auto default
     /// never returns `Iso3Sym` for Qwen MoE; explicit `--kv-quant iso3_sym`
     /// on Qwen MoE is rejected at resolve-time by
     /// `rmlx_models::kv_cache::validate_resolved`. Opt-in only via
@@ -316,7 +317,7 @@ pub enum KvQuant {
     ///
     /// **Arch guard (Contract A.y — mandatory)**: K-side ≤4-bit on Qwen MoE
     /// is the PPL-disaster zone (218→8641 on Q4_K_M baseline; 7:1 GQA
-    /// amplifies K-head error through softmax). `KvCacheBuilder::resolve_default`
+    /// amplifies K-head error through softmax). The auto default
     /// never returns `Rotor3Sym` for Qwen MoE; explicit `--kv-quant rotor3_sym`
     /// on Qwen MoE is rejected at resolve-time. Opt-in only via
     /// `--kv-quant rotor3_sym`. Requires `head_dim > 0`.

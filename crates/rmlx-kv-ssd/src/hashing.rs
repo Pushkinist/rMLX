@@ -60,7 +60,7 @@ pub const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 /// codec: the boundary-layer promotion rewrites some entries, and it can change
 /// between builds. `layout_key` folds a vector too, but it is fixed at attach
 /// from the *launch* codec, and a request may resolve a different one
-/// (auto-by-context, or a per-request override) — for those requests the
+/// (a per-request override) — for those requests the
 /// attach-time vector describes a layout they are not running. The seed is
 /// where the request's own codec already enters, so it is where the request's
 /// own mixture belongs: fold it here and a policy change invalidates every

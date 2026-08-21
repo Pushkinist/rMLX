@@ -127,7 +127,7 @@ coverage grows.
 
 ## Coding style
 
-- Workspace `Cargo.toml` with member crates `crates/rmlx-{core,quant,kv-quant,kv-ssd,mlx,loader,metrics,models,runtime,server,cli,audio}`. `rmlx-kv-quant` owns the KV-cache codec layer (storage enums, MSL kernels, per-layer `KvCache`, paged-KV, mixed/rot-K, turbo/planar CPU codecs). `rmlx-kv-ssd` owns the SSD KV tier (index, spill, hydrate, block I/O, layout-key salt, 5 Prometheus hook globals, `SsdHydrate<E>` trait, FNV-1a-64 block-digest helpers); only the per-arch `attach_ssd_tier` dispatcher remains in `rmlx-models::ssd_tier` because the arch-specific `SpillSink<Entry>` / `SsdHydrate<Entry>` impls live in `rmlx-models`. The policy/builder wrappers (`KvCacheBuilder`, `kv_quant_for_layer`, `kv_quant_for_ctx`) stay in `rmlx-models::kv_cache`.
+- Workspace `Cargo.toml` with member crates `crates/rmlx-{core,quant,kv-quant,kv-ssd,mlx,loader,metrics,models,runtime,server,cli,audio}`. `rmlx-kv-quant` owns the KV-cache codec layer (storage enums, MSL kernels, per-layer `KvCache`, paged-KV, mixed/rot-K, turbo/planar CPU codecs). `rmlx-kv-ssd` owns the SSD KV tier (index, spill, hydrate, block I/O, layout-key salt, 5 Prometheus hook globals, `SsdHydrate<E>` trait, FNV-1a-64 block-digest helpers); only the per-arch `attach_ssd_tier` dispatcher remains in `rmlx-models::ssd_tier` because the arch-specific `SpillSink<Entry>` / `SsdHydrate<Entry>` impls live in `rmlx-models`. The policy/builder wrappers (`KvCacheBuilder`, `kv_quant_for_layer`, `DEFAULT_KV_QUANT`) stay in `rmlx-models::kv_cache`.
 - `thiserror` for library errors, `anyhow` for binary entry-point.
 - `tracing` for logging, not `log` or `eprintln`.
 - Async only at boundaries (HTTP server, file I/O). Compute is sync.
@@ -431,10 +431,13 @@ the change touches**, each at its best-known KV quant.
 **Perf tooling (feat/cache-type-flags).** The fast pre-commit smoke is
 `bash scripts/perf_canary.sh` — 1 warmup + 3 measured baseline calls per
 model (Bonsai, Gemma4-e4b, Qwen3.6), prints decode-only TPS, appends one
-CSV row per model to `.rmlx/bench/perf_canary.csv`. Phase 3 anchors (the
-committed baseline: Bonsai ~110, Gemma4-e4b ~74, Qwen3.6 ~97 TPS) live in
-`docs/PERF_BASELINE.md`. For automated gates use `scripts/regression_gate.sh
-<model> <baseline_tps> <baseline_stddev>` — pure awk float math, exit 125 =
+CSV row per model to `.rmlx/bench/perf_canary.csv`. Anchors live in
+`docs/PERF_BASELINE.md`; the current ones are at the bf16 `auto` default
+(Bonsai ~142, Gemma4-e4b ~80, Qwen3.6 ~101 TPS). The older Phase-3 row set
+(Bonsai ~110, Gemma4-e4b ~74, Qwen3.6 ~97) was recorded at the retired per-arch
+codec defaults and is not comparable to it. For automated gates use
+`scripts/regression_gate.sh <model> <baseline_tps> <baseline_stddev>` — pure
+awk float math, exit 125 =
 `git bisect skip`, exit 1 = regression. Two `Cargo.toml` perf profiles are
 in play: `release-perf` (`debug-assertions=false`, `overflow-checks=false`,
 stripped debug, `panic=unwind` kept for `MetalClaim::Drop` RAII — see Hard

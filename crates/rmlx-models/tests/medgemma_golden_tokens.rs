@@ -16,10 +16,9 @@
 //!    future index-truth migration that trusts the lying index).
 //!
 //! Model: `mlx-community__medgemma-1.5-4b-it-8bit` (Gemma3ForConditionalGeneration).
-//! KV quant: K8V8 — the deprecated `for_arch_default` fallback the in-process
-//! golden harness (`arch::generate_greedy`) uses. Production serving resolves
-//! gemma3 to `Planar` via `resolve_default`; this golden gates the weight-load
-//! + greedy-decode path (KV-codec-independent), not the Planar KV codec itself.
+//! KV quant: K8V8 — pinned by this golden, not resolved. Production serving
+//! resolves gemma3 to the engine default (unquantised bf16); this golden gates
+//! the weight-load + greedy-decode path, which is KV-codec-independent.
 //!
 //! The snapshot resolves from `RMLX_O_MODELS_ROOT` by slug, so no per-run
 //! variable is needed on a machine holding it (see `tests/common/mod.rs`).
@@ -65,10 +64,10 @@ const MODEL: common::GoldenModel = common::GoldenModel {
     archs: &["Gemma3ForConditionalGeneration"],
 };
 
-/// KV quant pinned for the golden. K8V8 is the deprecated `for_arch_default`
-/// fallback the in-process harness uses; production `resolve_default` returns
-/// `Planar` for gemma3. The golden gates weight loading + greedy decode (both
-/// KV-codec-independent), so K8V8 is a sound, reproducible pin here.
+/// KV quant pinned for the golden. K8V8 is what this harness has always
+/// recorded against; production auto-resolution returns unquantised bf16. The
+/// golden gates weight loading + greedy decode (both KV-codec-independent), so
+/// K8V8 is a sound, reproducible pin here.
 const GOLDEN_KV_QUANT: KvQuant = KvQuant::K8V8;
 
 #[ignore]

@@ -92,8 +92,8 @@ pub(crate) fn acquire_claim_for_device(
 
 /// Parse the `--kv-quant` flag value into an optional `KvQuant` override.
 ///
-/// `"auto"` → `None` — caller resolves to a per-arch best via
-/// [`resolve_kv_quant`] once the model's `config.json` is loaded.
+/// `"auto"` → `None` — caller resolves it via [`resolve_kv_quant`] once the
+/// model's `config.json` is loaded.
 /// `"mixed"` → `Some(KvQuant::Mixed { k_bits:8, v_bits:4, k_group_size:64, v_group_size:64 })`
 /// (mixed-precision quantized SDPA path; K=8-bit / V=4-bit affine, group=64).
 /// Backwards-compatible short alias for the canonical `mixed_k8g64_v4g64` form.
@@ -290,17 +290,61 @@ pub(crate) fn build_cache_type_spec(
     Ok(Some(CacheTypeSpec { k, v }))
 }
 
+/// Refuse `--paged-kv` when the resolved KV codec keeps no packed store.
+///
+/// Paged KV is a layout for a codec's packed store — a block table over
+/// quantised pages. `KvQuant::None` has no store to page, so the combination
+/// is not a slower mode, it is meaningless.
+///
+/// The bar is deliberately the same one this check has always used —
+/// "unquantised" — and not `materialises_packed_store()`. The mirror-family
+/// codecs (`K8V8`, `K8V4`, `Planar*`, …) no longer build a store either, so the
+/// stricter predicate would newly refuse `--kv-quant k8v8 --paged-kv`, which is
+/// a separate change with its own blast radius. Widening this belongs with the
+/// work that makes paged KV do anything at all.
+///
+/// This fires under `--kv-quant auto` now that auto is unquantised bf16, and
+/// that is deliberate. The alternative — promoting `auto` to a quantised codec
+/// because some *other* flag was passed — would be a second codec resolver
+/// keyed on something that is not the codec flag, invisible in `--kv-quant`'s
+/// own surface. One flag, named by the operator, is the honest form.
+///
+/// Returns `Some(message)` when the invocation must be refused. The message
+/// names the resolved codec and what to pass, because "requires K8V4 / K8V8 /
+/// Planar" alone does not tell an operator who passed no codec flag at all why
+/// they are being refused.
+pub(crate) fn reject_paged_kv_without_store(
+    paged_kv: bool,
+    resolved: Option<rmlx_kv_quant::KvQuant>,
+) -> Option<String> {
+    if !paged_kv {
+        return None;
+    }
+    let kq = resolved.unwrap_or(rmlx_models::kv_cache::DEFAULT_KV_QUANT);
+    if !matches!(kq, rmlx_kv_quant::KvQuant::None) {
+        return None;
+    }
+    Some(format!(
+        "--paged-kv needs a KV codec that keeps a packed store to page; \
+         the resolved codec is `{kq}`, which keeps none. \
+         `--kv-quant auto` is unquantised bf16, so --paged-kv must be given a \
+         quantised codec explicitly: try `--kv-quant k8v8 --paged-kv`."
+    ))
+}
+
 /// Resolve the final [`KvQuant`] from the parsed `--kv-quant` and
 /// `--cache-type-{k,v}` flag values plus the loaded [`rmlx_loader::ModelConfig`].
 ///
-/// Per Task 14: between `load_config` and `load_model`, every command runs the
-/// resolver and fails-fast with `EX_CONFIG` (exit 78) on `ResolveError`.
+/// Between `load_config` and `load_model`, every command runs the resolver and
+/// fails-fast with `EX_CONFIG` (exit 78) on `ResolveError`.
 ///
 /// Branch logic on the override pair:
 /// - `(Some(kq), None)` → preset override wins.
-/// - `(None, Some(spec))` → resolve the per-side spec against the per-arch
-///   auto default. On `Err`, log + hint + `exit(78)`.
-/// - `(None, None)` → use the per-arch auto default.
+/// - `(None, Some(spec))` → resolve the per-side spec. A side the operator left
+///   `auto` takes the named side's canonical partner, not the engine default —
+///   see [`rmlx_models::kv_cache::resolve_cache_type`]. On `Err`, log + hint +
+///   `exit(78)`.
+/// - `(None, None)` → [`rmlx_models::kv_cache::DEFAULT_KV_QUANT`].
 /// - `(Some(_), Some(_))` → defense-in-depth (clap should have rejected this);
 ///   log + hint + `exit(78)`. No panic.
 ///
@@ -320,8 +364,7 @@ pub(crate) fn resolve_kv_quant(
 ) -> rmlx_kv_quant::KvQuant {
     use rmlx_kv_quant::KvQuant;
     use rmlx_models::kv_cache::{
-        resolve_cache_type, validate_resolved_kv_quant, KvCacheBuilder, ResolverContext,
-        ResolverSignals,
+        resolve_cache_type, validate_resolved_kv_quant, ResolverContext, DEFAULT_KV_QUANT,
     };
 
     let arch_class = model_cfg
@@ -329,8 +372,7 @@ pub(crate) fn resolve_kv_quant(
         .first()
         .map_or("(empty)", String::as_str);
     let head_dim_opt = model_cfg.head_dim();
-    let signals = ResolverSignals::from_config(model_cfg);
-    let auto = KvCacheBuilder::resolve_default(arch_class, signals);
+    let auto = DEFAULT_KV_QUANT;
 
     let final_kv_quant = match (kv_quant_override, cts_override) {
         (Some(kq), None) => {

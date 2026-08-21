@@ -145,7 +145,7 @@
 //!
 //! Both sides use the same MLX affine quantizer (`mx.quantize` / `mlx_rs::quantize`
 //! in the `rmlx_mlx` crate bindings), parametrized independently by the four
-//! fields. The default values wired by `KvCacheBuilder::resolve_default` for
+//! fields. The default values wired by [`crate::kv_cache::DEFAULT_KV_QUANT`] for
 //! Qwen3/Bonsai are `k_bits=8, v_bits=4, k_group_size=64, v_group_size=64`
 //! (matching `mlx-lm-turboquant`'s `MixedQuantKVCache` defaults).
 //!
@@ -239,7 +239,7 @@ pub enum ParseError {
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheType {
-    /// `auto` — engine picks via `resolve_default`. Valid on both K and V sides.
+    /// `auto` — engine picks the auto default. Valid on both K and V sides.
     Auto,
     /// `bf16` (aliases `f16`, `none`) — unquantized; stored as bf16.
     Bf16,
@@ -850,11 +850,19 @@ pub enum ResolveError {
 
 // ── decompose_auto ────────────────────────────────────────────────────────────
 
+/// Does this side name a codec that quantises?
+///
+/// `Auto` is "unspecified", `Bf16` is "explicitly unquantised" — neither one
+/// obliges the other side to quantise. Everything else does.
+fn is_quantised(ct: CacheType) -> bool {
+    !matches!(ct, CacheType::Auto | CacheType::Bf16)
+}
+
 /// Decompose a concrete [`KvQuant`] into the `(k, v)` [`CacheType`] pair it
 /// would have come from in the §D1 mapping.
 ///
 /// Inverse of [`combo_to_kv_quant`] for the canonical resolutions of
-/// `KvCacheBuilder::resolve_default`. Used by [`resolve`] to override only the
+/// [`crate::kv_cache::DEFAULT_KV_QUANT`]. Used by [`resolve`] to override only the
 /// user-specified side when one side is `Auto`.
 ///
 /// For `Mixed { k_bits, v_bits, k_group_size, v_group_size }` this maps each
@@ -1522,7 +1530,7 @@ fn is_qwen_moe(arch: &str) -> bool {
 /// - §D6.4 (Qwen MoE K-bits ≥ 8) — inspects the K side of `Mixed`.
 ///   `K8V4`/`K8V8`/`Planar` always have K=8 so they pass; `None` passes.
 ///
-/// This runs **after** auto-decompose so future `resolve_default` table
+/// This runs **after** auto-decompose so a future auto-default table
 /// changes cannot bypass the invariant.
 ///
 /// The former guard that rejected `Mixed` on Gemma3 / Gemma4 (cross-layer KV
@@ -1639,7 +1647,7 @@ pub fn validate_resolved(arch_class: &str, kq: &KvQuant) -> Result<(), ResolveEr
 // ── resolve ───────────────────────────────────────────────────────────────────
 
 /// Resolve a user-supplied [`CacheTypeSpec`] against a [`ResolverContext`] and
-/// a base `auto` [`KvQuant`] (typically from `KvCacheBuilder::resolve_default`).
+/// a base `auto` [`KvQuant`] (typically [`crate::kv_cache::DEFAULT_KV_QUANT`]).
 ///
 /// Steps, in order:
 /// 1. `head_dim` required (else `HeadDimUnknown`).
@@ -1716,17 +1724,30 @@ pub fn resolve(
         return Err(ResolveError::Tq4UnsupportedHeadDim(head_dim));
     }
 
-    // (e) Decompose Auto, overriding only user-specified sides.
+    // (e) Fill each `Auto` side.
+    //
+    // Two different questions, and conflating them is what makes a single-sided
+    // invocation fail at startup. When BOTH sides are `Auto` the operator named
+    // no codec at all, so the answer is the engine default. When ONE side names
+    // a quantised codec, the operator has opted into quantisation and is asking
+    // this resolver for the other half of the pair — and the engine default is
+    // bf16, which has no other half: `combo_to_kv_quant` has no `KvQuant` for a
+    // bf16/quantised mix and rejects every one. So an `Auto` side standing next
+    // to a quantised side becomes `q8_g128`, the K width every quantised combo
+    // in that table is built on and the V width of the symmetric pair.
+    //
+    // An explicit `bf16` on one side is not "unspecified" — it is a codec the
+    // operator named, and it keeps the `Auto` side unquantised.
     let (auto_k, auto_v) = decompose_auto(auto);
-    let k = if matches!(spec.k, CacheType::Auto) {
-        auto_k
-    } else {
-        spec.k
+    let k = match spec.k {
+        CacheType::Auto if is_quantised(spec.v) => CacheType::Q8G128,
+        CacheType::Auto => auto_k,
+        named => named,
     };
-    let v = if matches!(spec.v, CacheType::Auto) {
-        auto_v
-    } else {
-        spec.v
+    let v = match spec.v {
+        CacheType::Auto if is_quantised(spec.k) => CacheType::Q8G128,
+        CacheType::Auto => auto_v,
+        named => named,
     };
 
     // (f) Map to KvQuant. Note the asymmetric-auto coercion guard lives in

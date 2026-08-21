@@ -42,7 +42,7 @@ use std::path::PathBuf;
 use rmlx_kv_quant::{KvCache, LinearAttnCache};
 use rmlx_mlx::{argmax, Device};
 use rmlx_models::arch;
-use rmlx_models::kv_cache::KvCacheBuilder;
+use rmlx_models::kv_cache::DEFAULT_KV_QUANT;
 use rmlx_models::speculative::dflash::{dflash_generate_greedy, DFlashDrafter};
 
 fn env_path(key: &str) -> Option<PathBuf> {
@@ -90,10 +90,9 @@ fn dflash_round0_first_token_aligns() {
     let enc = tk.encode(prompt, true).expect("encode");
     let prompt_ids: Vec<u32> = enc.get_ids().to_vec();
 
-    // for_arch_default is deprecated; this always returns K8V8 and the
-    // Qwen3.5-MoE default is K8V8. Suppress the deprecation warning here.
-    #[allow(deprecated)]
-    let kv_quant = KvCacheBuilder::for_arch_default("Qwen3_5MoeForConditionalGeneration");
+    // Mirror production: the verifier caches are built at the codec the
+    // drafter path resolves when no override is given.
+    let kv_quant = DEFAULT_KV_QUANT;
     let mut caches: Vec<KvCache> = (0..verifier.num_hidden_layers())
         .map(|i| {
             KvCache::with_quant_max_seq_window(kv_quant, 4096, verifier.layer_sliding_window(i))
