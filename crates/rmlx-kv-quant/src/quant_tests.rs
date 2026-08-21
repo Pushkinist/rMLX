@@ -643,3 +643,257 @@ fn a_storeless_codec_mirrors_both_axes() {
         );
     }
 }
+
+// ── codec disposition ────────────────────────────────────────────────────────
+
+/// What selecting a codec actually does to a served request.
+///
+/// The three classes are what a disposition has to distinguish, because they
+/// warrant different outcomes: a codec that is *beaten* by the bf16 baseline on
+/// every axis is not in the same position as one that is merely not selected by
+/// default, and neither is in the same position as the baseline itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disposition {
+    /// Unquantised bf16. The reference every other row is measured against and
+    /// the resolved `auto` default.
+    Baseline,
+    /// Decode reads the bf16 mirror on both axes, so `exit_prefill` builds no
+    /// packed store. Resident KV and generated token ids are identical to
+    /// `Baseline`; the only difference is the cost of carrying a quantised
+    /// layer type. Beaten by `none` on every axis a caller can observe.
+    InertMirrorFed,
+    /// Decode reads this codec's own packed store. These are the only codecs
+    /// that quantize anything a served request touches — the ones a fused
+    /// decode kernel would make pay, and the ones whose residency actually
+    /// differs from bf16 (today, upward).
+    ReadsItsOwnStore,
+}
+
+/// Derive the disposition from the classifiers the runtime itself dispatches
+/// on, so the table below cannot claim something the code does not do.
+fn disposition_of(q: KvQuant) -> Disposition {
+    if q == KvQuant::None {
+        Disposition::Baseline
+    } else if q.materialises_packed_store() {
+        Disposition::ReadsItsOwnStore
+    } else {
+        Disposition::InertMirrorFed
+    }
+}
+
+/// Every codec the tree can spell, with its disposition written out by name.
+///
+/// This exists so "nobody picks it" can never be an answer: a variant added to
+/// the enum reaches [`ALL_KV_QUANTS`] (pinned by `variants_are_exhaustive`) and
+/// then has to be classified here or the sweep below fails on it. Writing the
+/// class by hand rather than deriving it is the point — the derivation is what
+/// is being checked.
+///
+/// Parameterised families are listed at the same representative parameters
+/// `ALL_KV_QUANTS` uses; their disposition does not vary with the parameters,
+/// which `disposition_is_a_property_of_the_family_not_its_parameters` pins.
+const DISPOSITIONS: &[(KvQuant, Disposition)] = &[
+    (KvQuant::None, Disposition::Baseline),
+    (KvQuant::K8V4, Disposition::InertMirrorFed),
+    (KvQuant::K8V8, Disposition::InertMirrorFed),
+    (KvQuant::Planar, Disposition::InertMirrorFed),
+    (KvQuant::Planar3, Disposition::InertMirrorFed),
+    (KvQuant::PlanarK, Disposition::InertMirrorFed),
+    (
+        KvQuant::Mixed {
+            k_bits: 8,
+            v_bits: 4,
+            k_group_size: 64,
+            v_group_size: 64,
+        },
+        Disposition::ReadsItsOwnStore,
+    ),
+    (
+        KvQuant::RotK {
+            v_bits: 8,
+            v_group_size: 64,
+        },
+        Disposition::ReadsItsOwnStore,
+    ),
+    (KvQuant::K8VTurbo3, Disposition::InertMirrorFed),
+    (KvQuant::K8VTurbo3Tcq, Disposition::InertMirrorFed),
+    (KvQuant::K8VTurbo2, Disposition::InertMirrorFed),
+    (KvQuant::K8VTurbo2Tcq, Disposition::InertMirrorFed),
+    (KvQuant::TurboSym3, Disposition::InertMirrorFed),
+    (KvQuant::TurboSym4, Disposition::InertMirrorFed),
+    (KvQuant::Iso3, Disposition::InertMirrorFed),
+    (KvQuant::Iso4, Disposition::InertMirrorFed),
+    (KvQuant::Iso3Sym, Disposition::ReadsItsOwnStore),
+    (KvQuant::Iso4Sym, Disposition::ReadsItsOwnStore),
+    (KvQuant::IsoKOnly3, Disposition::ReadsItsOwnStore),
+    (KvQuant::IsoKOnly4, Disposition::ReadsItsOwnStore),
+    (KvQuant::Rotor3, Disposition::InertMirrorFed),
+    (KvQuant::Rotor4, Disposition::InertMirrorFed),
+    (KvQuant::Rotor3Sym, Disposition::ReadsItsOwnStore),
+    (KvQuant::Rotor4Sym, Disposition::ReadsItsOwnStore),
+    (KvQuant::RotorKOnly3, Disposition::ReadsItsOwnStore),
+    (KvQuant::RotorKOnly4, Disposition::ReadsItsOwnStore),
+    (
+        KvQuant::RotorK3Asym {
+            v_bits: 4,
+            v_group_size: 64,
+        },
+        Disposition::InertMirrorFed,
+    ),
+    (
+        KvQuant::RotorK4Asym {
+            v_bits: 4,
+            v_group_size: 64,
+        },
+        Disposition::InertMirrorFed,
+    ),
+];
+
+/// The hand-written table and the runtime classifiers agree, on every variant.
+#[test]
+fn every_codec_carries_a_disposition() {
+    for &(q, want) in DISPOSITIONS {
+        assert_eq!(
+            disposition_of(q),
+            want,
+            "{q} is recorded as {want:?} but the runtime classifiers say \
+             {:?} — one of the two moved without the other",
+            disposition_of(q)
+        );
+    }
+}
+
+/// The table covers `ALL_KV_QUANTS` exactly — no variant unclassified, none
+/// listed twice, none left behind after a retirement.
+///
+/// Driven off the const beside the enum rather than a count kept here: a
+/// literal expected length is satisfied by a swap as well as by coverage.
+#[test]
+fn disposition_table_covers_every_variant_once() {
+    for &q in ALL_KV_QUANTS {
+        let hits = DISPOSITIONS.iter().filter(|(k, _)| *k == q).count();
+        assert_eq!(
+            hits, 1,
+            "{q} appears {hits} times in the disposition table — every codec \
+             needs exactly one, or a reader cannot tell which class it is in"
+        );
+    }
+    assert_eq!(
+        DISPOSITIONS.len(),
+        ALL_KV_QUANTS.len(),
+        "the disposition table names a codec that is not in ALL_KV_QUANTS — a \
+         retired variant left a row behind"
+    );
+}
+
+/// The bf16 baseline is the only codec in its class.
+///
+/// If a second variant ever classifies as `Baseline` the comparison every other
+/// row is measured against stops being a single thing, and "identical to
+/// `none`" stops naming one number.
+#[test]
+fn exactly_one_codec_is_the_baseline() {
+    let n = DISPOSITIONS
+        .iter()
+        .filter(|(_, d)| *d == Disposition::Baseline)
+        .count();
+    assert_eq!(n, 1, "expected exactly one Baseline codec, found {n}");
+}
+
+/// A codec's disposition is a property of its family, not of the bits and
+/// group sizes a caller spells.
+///
+/// The four parameterised families appear once each in the table above, at one
+/// representative parameter set. That is only a legitimate stand-in for the
+/// family if the classification cannot move with the parameters — otherwise the
+/// table would be silent about every point it does not name.
+#[test]
+fn disposition_is_a_property_of_the_family_not_its_parameters() {
+    let mixed: &[KvQuant] = &[
+        KvQuant::Mixed {
+            k_bits: 8,
+            v_bits: 4,
+            k_group_size: 64,
+            v_group_size: 64,
+        },
+        KvQuant::Mixed {
+            k_bits: 8,
+            v_bits: 8,
+            k_group_size: 128,
+            v_group_size: 128,
+        },
+        KvQuant::Mixed {
+            k_bits: 8,
+            v_bits: 2,
+            k_group_size: 64,
+            v_group_size: 32,
+        },
+    ];
+    for &q in mixed {
+        assert_eq!(disposition_of(q), Disposition::ReadsItsOwnStore, "{q}");
+    }
+
+    let rot_k: &[KvQuant] = &[
+        KvQuant::RotK {
+            v_bits: 8,
+            v_group_size: 64,
+        },
+        KvQuant::RotK {
+            v_bits: 4,
+            v_group_size: 128,
+        },
+    ];
+    for &q in rot_k {
+        assert_eq!(disposition_of(q), Disposition::ReadsItsOwnStore, "{q}");
+    }
+
+    // `validate_rotor_k_asym_v` accepts (4, 128|64|32) and (3|2, 64).
+    let rotor_asym: &[KvQuant] = &[
+        KvQuant::RotorK3Asym {
+            v_bits: 4,
+            v_group_size: 128,
+        },
+        KvQuant::RotorK3Asym {
+            v_bits: 2,
+            v_group_size: 64,
+        },
+        KvQuant::RotorK4Asym {
+            v_bits: 4,
+            v_group_size: 32,
+        },
+        KvQuant::RotorK4Asym {
+            v_bits: 3,
+            v_group_size: 64,
+        },
+    ];
+    for &q in rotor_asym {
+        assert_eq!(disposition_of(q), Disposition::InertMirrorFed, "{q}");
+    }
+}
+
+/// An inert codec is inert on both axes and reads nothing packed.
+///
+/// This is what makes "identical resident KV and identical token ids to `none`"
+/// a derivation rather than a coincidence of the two cells it was measured at:
+/// with no store built and both axes fed from bf16, there is no path by which a
+/// served request can differ.
+#[test]
+fn an_inert_codec_has_no_quantised_read_path() {
+    for &(q, d) in DISPOSITIONS {
+        if d != Disposition::InertMirrorFed {
+            continue;
+        }
+        assert!(
+            !q.decode_reads_packed_store(),
+            "{q} is recorded inert but decode reads its packed store"
+        );
+        assert!(
+            q.feeds_bf16_k_at_decode() && q.feeds_bf16_v_at_decode(),
+            "{q} is recorded inert but one axis is not fed from the bf16 mirror"
+        );
+        assert!(
+            !q.materialises_packed_store(),
+            "{q} is recorded inert but exit_prefill still builds its store"
+        );
+    }
+}

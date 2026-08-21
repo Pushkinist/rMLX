@@ -107,7 +107,12 @@ quantization surface in a single process.
 ² `llama.cpp` audio is in the `mtmd` CLI, not the HTTP server.
 ³ affine 2–8 bit, fp8, mxfp/nvfp4, **plus** five rotation-KV families
 (TurboQuant, IsoQuant, PlanarQuant, RotorQuant, ParoQuant) no other MLX server
-ships. ⁴ oMLX has a tiered RAM+SSD KV cache, not KV-bit quantization.
+ships. Widest *matrix*, not a memory win: measured on two architectures at two
+contexts, no KV codec in the tree currently holds fewer resident bytes than
+plain bf16 — 17 of the 28 build no packed store at all and decode identically to
+it, and the rest are larger. The honest per-codec disposition, and why the
+families are kept anyway, is
+[`docs/KV_QUANT.md` § Codec disposition](docs/KV_QUANT.md). ⁴ oMLX has a tiered RAM+SSD KV cache, not KV-bit quantization.
 ⁵ `llama.cpp` offers per-tensor block KV types (`q8_0`…`q5_1`) but no
 rotation-KV families. Competitor cells verified against each project's README /
 server docs (2026-06); capabilities evolve — corrections welcome.</sub>

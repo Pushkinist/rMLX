@@ -1629,6 +1629,10 @@ pub fn validate_resolved(arch_class: &str, kq: &KvQuant) -> Result<(), ResolveEr
     // families) are honestly surfaced here with a loud structured warn so the
     // 30–60× cost is never silent. These codecs still produce correct output
     // and are not rejected — only flagged.
+    //
+    // The suggestion is deliberately a codec that reads its own packed store:
+    // naming one of the mirror-fed codecs here would be advice to swap a slow
+    // no-op for a fast one, which is not what the operator asked for.
     if let Some(reason) = kq.cpu_hot_path_reason() {
         tracing::warn!(
             arch = arch_class,
@@ -1637,7 +1641,30 @@ pub fn validate_resolved(arch_class: &str, kq: &KvQuant) -> Result<(), ResolveEr
             "KV codec runs its encode + dequant on CPU on the default hot path — \
              expect a slow first forward and decode that slows as KV grows. \
              This is NOT a Metal kernel. \
-             Pick a Metal codec (k8v4 / k8v8 / planar / rot_k_v4g64) to avoid this."
+             Pick a Metal codec that reads its own store \
+             (mixed_k8g64_v4g64 / rot_k_v4g64 / k_iso4) to avoid this."
+        );
+    }
+
+    // Arch-agnostic honesty check, same warn-and-proceed posture as the one
+    // above: a codec whose decode reads the bf16 mirror never has its packed
+    // store built (`exit_prefill` skips it), so naming it changes neither the
+    // resident KV nor a single generated token. Measured on two architectures
+    // and two contexts: identical `kv_cache_bytes` and identical greedy token
+    // ids against `none`, for every codec in this class.
+    //
+    // Not an error. The names stay selectable — they appear in recorded bench
+    // rows, and each is the entry point its codec's decode kernel will be wired
+    // to. But an operator who passes one is entitled to know it did nothing,
+    // rather than reading a resolved-codec log line and inferring that it did.
+    if *kq != KvQuant::None && !kq.materialises_packed_store() {
+        tracing::warn!(
+            arch = arch_class,
+            kv_quant = %kq,
+            "KV codec is inert on this build — decode reads the bf16 mirror, so its \
+             packed store is never built. Resident KV and generated tokens are \
+             identical to `--kv-quant none`. Selecting it neither saves memory nor \
+             changes output; it only costs the layer-type dispatch."
         );
     }
 

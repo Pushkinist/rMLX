@@ -16,9 +16,9 @@
 //!   static preset table. `"auto"` yields `KvPresetArg::Auto`; unknown names
 //!   return a clap `InvalidValue` error with an available-names hint.
 //! - [`KvPresetArg`] — parsed `--kv-preset` value: either a resolved
-//!   [`KvQuant`] or the sentinel `Auto` variant for auto-selection.
-//! - [`resolve_preset_arg`] — convert a `KvPresetArg` to a `KvQuant`,
-//!   running the auto-selector for `KvPresetArg::Auto`.
+//!   [`KvQuant`] or the sentinel `Auto` variant.
+//! - [`resolve_preset_arg`] — convert a `KvPresetArg` to a `KvQuant`;
+//!   `Auto` is `DEFAULT_KV_QUANT`.
 //! - [`parse_cache_type`] — `--cache-type` string → [`CacheType`].
 //! - [`build_cache_type_spec`] — combine `--ctk` / `--ctv` / `--kv-quant`
 //!   / `--cache-type` aliases into a resolved `CacheType`.
@@ -34,9 +34,7 @@ use rmlx_mlx::Device;
 use rmlx_server::{try_claim, ClaimError};
 use tracing::error;
 
-use crate::commands::preset_table::{
-    lookup_preset, preferred_2bit, recommend_preset, PresetError, AVAILABLE_NAMES,
-};
+use crate::commands::preset_table::{lookup_preset, PresetError, AVAILABLE_NAMES};
 
 /// Parse the `--device` flag value into a `Device`.
 pub(crate) fn parse_device(s: &str) -> anyhow::Result<Device> {
@@ -124,13 +122,13 @@ pub(crate) fn parse_kv_quant(s: &str) -> anyhow::Result<Option<rmlx_kv_quant::Kv
 ///
 /// A clap `value_parser` must return a concrete type.  `KvPresetArg` carries
 /// either a fully-resolved `KvQuant` (for named presets) or the `Auto`
-/// sentinel (for `--kv-preset auto`).  The actual auto-selection is deferred
-/// to [`resolve_preset_arg`], which runs after the model config is loaded.
+/// sentinel (for `--kv-preset auto`), which [`resolve_preset_arg`] turns into
+/// `DEFAULT_KV_QUANT`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum KvPresetArg {
     /// A named preset that was resolved at parse time.
     Resolved(rmlx_kv_quant::KvQuant),
-    /// `--kv-preset auto` — defer to the auto-selector.
+    /// `--kv-preset auto` — resolved to `DEFAULT_KV_QUANT`.
     Auto,
 }
 
@@ -140,7 +138,7 @@ pub(crate) enum KvPresetArg {
 /// `KvPresetArg`; on failure it returns a `String` error so clap wraps it as
 /// an `InvalidValue` usage error with an available-names hint.
 ///
-/// - `"auto"` → `Ok(KvPresetArg::Auto)` (auto-selector).
+/// - `"auto"` → `Ok(KvPresetArg::Auto)`.
 /// - Any named preset → `Ok(KvPresetArg::Resolved(kv_quant))`.
 /// - Unknown names → `Err(...)` with the `AVAILABLE_NAMES` hint.
 ///
@@ -168,91 +166,17 @@ pub(crate) fn parse_kv_preset(name: &str) -> Result<KvPresetArg, String> {
 ///
 /// For `KvPresetArg::Resolved` this is a trivial unwrap.
 ///
-/// For `KvPresetArg::Auto` the auto-selector runs:
-/// 1. Query `unified_memory_gb()` — fall back to 8.0 GB on `None`.
-/// 2. Call `estimate_params_billions(cfg)` — fall back to 7.0 B on `None`.
-/// 3. Determine `context_tokens` from `max_ctx_override` or the model's
-///    `max_position_embeddings` (default 4096).
-/// 4. Call `recommend_preset(model_size_b, context_tokens, vram_gb)`.
-/// 5. Resolve the chosen preset name → `KvQuant` via `lookup_preset`.
-/// 6. Log the chosen preset at `info!`.
-///
-/// If the auto-selector returns `"max_compression_fallback"` (no preset fits),
-/// it falls back to `preferred_2bit()` and logs a `warn!`.
-pub(crate) fn resolve_preset_arg(
-    arg: KvPresetArg,
-    cfg: &rmlx_loader::ModelConfig,
-    max_ctx_override: Option<i32>,
-) -> rmlx_kv_quant::KvQuant {
+/// `KvPresetArg::Auto` is [`rmlx_models::kv_cache::DEFAULT_KV_QUANT`] — the
+/// same constant `--kv-quant auto` resolves to, read from the same place. Two
+/// auto surfaces that resolve independently are two defaults that can disagree,
+/// and this one did: it ran a unified-memory decision tree and returned a
+/// "compressing" preset under pressure, while every preset it could return
+/// holds resident KV byte-identical to bf16. It answered a memory question with
+/// something that has no memory effect.
+pub(crate) fn resolve_preset_arg(arg: KvPresetArg) -> rmlx_kv_quant::KvQuant {
     match arg {
         KvPresetArg::Resolved(kq) => kq,
-        KvPresetArg::Auto => {
-            use rmlx_core::unified_memory::unified_memory_gb;
-            use rmlx_loader::estimate_params_billions;
-
-            let vram_gb = unified_memory_gb().unwrap_or_else(|| {
-                tracing::warn!("unified_memory_gb() returned None — falling back to 8.0 GB");
-                8.0_f32
-            });
-
-            let model_size_b = estimate_params_billions(cfg).unwrap_or_else(|| {
-                tracing::warn!("estimate_params_billions() returned None — falling back to 7.0 B");
-                7.0_f32
-            });
-
-            // context_tokens: explicit override → model max_position_embeddings → 4096
-            let context_tokens: u32 = max_ctx_override
-                .map(|n| n as u32)
-                .or_else(|| {
-                    cfg.text_config
-                        .as_ref()
-                        .and_then(|tc| tc.max_position_embeddings)
-                })
-                .unwrap_or(4096);
-
-            let chosen_name = recommend_preset(model_size_b, context_tokens, vram_gb);
-
-            // Resolve "max_compression_fallback" to the least-bad available preset.
-            let final_name = if chosen_name == "max_compression_fallback" {
-                let p = preferred_2bit();
-                if let Ok(spec) = lookup_preset(p) {
-                    tracing::warn!(
-                        model_size_b,
-                        context_tokens,
-                        vram_gb,
-                        chosen = p,
-                        "auto-selector: model may not fit in VRAM; using best available preset"
-                    );
-                    return spec.kv_quant;
-                }
-                // Absolute last resort (q8 must always be present).
-                "q8"
-            } else {
-                chosen_name
-            };
-
-            if let Ok(spec) = lookup_preset(final_name) {
-                tracing::info!(
-                    model_size_b,
-                    context_tokens,
-                    vram_gb,
-                    preset = final_name,
-                    "auto-selector chose preset"
-                );
-                spec.kv_quant
-            } else {
-                // Chosen name was a future preset not yet in the table;
-                // fall back to q8 which is always present.
-                tracing::warn!(
-                    wanted = final_name,
-                    chosen = "q8",
-                    "auto-selector: preset not yet in table, fell back to q8"
-                );
-                // q8 is a starter preset and must always be in the table.
-                // If somehow it's absent, return KvQuant::K8V8 directly.
-                lookup_preset("q8").map_or(rmlx_kv_quant::KvQuant::K8V8, |s| s.kv_quant)
-            }
-        }
+        KvPresetArg::Auto => rmlx_models::kv_cache::DEFAULT_KV_QUANT,
     }
 }
 

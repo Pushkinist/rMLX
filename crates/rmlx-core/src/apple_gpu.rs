@@ -31,7 +31,6 @@
 //! - Pure user-space, no extra Metal binding surface to maintain.
 //! - Side-effect free (no Metal context allocation).
 //! - Available before MLX initialises.
-//! - Mirrors the existing [`crate::unified_memory`] pattern.
 //!
 //! Unknown / unparseable brand strings (e.g. a future "Apple M6 Pro" we
 //! haven't taught the mapping yet) fall back to `None`. Callers MUST treat
