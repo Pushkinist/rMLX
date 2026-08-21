@@ -316,3 +316,163 @@ fn integer_bits_as_f32_dispatches_to_integer_path() {
     };
     assert_eq!(kq_int, kq_f32, "f32 integer dispatch must match u8 path");
 }
+
+// ── auto KV-quant resolution ─────────────────────────────────────────────
+//
+// `--kv-quant auto` (i.e. no flag) must resolve to the same codec for every
+// architecture the CLI can load. The table below names one checkpoint shape
+// per branch the arch resolver used to distinguish, so a per-arch exception
+// re-appearing anywhere fails here rather than at a user's first serve.
+
+/// One synthetic `config.json` per architecture class the resolver sees.
+fn auto_resolution_fixtures() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "qwen3-vl-moe",
+            r#"{"architectures":["Qwen3VLMoeForConditionalGeneration"]}"#,
+        ),
+        (
+            "qwen3.5-moe",
+            r#"{"architectures":["Qwen3_5MoeForConditionalGeneration"]}"#,
+        ),
+        (
+            "qwen3.5-dense-paro",
+            r#"{"architectures":["Qwen3_5ForConditionalGeneration"],
+                "quantization_config":{"quant_method":"paroquant"}}"#,
+        ),
+        (
+            "qwen3.5-dense",
+            r#"{"architectures":["Qwen3_5ForConditionalGeneration"]}"#,
+        ),
+        (
+            "qwen3-dense-2bit",
+            r#"{"architectures":["Qwen3ForCausalLM"],
+                "quantization":{"group_size":64,"bits":2}}"#,
+        ),
+        (
+            "qwen3-dense-8bit",
+            r#"{"architectures":["Qwen3ForCausalLM"],
+                "quantization":{"group_size":64,"bits":8}}"#,
+        ),
+        ("qwen2-dense", r#"{"architectures":["Qwen2ForCausalLM"]}"#),
+        ("laguna", r#"{"architectures":["LagunaForCausalLM"]}"#),
+        (
+            "gemma3",
+            r#"{"architectures":["Gemma3ForConditionalGeneration"]}"#,
+        ),
+        (
+            "gemma4-moe",
+            r#"{"architectures":["Gemma4ForConditionalGeneration"],
+                "text_config":{"hidden_size":2048,"enable_moe_block":true}}"#,
+        ),
+        (
+            "gemma4-small-paro",
+            r#"{"architectures":["Gemma4ForConditionalGeneration"],
+                "text_config":{"hidden_size":1536},
+                "quantization_config":{"quant_method":"paroquant"}}"#,
+        ),
+        (
+            "gemma4-small",
+            r#"{"architectures":["Gemma4ForConditionalGeneration"],
+                "text_config":{"hidden_size":1536}}"#,
+        ),
+        (
+            "gemma4-dense",
+            r#"{"architectures":["Gemma4ForConditionalGeneration"],
+                "text_config":{"hidden_size":5376}}"#,
+        ),
+        (
+            "gemma4-unified-12b",
+            r#"{"architectures":["Gemma4UnifiedForConditionalGeneration"],
+                "text_config":{"hidden_size":3840}}"#,
+        ),
+        (
+            "unknown-arch",
+            r#"{"architectures":["NoSuchArchForCausalLM"]}"#,
+        ),
+        ("no-arch-field", r"{}"),
+    ]
+}
+
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "fixture JSON is a literal in this file; a parse failure is a test bug"
+)]
+fn auto_kv_quant_resolves_to_bf16_for_every_arch_branch() {
+    for (name, body) in auto_resolution_fixtures() {
+        let cfg: rmlx_loader::ModelConfig = serde_json::from_str(body).unwrap();
+        let resolved = resolve_kv_quant(&cfg, None, None);
+        assert_eq!(
+            resolved,
+            rmlx_kv_quant::KvQuant::None,
+            "auto resolution for '{name}' is {resolved:?}, not bf16"
+        );
+    }
+}
+
+// ── --paged-kv against the resolved codec ────────────────────────────────────
+//
+// Paged KV pages a codec's packed store. Under the bf16 auto default there is
+// no store, so the flag combination is refused rather than silently promoted to
+// a quantised codec — see `reject_paged_kv_without_store`.
+
+#[test]
+fn paged_kv_is_refused_when_the_resolved_codec_keeps_no_store() {
+    use rmlx_kv_quant::KvQuant;
+    // The auto default, and the two ways an operator reaches it.
+    for resolved in [None, Some(rmlx_models::kv_cache::DEFAULT_KV_QUANT)] {
+        let msg = reject_paged_kv_without_store(true, resolved)
+            .unwrap_or_else(|| panic!("--paged-kv with {resolved:?} must be refused"));
+        // The message has to be actionable for someone who passed no codec flag.
+        assert!(
+            msg.contains("--kv-quant auto"),
+            "message must explain that auto is bf16: {msg}"
+        );
+        assert!(
+            msg.contains("k8v8"),
+            "message must name a codec to pass: {msg}"
+        );
+    }
+    // The bar is "unquantised", unchanged from before the auto default moved:
+    // a named quantised codec is still accepted, even though the mirror family
+    // no longer materialises a store. Widening that is a separate change.
+    assert_eq!(
+        reject_paged_kv_without_store(true, Some(KvQuant::K8V8)),
+        None
+    );
+}
+
+#[test]
+fn paged_kv_is_accepted_when_a_quantised_codec_was_named() {
+    use rmlx_kv_quant::KvQuant;
+    let mixed = KvQuant::Mixed {
+        k_bits: 8,
+        v_bits: 4,
+        k_group_size: 64,
+        v_group_size: 64,
+    };
+    assert!(
+        mixed.materialises_packed_store(),
+        "fixture must keep a store"
+    );
+    for kq in [mixed, KvQuant::K8V4, KvQuant::Planar] {
+        assert_eq!(
+            reject_paged_kv_without_store(true, Some(kq)),
+            None,
+            "--paged-kv refused a named quantised codec {kq:?}"
+        );
+    }
+}
+
+#[test]
+fn without_paged_kv_the_codec_is_never_second_guessed() {
+    use rmlx_kv_quant::KvQuant;
+    for resolved in [None, Some(KvQuant::None), Some(KvQuant::K8V8)] {
+        assert_eq!(
+            reject_paged_kv_without_store(false, resolved),
+            None,
+            "the guard fired without --paged-kv for {resolved:?}"
+        );
+    }
+}

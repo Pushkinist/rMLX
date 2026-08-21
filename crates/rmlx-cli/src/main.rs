@@ -378,9 +378,9 @@ enum Cmd {
         /// timeout on long prompts. Use --device cpu to fall back to CPU.
         #[arg(long)]
         device: Option<String>,
-        /// KV cache quantization: "auto" (arch default), "bf16" (unquantised cache; alias "none"), "k8v4", "k8v8", or "planar".
-        /// "auto" selects the CLAUDE.md-mandated default per architecture
-        /// (e.g. K8V4 for Qwen MoE). Default is "auto".
+        /// KV cache quantization: "auto", "bf16" (alias "none"), "k8v4",
+        /// "k8v8", or "planar". Default is "auto", which is unquantised bf16 on
+        /// every architecture and every context length.
         #[arg(long)]
         kv_quant: Option<String>,
         /// Named KV-cache preset (see long-help). Mutually exclusive with
@@ -767,7 +767,7 @@ enum Cmd {
         /// Defaults to "gpu". Chunked prefill (Stage-3.2b) resolves the Metal watchdog timeout.
         #[arg(long, default_value = "gpu")]
         device: String,
-        /// KV cache quantization: "auto" (arch default), "bf16" (unquantised cache; alias "none"), "k8v4", "k8v8", or "planar".
+        /// KV cache quantization: "auto" (unquantised bf16, every arch), "bf16" (alias "none"), "k8v4", "k8v8", or "planar".
         #[arg(long, default_value = "auto")]
         kv_quant: String,
         /// Named KV-cache preset (see long-help). Mutually exclusive with
@@ -883,7 +883,7 @@ enum Cmd {
         /// 5 = unsupported (architecture not handled). Exit 2 is reserved by clap.
         #[arg(long, default_value_t = false)]
         probe_smoke: bool,
-        /// KV cache quantization: "auto" (arch default), "bf16" (unquantised cache; alias "none"), "k8v4", "k8v8", or "planar".
+        /// KV cache quantization: "auto" (unquantised bf16, every arch), "bf16" (alias "none"), "k8v4", "k8v8", or "planar".
         #[arg(long, default_value = "auto")]
         kv_quant: String,
         /// Named KV-cache preset (see long-help). Mutually exclusive with
@@ -1005,7 +1005,7 @@ enum Cmd {
         /// Written to the `prompt` column of baseline.csv.
         #[arg(long, default_value = "")]
         prompt_label: String,
-        /// KV cache quantization: "auto" (arch default), "bf16" (unquantised cache; alias "none"), "k8v4", "k8v8", or "planar".
+        /// KV cache quantization: "auto" (unquantised bf16, every arch), "bf16" (alias "none"), "k8v4", "k8v8", or "planar".
         #[arg(long, default_value = "auto")]
         kv_quant: String,
         /// Named KV-cache preset (see long-help). Mutually exclusive with
@@ -1174,7 +1174,7 @@ enum Cmd {
         /// Discarded warmup runs before the measured ones.
         #[arg(long, default_value_t = 1)]
         warmup: u32,
-        /// KV cache quantization: "auto" (arch default), "bf16" (unquantised
+        /// KV cache quantization: "auto" (unquantised bf16, every arch), "bf16" (unquantised
         /// cache; alias "none"), "k8v4", "k8v8", "planar", ...
         #[arg(long, default_value = "auto")]
         kv_quant: String,
@@ -1926,13 +1926,10 @@ fn main() -> Result<()> {
             // Validate --paged-kv against the fully resolved KvQuant
             // (post-preset resolution). This covers --kv-preset fp16 and any
             // other path that yields KvQuant::None (unquantised / bf16).
-            if paged_kv {
-                let final_kq = kv_quant_final.unwrap_or(rmlx_kv_quant::KvQuant::None);
-                if matches!(final_kq, rmlx_kv_quant::KvQuant::None) {
-                    return Err(anyhow::anyhow!(
-                        "--paged-kv requires K8V4 / K8V8 / Planar; got unquantised (bf16/fp16)"
-                    ));
-                }
+            if let Some(msg) =
+                commands::parse::reject_paged_kv_without_store(paged_kv, kv_quant_final)
+            {
+                return Err(anyhow::anyhow!(msg));
             }
 
             // Acquire Metal claim for GPU runs; CPU-only skips.

@@ -689,7 +689,6 @@ fn load_assistant(
 // ---------------------------------------------------------------------------
 
 use crate::decode_loop::ProbeStep;
-use crate::kv_cache::{KvCacheBuilder, ResolverSignals};
 use rmlx_kv_quant::{KvCache, KvQuant, KV_MAX_SEQ_DEFAULT};
 use std::time::Instant;
 
@@ -738,14 +737,9 @@ pub fn mtp_assistant_generate_greedy(
     }
     let mut emitted: Vec<ProbeStep> = Vec::with_capacity(n_tokens);
 
-    // Migrated from for_arch_default (deprecated) to resolve_default.
-    // Signals::default() → hidden_size=None → falls through to K8V8 (Gemma4 unknown-size arm).
-    let kv_quant = kv_quant_override.unwrap_or_else(|| {
-        KvCacheBuilder::resolve_default(
-            "Gemma4ForConditionalGeneration",
-            ResolverSignals::default(),
-        )
-    });
+    // Same constant the verifier resolves — a spec pair must not run two
+    // different caches.
+    let kv_quant = kv_quant_override.unwrap_or(crate::kv_cache::DEFAULT_KV_QUANT);
     let max_seq = max_ctx_override.unwrap_or_else(|| {
         let v_mpe = verifier.max_position_embeddings();
         if v_mpe <= 0 || v_mpe > KV_MAX_SEQ_DEFAULT {

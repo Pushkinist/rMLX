@@ -555,10 +555,70 @@ Those figures are from gemma-4-**e2b**, Ternary-Bonsai-8B and Qwen3.6-35B-A3B.
 Only two of the three are canary models — the canary's Gemma4 is **e4b**, and no
 sampled cell was taken on it.
 
-**Per-model kv_quant resolved by arch resolver (auto):**
+**Per-model kv_quant resolved by arch resolver (auto) AT THE TIME THESE ROWS
+WERE RECORDED:**
 - Bonsai (Qwen3ForCausalLM, 2bit): `mixed_k8g64_v4g64`
 - Gemma4-e4b (mxfp8): `k8v8`
 - Qwen3.6-35B-A3B (8bit MoE): `k8v8`
+
+**`auto` no longer resolves to any of those.** The per-arch table is retired;
+`--kv-quant auto` is unquantised bf16 on every architecture
+(`docs/KV_QUANT.md` "The auto default"). Consequence for these anchors, by
+model:
+
+- **Gemma4-e4b and Qwen3.6-35B-A3B rows still describe the auto cell.** `k8v8`
+  is a bf16-mirror codec: it builds no packed store and decodes off the same
+  bf16 mirror `none` does. Two instruments, and each covers what it covers:
+  the *residency + token-id* comparison (one process per arm, pre-change binary
+  vs post-change binary) ran on gemma-4-e2b and Qwen3.6-35B-A3B at 4k / 8k /
+  32k and returned byte-identical `kv_cache_bytes` and identical token ids at
+  every point; the *decode-TPS* comparison (`perf_ab.sh`, ABBA, 8 slots) ran on
+  gemma-4-e2b at 4k / 8k / 32k and on Qwen3.6-35B-A3B at 4k / 32k only, and
+  returned INCONCLUSIVE at every cell with `kv_cache_bytes` ratio exactly
+  1.0000. There is no 8k ABBA cell on Qwen3.6-35B-A3B.
+- **The Bonsai row is now a different cell from `auto`.** `mixed_k8g64_v4g64`
+  reads its packed store and is a real codec; `auto` is bf16. Re-read that row
+  as a `mixed_k8g64_v4g64` anchor, not as an auto anchor. `scripts/perf_canary.sh`
+  passes no `--kv-quant`, so it no longer measures that cell at all.
+
+Re-anchored below rather than left to drift.
+
+### Canary anchors at the bf16 auto default (2026-08-21)
+
+Same instrument and same shape as the 2026-05-21 table above
+(`bash scripts/perf_canary.sh`, `release-perf`, `--prompt-tokens 4096
+--max-tokens 100 --max-ctx 8192`, 1 warmup discarded + 3 measured, median +
+sample stddev), taken at `2f4cafd3` — the branch tree, which differs from the
+merged commit only in doc comments. `kv_quant` is what the binary resolved, not
+a flag: `perf_canary.sh` passes no `--kv-quant`.
+
+| model | git_sha | kv_quant | decode_tps | stddev | CoV | profile | date |
+|---|---|---|---:|---:|---:|---|---|
+| prism-ml__Ternary-Bonsai-8B-mlx-2bit | 2f4cafd3 | `None` (bf16) | 142.33 | 2.91 | 2.0% | release-perf | 2026-08-21 |
+| mlx-community__gemma-4-e4b-it-mxfp8 | 2f4cafd3 | `None` (bf16) | 79.57 | 1.01 | 1.3% | release-perf | 2026-08-21 |
+| mlx-community__Qwen3.6-35B-A3B-8bit | 2f4cafd3 | `None` (bf16) | 100.53 | 0.34 | 0.3% | release-perf | 2026-08-21 |
+
+**These are new anchors, not a measured improvement over the 2026-05-21 rows,
+and must not be subtracted from them.** Three independent reasons: the codec
+differs on the Bonsai row; three months of unrelated decode work sit between the
+two dates (the Qwen3 bf16-stream cast, the layer-adaptive `none` exemption, the
+packed-store elision, the f32 dispatcher-output fix); and **cross-run absolute
+decode TPS is not reliable on this host** — the same binary with the same flags
+has read 54.89 and 49.27 TPS thirty minutes apart. Only within-a-single-ABBA-run
+ratios support a direction. What these rows are good for is what a canary is
+for: a floor for the *next* run of the same instrument on the same host.
+
+**Host conditions, disclosed rather than claimed clean.** `perf_canary.sh` has
+no quiescence gate (unlike `perf_ab.sh`). At launch the 1/5/15 load averages
+were 8.60 / 6.74 / 4.32 and the busiest foreign process sampled was 8.8% of one
+core; nothing was above the 25% bar `perf_ab.sh` would have enforced, and the
+per-model CoV (2.0% / 1.3% / 0.3%) is consistent with that. Treat the Bonsai
+row's 2.0% as the noise floor of this anchor, not as precision.
+
+The `k8vturbo3` comparison arm the canary also runs came back at 142.62 / 79.17
+/ 100.47 — within one stddev of the bf16 arm on all three models, sequential
+(not ABBA) and therefore not a comparison, only a sanity check that the opt-in
+codec still serves.
 
 Captured by `bash scripts/perf_canary.sh` under `release-perf` profile
 (debug-assertions=false, overflow-checks=false, stripped debug).
@@ -1530,11 +1590,11 @@ amortized differently across the generation window, which could make the
 *combined* number look better at 8k for some token counts. Once prefill is
 excluded, 8k decode is unambiguously slower.
 
-The KV-quant auto-resolution is **identical** at both contexts:
-`Qwen3ForCausalLM` with `weight_bits=2` resolves to `Mixed{k8,v4,g64,g64}`
-regardless of ctx — `resolve_default` (`kv_cache/mod.rs:331`) has no ctx branch
-for this arch, and `kv_quant_for_ctx` is not consulted on the baseline path. So
-the 4k-vs-8k difference is not a KV-quant-by-ctx effect. Both runs also go
+The KV-quant auto-resolution is **identical** at both contexts. It was
+`Mixed{k8,v4,g64,g64}` when this pair was recorded (the `Qwen3ForCausalLM`
+`weight_bits=2` entry of the per-arch table, since retired) and it is
+unquantised bf16 now; either way it does not vary with ctx, so the 4k-vs-8k
+difference is not a KV-quant-by-ctx effect. Both runs also go
 through the identical `rmlx baseline` path, which is what rules out a harness
 difference between the two rows — worth keeping in view now that the paragraph
 below asks for the pair to be re-measured.

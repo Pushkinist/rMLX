@@ -83,7 +83,7 @@ fn smoke_probe_gemma4_mxfp8_is_clean() {
     .expect("arch::load_model should succeed for Gemma4ForConditionalGeneration");
 
     // CPU: generate_greedy re-encodes the full prefix each step (O(N²), no KV cache).
-    // kv_quant_override = None: use arch default (KvCacheBuilder::for_arch_default).
+    // kv_quant_override = None: use the engine default (`DEFAULT_KV_QUANT`).
     // max_ctx_override = None: derive from model.max_position_embeddings.
     // A7.2: smoke probe is greedy (temperature 0.0).
     let smoke_sampler_cfg = rmlx_models::SamplerConfig {

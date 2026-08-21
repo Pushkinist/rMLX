@@ -17,14 +17,15 @@ primitives. Applies to `rmlx serve`, `rmlx chat`, `rmlx info`, and
 ## 1. TL;DR
 
 - **Presets** — `--kv-quant <k8v8|k8v4|planar|none|mixed_…>` picks a named
-  combo wired into the codebase. Default: `auto`, resolved per-arch by
-  `KvCacheBuilder::resolve_default` (see §6).
+  combo wired into the codebase. Default: `auto`, which resolves to
+  `DEFAULT_KV_QUANT` (see §6).
 - **Primitives** — `--cache-type-k <tag>` / `--cache-type-v <tag>` (long
   aliases `--ctk` / `--ctv`) set the K and V codec independently from §4's
-  namespace. `auto` on either side delegates that side to the resolver.
-- **Default recommendation**: leave both unset — the auto resolver picks the
-  best-known combo per architecture (see §6 table). Use the primitives only
-  when sweeping novel combos or migrating from llama.cpp.
+  namespace. `auto` on either side delegates that side to the default.
+- **Default recommendation**: leave both unset — `auto` is unquantised bf16 on
+  every architecture (see §6). Use the primitives only when sweeping novel
+  combos or migrating from llama.cpp; naming one side quantised makes the other
+  side's `auto` its canonical `q8_g128` partner, not bf16.
 
 **Note for llama.cpp users**: rMLX flags use double-dash (`--ctk`), not
 single-dash (`-ctk`).
@@ -815,46 +816,26 @@ storage variants regardless of `--paged-kv`):
 
 ## 6. Default policy
 
-When neither `--kv-quant` nor the primitives are passed, the per-arch
-default comes from `KvCacheBuilder::resolve_default` in
-`crates/rmlx-models/src/kv_cache/mod.rs`. The mapping (read from the
-current source):
+When neither `--kv-quant` nor the primitives are passed, the codec is
+`rmlx_models::kv_cache::DEFAULT_KV_QUANT` - unquantised bf16 - for every
+architecture, every checkpoint and every prompt length. One constant, read by
+the CLI, the server load path, the image branch, the arch dispatcher and all
+six speculative drafter stacks.
 
-| Arch class                              | Signal                          | Default `KvQuant` |
-|-----------------------------------------|---------------------------------|-------------------|
-| `Qwen3_5MoeForConditionalGeneration`    | (any)                           | `K8V8`            |
-| `Qwen3_5ForConditionalGeneration`       | `is_paroquant = true`           | `K8V4`            |
-| `Qwen3_5ForConditionalGeneration`       | otherwise                       | `K8V8`            |
-| `Qwen3ForCausalLM`                      | `weight_bits = 2` (Bonsai)      | `Mixed{8,4,g=64}` |
-| `Qwen3ForCausalLM`                      | otherwise                       | `K8V8`            |
-| `Qwen2ForCausalLM`, `LagunaForCausalLM` | (any)                           | `K8V8`            |
-| `Gemma3ForConditionalGeneration`        | (any)                           | `Planar`          |
-| `Gemma4ForConditionalGeneration`        | `has_moe`                       | `K8V8`            |
-| `Gemma4ForConditionalGeneration`        | `hidden_size ≤ 2560` (e2b/e4b)  | `K8V8` (`K8V4` if `is_paroquant`) |
-| `Gemma4ForConditionalGeneration`        | `hidden_size ≥ 5376` (31b)      | `Planar`          |
-| `Gemma4ForConditionalGeneration`        | hidden_size in (2560, 5376)     | `K8V8` (safe fallback) |
-| unknown                                 | —                               | `K8V8`            |
+It replaced a per-arch table (keyed on arch class, `hidden_size`, the MoE flag,
+the PARO flag and `quantization.bits`) and a separate per-prompt-length server
+policy that re-picked a codec per request (live under `--registry` only —
+`serve --model` pre-resolves `auto` in the CLI, so the server never saw an
+unresolved codec there). Both are removed,
+not retuned: the bf16-mirror codecs the table selected build no packed store
+and are byte-identical to bf16 in both output and resident KV, and the one
+store-reading codec it selected (`Mixed` on 2-bit Qwen3 dense) is bf16 plus a
+store - larger, lossy, and no faster. `docs/KV_QUANT.md` "The auto default"
+carries the measurement and the operator-visible consequences.
 
-One-line rationale per row:
+Every codec stays selectable by name. `--kv-preset auto`, a separate
+hardware-aware selector the operator opts into explicitly, is unchanged.
 
-- Qwen3.5 MoE — Mixed K8V8 regressed on the hybrid GDN+FA arch;
-  K8V8 fused dequant + fast SDPA wins on FA-light layouts.
-- Qwen3.5 dense PARO — K8V4 bit-exact vs paroquant reference, wins memory
-  and TPS.
-- Qwen3 dense (Bonsai 2-bit) — Mixed routes directly into
-  `mx.quantized_matmul` and skips the per-step full dequant.
-- Qwen2 / Laguna — safe K8V8 default (11/11 coherent at 4k bench).
-- Gemma3 (medgemma) — Planar wins TPS; chat-template divergence is not a
-  kernel issue.
-- Gemma4 MoE (26b-a4b) — K8V8 ties Planar on TPS; prefer the universally
-  validated path.
-- Gemma4 small (e2b/e4b) — K8V8 baseline; PARO variant gets K8V4.
-- Gemma4 dense 31b — Planar wins TPS at acceptable PPL with low GQA.
-- Unknown arch — K8V8 is the cross-arch safe default.
-
-The auto-by-context server policy (`kv_quant_for_ctx`) is a separate path
-documented in `crates/rmlx-models/src/kv_cache/mod.rs`; it is invoked only
-when no explicit `--kv-quant` flag is given and only by `serve`/`chat`.
 
 ---
 

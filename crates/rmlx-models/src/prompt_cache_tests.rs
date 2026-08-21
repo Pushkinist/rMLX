@@ -15,14 +15,14 @@ use rmlx_mlx::{Array, Device};
 /// running**, not a snapshot of the one the SSD tier attached under.
 ///
 /// The layout key cannot carry this: it is computed once at attach from the
-/// launch codec, while `kv_quant_for_ctx` (auto mode) and the per-request
+/// launch codec, while the per-request
 /// `kv_quant` override both let a request run a different one. Pinned two ways
 /// — the seed must equal the vector-form seed built from the request's own
 /// codec, and it must move with the layer count that sizes that vector.
 #[test]
 fn request_cache_seed_folds_the_requests_own_mixture() {
     let lk = 0x0f0f_0f0f_0f0f_0f0f_u64;
-    // Every codec `kv_quant_for_ctx` can hand a request in auto mode.
+    // Every codec a request can name for itself.
     for q in [KvQuant::K8V4, KvQuant::None, KvQuant::K8V8, KvQuant::Planar] {
         assert_eq!(
             request_cache_seed(lk, q, TEST_LAYERS, TEST_SIG),

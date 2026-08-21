@@ -424,10 +424,24 @@ pub(crate) fn run_qwen3vl_image(
     }
 
     // Qwen3-VL image-conditioned attention is sensitive to KV quantization:
-    // K8V8 (the global `for_arch_default`) measurably degraded the image
+    // K8V8 (the auto default at the time) measurably degraded the image
     // description (incoherent output) while bf16 reproduces the mlx-vlm
-    // reference answer exactly. Default the image branch to unquantised bf16
-    // KV unless the operator explicitly overrode `--kv-quant`.
+    // reference answer exactly. So the image branch runs unquantised bf16
+    // unless the operator explicitly overrode `--kv-quant`.
+    //
+    // What that actually amounts to today, stated rather than assumed: the
+    // `unwrap_or` only fires when the caller passed `None`, and the caller
+    // passes `None` exactly when no operator codec is in play. In registry mode
+    // with no `--kv-quant` that is this literal. In `--model` mode it is not
+    // reachable at all — the CLI resolves `auto` before `run_serve` and hands
+    // the generator a concrete codec, so the generator reports the flag as
+    // operator-supplied and forwards it here.
+    //
+    // So this literal does NOT insulate the image path from the engine default
+    // in `--model` mode; there the image path runs whatever `auto` resolved to.
+    // It is harmless while the two agree (both bf16). Making the pin real means
+    // threading "the operator named a codec" separately from "a codec is set",
+    // which is a change to the load config and is not made here.
     let kv_quant = kv_quant_override.unwrap_or(rmlx_kv_quant::KvQuant::None);
 
     let bytes = rmlx_server_load_image(&sources[0])?;

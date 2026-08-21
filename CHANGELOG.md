@@ -414,6 +414,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`--kv-quant auto` resolves to unquantised bf16, on every architecture and
+  every prompt length.** Previously two resolvers disagreed with each other: a
+  per-arch table returned `K8V8` / `K8V4` / `Planar` / `Mixed{k8g64,v4g64}`
+  from arch class, `hidden_size`, the MoE flag, the PARO flag and
+  `quantization.bits`, and a separate per-prompt-length server policy then
+  re-picked `K8V4` / `None` / `K8V8` / `Planar` per request, overriding it.
+  Both are removed.
+
+  The second one's reach was narrower than it looks, and worth stating so the
+  removal is not oversold: on `rmlx serve --model` it never fired, because the
+  CLI resolves `auto` before the server starts and hands the generator a
+  concrete codec, which the server reads as operator-supplied. It was live in
+  `--registry` (multi-model) mode, where no codec is pre-resolved — measured
+  there on one gemma-4-e2b: the same model served `K8V4`, `K8V4`, `None` and
+  `K8V8` across four requests of 110 / 3 010 / 9 010 / 30 010 prompt tokens. A single constant,
+  `rmlx_models::kv_cache::DEFAULT_KV_QUANT`, is now read by the CLI, the server
+  load path, the image branch, the arch dispatcher and all six speculative
+  drafter stacks. `KvCacheBuilder::for_arch_default`,
+  `KvCacheBuilder::resolve_default`, `ResolverSignals`, `kv_quant_for_ctx` and
+  `Architecture::preferred_auto_kv` are gone with it.
+
+  **What changes for you.** If you passed an explicit `--kv-quant`,
+  `--cache-type-k/-v`, `--kv-bits` or `--kv-preset`, nothing changes — explicit
+  always wins, and every codec remains selectable by name. If you passed no
+  flag, output is **byte-identical at temp=0** on every architecture whose old
+  default was a bf16-mirror codec (`K8V8`, `K8V4`, `Planar`), because those
+  codecs already decoded off the bf16 mirror and, since the packed store was
+  elided, already held exactly bf16's resident bytes — verified byte-identical
+  `kv_cache_bytes` and identical token ids on gemma-4-e2b at 4k/8k/32k. It is
+  **not** byte-identical on `Qwen3ForCausalLM` at `weight_bits == 2` (Bonsai
+  ternary), whose old default `Mixed{k8g64,v4g64}` genuinely quantises: that one
+  gets smaller and lossless instead of larger and lossy. Pass
+  `--kv-quant mixed_k8g64_v4g64` to reproduce the old bits.
+
+  This is not a claim that quantised KV cannot pay — it is a claim that these
+  implementations do not, today, on this hardware. `DEFAULT_KV_QUANT` is the
+  single place a future answer changes.
+
+  **Two flag surfaces change with it.** `--paged-kv` now requires an explicit
+  `--kv-quant`: it pages a codec's packed store, `auto` is bf16, and bf16 has no
+  store, so `rmlx serve --model M --paged-kv` exits 1 with a message naming a
+  codec instead of inheriting a quantised per-arch default. It is deliberately
+  not auto-promoted — picking a codec because a storage-layout flag was passed
+  would be a second codec resolver keyed on something other than `--kv-quant`.
+  And a single-sided `--cache-type-k` / `--cache-type-v` now fills the side you
+  left `auto` with that codec's canonical `q8_g128` partner rather than with the
+  engine default: naming one side quantised is an opt-in to quantisation, and
+  decomposing the other side from a bf16 default would have made every
+  single-sided invocation a startup refusal (`--ctv tq4`, `--ctk q8_g128`, …).
+
+  The `perf_canary` anchors in `docs/PERF_BASELINE.md` are re-taken at the new
+  default, because the Bonsai one silently changed meaning: the canary passes no
+  `--kv-quant`, so its Bonsai row measured `Mixed{k8g64,v4g64}` before and bf16
+  now. The 2026-05-21 rows are kept and marked as belonging to the retired
+  defaults; the new rows are anchors, not a measured gain over them.
+
+
 - **The five `OnceLock` kernel gates are one threaded `DispatchPolicy` value.**
   `fused_qk_enabled`, `sparse_attn_enabled`, `turbo_flash_enabled`,
   `turbo_flash_lock_enabled`, `planar_flash_decode_enabled`,

@@ -136,7 +136,7 @@ Conventions:
 | `bench/run_upstream_ppl.py` | Run `mlx_lm.evaluate` wikitext-PPL across the in-scope model set. |
 | `bench/build_ppl_drift_table.py` | Render the PPL × TPS × similarity-drift table. |
 | `bench/extract_outputs.py` | Extract per-(model, backend, quant) greedy-output tuples from CBB `summary.csv`. |
-| `bench/auto_resolution_smoke.py` | 5-model auto-resolution + regression smoke. |
+| `bench/auto_resolution_smoke.py` | 5-model auto-resolution + regression smoke. Asserts every arch resolves `--kv-quant auto` to the one engine default, and that serving has not collapsed. |
 
 ## One-off assets
 

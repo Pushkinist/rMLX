@@ -11,12 +11,12 @@
 > for codec-layer items (`KvCache`, `KvQuant`, `LinearAttnCache`, …) and
 > for SSD-tier items (`write_caches`, `set_ssd_*_hook`, …) was dropped.
 > Callers now import directly from `rmlx_kv_quant::*` / `rmlx_kv_ssd::*`.
-> Only the **policy / builder** items (`KvCacheBuilder`, `ResolverSignals`,
-> `kv_quant_for_layer`, `kv_quant_for_ctx`, `LAYER_ADAPTIVE_*`,
+> Only the **policy / builder** items (`KvCacheBuilder`,
+> `kv_quant_for_layer`, `DEFAULT_KV_QUANT`, `LAYER_ADAPTIVE_*`,
 > `cache_type::*`) remain under `rmlx_models::kv_cache::*`.
 
 Codec-level reference for every KV quantization variant in rMLX. Covers
-storage layout, dispatch path, per-arch defaults, and CLI flag surface.
+storage layout, dispatch path, the auto default, and CLI flag surface.
 
 For the flag-surface overview and per-command usage see `docs/KV_CACHE.md`.
 For weight quantization see `docs/WEIGHT_QUANTS.md`. For the SSD spill tier
@@ -48,9 +48,7 @@ dropped; callers import the items directly from `rmlx_kv_quant`:
 
 The policy / builder layer stays in `rmlx-models::kv_cache`:
 
-* `KvCacheBuilder::for_arch_default`, `KvCacheBuilder::resolve_default`
-* `ResolverSignals`
-* `kv_quant_for_layer`, `kv_quant_for_ctx`
+* `kv_quant_for_layer`, `DEFAULT_KV_QUANT`
 * `LAYER_ADAPTIVE_TAIL_N`, `LAYER_ADAPTIVE_HEAD_N`
 * SSD: `block_io::*`, `spill::*`, `hydrate::*`, `ssd_index::*`,
   `set_ssd_event_recorder`, `set_ssd_spill_prom_hook`,
@@ -86,8 +84,8 @@ use rmlx_kv_ssd::{block_io, hydrate, spill, ssd_index};
 
 // Builder / policy stay on the rmlx-models side:
 use rmlx_models::kv_cache::{
-    KvCacheBuilder, ResolverSignals,
-    kv_quant_for_layer, kv_quant_for_ctx,
+    KvCacheBuilder,
+    kv_quant_for_layer, DEFAULT_KV_QUANT,
     LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
     cache_type, CacheType, CacheTypeSpec,
     parse_cache_type_str, resolve_cache_type, validate_resolved_kv_quant,
@@ -611,10 +609,7 @@ remain correct and the on-disk `.kvb` payload is unchanged by this ordering.
 memory bandwidth; on GQA-light archs (25% FA layers) the overhead is small
 relative to routing computation.
 
-**Arch defaults**: universal fallback; every unknown arch defaults to K8V8.
-Explicit defaults: `Qwen3_5MoeForConditionalGeneration`, `Qwen3ForCausalLM`
-(non-ternary), `Qwen2ForCausalLM`, `Gemma4ForConditionalGeneration` (MoE and
-small hidden-size variants).
+**Arch defaults**: none. `auto` is bf16 on every arch; K8V8 is opt-in.
 
 **CLI**: `--kv-quant k8v8`.
 
@@ -1225,9 +1220,10 @@ codec does not retire the ability to check that codec's numerics.
 
 ### `KvStorage::K8VTurbo3` — q8_0 K, TurboQuant 3-bit V
 
-**Status**: opt-in for non-Gemma4-small archs; no longer the auto default for
-Gemma4 small (reverted to K8V8 per the composite-score audit; see
-per-arch defaults below). Available via `--kv-quant k8vturbo3`.
+**Status**: opt-in on every arch — `auto` is bf16 and never selects it. It was
+briefly the auto default for Gemma4 small, then reverted to K8V8 by the
+composite-score audit, and both of those tables are now retired (see "Retired:
+the per-arch default table" below). Available via `--kv-quant k8vturbo3`.
 
 **K codec**: rMLX MSL q8_0, `group_size=128` (same as K8V8 K-side).
 **V codec**: TurboQuant 3-bit Lloyd-Max N(0,1) codebook, `group_size=32`.
@@ -1423,7 +1419,7 @@ same surface as the existing Mixed K<8 rejection). The helper
 `KvQuant::k_below_8bit()` returns `true` for this variant — extend the
 helper when adding any future sub-8-bit-K codec.
 
-`KvCacheBuilder::resolve_default` never returns `TurboSym4` for any arch.
+It is never the auto default; `auto` resolves to bf16 for every arch.
 
 **Paged routing**: `PagedKStorage` is q8-only; adding a TurboQuant-K paged
 variant requires a separate page allocator and gather kernel.
@@ -1543,7 +1539,7 @@ preserved in the diagnostic). The helper `KvQuant::k_below_8bit()`
 returns `true` for this variant — extend the helper when adding any future
 sub-8-bit-K codec.
 
-`KvCacheBuilder::resolve_default` never returns `PlanarK` for any arch.
+It is never the auto default; `auto` resolves to bf16 for every arch.
 
 **Paged routing**: there is no `PagedPlanarKStorage`.
 `KvStorage::new(KvQuant::PlanarK, max_seq)` returns the non-paged `PlanarK`
@@ -1810,35 +1806,28 @@ table above — a `1.04× none` Bonsai row is `1.19×` true bf16. Ratios *betwee
 two recorded codecs are unaffected, and so is every SEPARATED / INCONCLUSIVE
 verdict; only "vs bf16" restatements move. New runs need no factor.
 
-Decode TPS moves with the change, and the direction is a real per-layer effect
-rather than measurement noise: a `K8V8`-typed layer costs more per decode step
-than a `None` layer even though both attend the same bf16 mirror. On Bonsai-8B
-at 4k the all-`K8V8` arm is 8.688 ms/step against `none`'s 7.215 ms over 36
-layers, i.e. ≈0.041 ms per layer; 10 promoted layers predict 7.62 ms for the
-old mixture against 7.58 ms measured. The exemption therefore buys ≈+5% decode
-on the affected architectures (Bonsai-8B 131.9 → 138.6 TPS, Qwen3.6-35B-A3B
-94.5 → 100.1) and 0% on the exempt ones (gemma-4-e2b 128.2 → 128.4).
+Decode TPS moved with the change: exempting `none` bought roughly +5% on the
+affected architectures (Bonsai-8B 131.9 -> 138.6 TPS, Qwen3.6-35B-A3B
+94.5 -> 100.1) and 0% on the exempt ones (gemma-4-e2b 128.2 -> 128.4).
+
+**The per-layer mechanism recorded here at the time no longer reproduces, and
+should not be quoted.** It read a `K8V8`-typed layer as costing ~0.041 ms/step
+more than a `None` layer (Bonsai-8B 4k: all-`K8V8` 8.688 ms/step against
+`none`'s 7.215 over 36 layers) even though both attend the same bf16 mirror.
+Re-measured on the current tree, all-`K8V8` against all-`none` is
+**INCONCLUSIVE at every cell**: ABBA, 8 slots, quiescent host, token ids
+identical and `kv_cache_bytes` ratio exactly 1.0000 --- Bonsai-8B +0.45% at 4k
+and +0.13% at 32k, Qwen3.6-35B-A3B +5.41% at 4k and +0.19% at 32k, gemma-4-e2b
++0.18% at 4k. Ranges overlap in all five, so none of those percentages is a
+measured difference. The intervening change is the packed-store elision: the
+figures above were taken while a `K8V8` layer still built and held a store that
+decode never read, and with the store gone a `K8V8` layer is a `None` layer
+under another name. The +5% the exemption bought is left as recorded --- it was
+measured against that older arm and is not re-derivable now.
 
 Recording the effective per-layer mixture alongside `kv_bytes` was considered
 and not done: it is summed at 14 per-arch call sites, and with `none` meaning
 none the requested codec is simply a true label for the row.
-
----
-
-## Auto-by-context server policy
-
-When neither `--kv-quant` nor `--cache-type-*` flags are passed, the server
-selects the KV mode by prompt length (`kv_quant_for_ctx`):
-
-| Prompt length (tokens) | Selected mode |
-|---|---|
-| ≤ 8 192 | `K8V4` |
-| ≤ 16 384 | `None` (bf16) |
-| ≤ 32 768 | `K8V8` |
-| > 32 768 | `Planar` |
-
-This policy applies after the arch-default resolver. Explicit flags always
-take precedence and bypass `kv_quant_for_ctx`.
 
 ---
 
@@ -2000,7 +1989,7 @@ Available K-side tags:
 
 | Tag | Codec |
 |---|---|
-| `auto` | resolved by `KvCacheBuilder::resolve_default` |
+| `auto` | resolved to `DEFAULT_KV_QUANT` (bf16) |
 | `bf16` / `f16` / `none` | unquantized bf16 |
 | `q8_g128` | rMLX MSL q8_0, group=128 |
 | `q8_g64` | MLX affine 8-bit, group=64 |
@@ -2538,8 +2527,8 @@ PPL-disaster zone (218 → 8641 on Q4_K_M baseline; 7:1 GQA amplifies K-head
 error through softmax). All four variants are flagged by `KvQuant::k_below_8bit()`
 and `cache_type::validate_resolved` routes them through the dedicated
 `ResolveError::QwenMoeIsoKRejected { variant }` error, which quotes the
-offending variant by name. `KvCacheBuilder::resolve_default` never returns
-any of the four variants for Qwen MoE (they are opt-in only — no auto path).
+offending variant by name. `auto` never returns any of the four variants on
+any arch (they are opt-in only — no auto path).
 
 Smoke runs on `mlx-community__Qwen3.6-35B-A3B-8bit` are expected
 to error with `exit 78` and the diagnostic
@@ -2752,32 +2741,145 @@ parallel `cargo test`.
 
 ---
 
-## Per-arch default table
+## The auto default
 
-| Arch class | Condition | Default `KvQuant` |
-|---|---|---|
-| `Qwen3VLMoeForConditionalGeneration` | (any) | `None` (bf16) |
-| `Qwen3_5MoeForConditionalGeneration` | (any) | `K8V8` |
-| `Qwen3_5ForConditionalGeneration` | PARO checkpoint | `K8V4` |
-| `Qwen3_5ForConditionalGeneration` | other | `K8V8` |
-| `Qwen3ForCausalLM` | `weight_bits == 2` (ternary) | `Mixed{k8g64,v4g64}` |
-| `Qwen3ForCausalLM` | other | `K8V8` |
-| `Qwen2ForCausalLM` | (any) | `K8V8` |
-| `LagunaForCausalLM` | (any) | `K8V8` |
-| `Gemma3ForConditionalGeneration` | (any) | `Planar` |
-| `Gemma4ForConditionalGeneration` | MoE (26B) | `K8V8` |
-| `Gemma4ForConditionalGeneration` | hidden_size ≤ 2560, non-PARO | `K8V8` |
-| `Gemma4ForConditionalGeneration` | hidden_size ≤ 2560, PARO | `K8V4` |
-| `Gemma4ForConditionalGeneration` | hidden_size ≥ 5376 | `Planar` |
-| (unknown) | — | `K8V8` |
+`--kv-quant auto` — the value when no codec flag is given — resolves to
+**unquantised bf16** (`KvQuant::None`), for every architecture, every
+checkpoint and every prompt length. One constant,
+`rmlx_models::kv_cache::DEFAULT_KV_QUANT`, is the only producer; the CLI, the
+server load path, the image branch, the arch dispatcher and all six
+speculative drafter stacks read it and nothing else. There is no per-arch table
+and no per-context re-selection behind it.
 
-Source: `KvCacheBuilder::resolve_default` in `kv_cache/mod.rs`.
+Two things this replaced, both removed rather than retuned:
+
+* a **per-arch table** that returned `K8V8`, `K8V4`, `Planar` or
+  `Mixed{k8g64,v4g64}` depending on arch class, `hidden_size`, the MoE flag,
+  the PARO flag and `quantization.bits`; and
+* a **per-prompt-length server policy** that re-picked a codec per request,
+  overriding whatever the table had chosen at load. Three of its four bands
+  quantised, including the longest one — where a wrong codec costs most.
+
+  Its reach was narrower than the description suggests, and the qualifier
+  belongs with the claim: on `rmlx serve --model` it never fired, because the
+  CLI resolves `auto` before `run_serve` and passes a concrete codec down, which
+  the server treats as operator-supplied. It was live under `--registry`, where
+  nothing pre-resolves. Measured on the pre-change binary in registry mode, one
+  gemma-4-e2b served `K8V4` / `K8V4` / `None` / `K8V8` across four requests at
+  110 / 3 010 / 9 010 / 30 010 prompt tokens.
+
+### Why bf16
+
+Neither half of the codec axis pays, and both halves were re-measured on the
+current tree rather than inherited:
+
+* **The bf16-mirror family costs bytes it does not save.** `K8V8`, `K8V4`,
+  `Planar*`, `PlanarK`, the `K8VTurbo*` / `TurboSym*` families and the
+  `Iso3/4` / `Rotor3/4` / `RotorK*Asym` asymmetric families all decode off the
+  bf16 mirror and never read their packed store, so no store is built
+  (§"Per-layer net-benefit decision" above). Their resident KV equals bf16's
+  **byte for byte**, and so does their output at temp=0.
+* **The one store-reading codec a default ever picked loses on memory, and
+  does not win on speed.** `Mixed` really does read its packed 3-tuples at
+  decode — and holds them *beside* a bf16 mirror, so it is bf16 plus a store.
+  Measured against `none` on Ternary-Bonsai-8B it is 1.29x / 1.29x / 1.29x the
+  resident KV at 4k / 8k / 32k and lossy, while `none` is faster at 4k and 8k
+  (SEPARATED) and indistinguishable at 32k. Note the *decode* gap narrows with
+  context in that series rather than widening — the growing-with-context loss
+  recorded for this trade is a different cell, Qwen3.8-27B at 130 848 tokens
+  (§"Fused flash-decode over a quant store"), and is not what the Bonsai rows
+  below show.
+
+So on every cell measured here — the bf16-mirror family and `Mixed`, three
+architectures, 4k to 32k — nothing is smaller than bf16 and nothing is faster.
+A default that picked one of those was charging for a label.
+
+That is a claim about the codecs a default could plausibly have picked, **not**
+about the whole codec axis. The fully symmetric families (`Iso3Sym`, `Iso4Sym`,
+`Rotor3Sym`, `Rotor4Sym`) return `false` from both `feeds_bf16_k_at_decode` and
+`feeds_bf16_v_at_decode`, so they keep no mirror on either axis and their
+resident KV is structurally *below* bf16. None of them was ever an auto default,
+none is measured in the table below, and each carries its own arch guards and a
+CPU-bound V path — so they are out of scope for this decision, not evidence
+against it. Making one of them the default is a different question with a
+different burden of proof.
+
+### Measured
+
+Every row below is one `scripts/perf_ab.sh` run: ABBA-interleaved, 8 slots
+(4 per arm), both arms the same binary and differing only in `--kv-quant`,
+`release-perf`, M5 Max. Host quiescent for every row -- none carries the
+harness's TAINTED verdict, and the busiest foreign process during each
+comparison was 7.2-7.4% of one core. `INCONCLUSIVE` means the two arms' per-slot
+ranges overlap: the percentage beside it is the gap between two point estimates
+and is **not** a measured difference. Only `SEPARATED` rows license a direction.
+
+Arm A is the codec `auto` used to pick for that model; arm B is `none`.
+
+The `bin` column is the sha256 prefix `perf_ab.sh` printed for that run's
+binary, because "one binary" is a claim and not a given: a build finishing in
+the background has already replaced `target/release-perf/rmlx` mid-campaign
+here. `f2f889b9` is the pre-change tree, `cae129bc` the branch; the arms within
+any single row share one binary, which is what the comparison needs. `run`
+distinguishes the two gemma-4-e2b 4 096 rows, which are the same cell measured
+in two separate sessions and are a deliberate repeat, not a transcription slip.
+
+| model | ctx | arm A | bin | run | resident KV B/A | token ids | decode B/A | verdict |
+|---|---:|---|---|---|---:|---|---:|---|
+| gemma-4-e2b | 4 096 | `k8v8` | `f2f889b9` | 1 | **1.0000** | identical | 0.9985 | INCONCLUSIVE |
+| gemma-4-e2b | 4 096 | `k8v8` | `cae129bc` | 2 | **1.0000** | identical | 1.0018 | INCONCLUSIVE |
+| gemma-4-e2b | 8 192 | `k8v8` | `f2f889b9` | 1 | **1.0000** | identical | 1.0013 | INCONCLUSIVE |
+| gemma-4-e2b | 32 768 | `k8v8` | `f2f889b9` | 1 | **1.0000** | identical | 0.9912 | INCONCLUSIVE |
+| Ternary-Bonsai-8B | 4 096 | `k8v8` | `cae129bc` | 2 | **1.0000** | identical | 1.0045 | INCONCLUSIVE |
+| Ternary-Bonsai-8B | 32 768 | `k8v8` | `cae129bc` | 2 | **1.0000** | identical | 1.0013 | INCONCLUSIVE |
+| Qwen3.6-35B-A3B | 4 096 | `k8v8` | `cae129bc` | 2 | **1.0000** | identical | 1.0541 | INCONCLUSIVE |
+| Qwen3.6-35B-A3B | 32 768 | `k8v8` | `cae129bc` | 2 | **1.0000** | identical | 1.0019 | INCONCLUSIVE |
+| Ternary-Bonsai-8B | 4 096 | `mixed_k8g64_v4g64` | `cae129bc` | 2 | **0.7771** | diverge at id 57 | 1.0300 | SEPARATED |
+| Ternary-Bonsai-8B | 8 192 | `mixed_k8g64_v4g64` | `cae129bc` | 2 | **0.7751** | diverge at id 56 | 1.0258 | SEPARATED |
+| Ternary-Bonsai-8B | 32 768 | `mixed_k8g64_v4g64` | `cae129bc` | 2 | **0.7736** | diverge at id 35 | 0.9994 | INCONCLUSIVE |
+
+The two binaries are not a confound: a codec-vs-codec comparison never crosses
+a row, and the repeated gemma-4-e2b 4 096 cell -- the one point measured on
+both -- returns the same verdict and the same 1.0000 residency on each.
+
+Two things to read off it. The eight `k8v8` rows are a *null* result by
+construction -- same bytes, same bits, no measurable time -- across three
+architectures and two KV shapes (`kv_h = 1` shared-KV/SWA at `head_dim` 256/512,
+and `kv_h = 8` dense at 128). The three `mixed` rows are the only place the
+default's behaviour actually changes, and every axis moves toward `none`.
+
+The same comparison run once per branch of the retired per-arch table that the
+release set reaches (4 096-token prompt, 32 tokens, temp=0, resident KV and token-id digest
+only) closes the branch table: `gemma-4-e2b` (`K8V8`), `gemma-4-12B` unified
+(`K8V8`), `gemma-4-26b-a4b` MoE (`K8V8`), `gemma-4-31b` (`Planar`), `medgemma`
+(`Gemma3`, `Planar`), `Qwen3.6-35B-A3B` (`K8V8`), `Qwen3.8-27B` (`K8V8`),
+`Qwen3.6-27B-PARO` (`K8V4`) -- all eight byte-identical in `kv_cache_bytes` and
+identical in token ids against `none`. `Ternary-Bonsai-8B` (`Mixed`) is the
+ninth and the only one that moves.
+
+### What stays
+
+Every codec remains selectable by name — `--kv-quant`, `--cache-type-k` /
+`--cache-type-v`, `--kv-bits`, `--kv-preset`. Nothing is deprecated or removed
+by this; only what `auto` resolves to is fixed. `--kv-preset auto` is a
+*different* thing and is unchanged: it is an explicit hardware-aware selector
+the operator opts into (§"Auto-selector — `--kv-preset auto`"), not the
+no-flag default.
+
+`DEFAULT_KV_QUANT` is where a future answer changes. When fused decode over a
+quantised store becomes profitable, that constant moves — on a fresh
+measurement, not by restoring a table.
 
 ---
 
 ## Memory and bit-rate summary
 
-Approximate bytes per KV pair (`B=1, 1 layer, 1 head, D elements`):
+Approximate bytes per KV pair (`B=1, 1 layer, 1 head, D elements`). These are
+**packed-store** rates — what a codec's codes and scales occupy. They are not
+resident KV for the bf16-mirror family, which builds no store: those codecs sit
+at the `None` row, 4·D, measured byte-identical (§"Per-layer net-benefit
+decision"). The rates below are what a codec would cost once decode reads its
+store.
 
 | Mode | K bytes/tok | V bytes/tok | Total bytes/tok |
 |---|---|---|---|
@@ -3797,9 +3899,9 @@ gemma4-assistant self-speculative path). Whether any of them can reach a
      `KvCache::truncate_to`.
   2. No drafter gates the **verifier** arch at all. The
      `"Qwen3_5MoeForConditionalGeneration"` strings in `speculative/mtp.rs` and
-     `speculative/dflash/mod.rs` are `KvCacheBuilder::resolve_default`
-     *arguments* — the KV-quant fallback when `kv_quant_override` is `None` —
-     not architecture guards, and an explicit `--kv-quant` makes them dead.
+     `speculative/dflash/mod.rs` are error-message text, not architecture
+     guards. The KV-quant fallback those sites take when `kv_quant_override`
+     is `None` is `DEFAULT_KV_QUANT`, which consults no arch at all.
 - **Gemma4 (e.g. e4b, `kv_h = 2`)** — reachable twice over: its
   `ReusePolicy::Partial` performs the trim on a real partial-prefix cache hit,
   and gemma4-assistant self-speculative decode also rolls back via
@@ -4693,116 +4795,33 @@ controllable in tests. Re-open condition: a production path where
 
 ---
 
-## Per-arch defaults (composite-score audit)
+## Retired: the per-arch default table (composite-score audit)
 
-### Composite score formula (3-term)
+Between 2026-05 and this change, `auto` resolved through a per-arch table
+scored by a 3-term composite (0.571 x decode TPS + 0.286 x cosine + 0.143 x
+1/mem_bits). The table and the audit behind it are **gone**: `auto` is
+unquantised bf16 on every arch (see "The auto default").
 
-The NIAH term was deferred from the initial audit; a 3-term composite is used
-with re-normalized weights (original 4-term: 0.4 TPS + 0.3 NIAH + 0.2 cosine
-+ 0.1 1/mem; drop NIAH, re-normalize remaining by 0.7):
+The audit is not merely superseded, it was scoring a quantity that no longer
+exists. Its `mem_norm` term ranked codecs by packed-store bit width, and the
+bf16-mirror codecs it ranked build no packed store - their resident KV is
+bf16's, byte for byte. Its `decode_tps` term was recorded before the store
+elision and the f32-leak fixes moved both arms. Re-running it would not restore
+a table; it would have to be designed against what the codecs cost today.
 
-```
-score = 0.571 × decode_tps_norm + 0.286 × cosine_norm + 0.143 × mem_norm
+**Operator-visible consequence.** An operator who passed no `--kv-quant` and
+relied on the table now gets bf16. Output is byte-identical at temp=0 for every
+arch whose table entry was a bf16-mirror codec (`K8V8`, `K8V4`, `Planar`),
+because those codecs already decoded off the bf16 mirror. It is **not**
+byte-identical for the one entry that read its store - `Qwen3ForCausalLM` at
+`weight_bits == 2`, which defaulted to `Mixed{k8g64,v4g64}` - where the old
+default was lossy and bf16 is the reference. Pass
+`--kv-quant mixed_k8g64_v4g64` to reproduce the old bits. `k8vturbo3`, which
+the table briefly selected for Gemma4 small, is likewise still available by
+name and simply never automatic.
 
-where:
-  decode_tps_norm = decode_tps / max_decode_tps_per_model
-  cosine_norm     = clamp((cosine_floor − 0.94) / 0.06, 0.0, 1.0)
-  mem_norm        = (1 / mem_bits_per_token) / max(1 / mem_bits_per_token)
-                    across all candidates for the same model
-```
-
-**Conservatism gate**: if the winner differs from the current default by
-`< ±1% TPS` AND `< ±0.002 cosine`, keep the current default.
-
-**Conservative tie-breaker**: `Δscore < 0.005` → prefer the
-landed-earlier / more-tested codec.
-
-NIAH will be added as a 4th term in a future audit cycle. Defaults will be
-re-audited then.
-
----
-
-### Data sources and exclusions
-
-- **TPS**: `docs/PERF_BASELINE.md` § "Per-codec × per-model cells".
-  Canary shape: `--prompt-tokens 4096 --max-tokens 100 --max-ctx 8192`,
-  release-perf binary, M5 Max, 1 warmup + 3 measured runs, median.
-- **Cosine floors**: per-codec empirical test floors from
-  `crates/rmlx-kv-quant/src/*_tests.rs` (LCG fixture, pinned seed).
-- **Mem per token**: K+V bits combined (e.g. K8V8=16, K8VTurbo3=11, Mixed{k8,v4}=12).
-
-**Exclusions from direct comparison (shape mismatch)**:
-
-The `iso3_sym`, `iso4_sym`, `k_iso3`, `k_iso4`, `rotor3_sym`, `rotor4_sym`,
-`k_rotor3`, `k_rotor4`, and `tsym3` anchor runs used a 2-token short-prompt
-shape which inflates decode TPS significantly vs the 4096-token canary
-baseline used for the existing defaults. These cells appear in the
-PERF_BASELINE.md table with measured values, but they cannot be directly
-compared in the composite formula without shape-normalizing. They are excluded
-from this audit cycle.
-
-`planar_fused_qk (on)` for Bonsai (26.4 TPS) is also excluded — the
-note marks it a short-ctx artifact, not representative of canary performance.
-
----
-
-### Candidate evaluation per arch
-
-#### Gemma4-e4b (hidden=2560, non-MoE, non-paroquant)
-
-Candidates measured at 4096-token canary shape:
-
-| Codec | TPS | cosine floor | mem bits | decode_norm | cosine_norm | mem_norm | score |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| **K8V8** | 74.22 | 0.9990 | 16 | 1.000 | 0.983 | 0.625 | **0.942** |
-| K8VTurbo3 | 73.16 | 0.9807 | 11 | 0.986 | 0.678 | 0.909 | 0.887 |
-| turbo3_tcq | 73.54 | 0.9807 | 11 | 0.991 | 0.678 | 0.909 | 0.890 |
-| turbo2_tcq | 73.97 | 0.9570 | 10 | 0.997 | 0.283 | 1.000 | 0.793 |
-
-Max TPS = 74.22 (K8V8). Max 1/mem = 1/10 (turbo2_tcq).
-
-**Winner: K8V8 (0.942)**. Prior default: K8VTurbo3.
-Δscore = 0.055 (> 0.005 tie-breaker). +1.4% TPS, +0.0183 cosine — both
-exceed conservatism gate (±1% / ±0.002). **FLIP: K8VTurbo3 → K8V8.**
-
-K8VTurbo3 remains available via `--kv-quant k8vturbo3` for operators who
-prefer the lower memory footprint (11 vs 16 bits/token) over the quality gain.
-
-#### Qwen3.6-MoE (Qwen3_5MoeForConditionalGeneration, affine 8-bit)
-
-A.y guard: K-side ≤4-bit rejected. All symmetric and K-side codecs skipped.
-
-| Codec | TPS | cosine floor | mem bits | decode_norm | cosine_norm | mem_norm | score |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| **K8V8** | 96.64 | 0.9990 | 16 | 0.991 | 0.983 | 0.625 | **0.937** |
-| turbo3_tcq | 94.57 | 0.9807 | 11 | 0.970 | 0.678 | 0.909 | 0.878 |
-| turbo2_tcq | 97.52 | 0.9570 | 10 | 1.000 | 0.283 | 1.000 | 0.795 |
-
-Max TPS = 97.52 (turbo2_tcq). Max 1/mem = 1/10 (turbo2_tcq).
-
-**Winner: K8V8 (0.937)**. No flip — default was already K8V8.
-
-#### Bonsai / Qwen3ForCausalLM 2-bit (Mixed{k8g64,v4g64})
-
-| Codec | TPS | cosine floor | mem bits | decode_norm | cosine_norm | mem_norm | score |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| **Mixed{k8,v4}** | 109.86 | 0.9937 | 12 | 1.000 | 0.895 | 0.833 | **0.946** |
-| turbo3_tcq | 95.11 | 0.9807 | 11 | 0.866 | 0.678 | 0.909 | 0.819 |
-| turbo2_tcq | 94.29 | 0.9570 | 10 | 0.858 | 0.283 | 1.000 | 0.714 |
-
-Max TPS = 109.86 (Mixed). Max 1/mem = 1/10 (turbo2_tcq).
-Mixed cosine floor: V-side turbo4 ≥ 0.9937 (the binding constraint).
-
-**Winner: Mixed{k8g64,v4g64} (0.946)**. No flip — default was already Mixed.
-
-#### Gemma4 dense (hidden ≥ 5376) and Gemma4 MoE
-
-No cell data at canary shape. Defaults unchanged: Planar (dense),
-K8V8 (MoE).
-
-#### Qwen3ForCausalLM 8-bit (dense, non-Bonsai)
-
-No cell data. Default unchanged: K8V8.
+The Qwen-MoE K-width rejection table below is independent of all this and
+still stands.
 
 ---
 
@@ -4817,9 +4836,9 @@ inspected and confirmed to reject K-side ≤4-bit codecs on Qwen MoE arches:
 - `Rotor3Sym`, `Rotor4Sym`, `RotorKOnly3`, `RotorKOnly4` → `RotorKOnQwenMoe`
 - `TurboSym3` → `TurboSym3KOnQwenMoe`
 
-None of these K-side ≤4-bit codecs are selected by `resolve_default` for
-Qwen MoE — the `Qwen3_5MoeForConditionalGeneration` arm always returns
-`K8V8`. The rejection table itself has not been weakened by the codec adds.
+None of these K-side codecs is ever selected by `auto`, on Qwen MoE or
+anywhere else - `auto` is bf16. The rejection table itself has not been
+weakened by the codec adds.
 
 #### What the guard keys off
 
@@ -4877,22 +4896,6 @@ that declares dense while shipping MoE tensors and asserts the guard fires.
 
 ---
 
-### Operator migration note
-
-**If you pinned `--kv-quant k8vturbo3` explicitly**: your config is
-unaffected. Explicit `--kv-quant` always overrides the auto-default.
-
-**If you relied on the auto-default for Gemma4 small** (e2b / e4b, non-MoE,
-non-paroquant): the default reverts from K8VTurbo3 back to K8V8 as of this
-audit. Memory footprint increases from 11 → 16 bits/token on K+V combined.
-To keep the lower-memory option, pass `--kv-quant k8vturbo3` explicitly.
-
-**`for_arch_default` deprecated**: callers should migrate to
-`KvCacheBuilder::resolve_default(arch_class, ResolverSignals::from_config(&cfg))`.
-The deprecated function remains (returns K8V8 for all inputs) and will be
-removed in a future cleanup.
-
----
 
 ## Codec fidelity — measured
 

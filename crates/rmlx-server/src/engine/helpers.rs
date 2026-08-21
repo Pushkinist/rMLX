@@ -101,9 +101,14 @@ pub(crate) fn record_ttft_and_prefill(
 ///
 /// Returns `(resolved_quant, user_explicit)`:
 /// - explicit override (`Some`) → `(Some(q), true)`.
-/// - auto (`None`) → resolve via the per-arch default table → `(Some(r), false)`.
+/// - auto (`None`) → the engine default → `(Some(DEFAULT_KV_QUANT), false)`.
 ///
-/// `user_explicit=false` lets per-request `kv_quant_for_ctx` override in auto mode.
+/// The `user_explicit` flag it returns no longer gates any per-request
+/// re-selection; its one remaining consumer is the Qwen3-VL image branch, which
+/// substitutes its own bf16 codec when no operator codec is in play. Note it is
+/// `true` for every `--model`-mode launch, flag or not, because the CLI resolves
+/// `auto` before the server sees it — so "explicit" means "a codec arrived
+/// here", not "the operator typed one".
 pub(crate) fn resolve_kv_quant_for_load(
     cfg: &rmlx_loader::ModelConfig,
     kv_quant: Option<rmlx_kv_quant::KvQuant>,
@@ -113,29 +118,43 @@ pub(crate) fn resolve_kv_quant_for_load(
         (Some(q), true)
     } else {
         let arch_class = cfg.architectures.first().map_or("(empty)", String::as_str);
-        let signals = rmlx_models::kv_cache::ResolverSignals::from_config(cfg);
-        let resolved = rmlx_models::kv_cache::KvCacheBuilder::resolve_default(arch_class, signals);
+        let resolved = rmlx_models::kv_cache::DEFAULT_KV_QUANT;
         tracing::info!(
             model_id = %model_id,
             arch = arch_class,
-            hidden_size = ?signals.hidden_size,
-            has_moe = signals.has_moe,
-            is_paroquant = signals.is_paroquant,
-            weight_bits = ?signals.weight_bits,
             ?resolved,
-            "kv-quant=auto resolved via per-arch default table"
+            "kv-quant=auto resolved to the engine default"
         );
         (Some(resolved), false)
     }
 }
 
-/// Issue #26: parse a per-request `kv_quant` string into an optional override.
+/// The KV codec one request runs.
+///
+/// One producer for both generators. A request-scoped `kv_quant` wins; anything
+/// else is the codec resolved once at load — the launch `--kv-quant`, or
+/// [`rmlx_models::kv_cache::DEFAULT_KV_QUANT`] in auto mode.
+///
+/// There is deliberately **no prompt-length term**. A per-context re-selection
+/// used to sit here and silently override the resolved default on exactly the
+/// long requests where a wrong codec costs most; with one default for every
+/// architecture and every context there is nothing left for it to select
+/// between, and a second resolver that can disagree with the first is how the
+/// two drift apart.
+pub(crate) fn kv_quant_for_request(
+    req_override: Option<rmlx_kv_quant::KvQuant>,
+    launch_resolved: Option<rmlx_kv_quant::KvQuant>,
+) -> Option<rmlx_kv_quant::KvQuant> {
+    req_override.or(launch_resolved)
+}
+
+/// Parse a per-request `kv_quant` string into an optional override.
 ///
 /// Mirrors the `--kv-quant` CLI grammar (`crate`-external
 /// `rmlx_cli::commands::parse::parse_kv_quant`) so a request field and the
 /// launch flag accept identical strings:
-/// - `"auto"` → `Ok(None)` — fall through to the generator's per-arch/per-ctx
-///   auto policy (NOT the launch explicit value).
+/// - `"auto"` → `Ok(None)` — this request names no codec of its own and runs
+///   whatever the generator resolved at load ([`kv_quant_for_request`]).
 /// - `"mixed"` → the canonical `Mixed{k8,v4,g64}` short alias.
 /// - everything else → `<KvQuant as FromStr>::from_str` (`none`/`bf16`,
 ///   `k8v4`, `k8v8`, `planar`, `mixed_k<kb>g<kg>_v<vb>g<vg>`, …).
@@ -284,3 +303,7 @@ pub(crate) fn kv_quant_label(kv: Option<rmlx_kv_quant::KvQuant>) -> String {
     }
     .into()
 }
+
+#[cfg(test)]
+#[path = "helpers_tests.rs"]
+mod helpers_tests;

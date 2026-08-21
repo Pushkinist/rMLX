@@ -865,10 +865,9 @@ impl Architecture {
 
     /// Greedy generation using KV-cache prefill + decode (all architectures).
     ///
-    /// `kv_quant` selects the KV cache quantization mode. Pass `None` to use
-    /// the arch default selected by `KvCacheBuilder::for_arch_default` (the
-    /// "auto" behaviour mandated by CLAUDE.md for Qwen MoE). Pass
-    /// `Some(q)` to override (e.g. from the `--kv-quant` CLI flag).
+    /// `kv_quant` selects the KV cache quantization mode. Pass `None` for the
+    /// auto default ([`crate::kv_cache::DEFAULT_KV_QUANT`]); pass `Some(q)` to
+    /// override (e.g. from the `--kv-quant` CLI flag).
     ///
     /// `max_ctx_override` sets the KV buffer size. Pass `None` to use the
     /// model's `max_position_embeddings` (capped at `KV_MAX_SEQ_DEFAULT`).
@@ -917,20 +916,13 @@ impl Architecture {
         penalty_cfg: &'a crate::sampler::PenaltyConfig,
         token_history: &'a mut Vec<u32>,
     ) -> Result<Vec<crate::decode_loop::ProbeStep>> {
-        use crate::kv_cache::KvCacheBuilder;
+        use crate::kv_cache::DEFAULT_KV_QUANT;
         use rmlx_kv_quant::KvQuant;
-        // Resolve the effective quant: explicit override wins; otherwise ask the builder.
+        // Resolve the effective quant: explicit override wins, else the auto
+        // default. It is the same constant every other resolution path reads,
+        // so this site needs no config signals of its own.
         let arch_name = self.arch_class();
-        // `for_arch_default` is deprecated; callers with a full ModelConfig
-        // should use `resolve_default`. This arch-dispatch site has no ModelConfig
-        // available (the arch-level generate_greedy gets signals separately); the
-        // function is a no-op (always K8V8) so the behaviour is preserved.
-        #[allow(
-            deprecated,
-            reason = "no ModelConfig at arch-dispatch site; for_arch_default is a no-op returning K8V8"
-        )]
-        let kv_quant: KvQuant =
-            kv_quant_override.unwrap_or_else(|| KvCacheBuilder::for_arch_default(arch_name));
+        let kv_quant: KvQuant = kv_quant_override.unwrap_or(DEFAULT_KV_QUANT);
 
         // Enforce the arch invariants against the resolved architecture before
         // a single KV cache is built. The startup resolvers key off the
@@ -1140,14 +1132,14 @@ impl Architecture {
         penalty_cfg: &'a crate::sampler::PenaltyConfig,
         token_history: &'a mut Vec<u32>,
     ) -> Result<Vec<crate::decode_loop::ProbeStep>> {
-        use crate::kv_cache::KvCacheBuilder;
+        use crate::kv_cache::DEFAULT_KV_QUANT;
         use rmlx_kv_quant::KvQuant;
 
         // Same enforcement as the text entry, and in the same position: reject
         // before touching MLX thread state, so a refused codec costs nothing.
-        // The `None` fallback below is `for_arch_default`, a no-op returning
-        // K8V8 — K stays 8-bit, so it satisfies every arch invariant by
-        // construction and needs no separate check.
+        // The `None` fallback below is the auto default, unquantised bf16 —
+        // accepted by every arch invariant by construction, so it needs no
+        // separate check.
         if let Some(kq) = kv_quant_override {
             self.validate_kv_quant(kq)?;
         }
@@ -1165,14 +1157,7 @@ impl Architecture {
 
         match self {
             Architecture::Gemma4(m) => {
-                // `for_arch_default` deprecated; no ModelConfig at this call site → keep K8V8.
-                #[allow(
-                    deprecated,
-                    reason = "no ModelConfig at generate_image Gemma4 arm; for_arch_default is a no-op returning K8V8"
-                )]
-                let kv_quant: KvQuant = kv_quant_override.unwrap_or_else(|| {
-                    KvCacheBuilder::for_arch_default("Gemma4ForConditionalGeneration")
-                });
+                let kv_quant: KvQuant = kv_quant_override.unwrap_or(DEFAULT_KV_QUANT);
                 crate::gemma4::generate_greedy(
                     m,
                     tokenizer,
@@ -1193,14 +1178,7 @@ impl Architecture {
                 )
             }
             Architecture::Gemma3(m) => {
-                // `for_arch_default` deprecated; no ModelConfig at this call site → K8V8.
-                #[allow(
-                    deprecated,
-                    reason = "no ModelConfig at generate_image Gemma3 arm; for_arch_default is a no-op returning K8V8"
-                )]
-                let kv_quant: KvQuant = kv_quant_override.unwrap_or_else(|| {
-                    KvCacheBuilder::for_arch_default("Gemma3ForConditionalGeneration")
-                });
+                let kv_quant: KvQuant = kv_quant_override.unwrap_or(DEFAULT_KV_QUANT);
                 // Gemma3 has no per-layer-input gating, so `masked_ids` is
                 // unused (the scatter-merged embeds carry everything). The
                 // prompt cache is bypassed internally for an image prompt
@@ -1393,23 +1371,6 @@ impl Architecture {
     /// against.
     pub fn kv_cache_bytes(&self) -> u64 {
         self.kv_cache_bytes_sample().bytes
-    }
-
-    /// Arch-pinned auto-KV default, when the arch must not take the
-    /// ctx-based quant policy. `None` = use the normal auto policy.
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "only archs with a measured quantized-KV degradation pin a default"
-    )]
-    pub fn preferred_auto_kv(&self) -> Option<rmlx_kv_quant::KvQuant> {
-        match self {
-            // Qwen3-VL-MoE degrades under quantized KV (K8V4/K8V8) — both
-            // text and image decode go incoherent on this 4-bit checkpoint.
-            // Pin its auto default to bf16 (None) rather than the ctx-based
-            // quant policy.
-            Architecture::Qwen3VlMoe(_) => Some(rmlx_kv_quant::KvQuant::None),
-            _ => None,
-        }
     }
 
     /// Smoke probe verdict -- delegates to gemma4::classify_smoke for now.

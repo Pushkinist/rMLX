@@ -113,7 +113,7 @@ use rmlx_kv_ssd::cache_seed;
 ///
 /// Why per request, when `layout_key` already folds a vector: the layout key is
 /// fixed at attach from the launch codec, and a request may resolve a different
-/// one (`kv_quant_for_ctx` in auto mode, or an explicit per-request override).
+/// one (an explicit per-request override).
 /// For those requests the attach-time vector describes a layout they are not
 /// running, so the guarantee "a layer-policy change invalidates stored blocks"
 /// would hold only for requests on the launch default. Seeding from the
