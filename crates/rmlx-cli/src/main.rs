@@ -143,25 +143,33 @@ Mutually exclusive with `--kv-quant`, `--cache-type-k`, `--cache-type-v`,
 and `--kv-bits`. Passing any of those alongside `--kv-preset` is a hard
 clap error (exit 2).
 
+NO PRESET BELOW REDUCES MEMORY BELOW fp16 — fp16 is the unquantised reference,
+and every other name resolves to a codec whose decode reads the bf16 mirror, so
+its packed store is never built: the served request holds the same resident KV
+as fp16 and emits the same tokens. Measured on two architectures at two
+contexts; decode throughput against fp16 is INCONCLUSIVE, so they are not
+known to cost anything either. They are kept because the names appear in
+recorded bench rows and each is its codec's entry point, not because one of
+them is a smaller cache.
+
 Special value:
-  auto      -- auto-selector: queries sysctl unified memory, estimates model
-               size from config.json, and picks the best preset for your hardware.
-               Falls back to 8 GB VRAM / 7 B model if detection fails.
+  auto      -- the same codec `--kv-quant auto` resolves to (unquantised bf16).
+               It does not inspect the hardware: the memory-pressure selector
+               that used to live here returned a preset that saves no bytes.
 
-Starter presets:
-  fp16      -- bf16 both sides (unquantised; KvQuant::None)
-  q8        -- symmetric 8-bit K+V (KvQuant::K8V8)
-  speed     -- TurboSym3 (symmetric WHT-3 K+V; rejected on Qwen MoE)
-  quality   -- TurboSym4 (WHT-4 symmetric K+V; rejected on Qwen MoE — see arch guard note*)
-  planar    -- PlanarQuant V-side (KvQuant::Planar)
-
-Future presets will add: balanced, max_compression, k_only_iso,
-agents_8x16k, rot_k_quality.
+Presets:
+  fp16          -- bf16 both sides (unquantised; KvQuant::None)
+  q8            -- symmetric 8-bit K+V (KvQuant::K8V8)
+  speed         -- TurboSym3 (symmetric WHT-3 K+V; rejected on Qwen MoE)
+  quality       -- TurboSym4 (WHT-4 symmetric K+V; rejected on Qwen MoE — see arch guard note*)
+  planar        -- PlanarQuant V-side (KvQuant::Planar)
+  planar3       -- PlanarQuant 3-bit V-side (KvQuant::Planar3)
+  k_only_planar -- PlanarQuant K-side, V bf16 (KvQuant::PlanarK; rejected on Qwen MoE)
 
 *Arch guard: --kv-preset quality resolves to TurboSym4 (symmetric WHT-4 K+V), rejected on \
 Qwen MoE (PPL disaster path). --kv-preset speed resolves to TurboSym3 (symmetric WHT-3 K+V), \
 also rejected on Qwen MoE (K-side 3-bit PPL disaster). \
-See docs/KV_QUANT.md Preset semantics section and §Auto-selector section.";
+See docs/KV_QUANT.md sections \"Preset semantics\" and \"Codec disposition\".";
 
 /// Long-help for `--kv-bits`. Mirrors mlx-lm's `kv_bits` / `kv_group_size` ergonomics.
 const KV_BITS_LONG_HELP: &str = "\
@@ -1841,8 +1849,8 @@ fn main() -> Result<()> {
             // re-run for every model in the registry, out of scope for v0.0.1).
             //
             // --kv-preset pre-resolution. parse_kv_preset returns a
-            // KvPresetArg which is either Resolved(KvQuant) or Auto. resolve_preset_arg
-            // runs the auto-selector for Auto (sysctl + model-size estimate).
+            // KvPresetArg which is either Resolved(KvQuant) or Auto;
+            // resolve_preset_arg turns Auto into DEFAULT_KV_QUANT.
             let (dev, kv_quant_final, max_ctx_override) = if let Some(ref model_path) = model {
                 if let Some(preset_arg) = kv_preset {
                     let max_ctx_override = parse_max_ctx(max_ctx)?;
@@ -1850,7 +1858,7 @@ fn main() -> Result<()> {
                     info!(device = %device, "rmlx serve: resolved device");
                     let cfg = rmlx_loader::load_config(model_path)
                         .map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
-                    let preset_kq = resolve_preset_arg(preset_arg, &cfg, max_ctx_override);
+                    let preset_kq = resolve_preset_arg(preset_arg);
                     info!(kv_quant = ?preset_kq, "--kv-preset resolved");
                     let kq = commands::parse::resolve_kv_quant(&cfg, Some(preset_kq), None);
                     (dev, Some(kq), max_ctx_override)
@@ -1873,21 +1881,16 @@ fn main() -> Result<()> {
                 // --kv-bits in registry mode is resolved directly (no arch validation).
                 // fractional dispatch mirrors resolve_model_flags.
                 //
-                // `--kv-preset auto` requires --model (needs config.json). Reject here.
-                if matches!(kv_preset, Some(KvPresetArg::Auto)) {
-                    tracing::error!(
-                        "--kv-preset auto requires --model; auto-selection needs config.json"
-                    );
-                    eprintln!(
-                        "error: --kv-preset auto requires --model (auto-selection needs config.json to estimate model size)"
-                    );
-                    std::process::exit(78);
-                }
+                // `--kv-preset auto` used to be rejected here with exit 78 and
+                // "auto-selection needs config.json to estimate model size".
+                // That reason is gone: `resolve_preset_arg` reads a constant and
+                // opens nothing, so there is nothing for a missing config.json
+                // to prevent — and `--kv-quant auto`, the same constant under
+                // another flag, was accepted on the same command line. Two
+                // spellings of one default must not disagree about whether they
+                // are allowed.
                 let kv_quant_opt = if let Some(preset_arg) = kv_preset {
-                    let preset_kq = match preset_arg {
-                        KvPresetArg::Resolved(kq) => kq,
-                        KvPresetArg::Auto => unreachable!("auto rejected above"),
-                    };
+                    let preset_kq = resolve_preset_arg(preset_arg);
                     info!(kv_quant = ?preset_kq, "rmlx serve registry: --kv-preset applied");
                     Some(preset_kq)
                 } else if let Some(bits) = kv_bits {
@@ -1998,14 +2001,14 @@ fn main() -> Result<()> {
             // load. Even though `chat` is a stub today, validating the flag
             // combination here keeps the CLI failure semantics consistent.
             //
-            // --kv-preset pre-resolution. resolve_preset_arg runs the
-            // auto-selector for KvPresetArg::Auto.
+            // --kv-preset pre-resolution. resolve_preset_arg turns
+            // KvPresetArg::Auto into DEFAULT_KV_QUANT.
             let (dev, _kv_quant_final, _max_ctx_override) = if let Some(preset_arg) = kv_preset {
                 let max_ctx_override = parse_max_ctx(max_ctx)?;
                 let dev = parse_device(&device)?;
                 let cfg = rmlx_loader::load_config(&model)
                     .map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
-                let preset_kq = resolve_preset_arg(preset_arg, &cfg, max_ctx_override);
+                let preset_kq = resolve_preset_arg(preset_arg);
                 info!(kv_quant = ?preset_kq, "--kv-preset resolved");
                 let kq = commands::parse::resolve_kv_quant(&cfg, Some(preset_kq), None);
                 (dev, kq, max_ctx_override)
@@ -2084,14 +2087,14 @@ fn main() -> Result<()> {
             // resolved KvQuant is only handed downstream when a probe will
             // actually load the model.
             //
-            // --kv-preset pre-resolution. resolve_preset_arg runs the
-            // auto-selector for KvPresetArg::Auto.
+            // --kv-preset pre-resolution. resolve_preset_arg turns
+            // KvPresetArg::Auto into DEFAULT_KV_QUANT.
             let (dev, kv_quant_final, max_ctx_override) = if let Some(preset_arg) = kv_preset {
                 let max_ctx_override = parse_max_ctx(max_ctx)?;
                 let dev = parse_device(&device)?;
                 let cfg = rmlx_loader::load_config(&model)
                     .map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
-                let preset_kq = resolve_preset_arg(preset_arg, &cfg, max_ctx_override);
+                let preset_kq = resolve_preset_arg(preset_arg);
                 info!(kv_quant = ?preset_kq, "--kv-preset resolved");
                 let kq = commands::parse::resolve_kv_quant(&cfg, Some(preset_kq), None);
                 (dev, kq, max_ctx_override)
@@ -2207,14 +2210,14 @@ fn main() -> Result<()> {
             let max_prompt_tokens = parse_max_prompt_tokens(
                 max_prompt_tokens.unwrap_or(commands::baseline::MAX_PROMPT_TOKENS),
             )?;
-            // --kv-preset pre-resolution. resolve_preset_arg runs the
-            // auto-selector for KvPresetArg::Auto.
+            // --kv-preset pre-resolution. resolve_preset_arg turns
+            // KvPresetArg::Auto into DEFAULT_KV_QUANT.
             let (dev, kv_quant_resolved, max_ctx_override) = if let Some(preset_arg) = kv_preset {
                 let max_ctx_override = parse_max_ctx(max_ctx)?;
                 let dev = parse_device(&device)?;
                 let cfg = rmlx_loader::load_config(&model)
                     .map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
-                let preset_kq = resolve_preset_arg(preset_arg, &cfg, max_ctx_override);
+                let preset_kq = resolve_preset_arg(preset_arg);
                 info!(kv_quant = ?preset_kq, "--kv-preset resolved");
                 let kq = commands::parse::resolve_kv_quant(&cfg, Some(preset_kq), None);
                 (dev, kq, max_ctx_override)
@@ -2366,7 +2369,7 @@ fn main() -> Result<()> {
                 let dev = parse_device(&device)?;
                 let cfg = rmlx_loader::load_config(&model)
                     .map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
-                let preset_kq = resolve_preset_arg(preset_arg, &cfg, max_ctx_override);
+                let preset_kq = resolve_preset_arg(preset_arg);
                 info!(kv_quant = ?preset_kq, "--kv-preset resolved");
                 let kq = commands::parse::resolve_kv_quant(&cfg, Some(preset_kq), None);
                 (dev, kq, max_ctx_override)

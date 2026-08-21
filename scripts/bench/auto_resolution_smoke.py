@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
-"""5-model auto-resolution + regression smoke.
+"""5-model auto-resolution + regression smoke, over both `auto` surfaces.
 
-For each of the 5 regression models:
-  1. Start `rmlx serve --kv-quant auto`.
+For each of the 5 regression models, and for each of `--kv-quant auto` and
+`--kv-preset auto`:
+  1. Start `rmlx serve` with that flag.
   2. Wait for /v1/models to respond.
-  3. Send one /v1/chat/completions request, measure decode TPS.
+  3. On the `--kv-quant auto` pass only, send one /v1/chat/completions request
+     and measure decode TPS.
   4. Grep the rMLX log for "resolved KV cache quant" and assert KV.
-  5. Print one CSV row: model, expected_kv, resolved_kv, baseline_tps, observed_tps, delta_pct, ok.
+  5. Print one CSV row: surface, model, expected_kv, resolved_kv, baseline_tps,
+     observed_tps, delta_pct, ok.
+
+Both surfaces are swept because there is no useful sense in which they may
+differ: they are two spellings of "you pick". `--kv-preset auto` used to run its
+own resolver — a unified-memory decision tree that returned a "compressing"
+preset under pressure — so the two could disagree, and on this hardware they
+did. A unit test pins that they read the same constant; this is the check that
+the constant is what a served model actually gets, on every architecture.
 
 Single MLX server at a time — strict serial.
 """
@@ -34,13 +44,31 @@ O_MODELS = Path(
     or ROOT.parents[1] / "open-models"
 )
 RMLX = str(ROOT / "target" / "release" / "rmlx")
+# Logs live under the single runtime root, not beside the checkout (CLAUDE.md).
+# Resolution mirrors `rmlx_core::paths::home()`: `$RMLX_HOME` wins, else the
+# workspace `.rmlx/`. This used to read `<repo>/logs`, a directory that holds
+# two 2026-06 `.log` files and no `.jsonl` — so `serve_one` never found a log,
+# `grep_resolved_kv` was handed `""`, and every row printed NO_LOG_MATCH. The
+# script could not pass on any surface, which is not a gate.
+RMLX_HOME = Path(os.environ.get("RMLX_HOME") or (ROOT / ".rmlx"))
+LOG_DIR = RMLX_HOME / "logs"
 PORT = 62265
 HOST = "127.0.0.1"
 
-# What `--kv-quant auto` must resolve to, on every architecture. It is a single
-# constant on purpose: a per-model column here is what let this smoke carry a
-# wrong expectation for Bonsai (recorded K8V8, actually Mixed) unnoticed.
+# What `auto` must resolve to, on every architecture and on every surface. It is
+# a single constant on purpose: a per-model column here is what let this smoke
+# carry a wrong expectation for Bonsai (recorded K8V8, actually Mixed)
+# unnoticed.
 EXPECTED_KV = "None"
+
+# The flag pair each `auto` surface is spelled with. Both must land on
+# EXPECTED_KV; only the first is timed, because the TPS check is a
+# "did serving collapse" floor and running it twice per model doubles the
+# GPU time without adding a signal.
+AUTO_SURFACES = [
+    ("kv-quant", ["--kv-quant", "auto"]),
+    ("kv-preset", ["--kv-preset", "auto"]),
+]
 
 # TPS anchors below were recorded while `auto` still resolved through the
 # retired per-arch table, i.e. at a different codec for four of the five rows.
@@ -162,7 +190,7 @@ def grep_resolved_kv(log_path: str) -> Optional[str]:
 
 
 def find_latest_log() -> Optional[str]:
-    log_dir = f"{ROOT}/logs"
+    log_dir = str(LOG_DIR)
     if not os.path.isdir(log_dir):
         return None
     candidates = sorted(
@@ -177,17 +205,17 @@ def find_latest_log() -> Optional[str]:
     return candidates[0] if candidates else None
 
 
-def serve_one(model_path: str) -> Tuple[subprocess.Popen, str]:
-    """Start rMLX serve, return (proc, log_path)."""
+def serve_one(model_path: str, auto_flags: List[str]) -> Tuple[subprocess.Popen, str]:
+    """Start rMLX serve under one `auto` surface, return (proc, log_path)."""
     # Discover the log path by snapshotting before/after.
-    pre = set(os.listdir(f"{ROOT}/logs")) if os.path.isdir(f"{ROOT}/logs") else set()
+    pre = set(os.listdir(LOG_DIR)) if os.path.isdir(LOG_DIR) else set()
     proc = subprocess.Popen(
         [
             RMLX, "serve",
             "--model", model_path,
             "--port", str(PORT),
             "--device", "gpu",
-            "--kv-quant", "auto",
+            *auto_flags,
             "--max-ctx", "8192",
         ],
         stdout=subprocess.DEVNULL,
@@ -198,12 +226,12 @@ def serve_one(model_path: str) -> Tuple[subprocess.Popen, str]:
     log_path = None
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        if os.path.isdir(f"{ROOT}/logs"):
-            now = set(os.listdir(f"{ROOT}/logs"))
+        if os.path.isdir(LOG_DIR):
+            now = set(os.listdir(LOG_DIR))
             new = now - pre
             new_jsonl = [n for n in new if n.endswith(".jsonl")]
             if new_jsonl:
-                log_path = os.path.join(f"{ROOT}/logs", sorted(new_jsonl)[-1])
+                log_path = os.path.join(str(LOG_DIR), sorted(new_jsonl)[-1])
                 break
         time.sleep(0.2)
     if log_path is None:
@@ -232,55 +260,82 @@ def stop_proc(proc: subprocess.Popen):
 
 
 def main():
-    print("model,expected_kv,resolved_kv,baseline_tps,observed_tps,delta_pct,ok")
+    print("surface,model,expected_kv,resolved_kv,baseline_tps,observed_tps,delta_pct,ok")
     all_ok = True
     for basename, baseline_tps, label in MODELS:
         expected_kv = EXPECTED_KV
         path = str(O_MODELS / basename)
         if not os.path.isdir(path):
-            print(f"{basename},{expected_kv},MISSING,{baseline_tps},0.0,nan,FAIL")
+            for surface, _ in AUTO_SURFACES:
+                print(f"{surface},{basename},{expected_kv},MISSING,{baseline_tps},0.0,nan,FAIL")
             all_ok = False
             continue
 
-        proc, log_path = serve_one(path)
-        ok = False
-        resolved = "NO_LOG_MATCH"
-        observed_tps = 0.0
-        try:
-            if not wait_ready(timeout_s=300):
-                print(f"{basename},{expected_kv},NOT_READY,{baseline_tps},0.0,nan,FAIL", flush=True)
-                continue
-            # warm-up + measure: a longer warm primes the prompt cache + JIT
-            # (otherwise first-decode is dominated by setup, not decode steady-state).
+        for idx, (surface, auto_flags) in enumerate(AUTO_SURFACES):
+            timed = idx == 0
+            proc, log_path = serve_one(path, auto_flags)
+            observed_tps = 0.0
             try:
-                _ = measure_tps(basename, max_tokens=64)   # warm 1 (load + JIT)
-                _ = measure_tps(basename, max_tokens=128)  # warm 2
-                # Take the best of two measurement runs.
-                t1 = measure_tps(basename, max_tokens=128)
-                t2 = measure_tps(basename, max_tokens=128)
-                observed_tps = max(t1, t2)
-            except Exception as e:
-                print(f"# {basename} measure error: {e}", file=sys.stderr)
-                observed_tps = 0.0
-        finally:
-            stop_proc(proc)
-            time.sleep(2)  # let the claim file release
+                if not wait_ready(timeout_s=300):
+                    print(
+                        f"{surface},{basename},{expected_kv},NOT_READY,{baseline_tps},0.0,nan,FAIL",
+                        flush=True,
+                    )
+                    all_ok = False
+                    continue
+                # EVERY surface serves at least one request, timed or not.
+                # The codec assertion reads `resolved KV cache quant`, which
+                # `arch::generate_greedy` emits per generation — a server that
+                # only started has never logged it, so an arm that skips the
+                # request can only ever report NO_LOG_MATCH and FAIL. Matching
+                # the CLI's own `--kv-preset resolved` line instead would prove
+                # the flag parsed, not that a served model got the codec, which
+                # is what this smoke exists to check.
+                try:
+                    if timed:
+                        # warm-up + measure: a longer warm primes the prompt
+                        # cache + JIT (otherwise first-decode is dominated by
+                        # setup, not decode steady-state).
+                        _ = measure_tps(basename, max_tokens=64)   # warm 1 (load + JIT)
+                        _ = measure_tps(basename, max_tokens=128)  # warm 2
+                        # Take the best of two measurement runs.
+                        t1 = measure_tps(basename, max_tokens=128)
+                        t2 = measure_tps(basename, max_tokens=128)
+                        observed_tps = max(t1, t2)
+                    else:
+                        # One short generation: enough to make the codec reach
+                        # a decode loop and be logged. Its timing is discarded.
+                        _ = measure_tps(basename, max_tokens=16)
+                except Exception as e:
+                    print(f"# {basename} {surface} generate error: {e}", file=sys.stderr)
+                    observed_tps = 0.0
+            finally:
+                stop_proc(proc)
+                time.sleep(2)  # let the claim file release
 
-        # The sentinel must NOT be spellable as a real codec: `auto` now
-        # resolves to `None`, so a "NONE" fallback would make a failed log grep
-        # compare equal to the expectation and pass this check vacuously.
-        resolved = grep_resolved_kv(log_path) or "NO_LOG_MATCH"
-        delta_pct = ((observed_tps - baseline_tps) / baseline_tps * 100.0) if baseline_tps else 0.0
-        kv_match = (resolved.lower() == expected_kv.lower())
-        tps_ok = observed_tps >= baseline_tps * 0.95
-        ok = kv_match and tps_ok
-        if not ok:
-            all_ok = False
-        print(
-            f"{basename},{expected_kv},{resolved},{baseline_tps:.2f},"
-            f"{observed_tps:.2f},{delta_pct:+.2f},{'PASS' if ok else 'FAIL'}",
-            flush=True,
-        )
+            # The sentinel must NOT be spellable as a real codec: `auto` now
+            # resolves to `None`, so a "NONE" fallback would make a failed log
+            # grep compare equal to the expectation and pass this check
+            # vacuously.
+            resolved = grep_resolved_kv(log_path) or "NO_LOG_MATCH"
+            kv_match = (resolved.lower() == expected_kv.lower())
+            if timed:
+                delta_pct = (
+                    (observed_tps - baseline_tps) / baseline_tps * 100.0
+                ) if baseline_tps else 0.0
+                tps_ok = observed_tps >= baseline_tps * 0.95
+                ok = kv_match and tps_ok
+                tps_cols = f"{baseline_tps:.2f},{observed_tps:.2f},{delta_pct:+.2f}"
+            else:
+                ok = kv_match
+                tps_cols = "n/a,n/a,n/a"
+            if not ok:
+                all_ok = False
+            print(
+                f"{surface},{basename},{expected_kv},{resolved},{tps_cols},"
+                f"{'PASS' if ok else 'FAIL'}",
+                flush=True,
+            )
 
     if not all_ok:
         sys.exit(1)

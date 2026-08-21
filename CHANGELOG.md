@@ -414,6 +414,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`--kv-preset auto` resolves to `DEFAULT_KV_QUANT`, the same constant
+  `--kv-quant auto` resolves to.** It previously ran its own resolver — a
+  decision tree over `sysctl hw.memsize` and a `config.json` parameter estimate
+  that returned a "compressing" preset when the model plus its bf16 KV would not
+  fit. Two `auto` surfaces resolving independently are two defaults that can
+  disagree, and these did: at identical flags
+  (`--max-ctx 131072 --prompt-tokens 4096`) `--kv-preset auto` resolved
+  `TurboSym4` on Ternary-Bonsai-8B and `K8V8` on gemma-4-e2b while
+  `--kv-quant auto` resolved `None` on both.
+
+  Worse, the answer bought nothing. Every preset that tree could return holds
+  resident KV **byte-identical** to `fp16` — measured below — so it warned that
+  the model might not fit and then picked a codec with no memory effect. Its own
+  KV estimate was, by its docstring, 10–30× off, so it could not be repurposed
+  into a diagnostic either. The tree and its two hardware queries
+  (`rmlx_core::unified_memory`, `rmlx_loader::model_size`, whose only caller it
+  was) are removed. Every named preset still resolves to its own codec.
+
+- **No `--kv-preset` row is described as a memory setting any more, because none
+  is one.** `q8`, `speed`, `quality`, `planar`, `planar3` and `k_only_planar`
+  each resolve to a codec whose decode reads the bf16 mirror, so `exit_prefill`
+  never builds its packed store. `--help`, `docs/CLI.md` and `docs/KV_QUANT.md`
+  now say so.
+
+- **A KV codec that changes nothing says so at resolve time.** `validate_resolved`
+  emits a `warn!` when the resolved codec keeps no packed store and is not
+  `none`: 17 of the 28 codecs the enum spells are in that class, and selecting
+  one previously produced a confident "resolved KV cache quant" log line and no
+  hint that resident KV and every generated token were identical to bf16.
+  Warn-and-proceed, like the existing CPU-hot-path classification beside it.
+
+  Both honesty warns are now emitted **once per `(arch, codec)` per process**.
+  They classify a resolved configuration, not a request, and `validate_resolved`
+  runs per request on the normal and speculative paths — so an operator serving
+  under one of them was getting the same paragraph for the process lifetime.
+
+  The warning says the codec is not known to cost anything either. That is
+  deliberate: the per-layer dispatch cost an earlier draft charged it with is
+  INCONCLUSIVE at all five recorded ABBA cells, so the class is *equivalent* to
+  bf16, not beaten by it. `docs/KV_QUANT.md` § "Codec disposition" carries the
+  axis-by-axis reading and the consequence for the dominated-vs-unused split:
+  the codecs that are genuinely dominated by the baseline are the ten that read
+  their own store and measure 1.003×–1.541× larger, not the seventeen that tie
+  it.
+
+- **`--kv-preset auto` works in `--registry` mode.** It was rejected there with
+  exit 78 and "auto-selection needs config.json to estimate model size" — a
+  reason that stopped existing when the selector did, since the resolver now
+  reads a constant and opens nothing. `--kv-quant auto`, the same constant under
+  another flag, was accepted on the same command line.
+
+  Measured with `scripts/bench/codec_inertness_probe.sh` — one `rmlx baseline`
+  per codec at temperature 0, 27 codec spellings × 2 architectures × 2 contexts,
+  108 runs, all exit 0. gemma-4-e2b is `kv_h == 1` with shared-KV and
+  sliding-window layers; Ternary-Bonsai-8B is `kv_h == 8` dense.
+
+  | | e2b 4k | e2b 32k | Bonsai 4k | Bonsai 32k |
+  |---|---:|---:|---:|---:|
+  | `none` resident KV (B) | 32 194 560 | 217 976 832 | 570 507 264 | 4 667 277 312 |
+  | of 27 driven spellings, those byte- and id-identical to `none` | 17 | 17 | 17 | 17 |
+  | spellings larger than `none` | 10 | 10 | 10 | 10 |
+  | spellings **smaller** than `none` | **0** | **0** | **0** | **0** |
+
+  The two 17s in this entry are different sets of the same size and it is a
+  coincidence: 17 of the 28 enum variants are in the inert class (`none` is
+  not one of them), while 17 of the 27 driven spellings measure identical to
+  `none` (16 inert ones plus `none` itself — the 28th variant,
+  `rotor_k_3_asym_*`, was left to the family-parameter test).
+
+  No codec is removed. The full disposition — which codecs are dominated, which
+  are merely losing today, and why the rotation families stay despite both — is
+  `docs/KV_QUANT.md` § "Codec disposition", pinned by a
+  `DISPOSITIONS` table that every variant must appear in exactly once.
+
 - **`--kv-quant auto` resolves to unquantised bf16, on every architecture and
   every prompt length.** Previously two resolvers disagreed with each other: a
   per-arch table returned `K8V8` / `K8V4` / `Planar` / `Mixed{k8g64,v4g64}`
