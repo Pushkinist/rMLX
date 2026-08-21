@@ -2021,20 +2021,35 @@ where `*` is the **Hamilton product** and `v ∈ ℝ⁴` is treated as a quatern
 The nominal codebook width never reaches the store: iso3 uses 12 of its 32
 code bits and iso4 uses 16, so **iso3 and iso4 occupy byte-identical
 storage**. At head_dim=128 that is 260 B per token per kv_head against bf16's
-256 B: **16.25 bits per value, 1.02× bf16**. The result is head_dim
-independent — at head_dim=512 it is 1028 B against 1024 B.
+256 B: **16.25 bits per value, 1.02× bf16**.
 
-Stores that keep the CPU `IsoBlocks` (the V-only `iso3` / `iso4` codecs) add a
-4×f32 quaternion per group on top, taking the same token to ≈772 B (≈48.25
-bits per value, 3.0× bf16). That sideband is the constant `FIXED_QUAT`
-replicated per group, not data — the GPU ring the K-only and symmetric codecs
-decode from does not carry it, which is why `k_iso3/4` and `iso3_sym/4_sym`
-measure ≈1.00–1.02× `none` while `iso3` / `iso4` measure ≈2.1×. Those are
-whole-cache ratios against the `none` *control*, which on the architectures
-with promoted global layers was itself a bf16/K8V8 mixture when they were
-recorded — see §"`--kv-quant none` is a bf16 control" for the per-arch
-restatement factor. The per-group figures above are the store density and are
-unaffected.
+The rate itself does move with head dim; the *sign* does not. Reading it off
+the allocation — `(D/4)·4 B` codes + `(D/4)·4 B` scales + `4 B` norm — gives
+
+```
+iso stored bits/value = 16 + 32/head_dim
+```
+
+so 16.25 at D=128, 16.125 at D=256, 16.03 at D=512, approaching 16.0 **from
+above** and never reaching it. Two planes at 8 B per 4 values are already
+exactly bf16's density, and the per-token norm is what keeps the sum strictly
+greater at every finite head dim. This is a derivation from
+`QuantKGpuRing::alloc` (`Dtype::U32` codes, `Dtype::F32` scales and norms, one
+element each per group per token per KV head), not a measurement.
+
+The CPU `IsoBlocks` form adds a 4×f32 quaternion per group on top, taking the
+same token to ≈772 B (≈48.25 bits per value, 3.0× bf16). That sideband is the
+constant `FIXED_QUAT` replicated per group, not data, and the GPU ring the
+K-only and symmetric codecs decode from does not carry it. **That figure is
+hypothetical on a served request**: the V-only `iso3` / `iso4` codecs decode
+from the bf16 mirror, so `exit_prefill` builds them no store and they measure
+byte-identical to `none` (§"Codec disposition", Class 2). It is the rate they
+would cost the day a decode kernel reads their store. The store-reading members
+are `k_iso3/4` and `iso3_sym/4_sym`, and those measure 1.003–1.054× `none` on
+the ring layout above (§"Codec disposition", Class 3 — whole-cache ratios
+against a `none` that is a true bf16 control since the head/tail promotion
+stopped applying to it). The per-group figures above are the store density and
+are unaffected by that.
 
 **No iso codec is a memory win, at any head_dim.** 8 B per 4 values is exactly
 bf16's density before the per-token norm is added, so the packed side is
@@ -2289,7 +2304,7 @@ amortises across every token in the layer.
 
 | Property | rotor3 |
 |---|---|
-| Delivered bits / element | **21.75** at head\_dim=128 (348 B/token/kv\_head vs bf16's 256 B, **1.36× bf16**), split **10.75 codes + 10.75 scales + 0.25 norm**. 43 groups cover a 128-element row, and each spends one whole `u32` code word **and** one `f32` scale for 3 real grade-1 elements. rotor3 and rotor4 therefore occupy byte-identical storage. The 3.25 bpe target reported by the Python `rotorquant` reference is gated on the grade-aware codebook follow-up (deferred — see below). **No rotor codec is a memory win at any head\_dim** — see the iso3 "Memory truth" note, `iso_and_rotor_k_codecs_are_never_a_memory_win`, and the crate-wide rate ceiling in `kv_rate_tests.rs`. |
+| Delivered bits / element | **21.75** at head\_dim=128 (348 B/token/kv\_head vs bf16's 256 B, **1.36× bf16**), split **10.75 codes + 10.75 scales + 0.25 norm**. 43 groups cover a 128-element row, and each spends one whole `u32` code word **and** one `f32` scale for 3 real grade-1 elements. rotor3 and rotor4 therefore occupy byte-identical storage. Read off the same allocation, `rotor stored bits/value = (64·⌈D/3⌉ + 32) / D` — 21.75 at D=128, 21.625 at D=256, with a floor of 64/3 = **21.33** as D grows. A derivation from `QuantKGpuRing::alloc`, not a measurement. The 3.25 bpe target reported by the Python `rotorquant` reference is gated on the grade-aware codebook follow-up (deferred — see below). **No rotor codec is a memory win at any head\_dim** — see the iso3 "Memory truth" note, `iso_and_rotor_k_codecs_are_never_a_memory_win`, and the crate-wide rate ceiling in `kv_rate_tests.rs`. |
 | Dead code budget | **5 of the 8 codes per group carry no information.** A rotor sandwich is grade-preserving, so embedding 3 values as the grade-1 part leaves the scalar, three bivector and pseudoscalar slots algebraically zero on encode; on decode the inverse sandwich keeps every non-grade-1 part out of the reconstructed vector, so quantising those slots injects no error either. 15 of the 24 code bits per group are pure waste. Pinned by `clifford_tests::sandwich_of_grade1_in_3d_stays_grade1` (encode side) and `clifford_tests::inverse_sandwich_of_non_grade1_leaks_nothing_into_grade1` (decode side). Removing them is a format + MSL-kernel change and is not scheduled; the 10.75 bits/value of `f32` scale would still dominate afterwards. |
 | Codebook | `lloyd_gaussian_codebook(3)` (8 centroids), shared across all 8 mv components (single-codebook simplification) |
 | Pack density (per u32) | 10 vals (planar3 / iso3 convention; 8 codes ≤ 30 bits per group, 1 u32 per group) |
@@ -2534,9 +2549,11 @@ and K dequant matches within 1e-3.
 
 Four variants mirror the V-side rotor3 / rotor4 codecs to the K axis. They
 add an **optional 1-bit QJL residual sideband** (Johnson–
-Lindenstrauss sketch of the post-rotor MSE residual) when
-`--rotor-qjl on` (the default). The storage format is controlled by a global
-toggle ([`rotor_qjl_enabled()`] in `rmlx-kv-quant::rotor_qjl`).
+Lindenstrauss sketch of the post-rotor MSE residual) under
+`--rotor-qjl on`, which is **not** the default — QJL has no MSL kernel, so
+enabling it moves the rotor K encode + dequant onto the CPU. The storage format
+is controlled by a global toggle ([`rotor_qjl_enabled()`] in
+`rmlx-kv-quant::rotor_qjl`), whose default is `false`.
 
 | `KvQuant` | K codec | V codec | CacheType pair (`(K, V)`) | SSD tag (QJL off / on) |
 |---|---|---|---|---|
@@ -2580,14 +2597,16 @@ siblings (K-side ≤4-bit on Qwen MoE is the PPL-disaster path). The error's
 path); the affine V codec dequants to bf16 (existing `K8V4` V path); then
 `scaled_dot_product_attention` runs.
 
-**Decode-cost caveat.** Like the iso K-side codecs, the rotor K-side codecs
-have no GPU-resident code mirror: with the default `--rotor-qjl on`, each
-decode step re-decodes the full K prefix on the CPU (and re-encodes the newly
-appended token), applies an O(head_dim²)-per-cached-token QJL score
-correction, then re-uploads the K prefix — an O(kv_seq) per-step cost that the
-short-prompt anchors mask but long-prompt decode exposes. The fused-QK fast path (which would avoid the
-per-step marshaling) is reachable only with `--rotor-qjl off` and is
-default-OFF; see the Fused-QK status below.
+**Decode-cost caveat — opt-in only.** With `--rotor-qjl on` the rotor K-side
+codecs have no GPU-resident code mirror: each decode step re-decodes the full K
+prefix on the CPU (and re-encodes the newly appended token), applies an
+O(head_dim²)-per-cached-token QJL score correction, then re-uploads the K
+prefix — an O(kv_seq) per-step cost that the short-prompt anchors mask but
+long-prompt decode exposes. That is why QJL is **off** by default: the default
+path runs the rotor K encode and `rotor_flash_decode` on Metal. The fused-QK
+fast path (which would avoid the per-step marshaling) also needs
+`--rotor-qjl off` and is separately default-OFF; see the Fused-QK status
+below.
 
 **Fused-QK status:** the 6 rotor variants (`Rotor3Sym`, `Rotor4Sym`,
 `RotorKOnly3`, `RotorKOnly4`, `RotorK3Asym`, `RotorK4Asym`) are wired into
@@ -2612,8 +2631,8 @@ generated once per layer/head on first append and persisted to the SSD block
 (`l{idx}.k.qjl_s`). The layout tag (`*_qjl`) distinguishes QJL-ON blocks
 from QJL-OFF blocks so the reader can hydrate the projection matrix.
 
-**QJL toggle.** CLI: `--rotor-qjl on|off` (default `on`). Env fallback:
-`RMLX_ROTOR_QJL=0` disables. The toggle is read per-construction (not cached)
+**QJL toggle.** CLI: `--rotor-qjl on|off` (default `off`). Env fallback:
+`RMLX_ROTOR_QJL=1` enables. The toggle is read per-construction (not cached)
 so env changes between tests still propagate.
 
 **Score-time QJL correction.** The QJL correction is
@@ -2834,8 +2853,8 @@ Approximate bytes per KV pair (`B=1, 1 layer, 1 head, D elements`). These are
 **packed-store** rates — what a codec's codes and scales occupy. They are not
 resident KV for the bf16-mirror family, which builds no store: those codecs sit
 at the `None` row, 4·D, measured byte-identical (§"Per-layer net-benefit
-decision"). The rates below are what a codec would cost once decode reads its
-store.
+decision"). Which rows are live and which are hypothetical is stated under the
+table.
 
 | Mode | K bytes/tok | V bytes/tok | Total bytes/tok |
 |---|---|---|---|
@@ -2846,10 +2865,31 @@ store.
 | `Mixed{k8g64,v4g64}` | 1·D + 2·D/64·4 | 0.5·D + 2·D/64·4 | ~1.75·D |
 | `K8VTurbo3` | 1·D + D/128·4 | 0.375·D + D/32·4 | ~1.51·D |
 | `K8VTurbo2` | 1·D + D/128·4 | 0.25·D + D/32·4 | ~1.38·D |
+| `k_iso3` / `k_iso4` | 2·D + 4 | 2·D (bf16) | ~4·D + 4 |
+| `iso3_sym` / `iso4_sym` | 2·D + 4 | 2·D + 4 | ~4·D + 8 |
+| `k_rotor3` / `k_rotor4` | 8·⌈D/3⌉ + 4 | 2·D (bf16) | ~4.67·D + 4 |
+| `rotor3_sym` / `rotor4_sym` | 8·⌈D/3⌉ + 4 | 8·⌈D/3⌉ + 4 | ~5.33·D + 8 |
 
 PlanarQuant V carries extra rotation state (two u32 per group of 32), which
 raises its byte cost above K8V4 despite the same 4-bit code width. The
 quality improvement compensates on dense full-attention archs.
+
+Two groups of rows here have a decode that reads the store they describe, so
+their rates are live rather than hypothetical: the `Mixed{k8g64,v4g64}` row and
+the four ring rows (§"Codec disposition", Class 3). Every other row is a rate
+its codec would cost the day a kernel reads its store. Of all of them, only the
+four ring rows are **above** the `None` row *on rate* — `Mixed` is below it
+here and still measures larger resident, because it keeps both bf16 seeds
+beside its store, which is a residency fact this table does not carry.
+
+Each ring side spends one `u32` code word and one `f32` scale per group
+whatever the codebook width, so the nominal
+3-/4-bit label never reaches the store: iso is `16 + 32/head_dim` bits per
+value and rotor floors at `64/3` = 21.33, both strictly above bf16's 16.0 at
+every finite head dim (§ iso3 "Memory truth", § rotor3). The rate is a property
+of the ring layout, not of the algorithms; a layout that packs its scale plane
+separately is unbuilt and is the open question § "What this disposition does not
+decide" names.
 
 ---
 
@@ -3642,7 +3682,7 @@ carry QJL, `q_seq == 1`, `b == 1`, `head_dim` is a power of two and
 `<= ROTOR_FLASH_HEAD_DIM_MAX` (512). Any miss falls through to the legacy CPU
 dequant path.
 
-**QJL.** The optional 1-bit QJL residual (`--rotor-qjl on`, the default) is a
+**QJL.** The optional 1-bit QJL residual (`--rotor-qjl on`, opt-in) is a
 per-token back-projection through a dense `[head_dim, head_dim]` matrix.
 Reproducing it in the flash inner loop would mean reading that whole matrix per
 token per threadgroup — far more bandwidth than the kernel saves — so a
@@ -4083,8 +4123,9 @@ reaches it.
 | medgemma-4B (Gemma3, D=256) | `k_rotor3` | 7.37 | **51.8** | 7.0× |
 | medgemma-4B | `k_rotor4` | 7.34 | **52.1** | 7.1× |
 
-Against the *default* (`--rotor-qjl on`) baseline the same cells move
-0.66 → 17.0 (Bonsai, 26×) and 2.35 → 51.8 (medgemma, 22×).
+Against the `--rotor-qjl on` baseline — which was the default when these cells
+were taken and is now opt-in — the same cells move 0.66 → 17.0 (Bonsai, 26×)
+and 2.35 → 51.8 (medgemma, 22×).
 
 Bonsai is a noisy measurement target at this prompt size (k_rotor4 spans
 14.0–17.1 across 5 runs); medgemma is stable to ~±3%. Treat a single Bonsai run

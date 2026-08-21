@@ -396,6 +396,65 @@ fn a_channel_with_no_latency_sample_reports_empty_not_zero() {
 fn a_process_filter_matching_nothing_is_an_error_not_an_empty_summary() {
     let err = summarise_gpu_intervals(&doc(ROWS_HAPPY), only("no-such-process"))
         .expect_err("a filter that selects nothing must be refused");
+    assert!(
+        matches!(err, XctraceError::NoRowsForProcess { .. }),
+        "got {err}"
+    );
+}
+
+/// A recording that captured nothing and a recording that captured other
+/// processes are different states with different remedies, and reporting both
+/// as "no rows" sends the reader to re-run a command that works. The table
+/// knows which one it is: `rows_total` and the process census are both in
+/// hand at the point of refusal.
+#[test]
+fn a_table_with_rows_for_other_processes_says_so_and_names_them() {
+    let err = summarise_gpu_intervals(&doc(ROWS_HAPPY), only("no-such-process"))
+        .expect_err("a filter that selects nothing must be refused");
+    let text = err.to_string();
+    assert!(
+        text.contains("rmlx (99)"),
+        "the refusal must name the processes the recording did see; got {text}"
+    );
+    assert!(
+        text.contains('2'),
+        "the refusal must say how many rows the table held; got {text}"
+    );
+    // The empty-table wording would send the reader to re-run the workload.
+    assert!(
+        !text.contains("contains no rows"),
+        "a populated table must not be reported as an empty one; got {text}"
+    );
+}
+
+/// The `skip_ms > 0` entry takes its own pre-pass over the table, so the
+/// distinction has to hold on both branches or a `--skip-ms` run reports the
+/// wrong one.
+#[test]
+fn the_skip_branch_reports_the_same_distinction() {
+    let err = summarise_gpu_intervals(
+        &doc(ROWS_HAPPY),
+        SummaryFilter {
+            process: Some("no-such-process"),
+            skip_ms: 1,
+        },
+    )
+    .expect_err("a filter that selects nothing must be refused on the skip branch too");
+    assert!(
+        matches!(err, XctraceError::NoRowsForProcess { .. }),
+        "got {err}"
+    );
+    assert!(err.to_string().contains("rmlx (99)"), "got {err}");
+}
+
+/// An empty table keeps the empty-table wording: there the recording really
+/// did capture nothing. Refused by the row walk itself, before the summary's
+/// own filter check — which is why that check needs no emptiness test of its
+/// own.
+#[test]
+fn an_empty_table_is_still_reported_as_an_empty_table() {
+    let err = summarise_gpu_intervals(&doc(""), only("rmlx"))
+        .expect_err("an export with no rows must be refused");
     assert!(matches!(err, XctraceError::NoRows { .. }), "got {err}");
 }
 

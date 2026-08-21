@@ -9,9 +9,11 @@
 //! attention reads at most `max_size` tokens — no per-step trimming, no per-step
 //! window mask.
 //!
-//! Used by SWA layers (e.g. Gemma3/Gemma4) in **bf16-KV mode only**.
-//! Quantized SWA layers stay on the existing full-size [`KvStorage`] codec
-//! paths; mlx-lm's reference also keeps RotatingKVCache as bf16
+//! Used by SWA layers (e.g. Gemma3/Gemma4) under **every** `KvQuant`. The
+//! rotating branch is selected on `window > 0` alone
+//! ([`crate::KvCache::with_quant_max_seq_window`]), so a quantized codec on an
+//! SWA layer runs this bf16 ring and its [`crate::KvStorage`] is never
+//! allocated; mlx-lm's reference also keeps RotatingKVCache as bf16
 //! (`to_quantized` raises `NotImplementedError`).
 //!
 //! Algorithm (mirrors mlx-lm exactly):

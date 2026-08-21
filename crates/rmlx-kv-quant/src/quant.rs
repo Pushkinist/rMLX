@@ -101,7 +101,9 @@ pub enum KvQuant {
     /// K = affine q8_0 (group_size=128),
     /// V = TurboQuant **3-bit** Lloyd-Max N(0,1) codebook (group=32).
     ///
-    /// Auto default for Gemma4 small (non-MoE, hidden_size ≤ 2560, non-paroquant).
+    /// Opt-in on every arch — `auto` resolves to bf16 and never selects it. It
+    /// was the auto default for Gemma4 small (non-MoE, `hidden_size` ≤ 2560,
+    /// non-paroquant) until the per-arch table was retired.
     /// Validated on Gemma4-e4b: −0.40% vs K8V4 at canary shape (within the
     /// <1% promote gate). Cosine gate ≥ 0.9807 passes.
     ///

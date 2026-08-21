@@ -124,13 +124,58 @@ pub struct SummaryFilter<'a> {
     pub skip_ms: u64,
 }
 
+/// The refusal for "the filter matched nothing", built once so both entry
+/// branches say the same thing.
+///
+/// Only reachable on a table that *has* rows: `for_each_row` refuses an empty
+/// export itself, before either caller gets here. So a filter being present is
+/// the whole decision — when one is, the rows exist and belong to somebody
+/// else, and naming who is what separates "the recording failed" from "this
+/// process was not in it".
+fn no_rows_error(
+    schema: String,
+    rows_total: u64,
+    process_filter: Option<&str>,
+    processes: &[(String, u64)],
+    after_skip: bool,
+) -> XctraceError {
+    let Some(want) = process_filter else {
+        return XctraceError::NoRows { schema };
+    };
+    // Bounded: a recording holds a handful of processes, and the census is
+    // read only on this error path.
+    let seen = processes
+        .iter()
+        .map(|(name, n)| format!("{name} ({n} rows)"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    XctraceError::NoRowsForProcess {
+        schema,
+        rows_total,
+        filter: want.to_owned(),
+        processes: if seen.is_empty() {
+            "<none>".to_owned()
+        } else {
+            seen
+        },
+        after_skip: if after_skip {
+            " after the requested skip".to_owned()
+        } else {
+            String::new()
+        },
+    }
+}
+
 /// Parses a `metal-gpu-intervals` export and summarises it.
 ///
 /// # Errors
 /// [`XctraceError::WrongSchema`] when the export is a different table, plus any
-/// parse error. A filter that matches no row is [`XctraceError::NoRows`]: an
-/// empty summary is indistinguishable from a run that recorded nothing, and
-/// reporting zeros for it is how a profiling harness lies.
+/// parse error. A filter that matches no row is refused rather than summarised
+/// as zeros — an empty summary is indistinguishable from a run that recorded
+/// nothing, and reporting zeros for it is how a profiling harness lies. Which
+/// refusal says which: [`XctraceError::NoRows`] when the table itself is empty,
+/// [`XctraceError::NoRowsForProcess`] when it holds other processes' work and
+/// none of this one's.
 pub fn summarise_gpu_intervals(xml: &str, filter: SummaryFilter<'_>) -> Result<GpuIntervalSummary> {
     // Checked up front, from the header alone, so the wrong table refuses
     // identically whatever the options say. Left inside the row walk it would
@@ -152,9 +197,22 @@ pub fn summarise_gpu_intervals(xml: &str, filter: SummaryFilter<'_>) -> Result<G
     // avoid.
     let mut earliest = u64::MAX;
     let mut latest = 0u64;
+    // Counted on the way past so the refusal below can name what the recording
+    // did hold; a second pass purely to answer that would be a second reader of
+    // the same table.
+    let mut rows_total = 0u64;
+    let mut processes: HashMap<String, u64> = HashMap::new();
     for_each_row(xml, |row| {
+        rows_total += 1;
+        let seen = row.fmt("process")?.unwrap_or("<unattributed>");
+        match processes.get_mut(seen) {
+            Some(n) => *n += 1,
+            None => {
+                processes.insert(seen.to_owned(), 1);
+            }
+        }
         if let Some(want) = filter.process {
-            if !row.fmt("process")?.unwrap_or_default().contains(want) {
+            if !seen.contains(want) {
                 return Ok(());
             }
         }
@@ -168,12 +226,13 @@ pub fn summarise_gpu_intervals(xml: &str, filter: SummaryFilter<'_>) -> Result<G
         Ok(())
     })?;
     if earliest == u64::MAX {
-        return Err(XctraceError::NoRows {
-            schema: filter.process.map_or_else(
-                || GPU_INTERVALS_SCHEMA.to_owned(),
-                |f| format!("{GPU_INTERVALS_SCHEMA} filtered to process containing {f:?}"),
-            ),
-        });
+        return Err(no_rows_error(
+            GPU_INTERVALS_SCHEMA.to_owned(),
+            rows_total,
+            filter.process,
+            &sorted_processes(processes),
+            false,
+        ));
     }
     let origin_ns = earliest.saturating_add(filter.skip_ms.saturating_mul(1_000_000));
     if origin_ns >= latest {
@@ -243,14 +302,13 @@ fn summarise_from(
     })?;
 
     if summary.rows_matched == 0 {
-        let mut what = schema.name;
-        if let Some(f) = process_filter {
-            what = format!("{what} filtered to process containing {f:?}");
-        }
-        if start_floor_ns > 0 {
-            what = format!("{what} after the requested skip");
-        }
-        return Err(XctraceError::NoRows { schema: what });
+        return Err(no_rows_error(
+            schema.name,
+            summary.rows_total,
+            process_filter,
+            &sorted_processes(processes),
+            start_floor_ns > 0,
+        ));
     }
 
     summary.first_start_ns = if first_start == u64::MAX {
@@ -268,11 +326,16 @@ fn summarise_from(
             .cmp(&a.busy_ns)
             .then_with(|| a.channel.cmp(&b.channel))
     });
-    summary.processes = processes.into_iter().collect();
-    summary
-        .processes
-        .sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    summary.processes = sorted_processes(processes);
     Ok(summary)
+}
+
+/// Process census as a busiest-first list, ties broken by name so the order is
+/// stable across runs (the refusal message quotes it).
+fn sorted_processes(processes: HashMap<String, u64>) -> Vec<(String, u64)> {
+    let mut out: Vec<(String, u64)> = processes.into_iter().collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
 }
 
 /// Renders a summary as CSV — the form a regression script asserts on.

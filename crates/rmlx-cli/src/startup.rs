@@ -235,8 +235,8 @@ pub(crate) fn print_cache_type_table() {
             CacheType::Turbo2Tcq => "TurboQuant + Viterbi trellis (2-bit)",
             CacheType::IsoK3 => "IsoQuant K-rotation (3-bit)",
             CacheType::IsoK4 => "IsoQuant K-rotation (4-bit)",
-            CacheType::RotorK3 => "Clifford rotor K-side (3-bit, +QJL)",
-            CacheType::RotorK4 => "Clifford rotor K-side (4-bit, +QJL)",
+            CacheType::RotorK3 => "Clifford rotor K-side (3-bit)",
+            CacheType::RotorK4 => "Clifford rotor K-side (4-bit)",
             // Symmetric WHT-3 K+V.
             CacheType::TurboSym3 => "TurboQuant sym K+V (3-bit)",
         };
@@ -289,4 +289,20 @@ pub(crate) fn print_cache_type_table() {
             sides,
         );
     }
+    // The nominal width in a rotation codec's name is its codebook, not what
+    // the store spends. The iso and rotor tags decode from a shared GPU ring
+    // that costs one whole u32 code word plus one f32 scale per group whatever
+    // the codebook width, so a 3-bit and a 4-bit member of the same family
+    // occupy byte-identical space and both land above bf16. Said here because
+    // this listing is where the tags are chosen.
+    println!();
+    println!("note: the bit width in an iso_*/rotor_* name is its codebook, not what");
+    println!("      it stores. Their shared ring spends one u32 code word and one f32");
+    println!("      scale per group whatever that width, so a store built from it holds");
+    println!("      16 + 32/head_dim bits per value (iso) or (64*ceil(head_dim/3)+32)");
+    println!("      /head_dim (rotor) — 16.25 and 21.75 at head_dim 128, against bf16's");
+    println!("      16.00, and the 3-bit and 4-bit members are byte-identical. These are");
+    println!("      the widest cells on this menu, not the narrowest. Derived from the");
+    println!("      ring allocation; for which pairings actually build that store see");
+    println!("      docs/KV_QUANT.md \"Codec disposition\".");
 }

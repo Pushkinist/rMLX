@@ -23,7 +23,9 @@ One `cargo build --release` binary that:
    input for models that support those modalities.
 3. Supports the **widest weight × KV quantization matrix** MLX can express,
    including rotation-based KV families no other MLX server ships
-   (TurboQuant, IsoQuant, PlanarQuant, ParoQuant).
+   (TurboQuant, IsoQuant, PlanarQuant, RotorQuant). ParoQuant is supported
+   too, on the **weight** side — it is not a KV method (see
+   `docs/WEIGHT_QUANTS.md` §7).
 4. **Converts** models between quant formats / layouts (re-quantize, KV-quant
    repack) — MLX in, MLX out.
 5. Multi-model lifecycle (load on demand, unload on idle), but enforces a
@@ -104,7 +106,12 @@ coverage grows.
 - `oxideai/mlx-rs` — community Rust binding over `mlx-c`.
 - `ml-explore/mlx-c` — Apple's stable C ABI.
 - `huggingface/safetensors` — Rust safetensors crate.
-- `z-lab/paroquant`, `ParaMind2025/isoquant` — rotation-KV references.
+- `z-lab/paroquant` — weight-side pairwise-rotation INT4 reference. Not a KV
+  method: the token `kv` does not occur in the repo, and its calibration path
+  drops `use_cache`. See `docs/WEIGHT_QUANTS.md` §7.
+- `ParaMind2025/isoquant` — SO(4) isoclinic rotation reference. Stage-1
+  quantize/dequantize only (5 tracked files, two CUDA kernels); no cache and no
+  decode path upstream, so rMLX's `iso*` KV codecs have no counterpart to port.
 
 ## Hard rules
 

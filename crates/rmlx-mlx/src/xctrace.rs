@@ -161,13 +161,46 @@ pub enum XctraceError {
         actual: String,
     },
 
-    /// A well-formed export with no rows. Never silently reported as an empty
-    /// result: it means the recording captured nothing, which is a failed run,
-    /// not a run with zero GPU work.
+    /// A well-formed export with **no rows at all**. Never silently reported as
+    /// an empty result: the recording captured nothing, from any process.
+    ///
+    /// This is deliberately narrower than "the summary is empty". A table that
+    /// holds rows for other processes and none for the one asked about is a
+    /// different state with a different remedy, and it is
+    /// [`Self::NoRowsForProcess`].
     #[error("schema '{schema}' parsed but contains no rows")]
     NoRows {
         /// Name of the parsed schema.
         schema: String,
+    },
+
+    /// The table is populated, but no row is attributed to a process matching
+    /// the filter.
+    ///
+    /// Separated from [`Self::NoRows`] because the two point at opposite
+    /// things: an empty table means the recording failed, while a populated
+    /// one means it ran and this process was not in it — because it never
+    /// launched, exited before submitting GPU work, or was not instrumented.
+    /// Reporting the second as the first sends the reader to re-run a workload
+    /// that is fine. The processes the recording *did* see are the evidence
+    /// that distinguishes them, so they are carried here rather than left for
+    /// a second pass the caller has to know to make.
+    #[error(
+        "'{schema}' holds {rows_total} rows but none for a process matching \
+         {filter:?}{after_skip} — the recording ran; this process was not in it. \
+         Processes seen: {processes}"
+    )]
+    NoRowsForProcess {
+        /// Name of the parsed schema.
+        schema: String,
+        /// Rows in the table before the process filter.
+        rows_total: u64,
+        /// The substring the caller filtered on.
+        filter: String,
+        /// Process display names seen, with row counts, busiest first.
+        processes: String,
+        /// `" after the requested skip"` when a skip was in force, else empty.
+        after_skip: String,
     },
 
     /// The requested skip covers everything the matched process did.

@@ -234,7 +234,9 @@ rc=$?
 # the child's termination as a non-zero exit on the ordinary, successful path.
 # The exit code therefore cannot be the gate; the bundle and the exported table
 # are. A run that genuinely failed leaves no rows for this process, and the
-# summariser refuses that rather than printing zeros.
+# summariser refuses that rather than printing zeros — naming, when the table
+# does hold rows, which processes they belong to, so "the recording failed" and
+# "this process was not in it" stay apart.
 if [ $rc -ne 0 ]; then
 	echo "note: xctrace record exited $rc — expected when --time-limit ends a" >&2
 	echo "  still-running process. The export below is what decides." >&2
@@ -309,9 +311,14 @@ fi
 # its exit code is load-bearing here.
 if [ $rc -ne 0 ]; then
 	echo "ERROR: summarising $xml failed (exit $rc)" >&2
-	echo "  If it reports no rows for this process, the run itself failed and" >&2
-	echo "  xctrace swallowed its output. Re-run it directly to see why:" >&2
-	echo "    ${run_cmd[*]}" >&2
+	echo "  Read WHICH refusal it printed — they mean opposite things:" >&2
+	echo "  * 'contains no rows'  -> the recording captured nothing from any" >&2
+	echo "    process. The recording failed; the workload is not implicated." >&2
+	echo "  * 'holds N rows but none for a process matching ...' -> the" >&2
+	echo "    recording ran and this process was not in it. It lists the" >&2
+	echo "    processes it did see. Re-run the workload directly to check it" >&2
+	echo "    reaches the GPU at all:" >&2
+	echo "      ${run_cmd[*]}" >&2
 	exit $rc
 fi
 
