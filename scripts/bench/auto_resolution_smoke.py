@@ -44,6 +44,14 @@ O_MODELS = Path(
     or ROOT.parents[1] / "open-models"
 )
 RMLX = str(ROOT / "target" / "release" / "rmlx")
+# Logs live under the single runtime root, not beside the checkout (CLAUDE.md).
+# Resolution mirrors `rmlx_core::paths::home()`: `$RMLX_HOME` wins, else the
+# workspace `.rmlx/`. This used to read `<repo>/logs`, a directory that holds
+# two 2026-06 `.log` files and no `.jsonl` — so `serve_one` never found a log,
+# `grep_resolved_kv` was handed `""`, and every row printed NO_LOG_MATCH. The
+# script could not pass on any surface, which is not a gate.
+RMLX_HOME = Path(os.environ.get("RMLX_HOME") or (ROOT / ".rmlx"))
+LOG_DIR = RMLX_HOME / "logs"
 PORT = 62265
 HOST = "127.0.0.1"
 
@@ -182,7 +190,7 @@ def grep_resolved_kv(log_path: str) -> Optional[str]:
 
 
 def find_latest_log() -> Optional[str]:
-    log_dir = f"{ROOT}/logs"
+    log_dir = str(LOG_DIR)
     if not os.path.isdir(log_dir):
         return None
     candidates = sorted(
@@ -200,7 +208,7 @@ def find_latest_log() -> Optional[str]:
 def serve_one(model_path: str, auto_flags: List[str]) -> Tuple[subprocess.Popen, str]:
     """Start rMLX serve under one `auto` surface, return (proc, log_path)."""
     # Discover the log path by snapshotting before/after.
-    pre = set(os.listdir(f"{ROOT}/logs")) if os.path.isdir(f"{ROOT}/logs") else set()
+    pre = set(os.listdir(LOG_DIR)) if os.path.isdir(LOG_DIR) else set()
     proc = subprocess.Popen(
         [
             RMLX, "serve",
@@ -218,12 +226,12 @@ def serve_one(model_path: str, auto_flags: List[str]) -> Tuple[subprocess.Popen,
     log_path = None
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        if os.path.isdir(f"{ROOT}/logs"):
-            now = set(os.listdir(f"{ROOT}/logs"))
+        if os.path.isdir(LOG_DIR):
+            now = set(os.listdir(LOG_DIR))
             new = now - pre
             new_jsonl = [n for n in new if n.endswith(".jsonl")]
             if new_jsonl:
-                log_path = os.path.join(f"{ROOT}/logs", sorted(new_jsonl)[-1])
+                log_path = os.path.join(str(LOG_DIR), sorted(new_jsonl)[-1])
                 break
         time.sleep(0.2)
     if log_path is None:
@@ -275,20 +283,32 @@ def main():
                     )
                     all_ok = False
                     continue
-                if timed:
-                    # warm-up + measure: a longer warm primes the prompt cache
-                    # + JIT (otherwise first-decode is dominated by setup, not
-                    # decode steady-state).
-                    try:
+                # EVERY surface serves at least one request, timed or not.
+                # The codec assertion reads `resolved KV cache quant`, which
+                # `arch::generate_greedy` emits per generation — a server that
+                # only started has never logged it, so an arm that skips the
+                # request can only ever report NO_LOG_MATCH and FAIL. Matching
+                # the CLI's own `--kv-preset resolved` line instead would prove
+                # the flag parsed, not that a served model got the codec, which
+                # is what this smoke exists to check.
+                try:
+                    if timed:
+                        # warm-up + measure: a longer warm primes the prompt
+                        # cache + JIT (otherwise first-decode is dominated by
+                        # setup, not decode steady-state).
                         _ = measure_tps(basename, max_tokens=64)   # warm 1 (load + JIT)
                         _ = measure_tps(basename, max_tokens=128)  # warm 2
                         # Take the best of two measurement runs.
                         t1 = measure_tps(basename, max_tokens=128)
                         t2 = measure_tps(basename, max_tokens=128)
                         observed_tps = max(t1, t2)
-                    except Exception as e:
-                        print(f"# {basename} measure error: {e}", file=sys.stderr)
-                        observed_tps = 0.0
+                    else:
+                        # One short generation: enough to make the codec reach
+                        # a decode loop and be logged. Its timing is discarded.
+                        _ = measure_tps(basename, max_tokens=16)
+                except Exception as e:
+                    print(f"# {basename} {surface} generate error: {e}", file=sys.stderr)
+                    observed_tps = 0.0
             finally:
                 stop_proc(proc)
                 time.sleep(2)  # let the claim file release

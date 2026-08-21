@@ -143,29 +143,47 @@ fn no_preset_is_a_memory_lever() {
     }
 }
 
-/// `--kv-preset auto` and `--kv-quant auto` resolve to the same codec.
+/// `--kv-preset auto` and `--kv-quant auto` resolve to the same codec, from the
+/// strings an operator actually types.
 ///
-/// They are two spellings of "you pick", and a user who passes one has no way
-/// to know they got a different answer than the other would have given. The
-/// preset surface used to resolve independently, through a unified-memory
-/// decision tree; the two defaults could disagree and did.
+/// Driven through both real parsers rather than through `KvPresetArg::Auto` and
+/// the constant: comparing `DEFAULT_KV_QUANT` against itself would hold no
+/// matter what `parse_kv_preset` did with the word `auto`, and the defect this
+/// pins was a second resolver sitting behind exactly that word. `parse_kv_quant`
+/// returns `Ok(None)` for `auto` — the "use the engine default" sentinel — so
+/// the two sides are compared after each has been resolved the way its own
+/// command path resolves it.
 #[test]
 fn preset_auto_is_the_same_default_as_kv_quant_auto() {
-    use crate::commands::parse::{resolve_preset_arg, KvPresetArg};
+    use crate::commands::parse::{parse_kv_preset, parse_kv_quant, resolve_preset_arg};
+    let via_preset = resolve_preset_arg(parse_kv_preset("auto").expect("`auto` must parse"));
+    let via_kv_quant = parse_kv_quant("auto")
+        .expect("`auto` must parse")
+        .unwrap_or(rmlx_models::kv_cache::DEFAULT_KV_QUANT);
     assert_eq!(
-        resolve_preset_arg(KvPresetArg::Auto),
+        via_preset, via_kv_quant,
+        "--kv-preset auto and --kv-quant auto must resolve to one codec"
+    );
+    assert_eq!(
+        via_preset,
         rmlx_models::kv_cache::DEFAULT_KV_QUANT,
         "--kv-preset auto must read DEFAULT_KV_QUANT, not a second resolver"
     );
 }
 
-/// A named preset is unaffected by the `auto` collapse.
+/// Every preset name resolves to its own codec, from the string inward.
+///
+/// `parse_kv_preset` → `resolve_preset_arg` is the whole path a `--kv-preset`
+/// argument takes. Building a `KvPresetArg::Resolved` from the table and
+/// asserting it comes back unchanged would exercise neither the name lookup nor
+/// the parser, so a name→codec regression would pass it.
 #[test]
 fn named_presets_still_resolve_to_their_own_codec() {
-    use crate::commands::parse::{resolve_preset_arg, KvPresetArg};
+    use crate::commands::parse::{parse_kv_preset, resolve_preset_arg};
     for (name, spec) in PRESETS {
+        let parsed = parse_kv_preset(name).unwrap_or_else(|e| panic!("preset '{name}': {e}"));
         assert_eq!(
-            resolve_preset_arg(KvPresetArg::Resolved(spec.kv_quant)),
+            resolve_preset_arg(parsed),
             spec.kv_quant,
             "preset '{name}' must resolve to its own codec"
         );

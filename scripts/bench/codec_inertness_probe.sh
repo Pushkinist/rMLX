@@ -10,12 +10,16 @@
 #                          `none` arm means the codec is not on the decode read
 #                          path at all; decoded text cannot show this, because
 #                          different id sequences decode to the same string.
-#   * `store_skipped`    — whether the run logged `exit_prefill: packed store
-#                          skipped`, i.e. the codec encoded nothing at all.
+#   * `store_skipped`    — whether ANY layer-cache in the run logged
+#                          `exit_prefill: packed store skipped`. Corroborating
+#                          only, and NOT a per-codec fact: the layer-adaptive
+#                          head/tail promotion types some layers `K8V8`, so a
+#                          store-READING codec sets this too (`mixed_*` does, on
+#                          Ternary-Bonsai-8B, where 10 of 36 layers are
+#                          promoted). Do not classify a codec by this column.
 #
-# The three together separate "dominated" from "merely unused": a codec whose
-# bytes and ids both equal `none`'s, and which skipped its store, is inert —
-# selecting it is a no-op with a name.
+# `kv_cache_bytes` and the id digest are the deciding columns: a codec whose
+# bytes and ids both equal `none`'s is doing nothing a caller can observe.
 #
 # `ttft_ms`, `decode_tps` and `prefill_tps` are recorded for context only and
 # are NOT comparable across rows: these are single unpaired runs on a shared
@@ -29,8 +33,8 @@
 #       [--codecs "none k8v8 ..."]
 #
 # Output CSV (appended, header written once):
-#   timestamp,model,prompt_tokens,prompt_tokens_measured,max_tokens,codec,
-#   exit_code,kv_cache_bytes,ids_sha,store_skipped,ttft_ms,decode_tps,
+#   timestamp,model,prompt_tokens,prompt_tokens_measured,max_ctx,max_tokens,
+#   codec,exit_code,kv_cache_bytes,ids_sha,store_skipped,ttft_ms,decode_tps,
 #   prefill_tps,binary_sha
 #
 # `prompt_tokens` is the fixture NAME (`--prompt-tokens 4096` selects
@@ -64,7 +68,12 @@ MODEL=""
 PROMPT_TOKENS=4096
 MAX_TOKENS=100
 MAX_CTX=""
-PORT="${RMLX_PORT:-62265}"
+# `rmlx baseline` is a single-shot GPU op: it takes the claim at
+# `rmlx_server::claim::SENTINEL_PORT` (0xCAFE = 51966), not at a server port.
+# An earlier version of this preflight removed `/tmp/rmlx.62265.claim` only —
+# the server default — so the mitigation never touched the file it was written
+# for. Both are cleared; 62265 covers a stray `rmlx serve` holding the GPU.
+CLAIM_PORTS=(51966 62265)
 
 # Every `KvQuant` the enum can spell, one representative per parameterised
 # family. Kept in the order of `ALL_KV_QUANTS` so a reader can diff the two.
@@ -148,14 +157,16 @@ MODEL_NAME="$(basename "$MODEL")"
 
 mkdir -p "$(dirname "$OUT")"
 if [[ ! -f "$OUT" ]]; then
-	echo "timestamp,model,prompt_tokens,prompt_tokens_measured,max_tokens,codec,exit_code,kv_cache_bytes,ids_sha,store_skipped,ttft_ms,decode_tps,prefill_tps,binary_sha" >"$OUT"
+	echo "timestamp,model,prompt_tokens,prompt_tokens_measured,max_ctx,max_tokens,codec,exit_code,kv_cache_bytes,ids_sha,store_skipped,ttft_ms,decode_tps,prefill_tps,binary_sha" >"$OUT"
 fi
 
 preflight() {
 	pkill -f "rmlx serve" 2>/dev/null
 	pkill -f "rmlx_main serve" 2>/dev/null
 	pkill -f mlx_lm 2>/dev/null
-	rm -f "/tmp/rmlx.${PORT}.claim"
+	for p in "${CLAIM_PORTS[@]}"; do
+		rm -f "/tmp/rmlx.${p}.claim"
+	done
 	sleep 1
 }
 
@@ -197,9 +208,9 @@ for codec in "${CODECS[@]}"; do
 		skipped=1
 	fi
 
-	printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+	printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
 		"$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$MODEL_NAME" "$PROMPT_TOKENS" "${measured:-}" \
-		"$MAX_TOKENS" "$codec" "$rc" "${kv_bytes:-}" "${ids_sha:-}" "$skipped" \
+		"$MAX_CTX" "$MAX_TOKENS" "$codec" "$rc" "${kv_bytes:-}" "${ids_sha:-}" "$skipped" \
 		"${ttft:-}" "${dtps:-}" "${ptps:-}" "$BINARY_SHA" >>"$OUT"
 
 	printf '  %-24s rc=%-3s bytes=%-12s ids=%-16s skipped=%s\n' \

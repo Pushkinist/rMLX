@@ -658,9 +658,15 @@ enum Disposition {
     /// the resolved `auto` default.
     Baseline,
     /// Decode reads the bf16 mirror on both axes, so `exit_prefill` builds no
-    /// packed store. Resident KV and generated token ids are identical to
-    /// `Baseline`; the only difference is the cost of carrying a quantised
-    /// layer type. Beaten by `none` on every axis a caller can observe.
+    /// packed store and prefill encodes nothing.
+    ///
+    /// **Equivalent to `Baseline`, not beaten by it.** Resident KV and greedy
+    /// token ids measure identical (4 cells, 2 architectures); decode
+    /// throughput against it is INCONCLUSIVE at all five recorded ABBA cells.
+    /// An earlier draft called this class dominated, on the strength of a
+    /// per-layer dispatch cost that `docs/KV_QUANT.md` § "`--kv-quant none` is
+    /// a bf16 control" records as no longer reproducing. There is no axis left
+    /// with a measured difference in either direction.
     InertMirrorFed,
     /// Decode reads this codec's own packed store. These are the only codecs
     /// that quantize anything a served request touches — the ones a fused
@@ -671,10 +677,22 @@ enum Disposition {
 
 /// Derive the disposition from the classifiers the runtime itself dispatches
 /// on, so the table below cannot claim something the code does not do.
+///
+/// The store-reading class keys off [`KvQuant::decode_reads_packed_store`] —
+/// the predicate the class name asserts — and **not** off
+/// `materialises_packed_store`, which is the strictly weaker "`exit_prefill`
+/// builds a store". The two agree on every variant today, which is exactly why
+/// the weaker one must not be used: the table would then be right by accident,
+/// and `an_inert_codec_has_no_quantised_read_path` would reduce to restating
+/// the single predicate it was derived from. Keyed this way, that test asserts
+/// three independent facts, and it fires the day a half-mirrored codec
+/// (one axis quantised, the other bf16) makes the two predicates diverge —
+/// which is the case `a_storeless_codec_mirrors_both_axes` exists to describe
+/// and that nothing else would catch.
 fn disposition_of(q: KvQuant) -> Disposition {
     if q == KvQuant::None {
         Disposition::Baseline
-    } else if q.materialises_packed_store() {
+    } else if q.decode_reads_packed_store() {
         Disposition::ReadsItsOwnStore
     } else {
         Disposition::InertMirrorFed
@@ -684,8 +702,9 @@ fn disposition_of(q: KvQuant) -> Disposition {
 /// Every codec the tree can spell, with its disposition written out by name.
 ///
 /// This exists so "nobody picks it" can never be an answer: a variant added to
-/// the enum reaches [`ALL_KV_QUANTS`] (pinned by `variants_are_exhaustive`) and
-/// then has to be classified here or the sweep below fails on it. Writing the
+/// the enum reaches [`ALL_KV_QUANTS`] (pinned by
+/// `all_kv_quants_names_every_variant_once`) and then has to be classified here
+/// or the sweep below fails on it. Writing the
 /// class by hand rather than deriving it is the point — the derivation is what
 /// is being checked.
 ///
@@ -871,12 +890,34 @@ fn disposition_is_a_property_of_the_family_not_its_parameters() {
     }
 }
 
-/// An inert codec is inert on both axes and reads nothing packed.
+/// An inert codec is inert on both axes and allocates nothing packed.
 ///
 /// This is what makes "identical resident KV and identical token ids to `none`"
-/// a derivation rather than a coincidence of the two cells it was measured at:
+/// a derivation rather than a coincidence of the four cells it was measured at:
 /// with no store built and both axes fed from bf16, there is no path by which a
 /// served request can differ.
+///
+/// [`disposition_of`] keys the class on `decode_reads_packed_store`, so that
+/// predicate is the *premise* here and is not re-asserted — restating it would
+/// be a tautology dressed as a check.
+///
+/// The two claims below are independent of the premise and of each other, each
+/// against a different failure. Mutation-checked, both ways:
+///
+/// * A codec that stops mirroring one axis becomes store-*allocating* without
+///   becoming store-*reading* — `materialises_packed_store` is
+///   `decode_reads || !feeds_bf16_k || !feeds_bf16_v`. The first assertion
+///   catches it, and it is caught **here** rather than absorbed into a class
+///   change: keyed off the weaker predicate instead, the codec's derived class
+///   would move, and relabelling its row would turn the suite green while the
+///   table claimed a codec reads a store its own predicate denies.
+/// * A change to `materialises_packed_store`'s definition that leaves per-codec
+///   mirroring intact passes the first assertion and fails the second.
+///
+/// Deleting the two mirror disjuncts from `materialises_packed_store` remains
+/// behaviour-preserving *today* — no shipped codec is half-mirrored — so that
+/// mutation is a null in both. The first bullet is what makes the disjuncts a
+/// live claim rather than only a documented intention.
 #[test]
 fn an_inert_codec_has_no_quantised_read_path() {
     for &(q, d) in DISPOSITIONS {
@@ -884,16 +925,15 @@ fn an_inert_codec_has_no_quantised_read_path() {
             continue;
         }
         assert!(
-            !q.decode_reads_packed_store(),
-            "{q} is recorded inert but decode reads its packed store"
-        );
-        assert!(
             q.feeds_bf16_k_at_decode() && q.feeds_bf16_v_at_decode(),
-            "{q} is recorded inert but one axis is not fed from the bf16 mirror"
+            "{q} is recorded inert but one axis is not fed from the bf16 mirror — \
+             that axis has to decode from somewhere, and it is not the mirror"
         );
         assert!(
             !q.materialises_packed_store(),
-            "{q} is recorded inert but exit_prefill still builds its store"
+            "{q} is recorded inert (decode reads no packed store) but exit_prefill \
+             still builds one — an O(context) allocation per layer that nothing \
+             reads, which is what makes this class cost the same as `none`"
         );
     }
 }

@@ -110,7 +110,7 @@ quantization surface in a single process.
 ships. Widest *matrix*, not a memory win: measured on two architectures at two
 contexts, no KV codec in the tree currently holds fewer resident bytes than
 plain bf16 — 17 of the 28 build no packed store at all and decode identically to
-it, and the rest are larger. The honest per-codec disposition, and why the
+it, bf16 itself is the 18th, and the other 10 are larger. The honest per-codec disposition, and why the
 families are kept anyway, is
 [`docs/KV_QUANT.md` § Codec disposition](docs/KV_QUANT.md). ⁴ oMLX has a tiered RAM+SSD KV cache, not KV-bit quantization.
 ⁵ `llama.cpp` offers per-tensor block KV types (`q8_0`…`q5_1`) but no

@@ -16,6 +16,12 @@ belongs to `scripts/perf_ab.sh` and `perf_ab_ingest.py`.
 The greedy token-id digest travels in `notes`, not as a metric: it is an
 identity, not a measurement, and `observations` stores reals.
 
+`notes` also carries `any_layer_skipped_store`, which is a per-RUN flag and not
+a codec classification — see the field's comment below. Rows written before that
+rename spell it `packed_store_skipped` and carry no caveat; `observations` is
+append-only, so both spellings exist and a query over the column has to accept
+either. Nothing derived from it should classify a codec.
+
 Usage:
     # Inspect the records without writing anything:
     python3 scripts/ingest/codec_inertness_ingest.py --dry-run CSV \\
@@ -111,6 +117,20 @@ def build_record(row: dict[str, str], args: argparse.Namespace, prompts_dir: Pat
             "`prompt_tokens` is not a token count and is not substituted."
         )
     prompt_tokens = int(measured)
+    # `ctx_max` is a PK column. The probe accepts `--max-ctx`, so re-deriving it
+    # from its default formula here would silently record a plausible wrong
+    # ceiling for any sweep that overrode one — permanently, in an append-only
+    # table, with no error. Read what the run used; refuse if the CSV predates
+    # the column, for the same reason the token count above is not substituted.
+    raw_ctx = row.get("max_ctx") or ""
+    if not raw_ctx:
+        raise SystemExit(
+            "this CSV has no `max_ctx` column (it predates the probe recording "
+            "one). Re-run the probe; the default ceiling formula is not "
+            "re-derived here, because a sweep that passed --max-ctx would then "
+            "be recorded under a ceiling it never ran at."
+        )
+    max_ctx = int(raw_ctx)
     prompt_name, prompt_body = prompt_for(fixture_tokens, prompts_dir)
     return {
         "schema_version": 1,
@@ -120,7 +140,7 @@ def build_record(row: dict[str, str], args: argparse.Namespace, prompts_dir: Pat
         "model": model,
         "weight_quant": weight_quant_of(model),
         "kv_quant": row["codec"],
-        "ctx_max": fixture_tokens * 5 // 4 + int(row["max_tokens"]) + 2048,
+        "ctx_max": max_ctx,
         "prompt": {"name": prompt_name, "body": prompt_body, "notes": None},
         "ts_utc": row["timestamp"],
         "git_sha": args.git_sha,
@@ -134,9 +154,14 @@ def build_record(row: dict[str, str], args: argparse.Namespace, prompts_dir: Pat
         "n_measure": 1,
         "output_first_64": None,
         "notes": (
+            # `any_layer_skipped_store` is per-RUN, not per-codec: the
+            # layer-adaptive head/tail promotion types some layers `K8V8`, so a
+            # store-reading codec sets it too. Named so no later reader mistakes
+            # it for a classification. `observations` is append-only, so the
+            # caveat has to travel with the value.
             f"codec_inertness_probe; binary_sha={row['binary_sha']}; "
             f"token_ids_sha256_16={row['ids_sha']}; "
-            f"packed_store_skipped={row['store_skipped']}; "
+            f"any_layer_skipped_store={row['store_skipped']}; "
             "residency only — the probe's throughput columns are single unpaired "
             "runs on a shared host and are deliberately not recorded"
         ),

@@ -3369,17 +3369,43 @@ measured, and the reference every other row is compared against.
 `rotor4`, `rotor_k_3_asym_v*_g*`, `rotor_k_4_asym_v*_g*`.
 
 Decode reads the bf16 mirror on both axes, so `exit_prefill` skips the packed
-store (`exit_prefill: packed store skipped`, logged on every run above) and
-prefill never encodes one either — the codec math does not execute at all on a
-prefill-bracketed flow. In all four cells every one of these reports the
-identical `kv_cache_bytes` and the identical 100-token id digest as `none`.
+store and prefill never encodes one either — the codec math does not execute at
+all on a prefill-bracketed flow. That is a property of
+`KvQuant::decode_reads_packed_store`, checked by
+`exit_prefill_builds_a_store_exactly_when_the_predicate_says_so`. In all four
+cells every one of these reports the identical `kv_cache_bytes` and the
+identical 100-token id digest as `none`.
 
-**These are dominated, not merely unused.** Something else — `none` — is at
-least as good on every axis a caller can observe, and strictly better on one
-(it does not carry a quantised layer type through dispatch). An operator who
-passes `--kv-quant iso3` gets bf16 KV under another name, which is why
-`validate_resolved` now says so at `warn!` and why no `--kv-preset` row is
-described as a memory setting any more.
+The probe's `store_skipped` column corroborates and does **not** classify: it
+is set when *any* layer-cache in the run logged the skip, and the layer-adaptive
+head/tail promotion types some layers `K8V8`, so a store-*reading* codec sets it
+too — `mixed_k8g64_v4g64` does, on Ternary-Bonsai-8B, where 10 of 36 layers are
+promoted. Bytes and the id digest are the deciding columns.
+
+**These are equivalent to `none`, and unselected — not dominated.** The first
+draft of this section said "dominated, strictly better on one axis (it does not
+carry a quantised layer type through dispatch)". That axis does not survive
+measurement: the ~0.041 ms/layer/step figure it rests on was re-measured after
+the packed-store elision and is **INCONCLUSIVE at all five ABBA cells** — see
+"`--kv-quant none` is a bf16 control", which states in the same words that with
+the store gone "a `K8V8` layer is a `None` layer under another name". Nothing in
+this class costs anything a measurement here can see, and nothing in it buys
+anything either.
+
+So the honest reading, axis by axis: resident KV identical (4 cells, exact
+bytes); output token ids identical (4 cells); decode throughput INCONCLUSIVE
+(5 ABBA cells); TTFT INCONCLUSIVE (the mirror family's own spread at Bonsai-8B
+32 768 is 18 320–20 582 ms, wider than any gap inside it). An operator who
+passes `--kv-quant iso3` gets bf16 KV under another name — no better, no worse,
+just not what the name says — which is why `validate_resolved` says so at
+`warn!` and why no `--kv-preset` row is described as a memory setting any more.
+
+**What this does to the dominated-vs-unused split.** The word belongs to
+Class 3, not here. On the axes anything is measured on, `none` is strictly
+smaller than every Class 3 codec (4 cells, 1.003×–1.541×) and not slower, so
+Class 3 *is* dominated by the baseline; Class 2 merely ties it. The two classes
+are still kept for different reasons — see each disposition — but the reason is
+not that one is beaten and the other is not.
 
 **Disposition: keep parseable and selectable; stop advertising.** Not deleted,
 for three reasons, in descending order of force:
@@ -3396,11 +3422,12 @@ for three reasons, in descending order of force:
    differentiator. Removing them would narrow the matrix without making
    anything true.
 
-Two of them are *additionally* dominated inside their own family: the decoder
-of `k8vturbo3tcq` is bit-for-bit the plain `k8vturbo3` decoder and only the
-encode-time assignment differs, so while the encode never runs the two names
-are the same behaviour; likewise `k8vturbo2tcq` and `k8vturbo2`. They are fold
-candidates the day a turbo decode kernel lands, and identical today.
+Two pairs inside this class are *exact duplicates* of each other rather than
+merely equivalent to `none`: the decoder of `k8vturbo3tcq` is bit-for-bit the
+plain `k8vturbo3` decoder and only the encode-time assignment differs, so while
+the encode never runs the two names are one behaviour; likewise `k8vturbo2tcq`
+and `k8vturbo2`. They are fold candidates the day a turbo decode kernel lands,
+and indistinguishable today.
 
 #### Class 3 — reads its own packed store (10 codecs)
 
@@ -3428,10 +3455,15 @@ not depend on it (returning an unread seed frees memory, it does not speed a
 quantized-matmul decode) and is measured at 0.763× of `none` at 130 848 tokens
 with the arms' ranges disjoint.
 
-**Disposition: keep, unchanged, and do not treat as memory levers.** These are
-*not* dominated in the strict sense — nothing else in the tree does what they
-do, and they are the substrate any fused-decode work has to stand on. They lose
-today on both axes, which is a statement about the ring layout and about ε (the
+**Disposition: keep, unchanged, and do not treat as memory levers.** These
+*are* dominated by `none` on the measured axes — strictly larger resident KV in
+all four cells, and for `mixed` also slower (0.763× at 130 848 tokens, ranges
+disjoint). They are kept anyway, and the reason is not that they are competitive:
+they are the only codecs in the tree that decode over a packed store at all, so
+they are the substrate any fused-decode work has to stand on, and a dominated
+codec with a function is not the same object as a beaten one with none.
+
+Being dominated today is a statement about the ring layout and about ε (the
 byte-to-time conversion efficiency, ≈0.04–0.135 on every path measured, and
 shared with a non-MLX runtime on the same hardware), not about the codecs.
 

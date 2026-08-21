@@ -5,9 +5,11 @@
 //!
 //! # Adding a new preset
 //!
-//! Append a row to `PRESETS` in `preset_table()` and a test row in
-//! `preset_table_tests.rs`. Future presets extend the table;
-//! the resolution path in `parse.rs` is unchanged.
+//! A new row belongs here only once its codec's decode reads its own packed
+//! store — until then it is another spelling of `fp16`, which
+//! `no_preset_is_a_memory_lever` states and pins. If that day comes: append to
+//! the `PRESETS` const below and add a test row in `preset_table_tests.rs`; the
+//! resolution path in `parse.rs` is unchanged.
 //!
 //! # `auto`
 //!
@@ -64,7 +66,7 @@ pub(crate) enum PresetError {
 /// Static preset table: name → `PresetSpec`.
 ///
 /// Stored as a slice of `(&str, PresetSpec)` pairs.  We use a linear
-/// scan (5 entries) rather than `phf` — the table is tiny and `phf` is not
+/// scan (7 entries) rather than `phf` — the table is tiny and `phf` is not
 /// currently in the workspace.  When the table grows past ~20 entries, switch
 /// to a `phf::Map`.
 ///

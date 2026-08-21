@@ -445,6 +445,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hint that resident KV and every generated token were identical to bf16.
   Warn-and-proceed, like the existing CPU-hot-path classification beside it.
 
+  Both honesty warns are now emitted **once per `(arch, codec)` per process**.
+  They classify a resolved configuration, not a request, and `validate_resolved`
+  runs per request on the normal and speculative paths — so an operator serving
+  under one of them was getting the same paragraph for the process lifetime.
+
+  The warning says the codec is not known to cost anything either. That is
+  deliberate: the per-layer dispatch cost an earlier draft charged it with is
+  INCONCLUSIVE at all five recorded ABBA cells, so the class is *equivalent* to
+  bf16, not beaten by it. `docs/KV_QUANT.md` § "Codec disposition" carries the
+  axis-by-axis reading and the consequence for the dominated-vs-unused split:
+  the codecs that are genuinely dominated by the baseline are the ten that read
+  their own store and measure 1.003×–1.541× larger, not the seventeen that tie
+  it.
+
+- **`--kv-preset auto` works in `--registry` mode.** It was rejected there with
+  exit 78 and "auto-selection needs config.json to estimate model size" — a
+  reason that stopped existing when the selector did, since the resolver now
+  reads a constant and opens nothing. `--kv-quant auto`, the same constant under
+  another flag, was accepted on the same command line.
+
   Measured with `scripts/bench/codec_inertness_probe.sh` — one `rmlx baseline`
   per codec at temperature 0, 27 codec spellings × 2 architectures × 2 contexts,
   108 runs, all exit 0. gemma-4-e2b is `kv_h == 1` with shared-KV and
@@ -453,9 +473,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   | | e2b 4k | e2b 32k | Bonsai 4k | Bonsai 32k |
   |---|---:|---:|---:|---:|
   | `none` resident KV (B) | 32 194 560 | 217 976 832 | 570 507 264 | 4 667 277 312 |
-  | spellings byte- and id-identical to `none` (incl. `none`) | 17 | 17 | 17 | 17 |
+  | of 27 driven spellings, those byte- and id-identical to `none` | 17 | 17 | 17 | 17 |
   | spellings larger than `none` | 10 | 10 | 10 | 10 |
   | spellings **smaller** than `none` | **0** | **0** | **0** | **0** |
+
+  The two 17s in this entry are different sets of the same size and it is a
+  coincidence: 17 of the 28 enum variants are in the inert class (`none` is
+  not one of them), while 17 of the 27 driven spellings measure identical to
+  `none` (16 inert ones plus `none` itself — the 28th variant,
+  `rotor_k_3_asym_*`, was left to the family-parameter test).
 
   No codec is removed. The full disposition — which codecs are dominated, which
   are merely losing today, and why the rotation families stay despite both — is

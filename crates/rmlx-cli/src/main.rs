@@ -143,12 +143,14 @@ Mutually exclusive with `--kv-quant`, `--cache-type-k`, `--cache-type-v`,
 and `--kv-bits`. Passing any of those alongside `--kv-preset` is a hard
 clap error (exit 2).
 
-NONE OF THESE PRESETS REDUCES MEMORY. Every non-fp16 name below resolves to a
-codec whose decode reads the bf16 mirror, so its packed store is never built:
-the served request holds the same resident KV as fp16 and emits the same
-tokens. Measured on two architectures at two contexts. They are kept because
-the names appear in recorded bench rows and each is its codec's entry point,
-not because one of them is a smaller cache.
+NO PRESET BELOW REDUCES MEMORY BELOW fp16 — fp16 is the unquantised reference,
+and every other name resolves to a codec whose decode reads the bf16 mirror, so
+its packed store is never built: the served request holds the same resident KV
+as fp16 and emits the same tokens. Measured on two architectures at two
+contexts; decode throughput against fp16 is INCONCLUSIVE, so they are not
+known to cost anything either. They are kept because the names appear in
+recorded bench rows and each is its codec's entry point, not because one of
+them is a smaller cache.
 
 Special value:
   auto      -- the same codec `--kv-quant auto` resolves to (unquantised bf16).
@@ -1879,21 +1881,16 @@ fn main() -> Result<()> {
                 // --kv-bits in registry mode is resolved directly (no arch validation).
                 // fractional dispatch mirrors resolve_model_flags.
                 //
-                // `--kv-preset auto` requires --model (needs config.json). Reject here.
-                if matches!(kv_preset, Some(KvPresetArg::Auto)) {
-                    tracing::error!(
-                        "--kv-preset auto requires --model; auto-selection needs config.json"
-                    );
-                    eprintln!(
-                        "error: --kv-preset auto requires --model (auto-selection needs config.json to estimate model size)"
-                    );
-                    std::process::exit(78);
-                }
+                // `--kv-preset auto` used to be rejected here with exit 78 and
+                // "auto-selection needs config.json to estimate model size".
+                // That reason is gone: `resolve_preset_arg` reads a constant and
+                // opens nothing, so there is nothing for a missing config.json
+                // to prevent — and `--kv-quant auto`, the same constant under
+                // another flag, was accepted on the same command line. Two
+                // spellings of one default must not disagree about whether they
+                // are allowed.
                 let kv_quant_opt = if let Some(preset_arg) = kv_preset {
-                    let preset_kq = match preset_arg {
-                        KvPresetArg::Resolved(kq) => kq,
-                        KvPresetArg::Auto => unreachable!("auto rejected above"),
-                    };
+                    let preset_kq = resolve_preset_arg(preset_arg);
                     info!(kv_quant = ?preset_kq, "rmlx serve registry: --kv-preset applied");
                     Some(preset_kq)
                 } else if let Some(bits) = kv_bits {
