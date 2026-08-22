@@ -407,10 +407,24 @@ using it:
   `make traces-gc` does not cover this directory: it owns `.gputrace` bundles
   only, and its reported total is scoped to those.
 
-Pipeline and function names do **not** survive the export (only encoder,
-command-buffer, buffer and queue labels), and the driver coalesces consecutive
-compute encoders into one GPU kick — so one row can cover several encoders. Pair
-it with the identity list from a capture when you need to know *which* kernel.
+**One row is one encoder.** In the Bonsai-8B bundle above, 14 140 rmlx rows
+carry 13 996 distinct `encoder-id`s, and the same run's
+`metal-application-command-buffer-submissions` table sums **13 997** encoders
+across 14 512 command buffers — 13 592 of which hold exactly one encoder, 826
+hold none, and 94 hold between 2 and 9. So the row is the encoder, the
+`cmdbuffer-id` column groups rows into submissions, and no row is a coalesced
+multi-encoder kick. Every `gpu-channel-name` in both bundles is exactly
+`Compute`, `Fragment` or `Vertex`.
+
+**Names are in the bundle; the join key is not.** The `metal-gpu-intervals`
+export carries no pipeline or function names, but
+`metal-shader-profiler-shader-list` names every pipeline the run compiled — 52
+for `rmlx` in the Bonsai bundle, MLX kernels and any rMLX `.metal` body the run
+dispatched alike. There is no key from one of those names to a timed row,
+because the stock template
+records `Shader Timeline: Disabled` and `metal-shader-profiler-intervals`
+therefore exports zero rows. Until that changes, pair the timeline with the
+identity list from a `.gputrace` capture when you need to know *which* kernel.
 
 #### Reading the timeline
 

@@ -575,17 +575,18 @@ fn the_csv_is_nanoseconds_and_one_row_per_channel() {
     reason = "fixture is a literal in this file; a parse failure here is the test failing"
 )]
 fn ampersands_in_a_label_survive_unescaping() {
-    // The driver coalesces consecutive compute encoders and names the row
-    // "EncA & EncB", which the export escapes. Leaving it escaped corrupts the
-    // one field that identifies a submission.
+    // Row labels really do carry `&` — the compositor's IOSurface access labels
+    // read "Read Surface: 86(6016x3384:83b&)" — and the export escapes it.
+    // Leaving it escaped corrupts a field used to identify a row. The label
+    // goes in the channel-name cell because that is this fixture schema's only
+    // string column.
+    let label = "Read Surface: 86(6016x3384:83b&)";
     let rows = "<row><start-time fmt=\"a\">1</start-time><duration fmt=\"b\">2</duration>\
-                <sentinel/><gpu-channel-name fmt=\"EncA &amp; EncB\">EncA &amp; EncB</gpu-channel-name>\
+                <sentinel/>\
+                <gpu-channel-name fmt=\"l\">Read Surface: 86(6016x3384:83b&amp;)</gpu-channel-name>\
                 <process fmt=\"rmlx (1)\"></process></row>";
     let rows = collect(&doc(rows)).unwrap();
-    assert_eq!(
-        rows.first().unwrap().get(3).unwrap().text(),
-        Some("EncA & EncB")
-    );
+    assert_eq!(rows.first().unwrap().get(3).unwrap().text(), Some(label));
 }
 
 #[test]

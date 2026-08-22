@@ -541,9 +541,9 @@ fn attr(attrs: &str, want: &str) -> Option<String> {
     None
 }
 
-/// The five predefined XML entities. Encoder labels really do contain `&` —
-/// the driver coalesces encoders and names the row `EncA & EncB` — so leaving
-/// `&amp;` in place would corrupt the one field used to identify a submission.
+/// The five predefined XML entities. Row labels really do contain `&` — the
+/// compositor's IOSurface access labels read `Read Surface: 86(6016x3384:83b&)`
+/// — so leaving `&amp;` in place would corrupt a field used to identify a row.
 fn unescape(s: &str) -> String {
     if !s.contains('&') {
         return s.to_owned();

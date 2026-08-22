@@ -31,12 +31,26 @@
 #      table. --time-limit bounds the recording and the newest --keep bundles
 #      are retained; the rest are removed after a successful run.
 #
-# WHAT IT CANNOT GIVE — do not plan around these; they are device ceilings.
-#   No per-dispatch kernel timing (supportsCounterSampling(atDispatchBoundary)
-#   is false), no occupancy / limiter / bandwidth counters (one counter set,
-#   GPUTimestamp), and no pipeline or function names in the export. The driver
-#   also coalesces consecutive compute encoders into one GPU kick, so one row
-#   can cover several encoders.
+# WHAT IT CANNOT GIVE
+#   Device ceiling: no per-dispatch kernel timing
+#   (supportsCounterSampling(atDispatchBoundary) is false) and no occupancy /
+#   limiter / bandwidth counters — a recorded bundle carries exactly one GPU
+#   counter, "RT Unit Active". Those come from the Xcode GPU counter replay
+#   (docs/PROFILING.md), which needs a human.
+#
+#   Configuration, not ceiling: the exported metal-gpu-intervals table has no
+#   pipeline or function names, but the BUNDLE does — metal-shader-profiler-
+#   shader-list names every pipeline the run compiled (52 for rmlx in the
+#   bundles under <RMLX_HOME>/traces/mst). What is missing is a join key from a
+#   name to a timed row: the stock template ships Shader Timeline: Disabled, so
+#   metal-shader-profiler-intervals exports zero rows. Pair with
+#   scripts/gputrace_kernels.sh for identity until that changes.
+#
+#   GRANULARITY IS PER ENCODER, one row each. Measured on the bundles above:
+#   14 140 rmlx rows carry 13 996 distinct encoder-ids, and the same run's
+#   metal-application-command-buffer-submissions table sums 13 997 encoders over
+#   14 512 command buffers — of which 13 592 hold exactly one encoder and only
+#   94 hold more than one. Do not read a row as a coalesced multi-encoder kick.
 #
 # USAGE
 #   bash scripts/mst_capture.sh --model /path/to/snapshot
