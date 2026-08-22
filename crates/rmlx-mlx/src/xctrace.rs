@@ -161,13 +161,75 @@ pub enum XctraceError {
         actual: String,
     },
 
-    /// A well-formed export with no rows. Never silently reported as an empty
-    /// result: it means the recording captured nothing, which is a failed run,
-    /// not a run with zero GPU work.
+    /// A well-formed export with **no rows at all**. Never silently reported as
+    /// an empty result: the recording captured nothing, from any process.
+    ///
+    /// This is deliberately narrower than "the summary is empty". A table that
+    /// holds rows for other processes and none for the one asked about is a
+    /// different state with a different remedy, and it is
+    /// [`Self::NoRowsForProcess`].
     #[error("schema '{schema}' parsed but contains no rows")]
     NoRows {
         /// Name of the parsed schema.
         schema: String,
+    },
+
+    /// The table is populated, but no row is attributed to a process matching
+    /// the filter.
+    ///
+    /// Separated from [`Self::NoRows`] because the two point at opposite
+    /// things: an empty table means the recording failed, while a populated
+    /// one means it ran and this process was not in it — because it never
+    /// launched, exited before submitting GPU work, or was not instrumented.
+    /// Reporting the second as the first sends the reader to re-run a workload
+    /// that is fine. The processes the recording *did* see are the evidence
+    /// that distinguishes them, so they are carried here rather than left for
+    /// a second pass the caller has to know to make.
+    #[error(
+        "'{schema}' holds {rows_total} rows but none for a process matching \
+         {filter:?} — the recording ran; this process was not in it. \
+         Processes seen: {processes}"
+    )]
+    NoRowsForProcess {
+        /// Name of the parsed schema.
+        schema: String,
+        /// Rows in the table before the process filter.
+        rows_total: u64,
+        /// The substring the caller filtered on.
+        filter: String,
+        /// Process display names seen, with row counts, busiest first.
+        processes: String,
+    },
+
+    /// Rows for the requested scope exist, and the `skip_ms` floor removed all
+    /// of them.
+    ///
+    /// A third state, not a decoration on the other two. Reporting it as
+    /// [`Self::NoRowsForProcess`] is self-contradictory — the message would
+    /// claim the process is absent while printing that process's own row count
+    /// in the census — and reporting it as [`Self::NoRows`] loses the skip
+    /// entirely.
+    ///
+    /// [`Self::SkipExceedsSpan`] does **not** subsume it. That guard fires on
+    /// `origin_ns >= latest` where `latest` is `max(start + duration)`, so a
+    /// single long submission straddling the origin keeps it silent while every
+    /// row's `start` is below the floor.
+    #[error(
+        "the {skip_ms} ms skip removed every one of the {matched} rows recorded \
+         for {scope} in '{schema}' ({rows_total} rows total) — that work all \
+         starts before the skip origin; lower the skip or record for longer"
+    )]
+    SkipRemovedEveryRow {
+        /// Name of the parsed schema.
+        schema: String,
+        /// Rows in the table before any filter.
+        rows_total: u64,
+        /// Rows the scope matched before the skip floor was applied.
+        matched: u64,
+        /// The skip that was asked for, milliseconds.
+        skip_ms: u64,
+        /// What the rows were scoped to — a process filter, or the whole table.
+        scope: String,
     },
 
     /// The requested skip covers everything the matched process did.

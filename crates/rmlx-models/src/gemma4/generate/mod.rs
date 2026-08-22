@@ -386,12 +386,16 @@ pub fn generate_greedy<'a>(
             // Allocate one KvCache per decoder layer using the selected
             // quant mode.
             //
-            // SWA layers in bf16-KV mode (`KvQuant::None`) use the
-            // byte-for-byte RotatingKvCache port (mirrors mlx-lm
-            // `gemma4_text.py::Model.make_cache` line 686:
+            // SWA layers always use the byte-for-byte RotatingKvCache port
+            // (mirrors mlx-lm `gemma4_text.py::Model.make_cache`:
             // `RotatingKVCache(max_size=sliding_window)` for sliding layers,
-            // `KVCache()` for full-attention). Quantized KV codecs stay on
-            // the existing full-size path (pending follow-up).
+            // `KVCache()` for full-attention) and stay bf16 at
+            // `sliding_window` tokens **regardless of the requested KV
+            // codec** — mlx-lm's `RotatingKVCache.to_quantized` raises
+            // `NotImplementedError` and we mirror that. The codec flag is
+            // recorded on the cache but unused by the rotating update path;
+            // only full-attention layers are quantized. See
+            // `KvCache::with_quant_max_seq_window`.
             //
             // Force K8V8 for boundary layers (first head_n + last tail_n) to
             // protect output quality when base_quant uses aggressive V

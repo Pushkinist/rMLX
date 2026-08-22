@@ -350,6 +350,19 @@ It records the live process, exports the `metal-gpu-intervals` table, parses it
 and prints a per-channel table plus a CSV a script can assert on. See
 [Reading the timeline](#reading-the-timeline) for what the numbers mean.
 
+**This works on this host**, and the claim is worth pinning because a report
+once concluded the opposite. Two runs, xctrace 16.0 / Xcode 26.6, M5 Max:
+gemma-4-e2b `none` @4096 on `target/release/rmlx` gave 6 931 rmlx rows
+(6 927 `Compute`, `start-latency` p50 3.98 ms), and Ternary-Bonsai-8B `k8v4`
+@8192 on `target/release-perf/rmlx` — the exact cell that report used — gave
+14 140. Neither needed `sudo` or an entitlement. The earlier zero-row
+recordings held **24 rows for the whole machine** across a 25 s window, against
+36 441 here across 20 s, so what failed was the recording, not the instrument's
+coverage of the compute channel. That is the state the summariser's two
+refusals now distinguish: `contains no rows` is an empty table, `holds N rows
+but none for a process matching …` is a populated one, and the second lists the
+processes it did see.
+
 The table gives per-GPU-submission `start` and `duration` in nanoseconds,
 `gpu-channel-name`, `start-latency` (the CPU→GPU gap), and `cmdbuffer-id` /
 `encoder-id`, per process; `metal-application-encoders-list` and
@@ -695,9 +708,15 @@ its editor. An agent can capture the bundle, open it, and read the exported CSV 
 a person has to click Profile. **Ask the user; do not report the counters as
 unavailable.**
 
-Headless Metal System Trace is *not* a substitute: it exports zero rows for
-`rmlx` on this host, and per-dispatch counter sampling is unsupported on M5 Max.
-This GUI path is what remains.
+Headless Metal System Trace is *not* a substitute, but not because it fails:
+it does instrument `rmlx`'s compute work here (§5 — reproduced on this host at
+xctrace 16.0 / Xcode 26.6, 6 931 and 14 140 rmlx `Compute` rows with
+`start-latency` populated). What it does not carry is *which kernel* and *any
+counter*: the `metal-gpu-intervals` export has no pipeline or function names,
+and per-dispatch counter sampling is unsupported on M5 Max. So MST answers
+"how long did each submission take and how long did it wait", and this GUI path
+answers "which kernel, and at what occupancy / limiter". Different questions —
+use both.
 
 ### Capture
 

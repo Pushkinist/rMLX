@@ -630,13 +630,13 @@ impl SpeculativeDispatcher {
         );
 
         // --- Allocate per-layer caches for verifier and draft. ---------
-        // SWA layers in bf16-KV mode use the RotatingKvCache port.
-        // For quantized modes (planar/k8v8/k8v4) the per-layer window is
-        // ignored — `with_quant_max_seq_window` falls back to the standard
-        // full-size cache, preserving the existing spec-decode `truncate_to`
-        // semantics. Spec is only validated with the default per-arch quant
-        // (which for 31b is `Planar`, for e2b draft is `K8V8`); the bf16
-        // path is not exercised by the spec smoke.
+        // A layer that reports a sliding window gets the RotatingKvCache port
+        // whatever codec it is handed — the branch is `window > 0` alone
+        // (`KvCache::with_quant_max_seq_window`), so an SWA layer here is bf16
+        // at `sliding_window` tokens under every `kv_quant`, and only the
+        // full-attention layers quantize. Rollback below calls `truncate_to`
+        // on every layer without consulting `is_trimmable()`, which a rotating
+        // layer only satisfies until it wraps.
         let mut verifier_caches: Vec<KvCache> = (0..self.verifier.num_hidden_layers())
             .map(|i| {
                 let window = self.verifier.layer_sliding_window(i);

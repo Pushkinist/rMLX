@@ -108,10 +108,17 @@ harder, so they were even lower.
 
 | model | git_sha | kv_quant_resolved | decode_tps | combined_tps_old | ratio_vs_ceiling | date |
 |---|---|---|---:|---:|---:|---|
-| prism-ml__Ternary-Bonsai-8B-mlx-2bit | 877da73 | mixed_k8g64_v4g64 | 115.21 | 38.20 | 2.66x (vs ~307) | 2026-05-21 |
-| mlx-community__gemma-4-e4b-it-mxfp8 | 877da73 | k8v8 | 72.92 | 47.31 | 2.11x (vs ~154) | 2026-05-21 |
-| mlx-community__gemma-4-26b-a4b-it-mxfp8 | 877da73 | k8v8 | 72.19 | 9.57 | 2.42x (vs ~175) | 2026-05-21 |
-| mlx-community__Qwen3.6-35B-A3B-8bit | 877da73 | k8v8 | 94.96 | 12.59 | 1.84x (vs ~175) | 2026-05-21 |
+| prism-ml__Ternary-Bonsai-8B-mlx-2bit | 877da73 | mixed_k8g64_v4g64 | 115.21 | 38.20 | 2.15x (vs 248.2) | 2026-05-21 |
+| mlx-community__gemma-4-e4b-it-mxfp8 | 877da73 | k8v8 | 72.92 | 47.31 | 1.69x (vs 123.5) | 2026-05-21 |
+| mlx-community__gemma-4-26b-a4b-it-mxfp8 | 877da73 | k8v8 | 72.19 | 9.57 | 2.00x (vs 144.4) | 2026-05-21 |
+| mlx-community__Qwen3.6-35B-A3B-8bit | 877da73 | k8v8 | 94.96 | 12.59 | 2.01x (vs 191.1) | 2026-05-21 |
+
+The ceilings are a **tensor census**, not nameplate arithmetic — see H2 for the
+method, the per-model breakdown and the exact `scripts/perf_ceiling.py`
+invocations. A ceiling is a property of `(model, context, KV codec)`, so each
+one here is evaluated at this table's own shape (`--ctx 4096 --max-ctx 8192`)
+and at the `kv_quant_resolved` in column 3; a ceiling quoted without those is
+not comparable to one quoted with different ones.
 
 ### Finding: the "16-48x gap" was almost entirely prefill contamination
 
@@ -122,12 +129,12 @@ is excluded:
 
 - **Gemma4-26b MoE**: 3.47 → **72.19** decode_tps. The combined number at
   max-tokens 100 was 9.57; decode-only is ~7.5x higher than that combined
-  value. Ratio vs ceiling collapses from ~50x to **2.42x**.
-- **Qwen3.6 35B MoE**: 4.46 → **94.96** decode_tps. Ratio ~40x → **1.84x**.
-- **Bonsai 8B 2bit**: 15.88 → **115.21**. Ratio ~19x → **2.66x**.
-- **Gemma4-e4b dense**: 27.50 → **72.92**. Ratio ~5.6x → **2.11x**.
+  value. Ratio vs ceiling collapses from ~50x to **2.00x**.
+- **Qwen3.6 35B MoE**: 4.46 → **94.96** decode_tps. Ratio ~40x → **2.01x**.
+- **Bonsai 8B 2bit**: 15.88 → **115.21**. Ratio ~19x → **2.15x**.
+- **Gemma4-e4b dense**: 27.50 → **72.92**. Ratio ~5.6x → **1.69x**.
 
-All four now sit in the **1.8x–2.7x** band. The dramatic "MoE is 40-50x slow"
+All four now sit in the **1.7x–2.2x** band. The dramatic "MoE is 40-50x slow"
 signal was a **bench-harness measurement artifact** (prefill in the TPS
 denominator), not an inference-path defect.
 
@@ -1100,7 +1107,7 @@ k8vturbo3' (K=8-bit, V=turbo3).
 **Binary**: `target/release/rmlx` (debug-assertions on; ship-quality builds use release-perf — these numbers are the ceiling, not the floor).
 **Shape**: 2-token prompt ("Hello world") + `--max-tokens 100`. Single-MLX preflight between each run. Hardware: M5 Max.
 **Protocol**: 3 measured runs per (variant, model). Mean decode TPS reported. No warmup run (short prompt; first run included).
-**QJL flag**: default `on` (env not overridden). The K-only rotor variants (`k_rotor3`, `k_rotor4`) pay a per-token CPU encode + QJL sign computation cost; the symmetric variants (`rotor3_sym`, `rotor4_sym`) also pay for V-side rotor3/4 CPU dequant.
+**QJL flag**: `on` — the default at the time of this run, opt-in since (env not overridden). The K-only rotor variants (`k_rotor3`, `k_rotor4`) pay a per-token CPU encode + QJL sign computation cost; the symmetric variants (`rotor3_sym`, `rotor4_sym`) also pay for V-side rotor3/4 CPU dequant.
 
 Smoke gate: all four variants on Bonsai + Gemma4 ran end-to-end and produced coherent output (n_steps=63 for 64-token limit). Qwen3.6 errored with the A.y guard as expected (positive guard test) — quoted diagnostic:
 
@@ -1126,7 +1133,7 @@ Identical diagnostic for all four variants with variant name substituted. The co
 **Notes**:
 - Symmetric variants (`rotor3_sym` / `rotor4_sym`) match the corresponding V-only rotor anchors closely (~80–82 Gemma4, ~143–145 Bonsai), confirming the additional K-side rotor encode cost is amortised by the CPU decode path bottleneck.
 - K-only variants (`k_rotor3` / `k_rotor4`) are bottlenecked by the CPU-only rotor K-side decode + optional QJL projection. Bonsai shows wide cross-run variance (run 1 ~40 TPS, run 3 ~49 TPS) due to Metal graph JIT warm-up; Gemma4 is stable (~63–65 TPS). First run should not be treated as a regression floor.
-- **`k_rotor3/4` decode is now a fused MSL flash-decode** over the packed rotor store when `--rotor-qjl off` (`rotor_flash_decode`, see `docs/KV_QUANT.md`); the per-step full-prefix CPU dequant is gone. The anchors above are **not** superseded — they are 2-token short-prompt runs (§ below), where the prefix is empty and the dequant that this kernel removes costs nothing, so they measure a different thing. The kernel's effect scales with prefix length. Measured at a 4k prompt, `--rotor-qjl off`, medians of 3+ runs, before → after: Bonsai-8B `k_rotor3` 1.34 → **17.0**, `k_rotor4` 1.36 → **15.9**; medgemma-4B `k_rotor3` 7.37 → **51.8**, `k_rotor4` 7.34 → **52.1**. The default `--rotor-qjl on` path is unchanged (kernel dormant), as is Gemma4 (`update_and_sdpa_shared_source` never reaches the kernel).
+- **`k_rotor3/4` decode is now a fused MSL flash-decode** over the packed rotor store when `--rotor-qjl off` (`rotor_flash_decode`, see `docs/KV_QUANT.md`); the per-step full-prefix CPU dequant is gone. The anchors above are **not** superseded — they are 2-token short-prompt runs (§ below), where the prefix is empty and the dequant that this kernel removes costs nothing, so they measure a different thing. The kernel's effect scales with prefix length. Measured at a 4k prompt, `--rotor-qjl off`, medians of 3+ runs, before → after: Bonsai-8B `k_rotor3` 1.34 → **17.0**, `k_rotor4` 1.36 → **15.9**; medgemma-4B `k_rotor3` 7.37 → **51.8**, `k_rotor4` 7.34 → **52.1**. The `--rotor-qjl on` path is unchanged (kernel dormant) — it was the default when this was recorded and is opt-in now (§ line 206) — as is Gemma4 (`update_and_sdpa_shared_source` never reaches the kernel).
 - QJL toggle effect on Gemma4 `k_rotor3`: QJL ON = 66.5 TPS, QJL OFF = 73.2 TPS (encode cost). The QJL sideband is correctly stored / round-tripped; cosine lift on reconstructed K is deferred to a follow-up that applies QJL correction at score-time on the SDPA path.
 - All four variants are opt-in only — never an auto baseline.
 - Bonsai long-prompt (10867 tokens) fails with all quant variants (pre-existing SWA-layer zero-chunk bug). Use short prompt for this smoke.
@@ -1277,6 +1284,19 @@ section below).
 ### Profiling decision — Metal GEMV kernel
 
 BitNet at 31.6 TPS is at **0.25×** of its bandwidth ceiling (127 TPS at 614 GB/s).
+
+> **Ceiling provenance — nameplate, and the census cannot replace it here.**
+> The 127 TPS is the same nameplate arithmetic H2 replaced (≈2B params × bf16 ÷
+> 614 GB/s). `scripts/perf_ceiling.py` is **not applicable to this cell**: it
+> sizes weights from the safetensors headers, which for this checkpoint are
+> packed ternary `u8`, while `bitnet/loader.rs` dequantizes every weight to BF16
+> once at load (`dequant_trit_u8` → `Dtype::Bf16`). Run anyway it reports 1.179
+> GB/step and a 516 TPS ceiling — an ~8× undercount of what decode streams, in
+> the direction that would flatter the runtime. The nameplate figure is the
+> closer of the two *because* this model's runtime dtype is bf16 regardless of
+> its storage dtype. Neither number is a census; the decision below rests on the
+> dispatch count, not on the ratio.
+
 Root-cause analysis:
 
 - 211 Metal kernel launches per decode step (30 layers × 7 matmuls/layer + 1 LM head).
@@ -1348,7 +1368,7 @@ Raw data: `.rmlx/bench/tracing_overhead.csv` (gitignored).
 > **Reframe (2026-05-21).** The "16-50x decode catastrophe" premise was
 > falsified: it was a bench-harness prefill-contamination artifact (`baseline`
 > divided tokens by prefill+decode). With decode-only TPS measured correctly,
-> all four models sit at **1.8-2.7x the 614 GB/s bandwidth ceiling** —
+> all four models sit at **1.7-2.2x the 614 GB/s bandwidth ceiling** —
 > normal-to-good for batch-1 MLX decode. The `>=50% single-cause / >=80% summed`
 > thresholds are MOOT and not applied. The section below (a) records H1/H2/H5
 > outcomes, (b) answers the 4k-vs-8k question (H7), (c) confirms the
@@ -1403,26 +1423,88 @@ decode TPS. (The `kv_bytes` demotion to `trace!` level was good hygiene, not a f
 
 ### H2 — decode is bandwidth-bound — ACCEPT
 
-Active-param bytes/step vs the 614 GB/s ceiling, compared to decode-only TPS
-(decode-only re-baseline, `release`, n=3 median):
+Bytes a decode step must stream vs the 614 GB/s ceiling, compared to
+decode-only TPS (decode-only re-baseline, `release`, n=3 median):
 
-| Model | active bytes/step | ceiling @614 GB/s | measured decode_tps | ratio vs ceiling |
-|---|---:|---:|---:|---:|
-| Bonsai 8B 2bit | ~2 GB | ~307 TPS | 115.21 | **2.66x** |
-| Gemma4-e4b mxfp8 (dense) | ~4 GB | ~154 TPS | 72.92 | **2.11x** |
-| Gemma4-26b MoE | ~3.5 GB active | ~175 TPS | 72.19 | **2.42x** |
-| Qwen3.6-35B-A3B MoE | ~3.5 GB active | ~175 TPS | 94.96 | **1.84x** |
+| Model (KV codec) | weights GB/step | KV GB/step | total GB/step | ceiling @614 GB/s | measured decode_tps | ratio vs ceiling | KV share |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Bonsai 8B 2bit (`mixed_k8g64_v4g64`) | 2.129 | 0.345 | **2.474** | **248.2** | 115.21 | **2.15x** | 13.9% |
+| Gemma4-e4b mxfp8 dense (`k8v8`) | 4.817 | 0.154 | **4.971** | **123.5** | 72.92 | **1.69x** | 3.1% |
+| Gemma4-26b MoE (`k8v8`) | 3.960 | 0.294 | **4.253** | **144.4** | 72.19 | **2.00x** | 6.9% |
+| Qwen3.6-35B-A3B MoE (`k8v8`) | 3.130 | 0.084 | **3.214** | **191.1** | 94.96 | **2.01x** | 2.6% |
 
-All four sit in a **1.8x–2.7x** band. **ACCEPT** — decode is bandwidth-bound.
+All four sit in a **1.7x–2.2x** band. **ACCEPT** — decode is bandwidth-bound.
 This is the headline answer to the question "why is decode so low?": it was
 *not* low in the sense first suspected — the matrix numbers were
 prefill-contaminated (see the decode-only re-baseline section). The residual
 ~2x is MLX batch-1 overhead (dispatch + dequant + the gap between realized and
 peak bandwidth).
 
+#### Where the denominator comes from
+
+An earlier revision of this table quoted an `active bytes/step` column of
+`~2 / ~4 / ~3.5 / ~3.5 GB`. Those were nameplate active-parameter counts times
+the weight-quant bit width, and they dropped four things a decode step really
+streams: the `scales` (and, for affine, `biases`) sidebands each quantized
+tensor ships; the tied `lm_head` (`tie_word_embeddings=true` on all four
+models, so `embed_tokens` is the streamed output projection); the per-arch
+auxiliaries the headline does not model; and **KV traffic, omitted entirely**
+while the quotient was taken against a measurement made at a 4096-token prompt.
+
+The column above is a census instead: `config.json` plus the safetensors
+headers (dtype + shape per tensor, no tensor data read, no model launched, no
+GPU). It is produced by `scripts/perf_ceiling.py`, one invocation per row, and
+is re-checkable without a device:
+
+```sh
+scripts/perf_ceiling.py --model "$RMLX_O_MODELS_ROOT/<snapshot>" \
+    --kv-quant <codec> --ctx 4096 --max-ctx 8192 --no-db --json
+```
+
+`--no-db` keeps the row independent of `runs.db` — it only suppresses the
+prefill anchor, which this table does not use.
+
+The KV column is what a step **streams**, not what the cache holds, and for
+`mixed_k8g64_v4g64` those differ: that codec decodes over its packed store
+while still keeping both bf16 seeds resident, so its 0.345 GB/step sits well
+below the `kv_cache_bytes` the same run reports. A bandwidth ceiling wants the
+streamed figure; a memory question wants the resident one. Do not read one as
+the other.
+
+The correction is not a constant bias, so it does not cancel out of the ratio:
+three ceilings fall and Qwen3.6-35B's **rises** 9%, because 30 of its 40 layers
+are GDN and hold no attention projections, so its active weight footprint was
+overstated at `~3.5 GB` (census: 3.130 GB). The band tightens from
+1.84x–2.66x to 1.69x–2.15x, and with it the reading that Bonsai is a
+factor-of-1.4 outlier with arch-specific decode overhead worth hunting: most of
+its apparent excess was the missing KV term, 13.9% of its stream at this shape
+against under 7% for the other three.
+
+**The KV term is a second producer, and nothing gates it against the first.**
+It is *not* read from the engine — `scripts/perf_ceiling.py` transcribes the
+Rust predicates into Python by hand:
+`KvQuant::decode_reads_packed_store`, `KvQuant::feeds_bf16_{k,v}_at_decode` and
+the per-layer promotion in `kv_quant_for_layer`, mirrored as
+`_DECODE_READS_PACKED_STORE`, `_NO_BF16_{K,V}` and `kv_quant_for_layer` in the
+script. The script says so itself and names the failure mode: when a codec is
+added or reclassified, both copies move together or this column is off "by a
+full store per layer, silently, in a direction that flatters the codec". That
+is the same shape as the cache-seed formula that drifted once a consumer crate
+could not depend on it. Diff the two whenever either moves; a divergence is
+invisible here and changes the ceiling, not just a caveat on it.
+
+Three further caveats. It counts bytes a decode step **must** stream, not bytes
+moved — cache residency, dequant scratch, MoE gather inefficiency and the gap
+between realized and peak bandwidth are all in the residual, which is what the
+ratio is for. 614 GB/s is this document's own host constant, carried over
+unverified. And even with the transcription correct, the column inherits any
+error in the Rust it mirrors; it is a consistency win over an omitted term, not
+an independent measurement. `measured decode_tps` is unchanged — this revision
+moved only the denominator.
+
 #### H2 addendum — the comparison envelope, measured locally (TAINTED host)
 
-This section used to close by calling the 1.8x–2.7x band *"at/near the healthy
+This section used to close by calling the H2 band *"at/near the healthy
 1.5-2x ceiling-vs-realized envelope llama.cpp / mlx-lm hit on dense batch-1
 decode"*. **That envelope was taken from the literature, not measured here.** The
 first local measurement is below. It does not vindicate the sentence, and it
@@ -1454,7 +1536,7 @@ The reproducible band is **1.26x–1.30x**.
 
 ##### Ratio-vs-ceiling is not comparable across models of different size
 
-It is tempting to set 1.26x–1.30x against rMLX's 1.8x–2.7x and conclude
+It is tempting to set 1.26x–1.30x against rMLX's 1.7x–2.2x and conclude
 llama.cpp is the more efficient runtime. **That inference is invalid**, and the
 reason generalises well beyond this page.
 
@@ -1466,8 +1548,8 @@ ratio = measured_ms / ideal_ms = 1 + fixed_overhead_ms / ideal_ms
 
 so *the same* fixed per-step cost produces a large ratio on a small model and a
 small ratio on a large one. The two tables are not close in scale: llama.cpp's
-cells move **9.3–13.4 GB/step**, rMLX's H2 rows **2.0–4.0 GB/step** — 2.3x to
-6.7x apart. That difference alone moves the ratio in exactly the observed
+cells move **9.3–13.4 GB/step**, rMLX's H2 rows **2.5–5.0 GB/step** — 1.9x to
+5.4x apart. That difference alone moves the ratio in exactly the observed
 direction, before any question of runtime quality.
 
 The scale-free quantity is the **absolute per-step overhead**,
@@ -1478,25 +1560,28 @@ The scale-free quantity is the **absolute per-step overhead**,
 | llama.cpp | Qwen3-8B-Q8_0 @3 753 | 9.26 GB | 15.09 | 19.21 | **4.12** | 1.27x |
 | llama.cpp | Qwen3-8B-Q8_0 @7 722 | 9.85 GB | 16.04 | 18.22 / 20.30 | **2.18 / 4.26** | 1.14x / 1.26x |
 | llama.cpp | Qwen3-8B-Q8_0 @31 536 | 13.36 GB | 21.76 | 28.37 | **6.61** | 1.30x |
-| rMLX | Qwen3.6-35B-A3B MoE | 3.5 GB | 5.70 | 10.53 | **4.83** | 1.85x |
-| rMLX | Bonsai 8B 2bit | 2.0 GB | 3.26 | 8.68 | **5.42** | 2.66x |
-| rMLX | Gemma4-e4b mxfp8 | 4.0 GB | 6.51 | 13.71 | **7.20** | 2.11x |
-| rMLX | Gemma4-26b MoE | 3.5 GB | 5.70 | 13.85 | **8.15** | 2.43x |
+| rMLX | Bonsai 8B 2bit | 2.474 GB | 4.03 | 8.68 | **4.65** | 2.15x |
+| rMLX | Qwen3.6-35B-A3B MoE | 3.214 GB | 5.23 | 10.53 | **5.30** | 2.01x |
+| rMLX | Gemma4-e4b mxfp8 | 4.971 GB | 8.10 | 13.71 | **5.62** | 1.69x |
+| rMLX | Gemma4-26b MoE | 4.253 GB | 6.93 | 13.85 | **6.93** | 2.00x |
 
-llama.cpp 2.18–6.61 ms against rMLX 4.83–8.15 ms. **The ranges overlap**, so by
+The rMLX `bytes/step` column is the H2 census, so the overhead figures moved
+when the denominator did; llama.cpp's are unchanged.
+
+llama.cpp 2.18–6.61 ms against rMLX 4.65–6.93 ms. **The ranges overlap**, so by
 the same rule this repo applies to its own A/B arms the comparison is
-**INCONCLUSIVE**: the medians differ (~4.3 ms vs ~6.3 ms) but no separation is
+**INCONCLUSIVE**: the medians differ (~4.2 ms vs ~5.5 ms) but no separation is
 demonstrated at n=3 vs n=4, across two frameworks, two weight formats and two
 measurement sessions on a tainted host.
 
 What the data *does* establish:
 
 * The **band difference is dominated by bytes/step, not by runtime efficiency.**
-  A 1.26x-vs-2.4x gap in ratios coexists with overlapping absolute overheads.
+  A 1.26x-vs-2.0x gap in ratios coexists with overlapping absolute overheads.
 * E2's original sentence is still unsupported — it cited an envelope nobody had
   measured — but it is **not falsified**, and an earlier revision of this
   addendum that claimed rMLX was "roughly 1.5x looser" was **wrong**: it compared
-  the non-scale-free quantity across a 2.3–6.7x span in model size.
+  the non-scale-free quantity across a 1.9–5.4x span in model size.
 * Settling it needs a like-for-like cell — llama.cpp on a model with
   rMLX-comparable bytes/step, or rMLX on an ~9 GB/step model — on a quiescent
   host. That has not been run.
@@ -1504,10 +1589,11 @@ What the data *does* establish:
 **Equivalence caveat, and it is load-bearing.** No file both runtimes can load
 exists: rMLX reads MLX safetensors, llama.cpp reads GGUF. The tables set a
 `q8_0` (block 32, one fp16 scale) model against rMLX's `mxfp8`/affine rows —
-near-equivalent, not identical. The rMLX bytes/step figures are themselves the
-rounded estimates this section already published (and `#403` tightens that
-census), so the overhead column inherits their uncertainty. Treat a cross-family
-gap under ~10% as unresolved by this method.
+near-equivalent, not identical. The rMLX bytes/step figures are the H2 tensor
+census, so the overhead column inherits its caveats — bytes a step must stream,
+not bytes moved — while llama.cpp's come from a separate hand-built arithmetic
+over the GGUF. Treat a cross-family gap under ~10% as unresolved by this
+method.
 
 **Cross-run absolute TPS on this host is not comparable.** The 7 722 cell above
 is the demonstration: 54.89 and 49.27, an 11% drift driven by foreground desktop
@@ -1538,10 +1624,13 @@ dispatching to `rmlx_mlx::gather_qmm` for `Linear::Quantized` experts
 (`qwen3_5_moe/layers.rs:187`) — the batched-expert fast path, equivalent to
 mlx-lm's `SwitchGLU`, not a dense-masked loop. Confirmed the `sorted_indices`
 argument is the **hardcoded `false`** positional at `layers.rs:197` (there is no
-named `sorted_indices` param; mlx-lm threads one through). With Qwen3.6's
-1.84x-of-ceiling decode being the *best* of the four models, the expert gather
-is not a bottleneck worth chasing — it is doing the right (gather_qmm) thing and
-the model is the closest to the bandwidth wall. `sorted_indices=true` for the
+named `sorted_indices` param; mlx-lm threads one through). Qwen3.6's
+absolute per-step overhead is 5.30 ms against 4.65–6.93 ms across the four
+models (H2 addendum), i.e. mid-pack and no outlier, so the expert gather is not
+a bottleneck worth chasing — it is doing the right (gather_qmm) thing. The
+scale-free quantity is the one to read here: a ratio-vs-ceiling ranking across
+models of different size is a statement about model size, not about the gather
+(same addendum). `sorted_indices=true` for the
 decode gather is a possible micro-tweak but unjustified by this data (no
 catastrophe to recover). **Characterized — fast gather_qmm path confirmed; not
 dominant.**
@@ -1645,7 +1734,7 @@ nothing) — it is used, if at all, only inside isolated layer ops / prefill, no
 the decode loop. So every decode step re-builds the Rust→mlx-c graph.
 
 Is compiling it worth doing? The bucket breakdown says the forced per-token sync
-is <0.6%, and the model is already 1.8-2.7x of the bandwidth ceiling. The
+is <0.6%, and the model is already 1.7-2.2x of the bandwidth ceiling. The
 per-step forward (8.96 ms Bonsai / 10.97 ms Qwen3.6) is dominated by the
 overlapped GPU kernel + memory traffic, not by host-side graph re-trace stalling
 the GPU (if it were, sync/idle would show up large, and the ratio-vs-ceiling
@@ -1663,16 +1752,18 @@ attention layers, each dispatching a per-step MSL kernel `gated_delta_step_gpu`
 (`qwen3_5_moe/gated_delta_net.rs:267`) plus per-step `conv1d`, several
 `rms_norm`, slices and `astype`. The GDN forward is **not** separately
 instrumented (no span), so it folds into the `forward_total` bucket. Despite the
-long per-layer GDN op chain, Qwen3.6 is the *best* of the four models at 1.84x of
-ceiling — so the GDN chain is not pathological at 4k. It is a plausible
+long per-layer GDN op chain, Qwen3.6's per-step overhead (5.30 ms) sits inside
+the four-model range 4.65–6.93 ms — so the GDN chain is not pathological at 4k.
+Compared on overhead rather than on ratio-vs-ceiling, which is not comparable
+across models of different size (H2 addendum). It is a plausible
 follow-up-branch candidate for per-step kernel fusion if longer-context decode is
 later found wanting, but MSL-kernel work is explicitly out of scope here.
 **Documented as a follow-up-branch candidate only; no action this branch.**
 
 ### Net narrative
 
-Decode is **healthy** — all four models run at ~1.8-2.7x the 614 GB/s bandwidth
-ceiling, the normal-to-good band for batch-1 MLX decode. The "16-50x
+Decode is **healthy** — all four models run at 1.7-2.2x the 614 GB/s bandwidth
+ceiling on a tensor census of what a step streams (H2). The "16-50x
 catastrophe" was a prefill-contaminated bench metric, not an inference defect.
 The modest ~2x residual is ordinary MLX batch-1 overhead (dispatch + dequant +
 sub-peak bandwidth); the forced per-token sync is <0.6% of decode time, and

@@ -73,8 +73,8 @@ pub struct KvCache {
     /// model actually pushed is recorded instead of guessed.
     pub(super) stream_dtype: Option<Dtype>,
     /// If `Some`, this cache uses the SWA ring-buffer code path
-    /// (RotatingKvCache port). Activated by SWA layers in
-    /// `KvQuant::None` mode only.
+    /// (RotatingKvCache port). Activated by any layer constructed with a
+    /// positive `sliding_window`, under every `KvQuant`.
     pub(super) rotating: Option<RotatingState>,
     // ── Head-major persistent K8V4 storage ──
     //

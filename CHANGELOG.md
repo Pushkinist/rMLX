@@ -412,7 +412,120 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gate carries the observed value. This is what identified the Gemma4 result
   below in one run instead of by reading the dispatcher.
 
+### Documentation
+
+- **The gemma4 SWA comment claimed quantized codecs take a full-size path.**
+  They do not, and never did on this tree: `KvCache::with_quant_max_seq_window`
+  selects the rotating ring on `window > 0` alone, `update` / `enter_prefill` /
+  `exit_prefill` all return before any codec dispatch when it is set, and
+  `KvStorage` is allocated lazily, so a windowed layer under `k8v8` holds
+  exactly what it holds under `none`. There was no "pending follow-up" branch
+  behind the comment. Corrected at the gemma4 site and at the five places that
+  restated it — `gemma3/generate.rs`, `speculative/mod.rs` (which additionally
+  claimed the window is *ignored* for quantized modes, and named a per-arch
+  default table that no longer exists), the `rotating` module doc, the
+  `KvCache::rotating` field doc, and `docs/KV_CACHE.md`'s windowed-ring scope
+  note.
+
+- **`CLAUDE.md` filed ParoQuant as a rotation-based KV family and both
+  ParoQuant and IsoQuant as "rotation-KV references".** ParoQuant is a
+  weight-only INT4 method — the token `kv` does not occur in its upstream repo
+  and its calibration path drops `use_cache` — and rMLX has no `KvQuant::Paro*`
+  variant, no ParoQuant `KvStorage` and no `--kv-quant` name for it. IsoQuant
+  upstream is five files, two stage-1 CUDA kernels, no cache and no decode
+  path, so rMLX's `iso*` codecs have no upstream KV counterpart to port. The
+  capability line now names the four families that are KV codecs
+  (TurboQuant, IsoQuant, PlanarQuant, RotorQuant) and says where ParoQuant
+  actually lives; the reference entries state each repo's real scope. The same
+  parenthetical in `README.md` carried the same error twice and is corrected
+  with it. No code changes — `docs/WEIGHT_QUANTS.md` §7 already filed ParoQuant
+  correctly.
+
+- **`docs/PERF_BASELINE.md` H2's "active bytes/step" was nameplate arithmetic.**
+  The four figures (`~2 / ~4 / ~3.5 / ~3.5 GB`) were active-parameter counts
+  times the weight-quant bit width. They dropped the quantization sidebands,
+  the tied `lm_head` (all four models set `tie_word_embeddings`), the per-arch
+  auxiliaries — and KV traffic entirely, while being divided into a decode rate
+  measured at a 4 096-token prompt. Replaced with a tensor census from
+  `scripts/perf_ceiling.py` (`config.json` + safetensors headers), with the
+  invocation recorded so the row is re-checkable without a device. The KV term
+  is a **second producer** — the script transcribes
+  `decode_reads_packed_store`, `feeds_bf16_{k,v}_at_decode` and
+  `kv_quant_for_layer` into Python by hand and nothing gates the two copies
+  against each other, which the doc now states rather than calling the term
+  "the engine's own accounting". The correction is not a constant bias: three
+  ceilings fall and Qwen3.6-35B's rises 9%, because 30 of its 40 layers are GDN
+  and hold no attention projections. The band tightens from 1.84x–2.66x to
+  1.69x–2.15x, dissolving the reading that Bonsai is a factor-of-1.4 outlier
+  with arch-specific overhead worth hunting — most of its excess was the
+  missing KV term, 13.9% of its stream at that shape. `measured decode_tps` is
+  untouched; only the denominator moved. Carried through every dependent claim
+  in the file — the decode-only re-baseline table, the H2 addendum's per-step
+  overhead comparison against llama.cpp (still INCONCLUSIVE, ranges still
+  overlap), H9b, H10 and the net narrative — and through
+  `docs/KV_CACHE.md`'s restatement of the band, which also repeated an
+  unmeasured literature envelope that `PERF_BASELINE.md` had already retracted.
+  H9b and H10 additionally ranked Qwen3.6 "the best of the four models" by
+  ratio-vs-ceiling; that is a comparison across models of different size, which
+  the same document forbids, so both now read the scale-free quantity
+  (per-step overhead, 5.30 ms against a 4.65–6.93 ms range) and reach the same
+  conclusion.
+
+- **The iso / rotor stored bit rate is now stated symbolically and at the point
+  of selection.** `docs/KV_QUANT.md` said the 16.25 bits/value result is
+  "head_dim independent" and then gave two different values for two head dims.
+  The rate is `16 + 32/head_dim` for iso and `(64·⌈D/3⌉ + 32)/D` for rotor,
+  floors 16.0 (approached from above, never reached) and 21.33 — so it is the
+  *sign*, not the rate, that holds at every finite head dim, and both are
+  strictly above bf16's 16.0. Both formulas are derivations from
+  `QuantKGpuRing::alloc`, marked as such. The "Memory and bit-rate summary"
+  table omitted the ring families entirely while listing seven codecs below
+  bf16; the four ring rows are added, flagged as the only rows whose decode
+  reads the store they describe. `rmlx info --list-cache-types` — where these
+  tags are actually chosen — now says the bit width in an `iso_*`/`rotor_*`
+  name is its codebook rather than its stored rate.
+
+- **Three stale claims found beside the above and corrected.** `--rotor-qjl`
+  has defaulted to `off` since the rotor Metal path landed, but four places in
+  `docs/KV_QUANT.md` still called `on` the default — including the decode-cost
+  caveat, which therefore described the CPU path as what an operator gets.
+  `docs/KV_QUANT.md` also said the V-only `iso3`/`iso4` codecs "measure ≈2.1×
+  `none`", which its own codec-disposition section measures as byte-identical
+  (they build no store); the 48.25 bits/value figure is the rate they would
+  cost once a kernel reads one, and now says so. And `KvQuant::K8VTurbo3`'s doc
+  comment still described itself as the auto default for Gemma4 small, which
+  the retired per-arch table used to make true.
+
+- **Metal System Trace does instrument `rmlx` on this host.**
+  `docs/PROFILING.md` claimed the headless path "exports zero rows for `rmlx`".
+  Reproduced twice at xctrace 16.0 / Xcode 26.6 on M5 Max — 6 931 rmlx rows
+  (gemma-4-e2b `none` @4096, `target/release/rmlx`) and 14 140 (Bonsai-8B
+  `k8v4` @8192, `target/release-perf/rmlx`), `Compute` channel,
+  `start-latency` populated, no `sudo` and no entitlement. The recordings that
+  produced the claim held 24 rows for the *whole machine* over 25 s, against
+  36 441 here over 20 s, so what failed was the recording. The false sentence
+  is removed and the real boundary stated: MST carries no kernel names and no
+  counters, which is what the Xcode GUI replay is for.
+
 ### Changed
+
+- **`xctrace`'s "no rows" refusal splits into the two states it was
+  conflating.** A table with no rows at all (the recording captured nothing)
+  and a table holding other processes' rows and none of this one's (the
+  recording ran; this process was not in it) have opposite remedies, and both
+  were reported as `parsed but contains no rows` — which `scripts/mst_capture.sh`
+  then annotated with "the run itself failed", sending the reader to re-run a
+  workload that is fine. `XctraceError::NoRowsForProcess` is the second case
+  and carries the row count and the process census the recording *did* see, on
+  both the plain and the `--skip-ms` entry branch. A third state,
+  `SkipRemovedEveryRow`, covers the case those two cannot describe honestly: the
+  process IS in the recording and `--skip-ms` cut past its work.
+  `SkipExceedsSpan` does not subsume it — that guard fires on
+  `origin >= max(start + duration)`, so one long submission straddling the
+  origin keeps it silent while every row's `start` is below the floor, and the
+  refusal would otherwise claim the process was absent while printing its own
+  row count in the census. This is the diagnostic that would have identified the
+  four zero-row recordings above as failed recordings.
 
 - **`--kv-preset auto` resolves to `DEFAULT_KV_QUANT`, the same constant
   `--kv-quant auto` resolves to.** It previously ran its own resolver — a
