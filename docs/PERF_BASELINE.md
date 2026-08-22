@@ -810,6 +810,33 @@ were each run once per (model, context) and recorded through
 (model, offset, codec), so one run per cell is the whole measurement — unlike a
 throughput figure, which is why these are not ABBA-paired.
 
+### Disposition: the packed-store throughput gap is not a funded lever (2026-08-22)
+
+The table above is the measured basis for a proposal to lift the `mixed_*`
+decode path from 227.8 GB/s to ≥ 400 GB/s on its own layers, alongside a
+proposal to re-index the fused flash-decode grid by KV head. **Both are
+answered negative and neither should be scheduled as a throughput lever.** The
+argument, its artifacts and the one cell that stays open are in
+`docs/KV_QUANT.md` § "Lifting ε does not pay — answered negative". In summary,
+against this section's numbers:
+
+* The ≥ 400 GB/s pass criterion presumes a bandwidth bound. GPU counters on the
+  fused path measure the opposite — Integer and Conditional Limiter 50.45%
+  against Last Level Cache 10.66% — so the byte savings have nothing to convert
+  into and the criterion would fail work that did everything right.
+* The 130 848-token row above is the long cell the claim was meant to turn on,
+  and it went the other way: **23.7% slower**, ranges disjoint, where the byte
+  model predicted +14.9% faster.
+* The `mixed_*` GQA broadcast is already consumed as a stride-0 view by MLX's
+  quantized-matmul batch addressing, so the first named fix target has nothing
+  to change; the second is inside MLX's kernels, not rMLX code.
+* The auto default is bf16 on every arch
+  (`DEFAULT_KV_QUANT = KvQuant::None`), so no user reaches this path unless
+  they ask for it by name.
+
+The `none` rows in this section keep their standing as anchors. What is retired
+is the expectation that the packed-store arms in them have collectable headroom.
+
 ## Host-sampler cost — PROVISIONAL, NOT AN ANCHOR (2026-08-16)
 
 First measurement of the sampling / penalty / mask / logprob path, which every
