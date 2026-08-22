@@ -3344,14 +3344,35 @@ threadgroups each stream the identical KV bytes. That caps the shell at
 | gemma-4-e2b | 8 | 0.125 | 0.052 (42% of ceiling) |
 
 Measured ε differs between the two archs by 2.6×; `heads_per_kv` alone predicts
-2.0×. The geometry is the dominant term. The residual ≈2× is the f32
-`partial_o` P1→P2 DRAM round trip plus the thread-0-serial online-softmax
-section, where all but one lane idle twice per KV token.
+2.0×. The residual ≈2× is **unattributed**, and the two constructs it is easiest
+to blame are not available to blame in general:
+
+* `turbo_flash_p1.metal` contains **zero** `threadgroup_barrier` and no thread-0
+  serial section — its online softmax is per-lane with a `simd_sum` at `:106`,
+  and its only `lane == 0` is the epilogue store at `:153`. It has no
+  `partial_o` either; its P1→P2 buffers are `partial_out` / `partial_ms`. Both
+  constructs live in `turbo_flash_p2.metal` (barrier `:37`, `tid == 0u` `:20`),
+  which measures **3.66%** of GPU time, so eliminating it entirely recovers at
+  most that.
+* The iso and rotor P1 kernels do carry both constructs inside the per-KV-token
+  loop (`iso_flash_decode_symv_p1.metal:84` between barriers at `:81` / `:107`;
+  same shape in `iso_flash_decode_p1`, `rotor_flash_decode_p1`,
+  `rotor_flash_decode_symv_p1`). Their **magnitude has never been measured** —
+  every counter and timing measurement to date is of `turbo_flash_p1`.
+
+Where the residual went on the one kernel that was profiled: `turbo_flash_p1`
+is **issue-bound, not memory-bound** — Integer and Conditional Limiter 50.45%,
+Instruction Throughput 45.66%, Control Flow 28.92%, against LLC 10.66% and L1
+3.31%, at 22.24% occupancy with 94 allocated registers and 0 spilled bytes. The
+bf16 `sdpa_vector` encoders in the same capture are the opposite: LLC 42.16%,
+occupancy 52.93%, 56 registers. See "Lifting ε does not pay" below.
 
 **Corollary for `kv_h == 1` architectures.** e2b's geometric ceiling (0.125) is
 *below* the densest store in the tree (`tsym3`, ρ = 0.158). On such an arch no
 fused decode over any store that exists or has been proposed can beat bf16 **even
-with a perfect kernel body**, until the grid stops re-reading KV per query head.
+with a perfect kernel body**, while the grid re-reads KV per query head. That is
+a necessary condition, not a sufficient one — lifting it is measured below and
+does not produce a win either.
 
 ### What ρ would have to be
 
@@ -3372,8 +3393,136 @@ Against what exists or has been specced:
 
 **The binding constraint is ε, not ρ.** Repacking a store is necessary for some
 of these codecs to stop costing memory, but it is not sufficient to make a fused
-decode win, and on `kv_h == 1` it is not even close. Order kernel-shell work
-first; judge a store repack on its memory merits, not on an expected decode win.
+decode win, and on `kv_h == 1` it is not even close. Judge a store repack on its
+memory merits, not on an expected decode win — and read the next section before
+funding kernel-shell work on the expectation that lifting ε collects the
+difference.
+
+### Lifting ε does not pay — answered negative
+
+Two proposals rested on the arithmetic above. Both are answered **no** from
+evidence already in the tree, with no new measurement. Neither is a throughput
+lever; do not sequence a codec change behind either.
+
+**What was asked.**
+
+* *Re-index the P1 grid by KV head* — carry `heads_per_kv` query vectors and
+  their online-softmax state in registers so each KV byte is read once per
+  threadgroup instead of `heads_per_kv` times. Predicted ceiling lift 4× at
+  `heads_per_kv = 4`, 8× at 8; success criterion ε on `iso3_sym` at Bonsai-8B
+  rising from 0.135 toward 0.25.
+* *Close the mirror→packed bandwidth cliff in `mixed_*`* — the `Mixed` decode
+  path streams its packed KV at 227.8 GB/s where the bf16 path moves the same
+  layers' KV at 533.9 GB/s on the same host, shape and context segment. Pass
+  criterion: those layers reach ≥ 400 GB/s, 65% of the 614 GB/s host ceiling.
+
+**The re-index's mechanism is true; its consequence is not.** The grid really is
+indexed by query head — `turbo_flash_p1.metal:17,20,27` (`bh_idx` flat over
+`B * n_q_heads`, `kv_head = q_head / n_repeats`) and `:29-32` in each of
+`iso_flash_decode_p1`, `iso_flash_decode_symv_p1`, `rotor_flash_decode_p1`,
+`rotor_flash_decode_symv_p1` (`kv_h_idx = hq / heads_per_kv`) — so
+`heads_per_kv` threadgroups do stream identical bytes, and `ε ≤ 1/heads_per_kv`
+is a correct analytic cap. What fails is the step from that cap to a win. A
+`1/heads_per_kv` cap binds only if the kernel is waiting on memory, and it is
+not.
+
+1. **The headroom ladder.** `.rmlx/analysis/kv-campaign/P12/03_headroom_calc.txt`
+   (Bonsai-8B `k8v4` @32k, `--turbo-flash off|on`, ABBA, 12 slots): removing the
+   **entire** query-head class — an upper bound on the re-index, since that class
+   also holds irreducible per-query-head arithmetic — moves the ON arm from
+   0.231× of the generic path to **0.311×**. End-to-end that is a 1.348×
+   speedup on a kernel 4.33× behind, i.e. perfect execution still lands 3.21×
+   slower than not running the codec at all. Reaching parity needs the *bytes*
+   class to run ~3× better as well (0.701×), and only full per-byte parity with
+   MLX `sdpa_vector` clears 1.0 (1.283×).
+2. **The kernel is issue-bound, so a bandwidth fix has little to recover.**
+   Xcode Metal Debugger counter export, Bonsai-8B `k8v4` @8192, Serial
+   execution mode / Maximum performance state: `turbo_flash_p1` reads Integer
+   and Conditional Limiter **50.45%**, Instruction Throughput 45.66%, Control
+   Flow 28.92%, against LLC **10.66%** and L1 3.31%. The bf16 `sdpa_vector`
+   encoders in the same capture invert it — LLC 42.16%, Integer and Conditional
+   9.50%. Every memory limiter on the fused kernel is small; the byte savings
+   are real and have nothing to convert into. *Serial execution mode makes
+   absolute wall-clock and absolute bandwidth non-production numbers; limiters,
+   occupancy, register counts and the P1:P2 ratio are the precise half, and are
+   what is quoted here.*
+3. **The redesign worsens the real co-limiter.** Occupancy is 22.24% at 94
+   allocated registers with **0** spilled bytes, so resident threadgroups are
+   already register-limited without spilling. *Derivation* from the declared
+   per-lane arrays in `turbo_flash_p1.metal` — `q_vals[8]` (`:38`), `o_state[8]`
+   (`:47`), `m_state` / `l_state` (`:45,:46`) are per query context and would
+   replicate `heads_per_kv` times; `v_decoded[8]` (`:116`) is shared. 18 f32 per
+   query context: today 18 + 8 = 26, after the re-index 18·`heads_per_kv` + 8 —
+   **80 at `heads_per_kv` 4 (+54, 94 → ~148)** and **152 at 8 (+126, 94 → ~220)**.
+   This is a source-level count of declared f32s, not a compiler allocation, but
+   the direction is not in doubt: the architecture where the re-index predicts
+   the largest lift (8×, `kv_h == 1`) is the one with the least room to hold the
+   registers it needs.
+4. **The one store whose ρ clears a lifted ceiling is inert.** `tsym3` (ρ =
+   0.158) is the only spelling that would clear 0.25. It encodes nothing today:
+   in `.rmlx/analysis/kv-disposition-416/inertness_base.csv` it is
+   **byte-identical and token-identical to `none`** at 4 096 and 32 768 tokens on
+   both gemma-4-e2b and Ternary-Bonsai-8B (e.g. Bonsai @32 768: 4 667 277 312 B
+   and ids `eafa8d9dd4d4a507` on both). ρ = 0.158 is a specification, not a
+   store, and it has no symv-family kernel either.
+5. **No codec that does exist turns a lifted ε into a win.** `iso4_sym` at 32 768
+   tokens on Bonsai-8B decodes at **0.170×** of `none` (10.703 vs 62.936 TPS)
+   while holding **1.3% more** resident KV than bf16
+   (`.rmlx/analysis/kv-disposition-416/inertness_fix.csv`). A 4× ceiling lift
+   applied to the whole gap does not reach 1.0 from there, and there is no
+   bandwidth prize to collect at ρ > 1.
+
+**Cross-backend control.** `llama-cpp-turboquant`'s independently written fused
+decode dispatches over the same query-head grid (`ne02` is the query-head count,
+see "Cross-backend calibration" above) and loses 0.653–0.733× against its own
+f16 baseline, worsening with context. The geometry is shared by both
+implementations, so it is not what separates a winning fused decode from a
+losing one.
+
+**The packed-store proposal's motivation survives; its fix targets do not.**
+The byte→time conversion really is where the loss lives — that is the same
+finding, from the other side. But:
+
+* *Fix target 1* was to determine whether the GQA `expand_dims(-3)` broadcast in
+  `crates/rmlx-kv-quant/src/mixed_quant/sdpa.rs` materialises or is re-read per
+  repeat group. It does neither, and there is nothing in rMLX to change: MLX's
+  quantized-matmul batch addressing accumulates `pos_in_dim * stride` per axis
+  (`elem_to_loc_broadcast`, `mlx/backend/metal/kernels/steel/utils.h:7-22`, via
+  `adjust_matrix_offsets` in `quantized.h`), so a stride-0 axis contributes zero
+  and every repeat group resolves to the same base pointer. *This is a reading
+  of the installed MLX kernel headers; MLX's C++ `eval_gpu` is not on this
+  machine to confirm no copy precedes dispatch.* The measurement agrees
+  independently: a "K re-read r times" model needs r = 3.06 to explain `k8v4`
+  and r = 4.15 to explain `k4v4`, i.e. it does not fit.
+* *Fix target 2* is inside MLX's `affine_qmv_*` / `affine_qvm_split_k_*`
+  kernels, not in rMLX code.
+* The **≥ 400 GB/s pass criterion presumes a bandwidth bound the counters
+  contradict**, and would fail work that did everything right — the same defect
+  as the ≤ 4× criterion on the re-index, which is unreachable because the whole
+  query-head class measures 29.9% ± 4.1% of the loss.
+* There are also no users to collect for: the auto default is bf16 on every arch
+  (`DEFAULT_KV_QUANT = KvQuant::None`,
+  `crates/rmlx-models/src/kv_cache/mod.rs:461`), the codec holds 21.9–34.9% more
+  resident KV than `none` across the four cells measured, and the long cell went
+  the other way — Qwen3.8-27B at 130 848 tokens, ABBA n=4, is **23.7% slower**
+  with disjoint ranges where the byte model predicted +14.9% faster
+  (`docs/PERF_BASELINE.md`, "Codec cells across context").
+
+**The one genuinely open cell.** Every counter measurement in this argument is
+of `turbo_flash_p1` (ε = 0.041). The best kernel in the tree,
+`iso_flash_decode_symv_p1` (ε = 0.135, 3.3× better), **has never been
+profiled** — and it is also the one whose P1 does hold the barrier pair and the
+thread-0 softmax section, so its limiter split may differ. The decision rule is
+pre-registered here so the answer cannot be chosen after the fact. Capture it as
+`docs/PROFILING.md` describes (Bonsai-8B, `--kv-quant iso3_sym`, `--skip 32
+--steps 8`, Serial execution / Maximum performance) and read
+`iso_flash_decode_symv_p1`'s Counters tab:
+
+| reading | conclusion |
+|---|---|
+| Last Level Cache Limiter **> 35%** | memory-bound; the grid re-index becomes a live proposal for this kernel family and the question reopens |
+| LLC **< 20%** with Integer and Conditional **> 40%** | same disease as `turbo_flash_p1`; the negative result covers both families and the question is closed on evidence |
+| anything between | inconclusive; state it as such and do not fund on it |
 
 ### Codec disposition — what every codec in the tree is for
 

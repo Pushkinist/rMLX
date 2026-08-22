@@ -394,10 +394,14 @@ Ranked by impact:
      rotor, against bf16's 16.0), so there was never a bandwidth prize to
      collect — see "Memory truth" in `docs/KV_QUANT.md`.
    * The kernel shell itself achieves only 4–14 % of MLX `sdpa_vector`'s
-     per-byte throughput, chiefly because its P1 grid is indexed by *query* head
-     and so re-reads the whole KV stream `heads_per_kv` times. Even the densest
-     store in the tree is too fat to clear that bar. The `ρ < ε` arithmetic,
-     the two-architecture measurement and the corollary for `kv_h == 1` are in
+     per-byte throughput. Its P1 grid is indexed by *query* head and so re-reads
+     the whole KV stream `heads_per_kv` times, which caps the shell at
+     `1/heads_per_kv` — but that cap is **not** where the loss is: the fused
+     kernel is issue-bound, not memory-bound, and removing the entire
+     query-head class leaves it 3.2× slower than the generic path. Even the
+     densest store in the tree is too fat to clear the bar either way. The
+     `ρ < ε` arithmetic, the two-architecture measurement, the corollary for
+     `kv_h == 1` and the negative result on lifting ε are in
      `docs/KV_QUANT.md` § "Fused flash-decode over a quant store — the break-even
      condition".
 

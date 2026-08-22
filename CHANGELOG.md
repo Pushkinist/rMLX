@@ -414,6 +414,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- **Lifting ε is answered negative, and the residual it was blamed on was the
+  wrong residual.** Two standing proposals — re-index the flash-decode P1 grid
+  by KV head, and lift the `mixed_*` packed-store path to ≥ 400 GB/s — are
+  recorded as answered-negative in `docs/KV_QUANT.md` § "Lifting ε does not pay"
+  and `docs/PERF_BASELINE.md`. The grid mechanism is true and re-verified at
+  source (`turbo_flash_p1.metal:17,20,27`; `:29-32` in each iso/rotor P1), but
+  its consequence is not: removing the *entire* query-head class moves the ON
+  arm only 0.231× → 0.311× of the generic path, because the kernel is
+  issue-bound (Integer and Conditional 50.45%) rather than memory-bound (LLC
+  10.66%), the redesign adds ~54–126 f32 per lane against 22.24% occupancy with
+  no spill headroom, the one store dense enough to clear a lifted ceiling
+  (`tsym3`) is byte- and token-identical to `none`, and the best real codec on
+  that kernel (`iso4_sym` @32k) decodes at 0.170× of `none` while holding more
+  bytes than bf16. The ≥ 400 GB/s and ≤ 4× pass criteria both presume a bound
+  the counters contradict. `docs/KV_QUANT.md` had attributed the residual to
+  "the f32 `partial_o` P1→P2 round trip plus the thread-0-serial softmax
+  between threadgroup barriers" — `turbo_flash_p1` has zero
+  `threadgroup_barrier`, no thread-0 section and no `partial_o` at all, and the
+  P2 that does have them is 3.66% of GPU time; the iso/rotor P1s do carry both
+  and have never been profiled. `docs/models/bonsai/27B/rMLX.md` restated the
+  same attribution as "chiefly because". Both corrected, and the one unmeasured
+  cell (`iso_flash_decode_symv_p1`) is recorded with a pre-registered decision
+  rule.
+
+- **Metal System Trace granularity is per encoder, and the driver-coalescing
+  claim was unsupported.** `scripts/mst_capture.sh`, `docs/PROFILING.md` and the
+  XML unescaper in `rmlx-mlx` all said the driver merges consecutive compute
+  encoders into one GPU kick so a row can cover several. Re-derived from the two
+  bundles under `<RMLX_HOME>/traces/mst`: 14 140 rmlx `metal-gpu-intervals` rows
+  carry 13 996 distinct `encoder-id`s, and the same run's
+  `metal-application-command-buffer-submissions` sums 13 997 encoders over
+  14 512 command buffers, of which 13 592 hold exactly one. No row is a
+  coalesced kick, and no `gpu-channel-name` in either export is anything but
+  `Compute` / `Fragment` / `Vertex` — the `&` the unescaper exists for comes
+  from the compositor's IOSurface labels. Also corrected: "no pipeline or
+  function names in the export" is true of `metal-gpu-intervals` only. The
+  bundle names 52 rmlx pipelines in `metal-shader-profiler-shader-list`; what is
+  missing is a join key, because the stock template records `Shader Timeline:
+  Disabled` and `metal-shader-profiler-intervals` exports zero rows —
+  configuration, not a device ceiling. Counters genuinely are dead headlessly:
+  the bundle holds exactly one, `RT Unit Active`.
+
 - **The gemma4 SWA comment claimed quantized codecs take a full-size path.**
   They do not, and never did on this tree: `KvCache::with_quant_max_seq_window`
   selects the rotating ring on `window > 0` alone, `update` / `enter_prefill` /
