@@ -284,10 +284,12 @@ retained set always contains the full most-recent `window` — no still-attended
 key is ever evicted).
 
 Scope note: the rotating ring is the bf16 SWA path used by Gemma3/Gemma4 (the
-only archs with interleaved windowed + global attention). Quantized SWA codecs
-are not currently routed through the ring (mlx-lm's reference keeps SWA bf16
-too — `RotatingKVCache.to_quantized` raises), but the SWA layers are bf16 by
-default (§5.7), so the bound applies on every shipping SWA configuration.
+only archs with interleaved windowed + global attention), and it is taken under
+**every** `KvQuant` — `KvCache::with_quant_max_seq_window` branches on
+`window > 0` alone, so a quantized codec on an SWA layer runs this ring and
+never allocates its `KvStorage` (mlx-lm's reference keeps SWA bf16 too —
+`RotatingKVCache.to_quantized` raises). The bound therefore applies at every
+codec, not only at the default.
 
 ### `resident_bytes` counts the live-inference KV (filled prefix, not ceiling)
 
@@ -1349,16 +1351,22 @@ TPS) are dominated by prefill latency, **not** decode speed.
 The corrected **decode-only** numbers and their derivation are in
 [`docs/PERF_BASELINE.md`](PERF_BASELINE.md). Short summary: once prefill is
 excluded, all four models
-run at **1.8–2.7× the 614 GB/s bandwidth ceiling**, which is the normal
-batch-1 band that llama.cpp and mlx-lm hit on dense models — there is no
-inference defect. The "headline" decode-only figures are:
+run at **1.7–2.2× the 614 GB/s bandwidth ceiling** — there is no inference
+defect. (An earlier revision called that "the normal batch-1 band that
+llama.cpp and mlx-lm hit on dense models". That envelope came from the
+literature, and the local measurement neither confirms nor contradicts it:
+ratio-vs-ceiling is not comparable across models of different size, and on the
+scale-free quantity the two runtimes overlap. See `PERF_BASELINE.md` H2
+addendum.) The "headline" decode-only figures, and the ceilings they are read
+against, are a tensor census of what a step streams at
+`--ctx 4096 --max-ctx 8192`:
 
-| Model | §10 cell (combined) | decode-only (PERF_BASELINE.md) | ratio vs ceiling |
-|---|---:|---:|---|
-| Bonsai 8B 2bit | 15.88 TPS | ~110 TPS | ~2.7x |
-| Gemma4-e4b mxfp8 | 27.50 TPS | ~74 TPS | ~2.1x |
-| Gemma4-26b MoE | 3.47 TPS | ~72 TPS | ~2.4x |
-| Qwen3.6-35B MoE | 4.46 TPS | ~96 TPS | ~1.8x |
+| Model | §10 cell (combined) | decode-only (PERF_BASELINE.md) | ceiling @614 GB/s | ratio vs ceiling |
+|---|---:|---:|---:|---|
+| Bonsai 8B 2bit | 15.88 TPS | 115.21 TPS | 248.2 | 2.15x |
+| Gemma4-e4b mxfp8 | 27.50 TPS | 72.92 TPS | 123.5 | 1.69x |
+| Gemma4-26b MoE | 3.47 TPS | 72.19 TPS | 144.4 | 2.00x |
+| Qwen3.6-35B MoE | 4.46 TPS | 94.96 TPS | 191.1 | 2.01x |
 
 For steady-state decode reasoning — picking a KV quant, estimating
 throughput, comparing combos — use the **decode-only** TPS from
@@ -1454,7 +1462,11 @@ prompt registry, `bests` view, query API).
 
 - llama.cpp 4-bit KV cache discussion: <https://github.com/ggml-org/llama.cpp/pull/5932>
 - MLX `mx.quantize` API reference: <https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.quantize.html>
-- ParoQuant (z-lab): <https://github.com/z-lab/paroquant>
-- IsoQuant (ParaMind2025): <https://github.com/ParaMind2025/isoquant>
+- ParoQuant (z-lab): <https://github.com/z-lab/paroquant> — a **weight**
+  quantizer (pairwise-rotation INT4). Listed here for the rotation math, not as
+  a KV reference: its upstream repo has no KV-cache surface at all.
+- IsoQuant (ParaMind2025): <https://github.com/ParaMind2025/isoquant> — SO(4)
+  isoclinic rotation, stage-1 quantize/dequantize only. No cache and no decode
+  path upstream, so rMLX's `iso*` KV codecs have no counterpart to port.
 - Metrics database operating rules: `docs/METRICS_DB.md`
 - Profiling runbook (samply, Instruments, dhat): `docs/PROFILING.md`

@@ -235,8 +235,8 @@ pub(crate) fn print_cache_type_table() {
             CacheType::Turbo2Tcq => "TurboQuant + Viterbi trellis (2-bit)",
             CacheType::IsoK3 => "IsoQuant K-rotation (3-bit)",
             CacheType::IsoK4 => "IsoQuant K-rotation (4-bit)",
-            CacheType::RotorK3 => "Clifford rotor K-side (3-bit, +QJL)",
-            CacheType::RotorK4 => "Clifford rotor K-side (4-bit, +QJL)",
+            CacheType::RotorK3 => "Clifford rotor K-side (3-bit)",
+            CacheType::RotorK4 => "Clifford rotor K-side (4-bit)",
             // Symmetric WHT-3 K+V.
             CacheType::TurboSym3 => "TurboQuant sym K+V (3-bit)",
         };
@@ -289,4 +289,27 @@ pub(crate) fn print_cache_type_table() {
             sides,
         );
     }
+    // The nominal width in a rotation codec's name is its codebook, not what
+    // the store spends. The iso and rotor tags decode from a shared GPU ring
+    // that costs one whole u32 code word plus one f32 scale per group whatever
+    // the codebook width, so a 3-bit and a 4-bit member of the same family
+    // occupy byte-identical space; planar spends an f32 per PAIR and is wider
+    // still. None of the three is a compression format at this layout. Said
+    // here because this listing is where the tags are chosen.
+    println!();
+    println!("note: the bit width in an iso_*/rotor_*/planar* name is its codebook, not");
+    println!("      what it stores. None of the three is a compression format at the");
+    println!("      layout it ships: each spends a whole u32 code word and an f32 scale");
+    println!("      per group (planar, per PAIR), so all land ABOVE bf16's 16.00 bits");
+    println!("      per value. At head_dim 128:");
+    println!("        iso_k_3/4, iso_v_3/4         16.25   (16 + 32/head_dim)");
+    println!("        rotor_k_3/4, rotor_v_3/4     21.75   ((64*ceil(D/3)+32)/D)");
+    println!("        planar3, planar4, planar_k4  22.00   (at every head_dim)");
+    println!("      so planar is the widest cell on this menu, not iso or rotor. Each");
+    println!("      pair is byte-identical across its 3-bit and 4-bit member. The");
+    println!("      iso/rotor rates are derived from the ring allocation; the rotor and");
+    println!("      planar figures are also measured by the crate rate gate");
+    println!("      (kv_rate_tests), which measures iso in its wider CPU-block form.");
+    println!("      For which pairings actually build such a store see docs/KV_QUANT.md");
+    println!("      \"Codec disposition\".");
 }

@@ -233,8 +233,11 @@ pub fn generate_greedy<'a>(
 
     // Allocate one KvCache per decoder layer using the selected quant mode.
     //
-    // SWA layers in bf16-KV mode (`KvQuant::None`) use the byte-for-byte
-    // RotatingKvCache port. medgemma has the SWA pattern (5 sliding + 1 full).
+    // SWA layers always use the byte-for-byte RotatingKvCache port and stay
+    // bf16 at `sliding_window` tokens whatever codec they are handed — the
+    // rotating branch is chosen on `window > 0` alone
+    // (`KvCache::with_quant_max_seq_window`). medgemma has the SWA pattern
+    // (5 sliding + 1 full), so only the full-attention layer is quantized.
     use super::config::LayerType;
     let sliding_window_i32 = model.cfg.sliding_window as i32;
     let n_layers = model.cfg.num_hidden_layers;

@@ -12,8 +12,8 @@ OpenAI- and Anthropic-compatible alternative to `mlx_lm.server`, and a
 Metal-native counterpart to `llama.cpp` that runs MLX-format models directly.
 One `cargo build --release` artifact — no Python runtime, no GGUF translation layer — and the widest
 weight × KV-quantization matrix any MLX server ships, including rotation-based
-KV families (TurboQuant, IsoQuant, PlanarQuant, RotorQuant, ParoQuant) that no
-other MLX server offers. Works as a local backend for any OpenAI/Anthropic-compatible
+KV families (TurboQuant, IsoQuant, PlanarQuant, RotorQuant) that no
+other MLX server offers, plus ParoQuant on the weight side. Works as a local backend for any OpenAI/Anthropic-compatible
 coding agent (Claude Code, Cursor, Aider, OpenCode).
 
 > Status: **feature-complete native MLX backend** — OpenAI- and
@@ -105,9 +105,10 @@ quantization surface in a single process.
 
 <sub>¹ `mlx-lm` itself is text; vision lives in the separate `mlx-vlm` package.
 ² `llama.cpp` audio is in the `mtmd` CLI, not the HTTP server.
-³ affine 2–8 bit, fp8, mxfp/nvfp4, **plus** five rotation-KV families
-(TurboQuant, IsoQuant, PlanarQuant, RotorQuant, ParoQuant) no other MLX server
-ships. Widest *matrix*, not a memory win: measured on two architectures at two
+³ affine 2–8 bit, fp8, mxfp/nvfp4, **plus** four rotation-KV families
+(TurboQuant, IsoQuant, PlanarQuant, RotorQuant) no other MLX server
+ships. ParoQuant is a weight quantizer, not a KV codec, and is counted in the
+weight column. Widest *matrix*, not a memory win: measured on two architectures at two
 contexts, no KV codec in the tree currently holds fewer resident bytes than
 plain bf16 — 17 of the 28 build no packed store at all and decode identically to
 it, bf16 itself is the 18th, and the other 10 are larger. The honest per-codec disposition, and why the

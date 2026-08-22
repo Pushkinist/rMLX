@@ -362,3 +362,131 @@ fn windowed_ring_retains_full_swa_window() {
         assert_window_retained(&read_rows(&kk), head + 1);
     }
 }
+
+// ── The codec-independence of the rotating path ─────────────────────────────
+//
+// "A windowed layer runs the bf16 ring whatever codec it is handed" is asserted
+// in the `rotating` module doc, on the `KvCache::rotating` field, in
+// `with_quant_max_seq_window`'s own doc, in three per-arch cache-construction
+// comments and in two `docs/` files. Until this test it was pinned by nothing
+// that varied the codec — which is exactly how the gemma4 comment came to claim
+// the opposite for long enough to be filed as a defect. One table, every codec a
+// caller can hand a windowed layer.
+
+/// Codecs a windowed layer can be constructed with, spanning the classes that
+/// behave differently on a GLOBAL layer: bf16 (`None`), mirror-fed with no
+/// store (`K8V8`, `K8V4`, `Planar`) and store-reading (`Mixed`). If the window
+/// were conditional on the codec, these would not agree.
+fn windowed_codec_table() -> Vec<(&'static str, KvQuant)> {
+    vec![
+        ("none", KvQuant::None),
+        ("k8v8", KvQuant::K8V8),
+        ("k8v4", KvQuant::K8V4),
+        ("planar", KvQuant::Planar),
+        (
+            "mixed_k8g64_v4g64",
+            KvQuant::Mixed {
+                k_bits: 8,
+                v_bits: 4,
+                k_group_size: 64,
+                v_group_size: 64,
+            },
+        ),
+    ]
+}
+
+/// Prefill `ctx` tokens into a cache built at `quant`, chunked, and return it.
+#[allow(
+    clippy::unwrap_used,
+    reason = "test — panics are the intended failure mode"
+)]
+fn prefilled(quant: KvQuant, window: Option<i32>, ctx: i32) -> KvCache {
+    let device = Device::Cpu;
+    let mut cache = KvCache::with_quant_max_seq_window(quant, ctx.max(4096), window);
+    cache.enter_prefill();
+    let mut pos = 0;
+    while pos < ctx {
+        let s = PREFILL_CHUNK.min(ctx - pos);
+        let n = (B * KV_H * s * D) as usize;
+        let bytes = vec![0u8; n * 2];
+        let k = Array::from_bytes(&bytes, &[B, KV_H, s, D], Dtype::Bf16).unwrap();
+        let v = Array::from_bytes(&bytes, &[B, KV_H, s, D], Dtype::Bf16).unwrap();
+        cache.update(&k, &v, device).unwrap();
+        pos += s;
+    }
+    cache.exit_prefill(device).unwrap();
+    cache
+}
+
+/// A windowed layer takes the bf16 ring under **every** codec, allocates no
+/// packed store and keeps no decode seed, and holds byte-identical KV to
+/// `none`. This is the claim six comments make; here it is measured.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test — panics are the intended failure mode"
+)]
+fn a_windowed_layer_is_the_bf16_ring_under_every_codec() {
+    // Longer than the window, so the ring has wrapped and any codec that was
+    // going to encode something has had a full prefill to do it in.
+    let ctx = WINDOW * 3;
+    let mut baseline: Option<u64> = None;
+    for (name, quant) in windowed_codec_table() {
+        let cache = prefilled(quant, Some(WINDOW), ctx);
+        assert!(
+            cache.is_rotating(),
+            "{name}: a layer given a window must take the rotating path"
+        );
+        assert_eq!(
+            cache.storage().resident_bytes(),
+            0,
+            "{name}: the rotating path must allocate no packed store"
+        );
+        assert!(
+            cache.decode_fp16_kv().is_none(),
+            "{name}: the rotating path must materialise no decode seed"
+        );
+        let bytes = cache.resident_bytes();
+        match baseline {
+            None => baseline = Some(bytes),
+            Some(want) => assert_eq!(
+                bytes, want,
+                "{name}: windowed KV must be byte-identical to `none` ({bytes} vs {want})"
+            ),
+        }
+    }
+    assert!(
+        baseline.is_some_and(|b| b > 0),
+        "the harness stored nothing"
+    );
+}
+
+/// The null control, and the reason the test above is not vacuous: the same
+/// codecs on a layer with **no** window do not take the ring, and the
+/// store-reading one really does build a store. Without this a change that made
+/// every cache rotating would pass the table above.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test — panics are the intended failure mode"
+)]
+fn the_same_codecs_without_a_window_do_not_take_the_ring() {
+    let ctx = 128;
+    for (name, quant) in windowed_codec_table() {
+        let cache = prefilled(quant, None, ctx);
+        assert!(
+            !cache.is_rotating(),
+            "{name}: a layer with no window must not take the rotating path"
+        );
+        // `Mixed` is the one codec here whose decode reads its own packed
+        // store, so it is the one that must have built one. The rest are
+        // mirror-fed by design and legitimately hold none.
+        if matches!(quant, KvQuant::Mixed { .. }) {
+            assert!(
+                cache.storage().resident_bytes() > 0,
+                "{name}: a global store-reading layer must allocate its store — \
+                 without this the windowed assertion above cannot fail"
+            );
+        }
+    }
+}

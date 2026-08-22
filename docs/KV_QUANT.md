@@ -156,10 +156,18 @@ is estimated to increase resident KV vs bf16 on the active layer mix:
 ```
 WARN KV codec increases resident KV vs bf16 on this layer mix — the
 per-global-layer warm-TTFT bf16 seed plus codec scales exceed the bytes saved
-at this context; windowed layers already run bf16 and are unaffected. Consider
---kv-quant none if memory is the goal.
-  kv_quant=mixed_k8g64_v8g64 eff_seq=8192 n_global=7 n_windowed=28 est_extra_bytes=51380224
+at this context; windowed layers already run bf16 and are unaffected. The byte
+figure is an UPPER BOUND, not an estimate: the iso arm of the estimator sizes a
+group from the CPU-block layout, which carries a per-group quaternion the GPU
+ring the iso codecs actually decode from does not, so for those codecs it
+overstates by roughly 3x. The sign is exact either way. Consider --kv-quant none
+if memory is the goal.
+  kv_quant=mixed_k8g64_v8g64 eff_seq=8192 n_global=7 n_windowed=28 est_extra_bytes_upper_bound=51380224
 ```
+
+The field is named for what it is. Only the **sign** of that number is exact;
+size nothing from its magnitude, and for `k_iso*` / `iso*_sym` expect it to run
+about 3x high (`KvQuant::approx_code_bits`, iso arm).
 
 The estimate is model-agnostic — keyed only on layer geometry (`head_dim`,
 `kv_heads`, `window`) and codec attributes (`KvQuant::approx_code_bits`, the
@@ -540,8 +548,10 @@ short-context parity benches only.
 
 **CLI**: `--kv-quant none` (aliases: `bf16`, `f16`).
 
-**Arch defaults**: `Qwen3VLMoeForConditionalGeneration` defaults to `None`
-because quantized KV produces incoherent output on that checkpoint.
+**Arch defaults**: none. `auto` is bf16 on every arch, so this is what
+`Qwen3VLMoeForConditionalGeneration` gets — which matters there beyond
+uniformity, because quantized KV produces incoherent output on that
+checkpoint.
 
 **Smoke-probe status**: validated across all primary test-target families.
 
@@ -887,8 +897,10 @@ K below 8-bit on a 7:1 GQA model amplifies quantization error through
 softmax and produces catastrophic PPL degradation (218 → 8641 observed).
 The K-side codec is the safeguard — not the variant name.
 
-**Arch defaults**: `Qwen3_5ForConditionalGeneration` (PARO checkpoints);
-`Gemma4ForConditionalGeneration` (small + PARO); auto-by-ctx at ≤8192 tokens.
+**Arch defaults**: none. `auto` is bf16 on every arch and at every context;
+K8V4 is opt-in. It was the default for `Qwen3_5ForConditionalGeneration` (PARO
+checkpoints) and `Gemma4ForConditionalGeneration` (small + PARO), and the
+per-context policy picked it at ≤8192 tokens, until both were retired.
 
 **CLI**: `--kv-quant k8v4`; or `--ctk q8_g128 --ctv tq4`.
 
@@ -956,9 +968,10 @@ the rate. Measured, not modelled — `kv_rate_tests.rs` reads the bytes
   prefill bracket), and the resident bytes of any future decode path that reads
   the store.
 
-**Arch defaults**: `Gemma3ForConditionalGeneration`;
-`Gemma4ForConditionalGeneration` (dense, hidden_size ≥ 5376); auto-by-ctx at
->32K tokens.
+**Arch defaults**: none. `auto` is bf16 on every arch and at every context;
+Planar is opt-in. It was the default for `Gemma3ForConditionalGeneration` and
+dense `Gemma4ForConditionalGeneration` (`hidden_size` ≥ 5376), and the
+per-context policy picked it above 32K tokens, until both were retired.
 
 **CLI**: `--kv-quant planar`; or `--ctk q8_g128 --ctv planar4`.
 
@@ -1054,7 +1067,9 @@ On GQA-light MoE archs (25% FA layers) Mixed K8V4 regresses by 11–28% vs
 K8V8 — the `quantize` + `quantized_matmul` overhead amortises poorly when
 most layers are not full-attention.
 
-**Arch defaults**: `Qwen3ForCausalLM` at `weight_bits=2` (Bonsai ternary).
+**Arch defaults**: none. `auto` is bf16 on every arch; Mixed is opt-in. It
+was the default for `Qwen3ForCausalLM` at `weight_bits=2` (Bonsai ternary)
+until the per-arch table was retired.
 
 **CLI**: `--kv-quant mixed_k<kb>g<kg>_v<vb>g<vg>` (e.g.
 `mixed_k8g64_v4g64`). The `RotK` variant is reached via `--ctk rot_k` (see
@@ -2021,20 +2036,35 @@ where `*` is the **Hamilton product** and `v ∈ ℝ⁴` is treated as a quatern
 The nominal codebook width never reaches the store: iso3 uses 12 of its 32
 code bits and iso4 uses 16, so **iso3 and iso4 occupy byte-identical
 storage**. At head_dim=128 that is 260 B per token per kv_head against bf16's
-256 B: **16.25 bits per value, 1.02× bf16**. The result is head_dim
-independent — at head_dim=512 it is 1028 B against 1024 B.
+256 B: **16.25 bits per value, 1.02× bf16**.
 
-Stores that keep the CPU `IsoBlocks` (the V-only `iso3` / `iso4` codecs) add a
-4×f32 quaternion per group on top, taking the same token to ≈772 B (≈48.25
-bits per value, 3.0× bf16). That sideband is the constant `FIXED_QUAT`
-replicated per group, not data — the GPU ring the K-only and symmetric codecs
-decode from does not carry it, which is why `k_iso3/4` and `iso3_sym/4_sym`
-measure ≈1.00–1.02× `none` while `iso3` / `iso4` measure ≈2.1×. Those are
-whole-cache ratios against the `none` *control*, which on the architectures
-with promoted global layers was itself a bf16/K8V8 mixture when they were
-recorded — see §"`--kv-quant none` is a bf16 control" for the per-arch
-restatement factor. The per-group figures above are the store density and are
-unaffected.
+The rate itself does move with head dim; the *sign* does not. Reading it off
+the allocation — `(D/4)·4 B` codes + `(D/4)·4 B` scales + `4 B` norm — gives
+
+```
+iso stored bits/value = 16 + 32/head_dim
+```
+
+so 16.25 at D=128, 16.125 at D=256, 16.0625 at D=512, approaching 16.0 **from
+above** and never reaching it. Two planes at 8 B per 4 values are already
+exactly bf16's density, and the per-token norm is what keeps the sum strictly
+greater at every finite head dim. This is a derivation from
+`QuantKGpuRing::alloc` (`Dtype::U32` codes, `Dtype::F32` scales and norms, one
+element each per group per token per KV head), not a measurement.
+
+The CPU `IsoBlocks` form adds a 4×f32 quaternion per group on top, taking the
+same token to ≈772 B (≈48.25 bits per value, 3.0× bf16). That sideband is the
+constant `FIXED_QUAT` replicated per group, not data, and the GPU ring the
+K-only and symmetric codecs decode from does not carry it. **That figure is
+hypothetical on a served request**: the V-only `iso3` / `iso4` codecs decode
+from the bf16 mirror, so `exit_prefill` builds them no store and they measure
+byte-identical to `none` (§"Codec disposition", Class 2). It is the rate they
+would cost the day a decode kernel reads their store. The store-reading members
+are `k_iso3/4` and `iso3_sym/4_sym`, and those measure 1.003–1.054× `none` on
+the ring layout above (§"Codec disposition", Class 3 — whole-cache ratios
+against a `none` that is a true bf16 control since the head/tail promotion
+stopped applying to it). The per-group figures above are the store density and
+are unaffected by that.
 
 **No iso codec is a memory win, at any head_dim.** 8 B per 4 values is exactly
 bf16's density before the per-token norm is added, so the packed side is
@@ -2205,7 +2235,7 @@ differences are the codebook (16 centroids vs 8) and the pack density
 |---|---|---|
 | Code bits / element | 3 | 4 |
 | Delivered bits / element, ring-resident (`k_iso*`, `*_sym`) | **16.25** (260 B/token at head\_dim=128 — see Memory truth in iso3 section) | **16.25** — byte-identical to iso3; the codebook width never reaches the store |
-| Delivered bits / element, CPU-blocks-resident (`iso3` / `iso4`) | ≈48.25 (≈772 B/token at head\_dim=128, incl. the constant quaternion sideband) | ≈48.25 — same sideband, same code word |
+| Delivered bits / element, CPU-blocks form (`iso3` / `iso4`) — **hypothetical, not resident** | ≈48.25 (≈772 B/token at head\_dim=128, incl. the constant quaternion sideband). These two codecs decode from the bf16 mirror, so `exit_prefill` builds them no store and they measure byte-identical to `none` (§"Codec disposition", Class 2); this is the rate they would cost once a kernel reads one | ≈48.25 — same sideband, same code word, same hypothetical |
 | Codebook | `lloyd_gaussian_codebook(3)` (8 centroids) | `lloyd_gaussian_codebook(4)` (16 centroids) |
 | Pack density (per u32) | 10 vals (30 bits used, 2 wasted) | 8 vals (32 bits used, 0 wasted) |
 | Rotation | Golden-ratio fixed quaternion (`FIXED_QUAT`) | Same |
@@ -2289,7 +2319,7 @@ amortises across every token in the layer.
 
 | Property | rotor3 |
 |---|---|
-| Delivered bits / element | **21.75** at head\_dim=128 (348 B/token/kv\_head vs bf16's 256 B, **1.36× bf16**), split **10.75 codes + 10.75 scales + 0.25 norm**. 43 groups cover a 128-element row, and each spends one whole `u32` code word **and** one `f32` scale for 3 real grade-1 elements. rotor3 and rotor4 therefore occupy byte-identical storage. The 3.25 bpe target reported by the Python `rotorquant` reference is gated on the grade-aware codebook follow-up (deferred — see below). **No rotor codec is a memory win at any head\_dim** — see the iso3 "Memory truth" note, `iso_and_rotor_k_codecs_are_never_a_memory_win`, and the crate-wide rate ceiling in `kv_rate_tests.rs`. |
+| Delivered bits / element | **21.75** at head\_dim=128 (348 B/token/kv\_head vs bf16's 256 B, **1.36× bf16**), split **10.75 codes + 10.75 scales + 0.25 norm**. 43 groups cover a 128-element row, and each spends one whole `u32` code word **and** one `f32` scale for 3 real grade-1 elements. rotor3 and rotor4 therefore occupy byte-identical storage. Read off the same allocation, `rotor stored bits/value = (64·⌈D/3⌉ + 32) / D` — 21.75 at D=128, 21.625 at D=256, with a floor of 64/3 = **21.33** as D grows. A derivation from `QuantKGpuRing::alloc`, not a measurement. The 3.25 bpe target reported by the Python `rotorquant` reference is gated on the grade-aware codebook follow-up (deferred — see below). **No rotor codec is a memory win at any head\_dim** — see the iso3 "Memory truth" note, `iso_and_rotor_k_codecs_are_never_a_memory_win`, and the crate-wide rate ceiling in `kv_rate_tests.rs`. |
 | Dead code budget | **5 of the 8 codes per group carry no information.** A rotor sandwich is grade-preserving, so embedding 3 values as the grade-1 part leaves the scalar, three bivector and pseudoscalar slots algebraically zero on encode; on decode the inverse sandwich keeps every non-grade-1 part out of the reconstructed vector, so quantising those slots injects no error either. 15 of the 24 code bits per group are pure waste. Pinned by `clifford_tests::sandwich_of_grade1_in_3d_stays_grade1` (encode side) and `clifford_tests::inverse_sandwich_of_non_grade1_leaks_nothing_into_grade1` (decode side). Removing them is a format + MSL-kernel change and is not scheduled; the 10.75 bits/value of `f32` scale would still dominate afterwards. |
 | Codebook | `lloyd_gaussian_codebook(3)` (8 centroids), shared across all 8 mv components (single-codebook simplification) |
 | Pack density (per u32) | 10 vals (planar3 / iso3 convention; 8 codes ≤ 30 bits per group, 1 u32 per group) |
@@ -2534,9 +2564,11 @@ and K dequant matches within 1e-3.
 
 Four variants mirror the V-side rotor3 / rotor4 codecs to the K axis. They
 add an **optional 1-bit QJL residual sideband** (Johnson–
-Lindenstrauss sketch of the post-rotor MSE residual) when
-`--rotor-qjl on` (the default). The storage format is controlled by a global
-toggle ([`rotor_qjl_enabled()`] in `rmlx-kv-quant::rotor_qjl`).
+Lindenstrauss sketch of the post-rotor MSE residual) under
+`--rotor-qjl on`, which is **not** the default — QJL has no MSL kernel, so
+enabling it moves the rotor K encode + dequant onto the CPU. The storage format
+is controlled by a global toggle ([`rotor_qjl_enabled()`] in
+`rmlx-kv-quant::rotor_qjl`), whose default is `false`.
 
 | `KvQuant` | K codec | V codec | CacheType pair (`(K, V)`) | SSD tag (QJL off / on) |
 |---|---|---|---|---|
@@ -2580,14 +2612,16 @@ siblings (K-side ≤4-bit on Qwen MoE is the PPL-disaster path). The error's
 path); the affine V codec dequants to bf16 (existing `K8V4` V path); then
 `scaled_dot_product_attention` runs.
 
-**Decode-cost caveat.** Like the iso K-side codecs, the rotor K-side codecs
-have no GPU-resident code mirror: with the default `--rotor-qjl on`, each
-decode step re-decodes the full K prefix on the CPU (and re-encodes the newly
-appended token), applies an O(head_dim²)-per-cached-token QJL score
-correction, then re-uploads the K prefix — an O(kv_seq) per-step cost that the
-short-prompt anchors mask but long-prompt decode exposes. The fused-QK fast path (which would avoid the
-per-step marshaling) is reachable only with `--rotor-qjl off` and is
-default-OFF; see the Fused-QK status below.
+**Decode-cost caveat — opt-in only.** With `--rotor-qjl on` the rotor K-side
+codecs have no GPU-resident code mirror: each decode step re-decodes the full K
+prefix on the CPU (and re-encodes the newly appended token), applies an
+O(head_dim²)-per-cached-token QJL score correction, then re-uploads the K
+prefix — an O(kv_seq) per-step cost that the short-prompt anchors mask but
+long-prompt decode exposes. That is why QJL is **off** by default: the default
+path runs the rotor K encode and `rotor_flash_decode` on Metal. The fused-QK
+fast path (which would avoid the per-step marshaling) also needs
+`--rotor-qjl off` and is separately default-OFF; see the Fused-QK status
+below.
 
 **Fused-QK status:** the 6 rotor variants (`Rotor3Sym`, `Rotor4Sym`,
 `RotorKOnly3`, `RotorKOnly4`, `RotorK3Asym`, `RotorK4Asym`) are wired into
@@ -2612,8 +2646,8 @@ generated once per layer/head on first append and persisted to the SSD block
 (`l{idx}.k.qjl_s`). The layout tag (`*_qjl`) distinguishes QJL-ON blocks
 from QJL-OFF blocks so the reader can hydrate the projection matrix.
 
-**QJL toggle.** CLI: `--rotor-qjl on|off` (default `on`). Env fallback:
-`RMLX_ROTOR_QJL=0` disables. The toggle is read per-construction (not cached)
+**QJL toggle.** CLI: `--rotor-qjl on|off` (default `off`). Env fallback:
+`RMLX_ROTOR_QJL=1` enables. The toggle is read per-construction (not cached)
 so env changes between tests still propagate.
 
 **Score-time QJL correction.** The QJL correction is
@@ -2834,22 +2868,52 @@ Approximate bytes per KV pair (`B=1, 1 layer, 1 head, D elements`). These are
 **packed-store** rates — what a codec's codes and scales occupy. They are not
 resident KV for the bf16-mirror family, which builds no store: those codecs sit
 at the `None` row, 4·D, measured byte-identical (§"Per-layer net-benefit
-decision"). The rates below are what a codec would cost once decode reads its
-store.
+decision"). Which rows are live and which are hypothetical is stated under the
+table.
 
 | Mode | K bytes/tok | V bytes/tok | Total bytes/tok |
 |---|---|---|---|
 | `None` (bf16) | 2·D | 2·D | 4·D |
 | `K8V8` | 1·D + D/128·4 | 1·D + D/128·4 | ~2.06·D |
 | `K8V4` | 1·D + D/128·4 | 0.5·D + D/32·4 | ~1.65·D |
-| `Planar` | 1·D + D/128·4 | 0.5·D + 0.5·D + D/16·4 | ~2.13·D |
+| `Planar` | 1·D + D/128·4 | 2.75·D (measured) | ~3.78·D |
 | `Mixed{k8g64,v4g64}` | 1·D + 2·D/64·4 | 0.5·D + 2·D/64·4 | ~1.75·D |
 | `K8VTurbo3` | 1·D + D/128·4 | 0.375·D + D/32·4 | ~1.51·D |
 | `K8VTurbo2` | 1·D + D/128·4 | 0.25·D + D/32·4 | ~1.38·D |
+| `k_iso3` / `k_iso4` | 2·D + 4 | 2·D (bf16) | ~4·D + 4 |
+| `iso3_sym` / `iso4_sym` | 2·D + 4 | 2·D + 4 | ~4·D + 8 |
+| `k_rotor3` / `k_rotor4` | 8·⌈D/3⌉ + 4 | 2·D (bf16) | ~4.67·D + 4 |
+| `rotor3_sym` / `rotor4_sym` | 8·⌈D/3⌉ + 4 | 8·⌈D/3⌉ + 4 | ~5.33·D + 8 |
 
-PlanarQuant V carries extra rotation state (two u32 per group of 32), which
-raises its byte cost above K8V4 despite the same 4-bit code width. The
-quality improvement compensates on dense full-attention archs.
+PlanarQuant's V row is **measured**, not a layout formula, and it is the one
+row an earlier revision of this table got wrong (`~2.13·D`, from a per-group
+sideband cadence the codec does not use). Its scale is per **pair** — one `f32`
+per 2 elements — which is 16 bits per value before a single code bit, so the
+store is **22.00 bits per value at every head_dim and at both bit widths**
+(`planar3` and `planar4` are byte-identical). That is the widest rate in the
+crate's rate gate, above rotor's 21.75, and it is why `planar3` / `planar4` /
+`planar_k4` carry a written exemption in
+`crates/rmlx-kv-quant/src/kv_rate_tests.rs` rather than a fix: a scale-cadence
+change is a format change. The quality improvement is what it buys on dense
+full-attention archs.
+
+Two groups of rows here have a decode that reads the store they describe, so
+their rates are live rather than hypothetical: the `Mixed{k8g64,v4g64}` row and
+the four ring rows (§"Codec disposition", Class 3). Every other row is a rate
+its codec would cost the day a kernel reads its store. Of all of them, only the
+four ring rows are **above** the `None` row *on rate*; `Planar` is the closest
+of the rest at 3.78·D against 4·D, i.e. a 5% saving for a 4-bit name. `Mixed` is
+below the `None` row here and still measures larger resident, because it keeps
+both bf16 seeds beside its store — a residency fact this table does not carry.
+
+Each ring side spends one `u32` code word and one `f32` scale per group
+whatever the codebook width, so the nominal
+3-/4-bit label never reaches the store: iso is `16 + 32/head_dim` bits per
+value and rotor floors at `64/3` = 21.33, both strictly above bf16's 16.0 at
+every finite head dim (§ iso3 "Memory truth", § rotor3). The rate is a property
+of the ring layout, not of the algorithms; a layout that packs its scale plane
+separately is unbuilt and is the open question § "What this disposition does not
+decide" names.
 
 ---
 
@@ -3642,7 +3706,7 @@ carry QJL, `q_seq == 1`, `b == 1`, `head_dim` is a power of two and
 `<= ROTOR_FLASH_HEAD_DIM_MAX` (512). Any miss falls through to the legacy CPU
 dequant path.
 
-**QJL.** The optional 1-bit QJL residual (`--rotor-qjl on`, the default) is a
+**QJL.** The optional 1-bit QJL residual (`--rotor-qjl on`, opt-in) is a
 per-token back-projection through a dense `[head_dim, head_dim]` matrix.
 Reproducing it in the flash inner loop would mean reading that whole matrix per
 token per threadgroup — far more bandwidth than the kernel saves — so a
@@ -4083,8 +4147,9 @@ reaches it.
 | medgemma-4B (Gemma3, D=256) | `k_rotor3` | 7.37 | **51.8** | 7.0× |
 | medgemma-4B | `k_rotor4` | 7.34 | **52.1** | 7.1× |
 
-Against the *default* (`--rotor-qjl on`) baseline the same cells move
-0.66 → 17.0 (Bonsai, 26×) and 2.35 → 51.8 (medgemma, 22×).
+Against the `--rotor-qjl on` baseline — which was the default when these cells
+were taken and is now opt-in — the same cells move 0.66 → 17.0 (Bonsai, 26×)
+and 2.35 → 51.8 (medgemma, 22×).
 
 Bonsai is a noisy measurement target at this prompt size (k_rotor4 spans
 14.0–17.1 across 5 runs); medgemma is stable to ~±3%. Treat a single Bonsai run
@@ -5118,12 +5183,14 @@ is what makes the dB interpretable. i.i.d. Gaussian fixture, 256 x 128:
 
 No shipped cell is short of its anchor by more than 0.35 bits.
 
-† **The iso rate is path-specific.** 48.25 is the CPU `IsoBlocks` figure, which
-carries a per-group quaternion sideband; it is the right number for the V-only
-`iso3` / `iso4` stores. `k_iso3/4` and `iso3_sym/4_sym` decode from a GPU ring
-that does not carry the quaternion — it is the constant `FIXED_QUAT` replicated
-per group, not data — and sit at **16.25** bits/value. See § iso3 "Memory
-truth". Read against rotor's 21.75 without that distinction the table inverts
+† **The iso rate is path-specific, and neither path is resident today.** 48.25
+is the CPU `IsoBlocks` figure, which carries a per-group quaternion sideband. It
+is the rate the V-only `iso3` / `iso4` stores *would* cost — those codecs decode
+from the bf16 mirror, so `exit_prefill` builds them no store at all and they
+measure byte-identical to `none` (§"Codec disposition", Class 2). `k_iso3/4` and
+`iso3_sym/4_sym` do build a store: a GPU ring that does not carry the quaternion
+— it is the constant `FIXED_QUAT` replicated per group, not data — and they sit
+at **16.25** bits/value. See § iso3 "Memory truth". Read against rotor's 21.75 without that distinction the table inverts
 the comparison: on the ring path iso is the cheaper of the two. Distortion is
 identical on both paths, so only the rate column is affected.
 
