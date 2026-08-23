@@ -48,10 +48,11 @@ pub enum KvQuant {
     Planar,
     /// Unquantised KV cache (bf16 / model dtype, full max_seq buffer).
     ///
-    /// Opt-in only via `--kv-quant none`
-    /// (alias `bf16`). Auto-resolver default is unchanged (still K8V8 per
-    /// this variant exists for apples-to-apples comparison against
-    /// mlx-lm's bf16-KV champion.
+    /// Selected by `--kv-quant none` (alias `bf16`) — and by `auto`, which
+    /// resolves here on every architecture and every context length
+    /// (`DEFAULT_KV_QUANT` in `rmlx-models::kv_cache`). It is also the
+    /// baseline the codecs are measured against: no codec in the tree holds
+    /// less resident KV than this one.
     ///
     /// Memory cost: one full `[B, kv_h, max_seq, head_dim]` bf16 buffer per
     /// layer for both K and V. ~64 GB at 128k context — reserve for short-ctx
@@ -413,9 +414,12 @@ pub enum KvQuant {
 /// stops covering the newest codec, which is the shape of gate this repo has
 /// shipped before.
 ///
-/// `all_kv_quants_names_every_variant_once` pins this list against
+/// `variant_index_has_one_arm_per_listed_codec` pins this list against
 /// [`KvQuant::variant_index`], a `match` the compiler checks for exhaustiveness,
-/// so a variant added to the enum and not added here fails there.
+/// so a variant added to the enum and not added here fails there. It counts
+/// that match's arms out of this file's source, because a variant missing from
+/// this list can be constructed nowhere in the crate and so is invisible to
+/// every test that sweeps it.
 pub const ALL_KV_QUANTS: &[KvQuant] = &[
     KvQuant::None,
     KvQuant::K8V4,
@@ -1412,7 +1416,10 @@ pub fn validate_mixed_side(side: char, bits: u8, group_size: u16) -> Result<(), 
     match (bits, group_size) {
         (2 | 3 | 4 | 5 | 6 | 8, 32 | 64 | 128) => Ok(()),
         _ => Err(format!(
-            "unsupported ({side}_bits={bits}, {side}_group_size={group_size}) for Mixed;              valid bits: 2, 3, 4, 5, 6, 8 (MLX affine quantize),              valid group sizes: 32, 64, 128.              For an unquantized side use --kv-quant none (bf16 K and V)."
+            "unsupported ({side}_bits={bits}, {side}_group_size={group_size}) for Mixed; \
+             valid bits: 2, 3, 4, 5, 6, 8 (MLX affine quantize), \
+             valid group sizes: 32, 64, 128. \
+             For an unquantized side use --kv-quant none (bf16 K and V)."
         )),
     }
 }
@@ -1518,16 +1525,24 @@ impl std::str::FromStr for KvQuant {
 
         // "rot_k_v<vb>g<vg>" — RotK Display form round-trip.
         if let Some(rest) = s.strip_prefix("rot_k_v") {
+            // The shape already matched, so a malformed numeric component is a
+            // bad `rot_k_*` spelling and not an unknown codec: reporting it as
+            // `Unknown` printed the whole codec list and never said which part
+            // of the tag failed.
+            let mk_err = |reason: String| KvQuantParseError::InvalidRotK {
+                input: s.to_string(),
+                reason,
+            };
             let (v_bits, v_group_size) = rest
                 .split_once('g')
-                .ok_or_else(|| KvQuantParseError::Unknown(s.to_string()))
+                .ok_or_else(|| mk_err(format!("missing 'g' separator in 'v{rest}'")))
                 .and_then(|(bits_str, group_str)| {
                     let v_bits: u8 = bits_str
                         .parse()
-                        .map_err(|_| KvQuantParseError::Unknown(s.to_string()))?;
+                        .map_err(|e| mk_err(format!("bad v_bits in 'v{rest}': {e}")))?;
                     let v_group_size: u16 = group_str
                         .parse()
-                        .map_err(|_| KvQuantParseError::Unknown(s.to_string()))?;
+                        .map_err(|e| mk_err(format!("bad v_group_size in 'v{rest}': {e}")))?;
                     Ok((v_bits, v_group_size))
                 })?;
             // RotK's V slot *is* Mixed's V slot: `KvStorage::new` builds it
@@ -1536,12 +1551,7 @@ impl std::str::FromStr for KvQuant {
             // function keeps the two from accepting different sets — the arm
             // used to accept every `u8` / `u16` pair, so `rot_k_v99g7` parsed
             // into a codec whose first encode would ask for a 99-bit quantize.
-            validate_mixed_side('v', v_bits, v_group_size).map_err(|reason| {
-                KvQuantParseError::InvalidRotK {
-                    input: s.to_string(),
-                    reason,
-                }
-            })?;
+            validate_mixed_side('v', v_bits, v_group_size).map_err(mk_err)?;
             return Ok(KvQuant::RotK {
                 v_bits,
                 v_group_size,

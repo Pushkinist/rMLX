@@ -505,13 +505,62 @@ fn kv_bits_fractional_rejects_a_group_size_the_codec_cannot_store() {
 }
 
 #[test]
+fn kv_bits_outside_the_codec_field_is_rejected_not_saturated() {
+    // `bits as u8` saturates, so 4096 would have arrived as 255 and been
+    // rejected for the right reason by accident. The screen makes the
+    // rejection the code's, not the cast rule's.
+    for bits in [-1.0f32, 256.0, 4096.0, f32::NAN, f32::INFINITY] {
+        assert!(
+            kv_bits_u8(bits).is_err(),
+            "--kv-bits {bits} does not fit the codec's u8 bit-width field"
+        );
+    }
+    for (bits, want) in [(0.0f32, 0u8), (4.0, 4), (255.0, 255)] {
+        assert_eq!(kv_bits_u8(bits).ok(), Some(want));
+    }
+}
+
+#[test]
+fn kv_bits_combo_rejects_a_group_size_that_does_not_fit_the_codec_field() {
+    // The codec field is a u16. `65664 as u16` is 128, which is a group size
+    // the validator accepts and `Display` spells back cleanly — so the wrap
+    // produced a working codec at a size nobody asked for, and every check
+    // downstream of the cast agreed with it. 65664 and 65600 are the two
+    // wraps that land on an accepted size (128 and 64); 65536 lands on 0.
+    for group_size in [65536usize, 65600, 65664] {
+        let err = parse_kv_bits_combo(8, group_size).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("65535") && msg.contains(&group_size.to_string()),
+            "--kv-group-size {group_size} should be rejected by value, not \
+             wrapped into a u16: {msg}"
+        );
+    }
+}
+
+#[test]
+fn kv_bits_fractional_rejects_a_group_size_that_does_not_fit_the_codec_field() {
+    for group_size in [65536usize, 65600, 65664] {
+        let err = parse_kv_bits_fractional(3.5, group_size).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("65535") && msg.contains(&group_size.to_string()),
+            "--kv-group-size {group_size} should be rejected by value, not \
+             wrapped into a u16: {msg}"
+        );
+    }
+}
+
+#[test]
 fn kv_bits_combo_never_builds_a_codec_from_str_rejects() {
     // The invariant behind the two rejections above, swept rather than
     // sampled: whatever the alias flags accept must be spellable back through
     // the parser that owns the codec set, or the two disagree about which
     // codecs exist.
     for bits in 0u8..=16 {
-        for group_size in [0usize, 1, 17, 31, 32, 63, 64, 100, 128, 256] {
+        for group_size in [
+            0usize, 1, 17, 31, 32, 63, 64, 100, 128, 256, 65536, 65600, 65664,
+        ] {
             let Ok(kq) = parse_kv_bits_combo(bits, group_size) else {
                 continue;
             };
@@ -530,7 +579,9 @@ fn kv_bits_combo_never_builds_a_codec_from_str_rejects() {
 fn kv_bits_fractional_never_builds_a_codec_from_str_rejects() {
     for half in 0u8..=16 {
         let bits = f32::from(half) + 0.5;
-        for group_size in [0usize, 1, 17, 31, 32, 63, 64, 100, 128, 256] {
+        for group_size in [
+            0usize, 1, 17, 31, 32, 63, 64, 100, 128, 256, 65536, 65600, 65664,
+        ] {
             let Ok(kq) = parse_kv_bits_fractional(bits, group_size) else {
                 continue;
             };
