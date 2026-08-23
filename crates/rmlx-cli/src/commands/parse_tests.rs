@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 use super::*;
 use rmlx_models::kv_cache::{CacheType, CacheTypeSpec};
 
@@ -474,5 +476,71 @@ fn without_paged_kv_the_codec_is_never_second_guessed() {
             None,
             "the guard fired without --paged-kv for {resolved:?}"
         );
+    }
+}
+
+// ── --kv-bits / --kv-group-size are the same set --kv-quant is ───────────
+
+#[test]
+fn kv_bits_combo_rejects_a_group_size_the_codec_cannot_store() {
+    // `--kv-bits 4 --kv-group-size 17` used to build Mixed{k8g64_v4g17}: a
+    // shape `KvQuant::from_str` rejects, so the flag pair could construct a
+    // codec the codec's own parser refuses to spell.
+    let err = parse_kv_bits_combo(4, 17).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("v_group_size=17"),
+        "error should name the rejected group size: {msg}"
+    );
+}
+
+#[test]
+fn kv_bits_fractional_rejects_a_group_size_the_codec_cannot_store() {
+    let err = parse_kv_bits_fractional(3.5, 17).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("group_size=17"),
+        "error should name the rejected group size: {msg}"
+    );
+}
+
+#[test]
+fn kv_bits_combo_never_builds_a_codec_from_str_rejects() {
+    // The invariant behind the two rejections above, swept rather than
+    // sampled: whatever the alias flags accept must be spellable back through
+    // the parser that owns the codec set, or the two disagree about which
+    // codecs exist.
+    for bits in 0u8..=16 {
+        for group_size in [0usize, 1, 17, 31, 32, 63, 64, 100, 128, 256] {
+            let Ok(kq) = parse_kv_bits_combo(bits, group_size) else {
+                continue;
+            };
+            let spelled = kq.to_string();
+            assert_eq!(
+                rmlx_kv_quant::KvQuant::from_str(&spelled).ok(),
+                Some(kq),
+                "--kv-bits {bits} --kv-group-size {group_size} built {spelled}, \
+                 which --kv-quant does not accept"
+            );
+        }
+    }
+}
+
+#[test]
+fn kv_bits_fractional_never_builds_a_codec_from_str_rejects() {
+    for half in 0u8..=16 {
+        let bits = f32::from(half) + 0.5;
+        for group_size in [0usize, 1, 17, 31, 32, 63, 64, 100, 128, 256] {
+            let Ok(kq) = parse_kv_bits_fractional(bits, group_size) else {
+                continue;
+            };
+            let spelled = kq.to_string();
+            assert_eq!(
+                rmlx_kv_quant::KvQuant::from_str(&spelled).ok(),
+                Some(kq),
+                "--kv-bits {bits} --kv-group-size {group_size} built {spelled}, \
+                 which --kv-quant does not accept"
+            );
+        }
     }
 }

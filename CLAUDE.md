@@ -310,6 +310,7 @@ hand — keeps the CI gate and the local gate identical.
 | `make ci` | `fmt-check + lint + test + deny + audit` — pre-merge gate. |
 | `make ci-perf` | `test-perf` under `release-perf` + the serialized GPU/Metal suite. Requires an idle GPU. Run before merging perf-sensitive or codec-layer changes (~21 min). |
 | `make check-kv-layer-quants` | CI gate (in `make ci`): the per-layer KV codec vector has one producer (`kv_layer_quants`) — no second `kv_quant_for_layer` loop, and every per-layer cache stack either uses it or declares itself uniform. |
+| `make check-kv-codec-disposition` | CI gate (in `make ci`): the `--kv-quant` / `--kv-bits` help and the `docs/KV_QUANT.md` INERT banners agree with each codec's runtime disposition, derived from `ALL_KV_QUANTS` + `decode_reads_packed_store` / `feeds_bf16_{k,v}_at_decode`. |
 | `make check-eval-lock` | CI gate (in `make ci`): every MLX eval FFI call is made under the process-wide evaluation lock (25-symbol reach-set). |
 | `make check-eval-lock-fixtures` | CI gate (in `make ci`): recall test for the above, 26 synthetic scan roots, each asserting which rule fired. |
 | `make eval-lock-stress` | Drive the evaluation-lock reproducer across `RUNS` fresh processes (default 60). Not in `make ci` — probabilistic (~8%/run) and costs ~412 threads. |

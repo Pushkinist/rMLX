@@ -25,6 +25,7 @@ Conventions:
 | `check_kernel_dtype_contract.sh` | A custom-Metal-kernel dispatcher returns the caller's dtype, not the kernel's working precision. |
 | `check_kernel_dtype_contract_fixtures.sh` | Recall test for the above. |
 | `check_kv_layer_quants.sh` | The per-layer KV codec vector has one producer; every per-layer cache stack uses it or declares itself uniform. |
+| `check_kv_codec_disposition.sh` | The `--kv-quant` / `--kv-bits` help and every `docs/KV_QUANT.md` INERT banner agree with the codec's runtime disposition, derived from `ALL_KV_QUANTS` + the three decode predicates. |
 | `check_metal_compiles.sh` | Every `.metal` kernel compiles natively at `-std=metal3.0` and `-std=metal4.0`, and is named by its `probes/kernels.manifest`. |
 | `check_metal_format.sh` | Every `.metal` file is formatted. |
 | `check_no_decode_swallow.sh` | A failed decode step or failed sampler call cannot be swallowed into a silent success. |

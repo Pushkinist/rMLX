@@ -171,29 +171,97 @@ Qwen MoE (PPL disaster path). --kv-preset speed resolves to TurboSym3 (symmetric
 also rejected on Qwen MoE (K-side 3-bit PPL disaster). \
 See docs/KV_QUANT.md sections \"Preset semantics\" and \"Codec disposition\".";
 
+/// Short help for `--kv-quant`, shared by every subcommand that takes it.
+///
+/// Names no codec on purpose — a name in a one-line help cannot carry its
+/// disposition, and three of the four this line used to name do nothing.
+const KV_QUANT_HELP: &str = "\
+KV cache quantization codec. Default \"auto\" = unquantised bf16 on every arch. \
+No codec in the tree holds less resident KV than bf16 — see --help.";
+
+/// Long-help for `--kv-quant`, shared by every subcommand that takes it.
+///
+/// The codec lists here are checked against the runtime classifiers by
+/// `make check-kv-codec-disposition`: a name in the INERT block that starts
+/// reading its own packed store, or an inert name listed anywhere else, fails
+/// the build.
+const KV_QUANT_LONG_HELP: &str = "\
+KV cache quantization codec. Default \"auto\", which resolves to unquantised
+bf16 (\"bf16\", alias \"none\") on every architecture and every context length.
+
+NO CODEC BELOW HOLDS LESS RESIDENT KV THAN bf16. bf16 is the smallest cache
+measured. Every codec that quantises something a served request touches measures
+LARGER than it, and the rest do not execute at all. Pick a name for what its
+decode does, not to save memory.
+
+Mutually exclusive with `--kv-preset`, `--cache-type-k`, `--cache-type-v`,
+and `--kv-bits`.
+
+  bf16 (alias none; what auto resolves to)
+      Unquantised bf16 K and V. The baseline, and the smallest resident KV.
+
+  INERT — accepted, but does nothing:
+      k8v4, k8v8, planar, planar3, planar_k, k8vturbo2, k8vturbo2tcq,
+      k8vturbo3, k8vturbo3tcq, tsym3, tsym4, iso3, iso4, rotor3, rotor4,
+      rotor_k_3_asym_v<vb>_g<vg>, rotor_k_4_asym_v<vb>_g<vg>.
+      Decode reads the bf16 mirror on both axes, so the packed store is never
+      built and the codec math never runs. Resident KV and generated tokens
+      measure identical to bf16, on two architectures at two contexts; decode
+      throughput against it is INCONCLUSIVE, so selecting one is not known to
+      cost anything either. It simply does not do what the name says.
+
+  Runs its codec — and measures LARGER than bf16:
+      mixed_k<kb>g<kg>_v<vb>g<vg>, rot_k_v<vb>g<vg>, iso3_sym, iso4_sym,
+      k_iso3, k_iso4, rotor3_sym, rotor4_sym, k_rotor3, k_rotor4.
+      These decode over their own packed store. Resident KV against bf16:
+      k_iso3/k_iso4 1.00x-1.03x, iso3_sym/iso4_sym 1.01x-1.05x,
+      k_rotor3/k_rotor4 1.13x-1.17x, rotor3_sym/rotor4_sym 1.26x-1.33x,
+      mixed 1.29x-1.40x, rot_k 1.38x-1.54x.
+
+Per-codec detail and the measurements behind these numbers: docs/KV_QUANT.md,
+section \"Codec disposition — what every codec in the tree is for\".";
+
 /// Long-help for `--kv-bits`. Mirrors mlx-lm's `kv_bits` / `kv_group_size` ergonomics.
+///
+/// Same disposition gate as [`KV_QUANT_LONG_HELP`] — the codec names here are
+/// checked against the runtime classifiers, in both directions.
 const KV_BITS_LONG_HELP: &str = "\
 Bit-width alias for KV cache quantization (mlx-lm ergonomics).
 Accepts integer or fractional values (e.g. 3, 4, 3.5, 4.5).
 
-Mutually exclusive with `--kv-quant`, `--cache-type-k`, and `--cache-type-v`.
-Pass `--kv-bits` + optionally `--kv-group-size` instead of a preset string.
+Mutually exclusive with `--kv-quant`, `--kv-preset`, `--cache-type-k`, and
+`--cache-type-v`. Pass `--kv-bits` + optionally `--kv-group-size` instead of a
+preset string.
+
+THIS FLAG DOES NOT SHRINK THE KV CACHE. Every value except (8, 128) resolves to
+the mixed_* codec, which keeps a full bf16 K and V mirror beside its packed
+store and so measures 1.287x-1.396x LARGER resident KV than plain bf16 (two
+architectures, two contexts). The single exception is not smaller either:
+
+  INERT — accepted, but does nothing:
+      k8v8, which is what (8, 128) resolves to.
+      Decode reads the bf16 mirror on both axes, so its packed store is never
+      built: resident KV and generated tokens measure identical to bf16.
+
+For the smallest measured KV cache, pass `--kv-quant none`.
 
 Integer mapping:
-  --kv-bits 8 --kv-group-size 128  → K8V8 (rMLX MSL q8_0, both sides)
-  --kv-bits 4 --kv-group-size 64   → Mixed(K=8/g=64, V=4/g=64)  [mlx-lm default]
-  --kv-bits 4 --kv-group-size 32   → Mixed(K=8/g=64, V=4/g=32)
-  --kv-bits 3 --kv-group-size 64   → Mixed(K=8/g=64, V=3/g=64)
-  other (bits, group_size)          → Mixed(K=8/g=64, V=bits/g=group_size)
+  --kv-bits 8 --kv-group-size 128  → k8v8 (see INERT above)
+  --kv-bits 4 --kv-group-size 64   → mixed_k8g64_v4g64  [mlx-lm default]
+  --kv-bits 4 --kv-group-size 32   → mixed_k8g64_v4g32
+  --kv-bits 3 --kv-group-size 64   → mixed_k8g64_v3g64
+  other (bits, group_size)         → mixed_k8g64_v<bits>g<group_size>
 
-Fractional mapping (TurboQuant asymmetric K-floor/V-ceil):
-  --kv-bits 3.5 --kv-group-size 64 → Mixed(K=3/g=64, V=4/g=64)
-  --kv-bits 4.5 --kv-group-size 64 → Mixed(K=4/g=64, V=5/g=64)
+Fractional mapping (MLX affine, K=floor / V=ceil — not TurboQuant):
+  --kv-bits 3.5 --kv-group-size 64 → mixed_k3g64_v4g64
+  --kv-bits 4.5 --kv-group-size 64 → mixed_k4g64_v5g64
   Fractional bits: K=floor(bits), V=ceil(bits), both sides use group_size.
 
 K always defaults to 8-bit / group=64 for integer values (mlx-lm K=8 convention).
 When --kv-group-size is omitted, group_size defaults to 64.
-Valid bits: 3, 4, 5, 6, 8 (and fractions between supported integers).";
+Valid bits: 2, 3, 4, 5, 6, 8 for integers, 3..8 for the floor and ceil of a
+fraction. Valid group sizes: 32, 64, 128 — the set the MLX affine
+quantizer implements. Anything else is a parse error, not a mode.";
 
 #[derive(Parser, Debug)]
 #[command(name = "rmlx", version, about = "Rust-native MLX inference server")]
@@ -386,10 +454,7 @@ enum Cmd {
         /// timeout on long prompts. Use --device cpu to fall back to CPU.
         #[arg(long)]
         device: Option<String>,
-        /// KV cache quantization: "auto", "bf16" (alias "none"), "k8v4",
-        /// "k8v8", or "planar". Default is "auto", which is unquantised bf16 on
-        /// every architecture and every context length.
-        #[arg(long)]
+        #[arg(long, help = KV_QUANT_HELP, long_help = KV_QUANT_LONG_HELP)]
         kv_quant: Option<String>,
         /// Named KV-cache preset (see long-help). Mutually exclusive with
         /// `--kv-quant`, `--cache-type-k`, `--cache-type-v`, and `--kv-bits`.
@@ -775,8 +840,12 @@ enum Cmd {
         /// Defaults to "gpu". Chunked prefill (Stage-3.2b) resolves the Metal watchdog timeout.
         #[arg(long, default_value = "gpu")]
         device: String,
-        /// KV cache quantization: "auto" (unquantised bf16, every arch), "bf16" (alias "none"), "k8v4", "k8v8", or "planar".
-        #[arg(long, default_value = "auto")]
+        #[arg(
+            long,
+            default_value = "auto",
+            help = KV_QUANT_HELP,
+            long_help = KV_QUANT_LONG_HELP
+        )]
         kv_quant: String,
         /// Named KV-cache preset (see long-help). Mutually exclusive with
         /// `--kv-quant`, `--cache-type-k`, `--cache-type-v`, and `--kv-bits`.
@@ -891,8 +960,12 @@ enum Cmd {
         /// 5 = unsupported (architecture not handled). Exit 2 is reserved by clap.
         #[arg(long, default_value_t = false)]
         probe_smoke: bool,
-        /// KV cache quantization: "auto" (unquantised bf16, every arch), "bf16" (alias "none"), "k8v4", "k8v8", or "planar".
-        #[arg(long, default_value = "auto")]
+        #[arg(
+            long,
+            default_value = "auto",
+            help = KV_QUANT_HELP,
+            long_help = KV_QUANT_LONG_HELP
+        )]
         kv_quant: String,
         /// Named KV-cache preset (see long-help). Mutually exclusive with
         /// `--kv-quant`, `--cache-type-k`, `--cache-type-v`, and `--kv-bits`.
@@ -1013,8 +1086,12 @@ enum Cmd {
         /// Written to the `prompt` column of baseline.csv.
         #[arg(long, default_value = "")]
         prompt_label: String,
-        /// KV cache quantization: "auto" (unquantised bf16, every arch), "bf16" (alias "none"), "k8v4", "k8v8", or "planar".
-        #[arg(long, default_value = "auto")]
+        #[arg(
+            long,
+            default_value = "auto",
+            help = KV_QUANT_HELP,
+            long_help = KV_QUANT_LONG_HELP
+        )]
         kv_quant: String,
         /// Named KV-cache preset (see long-help). Mutually exclusive with
         /// `--kv-quant`, `--cache-type-k`, `--cache-type-v`, and `--kv-bits`.
@@ -1182,9 +1259,12 @@ enum Cmd {
         /// Discarded warmup runs before the measured ones.
         #[arg(long, default_value_t = 1)]
         warmup: u32,
-        /// KV cache quantization: "auto" (unquantised bf16, every arch), "bf16" (unquantised
-        /// cache; alias "none"), "k8v4", "k8v8", "planar", ...
-        #[arg(long, default_value = "auto")]
+        #[arg(
+            long,
+            default_value = "auto",
+            help = KV_QUANT_HELP,
+            long_help = KV_QUANT_LONG_HELP
+        )]
         kv_quant: String,
         /// Named KV-cache preset (see `rmlx baseline --help` long-help).
         /// Mutually exclusive with `--kv-quant`, `--cache-type-k`,

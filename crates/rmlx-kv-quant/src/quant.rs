@@ -94,8 +94,9 @@ pub enum KvQuant {
     /// hard rule 6). Opt-in **only** via `--ctk rot_k`; never an auto default.
     RotK {
         /// V quantization bit-width (K is always 8-bit rotated affine).
+        /// Validated by [`validate_mixed_side`] — the V slot is `Mixed`'s.
         v_bits: u8,
-        /// V affine group size.
+        /// V affine group size. Validated by [`validate_mixed_side`].
         v_group_size: u16,
     },
     /// K = affine q8_0 (group_size=128),
@@ -1349,6 +1350,16 @@ pub enum KvQuantParseError {
         /// Why the V codec spec failed to validate.
         reason: String,
     },
+    /// The `rot_k_v*g*` shape matched but a numeric component failed to parse
+    /// or the (`v_bits`, `v_group_size`) tuple is not one the MLX affine
+    /// quantizer implements.
+    #[error("invalid RotK KvQuant '{input}': {reason}")]
+    InvalidRotK {
+        /// The raw input string that triggered the parse attempt.
+        input: String,
+        /// Why the V codec spec failed to validate.
+        reason: String,
+    },
 }
 
 /// Validate that `(v_bits, v_group_size)` matches one of the supported V codecs
@@ -1393,8 +1404,10 @@ pub fn validate_rotor_k_asym_v(v_bits: u8, v_group_size: u16) -> Result<(), Stri
 /// quality floor among them) while still packing 16-bit affine codes at
 /// runtime. A width the codec cannot store is a parse error, not a mode.
 ///
-/// The sibling parametric family validates the same way
-/// ([`validate_rotor_k_asym_v`]); this is the missing half of that pair.
+/// [`KvQuant::RotK`] shares this validator, not a second table: its store *is*
+/// `Mixed` storage (`MixedKvState::new_rotated`), so its V slot reaches the same
+/// quantizer and must accept the same set. The other parametric family has its
+/// own codec and so its own check ([`validate_rotor_k_asym_v`]).
 pub fn validate_mixed_side(side: char, bits: u8, group_size: u16) -> Result<(), String> {
     match (bits, group_size) {
         (2 | 3 | 4 | 5 | 6 | 8, 32 | 64 | 128) => Ok(()),
@@ -1517,6 +1530,18 @@ impl std::str::FromStr for KvQuant {
                         .map_err(|_| KvQuantParseError::Unknown(s.to_string()))?;
                     Ok((v_bits, v_group_size))
                 })?;
+            // RotK's V slot *is* Mixed's V slot: `KvStorage::new` builds it
+            // with `MixedKvState::new_rotated`, which hands (bits, group_size)
+            // to the same MLX affine quantizer. Validating it with the same
+            // function keeps the two from accepting different sets — the arm
+            // used to accept every `u8` / `u16` pair, so `rot_k_v99g7` parsed
+            // into a codec whose first encode would ask for a 99-bit quantize.
+            validate_mixed_side('v', v_bits, v_group_size).map_err(|reason| {
+                KvQuantParseError::InvalidRotK {
+                    input: s.to_string(),
+                    reason,
+                }
+            })?;
             return Ok(KvQuant::RotK {
                 v_bits,
                 v_group_size,
