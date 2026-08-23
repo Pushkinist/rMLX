@@ -248,8 +248,7 @@ pub struct KvLayerShape {
 }
 
 /// Emit one structured `warn!` when the resolved KV codec is estimated to
-/// **increase** resident KV versus plain bf16 on the active layer mix
-/// (issue #34).
+/// **increase** resident KV versus plain bf16 on the active layer mix.
 ///
 /// Why this can happen, generally: a quantized codec can keep a warm-TTFT bf16
 /// decode seed (`decode_fp16_k/v`) alongside its packed codes and per-group
@@ -279,14 +278,14 @@ pub struct KvLayerShape {
 /// hold (the resolved `--max-ctx` ceiling or the prompt length — either is a
 /// fine estimate for the sign of the saving).
 ///
-/// The emitted byte count is named `est_extra_bytes_upper_bound` and not
-/// `est_extra_bytes` on purpose. `KvQuant::estimated_resident_bytes_per_layer`
-/// sizes an iso group from the CPU-block layout — codes, scale, a 4xf32
-/// quaternion and a norm — while the ring the `k_iso*` / `iso*_sym` codecs
-/// decode from carries no quaternion, so the figure runs ~3x high for exactly
-/// the codecs this warning most often fires on. Only the sign is exact, and the
-/// sign is what the warning is for; a reader must not size a buffer from the
-/// number.
+/// The emitted byte count is an estimate on both sides of the true figure, so
+/// read the sign and not the magnitude. `KvQuant::estimated_resident_bytes_per_layer`
+/// over-charges the affine and q8_0 sidebands (it models one f32 per 32 values
+/// for stores whose cadence is one per 64 or 128), and under-reports an iso
+/// codec over the window between `exit_prefill`, which bulk-encodes into CPU
+/// blocks 2.97x the GPU ring, and the first fused decode step that drops them.
+/// The sign is what the warning is for; a reader must not size a buffer from
+/// the number.
 pub fn warn_if_kv_codec_net_negative(quant: KvQuant, layers: &[KvLayerShape], eff_seq: u64) {
     let (total_saving, n_global, n_windowed) = kv_codec_net_saving_total(quant, layers, eff_seq);
     if total_saving < 0 {
@@ -295,8 +294,8 @@ pub fn warn_if_kv_codec_net_negative(quant: KvQuant, layers: &[KvLayerShape], ef
             eff_seq,
             n_global,
             n_windowed,
-            est_extra_bytes_upper_bound = -total_saving,
-            "KV codec increases resident KV vs bf16 on this layer mix — the per-global-layer warm-TTFT bf16 seed plus codec scales exceed the bytes saved at this context; windowed layers already run bf16 and are unaffected. The byte figure is an UPPER BOUND, not an estimate: the iso arm of the estimator sizes a group from the CPU-block layout, which carries a per-group quaternion the GPU ring the iso codecs actually decode from does not, so for those codecs it overstates by roughly 3x. The sign is exact either way. Consider --kv-quant none if memory is the goal."
+            est_extra_bytes = -total_saving,
+            "KV codec increases resident KV vs bf16 on this layer mix — the per-global-layer warm-TTFT bf16 seed plus codec scales exceed the bytes saved at this context; windowed layers already run bf16 and are unaffected. Read the sign, not the magnitude: the estimator over-charges the affine and q8_0 per-group sidebands, and under-reports an iso codec until its fused decode path drops the CPU blocks the prefill encode built. Consider --kv-quant none if memory is the goal."
         );
     }
 }
