@@ -153,7 +153,7 @@ fn rotk_cli_form_parses() {
     assert_eq!(q.to_string(), "rot_k_v4g64");
 }
 
-/// Issue #26: `cache_key_salt` must be collision-free across distinct codecs so
+/// `cache_key_salt` must be collision-free across distinct codecs so
 /// the codec-partitioned prompt-cache key never conflates two codecs. Two
 /// distinct `KvQuant` values (including payload-bearing variants that differ
 /// only by bit-width / group size) must produce distinct salts; the same value
@@ -223,7 +223,7 @@ fn cache_key_salt_is_unique_and_deterministic() {
     assert_ne!(m1.cache_key_salt(), m2.cache_key_salt());
 }
 
-// ── Issue #34: per-layer net-benefit estimator ────────────────────────────────
+// ── Per-layer net-benefit estimator ───────────────────────────────────────────
 
 /// A windowed layer always runs the bf16 rotating ring regardless of the codec
 /// flag, so the estimated net saving is exactly 0 (codec is a no-op there).
@@ -389,6 +389,17 @@ fn none_codec_zero_saving_vs_itself() {
 /// (codes + scales + sidebands), not just nominal code bits — otherwise the
 /// net-negative warn lies for sideband-heavy families (iso quaternions,
 /// rotor group-3 scale cadence).
+///
+/// The iso anchor is the **ring** payload, not the CPU encode's full output.
+/// Both forms exist, and which one is resident is not a matter of taste: the
+/// four iso codecs that materialise a store (`k_iso3/4`, `iso3_sym/4_sym`) all
+/// decode through a fused kernel that reads the GPU ring, and their append
+/// drops the CPU blocks the moment the ring is live
+/// (`drop_blocks_when_ring_live_iso_*`). The quaternion the CPU blocks carry is
+/// the constant `FIXED_QUAT` replicated per group and never reaches the ring.
+/// So the ring is what a served request holds, and the block form — asserted
+/// below at its measured 2.97x — is what the same store holds only between
+/// `exit_prefill` and the first fused decode step.
 #[test]
 fn estimator_matches_actual_iso_rotor_encode_bytes() {
     let head_dim = 128usize;
@@ -399,35 +410,44 @@ fn estimator_matches_actual_iso_rotor_encode_bytes() {
         .map(|i| ((i % 251) as f32) / 251.0 - 0.5)
         .collect();
 
-    // iso3: actual stored bytes per side (codes + scales + quaternions + norms).
+    // iso3: the ring holds codes (u32) + scales (f32) + one norm (f32) per
+    // token. `iso_encode_fast` also returns the per-group quaternion, which
+    // `QuantKGpuRing::alloc` has no buffer for.
     let (codes, scales, quats, norms) =
         crate::isoquant::iso_encode_fast(&v, head_dim, 4, 3).unwrap();
-    let iso_side_actual = 4 * (codes.len() + scales.len() + quats.len() + norms.len()) as u64;
+    let iso_ring_actual = 4 * (codes.len() + scales.len() + norms.len()) as u64;
+    let iso_blocks_actual = iso_ring_actual + 4 * quats.len() as u64;
+
+    // The two forms differ by the quaternion sideband alone. Pinned so the
+    // choice above stays a choice a reader can check rather than a claim.
+    let block_ratio = iso_blocks_actual as f64 / iso_ring_actual as f64;
+    assert!(
+        (block_ratio - 2.969).abs() < 0.01,
+        "iso CPU blocks must be 2.97x the ring at head_dim=128, got {block_ratio}"
+    );
 
     // Iso3Sym quantizes BOTH sides with the iso codec and — like Rotor3Sym —
     // retains **no** bf16 seed on either: its decode is the quant-V flash kernel
-    // over both packed iso rings, so estimate = 2*side with no seed term. (The
-    // estimator still counts the quaternion sideband, matching the CPU encode
-    // bytes; the resident ring drops it, so real residency is below this — the
-    // estimate is a conservative upper bound, not a census.)
+    // over both packed iso rings, so estimate = 2*side with no seed term.
     let elems = seq * head_dim as u64 * kv_heads;
     let seed = elems * 2;
     let est = KvQuant::Iso3Sym.estimated_resident_bytes_per_layer(seq, head_dim as u64, kv_heads);
-    let expected = 2 * iso_side_actual;
-    let tol = expected / 10; // ±10%
-    assert!(
-        est.abs_diff(expected) <= tol,
-        "Iso3Sym estimate {est} not within 10% of actual {expected}"
+    let expected = 2 * iso_ring_actual;
+    assert_eq!(
+        est, expected,
+        "Iso3Sym estimate {est} must be exactly the two ring payloads {expected}"
     );
     // The seedless estimate must be strictly below the seeded sibling's — the
     // point of the fused path.
     assert!(
-        est < 2 * (iso_side_actual + seed),
+        est < 2 * (iso_ring_actual + seed),
         "Iso3Sym must not carry a bf16 mirror: {est} should be below the seeded {}",
-        2 * (iso_side_actual + seed)
+        2 * (iso_ring_actual + seed)
     );
 
-    // rotor3: per-token = n_groups*(code u32 + scale f32) + norm f32.
+    // rotor3: per-token = n_groups*(code u32 + scale f32) + norm f32. The rotor
+    // ring and the rotor CPU blocks carry the same payload — rotor has no
+    // quaternion analogue — so one anchor covers both forms.
     let n_groups = head_dim.div_ceil(crate::rotorquant::ROTOR3_GROUP_SIZE);
     let rotors = vec![0.5f32; n_groups * 4];
     let (r_codes, r_scales, r_norms) =
@@ -435,15 +455,14 @@ fn estimator_matches_actual_iso_rotor_encode_bytes() {
     let rotor_side_actual = 4 * (r_codes.len() + r_scales.len() + r_norms.len()) as u64;
     let est_r =
         KvQuant::Rotor3Sym.estimated_resident_bytes_per_layer(seq, head_dim as u64, kv_heads);
-    // Rotor3Sym quantizes BOTH sides and — unlike Iso3Sym — retains **no** bf16
+    // Rotor3Sym quantizes BOTH sides and — like Iso3Sym — retains **no** bf16
     // seed on either: its decode is a flash kernel over the two packed rings, so
     // estimate = 2*side with no seed term. This is the codec's whole memory
     // claim; if a seed ever creeps back the estimate and this test move together.
     let expected_r = 2 * rotor_side_actual;
-    let tol_r = expected_r / 10;
-    assert!(
-        est_r.abs_diff(expected_r) <= tol_r,
-        "Rotor3Sym estimate {est_r} not within 10% of actual {expected_r}"
+    assert_eq!(
+        est_r, expected_r,
+        "Rotor3Sym estimate {est_r} must be exactly the two ring payloads {expected_r}"
     );
     // The seedless estimate must be strictly below the seeded sibling's — the
     // point of the fused path. Same codec shape, same bit width, so the gap is
@@ -454,7 +473,9 @@ fn estimator_matches_actual_iso_rotor_encode_bytes() {
         2 * (rotor_side_actual + seed)
     );
 
-    // Net-saving must now be NEGATIVE for iso at head_dim=128.
+    // Net-saving must still be NEGATIVE for iso at head_dim=128: the ring is
+    // 16.25 bits per value against bf16's 16.0, so dropping the quaternion
+    // narrows the gap without closing it.
     let saving =
         KvQuant::Iso3Sym.estimated_net_saving_per_layer(seq, head_dim as u64, kv_heads, false);
     assert!(
@@ -1156,4 +1177,405 @@ fn emit_kv_codec_disposition_manifest() {
          the other"
     );
     println!("KVQUANT-DISPOSITION-END\t{n}");
+}
+
+// ── Store-cadence gate: the byte model against the real allocation ────────────
+//
+// `KvQuant::estimated_resident_bytes_per_layer` is the instrument the
+// resolve-time net-benefit warn reads, and `scripts/perf_ceiling.py` mirrors it.
+// A cadence that drifts from the store it models does not fail anything on its
+// own — it just reports a saving the store never delivers. These tests close
+// that by measuring each store's bytes from its own encoder over one shared
+// fixture and holding the model to the result.
+
+/// Fixture geometry. `head_dim = 128` is the shipped test-target head dimension
+/// and the one every published rate figure quotes; a group-bound store's rate
+/// depends on it, so a rate quoted without one is not a number.
+const CADENCE_HEAD_DIM: u64 = 128;
+const CADENCE_KV_HEADS: u64 = 4;
+const CADENCE_SEQ: u64 = 64;
+const CADENCE_ROWS: usize = (CADENCE_SEQ * CADENCE_KV_HEADS) as usize;
+const CADENCE_VALUES: usize = CADENCE_ROWS * CADENCE_HEAD_DIM as usize;
+const CADENCE_SHAPE: [i32; 4] = [1, 1, CADENCE_ROWS as i32, CADENCE_HEAD_DIM as i32];
+
+fn cadence_fixture() -> Vec<f32> {
+    (0..CADENCE_VALUES)
+        .map(|i| ((i % 251) as f32) / 251.0 - 0.5)
+        .collect()
+}
+
+/// The store one axis of a codec actually writes.
+///
+/// Named per codec by [`codec_side_layouts`] and measured by
+/// [`measured_side_bytes`] from that store's own encoder — never from a table
+/// of expected rates, which is a number that agrees with itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StoreLayout {
+    /// No packed store on this axis: one buffer at model dtype.
+    Bf16,
+    /// `QuantK` — affine q8_0, group 128.
+    Q8,
+    /// `QuantV` — TurboQuant Lloyd-Max at `bits`, group 32.
+    Turbo(u8),
+    /// `QuantV` with Viterbi assignment; decoder and layout identical to
+    /// [`StoreLayout::Turbo`] at the same width.
+    Tcq(u8),
+    /// `QuantPlanarK` / `QuantPlanarV` — Givens rotation, per-pair scales.
+    Planar(u8),
+    /// IsoQuant on `QuantKGpuRing`: codes, scales, per-token norms. The
+    /// resident form for every iso codec that materialises a store.
+    IsoRing(u8),
+    /// IsoQuant in CPU `IsoBlocks`: the ring plus a per-group quaternion.
+    IsoBlocks(u8),
+    /// RotorQuant — one code word and one scale per 3-element group. Ring and
+    /// CPU blocks carry the same payload, so one layout covers both.
+    Rotor(u8),
+    /// MLX affine 3-tuple (`Mixed` / `RotK`).
+    ///
+    /// The one row that is **not** measured: this crate has no CPU affine
+    /// encoder, so the bytes are read off the allocation in
+    /// `mixed_quant::state::init_quant` — `bits` code bits per value plus a
+    /// scale AND a bias per `group`, both at the input dtype, which is bf16 on
+    /// every shipped model. A change to that allocation that nobody mirrors
+    /// here is the one drift this gate cannot see; it is review's job, and
+    /// `kv_rate_tests.rs` carries the same limitation for the same reason.
+    Affine { bits: u32, group: u32 },
+}
+
+/// Bytes this store holds for the fixture.
+#[allow(
+    clippy::unwrap_used,
+    reason = "every encoder here is called on the fixture with a shape and width it validates; a failure is a broken encoder and the panic names it"
+)]
+fn measured_side_bytes(layout: StoreLayout, data: &[f32]) -> u64 {
+    let elems = CADENCE_VALUES as u64;
+    let head_dim = CADENCE_HEAD_DIM as usize;
+    match layout {
+        StoreLayout::Bf16 => elems * 2,
+        StoreLayout::Q8 => {
+            let (codes, scales) = crate::q8::q8_quantize(data);
+            (codes.len() + 4 * scales.len()) as u64
+        }
+        StoreLayout::Turbo(bits) => crate::turboquant::turbo_quantize_v(data, bits, &CADENCE_SHAPE)
+            .unwrap()
+            .byte_size(),
+        StoreLayout::Tcq(bits) => if bits == 2 {
+            crate::tcq::tcq_quantize_v2(data, &CADENCE_SHAPE).unwrap()
+        } else {
+            crate::tcq::tcq_quantize_v3(data, &CADENCE_SHAPE).unwrap()
+        }
+        .byte_size(),
+        StoreLayout::Planar(bits) => crate::planarquant::planar_quantize(
+            data,
+            crate::turboquant::GROUP_SIZE,
+            bits,
+            &CADENCE_SHAPE,
+        )
+        .unwrap()
+        .byte_size(),
+        StoreLayout::IsoRing(bits) | StoreLayout::IsoBlocks(bits) => {
+            let (codes, scales, quats, norms) =
+                crate::isoquant::iso_encode_fast(data, head_dim, 4, bits).unwrap();
+            let ring = 4 * (codes.len() + scales.len() + norms.len()) as u64;
+            if matches!(layout, StoreLayout::IsoBlocks(_)) {
+                ring + 4 * quats.len() as u64
+            } else {
+                ring
+            }
+        }
+        StoreLayout::Rotor(bits) => {
+            let n_groups = crate::rotorquant::n_groups_for(head_dim);
+            let rotors = crate::clifford::make_rotor_table(0, 0, n_groups);
+            let (codes, scales, norms) = if bits == 3 {
+                crate::rotorquant::rotor3_encode(data, &rotors, head_dim).unwrap()
+            } else {
+                crate::rotorquant::rotor4_encode(data, &rotors, head_dim).unwrap()
+            };
+            4 * (codes.len() + scales.len() + norms.len()) as u64
+        }
+        StoreLayout::Affine { bits, group } => {
+            let codes = elems * u64::from(bits) / 8;
+            // scale + bias, 2 bytes each at the bf16 input dtype.
+            let sideband = elems / u64::from(group) * 2 * 2;
+            codes + sideband
+        }
+    }
+}
+
+/// The estimator's layout for this store, or `None` for an unquantised axis.
+fn model_side_store(layout: StoreLayout) -> Option<super::SideStore> {
+    match layout {
+        StoreLayout::Bf16 => None,
+        StoreLayout::Q8
+        | StoreLayout::Turbo(_)
+        | StoreLayout::Tcq(_)
+        | StoreLayout::Affine { .. } => Some(super::SideStore::Generic),
+        StoreLayout::Planar(_) => Some(super::SideStore::Planar),
+        StoreLayout::IsoRing(_) => Some(super::SideStore::IsoRing),
+        StoreLayout::IsoBlocks(_) => Some(super::SideStore::IsoBlocks),
+        StoreLayout::Rotor(_) => Some(super::SideStore::Rotor),
+    }
+}
+
+/// The model's bytes divided by the store's, over the fixture.
+///
+/// `1.0` means the model is byte-for-byte. Anything else is a **deliberate**
+/// deviation and is pinned to its magnitude here rather than skipped, so a
+/// cadence change moves this number instead of quietly widening a tolerance.
+/// Every deviation in the tree is `> 1.0` — the model charging more than the
+/// store holds — which is the safe direction: it can only warn about a codec
+/// that is fine, never bless one that is not.
+fn model_over_store(layout: StoreLayout) -> f64 {
+    match layout {
+        // One f32 per 32 values modelled against q8_0's one per 128: 9.00 / 8.25.
+        StoreLayout::Q8 => 12.0 / 11.0,
+        // Same cadence against a scale AND a bias at bf16 per `group`.
+        StoreLayout::Affine { bits, group } => {
+            (f64::from(bits) + 1.0) / (f64::from(bits) + 32.0 / f64::from(group))
+        }
+        StoreLayout::Bf16
+        | StoreLayout::Turbo(_)
+        | StoreLayout::Tcq(_)
+        | StoreLayout::Planar(_)
+        | StoreLayout::IsoRing(_)
+        | StoreLayout::IsoBlocks(_)
+        | StoreLayout::Rotor(_) => 1.0,
+    }
+}
+
+/// The store each axis of each codec writes, as `[K, V]`.
+///
+/// One arm per variant, no grouping: the arm count is what
+/// [`codec_side_layouts_has_one_arm_per_listed_codec`] compares against
+/// [`ALL_KV_QUANTS`], and a grouped arm would let a variant ride in on
+/// another's line. Deliberately no `=>` in any comment inside the body for the
+/// same reason.
+#[allow(
+    clippy::match_same_arms,
+    reason = "one arm per variant even when two write the same pair of stores — merging them hides which codecs were considered, and this match exists to be read variant by variant"
+)]
+fn codec_side_layouts(q: KvQuant) -> [StoreLayout; 2] {
+    match q {
+        KvQuant::None => [StoreLayout::Bf16, StoreLayout::Bf16],
+        KvQuant::K8V4 => [StoreLayout::Q8, StoreLayout::Turbo(4)],
+        KvQuant::K8V8 => [StoreLayout::Q8, StoreLayout::Q8],
+        KvQuant::Planar => [StoreLayout::Q8, StoreLayout::Planar(4)],
+        KvQuant::Planar3 => [StoreLayout::Q8, StoreLayout::Planar(3)],
+        KvQuant::PlanarK => [StoreLayout::Planar(4), StoreLayout::Bf16],
+        KvQuant::Mixed {
+            k_bits,
+            v_bits,
+            k_group_size,
+            v_group_size,
+        } => [
+            StoreLayout::Affine {
+                bits: u32::from(k_bits),
+                group: u32::from(k_group_size),
+            },
+            StoreLayout::Affine {
+                bits: u32::from(v_bits),
+                group: u32::from(v_group_size),
+            },
+        ],
+        KvQuant::RotK {
+            v_bits,
+            v_group_size,
+        } => [
+            StoreLayout::Affine { bits: 8, group: 64 },
+            StoreLayout::Affine {
+                bits: u32::from(v_bits),
+                group: u32::from(v_group_size),
+            },
+        ],
+        KvQuant::K8VTurbo3 => [StoreLayout::Q8, StoreLayout::Turbo(3)],
+        KvQuant::K8VTurbo3Tcq => [StoreLayout::Q8, StoreLayout::Tcq(3)],
+        KvQuant::K8VTurbo2 => [StoreLayout::Q8, StoreLayout::Turbo(2)],
+        KvQuant::K8VTurbo2Tcq => [StoreLayout::Q8, StoreLayout::Tcq(2)],
+        KvQuant::TurboSym3 => [StoreLayout::Turbo(3), StoreLayout::Turbo(3)],
+        KvQuant::TurboSym4 => [StoreLayout::Turbo(4), StoreLayout::Turbo(4)],
+        KvQuant::Iso3 => [StoreLayout::Q8, StoreLayout::IsoBlocks(3)],
+        KvQuant::Iso4 => [StoreLayout::Q8, StoreLayout::IsoBlocks(4)],
+        KvQuant::Iso3Sym => [StoreLayout::IsoRing(3), StoreLayout::IsoRing(3)],
+        KvQuant::Iso4Sym => [StoreLayout::IsoRing(4), StoreLayout::IsoRing(4)],
+        KvQuant::IsoKOnly3 => [StoreLayout::IsoRing(3), StoreLayout::Bf16],
+        KvQuant::IsoKOnly4 => [StoreLayout::IsoRing(4), StoreLayout::Bf16],
+        KvQuant::Rotor3 => [StoreLayout::Q8, StoreLayout::Rotor(3)],
+        KvQuant::Rotor4 => [StoreLayout::Q8, StoreLayout::Rotor(4)],
+        KvQuant::Rotor3Sym => [StoreLayout::Rotor(3), StoreLayout::Rotor(3)],
+        KvQuant::Rotor4Sym => [StoreLayout::Rotor(4), StoreLayout::Rotor(4)],
+        KvQuant::RotorKOnly3 => [StoreLayout::Rotor(3), StoreLayout::Bf16],
+        KvQuant::RotorKOnly4 => [StoreLayout::Rotor(4), StoreLayout::Bf16],
+        KvQuant::RotorK3Asym {
+            v_bits,
+            v_group_size,
+        } => [
+            StoreLayout::Rotor(3),
+            StoreLayout::Affine {
+                bits: u32::from(v_bits),
+                group: u32::from(v_group_size),
+            },
+        ],
+        KvQuant::RotorK4Asym {
+            v_bits,
+            v_group_size,
+        } => [
+            StoreLayout::Rotor(4),
+            StoreLayout::Affine {
+                bits: u32::from(v_bits),
+                group: u32::from(v_group_size),
+            },
+        ],
+    }
+}
+
+/// Every codec's byte model is checked against the store it names, per axis and
+/// then whole.
+///
+/// Three assertions per codec, and they fail for different reasons on purpose:
+///
+/// 1. **The layout the estimator picked is the layout the codec writes.**
+///    `KvQuant::side_stores` against [`codec_side_layouts`]. A codec whose store
+///    changes family fails here first.
+/// 2. **The cadence is right.** The estimator's per-side bytes against the bytes
+///    that store's own encoder produced, at the exact ratio
+///    [`model_over_store`] declares. Reaches every layout including the ones no
+///    live codec materialises today — the planar arm is only reachable this way,
+///    and a cadence nothing can call is a gate that cannot fail.
+/// 3. **The gating is right.** The whole-codec estimate against the per-side
+///    model re-assembled through `materialises_packed_store` and the two
+///    `feeds_bf16_*` predicates. Independent of (2): this one moves when a
+///    codec's mirror or store disposition changes, not when a cadence does.
+#[test]
+fn every_codec_byte_model_matches_the_store_it_writes() {
+    let data = cadence_fixture();
+    let elems = CADENCE_VALUES as u64;
+    let n_tokens = CADENCE_ROWS as u64;
+
+    for &q in ALL_KV_QUANTS {
+        let layouts = codec_side_layouts(q);
+        let (k_bits, v_bits) = q.approx_code_bits();
+        let bits = [k_bits, v_bits];
+        let (k_store, v_store) = q.side_stores();
+        let stores = [k_store, v_store];
+        let packs = q.materialises_packed_store();
+        let feeds = [q.feeds_bf16_k_at_decode(), q.feeds_bf16_v_at_decode()];
+
+        let mut expected_total = 0u64;
+        for axis in 0..2 {
+            let (layout, store, side_bits) = (layouts[axis], stores[axis], bits[axis]);
+            let side = if axis == 0 { "K" } else { "V" };
+
+            // (1) same layout.
+            assert_eq!(
+                store,
+                model_side_store(layout),
+                "{q} {side}: the estimator sizes this side from {store:?} but the codec \
+                 writes {layout:?}"
+            );
+
+            // (2) same cadence, at the declared ratio.
+            let actual = measured_side_bytes(layout, &data);
+            expected_total += match store {
+                None => {
+                    assert_eq!(
+                        actual,
+                        elems * 2,
+                        "{q} {side}: an unquantised axis is two bytes per value"
+                    );
+                    elems * 2
+                }
+                Some(store) => {
+                    let modelled = super::packed_side_bytes(
+                        store,
+                        side_bits,
+                        elems,
+                        CADENCE_HEAD_DIM,
+                        n_tokens,
+                    );
+                    let ratio = modelled as f64 / actual as f64;
+                    let want = model_over_store(layout);
+                    assert!(
+                        (ratio - want).abs() < 1e-9,
+                        "{q} {side}: the model holds {modelled} B for a {layout:?} store of \
+                         {actual} B (ratio {ratio}), but the declared relation is {want}. \
+                         Either the cadence drifted from the store or the deviation is no \
+                         longer the one model_over_store records."
+                    );
+                    // (3) gating: a codec that builds no store holds only mirrors.
+                    if packs {
+                        modelled + if feeds[axis] { elems * 2 } else { 0 }
+                    } else {
+                        elems * 2
+                    }
+                }
+            };
+        }
+
+        assert_eq!(
+            q.estimated_resident_bytes_per_layer(CADENCE_SEQ, CADENCE_HEAD_DIM, CADENCE_KV_HEADS),
+            expected_total,
+            "{q}: whole-codec estimate disagrees with its own per-side model assembled \
+             through materialises_packed_store + feeds_bf16_k/v"
+        );
+    }
+}
+
+/// A side that reports 16 bits from `approx_code_bits` has no packed store, and
+/// a side that has one reports fewer.
+///
+/// The two are separate matches over the same enum and nothing in the type
+/// system couples them. `approx_code_bits`'s "a side kept at model dtype reports
+/// 16" is the property several callers key off; `side_stores`'s `None` is what
+/// the byte model branches on. A variant that gains a store on a side still
+/// reporting 16 would be sized as bf16 and cost the estimate its whole store
+/// term, silently.
+#[test]
+fn side_stores_agree_with_approx_code_bits() {
+    for &q in ALL_KV_QUANTS {
+        let (k_bits, v_bits) = q.approx_code_bits();
+        let (k_store, v_store) = q.side_stores();
+        for (side, bits, store) in [("K", k_bits, k_store), ("V", v_bits, v_store)] {
+            assert_eq!(
+                bits >= 16,
+                store.is_none(),
+                "{q} {side}: approx_code_bits says {bits} but side_stores says {store:?} — \
+                 one of the two matches has a variant the other does not"
+            );
+        }
+    }
+}
+
+/// [`codec_side_layouts`] names every variant, one arm each.
+///
+/// Same oracle and same reason as `variant_index_has_one_arm_per_listed_codec`:
+/// the `match` is exhaustive so a new variant cannot be forgotten, but a variant
+/// folded into a neighbour's arm with a `|` would be swept by
+/// [`every_codec_byte_model_matches_the_store_it_writes`] under the neighbour's
+/// layouts and never on its own. Counting the arms out of the source is the one
+/// reading that moves when the grouping does. This repo has shipped a sweep that
+/// iterated a literal list and ran 21 variants behind while reporting full
+/// coverage; the count is what stops that.
+#[test]
+fn codec_side_layouts_has_one_arm_per_listed_codec() {
+    const SRC: &str = include_str!("quant_tests.rs");
+    const OPEN: &str = "fn codec_side_layouts(q: KvQuant) -> [StoreLayout; 2] {";
+
+    let Some((_, after_open)) = SRC.split_once(OPEN) else {
+        panic!("quant_tests.rs no longer declares `{OPEN}` — this test reads that fn's arms")
+    };
+    // A free fn's body ends at the first line that closes an item at column 0;
+    // the inner `match` closes one level in.
+    let Some((body, _)) = after_open.split_once("\n}\n") else {
+        panic!("could not find the end of `codec_side_layouts` in quant_tests.rs")
+    };
+    let arms = body.lines().filter(|line| line.contains("=>")).count();
+
+    assert_eq!(
+        arms,
+        ALL_KV_QUANTS.len(),
+        "`codec_side_layouts` has {arms} arms but ALL_KV_QUANTS lists {} codecs. One arm \
+         per variant, no `|` grouping — a grouped arm hides a codec inside another's \
+         layouts.",
+        ALL_KV_QUANTS.len()
+    );
 }
