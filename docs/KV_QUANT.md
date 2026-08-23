@@ -3446,18 +3446,24 @@ not.
    absolute wall-clock and absolute bandwidth non-production numbers; limiters,
    occupancy, register counts and the P1:P2 ratio are the precise half, and are
    what is quoted here.*
-3. **The redesign worsens the real co-limiter.** Occupancy is 22.24% at 94
-   allocated registers with **0** spilled bytes, so resident threadgroups are
-   already register-limited without spilling. *Derivation* from the declared
-   per-lane arrays in `turbo_flash_p1.metal` — `q_vals[8]` (`:38`), `o_state[8]`
-   (`:47`), `m_state` / `l_state` (`:45,:46`) are per query context and would
-   replicate `heads_per_kv` times; `v_decoded[8]` (`:116`) is shared. 18 f32 per
-   query context: today 18 + 8 = 26, after the re-index 18·`heads_per_kv` + 8 —
-   **80 at `heads_per_kv` 4 (+54, 94 → ~148)** and **152 at 8 (+126, 94 → ~220)**.
-   This is a source-level count of declared f32s, not a compiler allocation, but
-   the direction is not in doubt: the architecture where the re-index predicts
-   the largest lift (8×, `kv_h == 1`) is the one with the least room to hold the
-   registers it needs.
+3. **The redesign costs registers — but not obviously more than this GPU
+   schedules.** *Derivation* from the declared per-lane arrays in
+   `turbo_flash_p1.metal` — `q_vals[8]` (`:38`), `o_state[8]` (`:47`), `m_state`
+   / `l_state` (`:45,:46`) are per query context and would replicate
+   `heads_per_kv` times; `v_decoded[8]` (`:116`) is shared. 18 f32 per query
+   context: today 18 + 8 = 26, after the re-index 18·`heads_per_kv` + 8 — **+54
+   at `heads_per_kv` 4** and **+126 at 8**.
+
+   **This argument is weaker than an earlier revision of this section claimed,
+   and the measurement is why.** That revision anchored on `turbo_flash_p1`'s
+   94 allocated registers at 22.24% occupancy and concluded the re-index had no
+   room. But the kernel #340 would actually rebuild is
+   `iso_flash_decode_symv_p1`, and the Xcode Shaders tab for
+   `.rmlx/traces/…iso4_sym-8192tok-20260823-104642.gputrace` measures it at
+   **60 allocated registers, 0 spilled** — with `affine_qmv_fast_bfloat16_t_gs_128_b_2`
+   running in the same capture at **115 allocated, 0 spilled**. 60 + 54 ≈ 114 is
+   therefore a shape this GPU demonstrably schedules. Register pressure is a
+   cost to price, not a wall. The verdict below does not rest on it.
 4. **The one store whose ρ clears a lifted ceiling is inert.** `tsym3` (ρ =
    0.158) is the only spelling that would clear 0.25. It encodes nothing today:
    in `.rmlx/analysis/kv-disposition-416/inertness_base.csv` it is
@@ -3508,21 +3514,37 @@ finding, from the other side. But:
   with disjoint ranges where the byte model predicted +14.9% faster
   (`docs/PERF_BASELINE.md`, "Codec cells across context").
 
-**The one genuinely open cell.** Every counter measurement in this argument is
-of `turbo_flash_p1` (ε = 0.041). The best kernel in the tree,
-`iso_flash_decode_symv_p1` (ε = 0.135, 3.3× better), **has never been
-profiled** — and it is also the one whose P1 does hold the barrier pair and the
-thread-0 softmax section, so its limiter split may differ. The decision rule is
-pre-registered here so the answer cannot be chosen after the fact. Capture it as
-`docs/PROFILING.md` describes (Bonsai-8B, `--kv-quant iso3_sym`, `--skip 32
---steps 8`, Serial execution / Maximum performance) and read
-`iso_flash_decode_symv_p1`'s Counters tab:
+**The open cell, now closed.** Every *counter* measurement in this argument is
+of `turbo_flash_p1` (ε = 0.041); the best kernel in the tree,
+`iso_flash_decode_symv_p1` (ε = 0.135, 3.3× better), was unprofiled when the
+disposition was written. It has since been captured —
+`.rmlx/traces/prism-ml__Ternary-Bonsai-8B-mlx-2bit-iso4_sym-8192tok-20260823-104642.gputrace`,
+Bonsai-8B `iso4_sym` @8192, `--skip 32 --steps 8` — and read from the Xcode
+Metal Debugger **Shaders** tab:
 
-| reading | conclusion |
-|---|---|
-| Last Level Cache Limiter **> 35%** | memory-bound; the grid re-index becomes a live proposal for this kernel family and the question reopens |
-| LLC **< 20%** with Integer and Conditional **> 40%** | same disease as `turbo_flash_p1`; the negative result covers both families and the question is closed on evidence |
-| anything between | inconclusive; state it as such and do not fund on it |
+| kernel | cost | allocated registers | spilled |
+|---|---:|---:|---:|
+| `custom_kernel_rmlx_iso_flash_decode_symv_p1_b4` | **67.84%** | 60 | 0 |
+| `affine_qmv_fast_bfloat16_t_gs_128_b_2_batch_0` | 18.53% | 115 | 0 |
+| `custom_kernel_rmlx_iso_flash_decode_symv_p2` | 6.86% | 24 | 0 |
+
+The fused decode kernel is **two thirds of all GPU time**, confirming it is the
+decode bottleneck rather than a contributor to one. Its register count retires
+argument 3 above as a wall (see the correction there); it does not disturb
+arguments 1, 2, 4 or 5, and the headroom ladder — the load-bearing one — is
+independent of every counter.
+
+**Read the Shaders tab, not the Counters CSV, for anything per-kernel.** A
+Counters export is per *encoder*, and one encoder in this capture holds **51
+commands** spanning a dozen pipelines, so a counter column cannot be attributed
+to a named kernel from it. An earlier revision of this section inferred a
+kernel's limiter split by clustering that CSV; the inference was unfounded and
+has been withdrawn. Pipeline names, cost share, register counts and spilled
+bytes all come from the Shaders tab, which carries them directly.
+
+The LLC-limiter decision rule that stood here is therefore retired unfired: the
+per-kernel limiter split it asked for is not what the Counters export provides,
+and the disposition no longer depends on it.
 
 ### Codec disposition — what every codec in the tree is for
 
