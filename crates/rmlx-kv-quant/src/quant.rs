@@ -473,25 +473,55 @@ pub const ALL_KV_QUANTS: &[KvQuant] = &[
 /// [`KvQuant::approx_code_bits`]. Two members of the same family at different
 /// bit widths can (and for planar, iso and rotor do) occupy byte-identical
 /// storage, so the width is not what sets the rate.
+///
+/// Every variant models its store **byte for byte**;
+/// `every_codec_byte_model_matches_the_store_it_writes` asserts the equality
+/// against bytes that store's own encoder produced. There is no rounding term
+/// and no deliberate over-charge to remember.
+///
+/// **Only three of the seven are reachable from the estimator.** It sizes a
+/// side only when [`KvQuant::materialises_packed_store`] holds, which is true
+/// for exactly ten codecs (`Mixed`, `RotK`, `IsoKOnly3/4`, `Iso3Sym/4Sym`,
+/// `RotorKOnly3/4`, `Rotor3Sym/4Sym`), and their sides name only [`Self::Affine`],
+/// [`Self::IsoRing`] and [`Self::Rotor`]. [`Self::Q8`], [`Self::Turbo`],
+/// [`Self::Planar`] and [`Self::IsoBlocks`] are **latent**: they are the true
+/// layout of the side that names them, but every codec that names one decodes
+/// off the bf16 mirror and so builds no store for the estimator to size. The
+/// cadence test is the only caller that reaches them, which is why
+/// [`packed_side_bytes`] is a free fn rather than inlined into the estimator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SideStore {
-    /// Dense `bits`-bit codes plus one `f32` scale per 32-element group.
+    /// q8_0 K (`crate::storage::QuantK`): one `u8` code per value plus one
+    /// `f32` scale per [`crate::q8::Q8_GROUP_SIZE`]-element group — 8.25 bits
+    /// per value. Latent (see the type doc): every codec with a q8_0 side
+    /// decodes off the mirror.
+    Q8,
+    /// TurboQuant / TCQ V (`crate::storage::QuantV`): `bits` code bits per
+    /// value plus one `f32` scale per [`crate::turboquant::GROUP_SIZE`]-element
+    /// group — `bits + 1.0` bits per value. The one family whose stored width
+    /// and codebook width agree. Latent.
+    Turbo,
+    /// MLX affine 3-tuple (`Mixed` / `RotK`, `crate::mixed_quant::MixedTuple`):
+    /// `bits` code bits per value plus a scale **and** a bias per `group`, each
+    /// at the KV stream's dtype.
     ///
-    /// Serves three stores whose sidebands differ, and charges the **densest**
-    /// of the three, so the model never under-counts any of them:
+    /// **The sideband is 32 bits per group, measured.** `mx.quantize(mode =
+    /// "affine")` emits `scales` and `biases` at the input dtype, and the KV
+    /// stream reaching the store is bf16: `cast_store_bf16` floors the prefill
+    /// buffer that `exit_prefill` bulk-quantizes (`kvcache/update.rs`), so a
+    /// 2-byte scalar each is what the store holds on every shipped model.
+    /// `affine_sideband_is_thirty_two_bits_per_group` reads the figure off a
+    /// real `MixedTuple` rather than restating it.
     ///
-    /// * q8_0 K (`QuantK`, group 128) — one `f32` per 128, so the model charges
-    ///   4× the sideband the store holds: 9.00 bits per value against 8.25.
-    /// * TurboQuant V (`QuantV`, group 32) — one `f32` per 32. Exact.
-    /// * MLX-affine 3-tuples (`Mixed` / `RotK`) — scale **and** bias at the
-    ///   input dtype (bf16 on every shipped model), i.e. 32 sideband bits per
-    ///   `group_size` values. At group 64 the store holds 0.5 bits per value
-    ///   against the model's 1.0; at group 128, 0.25 against 1.0.
-    ///
-    /// Modelling each cadence exactly would move only the magnitude, and every
-    /// deviation is in the safe direction (the model never claims a saving the
-    /// store does not deliver), which is why one cadence stands for the three.
-    Generic,
+    /// So this is `bits + 32/group` bits per value: 8.5 at group 64, 9.0 at
+    /// group 32, 8.25 at group 128 for an 8-bit side. The one arm the estimator
+    /// evaluates in production.
+    Affine {
+        /// Affine group size of this side, as the codec carries it. The store's
+        /// own parameter — `mx.quantize` emits one scale and one bias per group
+        /// of this many values.
+        group: u32,
+    },
     /// PlanarQuant K or V (`QuantPlanarK` / `QuantPlanarV`): 4 `u32` code words
     /// per 32-element group, one `f32` scale **per pair**, and 2 `u32` rotation
     /// words per 32-element group.
@@ -501,8 +531,10 @@ enum SideStore {
     /// bf16 value's worth of sideband before a single code bit is spent, so the
     /// 3-bit and 4-bit members occupy byte-identical storage (the 3-bit pack is
     /// 10 vals/`u32`, `ceil(32/10) = 4` words — the same word count as 4-bit's
-    /// 8 vals/`u32`). The generic cadence would model this at 5.0, understating
-    /// it 4.4× and in the codec's favour.
+    /// 8 vals/`u32`). Reading it as codes plus one `f32` per 32 values would
+    /// give 5.0 bits for the 4-bit members and 4.0 for `Planar3` — an
+    /// understatement of 4.4× and 5.5× respectively, in the codec's favour.
+    /// Latent.
     Planar,
     /// IsoQuant on the GPU ring (`QuantKGpuRing`): one `u32` code word + one
     /// `f32` scale per 4-element quaternion group, plus one `f32` norm per
@@ -515,21 +547,27 @@ enum SideStore {
     /// and then drops them, so the ring is the sole resident copy from the first
     /// fused decode step onward.
     ///
-    /// Two shapes hold the blocks instead and cost 2.97× this. Both are
-    /// observable, so the estimate can run low: the window before the first
-    /// fused decode step, and a layer the flash dispatcher's shape gate rejects
-    /// (batch > 1, or a `head_dim` that is not a power of two at most 512),
-    /// which falls back to the block path for the whole request.
+    /// Two shapes hold the blocks instead and cost 2.97× this, so the estimate
+    /// runs low for them. Both are observable:
+    ///
+    /// * **transient** — the window between `exit_prefill`, which bulk-encodes
+    ///   on the CPU, and the first fused decode step, which drops the blocks;
+    /// * **permanent** — a layer whose shape the flash dispatcher's gate
+    ///   rejects (batch > 1, or a `head_dim` that is not a power of two at most
+    ///   512 — `head_dim = 80` is enough). The fused append never runs, the ring
+    ///   is never allocated, and the block-dropping step is a no-op, so the
+    ///   blocks are what that layer holds for the whole request. This one is a
+    ///   property of the model's geometry, not a startup window: it does not
+    ///   end.
     IsoRing,
     /// IsoQuant in CPU `IsoBlocks`: [`SideStore::IsoRing`] plus a 4×`f32`
     /// quaternion per group — 48.25 bits per value at `head_dim = 128`, 2.97×
     /// the ring.
     ///
     /// The quaternion is the constant `FIXED_QUAT` replicated per group, not
-    /// data. This form is what a codec with no ring path would hold; it is also
-    /// what any iso store holds transiently between `exit_prefill` (which
-    /// bulk-encodes on the CPU) and the first fused decode step that drops the
-    /// blocks.
+    /// data. This form is what a codec with no ring path would hold — which is
+    /// what `Iso3` / `Iso4` name, and why they are latent: their decode
+    /// early-returns to the bf16 mirror, so no store is built at all.
     IsoBlocks,
     /// RotorQuant: one `u32` code word + one `f32` scale per 3-element group,
     /// plus one `f32` norm per token — `(64 * ceil(head_dim/3) + 32) / head_dim`
@@ -542,41 +580,63 @@ enum SideStore {
     Rotor,
 }
 
+/// Bytes the MLX affine 3-tuple spends per group on one side: a scale and a
+/// bias, each at the KV stream's dtype.
+///
+/// bf16 on every shipped model — the store boundary floors it there
+/// (`cast_store_bf16`). An f32 KV stream would double this, and at `group == 32`
+/// (which `validate_mixed_side` accepts) that is the one configuration where
+/// this figure would under-count the store rather than match it; the floor is
+/// what rules it out.
+const AFFINE_SIDEBAND_BYTES_PER_GROUP: u64 = 4;
+
 /// Bytes one side's packed store holds for `elems` values laid out as
 /// `n_tokens` rows of `head_dim`.
 ///
 /// Split out of [`KvQuant::estimated_resident_bytes_per_layer`] so the cadence
 /// of a store no live codec materialises yet is still reachable from a test:
-/// the planar codecs decode from the bf16 mirror today, so the estimator's
-/// mirror gate returns before this ever runs for them, and a cadence only the
-/// estimator could call would be a gate that cannot fail.
+/// four of the seven layouts are latent (see [`SideStore`]), and a cadence only
+/// the estimator could call would be a gate that cannot fail.
 fn packed_side_bytes(store: SideStore, bits: u32, elems: u64, head_dim: u64, n_tokens: u64) -> u64 {
+    let codes = elems.saturating_mul(u64::from(bits)) / 8;
     match store {
-        SideStore::Generic => {
-            let codes = elems.saturating_mul(u64::from(bits)) / 8;
-            let scales = (elems / 32).saturating_mul(4);
+        SideStore::Q8 => {
+            let scales = (elems / crate::q8::Q8_GROUP_SIZE as u64).saturating_mul(4);
             codes.saturating_add(scales)
+        }
+        SideStore::Turbo => {
+            let scales = (elems / crate::turboquant::GROUP_SIZE as u64).saturating_mul(4);
+            codes.saturating_add(scales)
+        }
+        SideStore::Affine { group } => {
+            let sideband =
+                (elems / u64::from(group)).saturating_mul(AFFINE_SIDEBAND_BYTES_PER_GROUP);
+            codes.saturating_add(sideband)
         }
         SideStore::Planar => {
             // 4 u32 codes + 2 u32 rotation words per 32-element group, and one
             // f32 scale per pair. Independent of `bits` — see `SideStore::Planar`.
             let groups = elems / 32;
-            let codes = groups.saturating_mul(4 * 4);
+            let planar_codes = groups.saturating_mul(4 * 4);
             let rotations = groups.saturating_mul(2 * 4);
             let scales = (elems / 2).saturating_mul(4);
-            codes.saturating_add(scales).saturating_add(rotations)
+            planar_codes
+                .saturating_add(scales)
+                .saturating_add(rotations)
         }
-        SideStore::IsoRing | SideStore::IsoBlocks => {
-            let per_group = if store == SideStore::IsoBlocks {
-                // code u32 + scale f32 + 4x f32 quaternion
-                4 + 4 + 16
-            } else {
-                // code u32 + scale f32; the rotation is FIXED_QUAT
-                4 + 4
-            };
+        SideStore::IsoRing => {
+            // code u32 + scale f32; the rotation is FIXED_QUAT.
             let groups = elems / 4;
             groups
-                .saturating_mul(per_group)
+                .saturating_mul(4 + 4)
+                .saturating_add(n_tokens.saturating_mul(4))
+        }
+        SideStore::IsoBlocks => {
+            // The ring's code u32 + scale f32, plus the 4x f32 quaternion the
+            // CPU blocks replicate per group.
+            let groups = elems / 4;
+            groups
+                .saturating_mul(4 + 4 + 16)
                 .saturating_add(n_tokens.saturating_mul(4))
         }
         SideStore::Rotor => {
@@ -1223,51 +1283,76 @@ impl KvQuant {
     /// sides are unquantised — a side reporting 16 bits there is `None` here and
     /// vice versa — and `side_stores_agree_with_approx_code_bits` pins that.
     ///
-    /// Note the two iso layouts. `IsoKOnly3/4` and `Iso3Sym/4Sym` decode from
-    /// the GPU ring and their fused append drops the CPU blocks once it is live,
-    /// so they are [`SideStore::IsoRing`]. `Iso3` / `Iso4` have no ring path —
-    /// their decode early-returns to the bf16 mirror — so the store they would
-    /// hold is [`SideStore::IsoBlocks`], 2.97× larger. Collapsing the two would
-    /// mis-size one family or the other by that factor.
+    /// Three pairs are easy to get wrong and are called out:
+    ///
+    /// * **The two iso layouts.** `IsoKOnly3/4` and `Iso3Sym/4Sym` decode from
+    ///   the GPU ring and their fused append drops the CPU blocks once it is
+    ///   live, so they are [`SideStore::IsoRing`]. `Iso3` / `Iso4` have no ring
+    ///   path — their decode early-returns to the bf16 mirror — so the store
+    ///   they would hold is [`SideStore::IsoBlocks`], 2.97× larger. Collapsing
+    ///   the two would mis-size one family or the other by that factor.
+    /// * **`RotorK{3,4}Asym`'s V is not affine.** Its name and its storage
+    ///   field say `QuantV`, and `QuantV::new_affine_decode` is a misnomer: the
+    ///   codec behind it is the TurboQuant N(0,1) Lloyd-Max one at a fixed
+    ///   32-element group ([`validate_rotor_k_asym_v`]). `v_group_size` is a
+    ///   layout-key tag the encoder never reads, so it must not reach a store
+    ///   parameter here.
+    /// * **`RotK`'s K group is fixed at 64**, by `MixedKvState::new_rotated` —
+    ///   the codec carries no `k_group_size` field to read it from.
     ///
     /// Exhaustive on purpose, same reasoning as the decode predicates: a new
     /// variant must state where its bytes go rather than inherit a layout.
     #[allow(
         clippy::match_same_arms,
-        reason = "the families that share the generic layout are kept in separate arms so the \
+        reason = "the families that share a layout are kept in separate arms so the \
                   match reads as a per-family record of where each codec's bytes go; merging \
                   them would collapse q8/turbo/affine into one unlabelled arm"
     )]
     fn side_stores(self) -> (Option<SideStore>, Option<SideStore>) {
         match self {
             KvQuant::None => (None, None),
-            KvQuant::K8V4 | KvQuant::K8V8 => (Some(SideStore::Generic), Some(SideStore::Generic)),
-            KvQuant::Planar | KvQuant::Planar3 => {
-                (Some(SideStore::Generic), Some(SideStore::Planar))
-            }
+            KvQuant::K8V4 => (Some(SideStore::Q8), Some(SideStore::Turbo)),
+            KvQuant::K8V8 => (Some(SideStore::Q8), Some(SideStore::Q8)),
+            KvQuant::Planar | KvQuant::Planar3 => (Some(SideStore::Q8), Some(SideStore::Planar)),
             KvQuant::PlanarK => (Some(SideStore::Planar), None),
-            KvQuant::Mixed { .. } | KvQuant::RotK { .. } => {
-                (Some(SideStore::Generic), Some(SideStore::Generic))
-            }
+            KvQuant::Mixed {
+                k_group_size,
+                v_group_size,
+                ..
+            } => (
+                Some(SideStore::Affine {
+                    group: u32::from(k_group_size),
+                }),
+                Some(SideStore::Affine {
+                    group: u32::from(v_group_size),
+                }),
+            ),
+            KvQuant::RotK { v_group_size, .. } => (
+                Some(SideStore::Affine { group: 64 }),
+                Some(SideStore::Affine {
+                    group: u32::from(v_group_size),
+                }),
+            ),
             KvQuant::K8VTurbo3
             | KvQuant::K8VTurbo3Tcq
             | KvQuant::K8VTurbo2
-            | KvQuant::K8VTurbo2Tcq
-            | KvQuant::TurboSym3
-            | KvQuant::TurboSym4 => (Some(SideStore::Generic), Some(SideStore::Generic)),
+            | KvQuant::K8VTurbo2Tcq => (Some(SideStore::Q8), Some(SideStore::Turbo)),
+            KvQuant::TurboSym3 | KvQuant::TurboSym4 => {
+                (Some(SideStore::Turbo), Some(SideStore::Turbo))
+            }
             // V-only iso: K is affine q8_0, V is the CPU-block iso form.
-            KvQuant::Iso3 | KvQuant::Iso4 => (Some(SideStore::Generic), Some(SideStore::IsoBlocks)),
+            KvQuant::Iso3 | KvQuant::Iso4 => (Some(SideStore::Q8), Some(SideStore::IsoBlocks)),
             KvQuant::Iso3Sym | KvQuant::Iso4Sym => {
                 (Some(SideStore::IsoRing), Some(SideStore::IsoRing))
             }
             KvQuant::IsoKOnly3 | KvQuant::IsoKOnly4 => (Some(SideStore::IsoRing), None),
-            KvQuant::Rotor3 | KvQuant::Rotor4 => (Some(SideStore::Generic), Some(SideStore::Rotor)),
+            KvQuant::Rotor3 | KvQuant::Rotor4 => (Some(SideStore::Q8), Some(SideStore::Rotor)),
             KvQuant::Rotor3Sym | KvQuant::Rotor4Sym => {
                 (Some(SideStore::Rotor), Some(SideStore::Rotor))
             }
             KvQuant::RotorKOnly3 | KvQuant::RotorKOnly4 => (Some(SideStore::Rotor), None),
             KvQuant::RotorK3Asym { .. } | KvQuant::RotorK4Asym { .. } => {
-                (Some(SideStore::Rotor), Some(SideStore::Generic))
+                (Some(SideStore::Rotor), Some(SideStore::Turbo))
             }
         }
     }
@@ -1282,21 +1367,21 @@ impl KvQuant {
     /// seed via [`Self::feeds_bf16_k_at_decode`]) — never from an arch name.
     ///
     /// Per side, the store layout sets the cadence; see [`SideStore`] for each
-    /// one's group geometry and for how far it sits from the store it models.
-    /// Two properties matter to a reader of the result:
+    /// one's group geometry. Two properties matter to a reader of the result:
     ///
     /// * **Only the side that carries a family codec uses its formula.** The
-    ///   V-only variants (`Iso3`/`Iso4`/`Rotor3`/`Rotor4`) keep an 8-bit affine
-    ///   K, so their K side is [`SideStore::Generic`]; the K-only variants
+    ///   V-only variants (`Iso3`/`Iso4`/`Rotor3`/`Rotor4`) keep an 8-bit q8_0
+    ///   K, so their K side is [`SideStore::Q8`]; the K-only variants
     ///   (`PlanarK`, `IsoKOnly*`, `RotorKOnly*`) keep a bf16 V.
-    /// * **Every deviation from the store is in the safe direction, except
-    ///   one.** The generic cadence over-charges q8_0 K and the affine
-    ///   3-tuples, so the model never claims a saving those stores do not
-    ///   deliver. The exception is iso, whose side is sized from the GPU ring:
-    ///   a cache still holding the CPU blocks `exit_prefill` built — before the
-    ///   first fused decode step, or on a layer the flash dispatcher's shape
-    ///   gate rejects — holds 2.97× that on the iso axis. See
-    ///   [`SideStore::IsoRing`].
+    /// * **Each side is byte-exact against its store, with one exception.**
+    ///   Every cadence in [`SideStore`] is measured against the store's own
+    ///   encoder, so there is no rounding term to remember. The exception is
+    ///   iso, whose side is sized from the GPU ring: a cache holding the CPU
+    ///   blocks `exit_prefill` built holds 2.97× that on the iso axis. That is
+    ///   a transient window on a layer the fused decode path serves, and a
+    ///   permanent under-report on a layer whose shape that path's gate rejects
+    ///   (batch > 1, or a `head_dim` that is not a power of two at most 512).
+    ///   See [`SideStore::IsoRing`].
     ///
     /// Two terms sit on top of the per-side store:
     ///
