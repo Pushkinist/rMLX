@@ -106,7 +106,7 @@ use commands::serve::{
     FusedQkMode, PlanarFlashDecodeMode, RotKFusedMode, SparseAttnMode, TurboFlashMode,
 };
 use commands::{
-    acquire_claim_for_device, build_cache_type_spec, parse_device, parse_kv_bits_combo,
+    acquire_claim_for_device, build_cache_type_spec, kv_bits_u8, parse_device, parse_kv_bits_combo,
     parse_kv_bits_fractional, parse_kv_preset, parse_kv_quant, parse_max_ctx,
     parse_max_prompt_tokens, resolve_model_flags, resolve_preset_arg, run_baseline, run_bench,
     run_healthcheck, run_info, run_kv_calibrate, run_ppl, run_serve,
@@ -1976,7 +1976,7 @@ fn main() -> Result<()> {
                 } else if let Some(bits) = kv_bits {
                     let gs = kv_group_size.unwrap_or(64);
                     let kq = if bits.fract() == 0.0 {
-                        parse_kv_bits_combo(bits as u8, gs)?
+                        parse_kv_bits_combo(kv_bits_u8(bits)?, gs)?
                     } else {
                         parse_kv_bits_fractional(bits, gs)?
                     };

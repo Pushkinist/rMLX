@@ -3699,7 +3699,9 @@ per-variant section above, and the `--kv-quant` / `--kv-bits` help says the same
 thing. Neither is maintained by review: `make check-kv-codec-disposition`
 derives the class from `ALL_KV_QUANTS` and the three decode predicates and fails
 on a banner a codec no longer earns, or a codec that earns one and does not have
-it.
+it. `make check-kv-codec-disposition-fixtures` measures that gate's own recall,
+one synthetic scan root per rule, asserting which rule fires rather than the
+exit code alone.
 
 The probe's `store_skipped` column corroborates and does **not** classify: it
 is set when *any* layer-cache in the run logged the skip, and the layer-adaptive

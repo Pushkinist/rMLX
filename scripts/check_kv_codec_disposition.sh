@@ -2,8 +2,18 @@
 # scripts/check_kv_codec_disposition.sh — CI gate: what the user-facing surfaces
 # say a KV codec does, and what the runtime classifiers say it does, agree.
 #
+# USAGE
+#   check_kv_codec_disposition.sh [SCAN_ROOT]
+#
+#   With no argument it reads the real surfaces and derives the manifest by
+#   running the emitter test. With a SCAN_ROOT it reads `main.rs`, `KV_QUANT.md`
+#   and a pre-captured `manifest.raw` from that directory instead — how
+#   `check_kv_codec_disposition_fixtures.sh` drives it, one mutation at a time.
+#
 # WHY
-#   Seventeen of the twenty-eight `KvQuant` variants never run. Their decode
+#   Most of the `KvQuant` variants never run — the gate prints how many on every
+#   pass, so the number lives in one place and cannot be read here after it
+#   moved. Their decode
 #   reads the bf16 mirror on both axes, so `exit_prefill` skips the encode and
 #   calls `storage.clear_payload()`: at runtime they are byte-identical to
 #   `--kv-quant none` in both resident bytes and generated tokens. That is not
@@ -25,9 +35,12 @@
 #       decode_reads_packed_store()  feeds_bf16_k_at_decode()  feeds_bf16_v_at_decode()
 #
 #   `ALL_KV_QUANTS`'s completeness is pinned by
-#   `all_kv_quants_names_every_variant_once` against the compiler-checked
-#   `variant_index`, so a new enum variant cannot slip past this gate by being
-#   absent from a list. Nothing here is hand-written per codec.
+#   `variant_index_has_one_arm_per_listed_codec`, which counts the arms of the
+#   compiler-checked `variant_index` match out of the source and compares them
+#   to the list's length — a variant absent from the list can be constructed
+#   nowhere in the crate, so nothing that sweeps the list could see it. A new
+#   enum variant therefore cannot slip past this gate by being absent from a
+#   list. Nothing here is hand-written per codec.
 #
 # RULE 1 (CLI help, coverage)
 #   Every inert codec named anywhere in the `--kv-quant` / `--kv-bits` help
@@ -53,8 +66,11 @@
 #   head of the section it qualifies, not buried in one.
 #
 # RULE 6 (the help is actually reached)
-#   Every `--kv-quant` argument in the CLI must take its help from the shared
-#   constants. Five copies drift; one that is checked does not.
+#   Every `--kv-quant` and every `--kv-bits` argument in the CLI must take its
+#   help from the shared constants. Copies drift; one that is checked does not.
+#   Checked per argument, not by comparing two counts: "five arguments and five
+#   `help =` attributes" is also what one argument carrying two of them and
+#   another carrying none looks like.
 #
 # SCOPE
 #   Rules 3-5 check that an inert codec carries a banner *somewhere* in
@@ -72,8 +88,19 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CLI_MAIN="${REPO_ROOT}/crates/rmlx-cli/src/main.rs"
-KV_DOC="${REPO_ROOT}/docs/KV_QUANT.md"
+SCAN_ROOT="${1:-}"
+
+if [ -n "${SCAN_ROOT}" ]; then
+    CLI_MAIN="${SCAN_ROOT}/main.rs"
+    KV_DOC="${SCAN_ROOT}/KV_QUANT.md"
+    MANIFEST_SRC="${SCAN_ROOT}/manifest.raw"
+else
+    CLI_MAIN="${REPO_ROOT}/crates/rmlx-cli/src/main.rs"
+    KV_DOC="${REPO_ROOT}/docs/KV_QUANT.md"
+    MANIFEST_SRC=""
+fi
+CLI_LABEL="${CLI_MAIN#"${REPO_ROOT}/"}"
+DOC_LABEL="${KV_DOC#"${REPO_ROOT}/"}"
 
 BANNER_MARKER='[*][*]INERT on this build[*][*]'
 HELP_INERT_MARKER='^[[:space:]]*INERT[[:space:]]*—'
@@ -87,7 +114,7 @@ die_violation() {
     exit 1
 }
 
-for f in "${CLI_MAIN}" "${KV_DOC}"; do
+for f in "${CLI_MAIN}" "${KV_DOC}" ${MANIFEST_SRC:+"${MANIFEST_SRC}"}; do
     [ -f "$f" ] || die_env "missing ${f#"${REPO_ROOT}/"}"
 done
 
@@ -95,24 +122,33 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
 
 # ── Oracle: the disposition manifest, derived from the type ──────────────────
-if ! command -v cargo >/dev/null 2>&1; then
-    die_env "cargo not on PATH — the disposition manifest comes from the crate"
-fi
+if [ -n "${MANIFEST_SRC}" ]; then
+    # Fixture mode: the manifest was captured ahead of time. Everything below
+    # this point is the production path unchanged, including the two sentinel
+    # checks — that is what makes the fixtures a recall test of the real gate.
+    cat "${MANIFEST_SRC}" >"${WORK}/manifest.raw"
+    : >"${WORK}/manifest.err"
+    cargo_status=0
+else
+    if ! command -v cargo >/dev/null 2>&1; then
+        die_env "cargo not on PATH — the disposition manifest comes from the crate"
+    fi
 
-(
-    cd "${REPO_ROOT}" || exit 1
-    cargo test -q -p rmlx-kv-quant --lib -- \
-        --exact quant::quant_tests::emit_kv_codec_disposition_manifest --nocapture
-) >"${WORK}/manifest.raw" 2>"${WORK}/manifest.err"
-cargo_status=$?
+    (
+        cd "${REPO_ROOT}" || exit 1
+        cargo test -q -p rmlx-kv-quant --lib -- \
+            --exact quant::quant_tests::emit_kv_codec_disposition_manifest --nocapture
+    ) >"${WORK}/manifest.raw" 2>"${WORK}/manifest.err"
+    cargo_status=$?
+fi
 
 if ! grep -q '^KVQUANT-DISPOSITION-BEGIN$' "${WORK}/manifest.raw"; then
     # Never reached the emitter: build failure, filtered-away test, wrong path.
-    echo "--- cargo stdout ---" >&2
+    echo "--- manifest stdout ---" >&2
     tail -n 30 "${WORK}/manifest.raw" >&2
-    echo "--- cargo stderr ---" >&2
+    echo "--- manifest stderr ---" >&2
     tail -n 30 "${WORK}/manifest.err" >&2
-    die_env "the disposition manifest did not run (cargo exit ${cargo_status})"
+    die_env "the disposition manifest did not run (emitter exit ${cargo_status})"
 fi
 
 if [ "${cargo_status}" -ne 0 ]; then
@@ -132,6 +168,10 @@ actual=$(grep -c '^KVQUANT-DISPOSITION	' "${WORK}/manifest.raw")
     die_env "manifest truncated: END says ${declared} codecs, read ${actual}"
 [ "${actual}" -gt 0 ] || die_env "the manifest is empty"
 
+# How many codecs are inert, read off the manifest rather than typed here — a
+# hand-written count goes stale exactly when this gate is doing its job.
+inert_count=$(awk -F'\t' '$6 == "INERT" { n++ } END { print n + 0 }' "${WORK}/manifest")
+
 # ── Surface 1: the CLI help constants ────────────────────────────────────────
 # Extract each named `const X: &str = "..."` body. The consts are the whole
 # `--kv-quant` / `--kv-bits` help surface: rule 6 pins that the arguments take
@@ -148,7 +188,7 @@ extract_const() {
 for c in KV_QUANT_HELP KV_QUANT_LONG_HELP KV_BITS_LONG_HELP; do
     extract_const "$c" >"${WORK}/const.$c"
     [ -s "${WORK}/const.$c" ] ||
-        die_env "could not extract const ${c} from crates/rmlx-cli/src/main.rs"
+        die_env "could not extract const ${c} from ${CLI_LABEL}"
     cat "${WORK}/const.$c" >>"${WORK}/help.txt"
 done
 
@@ -161,22 +201,54 @@ awk '
 
 if [ ! -s "${WORK}/help_inert.txt" ]; then
     die_violation "the --kv-quant/--kv-bits help declares no INERT block.
-Seventeen of the codecs it can name do nothing at runtime. If that stopped
-being true, this gate's manifest would say so — check its output first.
-A block opens with a line matching: ${HELP_INERT_MARKER}"
+${inert_count} of the ${actual} codecs it can name do nothing at runtime. If
+that stopped being true, this gate's manifest would say so — check its output
+first. A block opens with a line matching: ${HELP_INERT_MARKER}"
 fi
 
-# Rule 6: every --kv-quant argument reaches the shared constants.
-args=$(grep -cE '^ +kv_quant: (String|Option<String>),$' "${CLI_MAIN}")
-short=$(grep -c 'help = KV_QUANT_HELP' "${CLI_MAIN}")
-long=$(grep -c 'long_help = KV_QUANT_LONG_HELP' "${CLI_MAIN}")
-if [ "${args}" -eq 0 ]; then
-    die_env "found no --kv-quant argument declarations to check"
+# Rule 6: every --kv-quant / --kv-bits argument reaches the shared constants.
+# Per argument, not by comparing counts: N arguments and N `help =` attributes
+# is also what one argument carrying two and another carrying none looks like.
+# The attribute block that belongs to an argument opens at its `#[` and runs to
+# the declaration; a `help =` on some other argument cannot launder this one.
+awk '
+    /^[[:space:]]*#\[/ { block = "" }
+    { block = block $0 "\n" }
+    /^[[:space:]]+kv_quant: (String|Option<String>),$/ {
+        quant_args++
+        if (block !~ /[^_]help = KV_QUANT_HELP/) {
+            printf "MISS\t%d\t--kv-quant\thelp = KV_QUANT_HELP\n", NR
+        }
+        if (block !~ /long_help = KV_QUANT_LONG_HELP/) {
+            printf "MISS\t%d\t--kv-quant\tlong_help = KV_QUANT_LONG_HELP\n", NR
+        }
+    }
+    /^[[:space:]]+kv_bits: Option<f32>,$/ {
+        bits_args++
+        if (block !~ /long_help = KV_BITS_LONG_HELP/) {
+            printf "MISS\t%d\t--kv-bits\tlong_help = KV_BITS_LONG_HELP\n", NR
+        }
+    }
+    END { printf "COUNT\t%d\t%d\n", quant_args, bits_args }
+' "${CLI_MAIN}" >"${WORK}/argcheck"
+
+quant_args=$(awk -F'\t' '$1 == "COUNT" { print $2 }' "${WORK}/argcheck")
+bits_args=$(awk -F'\t' '$1 == "COUNT" { print $3 }' "${WORK}/argcheck")
+if [ "${quant_args}" -eq 0 ] || [ "${bits_args}" -eq 0 ]; then
+    die_env "found ${quant_args} --kv-quant and ${bits_args} --kv-bits argument \
+declarations in ${CLI_LABEL} — one of the two shapes stopped matching, so the \
+gate would be checking nothing"
 fi
-if [ "${args}" != "${short}" ] || [ "${args}" != "${long}" ]; then
-    die_violation "${args} --kv-quant arguments, but ${short} use \
-help = KV_QUANT_HELP and ${long} use long_help = KV_QUANT_LONG_HELP.
-An argument with its own help text is one this gate does not read."
+
+grep '^MISS	' "${WORK}/argcheck" >"${WORK}/argmiss" || true
+if [ -s "${WORK}/argmiss" ]; then
+    echo "ERROR: an argument does not take its help from the shared constants:" >&2
+    while IFS=$'\t' read -r _ line flag want; do
+        echo "  RULE 6  ${CLI_LABEL}:${line}  ${flag} is missing ${want}" >&2
+    done <"${WORK}/argmiss"
+    echo >&2
+    echo "An argument with its own help text is one this gate does not read." >&2
+    exit 1
 fi
 
 # ── Surface 2: the docs banners ──────────────────────────────────────────────
@@ -200,7 +272,7 @@ awk -v marker="${BANNER_MARKER}" '
     }
     { inside = 0 }
 ' "${KV_DOC}" >"${WORK}/banners.raw" ||
-    die_env "the banner scan of docs/KV_QUANT.md failed"
+    die_env "the banner scan of ${DOC_LABEL} failed"
 
 
 grep '^PLACEMENT	' "${WORK}/banners.raw" >"${WORK}/placement" || true
@@ -209,7 +281,7 @@ grep '^BANNER	' "${WORK}/banners.raw" | cut -f2- >"${WORK}/banners.txt" || true
 if [ -s "${WORK}/placement" ]; then
     echo "ERROR: an INERT banner does not open within 3 lines of a '### ' heading:" >&2
     while IFS=$'\t' read -r _ line; do
-        echo "  docs/KV_QUANT.md:${line}" >&2
+        echo "  RULE 5  ${DOC_LABEL}:${line}" >&2
     done <"${WORK}/placement"
     echo >&2
     echo "A banner qualifies the section it heads. Buried in the body it is a" >&2
@@ -218,7 +290,7 @@ if [ -s "${WORK}/placement" ]; then
 fi
 
 if [ ! -s "${WORK}/banners.txt" ]; then
-    die_violation "docs/KV_QUANT.md carries no INERT banner at all — every \
+    die_violation "${DOC_LABEL} carries no INERT banner at all — every \
 per-variant section for an inert codec needs one (marker: **INERT on this build**)"
 fi
 
@@ -243,11 +315,9 @@ report() {
     violations=$((violations + 1))
 }
 
-inert_count=0
 while IFS=$'\t' read -r _ _idx display stem mode class _rs _bk _bv; do
     case "${class}" in
         INERT)
-            inert_count=$((inert_count + 1))
             # Rule 1: named in the help at all → must be in an INERT block.
             if match_stem "${stem}" "${mode}" "${WORK}/help.txt" &&
                 ! match_stem "${stem}" "${mode}" "${WORK}/help_inert.txt"; then
@@ -255,7 +325,7 @@ while IFS=$'\t' read -r _ _idx display stem mode class _rs _bk _bv; do
             fi
             # Rule 3: must carry a docs banner.
             if ! match_stem "${stem}" "${mode}" "${WORK}/banners.txt"; then
-                report "RULE 3  '${display}' is inert but no docs/KV_QUANT.md INERT banner names it"
+                report "RULE 3  '${display}' is inert but no ${DOC_LABEL} INERT banner names it"
             fi
             ;;
         LIVE | BASELINE)
@@ -264,7 +334,7 @@ while IFS=$'\t' read -r _ _idx display stem mode class _rs _bk _bv; do
                 report "RULE 2  '${display}' is ${class}, not inert, but the CLI help's INERT block names it"
             fi
             if match_stem "${stem}" "${mode}" "${WORK}/banners.txt"; then
-                report "RULE 4  '${display}' is ${class}, not inert, but a docs/KV_QUANT.md INERT banner names it"
+                report "RULE 4  '${display}' is ${class}, not inert, but a ${DOC_LABEL} INERT banner names it"
             fi
             ;;
         *)
@@ -286,4 +356,4 @@ if [ "${violations}" -gt 0 ]; then
 fi
 
 echo "OK: ${actual} KV codecs classified from the type (${inert_count} inert); \
-CLI help and docs/KV_QUANT.md agree with all of them."
+CLI help and ${DOC_LABEL} agree with all of them."

@@ -568,14 +568,13 @@ fn every_parseable_mixed_quantizes_a_side() {
 
 // ── The codec surface is swept exhaustively, by construction ─────────────────
 
-/// [`ALL_KV_QUANTS`] names every variant exactly once.
+/// [`ALL_KV_QUANTS`] indexes densely from zero and repeats no variant.
 ///
-/// The oracle is `variant_index`, whose `match` the compiler checks: a variant
-/// added to the enum and not to the list leaves a hole in the index set here,
-/// and a variant added to neither fails to compile in `quant.rs`. Every sweep
-/// test below inherits its exhaustiveness from this one.
+/// Pairs with `variant_index_has_one_arm_per_listed_codec`, which supplies the
+/// count this test cannot: both sides of the comparison here are derived from
+/// the list, so this one sees a duplicate or a re-used index and nothing else.
 #[test]
-fn all_kv_quants_names_every_variant_once() {
+fn all_kv_quants_indexes_densely_with_no_repeats() {
     let mut seen: Vec<usize> = ALL_KV_QUANTS.iter().map(KvQuant::variant_index).collect();
     seen.sort_unstable();
     let n = seen.len();
@@ -588,8 +587,47 @@ fn all_kv_quants_names_every_variant_once() {
     assert_eq!(
         seen,
         (0..n).collect::<Vec<_>>(),
-        "ALL_KV_QUANTS must cover every discriminant `variant_index` can return \
-         — a gap means a variant was added to the enum but not to the list"
+        "ALL_KV_QUANTS's indices must run 0..{n} with no gap — a hole means two \
+         entries claim indices that skip one"
+    );
+}
+
+/// [`ALL_KV_QUANTS`] names every variant — including one no value in the test
+/// binary can construct.
+///
+/// The oracle is `variant_index`, whose `match` the compiler checks, but the
+/// coupling has to be read out of the *source*: a variant wired into that match
+/// and forgotten in the list produces no value anywhere in this crate, so no
+/// test that sweeps the list can observe it. `ALL_KV_QUANTS.len()` and
+/// `(0..ALL_KV_QUANTS.len())` are the same number twice. Counting the arms of
+/// the match is the one reading that moves when the list does not.
+///
+/// The count is `=>` occurrences inside the fn body, so a rustfmt-wrapped arm
+/// still counts once. Anything the scan cannot read back — a renamed fn, a
+/// comment carrying `=>` — fails loudly rather than passing.
+#[test]
+fn variant_index_has_one_arm_per_listed_codec() {
+    const SRC: &str = include_str!("quant.rs");
+    const OPEN: &str = "pub fn variant_index(&self) -> usize {";
+
+    let Some((_, after_open)) = SRC.split_once(OPEN) else {
+        panic!("quant.rs no longer declares `{OPEN}` — this test reads that fn's arms")
+    };
+    // The fn body ends at the first line that closes an item at impl-block
+    // indentation; everything before it is the `match self { ... }` arms.
+    let Some((body, _)) = after_open.split_once("\n    }\n") else {
+        panic!("could not find the end of `variant_index` in quant.rs")
+    };
+    let arms = body.lines().filter(|line| line.contains("=>")).count();
+
+    assert_eq!(
+        arms,
+        ALL_KV_QUANTS.len(),
+        "`variant_index` has {arms} arms but ALL_KV_QUANTS lists {} codecs. \
+         A variant added to the enum reaches the match by compiler error; it \
+         reaches the list, every sweep below, and the disposition manifest only \
+         if someone adds it there too.",
+        ALL_KV_QUANTS.len()
     );
 }
 
@@ -703,7 +741,7 @@ fn disposition_of(q: KvQuant) -> Disposition {
 ///
 /// This exists so "nobody picks it" can never be an answer: a variant added to
 /// the enum reaches [`ALL_KV_QUANTS`] (pinned by
-/// `all_kv_quants_names_every_variant_once`) and then has to be classified here
+/// `variant_index_has_one_arm_per_listed_codec`) and then has to be classified here
 /// or the sweep below fails on it. Writing the
 /// class by hand rather than deriving it is the point — the derivation is what
 /// is being checked.
@@ -947,10 +985,32 @@ fn an_inert_codec_has_no_quantised_read_path() {
 /// `(bits, group_size)` to — and therefore the same accepted set. Before this
 /// check the arm did no validation at all: `rot_k_v99g7` parsed into a codec
 /// that would have asked MLX for a 99-bit affine quantize at its first encode.
+///
+/// The malformed spellings are here for the same reason. The shape already
+/// matched by the time they fail, so they are bad `rot_k_*` tags and must say
+/// so; reporting them as `Unknown` printed all 28 codec names and never named
+/// the component that failed. Asserting the variant and not just "the message
+/// contains the input" is what separates the two — `Unknown`'s message
+/// contains the input as well.
 #[test]
 fn rot_k_rejects_a_v_codec_the_store_cannot_hold() {
-    for tag in ["rot_k_v99g7", "rot_k_v16g64", "rot_k_v4g17", "rot_k_v0g0"] {
+    for tag in [
+        // Shape is well-formed, the (bits, group) tuple is not.
+        "rot_k_v99g7",
+        "rot_k_v16g64",
+        "rot_k_v4g17",
+        "rot_k_v0g0",
+        // Shape matched, a numeric component did not parse.
+        "rot_k_vXg64",
+        "rot_k_v4gY",
+        "rot_k_v4",
+    ] {
         let err = KvQuant::from_str(tag).unwrap_err();
+        assert!(
+            matches!(err, super::KvQuantParseError::InvalidRotK { .. }),
+            "'{tag}' matched the rot_k_ shape, so its rejection must be \
+             InvalidRotK and not a generic unknown-codec error: {err:?}"
+        );
         let msg = err.to_string();
         assert!(
             msg.contains(tag),
@@ -1028,16 +1088,24 @@ fn surface_stem(q: KvQuant) -> String {
 /// `docs/KV_QUANT.md` against.
 ///
 /// The sweep is [`ALL_KV_QUANTS`], whose completeness
-/// `all_kv_quants_names_every_variant_once` pins against the compiler-checked
-/// `variant_index` — so a codec cannot reach the CLI without reaching this
-/// manifest, and the gate cannot go stale by omission.
+/// `variant_index_has_one_arm_per_listed_codec` pins against the
+/// compiler-checked `variant_index` — so a codec cannot reach the CLI without
+/// reaching this manifest, and the gate cannot go stale by omission.
 ///
 /// `INERT` is [`KvQuant::materialises_packed_store`] returning false, which is
 /// the disjunction of the three classifiers printed beside it and the exact
 /// condition `exit_prefill` skips the encode on. The three are printed so a
 /// reader of the gate's output can see which one moved. `KvQuant::None` also
-/// builds no store — it has none to build — and is labelled `BASELINE` instead,
-/// the same split `disposition_of` makes.
+/// builds no store — it has none to build — and is labelled `BASELINE` instead.
+///
+/// The predicate here is deliberately not `disposition_of`'s. That one keys on
+/// `decode_reads_packed_store` — "this codec's decode reads its own store" —
+/// because the class it names asserts exactly that, and the file argues above
+/// why the weaker predicate must not stand in for it. This manifest is checked
+/// against surfaces that promise an operator a codec *does something*, and the
+/// thing `exit_prefill` gates on is `materialises_packed_store`. The two agree
+/// on every variant today; they are still different questions, and a
+/// half-mirrored codec would answer them differently.
 ///
 /// Emits sentinels around the block: a run that reaches `BEGIN` and stops has
 /// failed an assertion here, which is a violation; a run with no `BEGIN` at all
