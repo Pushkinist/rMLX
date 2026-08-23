@@ -21,10 +21,15 @@ HOST_BW_BYTES_PER_S = 614e9
     614 GB/s"). Override with --bandwidth-gbs for another host.
 
 KV byte accounting mirrors the engine, not a re-invention:
-    crates/rmlx-kv-quant/src/quant.rs:966  KvQuant::estimated_resident_bytes_per_layer
-    crates/rmlx-kv-quant/src/quant.rs:888  KvQuant::approx_code_bits
-    crates/rmlx-kv-quant/src/quant.rs:515  KvQuant::feeds_bf16_k_at_decode
-    crates/rmlx-kv-quant/src/quant.rs:575  KvQuant::feeds_bf16_v_at_decode
+    crates/rmlx-kv-quant/src/quant.rs  KvQuant::estimated_resident_bytes_per_layer
+    crates/rmlx-kv-quant/src/quant.rs  KvQuant::side_stores / SideStore /
+        packed_side_bytes -- the per-side store layout and its byte cadence.
+        `_PLANAR` / `_ISO` / `_ISO_RING` / `_ROTOR` / `_K_FAMILY` / `_V_FAMILY`
+        below are that split transcribed; same no-gate caveat as the store
+        predicates.
+    crates/rmlx-kv-quant/src/quant.rs  KvQuant::approx_code_bits
+    crates/rmlx-kv-quant/src/quant.rs  KvQuant::feeds_bf16_k_at_decode
+    crates/rmlx-kv-quant/src/quant.rs  KvQuant::feeds_bf16_v_at_decode
     crates/rmlx-kv-quant/src/quant.rs      KvQuant::decode_reads_packed_store /
         materialises_packed_store -- a codec that reads no store gets none
         built, so its resident KV is the two bf16 mirrors and nothing more.
@@ -112,7 +117,7 @@ class Codec:
 
 
 _SIMPLE = {
-    # canonical string -> (variant tag, k_bits, v_bits)  [quant.rs:888 approx_code_bits]
+    # canonical string -> (variant tag, k_bits, v_bits)  [quant.rs approx_code_bits]
     "none": ("None", 16, 16),
     "bf16": ("None", 16, 16),
     "f16": ("None", 16, 16),
@@ -157,7 +162,7 @@ _READS_PACKED = {"Mixed", "RotK"}
 # uint8 scales this term is 2x too large. Verify before quoting a tight ratio.
 _AFFINE_SIDEBAND_BITS = 32
 
-# Store group sizes, from source: q8.rs:33 and turboquant.rs:70.
+# Store group sizes, from source: q8.rs Q8_GROUP_SIZE and turboquant.rs GROUP_SIZE.
 Q8_GROUP_SIZE = 128
 TURBO_GROUP_SIZE = 32
 
@@ -169,14 +174,14 @@ def _affine_side_bytes(bits: int, group: int, elems: int) -> int:
     return int(elems * (bits + _AFFINE_SIDEBAND_BITS / group) / 8)
 
 
-# quant.rs:515 / :575 -- feeds_bf16_k/v_at_decode.
+# quant.rs -- feeds_bf16_k/v_at_decode.
 #
 # CAUTION: this predicate is a SEED-ALLOCATION gate, not a decode-read flag. Its
-# only behavioural caller is `need_k_seed`/`need_v_seed` (kvcache/update.rs:2658)
+# only behavioural caller is `need_k_seed`/`need_v_seed` (kvcache/update.rs)
 # -- "must exit_prefill materialise this buffer for SOME consumer?" -- and Mixed
 # keeps the seed for the shared-KV handoff, the fused-QK shadow, SSD hydrate and
 # speculative decode while its own decode reads packed. The doc comment at
-# quant.rs:494/:561 states the narrow reading and this script previously acted on
+# quant.rs states the narrow reading and this script previously acted on
 # it. Membership below is therefore necessary but NOT sufficient for reads-mirror;
 # _READS_PACKED overrides it.
 _NO_BF16_K = {"IsoKOnly3", "IsoKOnly4", "RotorKOnly3", "RotorKOnly4",
@@ -184,14 +189,24 @@ _NO_BF16_K = {"IsoKOnly3", "IsoKOnly4", "RotorKOnly3", "RotorKOnly4",
 _NO_BF16_V = {"Iso3Sym", "Iso4Sym", "Rotor3Sym", "Rotor4Sym"}
 
 _ISO = {"Iso3", "Iso4", "Iso3Sym", "Iso4Sym", "IsoKOnly3", "IsoKOnly4"}
+# The iso codecs whose resident form is the GPU ring (codes/scales/norms, no
+# quaternion -- the rotation is the compile-time FIXED_QUAT). Their fused append
+# seeds the ring from the prefill CPU blocks and then drops them
+# (`drop_blocks_when_ring_live_iso_*`, kvcache/update.rs), so the ring is the
+# sole resident copy from the first fused decode step. `Iso3` / `Iso4` have no
+# ring path and would hold the CPU-block form, 2.97x larger. Mirrors
+# `SideStore::IsoRing` vs `SideStore::IsoBlocks`.
+_ISO_RING = {"Iso3Sym", "Iso4Sym", "IsoKOnly3", "IsoKOnly4"}
 _ROTOR = {"Rotor3", "Rotor4", "Rotor3Sym", "Rotor4Sym", "RotorKOnly3",
           "RotorKOnly4", "RotorK3Asym", "RotorK4Asym"}
-# quant.rs:1060 -- which side actually carries the iso/rotor encoding
-_K_FAMILY = {"Iso3Sym", "Iso4Sym", "IsoKOnly3", "IsoKOnly4", "Rotor3Sym",
-             "Rotor4Sym", "RotorKOnly3", "RotorKOnly4", "RotorK3Asym",
-             "RotorK4Asym"}
-_V_FAMILY = {"Iso3", "Iso4", "Iso3Sym", "Iso4Sym", "Rotor3", "Rotor4",
-             "Rotor3Sym", "Rotor4Sym"}
+_PLANAR = {"Planar", "Planar3", "PlanarK"}
+# Which side actually carries the planar/iso/rotor encoding. Mirrors
+# `KvQuant::side_stores`.
+_K_FAMILY = {"PlanarK", "Iso3Sym", "Iso4Sym", "IsoKOnly3", "IsoKOnly4",
+             "Rotor3Sym", "Rotor4Sym", "RotorKOnly3", "RotorKOnly4",
+             "RotorK3Asym", "RotorK4Asym"}
+_V_FAMILY = {"Planar", "Planar3", "Iso3", "Iso4", "Iso3Sym", "Iso4Sym",
+             "Rotor3", "Rotor4", "Rotor3Sym", "Rotor4Sym"}
 
 _MIXED_RE = re.compile(r"^mixed_k(\d+)g(\d+)_v(\d+)g(\d+)$")
 _ROTK_RE = re.compile(r"^rot_k_v(\d+)g(\d+)$")
@@ -207,7 +222,7 @@ VALID_CODECS = (
 
 
 def parse_codec(s: str) -> Codec:
-    """Mirror of `<KvQuant as FromStr>::from_str` (quant.rs:1224)."""
+    """Mirror of `<KvQuant as FromStr>::from_str` (quant.rs)."""
     if s in _SIMPLE:
         kind, kb, vb = _SIMPLE[s]
         canonical = "none" if kind == "None" else s
@@ -228,35 +243,47 @@ def parse_codec(s: str) -> Codec:
 
 
 def _side_bytes(c: Codec, bits: int, elems: int, n_tokens: int, head_dim: int,
-                uses_family: bool, retains_seed: bool, iso_ring: bool) -> int:
-    """Per-side stored+seed bytes. Mirrors the `side_bytes` closure at
-    quant.rs:1020."""
+                uses_family: bool, retains_seed: bool) -> int:
+    """Per-side stored+seed bytes. Mirrors the `side_bytes` closure and
+    `packed_side_bytes` in quant.rs; the family split mirrors `SideStore`."""
     if bits >= 16:
         return elems * BF16
-    if uses_family and c.kind in _ISO:
-        groups = elems // 4
-        # quant.rs:1027 charges 4B code + 4B scale + 16B quaternion per group.
-        # The doc at quant.rs:862-878 states the resident GPU ring carries
-        # codes/scales/norms only (the rotation is the compile-time FIXED_QUAT),
-        # so the 16B quaternion is a CPU-block term and a 3x over-count for the
-        # ring-backed members. --iso-ring drops it.
-        per_group = (4 + 4) if iso_ring else (4 + 4 + 16)
-        stored = groups * per_group + n_tokens * 4
+    if uses_family and c.kind in _PLANAR:
+        # PlanarQuant: 4 u32 code words + 2 u32 rotation words per 32-element
+        # group, and one f32 scale PER PAIR (storage/quant_planar_v.rs, in the
+        # `gpu_codes_buf.is_none()` init; quant_planar_k.rs is bit-identical).
+        # 22.00 bits per value at every head_dim and at BOTH bit widths -- the
+        # 3-bit pack is 10 vals/u32, ceil(32/10) = 4 words, the same word count
+        # as 4-bit's 8 vals/u32. The generic cadence below would model this at
+        # 5.0, understating a store that is ABOVE bf16's 16.0 by 4.4x and in the
+        # codec's favour.
+        groups = elems // TURBO_GROUP_SIZE
+        stored = groups * 4 * 4 + (elems // 2) * 4 + groups * 2 * 4
+    elif uses_family and c.kind in _ISO:
+        # 4B code + 4B scale per quaternion group, plus one 4B norm per token.
+        # The ring-backed members stop there; a block-backed one also carries a
+        # 16B quaternion per group (see _ISO_RING).
+        per_group = (4 + 4) if c.kind in _ISO_RING else (4 + 4 + 16)
+        stored = (elems // 4) * per_group + n_tokens * 4
     elif uses_family and c.kind in _ROTOR:
-        # group size 3: per-token ceil(head_dim/3), NOT elems/3 (quant.rs:1032)
+        # group size 3: per-token ceil(head_dim/3), NOT elems/3
         groups = -(-head_dim // 3) * n_tokens
         stored = groups * (4 + 4) + n_tokens * 4
     else:
         codes = elems * bits // 8
-        # Sideband cadence is per-store, not a single constant. quant.rs:1029
-        # charges one f32 per 32 elements for all three, which its own comment
-        # at :1006-1007 calls "conservative"; measured against the stores:
+        # Sideband cadence is per-store, not a single constant. The Rust
+        # generic arm charges one f32 per 32 elements for all three stores it
+        # serves; measured against them:
         #   q8_0 K   -- Q8_GROUP_SIZE = 128 (q8.rs:33)        -> /32 is 4x high
         #   TurboQuant V -- GROUP_SIZE = 32 (turboquant.rs:70) -> /32 is EXACT
         #   Mixed/RotK affine -- group from the codec name, and the store is an
         #     mx.quantize 3-tuple, so the sideband is scale AND bias in the
         #     input dtype (mixed_quant/state.rs:29-34), not one f32
         #     -> /32 is 2x high AND structurally the wrong shape.
+        # Those three are the WHOLE list this arm serves. Planar used to fall in
+        # here unnamed and was modelled at 5.0 against a measured 22.0; it now
+        # has its own branch above. An audit that enumerates the stores it
+        # checked is only as good as the enumeration.
         # Footprint figures only: decode_read_bytes_per_layer never reaches here.
         if c.kind in _READS_PACKED:
             group = (c.k_group if bits == c.k_bits else c.v_group) or 64
@@ -307,9 +334,9 @@ def materialises_packed_store(kind: str) -> bool:
             or kind in _NO_BF16_V)
 
 
-def resident_bytes_per_layer(c: Codec, seq: int, head_dim: int, kv_heads: int,
-                             iso_ring: bool = False) -> int:
-    """Mirror of `KvQuant::estimated_resident_bytes_per_layer` (quant.rs:966)."""
+def resident_bytes_per_layer(c: Codec, seq: int, head_dim: int,
+                             kv_heads: int) -> int:
+    """Mirror of `KvQuant::estimated_resident_bytes_per_layer` (quant.rs)."""
     elems = seq * head_dim * kv_heads
     if c.kind == "None":
         return elems * BF16 * 2
@@ -318,9 +345,9 @@ def resident_bytes_per_layer(c: Codec, seq: int, head_dim: int, kv_heads: int,
         return elems * BF16 * 2
     n_tokens = seq * kv_heads
     k = _side_bytes(c, c.k_bits, elems, n_tokens, head_dim,
-                    c.kind in _K_FAMILY, c.kind not in _NO_BF16_K, iso_ring)
+                    c.kind in _K_FAMILY, c.kind not in _NO_BF16_K)
     v = _side_bytes(c, c.v_bits, elems, n_tokens, head_dim,
-                    c.kind in _V_FAMILY, c.kind not in _NO_BF16_V, iso_ring)
+                    c.kind in _V_FAMILY, c.kind not in _NO_BF16_V)
     return k + v
 
 
@@ -351,7 +378,9 @@ def decode_read_bytes_per_layer(c: Codec, seq: int, head_dim: int,
          reads packed while consumers attend over the surfaced bf16 prefix.
 
     The iso/rotor stored terms use the ring layout (codes/scales/norms), which
-    is what a decode kernel actually streams -- see quant.rs:862-878.
+    is what a decode kernel actually streams. Only the four ring-backed iso
+    codecs reach this arm at all: `Iso3` / `Iso4` keep both bf16 mirrors and take
+    the reads-mirror branch above.
     """
     elems = seq * head_dim * kv_heads
     if c.kind == "None":
@@ -364,12 +393,12 @@ def decode_read_bytes_per_layer(c: Codec, seq: int, head_dim: int,
         k = elems * BF16
     else:
         k = _side_bytes(c, c.k_bits, elems, n_tokens, head_dim,
-                        c.kind in _K_FAMILY, False, True)
+                        c.kind in _K_FAMILY, False)
     if c.kind not in _NO_BF16_V:
         v = elems * BF16
     else:
         v = _side_bytes(c, c.v_bits, elems, n_tokens, head_dim,
-                        c.kind in _V_FAMILY, False, True)
+                        c.kind in _V_FAMILY, False)
     return k + v
 
 
@@ -615,8 +644,8 @@ def weight_census(snapshot: Path, cfg: dict, spec_layers: list[KvLayer],
 
 # ── KV totals per context ────────────────────────────────────────────────────
 
-def kv_at_ctx(spec: ModelSpec, base: Codec, ctx: int, max_ctx: int | None,
-              iso_ring: bool) -> tuple[int, int, dict]:
+def kv_at_ctx(spec: ModelSpec, base: Codec, ctx: int,
+              max_ctx: int | None) -> tuple[int, int, dict]:
     """Return (decode_read_bytes_per_step, resident_bytes, detail).
 
     Read bytes count EVERY layer's attention read, including a gemma4 shared-KV
@@ -653,7 +682,7 @@ def kv_at_ctx(spec: ModelSpec, base: Codec, ctx: int, max_ctx: int | None,
             cap = min(next_pow2(ctx), ceiling)
             codec = kv_quant_for_layer(l.idx, spec.n_layers, base)
         resident += resident_bytes_per_layer(codec, cap, l.head_dim,
-                                             l.kv_heads, iso_ring)
+                                             l.kv_heads)
     return read, resident, {"n_global": n_global, "n_windowed": n_windowed}
 
 
@@ -767,7 +796,7 @@ def analyse(snapshot: Path, codec_name: str, ctxs: list[int], args) -> dict:
 
     rows = []
     for ctx in ctxs:
-        kv_read, kv_res, det = kv_at_ctx(spec, base, ctx, args.max_ctx, args.iso_ring)
+        kv_read, kv_res, det = kv_at_ctx(spec, base, ctx, args.max_ctx)
         bytes_step = wbytes + kv_read
         ceiling = bw / bytes_step
         if achieved:
@@ -858,9 +887,6 @@ def main() -> None:
     p.add_argument("--runs-db", default=".rmlx/metrics/runs.db",
                    help="metrics DB to read the prefill anchor from (read-only)")
     p.add_argument("--no-db", action="store_true", help="do not consult runs.db")
-    p.add_argument("--iso-ring", action="store_true",
-                   help="size iso groups from the GPU ring (codes+scales+norms) "
-                        "instead of the engine's CPU-block upper bound")
     p.add_argument("--json", action="store_true")
     args = p.parse_args()
 

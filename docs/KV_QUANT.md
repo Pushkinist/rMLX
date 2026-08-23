@@ -156,23 +156,34 @@ is estimated to increase resident KV vs bf16 on the active layer mix:
 ```
 WARN KV codec increases resident KV vs bf16 on this layer mix — the
 per-global-layer warm-TTFT bf16 seed plus codec scales exceed the bytes saved
-at this context; windowed layers already run bf16 and are unaffected. The byte
-figure is an UPPER BOUND, not an estimate: the iso arm of the estimator sizes a
-group from the CPU-block layout, which carries a per-group quaternion the GPU
-ring the iso codecs actually decode from does not, so for those codecs it
-overstates by roughly 3x. The sign is exact either way. Consider --kv-quant none
-if memory is the goal.
-  kv_quant=mixed_k8g64_v8g64 eff_seq=8192 n_global=7 n_windowed=28 est_extra_bytes_upper_bound=51380224
+at this context; windowed layers already run bf16 and are unaffected. Read the
+sign, not the magnitude: the estimator over-charges the affine and q8_0
+per-group sidebands, and under-reports an iso codec until its fused decode path
+drops the CPU blocks the prefill encode built. Consider --kv-quant none if
+memory is the goal.
+  kv_quant=mixed_k8g64_v8g64 eff_seq=8192 n_global=7 n_windowed=28 est_extra_bytes=51380224
 ```
 
-The field is named for what it is. Only the **sign** of that number is exact;
-size nothing from its magnitude, and for `k_iso*` / `iso*_sym` expect it to run
-about 3x high (`KvQuant::approx_code_bits`, iso arm).
+Only the **sign** of that number is exact; size nothing from its magnitude. It
+errs in both directions, and the two are separate:
+
+- **High** for `Mixed` / `RotK` and for any q8_0 K side. One generic cadence —
+  one `f32` per 32 values — stands for three stores whose real cadences are one
+  `f32` per 128 (q8_0) and a bf16 scale *and* bias per `group_size` (affine).
+  That direction is safe: the model cannot bless a codec the store does not.
+- **Low** for `k_iso*` / `iso*_sym`. The estimator sizes an iso side from the
+  GPU ring, which is what a served request settles at; but `exit_prefill`
+  bulk-encodes into CPU `IsoBlocks` 2.97× the ring, and those are freed only on
+  the first fused decode step (`drop_blocks_when_ring_live_iso_*`). Over that
+  window — and for the whole request on a layer the flash dispatcher's shape
+  gate rejects, i.e. batch > 1 or a `head_dim` that is not a power of two at
+  most 512 — the cache holds more than the warn reported.
 
 The estimate is model-agnostic — keyed only on layer geometry (`head_dim`,
-`kv_heads`, `window`) and codec attributes (`KvQuant::approx_code_bits`, the
-per-group scale cadence, whether the codec retains a bf16 seed, and whether it
-materialises a packed store at all). The decision lives in:
+`kv_heads`, `window`) and codec attributes (the per-side store layout from
+`KvQuant::side_stores`, the codebook width from `KvQuant::approx_code_bits`,
+whether the codec retains a bf16 seed, and whether it materialises a packed
+store at all). The decision lives in:
 
 - `rmlx_kv_quant::KvQuant::estimated_resident_bytes_per_layer` /
   `estimated_net_saving_per_layer` (codec layer — the per-side byte model;
@@ -976,12 +987,15 @@ the rate. Measured, not modelled — `kv_rate_tests.rs` reads the bytes
   longer keeps a store: nothing reads it at decode, so `exit_prefill` does not
   build it (`docs/KV_CACHE.md` §9.6 F3) and the layer's resident V is the bf16
   mirror at 16.0 bits per value. `KvQuant::estimated_resident_bytes_per_layer`
-  reports that directly and its old store sub-term — 5.0 bits per value against
-  a measured 22.0, off by 4.4× and wrong in the codec's favour — no longer
-  enters the figure for this codec. The 22.0-bit rate still governs a
-  store-backed planar cache: a seedless one (hydrated, or never through a
-  prefill bracket), and the resident bytes of any future decode path that reads
-  the store.
+  reports that directly. The 22.0-bit rate still governs a store-backed planar
+  cache: a seedless one (hydrated, or never through a prefill bracket), and the
+  resident bytes of any future decode path that reads the store. The estimator
+  now models it at 22.0 (`SideStore::Planar`), so the day a planar decode kernel
+  flips `decode_reads_packed_store` the advisory is right the same day. It used
+  to model 5.0 — off by 4.4× and wrong in the codec's favour, i.e. it would have
+  called a store *larger* than bf16 a memory win. That arm is latent, so nothing
+  observable would have caught it; `every_codec_byte_model_matches_the_store_it_writes`
+  reaches it directly for that reason.
 
 **Arch defaults**: none. `auto` is bf16 on every arch and at every context;
 Planar is opt-in. It was the default for `Gemma3ForConditionalGeneration` and
@@ -2116,15 +2130,24 @@ The CPU `IsoBlocks` form adds a 4×f32 quaternion per group on top, taking the
 same token to ≈772 B (≈48.25 bits per value, 3.0× bf16). That sideband is the
 constant `FIXED_QUAT` replicated per group, not data, and the GPU ring the
 K-only and symmetric codecs decode from does not carry it. **That figure is
-hypothetical on a served request**: the V-only `iso3` / `iso4` codecs decode
-from the bf16 mirror, so `exit_prefill` builds them no store and they measure
-byte-identical to `none` (§"Codec disposition", Class 2). It is the rate they
-would cost the day a decode kernel reads their store. The store-reading members
-are `k_iso3/4` and `iso3_sym/4_sym`, and those measure 1.003–1.054× `none` on
-the ring layout above (§"Codec disposition", Class 3 — whole-cache ratios
-against a `none` that is a true bf16 control since the head/tail promotion
-stopped applying to it). The per-group figures above are the store density and
-are unaffected by that.
+not what a served request settles at, but it is not hypothetical either.**
+Three cases, and they differ:
+
+- The V-only `iso3` / `iso4` codecs decode from the bf16 mirror, so
+  `exit_prefill` builds them no store at all and they measure byte-identical to
+  `none` (§"Codec disposition", Class 2). 48.25 is the rate they would cost the
+  day a decode kernel reads their store.
+- The store-reading members — `k_iso3/4` and `iso3_sym/4_sym` — **do** pay it,
+  for one window: `exit_prefill` bulk-encodes them on the CPU, into blocks. The
+  first fused decode step seeds the ring from those blocks and frees them
+  (`drop_blocks_when_ring_live_iso_*` in `kvcache/update.rs`), after which the
+  ring is the sole resident copy.
+- From there they measure 1.003–1.054× `none` (§"Codec disposition", Class 3 —
+  whole-cache ratios against a `none` that is a true bf16 control since the
+  head/tail promotion stopped applying to it), which is the ring layout above.
+
+The per-group figures are the store density and are unaffected by which of the
+three a cache is in.
 
 **No iso codec is a memory win, at any head_dim.** 8 B per 4 values is exactly
 bf16's density before the per-token norm is added, so the packed side is
@@ -2135,8 +2158,13 @@ sign is pinned by `iso_and_rotor_k_codecs_are_never_a_memory_win`
 the resolve-time net-negative warn, which the Gemma4, Qwen3 and Qwen3.5-MoE
 generate paths call (the remaining arches do not call it yet).
 `estimated_resident_bytes_per_layer` models the group layout directly (never
-the codebook width) and counts the quaternion sideband, so its number is a
-conservative upper bound for the ring-resident members.
+the codebook width) and sizes the four store-reading members from the **ring**,
+which is what a served request holds: their fused append seeds the ring from the
+prefill CPU blocks and then drops the blocks
+(`drop_blocks_when_ring_live_iso_*`). The block form above is what `iso3` /
+`iso4` would hold if a kernel ever read their store, and what any iso store
+holds over the window between `exit_prefill` and the first fused decode step —
+the one interval in which the estimate runs low rather than high.
 
 **Crate-wide rate ceiling.** `crates/rmlx-kv-quant/src/kv_rate_tests.rs` reports
 every store family's bits per value and fails any family above bf16's 16.0 that
@@ -2300,7 +2328,7 @@ differences are the codebook (16 centroids vs 8) and the pack density
 |---|---|---|
 | Code bits / element | 3 | 4 |
 | Delivered bits / element, ring-resident (`k_iso*`, `*_sym`) | **16.25** (260 B/token at head\_dim=128 — see Memory truth in iso3 section) | **16.25** — byte-identical to iso3; the codebook width never reaches the store |
-| Delivered bits / element, CPU-blocks form (`iso3` / `iso4`) — **hypothetical, not resident** | ≈48.25 (≈772 B/token at head\_dim=128, incl. the constant quaternion sideband). These two codecs decode from the bf16 mirror, so `exit_prefill` builds them no store and they measure byte-identical to `none` (§"Codec disposition", Class 2); this is the rate they would cost once a kernel reads one | ≈48.25 — same sideband, same code word, same hypothetical |
+| Delivered bits / element, CPU-blocks form (`iso3` / `iso4`) — **not resident on a settled cache** | ≈48.25 (≈772 B/token at head\_dim=128, incl. the constant quaternion sideband). These two codecs decode from the bf16 mirror, so `exit_prefill` builds them no store and they measure byte-identical to `none` (§"Codec disposition", Class 2); this is the rate they would cost once a kernel reads one. The ring-backed members do pay it between `exit_prefill` and the first fused decode step, which frees the blocks | ≈48.25 — same sideband, same code word, same window |
 | Codebook | `lloyd_gaussian_codebook(3)` (8 centroids) | `lloyd_gaussian_codebook(4)` (16 centroids) |
 | Pack density (per u32) | 10 vals (30 bits used, 2 wasted) | 8 vals (32 bits used, 0 wasted) |
 | Rotation | Golden-ratio fixed quaternion (`FIXED_QUAT`) | Same |
