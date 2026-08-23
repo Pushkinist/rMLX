@@ -10,6 +10,8 @@
 use std::str::FromStr;
 
 use super::{KvQuant, ALL_KV_QUANTS};
+use crate::mixed_quant::MixedTuple;
+use rmlx_mlx::{quantize, Array, Device, Dtype};
 
 /// Construct one representative instance of every `KvQuant` variant and assert
 /// `KvQuant::from_str(&q.to_string()) == Ok(q)`.
@@ -1186,23 +1188,59 @@ fn emit_kv_codec_disposition_manifest() {
 // A cadence that drifts from the store it models does not fail anything on its
 // own — it just reports a saving the store never delivers. These tests close
 // that by measuring each store's bytes from its own encoder over one shared
-// fixture and holding the model to the result.
+// fixture, at three head dimensions, and holding the model to the result.
 
-/// Fixture geometry. `head_dim = 128` is the shipped test-target head dimension
-/// and the one every published rate figure quotes; a group-bound store's rate
-/// depends on it, so a rate quoted without one is not a number.
-const CADENCE_HEAD_DIM: u64 = 128;
-const CADENCE_KV_HEADS: u64 = 4;
-const CADENCE_SEQ: u64 = 64;
-const CADENCE_ROWS: usize = (CADENCE_SEQ * CADENCE_KV_HEADS) as usize;
-const CADENCE_VALUES: usize = CADENCE_ROWS * CADENCE_HEAD_DIM as usize;
-const CADENCE_SHAPE: [i32; 4] = [1, 1, CADENCE_ROWS as i32, CADENCE_HEAD_DIM as i32];
-
-fn cadence_fixture() -> Vec<f32> {
-    (0..CADENCE_VALUES)
-        .map(|i| ((i % 251) as f32) / 251.0 - 0.5)
-        .collect()
+/// One fixture geometry: `kv_heads * seq` rows of `head_dim`.
+#[derive(Clone, Copy, Debug)]
+struct Cadence {
+    head_dim: u64,
+    kv_heads: u64,
+    seq: u64,
 }
+
+impl Cadence {
+    fn rows(self) -> u64 {
+        self.seq * self.kv_heads
+    }
+    fn values(self) -> u64 {
+        self.rows() * self.head_dim
+    }
+    fn shape(self) -> [i32; 4] {
+        [1, 1, self.rows() as i32, self.head_dim as i32]
+    }
+    fn data(self) -> Vec<f32> {
+        (0..self.values())
+            .map(|i| ((i % 251) as f32) / 251.0 - 0.5)
+            .collect()
+    }
+}
+
+/// The geometries every cadence assertion runs at.
+///
+/// `head_dim = 128` is the shipped test-target head dimension and the one every
+/// published rate figure quotes; 256 is what a served gemma-4 layer uses; 64 is
+/// the low end. A group-bound store's rate depends on `head_dim`, so a rate
+/// quoted without one is not a number — and a proof at one `head_dim` is not a
+/// proof: `SideStore::Rotor`'s `head_dim.div_ceil(3)` is the only non-linear
+/// term in the whole model, and the group-bound arms divide `elems` by a group
+/// size that a short `head_dim` could leave a remainder against.
+const CADENCE_GEOMETRIES: &[Cadence] = &[
+    Cadence {
+        head_dim: 64,
+        kv_heads: 4,
+        seq: 64,
+    },
+    Cadence {
+        head_dim: 128,
+        kv_heads: 4,
+        seq: 64,
+    },
+    Cadence {
+        head_dim: 256,
+        kv_heads: 4,
+        seq: 64,
+    },
+];
 
 /// The store one axis of a codec actually writes.
 ///
@@ -1216,6 +1254,12 @@ enum StoreLayout {
     /// `QuantK` — affine q8_0, group 128.
     Q8,
     /// `QuantV` — TurboQuant Lloyd-Max at `bits`, group 32.
+    ///
+    /// This is also what `RotorK{3,4}Asym` puts its V in. The constructor it
+    /// reaches is named `QuantV::new_affine_decode` and the storage field is
+    /// documented as "MLX-affine", but the codec behind both is the TurboQuant
+    /// N(0,1) Lloyd-Max one at a fixed 32-element group, and the codec's
+    /// `v_group_size` never reaches it (`validate_rotor_k_asym_v`).
     Turbo(u8),
     /// `QuantV` with Viterbi assignment; decoder and layout identical to
     /// [`StoreLayout::Turbo`] at the same width.
@@ -1232,14 +1276,39 @@ enum StoreLayout {
     Rotor(u8),
     /// MLX affine 3-tuple (`Mixed` / `RotK`).
     ///
-    /// The one row that is **not** measured: this crate has no CPU affine
-    /// encoder, so the bytes are read off the allocation in
-    /// `mixed_quant::state::init_quant` — `bits` code bits per value plus a
-    /// scale AND a bias per `group`, both at the input dtype, which is bf16 on
-    /// every shipped model. A change to that allocation that nobody mirrors
-    /// here is the one drift this gate cannot see; it is review's job, and
-    /// `kv_rate_tests.rs` carries the same limitation for the same reason.
+    /// Measured like every other row, from `mx.quantize` itself: this crate has
+    /// no CPU affine encoder, but MLX's is reachable and its output *is* the
+    /// store — `exit_prefill` hands the 3-tuple straight to `MixedTuple`
+    /// (`bulk_init_from_fp16`), and the incremental path's `init_quant`
+    /// pre-allocates the same three arrays at the same dtypes (it takes
+    /// `scales_dtype` from the same `keys.dtype()`). So the bytes below come
+    /// from the allocation, not from a formula restating it.
     Affine { bits: u32, group: u32 },
+}
+
+/// The fixture as the bf16 KV stream a store sees.
+///
+/// bf16 and not f32 on purpose: the sideband width of the affine 3-tuple is the
+/// input dtype, and `cast_store_bf16` floors the prefill buffer that
+/// `exit_prefill` quantizes at bf16 on every arch. Measuring an f32 array would
+/// measure a stream no cache holds.
+fn cadence_bf16_array(data: &[f32], geom: Cadence) -> Array {
+    Array::from_f32_slice(data, &geom.shape())
+        .expect("fixture array")
+        .astype(Dtype::Bf16, Device::Cpu)
+        .expect("bf16 cast")
+}
+
+/// The MLX affine 3-tuple for one side of the fixture, as the store holds it.
+fn affine_tuple(data: &[f32], geom: Cadence, bits: u32, group: u32) -> MixedTuple {
+    let arr = cadence_bf16_array(data, geom);
+    let (codes, scales, biases) = quantize(&arr, group as i32, bits as i32, Device::Cpu)
+        .expect("mx.quantize(mode = affine) on the fixture");
+    MixedTuple {
+        codes,
+        scales,
+        biases,
+    }
 }
 
 /// Bytes this store holds for the fixture.
@@ -1247,32 +1316,30 @@ enum StoreLayout {
     clippy::unwrap_used,
     reason = "every encoder here is called on the fixture with a shape and width it validates; a failure is a broken encoder and the panic names it"
 )]
-fn measured_side_bytes(layout: StoreLayout, data: &[f32]) -> u64 {
-    let elems = CADENCE_VALUES as u64;
-    let head_dim = CADENCE_HEAD_DIM as usize;
+fn measured_side_bytes(layout: StoreLayout, data: &[f32], geom: Cadence) -> u64 {
+    let elems = geom.values();
+    let head_dim = geom.head_dim as usize;
+    let shape = geom.shape();
     match layout {
         StoreLayout::Bf16 => elems * 2,
         StoreLayout::Q8 => {
             let (codes, scales) = crate::q8::q8_quantize(data);
             (codes.len() + 4 * scales.len()) as u64
         }
-        StoreLayout::Turbo(bits) => crate::turboquant::turbo_quantize_v(data, bits, &CADENCE_SHAPE)
+        StoreLayout::Turbo(bits) => crate::turboquant::turbo_quantize_v(data, bits, &shape)
             .unwrap()
             .byte_size(),
         StoreLayout::Tcq(bits) => if bits == 2 {
-            crate::tcq::tcq_quantize_v2(data, &CADENCE_SHAPE).unwrap()
+            crate::tcq::tcq_quantize_v2(data, &shape).unwrap()
         } else {
-            crate::tcq::tcq_quantize_v3(data, &CADENCE_SHAPE).unwrap()
+            crate::tcq::tcq_quantize_v3(data, &shape).unwrap()
         }
         .byte_size(),
-        StoreLayout::Planar(bits) => crate::planarquant::planar_quantize(
-            data,
-            crate::turboquant::GROUP_SIZE,
-            bits,
-            &CADENCE_SHAPE,
-        )
-        .unwrap()
-        .byte_size(),
+        StoreLayout::Planar(bits) => {
+            crate::planarquant::planar_quantize(data, crate::turboquant::GROUP_SIZE, bits, &shape)
+                .unwrap()
+                .byte_size()
+        }
         StoreLayout::IsoRing(bits) | StoreLayout::IsoBlocks(bits) => {
             let (codes, scales, quats, norms) =
                 crate::isoquant::iso_encode_fast(data, head_dim, 4, bits).unwrap();
@@ -1293,12 +1360,7 @@ fn measured_side_bytes(layout: StoreLayout, data: &[f32]) -> u64 {
             };
             4 * (codes.len() + scales.len() + norms.len()) as u64
         }
-        StoreLayout::Affine { bits, group } => {
-            let codes = elems * u64::from(bits) / 8;
-            // scale + bias, 2 bytes each at the bf16 input dtype.
-            let sideband = elems / u64::from(group) * 2 * 2;
-            codes + sideband
-        }
+        StoreLayout::Affine { bits, group } => affine_tuple(data, geom, bits, group).byte_size(),
     }
 }
 
@@ -1306,40 +1368,13 @@ fn measured_side_bytes(layout: StoreLayout, data: &[f32]) -> u64 {
 fn model_side_store(layout: StoreLayout) -> Option<super::SideStore> {
     match layout {
         StoreLayout::Bf16 => None,
-        StoreLayout::Q8
-        | StoreLayout::Turbo(_)
-        | StoreLayout::Tcq(_)
-        | StoreLayout::Affine { .. } => Some(super::SideStore::Generic),
+        StoreLayout::Q8 => Some(super::SideStore::Q8),
+        StoreLayout::Turbo(_) | StoreLayout::Tcq(_) => Some(super::SideStore::Turbo),
+        StoreLayout::Affine { group, .. } => Some(super::SideStore::Affine { group }),
         StoreLayout::Planar(_) => Some(super::SideStore::Planar),
         StoreLayout::IsoRing(_) => Some(super::SideStore::IsoRing),
         StoreLayout::IsoBlocks(_) => Some(super::SideStore::IsoBlocks),
         StoreLayout::Rotor(_) => Some(super::SideStore::Rotor),
-    }
-}
-
-/// The model's bytes divided by the store's, over the fixture.
-///
-/// `1.0` means the model is byte-for-byte. Anything else is a **deliberate**
-/// deviation and is pinned to its magnitude here rather than skipped, so a
-/// cadence change moves this number instead of quietly widening a tolerance.
-/// Every deviation in the tree is `> 1.0` — the model charging more than the
-/// store holds — which is the safe direction: it can only warn about a codec
-/// that is fine, never bless one that is not.
-fn model_over_store(layout: StoreLayout) -> f64 {
-    match layout {
-        // One f32 per 32 values modelled against q8_0's one per 128: 9.00 / 8.25.
-        StoreLayout::Q8 => 12.0 / 11.0,
-        // Same cadence against a scale AND a bias at bf16 per `group`.
-        StoreLayout::Affine { bits, group } => {
-            (f64::from(bits) + 1.0) / (f64::from(bits) + 32.0 / f64::from(group))
-        }
-        StoreLayout::Bf16
-        | StoreLayout::Turbo(_)
-        | StoreLayout::Tcq(_)
-        | StoreLayout::Planar(_)
-        | StoreLayout::IsoRing(_)
-        | StoreLayout::IsoBlocks(_)
-        | StoreLayout::Rotor(_) => 1.0,
     }
 }
 
@@ -1405,119 +1440,223 @@ fn codec_side_layouts(q: KvQuant) -> [StoreLayout; 2] {
         KvQuant::Rotor4Sym => [StoreLayout::Rotor(4), StoreLayout::Rotor(4)],
         KvQuant::RotorKOnly3 => [StoreLayout::Rotor(3), StoreLayout::Bf16],
         KvQuant::RotorKOnly4 => [StoreLayout::Rotor(4), StoreLayout::Bf16],
+        // The V axis is TurboQuant, not affine. `v_group_size` is a layout-key
+        // tag the V encoder never reads, so it names no store parameter here.
         KvQuant::RotorK3Asym {
             v_bits,
-            v_group_size,
-        } => [
-            StoreLayout::Rotor(3),
-            StoreLayout::Affine {
-                bits: u32::from(v_bits),
-                group: u32::from(v_group_size),
-            },
-        ],
+            v_group_size: _,
+        } => [StoreLayout::Rotor(3), StoreLayout::Turbo(v_bits)],
         KvQuant::RotorK4Asym {
             v_bits,
-            v_group_size,
-        } => [
-            StoreLayout::Rotor(4),
-            StoreLayout::Affine {
-                bits: u32::from(v_bits),
-                group: u32::from(v_group_size),
-            },
-        ],
+            v_group_size: _,
+        } => [StoreLayout::Rotor(4), StoreLayout::Turbo(v_bits)],
+    }
+}
+
+/// The affine sideband is a scale **and** a bias at the KV stream's dtype, and
+/// the KV stream is bf16 — so 32 bits per group, not 64.
+///
+/// The figure was stated at both values in this crate and neither was read off
+/// an allocation. It is load-bearing: `validate_mixed_side` accepts
+/// `group_size == 32`, where the two readings differ by a whole bit per value —
+/// `bits + 2.0` against `bits + 1.0`. The estimator now charges the measured
+/// one, so the number below is the one `SideStore::Affine` spends and a change
+/// to either has to come back through here.
+///
+/// Read from `mx.quantize`'s own output over a bf16 input, which is what
+/// `exit_prefill` stores (`bulk_init_from_fp16`).
+#[test]
+fn affine_sideband_is_thirty_two_bits_per_group() {
+    let geom = Cadence {
+        head_dim: 128,
+        kv_heads: 4,
+        seq: 64,
+    };
+    let data = geom.data();
+    let elems = geom.values();
+
+    for (bits, group) in [(8u32, 32u32), (8, 64), (8, 128), (4, 64), (2, 32)] {
+        let tuple = affine_tuple(&data, geom, bits, group);
+        assert_eq!(
+            tuple.scales.dtype(),
+            Dtype::Bf16,
+            "affine scales follow the input dtype; a bf16 KV stream must not \
+             produce an f32 scale"
+        );
+        assert_eq!(tuple.biases.dtype(), Dtype::Bf16, "same for the bias");
+
+        let codes = elems * u64::from(bits) / 8;
+        let sideband = tuple.byte_size() - codes;
+        let groups = elems / u64::from(group);
+        assert_eq!(
+            sideband * 8 / groups,
+            32,
+            "bits={bits} group={group}: the sideband is a scale and a bias at \
+             the input dtype — 32 bits per group, not 64 (f32) and not 16 (one \
+             scalar). Measured {sideband} B over {groups} groups."
+        );
     }
 }
 
 /// Every codec's byte model is checked against the store it names, per axis and
-/// then whole.
+/// then whole, at every geometry in [`CADENCE_GEOMETRIES`].
 ///
-/// Three assertions per codec, and they fail for different reasons on purpose:
+/// Three assertions per codec per geometry, and they fail for different reasons
+/// on purpose:
 ///
 /// 1. **The layout the estimator picked is the layout the codec writes.**
 ///    `KvQuant::side_stores` against [`codec_side_layouts`]. A codec whose store
 ///    changes family fails here first.
 /// 2. **The cadence is right.** The estimator's per-side bytes against the bytes
-///    that store's own encoder produced, at the exact ratio
-///    [`model_over_store`] declares. Reaches every layout including the ones no
-///    live codec materialises today — the planar arm is only reachable this way,
-///    and a cadence nothing can call is a gate that cannot fail.
+///    that store's own encoder produced — byte for byte, no declared ratio and
+///    no tolerance. Reaches every layout including the four no live codec
+///    materialises today (`Q8`, `Turbo`, `Planar`, `IsoBlocks`), which are only
+///    reachable this way, and a cadence nothing can call is a gate that cannot
+///    fail.
 /// 3. **The gating is right.** The whole-codec estimate against the per-side
 ///    model re-assembled through `materialises_packed_store` and the two
 ///    `feeds_bf16_*` predicates. Independent of (2): this one moves when a
 ///    codec's mirror or store disposition changes, not when a cadence does.
 #[test]
 fn every_codec_byte_model_matches_the_store_it_writes() {
-    let data = cadence_fixture();
-    let elems = CADENCE_VALUES as u64;
-    let n_tokens = CADENCE_ROWS as u64;
+    for &geom in CADENCE_GEOMETRIES {
+        let data = geom.data();
+        let elems = geom.values();
+        let n_tokens = geom.rows();
 
-    for &q in ALL_KV_QUANTS {
-        let layouts = codec_side_layouts(q);
-        let (k_bits, v_bits) = q.approx_code_bits();
-        let bits = [k_bits, v_bits];
-        let (k_store, v_store) = q.side_stores();
-        let stores = [k_store, v_store];
-        let packs = q.materialises_packed_store();
-        let feeds = [q.feeds_bf16_k_at_decode(), q.feeds_bf16_v_at_decode()];
+        for &q in ALL_KV_QUANTS {
+            let layouts = codec_side_layouts(q);
+            let (k_bits, v_bits) = q.approx_code_bits();
+            let bits = [k_bits, v_bits];
+            let (k_store, v_store) = q.side_stores();
+            let stores = [k_store, v_store];
+            let packs = q.materialises_packed_store();
+            let feeds = [q.feeds_bf16_k_at_decode(), q.feeds_bf16_v_at_decode()];
 
-        let mut expected_total = 0u64;
-        for axis in 0..2 {
-            let (layout, store, side_bits) = (layouts[axis], stores[axis], bits[axis]);
-            let side = if axis == 0 { "K" } else { "V" };
+            let mut expected_total = 0u64;
+            for axis in 0..2 {
+                let (layout, store, side_bits) = (layouts[axis], stores[axis], bits[axis]);
+                let side = if axis == 0 { "K" } else { "V" };
 
-            // (1) same layout.
-            assert_eq!(
-                store,
-                model_side_store(layout),
-                "{q} {side}: the estimator sizes this side from {store:?} but the codec \
-                 writes {layout:?}"
-            );
+                // (1) same layout.
+                assert_eq!(
+                    store,
+                    model_side_store(layout),
+                    "{q} {side}: the estimator sizes this side from {store:?} but the codec \
+                     writes {layout:?}"
+                );
 
-            // (2) same cadence, at the declared ratio.
-            let actual = measured_side_bytes(layout, &data);
-            expected_total += match store {
-                None => {
-                    assert_eq!(
-                        actual,
-                        elems * 2,
-                        "{q} {side}: an unquantised axis is two bytes per value"
-                    );
-                    elems * 2
-                }
-                Some(store) => {
-                    let modelled = super::packed_side_bytes(
-                        store,
-                        side_bits,
-                        elems,
-                        CADENCE_HEAD_DIM,
-                        n_tokens,
-                    );
-                    let ratio = modelled as f64 / actual as f64;
-                    let want = model_over_store(layout);
-                    assert!(
-                        (ratio - want).abs() < 1e-9,
-                        "{q} {side}: the model holds {modelled} B for a {layout:?} store of \
-                         {actual} B (ratio {ratio}), but the declared relation is {want}. \
-                         Either the cadence drifted from the store or the deviation is no \
-                         longer the one model_over_store records."
-                    );
-                    // (3) gating: a codec that builds no store holds only mirrors.
-                    if packs {
-                        modelled + if feeds[axis] { elems * 2 } else { 0 }
-                    } else {
+                // (2) same cadence, byte for byte.
+                let actual = measured_side_bytes(layout, &data, geom);
+                expected_total += match store {
+                    None => {
+                        assert_eq!(
+                            actual,
+                            elems * 2,
+                            "{q} {side}: an unquantised axis is two bytes per value"
+                        );
                         elems * 2
                     }
-                }
-            };
-        }
+                    Some(store) => {
+                        let modelled = super::packed_side_bytes(
+                            store,
+                            side_bits,
+                            elems,
+                            geom.head_dim,
+                            n_tokens,
+                        );
+                        assert_eq!(
+                            modelled, actual,
+                            "{q} {side} at head_dim={}: the model holds {modelled} B for a \
+                             {layout:?} store of {actual} B. The cadence drifted from the \
+                             store it models.",
+                            geom.head_dim
+                        );
+                        // (3) gating: a codec that builds no store holds only mirrors.
+                        if packs {
+                            modelled + if feeds[axis] { elems * 2 } else { 0 }
+                        } else {
+                            elems * 2
+                        }
+                    }
+                };
+            }
 
-        assert_eq!(
-            q.estimated_resident_bytes_per_layer(CADENCE_SEQ, CADENCE_HEAD_DIM, CADENCE_KV_HEADS),
-            expected_total,
-            "{q}: whole-codec estimate disagrees with its own per-side model assembled \
-             through materialises_packed_store + feeds_bf16_k/v"
-        );
+            assert_eq!(
+                q.estimated_resident_bytes_per_layer(geom.seq, geom.head_dim, geom.kv_heads),
+                expected_total,
+                "{q} at head_dim={}: whole-codec estimate disagrees with its own per-side \
+                 model assembled through materialises_packed_store + feeds_bf16_k/v",
+                geom.head_dim
+            );
+        }
     }
+}
+
+/// Three of the seven [`SideStore`] variants are reachable from the estimator;
+/// four are latent, and named only by codecs that build no store.
+///
+/// The type's own doc says which, and a doc is not a gate. The estimator sizes
+/// a side only when `materialises_packed_store` holds, so a layout named
+/// exclusively by mirror-family codecs is never evaluated in production — its
+/// cadence is reached only by
+/// [`every_codec_byte_model_matches_the_store_it_writes`], which is why that
+/// test calls `packed_side_bytes` directly instead of going through the
+/// estimator. If a latent layout becomes live (a codec grows a decode path over
+/// its store), this fails and the doc has to be rewritten in the same change.
+///
+/// Latent is not dead: every one of the four is the true layout of the side that
+/// names it, and this asserts each is named.
+#[test]
+fn the_estimator_reaches_three_of_the_seven_store_layouts() {
+    fn tag(s: super::SideStore) -> &'static str {
+        match s {
+            super::SideStore::Q8 => "Q8",
+            super::SideStore::Turbo => "Turbo",
+            super::SideStore::Affine { .. } => "Affine",
+            super::SideStore::Planar => "Planar",
+            super::SideStore::IsoRing => "IsoRing",
+            super::SideStore::IsoBlocks => "IsoBlocks",
+            super::SideStore::Rotor => "Rotor",
+        }
+    }
+
+    let mut live: Vec<&'static str> = Vec::new();
+    let mut named: Vec<&'static str> = Vec::new();
+    for &q in ALL_KV_QUANTS {
+        let (k, v) = q.side_stores();
+        for store in [k, v].into_iter().flatten() {
+            named.push(tag(store));
+            if q.materialises_packed_store() {
+                live.push(tag(store));
+            }
+        }
+    }
+    live.sort_unstable();
+    live.dedup();
+    named.sort_unstable();
+    named.dedup();
+
+    assert_eq!(
+        live,
+        ["Affine", "IsoRing", "Rotor"],
+        "the estimator evaluates these store layouts in production; the SideStore doc and \
+         the net-negative warn's wording both name that set"
+    );
+    assert_eq!(
+        named,
+        [
+            "Affine",
+            "IsoBlocks",
+            "IsoRing",
+            "Planar",
+            "Q8",
+            "Rotor",
+            "Turbo"
+        ],
+        "every SideStore variant must be the declared layout of some codec's side — one \
+         that no codec names is a cadence modelling nothing"
+    );
 }
 
 /// A side that reports 16 bits from `approx_code_bits` has no packed store, and
@@ -1555,6 +1694,13 @@ fn side_stores_agree_with_approx_code_bits() {
 /// reading that moves when the grouping does. This repo has shipped a sweep that
 /// iterated a literal list and ran 21 variants behind while reporting full
 /// coverage; the count is what stops that.
+///
+/// The count alone does not: exhaustiveness plus an equal arm count forces a
+/// bijection only while no arm can cover two variants and none can cover a
+/// variant the compiler would otherwise demand. A `_ =>` catch-all added
+/// alongside one `|`-grouped arm restores both the count and the
+/// exhaustiveness, and defeats the reading. So the shape of the arms is
+/// asserted too, not just how many there are.
 #[test]
 fn codec_side_layouts_has_one_arm_per_listed_codec() {
     const SRC: &str = include_str!("quant_tests.rs");
@@ -1568,6 +1714,20 @@ fn codec_side_layouts_has_one_arm_per_listed_codec() {
     let Some((body, _)) = after_open.split_once("\n}\n") else {
         panic!("could not find the end of `codec_side_layouts` in quant_tests.rs")
     };
+    for line in body.lines() {
+        let t = line.trim();
+        assert!(
+            !t.starts_with("_ =>") && !t.starts_with("_=>") && !t.starts_with("_ if"),
+            "`codec_side_layouts` has a catch-all arm (`{t}`). With one, the count below \
+             stops implying a bijection: a `|`-grouped arm can hide a variant and the \
+             catch-all restores the count the compiler would otherwise have broken."
+        );
+        assert!(
+            !t.starts_with('|') && !t.contains(" | "),
+            "`codec_side_layouts` groups patterns with `|` (`{t}`). One arm per variant — \
+             a grouped arm is swept under its neighbour's layouts and never on its own."
+        );
+    }
     let arms = body.lines().filter(|line| line.contains("=>")).count();
 
     assert_eq!(

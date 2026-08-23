@@ -157,9 +157,11 @@ _SIMPLE = {
 # weight quantiser, which is gs_128/gs_32 on these snapshots.
 _READS_PACKED = {"Mixed", "RotK"}
 
-# Affine scale+bias sideband, bits per group. Inferred from the fp16 signature on
-# the captured kernel names, NOT from a dumped tuple -- if the store ever carries
-# uint8 scales this term is 2x too large. Verify before quoting a tight ratio.
+# Affine scale+bias sideband, bits per group. MEASURED off a real MixedTuple by
+# `affine_sideband_is_thirty_two_bits_per_group` (crates/rmlx-kv-quant/src/
+# quant_tests.rs): mx.quantize(mode="affine") emits scales and biases at the
+# input dtype, and the KV stream reaching the store is bf16 because
+# `cast_store_bf16` floors it there -- two bytes each, 32 bits per group.
 _AFFINE_SIDEBAND_BITS = 32
 
 # Store group sizes, from source: q8.rs Q8_GROUP_SIZE and turboquant.rs GROUP_SIZE.
@@ -243,7 +245,7 @@ def parse_codec(s: str) -> Codec:
 
 
 def _side_bytes(c: Codec, bits: int, elems: int, n_tokens: int, head_dim: int,
-                uses_family: bool, retains_seed: bool) -> int:
+                uses_family: bool, retains_seed: bool, group: int) -> int:
     """Per-side stored+seed bytes. Mirrors the `side_bytes` closure and
     `packed_side_bytes` in quant.rs; the family split mirrors `SideStore`."""
     if bits >= 16:
@@ -254,9 +256,10 @@ def _side_bytes(c: Codec, bits: int, elems: int, n_tokens: int, head_dim: int,
         # `gpu_codes_buf.is_none()` init; quant_planar_k.rs is bit-identical).
         # 22.00 bits per value at every head_dim and at BOTH bit widths -- the
         # 3-bit pack is 10 vals/u32, ceil(32/10) = 4 words, the same word count
-        # as 4-bit's 8 vals/u32. The generic cadence below would model this at
-        # 5.0, understating a store that is ABOVE bf16's 16.0 by 4.4x and in the
-        # codec's favour.
+        # as 4-bit's 8 vals/u32. Reading it as codes plus one f32 per 32 values
+        # would give 5.0 bits for the 4-bit members and 4.0 for planar3 --
+        # understating a store that is ABOVE bf16's 16.0 by 4.4x and 5.5x, and
+        # in the codec's favour.
         groups = elems // TURBO_GROUP_SIZE
         stored = groups * 4 * 4 + (elems // 2) * 4 + groups * 2 * 4
     elif uses_family and c.kind in _ISO:
@@ -271,23 +274,28 @@ def _side_bytes(c: Codec, bits: int, elems: int, n_tokens: int, head_dim: int,
         stored = groups * (4 + 4) + n_tokens * 4
     else:
         codes = elems * bits // 8
-        # Sideband cadence is per-store, not a single constant. The Rust
-        # generic arm charges one f32 per 32 elements for all three stores it
-        # serves; measured against them:
-        #   q8_0 K   -- Q8_GROUP_SIZE = 128 (q8.rs:33)        -> /32 is 4x high
-        #   TurboQuant V -- GROUP_SIZE = 32 (turboquant.rs:70) -> /32 is EXACT
-        #   Mixed/RotK affine -- group from the codec name, and the store is an
-        #     mx.quantize 3-tuple, so the sideband is scale AND bias in the
-        #     input dtype (mixed_quant/state.rs:29-34), not one f32
-        #     -> /32 is 2x high AND structurally the wrong shape.
+        # Sideband cadence is per-store, not a single constant, and the Rust
+        # `SideStore` arms are now per-store too -- Q8, Turbo and Affine{group},
+        # each byte-exact against its own encoder
+        # (`every_codec_byte_model_matches_the_store_it_writes`). The three
+        # branches below are those three arms, and the two models agree:
+        #   q8_0 K   -- Q8_GROUP_SIZE = 128 (q8.rs:33), one f32 per group
+        #   TurboQuant V -- GROUP_SIZE = 32 (turboquant.rs:70), one f32 per group
+        #   Mixed/RotK affine -- group from the codec name; the store is an
+        #     mx.quantize 3-tuple, so the sideband is a scale AND a bias at the
+        #     input dtype, 32 bits per group on the bf16 stream a cache holds
+        #     (measured: `affine_sideband_is_thirty_two_bits_per_group`).
         # Those three are the WHOLE list this arm serves. Planar used to fall in
         # here unnamed and was modelled at 5.0 against a measured 22.0; it now
         # has its own branch above. An audit that enumerates the stores it
         # checked is only as good as the enumeration.
         # Footprint figures only: decode_read_bytes_per_layer never reaches here.
         if c.kind in _READS_PACKED:
-            group = (c.k_group if bits == c.k_bits else c.v_group) or 64
-            scales = int(elems / group) * 2 * BF16
+            # The affine group is this axis's own, passed in by the caller. It
+            # cannot be recovered from `bits` here: a codec whose two axes share
+            # a width but not a group (mixed_k8g128_v8g32) would take the K
+            # group for both.
+            scales = int(elems / (group or 64)) * 2 * BF16
         elif bits == 8:
             scales = (elems // Q8_GROUP_SIZE) * 4
         else:
@@ -345,9 +353,9 @@ def resident_bytes_per_layer(c: Codec, seq: int, head_dim: int,
         return elems * BF16 * 2
     n_tokens = seq * kv_heads
     k = _side_bytes(c, c.k_bits, elems, n_tokens, head_dim,
-                    c.kind in _K_FAMILY, c.kind not in _NO_BF16_K)
+                    c.kind in _K_FAMILY, c.kind not in _NO_BF16_K, c.k_group)
     v = _side_bytes(c, c.v_bits, elems, n_tokens, head_dim,
-                    c.kind in _V_FAMILY, c.kind not in _NO_BF16_V)
+                    c.kind in _V_FAMILY, c.kind not in _NO_BF16_V, c.v_group)
     return k + v
 
 
@@ -393,12 +401,12 @@ def decode_read_bytes_per_layer(c: Codec, seq: int, head_dim: int,
         k = elems * BF16
     else:
         k = _side_bytes(c, c.k_bits, elems, n_tokens, head_dim,
-                        c.kind in _K_FAMILY, False)
+                        c.kind in _K_FAMILY, False, c.k_group)
     if c.kind not in _NO_BF16_V:
         v = elems * BF16
     else:
         v = _side_bytes(c, c.v_bits, elems, n_tokens, head_dim,
-                        c.kind in _V_FAMILY, False)
+                        c.kind in _V_FAMILY, False, c.v_group)
     return k + v
 
 

@@ -157,27 +157,36 @@ is estimated to increase resident KV vs bf16 on the active layer mix:
 WARN KV codec increases resident KV vs bf16 on this layer mix — the
 per-global-layer warm-TTFT bf16 seed plus codec scales exceed the bytes saved
 at this context; windowed layers already run bf16 and are unaffected. Read the
-sign, not the magnitude: the estimator over-charges the affine and q8_0
-per-group sidebands, and under-reports an iso codec until its fused decode path
-drops the CPU blocks the prefill encode built. Consider --kv-quant none if
-memory is the goal.
-  kv_quant=mixed_k8g64_v8g64 eff_seq=8192 n_global=7 n_windowed=28 est_extra_bytes=51380224
+sign, not the magnitude: the estimator under-reports an iso codec while a layer
+holds the CPU blocks the prefill encode built — until the first fused decode
+step drops them, or for the whole request on a layer the fused path's shape gate
+rejects (batch > 1, or a head_dim that is not a power of two at most 512), where
+they are never dropped. Consider --kv-quant none if memory is the goal.
+  kv_quant=mixed_k8g64_v8g64 eff_seq=8192 n_global=7 n_windowed=28 est_extra_bytes=31195136
 ```
 
-Only the **sign** of that number is exact; size nothing from its magnitude. It
-errs in both directions, and the two are separate:
+(Gemma4 e2b: 7 global layers at `head_dim` 256, 1 KV head, 8192 tokens — each
+holds 12 845 056 B under the codec against 8 388 608 B of bf16.)
 
-- **High** for `Mixed` / `RotK` and for any q8_0 K side. One generic cadence —
-  one `f32` per 32 values — stands for three stores whose real cadences are one
-  `f32` per 128 (q8_0) and a bf16 scale *and* bias per `group_size` (affine).
-  That direction is safe: the model cannot bless a codec the store does not.
-- **Low** for `k_iso*` / `iso*_sym`. The estimator sizes an iso side from the
-  GPU ring, which is what a served request settles at; but `exit_prefill`
-  bulk-encodes into CPU `IsoBlocks` 2.97× the ring, and those are freed only on
-  the first fused decode step (`drop_blocks_when_ring_live_iso_*`). Over that
-  window — and for the whole request on a layer the flash dispatcher's shape
-  gate rejects, i.e. batch > 1 or a `head_dim` that is not a power of two at
-  most 512 — the cache holds more than the warn reported.
+Only the **sign** of that number is exact; size nothing from its magnitude.
+
+Each side is now sized byte-for-byte against the store it writes — every
+`SideStore` cadence is measured against that store's own encoder by
+`every_codec_byte_model_matches_the_store_it_writes`, at `head_dim` 64, 128 and
+256, with no declared ratio and no tolerance. What the estimate still does not
+model is page rounding, the static per-layer rotation tables, and GPU/CPU
+residual coexistence.
+
+One error remains, and it runs **low**, for `k_iso*` / `iso*_sym`. The estimator
+sizes an iso side from the GPU ring, which is what a served request settles at;
+but `exit_prefill` bulk-encodes into CPU `IsoBlocks` 2.97× the ring. Those are
+freed on the first fused decode step (`drop_blocks_when_ring_live_iso_*`) — on a
+layer the fused path serves. On a layer whose shape its gate rejects (batch > 1,
+or a `head_dim` that is not a power of two at most 512 — `head_dim = 80`
+qualifies), `update_and_sdpa_iso_k_fused` returns before any mutation, the ring
+is never allocated, the drop is a no-op, and the blocks are what that layer
+holds for the whole request. That case is a property of the model's geometry,
+not a startup window: it does not end.
 
 The estimate is model-agnostic — keyed only on layer geometry (`head_dim`,
 `kv_heads`, `window`) and codec attributes (the per-side store layout from
@@ -2162,9 +2171,12 @@ the codebook width) and sizes the four store-reading members from the **ring**,
 which is what a served request holds: their fused append seeds the ring from the
 prefill CPU blocks and then drops the blocks
 (`drop_blocks_when_ring_live_iso_*`). The block form above is what `iso3` /
-`iso4` would hold if a kernel ever read their store, and what any iso store
-holds over the window between `exit_prefill` and the first fused decode step —
-the one interval in which the estimate runs low rather than high.
+`iso4` would hold if a kernel ever read their store, and what a store-reading
+member holds in the two cases where the estimate runs low rather than high: the
+window between `exit_prefill` and the first fused decode step, and — for the
+whole request — a layer whose shape the fused path's gate rejects (batch > 1, or
+a `head_dim` that is not a power of two at most 512), where the ring is never
+allocated and the drop is a no-op.
 
 **Crate-wide rate ceiling.** `crates/rmlx-kv-quant/src/kv_rate_tests.rs` reports
 every store family's bits per value and fails any family above bf16's 16.0 that
@@ -2187,26 +2199,31 @@ Table at `head_dim = 128`:
 | turbo3 / tcq3 | 4.00 | measured | under |
 | turbo4 | 5.00 | measured | under |
 | q8 (group 128) | 8.25 | measured | under |
-| affine (`CacheType::Q8G32`) | 10.00 | layout formula | under |
+| affine (`CacheType::Q8G32`) | 9.00 | layout formula, measured sideband | under |
 | bf16 | 16.00 | by definition | the floor |
 | **rotor3 / rotor4** | **21.75** | measured | exempt |
 | **planar3 / planar4** | **22.00** | measured | exempt |
 | **iso3 / iso4** (`IsoBlocks`) | **48.25** | measured | exempt |
 
 "Measured" means the summed byte length of the buffers that family's own CPU
-encoder produced over a shared fixture. The two non-measured rows have no CPU
+encoder produced over a shared fixture. The two remaining rows have no CPU
 encoder in this crate: bf16 is two bytes per value by definition, and MLX affine
-is `bits + 64/group` — code bits plus one `f32` scale and one `f32` bias per
-group.
+is `bits + 32/group` — code bits plus one scale and one bias per group, each at
+the KV stream's dtype. **That sideband is 32 bits, measured**, not 64: the
+stream reaching the store is bf16 (`cast_store_bf16` floors it at the store
+boundary) and `mx.quantize(mode = "affine")` emits both scalars at the input
+dtype. `affine_sideband_is_thirty_two_bits_per_group`
+(`crates/rmlx-kv-quant/src/quant_tests.rs`) reads the figure off a real
+`MixedTuple` rather than restating it.
 
-**The affine row is not a bound over every parseable config.** It covers the
-widest *enumerable* `CacheType` (`q8_g32`). The `mixed_k<b>g<g>_v<b>g<g>`
-grammar reads the group size as a bare `u16` with no whitelist and no floor, so
-`mixed_k8g4_v8g4` parses and stores `8 + 64/4 = 24` bits per value — above the
-floor and invisible to an enum-driven gate, because the rate is a property of a
-runtime field with an unbounded domain rather than of the variant. Pinned by
-`mixed_grammar_admits_affine_rates_above_the_floor` rather than fixed: adding a
-parser floor rejects configs that parse today, which is a CLI-surface decision.
+**The affine row covers the whole `mixed_*` grammar.** It is evaluated at the
+widest cadence the accepted grid reaches (`q8_g32`, 9.00), and `parse_kv_side`
+now validates both sides against MLX's affine grid (`validate_mixed_side`:
+2/3/4/5/6/8 bits, group 32/64/128), so every parseable spelling has a rate this
+table enumerates. Before that floor the group size was a bare `u16`, and
+`mixed_k8g4_v8g4` parsed at `8 + 32/4 = 16` bits per value with nothing bounding
+it below that group. Pinned by
+`mixed_grammar_no_longer_admits_unbounded_affine_rates`.
 
 **`head_dim % 4 == 0` constraint.** iso3 operates in groups of 4. Any
 `head_dim` not divisible by 4 is rejected at encode/decode time with

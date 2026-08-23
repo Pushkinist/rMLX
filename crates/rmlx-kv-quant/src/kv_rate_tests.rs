@@ -64,9 +64,13 @@ enum Rate {
     Measured(fn(&[f32]) -> u64),
     /// bf16 — two bytes per value by definition; there is no encoder to run.
     Bf16,
-    /// MLX affine (`scale` + `bias` f32 per group). This crate has no CPU
-    /// encoder for it, so the rate is the layout itself: `bits` code bits per
-    /// value plus 64 sideband bits per group. Evaluated at the widest cadence
+    /// MLX affine (`scale` + `bias` per group, each at the KV stream's dtype).
+    /// This crate has no CPU encoder for it, so the rate is the layout itself:
+    /// `bits` code bits per value plus **32** sideband bits per group — the
+    /// stream is bf16 (`cast_store_bf16` floors it at the store boundary), so
+    /// the two scalars are two bytes each. The figure is read off a real
+    /// `MixedTuple` by `affine_sideband_is_thirty_two_bits_per_group`
+    /// (`quant_tests.rs`), not restated here. Evaluated at the widest cadence
     /// any shipped `KvQuant` reaches, so it is an upper bound over the whole
     /// affine grid rather than one point of it.
     AffineLayout { bits: u32, group: u32 },
@@ -119,6 +123,16 @@ fn measure_iso(data: &[f32], bits: u8) -> u64 {
     4 * (codes.len() + scales.len() + quats.len() + norms.len()) as u64
 }
 
+/// The TurboQuant family entry for a `bits`-wide V axis.
+fn turbo_family(bits: u8) -> &'static str {
+    match bits {
+        2 => "turbo2",
+        3 => "turbo3",
+        4 => "turbo4",
+        _ => panic!("no TurboQuant family entry for {bits}-bit V"),
+    }
+}
+
 fn measure_rotor(data: &[f32], bits: u8) -> u64 {
     let rotors = crate::clifford::make_rotor_table(0, 0, n_groups_for(HEAD_DIM));
     let (codes, scales, norms) = if bits == 3 {
@@ -148,12 +162,11 @@ const FAMILIES: &[Family] = &[
         verdict: Verdict::UnderBf16,
     },
     Family {
-        // The widest cadence any **enumerable** affine cache type reaches:
-        // `CacheType::Q8G32` (8-bit, group 32) at 10.0 bits per value. This is
-        // NOT a bound over every parseable affine config — the `mixed_*`
-        // grammar takes an unvalidated group size, so rates above the floor are
-        // expressible and this gate cannot see them. See
-        // `mixed_grammar_admits_affine_rates_above_the_floor`.
+        // The widest cadence the affine grid reaches: `CacheType::Q8G32`
+        // (8-bit, group 32) at 9.0 bits per value. This IS a bound over every
+        // parseable affine config — `validate_mixed_side` bounds the group size
+        // to 32/64/128 and the width to the set MLX implements, so the grid is
+        // finite. See `mixed_grammar_no_longer_admits_unbounded_affine_rates`.
         name: "affine",
         rate: Rate::AffineLayout { bits: 8, group: 32 },
         verdict: Verdict::UnderBf16,
@@ -239,7 +252,7 @@ fn family_rate(f: &Family, data: &[f32]) -> f64 {
     match f.rate {
         Rate::Measured(m) => stored_bits_per_value(m(data), VALUES),
         Rate::Bf16 => stored_bits_per_value(2 * VALUES as u64, VALUES),
-        Rate::AffineLayout { bits, group } => f64::from(bits) + 64.0 / f64::from(group),
+        Rate::AffineLayout { bits, group } => f64::from(bits) + 32.0 / f64::from(group),
     }
 }
 
@@ -392,10 +405,11 @@ fn rotor_rate_splits_into_documented_code_scale_and_norm_bits() {
 /// then it is review's job, and saying so plainly is worth more than a third
 /// mechanism that does not work.
 ///
-/// `Mixed` / `RotK` / the asym variants carry runtime bit and group fields and
-/// map to the `affine` family — whose entry bounds the *enumerable* cache types
-/// only, not every parseable config (see
-/// [`mixed_grammar_admits_affine_rates_above_the_floor`]).
+/// `Mixed` / `RotK` carry runtime bit and group fields and map to the `affine`
+/// family, whose entry bounds the whole parseable grid (see
+/// [`mixed_grammar_no_longer_admits_unbounded_affine_rates`]). The `RotorK*Asym`
+/// variants do **not**: their V axis is TurboQuant at a fixed 32-element group,
+/// whatever `v_group_size` says.
 #[test]
 fn every_kv_quant_variant_names_its_store_families() {
     let data = fixture();
@@ -433,8 +447,11 @@ fn every_kv_quant_variant_names_its_store_families() {
             KvQuant::Rotor4Sym => ["rotor4", "rotor4"],
             KvQuant::RotorKOnly3 => ["rotor3", "bf16"],
             KvQuant::RotorKOnly4 => ["rotor4", "bf16"],
-            KvQuant::RotorK3Asym { .. } => ["rotor3", "affine"],
-            KvQuant::RotorK4Asym { .. } => ["rotor4", "affine"],
+            // The V axis is TurboQuant, not affine: `QuantV::new_affine_decode`
+            // is a misnomer for the N(0,1) Lloyd-Max codec at a fixed group of
+            // 32, and `v_group_size` never reaches it (validate_rotor_k_asym_v).
+            KvQuant::RotorK3Asym { v_bits, .. } => ["rotor3", turbo_family(*v_bits)],
+            KvQuant::RotorK4Asym { v_bits, .. } => ["rotor4", turbo_family(*v_bits)],
         }
     };
 
@@ -475,13 +492,15 @@ fn every_kv_quant_variant_names_its_store_families() {
         KvQuant::Rotor4Sym,
         KvQuant::RotorKOnly3,
         KvQuant::RotorKOnly4,
+        // (8, *) is not an accepted V codec here — `validate_rotor_k_asym_v`
+        // rejects it, so a representative carrying it represents nothing.
         KvQuant::RotorK3Asym {
-            v_bits: 8,
-            v_group_size: 128,
+            v_bits: 4,
+            v_group_size: 64,
         },
         KvQuant::RotorK4Asym {
-            v_bits: 8,
-            v_group_size: 128,
+            v_bits: 4,
+            v_group_size: 64,
         },
     ];
 
@@ -511,7 +530,8 @@ fn every_kv_quant_variant_names_its_store_families() {
 ///
 /// This test used to pin the opposite, and said so: `parse_kv_side` read the
 /// group size as a bare `u16` with no whitelist, so `mixed_k8g4_v8g4` parsed
-/// and stored `8 + 64/4 = 24` bits per value on each axis — a rate no
+/// and stored `8 + 32/4 = 16` bits per value on each axis, and nothing bounded
+/// the group below that (`g1` is 40) — a rate no
 /// enum-driven table can see, because it is a property of a runtime field with
 /// an unbounded domain rather than of the variant. Its own failure message
 /// named the disposition: *"if this now fails, the parser grew a floor and this
@@ -532,7 +552,7 @@ fn mixed_grammar_no_longer_admits_unbounded_affine_rates() {
     );
 
     // The accepted grid is finite, so its worst rate is a number this test can
-    // state: 8 bits at group 32 = 8 + 64/32 = 10.00 bits per value per axis.
+    // state: 8 bits at group 32 = 8 + 32/32 = 9.00 bits per value per axis.
     // Before the floor, the grid had no worst case at all.
     let mut worst = 0.0_f64;
     for group in [32u16, 64, 128] {
@@ -540,12 +560,12 @@ fn mixed_grammar_no_longer_admits_unbounded_affine_rates() {
             let spec = format!("mixed_k{bits}g{group}_v{bits}g{group}");
             let parsed = spec.parse::<KvQuant>();
             assert!(parsed.is_ok(), "{spec} must parse, got {parsed:?}");
-            worst = worst.max(f64::from(bits) + 64.0 / f64::from(group));
+            worst = worst.max(f64::from(bits) + 32.0 / f64::from(group));
         }
     }
     assert!(
-        (worst - 10.0).abs() < 1e-9,
-        "worst parseable mixed rate is {worst:.2} bits per value, expected 10.00 — \
+        (worst - 9.0).abs() < 1e-9,
+        "worst parseable mixed rate is {worst:.2} bits per value, expected 9.00 — \
          the accepted grid moved, so the ceiling gate's coverage claim moved with it"
     );
     assert!(
