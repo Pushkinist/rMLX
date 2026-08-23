@@ -559,6 +559,11 @@ checkpoint.
 
 ### `KvStorage::K8V8` — symmetric 8-bit both sides
 
+> **INERT on this build** — `k8v8` decodes from the bf16 mirror on both
+> axes, so `exit_prefill` never builds the packed store described below and the
+> codec math never runs. Resident KV and generated tokens measure identical to
+> bf16. See § "Codec disposition — what every codec in the tree is for".
+
 **K codec**: rMLX MSL `q8_0` — symmetric affine, `group_size=128`. Per-group
 scale equals `max(|x|) / 127`; no bias term.
 **V codec**: identical codec to K.
@@ -628,6 +633,11 @@ relative to routing computation.
 ---
 
 ### `KvStorage::K8V4` — q8_0 K, TurboQuant 4-bit V
+
+> **INERT on this build** — `k8v4` decodes from the bf16 mirror on both
+> axes, so `exit_prefill` never builds the packed store described below and the
+> codec math never runs. Resident KV and generated tokens measure identical to
+> bf16. See § "Codec disposition — what every codec in the tree is for".
 
 **K codec**: rMLX MSL `q8_0`, `group_size=128` (identical to K8V8 K-side).
 **V codec**: TurboQuant 4-bit Lloyd-Max N(0,1) codebook, `group_size=32`.
@@ -910,6 +920,11 @@ per-context policy picked it at ≤8192 tokens, until both were retired.
 
 ### `KvStorage::Planar` — q8_0 K, PlanarQuant 4-bit V
 
+> **INERT on this build** — `planar` decodes from the bf16 mirror on both
+> axes, so `exit_prefill` never builds the packed store described below and the
+> codec math never runs. Resident KV and generated tokens measure identical to
+> bf16. See § "Codec disposition — what every codec in the tree is for".
+
 **K codec**: rMLX MSL `q8_0`, `group_size=128` (same as K8V8 / K8V4).
 **V codec**: PlanarQuant 4-bit with per-pair Givens rotation, `group_size=32`.
 
@@ -980,6 +995,11 @@ per-context policy picked it above 32K tokens, until both were retired.
 ---
 
 ### `KvStorage::Planar` (bits=3) — PlanarQuant 3-bit V
+
+> **INERT on this build** — `planar3` decodes from the bf16 mirror on both
+> axes, so `exit_prefill` never builds the packed store described below and the
+> codec math never runs. Resident KV and generated tokens measure identical to
+> bf16. See § "Codec disposition — what every codec in the tree is for".
 
 **KvQuant variant**: `KvQuant::Planar3`. Routes to `KvStorage::Planar { bits: 3 }` — no new storage variant.
 
@@ -1235,6 +1255,11 @@ codec does not retire the ability to check that codec's numerics.
 
 ### `KvStorage::K8VTurbo3` — q8_0 K, TurboQuant 3-bit V
 
+> **INERT on this build** — `k8vturbo3` decodes from the bf16 mirror on both
+> axes, so `exit_prefill` never builds the packed store described below and the
+> codec math never runs. Resident KV and generated tokens measure identical to
+> bf16. See § "Codec disposition — what every codec in the tree is for".
+
 **Status**: opt-in on every arch — `auto` is bf16 and never selects it. It was
 briefly the auto default for Gemma4 small, then reverted to K8V8 by the
 composite-score audit, and both of those tables are now retired (see "Retired:
@@ -1270,6 +1295,11 @@ is retained as a future-reference hook.
 ---
 
 ### `KvStorage::K8VTurbo3Tcq` — q8_0 K, TurboQuant 3-bit V with Viterbi trellis
+
+> **INERT on this build** — `k8vturbo3tcq` decodes from the bf16 mirror on both
+> axes, so `exit_prefill` never builds the packed store described below and the
+> codec math never runs. Resident KV and generated tokens measure identical to
+> bf16. See § "Codec disposition — what every codec in the tree is for".
 
 **Status**: opt-in via `--kv-quant k8vturbo3tcq`. Never an auto baseline.
 Turbo3-equivalent quality (same Lloyd-Max codebook, degenerate trellis — see
@@ -1355,6 +1385,11 @@ with canonical tag `k8v_turbo_3_tcq`, alias `turbo3_tcq` in
 
 ### `KvStorage::K8VTurbo2Tcq` — q8_0 K, TurboQuant 2-bit V with Viterbi trellis
 
+> **INERT on this build** — `k8vturbo2tcq` decodes from the bf16 mirror on both
+> axes, so `exit_prefill` never builds the packed store described below and the
+> codec math never runs. Resident KV and generated tokens measure identical to
+> bf16. See § "Codec disposition — what every codec in the tree is for".
+
 **Status**: opt-in via `--kv-quant k8vturbo2tcq`. Never an auto baseline.
 Turbo2-equivalent quality (same Lloyd-Max codebook, degenerate trellis — same
 caveat as K8VTurbo3Tcq above).
@@ -1403,6 +1438,11 @@ with canonical tag `k8v_turbo_2_tcq`, alias `turbo2_tcq` in
 ---
 
 ### `KvStorage::TurboSym4` — symmetric TurboQuant 4-bit K + V
+
+> **INERT on this build** — `tsym4` decodes from the bf16 mirror on both
+> axes, so `exit_prefill` never builds the packed store described below and the
+> codec math never runs. Resident KV and generated tokens measure identical to
+> bf16. See § "Codec disposition — what every codec in the tree is for".
 
 **Status**: opt-in via `--kv-quant tsym4` (or the `quality` preset). Never an
 auto baseline.
@@ -1453,6 +1493,11 @@ tail/head candidate set; the fallback to `K8V8` is the correct safety net.
 
 ### `KvStorage::TurboSym3` — symmetric WHT-3 K + turbo3 V
 
+> **INERT on this build** — `tsym3` decodes from the bf16 mirror on both
+> axes, so `exit_prefill` never builds the packed store described below and the
+> codec math never runs. Resident KV and generated tokens measure identical to
+> bf16. See § "Codec disposition — what every codec in the tree is for".
+
 **Status**: opt-in via `--kv-quant tsym3` (or `--kv-preset speed`).
 Never an auto baseline.
 
@@ -1497,6 +1542,11 @@ nomenclature).
 ---
 
 ### `KvStorage::PlanarK` — K-axis PlanarQuant 4-bit
+
+> **INERT on this build** — `planar_k` decodes from the bf16 mirror on both
+> axes, so `exit_prefill` never builds the packed store described below and the
+> codec math never runs. Resident KV and generated tokens measure identical to
+> bf16. See § "Codec disposition — what every codec in the tree is for".
 
 **Status**: opt-in via `--kv-quant planar_k` (or the `k_only_planar` preset).
 Never an auto baseline.
@@ -1570,6 +1620,11 @@ candidate set; the fallback to `K8V8` is the correct safety net.
 **CLI**: `--kv-quant planar_k` or `--ctk planar_k4 --ctv bf16`
 (or `--kv-preset k_only_planar`).
 ### `KvStorage::K8VTurbo2` — q8_0 K, TurboQuant 2-bit V
+
+> **INERT on this build** — `k8vturbo2` decodes from the bf16 mirror on both
+> axes, so `exit_prefill` never builds the packed store described below and the
+> codec math never runs. Resident KV and generated tokens measure identical to
+> bf16. See § "Codec disposition — what every codec in the tree is for".
 
 **Status**: native 2-bit V codec, ships **naïve** (no outlier-mask). Not a
 production default for any arch.
@@ -2008,6 +2063,11 @@ rmlx serve --model <path> --paged-kv --kv-quant k8v4
 
 ### iso3 codec
 
+> **INERT on this build** — `iso3` decodes from the bf16 mirror on both
+> axes, so `exit_prefill` never builds the packed store described below and the
+> codec math never runs. Resident KV and generated tokens measure identical to
+> bf16. See § "Codec disposition — what every codec in the tree is for".
+
 **Algorithm — Quaternion SO(4) isoclinic rotation.**
 
 iso3 applies a left-isoclinic SO(4) rotation to groups of 4 elements in the
@@ -2224,6 +2284,11 @@ the token-row order within a block changes). GPU round-trip verified on
 
 ### iso4 codec
 
+> **INERT on this build** — `iso4` decodes from the bf16 mirror on both
+> axes, so `exit_prefill` never builds the packed store described below and the
+> codec math never runs. Resident KV and generated tokens measure identical to
+> bf16. See § "Codec disposition — what every codec in the tree is for".
+
 **Algorithm — Quaternion SO(4) isoclinic rotation, 4-bit codebook.**
 
 iso4 is the natural 4-bit extension of [iso3](#iso3-codec).
@@ -2307,6 +2372,11 @@ cross-crate churn for no benefit. `IsoBlocks` is shared (codes:
 ---
 
 ### rotor3 codec
+
+> **INERT on this build** — `rotor3` decodes from the bf16 mirror on both
+> axes, so `exit_prefill` never builds the packed store described below and the
+> codec math never runs. Resident KV and generated tokens measure identical to
+> bf16. See § "Codec disposition — what every codec in the tree is for".
 
 **Algorithm — Cl(3,0) Clifford rotor sandwich, 3-bit codebook.**
 
@@ -2439,6 +2509,11 @@ the iso3 / iso4 precedent (opt-in codec, never an auto baseline).
 
 ### rotor4 codec
 
+> **INERT on this build** — `rotor4` decodes from the bf16 mirror on both
+> axes, so `exit_prefill` never builds the packed store described below and the
+> codec math never runs. Resident KV and generated tokens measure identical to
+> bf16. See § "Codec disposition — what every codec in the tree is for".
+
 **Algorithm — Cl(3,0) Clifford rotor sandwich, 4-bit codebook.**
 
 rotor4 is the 4-bit member of the Clifford rotation family. The algebra and
@@ -2561,6 +2636,14 @@ floors plus the existing V-side iso{3,4} floors.
 and K dequant matches within 1e-3.
 
 ### rotor K-side variants
+
+> **INERT on this build** — the two asymmetric members,
+> `rotor_k_3_asym_v<vb>_g<vg>` and `rotor_k_4_asym_v<vb>_g<vg>`, decode from the
+> bf16 mirror on both axes, so `exit_prefill` never builds the packed store
+> described below and their codec math never runs. Resident KV and generated
+> tokens measure identical to bf16. The two K-only members of this section are
+> not in that class. See § "Codec disposition — what every codec in the tree
+> is for".
 
 Four variants mirror the V-side rotor3 / rotor4 codecs to the K axis. They
 add an **optional 1-bit QJL residual sideband** (Johnson–
@@ -3610,6 +3693,13 @@ all on a prefill-bracketed flow. That is a property of
 `exit_prefill_builds_a_store_exactly_when_the_predicate_says_so`. In all four
 cells every one of these reports the identical `kv_cache_bytes` and the
 identical 100-token id digest as `none`.
+
+Every codec in this class carries an INERT banner at the head of its
+per-variant section above, and the `--kv-quant` / `--kv-bits` help says the same
+thing. Neither is maintained by review: `make check-kv-codec-disposition`
+derives the class from `ALL_KV_QUANTS` and the three decode predicates and fails
+on a banner a codec no longer earns, or a codec that earns one and does not have
+it.
 
 The probe's `store_skipped` column corroborates and does **not** classify: it
 is set when *any* layer-cache in the run logged the skip, and the layer-adaptive

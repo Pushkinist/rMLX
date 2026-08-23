@@ -937,3 +937,155 @@ fn an_inert_codec_has_no_quantised_read_path() {
         );
     }
 }
+
+// ── The parametric families all validate their payload ───────────────────────
+
+/// `rot_k_v<vb>g<vg>` accepts only V codecs its store can actually hold.
+///
+/// `RotK` builds `KvStorage::Mixed` via `MixedKvState::new_rotated`, so its V
+/// side is the same MLX affine quantizer the `mixed_*` family hands its
+/// `(bits, group_size)` to — and therefore the same accepted set. Before this
+/// check the arm did no validation at all: `rot_k_v99g7` parsed into a codec
+/// that would have asked MLX for a 99-bit affine quantize at its first encode.
+#[test]
+fn rot_k_rejects_a_v_codec_the_store_cannot_hold() {
+    for tag in ["rot_k_v99g7", "rot_k_v16g64", "rot_k_v4g17", "rot_k_v0g0"] {
+        let err = KvQuant::from_str(tag).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(tag),
+            "the rejection should name the input: {msg}"
+        );
+    }
+}
+
+/// The accepted `rot_k_*` set is exactly the accepted `mixed_*` V set.
+///
+/// Stated as an equivalence rather than a second table, because a second table
+/// is how the two drift: `RotK`'s V slot *is* the `Mixed` V slot.
+#[test]
+fn rot_k_and_mixed_accept_the_same_v_side() {
+    for v_bits in 0u8..=16 {
+        for v_group_size in [0u16, 1, 17, 31, 32, 63, 64, 100, 128, 256] {
+            let rot_k = KvQuant::from_str(&format!("rot_k_v{v_bits}g{v_group_size}")).is_ok();
+            let mixed = KvQuant::from_str(&format!("mixed_k8g64_v{v_bits}g{v_group_size}")).is_ok();
+            assert_eq!(
+                rot_k, mixed,
+                "rot_k_v{v_bits}g{v_group_size} accepted={rot_k} but the same V side \
+                 under mixed_ accepted={mixed}"
+            );
+        }
+    }
+}
+
+// ── The disposition manifest the user-facing surfaces are checked against ────
+
+/// The token a user-facing surface (CLI help, `docs/KV_QUANT.md`) can be
+/// searched for to find this codec.
+///
+/// For a non-parametric codec that is its `Display` form. For the four
+/// parametric families it is the fixed prefix their `Display` starts with,
+/// because prose spells them `rot_k_v<vb>g<vg>`, not at one sample parameter.
+///
+/// Exhaustive on purpose: a new parametric family has to declare its prefix
+/// here or this stops compiling, and the gate would otherwise search the
+/// surfaces for a name that never appears in them.
+fn surface_stem(q: KvQuant) -> String {
+    match q {
+        KvQuant::Mixed { .. } => "mixed_".to_string(),
+        KvQuant::RotK { .. } => "rot_k_v".to_string(),
+        KvQuant::RotorK3Asym { .. } => "rotor_k_3_asym_".to_string(),
+        KvQuant::RotorK4Asym { .. } => "rotor_k_4_asym_".to_string(),
+        KvQuant::None
+        | KvQuant::K8V4
+        | KvQuant::K8V8
+        | KvQuant::Planar
+        | KvQuant::Planar3
+        | KvQuant::PlanarK
+        | KvQuant::K8VTurbo3
+        | KvQuant::K8VTurbo3Tcq
+        | KvQuant::K8VTurbo2
+        | KvQuant::K8VTurbo2Tcq
+        | KvQuant::TurboSym3
+        | KvQuant::TurboSym4
+        | KvQuant::Iso3
+        | KvQuant::Iso4
+        | KvQuant::Iso3Sym
+        | KvQuant::Iso4Sym
+        | KvQuant::IsoKOnly3
+        | KvQuant::IsoKOnly4
+        | KvQuant::Rotor3
+        | KvQuant::Rotor4
+        | KvQuant::Rotor3Sym
+        | KvQuant::Rotor4Sym
+        | KvQuant::RotorKOnly3
+        | KvQuant::RotorKOnly4 => q.to_string(),
+    }
+}
+
+/// Print one line per codec, classified by the runtime's own predicates, for
+/// `scripts/check_kv_codec_disposition.sh` to check the CLI help and
+/// `docs/KV_QUANT.md` against.
+///
+/// The sweep is [`ALL_KV_QUANTS`], whose completeness
+/// `all_kv_quants_names_every_variant_once` pins against the compiler-checked
+/// `variant_index` — so a codec cannot reach the CLI without reaching this
+/// manifest, and the gate cannot go stale by omission.
+///
+/// `INERT` is [`KvQuant::materialises_packed_store`] returning false, which is
+/// the disjunction of the three classifiers printed beside it and the exact
+/// condition `exit_prefill` skips the encode on. The three are printed so a
+/// reader of the gate's output can see which one moved. `KvQuant::None` also
+/// builds no store — it has none to build — and is labelled `BASELINE` instead,
+/// the same split `disposition_of` makes.
+///
+/// Emits sentinels around the block: a run that reaches `BEGIN` and stops has
+/// failed an assertion here, which is a violation; a run with no `BEGIN` at all
+/// did not get far enough to have an opinion, which is an environment error.
+/// The gate reports those two differently.
+#[test]
+fn emit_kv_codec_disposition_manifest() {
+    println!("KVQUANT-DISPOSITION-BEGIN");
+    let mut stems: Vec<String> = Vec::new();
+    for &q in ALL_KV_QUANTS {
+        let stem = surface_stem(q);
+        assert!(!stem.is_empty(), "{q} has an empty surface stem");
+        let mode = if stem == q.to_string() {
+            "EXACT"
+        } else {
+            "PREFIX"
+        };
+        println!(
+            "KVQUANT-DISPOSITION\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            q.variant_index(),
+            q,
+            stem,
+            mode,
+            if q == KvQuant::None {
+                // The unquantised baseline has no packed store to skip. It
+                // shares `materialises_packed_store() == false` with the inert
+                // class and nothing else about it, so it gets its own label —
+                // a surface must not describe bf16 as a codec that does nothing.
+                "BASELINE"
+            } else if q.materialises_packed_store() {
+                "LIVE"
+            } else {
+                "INERT"
+            },
+            u8::from(q.decode_reads_packed_store()),
+            u8::from(q.feeds_bf16_k_at_decode()),
+            u8::from(q.feeds_bf16_v_at_decode()),
+        );
+        stems.push(stem);
+    }
+    let n = stems.len();
+    stems.sort();
+    stems.dedup();
+    assert_eq!(
+        stems.len(),
+        n,
+        "two codecs share a surface stem — a gate searching for one would find \
+         the other"
+    );
+    println!("KVQUANT-DISPOSITION-END\t{n}");
+}
