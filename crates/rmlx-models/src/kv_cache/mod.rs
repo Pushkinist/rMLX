@@ -278,14 +278,19 @@ pub struct KvLayerShape {
 /// hold (the resolved `--max-ctx` ceiling or the prompt length — either is a
 /// fine estimate for the sign of the saving).
 ///
-/// The emitted byte count is an estimate on both sides of the true figure, so
-/// read the sign and not the magnitude. `KvQuant::estimated_resident_bytes_per_layer`
-/// over-charges the affine and q8_0 sidebands (it models one f32 per 32 values
-/// for stores whose cadence is one per 64 or 128), and under-reports an iso
-/// codec over the window between `exit_prefill`, which bulk-encodes into CPU
-/// blocks 2.97x the GPU ring, and the first fused decode step that drops them.
-/// The sign is what the warning is for; a reader must not size a buffer from
-/// the number.
+/// The emitted byte count is an estimate, so read the sign and not the
+/// magnitude. `KvQuant::estimated_resident_bytes_per_layer` sizes each side
+/// byte-for-byte against its store, but it does not model page rounding, the
+/// static rotation tables, or GPU/CPU residual coexistence — and it
+/// under-reports an iso codec whenever the CPU blocks `exit_prefill` built are
+/// what a layer holds. That happens two ways, and only one of them ends: it is
+/// a **window** on a layer the fused decode path serves, closing at the first
+/// fused decode step that drops the blocks; it is **permanent** on a layer
+/// whose shape that path's gate rejects (batch > 1, or a `head_dim` that is not
+/// a power of two at most 512 — `head_dim = 80` qualifies), because the ring is
+/// then never allocated and there is nothing to drop. The blocks are 2.97x the
+/// ring. The sign is what the warning is for; a reader must not size a buffer
+/// from the number.
 pub fn warn_if_kv_codec_net_negative(quant: KvQuant, layers: &[KvLayerShape], eff_seq: u64) {
     let (total_saving, n_global, n_windowed) = kv_codec_net_saving_total(quant, layers, eff_seq);
     if total_saving < 0 {
@@ -295,7 +300,7 @@ pub fn warn_if_kv_codec_net_negative(quant: KvQuant, layers: &[KvLayerShape], ef
             n_global,
             n_windowed,
             est_extra_bytes = -total_saving,
-            "KV codec increases resident KV vs bf16 on this layer mix — the per-global-layer warm-TTFT bf16 seed plus codec scales exceed the bytes saved at this context; windowed layers already run bf16 and are unaffected. Read the sign, not the magnitude: the estimator over-charges the affine and q8_0 per-group sidebands, and under-reports an iso codec until its fused decode path drops the CPU blocks the prefill encode built. Consider --kv-quant none if memory is the goal."
+            "KV codec increases resident KV vs bf16 on this layer mix — the per-global-layer warm-TTFT bf16 seed plus codec scales exceed the bytes saved at this context; windowed layers already run bf16 and are unaffected. Read the sign, not the magnitude: the estimator under-reports an iso codec while a layer holds the CPU blocks the prefill encode built — until the first fused decode step drops them, or for the whole request on a layer the fused path's shape gate rejects (batch > 1, or a head_dim that is not a power of two at most 512), where they are never dropped. Consider --kv-quant none if memory is the goal."
         );
     }
 }
