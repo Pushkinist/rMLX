@@ -477,6 +477,24 @@ fn kv_group_size_u16(group_size: usize) -> anyhow::Result<u16> {
         .map_err(|_| anyhow::anyhow!("--kv-group-size must be <= 65535, got {group_size}"))
 }
 
+/// Narrow an integer-valued `--kv-bits` to the `u8` [`parse_kv_bits_combo`]
+/// takes.
+///
+/// Only reached when `bits.fract() == 0.0`, so the value is integral and the
+/// question is only whether it fits. `as u8` saturates on `f32` rather than
+/// wrapping, so today no input reaches a bit-width it did not name — but that
+/// is a property of the cast rule, not of a check, and the same reasoning about
+/// its integer sibling was wrong. Screen the value instead.
+pub(crate) fn kv_bits_u8(bits: f32) -> anyhow::Result<u8> {
+    if (0.0..=f32::from(u8::MAX)).contains(&bits) {
+        Ok(bits as u8)
+    } else {
+        Err(anyhow::anyhow!(
+            "--kv-bits must be between 0 and 255, got {bits}"
+        ))
+    }
+}
+
 /// Parse `--kv-bits` + `--kv-group-size` integer aliases into a concrete [`KvQuant`].
 ///
 /// mlx-lm ergonomics: users pass integer bit-widths and group sizes instead of
@@ -592,7 +610,7 @@ pub(crate) fn resolve_model_flags(
     let (kv_quant_opt, cts_override) = if let Some(bits) = kv_bits {
         let gs = kv_group_size.unwrap_or(64);
         let kq = if bits.fract() == 0.0 {
-            parse_kv_bits_combo(bits as u8, gs)?
+            parse_kv_bits_combo(kv_bits_u8(bits)?, gs)?
         } else {
             parse_kv_bits_fractional(bits, gs)?
         };

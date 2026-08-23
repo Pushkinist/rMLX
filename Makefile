@@ -90,6 +90,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         e2e \
         file-size-report check-no-inline-tests check-no-scalar-f32-leak \
         check-kv-layer-quants check-kv-codec-disposition \
+        check-kv-codec-disposition-fixtures \
         check-no-decode-swallow check-gpu-tests-ignored \
         check-gpu-tests-ignored-fixtures \
         check-eval-lock check-eval-lock-fixtures eval-lock-stress \
@@ -377,6 +378,9 @@ check-kv-layer-quants: ## CI gate: fail if kv_quant_for_layer is called outside 
 check-kv-codec-disposition: ## CI gate: fail if the --kv-quant/--kv-bits help or docs/KV_QUANT.md contradicts a codec's runtime disposition
 	@bash scripts/check_kv_codec_disposition.sh
 
+check-kv-codec-disposition-fixtures: ## CI gate: recall test for the above — 10 synthetic scan roots, each asserting which rule fired
+	@bash scripts/check_kv_codec_disposition_fixtures.sh
+
 check-no-decode-swallow: ## CI gate: fail if a decode-step failure breaks instead of propagating (would report as finish_reason="length")
 	@bash scripts/check_no_decode_swallow.sh
 
@@ -424,6 +428,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_no_scalar_f32_leak.sh
 	@bash scripts/check_kv_layer_quants.sh
 	@bash scripts/check_kv_codec_disposition.sh
+	@bash scripts/check_kv_codec_disposition_fixtures.sh
 	@bash scripts/check_no_decode_swallow.sh
 	@bash scripts/check_eval_lock.sh
 	@bash scripts/check_eval_lock_fixtures.sh
