@@ -409,7 +409,8 @@ pub(crate) fn parse_max_ctx(v: Option<u32>) -> anyhow::Result<Option<i32>> {
 /// - `floor(bits)` outside `{3, 4, 5, 6, 8}` → error (K floor not supported by
 ///   MLX affine quantizer).
 /// - `ceil(bits)` outside `{3, 4, 5, 6, 8}` → error (V ceil not supported).
-/// - `group_size == 0` → error.
+/// - `group_size == 0`, `group_size > 65535`, or any `group_size` outside
+///   `{32, 64, 128}` → error, via [`rmlx_kv_quant::validate_mixed_side`].
 /// - The value is not strictly fractional (integer path should have been taken).
 pub(crate) fn parse_kv_bits_fractional(
     bits: f32,
@@ -449,12 +450,31 @@ pub(crate) fn parse_kv_bits_fractional(
         ));
     }
 
+    let group_size = kv_group_size_u16(group_size)?;
+    // Both sides reach the MLX affine quantizer, so both have to be a pair it
+    // implements — the same check `--kv-quant mixed_*` runs. The bit-width
+    // screens above do not cover the group size, so without this the alias
+    // flags could build a codec `KvQuant::from_str` refuses to spell back.
+    for (side, side_bits) in [('k', k_bits), ('v', v_bits)] {
+        rmlx_kv_quant::validate_mixed_side(side, side_bits, group_size)
+            .map_err(|e| anyhow::anyhow!("--kv-bits {bits} --kv-group-size {group_size}: {e}"))?;
+    }
+
     Ok(KvQuant::Mixed {
         k_bits,
         v_bits,
-        k_group_size: group_size as u16,
-        v_group_size: group_size as u16,
+        k_group_size: group_size,
+        v_group_size: group_size,
     })
+}
+
+/// Narrow a `--kv-group-size` to the `u16` the codec field holds.
+///
+/// A plain `as u16` wraps: `--kv-group-size 65600` would arrive as 64 and pass
+/// every check below it while naming a size nobody asked for.
+fn kv_group_size_u16(group_size: usize) -> anyhow::Result<u16> {
+    u16::try_from(group_size)
+        .map_err(|_| anyhow::anyhow!("--kv-group-size must be <= 65535, got {group_size}"))
 }
 
 /// Parse `--kv-bits` + `--kv-group-size` integer aliases into a concrete [`KvQuant`].
@@ -478,8 +498,10 @@ pub(crate) fn parse_kv_bits_fractional(
 ///
 /// # Rejected inputs
 ///
-/// - `bits` outside `{3, 4, 5, 6, 8}` → error (not supported by MLX affine quantizer).
-/// - `group_size == 0` → error.
+/// - `bits` outside `{2, 3, 4, 5, 6, 8}` → error (not supported by MLX affine quantizer).
+/// - `group_size == 0`, `group_size > 65535`, or any `group_size` outside
+///   `{32, 64, 128}` → error, via [`rmlx_kv_quant::validate_mixed_side`]. The
+///   named `(8, 128)` preset resolves to `K8V8` and does not reach it.
 pub(crate) fn parse_kv_bits_combo(
     bits: u8,
     group_size: usize,
@@ -505,19 +527,28 @@ pub(crate) fn parse_kv_bits_combo(
         return Err(anyhow::anyhow!("--kv-group-size must be > 0, got 0"));
     }
 
-    // Named presets — exact (bits, group_size) pairs that map to non-Mixed variants.
-    let kq = match (bits, group_size) {
-        (8, 128) => KvQuant::K8V8,
-        // Remaining cases fall through to the Mixed fallback below.
-        // All use mlx-lm's default: K stays at 8-bit (group=64), V uses caller's bits/group_size.
-        _ => KvQuant::Mixed {
-            k_bits: 8,
-            v_bits: bits,
-            k_group_size: 64,
-            v_group_size: group_size as u16,
-        },
-    };
-    Ok(kq)
+    let group_size = kv_group_size_u16(group_size)?;
+
+    // The one named preset that maps to a non-Mixed variant.
+    if (bits, group_size) == (8, 128) {
+        return Ok(KvQuant::K8V8);
+    }
+
+    // Everything else takes mlx-lm's default: K stays at 8-bit (group=64), V
+    // uses the caller's bits/group_size. The V side is therefore the one that
+    // varies (K is pinned to a pair the validator accepts), and it reaches the
+    // MLX affine quantizer — so it has to be a pair that quantizer implements,
+    // the same check `--kv-quant mixed_*` runs. The bit-width screen above does
+    // not cover the group size.
+    rmlx_kv_quant::validate_mixed_side('v', bits, group_size)
+        .map_err(|e| anyhow::anyhow!("--kv-bits {bits} --kv-group-size {group_size}: {e}"))?;
+
+    Ok(KvQuant::Mixed {
+        k_bits: 8,
+        v_bits: bits,
+        k_group_size: 64,
+        v_group_size: group_size,
+    })
 }
 
 /// Parse and resolve all model-related CLI flags in one call.
