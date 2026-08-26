@@ -4,8 +4,9 @@ use rmlx_core::error::Result;
 use rmlx_kv_quant::KvCache;
 use rmlx_mlx::{add, Array, Device};
 
-use super::attention::{MapleAttention, MapleRmsNorm};
+use super::attention::MapleAttention;
 use super::moe::MapleSparseMoeBlock;
+use super::rms::MapleRmsNorm;
 
 /// One Maple transformer block.
 ///

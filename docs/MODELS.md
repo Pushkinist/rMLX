@@ -1246,9 +1246,9 @@ scope.
 ## Maple (`MapleForCausalLM`)
 
 DeepGrove Maple-Preview — a 20B-A1B ternary MoE decoder (`maple-2bit-mlx`).
-v1 is the portable **reference** forward from `maple.py` (the path mlx-lm
-falls back to when a fused kernel fails its one-time self-check). FlashHead
-and the decode-only Metal fusions are skipped on purpose — see
+The forward matches `maple.py` including lossless load-time QKV / up+gate
+fusion (`sanitize`). FlashHead and the decode-only Metal fusions are skipped
+on purpose — see
 [Why v1 skips FlashHead and fused kernels](#why-v1-skips-flashhead-and-fused-kernels).
 
 ### Config schema
@@ -1312,7 +1312,7 @@ v1 does **not** implement FlashHead (`lm_head_flash.*` is skipped at load;
 ### KV quantization
 
 All `KvQuant` variants accepted. `auto` resolves to `DEFAULT_KV_QUANT`
-(unquantised bf16); `K8V8` is opt-in. Prefill chunk default is 64
+(unquantised bf16); `K8V8` is opt-in. Prefill chunk default is 1024
 (`RMLX_PREFILL_CHUNK_MAPLE` to override).
 
 ### Modalities
@@ -1329,14 +1329,15 @@ rMLX implements the reference, not the shortcuts:
 | Python fast path | What it is | Why not in rMLX v1 |
 |---|---|---|
 | **FlashHead** | Approximate `lm_head`: score 4748 cluster centroids, exact logits only for the top 512 clusters (+ forced EOS/think tokens). Greedy is exact **only if** the true argmax is in a probed cluster. Prefill still uses the exact head. Opt-in via `use_flash_head=true` (mlx-lm default **off**). | It is not the trained forward. A wrong cluster set changes tokens. rMLX kernels must live in `.metal` files and stay **model-agnostic** (CLAUDE.md hard rule 10); FlashHead is a Maple-specific vocab clustering path. The snapshot already carries a correct 4-bit `lm_head`. |
-| **Fused add+RMS** | One Metal dispatch for `h = x+r` and RMSNorm (fp32 weight multiply). Decode-only (`h.size == hidden`). | Same arithmetic as `add` + `MapleRMSNorm`. rMLX already has a shared `rms_norm`; an arch-named kernel is the rule we do not want. |
-| **Fused QK-norm+RoPE** | One dispatch replacing q_norm, k_norm, and two RoPEs. Decode-only. NoPE layers pass `ROPE_DIM=0`. | Same as the stock `MapleRMSNorm` + `rope` path we already run. |
-| **Fused router** | GEMV + fp32 softmax + top-8 + renormalize in one kernel (~+18% Python). Decode-only. | Same as `MapleGate`’s fp32 reference. Near-tied top-8 order may differ; scores must match. |
+| **Fused add+RMS** | One Metal dispatch for `h = x+r` and RMSNorm (fp32 weight multiply). Decode-only (`h.size == hidden`). | Custom Metal **and** `compile_shapeless` of the same math were A/B'd. Both lossless; both slower (~114 / ~123 vs ~190 TPS) because they insert extra `apply` nodes into a graph that is already one lazy forward per token. Not shipped. Load-time f32 RMS scales are kept. |
+| **Fused QK-norm+RoPE** | One dispatch replacing q_norm, k_norm, and two RoPEs. Decode-only. NoPE layers pass `ROPE_DIM=0`. | Same `apply`-tax as add+RMS. Q/K still use MapleRMSNorm with load-time f32 weights. |
+| **Fused router** | GEMV + fp32 softmax + top-8 + renormalize in one kernel (~+18% Python). Decode-only. | Same `apply`-tax. Router `W` is f32 and pre-transposed at load so decode is `x.f32 @ W_T` with no per-step cast/transpose. |
 
 Python also **fuses QKV into one matmul** and **up+gate into one SwitchLinear**
 at `sanitize()`. That is lossless along the output axis (row-wise affine).
-rMLX keeps split `q/k/v` and `gate/up/down` — three (resp. two) equivalent
-quantized GEMVs. Same math, more dispatches; fuse only behind a bench.
+rMLX does the same concat at load: one `qkv_proj` and one `up_gate_proj`
+(`gather_qmm`) per layer. Decode-only Metal (add+RMS / QK-norm+RoPE / router)
+and FlashHead stay skipped.
 
 What v1 **does** match: `row_alpha` → scales + `biases = -scales`, expert
 stacking, MapleRMSNorm (fp32 multiply) on Q/K **and** the final `model.norm`,
@@ -1347,7 +1348,14 @@ cache, `<think>` splitting.
 
 - No FlashHead, no fused add+RMS / QK-norm+RoPE / router Metal kernels
   (reference arithmetic; see above).
-- Split QKV / split MoE up+gate (equivalent to Python `sanitize` concat).
+- **SWA ring + chunked prefill is not bit-identical across chunk sizes** on
+  prompts longer than the 512-token window. A 1040-token greedy cell produced
+  distinct token digests at chunk 64 / 256–512 / 1024 / 2048 (256 and 512
+  matched each other). Rotating layers write the ring *during* prefill, so
+  one 1024-token SDPA then wrap is not the same bf16 reduction tree as
+  sixteen 64-token SDPAs. Short goldens stay in one chunk and do not see
+  this. Larger chunks are closer to mlx-lm's single prompt forward; 1024
+  is the default for TTFT, not for cross-chunk token identity.
 - Dense MLP (`first_k_dense_replace > 0`) is refused; Maple-Preview is 0.
 - `rope_scaling` other than null is refused (this snapshot is plain RoPE).
 - `forward_seq_last_k_with_cache` not wired. Speculative decode uses Phase-2.

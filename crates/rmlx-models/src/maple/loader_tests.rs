@@ -7,7 +7,8 @@
     clippy::float_cmp
 )]
 
-use super::{expand_row_alpha, n_groups_2bit, squeeze_to_row_rank};
+use super::{concat_linears, expand_row_alpha, n_groups_2bit, squeeze_to_row_rank};
+use crate::layers::Linear;
 use rmlx_mlx::{Array, Device, Dtype};
 
 fn to_f32_vec(a: &Array) -> Vec<f32> {
@@ -51,4 +52,39 @@ fn expand_row_alpha_broadcasts_and_negates_as_biases() {
     assert!((s[1] - 1.5).abs() < 1e-3, "scale[1]={}", s[1]);
     assert!((b[0] + s[0]).abs() < 1e-3, "bias is -scale");
     assert!((b[1] + s[1]).abs() < 1e-3, "bias is -scale");
+}
+
+fn plain(weight: Array) -> Linear {
+    Linear::Plain { weight }
+}
+
+#[test]
+fn concat_linears_axis0_stacks_qkv_output_rows() {
+    let q = plain(Array::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[2, 2]).unwrap());
+    let k = plain(Array::from_f32_slice(&[5.0, 6.0], &[1, 2]).unwrap());
+    let v = plain(Array::from_f32_slice(&[7.0, 8.0], &[1, 2]).unwrap());
+    let fused = concat_linears(&[q, k, v], 0, Device::Cpu).unwrap();
+    let Linear::Plain { weight } = fused else {
+        panic!("expected plain");
+    };
+    assert_eq!(weight.shape(), vec![4, 2]);
+    let got = to_f32_vec(&weight);
+    assert_eq!(got, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+}
+
+#[test]
+fn concat_linears_axis1_stacks_expert_up_then_gate() {
+    // [E=2, out=2, in=2] each.
+    let up = plain(
+        Array::from_f32_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 2, 2]).unwrap(),
+    );
+    let gate = plain(
+        Array::from_f32_slice(&[9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0], &[2, 2, 2])
+            .unwrap(),
+    );
+    let fused = concat_linears(&[up, gate], 1, Device::Cpu).unwrap();
+    let Linear::Plain { weight } = fused else {
+        panic!("expected plain");
+    };
+    assert_eq!(weight.shape(), vec![2, 4, 2]);
 }

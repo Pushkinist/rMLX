@@ -44,15 +44,18 @@ fn dummy_lin() -> Linear {
 
 #[allow(clippy::unwrap_used, reason = "tiny host arrays for constructor tests")]
 fn dummy_norm(eps: f32) -> MapleRmsNorm {
-    MapleRmsNorm::new(Array::from_f32_slice(&[1.0], &[1]).unwrap(), eps)
+    MapleRmsNorm::new(
+        Array::from_f32_slice(&[1.0], &[1]).unwrap(),
+        eps,
+        Device::Cpu,
+    )
+    .unwrap()
 }
 
 fn dummy_attn(cfg: &MapleConfig, layer: usize) -> MapleAttention {
     MapleAttention::new(
         cfg,
         layer,
-        dummy_lin(),
-        dummy_lin(),
         dummy_lin(),
         dummy_lin(),
         dummy_norm(cfg.rms_norm_eps),
@@ -91,7 +94,7 @@ fn maple_rms_norm_returns_input_dtype() {
     let x = x.astype(Dtype::Bf16, Device::Cpu).unwrap();
     let w = Array::from_f32_slice(&[1.0, 1.0, 1.0, 1.0], &[4]).unwrap();
     let w = w.astype(Dtype::Bf16, Device::Cpu).unwrap();
-    let n = MapleRmsNorm::new(w, 1e-6);
+    let n = MapleRmsNorm::new(w, 1e-6, Device::Cpu).unwrap();
     let out = n.forward(&x, Device::Cpu).unwrap();
     out.eval().unwrap();
     assert_eq!(out.dtype(), Dtype::Bf16);

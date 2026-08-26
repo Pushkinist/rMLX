@@ -1,52 +1,21 @@
-//! Maple attention: split Q/K/V/O, per-head QK RMSNorm (fp32 multiply),
+//! Maple attention: fused QKV + O, per-head QK RMSNorm (fp32 multiply),
 //! partial RoPE on SWA layers only (full-attention layers are NoPE).
 
 use rmlx_core::error::Result;
 use rmlx_kv_quant::KvCache;
-use rmlx_mlx::{rms_norm, rope, scaled_dot_product_attention, Array, Device, Dtype};
+use rmlx_mlx::{rope, scaled_dot_product_attention, Array, Device};
 
 use crate::layers::Linear;
 
 use super::config::MapleConfig;
+pub(super) use super::rms::MapleRmsNorm;
 
-/// RMSNorm with the weight multiply in float32 (`MapleRMSNorm` in maple.py).
-///
-/// `mx.fast.rms_norm` on bf16 rounds the normalized activation before the
-/// weight multiply (~1% per element vs the training reference). Casting both
-/// operands to f32, then casting the product back, matches the reference.
-#[allow(
-    clippy::exhaustive_structs,
-    reason = "closed layer struct — weight + eps is the full MapleRMSNorm contract"
-)]
-#[allow(missing_debug_implementations)]
-pub(super) struct MapleRmsNorm {
-    /// Learned scale, shape `[dims]`.
-    pub(super) weight: Array,
-    /// Variance epsilon (1e-6 in the snapshot).
-    pub(super) eps: f32,
-}
-
-impl MapleRmsNorm {
-    /// `weight` is `[dims]` (hidden for layer norms, `head_dim` for Q/K norms).
-    pub(super) fn new(weight: Array, eps: f32) -> Self {
-        Self { weight, eps }
-    }
-
-    /// `rms_norm(x.f32, weight.f32, eps).astype(x.dtype)`.
-    pub(super) fn forward(&self, x: &Array, device: Device) -> Result<Array> {
-        let x_f32 = x.astype(Dtype::F32, device)?;
-        let w_f32 = self.weight.astype(Dtype::F32, device)?;
-        let out = rms_norm(&x_f32, Some(&w_f32), self.eps, device)?;
-        out.astype(x.dtype(), device)
-    }
-}
-
-/// Maple GQA attention (16/4, head_dim 128). Split q/k/v/o, no bias.
+/// Maple GQA attention (16/4, head_dim 128). Fused qkv + o, no bias.
 #[allow(missing_debug_implementations)]
 pub(super) struct MapleAttention {
-    pub(super) q_proj: Linear,
-    pub(super) k_proj: Linear,
-    pub(super) v_proj: Linear,
+    /// Concatenated `q_proj`/`k_proj`/`v_proj` along the output axis
+    /// (`maple.py` `sanitize`). One `quantized_matmul` per step.
+    pub(super) qkv_proj: Linear,
     pub(super) o_proj: Linear,
     pub(super) q_norm: MapleRmsNorm,
     pub(super) k_norm: MapleRmsNorm,
@@ -58,31 +27,29 @@ pub(super) struct MapleAttention {
     pub(super) head_dim: usize,
     pub(super) n_q: usize,
     pub(super) n_kv: usize,
+    /// `n_q * head_dim` — Q slice of the fused QKV last dim.
+    pub(super) q_out: i32,
+    /// `n_kv * head_dim` — each of K and V.
+    pub(super) kv_out: i32,
     pub(super) rope_theta: f32,
     pub(super) rope_dims: i32,
 }
 
 impl MapleAttention {
-    /// Wire projections + norms; `use_rope` comes from `cfg.is_swa_layer`.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "loader passes the four projections and two norms; grouping them would be a single-caller wrapper"
-    )]
+    /// Wire fused QKV + O + norms; `use_rope` comes from `cfg.is_swa_layer`.
     pub(super) fn new(
         cfg: &MapleConfig,
         layer_idx: usize,
-        q_proj: Linear,
-        k_proj: Linear,
-        v_proj: Linear,
+        qkv_proj: Linear,
         o_proj: Linear,
         q_norm: MapleRmsNorm,
         k_norm: MapleRmsNorm,
     ) -> Self {
         let head_dim = cfg.head_dim as usize;
+        let n_q = cfg.num_attention_heads as usize;
+        let n_kv = cfg.num_key_value_heads as usize;
         Self {
-            q_proj,
-            k_proj,
-            v_proj,
+            qkv_proj,
             o_proj,
             q_norm,
             k_norm,
@@ -90,8 +57,10 @@ impl MapleAttention {
             use_qk_norm: cfg.use_qk_norm,
             scale: (head_dim as f32).sqrt().recip(),
             head_dim,
-            n_q: cfg.num_attention_heads as usize,
-            n_kv: cfg.num_key_value_heads as usize,
+            n_q,
+            n_kv,
+            q_out: (n_q * head_dim) as i32,
+            kv_out: (n_kv * head_dim) as i32,
             rope_theta: cfg.rope_theta,
             rope_dims: cfg.rope_dims(),
         }
@@ -120,10 +89,30 @@ impl MapleAttention {
         let hd = self.head_dim as i32;
         let nq = self.n_q as i32;
         let nkv = self.n_kv as i32;
+        let q_out = self.q_out;
+        let kv_out = self.kv_out;
+        let total = q_out + 2 * kv_out;
 
-        let queries = self.q_proj.forward(x, device)?;
-        let keys = self.k_proj.forward(x, device)?;
-        let values = self.v_proj.forward(x, device)?;
+        let qkv = self.qkv_proj.forward(x, device)?;
+        let qkv_last = qkv.shape()[2];
+        if qkv_last != total {
+            return Err(rmlx_core::error::Error::Mlx(format!(
+                "maple fused qkv last dim {qkv_last} != q+k+v {total}"
+            )));
+        }
+        let queries = qkv.slice(&[0, 0, 0], &[batch, seq, q_out], &[1, 1, 1], device)?;
+        let keys = qkv.slice(
+            &[0, 0, q_out],
+            &[batch, seq, q_out + kv_out],
+            &[1, 1, 1],
+            device,
+        )?;
+        let values = qkv.slice(
+            &[0, 0, q_out + kv_out],
+            &[batch, seq, total],
+            &[1, 1, 1],
+            device,
+        )?;
 
         let mut queries = queries.reshape(&[batch, seq, nq, hd], device)?;
         let mut keys = keys.reshape(&[batch, seq, nkv, hd], device)?;

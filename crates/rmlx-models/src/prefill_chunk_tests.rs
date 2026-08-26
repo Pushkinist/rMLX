@@ -17,7 +17,7 @@ fn defaults_match_recommendations() {
     assert_eq!(arch_default("qwen2"), Some(256));
     assert_eq!(arch_default("laguna"), Some(256));
     assert_eq!(arch_default("bitnet"), Some(64));
-    assert_eq!(arch_default("maple"), Some(64));
+    assert_eq!(arch_default("maple"), Some(1024));
     assert_eq!(arch_default("unknown_arch"), None);
 }
 

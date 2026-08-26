@@ -165,9 +165,12 @@ fn arch_default(arch: &str) -> Option<usize> {
         // bitnet: max_position_embeddings=4096, no GDN prefill ops.
         // 64 is conservative but safe; no bench data yet to justify larger.
         "bitnet" => Some(64),
-        // maple: hybrid SWA-512 / full NoPE MoE; no GDN. 64 until a real-model
-        // chunk sweep exists (same conservative default as bitnet).
-        "maple" => Some(64),
+        // maple: hybrid SWA-512 / full NoPE MoE; no GDN. Real-model sweep on
+        // maple-2bit-mlx (kv-none, 1040-token parity prompt): TTFT 64→1024
+        // 1135→528ms (2.1×), prefill 915→1970 tps; 2048 does not improve TTFT
+        // and decode slipped to 184 (1024 holds ~190). Override via
+        // `RMLX_PREFILL_CHUNK_MAPLE`.
+        "maple" => Some(1024),
         _ => None,
     }
 }

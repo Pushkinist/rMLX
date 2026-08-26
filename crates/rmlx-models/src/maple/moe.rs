@@ -1,12 +1,12 @@
 //! Maple sparse MoE: fp32 `MapleGate` + clamped-SwiGLU `MapleSwitchGLU`.
 //!
-//! v1 is the portable reference path from `mlx_lm/models/maple.py` (no fused
-//! Metal router). Every decoder layer is MoE (`first_k_dense_replace=0`); there
-//! are no shared experts.
+//! Graph path matches `maple.py` `sanitize`: fused `up_gate_proj` (one
+//! `gather_qmm`) then `down_proj`. No fused Metal router. Every decoder layer
+//! is MoE (`first_k_dense_replace=0`); there are no shared experts.
 
 #![allow(clippy::struct_field_names)]
 
-use rmlx_core::error::Result;
+use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{
     add, argpartition, argsort, clip, divide, expand_dims, floor_divide, matmul, maximum, multiply,
     negative, scalar_f32, silu, softmax, sum_axis, sum_axis_keepdims, take_along_axis, Array,
@@ -57,17 +57,37 @@ fn aggregate_expert_outputs(
 
 /// Router: plain (unquantized) `[num_experts, hidden]` weight.
 ///
-/// `gates = x.astype(F32) @ W.T.astype(F32)`, softmax over experts, argpartition
-/// top-k, gather scores, renormalize (`sum + 1e-20`).
+/// `gates = x.astype(F32) @ W_T` with `W_T` the load-time f32 transpose
+/// (`router_dtype: fp32`). Recasting/transposing W every decode step was
+/// 24 extra 256×2048 casts per token.
 #[allow(missing_debug_implementations)]
 pub(super) struct MapleGate {
-    /// `[num_experts, hidden]` bf16/f32 param — never quantized.
+    /// `[num_experts, hidden]` f32 param — never quantized.
     pub(super) weight: Array,
+    /// `[hidden, num_experts]` f32, `weight` transposed once at load.
+    pub(super) weight_t: Array,
     /// Experts per token (8).
     pub(super) top_k: usize,
 }
 
 impl MapleGate {
+    /// Upcast the router to f32 and pre-transpose `[E, H] → [H, E]`.
+    pub(super) fn new(weight: Array, top_k: usize, device: Device) -> Result<Self> {
+        let weight = if weight.dtype() == Dtype::F32 {
+            weight
+        } else {
+            weight.astype(Dtype::F32, device)?
+        };
+        let weight_t = weight.transpose(&[1, 0], device)?;
+        weight.eval()?;
+        weight_t.eval()?;
+        Ok(Self {
+            weight,
+            weight_t,
+            top_k,
+        })
+    }
+
     /// `x`: `[n_tokens, hidden]`.
     /// Returns `(indices [n, top_k] i32, scores [n, top_k] f32)`.
     #[allow(
@@ -81,11 +101,7 @@ impl MapleGate {
 
         // f32-ok: Maple router_dtype is fp32; near-tied top-8 flips in bf16
         let x_f32 = x.astype(Dtype::F32, device)?;
-        let w_t = self
-            .weight
-            .astype(Dtype::F32, device)?
-            .transpose(&[1, 0], device)?;
-        let gates = matmul(&x_f32, &w_t, device)?;
+        let gates = matmul(&x_f32, &self.weight_t, device)?;
 
         let probs = softmax(&gates, -1, device)?;
         let part_idx = argpartition(&probs, -tk, -1, device)?;
@@ -99,15 +115,11 @@ impl MapleGate {
     }
 }
 
-/// SwitchGLU with split gate/up/down expert projections (Qwen3.5 layout).
-///
-/// Checkpoint may ship fused `up_gate_proj`; the loader keeps them split.
+/// SwitchGLU with fused up+gate expert projection (`maple.py` sanitize).
 #[allow(missing_debug_implementations)]
 pub(super) struct MapleSwitchGLU {
-    /// Expert gate projection `[num_experts, moe_intermediate, hidden]`.
-    pub(super) gate_proj: Linear,
-    /// Expert up projection `[num_experts, moe_intermediate, hidden]`.
-    pub(super) up_proj: Linear,
+    /// Concatenated up then gate `[num_experts, 2 * moe_intermediate, packed_in]`.
+    pub(super) up_gate_proj: Linear,
     /// Expert down projection `[num_experts, hidden, moe_intermediate]`.
     pub(super) down_proj: Linear,
 }
@@ -144,12 +156,10 @@ impl MapleSwitchGLU {
         let xe = expand_dims(x, -2, device)?;
         let xe = expand_dims(&xe, -2, device)?;
 
-        let gate_raw = self
-            .gate_proj
+        let fused = self
+            .up_gate_proj
             .gather_forward(&xe, expert_indices, false, device)?;
-        let up_raw = self
-            .up_proj
-            .gather_forward(&xe, expert_indices, false, device)?;
+        let (up_raw, gate_raw) = split_last_dim_half(&fused, device)?;
 
         let gs = gate_raw.shape();
         let gate_3d = gate_raw.reshape(&[gs[0], gs[1], gs[3]], device)?;
@@ -189,12 +199,10 @@ impl MapleSwitchGLU {
         // x [total, 1, hidden] aligns its leading dim with rhs_indices [total].
         let xe = expand_dims(&x_sorted, -2, device)?;
 
-        let gate_raw = self
-            .gate_proj
+        let fused = self
+            .up_gate_proj
             .gather_forward(&xe, &sorted_idx, true, device)?;
-        let up_raw = self
-            .up_proj
-            .gather_forward(&xe, &sorted_idx, true, device)?;
+        let (up_raw, gate_raw) = split_last_dim_half(&fused, device)?;
 
         let gs = gate_raw.shape();
         let gate_2d = gate_raw.reshape(&[gs[0], gs[2]], device)?;
@@ -253,6 +261,37 @@ impl MapleSparseMoeBlock {
         let combined = aggregate_expert_outputs(&expert_out, &scores, device)?;
         combined.reshape(&[batch, seq, hidden], device)
     }
+}
+
+/// First half of the last axis is up, second is gate (`maple.py` sanitize order).
+#[allow(
+    clippy::indexing_slicing,
+    reason = "last axis of gather_qmm output; empty rank is rejected"
+)]
+fn split_last_dim_half(x: &Array, device: Device) -> Result<(Array, Array)> {
+    let shape = x.shape();
+    let nd = shape.len();
+    if nd == 0 {
+        return Err(Error::Mlx(
+            "maple up_gate_proj gather output has empty shape".to_owned(),
+        ));
+    }
+    let last = shape[nd - 1];
+    if last % 2 != 0 {
+        return Err(Error::Mlx(format!(
+            "maple up_gate_proj last dim {last} is not even"
+        )));
+    }
+    let half = last / 2;
+    let mut stop_up = shape.clone();
+    stop_up[nd - 1] = half;
+    let start_up = vec![0i32; nd];
+    let mut start_gate = vec![0i32; nd];
+    start_gate[nd - 1] = half;
+    let strides = vec![1i32; nd];
+    let up = x.slice(&start_up, &stop_up, &strides, device)?;
+    let gate = x.slice(&start_gate, &shape, &strides, device)?;
+    Ok((up, gate))
 }
 
 #[cfg(test)]

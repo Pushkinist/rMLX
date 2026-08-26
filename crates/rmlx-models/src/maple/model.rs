@@ -18,9 +18,9 @@ use rmlx_mlx::{Array, Device};
 use crate::layers::{Embedding, Linear};
 use rmlx_kv_quant::{KvCache, KvQuant};
 
-use super::attention::MapleRmsNorm;
 use super::config::MapleConfig;
 use super::decoder_layer::MapleDecoderLayer;
+use super::rms::MapleRmsNorm;
 
 /// `MapleForCausalLM` weights + forward pass.
 #[allow(missing_debug_implementations)]

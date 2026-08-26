@@ -1,13 +1,14 @@
 //! Maple checkpoint loader (`MapleForCausalLM`).
 //!
-//! Replicates mlx-lm `Model.sanitize()` enough for v1 (no FlashHead, no QKV
-//! concat, no up/gate fuse):
+//! Replicates mlx-lm `Model.sanitize()` (no FlashHead, no Metal kernels):
 //!
 //! 1. Expand sibling `{prefix}.row_alpha` → per-group affine `scales` /
 //!    `biases = -scales` (2-bit, group 128) when `{prefix}.scales` is absent.
 //! 2. Stack `mlp.experts.{0..E-1}.{gate,up,down}_proj.*` along axis 0 into
 //!    `mlp.switch_mlp.*` when the Hugging Face per-expert layout is present.
-//! 3. Skip `lm_head_flash.*` (v1 has no FlashHead).
+//! 3. Concatenate `q/k/v_proj` along output rows into `qkv_proj`, and
+//!    `up_proj`/`gate_proj` along expert out-dim into `up_gate_proj`.
+//! 4. Skip `lm_head_flash.*` (no FlashHead).
 //!
 //! # Snapshot tensor names
 //!
@@ -27,10 +28,10 @@
 //! [`load_weights`] returns [`MapleLoadBundle`]. [`load_from_path`] calls
 //! [`MapleText::from_bundle`], which wires:
 //!
-//! - [`MapleAttention::new`] — `{ q,k,v,o }_proj` + `MapleRmsNorm` Q/K norms;
+//! - [`MapleAttention::new`] — fused `qkv_proj` + `o_proj` + `MapleRmsNorm` Q/K norms;
 //!   `use_rope` / scale / head counts come from `MapleConfig`.
 //! - [`MapleSparseMoeBlock`] — `MapleGate { weight, top_k }` +
-//!   `MapleSwitchGLU { gate_proj, up_proj, down_proj }` with 3-D expert
+//!   `MapleSwitchGLU { up_gate_proj, down_proj }` with 3-D expert
 //!   weights `[E, out, packed_in]`.
 //! - [`MapleDecoderLayer::new`] — pre-norm attn + pre-norm MoE.
 //! - [`MapleText`] — `{ cfg, embed, layers, norm, lm_head, kv_bytes, model_sig }`.
@@ -46,17 +47,18 @@ use std::path::Path;
 
 use rmlx_core::error::{Error, Result};
 use rmlx_loader::{load_shard_index, ShardSet};
-use rmlx_mlx::{broadcast_to, expand_dims, negative, stack_axis, Array, Device};
+use rmlx_mlx::{broadcast_to, concatenate, expand_dims, negative, stack_axis, Array, Device};
 use tracing::info;
 
 use crate::layers::{resolve_quant, Embedding, Linear, QuantMode, QuantParams};
 use crate::load_util::{bf16_param, bf16_scales, Weights};
 
-use super::attention::{MapleAttention, MapleRmsNorm};
+use super::attention::MapleAttention;
 use super::config::MapleConfig;
 use super::decoder_layer::MapleDecoderLayer;
 use super::model::MapleText;
 use super::moe::{MapleGate, MapleSparseMoeBlock, MapleSwitchGLU};
+use super::rms::MapleRmsNorm;
 
 /// 2-bit packing: 32 / 2 = 16 codes per uint32 word.
 const CODES_PER_U32_2BIT: i64 = 16;
@@ -122,12 +124,8 @@ pub(crate) struct MapleLayerWeights {
     reason = "load-time attention bundle; fields match MapleAttention"
 )]
 pub(crate) struct MapleAttnWeights {
-    /// `self_attn.q_proj` (2-bit g128 after `row_alpha` expansion).
-    pub q_proj: Linear,
-    /// `self_attn.k_proj`.
-    pub k_proj: Linear,
-    /// `self_attn.v_proj`.
-    pub v_proj: Linear,
+    /// Concatenated `self_attn.{q,k,v}_proj` along output rows.
+    pub qkv_proj: Linear,
     /// `self_attn.o_proj`.
     pub o_proj: Linear,
     /// `self_attn.q_norm.weight` (bf16, per-head `[head_dim]`).
@@ -148,10 +146,8 @@ pub(crate) enum MapleMlpWeights {
     Moe {
         /// `mlp.gate` — plain bf16 `[num_experts, hidden]`.
         gate: Linear,
-        /// Stacked `gate_proj` `[E, moe_ff, packed_in]`.
-        gate_proj: Linear,
-        /// Stacked `up_proj` `[E, moe_ff, packed_in]`.
-        up_proj: Linear,
+        /// Concatenated stacked `up_proj` then `gate_proj` `[E, 2*moe_ff, packed_in]`.
+        up_gate_proj: Linear,
         /// Stacked `down_proj` `[E, hidden, packed_ff]`.
         down_proj: Linear,
         /// Expert count (256).
@@ -196,18 +192,15 @@ impl MapleText {
             let attn = MapleAttention::new(
                 &cfg,
                 i,
-                layer.attn.q_proj,
-                layer.attn.k_proj,
-                layer.attn.v_proj,
+                layer.attn.qkv_proj,
                 layer.attn.o_proj,
-                MapleRmsNorm::new(layer.attn.q_norm, eps),
-                MapleRmsNorm::new(layer.attn.k_norm, eps),
+                MapleRmsNorm::new(layer.attn.q_norm, eps, Device::Gpu)?,
+                MapleRmsNorm::new(layer.attn.k_norm, eps, Device::Gpu)?,
             );
             let mlp = match layer.mlp {
                 MapleMlpWeights::Moe {
                     gate,
-                    gate_proj,
-                    up_proj,
+                    up_gate_proj,
                     down_proj,
                     top_k,
                     ..
@@ -218,13 +211,9 @@ impl MapleText {
                         ))
                     })?;
                     MapleSparseMoeBlock {
-                        gate: MapleGate {
-                            weight: router_weight(gate)?,
-                            top_k,
-                        },
+                        gate: MapleGate::new(router_weight(gate)?, top_k, Device::Gpu)?,
                         switch: MapleSwitchGLU {
-                            gate_proj,
-                            up_proj,
+                            up_gate_proj,
                             down_proj,
                         },
                     }
@@ -236,9 +225,9 @@ impl MapleText {
                 }
             };
             layers.push(MapleDecoderLayer::new(
-                MapleRmsNorm::new(layer.input_layernorm, eps),
+                MapleRmsNorm::new(layer.input_layernorm, eps, Device::Gpu)?,
                 attn,
-                MapleRmsNorm::new(layer.post_attention_layernorm, eps),
+                MapleRmsNorm::new(layer.post_attention_layernorm, eps, Device::Gpu)?,
                 mlp,
             ));
         }
@@ -324,7 +313,8 @@ pub(crate) fn load_weights(model_dir: &Path) -> Result<MapleLoadBundle> {
     let norm = MapleRmsNorm::new(
         load_rms_weight(&w, &format!("{pfx}.norm"))?,
         cfg.rms_norm_eps,
-    );
+        device,
+    )?;
 
     let lm_head = if cfg.tie_word_embeddings {
         info!("Maple: tie_word_embeddings=true, skipping lm_head");
@@ -360,28 +350,29 @@ pub(crate) fn load_weights(model_dir: &Path) -> Result<MapleLoadBundle> {
     for i in 0..n_layers {
         let base = format!("{pfx}.layers.{i}");
         let sa = format!("{base}.self_attn");
+        let q_proj = load_linear(
+            &w,
+            &format!("{sa}.q_proj"),
+            &lin_defaults,
+            &overrides,
+            device,
+        )?;
+        let k_proj = load_linear(
+            &w,
+            &format!("{sa}.k_proj"),
+            &lin_defaults,
+            &overrides,
+            device,
+        )?;
+        let v_proj = load_linear(
+            &w,
+            &format!("{sa}.v_proj"),
+            &lin_defaults,
+            &overrides,
+            device,
+        )?;
         let attn = MapleAttnWeights {
-            q_proj: load_linear(
-                &w,
-                &format!("{sa}.q_proj"),
-                &lin_defaults,
-                &overrides,
-                device,
-            )?,
-            k_proj: load_linear(
-                &w,
-                &format!("{sa}.k_proj"),
-                &lin_defaults,
-                &overrides,
-                device,
-            )?,
-            v_proj: load_linear(
-                &w,
-                &format!("{sa}.v_proj"),
-                &lin_defaults,
-                &overrides,
-                device,
-            )?,
+            qkv_proj: concat_linears(&[q_proj, k_proj, v_proj], 0, device)?,
             o_proj: load_linear(
                 &w,
                 &format!("{sa}.o_proj"),
@@ -564,6 +555,114 @@ fn load_linear(
     })
 }
 
+/// Concatenate matching `Linear`s along `axis` (mlx-lm `sanitize` row concat).
+///
+/// Affine scales/biases concatenate losslessly along the output axis. All
+/// parts must be the same variant, same quant params, and the same bias
+/// presence.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "parts.len() >= 2 is checked before indexing"
+)]
+pub(super) fn concat_linears(parts: &[Linear], axis: i32, device: Device) -> Result<Linear> {
+    if parts.len() < 2 {
+        return Err(Error::Loader(
+            "maple: concat_linears needs at least two projections".to_owned(),
+        ));
+    }
+    match &parts[0] {
+        Linear::Quantized {
+            group_size,
+            bits,
+            mode,
+            ..
+        } => {
+            let group_size = *group_size;
+            let bits = *bits;
+            let mode = *mode;
+            let mut weights: Vec<&Array> = Vec::with_capacity(parts.len());
+            let mut scales: Vec<&Array> = Vec::with_capacity(parts.len());
+            let mut biases: Vec<&Array> = Vec::with_capacity(parts.len());
+            let mut saw_bias = false;
+            let mut missing_bias = false;
+            for (i, p) in parts.iter().enumerate() {
+                match p {
+                    Linear::Quantized {
+                        weight,
+                        scales: sc,
+                        biases: bi,
+                        group_size: gs,
+                        bits: b,
+                        mode: m,
+                    } => {
+                        if *gs != group_size || *b != bits || *m != mode {
+                            return Err(Error::Loader(format!(
+                                "maple: concat_linears part {i} quant params differ"
+                            )));
+                        }
+                        weights.push(weight);
+                        scales.push(sc);
+                        match bi {
+                            Some(b) => {
+                                saw_bias = true;
+                                biases.push(b);
+                            }
+                            None => missing_bias = true,
+                        }
+                    }
+                    Linear::Plain { .. } | Linear::Paro { .. } => {
+                        return Err(Error::Loader(format!(
+                            "maple: concat_linears part {i} is not quantized (mixed variants)"
+                        )));
+                    }
+                }
+            }
+            let weight = concatenate(&weights, axis, device)?;
+            weight.eval()?;
+            let scales = concatenate(&scales, axis, device)?;
+            scales.eval()?;
+            let biases = if saw_bias && missing_bias {
+                return Err(Error::Loader(
+                    "maple: concat_linears mixed bias presence".to_owned(),
+                ));
+            } else if saw_bias {
+                let b = concatenate(&biases, axis, device)?;
+                b.eval()?;
+                Some(b)
+            } else {
+                None
+            };
+            Ok(Linear::Quantized {
+                weight,
+                scales,
+                biases,
+                group_size,
+                bits,
+                mode,
+            })
+        }
+        Linear::Plain { .. } => {
+            let mut weights: Vec<&Array> = Vec::with_capacity(parts.len());
+            for (i, p) in parts.iter().enumerate() {
+                match p {
+                    Linear::Plain { weight } => weights.push(weight),
+                    Linear::Quantized { .. } | Linear::Paro { .. } => {
+                        return Err(Error::Loader(format!(
+                            "maple: concat_linears part {i} is not plain (mixed variants)"
+                        )));
+                    }
+                }
+            }
+            let weight = concatenate(&weights, axis, device)?;
+            weight.eval()?;
+            Ok(Linear::Plain { weight })
+        }
+        Linear::Paro { .. } => Err(Error::Loader(
+            "maple: concat_linears does not support Paro projections".to_owned(),
+        )),
+    }
+}
+
 fn shared_linear(
     w: &Weights<'_>,
     base: &str,
@@ -636,8 +735,7 @@ fn load_mlp(
         )?;
         return Ok(MapleMlpWeights::Moe {
             gate,
-            gate_proj,
-            up_proj,
+            up_gate_proj: concat_linears(&[up_proj, gate_proj], 1, device)?,
             down_proj,
             num_experts: cfg.num_experts,
             top_k: cfg.num_experts_per_tok,
