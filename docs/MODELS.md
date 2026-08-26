@@ -1349,13 +1349,14 @@ cache, `<think>` splitting.
 - No FlashHead, no fused add+RMS / QK-norm+RoPE / router Metal kernels
   (reference arithmetic; see above).
 - **SWA ring + chunked prefill is not bit-identical across chunk sizes** on
-  prompts longer than the 512-token window. A 1040-token greedy cell produced
-  distinct token digests at chunk 64 / 256–512 / 1024 / 2048 (256 and 512
-  matched each other). Rotating layers write the ring *during* prefill, so
-  one 1024-token SDPA then wrap is not the same bf16 reduction tree as
-  sixteen 64-token SDPAs. Short goldens stay in one chunk and do not see
-  this. Larger chunks are closer to mlx-lm's single prompt forward; 1024
-  is the default for TTFT, not for cross-chunk token identity.
+  prompts longer than the 512-token window. The rotating cache's first
+  `update_concat` stores the whole first chunk untrimmed (`keys is None`),
+  so chunk 64 vs 1024 vs 2048 (one-shot for a 1040-token prompt) are
+  different bf16 trees. On `maple_parity.json`, chunk 64 diverges
+  immediately; 1024 and 2048 match for 32 generated tokens and split by
+  256. Short goldens fit in one chunk. 1024 is the TTFT default; set
+  `RMLX_PREFILL_CHUNK_MAPLE` ≥ prompt length for one-shot identity with
+  mlx-lm.
 - Dense MLP (`first_k_dense_replace > 0`) is refused; Maple-Preview is 0.
 - `rope_scaling` other than null is refused (this snapshot is plain RoPE).
 - `forward_seq_last_k_with_cache` not wired. Speculative decode uses Phase-2.
