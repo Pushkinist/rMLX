@@ -115,6 +115,7 @@ pub fn module_key_for_class(arch_class: &str) -> &'static str {
         "LagunaForCausalLM" => "laguna",
         "Qwen3_5MoeForConditionalGeneration" | "Qwen3_5ForConditionalGeneration" => "qwen3_5_moe",
         "BitNetForCausalLM" => "bitnet",
+        "MapleForCausalLM" => "maple",
         "Qwen3VLMoeForConditionalGeneration" => "qwen3_vl_moe",
         // Any unsupported class: no dedicated prefill-chunk row, fall through to
         // FALLBACK (safe, conservative).
@@ -164,6 +165,9 @@ fn arch_default(arch: &str) -> Option<usize> {
         // bitnet: max_position_embeddings=4096, no GDN prefill ops.
         // 64 is conservative but safe; no bench data yet to justify larger.
         "bitnet" => Some(64),
+        // maple: hybrid SWA-512 / full NoPE MoE; no GDN. 64 until a real-model
+        // chunk sweep exists (same conservative default as bitnet).
+        "maple" => Some(64),
         _ => None,
     }
 }

@@ -186,6 +186,12 @@ pub fn load_model(model_dir: &Path, _device: Device, opts: &LoadOpts) -> Result<
             tracing::info!(summary = %a.config_summary(), "arch::load_model: loaded BitNet");
             a
         }
+        "MapleForCausalLM" => {
+            let model = crate::maple::load_from_path(model_dir)?;
+            let a = Architecture::Maple(model);
+            tracing::info!(summary = %a.config_summary(), "arch::load_model: loaded Maple");
+            a
+        }
         // jina-embeddings-v4 is an encoder served via `/v1/embeddings`, not
         // the generative path. It is in KNOWN_ARCHS so the registry accepts
         // it, but it has no `Architecture` variant — refuse load_model here

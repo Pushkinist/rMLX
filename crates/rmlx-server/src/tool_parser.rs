@@ -115,9 +115,10 @@ pub fn arch_to_tool_call_format(arch_str: &str) -> Option<ToolCallFormat> {
     match arch_str {
         // Qwen3 dense and Qwen3.5 / Qwen3.6 MoE all use the same XML shape
         // documented in their chat templates.
-        "Qwen3ForCausalLM" | "Qwen3MoeForCausalLM" | "Qwen3_5MoeForConditionalGeneration" => {
-            Some(ToolCallFormat::Qwen3XmlFunction)
-        }
+        "Qwen3ForCausalLM"
+        | "Qwen3MoeForCausalLM"
+        | "Qwen3_5MoeForConditionalGeneration"
+        | "MapleForCausalLM" => Some(ToolCallFormat::Qwen3XmlFunction),
         _ => None,
     }
 }

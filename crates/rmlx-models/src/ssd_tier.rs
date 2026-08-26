@@ -134,6 +134,14 @@ pub fn attach_at_load(
                 info.device,
             );
         }
+        "MapleForCausalLM" => {
+            crate::maple::prompt_cache::PROMPT_CACHE.attach_ssd_tier(
+                &info.namespace,
+                info.kv_quant,
+                info.layout_key,
+                info.device,
+            );
+        }
         "Qwen3VLMoeForConditionalGeneration" => {
             crate::qwen3_vl_moe::prompt_cache::PROMPT_CACHE.attach_ssd_tier(
                 &info.namespace,

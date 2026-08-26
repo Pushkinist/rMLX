@@ -17,6 +17,7 @@ fn defaults_match_recommendations() {
     assert_eq!(arch_default("qwen2"), Some(256));
     assert_eq!(arch_default("laguna"), Some(256));
     assert_eq!(arch_default("bitnet"), Some(64));
+    assert_eq!(arch_default("maple"), Some(64));
     assert_eq!(arch_default("unknown_arch"), None);
 }
 
@@ -48,6 +49,7 @@ fn module_key_for_class_maps_supported_classes() {
         "qwen3_5_moe"
     );
     assert_eq!(module_key_for_class("BitNetForCausalLM"), "bitnet");
+    assert_eq!(module_key_for_class("MapleForCausalLM"), "maple");
     // Qwen3-VL-MoE chunks its image prefill (native tiling → thousands of soft
     // tokens would trip the Metal watchdog in one forward).
     assert_eq!(

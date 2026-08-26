@@ -8,6 +8,7 @@
 //! Qwen3ForCausalLM -> Architecture::Qwen3
 //! LagunaForCausalLM -> Architecture::Laguna
 //! Qwen3_5MoeForConditionalGeneration -> Architecture::Qwen3_5Moe
+//! MapleForCausalLM -> Architecture::Maple
 //!
 //! All other architectures return Error::Model with a "not yet supported" message.
 
@@ -35,6 +36,7 @@ use crate::decode_loop::SmokeVerdict;
 use crate::gemma3::Gemma3Text;
 use crate::gemma4::Gemma4Text;
 use crate::laguna::LagunaText;
+use crate::maple::MapleText;
 use crate::qwen2::Qwen2Text;
 use crate::qwen3::Qwen3Text;
 use crate::qwen3_5_moe::Qwen3_5MoeText;
@@ -66,6 +68,8 @@ pub enum Architecture {
     Qwen3VlMoe(Qwen3VlMoe),
     /// `BitNetForCausalLM` -- ternary-weight (b1.58), GQA, Relu2, sub-norms.
     BitNet(BitNetText),
+    /// `MapleForCausalLM` -- DeepGrove ternary MoE, hybrid SWA/NoPE, affine 2-bit.
+    Maple(MapleText),
 }
 
 impl std::fmt::Debug for Architecture {
@@ -114,6 +118,11 @@ impl std::fmt::Debug for Architecture {
                 "Architecture::BitNet(layers={}, hidden={}, vocab={})",
                 m.cfg.num_hidden_layers, m.cfg.hidden_size, m.cfg.vocab_size
             ),
+            Architecture::Maple(m) => write!(
+                f,
+                "Architecture::Maple(layers={}, hidden={}, vocab={}, experts={})",
+                m.cfg.num_hidden_layers, m.cfg.hidden_size, m.cfg.vocab_size, m.cfg.num_experts
+            ),
         }
     }
 }
@@ -132,6 +141,7 @@ impl Architecture {
             Architecture::Qwen3_5Moe(m) => m.forward_seq(ids, device),
             Architecture::Qwen3VlMoe(m) => m.text.forward_seq(ids, device),
             Architecture::BitNet(m) => m.forward_seq(ids, device),
+            Architecture::Maple(m) => m.forward_seq(ids, device),
         }
     }
 
@@ -163,6 +173,7 @@ impl Architecture {
                     Architecture::Qwen3_5Moe(_) => "Qwen3_5Moe",
                     Architecture::Qwen3VlMoe(_) => "Qwen3VlMoe",
                     Architecture::BitNet(_) => "BitNet",
+                    Architecture::Maple(_) => "Maple",
                 };
                 Err(Error::Model(format!(
                     "forward_seq_last_k not yet wired for {arch}"
@@ -226,6 +237,7 @@ impl Architecture {
                     Architecture::Laguna(_) => "Laguna",
                     Architecture::Qwen3VlMoe(_) => "Qwen3VlMoe",
                     Architecture::BitNet(_) => "BitNet",
+                    Architecture::Maple(_) => "Maple",
                 };
                 Err(Error::Model(format!(
                     "forward_seq_last_k_with_cache not yet wired for {arch}"
@@ -276,6 +288,7 @@ impl Architecture {
                     Architecture::Qwen3_5Moe(_) => "Qwen3_5Moe",
                     Architecture::Qwen3VlMoe(_) => "Qwen3VlMoe",
                     Architecture::BitNet(_) => "BitNet",
+                    Architecture::Maple(_) => "Maple",
                 };
                 Err(Error::Model(format!(
                     "forward_hidden_states not yet wired for {arch} (Gemma4 only)"
@@ -552,6 +565,7 @@ impl Architecture {
                     Architecture::Laguna(_) => "Laguna",
                     Architecture::Qwen3VlMoe(_) => "Qwen3VlMoe",
                     Architecture::BitNet(_) => "BitNet",
+                    Architecture::Maple(_) => "Maple",
                 };
                 Err(Error::Model(format!(
                     "logits_from_hidden not yet wired for {arch} (Gemma4 only)"
@@ -606,6 +620,7 @@ impl Architecture {
                     Architecture::Laguna(_) => "Laguna",
                     Architecture::Qwen3VlMoe(_) => "Qwen3VlMoe",
                     Architecture::BitNet(_) => "BitNet",
+                    Architecture::Maple(_) => "Maple",
                 };
                 Err(Error::Model(format!(
                     "forward_arr_with_cache not yet wired for {arch}"
@@ -625,6 +640,7 @@ impl Architecture {
             Architecture::Qwen3_5Moe(m) => m.cfg.num_hidden_layers,
             Architecture::Qwen3VlMoe(m) => m.text.cfg.num_hidden_layers,
             Architecture::BitNet(m) => m.cfg.num_hidden_layers,
+            Architecture::Maple(m) => m.cfg.num_hidden_layers as usize,
         }
     }
 
@@ -643,17 +659,20 @@ impl Architecture {
     /// Whether this architecture emits `<think>...</think>` reasoning tokens
     /// that the server should surface on a separate output channel (A3).
     ///
-    /// `true` only for the Qwen3 family (Qwen3 dense + Qwen3.5 MoE). It says
-    /// the architecture *can* produce `<think>...</think>` — nothing more.
-    /// Whether a given checkpoint's chat template prefills an open `<think>`,
-    /// prefills a closed `<think></think>` so the model answers directly, or
-    /// prefills nothing varies **per checkpoint** inside this same family, so
-    /// the server reads the initial reasoning channel off the rendered prompt
-    /// rather than off this flag. All other architectures (including BitNet)
-    /// emit plain assistant text — the state machine in the server's decode
-    /// loop is skipped entirely when this returns `false`.
+    /// `true` for the Qwen3 family (Qwen3 dense + Qwen3.5 MoE) and Maple.
+    /// It says the architecture *can* produce `<think>...</think>` — nothing
+    /// more. Whether a given checkpoint's chat template prefills an open
+    /// `<think>`, prefills a closed `<think></think>` so the model answers
+    /// directly, or prefills nothing varies **per checkpoint** inside this
+    /// same family, so the server reads the initial reasoning channel off the
+    /// rendered prompt rather than off this flag. All other architectures
+    /// (including BitNet) emit plain assistant text — the state machine in
+    /// the server's decode loop is skipped entirely when this returns `false`.
     pub fn supports_thinking(&self) -> bool {
-        matches!(self, Architecture::Qwen3(_) | Architecture::Qwen3_5Moe(_))
+        matches!(
+            self,
+            Architecture::Qwen3(_) | Architecture::Qwen3_5Moe(_) | Architecture::Maple(_)
+        )
     }
 
     /// SWA window size in tokens for layer `i`, or `None` if it is a
@@ -672,6 +691,15 @@ impl Architecture {
                 crate::gemma3::LayerType::SlidingAttention => Some(m.cfg.sliding_window as i32),
                 crate::gemma3::LayerType::FullAttention => None,
             },
+            Architecture::Maple(m) => {
+                if i >= m.n_layers() {
+                    None
+                } else if m.cfg.is_swa_layer(i) {
+                    Some(m.cfg.sliding_window)
+                } else {
+                    None
+                }
+            }
             Architecture::Qwen2(_)
             | Architecture::Qwen3(_)
             | Architecture::Laguna(_)
@@ -697,6 +725,7 @@ impl Architecture {
             Architecture::Qwen2(_) => 0,
             Architecture::Laguna(_) => 0,
             Architecture::BitNet(m) => m.cfg.max_position_embeddings as i32,
+            Architecture::Maple(m) => m.cfg.max_position_embeddings,
         }
     }
 
@@ -714,6 +743,7 @@ impl Architecture {
             Architecture::Qwen3_5Moe(m) => m.cfg.hidden_size,
             Architecture::Qwen3VlMoe(m) => m.text.cfg.hidden_size,
             Architecture::BitNet(m) => m.cfg.hidden_size,
+            Architecture::Maple(m) => m.cfg.hidden_size as usize,
         }
     }
 
@@ -731,6 +761,7 @@ impl Architecture {
             Architecture::Qwen3_5Moe(m) => m.cfg.num_key_value_heads,
             Architecture::Qwen3VlMoe(m) => m.text.cfg.num_key_value_heads,
             Architecture::BitNet(m) => m.cfg.num_key_value_heads,
+            Architecture::Maple(m) => m.cfg.num_key_value_heads as usize,
         }
     }
 
@@ -746,6 +777,7 @@ impl Architecture {
             Architecture::Qwen3_5Moe(m) => m.cfg.head_dim,
             Architecture::Qwen3VlMoe(m) => m.text.cfg.head_dim,
             Architecture::BitNet(m) => m.cfg.head_dim,
+            Architecture::Maple(m) => m.cfg.head_dim as usize,
         }
     }
 
@@ -760,6 +792,7 @@ impl Architecture {
             Architecture::Qwen3_5Moe(m) => m.cfg.vocab_size,
             Architecture::Qwen3VlMoe(m) => m.text.cfg.vocab_size,
             Architecture::BitNet(m) => m.cfg.vocab_size,
+            Architecture::Maple(m) => m.cfg.vocab_size as usize,
         }
     }
 
@@ -797,6 +830,7 @@ impl Architecture {
             Architecture::Qwen3_5Moe(m) => m.arch_class(),
             Architecture::Qwen3VlMoe(_) => "Qwen3VLMoeForConditionalGeneration",
             Architecture::BitNet(_) => "BitNetForCausalLM",
+            Architecture::Maple(_) => "MapleForCausalLM",
         }
     }
 
@@ -859,6 +893,10 @@ impl Architecture {
             Architecture::BitNet(m) => format!(
                 "BitNetForCausalLM layers={} hidden={} vocab={}",
                 m.cfg.num_hidden_layers, m.cfg.hidden_size, m.cfg.vocab_size
+            ),
+            Architecture::Maple(m) => format!(
+                "MapleForCausalLM layers={} hidden={} vocab={} experts={}",
+                m.cfg.num_hidden_layers, m.cfg.hidden_size, m.cfg.vocab_size, m.cfg.num_experts
             ),
         }
     }
@@ -1093,6 +1131,23 @@ impl Architecture {
                 penalty_cfg,
                 token_history,
             ),
+            Architecture::Maple(m) => crate::maple::generate_greedy(
+                m,
+                tokenizer,
+                prompt_ids,
+                n_tokens,
+                device,
+                kv_quant,
+                max_ctx_override,
+                prompt_cache_slots,
+                eos_ids,
+                step_fn,
+                constraint,
+                sampler_cfg,
+                rng,
+                penalty_cfg,
+                token_history,
+            ),
         }
     }
 
@@ -1271,6 +1326,7 @@ impl Architecture {
             Architecture::Qwen3(_) => crate::qwen3::read_cache_stats(),
             Architecture::Qwen2(_) => crate::qwen2::qwen2_cache_stats(),
             Architecture::BitNet(_) => crate::bitnet::bitnet_cache_stats(),
+            Architecture::Maple(_) => crate::maple::maple_cache_stats(),
             Architecture::Qwen3VlMoe(_) => crate::qwen3_vl_moe::qwen3_vl_moe_cache_stats(),
             Architecture::Laguna(_) => crate::laguna::laguna_cache_stats(),
         }
@@ -1299,6 +1355,7 @@ impl Architecture {
             Architecture::Qwen3(_) => crate::qwen3::QWEN3_PROMPT_CACHE.clear(),
             Architecture::Qwen2(_) => crate::qwen2::prompt_cache::PROMPT_CACHE.clear(),
             Architecture::BitNet(_) => crate::bitnet::prompt_cache::PROMPT_CACHE.clear(),
+            Architecture::Maple(_) => crate::maple::prompt_cache::PROMPT_CACHE.clear(),
             Architecture::Qwen3VlMoe(_) => crate::qwen3_vl_moe::prompt_cache::PROMPT_CACHE.clear(),
             Architecture::Laguna(_) => crate::laguna::prompt_cache::PROMPT_CACHE.clear(),
         }
@@ -1329,6 +1386,7 @@ impl Architecture {
             Architecture::Qwen3(m) => m.kv_bytes.sample(),
             Architecture::Qwen2(m) => m.kv_bytes.sample(),
             Architecture::BitNet(m) => m.kv_bytes.sample(),
+            Architecture::Maple(m) => m.kv_bytes.sample(),
             Architecture::Qwen3VlMoe(m) => m.text.kv_bytes.sample(),
             Architecture::Laguna(m) => m.kv_bytes.sample(),
         }
@@ -1360,6 +1418,7 @@ impl Architecture {
             Architecture::Qwen3(m) => m.kv_bytes.store(n, post),
             Architecture::Qwen2(m) => m.kv_bytes.store(n, post),
             Architecture::BitNet(m) => m.kv_bytes.store(n, post),
+            Architecture::Maple(m) => m.kv_bytes.store(n, post),
             Architecture::Qwen3VlMoe(m) => m.text.kv_bytes.store(n, post),
             Architecture::Laguna(m) => m.kv_bytes.store(n, post),
         }

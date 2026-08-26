@@ -21,6 +21,7 @@ known limitations for every architecture the server can load.
 - [Gemma4](#gemma4-gemma4forconditionalgeneration)
 - [Laguna](#laguna-lagunaforcausallm)
 - [BitNet b1.58](#bitnet-b158-bitnetforcausallm)
+- [Maple](#maple-mapleforcausallm)
 - [Jina V4](#jina-v4-jinaembeddingsv4model)
 - [Whisper (audio STT)](#whisper-audio-stt)
 - [Silero VAD (long-audio chunking)](#silero-vad-long-audio-chunking)
@@ -48,7 +49,7 @@ the model rather than merely route to it (KV codec guards, per-arch caches,
 metrics identity) reads the resolved class.
 
 The generative architectures (`Qwen2`, `Qwen3`, `Qwen3_5Moe`, `Qwen3VlMoe`,
-`Gemma3`, `Gemma4`, `Laguna`) implement `Architecture::generate_greedy` and are
+`Gemma3`, `Gemma4`, `Laguna`, `BitNet`, `Maple`) implement `Architecture::generate_greedy` and are
 served via `/v1/chat/completions` and `/v1/completions`. `JinaEmbeddingsV4Model`
 is an encoder-only model served via `/v1/embeddings`; it never enters the
 `Architecture` enum.
@@ -60,7 +61,7 @@ pipelined loop (`choose_token` → `async_eval(next)` → drain the previous pen
 token → feed), the sampling fork, and Fresh chunked prefill live in
 `rmlx_models::decode_loop` (`pipelined_decode`, `choose_token`,
 `chunked_prefill`). The pipelined family — `Qwen3`, `Qwen3_5Moe`, `Gemma3`,
-`Gemma4` — funnels every cache-lookup outcome (Miss / Exact / Prefix / image /
+`Gemma4`, `Maple` — funnels every cache-lookup outcome (Miss / Exact / Prefix / image /
 HydratedTail) into `pipelined_decode`.
 
 A converting or new architecture supplies only:
@@ -94,6 +95,7 @@ A converting or new architecture supplies only:
 | `Gemma4UnifiedForConditionalGeneration` | `Architecture::Gemma4` (alias) | text + image + audio (12B) | `K8V8` | config | green |
 | `LagunaForCausalLM` | `Architecture::Laguna` | text | `K8V8` | `KV_MAX_SEQ_DEFAULT` | green |
 | `BitNetForCausalLM` | `Architecture::BitNet` | text | `K8V8` | 4 096 | green |
+| `MapleForCausalLM` | `Architecture::Maple` | text | `K8V8` | 128 000 | pending |
 | `JinaEmbeddingsV4Model` | (encoder — no enum variant) | text + image | n/a | 128 000 | green |
 
 `KV_MAX_SEQ_DEFAULT` = 32 768 tokens (fallback when the config does not declare
@@ -1238,6 +1240,91 @@ gap is not bandwidth on LM-head/projections — it is Metal kernel dispatch over
 (~211 kernel launches per decode step). A Metal GEMV kernel would not close this
 gap; kernel fusion across per-layer projections would be required but is out of
 scope.
+
+---
+
+## Maple (`MapleForCausalLM`)
+
+DeepGrove Maple-Preview — a 20B-A1B ternary MoE decoder (`maple-2bit-mlx`).
+v1 is the portable reference forward: no FlashHead, no fused Metal kernels.
+
+### Config schema
+
+Top-level `config.json` (no `text_config` nesting).
+
+| Field | Type | Notes |
+|---|---|---|
+| `num_hidden_layers` | int | 24 |
+| `hidden_size` | int | 2048 |
+| `num_attention_heads` | int | 16 |
+| `num_key_value_heads` | int | 4 (GQA) |
+| `head_dim` | int | 128 |
+| `num_experts` | int | 256 |
+| `num_experts_per_tok` | int | 8 |
+| `moe_intermediate_size` | int | 512 |
+| `first_k_dense_replace` | int | 0 (every layer is MoE) |
+| `sliding_window` | int | 512 |
+| `layer_types` | string[] | 3× `sliding_attention` + 1× `full_attention`, repeating |
+| `partial_rotary_factor` | float | 0.5 → 64 rotary dims |
+| `rope_theta` | float | 10 000 |
+| `rms_norm_eps` | float | 1e-6 |
+| `vocab_size` | int | 151 936 |
+| `max_position_embeddings` | int | 128 000 |
+| `use_qk_norm` | bool | per-head Q/K RMSNorm (fp32 weight multiply) |
+
+Tensor prefix is `model.word_embeddings.*` (not `embed_tokens`).
+
+### Key structural properties
+
+**Hybrid SWA / NoPE.** Sliding-window layers (window 512) apply partial RoPE
+(`traditional=false`, 64 of 128 dims). Full-attention layers are **NoPE**
+(no RoPE). SWA layers use a rotating KV ring; full layers use unbounded KV.
+
+**QK RMSNorm.** Per-head, `eps=1e-6`, weight multiply in fp32 (`MapleRMSNorm`)
+then cast back — bf16 `mx.fast.rms_norm` would round before the scale.
+
+**MoE.** fp32 softmax router over 256 experts, top-8, renormalize. Gate weight
+is a plain bf16/f32 param, **not** quantized. Expert SwiGLU is **clamped**:
+`silu(min(gate, 7)) * clip(up, -7, 7)`. No shared expert.
+
+**Thinking mode.** `supports_thinking()` returns `true`. Tags are `<think>` /
+`</think>`; the chat template opens think on generation by default.
+
+**Prompt cache.** Exact-only (SWA rotating ring cannot be reconstructed from a
+block-truncated / SSD-hydrated prefix). SSD spill/hydrate is attached; SWA
+rings come back payload-less and are not reused.
+
+### Weight quantization
+
+- Embed / `lm_head`: affine 4-bit, group 64, with on-disk `scales` + `biases`.
+- Linear / MoE: affine 2-bit packed `{-α, 0, +α}`, **one `row_alpha` per
+  output row**, no on-disk biases. The loader expands `*.row_alpha` to
+  broadcast `scales [rows, n_groups]` and `biases = -scales`
+  (`n_groups = packed_last_dim * 16 / group_size`, group_size=128).
+- Layer norms, Q/K norms, and `mlp.gate.weight` are plain bf16.
+
+v1 does **not** implement FlashHead (`lm_head_flash.*` is skipped at load).
+
+### KV quantization
+
+All `KvQuant` variants accepted. `auto` resolves to `DEFAULT_KV_QUANT`
+(unquantised bf16); `K8V8` is opt-in. Prefill chunk default is 64
+(`RMLX_PREFILL_CHUNK_MAPLE` to override).
+
+### Modalities
+
+Text only. Tokenizer is Qwen-style (BOS 151643, EOS 151645).
+
+### Known limitations (v1)
+
+- No FlashHead, no fused add+RMS / QK-norm+RoPE / router Metal kernels.
+- `forward_seq_last_k_with_cache` not wired. Speculative decode uses Phase-2.
+- No vision or audio tower.
+
+### Smoke-probe status
+
+Pending. First greedy smoke is against `maple-2bit-mlx` (temp=0); reject NaN
+logits; EOS 151645.
 
 ---
 

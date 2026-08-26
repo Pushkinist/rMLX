@@ -41,6 +41,7 @@ Supported architectures (spill + hydrate wired). These are **resolved** classes
   and `PROMPT_CACHE` static as the sparse-MoE class)
 - `Qwen3VLMoeForConditionalGeneration`
 - `BitNetForCausalLM`
+- `MapleForCausalLM`
 
 Other architectures silently remain RAM-only when the tier is enabled; the SSD
 flag itself is not an error.
