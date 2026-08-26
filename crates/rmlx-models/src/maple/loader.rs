@@ -81,7 +81,7 @@ const EMBED_BITS: i32 = 4;
     clippy::exhaustive_structs,
     reason = "load-time bundle of MLX arrays; fields are the Maple checkpoint contract"
 )]
-pub struct MapleLoadBundle {
+pub(crate) struct MapleLoadBundle {
     /// Parsed `config.json`.
     pub cfg: MapleConfig,
     /// `model.word_embeddings` (4-bit g64, or plain).
@@ -102,7 +102,7 @@ pub struct MapleLoadBundle {
     clippy::exhaustive_structs,
     reason = "load-time layer bundle; fields match the decoder-layer constructor"
 )]
-pub struct MapleLayerWeights {
+pub(crate) struct MapleLayerWeights {
     /// `input_layernorm.weight` (bf16 `[hidden]`).
     pub input_layernorm: Array,
     /// `post_attention_layernorm.weight` (bf16 `[hidden]`).
@@ -121,7 +121,7 @@ pub struct MapleLayerWeights {
     clippy::exhaustive_structs,
     reason = "load-time attention bundle; fields match MapleAttention"
 )]
-pub struct MapleAttnWeights {
+pub(crate) struct MapleAttnWeights {
     /// `self_attn.q_proj` (2-bit g128 after `row_alpha` expansion).
     pub q_proj: Linear,
     /// `self_attn.k_proj`.
@@ -140,9 +140,10 @@ pub struct MapleAttnWeights {
 #[allow(
     missing_debug_implementations,
     clippy::exhaustive_enums,
-    reason = "two checkpoint MLP layouts (MoE vs dense); adding a variant needs a new tensor layout"
+    dead_code,
+    reason = "two checkpoint MLP layouts (MoE vs dense); Dense is the load-time reject path, Moe extras are the checkpoint contract"
 )]
-pub enum MapleMlpWeights {
+pub(crate) enum MapleMlpWeights {
     /// Routed experts + bf16 router.
     Moe {
         /// `mlp.gate` — plain bf16 `[num_experts, hidden]`.
@@ -180,7 +181,7 @@ pub fn load_from_path(model_dir: &Path) -> Result<MapleText> {
 
 impl MapleText {
     /// Wire a [`MapleLoadBundle`] into attention / MoE / decoder types.
-    pub fn from_bundle(bundle: MapleLoadBundle) -> Result<Self> {
+    pub(crate) fn from_bundle(bundle: MapleLoadBundle) -> Result<Self> {
         let MapleLoadBundle {
             cfg,
             embed,
@@ -260,7 +261,7 @@ impl MapleText {
     clippy::cognitive_complexity,
     reason = "single cohesive load sequence: config + embed/head + per-layer attn/MLP"
 )]
-pub fn load_weights(model_dir: &Path) -> Result<MapleLoadBundle> {
+pub(crate) fn load_weights(model_dir: &Path) -> Result<MapleLoadBundle> {
     let raw_json = crate::load_util::read_raw_config(model_dir)?;
     let cfg: MapleConfig = serde_json::from_value(raw_json.clone())
         .map_err(|e| Error::Config(format!("maple: cannot deserialize config.json: {e}")))?;
@@ -812,3 +813,7 @@ fn squeeze_to_row_rank(mut alpha: Array, packed_ndim: usize, device: Device) -> 
     }
     Ok(alpha)
 }
+
+#[cfg(test)]
+#[path = "loader_tests.rs"]
+mod loader_tests;

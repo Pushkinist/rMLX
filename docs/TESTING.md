@@ -137,7 +137,7 @@ nothing.
 
 ## Golden-token suites: how their snapshot resolves
 
-`crates/rmlx-models/tests/{bonsai,gemma4,qwen3,bitnet,medgemma}_golden_tokens.rs`
+`crates/rmlx-models/tests/{bonsai,gemma4,qwen3,bitnet,medgemma,maple}_golden_tokens.rs`
 each pin a 32-token temp=0 decode of one architecture against a committed
 fixture under `tests/fixtures/`. Each covers ONE arch and names its own snapshot
 by slug. `tests/common/mod.rs` reads exactly **two** variables:

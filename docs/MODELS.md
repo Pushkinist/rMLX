@@ -95,7 +95,7 @@ A converting or new architecture supplies only:
 | `Gemma4UnifiedForConditionalGeneration` | `Architecture::Gemma4` (alias) | text + image + audio (12B) | `K8V8` | config | green |
 | `LagunaForCausalLM` | `Architecture::Laguna` | text | `K8V8` | `KV_MAX_SEQ_DEFAULT` | green |
 | `BitNetForCausalLM` | `Architecture::BitNet` | text | `K8V8` | 4 096 | green |
-| `MapleForCausalLM` | `Architecture::Maple` | text | `K8V8` | 128 000 | pending |
+| `MapleForCausalLM` | `Architecture::Maple` | text | `K8V8` | 128 000 | green |
 | `JinaEmbeddingsV4Model` | (encoder — no enum variant) | text + image | n/a | 128 000 | green |
 
 `KV_MAX_SEQ_DEFAULT` = 32 768 tokens (fallback when the config does not declare
@@ -1323,8 +1323,9 @@ Text only. Tokenizer is Qwen-style (BOS 151643, EOS 151645).
 
 ### Smoke-probe status
 
-Pending. First greedy smoke is against `maple-2bit-mlx` (temp=0); reject NaN
-logits; EOS 151645.
+Green. `rmlx info --probe-smoke` on `maple-2bit-mlx` (temp=0, 8 tokens,
+`kv_quant=auto` → unquantised bf16): verdict `Ok`, no NaN logits, BOS 151644.
+Golden-token gate: `maple_golden_tokens` / `maple_2bit_k8v8` (K8V8, 32 tokens).
 
 ---
 
@@ -1551,6 +1552,8 @@ and defaults to group=64).
 | `Gemma4ForConditionalGeneration` | `K8V4` | small, paroquant |
 | `Gemma4ForConditionalGeneration` | `Planar` | dense large (31B) |
 | `LagunaForCausalLM` | `K8V8` | always |
+| `BitNetForCausalLM` | `K8V8` | always |
+| `MapleForCausalLM` | `K8V8` | advertised default; `auto` is unquantised bf16 |
 
 Override via `--kv-quant <preset>` or `--cache-type-k <tag> --cache-type-v <tag>`.
 Run `rmlx info --list-cache-types` for all valid tags.
@@ -1580,6 +1583,8 @@ Run `rmlx info --list-cache-types` for all valid tags.
 | `Gemma3ForConditionalGeneration` | yes | yes | no | no |
 | `Gemma4ForConditionalGeneration` | yes | yes | yes | no |
 | `LagunaForCausalLM` | yes | no | no | no |
+| `BitNetForCausalLM` | yes | no | no | no |
+| `MapleForCausalLM` | yes | no | no | no |
 | `JinaEmbeddingsV4Model` | yes | yes | no | yes (only) |
 
 ---

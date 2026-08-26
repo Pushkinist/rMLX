@@ -58,7 +58,7 @@ coding agent (Claude Code, Cursor, Aider, OpenCode).
 Conversion (`rmlx convert`, MLX → MLX re-quantize / layout repack) is a roadmap
 target and not yet shipped.
 
-Continuously smoke-tested end-to-end. The first four families carry committed
+Continuously smoke-tested end-to-end. The families below carry committed
 golden-token decode gates (temp=0, exact token-id match); embeddings and the
 speculative drafters are validated end-to-end via their serving endpoints.
 
@@ -68,6 +68,7 @@ speculative drafters are validated end-to-end via their serving endpoints.
 | Qwen 3.6 | `Qwen3.6-35B-A3B-8bit` | `Qwen3_5MoeForConditionalGeneration` |
 | Bonsai | `Ternary-Bonsai-8B-mlx-2bit` | `Qwen3ForCausalLM` |
 | BitNet | `bitnet-b1.58-2B-4T` | `BitNetForCausalLM` |
+| Maple | `maple-2bit-mlx` | `MapleForCausalLM` |
 | Embeddings | `jina-embeddings-v4` (text + image) | `JinaEmbeddingsV4Model` |
 
 Google's Gemma 4 **QAT** low-bit checkpoints (`*-qat-4bit` / `-mxfp4` / `-nvfp4`

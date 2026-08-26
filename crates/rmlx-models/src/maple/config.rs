@@ -3,6 +3,10 @@
 use serde::Deserialize;
 
 /// `MapleForCausalLM` config as stored in the DeepGrove MLX snapshot.
+#[allow(
+    clippy::exhaustive_structs,
+    reason = "closed config struct — fields are the Maple checkpoint contract; adding one updates MapleConfig and every layer constructor"
+)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct MapleConfig {
     /// Hidden width (2048).
@@ -62,6 +66,10 @@ pub struct MapleConfig {
 }
 
 /// `quantization` / `quantization_config` object.
+#[allow(
+    clippy::exhaustive_structs,
+    reason = "closed quant block — bits + group_size is the Maple affine contract"
+)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct MapleQuantization {
     /// Default packed bits (2 for Maple linears).
@@ -102,12 +110,18 @@ fn default_group() -> i32 {
 
 impl MapleConfig {
     /// Sliding-window layer? Full-attention layers are NoPE.
+    ///
+    /// Empty `layer_types` matches maple.py: every layer is full-attention.
+    /// A short repeating pattern (e.g. 3× SWA + 1× full) is indexed modulo
+    /// its length so a 4-entry list still covers a 24-layer stack.
     #[must_use]
     pub fn is_swa_layer(&self, layer: usize) -> bool {
+        if self.layer_types.is_empty() {
+            return false;
+        }
         self.layer_types
-            .get(layer)
-            .map(|t| t == "sliding_attention")
-            .unwrap_or(true)
+            .get(layer % self.layer_types.len())
+            .is_some_and(|t| t == "sliding_attention")
     }
 
     /// Rotary dims (`head_dim * partial_rotary_factor`).
@@ -119,44 +133,10 @@ impl MapleConfig {
     /// MoE / most linear group size.
     #[must_use]
     pub fn moe_group_size(&self) -> i32 {
-        self.quantization
-            .as_ref()
-            .map_or(128, |q| q.group_size)
+        self.quantization.as_ref().map_or(128, |q| q.group_size)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn snapshot_config_parses() {
-        let raw = r#"{
-            "hidden_size": 2048,
-            "moe_intermediate_size": 512,
-            "num_hidden_layers": 24,
-            "num_attention_heads": 16,
-            "num_key_value_heads": 4,
-            "head_dim": 128,
-            "num_experts": 256,
-            "num_experts_per_tok": 8,
-            "first_k_dense_replace": 0,
-            "rms_norm_eps": 1e-6,
-            "rope_theta": 10000,
-            "partial_rotary_factor": 0.5,
-            "sliding_window": 512,
-            "layer_types": [
-                "sliding_attention","sliding_attention","sliding_attention","full_attention"
-            ],
-            "vocab_size": 151936,
-            "quantization": {"bits": 2, "group_size": 128}
-        }"#;
-        let cfg: MapleConfig = serde_json::from_str(raw).expect("parse maple config");
-        assert_eq!(cfg.hidden_size, 2048);
-        assert_eq!(cfg.num_experts, 256);
-        assert_eq!(cfg.rope_dims(), 64);
-        assert!(cfg.is_swa_layer(0));
-        assert!(!cfg.is_swa_layer(3));
-        assert_eq!(cfg.moe_group_size(), 128);
-    }
-}
+#[path = "config_tests.rs"]
+mod config_tests;

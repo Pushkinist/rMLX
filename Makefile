@@ -326,6 +326,7 @@ model-check-full: ## run model-logic crates + golden-token integration tests (MO
 	  --test qwen3_golden_tokens \
 	  --test bitnet_golden_tokens \
 	  --test medgemma_golden_tokens \
+	  --test maple_golden_tokens \
 	  -- --ignored --test-threads=1
 
 # e2e: the feature-proof harness — drives the REAL rmlx binary per manifest case

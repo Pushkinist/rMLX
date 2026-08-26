@@ -254,3 +254,7 @@ impl MapleSparseMoeBlock {
         combined.reshape(&[batch, seq, hidden], device)
     }
 }
+
+#[cfg(test)]
+#[path = "moe_tests.rs"]
+mod moe_tests;

@@ -222,10 +222,11 @@ check_sweep() {
 NAN_CONTEXT=16
 
 # Call sites of the detector in the arch layer.
-EXPECTED_NAN_DETECT_SITES=11
+# MapleForCausalLM adds one miss-path prefill site (Exact-hit replays first_id).
+EXPECTED_NAN_DETECT_SITES=12
 # Call sites of the guard, counting the two wrappers that fan out to several
 # prefill paths (qwen3_vl_moe text+image; the four speculative drivers).
-EXPECTED_GUARD_CALL_SITES=16
+EXPECTED_GUARD_CALL_SITES=17
 GUARD_CALL_RE='reject_nan_prefill\(|guard_prefill_logits\(|guard_verifier_prefill_logits\('
 
 nan_detect_sites() {
