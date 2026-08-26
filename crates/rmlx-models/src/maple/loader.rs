@@ -49,7 +49,7 @@ use rmlx_loader::{load_shard_index, ShardSet};
 use rmlx_mlx::{broadcast_to, expand_dims, negative, stack_axis, Array, Device};
 use tracing::info;
 
-use crate::layers::{resolve_quant, Embedding, Linear, QuantMode, QuantParams, RmsNorm};
+use crate::layers::{resolve_quant, Embedding, Linear, QuantMode, QuantParams};
 use crate::load_util::{bf16_param, bf16_scales, Weights};
 
 use super::attention::{MapleAttention, MapleRmsNorm};
@@ -88,8 +88,8 @@ pub(crate) struct MapleLoadBundle {
     pub embed: Embedding,
     /// Per-layer norms + attention + MLP.
     pub layers: Vec<MapleLayerWeights>,
-    /// `model.norm`.
-    pub norm: RmsNorm,
+    /// `model.norm` (`MapleRMSNorm`).
+    pub(super) norm: MapleRmsNorm,
     /// Top-level `lm_head`. `None` when `tie_word_embeddings`.
     pub lm_head: Option<Linear>,
     /// Snapshot identity folded into the prompt-cache seed.
@@ -265,6 +265,24 @@ pub(crate) fn load_weights(model_dir: &Path) -> Result<MapleLoadBundle> {
     let raw_json = crate::load_util::read_raw_config(model_dir)?;
     let cfg: MapleConfig = serde_json::from_value(raw_json.clone())
         .map_err(|e| Error::Config(format!("maple: cannot deserialize config.json: {e}")))?;
+    if cfg.has_rope_scaling() {
+        return Err(Error::Config(
+            "maple: rope_scaling is set; v1 only implements unscaled partial RoPE \
+             (traditional=false). A scaled scheme would rotate the wrong frequencies."
+                .to_owned(),
+        ));
+    }
+    if raw_json
+        .get("use_flash_head")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return Err(Error::Config(
+            "maple: use_flash_head=true is not implemented; rMLX uses the exact \
+             lm_head. Unset the flag (mlx-lm default) to load this snapshot."
+                .to_owned(),
+        ));
+    }
     let raw_quant = raw_json.get("quantization");
     let overrides = extract_quant_overrides(raw_quant);
     let lin_defaults = linear_defaults(&cfg);
@@ -287,6 +305,13 @@ pub(crate) fn load_weights(model_dir: &Path) -> Result<MapleLoadBundle> {
     let pfx = w.resolve_prefix(&["model"], "word_embeddings.weight")?;
     info!(prefix = %pfx, "Maple: resolved tensor prefix");
 
+    if w.has("lm_head_flash.centroids.weight")? || w.has("lm_head_flash.token_map")? {
+        info!(
+            "Maple: ignoring lm_head_flash.* (exact lm_head; FlashHead is an \
+             optional decode approximation, not the trained forward)"
+        );
+    }
+
     let device = Device::Gpu;
 
     let embed = load_embedding(
@@ -296,10 +321,10 @@ pub(crate) fn load_weights(model_dir: &Path) -> Result<MapleLoadBundle> {
         &overrides,
     )?;
 
-    let norm = RmsNorm {
-        weight: Some(load_rms_weight(&w, &format!("{pfx}.norm"))?),
-        eps: cfg.rms_norm_eps,
-    };
+    let norm = MapleRmsNorm::new(
+        load_rms_weight(&w, &format!("{pfx}.norm"))?,
+        cfg.rms_norm_eps,
+    );
 
     let lm_head = if cfg.tie_word_embeddings {
         info!("Maple: tie_word_embeddings=true, skipping lm_head");

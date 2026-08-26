@@ -63,6 +63,10 @@ pub struct MapleConfig {
     /// Snapshot quantization block (`bits`, `group_size`, per-tensor overrides).
     #[serde(default)]
     pub quantization: Option<MapleQuantization>,
+    /// YaRN / Su / Llama3 RoPE scaling. Maple-Preview is `null` (plain RoPE).
+    /// A non-null value is rejected at load — silent ignore would rotate wrong.
+    #[serde(default)]
+    pub rope_scaling: Option<serde_json::Value>,
 }
 
 /// `quantization` / `quantization_config` object.
@@ -134,6 +138,17 @@ impl MapleConfig {
     #[must_use]
     pub fn moe_group_size(&self) -> i32 {
         self.quantization.as_ref().map_or(128, |q| q.group_size)
+    }
+
+    /// True when `rope_scaling` is present and not JSON null / empty object.
+    #[must_use]
+    pub fn has_rope_scaling(&self) -> bool {
+        match &self.rope_scaling {
+            None => false,
+            Some(v) if v.is_null() => false,
+            Some(v) if v.as_object().is_some_and(serde_json::Map::is_empty) => false,
+            Some(_) => true,
+        }
     }
 }
 

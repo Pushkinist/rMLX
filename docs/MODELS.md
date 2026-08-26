@@ -1246,7 +1246,10 @@ scope.
 ## Maple (`MapleForCausalLM`)
 
 DeepGrove Maple-Preview — a 20B-A1B ternary MoE decoder (`maple-2bit-mlx`).
-v1 is the portable reference forward: no FlashHead, no fused Metal kernels.
+v1 is the portable **reference** forward from `maple.py` (the path mlx-lm
+falls back to when a fused kernel fails its one-time self-check). FlashHead
+and the decode-only Metal fusions are skipped on purpose — see
+[Why v1 skips FlashHead and fused kernels](#why-v1-skips-flashhead-and-fused-kernels).
 
 ### Config schema
 
@@ -1303,7 +1306,8 @@ rings come back payload-less and are not reused.
   (`n_groups = packed_last_dim * 16 / group_size`, group_size=128).
 - Layer norms, Q/K norms, and `mlp.gate.weight` are plain bf16.
 
-v1 does **not** implement FlashHead (`lm_head_flash.*` is skipped at load).
+v1 does **not** implement FlashHead (`lm_head_flash.*` is skipped at load;
+`use_flash_head=true` is refused). The exact 4-bit `lm_head` is always used.
 
 ### KV quantization
 
@@ -1315,9 +1319,37 @@ All `KvQuant` variants accepted. `auto` resolves to `DEFAULT_KV_QUANT`
 
 Text only. Tokenizer is Qwen-style (BOS 151643, EOS 151645).
 
+### Why v1 skips FlashHead and fused kernels
+
+mlx-lm `maple.py` ships **four decode-only shortcuts** on top of a portable
+reference. Each fused path is probed once against that reference (`_matches`
+/ `_probe`) and silently falls back if it fails to compile or disagrees.
+rMLX implements the reference, not the shortcuts:
+
+| Python fast path | What it is | Why not in rMLX v1 |
+|---|---|---|
+| **FlashHead** | Approximate `lm_head`: score 4748 cluster centroids, exact logits only for the top 512 clusters (+ forced EOS/think tokens). Greedy is exact **only if** the true argmax is in a probed cluster. Prefill still uses the exact head. Opt-in via `use_flash_head=true` (mlx-lm default **off**). | It is not the trained forward. A wrong cluster set changes tokens. rMLX kernels must live in `.metal` files and stay **model-agnostic** (CLAUDE.md hard rule 10); FlashHead is a Maple-specific vocab clustering path. The snapshot already carries a correct 4-bit `lm_head`. |
+| **Fused add+RMS** | One Metal dispatch for `h = x+r` and RMSNorm (fp32 weight multiply). Decode-only (`h.size == hidden`). | Same arithmetic as `add` + `MapleRMSNorm`. rMLX already has a shared `rms_norm`; an arch-named kernel is the rule we do not want. |
+| **Fused QK-norm+RoPE** | One dispatch replacing q_norm, k_norm, and two RoPEs. Decode-only. NoPE layers pass `ROPE_DIM=0`. | Same as the stock `MapleRMSNorm` + `rope` path we already run. |
+| **Fused router** | GEMV + fp32 softmax + top-8 + renormalize in one kernel (~+18% Python). Decode-only. | Same as `MapleGate`’s fp32 reference. Near-tied top-8 order may differ; scores must match. |
+
+Python also **fuses QKV into one matmul** and **up+gate into one SwitchLinear**
+at `sanitize()`. That is lossless along the output axis (row-wise affine).
+rMLX keeps split `q/k/v` and `gate/up/down` — three (resp. two) equivalent
+quantized GEMVs. Same math, more dispatches; fuse only behind a bench.
+
+What v1 **does** match: `row_alpha` → scales + `biases = -scales`, expert
+stacking, MapleRMSNorm (fp32 multiply) on Q/K **and** the final `model.norm`,
+clamped expert SwiGLU, fp32 router, hybrid SWA-512 / NoPE, Exact-only prompt
+cache, `<think>` splitting.
+
 ### Known limitations (v1)
 
-- No FlashHead, no fused add+RMS / QK-norm+RoPE / router Metal kernels.
+- No FlashHead, no fused add+RMS / QK-norm+RoPE / router Metal kernels
+  (reference arithmetic; see above).
+- Split QKV / split MoE up+gate (equivalent to Python `sanitize` concat).
+- Dense MLP (`first_k_dense_replace > 0`) is refused; Maple-Preview is 0.
+- `rope_scaling` other than null is refused (this snapshot is plain RoPE).
 - `forward_seq_last_k_with_cache` not wired. Speculative decode uses Phase-2.
 - No vision or audio tower.
 

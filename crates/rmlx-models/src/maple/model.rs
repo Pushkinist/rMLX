@@ -15,9 +15,10 @@
 use rmlx_core::error::Result;
 use rmlx_mlx::{Array, Device};
 
-use crate::layers::{Embedding, Linear, RmsNorm};
+use crate::layers::{Embedding, Linear};
 use rmlx_kv_quant::{KvCache, KvQuant};
 
+use super::attention::MapleRmsNorm;
 use super::config::MapleConfig;
 use super::decoder_layer::MapleDecoderLayer;
 
@@ -30,8 +31,8 @@ pub struct MapleText {
     pub(super) embed: Embedding,
     /// Decoder stack (SWA and full-attention layers mixed).
     pub(super) layers: Vec<MapleDecoderLayer>,
-    /// Final RMSNorm before the LM head.
-    pub(super) norm: RmsNorm,
+    /// Final RMSNorm before the LM head (`MapleRMSNorm`: fp32 weight multiply).
+    pub(super) norm: MapleRmsNorm,
     /// `None` when `tie_word_embeddings`.
     pub(super) lm_head: Option<Linear>,
     /// Resident-KV byte total of this instance's last generation.

@@ -51,3 +51,20 @@ fn empty_layer_types_are_full_attention() {
     assert!(!cfg.is_swa_layer(0));
     assert!(!cfg.is_swa_layer(3));
 }
+
+#[test]
+fn rope_scaling_null_or_absent_is_plain_rope() {
+    let cfg: MapleConfig = serde_json::from_str(SNAPSHOT_JSON).expect("parse maple config");
+    assert!(!cfg.has_rope_scaling());
+    let with_null = SNAPSHOT_JSON.trim_end_matches('}').to_owned() + r#", "rope_scaling": null}"#;
+    let cfg: MapleConfig = serde_json::from_str(&with_null).expect("parse");
+    assert!(!cfg.has_rope_scaling());
+}
+
+#[test]
+fn rope_scaling_object_is_flagged() {
+    let with = SNAPSHOT_JSON.trim_end_matches('}').to_owned()
+        + r#", "rope_scaling": {"rope_type": "yarn"}}"#;
+    let cfg: MapleConfig = serde_json::from_str(&with).expect("parse");
+    assert!(cfg.has_rope_scaling());
+}

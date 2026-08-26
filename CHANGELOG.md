@@ -407,7 +407,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   affine 2-bit `row_alpha` expanded to group scales + `biases = -scales`,
   fp32 top-8 router, clamped expert SwiGLU, `<think>` reasoning via the
   existing splitter. v1 is the portable reference forward (no FlashHead,
-  no fused Metal). Golden-token gate: `maple_golden_tokens`.
+  no fused Metal). Final `model.norm` uses MapleRMSNorm (fp32 weight
+  multiply), matching maple.py — not the generic bf16 `rms_norm`.
+  Golden-token gate: `maple_golden_tokens`.
 - **Per-dispatch `trace!` on the two PlanarQuant kernels**
   (`planar_flash_decode_sdpa: dispatch`, `planar_fused_qk: dispatch`), matching
   every sibling KV kernel. Their in-process dispatch counters have no caller
