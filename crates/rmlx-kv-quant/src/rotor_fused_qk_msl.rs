@@ -134,6 +134,7 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
+use crate::storage::to_sideband_dtype;
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::metal_kernel::{MetalKernel, MetalKernelInvoke};
 use rmlx_mlx::{Array, Device, Dtype};
@@ -465,8 +466,10 @@ pub fn rotor_fused_qk_sdpa_generic<const BITS: u8>(
     let norms_total: i64 = tok_count;
     let rotors_total: i64 = i64::from(n_groups_i32) * (ROTOR_STRIDE as i64);
     let codes_flat = k_codes.reshape(&[codes_total as i32], device)?;
-    let scales_flat = k_scales.reshape(&[scales_total as i32], device)?;
-    let norms_flat = k_norms.reshape(&[norms_total as i32], device)?;
+    // Bound at the stored sideband dtype — see `iso_flash_decode_msl`.
+    let scales_flat =
+        to_sideband_dtype(&k_scales.reshape(&[scales_total as i32], device)?, device)?;
+    let norms_flat = to_sideband_dtype(&k_norms.reshape(&[norms_total as i32], device)?, device)?;
     let rotors_flat = k_rotors.reshape(&[rotors_total as i32], device)?;
 
     let (mask_flat, has_mask) = if let Some(m) = additive_mask {

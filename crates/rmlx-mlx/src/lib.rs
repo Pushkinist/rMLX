@@ -747,7 +747,8 @@ impl Dtype {
     }
 
     /// Element size in bytes.
-    pub fn itemsize(self) -> usize {
+    #[must_use]
+    pub const fn itemsize(self) -> usize {
         match self {
             Dtype::Bf16 | Dtype::F16 => 2,
             Dtype::F32 | Dtype::U32 | Dtype::I32 => 4,

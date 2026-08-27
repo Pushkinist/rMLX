@@ -108,6 +108,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
+use crate::storage::to_sideband_dtype;
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::metal_kernel::{MetalKernel, MetalKernelInvoke};
 use rmlx_mlx::{Array, Device, Dtype};
@@ -403,11 +404,14 @@ pub fn rotor_flash_decode_symv_sdpa<const BITS: u8>(
     let codes_total: i64 = tok_count * n_groups_i64;
     let rotors_total: i64 = n_groups_i64 * ROTOR_STRIDE;
 
+    // Scales and norms are bound at the stored sideband dtype, which is what
+    // the header's decode helper declares. The rotor table stays f32 — it is a
+    // per-(layer, head) constant, not a per-token plane.
     let flatten_axis = |axis: RotorPackedAxis<'_>| -> Result<(Array, Array, Array, Array)> {
         Ok((
             axis.codes.reshape(&[codes_total as i32], device)?,
-            axis.scales.reshape(&[codes_total as i32], device)?,
-            axis.norms.reshape(&[tok_count as i32], device)?,
+            to_sideband_dtype(&axis.scales.reshape(&[codes_total as i32], device)?, device)?,
+            to_sideband_dtype(&axis.norms.reshape(&[tok_count as i32], device)?, device)?,
             axis.rotors.reshape(&[rotors_total as i32], device)?,
         ))
     };
@@ -417,7 +421,7 @@ pub fn rotor_flash_decode_symv_sdpa<const BITS: u8>(
     // GPU-native small-`norms`-buffer floor — see
     // [`crate::flash_decode_common::pad_norms_to_device_floor`]. Same trap and
     // fix as the iso sibling: `rf_decode_k_group` (the decoder the symv P1 body
-    // calls) also declares `norms` `device const float*`.
+    // calls) also declares `norms` in the `device` address space.
     let k_norms = pad_norms_to_device_floor(k_norms, tok_count, device)?;
     let v_norms = pad_norms_to_device_floor(v_norms, tok_count, device)?;
 

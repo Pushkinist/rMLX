@@ -37,9 +37,9 @@ constant float ISO_CB[8] = {
 // Shared surface: a quantized-V flash kernel calls this unchanged,
 // passing the V store's (codes, scales, norms) instead of K's.
 inline float if_decode_k_lane(
-    device const uint*  codes,
-    device const float* scales,
-    device const float* norms,
+    device const uint*   codes,
+    device const bfloat* scales,
+    device const bfloat* norms,
     uint                tok_idx,
     uint                n_groups,
     uint                lane) {

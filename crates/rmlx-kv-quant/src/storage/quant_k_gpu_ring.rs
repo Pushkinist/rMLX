@@ -30,8 +30,8 @@
 //! * `codes[(s * kv_h + h) * n_groups + g]`  (1 u32 per group; what a group
 //!   spans is the codec's business — 8 Cl(3,0) multivector components for
 //!   rotor, one 4-element quaternion block for iso)
-//! * `scales[(s * kv_h + h) * n_groups + g]` (1 f32 per group)
-//! * `norms[s * kv_h + h]`                   (1 f32 per token)
+//! * `scales[(s * kv_h + h) * n_groups + g]` (1 bf16 per group)
+//! * `norms[s * kv_h + h]`                   (1 bf16 per token)
 //!
 //! One sequence position therefore occupies `kv_h * n_groups` code words and
 //! `kv_h` norms, which is what lets an append land at a fixed per-step stride.
@@ -48,6 +48,68 @@ use rmlx_mlx::{zeros, Array, Device, Dtype};
 
 use super::KV_PAGE_SIZE;
 
+/// Stored element type of the ring's scale and norm planes.
+///
+/// A scale and an L2 norm are both a single positive magnitude reconstructed
+/// straight into a `float` accumulator by the decode kernels, so bf16's 8
+/// mantissa bits are the whole of what a consumer can use — an `f32` plane
+/// spends 16 bits per element that no reader reads. At `head_dim = 128` the
+/// two planes are 4.125 of iso's 16.25 stored bits per value and 5.5 of
+/// rotor's 21.75; halving them is what puts the iso family under bf16.
+///
+/// Single producer on purpose: `alloc`, `grow`, the upload path and every
+/// consumer that asserts a ring dtype read it from here, so the stored format
+/// cannot drift between the allocation and the reader.
+pub const KV_SIDEBAND_DTYPE: Dtype = Dtype::Bf16;
+
+/// Round `x` to what [`KV_SIDEBAND_DTYPE`] can hold, as an `f32`.
+///
+/// The CPU encoders call this on a scale and a norm *before* quantizing
+/// against it, so the value the codes were chosen against is the value the
+/// store holds and a decode reconstructs with. Skipping it would leave the
+/// encoder working at a precision the store cannot keep, which shows up twice:
+/// the reconstruction is off by the rounding, and a store seeded from CPU
+/// blocks stops decoding identically to the blocks it was seeded from.
+///
+/// Round-to-nearest-even, matching MLX's `astype` and MSL's `bfloat(x)` — the
+/// two other places a sideband value is narrowed. `sideband_rounding_matches_mlx`
+/// pins that agreement against MLX rather than restating it.
+#[must_use]
+pub fn bf16_round(x: f32) -> f32 {
+    let bits = x.to_bits();
+    // NaN: shifting the payload out can land on an infinity, so keep it a NaN.
+    if x.is_nan() {
+        return x;
+    }
+    let lower = bits & 0xFFFF;
+    let round_up = lower > 0x8000 || (lower == 0x8000 && (bits & 0x1_0000) != 0);
+    let hi = (bits >> 16) as u16;
+    let hi = if round_up { hi.wrapping_add(1) } else { hi };
+    f32::from_bits(u32::from(hi) << 16)
+}
+
+/// Cast `a` to [`KV_SIDEBAND_DTYPE`] unless it is already there.
+///
+/// Every kernel that reads a scale or norm plane declares it at the sideband
+/// dtype, and MLX binds the buffer by the bound array's dtype with no
+/// conversion — so handing such a kernel an `f32` plane does not fail, it
+/// reinterprets the bytes and decodes garbage. Dispatchers run their planes
+/// through this so the declaration and the binding cannot disagree.
+///
+/// Free on the shipped path: the ring and the encode kernels are already at
+/// this dtype, so the branch returns without enqueueing anything.
+///
+/// # Errors
+///
+/// Forwards MLX cast failures.
+pub fn to_sideband_dtype(a: &Array, device: Device) -> Result<Array> {
+    if a.dtype() == KV_SIDEBAND_DTYPE {
+        a.try_clone()
+    } else {
+        a.astype(KV_SIDEBAND_DTYPE, device)
+    }
+}
+
 /// GPU-resident packed K payload plus its growth bookkeeping.
 ///
 /// `None` buffers mean "not yet allocated" — the ring is created lazily on the
@@ -56,9 +118,10 @@ use super::KV_PAGE_SIZE;
 pub struct QuantKGpuRing {
     /// Packed codes, flat `u32 [capacity * kv_h * n_groups]`.
     pub codes: Option<Array>,
-    /// Per-group scales, flat `f32 [capacity * kv_h * n_groups]`.
+    /// Per-group scales, flat [`KV_SIDEBAND_DTYPE`]
+    /// `[capacity * kv_h * n_groups]`.
     pub scales: Option<Array>,
-    /// Per-token L2 norms, flat `f32 [capacity * kv_h]`.
+    /// Per-token L2 norms, flat [`KV_SIDEBAND_DTYPE`] `[capacity * kv_h]`.
     pub norms: Option<Array>,
     /// Code words / scales per sequence position (`kv_h * n_groups`).
     pub codes_per_step: i32,
@@ -297,8 +360,8 @@ impl QuantKGpuRing {
         self.alloc(cap, device)?;
 
         let codes_arr = u32_slice_to_array(codes)?;
-        let scales_arr = f32_slice_to_array(scales)?;
-        let norms_arr = f32_slice_to_array(norms)?;
+        let scales_arr = f32_slice_to_sideband_array(scales, device)?;
+        let norms_arr = f32_slice_to_sideband_array(norms, device)?;
 
         let (cps, nps) = (self.codes_per_step, self.norms_per_step);
         write_range(&mut self.codes, &codes_arr, 0, filled_seq * cps, device)?;
@@ -363,10 +426,13 @@ impl QuantKGpuRing {
     /// sequence-major `(codes, per-group scales, per-token norms)` vectors.
     ///
     /// The CPU form the packed K stores accumulate their `blocks` in
-    /// (`RotorKBlocks` / `IsoBlocks`) is byte-identical to this download: the
-    /// ring was fed the encode kernel's own GPU arrays, and it already stores
-    /// **per-token** norms (collapsed at feed time), so no group→token collapse
-    /// is applied here. Returns `None` when the ring is not live.
+    /// (`RotorKBlocks` / `IsoBlocks`) has the same shape and ordering as this
+    /// download: the ring was fed the encode kernel's own GPU arrays, and it
+    /// already stores **per-token** norms (collapsed at feed time), so no
+    /// group→token collapse is applied here. The scale and norm values are the
+    /// ring's, at [`KV_SIDEBAND_DTYPE`] precision widened back to `f32` — the
+    /// stored format, not the encoder's pre-store `f32`. Returns `None` when the
+    /// ring is not live.
     ///
     /// Cold path — used to rebuild the CPU blocks on demand for a store whose
     /// decode tail lives only in the ring (`dequant` / SSD spill), never per
@@ -386,8 +452,8 @@ impl QuantKGpuRing {
         };
         Ok(Some((
             array_to_u32_vec(&codes)?,
-            array_to_f32_vec(&scales)?,
-            array_to_f32_vec(&norms)?,
+            sideband_to_f32_vec(&scales, "scales")?,
+            sideband_to_f32_vec(&norms, "norms")?,
         )))
     }
 
@@ -395,8 +461,8 @@ impl QuantKGpuRing {
         let cps = self.codes_per_step;
         let nps = self.norms_per_step;
         self.codes = Some(zeros(&[cap * cps], Dtype::U32, device)?);
-        self.scales = Some(zeros(&[cap * cps], Dtype::F32, device)?);
-        self.norms = Some(zeros(&[cap * nps], Dtype::F32, device)?);
+        self.scales = Some(zeros(&[cap * cps], KV_SIDEBAND_DTYPE, device)?);
+        self.norms = Some(zeros(&[cap * nps], KV_SIDEBAND_DTYPE, device)?);
         self.capacity = cap;
         tracing::debug!(cap, cps, nps, "QuantKGpuRing: ring allocated");
         Ok(())
@@ -419,7 +485,7 @@ impl QuantKGpuRing {
             self.scales.take(),
             cap * cps,
             prev_seq * cps,
-            Dtype::F32,
+            KV_SIDEBAND_DTYPE,
             "scales",
             device,
         )?);
@@ -427,7 +493,7 @@ impl QuantKGpuRing {
             self.norms.take(),
             cap * nps,
             prev_seq * nps,
-            Dtype::F32,
+            KV_SIDEBAND_DTYPE,
             "norms",
             device,
         )?);
@@ -476,7 +542,14 @@ fn regrow(
     fresh.slice_update(&prefix, &[0], &[copy_seq], &[1], device)
 }
 
-/// `slice_update` `src` into `buf[start..stop]`.
+/// `slice_update` `src` into `buf[start..stop]`, at the buffer's own dtype.
+///
+/// The cast is the store-format boundary: a codec's encode kernel is free to
+/// hand over a plane at whatever dtype it computes in, and what lands in the
+/// ring is [`KV_SIDEBAND_DTYPE`] either way. It is a no-op for a source already
+/// at the target dtype, which is the shipped case for every plane — the encode
+/// dispatchers declare their outputs at the ring's dtypes — so the steady-state
+/// append enqueues no conversion.
 fn write_range(
     buf: &mut Option<Array>,
     src: &Array,
@@ -495,6 +568,11 @@ fn write_range(
         )));
     }
     let flat = src.reshape(&[span], device)?;
+    let flat = if flat.dtype() == target.dtype() {
+        flat
+    } else {
+        flat.astype(target.dtype(), device)?
+    };
     *buf = Some(target.slice_update(&flat, &[start], &[stop], &[1], device)?);
     Ok(())
 }
@@ -511,15 +589,24 @@ fn u32_slice_to_array(vals: &[u32]) -> Result<Array> {
     Array::from_bytes(bytes, &[len], Dtype::U32)
 }
 
-/// Upload an `f32` slice as a flat 1-D GPU array.
-fn f32_slice_to_array(vals: &[f32]) -> Result<Array> {
+/// Upload an `f32` slice as a flat 1-D GPU array at [`KV_SIDEBAND_DTYPE`].
+///
+/// The narrowing runs through MLX's own cast rather than a hand-rolled one, so
+/// the rounding a seeded position gets is the rounding an appended position
+/// gets — the encode kernels write the same dtype through the same MLX
+/// conversion. A hand-rolled rounding here could differ from it in the last
+/// mantissa bit and make a hydrated prefix decode differently from a freshly
+/// appended tail.
+///
+/// Cold path: seeding runs once per ring, on the first GPU append.
+fn f32_slice_to_sideband_array(vals: &[f32], device: Device) -> Result<Array> {
     // SAFETY: same reasoning as `u32_slice_to_array` — `f32` is `Copy`, 4-byte,
     // alignment ≥ `u8`; `Array::from_bytes` copies before the borrow ends.
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(vals.as_ptr().cast::<u8>(), vals.len() * 4) };
     let len = i32::try_from(vals.len())
         .map_err(|_| Error::Quant("QuantKGpuRing: f32 prefix exceeds i32::MAX".into()))?;
-    Array::from_bytes(bytes, &[len], Dtype::F32)
+    Array::from_bytes(bytes, &[len], Dtype::F32)?.astype(KV_SIDEBAND_DTYPE, device)
 }
 
 /// Download a flat `u32` GPU array to a `Vec<u32>`.
@@ -535,17 +622,66 @@ fn array_to_u32_vec(a: &Array) -> Result<Vec<u32>> {
         .collect())
 }
 
-/// Download a flat `f32` GPU array to a `Vec<f32>`.
+/// Widen a flat sideband GPU array to a `Vec<f32>`, keyed on the array's own
+/// dtype.
+///
+/// The stride a reader has to use is a function of the stored dtype, so this
+/// reads the dtype instead of assuming one: a fixed `chunks_exact(4)` over a
+/// bf16 plane is length-correct for half the elements and garbage in all of
+/// them, with nothing to notice it. An unexpected dtype is a store-format
+/// mismatch and is rejected rather than reinterpreted.
+///
+/// Cold path: only `dequant` / SSD spill rebuild the CPU blocks.
 #[allow(
     clippy::expect_used,
-    reason = "chunks_exact(4) yields slices of exactly 4 bytes"
+    reason = "chunks_exact(n) yields slices of exactly n bytes"
 )]
-fn array_to_f32_vec(a: &Array) -> Result<Vec<f32>> {
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "the wildcard is the point: a plane at any dtype other than the two this reader \
+              has a stride for is rejected, and a dtype added to Dtype later must keep being \
+              rejected rather than acquiring a silent stride here"
+)]
+pub fn sideband_to_f32_vec(a: &Array, what: &str) -> Result<Vec<f32>> {
+    // eval-ok: host readback — `to_bytes()` copies this array to CPU, so it has
+    // to be materialised first.
     a.eval()?;
-    Ok(a.to_bytes()?
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().expect("len 4 by chunks_exact contract")))
-        .collect())
+    let bytes = a.to_bytes()?;
+    let item = match a.dtype() {
+        Dtype::F32 => 4_usize,
+        Dtype::Bf16 => 2,
+        other => {
+            return Err(Error::Quant(format!(
+                "sideband_to_f32_vec: {what} plane is {other:?}, which is neither the stored \
+                 sideband dtype ({KV_SIDEBAND_DTYPE:?}) nor f32 — refusing to reinterpret its \
+                 bytes at a stride the dtype does not back"
+            )))
+        }
+    };
+    if !bytes.len().is_multiple_of(item) {
+        return Err(Error::Quant(format!(
+            "sideband_to_f32_vec: {what} plane holds {} bytes, not a whole number of {:?} \
+             elements",
+            bytes.len(),
+            a.dtype()
+        )));
+    }
+    Ok(if item == 2 {
+        bytes
+            .chunks_exact(2)
+            .map(|b| {
+                let bits =
+                    u16::from_le_bytes(b.try_into().expect("len 2 by chunks_exact contract"));
+                // bf16 is the top 16 bits of the f32 it widens to.
+                f32::from_bits(u32::from(bits) << 16)
+            })
+            .collect()
+    } else {
+        bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().expect("len 4 by chunks_exact contract")))
+            .collect()
+    })
 }
 
 fn slice_prefix(buf: Option<&Array>, len: i32, what: &str, device: Device) -> Result<Array> {

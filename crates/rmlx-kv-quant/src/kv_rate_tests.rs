@@ -37,9 +37,11 @@ use crate::planarquant::planar_quantize;
 use crate::q8::{q8_quantize, Q8_GROUP_SIZE};
 use crate::quant::KvQuant;
 use crate::rotorquant::{n_groups_for, rotor3_encode, rotor4_encode};
+use crate::storage::QuantKGpuRing;
 use crate::tcq::{tcq_quantize_v2, tcq_quantize_v3};
 use crate::test_utils::{gaussian_data, stored_bits_per_value, BF16_BITS_PER_VALUE, TEST_SEED};
 use crate::turboquant::{turbo_quantize_v, GROUP_SIZE};
+use rmlx_mlx::Device;
 
 // ── Fixture ──────────────────────────────────────────────────────────────────
 
@@ -117,10 +119,37 @@ fn measure_planar(data: &[f32], bits: u8) -> u64 {
         .byte_size()
 }
 
+/// Bytes the shipped GPU ring holds for one encoded side.
+///
+/// Measured off `QuantKGpuRing::byte_size`, which reads each plane's own shape
+/// and dtype, rather than multiplying host `Vec` lengths by a constant: the
+/// constant is the thing that goes stale when a plane's stored width changes,
+/// and a stored-rate gate that restates it is measuring its own arithmetic.
+/// `max_seq == rows` keeps the page-rounding out of the figure.
+fn ring_bytes(codes: &[u32], scales: &[f32], norms: &[f32], n_groups: usize) -> u64 {
+    let mut ring = QuantKGpuRing::default();
+    ring.seed_from_cpu(
+        codes,
+        scales,
+        norms,
+        1,
+        n_groups as i32,
+        ROWS as i32,
+        ROWS as i32,
+        Device::Cpu,
+    )
+    .expect("seed the ring from the encoder output");
+    ring.byte_size()
+}
+
+/// The iso store as a **served request holds it**: the GPU ring. The CPU
+/// `IsoBlocks` form — the ring's payload plus a replicated `FIXED_QUAT` per
+/// group, all at `f32` — exists only between `exit_prefill` and the first fused
+/// decode step, which drops it (`drop_blocks_when_ring_live_iso_*`).
 fn measure_iso(data: &[f32], bits: u8) -> u64 {
-    let (codes, scales, quats, norms) =
+    let (codes, scales, _quats, norms) =
         iso_encode_fast(data, HEAD_DIM, 4, bits).expect("iso_encode_fast");
-    4 * (codes.len() + scales.len() + quats.len() + norms.len()) as u64
+    ring_bytes(&codes, &scales, &norms, HEAD_DIM / 4)
 }
 
 /// The TurboQuant family entry for a `bits`-wide V axis.
@@ -140,16 +169,17 @@ fn measure_rotor(data: &[f32], bits: u8) -> u64 {
     } else {
         rotor4_encode(data, &rotors, HEAD_DIM).expect("rotor4_encode")
     };
-    4 * (codes.len() + scales.len() + norms.len()) as u64
+    ring_bytes(&codes, &scales, &norms, n_groups_for(HEAD_DIM))
 }
 
 /// Every store family a shipped `KvQuant` variant can put an axis into.
 ///
-/// The two exemptions are the families the accounting was written to surface.
-/// Both spend one whole `u32` code word **and** one `f32` scale per group — 4
-/// head-dim slots for iso, 3 for rotor — so the nominal 3-bit and 4-bit members
-/// occupy byte-identical storage and neither is a compression format at any
-/// `head_dim`.
+/// The remaining exemptions are what is left of the four families the
+/// accounting was written to surface. All of them spend one whole `u32` code
+/// word per group — 4 head-dim slots for iso, 3 for rotor, 32 for planar — so
+/// the nominal 3-bit and 4-bit member of each occupies byte-identical storage.
+/// Iso has since come under the floor on a sideband change; rotor and planar
+/// have not, and their code and scale cadences are why.
 const FAMILIES: &[Family] = &[
     Family {
         name: "bf16",
@@ -213,25 +243,28 @@ const FAMILIES: &[Family] = &[
         verdict: Verdict::Exempt("same layout as planar3 — byte-identical at every head_dim"),
     },
     Family {
+        // Was exempt at 16.25 while the ring's scale and norm planes were f32.
+        // They are the sideband dtype now, which is what took iso under the
+        // floor — the code cadence did not change.
         name: "iso3",
         rate: Rate::Measured(|d| measure_iso(d, 3)),
-        verdict: Verdict::Exempt(
-            "fidelity experiment, not a compression format: one u32 code word + one f32 \
-             scale + one f32 quaternion per 4-element group, plus one f32 norm per token",
-        ),
+        verdict: Verdict::UnderBf16,
     },
     Family {
         name: "iso4",
         rate: Rate::Measured(|d| measure_iso(d, 4)),
-        verdict: Verdict::Exempt("same layout as iso3 — byte-identical at every head_dim"),
+        verdict: Verdict::UnderBf16,
     },
     Family {
         name: "rotor3",
         rate: Rate::Measured(|d| measure_rotor(d, 3)),
         verdict: Verdict::Exempt(
-            "fidelity experiment, not a compression format: one u32 code word + one f32 \
-             scale per 3-element group, plus one f32 norm per token. Five of the eight \
-             codes in each word are structurally zero (see crate::clifford)",
+            "fidelity experiment, not a compression format: one u32 code word per 3-element \
+             group is 10.67 bits per value before any sideband, and five of the eight codes \
+             in each word are structurally zero (see crate::clifford). Narrowing the scale \
+             and norm planes to the stored sideband dtype cut this family from 21.75 to \
+             16.25 bits per value — a 25% saving that still does not reach bf16, because a \
+             sideband change cannot fix a code cadence",
         ),
     },
     Family {
@@ -360,27 +393,58 @@ fn rotor_rate_splits_into_documented_code_scale_and_norm_bits() {
     let data = fixture();
     let (codes, scales, norms) = rotor3_encode(&data, &rotors, HEAD_DIM).expect("rotor3_encode");
 
-    let code_bits = stored_bits_per_value(4 * codes.len() as u64, VALUES);
-    let scale_bits = stored_bits_per_value(4 * scales.len() as u64, VALUES);
-    let norm_bits = stored_bits_per_value(4 * norms.len() as u64, VALUES);
+    // Each plane is measured at the width the ring stores it at, by allocating
+    // that plane alone: a per-plane `4 *` here would keep reporting the old
+    // scale and norm widths after the store narrowed, and the three parts would
+    // stop summing to the family rate above without anything saying so.
+    let n_groups = n_groups_for(HEAD_DIM);
+    let mut ring = QuantKGpuRing::default();
+    ring.seed_from_cpu(
+        &codes,
+        &scales,
+        &norms,
+        1,
+        n_groups as i32,
+        ROWS as i32,
+        ROWS as i32,
+        Device::Cpu,
+    )
+    .expect("seed the ring from the encoder output");
+    let plane = |a: Option<&rmlx_mlx::Array>| {
+        stored_bits_per_value(crate::bytes::opt_array_bytes(a), VALUES)
+    };
+    let code_bits = plane(ring.codes.as_ref());
+    let scale_bits = plane(ring.scales.as_ref());
+    let norm_bits = plane(ring.norms.as_ref());
     let total = code_bits + scale_bits + norm_bits;
     println!(
         "rotor3 @ head_dim={HEAD_DIM}: codes {code_bits:.2} + scales {scale_bits:.2} + \
          norms {norm_bits:.2} = {total:.2} bits/value"
     );
 
-    // 43 groups per row of 128 values: 43 * 32 / 128 = 10.75 on each of codes
-    // and scales, and one f32 norm per row is 32 / 128 = 0.25.
+    // 43 groups per row of 128 values: 43 * 32 / 128 = 10.75 for the u32 codes
+    // and 43 * 16 / 128 = 5.375 for the bf16 scales; one bf16 norm per row is
+    // 16 / 128 = 0.125.
     assert!((code_bits - 10.75).abs() < 1e-9, "code rate {code_bits}");
-    assert!((scale_bits - 10.75).abs() < 1e-9, "scale rate {scale_bits}");
-    assert!((norm_bits - 0.25).abs() < 1e-9, "norm rate {norm_bits}");
-    assert!((total - 21.75).abs() < 1e-9, "total rate {total}");
+    assert!((scale_bits - 5.375).abs() < 1e-9, "scale rate {scale_bits}");
+    assert!((norm_bits - 0.125).abs() < 1e-9, "norm rate {norm_bits}");
+    assert!((total - 16.25).abs() < 1e-9, "total rate {total}");
 
-    // The scale sideband alone costs two thirds of a bf16 value. Stated as an
-    // assertion so a scale-cadence change has to come back through here.
+    // The codes are now the dominant term, and they are what keeps this family
+    // above the floor: the sideband could go to zero and rotor would still
+    // store 10.75 bits per value against bf16's 16, but its 4-bit sibling packs
+    // the same u32 for a 4-bit codebook, so there is no width at which the
+    // cadence pays. Stated as an assertion so a code-cadence change has to come
+    // back through here.
     assert!(
-        scale_bits > 0.5 * BF16_BITS_PER_VALUE,
-        "one f32 scale per 3 values is supposed to be the dominant term ({scale_bits:.2})"
+        code_bits > scale_bits + norm_bits,
+        "the u32-per-3-values code cadence is supposed to be the dominant term \
+         (codes {code_bits:.3} vs sideband {:.3})",
+        scale_bits + norm_bits
+    );
+    assert!(
+        total > BF16_BITS_PER_VALUE,
+        "rotor3 is exempt from the bf16 floor, so its split must sum to above it ({total:.3})"
     );
 }
 

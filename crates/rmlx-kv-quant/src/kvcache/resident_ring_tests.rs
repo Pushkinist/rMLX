@@ -32,7 +32,9 @@ use super::KvCache;
 use crate::clifford::make_rotor_table;
 use crate::quant::KvQuant;
 use crate::rotorquant::n_groups_for;
-use crate::storage::{KvStorage, QuantIsoK3, QuantIsoK4, QuantRotorK3, QuantRotorK4};
+use crate::storage::{
+    KvStorage, QuantIsoK3, QuantIsoK4, QuantRotorK3, QuantRotorK4, KV_SIDEBAND_DTYPE,
+};
 use crate::test_utils::{lcg_data, skip_if_no_gpu_env};
 use rmlx_core::DispatchPolicy;
 use rmlx_mlx::{Array, Device, Dtype};
@@ -42,10 +44,19 @@ const KV_H: i32 = 8;
 const N_Q_HEADS: i32 = 32;
 const HEAD_DIM: i32 = 128;
 
+/// A `bf16` input array.
+///
+/// bf16 and not f32 because the mirror buffers this file measures take their
+/// dtype from the stream that fills them (`stream_dtype`): an f32 K/V feed
+/// produces f32 mirrors, which are twice the bytes production allocates and
+/// would make every mirror term here describe a cache no request ever holds.
 #[allow(clippy::expect_used, reason = "test helper: invariants documented")]
-fn f32_array(data: &[f32], shape: &[i32]) -> Array {
+fn bf16_array(data: &[f32], shape: &[i32]) -> Array {
     let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
-    Array::from_bytes(&bytes, shape, Dtype::F32).expect("f32_array")
+    Array::from_bytes(&bytes, shape, Dtype::F32)
+        .expect("bf16_array: build f32")
+        .astype(Dtype::Bf16, Device::Gpu)
+        .expect("bf16_array: cast")
 }
 
 /// Build an empty K-only cache for a ring-backed codec.
@@ -224,9 +235,9 @@ fn drive_to_ring(cache: &mut KvCache, prefill: i32) {
 
     // Prefill goes through the legacy path: CPU blocks accumulate, no ring yet.
     let pf = (prefill * KV_H * HEAD_DIM) as usize;
-    let k = f32_array(&lcg_data(pf, 1), &[1, KV_H, prefill, HEAD_DIM]);
-    let v = f32_array(&lcg_data(pf, 2), &[1, KV_H, prefill, HEAD_DIM]);
-    let q = f32_array(
+    let k = bf16_array(&lcg_data(pf, 1), &[1, KV_H, prefill, HEAD_DIM]);
+    let v = bf16_array(&lcg_data(pf, 2), &[1, KV_H, prefill, HEAD_DIM]);
+    let q = bf16_array(
         &lcg_data((prefill * N_Q_HEADS * HEAD_DIM) as usize, 3),
         &[1, N_Q_HEADS, prefill, HEAD_DIM],
     );
@@ -242,9 +253,9 @@ fn drive_to_ring(cache: &mut KvCache, prefill: i32) {
 
     // First decode step seeds the ring from the accumulated CPU prefix.
     let one = (KV_H * HEAD_DIM) as usize;
-    let k1 = f32_array(&lcg_data(one, 10), &[1, KV_H, 1, HEAD_DIM]);
-    let v1 = f32_array(&lcg_data(one, 20), &[1, KV_H, 1, HEAD_DIM]);
-    let q1 = f32_array(
+    let k1 = bf16_array(&lcg_data(one, 10), &[1, KV_H, 1, HEAD_DIM]);
+    let v1 = bf16_array(&lcg_data(one, 20), &[1, KV_H, 1, HEAD_DIM]);
+    let q1 = bf16_array(
         &lcg_data((N_Q_HEADS * HEAD_DIM) as usize, 30),
         &[1, N_Q_HEADS, 1, HEAD_DIM],
     );
@@ -316,10 +327,17 @@ fn assert_ring_is_counted(quant: KvQuant, prefill: i32) {
 /// This is the magnitude oracle the delta tests deliberately are not. It does
 /// not call `byte_size`'s arithmetic: it rebuilds the total from the layout
 /// `QuantKGpuRing` documents for its three buffers —
-/// `codes: u32[cap * kv_h * n_groups]`, `scales: f32[cap * kv_h * n_groups]`,
-/// `norms: f32[cap * kv_h]`, with iso's `n_groups = head_dim / 4` — and
-/// compares. A dtype or element-count error in the accounting (the 4-vs-8 byte
-/// class) fails here; the delta tests would sail through it.
+/// `codes: u32[cap * kv_h * n_groups]` and the two sideband planes
+/// `scales[cap * kv_h * n_groups]` / `norms[cap * kv_h]` at
+/// `KV_SIDEBAND_DTYPE`, with iso's `n_groups = head_dim / 4` — and compares. A
+/// dtype or element-count error in the accounting (the 4-vs-8 byte class) fails
+/// here; the delta tests would sail through it.
+///
+/// The two widths are read from `Dtype::itemsize` rather than written as
+/// literals, but they are read from *different* sources than `byte_size` uses:
+/// this side names `Dtype::U32` and `KV_SIDEBAND_DTYPE` explicitly, while
+/// `byte_size` reads whatever dtype each allocated buffer actually carries. A
+/// plane allocated at the wrong dtype still fails here.
 #[test]
 #[ignore = "GPU Metal context — run in isolation: cargo test resident_ring -- --ignored --test-threads=1"]
 fn ring_bytes_match_independent_geometry() {
@@ -333,9 +351,11 @@ fn ring_bytes_match_independent_geometry() {
 
     let kv_h = KV_H as u64;
     let n_groups = HEAD_DIM as u64 / 4; // ISO_QUAT_BLOCK_SIZE
-    let codes = cap * kv_h * n_groups * 4; // u32
-    let scales = cap * kv_h * n_groups * 4; // f32
-    let norms = cap * kv_h * 4; // f32
+    let code_w = Dtype::U32.itemsize() as u64;
+    let side_w = KV_SIDEBAND_DTYPE.itemsize() as u64;
+    let codes = cap * kv_h * n_groups * code_w;
+    let scales = cap * kv_h * n_groups * side_w;
+    let norms = cap * kv_h * side_w;
     let expected = codes + scales + norms;
 
     assert_eq!(
@@ -414,4 +434,104 @@ fn ring_stays_counted_across_contexts() {
             assert_ring_is_counted(quant, prefill);
         }
     }
+}
+
+/// The **estimator's** byte model, checked against a live cache rather than
+/// against a store's own encoder.
+///
+/// `KvQuant::estimated_resident_bytes_per_layer` is what the resolve-time
+/// net-benefit advisory is computed from, and every other gate on it —
+/// `every_codec_byte_model_matches_the_store_it_writes`, the stored-rate
+/// families in `kv_rate_tests` — checks it against a store built by hand from
+/// an encoder's output. None of them drives a decode. That leaves one seam
+/// uncovered: the estimator sizes the ring-backed families from
+/// `SideStore::IsoRing` / `SideStore::Rotor`, which is only the right store
+/// **because** the production append drops the CPU blocks once the ring is live
+/// (`drop_blocks_when_ring_live_*`). If that ever regained a route where the
+/// blocks survive, the iso model would be wrong by the block form's whole
+/// factor and every hand-built gate would still be green.
+///
+/// So this one drives a real prefill and a real fused decode step, then
+/// compares the estimate against `KvCache::resident_bytes`.
+///
+/// Two terms have to be named for the comparison to be exact, and both are
+/// documented properties of the estimate rather than fudge:
+///
+/// * **Page rounding.** The ring allocates in whole `KV_PAGE_SIZE` pages and
+///   the estimate models none, so the prefill is chosen to land the filled
+///   length exactly on a page boundary. `live_ring_capacity` is asserted equal
+///   to it, so a change in the growth policy fails here instead of being
+///   absorbed.
+/// * **Rotor's static rotation table.** Per-(layer, head), not per-token; the
+///   estimate omits it on purpose ("estimate, not census"), so it is added
+///   back from the store. It is zero for iso, whose rotation is a compile-time
+///   constant.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test resident_ring -- --ignored --test-threads=1"]
+fn estimator_matches_a_live_ring_backed_cache() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    // One decode step follows the prefill, so this lands `filled` on 256 — one
+    // whole KV_PAGE_SIZE.
+    const PREFILL: i32 = 255;
+    let seq = u64::try_from(PREFILL + 1).unwrap_or(0);
+
+    for quant in RING_BACKED_K_ONLY {
+        let (cache, ring) = cache_with_live_ring(quant, PREFILL);
+        assert!(ring > 0, "{quant}: the decode step must stand up the ring");
+
+        let estimate = quant.estimated_resident_bytes_per_layer(seq, HEAD_DIM as u64, KV_H as u64);
+        let expected = estimate + k_store_static_bytes(&cache);
+        let actual = cache.resident_bytes();
+        assert_eq!(
+            actual,
+            expected,
+            "{quant} @ seq={seq}: the live cache holds {actual} B but the estimator models \
+             {estimate} B (+{} B of static rotation table). The estimate sizes the K side \
+             from the ring alone — if the CPU blocks survived the decode step, or a bf16 \
+             seed came back, this is where it shows",
+            k_store_static_bytes(&cache)
+        );
+    }
+}
+
+/// The estimate is the *ring* form, not the CPU-block form — and the gap is
+/// large enough that nothing else in this file would notice the difference.
+///
+/// Companion to `estimator_matches_a_live_ring_backed_cache`: that one asserts
+/// the estimate is right, this one asserts it is right for a reason, by pinning
+/// what it would have been had the blocks survived. Without it, an estimate
+/// that silently switched to the block form could still be made to pass by
+/// moving the model and the gate together.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test resident_ring -- --ignored --test-threads=1"]
+fn the_live_cache_estimate_is_the_ring_form_not_the_block_form() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    const PREFILL: i32 = 255;
+    let quant = KvQuant::IsoKOnly3;
+    let (cache, ring) = cache_with_live_ring(quant, PREFILL);
+    let cap = u64::try_from(
+        live_ring_capacity(&cache).expect("iso3 ring must be live after the decode step"),
+    )
+    .unwrap_or(0);
+    assert_eq!(
+        cap,
+        u64::try_from(PREFILL + 1).unwrap_or(0),
+        "prefill is chosen so the ring's page-rounded capacity is the filled length"
+    );
+
+    // What the same prefix costs as CPU `IsoBlocks`: the ring's payload with
+    // both sideband planes at f32, plus a replicated FIXED_QUAT per group.
+    let kv_h = KV_H as u64;
+    let n_groups = HEAD_DIM as u64 / 4;
+    let groups = cap * kv_h * n_groups;
+    let blocks = groups * (4 + 4 + 4 * 4) + cap * kv_h * 4;
+    assert!(
+        blocks > 3 * ring,
+        "the block form ({blocks} B) must be several times the ring ({ring} B) — if it were \
+         not, sizing the estimate from the wrong one would be undetectable"
+    );
 }

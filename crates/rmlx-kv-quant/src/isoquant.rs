@@ -68,6 +68,7 @@
 //!   `bits ∈ {3,4}`. iso4 ships **CPU-only** (no MSL kernel) — the existing
 //!   MSL is hard-coded for `bits=3`; an iso4 MSL variant is deferred.
 
+use crate::storage::bf16_round;
 use crate::turboquant::lloyd_gaussian_codebook;
 use thiserror::Error;
 
@@ -344,9 +345,12 @@ pub fn iso_encode_fast(
             reason = "tok < n_tokens = v.len()/head_dim; row slice is always in-bounds"
         )]
         let row = &v[tok * head_dim..(tok + 1) * head_dim];
+        // Rounded to the stored sideband precision before it is used: the
+        // decode multiplies by the *stored* norm, so quantizing against a
+        // finer one would bake in an error the store cannot represent.
         let norm = {
             let sq: f32 = row.iter().map(|&x| x * x).sum();
-            sq.sqrt().max(1e-8)
+            bf16_round(sq.sqrt().max(1e-8))
         };
         norms.push(norm);
 
@@ -385,12 +389,14 @@ pub fn iso_encode_fast(
                 }
             }
 
-            // Scale = max_abs / max_centroid (same convention as TurboQuant/PlanarQuant).
-            let scale = if group_scale < 1e-12 {
+            // Scale = max_abs / max_centroid (same convention as
+            // TurboQuant/PlanarQuant), rounded to the stored sideband
+            // precision before the codes are chosen against it.
+            let scale = bf16_round(if group_scale < 1e-12 {
                 1e-12
             } else {
                 group_scale / max_centroid
-            };
+            });
             scales.push(scale);
 
             // Pass 2: quantize.

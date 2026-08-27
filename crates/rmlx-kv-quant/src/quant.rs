@@ -537,9 +537,13 @@ enum SideStore {
     /// Latent.
     Planar,
     /// IsoQuant on the GPU ring (`QuantKGpuRing`): one `u32` code word + one
-    /// `f32` scale per 4-element quaternion group, plus one `f32` norm per
-    /// token. `16 + 32/head_dim` bits per value — 16.25 at `head_dim = 128`,
-    /// approaching bf16's 16.0 from above and never reaching it.
+    /// scale per 4-element quaternion group, plus one norm per token, both
+    /// planes at [`crate::storage::KV_SIDEBAND_DTYPE`]. At bf16 that is
+    /// `12 + 16/head_dim` bits per value — **12.125 at `head_dim = 128`, under
+    /// bf16's 16.0**. It was 16.25 while the two planes were `f32`: a whole
+    /// `f32` scale per 4 values is 8 bits per value of sideband on its own, and
+    /// the mantissa beyond bf16's 8 bits is not read by anything — the decode
+    /// kernels reconstruct into a `float` accumulator from a magnitude.
     ///
     /// The rotation is the compile-time `crate::isoquant::FIXED_QUAT` and is not
     /// stored. This is the resident form for every iso codec that materialises a
@@ -547,7 +551,7 @@ enum SideStore {
     /// and then drops them, so the ring is the sole resident copy from the first
     /// fused decode step onward.
     ///
-    /// Two shapes hold the blocks instead and cost 2.97× this, so the estimate
+    /// Two shapes hold the blocks instead and cost 3.98× this, so the estimate
     /// runs low for them. Both are observable:
     ///
     /// * **transient** — the window between `exit_prefill`, which bulk-encodes
@@ -560,23 +564,34 @@ enum SideStore {
     ///   property of the model's geometry, not a startup window: it does not
     ///   end.
     IsoRing,
-    /// IsoQuant in CPU `IsoBlocks`: [`SideStore::IsoRing`] plus a 4×`f32`
-    /// quaternion per group — 48.25 bits per value at `head_dim = 128`, 2.97×
-    /// the ring.
+    /// IsoQuant in CPU `IsoBlocks`: one `u32` code word, one `f32` scale and a
+    /// 4×`f32` quaternion per group, plus one `f32` norm per token — 48.25 bits
+    /// per value at `head_dim = 128`, 3.98× the ring. The sideband is `f32`
+    /// here and not [`crate::storage::KV_SIDEBAND_DTYPE`]: these are `Vec<f32>`
+    /// in host RAM, not a GPU plane, so the ring's stored width does not apply
+    /// to them.
     ///
     /// The quaternion is the constant `FIXED_QUAT` replicated per group, not
     /// data. This form is what a codec with no ring path would hold — which is
     /// what `Iso3` / `Iso4` name, and why they are latent: their decode
     /// early-returns to the bf16 mirror, so no store is built at all.
     IsoBlocks,
-    /// RotorQuant: one `u32` code word + one `f32` scale per 3-element group,
-    /// plus one `f32` norm per token — `(64 * ceil(head_dim/3) + 32) / head_dim`
-    /// bits per value, 21.75 at `head_dim = 128`.
+    /// RotorQuant on the GPU ring: one `u32` code word + one scale per
+    /// 3-element group, plus one norm per token, both planes at
+    /// [`crate::storage::KV_SIDEBAND_DTYPE`] —
+    /// `(48 * ceil(head_dim/3) + 16) / head_dim` bits per value, **16.25 at
+    /// `head_dim = 128`**, down from 21.75 at an `f32` sideband. That is a 25%
+    /// cut and it still does not reach bf16's 16.0: rotor spends a whole `u32`
+    /// code word per 3 head-dim slots — 10.67 bits per value before any
+    /// sideband — and five of the eight codes in each word are structurally
+    /// zero (see `crate::clifford`). Narrowing the sideband cannot fix a code
+    /// cadence, so rotor remains a fidelity experiment rather than a
+    /// compression format.
     ///
-    /// The ring and the CPU blocks carry the same payload here (rotor has no
-    /// quaternion analogue), so one layout covers both. The static
-    /// per-(layer, head) rotor table is not per-token and is omitted — estimate,
-    /// not census.
+    /// The CPU blocks carry the same payload with an `f32` sideband (they are
+    /// `Vec<f32>` in host RAM), and are dropped once the ring is live, which is
+    /// what this arm sizes. The static per-(layer, head) rotor table is not
+    /// per-token and is omitted — estimate, not census.
     Rotor,
 }
 
@@ -589,6 +604,14 @@ enum SideStore {
 /// this figure would under-count the store rather than match it; the floor is
 /// what rules it out.
 const AFFINE_SIDEBAND_BYTES_PER_GROUP: u64 = 4;
+
+/// Bytes one scale — or one norm — occupies in a GPU-resident packed store.
+///
+/// Read from [`crate::storage::KV_SIDEBAND_DTYPE`], the single producer of that
+/// decision, so this estimate cannot describe a stored width the allocation
+/// does not use. `iso_and_rotor_side_bytes_track_the_stored_sideband_dtype`
+/// pins the two together.
+const SIDEBAND_BYTES: u64 = crate::storage::KV_SIDEBAND_DTYPE.itemsize() as u64;
 
 /// Bytes one side's packed store holds for `elems` values laid out as
 /// `n_tokens` rows of `head_dim`.
@@ -625,15 +648,18 @@ fn packed_side_bytes(store: SideStore, bits: u32, elems: u64, head_dim: u64, n_t
                 .saturating_add(rotations)
         }
         SideStore::IsoRing => {
-            // code u32 + scale f32; the rotation is FIXED_QUAT.
+            // code u32 + scale at the ring's sideband dtype; the rotation is
+            // FIXED_QUAT. One norm per token, same dtype.
             let groups = elems / 4;
             groups
-                .saturating_mul(4 + 4)
-                .saturating_add(n_tokens.saturating_mul(4))
+                .saturating_mul(4 + SIDEBAND_BYTES)
+                .saturating_add(n_tokens.saturating_mul(SIDEBAND_BYTES))
         }
         SideStore::IsoBlocks => {
-            // The ring's code u32 + scale f32, plus the 4x f32 quaternion the
-            // CPU blocks replicate per group.
+            // Host `Vec` form: code u32 + scale f32 + the 4x f32 quaternion the
+            // CPU blocks replicate per group, and one f32 norm per token. The
+            // sideband is f32 here and not the ring's dtype — these are
+            // `Vec<f32>` in host RAM, not a GPU plane.
             let groups = elems / 4;
             groups
                 .saturating_mul(4 + 4 + 16)
@@ -641,10 +667,11 @@ fn packed_side_bytes(store: SideStore, bits: u32, elems: u64, head_dim: u64, n_t
         }
         SideStore::Rotor => {
             // group size 3: per-token head_dim.div_ceil(3), NOT elems/3.
+            // code u32 + scale at the ring's sideband dtype, one norm per token.
             let groups = head_dim.div_ceil(3).saturating_mul(n_tokens);
             groups
-                .saturating_mul(4 + 4)
-                .saturating_add(n_tokens.saturating_mul(4))
+                .saturating_mul(4 + SIDEBAND_BYTES)
+                .saturating_add(n_tokens.saturating_mul(SIDEBAND_BYTES))
         }
     }
 }
@@ -1289,7 +1316,7 @@ impl KvQuant {
     ///   the GPU ring and their fused append drops the CPU blocks once it is
     ///   live, so they are [`SideStore::IsoRing`]. `Iso3` / `Iso4` have no ring
     ///   path — their decode early-returns to the bf16 mirror — so the store
-    ///   they would hold is [`SideStore::IsoBlocks`], 2.97× larger. Collapsing
+    ///   they would hold is [`SideStore::IsoBlocks`], 3.98× larger. Collapsing
     ///   the two would mis-size one family or the other by that factor.
     /// * **`RotorK{3,4}Asym`'s V is not affine.** Its name and its storage
     ///   field say `QuantV`, and `QuantV::new_affine_decode` is a misnomer: the
@@ -1377,7 +1404,7 @@ impl KvQuant {
     ///   Every cadence in [`SideStore`] is measured against the store's own
     ///   encoder, so there is no rounding term to remember. The exception is
     ///   iso, whose side is sized from the GPU ring: a cache holding the CPU
-    ///   blocks `exit_prefill` built holds 2.97× that on the iso axis. That is
+    ///   blocks `exit_prefill` built holds 3.98× that on the iso axis. That is
     ///   a transient window on a layer the fused decode path serves, and a
     ///   permanent under-report on a layer whose shape that path's gate rejects
     ///   (batch > 1, or a `head_dim` that is not a power of two at most 512).

@@ -12,7 +12,7 @@
 # dtypes mirror the arrays those sites pass / `add_output_shape` declares.
 #
 # Format:  <body.metal> | <header or -> | <name:type,...> | [NAME=VALUE,...]
-#   type: u = uint buffer, i = int buffer, f = float buffer
+#   type: u = uint buffer, i = int buffer, f = float buffer, b = bfloat buffer
 #
 # The optional fourth field emits `#define NAME VALUE` immediately ahead of the
 # body. It supplies the values MLX injects at dispatch that are neither buffers
@@ -34,18 +34,18 @@
 # One flash-decode pass-1 body serves both iso bit widths — the unpack width
 # arrives via the header (IF_BITS / IF_MASK), so each header gets its own probe
 # line over the same body.
-iso_flash_decode_p1.metal | iso_flash_decode_p1_b3.hdr.metal | query:f,codes:u,scales:f,norms:f,v_flat:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
-iso_flash_decode_p1.metal | iso_flash_decode_p1_b4.hdr.metal | query:f,codes:u,scales:f,norms:f,v_flat:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
+iso_flash_decode_p1.metal | iso_flash_decode_p1_b3.hdr.metal | query:f,codes:u,scales:b,norms:b,v_flat:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
+iso_flash_decode_p1.metal | iso_flash_decode_p1_b4.hdr.metal | query:f,codes:u,scales:b,norms:b,v_flat:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
 # The all-quant sibling: same two headers (both axes of a symmetric iso codec
 # share one bit width, so IF_BITS covers the K and the V unpack), and it calls
 # the header's `if_decode_k_lane` for both. V arrives as its own packed ring
 # instead of a bf16 mirror, hence v_codes/v_scales/v_norms in place of v_flat.
-iso_flash_decode_symv_p1.metal | iso_flash_decode_p1_b3.hdr.metal | query:f,k_codes:u,k_scales:f,k_norms:f,v_codes:u,v_scales:f,v_norms:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
-iso_flash_decode_symv_p1.metal | iso_flash_decode_p1_b4.hdr.metal | query:f,k_codes:u,k_scales:f,k_norms:f,v_codes:u,v_scales:f,v_norms:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
-isoquant_quantize_iso3.metal | isoquant_iso3.hdr.metal | inp:f,n_groups:u,codes_out:u,scales_out:f,norms_out:f
-isoquant_dequantize_iso3.metal | isoquant_iso3.hdr.metal | codes_in:u,scales_in:f,norms_in:f,n_groups:u,out:f
-isoquant_quantize_iso4.metal | isoquant_iso4.hdr.metal | inp:f,n_groups:u,codes_out:u,scales_out:f,norms_out:f
-isoquant_dequantize_iso4.metal | isoquant_iso4.hdr.metal | codes_in:u,scales_in:f,norms_in:f,n_groups:u,out:f
+iso_flash_decode_symv_p1.metal | iso_flash_decode_p1_b3.hdr.metal | query:f,k_codes:u,k_scales:b,k_norms:b,v_codes:u,v_scales:b,v_norms:b,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
+iso_flash_decode_symv_p1.metal | iso_flash_decode_p1_b4.hdr.metal | query:f,k_codes:u,k_scales:b,k_norms:b,v_codes:u,v_scales:b,v_norms:b,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
+isoquant_quantize_iso3.metal | isoquant_iso3.hdr.metal | inp:f,n_groups:u,codes_out:u,scales_out:b,norms_out:b
+isoquant_dequantize_iso3.metal | isoquant_iso3.hdr.metal | codes_in:u,scales_in:b,norms_in:b,n_groups:u,out:f
+isoquant_quantize_iso4.metal | isoquant_iso4.hdr.metal | inp:f,n_groups:u,codes_out:u,scales_out:b,norms_out:b
+isoquant_dequantize_iso4.metal | isoquant_iso4.hdr.metal | codes_in:u,scales_in:b,norms_in:b,n_groups:u,out:f
 k8vturbo3_quantize.metal | ../k8vturbo3_header.metal | inp:f,codes:u,scales:f
 k8vturbo3_dequantize.metal | ../k8vturbo3_header.metal | codes:u,scales:f,out:f | OutT=float
 planar_flash_decode_p1.metal | planar_flash_decode_p1.hdr.metal | query:f,k_codes:u,k_scales:f,k_rot32:u,v_flat:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
@@ -84,24 +84,24 @@ rot_k_fwht_rotate_d512.metal | rot_k.hdr.metal | inp:f,out:f
 # One flash-decode pass-1 body serves both rotor bit widths — the unpack width
 # arrives via the header (RF_BITS / RF_MASK), so each header gets its own probe
 # line over the same body.
-rotor_flash_decode_p1.metal | rotor_flash_decode_p1_b3.hdr.metal | query:f,codes:u,scales:f,norms:f,rotors:f,v_flat:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
-rotor_flash_decode_p1.metal | rotor_flash_decode_p1_b4.hdr.metal | query:f,codes:u,scales:f,norms:f,rotors:f,v_flat:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
+rotor_flash_decode_p1.metal | rotor_flash_decode_p1_b3.hdr.metal | query:f,codes:u,scales:b,norms:b,rotors:f,v_flat:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
+rotor_flash_decode_p1.metal | rotor_flash_decode_p1_b4.hdr.metal | query:f,codes:u,scales:b,norms:b,rotors:f,v_flat:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
 # The all-quant sibling: same two headers (both axes of a symmetric rotor codec
 # share one bit width, so RF_BITS covers the K and the V unpack), and it calls
 # the header's `rf_decode_k_group` for both. V arrives as its own packed ring
 # instead of a bf16 mirror, hence v_codes/v_scales/v_norms/v_rotors in place of
 # v_flat.
-rotor_flash_decode_symv_p1.metal | rotor_flash_decode_p1_b3.hdr.metal | query:f,k_codes:u,k_scales:f,k_norms:f,k_rotors:f,v_codes:u,v_scales:f,v_norms:f,v_rotors:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
-rotor_flash_decode_symv_p1.metal | rotor_flash_decode_p1_b4.hdr.metal | query:f,k_codes:u,k_scales:f,k_norms:f,k_rotors:f,v_codes:u,v_scales:f,v_norms:f,v_rotors:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
+rotor_flash_decode_symv_p1.metal | rotor_flash_decode_p1_b3.hdr.metal | query:f,k_codes:u,k_scales:b,k_norms:b,k_rotors:f,v_codes:u,v_scales:b,v_norms:b,v_rotors:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
+rotor_flash_decode_symv_p1.metal | rotor_flash_decode_p1_b4.hdr.metal | query:f,k_codes:u,k_scales:b,k_norms:b,k_rotors:f,v_codes:u,v_scales:b,v_norms:b,v_rotors:f,mask_flat:f,scale_arr:f,dims:u,partial_o:f,tile_max:f,tile_sum_exp:f
 # One fused-QK body serves both rotor bit widths — the unpack width arrives via
 # the header (RF_BITS / RF_MASK), so each header gets its own probe line over the
 # same body.
-rotor_fused_qk.metal | rotor_fused_qk_b3.hdr.metal | query:f,codes:u,scales:f,norms:f,rotors:f,mask:f,scale_arr:f,dims:u,out:f
-rotor_fused_qk.metal | rotor_fused_qk_b4.hdr.metal | query:f,codes:u,scales:f,norms:f,rotors:f,mask:f,scale_arr:f,dims:u,out:f
-rotorquant_quantize_rotor3.metal | rotorquant_rotor3.hdr.metal | inp:f,rotors_in:f,n_groups:u,head_dim:u,codes_out:u,scales_out:f,norms_out:f
-rotorquant_dequantize_rotor3.metal | rotorquant_rotor3.hdr.metal | codes_in:u,scales_in:f,norms_in:f,rotors_in:f,n_groups:u,head_dim:u,out:f
-rotorquant_quantize_rotor4.metal | rotorquant_rotor4.hdr.metal | inp:f,rotors_in:f,n_groups:u,head_dim:u,codes_out:u,scales_out:f,norms_out:f
-rotorquant_dequantize_rotor4.metal | rotorquant_rotor4.hdr.metal | codes_in:u,scales_in:f,norms_in:f,rotors_in:f,n_groups:u,head_dim:u,out:f
+rotor_fused_qk.metal | rotor_fused_qk_b3.hdr.metal | query:f,codes:u,scales:b,norms:b,rotors:f,mask:f,scale_arr:f,dims:u,out:f
+rotor_fused_qk.metal | rotor_fused_qk_b4.hdr.metal | query:f,codes:u,scales:b,norms:b,rotors:f,mask:f,scale_arr:f,dims:u,out:f
+rotorquant_quantize_rotor3.metal | rotorquant_rotor3.hdr.metal | inp:f,rotors_in:f,n_groups:u,head_dim:u,codes_out:u,scales_out:b,norms_out:b
+rotorquant_dequantize_rotor3.metal | rotorquant_rotor3.hdr.metal | codes_in:u,scales_in:b,norms_in:b,rotors_in:f,n_groups:u,head_dim:u,out:f
+rotorquant_quantize_rotor4.metal | rotorquant_rotor4.hdr.metal | inp:f,rotors_in:f,n_groups:u,head_dim:u,codes_out:u,scales_out:b,norms_out:b
+rotorquant_dequantize_rotor4.metal | rotorquant_rotor4.hdr.metal | codes_in:u,scales_in:b,norms_in:b,rotors_in:f,n_groups:u,head_dim:u,out:f
 tcq_v_quantize.metal | ../tcq_v_header.metal | inp:f,codes:u,scales:f
 turbo2_v_quantize.metal | ../turbo2_v_header.metal | inp:f,codes:u,scales:f
 turbo2_v_dequantize.metal | ../turbo2_v_header.metal | codes:u,scales:f,out:f | OutT=float
