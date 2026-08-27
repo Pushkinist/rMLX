@@ -11,11 +11,15 @@ for (uint i = 0u; i < hd; i++) {
     float vi = inp[token * hd + i];
     norm_sq += vi * vi;
 }
-float norm = sqrt(norm_sq);
-if (norm < 1e-8f)
-    norm = 1e-8f;
+// Rounded to the stored sideband precision before it is used: the decode
+// multiplies by the *stored* norm, so quantizing against a finer one bakes
+// in an error the store cannot represent.
+float norm = float(bfloat(max(sqrt(norm_sq), 1e-8f)));
 
-norms_out[gid] = norm; // store per group slot
+// The store's element type is the sideband dtype; MSL requires the
+// narrowing to be written out (bfloat has no implicit conversion from
+// float, unlike half).
+norms_out[gid] = bfloat(norm); // store per group slot
 
 // ── Load 4 elements, normalise, apply Hamilton product r = q_L * v ────────
 uint base = token * hd + grp * ISO3_GS;
@@ -32,8 +36,8 @@ float rz = ISO3_QW * vz + ISO3_QX * vy - ISO3_QY * vx + ISO3_QZ * vw;
 
 // ── Per-group scale ────────────────────────────────────────────────────────
 float abs_max   = max(max(abs(rw), abs(rx)), max(abs(ry), abs(rz)));
-float scale     = (abs_max < 1e-12f) ? 1e-12f : (abs_max / ISO3_CB_MAX);
-scales_out[gid] = scale;
+float scale     = float(bfloat((abs_max < 1e-12f) ? 1e-12f : (abs_max / ISO3_CB_MAX)));
+scales_out[gid] = bfloat(scale);
 
 // ── 3-bit quantize (codebook lookup) and pack via atomic OR ───────────────
 // ISO3_GS=4 elements → 1 u32 per group (4*3=12 bits ≤ 30).

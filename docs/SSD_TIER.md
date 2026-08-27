@@ -202,10 +202,15 @@ behaviour — `layout_key` is weight-independent on purpose.
 
 `SsdKvIndex::open` inspects the DB before touching any table:
 
-- File absent → creates the current schema, inserts `schema_version = 3`.
+The version is single-sourced as `SsdKvIndex::SCHEMA_VERSION` in
+`crates/rmlx-kv-ssd/src/ssd_index.rs`, which carries the per-transition
+rationale; it is **7** at the time of writing. This section names it `N` rather
+than restating the number, so the two cannot drift.
+
+- File absent → creates the current schema, inserts `schema_version = N`.
 - File present, `schema_version` table missing → `SchemaMismatch` (pre-release v1 DB; should have been wiped by `install_config`).
-- File present, `schema_version != 3` → `SchemaMismatch` (a schema this binary cannot interpret; older ones are wiped by `install_config` first, newer ones are deliberately left in place).
-- File present, `schema_version == 3` → open succeeds.
+- File present, `schema_version != N` → `SchemaMismatch` (a schema this binary cannot interpret; older ones are wiped by `install_config` first, newer ones are deliberately left in place).
+- File present, `schema_version == N` → open succeeds.
 
 ### Migration
 
@@ -217,6 +222,16 @@ cost of a wipe is one re-prefill per dropped block.
 |---|---|---|
 | v1 (no `schema_version` table, `hash` is the sole PK) | `layout_key` column + composite PK + `schema_version` table | Namespace dir removed at startup |
 | v2 | `last_used` unit: seconds → microseconds | Namespace dir removed at startup |
+| v3 | bf16-mirror codecs stopped spilling codes + scales under their own tag | Namespace dir removed at startup |
+| v4 | `rot_k` scale/bias dtype | Namespace dir removed at startup |
+| v5 | the retired `rot_k_tq4v` storage tag | Namespace dir removed at startup |
+| v6 | iso / rotor scale + norm planes moved to the GPU ring's sideband dtype, and their CPU encoders round to it before choosing codes | Namespace dir removed at startup |
+
+`compute_layout_key` folds arch, layer count, kv_heads, head_dim and the codec
+`Display` vector — no dtype and no format version — so none of the last four
+transitions moved the key. A block from any of them would still *hit*. The
+schema version is the only lever that retires them, which is why a payload
+change with an unchanged key has to bump it.
 
 `install_config` removes the entire namespace directory for any `index.db` at a
 version this binary **supersedes**, before any `SsdKvIndex::open` call runs

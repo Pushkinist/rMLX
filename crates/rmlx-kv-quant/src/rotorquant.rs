@@ -113,6 +113,7 @@
 use thiserror::Error;
 
 use crate::clifford::{rotor_reverse, rotor_sandwich, Rotor, MV_DIM};
+use crate::storage::bf16_round;
 use crate::turboquant::lloyd_gaussian_codebook;
 
 /// Bit-width of the rotor3 codebook (fixed at 3-bit Lloyd-Max).
@@ -299,9 +300,11 @@ pub fn rotor3_encode(
             reason = "tok < n_tokens = v.len()/head_dim; row slice is in-bounds"
         )]
         let row = &v[tok * head_dim..(tok + 1) * head_dim];
+        // Rounded to the stored sideband precision before use — see
+        // `crate::isoquant`: the decode multiplies by the *stored* norm.
         let norm = {
             let sq: f32 = row.iter().map(|&x| x * x).sum();
-            sq.sqrt().max(1e-8)
+            bf16_round(sq.sqrt().max(1e-8))
         };
         norms.push(norm);
 
@@ -350,11 +353,13 @@ pub fn rotor3_encode(
                 .iter()
                 .copied()
                 .fold(0.0_f32, |acc, x| acc.max(x.abs()));
-            let scale = if max_abs < 1e-12 {
+            // Rounded to the stored sideband precision before the codes are
+            // chosen against it.
+            let scale = bf16_round(if max_abs < 1e-12 {
                 1e-12
             } else {
                 max_abs / max_centroid
-            };
+            });
             scales.push(scale);
 
             // Quantise each component → nearest centroid (linear scan; 8 entries).
@@ -613,9 +618,11 @@ pub fn rotor4_encode(
             reason = "tok < n_tokens = v.len()/head_dim; row slice is in-bounds"
         )]
         let row = &v[tok * head_dim..(tok + 1) * head_dim];
+        // Rounded to the stored sideband precision before use — see
+        // `crate::isoquant`: the decode multiplies by the *stored* norm.
         let norm = {
             let sq: f32 = row.iter().map(|&x| x * x).sum();
-            sq.sqrt().max(1e-8)
+            bf16_round(sq.sqrt().max(1e-8))
         };
         norms.push(norm);
 
@@ -655,11 +662,13 @@ pub fn rotor4_encode(
                 .iter()
                 .copied()
                 .fold(0.0_f32, |acc, x| acc.max(x.abs()));
-            let scale = if max_abs < 1e-12 {
+            // Rounded to the stored sideband precision before the codes are
+            // chosen against it.
+            let scale = bf16_round(if max_abs < 1e-12 {
                 1e-12
             } else {
                 max_abs / max_centroid
-            };
+            });
             scales.push(scale);
 
             let mut group_codes = [0_u8; ROTOR3_MV_COMPONENTS];

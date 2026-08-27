@@ -10,10 +10,12 @@ for (uint i = 0u; i < hd; i++) {
     float vi = inp[token * hd + i];
     norm_sq += vi * vi;
 }
-float norm = sqrt(norm_sq);
-if (norm < 1e-8f)
-    norm = 1e-8f;
-norms_out[gid] = norm;
+// Rounded to the stored sideband precision before use — see
+// isoquant_quantize_iso3.metal.
+float norm = float(bfloat(max(sqrt(norm_sq), 1e-8f)));
+// Narrowing to the sideband dtype is explicit: MSL has no implicit
+// float -> bfloat conversion.
+norms_out[gid] = bfloat(norm);
 
 uint grp_start = grp * ROTOR4_GS;
 float v1       = (grp_start + 0u < hd) ? (inp[token * hd + grp_start + 0u] / norm) : 0.0f;
@@ -49,8 +51,8 @@ rots[6] = 0.0f;
 rots[7] = 0.0f;
 
 float abs_max   = max(max(abs(R1), abs(R2)), abs(R3));
-float scale     = (abs_max < 1e-12f) ? 1e-12f : (abs_max / ROTOR4_CB_MAX);
-scales_out[gid] = scale;
+float scale     = float(bfloat((abs_max < 1e-12f) ? 1e-12f : (abs_max / ROTOR4_CB_MAX)));
+scales_out[gid] = bfloat(scale);
 
 uint code_word = gid * ROTOR4_WPG;
 for (uint e = 0u; e < ROTOR4_MV; e++) {

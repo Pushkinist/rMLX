@@ -54,10 +54,10 @@ constant float RF_MUL_S[64] = {
 // One decode per group: the sandwich runs once here rather than once
 // per head-dim lane.
 inline void rf_decode_k_group(
-    device const uint*  codes,
-    device const float* scales,
-    device const float* norms,
-    device const float* rotors,
+    device const uint*   codes,
+    device const bfloat* scales,
+    device const bfloat* norms,
+    device const float*  rotors,
     uint                tok_idx,
     uint                n_groups,
     uint                group_id,
@@ -129,10 +129,10 @@ inline void rf_decode_k_group(
 // [0, head_dim). Shared surface: a quantized-V flash kernel calls this
 // unchanged.
 inline float rf_decode_k_lane(
-    device const uint*  codes,
-    device const float* scales,
-    device const float* norms,
-    device const float* rotors,
+    device const uint*   codes,
+    device const bfloat* scales,
+    device const bfloat* norms,
+    device const float*  rotors,
     uint                tok_idx,
     uint                n_groups,
     uint                lane) {

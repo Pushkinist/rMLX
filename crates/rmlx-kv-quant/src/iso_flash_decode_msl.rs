@@ -116,6 +116,7 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
+use crate::storage::to_sideband_dtype;
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::metal_kernel::{MetalKernel, MetalKernelInvoke};
 use rmlx_mlx::{Array, Device, Dtype};
@@ -211,9 +212,9 @@ fn render_decode_fn() -> String {
          // Shared surface: a quantized-V flash kernel calls this unchanged,\n\
          // passing the V store's (codes, scales, norms) instead of K's.\n\
          inline float if_decode_k_lane(\n\
-         \x20   device const uint*  codes,\n\
-         \x20   device const float* scales,\n\
-         \x20   device const float* norms,\n\
+         \x20   device const uint*   codes,\n\
+         \x20   device const bfloat* scales,\n\
+         \x20   device const bfloat* norms,\n\
          \x20   uint                tok_idx,\n\
          \x20   uint                n_groups,\n\
          \x20   uint                lane) {{\n\
@@ -560,8 +561,12 @@ pub fn iso_flash_decode_sdpa<const BITS: u8>(
     let codes_total: i64 = tok_count * n_groups_i64;
 
     let codes_flat = k_codes.reshape(&[codes_total as i32], device)?;
-    let scales_flat = k_scales.reshape(&[codes_total as i32], device)?;
-    let norms_flat = k_norms.reshape(&[tok_count as i32], device)?;
+    // Both planes are bound at the stored sideband dtype, which is what the
+    // header's decode helper declares. MLX binds by the array's dtype and does
+    // not convert, so a plane arriving at another dtype has to be cast here or
+    // the kernel reads its bytes at the wrong stride.
+    let scales_flat = to_sideband_dtype(&k_scales.reshape(&[codes_total as i32], device)?, device)?;
+    let norms_flat = to_sideband_dtype(&k_norms.reshape(&[tok_count as i32], device)?, device)?;
 
     // ── V flat — keep native dtype (bf16 / f16 / f32) ─────────────────────
     let v_total: i64 = tok_count * i64::from(head_dim);

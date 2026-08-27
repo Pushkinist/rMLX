@@ -102,6 +102,7 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
+use crate::storage::to_sideband_dtype;
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::metal_kernel::{MetalKernel, MetalKernelInvoke};
 use rmlx_mlx::{Array, Device, Dtype};
@@ -267,10 +268,10 @@ fn render_decode_fn() -> String {
          // One decode per group: the sandwich runs once here rather than once\n\
          // per head-dim lane.\n\
          inline void rf_decode_k_group(\n\
-         \x20   device const uint*  codes,\n\
-         \x20   device const float* scales,\n\
-         \x20   device const float* norms,\n\
-         \x20   device const float* rotors,\n\
+         \x20   device const uint*   codes,\n\
+         \x20   device const bfloat* scales,\n\
+         \x20   device const bfloat* norms,\n\
+         \x20   device const float*  rotors,\n\
          \x20   uint                tok_idx,\n\
          \x20   uint                n_groups,\n\
          \x20   uint                group_id,\n\
@@ -342,10 +343,10 @@ fn render_decode_fn() -> String {
          // [0, head_dim). Shared surface: a quantized-V flash kernel calls this\n\
          // unchanged.\n\
          inline float rf_decode_k_lane(\n\
-         \x20   device const uint*  codes,\n\
-         \x20   device const float* scales,\n\
-         \x20   device const float* norms,\n\
-         \x20   device const float* rotors,\n\
+         \x20   device const uint*   codes,\n\
+         \x20   device const bfloat* scales,\n\
+         \x20   device const bfloat* norms,\n\
+         \x20   device const float*  rotors,\n\
          \x20   uint                tok_idx,\n\
          \x20   uint                n_groups,\n\
          \x20   uint                lane) {{\n\
@@ -627,8 +628,11 @@ pub fn rotor_flash_decode_sdpa<const BITS: u8>(
     let rotors_total: i64 = n_groups_i64 * ROTOR_STRIDE;
 
     let codes_flat = k_codes.reshape(&[codes_total as i32], device)?;
-    let scales_flat = k_scales.reshape(&[codes_total as i32], device)?;
-    let norms_flat = k_norms.reshape(&[tok_count as i32], device)?;
+    // Bound at the stored sideband dtype — see `iso_flash_decode_msl`. The
+    // rotor table stays f32: it is a per-(layer, head) constant, not a
+    // per-token plane, and its declaration is unchanged.
+    let scales_flat = to_sideband_dtype(&k_scales.reshape(&[codes_total as i32], device)?, device)?;
+    let norms_flat = to_sideband_dtype(&k_norms.reshape(&[tok_count as i32], device)?, device)?;
     let rotors_flat = k_rotors.reshape(&[rotors_total as i32], device)?;
 
     // ── V flat — keep native dtype (bf16 / f16 / f32) ─────────────────────

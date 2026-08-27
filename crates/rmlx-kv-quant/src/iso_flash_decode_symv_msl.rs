@@ -99,6 +99,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
+use crate::storage::to_sideband_dtype;
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::metal_kernel::{MetalKernel, MetalKernelInvoke};
 use rmlx_mlx::{Array, Device, Dtype};
@@ -387,11 +388,13 @@ pub fn iso_flash_decode_symv_sdpa<const BITS: u8>(
     let tok_count: i64 = i64::from(b) * i64::from(kv_h) * i64::from(kv_seq);
     let codes_total: i64 = tok_count * n_groups_i64;
 
+    // Scales and norms are bound at the stored sideband dtype, which is what
+    // the header's decode helper declares — see `iso_flash_decode_msl`.
     let flatten_axis = |axis: IsoPackedAxis<'_>| -> Result<(Array, Array, Array)> {
         Ok((
             axis.codes.reshape(&[codes_total as i32], device)?,
-            axis.scales.reshape(&[codes_total as i32], device)?,
-            axis.norms.reshape(&[tok_count as i32], device)?,
+            to_sideband_dtype(&axis.scales.reshape(&[codes_total as i32], device)?, device)?,
+            to_sideband_dtype(&axis.norms.reshape(&[tok_count as i32], device)?, device)?,
         ))
     };
     let (k_codes, k_scales, k_norms) = flatten_axis(k)?;

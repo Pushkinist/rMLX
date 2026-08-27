@@ -11,10 +11,12 @@ for (uint i = 0u; i < hd; i++) {
     float vi = inp[token * hd + i];
     norm_sq += vi * vi;
 }
-float norm = sqrt(norm_sq);
-if (norm < 1e-8f)
-    norm = 1e-8f;
-norms_out[gid] = norm;
+// Rounded to the stored sideband precision before use — see
+// isoquant_quantize_iso3.metal.
+float norm = float(bfloat(max(sqrt(norm_sq), 1e-8f)));
+// Narrowing to the sideband dtype is explicit: MSL has no implicit
+// float -> bfloat conversion.
+norms_out[gid] = bfloat(norm);
 
 // ── Load 3 grade-1 components with tail-pad (head_dim % 3 may be != 0) ────
 uint grp_start = grp * ROTOR3_GS;
@@ -55,8 +57,8 @@ rots[7] = 0.0f;
 
 // ── Per-group scale = max|R_i| / CB_MAX ──────────────────────────────────
 float abs_max   = max(max(abs(R1), abs(R2)), abs(R3));
-float scale     = (abs_max < 1e-12f) ? 1e-12f : (abs_max / ROTOR3_CB_MAX);
-scales_out[gid] = scale;
+float scale     = float(bfloat((abs_max < 1e-12f) ? 1e-12f : (abs_max / ROTOR3_CB_MAX)));
+scales_out[gid] = bfloat(scale);
 
 // ── 3-bit quantize all 8 components and pack into 1 u32 via atomic OR ────
 uint code_word = gid * ROTOR3_WPG; // = gid (WPG = 1)
