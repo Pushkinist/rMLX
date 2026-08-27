@@ -92,6 +92,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Maple prompt-cache SSD attachment is disabled until SWA rings can be
+  restored completely.** The current SSD representation serialises persistent
+  K/V blocks but not the rotating-ring payload Maple needs for an Exact cache
+  hit. Maple now keeps prompt-cache entries in RAM instead of hydrating an
+  incomplete entry, promoting it to RAM, counting a misleading SSD hit, and
+  rejecting it later during reuse validation.
+
 - **Token selection resolved ties differently on the host than on the device,
   and `top_p` / `top_k` resolved them differently on every call.** MLX `argmax`
   resolves a tie to the lowest token id. The host greedy path

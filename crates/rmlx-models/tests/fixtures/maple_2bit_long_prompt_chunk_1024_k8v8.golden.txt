@@ -1,0 +1,35 @@
+# golden tokens — tag=maple_2bit_long_prompt_chunk_1024_k8v8 kv_quant=k8v8
+# n_tokens=32
+# decoded: "<|im_start|>assistant\n<think>\nWe need to answer in one sentence why exact prefix-cache reuse must preserve both cache classes. The context says: \"Maple's repeating"
+151644
+77091
+198
+151667
+198
+1654
+1184
+311
+4226
+304
+825
+11652
+3170
+4734
+9252
+36680
+25978
+1969
+21129
+2176
+6500
+6846
+13
+576
+2266
+2727
+25
+330
+2227
+273
+594
+39816

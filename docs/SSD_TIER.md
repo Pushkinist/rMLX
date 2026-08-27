@@ -41,10 +41,14 @@ Supported architectures (spill + hydrate wired). These are **resolved** classes
   and `PROMPT_CACHE` static as the sparse-MoE class)
 - `Qwen3VLMoeForConditionalGeneration`
 - `BitNetForCausalLM`
-- `MapleForCausalLM`
 
 Other architectures silently remain RAM-only when the tier is enabled; the SSD
 flag itself is not an error.
+
+`MapleForCausalLM` deliberately remains RAM-only. Its prompt-cache snapshots
+include SWA rotating rings, which the current SSD block format cannot serialise
+or reconstruct on hydrate. The SSD spiller and hydrator must not be attached to
+Maple until complete ring-state round-tripping is implemented.
 
 ---
 
@@ -802,6 +806,12 @@ re-prefill** (Miss), which recomputes the SWA prefix correctly. The guard is a
 no-op for RAM-resident snapshots (every layer holds payload), so non-SSD prefix
 reuse is unaffected. Serialising the SWA ring so hydrated entries could be reused
 as prefixes is a future enhancement.
+
+Maple also contains SWA rotating rings, but unlike Gemma4 it supports only exact
+RAM prompt-cache reuse. Because an SSD-hydrated entry cannot reconstruct the
+complete exact snapshot, Maple does not attach the SSD spiller or hydrator at
+all. It remains RAM-only until the ring state can be serialised and hydrated
+losslessly.
 
 ---
 

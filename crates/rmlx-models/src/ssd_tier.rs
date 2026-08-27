@@ -16,6 +16,16 @@ use rmlx_mlx::Device;
 
 use crate::kv_cache::kv_layer_quants;
 
+/// Whether SSD spiller / hydrator attachment is unsafe for this architecture.
+///
+/// Maple's prompt-cache entries include SWA rotating rings, but the current
+/// SSD format serialises only their persistent K/V blocks. Hydrating such an
+/// entry therefore cannot reconstruct a reusable Maple snapshot. Keep Maple
+/// RAM-only until the SSD representation carries the complete ring state.
+fn ssd_attachment_blocked(arch: &str) -> bool {
+    matches!(arch, "MapleForCausalLM")
+}
+
 /// At model-load, run startup maintenance (prune + evict-to-budget) for the
 /// namespace and attach the spiller + hydrator onto the right per-arch
 /// `PROMPT_CACHE`. No-op when the tier is OFF.
@@ -67,6 +77,17 @@ pub fn attach_at_load(
     head_dim: usize,
     device: Device,
 ) {
+    if ssd_attachment_blocked(arch) {
+        if rmlx_kv_ssd::active_ssd_tier_config().is_some() {
+            tracing::info!(
+                arch,
+                "SSD tier enabled but this arch cannot reconstruct complete hydrated entries \
+                 — prompt cache stays RAM-only"
+            );
+        }
+        return;
+    }
+
     let layer_quants: Vec<KvQuant> =
         kv_quant.map_or_else(Vec::new, |base| kv_layer_quants(n_layers, base));
 
@@ -134,14 +155,6 @@ pub fn attach_at_load(
                 info.device,
             );
         }
-        "MapleForCausalLM" => {
-            crate::maple::prompt_cache::PROMPT_CACHE.attach_ssd_tier(
-                &info.namespace,
-                info.kv_quant,
-                info.layout_key,
-                info.device,
-            );
-        }
         "Qwen3VLMoeForConditionalGeneration" => {
             crate::qwen3_vl_moe::prompt_cache::PROMPT_CACHE.attach_ssd_tier(
                 &info.namespace,
@@ -167,3 +180,7 @@ pub fn attach_at_load(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "ssd_tier_tests.rs"]
+mod tests;

@@ -138,9 +138,15 @@ nothing.
 ## Golden-token suites: how their snapshot resolves
 
 `crates/rmlx-models/tests/{bonsai,gemma4,qwen3,bitnet,medgemma,maple}_golden_tokens.rs`
-each pin a 32-token temp=0 decode of one architecture against a committed
-fixture under `tests/fixtures/`. Each covers ONE arch and names its own snapshot
-by slug. `tests/common/mod.rs` reads exactly **two** variables:
+pin temp=0 decodes of one architecture against committed fixtures under
+`tests/fixtures/`. The standard gate for each architecture generates 32 tokens.
+Maple additionally carries `maple_long_prompt_chunk_1024_k8v8`: a K8V8 golden
+whose generated prompt is asserted to tokenize to 513..=1024 tokens, crossing
+the SWA-512 window while remaining inside Maple's 1024-token default prefill
+chunk. This protects the chunk-sensitive long-prompt path when that default or
+the rotating-ring prefill behavior changes. Each suite covers ONE arch and
+names its own snapshot by slug. `tests/common/mod.rs` reads exactly **two**
+variables:
 
 1. `RMLX_KV_TEST_MODEL`, **for the one golden whose architecture it serves**.
    Pointed at another architecture it is not a statement about this golden, and

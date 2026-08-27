@@ -1293,9 +1293,11 @@ is a plain bf16/f32 param, **not** quantized. Expert SwiGLU is **clamped**:
 **Thinking mode.** `supports_thinking()` returns `true`. Tags are `<think>` /
 `</think>`; the chat template opens think on generation by default.
 
-**Prompt cache.** Exact-only (SWA rotating ring cannot be reconstructed from a
-block-truncated / SSD-hydrated prefix). SSD spill/hydrate is attached; SWA
-rings come back payload-less and are not reused.
+**Prompt cache.** RAM-only and Exact-only. A rotating SWA ring cannot be
+reconstructed from a block-truncated prefix, and the current SSD format does
+not serialise the ring payload needed to rebuild a complete Maple snapshot.
+Maple therefore does not attach the SSD spiller / hydrator; SSD reuse stays
+disabled until the representation carries the complete SWA ring state.
 
 ### Weight quantization
 
@@ -1348,6 +1350,8 @@ cache, `<think>` splitting.
 
 - No FlashHead, no fused add+RMS / QK-norm+RoPE / router Metal kernels
   (reference arithmetic; see above).
+- Prompt-cache reuse is RAM-only. SSD spill / hydrate is disabled because the
+  current on-disk representation cannot reconstruct Maple's SWA rings.
 - **SWA ring + chunked prefill is not bit-identical across chunk sizes** on
   prompts longer than the 512-token window. The rotating cache's first
   `update_concat` stores the whole first chunk untrimmed (`keys is None`),
@@ -1366,7 +1370,10 @@ cache, `<think>` splitting.
 
 Green. `rmlx info --probe-smoke` on `maple-2bit-mlx` (temp=0, 8 tokens,
 `kv_quant=auto` → unquantised bf16): verdict `Ok`, no NaN logits, BOS 151644.
-Golden-token gate: `maple_golden_tokens` / `maple_2bit_k8v8` (K8V8, 32 tokens).
+Golden-token gates: `maple_golden_tokens_k8v8` / `maple_2bit_k8v8` (short
+prompt, K8V8, 32 generated tokens), plus
+`maple_long_prompt_chunk_1024_k8v8` (513..=1024 prompt tokens, crossing the
+SWA-512 window under Maple's 1024-token default, K8V8, 32 generated tokens).
 
 ---
 
