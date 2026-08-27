@@ -34,19 +34,12 @@ fn read_u32(a: &Array) -> Vec<u32> {
         .collect()
 }
 
-#[allow(clippy::expect_used, reason = "test helper: invariants documented")]
-#[allow(
-    clippy::unwrap_used,
-    reason = "test helper: chunks_exact(4) guarantees length"
-)]
-fn read_f32(a: &Array) -> Vec<f32> {
-    a.eval().expect("eval");
-    a.to_bytes()
-        .expect("to_bytes")
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-        .collect()
-}
+/// Read a sideband plane back, at the width the ring stores it.
+///
+/// Every value asserted against this in the tests below is exactly
+/// representable at that width, so the comparisons stay exact equalities and do
+/// not need a tolerance that would also swallow a mis-strided read.
+use crate::test_utils::read_sideband_plane as read_f32;
 
 /// n_groups 2, so one sequence position with kv_h=2 is 4 code words and 2
 /// norms. Small enough to assert element-by-element.
