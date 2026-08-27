@@ -54,7 +54,7 @@ fn arr(data: &[f32], shape: &[i32]) -> Array {
 )]
 fn to_vec(a: &Array) -> Vec<f32> {
     a.eval().unwrap();
-    bytes_to_f32(&a.to_bytes().unwrap())
+    tensor_to_f32(a, "test").unwrap()
 }
 
 // Build a single-layer storage of `quant` populated with `[1,kv_h,S,D]` K/V
@@ -621,7 +621,7 @@ fn dequant_k(storage: &KvStorage, device: Device) -> Vec<f32> {
             codes.eval().unwrap();
             scales.eval().unwrap();
             let codes_v = codes.to_bytes().unwrap();
-            let scales_v = bytes_to_f32(&scales.to_bytes().unwrap());
+            let scales_v = tensor_to_f32(&scales, "scales").unwrap();
             rmlx_kv_quant::q8::q8_dequantize(&codes_v, &scales_v)
         }
         KvStorage::None { .. } => Vec::new(),
@@ -3695,12 +3695,17 @@ fn ref_attn_head_major(
 /// numerically-correct output (vs a scalar reference over the store's own
 /// dequant) for `kv_seq` 2, 3, 4, 7, 15 — all below the compile floor.
 ///
-/// Mutation check: force `iso_flash_decode_symv_sdpa`'s norms-padding helper
+/// Mutation check, and what it now shows: forcing
+/// `iso_flash_decode_symv_sdpa`'s norms-padding helper
 /// `pad_norms_to_device_floor` to skip padding (return the unpadded array
-/// unconditionally) → the `kv_seq == 2`
-/// step aborts with "Unable to build metal library from source … cannot pass
-/// pointer to address space 'constant' as a pointer to address space 'device' …
-/// if_decode_k_lane" (RED).
+/// unconditionally) used to make the `kv_seq == 2` step abort with "Unable to
+/// build metal library from source … cannot pass pointer to address space
+/// 'constant' as a pointer to address space 'device' … if_decode_k_lane". On
+/// the pinned MLX it does not: swept over `kv_seq` 2..=24 with the padding
+/// disabled, every step dispatched the fused symv kernel and returned. So this
+/// test's *padding* leg is currently inert — what it still gates is the
+/// numeric-correctness leg below the floor, which does fail on a wrong decode.
+/// See `crate::flash_decode_common` for the re-measurement.
 #[test]
 #[ignore = "GPU Metal context — run: cargo test -p rmlx-kv-ssd iso_sym_short_kv_seq_kv_h1 -- --ignored --test-threads=1"]
 #[allow(
@@ -3813,11 +3818,11 @@ fn iso_sym_short_kv_seq_kv_h1_stays_on_gpu() {
 /// outputs — a gross softmax shift over a materially different key set,
 /// against random per-step K/V/Q — not just quantisation noise.
 ///
-/// Mutation check: same as [`iso_sym_short_kv_seq_kv_h1_stays_on_gpu`] —
-/// forcing `iso_flash_decode_symv_sdpa`'s norms-padding helper
-/// `pad_norms_to_device_floor` to skip padding makes the very first decode
-/// step (`kv_seq == 2`) abort before
-/// this test can reach the floor at all.
+/// Mutation check: same as [`iso_sym_short_kv_seq_kv_h1_stays_on_gpu`] — and
+/// with the same caveat. Skipping the padding no longer aborts the first decode
+/// step on the pinned MLX, so what this test gates is the per-step numeric
+/// agreement with the unquantised reference across the floor, not the padding
+/// itself.
 #[test]
 #[ignore = "GPU Metal context — run: cargo test -p rmlx-kv-ssd iso_sym_transition_across_ring_norms_floor -- --ignored --test-threads=1"]
 #[allow(
@@ -3931,10 +3936,12 @@ fn iso_sym_transition_across_ring_norms_floor() {
 /// as iso — same root cause, same [`crate::flash_decode_common`] fix.
 ///
 /// Mutation check: forcing `rotor_flash_decode_symv_sdpa`'s norms-padding
-/// helper `pad_norms_to_device_floor` to skip padding makes the very first
-/// decode step (`kv_seq == 2`) abort with the same address-space-mismatch
-/// class of MSL error (`rf_decode_k_group`, `constant` vs `device`) before
-/// this test can reach the floor at all.
+/// helper `pad_norms_to_device_floor` to skip padding used to make the first
+/// decode step (`kv_seq == 2`) abort with the address-space-mismatch class of
+/// MSL error (`rf_decode_k_group`, `constant` vs `device`). It no longer does
+/// on the pinned MLX — see `crate::flash_decode_common`. What this test gates
+/// is the per-step numeric agreement with the unquantised reference across the
+/// floor.
 #[test]
 #[ignore = "GPU Metal context — run: cargo test -p rmlx-kv-ssd rotor_sym_transition_across_ring_norms_floor -- --ignored --test-threads=1"]
 #[allow(

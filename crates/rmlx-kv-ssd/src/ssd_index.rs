@@ -138,6 +138,22 @@ type Result<T> = std::result::Result<T, SsdKvIndexError>;
 ///   two crates away, and a tag the reader would now fail on is exactly the
 ///   kind of thing a version exists to retire. The bump wipes them instead of
 ///   leaving files no request can ever claim.
+/// - v6 → v7: the **stored width of a quantization parameter changed**, and
+///   with it the values the encoder emits. The iso and rotor codecs' scale and
+///   norm planes are the GPU ring's sideband, now held at
+///   `rmlx_kv_quant::storage::KV_SIDEBAND_DTYPE`; their CPU encoders round each
+///   scale and norm to that width *before* choosing the codes against it, so a
+///   block spilled by an older binary carries codes chosen against a scale the
+///   store can no longer hold. Neither the wire dtype (those planes persist as
+///   `f32` either way, from the CPU blocks), nor the index shape, nor the
+///   `(hash, layout_key)` key changed — `compute_layout_key` folds arch, layer
+///   count, kv_heads, head_dim and the codec `Display` vector, none of which
+///   moved — so a v6 block still *hits*. It then hydrates, seeds the ring, and
+///   has its scales rounded on upload, decoding a hair away from what the same
+///   prompt decodes to when it is served from RAM. Two requests for the same
+///   prompt at temp=0 disagreeing on whether they hit the SSD tier is exactly
+///   the nondeterminism the tier must not introduce, so the version routes
+///   those blocks through the wipe.
 ///
 /// v2 rows are **convertible** — `UPDATE kv_blocks SET last_used = last_used *
 /// 1000000` is the whole migration. They are wiped anyway, and that is a
@@ -145,7 +161,7 @@ type Result<T> = std::result::Result<T, SsdKvIndexError>;
 /// whose worst loss is one re-prefill per block, and carrying migration code
 /// (plus the branch in the wipe pass that has to let a v2 DB through so it can
 /// be converted) buys nothing a warm cache does not rebuild in minutes.
-pub(crate) const SCHEMA_VERSION: i64 = 6;
+pub(crate) const SCHEMA_VERSION: i64 = 7;
 
 const SCHEMA_PRAGMAS: &str = "
 PRAGMA journal_mode = WAL;

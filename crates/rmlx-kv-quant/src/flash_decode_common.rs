@@ -10,15 +10,26 @@
 //! — the symv P1 kernel body calls this directly rather than the
 //! `rf_decode_k_lane` wrapper, since the Cl(3,0) sandwich needs the group
 //! result, not a single lane — in [`crate::rotor_flash_decode_msl`]) declare
-//! their `norms` parameter `device const float*` — an address-space mismatch
-//! that fails the MSL compile at first dispatch. The threshold was
-//! **measured** at 8 (a
-//! ring-only decode at `kv_h == 1` aborts for `kv_seq` 2–7 and succeeds from 8
-//! on, for every `head_dim`); [`NORMS_DEVICE_MIN`] is set above it for
-//! margin. Only `norms` (one f32 per token) crosses it at low `kv_seq` —
-//! `codes` / `scales` carry `n_groups` more elements per token, and rotor's
-//! `rotors` table is sized off `n_groups` alone, so both stay above the
-//! threshold at any `kv_seq >= 1`.
+//! their `norms` parameter in the `device` address space — a mismatch
+//! that fails the MSL compile at first dispatch. The threshold was originally
+//! **measured** at 8 (a ring-only decode at `kv_h == 1` aborted for `kv_seq`
+//! 2–7 and succeeded from 8 on, for every `head_dim`); [`NORMS_DEVICE_MIN`] is
+//! set above it for margin. Only `norms` (one scalar per token) crosses it at
+//! low `kv_seq` — `codes` / `scales` carry `n_groups` more elements per token,
+//! and rotor's `rotors` table is sized off `n_groups` alone, so both stay above
+//! the threshold at any `kv_seq >= 1`.
+//!
+//! **The abort no longer reproduces on the pinned MLX.** Re-measured by
+//! disabling [`pad_norms_to_device_floor`] and sweeping a `kv_h == 1`
+//! `iso3_sym` ring-only decode over `kv_seq` 2..=24 at `head_dim = 512`: every
+//! step dispatched the fused symv kernel and returned successfully, at both the
+//! `f32` sideband this store used to carry and the `bf16` one it carries now.
+//! So the floor is currently inert rather than load-bearing, and halving the
+//! plane's element width did **not** raise it — the heuristic that produced the
+//! original abort is not the byte size of this buffer on this MLX build. The
+//! constant stays because the failure mode it guards is a property of MLX's
+//! signature builder, not of this crate, and an MLX bump could bring it back;
+//! what does not stay is a claim that it is currently doing something.
 //!
 //! [`pad_norms_to_device_floor`] zero-pads `norms` up to the floor before
 //! dispatch instead of falling back to a CPU dequant path: each kernel's

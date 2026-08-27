@@ -2,8 +2,8 @@
 //
 // Outputs:
 //   codes_out  : u32 [n_tokens * n_groups * ISO4_WPG] — 4-bit codes, 8/u32
-//   scales_out : f32 [n_tokens * n_groups]            — per-group scale
-//   norms_out  : f32 [n_tokens * n_groups]            — per-group L2 norm slot
+//   scales_out : bf16 [n_tokens * n_groups]           — per-group scale
+//   norms_out  : bf16 [n_tokens * n_groups]           — per-group L2 norm slot
 uint gid        = thread_position_in_grid.x;
 uint n_groups_u = n_groups[0];
 uint token      = gid / n_groups_u;
@@ -17,11 +17,13 @@ for (uint i = 0u; i < hd; i++) {
     float vi = inp[token * hd + i];
     norm_sq += vi * vi;
 }
-float norm = sqrt(norm_sq);
-if (norm < 1e-8f)
-    norm = 1e-8f;
+// Rounded to the stored sideband precision before use — see
+// isoquant_quantize_iso3.metal.
+float norm = float(bfloat(max(sqrt(norm_sq), 1e-8f)));
 
-norms_out[gid] = norm;
+// Narrowing to the sideband dtype is explicit: MSL has no implicit
+// float -> bfloat conversion.
+norms_out[gid] = bfloat(norm);
 
 // ── Load 4 elements, normalise, apply Hamilton product r = q_L * v ────────
 uint base = token * hd + grp * ISO4_GS;
@@ -37,8 +39,8 @@ float rz = ISO4_QW * vz + ISO4_QX * vy - ISO4_QY * vx + ISO4_QZ * vw;
 
 // ── Per-group scale ───────────────────────────────────────────────────────
 float abs_max   = max(max(abs(rw), abs(rx)), max(abs(ry), abs(rz)));
-float scale     = (abs_max < 1e-12f) ? 1e-12f : (abs_max / ISO4_CB_MAX);
-scales_out[gid] = scale;
+float scale     = float(bfloat((abs_max < 1e-12f) ? 1e-12f : (abs_max / ISO4_CB_MAX)));
+scales_out[gid] = bfloat(scale);
 
 // ── 4-bit quantize (codebook lookup) and pack via atomic OR ───────────────
 // ISO4_GS=4 elements → 1 u32 per group (4*4=16 bits ≤ 32).

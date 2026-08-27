@@ -179,7 +179,9 @@ residual coexistence.
 
 One error remains, and it runs **low**, for `k_iso*` / `iso*_sym`. The estimator
 sizes an iso side from the GPU ring, which is what a served request settles at;
-but `exit_prefill` bulk-encodes into CPU `IsoBlocks` 2.97× the ring. Those are
+but `exit_prefill` bulk-encodes into CPU `IsoBlocks` 3.98× the ring (the
+quaternion sideband, and three host planes at `f32` where the ring holds two of
+them at `KV_SIDEBAND_DTYPE`). Those are
 freed on the first fused decode step (`drop_blocks_when_ring_live_iso_*`) — on a
 layer the fused path serves. On a layer whose shape its gate rejects (batch > 1,
 or a `head_dim` that is not a power of two at most 512 — `head_dim = 80`
@@ -2115,28 +2117,41 @@ where `*` is the **Hamilton product** and `v ∈ ℝ⁴` is treated as a quatern
 **Dequantize:** unpack → centroid lookup → rescale → inverse rotate → renorm.
 
 **Memory truth.** iso spends, per 4-element group, one whole `u32` code word
-**and** one `f32` scale — 8 B for 4 values — plus one `f32` norm per token.
-The nominal codebook width never reaches the store: iso3 uses 12 of its 32
-code bits and iso4 uses 16, so **iso3 and iso4 occupy byte-identical
-storage**. At head_dim=128 that is 260 B per token per kv_head against bf16's
-256 B: **16.25 bits per value, 1.02× bf16**.
+**and** one scale at the ring's sideband dtype (`bf16`) — 6 B for 4 values —
+plus one `bf16` norm per token. The nominal codebook width never reaches the
+store: iso3 uses 12 of its 32 code bits and iso4 uses 16, so **iso3 and iso4
+occupy byte-identical storage**. At head_dim=128 that is 194 B per token per
+kv_head against bf16's 256 B: **12.125 bits per value, 0.758× bf16**.
 
 The rate itself does move with head dim; the *sign* does not. Reading it off
-the allocation — `(D/4)·4 B` codes + `(D/4)·4 B` scales + `4 B` norm — gives
+the allocation — `(D/4)·4 B` codes + `(D/4)·2 B` scales + `2 B` norm — gives
 
 ```
-iso stored bits/value = 16 + 32/head_dim
+iso stored bits/value = 12 + 16/head_dim
 ```
 
-so 16.25 at D=128, 16.125 at D=256, 16.0625 at D=512, approaching 16.0 **from
-above** and never reaching it. Two planes at 8 B per 4 values are already
-exactly bf16's density, and the per-token norm is what keeps the sum strictly
-greater at every finite head dim. This is a derivation from
-`QuantKGpuRing::alloc` (`Dtype::U32` codes, `Dtype::F32` scales and norms, one
-element each per group per token per KV head), not a measurement.
+so 12.125 at D=128, 12.0625 at D=256, 12.03125 at D=512, approaching 12.0
+**from above**. This is a derivation from `QuantKGpuRing::alloc` (`Dtype::U32`
+codes, `KV_SIDEBAND_DTYPE` scales and norms, one element each per group per
+token per KV head); it is measured against the allocation itself by
+`ring_bytes_match_independent_geometry` and `kv_rate_tests`.
 
-The CPU `IsoBlocks` form adds a 4×f32 quaternion per group on top, taking the
-same token to ≈772 B (≈48.25 bits per value, 3.0× bf16). That sideband is the
+**This is a change, and it is the whole of what changed.** The scale and norm
+planes used to be `f32`, at which the same layout was `16 + 32/head_dim` —
+16.25 at D=128, approaching bf16's 16.0 from above and never reaching it. The
+code cadence did not move; the two sideband planes halved. A scale and an L2
+norm are each a single positive magnitude that the decode kernels reconstruct
+straight into a `float` accumulator, so bf16's 8 mantissa bits are the whole of
+what any reader consumes. Measured fidelity cost of the narrowing, same fixture
+and seed, CPU encode → decode: iso3 cosine 0.994098 → 0.994090, iso4 0.998638 →
+0.998639, and SQNR iso4 25.395 → 25.391 dB. The CPU encoders round each scale
+and norm to the stored width *before* choosing codes against it, so the encoder
+and the store agree exactly and a ring seeded from CPU blocks decodes bit-identically
+to the blocks it was seeded from.
+
+The CPU `IsoBlocks` form adds a 4×f32 quaternion per group on top, and holds
+all three of its own planes at `f32`, taking the same token to ≈772 B
+(≈48.25 bits per value, 3.0× bf16 and 3.98× the ring). That sideband is the
 constant `FIXED_QUAT` replicated per group, not data, and the GPU ring the
 K-only and symmetric codecs decode from does not carry it. **That figure is
 not what a served request settles at, but it is not hypothetical either.**
@@ -2151,9 +2166,11 @@ Three cases, and they differ:
   first fused decode step seeds the ring from those blocks and frees them
   (`drop_blocks_when_ring_live_iso_*` in `kvcache/update.rs`), after which the
   ring is the sole resident copy.
-- From there they measure 1.003–1.054× `none` (§"Codec disposition", Class 3 —
-  whole-cache ratios against a `none` that is a true bf16 control since the
-  head/tail promotion stopped applying to it), which is the ring layout above.
+- From there they hold the ring layout above. The whole-cache ratios recorded
+  in §"Codec disposition", Class 3 (1.003–1.054× `none`) were measured at the
+  `f32` sideband and are **stale**; the K side of that ratio is now 0.746× what
+  it was. They are left in place rather than adjusted by arithmetic, because a
+  whole-cache ratio is a measurement and re-deriving one is not.
 
 The per-group figures are the store density and are unaffected by which of the
 three a cache is in.
@@ -2200,13 +2217,26 @@ Table at `head_dim = 128`:
 | turbo4 | 5.00 | measured | under |
 | q8 (group 128) | 8.25 | measured | under |
 | affine (`CacheType::Q8G32`) | 9.00 | layout formula, measured sideband | under |
+| **iso3 / iso4** (GPU ring) | **12.12** | measured | under |
 | bf16 | 16.00 | by definition | the floor |
-| **rotor3 / rotor4** | **21.75** | measured | exempt |
+| **rotor3 / rotor4** (GPU ring) | **16.25** | measured | exempt |
 | **planar3 / planar4** | **22.00** | measured | exempt |
-| **iso3 / iso4** (`IsoBlocks`) | **48.25** | measured | exempt |
 
-"Measured" means the summed byte length of the buffers that family's own CPU
-encoder produced over a shared fixture. The two remaining rows have no CPU
+Iso and rotor were 16.25 and 21.75 while the ring's scale and norm planes were
+`f32`. Narrowing both planes to `KV_SIDEBAND_DTYPE` took 4.125 bits per value
+off iso and 5.5 off rotor — a 25% cut in rotor's case, and still not enough to
+clear the floor, because rotor spends one whole `u32` code word per 3 head-dim
+slots (10.67 bits per value) before any sideband at all. A sideband change
+cannot fix a code cadence. Iso spends its `u32` per 4 slots (8.0) and clears it.
+The `IsoBlocks` host form is unaffected and still measures 48.25 — it is
+`Vec<f32>` in RAM, not a GPU plane — but no served request settles there.
+
+"Measured" means the byte total the shipped store reports for the buffers that
+family's own encoder produced over a shared fixture. For iso and rotor that is
+`QuantKGpuRing::byte_size`, read off a real seeded ring rather than a `4 *
+len()` written in the test: the constant is exactly the thing that goes stale
+when a plane's stored width changes, and a rate gate that restates it is
+measuring its own arithmetic. The two remaining rows have no CPU
 encoder in this crate: bf16 is two bytes per value by definition, and MLX affine
 is `bits + 32/group` — code bits plus one scale and one bias per group, each at
 the KV stream's dtype. **That sideband is 32 bits, measured**, not 64: the
@@ -2344,7 +2374,7 @@ differences are the codebook (16 centroids vs 8) and the pack density
 | Property | iso3 | iso4 |
 |---|---|---|
 | Code bits / element | 3 | 4 |
-| Delivered bits / element, ring-resident (`k_iso*`, `*_sym`) | **16.25** (260 B/token at head\_dim=128 — see Memory truth in iso3 section) | **16.25** — byte-identical to iso3; the codebook width never reaches the store |
+| Delivered bits / element, ring-resident (`k_iso*`, `*_sym`) | **12.125** (194 B/token at head\_dim=128 — see Memory truth in iso3 section) | **12.125** — byte-identical to iso3; the codebook width never reaches the store |
 | Delivered bits / element, CPU-blocks form (`iso3` / `iso4`) — **not resident on a settled cache** | ≈48.25 (≈772 B/token at head\_dim=128, incl. the constant quaternion sideband). These two codecs decode from the bf16 mirror, so `exit_prefill` builds them no store and they measure byte-identical to `none` (§"Codec disposition", Class 2); this is the rate they would cost once a kernel reads one. The ring-backed members do pay it between `exit_prefill` and the first fused decode step, which frees the blocks | ≈48.25 — same sideband, same code word, same window |
 | Codebook | `lloyd_gaussian_codebook(3)` (8 centroids) | `lloyd_gaussian_codebook(4)` (16 centroids) |
 | Pack density (per u32) | 10 vals (30 bits used, 2 wasted) | 8 vals (32 bits used, 0 wasted) |
@@ -2434,7 +2464,7 @@ amortises across every token in the layer.
 
 | Property | rotor3 |
 |---|---|
-| Delivered bits / element | **21.75** at head\_dim=128 (348 B/token/kv\_head vs bf16's 256 B, **1.36× bf16**), split **10.75 codes + 10.75 scales + 0.25 norm**. 43 groups cover a 128-element row, and each spends one whole `u32` code word **and** one `f32` scale for 3 real grade-1 elements. rotor3 and rotor4 therefore occupy byte-identical storage. Read off the same allocation, `rotor stored bits/value = (64·⌈D/3⌉ + 32) / D` — 21.75 at D=128, 21.625 at D=256, with a floor of 64/3 = **21.33** as D grows. A derivation from `QuantKGpuRing::alloc`, not a measurement. The 3.25 bpe target reported by the Python `rotorquant` reference is gated on the grade-aware codebook follow-up (deferred — see below). **No rotor codec is a memory win at any head\_dim** — see the iso3 "Memory truth" note, `iso_and_rotor_k_codecs_are_never_a_memory_win`, and the crate-wide rate ceiling in `kv_rate_tests.rs`. |
+| Delivered bits / element | **16.25** at head\_dim=128 (260 B/token/kv\_head vs bf16's 256 B, **1.016× bf16**), split **10.75 codes + 5.375 scales + 0.125 norm**. 43 groups cover a 128-element row, and each spends one whole `u32` code word **and** one scale at `KV_SIDEBAND_DTYPE` for 3 real grade-1 elements. rotor3 and rotor4 therefore occupy byte-identical storage. Read off the same allocation, `rotor stored bits/value = (48·⌈D/3⌉ + 16) / D` — 16.25 at D=128, 16.1875 at D=256, with a floor of 16.0 as D grows. A derivation from `QuantKGpuRing::alloc`, measured against a seeded ring by `rotor_rate_splits_into_documented_code_scale_and_norm_bits`. **This was 21.75 while the scale and norm planes were `f32`** (split 10.75 + 10.75 + 0.25); narrowing them cut 25% and did not clear the floor, because the code cadence — one `u32` per 3 slots, 10.67 bits per value — is what keeps rotor above bf16 and no sideband change can fix it. The 3.25 bpe target reported by the Python `rotorquant` reference is gated on the grade-aware codebook follow-up (deferred — see below). **No rotor codec is a memory win at any head\_dim** — see the iso3 "Memory truth" note, `iso_k_codecs_win_and_rotor_k_codecs_do_not_at_every_geometry`, and the crate-wide rate ceiling in `kv_rate_tests.rs`. |
 | Dead code budget | **5 of the 8 codes per group carry no information.** A rotor sandwich is grade-preserving, so embedding 3 values as the grade-1 part leaves the scalar, three bivector and pseudoscalar slots algebraically zero on encode; on decode the inverse sandwich keeps every non-grade-1 part out of the reconstructed vector, so quantising those slots injects no error either. 15 of the 24 code bits per group are pure waste. Pinned by `clifford_tests::sandwich_of_grade1_in_3d_stays_grade1` (encode side) and `clifford_tests::inverse_sandwich_of_non_grade1_leaks_nothing_into_grade1` (decode side). Removing them is a format + MSL-kernel change and is not scheduled; the 10.75 bits/value of `f32` scale would still dominate afterwards. |
 | Codebook | `lloyd_gaussian_codebook(3)` (8 centroids), shared across all 8 mv components (single-codebook simplification) |
 | Pack density (per u32) | 10 vals (planar3 / iso3 convention; 8 codes ≤ 30 bits per group, 1 u32 per group) |
@@ -2567,7 +2597,7 @@ codebook and packing:
 
 | Property | rotor4 |
 |---|---|
-| Delivered bits / element | **21.75** at head\_dim=128 — byte-identical to rotor3 (8 codes × 4 bits = exactly 1 `u32` per group of 3 real grade-1 elements, plus the same per-group `f32` scale and per-token norm; rotor3 spends 24 of the same 32 code bits). Codes alone are ~10.7 bpe. Same grade-aware split deferral as rotor3, and the same "never a memory win" conclusion. |
+| Delivered bits / element | **16.25** at head\_dim=128 — byte-identical to rotor3 (8 codes × 4 bits = exactly 1 `u32` per group of 3 real grade-1 elements, plus the same per-group scale and per-token norm at `KV_SIDEBAND_DTYPE`; rotor3 spends 24 of the same 32 code bits). Codes alone are ~10.7 bpe, which is why the sideband narrowing that took iso under bf16 leaves rotor above it. Same grade-aware split deferral as rotor3, and the same "never a memory win" conclusion. |
 | Codebook | `lloyd_gaussian_codebook(4)` (16 centroids), shared across all 8 mv components (single-codebook simplification, same as rotor3) |
 | Pack density (per u32) | 8 vals / u32 (dense 4-bit packing: 8 components × 4 bits = 32 bits = 1 u32 per group; `ROTOR4_WORDS_PER_GROUP = 1`) |
 | Rotation | Same static per-(layer, head) rotor table as rotor3 (`[n_groups, 4]`); seeded from the same `ROTORQUANT_GLOBAL_SEED` formula |
@@ -3019,7 +3049,7 @@ sideband cadence the codec does not use). Its scale is per **pair** — one `f32
 per 2 elements — which is 16 bits per value before a single code bit, so the
 store is **22.00 bits per value at every head_dim and at both bit widths**
 (`planar3` and `planar4` are byte-identical). That is the widest rate in the
-crate's rate gate, above rotor's 21.75, and it is why `planar3` / `planar4` /
+crate's rate gate, above rotor's 16.25, and it is why `planar3` / `planar4` /
 `planar_k4` carry a written exemption in
 `crates/rmlx-kv-quant/src/kv_rate_tests.rs` rather than a fix: a scale-cadence
 change is a format change. The quality improvement is what it buys on dense
@@ -3517,7 +3547,7 @@ Against what exists or has been specced:
 | `tsym3` — densest store in the tree | 2.5 | 0.158 | no, 1.2× over |
 | the repacked iso/rotor store specced in "Memory truth" | 3.75 | 0.234 | no, 1.7× over |
 | rotor with its structurally-zero components dropped | 14.0 | 0.876 | no, 6.5× over |
-| iso / rotor as stored today | 16.25 / 21.75 | 1.02 / 1.36 | no |
+| iso / rotor as stored today | 12.125 / 16.25 | 0.758 / 1.016 | iso yes, rotor no |
 
 **The binding constraint is ε, not ρ.** Repacking a store is necessary for some
 of these codecs to stop costing memory, but it is not sufficient to make a fused
@@ -3819,7 +3849,7 @@ one of them is **larger** than bf16, in all four cells:
 | `rot_k_v8g64` | 1.541× | 1.533× | 1.384× | 1.384× |
 
 The iso / rotor rows are the ring-layout result restated on real serving: a
-per-group `f32` scale beside each packed word puts 16.25–21.75 bits on the
+per-group scale beside each packed word puts 12.125–16.25 bits on the
 store per value against bf16's 16.0, so the family cannot win on bytes at any
 finite head dim. The `mixed` / `rot_k` rows still carry both bf16 seeds beside
 their store, which is a separate, unlanded elision; their decode result does
@@ -4531,7 +4561,7 @@ same two predicates — it cannot drift from what is materialised.
 
 Dropping the mirror is **neither** a memory win nor a decode-speed win. It is
 not a memory win because the store is not smaller than bf16 to begin with (see
-"Memory truth" above — 21.75 bits/value for rotor, 16.25 for iso), so there is
+"Memory truth" above — 16.25 bits/value for rotor, 12.125 for iso), so there is
 no bandwidth prize to collect and no context at which a crossover exists. It is
 not a speed win because the two-pass flash-decode shell — a per-token
 threadgroup barrier pair with a thread-0-only softmax section, one threadgroup
@@ -5485,9 +5515,9 @@ is what makes the dB interpretable. i.i.d. Gaussian fixture, 256 x 128:
 | planar | 3 | 40.604 dB | 14.616 dB | −4.316 | 22.00 |
 | planar | 4 | 36.724 dB | 20.224 dB | −2.741 | 22.00 |
 | iso | 3 | 19.292 dB | 14.616 dB | −0.777 | 48.25 † |
-| iso | 4 | 25.395 dB | 20.224 dB | −0.859 | 48.25 † |
-| rotor | 3 | 20.432 dB | 14.616 dB | −0.966 | 21.75 |
-| rotor | 4 | 26.555 dB | 20.224 dB | −1.052 | 21.75 |
+| iso | 4 | 25.391 dB | 20.224 dB | −0.858 | 48.25 † |
+| rotor | 3 | 20.432 dB | 14.616 dB | −0.966 | 16.25 |
+| rotor | 4 | 26.551 dB | 20.224 dB | −1.051 | 16.25 |
 
 No shipped cell is short of its anchor by more than 0.35 bits.
 
@@ -5498,7 +5528,7 @@ from the bf16 mirror, so `exit_prefill` builds them no store at all and they
 measure byte-identical to `none` (§"Codec disposition", Class 2). `k_iso3/4` and
 `iso3_sym/4_sym` do build a store: a GPU ring that does not carry the quaternion
 — it is the constant `FIXED_QUAT` replicated per group, not data — and they sit
-at **16.25** bits/value. See § iso3 "Memory truth". Read against rotor's 21.75 without that distinction the table inverts
+at **12.125** bits/value. See § iso3 "Memory truth". Read against rotor's 16.25 without that distinction the table inverts
 the comparison: on the ring path iso is the cheaper of the two. Distortion is
 identical on both paths, so only the rate column is affected.
 

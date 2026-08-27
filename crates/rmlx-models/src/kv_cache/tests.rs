@@ -1751,13 +1751,20 @@ mod tests {
         assert_eq!(saving, 0, "bf16 must never be net-negative against itself");
     }
 
-    /// A pure-global layer mix with the seed-free iso K-only codec at large
-    /// context is net-NEGATIVE (warn fires) — the iso quaternion sideband on K
-    /// exceeds the bf16 K it replaces, so the codec costs memory even with no
-    /// windowed layers. Proves the decision is keyed on codec attrs (the K
-    /// sideband), not on the presence of windowed layers.
+    /// On one and the same pure-global layer mix at large context, the two
+    /// seed-free K-only codecs land on opposite sides of the advisory: rotor
+    /// fires it and iso does not.
+    ///
+    /// That is the point of running them together. Both are "a K-only codec
+    /// with a per-group sideband on a mix with no windowed layers", so a
+    /// decision keyed on the layer mix — or on the codec being K-only — would
+    /// have to give them the same answer. The sign comes from each codec's own
+    /// group geometry: rotor spends one `u32` code word per 3 head-dim slots
+    /// (10.67 bits per value before any sideband), iso spends one per 4 (8),
+    /// and both carry the same two sideband planes at the stored sideband
+    /// dtype.
     #[test]
-    fn net_negative_warn_for_iso_k_only_codec_global_only() {
+    fn net_negative_warn_splits_the_two_k_only_codecs_global_only() {
         // All-global mix (no windowed layers), large context.
         let layers: Vec<KvLayerShape> = (0..16)
             .map(|_| KvLayerShape {
@@ -1766,13 +1773,20 @@ mod tests {
                 window: None,
             })
             .collect();
-        let (saving, n_global, n_win) =
-            kv_codec_net_saving_total(KvQuant::IsoKOnly4, &layers, 16_384);
+        let (rotor, n_global, n_win) =
+            kv_codec_net_saving_total(KvQuant::RotorKOnly4, &layers, 16_384);
         assert_eq!(n_global, 16);
         assert_eq!(n_win, 0);
         assert!(
-            saving < 0,
-            "IsoKOnly4 K carries the iso quaternion sideband (larger than bf16 K) → net-negative even all-global; got {saving}"
+            rotor < 0,
+            "RotorKOnly4 stores 16.25 bits per value against bf16's 16 → net-negative even \
+             all-global; got {rotor}"
+        );
+        let (iso, _, _) = kv_codec_net_saving_total(KvQuant::IsoKOnly4, &layers, 16_384);
+        assert!(
+            iso > 0,
+            "IsoKOnly4 stores 12.125 bits per value on the same mix → the advisory must stay \
+             silent; got {iso}"
         );
     }
 

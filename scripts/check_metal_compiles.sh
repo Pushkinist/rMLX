@@ -46,12 +46,17 @@
 # reads `__METAL_VERSION__` from inside a JIT'd body and gets 400. So every body
 # is compiled twice:
 #
-#   metal3.0  the floor. Keeps new syntax from creeping in unnoticed.
+#   metal3.1  the floor. Keeps new syntax from creeping in unnoticed. It is
+#             3.1 and not 3.0 because `bfloat` — the stored dtype of the KV
+#             codecs' scale and norm planes, and so the declared type of every
+#             kernel parameter that reads one — is a Metal 3.1 type. A 3.0 floor
+#             would have to be held by textually hiding those declarations from
+#             the gate, which is the one thing the gate exists to prevent.
 #   metal4.0  what production actually compiles at, and the only version where
 #             `__HAVE_TENSOR__` is defined.
 #
 # The second pass is the one that matters for a kernel guarded by
-# `#if __HAVE_TENSOR__`: at metal3.0 that guard is inactive, the body compiles
+# `#if __HAVE_TENSOR__`: at the baseline that guard is inactive, the body compiles
 # to an empty translation unit, and the gate would go green having checked
 # nothing. Such a body is therefore never compiled without the guard — it is
 # either checked for real or reported as SKIPPED, never quietly passed.
@@ -102,7 +107,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$(dirname "${BASH_SOURCE[0]}")/metal_dirs.sh"
 
 # The floor, and the version MLX's JIT was observed to use.
-BASELINE_STD="metal3.0"
+BASELINE_STD="metal3.1"
 TENSOR_STD="metal4.0"
 # Defined from metal4.0 onwards; gates the cooperative-tensor surface.
 TENSOR_GUARD="__HAVE_TENSOR__"
@@ -299,9 +304,10 @@ for METAL_DIR in "${METAL_DIRS[@]}"; do
             fi
             echo
             echo 'kernel void rmlx_msl_compile_probe('
-            echo '    device uint*  probe_u [[buffer(0)]],'
-            echo '    device float* probe_f [[buffer(1)]],'
-            echo '    device int*   probe_i [[buffer(2)]],'
+            echo '    device uint*   probe_u [[buffer(0)]],'
+            echo '    device float*  probe_f [[buffer(1)]],'
+            echo '    device int*    probe_i [[buffer(2)]],'
+            echo '    device bfloat* probe_b [[buffer(3)]],'
             echo '    uint3 thread_position_in_grid          [[thread_position_in_grid]],'
             echo '    uint3 threadgroup_position_in_grid     [[threadgroup_position_in_grid]],'
             echo '    uint3 thread_position_in_threadgroup   [[thread_position_in_threadgroup]],'
@@ -318,8 +324,9 @@ for METAL_DIR in "${METAL_DIRS[@]}"; do
                     u) echo "    device uint* ${name} = probe_u; (void)${name};" ;;
                     i) echo "    device int* ${name} = probe_i; (void)${name};" ;;
                     f) echo "    device float* ${name} = probe_f; (void)${name};" ;;
+                    b) echo "    device bfloat* ${name} = probe_b; (void)${name};" ;;
                     *)
-                        echo "ERROR: ${rel_dir}/${body}: unknown buffer type '${type}' for '${name}' (want u, i or f)" >&2
+                        echo "ERROR: ${rel_dir}/${body}: unknown buffer type '${type}' for '${name}' (want u, i, f or b)" >&2
                         exit 1
                         ;;
                 esac

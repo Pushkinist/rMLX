@@ -120,6 +120,7 @@ use crate::rotorquant::{
     ROTOR3_BITS, ROTOR3_GROUP_SIZE, ROTOR3_MV_COMPONENTS, ROTOR3_VALS_PER_WORD,
     ROTOR3_WORDS_PER_GROUP, ROTOR4_BITS, ROTOR4_VALS_PER_WORD, ROTOR4_WORDS_PER_GROUP,
 };
+use crate::storage::{sideband_to_f32_vec, to_sideband_dtype, KV_SIDEBAND_DTYPE};
 use crate::turboquant::lloyd_gaussian_codebook;
 use rmlx_core::error::Result;
 use rmlx_mlx::metal_kernel::{MetalKernel, MetalKernelInvoke};
@@ -635,8 +636,11 @@ fn rotor_quantize_gpu_impl(
 
     // codes_out: 1 u32 per group.
     invoke.add_output_shape(&[total_groups as i32], Dtype::U32)?;
-    invoke.add_output_shape(&[total_groups as i32], Dtype::F32)?;
-    invoke.add_output_shape(&[total_groups as i32], Dtype::F32)?;
+    // scales_out / norms_out at the ring's stored sideband dtype, so the ring
+    // append is a straight `slice_update` with no conversion on the
+    // per-decode-step path.
+    invoke.add_output_shape(&[total_groups as i32], KV_SIDEBAND_DTYPE)?;
+    invoke.add_output_shape(&[total_groups as i32], KV_SIDEBAND_DTYPE)?;
 
     // Zero-initialise: codes_out written via atomic OR.
     invoke.set_init_value(0.0)?;
@@ -697,8 +701,11 @@ fn rotor_dequantize_gpu_impl(
     }
 
     let codes_flat = codes_packed.reshape(&[total_groups as i32], device)?;
-    let scales_flat = scales.reshape(&[total_groups as i32], device)?;
-    let norms_flat = norms.reshape(&[total_groups as i32], device)?;
+    // The kernel declares both planes at the stored sideband dtype; MLX binds
+    // by the array's own dtype, so a caller-supplied `f32` plane would be
+    // reinterpreted rather than rejected.
+    let scales_flat = to_sideband_dtype(&scales.reshape(&[total_groups as i32], device)?, device)?;
+    let norms_flat = to_sideband_dtype(&norms.reshape(&[total_groups as i32], device)?, device)?;
     let rotors_flat = if rotors.ndim() == 1 {
         rotors.try_clone()?
     } else {
@@ -802,32 +809,12 @@ pub fn rotor_gpu_outputs_to_cpu(
         .chunks_exact(4)
         .map(|b| u32::from_le_bytes(b.try_into().expect("len 4 by chunks_exact contract")))
         .collect();
-    // eval-ok: host readback — the `to_bytes()` below copies this array to
-    // CPU, so it has to be materialised first. Not a kernel-input barrier: this
-    // runs once per quantize call, off the per-decode-step path.
-    scales_gpu.eval()?;
-    #[allow(
-        clippy::expect_used,
-        reason = "chunks_exact(4) yields slices of exactly 4 bytes"
-    )]
-    let scales: Vec<f32> = scales_gpu
-        .to_bytes()?
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().expect("len 4 by chunks_exact contract")))
-        .collect();
-    // eval-ok: host readback — the `to_bytes()` below copies this array to
-    // CPU, so it has to be materialised first. Not a kernel-input barrier: this
-    // runs once per quantize call, off the per-decode-step path.
-    norms_gpu.eval()?;
-    #[allow(
-        clippy::expect_used,
-        reason = "chunks_exact(4) yields slices of exactly 4 bytes"
-    )]
-    let norms_per_group: Vec<f32> = norms_gpu
-        .to_bytes()?
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().expect("len 4 by chunks_exact contract")))
-        .collect();
+    // Widened by the plane's own dtype — see `sideband_to_f32_vec`. Cold path:
+    // once per quantize call, off the per-decode-step path.
+    let scales: Vec<f32> = sideband_to_f32_vec(scales_gpu, "scales")?;
+    // Widened by the plane's own dtype — see `sideband_to_f32_vec`. Cold path:
+    // once per quantize call, off the per-decode-step path.
+    let norms_per_group: Vec<f32> = sideband_to_f32_vec(norms_gpu, "norms_per_group")?;
 
     if codes.len() != total_groups {
         return Err(rmlx_core::error::Error::Quant(format!(

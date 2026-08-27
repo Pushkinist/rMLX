@@ -116,37 +116,74 @@ fn run_planar(data: &[f32], bits: u8) -> (Vec<f32>, f64) {
     (planar_dequantize(&blocks).expect("planar_dequantize"), rate)
 }
 
+/// Bytes the GPU ring holds for an encoded side, measured off the ring itself.
+///
+/// `QuantKGpuRing::byte_size` reads each plane's own shape and dtype, so the
+/// rate column tracks the stored sideband width rather than a constant written
+/// here — which is the term that moved when the scale and norm planes narrowed.
+fn ring_bytes(codes: &[u32], scales: &[f32], norms: &[f32], n_groups: usize) -> u64 {
+    let mut ring = crate::storage::QuantKGpuRing::default();
+    ring.seed_from_cpu(
+        codes,
+        scales,
+        norms,
+        1,
+        n_groups as i32,
+        RD_ROWS as i32,
+        RD_ROWS as i32,
+        rmlx_mlx::Device::Cpu,
+    )
+    .expect("seed the ring from the encoder output");
+    ring.byte_size()
+}
+
 /// iso, at the **CPU `IsoBlocks` rate**, not the ring-resident one.
 ///
-/// The byte count includes the per-group quaternion array, so it reports
-/// ≈48.25 bits/value at `head_dim = 128`. That is the honest figure for the
-/// V-only `iso3` / `iso4` stores, which keep `IsoBlocks`. It is **not** the
-/// figure for `k_iso3/4` and `iso3_sym/4_sym`: the GPU ring those decode from
-/// does not carry the quaternion — it is the constant `FIXED_QUAT` replicated
-/// per group, not data — so they sit at ≈16.25 bits/value. See
-/// `docs/KV_QUANT.md` § iso3 "Memory truth". Quoting 48.25 against `rotor`'s
-/// 21.75 without that distinction inverts the comparison: on the ring path iso
-/// is the cheaper of the two.
+/// The byte count includes the per-group quaternion array and holds all three
+/// host planes at `f32`, so it reports ≈48.25 bits/value at `head_dim = 128`.
+/// That is the honest figure for the V-only `iso3` / `iso4` stores, which keep
+/// `IsoBlocks`. It is **not** the figure for `k_iso3/4` and `iso3_sym/4_sym`:
+/// the GPU ring those decode from does not carry the quaternion — it is the
+/// constant `FIXED_QUAT` replicated per group, not data — and it holds the
+/// scale and norm planes at the stored sideband dtype, so they sit at
+/// ≈12.125 bits/value. See `docs/KV_QUANT.md` § iso3 "Memory truth". Quoting
+/// 48.25 against `rotor`'s ring rate without that distinction inverts the
+/// comparison: on the ring path iso is much the cheaper of the two.
 ///
 /// The distortion is identical on both paths — the quaternion is a sideband,
 /// not an input to reconstruction — so only the rate column is affected.
 fn run_iso(data: &[f32], bits: u8) -> (Vec<f32>, f64) {
     let (codes, scales, quats, norms) =
         iso_encode_fast(data, RD_HEAD_DIM, 4, bits).expect("iso_encode_fast");
-    let bytes = 4 * (codes.len() + scales.len() + quats.len() + norms.len()) as u64;
+    let bytes = crate::storage::IsoBlocks {
+        codes: codes.clone(),
+        scales: scales.clone(),
+        quaternions: quats.clone(),
+        norms: norms.clone(),
+        n_tokens: RD_ROWS,
+    }
+    .byte_size();
     let decoded = iso_decode_fast(&codes, &scales, &quats, &norms, RD_HEAD_DIM, 4, bits)
         .expect("iso_decode_fast");
     (decoded, bits_per_value(bytes))
 }
 
+/// rotor, at the **ring-resident rate** — which is what every shipped rotor
+/// variant decodes from once the fused append drops the CPU blocks.
+///
+/// Unlike iso, rotor's two forms carry the same payload (there is no
+/// quaternion), so the only difference between them is the width of the scale
+/// and norm planes: `f32` in the host `Vec`s, the stored sideband dtype in the
+/// ring. The ring figure is the one an operator's memory sees.
 fn run_rotor(data: &[f32], bits: u8) -> (Vec<f32>, f64) {
-    let rotors = crate::clifford::make_rotor_table(0, 0, n_groups_for(RD_HEAD_DIM));
+    let n_groups = n_groups_for(RD_HEAD_DIM);
+    let rotors = crate::clifford::make_rotor_table(0, 0, n_groups);
     let (codes, scales, norms) = if bits == 3 {
         rotor3_encode(data, &rotors, RD_HEAD_DIM).expect("rotor3_encode")
     } else {
         rotor4_encode(data, &rotors, RD_HEAD_DIM).expect("rotor4_encode")
     };
-    let bytes = 4 * (codes.len() + scales.len() + norms.len()) as u64;
+    let bytes = ring_bytes(&codes, &scales, &norms, n_groups);
     let decoded = if bits == 3 {
         rotor3_decode(&codes, &scales, &norms, &rotors, RD_HEAD_DIM).expect("rotor3_decode")
     } else {

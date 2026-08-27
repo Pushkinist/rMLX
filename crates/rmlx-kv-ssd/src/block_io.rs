@@ -2463,7 +2463,7 @@ fn read_quant_k_turbo3(
     let scales_t = tensor_req(st, &format!("l{idx}.k.scales"))?;
     let block = TurboBlocks {
         codes: codes_t.to_bytes()?,
-        scales: bytes_to_f32(&scales_t.to_bytes()?),
+        scales: tensor_to_f32(&scales_t, "scales_t")?,
         original_shape: shape4(shape),
         bits: 3,
     };
@@ -2499,7 +2499,7 @@ fn read_quant_k_turbo4(st: &SafeTensors<'_>, idx: usize, shape: &[i32]) -> Resul
     scales_t.eval()?;
     let block = TurboBlocks {
         codes: codes_t.to_bytes()?,
-        scales: bytes_to_f32(&scales_t.to_bytes()?),
+        scales: tensor_to_f32(&scales_t, "scales_t")?,
         original_shape: shape4(shape),
         bits: 4,
     };
@@ -2519,7 +2519,7 @@ fn read_quant_k(st: &SafeTensors<'_>, idx: usize, side: &str, shape: &[i32]) -> 
     scales.eval()?;
     Ok(QuantK::from_cpu_parts(
         codes.to_bytes()?,
-        bytes_to_f32(&scales.to_bytes()?),
+        tensor_to_f32(&scales, "scales")?,
         shape.to_vec(),
     ))
 }
@@ -2535,7 +2535,7 @@ fn read_quant_v_bits(st: &SafeTensors<'_>, idx: usize, shape: &[i32], bits: u8) 
     scales.eval()?;
     let block = TurboBlocks {
         codes: codes.to_bytes()?,
-        scales: bytes_to_f32(&scales.to_bytes()?),
+        scales: tensor_to_f32(&scales, "scales")?,
         original_shape: shape4(shape),
         bits,
     };
@@ -2556,7 +2556,7 @@ fn read_quant_planar_v(
     rotations.eval()?;
     let block = PlanarBlocks {
         codes: codes.to_bytes()?,
-        scales: bytes_to_f32(&scales.to_bytes()?),
+        scales: tensor_to_f32(&scales, "scales")?,
         rotations: rotations.to_bytes()?,
         original_shape: shape4(shape),
         bits,
@@ -2580,7 +2580,7 @@ fn read_quant_planar_k(st: &SafeTensors<'_>, idx: usize, shape: &[i32]) -> Resul
     rotations.eval()?;
     let block = PlanarBlocks {
         codes: codes.to_bytes()?,
-        scales: bytes_to_f32(&scales.to_bytes()?),
+        scales: tensor_to_f32(&scales, "scales")?,
         rotations: rotations.to_bytes()?,
         original_shape: shape4(shape),
         bits: 4,
@@ -2618,9 +2618,9 @@ fn read_quant_iso_v3(st: &SafeTensors<'_>, idx: usize, shape: &[i32]) -> Result<
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
         .collect();
-    let scales = bytes_to_f32(&scales_t.to_bytes()?);
-    let quaternions = bytes_to_f32(&quats_t.to_bytes()?);
-    let norms = bytes_to_f32(&norms_t.to_bytes()?);
+    let scales = tensor_to_f32(&scales_t, "scales_t")?;
+    let quaternions = tensor_to_f32(&quats_t, "quats_t")?;
+    let norms = tensor_to_f32(&norms_t, "norms_t")?;
     // n_tokens: shape is [B, kv_h, S, D]; S = shape[2].
     let n_tokens = (shape[0] as usize) * (shape[1] as usize) * (shape[2].max(0) as usize);
     let block = IsoBlocks {
@@ -2659,9 +2659,9 @@ fn read_quant_iso_v4(st: &SafeTensors<'_>, idx: usize, shape: &[i32]) -> Result<
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
         .collect();
-    let scales = bytes_to_f32(&scales_t.to_bytes()?);
-    let quaternions = bytes_to_f32(&quats_t.to_bytes()?);
-    let norms = bytes_to_f32(&norms_t.to_bytes()?);
+    let scales = tensor_to_f32(&scales_t, "scales_t")?;
+    let quaternions = tensor_to_f32(&quats_t, "quats_t")?;
+    let norms = tensor_to_f32(&norms_t, "norms_t")?;
     let n_tokens = (shape[0] as usize) * (shape[1] as usize) * (shape[2].max(0) as usize);
     let block = IsoBlocks {
         codes,
@@ -2705,9 +2705,9 @@ fn read_quant_rotor_v3(st: &SafeTensors<'_>, idx: usize, shape: &[i32]) -> Resul
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
         .collect();
-    let scales = bytes_to_f32(&scales_t.to_bytes()?);
-    let norms = bytes_to_f32(&norms_t.to_bytes()?);
-    let rotors = bytes_to_f32(&rotors_t.to_bytes()?);
+    let scales = tensor_to_f32(&scales_t, "scales_t")?;
+    let norms = tensor_to_f32(&norms_t, "norms_t")?;
+    let rotors = tensor_to_f32(&rotors_t, "rotors_t")?;
     let n_tokens = (shape[0] as usize) * (shape[1] as usize) * (shape[2].max(0) as usize);
     let block = RotorBlocks {
         codes,
@@ -2755,9 +2755,9 @@ fn read_quant_rotor_v4(st: &SafeTensors<'_>, idx: usize, shape: &[i32]) -> Resul
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
         .collect();
-    let scales = bytes_to_f32(&scales_t.to_bytes()?);
-    let norms = bytes_to_f32(&norms_t.to_bytes()?);
-    let rotors = bytes_to_f32(&rotors_t.to_bytes()?);
+    let scales = tensor_to_f32(&scales_t, "scales_t")?;
+    let norms = tensor_to_f32(&norms_t, "norms_t")?;
+    let rotors = tensor_to_f32(&rotors_t, "rotors_t")?;
     let n_tokens = (shape[0] as usize) * (shape[1] as usize) * (shape[2].max(0) as usize);
     let block = RotorBlocks {
         codes,
@@ -2880,15 +2880,64 @@ fn read_paged(st: &SafeTensors<'_>, idx: usize, geom: &str, device: Device) -> R
 
 // ── Small helpers ───────────────────────────────────────────────────────────
 
+/// Widen a persisted float plane to `Vec<f32>`, keyed on the tensor's own
+/// dtype.
+///
+/// The byte stride a reader needs is a function of the stored dtype, and the
+/// writers persist whatever dtype the store holds — `OwnedTensor::from_array`
+/// preserves it, and safetensors carries it through the round trip. A reader
+/// that assumes one stride is therefore only correct for as long as no store
+/// changes its element type: reading a bf16 plane at a 4-byte stride yields
+/// half as many values, every one of them a pair of unrelated halves, and
+/// `chunks_exact` drops the odd tail without a word. Both the dtype and the
+/// length are checked here so that a plane this function does not understand
+/// stops the hydrate instead of hydrating garbage.
 #[allow(
-    clippy::unwrap_used,
-    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    clippy::expect_used,
+    reason = "chunks_exact(n) yields slices of exactly n bytes"
 )]
-fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-        .collect()
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "the wildcard is the point: a persisted plane at any dtype other than the two \
+              this reader has a stride for is rejected, and a dtype added to Dtype later must \
+              keep being rejected rather than acquiring a silent stride here"
+)]
+fn tensor_to_f32(a: &Array, name: &str) -> Result<Vec<f32>> {
+    a.eval()?;
+    let bytes = a.to_bytes()?;
+    let item = match a.dtype() {
+        Dtype::F32 => 4_usize,
+        Dtype::Bf16 => 2,
+        other => {
+            return Err(Error::Mlx(format!(
+                "KV block: tensor '{name}' is {other:?}; a persisted float plane must be f32 \
+                 or bf16 — refusing to reinterpret its bytes at a stride the dtype does not back"
+            )))
+        }
+    };
+    if !bytes.len().is_multiple_of(item) {
+        return Err(Error::Mlx(format!(
+            "KV block: tensor '{name}' holds {} bytes, not a whole number of {:?} elements",
+            bytes.len(),
+            a.dtype()
+        )));
+    }
+    Ok(if item == 2 {
+        bytes
+            .chunks_exact(2)
+            .map(|c| {
+                let bits =
+                    u16::from_le_bytes(c.try_into().expect("len 2 by chunks_exact contract"));
+                // bf16 is the top 16 bits of the f32 it widens to.
+                f32::from_bits(u32::from(bits) << 16)
+            })
+            .collect()
+    } else {
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().expect("len 4 by chunks_exact contract")))
+            .collect()
+    })
 }
 
 #[allow(
@@ -2946,9 +2995,9 @@ fn read_quant_iso_k3(
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
         .collect();
-    let scales = bytes_to_f32(&scales_t.to_bytes()?);
-    let quaternions = bytes_to_f32(&quats_t.to_bytes()?);
-    let norms = bytes_to_f32(&norms_t.to_bytes()?);
+    let scales = tensor_to_f32(&scales_t, "scales_t")?;
+    let quaternions = tensor_to_f32(&quats_t, "quats_t")?;
+    let norms = tensor_to_f32(&norms_t, "norms_t")?;
     let n_tokens = (shape[0] as usize) * (shape[1] as usize) * (shape[2].max(0) as usize);
     let block = IsoBlocks {
         codes,
@@ -2989,9 +3038,9 @@ fn read_quant_iso_k4(
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
         .collect();
-    let scales = bytes_to_f32(&scales_t.to_bytes()?);
-    let quaternions = bytes_to_f32(&quats_t.to_bytes()?);
-    let norms = bytes_to_f32(&norms_t.to_bytes()?);
+    let scales = tensor_to_f32(&scales_t, "scales_t")?;
+    let quaternions = tensor_to_f32(&quats_t, "quats_t")?;
+    let norms = tensor_to_f32(&norms_t, "norms_t")?;
     let n_tokens = (shape[0] as usize) * (shape[1] as usize) * (shape[2].max(0) as usize);
     let block = IsoBlocks {
         codes,
@@ -3076,9 +3125,9 @@ fn read_quant_rotor_k3(
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
         .collect();
-    let scales = bytes_to_f32(&scales_t.to_bytes()?);
-    let norms = bytes_to_f32(&norms_t.to_bytes()?);
-    let rotors = bytes_to_f32(&rotors_t.to_bytes()?);
+    let scales = tensor_to_f32(&scales_t, "scales_t")?;
+    let norms = tensor_to_f32(&norms_t, "norms_t")?;
+    let rotors = tensor_to_f32(&rotors_t, "rotors_t")?;
     let n_tokens = (shape[0] as usize) * (shape[1] as usize) * (shape[2].max(0) as usize);
 
     let (qjl_codes, qjl_norms, qjl_s_matrix) = if use_qjl {
@@ -3088,8 +3137,8 @@ fn read_quant_rotor_k3(
         materialize_rotor_k_qjl_tensors(&qjl_codes_t, &qjl_norms_t, &qjl_s_t)?;
         (
             qjl_codes_t.to_bytes()?,
-            bytes_to_f32(&qjl_norms_t.to_bytes()?),
-            Some(bytes_to_f32(&qjl_s_t.to_bytes()?)),
+            tensor_to_f32(&qjl_norms_t, "qjl_norms_t")?,
+            Some(tensor_to_f32(&qjl_s_t, "qjl_s_t")?),
         )
     } else {
         (Vec::new(), Vec::new(), None)
@@ -3137,9 +3186,9 @@ fn read_quant_rotor_k4(
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
         .collect();
-    let scales = bytes_to_f32(&scales_t.to_bytes()?);
-    let norms = bytes_to_f32(&norms_t.to_bytes()?);
-    let rotors = bytes_to_f32(&rotors_t.to_bytes()?);
+    let scales = tensor_to_f32(&scales_t, "scales_t")?;
+    let norms = tensor_to_f32(&norms_t, "norms_t")?;
+    let rotors = tensor_to_f32(&rotors_t, "rotors_t")?;
     let n_tokens = (shape[0] as usize) * (shape[1] as usize) * (shape[2].max(0) as usize);
 
     let (qjl_codes, qjl_norms, qjl_s_matrix) = if use_qjl {
@@ -3149,8 +3198,8 @@ fn read_quant_rotor_k4(
         materialize_rotor_k_qjl_tensors(&qjl_codes_t, &qjl_norms_t, &qjl_s_t)?;
         (
             qjl_codes_t.to_bytes()?,
-            bytes_to_f32(&qjl_norms_t.to_bytes()?),
-            Some(bytes_to_f32(&qjl_s_t.to_bytes()?)),
+            tensor_to_f32(&qjl_norms_t, "qjl_norms_t")?,
+            Some(tensor_to_f32(&qjl_s_t, "qjl_s_t")?),
         )
     } else {
         (Vec::new(), Vec::new(), None)
