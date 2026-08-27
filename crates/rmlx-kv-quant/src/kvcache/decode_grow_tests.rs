@@ -39,7 +39,7 @@ use super::KvCache;
 use crate::clifford::make_rotor_table;
 use crate::quant::KvQuant;
 use crate::rotorquant::n_groups_for;
-use crate::storage::{KvStorage, QuantRotorK3, QuantRotorK4};
+use crate::storage::{bf16_round, KvStorage, QuantRotorK3, QuantRotorK4};
 use crate::test_utils::{lcg_data, skip_if_no_gpu_env};
 use rmlx_core::error::Error;
 use rmlx_core::DispatchPolicy;
@@ -180,7 +180,7 @@ fn ring_norms(cache: &KvCache, kv_seq: i32, device: Device) -> Option<Vec<f32>> 
         return None;
     };
     if let Ok(Some((_, _, norms))) = view {
-        Some(read_f32(&norms))
+        Some(crate::test_utils::read_sideband_plane(&norms))
     } else {
         None
     }
@@ -355,17 +355,21 @@ fn decode_past_max_seq_lands_every_append_in_the_ring() {
                 reason = "length asserted equal to total * KV_H above"
             )]
             let got = norms[(seq * KV_H + head) as usize];
-            let want = cpu_norm(&k_row(seq, head, prefill_len));
+            // The re-encode is rounded to the width the ring stores, because
+            // that is what a decode reconstructs with. Rounding the reference
+            // rather than widening the tolerance keeps this an exact equality:
+            // a tolerance of one bf16 ulp would also admit a genuinely wrong
+            // norm that happened to land inside it.
+            let want = bf16_round(cpu_norm(&k_row(seq, head, prefill_len)));
             assert!(
                 got > 0.0,
                 "ring slot (seq={seq}, head={head}) reads back as {got} — the append was \
                  dropped and attention would read a zeroed token"
             );
-            let rel = (got - want).abs() / want.abs().max(1e-6);
             assert!(
-                rel < 1e-3,
+                (got - want).abs() <= f32::EPSILON * want.abs(),
                 "ring slot (seq={seq}, head={head}) = {got} disagrees with the CPU \
-                 re-encode {want} (rel={rel})"
+                 re-encode rounded to the stored sideband width ({want})"
             );
         }
     }

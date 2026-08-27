@@ -99,10 +99,19 @@ fi
 # expected to find. A refactor that hides them behind a helper the scan cannot
 # see must fail here rather than silently shrink coverage to nothing.
 #
-# Lower it only against dispatchers that are *gone from the tree*, and say
-# which ones here. An unexplained decrement is indistinguishable from the
-# broken scan this floor exists to catch.
-MIN_FNS="${2:-33}"
+# Lower it only against dispatchers that are *gone from the scan's condition*,
+# and say which ones here. An unexplained decrement is indistinguishable from
+# the broken scan this floor exists to catch.
+#
+# 33 -> 30: the three packed-K/V quantize dispatchers
+# (`iso_quantize_v3_gpu`, `iso_quantize_v4_gpu`, `rotor_quantize_gpu_impl`)
+# declared `Dtype::F32` for their scale and norm outputs. Those planes are the
+# GPU ring's sideband and are now declared at `KV_SIDEBAND_DTYPE`, so none of
+# the three declares an f32 output any more and the scan no longer counts them.
+# They are still in the tree and still dispatchers; what left is the promotion
+# risk this gate is about. Their remaining output is `Dtype::U32` codes, which
+# no MLX op can promote a bf16 stream through.
+MIN_FNS="${2:-30}"
 
 for d in "${SRC_DIRS[@]}"; do
     if [ ! -d "$d" ]; then
