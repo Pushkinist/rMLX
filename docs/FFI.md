@@ -1158,7 +1158,7 @@ something gated on an MLX change. mlx-c exposes no compile-options surface (the
 kernel config is seven setters in `mlx/c/fast.h`), so this is observed, never
 forced — re-run the probe after an MLX bump rather than assuming it holds.
 
-The compile gate mirrors this: it compiles every body at `metal3.0` **and**
+The compile gate mirrors this: it compiles every body at `metal3.1` **and**
 `metal4.0`. See "MSL gates" below.
 
 **Lazy compile.** `MetalKernel::new` only *registers* the kernel
@@ -1296,14 +1296,19 @@ starts shipping MSL must be added there, since nothing else discovers it.
 
 | Target | Tool | Checks |
 |---|---|---|
-| `make check-metal-compiles` | `xcrun -sdk macosx metal` (full Xcode, not just the Command Line Tools) | Every kernel compiles natively at `-std=metal3.0` **and** `-std=metal4.0`, so an MSL syntax error surfaces at CI instead of on first GPU dispatch. Also fails if a `.metal` file is missing from its directory's manifest. |
+| `make check-metal-compiles` | `xcrun -sdk macosx metal` (full Xcode, not just the Command Line Tools) | Every kernel compiles natively at `-std=metal3.1` **and** `-std=metal4.0`, so an MSL syntax error surfaces at CI instead of on first GPU dispatch. Also fails if a `.metal` file is missing from its directory's manifest. |
 | `make check-metal-format` | `clang-format` (on `PATH` or via `xcrun -f clang-format` — it is not on `PATH` by default) | Every kernel is clang-format clean. MSL is a C++14 dialect; style is pinned by the `.clang-format` in each kernel directory. |
 
 **Two language versions, for two different reasons.** `metal4.0` is what
-production compiles at (see "MLX JIT language version" above). `metal3.0` is the
-floor, kept so newer syntax cannot creep in unnoticed. The second pass is what
+production compiles at (see "MLX JIT language version" above). `metal3.1` is the
+floor, kept so newer syntax cannot creep in unnoticed. It is 3.1 and not 3.0
+because `bfloat` — the stored element type of the KV codecs' scale and norm
+planes, and therefore the declared type of every kernel parameter that reads one
+— is a Metal 3.1 type. Holding a 3.0 floor would mean keeping those
+declarations textually out of the gate's sight, which is the one thing the gate
+exists to prevent. The second pass is what
 makes a `#if __HAVE_TENSOR__` kernel checkable at all: that macro is undefined
-below 4.0, so at `metal3.0` such a body compiles to an empty translation unit
+below 4.0, so at the baseline such a body compiles to an empty translation unit
 and the gate goes green having validated nothing. Such a body is therefore never
 compiled without the guard — it is checked for real, or reported as `SKIP` and
 counted, never quietly passed.

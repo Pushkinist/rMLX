@@ -31,15 +31,24 @@ needs a per-kernel signature or buffer-index bookkeeping. The `#define`s sit
 immediately ahead of the body so a common name (`T`) cannot collide with the
 header or the probe's own signature.
 
-Each body is compiled twice, at `-std=metal3.0` and `-std=metal4.0`. The second
+Each body is compiled twice, at `-std=metal3.1` and `-std=metal4.0`. The second
 pass is what makes a `#if __HAVE_TENSOR__` body checkable: below Metal 4.0 that
 macro is undefined and such a body compiles to an empty translation unit. On a
 toolchain that cannot do the second pass, those bodies are reported as `SKIP` and
 counted rather than compiled without the guard; CI runs `--strict`, which refuses
 the reduced gate outright.
 
-Buffer types are `u` (uint), `i` (int) and `f` (float) — use the one the dispatch
-site declares.
+Buffer types are `u` (uint), `i` (int), `f` (float) and `b` (bfloat) — use the
+one the dispatch site declares. `b` is why the baseline is `metal3.1` and not
+`metal3.0`: `bfloat` does not exist before 3.1, and the KV codecs' scale and
+norm planes are stored at it.
+
+Getting the letter wrong is not cosmetic where a header **declares** the
+parameter: `if_decode_k_lane` and `rf_decode_k_group` take
+`device const bfloat*`, and a probe that aliases a `float*` into them fails to
+compile. Where a body reads the buffer directly (`float s = scales[i];`) MSL
+widens either type implicitly, so the letter is documentation of the dispatch
+site rather than something the compiler can check — state what is bound.
 
 ## Files
 
