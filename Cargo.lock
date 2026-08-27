@@ -1945,6 +1945,7 @@ name = "rmlx-cli"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "axum",
  "chrono",
  "clap",
  "dhat",
