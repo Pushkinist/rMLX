@@ -29,7 +29,7 @@
 //! line 686: `RotatingKVCache(max_size=sliding_window)` — no keep arg).
 
 use rmlx_core::error::{Error, Result};
-use rmlx_mlx::{concatenate, zeros, Array, Device};
+use rmlx_mlx::{concatenate, zeros, Array, Device, Dtype};
 
 /// Step size for buffer growth, mirrors mlx-lm `RotatingKVCache.step = 256`.
 const ROTATING_STEP: i32 = 256;
@@ -54,9 +54,50 @@ pub(super) struct RotatingSnapshot {
     pub(super) idx: i32,
 }
 
+/// A restart-safe, host-owned representation of one rotating KV ring tensor.
+///
+/// `bytes` are the row-major bytes of the *physical* ring buffer, not a
+/// temporal reorder.  Keeping the physical layout together with the ring
+/// position makes the next append exactly equivalent after restoration.
+#[allow(clippy::exhaustive_structs)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RotatingTensorSnapshot {
+    /// Row-major tensor payload.
+    pub bytes: Vec<u8>,
+    /// Tensor shape in MLX order.
+    pub shape: Vec<i32>,
+    /// Tensor element dtype.
+    pub dtype: Dtype,
+}
+
+/// Lossless, process-independent snapshot of a [`RotatingState`].
+///
+/// The K/V payload is copied to host memory, so this value can be serialized
+/// by the caller and restored in a later process.  `idx` is the next physical
+/// ring position (and is deliberately retained separately from `valid_len`),
+/// while `offset` is the absolute number of tokens accepted by the cache.
+#[allow(clippy::exhaustive_structs)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RotatingStateSnapshot {
+    /// Physical K ring payload.
+    pub keys: Option<RotatingTensorSnapshot>,
+    /// Physical V ring payload.
+    pub values: Option<RotatingTensorSnapshot>,
+    /// Absolute number of accepted tokens.
+    pub offset: i32,
+    /// Configured ring capacity.
+    pub max_size: i32,
+    /// Prefix retained during rotation.
+    pub keep: i32,
+    /// Number of valid logical positions.
+    pub valid_len: i32,
+    /// Next physical write position.
+    pub idx: i32,
+}
+
 /// Internal state for a rotating bf16 KV cache.
 #[allow(missing_debug_implementations)]
-pub(super) struct RotatingState {
+pub struct RotatingState {
     pub(super) keys: Option<Array>,
     pub(super) values: Option<Array>,
     pub(super) offset: i32,
@@ -90,7 +131,8 @@ impl RotatingState {
             + crate::bytes::opt_filled_seq_bytes(values.as_ref(), filled)
     }
 
-    pub(super) fn new(max_size: i32) -> Self {
+    /// Construct an empty ring with the given capacity.
+    pub fn new(max_size: i32) -> Self {
         Self {
             keys: None,
             values: None,
@@ -99,6 +141,11 @@ impl RotatingState {
             keep: 0,
             idx: 0,
         }
+    }
+
+    /// Configured sliding-window capacity.
+    pub fn max_size(&self) -> i32 {
+        self.max_size
     }
 
     pub(super) fn reset(&mut self) {
@@ -174,6 +221,29 @@ impl RotatingState {
         })
     }
 
+    /// Capture a restart-safe snapshot. Unlike [`Self::snapshot`], this
+    /// evaluates each ring array on the calling (inference-owner) thread and
+    /// copies it to host bytes, so the result does not retain MLX device
+    /// allocations or process-local array handles.
+    pub fn snapshot_persistent(&self) -> Result<RotatingStateSnapshot> {
+        fn tensor(a: &Array) -> Result<RotatingTensorSnapshot> {
+            Ok(RotatingTensorSnapshot {
+                bytes: a.to_bytes()?,
+                shape: a.shape(),
+                dtype: a.dtype(),
+            })
+        }
+        Ok(RotatingStateSnapshot {
+            keys: self.keys.as_ref().map(tensor).transpose()?,
+            values: self.values.as_ref().map(tensor).transpose()?,
+            offset: self.offset,
+            max_size: self.max_size,
+            keep: self.keep,
+            valid_len: self.offset.min(self.max_size),
+            idx: self.idx,
+        })
+    }
+
     /// Restore the ring from a [`RotatingSnapshot`], rebuilding the exact
     /// pre-snapshot state (mlx-lm `state.setter` + `meta_state.setter`).
     ///
@@ -190,6 +260,84 @@ impl RotatingState {
             Some(a) => Some(a.try_clone()?),
             None => None,
         };
+        self.offset = snap.offset;
+        self.max_size = snap.max_size;
+        self.keep = snap.keep;
+        self.idx = snap.idx;
+        Ok(())
+    }
+
+    /// Restore a persistent snapshot onto `device`.
+    ///
+    /// Shape, dtype, and ring metadata are checked before MLX arrays are
+    /// created.  K and V must describe the same batch/head/ring dimensions;
+    /// their final head dimensions may differ, as in the live cache.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "shape length is checked before indexing and slicing"
+    )]
+    pub fn restore_persistent(
+        &mut self,
+        snap: &RotatingStateSnapshot,
+        device: Device,
+    ) -> Result<()> {
+        fn array(t: &RotatingTensorSnapshot, device: Device) -> Result<Array> {
+            let host = Array::from_bytes(&t.bytes, &t.shape, t.dtype)?;
+            host.astype(t.dtype, device)
+        }
+
+        if snap.max_size <= 0
+            || snap.keep < 0
+            || snap.keep > snap.max_size
+            || snap.offset < 0
+            || snap.valid_len < 0
+            || snap.valid_len > snap.max_size
+            || snap.idx < 0
+        {
+            return Err(Error::Mlx("invalid rotating snapshot metadata".into()));
+        }
+        if snap.valid_len != snap.offset.min(snap.max_size) {
+            return Err(Error::Mlx(
+                "rotating snapshot valid_len is inconsistent with offset".into(),
+            ));
+        }
+        match (&snap.keys, &snap.values) {
+            (None, None) if snap.offset == 0 && snap.valid_len == 0 => {}
+            (None, None) => {
+                return Err(Error::Mlx(
+                    "rotating snapshot is missing K/V payload for a non-empty cache".into(),
+                ))
+            }
+            (Some(k), Some(v)) => {
+                let valid = |t: &RotatingTensorSnapshot| {
+                    t.shape.len() == 4
+                        && t.shape[0] > 0
+                        && t.shape[1] > 0
+                        && t.shape[2] > 0
+                        && t.shape[3] > 0
+                        && t.bytes.len()
+                            == t.shape.iter().map(|&x| x as usize).product::<usize>()
+                                * t.dtype.itemsize()
+                };
+                if !valid(k)
+                    || !valid(v)
+                    || k.shape[..3] != v.shape[..3]
+                    || k.dtype != v.dtype
+                    || snap.idx > k.shape[2]
+                {
+                    return Err(Error::Mlx(
+                        "invalid rotating snapshot tensor invariants".into(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(Error::Mlx(
+                    "rotating snapshot must contain both K and V".into(),
+                ))
+            }
+        }
+        self.keys = snap.keys.as_ref().map(|t| array(t, device)).transpose()?;
+        self.values = snap.values.as_ref().map(|t| array(t, device)).transpose()?;
         self.offset = snap.offset;
         self.max_size = snap.max_size;
         self.keep = snap.keep;

@@ -1293,11 +1293,12 @@ is a plain bf16/f32 param, **not** quantized. Expert SwiGLU is **clamped**:
 **Thinking mode.** `supports_thinking()` returns `true`. Tags are `<think>` /
 `</think>`; the chat template opens think on generation by default.
 
-**Prompt cache.** RAM-only and Exact-only. A rotating SWA ring cannot be
-reconstructed from a block-truncated prefix, and the current SSD format does
-not serialise the ring payload needed to rebuild a complete Maple snapshot.
-Maple therefore does not attach the SSD spiller / hydrator; SSD reuse stays
-disabled until the representation carries the complete SWA ring state.
+**Prompt cache.** Exact-only in RAM and on SSD. Format-v2 SSD snapshots preserve
+the physical SWA rings, full-attention layers, per-layer offsets, full prompt
+identity, and exact first-token replay metadata. Hydration is accepted only for
+a complete, internally consistent entry; otherwise Maple performs a normal
+prefill. Restart qualification covers exact 1K, 4K, and 8K tokenizer-token
+prompts, crossing the 512-token SWA window.
 
 ### Weight quantization
 
@@ -1350,8 +1351,6 @@ cache, `<think>` splitting.
 
 - No FlashHead, no fused add+RMS / QK-norm+RoPE / router Metal kernels
   (reference arithmetic; see above).
-- Prompt-cache reuse is RAM-only. SSD spill / hydrate is disabled because the
-  current on-disk representation cannot reconstruct Maple's SWA rings.
 - **SWA ring + chunked prefill is not bit-identical across chunk sizes** on
   prompts longer than the 512-token window. The rotating cache's first
   `update_concat` stores the whole first chunk untrimmed (`keys is None`),

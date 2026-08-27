@@ -4364,6 +4364,224 @@ fn rotor_sym_truncate_keeps_ring_tail() {
 
 // ── Layout-tag versioning ────────────────────────────────────────────────────
 
+/// Deterministic `[1, 1, seq, 8]` tensor whose token positions are visually
+/// distinct after a ring wrap. Maple alternates rotating SWA and non-rotating
+/// full-attention layers, so this small CPU fixture models the persistence
+/// contract without loading model weights or requiring Metal.
+fn maple_ring_tensor(seq: i32, base: f32) -> Array {
+    let mut data = Vec::with_capacity((seq * 8) as usize);
+    for token in 0..seq {
+        for lane in 0..8 {
+            data.push(base + token as f32 * 10.0 + lane as f32);
+        }
+    }
+    arr(&data, &[1, 1, seq, 8])
+}
+
+#[allow(
+    clippy::unwrap_used,
+    reason = "test helper: K8V8 payload presence is established by fixture construction"
+)]
+fn k8v8_payload(cache: &KvCache) -> (Vec<f32>, Vec<f32>) {
+    let KvStorage::K8V8 {
+        k: Some(k),
+        v: Some(v),
+        ..
+    } = cache.storage()
+    else {
+        panic!("expected populated K8V8 full-attention layer");
+    };
+    let k = k.dequantize_choice(Device::Cpu, Dtype::F32).unwrap().0;
+    let v = v.dequantize_choice(Device::Cpu, Dtype::F32).unwrap().0;
+    (k, v)
+}
+
+/// A Maple-shaped cache vector must preserve both kinds of attention layer in
+/// one block: the wrapped SWA layer needs its physical ring bytes and cursor,
+/// while the global layer needs its packed K8V8 payload and absolute offset.
+/// Full prompt identity and exact-replay metadata are part of the same atomic
+/// record. The final append is the load-bearing check: retaining logical ring
+/// contents but losing the physical cursor would pass a static comparison and
+/// diverge only on the first token generated after hydrate.
+#[test]
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    reason = "test fixture invariants are established explicitly before assertions"
+)]
+fn maple_mixed_wrapped_swa_and_global_layer_round_trip_exactly() {
+    let device = Device::Cpu;
+    let window = 4;
+    let prompt_len = 7;
+    let mut source_swa =
+        KvCache::with_quant_max_seq_window(KvQuant::K8V8, window, Some(window)).with_layer_idx(0);
+    source_swa
+        .update(
+            &maple_ring_tensor(prompt_len, 0.0),
+            &maple_ring_tensor(prompt_len, 1_000.0),
+            device,
+        )
+        .expect("populate wrapped SWA ring");
+    assert_eq!(source_swa.offset(), prompt_len);
+    assert!(!source_swa.is_trimmable(), "fixture must be post-wrap");
+
+    let shape = [1, 1, prompt_len, 128];
+    let (global_storage, _) = build_storage(KvQuant::K8V8, &shape, 0x4D41_504C, device);
+    let source_global = KvCache::from_storage(
+        global_storage,
+        KvQuant::K8V8,
+        prompt_len,
+        1,
+        DispatchPolicy::default(),
+    );
+    let global_payload_before = k8v8_payload(&source_global);
+    let ring_before = source_swa
+        .rotating_snapshot()
+        .expect("snapshot SWA ring")
+        .expect("SWA layer must have rotating state");
+    assert_eq!(ring_before.valid_len, window);
+    assert_eq!(ring_before.offset, prompt_len);
+
+    let prompt_ids: Vec<u32> = (10_000..10_000 + prompt_len as u32).collect();
+    let replay = ExactReplayMetadata {
+        id: 42,
+        piece: " maple".into(),
+    };
+    let caches = vec![source_swa, source_global];
+    let snapshots = vec![Some(ring_before.clone()), None];
+    let path = tmp_path("maple_mixed_ring_global");
+    write_caches_timed_with_identity(
+        &path,
+        device,
+        MODEL_ID,
+        KvQuant::K8V8,
+        &caches,
+        &[],
+        &snapshots,
+        &prompt_ids,
+        Some(&replay),
+    )
+    .expect("serialize Maple-shaped mixed cache block");
+
+    let (mut hydrated, linear, identity, bytes, _, _, _) = read_caches_timed_with_identity(
+        &path,
+        device,
+        MODEL_ID,
+        KvQuant::K8V8,
+        DispatchPolicy::default(),
+    )
+    .expect("read Maple-shaped cache block")
+    .expect("cache block exists");
+    assert!(bytes > 0);
+    assert!(linear.is_empty());
+    assert_eq!(hydrated.len(), 2);
+    assert_eq!(hydrated[0].layer_idx(), 0);
+    assert_eq!(hydrated[1].layer_idx(), 1);
+    assert_eq!(hydrated[0].offset(), prompt_len);
+    assert_eq!(hydrated[1].offset(), prompt_len);
+    assert!(hydrated[0].is_rotating());
+    assert!(!hydrated[1].is_rotating());
+    assert_eq!(
+        identity,
+        Some(BlockIdentity {
+            prompt_ids,
+            exact_replay: Some(replay),
+        }),
+        "full prompt identity and exact replay must be atomic with the KV block"
+    );
+    assert_eq!(
+        hydrated[0]
+            .rotating_snapshot()
+            .expect("snapshot hydrated ring"),
+        Some(ring_before),
+        "physical ring bytes and cursor metadata must round-trip exactly"
+    );
+    assert_eq!(
+        k8v8_payload(&hydrated[1]),
+        global_payload_before,
+        "global-attention K/V payload must round-trip exactly"
+    );
+
+    let append_k = maple_ring_tensor(2, 2_000.0);
+    let append_v = maple_ring_tensor(2, 3_000.0);
+    let mut live_reference = caches[0]
+        .try_deep_clone()
+        .expect("clone live SWA reference");
+    let (expected_k, expected_v) = live_reference
+        .update(&append_k, &append_v, device)
+        .expect("append to live SWA reference");
+    let (actual_k, actual_v) = hydrated[0]
+        .update(&append_k, &append_v, device)
+        .expect("append to hydrated SWA ring");
+    assert_eq!(to_vec(&actual_k), to_vec(&expected_k));
+    assert_eq!(to_vec(&actual_v), to_vec(&expected_v));
+    assert_eq!(hydrated[0].offset(), prompt_len + 2);
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// Corrupt ring cursors must fail closed during hydrate. `keep > max_size` is
+/// deliberately chosen because it can coexist with otherwise well-formed K/V
+/// tensors; accepting it would reconstruct a cache that only becomes wrong on
+/// a later rotation rather than failing at the read boundary.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test fixture construction and asserted failure use diagnostic expect messages"
+)]
+fn maple_rotating_metadata_outside_window_is_rejected_on_hydrate() {
+    let device = Device::Cpu;
+    let window = 4;
+    let prompt_len = 7;
+    let mut cache = KvCache::with_quant_max_seq_window(KvQuant::K8V8, window, Some(window));
+    cache
+        .update(
+            &maple_ring_tensor(prompt_len, 0.0),
+            &maple_ring_tensor(prompt_len, 100.0),
+            device,
+        )
+        .expect("populate wrapped SWA ring");
+    let mut malformed = cache
+        .rotating_snapshot()
+        .expect("snapshot ring")
+        .expect("rotating snapshot exists");
+    malformed.keep = window + 1;
+
+    let path = tmp_path("maple_bad_rotating_metadata");
+    write_caches_timed_with_identity(
+        &path,
+        device,
+        MODEL_ID,
+        KvQuant::K8V8,
+        &[cache],
+        &[],
+        &[Some(malformed)],
+        &[1, 2, 3, 4, 5, 6, 7],
+        None,
+    )
+    .expect("serialize structurally complete malformed fixture");
+
+    let Err(err) = read_caches_timed_with_identity(
+        &path,
+        device,
+        MODEL_ID,
+        KvQuant::K8V8,
+        DispatchPolicy::default(),
+    ) else {
+        panic!("hydrate must reject ring metadata outside its window");
+    };
+    assert!(
+        err.to_string()
+            .contains("invalid rotating snapshot metadata"),
+        "unexpected error: {err}"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+// ── Layout-tag versioning ───────────────────────────────────────────
+
 /// A stored byte layout change must move the tag, because the tag is the only
 /// thing that distinguishes two layouts on disk.
 ///

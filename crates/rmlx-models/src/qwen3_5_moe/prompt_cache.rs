@@ -191,6 +191,7 @@ impl SsdHydrate<Qwen35MoeEntry> for SsdHydrator {
             prompt_ids,
             kv_caches,
             lin_caches,
+            ..
         } = block;
         Ok(Some(Qwen35MoeEntry {
             prompt_token_ids: prompt_ids,

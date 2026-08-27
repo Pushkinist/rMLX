@@ -68,4 +68,4 @@ pub use ssd_tier::{
     active as active_ssd_tier_config, compute_layout_key, install_config, prepare_attach,
     AttachInfo, SsdTierConfig,
 };
-pub use traits::SsdHydrate;
+pub use traits::{ExactReplayMetadata, SsdHydrate};

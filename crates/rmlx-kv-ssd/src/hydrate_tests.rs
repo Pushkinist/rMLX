@@ -1,5 +1,14 @@
+#![allow(
+    clippy::expect_used,
+    reason = "test fixtures use expect to document the invariant under test; production hydrate code remains panic-free"
+)]
+#![allow(
+    clippy::indexing_slicing,
+    reason = "test fixtures establish fixed lengths before indexing; these accesses exercise identity and cache-shape behavior"
+)]
+
 use super::*;
-use crate::block_io::write_caches;
+use crate::block_io::{write_caches, write_caches_timed_with_identity};
 use crate::hashing::cache_seed;
 use rmlx_core::DispatchPolicy;
 use rmlx_mlx::{Array, Device, Dtype};
@@ -123,7 +132,7 @@ fn prefilled_cache_spills_through_the_bf16_route_not_the_store() {
     );
 }
 
-/// (a): a block written by `write_caches` + recorded in the index is read
+/// (a): a block written with the full identity + recorded in the index is read
 /// back by `SsdHydrator::lookup`, reconstructing a KV cache whose K dequant
 /// matches the spilled one within the fp tolerance.
 #[test]
@@ -160,7 +169,18 @@ fn ssd_hit_reconstructs_block_within_tolerance() {
     let cache = build_kvcache(BLOCK_TOKENS as i32, 0x51D1);
     let before = probe_k(&cache, device);
     let path = dir.join(format!("{key}.kvb"));
-    write_caches(&path, device, MODEL_ID, QUANT, &[cache], &[]).unwrap();
+    write_caches_timed_with_identity(
+        &path,
+        device,
+        MODEL_ID,
+        QUANT,
+        &[cache],
+        &[],
+        &[None],
+        &prompt_ids,
+        None,
+    )
+    .unwrap();
     let size = std::fs::metadata(&path).unwrap().len();
     index
         .record(
@@ -200,6 +220,171 @@ fn ssd_hit_reconstructs_block_within_tolerance() {
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
     assert!(max_err < 1e-3, "K dequant round-trip error {max_err}");
+}
+
+/// A v2 record must use the persisted full prompt, not the request's
+/// block-aligned prefix, as the hydrate identity. This catches the original
+/// SWA failure mode where a 1,118-token cache was indexed by its first four
+/// blocks and could be attached to a request with a divergent tail.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "fixture setup under a temp dir this test owns; a failure is a broken fixture, not a condition under test"
+)]
+#[allow(
+    clippy::expect_used,
+    reason = "the exact-identity hit is the assertion under test; expect makes a failed hydrate report the test invariant"
+)]
+fn v2_identity_rejects_divergent_tail_and_preserves_owner_row() {
+    let device = Device::Cpu;
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let db = dir.join("index.db");
+    let index = SsdKvIndex::open_at(&db).unwrap();
+
+    let stored: Vec<u32> = (0..1_118).collect();
+    let chained = chained_block_hashes_seeded(
+        &stored,
+        cache_seed(TEST_LAYOUT_KEY, QUANT, &[QUANT], TEST_MODEL_SIG),
+    );
+    assert_eq!(chained.len(), 4);
+    let key = hash_to_hex_local(chained[3]);
+    let path = dir.join(format!("{key}.kvb"));
+    let cache = build_kvcache(stored.len() as i32, 0x1D3A);
+    write_caches_timed_with_identity(
+        &path,
+        device,
+        MODEL_ID,
+        QUANT,
+        &[cache],
+        &[],
+        &[None],
+        &stored,
+        Some(&ExactReplayMetadata {
+            id: 42,
+            piece: " answer".into(),
+        }),
+    )
+    .unwrap();
+    let size = std::fs::metadata(&path).unwrap().len();
+    index
+        .record(
+            &key,
+            TEST_LAYOUT_KEY,
+            &path,
+            MODEL_ID,
+            &QUANT.to_string(),
+            size,
+        )
+        .unwrap();
+
+    let hydrator = SsdHydrator::with_index(
+        MODEL_ID,
+        TEST_LAYOUT_KEY,
+        device,
+        dir,
+        SsdKvIndex::open_at(&db).unwrap(),
+    );
+    let mut divergent = stored.clone();
+    divergent[1_117] = u32::MAX;
+    assert!(
+        hydrator
+            .lookup(
+                &divergent,
+                cache_seed(TEST_LAYOUT_KEY, QUANT, &[QUANT], TEST_MODEL_SIG),
+                QUANT,
+                DispatchPolicy::default(),
+            )
+            .unwrap()
+            .is_none(),
+        "same block hash candidate with a divergent tail must fail closed"
+    );
+    assert!(
+        path.exists(),
+        "identity mismatch must not delete the owner block"
+    );
+    assert!(
+        hydrator
+            .lookup(
+                &stored,
+                cache_seed(TEST_LAYOUT_KEY, QUANT, &[QUANT], TEST_MODEL_SIG),
+                QUANT,
+                DispatchPolicy::default(),
+            )
+            .unwrap()
+            .is_some(),
+        "the owning prompt must still hydrate after a foreign request misses"
+    );
+}
+
+/// A v2 exact hit returns the persisted first-token replay alongside the full
+/// prompt identity. KV state alone cannot reproduce that already-computed
+/// token without another prefill.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "fixture setup under a temp dir this test owns; a failure is a broken fixture, not a condition under test"
+)]
+fn v2_identity_returns_exact_replay_metadata() {
+    let device = Device::Cpu;
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let db = dir.join("index.db");
+    let index = SsdKvIndex::open_at(&db).unwrap();
+    let stored: Vec<u32> = (0..BLOCK_TOKENS as u32).collect();
+    let chained = chained_block_hashes_seeded(
+        &stored,
+        cache_seed(TEST_LAYOUT_KEY, QUANT, &[QUANT], TEST_MODEL_SIG),
+    );
+    let key = hash_to_hex_local(chained[0]);
+    let path = dir.join(format!("{key}.kvb"));
+    let cache = build_kvcache(BLOCK_TOKENS as i32, 0x4E7A);
+    let replay = ExactReplayMetadata {
+        id: 7,
+        piece: " maple".into(),
+    };
+    write_caches_timed_with_identity(
+        &path,
+        device,
+        MODEL_ID,
+        QUANT,
+        &[cache],
+        &[],
+        &[None],
+        &stored,
+        Some(&replay),
+    )
+    .unwrap();
+    let size = std::fs::metadata(&path).unwrap().len();
+    index
+        .record(
+            &key,
+            TEST_LAYOUT_KEY,
+            &path,
+            MODEL_ID,
+            &QUANT.to_string(),
+            size,
+        )
+        .unwrap();
+
+    let hydrator = SsdHydrator::with_index(
+        MODEL_ID,
+        TEST_LAYOUT_KEY,
+        device,
+        dir,
+        SsdKvIndex::open_at(&db).unwrap(),
+    );
+    let block = hydrator
+        .lookup(
+            &stored,
+            cache_seed(TEST_LAYOUT_KEY, QUANT, &[QUANT], TEST_MODEL_SIG),
+            QUANT,
+            DispatchPolicy::default(),
+        )
+        .unwrap()
+        .expect("exact v2 identity must hydrate");
+    assert_eq!(block.prompt_ids, stored);
+    assert_eq!(block.exact_replay, Some(replay));
 }
 
 /// Production-truth probe match: the spill side keys every index row with the
@@ -245,7 +430,18 @@ fn salted_keyed_block_is_found_by_probe() {
     // under the SALTED key + the non-zero layout key.
     let cache = build_kvcache(BLOCK_TOKENS as i32, 0x5A17);
     let path = dir.join(format!("{key}.kvb"));
-    write_caches(&path, device, MODEL_ID, QUANT, &[cache], &[]).unwrap();
+    write_caches_timed_with_identity(
+        &path,
+        device,
+        MODEL_ID,
+        QUANT,
+        &[cache],
+        &[],
+        &[None],
+        &prompt_ids,
+        None,
+    )
+    .unwrap();
     let size = std::fs::metadata(&path).unwrap().len();
     index
         .record(&key, LK, &path, MODEL_ID, &QUANT.to_string(), size)
@@ -333,7 +529,18 @@ fn probe_finds_own_models_block_and_not_another_models() {
 
     let cache = build_kvcache(BLOCK_TOKENS as i32, 0x0B1E);
     let path = dir.join(format!("{key}.kvb"));
-    write_caches(&path, device, MODEL_ID, QUANT, &[cache], &[]).unwrap();
+    write_caches_timed_with_identity(
+        &path,
+        device,
+        MODEL_ID,
+        QUANT,
+        &[cache],
+        &[],
+        &[None],
+        &prompt_ids,
+        None,
+    )
+    .unwrap();
     let size = std::fs::metadata(&path).unwrap().len();
     index
         .record(&key, LK, &path, MODEL_ID, &QUANT.to_string(), size)
@@ -447,7 +654,18 @@ fn lookup_seeded_matches_arch_recompute() {
     // Build + spill a single-block, single-layer cache, record the row.
     let cache = build_kvcache(BLOCK_TOKENS as i32, 0x9F3C);
     let path = dir.join(format!("{key}.kvb"));
-    write_caches(&path, device, MODEL_ID, QUANT, &[cache], &[]).unwrap();
+    write_caches_timed_with_identity(
+        &path,
+        device,
+        MODEL_ID,
+        QUANT,
+        &[cache],
+        &[],
+        &[None],
+        first_block_ids,
+        None,
+    )
+    .unwrap();
     let size = std::fs::metadata(&path).unwrap().len();
     index
         .record(&key, LK, &path, MODEL_ID, &QUANT.to_string(), size)
@@ -586,7 +804,18 @@ fn metadata_mismatch_treated_as_corrupt() {
     // Write a valid block at K8V8 ...
     let cache = build_kvcache(BLOCK_TOKENS as i32, 0xBEEF);
     let path = dir.join(format!("{key}.kvb"));
-    write_caches(&path, device, MODEL_ID, KvQuant::K8V8, &[cache], &[]).unwrap();
+    write_caches_timed_with_identity(
+        &path,
+        device,
+        MODEL_ID,
+        KvQuant::K8V8,
+        &[cache],
+        &[],
+        &[None],
+        &prompt_ids,
+        None,
+    )
+    .unwrap();
     index
         .record(&key, TEST_LAYOUT_KEY, &path, MODEL_ID, "k8v8", 0)
         .unwrap();
@@ -719,7 +948,18 @@ fn ssd_hit_lookup_emits_hydrate_event() {
 
     // Build + write a valid K8V8 block.
     let cache = build_kvcache(BLOCK_TOKENS as i32, 0xAB12);
-    write_caches(&path, device, MODEL_ID, QUANT, &[cache], &[]).unwrap();
+    write_caches_timed_with_identity(
+        &path,
+        device,
+        MODEL_ID,
+        QUANT,
+        &[cache],
+        &[],
+        &[None],
+        &prompt_ids,
+        None,
+    )
+    .unwrap();
     let size = std::fs::metadata(&path).unwrap().len();
     index
         .record(
@@ -1060,7 +1300,18 @@ fn seed_race_fixture(dir: &std::path::Path, db: &std::path::Path, device: Device
         let cache = build_kvcache(BLOCK_TOKENS as i32, 0x9E11 + i as u64 * 977);
         expected_k.push(probe_k(&cache, device));
         let path = dir.join(format!("{key}.kvb"));
-        write_caches(&path, device, MODEL_ID, QUANT, &[cache], &[]).unwrap();
+        write_caches_timed_with_identity(
+            &path,
+            device,
+            MODEL_ID,
+            QUANT,
+            &[cache],
+            &[],
+            &[None],
+            ids,
+            None,
+        )
+        .unwrap();
         let size = std::fs::metadata(&path).unwrap().len();
         index
             .record(&key, RACE_LK, &path, MODEL_ID, &QUANT.to_string(), size)
@@ -1147,7 +1398,18 @@ fn hydrate_of_a_row_whose_file_vanished_is_a_miss_and_leaves_the_tier_usable() {
 
     let cache = build_kvcache(BLOCK_TOKENS as i32, 0x7E57);
     let expected = probe_k(&cache, device);
-    write_caches(&path, device, MODEL_ID, QUANT, &[cache], &[]).unwrap();
+    write_caches_timed_with_identity(
+        &path,
+        device,
+        MODEL_ID,
+        QUANT,
+        &[cache],
+        &[],
+        &[None],
+        &prompt_ids,
+        None,
+    )
+    .unwrap();
     let size = std::fs::metadata(&path).unwrap().len();
     let kvb = std::fs::read(&path).unwrap();
     index

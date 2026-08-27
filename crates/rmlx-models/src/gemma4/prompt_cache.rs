@@ -34,7 +34,7 @@ use crate::prompt_cache::{
     ArchPromptCache, CacheStats, PromptCacheEntry, ReuseKind, ReusePolicy, SsdHydrate, BLOCK_TOKENS,
 };
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
-use rmlx_kv_ssd::{HydratedBlock, SsdHydrator};
+use rmlx_kv_ssd::{ExactReplayMetadata, HydratedBlock, SsdHydrator};
 
 // ---------------------------------------------------------------------------
 // Entry type
@@ -53,15 +53,17 @@ pub(crate) struct Gemma4Entry {
     pub(crate) first_id: u32,
     /// Decoded piece for `first_id`.
     pub(crate) first_piece: String,
+    /// Exact first-token replay metadata, when captured for this snapshot.
+    /// RAM entries set this after decode; SSD entries restore it only when the
+    /// block carries authoritative full-prompt identity metadata.
+    pub(crate) exact_replay: Option<ExactReplayMetadata>,
     /// Runtime `KvQuant` discriminant in effect when this snapshot was written
     /// (Plan §D8 / Task 11.5). See the original commit comments for the
     /// `Option<None>` legacy-sentinel rationale.
     pub(crate) kv_quant: Option<KvQuant>,
-    /// True when this entry was reconstructed from the SSD tier and therefore
-    /// stores only the block-aligned prefix KV — `first_id` / `first_piece` are
-    /// placeholders, not a real decode token. The generate loop excludes such
-    /// an entry from the Exact fast path so it falls through to a re-prefill
-    /// that recomputes the real first token.
+    /// True when this entry was reconstructed from the SSD tier. Format-v2
+    /// entries restore the complete prompt snapshot and exact replay token;
+    /// legacy or malformed entries remain ineligible and fail closed.
     ///
     /// MUST be set only in `SsdHydrate::hydrate`; never by the RAM-cache push
     /// path. Do NOT use the `first_id == 0` heuristic as a substitute —
@@ -118,25 +120,38 @@ impl Gemma4Entry {
     /// strict-prefix snapshot/restore or block-truncate) without re-prefilling
     /// the prefix.
     ///
-    /// Gemma4's sliding-window (SWA) layers run a bf16 `RotatingKvCache` ring
-    /// that is NOT serialised to the SSD tier; on hydrate they are
-    /// reconstructed as a payload-less `KvStorage::None` (the spill writer
-    /// records them geometry-only, see `block_io::write_layer`). Reusing such a
-    /// hydrated entry via a prefix arm would re-prefill only the tail on top of
-    /// an empty SWA prefix, giving the SWA layers the wrong attention context
-    /// and corrupting the output. `KvCache::is_trimmable()` returns `true` for a
-    /// `None` layer, so it is the wrong predicate to detect this.
+    /// Gemma4's sliding-window (SWA) layers run a bf16 `RotatingKvCache` ring.
+    /// Format-v2 restores that ring, but the hydrate seam still has to reject
+    /// legacy or malformed entries that flatten the producer/consumer topology
+    /// into payload-less `KvStorage::None` layers or bogus offsets. Reusing such
+    /// a hydrated entry via a prefix arm would re-prefill only the tail on top
+    /// of the wrong SWA context and corrupt the output.
     ///
-    /// A layer is payload-less when its storage is `None` AND it carries no
-    /// off-storage bf16 seed. This distinguishes a dropped SWA ring (no seed →
-    /// incomplete) from a `KvQuant::None` global layer whose bf16 K/V was
-    /// spilled and restored via `KvCache::with_decode_fp16_seed` (seed present →
-    /// complete). A fully RAM-resident snapshot always passes (no layer is
-    /// `None`-without-seed), so only hydrated SWA entries are degraded.
+    /// A layer is complete when dense attention has persistent storage or SWA
+    /// has an actual restored rotating ring. A bf16 decode mirror by itself is
+    /// not enough: it can be a legacy/geometry-only SSD payload with no ring
+    /// metadata, and treating it as a live SWA cache would make tail appends
+    /// attend to the wrong positions.
     pub(crate) fn is_hydrate_complete(&self) -> bool {
-        self.kv_caches
-            .iter()
-            .all(|c| c.has_persistent_cache() || c.decode_fp16_kv().is_some())
+        // A hydrated block must describe every decoder layer.  `Iterator::all`
+        // is vacuously true for an empty vector, which would otherwise let a
+        // malformed/legacy payload through to the prefix path.
+        if !self.is_ssd_hydrated {
+            return true;
+        }
+        !self.kv_caches.is_empty()
+            && self.kv_caches.iter().all(|c| {
+                // Gemma4 shared-KV consumer layers are deliberately empty;
+                // the model attends through their producer cache. Format v2
+                // preserves those per-layer zero offsets. Every filled layer
+                // must still match the exact stored prompt and carry a real
+                // dense payload or restored rotating ring.
+                c.offset() == 0
+                    || (c.offset() == self.prompt_token_ids.len() as i32
+                        && (c.has_persistent_cache()
+                            || c.is_rotating()
+                            || (self.exact_replay.is_some() && c.decode_fp16_kv().is_some())))
+            })
     }
 }
 
@@ -158,6 +173,7 @@ impl PromptCacheEntry for Gemma4Entry {
             kv_caches: kv_caches?,
             first_id: self.first_id,
             first_piece: self.first_piece.clone(),
+            exact_replay: self.exact_replay.clone(),
             kv_quant: self.kv_quant,
             is_ssd_hydrated: self.is_ssd_hydrated,
         })
@@ -179,6 +195,10 @@ impl PromptCacheEntry for Gemma4Entry {
         self.is_ssd_hydrated
     }
 
+    fn exact_replay(&self) -> Option<&ExactReplayMetadata> {
+        self.exact_replay.as_ref()
+    }
+
     // Pure-attention arch: no GDN linear state.
     fn lin_caches(&self) -> &[LinearAttnCache] {
         &[]
@@ -188,8 +208,7 @@ impl PromptCacheEntry for Gemma4Entry {
     // `is_strict_prefix_of`; the trim itself is the byte-identical default.
 
     /// Delegates to the inherent [`Gemma4Entry::is_hydrate_complete`]: an
-    /// SSD-hydrated entry whose SWA rotating ring came back as a payload-less
-    /// `KvStorage::None` (the ring is not serialised to the SSD tier) is
+    /// SSD-hydrated entry whose SWA topology came back malformed or legacy is
     /// incomplete, so the consume engine excludes it from prefix reuse and
     /// degrades it to a full re-prefill.
     fn is_hydrate_complete(&self) -> bool {
@@ -216,9 +235,15 @@ impl PromptCacheEntry for Gemma4Entry {
     fn is_reusable_prefix_of(
         &self,
         prompt_ids: &[u32],
-        _is_ssd_hydrated: bool,
+        is_ssd_hydrated: bool,
         matched_blocks: usize,
     ) -> Option<ReuseKind> {
+        // Keep this guard at the Gemma4 seam as well as in the shared consume
+        // engine: callers/tests that invoke the arch hook directly must not be
+        // able to reuse a hydrated payload with a dropped SWA ring.
+        if is_ssd_hydrated && !self.is_hydrate_complete() {
+            return None;
+        }
         // B1 precedence — strict prefix supersedes block-truncate.
         if self.is_strict_prefix_of(prompt_ids) {
             return Some(ReuseKind::StrictPrefix {
@@ -309,18 +334,23 @@ impl SsdHydrate<Gemma4Entry> for SsdHydrator {
         };
         let HydratedBlock {
             prompt_ids,
+            exact_replay,
             kv_caches,
             lin_caches: _,
         } = block;
+        let (first_id, first_piece) = exact_replay.as_ref().map_or((0, String::new()), |replay| {
+            (replay.id, replay.piece.clone())
+        });
         Ok(Some(Gemma4Entry {
             prompt_token_ids: prompt_ids,
             block_hashes,
             kv_caches,
-            first_id: 0,
-            first_piece: String::new(),
+            first_id,
+            first_piece,
+            exact_replay,
             kv_quant: Some(kv_quant),
-            // Block-aligned prefix only; the placeholder first_id must not be
-            // replayed — the generate loop re-prefills to recompute it.
+            // The shared consume gate permits exact replay only when the v2
+            // record restored both a complete cache and replay metadata.
             is_ssd_hydrated: true,
         }))
     }

@@ -122,3 +122,90 @@ All criteria are printed in the final summary table and recorded in `iteration_s
 - `scripts/spec_bench.sh` — decode-TPS canary (template this script mirrors).
 - `crates/rmlx-server/tests/ssd_cache_restart.rs` — integration-level SSD cache correctness test (spill → restart → hydrate chain).
 - `crates/rmlx-metrics/src/events.rs` — `SsdSpillEvent` and `SsdHydrateEvent` payloads.
+
+## Cross-restart SSD uplift gate
+
+For the rotating-SWA uplift, run the ignored integration gate with one model
+process at a time. It owns and terminates only the child it spawned; it does
+not use `pkill` or remove unrelated claim files, and it deletes no cache data
+outside its temporary `RMLX_HOME`.
+
+```sh
+RMLX_TEST_MODEL=/abs/path/to/gemma4 cargo test -p rmlx-server \
+  --test ssd_cache_restart ssd_cache_survives_server_restart \
+  -- --ignored --nocapture --test-threads=1
+```
+
+The gate warms the same deterministic request in both phases, compares the
+returned assistant text, and proves all of the following independently:
+
+1. RAM eviction created `.kvb` data and an index row.
+2. The safetensors `seq_len` contains at least one complete 256-token indexed
+   block and preserves the exact full-prompt offset across restart.
+3. The first post-restart request increments `rmlx_prompt_cache_ssd_hits_total`
+   and `rmlx_ssd_hydrate_us`/its bucket, proving accepted reuse and hydrate I/O,
+   rather than treating either metric as the other.
+4. Five post-restart timings are reported as a median, and each sample first
+   evicts A with B so it is an accepted SSD reuse. A separate SSD-disabled
+   child measures three identical A cold samples with the same B→A warm-up;
+   warm is accepted only when its median is below 85% of cold. One-shot ratios
+   are never a pass.
+
+TTFT is the request-to-complete proxy for a one-token deterministic response.
+The run prints the measured cold and SSD medians; repeat the same protocol with
+1K, 4K, and 8K-token prompts when the selected model supports those lengths.
+Do not combine lengths or average them: record one median and sample count per
+length, and mark unsupported lengths `not available`.
+
+The 3-cold/5-treatment integration test is the per-change smoke gate. Before
+enabling the path more broadly, run at least 10 paired cold/treatment trials at
+each supported length (20 preferred), using fresh homes and the same binary,
+model, tokenizer, quantization, seed, request, and decode settings. Require:
+
+- byte-identical generated token/text output;
+- an accepted SSD-hit increment for every treatment request, with no fallback;
+- treatment median at most 80% of the cold median;
+- paired-bootstrap 95% confidence-interval lower bound of at least 10% uplift;
+- treatment p95 no worse than 110% of cold p95; and
+- hydrate p95 below the cold-prefill median.
+
+Run the matrix independently for each SSD-enabled architecture under review.
+Gemma4 and Maple are positive SSD targets; Maple's real golden-token suite must
+also stay green between cells to protect its hybrid SWA/full model path.
+
+Run each 1K/4K/8K qualification cell separately from the five-sample smoke so
+the Maple negative control can run between cells. `RMLX_SSD_QUAL_TRIALS`
+defaults to the required minimum of 10; use 20 for the preferred contribution
+evidence. Set `RMLX_SSD_QUAL_LENGTHS` to one cell at a time (a comma-separated
+subset is also accepted for unattended reruns):
+
+```sh
+RMLX_TEST_MODEL=/abs/path/to/gemma4 RMLX_SSD_QUAL_TRIALS=20 \
+  RMLX_SSD_QUAL_LENGTHS=1024 \
+  cargo test -p rmlx-server --test ssd_cache_restart \
+  ssd_cache_restart_qualification_matrix -- \
+  --ignored --nocapture --test-threads=1
+```
+
+Each cell constructs user content through the snapshot's real chat template
+and tokenizer, then verifies the response's `usage.prompt_tokens` is exactly
+1024, 4096, or 8192. Each child is started with `--max-ctx` equal to the
+selected cell so a model's lower server default cannot silently invalidate a
+long-context measurement. It records paired cold/treatment TTFT plus per-treatment
+hydrate time from histogram sum/count deltas. The test requires identical
+assistant text, an accepted SSD hit and exactly one hydrate per treatment,
+the median/paired-bootstrap/p95 thresholds above, and exact reconciliation of
+every SQLite row with one direct-child `.kvb` file (path, metadata byte size,
+summed bytes, parsed `seq_len`, no missing files, and no orphan files).
+Each completed cell writes its raw samples, derived statistics, gate booleans,
+and final disk reconciliation to
+`target/ssd-qualification/<model>-<tokens>.json`. Override that retained
+artifact directory with `RMLX_SSD_QUAL_REPORT_DIR`.
+
+After each completed cell, run Maple's real golden-token suite before proceeding
+to the next cell or contribution milestone:
+
+```sh
+cargo test -p rmlx-models --test maple_golden_tokens -- \
+  --ignored --nocapture --test-threads=1
+```

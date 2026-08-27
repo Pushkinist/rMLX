@@ -52,7 +52,7 @@ variables above:
 
 | Variable | Used by | Purpose |
 |----------|---------|---------|
-| `RMLX_TEST_MODEL` | `rmlx-server/tests/ssd_cache_restart.rs` | Generic single-model override for the SSD-restart smoke test. |
+| `RMLX_TEST_MODEL` | `rmlx-server/tests/ssd_cache_restart.rs` | Generic single-model override (Gemma4 or another supported snapshot) for the SSD-restart smoke test. |
 | `RMLX_KV_TEST_MODEL` | `gemma4_kv_cache_equivalence.rs`, `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs`, `projects_toml_e2e.rs`, `cli_flags_e2e.rs`, and as the single-model override for the golden-token suites | Model snapshot for KV-cache equivalence and drafter-alignment tests. Typically set to a Gemma4-e4b path. |
 | `RMLX_DRAFT_TEST_MODEL` | `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs` | Draft model snapshot path. Used alongside `RMLX_KV_TEST_MODEL` for speculative-decode alignment tests. |
 | `RMLX_VL_TEST_MODEL` | `qwen3_vl_moe_text_parity.rs` | Vision-language model snapshot for VL text-parity tests. |
@@ -448,8 +448,9 @@ runner would execute a handful of early returns, see no banner for the crate, an
 fail the suite over a missing model rather than a defect. `ssd_cache_restart`
 could not be listed on any machine: its Metal is in the child, so the in-process
 instrumentation covers nothing, and it additionally needs `cargo build -p
-rmlx-cli` first (`cargo test --tests` does not build that binary), `pkill`s every
-MLX process, and spends two 180 s readiness waits.
+rmlx-cli` first (`cargo test --tests` does not build that binary), owns only its
+spawned child (no indiscriminate process cleanup), and spends two 180 s
+readiness waits.
 
 Run the embeddings cells by hand:
 

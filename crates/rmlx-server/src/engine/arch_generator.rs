@@ -1179,6 +1179,7 @@ impl Generator for ArchGenerator {
                     tracing::info!(
                         model_id = %model_id_for_log,
                         prompt_cache_hits = cs.hits,
+                        prompt_cache_ssd_hits = cs.ssd_hits,
                         prompt_cache_misses = cs.misses,
                         prompt_cache_bytes = cs.bytes,
                         prompt_cache_hit_rate = hit_rate,

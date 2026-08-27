@@ -326,7 +326,15 @@ fn qwen3_ssd_hydrate_promotes_entry_into_ram() {
         1,
         "hydrate called exactly once"
     );
-    assert_eq!(cache.stats().ssd_hits, 1, "ssd_hits counter must be bumped");
+    // `hydrate_from_ssd` only promotes the reconstructed entry.  The SSD-hit
+    // counter is intentionally reserved for the shared consume path, which
+    // can prove that the promoted entry was actually accepted for reuse; a
+    // direct promotion test must therefore not count it as a served hit.
+    assert_eq!(
+        cache.stats().ssd_hits,
+        0,
+        "direct SSD promotion must not count as accepted reuse"
+    );
 
     // After hydrate: RAM hit.
     let after = cache.find_best_prefix(&prompt_ids, FNV_OFFSET);

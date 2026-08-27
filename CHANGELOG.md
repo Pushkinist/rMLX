@@ -92,12 +92,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Maple prompt-cache SSD attachment is disabled until SWA rings can be
-  restored completely.** The current SSD representation serialises persistent
-  K/V blocks but not the rotating-ring payload Maple needs for an Exact cache
-  hit. Maple now keeps prompt-cache entries in RAM instead of hydrating an
-  incomplete entry, promoting it to RAM, counting a misleading SSD hit, and
-  rejecting it later during reuse validation.
+- **Rotating Gemma4 and Maple prompt-cache snapshots now round-trip through the
+  SSD tier.** Format-v2 blocks persist physical SWA ring state, per-layer
+  offsets, full prompt identity, and exact first-token replay metadata. Hydrates
+  fail closed on malformed rings or divergent prompt tails, and an SSD hit is
+  counted only after the model accepts the restored entry. Maple's hybrid
+  SWA/full path passed process-restart qualification at exact 1K, 4K, and 8K
+  tokenizer-token lengths.
 
 - **Token selection resolved ties differently on the host than on the device,
   and `top_p` / `top_k` resolved them differently on every call.** MLX `argmax`

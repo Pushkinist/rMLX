@@ -241,7 +241,7 @@ impl SsdHydrate<Qwen3Entry> for SsdHydrator {
         let HydratedBlock {
             prompt_ids,
             kv_caches,
-            lin_caches: _, // pure-attention arch has no GDN state
+            ..
         } = block;
         Ok(Some(Qwen3Entry {
             prompt_token_ids: prompt_ids,

@@ -32,18 +32,16 @@ use super::layers::softcap_fused;
 /// Return the sequence offset that should be used as the RoPE `base_offset`
 /// for this forward call.
 ///
-/// Gemma4 layer 0 is always a `SlidingAttention` layer whose cache becomes
-/// `KvStorage::None` after SSD hydration (the rotating ring buffer cannot be
-/// spilled). That cache carries the block's `seq_len` as `self.offset` so the
-/// SWA decode can compute correct write positions, but [`KvCache::offset`] on
-/// such a cache does **not** reflect how many K/V tokens are actually usable
-/// for attention (the answer is zero). Using it for RoPE base_offset would
-/// silently produce incorrect token positions.
+/// Gemma4 layer 0 is always a `SlidingAttention` layer. Legacy or malformed
+/// SSD records may reconstruct it without persistent payload, while format-v2
+/// records restore its rotating ring. In either case, the full-attention
+/// producer remains the authoritative base-offset source when present.
 ///
 /// We therefore skip `has_persistent_cache() == false` caches and read from
 /// the first full-attention cache (which always has real quantised K/V data).
-/// If no cache has persistent data (all fresh / all SWA-None), fall back to
-/// `cs[0].offset()` which is 0 on a cold start.
+/// If no dense cache has persistent data (all fresh or rotating-only), fall
+/// back to `cs[0].offset()`, which is 0 on a cold start and the restored
+/// absolute offset for a hydrated ring.
 fn cache_base_offset(caches: Option<&[KvCache]>) -> i32 {
     let Some(cs) = caches else {
         return 0;

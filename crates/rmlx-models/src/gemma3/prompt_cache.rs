@@ -19,8 +19,8 @@
 //!   hydrated strict-prefix) is declined here (`is_reusable_prefix_of` → `None`),
 //!   so the only reachable consume outcomes are `Exact` and `Miss`.
 //! - `impl SsdHydrate<Gemma3Entry> for SsdHydrator`: pure-attention hydrate (the
-//!   reconstructed block carries `kv_caches` only; the SWA rotating-ring layers
-//!   come back payload-less). The SSD spill path is the blanket
+//!   reconstructed block carries `kv_caches` only; ExactOnly still forces any
+//!   hydrated entry back through re-prefill before it can decode). The SSD spill path is the blanket
 //!   `SpillSink<E> for SsdSpiller` in `crate::prompt_cache`.
 //!
 //! ## Reuse policy — Exact-only (SWA-first)
@@ -36,16 +36,11 @@
 //!
 //! ## SWA-hydrate completeness
 //!
-//! An SSD-hydrated entry restores only the block-aligned prefix of the
-//! full-attention layers; the SWA rotating-ring layers are NOT serialised to the
-//! SSD tier and come back as a payload-less `KvStorage::None`. Such an entry is
-//! never reused under ExactOnly anyway (the Exact arm declines
-//! `is_ssd_hydrated`, and the default `is_reusable_prefix_of` returns `None`), so
-//! it always falls to a full re-prefill — safe by construction. The
-//! `is_hydrate_complete` override below encodes the SWA-completeness predicate
-//! regardless, both to document the truth and to future-proof a later Partial
-//! promotion (the engine excludes an incomplete hydrated entry from prefix
-//! reuse).
+//! An SSD-hydrated entry is never reused under ExactOnly anyway (the Exact arm
+//! declines `is_ssd_hydrated`, and the default `is_reusable_prefix_of` returns
+//! `None`), so it always falls to a full re-prefill. The
+//! `is_hydrate_complete` override below still encodes a conservative payload
+//! predicate to future-proof a later Partial promotion.
 
 #![allow(clippy::redundant_closure_for_method_calls)]
 use rmlx_core::error::Result;
@@ -96,15 +91,10 @@ impl Gemma3Entry {
     /// True iff every layer this architecture attends to carries real K/V
     /// payload — i.e. the snapshot has a complete attention context.
     ///
-    /// Gemma3's sliding-window (SWA) layers run a bf16 `RotatingKvCache` ring
-    /// that is NOT serialised to the SSD tier; on hydrate they are reconstructed
-    /// as a payload-less `KvStorage::None` (the spill writer records them
-    /// geometry-only). A layer is payload-less when its storage is `None` AND it
-    /// carries no off-storage bf16 seed. This distinguishes a dropped SWA ring
-    /// (no seed → incomplete) from a `KvQuant::None` global layer whose bf16 K/V
-    /// was spilled and restored via `KvCache::with_decode_fp16_seed` (seed
-    /// present → complete). A fully RAM-resident snapshot always passes (no layer
-    /// is `None`-without-seed), so only hydrated SWA entries are degraded.
+    /// Gemma3 stays ExactOnly, so hydrated entries are not reused today, but we
+    /// still keep a conservative payload predicate here for future Partial
+    /// promotion. A layer is treated as complete only when it carries actual
+    /// persistent storage or an explicit bf16 seed.
     ///
     /// Under ExactOnly such a hydrated entry is never reused anyway, but the
     /// predicate documents the SWA truth and gates the engine's prefix-reuse
@@ -160,9 +150,8 @@ impl PromptCacheEntry for Gemma3Entry {
     }
 
     /// Delegates to the inherent [`Gemma3Entry::is_hydrate_complete`]: an
-    /// SSD-hydrated entry whose SWA rotating ring came back as a payload-less
-    /// `KvStorage::None` (the ring is not serialised to the SSD tier) is
-    /// incomplete, so the consume engine would exclude it from any prefix reuse.
+    /// SSD-hydrated entry whose payload is incomplete is excluded from any
+    /// future prefix reuse.
     /// (Under the current ExactOnly policy it is excluded from the Exact arm by
     /// `!is_ssd_hydrated` regardless; this override documents the SWA truth and
     /// future-proofs a Partial promotion.)
@@ -190,11 +179,10 @@ impl PromptCacheEntry for Gemma3Entry {
 /// Hydrate a `Gemma3Entry` from the SSD tier on a RAM-cache miss.
 ///
 /// Pure-attention arch: the reconstructed block carries `kv_caches` only (the
-/// `lin_caches` from the block are discarded). The SWA rotating-ring layers come
-/// back payload-less (the ring is not serialised). The matched block-aligned
-/// prefix token IDs become the entry's `prompt_token_ids`; block hashes are
-/// recomputed and the runtime `kv_quant` recorded. `first_id` / `first_piece`
-/// are sentinels (the SSD block stores no first decode token), so the entry is
+/// `lin_caches` from the block are discarded). The matched block-aligned prefix
+/// token IDs become the entry's `prompt_token_ids`; block hashes are recomputed
+/// and the runtime `kv_quant` recorded. `first_id` / `first_piece` are
+/// sentinels (the SSD block stores no first decode token), so the entry is
 /// flagged `is_ssd_hydrated = true`; the consume engine excludes it from the
 /// Exact fast path and the generate loop recomputes the real first token via
 /// re-prefill.
@@ -213,7 +201,7 @@ impl SsdHydrate<Gemma3Entry> for SsdHydrator {
         let HydratedBlock {
             prompt_ids,
             kv_caches,
-            lin_caches: _, // pure-attention arch has no GDN state
+            ..
         } = block;
         Ok(Some(Gemma3Entry {
             prompt_token_ids: prompt_ids,

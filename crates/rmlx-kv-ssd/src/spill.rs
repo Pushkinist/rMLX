@@ -2,29 +2,32 @@
 //!
 //! When `PromptCache::push` evicts an entry (RAM-cap or slot-count), the entry
 //! is offered to a [`crate::prompt_cache::SpillSink`] before being dropped.
-//! The production sink builds an [`SpillJob`] — a cheap refcount-clone of the
-//! evicted entry's caches plus its identity metadata — and `try_send`s it onto
-//! a **bounded `std::sync::mpsc::sync_channel`**. A single dedicated drain
-//! thread receives jobs, serializes them via 's `block_io::write_caches`
+//! The production sink builds an [`SpillJob`] — a refcount-clone of the
+//! evicted entry's caches plus its identity metadata and any host-owned
+//! rotating snapshots — and `try_send`s it onto a **bounded
+//! `std::sync::mpsc::sync_channel`**. A single dedicated drain thread receives
+//! jobs, serializes them via the block I/O spill writer
 //! to a `.kvb` file under `paths::kv_cache_dir(namespace)`, and records the
-//! file in 's `SsdKvIndex`.
+//! file in the `SsdKvIndex`.
 //!
 //! ## Why a channel + drain thread (not `spawn_blocking`)
 //!
 //! `PromptCache` is sync, called from the sync inference path. Threading a
 //! Tokio handle into the cache layer would leak async into compute. A bounded
 //! `sync_channel` + one drain thread keeps the hot path sync and **never
-//! blocks on disk I/O**: the hot path only does a refcount-clone of the caches
-//! (no tensor copy) and a non-blocking `try_send`. If the channel is full the
-//! job is `warn!`-dropped — back-pressure never stalls decode.
+//! blocks on disk I/O**: the hot path does a refcount-clone of the caches,
+//! captures rotating rings into host-owned snapshots while its inference
+//! context is current, and performs a non-blocking `try_send`. If the channel
+//! is full the job is `warn!`-dropped — back-pressure never stalls decode.
 //!
 //! ## Where the host-materialization happens
 //!
-//! Serialization (forcing the MLX arrays to the host via `to_bytes()`) is the
-//! expensive part and runs **in the drain thread**, inside
-//! `block_io::write_caches`. The hot path moves only the (refcount-cloned)
-//! caches into the job. This matches the decision to keep that work off
-//! the inference thread.
+//! Serialization of packed caches (forcing MLX arrays to the host via
+//! `to_bytes()`) is the expensive part and runs **in the drain thread**, inside
+//! the block I/O spill writer. Rotating rings are the exception: their snapshots
+//! must be captured on the inference thread so the drain never evaluates or
+//! reads live MLX arrays. The hot path moves only refcount-cloned caches and
+//! those already host-owned snapshots into the job.
 //!
 //! ## Failure containment
 //!
@@ -49,11 +52,13 @@ use rmlx_mlx::Device;
 
 use rmlx_kv_quant::kvcache::KvCache;
 use rmlx_kv_quant::linear_attn::LinearAttnCache;
+use rmlx_kv_quant::rotating::RotatingStateSnapshot;
 use rmlx_kv_quant::KvQuant;
 
-use crate::block_io::write_caches_timed;
+use crate::block_io::write_caches_timed_with_identity;
 use crate::hooks::{call_ssd_spill_prom_hook, ssd_event_recorder};
 use crate::ssd_index::{hash_to_hex, SsdKvIndex};
+use crate::traits::ExactReplayMetadata;
 
 /// Bounded spill channel depth. Small on purpose: spill is best-effort, and a
 /// backlog means the disk cannot keep up — dropping is the correct behavior.
@@ -69,6 +74,18 @@ const SPILL_CHANNEL_CAP: usize = 16;
     reason = "promoted: internal SSD-tier bridge struct, was pub(crate); promoted to pub for cross-crate use by arch SpillSink impls in rmlx-models; adding a field is a coordinated update across both crates"
 )]
 pub struct SpillJob {
+    /// Complete prompt token identity that produced this snapshot.
+    ///
+    /// This is deliberately not reduced to the block-aligned prefix: a
+    /// geometry-only hash candidate is not proof that a request has the same
+    /// full prompt (in particular for SWA snapshots).
+    pub prompt_ids: Vec<u32>,
+    /// Optional exact first-token replay captured with the full prompt.
+    pub exact_replay: Option<ExactReplayMetadata>,
+    /// Host-owned snapshots of rotating SWA state, captured on the inference
+    /// thread before this job is queued. The spill drain must only serialize
+    /// these values; it must never inspect or snapshot live MLX arrays.
+    pub rotating_snapshots: Vec<Option<RotatingStateSnapshot>>,
     /// Spill key — the last chained-block digest of the entry's prompt under
     /// the active `layout_key` salt. Hex-formatted for the `.kvb`
     /// filename stem and the index `hash` column.
@@ -310,6 +327,9 @@ fn drain_one_inner(
     test_recorder: Option<&EventRecorder>,
 ) -> bool {
     let SpillJob {
+        prompt_ids,
+        exact_replay,
+        rotating_snapshots,
         hash,
         layout_key,
         model_id,
@@ -320,22 +340,51 @@ fn drain_one_inner(
     let hex = hash_to_hex(hash);
     let path: PathBuf = dir.join(format!("{hex}.kvb"));
 
+    // A rotating cache has no usable payload in `KvStorage`; its complete
+    // state must arrive as the host-owned snapshot captured by the producer.
+    // Refuse a malformed job rather than allowing the writer to persist a
+    // geometry-only SWA record that could later be mistaken for a normal KV
+    // cache. This check only reads cache metadata and performs no MLX work.
+    if rotating_snapshots.len() != kv_caches.len()
+        || kv_caches
+            .iter()
+            .zip(&rotating_snapshots)
+            .any(|(cache, snapshot)| cache.is_rotating() != snapshot.is_some())
+    {
+        tracing::warn!(
+            hash = %hex,
+            cache_layers = kv_caches.len(),
+            snapshot_layers = rotating_snapshots.len(),
+            "kv-spill: rotating snapshot coverage does not match cache layers, dropping job"
+        );
+        return false;
+    }
+
     // ── Phase 1+2: serialize (CPU eval) + write (FS) ─────────────────────────
     let t0 = Instant::now();
-    let (byte_size, dur_serialize_us, dur_write_us) =
-        match write_caches_timed(&path, device, &model_id, kv_quant, &kv_caches, &lin_caches) {
-            Ok(timings) => timings,
-            Err(e) => {
-                tracing::warn!(
-                    hash = %hex,
-                    path = %path.display(),
-                    error = %e,
-                    "kv-spill: serialize failed, dropping job"
-                );
-                let _ = std::fs::remove_file(&path);
-                return false;
-            }
-        };
+    let (byte_size, dur_serialize_us, dur_write_us) = match write_caches_timed_with_identity(
+        &path,
+        device,
+        &model_id,
+        kv_quant,
+        &kv_caches,
+        &lin_caches,
+        &rotating_snapshots,
+        &prompt_ids,
+        exact_replay.as_ref(),
+    ) {
+        Ok(timings) => timings,
+        Err(e) => {
+            tracing::warn!(
+                hash = %hex,
+                path = %path.display(),
+                error = %e,
+                "kv-spill: serialize failed, dropping job"
+            );
+            let _ = std::fs::remove_file(&path);
+            return false;
+        }
+    };
 
     // ── Phase 3: index record ─────────────────────────────────────────────────
     let t_idx = Instant::now();
@@ -354,6 +403,16 @@ fn drain_one_inner(
             error = %e,
             "kv-spill: index record failed, dropping job"
         );
+        if let Err(cleanup_error) = std::fs::remove_file(&path) {
+            if cleanup_error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    hash = %hex,
+                    path = %path.display(),
+                    error = %cleanup_error,
+                    "kv-spill: failed to remove unindexed block"
+                );
+            }
+        }
         return false;
     }
     let dur_index_us = t_idx.elapsed().as_micros() as u64;
