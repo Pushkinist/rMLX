@@ -144,6 +144,41 @@ pub(crate) fn skip_if_no_gpu_env() -> bool {
     skip_value_means_skip(std::env::var("RMLX_SKIP_GPU").ok().as_deref())
 }
 
+/// Read a GPU ring **sideband** plane (a scale or norm buffer) back to the host.
+///
+/// Asserts the plane's dtype first. A test that reads a stored plane at a
+/// hard-coded stride is only correct until the plane's element width changes,
+/// and then it is silently wrong in the worst way available: `chunks_exact(4)`
+/// over a `bf16` buffer yields half as many values, every one of them a pair of
+/// unrelated halves, and drops the odd tail without a word. The assertion is
+/// what turns that into a failure that names the cause.
+///
+/// Deliberately does **not** call the production widener: this is the oracle
+/// for it, and an oracle that shares the reader under test proves nothing about
+/// the stride.
+#[allow(clippy::expect_used, reason = "test helper: invariants documented")]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test helper: chunks_exact(2) guarantees length"
+)]
+pub(crate) fn read_sideband_plane(a: &rmlx_mlx::Array) -> Vec<f32> {
+    assert_eq!(
+        a.dtype(),
+        crate::storage::KV_SIDEBAND_DTYPE,
+        "a ring sideband plane is stored at KV_SIDEBAND_DTYPE; this reader decodes that \
+         width and nothing else"
+    );
+    a.eval().expect("eval");
+    a.to_bytes()
+        .expect("to_bytes")
+        .chunks_exact(2)
+        .map(|b| {
+            // bf16 is the top 16 bits of the f32 it widens to.
+            f32::from_bits(u32::from(u16::from_le_bytes(b.try_into().unwrap())) << 16)
+        })
+        .collect()
+}
+
 /// Run `cpu_path` and `msl_path` on `input` and assert max-abs-error ≤ `tol`.
 ///
 /// # Arguments
