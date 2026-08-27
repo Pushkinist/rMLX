@@ -2166,11 +2166,9 @@ Three cases, and they differ:
   first fused decode step seeds the ring from those blocks and frees them
   (`drop_blocks_when_ring_live_iso_*` in `kvcache/update.rs`), after which the
   ring is the sole resident copy.
-- From there they hold the ring layout above. The whole-cache ratios recorded
-  in §"Codec disposition", Class 3 (1.003–1.054× `none`) were measured at the
-  `f32` sideband and are **stale**; the K side of that ratio is now 0.746× what
-  it was. They are left in place rather than adjusted by arithmetic, because a
-  whole-cache ratio is a measurement and re-deriving one is not.
+- From there they hold the ring layout above, and measure **0.763–0.915×**
+  `none` on a whole cache — see §"Codec disposition", Class 3, which carries the
+  paired before/after figures for both archs at two contexts.
 
 The per-group figures are the store density and are unaffected by which of the
 three a cache is in.
@@ -3804,8 +3802,10 @@ just not what the name says — which is why `validate_resolved` says so at
 
 **What this does to the dominated-vs-unused split.** The word belongs to
 Class 3, not here. On the axes anything is measured on, `none` is strictly
-smaller than every Class 3 codec (4 cells, 1.003×–1.541×) and not slower, so
-Class 3 *is* dominated by the baseline; Class 2 merely ties it. The two classes
+smaller than every Class 3 codec except the four iso ones (4 cells, 1.004×–1.541×
+for the rest; the iso rows are 0.763×–0.915× and are the exception) and not
+slower, so most of Class 3 *is* dominated by the baseline; Class 2 merely ties
+it. The two classes
 are still kept for different reasons — see each disposition — but the reason is
 not that one is beaten and the other is not.
 
@@ -3836,34 +3836,63 @@ and indistinguishable today.
 `mixed_k<kb>g<kg>_v<vb>g<vg>`, `rot_k_v<vb>g<vg>`, `iso3_sym`, `iso4_sym`,
 `k_iso3`, `k_iso4`, `rotor3_sym`, `rotor4_sym`, `k_rotor3`, `k_rotor4`.
 
-These are the only codecs whose quantization a served request touches. Every
-one of them is **larger** than bf16, in all four cells:
+These are the only codecs whose quantization a served request touches. **The
+iso family is now smaller than bf16; the rotor family is still larger.**
+
+Measured as `kv_cache_bytes` from `rmlx baseline`, both arms in one harness on
+one host, at `--max-tokens 32`. The "was" column is the same measurement taken
+with the ring's scale and norm planes at `f32`; the "now" column is the shipped
+`KV_SIDEBAND_DTYPE`. Residency is deterministic — every cell reproduced
+byte-for-byte across runs — so these are exact, not medians.
 
 | codec | e2b 4k | e2b 32k | Bonsai 4k | Bonsai 32k |
 |---|---:|---:|---:|---:|
-| `k_iso3` / `k_iso4` | 1.015× | 1.003× | 1.027× | 1.007× |
-| `iso3_sym` / `iso4_sym` | 1.029× | 1.007× | 1.054× | 1.013× |
-| `k_rotor3` / `k_rotor4` | 1.154× | 1.167× | 1.159× | 1.131× |
-| `rotor3_sym` / `rotor4_sym` | 1.309× | 1.334× | 1.317× | 1.262× |
+| `k_iso3` / `k_iso4` — was | 1.021× | 1.004× | 1.009× | 1.008× |
+| `k_iso3` / `k_iso4` — **now** | **0.915×** | **0.881×** | **0.915×** | **0.914×** |
+| `iso3_sym` / `iso4_sym` — was | 1.043× | 1.009× | 1.019× | 1.015× |
+| `iso3_sym` / `iso4_sym` — **now** | **0.831×** | **0.763×** | **0.831×** | **0.828×** |
+| `k_rotor3` / `k_rotor4` — was | 1.163× | 1.168× | 1.135× | 1.132× |
+| `k_rotor3` / `k_rotor4` — now | 1.022× | 1.004× | 1.009× | 1.008× |
+| `rotor3_sym` / `rotor4_sym` — was | 1.326× | 1.337× | 1.270× | 1.265× |
+| `rotor3_sym` / `rotor4_sym` — now | 1.043× | 1.009× | 1.019× | 1.015× |
 | `mixed_k8g64_v4g64` | 1.339× | 1.396× | 1.287× | 1.293× |
 | `rot_k_v8g64` | 1.541× | 1.533× | 1.384× | 1.384× |
 
-The iso / rotor rows are the ring-layout result restated on real serving: a
-per-group scale beside each packed word puts 12.125–16.25 bits on the
-store per value against bf16's 16.0, so the family cannot win on bytes at any
-finite head dim. The `mixed` / `rot_k` rows still carry both bf16 seeds beside
+The iso / rotor rows are the ring-layout result restated on real serving. Both
+families spend one whole `u32` code word per group; iso's group is 4 head-dim
+slots and rotor's is 3, so before any sideband iso stores 8 bits per value and
+rotor 10.67. Halving the two sideband planes took 4.125 bits per value off iso
+and 5.5 off rotor, which is enough to put iso under bf16's 16.0 at every
+geometry and not enough to put rotor under it at any. The rotor rows moved by
+20% and stayed on the wrong side of 1.0, which is the shape of the conclusion:
+**the rotor overrun is a code cadence, and a sideband change cannot fix one.**
+
+Decode speed did not pay for the bytes. ABBA-interleaved,
+`scripts/perf_ab.sh`, 12 slots (8 at 32k), `--max-tokens 100`, the two binaries
+verified distinct by sha256 and by a symbol: Bonsai `iso3_sym` 4k **+2.23%
+(SEPARATED)**; Bonsai `rotor3_sym` 4k +0.71%, Bonsai `iso3_sym` 32k +0.31%,
+e2b `iso3_sym` 4k +0.27%, e2b `k_rotor3` 4k +0.02% — all four INCONCLUSIVE,
+i.e. slot ranges overlap and the point estimate is not evidence of a
+difference. No cell regressed. The e2b `k_rotor3` cell also generated
+**identical token ids** in every one of its 12 slots.
+
+The `mixed` / `rot_k` rows still carry both bf16 seeds beside
 their store, which is a separate, unlanded elision; their decode result does
 not depend on it (returning an unread seed frees memory, it does not speed a
 quantized-matmul decode) and is measured at 0.763× of `none` at 130 848 tokens
 with the arms' ranges disjoint.
 
-**Disposition: keep, unchanged, and do not treat as memory levers.** These
-*are* dominated by `none` on the measured axes — strictly larger resident KV in
-all four cells, and for `mixed` also slower (0.763× at 130 848 tokens, ranges
-disjoint). They are kept anyway, and the reason is not that they are competitive:
-they are the only codecs in the tree that decode over a packed store at all, so
-they are the substrate any fused-decode work has to stand on, and a dominated
-codec with a function is not the same object as a beaten one with none.
+**Disposition: keep. The four iso rows are now memory levers; the rest are
+not.** `k_iso3/4` and `iso3_sym/4_sym` hold 0.76–0.92× `none`'s resident KV in
+all four cells at no measured decode cost, which is the first time any codec in
+this tree has been smaller than bf16 on a served request. The rotor, `mixed` and
+`rot_k` rows remain dominated by `none` on the measured axes — strictly larger
+resident KV in all four cells, and for `mixed` also slower (0.763× at 130 848
+tokens, ranges disjoint). Those are kept anyway, and the reason is not that they
+are competitive: they are the only other codecs in the tree that decode over a
+packed store at all, so they are the substrate any fused-decode work has to
+stand on, and a dominated codec with a function is not the same object as a
+beaten one with none.
 
 Being dominated today is a statement about the ring layout and about ε (the
 byte-to-time conversion efficiency, ≈0.04–0.135 on every path measured, and

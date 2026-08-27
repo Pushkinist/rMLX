@@ -27,7 +27,7 @@ Conventions:
 | `check_kv_layer_quants.sh` | The per-layer KV codec vector has one producer; every per-layer cache stack uses it or declares itself uniform. |
 | `check_kv_codec_disposition.sh` | The `--kv-quant` / `--kv-bits` help and every `docs/KV_QUANT.md` INERT banner agree with the codec's runtime disposition, derived from `ALL_KV_QUANTS` + the three decode predicates. |
 | `check_kv_codec_disposition_fixtures.sh` | Recall test for the above — 10 synthetic scan roots (one edit each), asserting which rule fired and exit 2 vs exit 1. |
-| `check_metal_compiles.sh` | Every `.metal` kernel compiles natively at `-std=metal3.0` and `-std=metal4.0`, and is named by its `probes/kernels.manifest`. |
+| `check_metal_compiles.sh` | Every `.metal` kernel compiles natively at `-std=metal3.1` and `-std=metal4.0`, and is named by its `probes/kernels.manifest`. |
 | `check_metal_format.sh` | Every `.metal` file is formatted. |
 | `check_no_decode_swallow.sh` | A failed decode step or failed sampler call cannot be swallowed into a silent success. |
 | `check_no_inline_tests.sh` | No inline `#[cfg(test)] mod tests` outside `*_tests.rs` / `tests.rs`. |
