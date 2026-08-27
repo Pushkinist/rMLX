@@ -416,7 +416,7 @@ check-kernel-dtype-contract-fixtures: ## CI gate: the dtype-contract gate still 
 # mean the gate protected nothing); local runs leave it empty and skip.
 METAL_STRICT ?=
 
-check-metal-compiles: ## CI gate: every .metal kernel compiles natively at metal3.0 + metal4.0 and is named by its manifest (skips without the Xcode Metal toolchain; METAL_STRICT=--strict to require it)
+check-metal-compiles: ## CI gate: every .metal kernel compiles natively at metal3.1 + metal4.0 and is named by its manifest (skips without the Xcode Metal toolchain; METAL_STRICT=--strict to require it)
 	@bash scripts/check_metal_compiles.sh $(METAL_STRICT)
 
 check-metal-format: ## CI gate: every .metal kernel is clang-format clean (skips without clang-format; METAL_STRICT=--strict to require it)
